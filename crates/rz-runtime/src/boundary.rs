@@ -24,9 +24,18 @@ impl Resources {
     pub(crate) fn subtract(self, other: Self) -> Self {
         // Every release corresponds to an owner that successfully reserved.
         Self {
-            host_bytes: self.host_bytes.checked_sub(other.host_bytes).expect("host reservation"),
-            device_bytes: self.device_bytes.checked_sub(other.device_bytes).expect("device reservation"),
-            pinned_bytes: self.pinned_bytes.checked_sub(other.pinned_bytes).expect("pinned reservation"),
+            host_bytes: self
+                .host_bytes
+                .checked_sub(other.host_bytes)
+                .expect("host reservation"),
+            device_bytes: self
+                .device_bytes
+                .checked_sub(other.device_bytes)
+                .expect("device reservation"),
+            pinned_bytes: self
+                .pinned_bytes
+                .checked_sub(other.pinned_bytes)
+                .expect("pinned reservation"),
         }
     }
 
@@ -122,6 +131,8 @@ pub trait Adapter {
     ) -> Result<(), Self::Error>;
     fn allocate_execution_id(&mut self) -> Result<Self::ExecutionId, Self::Error>;
     fn runtime_error(&self, fault: RuntimeFault) -> Self::Error;
+    /// Attach each subscriber's context while preserving the physical failure.
+    fn execution_error(&self, request: &Self::Request, error: &Self::Error) -> Self::Error;
     fn terminal(
         &mut self,
         request: &Self::Request,

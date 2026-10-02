@@ -10,3 +10,6 @@ description = "Bounded, single-owner evaluation scheduling for RoveZero"
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+rz-telemetry = { path = "../rz-telemetry" }

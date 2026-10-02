@@ -5,5 +5,7 @@
 #![forbid(unsafe_code)]
 
 mod boundary;
+mod scheduler;
 
 pub use boundary::*;
+pub use scheduler::*;
