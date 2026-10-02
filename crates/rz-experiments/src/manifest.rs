@@ -399,15 +399,25 @@ impl LockedManifest {
         self.input.artifacts()
     }
 
-    pub fn to_json(&self) -> Result<String, ManifestError> {
-        let envelope = LockEnvelope {
+    fn envelope(&self) -> LockEnvelope {
+        LockEnvelope {
             lock_version: 1,
             canonicalization: CANONICALIZATION.into(),
             execution_ready: false,
             input_sha256: self.sha256.clone(),
             input: self.input.clone(),
-        };
-        serde_json::to_string_pretty(&envelope).map_err(|e| ManifestError::Integrity(e.to_string()))
+        }
+    }
+
+    pub fn to_json(&self) -> Result<String, ManifestError> {
+        serde_json::to_string_pretty(&self.envelope())
+            .map_err(|e| ManifestError::Integrity(e.to_string()))
+    }
+
+    /// Compact form for bounded nesting in later E-owned persisted formats.
+    /// It has exactly the same envelope and digest semantics as `to_json`.
+    pub fn to_compact_json(&self) -> Result<String, ManifestError> {
+        serde_json::to_string(&self.envelope()).map_err(|e| ManifestError::Integrity(e.to_string()))
     }
 
     pub fn from_json(input: &str) -> Result<Self, ManifestError> {

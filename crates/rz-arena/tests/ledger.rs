@@ -43,6 +43,14 @@ fn evidence() -> ArtifactRef {
     }
 }
 
+fn input_artifact_bytes(plan: &ArenaPlan) -> u64 {
+    let mut unique = std::collections::BTreeMap::new();
+    for artifact in plan.manifest().declared_artifacts() {
+        unique.insert(&artifact.path, artifact.bytes);
+    }
+    unique.values().copied().sum()
+}
+
 fn start(plan: &ArenaPlan, pair: usize, attempt: u32) -> Event {
     Event::PairStarted {
         pair_id: plan.pairs()[pair].id.clone(),
@@ -798,7 +806,7 @@ fn unique_evidence_refs_share_the_aggregate_artifact_budget() {
             GameOutcome::Incomplete {
                 reason: "synthetic first log".into(),
                 evidence: ArtifactRef {
-                    bytes: cap - 1,
+                    bytes: cap - input_artifact_bytes(&plan) - 1,
                     ..evidence()
                 },
             },
@@ -821,4 +829,110 @@ fn unique_evidence_refs_share_the_aggregate_artifact_budget() {
             },
         ),
     );
+}
+
+#[test]
+fn input_artifact_identity_cannot_be_replaced_by_an_evidence_declaration() {
+    let plan = plan(1);
+    let mut ledger = Ledger::new(&plan, limits()).unwrap();
+    ledger.append(start(&plan, 0, 1)).unwrap();
+    let game = plan.pairs()[0].execution_order[0];
+    let original = plan.manifest().declared_artifacts()[0].clone();
+    let mut conflicting = original.clone();
+    conflicting.sha256 = "b".repeat(64);
+    assert_ne!(conflicting.sha256, original.sha256);
+    reject_unchanged(
+        &mut ledger,
+        record(
+            &plan,
+            0,
+            game,
+            1,
+            GameOutcome::Incomplete {
+                reason: "synthetic outcome".into(),
+                evidence: conflicting,
+            },
+        ),
+    );
+}
+
+#[test]
+fn exact_input_identity_reuse_does_not_charge_the_artifact_budget_twice() {
+    let original_plan = plan(1);
+    let mut input = manifest(1);
+    input.budget.max_artifact_bytes = input_artifact_bytes(&original_plan);
+    let plan = ArenaPlan::build(
+        &input.lock().unwrap(),
+        PlanLimits {
+            max_pairs: 1,
+            max_json_bytes: 4 * 1024 * 1024,
+        },
+    )
+    .unwrap();
+    let mut ledger = Ledger::new(&plan, limits()).unwrap();
+    ledger.append(start(&plan, 0, 1)).unwrap();
+    let original = plan.manifest().declared_artifacts()[0].clone();
+    for game in plan.pairs()[0].execution_order {
+        ledger
+            .append(record(
+                &plan,
+                0,
+                game,
+                1,
+                GameOutcome::Incomplete {
+                    reason: "synthetic declaration referencing exact input identity".into(),
+                    evidence: original.clone(),
+                },
+            ))
+            .unwrap();
+    }
+    ledger.append(close(&plan, 0, 1)).unwrap();
+    assert_eq!(ledger.summary().unwrap().failure_counts.incomplete, 2);
+    Ledger::from_jsonl(&plan, &ledger.to_jsonl().unwrap(), limits()).unwrap();
+}
+
+#[test]
+fn input_and_new_evidence_share_one_artifact_budget() {
+    let original_plan = plan(1);
+    let mut input = manifest(1);
+    input.budget.max_artifact_bytes = input_artifact_bytes(&original_plan) + 1;
+    let plan = ArenaPlan::build(
+        &input.lock().unwrap(),
+        PlanLimits {
+            max_pairs: 1,
+            max_json_bytes: 4 * 1024 * 1024,
+        },
+    )
+    .unwrap();
+    let mut ledger = Ledger::new(&plan, limits()).unwrap();
+    ledger.append(start(&plan, 0, 1)).unwrap();
+    let game = plan.pairs()[0].execution_order[0];
+    reject_unchanged(
+        &mut ledger,
+        record(
+            &plan,
+            0,
+            game,
+            1,
+            GameOutcome::Incomplete {
+                reason: "synthetic second artifact".into(),
+                evidence: ArtifactRef {
+                    bytes: 2,
+                    ..evidence()
+                },
+            },
+        ),
+    );
+    ledger
+        .append(record(
+            &plan,
+            0,
+            game,
+            1,
+            GameOutcome::Incomplete {
+                reason: "synthetic artifact within total budget".into(),
+                evidence: evidence(),
+            },
+        ))
+        .unwrap();
 }

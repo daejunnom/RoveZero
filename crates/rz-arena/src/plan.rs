@@ -185,7 +185,7 @@ impl ArenaPlan {
         }
         // Bound the existing input before materializing its nested lock JSON.
         json_length(input, limits.max_json_bytes)?;
-        let input_lock = decode_json(&manifest.to_json().map_err(ArenaError::Manifest)?)?;
+        let input_lock = decode_json(&manifest.to_compact_json().map_err(ArenaError::Manifest)?)?;
         let mut plan = Self {
             manifest: manifest.clone(),
             input_lock,

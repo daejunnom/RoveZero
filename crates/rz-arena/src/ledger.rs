@@ -200,13 +200,17 @@ impl Ledger {
                 "header exceeds ledger byte limit".into(),
             ));
         }
+        let mut state = State::default();
+        for artifact in plan.manifest().declared_artifacts() {
+            register_evidence(plan, &mut state, artifact)?;
+        }
         Ok(Self {
             plan: plan.clone(),
             limits,
             header,
             header_sha256,
             records: Vec::new(),
-            state: State::default(),
+            state,
             bytes,
         })
     }
@@ -636,7 +640,7 @@ fn register_evidence(
     if let Some(previous) = state.evidence.get(&evidence.path) {
         if previous != evidence {
             return Err(ArenaError::Invalid(
-                "conflicting evidence identity at same path".into(),
+                "conflicting input/evidence artifact identity at same path".into(),
             ));
         }
         return Ok(());
@@ -647,7 +651,7 @@ fn register_evidence(
         .ok_or_else(|| ArenaError::Budget("evidence byte count overflow".into()))?;
     if bytes > plan.manifest().input().budget.max_artifact_bytes {
         return Err(ArenaError::Budget(
-            "evidence artifact byte limit exceeded".into(),
+            "input/evidence artifact byte limit exceeded".into(),
         ));
     }
     state

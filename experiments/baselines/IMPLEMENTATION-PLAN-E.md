@@ -1,7 +1,7 @@
 # E 역할 구현 계획 — TASK-E01/E02/E03
 
 작성일: 2026-10-03, Asia/Seoul. 담당: 사용자가 E 역할로 배정한 이 채팅의 에이전트.
-상태: E01 입력 단계의 첫 구현·로컬 검증 완료. 구현 진행과 실제 근거는 9절에 기록한다.
+상태: E01 입력 단계와 E02 pair·원장 내부 구현. 진행과 실제 근거는 9·10절에 기록한다.
 
 ## 1. 계획 수립 당시 기준과 상태
 
@@ -92,7 +92,8 @@ digest 계산용 직렬화의 필드 순서·숫자 표현·버전을 고정하�
 preflight에서 확인한 설정은 실행 시작 시 다시 대조하며, 평가 opening을 preflight 분석에 사용하지 않는다.
 
 설계할 CLI의 작업은 `validate → lock → plan → run → audit → report`와 `resume`이다.
-이는 구현 예정 동작이며 현재 실행 가능한 명령으로 제시하지 않는다.
+현재 제공하는 명령은 E01 `validate/lock/verify`, arena `plan/ledger-init/ledger-append/audit`다.
+`run/report/resume`는 실제 runner·감사·통계와 연결할 후속 동작이다.
 
 ## 5. E02 — pair 계획과 외부 실행
 
@@ -246,3 +247,40 @@ SHA-256을 실제 파일에서 대조했다. 의존성 resolution도 별도 lock
 다음 구현 단위는 E02의 동일한 전체 시작 상태를 공유하는 color-swapped pair 계획과
 attempt/failure 원장이다. A의 상태 계약과 독립 opening 감사, runner의 실제 옵션·시계·
 종료 사건 연결 후 실행 인수를 진행한다. E03 집계·군집 통계·독립 holdout 비교는 후속이다.
+
+## 10. E02 내부 구현 진행 — 2026-10-03, Asia/Seoul
+
+사용자는 PR #7을 확인한 뒤 내부 구현을 계속하고, 미게시 계약은 구현 이후 맞추도록
+지시했다. 확인한 [PR #7](https://github.com/daejunnom/RoveZero/pull/7)의 head는
+`ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8`, base `develop`은 기존 `9f0bc598…`다.
+총괄 공통 계약 0.1이 실제 std-only crate로 게시됐지만 draft/open·미병합 상태다.
+반환된 리뷰 댓글·commit status·PR-triggered workflow 목록은 비어 있었으며
+CI 인수 성공으로 기록하지 않는다. 실제 Rules 복원·runner 사건·PGN 접점은 후속이다.
+
+`rz-arena`에 같은 opening 입력의 색 교환 pair 계획, 결정적 seed·실행 순서·logical
+resource slot, game attempt 상태기계·실패 원장과 기본 W/D/L·pentanomial 회계를 구현했다.
+pair의 실제 차례·FEN·수순·known/unknown history는 변형하지 않는다.
+인프라 장애의 전체 pair 제한 재시도만 허용하고 엔진 패배·미완료를 재시도하거나
+한 판만 살리지 않는다. 계약 오류·동시 장애는 해석을 중단한다.
+
+입력과 파생 pair를 재생성해 계획 변조를 거부하고, JSONL seq/hashchain·마지막 newline과
+별도 trusted tip을 검증한다. 입력·evidence 전체의 identity 충돌과 고유 artifact 상한도
+검사한다. arbitrary 판정은 구체 잠긴 정책이 없어 거부한다. 세부 API·schema·명령·한계는
+[arena README](../../crates/rz-arena/README.md)에 둔다.
+
+첫 E02 WIP는 `383eb05`로 기존 브랜치와 [draft PR #8](https://github.com/daejunnom/RoveZero/pull/8)에
+공유했다. 이후 입력+evidence 통합 identity/예산과 큰 입력의 compact nesting 경계를
+보강했다. Rust 1.99.0에서 E01 31개와 arena CLI 10/ledger 22/planner 15개,
+총 78개 테스트 및 두 package의 fmt/clippy가 통과했다. Rust 1.85.0의 두 package
+`cargo check --all-targets --locked`도 통과했다. 기본 feature·Linux CPU/합성 검사다.
+
+실제 CLI로 합성 6 pair·30개 사건의 전체 입력 잠금→계획→원장→감사를 재현하고,
+W=D=L=4와 `n=[1,1,2,1,1]`을 독립 손계산에 대조했다. 독립 Python의 fixture 계획
+SHA·opening SHA·seed vector와 일치했고, 완전 record suffix 삭제를 trusted tip으로
+검출했다. 정확한 명령·로그·lockfile·검토 SHA는 저장소 밖 `reports/e02/`에 보존한다.
+source SHA는 draft PR head와 최종 영수증으로 인계한다.
+
+모든 계획·감사는 `execution_ready=false`, `structural_only`이며 실제 runner 실행·resume·
+NN·GPU·강도·CI 성공을 의미하지 않는다. E03의 CI/Elo/bootstrap·순차 검정은 아직
+구현하지 않았다. 다음 단위는 외부 runner adapter·실제 시작/종료 영수증과 bounded
+process 수명, A의 checked 복원과 독립 PGN 감사·clock/resource/drain/reset 연결이다.

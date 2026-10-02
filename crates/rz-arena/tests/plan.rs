@@ -276,6 +276,33 @@ fn explicit_pair_json_limits_and_cumulative_repeated_opening_bytes_are_enforced(
 }
 
 #[test]
+fn compact_plan_budget_accepts_a_large_input_despite_pretty_formatting_expansion() {
+    let mut input = fixture();
+    let opening = input.input.openings[0].clone();
+    input.input.openings = (0..64)
+        .map(|ordinal| {
+            let mut repeated = opening.clone();
+            repeated.id = format!("large-opening-{ordinal}");
+            repeated.moves = vec!["e2e4".into(); 4096];
+            repeated
+        })
+        .collect();
+    let locked = input.lock().unwrap();
+    assert!(locked.to_json().unwrap().len() > 4 * 1024 * 1024);
+    let budget = PlanLimits {
+        max_pairs: 1,
+        max_json_bytes: 3 * 1024 * 1024,
+    };
+    let planned = ArenaPlan::build(&locked, budget)
+        .expect("compact serialization stays within the explicit budget");
+    let encoded = planned.to_json().unwrap();
+    assert!(encoded.len() <= budget.max_json_bytes);
+    assert_eq!(planned.pairs().len(), 1);
+    let restored = ArenaPlan::from_json(&encoded, budget).unwrap();
+    assert_eq!(restored.sha256(), planned.sha256());
+}
+
+#[test]
 fn plan_roundtrip_preserves_the_locked_input_and_remains_unready() {
     let planned = plan(pairs(fixture(), 3));
     let encoded = planned.to_json().unwrap();
