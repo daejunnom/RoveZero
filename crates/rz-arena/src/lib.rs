@@ -2,11 +2,21 @@
 //! Rules reconstruction, runner receipts and physical fairness require adapters.
 #![forbid(unsafe_code)]
 
+mod contract;
+mod fastchess;
 mod ledger;
+mod pgn;
 mod plan;
+mod process;
+mod runner;
 
+pub use contract::*;
+pub use fastchess::*;
 pub use ledger::*;
+pub use pgn::*;
 pub use plan::*;
+pub use process::*;
+pub use runner::*;
 
 use rz_experiments::ManifestError;
 use serde::Serialize;
@@ -17,6 +27,8 @@ pub const MAX_JSON_BYTES: usize = rz_experiments::MAX_MANIFEST_BYTES;
 
 #[derive(Debug)]
 pub enum ArenaError {
+    Execution(Box<FixtureExecutionFailure>),
+    Contract(rz_contracts::ContractError),
     Manifest(ManifestError),
     Invalid(String),
     Integrity(String),
@@ -27,6 +39,12 @@ pub enum ArenaError {
 impl fmt::Display for ArenaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Execution(failure) => write!(
+                f,
+                "fixture evidence persistence failed: {} (pid={}, cleanup={:?})",
+                failure.cause, failure.process.receipt.pid, failure.process.receipt.group_cleanup
+            ),
+            Self::Contract(error) => error.fmt(f),
             Self::Manifest(error) => error.fmt(f),
             Self::Invalid(reason) => write!(f, "arena validation: {reason}"),
             Self::Integrity(reason) => write!(f, "arena integrity: {reason}"),
@@ -37,6 +55,12 @@ impl fmt::Display for ArenaError {
 }
 
 impl std::error::Error for ArenaError {}
+
+impl From<rz_contracts::ContractError> for ArenaError {
+    fn from(error: rz_contracts::ContractError) -> Self {
+        Self::Contract(error)
+    }
+}
 
 impl From<ManifestError> for ArenaError {
     fn from(error: ManifestError) -> Self {

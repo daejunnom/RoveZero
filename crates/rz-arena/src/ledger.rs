@@ -474,12 +474,12 @@ fn apply(plan: &ArenaPlan, state: &mut State, event: &Event) -> Result<(), Arena
                     "invalid or exhausted retry number".into(),
                 ));
             }
-            if let Some(previous) = attempts.last() {
-                if !previous.closed || !retryable(previous) {
-                    return Err(ArenaError::Invalid(
-                        "retry requires a closed infrastructure-invalid whole pair".into(),
-                    ));
-                }
+            if let Some(previous) = attempts.last()
+                && (!previous.closed || !retryable(previous))
+            {
+                return Err(ArenaError::Invalid(
+                    "retry requires a closed infrastructure-invalid whole pair".into(),
+                ));
             }
             attempts.push(Attempt {
                 number: attempt_number,

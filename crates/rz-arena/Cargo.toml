@@ -2,9 +2,17 @@
 name = "rz-arena"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 license = "MIT"
 description = "RoveZero paired opening plans and attempt/failure ledger"
+
+[features]
+test-fixtures = []
+
+[[bin]]
+name = "rz-arena-fixture-engine"
+path = "src/bin/fixture-engine.rs"
+required-features = ["test-fixtures"]
 
 # Independent E development until I01 registers the crate in the root workspace.
 [workspace]
@@ -14,6 +22,14 @@ rz-experiments = { path = "../rz-experiments" }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.145"
 sha2 = "=0.10.9"
+rz-contracts = { git = "https://github.com/daejunnom/RoveZero", rev = "67284c4f66f7a7ae9f46fa63dfd50e7410eb6845" }
+rz-position = { git = "https://github.com/daejunnom/RoveZero", rev = "118dc0311a88e143be285703940321dc16261f6a", features = ["contracts"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.177"
+signal-hook = "=0.3.18"
+cap-std = "=4.0.3"
+cap-fs-ext = "=4.0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "=0.30.1", features = ["fs", "signal", "process"] }

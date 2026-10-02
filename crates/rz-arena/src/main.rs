@@ -1,4 +1,4 @@
-use rz_arena::{ArenaPlan, Event, Ledger, LedgerLimits, PlanLimits, decode_json};
+use rz_arena::{ArenaPlan, Event, Ledger, LedgerLimits, PlanLimits, decode_json, run_fixture_pair};
 use rz_experiments::{LockedManifest, MAX_MANIFEST_BYTES};
 use std::env;
 use std::ffi::OsString;
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const JSON_LIMIT: u64 = MAX_MANIFEST_BYTES as u64;
-const USAGE: &str = "Usage:\n  rz-arena plan LOCKED OUTPUT --max-pairs N --max-plan-bytes N\n  rz-arena ledger-init PLAN OUTPUT --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N\n  rz-arena ledger-append PLAN LEDGER EVENT OUTPUT --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N\n  rz-arena audit PLAN LEDGER --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N [--expected-tip SHA]\n\nAll bounds are required and positive. Validation is structural only; execution_ready=false.";
+const USAGE: &str = "Usage:\n  rz-arena plan LOCKED OUTPUT --max-pairs N --max-plan-bytes N\n  rz-arena ledger-init PLAN OUTPUT --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N\n  rz-arena ledger-append PLAN LEDGER EVENT OUTPUT --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N\n  rz-arena audit PLAN LEDGER --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N [--expected-tip SHA]\n  rz-arena fixture-pair PLAN ARTIFACT_ROOT NEW_OUTPUT_BASENAME --max-pairs N --max-plan-bytes N\n\nAll bounds are required and positive. fixture-pair is a synthetic smoke only; execution_ready=false.";
 
 #[derive(Clone, Copy)]
 enum Operation {
@@ -16,6 +16,7 @@ enum Operation {
     LedgerInit,
     LedgerAppend,
     Audit,
+    FixturePair,
 }
 
 struct Bounds {
@@ -83,6 +84,7 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, String> {
         Some("ledger-init") => (Operation::LedgerInit, 2, true),
         Some("ledger-append") => (Operation::LedgerAppend, 4, true),
         Some("audit") => (Operation::Audit, 2, true),
+        Some("fixture-pair") => (Operation::FixturePair, 3, false),
         _ => return Err(format!("invalid or missing command\n{USAGE}")),
     };
     if args.len() < path_count + 1 {
@@ -187,6 +189,47 @@ fn execute(command: Command) -> Result<String, String> {
         bounds.plan_limits(),
     )
     .map_err(|error| error.to_string())?;
+    if matches!(operation, Operation::FixturePair) {
+        let output_name = paths[2]
+            .to_str()
+            .ok_or_else(|| "output basename must be ASCII".to_string())?;
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(unix)]
+        {
+            signal_hook::flag::register(signal_hook::consts::SIGINT, cancelled.clone())
+                .map_err(|_| "cannot install SIGINT cancellation".to_string())?;
+            signal_hook::flag::register(signal_hook::consts::SIGTERM, cancelled.clone())
+                .map_err(|_| "cannot install SIGTERM cancellation".to_string())?;
+        }
+        let result =
+            run_fixture_pair(&plan, &paths[1], output_name, Some(&cancelled)).map_err(|error| {
+                if let rz_arena::ArenaError::Execution(failure) = &error {
+                    // Last available evidence channel when output storage fails.
+                    if let Ok(receipt) = serde_json::to_string(&failure.process.receipt) {
+                        eprintln!("process_failure_receipt={receipt}");
+                    }
+                }
+                error.to_string()
+            })?;
+        if result.receipt.process.group_cleanup != rz_arena::CleanupStatus::Gone {
+            return Err(format!(
+                "fixture cleanup is unverified (pid={}); receipt and excluded ledger preserved; CLI releases pending ownership on exit",
+                result.receipt.process.pid
+            ));
+        }
+        if result.receipt.pgn_audit.is_none() {
+            return Err(format!("fixture run failed ({:?}); receipt {} and excluded ledger preserved", result.receipt.process.stop, result.receipt_artifact.path));
+        }
+        return serde_json::to_string_pretty(&serde_json::json!({
+            "execution_ready": false,
+            "validation_scope": result.receipt.validation_scope,
+            "receipt": result.receipt_artifact,
+            "ledger_tip_sha256": result.ledger_tip_sha256,
+            "summary": result.summary,
+            "process_cleanup": result.receipt.process.group_cleanup,
+        }))
+        .map_err(|error| error.to_string());
+    }
     let ledger_limits = bounds.ledger_limits(&plan)?;
     let max_ledger_bytes = ledger_limits.max_bytes;
     match operation {
@@ -230,6 +273,7 @@ fn execute(command: Command) -> Result<String, String> {
             serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
         }
         Operation::Plan => unreachable!("plan operation is handled above"),
+        Operation::FixturePair => unreachable!("fixture pair is handled above"),
     }
 }
 

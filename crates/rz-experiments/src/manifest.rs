@@ -118,6 +118,19 @@ impl ArtifactRef {
     pub fn validate(&self) -> Result<(), ManifestError> {
         crate::validation::validate_artifact(self)
     }
+
+    /// Verify bounded bytes through a pinned no-follow file handle and return
+    /// that same read-only handle at offset zero. Pathname replacement cannot
+    /// redirect the returned handle. The caller must prevent concurrent writes
+    /// to its inode (including through hardlinks) throughout subsequent use;
+    /// this API does not freeze file contents or authorize engine execution.
+    pub fn open_verified(
+        &self,
+        root: &Path,
+        max_bytes: u64,
+    ) -> Result<std::fs::File, ManifestError> {
+        crate::artifact::open_verified(self, root, max_bytes)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
