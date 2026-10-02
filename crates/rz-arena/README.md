@@ -6,23 +6,28 @@
 
 ## PR #7과 계약 연결 경계
 
-[PR #7](https://github.com/daejunnom/RoveZero/pull/7)의 확인한 head는
-`ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8`이다. 총괄의 공통 Rust 계약 revision 0.1이
-게시됐지만 draft/open이며 기준 `develop`에는 아직 병합되지 않았다. 반환된 리뷰 댓글,
-commit status와 PR-triggered workflow run 목록은 비어 있었다. CI 통과로 기록하지 않는다.
+[PR #7](https://github.com/daejunnom/RoveZero/pull/7)의 공통 Rust 계약 revision 0.1은
+`develop`의 `3e3cd80533a69ee2118f1c130e72a1cb0745ae8c`에 병합됐다. 현재 총괄
+통합본은 같은 root path 계약과 A Rules를 소비한다. 당시 독립 branch의 PR 상태와
+검사 보고를 현재 통합 SHA의 CI 성공으로 재사용하지 않는다.
 
 이번 구현의 pair/game/attempt ID와 결과 enum은 E의 영속 기록 형식이다. 공통
 RequestId·Move·신경망 WDL·StateIdentity를 복제하지 않는다. opening은 E01의
 `OpeningSpec`을 재사용한다. 공통 계약의 `PositionSnapshot<P>`는 A가 복원한 상태를
-연결하는 후속 접점이며, 이 코드의 입력 hash를 그 실제 semantic digest로 사용하지 않는다.
+연결하는 접점이며, 이 코드의 입력 hash를 그 실제 semantic digest로 사용하지 않는다.
 공통 오류·generation·runner/PGN/시계 사건을 연결할 때 계약 0.1의 정확한 revision과
 실제 producer를 확인한다. 계약 연결 전에도 내부 구현을 진행하라는 사용자 지시를 따른다.
 
-독립 package workspace로 빌드한다. root workspace·lockfile·CI·공통 타입은 I01 소유다.
-총괄이 정식 member로 등록할 때 두 E package의 `[workspace]` 경계와 임시 lockfile을
-정리하고 같은 통합 SHA로 인수해야 한다. 자체 코드는 [MIT LICENSE](LICENSE)를 따른다.
-의존성은 E01 path dependency와 serde/serde_json/sha2, Unix CLI의 libc이며
-권리와 버전은 [E01 README](../rz-experiments/README.md)의 목록과 같다.
+현재 두 E package는 root workspace·lockfile을 공유한다. root Cargo·CI·공통 타입은
+I01 소유다. 자체 코드는 [MIT LICENSE](LICENSE)를 따른다. 의존성 버전은 root Cargo와
+[E01 README](../rz-experiments/README.md)를 따른다. Unix/Linux 전용 실행과 Windows의
+명시적인 미지원 반환을 구분한다.
+
+Linux fixture supervisor는 검증한 실행 파일, 유한 process group, 출력·artifact 한도와
+A Rules 기반 PGN 감사를 제공한다. 전체 ply는 4095 이하이며 config·opening·PGN이
+공유 artifact 예산을 사용한다. Fastchess 로그 인자는 기존 bounded stdout으로 연결하지만
+실제 trace 확보는 별도 확인한다. 실제 고정 Fastchess의 전체 fixture 실행과 정식 대국
+시계·장비·통계 인수는 아직 완료하지 않았다. `execution_ready=false`를 유지한다.
 
 ## 불변 pair 계획
 

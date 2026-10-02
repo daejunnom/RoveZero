@@ -2,10 +2,10 @@
 
 TASK-E01의 첫 구현이다. 버전이 있는 실행 입력을 검증·잠그고, 다시 읽을 때 입력
 SHA-256과 정책을 재검증한다. E의 내부 직렬화 형식이며 총괄의 `rz-contracts`를
-정의하거나 대체하지 않는다. 기준 `develop`에는 아직 Cargo workspace와 공통 타입이
-없어 이 패키지를 독립적으로 빌드한다. 이후 공통 계약 0.1은
-[PR #7](https://github.com/daejunnom/RoveZero/pull/7)에 게시됐으며 정식 통합은 I01에서 진행한다.
-root Cargo·CI는 변경하지 않는다.
+정의하거나 대체하지 않는다. 공통 계약 0.1은
+[PR #7](https://github.com/daejunnom/RoveZero/pull/7)로 `develop`에 병합됐다. 현재 총괄
+통합본은 root workspace·lockfile을 공유한다. root Cargo·CI는 I01의 소유이며 이 도구의
+source 제공과 실제 실행·대국 인수는 [통합 인수 기록](../../docs/INTEGRATION-STATUS.md)을 따른다.
 
 ## 제공하는 동작
 

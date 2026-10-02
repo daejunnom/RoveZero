@@ -85,6 +85,20 @@ fn constructs_the_verified_single_pair_interface_and_accounts_for_book_prefix() 
     assert_eq!(value(args, "-startup-ms"), "1100");
     assert_eq!(value(args, "-ping-ms"), "1100");
     assert_eq!(value(args, "-ucinewgame-ms"), "1200");
+    // Check the pinned Linux logging profile's arguments. The real runner's
+    // ability to capture UCI trace is a separate execution check.
+    assert_eq!(value(args, "-log"), "file=/proc/self/fd/1");
+    let log_index = args.iter().position(|argument| argument == "-log").unwrap();
+    assert_eq!(
+        &args[log_index + 1..log_index + 6],
+        &[
+            OsString::from("file=/proc/self/fd/1"),
+            "append=true".into(),
+            "level=trace".into(),
+            "realtime=true".into(),
+            "engine=true".into(),
+        ]
+    );
     for expected in [
         "-repeat",
         "-strict",
@@ -113,6 +127,7 @@ fn constructs_the_verified_single_pair_interface_and_accounts_for_book_prefix() 
         "-sprt",
         "-tb",
         "-force-concurrency",
+        "-debug",
     ] {
         assert!(
             !args.iter().any(|argument| argument == forbidden),
@@ -248,7 +263,7 @@ fn rejects_unsupported_clock_increment_and_fractional_second_conversion() {
 
 #[test]
 fn rejects_limits_that_cannot_represent_the_full_opening_plus_searched_plies() {
-    for maximum in [1, 2, 3, 5] {
+    for maximum in [1, 2, 3, 5, 4096] {
         let mut input = fixture();
         input.protocol.max_plies = maximum;
         assert!(invoke(input).is_err());

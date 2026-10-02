@@ -71,6 +71,8 @@ pub struct FixtureExecutionFailure {
 /// below artifact_root, preserves every failed attempt's outputs, and never
 /// resumes or overwrites an earlier attempt. Retries require an external owner.
 /// Input files must not be modified in place while this function uses them.
+/// The caller must exclusively manage artifact_root and its directory names;
+/// concurrent root/attempt pathname replacement is outside this fixture API.
 pub fn run_fixture_pair(
     plan: &ArenaPlan,
     artifact_root: &Path,
@@ -119,6 +121,24 @@ fn linux_run(
     }
     let input = plan.manifest().input();
     let pair = &plan.pairs()[0];
+    let preflight_commands = input
+        .engines
+        .iter()
+        .enumerate()
+        .map(|(index, engine)| {
+            (
+                engine.id.clone(),
+                std::path::PathBuf::from(format!("/fixture/engine-{index}")),
+            )
+        })
+        .collect();
+    build_fastchess_invocation(
+        plan,
+        &pair.id,
+        &preflight_commands,
+        Path::new("/fixture/opening.pgn"),
+        Path::new("/fixture/match.pgn"),
+    )?;
     let mut engine_files = Vec::new();
     let mut commands = BTreeMap::new();
     // Preflight the entire immutable input lock, then pin each actual launch file.
@@ -144,13 +164,6 @@ fn linux_run(
         );
         engine_files.push(file);
     }
-    build_fastchess_invocation(
-        plan,
-        &pair.id,
-        &commands,
-        Path::new("/fixture/opening.pgn"),
-        Path::new("/fixture/match.pgn"),
-    )?;
     let opening = opening_pgn(plan, &pair.id)?;
     let unique: BTreeMap<_, _> = plan
         .manifest()
@@ -261,7 +274,11 @@ fn linux_run(
         },
         cancel,
         Some(&ArtifactWatch {
-            relative_files: vec!["opening.pgn".into(), "match.pgn".into()],
+            relative_files: vec![
+                "opening.pgn".into(),
+                "match.pgn".into(),
+                "config.json".into(),
+            ],
             max_total_bytes: watch_cap,
         }),
     )?;
@@ -271,6 +288,32 @@ fn linux_run(
             put("stdout.log", &process.stdout, stream_cap)?,
             put("stderr.log", &process.stderr, stream_cap)?,
         ];
+        let config_bytes = match directory.symlink_metadata("config.json") {
+            Ok(metadata) => {
+                if !metadata.is_file() {
+                    return Err(ArenaError::Integrity(
+                        "runner config is not a regular file".into(),
+                    ));
+                }
+                let mut options = OpenOptions::new();
+                options
+                    .read(true)
+                    .follow(FollowSymlinks::No)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                let file = directory
+                    .open_with("config.json", &options)
+                    .map_err(|_| ArenaError::Io("cannot open runner config".into()))?;
+                let config_cap = watch_cap
+                    .checked_sub(opening.len() as u64)
+                    .ok_or_else(|| ArenaError::Budget("opening exceeds watched budget".into()))?
+                    .min(METADATA_CAP);
+                let text = read_pgn(file.into_std(), config_cap)?;
+                artifacts.push(artifact(output_directory, "config.json", text.as_bytes()));
+                text.len() as u64
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(_) => return Err(ArenaError::Io("cannot inspect runner config".into())),
+        };
         let pgn = match directory.symlink_metadata("match.pgn") {
             Ok(metadata) => {
                 if !metadata.is_file() {
@@ -286,7 +329,28 @@ fn linux_run(
                     let file = directory
                         .open_with("match.pgn", &options)
                         .map_err(|_| ArenaError::Io("cannot open match PGN".into()))?;
-                    read_pgn(file.into_std(), watch_cap.min(crate::MAX_JSON_BYTES as u64))
+                    let opening_metadata =
+                        directory.symlink_metadata("opening.pgn").map_err(|_| {
+                            ArenaError::Integrity(
+                                "opening artifact unavailable after execution".into(),
+                            )
+                        })?;
+                    if !opening_metadata.is_file() || opening_metadata.len() != opening.len() as u64
+                    {
+                        return Err(ArenaError::Integrity(
+                            "opening artifact length or type changed during execution".into(),
+                        ));
+                    }
+                    read_pgn(
+                        file.into_std(),
+                        watch_cap
+                            .checked_sub(opening_metadata.len())
+                            .and_then(|n| n.checked_sub(config_bytes))
+                            .ok_or_else(|| {
+                                ArenaError::Budget("watched output exceeds shared budget".into())
+                            })?
+                            .min(crate::MAX_JSON_BYTES as u64),
+                    )
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

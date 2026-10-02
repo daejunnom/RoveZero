@@ -131,6 +131,13 @@ pub fn build_fastchess_invocation(
     let pair = plan
         .pair(pair_id)
         .ok_or_else(|| invalid("unknown pair ID"))?;
+    // The pinned A-backed PGN auditor bounds full histories to 4095 plies.
+    // Reject before launch rather than producing an unauditable runner result.
+    if input.protocol.max_plies > 4095 {
+        return Err(invalid(
+            "Fastchess fixture full game ply ceiling exceeds the supported PGN audit limit of 4095",
+        ));
+    }
     let prefix_plies = u32::try_from(pair.opening.moves.len())
         .map_err(|_| invalid("opening prefix exceeds Fastchess ply range"))?;
     let searched_plies = input
@@ -273,6 +280,15 @@ pub fn build_fastchess_invocation(
         "-ucinewgame-ms".into(),
         deadline(input.lifecycle.drain_timeout_ms)?.into(),
         "-strict".into(),
+        // This pinned version rejects -debug. On the Linux supervisor path,
+        // the descriptor alias routes its logger into the same bounded stdout
+        // pipe; it creates no separate, unwatched log artifact.
+        "-log".into(),
+        "file=/proc/self/fd/1".into(),
+        "append=true".into(),
+        "level=trace".into(),
+        "realtime=true".into(),
+        "engine=true".into(),
     ]);
     Ok(FastchessInvocation {
         args,
@@ -284,6 +300,7 @@ pub fn build_fastchess_invocation(
             "per-game derived engine seeds are not applied; this profile requires deterministic scripted fixtures and rejects RNG options",
             "opening path bytes are not attested by this pure builder; caller must write the complete A-validated opening_pgn and compare actual PGN/full prefix after execution",
             "process-group child/output/artifact snapshots are observed limits, not kernel resource caps; escaped or transient children require a future cgroup adapter",
+            "raw UCI command/response logs share the bounded Linux stdout pipe with runner reports; concurrent text may interleave and does not prove option application",
         ].map(String::from).to_vec(),
     })
 }
