@@ -29,6 +29,8 @@ pub enum CauseCode {
     WdlExtract,
     OutputValidation,
     ProfileParse,
+    MockCallback,
+    MockLifecycle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -330,13 +332,14 @@ mod tests {
             "model output rejected",
         );
         assert_eq!(
-            base.clone().with_output_cause(&crate::output::OutputError::NonFinite {
-                head: crate::output::Head::Policy,
-                index: 17,
-            })
-            .cause
-            .unwrap()
-            .output,
+            base.clone()
+                .with_output_cause(&crate::output::OutputError::NonFinite {
+                    head: crate::output::Head::Policy,
+                    index: 17,
+                })
+                .cause
+                .unwrap()
+                .output,
             Some(OutputCause::NonFinite {
                 head: OutputHead::Policy,
                 index: 17,

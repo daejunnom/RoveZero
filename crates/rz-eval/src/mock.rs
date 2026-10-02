@@ -194,6 +194,12 @@ impl<K: Clone + Eq> ScriptedBackend<K> {
     pub fn identity_digest(&self) -> [u8; 32] {
         self.digest
     }
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+    pub fn pending_events(&self) -> usize {
+        self.events.len()
+    }
 
     pub fn now(&self) -> Duration {
         self.now

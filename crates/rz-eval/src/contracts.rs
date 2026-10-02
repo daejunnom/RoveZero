@@ -13,6 +13,9 @@ use rz_encoding::{policy, POLICY_SIZE};
 use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
 
+pub use crate::rules_projection::{ClassicalProjection, RulesProjection};
+pub use crate::runtime_bridge::{BridgeDiagnostics, MockTicket, ScriptedRuntimeBackend};
+
 /// Conservative C buffer reservation: encoded input + staging, native/owned raw
 /// heads, legal f32/f64 conversion and Arc allocation, plus small metadata.
 /// Rules snapshots and native session/activation workspace require other budgets.
@@ -132,6 +135,9 @@ impl MaiaBinding {
     }
     pub fn backend(&self) -> Digest {
         self.backend
+    }
+    pub fn history_fill(&self) -> HistoryFill {
+        self.history_fill
     }
 
     /// Projection is supplied by the Rules adapter and must come from
@@ -407,6 +413,15 @@ fn ordered_indices(
     projection: Input<'_>,
     legal: &LegalMoveView,
 ) -> Result<Vec<usize>, ContractError> {
+    ordered_policy_indices(projection, legal.moves())
+}
+
+/// Maps an already Rules-attested ordered array. Geometry is not a legality
+/// oracle; the caller retains the immutable Rules owner and legal view.
+pub fn ordered_policy_indices(
+    projection: Input<'_>,
+    moves: &[Move],
+) -> Result<Vec<usize>, ContractError> {
     let bad = || {
         error(
             ErrorCode::InvalidInput,
@@ -414,14 +429,14 @@ fn ordered_indices(
             "legal view cannot be mapped to selected Maia action space",
         )
     };
-    if legal.moves().is_empty() || legal.moves().len() > POLICY_SIZE {
+    if moves.is_empty() || moves.len() > POLICY_SIZE {
         return Err(bad());
     }
     let kings = projection.history.first().ok_or_else(bad)?.pieces
         [usize::from(projection.black_to_move)][5];
-    let mut result = Vec::with_capacity(legal.moves().len());
+    let mut result = Vec::with_capacity(moves.len());
     let mut seen = [false; POLICY_SIZE];
-    for movement in legal.moves() {
+    for movement in moves {
         let from = policy::canonical_square(movement.from.index(), projection.black_to_move)
             .map_err(|_| bad())?;
         let to = policy::canonical_square(movement.to.index(), projection.black_to_move)

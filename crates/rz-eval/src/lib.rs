@@ -15,6 +15,12 @@ pub mod worker;
 #[cfg(feature = "contracts")]
 pub mod contracts;
 
+#[cfg(feature = "contracts")]
+pub mod rules_projection;
+
+#[cfg(feature = "contracts")]
+pub mod runtime_bridge;
+
 #[cfg(feature = "onnx")]
 pub mod onnx;
 

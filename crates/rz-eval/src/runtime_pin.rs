@@ -55,6 +55,18 @@ impl RuntimeLibraryPin {
         output_root: &Path,
         expected_sha256: &str,
     ) -> Result<Self, BackendError> {
+        Self::copy_with(source, output_root, expected_sha256, |writer, bytes| {
+            writer.write_all(bytes)?;
+            writer.sync_all()
+        })
+    }
+
+    fn copy_with(
+        source: &Path,
+        output_root: &Path,
+        expected_sha256: &str,
+        write: impl FnOnce(&mut File, &[u8]) -> std::io::Result<()>,
+    ) -> Result<Self, BackendError> {
         let expected = asset::parse_sha256(expected_sha256)?;
         let root_metadata = fs::symlink_metadata(output_root)
             .map_err(|_| io_error("runtime output root is unavailable"))?;
@@ -109,12 +121,10 @@ impl RuntimeLibraryPin {
             let mut writer = options
                 .open(&path)
                 .map_err(|_| io_error("cannot create exclusive runtime copy"))?;
-            writer
-                .write_all(&bytes)
-                .map_err(|_| io_error("cannot write verified runtime copy"))?;
-            writer
-                .sync_all()
-                .map_err(|_| io_error("cannot sync verified runtime copy"))?;
+            write(&mut writer, &bytes).map_err(|error| {
+                io_error("cannot write and sync verified runtime copy")
+                    .with_external_cause(crate::error::CauseCode::RuntimePath, &error)
+            })?;
             drop(writer);
             let mut permissions = fs::metadata(&path)
                 .map_err(|_| io_error("runtime copy metadata failed"))?
@@ -177,6 +187,7 @@ impl RuntimeLibraryPin {
         self.0.digest
     }
 
+    #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
     pub(crate) fn path(&self) -> &Path {
         &self.0.path
     }
@@ -184,4 +195,125 @@ impl RuntimeLibraryPin {
 
 fn io_error(detail: &'static str) -> BackendError {
     BackendError::new(K::Io, S::Backend, detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+    const FAKE_LIBRARY: &[u8] = b"fake native bootstrap bytes: no actual ORT execution";
+
+    fn fixture_root() -> (PathBuf, PathBuf) {
+        #[cfg(windows)]
+        let base =
+            PathBuf::from(std::env::var_os("APPDATA").expect("Windows tests require APPDATA"));
+        #[cfg(not(windows))]
+        let base = std::env::var_os("RUNNER_TEMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let base = base.join("RoveZero").join("tmp").join("native-pin-tests");
+        fs::create_dir_all(&base).unwrap();
+        let base = base.canonicalize().unwrap();
+        let root = base.join(format!(
+            "{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("library.fixture");
+        fs::write(&source, FAKE_LIBRARY).unwrap();
+        (root, source)
+    }
+    fn release_copy(pin: RuntimeLibraryPin, root: &Path) {
+        let path = pin.path().to_owned();
+        let directory = path.parent().unwrap().to_owned();
+        assert_eq!(directory.parent().unwrap(), root);
+        drop(pin);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&path, permissions).unwrap();
+        }
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+    fn release_root(root: PathBuf, source: PathBuf) {
+        assert_eq!(source.parent().unwrap(), root);
+        fs::remove_file(source).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn mutable_source_does_not_change_owned_bytes_or_disclose_private_path() {
+        let (root, source) = fixture_root();
+        let digest = asset::sha256(FAKE_LIBRARY);
+        let pin =
+            RuntimeLibraryPin::copy_verified(&source, &root, &asset::hex_sha256(FAKE_LIBRARY))
+                .unwrap();
+        fs::write(&source, b"source was subsequently replaced").unwrap();
+        assert_eq!(asset::sha256(&fs::read(pin.path()).unwrap()), digest);
+        assert_eq!(pin.binary_digest(), digest);
+        let diagnostic = format!("{pin:?}");
+        assert!(!diagnostic.contains(root.to_str().unwrap()));
+        assert!(!diagnostic.contains("library.fixture"));
+        release_copy(pin, &root);
+        release_root(root, source);
+    }
+
+    #[test]
+    fn digest_rejection_and_partial_write_failure_leave_no_copy() {
+        let (root, source) = fixture_root();
+        let failure =
+            RuntimeLibraryPin::copy_verified(&source, &root, &"01".repeat(32)).unwrap_err();
+        assert_eq!(failure.kind, K::IdentityMismatch);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        let failure = RuntimeLibraryPin::copy_with(
+            &source,
+            &root,
+            &asset::hex_sha256(FAKE_LIBRARY),
+            |writer, bytes| {
+                writer.write_all(&bytes[..8])?;
+                Err(std::io::Error::other(
+                    "injected finite partial-write failure",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failure.kind, K::Io);
+        assert!(failure.cause.is_some());
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            1,
+            "only the caller's source remains after failure cleanup"
+        );
+        release_root(root, source);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn live_pin_denies_write_and_delete_sharing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (root, source) = fixture_root();
+        let pin =
+            RuntimeLibraryPin::copy_verified(&source, &root, &asset::hex_sha256(FAKE_LIBRARY))
+                .unwrap();
+        // Clear readonly to test OS sharing rather than just the attribute.
+        let mut permissions = fs::metadata(pin.path()).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(pin.path(), permissions).unwrap();
+        assert!(OpenOptions::new()
+            .write(true)
+            .share_mode(7)
+            .open(pin.path())
+            .is_err());
+        assert!(fs::remove_file(pin.path()).is_err());
+        release_copy(pin, &root);
+        release_root(root, source);
+    }
 }
