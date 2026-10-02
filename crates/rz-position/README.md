@@ -100,17 +100,20 @@ Process deadline 30초, stdout 8 MiB, stderr 64 KiB로 제한한다. 첫 불일�
 보고하고, 원시 trace/log는 외부 output root에 보존한다. Mock/GPU/Elo 증거와는 별도다.
 
 계약 적용 후 CPU Linux/Rust 1.90.0에서 기본 debug 29개 통과(외부 참조·확장 perft
-2개 명시 ignore), `--all-features` 전체 release는 doctest 포함 **41개 통과, 0 실패/ignore**를
-확인했다. 이 중 실제 공통 계약 consumer 검사는 9개다. Fmt와 전체 feature/target Clippy
-`-D warnings`도 통과했다. 별도 PR #7 source checkout의 `cargo test --locked` 6개와
+2개 명시 ignore), `--all-features` 전체 release는 doctest 포함 **42개 통과, 0 실패/ignore**를
+확인했다. 이 중 실제 공통 계약 consumer 검사는 10개다. Fmt와 전체 feature/target Clippy
+`-D warnings`도 통과했다. 별도 PR #7 source checkout의 `cargo test --locked` 20개와
 fmt/Clippy도 같은 CPU/compiler에서 통과했으며 원격 CI 결과로 표현하지 않는다.
 
 ## TASK-A03 공통 계약 0.1 적용
 
 [PR #7](https://github.com/daejunnom/RoveZero/pull/7)의 실제 Rust 계약 revision 0.1을
-검토하고 source `ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8`에 고정했다. 검토 시 Draft/open,
-base `develop@9f0bc598f6b2d8f863fd46af6a4fd73bfef1f0b8`, 미통합이며 해당 head의 원격
-check run과 review는 없었다. 계약 게시·CPU 검사·workspace 통합은 서로 다른 인수다.
+검토하고 source `67284c4f66f7a7ae9f46fa63dfd50e7410eb6845`에 고정했다. 검토 시 Draft/open,
+base `develop@9f0bc598f6b2d8f863fd46af6a4fd73bfef1f0b8`, 미통합이다. 해당 head의
+[CPU CI run 37031938422](https://github.com/daejunnom/RoveZero/actions/runs/37031938422)에서
+Linux/Windows fmt·test·Clippy job 성공을 확인했으며 review와 미해결 review thread는 없었다.
+계약 게시·CPU 검사·workspace 통합은 서로 다른 인수다. 계약의 새 epoch/mate 검증과
+[적용 지시서](https://github.com/daejunnom/RoveZero/blob/67284c4f66f7a7ae9f46fa63dfd50e7410eb6845/docs/CONTRACT-ADOPTION.md)의 A 경계를 함께 확인했다.
 
 `contracts::ContractPosition`은 실제 registry가 발급한 `OwnerId`와 `Position`을
 소유한다. 각 인스턴스·fork·새 게임에는 발급자가 재사용하지 않는 ID를 배정해야 한다.
@@ -143,8 +146,9 @@ semantic digest와 별도다. Export 시 전체 알려진 이력을 hash하므�
 
 `tests/contracts.rs`는 실제 A 상태와 공통 `EvalRequest<RulesState>/EvalOutput`을 연결한다.
 CPU mock의 독립 literal 합법 순서·승격·digest fixture, full history·raw EP·origin 구별,
-make/unmake/drop/thread 수명, state/order 혼용과 위조 순서, claim/terminal, side-to-move WDL,
-game/root/model/encoding/backend 교체·정확한 deadline 경계·취소를 검사한다. 모델/encoding
+캐슬링/앙파상 shared 전이·정확한 delta, make/unmake/drop/thread 수명, state/order 혼용과
+위조 순서, claim/terminal, side-to-move WDL, game/root/model/encoding/backend 교체·
+request/clock/execution epoch 불일치·정확한 deadline 경계·취소를 검사한다. 모델/encoding
 manifest·input key·clock은 명시 mock이며 실제 C mapping이나 D scheduler를 인수한 것은 아니다.
 
 총괄 workspace 인수에서는 pinned Git 의존성을 `path = "../rz-contracts"`로 바꾸고

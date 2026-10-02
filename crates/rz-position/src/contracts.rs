@@ -27,7 +27,7 @@ use rz_contracts as shared;
 use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
 
-pub const CONTRACT_SOURCE_REVISION: &str = "ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8";
+pub const CONTRACT_SOURCE_REVISION: &str = "67284c4f66f7a7ae9f46fa63dfd50e7410eb6845";
 
 /// SHA-256 input profile. Changing any field requires a new profile identifier.
 /// The framed fields below are bytes with u64 little-endian lengths, not a wire

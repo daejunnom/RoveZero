@@ -164,7 +164,7 @@ fn canonical_profile_state_and_legal_order_match_independent_sha256_goldens() {
     // No Rust digest or Rules history traversal generated these expected bytes.
     assert_eq!(
         rz_position::contracts::CONTRACT_SOURCE_REVISION,
-        "ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8"
+        "67284c4f66f7a7ae9f46fa63dfd50e7410eb6845"
     );
     assert_digest(
         rz_position::contracts::profile_digest(),
@@ -464,10 +464,23 @@ fn mismatched_state_and_order_are_rejected_before_evaluation_or_move_mutation() 
     wrong_context = context(&a, &model);
     wrong_context.legal_order = shared::LegalOrderIdentity(digest(201));
     assert_eq!(
-        build_request(&a, a.legal_moves().clone(), wrong_context, model)
+        build_request(&a, a.legal_moves().clone(), wrong_context, model.clone())
             .unwrap_err()
             .code,
         shared::ErrorCode::IdentityMismatch
+    );
+    // Request and selection agree with each other, but the deadline clock is
+    // still CLOCK. Cross-process ticks must never enter a valid request.
+    wrong_context = context(&a, &model);
+    wrong_context.request.epoch = shared::ProcessEpoch(82);
+    wrong_context.selection.epoch = shared::ProcessEpoch(82);
+    let error = build_request(&a, a.legal_moves().clone(), wrong_context, model).unwrap_err();
+    assert_eq!(
+        (error.code, error.stage),
+        (
+            shared::ErrorCode::IdentityMismatch,
+            shared::Stage::Admission
+        )
     );
 
     let request = request(&a).unwrap();
@@ -643,6 +656,17 @@ fn black_viewpoint_stale_generations_deadline_and_cancel_are_checked_at_output()
         .validate_for(&request, scope(&request), CLOCK, shared::MonotonicTick(99))
         .unwrap();
 
+    let mut foreign_execution = output(&request);
+    foreign_execution.actual.execution =
+        Some(shared::ExecutionId::new(shared::ProcessEpoch(82), 1));
+    let error = foreign_execution
+        .validate_for(&request, scope(&request), CLOCK, shared::MonotonicTick(99))
+        .unwrap_err();
+    assert_eq!(
+        (error.code, error.stage),
+        (shared::ErrorCode::IdentityMismatch, shared::Stage::Output)
+    );
+
     for kind in 0..5 {
         let mut stale = scope(&request);
         match kind {
@@ -756,5 +780,144 @@ fn operational_and_malformed_input_failures_preserve_owned_state() {
         );
         assert!(position.position().matches_snapshot(&before));
         assert!(position.position().snapshot().same_state(&before));
+    }
+}
+
+#[test]
+fn shared_castling_and_en_passant_moves_have_exact_deltas_and_restore() {
+    use rz_position::{Color, Piece, PieceChange, PieceKind, RuleMoveKind, Square};
+    use Color::{Black, White};
+    use PieceKind::{King, Pawn, Rook};
+
+    struct Fixture {
+        fen: &'static str,
+        uci: &'static str,
+        child_fen: &'static str,
+        castling: bool,
+        removals: &'static [(u8, Color, PieceKind)],
+        additions: &'static [(u8, Color, PieceKind)],
+    }
+    fn changes(entries: &[(u8, Color, PieceKind)]) -> Vec<PieceChange> {
+        entries
+            .iter()
+            .map(|&(square, color, kind)| PieceChange {
+                square: Square::new(square).unwrap(),
+                piece: Piece { color, kind },
+            })
+            .collect()
+    }
+    // Literal independent successor FENs and rank-major square changes. These
+    // expected deltas do not come from applying/reversing another Rules move.
+    let cases = [
+        Fixture {
+            fen: "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+            uci: "e1g1",
+            child_fen: "r3k2r/8/8/8/8/8/8/R4RK1 b kq - 1 1",
+            castling: true,
+            removals: &[(4, White, King), (7, White, Rook)],
+            additions: &[(5, White, Rook), (6, White, King)],
+        },
+        Fixture {
+            fen: "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1",
+            uci: "e8c8",
+            child_fen: "2kr3r/8/8/8/8/8/8/R3K2R w KQ - 1 2",
+            castling: true,
+            removals: &[(56, Black, Rook), (60, Black, King)],
+            additions: &[(58, Black, King), (59, Black, Rook)],
+        },
+        Fixture {
+            fen: "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2",
+            uci: "e5d6",
+            child_fen: "4k3/8/3P4/8/8/8/8/4K3 b - - 0 2",
+            castling: false,
+            removals: &[(35, Black, Pawn), (36, White, Pawn)],
+            additions: &[(43, White, Pawn)],
+        },
+        Fixture {
+            fen: "4k3/8/8/8/3Pp3/8/8/4K3 b - d3 0 2",
+            uci: "e4d3",
+            child_fen: "4k3/8/8/8/8/3p4/8/4K3 w - - 0 3",
+            castling: false,
+            removals: &[(27, White, Pawn), (28, Black, Pawn)],
+            additions: &[(19, Black, Pawn)],
+        },
+    ];
+    for (index, fixture) in cases.into_iter().enumerate() {
+        let mut position = imported(190 + index as u64, fixture.fen);
+        let before = position.export().unwrap();
+        let frozen_request = request(&before).unwrap();
+        let mv = shared_move(fixture.uci);
+        assert!(before.legal_moves().moves().contains(&mv));
+        let token = position.make_from_view(&before, mv).unwrap();
+        let delta = token.delta();
+        assert_eq!(
+            position.position().to_fen(),
+            fixture.child_fen,
+            "{}",
+            fixture.uci
+        );
+        assert_eq!(delta.mv.to_string(), fixture.uci);
+        assert_eq!(
+            delta.kind,
+            RuleMoveKind {
+                capture: !fixture.castling,
+                castling: fixture.castling,
+                en_passant: !fixture.castling,
+                promotion: false,
+            }
+        );
+        assert_eq!(
+            delta.removals,
+            changes(fixture.removals),
+            "{} removals",
+            fixture.uci
+        );
+        assert_eq!(
+            delta.additions,
+            changes(fixture.additions),
+            "{} additions",
+            fixture.uci
+        );
+        assert!(delta.before.same_state(before.rules().snapshot()));
+        assert_eq!(delta.after.to_fen(), fixture.child_fen);
+        let child = position.export().unwrap();
+        assert!(delta.after.same_state(child.rules().snapshot()));
+        assert_eq!(
+            child.snapshot().identity().owner,
+            before.snapshot().identity().owner
+        );
+        assert_ne!(
+            child.snapshot().identity().semantic,
+            before.snapshot().identity().semantic
+        );
+        assert_eq!(
+            frozen_request.position().state().snapshot().to_fen(),
+            fixture.fen
+        );
+        output(&frozen_request)
+            .validate_for(
+                &frozen_request,
+                scope(&frozen_request),
+                CLOCK,
+                shared::MonotonicTick(99),
+            )
+            .unwrap();
+        position.unmake(token).unwrap();
+        let restored = position.export().unwrap();
+        assert_eq!(position.position().to_fen(), fixture.fen);
+        assert!(restored
+            .rules()
+            .snapshot()
+            .same_state(before.rules().snapshot()));
+        assert_eq!(
+            restored.snapshot().identity().semantic,
+            before.snapshot().identity().semantic
+        );
+        assert_eq!(
+            restored.snapshot().identity().owner,
+            before.snapshot().identity().owner
+        );
+        assert!(restored.snapshot().identity().revision > child.snapshot().identity().revision);
+        assert_eq!(restored.legal_moves().moves(), before.legal_moves().moves());
     }
 }
