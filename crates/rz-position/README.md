@@ -100,7 +100,8 @@ Process deadline 30초, stdout 8 MiB, stderr 64 KiB로 제한한다. 첫 불일�
 owner/revision 검증 및 cross-thread 수명을 제공한다. `BoardMove`는 A의 concrete
 좌표 입력이며 shared Move ABI가 아니다. Shared ID/error/request/result 선언은 복제하지 않았다.
 
-현재 `rz-contracts` Rust revision과 소비자 코드가 없으므로 아래 연결은 미실행이다.
+총괄의 `rz-contracts` Rust revision이 아직 게시되지 않아 아래 통합 연결은 미실행이다.
+다른 담당의 WIP는 별도 PR로 개발되며, 실제 통합은 같은 공통 revision을 기준으로 인수한다.
 
 1. 총괄의 primitive·handle·공통 오류를 이 concrete state/view에 adapter로 연결한다.
    필요 공통 타입 재배치는 총괄 revision으로 수행하고 이 local API를 frozen ABI로 취급하지 않는다.
