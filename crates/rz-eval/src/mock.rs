@@ -7,6 +7,7 @@
 //! never removes a scheduled physical completion.
 
 use crate::RawOutput;
+use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
 use std::fmt;
 use std::time::Duration;
@@ -119,6 +120,7 @@ struct Active<K> {
 #[derive(Debug)]
 pub struct ScriptedBackend<K> {
     identity: ScriptIdentity,
+    digest: [u8; 32],
     limits: Limits,
     steps: VecDeque<Step>,
     active: Vec<Active<K>>,
@@ -169,8 +171,10 @@ impl<K: Clone + Eq> ScriptedBackend<K> {
                 }
             }
         }
+        let digest = script_digest(&identity, &steps);
         Ok(Self {
             identity,
+            digest,
             limits,
             steps: steps.into(),
             active: Vec::new(),
@@ -183,6 +187,12 @@ impl<K: Clone + Eq> ScriptedBackend<K> {
 
     pub fn identity(&self) -> &ScriptIdentity {
         &self.identity
+    }
+
+    /// Actual ordered script receipt, including delays, injected errors and raw
+    /// float bits. Name/seed annotations alone never identify an execution plan.
+    pub fn identity_digest(&self) -> [u8; 32] {
+        self.digest
     }
 
     pub fn now(&self) -> Duration {
@@ -336,4 +346,47 @@ impl<K: Clone + Eq> ScriptedBackend<K> {
             },
         });
     }
+}
+
+fn script_digest(identity: &ScriptIdentity, steps: &[Step]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"rz-scripted-backend/1\0");
+    hash.update((identity.name.len() as u64).to_le_bytes());
+    hash.update(identity.name.as_bytes());
+    hash.update(identity.seed.to_le_bytes());
+    hash.update((steps.len() as u64).to_le_bytes());
+    let duration = |hash: &mut Sha256, value: Duration| {
+        hash.update(value.as_secs().to_le_bytes());
+        hash.update(value.subsec_nanos().to_le_bytes());
+    };
+    for step in steps {
+        hash.update((step.callbacks.len() as u64).to_le_bytes());
+        for callback in &step.callbacks {
+            duration(&mut hash, callback.after);
+            match &callback.reply {
+                Ok(raw) => {
+                    hash.update([0]);
+                    for values in [&raw.policy_logits, &raw.wdl] {
+                        hash.update((values.len() as u64).to_le_bytes());
+                        for value in values {
+                            hash.update(value.to_bits().to_le_bytes());
+                        }
+                    }
+                }
+                Err(error) => {
+                    hash.update([1]);
+                    for text in [&error.code, &error.stage] {
+                        hash.update((text.len() as u64).to_le_bytes());
+                        hash.update(text.as_bytes());
+                    }
+                }
+            }
+        }
+        duration(&mut hash, step.device_complete_after);
+        hash.update([u8::from(step.cancel_ack_after.is_some())]);
+        if let Some(delay) = step.cancel_ack_after {
+            duration(&mut hash, delay);
+        }
+    }
+    hash.finalize().into()
 }

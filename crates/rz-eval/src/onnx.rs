@@ -6,7 +6,8 @@
 //! logical cancellation cannot release those leases or terminate native work.
 
 use crate::asset::{self, MaiaAsset, INPUT_NAME, POLICY_NAME, WDL_NAME};
-use crate::error::{BackendError, FailureKind as K, FailureStage as S};
+use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
+use crate::runtime_pin::RuntimeLibraryPin;
 use crate::{output, RawOutput};
 use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider};
 use ort::session::{builder::GraphOptimizationLevel, Session};
@@ -24,31 +25,47 @@ pub const IO_BYTES_PER_ITEM: usize = (INPUT_VALUES + 2 * (POLICY_SIZE + 3)) * 4;
 
 #[derive(Clone, Debug)]
 pub struct OrtRuntime {
-    path: PathBuf,
-    binary_digest: [u8; 32],
+    pin: RuntimeLibraryPin,
     build_info: String,
 }
 
-static RUNTIME: Mutex<Option<Result<OrtRuntime, BackendError>>> = Mutex::new(None);
+struct RuntimeLatch {
+    // ORT may retain the native library even if later initialization fails.
+    // Preserve its bootstrap capability on both success and latched failure.
+    pin: RuntimeLibraryPin,
+    result: Result<OrtRuntime, BackendError>,
+}
+
+static RUNTIME: Mutex<Option<RuntimeLatch>> = Mutex::new(None);
 
 impl OrtRuntime {
     /// Bootstrap must be the sole initializer of the process-global `ort`
     /// library. Refuse prior initialization, path changes and failed retries.
-    /// Only load trusted native libraries; a hash is identity, not a sandbox.
-    pub fn load(path: &Path, expected_sha256: &str) -> Result<Self, BackendError> {
+    /// Requires the bootstrap-owned, verified and durably pinned copy. Mutable
+    /// caller paths cannot authorize native loading. Sibling libraries are not
+    /// copied or downloaded; missing native dependencies are an explicit error.
+    /// A hash is identity, not a sandbox for executing native code.
+    pub fn load(pin: &RuntimeLibraryPin) -> Result<Self, BackendError> {
         let unavailable = || {
             BackendError::new(
                 K::BackendUnavailable,
                 S::Backend,
-                "ORT initialization failed",
+                "ORT initialization failed; native dependencies must be provided explicitly",
             )
         };
-        let path = path.canonicalize().map_err(|_| unavailable())?;
-        let expected = asset::parse_sha256(expected_sha256)?;
-        let mut guard = RUNTIME.lock().map_err(|_| unavailable())?;
-        if let Some(result) = guard.as_ref() {
-            let runtime = result.as_ref().map_err(|error| *error)?;
-            return if runtime.path == path && runtime.binary_digest == expected {
+        let mut guard = RUNTIME.lock().map_err(|error| {
+            unavailable().with_external_cause(CauseCode::RuntimeInitialize, &error)
+        })?;
+        if let Some(latch) = guard.as_ref() {
+            if latch.pin.path() != pin.path() || latch.pin.binary_digest() != pin.binary_digest() {
+                return Err(BackendError::new(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "ORT library is process-global and already pinned",
+                ));
+            }
+            let runtime = latch.result.as_ref().map_err(|error| *error)?;
+            return if runtime.pin.binary_digest() == pin.binary_digest() {
                 Ok(runtime.clone())
             } else {
                 Err(BackendError::new(
@@ -58,23 +75,16 @@ impl OrtRuntime {
                 ))
             };
         }
-        let bytes = asset::read_bounded(&path, 512 * 1024 * 1024)?;
-        if asset::sha256(&bytes) != expected {
-            return Err(BackendError::new(
-                K::IdentityMismatch,
-                S::Backend,
-                "ORT library digest differs",
-            ));
-        }
-        drop(bytes);
-        let path_text = path.to_str().ok_or_else(unavailable)?;
+        let path_text = pin.path().to_str().ok_or_else(unavailable)?;
         // ort rc.10 panics on dlopen / API-version failure; translate that narrow
         // bootstrap boundary and latch failure. Native crashes are not recoverable.
         let result = std::panic::catch_unwind(|| {
             if !ort::init_from(path_text)
                 .with_name("RoveZero-C")
                 .commit()
-                .map_err(|_| unavailable())?
+                .map_err(|error| {
+                    unavailable().with_external_cause(CauseCode::RuntimeInitialize, &error)
+                })?
             {
                 return Err(BackendError::new(
                     K::IdentityMismatch,
@@ -91,18 +101,30 @@ impl OrtRuntime {
                 ));
             }
             Ok(Self {
-                path: path.clone(),
-                binary_digest: expected,
+                pin: pin.clone(),
                 build_info: info.to_owned(),
             })
         })
-        .unwrap_or_else(|_| Err(unavailable()));
-        *guard = Some(result.clone());
+        .unwrap_or_else(|payload| {
+            let cause = CauseCode::RuntimePanic;
+            let error = if let Some(message) = payload.downcast_ref::<&str>() {
+                unavailable().with_external_cause(cause, message)
+            } else if let Some(message) = payload.downcast_ref::<String>() {
+                unavailable().with_external_cause(cause, message)
+            } else {
+                unavailable().with_external_cause(cause, &"non-string native initialization panic")
+            };
+            Err(error)
+        });
+        *guard = Some(RuntimeLatch {
+            pin: pin.clone(),
+            result: result.clone(),
+        });
         result
     }
 
     pub fn binary_digest(&self) -> [u8; 32] {
-        self.binary_digest
+        self.pin.binary_digest()
     }
     pub fn build_info(&self) -> &str {
         &self.build_info
@@ -192,29 +214,30 @@ impl OnnxBackend {
         config: BackendConfig,
     ) -> Result<Self, BackendError> {
         config.validate()?;
-        let setup_error = |_| {
+        let setup_error = |code, error: ort::Error| {
             BackendError::new(
                 K::BackendUnavailable,
                 S::Backend,
                 "ORT session/provider setup failed",
             )
+            .with_external_cause(code, &error)
         };
         let mut builder = Session::builder()
-            .map_err(setup_error)?
+            .map_err(|error| setup_error(CauseCode::SessionBuilder, error))?
             .with_no_environment_execution_providers()
-            .map_err(setup_error)?
+            .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?
             .with_intra_threads(config.intra_threads)
-            .map_err(setup_error)?
+            .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?
             .with_inter_threads(1)
-            .map_err(setup_error)?
+            .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?
             .with_parallel_execution(false)
-            .map_err(setup_error)?
+            .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?
             .with_memory_pattern(false)
-            .map_err(setup_error)?
+            .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?
             .with_intra_op_spinning(false)
-            .map_err(setup_error)?
+            .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?
             .with_optimization_level(GraphOptimizationLevel::Level1)
-            .map_err(setup_error)?;
+            .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?;
         match config.provider {
             Provider::Cpu => {
                 builder = builder
@@ -222,14 +245,17 @@ impl OnnxBackend {
                         .with_arena_allocator(false)
                         .build()
                         .error_on_failure()])
-                    .map_err(setup_error)?;
+                    .map_err(|error| setup_error(CauseCode::ProviderRegistration, error))?;
             }
             Provider::Cuda {
                 device_id,
                 arena_bytes,
             } => {
                 let cuda = CUDAExecutionProvider::default();
-                if !cuda.is_available().map_err(setup_error)? {
+                if !cuda
+                    .is_available()
+                    .map_err(|error| setup_error(CauseCode::ProviderQuery, error))?
+                {
                     return Err(BackendError::new(
                         K::BackendUnavailable,
                         S::Backend,
@@ -238,7 +264,7 @@ impl OnnxBackend {
                 }
                 builder = builder
                     .with_config_entry("session.disable_cpu_ep_fallback", "1")
-                    .map_err(setup_error)?
+                    .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?
                     .with_execution_providers([cuda
                         .with_device_id(device_id)
                         .with_memory_limit(arena_bytes)
@@ -246,25 +272,28 @@ impl OnnxBackend {
                         .with_conv_max_workspace(false)
                         .build()
                         .error_on_failure()])
-                    .map_err(setup_error)?;
+                    .map_err(|error| setup_error(CauseCode::ProviderRegistration, error))?;
             }
         }
         if let Some(prefix) = &config.profiling_prefix {
-            builder = builder.with_profiling(prefix).map_err(setup_error)?;
+            builder = builder
+                .with_profiling(prefix)
+                .map_err(|error| setup_error(CauseCode::ProfilingStart, error))?;
         }
         let session = builder
             .commit_from_memory(asset.onnx_bytes())
-            .map_err(|_| {
+            .map_err(|error| {
                 BackendError::new(
                     K::BackendUnavailable,
                     S::Backend,
                     "ORT could not load the verified model with the requested provider",
                 )
+                .with_external_cause(CauseCode::ModelLoad, &error)
             })?;
         validate_interface(&session)?;
         // This is a versioned C backend identity, not a new global wire codec.
         let profile = format!("rz-maia-ort-v1;ort=1.22.0;wrapper=2.0.0-rc.10;runtime={:?};asset={:?};provider={:?};threads={};batch={};fp32;tf32=0;opt=1;sync;full=1;temp=1;sum=1e-5",
-            runtime.binary_digest, asset.manifest_digest(), config.provider, config.intra_threads, config.max_batch);
+            runtime.binary_digest(), asset.manifest_digest(), config.provider, config.intra_threads, config.max_batch);
         let mut result = Self {
             session,
             config,
@@ -276,7 +305,10 @@ impl OnnxBackend {
             // A registered provider alone proves nothing. Synchronous physical
             // execution plus ORT kernel placement is required before returning.
             result.run_values(&[&vec![0.0; INPUT_VALUES]])?;
-            let path = result.session.end_profiling().map_err(setup_error)?;
+            let path = result
+                .session
+                .end_profiling()
+                .map_err(|error| setup_error(CauseCode::ProfilingFinish, error))?;
             let bytes = asset::read_bounded(Path::new(&path), 4 * 1024 * 1024)?;
             let executed_cuda_nodes = verify_cuda_profile(&bytes)?;
             result.cuda_evidence = Some(CudaEvidence {
@@ -338,22 +370,24 @@ impl OnnxBackend {
         let mut dense = Vec::new();
         dense
             .try_reserve_exact(inputs.len() * INPUT_VALUES)
-            .map_err(|_| {
+            .map_err(|error| {
                 BackendError::new(
                     K::ResourceExhausted,
                     S::Admission,
                     "input staging allocation failed",
                 )
+                .with_external_cause(CauseCode::InputAllocation, &error)
             })?;
         for input in inputs {
             dense.extend_from_slice(input);
         }
-        let input = Tensor::from_array(([inputs.len(), 112, 8, 8], dense)).map_err(|_| {
+        let input = Tensor::from_array(([inputs.len(), 112, 8, 8], dense)).map_err(|error| {
             BackendError::new(
                 K::BackendFailure,
                 S::Backend,
                 "cannot create ORT input tensor",
             )
+            .with_external_cause(CauseCode::TensorCreate, &error)
         })?;
         // No RunOptions enabling asynchronous EP execution or terminate-on-cancel.
         // On both success and error ORT's default synchronous Run has returned
@@ -361,8 +395,9 @@ impl OnnxBackend {
         let outputs = self
             .session
             .run(ort::inputs![INPUT_NAME => input])
-            .map_err(|_| {
+            .map_err(|error| {
                 BackendError::new(K::BackendFailure, S::Backend, "synchronous ORT Run failed")
+                    .with_external_cause(CauseCode::OrtRun, &error)
             })?;
         let malformed = || {
             BackendError::new(
@@ -375,12 +410,12 @@ impl OnnxBackend {
             .get(POLICY_NAME)
             .ok_or_else(malformed)?
             .try_extract_tensor::<f32>()
-            .map_err(|_| malformed())?;
+            .map_err(|error| malformed().with_external_cause(CauseCode::PolicyExtract, &error))?;
         let (wdl_shape, wdl) = outputs
             .get(WDL_NAME)
             .ok_or_else(malformed)?
             .try_extract_tensor::<f32>()
-            .map_err(|_| malformed())?;
+            .map_err(|error| malformed().with_external_cause(CauseCode::WdlExtract, &error))?;
         if policy_shape.as_ref() != [inputs.len() as i64, POLICY_SIZE as i64]
             || wdl_shape.as_ref() != [inputs.len() as i64, 3]
         {
@@ -393,12 +428,13 @@ impl OnnxBackend {
                 wdl: wdl.to_vec(),
             };
             // Validate every raw element and WDL, before a legal view is attached.
-            output::validate_maia(&raw, &[0]).map_err(|_| {
+            output::validate_maia(&raw, &[0]).map_err(|error| {
                 BackendError::new(
                     K::NumericalFailure,
                     S::Output,
                     "nonfinite or inadmissible model output",
                 )
+                .with_output_cause(&error)
             })?;
             result.push(raw);
         }
@@ -445,18 +481,38 @@ pub fn verify_cuda_profile(bytes: &[u8]) -> Result<usize, BackendError> {
     if bytes.len() > 4 * 1024 * 1024 {
         return Err(fail());
     }
-    let events: Vec<serde_json::Value> = serde_json::from_slice(bytes).map_err(|_| fail())?;
+    let events: Vec<serde_json::Value> = serde_json::from_slice(bytes)
+        .map_err(|error| fail().with_external_cause(CauseCode::ProfileParse, &error))?;
     let mut count = 0;
     for event in events {
         if event.get("cat").and_then(|v| v.as_str()) != Some("Node") {
             continue;
         }
-        if let Some(provider) = event.pointer("/args/provider").and_then(|v| v.as_str()) {
-            if provider != "CUDAExecutionProvider" {
-                return Err(fail());
+        let name = event
+            .get("name")
+            .and_then(|value| value.as_str())
+            .ok_or_else(fail)?;
+        if name.ends_with("_fence_before") || name.ends_with("_fence_after") {
+            // ORT fence records are synchronization metadata, not node kernels.
+            // They need not identify an EP, but a supplied EP must still be CUDA.
+            if let Some(provider) = event.pointer("/args/provider") {
+                if provider.as_str() != Some("CUDAExecutionProvider") {
+                    return Err(fail());
+                }
             }
-            count += 1;
+            continue;
         }
+        // Unknown Node records cannot be silently excluded from placement proof.
+        // Actual kernel events require an explicit, correctly typed CUDA EP.
+        if !name.ends_with("_kernel_time")
+            || event
+                .pointer("/args/provider")
+                .and_then(|value| value.as_str())
+                != Some("CUDAExecutionProvider")
+        {
+            return Err(fail());
+        }
+        count += 1;
     }
     if count == 0 {
         return Err(fail());

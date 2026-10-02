@@ -9,6 +9,7 @@ pub mod asset;
 pub mod error;
 pub mod mock;
 pub mod output;
+pub mod runtime_pin;
 
 #[cfg(feature = "onnx")]
 pub mod onnx;

@@ -7,17 +7,69 @@ fn provider_registration_or_mixed_execution_does_not_prove_cuda_execution() {
     for profile in [
         r#"[]"#,
         r#"[{"cat":"Session","args":{"provider":"CUDAExecutionProvider"}}]"#,
-        r#"[{"cat":"Node","args":{"provider":"CPUExecutionProvider"}}]"#,
-        r#"[{"cat":"Node","args":{"provider":"CUDAExecutionProvider"}},{"cat":"Node","args":{"provider":"CPUExecutionProvider"}}]"#,
+        r#"[{"cat":"Node","name":"conv_kernel_time","args":{"provider":"CPUExecutionProvider"}}]"#,
+        r#"[{"cat":"Node","name":"conv_kernel_time","args":{"provider":"CUDAExecutionProvider"}},{"cat":"Node","name":"policy_kernel_time","args":{"provider":"CPUExecutionProvider"}}]"#,
         "invalid json",
     ] {
         assert!(verify_cuda_profile(profile.as_bytes()).is_err());
     }
     assert_eq!(
-        verify_cuda_profile(br#"[{"cat":"Node","args":{"provider":"CUDAExecutionProvider"}}]"#)
-            .unwrap(),
+        verify_cuda_profile(
+            br#"[{"cat":"Node","name":"conv_kernel_time","args":{"provider":"CUDAExecutionProvider"}}]"#
+        )
+        .unwrap(),
         1
     );
+}
+
+#[test]
+fn real_kernel_placement_cannot_be_missing_malformed_or_unknown() {
+    let known = serde_json::json!({
+        "cat": "Node",
+        "name": "conv_kernel_time",
+        "args": {"provider": "CUDAExecutionProvider"},
+    });
+    for unknown in [
+        serde_json::json!({"cat": "Node", "name": "value_kernel_time"}),
+        serde_json::json!({"cat": "Node", "name": "value_kernel_time", "args": {}}),
+        serde_json::json!({"cat": "Node", "name": "value_kernel_time", "args": {"provider": null}}),
+        serde_json::json!({"cat": "Node", "name": "value_kernel_time", "args": {"provider": 17}}),
+        serde_json::json!({"cat": "Node", "name": "value_kernel_time", "args": {"provider": "UnknownExecutionProvider"}}),
+        serde_json::json!({"cat": "Node", "args": {"provider": "CUDAExecutionProvider"}}),
+        serde_json::json!({"cat": "Node", "name": "unknown_event", "args": {"provider": "CUDAExecutionProvider"}}),
+    ] {
+        // One valid kernel must not hide an unaccounted sibling's placement.
+        let profile = serde_json::to_vec(&vec![known.clone(), unknown]).unwrap();
+        assert!(verify_cuda_profile(&profile).is_err());
+    }
+}
+
+#[test]
+fn known_fences_are_metadata_and_never_count_as_executed_kernels() {
+    let profile = br#"[
+        {"cat":"Session","name":"model_run"},
+        {"cat":"Node","name":"conv_fence_before","args":{}},
+        {"cat":"Node","name":"conv_kernel_time","args":{"provider":"CUDAExecutionProvider"}},
+        {"cat":"Node","name":"conv_fence_after","args":{}},
+        {"cat":"Node","name":"policy_kernel_time","args":{"provider":"CUDAExecutionProvider"}}
+    ]"#;
+    assert_eq!(verify_cuda_profile(profile).unwrap(), 2);
+    assert!(verify_cuda_profile(
+        br#"[{"cat":"Node","name":"conv_fence_before"},{"cat":"Node","name":"conv_fence_after"}]"#
+    )
+    .is_err());
+    for provider in [
+        serde_json::json!(null),
+        serde_json::json!(false),
+        serde_json::json!("CPUExecutionProvider"),
+    ] {
+        let profile = serde_json::to_vec(&serde_json::json!([
+            {"cat":"Node","name":"conv_kernel_time","args":{"provider":"CUDAExecutionProvider"}},
+            {"cat":"Node","name":"conv_fence_after","args":{"provider":provider}}
+        ]))
+        .unwrap();
+        assert!(verify_cuda_profile(&profile).is_err());
+    }
 }
 
 #[test]
