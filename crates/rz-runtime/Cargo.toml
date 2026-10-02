@@ -1,0 +1,18 @@
+[package]
+name = "rz-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Bounded, single-owner evaluation scheduling for RoveZero"
+
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rz-telemetry.workspace = true
+rz-contracts = { workspace = true, optional = true }
+
+[features]
+default = []
+contracts = ["dep:rz-contracts"]

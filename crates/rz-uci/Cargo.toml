@@ -1,0 +1,18 @@
+[package]
+name = "rz-uci"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "RoveZero UCI parser and injected session control boundary"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rz-search.workspace = true
+rz-contracts.workspace = true
+rz-position = { workspace = true, features = ["contracts"] }
+rz-runtime = { workspace = true, features = ["contracts"] }
+rz-eval = { workspace = true, features = ["contracts"] }
+rz-encoding.workspace = true

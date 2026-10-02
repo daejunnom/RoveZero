@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "game_id": "fixture-game-1",
+      "opening_family_id": "fixture-opening-1",
+      "lineage_id": "fixture-lineage-1",
+      "seed_group_id": "fixture-seed-group-1"
+    }
+  ]
+}

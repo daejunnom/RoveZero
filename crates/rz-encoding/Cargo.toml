@@ -1,0 +1,10 @@
+[package]
+name = "rz-encoding"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "RoveZero Maia model input and policy encoding"
+publish = false
+
+[lib]
+path = "src/lib.rs"

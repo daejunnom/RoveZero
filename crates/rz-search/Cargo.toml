@@ -1,0 +1,10 @@
+[package]
+name = "rz-search"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "RoveZero deterministic PUCT accounting and time control"
+
+[dependencies]
+rz-contracts.workspace = true

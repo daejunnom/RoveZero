@@ -1,10 +1,14 @@
 [workspace]
-members = ["crates/rz-contracts"]
+members = [
+    "crates/rz-contracts", "crates/rz-position", "crates/rz-search", "crates/rz-uci",
+    "crates/rz-encoding", "crates/rz-eval", "crates/rz-runtime", "crates/rz-telemetry",
+    "crates/rz-experiments", "crates/rz-arena",
+]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.90"
 license = "MIT"
 version = "0.1.0"
 
@@ -13,3 +17,22 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "warn"
+
+[workspace.dependencies]
+rz-contracts = { path = "crates/rz-contracts", version = "0.1.0" }
+rz-position = { path = "crates/rz-position", version = "0.1.0" }
+rz-search = { path = "crates/rz-search", version = "0.1.0" }
+rz-runtime = { path = "crates/rz-runtime", version = "0.1.0" }
+rz-telemetry = { path = "crates/rz-telemetry", version = "0.1.0" }
+rz-eval = { path = "crates/rz-eval", version = "0.1.0" }
+rz-encoding = { path = "crates/rz-encoding", version = "0.1.0" }
+rz-experiments = { path = "crates/rz-experiments", version = "0.1.0" }
+sha2 = "=0.10.9"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+flate2 = "=1.1.2"
+libc = "=0.2.177"
+cap-std = "=4.0.3"
+cap-fs-ext = "=4.0.3"
+signal-hook = "=0.3.18"
+nix = { version = "=0.30.1", features = ["fs", "signal", "process"] }

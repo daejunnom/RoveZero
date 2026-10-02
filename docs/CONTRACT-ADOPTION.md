@@ -20,8 +20,10 @@ search tree, scheduler, encoder tensor, GPU stream·provider를 역으로 의존
 공통 crate를 추가한 사실이나 crate 자체 검사의 성공은 A~F와의 실제 연결 성공이 아니다.
 루트 workspace와 CPU CI의 게시·dispatch·관측 결과도 각각 분리해 기록한다.
 
-이 문서는 consumer의 적용 지시서다. 아래 조사 snapshot의 PR은 공통 계약과 아직
-연결되지 않았고, 이 문서 작성으로 consumer compile/test·신경망·GPU·대국 인수가
+이 문서는 consumer의 적용 지시서다. 아래 source pin은 각 담당 PR의 독립 WIP를
+관찰한 자료이며 현재 총괄 integration 변경과 구분한다. 공통 계약은 PR #7로 병합됐고
+총괄은 PR #9에서 실제 source adapter·workspace를 수동으로 연결 중이다.
+문서 작성·source 반입으로 consumer compile/test·신경망·GPU·대국 인수가
 완료된 것으로 표시하지 않는다. 실제 공통 API는 `crates/rz-contracts/src/`의 게시된
 동일 SHA를 기준으로 사용하고 의미가 같은 로컬 이름을 자동으로 같은 타입으로 보지 않는다.
 
@@ -56,24 +58,31 @@ C/D adapter는 원래 backend code/stage·실제 실행 상태·추가 복구 �
 
 ## 2. 조사한 PR과 연결 책임
 
-2026-10-03 조사에서 아래 A~F PR은 `develop` 대상의 OPEN/Draft였고,
-base는 `9f0bc598f6b2d8f863fd46af6a4fd73bfef1f0b8`이었다. E의 #8은 조사 중 새로 게시됐다.
-일반 코멘트·리뷰·checks의 부재는 검사를 통과했다는 뜻이 아니다. 표는 조사 중 전진한
-후속 head의 공개 source를 다시 읽은 snapshot이다.
-표의 head는 이후 push로 바뀔 수 있다.
+초기 2026-10-03 조사는 `develop`의
+`9f0bc598f6b2d8f863fd46af6a4fd73bfef1f0b8`을 기준으로 했다. 그 뒤 공통 계약
+[PR #7](https://github.com/daejunnom/RoveZero/pull/7)이 병합되어 현재 총괄 통합의
+develop base는 `3e3cd80533a69ee2118f1c130e72a1cb0745ae8c`다.
+다음 표는 재개 후 총괄이 포착한 담당별 source pin이다. 초기 관찰 base, 담당 branch
+head와 총괄의 integration SHA를 혼용하지 않는다. E/F는 아래 full SHA의 source·tests를
+읽기 전용으로 대조했고, A~D의 짧은 표시는 총괄이 제공한 captured head prefix다.
+표의 head는 이후 push로 바뀔 수 있으므로 실제 인수 직전에 다시 확인한다.
+PR·리뷰·checks의 부재나 source의 test 선언 수만으로 실행 성공을 인정하지 않는다.
 
 | 담당 | PR·조사 head SHA | 총괄이 연결할 공통 경계 | 담당 영역에 유지할 구현 |
 |---|---|---|---|
-| A | [#3](https://github.com/daejunnom/RoveZero/pull/3), `7a33bd4e7722fe403bad3eb4fe93b9a9ceda6a5a` | Rules가 발급한 state/revision·semantic move·ordered legal view와 공통 상태 권한 | board/FEN/attacks/legal/make-unmake·이력·종료·규칙 내부 key |
-| B | [#6](https://github.com/daejunnom/RoveZero/pull/6), `29b96c24d06513dbd820dc2761192420ac1f590f` | SelectionTicket의 논리 ID·세대·deadline을 공통 요청으로 변환하고 검증된 policy/WDL을 backup 접점으로 변환 | PUCT tree·driver·selection/reservation·방문·backup·시간 배분; UCI worker는 후속 연결 |
-| C | [#5](https://github.com/daejunnom/RoveZero/pull/5), `a6e46a3e6528369a7dedf6ea6cfb5fbdad56d535` | 모델/인코딩 descriptor, immutable state/legal view, request/result/error, backend와 runtime의 physical completion | ScriptedBackend와 raw output, 인코더·action mapping·loader·provider·수치 adapter |
-| D | [#4](https://github.com/daejunnom/RoveZero/pull/4), `2e8dfa59833a50cdce70e3be36cc2df74decc6a0` | Adapter associated types, clock/deadline domain, admission/current/output 검증과 공통 오류 | Scheduler·queue·batch·Resources/Limits·Lease·reservation·telemetry |
-| E | [#8](https://github.com/daejunnom/RoveZero/pull/8), `c2f944f1794b44081905b4019643f6b2978d8feb` | engine 계약 revision과 실행 manifest의 버전/해시/설정 provenance, Rules 검증 접점 | 외부 runner·paired 대국·PGN 검증·실패 분류·집계·통계 |
-| F | [#2](https://github.com/daejunnom/RoveZero/pull/2), `387790173754992979902b233af443b5fa2006c1` | engine 계약 revision, Rules/인코딩 identity bridge, move·관점·종료 의미 | Python persisted envelope·JSON IO·라벨 검증·group split·누출 audit·학습 도구 |
+| A | [#3](https://github.com/daejunnom/RoveZero/pull/3), `118dc03` | Rules가 발급한 state/revision·semantic move·ordered legal view와 공통 상태 권한 | board/FEN/attacks/legal/make-unmake·이력·종료·규칙 내부 key |
+| B | [#6](https://github.com/daejunnom/RoveZero/pull/6), `e80be2f` | SelectionTicket의 논리 ID·세대·deadline을 공통 요청으로 변환하고 검증된 policy/WDL을 backup 접점으로 변환 | PUCT tree·driver·selection/reservation·방문·backup·시간 배분·UCI/worker 소유 구현 |
+| C | [#5](https://github.com/daejunnom/RoveZero/pull/5), `0a56367` | 모델/인코딩 descriptor, immutable state/legal view, request/result/error, backend와 runtime의 physical completion | ScriptedBackend와 raw output, 인코더·action mapping·loader·provider·수치 adapter |
+| D | [#4](https://github.com/daejunnom/RoveZero/pull/4), `83c2869` | Adapter associated types, clock/deadline domain, admission/current/output 검증과 공통 오류 | Scheduler·queue·batch·Resources/Limits·Lease·reservation·telemetry |
+| E | [#8](https://github.com/daejunnom/RoveZero/pull/8), `383eb05c55f65cd2df5c8642a7f374e50be084b5` | engine 계약 revision과 실행 manifest의 버전/해시/설정 provenance, Rules 검증 접점 | 입력 잠금·artifact 확인·pair 계획·attempt 원장·원시 WDL/pentanomial; 실제 runner·군집 통계는 후속 |
+| F | [#2](https://github.com/daejunnom/RoveZero/pull/2), `36e619bae238a587e04c0a4bae24624eb5414aec` | engine 계약 revision, Rules/인코딩 identity bridge, move·관점·종료 의미 | Python envelope·라벨/group split·누출 audit·CPU 숫자 fixture gradient/checkpoint/export/resume; 제품 NN 학습은 후속 |
 
 공통 타입·오류·revision을 consumer마다 복제하지 않는다. 이미 구현된 local 타입을
 무조건 모두 공통 crate로 이동하지도 않는다. 공통 의미와 owner를 지킨 얇은 adapter를
 각 담당 경계에 두며 총괄이 실제 PR 인수 변경에서 mapping을 수동으로 맞춘다.
+현재 통합은 [Draft PR #9](https://github.com/daejunnom/RoveZero/pull/9)에서 진행한다.
+루트 10개 member·path 의존·toolchain 선언과 수동 adapter 작업, 실제 통합 검사·
+최종 SHA의 기록은 [INTEGRATION-STATUS](INTEGRATION-STATUS.md)에 분리해 둔다.
 
 ## 3. A: Rules authority와 합법 수
 
@@ -115,8 +124,9 @@ process epoch, game/root generation, 상태 revision과 legal order를 요청에
 B의 `tree.rs`에 있는 `SelectionTicket`의 owner/serial 검사는 그대로 유지한다.
 공통 세대 검사가 B-local consume capability를 대체하지 않는다. `accept_evaluation()`에는
 실제 요청의 legal move 순서·f64 prior·leaf 차례 기준 scalar를 전달하고 exact Rules terminal은
-`accept_terminal()`로 evaluator를 우회한다. 조사 head에는 rz-search만 게시되어 있으므로
-UCI worker의 후속 구현도 인수 때 다시 확인한다.
+`accept_terminal()`로 evaluator를 우회한다. 초기 조사에는 rz-search만 게시되어 있었지만
+후속 captured head와 현재 통합에서는 UCI/worker의 실제 구현·계약 적용·binary/trace
+검사를 별도로 확인한다. 초기 조사 당시의 부재를 최신 코드의 부재로 옮기지 않는다.
 
 B가 UCI 시계에서 산출한 deadline을 공통 ClockDomain의 단조 ns deadline으로
 명시 변환한다. UCI wall-clock 또는 `Instant`의 내부 표현을 숫자로 옮기지 않는다.
@@ -182,10 +192,12 @@ epoch를 소유하는 adapter를 둔다. 같은 도메인의 elapsed만 계산�
 arithmetic을 쓴다. UTC는 로그용이며 deadline 비교에 쓰지 않는다. mock 수동 시계도
 동일 domain 규약으로 동작하며 다른 clock domain의 tick은 같아 보여도 거부한다.
 
-총괄 root 통합 때 D runtime/telemetry의 임시 standalone `[workspace]`를 제거하고
-root member·dependency·feature·toolchain·lockfile을 맞춘다. C는 조사 head에서 중첩
-workspace를 선언하지 않았다. 최신 manifest를 다시 읽어 차이를 확인하며 다른 담당의
-root 설정을 묵시적으로 덮어쓰지 않는다. CPU/mock와 provider feature의 의존 방향을 유지한다.
+총괄 root 통합에서 담당의 standalone `[workspace]`와 독립 의존 선언을
+root member·path dependency·feature·toolchain·lockfile로 수동 정합한다.
+현재 root는 10개 crate를 member로 선언하고 compiler 1.96.0과 workspace rust-version
+1.90을 사용한다. 공통 crate의 MSRV 1.85는 별도 범위이며 전체 workspace의 1.85
+호환을 뜻하지 않는다. 실제 manifest·adapter·검사 범위는 통합 SHA로 확인하며
+CPU/mock와 명시 provider feature의 의존 방향을 유지한다.
 
 수동 연결 검사에는 정상/실패·역순·중복·partial/NaN/Inf, 취소 ack 이전/이후 callback,
 DeviceCompleted 전 buffer pin, logical 취소 뒤 physical pin, root/model/slot 교체,
@@ -215,6 +227,14 @@ state_restore/independent_legal_moves/actual_encoding_identity 등을 not_run으
 **공통 계약 게시만으로 execution_ready를 true로 바꾸지 않는다.** 실제 bridge 검사와
 독립 상태·인코딩 증거가 확보된 후 F의 실행 준비 조건을 별도 변경·인수한다.
 
+F의 최신 source에는 F02 내부 lifecycle도 제공돼 있다. `rz_training/recipe.py`는
+execution_scope=cpu_fixture·float64·단일 fixture adapter와 engine wire_binding=not_run을
+강제하고 `data.py`는 실제 teacher/self_play 입력을 거부한다. holdout forward와 선택은
+제외되며 trainer가 model·SGD momentum·sampler/RNG·진행·validation 선택을 저장·복구한다.
+실패/취소 step rollback과 typed receipt, native fixture export의 import/probe 대조도
+제품 호환 검사와 구별한다. 숫자 fixture의 weights 변경·loss 감소는 실제 Maia 학습·
+GPU·CONTROL 대국 인수의 근거가 아니다.
+
 E는 실제 engine binary·weights·backend·precision·options·장비·seed·완전 시작 상태·
 clock와 계약 revision을 실행 manifest에서 보존한다. 계약 revision 일치만으로 binary나
 weights hash를 생략하지 않는다. runner fixture/CPU 외부 엔진 검사는 먼저 수행할 수 있지만
@@ -223,8 +243,21 @@ weights hash를 생략하지 않는다. runner fixture/CPU 외부 엔진 검사�
 E 조사 branch의 `RunManifest::contract_revision`은 engine revision을 별도 string으로
 담고 E persisted `SCHEMA_VERSION=1`/canonicalization을 유지한다. 공통 0.1 exact match의
 string 대응을 명시한다. `LockedManifest`의 구조 잠금은 launch/legality/fairness가 검증되었다는
-뜻이 아니며 execution_ready=false를 유지한다. 조사 head에 실제 arena runner·pair 집계·
-bootstrap 실행은 아직 없으므로 통계 명세를 실제 대국·강도 결과로 승격하지 않는다.
+뜻이 아니며 execution_ready=false를 유지한다. 최신 E source에는 같은 OpeningSpec의
+엔진 색 배정만 바꾸는 결정적 plan, infrastructure-invalid pair 전체 제한 재시도·
+attempt 원장, 마지막 완료·유효 pair의 원시 WDL/n0..n4 집계가 제공됐다.
+미완료 pair에 0.5를 주지 않고 이전 실패 attempt도 보존한다.
+
+E에는 F와 같은 literal not_run 감사 필드가 없으며 execution_ready=false와
+validation_scope=structural_only로 경계를 표시한다. move 문법/FEN 필드·declared identity
+검사는 실제 A 복원·legal/terminal·PGN 증거와 다르다. 실제 외부 runner/launch·시계·
+자원·drain 영수증, cluster bootstrap/CI/Elo 계산과 정식 대국은 아직 인수하지 않았다.
+A/C bridge만 연결한 결과로 이 실행 gate를 승격하지 않는다.
+
+읽기 전용 리뷰에서 F의 test method 105개와 E의 test 선언 74개를 확인했다.
+E 74개 중 4개는 Unix 조건부다. 이는 source 정의 수이며 이 문서 변경에서 검사·
+학습을 실행한 결과가 아니다. 담당자가 보고한 과거 단독 검사는 현재 root 통합의
+동일 SHA·환경·feature·영향 입력 검사와 분리한다.
 
 ## 7. 총괄의 PR 인수 작업
 

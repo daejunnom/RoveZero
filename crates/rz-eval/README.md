@@ -1,0 +1,169 @@
+# rz-eval — C 평가 구현
+
+담당: TASK-C01/C02/C03. 기준 규약은 저장소의
+[구현 지시서](../../docs/IMPLEMENTATION-DIRECTIVES.md),
+[계약](../../docs/CONTRACTS.md), [선정 기록](../../docs/WEIGHT-SELECTION.md)이다.
+
+## 실제 backend
+
+PR #7의 병합된 계약 0.1(`18339c30754f4f38d957d96aeab481b018b98718`)을 확인했다.
+`contracts` feature는 이 SHA의 공통 crate를 소비한다. workspace 통합 때 총괄이
+모든 consumer를 같은 path dependency로 바꾸어야 한다. 공통 타입·루트 workspace는
+수정하지 않았다. Linux 검증 toolchain은 PR #7 CI와 같은 Rust 1.96.0이다.
+
+`asset::MaiaAsset`는 선정 gzip/protobuf와 변환 ONNX의 크기·SHA-256을 검증한다.
+`tools/prepare_maia.py`는 외부 LC0 고정 commit의 FP32/opset 17 변환과 provenance
+작성을 제공한다. 변환 자산·GPL 도구는 저장소 밖에 보존한다.
+
+`onnx` feature는 `ort=2.0.0-rc.10`/ORT 1.22.0을 명시 동적 로딩한다. 기본 feature는
+native runtime/CUDA 설치가 필요 없다. CPU/CUDA 선택, shape/dtype, 최대 batch 16,
+1~4 CPU threads, IO staging 예산을 검사한다. CUDA는 TF32 off·CPU fallback 금지와
+실제 node placement probe를 요구한다. IO 예산과 CUDA arena cap은 전체 RAM/VRAM
+상한이 아니므로 bootstrap/실행 환경에서 activation·workspace·동시 점유를 별도 제한한다.
+
+선정 원본→ONNX 변환, 원본 protobuf의 **LC0 Eigen** 대비 실제 Rust ORT CPU 검사를
+통과했다. 서로 같은 ONNX를 두 언어에서 실행한 대조가 아니다. 12개 국면에서 모든
+입력 plane·합법 수 index를 정확히 비교하고 batch 1/2/4/8/16을 검사한다.
+최대 오차는 logits `1.0252e-5`, WDL `3.5763e-7`, 합법 정책 `1.6094e-6`이었다.
+실제 GPU/RTX 4050·VRAM·강도 인수는 미실행이다.
+검증 source SHA·tool/asset digest·국면별 오차·제한·미실행 범위는
+[CPU 인수 기록](validation/maia-cpu.json)에 고정했다. Rust 1.96.0에서 eval 27개와
+encoding 11개(총 38개) 테스트, fmt·Clippy가 통과했고 Rust 1.85.0 all-feature
+check도 통과했다. 기본 feature 검사는 native ORT/CUDA 없이 별도로 통과했다.
+
+## 현재 제공 범위
+
+`mock::ScriptedBackend<K>`는 수동 시계로 움직이는 **물리 backend 시험 도구**다.
+`K`에는 호출자가 공통 계약의 요청/실행 문맥을 넣는다. 별도 RequestId, generation,
+EvalRequest/Result, scheduler 또는 search 타입을 선언하지 않는다.
+
+- `Step`이 callback 지연·원시 출력/실패·물리 완료·취소 응답을 정한다.
+- `advance_to`와 `next_event`를 분리해 같은 tick에서 root 교체·취소·callback을
+  원하는 순서로 소비할 수 있다. 지연 polling에도 원래 event 시각을 보존한다.
+- 중복 callback, 다른 요청의 역순 완료, missing head, NaN/Inf를 주입할 수 있다.
+  seed는 replay metadata이며 숨은 난수 대신 script가 실행을 결정한다.
+- 취소는 callback이나 `DeviceCompleted`를 지우지 않는다. 논리 취소 성공은 D의
+  finalization, buffer 해제는 실제 물리 완료, accepted backup은 B의 책임이다.
+- script 크기·payload·in-flight·대기 event를 제한한다. admission과 cancel 거부는
+  다음 script를 소비하거나 기존 physical completion을 잃지 않는다.
+
+이 도구 자체의 성공을 D의 exactly-once finalization 또는 B의 backup 검증으로
+보지 않는다. B/D의 실제 consumer 연결 검사는 통합 단계에 남아 있다.
+
+## Maia 출력 검증
+
+`output::validate_maia`는 선정 FP32 export의 1858개 raw policy logits와 이미 확률인
+W/D/L head를 검증한다. 호출자가 checked legal move에서 구한 model index 목록을
+요청 순서대로 넘기며, 합법 index를 먼저 gather한 뒤 temperature 1.0 softmax를 한다.
+WDL에는 softmax를 다시 적용하지 않고 실제 차례 관점을 유지한다.
+
+모든 필수 head의 shape·유한값을 검사한다. legal 목록의 중복·범위·빈 목록, WDL의
+범위·합 오류를 명시적으로 거부하며 clipping·자동 renormalization·가짜 무승부로
+수선하지 않는다. `ValidatedHeads`는 검증된 **모델 head**만 담고 공통 EvalResult의
+요청·세대·관점 metadata를 대체하지 않는다. terminal 상태는 Rules/Search가 선행 처리한다.
+
+첫 코드 profile의 확률 합 허용 오차는 `1e-5`다. 이는 probability admissibility이며
+선정 기록의 독립 FP32 parity 기준(raw logit atol=1e-4/rtol=1e-3, 확률 max_abs=1e-4)과
+구분한다. 이 수치 설정과 temperature는 C backend identity에 포함한다.
+공통 payload는 검증한 f32 head의 반올림을 보존한다. B의 strict f64 합 검사에 넘길 때는
+공통 `LegalPolicy::normalized()`와 `Wdl::normalized()`를 명시 호출하는 B adapter 정책을
+사용한다. 허용 범위를 벗어난 입력을 그 함수로 복구하지 않는다.
+
+## 계약 0.1과 물리 worker 연결
+
+`contracts::MaiaBinding::for_backend`는 registry가 발급한 model/encoding handle을
+로드한 자산·backend에 연결한다. model manifest는 `MaiaAsset::manifest_digest()`,
+encoding manifest는 `encoding_manifest(fill)`을 사용한다. full compute는 고정
+feed-forward 한 번(`steps=1`), FP32만 지원한다. `input_key`는 encoding handle과
+실제 f32 tensor의 little-endian bytes, 알려진/padded 이력 정보를 SHA-256에 넣는다.
+이 함수는 C 입력 codec이며 Rules의 상태 digest를 대신하지 않는다.
+
+A/embedding adapter는 **해당 request의 immutable snapshot**에서 `classical::Input`을
+투영하고 `input_key`로 요청을 구성한다. `prepare`는 이를 다시 인코딩해 input identity,
+차례·history-fill·backend·descriptor·예산·합법 수 순서를 검사한다. 좌표는 a1=0이며
+공통 Move의 캐슬링은 king destination(e1g1/e1c1 등)으로 받는다. 실제 king bit를 보고
+LC0 king-to-rook index로 변환하며 네 승격을 보존한다. C는 generic P의 합법성이나
+Rules metadata를 독립 증명하지 않는다. `HOST_BYTES_PER_ITEM`은 C buffer 예약이며
+Rules snapshot과 native workspace 예산은 별도로 더한다.
+
+`spawn_onnx_worker`는 세션 하나를 worker 하나로 옮긴다. D가 발급한 ExecutionId와
+`PreparedBatch`를 `submit`하면 nonblocking `PhysicalLease`를 돌려준다. 동시에 물리
+batch 하나만 허용하며 자동 재시도·batch 축소는 없다. `poll`의 Ready에는 물리 완료 후
+owned EvalOutput 또는 실패가 들어 있다. output은 문맥·legal order·실행 ID를 그대로
+보존한다. D는 batch 실패를 각 원 요청에 연결하고 `EvalOutput::validate_for`로 현재
+scope/clock을 재검사한 뒤 한 번만 finalization해야 한다. B는 backup 직전에 다시 검사한다.
+실패의 `PhysicalFailure`에는 공통 오류와 별도로 원래 C code/stage 및 ORT code·최대
+1024-byte UTF-8 원인을 보존한다. 원시 원인 문자열은 local 진단용이며 공통 static detail과
+기본 Debug/Display 출력에 복사하지 않는다. 복구/재시도는 수행하지 않는다.
+
+논리 취소는 native Run을 중단하지 않는다. consumer/worker handle을 먼저 drop해도
+실행 thread가 입력과 세션을 보유한다. wrapper panic으로 물리 완료가 불확실하면
+`Quarantined`이며 backend·입력 pin을 프로세스 종료까지 보존한다. D는 이를 Ready로
+바꾸거나 예약을 해제하면 안 된다. 이는 OS/native crash 복구를 보장하는 경계가 아니다.
+
+D PR #4의 `83c2869000482ea1e5c8298b13431f97009c9095` 접점도 확인했다. D의
+`Backend::dispatch/poll`을 직접 구현하려면 runtime/embedding 소유 경로에서 이 worker
+lease를 감싼다. C→runtime 역의존은 추가하지 않았다. mock Callback도 DeviceCompleted
+없이 Ready로 바꾸면 안 된다. 실제 A/D/B 전체 엔진 조합은 아직 검증하지 않았다.
+
+## 개발 검사
+
+루트 workspace 게시 전에는 crate별 manifest로 검사할 수 있다. `[workspace]`를
+중첩 선언하지 않아 I01에서 그대로 workspace member로 등록할 수 있다. edition 2021은
+이 crate의 현재 선언이며 최종 toolchain/MSRV·workspace 공통 설정은 총괄이 정한다.
+
+```sh
+cargo +1.96.0 test --manifest-path crates/rz-eval/Cargo.toml
+cargo +1.96.0 test --manifest-path crates/rz-eval/Cargo.toml --all-features
+cargo +1.96.0 clippy --manifest-path crates/rz-eval/Cargo.toml --all-targets --all-features -- -D warnings
+cargo +1.96.0 fmt --manifest-path crates/rz-eval/Cargo.toml -- --check
+```
+
+임시 standalone Cargo.lock은 추적하지 않는다. 직접 의존성은 Cargo.toml에 exact pin했다.
+전이 의존성까지 고정하는 root lockfile 도입은 총괄 소유다. build·toolchain·원시 결과는 저장소 밖 작업 전용 output
+root에 둔다. 클라우드 작업 동안 보존하고 종료 전 재현 명령·검토된 결과는 PR에,
+회수할 원시 근거는 별도 artifact로 인계한다. 자동 삭제는 하지 않는다.
+
+## 실제 자산·독립 참조 검사 재현
+
+저장소 밖에 선정 원본과 LC0 commit `fd71a2d921b689c5f479d3227c3806c8e272d9c5`를
+준비한다. submodule은 해당 commit의 `b326b154221a6eb91977bdccf11d6f89e8547875`다.
+LC0의 Meson 빌드에서 release, b_lto=false, gtest/ispc/plain_cuda/onnx/openblas=false,
+metal=disabled, python_bindings=true를 사용했다. Eigen 3.4.0, Meson 1.8.2,
+Ninja 1.11.1.4, GCC 14.2.0, Python 3.12 환경이며 빌드는 jobs=3·timeout 600초였다.
+Meson wrapdb 접근 제한은 공식 GitHub release의 **같은 hash** patch를 packagecache에
+받아 해결했다. upstream 소스는 수정하지 않았다.
+
+검사용 venv: `onnx==1.18.0`, `onnxruntime==1.22.0`, `numpy==2.2.6`,
+`python-chess==1.999`/`chess==1.11.2`. python-chess와 LC0 bindings는 외부 fixture
+oracle일 뿐 제품 dependency가 아니다. `LC0_BUILD`, `LC0_SOURCE`, `ASSET_DIR`,
+`OUTPUT_DIR`, `ORT_LIBRARY`, `ORT_SHA256`는 사용자가 준비한 절대 경로/해시다.
+
+```sh
+python crates/rz-eval/tools/prepare_maia.py \
+  --source "$ASSET_DIR/maia-1900.pb.gz" --lc0 "$LC0_BUILD/lc0" \
+  --lc0-source "$LC0_SOURCE" --output-dir "$OUTPUT_DIR/export"
+PYTHONPATH="$LC0_BUILD" python crates/rz-eval/tools/maia_reference.py \
+  --source "$ASSET_DIR/maia-1900.pb.gz" --lc0-source "$LC0_SOURCE" \
+  --output "$OUTPUT_DIR/reference.json"
+cargo +1.96.0 run --manifest-path crates/rz-eval/Cargo.toml --all-features --example maia_check -- \
+  "$ASSET_DIR/maia-1900.pb.gz" "$OUTPUT_DIR/export/maia-1900.onnx" \
+  "$OUTPUT_DIR/export/manifest.json" "$ORT_LIBRARY" "$ORT_SHA256" \
+  "$OUTPUT_DIR/reference.json" "$OUTPUT_DIR/cpu-report.json" cpu
+```
+
+최종 명령을 60초/2 GiB 주소 공간 한도 아래 실행했다. test matrix는 12개 국면,
+단일 및 batch 1/2/4/8/16, invalid/empty/oversized 입력, 정책 순열, 실제 CPU worker의
+4개 계약 출력과 취소 1개 수락 거부다. 참조 binding의 FEN_ONLY는 각 fixture에서
+명시한 No/RepeatOldest와 같음을 plane 전체 비교로 확인한다. 일반 FEN_ONLY profile을
+지원한다고 주장하지 않는다.
+
+CUDA 검사 시 마지막 `cpu`를 `cuda "$OUTPUT_DIR/cuda-probe"`로 바꾼다. 지정 GPU와
+ORT 1.22.0 CUDA/cuDNN 호환 runtime을 먼저 준비해야 한다. CPU-only ORT에서는
+BackendUnavailable로 실패해야 하며 이를 GPU 검사 통과로 세지 않는다. target GPU의
+총 VRAM·메모리 peak·수명·종단 계측은 별도 I02 인수가 필요하다.
+
+직접 Rust dependency의 라이선스는 MIT OR Apache-2.0이며 ONNX Runtime 자체는 MIT와
+포함 third-party notices를 따른다. 선정 원본/ONNX는 upstream GPL-3.0 외부 자산이다.
+LC0 GPL 구현·테이블·protobuf 생성 코드를 제품에 복사·링크하지 않는다. 변환 산출물의
+RIGHTS.txt는 provenance 메모이며 재배포 source/notice 의무 충족 확인을 대신하지 않는다.

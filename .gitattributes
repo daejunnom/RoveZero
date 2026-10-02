@@ -3,6 +3,7 @@
 *.rs text eol=lf
 *.toml text eol=lf
 *.yml text eol=lf
+*.py text eol=lf
 Cargo.lock text eol=lf
 .gitignore text eol=lf
 .gitattributes text eol=lf
@@ -10,3 +11,7 @@ Cargo.lock text eol=lf
 # Preserve the supplied handoff snapshots byte for byte.
 docs/reference/PlyZero_Handoff_v0.1.0_KO.md -text
 docs/reference/RoveZero_Handoff_v0.2.0_KO.md -text
+
+# Locked fixtures use exact byte digests across Windows and Linux checkouts.
+experiments/**/fixtures/** -text
+crates/**/tests/fixtures/** -text

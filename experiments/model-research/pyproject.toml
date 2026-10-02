@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rovezero-data"
+version = "0.1.0"
+description = "F-owned offline data auditing and CPU fixture training lifecycle"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+dependencies = []
+
+[project.scripts]
+rz-data = "rz_data.cli:main"
+rz-train = "rz_training.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

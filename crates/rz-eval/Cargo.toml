@@ -1,0 +1,31 @@
+[package]
+name = "rz-eval"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "RoveZero model evaluation and deterministic backend test support"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rz-encoding.workspace = true
+sha2.workspace = true
+flate2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic", "cuda"], optional = true }
+rz-contracts = { workspace = true, optional = true }
+rz-position = { workspace = true, optional = true, features = ["contracts"] }
+rz-runtime = { workspace = true, optional = true, features = ["contracts"] }
+
+[features]
+default = []
+onnx = ["dep:ort"]
+contracts = ["dep:rz-contracts", "dep:rz-position", "dep:rz-runtime"]
+
+[[example]]
+name = "maia_check"
+required-features = ["onnx"]
