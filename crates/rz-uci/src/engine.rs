@@ -474,6 +474,57 @@ impl fmt::Display for DiagnosticRetentionFailure {
     }
 }
 
+/// Original typed failures outlive a closed owner event channel. The protocol
+/// completion is a presentation; it cannot replace these source values.
+#[derive(Clone, Debug)]
+pub enum WorkerFailureSource {
+    Factory(contract::ContractError),
+    SearchConstructor(contract::ContractError),
+    Authority(contract::ContractError),
+    Search(Box<rz_search::contracts::ContractSearchFailure>),
+    DiagnosticRetention {
+        error: contract::ContractError,
+        receipt: Box<WorkerDiagnosticReceipt>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct UndeliveredWorkerFailure {
+    pub ticket: SearchTicket,
+    pub completion: SearchCompletion,
+    pub source: WorkerFailureSource,
+}
+
+enum WorkerCompletion {
+    Completed {
+        bestmove: Option<String>,
+    },
+    Failed {
+        completion: SearchCompletion,
+        source: WorkerFailureSource,
+    },
+}
+impl WorkerCompletion {
+    fn failed(source: WorkerFailureSource) -> Self {
+        let completion = match &source {
+            WorkerFailureSource::Factory(error)
+            | WorkerFailureSource::SearchConstructor(error)
+            | WorkerFailureSource::Authority(error) => failed_completion(*error),
+            WorkerFailureSource::Search(error) => SearchCompletion::Failed {
+                code: "SearchFailed".into(),
+                message: format!("{error:?}"),
+            },
+            WorkerFailureSource::DiagnosticRetention { error, receipt } => {
+                SearchCompletion::Failed {
+                    code: "DiagnosticRetentionFailure".into(),
+                    message: format!("{error}; original diagnostic: {receipt}"),
+                }
+            }
+        };
+        Self::Failed { completion, source }
+    }
+}
+
 #[derive(Debug)]
 pub enum EngineError {
     Contract(contract::ContractError),
@@ -482,6 +533,7 @@ pub enum EngineError {
     WorkerPanic,
     DrainTimeout,
     UndeliveredDiagnostics(Vec<(WorkerDiagnosticReceipt, u64)>),
+    UndeliveredWorkerFailure(Box<UndeliveredWorkerFailure>),
     Cleanup {
         primary: Box<EngineError>,
         cleanup: Vec<EngineError>,
@@ -503,6 +555,16 @@ struct ActiveBinding {
     control: SearchControl,
     authority: SearchAuthority,
 }
+type FailedPublication = Arc<Mutex<Option<Box<UndeliveredWorkerFailure>>>>;
+struct Worker {
+    handle: JoinHandle<Result<(), EngineError>>,
+    failure: FailedPublication,
+}
+impl Worker {
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+}
 struct Owner {
     session_owner: crate::contracts::ContractSessionOwner,
     active: Option<ActiveBinding>,
@@ -511,7 +573,7 @@ struct Owner {
     clock: ProcessClock,
     ids: Arc<rz_search::contracts::IdAllocator>,
     settings: EngineSettings,
-    workers: Vec<JoinHandle<Result<(), contract::ContractError>>>,
+    workers: Vec<Worker>,
     pending_failures: VecDeque<(SearchTicket, SearchCompletion)>,
     diagnostics: Arc<Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>>,
 }
@@ -535,6 +597,13 @@ impl Owner {
         event: Event,
     ) -> SessionResult<RulesSearchPosition> {
         let mut out = SessionResult::default();
+        let completion_receipt = match &event {
+            Event::Complete {
+                ticket,
+                completion: completion @ SearchCompletion::Failed { .. },
+            } => Some((ticket.clone(), completion.clone())),
+            _ => None,
+        };
         match self.diagnostics.lock() {
             Ok(mut receipts) => {
                 for (error, count) in std::mem::take(&mut *receipts) {
@@ -579,6 +648,40 @@ impl Owner {
                 out
             }
         };
+        // Enqueueing is not consumption. A typed failed publication stays with
+        // its bounded worker slot until this owner has handled the exact ticket.
+        if let Some((ticket, completion)) = completion_receipt {
+            let diagnosed = match &completion {
+                SearchCompletion::Failed { code, message } => {
+                    next.diagnostics.iter().any(|diagnostic| {
+                        diagnostic.code == "SearchFailed"
+                            && diagnostic.message == format!("{code}: {message}")
+                    })
+                }
+                SearchCompletion::Completed { .. } => false,
+            };
+            for worker in &self.workers {
+                match worker.failure.lock() {
+                    Ok(mut receipt) => {
+                        if diagnosed
+                            && receipt.as_ref().is_some_and(|failure| {
+                                failure.ticket == ticket && failure.completion == completion
+                            })
+                        {
+                            receipt.take();
+                        }
+                    }
+                    Err(_) => {
+                        self.cancel();
+                        out.diagnostics.push(Diagnostic {
+                            code: "DiagnosticFailure",
+                            message: "worker failed publication owner poisoned".into(),
+                        });
+                        append_result(&mut out, session.end_of_input());
+                    }
+                }
+            }
+        }
         // B closes common/tree cancellation before changing its generations.
         match self.scope.lock() {
             Ok(mut scope) => *scope = self.session_owner.scope(),
@@ -601,18 +704,71 @@ impl Owner {
         }
     }
     fn reap(&mut self) -> Result<(), EngineError> {
+        self.reap_workers(false)
+    }
+    fn reap_workers(&mut self, closing: bool) -> Result<(), EngineError> {
         let mut index = 0;
         while index < self.workers.len() {
             if self.workers[index].is_finished() {
-                self.workers
-                    .swap_remove(index)
+                if !closing
+                    && self.workers[index]
+                        .failure
+                        .lock()
+                        .map_err(|_| {
+                            failure(
+                                contract::ErrorCode::BackendFailure,
+                                "worker failed publication owner poisoned",
+                            )
+                        })?
+                        .is_some()
+                {
+                    // Keep the unacknowledged slot in max_workers. Starting more
+                    // workers cannot grow an orphaned failed-publication history.
+                    index += 1;
+                    continue;
+                }
+                let worker = self.workers.swap_remove(index);
+                let (unconsumed, poisoned) = take_failed_publication(&worker.failure);
+                let joined = worker
+                    .handle
                     .join()
-                    .map_err(|_| EngineError::WorkerPanic)??;
+                    .map_err(|_| EngineError::WorkerPanic)
+                    .and_then(|result| result);
+                let joined = match (unconsumed.as_deref(), joined) {
+                    (Some(receipt), Err(error)) => {
+                        discard_duplicate_delivery_failure(error, receipt).map_or(Ok(()), Err)
+                    }
+                    (_, result) => result,
+                };
+                let mut errors = Vec::new();
+                if let Some(receipt) = unconsumed {
+                    errors.push(EngineError::UndeliveredWorkerFailure(receipt));
+                }
+                if let Some(error) = poisoned {
+                    errors.push(error);
+                }
+                if let Err(error) = joined {
+                    errors.push(error);
+                }
+                finish_errors(None, errors)?;
             } else {
                 index += 1;
             }
         }
         Ok(())
+    }
+    fn collect_unconsumed_failures(&self) -> Vec<EngineError> {
+        let mut errors = Vec::new();
+        for worker in &self.workers {
+            let (receipt, poisoned) = take_failed_publication(&worker.failure);
+            if let Some(receipt) = receipt {
+                errors.push(EngineError::UndeliveredWorkerFailure(receipt));
+            }
+            if let Some(error) = poisoned {
+                errors.push(error);
+            }
+        }
+        errors
     }
     fn dispatch(
         &mut self,
@@ -702,26 +858,36 @@ impl Owner {
                 let shutdown_limit = self.settings.shutdown_limit;
                 let events = sender.clone();
                 let diagnostics = Arc::clone(&self.diagnostics);
-                self.workers.push(thread::spawn(move || {
+                let publication = Arc::new(Mutex::new(None));
+                let worker_publication = Arc::clone(&publication);
+                let handle = thread::spawn(move || {
                     let mut runtime = match factory.create(clock.clone(), authority.clone()) {
                         Ok(runtime) => runtime,
                         Err(error) => {
-                            let _ = events.send(Event::Complete {
+                            return finish_worker(
+                                &events,
                                 ticket,
-                                completion: failed_completion(error),
-                            });
-                            return Ok(());
+                                WorkerCompletion::failed(WorkerFailureSource::Factory(error)),
+                                &worker_publication,
+                                None,
+                                shutdown_limit,
+                            );
                         }
                     };
                     let mut search =
                         match rz_search::contracts::ContractSearch::new(snapshot, config) {
                             Ok(search) => search,
                             Err(error) => {
-                                let _ = events.send(Event::Complete {
+                                return finish_worker(
+                                    &events,
                                     ticket,
-                                    completion: failed_completion(error),
-                                });
-                                return shutdown(runtime.as_mut(), shutdown_limit);
+                                    WorkerCompletion::failed(
+                                        WorkerFailureSource::SearchConstructor(error),
+                                    ),
+                                    &worker_publication,
+                                    Some(runtime.as_mut()),
+                                    shutdown_limit,
+                                );
                             }
                         };
                     let mut previous_move = None;
@@ -782,26 +948,37 @@ impl Owner {
                     }
                     let outcome = search.outcome();
                     let completion = match (diagnostic_failure, authority_error, outcome.status) {
-                        (Some(error), _, _) => SearchCompletion::Failed {
-                            code: "DiagnosticRetentionFailure".into(),
-                            message: error.to_string(),
-                        },
-                        (_, Some(error), _) => failed_completion(error),
-                        (_, _, rz_search::contracts::ContractSearchStatus::Failed(error)) => {
-                            SearchCompletion::Failed {
-                                code: "SearchFailed".into(),
-                                message: format!("{error:?}"),
-                            }
+                        (Some(error), _, _) => {
+                            WorkerCompletion::failed(WorkerFailureSource::DiagnosticRetention {
+                                error: error.error,
+                                receipt: Box::new(error.receipt),
+                            })
                         }
-                        _ => SearchCompletion::Completed {
+                        (_, Some(error), _) => {
+                            WorkerCompletion::failed(WorkerFailureSource::Authority(error))
+                        }
+                        (_, _, rz_search::contracts::ContractSearchStatus::Failed(error)) => {
+                            WorkerCompletion::failed(WorkerFailureSource::Search(Box::new(error)))
+                        }
+                        _ => WorkerCompletion::Completed {
                             bestmove: outcome
                                 .best_move
                                 .and_then(|movement| move_text(movement).ok()),
                         },
                     };
-                    let _ = events.send(Event::Complete { ticket, completion });
-                    shutdown(runtime.as_mut(), shutdown_limit)
-                }));
+                    finish_worker(
+                        &events,
+                        ticket,
+                        completion,
+                        &worker_publication,
+                        Some(runtime.as_mut()),
+                        shutdown_limit,
+                    )
+                });
+                self.workers.push(Worker {
+                    handle,
+                    failure: publication,
+                });
             }
             Effect::OptionChanged { .. } | Effect::Button { .. } => {
                 return Err(failure(
@@ -814,6 +991,137 @@ impl Owner {
         Ok(())
     }
 }
+fn finish_worker(
+    sender: &SyncSender<Event>,
+    ticket: SearchTicket,
+    completion: WorkerCompletion,
+    publication: &Mutex<Option<Box<UndeliveredWorkerFailure>>>,
+    runtime: Option<&mut dyn ManagedEvaluator>,
+    shutdown_limit: Duration,
+) -> Result<(), EngineError> {
+    let (completion, source) = match completion {
+        WorkerCompletion::Completed { bestmove } => {
+            (SearchCompletion::Completed { bestmove }, None)
+        }
+        WorkerCompletion::Failed { completion, source } => (completion, Some(source)),
+    };
+    let failed = source.is_some();
+    let mut errors = Vec::new();
+    if let Some(source) = source {
+        let receipt = Box::new(UndeliveredWorkerFailure {
+            ticket: ticket.clone(),
+            completion: completion.clone(),
+            source,
+        });
+        match publication.lock() {
+            Ok(mut slot) if slot.is_none() => *slot = Some(receipt),
+            Ok(_) => {
+                errors.push(EngineError::UndeliveredWorkerFailure(receipt));
+                errors.push(
+                    failure(
+                        contract::ErrorCode::ResourceExhausted,
+                        "worker single failed-publication slot already occupied",
+                    )
+                    .into(),
+                );
+            }
+            Err(_) => {
+                errors.push(EngineError::UndeliveredWorkerFailure(receipt));
+                errors.push(
+                    failure(
+                        contract::ErrorCode::BackendFailure,
+                        "worker failed publication owner poisoned",
+                    )
+                    .into(),
+                );
+            }
+        }
+    }
+    let delivery_failed =
+        errors.is_empty() && sender.send(Event::Complete { ticket, completion }).is_err() && failed;
+    // Keep the original owner-reclaimable until actual owner consumption/reap,
+    // including the gap between returning this closure and handle.is_finished.
+    let cleanup = runtime.and_then(|runtime| shutdown(runtime, shutdown_limit).err());
+    if delivery_failed {
+        // Failed sends are reclaimed by the join result. Successful sends keep
+        // the slot until the owner acknowledges consumption or closing reaps it.
+        let (receipt, poisoned) = copy_failed_publication(publication);
+        if let Some(receipt) = receipt {
+            errors.push(EngineError::UndeliveredWorkerFailure(receipt));
+        }
+        if let Some(error) = poisoned {
+            errors.push(error);
+        }
+    }
+    // Do not return early on failed delivery: physical shutdown always runs when
+    // a runtime was created, and its failure remains separate from the source.
+    if let Some(error) = cleanup {
+        errors.push(EngineError::Contract(error));
+    }
+    finish_errors(None, errors)
+}
+
+fn take_failed_publication(
+    publication: &Mutex<Option<Box<UndeliveredWorkerFailure>>>,
+) -> (Option<Box<UndeliveredWorkerFailure>>, Option<EngineError>) {
+    match publication.lock() {
+        Ok(mut slot) => (slot.take(), None),
+        Err(poisoned) => (
+            poisoned.into_inner().take(),
+            Some(
+                failure(
+                    contract::ErrorCode::BackendFailure,
+                    "worker failed publication owner poisoned",
+                )
+                .into(),
+            ),
+        ),
+    }
+}
+
+fn copy_failed_publication(
+    publication: &Mutex<Option<Box<UndeliveredWorkerFailure>>>,
+) -> (Option<Box<UndeliveredWorkerFailure>>, Option<EngineError>) {
+    match publication.lock() {
+        Ok(slot) => (slot.clone(), None),
+        Err(poisoned) => (
+            poisoned.into_inner().clone(),
+            Some(
+                failure(
+                    contract::ErrorCode::BackendFailure,
+                    "worker failed publication owner poisoned",
+                )
+                .into(),
+            ),
+        ),
+    }
+}
+
+/// Failed send returns one bounded typed copy while its original stays visible
+/// to the owner. Reaping acknowledges the original once and retains all cleanup
+/// errors from the copy's join result without reporting the source twice.
+fn discard_duplicate_delivery_failure(
+    error: EngineError,
+    receipt: &UndeliveredWorkerFailure,
+) -> Option<EngineError> {
+    match error {
+        EngineError::UndeliveredWorkerFailure(copy)
+            if copy.ticket == receipt.ticket && copy.completion == receipt.completion =>
+        {
+            None
+        }
+        EngineError::Cleanup { primary, cleanup } => {
+            let primary = discard_duplicate_delivery_failure(*primary, receipt);
+            let cleanup = cleanup
+                .into_iter()
+                .filter_map(|error| discard_duplicate_delivery_failure(error, receipt))
+                .collect();
+            finish_errors(primary, cleanup).err()
+        }
+        error => Some(error),
+    }
+}
+
 struct RuntimePort<'a>(&'a mut dyn ManagedEvaluator);
 impl contract::Evaluator<RulesState> for RuntimePort<'_> {
     fn submit(
@@ -1085,7 +1393,7 @@ pub fn serve<O: Write, D: Write>(
                 }
             };
             owner.cancel();
-            if let Err(error) = owner.reap() {
+            if let Err(error) = owner.reap_workers(true) {
                 cleanup.push(error);
             }
             if owner.workers.is_empty() {
@@ -1108,19 +1416,24 @@ pub fn serve<O: Write, D: Write>(
         );
     }
     match owner.lock() {
-        Ok(owner) => match owner.diagnostics.lock() {
-            Ok(mut receipts) if !receipts.is_empty() => cleanup.push(
-                EngineError::UndeliveredDiagnostics(std::mem::take(&mut *receipts)),
-            ),
-            Err(_) => cleanup.push(
-                failure(
-                    contract::ErrorCode::BackendFailure,
-                    "worker diagnostic receipt owner poisoned",
-                )
-                .into(),
-            ),
-            _ => {}
-        },
+        Ok(owner) => {
+            // A timed-out/panicking drain does not discard failures that were
+            // already published by workers which have not yet finished joining.
+            cleanup.extend(owner.collect_unconsumed_failures());
+            match owner.diagnostics.lock() {
+                Ok(mut receipts) if !receipts.is_empty() => cleanup.push(
+                    EngineError::UndeliveredDiagnostics(std::mem::take(&mut *receipts)),
+                ),
+                Err(_) => cleanup.push(
+                    failure(
+                        contract::ErrorCode::BackendFailure,
+                        "worker diagnostic receipt owner poisoned",
+                    )
+                    .into(),
+                ),
+                _ => {}
+            }
+        }
         Err(_) => {
             cleanup.push(failure(contract::ErrorCode::BackendFailure, "UCI owner poisoned").into())
         }
@@ -1152,6 +1465,107 @@ pub fn event_channel() -> (SyncSender<Event>, Receiver<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy)]
+    enum FailureMode {
+        Factory,
+        Matching,
+        ForeignFlood,
+        NoEvaluation,
+        PanicDrain,
+    }
+    struct FailureFactory {
+        profile: EvaluatorProfile,
+        mode: FailureMode,
+        drained: Arc<AtomicU64>,
+        cleanup: Option<contract::ContractError>,
+    }
+    struct FailureRuntime {
+        mode: FailureMode,
+        context: Option<contract::EvalContext>,
+        callbacks: u64,
+        drained: Arc<AtomicU64>,
+        cleanup: Option<contract::ContractError>,
+    }
+    fn injected_backend_failure() -> contract::ContractError {
+        contract::ContractError::new(
+            contract::ErrorCode::BackendFailure,
+            contract::Stage::Backend,
+            "worker physical failure before owner consumption",
+        )
+    }
+    impl EvaluatorFactory for FailureFactory {
+        fn profile(&self) -> EvaluatorProfile {
+            self.profile.clone()
+        }
+        fn create(
+            &self,
+            _: ProcessClock,
+            authority: SearchAuthority,
+        ) -> Result<Box<dyn ManagedEvaluator>, contract::ContractError> {
+            if matches!(self.mode, FailureMode::Factory) {
+                return Err(injected_backend_failure());
+            }
+            if matches!(self.mode, FailureMode::NoEvaluation) {
+                authority.cancel();
+            }
+            Ok(Box::new(FailureRuntime {
+                mode: self.mode,
+                context: None,
+                callbacks: 0,
+                drained: Arc::clone(&self.drained),
+                cleanup: self.cleanup,
+            }))
+        }
+        fn input_key(
+            &self,
+            _: &RulesState,
+            _: &[contract::Move],
+        ) -> Result<contract::EvalInputKey, contract::ContractError> {
+            Ok(contract::EvalInputKey(contract::Digest([9; 32])))
+        }
+    }
+    impl contract::Evaluator<RulesState> for FailureRuntime {
+        fn submit(
+            &mut self,
+            request: Arc<contract::EvalRequest<RulesState>>,
+        ) -> Result<(), contract::ContractError> {
+            self.context = Some(request.context());
+            Ok(())
+        }
+        fn poll(&mut self) -> Option<contract::EvalResult> {
+            let mut context = self.context?;
+            self.callbacks += 1;
+            if matches!(self.mode, FailureMode::ForeignFlood) {
+                context.request.sequence += 100 + self.callbacks;
+            } else {
+                self.context = None;
+            }
+            Some(contract::EvalResult::Failed(contract::EvalFailure {
+                context: contract::CompletionContext {
+                    request: context,
+                    execution: Some(contract::ExecutionId::new(
+                        context.request.epoch,
+                        self.callbacks,
+                    )),
+                },
+                error: injected_backend_failure(),
+                recovery: contract::RecoveryOutcome::Failed,
+            }))
+        }
+        fn cancel(&mut self, _: contract::RequestId) -> Result<(), contract::ContractError> {
+            Ok(())
+        }
+    }
+    impl ManagedEvaluator for FailureRuntime {
+        fn shutdown(&mut self, _: Instant) -> Result<(), contract::ContractError> {
+            self.drained.fetch_add(1, Ordering::AcqRel);
+            if matches!(self.mode, FailureMode::PanicDrain) {
+                panic!("injected drain panic after publication");
+            }
+            self.cleanup.map_or(Ok(()), Err)
+        }
+    }
 
     struct UnusedFactory(EvaluatorProfile);
     impl EvaluatorFactory for UnusedFactory {
@@ -1264,10 +1678,13 @@ mod tests {
     fn full_event_queue_cannot_lose_worker_refusal_or_checked_fallback() {
         let (mut owner, mut session) = fixture();
         let (release, waiting) = mpsc::channel();
-        owner.workers.push(thread::spawn(move || {
-            waiting.recv().unwrap();
-            Ok(())
-        }));
+        owner.workers.push(Worker {
+            handle: thread::spawn(move || {
+                waiting.recv().unwrap();
+                Ok(())
+            }),
+            failure: Arc::new(Mutex::new(None)),
+        });
         let out = owner.handle(&mut session, Event::Line("go nodes 1".into()));
         let (sender, events) = mpsc::sync_channel(1);
         sender.send(Event::Line("isready".into())).unwrap();
@@ -1292,7 +1709,7 @@ mod tests {
         assert!(owner.pending_failures.is_empty());
         assert!(session.active_ticket().is_none());
         release.send(()).unwrap();
-        owner.workers.pop().unwrap().join().unwrap().unwrap();
+        owner.workers.pop().unwrap().handle.join().unwrap().unwrap();
     }
 
     #[test]
@@ -1573,5 +1990,464 @@ mod tests {
         let receipts = owner.diagnostics.lock().unwrap();
         assert_eq!(receipts.len(), 32);
         assert!(receipts.iter().all(|(_, count)| *count == 1));
+    }
+
+    fn closed_receiver_worker(
+        mode: FailureMode,
+        invalid_constructor: bool,
+        cleanup: Option<contract::ContractError>,
+    ) -> (Result<(), EngineError>, u64, usize) {
+        let (mut owner, mut session) = fixture();
+        let drained = Arc::new(AtomicU64::new(0));
+        owner.factory = Arc::new(FailureFactory {
+            profile: owner.factory.profile(),
+            mode,
+            drained: Arc::clone(&drained),
+            cleanup,
+        });
+        if invalid_constructor {
+            owner.settings.tree.max_nodes = 0;
+        }
+        let start = owner.handle(&mut session, Event::Line("go nodes 1".into()));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        for effect in start.effects {
+            owner.dispatch(effect, &sender).unwrap();
+        }
+        assert_eq!(owner.workers.len(), 1);
+        let until = Instant::now() + Duration::from_secs(5);
+        while !owner.workers[0].is_finished() {
+            assert!(Instant::now() < until, "worker must finitely terminate");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let result = owner.reap_workers(true);
+        assert!(owner.workers.is_empty());
+        let receipts = owner.diagnostics.lock().unwrap().len();
+        (result, drained.load(Ordering::Acquire), receipts)
+    }
+
+    #[test]
+    fn closed_receiver_preserves_factory_source_in_actual_worker_join() {
+        let (result, drained, _) = closed_receiver_worker(FailureMode::Factory, false, None);
+        let EngineError::UndeliveredWorkerFailure(failure) = result.unwrap_err() else {
+            panic!("undelivered factory failure required")
+        };
+        assert!(
+            matches!(&failure.completion, SearchCompletion::Failed { message, .. } if message == injected_backend_failure().detail)
+        );
+        let WorkerFailureSource::Factory(source) = failure.source else {
+            panic!("typed factory source required")
+        };
+        assert_eq!(source, injected_backend_failure());
+        assert_eq!(drained, 0, "failed factory created no runtime");
+    }
+
+    #[test]
+    fn closed_receiver_search_constructor_failure_still_drains_and_keeps_cleanup() {
+        let cleanup_cause = failure(
+            contract::ErrorCode::BackendFailure,
+            "physical drain failed after failed delivery",
+        );
+        let (result, drained, _) =
+            closed_receiver_worker(FailureMode::Matching, true, Some(cleanup_cause));
+        let EngineError::Cleanup { primary, cleanup } = result.unwrap_err() else {
+            panic!("delivery and drain failures required")
+        };
+        assert!(
+            matches!(cleanup.as_slice(), [EngineError::Contract(error)] if *error == cleanup_cause)
+        );
+        let EngineError::UndeliveredWorkerFailure(failure) = *primary else {
+            panic!("undelivered constructor source required")
+        };
+        assert!(matches!(
+            failure.source,
+            WorkerFailureSource::SearchConstructor(_)
+        ));
+        assert!(matches!(
+            failure.completion,
+            SearchCompletion::Failed { .. }
+        ));
+        assert_eq!(drained, 1);
+    }
+
+    #[test]
+    fn closed_receiver_matching_eval_failure_preserves_typed_context_and_recovery() {
+        let (result, drained, _) = closed_receiver_worker(FailureMode::Matching, false, None);
+        let EngineError::UndeliveredWorkerFailure(failure) = result.unwrap_err() else {
+            panic!("undelivered search failure required")
+        };
+        let WorkerFailureSource::Search(source) = failure.source else {
+            panic!("typed search source required")
+        };
+        let rz_search::contracts::ContractSearchFailure::Evaluation(evaluation) = *source else {
+            panic!("original evaluator failure required")
+        };
+        assert_eq!(evaluation.error, injected_backend_failure());
+        assert_eq!(evaluation.recovery, contract::RecoveryOutcome::Failed);
+        assert_eq!(evaluation.context.execution.unwrap().sequence, 1);
+        assert_eq!(
+            evaluation.context.request.request.epoch,
+            contract::ProcessEpoch(7)
+        );
+        assert_eq!(drained, 1);
+    }
+
+    #[test]
+    fn closed_receiver_cap33_failure_keeps_original_receipt_and_drain_failure() {
+        let cleanup_cause = failure(
+            contract::ErrorCode::BackendFailure,
+            "physical drain failed after failed delivery",
+        );
+        let (result, drained, receipts) =
+            closed_receiver_worker(FailureMode::ForeignFlood, false, Some(cleanup_cause));
+        let EngineError::Cleanup { primary, cleanup } = result.unwrap_err() else {
+            panic!("overflow and drain failures required")
+        };
+        assert!(
+            matches!(cleanup.as_slice(), [EngineError::Contract(error)] if *error == cleanup_cause)
+        );
+        let EngineError::UndeliveredWorkerFailure(failure) = *primary else {
+            panic!("undelivered overflow source required")
+        };
+        let WorkerFailureSource::DiagnosticRetention { error, receipt } = failure.source else {
+            panic!("typed overflow receipt required")
+        };
+        assert_eq!(error.code, contract::ErrorCode::ResourceExhausted);
+        let WorkerDiagnosticReceipt::RejectedFailure { failure, .. } = *receipt else {
+            panic!("original cap33 evaluator failure required")
+        };
+        assert_eq!(failure.error, injected_backend_failure());
+        assert_eq!(failure.recovery, contract::RecoveryOutcome::Failed);
+        assert_eq!(failure.context.execution.unwrap().sequence, 33);
+        assert_eq!(
+            failure.context.request.request.epoch,
+            contract::ProcessEpoch(7)
+        );
+        assert_eq!(receipts, 32);
+        assert_eq!(drained, 1);
+    }
+
+    #[test]
+    fn closed_receiver_normal_cancel_completion_drains_without_delivery_error() {
+        let (result, drained, _) = closed_receiver_worker(FailureMode::NoEvaluation, false, None);
+        result.unwrap();
+        assert_eq!(drained, 1);
+    }
+
+    #[test]
+    fn queued_quit_before_successful_failed_send_keeps_unconsumed_typed_source() {
+        let (mut owner, mut session) = fixture();
+        owner.factory = Arc::new(FailureFactory {
+            profile: owner.factory.profile(),
+            mode: FailureMode::Factory,
+            drained: Arc::new(AtomicU64::new(0)),
+            cleanup: None,
+        });
+        let start = owner.handle(&mut session, Event::Line("go nodes 1".into()));
+        let (sender, receiver) = mpsc::sync_channel(2);
+        sender.send(Event::Line("quit".into())).unwrap();
+        for effect in start.effects {
+            owner.dispatch(effect, &sender).unwrap();
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while !owner.workers[0].is_finished() {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let failure_ticket = owner.workers[0]
+            .failure
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .ticket
+            .clone();
+        // A completed worker whose failed publication is still queued continues
+        // occupying its existing worker slot until actual owner consumption.
+        owner.reap().unwrap();
+        assert_eq!(owner.workers.len(), owner.settings.max_workers);
+        let out = owner.handle(&mut session, receiver.recv().unwrap());
+        assert!(out.protocol.is_empty());
+        drop(receiver); // The successful second send was never consumed.
+        let error = owner.reap_workers(true).unwrap_err();
+        let EngineError::UndeliveredWorkerFailure(failure) = error else {
+            panic!("unconsumed successful publication required")
+        };
+        assert_eq!(failure.ticket, failure_ticket);
+        assert!(matches!(
+            failure.completion,
+            SearchCompletion::Failed { .. }
+        ));
+        let WorkerFailureSource::Factory(source) = failure.source else {
+            panic!("typed queued factory source required")
+        };
+        assert_eq!(source, injected_backend_failure());
+        assert!(owner.workers.is_empty());
+    }
+
+    #[test]
+    fn consumed_failed_publication_acknowledges_slot_and_allows_next_root() {
+        let (mut owner, mut session) = fixture();
+        owner.factory = Arc::new(FailureFactory {
+            profile: owner.factory.profile(),
+            mode: FailureMode::Factory,
+            drained: Arc::new(AtomicU64::new(0)),
+            cleanup: None,
+        });
+        let start = owner.handle(&mut session, Event::Line("go nodes 1".into()));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        for effect in start.effects {
+            owner.dispatch(effect, &sender).unwrap();
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while !owner.workers[0].is_finished() {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let out = owner.handle(&mut session, receiver.recv().unwrap());
+        assert_eq!(
+            out.protocol
+                .iter()
+                .filter(|line| line.starts_with("bestmove "))
+                .count(),
+            1
+        );
+        assert!(out.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains(injected_backend_failure().detail)
+        }));
+        assert!(owner.workers[0].failure.lock().unwrap().is_none());
+        owner.reap().unwrap();
+        assert!(owner.workers.is_empty());
+        let next = owner.handle(&mut session, Event::Line("go nodes 1".into()));
+        assert!(next.accepted);
+        assert!(
+            next.effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Start { .. }))
+        );
+    }
+
+    #[test]
+    fn closed_receiver_panicking_drain_keeps_source_and_worker_panic() {
+        let (result, drained, _) = closed_receiver_worker(FailureMode::PanicDrain, false, None);
+        let EngineError::Cleanup { primary, cleanup } = result.unwrap_err() else {
+            panic!("source and panic required")
+        };
+        assert!(matches!(cleanup.as_slice(), [EngineError::WorkerPanic]));
+        let EngineError::UndeliveredWorkerFailure(failure) = *primary else {
+            panic!("source must survive drain unwind")
+        };
+        let WorkerFailureSource::Search(source) = failure.source else {
+            panic!("typed source required")
+        };
+        let rz_search::contracts::ContractSearchFailure::Evaluation(evaluation) = *source else {
+            panic!("original evaluator failure required")
+        };
+        assert_eq!(evaluation.error, injected_backend_failure());
+        assert_eq!(evaluation.recovery, contract::RecoveryOutcome::Failed);
+        assert_eq!(drained, 1);
+    }
+
+    #[test]
+    fn early_rejected_failure_after_diagnostic_poison_does_not_ack_original() {
+        let (mut owner, mut session) = fixture();
+        owner.factory = Arc::new(FailureFactory {
+            profile: owner.factory.profile(),
+            mode: FailureMode::Factory,
+            drained: Arc::new(AtomicU64::new(0)),
+            cleanup: None,
+        });
+        let start = owner.handle(&mut session, Event::Line("go nodes 1".into()));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        for effect in start.effects {
+            owner.dispatch(effect, &sender).unwrap();
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while !owner.workers[0].is_finished() {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let diagnostics = Arc::clone(&owner.diagnostics);
+        assert!(
+            thread::spawn(move || {
+                let _guard = diagnostics.lock().unwrap();
+                panic!("injected diagnostic owner poison");
+            })
+            .join()
+            .is_err()
+        );
+        let out = owner.handle(&mut session, receiver.recv().unwrap());
+        assert!(
+            !out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "SearchFailed")
+        );
+        assert!(owner.workers[0].failure.lock().unwrap().is_some());
+        let EngineError::UndeliveredWorkerFailure(failure) = owner.reap_workers(true).unwrap_err()
+        else {
+            panic!("unconsumed source required")
+        };
+        assert!(
+            matches!(failure.source, WorkerFailureSource::Factory(error) if error == injected_backend_failure())
+        );
+    }
+
+    #[test]
+    fn unfinished_drain_keeps_published_source_reclaimable_by_closing_owner() {
+        struct BlockingDrain {
+            entered: SyncSender<()>,
+            release: Receiver<()>,
+        }
+        impl contract::Evaluator<RulesState> for BlockingDrain {
+            fn submit(
+                &mut self,
+                _: Arc<contract::EvalRequest<RulesState>>,
+            ) -> Result<(), contract::ContractError> {
+                unreachable!("only shutdown is exercised")
+            }
+            fn poll(&mut self) -> Option<contract::EvalResult> {
+                None
+            }
+            fn cancel(&mut self, _: contract::RequestId) -> Result<(), contract::ContractError> {
+                Ok(())
+            }
+        }
+        impl ManagedEvaluator for BlockingDrain {
+            fn shutdown(&mut self, _: Instant) -> Result<(), contract::ContractError> {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            }
+        }
+        struct ReleaseOnDrop(Option<SyncSender<()>>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.try_send(());
+                }
+            }
+        }
+        let (mut owner, mut session) = fixture();
+        owner.handle(&mut session, Event::Line("go nodes 1".into()));
+        let ticket = session.active_ticket().unwrap();
+        let expected_ticket = ticket.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let (entered, waiting) = mpsc::sync_channel(1);
+        let (release, gate) = mpsc::sync_channel(1);
+        let mut release = ReleaseOnDrop(Some(release));
+        let publication = Arc::new(Mutex::new(None));
+        let worker_publication = Arc::clone(&publication);
+        let handle = thread::spawn(move || {
+            let mut runtime = BlockingDrain {
+                entered,
+                release: gate,
+            };
+            finish_worker(
+                &sender,
+                ticket,
+                WorkerCompletion::failed(WorkerFailureSource::Factory(injected_backend_failure())),
+                &worker_publication,
+                Some(&mut runtime),
+                Duration::from_secs(5),
+            )
+        });
+        owner.workers.push(Worker {
+            handle,
+            failure: publication,
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!owner.workers[0].is_finished());
+        owner.reap_workers(true).unwrap();
+        assert_eq!(owner.workers.len(), 1);
+        // The final owner collection also runs when its drain deadline expires.
+        // A reclaimed failure does not mean the physical worker has completed.
+        let mut recovered = owner.collect_unconsumed_failures();
+        assert_eq!(recovered.len(), 1);
+        let EngineError::UndeliveredWorkerFailure(failure) = recovered.pop().unwrap() else {
+            panic!("registered source required before physical completion")
+        };
+        assert_eq!(failure.ticket, expected_ticket);
+        assert!(
+            matches!(failure.source, WorkerFailureSource::Factory(error) if error == injected_backend_failure())
+        );
+        assert!(!owner.workers[0].is_finished());
+        release.0.take().unwrap().send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while !owner.workers[0].is_finished() {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(1));
+        }
+        owner.reap_workers(true).unwrap();
+    }
+
+    #[test]
+    fn returned_failure_before_thread_finish_keeps_original_owner_visible() {
+        let (mut owner, mut session) = fixture();
+        let event = foreign_failure_event(&mut owner, &mut session);
+        let rz_search::contracts::ContractPumpEvent::RejectedResult { result, .. } = event else {
+            panic!("foreign result fixture")
+        };
+        let contract::EvalResult::Failed(original) = *result else {
+            panic!("original failure fixture")
+        };
+        let expected = original.context;
+        let ticket = session.active_ticket().unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let (entered, waiting) = mpsc::sync_channel(1);
+        let (release, gate) = mpsc::sync_channel(1);
+        let publication = Arc::new(Mutex::new(None));
+        let worker_publication = Arc::clone(&publication);
+        let handle = thread::spawn(move || {
+            let result = finish_worker(
+                &sender,
+                ticket,
+                WorkerCompletion::failed(WorkerFailureSource::Search(Box::new(
+                    rz_search::contracts::ContractSearchFailure::Evaluation(Box::new(original)),
+                ))),
+                &worker_publication,
+                None,
+                Duration::from_secs(1),
+            );
+            // Model preemption after finish_worker returned and before the
+            // thread publishes completion through JoinHandle::is_finished.
+            entered.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(5)).unwrap();
+            result
+        });
+        owner.workers.push(Worker {
+            handle,
+            failure: publication,
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!owner.workers[0].is_finished());
+        let mut recovered = owner.collect_unconsumed_failures();
+        let EngineError::UndeliveredWorkerFailure(source) = recovered.pop().unwrap() else {
+            panic!("original must remain visible after closure return")
+        };
+        let WorkerFailureSource::Search(source) = source.source else {
+            panic!("typed original search failure")
+        };
+        let rz_search::contracts::ContractSearchFailure::Evaluation(source) = *source else {
+            panic!("original evaluator failure")
+        };
+        assert_eq!(source.context, expected);
+        assert_eq!(source.recovery, contract::RecoveryOutcome::Failed);
+        release.send(()).unwrap();
+        let result = owner.workers.pop().unwrap().handle.join().unwrap();
+        let EngineError::UndeliveredWorkerFailure(copy) = result.unwrap_err() else {
+            panic!("join must retain typed failure copy")
+        };
+        let WorkerFailureSource::Search(copy) = copy.source else {
+            panic!("typed join search failure")
+        };
+        let rz_search::contracts::ContractSearchFailure::Evaluation(copy) = *copy else {
+            panic!("join evaluator failure")
+        };
+        assert_eq!(copy.context, expected);
+        assert_eq!(copy.recovery, contract::RecoveryOutcome::Failed);
     }
 }
