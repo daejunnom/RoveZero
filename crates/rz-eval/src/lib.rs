@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod mock;
+pub mod output;
 
 /// Untrusted output at the model adapter boundary. Missing heads, bad shapes,
 /// and non-finite values are deliberately representable for fault injection.
