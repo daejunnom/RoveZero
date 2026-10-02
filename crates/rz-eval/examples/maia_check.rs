@@ -181,8 +181,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             builder.mode(0o700);
             builder
         };
-        #[cfg(not(unix))]
-        let builder = builder;
         // create, rather than create_dir_all: an existing probe namespace
         // cannot supply stale placement evidence or overwrite earlier logs.
         builder.create(profile_directory)?;
