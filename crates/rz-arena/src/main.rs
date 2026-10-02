@@ -218,7 +218,10 @@ fn execute(command: Command) -> Result<String, String> {
             ));
         }
         if result.receipt.pgn_audit.is_none() {
-            return Err(format!("fixture run failed ({:?}); receipt {} and excluded ledger preserved", result.receipt.process.stop, result.receipt_artifact.path));
+            return Err(format!(
+                "fixture run failed ({:?}); receipt {} and excluded ledger preserved",
+                result.receipt.process.stop, result.receipt_artifact.path
+            ));
         }
         return serde_json::to_string_pretty(&serde_json::json!({
             "execution_ready": false,

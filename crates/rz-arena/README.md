@@ -116,23 +116,33 @@ cargo run --manifest-path crates/rz-arena/Cargo.toml -- audit "$ARTIFACT_ROOT/ru
 입력은 bounded UTF-8 regular file이며 Unix에서 final symlink·FIFO blocking을 방지한다.
 쓰기 실패의 부분 파일은 보존하고 오류를 반환한다. audit의 `tip_sha256`을 외부 보존 위치에
 기록한 경우 다음 감사에 `--expected-tip`으로 대조할 수 있다. audit의 성공은
-`validation_scope=structural_only`이고 run 명령은 제공하지 않는다.
+`validation_scope=structural_only`이고 정식 run 명령은 제공하지 않는다.
+후속 `fixture-pair`는 Linux의 합성 CPU smoke 전용이며 아래 범위를 따른다.
 
 ## 현재 인수 범위
 
-내부 plan·사건 회계·JSONL 검증을 CPU와 합성 fixture로 확인한다. 실제 실행 receipt,
-A의 checked opening 복원·독립 참조·전체 PGN, 외부 Fastchess/Cute Chess adapter,
-clock/resource/drain/reset, 실제 runner 재개는 후속이다. 실제 NN·GPU·대국 강도·CI 성공은
-이 내부 코드로 인수하지 않는다. 진행과 정확한 검사 근거는
+현재 source에는 plan·사건 회계·JSONL 외에 A의 checked opening·PGN replay,
+Fastchess 인자 adapter·verified file handle과 유한 Linux subprocess 수명 코드가 있다.
+`fixture-pair`는 고정한 외부 runner와 실제 engine·입력·PGN의 identity를 연결해 별도
+smoke를 실행해야 인수할 수 있다. 코드 반입·단위 fixture 성공을 이 전체 실행으로
+보고하지 않는다. 정식 clock/draw/seed·CPU/RAM·GPU drain·통계·resume 인수는 후속이다.
+`ProcessReceipt.elapsed_ns`는 subprocess와 cleanup 구간이며 앞뒤의 입력 검증·opening
+생성·PGN 감사·기록 비용까지 포함한 전체 실행 시간이 아니다.
+이 코드는 `execution_ready=false`를 유지한다. 실제 NN·GPU·대국 강도는 별도 인수한다.
+진행과 정확한 검사 근거는
 [E 계획서](../../experiments/baselines/IMPLEMENTATION-PLAN-E.md)에 기록한다.
 
-## 실제 로컬 검증 — 2026-10-03, Asia/Seoul
+## 담당의 단독 검증 보고 — 2026-10-03, Asia/Seoul
 
 Linux x86_64·Rust 1.99.0·기본 feature에서 arena CLI 10개, ledger 22개, planner 15개,
 총 47개 테스트가 통과했다. 변경된 E01의 기존 31개도 통과해 전체 78개다.
 두 package의 fmt/clippy `-D warnings`와 Rust 1.85.0
 `cargo check --all-targets --locked`가 통과했다. README 링크와 Git whitespace도 검사했다.
 다른 OS·실제 GPU·CI의 성공으로 재사용하지 않는다.
+아래 78개 보고는 후속 runner가 추가되기 전 담당 branch의 범위다. 현재 root 통합은
+Rust 1.96.0·workspace MSRV 1.90을 사용하며 정확한 integration SHA와 실제 실행은
+[총괄 인수 기록](../../docs/INTEGRATION-STATUS.md)에 따로 기록한다.
+receipt의 초기 contract/rules source pin을 현재 binary의 integration SHA로 해석하지 않는다.
 
 독립 Python SHA/seed vector와 대조한 E01 fixture 계획 SHA-256은
 `980d61aadc3da58fe75720b125f7017a08ad40c5ae58c490f6e411e89429511f`,
