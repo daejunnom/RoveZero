@@ -1,0 +1,115 @@
+#![forbid(unsafe_code)]
+
+mod artifact;
+mod manifest;
+mod validation;
+
+pub use manifest::*;
+
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::fmt;
+
+pub const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug)]
+pub enum ManifestError {
+    Parse(String),
+    Validation(Vec<Violation>),
+    Integrity(String),
+    Artifact(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Violation {
+    pub path: String,
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl fmt::Display for ManifestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Validation(issues) => {
+                for (i, issue) in issues.iter().enumerate() {
+                    if i > 0 { writeln!(f)?; }
+                    write!(f, "{} [{}]: {}", issue.path, issue.code, issue.message)?;
+                }
+                Ok(())
+            }
+            Self::Parse(reason) => write!(f, "manifest parse: {reason}"),
+            Self::Integrity(reason) => write!(f, "input lock integrity: {reason}"),
+            Self::Artifact(reason) => write!(f, "artifact verification: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for ManifestError {}
+
+pub(crate) fn digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+// All objects, including arbitrary UCI option maps, reject duplicate keys.
+// serde_json's normal Value parser would silently retain the last value.
+struct UniqueValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for UniqueValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueValue;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("JSON with unique object keys")
+            }
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(UniqueValue(v.into()))
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(UniqueValue(v.into()))
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(UniqueValue(v.into()))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(v).map(|n| UniqueValue(n.into()))
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(UniqueValue(v.into()))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+                Ok(UniqueValue(v.into()))
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(UniqueValue(serde_json::Value::Null))
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> { self.visit_unit() }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(v) = a.next_element::<UniqueValue>()? { values.push(v.0); }
+                Ok(UniqueValue(values.into()))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+                let mut map = serde_json::Map::new();
+                while let Some(key) = a.next_key::<String>()? {
+                    if map.contains_key(&key) {
+                        return Err(serde::de::Error::custom("duplicate JSON object key"));
+                    }
+                    map.insert(key, a.next_value::<UniqueValue>()?.0);
+                }
+                Ok(UniqueValue(map.into()))
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
+}
+
+pub(crate) fn parse<T: serde::de::DeserializeOwned>(input: &str) -> Result<T, ManifestError> {
+    if input.len() > MAX_MANIFEST_BYTES {
+        return Err(ManifestError::Parse("input exceeds 4 MiB limit".into()));
+    }
+    let unique: UniqueValue = serde_json::from_str(input)
+        .map_err(|e| ManifestError::Parse(e.to_string()))?;
+    serde_json::from_value(unique.0).map_err(|e| ManifestError::Parse(e.to_string()))
+}
