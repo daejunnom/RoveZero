@@ -4,6 +4,19 @@
 //! issued by the actual registry, never by a hash or pointer cast in this crate.
 //! No mutable board borrow crosses the evaluator boundary. Model input keys,
 //! action maps, request IDs, generations and clocks remain their owners' work.
+//!
+//! ```
+//! use rz_position::{contracts::ContractPosition, BoardMove, Position};
+//! let mut live = ContractPosition::new(rz_contracts::OwnerId(1), Position::startpos());
+//! let frozen = live.export()?;
+//! let mv = rz_contracts::Move::try_from(BoardMove::from_uci("e2e4")?)?;
+//! let undo = live.make_from_view(&frozen, mv)?;
+//! assert_eq!(frozen.snapshot().side_to_move(), rz_contracts::Color::White);
+//! assert_eq!(live.position().side_to_move(), rz_position::Color::Black);
+//! live.unmake(undo)?;
+//! assert!(live.make_from_view(&frozen, mv).is_err());
+//! # Ok::<(), rz_contracts::ContractError>(())
+//! ```
 
 use crate::{
     Availability, BoardMove, ClaimEvidence, ClaimReason, Color, HistoryCompleteness, HistoryOrigin,

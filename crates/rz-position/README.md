@@ -1,7 +1,8 @@
 # rz-position — A 역할 규칙·상태 구현
 
-`TASK-A01/A02`의 표준 체스 규칙과 `TASK-A03`의 concrete state 경계를 자체 Rust 코드로
-구현한다. 제품 의존성은 없고 신규 코드는 [MIT](LICENSE)다. 기준 지시서는
+`TASK-A01/A02`의 표준 체스 규칙과 `TASK-A03`의 공통 계약 적용을 자체 Rust 코드로
+구현한다. 기본 규칙 코어는 의존성 없이 동작하며, 선택 `contracts` feature는 총괄의
+`rz-contracts` 0.1과 `sha2=0.10.9`를 사용한다. 신규 코드는 [MIT](LICENSE)다. 기준 지시서는
 [IMPLEMENTATION-DIRECTIVES](../../docs/IMPLEMENTATION-DIRECTIVES.md), 의미 계약은
 [CONTRACTS](../../docs/CONTRACTS.md)다. 연구 `CARD-A*`와 담당 `TASK-A*`는 다르다.
 
@@ -60,15 +61,19 @@ nodes도 같은 전체 노드 예산으로 센다. 카운터·revision overflow�
 
 ## 빌드·독립 검증
 
-검증한 compiler는 Rust 1.90.0, CPU Linux x86_64다. 총괄 workspace가 아직 없어
-manifest 경로로 독립 빌드한다. 임시 standalone lockfile은 crate ignore에 두며
-공유 workspace 등록·root lockfile·toolchain·CI는 TASK-I01 소유다.
+검증한 compiler는 Rust 1.90.0, CPU Linux x86_64다. A 작업 branch는 총괄 PR #7의
+루트 변경을 포함하지 않으며 manifest 경로로 독립 빌드한다. 임시 standalone lockfile은
+crate ignore에 두며 공유 workspace 등록·root lockfile·toolchain·CI는 TASK-I01 소유다.
+선택 의존성의 metadata는 첫 Cargo 해석 시 내려받을 수 있지만, 기본 build에서는
+공통 계약과 SHA-256 구현을 컴파일하거나 규칙 코어에 연결하지 않는다.
 
 ```sh
 cargo fmt --manifest-path crates/rz-position/Cargo.toml --check
 cargo clippy --manifest-path crates/rz-position/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path crates/rz-position/Cargo.toml
 cargo test --release --manifest-path crates/rz-position/Cargo.toml --test perft -- --include-ignored
+cargo clippy --manifest-path crates/rz-position/Cargo.toml --all-features --all-targets -- -D warnings
+cargo test --manifest-path crates/rz-position/Cargo.toml --features contracts --test contracts
 ```
 
 공개 [CPW perft](https://www.chessprogramming.org/Perft_Results)의 6개 FEN과 depth 1~4
@@ -85,7 +90,7 @@ golden counts를 fixture에 고정한다. 기본 검사는 depth 3 및 초기/EP
 python3 -m venv "$RZ_A_OUTPUT/oracle-venv"
 "$RZ_A_OUTPUT/oracle-venv/bin/python" -m pip install python-chess==1.999 chess==1.11.2
 RZ_CHESS_PYTHON="$RZ_A_OUTPUT/oracle-venv/bin/python" \
-  cargo test --release --manifest-path crates/rz-position/Cargo.toml -- --include-ignored
+  cargo test --release --manifest-path crates/rz-position/Cargo.toml --all-features -- --include-ignored
 ```
 
 Seed 20261003, 8 games×96 ply, 공개·특수 fixture를 고정하며 현재 참조 trace는
@@ -94,20 +99,59 @@ Seed 20261003, 8 games×96 ply, 공개·특수 fixture를 고정하며 현재 �
 Process deadline 30초, stdout 8 MiB, stderr 64 KiB로 제한한다. 첫 불일치 FEN·move/path·seed를
 보고하고, 원시 trace/log는 외부 output root에 보존한다. Mock/GPU/Elo 증거와는 별도다.
 
-## TASK-A03 인계와 선행 항목
+계약 적용 후 CPU Linux/Rust 1.90.0에서 기본 debug 29개 통과(외부 참조·확장 perft
+2개 명시 ignore), `--all-features` 전체 release는 doctest 포함 **41개 통과, 0 실패/ignore**를
+확인했다. 이 중 실제 공통 계약 consumer 검사는 9개다. Fmt와 전체 feature/target Clippy
+`-D warnings`도 통과했다. 별도 PR #7 source checkout의 `cargo test --locked` 6개와
+fmt/Clippy도 같은 CPU/compiler에서 통과했으며 원격 CI 결과로 표현하지 않는다.
 
-불변 state·raw history, ordered move view, 네 승격, exact order 비교, typed failure,
-owner/revision 검증 및 cross-thread 수명을 제공한다. `BoardMove`는 A의 concrete
-좌표 입력이며 shared Move ABI가 아니다. Shared ID/error/request/result 선언은 복제하지 않았다.
+## TASK-A03 공통 계약 0.1 적용
 
-총괄의 `rz-contracts` Rust revision이 아직 게시되지 않아 아래 통합 연결은 미실행이다.
-다른 담당의 WIP는 별도 PR로 개발되며, 실제 통합은 같은 공통 revision을 기준으로 인수한다.
+[PR #7](https://github.com/daejunnom/RoveZero/pull/7)의 실제 Rust 계약 revision 0.1을
+검토하고 source `ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8`에 고정했다. 검토 시 Draft/open,
+base `develop@9f0bc598f6b2d8f863fd46af6a4fd73bfef1f0b8`, 미통합이며 해당 head의 원격
+check run과 review는 없었다. 계약 게시·CPU 검사·workspace 통합은 서로 다른 인수다.
 
-1. 총괄의 primitive·handle·공통 오류를 이 concrete state/view에 adapter로 연결한다.
-   필요 공통 타입 재배치는 총괄 revision으로 수행하고 이 local API를 frozen ABI로 취급하지 않는다.
-2. B/C와 legal policy gather/scatter·승격·permutation·side-to-move WDL·terminal 선행을 대조한다.
-3. B/D와 request/game/root generation·deadline·늦은 결과·새 position의 경계를 통합 검사한다.
-4. E/F와 raw 이력 복원·unknown prefix·claim/dead profile을 맞추고 총괄 I02가 인수한다.
+`contracts::ContractPosition`은 실제 registry가 발급한 `OwnerId`와 `Position`을
+소유한다. 각 인스턴스·fork·새 게임에는 발급자가 재사용하지 않는 ID를 배정해야 한다.
+Position의 mutable 참조와 wrapper Clone을 제공하지 않아 외부에서 revision의 의미를
+바꾸지 못한다. `export`는 caller의 digest·classification·수 배열을 입력으로 받지 않는다.
 
-A01/A02 소스·CPU 정확성 검사 완료와 A03의 실제 공통 계약/소비자 통합 완료를 구분한다.
-원격 feature PR의 동일 SHA·계약 revision·실제 명령·결과로 인계하며 최종 통합은 총괄이 확인한다.
+- `ContractState::snapshot()`은 공통 `PositionSnapshot<RulesState>`다. Concrete payload의
+  `snapshot()`에는 원시 상태·이력이, `classification()`에는 origin·알려진 반복 수·
+  반복 증거 완전성·5회 반복 unknown 여부 등 상세 근거가 남는다.
+- `ContractState::legal_moves()`는 같은 상태의 정확한 순서와 네 승격을 보존한다.
+  `BoardMove`와 공통 `Move` 사이의 `TryFrom`은 좌표·승격을 변환하며 합법성은 checked
+  Rules 전이가 검증한다. 공통 generic 생성자 자체는 체스 상태의 진위를 보증하지 않으므로
+  소비자는 A가 export한 bundle의 metadata와 배열을 사용한다.
+- `make_from_view`는 원본 concrete owner/revision/history와 합법 수를 확인한다.
+  Make→unmake로 의미 상태를 복원해도 예전 view는 stale다. 오류는 공통 code/stage/detail로
+  전달하며 자원·카운터 실패를 무승부로 숨기지 않는다.
+- Exact terminal은 추가 대국 수와 평가 요청에서 거부한다. `terminal_wdl`은 frozen
+  side-to-move 관점의 정확한 승/무/패다. Current/intended claim은 ongoing과 공존한다.
+  Claim을 실행할지는 B/E의 정책이며 adapter가 자동 무승부로 만들지 않는다.
+
+SHA-256의 고정 profile은 `IDENTITY_PROFILE` 문자열이며 `profile_digest()`로 읽는다.
+State 입력은 domain의 u64-LE 길이 framing, profile digest, origin/completeness 각 1 byte,
+알려진 이력 길이 u64-LE, newest-first의 각 irreversible byte와 canonical FEN framing이다.
+Legal-order 입력은 별도 domain framing, profile digest, 배열 길이 u64-LE, 순서대로
+`from/to/promotion` 각 1 byte(승격 none/Q/R/B/N=0/1/2/3/4)다. Owner·live revision은
+semantic digest와 별도다. Export 시 전체 알려진 이력을 hash하므로 비용은 이력 길이에
+비례하며 현재 adapter에 hot-path 성능 개선을 주장하지 않는다. Live 적용은 hash 일치만으로
+허용하지 않고 concrete 상태를 확인한다. C/D는 실제 모델·encoding·fill·정밀도의 평가
+입력 key를 별도로 만들며 repetition identity나 이 semantic digest로 대체하지 않는다.
+
+`tests/contracts.rs`는 실제 A 상태와 공통 `EvalRequest<RulesState>/EvalOutput`을 연결한다.
+CPU mock의 독립 literal 합법 순서·승격·digest fixture, full history·raw EP·origin 구별,
+make/unmake/drop/thread 수명, state/order 혼용과 위조 순서, claim/terminal, side-to-move WDL,
+game/root/model/encoding/backend 교체·정확한 deadline 경계·취소를 검사한다. 모델/encoding
+manifest·input key·clock은 명시 mock이며 실제 C mapping이나 D scheduler를 인수한 것은 아니다.
+
+총괄 workspace 인수에서는 pinned Git 의존성을 `path = "../rz-contracts"`로 바꾸고
+root lockfile을 확정해 **단일 Cargo source의 계약 타입**을 사용한다. 같은 SHA라도 Git과
+path package를 함께 사용하면 Rust 타입이 다르다. 총괄은 선택 feature·동일 계약 source로
+A03 검사를 다시 실행하고 B/C의 실제 model policy mapping, B/D의 late-result와 수명,
+E/F의 history/claim/dead profile을 연결해야 한다. 공통 타입·root/CI 변경은 이 PR에 없다.
+
+A01/A02 정확성 검사와 A03의 실제 계약 CPU/mock 검증을 제공하며, B~F의 최종 소비자
+통합과 총괄 I02의 workspace 인수는 후속 단계다. 동일 SHA·revision·명령·결과로 인계한다.
