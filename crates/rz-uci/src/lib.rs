@@ -11,6 +11,8 @@ pub mod bridge;
 pub mod contracts;
 pub mod engine;
 #[cfg(feature = "onnx-cpu")]
+pub mod native_attestation;
+#[cfg(feature = "onnx-cpu")]
 pub mod native_bootstrap;
 pub mod parser;
 pub mod runner;

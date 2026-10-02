@@ -2,6 +2,7 @@ use rz_contracts::ProcessEpoch;
 #[cfg(feature = "onnx-cpu")]
 use rz_uci::{
     EngineIdentity,
+    native_attestation::{ReceiptWriter, StartupReceiptV1, TerminationReceiptV1},
     native_bootstrap::{NativeConfig, NativeCpuFactory},
 };
 use rz_uci::{
@@ -67,6 +68,18 @@ fn run_native(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     let owners = Arc::new(OwnerRegistry::default());
     let clock = ProcessClock::new(ProcessEpoch(1));
     let factory = Arc::new(NativeCpuFactory::load(&owners, &config)?);
+    let mut receipts = if config.attestation_requested() {
+        Some(ReceiptWriter::open(&config)?)
+    } else {
+        None
+    };
+    let startup = if let Some(writer) = receipts.as_mut() {
+        let startup = StartupReceiptV1::capture(&factory, &clock)?;
+        writer.startup(&startup)?;
+        Some(startup)
+    } else {
+        None
+    };
     let process =
         EngineProcess::new(factory.clone(), owners, clock).with_identity(EngineIdentity {
             name: "RoveZero Maia ONNX CPU integration".into(),
@@ -79,7 +92,15 @@ fn run_native(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     // Retain the native owner outside EngineProcess. Report/drain acceptance runs
     // for both successful protocol service and EngineError; neither implies GPU support.
     let served = serve_process(process, settings);
-    let report = factory.finish(served)?;
+    let finished = factory.finish(served);
+    if let (Some(writer), Some(startup)) = (receipts.as_mut(), startup.as_ref()) {
+        let receipt = TerminationReceiptV1::from_result(startup, &finished);
+        if let Err(error) = writer.termination(&receipt) {
+            // Publication must not replace an original service/drain failure.
+            return Err(Box::new(error.retaining(finished)));
+        }
+    }
+    let report = finished?;
     eprintln!("{report}");
     Ok(())
 }
