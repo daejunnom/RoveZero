@@ -83,7 +83,11 @@ impl OrtRuntime {
                 ));
             }
             let info = ort::info();
-            if !info.contains("git-branch=rel-1.22.0,") {
+            // Official wheels use git-branch=HEAD; the tag's source commit is
+            // authoritative, while the bootstrap-supplied digest pins the build.
+            if !info.contains("git-commit-id=f217402897,")
+                && !info.contains("git-commit-id=f217402897f40ebba457e2421bc0a4702771968e,")
+            {
                 return Err(BackendError::new(
                     K::BackendUnavailable,
                     S::Backend,
@@ -166,6 +170,12 @@ impl BackendConfig {
                     "CUDA requires device, arena cap and profile path",
                 ));
             }
+        } else if self.profiling_prefix.is_some() {
+            return Err(BackendError::new(
+                K::InvalidInput,
+                S::Admission,
+                "profiling is limited to the one-shot CUDA placement probe",
+            ));
         }
         Ok(())
     }
@@ -179,6 +189,9 @@ pub struct CudaEvidence {
 
 pub struct OnnxBackend {
     session: Session,
+    // Kept outside the Run stack so worker quarantine also pins tensor storage
+    // if a Rust wrapper unexpectedly unwinds before attesting completion.
+    active_input: Option<Tensor<f32>>,
     config: BackendConfig,
     identity: [u8; 32],
     asset_identity: [u8; 32],
@@ -267,6 +280,7 @@ impl OnnxBackend {
             runtime.binary_digest, asset.manifest_digest(), config.provider, config.intra_threads, config.max_batch);
         let mut result = Self {
             session,
+            active_input: None,
             config,
             identity: asset::sha256(profile.as_bytes()),
             asset_identity: asset.manifest_digest(),
@@ -318,6 +332,13 @@ impl OnnxBackend {
 
     /// Dense entry point for independent reference fixtures, still fully checked.
     pub fn run_values(&mut self, inputs: &[&[f32]]) -> Result<Vec<RawOutput>, BackendError> {
+        if self.active_input.is_some() {
+            return Err(BackendError::new(
+                K::BackendUnavailable,
+                S::Backend,
+                "previous run did not attest physical completion",
+            ));
+        }
         if inputs.is_empty() || inputs.len() > self.config.max_batch {
             return Err(BackendError::new(
                 K::ResourceExhausted,
@@ -348,22 +369,26 @@ impl OnnxBackend {
         for input in inputs {
             dense.extend_from_slice(input);
         }
-        let input = Tensor::from_array(([inputs.len(), 112, 8, 8], dense)).map_err(|_| {
-            BackendError::new(
-                K::BackendFailure,
-                S::Backend,
-                "cannot create ORT input tensor",
-            )
-        })?;
+        self.active_input = Some(
+            Tensor::from_array(([inputs.len(), 112, 8, 8], dense)).map_err(|_| {
+                BackendError::new(
+                    K::BackendFailure,
+                    S::Backend,
+                    "cannot create ORT input tensor",
+                )
+            })?,
+        );
         // No RunOptions enabling asynchronous EP execution or terminate-on-cancel.
         // On both success and error ORT's default synchronous Run has returned
         // before input/output storage is released. D keeps its lease throughout.
-        let outputs = self
+        let run_result = self
             .session
-            .run(ort::inputs![INPUT_NAME => input])
-            .map_err(|_| {
-                BackendError::new(K::BackendFailure, S::Backend, "synchronous ORT Run failed")
-            })?;
+            .run(ort::inputs![INPUT_NAME => self.active_input.as_ref()
+            .ok_or(BackendError::new(K::BackendFailure, S::Backend, "input pin is missing"))?]);
+        self.active_input = None;
+        let outputs = run_result.map_err(|_| {
+            BackendError::new(K::BackendFailure, S::Backend, "synchronous ORT Run failed")
+        })?;
         let malformed = || {
             BackendError::new(
                 K::NumericalFailure,
@@ -451,11 +476,15 @@ pub fn verify_cuda_profile(bytes: &[u8]) -> Result<usize, BackendError> {
         if event.get("cat").and_then(|v| v.as_str()) != Some("Node") {
             continue;
         }
-        if let Some(provider) = event.pointer("/args/provider").and_then(|v| v.as_str()) {
-            if provider != "CUDAExecutionProvider" {
-                return Err(fail());
-            }
-            count += 1;
+        match event.pointer("/args/provider").and_then(|v| v.as_str()) {
+            Some("CUDAExecutionProvider") => count += 1,
+            None if event
+                .get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|name| {
+                    name.ends_with("_fence_before") || name.ends_with("_fence_after")
+                }) => {}
+            _ => return Err(fail()),
         }
     }
     if count == 0 {

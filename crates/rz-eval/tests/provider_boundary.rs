@@ -8,6 +8,7 @@ fn provider_registration_or_mixed_execution_does_not_prove_cuda_execution() {
         r#"[]"#,
         r#"[{"cat":"Session","args":{"provider":"CUDAExecutionProvider"}}]"#,
         r#"[{"cat":"Node","args":{"provider":"CPUExecutionProvider"}}]"#,
+        r#"[{"cat":"Node","args":{"provider":"CUDAExecutionProvider"}},{"cat":"Node","name":"unknown_kernel_time"}]"#,
         r#"[{"cat":"Node","args":{"provider":"CUDAExecutionProvider"}},{"cat":"Node","args":{"provider":"CPUExecutionProvider"}}]"#,
         "invalid json",
     ] {

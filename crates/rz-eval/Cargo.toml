@@ -2,6 +2,7 @@
 name = "rz-eval"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 license = "MIT"
 description = "RoveZero model evaluation and deterministic backend test support"
 publish = false
@@ -22,3 +23,7 @@ rz-contracts = { git = "https://github.com/daejunnom/RoveZero.git", rev = "ae7bf
 default = []
 onnx = ["dep:ort"]
 contracts = ["dep:rz-contracts"]
+
+[[example]]
+name = "maia_check"
+required-features = ["onnx"]
