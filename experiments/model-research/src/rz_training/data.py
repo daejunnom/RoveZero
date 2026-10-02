@@ -7,6 +7,7 @@ from rz_data.audit import audit_dataset
 from rz_data.errors import DataError
 from rz_data.io import Limits, read_json, read_jsonl
 from rz_data.serialization import digest
+from rz_data.schema import validate_record
 
 from .recipe import ADAPTER_ID, fields, integer, number, validate_recipe
 
@@ -59,6 +60,7 @@ def load_fixture_data(recipe, manifest_path: Path, records_path: Path,
     for _, record, error in read_jsonl(records_path, limits, hasher=second_hash):
         if error is not None:
             raise error
+        validate_record(record, manifest)
         identity = record["record_id"]
         identities.add(identity)
         feature = features.get(identity)
