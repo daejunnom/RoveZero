@@ -131,6 +131,13 @@ pub fn build_fastchess_invocation(
     let pair = plan
         .pair(pair_id)
         .ok_or_else(|| invalid("unknown pair ID"))?;
+    // The pinned A-backed PGN auditor bounds full histories to 4095 plies.
+    // Reject before launch rather than producing an unauditable runner result.
+    if input.protocol.max_plies > 4095 {
+        return Err(invalid(
+            "Fastchess fixture full game ply ceiling exceeds the supported PGN audit limit of 4095",
+        ));
+    }
     let prefix_plies = u32::try_from(pair.opening.moves.len())
         .map_err(|_| invalid("opening prefix exceeds Fastchess ply range"))?;
     let searched_plies = input

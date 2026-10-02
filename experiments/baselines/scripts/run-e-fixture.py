@@ -63,15 +63,13 @@ def main():
             if interrupt:
                 # Wait for the actual runner child, beyond input hashing.
                 deadline = time.monotonic() + 10
-                children = Path(f"/proc/{child.pid}/task/{child.pid}/children")
                 while child.poll() is None and time.monotonic() < deadline:
-                    try:
-                        if children.read_text().strip():
+                    if (root / "attempt-cancel/opening.pgn").exists():
+                        time.sleep(0.05)
+                        if child.poll() is None:
                             child.send_signal(signal.SIGINT)
                             break
-                    except FileNotFoundError:
-                        pass
-                    time.sleep(0.01)
+                    time.sleep(0.001)
                 else:
                     raise RuntimeError("no live runner child available for cancellation")
             try:

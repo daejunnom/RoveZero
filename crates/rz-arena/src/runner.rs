@@ -64,6 +64,8 @@ pub struct FixtureExecutionFailure {
 /// below artifact_root, preserves every failed attempt's outputs, and never
 /// resumes or overwrites an earlier attempt. Retries require an external owner.
 /// Input files must not be modified in place while this function uses them.
+/// The caller must exclusively manage artifact_root and its directory names;
+/// concurrent root/attempt pathname replacement is outside this fixture API.
 pub fn run_fixture_pair(
     plan: &ArenaPlan,
     artifact_root: &Path,
@@ -265,7 +267,11 @@ fn linux_run(
         },
         cancel,
         Some(&ArtifactWatch {
-            relative_files: vec!["opening.pgn".into(), "match.pgn".into()],
+            relative_files: vec![
+                "opening.pgn".into(),
+                "match.pgn".into(),
+                "config.json".into(),
+            ],
             max_total_bytes: watch_cap,
         }),
     )?;
@@ -275,6 +281,32 @@ fn linux_run(
             put("stdout.log", &process.stdout, stream_cap)?,
             put("stderr.log", &process.stderr, stream_cap)?,
         ];
+        let config_bytes = match directory.symlink_metadata("config.json") {
+            Ok(metadata) => {
+                if !metadata.is_file() {
+                    return Err(ArenaError::Integrity(
+                        "runner config is not a regular file".into(),
+                    ));
+                }
+                let mut options = OpenOptions::new();
+                options
+                    .read(true)
+                    .follow(FollowSymlinks::No)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                let file = directory
+                    .open_with("config.json", &options)
+                    .map_err(|_| ArenaError::Io("cannot open runner config".into()))?;
+                let config_cap = watch_cap
+                    .checked_sub(opening.len() as u64)
+                    .ok_or_else(|| ArenaError::Budget("opening exceeds watched budget".into()))?
+                    .min(METADATA_CAP);
+                let text = read_pgn(file.into_std(), config_cap)?;
+                artifacts.push(artifact(output_directory, "config.json", text.as_bytes()));
+                text.len() as u64
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(_) => return Err(ArenaError::Io("cannot inspect runner config".into())),
+        };
         let pgn = match directory.symlink_metadata("match.pgn") {
             Ok(metadata) => {
                 if !metadata.is_file() {
@@ -304,7 +336,13 @@ fn linux_run(
                     }
                     read_pgn(
                         file.into_std(),
-                        (watch_cap - opening_metadata.len()).min(crate::MAX_JSON_BYTES as u64),
+                        watch_cap
+                            .checked_sub(opening_metadata.len())
+                            .and_then(|n| n.checked_sub(config_bytes))
+                            .ok_or_else(|| {
+                                ArenaError::Budget("watched output exceeds shared budget".into())
+                            })?
+                            .min(crate::MAX_JSON_BYTES as u64),
                     )
                 }
             }

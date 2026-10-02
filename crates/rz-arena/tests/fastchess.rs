@@ -253,7 +253,7 @@ fn rejects_unsupported_clock_increment_and_fractional_second_conversion() {
 
 #[test]
 fn rejects_limits_that_cannot_represent_the_full_opening_plus_searched_plies() {
-    for maximum in [1, 2, 3, 5] {
+    for maximum in [1, 2, 3, 5, 4096] {
         let mut input = fixture();
         input.protocol.max_plies = maximum;
         assert!(invoke(input).is_err());
