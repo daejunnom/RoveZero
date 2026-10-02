@@ -5,6 +5,8 @@
 mod contract;
 mod fastchess;
 mod ledger;
+mod native_launch;
+mod native_runner;
 mod pgn;
 mod plan;
 mod process;
@@ -13,6 +15,8 @@ mod runner;
 pub use contract::*;
 pub use fastchess::*;
 pub use ledger::*;
+pub use native_launch::*;
+pub use native_runner::*;
 pub use pgn::*;
 pub use plan::*;
 pub use process::*;

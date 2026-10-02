@@ -1,6 +1,10 @@
-use rz_arena::{ArenaPlan, Event, Ledger, LedgerLimits, PlanLimits, decode_json, run_fixture_pair};
+use rz_arena::{
+    ArenaPlan, Event, Ledger, LedgerLimits, PlanLimits, decode_json, prepare_native_launch,
+    run_fixture_pair, run_native_pair,
+};
 use rz_experiments::{
-    IntegrationPairSpecV1, LockedManifest, MAX_MANIFEST_BYTES, MAX_NATIVE_LAUNCH_JSON_BYTES,
+    IntegrationPairSpecV1, LockedIntegrationPairSpecV1, LockedManifest, MAX_MANIFEST_BYTES,
+    MAX_NATIVE_LAUNCH_JSON_BYTES,
 };
 use std::env;
 use std::ffi::OsString;
@@ -10,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const JSON_LIMIT: u64 = MAX_MANIFEST_BYTES as u64;
-const USAGE: &str = "Usage:\n  rz-arena plan LOCKED OUTPUT --max-pairs N --max-plan-bytes N\n  rz-arena ledger-init PLAN OUTPUT --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N\n  rz-arena ledger-append PLAN LEDGER EVENT OUTPUT --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N\n  rz-arena audit PLAN LEDGER --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N [--expected-tip SHA]\n  rz-arena fixture-pair PLAN ARTIFACT_ROOT NEW_OUTPUT_BASENAME --max-pairs N --max-plan-bytes N\n  rz-arena native-lock INPUT OUTPUT\n\nAll bounds are required and positive. fixture-pair is a synthetic smoke only; execution_ready=false. native-lock checks declarations for one CPU NN integration pair, with required locked budgets and strength_eligible=false.";
+const USAGE: &str = "Usage:\n  rz-arena plan LOCKED OUTPUT --max-pairs N --max-plan-bytes N\n  rz-arena ledger-init PLAN OUTPUT --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N\n  rz-arena ledger-append PLAN LEDGER EVENT OUTPUT --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N\n  rz-arena audit PLAN LEDGER --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N [--expected-tip SHA]\n  rz-arena fixture-pair PLAN ARTIFACT_ROOT NEW_OUTPUT_BASENAME --max-pairs N --max-plan-bytes N\n  rz-arena native-lock INPUT OUTPUT\n  rz-arena native-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME\n\nAll bounds are required and positive. fixture-pair is a synthetic smoke only; execution_ready=false. native-lock checks declarations for one CPU NN integration pair, with required locked budgets and strength_eligible=false. native-pair requires Linux and exclusively owned outside-Git roots; it audits actual CPU NN evidence and process cleanup within the locked budgets.";
 
 #[derive(Clone, Copy)]
 enum Operation {
@@ -59,6 +63,12 @@ enum Command {
         input: PathBuf,
         output: PathBuf,
     },
+    NativePair {
+        locked: PathBuf,
+        artifact_root: PathBuf,
+        output_root: PathBuf,
+        output_directory: OsString,
+    },
     Execute {
         operation: Operation,
         paths: Vec<PathBuf>,
@@ -92,6 +102,20 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, String> {
         return Ok(Command::NativeLock {
             input: PathBuf::from(&args[1]),
             output: PathBuf::from(&args[2]),
+        });
+    }
+    if command == Some("native-pair") {
+        if args.len() != 5 {
+            return Err(
+                "native-pair requires exactly LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME"
+                    .to_string(),
+            );
+        }
+        return Ok(Command::NativePair {
+            locked: PathBuf::from(&args[1]),
+            artifact_root: PathBuf::from(&args[2]),
+            output_root: PathBuf::from(&args[3]),
+            output_directory: args[4].clone(),
         });
     }
     let (operation, path_count, ledger_bounds) = match command {
@@ -192,6 +216,69 @@ fn execute(command: Command) -> Result<String, String> {
             return Ok(success(
                 "native integration declarations locked; execution not verified",
             ));
+        }
+        Command::NativePair {
+            locked,
+            artifact_root,
+            output_root,
+            output_directory,
+        } => {
+            let spec = LockedIntegrationPairSpecV1::from_json(&read_text(
+                &locked,
+                MAX_NATIVE_LAUNCH_JSON_BYTES as u64,
+            )?)
+            .map_err(|error| error.to_string())?;
+            let output_directory = output_directory
+                .to_str()
+                .ok_or_else(|| "output basename must be ASCII".to_string())?;
+            let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            #[cfg(unix)]
+            {
+                signal_hook::flag::register(signal_hook::consts::SIGINT, cancelled.clone())
+                    .map_err(|_| "cannot install SIGINT cancellation".to_string())?;
+                signal_hook::flag::register(signal_hook::consts::SIGTERM, cancelled.clone())
+                    .map_err(|_| "cannot install SIGTERM cancellation".to_string())?;
+            }
+            let owner = prepare_native_launch(
+                &spec,
+                &artifact_root,
+                &output_root,
+                output_directory,
+            )
+            .map_err(|failure| {
+                if let Ok(receipt) = serde_json::to_string(&serde_json::json!({
+                    "preparation": failure.receipt,
+                    "receipt_artifact": failure.receipt_artifact,
+                    "persistence_error": failure.persistence_error.as_ref().map(ToString::to_string),
+                })) {
+                    eprintln!("native_preparation_failure_receipt={receipt}");
+                }
+                failure.to_string()
+            })?;
+            let output = run_native_pair(owner, Some(&cancelled)).map_err(|failure| {
+                if let Ok(receipt) = serde_json::to_string(&serde_json::json!({
+                    "receipt": failure.receipt,
+                    "receipt_artifact": failure.receipt_artifact,
+                    "process": failure.process().map(|process| &process.receipt),
+                    "cause": failure.cause.to_string(),
+                    "ownership_scope": "unverified process ownership is retained for this CLI process lifetime; files are preserved",
+                })) {
+                    eprintln!("native_pair_failure_receipt={receipt}");
+                }
+                failure.to_string()
+            })?;
+            return serde_json::to_string_pretty(&serde_json::json!({
+                "execution_ready": false,
+                "strength_eligible": false,
+                "validation_scope": output.receipt.validation_scope,
+                "integration_checks_passed": output.receipt.integration_checks_passed,
+                "receipt": output.receipt_artifact,
+                "provider_sessions": output.receipt.provider_sessions,
+                "scored_games": output.receipt.scored_games,
+                "incomplete_games": output.receipt.incomplete_games,
+                "process_cleanup": output.receipt.process.group_cleanup,
+            }))
+            .map_err(|error| error.to_string());
         }
         other => other,
     };
