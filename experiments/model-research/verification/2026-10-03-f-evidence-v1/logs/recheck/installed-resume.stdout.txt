@@ -1,0 +1,1 @@
+{"run": "${ARTIFACT_ROOT}/runs/installed-resume", "status": "step_budget_reached", "steps": 8, "execution_scope": "cpu_fixture", "execution_ready": false, "digest": "c8351b4bd96bd1549bd0c2b56160e4c79efe617bc3b98d1be206e78007f36795"}

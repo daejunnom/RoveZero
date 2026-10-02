@@ -129,6 +129,11 @@ raw log를 Git에 넣지 않는다. 독립 클라우드의 예시 output root는
 환경 수명 동안 보존한다. 종료 전에 필요한 근거를 회수하고 검토된 인수 요약을
 [HANDOFF](HANDOFF.md)에 남긴다.
 
+사용자의 raw 검증 자료 보존 지시에 따른 작은 검토 archive는
+[verification/2026-10-03-f-evidence-v1](verification/2026-10-03-f-evidence-v1/README.md)에 있다.
+원본/과거 tool log/새 재실행/재구성/파생 자료를 구분하고 파일 SHA·소스 연결·누락·
+경로 마스킹·재현 명령을 함께 보존한다. 원본을 삭제하거나 새 기능을 구현하는 변경이 아니다.
+
 ## 다음 연결 요구
 
 확인한 Rust revision 0.1과 향후 영속화 표현에 이 잠정 envelope의 adapter를

@@ -1,0 +1,82 @@
+======================================================================
+FAIL: test_nonfinite_targets_are_rejected_without_clipping (test_schema.SchemaTests.test_nonfinite_targets_are_rejected_without_clipping) (target='policy', invalid=nan)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 129, in test_nonfinite_targets_are_rejected_without_clipping
+    self.assert_invalid_record(record, "NonFinite")
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 34, in assert_invalid_record
+    self.assertEqual(caught.exception.code, code)
+AssertionError: 'InvalidJson' != 'NonFinite'
+- InvalidJson
++ NonFinite
+
+
+======================================================================
+FAIL: test_nonfinite_targets_are_rejected_without_clipping (test_schema.SchemaTests.test_nonfinite_targets_are_rejected_without_clipping) (target='policy', invalid=inf)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 129, in test_nonfinite_targets_are_rejected_without_clipping
+    self.assert_invalid_record(record, "NonFinite")
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 34, in assert_invalid_record
+    self.assertEqual(caught.exception.code, code)
+AssertionError: 'InvalidJson' != 'NonFinite'
+- InvalidJson
++ NonFinite
+
+
+======================================================================
+FAIL: test_nonfinite_targets_are_rejected_without_clipping (test_schema.SchemaTests.test_nonfinite_targets_are_rejected_without_clipping) (target='policy', invalid=-inf)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 129, in test_nonfinite_targets_are_rejected_without_clipping
+    self.assert_invalid_record(record, "NonFinite")
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 34, in assert_invalid_record
+    self.assertEqual(caught.exception.code, code)
+AssertionError: 'InvalidJson' != 'NonFinite'
+- InvalidJson
++ NonFinite
+
+
+======================================================================
+FAIL: test_nonfinite_targets_are_rejected_without_clipping (test_schema.SchemaTests.test_nonfinite_targets_are_rejected_without_clipping) (target='value', invalid=nan)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 129, in test_nonfinite_targets_are_rejected_without_clipping
+    self.assert_invalid_record(record, "NonFinite")
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 34, in assert_invalid_record
+    self.assertEqual(caught.exception.code, code)
+AssertionError: 'InvalidJson' != 'NonFinite'
+- InvalidJson
++ NonFinite
+
+
+======================================================================
+FAIL: test_nonfinite_targets_are_rejected_without_clipping (test_schema.SchemaTests.test_nonfinite_targets_are_rejected_without_clipping) (target='value', invalid=inf)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 129, in test_nonfinite_targets_are_rejected_without_clipping
+    self.assert_invalid_record(record, "NonFinite")
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 34, in assert_invalid_record
+    self.assertEqual(caught.exception.code, code)
+AssertionError: 'InvalidJson' != 'NonFinite'
+- InvalidJson
++ NonFinite
+
+
+======================================================================
+FAIL: test_nonfinite_targets_are_rejected_without_clipping (test_schema.SchemaTests.test_nonfinite_targets_are_rejected_without_clipping) (target='value', invalid=-inf)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 129, in test_nonfinite_targets_are_rejected_without_clipping
+    self.assert_invalid_record(record, "NonFinite")
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 34, in assert_invalid_record
+    self.assertEqual(caught.exception.code, code)
+AssertionError: 'InvalidJson' != 'NonFinite'
+- InvalidJson
++ NonFinite
+
+
+----------------------------------------------------------------------
+Ran 52 tests in 0.049s
+
+FAILED (failures=6)

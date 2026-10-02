@@ -1,0 +1,5 @@
+# Preserve evidence bytes across Linux and Windows checkouts.
+* -text
+# Original package metadata intentionally contains CRLF and whitespace.
+original/** whitespace=-blank-at-eol,-blank-at-eof,cr-at-eol
+recheck/package/** whitespace=-blank-at-eol,-blank-at-eof,cr-at-eol

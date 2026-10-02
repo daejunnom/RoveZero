@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "redactions": [
+    {
+      "path": "original/f01/package-check/installed/rovezero_data-0.1.0.dist-info/direct_url.json",
+      "kind": "local_absolute_path_normalization",
+      "original_byte_sha256": "8573567e6f2ee66dfc2304dd6bdfd8f55ef08c3adcc12d2e99b687d443e50f1c",
+      "published_byte_sha256": "5140f3b5d073075f03fd6249233ab2c35e7c5776b82b2aaca4fbc42c90fe8772"
+    },
+    {
+      "path": "original/f01/package-check/installed-final/rovezero_data-0.1.0.dist-info/direct_url.json",
+      "kind": "local_absolute_path_normalization",
+      "original_byte_sha256": "883a0d1bf75f85e63055f6a049a664ae2d1e3d255962a3bfd59ddaf68c79a2be",
+      "published_byte_sha256": "a6c92b9399cea87359ea71d582394b2ff2125a12a8668bdd9a59cc7276d28d00"
+    },
+    {
+      "path": "original/f02/package-check-v1/installed/rovezero_data-0.1.0.dist-info/direct_url.json",
+      "kind": "local_absolute_path_normalization",
+      "original_byte_sha256": "eb13cb8a4bf16ad28c0b84877c3b9433d959c38a1448083e3d041e0b2ba44a2f",
+      "published_byte_sha256": "5f18c2ea0dc912002a404144581a940c442dad9a21d1ac9a95581e1eed4173dd"
+    }
+  ],
+  "historical_logs": "only task paths normalized; full chat/messages/identities were not copied"
+}

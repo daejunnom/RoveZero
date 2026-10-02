@@ -1,0 +1,64 @@
+======================================================================
+FAIL: test_nonfinite_targets_are_rejected_without_clipping (test_schema.SchemaTests.test_nonfinite_targets_are_rejected_without_clipping) (target='policy', invalid=nan)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 129, in test_nonfinite_targets_are_rejected_without_clipping
+    self.assert_invalid_record(record, "NonFinite")
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 35, in assert_invalid_record
+    self.assertTrue(caught.exception.context.startswith("record"))
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_nonfinite_targets_are_rejected_without_clipping (test_schema.SchemaTests.test_nonfinite_targets_are_rejected_without_clipping) (target='policy', invalid=inf)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 129, in test_nonfinite_targets_are_rejected_without_clipping
+    self.assert_invalid_record(record, "NonFinite")
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 35, in assert_invalid_record
+    self.assertTrue(caught.exception.context.startswith("record"))
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_nonfinite_targets_are_rejected_without_clipping (test_schema.SchemaTests.test_nonfinite_targets_are_rejected_without_clipping) (target='policy', invalid=-inf)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 129, in test_nonfinite_targets_are_rejected_without_clipping
+    self.assert_invalid_record(record, "NonFinite")
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 35, in assert_invalid_record
+    self.assertTrue(caught.exception.context.startswith("record"))
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_nonfinite_targets_are_rejected_without_clipping (test_schema.SchemaTests.test_nonfinite_targets_are_rejected_without_clipping) (target='value', invalid=nan)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 129, in test_nonfinite_targets_are_rejected_without_clipping
+    self.assert_invalid_record(record, "NonFinite")
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 35, in assert_invalid_record
+    self.assertTrue(caught.exception.context.startswith("record"))
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_nonfinite_targets_are_rejected_without_clipping (test_schema.SchemaTests.test_nonfinite_targets_are_rejected_without_clipping) (target='value', invalid=inf)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 129, in test_nonfinite_targets_are_rejected_without_clipping
+    self.assert_invalid_record(record, "NonFinite")
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 35, in assert_invalid_record
+    self.assertTrue(caught.exception.context.startswith("record"))
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_nonfinite_targets_are_rejected_without_clipping (test_schema.SchemaTests.test_nonfinite_targets_are_rejected_without_clipping) (target='value', invalid=-inf)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 129, in test_nonfinite_targets_are_rejected_without_clipping
+    self.assert_invalid_record(record, "NonFinite")
+  File "${CHECKOUT_ROOT}/experiments/model-research/tests/test_schema.py", line 35, in assert_invalid_record
+    self.assertTrue(caught.exception.context.startswith("record"))
+AssertionError: False is not true
+
+----------------------------------------------------------------------
+Ran 54 tests in 0.054s
+
+FAILED (failures=6)

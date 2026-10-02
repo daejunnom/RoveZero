@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "items": [
+    {
+      "item": "original separate stdout/stderr files",
+      "status": "not_created_or_no_longer_present",
+      "replacement": "22 complete historical tool combined-output captures; stream separation unavailable; 13 new rechecks record separate streams"
+    },
+    {
+      "item": "historical exact command Git/source SHA",
+      "status": "not_in_tool_command_metadata",
+      "replacement": "source byte matching and run provenance are recorded separately; do not equate matching bytes with execution-time HEAD"
+    },
+    {
+      "item": "F02 preliminary-v1 exact source tree",
+      "status": "unknown_uncommitted_WIP",
+      "implementation_digest": "7fa34f85fd35fe6db1d5b141974922790648c3e43cb7753d073c978fe1130b55",
+      "replacement": "original JSON kept; no matching Git Python tree found; current-source reproduction not claimed"
+    },
+    {
+      "item": "initial F01 package source exact Git commit",
+      "status": "no_matching_preserved_Git_tree",
+      "replacement": "original package metadata retained; source-final and installed-final match 3877901; initial package does not"
+    },
+    {
+      "item": "original training provenance audit body",
+      "status": "not_saved_by_original_training_loader",
+      "replacement": "reconstructed/training-data-audit.json; identical embedded digest confirmed with original receipts; not relabeled original"
+    },
+    {
+      "item": "original raw metrics TSV/CSV",
+      "status": "not_generated",
+      "replacement": "derived/original-training-history.tsv from original receipt.history, explicitly derived"
+    },
+    {
+      "item": "original installed-cli-resume-v1 export-specific verifier receipt",
+      "status": "not_present",
+      "replacement": "original installed-export-verify-v1 verifies cpu-resume-v1/export; new recheck explicitly verifies its installed-resume export"
+    },
+    {
+      "item": "original wheel binaries",
+      "status": "ephemeral_wheel_bytes_not_present_and_binary_publication_excluded",
+      "replacement": "original pip output carries reported wheel SHA only; bytes cannot be rechecked; new pip capture retained"
+    },
+    {
+      "item": "build/cache/bytecode/installed scripts and copied package sources",
+      "status": "excluded_regenerable_or_binary",
+      "replacement": "source Git SHA, fixture input bytes, package text metadata and installation logs retained; originals not deleted"
+    },
+    {
+      "item": "full chat records and mixed validation/Git-mutation transcript record",
+      "status": "not_published",
+      "replacement": "only selected F validation command/output records; one mixed Git mutation record excluded from executable history"
+    },
+    {
+      "item": "D/E artifacts",
+      "status": "outside_F_owned_workspace_and_path_scope",
+      "replacement": "handled in their owning roles; no D/E files changed"
+    },
+    {
+      "item": "real teacher/Maia/GPU/arena evidence",
+      "status": "not_run_or_not_available",
+      "replacement": "this bundle contains actual CPU checks on synthetic fixtures only"
+    }
+  ]
+}

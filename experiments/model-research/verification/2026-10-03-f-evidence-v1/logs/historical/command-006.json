@@ -1,0 +1,21 @@
+{
+  "status": "completed",
+  "exit_code": 0,
+  "duration_ms": 0,
+  "truncated": false,
+  "origin": "historical_codex_command_execution",
+  "turn_started_at": 1790954561,
+  "turn_completed_at": 1790955779,
+  "position": 69,
+  "source_git_sha": null,
+  "source_sha_status": "not_recorded_in_command_metadata; see artifact provenance mapping",
+  "data_kind": "synthetic_fixture_or_package_self_check",
+  "command": "/bin/bash -lc 'PYTHONPATH=src python -m rz_data split --sources fixtures/sources.json --seed fixture-demo --output-root ${ARTIFACT_ROOT}/original-f01 --run-id fixture-source-plan-v1\nPYTHONPATH=src python -m rz_data validate --manifest fixtures/manifest.json --records fixtures/records.jsonl --split-plan ${ARTIFACT_ROOT}/original-f01/fixture-source-plan-v1/split-plan.json --output-root ${ARTIFACT_ROOT}/original-f01 --run-id fixture-audit-v1'",
+  "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+  "original_output_byte_sha256": "f381a92d6281e69ad6275ec81c48231b03c6002f60f81956670a50b2320f74ff",
+  "original_command_byte_sha256": "7931538d23366e2b7bd046169714d533a93435007a00f62dab748cb6adda80ba",
+  "output_file": "logs/historical/command-006.combined.txt",
+  "stdout_stderr_separation": "unavailable_in_historical_tool_capture",
+  "source_kind": "actual_process_capture_on_synthetic_fixture_or_own_package",
+  "privacy_normalization": "logical task paths; output otherwise preserved"
+}

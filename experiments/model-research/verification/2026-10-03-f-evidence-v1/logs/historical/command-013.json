@@ -1,0 +1,21 @@
+{
+  "status": "completed",
+  "exit_code": 0,
+  "duration_ms": 73,
+  "truncated": false,
+  "origin": "historical_codex_command_execution",
+  "turn_started_at": 1790956763,
+  "turn_completed_at": 1790958251,
+  "position": 55,
+  "source_git_sha": null,
+  "source_sha_status": "not_recorded_in_command_metadata; see artifact provenance mapping",
+  "data_kind": "synthetic_fixture_or_package_self_check",
+  "command": "/bin/bash -lc 'PYTHONPATH=src python -m unittest discover -s tests -q'",
+  "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+  "original_output_byte_sha256": "d80a8f37154ff74b3250766ed1628499043e80f2a7732bd26dd955aa22e49f06",
+  "original_command_byte_sha256": "560b21a664ffd629993a46562c1fc2bf1ddbb5412ecdef0faf4a7e97f0778b0a",
+  "output_file": "logs/historical/command-013.combined.txt",
+  "stdout_stderr_separation": "unavailable_in_historical_tool_capture",
+  "source_kind": "actual_process_capture_on_synthetic_fixture_or_own_package",
+  "privacy_normalization": "logical task paths; output otherwise preserved"
+}

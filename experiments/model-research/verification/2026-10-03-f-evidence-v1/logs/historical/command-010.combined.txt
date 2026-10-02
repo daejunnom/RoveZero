@@ -1,0 +1,22 @@
+Processing ${ARTIFACT_ROOT}/original-f01/package-check/source-final
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: rovezero-data
+  Building wheel for rovezero-data (pyproject.toml): started
+  Building wheel for rovezero-data (pyproject.toml): finished with status 'done'
+  Created wheel for rovezero-data: filename=rovezero_data-0.1.0-py3-none-any.whl size=19106 sha256=52052a0350be95aea9d852736ed922575e81cd9bfd5a4b8cf4fb04760e26863f
+  Stored in directory: ${TMPDIR}/pip-ephem-wheel-cache-wi1yyc4y/wheels/4f/cd/b8/ceb37498d981743bd2a45e1791c0918ee174b3ebc73a2a5f20
+Successfully built rovezero-data
+Installing collected packages: rovezero-data
+Successfully installed rovezero-data-0.1.0
+usage: rz-data [-h] {split,validate} ...
+
+F01 source grouping and structural data audits (CPU only)
+
+positional arguments:
+  {split,validate}
+    split           freeze source groups before row generation
+    validate        audit rows against their immutable split plan
+
+options:
+  -h, --help        show this help message and exit

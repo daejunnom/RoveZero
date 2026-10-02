@@ -1,0 +1,17 @@
+LICENSE
+README.md
+pyproject.toml
+src/rovezero_data.egg-info/PKG-INFO
+src/rovezero_data.egg-info/SOURCES.txt
+src/rovezero_data.egg-info/dependency_links.txt
+src/rovezero_data.egg-info/entry_points.txt
+src/rovezero_data.egg-info/top_level.txt
+src/rz_data/__init__.py
+src/rz_data/__main__.py
+src/rz_data/audit.py
+src/rz_data/cli.py
+src/rz_data/errors.py
+src/rz_data/io.py
+src/rz_data/schema.py
+src/rz_data/serialization.py
+src/rz_data/splits.py

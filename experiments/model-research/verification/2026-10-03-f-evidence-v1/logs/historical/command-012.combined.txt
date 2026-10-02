@@ -1,0 +1,1 @@
+{"run": "${ARTIFACT_ROOT}/original-f02/preliminary-v1", "status": "step_budget_reached", "steps": 8, "execution_scope": "cpu_fixture", "execution_ready": false, "digest": "c96be4bf89fe8e0d08dfab6ac37bc369fcfe9019eff988a6996102e9e69900ef"}

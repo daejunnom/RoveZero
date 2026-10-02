@@ -1,0 +1,21 @@
+{
+  "status": "completed",
+  "exit_code": 0,
+  "duration_ms": 0,
+  "truncated": false,
+  "origin": "historical_codex_command_execution",
+  "turn_started_at": 1790954561,
+  "turn_completed_at": 1790955779,
+  "position": 91,
+  "source_git_sha": null,
+  "source_sha_status": "not_recorded_in_command_metadata; see artifact provenance mapping",
+  "data_kind": "synthetic_fixture_or_package_self_check",
+  "command": "/bin/bash -lc 'PYTHONPATH=${ARTIFACT_ROOT}/original-f01/package-check/installed-final ${ARTIFACT_ROOT}/original-f01/package-check/installed-final/bin/rz-data validate --manifest fixtures/manifest.json --records fixtures/records.jsonl --split-plan ${ARTIFACT_ROOT}/original-f01/fixture-source-plan-v1/split-plan.json --output-root ${ARTIFACT_ROOT}/original-f01 --run-id installed-final-fixture-audit-v1'",
+  "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+  "original_output_byte_sha256": "d1f040b08a96cc75e466d169d10252283d78583f40e5f9e1ae1bff6ed5ebea65",
+  "original_command_byte_sha256": "247a3fc4d81da901ed6d5f27a59a4386859f32e01d5c9ffed334db59ba682fa4",
+  "output_file": "logs/historical/command-011.combined.txt",
+  "stdout_stderr_separation": "unavailable_in_historical_tool_capture",
+  "source_kind": "actual_process_capture_on_synthetic_fixture_or_own_package",
+  "privacy_normalization": "logical task paths; output otherwise preserved"
+}

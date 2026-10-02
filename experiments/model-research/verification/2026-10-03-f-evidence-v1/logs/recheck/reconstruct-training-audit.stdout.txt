@@ -1,0 +1,1 @@
+{"audit_digest":"0232cafab69cc4cee02dac8fa3d3eaaeb69ae3f25192c6d6adbbbf998409a7e4","counts":{"complete_label_candidates":6,"excluded_labels":0,"input_records":6,"rejected_records":0,"structurally_valid_records":6},"execution_ready":false,"run_id":"training-audit","structural_audit_passed":true}

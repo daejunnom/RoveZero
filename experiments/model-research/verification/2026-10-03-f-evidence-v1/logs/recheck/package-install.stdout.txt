@@ -1,0 +1,11 @@
+Processing ${ARTIFACT_ROOT}/package-source/experiments/model-research
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: rovezero-data
+  Building wheel for rovezero-data (pyproject.toml): started
+  Building wheel for rovezero-data (pyproject.toml): finished with status 'done'
+  Created wheel for rovezero-data: filename=rovezero_data-0.1.0-py3-none-any.whl size=37051 sha256=d5bca3146e6c6f0057db40ee5a131dbe8f96ef0e735c7c15c45466c319dfdb14
+  Stored in directory: ${TMPDIR}/pip-ephem-wheel-cache-i4qj7ngb/wheels/04/00/9a/488743a23c269576d76fd7f61fb67cdc9e8bde5225af180aa8
+Successfully built rovezero-data
+Installing collected packages: rovezero-data
+Successfully installed rovezero-data-0.1.0

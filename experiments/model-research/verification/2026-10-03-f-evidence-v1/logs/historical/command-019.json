@@ -1,0 +1,21 @@
+{
+  "status": "completed",
+  "exit_code": 0,
+  "duration_ms": 0,
+  "truncated": false,
+  "origin": "historical_codex_command_execution",
+  "turn_started_at": 1790956763,
+  "turn_completed_at": 1790958251,
+  "position": 91,
+  "source_git_sha": null,
+  "source_sha_status": "not_recorded_in_command_metadata; see artifact provenance mapping",
+  "data_kind": "synthetic_fixture_or_package_self_check",
+  "command": "/bin/bash -lc \"PYTHONPATH=src python - <<'PY'\nfrom pathlib import Path\nfrom rz_data.io import read_json\nfrom rz_data.serialization import canonical_bytes\nfrom rz_training.trainer import train_fixture,verify_export\np=Path('fixtures/training')\nout=Path('${ARTIFACT_ROOT}/original-f02')\nrecipe=read_json(p/'recipe.json',max_bytes=65536)\nsource=Path.cwd().parents[1]\ndef run(name,**kw):\n    return train_fixture(recipe,p/'manifest.json',p/'records.jsonl',p/'split-plan.json',p/'features.json',output_root=out,run_id=name,source_root=source,**kw)\nfull,full_r=run('cpu-continuous-v1')\npaused,pause_r=run('cpu-pause-v1',stop_after=3)\nresumed,resume_r=run('cpu-resume-v1',resume_path=paused/'resume-checkpoint.json')\na=read_json(full/'resume-checkpoint.json',max_bytes=1048576)\nb=read_json(resumed/'resume-checkpoint.json',max_bytes=1048576)\nchecks={k:a[k]==b[k] for k in ('model','optimizer','sampler','best','history')}\nassert all(checks.values())\nrecipe['freeze']=True\n(out/'frozen-recipe-v1.json').write_bytes(canonical_bytes(recipe)+b'\\\\n')\nfrozen,frozen_r=run('cpu-frozen-v1')\nassert not frozen_r['weights_changed'] and frozen_r['selection']['step']==0\nsummary={'continuous_steps':full_r['actual']['steps'],'paused_steps':pause_r['actual']['steps'],'resumed_steps':resume_r['actual']['steps'],'resume_matches':checks,'weights_changed':full_r['weights_changed'],'validation_loss_first':full_r['history'][0]['validation_loss'],'validation_loss_last':full_r['history'][-1]['validation_loss'],'frozen_weights_changed':frozen_r['weights_changed'],'export':verify_export(read_json(resumed/'export.json',max_bytes=1048576)),'digests':{'full_receipt':full_r['digest'],'resume_receipt':resume_r['digest'],'frozen_receipt':frozen_r['digest'],'final_model':full_r['final_weights_digest']}}\n(out/'cpu-lifecycle-summary-v1.json').write_bytes(canonical_bytes(summary)+b'\\\\n')\nprint(canonical_bytes(summary).decode())\nPY\"",
+  "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+  "original_output_byte_sha256": "94ddf984b02c93a277ad3665ad38d16143df5592d5b6ee09ab760778032e58b9",
+  "original_command_byte_sha256": "535ac60647eee0fc657146ff53b0c8743d0e94f183853fbb91c501c056754e9e",
+  "output_file": "logs/historical/command-019.combined.txt",
+  "stdout_stderr_separation": "unavailable_in_historical_tool_capture",
+  "source_kind": "actual_process_capture_on_synthetic_fixture_or_own_package",
+  "privacy_normalization": "logical task paths; output otherwise preserved"
+}

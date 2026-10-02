@@ -1,0 +1,3 @@
+[console_scripts]
+rz-data = rz_data.cli:main
+rz-train = rz_training.cli:main

@@ -92,8 +92,19 @@ Python에 재선언하지 않고 향후 F adapter가 연결할 move/order/identi
 
 ## 산출물 보존
 
-합성 fixture와 검토된 요약만 Git에 넣는다. 원시 output run과 package-check는
+일반적으로 합성 fixture와 검토된 요약을 Git에 넣는다. 원시 output run과 package-check는
 저장소 밖 이 작업의 전용 `rovezero-f01`/`rovezero-f02` output root에 두었다. 현재 클라우드 환경
 수명 동안 보존하고, 환경 종료 전에 필요한 report/package를 회수한다.
 공유 요약에서는 개인 경로·비밀·외부 가중치·raw teacher 기록을 포함하지 않는다.
 동일 run ID는 덮어쓰지 않으며 새로운 검사에는 새 run ID를 사용한다.
+
+2026-10-03 사용자 지시로 작은 검토 완료 raw 검증 자료를
+[F evidence archive](verification/2026-10-03-f-evidence-v1/README.md)에 추가했다.
+원본 JSON 52개, 과거 commandExecution combined log 22개(실패 2개 포함), 실행 입력·
+recipe·split·checkpoint·receipt·export·package text metadata를 보존한다. 별도 보존용
+새 실행 13개의 stdout/stderr·명령·소스 SHA·결과, 같은 digest로 재구성한 누락 audit,
+receipt.history의 파생 TSV와 누락 원장도 포함한다. 파일별 byte SHA-256은 manifest와
+SHA256SUMS에 있다. 원래 execution-time source SHA가 없는 항목과 WIP source 미상은
+그대로 표시한다. 개인정보 경로를 마스킹하고 비밀/권리 검사를 거쳤으며 build cache·
+바이너리·외부 weights/data는 제외했다. source 구현은 변경하지 않았다. 원격 보존을
+확인한 뒤에도 원본 scratch 자료는 삭제하지 않는다.

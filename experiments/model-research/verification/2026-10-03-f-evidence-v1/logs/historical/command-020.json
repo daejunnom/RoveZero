@@ -1,0 +1,21 @@
+{
+  "status": "completed",
+  "exit_code": 0,
+  "duration_ms": 521,
+  "truncated": false,
+  "origin": "historical_codex_command_execution",
+  "turn_started_at": 1790956763,
+  "turn_completed_at": 1790958251,
+  "position": 98,
+  "source_git_sha": null,
+  "source_sha_status": "not_recorded_in_command_metadata; see artifact provenance mapping",
+  "data_kind": "synthetic_fixture_or_package_self_check",
+  "command": "/bin/bash -lc 'PYTHONPATH=src python -m unittest discover -s tests -q\n PYTHONPATH=src python -m rz_training verify-export --export ${ARTIFACT_ROOT}/original-f02/cpu-resume-v1/export.json --output-root ${ARTIFACT_ROOT}/original-f02 --run-id cpu-export-verify-v1'",
+  "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+  "original_output_byte_sha256": "e4f387fa8a06b41238b15711e68335e24cc2bd8d5157d7ab7629d4765160c55a",
+  "original_command_byte_sha256": "4d9426efbac141da5e78372ca8c091ea51e4ef5a006a050094683abc8594b2c1",
+  "output_file": "logs/historical/command-020.combined.txt",
+  "stdout_stderr_separation": "unavailable_in_historical_tool_capture",
+  "source_kind": "actual_process_capture_on_synthetic_fixture_or_own_package",
+  "privacy_normalization": "logical task paths; output otherwise preserved"
+}

@@ -1,0 +1,1 @@
+{"run": "${ARTIFACT_ROOT}/runs/cpu-pause", "status": "paused", "steps": 3, "execution_scope": "cpu_fixture", "execution_ready": false, "digest": "96af4d49e7ccd757656d3de7ea0c32478eba734e6f8149410a71067cdcc41425"}

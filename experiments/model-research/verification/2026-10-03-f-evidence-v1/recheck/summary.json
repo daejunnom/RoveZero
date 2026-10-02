@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "source_git_sha": "36e619bae238a587e04c0a4bae24624eb5414aec",
+  "capture_kind": "new_preservation_recheck",
+  "execution": "actual_CPU_process",
+  "data_kind": "synthetic_numeric_fixture",
+  "continuous_resume_installed_equal": {
+    "model": true,
+    "optimizer": true,
+    "sampler": true,
+    "best": true,
+    "history": true,
+    "provenance": true
+  },
+  "original_continuous_equal": {
+    "model": true,
+    "optimizer": true,
+    "sampler": true,
+    "best": true,
+    "history": true,
+    "provenance": true
+  },
+  "frozen_weights_unchanged": true,
+  "reconstructed_audit_digest": "0232cafab69cc4cee02dac8fa3d3eaaeb69ae3f25192c6d6adbbbf998409a7e4",
+  "original_audit_body_was_missing": true,
+  "original_audit_digest_matched": true,
+  "python": "3.12.14",
+  "platform": "Linux-6.18.44-x86_64-with-glibc2.41",
+  "cpu_count": 5,
+  "gpu_training": "not_run",
+  "maia_training": "not_run",
+  "engine_arena": "not_run",
+  "files_excluded": [
+    "source.tar",
+    "package-source",
+    "installed binaries/scripts/bytecode/build trees"
+  ],
+  "command_count": 13
+}

@@ -1,0 +1,55 @@
+test_actual_game_outcome_is_one_hot_and_not_teacher_distribution (test_schema.SchemaTests.test_actual_game_outcome_is_one_hot_and_not_teacher_distribution) ... ok
+test_budgets_and_tolerance_cannot_accept_bool (test_schema.SchemaTests.test_budgets_and_tolerance_cannot_accept_bool) ... ok
+test_centipawns_remain_a_distinct_score_without_conversion (test_schema.SchemaTests.test_centipawns_remain_a_distinct_score_without_conversion) ... ok
+test_complete_label_cannot_exceed_declared_cost_budgets (test_schema.SchemaTests.test_complete_label_cannot_exceed_declared_cost_budgets) ... ok
+test_complete_label_needs_a_target_and_no_failure_reason (test_schema.SchemaTests.test_complete_label_needs_a_target_and_no_failure_reason) ... ok
+test_confirmed_rights_require_both_license_and_evidence (test_schema.SchemaTests.test_confirmed_rights_require_both_license_and_evidence) ... ok
+test_failed_partial_or_canceled_labels_cannot_fabricate_targets (test_schema.SchemaTests.test_failed_partial_or_canceled_labels_cannot_fabricate_targets) ... ok
+test_four_promotion_identities_and_targets_are_preserved (test_schema.SchemaTests.test_four_promotion_identities_and_targets_are_preserved) ... ok
+test_incomplete_game_keeps_teacher_wdl_separate_without_outcome_target (test_schema.SchemaTests.test_incomplete_game_keeps_teacher_wdl_separate_without_outcome_target) ... ok
+test_legal_order_requires_new_digest_and_matching_policy_permutation (test_schema.SchemaTests.test_legal_order_requires_new_digest_and_matching_policy_permutation) ... ok
+test_no_value_can_enable_execution_without_engine_bindings (test_schema.SchemaTests.test_no_value_can_enable_execution_without_engine_bindings) ... ok
+test_nonfinite_targets_are_rejected_without_clipping (test_schema.SchemaTests.test_nonfinite_targets_are_rejected_without_clipping) ... ok
+test_ongoing_empty_legal_is_rejected (test_schema.SchemaTests.test_ongoing_empty_legal_is_rejected) ... ok
+test_policy_and_wdl_probabilities_require_range_shape_and_sum (test_schema.SchemaTests.test_policy_and_wdl_probabilities_require_range_shape_and_sum) ... ok
+test_record_encoding_must_match_declared_manifest (test_schema.SchemaTests.test_record_encoding_must_match_declared_manifest) ... ok
+test_teacher_value_requires_explicit_viewpoint_and_scale (test_schema.SchemaTests.test_teacher_value_requires_explicit_viewpoint_and_scale) ... ok
+test_terminal_empty_legal_accepts_value_only_and_rejects_policy (test_schema.SchemaTests.test_terminal_empty_legal_accepts_value_only_and_rejects_policy) ... ok
+test_unknown_fen_prefix_cannot_be_claimed_complete (test_schema.SchemaTests.test_unknown_fen_prefix_cannot_be_claimed_complete) ... ok
+test_unknown_or_bool_schema_versions_are_rejected (test_schema.SchemaTests.test_unknown_or_bool_schema_versions_are_rejected) ... ok
+test_validators_return_original_objects_without_repair (test_schema.SchemaTests.test_validators_return_original_objects_without_repair) ... ok
+test_visits_require_integer_positive_total_and_search_provenance (test_schema.SchemaTests.test_visits_require_integer_positive_total_and_search_provenance) ... ok
+test_digest_is_independent_of_object_key_order (test_serialization.SerializationTests.test_digest_is_independent_of_object_key_order) ... ok
+test_digest_preserves_array_order (test_serialization.SerializationTests.test_digest_preserves_array_order) ... ok
+test_duplicate_keys_are_rejected_even_nested (test_serialization.SerializationTests.test_duplicate_keys_are_rejected_even_nested) ... ok
+test_invalid_utf8_and_surrogate_are_rejected (test_serialization.SerializationTests.test_invalid_utf8_and_surrogate_are_rejected) ... ok
+test_non_finite_and_numeric_overflow_are_rejected (test_serialization.SerializationTests.test_non_finite_and_numeric_overflow_are_rejected) ... ok
+test_augmentation_keeps_lineage_and_parent_split (test_splits.LeakageTests.test_augmentation_keeps_lineage_and_parent_split) ... ok
+test_disconnected_parent_sources_are_detected_even_when_splits_match (test_splits.LeakageTests.test_disconnected_parent_sources_are_detected_even_when_splits_match) ... ok
+test_exact_duplicate_full_inputs_across_splits (test_splits.LeakageTests.test_exact_duplicate_full_inputs_across_splits) ... ok
+test_invalid_field_types_are_typed_findings_not_type_errors (test_splits.LeakageTests.test_invalid_field_types_are_typed_findings_not_type_errors) ... ok
+test_long_parent_chain_and_bucket_output_are_linear (test_splits.LeakageTests.test_long_parent_chain_and_bucket_output_are_linear) ... ok
+test_metadata_and_assignment_changes_are_reported (test_splits.LeakageTests.test_metadata_and_assignment_changes_are_reported) ... ok
+test_missing_self_and_cyclic_parent_graphs (test_splits.LeakageTests.test_missing_self_and_cyclic_parent_graphs) ... ok
+test_same_board_distinct_histories_are_conservative_risk (test_splits.LeakageTests.test_same_board_distinct_histories_are_conservative_risk) ... ok
+test_unknown_game_and_erased_provenance_are_errors (test_splits.LeakageTests.test_unknown_game_and_erased_provenance_are_errors) ... ok
+test_empty_sources_are_reproducible_and_no_fake_rows_are_added (test_splits.SplitPlanTests.test_empty_sources_are_reproducible_and_no_fake_rows_are_added) ... ok
+test_order_independent_connected_groups_and_namespace (test_splits.SplitPlanTests.test_order_independent_connected_groups_and_namespace) ... ok
+test_plan_rejects_tampering_even_with_recomputed_digest (test_splits.SplitPlanTests.test_plan_rejects_tampering_even_with_recomputed_digest) ... ok
+test_rejects_invalid_sources_and_weights (test_splits.SplitPlanTests.test_rejects_invalid_sources_and_weights) ... ok
+
+----------------------------------------------------------------------
+Ran 39 tests in 0.038s
+
+OK
+usage: __main__.py [-h] {split,validate} ...
+
+F01 source grouping and structural data audits (CPU only)
+
+positional arguments:
+  {split,validate}
+    split           freeze source groups before row generation
+    validate        audit rows against their immutable split plan
+
+options:
+  -h, --help        show this help message and exit

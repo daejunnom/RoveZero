@@ -1,0 +1,255 @@
+{
+  "schema_version": 1,
+  "commands": [
+    {
+      "id": "historical-001",
+      "command": "/bin/bash -lc 'PYTHONPATH=src python -m unittest discover -s tests -p test_serialization.py -v'",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-001.combined.txt",
+      "metadata_file": "logs/historical/command-001.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-002",
+      "command": "/bin/bash -lc 'PYTHONPATH=src python -m unittest discover -s tests -v\nPYTHONPATH=src python -m rz_data --help'",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-002.combined.txt",
+      "metadata_file": "logs/historical/command-002.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-003",
+      "command": "/bin/bash -lc 'PYTHONPATH=src python -m unittest discover -s tests -q'",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 1,
+      "output_file": "logs/historical/command-003.combined.txt",
+      "metadata_file": "logs/historical/command-003.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-004",
+      "command": "/bin/bash -lc 'PYTHONPATH=src python -m unittest discover -s tests -q'",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 1,
+      "output_file": "logs/historical/command-004.combined.txt",
+      "metadata_file": "logs/historical/command-004.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-005",
+      "command": "/bin/bash -lc \"PYTHONPATH=src python -m unittest discover -s tests -q\nPYTHONPATH=src python - <<'PY'\nfrom pathlib import Path\nfrom rz_data.serialization import loads, canonical_bytes\nfrom rz_data.splits import make_split_plan\nfixture=Path('fixtures')\nrecord=loads((fixture/'record.json').read_bytes())\nsources=loads((fixture/'sources.json').read_bytes())\nplan=make_split_plan(sources['sources'],seed='fixture-demo')\nrecord['split']=plan['assignments'][record['game_id']]\n(fixture/'records.jsonl').write_bytes(canonical_bytes(record)+b'\\\\n')\nprint('fixture split:',record['split'])\nPY\"",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-005.combined.txt",
+      "metadata_file": "logs/historical/command-005.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-006",
+      "command": "/bin/bash -lc 'PYTHONPATH=src python -m rz_data split --sources fixtures/sources.json --seed fixture-demo --output-root ${ARTIFACT_ROOT}/original-f01 --run-id fixture-source-plan-v1\nPYTHONPATH=src python -m rz_data validate --manifest fixtures/manifest.json --records fixtures/records.jsonl --split-plan ${ARTIFACT_ROOT}/original-f01/fixture-source-plan-v1/split-plan.json --output-root ${ARTIFACT_ROOT}/original-f01 --run-id fixture-audit-v1'",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-006.combined.txt",
+      "metadata_file": "logs/historical/command-006.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-007",
+      "command": "/bin/bash -lc \"python - <<'PY'\nfrom pathlib import Path\nimport shutil\npackage=Path('experiments/model-research')\ntarget=Path('${ARTIFACT_ROOT}/original-f01/package-check/source')\ntarget.mkdir(parents=True,exist_ok=False)\nfor name in ['pyproject.toml','LICENSE','README.md']:\n shutil.copy2(package/name,target/name)\nshutil.copytree(package/'src',target/'src',ignore=shutil.ignore_patterns('__pycache__','*.pyc'))\nPY\npython -m pip install --no-deps --no-build-isolation --no-compile --target ${ARTIFACT_ROOT}/original-f01/package-check/installed ${ARTIFACT_ROOT}/original-f01/package-check/source\nPYTHONPATH=${ARTIFACT_ROOT}/original-f01/package-check/installed ${ARTIFACT_ROOT}/original-f01/package-check/installed/bin/rz-data --help\"",
+      "cwd": "${CHECKOUT_ROOT}",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-007.combined.txt",
+      "metadata_file": "logs/historical/command-007.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-008",
+      "command": "/bin/bash -lc 'PYTHONPATH=${ARTIFACT_ROOT}/original-f01/package-check/installed ${ARTIFACT_ROOT}/original-f01/package-check/installed/bin/rz-data validate --manifest fixtures/manifest.json --records fixtures/records.jsonl --split-plan ${ARTIFACT_ROOT}/original-f01/fixture-source-plan-v1/split-plan.json --output-root ${ARTIFACT_ROOT}/original-f01 --run-id installed-fixture-audit-v1'",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-008.combined.txt",
+      "metadata_file": "logs/historical/command-008.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-009",
+      "command": "/bin/bash -lc \"PYTHONPATH=src python -m unittest discover -s tests -q\ngit diff --check\npython - <<'PY'\nfrom pathlib import Path\nimport re\nroot=Path.cwd()\nfor file in [root/'README.md',root/'HANDOFF.md']:\n text=file.read_text(encoding='utf-8')\n for target in re.findall(r'\\\\]\\\\(([\"'^)]+)'\"\\\\)',text):\n  if '://' not in target and not target.startswith('#'):\n   assert (file.parent/target.split('#')[0]).is_file(),(file.name,target)\n assert text.count('\"'```'\"')%2==0,file.name\n print(file.name,'UTF-8/links/fences passed')\nPY\"",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-009.combined.txt",
+      "metadata_file": "logs/historical/command-009.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-010",
+      "command": "/bin/bash -lc \"python - <<'PY'\nfrom pathlib import Path\nimport shutil\npackage=Path('experiments/model-research')\ntarget=Path('${ARTIFACT_ROOT}/original-f01/package-check/source-final')\ntarget.mkdir(parents=True,exist_ok=False)\nfor name in ['pyproject.toml','LICENSE','README.md','HANDOFF.md']:\n shutil.copy2(package/name,target/name)\nshutil.copytree(package/'src',target/'src',ignore=shutil.ignore_patterns('__pycache__','*.pyc'))\nPY\npython -m pip install --no-deps --no-build-isolation --no-compile --target ${ARTIFACT_ROOT}/original-f01/package-check/installed-final ${ARTIFACT_ROOT}/original-f01/package-check/source-final\nPYTHONPATH=${ARTIFACT_ROOT}/original-f01/package-check/installed-final ${ARTIFACT_ROOT}/original-f01/package-check/installed-final/bin/rz-data --help\"",
+      "cwd": "${CHECKOUT_ROOT}",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-010.combined.txt",
+      "metadata_file": "logs/historical/command-010.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-011",
+      "command": "/bin/bash -lc 'PYTHONPATH=${ARTIFACT_ROOT}/original-f01/package-check/installed-final ${ARTIFACT_ROOT}/original-f01/package-check/installed-final/bin/rz-data validate --manifest fixtures/manifest.json --records fixtures/records.jsonl --split-plan ${ARTIFACT_ROOT}/original-f01/fixture-source-plan-v1/split-plan.json --output-root ${ARTIFACT_ROOT}/original-f01 --run-id installed-final-fixture-audit-v1'",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-011.combined.txt",
+      "metadata_file": "logs/historical/command-011.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-012",
+      "command": "/bin/bash -lc 'PYTHONPATH=src python -m rz_training run --recipe fixtures/training/recipe.json --manifest fixtures/training/manifest.json --records fixtures/training/records.jsonl --split-plan fixtures/training/split-plan.json --features fixtures/training/features.json --output-root ${ARTIFACT_ROOT}/original-f02 --run-id preliminary-v1'",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-012.combined.txt",
+      "metadata_file": "logs/historical/command-012.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-013",
+      "command": "/bin/bash -lc 'PYTHONPATH=src python -m unittest discover -s tests -q'",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-013.combined.txt",
+      "metadata_file": "logs/historical/command-013.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-014",
+      "command": "/bin/bash -lc 'PYTHONPATH=src python -m unittest discover -s tests -q'",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-014.combined.txt",
+      "metadata_file": "logs/historical/command-014.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-015",
+      "command": "/bin/bash -lc 'PYTHONPATH=src python -m unittest discover -s tests -q'",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-015.combined.txt",
+      "metadata_file": "logs/historical/command-015.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-016",
+      "command": "/bin/bash -lc 'PYTHONPATH=src python -m unittest discover -s tests -q'",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-016.combined.txt",
+      "metadata_file": "logs/historical/command-016.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-017",
+      "command": "/bin/bash -lc 'PYTHONPATH=src python -m unittest discover -s tests -q'",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-017.combined.txt",
+      "metadata_file": "logs/historical/command-017.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-018",
+      "command": "/bin/bash -lc 'PYTHONPATH=src python -m unittest discover -s tests -q'",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-018.combined.txt",
+      "metadata_file": "logs/historical/command-018.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-019",
+      "command": "/bin/bash -lc \"PYTHONPATH=src python - <<'PY'\nfrom pathlib import Path\nfrom rz_data.io import read_json\nfrom rz_data.serialization import canonical_bytes\nfrom rz_training.trainer import train_fixture,verify_export\np=Path('fixtures/training')\nout=Path('${ARTIFACT_ROOT}/original-f02')\nrecipe=read_json(p/'recipe.json',max_bytes=65536)\nsource=Path.cwd().parents[1]\ndef run(name,**kw):\n    return train_fixture(recipe,p/'manifest.json',p/'records.jsonl',p/'split-plan.json',p/'features.json',output_root=out,run_id=name,source_root=source,**kw)\nfull,full_r=run('cpu-continuous-v1')\npaused,pause_r=run('cpu-pause-v1',stop_after=3)\nresumed,resume_r=run('cpu-resume-v1',resume_path=paused/'resume-checkpoint.json')\na=read_json(full/'resume-checkpoint.json',max_bytes=1048576)\nb=read_json(resumed/'resume-checkpoint.json',max_bytes=1048576)\nchecks={k:a[k]==b[k] for k in ('model','optimizer','sampler','best','history')}\nassert all(checks.values())\nrecipe['freeze']=True\n(out/'frozen-recipe-v1.json').write_bytes(canonical_bytes(recipe)+b'\\\\n')\nfrozen,frozen_r=run('cpu-frozen-v1')\nassert not frozen_r['weights_changed'] and frozen_r['selection']['step']==0\nsummary={'continuous_steps':full_r['actual']['steps'],'paused_steps':pause_r['actual']['steps'],'resumed_steps':resume_r['actual']['steps'],'resume_matches':checks,'weights_changed':full_r['weights_changed'],'validation_loss_first':full_r['history'][0]['validation_loss'],'validation_loss_last':full_r['history'][-1]['validation_loss'],'frozen_weights_changed':frozen_r['weights_changed'],'export':verify_export(read_json(resumed/'export.json',max_bytes=1048576)),'digests':{'full_receipt':full_r['digest'],'resume_receipt':resume_r['digest'],'frozen_receipt':frozen_r['digest'],'final_model':full_r['final_weights_digest']}}\n(out/'cpu-lifecycle-summary-v1.json').write_bytes(canonical_bytes(summary)+b'\\\\n')\nprint(canonical_bytes(summary).decode())\nPY\"",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-019.combined.txt",
+      "metadata_file": "logs/historical/command-019.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-020",
+      "command": "/bin/bash -lc 'PYTHONPATH=src python -m unittest discover -s tests -q\n PYTHONPATH=src python -m rz_training verify-export --export ${ARTIFACT_ROOT}/original-f02/cpu-resume-v1/export.json --output-root ${ARTIFACT_ROOT}/original-f02 --run-id cpu-export-verify-v1'",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-020.combined.txt",
+      "metadata_file": "logs/historical/command-020.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-021",
+      "command": "/bin/bash -lc 'mkdir -p ${ARTIFACT_ROOT}/original-f02/package-check-v1/source\n git archive --format=tar HEAD experiments/model-research | tar -x -C ${ARTIFACT_ROOT}/original-f02/package-check-v1/source\n python -m pip install --no-deps --no-build-isolation --no-compile --target ${ARTIFACT_ROOT}/original-f02/package-check-v1/installed ${ARTIFACT_ROOT}/original-f02/package-check-v1/source/experiments/model-research'",
+      "cwd": "${CHECKOUT_ROOT}",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-021.combined.txt",
+      "metadata_file": "logs/historical/command-021.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    },
+    {
+      "id": "historical-022",
+      "command": "/bin/bash -lc 'PYTHONPATH=${ARTIFACT_ROOT}/original-f02/package-check-v1/installed ${ARTIFACT_ROOT}/original-f02/package-check-v1/installed/bin/rz-train run --recipe fixtures/training/recipe.json --manifest fixtures/training/manifest.json --records fixtures/training/records.jsonl --split-plan fixtures/training/split-plan.json --features fixtures/training/features.json --output-root ${ARTIFACT_ROOT}/original-f02 --run-id installed-cli-resume-v1 --resume ${ARTIFACT_ROOT}/original-f02/cpu-pause-v1/resume-checkpoint.json\n PYTHONPATH=${ARTIFACT_ROOT}/original-f02/package-check-v1/installed ${ARTIFACT_ROOT}/original-f02/package-check-v1/installed/bin/rz-train verify-export --export ${ARTIFACT_ROOT}/original-f02/cpu-resume-v1/export.json --output-root ${ARTIFACT_ROOT}/original-f02 --run-id installed-export-verify-v1\n PYTHONPATH=${ARTIFACT_ROOT}/original-f02/package-check-v1/installed ${ARTIFACT_ROOT}/original-f02/package-check-v1/installed/bin/rz-data validate --manifest fixtures/training/manifest.json --records fixtures/training/records.jsonl --split-plan fixtures/training/split-plan.json --output-root ${ARTIFACT_ROOT}/original-f02 --run-id installed-data-audit-v1'",
+      "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+      "exit_code": 0,
+      "output_file": "logs/historical/command-022.combined.txt",
+      "metadata_file": "logs/historical/command-022.json",
+      "capture": "historical_tool_output",
+      "source_git_sha": null,
+      "source_binding_status": "not_recorded_in_command_metadata; see artifact provenance mapping"
+    }
+  ],
+  "not_a_replay_script": true,
+  "excluded_mixed_git_mutation_records": [
+    {
+      "reason": "mixed validation and git-mutating command; not copied",
+      "turnStartedAt": 1790954561,
+      "position": 44
+    }
+  ]
+}

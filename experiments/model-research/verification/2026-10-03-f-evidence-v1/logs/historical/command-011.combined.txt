@@ -1,0 +1,1 @@
+{"audit_digest":"2173394ddeadeed293d9f0ef48eeab0ec0fa9f059edde0e8979e13ef2143c14e","counts":{"complete_label_candidates":1,"excluded_labels":0,"input_records":1,"rejected_records":0,"structurally_valid_records":1},"execution_ready":false,"run_id":"installed-final-fixture-audit-v1","structural_audit_passed":true}

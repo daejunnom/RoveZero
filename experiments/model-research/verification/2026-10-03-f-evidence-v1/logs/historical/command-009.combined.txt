@@ -1,0 +1,6 @@
+----------------------------------------------------------------------
+Ran 58 tests in 0.056s
+
+OK
+README.md UTF-8/links/fences passed
+HANDOFF.md UTF-8/links/fences passed

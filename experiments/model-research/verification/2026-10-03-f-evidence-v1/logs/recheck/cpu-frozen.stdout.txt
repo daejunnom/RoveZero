@@ -1,0 +1,1 @@
+{"run": "${ARTIFACT_ROOT}/runs/cpu-frozen", "status": "step_budget_reached", "steps": 8, "execution_scope": "cpu_fixture", "execution_ready": false, "digest": "c8f75449bb82b72a46bd4d320d84fef504a2f7316438bbc66618f4985d07b139"}

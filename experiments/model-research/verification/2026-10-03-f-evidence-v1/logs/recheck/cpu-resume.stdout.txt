@@ -1,0 +1,1 @@
+{"run": "${ARTIFACT_ROOT}/runs/cpu-resume", "status": "step_budget_reached", "steps": 8, "execution_scope": "cpu_fixture", "execution_ready": false, "digest": "78a14c22cfb13b1ebf95cb8f7f6557f6103f092af35e2a61438d2abc7038f83a"}

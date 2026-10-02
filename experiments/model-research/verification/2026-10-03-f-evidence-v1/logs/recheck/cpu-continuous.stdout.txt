@@ -1,0 +1,1 @@
+{"run": "${ARTIFACT_ROOT}/runs/cpu-continuous", "status": "step_budget_reached", "steps": 8, "execution_scope": "cpu_fixture", "execution_ready": false, "digest": "2d1f05492840a4c4dbbf852bf2fe83b78c137da06d69d35683acdd8d4ab2127c"}

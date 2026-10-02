@@ -1,0 +1,3 @@
+{"run": "${ARTIFACT_ROOT}/original-f02/installed-cli-resume-v1", "status": "step_budget_reached", "steps": 8, "execution_scope": "cpu_fixture", "execution_ready": false, "digest": "df99b1479301b4a8b24b38b727a56616c6bea2121bd592cf1656f19870a599c5"}
+{"run": "${ARTIFACT_ROOT}/original-f02/installed-export-verify-v1", "probes": 2, "max_absolute_error": 0.0, "engine_compatibility": "not_run", "digest": "450b4cbd4a262d7bc2a9d82a61c6263eaa2334dbb28cd5bf9995926298a9a044"}
+{"audit_digest":"a2d28735ea914bc0ac0d4260dd4a634f9642c4b7f9e9b6deac744b005e9f4406","counts":{"complete_label_candidates":6,"excluded_labels":0,"input_records":6,"rejected_records":0,"structurally_valid_records":6},"execution_ready":false,"run_id":"installed-data-audit-v1","structural_audit_passed":true}

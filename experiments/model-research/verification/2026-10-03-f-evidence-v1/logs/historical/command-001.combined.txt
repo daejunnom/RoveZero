@@ -1,0 +1,10 @@
+test_digest_is_independent_of_object_key_order (test_serialization.SerializationTests.test_digest_is_independent_of_object_key_order) ... ok
+test_digest_preserves_array_order (test_serialization.SerializationTests.test_digest_preserves_array_order) ... ok
+test_duplicate_keys_are_rejected_even_nested (test_serialization.SerializationTests.test_duplicate_keys_are_rejected_even_nested) ... ok
+test_invalid_utf8_and_surrogate_are_rejected (test_serialization.SerializationTests.test_invalid_utf8_and_surrogate_are_rejected) ... ok
+test_non_finite_and_numeric_overflow_are_rejected (test_serialization.SerializationTests.test_non_finite_and_numeric_overflow_are_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.001s
+
+OK

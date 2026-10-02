@@ -1,0 +1,21 @@
+{
+  "status": "completed",
+  "exit_code": 0,
+  "duration_ms": 0,
+  "truncated": false,
+  "origin": "historical_codex_command_execution",
+  "turn_started_at": 1790954561,
+  "turn_completed_at": 1790955779,
+  "position": 65,
+  "source_git_sha": null,
+  "source_sha_status": "not_recorded_in_command_metadata; see artifact provenance mapping",
+  "data_kind": "synthetic_fixture_or_package_self_check",
+  "command": "/bin/bash -lc \"PYTHONPATH=src python -m unittest discover -s tests -q\nPYTHONPATH=src python - <<'PY'\nfrom pathlib import Path\nfrom rz_data.serialization import loads, canonical_bytes\nfrom rz_data.splits import make_split_plan\nfixture=Path('fixtures')\nrecord=loads((fixture/'record.json').read_bytes())\nsources=loads((fixture/'sources.json').read_bytes())\nplan=make_split_plan(sources['sources'],seed='fixture-demo')\nrecord['split']=plan['assignments'][record['game_id']]\n(fixture/'records.jsonl').write_bytes(canonical_bytes(record)+b'\\\\n')\nprint('fixture split:',record['split'])\nPY\"",
+  "cwd": "${CHECKOUT_ROOT}/experiments/model-research",
+  "original_output_byte_sha256": "b1cf662c76a0f581864ad80d882ac6c311141901151da68de9dea932c86b4942",
+  "original_command_byte_sha256": "86bfd37b224b1c504ffc70955b0ce0d13f86e1a22ed2d9b8d88cfaf257038673",
+  "output_file": "logs/historical/command-005.combined.txt",
+  "stdout_stderr_separation": "unavailable_in_historical_tool_capture",
+  "source_kind": "actual_process_capture_on_synthetic_fixture_or_own_package",
+  "privacy_normalization": "logical task paths; output otherwise preserved"
+}

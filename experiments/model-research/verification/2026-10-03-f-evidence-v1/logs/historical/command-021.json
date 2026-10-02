@@ -1,0 +1,21 @@
+{
+  "status": "completed",
+  "exit_code": 0,
+  "duration_ms": 582,
+  "truncated": false,
+  "origin": "historical_codex_command_execution",
+  "turn_started_at": 1790956763,
+  "turn_completed_at": 1790958251,
+  "position": 101,
+  "source_git_sha": null,
+  "source_sha_status": "not_recorded_in_command_metadata; see artifact provenance mapping",
+  "data_kind": "synthetic_fixture_or_package_self_check",
+  "command": "/bin/bash -lc 'mkdir -p ${ARTIFACT_ROOT}/original-f02/package-check-v1/source\n git archive --format=tar HEAD experiments/model-research | tar -x -C ${ARTIFACT_ROOT}/original-f02/package-check-v1/source\n python -m pip install --no-deps --no-build-isolation --no-compile --target ${ARTIFACT_ROOT}/original-f02/package-check-v1/installed ${ARTIFACT_ROOT}/original-f02/package-check-v1/source/experiments/model-research'",
+  "cwd": "${CHECKOUT_ROOT}",
+  "original_output_byte_sha256": "64db569cc1ef438e08a41284819fd9efc13ed5af24ae425216e7360d18f841d6",
+  "original_command_byte_sha256": "0ae70674f8c406cab918a0dd2489c199584b12032fd23aa6a8b199747a07c1a3",
+  "output_file": "logs/historical/command-021.combined.txt",
+  "stdout_stderr_separation": "unavailable_in_historical_tool_capture",
+  "source_kind": "actual_process_capture_on_synthetic_fixture_or_own_package",
+  "privacy_normalization": "logical task paths; output otherwise preserved"
+}

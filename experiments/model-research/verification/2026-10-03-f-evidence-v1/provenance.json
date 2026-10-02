@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "preservation_baseline_sha": "36e619bae238a587e04c0a4bae24624eb5414aec",
+  "f01_final_sha": "387790173754992979902b233af443b5fa2006c1",
+  "f02_verified_source_sha": "8aa798e6fe3e760be125c5c79da869a1a9c46378",
+  "f02_python_implementation_digest": "c3d1b358e85dadf22c44b4a1f11ab8132fb1b52e7bc221108405f816c910f8cb",
+  "source_evidence": [
+    {
+      "input": "F02 package-check-v1/source",
+      "git_sha": "8aa798e6fe3e760be125c5c79da869a1a9c46378",
+      "matched_files": 39,
+      "basis": "post-execution byte comparison; cache/build/egg-info excluded"
+    },
+    {
+      "input": "F01 package-check/source-final",
+      "git_sha": "387790173754992979902b233af443b5fa2006c1",
+      "matched_files": 13,
+      "basis": "post-execution byte comparison; original copy intentionally omitted fixtures/tests"
+    },
+    {
+      "input": "F02 installed Python",
+      "git_sha": "8aa798e6fe3e760be125c5c79da869a1a9c46378",
+      "matched_python_files": 17,
+      "basis": "code_digest source bytes; same Python files at preservation baseline"
+    },
+    {
+      "input": "F01 installed-final Python",
+      "git_sha": "387790173754992979902b233af443b5fa2006c1",
+      "matched_python_files": 9,
+      "basis": "post-execution byte comparison"
+    }
+  ],
+  "originals_deleted": false,
+  "archive_execution_scope": "actual CPU process with synthetic inputs",
+  "remote_baseline_observation": {
+    "pr": 2,
+    "state": "open",
+    "draft": true,
+    "merged": false,
+    "head_sha": "36e619bae238a587e04c0a4bae24624eb5414aec",
+    "develop_sha": "3e3cd80533a69ee2118f1c130e72a1cb0745ae8c"
+  },
+  "instruction_exception": "User explicitly requested reviewed small raw F evidence in repository; original working artifacts are retained outside source."
+}

@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "dataset_id": "fixture-f01-v1",
+  "kind": "fixture",
+  "engine_contract_revision": null,
+  "execution_ready": false,
+  "source": {
+    "id": "synthetic-f01",
+    "uri": "fixture:f01",
+    "digest": "70628570488f77ffc36479fb4371ed9525a398a6ba9fa74c49e45db53c40e360",
+    "rights": {
+      "status": "confirmed",
+      "license": "MIT",
+      "reference": "synthetic fixture authored in this package; LICENSE"
+    }
+  },
+  "teacher": {
+    "id": "mock-teacher",
+    "version": "fixture-v1",
+    "code_digest": "9ce77205493a8d7097a73f2cfa4018d9d2c12e27dc14dd213c63ec868439f57e",
+    "binary_digest": "c470b1ad0f406edd15c32b22f4988dd442aca4401fb7a084b2facb86c1dc5ed6",
+    "weights_digest": "670fcb69d6af2719511ce52ed9d6103ec23abc3500d5869bef015756deddfbec",
+    "search_id": "fixture-search",
+    "backend_id": "mock",
+    "precision": "synthetic",
+    "device": "cpu-fixture",
+    "options": {},
+    "budget": {
+      "max_positions": 100,
+      "max_nodes_per_position": 1000,
+      "max_time_ms_per_position": 1000,
+      "workers": 1,
+      "max_memory_bytes": 1048576
+    },
+    "rights": {
+      "status": "confirmed",
+      "license": "MIT",
+      "reference": "synthetic fixture authored in this package; LICENSE"
+    }
+  },
+  "encoding": {
+    "id": "fixture-input",
+    "version": "v1",
+    "model_digest": "670fcb69d6af2719511ce52ed9d6103ec23abc3500d5869bef015756deddfbec",
+    "history_policy": "declared only; no encoder executed"
+  },
+  "probability_tolerance": 1e-06,
+  "leakage_policy": {
+    "near_duplicate_key": "opening_family_id",
+    "key_producer": "synthetic-fixture-v1",
+    "pretraining_overlap": "unknown",
+    "limitations": "No real corpus or encoder audited. Fixture identities are declared only.",
+    "holdout_usage": "final_evaluation_only"
+  }
+}

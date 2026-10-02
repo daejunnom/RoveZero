@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "performed_utc": "2026-10-02T17:11:12.162834+00:00",
+  "scope": "all proposed bundle UTF-8 files; prohibited secret files were not read",
+  "checks": [
+    "credential_token",
+    "private_key",
+    "bearer_credential",
+    "assigned_secret",
+    "email_address",
+    "personal_home_path",
+    "unmasked_task_path",
+    "UTF-8",
+    "no_NUL"
+  ],
+  "findings_after_masking": 0,
+  "historical_path_normalization": true,
+  "masked_original_metadata_files": 3,
+  "new_package_metadata_path_normalization": true,
+  "rights": "Own MIT source and authored numeric fixtures; no external datasets/weights/binaries",
+  "limitations": "Heuristic checks plus independent review; not a proof that arbitrary text cannot contain personal information",
+  "independent_review": {
+    "reviewed_files": 237,
+    "byte_and_embedded_receipts": "passed",
+    "privacy_actionable_findings": 0,
+    "scope": "before adding byte-preserving attributes and this review note",
+    "generic_temporary_prefix_in_sanitizer": "reviewed_nonpersonal_code_literal"
+  }
+}
