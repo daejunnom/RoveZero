@@ -6,7 +6,7 @@
 
 ## 실제 backend
 
-PR #7의 계약 0.1(`ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8`)을 확인했다.
+PR #7의 병합된 계약 0.1(`18339c30754f4f38d957d96aeab481b018b98718`)을 확인했다.
 `contracts` feature는 이 SHA의 공통 crate를 소비한다. workspace 통합 때 총괄이
 모든 consumer를 같은 path dependency로 바꾸어야 한다. 공통 타입·루트 workspace는
 수정하지 않았다. Linux 검증 toolchain은 PR #7 CI와 같은 Rust 1.96.0이다.
@@ -61,6 +61,9 @@ WDL에는 softmax를 다시 적용하지 않고 실제 차례 관점을 유지�
 첫 코드 profile의 확률 합 허용 오차는 `1e-5`다. 이는 probability admissibility이며
 선정 기록의 독립 FP32 parity 기준(raw logit atol=1e-4/rtol=1e-3, 확률 max_abs=1e-4)과
 구분한다. 이 수치 설정과 temperature는 C backend identity에 포함한다.
+공통 payload는 검증한 f32 head의 반올림을 보존한다. B의 strict f64 합 검사에 넘길 때는
+공통 `LegalPolicy::normalized()`와 `Wdl::normalized()`를 명시 호출하는 B adapter 정책을
+사용한다. 허용 범위를 벗어난 입력을 그 함수로 복구하지 않는다.
 
 ## 계약 0.1과 물리 worker 연결
 
@@ -85,6 +88,9 @@ batch 하나만 허용하며 자동 재시도·batch 축소는 없다. `poll`의
 owned EvalOutput 또는 실패가 들어 있다. output은 문맥·legal order·실행 ID를 그대로
 보존한다. D는 batch 실패를 각 원 요청에 연결하고 `EvalOutput::validate_for`로 현재
 scope/clock을 재검사한 뒤 한 번만 finalization해야 한다. B는 backup 직전에 다시 검사한다.
+실패의 `PhysicalFailure`에는 공통 오류와 별도로 원래 C code/stage 및 ORT code·최대
+1024-byte UTF-8 원인을 보존한다. 원시 원인 문자열은 local 진단용이며 공통 static detail과
+기본 Debug/Display 출력에 복사하지 않는다. 복구/재시도는 수행하지 않는다.
 
 논리 취소는 native Run을 중단하지 않는다. consumer/worker handle을 먼저 drop해도
 실행 thread가 입력과 세션을 보유한다. wrapper panic으로 물리 완료가 불확실하면

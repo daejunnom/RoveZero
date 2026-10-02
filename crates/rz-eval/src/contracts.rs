@@ -329,7 +329,40 @@ impl<P> PreparedBatch<P> {
 
 #[cfg(feature = "onnx")]
 pub type OnnxWorker<P> =
-    crate::worker::SingleWorker<PreparedBatch<P>, Result<Vec<EvalOutput>, ContractError>>;
+    crate::worker::SingleWorker<PreparedBatch<P>, Result<Vec<EvalOutput>, PhysicalFailure>>;
+
+/// Preserve bounded native cause beside the common error. D can retain this
+/// local evidence before publishing EvalFailure with its own completion context.
+#[derive(Debug)]
+pub struct PhysicalFailure {
+    pub contract: ContractError,
+    pub backend: Option<BackendError>,
+}
+
+impl From<ContractError> for PhysicalFailure {
+    fn from(contract: ContractError) -> Self {
+        Self {
+            contract,
+            backend: None,
+        }
+    }
+}
+
+impl From<BackendError> for PhysicalFailure {
+    fn from(backend: BackendError) -> Self {
+        Self {
+            contract: backend_error(&backend),
+            backend: Some(backend),
+        }
+    }
+}
+
+impl std::fmt::Display for PhysicalFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.contract.fmt(f)
+    }
+}
+impl std::error::Error for PhysicalFailure {}
 
 /// Owns one ORT session on one physical thread. Runtime maps the returned lease
 /// into its Backend interface; no reverse dependency from C to rz-runtime.
@@ -346,7 +379,8 @@ pub fn spawn_onnx_worker<P: Send + Sync + 'static>(
                     ErrorCode::IdentityMismatch,
                     Stage::Admission,
                     "batch does not belong to this physical backend",
-                ));
+                )
+                .into());
             }
         }
         let inputs = batch
@@ -354,15 +388,19 @@ pub fn spawn_onnx_worker<P: Send + Sync + 'static>(
             .iter()
             .map(PreparedRequest::encoded)
             .collect::<Vec<_>>();
-        let raw = backend.run(&inputs).map_err(backend_error)?;
+        let raw = backend.run(&inputs).map_err(PhysicalFailure::from)?;
         batch
             .requests()
             .iter()
             .zip(raw)
-            .map(|(request, raw)| request.output(&raw, batch.execution()))
+            .map(|(request, raw)| {
+                request
+                    .output(&raw, batch.execution())
+                    .map_err(PhysicalFailure::from)
+            })
             .collect()
     })
-    .map_err(backend_error)
+    .map_err(|failure| backend_error(&failure))
 }
 
 fn ordered_indices(
@@ -413,7 +451,7 @@ fn ordered_indices(
     Ok(result)
 }
 
-pub fn backend_error(failure: BackendError) -> ContractError {
+pub fn backend_error(failure: &BackendError) -> ContractError {
     let code = match failure.kind {
         FailureKind::InvalidInput => ErrorCode::InvalidInput,
         FailureKind::UnsupportedModel => ErrorCode::UnsupportedContract,

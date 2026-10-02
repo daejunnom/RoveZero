@@ -322,3 +322,24 @@ fn encoding_identity_distinguishes_history_profiles_and_registry_generations() {
         )
     );
 }
+
+#[test]
+fn native_failure_keeps_bounded_local_cause_without_putting_it_in_common_error() {
+    use rz_eval::contracts::PhysicalFailure;
+    use rz_eval::error::{BackendError, FailureKind, FailureStage};
+    let native = BackendError::new(
+        FailureKind::BackendFailure,
+        FailureStage::Backend,
+        "ORT Run failed",
+    )
+    .with_diagnostic("RuntimeException", &"원인 diagnostic-path ".repeat(300));
+    let failure = PhysicalFailure::from(native);
+    assert_eq!(failure.contract.code, ErrorCode::BackendFailure);
+    assert_eq!(failure.contract.stage, Stage::Backend);
+    assert_eq!(failure.contract.detail, "ORT Run failed");
+    let diagnostic = failure.backend.as_ref().unwrap().native.as_ref().unwrap();
+    assert_eq!(diagnostic.code, "RuntimeException");
+    assert!(diagnostic.message.len() <= 1024);
+    assert!(diagnostic.truncated);
+    assert!(!format!("{failure:?}").contains("diagnostic-path"));
+}

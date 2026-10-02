@@ -47,7 +47,7 @@ impl OrtRuntime {
         let expected = asset::parse_sha256(expected_sha256)?;
         let mut guard = RUNTIME.lock().map_err(|_| unavailable())?;
         if let Some(result) = guard.as_ref() {
-            let runtime = result.as_ref().map_err(|error| *error)?;
+            let runtime = result.as_ref().map_err(Clone::clone)?;
             return if runtime.path == path && runtime.binary_digest == expected {
                 Ok(runtime.clone())
             } else {
@@ -74,7 +74,7 @@ impl OrtRuntime {
             if !ort::init_from(path_text)
                 .with_name("RoveZero-C")
                 .commit()
-                .map_err(|_| unavailable())?
+                .map_err(|error| unavailable().with_ort(error))?
             {
                 return Err(BackendError::new(
                     K::IdentityMismatch,
@@ -205,12 +205,13 @@ impl OnnxBackend {
         config: BackendConfig,
     ) -> Result<Self, BackendError> {
         config.validate()?;
-        let setup_error = |_| {
+        let setup_error = |error| {
             BackendError::new(
                 K::BackendUnavailable,
                 S::Backend,
                 "ORT session/provider setup failed",
             )
+            .with_ort(error)
         };
         let mut builder = Session::builder()
             .map_err(setup_error)?
@@ -267,12 +268,13 @@ impl OnnxBackend {
         }
         let session = builder
             .commit_from_memory(asset.onnx_bytes())
-            .map_err(|_| {
+            .map_err(|error| {
                 BackendError::new(
                     K::BackendUnavailable,
                     S::Backend,
                     "ORT could not load the verified model with the requested provider",
                 )
+                .with_ort(error)
             })?;
         validate_interface(&session)?;
         // This is a versioned C backend identity, not a new global wire codec.
@@ -289,7 +291,24 @@ impl OnnxBackend {
         if matches!(result.config.provider, Provider::Cuda { .. }) {
             // A registered provider alone proves nothing. Synchronous physical
             // execution plus ORT kernel placement is required before returning.
-            result.run_values(&[&vec![0.0; INPUT_VALUES]])?;
+            let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                result.run_values(&[&vec![0.0; INPUT_VALUES]])
+            }));
+            match probe {
+                Ok(completed) => {
+                    completed?;
+                }
+                Err(_) => {
+                    // Bootstrap has no runtime lease yet. Retain this session and
+                    // active tensor if an unexpected unwind leaves completion unknown.
+                    std::mem::forget(result);
+                    return Err(BackendError::new(
+                        K::BackendFailure,
+                        S::Backend,
+                        "CUDA probe unwound; session quarantined until process exit",
+                    ));
+                }
+            }
             let path = result.session.end_profiling().map_err(setup_error)?;
             let bytes = asset::read_bounded(Path::new(&path), 4 * 1024 * 1024)?;
             let executed_cuda_nodes = verify_cuda_profile(&bytes)?;
@@ -370,12 +389,13 @@ impl OnnxBackend {
             dense.extend_from_slice(input);
         }
         self.active_input = Some(
-            Tensor::from_array(([inputs.len(), 112, 8, 8], dense)).map_err(|_| {
+            Tensor::from_array(([inputs.len(), 112, 8, 8], dense)).map_err(|error| {
                 BackendError::new(
                     K::BackendFailure,
                     S::Backend,
                     "cannot create ORT input tensor",
                 )
+                .with_ort(error)
             })?,
         );
         // No RunOptions enabling asynchronous EP execution or terminate-on-cancel.
@@ -386,8 +406,9 @@ impl OnnxBackend {
             .run(ort::inputs![INPUT_NAME => self.active_input.as_ref()
             .ok_or(BackendError::new(K::BackendFailure, S::Backend, "input pin is missing"))?]);
         self.active_input = None;
-        let outputs = run_result.map_err(|_| {
+        let outputs = run_result.map_err(|error| {
             BackendError::new(K::BackendFailure, S::Backend, "synchronous ORT Run failed")
+                .with_ort(error)
         })?;
         let malformed = || {
             BackendError::new(
@@ -400,12 +421,12 @@ impl OnnxBackend {
             .get(POLICY_NAME)
             .ok_or_else(malformed)?
             .try_extract_tensor::<f32>()
-            .map_err(|_| malformed())?;
+            .map_err(|error| malformed().with_ort(error))?;
         let (wdl_shape, wdl) = outputs
             .get(WDL_NAME)
             .ok_or_else(malformed)?
             .try_extract_tensor::<f32>()
-            .map_err(|_| malformed())?;
+            .map_err(|error| malformed().with_ort(error))?;
         if policy_shape.as_ref() != [inputs.len() as i64, POLICY_SIZE as i64]
             || wdl_shape.as_ref() != [inputs.len() as i64, 3]
         {
@@ -418,12 +439,13 @@ impl OnnxBackend {
                 wdl: wdl.to_vec(),
             };
             // Validate every raw element and WDL, before a legal view is attached.
-            output::validate_maia(&raw, &[0]).map_err(|_| {
+            output::validate_maia(&raw, &[0]).map_err(|error| {
                 BackendError::new(
                     K::NumericalFailure,
                     S::Output,
                     "nonfinite or inadmissible model output",
                 )
+                .with_diagnostic("OutputValidation", &error.to_string())
             })?;
             result.push(raw);
         }
