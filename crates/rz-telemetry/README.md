@@ -16,6 +16,12 @@ D01 CPU/mock 런타임이 전달하는 이벤트를 수동적으로 집계합니
 `record(&mut self, Event)`는 추가 할당·정렬 없이 카운터와 표본을 갱신합니다.
 thread 간 동기화는 호출자 책임입니다.
 
+D02의 `profile::TraceCollector`는 별도 bounded tracking과 단계별 표본으로 종단
+trace를 집계합니다. 요청·물리 실행·실제 소비·최종 미사용 항목을 분리하고, 겹친
+단계의 합 대신 같은 domain의 wall span으로 처리량을 계산합니다. API와 관측
+window·시간·메모리·GPU 경계는 [PROFILE.md](PROFILE.md), Scheduler에 연결한
+재현 진입점은 [CPU trace 기록](../../benches/runtime/README.md)을 따릅니다.
+
 `snapshot()`은 보존한 latency를 정렬해 nearest-rank P50/P95/P99를 계산하고,
 보존한 batch 크기의 분포를 반환합니다. 결과에는 각 표본의 총수·보존수·유실수가
 함께 들어갑니다. 유실에는 ring에서 덮어쓴 오래된 표본과 용량 0에서 생략한 표본이
@@ -35,5 +41,5 @@ thread 간 동기화는 호출자 책임입니다.
 현재 root workspace와 공통 계약의 연결 전이라 독립 `[workspace]`로 빌드합니다.
 검사 명령은 `cargo test --manifest-path crates/rz-telemetry/Cargo.toml`과
 `cargo clippy --manifest-path crates/rz-telemetry/Cargo.toml --all-targets -- -D warnings`입니다.
-이 crate의 검사는 CPU 계측 계약 검사이며 실제 GPU·종단 D02 또는 D03 개선 근거가
+이 crate의 검사는 CPU 계측 계약 검사이며 실제 GPU 종단 D02 또는 D03 개선 근거가
 아닙니다.

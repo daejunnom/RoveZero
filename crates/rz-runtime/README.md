@@ -2,7 +2,7 @@
 
 담당은 D, 작업은 TASK-D01과 D02 내부 계측이다. 브랜치 기반은 문서 커밋
 `9f0bc59`이며 총괄 [PR #7](https://github.com/daejunnom/RoveZero/pull/7)의
-`ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8`에서 게시한 공통 계약 0.1을 참조한다.
+`67284c4f66f7a7ae9f46fa63dfd50e7410eb6845`에서 게시한 공통 계약 0.1을 참조한다.
 generic core의 associated type 경계와 `contracts` feature의 실제 타입 adapter를
 함께 제공한다. 공통 ID·WDL·EvalResult·계약 revision을 복제하지 않는다.
 
@@ -100,41 +100,82 @@ Drop 안에서만 기록한 quarantine metric은 객체와 함께 사라져 외�
 counter overflow를 노출한다. 이 지연은 admission부터 logical finish까지이며 B의 backup,
 UCI 출력, GPU 전송·완료 전체를 잰 D02 종단 프로파일은 아직 아니다.
 
+`Scheduler::take_observations`와 common wrapper의 같은 메서드는 유한 관측 ring을
+시간 순서로 비운다. 용량은 constructor의 `metric_sample_capacity`와 같다. ring은
+오래된 event를 버리고 drain별 `dropped`·`counter_overflow`를 보고한다. 용량 0에서도
+요청 결과·예약 수명은 같으며 모든 event는 유실로 센다. generic ID의 크기·clone 비용과
+관측 ring·drain 반환 Vec의 예산은 별도 metadata 예산이다.
+
+관측 tick은 deadline과 같은 owner clock이다. 예약 snapshot은 다른 스레드에서
+receipt가 해제된 정확한 시각을 뜻하지 않는다. `peak_reserved`는 lock에서 보존한
+high-water이며 이를 profiler에 별도로 전달할 수 있다. `ValidationFinished.valid`는
+payload 검증 사실이고 이후 stale/expired가 될 수 있다. `Finished.delivered`는 mailbox
+enqueue 성공이며 실제 수신·selection consume·backup을 뜻하지 않는다.
+
+D02의 bounded `rz-telemetry::profile::TraceCollector`는 CPU 준비·queue·dispatch·
+backend physical·validation·backup·output·종단 span을 받아 class별 percentile,
+batch 분포·예약 peak와 physical/consumed/unused 집계를 제공한다. 같은 monotonic
+domain을 사용하며 wall span으로 처리량을 계산한다. 전체 phase 시간을 합산하지 않는다.
+actual transfer가 없으면 Transfer는 absent다. engine ID·정확한 소비 권한은 caller가
+검증하고 profiler의 중복 검사는 유한한 관측 window에만 적용된다. 자세한 사용·손실
+경계는 [계측 설명](../rz-telemetry/PROFILE.md)에 있다.
+
+[CPU trace 예제](examples/cpu_trace.rs)는 cold/warm·parent-child·sibling·transposition·
+eviction·long 입력 관계 fixture를 독립 실행하고 runtime의 실제 queue·취소·receipt·
+drain을 검사한다. fixture clock의 단계별 지연과 실제 `Instant` 실행 벽시계를 분리한다.
+실제 B backup/UCI 출력·GPU provider hook 연결은 추가 인수가 필요하다. 입력 관계
+label은 cache·dedup·warm-start 구현이나 D03 성능 개선을 뜻하지 않는다.
+
 이번 인계의 기반은 `9f0bc598f6b2d8f863fd46af6a4fd73bfef1f0b8`이다. Rust
-1.99.0/Linux x86_64, CPU 5개·RAM 약 17 GiB의 클라우드에서 standalone으로
+1.96.0/Linux x86_64, CPU 5개·RAM 약 17.6 GiB의 클라우드에서 standalone으로
 검사했다. 실제 GPU 장치와 GPU provider는 사용할 수 없었다. 최종 소스에서 다음이
 통과했다. 실제 신경망을 사용한 검사는 아니다.
 
 - `tests/lifecycle.rs`의 독립 CPU/mock 수명 검사 30개: queue/batch, 마감·세대·취소,
   malformed 결과, 미수신 delivery 예산, physical pin, timeout·quarantine과 실제
   CPU worker 실행 중 다른 스레드의 취소를 포함한다.
-- 관측 ring 내부 검사 3개와 실제 계약 adapter 검사 13개: 유한 이벤트 손실과
+- 관측 ring 내부 검사 3개와 실제 계약 adapter 검사 14개: 유한 이벤트 손실과
   capacity overflow, execution identity, epoch·clock domain·ID 재사용, 미수신
   common 결과 예산과 poll 시 재검증을 포함한다.
 - `rz-telemetry`의 계측 검사 8개: logical/physical 분리, 고정 용량·표본 손실,
   percentile·counter overflow와 할당 전 capacity 검증을 포함한다.
-- 두 crate의 `cargo fmt -- --check`, `cargo clippy --all-targets -- -D warnings`.
+- profiler 검사 10개와 CPU trace 예제 검사 4개: 겹친 span·exec-only wall 시작,
+  실제 소비·미사용 작업, 시간·domain·유실·tracking 상한, 7종 trace와 작은 ring의
+  2,048 요청 장기 재생을 포함한다. **합계 69개**가 통과했다.
+- 두 crate의 Rust 1.96 `cargo fmt -- --check`, `cargo clippy --all-targets -- -D warnings`와
+  runtime의 `--all-features` 구성. Rust 1.85에서 runtime `--all-targets --all-features`
+  compile도 통과했다.
 
-fixture의 ID·오류·출력은 검사 전용이며 공통 계약이 아니다. 기본 fixture는
+Rust 1.96 release 예제의 기본 7종 trace × 32 요청은 각 시나리오에서 physical 완료
+32·성공 소비 31·취소 1·최종 미사용 1, host 예약 peak 4,608 byte·최종 예약 0,
+관측 손실·관측 오류 0이었다. fixture 지연은 실제 호스트 성능 수치가 아니다.
+상한·명령·TSV 해석은 [재현 기록](../../benches/runtime/README.md)을 따른다.
+
+lifecycle와 CPU trace의 로컬 ID·오류·출력은 검사 전용이며 공통 계약이 아니다.
+계약 adapter 검사는 실제 공통 타입을 사용하되 Rules·모델·head는 독립 fixture다.
+기본 lifecycle fixture는
 요청 8개·batch 1개·동시 실행 1개·queue age 100 ms·deadline reserve 2 ms,
 host/device/pinned 각각 1,000 byte의 **모의 예약 상한**과 ring 16개를 사용한다.
 개별 검사는 같은 파일에서 상한을 바꿔 초과·overflow를 검증한다. GPU 실측 상한이나
 성능 튜닝값으로 사용하지 않는다. 실제 thread 검사에는 2초 receive timeout을 둔다.
 
 검증 target은 저장소 밖 `${RZ_D_ARTIFACT_ROOT}/target`에 둔다. 이 클라우드 작업의
-build cache는 세션 동안만 보존하며 소스·fixture·검사 결과 요약은 draft PR에서
-회수한다. 저장소 CI는 아직 구성되지 않아 원격 CI 결과는 없다. 재현 명령:
+build cache와 원시 TSV는 세션 동안만 보존하며 소스·fixture·검사 결과 요약은 draft PR에서
+회수한다. 이 D 브랜치의 runtime CI는 미실행이다. PR #7의 공통 계약 CI 성공은
+별도 결과이며 D/B/C 소비자 통합 성공을 뜻하지 않는다. 재현 명령:
 
 ```sh
-CARGO_TARGET_DIR="${RZ_D_ARTIFACT_ROOT}/target/runtime" cargo test --locked --offline --manifest-path crates/rz-runtime/Cargo.toml
-CARGO_TARGET_DIR="${RZ_D_ARTIFACT_ROOT}/target/telemetry" cargo test --locked --offline --manifest-path crates/rz-telemetry/Cargo.toml
-cargo fmt --manifest-path crates/rz-runtime/Cargo.toml -- --check
-cargo fmt --manifest-path crates/rz-telemetry/Cargo.toml -- --check
-cargo clippy --locked --offline --manifest-path crates/rz-runtime/Cargo.toml --all-targets -- -D warnings
-cargo clippy --locked --offline --manifest-path crates/rz-telemetry/Cargo.toml --all-targets -- -D warnings
+CARGO_TARGET_DIR="${RZ_D_ARTIFACT_ROOT}/target/runtime" cargo +1.96.0 test --locked --offline --manifest-path crates/rz-runtime/Cargo.toml --all-targets --all-features
+CARGO_TARGET_DIR="${RZ_D_ARTIFACT_ROOT}/target/telemetry" cargo +1.96.0 test --locked --offline --manifest-path crates/rz-telemetry/Cargo.toml --all-targets
+cargo +1.96.0 fmt --manifest-path crates/rz-runtime/Cargo.toml -- --check
+cargo +1.96.0 fmt --manifest-path crates/rz-telemetry/Cargo.toml -- --check
+cargo +1.96.0 clippy --locked --offline --manifest-path crates/rz-runtime/Cargo.toml --all-targets --all-features -- -D warnings
+cargo +1.96.0 clippy --locked --offline --manifest-path crates/rz-telemetry/Cargo.toml --all-targets -- -D warnings
+CARGO_TARGET_DIR="${RZ_D_ARTIFACT_ROOT}/target/msrv" cargo +1.85.0 check --locked --offline --manifest-path crates/rz-runtime/Cargo.toml --all-targets --all-features
 ```
 
-총괄 공통 계약 revision·C01 evaluator·B selection/backup의 실제 연결은 미인수다.
+공통 계약 0.1의 D adapter는 위 CPU 검사로 연결했다. C01 evaluator·B selection/backup과
+root workspace의 실제 소비자 통합은 미인수다.
 실제 신경망, 목표 GPU buffer 수명·수치·메모리, D02 GPU 종단 계측, D03 개선과
 paired 대국은 미실행이다. GPU 없는 개발 환경의 mock 검사를 GPU 인수로 사용하지 않는다.
 후속 I01/I02 인계에는 같은 SHA의 adapter·소비자 검사와 명령·설정·fixture·자원·

@@ -11,6 +11,8 @@ use std::fmt;
 use std::mem::size_of;
 use std::time::Duration;
 
+pub mod profile;
+
 /// Failure to create the bounded sample storage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CapacityError {
