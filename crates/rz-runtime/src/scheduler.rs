@@ -1,7 +1,7 @@
 use crate::{
     Adapter, Backend, BackendResult, Clock, Limits, Resources, RuntimeFault, TerminalEvent,
 };
-use rz_telemetry::{Event, FinishKind, Metrics, Snapshot};
+use rz_telemetry::{CapacityError, Event, FinishKind, Metrics, Snapshot};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{mpsc, Arc, Mutex};
 use std::task::Poll;
@@ -157,6 +157,10 @@ where
         metric_sample_capacity: usize,
     ) -> Result<Self, RuntimeFault> {
         let limits = limits.validate()?;
+        let metrics = Metrics::try_new(metric_sample_capacity).map_err(|error| match error {
+            CapacityError::Overflow => RuntimeFault::ResourceOverflow,
+            CapacityError::AllocationFailed => RuntimeFault::ResourceLimit,
+        })?;
         Ok(Self {
             adapter,
             provider: Some(provider),
@@ -168,7 +172,7 @@ where
             budget: Arc::new(Mutex::new(Budget::default())),
             closed: false,
             drain_deadline: None,
-            metrics: Metrics::new(metric_sample_capacity),
+            metrics,
         })
     }
 

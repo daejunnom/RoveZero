@@ -3,10 +3,18 @@
 D01 CPU/mock 런타임이 전달하는 이벤트를 수동적으로 집계합니다. 요청 상태를
 제어하거나 ID·계약을 새로 정의하지 않으며 외부 의존성과 `unsafe`가 없습니다.
 
-`Metrics::new(sample_capacity)`는 latency와 batch 크기 표본을 각각 최대
-`sample_capacity`개 보존하는 ring을 미리 할당합니다. 호출자는 이 용량을 자신의
-메모리 예산에 맞게 검증합니다. `record(&mut self, Event)`는 추가 할당·정렬 없이
-카운터와 표본을 갱신합니다. thread 간 동기화는 호출자 책임입니다.
+`Metrics::try_new(sample_capacity)`는 latency와 batch 크기 표본을 각각 최대
+`sample_capacity`개 보존하는 ring을 미리 할당합니다. 두 ring의 원소 수×원소 크기를
+할당 전에 모두 검사하고, `usize` overflow·`isize::MAX` byte 한계 초과는
+`CapacityError::Overflow`, `try_reserve_exact`의 할당 실패는 `AllocationFailed`로
+반환합니다. 용량 0은 정상입니다. `Metrics::new`는 신뢰된 제한 설정용 편의 API이며
+같은 검사·할당 실패 시 panic하므로 외부 설정과 런타임 생성에는 `try_new`를 씁니다.
+
+호출자는 representable 용량 검사와 별도로 운영 메모리 예산을 관리합니다. 두 ring
+저장 공간, runtime의 요청·실행 메타데이터, snapshot의 표본 복사·분포 map 할당을
+함께 고려하며 inference buffer 예산만으로 이 비용을 제한했다고 해석하지 않습니다.
+`record(&mut self, Event)`는 추가 할당·정렬 없이 카운터와 표본을 갱신합니다.
+thread 간 동기화는 호출자 책임입니다.
 
 `snapshot()`은 보존한 latency를 정렬해 nearest-rank P50/P95/P99를 계산하고,
 보존한 batch 크기의 분포를 반환합니다. 결과에는 각 표본의 총수·보존수·유실수가

@@ -7,7 +7,33 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::mem::size_of;
 use std::time::Duration;
+
+/// Failure to create the bounded sample storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapacityError {
+    /// Element byte size overflows `usize` or exceeds the `Vec` byte limit.
+    Overflow,
+    /// The allocator could not reserve the validated sample storage.
+    AllocationFailed,
+}
+
+impl fmt::Display for CapacityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Overflow => {
+                formatter.write_str("telemetry sample capacity exceeds the byte limit")
+            }
+            Self::AllocationFailed => {
+                formatter.write_str("telemetry sample storage allocation failed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CapacityError {}
 
 /// The logical terminal outcome of one admitted request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,8 +111,8 @@ pub struct Snapshot {
 /// Single-owner metrics with a fixed storage budget for each sample stream.
 ///
 /// Thread synchronization belongs to the caller. Both rings are allocated in
-/// `new`, with at most `sample_capacity` retained entries each. A snapshot may
-/// allocate and sort; callers should take it outside request handling paths.
+/// construction, with at most `sample_capacity` retained entries each. A snapshot
+/// may allocate and sort; callers should take it outside request handling paths.
 #[derive(Debug)]
 pub struct Metrics {
     counters: Counters,
@@ -98,15 +124,32 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// Convenience constructor for trusted, bounded capacity configurations.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the capacity exceeds the byte limit or storage allocation
+    /// fails. Use [`Metrics::try_new`] for runtime or external configuration.
     pub fn new(sample_capacity: usize) -> Self {
-        Self {
+        Self::try_new(sample_capacity).expect("trusted telemetry sample capacity must fit")
+    }
+
+    /// Check both sample layouts before allocating either ring.
+    ///
+    /// Allocation failures are returned as typed errors. This checks representable
+    /// storage, not the owner's operational memory budget, which also includes
+    /// runtime metadata and temporary snapshot storage.
+    pub fn try_new(sample_capacity: usize) -> Result<Self, CapacityError> {
+        validate_capacity::<usize>(sample_capacity)?;
+        validate_capacity::<Duration>(sample_capacity)?;
+        Ok(Self {
             counters: Counters::default(),
-            batches: Ring::new(sample_capacity),
-            latencies: Ring::new(sample_capacity),
+            batches: Ring::try_new(sample_capacity)?,
+            latencies: Ring::try_new(sample_capacity)?,
             batch_samples_dropped: 0,
             latency_samples_dropped: 0,
             counter_overflow: false,
-        }
+        })
     }
 
     /// Record one observation without changing runtime behavior.
@@ -211,12 +254,16 @@ struct Ring<T> {
 }
 
 impl<T> Ring<T> {
-    fn new(limit: usize) -> Self {
-        Self {
-            samples: Vec::with_capacity(limit),
+    fn try_new(limit: usize) -> Result<Self, CapacityError> {
+        let mut samples = Vec::new();
+        samples
+            .try_reserve_exact(limit)
+            .map_err(|_| CapacityError::AllocationFailed)?;
+        Ok(Self {
+            samples,
             limit,
             next: 0,
-        }
+        })
     }
 
     /// Return true if one sample was omitted or an older sample was overwritten.
@@ -236,6 +283,16 @@ impl<T> Ring<T> {
         };
         true
     }
+}
+
+fn validate_capacity<T>(capacity: usize) -> Result<(), CapacityError> {
+    let bytes = capacity
+        .checked_mul(size_of::<T>())
+        .ok_or(CapacityError::Overflow)?;
+    if bytes > isize::MAX as usize {
+        return Err(CapacityError::Overflow);
+    }
+    Ok(())
 }
 
 fn add(counter: &mut u64, amount: u64, overflow: &mut bool) {
@@ -282,6 +339,19 @@ mod tests {
     #[test]
     fn empty_snapshot_has_no_invented_samples() {
         assert_eq!(Metrics::new(4).snapshot(), Snapshot::default());
+    }
+
+    #[test]
+    fn impossible_capacity_is_rejected_before_either_ring_is_allocated() {
+        // The second case fits the usize ring but exceeds the Duration ring's
+        // isize byte limit. Prevalidation must reject it before any allocation.
+        let duration_limit_exceeded = isize::MAX as usize / size_of::<Duration>() + 1;
+        for capacity in [usize::MAX, duration_limit_exceeded] {
+            assert!(matches!(
+                Metrics::try_new(capacity),
+                Err(CapacityError::Overflow)
+            ));
+        }
     }
 
     #[test]
@@ -355,7 +425,7 @@ mod tests {
 
     #[test]
     fn zero_capacity_keeps_counters_and_reports_all_samples_as_dropped() {
-        let mut metrics = Metrics::new(0);
+        let mut metrics = Metrics::try_new(0).expect("zero capacity requires no sample allocation");
         finish(&mut metrics, FinishKind::Canceled, 7);
         metrics.record(Event::Dispatched { items: 2 });
         let snapshot = metrics.snapshot();

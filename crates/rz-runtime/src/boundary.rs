@@ -154,8 +154,12 @@ pub struct BackendResult<A: Adapter> {
 /// result for every input. Pending keeps all device/input/output/workspace pins
 /// in the Lease. A Ready output must own its data without borrowing the Lease.
 /// Additional resources cover batch workspace/staging not counted per request.
-pub trait Backend<A: Adapter> {
-    type Lease;
+/// Once device work starts, provider code must contain panic/unwind and preserve
+/// pins/context in a Lease until completion. An unwinding launch that loses its
+/// Lease is a provider contract violation, not a recoverable scheduler error.
+pub trait Backend<A: Adapter>: 'static {
+    /// Own/pin its context; borrowed external owners cannot survive quarantine.
+    type Lease: 'static;
 
     fn additional_resources(&self, requests: &[Arc<A::Request>]) -> Resources;
     fn dispatch(
