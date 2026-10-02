@@ -1,0 +1,12 @@
+[package]
+name = "rz-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Bounded, single-owner evaluation scheduling for RoveZero"
+
+# Temporary isolated build until TASK-I01 publishes the root workspace.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
