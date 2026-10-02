@@ -73,13 +73,85 @@ worker당 원본 하나를 owner mailbox에 둔다. 정확한 ticket·completion
 | 실제 CPU NN | 아래 a9a5ae7에서 선정 Maia·고정 LC0 Eigen 참조·ORT CPU와 실제 A→C→D·B UCI 연결 성공 | Linux CPU/FP32·지정 fixture·정상 완료 범위; 실제 Windows NN·목표 GPU는 별도 |
 | 목표 GPU | 목표 RTX 4050 6GB와 준비 provider를 개발 호스트와 구분 | 실제 장치·precision·batch·수치·buffer·메모리·D02 종단 계측 pending |
 | 실제 F02 학습 | F CPU 숫자 fixture gradient·checkpoint/export/resume 제공; 총괄 Linux F 검사 105개 성공 | 실제 Maia 학습·실제 encoder·검증 data·유한 예산·CONTROL-1→2 인수 pending |
-| 정식 paired 대국 | E manifest·pair planner·attempt ledger·원시 WDL/n0..n4와 고정 Fastchess fixture 준비 | Fastchess fixture 전체 실행 not_run; 실제 NN·시계/자원·군집 통계·holdout 및 정식 대국 인수 pending |
+| E 합성 fixture | 고정 Fastchess의 실제 paired 실행·A/독립 PGN 대조·artifact 사전 거부·live 취소를 아래에서 인수 | 합성 script·Linux CPU만 해당; NN·GPU·정식 시계/자원과 구분 |
+| 정식 paired 대국 | E manifest·pair planner·attempt ledger·원시 WDL/n0..n4 제공 | 실제 NN launch·시계/자원·군집 통계·holdout 및 정식 대국 인수 pending |
 
 이전 E source 리뷰의 test 선언 74개(Unix 조건부 4개)는 당시의 정의 수이며 최신 E
 실행 결과로 재사용하지 않는다. F source의 test method 105개와 아래 실제 105개 성공도
 정의 수·실행 결과를 구별한다. 정식 실행은 `execution_ready=false`를 유지한다.
 F의 fixture 데이터 `training_eligible_records=0`·wire/Rules/encoder `not_run`을
 실제 A/C 연결이나 CPU 검사 성공만으로 승격하지 않는다.
+
+## 후속 E 고정 Fastchess fixture 인수
+
+[PR #11](https://github.com/daejunnom/RoveZero/pull/11)의 실행 소스는
+`3de9603c94da68bf3fa0f47797a1f37559e0ec95`, 후속 검사 소스는
+`d15485017d3affdccf0df274df63fd988fa6f3e3`다. 후자는 실제 binary 검사 helper의
+원래 실패·독립 cleanup 실패 보존만 바꿨다. diff의 변경 경로가
+`crates/rz-arena/tests/fastchess.rs` 하나이며 제품 실행 소스·Cargo·toolchain·CI는
+일치함을 확인했다. 이전 release binary의 source SHA를 새 SHA로 바꾸지 않았다.
+
+선택적 UCI `FixtureMode=normal/crash/illegal/timeout`을 실제 합성 binary에 연결하고
+CLI 초기값·새 게임 이후 설정 보존·잘못된 값 거부를 검사했다. 기존 builder의
+Fixture·CPU·무가중치 제한은 유지하고 제품 엔진에는 이 옵션을 허용하지 않는다.
+계약 revision은 0.1이다. Linux/Rust 1.96.0에서 release binary 세 개를 실제 빌드해
+digest·byte·명령·root lock·feature를 고정했고, d154850의 E 검사는 **148 성공·0 실패·
+10 ignored**였다. ignored는 supervisor 검사가 별도로 띄우는 helper 진입점이다.
+[CI run 37064762859](https://github.com/daejunnom/RoveZero/actions/runs/37064762859)는
+d154850을 직접 checkout했고 Ubuntu·Windows의 필수 단계가 모두 성공했다.
+이 CI는 외부 Fastchess 전체 실행을 포함하지 않는다.
+
+외부 Fastchess 소스 `f618e34540f94f4719ad3817950618dabe441318`, tree
+`7af51c972096164b267d617ea4c32a856a17b586`를 clean 상태로 고정해
+GCC 13.3.0·C++17·`-march=x86-64`·`ZLIB=false`·jobs 2의 실제 `make all`로 빌드했다.
+`build=release`의 정적 링크 설정은 사용하지 않았다. 실제 binary는 2,429,320 bytes,
+SHA256 `ca85b6f3cbaab62352d7c98fb684f427a15c8a03d67825f0f2909eae725d9cfe`,
+실제 version stdout은 `fastchess alpha 1.8.2 20260726-f618e34`와 newline이다.
+본체 MIT와 포함된 외부 공지를 분리 보존했고 POSIX `argv_split.hpp`의 upstream
+permission 근거는 unresolved다. 내부 fixture 실행이며 외부 도구의 배포 권리 확정이 아니다.
+
+총괄의 새 외부 driver는 과거 standalone scripts를 재사용하지 않았다. 고정 빌드
+영수증·binary를 검증해 별도 snapshot을 만들고 새 manifest→lock→artifact verify→
+plan→실제 fixture→trusted tip ledger audit를 실행했다. 총 23개 CLI 명령이 원래 실패와
+cleanup을 독립 보존한다. Linux 6.6.87.2 WSL2·Python 3.12.3·default SIGCHLD·subreaper
+비활성으로 실행했으며, child에 논리 CPU 0 affinity·프로세스별 address-space 2 GiB를
+상속했다. kernel child quota·합산 RAM 한도·peak RSS는 인수하지 않는다.
+
+| 실제 gate | 결과 |
+|---|---|
+| Normal | 같은 `startpos + e2e4 e7e5`에서 색을 교환한 두 판. 전체 7 ply mate를 A Rules와 독립 `chess 1.11.2`로 대조. runner exit 0·Gone, 완료 pair 1·W1/D0/L1·`n=[0,0,1,0,0]` |
+| Cutoff | 전체 4 ply에서 두 판 종료. A/독립 oracle이 진행 중 상태를 확인. PGN의 adjudication draw를 점수에 넣지 않고 Incomplete 2·제외 pair 1·WDL/n 모두 0 |
+| Invalid artifact | runner SHA를 다르게 잠근 새 입력. artifact verifier와 실제 fixture 명령이 exit 2로 거부. attempt 디렉터리·runner·engine spawn 없음 |
+| Live cancel | 실제 CLI와 별도 runner group·fixture 두 개의 계보/PID/start-time/executable/affinity를 관측한 뒤 CLI에 SIGTERM. E `Cancelled`·signal 15·Gone·오류 없음, CLI exit 2. Incomplete 2·제외 pair 1·WDL/n 모두 0 |
+
+live cancel의 outer cleanup도 Gone·잔여 pin 없음이며 outer TERM/KILL·subreaper adoption은
+사용하지 않았다. 이것은 실제 프로세스 실행 중 취소이며, `go` 수신·신경망 physical
+in-flight·runtime/GPU drain을 관측했다는 뜻은 아니다. 취소의 PGN 감사는 수행하지 않는다.
+기존 receipt의 generic audit 오류 문구는 `Exited + exit 0 + Gone` 완료 조건의 실패를
+나타내며, 실제 cleanup은 별도 `process.group_cleanup=gone` 필드로 확인한다.
+Fastchess의 자체 정상 quit/reap 경로와 강제 종료 뒤 OS에서 관측한 group 부재도 구분한다.
+
+| 보존 근거 | SHA256 |
+|---|---|
+| 실제 RoveZero build receipt | `38af224d57c08ffd10ee843d48532960d02b92ea09077d1e75d0dd8066121011` |
+| Fastchess preparation receipt | `a26c5007bcedd6f6f1a4c189e2e97bdd910a1e4cbded2fdde092df3c5ae7496d` |
+| 실행한 driver | `80b7e74429f3c9cbde1bf314beb4cf965e5737fe02c1da871de8e333e6e9c221` |
+| 4 gate acceptance | `6691dc0620cf977c8c8ae17af3677fe2040aac1bb3496a2e33210b8922761019` |
+| Windows 회수 receipt | `659426e2c3426c297b6c1d52a656f13ccbe81a311909a48d20ca590c3976592d` |
+
+논리 보존 root는 저장소 밖 `reports/coordinator-integration/arena-fixture/`다.
+`captured-execution-baseline-01/`의 171개 파일·589,423 bytes가 Linux의 실행 자료와
+SHA256·byte 모두 일치했다. compiler/source checkout·executable snapshot·build object는
+별도 외부 root에 있으며 이 회수 수에 포함하지 않는다. fixture의 PGN·raw UCI stdout,
+manifest/lock/plan·원장·23개 명령·프로세스 receipt를 보존했다. trace 파일의 존재를
+모든 UCI 로그·옵션 적용 또는 provider attestation의 완전성으로 승격하지 않는다.
+
+네 gate는 `execution_ready=false`인 합성 script 인수다. 실제 NN pair에는 별도 typed
+launch와 original weights/ONNX/export manifest/ORT pin, 적용 provider와 종료/drain
+영수증, unresolved child와 입력/output pins를 함께 보유하는 owner가 필요하다.
+현재 native UCI는 고정 CPU 시작 인자를 사용하고 UCI options를 제공하지 않으므로
+fixture의 Threads/Ponder 옵션으로 이 계약을 대신하지 않는다. NN pair·목표 GPU·학습·
+정식 시계/자원/통계·LC0 대비 강도는 각각 pending이다.
 
 ## 후속 실제 CPU NN 인수
 
@@ -286,5 +358,5 @@ toolchain·backend/feature·fixture/weights/config digest·자원 한도, 실제
 skip/미실행, 외부 산출물 참조·digest와 다음 검증자를 기록한다. CI 요청·관측 완료·
 재사용 확인도 분리한다. CPU/mock과 후속 Linux 실제 CPU NN 소스·gate는 위에서
 확정했고 목표 GPU·GPU 종단 계측·학습·정식 대국은 각각 pending이다. 고정 Fastchess fixture
-전체 실행도 `not_run`이며 정상 PGN·exit 0만으로 raw UCI 로그 완전성을 인수하지 않는다.
+전체 실행은 위 새 4 gate에서 인수했으며 정상 PGN·exit 0만으로 raw UCI 로그 완전성을 인수하지 않는다.
 후속 총괄은 사용자 재개 때 원격 head와 이 조합을 대조해 계약을 수동 정합한다.

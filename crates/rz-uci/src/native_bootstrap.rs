@@ -1224,6 +1224,31 @@ mod physical_owner_tests {
         }
     }
 
+    fn assert_blocked_physical_owner_active(owner: &NativeWorkerOwner, stage: &'static str) {
+        let until = Instant::now() + WAIT;
+        loop {
+            match owner.try_status() {
+                Ok(Some(status)) => {
+                    assert!(
+                        status.active,
+                        "{stage}: blocked physical owner is inactive: {status:?}"
+                    );
+                    return;
+                }
+                Err(error) => panic!("{stage}: native owner status query failed: {error:?}"),
+                Ok(None) => {
+                    // None means owner-lock contention, not an inactive worker.
+                    // Retry the actual observation without claiming synchronization.
+                    assert!(
+                        Instant::now() < until,
+                        "{stage}: native owner status remained busy until the bounded observation deadline"
+                    );
+                    thread::yield_now();
+                }
+            }
+        }
+    }
+
     #[test]
     fn root_replacement_while_the_single_physical_worker_is_blocked_returns_current_legal_fallback_once()
      {
@@ -1293,7 +1318,7 @@ mod physical_owner_tests {
         entering
             .recv_timeout(WAIT)
             .expect("first root reached the actual physical worker");
-        assert!(native.owner.try_status().unwrap().unwrap().active);
+        assert_blocked_physical_owner_active(&native.owner, "after physical worker entry");
         for line in ["position startpos moves e2e4", "go nodes 1 movetime 30000"] {
             guard.events.send(Event::Line(line.into())).unwrap();
         }
@@ -1322,9 +1347,9 @@ mod physical_owner_tests {
             1,
             "busy root fallback cannot reload/create another provider session"
         );
-        assert!(
-            native.owner.try_status().unwrap().unwrap().active,
-            "valid fallback is independent of physical completion"
+        assert_blocked_physical_owner_active(
+            &native.owner,
+            "after current-root legal fallback before physical release",
         );
         guard.release.take().unwrap().send(()).unwrap();
         guard.events.send(Event::Line("quit".into())).unwrap();

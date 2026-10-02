@@ -27,8 +27,17 @@ I01 소유다. 자체 코드는 [MIT LICENSE](LICENSE)를 따른다. 의존성 �
 Linux fixture supervisor는 검증한 실행 파일, 유한 process group, 출력·artifact 한도와
 A Rules 기반 PGN 감사를 제공한다. 전체 ply는 4095 이하이며 config·opening·PGN이
 공유 artifact 예산을 사용한다. Fastchess 로그 인자는 기존 bounded stdout으로 연결하지만
-실제 trace 확보는 별도 확인한다. 실제 고정 Fastchess의 전체 fixture 실행과 정식 대국
-시계·장비·통계 인수는 아직 완료하지 않았다. `execution_ready=false`를 유지한다.
+실제 trace의 완전성은 별도 확인한다. 총괄은 고정 Fastchess의 normal/cutoff/artifact 거부/
+live cancel 전체 fixture를 실제 실행해 인수했다. 정식 대국 시계·장비·통계 인수는
+후속이며 `execution_ready=false`를 유지한다. 정확한 binary·소스·결과는
+[총괄 인수 기록](../../docs/INTEGRATION-STATUS.md#후속-e-고정-fastchess-fixture-인수)을 따른다.
+
+선택적 UCI combo `FixtureMode`는 `normal`, `crash`, `illegal`, `timeout` 네 값만
+받는다. 기존 CLI `--mode`는 초기 기본값이며 적용 설정은 `ucinewgame` 뒤에도 남는다.
+timeout은 `stop`/`quit`을 계속 처리하며 외부 runner가 유한 시간·취소를 소유한다.
+builder는 Fixture·CPU·무가중치 제한 뒤에만 이 옵션을 전달한다. 실제 RoveZero/LC0의
+argv·모델/provider 명세를 이 옵션으로 대체하지 않는다. crash/illegal binary 회귀와
+실제 고정 runner의 네 gate를 구분하며, 강도 실험의 실패 판 득점 인수는 후속이다.
 
 ## 불변 pair 계획
 
@@ -129,9 +138,10 @@ cargo run --manifest-path crates/rz-arena/Cargo.toml -- audit "$ARTIFACT_ROOT/ru
 
 현재 source에는 plan·사건 회계·JSONL 외에 A의 checked opening·PGN replay,
 Fastchess 인자 adapter·verified file handle과 유한 Linux subprocess 수명 코드가 있다.
-`fixture-pair`는 고정한 외부 runner와 실제 engine·입력·PGN의 identity를 연결해 별도
-smoke를 실행해야 인수할 수 있다. 코드 반입·단위 fixture 성공을 이 전체 실행으로
-보고하지 않는다. 정식 clock/draw/seed·CPU/RAM·GPU drain·통계·resume 인수는 후속이다.
+`fixture-pair`는 고정한 외부 runner와 실제 engine·입력·PGN의 identity를 연결한다.
+총괄의 새 Linux 실행은 normal과 cutoff의 A/독립 PGN 대조, artifact 사전 거부,
+실행 중 취소의 Cancelled·Gone과 득점 제외를 확인했다. 코드 반입·단위 fixture와
+이 전체 실행을 구분한다. 정식 clock/draw/seed·CPU/RAM·GPU drain·통계·resume 인수는 후속이다.
 `ProcessReceipt.elapsed_ns`는 subprocess와 cleanup 구간이며 앞뒤의 입력 검증·opening
 생성·PGN 감사·기록 비용까지 포함한 전체 실행 시간이 아니다.
 이 코드는 `execution_ready=false`를 유지한다. 실제 NN·GPU·대국 강도는 별도 인수한다.

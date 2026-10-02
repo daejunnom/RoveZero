@@ -217,6 +217,8 @@ pub fn build_fastchess_invocation(
             match name.as_str() {
                 "Threads" if value == "1" => {}
                 "Ponder" if value == "false" => {}
+                "FixtureMode"
+                    if matches!(value.as_str(), "normal" | "crash" | "illegal" | "timeout") => {}
                 "Hash" => {
                     let megabytes = value
                         .parse::<u32>()

@@ -11,8 +11,9 @@ const MAX_LINE_BYTES: usize = 8192;
 const MAX_COMMANDS: usize = 10_000;
 const SCRIPT: [&str; 7] = ["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6", "h5f7"];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Mode {
+    #[default]
     Normal,
     Crash,
     Illegal,
@@ -20,6 +21,16 @@ enum Mode {
 }
 
 impl Mode {
+    fn parse(value: &str) -> Result<Self, &'static str> {
+        match value {
+            "normal" => Ok(Self::Normal),
+            "crash" => Ok(Self::Crash),
+            "illegal" => Ok(Self::Illegal),
+            "timeout" => Ok(Self::Timeout),
+            _ => Err("mode must be exactly normal, crash, illegal or timeout"),
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::Normal => "normal",
@@ -38,6 +49,7 @@ enum Termination {
 
 #[derive(Default)]
 struct FixtureState {
+    mode: Mode,
     prefix_len: usize,
     pending_go: bool,
     seed: u64,
@@ -89,13 +101,10 @@ fn parse_mode(args: &[OsString]) -> Result<Mode, String> {
         return Ok(Mode::Normal);
     }
     if args.len() == 2 && args[0] == "--mode" {
-        return match args[1].to_str() {
-            Some("normal") => Ok(Mode::Normal),
-            Some("crash") => Ok(Mode::Crash),
-            Some("illegal") => Ok(Mode::Illegal),
-            Some("timeout") => Ok(Mode::Timeout),
-            _ => Err("--mode must be exactly normal, crash, illegal or timeout".to_string()),
-        };
+        return args[1]
+            .to_str()
+            .ok_or_else(|| "--mode must be valid UTF-8".to_string())
+            .and_then(|value| Mode::parse(value).map_err(str::to_string));
     }
     Err("Usage: rz-arena-fixture-engine [--mode normal|crash|illegal|timeout]".to_string())
 }
@@ -113,7 +122,10 @@ fn run<R: BufRead, W: Write, D: Write>(
             mode.name()
         ),
     )?;
-    let mut state = FixtureState::default();
+    let mut state = FixtureState {
+        mode,
+        ..FixtureState::default()
+    };
     for _ in 0..MAX_COMMANDS {
         let Some(command) = read_bounded_line(input)? else {
             return Ok(Termination::Complete);
@@ -130,20 +142,26 @@ fn run<R: BufRead, W: Write, D: Write>(
                     "option name Ponder type check default false",
                     "option name Threads type spin default 1 min 1 max 1",
                     "option name Seed type string default 0",
-                    "uciok",
                 ] {
                     line(output, response)?;
                 }
-            }
-            ["isready"] => {
                 line(
                     output,
                     &format!(
-                        "info string synthetic applied Ponder=false Threads=1 Seed={} mode={}",
-                        state.seed,
+                        "option name FixtureMode type combo default {} var normal var crash var illegal var timeout",
                         mode.name()
                     ),
                 )?;
+                line(output, "uciok")?;
+            }
+            ["isready"] => {
+                let applied = format!(
+                    "synthetic applied Ponder=false Threads=1 Seed={} mode={}",
+                    state.seed,
+                    state.mode.name()
+                );
+                line(diagnostics, &applied)?;
+                line(output, &format!("info string {applied}"))?;
                 line(output, "readyok")?;
             }
             ["ucinewgame"] => {
@@ -158,8 +176,9 @@ fn run<R: BufRead, W: Write, D: Write>(
                 line(
                     diagnostics,
                     &format!(
-                        "synthetic applied Ponder=false Threads=1 Seed={}",
-                        state.seed
+                        "synthetic applied Ponder=false Threads=1 Seed={} mode={}",
+                        state.seed,
+                        state.mode.name()
                     ),
                 )?;
             }
@@ -181,11 +200,11 @@ fn run<R: BufRead, W: Write, D: Write>(
                     diagnostics,
                     &format!(
                         "synthetic go mode={} prefix_len={} clock_arguments_ignored=true",
-                        mode.name(),
+                        state.mode.name(),
                         state.prefix_len
                     ),
                 )?;
-                match mode {
+                match state.mode {
                     Mode::Normal => line(output, &format!("bestmove {}", state.next_move()))?,
                     Mode::Crash => {
                         line(diagnostics, "synthetic injected crash: exit 17")?;
@@ -228,8 +247,12 @@ fn apply_option(words: &[&str], state: &mut FixtureState) -> Result<(), String> 
                 .map_err(|_| "synthetic Seed option must be a u64".to_string())?;
             Ok(())
         }
+        ["setoption", "name", "FixtureMode", "value", value] => {
+            state.mode = Mode::parse(value).map_err(str::to_string)?;
+            Ok(())
+        }
         _ => Err(
-            "synthetic fixture supports only Ponder=false, Threads=1 and a u64 Seed".to_string(),
+            "synthetic fixture supports only Ponder=false, Threads=1, a u64 Seed and canonical FixtureMode values".to_string(),
         ),
     }
 }
@@ -358,6 +381,76 @@ mod tests {
     }
 
     #[test]
+    fn cli_initial_mode_is_the_advertised_uci_combo_default() {
+        assert_eq!(parse_mode(&[]).unwrap(), Mode::Normal);
+        for mode in [Mode::Normal, Mode::Crash, Mode::Illegal, Mode::Timeout] {
+            let initial = parse_mode(&["--mode".into(), mode.name().into()]).unwrap();
+            assert_eq!(initial, mode);
+            assert_eq!(Mode::parse(mode.name()).unwrap(), mode);
+            let (result, output, _) = session(initial, "uci\nisready\nquit\n");
+            assert_eq!(result.unwrap(), Termination::Complete);
+            assert!(output.contains(&format!(
+                "option name FixtureMode type combo default {} var normal var crash var illegal var timeout\n",
+                mode.name()
+            )));
+            assert!(output.contains(&format!("mode={}\nreadyok\n", mode.name())));
+        }
+    }
+
+    #[test]
+    fn runtime_mode_option_controls_go_and_records_the_applied_configuration() {
+        for mode in [Mode::Normal, Mode::Crash, Mode::Illegal, Mode::Timeout] {
+            let initial = if mode == Mode::Normal {
+                Mode::Illegal
+            } else {
+                Mode::Normal
+            };
+            let commands = format!(
+                "setoption name FixtureMode value {}\nisready\nposition startpos\ngo\nisready\nstop\nquit\n",
+                mode.name()
+            );
+            let (result, output, diagnostics) = session(initial, &commands);
+            assert!(output.contains(&format!("mode={}\nreadyok\n", mode.name())));
+            assert!(diagnostics.contains(&format!(
+                "synthetic applied Ponder=false Threads=1 Seed=0 mode={}\n",
+                mode.name()
+            )));
+            assert!(diagnostics.contains(&format!("synthetic go mode={} ", mode.name())));
+            let moves: Vec<_> = output
+                .lines()
+                .filter(|line| line.starts_with("bestmove "))
+                .collect();
+            match mode {
+                Mode::Crash => {
+                    assert_eq!(result.unwrap(), Termination::InjectedCrash);
+                    assert!(moves.is_empty());
+                }
+                Mode::Illegal => {
+                    assert_eq!(result.unwrap(), Termination::Complete);
+                    assert_eq!(moves, ["bestmove a1a8"]);
+                }
+                Mode::Normal | Mode::Timeout => {
+                    assert_eq!(result.unwrap(), Termination::Complete);
+                    assert_eq!(moves, ["bestmove e2e4"]);
+                    let bestmove = output.find("bestmove ").unwrap();
+                    let ready_after_go = output.rfind("readyok\n").unwrap();
+                    if mode == Mode::Timeout {
+                        assert!(
+                            ready_after_go < bestmove,
+                            "timeout withholds reply until stop"
+                        );
+                    } else {
+                        assert!(
+                            bestmove < ready_after_go,
+                            "normal replies to go immediately"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn position_parser_rejects_every_unregistered_variation() {
         assert_eq!(parse_position(&["position", "startpos"]).unwrap(), 0);
         assert_eq!(
@@ -370,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn newgame_resets_position_and_pending_work_but_preserves_seed_configuration() {
+    fn newgame_resets_position_and_pending_work_but_preserves_seed_and_mode() {
         let (result, output, _) = session(
             Mode::Normal,
             "setoption name Seed value 42\nposition startpos moves e2e4 e7e5\nucinewgame\nisready\ngo\nquit\n",
@@ -384,6 +477,21 @@ mod tests {
         );
         assert!(result.is_ok());
         assert!(!output.contains("bestmove"));
+        let (result, output, _) = session(
+            Mode::Normal,
+            "setoption name Seed value 42\nsetoption name FixtureMode value illegal\nposition startpos moves e2e4 e7e5\nucinewgame\nisready\ngo\nquit\n",
+        );
+        assert_eq!(result.unwrap(), Termination::Complete);
+        assert!(output.contains("Seed=42 mode=illegal\nreadyok\n"));
+        assert!(output.contains("bestmove a1a8\n"));
+        let (result, output, _) = session(
+            Mode::Normal,
+            "setoption name FixtureMode value timeout\nposition startpos moves e2e4 e7e5\ngo\nucinewgame\nisready\nstop\ngo\nstop\nquit\n",
+        );
+        assert_eq!(result.unwrap(), Termination::Complete);
+        assert!(output.contains("mode=timeout\nreadyok\n"));
+        assert_eq!(output.matches("bestmove ").count(), 1);
+        assert!(output.contains("bestmove e2e4\n"));
     }
 
     #[test]
@@ -423,6 +531,42 @@ mod tests {
         }
         assert!(parse_mode(&["--mode".into(), "random".into()]).is_err());
         assert!(parse_mode(&["--mode".into(), "normal".into(), "extra".into()]).is_err());
+    }
+
+    #[test]
+    fn invalid_runtime_mode_is_static_and_leaves_the_previous_configuration_intact() {
+        let mut state = FixtureState {
+            mode: Mode::Illegal,
+            prefix_len: 2,
+            pending_go: true,
+            seed: 42,
+        };
+        for value in ["NORMAL", "Normal", "private-option-marker", "", "timeout=1"] {
+            let rejected = apply_option(
+                &["setoption", "name", "FixtureMode", "value", value],
+                &mut state,
+            )
+            .unwrap_err();
+            assert_eq!(
+                rejected,
+                "mode must be exactly normal, crash, illegal or timeout"
+            );
+            assert_eq!(state.mode, Mode::Illegal);
+            assert_eq!(state.prefix_len, 2);
+            assert!(state.pending_go);
+            assert_eq!(state.seed, 42);
+        }
+        let (result, output, diagnostics) = session(
+            Mode::Normal,
+            "setoption name FixtureMode value private-option-marker\ngo\n",
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "mode must be exactly normal, crash, illegal or timeout"
+        );
+        assert!(output.is_empty());
+        assert!(!diagnostics.contains("private-option-marker"));
+        assert!(!diagnostics.contains("synthetic applied"));
     }
 
     #[test]
