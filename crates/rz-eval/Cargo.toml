@@ -10,15 +10,17 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-rz-encoding = { path = "../rz-encoding" }
-sha2 = "=0.10.9"
-flate2 = "=1.1.2"
-serde = { version = "=1.0.219", features = ["derive"] }
-serde_json = "=1.0.140"
+rz-encoding.workspace = true
+sha2.workspace = true
+flate2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic", "cuda"], optional = true }
-rz-contracts = { git = "https://github.com/daejunnom/RoveZero.git", rev = "ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8", optional = true }
+rz-contracts = { workspace = true, optional = true }
+rz-position = { workspace = true, optional = true, features = ["contracts"] }
+rz-runtime = { workspace = true, optional = true, features = ["contracts"] }
 
 [features]
 default = []
 onnx = ["dep:ort"]
-contracts = ["dep:rz-contracts"]
+contracts = ["dep:rz-contracts", "dep:rz-position", "dep:rz-runtime"]

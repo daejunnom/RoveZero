@@ -5,5 +5,4 @@ edition = "2021"
 license = "MIT"
 description = "Bounded passive runtime metrics for RoveZero"
 
-[workspace]
 

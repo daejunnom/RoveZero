@@ -10,4 +10,9 @@ description = "RoveZero UCI parser and injected session control boundary"
 path = "src/lib.rs"
 
 [dependencies]
-rz-search = { path = "../rz-search" }
+rz-search.workspace = true
+rz-contracts.workspace = true
+rz-position = { workspace = true, features = ["contracts"] }
+rz-runtime = { workspace = true, features = ["contracts"] }
+rz-eval = { workspace = true, features = ["contracts"] }
+rz-encoding.workspace = true

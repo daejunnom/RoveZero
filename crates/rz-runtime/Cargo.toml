@@ -5,15 +5,13 @@ edition = "2021"
 license = "MIT"
 description = "Bounded, single-owner evaluation scheduling for RoveZero"
 
-# Temporary isolated build until TASK-I01 publishes the root workspace.
-[workspace]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-rz-telemetry = { path = "../rz-telemetry" }
-rz-contracts = { git = "https://github.com/daejunnom/RoveZero", rev = "ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8", optional = true }
+rz-telemetry.workspace = true
+rz-contracts = { workspace = true, optional = true }
 
 [features]
 default = []
