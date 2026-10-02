@@ -246,6 +246,11 @@ where
 
     pub fn submit(&mut self, request: A::Request) -> SubmitResult<A> {
         let id = self.adapter.request_id(&request);
+        // Every submission reaches the adapter, even if a local scheduling
+        // limit refuses it. Admission may consume a fresh logical ID; capacity
+        // must not make refused IDs reusable later. Preserve the local fault
+        // precedence below, and never reserve or launch work in validation.
+        let admission = self.adapter.validate_admission(&request);
         let fault = if self.closed {
             Some(RuntimeFault::Closed)
         } else if self.entries.contains_key(&id)
@@ -263,7 +268,7 @@ where
         if let Some(fault) = fault {
             return self.reject(request, self.adapter.runtime_error(fault));
         }
-        if let Err(error) = self.adapter.validate_admission(&request) {
+        if let Err(error) = admission {
             return self.reject(request, error);
         }
         // Validation itself costs time; sample after it, not before it.

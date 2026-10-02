@@ -15,7 +15,10 @@ use rz_contracts::{
 use rz_runtime::contracts::{
     ContractClock, ContractEvaluator, ContractsAdapter, RuntimeRequest, SharedScope,
 };
-use rz_runtime::{Backend, BackendResult, Clock, Limits, Resources};
+use rz_runtime::{
+    Backend, BackendResult, Clock, DrainState, Limits, ObservationKind, Resources, Scheduler,
+};
+use rz_telemetry::FinishKind;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -356,6 +359,10 @@ struct Fixture {
 }
 
 fn fixture(max_requests: usize) -> Fixture {
+    fixture_with_capacity(max_requests, 8)
+}
+
+fn fixture_with_capacity(max_requests: usize, observation_capacity: usize) -> Fixture {
     let clock = ManualClock::default();
     let shared_scope = SharedScope::new(scope());
     let backend = Arc::new(BackendControl::default());
@@ -368,7 +375,7 @@ fn fixture(max_requests: usize) -> Fixture {
                 clock: clock.clone(),
             },
             limits(max_requests),
-            8,
+            observation_capacity,
         )
         .unwrap(),
         clock,
@@ -389,6 +396,182 @@ fn failed(result: EvalResult) -> rz_contracts::EvalFailure {
     match result {
         EvalResult::Failed(failure) => failure,
         other => panic!("expected explicit failure, got {other:?}"),
+    }
+}
+
+#[test]
+fn direct_scheduler_consumes_a_queue_full_contract_request_id() {
+    let clock = ManualClock::default();
+    let backend = Arc::new(BackendControl::default());
+    let adapter = ContractsAdapter::new(SharedScope::new(scope()), clock.clone(), 1).unwrap();
+    let mut scheduler = Scheduler::new(
+        adapter,
+        ControlledBackend {
+            control: Arc::clone(&backend),
+            clock: clock.clone(),
+        },
+        clock,
+        limits(1),
+        8,
+    )
+    .unwrap();
+    let first = scheduler
+        .submit(RuntimeRequest::new(request(1, 100)))
+        .unwrap_or_else(|rejected| panic!("first admission failed: {:?}", rejected.error));
+    let refused = scheduler
+        .submit(RuntimeRequest::new(request(2, 100)))
+        .err()
+        .expect("full scheduler must refuse the second request");
+    assert_eq!(refused.error.code, ErrorCode::ResourceExhausted);
+    drop(refused);
+    assert!(scheduler.cancel(&RequestId::new(EPOCH, 1)));
+    assert!(matches!(first.try_recv().unwrap(), EvalResult::Canceled(_)));
+    assert_eq!(scheduler.state().reserved_requests, 0);
+    assert_eq!(scheduler.state().reserved, Resources::default());
+    let reused = scheduler
+        .submit(RuntimeRequest::new(request(2, 100)))
+        .err()
+        .expect("free capacity must not permit a refused ID to be reused");
+    assert_eq!(reused.error.code, ErrorCode::IdentityMismatch);
+    assert_eq!(reused.error.stage, Stage::Admission);
+    drop(reused);
+    assert_eq!(scheduler.state().reserved_requests, 0);
+    assert!(backend.executions.lock().unwrap().is_empty());
+    let fresh = scheduler
+        .submit(RuntimeRequest::new(request(3, 100)))
+        .unwrap_or_else(|rejected| panic!("fresh admission failed: {:?}", rejected.error));
+    scheduler.pump();
+    scheduler.pump();
+    let EvalResult::Completed(output) = fresh.try_recv().unwrap() else {
+        panic!("a fresh ID must still complete after a refused retry")
+    };
+    assert_eq!(output.context.request, RequestId::new(EPOCH, 3));
+    assert_eq!(scheduler.state().reserved_requests, 0);
+}
+
+#[test]
+fn common_observations_preserve_logical_cancel_before_physical_completion() {
+    let mut fixture = fixture_with_capacity(1, 64);
+    let ready = Arc::new(AtomicBool::new(false));
+    fixture.backend.plans.lock().unwrap().push_back(Plan {
+        ready: Arc::clone(&ready),
+        ..Plan::default()
+    });
+    let id = RequestId::new(EPOCH, 1);
+    fixture.runtime.submit(request(1, 100)).unwrap();
+    fixture.runtime.pump();
+    let execution = fixture.backend.executions.lock().unwrap()[0];
+    fixture.runtime.cancel(id).unwrap();
+    assert!(matches!(
+        fixture.runtime.poll(),
+        Some(EvalResult::Canceled(_))
+    ));
+    assert_eq!(fixture.backend.lease_drops.load(Ordering::SeqCst), 0);
+    ready.store(true, Ordering::SeqCst);
+    fixture.clock.set(1);
+    fixture.runtime.pump();
+    let observed = fixture.runtime.take_observations();
+    assert_eq!(observed.dropped, 0);
+    assert!(!observed.counter_overflow);
+    let canceled = observed
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                ObservationKind::Finished {
+                    request,
+                    kind: FinishKind::Canceled,
+                    delivered: true,
+                } if *request == id
+            )
+        })
+        .unwrap();
+    let completed = observed
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                ObservationKind::PhysicalCompleted { execution: actual } if *actual == execution
+            )
+        })
+        .unwrap();
+    assert!(canceled < completed);
+    assert!(!observed.events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            ObservationKind::ValidationStarted { .. } | ObservationKind::ValidationFinished { .. }
+        )
+    }));
+    assert_eq!(fixture.backend.lease_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.runtime.state().reserved_requests, 0);
+    assert!(fixture.runtime.poll().is_none());
+}
+
+#[test]
+fn common_observation_loss_is_bounded_and_does_not_change_completion() {
+    for capacity in [0, 2] {
+        let mut fixture = fixture_with_capacity(1, capacity);
+        fixture.runtime.submit(request(1, 100)).unwrap();
+        assert!(matches!(
+            complete(&mut fixture.runtime),
+            EvalResult::Completed(_)
+        ));
+        let observed = fixture.runtime.take_observations();
+        assert!(observed.events.len() <= capacity);
+        assert!(observed.dropped > 0);
+        assert!(!observed.counter_overflow);
+        assert_eq!(fixture.runtime.state().reserved_requests, 0);
+        assert_eq!(fixture.runtime.state().reserved, Resources::default());
+        let second = fixture.runtime.take_observations();
+        assert!(second.events.is_empty());
+        assert_eq!(second.dropped, 0);
+        assert!(!second.counter_overflow);
+    }
+}
+
+#[test]
+fn common_shutdown_snapshot_separates_physical_drain_from_unread_delivery() {
+    for completed in [false, true] {
+        let mut fixture = fixture(1);
+        assert_eq!(fixture.runtime.shutdown_snapshot().drain, DrainState::Open);
+        fixture.runtime.submit(request(1, 100)).unwrap();
+        if completed {
+            fixture.runtime.pump();
+            fixture.runtime.pump();
+        }
+        fixture
+            .runtime
+            .begin_shutdown(Deadline {
+                clock: CLOCK_DOMAIN,
+                at: MonotonicTick(100),
+            })
+            .unwrap();
+        let snapshot = fixture.runtime.shutdown_snapshot();
+        assert_eq!(snapshot.drain, DrainState::Drained);
+        assert!(snapshot.state.closed);
+        assert_eq!(snapshot.state.logical_requests, 0);
+        assert_eq!(snapshot.state.executions, 0);
+        assert_eq!(snapshot.state.reserved_requests, 1);
+        assert_eq!(
+            snapshot.state.reserved,
+            Resources {
+                host_bytes: 11,
+                device_bytes: 13,
+                pinned_bytes: 5,
+            }
+        );
+        let result = fixture.runtime.poll().unwrap();
+        assert!(matches!(
+            (completed, result),
+            (true, EvalResult::Completed(_)) | (false, EvalResult::Canceled(_))
+        ));
+        let released = fixture.runtime.shutdown_snapshot();
+        assert_eq!(released.drain, DrainState::Drained);
+        assert_eq!(released.state.reserved_requests, 0);
+        assert_eq!(released.state.reserved, Resources::default());
+        assert!(fixture.runtime.poll().is_none());
     }
 }
 

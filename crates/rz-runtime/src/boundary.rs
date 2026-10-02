@@ -103,6 +103,11 @@ pub enum TerminalEvent<O, E> {
 ///
 /// Request metadata must be immutable. `validate_admission` must validate the
 /// shared contract and provenance of a fresh RequestId; IDs must never be reused.
+/// It is called exactly once for every `submit`, including submissions refused
+/// because admission is closed, the ID is active, or the queue is full. It may
+/// consume fresh IDs, but must remain bounded and must not reserve scheduler
+/// resources, launch work, or publish a terminal result. Local scheduling faults
+/// take precedence over its returned error when both refuse the submission.
 /// `is_current` includes game/root/model/encoding/state/slot generations.
 /// `validate_output` checks request identity, legal order, required heads and
 /// numerical admissibility. `terminal` must be a short, infallible construction;

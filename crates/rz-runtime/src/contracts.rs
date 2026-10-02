@@ -5,7 +5,7 @@
 
 use crate::{
     Adapter, Backend, Clock, CompletionReceiver, DrainState, Limits, Resources, RuntimeFault,
-    Scheduler, State, TerminalEvent,
+    Scheduler, SchedulerObservations, ShutdownSnapshot, State, TerminalEvent,
 };
 use rz_contracts::*;
 use rz_telemetry::Snapshot;
@@ -435,6 +435,14 @@ where
         self.scheduler.metrics()
     }
 
+    /// Drain bounded scheduler facts without consuming common result receipts.
+    /// Event loss is explicit; these facts do not authorize search backup or
+    /// describe the separate final acceptance performed by common `poll`.
+    /// The caller records wrapper refusals that occur before scheduler admission.
+    pub fn take_observations(&mut self) -> SchedulerObservations<ContractsAdapter<P, C>> {
+        self.scheduler.take_observations()
+    }
+
     pub fn begin_shutdown(&mut self, deadline: Deadline) -> Result<(), ContractError> {
         if deadline.clock != self.clock.domain() {
             return Err(ContractError::new(
@@ -449,6 +457,12 @@ where
 
     pub fn drain_state(&self) -> DrainState {
         self.scheduler.drain_state()
+    }
+
+    /// Physical drain can finish while unread common results still own their
+    /// delivery reservations. Report both facts from one scheduler snapshot.
+    pub fn shutdown_snapshot(&self) -> ShutdownSnapshot {
+        self.scheduler.shutdown_snapshot()
     }
 
     fn accept_delivery(&self, request: &RuntimeRequest<P>, result: EvalResult) -> EvalResult {

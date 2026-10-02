@@ -122,6 +122,7 @@ struct AdapterControl {
     root: AtomicU64,
     validation: Mutex<VecDeque<ValidationHook>>,
     admission_tick: AtomicU64,
+    admission_ids: Mutex<Vec<u64>>,
     execution_tick: AtomicU64,
     fail_execution_id: AtomicBool,
     panic_binding: AtomicBool,
@@ -162,6 +163,7 @@ impl Adapter for FixtureAdapter {
     }
 
     fn validate_admission(&mut self, request: &Request) -> Result<(), Error> {
+        self.control.admission_ids.lock().unwrap().push(request.id);
         let tick = self.control.admission_tick.swap(0, Ordering::SeqCst);
         if tick != 0 {
             self.control.clock.set(tick);
@@ -425,6 +427,7 @@ impl Fixture {
             root: AtomicU64::new(1),
             validation: Mutex::new(VecDeque::new()),
             admission_tick: AtomicU64::new(0),
+            admission_ids: Mutex::new(Vec::new()),
             execution_tick: AtomicU64::new(0),
             fail_execution_id: AtomicBool::new(false),
             panic_binding: AtomicBool::new(false),
@@ -540,9 +543,17 @@ fn admission_returns_rejected_ownership_without_terminal_or_reservation() {
     let reused = fixture.runtime.submit(fixture.request(1)).err().unwrap();
     assert_eq!(reused.error.failure, Failure::Admission);
     drop(reused);
+    let refused = fixture.runtime.submit(fixture.request(2)).err().unwrap();
+    assert_eq!(refused.error.failure, Failure::Admission);
+    drop(refused);
+    assert_eq!(
+        *fixture.adapter.admission_ids.lock().unwrap(),
+        vec![1, 1, 2, 1, 2],
+        "capacity and duplicate refusals must each validate exactly once"
+    );
     assert_eq!(fixture.runtime.state().reserved, Resources::default());
     assert_eq!(*fixture.adapter.terminal_ids.lock().unwrap(), vec![1]);
-    assert_eq!(fixture.runtime.metrics().rejected, 3);
+    assert_eq!(fixture.runtime.metrics().rejected, 4);
 }
 
 #[test]
@@ -1057,6 +1068,10 @@ fn shutdown_keeps_first_deadline_and_reclaims_after_timeout_when_physical_work_f
     assert_eq!(
         rejected.error.failure,
         Failure::Runtime(RuntimeFault::Closed)
+    );
+    assert_eq!(
+        *fixture.adapter.admission_ids.lock().unwrap(),
+        vec![1, 2, 3]
     );
     drop(rejected);
     fixture.runtime.pump();
