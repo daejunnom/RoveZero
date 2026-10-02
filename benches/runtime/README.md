@@ -129,3 +129,14 @@ crates/rz-runtime/Cargo.toml --examples`다. 네 검사는 일곱 시나리오�
 이 진입점은 D02 내부 CPU/mock 도구의 baseline이다. 같은 weights·search 의미·
 자원의 variant 대조나 D03 성능 개선 결과는 포함하지 않는다. 실제 B/C 소비자와
 목표 GPU의 전송·완료·VRAM·전체 탐색 경로, 신경망 오차와 정식 대국은 별도 인수한다.
+
+## 검증 자료 보존
+
+원본 TSV 8개와 재수집 검사 로그 8개를 포함한 공개 보존 사본은 저장소 밖의
+`reports/coordinator-integration/recovered-pr-evidence/exact-blobs/D-f2a6c60`에 회수했다.
+26개 파일 모두 보존 커밋의 Git blob identity·길이와 대조했다. 출처는
+[D 보존 커밋](https://github.com/daejunnom/RoveZero/tree/f2a6c605dccfe85f8127b52b76380844a4c9c81c/benches/runtime/evidence/aa2fe1c-d02),
+인수 요약·manifest 참조는 [총괄 인수 기록](../../docs/INTEGRATION-STATUS.md)이다.
+과거 정확한 실행 SHA·argv·UTC·요청별 입력·event stream의 누락과 초기 trace의
+미확인 소스를 유지한다. 재수집 69개 통과는 D의 과거 standalone 구성에 대한
+결과이며 현재 root workspace의 검사나 GPU·D03 개선 근거로 재사용하지 않는다.
