@@ -118,6 +118,19 @@ impl ArtifactRef {
     pub fn validate(&self) -> Result<(), ManifestError> {
         crate::validation::validate_artifact(self)
     }
+
+    /// Verify bounded bytes through a pinned no-follow file handle and return
+    /// that same read-only handle at offset zero. Pathname replacement cannot
+    /// redirect the returned handle. The caller must prevent concurrent writes
+    /// to its inode (including through hardlinks) throughout subsequent use;
+    /// this API does not freeze file contents or authorize engine execution.
+    pub fn open_verified(
+        &self,
+        root: &Path,
+        max_bytes: u64,
+    ) -> Result<std::fs::File, ManifestError> {
+        crate::artifact::open_verified(self, root, max_bytes)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -399,15 +412,25 @@ impl LockedManifest {
         self.input.artifacts()
     }
 
-    pub fn to_json(&self) -> Result<String, ManifestError> {
-        let envelope = LockEnvelope {
+    fn envelope(&self) -> LockEnvelope {
+        LockEnvelope {
             lock_version: 1,
             canonicalization: CANONICALIZATION.into(),
             execution_ready: false,
             input_sha256: self.sha256.clone(),
             input: self.input.clone(),
-        };
-        serde_json::to_string_pretty(&envelope).map_err(|e| ManifestError::Integrity(e.to_string()))
+        }
+    }
+
+    pub fn to_json(&self) -> Result<String, ManifestError> {
+        serde_json::to_string_pretty(&self.envelope())
+            .map_err(|e| ManifestError::Integrity(e.to_string()))
+    }
+
+    /// Compact form for bounded nesting in later E-owned persisted formats.
+    /// It has exactly the same envelope and digest semantics as `to_json`.
+    pub fn to_compact_json(&self) -> Result<String, ManifestError> {
+        serde_json::to_string(&self.envelope()).map_err(|e| ManifestError::Integrity(e.to_string()))
     }
 
     pub fn from_json(input: &str) -> Result<Self, ManifestError> {

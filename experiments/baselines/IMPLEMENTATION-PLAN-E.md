@@ -94,8 +94,9 @@ preflight에서 확인한 설정은 실행 시작 시 다시 대조하며, 평�
 
 전체 CLI의 목표 흐름은 `validate → lock → plan → run → audit → report`와 `resume`이다.
 현재 제공 명령은 `rz-experiments`의 validate/lock/verify, `rz-arena`의
-plan/ledger-init/ledger-append/audit다. run·runner/process adapter·정식 통계 보고는
-후속이며 전체 흐름을 실행 가능한 현재 기능으로 제시하지 않는다.
+plan/ledger-init/ledger-append/audit와 Linux 전용 `fixture-pair`다. fixture runner는
+합성 CPU smoke용이며 정식 run·resume·통계 보고는 후속이다. 전체 흐름을 실행 가능한
+현재 기능으로 제시하지 않는다.
 
 ## 5. E02 — pair 계획과 외부 실행
 
@@ -278,3 +279,62 @@ C의 실제 model/encoding/weight/backend/precision 근거, B의 UCI binary/옵�
 D의 clock/drain/reset·자원 영수증과 외부 runner adapter를 연결하는 것이다.
 공통 revision 게시·A/C bridge·CPU fixture만으로 실제 NN/GPU·학습·정식 paired
 대국을 인수하지 않는다.
+
+## 10. E02 내부 구현 진행 — 2026-10-03, Asia/Seoul
+
+사용자는 PR #7을 확인한 뒤 내부 구현을 계속하고, 미게시 계약은 구현 이후 맞추도록
+지시했다. 확인한 [PR #7](https://github.com/daejunnom/RoveZero/pull/7)의 head는
+`ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8`, base `develop`은 기존 `9f0bc598…`다.
+총괄 공통 계약 0.1이 실제 std-only crate로 게시됐지만 draft/open·미병합 상태다.
+반환된 리뷰 댓글·commit status·PR-triggered workflow 목록은 비어 있었으며
+CI 인수 성공으로 기록하지 않는다. 실제 Rules 복원·runner 사건·PGN 접점은 후속이다.
+
+`rz-arena`에 같은 opening 입력의 색 교환 pair 계획, 결정적 seed·실행 순서·logical
+resource slot, game attempt 상태기계·실패 원장과 기본 W/D/L·pentanomial 회계를 구현했다.
+pair의 실제 차례·FEN·수순·known/unknown history는 변형하지 않는다.
+인프라 장애의 전체 pair 제한 재시도만 허용하고 엔진 패배·미완료를 재시도하거나
+한 판만 살리지 않는다. 계약 오류·동시 장애는 해석을 중단한다.
+
+입력과 파생 pair를 재생성해 계획 변조를 거부하고, JSONL seq/hashchain·마지막 newline과
+별도 trusted tip을 검증한다. 입력·evidence 전체의 identity 충돌과 고유 artifact 상한도
+검사한다. arbitrary 판정은 구체 잠긴 정책이 없어 거부한다. 세부 API·schema·명령·한계는
+[arena README](../../crates/rz-arena/README.md)에 둔다.
+
+첫 E02 WIP는 `383eb05`로 기존 브랜치와 [draft PR #8](https://github.com/daejunnom/RoveZero/pull/8)에
+공유했다. 이후 입력+evidence 통합 identity/예산과 큰 입력의 compact nesting 경계를
+보강했다. Rust 1.99.0에서 E01 31개와 arena CLI 10/ledger 22/planner 15개,
+총 78개 테스트 및 두 package의 fmt/clippy가 통과했다. Rust 1.85.0의 두 package
+`cargo check --all-targets --locked`도 통과했다. 기본 feature·Linux CPU/합성 검사다.
+
+실제 CLI로 합성 6 pair·30개 사건의 전체 입력 잠금→계획→원장→감사를 재현하고,
+W=D=L=4와 `n=[1,1,2,1,1]`을 독립 손계산에 대조했다. 독립 Python의 fixture 계획
+SHA·opening SHA·seed vector와 일치했고, 완전 record suffix 삭제를 trusted tip으로
+검출했다. 정확한 명령·로그·lockfile·검토 SHA는 저장소 밖 `reports/e02/`에 보존한다.
+source SHA는 draft PR head와 최종 영수증으로 인계한다.
+
+모든 계획·감사는 `execution_ready=false`, `structural_only`이며 실제 runner 실행·resume·
+NN·GPU·강도·CI 성공을 의미하지 않는다. E03의 CI/Elo/bootstrap·순차 검정은 아직
+구현하지 않았다. 다음 단위는 외부 runner adapter·실제 시작/종료 영수증과 bounded
+process 수명, A의 checked 복원과 독립 PGN 감사·clock/resource/drain/reset 연결이다.
+
+## 11. 총괄의 후속 source 정합
+
+총괄은 PR #8의 후속 `fcbe8b25d53ee96f48ca8dafd227e7c46f8d90ab`에서
+검증된 artifact handle, 외부 runner 인자, A Rules를 사용하는 PGN replay와
+bounded Linux fixture subprocess 소스를 반입했다. 이전 9·10절의 source pin과
+단독 검사·합성 원장 실행 보고는 그 당시 범위로 보존하며 현재 통합의 검사로 바꾸지 않는다.
+Root path 의존으로 계약과 A 코어를 하나씩 사용하고 standalone workspace·Git
+의존을 제거한다. source receipt의 초기 contract/rules pin은 실제 integration SHA와 구별한다.
+Windows에서도 metadata 검사와 native Rules replay를 수행하며 Linux 전용 runner는
+명시적으로 미지원이다. 두 OS의 import·절대 경로 검사를 맞춘 후 같은 SHA의 CI로 인수한다.
+
+`fixture-pair` 전체 실행은 고정한 Fastchess binary·실제 engine·lock·plan·PGN
+identity를 연결한 별도 Linux smoke가 필요하다. 단위/프로세스 fixture 검사의 성공이나
+코드 반입만으로 이 실행을 통과로 표시하지 않는다. `ProcessReceipt.elapsed_ns`는
+subprocess와 cleanup 구간이며 전후의 입력 검증·opening 생성·PGN 감사·기록 비용을
+포함하지 않는다. 정식 시계·draw profile·seed·CPU/RAM·GPU drain·통계 인수는
+계속 후속이며 `execution_ready=false`를 유지한다.
+
+D의 원본 TSV와 E/F의 원시 실행 자료는 아직 회수하지 않았다. 사용자 지시에 따라
+별도 회수 작업을 보류하고 source 정합과 현재 CPU/mock 검사를 먼저 진행한다.
+요약·fixture·과거 실행 보고를 원시 자료 회수나 현재 integration 실행 증거로 대체하지 않는다.

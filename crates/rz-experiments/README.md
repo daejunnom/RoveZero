@@ -3,7 +3,9 @@
 TASK-E01의 첫 구현이다. 버전이 있는 실행 입력을 검증·잠그고, 다시 읽을 때 입력
 SHA-256과 정책을 재검증한다. E의 내부 직렬화 형식이며 총괄의 `rz-contracts`를
 정의하거나 대체하지 않는다. 기준 `develop`에는 아직 Cargo workspace와 공통 타입이
-없어 이 패키지를 독립적으로 빌드한다. 총괄 I01 연결 전 root Cargo·CI는 변경하지 않는다.
+없어 이 패키지를 독립적으로 빌드한다. 이후 공통 계약 0.1은
+[PR #7](https://github.com/daejunnom/RoveZero/pull/7)에 게시됐으며 정식 통합은 I01에서 진행한다.
+root Cargo·CI는 변경하지 않는다.
 
 ## 제공하는 동작
 
@@ -82,6 +84,11 @@ artifact는 명시 목록만 읽는다. 상대 경로·SHA-256·byte 수·권리
 실제 launch 시 새로 파일을 열면 다시 대조해야 한다. E01의 검사만으로 미래 파일 변경이나
 실제 옵션 적용·GPU drain·공정성을 증명할 수 없다.
 
+E02는 `decode_json`의 bounded strict reader, `ArtifactRef::validate`의 메타데이터 검사,
+`LockedManifest::declared_artifacts`의 identity 목록을 재사용한다. `to_compact_json`은
+기존 pretty `to_json`과 동일한 envelope를 compact 형식으로 내보내므로, 다른 잠금 안에
+중첩할 때 공백 확장으로 입력 상한을 넘지 않는다. 내용과 digest 의미는 동일하다.
+
 FEN과 UCI 수순은 최소 형식만 검사한다. 실제 합법성·FEN 의미·완전 상태와 종료 판정은
 A의 Position과 E02 독립 참조에 연결한다. FEN-only 입력의 unknown prefix는 그대로 보존한다.
 runner 이름·정책 식별 문자열을 실제 지원 증거로 해석하지 않는다.
@@ -106,6 +113,7 @@ contract revision·shared error의 실제 연결을 검토한다. 이 crate는 R
 등 공통 primitive를 복제하지 않는다. 루트 공통 선언은 E 변경에 포함하지 않았다.
 
 인수 조건과 후속 E02/E03 순서는 [E 계획서](../../experiments/baselines/IMPLEMENTATION-PLAN-E.md)를 따른다.
+내부 pair 계획·실패 원장·CLI는 [arena README](../rz-arena/README.md)에 기록한다.
 
 ## 실제 로컬 검증 — 2026-10-03, Asia/Seoul
 

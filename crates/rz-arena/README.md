@@ -63,8 +63,9 @@ base engine seed, pair/game ordinal, engine ID를 canonical JSON으로 hash한�
 game 기록은 계획 순서로 한 번만 허용한다. 두 판의 기록 없이 pair를 닫을 수 없으며,
 완료 pair만 후보 관점 W/D/L과 `n0..n4`에 한 번 포함한다. DD와 WL의 원시 결과는
 지우지 않는다. 각 outcome은 안전한 논리 경로·SHA·byte 수·공개 출처·권리가 있는
-evidence metadata를 요구한다. 같은 경로의 다른 identity와 고유 evidence byte 상한
-초과를 거부한다. 실제 evidence 파일 내용·PGN의 진위는 아직 감사하지 않는다.
+evidence metadata를 요구한다. 입력·evidence 전체에서 같은 경로의 다른 identity와
+고유 artifact byte 상한 초과를 거부한다. 같은 identity의 재사용은 중복으로 계산하지 않는다.
+실제 evidence 파일 내용·PGN의 진위는 아직 감사하지 않는다.
 
 - rules terminal: checkmate는 승패, stalemate/dead-position/자동 5회/75수는 draw만 허용.
 - engine loss: 불법 수·crash·timeout과 책임 엔진을 기록하고 패배로 계산.
@@ -124,3 +125,28 @@ A의 checked opening 복원·독립 참조·전체 PGN, 외부 Fastchess/Cute Ch
 clock/resource/drain/reset, 실제 runner 재개는 후속이다. 실제 NN·GPU·대국 강도·CI 성공은
 이 내부 코드로 인수하지 않는다. 진행과 정확한 검사 근거는
 [E 계획서](../../experiments/baselines/IMPLEMENTATION-PLAN-E.md)에 기록한다.
+
+## 실제 로컬 검증 — 2026-10-03, Asia/Seoul
+
+Linux x86_64·Rust 1.99.0·기본 feature에서 arena CLI 10개, ledger 22개, planner 15개,
+총 47개 테스트가 통과했다. 변경된 E01의 기존 31개도 통과해 전체 78개다.
+두 package의 fmt/clippy `-D warnings`와 Rust 1.85.0
+`cargo check --all-targets --locked`가 통과했다. README 링크와 Git whitespace도 검사했다.
+다른 OS·실제 GPU·CI의 성공으로 재사용하지 않는다.
+
+독립 Python SHA/seed vector와 대조한 E01 fixture 계획 SHA-256은
+`980d61aadc3da58fe75720b125f7017a08ad40c5ae58c490f6e411e89429511f`,
+opening 입력 SHA-256은 `2bfb56da02967f952312886e257018974843fb0ea9a81fa5b0265e94f4240e46`이다.
+큰 입력의 compact 계획이 3 MiB에 들어가도 중간 pretty JSON이 4 MiB를 넘던 경계를
+별도 회귀로 검사했다. compact nesting으로 정상 생성·roundtrip하며 기존 digest는 유지된다.
+
+실제 CLI로 입력 잠금→계획→원장 생성→합성 사건 30개 추가→감사를 실행했다.
+LL/DL/DD/WL/WD/WW 선언의 손계산과 W=D=L=4, `n=[1,1,2,1,1]`, 완료 pair 6이 일치했다.
+이는 **합성 결과 선언의 회계**이며 실제 12판 체스를 실행한 기록이 아니다.
+원장 끝의 완전한 record 하나를 지운 prefix는 구조적으로 유효하지만 원래 trusted tip과
+대조하면 exit 2로 거부되는 것도 CLI에서 확인했다.
+
+검사 로그·명령 영수증·입력/원장·독립 lockfile은 외부 artifact root의
+`reports/e02/`, `runs/e02-synthetic-*/`에 보존한다. arena 임시 Cargo.lock의 SHA-256은
+`d890a0f527543df34e5a47942a99ce3eeeefb2c687682b4e54c84e2531cdbcac`이다.
+E01 lockfile은 기존 `3f0688d9…`와 같다. 환경 종료 전 회수와 I01 정식 lockfile 인계가 필요하다.

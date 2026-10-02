@@ -2,16 +2,31 @@
 name = "rz-arena"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 license = "MIT"
 description = "RoveZero paired opening plans and attempt/failure ledger"
 
+[features]
+test-fixtures = []
+
+[[bin]]
+name = "rz-arena-fixture-engine"
+path = "src/bin/fixture-engine.rs"
+required-features = ["test-fixtures"]
 
 [dependencies]
 rz-experiments.workspace = true
+rz-contracts.workspace = true
+rz-position = { workspace = true, features = ["contracts"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+signal-hook.workspace = true
+cap-std.workspace = true
+cap-fs-ext.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix.workspace = true
