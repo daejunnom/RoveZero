@@ -500,12 +500,17 @@ version = "0.1.0"
 name = "rz-uci"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "rz-contracts",
  "rz-encoding",
  "rz-eval",
  "rz-position",
  "rz-runtime",
  "rz-search",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

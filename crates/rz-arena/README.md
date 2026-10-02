@@ -1,9 +1,50 @@
-# rz-arena — E02 pair·원장·fixture 실행
+# rz-arena — E02 pair·원장·fixture와 CPU 신경망 연결
 
 같은 opening 입력에 흑백 엔진 배정만 교환하는 pair를 만들고, 모든 game attempt의
 결과·실패를 보존한다. E01의 잠긴 입력, A의 checked Rules와 bounded Fastchess
 fixture adapter를 소비하며 새 엔진·Rules·UCI를 구현하지 않는다. 출력은 모두
-**`execution_ready=false`**이며 합성 script 실행을 실제 NN·GPU·강도 검증으로 올리지 않는다.
+**`execution_ready=false`**다. 합성 fixture와 실제 CPU 신경망 연결을 별도 실행 경로로 제공하며,
+GPU·강도 검증은 별도 인수한다.
+
+## 실제 CPU 신경망 pair
+
+`IntegrationPairSpecV1`은 E의 별도 wire version 1이며 공통 엔진 계약 revision 0.1을
+소비한다. 첫 연결 검사는 같은 binary·원본 가중치·ONNX·manifest·ORT·탐색을 두 역할에
+사용하고 흑백만 교환한다. 내부 성능 변경을 허위로 선언해 강도 실험 형식에 끼워 넣지 않는다.
+`strength_eligible=false`, `scored_games=0`을 유지한다.
+
+```text
+rz-arena native-lock INPUT OUTPUT
+rz-arena native-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME
+```
+
+잠금은 64 KiB 이하의 선언 JSON·고유 입력 예산·CPU FP32 batch/thread/worker/step 1과
+expected backend/encoding digest를 검사한다. `native-pair`는 Linux에서만 실행하며,
+호출자가 독점 관리하는 저장소 밖의 입력·출력 root와 새 basename을 요구한다. 선정한
+Maia 원본과 변환본, export manifest, 검증된 ORT 및 `onnx-cpu` feature로 빌드한 UCI
+binary를 명시한다. 외부 가중치의 GPL 조건과 MIT 자체 코드의 권리는 분리한다.
+
+준비 단계는 모든 source bytes를 검사한 뒤 별도 inode로 복사하고 writer를 닫는다.
+실행 owner가 runner·engine·모델·ORT·cwd·역할별 runtime 디렉터리 핸들을 보존한다.
+Unix 읽기 전용 권한은 동일 UID의 변경을 막는 OS seal이 아니며, 부모와 고정 프로그램의
+독점 소유 가정을 요구한다. 프로세스·트리 한도는 관측 방식이다. 주소 공간 제한은
+별도 실행 wrapper의 상속 설정·근거를 기록하며 이 라이브러리가 RAM 제한을 설치하지 않는다.
+
+성공은 exit 0·프로세스 group `Gone`·pending child/감독 오류 없음·A 기반 PGN 감사·
+정확히 네 개의 B startup/final 기록을 함께 요구한다. 역할마다 두 번 새 프로세스를
+시작하고 CPU provider·입력 hash·registry·fresh computed 완료·확정 drain을 비교한다.
+시작 시 `loaded=true`만으로 실제 추론을 인정하지 않는다. 완료 수는 D가 수락한
+평가 응답 집계이며 물리 추론 호출 수나 전체 root별 journal을 대신하지 않는다.
+
+준비 실패는 원래 cause·부분 복사·writer 종료·저장 실패를 별도 typed receipt에 보존한다.
+실행 후 정리가 미확인되면 원래 Child와 전체 입력 owner를 같은 quarantine에 보존하고
+새 입장을 닫는다. ownership loss 이후의 handle 보존은 숫자 PID의 wait/signal 권한을
+복구하지 않는다. 보존은 해당 부모 프로세스 수명 범위이며 CLI 종료가 미확인 자식 정리를
+보장하지 않는다. attempt 자동 삭제·재시도는 제공하지 않는다.
+
+총괄은 `0f0d70d`의 실제 CPU NN 두 판을 인수했다. 6 ply 제한의 원시 PGN draw는
+`Incomplete` 두 판으로 남기며 득점에 넣지 않았다. 정확한 source·binary·검사·보존 근거는
+[CPU NN pair 인수 기록](../../docs/INTEGRATION-STATUS.md#후속-실제-cpu-신경망-pair-인수)을 따른다.
 
 ## PR #7과 계약 연결 경계
 

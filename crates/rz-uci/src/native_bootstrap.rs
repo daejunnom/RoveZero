@@ -12,6 +12,7 @@ use crate::{
         EngineError, EvaluatorFactory, EvaluatorProfile, ManagedEvaluator, OwnerRegistry,
         ProcessClock, SearchAuthority,
     },
+    native_attestation::CpuProfileV1,
 };
 use rz_contracts::*;
 use rz_encoding::classical::HistoryFill;
@@ -60,6 +61,7 @@ pub struct NativeConfig {
     ort_library: PathBuf,
     ort_sha256: [u8; 32],
     output_root: PathBuf,
+    attestation: bool,
 }
 impl fmt::Debug for NativeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -81,7 +83,16 @@ impl NativeConfig {
         let mut ort_library = None;
         let mut ort_sha256 = None;
         let mut output_root = None;
+        let mut attestation = false;
         for argument in arguments {
+            if argument == "--attestation" {
+                if std::mem::replace(&mut attestation, true) {
+                    return Err(NativeBootstrapError::Config(
+                        "duplicate native attestation flag",
+                    ));
+                }
+                continue;
+            }
             if argument == "--onnx-cpu" {
                 if std::mem::replace(&mut native, true) {
                     return Err(NativeBootstrapError::Config(
@@ -128,7 +139,14 @@ impl NativeConfig {
             ort_library: ort_library.ok_or_else(missing)?,
             ort_sha256: ort_sha256.ok_or_else(missing)?,
             output_root: output_root.ok_or_else(missing)?,
+            attestation,
         })
+    }
+    pub fn attestation_requested(&self) -> bool {
+        self.attestation
+    }
+    pub(crate) fn attestation_output_root(&self) -> Result<PathBuf, NativeBootstrapError> {
+        private_output_root(&self.output_root).map_err(Into::into)
     }
 }
 fn set_path(slot: &mut Option<PathBuf>, value: &str) -> Result<(), NativeBootstrapError> {
@@ -578,6 +596,7 @@ pub struct NativeCpuFactory {
     profile: EvaluatorProfile,
     evidence: NativeEvidenceHandle,
     _runtime: Option<OrtRuntime>,
+    loaded_profile: Option<CpuProfileV1>,
 }
 impl NativeCpuFactory {
     pub fn load(
@@ -626,8 +645,12 @@ impl NativeCpuFactory {
         };
         let projection =
             ClassicalProjection::new(MaiaBinding::for_backend(&backend, model, encoding, fill)?);
+        let loaded_profile =
+            CpuProfileV1::from_loaded(&asset, &runtime, &backend, projection.model())?;
         let owner = NativeWorkerOwner::from_onnx(backend, projection, NATIVE_DIAGNOSTIC_CAPACITY)?;
-        Self::from_owner(owner, Some(runtime)).map_err(Into::into)
+        let mut factory = Self::from_owner(owner, Some(runtime))?;
+        factory.loaded_profile = Some(loaded_profile);
+        Ok(factory)
     }
     fn from_owner(
         owner: NativeWorkerOwner,
@@ -657,6 +680,23 @@ impl NativeCpuFactory {
             profile,
             evidence,
             _runtime: runtime,
+            loaded_profile: None,
+        })
+    }
+    pub(crate) fn attestation_profile(&self) -> Result<&CpuProfileV1, ContractError> {
+        if self.owner.origin() != NativeWorkerOrigin::CpuOnnx || self._runtime.is_none() {
+            return Err(error(
+                ErrorCode::UnsupportedContract,
+                Stage::Output,
+                "injected owner cannot issue native CPU provider evidence",
+            ));
+        }
+        self.loaded_profile.as_ref().ok_or_else(|| {
+            error(
+                ErrorCode::IdentityMismatch,
+                Stage::Output,
+                "loaded CPU provider snapshot is unavailable",
+            )
         })
     }
     /// Called for serve success and failure. A busy physical owner/evidence lock
@@ -668,21 +708,11 @@ impl NativeCpuFactory {
         let until = Instant::now() + FINAL_COLLECTION_LIMIT;
         let mut collection_error = None;
         loop {
-            match self.evidence.collect(&self.owner) {
-                Ok(true) => match self.owner.try_status() {
-                    Ok(Some(status))
-                        if !status.active
-                            && status.reserved_diagnostics == 0
-                            && status.occupied_diagnostics == 0 =>
-                    {
-                        break;
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        collection_error = Some(error);
-                        break;
-                    }
-                },
+            match confirm_collected_drain(
+                || self.evidence.collect(&self.owner),
+                || self.owner.try_status(),
+            ) {
+                Ok(true) => break,
                 Ok(false) => {}
                 Err(error) => {
                     collection_error = Some(error);
@@ -727,6 +757,29 @@ impl NativeCpuFactory {
             retained_owner: self.owner.clone(),
         })
     }
+}
+
+/// Status observation may itself discover owner poison. Collect after each
+/// final idle observation before accepting the report, and confirm the same
+/// physical idle condition again. A busy lock remains bounded by finish().
+fn confirm_collected_drain(
+    mut collect: impl FnMut() -> Result<bool, ContractError>,
+    mut status: impl FnMut() -> Result<
+        Option<rz_eval::native_runtime_bridge::NativeOwnerStatus>,
+        ContractError,
+    >,
+) -> Result<bool, ContractError> {
+    let idle = |value: Option<rz_eval::native_runtime_bridge::NativeOwnerStatus>| {
+        value.is_some_and(|value| {
+            !value.active && value.reserved_diagnostics == 0 && value.occupied_diagnostics == 0
+        })
+    };
+    if !collect()? || !idle(status()?) || !collect()? || !idle(status()?) {
+        return Ok(false);
+    }
+    // The second status can also be the first observer of poison; preserve its
+    // original receipt even when a previous normal close set admission_error.
+    collect()
 }
 
 fn private_output_root(path: &Path) -> Result<PathBuf, BackendError> {
@@ -979,6 +1032,82 @@ mod physical_owner_tests {
     };
 
     const WAIT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn final_idle_observation_collects_new_poison_even_after_prior_normal_close() {
+        use std::cell::Cell;
+        let observed = Cell::new(0_u8);
+        let pending_poison = Cell::new(false);
+        let preserved_poison = Cell::new(false);
+        let normal_close = error(
+            ErrorCode::Canceled,
+            Stage::Admission,
+            "normal logical close",
+        );
+        let confirmed = confirm_collected_drain(
+            || {
+                if pending_poison.replace(false) {
+                    preserved_poison.set(true);
+                }
+                Ok(true)
+            },
+            || {
+                observed.set(observed.get() + 1);
+                if observed.get() == 2 {
+                    pending_poison.set(true);
+                }
+                Ok(Some(rz_eval::native_runtime_bridge::NativeOwnerStatus {
+                    active: false,
+                    admission_error: Some(normal_close),
+                    occupied_diagnostics: 0,
+                    reserved_diagnostics: 0,
+                }))
+            },
+        )
+        .unwrap();
+        assert!(confirmed);
+        assert_eq!(observed.get(), 2);
+        assert!(
+            preserved_poison.get(),
+            "a final status-created poison must reach the collector despite unchanged admission_error"
+        );
+        assert!(!pending_poison.get());
+        assert!(!confirm_collected_drain(|| Ok(true), || Ok(None)).unwrap());
+        let original = error(
+            ErrorCode::BackendFailure,
+            Stage::Output,
+            "collection failed",
+        );
+        assert_eq!(
+            confirm_collected_drain(
+                || Err(original),
+                || panic!("failed collection cannot authorize a status check")
+            ),
+            Err(original)
+        );
+    }
+
+    #[test]
+    fn injected_physical_factory_cannot_issue_native_provider_startup_attestation() {
+        let owners = OwnerRegistry::default();
+        let worker = SingleWorker::spawn(|batch: &PreparedBatch<RulesState>| {
+            batch
+                .requests()
+                .iter()
+                .map(|request| request.physical_output(&raw(), batch.execution()))
+                .collect()
+        })
+        .unwrap();
+        let owner = NativeWorkerOwner::from_worker(worker, projection(&owners), 1).unwrap();
+        let factory = NativeCpuFactory::from_owner(owner, None).unwrap();
+        let clock = ProcessClock::new(ProcessEpoch(304));
+        let denied =
+            crate::native_attestation::StartupReceiptV1::capture(&factory, &clock).unwrap_err();
+        assert!(denied.to_string().contains("actually loaded CPU ONNX"));
+        let report = factory.finish(Ok(())).unwrap();
+        assert_eq!(report.origin, NativeWorkerOrigin::Injected);
+        assert_eq!(report.completed_by_runtime, 0);
+    }
 
     fn projection(owners: &OwnerRegistry) -> ClassicalProjection {
         ClassicalProjection::new(

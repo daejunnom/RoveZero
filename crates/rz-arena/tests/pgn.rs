@@ -1,5 +1,8 @@
-use rz_arena::{ArenaPlan, GameResult, PgnLimits, PlanLimits, audit_pair_pgn, opening_pgn};
-use rz_experiments::{HistoryCompleteness, InitialPosition, RunManifest};
+use rz_arena::{
+    ArenaPlan, GameResult, PgnLimits, PgnOutcomePolicy, PlanLimits, audit_pair_pgn,
+    audit_pair_pgn_for_spec, opening_pgn, opening_pgn_for_spec,
+};
+use rz_experiments::{HistoryCompleteness, InitialPosition, OutcomePolicy, RunManifest};
 
 const FIXTURE: &str = include_str!("../../../experiments/baselines/fixtures/e01-input.json");
 const MATE_MOVES: &str = "1. e4 e5 2. Qh5 Nc6 3. Bc4 Nf6 4. Qxf7#";
@@ -42,6 +45,14 @@ fn pair_pgn(
 }
 fn audit(plan: &ArenaPlan, pgn: &str) -> Result<rz_arena::PairPgnAudit, rz_arena::ArenaError> {
     audit_pair_pgn(plan, &plan.pairs()[0].id, pgn, limits())
+}
+
+fn policy(max_game_plies: u32) -> PgnOutcomePolicy {
+    PgnOutcomePolicy {
+        engine_failure: OutcomePolicy::Loss,
+        max_plies_outcome: OutcomePolicy::Incomplete,
+        max_game_plies,
+    }
 }
 
 #[test]
@@ -576,4 +587,112 @@ fn exact_max_plies_adjudication_is_incomplete_and_never_a_scored_draw() {
         audit(&p, &terminal).is_err(),
         "an A terminal may not become a limit draw or incomplete result"
     );
+}
+
+#[test]
+fn common_pair_helpers_reuse_rules_identity_and_preserve_execution_order() {
+    let p = plan(input());
+    let pair = &p.pairs()[0];
+    assert_eq!(
+        opening_pgn_for_spec(&pair.opening, 256).unwrap(),
+        opening_pgn(&p, &pair.id).unwrap()
+    );
+    let pgn = pair_pgn(&p, MATE_MOVES, "1-0", "normal", "");
+    let wrapped = audit(&p, &pgn).unwrap();
+    let common = audit_pair_pgn_for_spec(pair, &pgn, limits(), policy(256)).unwrap();
+    assert_eq!(common.engine_contract_revision, "0.1");
+    assert_eq!(common.opening_input_sha256, wrapped.opening_input_sha256);
+    assert_eq!(
+        common.start_state_semantic_sha256,
+        wrapped.start_state_semantic_sha256
+    );
+    for (actual, expected) in common.games.iter().zip(&wrapped.games) {
+        assert_eq!(actual.game_id, expected.game_id);
+        assert_eq!(actual.white_engine, expected.white_engine);
+        assert_eq!(actual.black_engine, expected.black_engine);
+        assert_eq!(actual.uci_moves, expected.uci_moves);
+        assert_eq!(actual.final_fen, expected.final_fen);
+        assert_eq!(actual.classification, "rules_terminal");
+        assert_eq!(actual.terminal_reason, expected.terminal_reason);
+    }
+    let mut reversed = pair.clone();
+    reversed.execution_order.reverse();
+    let split = pgn.rfind("[Event").unwrap();
+    let reversed_pgn = format!("{}{}", &pgn[split..], &pgn[..split]);
+    let result = audit_pair_pgn_for_spec(&reversed, &reversed_pgn, limits(), policy(256)).unwrap();
+    assert_eq!(
+        result.games[0].game_id,
+        reversed.games[reversed.execution_order[0]].id
+    );
+    assert!(audit_pair_pgn_for_spec(&reversed, &pgn, limits(), policy(256)).is_err());
+    for order in [[0, 0], [1, 1], [2, 0]] {
+        let mut invalid = pair.clone();
+        invalid.execution_order = order;
+        assert!(audit_pair_pgn_for_spec(&invalid, &pgn, limits(), policy(256)).is_err());
+    }
+    let mut invalid = pair.clone();
+    invalid.games[1].white_engine = invalid.games[0].white_engine.clone();
+    assert!(audit_pair_pgn_for_spec(&invalid, &pgn, limits(), policy(256)).is_err());
+    let mut invalid = pair.clone();
+    invalid.games[1].id = invalid.games[0].id.clone();
+    assert!(audit_pair_pgn_for_spec(&invalid, &pgn, limits(), policy(256)).is_err());
+}
+
+#[test]
+fn common_opening_helper_preserves_full_fen_and_rejects_ambiguous_history_or_ceiling() {
+    let p = plan(input());
+    let mut opening = p.pairs()[0].opening.clone();
+    opening.initial = InitialPosition::Fen;
+    opening.fen = Some("r3k2r/8/8/3pP3/8/8/8/R3K2R b KQkq - 17 42".into());
+    opening.history = HistoryCompleteness::UnknownPrefix;
+    opening.history_origin = "imported-fen-unknown-prefix".into();
+    opening.moves = vec!["e8g8".into(), "e1c1".into()];
+    let book = opening_pgn_for_spec(&opening, 2).unwrap();
+    assert!(book.contains("[FEN \"r3k2r/8/8/3pP3/8/8/8/R3K2R b KQkq - 17 42\"]"));
+    assert!(book.ends_with("42... O-O 43. O-O-O *\n"));
+    for max_plies in [0, 1, 4096] {
+        assert!(opening_pgn_for_spec(&opening, max_plies).is_err());
+    }
+    opening.history = HistoryCompleteness::Complete;
+    assert!(opening_pgn_for_spec(&opening, 2).is_err());
+    opening.history = HistoryCompleteness::UnknownPrefix;
+    opening.initial = InitialPosition::Startpos;
+    assert!(opening_pgn_for_spec(&opening, 2).is_err());
+}
+
+#[test]
+fn common_pair_cutoff_preserves_incomplete_and_never_admits_a_longer_terminal() {
+    let p = plan(input());
+    let pair = &p.pairs()[0];
+    let cutoff = pair_pgn(
+        &p,
+        "1. e4 e5 2. Nf3 Nc6 {Draw by adjudication}",
+        "1/2-1/2",
+        "adjudication",
+        "[PlyCount \"4\"]\n",
+    );
+    let result = audit_pair_pgn_for_spec(pair, &cutoff, limits(), policy(4)).unwrap();
+    for game in &result.games {
+        assert_eq!(game.classification, "incomplete");
+        assert_eq!(
+            game.result,
+            GameResult::Draw,
+            "raw declaration grants no scored draw"
+        );
+        assert_eq!(game.uci_moves.len(), 4);
+        assert_eq!(game.terminal_reason, None);
+        assert_eq!(game.engine_failure, None);
+    }
+    let terminal = pair_pgn(&p, MATE_MOVES, "1-0", "normal", "");
+    assert!(audit_pair_pgn_for_spec(pair, &terminal, limits(), policy(4)).is_err());
+    let mut unsupported_cutoff = policy(4);
+    unsupported_cutoff.max_plies_outcome = OutcomePolicy::Loss;
+    assert!(audit_pair_pgn_for_spec(pair, &cutoff, limits(), unsupported_cutoff).is_err());
+    let loss = pair_pgn(&p, "1. e4 e5 {White disconnects}", "0-1", "abandoned", "");
+    let result = audit_pair_pgn_for_spec(pair, &loss, limits(), policy(4)).unwrap();
+    assert_eq!(result.games[0].classification, "engine_loss");
+    let mut non_loss = policy(4);
+    non_loss.engine_failure = OutcomePolicy::Incomplete;
+    assert!(audit_pair_pgn_for_spec(pair, &loss, limits(), non_loss).is_err());
+    assert!(audit_pair_pgn_for_spec(pair, &cutoff, limits(), policy(0)).is_err());
 }

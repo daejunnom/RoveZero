@@ -2,8 +2,11 @@
 
 `TASK-B01/B03`의 UCI 파서, 세션 수명과 탐색 시간 연결을 구현한다. 총괄 통합본의
 `engine`·`bootstrap`과 실행 파일은 A Rules → C classical projection/scripted backend →
-D runtime → B 비동기 탐색을 연결한다. provider는 명시적인 `--cpu-mock`만 지원한다.
-실제 신경망 backend는 아직 연결하지 않았다. 초기 B-local 접점에 이어
+D runtime → B 비동기 탐색을 연결한다. `--cpu-mock`은 GPU 없는 개발용 provider다.
+`onnx-cpu` feature로 빌드하면 명시적인 `--onnx-cpu`가 선정 Maia·검증한 ORT CPU
+FP32의 실제 신경망 평가를 연결한다. Linux에서 실제 수치·Rules·UCI 연결을 인수한
+소스와 실행 근거는 [통합 인수 기록](../../docs/INTEGRATION-STATUS.md)을 따른다.
+목표 GPU와 정식 대국은 별도 인수다. 초기 B-local 접점에 이어
 [PR #7](https://github.com/daejunnom/RoveZero/pull/7)의 공통 0.1 계약을 연결했다.
 `rz-contracts` 의존성은 root workspace의 단일 `path` 계약 0.1.0을 사용한다.
 게시 기준 SHA는 `67284c4f66f7a7ae9f46fa63dfd50e7410eb6845`이며 현재 root와 같은
@@ -145,6 +148,30 @@ cargo fmt --all -- --check
 cargo clippy -p rz-uci --all-targets --all-features --locked -- -D warnings
 cargo run -p rz-uci --locked -- --cpu-mock
 ```
+
+실제 CPU provider는 다음의 독립 입력을 모두 요구한다. 이름과 값은 하나의
+`--이름=값` 인수로 전달하며 다른 provider로 조용히 대체하지 않는다. 경로는 실행
+환경의 저장소 밖 입력·출력에 맞춘다. 가중치·변환본·ORT 파일의 권리와 출처는
+MIT 엔진 소스와 분리한다.
+
+```text
+rz-uci --onnx-cpu
+  --source-weights=<selected-maia.pb.gz>
+  --onnx-model=<verified-export.onnx>
+  --export-manifest=<verified-export-manifest.json>
+  --manifest-sha256=<64 lowercase hex>
+  --ort-library=<explicit-runtime-library>
+  --ort-sha256=<64 lowercase hex>
+  --output-root=<existing-private-output-directory-outside-Git>
+```
+
+위 표기는 필요한 인수 목록이며 줄을 나눈 shell 명령이 아니다. `--attestation`
+선택 시의 구조화된 startup·종료 영수증과 E의 실제 NN paired 실행 연결은
+`0f0d70d`의 Linux CPU 인수에서 확인했다. startup의 검증된 프로필과 executable,
+종료의 D 완료 집계·첫/마지막 computed context·확정 drain을 서로 대조한다.
+모델 로딩 성공, 실제 평가 응답, 물리 종료 확인을 구분하며 전체 root별 journal이나
+물리 추론 호출 수를 이 집계로 대신하지 않는다. [인수 기록](../../docs/INTEGRATION-STATUS.md#후속-실제-cpu-신경망-pair-인수)의
+소스·binary·명령·외부 증거가 실제 결과의 적용 범위다.
 
 CPU fixture는 parser, 상태 원자성, ticket 취소와 착수 출력·event loop를 확인한다.
 `tests/search_integration.rs`는 독립 인공 트리로 UCI→PUCT→착수와 terminal 우회,

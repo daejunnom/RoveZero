@@ -51,6 +51,27 @@ fn complete_native_config_keeps_private_paths_out_of_debug() {
 }
 
 #[test]
+fn attestation_is_explicit_optional_and_duplicate_selection_is_rejected() {
+    assert!(
+        !NativeConfig::parse(valid_arguments())
+            .unwrap()
+            .attestation_requested()
+    );
+    let mut selected = valid_arguments();
+    selected.push("--attestation".into());
+    assert!(
+        NativeConfig::parse(selected.clone())
+            .unwrap()
+            .attestation_requested()
+    );
+    selected.push("--attestation".into());
+    assert_private_config_rejection(selected);
+    let mut named = valid_arguments();
+    named.push("--attestation=true".into());
+    assert_private_config_rejection(named);
+}
+
+#[test]
 fn native_parser_rejects_missing_duplicate_and_mixed_provider_arguments() {
     let valid = valid_arguments();
     for omitted in 0..valid.len() {
