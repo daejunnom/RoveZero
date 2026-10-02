@@ -254,7 +254,12 @@ impl Evaluator<RulesState> for CpuMockRuntime {
 }
 impl ManagedEvaluator for CpuMockRuntime {
     fn shutdown(&mut self, until: Instant) -> Result<(), ContractError> {
-        self.authority.cancel();
+        // Runtime admission/drain does not own UCI's root output permission.
+        // A naturally completed worker can reach this before its queued
+        // completion is accepted by the UCI owner. Canceling the shared root
+        // token here would reject that valid completion and lose bestmove.
+        // Stop/root replacement/deadline/quit close it at the UCI boundary;
+        // D independently closes every remaining logical request on shutdown.
         self.evaluator.begin_shutdown(self.clock.deadline(until)?)?;
         loop {
             self.refresh()?;

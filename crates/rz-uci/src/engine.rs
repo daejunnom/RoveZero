@@ -300,7 +300,10 @@ pub struct EvaluatorProfile {
     pub bytes: contract::ByteBudget,
 }
 
-/// Shutdown must close admission and wait for physical work within its finite bound.
+/// Shutdown closes runtime admission and drains physical work within its finite
+/// bound. It must preserve the UCI owner's root output permission: a natural
+/// completion can still be queued. UCI closes shared cancellation on its own
+/// stop/root/deadline/quit or completed-output acceptance boundary.
 pub trait ManagedEvaluator: contract::Evaluator<RulesState> + Send {
     fn shutdown(&mut self, deadline: Instant) -> Result<(), contract::ContractError>;
 }
