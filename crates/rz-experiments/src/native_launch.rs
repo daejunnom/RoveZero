@@ -659,7 +659,7 @@ fn validate_opening(opening: &OpeningSpec, max_plies: u32) -> Result<(), Manifes
         "full opening prefix must leave searched plies within the 4095-ply ceiling",
     )?;
     require(
-        (max_plies as usize - opening.moves.len()).is_multiple_of(2),
+        (max_plies as usize - opening.moves.len()) % 2 == 0,
         "max_plies",
         "NativePlyBudget",
         "Fastchess maxmoves requires a positive even searched-ply remainder",
