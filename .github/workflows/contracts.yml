@@ -2,7 +2,7 @@ name: Contracts CPU
 
 on:
   push:
-    branches: [develop, 'feature/**']
+    branches: [develop]
     paths: ['Cargo.toml', 'Cargo.lock', 'crates/rz-contracts/**', '.github/workflows/contracts.yml']
   pull_request:
     branches: [develop]
