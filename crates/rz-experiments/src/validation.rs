@@ -147,7 +147,7 @@ impl Checks {
                 "option names must be unique ignoring ASCII case",
             );
             self.require(
-                !(name.eq_ignore_ascii_case("ponder") && !value.eq_ignore_ascii_case("false")),
+                !name.eq_ignore_ascii_case("ponder") || value.eq_ignore_ascii_case("false"),
                 path,
                 "ForbiddenPonder",
                 "ponder must be disabled",

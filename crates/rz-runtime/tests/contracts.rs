@@ -634,7 +634,7 @@ fn request_constructor_rejects_mixed_request_selection_and_deadline_epochs() {
             "deadline" => deadline.clock = ClockDomain(ProcessEpoch(8)),
             _ => unreachable!(),
         }
-        let error = EvalRequest::try_new(
+        let error = match EvalRequest::try_new(
             context,
             valid.position().clone(),
             valid.legal().clone(),
@@ -642,9 +642,10 @@ fn request_constructor_rejects_mixed_request_selection_and_deadline_epochs() {
             deadline,
             valid.cancel_token().clone(),
             valid.byte_budget(),
-        )
-        .err()
-        .expect("internally mixed epochs must be refused by the constructor");
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("internally mixed epochs must be refused by the constructor"),
+        };
         assert_eq!(error.code, ErrorCode::IdentityMismatch, "{changed_field}");
         assert_eq!(error.stage, Stage::Admission, "{changed_field}");
     }

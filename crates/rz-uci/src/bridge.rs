@@ -87,17 +87,11 @@ impl SearchBinding {
                 TimeControl::MoveTime(Duration::from_millis(movetime)),
                 BudgetKind::UciTime,
             )
-        } else if limits.white_time_ms.is_some() {
+        } else if let (Some(white), Some(black)) = (limits.white_time_ms, limits.black_time_ms) {
             // validate_limits established that both side clocks exist.
             let (remaining, increment) = match side {
-                SideToMove::White => (
-                    limits.white_time_ms.expect("validated white clock"),
-                    limits.white_increment_ms.unwrap_or(0),
-                ),
-                SideToMove::Black => (
-                    limits.black_time_ms.expect("validated black clock"),
-                    limits.black_increment_ms.unwrap_or(0),
-                ),
+                SideToMove::White => (white, limits.white_increment_ms.unwrap_or(0)),
+                SideToMove::Black => (black, limits.black_increment_ms.unwrap_or(0)),
             };
             (
                 TimeControl::Clock {

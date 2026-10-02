@@ -1,7 +1,7 @@
 use rz_contracts::ProcessEpoch;
 use rz_uci::{
     bootstrap::CpuMockFactory,
-    engine::{self, EngineSettings, OwnerRegistry, ProcessClock},
+    engine::{self, EngineProcess, EngineSettings, OwnerRegistry, ProcessClock},
     forward_lines,
 };
 use std::{io, sync::Arc, thread, time::Duration};
@@ -33,6 +33,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let owners = Arc::new(OwnerRegistry::default());
     let factory = Arc::new(CpuMockFactory::new(&owners, delay)?);
     let clock = ProcessClock::new(ProcessEpoch(1)); // Issued once for this executable process.
+    let process = EngineProcess::new(factory, owners, clock);
     let settings = EngineSettings::default();
     let (sender, events) = engine::event_channel();
     let input = sender.clone();
@@ -50,9 +51,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         sender,
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
-        factory,
-        owners,
-        clock,
+        process,
         settings,
     )?;
     Ok(())

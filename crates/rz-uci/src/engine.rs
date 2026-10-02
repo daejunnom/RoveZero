@@ -322,6 +322,27 @@ pub trait EvaluatorFactory: Send + Sync + 'static {
     ) -> Result<contract::EvalInputKey, contract::ContractError>;
 }
 
+/// The injected evaluator and Rules owner registry share this process's clock
+/// origin and ID allocators across all roots, games and physical worker drains.
+pub struct EngineProcess {
+    factory: Arc<dyn EvaluatorFactory>,
+    owners: Arc<OwnerRegistry>,
+    clock: ProcessClock,
+}
+impl EngineProcess {
+    pub fn new(
+        factory: Arc<dyn EvaluatorFactory>,
+        owners: Arc<OwnerRegistry>,
+        clock: ProcessClock,
+    ) -> Self {
+        Self {
+            factory,
+            owners,
+            clock,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct EngineSettings {
     pub parser: ParserLimits,
@@ -947,11 +968,14 @@ pub fn serve<O: Write, D: Write>(
     sender: SyncSender<Event>,
     protocol: &mut O,
     diagnostics: &mut D,
-    factory: Arc<dyn EvaluatorFactory>,
-    owners: Arc<OwnerRegistry>,
-    clock: ProcessClock,
+    process: EngineProcess,
     settings: EngineSettings,
 ) -> Result<(), EngineError> {
+    let EngineProcess {
+        factory,
+        owners,
+        clock,
+    } = process;
     if settings.max_workers == 0
         || settings.shutdown_limit.is_zero()
         || settings.search.max_simulations > 128
@@ -1009,13 +1033,11 @@ pub fn serve<O: Write, D: Write>(
                 if let Some(active) = &owner.active {
                     if delivered.as_ref() != Some(&active.ticket)
                         && Instant::now() >= active.control.deadline
-                    {
-                        if timer_events
+                        && timer_events
                             .try_send(Event::Deadline(active.ticket.clone()))
                             .is_ok()
-                        {
-                            delivered = Some(active.ticket.clone());
-                        }
+                    {
+                        delivered = Some(active.ticket.clone());
                     }
                 }
             }

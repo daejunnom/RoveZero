@@ -315,57 +315,56 @@ mod tests {
         let mut second = factory.create(clock.clone(), authority).unwrap();
         let until = Instant::now() + Duration::from_secs(5);
         let mut sequence = 0;
-        let mut evaluate = |runtime: &mut dyn ManagedEvaluator| {
-            sequence += 1;
-            let context = EvalContext {
-                revision: CONTRACT_REVISION,
-                request: RequestId::new(clock.epoch(), sequence),
-                selection: SelectionId::new(clock.epoch(), sequence),
-                game: scope.game,
-                root: scope.root,
-                state: position.state().snapshot().identity(),
-                legal_order: position.state().legal_moves().order(),
-                input: factory
-                    .input_key(
-                        position.state().rules(),
-                        position.state().legal_moves().moves(),
+        let mut evaluate =
+            |runtime: &mut dyn ManagedEvaluator| -> Result<ExecutionId, ContractError> {
+                sequence += 1;
+                let context = EvalContext {
+                    revision: CONTRACT_REVISION,
+                    request: RequestId::new(clock.epoch(), sequence),
+                    selection: SelectionId::new(clock.epoch(), sequence),
+                    game: scope.game,
+                    root: scope.root,
+                    state: position.state().snapshot().identity(),
+                    legal_order: position.state().legal_moves().order(),
+                    input: factory
+                        .input_key(
+                            position.state().rules(),
+                            position.state().legal_moves().moves(),
+                        )
+                        .unwrap(),
+                    model: scope.model,
+                    encoding: scope.encoding,
+                    precision: profile.precision,
+                    compute: profile.compute,
+                    backend: scope.backend,
+                };
+                let request = Arc::new(
+                    EvalRequest::try_new(
+                        context,
+                        position.state().snapshot().clone(),
+                        position.state().legal_moves().clone(),
+                        Arc::clone(&profile.model),
+                        clock.deadline(until).unwrap(),
+                        CancelToken::new(),
+                        profile.bytes,
                     )
                     .unwrap(),
-                model: scope.model,
-                encoding: scope.encoding,
-                precision: profile.precision,
-                compute: profile.compute,
-                backend: scope.backend,
-            };
-            let request = Arc::new(
-                EvalRequest::try_new(
-                    context,
-                    position.state().snapshot().clone(),
-                    position.state().legal_moves().clone(),
-                    Arc::clone(&profile.model),
-                    clock.deadline(until).unwrap(),
-                    CancelToken::new(),
-                    profile.bytes,
-                )
-                .unwrap(),
-            );
-            if let Err(error) = runtime.submit(request) {
-                return Err(error);
-            }
-            loop {
-                if let Some(result) = runtime.poll() {
-                    let EvalResult::Completed(output) = result else {
-                        panic!("fresh CPU/mock evaluation failed: {result:?}")
-                    };
-                    assert_eq!(output.context, context);
-                    assert_eq!(output.actual.provenance, CacheProvenance::Computed);
-                    assert_eq!(output.policy.probabilities().len(), 20);
-                    return Ok(output.actual.execution.unwrap());
+                );
+                runtime.submit(request)?;
+                loop {
+                    if let Some(result) = runtime.poll() {
+                        let EvalResult::Completed(output) = result else {
+                            panic!("fresh CPU/mock evaluation failed: {result:?}")
+                        };
+                        assert_eq!(output.context, context);
+                        assert_eq!(output.actual.provenance, CacheProvenance::Computed);
+                        assert_eq!(output.policy.probabilities().len(), 20);
+                        return Ok(output.actual.execution.unwrap());
+                    }
+                    assert!(Instant::now() < until, "bounded CPU/mock completion");
+                    thread::sleep(Duration::from_millis(1));
                 }
-                assert!(Instant::now() < until, "bounded CPU/mock completion");
-                thread::sleep(Duration::from_millis(1));
-            }
-        };
+            };
         let first_execution = evaluate(first.as_mut()).unwrap();
         let second_execution = evaluate(second.as_mut()).unwrap();
         assert_eq!(first_execution.epoch, second_execution.epoch);
