@@ -1,0 +1,14 @@
+Started game 1 of 2 (baseline-fixture vs candidate-fixture)
+Finished game 1 (baseline-fixture vs candidate-fixture): 1-0 {White mates}
+Started game 2 of 2 (candidate-fixture vs baseline-fixture)
+Finished game 2 (candidate-fixture vs baseline-fixture): 1-0 {White mates}
+--------------------------------------------------
+Results of baseline-fixture vs candidate-fixture (1, 1t, NULL, opening.pgn):
+Elo: -0.00 +/- 0.00, nElo: -nan +/- -nan
+LOS: -nan %, DrawRatio: 100.00 %, PairsRatio: -nan
+Games: 2, Wins: 1, Losses: 1, Draws: 0, Points: 1.0 (50.00 %)
+Ptnml(0-2): [0, 0, 1, 0, 0], WL/DD Ratio: inf
+--------------------------------------------------
+Finished match
+Total Time: 00:00:01 (hours:minutes:seconds)
+

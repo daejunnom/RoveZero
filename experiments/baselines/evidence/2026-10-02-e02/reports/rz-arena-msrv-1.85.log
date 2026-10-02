@@ -1,0 +1,3 @@
+    Checking rz-experiments v0.1.0 (${REPO_ROOT}/crates/rz-experiments)
+    Checking rz-arena v0.1.0 (${REPO_ROOT}/crates/rz-arena)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.43s

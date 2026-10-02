@@ -1,0 +1,63 @@
+   Compiling rz-experiments v0.1.0 (${REPO_ROOT}/crates/rz-experiments)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.51s
+     Running unittests src/lib.rs (${ARTIFACT_ROOT}/build/debug/deps/rz_experiments-479d8464bf67f52a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (${ARTIFACT_ROOT}/build/debug/deps/rz_experiments-ab4b5ee99b0671bb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cli.rs (${ARTIFACT_ROOT}/build/debug/deps/cli-fd1a51315901a761)
+
+running 9 tests
+test existing_output_is_preserved ... ok
+test fifo_input_is_rejected_without_waiting_for_a_writer ... ok
+test input_lock_and_integrity_verification_retain_readiness_false ... ok
+test artifact_verification_requires_an_explicit_positive_budget ... ok
+test partial_write_failure_preserves_output_and_other_files ... ok
+test incomplete_or_unknown_commands_fail ... ok
+test malformed_json_does_not_create_a_lock ... ok
+test json_input_is_bounded_and_strict_utf8 ... ok
+test requested_artifact_verification_rejects_missing_files ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/manifest.rs (${ARTIFACT_ROOT}/build/debug/deps/manifest-b2dcbba502ca6f11)
+
+running 22 tests
+test a_single_predeclared_option_change_preserves_all_other_runtime_inputs ... ok
+test artifact_hash_and_byte_length_changes_are_distinct_integrity_failures ... ok
+test artifact_verification_deduplicates_references_and_obeys_an_explicit_byte_ceiling ... ok
+test control_axes_hold_weights_search_and_runtime_fixed_where_required ... ok
+test canonical_lock_matches_an_independent_digest_and_never_authorizes_execution ... ok
+test dirty_source_and_artifact_identities_cannot_be_incomplete_or_conflicting ... ok
+test declared_pair_retries_children_and_artifacts_use_checked_arithmetic ... ok
+test duplicate_decoded_object_keys_are_rejected_including_option_maps ... ok
+test duplicate_case_options_ponder_and_protocol_line_injection_are_rejected ... ok
+test card_identifiers_must_belong_to_the_76_card_registry ... ok
+test incomplete_failure_and_unknown_history_cannot_be_promoted_to_normal_results ... ok
+test missing_gpu_and_unfair_compute_do_not_silently_fall_back ... ok
+test non_regular_artifacts_and_missing_roots_are_rejected ... ok
+test observed_identity_requested_values_and_defaults_are_checked_separately ... ok
+test formal_inputs_require_contract_holdout_weights_observations_and_statistics ... ok
+test parse_is_bounded_and_budget_numbers_do_not_round_into_u64 ... ok
+test runtime_controls_reject_evaluator_and_undeclared_option_changes ... ok
+test modified_inputs_readiness_and_lock_versions_cannot_bypass_integrity ... ok
+test schema_unknown_fields_and_unsupported_versions_are_rejected ... ok
+test fifo_artifact_without_a_writer_is_rejected_within_a_finite_deadline ... ok
+test symlink_artifacts_and_intermediate_root_escape_are_rejected ... ok
+test traversal_secret_and_cross_platform_device_paths_are_rejected_before_reads ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+   Doc-tests rz_experiments
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

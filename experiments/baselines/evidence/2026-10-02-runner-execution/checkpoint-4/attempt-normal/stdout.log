@@ -1,0 +1,419 @@
+[INFO  ] [17:11:47.766790] <                    > fastchess --- fastchess alpha 1.8.2 20260726-f618e34
+[INFO  ] [17:11:47.766818] <                    > fastchess --- Setting seed to: 1
+[TRACE ] [17:11:47.766822] <                    > fastchess --- Creating tournament...
+[TRACE ] [17:11:47.766900] <                    > fastchess --- Setting results...
+[INFO  ] [17:11:47.767023] <                    > fastchess --- Starting tournament...
+[TRACE ] [17:11:47.767030] <                    > fastchess --- Starting round robin tournament...
+[TRACE ] [17:11:47.767032] <                    > fastchess --- Starting tournament...
+[TRACE ] [17:11:47.767034] <                    > fastchess --- Creating matches...
+[TRACE ] [17:11:47.767180] <     140548292564672> fastchess --- Game 1 between baseline-fixture and candidate-fixture starting
+Started game 1 of 2 (baseline-fixture vs candidate-fixture)
+[TRACE ] [17:11:47.767238] <     140548292564672> fastchess --- Starting engine baseline-fixture at /proc/20362/fd/7
+[TRACE ] [17:11:47.767461] <                    > fastchess --- Using eventfd for process interrupt signaling
+[TRACE ] [17:11:47.767467] <     140548292564672> fastchess --- Sending uci to engine baseline-fixture
+[Engine] [17:11:47.767469] <     140548292564672>  baseline-fixture <--- uci
+[TRACE ] [17:11:47.767478] <     140548292564672> fastchess --- Waiting for uciok from engine baseline-fixture
+[Engine] [17:11:47.768980] <     140548292564672>  baseline-fixture ---> id name RoveZero SYNTHETIC ScholarMate fixture (no NN, no search)
+[Engine] [17:11:47.768989] <     140548292564672>  baseline-fixture ---> id author RoveZero synthetic test fixtures
+[Engine] [17:11:47.768991] <     140548292564672>  baseline-fixture ---> option name Ponder type check default false
+[Engine] [17:11:47.768993] <     140548292564672>  baseline-fixture ---> option name Threads type spin default 1 min 1 max 1
+[Engine] [17:11:47.768994] <     140548292564672>  baseline-fixture ---> option name Seed type string default 0
+[Engine] [17:11:47.768996] <     140548292564672>  baseline-fixture ---> uciok
+[TRACE ] [17:11:47.769032] <     140548292564672> fastchess --- Starting engine candidate-fixture at /proc/20362/fd/6
+[TRACE ] [17:11:47.769209] <                    > fastchess --- Using eventfd for process interrupt signaling
+[TRACE ] [17:11:47.769214] <     140548292564672> fastchess --- Sending uci to engine candidate-fixture
+[Engine] [17:11:47.769216] <     140548292564672>  candidate-fixture <--- uci
+[TRACE ] [17:11:47.769221] <     140548292564672> fastchess --- Waiting for uciok from engine candidate-fixture
+[Engine] [17:11:47.770810] <     140548292564672>  <stderr> candidate-fixture ---> SYNTHETIC_UCI_FIXTURE mode=normal script=scholars_mate_v1 no_nn=true max_line_bytes=8192 max_commands=10000
+[Engine] [17:11:47.770817] <     140548292564672>  candidate-fixture ---> id name RoveZero SYNTHETIC ScholarMate fixture (no NN, no search)
+[Engine] [17:11:47.770819] <     140548292564672>  candidate-fixture ---> id author RoveZero synthetic test fixtures
+[Engine] [17:11:47.770821] <     140548292564672>  candidate-fixture ---> option name Ponder type check default false
+[Engine] [17:11:47.770822] <     140548292564672>  candidate-fixture ---> option name Threads type spin default 1 min 1 max 1
+[Engine] [17:11:47.770824] <     140548292564672>  candidate-fixture ---> option name Seed type string default 0
+[Engine] [17:11:47.770826] <     140548292564672>  candidate-fixture ---> uciok
+[TRACE ] [17:11:47.770837] <     140548292564672> fastchess --- Refreshing engine baseline-fixture
+[TRACE ] [17:11:47.770842] <     140548292564672> fastchess --- Sending setoption to engine baseline-fixture Threads 1
+[Engine] [17:11:47.770844] <     140548292564672>  baseline-fixture <--- setoption name Threads value 1
+[TRACE ] [17:11:47.770860] <     140548292564672> fastchess --- Sending setoption to engine baseline-fixture Ponder false
+[Engine] [17:11:47.770862] <     140548292564672>  baseline-fixture <--- setoption name Ponder value false
+[TRACE ] [17:11:47.770866] <     140548292564672> fastchess --- Sending ucinewgame to engine baseline-fixture
+[Engine] [17:11:47.770867] <     140548292564672>  baseline-fixture <--- ucinewgame
+[TRACE ] [17:11:47.770870] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.770871] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.770875] <     140548292564672>  <stderr> baseline-fixture ---> SYNTHETIC_UCI_FIXTURE mode=normal script=scholars_mate_v1 no_nn=true max_line_bytes=8192 max_commands=10000
+[Engine] [17:11:47.770918] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.770922] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.770928] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[TRACE ] [17:11:47.770930] <     140548292564672> fastchess --- Engine baseline-fixture refreshed.
+[TRACE ] [17:11:47.770932] <     140548292564672> fastchess --- Refreshing engine candidate-fixture
+[TRACE ] [17:11:47.770934] <     140548292564672> fastchess --- Sending setoption to engine candidate-fixture Threads 1
+[Engine] [17:11:47.770936] <     140548292564672>  candidate-fixture <--- setoption name Threads value 1
+[TRACE ] [17:11:47.770949] <     140548292564672> fastchess --- Sending setoption to engine candidate-fixture Ponder false
+[Engine] [17:11:47.770952] <     140548292564672>  candidate-fixture <--- setoption name Ponder value false
+[TRACE ] [17:11:47.770955] <     140548292564672> fastchess --- Sending ucinewgame to engine candidate-fixture
+[Engine] [17:11:47.770956] <     140548292564672>  candidate-fixture <--- ucinewgame
+[TRACE ] [17:11:47.770958] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.770960] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.771008] <     140548292564672>  <stderr> candidate-fixture ---> synthetic applied Ponder=false Threads=1 Seed=0
+[Engine] [17:11:47.771012] <     140548292564672>  <stderr> candidate-fixture ---> synthetic applied Ponder=false Threads=1 Seed=0
+[Engine] [17:11:47.771014] <     140548292564672>  <stderr> candidate-fixture ---> synthetic newgame: prefix and pending go reset
+[Engine] [17:11:47.771017] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.771018] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.771021] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[TRACE ] [17:11:47.771023] <     140548292564672> fastchess --- Engine candidate-fixture refreshed.
+[TRACE ] [17:11:47.771026] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.771027] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.771040] <     140548292564672>  <stderr> baseline-fixture ---> synthetic applied Ponder=false Threads=1 Seed=0
+[Engine] [17:11:47.771043] <     140548292564672>  <stderr> baseline-fixture ---> synthetic applied Ponder=false Threads=1 Seed=0
+[Engine] [17:11:47.771045] <     140548292564672>  <stderr> baseline-fixture ---> synthetic newgame: prefix and pending go reset
+[Engine] [17:11:47.771068] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.771071] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.771073] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[TRACE ] [17:11:47.771081] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.771082] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.771119] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.771123] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.771125] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[Engine] [17:11:47.771131] <     140548292564672>  baseline-fixture <--- position startpos moves e2e4 e7e5
+[TRACE ] [17:11:47.771141] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.771144] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.771164] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.771168] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.771170] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[TRACE ] [17:11:47.771173] <     140548292564672> fastchess --- Engine baseline-fixture is thinking
+[Engine] [17:11:47.771176] <     140548292564672>  baseline-fixture <--- go wtime 1000 btime 1000
+[Engine] [17:11:47.771186] <     140548292564672>  <stderr> baseline-fixture ---> synthetic position startpos prefix_len=2 moves=e2e4 e7e5
+[Engine] [17:11:47.771206] <     140548292564672>  baseline-fixture ---> bestmove d1h5
+[TRACE ] [17:11:47.771210] <     140548292564672> fastchess --- Engine baseline-fixture is done thinking
+[TRACE ] [17:11:47.771212] <     140548292564672> fastchess --- Check if engine baseline-fixture is in a ready state
+[TRACE ] [17:11:47.771214] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.771215] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.771225] <     140548292564672>  <stderr> baseline-fixture ---> synthetic go mode=normal prefix_len=2 clock_arguments_ignored=true
+[Engine] [17:11:47.771242] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.771246] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.771248] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[TRACE ] [17:11:47.771250] <     140548292564672> fastchess --- Engine baseline-fixture is in a ready state
+[TRACE ] [17:11:47.771262] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.771263] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.771307] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.771311] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.771313] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[Engine] [17:11:47.771315] <     140548292564672>  candidate-fixture <--- position startpos moves e2e4 e7e5 d1h5
+[TRACE ] [17:11:47.771328] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.771330] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.771363] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.771366] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.771368] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[TRACE ] [17:11:47.771370] <     140548292564672> fastchess --- Engine candidate-fixture is thinking
+[Engine] [17:11:47.771372] <     140548292564672>  candidate-fixture <--- go wtime 1000 btime 1000
+[Engine] [17:11:47.771384] <     140548292564672>  <stderr> candidate-fixture ---> synthetic position startpos prefix_len=3 moves=e2e4 e7e5 d1h5
+[Engine] [17:11:47.771413] <     140548292564672>  candidate-fixture ---> bestmove b8c6
+[TRACE ] [17:11:47.771417] <     140548292564672> fastchess --- Engine candidate-fixture is done thinking
+[TRACE ] [17:11:47.771418] <     140548292564672> fastchess --- Check if engine candidate-fixture is in a ready state
+[TRACE ] [17:11:47.771420] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.771422] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.771431] <     140548292564672>  <stderr> candidate-fixture ---> synthetic go mode=normal prefix_len=3 clock_arguments_ignored=true
+[Engine] [17:11:47.771449] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.771453] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.771455] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[TRACE ] [17:11:47.771457] <     140548292564672> fastchess --- Engine candidate-fixture is in a ready state
+[TRACE ] [17:11:47.771462] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.771463] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.771515] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.771519] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.771521] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[Engine] [17:11:47.771523] <     140548292564672>  baseline-fixture <--- position startpos moves e2e4 e7e5 d1h5 b8c6
+[TRACE ] [17:11:47.771535] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.771537] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.771563] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.771566] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.771568] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[TRACE ] [17:11:47.771570] <     140548292564672> fastchess --- Engine baseline-fixture is thinking
+[Engine] [17:11:47.771572] <     140548292564672>  baseline-fixture <--- go wtime 1000 btime 1000
+[Engine] [17:11:47.771581] <     140548292564672>  <stderr> baseline-fixture ---> synthetic position startpos prefix_len=4 moves=e2e4 e7e5 d1h5 b8c6
+[Engine] [17:11:47.771600] <     140548292564672>  baseline-fixture ---> bestmove f1c4
+[TRACE ] [17:11:47.771604] <     140548292564672> fastchess --- Engine baseline-fixture is done thinking
+[TRACE ] [17:11:47.771605] <     140548292564672> fastchess --- Check if engine baseline-fixture is in a ready state
+[TRACE ] [17:11:47.771607] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.771609] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.771618] <     140548292564672>  <stderr> baseline-fixture ---> synthetic go mode=normal prefix_len=4 clock_arguments_ignored=true
+[Engine] [17:11:47.771636] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.771639] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.771642] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[TRACE ] [17:11:47.771643] <     140548292564672> fastchess --- Engine baseline-fixture is in a ready state
+[TRACE ] [17:11:47.771648] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.771650] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.771695] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.771698] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.771701] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[Engine] [17:11:47.771702] <     140548292564672>  candidate-fixture <--- position startpos moves e2e4 e7e5 d1h5 b8c6 f1c4
+[TRACE ] [17:11:47.771717] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.771720] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.771742] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.771746] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.771748] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[TRACE ] [17:11:47.771750] <     140548292564672> fastchess --- Engine candidate-fixture is thinking
+[Engine] [17:11:47.771752] <     140548292564672>  candidate-fixture <--- go wtime 1000 btime 1000
+[Engine] [17:11:47.771762] <     140548292564672>  <stderr> candidate-fixture ---> synthetic position startpos prefix_len=5 moves=e2e4 e7e5 d1h5 b8c6 f1c4
+[Engine] [17:11:47.771782] <     140548292564672>  candidate-fixture ---> bestmove g8f6
+[TRACE ] [17:11:47.771786] <     140548292564672> fastchess --- Engine candidate-fixture is done thinking
+[TRACE ] [17:11:47.771788] <     140548292564672> fastchess --- Check if engine candidate-fixture is in a ready state
+[TRACE ] [17:11:47.771790] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.771791] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.771800] <     140548292564672>  <stderr> candidate-fixture ---> synthetic go mode=normal prefix_len=5 clock_arguments_ignored=true
+[Engine] [17:11:47.771818] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.771822] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.771824] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[TRACE ] [17:11:47.771826] <     140548292564672> fastchess --- Engine candidate-fixture is in a ready state
+[TRACE ] [17:11:47.771830] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.771831] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.771869] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.771872] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.771874] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[Engine] [17:11:47.771876] <     140548292564672>  baseline-fixture <--- position startpos moves e2e4 e7e5 d1h5 b8c6 f1c4 g8f6
+[TRACE ] [17:11:47.771888] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.771891] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.772009] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.772013] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.772015] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[TRACE ] [17:11:47.772017] <     140548292564672> fastchess --- Engine baseline-fixture is thinking
+[Engine] [17:11:47.772019] <     140548292564672>  baseline-fixture <--- go wtime 1000 btime 1000
+[Engine] [17:11:47.772032] <     140548292564672>  <stderr> baseline-fixture ---> synthetic position startpos prefix_len=6 moves=e2e4 e7e5 d1h5 b8c6 f1c4 g8f6
+[Engine] [17:11:47.772058] <     140548292564672>  baseline-fixture ---> bestmove h5f7
+[TRACE ] [17:11:47.772062] <     140548292564672> fastchess --- Engine baseline-fixture is done thinking
+[TRACE ] [17:11:47.772063] <     140548292564672> fastchess --- Check if engine baseline-fixture is in a ready state
+[TRACE ] [17:11:47.772066] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.772067] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.772076] <     140548292564672>  <stderr> baseline-fixture ---> synthetic go mode=normal prefix_len=6 clock_arguments_ignored=true
+[Engine] [17:11:47.772094] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.772097] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.772099] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[TRACE ] [17:11:47.772101] <     140548292564672> fastchess --- Engine baseline-fixture is in a ready state
+[TRACE ] [17:11:47.772131] <     140548292564672> fastchess --- Game 1 between baseline-fixture and candidate-fixture finished
+[TRACE ] [17:11:47.772229] <     140548292564672> fastchess --- Game 1 finished with result 1-0
+Finished game 1 (baseline-fixture vs candidate-fixture): 1-0 {White mates}
+[Engine] [17:11:47.772243] <     140548292564672>  baseline-fixture <--- stop
+[Engine] [17:11:47.772256] <     140548292564672>  baseline-fixture <--- quit
+[TRACE ] [17:11:47.872419] <     140548292564672> fastchess --- Process with pid: 20365 terminated with status: 0
+[Engine] [17:11:47.872441] <     140548292564672>  <stderr> baseline-fixture ---> Process exited normally with status 0
+[Engine] [17:11:47.872471] <     140548292564672>  candidate-fixture <--- stop
+[Engine] [17:11:47.872510] <     140548292564672>  candidate-fixture <--- quit
+[TRACE ] [17:11:47.972674] <     140548292564672> fastchess --- Process with pid: 20366 terminated with status: 0
+[Engine] [17:11:47.972697] <     140548292564672>  <stderr> candidate-fixture ---> Process exited normally with status 0
+[TRACE ] [17:11:47.972730] <     140548292564672> fastchess --- Thread 140548292564672 finished match 1
+[TRACE ] [17:11:47.972773] <     140548292564672> fastchess --- Game 2 between candidate-fixture and baseline-fixture starting
+Started game 2 of 2 (candidate-fixture vs baseline-fixture)
+[TRACE ] [17:11:47.972824] <     140548292564672> fastchess --- Starting engine candidate-fixture at /proc/20362/fd/6
+[TRACE ] [17:11:47.973074] <                    > fastchess --- Using eventfd for process interrupt signaling
+[TRACE ] [17:11:47.973079] <     140548292564672> fastchess --- Sending uci to engine candidate-fixture
+[Engine] [17:11:47.973082] <     140548292564672>  candidate-fixture <--- uci
+[TRACE ] [17:11:47.973088] <     140548292564672> fastchess --- Waiting for uciok from engine candidate-fixture
+[Engine] [17:11:47.974607] <     140548292564672>  <stderr> candidate-fixture ---> SYNTHETIC_UCI_FIXTURE mode=normal script=scholars_mate_v1 no_nn=true max_line_bytes=8192 max_commands=10000
+[Engine] [17:11:47.974619] <     140548292564672>  candidate-fixture ---> id name RoveZero SYNTHETIC ScholarMate fixture (no NN, no search)
+[Engine] [17:11:47.974622] <     140548292564672>  candidate-fixture ---> id author RoveZero synthetic test fixtures
+[Engine] [17:11:47.974624] <     140548292564672>  candidate-fixture ---> option name Ponder type check default false
+[Engine] [17:11:47.974626] <     140548292564672>  candidate-fixture ---> option name Threads type spin default 1 min 1 max 1
+[Engine] [17:11:47.974627] <     140548292564672>  candidate-fixture ---> option name Seed type string default 0
+[Engine] [17:11:47.974629] <     140548292564672>  candidate-fixture ---> uciok
+[TRACE ] [17:11:47.974650] <     140548292564672> fastchess --- Starting engine baseline-fixture at /proc/20362/fd/7
+[TRACE ] [17:11:47.974970] <                    > fastchess --- Using eventfd for process interrupt signaling
+[TRACE ] [17:11:47.974975] <     140548292564672> fastchess --- Sending uci to engine baseline-fixture
+[Engine] [17:11:47.974977] <     140548292564672>  baseline-fixture <--- uci
+[TRACE ] [17:11:47.974983] <     140548292564672> fastchess --- Waiting for uciok from engine baseline-fixture
+[Engine] [17:11:47.976413] <     140548292564672>  baseline-fixture ---> id name RoveZero SYNTHETIC ScholarMate fixture (no NN, no search)
+[Engine] [17:11:47.976418] <     140548292564672>  baseline-fixture ---> id author RoveZero synthetic test fixtures
+[Engine] [17:11:47.976420] <     140548292564672>  baseline-fixture ---> option name Ponder type check default false
+[Engine] [17:11:47.976423] <     140548292564672>  baseline-fixture ---> option name Threads type spin default 1 min 1 max 1
+[Engine] [17:11:47.976424] <     140548292564672>  baseline-fixture ---> option name Seed type string default 0
+[Engine] [17:11:47.976426] <     140548292564672>  baseline-fixture ---> uciok
+[TRACE ] [17:11:47.976438] <     140548292564672> fastchess --- Refreshing engine candidate-fixture
+[TRACE ] [17:11:47.976442] <     140548292564672> fastchess --- Sending setoption to engine candidate-fixture Threads 1
+[Engine] [17:11:47.976444] <     140548292564672>  candidate-fixture <--- setoption name Threads value 1
+[TRACE ] [17:11:47.976459] <     140548292564672> fastchess --- Sending setoption to engine candidate-fixture Ponder false
+[Engine] [17:11:47.976462] <     140548292564672>  candidate-fixture <--- setoption name Ponder value false
+[TRACE ] [17:11:47.976465] <     140548292564672> fastchess --- Sending ucinewgame to engine candidate-fixture
+[Engine] [17:11:47.976466] <     140548292564672>  candidate-fixture <--- ucinewgame
+[TRACE ] [17:11:47.976469] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.976470] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.976935] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.976942] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.976945] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[TRACE ] [17:11:47.976947] <     140548292564672> fastchess --- Engine candidate-fixture refreshed.
+[TRACE ] [17:11:47.976949] <     140548292564672> fastchess --- Refreshing engine baseline-fixture
+[TRACE ] [17:11:47.976952] <     140548292564672> fastchess --- Sending setoption to engine baseline-fixture Threads 1
+[Engine] [17:11:47.976953] <     140548292564672>  baseline-fixture <--- setoption name Threads value 1
+[TRACE ] [17:11:47.976968] <     140548292564672> fastchess --- Sending setoption to engine baseline-fixture Ponder false
+[Engine] [17:11:47.976971] <     140548292564672>  baseline-fixture <--- setoption name Ponder value false
+[TRACE ] [17:11:47.976974] <     140548292564672> fastchess --- Sending ucinewgame to engine baseline-fixture
+[Engine] [17:11:47.976975] <     140548292564672>  baseline-fixture <--- ucinewgame
+[TRACE ] [17:11:47.976978] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.976979] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.976983] <     140548292564672>  <stderr> baseline-fixture ---> SYNTHETIC_UCI_FIXTURE mode=normal script=scholars_mate_v1 no_nn=true max_line_bytes=8192 max_commands=10000
+[Engine] [17:11:47.977070] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.977075] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.977078] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[TRACE ] [17:11:47.977080] <     140548292564672> fastchess --- Engine baseline-fixture refreshed.
+[TRACE ] [17:11:47.977082] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.977084] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.977097] <     140548292564672>  <stderr> candidate-fixture ---> synthetic applied Ponder=false Threads=1 Seed=0
+[Engine] [17:11:47.977100] <     140548292564672>  <stderr> candidate-fixture ---> synthetic applied Ponder=false Threads=1 Seed=0
+[Engine] [17:11:47.977102] <     140548292564672>  <stderr> candidate-fixture ---> synthetic newgame: prefix and pending go reset
+[Engine] [17:11:47.977130] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.977134] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.977136] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[TRACE ] [17:11:47.977144] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.977146] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.977191] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.977195] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.977197] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[Engine] [17:11:47.977200] <     140548292564672>  candidate-fixture <--- position startpos moves e2e4 e7e5
+[TRACE ] [17:11:47.977213] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.977215] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.977251] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.977255] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.977257] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[TRACE ] [17:11:47.977259] <     140548292564672> fastchess --- Engine candidate-fixture is thinking
+[Engine] [17:11:47.977262] <     140548292564672>  candidate-fixture <--- go wtime 1000 btime 1000
+[Engine] [17:11:47.977273] <     140548292564672>  <stderr> candidate-fixture ---> synthetic position startpos prefix_len=2 moves=e2e4 e7e5
+[Engine] [17:11:47.977293] <     140548292564672>  candidate-fixture ---> bestmove d1h5
+[TRACE ] [17:11:47.977297] <     140548292564672> fastchess --- Engine candidate-fixture is done thinking
+[TRACE ] [17:11:47.977299] <     140548292564672> fastchess --- Check if engine candidate-fixture is in a ready state
+[TRACE ] [17:11:47.977301] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.977302] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.977311] <     140548292564672>  <stderr> candidate-fixture ---> synthetic go mode=normal prefix_len=2 clock_arguments_ignored=true
+[Engine] [17:11:47.977330] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.977333] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.977335] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[TRACE ] [17:11:47.977337] <     140548292564672> fastchess --- Engine candidate-fixture is in a ready state
+[TRACE ] [17:11:47.977350] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.977351] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.977364] <     140548292564672>  <stderr> baseline-fixture ---> synthetic applied Ponder=false Threads=1 Seed=0
+[Engine] [17:11:47.977367] <     140548292564672>  <stderr> baseline-fixture ---> synthetic applied Ponder=false Threads=1 Seed=0
+[Engine] [17:11:47.977369] <     140548292564672>  <stderr> baseline-fixture ---> synthetic newgame: prefix and pending go reset
+[Engine] [17:11:47.977391] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.977394] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.977396] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[Engine] [17:11:47.977398] <     140548292564672>  baseline-fixture <--- position startpos moves e2e4 e7e5 d1h5
+[TRACE ] [17:11:47.977411] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.977415] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.977444] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.977449] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.977452] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[TRACE ] [17:11:47.977454] <     140548292564672> fastchess --- Engine baseline-fixture is thinking
+[Engine] [17:11:47.977568] <     140548292564672>  baseline-fixture <--- go wtime 1000 btime 1000
+[Engine] [17:11:47.977587] <     140548292564672>  <stderr> baseline-fixture ---> synthetic position startpos prefix_len=3 moves=e2e4 e7e5 d1h5
+[Engine] [17:11:47.977747] <     140548292564672>  baseline-fixture ---> bestmove b8c6
+[TRACE ] [17:11:47.977752] <     140548292564672> fastchess --- Engine baseline-fixture is done thinking
+[TRACE ] [17:11:47.977755] <     140548292564672> fastchess --- Check if engine baseline-fixture is in a ready state
+[TRACE ] [17:11:47.977759] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.977774] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.977788] <     140548292564672>  <stderr> baseline-fixture ---> synthetic go mode=normal prefix_len=3 clock_arguments_ignored=true
+[Engine] [17:11:47.977814] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.977818] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.977820] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[TRACE ] [17:11:47.977822] <     140548292564672> fastchess --- Engine baseline-fixture is in a ready state
+[TRACE ] [17:11:47.977830] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.977831] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.977873] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.977876] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.977878] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[Engine] [17:11:47.977881] <     140548292564672>  candidate-fixture <--- position startpos moves e2e4 e7e5 d1h5 b8c6
+[TRACE ] [17:11:47.977893] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.977896] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.977928] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.977932] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.977934] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[TRACE ] [17:11:47.977935] <     140548292564672> fastchess --- Engine candidate-fixture is thinking
+[Engine] [17:11:47.977937] <     140548292564672>  candidate-fixture <--- go wtime 1000 btime 1000
+[Engine] [17:11:47.977947] <     140548292564672>  <stderr> candidate-fixture ---> synthetic position startpos prefix_len=4 moves=e2e4 e7e5 d1h5 b8c6
+[Engine] [17:11:47.977967] <     140548292564672>  candidate-fixture ---> bestmove f1c4
+[TRACE ] [17:11:47.977970] <     140548292564672> fastchess --- Engine candidate-fixture is done thinking
+[TRACE ] [17:11:47.977972] <     140548292564672> fastchess --- Check if engine candidate-fixture is in a ready state
+[TRACE ] [17:11:47.977974] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.977975] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.977984] <     140548292564672>  <stderr> candidate-fixture ---> synthetic go mode=normal prefix_len=4 clock_arguments_ignored=true
+[Engine] [17:11:47.978002] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.978006] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.978009] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[TRACE ] [17:11:47.978010] <     140548292564672> fastchess --- Engine candidate-fixture is in a ready state
+[TRACE ] [17:11:47.978016] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.978017] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.978091] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.978095] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.978097] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[Engine] [17:11:47.978099] <     140548292564672>  baseline-fixture <--- position startpos moves e2e4 e7e5 d1h5 b8c6 f1c4
+[TRACE ] [17:11:47.978108] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.978111] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.978131] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.978134] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.978137] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[TRACE ] [17:11:47.978138] <     140548292564672> fastchess --- Engine baseline-fixture is thinking
+[Engine] [17:11:47.978140] <     140548292564672>  baseline-fixture <--- go wtime 1000 btime 1000
+[Engine] [17:11:47.978150] <     140548292564672>  <stderr> baseline-fixture ---> synthetic position startpos prefix_len=5 moves=e2e4 e7e5 d1h5 b8c6 f1c4
+[Engine] [17:11:47.978169] <     140548292564672>  baseline-fixture ---> bestmove g8f6
+[TRACE ] [17:11:47.978173] <     140548292564672> fastchess --- Engine baseline-fixture is done thinking
+[TRACE ] [17:11:47.978175] <     140548292564672> fastchess --- Check if engine baseline-fixture is in a ready state
+[TRACE ] [17:11:47.978177] <     140548292564672> fastchess --- Pinging engine baseline-fixture
+[Engine] [17:11:47.978178] <     140548292564672>  baseline-fixture <--- isready
+[Engine] [17:11:47.978187] <     140548292564672>  <stderr> baseline-fixture ---> synthetic go mode=normal prefix_len=5 clock_arguments_ignored=true
+[Engine] [17:11:47.978205] <     140548292564672>  baseline-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.978208] <     140548292564672>  baseline-fixture ---> readyok
+[TRACE ] [17:11:47.978210] <     140548292564672> fastchess --- Engine baseline-fixture is responsive
+[TRACE ] [17:11:47.978212] <     140548292564672> fastchess --- Engine baseline-fixture is in a ready state
+[TRACE ] [17:11:47.978216] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.978217] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.978255] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.978258] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.978261] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[Engine] [17:11:47.978263] <     140548292564672>  candidate-fixture <--- position startpos moves e2e4 e7e5 d1h5 b8c6 f1c4 g8f6
+[TRACE ] [17:11:47.978272] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.978274] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.978295] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.978298] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.978300] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[TRACE ] [17:11:47.978302] <     140548292564672> fastchess --- Engine candidate-fixture is thinking
+[Engine] [17:11:47.978304] <     140548292564672>  candidate-fixture <--- go wtime 1000 btime 1000
+[Engine] [17:11:47.978314] <     140548292564672>  <stderr> candidate-fixture ---> synthetic position startpos prefix_len=6 moves=e2e4 e7e5 d1h5 b8c6 f1c4 g8f6
+[Engine] [17:11:47.978333] <     140548292564672>  candidate-fixture ---> bestmove h5f7
+[TRACE ] [17:11:47.978337] <     140548292564672> fastchess --- Engine candidate-fixture is done thinking
+[TRACE ] [17:11:47.978338] <     140548292564672> fastchess --- Check if engine candidate-fixture is in a ready state
+[TRACE ] [17:11:47.978340] <     140548292564672> fastchess --- Pinging engine candidate-fixture
+[Engine] [17:11:47.978342] <     140548292564672>  candidate-fixture <--- isready
+[Engine] [17:11:47.978351] <     140548292564672>  <stderr> candidate-fixture ---> synthetic go mode=normal prefix_len=6 clock_arguments_ignored=true
+[Engine] [17:11:47.978369] <     140548292564672>  candidate-fixture ---> info string synthetic applied Ponder=false Threads=1 Seed=0 mode=normal
+[Engine] [17:11:47.978372] <     140548292564672>  candidate-fixture ---> readyok
+[TRACE ] [17:11:47.978374] <     140548292564672> fastchess --- Engine candidate-fixture is responsive
+[TRACE ] [17:11:47.978376] <     140548292564672> fastchess --- Engine candidate-fixture is in a ready state
+[TRACE ] [17:11:47.978406] <     140548292564672> fastchess --- Game 2 between candidate-fixture and baseline-fixture finished
+[TRACE ] [17:11:47.978516] <     140548292564672> fastchess --- Game 2 finished with result 1-0
+Finished game 2 (candidate-fixture vs baseline-fixture): 1-0 {White mates}
+--------------------------------------------------
+Results of baseline-fixture vs candidate-fixture (1, 1t, NULL, opening.pgn):
+Elo: -0.00 +/- 0.00, nElo: -nan +/- -nan
+LOS: -nan %, DrawRatio: 100.00 %, PairsRatio: -nan
+Games: 2, Wins: 1, Losses: 1, Draws: 0, Points: 1.0 (50.00 %)
+Ptnml(0-2): [0, 0, 1, 0, 0], WL/DD Ratio: inf
+--------------------------------------------------
+[TRACE ] [17:11:47.978572] <                    > fastchess --- No more matches to generate
+[Engine] [17:11:47.978575] <     140548292564672>  candidate-fixture <--- stop
+[Engine] [17:11:47.978588] <     140548292564672>  candidate-fixture <--- quit
+[TRACE ] [17:11:48.078757] <     140548292564672> fastchess --- Process with pid: 20367 terminated with status: 0
+[Engine] [17:11:48.078780] <     140548292564672>  <stderr> candidate-fixture ---> Process exited normally with status 0
+[Engine] [17:11:48.078802] <     140548292564672>  baseline-fixture <--- stop
+[Engine] [17:11:48.078820] <     140548292564672>  baseline-fixture <--- quit
+[TRACE ] [17:11:48.178970] <     140548292564672> fastchess --- Process with pid: 20368 terminated with status: 0
+[Engine] [17:11:48.178993] <     140548292564672>  <stderr> baseline-fixture ---> Process exited normally with status 0
+[TRACE ] [17:11:48.179031] <     140548292564672> fastchess --- Thread 140548292564672 finished match 2
+[TRACE ] [17:11:48.767167] <                    > fastchess --- ~BaseTournament()
+[TRACE ] [17:11:48.767198] <                    > fastchess --- Instructing engines to stop...
+[TRACE ] [17:11:48.767338] <                    > fastchess --- Saving results...
+[TRACE ] [17:11:48.767545] <                    > fastchess --- Saved results to.
+[TRACE ] [17:11:48.767670] <                    > fastchess --- ~TournamentManager()
+Finished match
+[INFO  ] [17:11:48.767680] <                    > fastchess --- Finished match
+
+Total Time: 00:00:01 (hours:minutes:seconds)
+
+[INFO  ] [17:11:48.767685] <                    > fastchess --- Total Time: 00:00:01 (hours:minutes:seconds)
+
+
