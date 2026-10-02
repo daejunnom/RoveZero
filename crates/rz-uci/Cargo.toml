@@ -11,7 +11,10 @@ path = "src/lib.rs"
 
 [features]
 default = []
-onnx-cpu = ["rz-eval/onnx"]
+onnx-cpu = [
+    "rz-eval/onnx", "dep:serde", "dep:serde_json", "dep:sha2",
+    "dep:cap-std", "dep:cap-fs-ext",
+]
 
 [dependencies]
 rz-search.workspace = true
@@ -20,3 +23,8 @@ rz-position = { workspace = true, features = ["contracts"] }
 rz-runtime = { workspace = true, features = ["contracts"] }
 rz-eval = { workspace = true, features = ["contracts"] }
 rz-encoding.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+cap-std = { workspace = true, optional = true }
+cap-fs-ext = { workspace = true, optional = true }
