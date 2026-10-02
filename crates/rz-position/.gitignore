@@ -1,0 +1,2 @@
+# The library's temporary standalone lockfile is superseded by I01's workspace lockfile.
+/Cargo.lock
