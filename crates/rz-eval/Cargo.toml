@@ -1,0 +1,10 @@
+[package]
+name = "rz-eval"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "RoveZero model evaluation and deterministic backend test support"
+publish = false
+
+[lib]
+path = "src/lib.rs"
