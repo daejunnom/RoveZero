@@ -1,0 +1,46 @@
+# Secrets: ignore rules are supplementary, not permission to inspect these files.
+.env
+.env.*
+*.pem
+*.key
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519_*
+*service-account*.json
+*service_account*.json
+credentials.json
+*credentials*.json
+
+# Generated and heavy directories. Model source belongs in crates/rz-encoding and crates/rz-eval.
+node_modules/
+dist/
+dist-server/
+build/
+coverage/
+models/
+checkpoints/
+.cache/
+target/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Raw outputs belong outside the repository; reviewed summaries go in docs/.
+/datasets/
+/runs/
+/reports/
+/tmp/
+*.log
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Local editor / OS files.
+.DS_Store
+Thumbs.db
+*.swp
