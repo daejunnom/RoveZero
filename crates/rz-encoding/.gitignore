@@ -1,0 +1,2 @@
+# Standalone development only; TASK-I01 owns the workspace lockfile.
+/Cargo.lock
