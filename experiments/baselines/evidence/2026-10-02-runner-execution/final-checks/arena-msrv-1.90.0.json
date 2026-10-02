@@ -1,0 +1,28 @@
+{
+  "name": "arena-msrv-1.90.0",
+  "argv": [
+    "${CARGO}",
+    "+1.90.0",
+    "check",
+    "--manifest-path",
+    "crates/rz-arena/Cargo.toml",
+    "--all-features",
+    "--all-targets",
+    "--locked"
+  ],
+  "cwd": "${REPO_ROOT}",
+  "source_git_head": "9e49b6679aeab4e96be0f6b90e51e26a0c7a9ead",
+  "started_utc": "2026-10-02T17:16:43.954725+00:00",
+  "timeout_seconds": 90,
+  "stdout": "arena-msrv-1.90.0.stdout.txt",
+  "stderr": "arena-msrv-1.90.0.stderr.txt",
+  "output_capture": "original_unmodified_bytes",
+  "exit_code": 0,
+  "executed": true,
+  "timed_out": false,
+  "interrupted": false,
+  "termination_scope": "process_group",
+  "status": "passed",
+  "elapsed_seconds": 9.677606,
+  "finished_utc": "2026-10-02T17:16:53.632570+00:00"
+}

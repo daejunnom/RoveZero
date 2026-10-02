@@ -1,7 +1,7 @@
 # E 역할 구현 계획 — TASK-E01/E02/E03
 
 작성일: 2026-10-03, Asia/Seoul. 담당: 사용자가 E 역할로 배정한 이 채팅의 에이전트.
-상태: E01 입력 단계와 E02 pair·원장 내부 구현. 진행과 실제 근거는 9·10절에 기록한다.
+상태: E01 입력, E02 pair·원장과 외부 fixture 실행·Rules 감사 구현. 이력과 근거는 9~11절에 기록한다.
 
 ## 1. 계획 수립 당시 기준과 상태
 
@@ -284,3 +284,45 @@ source SHA는 draft PR head와 최종 영수증으로 인계한다.
 NN·GPU·강도·CI 성공을 의미하지 않는다. E03의 CI/Elo/bootstrap·순차 검정은 아직
 구현하지 않았다. 다음 단위는 외부 runner adapter·실제 시작/종료 영수증과 bounded
 process 수명, A의 checked 복원과 독립 PGN 감사·clock/resource/drain/reset 연결이다.
+
+## 11. 외부 fixture 실행과 검증 자료 보존 — 2026-10-02 UTC
+
+PR #7 head `18339c30754f4f38d957d96aeab481b018b98718`은 open/ready-for-review이며
+Contracts CPU workflow `37033676814` success를 관측했다. 코드 의존성은 공통 source
+`67284c4f66f7a7ae9f46fa63dfd50e7410eb6845`, A PR #3 source
+`118dc0311a88e143be285703940321dc16261f6a`에 고정했다. manifest schema 1과
+engine contract 0.1을 분리하고 native 공통 타입·오류를 소비한다. A의 최소 버전 때문에
+arena MSRV는 1.90이고 E01은 1.85다. root workspace·lockfile·CI는 수정하지 않았다.
+
+Linux ELF 검증 핸들·고정 인수·환경 초기화·pinned cwd·합산 출력 상한·유한 wall/취소/
+TERM→KILL과 PGN/config snapshot 관측을 구현했다. 시작한 process의 PID·종료·정리와
+captured stdout/stderr를 남기며 저장 실패도 소유권을 보존한다. 상한 밖으로 탈출한
+process, 순간 fork, kernel RAM/디스크 quota를 보장하지 않는다. root·입력 파일은 caller의
+배타적 관리가 필요하다. 전역 subreaper·다른 process group을 사용하지 않는다.
+
+Fastchess `f618e34540f94f4719ad3817950618dabe441318` (MIT, ZLIB disabled)을 별도로
+빌드하고 원본 stdout UCI trace와 PGN/config를 확보했다. 실제 실행의 엔진은 고정 7수
+Scholar's Mate script이며 NN·GPU·RoveZero 검색 엔진이 아니다. 양색 동일 prefix와
+A의 checked 상태·semantic digest·checkmate를 확인해 1승/1패·완료 pair 1을 기록했다.
+full-ply 상한 6에서 외부 Draw 선언은 Incomplete로 제외해 W/D/L=0을 확인했다.
+실제 취소는 exit signal 15와 유한 반환을 확인했으나 자식 좀비 때문에 cleanup은
+Unverified였다. 해당 pair는 Incomplete·점수 제외이고 CLI exit 2다.
+
+Rust source `9e49b6679aeab4e96be0f6b90e51e26a0c7a9ead`에서 실제 검사 8개가 통과했다.
+E01 테스트 39개, arena 테스트 101개로 총 140개다. process native helper 10개는
+top-level에서 ignored지만 supervisor 테스트가 별도 프로세스로 실행한다. 두 crate
+fmt/clippy `-D warnings`, E01 Rust 1.85.0 및 arena Rust 1.90.0의 all-targets check도
+통과했다. 이는 Linux CPU의 로컬 검사이며 E CI·다른 OS의 성공은 확인하지 않았다.
+
+PGN notation·tags는 bounded 파서로 읽고 합법 수·origin FEN·차례·권리·EP·카운터·
+이력·terminal은 A가 판정한다. 임의 claim/adjudication·불명확 loss는 거부한다.
+Fastchess의 정식 clock boundary·draw profile과 차이가 있고 derived engine RNG seeds는
+적용하지 못하므로 deterministic CPU fixture만 허용한다. readiness는 false다.
+정식 NN·GPU 강도 평가·공정한 장비/시계·runtime drain·실제 재개와 E03 통계는 남아 있다.
+
+검사와 실행 재현은 `scripts/check-e.py`, `scripts/run-e-fixture.py`에 둔다.
+사용자 요청에 따라 E02 및 이번 작업의 원본 입력·잠금·계획·원장·영수증·PGN/config·
+TSV·stdout/stderr·명령을 [evidence 목록](evidence/README.md)에 원격 보존한다.
+비밀정보·개인정보 신호 검사 후 환경 경로를 마스킹한 사본이며 원본/saved SHA·byte·
+source SHA·합성 여부·누락·마스킹을 inventory에 기록한다. build cache·외부 binary·
+미확인 가중치/데이터는 제외하고 작업 환경 원본은 삭제하지 않는다.

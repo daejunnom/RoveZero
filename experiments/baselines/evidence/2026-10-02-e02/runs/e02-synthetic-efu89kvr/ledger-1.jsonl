@@ -1,0 +1,2 @@
+{"ledger_version":1,"canonicalization":"rz-e02-ledger-json-v1","execution_ready":false,"input_sha256":"382346d3ce99af66f3526cdb56760ce237a0f6d0d0b3f74506068c34e5977907","plan_sha256":"faba64849bdb5a0ede1f03a8896fa02f96404d6060e1e889099c4382902d56d6"}
+{"seq":1,"prev_sha256":"9e211c38272c30db1a604baffbc0444ae43c22d7fa812be706c5541bf364a3c0","event_sha256":"4ab165383dd0e71fe0b30787f1b6afeb63bfd6fcd39e744a202ebb42107c3755","event":{"event":"pair_started","pair_id":"e02-synthetic-accounting-01/pair-0","attempt":1,"process_run_id":"synthetic-pair-0"}}

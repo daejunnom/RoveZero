@@ -1,0 +1,4 @@
+case	cli_exit_code	process_receipt_exists	completed_pairs	excluded_pairs	incomplete_games	evidence_kind
+normal	0	true	1	0	0	actual_process_synthetic_engine
+cutoff	0	true	0	1	2	actual_process_synthetic_engine
+cancel	2	false	not_recorded	not_recorded	not_recorded	failed_preflight_no_spawn

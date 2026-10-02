@@ -1,0 +1,239 @@
+{
+  "lock_version": 1,
+  "canonicalization": "rz-e01-json-v1",
+  "execution_ready": false,
+  "input_sha256": "3763c90ba72e8bf412a84bd187fa2d6e7973994e0a31df3c2c3795075493e567",
+  "input": {
+    "schema_version": 1,
+    "experiment_id": "e01-input-validation",
+    "run_id": "fixture-001",
+    "question": "Synthetic E01 schema/identity fixture only; no executable engine or strength result",
+    "created_utc": "2026-10-02T15:30:00Z",
+    "parent_run": null,
+    "candidate_ids": [],
+    "purpose": "fixture",
+    "comparison": "fixture",
+    "change": "meaning_preserving",
+    "research_path": "cpu",
+    "contract_revision": null,
+    "allowed_option_change": null,
+    "engines": [
+      {
+        "id": "candidate-fixture",
+        "kind": "fixture",
+        "tool": {
+          "version": "e01-synthetic-schema-v1",
+          "source_url": "https://github.com/daejunnom/RoveZero",
+          "source_commit": "9f0bc598f6b2d8f863fd46af6a4fd73bfef1f0b8",
+          "binary": {
+            "path": "e01-identity.txt",
+            "sha256": "72e6620415dcbbba3ed738dc398848595a64f0e0dfd75c286cd1da51e53ae877",
+            "bytes": 63,
+            "source": "https://github.com/daejunnom/RoveZero",
+            "license": "MIT - synthetic test fixture"
+          },
+          "dirty": false,
+          "dirty_patch": null,
+          "build_mode": "fixture-no-executable",
+          "compiler": "fixture-no-compiler",
+          "target": "fixture-no-target",
+          "isa": "fixture-no-isa"
+        },
+        "model_id": "fixture-no-model",
+        "encoding_id": "fixture-no-encoding",
+        "evaluator_id": "fixture-no-evaluator",
+        "search_id": "fixture-no-search",
+        "runtime_id": "fixture-no-runtime",
+        "backend": "fixture-cpu",
+        "precision": "fixture-no-tensors",
+        "device": "cpu",
+        "weight": null,
+        "requested_options": {
+          "Ponder": "false",
+          "Threads": "1"
+        },
+        "observation": null
+      },
+      {
+        "id": "baseline-fixture",
+        "kind": "fixture",
+        "tool": {
+          "version": "e01-synthetic-schema-v1",
+          "source_url": "https://github.com/daejunnom/RoveZero",
+          "source_commit": "9f0bc598f6b2d8f863fd46af6a4fd73bfef1f0b8",
+          "binary": {
+            "path": "e01-identity.txt",
+            "sha256": "72e6620415dcbbba3ed738dc398848595a64f0e0dfd75c286cd1da51e53ae877",
+            "bytes": 63,
+            "source": "https://github.com/daejunnom/RoveZero",
+            "license": "MIT - synthetic test fixture"
+          },
+          "dirty": false,
+          "dirty_patch": null,
+          "build_mode": "fixture-no-executable",
+          "compiler": "fixture-no-compiler",
+          "target": "fixture-no-target",
+          "isa": "fixture-no-isa"
+        },
+        "model_id": "fixture-no-model",
+        "encoding_id": "fixture-no-encoding",
+        "evaluator_id": "fixture-no-evaluator",
+        "search_id": "fixture-no-search",
+        "runtime_id": "fixture-no-runtime",
+        "backend": "fixture-cpu",
+        "precision": "fixture-no-tensors",
+        "device": "cpu",
+        "weight": null,
+        "requested_options": {
+          "Ponder": "false",
+          "Threads": "1"
+        },
+        "observation": null
+      }
+    ],
+    "hardware": {
+      "cpu_model": "synthetic-fixture-cpu",
+      "physical_cores": 1,
+      "threads": 1,
+      "affinity": [
+        0
+      ],
+      "ram_limit_bytes": 2097152,
+      "gpu": null,
+      "operating_system": "synthetic-fixture-os",
+      "runtime_version": "synthetic-fixture-runtime",
+      "assignment_policy": "balanced-paired-fixture",
+      "residency": "cpu_only",
+      "helper_core_limit": 0,
+      "helper_ram_limit_bytes": 0,
+      "tablebase_enabled": false,
+      "tablebase_io_limit_bytes": 0
+    },
+    "input": {
+      "opening_artifact": {
+        "path": "e01-openings.json",
+        "sha256": "27fe2014ce3b865293f5d51de256424349666db6ba95d46a05745c934d78f729",
+        "bytes": 215,
+        "source": "https://github.com/daejunnom/RoveZero",
+        "license": "MIT - synthetic test fixture"
+      },
+      "selection_policy": "declared-order",
+      "seed": 1,
+      "split": "fixture",
+      "history_fill_policy": "no-model-fixture",
+      "repetition_policy": "known-prefix-only",
+      "openings": [
+        {
+          "id": "startpos-fixture",
+          "initial": "startpos",
+          "fen": null,
+          "moves": [
+            "e2e4",
+            "e7e5"
+          ],
+          "history": "complete",
+          "history_origin": "startpos-plus-declared-moves"
+        }
+      ]
+    },
+    "protocol": {
+      "runner": {
+        "version": "e01-synthetic-schema-v1",
+        "source_url": "https://github.com/daejunnom/RoveZero",
+        "source_commit": "9f0bc598f6b2d8f863fd46af6a4fd73bfef1f0b8",
+        "binary": {
+          "path": "e01-identity.txt",
+          "sha256": "72e6620415dcbbba3ed738dc398848595a64f0e0dfd75c286cd1da51e53ae877",
+          "bytes": 63,
+          "source": "https://github.com/daejunnom/RoveZero",
+          "license": "MIT - synthetic test fixture"
+        },
+        "dirty": false,
+        "dirty_patch": null,
+        "build_mode": "fixture-no-executable",
+        "compiler": "fixture-no-compiler",
+        "target": "fixture-no-target",
+        "isa": "fixture-no-isa"
+      },
+      "uci_adapter_version": "e01-fixture-no-runner",
+      "rules_reference_id": "fixture-not-semantic-rules-proof",
+      "rules_version": "fixture-not-semantic-rules-proof",
+      "draw_profile": "explicit-profile-fixture",
+      "claim_policy": "explicit_claim",
+      "terminal_priority": "checkmate-before-75-move",
+      "dead_position_scope": "fixture-no-oracle",
+      "adjudication_enabled": false,
+      "tablebase_policy": "disabled-both-engines",
+      "max_plies": 256,
+      "max_plies_outcome": "incomplete",
+      "engine_failure": "loss",
+      "simultaneous_failure": "contract_invalid",
+      "cancellation_outcome": "incomplete",
+      "infrastructure_invalid_policy": "whole_pair"
+    },
+    "clock": {
+      "track": "t1",
+      "base_ms": 1000,
+      "increment_ms": 0
+    },
+    "lifecycle": {
+      "clock_source": "runner_monotonic",
+      "clock_boundary": "go_write_to_valid_bestmove_read",
+      "uci_overhead_ms": 0,
+      "timeout_grace_ms": 10,
+      "handshake_timeout_ms": 100,
+      "request_deadline_policy": "reject-stale-generation-and-expired-result",
+      "loading_policy": "symmetric-before-game",
+      "compile_policy": "symmetric-before-game",
+      "warmup_policy": "disabled",
+      "warmup_input": null,
+      "warmup_max_ms": 0,
+      "warmup_cache_reset": true,
+      "newgame_reset_policy": "reset-game-scoped-state-and-drain",
+      "drain_timeout_ms": 100,
+      "shutdown_timeout_ms": 100,
+      "ponder": false,
+      "opponent_turn_compute": false,
+      "online_weights": false,
+      "cross_game_results": false,
+      "correction_policy": "disabled"
+    },
+    "plan": {
+      "seed": 1,
+      "engine_seeds": {
+        "baseline-fixture": 3,
+        "candidate-fixture": 2
+      },
+      "pair_order": "alternating",
+      "hardware_order": "balanced-alternating",
+      "pairs": 1,
+      "max_retries_per_pair": 1,
+      "rerun_policy": "whole_pair",
+      "incomplete_pair_policy": "preserve-incomplete-pair-no-score",
+      "stop_policy": "bounded-budget-or-contract-failure"
+    },
+    "statistics": {
+      "implementation": "e01-declared-plan-no-statistic-execution",
+      "score_viewpoint": "candidate-fixture",
+      "sample_plan": "fixed_sample",
+      "elo_scale": "logistic",
+      "cluster_unit": "opening",
+      "ci_method": "none",
+      "confidence_percent": 0,
+      "bootstrap_replicates": 0,
+      "seed": 4,
+      "minimum_clusters": 0,
+      "promotion_policy": "disabled-fixture-no-strength-claim",
+      "budget_end_policy": "inconclusive"
+    },
+    "budget": {
+      "max_pairs": 1,
+      "max_games": 4,
+      "max_wall_ms": 10000,
+      "workers": 1,
+      "max_child_processes": 2,
+      "max_output_bytes": 1048576,
+      "max_artifact_bytes": 1048576
+    }
+  }
+}

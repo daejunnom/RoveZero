@@ -1,0 +1,17 @@
+{
+  "name": "cancel",
+  "argv": [
+    "${ARTIFACT_ROOT}/build/debug/rz-arena",
+    "fixture-pair",
+    "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/cancel-plan.json",
+    "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4",
+    "attempt-cancel",
+    "--max-pairs",
+    "1",
+    "--max-plan-bytes",
+    "1048576"
+  ],
+  "exit_code": 2,
+  "elapsed_ns": 968191178,
+  "expected_exit_code": 2
+}

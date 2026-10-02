@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "${REPO_ROOT}/experiments/baselines/scripts/run-e-fixture.py", line 158, in <module>
+    main()
+  File "${REPO_ROOT}/experiments/baselines/scripts/run-e-fixture.py", line 135, in main
+    assert receipt["process"]["group_cleanup"] == "gone"
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError

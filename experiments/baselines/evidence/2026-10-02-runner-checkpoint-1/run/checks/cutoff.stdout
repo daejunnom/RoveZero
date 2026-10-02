@@ -1,0 +1,46 @@
+{
+  "execution_ready": false,
+  "ledger_tip_sha256": "602c464e5d4391f4118a57c18b6b3bb7e974533e3113fcca251fd81f6b494c35",
+  "process_cleanup": "gone",
+  "receipt": {
+    "bytes": 5225,
+    "license": "MIT - synthetic fixture execution evidence",
+    "path": "attempt-cutoff/process-receipt.json",
+    "sha256": "9e6397944dc234898600e0b8e03bac932720e3fe83eaedea6bb3da2c9820e1e5",
+    "source": "https://github.com/daejunnom/RoveZero"
+  },
+  "summary": {
+    "attempts": 1,
+    "candidate_engine": "candidate-fixture",
+    "closed_attempts": 1,
+    "completed_pairs": 0,
+    "draws": 0,
+    "excluded_pairs": 1,
+    "execution_ready": false,
+    "failure_counts": {
+      "contract_invalid": 0,
+      "crash": 0,
+      "illegal_move": 0,
+      "incomplete": 2,
+      "infrastructure_invalid": 0,
+      "simultaneous_failure": 0,
+      "timeout": 0
+    },
+    "input_sha256": "b33ddc435a9aa849da10a49f6db058f34b362d9347612dded8a08fec546162d4",
+    "interpretation_blocked": false,
+    "losses": 0,
+    "n": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "pending_pairs": 0,
+    "plan_sha256": "917b7f5fcfa1dda8a10c459508cdd51c712c2b892f19782d1507b4940b19e3a7",
+    "planned_pairs": 1,
+    "recorded_games": 2,
+    "wins": 0
+  },
+  "validation_scope": "synthetic_pair_process_and_native_rules"
+}

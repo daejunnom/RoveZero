@@ -1,0 +1,17 @@
+{
+  "name": "cutoff",
+  "argv": [
+    "${ARTIFACT_ROOT}/build/debug/rz-arena",
+    "fixture-pair",
+    "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-1/cutoff-plan.json",
+    "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-1",
+    "attempt-cutoff",
+    "--max-pairs",
+    "1",
+    "--max-plan-bytes",
+    "1048576"
+  ],
+  "exit_code": 0,
+  "elapsed_ns": 1657236402,
+  "expected_exit_code": 0
+}

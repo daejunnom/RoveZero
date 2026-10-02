@@ -1,0 +1,144 @@
+[
+  {
+    "crate": "rz-experiments",
+    "check": "format",
+    "argv": [
+      "${CARGO}",
+      "fmt",
+      "--manifest-path",
+      "crates/rz-experiments/Cargo.toml"
+    ],
+    "exit_code": 0,
+    "log": "rz-experiments-format.log"
+  },
+  {
+    "crate": "rz-experiments",
+    "check": "fmt",
+    "argv": [
+      "${CARGO}",
+      "fmt",
+      "--manifest-path",
+      "crates/rz-experiments/Cargo.toml",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0,
+    "log": "rz-experiments-fmt.log"
+  },
+  {
+    "crate": "rz-experiments",
+    "check": "test",
+    "argv": [
+      "${CARGO}",
+      "test",
+      "--manifest-path",
+      "crates/rz-experiments/Cargo.toml",
+      "--locked"
+    ],
+    "exit_code": 0,
+    "log": "rz-experiments-test.log"
+  },
+  {
+    "crate": "rz-experiments",
+    "check": "clippy",
+    "argv": [
+      "${CARGO}",
+      "clippy",
+      "--manifest-path",
+      "crates/rz-experiments/Cargo.toml",
+      "--all-targets",
+      "--locked",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "log": "rz-experiments-clippy.log"
+  },
+  {
+    "crate": "rz-experiments",
+    "check": "msrv-1.85",
+    "argv": [
+      "${CARGO}",
+      "+1.85.0",
+      "check",
+      "--manifest-path",
+      "crates/rz-experiments/Cargo.toml",
+      "--all-targets",
+      "--locked"
+    ],
+    "exit_code": 0,
+    "log": "rz-experiments-msrv-1.85.log"
+  },
+  {
+    "crate": "rz-arena",
+    "check": "format",
+    "argv": [
+      "${CARGO}",
+      "fmt",
+      "--manifest-path",
+      "crates/rz-arena/Cargo.toml"
+    ],
+    "exit_code": 0,
+    "log": "rz-arena-format.log"
+  },
+  {
+    "crate": "rz-arena",
+    "check": "fmt",
+    "argv": [
+      "${CARGO}",
+      "fmt",
+      "--manifest-path",
+      "crates/rz-arena/Cargo.toml",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0,
+    "log": "rz-arena-fmt.log"
+  },
+  {
+    "crate": "rz-arena",
+    "check": "test",
+    "argv": [
+      "${CARGO}",
+      "test",
+      "--manifest-path",
+      "crates/rz-arena/Cargo.toml",
+      "--locked"
+    ],
+    "exit_code": 0,
+    "log": "rz-arena-test.log"
+  },
+  {
+    "crate": "rz-arena",
+    "check": "clippy",
+    "argv": [
+      "${CARGO}",
+      "clippy",
+      "--manifest-path",
+      "crates/rz-arena/Cargo.toml",
+      "--all-targets",
+      "--locked",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "log": "rz-arena-clippy.log"
+  },
+  {
+    "crate": "rz-arena",
+    "check": "msrv-1.85",
+    "argv": [
+      "${CARGO}",
+      "+1.85.0",
+      "check",
+      "--manifest-path",
+      "crates/rz-arena/Cargo.toml",
+      "--all-targets",
+      "--locked"
+    ],
+    "exit_code": 0,
+    "log": "rz-arena-msrv-1.85.log"
+  }
+]

@@ -89,6 +89,11 @@ E02는 `decode_json`의 bounded strict reader, `ArtifactRef::validate`의 메타
 기존 pretty `to_json`과 동일한 envelope를 compact 형식으로 내보내므로, 다른 잠금 안에
 중첩할 때 공백 확장으로 입력 상한을 넘지 않는다. 내용과 digest 의미는 동일하다.
 
+`ArtifactRef::open_verified(root, max_bytes)`는 같은 보안 경계에서 검증한 파일을
+offset 0의 std 파일 핸들로 반환한다. Arena는 이를 다시 pathname으로 열지 않고 실행한다.
+이름 교체와 동시 inode 내용 변경은 별개이므로 caller는 실행 동안 내용 변경과
+artifact root 이름 교체를 막아야 한다. 이 API도 실행·공정성 허가를 뜻하지 않는다.
+
 FEN과 UCI 수순은 최소 형식만 검사한다. 실제 합법성·FEN 의미·완전 상태와 종료 판정은
 A의 Position과 E02 독립 참조에 연결한다. FEN-only 입력의 unknown prefix는 그대로 보존한다.
 runner 이름·정책 식별 문자열을 실제 지원 증거로 해석하지 않는다.

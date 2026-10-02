@@ -1,0 +1,16 @@
+{
+  "name": "cutoff-plan",
+  "argv": [
+    "${ARTIFACT_ROOT}/build/debug/rz-arena",
+    "plan",
+    "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-1/cutoff-input-lock.json",
+    "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-1/cutoff-plan.json",
+    "--max-pairs",
+    "1",
+    "--max-plan-bytes",
+    "1048576"
+  ],
+  "exit_code": 0,
+  "elapsed_ns": 16035550,
+  "expected_exit_code": 0
+}

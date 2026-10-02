@@ -1,0 +1,24 @@
+{
+  "name": "rustc-1.85.0-version",
+  "argv": [
+    "${RUSTC}",
+    "+1.85.0",
+    "--version",
+    "--verbose"
+  ],
+  "cwd": "${REPO_ROOT}",
+  "source_git_head": "9e49b6679aeab4e96be0f6b90e51e26a0c7a9ead",
+  "started_utc": "2026-10-02T17:20:26.055233+00:00",
+  "timeout_seconds": 90,
+  "stdout": "rustc-1.85.0-version.stdout.txt",
+  "stderr": "rustc-1.85.0-version.stderr.txt",
+  "output_capture": "original_unmodified_bytes",
+  "exit_code": 0,
+  "executed": true,
+  "timed_out": false,
+  "interrupted": false,
+  "termination_scope": "process_group",
+  "status": "passed",
+  "elapsed_seconds": 0.032491,
+  "finished_utc": "2026-10-02T17:20:26.087732+00:00"
+}

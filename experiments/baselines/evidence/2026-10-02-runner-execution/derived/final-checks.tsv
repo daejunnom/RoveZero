@@ -1,0 +1,9 @@
+check	exit_code	status	passed_tests	ignored_helpers	evidence_kind
+e01-fmt	0	passed	not_applicable	not_applicable	actual_software_check_with_synthetic_fixtures
+e01-test	0	passed	39	0	actual_software_check_with_synthetic_fixtures
+e01-clippy	0	passed	not_applicable	not_applicable	actual_software_check_with_synthetic_fixtures
+arena-fmt	0	passed	not_applicable	not_applicable	actual_software_check_with_synthetic_fixtures
+arena-test	0	passed	101	10	actual_software_check_with_synthetic_fixtures
+arena-clippy	0	passed	not_applicable	not_applicable	actual_software_check_with_synthetic_fixtures
+e01-msrv-1.85.0	0	passed	not_applicable	not_applicable	actual_software_check_with_synthetic_fixtures
+arena-msrv-1.90.0	0	passed	not_applicable	not_applicable	actual_software_check_with_synthetic_fixtures

@@ -1,0 +1,292 @@
+{
+  "source_commit": "9e49b6679aeab4e96be0f6b90e51e26a0c7a9ead",
+  "rules_source_commit": "118dc0311a88e143be285703940321dc16261f6a",
+  "contract_source_commit": "67284c4f66f7a7ae9f46fa63dfd50e7410eb6845",
+  "runner_source_commit": "f618e34540f94f4719ad3817950618dabe441318",
+  "actual_process_execution": true,
+  "engines_and_results": "synthetic scripted fixture; no NN, GPU or strength claim",
+  "commands": [
+    {
+      "name": "build",
+      "argv": [
+        "${CARGO}",
+        "build",
+        "--manifest-path",
+        "crates/rz-arena/Cargo.toml",
+        "--all-features",
+        "--bins",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "elapsed_ns": 1123591822,
+      "expected_exit_code": 0
+    },
+    {
+      "name": "build-input",
+      "argv": [
+        "${CARGO}",
+        "build",
+        "--manifest-path",
+        "crates/rz-experiments/Cargo.toml",
+        "--bins",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "elapsed_ns": 64100860,
+      "expected_exit_code": 0
+    },
+    {
+      "name": "normal-lock",
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-experiments",
+        "lock",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/normal-input.json",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/normal-input-lock.json"
+      ],
+      "exit_code": 0,
+      "elapsed_ns": 7884879,
+      "expected_exit_code": 0
+    },
+    {
+      "name": "normal-plan",
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "plan",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/normal-input-lock.json",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/normal-plan.json",
+        "--max-pairs",
+        "1",
+        "--max-plan-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "elapsed_ns": 15753796,
+      "expected_exit_code": 0
+    },
+    {
+      "name": "normal",
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "fixture-pair",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/normal-plan.json",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4",
+        "attempt-normal",
+        "--max-pairs",
+        "1",
+        "--max-plan-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "elapsed_ns": 1570577359,
+      "expected_exit_code": 0
+    },
+    {
+      "name": "normal-ledger-audit",
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "audit",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/normal-plan.json",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/attempt-normal/ledger.jsonl",
+        "--max-pairs",
+        "1",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "4",
+        "--max-ledger-bytes",
+        "65536"
+      ],
+      "exit_code": 0,
+      "elapsed_ns": 15902361,
+      "expected_exit_code": 0
+    },
+    {
+      "name": "cutoff-lock",
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-experiments",
+        "lock",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/cutoff-input.json",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/cutoff-input-lock.json"
+      ],
+      "exit_code": 0,
+      "elapsed_ns": 7632294,
+      "expected_exit_code": 0
+    },
+    {
+      "name": "cutoff-plan",
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "plan",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/cutoff-input-lock.json",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/cutoff-plan.json",
+        "--max-pairs",
+        "1",
+        "--max-plan-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "elapsed_ns": 15722397,
+      "expected_exit_code": 0
+    },
+    {
+      "name": "cutoff",
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "fixture-pair",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/cutoff-plan.json",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4",
+        "attempt-cutoff",
+        "--max-pairs",
+        "1",
+        "--max-plan-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "elapsed_ns": 1620581547,
+      "expected_exit_code": 0
+    },
+    {
+      "name": "cutoff-ledger-audit",
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "audit",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/cutoff-plan.json",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/attempt-cutoff/ledger.jsonl",
+        "--max-pairs",
+        "1",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "4",
+        "--max-ledger-bytes",
+        "65536"
+      ],
+      "exit_code": 0,
+      "elapsed_ns": 7851573,
+      "expected_exit_code": 0
+    },
+    {
+      "name": "cancel-lock",
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-experiments",
+        "lock",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/cancel-input.json",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/cancel-input-lock.json"
+      ],
+      "exit_code": 0,
+      "elapsed_ns": 7696022,
+      "expected_exit_code": 0
+    },
+    {
+      "name": "cancel-plan",
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "plan",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/cancel-input-lock.json",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/cancel-plan.json",
+        "--max-pairs",
+        "1",
+        "--max-plan-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "elapsed_ns": 17041453,
+      "expected_exit_code": 0
+    },
+    {
+      "name": "cancel",
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "fixture-pair",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4/cancel-plan.json",
+        "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-4",
+        "attempt-cancel",
+        "--max-pairs",
+        "1",
+        "--max-plan-bytes",
+        "1048576"
+      ],
+      "exit_code": 2,
+      "elapsed_ns": 968191178,
+      "expected_exit_code": 2
+    }
+  ],
+  "cases": {
+    "normal": {
+      "process_stop": "exited",
+      "summary": {
+        "attempts": 1,
+        "candidate_engine": "candidate-fixture",
+        "closed_attempts": 1,
+        "completed_pairs": 1,
+        "draws": 0,
+        "excluded_pairs": 0,
+        "execution_ready": false,
+        "failure_counts": {
+          "contract_invalid": 0,
+          "crash": 0,
+          "illegal_move": 0,
+          "incomplete": 0,
+          "infrastructure_invalid": 0,
+          "simultaneous_failure": 0,
+          "timeout": 0
+        },
+        "input_sha256": "0bbeb9d67dd7bd3b8b28abe6add1dd2a33bf07d493cf6f449dd53ca36296ca88",
+        "interpretation_blocked": false,
+        "losses": 1,
+        "n": [
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        "pending_pairs": 0,
+        "plan_sha256": "bac4a63479a267ce248cd8a1c117384941880309de9c8b0a86b01917f7bbefde",
+        "planned_pairs": 1,
+        "recorded_games": 2,
+        "wins": 1
+      }
+    },
+    "cutoff": {
+      "process_stop": "exited",
+      "summary": {
+        "attempts": 1,
+        "candidate_engine": "candidate-fixture",
+        "closed_attempts": 1,
+        "completed_pairs": 0,
+        "draws": 0,
+        "excluded_pairs": 1,
+        "execution_ready": false,
+        "failure_counts": {
+          "contract_invalid": 0,
+          "crash": 0,
+          "illegal_move": 0,
+          "incomplete": 2,
+          "infrastructure_invalid": 0,
+          "simultaneous_failure": 0,
+          "timeout": 0
+        },
+        "input_sha256": "ca926dac7ff50527178ffa06c2460ab70f32ed2fcb2545ebb5f6ead21cc013e9",
+        "interpretation_blocked": false,
+        "losses": 0,
+        "n": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "pending_pairs": 0,
+        "plan_sha256": "f898d38accbe320ae8f3333c5019ef1a0d96875ae438accec7581400097f06e8",
+        "planned_pairs": 1,
+        "recorded_games": 2,
+        "wins": 0
+      }
+    }
+  },
+  "binaries_excluded_from_public_evidence": [
+    "fastchess",
+    "fixture-engine"
+  ]
+}

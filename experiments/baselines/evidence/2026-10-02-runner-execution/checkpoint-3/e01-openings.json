@@ -1,0 +1,13 @@
+[
+  {
+    "id": "startpos-fixture",
+    "initial": "startpos",
+    "fen": null,
+    "moves": [
+      "e2e4",
+      "e7e5"
+    ],
+    "history": "complete",
+    "history_origin": "startpos-plus-declared-moves"
+  }
+]

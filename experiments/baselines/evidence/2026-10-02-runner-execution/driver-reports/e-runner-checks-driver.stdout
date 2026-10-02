@@ -1,0 +1,9 @@
+e01-fmt: passed
+e01-test: passed
+e01-clippy: passed
+arena-fmt: passed
+arena-test: passed
+arena-clippy: passed
+e01-msrv-1.85.0: passed
+arena-msrv-1.90.0: passed
+original evidence: ${ARTIFACT_ROOT}/reports/e-runner-final-checks

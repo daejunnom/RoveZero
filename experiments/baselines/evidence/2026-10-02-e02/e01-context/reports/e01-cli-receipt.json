@@ -1,0 +1,43 @@
+{
+  "scope": "E01 synthetic input preflight only",
+  "commands": [
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-experiments",
+        "validate",
+        "experiments/baselines/fixtures/e01-input.json"
+      ],
+      "exit_code": 0,
+      "stdout": "manifest valid; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-experiments",
+        "lock",
+        "experiments/baselines/fixtures/e01-input.json",
+        "${ARTIFACT_ROOT}/runs/e01-input-lock.json"
+      ],
+      "exit_code": 0,
+      "stdout": "input locked; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-experiments",
+        "verify",
+        "${ARTIFACT_ROOT}/runs/e01-input-lock.json",
+        "--artifact-root",
+        "experiments/baselines/fixtures",
+        "--max-artifact-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "locked input integrity and artifacts verified; execution_ready=false\n",
+      "stderr": ""
+    }
+  ],
+  "input_sha256_python": "3763c90ba72e8bf412a84bd187fa2d6e7973994e0a31df3c2c3795075493e567",
+  "cargo_lock_sha256": "3f0688d9b1c467bde89a16b69577255c8f50883f8de5f4ff02cf21eabaa01f9b",
+  "execution_ready": false
+}

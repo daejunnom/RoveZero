@@ -1,0 +1,133 @@
+{
+  "schema": "rovezero-e-checks-supplemental-v1",
+  "recorded_after_checks": true,
+  "recorded_utc": "2026-10-02T17:20:26.104254+00:00",
+  "original_checks_file": "checks-result.json",
+  "original_checks_source_git_head": "9e49b6679aeab4e96be0f6b90e51e26a0c7a9ead",
+  "original_checks_result_sha256": "224e71a520f1ae4a2b7cf36bfe258090169bfcbf89635c68595d246ede060cf7",
+  "original_checks_unchanged": true,
+  "original_checks_not_rerun": true,
+  "source_git_head": "9e49b6679aeab4e96be0f6b90e51e26a0c7a9ead",
+  "source_head_capture": {
+    "name": "supplemental-source-head",
+    "argv": [
+      "git",
+      "rev-parse",
+      "--verify",
+      "HEAD"
+    ],
+    "cwd": "${REPO_ROOT}",
+    "source_git_head": null,
+    "started_utc": "2026-10-02T17:20:26.013231+00:00",
+    "timeout_seconds": 90,
+    "stdout": "supplemental-source-head.stdout.txt",
+    "stderr": "supplemental-source-head.stderr.txt",
+    "output_capture": "original_unmodified_bytes",
+    "exit_code": 0,
+    "executed": true,
+    "timed_out": false,
+    "interrupted": false,
+    "termination_scope": "process_group",
+    "status": "passed",
+    "elapsed_seconds": 0.008454,
+    "finished_utc": "2026-10-02T17:20:26.021697+00:00"
+  },
+  "capture_script_sha256": "a2e61a460e1d562439b01d647277ff15d0c7d87421440eb50b508d2c677cfd08",
+  "cargo_locks": {
+    "start": {
+      "status": "not_captured",
+      "reason": "Snapshot feature was added after the original eight checks"
+    },
+    "end": {
+      "rz-experiments": {
+        "source": "crates/rz-experiments/Cargo.lock",
+        "file": "inputs/end/rz-experiments.Cargo.lock",
+        "sha256": "3f0688d9b1c467bde89a16b69577255c8f50883f8de5f4ff02cf21eabaa01f9b",
+        "bytes": 14128
+      },
+      "rz-arena": {
+        "source": "crates/rz-arena/Cargo.lock",
+        "file": "inputs/end/rz-arena.Cargo.lock",
+        "sha256": "fb3be0083f421a19a4bf8a2ff98f52feacd66b30d4a3f9da4b7d5fe5522014c4",
+        "bytes": 15712
+      }
+    },
+    "comparison": "unavailable_without_start_snapshot"
+  },
+  "tool_versions": [
+    {
+      "name": "rustc-default-version",
+      "argv": [
+        "${RUSTC}",
+        "--version",
+        "--verbose"
+      ],
+      "cwd": "${REPO_ROOT}",
+      "source_git_head": "9e49b6679aeab4e96be0f6b90e51e26a0c7a9ead",
+      "started_utc": "2026-10-02T17:20:26.022367+00:00",
+      "timeout_seconds": 90,
+      "stdout": "rustc-default-version.stdout.txt",
+      "stderr": "rustc-default-version.stderr.txt",
+      "output_capture": "original_unmodified_bytes",
+      "exit_code": 0,
+      "executed": true,
+      "timed_out": false,
+      "interrupted": false,
+      "termination_scope": "process_group",
+      "status": "passed",
+      "elapsed_seconds": 0.032601,
+      "finished_utc": "2026-10-02T17:20:26.054974+00:00"
+    },
+    {
+      "name": "rustc-1.85.0-version",
+      "argv": [
+        "${RUSTC}",
+        "+1.85.0",
+        "--version",
+        "--verbose"
+      ],
+      "cwd": "${REPO_ROOT}",
+      "source_git_head": "9e49b6679aeab4e96be0f6b90e51e26a0c7a9ead",
+      "started_utc": "2026-10-02T17:20:26.055233+00:00",
+      "timeout_seconds": 90,
+      "stdout": "rustc-1.85.0-version.stdout.txt",
+      "stderr": "rustc-1.85.0-version.stderr.txt",
+      "output_capture": "original_unmodified_bytes",
+      "exit_code": 0,
+      "executed": true,
+      "timed_out": false,
+      "interrupted": false,
+      "termination_scope": "process_group",
+      "status": "passed",
+      "elapsed_seconds": 0.032491,
+      "finished_utc": "2026-10-02T17:20:26.087732+00:00"
+    },
+    {
+      "name": "rustc-1.90.0-version",
+      "argv": [
+        "${RUSTC}",
+        "+1.90.0",
+        "--version",
+        "--verbose"
+      ],
+      "cwd": "${REPO_ROOT}",
+      "source_git_head": "9e49b6679aeab4e96be0f6b90e51e26a0c7a9ead",
+      "started_utc": "2026-10-02T17:20:26.087965+00:00",
+      "timeout_seconds": 90,
+      "stdout": "rustc-1.90.0-version.stdout.txt",
+      "stderr": "rustc-1.90.0-version.stderr.txt",
+      "output_capture": "original_unmodified_bytes",
+      "exit_code": 0,
+      "executed": true,
+      "timed_out": false,
+      "interrupted": false,
+      "termination_scope": "process_group",
+      "status": "passed",
+      "elapsed_seconds": 0.016033,
+      "finished_utc": "2026-10-02T17:20:26.104006+00:00"
+    }
+  ],
+  "tool_versions_recorded_after_checks": true,
+  "dependency_source_or_binary_payloads_in_report": false,
+  "status": "passed"
+}

@@ -1,0 +1,38 @@
+{
+  "execution_ready": false,
+  "summary": {
+    "attempts": 1,
+    "candidate_engine": "candidate-fixture",
+    "closed_attempts": 1,
+    "completed_pairs": 0,
+    "draws": 0,
+    "excluded_pairs": 1,
+    "execution_ready": false,
+    "failure_counts": {
+      "contract_invalid": 0,
+      "crash": 0,
+      "illegal_move": 0,
+      "incomplete": 2,
+      "infrastructure_invalid": 0,
+      "simultaneous_failure": 0,
+      "timeout": 0
+    },
+    "input_sha256": "28addf1e9967422c7f2e57b151eac45f6a375e43bc763c9400eec3bf67532cea",
+    "interpretation_blocked": false,
+    "losses": 0,
+    "n": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "pending_pairs": 0,
+    "plan_sha256": "6477ca4a756b15b303887c285ca3ad67eb20889733a03b395f2d04868d86c04e",
+    "planned_pairs": 1,
+    "recorded_games": 2,
+    "wins": 0
+  },
+  "tip_sha256": "c93ba4943e9c2bc943e0d8a086126d59662763c19be517d3d3ec545c7c4a9091",
+  "validation_scope": "structural_only"
+}

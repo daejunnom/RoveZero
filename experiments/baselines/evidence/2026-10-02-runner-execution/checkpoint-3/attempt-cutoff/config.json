@@ -1,0 +1,163 @@
+{
+    "resign": {
+        "move_count": 1,
+        "score": 0,
+        "twosided": false,
+        "enabled": false
+    },
+    "draw": {
+        "move_number": 0,
+        "move_count": 1,
+        "score": 0,
+        "enabled": false
+    },
+    "maxmoves": {
+        "move_count": 2,
+        "enabled": true
+    },
+    "tb_adjudication": {
+        "syzygy_dirs": "",
+        "max_pieces": 0,
+        "ignore_50_move_rule": false,
+        "enabled": false
+    },
+    "opening": {
+        "file": "/proc/19458/fd/8/opening.pgn",
+        "format": 1,
+        "order": 1,
+        "plies": 2,
+        "start": 1
+    },
+    "pgn": {
+        "additional_lines_rgx": [],
+        "event_name": "Fastchess Tournament",
+        "site": "?",
+        "file": "/proc/19458/fd/8/match.pgn",
+        "notation": 2,
+        "append_file": false,
+        "track_nodes": false,
+        "track_seldepth": false,
+        "track_nps": false,
+        "track_hashfull": false,
+        "track_tbhits": false,
+        "track_timeleft": true,
+        "track_latency": true,
+        "track_pv": false,
+        "min": false,
+        "crc": false
+    },
+    "epd": {
+        "file": "",
+        "append_file": true
+    },
+    "sprt": {
+        "alpha": 0.0,
+        "beta": 0.0,
+        "elo0": 0.0,
+        "elo1": 0.0,
+        "model": "normalized",
+        "enabled": false
+    },
+    "config_name": "config.json",
+    "output": 0,
+    "seed": 1,
+    "variant": 0,
+    "type": 0,
+    "gauntlet_seeds": 1,
+    "ratinginterval": 2147483647,
+    "scoreinterval": 1,
+    "wait": 0,
+    "autosaveinterval": 0,
+    "games": 2,
+    "rounds": 1,
+    "concurrency": 1,
+    "force_concurrency": false,
+    "recover": false,
+    "noswap": false,
+    "reverse": false,
+    "report_penta": true,
+    "affinity": false,
+    "check_mate_pvs": false,
+    "show_latency": false,
+    "log": {
+        "file": "/proc/self/fd/1",
+        "level": 1,
+        "append_file": true,
+        "compress": false,
+        "realtime": true,
+        "engine_coms": true
+    },
+    "engines": [
+        {
+            "name": "baseline-fixture",
+            "dir": "",
+            "cmd": "/proc/19458/fd/7",
+            "args": "",
+            "restart": true,
+            "options": [
+                [
+                    "Ponder",
+                    "false"
+                ],
+                [
+                    "Threads",
+                    "1"
+                ]
+            ],
+            "limit": {
+                "tc": {
+                    "increment": 0,
+                    "fixed_time": 0,
+                    "time": 1000,
+                    "moves": 0,
+                    "timemargin": 10
+                },
+                "nodes": 0,
+                "plies": 0
+            },
+            "variant": 0
+        },
+        {
+            "name": "candidate-fixture",
+            "dir": "",
+            "cmd": "/proc/19458/fd/6",
+            "args": "",
+            "restart": true,
+            "options": [
+                [
+                    "Ponder",
+                    "false"
+                ],
+                [
+                    "Threads",
+                    "1"
+                ]
+            ],
+            "limit": {
+                "tc": {
+                    "increment": 0,
+                    "fixed_time": 0,
+                    "time": 1000,
+                    "moves": 0,
+                    "timemargin": 10
+                },
+                "nodes": 0,
+                "plies": 0
+            },
+            "variant": 0
+        }
+    ],
+    "stats": {
+        "baseline-fixture vs candidate-fixture": {
+            "wins": 0,
+            "losses": 0,
+            "draws": 2,
+            "penta_WW": 0,
+            "penta_WD": 0,
+            "penta_WL": 0,
+            "penta_DD": 1,
+            "penta_LD": 0,
+            "penta_LL": 0
+        }
+    }
+}

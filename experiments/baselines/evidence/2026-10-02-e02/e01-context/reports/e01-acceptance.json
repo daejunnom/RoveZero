@@ -1,0 +1,112 @@
+{
+  "task": "TASK-E01",
+  "scope": "synthetic input preflight only",
+  "created_utc": "2026-10-02T15:56:05.317412+00:00",
+  "base_revision": "9f0bc598f6b2d8f863fd46af6a4fd73bfef1f0b8",
+  "implementation_revision": "c2f944f1794b44081905b4019643f6b2978d8feb",
+  "pull_request": "https://github.com/daejunnom/RoveZero/pull/8",
+  "commands": [
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-experiments",
+        "validate",
+        "experiments/baselines/fixtures/e01-input.json"
+      ],
+      "exit_code": 0,
+      "stdout": "manifest valid; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-experiments",
+        "lock",
+        "experiments/baselines/fixtures/e01-input.json",
+        "${ARTIFACT_ROOT}/runs/e01-input-lock-final.json"
+      ],
+      "exit_code": 0,
+      "stdout": "input locked; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-experiments",
+        "verify",
+        "${ARTIFACT_ROOT}/runs/e01-input-lock-final.json",
+        "--artifact-root",
+        "experiments/baselines/fixtures",
+        "--max-artifact-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "locked input integrity and artifacts verified; execution_ready=false\n",
+      "stderr": ""
+    }
+  ],
+  "input_sha256_python": "3763c90ba72e8bf412a84bd187fa2d6e7973994e0a31df3c2c3795075493e567",
+  "cli_binary_sha256": "39dad2e085f3c5217c63dd56a95da06f6954b88d8b6d2312f209279bcf5763a9",
+  "cargo_lock_sha256": "3f0688d9b1c467bde89a16b69577255c8f50883f8de5f4ff02cf21eabaa01f9b",
+  "checks": [
+    {
+      "check": "fmt",
+      "argv": [
+        "${CARGO}",
+        "fmt",
+        "--manifest-path",
+        "crates/rz-experiments/Cargo.toml",
+        "--",
+        "--check"
+      ],
+      "exit_code": 0,
+      "log": "reports/e01-fmt.log"
+    },
+    {
+      "check": "test",
+      "argv": [
+        "${CARGO}",
+        "test",
+        "--manifest-path",
+        "crates/rz-experiments/Cargo.toml",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "log": "reports/e01-test.log"
+    },
+    {
+      "check": "clippy",
+      "argv": [
+        "${CARGO}",
+        "clippy",
+        "--manifest-path",
+        "crates/rz-experiments/Cargo.toml",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "log": "reports/e01-clippy.log"
+    },
+    {
+      "check": "msrv-1.85",
+      "argv": [
+        "${CARGO}",
+        "+1.85.0",
+        "check",
+        "--manifest-path",
+        "crates/rz-experiments/Cargo.toml",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "log": "reports/e01-msrv-1.85.log"
+    }
+  ],
+  "execution_ready": false,
+  "not_run": [
+    "actual engine games",
+    "NN reference",
+    "GPU inference",
+    "statistics computation",
+    "CI"
+  ]
+}

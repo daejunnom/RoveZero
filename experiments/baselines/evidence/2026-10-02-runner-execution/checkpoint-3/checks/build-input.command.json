@@ -1,0 +1,14 @@
+{
+  "name": "build-input",
+  "argv": [
+    "${CARGO}",
+    "build",
+    "--manifest-path",
+    "crates/rz-experiments/Cargo.toml",
+    "--bins",
+    "--locked"
+  ],
+  "exit_code": 0,
+  "elapsed_ns": 64106620,
+  "expected_exit_code": 0
+}

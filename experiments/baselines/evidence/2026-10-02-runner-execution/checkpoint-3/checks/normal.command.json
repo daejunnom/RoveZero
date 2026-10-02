@@ -1,0 +1,17 @@
+{
+  "name": "normal",
+  "argv": [
+    "${ARTIFACT_ROOT}/build/debug/rz-arena",
+    "fixture-pair",
+    "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-3/normal-plan.json",
+    "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-3",
+    "attempt-normal",
+    "--max-pairs",
+    "1",
+    "--max-plan-bytes",
+    "1048576"
+  ],
+  "exit_code": 0,
+  "elapsed_ns": 1675702699,
+  "expected_exit_code": 0
+}

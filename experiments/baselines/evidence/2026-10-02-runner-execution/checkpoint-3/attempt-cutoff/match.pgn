@@ -1,0 +1,50 @@
+[Event "Fastchess Tournament"]
+[Site "?"]
+[Date "2026.10.02"]
+[Round "1"]
+[White "baseline-fixture"]
+[Black "candidate-fixture"]
+[Result "1/2-1/2"]
+[EngineWhiteName "RoveZero SYNTHETIC ScholarMate fixture (no NN, no search)"]
+[EngineWhiteAuthor "RoveZero synthetic test fixtures"]
+[EngineBlackName "RoveZero SYNTHETIC ScholarMate fixture (no NN, no search)"]
+[EngineBlackAuthor "RoveZero synthetic test fixtures"]
+[GameDuration "00:00:00"]
+[GameStartTime "2026-10-02T17:07:18 +0000"]
+[GameEndTime "2026-10-02T17:07:18 +0000"]
+[PlyCount "6"]
+[Termination "adjudication"]
+[TimeControl "1"]
+[ECO "C20"]
+[Opening "King's Pawn Game: Wayward Queen Attack"]
+
+1. e2e4 {book} e7e5 {book} 2. d1h5 {/0 0.000s, tl=0.000s, latency=0.000s}
+b8c6 {/0 0.000s, tl=0.000s, latency=0.000s}
+3. f1c4 {/0 0.000s, tl=0.000s, latency=0.000s}
+g8f6 {/0 0.000s, tl=0.000s, latency=0.000s, Draw by adjudication} 1/2-1/2
+
+[Event "Fastchess Tournament"]
+[Site "?"]
+[Date "2026.10.02"]
+[Round "1"]
+[White "candidate-fixture"]
+[Black "baseline-fixture"]
+[Result "1/2-1/2"]
+[EngineWhiteName "RoveZero SYNTHETIC ScholarMate fixture (no NN, no search)"]
+[EngineWhiteAuthor "RoveZero synthetic test fixtures"]
+[EngineBlackName "RoveZero SYNTHETIC ScholarMate fixture (no NN, no search)"]
+[EngineBlackAuthor "RoveZero synthetic test fixtures"]
+[GameDuration "00:00:00"]
+[GameStartTime "2026-10-02T17:07:18 +0000"]
+[GameEndTime "2026-10-02T17:07:18 +0000"]
+[PlyCount "6"]
+[Termination "adjudication"]
+[TimeControl "1"]
+[ECO "C20"]
+[Opening "King's Pawn Game: Wayward Queen Attack"]
+
+1. e2e4 {book} e7e5 {book} 2. d1h5 {/0 0.000s, tl=0.000s, latency=0.000s}
+b8c6 {/0 0.000s, tl=0.000s, latency=0.000s}
+3. f1c4 {/0 0.000s, tl=0.000s, latency=0.000s}
+g8f6 {/0 0.000s, tl=0.000s, latency=0.000s, Draw by adjudication} 1/2-1/2
+

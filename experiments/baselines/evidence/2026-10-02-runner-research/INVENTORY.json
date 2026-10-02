@@ -1,0 +1,451 @@
+{
+  "inventory_version": 1,
+  "checkpoint_created_utc": "2026-10-02T17:05:35.189870+00:00",
+  "scope": "historical external runner research with synthetic UCI fixture",
+  "preservation_repository_revision": "fcbe8b25d53ee96f48ca8dafd227e7c46f8d90ab",
+  "inventory_self_excluded_from_hash_list": true,
+  "originals_not_deleted": true,
+  "scan": {
+    "sources": "only ${ARTIFACT_ROOT}/runs and reports",
+    "private_key_or_provider_token_signals": 0,
+    "email_or_host_account_signals": 0,
+    "environment_path_redactions_applied": true,
+    "binary_or_nul_files_copied": 0
+  },
+  "excluded_classes": [
+    "binaries",
+    "Cargo build cache",
+    "external tool checkouts",
+    "external weights/data",
+    "personal secrets"
+  ],
+  "files": [
+    {
+      "file": "README.md",
+      "sha256": "4206701cfbecc5e59fef918d396f3b3034c29a49274d2c1ab3e98dd3ed8cdc32",
+      "bytes": 2565,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "generated at preservation after original run",
+      "actual_vs_synthetic": "preservation documentation generated later",
+      "origin": "generated_after_preservation",
+      "redactions": []
+    },
+    {
+      "file": "REPRODUCE.md",
+      "sha256": "d1efd8203784d98a14cf4b830599d437c46d78b746ff4bfb654ed1135487f621",
+      "bytes": 1963,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "generated at preservation after original run",
+      "actual_vs_synthetic": "newly authored reproduction instructions, not original executed commands",
+      "origin": "generated_after_preservation",
+      "redactions": []
+    },
+    {
+      "file": "reports/REPORT.md",
+      "sha256": "f83660afab72c01b744d3864349a3d5543347c8b16b1a218ed8997da1889d487",
+      "bytes": 7608,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported source execution revision",
+      "actual_vs_synthetic": "actual external CPU runner probe with synthetic UCI fixture; no NN/GPU/strength evidence",
+      "origin": "preserved_source",
+      "redactions": [
+        {
+          "category": "artifact_environment_root",
+          "replacement": "${ARTIFACT_ROOT}",
+          "count": 1,
+          "original_retained_outside_repository": true
+        }
+      ],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/REPORT.md",
+      "source_bytes": 7623,
+      "source_sha256": "d8538126c422a8e64e92028e919577485b011929c7bce23bdbe747c0352e6fa2",
+      "content_preservation": "sanitized_raw_text"
+    },
+    {
+      "file": "reports/config.json",
+      "sha256": "0ef736c524022381c6f57c7410f76084257c39f6046c1f29ef792c4f3aeec2e4",
+      "bytes": 4326,
+      "media_type": "application/json",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [
+        {
+          "category": "artifact_environment_root",
+          "replacement": "${ARTIFACT_ROOT}",
+          "count": 4,
+          "original_retained_outside_repository": true
+        }
+      ],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/config.json",
+      "source_bytes": 4386,
+      "source_sha256": "476e6a33173874aabbad7c2cf7d292f88ad1879483d6a0656802c65c724847b8",
+      "content_preservation": "sanitized_raw_text"
+    },
+    {
+      "file": "reports/fastchess-build-and-smoke.json",
+      "sha256": "830cb518b6e445a0fc2c2572db128aec6a15207e93a0bcd4b6394aa5cea97671",
+      "bytes": 2353,
+      "media_type": "application/json",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [
+        {
+          "category": "artifact_environment_root",
+          "replacement": "${ARTIFACT_ROOT}",
+          "count": 1,
+          "original_retained_outside_repository": true
+        }
+      ],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/fastchess-build-and-smoke.json",
+      "source_bytes": 2368,
+      "source_sha256": "b3af979516ac39db128be2f2806b18d8935ea539021346e7e063bfa0fa627fff",
+      "content_preservation": "sanitized_raw_text"
+    },
+    {
+      "file": "reports/fastchess-help.txt",
+      "sha256": "81ab228bb50195927319c62af47109c5de76ddf1223d48cf5b7b838a3e80027d",
+      "bytes": 16920,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/fastchess-help.txt",
+      "source_bytes": 16920,
+      "source_sha256": "81ab228bb50195927319c62af47109c5de76ddf1223d48cf5b7b838a3e80027d",
+      "content_preservation": "byte_identical"
+    },
+    {
+      "file": "reports/pre-stdout-log/REPORT.md",
+      "sha256": "ea9dc5f2eb5745030bb045bd0e30ccca093c52f99b5b7ffa960dc9ad8d2463da",
+      "bytes": 6722,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [
+        {
+          "category": "artifact_environment_root",
+          "replacement": "${ARTIFACT_ROOT}",
+          "count": 1,
+          "original_retained_outside_repository": true
+        }
+      ],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/REPORT.md",
+      "source_bytes": 6737,
+      "source_sha256": "09182fe309d07698de6f202e2baacc8185bd16c30300cfb6dd1a2e5136e2a4b2",
+      "content_preservation": "sanitized_raw_text",
+      "snapshot_note": "previous capture before research stdout-log probe updated the external report; retained without deletion"
+    },
+    {
+      "file": "reports/prefix-opening.pgn",
+      "sha256": "7e314a5adf23de16bb2da7810ad138c4317a628d1cd51bc8376bfbe4dda89a8a",
+      "bytes": 172,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/prefix-opening.pgn",
+      "source_bytes": 172,
+      "source_sha256": "7e314a5adf23de16bb2da7810ad138c4317a628d1cd51bc8376bfbe4dda89a8a",
+      "content_preservation": "byte_identical"
+    },
+    {
+      "file": "reports/smoke-pair.log",
+      "sha256": "8c167a0363617a78526b58b739a55c6bab67ea4161836a04b5cb5d6c8a952262",
+      "bytes": 30776,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [
+        {
+          "category": "artifact_environment_root",
+          "replacement": "${ARTIFACT_ROOT}",
+          "count": 4,
+          "original_retained_outside_repository": true
+        }
+      ],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/smoke-pair.log",
+      "source_bytes": 30836,
+      "source_sha256": "5685eaaead01467debeea10af1ca9fcc0bd037b14fd6712252c7a7c272936a39",
+      "content_preservation": "sanitized_raw_text"
+    },
+    {
+      "file": "reports/smoke-pair.pgn",
+      "sha256": "c282b2a62a0d1c27e4da7db1195be8354fc3bf7326872507792d35521565d324",
+      "bytes": 1592,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/smoke-pair.pgn",
+      "source_bytes": 1592,
+      "source_sha256": "c282b2a62a0d1c27e4da7db1195be8354fc3bf7326872507792d35521565d324",
+      "content_preservation": "byte_identical"
+    },
+    {
+      "file": "reports/smoke-pair.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/smoke-pair.stderr",
+      "source_bytes": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "content_preservation": "byte_identical"
+    },
+    {
+      "file": "reports/smoke-pair.stdout",
+      "sha256": "d7d7f57e23be5987adcc7c75c33a38382cf91ad06065fda80e33af7a80e64498",
+      "bytes": 710,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/smoke-pair.stdout",
+      "source_bytes": 710,
+      "source_sha256": "d7d7f57e23be5987adcc7c75c33a38382cf91ad06065fda80e33af7a80e64498",
+      "content_preservation": "byte_identical"
+    },
+    {
+      "file": "reports/smoke-stdout-log.argv.json",
+      "sha256": "f31e09bfce1d4b5632a68d711d838281937b5e80e9af9b469680729e34d9c09f",
+      "bytes": 1133,
+      "media_type": "application/json",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [
+        {
+          "category": "artifact_environment_root",
+          "replacement": "${ARTIFACT_ROOT}",
+          "count": 5,
+          "original_retained_outside_repository": true
+        }
+      ],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/smoke-stdout-log.argv.json",
+      "source_bytes": 1208,
+      "source_sha256": "227030fa9448862ef6481f4b5fa90fe7bf5de7ba709ebbf4ac5ad528c8db2958",
+      "content_preservation": "sanitized_raw_text"
+    },
+    {
+      "file": "reports/smoke-stdout-log.pgn",
+      "sha256": "f6042b155c9443d7522f416b556f000e7d7eeb43f8cb1aeebe12195d92185115",
+      "bytes": 1578,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/smoke-stdout-log.pgn",
+      "source_bytes": 1578,
+      "source_sha256": "f6042b155c9443d7522f416b556f000e7d7eeb43f8cb1aeebe12195d92185115",
+      "content_preservation": "byte_identical"
+    },
+    {
+      "file": "reports/smoke-stdout-log.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/smoke-stdout-log.stderr",
+      "source_bytes": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "content_preservation": "byte_identical"
+    },
+    {
+      "file": "reports/smoke-stdout-log.stdout",
+      "sha256": "aa89b73761fc21eabe738baaa929f93e866caff19c53788df3b6efe4a068b1c3",
+      "bytes": 31551,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [
+        {
+          "category": "artifact_environment_root",
+          "replacement": "${ARTIFACT_ROOT}",
+          "count": 4,
+          "original_retained_outside_repository": true
+        }
+      ],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/smoke-stdout-log.stdout",
+      "source_bytes": 31611,
+      "source_sha256": "612d332b34cf3a73a20f203e08487123af1c76b9bdadf70630c658dad33f2c69",
+      "content_preservation": "sanitized_raw_text"
+    },
+    {
+      "file": "reports/smoke-t1-argv.json",
+      "sha256": "963db21ec3bd0545b73ac938696d4802e3a7c8d7069bce6ea93fd6631ad42514",
+      "bytes": 1165,
+      "media_type": "application/json",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [
+        {
+          "category": "artifact_environment_root",
+          "replacement": "${ARTIFACT_ROOT}",
+          "count": 6,
+          "original_retained_outside_repository": true
+        }
+      ],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/smoke-t1-argv.json",
+      "source_bytes": 1255,
+      "source_sha256": "1842e4fa302db6d474373ab3bb118747b0da815bbeae09307eca3a2c5a503fc6",
+      "content_preservation": "sanitized_raw_text"
+    },
+    {
+      "file": "reports/smoke-t1-pair.log",
+      "sha256": "e6b18a48634857cdc164c83b83f69dd610223ae2880399cb43768b8d73095583",
+      "bytes": 30928,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [
+        {
+          "category": "artifact_environment_root",
+          "replacement": "${ARTIFACT_ROOT}",
+          "count": 4,
+          "original_retained_outside_repository": true
+        }
+      ],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/smoke-t1-pair.log",
+      "source_bytes": 30988,
+      "source_sha256": "e5077e93b380a14bbdbd1eb31d4a117d7f3a62ed6bbc1a5e7d48f89364b22288",
+      "content_preservation": "sanitized_raw_text"
+    },
+    {
+      "file": "reports/smoke-t1-pair.pgn",
+      "sha256": "5c5594488f98cd930a4b93f0a6576e85bb1a2d4203f0d3d80989ed890565abee",
+      "bytes": 1596,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/smoke-t1-pair.pgn",
+      "source_bytes": 1596,
+      "source_sha256": "5c5594488f98cd930a4b93f0a6576e85bb1a2d4203f0d3d80989ed890565abee",
+      "content_preservation": "byte_identical"
+    },
+    {
+      "file": "reports/smoke-t1-pair.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/smoke-t1-pair.stderr",
+      "source_bytes": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "content_preservation": "byte_identical"
+    },
+    {
+      "file": "reports/smoke-t1-pair.stdout",
+      "sha256": "ddf8b016581748d179b44bb69a558571951296453d3e4d8bc0f51730c42201ca",
+      "bytes": 712,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/smoke-t1-pair.stdout",
+      "source_bytes": 712,
+      "source_sha256": "ddf8b016581748d179b44bb69a558571951296453d3e4d8bc0f51730c42201ca",
+      "content_preservation": "byte_identical"
+    },
+    {
+      "file": "reports/synthetic-uci.py",
+      "sha256": "9caf9b2fbd803b834d151d1dc3101bb3d0f51cf3a57085e2c83b22d55be048e2",
+      "bytes": 1131,
+      "media_type": "text/x-python",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "reported original execution source",
+      "actual_vs_synthetic": "actual external CPU runner observation with synthetic UCI fixture; no playing-strength or GPU evidence",
+      "origin": "preserved_source",
+      "redactions": [],
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/synthetic-uci.py",
+      "source_bytes": 1131,
+      "source_sha256": "9caf9b2fbd803b834d151d1dc3101bb3d0f51cf3a57085e2c83b22d55be048e2",
+      "content_preservation": "byte_identical"
+    },
+    {
+      "file": "reproduce-runner.py",
+      "sha256": "aade4c2017cbcd4446a67089934f1e50043b4c0228512d6aac635306a3789462",
+      "bytes": 1721,
+      "media_type": "text/plain; charset=utf-8",
+      "source_revision": "f618e34540f94f4719ad3817950618dabe441318",
+      "source_revision_basis": "generated at preservation after original run",
+      "actual_vs_synthetic": "new reproduction script; not executed during preservation",
+      "origin": "generated_after_preservation",
+      "redactions": []
+    }
+  ],
+  "preserved_file_bytes": 147222,
+  "missing_items": [
+    "original raw Fastchess compiler/build stdout/stderr: not saved in source reports",
+    "original first st=0.1 smoke exact argv vector: no saved argv file; reconstructed commands labeled later-generated",
+    "Cute Chess executable/build/run results: not executed",
+    "RoveZero contract-compliant clocks/actual engine strength/NN/GPU results: not verified"
+  ],
+  "excluded_references": [
+    {
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/cutechess-cli-man.txt",
+      "reason": "third-party GPLv3+ documentation reference; source URL and commit retained, no executed Cute Chess result",
+      "source_revision": "5e84232be4546aaedc9d87a96c91867a1da06ada",
+      "source_url": "https://github.com/cutechess/cutechess/tree/5e84232be4546aaedc9d87a96c91867a1da06ada",
+      "license": "GPL-3.0-or-later",
+      "original_not_deleted": true
+    },
+    {
+      "source_file": "${ARTIFACT_ROOT}/reports/runner-research/cutechess-readme.md",
+      "reason": "third-party GPLv3+ documentation reference; source URL and commit retained, no executed Cute Chess result",
+      "source_revision": "5e84232be4546aaedc9d87a96c91867a1da06ada",
+      "source_url": "https://github.com/cutechess/cutechess/tree/5e84232be4546aaedc9d87a96c91867a1da06ada",
+      "license": "GPL-3.0-or-later",
+      "original_not_deleted": true
+    }
+  ],
+  "snapshot_update_utc": "2026-10-02T17:12:44.693180+00:00",
+  "latest_added_or_updated_source_files": [
+    "reports/REPORT.md"
+  ],
+  "originals_not_deleted_by_preservation": true
+}

@@ -1,0 +1,161 @@
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 6 tests
+test tests::fault_modes_are_explicit_and_stop_can_end_a_withheld_reply ... ok
+test tests::newgame_resets_position_and_pending_work_but_preserves_seed_configuration ... ok
+test tests::line_reader_is_bounded_and_strict_utf8 ... ok
+test tests::position_parser_rejects_every_unregistered_variation ... ok
+test tests::unsupported_options_and_go_inputs_fail_without_a_reply ... ok
+test tests::normal_session_returns_the_declared_script_and_observed_options ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 10 tests
+test existing_outputs_are_preserved ... ok
+test ledger_bound_cannot_exceed_manifest_output_budget ... ok
+test expected_tip_is_audit_only_and_requires_lowercase_sha256 ... ok
+test audit_checkpoint_detects_wrong_tip_and_complete_record_suffix_removal ... ok
+test malformed_event_does_not_publish_a_new_ledger ... ok
+test incomplete_pair_does_not_receive_a_draw_score ... ok
+test plan_input_is_bounded_and_strict_utf8 ... ok
+test wrong_plan_and_partial_ledger_are_rejected ... ok
+test missing_unknown_and_invalid_bounds_fail_before_reading_files ... ok
+test synthetic_complete_pair_can_be_planned_recorded_and_audited ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+
+running 5 tests
+test common_error_mapping_keeps_stable_codes_stages_and_static_details ... ok
+test native_unsupported_schema_error_is_preserved_without_string_matching ... ok
+test whitespace_revisions_are_rejected_before_a_structural_plan_can_be_locked ... ok
+test exact_manifest_revision_imports_and_validates_the_native_schema ... ok
+test null_noncanonical_and_unsupported_revisions_never_pass_execution_admission ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 11 tests
+test constructs_native_non_utf8_engine_paths_without_lossy_conversion ... ok
+test constructs_the_verified_single_pair_interface_and_accounts_for_book_prefix ... ok
+test engine_group_order_matches_each_declared_first_game_in_both_plan_parities ... ok
+test preserves_requested_options_and_does_not_invent_hash_or_seed_application ... ok
+test rejects_path_token_injection_alias_output_epd_and_unknown_engine_commands ... ok
+test rejects_nonfixture_engines_weights_and_insufficient_process_capacity ... ok
+test rejects_unrepresentable_runner_deadlines_instead_of_wrapping_cpp_durations ... ok
+test rejects_limits_that_cannot_represent_the_full_opening_plus_searched_plies ... ok
+test rejects_engine_option_token_injection_unknown_rng_options_and_noncanonical_values ... ok
+test rejects_unknown_or_dirty_runner_profiles_and_contract_versions ... ok
+test rejects_unsupported_clock_increment_and_fractional_second_conversion ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 22 tests
+test attempt_game_order_membership_and_process_ids_are_strict_and_atomic ... ok
+test an_adjudication_boolean_never_unlocks_an_unspecified_policy ... ok
+test event_and_output_budgets_reject_without_mutating_the_previous_ledger ... ok
+test each_engine_failure_is_a_loss_not_an_infrastructure_retry ... ok
+test evidence_paths_identity_and_byte_budget_are_validated_atomically ... ok
+test contract_fault_blocks_new_starts_but_preserves_pending_records ... ok
+test exact_input_identity_reuse_does_not_charge_the_artifact_budget_twice ... ok
+test incomplete_pair_is_excluded_and_never_retried_or_scored_as_draw ... ok
+test hash_sequence_reordering_and_content_tampering_are_rejected ... ok
+test hand_counted_ll_dl_dd_wl_wd_ww_preserve_distinct_raw_outcomes ... ok
+test infrastructure_retry_replaces_entire_pair_without_salvaging_success ... ok
+test incomplete_or_engine_loss_cannot_be_hidden_by_an_infrastructure_retry ... ok
+test input_artifact_identity_cannot_be_replaced_by_an_evidence_declaration ... ok
+test input_budget_is_enforced_even_if_caller_requests_more_output_bytes ... ok
+test partial_pair_has_no_score_and_cannot_close ... ok
+test ledger_cannot_be_replayed_under_another_input_or_pair_plan ... ok
+test input_and_new_evidence_share_one_artifact_budget ... ok
+test large_direct_fields_are_rejected_before_hashing_or_serialization ... ok
+test terminal_reason_result_consistency_and_adjudication_policy_are_checked ... ok
+test truncated_missing_newline_duplicate_and_unknown_json_fields_are_rejected ... ok
+test unique_evidence_refs_share_the_aggregate_artifact_budget ... ok
+test trusted_tip_detects_deletion_of_a_complete_suffix ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 18 tests
+test a_fen_origin_keeps_black_turn_rights_counters_and_unknown_history ... ok
+test a_exact_stalemate_is_a_draw_and_a_threefold_claim_is_not_terminal ... ok
+test an_illegal_reply_is_not_applied_to_the_final_a_state ... ok
+test arbitrary_adjudication_timeout_text_and_ambiguous_abandoned_are_not_losses ... ok
+test en_passant_and_every_promotion_are_serialized_by_checked_a_moves ... ok
+test byte_ply_comment_and_header_budgets_are_enforced ... ok
+test a_automatic_draws_and_mate_priority_are_preserved_without_claim_adjudication ... ok
+test an_extra_missing_or_reordered_game_is_not_a_complete_pair ... ok
+test exact_mate_pair_has_real_fen_contract_identity_and_swapped_engine_names ... ok
+test missing_or_unmatched_shared_contract_revision_blocks_execution_audit ... ok
+test opening_book_preserves_full_startpos_prefix_and_uses_a_legal_san ... ok
+test exact_max_plies_adjudication_is_incomplete_and_never_a_scored_draw ... ok
+test pinned_fastchess_uci_movetext_is_checked_with_the_same_a_rules ... ok
+test fen_startpos_origin_remains_unknown_and_has_a_different_semantic_identity ... ok
+test labels_and_prefix_cannot_hide_a_different_position_or_result ... ok
+test unsupported_pgn_syntax_is_rejected_instead_of_skipped ... ok
+test the_ply_ceiling_keeps_one_a_claim_inspection_without_admitting_extra_moves ... ok
+test san_requires_the_disambiguation_that_a_legal_moves_establish ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+
+
+running 15 tests
+test alternating_execution_and_logical_slots_are_balanced_without_seed_overflow ... ok
+test changing_each_locked_seed_component_changes_the_derived_engine_seed ... ok
+test black_to_move_fen_rights_ep_counters_unknown_history_and_promotion_tokens_survive ... ok
+test declared_openings_repeat_round_robin_and_alias_ids_share_one_input_cluster ... ok
+test a_recomputed_checksum_cannot_authorize_an_inconsistent_derived_pair ... ok
+test duplicate_keys_and_unknown_fields_cannot_hide_plan_or_game_changes ... ok
+test pair_changes_engine_colors_and_preserves_the_opening ... ok
+test history_fill_repetition_and_full_trace_changes_separate_opening_input_clusters ... ok
+test repeated_builds_and_whole_pair_retry_policy_keep_the_same_game_seeds ... ok
+test explicit_pair_json_limits_and_cumulative_repeated_opening_bytes_are_enforced ... ok
+test seed_derivation_matches_independent_python_big_endian_sha256_vectors ... ok
+test plan_roundtrip_preserves_the_locked_input_and_remains_unready ... ok
+test unsupported_selection_order_resume_and_stop_policies_are_explicitly_rejected ... ok
+test tampered_pair_assignments_seeds_openings_order_and_digests_are_rejected ... ok
+test compact_plan_budget_accepts_a_large_input_despite_pretty_formatting_expansion ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.24s
+
+
+running 24 tests
+test artifact_watch_rejects_unbounded_or_traversing_configuration ... ok
+test directory_handle_remains_bound_after_its_former_path_is_replaced ... ok
+test combined_output_limit_retains_only_the_budget ... ok
+test fixture_artifact_growth ... ignored, native helper; launched only by supervisor tests
+test fixture_cwd_marker ... ignored, native helper; launched only by supervisor tests
+test fixture_descendant ... ignored, native helper; launched only by supervisor tests
+test fixture_descendant_alive ... ignored, native helper; launched only by supervisor tests
+test fixture_flood ... ignored, native helper; launched only by supervisor tests
+test fixture_non_utf8_name ... ignored, native helper; launched only by supervisor tests
+test fixture_nonzero ... ignored, native helper; launched only by supervisor tests
+test fixture_normal ... ignored, native helper; launched only by supervisor tests
+test fixture_signal ... ignored, native helper; launched only by supervisor tests
+test fixture_sleep ... ignored, native helper; launched only by supervisor tests
+test artifact_fifo_or_symlink_is_rejected_without_opening_its_payload ... ok
+test invalid_limits_scripts_and_fifo_are_rejected_before_spawn ... ok
+test exit_failure_and_signal_are_not_general_success ... ok
+test native_runner_exit_preserves_both_outputs_and_closed_stdin ... ok
+test growing_regular_artifact_stops_the_runner_before_wall_deadline ... ok
+test opened_program_survives_replacement_of_its_former_path ... ok
+test non_utf8_process_name_does_not_break_group_observation ... ok
+test cancellation_stops_and_reaps_the_owned_runner ... ok
+test observed_child_limit_terminates_group ... ok
+test surviving_descendant_pipe_cannot_block_drain_forever ... ok
+test wall_limit_kills_a_runner_with_term_blocked_and_drains ... ok
+
+test result: ok. 14 passed; 0 failed; 10 ignored; 0 measured; 0 filtered out; finished in 0.29s
+

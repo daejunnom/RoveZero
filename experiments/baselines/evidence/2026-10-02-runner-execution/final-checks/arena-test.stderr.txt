@@ -1,0 +1,12 @@
+   Compiling rz-arena v0.1.0 (${REPO_ROOT}/crates/rz-arena)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.02s
+     Running unittests src/lib.rs (${ARTIFACT_ROOT}/build/debug/deps/rz_arena-f84ece117f0ade48)
+     Running unittests src/main.rs (${ARTIFACT_ROOT}/build/debug/deps/rz_arena-9b68d81c45ee8b94)
+     Running unittests src/bin/fixture-engine.rs (${ARTIFACT_ROOT}/build/debug/deps/rz_arena_fixture_engine-cb9b1750394acc31)
+     Running tests/cli.rs (${ARTIFACT_ROOT}/build/debug/deps/cli-aaeb99d55cd0eb52)
+     Running tests/contract.rs (${ARTIFACT_ROOT}/build/debug/deps/contract-e1ba597debb21fbc)
+     Running tests/fastchess.rs (${ARTIFACT_ROOT}/build/debug/deps/fastchess-5f3c1ad95b3e8d11)
+     Running tests/ledger.rs (${ARTIFACT_ROOT}/build/debug/deps/ledger-78d6141f57afffd2)
+     Running tests/pgn.rs (${ARTIFACT_ROOT}/build/debug/deps/pgn-5db8e02b48d3ca80)
+     Running tests/plan.rs (${ARTIFACT_ROOT}/build/debug/deps/plan-8889bf69164d288d)
+     Running tests/process.rs (${ARTIFACT_ROOT}/build/debug/deps/process-ce82f0d6a0b1558b)

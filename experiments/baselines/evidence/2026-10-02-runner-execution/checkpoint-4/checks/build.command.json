@@ -1,0 +1,15 @@
+{
+  "name": "build",
+  "argv": [
+    "${CARGO}",
+    "build",
+    "--manifest-path",
+    "crates/rz-arena/Cargo.toml",
+    "--all-features",
+    "--bins",
+    "--locked"
+  ],
+  "exit_code": 0,
+  "elapsed_ns": 1123591822,
+  "expected_exit_code": 0
+}

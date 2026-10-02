@@ -1,0 +1,14 @@
+Started game 1 of 2 (fixture-left vs fixture-right)
+Finished game 1 (fixture-left vs fixture-right): 1/2-1/2 {Draw by adjudication}
+Started game 2 of 2 (fixture-right vs fixture-left)
+Finished game 2 (fixture-right vs fixture-left): 1/2-1/2 {Draw by adjudication}
+--------------------------------------------------
+Results of fixture-left vs fixture-right (0.1/move, 1t, 1MB, prefix-opening.pgn):
+Elo: -0.00 +/- 0.00, nElo: -nan +/- -nan
+LOS: -nan %, DrawRatio: 100.00 %, PairsRatio: -nan
+Games: 2, Wins: 0, Losses: 0, Draws: 2, Points: 1.0 (50.00 %)
+Ptnml(0-2): [0, 0, 1, 0, 0], WL/DD Ratio: 0.00
+--------------------------------------------------
+Finished match
+Total Time: 00:00:01 (hours:minutes:seconds)
+

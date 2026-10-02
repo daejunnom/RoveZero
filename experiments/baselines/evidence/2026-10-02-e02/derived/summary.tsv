@@ -1,0 +1,10 @@
+metric	value	evidence_kind
+completed_pairs	6	synthetic_declaration
+wins	4	synthetic_declaration
+draws	4	synthetic_declaration
+losses	4	synthetic_declaration
+n0	1	synthetic_declaration
+n1	1	synthetic_declaration
+n2	2	synthetic_declaration
+n3	1	synthetic_declaration
+n4	1	synthetic_declaration

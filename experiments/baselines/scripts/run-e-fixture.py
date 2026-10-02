@@ -38,6 +38,7 @@ def main():
     parser.add_argument("--cargo", default="cargo")
     parser.add_argument("--label", default="e-runner-checkpoint")
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument("--scenarios", nargs="+", choices=["normal", "cutoff", "cancel"], default=["normal", "cutoff", "cancel"])
     args = parser.parse_args()
     if not args.label or not all(c.isascii() and (c.isalnum() or c in "-_") for c in args.label):
         parser.error("label requires an ASCII basename")
@@ -119,7 +120,8 @@ def main():
                            source="https://github.com/Disservin/fastchess", license="MIT (ZLIB disabled)")
     cases = {}
     try:
-        for scenario, max_plies in [("normal", 256), ("cutoff", 6), ("cancel", 256)]:
+        for scenario in args.scenarios:
+            max_plies = 6 if scenario == "cutoff" else 256
             manifest = copy.deepcopy(base)
             manifest["run_id"] = f"e02-{scenario}"
             manifest["protocol"]["max_plies"] = max_plies
@@ -132,7 +134,12 @@ def main():
             run(scenario, [str(arena), "fixture-pair", str(plan), str(root), f"attempt-{scenario}", "--max-pairs", "1", "--max-plan-bytes", "1048576"], expected=2 if scenario == "cancel" else 0, interrupt=scenario == "cancel")
             receipt = json.loads((root / f"attempt-{scenario}/process-receipt.json").read_text())
             assert not receipt["execution_ready"]
-            assert receipt["process"]["group_cleanup"] == "gone"
+            if scenario != "cancel":
+                assert receipt["process"]["group_cleanup"] == "gone"
+            else:
+                # Some init environments retain orphan descendant zombies.
+                # Keep Unverified and exclude the pair; never upgrade it to Gone.
+                assert receipt["process"]["group_cleanup"] in {"gone", "unverified"}
             if scenario == "normal":
                 assert [game["uci_moves"] for game in receipt["pgn_audit"]["games"]] == [["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6", "h5f7"]] * 2
                 assert all(game["terminal_reason"] == "checkmate" for game in receipt["pgn_audit"]["games"])
@@ -145,7 +152,7 @@ def main():
             summary = json.loads((reports / f"{audit_name}.stdout").read_text())["summary"]
             assert summary["completed_pairs"] == (1 if scenario == "normal" else 0)
             assert (summary["wins"], summary["draws"], summary["losses"]) == ((1, 0, 1) if scenario == "normal" else (0, 0, 0))
-            cases[scenario] = {"process_stop": receipt["process"]["stop"], "summary": summary}
+            cases[scenario] = {"process_stop": receipt["process"]["stop"], "group_cleanup": receipt["process"]["group_cleanup"], "summary": summary}
     finally:
         dump(root / "reproduction-receipt.json", {"source_commit": source, "rules_source_commit": RULES_SHA,
              "contract_source_commit": CONTRACT_SHA, "runner_source_commit": FASTCHESS_SHA,

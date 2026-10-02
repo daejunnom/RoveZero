@@ -1,0 +1,24 @@
+{
+  "name": "supplemental-source-head",
+  "argv": [
+    "git",
+    "rev-parse",
+    "--verify",
+    "HEAD"
+  ],
+  "cwd": "${REPO_ROOT}",
+  "source_git_head": null,
+  "started_utc": "2026-10-02T17:20:26.013231+00:00",
+  "timeout_seconds": 90,
+  "stdout": "supplemental-source-head.stdout.txt",
+  "stderr": "supplemental-source-head.stderr.txt",
+  "output_capture": "original_unmodified_bytes",
+  "exit_code": 0,
+  "executed": true,
+  "timed_out": false,
+  "interrupted": false,
+  "termination_scope": "process_group",
+  "status": "passed",
+  "elapsed_seconds": 0.008454,
+  "finished_utc": "2026-10-02T17:20:26.021697+00:00"
+}

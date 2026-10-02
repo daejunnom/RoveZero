@@ -1,0 +1,20 @@
+{
+  "name": "normal-ledger-audit",
+  "argv": [
+    "${ARTIFACT_ROOT}/build/debug/rz-arena",
+    "audit",
+    "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-1/normal-plan.json",
+    "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-1/attempt-normal/ledger.jsonl",
+    "--max-pairs",
+    "1",
+    "--max-plan-bytes",
+    "1048576",
+    "--max-events",
+    "4",
+    "--max-ledger-bytes",
+    "65536"
+  ],
+  "exit_code": 0,
+  "elapsed_ns": 32178377,
+  "expected_exit_code": 0
+}

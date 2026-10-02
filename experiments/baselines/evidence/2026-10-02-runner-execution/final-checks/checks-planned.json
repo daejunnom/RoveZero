@@ -1,0 +1,117 @@
+{
+  "schema": "rovezero-e-checks-v1",
+  "label": "e-runner-final-checks",
+  "evidence_kind": "actual_tool_execution",
+  "test_scope": "CPU tests including explicitly synthetic fixtures",
+  "report_contents": [
+    "original_stdout",
+    "original_stderr",
+    "command_metadata"
+  ],
+  "dependency_source_or_binary_payloads_in_report": false,
+  "cargo_target_dir": "${ARTIFACT_ROOT}/build",
+  "created_utc": "2026-10-02T17:16:33.683042+00:00",
+  "checks": [
+    {
+      "name": "e01-fmt",
+      "argv": [
+        "${CARGO}",
+        "fmt",
+        "--manifest-path",
+        "crates/rz-experiments/Cargo.toml",
+        "--all",
+        "--",
+        "--check"
+      ]
+    },
+    {
+      "name": "e01-test",
+      "argv": [
+        "${CARGO}",
+        "test",
+        "--manifest-path",
+        "crates/rz-experiments/Cargo.toml",
+        "--all-targets",
+        "--locked"
+      ]
+    },
+    {
+      "name": "e01-clippy",
+      "argv": [
+        "${CARGO}",
+        "clippy",
+        "--manifest-path",
+        "crates/rz-experiments/Cargo.toml",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    {
+      "name": "arena-fmt",
+      "argv": [
+        "${CARGO}",
+        "fmt",
+        "--manifest-path",
+        "crates/rz-arena/Cargo.toml",
+        "--all",
+        "--",
+        "--check"
+      ]
+    },
+    {
+      "name": "arena-test",
+      "argv": [
+        "${CARGO}",
+        "test",
+        "--manifest-path",
+        "crates/rz-arena/Cargo.toml",
+        "--all-features",
+        "--all-targets",
+        "--locked"
+      ]
+    },
+    {
+      "name": "arena-clippy",
+      "argv": [
+        "${CARGO}",
+        "clippy",
+        "--manifest-path",
+        "crates/rz-arena/Cargo.toml",
+        "--all-features",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    {
+      "name": "e01-msrv-1.85.0",
+      "argv": [
+        "${CARGO}",
+        "+1.85.0",
+        "check",
+        "--manifest-path",
+        "crates/rz-experiments/Cargo.toml",
+        "--all-targets",
+        "--locked"
+      ]
+    },
+    {
+      "name": "arena-msrv-1.90.0",
+      "argv": [
+        "${CARGO}",
+        "+1.90.0",
+        "check",
+        "--manifest-path",
+        "crates/rz-arena/Cargo.toml",
+        "--all-features",
+        "--all-targets",
+        "--locked"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+   Compiling rz-experiments v0.1.0 (${REPO_ROOT}/crates/rz-experiments)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.18s
+     Running unittests src/lib.rs (${ARTIFACT_ROOT}/build/debug/deps/rz_experiments-479d8464bf67f52a)
+     Running unittests src/main.rs (${ARTIFACT_ROOT}/build/debug/deps/rz_experiments-ab4b5ee99b0671bb)
+     Running tests/cli.rs (${ARTIFACT_ROOT}/build/debug/deps/cli-fd1a51315901a761)
+     Running tests/manifest.rs (${ARTIFACT_ROOT}/build/debug/deps/manifest-b2dcbba502ca6f11)
+     Running tests/verified_handle.rs (${ARTIFACT_ROOT}/build/debug/deps/verified_handle-7543c74c97304e91)

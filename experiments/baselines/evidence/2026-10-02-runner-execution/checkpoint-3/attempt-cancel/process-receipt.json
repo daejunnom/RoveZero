@@ -1,0 +1,127 @@
+{
+  "receipt_version": 1,
+  "execution_ready": false,
+  "validation_scope": "synthetic_pair_process_and_native_rules",
+  "input_sha256": "8e29eff031e63f2fe13b2304622ad2f3761e9326a47196692d43fa30335f3149",
+  "plan_sha256": "a4aeefd34ff0e613c4703034133ff6a7bff28a2f83f6c2655eebfe9f5790c211",
+  "pair_id": "e02-cancel/pair-0",
+  "attempt": 1,
+  "engine_contract_revision": "0.1",
+  "contract_source_commit": "67284c4f66f7a7ae9f46fa63dfd50e7410eb6845",
+  "rules_source_commit": "118dc0311a88e143be285703940321dc16261f6a",
+  "runner_source_commit": "f618e34540f94f4719ad3817950618dabe441318",
+  "runner_binary_sha256": "32f16e6bdb88605b38c3956dd5c379957eb33ee9fdf9afe2e5b47e33024eb997",
+  "process": {
+    "supervisor_version": 1,
+    "pid": 19469,
+    "elapsed_ns": 1015451988,
+    "stop": "exited",
+    "exit_code": 0,
+    "exit_signal": null,
+    "group_cleanup": "gone",
+    "stdout_bytes": 43781,
+    "stderr_bytes": 0,
+    "observed_output_bytes": 43781,
+    "descendant_cleanup_required": false,
+    "child_limit_enforcement": "process_group_snapshot",
+    "watched_artifact_bytes": 1957,
+    "artifact_limit_enforcement": "regular_file_snapshot",
+    "errors": []
+  },
+  "artifacts": [
+    {
+      "path": "attempt-cancel/opening.pgn",
+      "sha256": "9bde181bc5427bb0ad4850eadf4c81934e901b5c203329946765641edf4120ba",
+      "bytes": 125,
+      "source": "https://github.com/daejunnom/RoveZero",
+      "license": "MIT - synthetic fixture execution evidence"
+    },
+    {
+      "path": "attempt-cancel/stdout.log",
+      "sha256": "3f120472a955b6f8769effa2f7fcc0481e11c4c7f76a62e37153d7bd336ed43d",
+      "bytes": 43781,
+      "source": "https://github.com/daejunnom/RoveZero",
+      "license": "MIT - synthetic fixture execution evidence"
+    },
+    {
+      "path": "attempt-cancel/stderr.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "source": "https://github.com/daejunnom/RoveZero",
+      "license": "MIT - synthetic fixture execution evidence"
+    },
+    {
+      "path": "attempt-cancel/match.pgn",
+      "sha256": "77e82ffde9a92b6442fec781116a9da20c41736a804235191da129189285a1cc",
+      "bytes": 1832,
+      "source": "https://github.com/daejunnom/RoveZero",
+      "license": "MIT - synthetic fixture execution evidence"
+    }
+  ],
+  "pgn_audit": {
+    "audit_version": 1,
+    "rules_source_commit": "118dc0311a88e143be285703940321dc16261f6a",
+    "contract_source_commit": "67284c4f66f7a7ae9f46fa63dfd50e7410eb6845",
+    "engine_contract_revision": "0.1",
+    "opening_input_sha256": "2bfb56da02967f952312886e257018974843fb0ea9a81fa5b0265e94f4240e46",
+    "start_state_semantic_sha256": "bce4e332891fc11e34aeef1648a574f36c134f753b2e661bb0f66357e30e4496",
+    "games": [
+      {
+        "game_id": "e02-cancel/pair-0/game-1",
+        "white_engine": "baseline-fixture",
+        "black_engine": "candidate-fixture",
+        "uci_moves": [
+          "e2e4",
+          "e7e5",
+          "d1h5",
+          "b8c6",
+          "f1c4",
+          "g8f6",
+          "h5f7"
+        ],
+        "result": "white_win",
+        "termination": "normal",
+        "final_fen": "r1bqkb1r/pppp1Qpp/2n2n2/4p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 4",
+        "classification": "rules_terminal",
+        "loser_engine": null,
+        "terminal_reason": "checkmate",
+        "engine_failure": null
+      },
+      {
+        "game_id": "e02-cancel/pair-0/game-0",
+        "white_engine": "candidate-fixture",
+        "black_engine": "baseline-fixture",
+        "uci_moves": [
+          "e2e4",
+          "e7e5",
+          "d1h5",
+          "b8c6",
+          "f1c4",
+          "g8f6",
+          "h5f7"
+        ],
+        "result": "white_win",
+        "termination": "normal",
+        "final_fen": "r1bqkb1r/pppp1Qpp/2n2n2/4p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 4",
+        "classification": "rules_terminal",
+        "loser_engine": null,
+        "terminal_reason": "checkmate",
+        "engine_failure": null
+      }
+    ]
+  },
+  "audit_error": null,
+  "limitations": [
+    "fixture-development-only; execution_ready=false; no strength, GPU, backend or applied-option attestation",
+    "Fastchess measures after go write/read setup and before bestmove validation; shared clock boundary is unverified and its read timeout has an internal 100 ms margin",
+    "Fastchess automatic threefold/50-move/insufficient-material rules differ from A's explicit-claim contract; independently replay and audit each PGN",
+    "maxmoves counts searched plies excluding the full prefix and reports adjudication draws; the audit must classify the limit as incomplete, never score it as a draw",
+    "per-game derived engine seeds are not applied; this profile requires deterministic scripted fixtures and rejects RNG options",
+    "opening path bytes are not attested by this pure builder; caller must write the complete A-validated opening_pgn and compare actual PGN/full prefix after execution",
+    "process-group child/output/artifact snapshots are observed limits, not kernel resource caps; escaped or transient children require a future cgroup adapter",
+    "raw UCI command/response logs share the bounded Linux stdout pipe with runner reports; concurrent text may interleave and does not prove option application",
+    "CPU affinity and RAM quota are unverified",
+    "artifact and child limits use process snapshots, not kernel quotas",
+    "process exit does not attest runtime/GPU drain"
+  ]
+}

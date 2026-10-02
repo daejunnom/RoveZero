@@ -1,0 +1,337 @@
+[INFO  ] [17:03:23.072298] <                    > fastchess --- fastchess alpha 1.8.2 20260726-f618e34
+[INFO  ] [17:03:23.072413] <                    > fastchess --- Setting seed to: 101
+[TRACE ] [17:03:23.072417] <                    > fastchess --- Creating tournament...
+[TRACE ] [17:03:23.072520] <                    > fastchess --- Setting results...
+[INFO  ] [17:03:23.072853] <                    > fastchess --- Starting tournament...
+[TRACE ] [17:03:23.072870] <                    > fastchess --- Starting round robin tournament...
+[TRACE ] [17:03:23.072874] <                    > fastchess --- Starting tournament...
+[TRACE ] [17:03:23.072875] <                    > fastchess --- Creating matches...
+[TRACE ] [17:03:23.073050] <     140486379583168> fastchess --- Game 1 between fixture-left and fixture-right starting
+Started game 1 of 2 (fixture-left vs fixture-right)
+[TRACE ] [17:03:23.073147] <     140486379583168> fastchess --- Starting engine fixture-left at ${ARTIFACT_ROOT}/reports/runner-research/synthetic-uci.py
+[TRACE ] [17:03:23.073894] <                    > fastchess --- Using eventfd for process interrupt signaling
+[TRACE ] [17:03:23.073927] <     140486379583168> fastchess --- Sending uci to engine fixture-left
+[Engine] [17:03:23.073930] <     140486379583168>  fixture-left <--- uci
+[TRACE ] [17:03:23.073940] <     140486379583168> fastchess --- Waiting for uciok from engine fixture-left
+[Engine] [17:03:23.089977] <     140486379583168>  fixture-left ---> id name E02SyntheticFixture
+[Engine] [17:03:23.090010] <     140486379583168>  fixture-left ---> id author RoveZero test fixture
+[Engine] [17:03:23.090015] <     140486379583168>  fixture-left ---> option name Threads type spin default 1 min 1 max 1
+[Engine] [17:03:23.090023] <     140486379583168>  fixture-left ---> option name Hash type spin default 1 min 1 max 16
+[Engine] [17:03:23.090025] <     140486379583168>  fixture-left ---> option name Ponder type check default false
+[Engine] [17:03:23.090027] <     140486379583168>  fixture-left ---> option name Seed type spin default 1 min 1 max 10000
+[Engine] [17:03:23.090029] <     140486379583168>  fixture-left ---> uciok
+[TRACE ] [17:03:23.090309] <     140486379583168> fastchess --- Starting engine fixture-right at ${ARTIFACT_ROOT}/reports/runner-research/synthetic-uci.py
+[TRACE ] [17:03:23.091551] <                    > fastchess --- Using eventfd for process interrupt signaling
+[TRACE ] [17:03:23.091579] <     140486379583168> fastchess --- Sending uci to engine fixture-right
+[Engine] [17:03:23.091582] <     140486379583168>  fixture-right <--- uci
+[TRACE ] [17:03:23.091590] <     140486379583168> fastchess --- Waiting for uciok from engine fixture-right
+[Engine] [17:03:23.109200] <     140486379583168>  fixture-right ---> id name E02SyntheticFixture
+[Engine] [17:03:23.109241] <     140486379583168>  fixture-right ---> id author RoveZero test fixture
+[Engine] [17:03:23.109246] <     140486379583168>  fixture-right ---> option name Threads type spin default 1 min 1 max 1
+[Engine] [17:03:23.109249] <     140486379583168>  fixture-right ---> option name Hash type spin default 1 min 1 max 16
+[Engine] [17:03:23.109250] <     140486379583168>  fixture-right ---> option name Ponder type check default false
+[Engine] [17:03:23.109252] <     140486379583168>  fixture-right ---> option name Seed type spin default 1 min 1 max 10000
+[Engine] [17:03:23.109258] <     140486379583168>  fixture-right ---> uciok
+[TRACE ] [17:03:23.109279] <     140486379583168> fastchess --- Refreshing engine fixture-left
+[TRACE ] [17:03:23.109286] <     140486379583168> fastchess --- Sending setoption to engine fixture-left Threads 1
+[Engine] [17:03:23.109289] <     140486379583168>  fixture-left <--- setoption name Threads value 1
+[TRACE ] [17:03:23.109313] <     140486379583168> fastchess --- Sending setoption to engine fixture-left Seed 7
+[Engine] [17:03:23.109327] <     140486379583168>  fixture-left <--- setoption name Seed value 7
+[TRACE ] [17:03:23.109332] <     140486379583168> fastchess --- Sending setoption to engine fixture-left Hash 1
+[Engine] [17:03:23.109333] <     140486379583168>  fixture-left <--- setoption name Hash value 1
+[TRACE ] [17:03:23.109336] <     140486379583168> fastchess --- Sending setoption to engine fixture-left Ponder false
+[Engine] [17:03:23.109338] <     140486379583168>  fixture-left <--- setoption name Ponder value false
+[TRACE ] [17:03:23.109341] <     140486379583168> fastchess --- Sending ucinewgame to engine fixture-left
+[Engine] [17:03:23.109343] <     140486379583168>  fixture-left <--- ucinewgame
+[TRACE ] [17:03:23.109346] <     140486379583168> fastchess --- Pinging engine fixture-left
+[Engine] [17:03:23.109348] <     140486379583168>  fixture-left <--- isready
+[Engine] [17:03:23.109475] <     140486379583168>  fixture-left ---> readyok
+[TRACE ] [17:03:23.109492] <     140486379583168> fastchess --- Engine fixture-left is responsive
+[TRACE ] [17:03:23.109495] <     140486379583168> fastchess --- Engine fixture-left refreshed.
+[TRACE ] [17:03:23.109498] <     140486379583168> fastchess --- Refreshing engine fixture-right
+[TRACE ] [17:03:23.109500] <     140486379583168> fastchess --- Sending setoption to engine fixture-right Threads 1
+[Engine] [17:03:23.109502] <     140486379583168>  fixture-right <--- setoption name Threads value 1
+[TRACE ] [17:03:23.109524] <     140486379583168> fastchess --- Sending setoption to engine fixture-right Seed 11
+[Engine] [17:03:23.109532] <     140486379583168>  fixture-right <--- setoption name Seed value 11
+[TRACE ] [17:03:23.109543] <     140486379583168> fastchess --- Sending setoption to engine fixture-right Hash 1
+[Engine] [17:03:23.109551] <     140486379583168>  fixture-right <--- setoption name Hash value 1
+[TRACE ] [17:03:23.109561] <     140486379583168> fastchess --- Sending setoption to engine fixture-right Ponder false
+[Engine] [17:03:23.109563] <     140486379583168>  fixture-right <--- setoption name Ponder value false
+[TRACE ] [17:03:23.109570] <     140486379583168> fastchess --- Sending ucinewgame to engine fixture-right
+[Engine] [17:03:23.109578] <     140486379583168>  fixture-right <--- ucinewgame
+[TRACE ] [17:03:23.109596] <     140486379583168> fastchess --- Pinging engine fixture-right
+[Engine] [17:03:23.109606] <     140486379583168>  fixture-right <--- isready
+[Engine] [17:03:23.109781] <     140486379583168>  fixture-right ---> readyok
+[TRACE ] [17:03:23.109793] <     140486379583168> fastchess --- Engine fixture-right is responsive
+[TRACE ] [17:03:23.109796] <     140486379583168> fastchess --- Engine fixture-right refreshed.
+[TRACE ] [17:03:23.109799] <     140486379583168> fastchess --- Pinging engine fixture-left
+[Engine] [17:03:23.109807] <     140486379583168>  fixture-left <--- isready
+[Engine] [17:03:23.109881] <     140486379583168>  fixture-left ---> readyok
+[TRACE ] [17:03:23.109895] <     140486379583168> fastchess --- Engine fixture-left is responsive
+[TRACE ] [17:03:23.109906] <     140486379583168> fastchess --- Pinging engine fixture-left
+[Engine] [17:03:23.109907] <     140486379583168>  fixture-left <--- isready
+[Engine] [17:03:23.109964] <     140486379583168>  fixture-left ---> readyok
+[TRACE ] [17:03:23.109977] <     140486379583168> fastchess --- Engine fixture-left is responsive
+[Engine] [17:03:23.109984] <     140486379583168>  fixture-left <--- position startpos moves e2e4 e7e5
+[TRACE ] [17:03:23.110014] <     140486379583168> fastchess --- Pinging engine fixture-left
+[Engine] [17:03:23.110022] <     140486379583168>  fixture-left <--- isready
+[Engine] [17:03:23.110153] <     140486379583168>  fixture-left ---> readyok
+[TRACE ] [17:03:23.110166] <     140486379583168> fastchess --- Engine fixture-left is responsive
+[TRACE ] [17:03:23.110170] <     140486379583168> fastchess --- Engine fixture-left is thinking
+[Engine] [17:03:23.110173] <     140486379583168>  fixture-left <--- go wtime 1000 btime 1000
+[Engine] [17:03:23.110229] <     140486379583168>  fixture-left ---> info depth 1 score cp 0 nodes 1 time 0
+[Engine] [17:03:23.110238] <     140486379583168>  fixture-left ---> bestmove g1f3
+[TRACE ] [17:03:23.110242] <     140486379583168> fastchess --- Engine fixture-left is done thinking
+[TRACE ] [17:03:23.110257] <     140486379583168> fastchess --- Check if engine fixture-left is in a ready state
+[TRACE ] [17:03:23.110266] <     140486379583168> fastchess --- Pinging engine fixture-left
+[Engine] [17:03:23.110269] <     140486379583168>  fixture-left <--- isready
+[Engine] [17:03:23.110314] <     140486379583168>  fixture-left ---> readyok
+[TRACE ] [17:03:23.110324] <     140486379583168> fastchess --- Engine fixture-left is responsive
+[TRACE ] [17:03:23.110327] <     140486379583168> fastchess --- Engine fixture-left is in a ready state
+[TRACE ] [17:03:23.110363] <     140486379583168> fastchess --- Pinging engine fixture-right
+[Engine] [17:03:23.110370] <     140486379583168>  fixture-right <--- isready
+[Engine] [17:03:23.110389] <     140486379583168>  fixture-right ---> readyok
+[TRACE ] [17:03:23.110398] <     140486379583168> fastchess --- Engine fixture-right is responsive
+[Engine] [17:03:23.110401] <     140486379583168>  fixture-right <--- position startpos moves e2e4 e7e5 g1f3
+[TRACE ] [17:03:23.110414] <     140486379583168> fastchess --- Pinging engine fixture-right
+[Engine] [17:03:23.110422] <     140486379583168>  fixture-right <--- isready
+[Engine] [17:03:23.110433] <     140486379583168>  fixture-right ---> readyok
+[TRACE ] [17:03:23.110436] <     140486379583168> fastchess --- Engine fixture-right is responsive
+[TRACE ] [17:03:23.110439] <     140486379583168> fastchess --- Engine fixture-right is thinking
+[Engine] [17:03:23.110441] <     140486379583168>  fixture-right <--- go wtime 1000 btime 1000
+[Engine] [17:03:23.110490] <     140486379583168>  fixture-right ---> info depth 1 score cp 0 nodes 1 time 0
+[Engine] [17:03:23.110499] <     140486379583168>  fixture-right ---> bestmove b8c6
+[TRACE ] [17:03:23.110503] <     140486379583168> fastchess --- Engine fixture-right is done thinking
+[TRACE ] [17:03:23.110505] <     140486379583168> fastchess --- Check if engine fixture-right is in a ready state
+[TRACE ] [17:03:23.110508] <     140486379583168> fastchess --- Pinging engine fixture-right
+[Engine] [17:03:23.110509] <     140486379583168>  fixture-right <--- isready
+[Engine] [17:03:23.110519] <     140486379583168>  fixture-right ---> readyok
+[TRACE ] [17:03:23.110522] <     140486379583168> fastchess --- Engine fixture-right is responsive
+[TRACE ] [17:03:23.110524] <     140486379583168> fastchess --- Engine fixture-right is in a ready state
+[TRACE ] [17:03:23.110538] <     140486379583168> fastchess --- Pinging engine fixture-left
+[Engine] [17:03:23.110552] <     140486379583168>  fixture-left <--- isready
+[Engine] [17:03:23.110613] <     140486379583168>  fixture-left ---> readyok
+[TRACE ] [17:03:23.110632] <     140486379583168> fastchess --- Engine fixture-left is responsive
+[Engine] [17:03:23.110635] <     140486379583168>  fixture-left <--- position startpos moves e2e4 e7e5 g1f3 b8c6
+[TRACE ] [17:03:23.110647] <     140486379583168> fastchess --- Pinging engine fixture-left
+[Engine] [17:03:23.110649] <     140486379583168>  fixture-left <--- isready
+[Engine] [17:03:23.110689] <     140486379583168>  fixture-left ---> readyok
+[TRACE ] [17:03:23.110699] <     140486379583168> fastchess --- Engine fixture-left is responsive
+[TRACE ] [17:03:23.110702] <     140486379583168> fastchess --- Engine fixture-left is thinking
+[Engine] [17:03:23.110704] <     140486379583168>  fixture-left <--- go wtime 1000 btime 1000
+[Engine] [17:03:23.110831] <     140486379583168>  fixture-left ---> info depth 1 score cp 0 nodes 1 time 0
+[Engine] [17:03:23.110845] <     140486379583168>  fixture-left ---> bestmove f1b5
+[TRACE ] [17:03:23.110849] <     140486379583168> fastchess --- Engine fixture-left is done thinking
+[TRACE ] [17:03:23.110851] <     140486379583168> fastchess --- Check if engine fixture-left is in a ready state
+[TRACE ] [17:03:23.110854] <     140486379583168> fastchess --- Pinging engine fixture-left
+[Engine] [17:03:23.110855] <     140486379583168>  fixture-left <--- isready
+[Engine] [17:03:23.110907] <     140486379583168>  fixture-left ---> readyok
+[TRACE ] [17:03:23.110917] <     140486379583168> fastchess --- Engine fixture-left is responsive
+[TRACE ] [17:03:23.110920] <     140486379583168> fastchess --- Engine fixture-left is in a ready state
+[TRACE ] [17:03:23.110933] <     140486379583168> fastchess --- Pinging engine fixture-right
+[Engine] [17:03:23.110941] <     140486379583168>  fixture-right <--- isready
+[Engine] [17:03:23.110957] <     140486379583168>  fixture-right ---> readyok
+[TRACE ] [17:03:23.110966] <     140486379583168> fastchess --- Engine fixture-right is responsive
+[Engine] [17:03:23.110969] <     140486379583168>  fixture-right <--- position startpos moves e2e4 e7e5 g1f3 b8c6 f1b5
+[TRACE ] [17:03:23.110980] <     140486379583168> fastchess --- Pinging engine fixture-right
+[Engine] [17:03:23.110988] <     140486379583168>  fixture-right <--- isready
+[Engine] [17:03:23.110999] <     140486379583168>  fixture-right ---> readyok
+[TRACE ] [17:03:23.111001] <     140486379583168> fastchess --- Engine fixture-right is responsive
+[TRACE ] [17:03:23.111003] <     140486379583168> fastchess --- Engine fixture-right is thinking
+[Engine] [17:03:23.111005] <     140486379583168>  fixture-right <--- go wtime 1000 btime 1000
+[Engine] [17:03:23.111016] <     140486379583168>  fixture-right ---> info depth 1 score cp 0 nodes 1 time 0
+[Engine] [17:03:23.111024] <     140486379583168>  fixture-right ---> bestmove a7a6
+[TRACE ] [17:03:23.111027] <     140486379583168> fastchess --- Engine fixture-right is done thinking
+[TRACE ] [17:03:23.111029] <     140486379583168> fastchess --- Check if engine fixture-right is in a ready state
+[TRACE ] [17:03:23.111031] <     140486379583168> fastchess --- Pinging engine fixture-right
+[Engine] [17:03:23.111033] <     140486379583168>  fixture-right <--- isready
+[Engine] [17:03:23.111043] <     140486379583168>  fixture-right ---> readyok
+[TRACE ] [17:03:23.111052] <     140486379583168> fastchess --- Engine fixture-right is responsive
+[TRACE ] [17:03:23.111054] <     140486379583168> fastchess --- Engine fixture-right is in a ready state
+[TRACE ] [17:03:23.111092] <     140486379583168> fastchess --- Game 1 between fixture-left and fixture-right finished
+[TRACE ] [17:03:23.111309] <     140486379583168> fastchess --- Game 1 finished with result 1/2-1/2
+Finished game 1 (fixture-left vs fixture-right): 1/2-1/2 {Draw by adjudication}
+[Engine] [17:03:23.111337] <     140486379583168>  fixture-left <--- stop
+[Engine] [17:03:23.111350] <     140486379583168>  fixture-left <--- quit
+[TRACE ] [17:03:23.212064] <     140486379583168> fastchess --- Process with pid: 18354 terminated with status: 0
+[Engine] [17:03:23.212159] <     140486379583168>  <stderr> fixture-left ---> Process exited normally with status 0
+[Engine] [17:03:23.212320] <     140486379583168>  fixture-right <--- stop
+[Engine] [17:03:23.212341] <     140486379583168>  fixture-right <--- quit
+[TRACE ] [17:03:23.313020] <     140486379583168> fastchess --- Process with pid: 18355 terminated with status: 0
+[Engine] [17:03:23.313101] <     140486379583168>  <stderr> fixture-right ---> Process exited normally with status 0
+[TRACE ] [17:03:23.313197] <     140486379583168> fastchess --- Thread 140486379583168 finished match 1
+[TRACE ] [17:03:23.313293] <     140486379583168> fastchess --- Game 2 between fixture-right and fixture-left starting
+Started game 2 of 2 (fixture-right vs fixture-left)
+[TRACE ] [17:03:23.313471] <     140486379583168> fastchess --- Starting engine fixture-right at ${ARTIFACT_ROOT}/reports/runner-research/synthetic-uci.py
+[TRACE ] [17:03:23.314168] <                    > fastchess --- Using eventfd for process interrupt signaling
+[TRACE ] [17:03:23.314193] <     140486379583168> fastchess --- Sending uci to engine fixture-right
+[Engine] [17:03:23.314196] <     140486379583168>  fixture-right <--- uci
+[TRACE ] [17:03:23.314207] <     140486379583168> fastchess --- Waiting for uciok from engine fixture-right
+[Engine] [17:03:23.335121] <     140486379583168>  fixture-right ---> id name E02SyntheticFixture
+[Engine] [17:03:23.335154] <     140486379583168>  fixture-right ---> id author RoveZero test fixture
+[Engine] [17:03:23.335158] <     140486379583168>  fixture-right ---> option name Threads type spin default 1 min 1 max 1
+[Engine] [17:03:23.335161] <     140486379583168>  fixture-right ---> option name Hash type spin default 1 min 1 max 16
+[Engine] [17:03:23.335163] <     140486379583168>  fixture-right ---> option name Ponder type check default false
+[Engine] [17:03:23.335165] <     140486379583168>  fixture-right ---> option name Seed type spin default 1 min 1 max 10000
+[Engine] [17:03:23.335167] <     140486379583168>  fixture-right ---> uciok
+[TRACE ] [17:03:23.335190] <     140486379583168> fastchess --- Starting engine fixture-left at ${ARTIFACT_ROOT}/reports/runner-research/synthetic-uci.py
+[TRACE ] [17:03:23.336673] <                    > fastchess --- Using eventfd for process interrupt signaling
+[TRACE ] [17:03:23.336704] <     140486379583168> fastchess --- Sending uci to engine fixture-left
+[Engine] [17:03:23.336707] <     140486379583168>  fixture-left <--- uci
+[TRACE ] [17:03:23.336721] <     140486379583168> fastchess --- Waiting for uciok from engine fixture-left
+[Engine] [17:03:23.361349] <     140486379583168>  fixture-left ---> id name E02SyntheticFixture
+[Engine] [17:03:23.361376] <     140486379583168>  fixture-left ---> id author RoveZero test fixture
+[Engine] [17:03:23.361380] <     140486379583168>  fixture-left ---> option name Threads type spin default 1 min 1 max 1
+[Engine] [17:03:23.361382] <     140486379583168>  fixture-left ---> option name Hash type spin default 1 min 1 max 16
+[Engine] [17:03:23.361384] <     140486379583168>  fixture-left ---> option name Ponder type check default false
+[Engine] [17:03:23.361386] <     140486379583168>  fixture-left ---> option name Seed type spin default 1 min 1 max 10000
+[Engine] [17:03:23.361388] <     140486379583168>  fixture-left ---> uciok
+[TRACE ] [17:03:23.361408] <     140486379583168> fastchess --- Refreshing engine fixture-right
+[TRACE ] [17:03:23.361413] <     140486379583168> fastchess --- Sending setoption to engine fixture-right Threads 1
+[Engine] [17:03:23.361416] <     140486379583168>  fixture-right <--- setoption name Threads value 1
+[TRACE ] [17:03:23.361435] <     140486379583168> fastchess --- Sending setoption to engine fixture-right Seed 11
+[Engine] [17:03:23.361439] <     140486379583168>  fixture-right <--- setoption name Seed value 11
+[TRACE ] [17:03:23.361443] <     140486379583168> fastchess --- Sending setoption to engine fixture-right Hash 1
+[Engine] [17:03:23.361445] <     140486379583168>  fixture-right <--- setoption name Hash value 1
+[TRACE ] [17:03:23.361473] <     140486379583168> fastchess --- Sending setoption to engine fixture-right Ponder false
+[Engine] [17:03:23.361476] <     140486379583168>  fixture-right <--- setoption name Ponder value false
+[TRACE ] [17:03:23.361480] <     140486379583168> fastchess --- Sending ucinewgame to engine fixture-right
+[Engine] [17:03:23.361483] <     140486379583168>  fixture-right <--- ucinewgame
+[TRACE ] [17:03:23.361487] <     140486379583168> fastchess --- Pinging engine fixture-right
+[Engine] [17:03:23.361489] <     140486379583168>  fixture-right <--- isready
+[Engine] [17:03:23.361578] <     140486379583168>  fixture-right ---> readyok
+[TRACE ] [17:03:23.361603] <     140486379583168> fastchess --- Engine fixture-right is responsive
+[TRACE ] [17:03:23.361607] <     140486379583168> fastchess --- Engine fixture-right refreshed.
+[TRACE ] [17:03:23.361609] <     140486379583168> fastchess --- Refreshing engine fixture-left
+[TRACE ] [17:03:23.361612] <     140486379583168> fastchess --- Sending setoption to engine fixture-left Threads 1
+[Engine] [17:03:23.361613] <     140486379583168>  fixture-left <--- setoption name Threads value 1
+[TRACE ] [17:03:23.361625] <     140486379583168> fastchess --- Sending setoption to engine fixture-left Seed 7
+[Engine] [17:03:23.361627] <     140486379583168>  fixture-left <--- setoption name Seed value 7
+[TRACE ] [17:03:23.361630] <     140486379583168> fastchess --- Sending setoption to engine fixture-left Hash 1
+[Engine] [17:03:23.361631] <     140486379583168>  fixture-left <--- setoption name Hash value 1
+[TRACE ] [17:03:23.361634] <     140486379583168> fastchess --- Sending setoption to engine fixture-left Ponder false
+[Engine] [17:03:23.361635] <     140486379583168>  fixture-left <--- setoption name Ponder value false
+[TRACE ] [17:03:23.361638] <     140486379583168> fastchess --- Sending ucinewgame to engine fixture-left
+[Engine] [17:03:23.361639] <     140486379583168>  fixture-left <--- ucinewgame
+[TRACE ] [17:03:23.361642] <     140486379583168> fastchess --- Pinging engine fixture-left
+[Engine] [17:03:23.361643] <     140486379583168>  fixture-left <--- isready
+[Engine] [17:03:23.361899] <     140486379583168>  fixture-left ---> readyok
+[TRACE ] [17:03:23.361912] <     140486379583168> fastchess --- Engine fixture-left is responsive
+[TRACE ] [17:03:23.361915] <     140486379583168> fastchess --- Engine fixture-left refreshed.
+[TRACE ] [17:03:23.361917] <     140486379583168> fastchess --- Pinging engine fixture-right
+[Engine] [17:03:23.361919] <     140486379583168>  fixture-right <--- isready
+[Engine] [17:03:23.361987] <     140486379583168>  fixture-right ---> readyok
+[TRACE ] [17:03:23.362010] <     140486379583168> fastchess --- Engine fixture-right is responsive
+[TRACE ] [17:03:23.362087] <     140486379583168> fastchess --- Pinging engine fixture-right
+[Engine] [17:03:23.362091] <     140486379583168>  fixture-right <--- isready
+[Engine] [17:03:23.362146] <     140486379583168>  fixture-right ---> readyok
+[TRACE ] [17:03:23.362163] <     140486379583168> fastchess --- Engine fixture-right is responsive
+[Engine] [17:03:23.362168] <     140486379583168>  fixture-right <--- position startpos moves e2e4 e7e5
+[TRACE ] [17:03:23.362181] <     140486379583168> fastchess --- Pinging engine fixture-right
+[Engine] [17:03:23.362184] <     140486379583168>  fixture-right <--- isready
+[Engine] [17:03:23.362222] <     140486379583168>  fixture-right ---> readyok
+[TRACE ] [17:03:23.362237] <     140486379583168> fastchess --- Engine fixture-right is responsive
+[TRACE ] [17:03:23.362241] <     140486379583168> fastchess --- Engine fixture-right is thinking
+[Engine] [17:03:23.362246] <     140486379583168>  fixture-right <--- go wtime 1000 btime 1000
+[Engine] [17:03:23.362306] <     140486379583168>  fixture-right ---> info depth 1 score cp 0 nodes 1 time 0
+[Engine] [17:03:23.362321] <     140486379583168>  fixture-right ---> bestmove g1f3
+[TRACE ] [17:03:23.362326] <     140486379583168> fastchess --- Engine fixture-right is done thinking
+[TRACE ] [17:03:23.362341] <     140486379583168> fastchess --- Check if engine fixture-right is in a ready state
+[TRACE ] [17:03:23.362345] <     140486379583168> fastchess --- Pinging engine fixture-right
+[Engine] [17:03:23.362347] <     140486379583168>  fixture-right <--- isready
+[Engine] [17:03:23.362403] <     140486379583168>  fixture-right ---> readyok
+[TRACE ] [17:03:23.362418] <     140486379583168> fastchess --- Engine fixture-right is responsive
+[TRACE ] [17:03:23.362422] <     140486379583168> fastchess --- Engine fixture-right is in a ready state
+[TRACE ] [17:03:23.362481] <     140486379583168> fastchess --- Pinging engine fixture-left
+[Engine] [17:03:23.362484] <     140486379583168>  fixture-left <--- isready
+[Engine] [17:03:23.362586] <     140486379583168>  fixture-left ---> readyok
+[TRACE ] [17:03:23.362601] <     140486379583168> fastchess --- Engine fixture-left is responsive
+[Engine] [17:03:23.362604] <     140486379583168>  fixture-left <--- position startpos moves e2e4 e7e5 g1f3
+[TRACE ] [17:03:23.362617] <     140486379583168> fastchess --- Pinging engine fixture-left
+[Engine] [17:03:23.362620] <     140486379583168>  fixture-left <--- isready
+[Engine] [17:03:23.362747] <     140486379583168>  fixture-left ---> readyok
+[TRACE ] [17:03:23.362759] <     140486379583168> fastchess --- Engine fixture-left is responsive
+[TRACE ] [17:03:23.362762] <     140486379583168> fastchess --- Engine fixture-left is thinking
+[Engine] [17:03:23.362764] <     140486379583168>  fixture-left <--- go wtime 1000 btime 1000
+[Engine] [17:03:23.362947] <     140486379583168>  fixture-left ---> info depth 1 score cp 0 nodes 1 time 0
+[Engine] [17:03:23.362960] <     140486379583168>  fixture-left ---> bestmove b8c6
+[TRACE ] [17:03:23.362964] <     140486379583168> fastchess --- Engine fixture-left is done thinking
+[TRACE ] [17:03:23.362966] <     140486379583168> fastchess --- Check if engine fixture-left is in a ready state
+[TRACE ] [17:03:23.362969] <     140486379583168> fastchess --- Pinging engine fixture-left
+[Engine] [17:03:23.362970] <     140486379583168>  fixture-left <--- isready
+[Engine] [17:03:23.363016] <     140486379583168>  fixture-left ---> readyok
+[TRACE ] [17:03:23.363027] <     140486379583168> fastchess --- Engine fixture-left is responsive
+[TRACE ] [17:03:23.363029] <     140486379583168> fastchess --- Engine fixture-left is in a ready state
+[TRACE ] [17:03:23.363053] <     140486379583168> fastchess --- Pinging engine fixture-right
+[Engine] [17:03:23.363061] <     140486379583168>  fixture-right <--- isready
+[Engine] [17:03:23.363115] <     140486379583168>  fixture-right ---> readyok
+[TRACE ] [17:03:23.363128] <     140486379583168> fastchess --- Engine fixture-right is responsive
+[Engine] [17:03:23.363132] <     140486379583168>  fixture-right <--- position startpos moves e2e4 e7e5 g1f3 b8c6
+[TRACE ] [17:03:23.363144] <     140486379583168> fastchess --- Pinging engine fixture-right
+[Engine] [17:03:23.363154] <     140486379583168>  fixture-right <--- isready
+[Engine] [17:03:23.363190] <     140486379583168>  fixture-right ---> readyok
+[TRACE ] [17:03:23.363209] <     140486379583168> fastchess --- Engine fixture-right is responsive
+[TRACE ] [17:03:23.363212] <     140486379583168> fastchess --- Engine fixture-right is thinking
+[Engine] [17:03:23.363215] <     140486379583168>  fixture-right <--- go wtime 1000 btime 1000
+[Engine] [17:03:23.363252] <     140486379583168>  fixture-right ---> info depth 1 score cp 0 nodes 1 time 0
+[Engine] [17:03:23.363266] <     140486379583168>  fixture-right ---> bestmove f1b5
+[TRACE ] [17:03:23.363270] <     140486379583168> fastchess --- Engine fixture-right is done thinking
+[TRACE ] [17:03:23.363273] <     140486379583168> fastchess --- Check if engine fixture-right is in a ready state
+[TRACE ] [17:03:23.363276] <     140486379583168> fastchess --- Pinging engine fixture-right
+[Engine] [17:03:23.363278] <     140486379583168>  fixture-right <--- isready
+[Engine] [17:03:23.363312] <     140486379583168>  fixture-right ---> readyok
+[TRACE ] [17:03:23.363317] <     140486379583168> fastchess --- Engine fixture-right is responsive
+[TRACE ] [17:03:23.363319] <     140486379583168> fastchess --- Engine fixture-right is in a ready state
+[TRACE ] [17:03:23.363337] <     140486379583168> fastchess --- Pinging engine fixture-left
+[Engine] [17:03:23.363340] <     140486379583168>  fixture-left <--- isready
+[Engine] [17:03:23.363404] <     140486379583168>  fixture-left ---> readyok
+[TRACE ] [17:03:23.363420] <     140486379583168> fastchess --- Engine fixture-left is responsive
+[Engine] [17:03:23.363423] <     140486379583168>  fixture-left <--- position startpos moves e2e4 e7e5 g1f3 b8c6 f1b5
+[TRACE ] [17:03:23.363540] <     140486379583168> fastchess --- Pinging engine fixture-left
+[Engine] [17:03:23.363543] <     140486379583168>  fixture-left <--- isready
+[Engine] [17:03:23.363647] <     140486379583168>  fixture-left ---> readyok
+[TRACE ] [17:03:23.363658] <     140486379583168> fastchess --- Engine fixture-left is responsive
+[TRACE ] [17:03:23.363660] <     140486379583168> fastchess --- Engine fixture-left is thinking
+[Engine] [17:03:23.363662] <     140486379583168>  fixture-left <--- go wtime 1000 btime 1000
+[Engine] [17:03:23.363732] <     140486379583168>  fixture-left ---> info depth 1 score cp 0 nodes 1 time 0
+[Engine] [17:03:23.363742] <     140486379583168>  fixture-left ---> bestmove a7a6
+[TRACE ] [17:03:23.363746] <     140486379583168> fastchess --- Engine fixture-left is done thinking
+[TRACE ] [17:03:23.363748] <     140486379583168> fastchess --- Check if engine fixture-left is in a ready state
+[TRACE ] [17:03:23.363751] <     140486379583168> fastchess --- Pinging engine fixture-left
+[Engine] [17:03:23.363752] <     140486379583168>  fixture-left <--- isready
+[Engine] [17:03:23.363804] <     140486379583168>  fixture-left ---> readyok
+[TRACE ] [17:03:23.363814] <     140486379583168> fastchess --- Engine fixture-left is responsive
+[TRACE ] [17:03:23.363817] <     140486379583168> fastchess --- Engine fixture-left is in a ready state
+[TRACE ] [17:03:23.363857] <     140486379583168> fastchess --- Game 2 between fixture-right and fixture-left finished
+[TRACE ] [17:03:23.364059] <     140486379583168> fastchess --- Game 2 finished with result 1/2-1/2
+Finished game 2 (fixture-right vs fixture-left): 1/2-1/2 {Draw by adjudication}
+--------------------------------------------------
+Results of fixture-left vs fixture-right (1, 1t, 1MB, prefix-opening.pgn):
+Elo: -0.00 +/- 0.00, nElo: -nan +/- -nan
+LOS: -nan %, DrawRatio: 100.00 %, PairsRatio: -nan
+Games: 2, Wins: 0, Losses: 0, Draws: 2, Points: 1.0 (50.00 %)
+Ptnml(0-2): [0, 0, 1, 0, 0], WL/DD Ratio: 0.00
+--------------------------------------------------
+[TRACE ] [17:03:23.364168] <                    > fastchess --- No more matches to generate
+[Engine] [17:03:23.364172] <     140486379583168>  fixture-right <--- stop
+[Engine] [17:03:23.364186] <     140486379583168>  fixture-right <--- quit
+[TRACE ] [17:03:23.464366] <     140486379583168> fastchess --- Process with pid: 18356 terminated with status: 0
+[Engine] [17:03:23.464401] <     140486379583168>  <stderr> fixture-right ---> Process exited normally with status 0
+[Engine] [17:03:23.464428] <     140486379583168>  fixture-left <--- stop
+[Engine] [17:03:23.464442] <     140486379583168>  fixture-left <--- quit
+[TRACE ] [17:03:23.564877] <     140486379583168> fastchess --- Process with pid: 18357 terminated with status: 0
+[Engine] [17:03:23.564910] <     140486379583168>  <stderr> fixture-left ---> Process exited normally with status 0
+[TRACE ] [17:03:23.564948] <     140486379583168> fastchess --- Thread 140486379583168 finished match 2
+[TRACE ] [17:03:24.073294] <                    > fastchess --- ~BaseTournament()
+[TRACE ] [17:03:24.073406] <                    > fastchess --- Instructing engines to stop...
+[TRACE ] [17:03:24.073758] <                    > fastchess --- Saving results...
+[TRACE ] [17:03:24.074772] <                    > fastchess --- Saved results to.
+[TRACE ] [17:03:24.075391] <                    > fastchess --- ~TournamentManager()
+Finished match
+[INFO  ] [17:03:24.075418] <                    > fastchess --- Finished match
+
+Total Time: 00:00:01 (hours:minutes:seconds)
+
+[INFO  ] [17:03:24.075495] <                    > fastchess --- Total Time: 00:00:01 (hours:minutes:seconds)
+
+

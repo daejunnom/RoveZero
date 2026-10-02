@@ -1,0 +1,56 @@
+[
+  {
+    "check": "fmt",
+    "argv": [
+      "${CARGO}",
+      "fmt",
+      "--manifest-path",
+      "crates/rz-experiments/Cargo.toml",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0,
+    "log": "reports/e01-fmt.log"
+  },
+  {
+    "check": "test",
+    "argv": [
+      "${CARGO}",
+      "test",
+      "--manifest-path",
+      "crates/rz-experiments/Cargo.toml",
+      "--locked"
+    ],
+    "exit_code": 0,
+    "log": "reports/e01-test.log"
+  },
+  {
+    "check": "clippy",
+    "argv": [
+      "${CARGO}",
+      "clippy",
+      "--manifest-path",
+      "crates/rz-experiments/Cargo.toml",
+      "--all-targets",
+      "--locked",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "log": "reports/e01-clippy.log"
+  },
+  {
+    "check": "msrv-1.85",
+    "argv": [
+      "${CARGO}",
+      "+1.85.0",
+      "check",
+      "--manifest-path",
+      "crates/rz-experiments/Cargo.toml",
+      "--locked"
+    ],
+    "exit_code": 0,
+    "log": "reports/e01-msrv-1.85.log"
+  }
+]

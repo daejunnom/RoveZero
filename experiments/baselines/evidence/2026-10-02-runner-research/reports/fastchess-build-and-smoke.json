@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "purpose": "external_runner_interface_research_and_synthetic_CPU_fixture_only",
+  "source_url": "https://github.com/Disservin/fastchess",
+  "source_commit": "f618e34540f94f4719ad3817950618dabe441318",
+  "source_tag": "v1.8.2-alpha",
+  "source_dirty": false,
+  "version": "fastchess alpha 1.8.2 20260726-f618e34",
+  "binary_path": "${ARTIFACT_ROOT}/tools/fastchess/fastchess",
+  "binary_sha256": "32f16e6bdb88605b38c3956dd5c379957eb33ee9fdf9afe2e5b47e33024eb997",
+  "binary_bytes": 2470064,
+  "build_command": [
+    "make",
+    "-j",
+    "3"
+  ],
+  "compiler": "g++ (Debian 14.2.0-19) 14.2.0",
+  "default_flags": [
+    "-O3",
+    "-std=c++17",
+    "-Wall",
+    "-Wextra",
+    "-DNDEBUG",
+    "-march=native"
+  ],
+  "zlib": false,
+  "cute_output_compile_flag": false,
+  "license": "MIT",
+  "compiled_third_party_notes": [
+    "Pyrrhic MIT",
+    "fmt MIT",
+    "chess-library MIT header",
+    "opening classification data CC0-1.0"
+  ],
+  "fixture_files": [
+    "synthetic-uci.py",
+    "prefix-opening.pgn",
+    "smoke-pair.pgn",
+    "smoke-pair.log",
+    "smoke-pair.stdout",
+    "smoke-pair.stderr",
+    "smoke-t1-argv.json",
+    "smoke-t1-pair.pgn",
+    "smoke-t1-pair.log",
+    "smoke-t1-pair.stdout",
+    "smoke-t1-pair.stderr"
+  ],
+  "verified_interface": [
+    "PGN startpos moves prefix preserved in first position command both swapped games",
+    "rounds=1 games=2 repeat emits two games with colors reversed",
+    "restart=on resends option.Seed and ucinewgame",
+    "st=0.1 emits go movetime 100",
+    "tc=0.010+0.005 emits initial go wtime 15 btime 15 winc 5 binc 5",
+    "stop then quit recorded",
+    "maxmoves=2 counts 4 searched plies after 2 book plies"
+  ],
+  "formal_clock_verified": false,
+  "GPU_verified": false,
+  "playing_strength_verified": false,
+  "cutechess_doc_source": "https://github.com/cutechess/cutechess",
+  "cutechess_doc_commit": "5e84232be4546aaedc9d87a96c91867a1da06ada",
+  "cutechess_built": false,
+  "debug_option_supported": false,
+  "bounded_stdout_uci_log": {
+    "flags": [
+      "-log",
+      "file=/proc/self/fd/1",
+      "append=true",
+      "level=trace",
+      "realtime=true",
+      "engine=true"
+    ],
+    "platform": "Linux",
+    "return_code": 0,
+    "stdout_bytes": 31611,
+    "stderr_bytes": 0,
+    "separate_log_artifact": false,
+    "proves_applied_options": false
+  }
+}

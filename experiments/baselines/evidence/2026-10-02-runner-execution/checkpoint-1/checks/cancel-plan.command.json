@@ -1,0 +1,16 @@
+{
+  "name": "cancel-plan",
+  "argv": [
+    "${ARTIFACT_ROOT}/build/debug/rz-arena",
+    "plan",
+    "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-1/cancel-input-lock.json",
+    "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-1/cancel-plan.json",
+    "--max-pairs",
+    "1",
+    "--max-plan-bytes",
+    "1048576"
+  ],
+  "exit_code": 0,
+  "elapsed_ns": 15887620,
+  "expected_exit_code": 0
+}

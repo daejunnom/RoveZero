@@ -1,0 +1,50 @@
+[Event "Fastchess Tournament"]
+[Site "?"]
+[Date "2026.10.02"]
+[Round "1"]
+[White "fixture-left"]
+[Black "fixture-right"]
+[Result "1/2-1/2"]
+[EngineWhiteName "E02SyntheticFixture"]
+[EngineWhiteAuthor "RoveZero test fixture"]
+[EngineBlackName "E02SyntheticFixture"]
+[EngineBlackAuthor "RoveZero test fixture"]
+[GameDuration "00:00:00"]
+[GameStartTime "2026-10-02T17:03:23 +0000"]
+[GameEndTime "2026-10-02T17:03:23 +0000"]
+[PlyCount "6"]
+[Termination "adjudication"]
+[TimeControl "1"]
+[ECO "C70"]
+[Opening "Ruy Lopez: Morphy Defense"]
+
+1. e2e4 {book} e7e5 {book} 2. g1f3 {0.00/1 0.000s, tl=1.000s, latency=0.000s}
+b8c6 {0.00/1 0.000s, tl=1.000s, latency=0.000s}
+3. f1b5 {0.00/1 0.000s, tl=1.000s, latency=0.000s}
+a7a6 {0.00/1 0.000s, tl=1.000s, latency=0.000s, Draw by adjudication} 1/2-1/2
+
+[Event "Fastchess Tournament"]
+[Site "?"]
+[Date "2026.10.02"]
+[Round "1"]
+[White "fixture-right"]
+[Black "fixture-left"]
+[Result "1/2-1/2"]
+[EngineWhiteName "E02SyntheticFixture"]
+[EngineWhiteAuthor "RoveZero test fixture"]
+[EngineBlackName "E02SyntheticFixture"]
+[EngineBlackAuthor "RoveZero test fixture"]
+[GameDuration "00:00:00"]
+[GameStartTime "2026-10-02T17:03:23 +0000"]
+[GameEndTime "2026-10-02T17:03:23 +0000"]
+[PlyCount "6"]
+[Termination "adjudication"]
+[TimeControl "1"]
+[ECO "C70"]
+[Opening "Ruy Lopez: Morphy Defense"]
+
+1. e2e4 {book} e7e5 {book} 2. g1f3 {0.00/1 0.000s, tl=1.000s, latency=0.000s}
+b8c6 {0.00/1 0.000s, tl=1.000s, latency=0.000s}
+3. f1b5 {0.00/1 0.000s, tl=1.000s, latency=0.000s}
+a7a6 {0.00/1 0.000s, tl=1.000s, latency=0.000s, Draw by adjudication} 1/2-1/2
+

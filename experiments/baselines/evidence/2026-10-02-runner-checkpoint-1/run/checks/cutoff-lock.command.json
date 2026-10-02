@@ -1,0 +1,12 @@
+{
+  "name": "cutoff-lock",
+  "argv": [
+    "${ARTIFACT_ROOT}/build/debug/rz-experiments",
+    "lock",
+    "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-1/cutoff-input.json",
+    "${ARTIFACT_ROOT}/runs/e-runner-checkpoint-1/cutoff-input-lock.json"
+  ],
+  "exit_code": 0,
+  "elapsed_ns": 7779121,
+  "expected_exit_code": 0
+}

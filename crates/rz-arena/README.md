@@ -1,28 +1,34 @@
-# rz-arena — E02 pair 계획과 attempt 원장
+# rz-arena — E02 pair·원장·fixture 실행
 
 같은 opening 입력에 흑백 엔진 배정만 교환하는 pair를 만들고, 모든 game attempt의
-결과·실패를 보존하는 내부 구현이다. E01의 잠긴 입력을 소비하며 새 엔진·Rules·UCI를
-구현하지 않는다. 계획·감사 출력은 모두 **`execution_ready=false`**다.
+결과·실패를 보존한다. E01의 잠긴 입력, A의 checked Rules, 고정 Fastchess를 연결한다.
+테스트 전용 UCI script는 신경망·탐색이 없는 합성 엔진이다. 모든 출력은
+**`execution_ready=false`**이며 실제 NN·GPU·강도 검증을 뜻하지 않는다.
 
 ## PR #7과 계약 연결 경계
 
 [PR #7](https://github.com/daejunnom/RoveZero/pull/7)의 확인한 head는
-`ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8`이다. 총괄의 공통 Rust 계약 revision 0.1이
-게시됐지만 draft/open이며 기준 `develop`에는 아직 병합되지 않았다. 반환된 리뷰 댓글,
-commit status와 PR-triggered workflow run 목록은 비어 있었다. CI 통과로 기록하지 않는다.
+`18339c30754f4f38d957d96aeab481b018b98718`이다. open/ready-for-review이며
+Contracts CPU workflow `37033676814`의 success를 관측했다. E CI의 성공과 구분한다.
+공통 API source는 `67284c4f66f7a7ae9f46fa63dfd50e7410eb6845`에 고정한다.
+아직 `develop`에 병합되지 않은 [A PR #3](https://github.com/daejunnom/RoveZero/pull/3)의
+Rules source `118dc0311a88e143be285703940321dc16261f6a`를 같은 계약 source와 연결한다.
 
 이번 구현의 pair/game/attempt ID와 결과 enum은 E의 영속 기록 형식이다. 공통
 RequestId·Move·신경망 WDL·StateIdentity를 복제하지 않는다. opening은 E01의
 `OpeningSpec`을 재사용한다. 공통 계약의 `PositionSnapshot<P>`는 A가 복원한 상태를
 연결하는 후속 접점이며, 이 코드의 입력 hash를 그 실제 semantic digest로 사용하지 않는다.
-공통 오류·generation·runner/PGN/시계 사건을 연결할 때 계약 0.1의 정확한 revision과
-실제 producer를 확인한다. 계약 연결 전에도 내부 구현을 진행하라는 사용자 지시를 따른다.
+manifest schema 1과 engine contract 0.1은 별개다. 실행·PGN 경계에서는
+`contract_revision="0.1"`만 native `SchemaVersion`으로 변환해 validate하며,
+공통 `ContractError`의 code/stage를 보존한다. source SHA는 schema version과 따로 기록한다.
 
 독립 package workspace로 빌드한다. root workspace·lockfile·CI·공통 타입은 I01 소유다.
 총괄이 정식 member로 등록할 때 두 E package의 `[workspace]` 경계와 임시 lockfile을
 정리하고 같은 통합 SHA로 인수해야 한다. 자체 코드는 [MIT LICENSE](LICENSE)를 따른다.
-의존성은 E01 path dependency와 serde/serde_json/sha2, Unix CLI의 libc이며
-권리와 버전은 [E01 README](../rz-experiments/README.md)의 목록과 같다.
+arena는 A의 요구에 맞춰 Rust 1.90 이상을 사용한다. E01은 1.85를 유지한다.
+E01 path·serde/serde_json/sha2/libc 외에 cap-std/cap-fs-ext 4.0.3,
+nix 0.30.1(MIT), signal-hook 0.3.18(MIT/Apache-2.0), 두 RoveZero Git pin(MIT)을 소비한다.
+root 등록·MSRV·단일 lockfile 통합은 I 소유이며 이 PR에서 root를 변경하지 않는다.
 
 ## 불변 pair 계획
 
@@ -65,7 +71,8 @@ game 기록은 계획 순서로 한 번만 허용한다. 두 판의 기록 없�
 지우지 않는다. 각 outcome은 안전한 논리 경로·SHA·byte 수·공개 출처·권리가 있는
 evidence metadata를 요구한다. 입력·evidence 전체에서 같은 경로의 다른 identity와
 고유 artifact byte 상한 초과를 거부한다. 같은 identity의 재사용은 중복으로 계산하지 않는다.
-실제 evidence 파일 내용·PGN의 진위는 아직 감사하지 않는다.
+일반 원장 replay는 구조 검사다. 아래 fixture adapter에서 생산한 기록만 실제 process와
+A의 PGN 감사 영수증을 연결한다. 외부 선언 원장을 실행 증명으로 승격하지 않는다.
 
 - rules terminal: checkmate는 승패, stalemate/dead-position/자동 5회/75수는 draw만 허용.
 - engine loss: 불법 수·crash·timeout과 책임 엔진을 기록하고 패배로 계산.
@@ -116,9 +123,40 @@ cargo run --manifest-path crates/rz-arena/Cargo.toml -- audit "$ARTIFACT_ROOT/ru
 입력은 bounded UTF-8 regular file이며 Unix에서 final symlink·FIFO blocking을 방지한다.
 쓰기 실패의 부분 파일은 보존하고 오류를 반환한다. audit의 `tip_sha256`을 외부 보존 위치에
 기록한 경우 다음 감사에 `--expected-tip`으로 대조할 수 있다. audit의 성공은
-`validation_scope=structural_only`이고 run 명령은 제공하지 않는다.
+`validation_scope=structural_only`다. 합성 실행은 아래 별도 명령을 사용한다.
 
 ## 현재 인수 범위
+
+`fixture-pair PLAN ARTIFACT_ROOT NEW_OUTPUT_BASENAME --max-pairs 1 --max-plan-bytes N`은
+고정 Fastchess `f618e34540f94f4719ad3817950618dabe441318`의 한 pair를 실제 실행한다.
+fixture·CPU·계약 0.1·한 worker·runner 포함 child 최소 3·증분 없는 정수초 T1만 받는다.
+명령 인수를 직접 전달하고 환경을 초기화하며, E01이 검증한 동일 ELF 핸들로 실행한다.
+caller는 입력 파일 내용과 artifact root/attempt 이름을 실행 중 배타적으로 관리해야 한다.
+
+stdout/stderr는 합산 hard byte cap, PGN/config는 regular-file snapshot cap을 적용한다.
+유한 wall·취소·TERM→KILL·group 정리 상태와 PID·종료 code/signal을 영수증에 기록한다.
+leader PID를 정리 관측 전 reap하지 않으며 외부 child reaper와 SIGCHLD 변경은 지원하지 않는다.
+`pending_child`는 장기 library caller가 후속 reap해야 한다. 저장 실패는 captured bytes와
+process ownership을 `ArenaError::Execution`으로 보존한다. CLI는 실패에 exit 2를 반환한다.
+config.json 자동 저장과 전체 opening prefix도 artifact 예산에 포함한다.
+
+PGN은 A의 실제 `ContractPosition.export()`와 checked transition으로 origin FEN·차례·
+권리·EP·카운터·이력·합법 수·terminal·양색 엔진 배정·실행 순서를 검증한다.
+입력 hash와 A semantic SHA는 별개다. SAN/UCI는 받지만 variation/임의 adjudication/
+claim/불명확 engine-loss는 거부한다. 정확한 cutoff PGN의 runner Draw는 `incomplete`로
+제외한다. 실제 engine-loss는 pinned 종료 이유로 책임이 확인될 때만 기록한다.
+
+Fastchess clock boundary와 자동 draw profile, per-game RNG seed 적용, CPU/RAM/GPU 공정성,
+kernel child/disk quota, runtime/GPU drain은 미검증이다. 탈출·순간 fork를 snapshot으로
+보장하지 않는다. 취소 뒤 자식 좀비가 남은 실제 사례는 `Unverified`·pair 제외로 보존한다.
+본 adapter는 deterministic script fixture만 지원하고 development/formal 강도 실행은 거부한다.
+
+재현은 [run-e-fixture.py](../../experiments/baselines/scripts/run-e-fixture.py),
+검사는 [check-e.py](../../experiments/baselines/scripts/check-e.py)를 사용한다.
+Fastchess binary는 별도로 권리·source/build를 확인해 제공한다. 실행 원본과 재현 절차는
+[원격 보존 목록](../../experiments/baselines/evidence/README.md)에 기록한다.
+
+### E02 초기 내부 구현 당시 인수 범위
 
 내부 plan·사건 회계·JSONL 검증을 CPU와 합성 fixture로 확인한다. 실제 실행 receipt,
 A의 checked opening 복원·독립 참조·전체 PGN, 외부 Fastchess/Cute Chess adapter,

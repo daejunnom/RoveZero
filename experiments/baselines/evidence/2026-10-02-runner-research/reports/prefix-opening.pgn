@@ -1,0 +1,9 @@
+[Event "E02 synthetic runner interface fixture"]
+[Site "Local CPU fixture only"]
+[Date "2026.10.02"]
+[Round "1"]
+[White "Prefix"]
+[Black "Prefix"]
+[Result "*"]
+
+1. e4 e5 *

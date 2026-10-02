@@ -1,0 +1,29 @@
+{
+  "name": "e01-clippy",
+  "argv": [
+    "${CARGO}",
+    "clippy",
+    "--manifest-path",
+    "crates/rz-experiments/Cargo.toml",
+    "--all-targets",
+    "--locked",
+    "--",
+    "-D",
+    "warnings"
+  ],
+  "cwd": "${REPO_ROOT}",
+  "source_git_head": "9e49b6679aeab4e96be0f6b90e51e26a0c7a9ead",
+  "started_utc": "2026-10-02T17:16:35.173613+00:00",
+  "timeout_seconds": 90,
+  "stdout": "e01-clippy.stdout.txt",
+  "stderr": "e01-clippy.stderr.txt",
+  "output_capture": "original_unmodified_bytes",
+  "exit_code": 0,
+  "executed": true,
+  "timed_out": false,
+  "interrupted": false,
+  "termination_scope": "process_group",
+  "status": "passed",
+  "elapsed_seconds": 1.119123,
+  "finished_utc": "2026-10-02T17:16:36.292680+00:00"
+}

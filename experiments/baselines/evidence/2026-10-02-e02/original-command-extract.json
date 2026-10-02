@@ -1,0 +1,805 @@
+{
+  "origin": "original argv/exit/stdout/stderr captured in cli-receipt.json; environment paths sanitized",
+  "source_revision": "e48ff065a431bc6bdd835d75e46e2ed121661f53",
+  "commands": [
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-experiments",
+        "lock",
+        "experiments/baselines/fixtures/e01-input.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/original-lock.json"
+      ],
+      "exit_code": 0,
+      "stdout": "input locked; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "plan",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/original-lock.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/original-plan.json",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "plan created; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-experiments",
+        "lock",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/synthetic-input.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/input-lock.json"
+      ],
+      "exit_code": 0,
+      "stdout": "input locked; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "plan",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/input-lock.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "plan created; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-init",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-0.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger initialized; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-0.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-1.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-1.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-1.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-2.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-2.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-2.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-3.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-3.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-3.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-4.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-4.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-4.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-5.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-5.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-5.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-6.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-6.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-6.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-7.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-7.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-7.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-8.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-8.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-8.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-9.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-9.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-9.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-10.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-10.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-10.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-11.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-11.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-11.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-12.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-12.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-12.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-13.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-13.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-13.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-14.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-14.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-14.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-15.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-15.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-15.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-16.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-16.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-16.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-17.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-17.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-17.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-18.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-18.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-18.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-19.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-19.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-19.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-20.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-20.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-20.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-21.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-21.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-21.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-22.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-22.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-22.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-23.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-23.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "ledger-append",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-23.jsonl",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/event-24.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-24.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "ledger event appended; validation_scope=structural_only; execution_ready=false\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "audit",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-24.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "{\n  \"execution_ready\": false,\n  \"summary\": {\n    \"attempts\": 6,\n    \"candidate_engine\": \"candidate-fixture\",\n    \"closed_attempts\": 6,\n    \"completed_pairs\": 6,\n    \"draws\": 4,\n    \"excluded_pairs\": 0,\n    \"execution_ready\": false,\n    \"failure_counts\": {\n      \"contract_invalid\": 0,\n      \"crash\": 0,\n      \"illegal_move\": 0,\n      \"incomplete\": 0,\n      \"infrastructure_invalid\": 0,\n      \"simultaneous_failure\": 0,\n      \"timeout\": 0\n    },\n    \"input_sha256\": \"382346d3ce99af66f3526cdb56760ce237a0f6d0d0b3f74506068c34e5977907\",\n    \"interpretation_blocked\": false,\n    \"losses\": 4,\n    \"n\": [\n      1,\n      1,\n      2,\n      1,\n      1\n    ],\n    \"pending_pairs\": 0,\n    \"plan_sha256\": \"faba64849bdb5a0ede1f03a8896fa02f96404d6060e1e889099c4382902d56d6\",\n    \"planned_pairs\": 6,\n    \"recorded_games\": 12,\n    \"wins\": 4\n  },\n  \"tip_sha256\": \"69e753347b4a84b7dc7a2473ad3f6f298901c873eda7b5f1edea3bc542b1aa35\",\n  \"validation_scope\": \"structural_only\"\n}\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "audit",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/ledger-24.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576",
+        "--expected-tip",
+        "69e753347b4a84b7dc7a2473ad3f6f298901c873eda7b5f1edea3bc542b1aa35"
+      ],
+      "exit_code": 0,
+      "stdout": "{\n  \"execution_ready\": false,\n  \"summary\": {\n    \"attempts\": 6,\n    \"candidate_engine\": \"candidate-fixture\",\n    \"closed_attempts\": 6,\n    \"completed_pairs\": 6,\n    \"draws\": 4,\n    \"excluded_pairs\": 0,\n    \"execution_ready\": false,\n    \"failure_counts\": {\n      \"contract_invalid\": 0,\n      \"crash\": 0,\n      \"illegal_move\": 0,\n      \"incomplete\": 0,\n      \"infrastructure_invalid\": 0,\n      \"simultaneous_failure\": 0,\n      \"timeout\": 0\n    },\n    \"input_sha256\": \"382346d3ce99af66f3526cdb56760ce237a0f6d0d0b3f74506068c34e5977907\",\n    \"interpretation_blocked\": false,\n    \"losses\": 4,\n    \"n\": [\n      1,\n      1,\n      2,\n      1,\n      1\n    ],\n    \"pending_pairs\": 0,\n    \"plan_sha256\": \"faba64849bdb5a0ede1f03a8896fa02f96404d6060e1e889099c4382902d56d6\",\n    \"planned_pairs\": 6,\n    \"recorded_games\": 12,\n    \"wins\": 4\n  },\n  \"tip_sha256\": \"69e753347b4a84b7dc7a2473ad3f6f298901c873eda7b5f1edea3bc542b1aa35\",\n  \"validation_scope\": \"structural_only\"\n}\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "audit",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/prefix.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576"
+      ],
+      "exit_code": 0,
+      "stdout": "{\n  \"execution_ready\": false,\n  \"summary\": {\n    \"attempts\": 6,\n    \"candidate_engine\": \"candidate-fixture\",\n    \"closed_attempts\": 5,\n    \"completed_pairs\": 5,\n    \"draws\": 4,\n    \"excluded_pairs\": 0,\n    \"execution_ready\": false,\n    \"failure_counts\": {\n      \"contract_invalid\": 0,\n      \"crash\": 0,\n      \"illegal_move\": 0,\n      \"incomplete\": 0,\n      \"infrastructure_invalid\": 0,\n      \"simultaneous_failure\": 0,\n      \"timeout\": 0\n    },\n    \"input_sha256\": \"382346d3ce99af66f3526cdb56760ce237a0f6d0d0b3f74506068c34e5977907\",\n    \"interpretation_blocked\": false,\n    \"losses\": 4,\n    \"n\": [\n      1,\n      1,\n      2,\n      1,\n      0\n    ],\n    \"pending_pairs\": 1,\n    \"plan_sha256\": \"faba64849bdb5a0ede1f03a8896fa02f96404d6060e1e889099c4382902d56d6\",\n    \"planned_pairs\": 6,\n    \"recorded_games\": 12,\n    \"wins\": 2\n  },\n  \"tip_sha256\": \"d3746cfdab6b1d9c336a6c9b6103da207b5612467c428993dac28c0fc8ce7600\",\n  \"validation_scope\": \"structural_only\"\n}\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "${ARTIFACT_ROOT}/build/debug/rz-arena",
+        "audit",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/plan.json",
+        "${ARTIFACT_ROOT}/runs/e02-synthetic-efu89kvr/prefix.jsonl",
+        "--max-pairs",
+        "6",
+        "--max-plan-bytes",
+        "1048576",
+        "--max-events",
+        "64",
+        "--max-ledger-bytes",
+        "1048576",
+        "--expected-tip",
+        "69e753347b4a84b7dc7a2473ad3f6f298901c873eda7b5f1edea3bc542b1aa35"
+      ],
+      "exit_code": 2,
+      "stdout": "",
+      "stderr": "rz-arena: arena integrity: ledger tip checkpoint mismatch\n"
+    }
+  ],
+  "cargo_checks": [
+    {
+      "crate": "rz-experiments",
+      "check": "format",
+      "argv": [
+        "${CARGO}",
+        "fmt",
+        "--manifest-path",
+        "crates/rz-experiments/Cargo.toml"
+      ],
+      "exit_code": 0,
+      "log": "rz-experiments-format.log"
+    },
+    {
+      "crate": "rz-experiments",
+      "check": "fmt",
+      "argv": [
+        "${CARGO}",
+        "fmt",
+        "--manifest-path",
+        "crates/rz-experiments/Cargo.toml",
+        "--",
+        "--check"
+      ],
+      "exit_code": 0,
+      "log": "rz-experiments-fmt.log"
+    },
+    {
+      "crate": "rz-experiments",
+      "check": "test",
+      "argv": [
+        "${CARGO}",
+        "test",
+        "--manifest-path",
+        "crates/rz-experiments/Cargo.toml",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "log": "rz-experiments-test.log"
+    },
+    {
+      "crate": "rz-experiments",
+      "check": "clippy",
+      "argv": [
+        "${CARGO}",
+        "clippy",
+        "--manifest-path",
+        "crates/rz-experiments/Cargo.toml",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "log": "rz-experiments-clippy.log"
+    },
+    {
+      "crate": "rz-experiments",
+      "check": "msrv-1.85",
+      "argv": [
+        "${CARGO}",
+        "+1.85.0",
+        "check",
+        "--manifest-path",
+        "crates/rz-experiments/Cargo.toml",
+        "--all-targets",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "log": "rz-experiments-msrv-1.85.log"
+    },
+    {
+      "crate": "rz-arena",
+      "check": "format",
+      "argv": [
+        "${CARGO}",
+        "fmt",
+        "--manifest-path",
+        "crates/rz-arena/Cargo.toml"
+      ],
+      "exit_code": 0,
+      "log": "rz-arena-format.log"
+    },
+    {
+      "crate": "rz-arena",
+      "check": "fmt",
+      "argv": [
+        "${CARGO}",
+        "fmt",
+        "--manifest-path",
+        "crates/rz-arena/Cargo.toml",
+        "--",
+        "--check"
+      ],
+      "exit_code": 0,
+      "log": "rz-arena-fmt.log"
+    },
+    {
+      "crate": "rz-arena",
+      "check": "test",
+      "argv": [
+        "${CARGO}",
+        "test",
+        "--manifest-path",
+        "crates/rz-arena/Cargo.toml",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "log": "rz-arena-test.log"
+    },
+    {
+      "crate": "rz-arena",
+      "check": "clippy",
+      "argv": [
+        "${CARGO}",
+        "clippy",
+        "--manifest-path",
+        "crates/rz-arena/Cargo.toml",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "log": "rz-arena-clippy.log"
+    },
+    {
+      "crate": "rz-arena",
+      "check": "msrv-1.85",
+      "argv": [
+        "${CARGO}",
+        "+1.85.0",
+        "check",
+        "--manifest-path",
+        "crates/rz-arena/Cargo.toml",
+        "--all-targets",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "log": "rz-arena-msrv-1.85.log"
+    }
+  ]
+}

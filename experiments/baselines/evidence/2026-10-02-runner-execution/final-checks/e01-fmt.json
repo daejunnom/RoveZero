@@ -1,0 +1,27 @@
+{
+  "name": "e01-fmt",
+  "argv": [
+    "${CARGO}",
+    "fmt",
+    "--manifest-path",
+    "crates/rz-experiments/Cargo.toml",
+    "--all",
+    "--",
+    "--check"
+  ],
+  "cwd": "${REPO_ROOT}",
+  "source_git_head": "9e49b6679aeab4e96be0f6b90e51e26a0c7a9ead",
+  "started_utc": "2026-10-02T17:16:33.687524+00:00",
+  "timeout_seconds": 90,
+  "stdout": "e01-fmt.stdout.txt",
+  "stderr": "e01-fmt.stderr.txt",
+  "output_capture": "original_unmodified_bytes",
+  "exit_code": 0,
+  "executed": true,
+  "timed_out": false,
+  "interrupted": false,
+  "termination_scope": "process_group",
+  "status": "passed",
+  "elapsed_seconds": 0.114909,
+  "finished_utc": "2026-10-02T17:16:33.802446+00:00"
+}
