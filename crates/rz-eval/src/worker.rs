@@ -72,12 +72,15 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
             .name("rz-maia-physical".into())
             .spawn(move || {
                 while let Ok(job) = receiver.recv() {
-                    let outcome = match
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&job.input)))
-                    {
-                        Ok(outcome) => outcome,
-                        Err(payload) => PhysicalRun::Quarantined(panic_failure(payload.as_ref())),
-                    };
+                    let outcome =
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run(&job.input)
+                        })) {
+                            Ok(outcome) => outcome,
+                            Err(payload) => {
+                                PhysicalRun::Quarantined(panic_failure(payload.as_ref()))
+                            }
+                        };
                     match outcome {
                         PhysicalRun::Complete(output) => {
                             // Even a dropped logical consumer does not cancel native

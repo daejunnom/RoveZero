@@ -395,31 +395,41 @@ impl std::error::Error for PhysicalFailure {}
 pub fn spawn_onnx_worker<P: Send + Sync + 'static>(
     mut backend: crate::onnx::OnnxBackend,
 ) -> Result<OnnxWorker<P>, ContractError> {
-    crate::worker::SingleWorker::spawn(move |batch: &PreparedBatch<P>| {
-        for item in batch.requests() {
-            if item.backend.0 != backend.identity()
-                || item.request.context().model.manifest.0 != backend.asset_identity()
-            {
-                return Err(error(
-                    ErrorCode::IdentityMismatch,
-                    Stage::Admission,
-                    "batch does not belong to this physical backend",
-                )
-                .into());
+    crate::worker::SingleWorker::spawn_with_outcome(move |batch: &PreparedBatch<P>| {
+        let completed = (|| {
+            for item in batch.requests() {
+                if item.backend.0 != backend.identity()
+                    || item.request.context().model.manifest.0 != backend.asset_identity()
+                {
+                    return Err(error(
+                        ErrorCode::IdentityMismatch,
+                        Stage::Admission,
+                        "batch does not belong to this physical backend",
+                    )
+                    .into());
+                }
             }
+            let inputs = batch
+                .requests()
+                .iter()
+                .map(PreparedRequest::encoded)
+                .collect::<Vec<_>>();
+            let raw = backend.run(&inputs).map_err(PhysicalFailure::from)?;
+            batch
+                .requests()
+                .iter()
+                .zip(raw)
+                .map(|(request, raw)| request.physical_output(&raw, batch.execution()))
+                .collect()
+        })();
+        if let Some(cause) = backend.physical_quarantine_cause() {
+            // CUDA Run returned an error without a completion fence. No
+            // physical_output/ActualCompute or completed error may escape as
+            // Ready; the worker retains this batch and backend until exit.
+            crate::worker::PhysicalRun::Quarantined(cause.clone())
+        } else {
+            crate::worker::PhysicalRun::Complete(completed)
         }
-        let inputs = batch
-            .requests()
-            .iter()
-            .map(PreparedRequest::encoded)
-            .collect::<Vec<_>>();
-        let raw = backend.run(&inputs).map_err(PhysicalFailure::from)?;
-        batch
-            .requests()
-            .iter()
-            .zip(raw)
-            .map(|(request, raw)| request.physical_output(&raw, batch.execution()))
-            .collect()
     })
     .map_err(|failure| backend_error(&failure))
 }

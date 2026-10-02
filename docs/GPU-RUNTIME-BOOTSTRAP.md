@@ -23,6 +23,10 @@ NVIDIA 의존 파일 각각의 이름·byte 수·SHA-256을 잠근다. 이 버�
 
 - manifest는 미지원 schema·추가 필드·중복 이름·경로 성분·빠진 필수 파일·미지원
   basename·과대 할당을 거부한다. 첫 프로필의 NVIDIA 파일은 닫힌 집합으로 지정한다.
+- 복사 manifest의 hash는 파일 identity이며 native 실행 허용 목록은 별도다. 로더는
+  검토한 ORT 3개·NVIDIA 16개의 이름·크기·SHA-256을 소스의 고정 profile과 대조한다.
+  같은 이름의 임의 ELF와 caller가 선언한 새 hash는 거부한다. 다른 release 지원은
+  출처·권리·ABI와 실제 검사를 거친 소스 변경으로 추가한다.
 - bootstrap은 새 private directory에 독립 inode로 streaming copy하고, 길이·hash를
   검증한 뒤 writer를 닫고 읽기 전용으로 바꾼다. 모든 OS file pin과 directory 소유권을
   유지한다. 기존 caller source를 이후 바꾸어도 로드할 사본은 달라지지 않아야 한다.

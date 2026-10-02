@@ -158,10 +158,44 @@ cargo +1.96.0 run --manifest-path crates/rz-eval/Cargo.toml --all-features --exa
 명시한 No/RepeatOldest와 같음을 plane 전체 비교로 확인한다. 일반 FEN_ONLY profile을
 지원한다고 주장하지 않는다.
 
-CUDA 검사 시 마지막 `cpu`를 `cuda "$OUTPUT_DIR/cuda-probe"`로 바꾼다. 지정 GPU와
-ORT 1.22.0 CUDA/cuDNN 호환 runtime을 먼저 준비해야 한다. CPU-only ORT에서는
-BackendUnavailable로 실패해야 하며 이를 GPU 검사 통과로 세지 않는다. target GPU의
-총 VRAM·메모리 peak·수명·종단 계측은 별도 I02 인수가 필요하다.
+CUDA 검사 시 마지막 `cpu`를
+`cuda "$OUTPUT_DIR/cuda-probe" "$GPU_BUNDLE/bundle.json"`으로 바꾼다. 앞쪽의
+`ORT_LIBRARY`·`ORT_SHA256`도 GPU wheel의 core 파일과 SHA로 지정한다. CPU wheel의
+core SHA를 재사용하지 않는다. `cuda-probe`는 REPORT 부모의 새 직계 디렉터리여야
+하며 예제가 생성한다. 이미 존재하는 profile namespace는 거부한다.
+
+Linux CUDA bootstrap의 `CudaRuntimeBundleSpec` schema 1은 `schema_version`과
+`files`를 받는다. 각 파일은 `role`, `filename`, `bytes`, `sha256`이며 role은
+`core`, `providers_shared`, `providers_cuda`, `nvidia_dependency`다. ORT 1.22.0의
+core/shared/CUDA 세 파일과 지정한 NVIDIA 16개를 모두 요구한다. 임의 파일명,
+누락·중복·unknown JSON 필드·잘못된 크기·SHA를 거부한다. JSON 64 KiB, 파일 수 32,
+파일당 1 GiB, 합계 4 GiB가 상한이다. 64 KiB buffer로 새 독립 inode에 복사하고
+writer를 닫은 뒤 파일 `0400`·디렉터리 `0500`을 적용한다. 전체 19개 파일의 retained
+handle과 canonical bundle digest를 보유한다. host driver인 `libcuda`와 OS 기본
+라이브러리는 다운로드 bundle과 구별한다. Windows CUDA bundle은 명시 미지원이다.
+
+`rz-native-loader`는 검증된 NVIDIA 절대 경로를 명시 로드하고 resident 이미지의
+정체성을 검사하는 별도 작은 FFI 경계다. `rz-eval`의 unsafe 금지는 유지한다.
+NVIDIA를 로드하기 전 ORT 3개도 선정한 GPU wheel의 정확한 size·SHA 선언과
+대조한다. ORT가 provider를 로드한 실제 probe 뒤와 숫자·batch·C worker 검사 완료
+후에는 NVIDIA 16개와 ORT 3개의 mapped 이미지를 재검사한다.
+PATH·LD_LIBRARY_PATH 변경, 임의 ambient NVIDIA 또는 CPU fallback을
+허용하지 않는다. runtime latch는 전체 bundle을 비교하며 실패와 부분 native 로드의
+파일·handle도 프로세스 종료까지 보유한다. CUDA backend identity에 bundle과 loader
+정책을 추가하며 기존 CPU 단일 파일 identity와 profile은 유지한다.
+
+CUDA `Run` 오류나 wrapper panic은 물리 완료를 보장하지 않는다. 세션·활성 입력을
+격리하고 `PhysicalRun::Quarantined`를 통해 worker에도 원래 bounded typed 원인을
+보존한다. 그 lease는 Ready·ActualCompute 또는 예약 해제의 근거가 되지 않는다.
+probe panic의 bounded 원문도 별도 local 진단에 보존하며 기본 오류 출력에는 넣지
+않는다. 논리 deadline·취소는 이 물리 소유권을 바꾸지 않는다.
+
+이 추가 GPU 경로의 소스 제공은 실제 C03 통과가 아니다. 목표 RTX 4050에서의 실행,
+수치·kernel placement·mapped origin 인수는 총괄의 별도 실행 증거로 판정한다.
+`maia_check`의 C worker 검사에는 fixture Rules view를 사용하며 실제 A/D GPU 연결을
+증명하지 않는다. 현재 NativeRuntimeBackend/UCI 연결은 CPU 전용이다. CUDA arena cap과
+외부 sampler의 관측치를 전체 VRAM peak·종단 지연·강도 성과로 승격하지 않는다.
+총 VRAM·메모리 peak·GPU 수명·종단 계측은 별도 I02 인수가 필요하다.
 
 직접 Rust dependency의 라이선스는 MIT OR Apache-2.0이며 ONNX Runtime 자체는 MIT와
 포함 third-party notices를 따른다. 선정 원본/ONNX는 upstream GPL-3.0 외부 자산이다.

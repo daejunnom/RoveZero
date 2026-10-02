@@ -141,6 +141,7 @@ wire_enum!(
         RuntimePath,
         RuntimeInitialize,
         RuntimePanic,
+        RuntimeLibraryLoad,
         OrtNative,
         SessionBuilder,
         SessionConfiguration,

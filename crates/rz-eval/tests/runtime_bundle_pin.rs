@@ -10,11 +10,22 @@ const SHARED: &str = "libonnxruntime_providers_shared.so";
 const CUDA: &str = "libonnxruntime_providers_cuda.so";
 const CUDART: &str = "libcudart.so.12";
 const NVIDIA: &[&str] = &[
-    CUDART, "libnvJitLink.so.12", "libnvrtc-builtins.so.12.8", "libnvrtc.so.12",
-    "libcublasLt.so.12", "libcublas.so.12", "libcurand.so.10", "libcufft.so.11",
-    "libcudnn_graph.so.9", "libcudnn_ops.so.9", "libcudnn_adv.so.9", "libcudnn_cnn.so.9",
-    "libcudnn_engines_precompiled.so.9", "libcudnn_engines_runtime_compiled.so.9",
-    "libcudnn_heuristic.so.9", "libcudnn.so.9",
+    CUDART,
+    "libnvJitLink.so.12",
+    "libnvrtc-builtins.so.12.8",
+    "libnvrtc.so.12",
+    "libcublasLt.so.12",
+    "libcublas.so.12",
+    "libcurand.so.10",
+    "libcufft.so.11",
+    "libcudnn_graph.so.9",
+    "libcudnn_ops.so.9",
+    "libcudnn_adv.so.9",
+    "libcudnn_cnn.so.9",
+    "libcudnn_engines_precompiled.so.9",
+    "libcudnn_engines_runtime_compiled.so.9",
+    "libcudnn_heuristic.so.9",
+    "libcudnn.so.9",
 ];
 const FAKE_BYTES: &[u8] = b"authored fake bundle bytes; no native execution";
 
@@ -40,7 +51,11 @@ fn spec() -> CudaRuntimeBundleSpec {
         entry(Role::ProvidersShared, SHARED),
         entry(Role::ProvidersCuda, CUDA),
     ];
-    files.extend(NVIDIA.iter().map(|filename| entry(Role::NvidiaDependency, filename)));
+    files.extend(
+        NVIDIA
+            .iter()
+            .map(|filename| entry(Role::NvidiaDependency, filename)),
+    );
     CudaRuntimeBundleSpec {
         schema_version: 1,
         files,
@@ -48,21 +63,26 @@ fn spec() -> CudaRuntimeBundleSpec {
 }
 
 fn manifest_json(spec: &CudaRuntimeBundleSpec) -> String {
-    let files: Vec<_> = spec.files.iter().map(|file| {
-        let role = match file.role {
-            Role::Core => "core",
-            Role::ProvidersShared => "providers_shared",
-            Role::ProvidersCuda => "providers_cuda",
-            Role::NvidiaDependency => "nvidia_dependency",
-        };
-        format!(
-            "{{\"role\":\"{role}\",\"filename\":\"{}\",\"bytes\":{},\"sha256\":\"{}\"}}",
-            file.filename, file.bytes, file.sha256
-        )
-    }).collect();
+    let files: Vec<_> = spec
+        .files
+        .iter()
+        .map(|file| {
+            let role = match file.role {
+                Role::Core => "core",
+                Role::ProvidersShared => "providers_shared",
+                Role::ProvidersCuda => "providers_cuda",
+                Role::NvidiaDependency => "nvidia_dependency",
+            };
+            format!(
+                "{{\"role\":\"{role}\",\"filename\":\"{}\",\"bytes\":{},\"sha256\":\"{}\"}}",
+                file.filename, file.bytes, file.sha256
+            )
+        })
+        .collect();
     format!(
         "{{\"schema_version\":{},\"files\":[{}]}}",
-        spec.schema_version, files.join(",")
+        spec.schema_version,
+        files.join(",")
     )
 }
 
@@ -71,10 +91,22 @@ fn manifest_rejects_unknown_duplicate_fields_and_unbounded_json() {
     let source = manifest_json(&spec());
     assert!(CudaRuntimeBundleSpec::from_json(&source).is_ok());
     let rejected = [
-        source.replacen("\"schema_version\":1", "\"schema_version\":1,\"unknown\":0", 1),
-        source.replacen("\"schema_version\":1", "\"schema_version\":1,\"schema_version\":1", 1),
+        source.replacen(
+            "\"schema_version\":1",
+            "\"schema_version\":1,\"unknown\":0",
+            1,
+        ),
+        source.replacen(
+            "\"schema_version\":1",
+            "\"schema_version\":1,\"schema_version\":1",
+            1,
+        ),
         source.replacen("\"bytes\":", "\"unknown\":0,\"bytes\":", 1),
-        source.replacen("\"role\":\"core\"", "\"role\":\"core\",\"role\":\"core\"", 1),
+        source.replacen(
+            "\"role\":\"core\"",
+            "\"role\":\"core\",\"role\":\"core\"",
+            1,
+        ),
         source.replacen("\"sha256\":", "\"bytes\":1,\"sha256\":", 1),
         format!("{source}{}", " ".repeat(64 * 1024)),
     ];
@@ -90,7 +122,13 @@ fn canonical_identity_survives_order_and_binds_size_and_content() {
     let mut reordered = original.clone();
     reordered.files.reverse();
     assert_eq!(expected, reordered.digest().unwrap());
-    assert_eq!(expected, CudaRuntimeBundleSpec::from_json(&manifest_json(&reordered)).unwrap().digest().unwrap());
+    assert_eq!(
+        expected,
+        CudaRuntimeBundleSpec::from_json(&manifest_json(&reordered))
+            .unwrap()
+            .digest()
+            .unwrap()
+    );
     let mut changed_size = original.clone();
     changed_size.files[0].bytes += 1;
     assert_ne!(expected, changed_size.digest().unwrap());
@@ -104,7 +142,12 @@ fn canonical_identity_survives_order_and_binds_size_and_content() {
 
 #[test]
 fn manifest_rejects_unsafe_names_wrong_roles_missing_core_and_bad_hashes() {
-    for filename in ["../libcudart.so.12", "/tmp/libcudart.so.12", "..\\libcudart.so.12", "libunknown.so.12"] {
+    for filename in [
+        "../libcudart.so.12",
+        "/tmp/libcudart.so.12",
+        "..\\libcudart.so.12",
+        "libunknown.so.12",
+    ] {
         let mut invalid = spec();
         invalid.files[3].filename = filename.into();
         assert!(invalid.validate().is_err());
@@ -118,7 +161,10 @@ fn manifest_rejects_unsafe_names_wrong_roles_missing_core_and_bad_hashes() {
     assert!(invalid.validate().is_err());
     let mut invalid = spec();
     invalid.files.pop();
-    assert!(invalid.validate().is_err(), "the first GPU profile requires all 16 NVIDIA entries");
+    assert!(
+        invalid.validate().is_err(),
+        "the first GPU profile requires all 16 NVIDIA entries"
+    );
     let mut invalid = spec();
     invalid.files.push(invalid.files[3].clone());
     assert!(invalid.validate().is_err());
@@ -152,7 +198,10 @@ fn manifest_enforces_file_count_individual_and_total_byte_budgets() {
     assert!(excessive.validate().is_err());
     let remaining_file_bytes = (excessive.files.len() - 4) as u64;
     excessive.files[3].bytes -= remaining_file_bytes;
-    assert!(excessive.validate().is_ok(), "exactly 4 GiB is within the manifest budget");
+    assert!(
+        excessive.validate().is_ok(),
+        "exactly 4 GiB is within the manifest budget"
+    );
 }
 
 #[test]
@@ -182,30 +231,51 @@ mod linux {
         output: PathBuf,
     }
 
+    fn payload(file: &RuntimeBundleFile) -> Vec<u8> {
+        format!(
+            "authored fake bundle bytes; role={:?}; filename={}; no native execution\n",
+            file.role, file.filename
+        )
+        .into_bytes()
+    }
+
     impl Fixture {
-        fn new(spec: &CudaRuntimeBundleSpec) -> Self {
+        fn new(spec: &mut CudaRuntimeBundleSpec) -> Self {
             let base = std::env::var_os("RUNNER_TEMP")
                 .map(PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir)
-                .join("RoveZero").join("tmp").join("native-bundle-tests");
+                .join("RoveZero")
+                .join("tmp")
+                .join("native-bundle-tests");
             fs::create_dir_all(&base).unwrap();
             let root = base.canonicalize().unwrap().join(format!(
-                "{}-{}", std::process::id(), NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+                "{}-{}",
+                std::process::id(),
+                NEXT_TEST.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&root).unwrap();
             let source = root.join("source");
             let output = root.join("output");
             fs::create_dir(&source).unwrap();
             fs::create_dir(&output).unwrap();
-            for file in &spec.files {
-                fs::write(source.join(&file.filename), FAKE_BYTES).unwrap();
+            for file in &mut spec.files {
+                let bytes = payload(file);
+                file.bytes = bytes.len() as u64;
+                file.sha256 = hex(&bytes);
+                fs::write(source.join(&file.filename), bytes).unwrap();
             }
-            Self { root, source, output }
+            Self {
+                root,
+                source,
+                output,
+            }
         }
 
         fn bundle_directory(&self) -> PathBuf {
-            let entries: Vec<_> = fs::read_dir(&self.output).unwrap()
-                .map(|entry| entry.unwrap().path()).collect();
+            let entries: Vec<_> = fs::read_dir(&self.output)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].parent(), Some(self.output.as_path()));
             assert!(entries[0].is_dir());
@@ -242,12 +312,21 @@ mod linux {
 
     #[test]
     fn copied_bundle_is_immutable_from_source_and_survives_pin_clone() {
-        let spec = spec();
-        let fixture = Fixture::new(&spec);
-        let pin = RuntimeLibraryPin::copy_cuda_bundle(&fixture.source, &fixture.output, &spec).unwrap();
+        let mut spec = spec();
+        let fixture = Fixture::new(&mut spec);
+        let pin =
+            RuntimeLibraryPin::copy_cuda_bundle(&fixture.source, &fixture.output, &spec).unwrap();
         let directory = fixture.bundle_directory();
-        assert_eq!(fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o500);
-        let expected_core_digest: [u8; 32] = Sha256::digest(FAKE_BYTES).into();
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        let core = spec
+            .files
+            .iter()
+            .find(|file| file.role == Role::Core)
+            .unwrap();
+        let expected_core_digest: [u8; 32] = Sha256::digest(payload(core)).into();
         assert_eq!(pin.binary_digest(), expected_core_digest);
         assert_eq!(pin.bundle_digest(), Some(spec.digest().unwrap()));
         let mut expected_files = spec.files.clone();
@@ -255,9 +334,16 @@ mod linux {
         assert_eq!(pin.bundle_files().unwrap(), expected_files.as_slice());
         for file in &spec.files {
             let owned = directory.join(&file.filename);
-            assert_eq!(fs::metadata(&owned).unwrap().permissions().mode() & 0o777, 0o400);
-            fs::write(fixture.source.join(&file.filename), b"source replaced after issue").unwrap();
-            assert_eq!(fs::read(owned).unwrap(), FAKE_BYTES);
+            assert_eq!(
+                fs::metadata(&owned).unwrap().permissions().mode() & 0o777,
+                0o400
+            );
+            fs::write(
+                fixture.source.join(&file.filename),
+                b"source replaced after issue",
+            )
+            .unwrap();
+            assert_eq!(fs::read(owned).unwrap(), payload(file));
         }
         let debug = format!("{pin:?}");
         assert!(!debug.contains(fixture.root.to_str().unwrap()));
@@ -265,7 +351,13 @@ mod linux {
         let cloned = pin.clone();
         drop(pin);
         assert_eq!(cloned.bundle_digest(), Some(spec.digest().unwrap()));
-        assert_eq!(fs::read(directory.join(CUDA)).unwrap(), FAKE_BYTES);
+        assert_eq!(cloned.bundle_files().unwrap(), expected_files.as_slice());
+        for file in &spec.files {
+            assert_eq!(
+                fs::read(directory.join(&file.filename)).unwrap(),
+                payload(file)
+            );
+        }
         drop(cloned);
         fixture.release();
     }
@@ -274,31 +366,46 @@ mod linux {
     fn late_hash_or_length_failure_cleans_only_unpublished_bundle() {
         for wrong_length in [false, true] {
             let mut spec = spec();
+            // Establish the valid, per-file source identities before corrupting
+            // one manifest entry; Fixture::new must not repair that corruption.
+            let fixture = Fixture::new(&mut spec);
             if wrong_length {
                 spec.files[1].bytes += 1;
             } else {
                 spec.files[1].sha256 = hex(b"different authored fixture");
             }
-            let fixture = Fixture::new(&spec);
             let preserved = fixture.output.join("unrelated-authored.fixture");
             fs::write(&preserved, b"preserve this unrelated test file").unwrap();
-            assert!(RuntimeLibraryPin::copy_cuda_bundle(&fixture.source, &fixture.output, &spec).is_err());
+            assert!(
+                RuntimeLibraryPin::copy_cuda_bundle(&fixture.source, &fixture.output, &spec)
+                    .is_err()
+            );
             assert_eq!(fs::read_dir(&fixture.output).unwrap().count(), 1);
-            assert_eq!(fs::read(preserved).unwrap(), b"preserve this unrelated test file");
-            assert_eq!(fs::read(fixture.source.join(CORE)).unwrap(), FAKE_BYTES);
+            assert_eq!(
+                fs::read(preserved).unwrap(),
+                b"preserve this unrelated test file"
+            );
+            assert_eq!(
+                fs::read(fixture.source.join(CORE)).unwrap(),
+                payload(&spec.files[0])
+            );
             fixture.release();
         }
     }
 
     #[test]
     fn source_symlink_and_symlink_root_are_rejected_without_copy() {
-        let spec = spec();
-        let fixture = Fixture::new(&spec);
+        let mut spec = spec();
+        let fixture = Fixture::new(&mut spec);
         let library = fixture.source.join(CUDA);
-        fs::remove_file(&library).unwrap();
-        symlink(fixture.source.join(CORE), &library).unwrap();
-        assert!(RuntimeLibraryPin::copy_cuda_bundle(&fixture.source, &fixture.output, &spec).is_err());
+        fs::rename(&library, fixture.source.join("cuda-target.fixture")).unwrap();
+        symlink(fixture.source.join("cuda-target.fixture"), &library).unwrap();
+        assert!(
+            RuntimeLibraryPin::copy_cuda_bundle(&fixture.source, &fixture.output, &spec).is_err()
+        );
         assert_eq!(fs::read_dir(&fixture.output).unwrap().count(), 0);
+        fs::remove_file(&library).unwrap();
+        fs::rename(fixture.source.join("cuda-target.fixture"), &library).unwrap();
         let alias = fixture.root.join("source-alias");
         symlink(&fixture.source, &alias).unwrap();
         assert!(RuntimeLibraryPin::copy_cuda_bundle(&alias, &fixture.output, &spec).is_err());
@@ -315,6 +422,7 @@ fn nonlinux_gpu_bundle_is_explicitly_unavailable_before_any_copy() {
         std::path::Path::new("unopened-source"),
         std::path::Path::new("unopened-output"),
         &spec(),
-    ).unwrap_err();
+    )
+    .unwrap_err();
     assert!(error.detail.contains("require Linux"));
 }

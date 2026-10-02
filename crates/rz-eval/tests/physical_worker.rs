@@ -1,4 +1,6 @@
-use rz_eval::error::{BackendError, CauseCode, ExternalCause, FailureKind, FailureStage, CAUSE_PREFIX_BYTES};
+use rz_eval::error::{
+    BackendError, CauseCode, ExternalCause, FailureKind, FailureStage, CAUSE_PREFIX_BYTES,
+};
 use rz_eval::worker::{PhysicalPoll, PhysicalRun, SingleWorker};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -118,16 +120,20 @@ fn explicit_unknown_completion_preserves_native_cause_and_retains_one_job_and_ba
         FailureStage::Backend,
         "injected native run completion is unknown",
     )
-    .with_external_cause(CauseCode::OrtRun, &"injected physical completion uncertainty")
+    .with_external_cause(
+        CauseCode::OrtRun,
+        &"injected physical completion uncertainty",
+    )
     .with_diagnostic("NativeRunUnknown", "injected native execution failure");
     let injected = expected.clone();
     let run_calls = Arc::clone(&calls);
-    let mut worker = SingleWorker::spawn_with_outcome(move |_: &Arc<CountDrop>| -> PhysicalRun<()> {
-        let _backend_pin = &backend_pin;
-        run_calls.fetch_add(1, Ordering::SeqCst);
-        PhysicalRun::Quarantined(injected.clone())
-    })
-    .unwrap();
+    let mut worker =
+        SingleWorker::spawn_with_outcome(move |_: &Arc<CountDrop>| -> PhysicalRun<()> {
+            let _backend_pin = &backend_pin;
+            run_calls.fetch_add(1, Ordering::SeqCst);
+            PhysicalRun::Quarantined(injected.clone())
+        })
+        .unwrap();
     let input = Arc::new(CountDrop(Arc::clone(&input_drops)));
     let weak = Arc::downgrade(&input);
     let mut lease = worker.submit(input).unwrap();
@@ -159,7 +165,10 @@ fn explicit_unknown_completion_preserves_native_cause_and_retains_one_job_and_ba
     assert_eq!(lease.quarantine_cause().unwrap(), Some(expected));
     drop(lease);
     drop(worker);
-    assert!(weak.upgrade().is_some(), "unknown native job remains pinned");
+    assert!(
+        weak.upgrade().is_some(),
+        "unknown native job remains pinned"
+    );
     assert_eq!(input_drops.load(Ordering::SeqCst), 0);
     assert_eq!(backend_drops.load(Ordering::SeqCst), 0);
 }
