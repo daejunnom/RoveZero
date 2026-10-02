@@ -49,12 +49,12 @@ fn scope() -> AcceptanceScope {
     }
 }
 
-fn request_in_domain(
+fn try_request_in_domain(
     sequence: u64,
     epoch: ProcessEpoch,
     clock: ClockDomain,
     at: u64,
-) -> Arc<EvalRequest<()>> {
+) -> Result<Arc<EvalRequest<()>>, ContractError> {
     let scope = scope();
     let state = StateIdentity {
         owner: OwnerId(3),
@@ -101,43 +101,50 @@ fn request_in_domain(
         )
         .unwrap(),
     );
-    Arc::new(
-        EvalRequest::try_new(
-            EvalContext {
-                revision: CONTRACT_REVISION,
-                request: RequestId::new(epoch, sequence),
-                selection: SelectionId::new(epoch, sequence),
-                game: scope.game,
-                root: scope.root,
-                state,
-                legal_order,
-                input: EvalInputKey(digest(9)),
-                model: scope.model,
-                encoding: scope.encoding,
-                precision: PrecisionProfile::Fp32,
-                compute: ComputeBudget {
-                    min_steps: 4,
-                    max_steps: 4,
-                    require_full: true,
-                },
-                backend: scope.backend,
+    EvalRequest::try_new(
+        EvalContext {
+            revision: CONTRACT_REVISION,
+            request: RequestId::new(epoch, sequence),
+            selection: SelectionId::new(epoch, sequence),
+            game: scope.game,
+            root: scope.root,
+            state,
+            legal_order,
+            input: EvalInputKey(digest(9)),
+            model: scope.model,
+            encoding: scope.encoding,
+            precision: PrecisionProfile::Fp32,
+            compute: ComputeBudget {
+                min_steps: 4,
+                max_steps: 4,
+                require_full: true,
             },
-            position,
-            legal,
-            model,
-            Deadline {
-                clock,
-                at: MonotonicTick(at),
-            },
-            CancelToken::new(),
-            ByteBudget {
-                host: 11,
-                device: 13,
-                pinned: 5,
-            },
-        )
-        .unwrap(),
+            backend: scope.backend,
+        },
+        position,
+        legal,
+        model,
+        Deadline {
+            clock,
+            at: MonotonicTick(at),
+        },
+        CancelToken::new(),
+        ByteBudget {
+            host: 11,
+            device: 13,
+            pinned: 5,
+        },
     )
+    .map(Arc::new)
+}
+
+fn request_in_domain(
+    sequence: u64,
+    epoch: ProcessEpoch,
+    clock: ClockDomain,
+    at: u64,
+) -> Arc<EvalRequest<()>> {
+    try_request_in_domain(sequence, epoch, clock, at).unwrap()
 }
 
 fn request(sequence: u64, at: u64) -> Arc<EvalRequest<()>> {
@@ -417,19 +424,28 @@ fn common_evaluator_success_echoes_the_actual_physical_execution() {
 fn foreign_epoch_or_deadline_clock_is_rejected_without_a_completion() {
     let mut fixture = fixture(2);
     for request in [
-        request_in_domain(1, ProcessEpoch(8), CLOCK_DOMAIN, 100),
-        request_in_domain(2, EPOCH, ClockDomain(ProcessEpoch(8)), 100),
+        request_in_domain(1, ProcessEpoch(8), ClockDomain(ProcessEpoch(8)), 100),
+        request_in_domain(2, ProcessEpoch(9), ClockDomain(ProcessEpoch(9)), 100),
     ] {
         let error = fixture.runtime.submit(request).unwrap_err();
-        assert!(matches!(
-            error.code,
-            ErrorCode::IdentityMismatch | ErrorCode::InvalidInput
-        ));
+        assert_eq!(error.code, ErrorCode::IdentityMismatch);
         assert_eq!(fixture.runtime.state().reserved_requests, 0);
         assert_eq!(fixture.runtime.state().reserved, Resources::default());
         assert!(fixture.runtime.poll().is_none());
     }
     assert!(fixture.backend.executions.lock().unwrap().is_empty());
+}
+
+#[test]
+fn shared_constructor_rejects_mixed_request_and_deadline_epochs() {
+    for (epoch, clock) in [
+        (ProcessEpoch(8), CLOCK_DOMAIN),
+        (EPOCH, ClockDomain(ProcessEpoch(8))),
+    ] {
+        let error = try_request_in_domain(1, epoch, clock, 100).unwrap_err();
+        assert_eq!(error.code, ErrorCode::IdentityMismatch);
+        assert_eq!(error.stage, Stage::Admission);
+    }
 }
 
 #[test]

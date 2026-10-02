@@ -5,7 +5,7 @@
 
 use crate::{
     Adapter, Backend, Clock, CompletionReceiver, DrainState, Limits, Resources, RuntimeFault,
-    Scheduler, State, TerminalEvent,
+    Scheduler, SchedulerObservations, ShutdownSnapshot, State, TerminalEvent,
 };
 use rz_contracts::*;
 use rz_telemetry::Snapshot;
@@ -433,6 +433,15 @@ where
 
     pub fn metrics(&self) -> Snapshot {
         self.scheduler.metrics()
+    }
+
+    /// Drain passive observations without releasing unread completion receipts.
+    pub fn take_observations(&mut self) -> SchedulerObservations<ContractsAdapter<P, C>> {
+        self.scheduler.take_observations()
+    }
+
+    pub fn shutdown_snapshot(&self) -> ShutdownSnapshot {
+        self.scheduler.shutdown_snapshot()
     }
 
     pub fn begin_shutdown(&mut self, deadline: Deadline) -> Result<(), ContractError> {
