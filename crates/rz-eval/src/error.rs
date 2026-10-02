@@ -5,7 +5,8 @@ use std::fmt::{self, Write};
 
 /// Diagnostic identity, not an error-message archive or a cryptographic proof
 /// of execution. Format at most this many external bytes; never retain or emit
-/// a library's raw text, which may contain private paths or unbounded payloads.
+/// a library's raw text in this receipt. Separate bounded local diagnostics are
+/// opt-in and are never rendered by BackendError Display/Debug or common errors.
 pub const CAUSE_PREFIX_BYTES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,6 +14,7 @@ pub enum CauseCode {
     RuntimePath,
     RuntimeInitialize,
     RuntimePanic,
+    OrtNative,
     SessionBuilder,
     SessionConfiguration,
     ProviderQuery,
@@ -137,12 +139,32 @@ pub enum FailureStage {
     Output,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackendError {
     pub kind: FailureKind,
     pub stage: FailureStage,
     pub detail: &'static str,
     pub cause: Option<ExternalCause>,
+    /// Bounded local diagnostics, never copied into the common ContractError.
+    pub native: Option<Box<NativeDiagnostic>>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct NativeDiagnostic {
+    pub code: String,
+    pub message: String,
+    pub truncated: bool,
+}
+
+impl std::fmt::Debug for NativeDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Reading the raw native text is an explicit local diagnostics operation.
+        f.debug_struct("NativeDiagnostic")
+            .field("code", &self.code)
+            .field("message_bytes", &self.message.len())
+            .field("truncated", &self.truncated)
+            .finish()
+    }
 }
 
 impl BackendError {
@@ -152,6 +174,7 @@ impl BackendError {
             stage,
             detail,
             cause: None,
+            native: None,
         }
     }
 
@@ -194,7 +217,38 @@ impl BackendError {
         let mut cause = ExternalCause::capture(CauseCode::OutputValidation, source);
         cause.output = Some(context);
         self.cause = Some(cause);
+        self.with_diagnostic("OutputValidation", &source.to_string())
+    }
+
+    pub fn with_diagnostic(mut self, code: &str, message: &str) -> Self {
+        fn bounded(text: &str, limit: usize) -> String {
+            let mut end = text.len().min(limit);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text[..end].to_owned()
+        }
+        self.native = Some(Box::new(NativeDiagnostic {
+            code: bounded(code, 64),
+            message: bounded(message, 1024),
+            truncated: code.len() > 64 || message.len() > 1024,
+        }));
         self
+    }
+
+    #[cfg(feature = "onnx")]
+    pub(crate) fn with_ort(self, error: ort::Error) -> Self {
+        let error_with_cause = if self.cause.is_none() {
+            self.with_external_cause(CauseCode::OrtNative, &error)
+        } else {
+            self
+        };
+        error_with_cause.with_diagnostic(&format!("{:?}", error.code()), error.message())
+    }
+
+    #[cfg(feature = "onnx")]
+    pub(crate) fn with_ort_cause(self, code: CauseCode, error: ort::Error) -> Self {
+        self.with_external_cause(code, &error).with_ort(error)
     }
 }
 
@@ -223,17 +277,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn external_cause_is_bounded_copy_and_never_formats_raw_text() {
+    fn external_cause_is_bounded_cloneable_and_never_formats_raw_text() {
         let source = "synthetic/private/runtime/path: vendor failure";
         let error = BackendError::new(
             FailureKind::BackendFailure,
             FailureStage::Backend,
             "synchronous ORT Run failed",
         )
-        .with_external_cause(CauseCode::OrtRun, &source);
-        fn assert_copy<T: Copy>(_: T) {}
-        assert_copy(error);
+        .with_external_cause(CauseCode::OrtRun, &source)
+        .with_diagnostic("VendorCode", source);
         let cause = error.cause.unwrap();
+        assert_eq!(error.clone(), error);
+        assert_eq!(error.native.as_ref().unwrap().message, source);
         assert_eq!(cause.code, CauseCode::OrtRun);
         assert_eq!(usize::from(cause.hashed_bytes), source.len());
         assert!(!cause.truncated);
@@ -275,7 +330,7 @@ mod tests {
             "model output rejected",
         );
         assert_eq!(
-            base.with_output_cause(&crate::output::OutputError::NonFinite {
+            base.clone().with_output_cause(&crate::output::OutputError::NonFinite {
                 head: crate::output::Head::Policy,
                 index: 17,
             })

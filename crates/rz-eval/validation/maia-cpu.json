@@ -1,0 +1,187 @@
+{
+  "scope": "C internal implementation; not full A/B/D engine integration or GPU acceptance",
+  "tested_source_commit": "bce5821b6dc7883e9ff1e9342dff92bb5a263f57",
+  "contract_revision": "0.1",
+  "contract_commit": "18339c30754f4f38d957d96aeab481b018b98718",
+  "pr7_merge_commit": "3e3cd80533a69ee2118f1c130e72a1cb0745ae8c",
+  "toolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "msrv": "Rust 1.85.0 cargo check --all-targets --all-features --locked passed",
+  "local_tests": {
+    "rz_eval_all_features": 27,
+    "rz_eval_default": 20,
+    "rz_encoding": 11,
+    "distinct_total": 38
+  },
+  "checks": [
+    "cargo test default and all-features",
+    "cargo clippy all-targets all-features -D warnings",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "standalone_lock_sha256": "e6a88946d9252639a37a7609221511c197f5ac9da8ee8f593c7737a8702299fe",
+  "rust_checker_binary_sha256": "d119c4f2557b38f85448d1e62a859439c60de0fcffc8394af2d5c16a599638c0",
+  "cpu_reference": {
+    "batch_checks": [
+      {
+        "batch": 1,
+        "single_vs_batch_logit_max_abs": 0.0
+      },
+      {
+        "batch": 2,
+        "single_vs_batch_logit_max_abs": 0.0
+      },
+      {
+        "batch": 4,
+        "single_vs_batch_logit_max_abs": 0.0
+      },
+      {
+        "batch": 8,
+        "single_vs_batch_logit_max_abs": 0.0
+      },
+      {
+        "batch": 16,
+        "single_vs_batch_logit_max_abs": 0.0
+      }
+    ],
+    "case_errors": [
+      {
+        "case": "start",
+        "legal_policy_max_abs": 4.470348358154297e-07,
+        "logit_max_abs": 9.655952453613281e-06,
+        "wdl_max_abs": 3.3527612686157227e-08
+      },
+      {
+        "case": "black-after-e4",
+        "legal_policy_max_abs": 7.450580596923828e-07,
+        "logit_max_abs": 1.0251998901367188e-05,
+        "wdl_max_abs": 2.9802322387695312e-08
+      },
+      {
+        "case": "eight-ply-opening",
+        "legal_policy_max_abs": 2.9802322387695312e-08,
+        "logit_max_abs": 6.318092346191406e-06,
+        "wdl_max_abs": 5.960464477539063e-08
+      },
+      {
+        "case": "repeated-start-with-history",
+        "legal_policy_max_abs": 1.30385160446167e-07,
+        "logit_max_abs": 5.7220458984375e-06,
+        "wdl_max_abs": 1.4901161193847656e-08
+      },
+      {
+        "case": "same-board-unknown-prefix",
+        "legal_policy_max_abs": 3.5762786865234375e-07,
+        "logit_max_abs": 8.58306884765625e-06,
+        "wdl_max_abs": 2.9802322387695312e-08
+      },
+      {
+        "case": "white-en-passant",
+        "legal_policy_max_abs": 1.1026859283447266e-06,
+        "logit_max_abs": 8.58306884765625e-06,
+        "wdl_max_abs": 1.9371509552001953e-07
+      },
+      {
+        "case": "black-en-passant",
+        "legal_policy_max_abs": 1.1622905731201172e-06,
+        "logit_max_abs": 7.62939453125e-06,
+        "wdl_max_abs": 1.7881393432617188e-07
+      },
+      {
+        "case": "white-both-castles",
+        "legal_policy_max_abs": 9.238719940185547e-07,
+        "logit_max_abs": 5.7220458984375e-06,
+        "wdl_max_abs": 3.5762786865234375e-07
+      },
+      {
+        "case": "black-both-castles",
+        "legal_policy_max_abs": 1.6093254089355469e-06,
+        "logit_max_abs": 6.67572021484375e-06,
+        "wdl_max_abs": 7.450580596923828e-08
+      },
+      {
+        "case": "white-all-promotions",
+        "legal_policy_max_abs": 5.066394805908203e-07,
+        "logit_max_abs": 8.106231689453125e-06,
+        "wdl_max_abs": 4.470348358154297e-08
+      },
+      {
+        "case": "black-all-promotions",
+        "legal_policy_max_abs": 1.7881393432617188e-07,
+        "logit_max_abs": 5.7220458984375e-06,
+        "wdl_max_abs": 2.384185791015625e-07
+      },
+      {
+        "case": "short-fen-history",
+        "legal_policy_max_abs": 7.748603820800781e-07,
+        "logit_max_abs": 6.67572021484375e-06,
+        "wdl_max_abs": 6.705522537231445e-08
+      }
+    ],
+    "contract_worker": {
+      "canceled_rejected": 1,
+      "physical_outputs": 4,
+      "scope": "C worker plus contract 0.1; fixture Rules view; D scheduler not linked",
+      "status": "passed"
+    },
+    "cuda_executed_nodes": null,
+    "fixture_sha256": "e97d9342eef55181ac8b3bbf4778342c662c9e851d2c4d144f4ad64e61deae94",
+    "gpu_acceptance": "not_run",
+    "onnx_sha256": "f72492271f6476cd249546b3d790b35db50107a0623a5a08066bf7b28ea04e72",
+    "precision": "fp32",
+    "provider": "cpu",
+    "reference": "lc0-v0.32.1-eigen-original-protobuf",
+    "reference_commit": "fd71a2d921b689c5f479d3227c3806c8e272d9c5",
+    "reference_module_sha256": "a4fd9f680e60fe3053cb3142fc04933eb30273272af8446d1f31819912b5b19f",
+    "runtime_build": "ORT Build Info: git-branch=HEAD, git-commit-id=f217402897, build type=Release, cmake cxx flags: -DNDEBUG -Wp,-D_FORTIFY_SOURCE=2 -Wp,-D_GLIBCXX_ASSERTIONS -fstack-protector-strong -O3 -pipe -fstack-clash-protection -fcf-protection -ffunction-sections -fdata-sections -DCPUINFO_SUPPORTED",
+    "runtime_sha256": "7520bc1b4f649ee8fa956442a66ded303e8fd3b465b0159b7e893bdc87df4e38",
+    "status": "passed",
+    "tf32": false,
+    "tolerances": {
+      "legal_policy_max_abs": 0.0001,
+      "raw_logits_atol": 0.0001,
+      "raw_logits_rtol": 0.001,
+      "wdl_max_abs": 0.0001
+    }
+  },
+  "process_limit": {
+    "seconds": 60,
+    "address_space_bytes": 2147483648,
+    "max_observed_child_rss_kib": 38704,
+    "note": "one bounded validation invocation, not throughput/latency or GPU memory benchmark"
+  },
+  "asset_failure_checks": [
+    {
+      "case": "corrupt-onnx",
+      "exit_code": 1,
+      "expected_error": "IdentityMismatch",
+      "status": "passed",
+      "diagnostic": "Error: BackendError { kind: IdentityMismatch, stage: Asset, detail: \"asset length or SHA-256 differs\", native: None }"
+    },
+    {
+      "case": "wrong-precision",
+      "exit_code": 1,
+      "expected_error": "UnsupportedModel",
+      "status": "passed",
+      "diagnostic": "Error: BackendError { kind: UnsupportedModel, stage: Asset, detail: \"only the selected Maia FP32 export profile is supported\", native: None }"
+    },
+    {
+      "case": "wrong-runtime-digest",
+      "exit_code": 1,
+      "expected_error": "IdentityMismatch",
+      "status": "passed",
+      "diagnostic": "Error: BackendError { kind: IdentityMismatch, stage: Backend, detail: \"ORT library digest differs\", native: None }"
+    }
+  ],
+  "cuda_request": {
+    "exit_code": 1,
+    "error": "BackendUnavailable",
+    "cpu_fallback": false,
+    "gpu_inference": "not_run"
+  },
+  "not_run": [
+    "actual RTX 4050 CUDA inference and VRAM/lifetime validation",
+    "A checked Rules projection and D scheduler / B backup integration",
+    "UCI / paired games / strength evaluation"
+  ],
+  "raw_evidence_root": "/workspace/rovezero-c-output/reports"
+}

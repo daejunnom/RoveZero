@@ -464,6 +464,9 @@ dependencies = [
 [[package]]
 name = "rz-search"
 version = "0.1.0"
+dependencies = [
+ "rz-contracts",
+]
 
 [[package]]
 name = "rz-telemetry"

@@ -64,7 +64,7 @@ impl OrtRuntime {
                     "ORT library is process-global and already pinned",
                 ));
             }
-            let runtime = latch.result.as_ref().map_err(|error| *error)?;
+            let runtime = latch.result.as_ref().map_err(Clone::clone)?;
             return if runtime.pin.binary_digest() == pin.binary_digest() {
                 Ok(runtime.clone())
             } else {
@@ -83,7 +83,7 @@ impl OrtRuntime {
                 .with_name("RoveZero-C")
                 .commit()
                 .map_err(|error| {
-                    unavailable().with_external_cause(CauseCode::RuntimeInitialize, &error)
+                    unavailable().with_ort_cause(CauseCode::RuntimeInitialize, error)
                 })?
             {
                 return Err(BackendError::new(
@@ -93,7 +93,11 @@ impl OrtRuntime {
                 ));
             }
             let info = ort::info();
-            if !info.contains("git-branch=rel-1.22.0,") {
+            // Official wheels use git-branch=HEAD; the tag's source commit is
+            // authoritative, while the bootstrap-supplied digest pins the build.
+            if !info.contains("git-commit-id=f217402897,")
+                && !info.contains("git-commit-id=f217402897f40ebba457e2421bc0a4702771968e,")
+            {
                 return Err(BackendError::new(
                     K::BackendUnavailable,
                     S::Backend,
@@ -188,6 +192,12 @@ impl BackendConfig {
                     "CUDA requires device, arena cap and profile path",
                 ));
             }
+        } else if self.profiling_prefix.is_some() {
+            return Err(BackendError::new(
+                K::InvalidInput,
+                S::Admission,
+                "profiling is limited to the one-shot CUDA placement probe",
+            ));
         }
         Ok(())
     }
@@ -201,6 +211,9 @@ pub struct CudaEvidence {
 
 pub struct OnnxBackend {
     session: Session,
+    // Kept outside the Run stack so worker quarantine also pins tensor storage
+    // if a Rust wrapper unexpectedly unwinds before attesting completion.
+    active_input: Option<Tensor<f32>>,
     config: BackendConfig,
     identity: [u8; 32],
     asset_identity: [u8; 32],
@@ -220,7 +233,7 @@ impl OnnxBackend {
                 S::Backend,
                 "ORT session/provider setup failed",
             )
-            .with_external_cause(code, &error)
+            .with_ort_cause(code, error)
         };
         let mut builder = Session::builder()
             .map_err(|error| setup_error(CauseCode::SessionBuilder, error))?
@@ -288,7 +301,7 @@ impl OnnxBackend {
                     S::Backend,
                     "ORT could not load the verified model with the requested provider",
                 )
-                .with_external_cause(CauseCode::ModelLoad, &error)
+                .with_ort_cause(CauseCode::ModelLoad, error)
             })?;
         validate_interface(&session)?;
         // This is a versioned C backend identity, not a new global wire codec.
@@ -296,6 +309,7 @@ impl OnnxBackend {
             runtime.binary_digest(), asset.manifest_digest(), config.provider, config.intra_threads, config.max_batch);
         let mut result = Self {
             session,
+            active_input: None,
             config,
             identity: asset::sha256(profile.as_bytes()),
             asset_identity: asset.manifest_digest(),
@@ -304,7 +318,24 @@ impl OnnxBackend {
         if matches!(result.config.provider, Provider::Cuda { .. }) {
             // A registered provider alone proves nothing. Synchronous physical
             // execution plus ORT kernel placement is required before returning.
-            result.run_values(&[&vec![0.0; INPUT_VALUES]])?;
+            let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                result.run_values(&[&vec![0.0; INPUT_VALUES]])
+            }));
+            match probe {
+                Ok(completed) => {
+                    completed?;
+                }
+                Err(_) => {
+                    // Bootstrap has no runtime lease yet. Retain this session and
+                    // active tensor if an unexpected unwind leaves completion unknown.
+                    std::mem::forget(result);
+                    return Err(BackendError::new(
+                        K::BackendFailure,
+                        S::Backend,
+                        "CUDA probe unwound; session quarantined until process exit",
+                    ));
+                }
+            }
             let path = result
                 .session
                 .end_profiling()
@@ -350,6 +381,13 @@ impl OnnxBackend {
 
     /// Dense entry point for independent reference fixtures, still fully checked.
     pub fn run_values(&mut self, inputs: &[&[f32]]) -> Result<Vec<RawOutput>, BackendError> {
+        if self.active_input.is_some() {
+            return Err(BackendError::new(
+                K::BackendUnavailable,
+                S::Backend,
+                "previous run did not attest physical completion",
+            ));
+        }
         if inputs.is_empty() || inputs.len() > self.config.max_batch {
             return Err(BackendError::new(
                 K::ResourceExhausted,
@@ -381,24 +419,28 @@ impl OnnxBackend {
         for input in inputs {
             dense.extend_from_slice(input);
         }
-        let input = Tensor::from_array(([inputs.len(), 112, 8, 8], dense)).map_err(|error| {
-            BackendError::new(
-                K::BackendFailure,
-                S::Backend,
-                "cannot create ORT input tensor",
-            )
-            .with_external_cause(CauseCode::TensorCreate, &error)
-        })?;
+        self.active_input = Some(
+            Tensor::from_array(([inputs.len(), 112, 8, 8], dense)).map_err(|error| {
+                BackendError::new(
+                    K::BackendFailure,
+                    S::Backend,
+                    "cannot create ORT input tensor",
+                )
+                .with_ort_cause(CauseCode::TensorCreate, error)
+            })?,
+        );
         // No RunOptions enabling asynchronous EP execution or terminate-on-cancel.
         // On both success and error ORT's default synchronous Run has returned
         // before input/output storage is released. D keeps its lease throughout.
-        let outputs = self
+        let run_result = self
             .session
-            .run(ort::inputs![INPUT_NAME => input])
-            .map_err(|error| {
-                BackendError::new(K::BackendFailure, S::Backend, "synchronous ORT Run failed")
-                    .with_external_cause(CauseCode::OrtRun, &error)
-            })?;
+            .run(ort::inputs![INPUT_NAME => self.active_input.as_ref()
+            .ok_or(BackendError::new(K::BackendFailure, S::Backend, "input pin is missing"))?]);
+        self.active_input = None;
+        let outputs = run_result.map_err(|error| {
+            BackendError::new(K::BackendFailure, S::Backend, "synchronous ORT Run failed")
+                .with_ort_cause(CauseCode::OrtRun, error)
+        })?;
         let malformed = || {
             BackendError::new(
                 K::NumericalFailure,
@@ -410,12 +452,12 @@ impl OnnxBackend {
             .get(POLICY_NAME)
             .ok_or_else(malformed)?
             .try_extract_tensor::<f32>()
-            .map_err(|error| malformed().with_external_cause(CauseCode::PolicyExtract, &error))?;
+            .map_err(|error| malformed().with_ort_cause(CauseCode::PolicyExtract, error))?;
         let (wdl_shape, wdl) = outputs
             .get(WDL_NAME)
             .ok_or_else(malformed)?
             .try_extract_tensor::<f32>()
-            .map_err(|error| malformed().with_external_cause(CauseCode::WdlExtract, &error))?;
+            .map_err(|error| malformed().with_ort_cause(CauseCode::WdlExtract, error))?;
         if policy_shape.as_ref() != [inputs.len() as i64, POLICY_SIZE as i64]
             || wdl_shape.as_ref() != [inputs.len() as i64, 3]
         {

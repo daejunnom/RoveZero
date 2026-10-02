@@ -2,6 +2,7 @@
 name = "rz-eval"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 license = "MIT"
 description = "RoveZero model evaluation and deterministic backend test support"
 publish = false
@@ -24,3 +25,7 @@ rz-runtime = { workspace = true, optional = true, features = ["contracts"] }
 default = []
 onnx = ["dep:ort"]
 contracts = ["dep:rz-contracts", "dep:rz-position", "dep:rz-runtime"]
+
+[[example]]
+name = "maia_check"
+required-features = ["onnx"]

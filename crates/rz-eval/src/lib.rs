@@ -10,6 +10,10 @@ pub mod error;
 pub mod mock;
 pub mod output;
 pub mod runtime_pin;
+pub mod worker;
+
+#[cfg(feature = "contracts")]
+pub mod contracts;
 
 #[cfg(feature = "onnx")]
 pub mod onnx;
