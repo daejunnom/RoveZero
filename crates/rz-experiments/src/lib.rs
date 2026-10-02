@@ -32,7 +32,9 @@ impl fmt::Display for ManifestError {
         match self {
             Self::Validation(issues) => {
                 for (i, issue) in issues.iter().enumerate() {
-                    if i > 0 { writeln!(f)?; }
+                    if i > 0 {
+                        writeln!(f)?;
+                    }
                     write!(f, "{} [{}]: {}", issue.path, issue.code, issue.message)?;
                 }
                 Ok(())
@@ -72,7 +74,8 @@ impl<'de> Deserialize<'de> for UniqueValue {
                 Ok(UniqueValue(v.into()))
             }
             fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
-                serde_json::Number::from_f64(v).map(|n| UniqueValue(n.into()))
+                serde_json::Number::from_f64(v)
+                    .map(|n| UniqueValue(n.into()))
                     .ok_or_else(|| E::custom("non-finite JSON number"))
             }
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
@@ -84,13 +87,23 @@ impl<'de> Deserialize<'de> for UniqueValue {
             fn visit_unit<E>(self) -> Result<Self::Value, E> {
                 Ok(UniqueValue(serde_json::Value::Null))
             }
-            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> { self.visit_unit() }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<Self::Value, A::Error> {
                 let mut values = Vec::new();
-                while let Some(v) = a.next_element::<UniqueValue>()? { values.push(v.0); }
+                while let Some(v) = a.next_element::<UniqueValue>()? {
+                    values.push(v.0);
+                }
                 Ok(UniqueValue(values.into()))
             }
-            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<Self::Value, A::Error> {
                 let mut map = serde_json::Map::new();
                 while let Some(key) = a.next_key::<String>()? {
                     if map.contains_key(&key) {
@@ -109,7 +122,7 @@ pub(crate) fn parse<T: serde::de::DeserializeOwned>(input: &str) -> Result<T, Ma
     if input.len() > MAX_MANIFEST_BYTES {
         return Err(ManifestError::Parse("input exceeds 4 MiB limit".into()));
     }
-    let unique: UniqueValue = serde_json::from_str(input)
-        .map_err(|e| ManifestError::Parse(e.to_string()))?;
+    let unique: UniqueValue =
+        serde_json::from_str(input).map_err(|e| ManifestError::Parse(e.to_string()))?;
     serde_json::from_value(unique.0).map_err(|e| ManifestError::Parse(e.to_string()))
 }

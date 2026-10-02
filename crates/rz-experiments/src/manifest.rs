@@ -21,6 +21,7 @@ pub struct RunManifest {
     pub change: Change,
     pub research_path: ResearchPath,
     pub contract_revision: Option<String>,
+    pub allowed_option_change: Option<String>,
     pub engines: Vec<EngineSpec>,
     pub hardware: HardwareSpec,
     pub input: InputSpec,
@@ -39,22 +40,66 @@ macro_rules! choices {
         pub enum $name { $($variant),+ }
     };
 }
-choices!(RunPurpose { Fixture, Development, Formal });
-choices!(Comparison { Fixture, InternalSearch, InternalWeights, Runtime, ExternalLc0 });
-choices!(Change { MeaningPreserving, Model, Search });
-choices!(ResearchPath { Gpu, Hybrid, Cpu, Offline });
-choices!(EngineKind { Fixture, RoveZero, Lc0 });
+choices!(RunPurpose {
+    Fixture,
+    Development,
+    Formal
+});
+choices!(Comparison {
+    Fixture,
+    InternalSearch,
+    InternalWeights,
+    Runtime,
+    ExternalLc0
+});
+choices!(Change {
+    MeaningPreserving,
+    Model,
+    Search
+});
+choices!(ResearchPath {
+    Gpu,
+    Hybrid,
+    Cpu,
+    Offline
+});
+choices!(EngineKind {
+    Fixture,
+    RoveZero,
+    Lc0
+});
 choices!(Device { Cpu, Gpu });
-choices!(HistoryCompleteness { Complete, UnknownPrefix });
+choices!(HistoryCompleteness {
+    Complete,
+    UnknownPrefix
+});
 choices!(InitialPosition { Startpos, Fen });
-choices!(InputSplit { Fixture, Tuning, Holdout });
-choices!(Residency { CpuOnly, Concurrent, Swap });
-choices!(ClaimPolicy { ExplicitClaim, AutomaticAcceptance });
-choices!(OutcomePolicy { Loss, Incomplete, ContractInvalid });
+choices!(InputSplit {
+    Fixture,
+    Tuning,
+    Holdout
+});
+choices!(Residency {
+    CpuOnly,
+    Concurrent,
+    Swap
+});
+choices!(ClaimPolicy {
+    ExplicitClaim,
+    AutomaticAcceptance
+});
+choices!(OutcomePolicy {
+    Loss,
+    Incomplete,
+    ContractInvalid
+});
 choices!(SamplePlan { FixedSample });
 choices!(EloScale { Logistic });
 choices!(ClusterUnit { Opening });
-choices!(CiMethod { None, OpeningClusterBootstrap });
+choices!(CiMethod {
+    None,
+    OpeningClusterBootstrap
+});
 choices!(PairOrder { Alternating });
 choices!(RerunPolicy { WholePair });
 
@@ -93,6 +138,7 @@ pub struct EngineSpec {
     pub encoding_id: String,
     pub evaluator_id: String,
     pub search_id: String,
+    pub runtime_id: String,
     pub backend: String,
     pub precision: String,
     pub device: Device,
@@ -281,39 +327,63 @@ struct LockEnvelope {
 }
 
 impl RunManifest {
-    pub fn from_json(input: &str) -> Result<Self, ManifestError> { parse(input) }
+    pub fn from_json(input: &str) -> Result<Self, ManifestError> {
+        parse(input)
+    }
 
-    pub fn validate(&self) -> Result<(), ManifestError> { crate::validation::validate(self) }
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        crate::validation::validate(self)
+    }
 
     pub fn lock(self) -> Result<LockedManifest, ManifestError> {
         self.validate()?;
         let sha256 = digest(&self.canonical_bytes()?);
-        Ok(LockedManifest { input: self, sha256 })
+        Ok(LockedManifest {
+            input: self,
+            sha256,
+        })
     }
 
-    // V1: typed declaration field order; sorted BTreeMap keys; UTF-8 compact
-    // serde_json; integer-only numbers; explicit null/empty values; no envelope.
+    // V1: recursively sorted object keys; UTF-8 compact serde_json;
+    // integer-only numbers; explicit null/empty values; no envelope.
     fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestError> {
-        serde_json::to_vec(self).map_err(|e| ManifestError::Integrity(e.to_string()))
+        let mut value =
+            serde_json::to_value(self).map_err(|e| ManifestError::Integrity(e.to_string()))?;
+        value.sort_all_objects();
+        serde_json::to_vec(&value).map_err(|e| ManifestError::Integrity(e.to_string()))
     }
 
     pub(crate) fn artifacts(&self) -> Vec<&ArtifactRef> {
         let mut refs = vec![&self.input.opening_artifact, &self.protocol.runner.binary];
-        if let Some(p) = &self.protocol.runner.dirty_patch { refs.push(p); }
-        if let Some(p) = &self.lifecycle.warmup_input { refs.push(p); }
+        if let Some(p) = &self.protocol.runner.dirty_patch {
+            refs.push(p);
+        }
+        if let Some(p) = &self.lifecycle.warmup_input {
+            refs.push(p);
+        }
         for engine in &self.engines {
             refs.push(&engine.tool.binary);
-            if let Some(p) = &engine.tool.dirty_patch { refs.push(p); }
-            if let Some(p) = &engine.weight { refs.push(p); }
-            if let Some(o) = &engine.observation { refs.push(&o.evidence); }
+            if let Some(p) = &engine.tool.dirty_patch {
+                refs.push(p);
+            }
+            if let Some(p) = &engine.weight {
+                refs.push(p);
+            }
+            if let Some(o) = &engine.observation {
+                refs.push(&o.evidence);
+            }
         }
         refs
     }
 }
 
 impl LockedManifest {
-    pub fn input(&self) -> &RunManifest { &self.input }
-    pub fn sha256(&self) -> &str { &self.sha256 }
+    pub fn input(&self) -> &RunManifest {
+        &self.input
+    }
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
 
     pub fn to_json(&self) -> Result<String, ManifestError> {
         let envelope = LockEnvelope {
@@ -323,17 +393,20 @@ impl LockedManifest {
             input_sha256: self.sha256.clone(),
             input: self.input.clone(),
         };
-        serde_json::to_string_pretty(&envelope)
-            .map_err(|e| ManifestError::Integrity(e.to_string()))
+        serde_json::to_string_pretty(&envelope).map_err(|e| ManifestError::Integrity(e.to_string()))
     }
 
     pub fn from_json(input: &str) -> Result<Self, ManifestError> {
         let envelope: LockEnvelope = parse(input)?;
         if envelope.lock_version != 1 || envelope.canonicalization != CANONICALIZATION {
-            return Err(ManifestError::Integrity("unsupported lock/canonicalization version".into()));
+            return Err(ManifestError::Integrity(
+                "unsupported lock/canonicalization version".into(),
+            ));
         }
         if envelope.execution_ready {
-            return Err(ManifestError::Integrity("E01 input lock cannot authorize execution".into()));
+            return Err(ManifestError::Integrity(
+                "E01 input lock cannot authorize execution".into(),
+            ));
         }
         let locked = envelope.input.lock()?;
         if locked.sha256 != envelope.input_sha256 {

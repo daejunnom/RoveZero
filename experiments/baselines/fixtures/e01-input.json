@@ -45,7 +45,8 @@
         "Ponder": "false",
         "Threads": "1"
       },
-      "observation": null
+      "observation": null,
+      "runtime_id": "fixture-no-runtime"
     },
     {
       "id": "baseline-fixture",
@@ -80,7 +81,8 @@
         "Ponder": "false",
         "Threads": "1"
       },
-      "observation": null
+      "observation": null,
+      "runtime_id": "fixture-no-runtime"
     }
   ],
   "hardware": {
@@ -226,5 +228,6 @@
     "max_child_processes": 2,
     "max_output_bytes": 1048576,
     "max_artifact_bytes": 1048576
-  }
+  },
+  "allowed_option_change": null
 }

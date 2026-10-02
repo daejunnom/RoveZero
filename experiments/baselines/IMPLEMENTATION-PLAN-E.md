@@ -1,9 +1,9 @@
 # E 역할 구현 계획 — TASK-E01/E02/E03
 
 작성일: 2026-10-03, Asia/Seoul. 담당: 사용자가 E 역할로 배정한 이 채팅의 에이전트.
-상태: 원격 문서 확인을 마친 구현 계획. 코드·빌드·대국·통계 검증 결과가 아니다.
+상태: E01 입력 단계의 첫 구현·로컬 검증 완료. 구현 진행과 실제 근거는 9절에 기록한다.
 
-## 1. 기준과 현재 상태
+## 1. 계획 수립 당시 기준과 상태
 
 원격 `main`과 `develop`에서 확인한 기준은
 `9f0bc598f6b2d8f863fd46af6a4fd73bfef1f0b8`이다. 두 브랜치는 같은 SHA이며,
@@ -225,4 +225,24 @@ T2 100/1,000ms는 제안이며 이 계획으로 실행값을 확정하지 않는
 저장소에는 작은 독립 fixture·재현 설정·검토 가능한 요약만 포함한다.
 
 첫 실제 구현 단위는 E01의 draft/locked manifest와 필수 필드·digest·예산 검증이다.
-이 계획 작성에서는 엔진 코드·가중치 다운로드·대국·CI 실행과 원격 변경을 수행하지 않았다.
+초기 계획 작성 시에는 엔진 코드·가중치 다운로드·대국·CI 실행과 원격 변경을 수행하지 않았다.
+
+## 9. 첫 구현 진행 — 2026-10-03, Asia/Seoul
+
+`crates/rz-experiments`에 E01의 typed manifest, strict JSON 검증, canonical SHA-256
+입력 잠금과 bounded artifact 대조를 구현했다. `validate`, `lock`, `verify` CLI로
+합성 입력의 잠금·재검증이 가능하다. 실제 실행 시작·옵션 관측·결과 영수증은 아직
+구현하지 않았으며 모든 잠금은 `execution_ready=false`다. 상세 계약·명령·한계는
+[crate README](../../crates/rz-experiments/README.md)에 기록한다.
+
+계획 수립 이후 Rust toolchain을 설치했다. Linux x86_64에서 Rust 1.99.0으로
+CLI 9개와 library 22개, 총 31개 테스트 및 fmt/clippy 검사를 통과했고,
+선언한 MSRV Rust 1.85.0에서도 `cargo check --locked`를 통과했다.
+독립 Python canonical JSON 계산과 잠금 digest가 일치하며, 합성 artifact의 크기와
+SHA-256을 실제 파일에서 대조했다. 의존성 resolution도 별도 lockfile로 보존한다.
+이는 입력 단계의 CPU 검사이며 CI·실제 엔진 대국·NN 수치·GPU·통계 계산 근거가 아니다.
+
+루트 workspace·Cargo.lock·CI·공통 타입은 총괄 I01 소유로 남겨 두었다.
+다음 구현 단위는 E02의 동일한 전체 시작 상태를 공유하는 color-swapped pair 계획과
+attempt/failure 원장이다. A의 상태 계약과 독립 opening 감사, runner의 실제 옵션·시계·
+종료 사건 연결 후 실행 인수를 진행한다. E03 집계·군집 통계·독립 holdout 비교는 후속이다.

@@ -1,7 +1,7 @@
 use rz_experiments::{LockedManifest, MAX_MANIFEST_BYTES, RunManifest};
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -176,43 +176,11 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("cannot create output (existing files are preserved): {error}"))?;
     let result = file.write_all(bytes).and_then(|()| file.sync_all());
     if let Err(error) = result {
-        if let Err(cleanup_error) = check_output_identity(path, &file) {
-            return Err(format!(
-                "cannot write output: {error}; partial file cleanup refused: {cleanup_error}"
-            ));
-        }
-        drop(file);
-        return match fs::remove_file(path) {
-            Ok(()) => Err(format!(
-                "cannot write output; partial file removed: {error}"
-            )),
-            Err(cleanup_error) => Err(format!(
-                "cannot write output: {error}; partial file cleanup failed: {cleanup_error}"
-            )),
-        };
+        // A pathname can be replaced between checking its identity and unlinking.
+        // Keep partial evidence rather than risking deletion of another file.
+        return Err(format!(
+            "cannot write output; partial output preserved for inspection: {error}"
+        ));
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn check_output_identity(path: &Path, file: &File) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    let opened = file
-        .metadata()
-        .map_err(|error| format!("cannot inspect opened output: {error}"))?;
-    let current = fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect output path: {error}"))?;
-    if !current.is_file() || current.dev() != opened.dev() || current.ino() != opened.ino() {
-        return Err(
-            "output path no longer identifies the file created by this command".to_string(),
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_output_identity(_path: &Path, _file: &File) -> Result<(), String> {
-    // std offers no portable file identity. Preserve partial evidence rather than
-    // risking deletion of a replacement output on these platforms.
-    Err("automatic partial-file removal is unsupported on this platform".to_string())
 }
