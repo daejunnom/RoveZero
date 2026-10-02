@@ -4,9 +4,12 @@ E01/E02와 외부 runner 개발의 작은 검증 자료를 E 소유 경로와 �
 보존한다. 입력·잠금·계획·각 단계 원장·결과·실행 영수증·PGN/config·TSV·원본 검사
 stdout/stderr·실행 명령을 포함한다. D/F 자료는 각각 담당의 소유 범위다.
 
-공개 사본은 453개 파일, 약 1.8 MB이며 최대 파일도 약 255 KB다.
+공개 사본은 검증 기록을 포함해 454개 파일, 약 1.8 MB이며 최대 파일도 약 255 KB다.
 448개 자료 파일은 아래 inventory에 개별 hash를 기록하고, inventory 4개와 이 안내문을
-함께 보존한다. 전체 remote Git blob을 공개 사본의 SHA-256과 대조해 확인한다.
+함께 보존한다. 전체 remote Git blob을 공개 사본의 SHA-256과 대조했다.
+확인한 원격 SHA·파일 수·방법·명령은 [REMOTE-VERIFICATION.json](REMOTE-VERIFICATION.json)에
+보존한다. 이 기록은 명시된 이전 immutable checkpoint를 검증한 것으로 이후 파일까지
+소급 인증하지 않는다. 최종 push도 다시 fetch해 모든 공개 파일을 대조한다.
 
 | 묶음 | 파일 목록·SHA-256·source·누락·마스킹 |
 |---|---|

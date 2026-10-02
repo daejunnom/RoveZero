@@ -1,0 +1,58 @@
+{
+  "verification_version": 1,
+  "verified_utc": "2026-10-02T17:29:06.203586+00:00",
+  "repository": "https://github.com/daejunnom/RoveZero",
+  "branch": "feature/e-implementation-plan",
+  "remote_revision": "0cc9937701f2e5e24faa40e845636447c56c7381",
+  "method": "fresh git fetch; exact tree membership and SHA-256 of every remote Git blob compared with reviewed public files",
+  "public_files_verified": 453,
+  "public_bytes_verified": 1784061,
+  "all_files_match": true,
+  "inventories": {
+    "experiments/baselines/evidence/2026-10-02-e02/INVENTORY.json": {
+      "sha256": "e7cfae7f8f875c2df9bac844ab9f534562e2cf236343eeb8b465f4a5ecc7bd1b",
+      "bytes": 70821
+    },
+    "experiments/baselines/evidence/2026-10-02-runner-checkpoint-1/INVENTORY.json": {
+      "sha256": "e92522145d21a26b4b8194102f3f485d80ecc2e2fa9c9f1d26a1258bf94ff1e2",
+      "bytes": 55956
+    },
+    "experiments/baselines/evidence/2026-10-02-runner-execution/INVENTORY.json": {
+      "sha256": "a58ecd0d8f46d4db09f6a6652061c2687cc904da51ad7df09734ed1dbc7c4e0a",
+      "bytes": 255028
+    },
+    "experiments/baselines/evidence/2026-10-02-runner-research/INVENTORY.json": {
+      "sha256": "6a3cc4be2a3e93cbbe49803d0c4c71df6ed5397ab61f47ccaf58aedb450f20ee",
+      "bytes": 21635
+    }
+  },
+  "commands": [
+    [
+      "git",
+      "fetch",
+      "origin",
+      "feature/e-implementation-plan"
+    ],
+    [
+      "git",
+      "ls-tree",
+      "-r",
+      "-z",
+      "0cc9937701f2e5e24faa40e845636447c56c7381",
+      "--",
+      "experiments/baselines/evidence"
+    ],
+    [
+      "git",
+      "cat-file",
+      "blob",
+      "<each verified tree blob oid>"
+    ]
+  ],
+  "actual_vs_synthetic": "actual remote preservation verification; archived engines/results remain synthetic fixtures",
+  "originals_deleted": false,
+  "excluded_from_this_historical_snapshot": [
+    "this later verification record and subsequent edits to the index README"
+  ],
+  "note": "This verifies the stated immutable revision, not future commits. Final push is independently fetched and compared again."
+}
