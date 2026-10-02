@@ -1,15 +1,18 @@
 #![cfg(target_os = "linux")]
 
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask};
+use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
 use nix::unistd::Pid;
 use rz_arena::{
-    ArenaError, ArtifactWatch, CleanupStatus, ProcessLimits, ProcessStop, supervise,
-    supervise_in_directory, supervise_with_watch,
+    ArenaError, ArtifactWatch, CleanupStatus, OwnedArtifactTreeWatch, ProcessLimits, ProcessStop,
+    supervise, supervise_in_directory, supervise_in_directory_with_tree, supervise_with_watch,
 };
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -57,6 +60,15 @@ fn limits() -> ProcessLimits {
         shutdown_grace_ms: 100,
         max_output_bytes: 16_384,
         max_child_processes: 1,
+    }
+}
+
+fn tree_watch() -> OwnedArtifactTreeWatch {
+    OwnedArtifactTreeWatch {
+        max_total_bytes: 1024,
+        max_file_bytes: 1024,
+        max_files: 16,
+        max_depth: 4,
     }
 }
 
@@ -155,11 +167,343 @@ fn directory_handle_remains_bound_after_its_former_path_is_replaced() {
     );
     assert!(!scratch.0.join("match.pgn").exists());
     assert_eq!(result.receipt.watched_artifact_bytes, Some(25));
+
+    // Runtime-created nested artifacts are measured against the same inode,
+    // even after the former path has been replaced with another directory.
+    std::fs::create_dir_all(relocated.0.join("onnxruntime/session")).unwrap();
+    std::fs::write(
+        relocated.0.join("onnxruntime/session/cache"),
+        b"runtime cache",
+    )
+    .unwrap();
+    let tree_result = supervise_in_directory_with_tree(
+        &program,
+        &fixture_args("fixture_cwd_marker"),
+        &directory,
+        limits(),
+        None,
+        &tree_watch(),
+    )
+    .unwrap();
+    assert_eq!(tree_result.receipt.stop, ProcessStop::Exited);
+    assert_eq!(tree_result.receipt.group_cleanup, CleanupStatus::Gone);
+    assert_eq!(tree_result.receipt.watched_artifact_bytes, Some(38));
+    assert_eq!(
+        tree_result.receipt.artifact_limit_enforcement.as_deref(),
+        Some("owned_tree_snapshot")
+    );
+    assert!(tree_result.receipt.errors.is_empty());
+    assert!(tree_result.pending_child.is_none());
+    assert!(!scratch.0.join("match.pgn").exists());
     let not_directory = File::open(std::env::current_exe().unwrap()).unwrap();
     assert!(matches!(
         supervise_in_directory(&program, &[], &not_directory, limits(), None, None),
         Err(ArenaError::Invalid(_))
     ));
+}
+
+#[test]
+fn tree_snapshot_enforces_each_finite_limit() {
+    for (case, code) in [
+        ("file_bytes", "process.artifact_tree.file_bytes"),
+        ("total_bytes", "process.artifact_tree.total_bytes"),
+        ("file_count", "process.artifact_tree.file_count"),
+        ("directory_count", "process.artifact_tree.directory_count"),
+        ("depth", "process.artifact_tree.depth"),
+    ] {
+        let scratch = Scratch::new();
+        let mut watch = tree_watch();
+        match case {
+            "file_bytes" => {
+                watch.max_file_bytes = 32;
+                std::fs::write(scratch.0.join("output"), [b'x'; 33]).unwrap();
+            }
+            "total_bytes" => {
+                std::fs::write(scratch.0.join("first"), [b'x'; 600]).unwrap();
+                std::fs::write(scratch.0.join("second"), [b'x'; 600]).unwrap();
+            }
+            "file_count" => {
+                watch.max_files = 1;
+                std::fs::write(scratch.0.join("first"), b"x").unwrap();
+                std::fs::write(scratch.0.join("second"), b"x").unwrap();
+            }
+            "directory_count" => {
+                watch.max_files = 1;
+                std::fs::create_dir(scratch.0.join("first")).unwrap();
+                std::fs::create_dir(scratch.0.join("second")).unwrap();
+            }
+            "depth" => {
+                watch.max_depth = 1;
+                std::fs::create_dir_all(scratch.0.join("onnxruntime/session")).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let program = File::open(std::env::current_exe().unwrap()).unwrap();
+        let directory = File::open(&scratch.0).unwrap();
+        let result = supervise_in_directory_with_tree(
+            &program,
+            &fixture_args("fixture_sleep"),
+            &directory,
+            limits(),
+            None,
+            &watch,
+        )
+        .unwrap();
+        assert_eq!(result.receipt.stop, ProcessStop::ArtifactLimit, "{case}");
+        assert_eq!(result.receipt.group_cleanup, CleanupStatus::Gone, "{case}");
+        assert!(
+            result.receipt.errors.iter().any(|item| item == code),
+            "{case}"
+        );
+        assert!(result.receipt.elapsed_ns < 1_000_000_000, "{case}");
+    }
+}
+
+#[test]
+fn tree_snapshot_rejects_links_and_special_files_without_payload_access() {
+    for case in [
+        "symlink_file",
+        "symlink_directory",
+        "hard_link",
+        "fifo",
+        "socket",
+    ] {
+        let scratch = Scratch::new();
+        let outside = Scratch::new();
+        let outside_file = outside.0.join("payload");
+        std::fs::write(&outside_file, b"outside unchanged\n").unwrap();
+        let bad = scratch.0.join("bad");
+        let mut listener = None;
+        let expected = match case {
+            "symlink_file" => {
+                std::os::unix::fs::symlink(&outside_file, &bad).unwrap();
+                "process.artifact_tree.kind"
+            }
+            "symlink_directory" => {
+                std::os::unix::fs::symlink(&outside.0, &bad).unwrap();
+                "process.artifact_tree.kind"
+            }
+            "hard_link" => {
+                std::fs::hard_link(&outside_file, &bad).unwrap();
+                "process.artifact_tree.hard_link"
+            }
+            "fifo" => {
+                nix::unistd::mkfifo(&bad, nix::sys::stat::Mode::S_IRUSR).unwrap();
+                "process.artifact_tree.kind"
+            }
+            "socket" => {
+                listener = Some(UnixListener::bind(&bad).unwrap());
+                "process.artifact_tree.kind"
+            }
+            _ => unreachable!(),
+        };
+        let program = File::open(std::env::current_exe().unwrap()).unwrap();
+        let directory = File::open(&scratch.0).unwrap();
+        let result = supervise_in_directory_with_tree(
+            &program,
+            &fixture_args("fixture_sleep"),
+            &directory,
+            limits(),
+            None,
+            &tree_watch(),
+        )
+        .unwrap();
+        assert_eq!(result.receipt.stop, ProcessStop::IoFailure, "{case}");
+        assert!(
+            result.receipt.errors.iter().any(|code| code == expected),
+            "{case}"
+        );
+        assert_eq!(result.receipt.watched_artifact_bytes, Some(0), "{case}");
+        assert_eq!(result.receipt.group_cleanup, CleanupStatus::Gone, "{case}");
+        assert_eq!(std::fs::read(outside_file).unwrap(), b"outside unchanged\n");
+        drop(listener);
+    }
+}
+
+#[test]
+fn tree_watch_rejects_invalid_bounds_and_non_directory_before_spawn() {
+    let scratch = Scratch::new();
+    let program = File::open(std::env::current_exe().unwrap()).unwrap();
+    let directory = File::open(&scratch.0).unwrap();
+    for watch in [
+        OwnedArtifactTreeWatch {
+            max_total_bytes: 0,
+            ..tree_watch()
+        },
+        OwnedArtifactTreeWatch {
+            max_file_bytes: 0,
+            ..tree_watch()
+        },
+        OwnedArtifactTreeWatch {
+            max_files: 0,
+            ..tree_watch()
+        },
+        OwnedArtifactTreeWatch {
+            max_files: 4097,
+            ..tree_watch()
+        },
+        OwnedArtifactTreeWatch {
+            max_depth: 33,
+            ..tree_watch()
+        },
+    ] {
+        assert!(matches!(
+            supervise_in_directory_with_tree(&program, &[], &directory, limits(), None, &watch),
+            Err(ArenaError::Budget(_))
+        ));
+    }
+    assert!(matches!(
+        supervise_in_directory_with_tree(&program, &[], &program, limits(), None, &tree_watch()),
+        Err(ArenaError::Invalid(_))
+    ));
+}
+
+#[test]
+fn tree_snapshot_observes_new_runtime_subdirectories() {
+    let scratch = Scratch::new();
+    let program = File::open(std::env::current_exe().unwrap()).unwrap();
+    let directory = File::open(&scratch.0).unwrap();
+    let result = supervise_in_directory_with_tree(
+        &program,
+        &fixture_args("fixture_tree_artifact_growth"),
+        &directory,
+        limits(),
+        None,
+        &tree_watch(),
+    )
+    .unwrap();
+    assert_eq!(result.receipt.stop, ProcessStop::ArtifactLimit);
+    assert_eq!(result.receipt.group_cleanup, CleanupStatus::Gone);
+    assert!(result.receipt.watched_artifact_bytes.unwrap() > 1024);
+    assert!(
+        result
+            .receipt
+            .errors
+            .iter()
+            .any(|code| code == "process.artifact_tree.file_bytes")
+    );
+    assert!(scratch.0.join("onnxruntime/session/cache").is_file());
+}
+
+#[test]
+fn tree_snapshot_checks_artifacts_written_immediately_before_exit() {
+    let scratch = Scratch::new();
+    let program = File::open(std::env::current_exe().unwrap()).unwrap();
+    let directory = File::open(&scratch.0).unwrap();
+    let result = supervise_in_directory_with_tree(
+        &program,
+        &fixture_args("fixture_tree_artifact_at_exit"),
+        &directory,
+        limits(),
+        None,
+        &tree_watch(),
+    )
+    .unwrap();
+    assert_eq!(result.receipt.stop, ProcessStop::ArtifactLimit);
+    assert_eq!(result.receipt.exit_code, Some(0));
+    assert_eq!(result.receipt.group_cleanup, CleanupStatus::Gone);
+    assert_eq!(result.receipt.watched_artifact_bytes, Some(2048));
+    assert!(
+        result
+            .receipt
+            .errors
+            .iter()
+            .any(|code| code == "process.artifact_tree.file_bytes")
+    );
+}
+
+#[test]
+fn tree_unverified_cleanup_reserves_terminal_leader_while_flat_api_reaps() {
+    // An escaped helper intentionally holds both pipes. It cannot disappear
+    // before the release marker, so this does not depend on PID1 zombie timing.
+    // Its finite fallback and the guard also bound cleanup after test failure.
+    struct ReleaseHelper(PathBuf);
+    impl Drop for ReleaseHelper {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"release");
+        }
+    }
+    for tree in [false, true] {
+        let scratch = Scratch::new();
+        let _release = ReleaseHelper(scratch.0.join("release_escape"));
+        let program = File::open(std::env::current_exe().unwrap()).unwrap();
+        let directory = File::open(&scratch.0).unwrap();
+        let mut policy = limits();
+        policy.shutdown_grace_ms = 25;
+        let mut result = if tree {
+            supervise_in_directory_with_tree(
+                &program,
+                &fixture_args("fixture_escaped_descendant"),
+                &directory,
+                policy,
+                None,
+                &tree_watch(),
+            )
+        } else {
+            supervise_in_directory(
+                &program,
+                &fixture_args("fixture_escaped_descendant"),
+                &directory,
+                policy,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        assert_eq!(result.receipt.stop, ProcessStop::Exited);
+        assert_eq!(result.receipt.exit_code, Some(0));
+        assert_eq!(result.receipt.group_cleanup, CleanupStatus::Unverified);
+        assert!(
+            result
+                .receipt
+                .errors
+                .iter()
+                .any(|code| code == "process.cleanup_unverified")
+        );
+        let pid = Pid::from_raw(i32::try_from(result.receipt.pid).unwrap());
+        if tree {
+            assert_eq!(
+                result.pending_child.as_ref().unwrap().id(),
+                result.receipt.pid
+            );
+            // WNOWAIT observes without consuming the reservation. Repeated
+            // observation proves the terminal leader was not automatically
+            // reaped, and that keeping ProcessOutput causes no delayed reap.
+            for _ in 0..2 {
+                assert_eq!(
+                    waitid(
+                        Id::Pid(pid),
+                        WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                    )
+                    .unwrap(),
+                    WaitStatus::Exited(pid, 0)
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            assert!(result.pending_child.is_none());
+            assert_eq!(
+                waitid(
+                    Id::Pid(pid),
+                    WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                ),
+                Err(nix::errno::Errno::ECHILD)
+            );
+        }
+        assert!(!scratch.0.join("escape_finished").exists());
+        std::fs::write(scratch.0.join("release_escape"), b"release").unwrap();
+        let finished_deadline = Instant::now() + Duration::from_secs(2);
+        while !scratch.0.join("escape_finished").exists() {
+            assert!(Instant::now() < finished_deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // This test owns the fixture protocol: its only descendant was created
+        // in a separate group and has reached its bounded final step. No late
+        // numeric group signal is issued, and only this owner reaps the leader.
+        if let Some(mut child) = result.pending_child.take() {
+            assert_eq!(child.wait().unwrap().code(), Some(0));
+        }
+    }
 }
 
 #[test]
@@ -449,6 +793,25 @@ fn fixture_artifact_growth() {
 
 #[test]
 #[ignore = "native helper; launched only by supervisor tests"]
+fn fixture_tree_artifact_growth() {
+    std::fs::create_dir_all("onnxruntime/session").unwrap();
+    let mut file = File::create("onnxruntime/session/cache").unwrap();
+    loop {
+        file.write_all(&[b'x'; 256]).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+#[ignore = "native helper; launched only by supervisor tests"]
+fn fixture_tree_artifact_at_exit() {
+    std::fs::create_dir_all("onnxruntime/session").unwrap();
+    std::fs::write("onnxruntime/session/cache", [b'x'; 2048]).unwrap();
+    std::process::exit(0);
+}
+
+#[test]
+#[ignore = "native helper; launched only by supervisor tests"]
 fn fixture_cwd_marker() {
     std::fs::write("match.pgn", b"pinned working directory\n").unwrap();
     std::process::exit(0);
@@ -512,4 +875,32 @@ fn fixture_descendant() {
 fn fixture_descendant_alive() {
     descendant();
     std::thread::sleep(Duration::from_secs(3600));
+}
+
+#[test]
+#[ignore = "native helper; launched only by supervisor tests"]
+fn fixture_escaped_descendant() {
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(fixture_args("fixture_escaped_pipe_holder"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    drop(child);
+    std::process::exit(0);
+}
+
+#[test]
+#[ignore = "native helper; launched only by supervisor tests"]
+fn fixture_escaped_pipe_holder() {
+    let started = Instant::now();
+    while !std::path::Path::new("release_escape").exists()
+        && started.elapsed() < Duration::from_secs(3)
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::fs::write("escape_finished", b"finished").unwrap();
+    std::process::exit(0);
 }

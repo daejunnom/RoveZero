@@ -1,7 +1,7 @@
 //! Bounded PGN auditing against A-owned Rules and the pinned shared contract.
 //! PGN notation is E's responsibility; every move and terminal decision comes
 //! from `rz-position`, never from a second chess rules implementation.
-use crate::{ArenaError, ArenaPlan, EngineFailureKind, GameResult, GameSpec};
+use crate::{ArenaError, ArenaPlan, EngineFailureKind, GameResult, GameSpec, PairSpec};
 use rz_experiments::{HistoryCompleteness, InitialPosition, OpeningSpec, OutcomePolicy};
 use rz_position::contracts::{ContractPosition, ContractState};
 use rz_position::{
@@ -29,6 +29,18 @@ pub struct PgnLimits {
     pub max_bytes: usize,
     /// Ceiling on all movetext plies per game, including the opening prefix.
     pub max_plies: u32,
+}
+
+/// Outcome declarations for a caller-owned pair, independent of its launch purpose.
+/// This controls PGN classification only: it grants no launch or scoring authority.
+/// Native integration callers must keep the cutoff `Incomplete` and retain raw
+/// failures/incomplete games without promoting them to formal strength results.
+#[derive(Clone, Copy, Debug)]
+pub struct PgnOutcomePolicy {
+    pub engine_failure: OutcomePolicy,
+    pub max_plies_outcome: OutcomePolicy,
+    /// Ceiling on the complete game, including every declared opening ply.
+    pub max_game_plies: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -234,29 +246,76 @@ fn quote_tag(value: &str) -> Result<String, ArenaError> {
     Ok(value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+fn validate_pgn_contract() -> Result<(), ArenaError> {
+    let revision = rz_contracts::CONTRACT_REVISION;
+    revision.validate().map_err(ArenaError::Contract)?;
+    if revision.major != 0 || revision.minor != 1 {
+        return Err(rz_contracts::ContractError::new(
+            rz_contracts::ErrorCode::UnsupportedContract,
+            rz_contracts::Stage::Contract,
+            "PGN Rules adapter requires the native contract revision 0.1",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_opening_spec(opening: &OpeningSpec, max_plies: u32) -> Result<(), ArenaError> {
+    if !(1..=MAX_PGN_PLIES).contains(&max_plies) || opening.moves.len() > max_plies as usize {
+        return Err(ArenaError::Budget(
+            "opening requires a positive full-history PGN ceiling <=4095".into(),
+        ));
+    }
+    if opening.id.is_empty()
+        || opening.id.len() > MAX_TAG_VALUE_BYTES
+        || opening.id.chars().any(char::is_control)
+        || opening.history_origin.is_empty()
+        || opening.history_origin.len() > MAX_TAG_VALUE_BYTES
+        || opening.history_origin.chars().any(char::is_control)
+    {
+        return Err(invalid(
+            "opening identifiers must be bounded nonempty single-line values",
+        ));
+    }
+    if !matches!(
+        (opening.initial, opening.fen.as_ref()),
+        (InitialPosition::Startpos, None) | (InitialPosition::Fen, Some(_))
+    ) {
+        return Err(invalid(
+            "opening must declare exactly one startpos or full FEN origin",
+        ));
+    }
+    Ok(())
+}
+
 pub fn opening_pgn(plan: &ArenaPlan, pair_id: &str) -> Result<String, ArenaError> {
     crate::validate_engine_contract_revision(plan)?;
     let pair = plan
         .pair(pair_id)
         .ok_or_else(|| invalid("unknown pair ID"))?;
-    if pair.opening.moves.len() > MAX_PGN_PLIES as usize {
-        return Err(ArenaError::Budget(
-            "opening exceeds Rules history/PGN ceiling".into(),
-        ));
-    }
-    let mut live = contract(initial_position(&pair.opening, MAX_PGN_PLIES)?)?;
+    opening_pgn_for_spec(&pair.opening, MAX_PGN_PLIES)
+}
+
+/// Serialize the complete opening through the same A-owned Rules as the plan wrapper.
+/// A FEN remains an unknown-prefix origin; its counters, side and literal move
+/// history are never replaced by the final board alone. This is an input artifact,
+/// not validation of a caller's locked launch manifest or permission to run a game.
+pub fn opening_pgn_for_spec(opening: &OpeningSpec, max_plies: u32) -> Result<String, ArenaError> {
+    validate_pgn_contract()?;
+    validate_opening_spec(opening, max_plies)?;
+    let mut live = contract(initial_position(opening, max_plies)?)?;
     let mut text = format!(
         "[Event \"RoveZero opening input\"]\n[White \"Opening\"]\n[Black \"Opening\"]\n[Result \"*\"]\n[OpeningId \"{}\"]\n",
-        quote_tag(&pair.opening.id)?
+        quote_tag(&opening.id)?
     );
-    if pair.opening.initial == InitialPosition::Fen {
+    if opening.initial == InitialPosition::Fen {
         text.push_str(&format!(
             "[SetUp \"1\"]\n[FEN \"{}\"]\n",
             quote_tag(&live.position().to_fen())?
         ));
     }
     text.push('\n');
-    for (index, input) in pair.opening.moves.iter().enumerate() {
+    for (index, input) in opening.moves.iter().enumerate() {
         let state = export(&live)?;
         if live.position().side_to_move() == Color::White {
             text.push_str(&format!("{}. ", live.position().fullmove_number()));
@@ -633,8 +692,83 @@ pub fn audit_pair_pgn(
     limits: PgnLimits,
 ) -> Result<PairPgnAudit, ArenaError> {
     crate::validate_engine_contract_revision(plan)?;
+    let pair = plan
+        .pair(pair_id)
+        .ok_or_else(|| invalid("unknown pair ID"))?;
+    let protocol = &plan.manifest().input().protocol;
+    audit_pair_pgn_for_spec(
+        pair,
+        pgn,
+        limits,
+        PgnOutcomePolicy {
+            engine_failure: protocol.engine_failure,
+            max_plies_outcome: protocol.max_plies_outcome,
+            max_game_plies: protocol.max_plies,
+        },
+    )
+}
+
+fn validate_pair_spec(pair: &PairSpec) -> Result<(), ArenaError> {
+    if !matches!(pair.execution_order, [0, 1] | [1, 0]) {
+        return Err(invalid(
+            "PGN pair execution order must contain each game exactly once",
+        ));
+    }
+    let [first, second] = &pair.games;
+    if first.id == second.id
+        || first.white_engine == first.black_engine
+        || first.white_engine != second.black_engine
+        || first.black_engine != second.white_engine
+    {
+        return Err(invalid(
+            "PGN pair requires distinct game IDs and exactly swapped engine colors",
+        ));
+    }
+    for value in [
+        &pair.id,
+        &first.id,
+        &second.id,
+        &first.white_engine,
+        &first.black_engine,
+    ] {
+        if value.is_empty()
+            || value.len() > MAX_TAG_VALUE_BYTES
+            || value.chars().any(char::is_control)
+        {
+            return Err(invalid(
+                "PGN pair identifiers must be bounded nonempty single-line values",
+            ));
+        }
+    }
+    if pair.opening_input_sha256.len() != 64
+        || !pair
+            .opening_input_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid(
+            "declared opening input identity must be a lowercase SHA-256",
+        ));
+    }
+    Ok(())
+}
+
+/// Audit a complete pair using the same bounded parser and A-owned transitions.
+/// Callers supply a previously locked pair and its classification policy. This
+/// helper validates the pair's game order/colors, origin and literal history;
+/// it does not attest binaries, a launch purpose, clock/resource fairness or
+/// formal scoring. `opening_input_sha256` remains the caller's declaration
+/// identity, separate from the A-derived semantic identity returned below.
+pub fn audit_pair_pgn_for_spec(
+    pair: &PairSpec,
+    pgn: &str,
+    limits: PgnLimits,
+    policy: PgnOutcomePolicy,
+) -> Result<PairPgnAudit, ArenaError> {
+    validate_pgn_contract()?;
     if !(1..=MAX_PGN_BYTES).contains(&limits.max_bytes)
         || !(1..=MAX_PGN_PLIES).contains(&limits.max_plies)
+        || policy.max_game_plies == 0
     {
         return Err(ArenaError::Budget(
             "positive PGN ceilings require bytes <=4 MiB and plies <=4095".into(),
@@ -645,14 +779,12 @@ pub fn audit_pair_pgn(
             "PGN exceeds explicit byte ceiling".into(),
         ));
     }
-    let pair = plan
-        .pair(pair_id)
-        .ok_or_else(|| invalid("unknown pair ID"))?;
-    if pair.opening.moves.len() > limits.max_plies as usize {
-        return Err(ArenaError::Budget(
-            "opening prefix exceeds PGN ply ceiling".into(),
-        ));
-    }
+    validate_pair_spec(pair)?;
+    let limits = PgnLimits {
+        max_plies: limits.max_plies.min(policy.max_game_plies),
+        ..limits
+    };
+    validate_opening_spec(&pair.opening, limits.max_plies)?;
     let initial = initial_position(&pair.opening, limits.max_plies)?;
     let initial_fen = initial.to_fen();
     let mut expected_start = contract(initial)?;
@@ -731,7 +863,9 @@ pub fn audit_pair_pgn(
                         break;
                     }
                     if word == "*" {
-                        return Err(invalid("incomplete PGN cannot produce a paired score"));
+                        return Err(invalid(
+                            "incomplete PGN lacks a complete paired outcome declaration",
+                        ));
                     }
                     let actual = if let Some(rest) = check_move_number(live.position(), word)? {
                         if pending_number {
@@ -789,9 +923,9 @@ pub fn audit_pair_pgn(
             &termination,
             header_result,
             final_comment,
-            plan.manifest().input().protocol.engine_failure == OutcomePolicy::Loss,
-            plan.manifest().input().protocol.max_plies_outcome == OutcomePolicy::Incomplete
-                && uci_moves.len() == plan.manifest().input().protocol.max_plies as usize,
+            policy.engine_failure == OutcomePolicy::Loss,
+            policy.max_plies_outcome == OutcomePolicy::Incomplete
+                && uci_moves.len() == policy.max_game_plies as usize,
         )?;
         games.push(GamePgnAudit {
             game_id: game.id.clone(),

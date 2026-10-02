@@ -2,9 +2,11 @@
 
 mod artifact;
 mod manifest;
+mod native_launch;
 mod validation;
 
 pub use manifest::*;
+pub use native_launch::*;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};

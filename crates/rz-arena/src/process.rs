@@ -3,7 +3,9 @@
 //! This owns a fresh process group, not a security sandbox. The child limit is
 //! a `/proc` snapshot of that group: transient forks and children escaping with
 //! a new session/group require a future cgroup adapter. A leader is not reaped
-//! until group cleanup finishes, so its reserved PID cannot name another group.
+//! while group cleanup is in progress, so its reserved PID cannot name another
+//! group. The tree API also retains this reservation after unverified cleanup;
+//! the older flat APIs retain their original terminal-child reaping behavior.
 //! This requires unchanged default SIGCHLD handling and no foreign child reaper.
 
 use crate::ArenaError;
@@ -58,7 +60,8 @@ pub struct ProcessReceipt {
     pub descendant_cleanup_required: bool,
     /// Deliberately distinguishes observed enforcement from a kernel hard cap.
     pub child_limit_enforcement: String,
-    /// Peak total length observed in watched regular output files.
+    /// Peak total length observed in watched regular output files. A tree
+    /// observation that stops at a limit may describe only the visited prefix.
     pub watched_artifact_bytes: Option<u64>,
     pub artifact_limit_enforcement: Option<String>,
     /// Stable bounded step/code evidence; no arguments, paths or child payload.
@@ -70,8 +73,12 @@ pub struct ProcessOutput {
     pub receipt: ProcessReceipt,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
-    /// A leader still pending after the bounded cleanup interval. Long-lived
-    /// callers must retain this handle and later try_wait/reap it. This is not
+    /// A leader retained after the bounded cleanup interval. For the tree API,
+    /// this includes an observed terminal leader when cleanup is Unverified:
+    /// retaining it without wait/try_wait reserves its PID and process-group ID.
+    /// A typed external owner must confirm physical cleanup before reaping or
+    /// dropping that reservation. No subsequent kill/reap/drop is automatic.
+    /// The flat APIs retain their older pending-only behavior. A handle is not
     /// returned after ownership was lost to an unsupported external reaper.
     pub pending_child: Option<std::process::Child>,
 }
@@ -81,6 +88,37 @@ pub struct ArtifactWatch {
     /// Supported files are direct children of the pinned working directory.
     pub relative_files: Vec<PathBuf>,
     pub max_total_bytes: u64,
+}
+
+/// Periodic observation of an exclusively owned output directory tree.
+/// This measures file lengths, not allocated blocks or a kernel disk quota.
+/// Runtime-created subdirectories are included; symlinks, regular files with
+/// multiple hard links and all non-directory/non-regular kinds are rejected.
+#[derive(Debug, Clone, Copy)]
+pub struct OwnedArtifactTreeWatch {
+    pub max_total_bytes: u64,
+    pub max_file_bytes: u64,
+    /// Maximum regular files. Directories have a separate equal count limit,
+    /// and at most twice this many entries are examined per snapshot, including
+    /// entries that disappear before their inode can be opened.
+    pub max_files: usize,
+    /// Root depth is zero; a direct child directory has depth one.
+    pub max_depth: usize,
+}
+
+impl OwnedArtifactTreeWatch {
+    fn validate(&self) -> Result<(), ArenaError> {
+        if self.max_total_bytes == 0
+            || self.max_file_bytes == 0
+            || !(1..=4096).contains(&self.max_files)
+            || self.max_depth > 32
+        {
+            return Err(ArenaError::Budget(
+                "artifact tree requires positive bytes, 1..4096 files and depth at most 32".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl ArtifactWatch {
@@ -200,7 +238,7 @@ pub fn supervise_with_watch(
             linux::pin_directory(cwd)?,
             limits,
             cancel,
-            Some(watch),
+            Some(linux::ArtifactObservation::Flat(watch)),
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -240,7 +278,14 @@ pub fn supervise_in_directory(
         let directory = cwd
             .try_clone()
             .map_err(|_| ArenaError::Io("process.cwd_clone".into()))?;
-        linux::supervise(program, args, directory, limits, cancel, watch)
+        linux::supervise(
+            program,
+            args,
+            directory,
+            limits,
+            cancel,
+            watch.map(linux::ArtifactObservation::Flat),
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -251,9 +296,60 @@ pub fn supervise_in_directory(
     }
 }
 
+/// Supervise using a cloned directory capability and bounded recursive tree
+/// snapshots. Each inode is opened relative to a pinned directory without
+/// following symlinks; regular payloads are never opened for reading. This is
+/// observation, not a hard disk quota or an atomic view of a changing tree.
+/// When cleanup remains Unverified and leader ownership is intact, even a
+/// terminal leader is returned unreaped in pending_child. The caller must keep
+/// that reservation until its typed owner confirms physical cleanup; polling
+/// Child::try_wait also reaps and therefore releases the reservation.
+pub fn supervise_in_directory_with_tree(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+) -> Result<ProcessOutput, ArenaError> {
+    limits.validate()?;
+    watch.validate()?;
+    #[cfg(target_os = "linux")]
+    {
+        if !directory
+            .metadata()
+            .map_err(|_| ArenaError::Io("process.cwd_metadata".into()))?
+            .is_dir()
+        {
+            return Err(ArenaError::Invalid(
+                "runner cwd handle must be a directory".into(),
+            ));
+        }
+        let directory = directory
+            .try_clone()
+            .map_err(|_| ArenaError::Io("process.cwd_clone".into()))?;
+        linux::supervise(
+            program,
+            args,
+            directory,
+            limits,
+            cancel,
+            Some(linux::ArtifactObservation::Tree(watch)),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (program, args, directory, cancel);
+        Err(ArenaError::Invalid(
+            "native process supervision currently requires Linux".into(),
+        ))
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use cap_std::fs::Dir;
     use nix::errno::Errno;
     use nix::fcntl::{FcntlArg, OFlag, fcntl, open, openat};
     use nix::sys::signal::{Signal, killpg};
@@ -262,13 +358,28 @@ mod linux {
     use nix::unistd::Pid;
     use std::io::{self, Read};
     use std::os::fd::{AsFd, AsRawFd};
-    use std::os::unix::fs::FileExt;
+    use std::os::unix::fs::{FileExt, MetadataExt};
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::process::{Command, Stdio};
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     const POLL: Duration = Duration::from_millis(5);
+
+    #[derive(Clone, Copy)]
+    pub(super) enum ArtifactObservation<'a> {
+        Flat(&'a ArtifactWatch),
+        Tree(&'a OwnedArtifactTreeWatch),
+    }
+
+    impl ArtifactObservation<'_> {
+        fn enforcement(self) -> String {
+            match self {
+                Self::Flat(_) => "regular_file_snapshot".into(),
+                Self::Tree(_) => "owned_tree_snapshot".into(),
+            }
+        }
+    }
 
     pub(super) fn pin_directory(cwd: &Path) -> Result<File, ArenaError> {
         open(
@@ -286,7 +397,7 @@ mod linux {
         cwd_file: File,
         limits: ProcessLimits,
         cancel: Option<&AtomicBool>,
-        watch: Option<&ArtifactWatch>,
+        watch: Option<ArtifactObservation<'_>>,
     ) -> Result<ProcessOutput, ArenaError> {
         native_elf(program)?;
         default_child_disposition()?;
@@ -336,7 +447,7 @@ mod linux {
             descendant_cleanup_required: false,
             child_limit_enforcement: "process_group_snapshot".into(),
             watched_artifact_bytes: watch.map(|_| 0),
-            artifact_limit_enforcement: watch.map(|_| "regular_file_snapshot".into()),
+            artifact_limit_enforcement: watch.map(ArtifactObservation::enforcement),
             errors: Vec::new(),
         };
         let mut stdout = child.stdout.take();
@@ -361,6 +472,7 @@ mod linux {
         let mut killed = false;
         let mut leader_done = false;
         let mut ownership_lost = false;
+        let preserve_unverified = matches!(watch, Some(ArtifactObservation::Tree(_)));
         loop {
             let now = Instant::now();
             if stop.is_none() {
@@ -370,7 +482,7 @@ mod linux {
                     stop = Some(ProcessStop::WallLimit);
                 }
             }
-            if let Some(watch) = watch {
+            if let Some(ArtifactObservation::Flat(watch)) = watch {
                 match watched_size(&cwd_file, watch) {
                     Ok(bytes) => {
                         receipt.watched_artifact_bytes =
@@ -384,6 +496,9 @@ mod linux {
                         stop.get_or_insert(ProcessStop::IoFailure);
                     }
                 }
+            }
+            if let Some(ArtifactObservation::Tree(watch)) = watch {
+                observe_tree(&cwd_file, watch, &mut receipt, &mut stop);
             }
             // Each pass drains a finite amount from each pipe, preserving time,
             // cancellation and process checks even under continuous output.
@@ -407,8 +522,17 @@ mod linux {
                     Id::Pid(group),
                     WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
                 ) {
-                    Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
+                    Ok(WaitStatus::Exited(_, code)) => {
                         leader_done = true;
+                        if preserve_unverified {
+                            receipt.exit_code = Some(code);
+                        }
+                    }
+                    Ok(WaitStatus::Signaled(_, signal, _)) => {
+                        leader_done = true;
+                        if preserve_unverified {
+                            receipt.exit_signal = Some(signal as i32);
+                        }
                     }
                     Ok(WaitStatus::StillAlive) => {}
                     Ok(_) => {
@@ -446,6 +570,13 @@ mod linux {
             };
             let no_others = last_group.is_some_and(|snapshot| snapshot.other_members == 0);
             if leader_done && no_others && stdout.is_none() && stderr.is_none() {
+                // The child may have created its final outputs between this
+                // pass's snapshot and exit observation. Inspect that final
+                // tree before reporting a completed run, without changing the
+                // older flat API's observation schedule.
+                if let Some(ArtifactObservation::Tree(watch)) = watch {
+                    observe_tree(&cwd_file, watch, &mut receipt, &mut stop);
+                }
                 receipt.group_cleanup = CleanupStatus::Gone;
                 break;
             }
@@ -470,9 +601,13 @@ mod linux {
             }
             std::thread::sleep(POLL);
         }
-        // WNOWAIT kept this PID reserved throughout every group signal. Reap
-        // only an observed terminal child; never block waiting on an unknown one.
-        if leader_done {
+        // WNOWAIT kept this PID reserved throughout every group signal. The
+        // tree owner must retain that reservation when physical cleanup is not
+        // confirmed, even if the leader itself is already terminal.
+        let retain_reservation = !ownership_lost
+            && (!leader_done
+                || (preserve_unverified && receipt.group_cleanup == CleanupStatus::Unverified));
+        if leader_done && !retain_reservation && !ownership_lost {
             match child.wait() {
                 Ok(status) => {
                     receipt.exit_code = status.code();
@@ -481,8 +616,8 @@ mod linux {
                 Err(_) => evidence(&mut receipt, "process.reap"),
             }
         } else {
-            // A successful SIGKILL can still remain pending in uninterruptible
-            // kernel IO. Leave cleanup explicitly unverified, without waiting.
+            // A leader may still be in kernel IO, or already terminal while
+            // other cleanup is unverified. Keep the latter reservation too.
             evidence(&mut receipt, "process.leader_unreaped");
         }
         receipt.stop = stop.unwrap_or(ProcessStop::Exited);
@@ -494,7 +629,7 @@ mod linux {
             receipt,
             stdout: out,
             stderr: err,
-            pending_child: if !leader_done && !ownership_lost {
+            pending_child: if retain_reservation {
                 Some(child)
             } else {
                 None
@@ -584,6 +719,170 @@ mod linux {
                 .ok_or("process.artifact_size_overflow")?;
         }
         Ok(bytes)
+    }
+
+    struct TreeWatchFailure {
+        bytes: u64,
+        stop: ProcessStop,
+        code: &'static str,
+    }
+
+    #[derive(Default)]
+    struct TreeSnapshot {
+        bytes: u64,
+        files: usize,
+        directories: usize,
+        entries: usize,
+    }
+
+    fn observe_tree(
+        cwd: &File,
+        watch: &OwnedArtifactTreeWatch,
+        receipt: &mut ProcessReceipt,
+        stop: &mut Option<ProcessStop>,
+    ) {
+        let (bytes, failure) = match watched_tree_size(cwd, watch) {
+            Ok(bytes) => (bytes, None),
+            Err(failure) => (failure.bytes, Some(failure)),
+        };
+        receipt.watched_artifact_bytes =
+            Some(receipt.watched_artifact_bytes.unwrap_or(0).max(bytes));
+        if let Some(failure) = failure {
+            evidence(receipt, failure.code);
+            // A terminal leader is not a successful artifact verdict. A later
+            // observed tree failure must not be hidden by the provisional
+            // Exited stop while pipes/group cleanup were still in progress.
+            if stop.is_none() || *stop == Some(ProcessStop::Exited) {
+                *stop = Some(failure.stop);
+            }
+        }
+    }
+
+    fn watched_tree_size(
+        cwd: &File,
+        watch: &OwnedArtifactTreeWatch,
+    ) -> Result<u64, TreeWatchFailure> {
+        let mut snapshot = TreeSnapshot::default();
+        match visit_tree(cwd, watch, 0, &mut snapshot) {
+            Ok(()) => Ok(snapshot.bytes),
+            Err((stop, code)) => Err(TreeWatchFailure {
+                bytes: snapshot.bytes,
+                stop,
+                code,
+            }),
+        }
+    }
+
+    fn visit_tree(
+        directory: &File,
+        watch: &OwnedArtifactTreeWatch,
+        depth: usize,
+        snapshot: &mut TreeSnapshot,
+    ) -> Result<(), (ProcessStop, &'static str)> {
+        // Opening '.' obtains a fresh readable directory description from the
+        // already pinned inode, including an O_PATH root. It never reopens the
+        // entry's former name, and its offset is not shared with the caller.
+        let readable = openat(
+            directory,
+            ".",
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|_| {
+            (
+                ProcessStop::IoFailure,
+                "process.artifact_tree.directory_open",
+            )
+        })?;
+        let capability = Dir::from_std_file(readable);
+        let entries = capability
+            .entries()
+            .map_err(|_| (ProcessStop::IoFailure, "process.artifact_tree.enumerate"))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|_| (ProcessStop::IoFailure, "process.artifact_tree.enumerate"))?;
+            // Count even a disappearing entry: directory churn cannot turn a
+            // nominal file limit into an unbounded enumeration pass.
+            snapshot.entries += 1;
+            if snapshot.entries > watch.max_files * 2 {
+                return Err((
+                    ProcessStop::ArtifactLimit,
+                    "process.artifact_tree.entry_count",
+                ));
+            }
+            let name = entry.file_name();
+            let mut components = Path::new(&name).components();
+            if !matches!(components.next(), Some(Component::Normal(_)))
+                || components.next().is_some()
+            {
+                return Err((ProcessStop::IoFailure, "process.artifact_tree.entry_name"));
+            }
+            // O_PATH references every inode kind without opening a FIFO,
+            // socket or device payload. NOFOLLOW preserves a symlink itself.
+            let inode = match openat(
+                directory,
+                Path::new(&name),
+                OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => File::from(fd),
+                Err(Errno::ENOENT) => continue,
+                Err(_) => {
+                    return Err((ProcessStop::IoFailure, "process.artifact_tree.inode_open"));
+                }
+            };
+            let metadata = inode
+                .metadata()
+                .map_err(|_| (ProcessStop::IoFailure, "process.artifact_tree.metadata"))?;
+            if metadata.is_dir() {
+                snapshot.directories += 1;
+                if snapshot.directories > watch.max_files {
+                    return Err((
+                        ProcessStop::ArtifactLimit,
+                        "process.artifact_tree.directory_count",
+                    ));
+                }
+                if depth >= watch.max_depth {
+                    return Err((ProcessStop::ArtifactLimit, "process.artifact_tree.depth"));
+                }
+                visit_tree(&inode, watch, depth + 1, snapshot)?;
+            } else if metadata.is_file() {
+                if metadata.nlink() != 1 {
+                    return Err((ProcessStop::IoFailure, "process.artifact_tree.hard_link"));
+                }
+                snapshot.files += 1;
+                if snapshot.files > watch.max_files {
+                    return Err((
+                        ProcessStop::ArtifactLimit,
+                        "process.artifact_tree.file_count",
+                    ));
+                }
+                let Some(bytes) = snapshot.bytes.checked_add(metadata.len()) else {
+                    snapshot.bytes = u64::MAX;
+                    return Err((
+                        ProcessStop::ArtifactLimit,
+                        "process.artifact_tree.size_overflow",
+                    ));
+                };
+                snapshot.bytes = bytes;
+                if metadata.len() > watch.max_file_bytes {
+                    return Err((
+                        ProcessStop::ArtifactLimit,
+                        "process.artifact_tree.file_bytes",
+                    ));
+                }
+                if snapshot.bytes > watch.max_total_bytes {
+                    return Err((
+                        ProcessStop::ArtifactLimit,
+                        "process.artifact_tree.total_bytes",
+                    ));
+                }
+            } else {
+                return Err((ProcessStop::IoFailure, "process.artifact_tree.kind"));
+            }
+        }
+        Ok(())
     }
 
     fn nonblocking<T: AsFd>(pipe: &T) -> Result<(), Errno> {

@@ -1,5 +1,7 @@
 use rz_arena::{ArenaPlan, Event, Ledger, LedgerLimits, PlanLimits, decode_json, run_fixture_pair};
-use rz_experiments::{LockedManifest, MAX_MANIFEST_BYTES};
+use rz_experiments::{
+    IntegrationPairSpecV1, LockedManifest, MAX_MANIFEST_BYTES, MAX_NATIVE_LAUNCH_JSON_BYTES,
+};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -8,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const JSON_LIMIT: u64 = MAX_MANIFEST_BYTES as u64;
-const USAGE: &str = "Usage:\n  rz-arena plan LOCKED OUTPUT --max-pairs N --max-plan-bytes N\n  rz-arena ledger-init PLAN OUTPUT --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N\n  rz-arena ledger-append PLAN LEDGER EVENT OUTPUT --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N\n  rz-arena audit PLAN LEDGER --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N [--expected-tip SHA]\n  rz-arena fixture-pair PLAN ARTIFACT_ROOT NEW_OUTPUT_BASENAME --max-pairs N --max-plan-bytes N\n\nAll bounds are required and positive. fixture-pair is a synthetic smoke only; execution_ready=false.";
+const USAGE: &str = "Usage:\n  rz-arena plan LOCKED OUTPUT --max-pairs N --max-plan-bytes N\n  rz-arena ledger-init PLAN OUTPUT --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N\n  rz-arena ledger-append PLAN LEDGER EVENT OUTPUT --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N\n  rz-arena audit PLAN LEDGER --max-pairs N --max-plan-bytes N --max-events N --max-ledger-bytes N [--expected-tip SHA]\n  rz-arena fixture-pair PLAN ARTIFACT_ROOT NEW_OUTPUT_BASENAME --max-pairs N --max-plan-bytes N\n  rz-arena native-lock INPUT OUTPUT\n\nAll bounds are required and positive. fixture-pair is a synthetic smoke only; execution_ready=false. native-lock checks declarations for one CPU NN integration pair, with required locked budgets and strength_eligible=false.";
 
 #[derive(Clone, Copy)]
 enum Operation {
@@ -53,6 +55,10 @@ impl Bounds {
 
 enum Command {
     Help,
+    NativeLock {
+        input: PathBuf,
+        output: PathBuf,
+    },
     Execute {
         operation: Operation,
         paths: Vec<PathBuf>,
@@ -78,6 +84,15 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, String> {
     let command = args.first().and_then(|arg| arg.to_str());
     if matches!(command, Some("--help" | "-h")) && args.len() == 1 {
         return Ok(Command::Help);
+    }
+    if command == Some("native-lock") {
+        if args.len() != 3 {
+            return Err("native-lock requires exactly INPUT OUTPUT".to_string());
+        }
+        return Ok(Command::NativeLock {
+            input: PathBuf::from(&args[1]),
+            output: PathBuf::from(&args[2]),
+        });
     }
     let (operation, path_count, ledger_bounds) = match command {
         Some("plan") => (Operation::Plan, 2, false),
@@ -166,6 +181,20 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, String> {
 }
 
 fn execute(command: Command) -> Result<String, String> {
+    let command = match command {
+        Command::NativeLock { input, output } => {
+            let limit = MAX_NATIVE_LAUNCH_JSON_BYTES as u64;
+            let spec = IntegrationPairSpecV1::from_json(&read_text(&input, limit)?)
+                .map_err(|error| error.to_string())?;
+            let locked = spec.lock().map_err(|error| error.to_string())?;
+            let json = locked.to_json().map_err(|error| error.to_string())?;
+            write_new_file(&output, json.as_bytes(), limit)?;
+            return Ok(success(
+                "native integration declarations locked; execution not verified",
+            ));
+        }
+        other => other,
+    };
     let Command::Execute {
         operation,
         paths,
