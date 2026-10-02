@@ -18,6 +18,7 @@ GPU 중심 평가를 주 연구 방향으로 두고 CPU 보조·CPU 비교·오�
 |---|---|
 | [구현 지시서](docs/IMPLEMENTATION-DIRECTIVES.md) | 총괄·A~F의 20개 작업, crate 소유·의존 방향, 착수·인수·복구 |
 | [최소 공통 계약](docs/CONTRACTS.md) | 상태·수·policy/WDL·ID·deadline·cache·취소·buffer와 독립 수락 벡터 |
+| [계약 적용·PR 인수](docs/CONTRACT-ADOPTION.md) | revision 0.1 실제 API, 담당별 adapter와 총괄의 수동 통합·검사 |
 | [AGENTS.md](AGENTS.md) | 에이전트의 작업 시작·접근 제한·총괄 책임·WIP 공유·증거 규약 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 브랜치·커밋·PR·검토·완료 절차 |
 | [개발 기준](docs/ENGINEERING-STANDARDS.md) | SRP·오류·검증·생성물·CI·연구 기록 기준 |
@@ -69,7 +70,9 @@ A~F의 개발 환경은 GPU가 할당되지 않을 수 있는 클라우드다. C
 후속 사용자 요청으로 공용 규약과 참조 문서를 원격에 추가한다. 빈 원격의 최초 Git
 구성은 [RZ-D028](docs/DECISIONS.md)의 예외를 따르고 이후 작업은 `develop` 대상
 feature PR로 공유한다. 실제 브랜치·SHA·PR·검사 상태는 작업 착수 때 다시 확인한다.
-Cargo·엔진 소스·실행 검사기·CI는 아직 도입하지 않았다. 가중치 파일의 형식 확인,
+후속 총괄 작업은 `rz-contracts` 0.1.0·최소 root workspace·CPU 계약 CI를 게시한다.
+A~F의 엔진 구현은 Draft PR별로 진행 중이며 실제 연결·신경망·GPU 인수와 구분한다.
+가중치 파일의 형식 확인,
 실제 목표 GPU 추론, 학습·대국·원격 반영의 증거를 구별한다.
 구체 backend·학습 언어·실행 자원·시계·
 표본·통계·가중치 사용 조건은 해당 실행 전에 잠근다.

@@ -57,6 +57,8 @@
 | RZ-D028 | 최초 빈 원격의 bootstrap 예외 / 2026-10-03 | 기존 heads/tags와 PR이 없는 원격을 확인한 뒤, 최소 `.gitignore`만 `main`의 첫 커밋으로 공유하고 같은 SHA에서 `develop`을 만든다. 공용 AGENTS·필수 참조 문서·두 원문 snapshot은 `feature/docs-shared-agent-rules`에서 `develop` 대상 PR로 추가한다. 이 최초 브랜치 구성만 D005의 일반 흐름 예외이며 이후 작업은 feature PR을 따른다. 보호 규칙을 우회하거나 기존 공유 이력을 재작성하지 않는다. 실제 bootstrap SHA·PR 번호·체크 상태는 Git·원격에서 조회해 보고하며 이 결정으로 실행 성공을 선기록하지 않는다. |
 | RZ-D029 | 사용자 환경 지정 / 2026-10-03 | A~F는 GPU가 없을 수 있는 클라우드에서 개발한다. CPU/mock 기본 조합·가능한 CPU 신경망 참조·backend 코드·fixture·검사 진입점·학습 recipe/resume 검사는 먼저 진행할 수 있다. 목표 RTX 4050 6GB의 실제 GPU 추론·D02 계측·D03 GPU 개선·정식 대국과 실제 학습은 지원 환경에서 총괄 I02가 별도로 인수한다. CUDA capability 부재와 GPU 검사 skip·미실행을 기록하며 조용한 CPU 대체·CPU/mock CI의 GPU 통과 승격을 금지한다. 코드 완료·실제 학습·강도 인수는 구분한다. 기존 사용자 배정의 실행·자원·비용 범위는 재승인 없이 진행하고 이 규약 공유만으로 새 비용·범위를 추가하지 않는다. 독립 클라우드 생성물은 D008의 작업 전용 루트·보존·회수 조건을 따른다. |
 | RZ-D030 | 사용자 직접 허가 / 이번 문서 작업만 | 이번 공용 규약·구현 지시서 공유 작업에 한해 `main` fast-forward를 허용한다. `develop` 대상 feature PR로 변경을 남기고 문서·원문 무결성 검증을 마친 동일 SHA를 `develop`과 `main`에 fast-forward로 반영한다. 공유 이력 재작성·force-push를 하지 않는다. 이후 구현은 D005의 일반 feature PR 흐름을 따른다. 실제 반영 SHA·PR 상태는 원격에서 확인해 보고한다. |
+| RZ-D031 | 총괄의 최초 Rust 계약 / 2026-10-03 | `rz-contracts` 0.1.0, SchemaVersion 0.1 exact match를 게시한다. std-only typed IDs·epoch·immutable generic snapshot·ordered legal view·모델/인코딩 descriptor·WDL/합법 policy·단조 ns deadline·취소·fresh 평가 요청/결과·오류/유한 예산을 최소 경계로 구현한다. 구체 규칙·탐색·backend·runtime 및 wire/hash codec은 consumer 소유이며 계약 crate 자체 검사와 실제 연결 인수는 구분한다. |
+| RZ-D032 | 사용자 직접 요청 / 2026-10-03 | 다른 담당의 Draft PR 계약 요청을 조사하고 공통 계약을 만든 뒤 해당 PR에 적용 코멘트를 남긴다. PR 인수 때 총괄은 최신 코드의 adapter·루트 Cargo/lock·revision·시간·오류·policy·수명 경계를 수동으로 맞추고 같은 integration SHA의 소비자 검사를 수행한다. 계약 게시만으로 소비자 통합·실제 NN/GPU 완료를 보고하지 않는다. 이번 요청은 일시중지한 후속 목표 앞의 선행 계약 작업이며 D030의 과거 main 예외를 확대하지 않는다. |
 
 ## 남은 결정과 실행 전 잠금
 
@@ -74,16 +76,18 @@
 | RZ-O008 | 첫 가중치 이후 모델 구조·반복·warm·정밀도 | 현재 가중치 호환은 C02/C03, 구조 변경은 F03이다. CARD-A05/B01/C02/C03을 모두 채택한 것으로 간주하지 않는다. 각 변경은 독립 대조한다. |
 | RZ-O009 | 부분 결정: 최소 의미 계약; 모델별 action/tensor/오차 남음 | 기본 의미·관점·수명은 D025를 따른다. 선택 모델의 policy mapping·history-fill·shape·dtype·오차·deadline 단위는 연결 전에 잠근다. |
 | RZ-O010 | 데이터·교사·loss·split·seed·자가대국·훈련 언어 | F01은 계약·누출 검사를 병렬 준비한다. F02 실제 학습 전 provenance·권리·game/opening 분리·목표 관점·비용을 잠근다. |
-| RZ-O011 | 부분 결정: Git·원격 도입 요청; Cargo·CI·검사 남음 | 2026-10-02 초기 작성 당시 Git이 없었으나 후속 원격 추가 요청의 bootstrap은 D028로 진행한다. 실제 Git·브랜치·원격·PR 상태를 착수 때 조회한다. Cargo·엔진 소스·검사기·CI는 I01 소스 도입 시 설정하며 GPU 실행 성공은 별도 검증한다. |
+| RZ-O011 | 부분 결정: 최소 계약 게시; 소비자 인수 남음 | 2026-10-02 초기 작성 당시 Git이 없었으나 후속 원격 추가 요청의 bootstrap은 D028로 진행한다. 실제 Git·브랜치·원격·PR 상태를 착수 때 조회한다. I01은 rz-contracts·최소 workspace·CPU 계약 CI를 게시한다. 각 담당의 소비자 연결과 실제 NN/GPU 실행 성공은 별도 검증한다. |
 | RZ-O012 | 규칙 claim·dead-position 범위·runner 판정 | [CONTRACTS](CONTRACTS.md)의 claim/자동 종료·이력·mate 우선순위를 따른다. claim 의사표시·자동 수락·adjudication·지원 범위는 첫 대국 전에 외부 runner와 잠근다. |
 
 ## 현재 증거와 후속 기록
 
 초기 문서 작성에서 완료한 것은 참조 조사, 로컬 규약·구현 지시서 작성, 가중치
 후보의 공개 자료·표적 메타데이터 조사다. 후속 원격 추가 작업은 실제 커밋·원격 SHA·
-PR·검사 조회 결과로 별도 보고한다. 구현·Cargo 빌드·실제 GPU 추론·학습·
-프로파일링·Elo 대국은 아직 수행하지 않았다. 가중치 조사 결과와 실제 권리 확인
-범위는 선정 문서에 기록한다.
+PR·검사 조회 결과로 별도 보고한다. 후속 [공통 계약 PR #7](https://github.com/daejunnom/RoveZero/pull/7)에는
+최소 Rust 계약과 CPU workspace 검사가 추가됐다. 같은 PR의 commit·환경·실제 검사 결과를
+기준으로 증거를 확인하며 계약 crate 자체 성공과 A~F 소비자 인수는 구분한다. 실제 신경망·
+목표 GPU 추론·학습·종단 프로파일링·Elo 대국은 아직 수행하지 않았다. 가중치 조사 결과와
+실제 권리 확인 범위는 선정 문서에 기록한다.
 Accelerate `develop`의 규약과 오래된 로컬 구현 브랜치는 참조 당시 commit·blob으로
 [출처 기록](reference/README.md)에 구분했으며 새 RoveZero 구현의 성공 근거로 쓰지 않는다.
 

@@ -3,8 +3,10 @@
 이 문서는 [아키텍처](ARCHITECTURE.md)의 책임 경계를 구현자가 연결할 수 있는
 필드·불변식·실패·수락 조건으로 구체화한다. 주 근거는
 [RoveZero v0.2.0](reference/RoveZero_Handoff_v0.2.0_KO.md)의 3~4장, 11장,
-F14/F15/F21/F22, 17.3절이다. **현재 계약 초안이며 구현된 타입·ABI·wire schema를
-설명하지 않는다.** 사용자가 선택한 제품 엔진은 독립 Rust 구현이며 신규 자체 코드는
+F14/F15/F21/F22, 17.3절이다. **최소 Rust 계약 revision 0.1은 `rz-contracts`에 게시한다.**
+이 문서에는 후속 기능의 의미 명세도 포함되며 모든 타입·ABI·wire schema를 구현했다는
+뜻은 아니다. 실제 지원 API·Draft PR별 수동 연결은 [적용 지시서](CONTRACT-ADOPTION.md)를
+따른다. 사용자가 선택한 제품 엔진은 독립 Rust 구현이며 신규 자체 코드는
 MIT 방침을 따른다. 외부 가중치·데이터·도구의 권리는 각각 확인한다. 필드명은 의미
 명세이며 실제 Rust 타입·필드 배치는 구현 시 정한다. 추론 backend·가중치 format·
 학습 언어의 실제 연결은 [결정 기록](DECISIONS.md)의 별도 항목이다. 첫 호환 형식은
