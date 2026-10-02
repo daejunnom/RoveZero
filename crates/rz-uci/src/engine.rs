@@ -169,16 +169,29 @@ pub fn move_text(movement: contract::Move) -> Result<String, contract::ContractE
 }
 
 /// A clone preserves exactly one process origin and domain for every consumer.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProcessClock {
     epoch: contract::ProcessEpoch,
     origin: Instant,
+    ids: Arc<rz_search::contracts::IdAllocator>,
+    executions: Arc<AtomicU64>,
+}
+impl fmt::Debug for ProcessClock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessClock")
+            .field("epoch", &self.epoch)
+            .field("origin", &self.origin)
+            .finish_non_exhaustive()
+    }
 }
 impl ProcessClock {
     pub fn new(epoch: contract::ProcessEpoch) -> Self {
         Self {
             epoch,
             origin: Instant::now(),
+            ids: Arc::new(rz_search::contracts::IdAllocator::new(epoch)),
+            executions: Arc::new(AtomicU64::new(0)),
         }
     }
     pub fn domain(&self) -> contract::ClockDomain {
@@ -186,6 +199,24 @@ impl ProcessClock {
     }
     pub fn epoch(&self) -> contract::ProcessEpoch {
         self.epoch
+    }
+    pub(crate) fn reserve_executions(&self, count: u64) -> Result<u64, contract::ContractError> {
+        if count == 0 {
+            return Err(failure(
+                contract::ErrorCode::InvalidInput,
+                "physical ID range must be finite and positive",
+            ));
+        }
+        self.executions
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(count)
+            })
+            .map_err(|_| {
+                failure(
+                    contract::ErrorCode::ResourceExhausted,
+                    "physical execution ID range exhausted",
+                )
+            })
     }
     pub fn b_clock(&self) -> rz_search::contract_time::InstantClock {
         rz_search::contract_time::InstantClock::new(self.domain(), self.origin)
@@ -237,6 +268,13 @@ pub struct SearchAuthority {
     cancel: contract::CancelToken,
 }
 impl SearchAuthority {
+    #[cfg(test)]
+    pub(crate) fn isolated(scope: contract::AcceptanceScope) -> Self {
+        Self {
+            current: Arc::new(Mutex::new(scope)),
+            cancel: contract::CancelToken::new(),
+        }
+    }
     pub fn current_scope(&self) -> Result<contract::AcceptanceScope, contract::ContractError> {
         self.current.lock().map(|scope| *scope).map_err(|_| {
             failure(
@@ -322,6 +360,7 @@ pub enum EngineError {
     Transport(Box<ServeError<EngineError>>),
     WorkerPanic,
     DrainTimeout,
+    UndeliveredDiagnostics(Vec<(contract::ContractError, u64)>),
     Cleanup {
         primary: Box<EngineError>,
         cleanup: Vec<EngineError>,
@@ -353,6 +392,7 @@ struct Owner {
     settings: EngineSettings,
     workers: Vec<JoinHandle<Result<(), contract::ContractError>>>,
     pending_failures: VecDeque<(SearchTicket, SearchCompletion)>,
+    diagnostics: Arc<Mutex<Vec<(contract::ContractError, u64)>>>,
 }
 impl Owner {
     fn pending_failure(
@@ -374,6 +414,24 @@ impl Owner {
         event: Event,
     ) -> SessionResult<RulesSearchPosition> {
         let mut out = SessionResult::default();
+        match self.diagnostics.lock() {
+            Ok(mut receipts) => {
+                for (error, count) in std::mem::take(&mut *receipts) {
+                    out.diagnostics.push(Diagnostic {
+                        code: "SearchDiagnostic",
+                        message: format!("{error}; occurrences={count}"),
+                    });
+                }
+            }
+            Err(_) => {
+                self.cancel();
+                out.diagnostics.push(Diagnostic {
+                    code: "DiagnosticFailure",
+                    message: "worker diagnostic receipt owner poisoned".into(),
+                });
+                append_result(&mut out, session.end_of_input());
+            }
+        }
         while let Some((ticket, completion)) = self.pending_failures.pop_front() {
             append_contract_result(
                 &mut out,
@@ -522,6 +580,7 @@ impl Owner {
                 let clock = self.clock.clone();
                 let shutdown_limit = self.settings.shutdown_limit;
                 let events = sender.clone();
+                let diagnostics = Arc::clone(&self.diagnostics);
                 self.workers.push(thread::spawn(move || {
                     let mut runtime = match factory.create(clock.clone(), authority.clone()) {
                         Ok(runtime) => runtime,
@@ -579,6 +638,18 @@ impl Owner {
                                 )
                             },
                         );
+                        if let rz_search::contracts::ContractPumpEvent::Diagnostic(error) = &event {
+                            if let Err(error) = retain_diagnostic(&diagnostics, *error) {
+                                authority.cancel();
+                                authority_error = Some(error);
+                            }
+                            // The typed receipt stays shared with the owner even
+                            // when wakeup cannot enter the full bounded queue.
+                            let _ = events.try_send(Event::RejectedInput {
+                                code: "OwnerWake",
+                                message: String::new(),
+                            });
+                        }
                         let best = search.outcome().best_move;
                         if best != previous_move {
                             previous_move = best;
@@ -675,6 +746,33 @@ fn append_result<S>(out: &mut SessionResult<S>, next: SessionResult<S>) {
     out.effects.extend(next.effects);
     out.accepted &= next.accepted;
 }
+
+fn retain_diagnostic(
+    receipts: &Mutex<Vec<(contract::ContractError, u64)>>,
+    error: contract::ContractError,
+) -> Result<(), contract::ContractError> {
+    let mut receipts = receipts.lock().map_err(|_| {
+        failure(
+            contract::ErrorCode::BackendFailure,
+            "worker diagnostic receipt owner poisoned",
+        )
+    })?;
+    if let Some((_, count)) = receipts.iter_mut().find(|(existing, _)| *existing == error) {
+        *count = count.checked_add(1).ok_or_else(|| {
+            failure(
+                contract::ErrorCode::ResourceExhausted,
+                "worker diagnostic occurrence count exhausted",
+            )
+        })?;
+    } else if receipts.len() < 32 {
+        receipts.push((error, 1));
+    } else {
+        // The error that exceeds the finite class budget becomes the search's
+        // explicit failure; the preceding receipt classes remain owner-held.
+        return Err(error);
+    }
+    Ok(())
+}
 /// Independent input, timer, search and physical evaluator owners have bounded
 /// event/worker counts. CPU/mock success does not assert NN/GPU support.
 pub fn serve<O: Write, D: Write>(
@@ -716,11 +814,12 @@ pub fn serve<O: Write, D: Write>(
         active: None,
         scope: Arc::new(Mutex::new(scope)),
         factory,
-        ids: Arc::new(rz_search::contracts::IdAllocator::new(clock.epoch())),
+        ids: Arc::clone(&clock.ids),
         clock,
         settings,
         workers: Vec::new(),
         pending_failures: VecDeque::new(),
+        diagnostics: Arc::new(Mutex::new(Vec::new())),
     }));
     let mut session = Session::new(
         RulesUciPort::new(owners, settings.position),
@@ -818,6 +917,24 @@ pub fn serve<O: Write, D: Write>(
             )
             .into(),
         );
+    }
+    match owner.lock() {
+        Ok(owner) => match owner.diagnostics.lock() {
+            Ok(mut receipts) if !receipts.is_empty() => cleanup.push(
+                EngineError::UndeliveredDiagnostics(std::mem::take(&mut *receipts)),
+            ),
+            Err(_) => cleanup.push(
+                failure(
+                    contract::ErrorCode::BackendFailure,
+                    "worker diagnostic receipt owner poisoned",
+                )
+                .into(),
+            ),
+            _ => {}
+        },
+        Err(_) => {
+            cleanup.push(failure(contract::ErrorCode::BackendFailure, "UCI owner poisoned").into())
+        }
     }
     finish_errors(primary, cleanup)
 }
@@ -939,6 +1056,7 @@ mod tests {
             settings,
             workers: Vec::new(),
             pending_failures: VecDeque::new(),
+            diagnostics: Arc::new(Mutex::new(Vec::new())),
         };
         let session = Session::new(
             RulesUciPort::new(owners, settings.position),
@@ -1045,5 +1163,38 @@ mod tests {
         assert!(
             matches!(transport.failure, ServeFailure::Io(error) if error.kind() == std::io::ErrorKind::BrokenPipe)
         );
+    }
+
+    #[test]
+    fn diagnostic_receipts_survive_full_wakeup_queue_and_preserve_repeated_causes() {
+        let (mut owner, mut session) = fixture();
+        let (sender, events) = mpsc::sync_channel(1);
+        sender.send(Event::Line("isready".into())).unwrap();
+        let cause = contract::ContractError::new(
+            contract::ErrorCode::IdentityMismatch,
+            contract::Stage::Output,
+            "foreign response context",
+        );
+        retain_diagnostic(&owner.diagnostics, cause).unwrap();
+        retain_diagnostic(&owner.diagnostics, cause).unwrap();
+        assert!(
+            sender
+                .try_send(Event::RejectedInput {
+                    code: "OwnerWake",
+                    message: String::new()
+                })
+                .is_err()
+        );
+        let out = owner.handle(&mut session, events.recv().unwrap());
+        assert_eq!(out.protocol, ["readyok"]);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "SearchDiagnostic"
+                    && diagnostic.message.contains("Output/IdentityMismatch")
+                    && diagnostic.message.contains("foreign response context")
+                    && diagnostic.message.contains("occurrences=2"))
+        );
+        assert!(owner.diagnostics.lock().unwrap().is_empty());
     }
 }

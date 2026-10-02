@@ -21,10 +21,7 @@ use rz_runtime::{
     contracts::{ContractClock, ContractEvaluator, ContractsAdapter, SharedScope},
 };
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -56,7 +53,6 @@ pub struct CpuMockFactory {
     projection: ClassicalProjection,
     profile: EvaluatorProfile,
     delay: Duration,
-    executions: AtomicU64,
 }
 impl CpuMockFactory {
     pub fn new(owners: &OwnerRegistry, delay: Duration) -> Result<Self, ContractError> {
@@ -104,7 +100,6 @@ impl CpuMockFactory {
             projection: ClassicalProjection::new(binding),
             profile,
             delay,
-            executions: AtomicU64::new(0),
         })
     }
 }
@@ -157,18 +152,7 @@ impl EvaluatorFactory for CpuMockFactory {
     ) -> Result<Box<dyn ManagedEvaluator>, ContractError> {
         // Reserve a disjoint finite physical ID range across every worker/root.
         // Refused construction burns its range; no same-epoch reuse is possible.
-        let high_water = self
-            .executions
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(MAX_EVALUATIONS)
-            })
-            .map_err(|_| {
-                error(
-                    ErrorCode::ResourceExhausted,
-                    Stage::Admission,
-                    "physical execution ID range exhausted",
-                )
-            })?;
+        let high_water = clock.reserve_executions(MAX_EVALUATIONS)?;
         let runtime_clock = RuntimeClock(clock.clone());
         let scope = SharedScope::new(authority.current_scope()?);
         let adapter = ContractsAdapter::with_execution_high_water(
@@ -295,5 +279,105 @@ impl ManagedEvaluator for CpuMockRuntime {
                 _ => thread::sleep(Duration::from_millis(1)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{PositionPort, PositionSpec, engine::RulesUciPort};
+
+    #[test]
+    fn real_cpu_mock_runtime_uses_disjoint_execution_ranges_and_enforces_the_cap() {
+        let owners = Arc::new(OwnerRegistry::default());
+        let factory = CpuMockFactory::new(&owners, Duration::ZERO).unwrap();
+        let position =
+            RulesUciPort::new(Arc::clone(&owners), rz_position::PositionLimits::default())
+                .prepare(&PositionSpec::default())
+                .unwrap()
+                .snapshot;
+        let profile = factory.profile();
+        let clock = ProcessClock::new(ProcessEpoch(99));
+        let scope = AcceptanceScope {
+            game: GameGeneration(1),
+            root: RootGeneration(1),
+            model: profile.model.handle(),
+            encoding: profile.model.encoding().handle,
+            backend: profile.backend,
+        };
+        let authority = SearchAuthority::isolated(scope);
+        let mut first = factory.create(clock.clone(), authority.clone()).unwrap();
+        let mut second = factory.create(clock.clone(), authority).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut sequence = 0;
+        let mut evaluate = |runtime: &mut dyn ManagedEvaluator| {
+            sequence += 1;
+            let context = EvalContext {
+                revision: CONTRACT_REVISION,
+                request: RequestId::new(clock.epoch(), sequence),
+                selection: SelectionId::new(clock.epoch(), sequence),
+                game: scope.game,
+                root: scope.root,
+                state: position.state().snapshot().identity(),
+                legal_order: position.state().legal_moves().order(),
+                input: factory
+                    .input_key(
+                        position.state().rules(),
+                        position.state().legal_moves().moves(),
+                    )
+                    .unwrap(),
+                model: scope.model,
+                encoding: scope.encoding,
+                precision: profile.precision,
+                compute: profile.compute,
+                backend: scope.backend,
+            };
+            let request = Arc::new(
+                EvalRequest::try_new(
+                    context,
+                    position.state().snapshot().clone(),
+                    position.state().legal_moves().clone(),
+                    Arc::clone(&profile.model),
+                    clock.deadline(until).unwrap(),
+                    CancelToken::new(),
+                    profile.bytes,
+                )
+                .unwrap(),
+            );
+            if let Err(error) = runtime.submit(request) {
+                return Err(error);
+            }
+            loop {
+                if let Some(result) = runtime.poll() {
+                    let EvalResult::Completed(output) = result else {
+                        panic!("fresh CPU/mock evaluation failed: {result:?}")
+                    };
+                    assert_eq!(output.context, context);
+                    assert_eq!(output.actual.provenance, CacheProvenance::Computed);
+                    assert_eq!(output.policy.probabilities().len(), 20);
+                    return Ok(output.actual.execution.unwrap());
+                }
+                assert!(Instant::now() < until, "bounded CPU/mock completion");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let first_execution = evaluate(first.as_mut()).unwrap();
+        let second_execution = evaluate(second.as_mut()).unwrap();
+        assert_eq!(first_execution.epoch, second_execution.epoch);
+        assert_ne!(first_execution, second_execution);
+        assert!(second_execution.sequence > first_execution.sequence);
+        for _ in 1..MAX_EVALUATIONS {
+            evaluate(first.as_mut()).unwrap();
+        }
+        assert_eq!(
+            evaluate(first.as_mut()).unwrap_err().code,
+            ErrorCode::ResourceExhausted
+        );
+        first
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        second
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .unwrap();
     }
 }

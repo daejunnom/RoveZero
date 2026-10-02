@@ -6,10 +6,10 @@
 
 #![forbid(unsafe_code)]
 
-pub mod bridge;
 pub mod bootstrap;
-pub mod engine;
+pub mod bridge;
 pub mod contracts;
+pub mod engine;
 pub mod parser;
 pub mod runner;
 pub mod session;
