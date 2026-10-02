@@ -12,6 +12,12 @@ use std::fmt;
 
 pub const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 
+/// Bounded, duplicate-key rejecting JSON decoding for E-owned persisted formats.
+/// The target type must separately reject unknown fields and validate semantics.
+pub fn decode_json<T: serde::de::DeserializeOwned>(input: &str) -> Result<T, ManifestError> {
+    parse(input)
+}
+
 #[derive(Debug)]
 pub enum ManifestError {
     Parse(String),

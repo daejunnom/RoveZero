@@ -113,6 +113,13 @@ pub struct ArtifactRef {
     pub license: String,
 }
 
+impl ArtifactRef {
+    /// Validate declared metadata; does not read or attest the artifact bytes.
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        crate::validation::validate_artifact(self)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ToolIdentity {
@@ -383,6 +390,13 @@ impl LockedManifest {
     }
     pub fn sha256(&self) -> &str {
         &self.sha256
+    }
+
+    /// Declared input references, including repeated uses of the same artifact.
+    /// Consumers deduplicate by logical path and compare the full identity.
+    /// This metadata access does not verify current file bytes.
+    pub fn declared_artifacts(&self) -> Vec<&ArtifactRef> {
+        self.input.artifacts()
     }
 
     pub fn to_json(&self) -> Result<String, ManifestError> {

@@ -5,6 +5,16 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Default)]
 struct Checks(Vec<Violation>);
 
+pub(crate) fn validate_artifact(artifact: &ArtifactRef) -> Result<(), ManifestError> {
+    let mut checks = Checks::default();
+    checks.artifact("artifact", artifact);
+    if checks.0.is_empty() {
+        Ok(())
+    } else {
+        Err(ManifestError::Validation(checks.0))
+    }
+}
+
 impl Checks {
     fn require(&mut self, ok: bool, path: impl Into<String>, code: &'static str, message: &str) {
         if !ok {
