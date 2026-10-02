@@ -1,27 +1,36 @@
 # 총괄 통합 인수 상태
 
-기준일: 2026-10-03, Asia/Seoul. TASK-I01/I02의 source 관찰·수동 연결·실제 검사를
-구분하는 기록이다. 상세 적용은 [CONTRACT-ADOPTION](CONTRACT-ADOPTION.md),
+기준일: 2026-10-03, Asia/Seoul. TASK-I01/I02의 source 관찰·수동 연결·실제 검사와
+남은 실패를 구분하는 현재 기록이다. 상세 적용은 [CONTRACT-ADOPTION](CONTRACT-ADOPTION.md),
 작업 소유는 [IMPLEMENTATION-DIRECTIVES](IMPLEMENTATION-DIRECTIVES.md)를 따른다.
-문서 작성에서 Git 작업·검사·학습·대국을 수행하지 않았다. 실제 명령·결과·최종 SHA는
-총괄이 실행 후 채운다. 원시 근거는 저장소 밖에 보존하고 논리 경로·digest만 연결한다.
+현재 CPU/mock 인수 소스는 `4866a0b67dfd0aac10ffb03a0debd61fa018db3d`다.
+이 문서의 실행 결과는 해당 소스에서 총괄이 실제 관측한 검사이며 실제 NN·GPU·
+학습·정식 대국의 인수와 구분한다. 문서 후속 수정의 재사용 확인도 실제 실행과 구분한다.
+원시 근거는 저장소 밖에 보존하고 논리 경로·digest만 연결한다.
 
 ## 기준 조합
 
 공통 계약 [PR #7](https://github.com/daejunnom/RoveZero/pull/7)은 병합됐다.
-현재 총괄 develop base는 `3e3cd80533a69ee2118f1c130e72a1cb0745ae8c`,
+총괄 통합 시작 develop base는 `3e3cd80533a69ee2118f1c130e72a1cb0745ae8c`,
 통합은 [Draft PR #9](https://github.com/daejunnom/RoveZero/pull/9)다.
-다음은 총괄이 포착한 담당 source pin이며 최종 integration SHA가 아니다.
-A~D는 총괄 제공 prefix를 표시하고 실제 인수 영수증에는 full SHA를 기록한다.
+다음은 총괄이 포착·반입한 담당 source pin이다. 반입 뒤 root workspace의 adapter를
+수동 수정했다. 담당 standalone 소스와 최종 integration SHA의 실행 결과를 구분한다.
 
-| 담당 | PR | captured source head |
+| 담당 | PR | 현재 인수 기준 source head |
 |---|---|---|
-| A | #3 | `118dc03` |
-| B | #6 | `e80be2f` |
-| C | #5 | `0a56367` |
-| D | #4 | `83c2869` |
-| E | #8 | `383eb05c55f65cd2df5c8642a7f374e50be084b5` |
+| A | #3 | `118dc0311a88e143be285703940321dc16261f6a` |
+| B | #6 | `9eb805fe7e526d67044b69a4de67c80c08b5aafa` |
+| C | #5 | `b295e734f07b01ec65baf8ed6237daaa07ef5aad` |
+| D | #4 | `aa2fe1c3ac38274912017412e080a9bbd14c9485` |
+| E | #8 | `fcbe8b25d53ee96f48ca8dafd227e7c46f8d90ab` |
 | F | #2 | `36e619bae238a587e04c0a4bae24624eb5414aec` |
+
+E `91818e3d1309592cff561aa925688446c4a2e4e4`에서는 `rz-arena/src/fastchess.rs`,
+`src/runner.rs`, `tests/fastchess.rs`의 보완만 수동 반영했다. 4095 ply 상한, 실행 전
+profile 검사, bounded stdout 로그 인자, config.json의 감시·보존·공유 byte 예산과
+opening 재검사를 적용했다. 해당 head 전체나 실행 증거 번들을 반입한 것은 아니다.
+최신 D `f2a6c605dccfe85f8127b52b76380844a4c9c81c`와 F
+`bf38023640b2882e079eafc43e437ea9384b78f9`의 원시 증거 반입은 보류한다.
 
 ## TASK-I01: workspace와 단일 계약
 
@@ -30,41 +39,116 @@ A~D는 총괄 제공 prefix를 표시하고 실제 인수 영수증에는 full S
 - [x] Root path 의존에서 `rz-contracts=0.1.0`을 단일 공통 계약으로 지정.
 - [x] 선언 확인: toolchain `1.96.0`, workspace rust-version `1.90`; common crate
   MSRV `1.85`는 별도 범위이며 전체 workspace의 1.85 지원을 뜻하지 않는다.
-- [ ] 모든 consumer의 실제 path·revision·nested workspace 제거·feature·오류·수명
-  adapter 정합: 총괄 수동 연결 진행 중, 동일 integration SHA 인수는 pending.
-- [ ] 실제 Cargo resolution·format/lint/build/test·CPU 기본 CI 결과: pending.
+- [x] 실제 root 10개 crate의 `cargo check --workspace --all-features` 성공.
+  feature compile 성공은 실제 NN/provider·GPU 장치 실행의 성공과 구분한다.
+- [x] A Rules → C `ClassicalProjection`/`ScriptedRuntimeBackend` → D runtime →
+  B async UCI binary의 CPU/mock 접점을 연결. provider는 명시적인 `--cpu-mock`이다.
+- [x] 실제 소비자의 revision·오류·시간·취소·수명 접점을 수동으로 맞추고
+  `4866a0b67dfd0aac10ffb03a0debd61fa018db3d`의 CPU/mock 검사로 인수했다.
+- [x] 전체 test·fmt·엄격한 lint·양 OS CPU CI gate가 해당 소스 SHA에서 통과했다.
+
+공통 `ProcessClock`과 ID allocator, 실제 Rules 상태/ordered legal, C의 현재 tick→
+취소→ack 순서, D의 admission·물리 완료와 lease, B의 callback 거부·hard timer 출력
+권한을 직접 연결했다. 정상 완료의 출력 권한을 runtime 정리가 먼저 취소하지 않는다.
+B `RejectedResult`의 원래 오류·context·recovery를 engine에서 소비하고, 진단의
+32개 distinct receipt 상한을 넘는 원래 receipt도 보존한다. Failed publication은
+worker당 원본 하나를 owner mailbox에 둔다. 정확한 ticket·completion과 실제 실패
+진단 소비 때만 확인하며, 채널 종료·queued quit·panic·drain timeout·thread 완료
+직전 preemption에서도 회수한다. 동일 join 복제만 제거하고 별도 cleanup 오류는 남긴다.
 
 ## TASK-I02: 단계별 증거
 
 | 단계 | 현재 확인한 범위 | 별도 인수와 상태 |
 |---|---|---|
-| Source 반입·adapter | 위 captured pins와 root member/path 선언; 총괄 수동 정합 진행 | adapter diff·최종 integration SHA·실제 소비자 검사 pending |
-| CPU/mock binary·trace | 각 담당의 독립 코드·fixture/test 정의 | root 같은 SHA의 실제 UCI binary·연결 trace·cancel/drain·전체 CPU 검사 pending |
-| 실제 CPU NN | C의 모델 입력/loader/provider 준비와 수치 접점 | 선택 weights의 실제 독립 reference parity·engine 연결 pending |
+| Source 반입·adapter | 위 source pins, 단일 계약 path와 root 10개 crate 전체 target/feature 검사 성공 | 새 head 변경마다 영향 consumer 재검증 |
+| CPU/mock binary·trace | A→C→D→B async binary, C bridge 6개, UCI library 33개·실제 binary 7개가 전체 workspace 검사에 포함돼 성공 | 명시적 `--cpu-mock`; NN·GPU 인수는 별도 |
+| 실제 CPU NN | C 담당의 CPU NN 보고는 별도 근거로 유지 | root engine은 scripted/mock backend; 선택 weights의 실제 NN 연결·독립 reference 인수 pending |
 | 목표 GPU | 목표 RTX 4050 6GB와 준비 provider를 개발 호스트와 구분 | 실제 장치·precision·batch·수치·buffer·메모리·D02 종단 계측 pending |
-| 실제 F02 학습 | F CPU 숫자 fixture gradient·checkpoint/export/resume 제공 | Maia weights·실제 encoder·검증 data·유한 예산·CONTROL-1→2 인수 pending |
-| 정식 paired 대국 | E manifest·pair planner·attempt ledger·원시 WDL/n0..n4 제공 | 실제 runner/PGN Rules·시계/자원 공정성·NN·군집 통계·holdout 인수 pending |
+| 실제 F02 학습 | F CPU 숫자 fixture gradient·checkpoint/export/resume 제공; 총괄 Linux F 검사 105개 성공 | 실제 Maia 학습·실제 encoder·검증 data·유한 예산·CONTROL-1→2 인수 pending |
+| 정식 paired 대국 | E manifest·pair planner·attempt ledger·원시 WDL/n0..n4와 고정 Fastchess fixture 준비 | Fastchess fixture 전체 실행 not_run; 실제 NN·시계/자원·군집 통계·holdout 및 정식 대국 인수 pending |
 
-E/F 읽기 전용 source 리뷰에서 E test 선언 74개(Unix 조건부 4개), F test method
-105개를 확인했다. 이는 실행 결과가 아니다. E의 structural_only/readiness=false,
-F의 readiness=false·training_eligible_records=0·wire/Rules/encoder not_run을 유지한다.
-단독 package의 과거 검사 보고·source 선언 수·root 통합 검사를 합산하지 않는다.
+이전 E source 리뷰의 test 선언 74개(Unix 조건부 4개)는 당시의 정의 수이며 최신 E
+실행 결과로 재사용하지 않는다. F source의 test method 105개와 아래 실제 105개 성공도
+정의 수·실행 결과를 구별한다. 정식 실행은 `execution_ready=false`를 유지한다.
+F의 fixture 데이터 `training_eligible_records=0`·wire/Rules/encoder `not_run`을
+실제 A/C 연결이나 CPU 검사 성공만으로 승격하지 않는다.
 
-## 실제 검사 영수증 — pending
+## 실제 검사 영수증
 
-아래 명령은 CPU 기본 범위의 계획이며 이 기록에서 실행하지 않았다. source·feature·
-입력·환경과 실행 가능성을 총괄이 확인하고 실제 사용한 명령을 확정한다.
+아래는 모두 integration `4866a0b67dfd0aac10ffb03a0debd61fa018db3d`의 실제 실행이다.
+로컬은 Ubuntu/Rust 1.96.0·Python 3.12.3, `CARGO_BUILD_JOBS=2`, 저장소 밖의 작업 전용
+target/report root를 사용했다. provider는 CPU/mock이며 가중치 파일을 사용하지 않았다.
+서로 다른 gate의 검사 개수를 합쳐 하나의 강도·GPU 성공 수치로 표시하지 않는다.
 
-| 계획 명령/검사 | 상태 |
+| 검사/관측 | 실제 결과와 범위 |
 |---|---|
-| `cargo +1.96.0 fmt --all -- --check` | pending |
-| `cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings` | pending |
-| `cargo +1.96.0 test --workspace --all-targets --locked` | pending |
-| `cargo +1.96.0 build -p rz-uci --locked`와 실제 bounded UCI/mock trace | pending; trace 명령·fixture 총괄 확정 |
-| F Python unittest, import path=`experiments/model-research/src` | pending; 실제 Python·명령·출력 루트 총괄 확정 |
-| CPU NN·목표 GPU·실제 학습·정식 arena | pending; 각각 지원 환경·입력·유한 예산을 별도로 잠금 |
+| `cargo fmt --all -- --check` | 로컬·Ubuntu CI·Windows CI 성공 |
+| `cargo test --workspace --all-targets --all-features --locked` | 로컬/Ubuntu CI: 535 성공·0 실패·12 ignored, 55 target 결과. Windows CI: 515 성공·0 실패·2 ignored |
+| `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | 로컬·Ubuntu CI·Windows CI 성공 |
+| `python -m unittest discover -s experiments/model-research/tests -q` | 로컬·양 OS CI 각각 105 성공; `PYTHONPATH=experiments/model-research/src` |
+| `cargo test --release -p rz-position --all-features --locked --test perft -- --include-ignored` | 로컬 3 성공 |
+| `cargo test --release -p rz-position --all-features --locked -- --include-ignored` | CI의 pinned python-chess 1.999/chess 1.11.2 독립 대조 포함, 양 OS 각각 42 성공·0 ignored. 독립 oracle은 로컬 미실행 |
+| [CI run 37048414963](https://github.com/daejunnom/RoveZero/actions/runs/37048414963) | PR head를 직접 checkout; 해당 SHA의 양 OS 모든 필수 단계 성공 |
+| CPU NN·목표 GPU·실제 학습·정식 arena | root engine의 실제 실행 인수 pending; 각각 지원 환경·입력·유한 예산 별도 잠금 |
 
-각 실행 뒤 총괄은 integration SHA, 담당 full source heads, 계약 revision, 명령·OS·
+Ubuntu ignored는 E native child helper 10개와 A 확장 perft·독립 oracle 2개다.
+E helper는 supervisor 검사에서 별도 child로 실행하는 진입점이며 전체 workspace에
+`--include-ignored`를 붙여 직접 실행하지 않는다. A의 두 검사는 CI release 단계에서
+실제 실행했다. 플랫폼 조건부 검사 때문에 두 OS의 workspace 개수가 다르다.
+
+Publication 수정의 신규 회귀 11개는 실제 dispatch, 닫힌 receiver, queued quit,
+소비 확인 후 다음 root, 진단 poison, shutdown panic, 미완료 drain의 원인 회수와
+closure 반환→thread 완료 사이 preemption을 검사한다. 원인 회수는 물리 완료의
+주장이 아니다. 독립 읽기 리뷰는 추가 차단 결함을 찾지 못했으며, 검토한 engine 파일
+SHA256 `5c517a3ca4f7b36429a82d4f11996bbee0ca4618728ac92d0d9a15217930d86e`가
+인수 커밋의 파일과 일치했다. GitHub approval 리뷰는 아직 없으며 이 독립 리뷰와 구분한다.
+
+이전 실패 기록은 유지한다. [run 37040889696](https://github.com/daejunnom/RoveZero/actions/runs/37040889696)의
+B deadline/output·Windows E rename 실패, [run 37043890313](https://github.com/daejunnom/RoveZero/actions/runs/37043890313)의
+Windows clock·E lint 실패, [run 37045100732](https://github.com/daejunnom/RoveZero/actions/runs/37045100732)의
+Windows pin lint 실패를 각각 수정했다. 원래 guard·실패 원인을 제거해 통과시키지 않았다.
+`23d3567`의 양 OS 성공 뒤 독립 리뷰에서 찾은 publication 원인 손실도 후속 커밋과
+11개 회귀로 수정했다. 이전 SHA의 일부 성공 개수를 최신 성공 개수에 합하지 않는다.
+
+검증 입력의 Git object ID는 외부 파일 SHA256과 구분한다. 문서 후속 수정은 이 입력의
+일치를 확인해 위 소스 검사를 재사용하며, 새 head CI의 요청·완료는 PR에서 별도로 확인한다.
+
+| 입력 | 인수 소스의 Git object ID |
+|---|---|
+| `crates/` tree | `0647cefca478d9eab22e61b62e6bf12322277376` |
+| `experiments/model-research/` tree | `a4cf397ca7820f6dbe12c93f828fb772a8076821` |
+| `Cargo.toml` blob | `a786dd7c3f3bb03633d90bd070e87fad6157e6a6` |
+| `Cargo.lock` blob | `40ae7ed3acc260b31746b0b78c5d486b0e69e23f` |
+| `rust-toolchain.toml` blob | `c2294d8fb5bac0db761c2d5016932a38ab5060bc` |
+| CPU workflow blob | `748ed8e119ec3101e1f82370edc3bc950dde5aa8` |
+
+보존한 실행 로그는 저장소 밖 `reports/coordinator-integration/`에 있다.
+
+| 논리 파일명 | SHA256 |
+|---|---|
+| `workspace-4866a0b.log` | `4d0e408ebdb32fdd5bf5e3a218e8bcbe7589abb21a060d102476433cd29974bb` |
+| `clippy-4866a0b.log` | `b5cd628ef83643c4d1d3ef02e10d689554460495f0b7c843866175423229357d` |
+| `python-4866a0b.log` | `6df049697dc52e2743bdfef7341f4acbf02ee51056bd368f30bde220df7f1e77` |
+| `perft-4866a0b.log` | `d05b1ffc49582bc299746a1a7517c54f6d78573c1a0ec910dd7a87481f8c798a` |
+| `ci-4866a0b-37048414963.log` | `f4d9c1fc8701d17c90f22b47bbccf81a923b994703fe966f2b974e1cbe69f479` |
+
+## 증거 보존과 회수 상태
+
+D 원본 TSV와 E/F 원시 클라우드 실행 자료는 **unrecovered**다. 사용자가 다음 지시까지
+회수를 보류했으며 현재 회수·추가 원시 자료 탐색을 진행하지 않는다. source의 README,
+요약, 합성 fixture, 기록된 digest와 원격 metadata는 원본 자료 회수의 증거가 아니다.
+새 원격 head의 실행 근거도 회수·검증 전까지 unretrieved/unverified로 남긴다.
+
+증거는 source 관찰 → 대상 SHA의 실제 실행 → 외부 자료 보존·회수 → digest/입력·환경
+대조 → 해당 gate 인수로 구분한다. 위 새 로컬 CPU/mock·F fixture 로그는 총괄의 새
+실행 근거이며 과거 클라우드 자료의 대체 회수가 아니다. 로컬에서 실제 관측한 검사와
+아직 회수하지 않은 과거 클라우드 원시 자료를 혼동하지 않는다. 회수 재개 후에도
+원시 로그·TSV·checkpoint·실행 영수증을 Git에 반입하지 않고 외부 보존 참조를 연결한다.
+
+각 실제 인수에서 총괄은 integration SHA, 담당 full source heads, 계약 revision, 명령·OS·
 toolchain·backend/feature·fixture/weights/config digest·자원 한도, 실제 결과·실패·
 skip/미실행, 외부 산출물 참조·digest와 다음 검증자를 기록한다. CI 요청·관측 완료·
-재사용 확인도 분리한다. 최종 integration SHA와 전체 결과는 현재 pending이다.
+재사용 확인도 분리한다. CPU/mock 인수 소스와 gate는 위에서 확정했고 실제 CPU NN·
+목표 GPU·GPU 종단 계측·학습·정식 대국은 각각 pending이다. 고정 Fastchess fixture
+전체 실행도 `not_run`이며 정상 PGN·exit 0만으로 raw UCI 로그 완전성을 인수하지 않는다.
+후속 총괄은 사용자 재개 때 원격 head와 이 조합을 대조해 계약을 수동 정합한다.
