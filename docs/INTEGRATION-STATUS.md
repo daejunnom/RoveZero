@@ -21,16 +21,17 @@
 | A | #3 | `118dc0311a88e143be285703940321dc16261f6a` |
 | B | #6 | `9eb805fe7e526d67044b69a4de67c80c08b5aafa` |
 | C | #5 | `b295e734f07b01ec65baf8ed6237daaa07ef5aad` |
-| D | #4 | `aa2fe1c3ac38274912017412e080a9bbd14c9485` |
-| E | #8 | `fcbe8b25d53ee96f48ca8dafd227e7c46f8d90ab` |
-| F | #2 | `36e619bae238a587e04c0a4bae24624eb5414aec` |
+| D | #4 | `f2a6c605dccfe85f8127b52b76380844a4c9c81c`; 소스 기준 aa2fe1c, 후속 보존 자료는 외부 회수 |
+| E | #8 | `91818e3d1309592cff561aa925688446c4a2e4e4`; Rust 접점 수동 정합, 원시 자료·과거 scripts는 외부 회수 |
+| F | #2 | `bf38023640b2882e079eafc43e437ea9384b78f9`; 소스 기준 36e619b, 후속 보존 자료는 외부 회수 |
 
-E `91818e3d1309592cff561aa925688446c4a2e4e4`에서는 `rz-arena/src/fastchess.rs`,
-`src/runner.rs`, `tests/fastchess.rs`의 보완만 수동 반영했다. 4095 ply 상한, 실행 전
+E `91818e3d1309592cff561aa925688446c4a2e4e4`의 Rust 보완은 `rz-arena/src/fastchess.rs`,
+`src/runner.rs`, `tests/fastchess.rs`에 수동 반영했다. 4095 ply 상한, 실행 전
 profile 검사, bounded stdout 로그 인자, config.json의 감시·보존·공유 byte 예산과
-opening 재검사를 적용했다. 해당 head 전체나 실행 증거 번들을 반입한 것은 아니다.
-최신 D `f2a6c605dccfe85f8127b52b76380844a4c9c81c`와 F
-`bf38023640b2882e079eafc43e437ea9384b78f9`의 원시 증거 반입은 보류한다.
+opening 재검사를 적용했다. 이어 사용자의 자료 정리·develop 반영 지시에 따라
+D/E/F 최신 head의 이력을 merge했다. 기존 root 접점·Windows 검사·문서 정합을
+보존하고, 원시 자료는 외부 회수 후 최종 소스 tree에서 제외했다. Git에 이미 게시된
+원래 source history는 보존하며 재작성하지 않는다. 검토한 요약과 불변 출처만 소스에 둔다.
 
 ## TASK-I01: workspace와 단일 계약
 
@@ -111,7 +112,9 @@ Windows pin lint 실패를 각각 수정했다. 원래 guard·실패 원인을 �
 11개 회귀로 수정했다. 이전 SHA의 일부 성공 개수를 최신 성공 개수에 합하지 않는다.
 
 검증 입력의 Git object ID는 외부 파일 SHA256과 구분한다. 문서 후속 수정은 이 입력의
-일치를 확인해 위 소스 검사를 재사용하며, 새 head CI의 요청·완료는 PR에서 별도로 확인한다.
+검사 당시 입력을 식별한다. 연구자료 인수 후 변경은 Markdown에 한정돼 있으며,
+실행 영향 src/tests/examples·Python src/tests/fixtures·manifest/lock/toolchain/CI는
+동일하다. 이 소스 검사의 재사용 확인과 최종 PR head에서 새로 실행한 CI는 구분한다.
 
 | 입력 | 인수 소스의 Git object ID |
 |---|---|
@@ -134,15 +137,62 @@ Windows pin lint 실패를 각각 수정했다. 원래 guard·실패 원인을 �
 
 ## 증거 보존과 회수 상태
 
-D 원본 TSV와 E/F 원시 클라우드 실행 자료는 **unrecovered**다. 사용자가 다음 지시까지
-회수를 보류했으며 현재 회수·추가 원시 자료 탐색을 진행하지 않는다. source의 README,
-요약, 합성 fixture, 기록된 digest와 원격 metadata는 원본 자료 회수의 증거가 아니다.
-새 원격 head의 실행 근거도 회수·검증 전까지 unretrieved/unverified로 남긴다.
+사용자는 앞서 회수를 보류한 뒤 D~F 자료가 PR에 게시됐음을 알리고 정리·develop 반영을
+지시했다. 이에 **검증된 공개 보존 사본을 회수했다.** 마스킹 전 클라우드 원본,
+처음부터 저장하지 않은 로그·제외 binary·부재 wheel까지 회수한 것은 아니다.
+
+모든 파일의 mode·prefix·크기를 먼저 확인하고, 저장소 밖 사본의 길이와 Git blob
+identity를 지정 source와 대조했다. Windows의 자동 줄바꿈 변환을 거친 사본은
+인수하지 않았고, 최종 exact-blobs 사본은 719개 파일 모두 source byte와 일치했다.
+별도 과거 E script 두 개도 byte를 대조해 보존했다. 재현 script를 실행하거나 새로운
+과거 실험을 만들어 누락을 채우지 않았다.
+
+| 담당 | 공개 사본 수 / bytes | 회수의 논리 slot | archive SHA256 |
+|---|---|---|---|
+| D | 26 / 333,588 | `exact-blobs/D-f2a6c60` | `3e037102404a20e6863be201ea942e9fd372189c61c1a63535dcee5a0ac42257` |
+| E | 454 / 1,786,455 | `exact-blobs/E-91818e3` | `2b364c28ec5241402698651063a242c0e1a4b924c57f997e70e748bcafbf7bdf` |
+| F | 239 / 917,150 | `exact-blobs/F-bf38023` | `bc60a9dbcb44ba8a7c1256de7c196f12b0a622bd79838a973126f6e4869b17bb` |
+
+상위 논리 root는 저장소 밖 `reports/coordinator-integration/recovered-pr-evidence/`다.
+각 slot의 `.tar`와 `.receipt.json`은 source SHA·prefix·file count·mode·Git blob·
+file SHA256를 보존한다. receipt SHA256는 D
+`9614c9f75ca657a7cd70183ce1c896255b2b83a696b7944c7a88be786e77f693`, E
+`24d43849597b49eeeb1bd8003581c85b170f43cf930b7709793e4f99888502b2`, F
+`ffc74aa0cad13d8d84e38804e155f9ca54125a779e16c5189e6a3548a45290cb`다.
+E 과거 scripts의 별도 receipt SHA256는
+`0a523b4c08a587ab55083dde1ca30ca7a354403004654e2347d9d48edecf78a7`이다.
+후속 인수와 별도 정리 지시까지 보존한다. 원래 클라우드 scratch와 공개 Git 이력은 지우지 않았다.
+
+독립 자료 감사에서 확인한 범위와 한계는 다음과 같다.
+
+- D: 원본 TSV 8개·184,296 bytes·4,082 data rows와 results의 760개 metric이 맞았다.
+  재수집 69 tests는 aa2fe1c의 runtime 51 + telemetry 18이다. long-loss/zero의
+  관측 drop·오류와 불완전 profile, 초기 4개 source unknown, 정확한 과거 SHA/argv/UTC·
+  요청별 입력·event stream 누락을 유지한다. CPU 합성 stage·mock 계측이며 GPU/D03 성과가 아니다.
+- E: 네 inventory의 자료 448개와 11 ProcessReceipt가 참조한 artifact 46개가 맞았다.
+  과거 source 9e49b667의 Linux standalone 140 tests와 synthetic Event 회계를 분리한다.
+  실제 프로세스의 7수 script 1승·1패, cutoff Incomplete, signal 15 취소와 cleanup
+  Unverified도 보존한다. 시작 lock snapshot·최초 build raw 로그·제외 binary가 없으며,
+  마스킹 전 원본 회수나 root 엔진·NN의 대국 성과가 아니다.
+- F: manifest 237개·SHA256SUMS 238개, embedded digest 83개와 F02 receipt 11개가 맞았다.
+  source 미기록 historical 22개(실패 포함), source 36e619b의 새 recheck 13개,
+  재구성 audit·파생 TSV·경로 마스킹본·부재 wheel을 구분한다. 연속/resume의 model·
+  optimizer·sampler·history 정합은 numeric float64 fixture이며 실제 Maia 학습이 아니다.
+
+각 공개 bundle의 과거 remote receipt는 그때 대상 commit에만 적용한다. 이번 최신
+head의 독립 byte 감사와 총괄 외부 회수 receipt, 현재 root 실행은 서로 다른 근거다.
+불변 출처는 [D](https://github.com/daejunnom/RoveZero/tree/f2a6c605dccfe85f8127b52b76380844a4c9c81c/benches/runtime/evidence/aa2fe1c-d02),
+[E](https://github.com/daejunnom/RoveZero/tree/91818e3d1309592cff561aa925688446c4a2e4e4/experiments/baselines/evidence),
+[F](https://github.com/daejunnom/RoveZero/tree/bf38023640b2882e079eafc43e437ea9384b78f9/experiments/model-research/verification/2026-10-03-f-evidence-v1)다.
+
+E의 과거 `check-e.py`/`run-e-fixture.py`는 단일 root lock·실제 binary SHA 연결,
+출력 상한·readiness/timeout 자식 정리가 맞지 않아 실행 도구로 인수하지 않았다.
+원래 소스는 불변 commit과 외부 사본에 보존하며 실제 root 도구는 별도 정합·검사를 요구한다.
 
 증거는 source 관찰 → 대상 SHA의 실제 실행 → 외부 자료 보존·회수 → digest/입력·환경
 대조 → 해당 gate 인수로 구분한다. 위 새 로컬 CPU/mock·F fixture 로그는 총괄의 새
-실행 근거이며 과거 클라우드 자료의 대체 회수가 아니다. 로컬에서 실제 관측한 검사와
-아직 회수하지 않은 과거 클라우드 원시 자료를 혼동하지 않는다. 회수 재개 후에도
+실행 근거이며 과거 클라우드 자료의 대체 회수가 아니다. 새 검사와 공개 자료 감사,
+아직 회수하지 않은 마스킹 전/누락 원본을 혼동하지 않는다. 이후 회수에서도
 원시 로그·TSV·checkpoint·실행 영수증을 Git에 반입하지 않고 외부 보존 참조를 연결한다.
 
 각 실제 인수에서 총괄은 integration SHA, 담당 full source heads, 계약 revision, 명령·OS·
