@@ -13,3 +13,8 @@ path = "src/lib.rs"
 
 [dependencies]
 rz-telemetry = { path = "../rz-telemetry" }
+rz-contracts = { git = "https://github.com/daejunnom/RoveZero", rev = "ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8", optional = true }
+
+[features]
+default = []
+contracts = ["dep:rz-contracts"]

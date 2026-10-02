@@ -3,9 +3,15 @@
 version = 4
 
 [[package]]
+name = "rz-contracts"
+version = "0.1.0"
+source = "git+https://github.com/daejunnom/RoveZero?rev=ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8#ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8"
+
+[[package]]
 name = "rz-runtime"
 version = "0.1.0"
 dependencies = [
+ "rz-contracts",
  "rz-telemetry",
 ]
 

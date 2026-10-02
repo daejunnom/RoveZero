@@ -1,8 +1,10 @@
 use crate::{
-    Adapter, Backend, BackendResult, Clock, Limits, Resources, RuntimeFault, TerminalEvent,
+    observation::Observations, Adapter, Backend, BackendResult, Clock, Limits, Observation,
+    ObservationDrain, ObservationKind, Resources, RuntimeFault, TerminalEvent,
 };
 use rz_telemetry::{CapacityError, Event, FinishKind, Metrics, Snapshot};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::mem::size_of;
 use std::sync::{mpsc, Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
@@ -50,6 +52,8 @@ struct Delivery<T> {
 struct Budget {
     bytes: Resources,
     requests: usize,
+    peak_bytes: Resources,
+    peak_requests: usize,
 }
 
 struct Reservation {
@@ -76,6 +80,10 @@ pub struct State {
     pub queued: usize,
     pub executions: usize,
     pub reserved: Resources,
+    /// Exact per-domain ledger high-water marks, updated under the budget lock.
+    /// These are reservations, not allocated bytes or measured device memory.
+    pub peak_reserved: Resources,
+    pub peak_reserved_requests: usize,
     pub closed: bool,
 }
 
@@ -83,6 +91,7 @@ pub struct State {
 pub enum DrainState {
     Open,
     Draining,
+    /// Physical work is finished. Unread deliveries may still reserve bytes/slots.
     Drained,
     /// Resources remain pinned. The owner may keep pumping to reclaim them later.
     TimedOut {
@@ -90,6 +99,15 @@ pub enum DrainState {
         reserved: Resources,
     },
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShutdownSnapshot {
+    pub drain: DrainState,
+    pub state: State,
+}
+
+pub type SchedulerObservations<A> =
+    ObservationDrain<<A as Adapter>::RequestId, <A as Adapter>::ExecutionId, <A as Adapter>::Tick>;
 
 struct Entry<A: Adapter> {
     request: Arc<A::Request>,
@@ -107,7 +125,7 @@ struct Held<A: Adapter> {
 
 struct Execution<A: Adapter, P: Backend<A>> {
     // Physical ID never substitutes for subscriber/selection identity.
-    _id: A::ExecutionId,
+    id: A::ExecutionId,
     inputs: Vec<Held<A>>,
     _overhead: Arc<Reservation>,
     lease: P::Lease,
@@ -141,6 +159,7 @@ where
     closed: bool,
     drain_deadline: Option<A::Tick>,
     metrics: Metrics,
+    observations: Observations<A::RequestId, A::ExecutionId, A::Tick>,
 }
 
 impl<A, P, C> Scheduler<A, P, C>
@@ -161,6 +180,18 @@ where
             CapacityError::Overflow => RuntimeFault::ResourceOverflow,
             CapacityError::AllocationFailed => RuntimeFault::ResourceLimit,
         })?;
+        let observations = Observations::try_new(metric_sample_capacity)?;
+        let execution_bytes = limits
+            .max_executions
+            .checked_mul(size_of::<Execution<A, P>>())
+            .ok_or(RuntimeFault::ResourceOverflow)?;
+        if execution_bytes > isize::MAX as usize {
+            return Err(RuntimeFault::ResourceOverflow);
+        }
+        let mut executions = Vec::new();
+        executions
+            .try_reserve_exact(limits.max_executions)
+            .map_err(|_| RuntimeFault::ResourceLimit)?;
         Ok(Self {
             adapter,
             provider: Some(provider),
@@ -168,11 +199,12 @@ where
             limits,
             entries: HashMap::new(),
             queue: VecDeque::new(),
-            executions: Vec::new(),
+            executions,
             budget: Arc::new(Mutex::new(Budget::default())),
             closed: false,
             drain_deadline: None,
             metrics,
+            observations,
         })
     }
 
@@ -184,12 +216,32 @@ where
             queued: self.queue.len(),
             executions: self.executions.len(),
             reserved: budget.bytes,
+            peak_reserved: budget.peak_bytes,
+            peak_reserved_requests: budget.peak_requests,
             closed: self.closed,
         }
     }
 
     pub fn metrics(&self) -> Snapshot {
         self.metrics.snapshot()
+    }
+
+    /// Drain the passive bounded event stream outside latency-sensitive paths.
+    /// Capacity equals metric_sample_capacity. Overflow drops the oldest event;
+    /// sampling never changes request outcomes. A lossy drain is incomplete.
+    pub fn take_observations(&mut self) -> SchedulerObservations<A> {
+        self.observations.drain()
+    }
+
+    fn observe(&mut self, kind: ObservationKind<A::RequestId, A::ExecutionId, A::Tick>) {
+        let state = self.state();
+        self.observations.push(Observation {
+            at: self.clock.now(),
+            reserved: state.reserved,
+            peak_reserved: state.peak_reserved,
+            reserved_requests: state.reserved_requests,
+            kind,
+        });
     }
 
     pub fn submit(&mut self, request: A::Request) -> SubmitResult<A> {
@@ -240,8 +292,9 @@ where
                 reply,
             },
         );
-        self.queue.push_back(id);
+        self.queue.push_back(id.clone());
         self.metrics.record(Event::Admitted);
+        self.observe(ObservationKind::Admitted { request: id });
         Ok(CompletionReceiver { receiver })
     }
 
@@ -251,11 +304,14 @@ where
         error: A::Error,
     ) -> Result<T, Rejected<A::Request, A::Error>> {
         self.metrics.record(Event::Rejected);
+        self.observe(ObservationKind::Rejected {
+            request: self.adapter.request_id(&request),
+        });
         Err(Rejected { request, error })
     }
 
     fn reserve(
-        &self,
+        &mut self,
         bytes: Resources,
         request_slot: bool,
     ) -> Result<Arc<Reservation>, RuntimeFault> {
@@ -276,6 +332,14 @@ where
             .ok_or(RuntimeFault::ResourceOverflow)?;
         budget.bytes = total;
         budget.requests = requests;
+        budget.peak_bytes = Resources {
+            host_bytes: budget.peak_bytes.host_bytes.max(total.host_bytes),
+            device_bytes: budget.peak_bytes.device_bytes.max(total.device_bytes),
+            pinned_bytes: budget.peak_bytes.pinned_bytes.max(total.pinned_bytes),
+        };
+        budget.peak_requests = budget.peak_requests.max(requests);
+        drop(budget);
+        self.observe(ObservationKind::ReservationChanged);
         Ok(Arc::new(Reservation {
             budget: Arc::clone(&self.budget),
             bytes,
@@ -297,6 +361,23 @@ where
         } else {
             None
         }
+    }
+
+    fn queued_invalid(
+        &self,
+        id: &A::RequestId,
+        now: A::Tick,
+    ) -> Option<TerminalEvent<A::Output, A::Error>> {
+        let entry = &self.entries[id];
+        self.invalid(&entry.request, now).or_else(|| {
+            (!entry.running
+                && self.clock.elapsed(entry.admitted_at, now) >= self.limits.max_queue_age)
+                .then(|| {
+                    TerminalEvent::Failure(
+                        self.adapter.runtime_error(RuntimeFault::QueueAgeExceeded),
+                    )
+                })
+        })
     }
 
     /// Logical cancellation. Running input/Lease bytes remain owned by Execution.
@@ -329,17 +410,22 @@ where
         let latency = self.clock.elapsed(entry.admitted_at, self.clock.now());
         let result = self.adapter.terminal(&entry.request, event);
         // A sender is used once, on removal from entries, so this never waits.
-        if entry
+        let delivered = entry
             .reply
             .try_send(Delivery {
                 result,
                 _reservation: Arc::clone(&entry.reservation),
             })
-            .is_err()
-        {
+            .is_ok();
+        if !delivered {
             self.metrics.record(Event::ReceiverDropped);
         }
         self.metrics.record(Event::Finished { kind, latency });
+        self.observe(ObservationKind::Finished {
+            request: id.clone(),
+            kind,
+            delivered,
+        });
         true
     }
 
@@ -348,17 +434,8 @@ where
     pub fn pump(&mut self) {
         let ids: Vec<_> = self.entries.keys().cloned().collect();
         for id in ids {
-            let entry = &self.entries[&id];
             let now = self.clock.now();
-            let event = self.invalid(&entry.request, now).or_else(|| {
-                (!entry.running
-                    && self.clock.elapsed(entry.admitted_at, now) >= self.limits.max_queue_age)
-                    .then(|| {
-                        TerminalEvent::Failure(
-                            self.adapter.runtime_error(RuntimeFault::QueueAgeExceeded),
-                        )
-                    })
-            });
+            let event = self.queued_invalid(&id, now);
             if let Some(event) = event {
                 self.finish(&id, event);
             }
@@ -375,6 +452,9 @@ where
                 Poll::Ready(outputs) => {
                     let execution = self.executions.remove(index);
                     self.metrics.record(Event::PhysicalCompleted);
+                    self.observe(ObservationKind::PhysicalCompleted {
+                        execution: execution.id.clone(),
+                    });
                     self.complete(execution, outputs);
                 }
             }
@@ -386,6 +466,9 @@ where
             }
             self.dispatch(batch);
         }
+        // Receiver recv/drop can release its pin on another thread. This is the
+        // owner's later snapshot, not an assertion of the exact release time.
+        self.observe(ObservationKind::ReservationChanged);
     }
 
     fn next_batch(&self) -> Vec<A::RequestId> {
@@ -427,7 +510,7 @@ where
     fn dispatch(&mut self, batch: Vec<A::RequestId>) {
         // Revalidate immediately before allocating/launching the physical work.
         for id in &batch {
-            if let Some(event) = self.invalid(&self.entries[id].request, self.clock.now()) {
+            if let Some(event) = self.queued_invalid(id, self.clock.now()) {
                 self.finish(id, event);
             }
         }
@@ -473,7 +556,7 @@ where
         let invalid: Vec<_> = batch
             .iter()
             .filter_map(|id| {
-                self.invalid(&self.entries[id].request, self.clock.now())
+                self.queued_invalid(id, self.clock.now())
                     .map(|event| (id.clone(), event))
             })
             .collect();
@@ -484,6 +567,37 @@ where
             }
             return;
         }
+        // Prepare all owned pins and fallible/cloning metadata before launch.
+        // After a Lease is returned, register it before adapter/clock callbacks
+        // so unwinding still reaches the scheduler's physical quarantine.
+        let inputs: Vec<Held<A>> = batch
+            .iter()
+            .map(|id| {
+                let entry = &self.entries[id];
+                Held {
+                    id: id.clone(),
+                    request: Arc::clone(&entry.request),
+                    _reservation: Arc::clone(&entry.reservation),
+                }
+            })
+            .collect();
+        // Input preparation also costs wall time. Check queue age and authority
+        // again at the launch boundary rather than granting an implicit grace.
+        let invalid: Vec<_> = batch
+            .iter()
+            .filter_map(|id| {
+                self.queued_invalid(id, self.clock.now())
+                    .map(|event| (id.clone(), event))
+            })
+            .collect();
+        if !invalid.is_empty() {
+            drop(overhead);
+            for (id, event) in invalid {
+                self.finish(&id, event);
+            }
+            return;
+        }
+        let dispatch_started_at = self.clock.now();
         let dispatched = self
             .provider
             .as_mut()
@@ -497,26 +611,34 @@ where
                 return;
             }
         };
-        let mut inputs = Vec::with_capacity(batch.len());
-        for id in batch {
-            let entry = self.entries.get_mut(&id).expect("admitted input");
-            entry.running = true;
-            inputs.push(Held {
-                id,
-                request: Arc::clone(&entry.request),
-                _reservation: Arc::clone(&entry.reservation),
-            });
-        }
-        self.queue.drain(..inputs.len());
-        self.metrics.record(Event::Dispatched {
-            items: inputs.len(),
-        });
+        let execution_index = self.executions.len();
         self.executions.push(Execution {
-            _id: execution_id,
+            id: execution_id,
             inputs,
             _overhead: overhead,
             lease,
         });
+        for id in &batch {
+            let entry = self.entries.get_mut(id).expect("admitted input");
+            entry.running = true;
+            self.adapter
+                .bind_execution(&entry.request, &self.executions[execution_index].id);
+        }
+        self.queue.drain(..batch.len());
+        self.metrics
+            .record(Event::Dispatched { items: batch.len() });
+        self.observe(ObservationKind::Dispatched {
+            execution: self.executions[execution_index].id.clone(),
+            items: batch.len(),
+            dispatch_started_at,
+        });
+        for id in batch {
+            self.observe(ObservationKind::RequestDispatched {
+                request: id,
+                execution: self.executions[execution_index].id.clone(),
+                dispatch_started_at,
+            });
+        }
     }
 
     fn fail_batch(&mut self, batch: &[A::RequestId], error: &A::Error) {
@@ -545,10 +667,24 @@ where
                 };
                 let request = Arc::clone(&entry.request);
                 let event = match output.output {
-                    Ok(value) => match self.adapter.validate_output(&request, &value) {
-                        Ok(()) => TerminalEvent::Success(value),
-                        Err(error) => TerminalEvent::Failure(error),
-                    },
+                    Ok(value) => {
+                        self.observe(ObservationKind::ValidationStarted {
+                            request: output.request_id.clone(),
+                            execution: execution.id.clone(),
+                        });
+                        let checked =
+                            self.adapter
+                                .validate_execution(&request, &execution.id, &value);
+                        self.observe(ObservationKind::ValidationFinished {
+                            request: output.request_id.clone(),
+                            execution: execution.id.clone(),
+                            valid: checked.is_ok(),
+                        });
+                        match checked {
+                            Ok(()) => TerminalEvent::Success(value),
+                            Err(error) => TerminalEvent::Failure(error),
+                        }
+                    }
                     Err(error) => {
                         TerminalEvent::Failure(self.adapter.execution_error(&request, &error))
                     }
@@ -591,6 +727,10 @@ where
     }
 
     pub fn drain_state(&self) -> DrainState {
+        self.physical_drain_state(self.state().reserved)
+    }
+
+    fn physical_drain_state(&self, reserved: Resources) -> DrainState {
         let Some(deadline) = self.drain_deadline else {
             return DrainState::Open;
         };
@@ -599,10 +739,19 @@ where
         } else if self.clock.now() >= deadline {
             DrainState::TimedOut {
                 executions: self.executions.len(),
-                reserved: self.state().reserved,
+                reserved,
             }
         } else {
             DrainState::Draining
+        }
+    }
+
+    /// Report physical drain separately from still-owned delivery reservations.
+    pub fn shutdown_snapshot(&self) -> ShutdownSnapshot {
+        let state = self.state();
+        ShutdownSnapshot {
+            drain: self.physical_drain_state(state.reserved),
+            state,
         }
     }
 }

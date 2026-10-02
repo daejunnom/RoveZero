@@ -129,6 +129,19 @@ pub trait Adapter {
         request: &Self::Request,
         output: &Self::Output,
     ) -> Result<(), Self::Error>;
+    /// Bind only after successful launch. Keep this infallible and bounded;
+    /// failure to record metadata cannot undo already-running physical work.
+    fn bind_execution(&mut self, _request: &Self::Request, _id: &Self::ExecutionId) {}
+    /// Validate the actual physical identity as well as the logical payload.
+    /// Adapters whose output has no execution identity may use the default.
+    fn validate_execution(
+        &mut self,
+        request: &Self::Request,
+        _expected: &Self::ExecutionId,
+        output: &Self::Output,
+    ) -> Result<(), Self::Error> {
+        self.validate_output(request, output)
+    }
     fn allocate_execution_id(&mut self) -> Result<Self::ExecutionId, Self::Error>;
     fn runtime_error(&self, fault: RuntimeFault) -> Self::Error;
     /// Attach each subscriber's context while preserving the physical failure.

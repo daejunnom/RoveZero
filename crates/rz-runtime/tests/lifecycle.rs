@@ -3,9 +3,10 @@
 //! are not alternate definitions of TASK-I01's shared contract.
 
 use rz_runtime::{
-    Adapter, Backend, BackendResult, Clock, CompletionReceiver, DrainState, Limits, Resources,
-    RuntimeFault, Scheduler, TerminalEvent,
+    Adapter, Backend, BackendResult, Clock, CompletionReceiver, DrainState, Limits,
+    ObservationKind, Resources, RuntimeFault, Scheduler, TerminalEvent,
 };
+use rz_telemetry::FinishKind;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -123,6 +124,7 @@ struct AdapterControl {
     admission_tick: AtomicU64,
     execution_tick: AtomicU64,
     fail_execution_id: AtomicBool,
+    panic_binding: AtomicBool,
     terminal_ids: Mutex<Vec<u64>>,
     drops: Arc<Drops>,
 }
@@ -217,6 +219,13 @@ impl Adapter for FixtureAdapter {
         }
         self.next_execution += 1;
         Ok(self.next_execution)
+    }
+
+    fn bind_execution(&mut self, _request: &Request, _id: &u64) {
+        assert!(
+            !self.control.panic_binding.swap(false, Ordering::SeqCst),
+            "fixture binding failure"
+        );
     }
 
     fn runtime_error(&self, fault: RuntimeFault) -> Error {
@@ -405,6 +414,10 @@ fn limits() -> Limits {
 
 impl Fixture {
     fn new(limits: Limits, overhead: Resources) -> Self {
+        Self::with_capacity(limits, overhead, 16)
+    }
+
+    fn with_capacity(limits: Limits, overhead: Resources, capacity: usize) -> Self {
         let clock = ManualClock::default();
         let drops = Arc::new(Drops::default());
         let adapter = Arc::new(AdapterControl {
@@ -414,6 +427,7 @@ impl Fixture {
             admission_tick: AtomicU64::new(0),
             execution_tick: AtomicU64::new(0),
             fail_execution_id: AtomicBool::new(false),
+            panic_binding: AtomicBool::new(false),
             terminal_ids: Mutex::new(Vec::new()),
             drops: Arc::clone(&drops),
         });
@@ -431,7 +445,7 @@ impl Fixture {
             },
             clock.clone(),
             limits,
-            16,
+            capacity,
         )
         .unwrap();
         Self {
@@ -709,6 +723,8 @@ fn running_cancel_preserves_lease_inputs_provider_and_overhead_until_physical_re
     ready.store(true, Ordering::SeqCst);
     fixture.runtime.pump();
     assert_eq!(fixture.runtime.state().reserved, Resources::default());
+    assert_eq!(fixture.runtime.state().peak_reserved, bytes(5, 7, 9));
+    assert_eq!(fixture.runtime.state().peak_reserved_requests, 1);
     assert_eq!(fixture.drops.inputs.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.drops.leases.load(Ordering::SeqCst), 1);
     assert_eq!(*fixture.adapter.terminal_ids.lock().unwrap(), vec![1]);
@@ -831,6 +847,33 @@ fn execution_id_allocation_crossing_deadline_aborts_launch_and_releases_workspac
     assert_eq!(fixture.runtime.metrics().expired, 1);
     assert_eq!(fixture.runtime.metrics().dispatches, 0);
     assert_eq!(fixture.runtime.metrics().physical_completed, 0);
+    assert_eq!(fixture.drops.inputs.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.drops.leases.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn execution_id_allocation_crossing_queue_age_aborts_launch_at_the_configured_limit() {
+    let mut fixture = Fixture::new(limits(), bytes(4, 5, 6));
+    let receiver = fixture.runtime.submit(fixture.request(1)).unwrap();
+    fixture.clock.set(99);
+    fixture.adapter.execution_tick.store(100, Ordering::SeqCst);
+    fixture.runtime.pump();
+    assert!(fixture.batches().is_empty());
+    assert_eq!(fixture.clock.now(), 100);
+    assert_eq!(fixture.runtime.state().executions, 0);
+    assert_eq!(fixture.runtime.state().logical_requests, 0);
+    assert_eq!(fixture.runtime.state().queued, 0);
+    assert_eq!(fixture.runtime.state().reserved, bytes(1, 2, 3));
+    receive(
+        &receiver,
+        1,
+        runtime_failure(RuntimeFault::QueueAgeExceeded),
+    );
+    assert_eq!(fixture.runtime.state().reserved, Resources::default());
+    assert_eq!(fixture.runtime.state().reserved_requests, 0);
+    assert_eq!(fixture.runtime.metrics().failed, 1);
+    assert_eq!(fixture.runtime.metrics().expired, 0);
+    assert_eq!(fixture.runtime.metrics().dispatches, 0);
     assert_eq!(fixture.drops.inputs.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.drops.leases.load(Ordering::SeqCst), 0);
 }
@@ -1031,6 +1074,219 @@ fn shutdown_keeps_first_deadline_and_reclaims_after_timeout_when_physical_work_f
 }
 
 #[test]
+fn physical_drain_can_finish_while_unread_terminal_delivery_still_reserves_budget() {
+    for completed in [false, true] {
+        let mut fixture = Fixture::new(limits(), Resources::default());
+        let receiver = fixture.runtime.submit(fixture.request(1)).unwrap();
+        if completed {
+            fixture.runtime.pump();
+            fixture.runtime.pump();
+        }
+        fixture.runtime.begin_shutdown(10);
+        assert_eq!(fixture.runtime.drain_state(), DrainState::Drained);
+        assert_eq!(fixture.runtime.state().logical_requests, 0);
+        assert_eq!(fixture.runtime.state().executions, 0);
+        assert_eq!(fixture.runtime.state().reserved_requests, 1);
+        assert_eq!(fixture.runtime.state().reserved, bytes(1, 2, 3));
+        // A terminal result already committed before shutdown is immutable.
+        // Search must perform its own validity check before using that result.
+        assert!(!fixture.runtime.cancel(&1));
+        receive(
+            &receiver,
+            1,
+            if completed {
+                success(1)
+            } else {
+                Outcome::Canceled
+            },
+        );
+        assert_eq!(fixture.runtime.drain_state(), DrainState::Drained);
+        assert_eq!(fixture.runtime.state().reserved_requests, 0);
+        assert_eq!(fixture.runtime.state().reserved, Resources::default());
+        assert_eq!(*fixture.adapter.terminal_ids.lock().unwrap(), vec![1]);
+    }
+}
+
+#[test]
+fn canceled_observation_precedes_physical_completion_without_output_validation() {
+    let mut fixture = Fixture::with_capacity(limits(), bytes(4, 5, 6), 64);
+    let ready = fixture.pending();
+    let receiver = fixture.runtime.submit(fixture.request(1)).unwrap();
+    fixture.runtime.pump();
+    fixture.runtime.cancel(&1);
+    ready.store(true, Ordering::SeqCst);
+    fixture.runtime.pump();
+    receive(&receiver, 1, Outcome::Canceled);
+    let observed = fixture.runtime.take_observations();
+    assert_eq!(observed.dropped, 0);
+    assert!(!observed.counter_overflow);
+    let logical_finished = observed
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                ObservationKind::Finished {
+                    request: 1,
+                    kind: FinishKind::Canceled,
+                    delivered: true,
+                }
+            )
+        })
+        .unwrap();
+    let physical_finished = observed
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                ObservationKind::PhysicalCompleted { execution: 1 }
+            )
+        })
+        .unwrap();
+    assert!(logical_finished < physical_finished);
+    assert!(observed.events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            ObservationKind::RequestDispatched {
+                request: 1,
+                execution: 1,
+                ..
+            }
+        )
+    }));
+    assert!(!observed.events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            ObservationKind::ValidationStarted { .. } | ObservationKind::ValidationFinished { .. }
+        )
+    }));
+    assert_eq!(fixture.runtime.state().reserved, Resources::default());
+}
+
+#[test]
+fn zero_observation_capacity_preserves_outcome_and_reservation_lifecycle() {
+    let mut fixture = Fixture::with_capacity(limits(), bytes(4, 5, 6), 0);
+    let receiver = fixture.runtime.submit(fixture.request(1)).unwrap();
+    fixture.runtime.pump();
+    fixture.runtime.pump();
+    receive(&receiver, 1, success(1));
+    let observed = fixture.runtime.take_observations();
+    assert!(observed.events.is_empty());
+    assert!(observed.dropped > 0);
+    assert!(!observed.counter_overflow);
+    assert_eq!(fixture.runtime.metrics().completed, 1);
+    assert_eq!(fixture.runtime.metrics().physical_completed, 1);
+    assert_eq!(fixture.runtime.state().reserved_requests, 0);
+    assert_eq!(fixture.runtime.state().reserved, Resources::default());
+    assert_eq!(fixture.drops.inputs.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.drops.leases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn successful_validation_observation_does_not_imply_terminal_success() {
+    for deadline_changes in [false, true] {
+        let mut fixture = Fixture::with_capacity(limits(), Resources::default(), 64);
+        let mut request = fixture.request(1);
+        request.deadline = 10;
+        fixture
+            .adapter
+            .validation
+            .lock()
+            .unwrap()
+            .push_back(if deadline_changes {
+                ValidationHook::AdvanceClock(10)
+            } else {
+                ValidationHook::ChangeRoot(2)
+            });
+        let receiver = fixture.runtime.submit(request).unwrap();
+        fixture.runtime.pump();
+        fixture.clock.set(9);
+        fixture.runtime.pump();
+        receive(
+            &receiver,
+            1,
+            if deadline_changes {
+                Outcome::Expired
+            } else {
+                Outcome::Stale
+            },
+        );
+        let observed = fixture.runtime.take_observations();
+        assert_eq!(observed.dropped, 0);
+        let validated = observed
+            .events
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.kind,
+                    ObservationKind::ValidationFinished {
+                        request: 1,
+                        execution: 1,
+                        valid: true,
+                    }
+                )
+            })
+            .unwrap();
+        let terminal = observed
+            .events
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.kind,
+                    ObservationKind::Finished {
+                        request: 1,
+                        kind,
+                        ..
+                    } if *kind == if deadline_changes {
+                        FinishKind::Expired
+                    } else {
+                        FinishKind::Stale
+                    }
+                )
+            })
+            .unwrap();
+        assert!(validated < terminal);
+        assert!(!observed.events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                ObservationKind::Finished {
+                    kind: FinishKind::Completed,
+                    ..
+                }
+            )
+        }));
+        assert_eq!(fixture.runtime.metrics().completed, 0);
+        assert_eq!(fixture.runtime.state().reserved, Resources::default());
+    }
+}
+
+#[test]
+fn post_launch_binding_panic_keeps_pending_execution_owned_for_shutdown_quarantine() {
+    let mut fixture = Fixture::new(limits(), bytes(4, 5, 6));
+    let _ready = fixture.pending();
+    fixture.adapter.panic_binding.store(true, Ordering::SeqCst);
+    let receiver = fixture.runtime.submit(fixture.request(1)).unwrap();
+    let pumped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture.runtime.pump();
+    }));
+    assert!(pumped.is_err());
+    assert_eq!(fixture.runtime.state().executions, 1);
+    assert_eq!(fixture.runtime.state().reserved, bytes(5, 7, 9));
+    assert_eq!(fixture.drops.inputs.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.drops.leases.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.drops.providers.load(Ordering::SeqCst), 0);
+    let drops = Arc::clone(&fixture.drops);
+    let adapter = Arc::clone(&fixture.adapter);
+    drop(fixture);
+    receive(&receiver, 1, Outcome::Canceled);
+    assert_eq!(*adapter.terminal_ids.lock().unwrap(), vec![1]);
+    assert_eq!(drops.inputs.load(Ordering::SeqCst), 0);
+    assert_eq!(drops.leases.load(Ordering::SeqCst), 0);
+    assert_eq!(drops.providers.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn dropping_receiver_does_not_block_scheduler_or_retain_completed_resources() {
     let mut fixture = Fixture::new(limits(), Resources::default());
     let receiver = fixture.runtime.submit(fixture.request(1)).unwrap();
@@ -1170,6 +1426,8 @@ fn physical_concurrency_limit_keeps_fifo_tail_queued_until_one_execution_finishe
     assert_eq!(fixture.runtime.state().executions, 0);
     assert_eq!(fixture.runtime.state().reserved_requests, 0);
     assert_eq!(fixture.runtime.state().reserved, Resources::default());
+    assert_eq!(fixture.runtime.state().peak_reserved, bytes(11, 16, 21));
+    assert_eq!(fixture.runtime.state().peak_reserved_requests, 3);
     assert_eq!(fixture.drops.inputs.load(Ordering::SeqCst), 3);
     assert_eq!(fixture.drops.leases.load(Ordering::SeqCst), 3);
 }
