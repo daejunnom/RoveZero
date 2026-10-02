@@ -210,7 +210,7 @@ def train_fixture(recipe, manifest_path, records_path, plan_path, features_path,
         status = "canceled"
     except DataError as exc:
         status, failure = "failed", exc.as_dict()
-    if status != "failed" and (latest is None or latest["file"] != f"checkpoint-{progress['steps']:06d}.json"):
+    if status not in ("failed", "canceled") and (latest is None or latest["file"] != f"checkpoint-{progress['steps']:06d}.json"):
         latest = save_checkpoint()
     export = None
     try:

@@ -1,4 +1,4 @@
-# F01 데이터 구조·split·누출 감사
+# F 데이터 감사와 내부 학습 lifecycle
 
 `TASK-F01`의 CPU 전용 Python 도구다. Python 3.11 이상과 표준 라이브러리만으로
 데이터 형식, 라벨 대응, 유한 예산, 출처 그룹과 누출을 검사한다. 이 패키지의 신규
@@ -7,20 +7,25 @@
 ## 현재 인수 범위
 
 F 소유의 **잠정 저장 envelope v1**을 구현했다. 이것은 총괄이 발행한 Rust 공통
-계약·wire schema가 아니다. 현재 `rz-contracts`, A의 Rules, C의 Encoder/Eval binding이
-없어 `execution_ready=false`, `training_eligible_records=0`을 강제한다.
+계약·wire schema가 아니다. [PR #7](https://github.com/daejunnom/RoveZero/pull/7)의
+`ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8`에서 Rust 공통 revision 0.1 타입을
+확인했다. Python wire·A Rules·C Encoder/Eval binding은 연결하지 않아
+`execution_ready=false`, `training_eligible_records=0`을 강제한다.
 declared contract revision이나 fixture의 성공으로 이를 활성화할 수 없다.
 
 구현한 범위는 strict JSON, 라벨/수 순서/관점/예산 검사, 결정적 source split,
 교차 split 중복·출처·파생 관계 감사, 거부/제외 ledger와 크기가 제한된 보고서다.
 실제 상태 복원, 독립 합법 수 대조, 인코딩 digest 재계산, 증강의 규칙 의미 대조,
-teacher 품질, 실제 데이터 생성·학습·GPU·대국은 `not_run`이다.
+teacher 품질, 실제 데이터 생성·Maia 파인튜닝·GPU·대국은 `not_run`이다.
 `structural_audit_passed`는 이 제한된 검사 범위의 결과다.
 
 구현 기준은 [TRAINING-PLAN](../../docs/TRAINING-PLAN.md)의 3~4장,
 [CONTRACTS](../../docs/CONTRACTS.md), [IMPLEMENTATION-DIRECTIVES](../../docs/IMPLEMENTATION-DIRECTIVES.md)의
 F01이다. 루트 Cargo·CI·공통 선언이나 다른 담당 경로는 변경하지 않았다.
-학습 프레임워크와 F02 trainer는 이번 패키지에 도입하지 않았다.
+`rz_training`은 stdlib CPU float64 합성 모델로 recipe·gradient·checkpoint/resume·
+export lifecycle을 구현한다. 별도 학습 프레임워크 설치는 필요하지 않다.
+사용법과 실행 범위는 [TRAINING](TRAINING.md)에 있다. 이 fixture 모델은 엔진의 체스
+인코더나 Maia 모델이 아니며 TASK-F03의 새 architecture 선택도 아니다.
 
 ## 실행
 
@@ -126,8 +131,8 @@ raw log를 Git에 넣지 않는다. 독립 클라우드의 예시 output root는
 
 ## 다음 연결 요구
 
-총괄이 실제 공통 revision과 영속화 표현을 게시하면 이 잠정 envelope의 adapter를
-그 계약에 맞춘다. A의 초기 상태+trace 복원·합법 목록/종료·이력 대조, 독립 Rules 참조,
+확인한 Rust revision 0.1과 향후 영속화 표현에 이 잠정 envelope의 adapter를
+맞춘다. A의 초기 상태+trace 복원·합법 목록/종료·이력 대조, 독립 Rules 참조,
 C의 input fingerprint·policy mapping 대조, 증강의 의미 보존을 연결해야 F01 전체를
 인수할 수 있다. 확인한 SHA/revision과 독립 증거 없이 준비 상태를 활성화하지 않는다.
 F02는 그 데이터 감사와 C02/C03 실제 추론, CONTROL-0→1, 유한 학습 예산을 소비한다.

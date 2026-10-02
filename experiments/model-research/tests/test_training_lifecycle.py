@@ -155,7 +155,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(receipt["actual"]["steps"], 0)
         self.assertEqual(receipt["actual"]["samples"], 0)
         self.assertFalse(receipt["weights_changed"])
-        resumed, _ = self.run_training("resumed", resume_path=canceled / "checkpoint-000000.json")
+        resumed, _ = self.run_training("resumed", resume_path=canceled / "resume-checkpoint.json")
         continuous, _ = self.run_training("continuous")
         self.assertEqual(self.read(resumed / "checkpoint-000008.json")["model"],
                          self.read(continuous / "checkpoint-000008.json")["model"])
@@ -174,6 +174,25 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "canceled")
         self.assertEqual(checkpoint["sampler"], Sampler(3, 17).state_dict())
         self.run_training("resumed-draw", resume_path=run / "resume-checkpoint.json")
+
+    def test_cancellation_after_checkpoint_publication_does_not_retry_existing_file(self):
+        from rz_training.trainer import RunWriter
+        write = RunWriter.write
+        interrupted = False
+
+        def interrupt(writer, name, value):
+            nonlocal interrupted
+            write(writer, name, value)
+            if name.startswith("checkpoint-") and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+
+        with patch.object(RunWriter, "write", new=interrupt):
+            run, receipt = self.run_training("canceled-checkpoint")
+        self.assertEqual(receipt["status"], "canceled")
+        self.assertTrue((run / "checkpoint-000002.json").is_file())
+        self.assertEqual(receipt["checkpoint"]["file"], "resume-checkpoint.json")
+        self.run_training("resumed-checkpoint", resume_path=run / "resume-checkpoint.json")
 
     def test_export_cost_exceeding_time_budget_is_not_success_and_is_saved_for_resume(self):
         from rz_training import trainer
