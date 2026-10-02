@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "dataset_id": "fixture-f01-v1",
+  "record_id": "fixture-row-1",
+  "game_id": "fixture-game-1",
+  "opening_family_id": "fixture-opening-1",
+  "lineage_id": "fixture-lineage-1",
+  "seed_group_id": "fixture-seed-group-1",
+  "parent_record_id": null,
+  "augmentation_id": null,
+  "split": "train",
+  "input_identity": {
+    "digest": "6d9bcaf61f18e4d4f8c1c93e692c492a9a4002bf98def7361fc80a8032a5a0b2",
+    "encoding_id": "fixture-input",
+    "encoding_version": "v1"
+  },
+  "state": {
+    "rules_id": "standard_chess",
+    "rules_version": "unbound",
+    "initial_fen": "7k/P7/8/8/8/8/8/7K w - - 0 1",
+    "moves": [],
+    "history_origin": "fen",
+    "history_completeness": "unknown_prefix",
+    "state_digest": "cf461ff4831f6e75faa9d07f2e7ae5094778b6df81bd1872f79be4deb26709fb",
+    "board_digest": "2a96cf20890d37f6a72423060936f33db8f4eaafcf3cbd55f7d7425618a512fd",
+    "side_to_move": "white",
+    "play_status": "ongoing",
+    "termination_reason": null,
+    "legal_moves": [
+      "a7a8q",
+      "a7a8r",
+      "a7a8b",
+      "a7a8n"
+    ],
+    "legal_moves_digest": "db75670678313fb2e9857b6e9dd6a770cc13a3c8a7a3a2dfe5dcd2b750951a53"
+  },
+  "teacher_id": "mock-teacher",
+  "label": {
+    "status": "complete",
+    "failure_reason": null,
+    "generated_at": "2026-10-03T00:00:00+09:00",
+    "policy": {
+      "kind": "probabilities",
+      "source": "raw_nn",
+      "moves": [
+        "a7a8q",
+        "a7a8r",
+        "a7a8b",
+        "a7a8n"
+      ],
+      "values": [
+        0.4,
+        0.3,
+        0.2,
+        0.1
+      ],
+      "temperature": 1.0,
+      "normalization": "sum_one"
+    },
+    "value": {
+      "kind": "wdl",
+      "value": [
+        0.6,
+        0.2,
+        0.2
+      ],
+      "viewpoint": "side_to_move",
+      "scale": "probability"
+    },
+    "actual_cost": {
+      "time_ms": 0,
+      "nodes": 0,
+      "evaluations": 0,
+      "peak_memory_bytes": 0
+    },
+    "selection_reason": "synthetic contract fixture, not teacher analysis",
+    "confidence": null
+  },
+  "game_result": {
+    "status": "incomplete",
+    "wdl": null,
+    "viewpoint": "white",
+    "termination_reason": "synthetic fixture has no played game"
+  },
+  "failure_groups": [
+    "promotion",
+    "endgame"
+  ]
+}
