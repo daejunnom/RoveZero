@@ -112,6 +112,24 @@ fn linux_run(
     }
     let input = plan.manifest().input();
     let pair = &plan.pairs()[0];
+    let preflight_commands = input
+        .engines
+        .iter()
+        .enumerate()
+        .map(|(index, engine)| {
+            (
+                engine.id.clone(),
+                std::path::PathBuf::from(format!("/fixture/engine-{index}")),
+            )
+        })
+        .collect();
+    build_fastchess_invocation(
+        plan,
+        &pair.id,
+        &preflight_commands,
+        Path::new("/fixture/opening.pgn"),
+        Path::new("/fixture/match.pgn"),
+    )?;
     let mut engine_files = Vec::new();
     let mut commands = BTreeMap::new();
     // Preflight the entire immutable input lock, then pin each actual launch file.
@@ -137,13 +155,6 @@ fn linux_run(
         );
         engine_files.push(file);
     }
-    build_fastchess_invocation(
-        plan,
-        &pair.id,
-        &commands,
-        Path::new("/fixture/opening.pgn"),
-        Path::new("/fixture/match.pgn"),
-    )?;
     let opening = opening_pgn(plan, &pair.id)?;
     let unique: BTreeMap<_, _> = plan
         .manifest()
