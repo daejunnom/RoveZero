@@ -92,8 +92,8 @@ search는 position/contracts와 주입한 evaluator 접점, eval은 contracts/en
 구체 조합은 UCI/bootstrap에서 수행한다. telemetry는 수동 이벤트·계측이고 arena는
 외부 실행·검증 경계다. search↔runtime↔eval cycle이나 arena의 규칙 복제를 만들지 않는다.
 
-실제 CPU 조합의 C `contracts` feature에는 A 상태 projection과 D `RuntimeBackend`
-구현인 `native_runtime_bridge`가 포함된다. 이 선택적 연결부는 C의 모델·물리 worker를
+실제 CPU 조합의 C `contracts` feature에는 A 상태 projection과 D의 `Backend`
+접점을 구현한 `NativeRuntimeBackend`가 포함된다. 이 선택적 연결부는 C의 모델·물리 worker를
 D의 요청·lease·완료 계약에 맞추며 D는 구체 C provider에 역의존하지 않는다.
 B `onnx-cpu` bootstrap이 asset/runtime pin·한 session·공통 clock/ID·diagnostic owner를
 조합한다. 모델 추론 코어는 D queue 정책이나 탐색 방문 통계를 소유하지 않는다.

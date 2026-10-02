@@ -204,9 +204,9 @@ payload를 FP32로 풀었을 때 가중치 tensor만의 크기는 protobuf 전�
 작다는 단순 상한을 계산할 수 있지만, activation·cuDNN workspace·allocator·batch·두
 엔진 공동 점유를 포함하지 않는다. **파일 크기만으로 6 GB 실행 성공을 확정하지 않는다.**
 
-초기 backend의 우선 검토 경로는 Rust에서 ONNX Runtime C API를 호출하고 명시적으로
-CUDA EP를 선택하는 것이다. CPU EP는 독립 참조 검사로 따로 사용한다. 실제 Rust wrapper,
-ORT release, CUDA·cuDNN 조합과 lockfile은 총괄이 I01에서 선정·고정한다. driver가
+실제 CPU 경로는 Rust `ort=2.0.0-rc.10`·ONNX Runtime 1.22.0·명시 CPU EP로 고정해
+참조 대조와 root UCI 연결을 인수했다. 목표 GPU는 명시 CUDA EP를 우선 검토하며,
+CUDA·cuDNN·driver 조합과 GPU runtime 파일 identity는 실제 장비에서 별도로 고정한다. driver가
 지원하는 CUDA 최대값을 설치된 Toolkit/cuDNN 존재 증거로 쓰지 않는다.
 
 현재 ORT 문서는 release별 CUDA/cuDNN 호환표를 제공하며, cuDNN major version 간
