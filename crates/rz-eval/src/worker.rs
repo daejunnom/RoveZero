@@ -24,7 +24,6 @@ pub struct SingleWorker<J, R> {
 pub struct PhysicalLease<J, R> {
     input: Arc<J>,
     completion: mpsc::Receiver<R>,
-    state: Arc<AtomicU8>,
     consumed: bool,
     quarantine_cause: Arc<Mutex<Option<BackendError>>>,
 }
@@ -129,7 +128,6 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
         Ok(PhysicalLease {
             input,
             completion: receiver,
-            state: Arc::clone(&self.state),
             consumed: false,
             quarantine_cause,
         })
@@ -169,11 +167,20 @@ impl<J, R> PhysicalLease<J, R> {
                 self.consumed = true;
                 PhysicalPoll::Ready(result)
             }
-            Err(mpsc::TryRecvError::Empty) if self.state.load(Ordering::Acquire) != QUARANTINED => {
-                PhysicalPoll::Pending
-            }
+            Err(mpsc::TryRecvError::Empty) => self.poll_empty(),
             // Unexpected disconnection is also not proof of physical completion.
-            Err(_) => PhysicalPoll::Quarantined,
+            Err(mpsc::TryRecvError::Disconnected) => PhysicalPoll::Quarantined,
+        }
+    }
+
+    fn poll_empty(&self) -> PhysicalPoll<R> {
+        // The worker's admission state can belong to a later job by now. Only
+        // this job's own receipt may quarantine an observed Empty completion.
+        // Its output may also have arrived since try_recv: Pending is safe and
+        // the next poll will consume it; an unrelated job's panic is irrelevant.
+        match self.quarantine_cause.lock() {
+            Ok(slot) if slot.is_none() => PhysicalPoll::Pending,
+            _ => PhysicalPoll::Quarantined,
         }
     }
 }
@@ -198,5 +205,65 @@ fn panic_failure(payload: &(dyn std::any::Any + Send)) -> BackendError {
         error
             .with_external_cause(CauseCode::RuntimePanic, &unknown)
             .with_diagnostic("WorkerPanicNonString", unknown)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn wait_until(mut check: impl FnMut() -> bool) {
+        let stop = Instant::now() + Duration::from_secs(2);
+        while !check() {
+            assert!(
+                Instant::now() < stop,
+                "worker race fixture exceeded its budget"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn an_empty_observation_stays_pending_when_a_later_job_quarantines() {
+        let (entered, entering) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let mut worker = SingleWorker::spawn(move |input: &u8| {
+            if *input == 0 {
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(2)).unwrap();
+                return 0;
+            }
+            panic!("later job's injected unwind");
+        })
+        .unwrap();
+        let mut first = worker.submit(0).unwrap();
+        entering.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Freeze the exact interleaving between production poll's Empty receipt
+        // and its Empty classification, without timing sleeps or a public hook.
+        assert!(matches!(
+            first.completion.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        let mut next = None;
+        wait_until(|| match worker.submit(1) {
+            Ok(lease) => {
+                next = Some(lease);
+                true
+            }
+            Err(error) => {
+                assert_eq!(error.kind, K::ResourceExhausted);
+                false
+            }
+        });
+        let mut next = next.unwrap();
+        wait_until(|| matches!(next.poll(), PhysicalPoll::Quarantined));
+        wait_until(|| worker.state.load(Ordering::Acquire) == QUARANTINED);
+        assert!(next.quarantine_cause().unwrap().is_some());
+        assert!(first.quarantine_cause().unwrap().is_none());
+        assert!(matches!(first.poll_empty(), PhysicalPoll::Pending));
+        assert!(matches!(first.poll(), PhysicalPoll::Ready(0)));
+        assert!(matches!(first.poll(), PhysicalPoll::Consumed));
     }
 }

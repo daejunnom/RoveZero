@@ -107,15 +107,23 @@ fn a_later_panic_cause_is_not_attributed_to_a_completed_lease() {
     })
     .unwrap();
     let mut completed = worker.submit(0).unwrap();
-    wait_until(|| match completed.poll() {
-        PhysicalPoll::Ready(0) => true,
-        PhysicalPoll::Pending => false,
-        _ => panic!("unexpected first job state"),
+    // Admit the second job after native completion without consuming the first
+    // lease's queued output. Worker admission and each lease's result differ.
+    let mut failed = None;
+    wait_until(|| match worker.submit(1) {
+        Ok(lease) => {
+            failed = Some(lease);
+            true
+        }
+        Err(error) => {
+            assert_eq!(error.kind, FailureKind::ResourceExhausted);
+            false
+        }
     });
-    assert!(completed.quarantine_cause().unwrap().is_none());
-    let mut failed = worker.submit(1).unwrap();
+    let mut failed = failed.unwrap();
     wait_until(|| matches!(failed.poll(), PhysicalPoll::Quarantined));
     assert!(failed.quarantine_cause().unwrap().is_some());
     assert!(completed.quarantine_cause().unwrap().is_none());
+    assert!(matches!(completed.poll(), PhysicalPoll::Ready(0)));
     assert!(matches!(completed.poll(), PhysicalPoll::Consumed));
 }

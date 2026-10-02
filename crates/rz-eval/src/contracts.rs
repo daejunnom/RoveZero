@@ -13,6 +13,9 @@ use rz_encoding::{policy, POLICY_SIZE};
 use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
 
+pub use crate::native_runtime_bridge::{
+    NativeDiagnosticBatch, NativeDiagnosticReceipt, NativeRuntimeBackend, NativeWorkerOwner,
+};
 pub use crate::rules_projection::{ClassicalProjection, RulesProjection};
 pub use crate::runtime_bridge::{BridgeDiagnostics, MockTicket, ScriptedRuntimeBackend};
 

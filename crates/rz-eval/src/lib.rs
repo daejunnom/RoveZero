@@ -21,6 +21,9 @@ pub mod rules_projection;
 #[cfg(feature = "contracts")]
 pub mod runtime_bridge;
 
+#[cfg(feature = "contracts")]
+pub mod native_runtime_bridge;
+
 #[cfg(feature = "onnx")]
 pub mod onnx;
 

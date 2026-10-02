@@ -29,3 +29,7 @@ contracts = ["dep:rz-contracts", "dep:rz-position", "dep:rz-runtime"]
 [[example]]
 name = "maia_check"
 required-features = ["onnx"]
+
+[[example]]
+name = "rules_maia_check"
+required-features = ["onnx", "contracts"]

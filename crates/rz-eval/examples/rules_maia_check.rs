@@ -1,0 +1,621 @@
+//! Actual A Rules → C ONNX CPU → D finalization numerical acceptance.
+//!
+//! External reference frames never construct the product position or legal view.
+//! Model/encoding/position owners are assigned locally for this finite fixture;
+//! this example makes no production registry, B UCI, GPU, or strength claim.
+use rz_contracts::*;
+use rz_encoding::classical::{HistoryFill, HISTORY_FRAMES};
+use rz_eval::asset::{self, MaiaAsset};
+use rz_eval::contracts::{encoding_manifest, MaiaBinding, HOST_BYTES_PER_ITEM};
+use rz_eval::native_runtime_bridge::{NativeRuntimeBackend, NativeWorkerOrigin, NativeWorkerOwner};
+use rz_eval::onnx::{BackendConfig, OnnxBackend, OrtRuntime};
+use rz_eval::rules_projection::ClassicalProjection;
+use rz_eval::runtime_pin::RuntimeLibraryPin;
+use rz_position::contracts::{ContractPosition, ContractState, RulesState};
+use rz_position::{BoardMove, Position};
+use rz_runtime::contracts::{
+    ContractClock, ContractEvaluator, ContractSystemClock, ContractsAdapter, SharedScope,
+};
+use rz_runtime::{DrainState, Limits, Resources};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::error::Error;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+type Result<T> = std::result::Result<T, Box<dyn Error>>;
+type NativeEvaluator =
+    ContractEvaluator<RulesState, NativeRuntimeBackend<ContractSystemClock>, ContractSystemClock>;
+const REQUEST_SECONDS: u64 = 5;
+const CASE_NAMES: [&str; 12] = [
+    "start",
+    "black-after-e4",
+    "eight-ply-opening",
+    "repeated-start-with-history",
+    "same-board-unknown-prefix",
+    "white-en-passant",
+    "black-en-passant",
+    "white-both-castles",
+    "black-both-castles",
+    "white-all-promotions",
+    "black-all-promotions",
+    "short-fen-history",
+];
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Fixtures {
+    schema: u32,
+    reference: String,
+    reference_commit: String,
+    reference_module_sha256: String,
+    source_sha256: String,
+    fixture_oracle: String,
+    cases: Vec<Case>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Case {
+    name: String,
+    fen: String,
+    moves: Vec<String>,
+    frames: Vec<ReferenceFrame>,
+    black_to_move: bool,
+    castling: [bool; 4],
+    halfmove_clock: u32,
+    history_fill: String,
+    input: Vec<f32>,
+    legal_moves: Vec<ReferenceMove>,
+    indices: Vec<usize>,
+    policy_logits: Vec<f32>,
+    wdl: Vec<f32>,
+    legal_policy: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReferenceFrame {
+    pieces: [[u64; 6]; 2],
+    repeated: bool,
+    en_passant_target: Option<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReferenceMove {
+    from_square: u8,
+    to_square: u8,
+    promotion: Option<char>,
+    castle: bool,
+}
+
+fn compare(actual: &[f32], expected: &[f32], atol: f64, rtol: f64) -> Result<f64> {
+    if actual.len() != expected.len() || actual.is_empty() {
+        return Err("comparison shape differs".into());
+    }
+    let mut maximum: f64 = 0.0;
+    for (&actual, &expected) in actual.iter().zip(expected) {
+        let error = (f64::from(actual) - f64::from(expected)).abs();
+        if !actual.is_finite()
+            || !expected.is_finite()
+            || error > atol + rtol * f64::from(expected).abs()
+        {
+            return Err(format!("numerical mismatch: absolute error={error}").into());
+        }
+        maximum = maximum.max(error);
+    }
+    Ok(maximum)
+}
+
+fn probability_vector(values: &[f32], length: usize) -> bool {
+    values.len() == length
+        && !values.is_empty()
+        && values
+            .iter()
+            .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        && (values.iter().map(|&value| f64::from(value)).sum::<f64>() - 1.0).abs() <= 1e-5
+}
+
+fn reference_move(movement: &ReferenceMove) -> Result<Move> {
+    let promotion = match movement.promotion {
+        None => None,
+        Some('q') => Some(Promotion::Queen),
+        Some('r') => Some(Promotion::Rook),
+        Some('b') => Some(Promotion::Bishop),
+        Some('n') => Some(Promotion::Knight),
+        _ => return Err("unsupported reference promotion".into()),
+    };
+    if movement.castle && promotion.is_some() {
+        return Err("reference castle has a promotion".into());
+    }
+    Ok(Move::new(
+        Square::try_new(movement.from_square)?,
+        Square::try_new(movement.to_square)?,
+        promotion,
+    )?)
+}
+
+fn validate_reference(fixtures: &Fixtures) -> Result<()> {
+    if fixtures.schema != 1
+        || fixtures.reference != "lc0-v0.32.1-eigen-original-protobuf"
+        || fixtures.reference_commit != asset::CONVERTER_COMMIT
+        || fixtures.source_sha256 != asset::SOURCE_GZIP_SHA256
+        || fixtures.fixture_oracle != "python-chess-1.999/chess-1.11.2"
+        || fixtures.cases.len() != CASE_NAMES.len()
+    {
+        return Err("reference metadata or finite case set differs".into());
+    }
+    asset::parse_sha256(&fixtures.reference_module_sha256)?;
+    for (i, (case, name)) in fixtures.cases.iter().zip(CASE_NAMES).enumerate() {
+        let count = case.legal_moves.len();
+        let expected_profile = if i < 5 { "no" } else { "repeat_oldest" };
+        if case.name != name
+            || case.fen.len() > 256
+            || case.moves.len() > 8
+            || case
+                .moves
+                .iter()
+                .any(|movement| !(4..=5).contains(&movement.len()))
+            || case.frames.len() != (case.moves.len() + 1).min(HISTORY_FRAMES)
+            || case
+                .frames
+                .iter()
+                .any(|frame| frame.en_passant_target.is_some_and(|sq| sq >= 64))
+            || case.input.len() != 112 * 64
+            || case.input.iter().any(|value| !value.is_finite())
+            || case.policy_logits.len() != 1858
+            || case.policy_logits.iter().any(|value| !value.is_finite())
+            || count == 0
+            || count > rz_position::contracts::MAX_CONTRACT_LEGAL_MOVES
+            || case.indices.len() != count
+            || case.indices.iter().any(|&index| index >= 1858)
+            || !probability_vector(&case.wdl, 3)
+            || !probability_vector(&case.legal_policy, count)
+            || case.history_fill != expected_profile
+        {
+            return Err(format!("invalid reference dimensions/profile: {}", case.name).into());
+        }
+        let moves = case
+            .legal_moves
+            .iter()
+            .map(reference_move)
+            .collect::<Result<Vec<_>>>()?;
+        if moves
+            .iter()
+            .enumerate()
+            .any(|(i, movement)| moves[..i].contains(movement))
+            || case
+                .indices
+                .iter()
+                .enumerate()
+                .any(|(i, index)| case.indices[..i].contains(index))
+        {
+            return Err("duplicate reference move or action index".into());
+        }
+    }
+    if fixtures.cases[3].input == fixtures.cases[4].input {
+        return Err("known repeated history and unknown prefix collapsed to one NN input".into());
+    }
+    Ok(())
+}
+
+fn backend_receipt(error: &rz_eval::error::BackendError) -> Value {
+    json!({"kind":format!("{:?}",error.kind),"stage":format!("{:?}",error.stage),
+        "detail":error.detail,
+        "cause":error.cause.map(|cause| json!({"code":format!("{:?}",cause.code),
+            "prefix_sha256":cause.prefix_sha256,"hashed_bytes":cause.hashed_bytes,
+            "truncated":cause.truncated,"formatting_failed":cause.formatting_failed,
+            "output":cause.output.map(|output| format!("{output:?}"))})),
+        "native":error.native.as_ref().map(|native| json!({"code":native.code,
+            "message_bytes":native.message.len(),"truncated":native.truncated,
+            "raw_text":"bounded native text is excluded from this report"}))})
+}
+
+fn error_receipt(error: &(dyn Error + 'static)) -> Value {
+    if let Some(physical) = error.downcast_ref::<rz_eval::contracts::PhysicalFailure>() {
+        json!({"kind":"PhysicalFailure","contract":format!("{:?}",physical.contract),
+            "backend":physical.backend.as_ref().map(backend_receipt)})
+    } else if let Some(backend) = error.downcast_ref::<rz_eval::error::BackendError>() {
+        backend_receipt(backend)
+    } else {
+        json!({"kind":"fixture_or_contract_failure","detail":error.to_string()})
+    }
+}
+
+fn restore(case: &Case, owner: OwnerId) -> Result<ContractState> {
+    // Literal FEN imports remain unknown-prefix. Do not turn model padding into
+    // Rules history, or claim FEN-before history is complete because it looks like startpos.
+    let mut position = Position::from_fen(&case.fen)?;
+    for movement in &case.moves {
+        position.make_move(BoardMove::from_uci(movement)?)?;
+    }
+    let mut live = ContractPosition::new(owner, position);
+    let frozen = live.export()?;
+    if frozen.terminal_wdl().is_some() {
+        return Err("reference unexpectedly restores a terminal".into());
+    }
+    // Advance the live owner after export; every later comparison consumes only
+    // the already-owned immutable A snapshot and its exact legal attestation.
+    let first = *frozen
+        .legal_moves()
+        .moves()
+        .first()
+        .ok_or("empty A legal view")?;
+    live.make_from_view(&frozen, first)?;
+    Ok(frozen)
+}
+
+fn compare_projection(
+    projection: &ClassicalProjection,
+    frozen: &ContractState,
+    case: &Case,
+) -> Result<Vec<f32>> {
+    let projected = projection.project(frozen.rules())?;
+    let input = projected.input();
+    if input.black_to_move != case.black_to_move
+        || input.castling != case.castling
+        || input.halfmove_clock != case.halfmove_clock
+        || input.history.len() != case.frames.len()
+    {
+        return Err(format!("actual A frame metadata differs: {}", case.name).into());
+    }
+    for (actual, expected) in input.history.iter().zip(&case.frames) {
+        if actual.pieces != expected.pieces
+            || actual.repeated != expected.repeated
+            || actual.en_passant_target != expected.en_passant_target
+        {
+            return Err(format!("actual A known frame differs: {}", case.name).into());
+        }
+    }
+    let encoded = projection.encode(frozen.rules())?;
+    compare(encoded.values(), &case.input, 0.0, 0.0)?;
+    let actual_moves = frozen.legal_moves().moves();
+    let reference_moves = case
+        .legal_moves
+        .iter()
+        .map(reference_move)
+        .collect::<Result<Vec<_>>>()?;
+    if actual_moves.len() != reference_moves.len() {
+        return Err("A/reference legal move counts differ".into());
+    }
+    let actual_indices = projection.legal_indices(frozen.rules(), actual_moves)?;
+    let mut reordered = Vec::with_capacity(actual_moves.len());
+    for (movement, actual_index) in actual_moves.iter().zip(actual_indices) {
+        let reference_index = reference_moves
+            .iter()
+            .position(|reference| reference == movement)
+            .ok_or("actual A legal move absent from independent reference")?;
+        if actual_index != case.indices[reference_index] {
+            return Err("actual A legal action mapping differs".into());
+        }
+        reordered.push(case.legal_policy[reference_index]);
+    }
+    Ok(reordered)
+}
+
+fn deadline(clock: &ContractSystemClock) -> Result<Deadline> {
+    Ok(Deadline {
+        clock: clock.domain(),
+        at: MonotonicTick(
+            clock
+                .try_now()?
+                .0
+                .checked_add(REQUEST_SECONDS * 1_000_000_000)
+                .ok_or("fixture deadline overflow")?,
+        ),
+    })
+}
+
+fn request(
+    projection: &ClassicalProjection,
+    frozen: &ContractState,
+    clock: &ContractSystemClock,
+    sequence: u64,
+) -> Result<Arc<EvalRequest<RulesState>>> {
+    let epoch = clock.domain().0;
+    let context = EvalContext {
+        revision: CONTRACT_REVISION,
+        request: RequestId::new(epoch, sequence),
+        selection: SelectionId::new(epoch, sequence),
+        game: GameGeneration(1),
+        root: RootGeneration(1),
+        state: frozen.snapshot().identity(),
+        legal_order: frozen.legal_moves().order(),
+        input: projection.input_key(frozen.rules(), frozen.legal_moves().moves())?,
+        model: projection.model().handle(),
+        encoding: projection.model().encoding().handle,
+        precision: PrecisionProfile::Fp32,
+        compute: ComputeBudget {
+            min_steps: 1,
+            max_steps: 1,
+            require_full: true,
+        },
+        backend: projection.backend(),
+    };
+    Ok(Arc::new(EvalRequest::try_new(
+        context,
+        frozen.snapshot().clone(),
+        frozen.legal_moves().clone(),
+        Arc::clone(projection.model()),
+        deadline(clock)?,
+        CancelToken::new(),
+        ByteBudget {
+            host: HOST_BYTES_PER_ITEM + 4096,
+            device: 0,
+            pinned: 0,
+        },
+    )?))
+}
+
+fn drain(evaluator: &mut NativeEvaluator, clock: &ContractSystemClock) -> Result<Value> {
+    evaluator.begin_shutdown(deadline(clock)?)?;
+    let until = Instant::now() + Duration::from_secs(REQUEST_SECONDS);
+    let mut extra_deliveries = Vec::new();
+    let mut extra_overflow = false;
+    loop {
+        evaluator.pump();
+        // Preserve unexpected deliveries while still finishing physical cleanup.
+        if let Some(result) = evaluator.poll() {
+            if extra_deliveries.len() < CASE_NAMES.len() {
+                extra_deliveries.push(format!("{result:?}"));
+            } else {
+                extra_overflow = true;
+            }
+        }
+        let snapshot = evaluator.shutdown_snapshot();
+        if snapshot.drain == DrainState::Drained {
+            let state = snapshot.state;
+            if state.logical_requests != 0
+                || state.reserved_requests != 0
+                || state.queued != 0
+                || state.executions != 0
+                || state.reserved != Resources::default()
+            {
+                return Err("physical drain left logical/delivery reservations".into());
+            }
+            return Ok(
+                json!({"physical":"drained","logical_requests":0,"executions":0,
+                "reserved_requests":0,"reserved_host":0,"reserved_device":0,"reserved_pinned":0,
+                "unexpected_deliveries":extra_deliveries,"unexpected_delivery_overflow":extra_overflow}),
+            );
+        }
+        if Instant::now() >= until {
+            return Err(format!("native drain incomplete: {snapshot:?}").into());
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn evaluate_profile(
+    runtime: &OrtRuntime,
+    model: &MaiaAsset,
+    fixtures: &Fixtures,
+    fill: HistoryFill,
+    profile_slot: u64,
+    reports: &mut Vec<Value>,
+    profiles: &mut Vec<Value>,
+) -> Result<()> {
+    let mut config = BackendConfig::cpu();
+    config.max_batch = 1;
+    let loaded = OnnxBackend::load(runtime, model, config)?;
+    // Explicit local fixture ownership; these are not production-issued handles.
+    let encoding = EncodingHandle {
+        owner: OwnerId(900),
+        slot: profile_slot,
+        generation: SlotGeneration(1),
+        manifest: encoding_manifest(fill),
+    };
+    let handle = ModelHandle {
+        owner: OwnerId(900),
+        slot: profile_slot,
+        generation: SlotGeneration(1),
+        manifest: Digest(loaded.asset_identity()),
+    };
+    let projection =
+        ClassicalProjection::new(MaiaBinding::for_backend(&loaded, handle, encoding, fill)?);
+    let profile = match fill {
+        HistoryFill::No => "no",
+        HistoryFill::RepeatOldest => "repeat_oldest",
+    };
+    let owner = NativeWorkerOwner::from_onnx(loaded, projection.clone(), CASE_NAMES.len())?;
+    if owner.origin() != NativeWorkerOrigin::CpuOnnx {
+        return Err("injected worker is not actual ONNX CPU evidence".into());
+    }
+    let clock = ContractSystemClock::new(ProcessEpoch(910 + profile_slot));
+    let scope = AcceptanceScope {
+        game: GameGeneration(1),
+        root: RootGeneration(1),
+        model: handle,
+        encoding,
+        backend: projection.backend(),
+    };
+    let adapter =
+        ContractsAdapter::with_execution_high_water(SharedScope::new(scope), clock.clone(), 1, 0)?;
+    let backend = NativeRuntimeBackend::new(owner.clone(), clock.clone())?;
+    let limits = Limits {
+        max_requests: 1,
+        max_batch_items: 1,
+        max_executions: 1,
+        max_batch_wait: Duration::ZERO,
+        max_queue_age: Duration::from_secs(REQUEST_SECONDS),
+        deadline_reserve: Duration::ZERO,
+        memory: Resources {
+            host_bytes: 4 * HOST_BYTES_PER_ITEM + 8192,
+            device_bytes: 0,
+            pinned_bytes: 0,
+        },
+    };
+    let mut evaluator = ContractEvaluator::new(adapter, backend, limits, 64)?;
+    let work = (|| -> Result<()> {
+        for (i, case) in fixtures
+            .cases
+            .iter()
+            .enumerate()
+            .filter(|(_, case)| case.history_fill == profile)
+        {
+            let frozen = restore(case, OwnerId(1000 + i as u64))?;
+            let reference_policy = compare_projection(&projection, &frozen, case)?;
+            let request = request(&projection, &frozen, &clock, i as u64 + 1)?;
+            evaluator.submit(Arc::clone(&request))?;
+            let until = Instant::now() + Duration::from_secs(REQUEST_SECONDS);
+            let completed = loop {
+                if let Some(result) = evaluator.poll() {
+                    break result;
+                }
+                if Instant::now() >= until {
+                    return Err(format!("native completion timeout: {}", case.name).into());
+                }
+                std::thread::yield_now();
+            };
+            let output = match completed {
+                EvalResult::Completed(output) => output,
+                other => return Err(format!("native finalized failure: {other:?}").into()),
+            };
+            output.validate_for(&request, scope, clock.domain(), clock.try_now()?)?;
+            if output.actual.execution.is_none()
+                || output.actual.provenance != CacheProvenance::Computed
+                || output.actual.precision != PrecisionProfile::Fp32
+                || output.actual.steps != 1
+                || !output.actual.full
+                || output.viewpoint != Viewpoint::SideToMove
+            {
+                return Err("D result is not fresh full FP32 physical inference".into());
+            }
+            let policy = output
+                .policy
+                .probabilities()
+                .iter()
+                .map(|&value| value as f32)
+                .collect::<Vec<_>>();
+            let policy_error = compare(&policy, &reference_policy, 1e-4, 0.0)?;
+            let wdl_error = compare(&output.wdl.probabilities(), &case.wdl, 1e-4, 0.0)?;
+            reports.push(json!({"case":case.name,"history_fill":profile,
+                "rules_origin":"literal_fen_unknown_prefix_with_actual_trace",
+                "known_frames":case.frames.len(),"frozen_after_live_advance":true,
+                "dense_input_max_abs":0.0,"ordered_legal_count":policy.len(),
+                "legal_policy_max_abs":policy_error,"wdl_max_abs":wdl_error,
+                "physical_execution":format!("{:?}",output.actual.execution),"finalized_by":"D"}));
+        }
+        Ok(())
+    })();
+    // Both failure and cleanup receipts survive even when the profile fails.
+    let cleanup = drain(&mut evaluator, &clock);
+    let diagnostics = owner.take_diagnostics();
+    let diagnostic_report = match &diagnostics {
+        Ok(batch) => json!({"entries":batch.entries.iter().map(|receipt| json!({
+            "ticket":format!("{:?}",receipt.ticket),"context":format!("{:?}",receipt.context),
+            "kind":format!("{:?}",receipt.kind),"contract":format!("{:?}",receipt.failure.contract),
+            "backend":receipt.failure.backend.as_ref().map(backend_receipt)})).collect::<Vec<_>>(),
+            "boundary_error":batch.boundary_error.as_ref().map(|error| format!("{error:?}")),
+            "poison_error":batch.poison_error.as_ref().map(|error| format!("{error:?}"))}),
+        Err(error) => {
+            json!({"transfer_failed":format!("{error:?}"),"originals":"retained by owner"})
+        }
+    };
+    let diagnostics_clean = diagnostics.as_ref().is_ok_and(|batch| {
+        batch.entries.is_empty() && batch.boundary_error.is_none() && batch.poison_error.is_none()
+    });
+    let cleanup_clean = cleanup.as_ref().is_ok_and(|receipt| {
+        receipt["unexpected_deliveries"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+            && receipt["unexpected_delivery_overflow"] == false
+    });
+    profiles.push(json!({"history_fill":profile,"batch_size":1,
+        "work_status":if work.is_ok(){"passed"}else{"failed"},
+        "work_failure":work.as_ref().err().map(|error| error_receipt(error.as_ref())),
+        "drain":cleanup.as_ref().ok(),
+        "drain_failure":cleanup.as_ref().err().map(|error| error_receipt(error.as_ref())),
+        "native_diagnostics":diagnostic_report}));
+    if diagnostics.is_err() {
+        // Transfer failure leaves originals in this finite-capacity owner. Keep
+        // that owner through process exit instead of silently dropping originals.
+        std::mem::forget(owner);
+    }
+    work?;
+    cleanup?;
+    if !diagnostics_clean || !cleanup_clean {
+        return Err(
+            "native diagnostics or unexpected deliveries prevent profile acceptance".into(),
+        );
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.len() != 8 || args[7] != "cpu" {
+        return Err("usage: rules_maia_check SOURCE.pb.gz MODEL.onnx MANIFEST.json ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu".into());
+    }
+    let report_path = Path::new(&args[6]);
+    if !report_path.is_absolute() {
+        return Err("REPORT must be absolute".into());
+    }
+    let output_root = report_path.parent().ok_or("REPORT has no parent")?;
+    let canonical = output_root
+        .canonicalize()
+        .map_err(|_| "REPORT parent must already exist")?;
+    for ancestor in canonical.ancestors() {
+        if ancestor.join(".git").try_exists()? {
+            return Err("runtime/report root must be outside Git".into());
+        }
+    }
+    let mut report_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(report_path)?;
+    let mut cases = Vec::new();
+    let mut profiles = Vec::new();
+    let mut identity = json!({});
+    let result = (|| -> Result<()> {
+        let bytes = asset::read_bounded(Path::new(&args[5]), 8 * 1024 * 1024)?;
+        let fixtures: Fixtures = serde_json::from_slice(&bytes)?;
+        validate_reference(&fixtures)?;
+        let model = MaiaAsset::load(
+            Path::new(&args[0]),
+            Path::new(&args[1]),
+            Path::new(&args[2]),
+        )?;
+        let pin = RuntimeLibraryPin::copy_verified(Path::new(&args[3]), output_root, &args[4])?;
+        let runtime = OrtRuntime::load(&pin)?;
+        identity = json!({"reference":fixtures.reference,"reference_commit":fixtures.reference_commit,
+            "reference_module_sha256":fixtures.reference_module_sha256,"source_sha256":fixtures.source_sha256,
+            "fixture_sha256":asset::hex_sha256(&bytes),"onnx_sha256":model.manifest().onnx_sha256,
+            "runtime_sha256":args[4],"runtime_build":runtime.build_info()});
+        for (fill, slot) in [(HistoryFill::No, 1), (HistoryFill::RepeatOldest, 2)] {
+            evaluate_profile(
+                &runtime,
+                &model,
+                &fixtures,
+                fill,
+                slot,
+                &mut cases,
+                &mut profiles,
+            )?;
+        }
+        if cases.len() != CASE_NAMES.len() {
+            return Err("not all twelve actual A cases completed".into());
+        }
+        Ok(())
+    })();
+    let report = json!({"status":if result.is_ok(){"passed"}else{"failed"},
+        "failure":result.as_ref().err().map(|error| error_receipt(error.as_ref())),"identity":identity,
+        "scope":"actual A immutable Rules projection, C ONNX CPU and D finalization",
+        "handles":"explicit local fixture ownership; no production registry issuance claim",
+        "provider":"cpu","precision":"fp32","case_count":cases.len(),"case_results":cases,
+        "model_rights":"external Maia GPL asset; separately identified from engine source",
+        "profiles":profiles,"limits":{"fixture_bytes":8*1024*1024,"cases":12,"trace_plies":8,
+            "native_batch_size":1,"max_executions":1,"request_deadline_seconds":REQUEST_SECONDS,
+            "scheduler_host_reservation_limit":4*HOST_BYTES_PER_ITEM+8192,
+            "scheduler_reservations_are_resident_memory_measurements":false},
+        "tolerances":{"dense_input_atol":0.0,"legal_policy_max_abs":1e-4,"wdl_max_abs":1e-4},
+        "raw_logits":"separate maia_check gate","uci":"not_run","gpu":"not_run",
+        "maia_training":"not_run","arena":"not_run","strength":"not_run"});
+    report_file.write_all(&serde_json::to_vec_pretty(&report)?)?;
+    report_file.write_all(b"\n")?;
+    result
+}
