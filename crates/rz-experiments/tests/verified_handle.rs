@@ -98,28 +98,61 @@ fn replacing_a_verified_path_cannot_redirect_the_returned_file_handle() {
 #[test]
 fn replacing_a_parent_directory_does_not_redirect_a_verified_nested_file() {
     let directory = TestDirectory::new();
-    fs::create_dir(directory.0.join("engine")).unwrap();
-    fs::write(directory.0.join("engine/binary.txt"), IDENTITY).unwrap();
+    let original_parent = directory.0.join("engine");
+    let relocated_parent = directory.0.join("pinned-engine");
+    let original_path = original_parent.join("binary.txt");
+    fs::create_dir(&original_parent).unwrap();
+    fs::write(&original_path, IDENTITY).unwrap();
     let mut reference = artifact();
     reference.path = "engine/binary.txt".into();
     let mut pinned = reference
         .open_verified(&directory.0, reference.bytes)
         .unwrap();
-    fs::rename(
-        directory.0.join("engine"),
-        directory.0.join("pinned-engine"),
-    )
-    .unwrap();
-    fs::create_dir(directory.0.join("engine")).unwrap();
-    fs::write(
-        directory.0.join("engine/binary.txt"),
-        vec![b'x'; IDENTITY.len()],
-    )
-    .unwrap();
+    let replaced = match fs::rename(&original_parent, &relocated_parent) {
+        Ok(()) => {
+            assert!(fs::metadata(&relocated_parent).unwrap().is_dir());
+            assert_eq!(
+                fs::read(relocated_parent.join("binary.txt")).unwrap(),
+                IDENTITY
+            );
+            assert!(matches!(
+                fs::symlink_metadata(&original_parent),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ));
+            fs::create_dir(&original_parent).unwrap();
+            let replacement = vec![b'x'; IDENTITY.len()];
+            fs::write(&original_path, &replacement).unwrap();
+            assert_eq!(fs::read(&original_path).unwrap(), replacement);
+            true
+        }
+        #[cfg(windows)]
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Windows may protect the opened nested file by refusing its
+            // parent's rename. Verify that protection rather than relaxing
+            // the verified handle's share mode or skipping the test.
+            assert!(fs::metadata(&original_parent).unwrap().is_dir());
+            assert_eq!(fs::read(&original_path).unwrap(), IDENTITY);
+            assert!(matches!(
+                fs::symlink_metadata(&relocated_parent),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ));
+            false
+        }
+        Err(error) => panic!("rename verified artifact parent: {error}"),
+    };
     let mut actual = Vec::new();
     pinned.read_to_end(&mut actual).unwrap();
     assert_eq!(actual, IDENTITY);
-    rejected(&reference, &directory.0, reference.bytes);
+    if replaced {
+        rejected(&reference, &directory.0, reference.bytes);
+    } else {
+        let mut reopened = reference
+            .open_verified(&directory.0, reference.bytes)
+            .unwrap();
+        let mut unchanged = Vec::new();
+        reopened.read_to_end(&mut unchanged).unwrap();
+        assert_eq!(unchanged, IDENTITY);
+    }
 }
 
 #[test]
