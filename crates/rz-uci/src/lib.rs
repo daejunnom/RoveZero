@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bridge;
+pub mod bootstrap;
 pub mod engine;
 pub mod contracts;
 pub mod parser;

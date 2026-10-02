@@ -1,10 +1,7 @@
 //! Concrete Rules → UCI → search → common evaluation assembly.
 //! Model loading and physical execution remain the injected factory's responsibility.
 
-use crate::{
-    bridge::{BuildSearchSettings, SearchBinding, SideToMove},
-    *,
-};
+use crate::{bridge::BuildSearchSettings, *};
 use rz_contracts as contract;
 use rz_position::{
     BoardMove, Position, PositionLimits,
@@ -12,7 +9,7 @@ use rz_position::{
 };
 use rz_search::{
     TreeLimits,
-    driver::{self, CheckedPosition, SearchControl, SearchStatus},
+    driver::{CheckedPosition, SearchControl},
 };
 use std::{
     collections::VecDeque,
@@ -90,6 +87,33 @@ impl CheckedPosition for RulesSearchPosition {
     }
 }
 
+impl rz_search::contracts::ContractPosition for RulesSearchPosition {
+    type State = RulesState;
+    fn snapshot(&self) -> &contract::PositionSnapshot<RulesState> {
+        self.state.snapshot()
+    }
+    fn legal(&self) -> &contract::LegalMoveView {
+        self.state.legal_moves()
+    }
+    fn play(&self, movement: &contract::Move) -> Result<Self, contract::ContractError> {
+        CheckedPosition::play(self, movement)
+    }
+    fn validate_authority(&self) -> Result<(), contract::ContractError> {
+        if !self
+            .position
+            .position()
+            .matches_snapshot(self.state.rules().snapshot())
+            || self.state.snapshot().identity() != self.state.legal_moves().state()
+        {
+            return Err(failure(
+                contract::ErrorCode::IdentityMismatch,
+                "Rules state no longer owns its frozen legal view",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RulesUciPort {
     owners: Arc<OwnerRegistry>,
@@ -163,6 +187,9 @@ impl ProcessClock {
     pub fn epoch(&self) -> contract::ProcessEpoch {
         self.epoch
     }
+    pub fn b_clock(&self) -> rz_search::contract_time::InstantClock {
+        rz_search::contract_time::InstantClock::new(self.domain(), self.origin)
+    }
     pub fn now(&self) -> Result<contract::MonotonicTick, contract::ContractError> {
         self.tick_at(Instant::now())
     }
@@ -193,6 +220,14 @@ impl ProcessClock {
             clock: self.domain(),
             at: self.tick_at(instant)?,
         })
+    }
+}
+impl rz_search::contract_time::ContractClock for ProcessClock {
+    fn domain(&self) -> contract::ClockDomain {
+        self.domain()
+    }
+    fn now(&self) -> Result<contract::MonotonicTick, contract::ContractError> {
+        self.now()
     }
 }
 
@@ -246,192 +281,6 @@ pub trait EvaluatorFactory: Send + Sync + 'static {
     ) -> Result<contract::EvalInputKey, contract::ContractError>;
 }
 
-#[derive(Debug)]
-pub struct EvaluationFailure {
-    pub primary: contract::ContractError,
-    pub cleanup: Option<contract::ContractError>,
-}
-impl fmt::Display for EvaluationFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", self.primary)?;
-        if let Some(cleanup) = self.cleanup {
-            write!(formatter, "; cancel: {cleanup}")?;
-        }
-        Ok(())
-    }
-}
-impl std::error::Error for EvaluationFailure {}
-
-/// One worker issues one common request per pending B selection. B's private tree
-/// ticket continues to own exactly-once backup. A shared sequence spans workers.
-pub struct ContractSearchEvaluator {
-    runtime: Box<dyn ManagedEvaluator>,
-    factory: Arc<dyn EvaluatorFactory>,
-    profile: EvaluatorProfile,
-    clock: ProcessClock,
-    authority: SearchAuthority,
-    scope: contract::AcceptanceScope,
-    sequence: Arc<AtomicU64>,
-}
-impl ContractSearchEvaluator {
-    fn stop(
-        &mut self,
-        request: &contract::EvalRequest<RulesState>,
-        primary: contract::ContractError,
-    ) -> EvaluationFailure {
-        request.cancel_token().cancel();
-        EvaluationFailure {
-            primary,
-            cleanup: self.runtime.cancel(request.context().request).err(),
-        }
-    }
-}
-impl driver::Evaluator<RulesSearchPosition> for ContractSearchEvaluator {
-    type Error = EvaluationFailure;
-    fn evaluate(
-        &mut self,
-        position: &RulesSearchPosition,
-        legal: &[contract::Move],
-        control: &SearchControl,
-    ) -> Result<driver::Evaluation, Self::Error> {
-        let build =
-            || -> Result<Arc<contract::EvalRequest<RulesState>>, contract::ContractError> {
-                if legal != position.state.legal_moves().moves() {
-                    return Err(failure(
-                        contract::ErrorCode::IdentityMismatch,
-                        "search changed Rules legal order",
-                    ));
-                }
-                let previous = self
-                    .sequence
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
-                    .map_err(|_| {
-                        failure(
-                            contract::ErrorCode::ResourceExhausted,
-                            "request sequence exhausted",
-                        )
-                    })?;
-                let context = contract::EvalContext {
-                    revision: contract::CONTRACT_REVISION,
-                    request: contract::RequestId::new(self.clock.epoch(), previous + 1),
-                    selection: contract::SelectionId::new(self.clock.epoch(), previous + 1),
-                    game: self.scope.game,
-                    root: self.scope.root,
-                    state: position.state.snapshot().identity(),
-                    legal_order: position.state.legal_moves().order(),
-                    input: self.factory.input_key(position.state.rules(), legal)?,
-                    model: self.profile.model.handle(),
-                    encoding: self.profile.model.encoding().handle,
-                    precision: self.profile.precision,
-                    compute: self.profile.compute,
-                    backend: self.profile.backend,
-                };
-                Ok(Arc::new(contract::EvalRequest::try_new(
-                    context,
-                    position.state.snapshot().clone(),
-                    position.state.legal_moves().clone(),
-                    Arc::clone(&self.profile.model),
-                    self.clock.deadline(control.deadline)?,
-                    self.authority.cancel_token(),
-                    self.profile.bytes,
-                )?))
-            };
-        let request = build().map_err(|primary| EvaluationFailure {
-            primary,
-            cleanup: None,
-        })?;
-        if let Err(primary) = request.validate_acceptance(
-            self.authority
-                .current_scope()
-                .map_err(|primary| EvaluationFailure {
-                    primary,
-                    cleanup: None,
-                })?,
-            self.clock.domain(),
-            self.clock.now().map_err(|primary| EvaluationFailure {
-                primary,
-                cleanup: None,
-            })?,
-        ) {
-            return Err(self.stop(&request, primary));
-        }
-        if let Err(primary) = self.runtime.submit(Arc::clone(&request)) {
-            return Err(self.stop(&request, primary));
-        }
-        loop {
-            if control.cancellation.load(Ordering::Acquire) {
-                self.authority.cancel();
-            }
-            let checked = self.authority.current_scope().and_then(|scope| {
-                self.clock
-                    .now()
-                    .and_then(|now| request.validate_acceptance(scope, self.clock.domain(), now))
-            });
-            if let Err(primary) = checked {
-                return Err(self.stop(&request, primary));
-            }
-            if let Some(result) = self.runtime.poll() {
-                let context = match &result {
-                    contract::EvalResult::Completed(output) => output.context,
-                    contract::EvalResult::Canceled(context)
-                    | contract::EvalResult::Expired(context)
-                    | contract::EvalResult::Stale(context) => context.request,
-                    contract::EvalResult::Failed(error) => error.context.request,
-                };
-                if context != request.context() {
-                    return Err(self.stop(
-                        &request,
-                        failure(
-                            contract::ErrorCode::IdentityMismatch,
-                            "runtime returned another request context",
-                        ),
-                    ));
-                }
-                let output = match result {
-                    contract::EvalResult::Completed(output) => output,
-                    contract::EvalResult::Failed(error) => {
-                        return Err(self.stop(&request, error.error));
-                    }
-                    contract::EvalResult::Canceled(_) => {
-                        return Err(self.stop(
-                            &request,
-                            failure(contract::ErrorCode::Canceled, "runtime canceled request"),
-                        ));
-                    }
-                    contract::EvalResult::Expired(_) => {
-                        return Err(self.stop(
-                            &request,
-                            failure(contract::ErrorCode::Expired, "runtime expired request"),
-                        ));
-                    }
-                    contract::EvalResult::Stale(_) => {
-                        return Err(self.stop(
-                            &request,
-                            failure(contract::ErrorCode::Stale, "runtime rejected stale request"),
-                        ));
-                    }
-                };
-                if control.cancellation.load(Ordering::Acquire) {
-                    self.authority.cancel();
-                }
-                let checked = self.authority.current_scope().and_then(|scope| {
-                    self.clock.now().and_then(|now| {
-                        output.validate_for(&request, scope, self.clock.domain(), now)
-                    })
-                });
-                if let Err(primary) = checked {
-                    return Err(self.stop(&request, primary));
-                }
-                return Ok(driver::Evaluation {
-                    priors: output.policy.normalized(),
-                    wdl: output.wdl.normalized(),
-                });
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct EngineSettings {
     pub parser: ParserLimits,
@@ -466,7 +315,6 @@ impl Default for EngineSettings {
         }
     }
 }
-
 #[derive(Debug)]
 pub enum EngineError {
     Contract(contract::ContractError),
@@ -490,17 +338,18 @@ impl From<contract::ContractError> for EngineError {
         Self::Contract(error)
     }
 }
-
 struct ActiveBinding {
-    binding: Arc<SearchBinding>,
+    ticket: SearchTicket,
+    control: SearchControl,
     authority: SearchAuthority,
 }
 struct Owner {
+    session_owner: crate::contracts::ContractSessionOwner,
     active: Option<ActiveBinding>,
     scope: Arc<Mutex<contract::AcceptanceScope>>,
     factory: Arc<dyn EvaluatorFactory>,
     clock: ProcessClock,
-    sequence: Arc<AtomicU64>,
+    ids: Arc<rz_search::contracts::IdAllocator>,
     settings: EngineSettings,
     workers: Vec<JoinHandle<Result<(), contract::ContractError>>>,
     pending_failures: VecDeque<(SearchTicket, SearchCompletion)>,
@@ -513,8 +362,7 @@ impl Owner {
         completion: SearchCompletion,
     ) {
         self.pending_failures.push_back((ticket, completion));
-        // The receipt is owner-held. A full bounded queue already contains an
-        // event that will trigger its delivery; an empty queue needs a wakeup.
+        // The owner keeps the receipt even if the bounded queue is full.
         let _ = sender.try_send(Event::RejectedInput {
             code: "OwnerWake",
             message: String::new(),
@@ -527,67 +375,51 @@ impl Owner {
     ) -> SessionResult<RulesSearchPosition> {
         let mut out = SessionResult::default();
         while let Some((ticket, completion)) = self.pending_failures.pop_front() {
-            append_result(
+            append_contract_result(
                 &mut out,
-                unbound_event(session, Event::Complete { ticket, completion }),
+                self.session_owner
+                    .handle_event(session, Event::Complete { ticket, completion }),
             );
         }
-        let next = if matches!(
-            event,
+        let next = match event {
             Event::RejectedInput {
-                code: "OwnerWake",
-                ..
+                code: "OwnerWake", ..
+            } => SessionResult::default(),
+            Event::Line(line) => {
+                let next = self.session_owner.handle_line(session, &line, |snapshot| {
+                    Ok(snapshot.state.snapshot().side_to_move())
+                });
+                let mut out = SessionResult::default();
+                append_contract_result(&mut out, next);
+                out
             }
-        ) {
-            SessionResult::default()
-        } else if let Some(active) = &self.active {
-            match event {
-                Event::Progress { ticket, bestmove } if &ticket == active.binding.ticket() => {
-                    active.binding.progress(session, &bestmove, Instant::now())
-                }
-                Event::Complete { ticket, completion } if &ticket == active.binding.ticket() => {
-                    active.binding.complete(session, completion, Instant::now())
-                }
-                Event::Deadline(ticket) if &ticket == active.binding.ticket() => {
-                    active.binding.expire(session, Instant::now())
-                }
-                event => unbound_event(session, event),
+            event => {
+                let next = self.session_owner.handle_event(session, event);
+                let mut out = SessionResult::default();
+                append_contract_result(&mut out, next);
+                out
             }
-        } else {
-            unbound_event(session, event)
         };
+        // B closes common/tree cancellation before changing its generations.
+        match self.scope.lock() {
+            Ok(mut scope) => *scope = self.session_owner.scope(),
+            Err(_) => {
+                self.cancel();
+                out.diagnostics.push(Diagnostic {
+                    code: "AuthorityFailure",
+                    message: "acceptance authority poisoned".into(),
+                });
+                append_result(&mut out, session.end_of_input());
+            }
+        }
         append_result(&mut out, next);
         out
     }
-    fn cancel(&mut self) {
+    fn cancel(&self) {
         if let Some(active) = &self.active {
-            active.binding.cancel();
+            active.control.cancel();
             active.authority.cancel();
         }
-    }
-    fn bump(&mut self, game: bool) -> Result<(), EngineError> {
-        self.cancel();
-        let mut scope = self.scope.lock().map_err(|_| {
-            failure(
-                contract::ErrorCode::BackendFailure,
-                "acceptance authority poisoned",
-            )
-        })?;
-        scope.root.0 = scope.root.0.checked_add(1).ok_or_else(|| {
-            failure(
-                contract::ErrorCode::ResourceExhausted,
-                "root generation exhausted",
-            )
-        })?;
-        if game {
-            scope.game.0 = scope.game.0.checked_add(1).ok_or_else(|| {
-                failure(
-                    contract::ErrorCode::ResourceExhausted,
-                    "game generation exhausted",
-                )
-            })?;
-        }
-        Ok(())
     }
     fn reap(&mut self) -> Result<(), EngineError> {
         let mut index = 0;
@@ -613,24 +445,15 @@ impl Owner {
                 if self
                     .active
                     .as_ref()
-                    .is_some_and(|active| active.binding.ticket() == &ticket)
+                    .is_some_and(|active| active.ticket == ticket)
                 {
                     self.cancel();
                 }
             }
-            Effect::NewGame => {
-                self.bump(true)?;
-            }
-            Effect::Shutdown => {
-                self.bump(false)?;
-            }
+            Effect::NewGame | Effect::Shutdown => self.cancel(),
             Effect::Start {
-                ticket,
-                snapshot,
-                limits,
-                ..
+                ticket, snapshot, ..
             } => {
-                self.bump(false)?;
                 self.reap()?;
                 if self.workers.len() >= self.settings.max_workers {
                     self.pending_failure(
@@ -643,91 +466,144 @@ impl Owner {
                     );
                     return Ok(());
                 }
-                let side = match snapshot.state.snapshot().side_to_move() {
-                    contract::Color::White => SideToMove::White,
-                    contract::Color::Black => SideToMove::Black,
-                };
-                let binding = match SearchBinding::new(
-                    ticket.clone(),
-                    &limits,
-                    side,
-                    Instant::now(),
-                    self.settings.search,
-                ) {
-                    Ok(binding) => Arc::new(binding),
-                    Err(error) => {
-                        self.pending_failure(
-                            sender,
-                            ticket,
-                            SearchCompletion::Failed {
-                                code: "SearchConfiguration".into(),
-                                message: error.to_string(),
-                            },
-                        );
-                        return Ok(());
-                    }
-                };
+                let control = self.session_owner.control().cloned().ok_or_else(|| {
+                    failure(
+                        contract::ErrorCode::IdentityMismatch,
+                        "UCI start has no checked B control",
+                    )
+                })?;
+                let token = self
+                    .session_owner
+                    .cancellation()
+                    .ok_or_else(|| {
+                        failure(
+                            contract::ErrorCode::IdentityMismatch,
+                            "UCI start has no common cancellation",
+                        )
+                    })?
+                    .token();
+                let deadlines = *self.session_owner.deadlines().ok_or_else(|| {
+                    failure(
+                        contract::ErrorCode::IdentityMismatch,
+                        "UCI start has no common deadlines",
+                    )
+                })?;
+                let scope = self.session_owner.active_scope().ok_or_else(|| {
+                    failure(
+                        contract::ErrorCode::IdentityMismatch,
+                        "UCI start has no current scope",
+                    )
+                })?;
                 let authority = SearchAuthority {
                     current: Arc::clone(&self.scope),
-                    cancel: contract::CancelToken::new(),
+                    cancel: token.clone(),
                 };
                 self.active = Some(ActiveBinding {
-                    binding: Arc::clone(&binding),
+                    ticket: ticket.clone(),
+                    control: control.clone(),
                     authority: authority.clone(),
                 });
+                let profile = self.factory.profile();
+                let config = rz_search::contracts::ContractSearchConfig {
+                    scope,
+                    model: Arc::clone(&profile.model),
+                    precision: profile.precision,
+                    compute: profile.compute,
+                    bytes: profile.bytes,
+                    policy_tolerance: 1e-5,
+                    wdl_tolerance: 1e-5,
+                    cancellation: token,
+                    deadlines,
+                    ids: Arc::clone(&self.ids),
+                    max_simulations: control.max_simulations,
+                    tree_limits: self.settings.tree,
+                };
                 let factory = Arc::clone(&self.factory);
                 let clock = self.clock.clone();
-                let sequence = Arc::clone(&self.sequence);
-                let profile = factory.profile();
-                let scope = authority.current_scope()?;
-                let tree = self.settings.tree;
                 let shutdown_limit = self.settings.shutdown_limit;
                 let events = sender.clone();
                 self.workers.push(thread::spawn(move || {
-                    let runtime = match factory.create(clock.clone(), authority.clone()) {
+                    let mut runtime = match factory.create(clock.clone(), authority.clone()) {
                         Ok(runtime) => runtime,
                         Err(error) => {
                             let _ = events.send(Event::Complete {
                                 ticket,
-                                completion: SearchCompletion::Failed {
-                                    code: format!("{:?}", error.code),
-                                    message: error.to_string(),
-                                },
+                                completion: failed_completion(error),
                             });
                             return Ok(());
                         }
                     };
-                    let mut evaluator = ContractSearchEvaluator {
-                        runtime,
-                        factory,
-                        profile,
-                        clock,
-                        authority,
-                        scope,
-                        sequence,
-                    };
-                    let outcome = driver::run_search_with_progress(
-                        &snapshot,
-                        &mut evaluator,
-                        binding.control(),
-                        tree,
-                        |progress| {
-                            if let Some(movement) = progress
-                                .best_move
-                                .and_then(|movement| move_text(movement).ok())
+                    let mut search =
+                        match rz_search::contracts::ContractSearch::new(snapshot, config) {
+                            Ok(search) => search,
+                            Err(error) => {
+                                let _ = events.send(Event::Complete {
+                                    ticket,
+                                    completion: failed_completion(error),
+                                });
+                                return shutdown(runtime.as_mut(), shutdown_limit);
+                            }
+                        };
+                    let mut previous_move = None;
+                    let mut authority_error = None;
+                    while !search.is_finished() {
+                        if control.cancellation.load(Ordering::Acquire) {
+                            authority.cancel();
+                        }
+                        if let Err(error) = authority.current_scope() {
+                            authority.cancel();
+                            authority_error = Some(error);
+                        }
+                        let mut port = RuntimePort(runtime.as_mut());
+                        let event = search.pump(
+                            &mut port,
+                            &clock,
+                            || {
+                                authority
+                                    .current_scope()
+                                    .unwrap_or(contract::AcceptanceScope {
+                                        root: contract::RootGeneration(scope.root.0 ^ 1),
+                                        ..scope
+                                    })
+                            },
+                            |position, encoding| {
+                                if encoding != profile.model.encoding() {
+                                    return Err(failure(
+                                        contract::ErrorCode::IdentityMismatch,
+                                        "search changed encoder descriptor",
+                                    ));
+                                }
+                                factory.input_key(
+                                    position.state.rules(),
+                                    position.state.legal_moves().moves(),
+                                )
+                            },
+                        );
+                        let best = search.outcome().best_move;
+                        if best != previous_move {
+                            previous_move = best;
+                            if let Some(bestmove) =
+                                best.and_then(|movement| move_text(movement).ok())
                             {
                                 let _ = events.try_send(Event::Progress {
                                     ticket: ticket.clone(),
-                                    bestmove: movement,
+                                    bestmove,
                                 });
                             }
-                        },
-                    );
-                    let completion = match outcome.status {
-                        SearchStatus::Failed(error) => SearchCompletion::Failed {
-                            code: "SearchFailed".into(),
-                            message: format!("{error:?}"),
-                        },
+                        }
+                        if matches!(event, rz_search::contracts::ContractPumpEvent::Waiting) {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    let outcome = search.outcome();
+                    let completion = match (authority_error, outcome.status) {
+                        (Some(error), _) => failed_completion(error),
+                        (_, rz_search::contracts::ContractSearchStatus::Failed(error)) => {
+                            SearchCompletion::Failed {
+                                code: "SearchFailed".into(),
+                                message: format!("{error:?}"),
+                            }
+                        }
                         _ => SearchCompletion::Completed {
                             bestmove: outcome
                                 .best_move
@@ -735,63 +611,72 @@ impl Owner {
                         },
                     };
                     let _ = events.send(Event::Complete { ticket, completion });
-                    let deadline = Instant::now().checked_add(shutdown_limit).ok_or_else(|| {
-                        failure(
-                            contract::ErrorCode::ResourceExhausted,
-                            "shutdown deadline overflow",
-                        )
-                    })?;
-                    evaluator.runtime.shutdown(deadline)
+                    shutdown(runtime.as_mut(), shutdown_limit)
                 }));
             }
             Effect::OptionChanged { .. } | Effect::Button { .. } => {
-                return Err(EngineError::Contract(failure(
+                return Err(failure(
                     contract::ErrorCode::UnsupportedContract,
-                    "bootstrap did not register configurable backend options",
-                )));
+                    "bootstrap did not register backend options",
+                )
+                .into());
             }
         }
         Ok(())
     }
 }
-
+struct RuntimePort<'a>(&'a mut dyn ManagedEvaluator);
+impl contract::Evaluator<RulesState> for RuntimePort<'_> {
+    fn submit(
+        &mut self,
+        request: Arc<contract::EvalRequest<RulesState>>,
+    ) -> Result<(), contract::ContractError> {
+        self.0.submit(request)
+    }
+    fn poll(&mut self) -> Option<contract::EvalResult> {
+        self.0.poll()
+    }
+    fn cancel(&mut self, request: contract::RequestId) -> Result<(), contract::ContractError> {
+        self.0.cancel(request)
+    }
+}
+fn shutdown(
+    runtime: &mut dyn ManagedEvaluator,
+    limit: Duration,
+) -> Result<(), contract::ContractError> {
+    runtime.shutdown(Instant::now().checked_add(limit).ok_or_else(|| {
+        failure(
+            contract::ErrorCode::ResourceExhausted,
+            "shutdown deadline overflow",
+        )
+    })?)
+}
+fn failed_completion(error: contract::ContractError) -> SearchCompletion {
+    SearchCompletion::Failed {
+        code: format!("{:?}/{:?}", error.stage, error.code),
+        message: error.detail.into(),
+    }
+}
+fn append_contract_result<S>(
+    out: &mut SessionResult<S>,
+    next: crate::contracts::ContractSessionOutcome<S>,
+) {
+    for error in next.errors {
+        out.diagnostics.push(Diagnostic {
+            code: "SharedContractError",
+            message: error.to_string(),
+        });
+    }
+    append_result(out, next.session);
+}
 fn append_result<S>(out: &mut SessionResult<S>, next: SessionResult<S>) {
     out.protocol.extend(next.protocol);
     out.diagnostics.extend(next.diagnostics);
     out.effects.extend(next.effects);
     out.accepted &= next.accepted;
 }
-
-fn unbound_event(
-    session: &mut Session<RulesUciPort>,
-    event: Event,
-) -> SessionResult<RulesSearchPosition> {
-    let source = match &event {
-        Event::Complete {
-            completion: SearchCompletion::Failed { code, message },
-            ..
-        } => Some(format!("{code}: {message}")),
-        _ => None,
-    };
-    let mut out = handle_event(session, event);
-    if let Some(message) = source {
-        if !out
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "SearchFailed")
-        {
-            out.diagnostics.push(Diagnostic {
-                code: "SearchFailed",
-                message,
-            });
-        }
-    }
-    out
-}
-
-/// Runs the owner loop. Input has a bounded independent producer; this owner
-/// uses an independent timer so a pending evaluation cannot block stop/deadline.
-/// This CPU/mock entry point does not assert neural/GPU acceptance.
+/// Independent input, timer, search and physical evaluator owners have bounded
+/// event/worker counts. CPU/mock success does not assert NN/GPU support.
 pub fn serve<O: Write, D: Write>(
     events: Receiver<Event>,
     sender: SyncSender<Event>,
@@ -802,10 +687,13 @@ pub fn serve<O: Write, D: Write>(
     clock: ProcessClock,
     settings: EngineSettings,
 ) -> Result<(), EngineError> {
-    if settings.max_workers == 0 || settings.shutdown_limit.is_zero() {
+    if settings.max_workers == 0
+        || settings.shutdown_limit.is_zero()
+        || settings.search.max_simulations > 128
+    {
         return Err(failure(
             contract::ErrorCode::InvalidInput,
-            "finite positive worker/drain limits required",
+            "finite workers/drain and at most 128 simulations required",
         )
         .into());
     }
@@ -817,12 +705,19 @@ pub fn serve<O: Write, D: Write>(
         encoding: profile.model.encoding().handle,
         backend: profile.backend,
     };
+    let session_owner = crate::contracts::ContractSessionOwner::new(
+        scope,
+        clock.epoch(),
+        clock.b_clock(),
+        settings.search,
+    )?;
     let owner = Arc::new(Mutex::new(Owner {
+        session_owner,
         active: None,
         scope: Arc::new(Mutex::new(scope)),
         factory,
+        ids: Arc::new(rz_search::contracts::IdAllocator::new(clock.epoch())),
         clock,
-        sequence: Arc::new(AtomicU64::new(0)),
         settings,
         workers: Vec::new(),
         pending_failures: VecDeque::new(),
@@ -837,7 +732,6 @@ pub fn serve<O: Write, D: Write>(
         settings.parser,
     )
     .map_err(EngineError::Session)?;
-    // A single timer observes current binding. No timer is spawned per request.
     let timer_owner = Arc::clone(&owner);
     let timer_events = sender.clone();
     let timer_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -847,15 +741,14 @@ pub fn serve<O: Write, D: Write>(
         while !timer_flag.load(Ordering::Acquire) {
             if let Ok(owner) = timer_owner.lock() {
                 if let Some(active) = &owner.active {
-                    let binding = &active.binding;
-                    if delivered.as_ref() != Some(binding.ticket())
-                        && Instant::now() >= binding.control().deadline
+                    if delivered.as_ref() != Some(&active.ticket)
+                        && Instant::now() >= active.control.deadline
                     {
                         if timer_events
-                            .try_send(Event::Deadline(binding.ticket().clone()))
+                            .try_send(Event::Deadline(active.ticket.clone()))
                             .is_ok()
                         {
-                            delivered = Some(binding.ticket().clone());
+                            delivered = Some(active.ticket.clone());
                         }
                     }
                 }
@@ -871,25 +764,20 @@ pub fn serve<O: Write, D: Write>(
         protocol,
         diagnostics,
         move |session, event| {
-            let mut owner = handler_owner
+            handler_owner
                 .lock()
-                .expect("owner is only mutated by UCI event loop");
-            owner.handle(session, event)
+                .expect("UCI owner")
+                .handle(session, event)
         },
         move |effect| {
             dispatch_owner
                 .lock()
-                .map_err(|_| {
-                    EngineError::Contract(failure(
-                        contract::ErrorCode::BackendFailure,
-                        "UCI owner poisoned",
-                    ))
-                })?
+                .map_err(|_| failure(contract::ErrorCode::BackendFailure, "UCI owner poisoned"))?
                 .dispatch(effect, &sender)
         },
     );
     timer_stop.store(true, Ordering::Release);
-    drop(events); // Unblock any bounded completion publisher before joining workers.
+    drop(events);
     let primary = result
         .err()
         .map(|error| EngineError::Transport(Box::new(error)));
@@ -902,10 +790,9 @@ pub fn serve<O: Write, D: Write>(
             let mut owner = match owner.lock() {
                 Ok(owner) => owner,
                 Err(_) => {
-                    cleanup.push(EngineError::Contract(failure(
-                        contract::ErrorCode::BackendFailure,
-                        "UCI owner poisoned",
-                    )));
+                    cleanup.push(
+                        failure(contract::ErrorCode::BackendFailure, "UCI owner poisoned").into(),
+                    );
                     break;
                 }
             };
@@ -934,7 +821,6 @@ pub fn serve<O: Write, D: Write>(
     }
     finish_errors(primary, cleanup)
 }
-
 fn finish_errors(
     primary: Option<EngineError>,
     mut cleanup: Vec<EngineError>,
@@ -953,8 +839,211 @@ fn finish_errors(
         })
     }
 }
-
-/// Bounded transport constructor shared by the executable and integration tests.
 pub fn event_channel() -> (SyncSender<Event>, Receiver<Event>) {
     mpsc::sync_channel(128)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct UnusedFactory(EvaluatorProfile);
+    impl EvaluatorFactory for UnusedFactory {
+        fn profile(&self) -> EvaluatorProfile {
+            self.0.clone()
+        }
+        fn create(
+            &self,
+            _: ProcessClock,
+            _: SearchAuthority,
+        ) -> Result<Box<dyn ManagedEvaluator>, contract::ContractError> {
+            panic!("these owner refusal tests must not create a runtime")
+        }
+        fn input_key(
+            &self,
+            _: &RulesState,
+            _: &[contract::Move],
+        ) -> Result<contract::EvalInputKey, contract::ContractError> {
+            panic!("these owner refusal tests must not encode")
+        }
+    }
+    fn fixture() -> (Owner, Session<RulesUciPort>) {
+        let owners = Arc::new(OwnerRegistry::default());
+        let encoding = contract::EncodingHandle {
+            owner: owners.allocate().unwrap(),
+            slot: 0,
+            generation: contract::SlotGeneration(1),
+            manifest: contract::Digest([1; 32]),
+        };
+        let model = contract::ModelHandle {
+            owner: owners.allocate().unwrap(),
+            slot: 0,
+            generation: contract::SlotGeneration(1),
+            manifest: contract::Digest([2; 32]),
+        };
+        let descriptor = contract::ModelDescriptor::try_new(
+            model,
+            contract::EncodingDescriptor {
+                handle: encoding,
+                history_length: 1,
+                action_map: contract::Digest([3; 32]),
+                history_policy: contract::Digest([4; 32]),
+            },
+            vec![contract::PrecisionProfile::Fp32],
+            1,
+            1,
+        )
+        .unwrap();
+        let profile = EvaluatorProfile {
+            model: Arc::new(descriptor),
+            precision: contract::PrecisionProfile::Fp32,
+            backend: contract::Digest([5; 32]),
+            compute: contract::ComputeBudget {
+                min_steps: 1,
+                max_steps: 1,
+                require_full: true,
+            },
+            bytes: contract::ByteBudget {
+                host: 1,
+                device: 0,
+                pinned: 0,
+            },
+        };
+        let clock = ProcessClock::new(contract::ProcessEpoch(7));
+        let scope = contract::AcceptanceScope {
+            game: contract::GameGeneration(1),
+            root: contract::RootGeneration(0),
+            model,
+            encoding,
+            backend: profile.backend,
+        };
+        let settings = EngineSettings {
+            max_workers: 1,
+            ..EngineSettings::default()
+        };
+        let owner = Owner {
+            session_owner: crate::contracts::ContractSessionOwner::new(
+                scope,
+                clock.epoch(),
+                clock.b_clock(),
+                settings.search,
+            )
+            .unwrap(),
+            active: None,
+            scope: Arc::new(Mutex::new(scope)),
+            factory: Arc::new(UnusedFactory(profile)),
+            clock,
+            ids: Arc::new(rz_search::contracts::IdAllocator::new(
+                contract::ProcessEpoch(7),
+            )),
+            settings,
+            workers: Vec::new(),
+            pending_failures: VecDeque::new(),
+        };
+        let session = Session::new(
+            RulesUciPort::new(owners, settings.position),
+            EngineIdentity {
+                name: "actual Rules refusal fixture".into(),
+                author: "test".into(),
+            },
+            Vec::new(),
+            settings.parser,
+        )
+        .unwrap();
+        (owner, session)
+    }
+
+    #[test]
+    fn full_event_queue_cannot_lose_worker_refusal_or_checked_fallback() {
+        let (mut owner, mut session) = fixture();
+        let (release, waiting) = mpsc::channel();
+        owner.workers.push(thread::spawn(move || {
+            waiting.recv().unwrap();
+            Ok(())
+        }));
+        let out = owner.handle(&mut session, Event::Line("go nodes 1".into()));
+        let (sender, events) = mpsc::sync_channel(1);
+        sender.send(Event::Line("isready".into())).unwrap();
+        for effect in out.effects {
+            owner.dispatch(effect, &sender).unwrap();
+        }
+        assert_eq!(owner.pending_failures.len(), 1);
+        let out = owner.handle(&mut session, events.recv().unwrap());
+        assert_eq!(
+            out.protocol
+                .iter()
+                .filter(|line| line.starts_with("bestmove "))
+                .count(),
+            1
+        );
+        assert!(out.protocol.iter().any(|line| line == "readyok"));
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("WorkerLimit"))
+        );
+        assert!(owner.pending_failures.is_empty());
+        assert!(session.active_ticket().is_none());
+        release.send(()).unwrap();
+        owner.workers.pop().unwrap().join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn stale_provider_failure_keeps_source_without_emitting_old_bestmove() {
+        let (mut owner, mut session) = fixture();
+        owner.handle(&mut session, Event::Line("go nodes 1".into()));
+        let old = session.active_ticket().unwrap();
+        assert!(
+            owner
+                .handle(
+                    &mut session,
+                    Event::Line("position startpos moves e2e4".into())
+                )
+                .accepted
+        );
+        let out = owner.handle(
+            &mut session,
+            Event::Complete {
+                ticket: old,
+                completion: SearchCompletion::Failed {
+                    code: "InjectedDeviceFailure".into(),
+                    message: "physical callback after root replacement".into(),
+                },
+            },
+        );
+        assert!(out.protocol.is_empty());
+        assert!(out.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("InjectedDeviceFailure")
+                && diagnostic.message.contains("physical callback")
+        }));
+        assert_eq!(
+            session.snapshot().state().snapshot().side_to_move(),
+            contract::Color::Black
+        );
+    }
+
+    #[test]
+    fn transport_primary_and_source_diagnostics_survive_physical_drain_failure() {
+        let source = Diagnostic {
+            code: "SearchFailed",
+            message: "original physical backend failure".into(),
+        };
+        let primary = EngineError::Transport(Box::new(ServeError {
+            failure: ServeFailure::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            cleanup_failures: Vec::new(),
+            diagnostics: vec![source.clone()],
+        }));
+        let error = finish_errors(Some(primary), vec![EngineError::DrainTimeout]).unwrap_err();
+        let EngineError::Cleanup { primary, cleanup } = error else {
+            panic!("compound cleanup required")
+        };
+        assert!(matches!(cleanup.as_slice(), [EngineError::DrainTimeout]));
+        let EngineError::Transport(transport) = *primary else {
+            panic!("transport primary required")
+        };
+        assert_eq!(transport.diagnostics, [source]);
+        assert!(
+            matches!(transport.failure, ServeFailure::Io(error) if error.kind() == std::io::ErrorKind::BrokenPipe)
+        );
+    }
 }
