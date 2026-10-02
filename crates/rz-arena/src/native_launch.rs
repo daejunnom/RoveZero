@@ -193,7 +193,7 @@ pub fn prepare_native_launch(
     source_root: &Path,
     output_root: &Path,
     output_directory: &str,
-) -> Result<NativeLaunchOwner, NativePreparationFailure> {
+) -> Result<NativeLaunchOwner, Box<NativePreparationFailure>> {
     let mut receipt=NativePreparationReceipt{receipt_version:1,execution_ready:false,input_sha256:spec.sha256().into(),
         output_directory:if safe_output_basename(output_directory){output_directory.into()}else{"rejected-basename".into()},
         attempt_created:false,attempted_snapshot_relative_paths:Vec::new(),completed_snapshots:Vec::new(),child_spawned:false,writers_closed:true,input_pins_required:false,original_error:String::new(),
@@ -230,12 +230,12 @@ pub fn prepare_native_launch(
                     Ok(artifact) => (artifact, None),
                     Err(error) => (None, Some(error)),
                 };
-                Err(NativePreparationFailure {
+                Err(Box::new(NativePreparationFailure {
                     cause,
                     receipt,
                     receipt_artifact,
                     persistence_error,
-                })
+                }))
             }
         }
     }
@@ -245,12 +245,12 @@ pub fn prepare_native_launch(
         let cause =
             ArenaError::Invalid("CPU NN integration runner currently requires Linux".into());
         receipt.original_error = cause.to_string();
-        Err(NativePreparationFailure {
+        Err(Box::new(NativePreparationFailure {
             cause,
             receipt,
             receipt_artifact: None,
             persistence_error: None,
-        })
+        }))
     }
 }
 fn safe_output_basename(name: &str) -> bool {
@@ -533,12 +533,12 @@ pub(crate) mod linux {
         }
         let mut unique = BTreeMap::new();
         for artifact in spec.declared_artifacts() {
-            if let Some(prior) = unique.insert(artifact.path.clone(), artifact.clone()) {
-                if prior != *artifact {
-                    return Err(ArenaError::Integrity(
-                        "same native source path has conflicting metadata".into(),
-                    ));
-                }
+            if let Some(prior) = unique.insert(artifact.path.clone(), artifact.clone())
+                && prior != *artifact
+            {
+                return Err(ArenaError::Integrity(
+                    "same native source path has conflicting metadata".into(),
+                ));
             }
         }
         // Verify every source before creating the attempt; subsequently copied

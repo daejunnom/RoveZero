@@ -222,7 +222,7 @@ impl std::error::Error for NativePairFailure {}
 pub fn run_native_pair(
     owner: NativeLaunchOwner,
     cancel: Option<&AtomicBool>,
-) -> Result<NativePairOutput, NativePairFailure> {
+) -> Result<NativePairOutput, Box<NativePairFailure>> {
     let mut bundle = NativeRunBundle {
         owner: Some(owner),
         process: None,
@@ -250,12 +250,12 @@ pub fn run_native_pair(
         }
         Err(cause) => {
             bundle.original_error = Some(cause.to_string());
-            Err(NativePairFailure {
+            Err(Box::new(NativePairFailure {
                 cause,
                 receipt: bundle.receipt.clone(),
                 receipt_artifact: bundle.receipt_artifact.clone(),
                 bundle,
-            })
+            }))
         }
     }
 }
