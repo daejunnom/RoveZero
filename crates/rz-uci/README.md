@@ -166,9 +166,12 @@ rz-uci --onnx-cpu
 ```
 
 위 표기는 필요한 인수 목록이며 줄을 나눈 shell 명령이 아니다. `--attestation`
-선택 시의 구조화된 startup·종료 영수증과 E의 실제 NN paired 실행 연결은 현재
-후속 통합 작업이다. 모델 로딩 성공, D가 수락한 실제 NN 평가, 물리 종료 확인을
-구분하며 게시한 코드나 요청 설정을 실제 실행 근거로 보고하지 않는다.
+선택 시의 구조화된 startup·종료 영수증과 E의 실제 NN paired 실행 연결은
+`0f0d70d`의 Linux CPU 인수에서 확인했다. startup의 검증된 프로필과 executable,
+종료의 D 완료 집계·첫/마지막 computed context·확정 drain을 서로 대조한다.
+모델 로딩 성공, 실제 평가 응답, 물리 종료 확인을 구분하며 전체 root별 journal이나
+물리 추론 호출 수를 이 집계로 대신하지 않는다. [인수 기록](../../docs/INTEGRATION-STATUS.md#후속-실제-cpu-신경망-pair-인수)의
+소스·binary·명령·외부 증거가 실제 결과의 적용 범위다.
 
 CPU fixture는 parser, 상태 원자성, ticket 취소와 착수 출력·event loop를 확인한다.
 `tests/search_integration.rs`는 독립 인공 트리로 UCI→PUCT→착수와 terminal 우회,

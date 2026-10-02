@@ -8,6 +8,8 @@ CPU/mock 인수 소스는 `4866a0b67dfd0aac10ffb03a0debd61fa018db3d`, 후속 실
 총괄이 관측한 실제 검사이며 GPU·학습·정식 대국과 구분한다.
 문서 후속 수정의 재사용 확인도 실제 실행과 구분한다.
 원시 근거는 저장소 밖에 보존하고 논리 경로·digest만 연결한다.
+실제 CPU 신경망의 Fastchess pair 연결 인수 소스는
+`0f0d70dddb170e7d46729eb19da02e810f0dee61`이며 후속 절에 별도로 기록한다.
 
 ## 기준 조합
 
@@ -360,3 +362,73 @@ skip/미실행, 외부 산출물 참조·digest와 다음 검증자를 기록한
 확정했고 목표 GPU·GPU 종단 계측·학습·정식 대국은 각각 pending이다. 고정 Fastchess fixture
 전체 실행은 위 새 4 gate에서 인수했으며 정상 PGN·exit 0만으로 raw UCI 로그 완전성을 인수하지 않는다.
 후속 총괄은 사용자 재개 때 원격 head와 이 조합을 대조해 계약을 수동 정합한다.
+
+## 후속 실제 CPU 신경망 pair 인수
+
+[PR #12](https://github.com/daejunnom/RoveZero/pull/12)은 기존 실제 CPU NN 엔진과
+E runner를 총괄이 수동 연결한 후속 인수다. 실행 소스는
+`0f0d70dddb170e7d46729eb19da02e810f0dee61`이며 공통 계약 revision 0.1은 유지한다.
+E의 `IntegrationPairSpecV1` wire version 1은 강도 실험과 별도 선언이다. 같은 모델·탐색을
+두 역할에 쓰는 첫 연결 검사에서 허위 InternalSearch/Runtime/Weights 변경을 선언하지 않는다.
+
+총괄은 B startup/final의 실제 선언, C 모델·backend·encoding identity, D completed/context,
+E private snapshot·supervisor·PGN을 직접 대조했다. 지원하는 인자는 `--onnx-cpu`,
+`--attestation`과 명시적인 `--key=value`이며 Fastchess의 하나의 `args=` 값으로 전달한다.
+새 프로세스 네 개의 ID와 영수증을 구별하고 `restart=on`으로 게임 사이 상태를 초기화한다.
+
+| 실제 로컬 검사 | 결과 / 적용 소스 |
+|---|---|
+| Workspace `cargo test --workspace --all-targets --all-features --locked` | 606 passed, 0 failed, 16 ignored; `0f0d70d` |
+| Workspace clippy `--all-targets --all-features --locked -- -D warnings` | 성공; `0f0d70d` |
+| Release `rz-uci/onnx-cpu`, `rz-arena`, `rz-experiments` build | 성공; `0f0d70d`, Rust 1.96.0, Linux |
+| 실제 `native-lock` / `native-pair` | 각각 exit 0; 잠금 선언 검사와 실제 실행을 구분 |
+| 실제 CPU NN pair | 두 판 모두 6 ply; e2e4/e7e5 2 ply opening과 이후 실제 착수; 흑백 배정 교환 |
+| Native provider / 종료 | 네 프로세스 각각 D completed 258, first/last fresh computed 일치, confirmed drain |
+| Runner 감독 | exit 0, process group Gone, pending 없음, 오류 없음; 감독 3.0078초, 외부 실행 3.2068초 |
+| 동일 실행 소스 CI | [run 37073237805](https://github.com/daejunnom/RoveZero/actions/runs/37073237805), Ubuntu·Windows 모두 성공 |
+
+16 ignored는 helper 진입점과 별도 심화 규칙 검사이며 로컬 기본 suite의 성공 수에 넣지 않는다.
+위 CI의 release 규칙 검사 `--include-ignored`와 Python 학습 fixture는 별도 실제 step으로
+관측했다. Windows CPU CI 성공이 Linux 전용 actual launcher 실행이나 GPU 인수를 대신하지 않는다.
+
+선정한 Maia1 v1.0 원본·변환 ONNX·manifest·ORT 1.22.0은 이전 실제 CPU 검사와 같은
+검증된 파일을 사용했다. `HistoryFill=No`, FP32, batch/intra-thread/search-worker/full-step=1,
+CPU provider, fresh-only를 잠갔다. 원본과 변환본의 외부 권리와 converter lineage를 유지한다.
+입력 canonical SHA는 `6540ae15e7d609fe672de39c086d841015cf85ef6be264ebf3bbb9709934b53e`다.
+
+| 실행 파일 | bytes | SHA256 |
+|---|---|---|
+| `rz-uci` | 2,509,344 | `9621046985fd30d46c0e64a198c7174637fd64f4e67252fa7547f98708f2a4ae` |
+| `rz-arena` | 3,202,992 | `5a3b502ee281bc7f192a68f61687f9935f89c1b0f3246a2ce5652ae95648628d` |
+| 고정 Fastchess | 2,429,320 | `ca85b6f3cbaab62352d7c98fb684f427a15c8a03d67825f0f2909eae725d9cfe` |
+
+release build receipt SHA는 `7dff26dc56358b8b57b5a658183267226d3346fd6926aa846a04de8ff29f3794`,
+실제 pair receipt SHA는 `403afca816b953efbe4692ca93187837ffac1e28e8d471b6410f8ce75922b139`,
+PGN SHA는 `cfaa0ebfb44e2479d9b6a0837d14c3b232c16a6dd8aee306d3e07355693d7367`다.
+원시 PGN·config·stdout/stderr·provider 기록·선행 실패 로그와 실행 영수증은 저장소 밖
+`reports/coordinator-integration/native-pair/`에 보존한다. 알려진 자료 51개·206,260 bytes를
+Windows의 `captured-0f0d70d/`로 회수하고 byte 길이·SHA256를 각각 재대조했다.
+회수 receipt SHA는 `835454b545cf5eaf49cc30c134deb18ed656f4138e25d5ab7f23d30663552bc1`이다.
+가중치·binary·runtime library는 이 로그 회수에 포함하지 않으며 기존 외부 원본과
+Linux의 독점 snapshot을 보존한다. 원시 로그에 담긴 개인 경로는 소스 문서에 반입하지 않는다.
+
+자원 설정은 pair 전체 runtime 60초, startup/handshake/drain 각 5초, 종료 grace 3초,
+동시 group 프로세스 3개, input 64 MiB·output 2 MiB·runtime 128 MiB·전체 256 MiB다.
+외부 wrapper는 각 프로세스에 상속되는 hard/soft 주소 공간 2 GiB를 설정했다.
+고유 입력은 30,736,948 bytes였고 감독된 트리의 관측 byte 수는 114,972,764다.
+프로세스/트리 관찰을 hard child/disk quota나 전체 peak RAM 계측으로 보고하지 않는다.
+Fastchess의 per-move 500ms와 내부 read margin도 공통 whole-engine 시계 인수를 대신하지 않는다.
+
+수 제한으로 끝난 원시 PGN의 draw는 A 기반 감사에서 **Incomplete 두 판**으로 보존했다.
+`scored_games=0`, `strength_eligible=false`, `execution_ready=false`다. D의 총 1,032 완료는
+수락한 평가 응답의 프로세스 집계이며 물리 추론 호출 수나 모든 go/root의 event journal이 아니다.
+LC0 비교·탐색/runtime A/B·Elo 개선으로 해석하지 않는다. 목표 GPU·GPU 종단 계측·실제
+학습·정식 paired 강도 실험은 각각 pending이다.
+
+실패도 보존했다. `7e7067a` CI의 common MSRV 불일치, `95932e2` 로컬 clippy의
+unused wrapper/큰 오류 값, `57bcc65` 로컬·Linux CI의 O_PATH fchmod 실패와 Windows
+CI의 non-Linux 타입 추론 실패를 원래 로그에서 확인한 뒤 수정했다. 권한을 생략하거나
+MSRV를 올려 통과시키지 않았다. 준비 실패는 원래 cause와 부분 복사·writer 종료·저장
+오류를 구분한다. postspawn ownership loss에서는 원래 Child와 입력 owner를 함께 보존하고
+입장을 닫으며, 보존을 PID signal/reap 권한 회복으로 표시하지 않는다. 문서 후속과 develop
+인수에서는 `0f0d70d`의 실행 영향 입력과 실제 CI 대상 SHA를 다시 대조한다.
