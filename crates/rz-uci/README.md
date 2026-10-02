@@ -1,11 +1,13 @@
 # rz-uci — B01의 임시 protocol/session 경계
 
 `TASK-B01/B03`의 UCI 파서, 세션 수명과 탐색 시간 연결을 구현한 독립 library다. 실제 체스 실행
-파일·Rules·neural evaluator·runtime 구현은 이 crate에 없다. I01 공통 계약이
-원격에 없는 상태에서 사용자 지시에 따라 B 소유의 임시 접점을 작성했다.
+파일·Rules·neural evaluator·runtime 구현은 이 crate에 없다. 초기 B-local 접점에 이어
+[PR #7](https://github.com/daejunnom/RoveZero/pull/7)의 공통 0.1 계약을 연결했다.
+`rz-contracts` 의존성은 SHA `67284c4f66f7a7ae9f46fa63dfd50e7410eb6845`에 고정한다.
 `SearchTicket`은 세션 내부에서 발급하여 임의로 생성할 수 없는 소유권 토큰이며 공통 RequestId,
 SelectionId, GameGeneration, RootGeneration을 대체하는 정의가 아니다.
-총괄은 이후 이 임시 접점을 공통 계약과 연결·통일해야 한다.
+공통 `ContractSessionOwner`가 game/root·registry·clock·cancel을 관리하고 opaque ticket과
+실제 평가 요청/selection의 대응은 검색 adapter가 소유한다.
 
 ## 입력과 상태 정책
 
@@ -37,6 +39,37 @@ SelectionId, GameGeneration, RootGeneration을 대체하는 정의가 아니다.
   거부한다. `ucinewgame`은 startpos와 game-owned namespace/history/search/correction
   초기화 effect를 발행한다. 이전 raw-cache game generation을 무효화하고 model
   weights는 보존하는 것은 runtime adapter의 책임이다.
+
+## 공통 계약 owner
+
+`contracts::ContractSessionOwner`는 실제 process epoch·clock origin·registry의
+`AcceptanceScope`와 실행 설정을 받는다. accepted `position/go/ucinewgame`에서 root를,
+accepted `ucinewgame`에서 game을 checked 증가시킨다. overflow는 Session 변경 전에
+거절하며 잘못된 전체 trace와 명령은 이전 세대·snapshot·token을 유지한다. registry 교체는
+idle에서 명시적으로 수행한다. model/encoding/backend handle이나 digest를 만들어내지 않는다.
+
+`handle_line`은 준비 전에 go 시각을 잡고 Rules가 확인한 실제 차례로 예산을 배분한다.
+`handle_event`는 callback/deadline/EOF를 처리한다. Line event는 checked side callback을
+제공하는 `handle_line`으로 보내야 한다. outcome의 `errors`는 typed 계약 원인을,
+`session.diagnostics`는 원래 worker·설정 오류를 함께 보존한다.
+
+현재 `scope`, 공통 `deadlines`, cancellation의 `token()`과 control의 simulation 한도를
+`rz-search::contracts::ContractSearchConfig`에 전달한다. `IdAllocator`는 process 전체의
+동일 Arc를 공유한다. 각 pump의 live scope는 이 owner와 실제 registry에서 갱신해서 읽는다.
+새 root/game, stop/quit/EOF와 owner Drop은 공통 token과 기존 제어 flag를 닫는다.
+두 atomic은 같은 저장소가 아니므로 취소에는 owner 또는 `ContractCancellation::cancel()`을
+사용한다. baseline control flag만 직접 닫았다는 사실로 공통 worker 취소를 가정하지 않는다.
+
+callback은 Session이 후보를 검증한 뒤 공통 세대·취소·fresh clock을 최종 검사한다.
+현재 ticket의 hard timer는 worker 결과의 취소와 별도로 finite 출력을 마감한다. worker가
+이미 취소됐어도 합법 후보/fallback을 한 번 반환한다. infinite 자원 만료는 계산만 닫고
+stop까지 후보를 보관한다. 이른 timer와 이미 정상 완료한 infinite의 timer는 새 실패나
+착수 출력을 만들지 않는다.
+
+`serve_events_with_handler`의 handler에서 owner를 사용하고 typed 원인을 기록한다.
+transport/dispatch 실패의 EOF 정리도 같은 handler를 거쳐 취소 권한을 닫은 다음
+runtime Cancel/Shutdown을 시도한다. Cancel dispatch 실패 때문에 공통 수락 권한이
+열린 채로 남지 않으며 원래 I/O/dispatch 오류와 정리 오류를 모두 반환한다.
 
 ## 통합 adapter의 의무
 
@@ -89,9 +122,12 @@ OS read를 기다리는 무한 join을 하면 안 된다.
 | 임시 접점 | 후속 연결 의무 |
 |---|---|
 | `PositionPort` / `PreparedPosition` | A의 immutable checked snapshot, 전체 trace, exact terminal과 legal UCI mapping |
-| `SearchTicket` / Start·Cancel | 공통 game/root/request/selection 세대 및 D의 작업 수명 |
-| `SearchBinding` / 설정 | 총괄 clock·취소 계약, node 의미, E 실행 manifest의 유한 자원 한도 |
+| `SearchTicket` / Start·Cancel | `ContractSessionOwner`의 현재 game/root와 `ContractSearch` request/selection, 실제 D 작업 수명 |
+| `ContractSessionOwner` / 설정 | 실제 process/registry owner, node 의미, E 실행 manifest의 유한 자원 한도 |
 | event handler / effect dispatch | D의 bounded queue, 실제 worker·물리 drain 및 transport 종료 |
+
+총괄 root 통합에서는 두 B crate의 고정 git 의존성을 단일 workspace/path 계약 crate로
+통일하고 root member/lockfile을 맞춘다. 동일 source의 git/path 타입을 혼용하지 않는다.
 
 ## 검사
 
@@ -107,5 +143,9 @@ cargo clippy --manifest-path crates/rz-uci/Cargo.toml --all-targets -- -D warnin
 CPU fixture는 parser, 상태 원자성, ticket 취소와 착수 출력·event loop를 확인한다.
 `tests/search_integration.rs`는 독립 인공 트리로 UCI→PUCT→착수와 terminal 우회,
 정확 마감, root 교체, clock 선택, 잘못된 전체 trace와 stop 경계, 큐의 늦은 완료와
-infinite 자원 만료의 출력 소유권을 대조한다. 실제 체스 Rules,
-shared 계약 연결, GPU, neural 평가와 대국 강도는 아직 인수하지 않았다.
+infinite 자원 만료의 출력 소유권을 대조한다.
+`tests/contract_session.rs`는 공통 세대·취소·registry·clock owner 경계를 확인하며,
+`tests/contracts_integration.rs`는 실제 공통 타입으로 UCI→비동기 평가→두 ply backup,
+stop/newgame/deadline·전송 실패의 취소를 대조한다. 이 검사는 실제 A/C/D 구현 연결을
+대신하지 않는다. 실제 A/C/D adapter, root workspace 통합 CI, GPU, 실제 neural 평가와
+대국 강도는 아직 인수하지 않았다.

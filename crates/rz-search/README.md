@@ -1,8 +1,9 @@
 # B 담당 탐색·시간 제어
 
-TASK-B02/B03의 CPU 기준 구현이다. 사용자 지시에 따라 총괄의 Rust 계약이 게시되기
-전에 B-local 임시 API로 개발했다. 공통 계약 revision은 아직 없으며 아래 접점의
-필드·식별·오류·수명을 총괄이 게시한 계약과 후속 통일해야 한다. 루트 workspace,
+TASK-B02/B03의 CPU 기준 구현이다. 최초 B-local 기준선에 이어 총괄
+[PR #7](https://github.com/daejunnom/RoveZero/pull/7)의 `rz-contracts` 0.1.0,
+engine schema 0.1을 사용하는 비동기 연결부를 구현했다. 의존성은 게시 SHA
+`67284c4f66f7a7ae9f46fa63dfd50e7410eb6845`에 고정한다. 루트 workspace,
 CI, 실제 체스 코어·모델·runtime은 이 crate가 소유하지 않는다.
 
 ## 구현과 경계
@@ -18,6 +19,10 @@ CI, 실제 체스 코어·모델·runtime은 이 crate가 소유하지 않는다
 - `time`: movetime과 실제 자기 차례의 clock+increment를 구분한다. 기본 제안은
   moves horizon 30, increment 반영 80%, hard 배분 배수 3, 출력/drain 여유 각 10ms다.
   clock 배분은 현재 남은 시간을 넘지 않는다. 이 숫자는 실제 실행 manifest에서 잠근다.
+- `contracts`: 실제 공통 `Evaluator::submit/poll/cancel`을 사용하는 단일 진행 탐색.
+  실제 tree ticket과 공통 request/selection·snapshot·ordered legal view를 함께 보관한다.
+- `contract_time`: 하나의 process clock origin 이후 elapsed ns를 checked 변환하고
+  공통 deadline과 B 시간 예산, 공통 token과 기존 제어 flag의 취소를 연결한다.
 
 확률 검증은 기본 f64 합 오차 1e-9이며 입력을 uniform/clip/draw로 수선하지 않는다.
 정확 terminal scalar는 -1/0/+1, draw utility는 0이다. root history·종료와 평가 캐시를
@@ -46,25 +51,56 @@ byte budget에 별도 포함한다. 이 구조 한도만으로 전체 RAM/VRAM �
 아니다. root initialization, accepted backup, completed visit, 예약 해제를 구분한다.
 completed visit는 유효 traversal 한 개이며 그 경로의 각 edge N은 한 번 증가한다.
 
+## 공통 계약을 사용하는 비동기 경계
+
+`ContractSearchConfig`는 actual model/encoding/backend, declared raw head 허용 오차,
+유한 compute/byte/tree/simulation 예산, 공통 cancellation/deadlines와 공유 `IdAllocator`를
+요구한다. `ContractPosition`은 A의 불변 snapshot·legal view·checked transition과 실제
+owner/revision 권한을 제공한다. input-key callback은 C가 실제 모델/이력 입력으로
+발급한 `EvalInputKey`를 공급한다. B는 보드 hash나 임의 숫자로 해당 증거를 만들지 않는다.
+
+`pump`는 한 번의 제출·poll·논리 정리만 수행하며 기다리거나 thread를 join하지 않는다.
+`live_scope`는 현재 owner/registry에서 읽어야 한다. 요청의 과거 context를 그대로 반환하면
+현재 세대 검증이 되지 않는다. 제출과 backup 직전 Rules 권한·현재 세대·취소·시각을
+다시 검사한다. pending search의 Drop/unwind는 공통 token을 닫지만 Runtime의 물리
+작업을 해제하지 않는다. 명시 runtime cancel과 유한 drain은 호출자가 계속 수행한다.
+
+각 evaluator stream의 활성 search consumer는 하나다. 여러 검색을 실행하면 dispatcher가
+RequestId별 stream으로 라우팅한다. foreign/duplicate context의 `RejectedResult`는
+원래 owned payload·failure·recovery를 호출자에게 반환하고 현재 예약을 유지한다.
+matching 실패는 원래 typed 오류와 recovery를 보존하며 방문 없이 예약을 해제한다.
+
+공통 성공 payload는 전체 context·실제 ordered legal 배열·compute/provenance를 검증하고,
+선언된 raw head 허용 오차를 다시 검사한 뒤 `LegalPolicy::normalized()`와
+`Wdl::normalized()`를 명시 호출한다. 변환은 유효 head의 f64 unit-sum 복사본이며
+허용 범위 밖 값을 수선하지 않는다. 이 변환 정책과 두 허용 오차는 model/compute 실행
+manifest에 잠근다. leaf scalar는 f64 복사본의 W-L이다. accepted execution ID·raw-cache
+결과와 제출 시도·실제 admission을 구분하며, 이 카운터는 물리 NN 완료 계측이 아니다.
+
 ## 총괄 통일·연결 대상
 
 | 현재 임시 접점 | 후속 소유자와 연결 의무 |
 |---|---|
-| `CheckedPosition` | A의 checked state·legal order·make/unmake·정확 terminal·완전 이력 |
-| `Evaluation` / `Evaluator` | 총괄 요청/응답 및 C의 model·encoding·policy order·WDL 관점·수치 검증 |
-| `SelectionTicket` / `SearchControl` | 공통 request/selection·game/root·모델 세대·deadline·취소 의미 |
-| 동기 evaluator 호출 | D의 async queue/batch·partial/failed/canceled/expired/stale 결과와 유한 drain |
+| `ContractPosition` | 실제 A의 checked state·legal order·정확 terminal·완전 이력·live authority |
+| model/input-key 공급 | C의 실제 encoding/input identity·policy mapping·model registry·수치 허용 오차 |
+| common `Evaluator` | D의 queue/batch·finalized 결과·physical lease·유한 drain |
+| `SelectionTicket` / 공통 ID | 실제 registry/epoch 발급 owner; allocator는 전체 process에서 공유 |
+| `driver::CheckedPosition/Evaluator` | 독립 비교용 B-local 동기 기준선; 공통 경로는 `contracts` 사용 |
 | policy identity / 한도 | 공통 설정·E의 manifest·runner 자기 시간 경계 |
 
 평가 adapter는 요청/응답 ID·입력 revision·legal order·model/encoding·정밀도·완료 상태를
 검증한 뒤 B에 전달해야 한다. provider는 취소·deadline을 준수하고 물리 작업 완료 전
 buffer를 해제하지 않는다. B의 논리 취소만으로 GPU 취소·물리 drain이 완료되지 않는다.
 UCI 입출력 owner를 막는 evaluator 호출이나 무제한 worker join을 사용하지 않는다.
+현재 두 B crate는 같은 git SHA의 계약 crate를 사용한다. 총괄 root 통합 때 git 의존성을
+단일 workspace/path 계약 의존성으로 바꾸고 member/lockfile을 맞춰야 한다. 같은 소스라도
+git/path crate를 둘 다 링크하면 Rust 타입 identity가 달라지므로 하나로 통일한다.
 
 ## 검증과 재현
 
-루트 Cargo가 아직 없으므로 crate manifest를 직접 사용한다. 개발 검증 toolchain은
-Rust 1.90.0이며 프로젝트 toolchain 결정은 총괄 I01에 남아 있다. 생성물은 저장소 밖
+이 B 브랜치는 루트 Cargo를 변경하지 않으므로 crate manifest를 직접 사용한다. 최초
+검사에는 고정된 git 의존성을 가져올 GitHub 접근이 필요하다. 개발 검증 toolchain은
+Rust 1.90.0이며 root toolchain과 통합 MSRV 검사는 총괄이 별도 인수한다. 생성물은 저장소 밖
 작업 전용 `CARGO_TARGET_DIR`에 둔다. 해당 작업 output은 작업 종료 전 회수하며,
 소스에는 손계산 fixture와 검토 가능한 요약만 보존한다.
 
@@ -77,4 +113,6 @@ cargo clippy --manifest-path crates/rz-search/Cargo.toml --all-targets -- -D war
 검사는 독립 score·한/두 ply WDL, root 초기화, 정확 terminal, 중복·취소·reset·
 마감 중 검증 race, 자원 한도, 실패 fallback, 시간 산술 및 정책 교체를 대조한다.
 fixture는 작은 인공 트리이며 표준 체스 perft·실제 신경망 수치·GPU·대국 검증이 아니다.
+`tests/contract_search.rs`는 실제 공통 타입과 비동기 mock으로 context·승격·legal 순서,
+명시 head 변환, final submit/backup 경계, matching/foreign 결과·recovery·Drop을 검사한다.
 실제 A/C/D adapter, workspace 통합 CI, 목표 GPU 및 paired 대국 인수는 후속 작업이다.

@@ -1,4 +1,4 @@
-//! 잠정 B 평가 연결 경계. 공통 계약이 게시되면 A/C/D adapter로 통일한다.
+//! B-local 동기 비교 기준선. 공통 0.1의 비동기 경로는 `crate::contracts`를 사용한다.
 //!
 //! 이 driver는 규칙이나 backend를 구현하지 않는다. CheckedPosition이 소유한 정확한
 //! 상태를 매 selection마다 복원하고, terminal을 평가 요청 전에 처리한다. evaluator는

@@ -247,7 +247,8 @@ impl SearchBinding {
     }
 
     /// A timer must use the same hard tick as callbacks. Early expiry is rejected.
-    /// An already canceled/replaced binding cannot finish a different active search.
+    /// Worker cancellation blocks results but cannot suppress this owner's hard
+    /// output deadline. A replaced binding still cannot finish another search.
     pub fn expire<P: PositionPort>(
         &self,
         session: &mut Session<P>,
@@ -257,9 +258,6 @@ impl SearchBinding {
             return session.expire(&self.ticket);
         }
         let now = now.max(Instant::now());
-        if self.control.stop_reason(now) == Some(StopReason::Canceled) {
-            return rejected("CanceledSearch", "ignored timer for canceled search work");
-        }
         if now < self.control.deadline {
             return rejected(
                 "EarlyDeadline",
@@ -614,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn canceled_callbacks_and_replaced_tickets_emit_nothing() {
+    fn canceled_callbacks_cannot_output_but_owned_timer_finishes_and_old_ticket_stays_stale() {
         let now = Instant::now();
         let mut session = session();
         let old = binding(&mut session, "go movetime 1000", now);
@@ -632,18 +630,45 @@ mod tests {
             .is_empty()
         );
         let canceled_timer = old.expire(&mut session, old.control().deadline);
-        assert!(canceled_timer.protocol.is_empty());
+        assert_eq!(canceled_timer.protocol, ["bestmove a2a3"]);
         assert!(
             canceled_timer
                 .diagnostics
                 .iter()
-                .any(|d| d.code == "CanceledSearch")
+                .any(|d| d.code == "SearchExpired")
         );
         let current = binding(&mut session, "go movetime 1000", now);
         let out = old.expire(&mut session, old.control().deadline);
         assert!(out.protocol.is_empty());
         assert_eq!(session.active_ticket().as_ref(), Some(current.ticket()));
         assert_eq!(current.control().stop_reason(now), None);
+    }
+
+    #[test]
+    fn canceled_finite_worker_hard_timer_emits_last_valid_candidate_once() {
+        let now = Instant::now();
+        let mut session = session();
+        let binding = binding(&mut session, "go movetime 1000", now);
+        assert!(binding.progress(&mut session, "b2b3", now).accepted);
+        binding.cancel();
+        let rejected = binding.complete(
+            &mut session,
+            SearchCompletion::Completed {
+                bestmove: Some("a2a3".into()),
+            },
+            now,
+        );
+        assert!(!rejected.accepted);
+        assert!(rejected.protocol.is_empty());
+        let expired = binding.expire(&mut session, binding.control().deadline);
+        assert_eq!(expired.protocol, ["bestmove b2b3"]);
+        assert!(session.active_ticket().is_none());
+        assert!(
+            binding
+                .expire(&mut session, binding.control().deadline)
+                .protocol
+                .is_empty()
+        );
     }
 
     #[test]
@@ -828,6 +853,11 @@ mod tests {
         );
         assert!(completed.accepted);
         assert!(completed.protocol.is_empty());
+        let early = binding.expire(&mut session, now);
+        assert!(!early.accepted);
+        assert!(early.protocol.is_empty());
+        assert!(!binding.control().cancellation.load(Ordering::Acquire));
+        assert!(early.diagnostics.iter().any(|d| d.code == "EarlyDeadline"));
         let timer = binding.expire(&mut session, binding.control().deadline);
         assert!(timer.accepted);
         assert!(timer.protocol.is_empty());
