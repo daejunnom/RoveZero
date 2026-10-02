@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: contracts-${{ github.event.pull_request.number || github.ref }}
+  group: contracts-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -23,8 +23,6 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/RoveZero/contracts-target
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@3db9de313aa3e84732d075f6fd8938cc0d6d4b58
@@ -33,4 +31,8 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --locked
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/RoveZero/contracts-target
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/RoveZero/contracts-target

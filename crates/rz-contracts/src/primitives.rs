@@ -257,6 +257,14 @@ impl Wdl {
         [self.win, self.draw, self.loss]
     }
 
+    /// 검증된 값을 f64로 넓힌 뒤 합이 1인 복사본을 명시적으로 만든다.
+    /// 원래 head와 관점은 유지한다. try_new의 허용 오차 밖 값은 복구하지 않는다.
+    pub fn normalized(self) -> [f64; 3] {
+        let values = self.probabilities().map(f64::from);
+        let sum = values.iter().sum::<f64>();
+        values.map(|value| value / sum)
+    }
+
     pub const fn flipped(self) -> Self {
         Self {
             win: self.loss,

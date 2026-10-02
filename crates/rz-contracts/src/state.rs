@@ -100,6 +100,19 @@ impl<P> PositionSnapshot<P> {
         classification: PositionClassification,
     ) -> Result<Self, ContractError> {
         classification.validate()?;
+        if let PlayStatus::Terminal {
+            reason: TerminalReason::Checkmate,
+            winner: Some(winner),
+        } = classification.play_status
+        {
+            if winner == side {
+                return Err(ContractError::new(
+                    ErrorCode::InvalidInput,
+                    Stage::Contract,
+                    "checkmated side to move cannot be the winner",
+                ));
+            }
+        }
         Ok(Self {
             identity,
             state,

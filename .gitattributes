@@ -1,5 +1,9 @@
 # Keep authored documentation stable across Windows and cloud checkouts.
 *.md text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+Cargo.lock text eol=lf
 .gitignore text eol=lf
 .gitattributes text eol=lf
 

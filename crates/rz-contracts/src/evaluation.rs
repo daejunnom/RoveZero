@@ -110,11 +110,13 @@ impl<P> EvalRequest<P> {
     ) -> Result<Self, ContractError> {
         context.revision.validate()?;
         context.compute.validate()?;
-        if context.request.epoch != context.selection.epoch {
+        if context.request.epoch != context.selection.epoch
+            || context.request.epoch != deadline.clock.0
+        {
             return Err(ContractError::new(
                 ErrorCode::IdentityMismatch,
                 Stage::Admission,
-                "request and selection belong to different process epochs",
+                "request, selection and deadline belong to different process epochs",
             ));
         }
         if position.classification().play_status != PlayStatus::Ongoing || legal.moves().is_empty()
@@ -334,6 +336,17 @@ impl EvalOutput {
                     "cache provenance and new physical execution disagree",
                 ))
             }
+        }
+        if self
+            .actual
+            .execution
+            .is_some_and(|execution| execution.epoch != request.context.request.epoch)
+        {
+            return Err(ContractError::new(
+                ErrorCode::IdentityMismatch,
+                Stage::Output,
+                "new physical execution belongs to a different process epoch",
+            ));
         }
         Ok(())
     }
