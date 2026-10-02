@@ -13,9 +13,10 @@ class Limits:
     max_records: int = 10000
     max_record_bytes: int = 262144
     max_file_bytes: int = 67108864
+    max_output_bytes: int = 67108864
 
     def __post_init__(self) -> None:
-        for field in ("max_records", "max_record_bytes", "max_file_bytes"):
+        for field in ("max_records", "max_record_bytes", "max_file_bytes", "max_output_bytes"):
             if type(getattr(self, field)) is not int or not 1 <= getattr(self, field) <= 2**31 - 1:
                 raise DataError("InvalidLimit", field, "limit must be a positive bounded integer")
 
@@ -51,7 +52,8 @@ def read_jsonl(path: Path, limits: Limits, *, hasher=None):
                 yield line_number, None, DataError(exc.code, f"line:{line_number}/{exc.context}", exc.message)
 
 
-def write_run(output_root: Path, run_id: str, files: dict[str, object], *, source_root: Path) -> Path:
+def write_run(output_root: Path, run_id: str, files: dict[str, object], *, source_root: Path,
+              max_bytes: int = 67108864) -> Path:
     """Create a fresh run directory, rejecting overwrite and repository outputs."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", run_id):
         raise DataError("InvalidRunId", "output", "run ID must be a simple name, max 80 characters")
@@ -60,10 +62,12 @@ def write_run(output_root: Path, run_id: str, files: dict[str, object], *, sourc
     if root == source or root.is_relative_to(source):
         raise DataError("OutputInSource", "output", "generated reports belong outside the source repository")
     encoded = {}
+    used = 0
     for name, value in files.items():
         if not re.fullmatch(r"[A-Za-z0-9_-]+\.json", name):
             raise DataError("InvalidOutputName", "output", "expected a simple JSON filename")
-        encoded[name] = canonical_bytes(value) + b"\n"
+        encoded[name] = canonical_bytes(value, max_bytes=max_bytes - used - 1) + b"\n"
+        used += len(encoded[name])
     root.mkdir(parents=True, exist_ok=True)
     run = root / run_id
     try:

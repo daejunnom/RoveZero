@@ -6,12 +6,25 @@ import json
 from .errors import DataError
 
 
-def canonical_bytes(value: object) -> bytes:
+def canonical_bytes(value: object, *, max_bytes: int | None = None) -> bytes:
     try:
-        return json.dumps(value, sort_keys=True, separators=(",", ":"),
-                          ensure_ascii=False, allow_nan=False).encode("utf-8")
+        if max_bytes is None:
+            return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=False, allow_nan=False).encode("utf-8")
+        encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"),
+                                   ensure_ascii=False, allow_nan=False)
+        output = bytearray()
+        for chunk in encoder.iterencode(value):
+            encoded = chunk.encode("utf-8")
+            if len(output) + len(encoded) > max_bytes:
+                raise DataError("OutputByteLimit", "output", "JSON report exceeds byte limit")
+            output.extend(encoded)
+        return bytes(output)
     except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
-        raise DataError("InvalidJson", "json", str(exc)) from exc
+        if isinstance(exc, DataError):
+            raise
+        code = "NonFinite" if str(exc).startswith("Out of range float values") else "InvalidJson"
+        raise DataError(code, "json", str(exc)) from exc
 
 
 def digest(value: object) -> str:

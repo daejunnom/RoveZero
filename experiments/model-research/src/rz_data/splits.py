@@ -33,15 +33,15 @@ def _sources(sources: object) -> list[dict]:
         if not isinstance(source, dict) or set(source) != SOURCE_KEYS:
             raise DataError("InvalidSource", context, "source fields must match the source schema")
         game_id = source["game_id"]
-        if not isinstance(game_id, str) or not game_id.strip():
-            raise DataError("InvalidGameId", context, "game_id must be a nonempty string")
+        if not isinstance(game_id, str) or len(game_id) > 2048 or not game_id.strip():
+            raise DataError("InvalidGameId", context, "game_id must be nonempty text, max 2048 characters")
         if game_id in seen:
             raise DataError("DuplicateGameId", context, f"duplicate game_id: {game_id}")
         seen.add(game_id)
         for key in GROUP_KEYS:
             value = source[key]
-            if value is not None and (not isinstance(value, str) or not value.strip()):
-                raise DataError("InvalidGroupId", f"{context}.{key}", "expected null or a nonempty string")
+            if value is not None and (not isinstance(value, str) or len(value) > 2048 or not value.strip()):
+                raise DataError("InvalidGroupId", f"{context}.{key}", "expected null or nonempty text, max 2048 characters")
         result.append({key: source[key] for key in sorted(SOURCE_KEYS)})
     return sorted(result, key=lambda source: source["game_id"])
 
@@ -49,8 +49,8 @@ def _sources(sources: object) -> list[dict]:
 def _ratios(ratios: object) -> tuple[int, int, int]:
     if not isinstance(ratios, (list, tuple)) or len(ratios) != len(SPLITS):
         raise DataError("InvalidRatios", "ratios", "expected three positive integer weights")
-    if any(type(value) is not int or value <= 0 for value in ratios):
-        raise DataError("InvalidRatios", "ratios", "weights must be positive integers; booleans are invalid")
+    if any(type(value) is not int or not 1 <= value <= 2**31 - 1 for value in ratios):
+        raise DataError("InvalidRatios", "ratios", "weights must be integers in [1, 2^31-1]; booleans are invalid")
     return tuple(ratios)
 
 
@@ -92,8 +92,8 @@ def make_split_plan(
 ) -> dict:
     """Freeze source identities before producing training rows."""
     canonical_sources = _sources(sources)
-    if not isinstance(seed, str):
-        raise DataError("InvalidSeed", "seed", "seed must be a string")
+    if not isinstance(seed, str) or len(seed) > 2048:
+        raise DataError("InvalidSeed", "seed", "seed must be a string, max 2048 characters")
     weights = _ratios(ratios)
     assignments = {}
     for component in _components(canonical_sources):

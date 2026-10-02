@@ -89,13 +89,41 @@ class SplitPlanTests(unittest.TestCase):
             validate_split_plan(changed)
 
     def test_rejects_invalid_sources_and_weights(self):
-        for weights in ((True, 1, 1), (1, 0, 1), (1, -1, 1), (1.0, 1, 1), (1, 1), (1, float("inf"), 1)):
+        for weights in ((True, 1, 1), (1, 0, 1), (1, -1, 1), (1.0, 1, 1),
+                        (1, 1), (1, float("inf"), 1), (2**31, 1, 1)):
             with self.subTest(weights=weights), self.assertRaises(DataError):
                 make_split_plan([source("a")], seed="lock", ratios=weights)
         for rows in ([source("a"), source("a")], [source("")], [{"game_id": "a"}],
                      [source("a", opening="")], [source("a", lineage=["unhashable"])]):
             with self.subTest(rows=rows), self.assertRaises(DataError):
                 make_split_plan(rows, seed="lock")
+
+    def test_source_identifier_bounds_block_report_amplification(self):
+        # A large expected source ID would otherwise be repeated in one error
+        # per row, then repeated again in the audit's top-level error list.
+        for length in (2049, 50000):
+            for field in ("game_id", "opening_family_id", "lineage_id", "seed_group_id"):
+                row = source("game")
+                row[field] = "x" * length
+                with self.subTest(length=length, field=field), self.assertRaises(DataError) as caught:
+                    make_split_plan([row], seed="bounded")
+                self.assertIn(caught.exception.code, ("InvalidGameId", "InvalidGroupId"))
+        plan = make_split_plan([source("game", lineage="bounded")], seed="bounded")
+        plan["sources"][0]["lineage_id"] = "x" * 50000
+        plan["source_digest"] = digest(plan["sources"])
+        plan["digest"] = digest({key: value for key, value in plan.items() if key != "digest"})
+        with self.assertRaises(DataError) as caught:
+            validate_split_plan(plan)
+        self.assertEqual(caught.exception.code, "InvalidGroupId")
+
+    def test_identifier_seed_and_ratio_maximum_boundaries(self):
+        maximum_text = "x" * 2048
+        row = source(maximum_text, opening=maximum_text, lineage=maximum_text, seed_group=maximum_text)
+        plan = make_split_plan([row], seed=maximum_text, ratios=(2**31 - 1, 1, 1))
+        self.assertEqual(validate_split_plan(plan), plan)
+        with self.assertRaises(DataError) as caught:
+            make_split_plan([source("game")], seed="x" * 2049)
+        self.assertEqual(caught.exception.code, "InvalidSeed")
 
     def test_empty_sources_are_reproducible_and_no_fake_rows_are_added(self):
         plan = make_split_plan([], seed="empty")

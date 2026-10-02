@@ -10,12 +10,19 @@ import math
 import re
 
 from .errors import DataError
-from .serialization import digest
+from .serialization import canonical_bytes, digest
 
 SCHEMA_VERSION = 1
 SPLITS = ("train", "validation", "holdout")
 MOVE = re.compile(r"[a-h][1-8][a-h][1-8][qrbn]?\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _json_boundary(value: object, context: str) -> None:
+    try:
+        canonical_bytes(value)
+    except DataError as exc:
+        raise DataError(exc.code, context + "." + exc.context, exc.message) from exc
 
 
 def obj(value: object, context: str, fields: tuple[str, ...]) -> dict:
@@ -85,6 +92,7 @@ def rights(value: object, context: str) -> None:
 
 
 def validate_manifest(value: object) -> dict:
+    _json_boundary(value, "manifest")
     value = obj(value, "manifest", ("schema_version", "dataset_id", "kind",
                 "engine_contract_revision", "execution_ready", "source", "teacher",
                 "encoding", "probability_tolerance", "leakage_policy"))
@@ -142,6 +150,8 @@ def _distribution(value: object, context: str, tolerance: float, *, length: int)
 
 def validate_record(value: object, manifest: dict) -> dict:
     """Return the unchanged record; validation never repairs or fabricates labels."""
+    validate_manifest(manifest)
+    _json_boundary(value, "record")
     value = obj(value, "record", ("schema_version", "dataset_id", "record_id", "game_id",
                 "opening_family_id", "lineage_id", "seed_group_id", "parent_record_id",
                 "augmentation_id", "split", "input_identity", "state", "teacher_id", "label",

@@ -6,8 +6,23 @@ from pathlib import Path
 from .errors import DataError
 from .io import Limits, read_jsonl
 from .schema import validate_manifest, validate_record
-from .serialization import digest
+from .serialization import canonical_bytes, digest
 from .splits import audit_leakage, validate_split_plan
+
+
+def _provenance(record: object) -> dict:
+    """Keep parsed source relationships even when labels fail validation."""
+    if not isinstance(record, dict):
+        return {}
+    result = {}
+    for key in ("record_id", "game_id", "opening_family_id", "lineage_id", "seed_group_id",
+                "parent_record_id", "augmentation_id", "split"):
+        if key not in record:
+            continue
+        value = record[key]
+        result[key] = value if value is None or isinstance(value, str) and len(value) <= 2048 else {
+            "invalid_field_digest": digest(value)}
+    return result
 
 
 def audit_dataset(manifest: dict, records_path: Path, plan: dict, limits: Limits) -> dict:
@@ -20,8 +35,7 @@ def audit_dataset(manifest: dict, records_path: Path, plan: dict, limits: Limits
     seen = 0
     for line, record, parse_error in read_jsonl(records_path, limits, hasher=input_hash):
         seen += 1
-        identity = {key: record.get(key) for key in ("record_id", "game_id")
-                    if isinstance(record, dict) and isinstance(record.get(key), str)}
+        identity = _provenance(record)
         try:
             if parse_error is not None:
                 raise parse_error
@@ -66,6 +80,9 @@ def audit_dataset(manifest: dict, records_path: Path, plan: dict, limits: Limits
         "exclusions": excluded,
         "leakage": leakage,
         "coverage": {
+            "leakage_scope": "structurally_valid_records_only",
+            "rejected_record_leakage": "not_run",
+            "rejected_records_outside_leakage_audit": len(rejected),
             "engine_contract_binding": "not_run",
             "state_restore": "not_run",
             "independent_legal_moves": "not_run",
@@ -77,5 +94,7 @@ def audit_dataset(manifest: dict, records_path: Path, plan: dict, limits: Limits
         "limitations": manifest["leakage_policy"],
         "blocking_reasons": ["I/A/C bindings and independent state/encoding evidence are unavailable"],
     }
+    # Bound serialization before calculating a receipt digest, too.
+    canonical_bytes(report, max_bytes=limits.max_output_bytes)
     report["digest"] = digest(report)
     return report
