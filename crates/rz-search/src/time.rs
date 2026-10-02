@@ -117,10 +117,8 @@ impl TimeBudget {
                 }
                 deadline(start, remaining, "remaining clock")?;
                 deadline(start, increment, "increment")?;
-                let increment_share = share_duration(
-                    increment,
-                    u32::from(config.increment_share_basis_points),
-                )?;
+                let increment_share =
+                    share_duration(increment, u32::from(config.increment_share_basis_points))?;
                 let soft = (remaining / horizon)
                     .checked_add(increment_share)
                     .ok_or(TimeBudgetError::DurationOverflow("soft allocation"))?;
@@ -189,7 +187,10 @@ impl fmt::Display for TimeBudgetError {
         match self {
             Self::ZeroMoveHorizon => formatter.write_str("moves-to-go must be positive"),
             Self::InvalidIncrementShare(share) => {
-                write!(formatter, "increment share {share} exceeds 10000 basis points")
+                write!(
+                    formatter,
+                    "increment share {share} exceeds 10000 basis points"
+                )
             }
             Self::ZeroHardBudgetMultiplier => {
                 formatter.write_str("hard budget multiplier must be positive")
@@ -273,7 +274,10 @@ mod tests {
         assert!(!budget.can_accept(start + millis(90)));
         assert!(budget.soft_expired(start + millis(80)));
         assert!(budget.hard_expired(start + millis(90)));
-        assert_eq!(budget.remaining_result_time(start + millis(91)), Duration::ZERO);
+        assert_eq!(
+            budget.remaining_result_time(start + millis(91)),
+            Duration::ZERO
+        );
     }
 
     #[test]
