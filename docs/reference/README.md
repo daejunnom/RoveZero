@@ -16,6 +16,8 @@
 
 사용자가 제공한 두 파일을 그대로 복사하고 source와 보존본의 SHA-256 일치를
 확인했다. 아래 digest는 문서 무결성의 근거이며 과학적 주장·최신 외부 정보의 검증이 아니다.
+루트 `.gitattributes`는 두 snapshot의 Git 줄바꿈 변환을 끈다. Windows와 클라우드
+checkout에서도 원문 byte·공백을 보존하며 작성 문서의 LF 정책과 구분한다.
 
 ```text
 RoveZero_Handoff_v0.2.0_KO.md
