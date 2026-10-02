@@ -2,7 +2,8 @@
 
 이 문서는 [RoveZero v0.2.0 핸드오프](reference/RoveZero_Handoff_v0.2.0_KO.md)의
 3~4장과 14~17장 및 이번 사용자 지시를 바탕으로 책임·의존 방향·검증 경계를 정한다.
-사용자가 지정한 독립 Rust 구현의 설계 문서이며 현재 구현된 엔진을 설명하지 않는다.
+사용자가 지정한 독립 Rust 구현의 책임과 의존 방향을 정한다. 현재 구현·실행 인수
+범위는 [통합 상태](INTEGRATION-STATUS.md)에 따로 기록한다.
 A~F의 클라우드 개발 환경과 목표 RTX 4050 6GB 검증 환경을 구분한다. 개발 GPU가
 없어도 CPU/mock와 가능한 CPU 신경망 참조로 계약·코드·fixture를 구현할 수 있어야 한다.
 실제 GPU 실행·계측·정식 대국·학습은 지원 환경에서 총괄 I02가 별도로 인수한다.
@@ -90,6 +91,12 @@ search는 position/contracts와 주입한 evaluator 접점, eval은 contracts/en
 선택 backend를 사용한다. runtime은 공통 evaluator 접점으로 provider를 주입받으며
 구체 조합은 UCI/bootstrap에서 수행한다. telemetry는 수동 이벤트·계측이고 arena는
 외부 실행·검증 경계다. search↔runtime↔eval cycle이나 arena의 규칙 복제를 만들지 않는다.
+
+실제 CPU 조합의 C `contracts` feature에는 A 상태 projection과 D `RuntimeBackend`
+구현인 `native_runtime_bridge`가 포함된다. 이 선택적 연결부는 C의 모델·물리 worker를
+D의 요청·lease·완료 계약에 맞추며 D는 구체 C provider에 역의존하지 않는다.
+B `onnx-cpu` bootstrap이 asset/runtime pin·한 session·공통 clock/ID·diagnostic owner를
+조합한다. 모델 추론 코어는 D queue 정책이나 탐색 방문 통계를 소유하지 않는다.
 
 총괄은 루트 Cargo 파일·설정·CI·실험 목록과 consumer 영향을 관리한다. 불변
 snapshot·수명 고정 handle로 async borrow를 안전하게 연결하며 변경 후 계약

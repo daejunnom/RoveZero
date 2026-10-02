@@ -255,8 +255,8 @@ GPU 인수 상태를 나눠 공유한다. CUDA 단계는 지원 환경에서 총
 실험·유료 GPU 사용을 승인하지 않는다.
 
 초기 FP32 수치 인수안은 raw policy logit에 `atol=1e-4, rtol=1e-3`, WDL과 합법 수별
-확률의 최대 절대 오차에 `1e-4`를 사용한다. 이는 아직 실행되지 않은 프로젝트 기본안이며
-출판된 후보 성능 보장치가 아니다. 담당 C와 총괄은 참조·fixture·precision을 함께 고정한다.
+확률의 최대 절대 오차에 `1e-4`를 사용한다. 이 기준은 아래 고정 CPU 참조에서 실제
+검사했으며 GPU·다른 모델의 성능 보장치가 아니다. 담당 C와 총괄은 참조·fixture·precision을 함께 고정한다.
 실패하면 원인을 먼저 구분하고, 오차 기준 변경은 근거·영향·이전 실패를 남겨 결정한다.
 
 ## 대국·파인튜닝에서 효과를 분리하는 기준
@@ -280,8 +280,13 @@ policy index·WDL 관점·누출·seed 계약이 충족된 후 진행한다. F03
 - 완료: 공식 후보·사양·형식·라이선스 조사, 두 개 작은 공개 파일의 제한된 metadata
   검사와 digest 검증, 원저자의 weights GPL 적용 근거 확인, **Maia1 v1.0 maia-1900 단일
   호환 선정**, C02/C03 구현·인수 경계 작성.
-- 미완료: ONNX 변환, Rust 모델 loader/backend, CPU/실제 GPU 수치 대조, VRAM·속도·
-  대국·파인튜닝 결과, 실제 외부 배포 형태의 source/notice 충족 확인. T70 권리는 보류 유지.
-- 다음 작업: 총괄의 descriptor 발행과 실제 backend 버전 고정 후 담당 C가 선정한 Maia의
-  코드·fixture·가능한 CPU 참조를 개발하고, 총괄 I02가 지원 환경의 목표 GPU 인수를
-  별도로 확인한다. 학습·장시간 대국의 구체적 예산은 실행 전에 확정한다.
+- 후속 실제 CPU 인수: 고정 LC0 `fd71a2d921b689c5f479d3227c3806c8e272d9c5` converter·
+  Eigen 원본 protobuf 참조, ONNX Runtime 1.22.0 CPU/FP32와 Rust loader/backend를
+  `a9a5ae7f5c0bb5b13d8082e2ce662f8e807d8248`에서 연결했다. 직접 tensor 대조와 batch
+  1/2/4/8/16, 실제 A 이력·합법 수 12개를 통한 C→D 수치 대조·drain, 실제 CPU UCI를
+  검사했다. source·export·runtime·reference digest와 오차·범위는
+  [통합 인수 상태](INTEGRATION-STATUS.md)에 기록한다.
+- 미완료: 목표 GPU 수치 대조·VRAM·종단 성능, 정식 대국·실제 Maia 파인튜닝,
+  외부 배포 형태의 source/notice 충족 확인. T70 권리는 보류 유지.
+- 다음 작업: 총괄 I02가 지원 환경의 목표 GPU와 E 실행 gate를 각각 인수한다.
+  학습·장시간 대국의 구체적 예산은 실행 전에 확정한다.
