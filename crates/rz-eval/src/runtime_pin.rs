@@ -7,13 +7,18 @@
 //! Its owner must not chmod, replace or remove bootstrap copies. This is an
 //! ownership contract, not protection against hostile code with the same OS UID.
 //! Runtime copies are retained for process lifetime once passed to ORT. No
-//! runtime/provider assets are downloaded, and sibling provider libraries are
-//! deliberately not copied: absent native dependencies remain a bootstrap error.
+//! runtime/provider assets are downloaded. CPU copies contain one library. A
+//! Linux CUDA bundle copies only the explicitly declared, verified libraries;
+//! resolving and loading their complete dependency closure is a separate gate.
 
 use crate::{
     asset,
     error::{BackendError, FailureKind as K, FailureStage as S},
 };
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+#[cfg(target_os = "linux")]
+use std::io::{Read, Seek, SeekFrom};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
@@ -25,13 +30,230 @@ use std::{
 };
 
 const MAX_LIBRARY_BYTES: usize = 512 * 1024 * 1024;
+const MAX_BUNDLE_JSON_BYTES: usize = 64 * 1024;
+const MAX_BUNDLE_FILES: usize = 32;
+const MAX_BUNDLE_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_BUNDLE_BYTES: u64 = 4 * MAX_BUNDLE_FILE_BYTES;
+const CORE_FILENAME: &str = "libonnxruntime.so.1.22.0";
+const SHARED_FILENAME: &str = "libonnxruntime_providers_shared.so";
+const CUDA_FILENAME: &str = "libonnxruntime_providers_cuda.so";
+const NVIDIA_FILENAMES: &[&str] = &[
+    "libcudart.so.12",
+    "libcublas.so.12",
+    "libcublasLt.so.12",
+    "libcufft.so.11",
+    "libcurand.so.10",
+    "libnvrtc.so.12",
+    "libnvrtc-builtins.so.12.8",
+    "libnvJitLink.so.12",
+    "libcudnn.so.9",
+    "libcudnn_adv.so.9",
+    "libcudnn_cnn.so.9",
+    "libcudnn_ops.so.9",
+    "libcudnn_engines_precompiled.so.9",
+    "libcudnn_engines_runtime_compiled.so.9",
+    "libcudnn_graph.so.9",
+    "libcudnn_heuristic.so.9",
+];
 static NEXT_COPY: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeBundleFileRole {
+    Core,
+    ProvidersShared,
+    ProvidersCuda,
+    NvidiaDependency,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeBundleFile {
+    pub role: RuntimeBundleFileRole,
+    pub filename: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+impl std::fmt::Debug for RuntimeBundleFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let filename = if allowed_bundle_filename(self.role, &self.filename) {
+            self.filename.as_str()
+        } else {
+            "<invalid library basename>"
+        };
+        f.debug_struct("RuntimeBundleFile")
+            .field("role", &self.role)
+            .field("filename", &filename)
+            .field("bytes", &self.bytes)
+            .field("sha256", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The first Linux GPU profile requires ORT 1.22 plus all 16 declared NVIDIA
+/// libraries. This is a file identity manifest; ELF resolution is a separate gate.
+/// Only deserialization is provided: shared diagnostics use the safe Debug view.
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CudaRuntimeBundleSpec {
+    pub schema_version: u32,
+    pub files: Vec<RuntimeBundleFile>,
+}
+
+impl std::fmt::Debug for CudaRuntimeBundleSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CudaRuntimeBundleSpec")
+            .field("schema_version", &self.schema_version)
+            .field("files", &self.files)
+            .finish()
+    }
+}
+
+impl CudaRuntimeBundleSpec {
+    pub fn from_json(json: &str) -> Result<Self, BackendError> {
+        if json.len() > MAX_BUNDLE_JSON_BYTES {
+            return Err(bundle_limit_error("CUDA bundle JSON exceeds 64 KiB"));
+        }
+        // Derived structs reject duplicate fields at both manifest/file levels.
+        // Value-based parsing would lose that information and is not used here.
+        let spec: Self = serde_json::from_str(json).map_err(|error| {
+            bundle_error("CUDA bundle JSON is malformed")
+                .with_external_cause(crate::error::CauseCode::RuntimePath, &error)
+        })?;
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    pub fn validate(&self) -> Result<(), BackendError> {
+        if self.schema_version != 1 {
+            return Err(bundle_error("CUDA bundle schema version is unsupported"));
+        }
+        if self.files.len() > MAX_BUNDLE_FILES {
+            return Err(bundle_limit_error("CUDA bundle exceeds 32 files"));
+        }
+        let mut required = [false; 3];
+        let mut total = 0_u64;
+        for (index, file) in self.files.iter().enumerate() {
+            if !allowed_bundle_filename(file.role, &file.filename) {
+                return Err(bundle_error("CUDA bundle filename or role is unsupported"));
+            }
+            if self.files[..index]
+                .iter()
+                .any(|previous| previous.filename == file.filename)
+            {
+                return Err(bundle_error("CUDA bundle contains a duplicate filename"));
+            }
+            if file.bytes == 0 || file.bytes > MAX_BUNDLE_FILE_BYTES {
+                return Err(bundle_limit_error("CUDA bundle file size is outside its budget"));
+            }
+            total = total.checked_add(file.bytes).ok_or_else(|| {
+                bundle_limit_error("CUDA bundle total byte count overflowed")
+            })?;
+            if total > MAX_BUNDLE_BYTES {
+                return Err(bundle_limit_error("CUDA bundle exceeds 4 GiB"));
+            }
+            bundle_file_digest(file)?;
+            match file.role {
+                RuntimeBundleFileRole::Core => required[0] = true,
+                RuntimeBundleFileRole::ProvidersShared => required[1] = true,
+                RuntimeBundleFileRole::ProvidersCuda => required[2] = true,
+                RuntimeBundleFileRole::NvidiaDependency => {}
+            }
+        }
+        if required != [true; 3] {
+            return Err(bundle_error("CUDA bundle lacks required ORT libraries"));
+        }
+        if self.files.len() != 3 + NVIDIA_FILENAMES.len()
+            || NVIDIA_FILENAMES.iter().any(|filename| {
+                !self.files.iter().any(|file| {
+                    file.role == RuntimeBundleFileRole::NvidiaDependency
+                        && file.filename == *filename
+                })
+            })
+        {
+            return Err(bundle_error("CUDA bundle lacks first-profile NVIDIA dependencies"));
+        }
+        Ok(())
+    }
+
+    /// SHA-256 of a domain-separated binary codec, independent of JSON order.
+    /// Codec: domain, u32-BE schema/count, then filename-sorted entries containing
+    /// u32-BE name length, name bytes, u8 role, u64-BE size and 32 digest bytes.
+    pub fn digest(&self) -> Result<[u8; 32], BackendError> {
+        self.validate()?;
+        let mut files: Vec<_> = self.files.iter().collect();
+        files.sort_unstable_by(|left, right| left.filename.cmp(&right.filename));
+        let mut digest = Sha256::new();
+        digest.update(b"RoveZero/native-cuda-bundle\0binary-codec-v1\0");
+        digest.update(self.schema_version.to_be_bytes());
+        digest.update((files.len() as u32).to_be_bytes());
+        for file in files {
+            digest.update((file.filename.len() as u32).to_be_bytes());
+            digest.update(file.filename.as_bytes());
+            digest.update([match file.role {
+                RuntimeBundleFileRole::Core => 1,
+                RuntimeBundleFileRole::ProvidersShared => 2,
+                RuntimeBundleFileRole::ProvidersCuda => 3,
+                RuntimeBundleFileRole::NvidiaDependency => 4,
+            }]);
+            digest.update(file.bytes.to_be_bytes());
+            digest.update(bundle_file_digest(file)?);
+        }
+        Ok(digest.finalize().into())
+    }
+}
+
+fn allowed_bundle_filename(role: RuntimeBundleFileRole, filename: &str) -> bool {
+    match role {
+        RuntimeBundleFileRole::Core => filename == CORE_FILENAME,
+        RuntimeBundleFileRole::ProvidersShared => filename == SHARED_FILENAME,
+        RuntimeBundleFileRole::ProvidersCuda => filename == CUDA_FILENAME,
+        RuntimeBundleFileRole::NvidiaDependency => NVIDIA_FILENAMES.contains(&filename),
+    }
+}
+
+fn bundle_file_digest(file: &RuntimeBundleFile) -> Result<[u8; 32], BackendError> {
+    if file.sha256.len() != 64
+        || !file.sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(bundle_error("CUDA bundle SHA-256 must be lowercase hex"));
+    }
+    asset::parse_sha256(&file.sha256)
+}
+
+fn bundle_error(detail: &'static str) -> BackendError {
+    BackendError::new(K::UnsupportedModel, S::Backend, detail)
+}
+
+fn bundle_limit_error(detail: &'static str) -> BackendError {
+    BackendError::new(K::ResourceExhausted, S::Backend, detail)
+}
+
+struct OwnedCudaBundle {
+    digest: [u8; 32],
+    files: Vec<RuntimeBundleFile>,
+    // The core handle is OwnedCopy::_pin; every other bundle file is held here.
+    _pins: Vec<File>,
+}
+
+/// Crate-private handoff to the audited native loader. The path must never be
+/// printed as a diagnostic. File clones have independent lifetimes but share
+/// their seek offset; consumers must not perform concurrent positional reads.
+#[cfg_attr(not(all(feature = "onnx", target_os = "linux")), allow(dead_code))]
+pub(crate) struct PinnedBundleLibrary {
+    pub path: PathBuf,
+    pub file: File,
+    pub digest: [u8; 32],
+    pub bytes: u64,
+}
 
 struct OwnedCopy {
     path: PathBuf,
     digest: [u8; 32],
     // Windows denies write/delete sharing; Unix retains the exact owned inode.
     _pin: File,
+    bundle: Option<OwnedCudaBundle>,
 }
 
 /// Capability issued only after an owned copy has been verified and pinned.
@@ -42,7 +264,7 @@ impl std::fmt::Debug for RuntimeLibraryPin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Private filesystem paths are not shared diagnostics.
         f.debug_struct("RuntimeLibraryPin")
-            .field("digest", &self.0.digest)
+            .field("cuda_bundle", &self.0.bundle.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -169,6 +391,7 @@ impl RuntimeLibraryPin {
                 path: path.clone(),
                 digest: expected,
                 _pin: pin,
+                bundle: None,
             })))
         })();
         // Only a failed, unpublished copy is eligible for local cleanup.
@@ -185,10 +408,265 @@ impl RuntimeLibraryPin {
         self.0.digest
     }
 
+    pub fn bundle_digest(&self) -> Option<[u8; 32]> {
+        self.0.bundle.as_ref().map(|bundle| bundle.digest)
+    }
+
+    pub fn bundle_files(&self) -> Option<&[RuntimeBundleFile]> {
+        self.0.bundle.as_ref().map(|bundle| bundle.files.as_slice())
+    }
+
+    #[cfg_attr(not(all(feature = "onnx", target_os = "linux")), allow(dead_code))]
+    pub(crate) fn try_clone_nvidia_pins(&self) -> Result<Vec<PinnedBundleLibrary>, BackendError> {
+        self.try_clone_bundle_pins(false)
+    }
+
+    #[cfg_attr(not(all(feature = "onnx", target_os = "linux")), allow(dead_code))]
+    pub(crate) fn try_clone_ort_pins(&self) -> Result<Vec<PinnedBundleLibrary>, BackendError> {
+        self.try_clone_bundle_pins(true)
+    }
+
+    #[cfg_attr(not(all(feature = "onnx", target_os = "linux")), allow(dead_code))]
+    fn try_clone_bundle_pins(&self, ort: bool) -> Result<Vec<PinnedBundleLibrary>, BackendError> {
+        let bundle = self.0.bundle.as_ref().ok_or_else(|| {
+            BackendError::new(K::BackendUnavailable, S::Backend, "CPU runtime pin has no CUDA bundle")
+        })?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let directory = self.0.path.parent()
+                .ok_or_else(|| bundle_error("CUDA bundle pin has no owned directory"))?;
+            if bundle._pins.len() + 1 != bundle.files.len() {
+                return Err(bundle_error("CUDA bundle handle count differs"));
+            }
+            let mut result = Vec::with_capacity(if ort { 3 } else { NVIDIA_FILENAMES.len() });
+            let mut other_pins = bundle._pins.iter();
+            for entry in &bundle.files {
+                let pin = if entry.role == RuntimeBundleFileRole::Core {
+                    &self.0._pin
+                } else {
+                    other_pins.next()
+                        .ok_or_else(|| bundle_error("CUDA bundle retained handle is missing"))?
+                };
+                if (entry.role != RuntimeBundleFileRole::NvidiaDependency) != ort {
+                    continue;
+                }
+                let path = directory.join(&entry.filename);
+                let retained = pin.metadata()
+                    .map_err(|error| bundle_io_error("CUDA retained pin metadata failed", &error))?;
+                let named = fs::symlink_metadata(&path)
+                    .map_err(|error| bundle_io_error("CUDA owned pin path metadata failed", &error))?;
+                if !retained.is_file() || !named.is_file() || named.file_type().is_symlink()
+                    || retained.dev() != named.dev() || retained.ino() != named.ino()
+                    || retained.len() != entry.bytes || named.len() != entry.bytes
+                    || retained.permissions().mode() & 0o777 != 0o400
+                    || named.permissions().mode() & 0o777 != 0o400
+                {
+                    return Err(bundle_identity_error("CUDA owned pin inode or permissions differ"));
+                }
+                let file = pin.try_clone()
+                    .map_err(|error| bundle_io_error("cannot clone CUDA retained file pin", &error))?;
+                result.push(PinnedBundleLibrary {
+                    path, file, digest: bundle_file_digest(entry)?, bytes: entry.bytes,
+                });
+            }
+            Ok(result)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (bundle, ort);
+            Err(BackendError::new(K::BackendUnavailable, S::Backend, "CUDA runtime bundle pins currently require Linux"))
+        }
+    }
+
+    /// Copy an explicitly described Linux CUDA library bundle into one private
+    /// directory. The caller controls both roots and output-root ancestors.
+    /// Extra source files are never enumerated or copied. This does not resolve
+    /// ELF dependencies or execute native code; bootstrap must do those checks.
+    pub fn copy_cuda_bundle(
+        source_root: &Path,
+        output_root: &Path,
+        spec: &CudaRuntimeBundleSpec,
+    ) -> Result<Self, BackendError> {
+        spec.validate()?;
+        #[cfg(target_os = "linux")]
+        {
+            Self::copy_linux_cuda_bundle(source_root, output_root, spec)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (source_root, output_root);
+            Err(BackendError::new(
+                K::BackendUnavailable,
+                S::Backend,
+                "CUDA runtime bundle pins currently require Linux",
+            ))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn copy_linux_cuda_bundle(
+        source_root: &Path,
+        output_root: &Path,
+        spec: &CudaRuntimeBundleSpec,
+    ) -> Result<Self, BackendError> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        let source_root = real_bundle_root(source_root)?;
+        let output_root = real_bundle_root(output_root)?;
+        let bundle_digest = spec.digest()?;
+        let sequence = NEXT_COPY
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .map_err(|_| bundle_limit_error("runtime copy sequence exhausted"))?;
+        let directory = output_root.join(format!(
+            "ort-bootstrap-{}-{}", std::process::id(), sequence
+        ));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .map_err(|error| bundle_io_error("cannot create exclusive CUDA bundle directory", &error))?;
+        let mut created_files = Vec::with_capacity(spec.files.len());
+        let result = (|| {
+            let mut files = spec.files.clone();
+            files.sort_unstable_by(|left, right| left.filename.cmp(&right.filename));
+            let mut core = None;
+            let mut pins = Vec::with_capacity(files.len() - 1);
+            for file in &files {
+                let source = source_root.join(&file.filename);
+                let metadata = fs::symlink_metadata(&source)
+                    .map_err(|error| bundle_io_error("CUDA bundle source metadata failed", &error))?;
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    return Err(bundle_error("CUDA bundle source must be a regular nonsymlink file"));
+                }
+                // Linux O_NOFOLLOW closes the symlink swap window; O_NONBLOCK
+                // avoids waiting on a FIFO swapped in before the handle check.
+                let mut reader = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(0x20000 | 0x800)
+                    .open(&source)
+                    .map_err(|error| bundle_io_error("cannot open CUDA bundle source", &error))?;
+                verify_bundle_file_length(&reader, file.bytes)?;
+                let path = directory.join(&file.filename);
+                let mut writer = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .map_err(|error| bundle_io_error("cannot create exclusive CUDA bundle file", &error))?;
+                created_files.push(path.clone());
+                let expected = bundle_file_digest(file)?;
+                if stream_bundle_file(&mut reader, Some(&mut writer), file.bytes)? != expected {
+                    return Err(bundle_identity_error("CUDA bundle source digest differs"));
+                }
+                writer.sync_all()
+                    .map_err(|error| bundle_io_error("cannot sync CUDA bundle file", &error))?;
+                drop(writer);
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o400))
+                    .map_err(|error| bundle_io_error("cannot make CUDA bundle file read-only", &error))?;
+                let mut pin = File::open(&path)
+                    .map_err(|error| bundle_io_error("cannot pin CUDA bundle file", &error))?;
+                verify_bundle_file_length(&pin, file.bytes)?;
+                if stream_bundle_file(&mut pin, None, file.bytes)? != expected {
+                    return Err(bundle_identity_error("CUDA bundle owned copy digest differs"));
+                }
+                pin.seek(SeekFrom::Start(0))
+                    .map_err(|error| bundle_io_error("cannot rewind CUDA bundle file pin", &error))?;
+                if file.role == RuntimeBundleFileRole::Core {
+                    core = Some((path, expected, pin));
+                } else {
+                    pins.push(pin);
+                }
+            }
+            let (path, digest, pin) = core
+                .ok_or_else(|| bundle_error("CUDA bundle core pin is missing"))?;
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o500))
+                .map_err(|error| bundle_io_error("cannot seal CUDA bundle directory", &error))?;
+            Ok(Self(Arc::new(OwnedCopy {
+                path,
+                digest,
+                _pin: pin,
+                bundle: Some(OwnedCudaBundle { digest: bundle_digest, files, _pins: pins }),
+            })))
+        })();
+        if result.is_err() {
+            // Every handle in the failed closure has closed. Only paths created
+            // with create_new in our exclusive unpublished directory are removed.
+            // Cleanup is best-effort: IO failure may leave an unpublished copy
+            // for caller-owned cleanup. The original failure remains authoritative.
+            let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700));
+            for path in created_files.iter().rev() {
+                let _ = fs::remove_file(path);
+            }
+            let _ = fs::remove_dir(&directory);
+        }
+        result
+    }
+
     #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
     pub(crate) fn path(&self) -> &Path {
         &self.0.path
     }
+}
+
+#[cfg(target_os = "linux")]
+fn real_bundle_root(root: &Path) -> Result<PathBuf, BackendError> {
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|error| bundle_io_error("CUDA bundle root is unavailable", &error))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(bundle_error("CUDA bundle root must be a real owned directory"));
+    }
+    root.canonicalize()
+        .map_err(|error| bundle_io_error("cannot resolve CUDA bundle root", &error))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_bundle_file_length(file: &File, expected: u64) -> Result<(), BackendError> {
+    let metadata = file.metadata()
+        .map_err(|error| bundle_io_error("CUDA bundle opened file metadata failed", &error))?;
+    if !metadata.is_file() || metadata.len() != expected {
+        return Err(bundle_identity_error("CUDA bundle file size differs"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn stream_bundle_file(
+    reader: &mut File,
+    mut writer: Option<&mut File>,
+    expected_bytes: u64,
+) -> Result<[u8; 32], BackendError> {
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut remaining = expected_bytes;
+    let mut digest = Sha256::new();
+    while remaining > 0 {
+        let capacity = remaining.min(buffer.len() as u64) as usize;
+        let count = reader.read(&mut buffer[..capacity])
+            .map_err(|error| bundle_io_error("cannot read CUDA bundle bytes", &error))?;
+        if count == 0 {
+            return Err(bundle_identity_error("CUDA bundle bytes ended before declared size"));
+        }
+        if let Some(writer) = writer.as_mut() {
+            writer.write_all(&buffer[..count])
+                .map_err(|error| bundle_io_error("cannot write CUDA bundle bytes", &error))?;
+        }
+        digest.update(&buffer[..count]);
+        remaining -= count as u64;
+    }
+    if reader.read(&mut buffer[..1])
+        .map_err(|error| bundle_io_error("cannot verify CUDA bundle end", &error))? != 0
+    {
+        return Err(bundle_identity_error("CUDA bundle bytes exceed declared size"));
+    }
+    Ok(digest.finalize().into())
+}
+
+#[cfg(target_os = "linux")]
+fn bundle_identity_error(detail: &'static str) -> BackendError {
+    BackendError::new(K::IdentityMismatch, S::Backend, detail)
+}
+
+#[cfg(target_os = "linux")]
+fn bundle_io_error(detail: &'static str, error: &std::io::Error) -> BackendError {
+    io_error(detail).with_external_cause(crate::error::CauseCode::RuntimePath, error)
 }
 
 fn io_error(detail: &'static str) -> BackendError {
