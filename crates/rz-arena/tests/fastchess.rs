@@ -316,6 +316,62 @@ fn rejects_nonfixture_engines_weights_and_insufficient_process_capacity() {
 }
 
 #[test]
+fn optional_fixture_mode_accepts_only_the_four_literals_behind_fixture_guards() {
+    assert!(
+        !invoke(fixture())
+            .unwrap()
+            .args
+            .iter()
+            .any(|argument| argument
+                .as_encoded_bytes()
+                .starts_with(b"option.FixtureMode=")),
+        "the mode option remains optional"
+    );
+    for mode in ["normal", "crash", "illegal", "timeout"] {
+        let mut input = fixture();
+        input.engines[0]
+            .requested_options
+            .insert("FixtureMode".into(), mode.into());
+        let invocation = invoke(input).unwrap();
+        let expected = OsString::from(format!("option.FixtureMode={mode}"));
+        assert_eq!(
+            invocation
+                .args
+                .iter()
+                .filter(|argument| *argument == &expected)
+                .count(),
+            1
+        );
+        for kind in [EngineKind::RoveZero, EngineKind::Lc0] {
+            let mut input = fixture();
+            input.engines[0].kind = kind;
+            input.engines[0]
+                .requested_options
+                .insert("FixtureMode".into(), mode.into());
+            assert!(
+                invoke(input).is_err(),
+                "product kind {kind:?} cannot consume FixtureMode={mode}"
+            );
+        }
+    }
+    for value in ["Normal", "CRASH", "random", "normal crash", "", "--illegal"] {
+        let mut input = fixture();
+        input.engines[0]
+            .requested_options
+            .insert("FixtureMode".into(), value.into());
+        assert!(
+            invoke(input).is_err(),
+            "accepted noncanonical mode {value:?}"
+        );
+    }
+    let mut input = fixture();
+    input.engines[0]
+        .requested_options
+        .insert("fixtureMode".into(), "normal".into());
+    assert!(invoke(input).is_err());
+}
+
+#[test]
 fn rejects_engine_option_token_injection_unknown_rng_options_and_noncanonical_values() {
     for (name, value) in [
         ("Hash", "1 2"),
@@ -446,4 +502,276 @@ fn constructs_native_non_utf8_engine_paths_without_lossy_conversion() {
             .iter()
             .any(|argument| argument.as_bytes() == b"cmd=/fixture/engine-\xff")
     );
+}
+
+#[cfg(feature = "test-fixtures")]
+mod fixture_mode_binary {
+    //! Actual fixture binary checks, not runner/NN/strength acceptance.
+    use std::{
+        cell::RefCell,
+        io::{self, Read, Write},
+        process::{Child, Command, Output, Stdio},
+        rc::Rc,
+        sync::mpsc::{self, Receiver},
+        thread::{self, JoinHandle},
+        time::{Duration, Instant},
+    };
+
+    const WAIT: Duration = Duration::from_secs(5);
+    const MAX_OUTPUT: usize = 16 * 1024;
+
+    #[derive(Debug, Default)]
+    struct CleanupFailures {
+        kill: Option<io::Error>,
+        poll: Option<io::Error>,
+        reap_timed_out: bool,
+        readers_timed_out: bool,
+        reader_panicked: bool,
+    }
+    impl CleanupFailures {
+        fn is_empty(&self) -> bool {
+            self.kill.is_none()
+                && self.poll.is_none()
+                && !self.reap_timed_out
+                && !self.readers_timed_out
+                && !self.reader_panicked
+        }
+    }
+
+    struct Attempt {
+        child: Child,
+        readers: Vec<JoinHandle<()>>,
+        // The caller retains owned cleanup failures after this guard is dropped.
+        // This local receipt is never shared with the pipe producer threads.
+        cleanup: Rc<RefCell<CleanupFailures>>,
+    }
+    impl Drop for Attempt {
+        fn drop(&mut self) {
+            let mut cleanup = self.cleanup.borrow_mut();
+            if !matches!(self.child.try_wait(), Ok(Some(_))) {
+                cleanup.kill = self.child.kill().err();
+            }
+            let until = Instant::now() + Duration::from_secs(1);
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Err(error) => {
+                        cleanup.poll = Some(error);
+                        break;
+                    }
+                    Ok(None) if Instant::now() >= until => {
+                        cleanup.reap_timed_out = true;
+                        break;
+                    }
+                    Ok(None) => thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            let until = Instant::now() + Duration::from_secs(1);
+            while self.readers.iter().any(|reader| !reader.is_finished()) && Instant::now() < until
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            cleanup.readers_timed_out = self.readers.iter().any(|reader| !reader.is_finished());
+            for reader in self.readers.drain(..) {
+                if reader.is_finished() {
+                    cleanup.reader_panicked |= reader.join().is_err();
+                }
+            }
+        }
+    }
+    fn capture(
+        reader: impl Read + Send + 'static,
+    ) -> (Receiver<io::Result<Vec<u8>>>, JoinHandle<()>) {
+        let (send, recv) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = reader
+                .take((MAX_OUTPUT + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes);
+            let _ = send.send(result);
+        });
+        (recv, reader)
+    }
+    fn run(arguments: &[&str], input: &str) -> Output {
+        assert!(
+            input.len() <= 1024,
+            "one bounded fixture input fits the process pipe"
+        );
+        let child = Command::new(env!("CARGO_BIN_EXE_rz-arena-fixture-engine"))
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the explicitly enabled Cargo fixture binary");
+        let cleanup = Rc::new(RefCell::new(CleanupFailures::default()));
+        let mut attempt = Attempt {
+            child,
+            readers: Vec::new(),
+            cleanup: Rc::clone(&cleanup),
+        };
+        let (stdout, out) = capture(attempt.child.stdout.take().unwrap());
+        let (stderr, err) = capture(attempt.child.stderr.take().unwrap());
+        attempt.readers = vec![out, err];
+        attempt
+            .child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .expect("write bounded fixture command sequence and close stdin");
+        let until = Instant::now() + WAIT;
+        let status = loop {
+            if let Some(status) = attempt.child.try_wait().expect("poll fixture exit") {
+                break status;
+            }
+            assert!(
+                Instant::now() < until,
+                "fixture exceeded its five-second external test deadline"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        let stdout = stdout
+            .recv_timeout(WAIT)
+            .expect("bounded fixture stdout EOF")
+            .expect("read fixture stdout");
+        let stderr = stderr
+            .recv_timeout(WAIT)
+            .expect("bounded fixture stderr EOF")
+            .expect("read fixture stderr");
+        assert!(
+            stdout.len() <= MAX_OUTPUT && stderr.len() <= MAX_OUTPUT,
+            "bounded fixture process evidence"
+        );
+        let output = Output {
+            status,
+            stdout,
+            stderr,
+        };
+        drop(attempt);
+        let cleanup = cleanup.borrow();
+        assert!(
+            cleanup.is_empty(),
+            "fixture cleanup failures retained: {cleanup:?}"
+        );
+        output
+    }
+    fn streams(output: &Output) -> (String, String) {
+        (
+            String::from_utf8(output.stdout.clone()).unwrap(),
+            String::from_utf8(output.stderr.clone()).unwrap(),
+        )
+    }
+
+    #[test]
+    fn crash_mode_option_changes_the_actual_process_exit_after_newgame() {
+        let result = run(
+            &[],
+            "uci\nsetoption name FixtureMode value crash\nucinewgame\nisready\nposition startpos\ngo\n",
+        );
+        assert_eq!(result.status.code(), Some(17));
+        let (protocol, diagnostics) = streams(&result);
+        assert!(protocol.contains("option name FixtureMode type combo default normal var normal var crash var illegal var timeout\n"));
+        assert!(protocol.contains("mode=crash\nreadyok\n"));
+        assert!(!protocol.contains("bestmove"));
+        assert!(
+            diagnostics.contains("synthetic applied Ponder=false Threads=1 Seed=0 mode=crash\n")
+        );
+        assert!(diagnostics.contains("synthetic injected crash: exit 17"));
+    }
+
+    #[test]
+    fn illegal_mode_option_is_applied_and_survives_newgame() {
+        let result = run(
+            &[],
+            "uci\nsetoption name FixtureMode value illegal\nposition startpos moves e2e4 e7e5\ngo\nucinewgame\nisready\nposition startpos\ngo\nquit\n",
+        );
+        assert!(result.status.success());
+        let (protocol, diagnostics) = streams(&result);
+        assert_eq!(
+            protocol
+                .lines()
+                .filter(|line| line.starts_with("bestmove "))
+                .collect::<Vec<_>>(),
+            ["bestmove a1a8", "bestmove a1a8"]
+        );
+        assert!(protocol.contains("mode=illegal\nreadyok\n"));
+        assert!(diagnostics.contains("synthetic go mode=illegal prefix_len=0"));
+    }
+
+    #[test]
+    fn timeout_mode_withholds_reply_until_stop_and_newgame_keeps_the_mode() {
+        let result = run(
+            &[],
+            "uci\nsetoption name FixtureMode value timeout\nposition startpos moves e2e4 e7e5\ngo\nisready\nstop\nucinewgame\nisready\ngo\nisready\nquit\n",
+        );
+        assert!(result.status.success());
+        let (protocol, diagnostics) = streams(&result);
+        let lines: Vec<_> = protocol.lines().collect();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("bestmove "))
+                .copied()
+                .collect::<Vec<_>>(),
+            ["bestmove d1h5"]
+        );
+        let stopped = lines
+            .iter()
+            .position(|line| *line == "bestmove d1h5")
+            .unwrap();
+        let ready = lines.iter().position(|line| *line == "readyok").unwrap();
+        assert!(
+            ready < stopped,
+            "withheld go must permit readyok before its stop reply"
+        );
+        assert_eq!(
+            protocol
+                .lines()
+                .filter(|line| line.contains("mode=timeout"))
+                .count(),
+            3
+        );
+        assert!(diagnostics.contains("synthetic go mode=timeout prefix_len=0"));
+    }
+
+    #[test]
+    fn fixture_cli_initial_mode_is_advertised_and_invalid_mode_values_fail_closed() {
+        let result = run(
+            &["--mode", "illegal"],
+            "uci\nisready\nposition startpos\ngo\nquit\n",
+        );
+        assert!(result.status.success());
+        let (protocol, _) = streams(&result);
+        assert!(protocol.contains("option name FixtureMode type combo default illegal var normal var crash var illegal var timeout\n"));
+        assert!(protocol.contains("bestmove a1a8\n"));
+        for (value, expected) in [
+            (
+                "Normal",
+                "mode must be exactly normal, crash, illegal or timeout",
+            ),
+            (
+                "CRASH",
+                "mode must be exactly normal, crash, illegal or timeout",
+            ),
+            (
+                "random",
+                "mode must be exactly normal, crash, illegal or timeout",
+            ),
+            ("normal extra", "canonical FixtureMode values"),
+        ] {
+            let result = run(
+                &[],
+                &format!("setoption name FixtureMode value {value}\nposition startpos\ngo\n"),
+            );
+            assert_eq!(result.status.code(), Some(2));
+            let (protocol, diagnostics) = streams(&result);
+            assert!(
+                protocol.is_empty(),
+                "invalid option cannot launch a go or emit success"
+            );
+            assert!(diagnostics.contains(expected));
+        }
+    }
 }
