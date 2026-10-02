@@ -1,0 +1,2 @@
+# Standalone validation uses a local lock; I01 owns the future workspace lock.
+/Cargo.lock
