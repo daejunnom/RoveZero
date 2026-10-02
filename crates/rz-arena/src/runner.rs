@@ -279,7 +279,22 @@ fn linux_run(
                     let file = directory
                         .open_with("match.pgn", &options)
                         .map_err(|_| ArenaError::Io("cannot open match PGN".into()))?;
-                    read_pgn(file.into_std(), watch_cap.min(crate::MAX_JSON_BYTES as u64))
+                    let opening_metadata =
+                        directory.symlink_metadata("opening.pgn").map_err(|_| {
+                            ArenaError::Integrity(
+                                "opening artifact unavailable after execution".into(),
+                            )
+                        })?;
+                    if !opening_metadata.is_file() || opening_metadata.len() != opening.len() as u64
+                    {
+                        return Err(ArenaError::Integrity(
+                            "opening artifact length or type changed during execution".into(),
+                        ));
+                    }
+                    read_pgn(
+                        file.into_std(),
+                        (watch_cap - opening_metadata.len()).min(crate::MAX_JSON_BYTES as u64),
+                    )
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

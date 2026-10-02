@@ -74,6 +74,21 @@ fn constructs_the_verified_single_pair_interface_and_accounts_for_book_prefix() 
     assert_eq!(value(args, "-startup-ms"), "1100");
     assert_eq!(value(args, "-ping-ms"), "1100");
     assert_eq!(value(args, "-ucinewgame-ms"), "1200");
+    // Verified against the pinned native runner with a subprocess stdout pipe:
+    // this sink captured setoption/ucinewgame/full position and UCI replies.
+    // Its -debug compatibility parser explicitly rejects that alternative.
+    assert_eq!(value(args, "-log"), "file=/proc/self/fd/1");
+    let log_index = args.iter().position(|argument| argument == "-log").unwrap();
+    assert_eq!(
+        &args[log_index + 1..log_index + 6],
+        &[
+            OsString::from("file=/proc/self/fd/1"),
+            "append=true".into(),
+            "level=trace".into(),
+            "realtime=true".into(),
+            "engine=true".into(),
+        ]
+    );
     for expected in [
         "-repeat",
         "-strict",
@@ -102,6 +117,7 @@ fn constructs_the_verified_single_pair_interface_and_accounts_for_book_prefix() 
         "-sprt",
         "-tb",
         "-force-concurrency",
+        "-debug",
     ] {
         assert!(
             !args.iter().any(|argument| argument == forbidden),
