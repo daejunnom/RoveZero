@@ -1,0 +1,15 @@
+{
+  "verified_utc": "2026-10-02T17:19:46.850468+00:00",
+  "method": "fresh network bare clone followed by remote Git blob byte-SHA256 comparison",
+  "commit_sha": "bb232606e64f6447a96642be41ce56ba049687a4",
+  "archive_files_verified": 238,
+  "archive_total_bytes": 915407,
+  "checksum_entries_verified": 237,
+  "embedded_receipts_verified": 83,
+  "original_json_remote_byte_identical": 52,
+  "hash_mismatches": 0,
+  "manifest_byte_sha256": "a3818aab3cb7443592ed529e2e0a85dd17c94b4954b9435afc23d7b31fa4cbc0",
+  "SHA256SUMS_byte_sha256": "20fd1cb1582896bca807c63255854e231dc6b02e18f4c0cb2501b20610c75914",
+  "originals_retained": true,
+  "archive_url": "https://github.com/daejunnom/RoveZero/tree/bb232606e64f6447a96642be41ce56ba049687a4/experiments/model-research/verification/2026-10-03-f-evidence-v1"
+}

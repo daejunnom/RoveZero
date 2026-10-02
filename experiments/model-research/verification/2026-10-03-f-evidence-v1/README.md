@@ -96,3 +96,8 @@ storage/release attachment의 접근·권리·보존 기간을 먼저 보고하�
 원격 archive 예외를 적용했다. 원래 scratch 자료와 새 검사 raw logs는 삭제하지 않는다.
 원격 tree/blob의 실제 bytes와 SHA256SUMS를 대조한 뒤에만 보존 완료로 보고한다.
 D/E는 각 소유 경로·작업의 범위이며 이 F archive에는 해당 역할 파일을 섞지 않았다.
+
+첫 원격 byte 검증의 원본 영수증은 [remote/verification-bb23260.json](remote/verification-bb23260.json)에
+보존했다. 이 영수증은 자신을 추가하기 전의 immutable commit을 검증한 기록이다.
+영수증/index 추가 뒤 최종 commit의 모든 blob도 다시 대조하고, 최종 raw 검증 결과는
+기존 PR #2 본문에 기록한다. 원본이나 과거 commit의 검증 기록을 덮어쓰지 않는다.

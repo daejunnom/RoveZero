@@ -14,8 +14,8 @@
     },
     {
       "path": "README.md",
-      "size_bytes": 7199,
-      "byte_sha256": "d2a6ff3111bfaa0223f70b824e04d660f61b87388b996a797bd5ccb002c92498",
+      "size_bytes": 7639,
+      "byte_sha256": "e64aa3c0cf2a45c7b769e0bd500d9c5a0635843aff4b764b20a1b555ca26924b",
       "origin": "preservation_harness_or_document",
       "synthetic": false,
       "source_git_sha": "36e619bae238a587e04c0a4bae24624eb5414aec",
@@ -2676,6 +2676,15 @@
       "embedded_payload_digest": "0232cafab69cc4cee02dac8fa3d3eaaeb69ae3f25192c6d6adbbbf998409a7e4"
     },
     {
+      "path": "remote/verification-bb23260.json",
+      "size_bytes": 804,
+      "byte_sha256": "d880a700f399d3b48fc0c2c065ac760d36f9a6cfac57f4ae205857c015732135",
+      "origin": "first_remote_blob_verification_receipt",
+      "synthetic": false,
+      "source_git_sha": "bb232606e64f6447a96642be41ce56ba049687a4",
+      "source_binding_status": "fresh_network_clone_snapshot_verified"
+    },
+    {
       "path": "reproduce.py",
       "size_bytes": 10168,
       "byte_sha256": "cbbfb8791b48eada9da633abea14018374f8875df939114e50c29aca8caf9a84",
@@ -2694,8 +2703,8 @@
       "classification": "archive_helper_only; no implementation_feature_change"
     }
   ],
-  "indexed_files": 236,
-  "indexed_bytes": 755453,
+  "indexed_files": 237,
+  "indexed_bytes": 756697,
   "largest_file_bytes": 22116,
   "manifest_self_and_SHA256SUMS": "Excluded from this index to avoid self-reference; SHA256SUMS covers manifest and all other files",
   "original_json_files": 52,
