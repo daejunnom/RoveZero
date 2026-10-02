@@ -10,7 +10,7 @@ def canonical_bytes(value: object) -> bytes:
     try:
         return json.dumps(value, sort_keys=True, separators=(",", ":"),
                           ensure_ascii=False, allow_nan=False).encode("utf-8")
-    except (TypeError, ValueError, UnicodeError) as exc:
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
         raise DataError("InvalidJson", "json", str(exc)) from exc
 
 
