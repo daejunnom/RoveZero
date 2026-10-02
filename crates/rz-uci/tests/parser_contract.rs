@@ -236,6 +236,61 @@ fn option_parser_preserves_multiword_names_values_buttons_and_empty_strings() {
 }
 
 #[test]
+fn option_payloads_preserve_internal_spaces_and_only_trim_syntax_boundaries() {
+    for (line, name, value) in [
+        (
+            "setoption name Use  Cache value true",
+            "Use  Cache",
+            Some("true"),
+        ),
+        (
+            "setoption name Search Mode value Very  Fast",
+            "Search Mode",
+            Some("Very  Fast"),
+        ),
+        (
+            "\tsetoption\tname\tWeights  File \tvalue\tmodel  small.onnx\t\r\n",
+            "Weights  File",
+            Some("model  small.onnx"),
+        ),
+        (
+            "setoption name Weights value first value  second",
+            "Weights",
+            Some("first value  second"),
+        ),
+        ("setoption name Clear  Hash \t", "Clear  Hash", None),
+        ("setoption name Weights value \t", "Weights", Some("")),
+    ] {
+        assert_eq!(
+            parse_default(line),
+            Ok(Command::SetOption {
+                name: name.into(),
+                value: value.map(str::to_owned),
+            }),
+            "{line:?}"
+        );
+    }
+}
+
+#[test]
+fn option_byte_limits_measure_the_preserved_payload() {
+    let bounded = ParserLimits {
+        max_option_name_bytes: 3,
+        max_option_value_bytes: 3,
+        ..ParserLimits::default()
+    };
+    assert!(parse("setoption name A B value x y", bounded).is_ok());
+    assert_eq!(
+        parse("setoption name A  B value x y", bounded),
+        Err(ParseError::Limit("option name"))
+    );
+    assert_eq!(
+        parse("setoption name A B value x  y", bounded),
+        Err(ParseError::Limit("option value"))
+    );
+}
+
+#[test]
 fn configured_external_input_limits_are_enforced_at_the_boundary() {
     let short_line = ParserLimits {
         max_line_bytes: 3,

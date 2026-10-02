@@ -33,11 +33,15 @@ pub enum ServeFailure<E> {
     Handler(E),
 }
 
-/// Original failure and any explicit cancellation/shutdown failures are kept.
+/// Original failure, prepared event diagnostics, and explicit shutdown failures
+/// are kept independently, even when effect dispatch or output prevents logging.
 #[derive(Debug)]
 pub struct ServeError<E> {
     pub failure: ServeFailure<E>,
     pub cleanup_failures: Vec<E>,
+    /// All diagnostics prepared by the failed event and cleanup. Some may already
+    /// have reached the diagnostic writer before its write/flush failed.
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 impl<E: fmt::Display> fmt::Display for ServeError<E> {
@@ -48,6 +52,9 @@ impl<E: fmt::Display> fmt::Display for ServeError<E> {
         }
         for err in &self.cleanup_failures {
             write!(f, "; shutdown dispatch failed: {err}")?;
+        }
+        for diagnostic in &self.diagnostics {
+            write!(f, "; {}: {}", diagnostic.code, diagnostic.message)?;
         }
         Ok(())
     }
@@ -144,6 +151,7 @@ where
         let result = emit(out, protocol, diagnostics, &mut dispatch);
         if let Err(mut error) = result {
             let shutdown = session.end_of_input();
+            error.diagnostics.extend(shutdown.diagnostics);
             for effect in shutdown.effects {
                 if let Err(err) = dispatch(effect) {
                     error.cleanup_failures.push(err);
@@ -185,24 +193,26 @@ where
         return Err(ServeError {
             failure: ServeFailure::Handler(error),
             cleanup_failures,
+            diagnostics: out.diagnostics,
         });
     }
-    for line in out.protocol {
-        writeln!(protocol, "{line}").map_err(io_failure)?;
-    }
-    protocol.flush().map_err(io_failure)?;
-    for diagnostic in out.diagnostics {
-        writeln!(diagnostics, "{}: {}", diagnostic.code, diagnostic.message).map_err(io_failure)?;
-    }
-    diagnostics.flush().map_err(io_failure)?;
-    Ok(())
-}
-
-fn io_failure<E>(error: io::Error) -> ServeError<E> {
-    ServeError {
+    // Borrow the prepared diagnostics while writing so a protocol/diagnostic
+    // write or flush failure can return the complete original event evidence.
+    let written = (|| -> io::Result<()> {
+        for line in out.protocol {
+            writeln!(protocol, "{line}")?;
+        }
+        protocol.flush()?;
+        for diagnostic in &out.diagnostics {
+            writeln!(diagnostics, "{}: {}", diagnostic.code, diagnostic.message)?;
+        }
+        diagnostics.flush()
+    })();
+    written.map_err(|error| ServeError {
         failure: ServeFailure::Io(error),
         cleanup_failures: Vec::new(),
-    }
+        diagnostics: out.diagnostics,
+    })
 }
 
 /// Optional blocking input producer, normally run by the transport on its own

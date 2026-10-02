@@ -597,22 +597,57 @@ fn common_evaluator_success_echoes_the_actual_physical_execution() {
 }
 
 #[test]
-fn foreign_epoch_or_deadline_clock_is_rejected_without_a_completion() {
+fn foreign_clock_domain_is_rejected_without_a_completion() {
     let mut fixture = fixture(2);
     for request in [
-        request_in_domain(1, ProcessEpoch(8), CLOCK_DOMAIN, 100),
-        request_in_domain(2, EPOCH, ClockDomain(ProcessEpoch(8)), 100),
+        request_in_domain(1, ProcessEpoch(8), ClockDomain(ProcessEpoch(8)), 100),
+        request_in_domain(2, ProcessEpoch(9), ClockDomain(ProcessEpoch(9)), 100),
     ] {
+        // Each request is internally valid. The runtime owns a different
+        // process/clock domain and must refuse it without scheduling work.
         let error = fixture.runtime.submit(request).unwrap_err();
-        assert!(matches!(
-            error.code,
-            ErrorCode::IdentityMismatch | ErrorCode::InvalidInput
-        ));
+        assert_eq!(error.code, ErrorCode::IdentityMismatch);
+        assert_eq!(error.stage, Stage::Admission);
         assert_eq!(fixture.runtime.state().reserved_requests, 0);
         assert_eq!(fixture.runtime.state().reserved, Resources::default());
         assert!(fixture.runtime.poll().is_none());
     }
     assert!(fixture.backend.executions.lock().unwrap().is_empty());
+    // IDs from rejected foreign epochs cannot consume this runtime's sequence.
+    fixture.runtime.submit(request(1, 100)).unwrap();
+    assert!(matches!(
+        complete(&mut fixture.runtime),
+        EvalResult::Completed(_)
+    ));
+    assert!(fixture.runtime.poll().is_none());
+}
+
+#[test]
+fn request_constructor_rejects_mixed_request_selection_and_deadline_epochs() {
+    let valid = request(1, 100);
+    for changed_field in ["request", "selection", "deadline"] {
+        let mut context = valid.context();
+        let mut deadline = valid.deadline();
+        match changed_field {
+            "request" => context.request.epoch = ProcessEpoch(8),
+            "selection" => context.selection.epoch = ProcessEpoch(8),
+            "deadline" => deadline.clock = ClockDomain(ProcessEpoch(8)),
+            _ => unreachable!(),
+        }
+        let error = EvalRequest::try_new(
+            context,
+            valid.position().clone(),
+            valid.legal().clone(),
+            Arc::clone(valid.model()),
+            deadline,
+            valid.cancel_token().clone(),
+            valid.byte_budget(),
+        )
+        .err()
+        .expect("internally mixed epochs must be refused by the constructor");
+        assert_eq!(error.code, ErrorCode::IdentityMismatch, "{changed_field}");
+        assert_eq!(error.stage, Stage::Admission, "{changed_field}");
+    }
 }
 
 #[test]

@@ -1,9 +1,13 @@
+use rz_search::time::TimeBudgetConfig;
+use rz_uci::bridge::{BuildSearchSettings, SearchBinding, SideToMove};
 use rz_uci::{
     Effect, EngineIdentity, Event, ParserLimits, PositionPort, PositionSpec, PreparedPosition,
-    ServeFailure, Session, forward_lines, handle_event, serve_events, serve_events_with_handler,
+    SearchCompletion, ServeFailure, Session, forward_lines, handle_event, serve_events,
+    serve_events_with_handler,
 };
 use std::io::{self, Cursor, Write};
 use std::sync::mpsc::sync_channel;
+use std::time::{Duration, Instant};
 
 struct Fixture;
 impl PositionPort for Fixture {
@@ -327,6 +331,170 @@ fn quit_cancel_failure_still_attempts_shutdown() {
     ));
     assert_eq!(error.cleanup_failures, vec!["shutdown failed"]);
     assert!(shutdown_called);
+}
+
+#[test]
+fn late_provider_failure_survives_cancel_dispatch_and_shutdown_failures() {
+    let start = Instant::now();
+    let mut session = session();
+    let started = session.handle_line("go movetime 1000");
+    let Effect::Start { ticket, limits, .. } = &started.effects[0] else {
+        panic!("expected search start");
+    };
+    let binding = SearchBinding::new(
+        ticket.clone(),
+        limits,
+        SideToMove::White,
+        start,
+        BuildSearchSettings {
+            time_config: TimeBudgetConfig::default(),
+            max_simulations: 64,
+            untimed_limit: Duration::from_secs(1),
+        },
+    )
+    .unwrap();
+    let (tx, rx) = sync_channel(1);
+    tx.send(Event::Complete {
+        ticket: ticket.clone(),
+        completion: SearchCompletion::Failed {
+            code: "ProviderFailure".into(),
+            message: "original inference failed".into(),
+        },
+    })
+    .unwrap();
+    let mut protocol = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut effects = Vec::new();
+    let error = serve_events_with_handler(
+        &mut session,
+        &rx,
+        &mut protocol,
+        &mut diagnostics,
+        |session, event| match event {
+            Event::Complete { completion, .. } => {
+                binding.complete(session, completion, binding.budget().hard_deadline)
+            }
+            event => handle_event(session, event),
+        },
+        |effect| {
+            let failure = match &effect {
+                Effect::Cancel { .. } => "cancel failed",
+                Effect::Shutdown => "shutdown failed",
+                _ => panic!("unexpected effect"),
+            };
+            effects.push(effect);
+            Err(failure)
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.failure,
+        ServeFailure::Handler("cancel failed")
+    ));
+    assert_eq!(error.cleanup_failures, ["shutdown failed"]);
+    assert!(error.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "SearchFailed"
+            && diagnostic.message == "ProviderFailure: original inference failed"
+    }));
+    assert!(
+        error
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SearchExpired")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("ProviderFailure: original inference failed")
+    );
+    assert!(protocol.is_empty());
+    assert!(diagnostics.is_empty());
+    assert_eq!(effects.len(), 2);
+    assert!(matches!(effects[0], Effect::Cancel { .. }));
+    assert!(matches!(effects[1], Effect::Shutdown));
+    assert!(session.is_closed());
+}
+
+struct FaultWriter {
+    fail_write: bool,
+    fail_flush: bool,
+    bytes: Vec<u8>,
+}
+
+impl Write for FaultWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self.fail_write {
+            return Err(io::Error::other("output write failed"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.fail_flush {
+            Err(io::Error::other("output flush failed"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn provider_diagnostics_survive_protocol_and_diagnostic_write_or_flush_failures() {
+    for (fail_protocol, fail_flush) in [(true, false), (true, true), (false, false), (false, true)]
+    {
+        let mut session = session();
+        session.handle_line("go nodes 10");
+        let ticket = session.active_ticket().unwrap();
+        let (tx, rx) = sync_channel(1);
+        tx.send(Event::Complete {
+            ticket,
+            completion: SearchCompletion::Failed {
+                code: "ProviderFailure".into(),
+                message: "original inference failed".into(),
+            },
+        })
+        .unwrap();
+        let mut protocol = FaultWriter {
+            fail_write: fail_protocol && !fail_flush,
+            fail_flush: fail_protocol && fail_flush,
+            bytes: Vec::new(),
+        };
+        let mut diagnostics = FaultWriter {
+            fail_write: !fail_protocol && !fail_flush,
+            fail_flush: !fail_protocol && fail_flush,
+            bytes: Vec::new(),
+        };
+        let mut shutdown_called = false;
+        let error = serve_events(
+            &mut session,
+            &rx,
+            &mut protocol,
+            &mut diagnostics,
+            |effect| {
+                assert!(matches!(effect, Effect::Shutdown));
+                shutdown_called = true;
+                Err("shutdown failed")
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error.failure, ServeFailure::Io(_)));
+        assert_eq!(error.cleanup_failures, ["shutdown failed"]);
+        assert!(error.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "SearchFailed"
+                && diagnostic.message == "ProviderFailure: original inference failed"
+        }));
+        assert!(
+            error
+                .to_string()
+                .contains("ProviderFailure: original inference failed")
+        );
+        assert!(shutdown_called);
+        assert!(session.is_closed());
+        if !fail_protocol {
+            assert_eq!(protocol.bytes, b"bestmove e2e4\n");
+        }
+    }
 }
 
 struct BrokenWriter;

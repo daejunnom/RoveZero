@@ -123,7 +123,7 @@ pub fn parse(line: &str, limits: ParserLimits) -> Result<Command, ParseError> {
         "stop" => no_args(tail, Command::Stop),
         "quit" => no_args(tail, Command::Quit),
         "ucinewgame" => no_args(tail, Command::NewGame),
-        "setoption" => parse_option(tail, limits),
+        "setoption" => parse_option(line, limits),
         "position" => parse_position(tail, limits),
         "go" => parse_go(tail),
         "ponderhit" => Err(ParseError::Unsupported(head.to_owned())),
@@ -139,29 +139,53 @@ fn no_args(fields: &[&str], command: Command) -> Result<Command, ParseError> {
     }
 }
 
-fn parse_option(fields: &[&str], limits: ParserLimits) -> Result<Command, ParseError> {
-    if fields.first() != Some(&"name") {
+fn parse_option(line: &str, limits: ParserLimits) -> Result<Command, ParseError> {
+    let (_, after_command) = split_token(line).ok_or(ParseError::Empty)?;
+    let Some((keyword, after_name)) = split_token(after_command) else {
+        return Err(ParseError::Malformed("setoption requires name"));
+    };
+    if keyword != "name" {
         return Err(ParseError::Malformed("setoption requires name"));
     }
-    let value_at = fields.iter().position(|field| *field == "value");
-    let name_end = value_at.unwrap_or(fields.len());
-    if name_end <= 1 {
+    // Only syntax separators are trimmed. Option names, combo choices and string
+    // paths are literal payloads; joining whitespace tokens silently changes them.
+    let payload = after_name.trim_ascii_start();
+    let mut tail = payload;
+    let mut name_end = payload.len();
+    let mut value = None;
+    while let Some((token, remainder)) = split_token(tail) {
+        if token == "value" {
+            name_end = payload.len() - tail.trim_ascii_start().len();
+            value = Some(remainder.trim_ascii());
+            break;
+        }
+        tail = remainder;
+    }
+    let name = payload[..name_end].trim_ascii();
+    if name.is_empty() {
         return Err(ParseError::Malformed("option name is empty"));
     }
-    if joined_bytes(&fields[1..name_end]) > limits.max_option_name_bytes {
+    if name.len() > limits.max_option_name_bytes {
         return Err(ParseError::Limit("option name"));
     }
-    if value_at.is_some_and(|at| joined_bytes(&fields[at + 1..]) > limits.max_option_value_bytes) {
+    if value.is_some_and(|text| text.len() > limits.max_option_value_bytes) {
         return Err(ParseError::Limit("option value"));
     }
-    let name = fields[1..name_end].join(" ");
-    let value = value_at.map(|at| fields[at + 1..].join(" "));
-    Ok(Command::SetOption { name, value })
+    Ok(Command::SetOption {
+        name: name.to_owned(),
+        value: value.map(str::to_owned),
+    })
 }
 
-fn joined_bytes(fields: &[&str]) -> usize {
-    // Fields are disjoint slices of an already bounded physical input line.
-    fields.iter().map(|field| field.len()).sum::<usize>() + fields.len().saturating_sub(1)
+fn split_token(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim_ascii_start();
+    if line.is_empty() {
+        return None;
+    }
+    let end = line
+        .find(|character: char| character.is_ascii_whitespace())
+        .unwrap_or(line.len());
+    Some((&line[..end], &line[end..]))
 }
 
 fn parse_position(fields: &[&str], limits: ParserLimits) -> Result<Command, ParseError> {
