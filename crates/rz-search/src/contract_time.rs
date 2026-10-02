@@ -45,6 +45,15 @@ impl InstantClock {
     }
 
     pub fn tick_at(&self, instant: Instant) -> Result<MonotonicTick, ContractError> {
+        // Windows checked_duration_since can treat a small negative interval as
+        // zero. The owned clock contract rejects every pre-origin Instant.
+        if instant < self.origin {
+            return Err(ContractError::new(
+                ErrorCode::InvalidInput,
+                Stage::Admission,
+                "Instant precedes the owned clock origin",
+            ));
+        }
         let elapsed = instant.checked_duration_since(self.origin).ok_or_else(|| {
             ContractError::new(
                 ErrorCode::InvalidInput,
@@ -281,6 +290,7 @@ mod tests {
         let origin = Instant::now();
         let clock = InstantClock::new(domain(), origin);
         let before = origin.checked_sub(Duration::from_nanos(1)).unwrap();
+        assert!(before < origin);
         assert_eq!(
             clock.tick_at(before).unwrap_err().code,
             ErrorCode::InvalidInput
