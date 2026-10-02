@@ -461,7 +461,7 @@ fn missing_or_unknown_provider_is_rejected_without_cpu_fallback() {
         (Vec::new(), "requires --cpu-mock"),
         (
             vec!["--cpu-mock", "--provider=unknown"],
-            "unsupported argument: --provider=unknown",
+            "unsupported argument; supported flags: --cpu-mock",
         ),
     ] {
         let mut engine = Engine::spawn(&arguments);

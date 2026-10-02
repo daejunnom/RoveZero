@@ -13,6 +13,9 @@ use rz_encoding::{policy, POLICY_SIZE};
 use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
 
+pub use crate::native_runtime_bridge::{
+    NativeDiagnosticBatch, NativeDiagnosticReceipt, NativeRuntimeBackend, NativeWorkerOwner,
+};
 pub use crate::rules_projection::{ClassicalProjection, RulesProjection};
 pub use crate::runtime_bridge::{BridgeDiagnostics, MockTicket, ScriptedRuntimeBackend};
 
@@ -239,19 +242,35 @@ impl<P> PreparedRequest<P> {
         raw: &RawOutput,
         execution: ExecutionId,
     ) -> Result<EvalOutput, ContractError> {
+        self.physical_output(raw, execution)
+            .map_err(|failure| failure.contract)
+    }
+
+    /// Physical conversion with the bounded model-validator cause retained for
+    /// the runtime owner. Common-only callers can keep using `output` above.
+    pub fn physical_output(
+        &self,
+        raw: &RawOutput,
+        execution: ExecutionId,
+    ) -> Result<EvalOutput, PhysicalFailure> {
         let context = self.request.context();
         if execution.epoch != context.request.epoch {
             return Err(error(
                 ErrorCode::IdentityMismatch,
                 Stage::Output,
                 "physical execution belongs to a different epoch",
-            ));
+            )
+            .into());
         }
-        let heads = output::validate_maia(raw, &self.indices).map_err(|_| {
-            error(
-                ErrorCode::NumericalFailure,
-                Stage::Output,
-                "invalid Maia policy/WDL heads",
+        let heads = output::validate_maia(raw, &self.indices).map_err(|failure| {
+            let kind = if matches!(failure, output::OutputError::AllocationFailed) {
+                FailureKind::ResourceExhausted
+            } else {
+                FailureKind::NumericalFailure
+            };
+            PhysicalFailure::from(
+                BackendError::new(kind, FailureStage::Output, "invalid Maia policy/WDL heads")
+                    .with_output_cause(&failure),
             )
         })?;
         let [w, d, l] = heads.wdl();
@@ -339,7 +358,7 @@ pub type OnnxWorker<P> =
 
 /// Preserve bounded native cause beside the common error. D can retain this
 /// local evidence before publishing EvalFailure with its own completion context.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PhysicalFailure {
     pub contract: ContractError,
     pub backend: Option<BackendError>,
@@ -399,11 +418,7 @@ pub fn spawn_onnx_worker<P: Send + Sync + 'static>(
             .requests()
             .iter()
             .zip(raw)
-            .map(|(request, raw)| {
-                request
-                    .output(&raw, batch.execution())
-                    .map_err(PhysicalFailure::from)
-            })
+            .map(|(request, raw)| request.physical_output(&raw, batch.execution()))
             .collect()
     })
     .map_err(|failure| backend_error(&failure))

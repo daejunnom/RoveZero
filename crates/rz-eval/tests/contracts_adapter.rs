@@ -343,3 +343,50 @@ fn native_failure_keeps_bounded_local_cause_without_putting_it_in_common_error()
     assert!(diagnostic.truncated);
     assert!(!format!("{failure:?}").contains("diagnostic-path"));
 }
+
+#[test]
+fn physical_output_retains_typed_validator_failure_and_common_wrapper_compatibility() {
+    use rz_eval::error::{CauseCode, OutputCause, OutputHead};
+    let fixture = Fixture::new(false);
+    let prepared = fixture
+        .binding
+        .prepare(fixture.request(|_| {}), fixture.input())
+        .unwrap();
+    let execution = ExecutionId::new(ProcessEpoch(10), 13);
+    let mut invalid = raw();
+    // This raw head entry is outside the fixture's legal move indices; complete
+    // model-head validation must still retain its exact failing index.
+    invalid.policy_logits[1857] = f32::NAN;
+    let failure = prepared.physical_output(&invalid, execution).unwrap_err();
+    assert_eq!(failure.contract.code, ErrorCode::NumericalFailure);
+    assert_eq!(failure.contract.stage, Stage::Output);
+    let receipt = failure.backend.as_ref().unwrap().cause.unwrap();
+    assert_eq!(receipt.code, CauseCode::OutputValidation);
+    assert_eq!(
+        receipt.output,
+        Some(OutputCause::NonFinite {
+            head: OutputHead::Policy,
+            index: 1857,
+        })
+    );
+    assert_eq!(
+        failure.clone().backend.as_ref().unwrap().cause,
+        Some(receipt)
+    );
+    assert_eq!(
+        prepared.output(&invalid, execution).unwrap_err().code,
+        failure.contract.code
+    );
+
+    let mut missing = raw();
+    missing.wdl.pop();
+    let failure = prepared.physical_output(&missing, execution).unwrap_err();
+    assert_eq!(
+        failure.backend.unwrap().cause.unwrap().output,
+        Some(OutputCause::WrongShape {
+            head: OutputHead::Wdl,
+            actual: 2,
+            expected: 3,
+        })
+    );
+}

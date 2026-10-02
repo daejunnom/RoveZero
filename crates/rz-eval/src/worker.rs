@@ -1,9 +1,9 @@
 //! One bounded physical worker, suitable for a runtime Backend lease adapter.
 //! No queue policy, deadlines, request IDs, cancellation or logical finalization.
 
-use crate::error::{BackendError, FailureKind as K, FailureStage as S};
+use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 
 const IDLE: u8 = 0;
 const BUSY: u8 = 1;
@@ -13,6 +13,7 @@ const QUARANTINED: u8 = 3;
 struct Job<J, R> {
     input: Arc<J>,
     completion: mpsc::SyncSender<R>,
+    quarantine_cause: Arc<Mutex<Option<BackendError>>>,
 }
 
 pub struct SingleWorker<J, R> {
@@ -23,8 +24,8 @@ pub struct SingleWorker<J, R> {
 pub struct PhysicalLease<J, R> {
     input: Arc<J>,
     completion: mpsc::Receiver<R>,
-    state: Arc<AtomicU8>,
     consumed: bool,
+    quarantine_cause: Arc<Mutex<Option<BackendError>>>,
 }
 
 pub enum PhysicalPoll<R> {
@@ -60,10 +61,17 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
                             worker_state.store(IDLE, Ordering::Release);
                             let _ = job.completion.send(output);
                         }
-                        Err(_) => {
+                        Err(payload) => {
                             // Rust unwinding alone cannot attest GPU synchronization.
                             // Deliberately retain backend/inputs until process exit;
                             // no retry, no Ready, no reservation-release permission.
+                            let cause = panic_failure(payload.as_ref());
+                            // Per-job receipt: a later job's panic must not be
+                            // attributed to an earlier completed physical lease.
+                            match job.quarantine_cause.lock() {
+                                Ok(mut slot) => *slot = Some(cause),
+                                Err(poisoned) => *poisoned.into_inner() = Some(cause),
+                            }
                             std::mem::forget(job);
                             std::mem::forget(run);
                             worker_state.store(QUARANTINED, Ordering::Release);
@@ -100,11 +108,13 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
             })?;
         let (completion, receiver) = mpsc::sync_channel(1);
         let input = Arc::new(input);
+        let quarantine_cause = Arc::new(Mutex::new(None));
         if self
             .sender
             .try_send(Job {
                 input: Arc::clone(&input),
                 completion,
+                quarantine_cause: Arc::clone(&quarantine_cause),
             })
             .is_err()
         {
@@ -118,8 +128,8 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
         Ok(PhysicalLease {
             input,
             completion: receiver,
-            state: Arc::clone(&self.state),
             consumed: false,
+            quarantine_cause,
         })
     }
 }
@@ -127,6 +137,23 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
 impl<J, R> PhysicalLease<J, R> {
     pub fn input(&self) -> &J {
         &self.input
+    }
+
+    /// Bounded per-job evidence, not completion or permission to release pins.
+    /// A panic receipt is published before the QUARANTINED Release transition.
+    /// Reading raw NativeDiagnostic text remains an explicit local operation.
+    pub fn quarantine_cause(&self) -> Result<Option<BackendError>, BackendError> {
+        self.quarantine_cause
+            .lock()
+            .map(|slot| slot.clone())
+            .map_err(|error| {
+                BackendError::new(
+                    K::BackendFailure,
+                    S::Backend,
+                    "physical worker quarantine receipt lock is poisoned",
+                )
+                .with_external_cause(CauseCode::RuntimePanic, &error)
+            })
     }
 
     /// Nonblocking. Each owned output can be obtained exactly once, independently
@@ -140,11 +167,103 @@ impl<J, R> PhysicalLease<J, R> {
                 self.consumed = true;
                 PhysicalPoll::Ready(result)
             }
-            Err(mpsc::TryRecvError::Empty) if self.state.load(Ordering::Acquire) != QUARANTINED => {
-                PhysicalPoll::Pending
-            }
+            Err(mpsc::TryRecvError::Empty) => self.poll_empty(),
             // Unexpected disconnection is also not proof of physical completion.
-            Err(_) => PhysicalPoll::Quarantined,
+            Err(mpsc::TryRecvError::Disconnected) => PhysicalPoll::Quarantined,
         }
+    }
+
+    fn poll_empty(&self) -> PhysicalPoll<R> {
+        // The worker's admission state can belong to a later job by now. Only
+        // this job's own receipt may quarantine an observed Empty completion.
+        // Its output may also have arrived since try_recv: Pending is safe and
+        // the next poll will consume it; an unrelated job's panic is irrelevant.
+        match self.quarantine_cause.lock() {
+            Ok(slot) if slot.is_none() => PhysicalPoll::Pending,
+            _ => PhysicalPoll::Quarantined,
+        }
+    }
+}
+
+fn panic_failure(payload: &(dyn std::any::Any + Send)) -> BackendError {
+    let error = BackendError::new(
+        K::BackendFailure,
+        S::Backend,
+        "physical worker unwound; completion is unknown",
+    );
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        error
+            .with_external_cause(CauseCode::RuntimePanic, message)
+            .with_diagnostic("WorkerPanic", message)
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        error
+            .with_external_cause(CauseCode::RuntimePanic, message)
+            .with_diagnostic("WorkerPanic", message)
+    } else {
+        // Any need not implement Display/Debug; do not invent its original text.
+        let unknown = "non-string physical worker panic payload";
+        error
+            .with_external_cause(CauseCode::RuntimePanic, &unknown)
+            .with_diagnostic("WorkerPanicNonString", unknown)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn wait_until(mut check: impl FnMut() -> bool) {
+        let stop = Instant::now() + Duration::from_secs(2);
+        while !check() {
+            assert!(
+                Instant::now() < stop,
+                "worker race fixture exceeded its budget"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn an_empty_observation_stays_pending_when_a_later_job_quarantines() {
+        let (entered, entering) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let mut worker = SingleWorker::spawn(move |input: &u8| {
+            if *input == 0 {
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(2)).unwrap();
+                return 0;
+            }
+            panic!("later job's injected unwind");
+        })
+        .unwrap();
+        let mut first = worker.submit(0).unwrap();
+        entering.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Freeze the exact interleaving between production poll's Empty receipt
+        // and its Empty classification, without timing sleeps or a public hook.
+        assert!(matches!(
+            first.completion.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        let mut next = None;
+        wait_until(|| match worker.submit(1) {
+            Ok(lease) => {
+                next = Some(lease);
+                true
+            }
+            Err(error) => {
+                assert_eq!(error.kind, K::ResourceExhausted);
+                false
+            }
+        });
+        let mut next = next.unwrap();
+        wait_until(|| matches!(next.poll(), PhysicalPoll::Quarantined));
+        wait_until(|| worker.state.load(Ordering::Acquire) == QUARANTINED);
+        assert!(next.quarantine_cause().unwrap().is_some());
+        assert!(first.quarantine_cause().unwrap().is_none());
+        assert!(matches!(first.poll_empty(), PhysicalPoll::Pending));
+        assert!(matches!(first.poll(), PhysicalPoll::Ready(0)));
+        assert!(matches!(first.poll(), PhysicalPoll::Consumed));
     }
 }

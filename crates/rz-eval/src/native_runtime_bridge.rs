@@ -1,0 +1,792 @@
+//! One owned native physical worker at D's cooperative Backend boundary.
+//!
+//! Bootstrap loads the CPU session once. Per-root runtimes share this owner and
+//! never initialize ORT inside `dispatch`. Logical cancellation belongs to D/B;
+//! only a physically completed worker result permits Ready and pin release.
+
+use crate::{
+    contracts::{backend_error, PhysicalFailure, PreparedBatch},
+    error::{BackendError, CauseCode, FailureKind, FailureStage},
+    rules_projection::ClassicalProjection,
+    worker::{PhysicalLease, PhysicalPoll, SingleWorker},
+};
+use rz_contracts::*;
+use rz_position::contracts::RulesState;
+use rz_runtime::contracts::{ContractClock, ContractsAdapter, RuntimeRequest};
+use rz_runtime::{Backend, BackendResult, Resources};
+use std::{
+    sync::{Arc, Mutex, MutexGuard, TryLockError},
+    task::Poll,
+};
+
+pub type NativePhysicalWorker =
+    SingleWorker<PreparedBatch<RulesState>, Result<Vec<EvalOutput>, PhysicalFailure>>;
+type NativePhysicalLease =
+    PhysicalLease<PreparedBatch<RulesState>, Result<Vec<EvalOutput>, PhysicalFailure>>;
+type NativeDelivery<C> = Vec<BackendResult<ContractsAdapter<RulesState, C>>>;
+type PreparedDispatch<C> = Result<(NativePhysicalLease, NativeDelivery<C>), PhysicalFailure>;
+
+pub const NATIVE_RUNTIME_OVERHEAD_BYTES: u64 = 4096;
+const MAX_DIAGNOSTICS: usize = 4096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeWorkerOrigin {
+    Injected,
+    CpuOnnx,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeDiagnosticKind {
+    DispatchRefused,
+    PhysicalFailure,
+    Quarantined,
+}
+
+/// Native text stays bounded and hidden by BackendError's ordinary Debug/Display.
+/// `ticket` includes a burned dispatch attempt; `context.execution` is Some only
+/// after the physical worker accepted that input.
+#[derive(Clone, Debug)]
+pub struct NativeDiagnosticReceipt {
+    pub ticket: (ExecutionId, RequestId),
+    pub context: CompletionContext,
+    pub kind: NativeDiagnosticKind,
+    pub failure: PhysicalFailure,
+}
+
+#[derive(Debug)]
+pub struct NativeDiagnosticBatch {
+    pub entries: Vec<NativeDiagnosticReceipt>,
+    pub boundary_error: Option<ContractError>,
+    pub poison_error: Option<ContractError>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NativeOwnerStatus {
+    pub active: bool,
+    pub admission_error: Option<ContractError>,
+    pub occupied_diagnostics: usize,
+    pub reserved_diagnostics: usize,
+}
+
+struct OwnerState {
+    worker: NativePhysicalWorker,
+    epoch: Option<ProcessEpoch>,
+    last_execution: Option<u64>,
+    last_request: Option<u64>,
+    diagnostics: Vec<DiagnosticSlot>,
+    active: bool,
+    closed: Option<ContractError>,
+    boundary_error: Option<ContractError>,
+    poison_error: Option<ContractError>,
+    poison_observed: bool,
+}
+
+// The owner's 1..=4096 inline slots are reserved and initialized before launch;
+// allocation failure rejects construction. Boxing a receipt would introduce an
+// additional allocation while recording a physically completed failure.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "bounded inline diagnostic slots are allocated before native launch"
+)]
+enum DiagnosticSlot {
+    Free,
+    Reserved,
+    Occupied(NativeDiagnosticReceipt),
+}
+
+struct OwnerInner {
+    projection: ClassicalProjection,
+    origin: NativeWorkerOrigin,
+    state: Mutex<OwnerState>,
+}
+
+/// Process-owned session/worker and original diagnostic receipts. Keep this
+/// capability in bootstrap through serve success, failure and physical drain.
+/// Identity high-water marks use constant space. Every physical attempt reserves
+/// diagnostic capacity before launch; only actual failure/audit receipts occupy
+/// it afterward. A successful physical result releases its reserved slot.
+#[derive(Clone)]
+pub struct NativeWorkerOwner(Arc<OwnerInner>);
+
+impl NativeWorkerOwner {
+    /// Injection exercises the same physical Lease bridge without claiming NN
+    /// execution. The supplied closure must satisfy SingleWorker's Run contract.
+    pub fn from_worker(
+        worker: NativePhysicalWorker,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+    ) -> Result<Self, PhysicalFailure> {
+        let model = projection.model();
+        if diagnostic_capacity == 0 || diagnostic_capacity > MAX_DIAGNOSTICS {
+            return Err(failure(
+                ErrorCode::ResourceExhausted,
+                Stage::Contract,
+                "native owner requires a finite 1..=4096 diagnostic capacity",
+            )
+            .into());
+        }
+        if model.full_steps() != 1
+            || model.max_batch_items() != 1
+            || !model.supports(PrecisionProfile::Fp32)
+        {
+            return Err(failure(
+                ErrorCode::UnsupportedContract,
+                Stage::Contract,
+                "native CPU baseline requires fresh FP32 single-item inference",
+            )
+            .into());
+        }
+        let mut diagnostics = Vec::new();
+        diagnostics
+            .try_reserve_exact(diagnostic_capacity)
+            .map_err(allocation_failure)?;
+        diagnostics.resize_with(diagnostic_capacity, || DiagnosticSlot::Free);
+        Ok(Self(Arc::new(OwnerInner {
+            projection,
+            origin: NativeWorkerOrigin::Injected,
+            state: Mutex::new(OwnerState {
+                worker,
+                epoch: None,
+                last_execution: None,
+                last_request: None,
+                diagnostics,
+                active: false,
+                closed: None,
+                boundary_error: None,
+                poison_error: None,
+                poison_observed: false,
+            }),
+        })))
+    }
+
+    /// Consumes an already loaded, verified CPU session. Native load/provider
+    /// initialization is a bootstrap operation, outside every search deadline.
+    #[cfg(feature = "onnx")]
+    pub fn from_onnx(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+    ) -> Result<Self, PhysicalFailure> {
+        if !matches!(backend.config().provider, crate::onnx::Provider::Cpu)
+            || backend.config().max_batch != 1
+            || projection.backend().0 != backend.identity()
+            || projection.model().handle().manifest.0 != backend.asset_identity()
+        {
+            return Err(failure(
+                ErrorCode::IdentityMismatch,
+                Stage::Contract,
+                "native CPU owner differs from loaded provider/model/batch identity",
+            )
+            .into());
+        }
+        let worker = crate::contracts::spawn_onnx_worker(backend)?;
+        let mut owner = Self::from_worker(worker, projection, diagnostic_capacity)?;
+        // No clone has escaped this constructor; the actual origin is immutable.
+        Arc::get_mut(&mut owner.0)
+            .expect("new native owner is exclusively owned")
+            .origin = NativeWorkerOrigin::CpuOnnx;
+        Ok(owner)
+    }
+
+    pub fn origin(&self) -> NativeWorkerOrigin {
+        self.0.origin
+    }
+
+    pub fn projection(&self) -> &ClassicalProjection {
+        &self.0.projection
+    }
+
+    pub fn admission_error(&self) -> Option<ContractError> {
+        self.state().closed
+    }
+
+    /// Closing admission never closes a live physical completion/pin path.
+    pub fn close_admission(&self, error: ContractError) {
+        let mut state = self.state();
+        state.closed.get_or_insert(error);
+        state.boundary_error.get_or_insert(error);
+    }
+
+    pub fn try_close_admission(&self, error: ContractError) -> Result<bool, ContractError> {
+        let mut state = match self.0.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let mut state = poisoned.into_inner();
+                Self::mark_poison(&mut state);
+                state
+            }
+        };
+        state.closed.get_or_insert(error);
+        state.boundary_error.get_or_insert(error);
+        Ok(true)
+    }
+
+    /// Transfers original receipts only after output allocation succeeds. Poison
+    /// recovery closes admission and accompanies recovered originals with an
+    /// explicit boundary error; shutdown must not silently take/drop this batch.
+    pub fn take_diagnostics(&self) -> Result<NativeDiagnosticBatch, ContractError> {
+        let mut state = self.state();
+        Self::take_from(&mut state, usize::MAX)
+    }
+
+    /// No wait for an owner lock. Transfer at most the consumer's remaining
+    /// receipt budget; every unselected original and Reserved slot stays owned.
+    pub fn try_take_diagnostics(
+        &self,
+        max_entries: usize,
+    ) -> Result<Option<NativeDiagnosticBatch>, ContractError> {
+        let mut state = match self.0.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let mut state = poisoned.into_inner();
+                Self::mark_poison(&mut state);
+                state
+            }
+        };
+        Self::take_from(&mut state, max_entries).map(Some)
+    }
+
+    pub fn try_status(&self) -> Result<Option<NativeOwnerStatus>, ContractError> {
+        let state = match self.0.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let mut state = poisoned.into_inner();
+                Self::mark_poison(&mut state);
+                state
+            }
+        };
+        Ok(Some(NativeOwnerStatus {
+            active: state.active,
+            admission_error: state.closed,
+            occupied_diagnostics: state
+                .diagnostics
+                .iter()
+                .filter(|entry| matches!(entry, DiagnosticSlot::Occupied(_)))
+                .count(),
+            reserved_diagnostics: state
+                .diagnostics
+                .iter()
+                .filter(|entry| matches!(entry, DiagnosticSlot::Reserved))
+                .count(),
+        }))
+    }
+
+    fn take_from(
+        state: &mut OwnerState,
+        max_entries: usize,
+    ) -> Result<NativeDiagnosticBatch, ContractError> {
+        let count = state
+            .diagnostics
+            .iter()
+            .filter(|entry| matches!(entry, DiagnosticSlot::Occupied(_)))
+            .count()
+            .min(max_entries);
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(count).map_err(|_| {
+            failure(
+                ErrorCode::ResourceExhausted,
+                Stage::Output,
+                "cannot allocate native diagnostic delivery; originals retained",
+            )
+        })?;
+        for entry in &mut state.diagnostics {
+            if entries.len() == count {
+                break;
+            }
+            if matches!(entry, DiagnosticSlot::Occupied(_)) {
+                let DiagnosticSlot::Occupied(receipt) =
+                    std::mem::replace(entry, DiagnosticSlot::Free)
+                else {
+                    unreachable!("matched occupied receipt")
+                };
+                entries.push(receipt);
+            }
+        }
+        Ok(NativeDiagnosticBatch {
+            entries,
+            boundary_error: state.boundary_error.take(),
+            poison_error: state.poison_error.take(),
+        })
+    }
+
+    fn state(&self) -> MutexGuard<'_, OwnerState> {
+        match self.0.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                Self::mark_poison(&mut state);
+                state
+            }
+        }
+    }
+
+    fn mark_poison(state: &mut OwnerState) {
+        let error = failure(
+            ErrorCode::BackendFailure,
+            Stage::Backend,
+            "native physical/diagnostic owner poisoned; admission closed",
+        );
+        state.closed.get_or_insert(error);
+        if !state.poison_observed {
+            state.boundary_error.get_or_insert(error);
+            state.poison_error = Some(error);
+            state.poison_observed = true;
+        }
+    }
+
+    fn record(&self, slot: usize, receipt: NativeDiagnosticReceipt) {
+        let mut state = self.state();
+        // Each burned attempt reserves one exclusive slot before launch. A
+        // dispatch refusal has no Lease; each accepted Lease records at most once.
+        state.diagnostics[slot] = DiagnosticSlot::Occupied(receipt);
+    }
+}
+
+pub struct NativeRuntimeBackend<C: ContractClock + Send> {
+    owner: NativeWorkerOwner,
+    clock: C,
+}
+
+pub struct NativeRuntimeLease<C: ContractClock> {
+    physical: NativePhysicalLease,
+    owner: NativeWorkerOwner,
+    slot: usize,
+    ticket: (ExecutionId, RequestId),
+    context: CompletionContext,
+    results: NativeDelivery<C>,
+    consumed: bool,
+    quarantined: bool,
+}
+
+impl<C: ContractClock + Send> NativeRuntimeBackend<C> {
+    pub fn new(owner: NativeWorkerOwner, clock: C) -> Result<Self, ContractError> {
+        {
+            let state = owner.state();
+            if let Some(error) = state.closed {
+                return Err(error);
+            }
+            if state.epoch.is_some_and(|epoch| epoch != clock.domain().0) {
+                return Err(failure(
+                    ErrorCode::IdentityMismatch,
+                    Stage::Contract,
+                    "native owner clock domain changed",
+                ));
+            }
+        }
+        Ok(Self { owner, clock })
+    }
+
+    fn quarantine(&self, lease: &mut NativeRuntimeLease<C>, error: BackendError) {
+        let contract = backend_error(&error);
+        self.owner.record(
+            lease.slot,
+            NativeDiagnosticReceipt {
+                ticket: lease.ticket,
+                context: lease.context,
+                kind: NativeDiagnosticKind::Quarantined,
+                failure: error.into(),
+            },
+        );
+        self.owner.state().closed.get_or_insert(contract);
+        lease.quarantined = true;
+    }
+}
+
+impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for NativeRuntimeBackend<C> {
+    type Lease = NativeRuntimeLease<C>;
+
+    fn additional_resources(&self, requests: &[Arc<RuntimeRequest<RulesState>>]) -> Resources {
+        Resources {
+            host_bytes: (requests.len() as u64).saturating_mul(NATIVE_RUNTIME_OVERHEAD_BYTES),
+            device_bytes: 0,
+            pinned_bytes: 0,
+        }
+    }
+
+    fn dispatch(
+        &mut self,
+        execution: &ExecutionId,
+        requests: &[Arc<RuntimeRequest<RulesState>>],
+    ) -> Result<Self::Lease, ContractError> {
+        if requests.len() != 1 {
+            return Err(failure(
+                ErrorCode::UnsupportedContract,
+                Stage::Admission,
+                "native CPU baseline requires single-item dispatch",
+            ));
+        }
+        let request = requests[0].eval();
+        let context = request.context();
+        if execution.epoch != self.clock.domain().0
+            || context.request.epoch != execution.epoch
+            || context.selection.epoch != execution.epoch
+        {
+            return Err(failure(
+                ErrorCode::IdentityMismatch,
+                Stage::Admission,
+                "native physical/request/clock epoch differs",
+            ));
+        }
+        let ticket = (*execution, context.request);
+        let slot = {
+            let mut state = self.owner.state();
+            if let Some(error) = state.closed {
+                return Err(error);
+            }
+            if state.epoch.is_some_and(|epoch| epoch != execution.epoch)
+                || state
+                    .last_execution
+                    .is_some_and(|last| execution.sequence <= last)
+                || state
+                    .last_request
+                    .is_some_and(|last| context.request.sequence <= last)
+            {
+                return Err(failure(
+                    ErrorCode::IdentityMismatch,
+                    Stage::Admission,
+                    "native physical identity reused or moved backwards",
+                ));
+            }
+            state.epoch = Some(execution.epoch);
+            state.last_execution = Some(execution.sequence);
+            state.last_request = Some(context.request.sequence);
+            let Some(slot) = state
+                .diagnostics
+                .iter()
+                .position(|entry| matches!(entry, DiagnosticSlot::Free))
+            else {
+                let error = failure(
+                    ErrorCode::ResourceExhausted,
+                    Stage::Admission,
+                    "native diagnostic store is full; admission closed",
+                );
+                state.closed = Some(error);
+                state.boundary_error = Some(error);
+                return Err(error);
+            };
+            state.diagnostics[slot] = DiagnosticSlot::Reserved;
+            slot
+        };
+        let prepared: PreparedDispatch<C> = (|| {
+            request
+                .deadline()
+                .accepts(self.clock.domain(), self.clock.now())?;
+            if request.cancel_token().is_canceled() {
+                return Err(failure(
+                    ErrorCode::Canceled,
+                    Stage::Admission,
+                    "native request canceled before launch",
+                )
+                .into());
+            }
+            let prepared = self.owner.projection().prepare(Arc::clone(request))?;
+            let batch = PreparedBatch::new(*execution, vec![prepared])?;
+            let mut results = Vec::new();
+            results.try_reserve_exact(1).map_err(allocation_failure)?;
+            // Encoding/preparation costs wall time. Repeat deadline/cancel checks
+            // at the final handoff; no implicit grace and no native termination.
+            request
+                .deadline()
+                .accepts(self.clock.domain(), self.clock.now())?;
+            if request.cancel_token().is_canceled() {
+                return Err(failure(
+                    ErrorCode::Canceled,
+                    Stage::Admission,
+                    "native request canceled during preparation",
+                )
+                .into());
+            }
+            let mut state = self.owner.state();
+            if let Some(error) = state.closed {
+                return Err(error.into());
+            }
+            if state.active {
+                return Err(failure(
+                    ErrorCode::ResourceExhausted,
+                    Stage::Admission,
+                    "native owner still holds a physical lease",
+                )
+                .into());
+            }
+            if requests[0]
+                .execution()
+                .is_some_and(|bound| bound != *execution)
+            {
+                return Err(failure(
+                    ErrorCode::IdentityMismatch,
+                    Stage::Admission,
+                    "native request is already bound to a different execution",
+                )
+                .into());
+            }
+            let physical = state.worker.submit(batch).map_err(PhysicalFailure::from)?;
+            // Every fallible operation precedes successful native handoff. The
+            // returned lease is registered even if the worker already failed.
+            state.active = true;
+            Ok((physical, results))
+        })();
+        let (physical, results) = match prepared {
+            Ok(value) => value,
+            Err(error) => {
+                let contract = error.contract;
+                self.owner.record(
+                    slot,
+                    NativeDiagnosticReceipt {
+                        ticket,
+                        context: CompletionContext {
+                            request: context,
+                            execution: None,
+                        },
+                        kind: NativeDiagnosticKind::DispatchRefused,
+                        failure: error,
+                    },
+                );
+                return Err(contract);
+            }
+        };
+        Ok(NativeRuntimeLease {
+            physical,
+            owner: self.owner.clone(),
+            slot,
+            ticket,
+            context: CompletionContext {
+                request: context,
+                execution: Some(*execution),
+            },
+            results,
+            consumed: false,
+            quarantined: false,
+        })
+    }
+
+    fn poll(&mut self, lease: &mut Self::Lease) -> Poll<NativeDelivery<C>> {
+        if lease.consumed || lease.quarantined {
+            return Poll::Pending;
+        }
+        if !Arc::ptr_eq(&self.owner.0, &lease.owner.0) {
+            // Preserve the actual lease owner; a foreign caller cannot complete it.
+            let error = failure(
+                ErrorCode::IdentityMismatch,
+                Stage::Backend,
+                "native lease belongs to a different owner",
+            );
+            lease.owner.record(
+                lease.slot,
+                NativeDiagnosticReceipt {
+                    ticket: lease.ticket,
+                    context: lease.context,
+                    kind: NativeDiagnosticKind::Quarantined,
+                    failure: error.into(),
+                },
+            );
+            let mut state = lease.owner.state();
+            state.closed.get_or_insert(error);
+            state.boundary_error.get_or_insert(error);
+            lease.quarantined = true;
+            return Poll::Pending;
+        }
+        let result = match lease.physical.poll() {
+            PhysicalPoll::Pending | PhysicalPoll::Consumed => return Poll::Pending,
+            PhysicalPoll::Quarantined => {
+                let cause = match lease.physical.quarantine_cause() {
+                    Ok(Some(cause)) | Err(cause) => cause,
+                    Ok(None) => BackendError::new(
+                        FailureKind::BackendFailure,
+                        FailureStage::Backend,
+                        "native completion disconnected without physical completion proof",
+                    ),
+                };
+                self.quarantine(lease, cause);
+                return Poll::Pending;
+            }
+            PhysicalPoll::Ready(result) => result,
+        };
+        lease.consumed = true;
+        let output = match result {
+            Ok(mut outputs) if outputs.len() == 1 => {
+                Ok(outputs.pop().expect("validated single output"))
+            }
+            Ok(outputs) => Err(BackendError::new(
+                FailureKind::BackendFailure,
+                FailureStage::Output,
+                "native output count differs from physical inputs",
+            )
+            .with_diagnostic(
+                "NativeOutputCount",
+                &format!("expected=1 actual={}", outputs.len()),
+            )
+            .into()),
+            Err(error) => Err(error),
+        };
+        let output = match output {
+            Ok(output) => {
+                self.owner.state().diagnostics[lease.slot] = DiagnosticSlot::Free;
+                Ok(output)
+            }
+            Err(error) => {
+                let contract = error.contract;
+                self.owner.record(
+                    lease.slot,
+                    NativeDiagnosticReceipt {
+                        ticket: lease.ticket,
+                        context: lease.context,
+                        kind: NativeDiagnosticKind::PhysicalFailure,
+                        failure: error,
+                    },
+                );
+                Err(contract)
+            }
+        };
+        self.owner.state().active = false;
+        lease.results.push(BackendResult {
+            request_id: lease.ticket.1,
+            output,
+        });
+        Poll::Ready(std::mem::take(&mut lease.results))
+    }
+}
+
+fn allocation_failure(error: std::collections::TryReserveError) -> PhysicalFailure {
+    BackendError::new(
+        FailureKind::ResourceExhausted,
+        FailureStage::Admission,
+        "native bridge allocation failed before launch",
+    )
+    .with_external_cause(CauseCode::InputAllocation, &error)
+    .into()
+}
+
+fn failure(code: ErrorCode, stage: Stage, detail: &'static str) -> ContractError {
+    ContractError::new(code, stage, detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contracts::{encoding_manifest, MaiaBinding};
+    use rz_encoding::classical::HistoryFill;
+
+    fn owner() -> NativeWorkerOwner {
+        let binding = MaiaBinding::new(
+            ModelHandle {
+                owner: OwnerId(911),
+                slot: 1,
+                generation: SlotGeneration(1),
+                manifest: Digest([91; 32]),
+            },
+            EncodingHandle {
+                owner: OwnerId(911),
+                slot: 2,
+                generation: SlotGeneration(1),
+                manifest: encoding_manifest(HistoryFill::No),
+            },
+            HistoryFill::No,
+            Digest([92; 32]),
+            1,
+        )
+        .unwrap();
+        let worker = SingleWorker::spawn(|_: &PreparedBatch<RulesState>| Ok(Vec::new())).unwrap();
+        NativeWorkerOwner::from_worker(worker, ClassicalProjection::new(binding), 2).unwrap()
+    }
+
+    fn occupied(owner: &NativeWorkerOwner) -> NativeDiagnosticReceipt {
+        let live = rz_position::contracts::ContractPosition::new(
+            OwnerId(912),
+            rz_position::Position::startpos(),
+        );
+        let state = live.export().unwrap();
+        let request = EvalContext {
+            revision: CONTRACT_REVISION,
+            request: RequestId::new(ProcessEpoch(913), 1),
+            selection: SelectionId::new(ProcessEpoch(913), 1),
+            game: GameGeneration(1),
+            root: RootGeneration(1),
+            state: state.snapshot().identity(),
+            legal_order: state.legal_moves().order(),
+            input: owner
+                .projection()
+                .input_key(state.rules(), state.legal_moves().moves())
+                .unwrap(),
+            model: owner.projection().model().handle(),
+            encoding: owner.projection().model().encoding().handle,
+            precision: PrecisionProfile::Fp32,
+            compute: ComputeBudget {
+                min_steps: 1,
+                max_steps: 1,
+                require_full: true,
+            },
+            backend: owner.projection().backend(),
+        };
+        let execution = ExecutionId::new(ProcessEpoch(913), 1);
+        NativeDiagnosticReceipt {
+            ticket: (execution, request.request),
+            context: CompletionContext {
+                request,
+                execution: Some(execution),
+            },
+            kind: NativeDiagnosticKind::PhysicalFailure,
+            failure: BackendError::new(
+                FailureKind::BackendFailure,
+                FailureStage::Backend,
+                "original native failure before owner poison",
+            )
+            .into(),
+        }
+    }
+
+    #[test]
+    fn poison_preserves_first_close_or_store_full_and_existing_slots() {
+        for original in [
+            failure(
+                ErrorCode::BackendFailure,
+                Stage::Backend,
+                "original explicit owner close",
+            ),
+            failure(
+                ErrorCode::ResourceExhausted,
+                Stage::Admission,
+                "original native diagnostic store full",
+            ),
+        ] {
+            let owner = owner();
+            let receipt = occupied(&owner);
+            let expected = receipt.context;
+            {
+                let mut state = owner.state();
+                state.diagnostics[0] = DiagnosticSlot::Reserved;
+                state.diagnostics[1] = DiagnosticSlot::Occupied(receipt);
+            }
+            owner.close_admission(original);
+            let poisoned = owner.clone();
+            assert!(std::thread::spawn(move || {
+                let _state = poisoned.0.state.lock().unwrap();
+                panic!("injected native owner mutex poison");
+            })
+            .join()
+            .is_err());
+            let mut batch = owner.try_take_diagnostics(1).unwrap().unwrap();
+            assert_eq!(batch.boundary_error, Some(original));
+            assert_eq!(batch.poison_error.unwrap().code, ErrorCode::BackendFailure);
+            let receipt = batch.entries.pop().unwrap();
+            assert_eq!(receipt.context, expected);
+            assert_eq!(
+                receipt.failure.backend.unwrap().detail,
+                "original native failure before owner poison"
+            );
+            let snapshot = owner.try_status().unwrap().unwrap();
+            assert_eq!(snapshot.admission_error, Some(original));
+            assert_eq!(snapshot.reserved_diagnostics, 1);
+            assert_eq!(snapshot.occupied_diagnostics, 0);
+            let acknowledged = owner.take_diagnostics().unwrap();
+            assert!(acknowledged.entries.is_empty());
+            assert!(acknowledged.boundary_error.is_none());
+            assert!(
+                acknowledged.poison_error.is_none(),
+                "a retained poison fact is delivered once"
+            );
+        }
+    }
+}

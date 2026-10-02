@@ -328,6 +328,7 @@ pub struct EngineProcess {
     factory: Arc<dyn EvaluatorFactory>,
     owners: Arc<OwnerRegistry>,
     clock: ProcessClock,
+    identity: EngineIdentity,
 }
 impl EngineProcess {
     pub fn new(
@@ -339,7 +340,16 @@ impl EngineProcess {
             factory,
             owners,
             clock,
+            identity: EngineIdentity {
+                name: "RoveZero CPU mock integration".into(),
+                author: "RoveZero contributors".into(),
+            },
         }
+    }
+    /// Session validates the declared identity before starting protocol service.
+    pub fn with_identity(mut self, identity: EngineIdentity) -> Self {
+        self.identity = identity;
+        self
     }
 }
 
@@ -1283,6 +1293,7 @@ pub fn serve<O: Write, D: Write>(
         factory,
         owners,
         clock,
+        identity,
     } = process;
     if settings.max_workers == 0
         || settings.shutdown_limit.is_zero()
@@ -1322,10 +1333,7 @@ pub fn serve<O: Write, D: Write>(
     }));
     let mut session = Session::new(
         RulesUciPort::new(owners, settings.position),
-        EngineIdentity {
-            name: "RoveZero CPU mock integration".into(),
-            author: "RoveZero contributors".into(),
-        },
+        identity,
         Vec::new(),
         settings.parser,
     )
@@ -2449,5 +2457,55 @@ mod tests {
         };
         assert_eq!(copy.context, expected);
         assert_eq!(copy.recovery, contract::RecoveryOutcome::Failed);
+    }
+
+    #[test]
+    fn injected_identity_reaches_uci_and_newline_identity_is_rejected_before_output() {
+        let run = |name: &str| {
+            let (owner, session) = fixture();
+            let process = EngineProcess::new(
+                Arc::clone(&owner.factory),
+                Arc::clone(&session.snapshot().owners),
+                owner.clock.clone(),
+            )
+            .with_identity(EngineIdentity {
+                name: name.into(),
+                author: "RoveZero identity fixture".into(),
+            });
+            let (sender, events) = event_channel();
+            sender.send(Event::Line("uci".into())).unwrap();
+            sender.send(Event::Line("quit".into())).unwrap();
+            let mut protocol = Vec::new();
+            let mut diagnostics = Vec::new();
+            let result = serve(
+                events,
+                sender,
+                &mut protocol,
+                &mut diagnostics,
+                process,
+                owner.settings,
+            );
+            (result, String::from_utf8(protocol).unwrap(), diagnostics)
+        };
+
+        let (result, protocol, diagnostics) = run("RoveZero native CPU identity fixture");
+        result.unwrap();
+        assert_eq!(
+            protocol.lines().collect::<Vec<_>>(),
+            [
+                "id name RoveZero native CPU identity fixture",
+                "id author RoveZero identity fixture",
+                "uciok",
+            ]
+        );
+        assert!(diagnostics.is_empty());
+
+        let (result, protocol, diagnostics) = run("RoveZero native CPU\nid name injected");
+        let Err(EngineError::Session(error)) = result else {
+            panic!("Session must reject the injected newline identity")
+        };
+        assert!(error.to_string().contains("engine identity requires"));
+        assert!(protocol.is_empty());
+        assert!(diagnostics.is_empty());
     }
 }

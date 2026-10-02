@@ -1,3 +1,4 @@
+use rz_eval::error::{CauseCode, ExternalCause, FailureKind, FailureStage, CAUSE_PREFIX_BYTES};
 use rz_eval::worker::{PhysicalPoll, SingleWorker};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -59,15 +60,70 @@ fn physical_completion_yields_owned_data_once() {
 
 #[test]
 fn unwind_quarantines_backend_and_pins_instead_of_claiming_completion() {
-    let mut worker =
-        SingleWorker::spawn(|_: &Arc<usize>| -> () { panic!("injected provider unwind") }).unwrap();
+    let message = "injected provider unwind α ".repeat(100);
+    let injected = message.clone();
+    let mut worker = SingleWorker::spawn(move |_: &Arc<usize>| -> () {
+        std::panic::panic_any(injected.clone())
+    })
+    .unwrap();
     let input = Arc::new(5);
     let weak = Arc::downgrade(&input);
     let mut lease = worker.submit(input).unwrap();
     wait_until(|| matches!(lease.poll(), PhysicalPoll::Quarantined));
+    let cause = lease.quarantine_cause().unwrap().unwrap();
+    assert_eq!(cause.kind, FailureKind::BackendFailure);
+    assert_eq!(cause.stage, FailureStage::Backend);
+    let receipt = cause.cause.unwrap();
+    assert_eq!(receipt.code, CauseCode::RuntimePanic);
+    assert_eq!(usize::from(receipt.hashed_bytes), CAUSE_PREFIX_BYTES);
+    assert!(receipt.truncated);
+    assert_eq!(
+        receipt.prefix_sha256,
+        ExternalCause::capture(CauseCode::RuntimePanic, &message).prefix_sha256
+    );
+    let local = cause.native.as_ref().unwrap();
+    assert_eq!(local.code, "WorkerPanic");
+    assert!(local.message.len() <= 1024);
+    assert!(local.truncated);
+    assert!(message.starts_with(&local.message));
+    assert!(!format!("{cause:?}").contains("injected provider unwind"));
+    assert!(!cause.to_string().contains("injected provider unwind"));
+    assert_eq!(lease.quarantine_cause().unwrap(), Some(cause));
+    assert!(matches!(lease.poll(), PhysicalPoll::Quarantined));
     assert!(worker.submit(Arc::new(6)).is_err());
     drop(lease);
     drop(worker);
     // One tiny allocation intentionally survives this injected unknown completion.
     assert!(weak.upgrade().is_some());
+}
+
+#[test]
+fn a_later_panic_cause_is_not_attributed_to_a_completed_lease() {
+    let mut worker = SingleWorker::spawn(|input: &u8| {
+        if *input == 1 {
+            panic!("second job panic");
+        }
+        *input
+    })
+    .unwrap();
+    let mut completed = worker.submit(0).unwrap();
+    // Admit the second job after native completion without consuming the first
+    // lease's queued output. Worker admission and each lease's result differ.
+    let mut failed = None;
+    wait_until(|| match worker.submit(1) {
+        Ok(lease) => {
+            failed = Some(lease);
+            true
+        }
+        Err(error) => {
+            assert_eq!(error.kind, FailureKind::ResourceExhausted);
+            false
+        }
+    });
+    let mut failed = failed.unwrap();
+    wait_until(|| matches!(failed.poll(), PhysicalPoll::Quarantined));
+    assert!(failed.quarantine_cause().unwrap().is_some());
+    assert!(completed.quarantine_cause().unwrap().is_none());
+    assert!(matches!(completed.poll(), PhysicalPoll::Ready(0)));
+    assert!(matches!(completed.poll(), PhysicalPoll::Consumed));
 }
