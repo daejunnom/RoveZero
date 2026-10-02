@@ -1,8 +1,9 @@
-# rz-arena — E02 pair 계획과 attempt 원장
+# rz-arena — E02 pair·원장·fixture 실행
 
 같은 opening 입력에 흑백 엔진 배정만 교환하는 pair를 만들고, 모든 game attempt의
-결과·실패를 보존하는 내부 구현이다. E01의 잠긴 입력을 소비하며 새 엔진·Rules·UCI를
-구현하지 않는다. 계획·감사 출력은 모두 **`execution_ready=false`**다.
+결과·실패를 보존한다. E01의 잠긴 입력, A의 checked Rules와 bounded Fastchess
+fixture adapter를 소비하며 새 엔진·Rules·UCI를 구현하지 않는다. 출력은 모두
+**`execution_ready=false`**이며 합성 script 실행을 실제 NN·GPU·강도 검증으로 올리지 않는다.
 
 ## PR #7과 계약 연결 경계
 
@@ -148,6 +149,25 @@ Linux x86_64·Rust 1.99.0·기본 feature에서 arena CLI 10개, ledger 22개, p
 Rust 1.96.0·workspace MSRV 1.90을 사용하며 정확한 integration SHA와 실제 실행은
 [총괄 인수 기록](../../docs/INTEGRATION-STATUS.md)에 따로 기록한다.
 receipt의 초기 contract/rules source pin을 현재 binary의 integration SHA로 해석하지 않는다.
+
+## 후속 실행 자료 인수
+
+E `91818e3d1309592cff561aa925688446c4a2e4e4`의 공개 보존 사본 454개 파일을
+저장소 밖 `reports/coordinator-integration/recovered-pr-evidence/exact-blobs/E-91818e3`에
+회수하고 전체 Git blob identity·길이를 확인했다. 독립 감사에서 inventory 448개와
+process receipt 11개가 참조한 artifact 46개의 digest·크기가 맞았다. 출처는
+[E 보존 커밋](https://github.com/daejunnom/RoveZero/tree/91818e3d1309592cff561aa925688446c4a2e4e4/experiments/baselines/evidence),
+현재 인수는 [총괄 기록](../../docs/INTEGRATION-STATUS.md)을 따른다.
+
+과거 7수 script fixture의 1승·1패, cutoff Incomplete, signal 15 취소와 cleanup
+Unverified를 그대로 보존한다. 과거 Linux standalone의 140개 검사 결과를 현재
+root 통합의 양 OS 검사로 재사용하지 않는다. 마스킹 전 클라우드 원본·제외 binary·
+누락된 최초 build 로그까지 회수했다고 보고하지 않는다.
+
+그 당시 `check-e.py`와 `run-e-fixture.py`는 별도 외부 원본 사본으로 보존한다.
+개별 lockfile 가정·오래된 binary의 SHA 선언·일부 무제한 출력 및 자식 정리 경계가
+현재 root와 맞지 않아 실행 도구로 등록하지 않았다. root fixture 도구를 제공하려면
+단일 lock·실제 binary 빌드 영수증·유한 cleanup/output을 맞춘 뒤 별도 검사해야 한다.
 
 독립 Python SHA/seed vector와 대조한 E01 fixture 계획 SHA-256은
 `980d61aadc3da58fe75720b125f7017a08ad40c5ae58c490f6e411e89429511f`,

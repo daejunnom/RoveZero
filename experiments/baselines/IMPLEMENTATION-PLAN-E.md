@@ -335,6 +335,29 @@ subprocess와 cleanup 구간이며 전후의 입력 검증·opening 생성·PGN 
 포함하지 않는다. 정식 시계·draw profile·seed·CPU/RAM·GPU drain·통계 인수는
 계속 후속이며 `execution_ready=false`를 유지한다.
 
-D의 원본 TSV와 E/F의 원시 실행 자료는 아직 회수하지 않았다. 사용자 지시에 따라
-별도 회수 작업을 보류하고 source 정합과 현재 CPU/mock 검사를 먼저 진행한다.
-요약·fixture·과거 실행 보고를 원시 자료 회수나 현재 integration 실행 증거로 대체하지 않는다.
+위 총괄 소스 인수 뒤 사용자가 PR에 게시한 D~F 자료의 정리·develop 반영을 지시했다.
+E `91818e3d1309592cff561aa925688446c4a2e4e4`의 공개 보존 사본을 저장소 밖에 회수했다.
+마스킹 전 원본·누락 binary·당시 저장하지 않은 로그는 여전히 미회수이며,
+현재 소스의 실행과 과거 공개 보존 사본의 무결성을 구분한다.
+
+## 12. 과거 E 실행 근거의 검토와 외부 보존
+
+공개 자료 454개 파일·1,786,455 bytes가 지정 source Git blob과 일치했다.
+네 inventory의 saved 자료 448개 및 ProcessReceipt 11개가 참조한 artifact 46개의
+digest·bytes도 독립 감사에서 맞았다. 초기 6 pair의 W=D=L=4는 합성 Event 회계다.
+후속 정상 runner는 실제 프로세스를 쓰는 7수 Scholar's Mate script의 1승·1패이며
+RoveZero 탐색·NN·GPU 성과가 아니다. cutoff Draw는 Incomplete, 취소의 signal 15와
+cleanup Unverified·점수 제외 및 실패/누락 기록을 유지한다.
+
+과거 source `9e49b6679aeab4e96be0f6b90e51e26a0c7a9ead`의 검사 8개·140 tests는
+Linux standalone 결과다. 시작 시 lock snapshot·최초 build raw 로그·제외 binary가
+없으며 종료 후 보완 영수증으로 실행 시작 입력의 동일성을 소급 증명하지 않는다.
+기존 remote receipt의 대상도 `0cc9937701f2e5e24faa40e845636447c56c7381`의 453개이며
+현재 454개나 root SHA의 검사로 확대하지 않는다.
+
+재현 source scripts는 원래 byte로 외부 보존했다. root 실행 도구로 인수하지 않은
+이유는 개별 crate lock 가정, skip-build의 실제 binary/SHA 연결 누락, staged/root/A/Contracts
+변경 검사의 누락, readiness/timeout 자식 cleanup·output 상한과 Python assert 의존이다.
+이 경계는 실제 root 도구를 제공할 때 수동 정합·검사해야 한다. 공개 출처는
+[원래 E 보존 자료](https://github.com/daejunnom/RoveZero/tree/91818e3d1309592cff561aa925688446c4a2e4e4/experiments/baselines/evidence),
+외부 보존 receipt·현재 integration 검사는 [INTEGRATION-STATUS](../../docs/INTEGRATION-STATUS.md)를 따른다.
