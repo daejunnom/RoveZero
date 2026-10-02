@@ -26,6 +26,10 @@ native runtime/CUDA 설치가 필요 없다. CPU/CUDA 선택, shape/dtype, 최�
 입력 plane·합법 수 index를 정확히 비교하고 batch 1/2/4/8/16을 검사한다.
 최대 오차는 logits `1.0252e-5`, WDL `3.5763e-7`, 합법 정책 `1.6094e-6`이었다.
 실제 GPU/RTX 4050·VRAM·강도 인수는 미실행이다.
+검증 source SHA·tool/asset digest·국면별 오차·제한·미실행 범위는
+[CPU 인수 기록](validation/maia-cpu.json)에 고정했다. Rust 1.96.0에서 eval 27개와
+encoding 11개(총 38개) 테스트, fmt·Clippy가 통과했고 Rust 1.85.0 all-feature
+check도 통과했다. 기본 feature 검사는 native ORT/CUDA 없이 별도로 통과했다.
 
 ## 현재 제공 범위
 
