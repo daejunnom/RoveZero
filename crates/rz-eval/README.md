@@ -4,6 +4,26 @@
 [구현 지시서](../../docs/IMPLEMENTATION-DIRECTIVES.md),
 [계약](../../docs/CONTRACTS.md), [선정 기록](../../docs/WEIGHT-SELECTION.md)이다.
 
+## 진행 중인 실제 backend
+
+PR #7의 계약 0.1(`ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8`)을 확인했다.
+`contracts` feature는 이 SHA의 공통 crate를 소비한다. workspace 통합 때 총괄이
+모든 consumer를 같은 path dependency로 바꾸어야 한다. 아래 초기 연결 메모는
+계약 게시 전 기록이다. 현재 C 내부 구현은 계약 통합을 기다리지 않고 진행한다.
+
+`asset::MaiaAsset`는 선정 gzip/protobuf와 변환 ONNX의 크기·SHA-256을 검증한다.
+`tools/prepare_maia.py`는 외부 LC0 고정 commit의 FP32/opset 17 변환과 provenance
+작성을 제공한다. 변환 자산·GPL 도구는 저장소 밖에 보존한다.
+
+`onnx` feature는 `ort=2.0.0-rc.10`/ORT 1.22.0을 명시 동적 로딩한다. 기본 feature는
+native runtime/CUDA 설치가 필요 없다. CPU/CUDA 선택, shape/dtype, 최대 batch 16,
+1~4 CPU threads, IO staging 예산을 검사한다. CUDA는 TF32 off·CPU fallback 금지와
+실제 node placement probe를 요구한다. IO 예산과 CUDA arena cap은 전체 RAM/VRAM
+상한이 아니므로 bootstrap/실행 환경에서 activation·workspace·동시 점유를 별도 제한한다.
+
+현재 WIP 검사: 19개 eval 테스트 통과, ONNX 변환 성공. 원본↔ONNX 수치 대조,
+공통 계약 adapter 및 실제 GPU 검사는 아직 미완료다.
+
 ## 현재 제공 범위
 
 `mock::ScriptedBackend<K>`는 수동 시계로 움직이는 **물리 backend 시험 도구**다.
