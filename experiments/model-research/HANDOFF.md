@@ -30,7 +30,7 @@ Linux x86_64, Python 3.12.14, CPU 환경에서 수행했다. Rust toolchain과 G
 | CPU regression | `PYTHONPATH=src python -m unittest discover -s tests -v` | 105 tests 통과 |
 | source plan | `rz_data split`, fixture sources, `fixture-demo`, 8:1:1 | source 1개, train 배정, 정상 종료 |
 | JSONL audit | `rz_data validate`, fixture manifest/records와 위 plan | 구조 검사 통과, row 1개, 거부 0개, execution_ready=false |
-| package/entrypoint | 저장소 밖 source copy에서 `pip install --no-deps --no-build-isolation --no-compile --target ...`, 설치된 `rz-data`/`rz-train` | wheel 생성·설치·두 CLI 실행 검사 |
+| package/entrypoint | 저장소 밖 source copy에서 `pip install --no-deps --no-build-isolation --no-compile --target ...`, 설치된 `rz-data`/`rz-train` | wheel 생성·설치, training row 6개 감사, source checkpoint 재개와 export 검사 통과 |
 | CPU fixture gradient | `rz_training run`, training fixture, seed 17, float64, batch 2, SGD lr 0.1/momentum 0.8, 8 step/16 samples | 실제 weights·출력 변경, validation loss 감소 |
 | resume/reproduce | 같은 recipe 8 step 연속 실행 vs 3 step pause+resume | model·optimizer·RNG/sampler·history·best 선택 일치; 시간만 별도 실제 계측 |
 | frozen/export | freeze recipe, validation probe import 대조 | weights·optimizer·출력 불변; 자체 export probe 오차 0 |
@@ -52,6 +52,11 @@ validation weighted loss는 step 1 `2.831684806206051` → step 8
 `cpu-continuous-v1`와 `cpu-pause-v1`(3 step)→`cpu-resume-v1`의 model/optimizer/
 sampler/best/history는 동일했다. `cpu-frozen-v1`은 weights 불변과 step 0 선택,
 export validation probe 2개는 float64 출력 오차 0을 확인했다.
+소스·검사 commit `8aa798e6fe3e760be125c5c79da869a1a9c46378`의 설치된 CLI도
+같은 checkpoint를 재개해 source 연속 실행과 provenance/model/optimizer/sampler/
+history/best가 같았다. wheel SHA256은
+`2777238990fec741138446b60d882d4f99ea84570e74f9fe126eff67247d09ad`.
+이후 인수 기록 수정은 Python 소스를 변경하지 않는다.
 
 검토 중 nested non-finite 값과 결과 context 검사, 긴 group ID의 보고서 증폭,
 거부된 row의 provenance/누출 scope 누락, CLI의 I/O 원인·단계 손실을 재현·수정했다. 실패 이력은 WIP 후속
