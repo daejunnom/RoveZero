@@ -1,0 +1,4 @@
+    Checking rz-telemetry v0.1.0 (${REPO}/crates/rz-telemetry)
+    Checking rz-contracts v0.1.0 (https://github.com/daejunnom/RoveZero?rev=67284c4f66f7a7ae9f46fa63dfd50e7410eb6845#67284c4f)
+    Checking rz-runtime v0.1.0 (${REPO}/crates/rz-runtime)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.02s

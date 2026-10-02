@@ -1,0 +1,33 @@
+    Blocking waiting for file lock on package cache
+   Compiling rz-telemetry v0.1.0 (${REPO}/crates/rz-telemetry)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.07s
+     Running unittests src/lib.rs (${ARTIFACT_ROOT}/target/preservation-telemetry/debug/deps/rz_telemetry-6b834339754e38a0)
+
+running 8 tests
+test tests::counters_saturate_and_keep_overflow_visible_after_later_events ... ok
+test tests::empty_snapshot_has_no_invented_samples ... ok
+test tests::logical_outcomes_and_physical_completion_are_independent ... ok
+test tests::impossible_capacity_is_rejected_before_either_ring_is_allocated ... ok
+test tests::nearest_rank_percentiles_sort_only_the_snapshot_and_preserve_durations ... ok
+test tests::one_retained_sample_including_zero_and_max_duration_has_all_percentiles ... ok
+test tests::ring_eviction_is_bounded_and_reported_for_both_sample_streams ... ok
+test tests::zero_capacity_keeps_counters_and_reports_all_samples_as_dropped ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/profile.rs (${ARTIFACT_ROOT}/target/preservation-telemetry/debug/deps/profile-bbaeb01631c4ef7d)
+
+running 10 tests
+test checked_capacities_and_zero_sample_capacity_do_not_need_unsafe_allocations ... ok
+test actual_transfer_requires_gpu_label_and_successful_validation_does_not_mean_consumption ... ok
+test cancellation_closes_logically_before_late_physical_completion_and_unused_finalization ... ok
+test domain_and_temporal_errors_leave_measurements_unchanged_and_report_incompleteness ... ok
+test reservation_peaks_are_ledger_measurements_and_do_not_invent_actual_device_usage ... ok
+test execution_only_dispatch_moves_wall_start_to_the_earliest_accepted_span ... ok
+test finish_backup_and_physical_work_are_exactly_once_within_the_check_window ... ok
+test overlap_uses_wall_span_and_separates_dispatch_backend_and_consumption ... ok
+test tracking_limits_are_explicit_and_retirement_reuses_slots_with_a_bounded_authority_window ... ok
+test rings_keep_recent_samples_and_losses_are_attributed_to_stage_and_class ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

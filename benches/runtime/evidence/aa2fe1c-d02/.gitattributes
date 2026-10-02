@@ -1,0 +1,2 @@
+# Rust test stdout ends with blank lines; preserve these archival log bytes.
+logs/recapture/*.log whitespace=-blank-at-eof

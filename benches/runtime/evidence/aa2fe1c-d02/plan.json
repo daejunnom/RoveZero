@@ -1,0 +1,29 @@
+{
+  "format": "rove-d-preservation-plan-v1",
+  "created_at_utc": "2026-10-02T17:04:00.809837+00:00",
+  "kind": "new_preservation_plan_not_original_implementation_plan",
+  "role": "D",
+  "branch": "feature/d-runtime-lifecycle",
+  "existing_pr": "https://github.com/daejunnom/RoveZero/pull/4",
+  "source_sha": "aa2fe1c3ac38274912017412e080a9bbd14c9485",
+  "scope": "Preserve existing D trace TSV and recapture existing verification logs only",
+  "steps": [
+    "Inventory original files and sizes without traversing caches or credentials",
+    "Audit original text for secrets and personal data",
+    "Preserve original TSV bytes and disclose missing historical metadata/logs",
+    "Rerun existing checks at unchanged source and capture logs/UTC receipts",
+    "Mask local path prefixes and independently audit publication payload",
+    "Verify hashes and ownership, commit/push existing branch and update existing PR",
+    "Read remote files at published SHA and verify all SHA-256 values",
+    "Report remote links; retain original local material"
+  ],
+  "size_policy": {
+    "original_tsv_bytes": 184296,
+    "git_payload_budget_bytes": 524288,
+    "individual_file_budget_bytes": 102400,
+    "oversized_action": "Report size and propose a separate durable object store or release artifact before publication; do not silently add Git LFS or large blobs"
+  },
+  "publication_state_at_document_creation": "prepared_before_commit_and_remote_verification",
+  "merge": false,
+  "new_engine_feature": false
+}

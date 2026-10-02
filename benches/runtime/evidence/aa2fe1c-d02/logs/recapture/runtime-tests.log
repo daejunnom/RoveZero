@@ -1,0 +1,80 @@
+    Blocking waiting for file lock on package cache
+   Compiling rz-contracts v0.1.0 (https://github.com/daejunnom/RoveZero?rev=67284c4f66f7a7ae9f46fa63dfd50e7410eb6845#67284c4f)
+   Compiling rz-telemetry v0.1.0 (${REPO}/crates/rz-telemetry)
+   Compiling rz-runtime v0.1.0 (${REPO}/crates/rz-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.66s
+     Running unittests src/lib.rs (${ARTIFACT_ROOT}/target/preservation-runtime/debug/deps/rz_runtime-e1971bed0c97f3e5)
+
+running 3 tests
+test observation::tests::zero_capacity_records_loss_and_saturation_is_explicit ... ok
+test observation::tests::event_layout_overflow_is_rejected_before_allocation ... ok
+test observation::tests::retains_latest_events_in_order_and_reports_loss_per_drain ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/contracts.rs (${ARTIFACT_ROOT}/target/preservation-runtime/debug/deps/contracts-08054a5be452e582)
+
+running 14 tests
+test backend_failure_retains_its_stage_detail_and_physical_context ... ok
+test cancellation_is_idempotent_and_pins_survive_logical_delivery ... ok
+test common_poll_revalidates_a_buffered_success_after_authority_changes ... ok
+test common_evaluator_success_echoes_the_actual_physical_execution ... ok
+test execution_sequence_exhaustion_fails_without_launch_or_wrapping ... ok
+test foreign_epoch_or_deadline_clock_is_rejected_without_a_completion ... ok
+test deadline_equal_to_completion_tick_is_expired_after_backend_poll ... ok
+test malformed_physical_execution_or_output_context_never_completes ... ok
+test partial_compute_is_an_explicit_contract_failure ... ok
+test queue_full_submission_consumes_identity_before_admission ... ok
+test shared_constructor_rejects_mixed_request_and_deadline_epochs ... ok
+test root_scope_update_stales_inflight_request_and_disallows_late_success ... ok
+test request_identity_cannot_be_reused_after_completion ... ok
+test unread_common_completion_bounds_admission_until_consumed ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/lifecycle.rs (${ARTIFACT_ROOT}/target/preservation-runtime/debug/deps/lifecycle-38812da068473ad4)
+
+running 30 tests
+test admission_rechecks_time_and_request_generation_after_validation ... ok
+test admission_returns_rejected_ownership_without_terminal_or_reservation ... ok
+test canceled_observation_precedes_physical_completion_without_output_validation ... ok
+test allocation_and_dispatch_failures_preserve_subscriber_context_and_release_reservations ... ok
+test dropping_pending_scheduler_quarantines_provider_lease_and_input_instead_of_freeing_borrows ... ok
+test dropping_receiver_does_not_block_scheduler_or_retain_completed_resources ... ok
+test cancellation_keeps_a_request_slot_until_both_delivery_and_physical_owners_release_it ... ok
+test canceled_running_reservations_still_block_new_admission ... ok
+test each_memory_budget_and_checked_addition_are_admission_boundaries ... ok
+test exact_deadline_expiry_prevents_dispatch_or_late_completion ... ok
+test execution_id_allocation_crossing_deadline_aborts_launch_and_releases_workspace ... ok
+test execution_id_allocation_crossing_queue_age_aborts_launch_at_the_configured_limit ... ok
+test full_batch_dispatches_without_wait_and_near_deadline_flushes_small_batch ... ok
+test fifo_batches_stop_at_incompatible_head_and_wait_for_size_or_age ... ok
+test output_validation_rechecks_deadline_generation_and_cancel_before_terminal_success ... ok
+test malformed_completion_ids_fail_the_whole_batch_before_sibling_success ... ok
+test physical_drain_can_finish_while_unread_terminal_delivery_still_reserves_budget ... ok
+test physical_concurrency_limit_keeps_fifo_tail_queued_until_one_execution_finishes ... ok
+test queued_cancel_releases_input_once_and_queue_age_is_explicit_failure ... ok
+test running_cancel_preserves_lease_inputs_provider_and_overhead_until_physical_ready ... ok
+test reordered_results_route_to_original_request_and_partial_failure_is_preserved ... ok
+test shutdown_keeps_first_deadline_and_reclaims_after_timeout_when_physical_work_finishes ... ok
+test post_launch_binding_panic_keeps_pending_execution_owned_for_shutdown_quarantine ... ok
+test successful_validation_observation_does_not_imply_terminal_success ... ok
+test unrepresentable_telemetry_capacity_is_a_typed_constructor_failure ... ok
+test unread_completion_keeps_request_slot_and_output_bytes_bounded_until_receive_or_drop ... ok
+test workspace_limit_or_overflow_fails_batch_before_any_dispatch ... ok
+test zero_observation_capacity_preserves_outcome_and_reservation_lifecycle ... ok
+test validation_failure_stays_failure_and_lease_is_alive_through_validation ... ok
+test shared_cancel_token_from_another_thread_terminates_logically_before_cpu_worker_finishes ... ok
+
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/cpu_trace.rs (${ARTIFACT_ROOT}/target/preservation-runtime/debug/examples/cpu_trace-37ad2c8ce0abbfa6)
+
+running 4 tests
+test tests::zero_event_capacity_preserves_runtime_results_and_reports_incomplete_tracking ... ok
+test tests::a_single_canceled_item_drains_late_work_without_creating_a_backup_sample ... ok
+test tests::seven_traces_separate_physical_work_from_backup_and_record_every_boundary ... ok
+test tests::long_lossy_traces_keep_auxiliary_reconstruction_within_runtime_limits ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+

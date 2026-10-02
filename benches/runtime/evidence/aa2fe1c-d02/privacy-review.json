@@ -1,0 +1,57 @@
+{
+  "format": "rove-d-privacy-review-v1",
+  "created_at_utc": "2026-10-02T17:04:00.809837+00:00",
+  "publication_review_state": "automated_text_scan_and_independent_readonly_review_passed",
+  "inspected_original_tsv_count": 8,
+  "original_tsv_findings": 0,
+  "inspected_publication_file_count": 26,
+  "scanned_categories": [
+    "api_token",
+    "private_key_block",
+    "jwt",
+    "credential_url",
+    "authorization_value",
+    "email",
+    "korean_mobile",
+    "ipv4",
+    "local_absolute_path"
+  ],
+  "candidate_findings": 0,
+  "text_only_utf8_no_nul": true,
+  "redaction_policy": "Original TSVs unchanged. In newly captured logs and receipts, local absolute path prefixes replaced with named placeholders; raw digest retained.",
+  "log_redactions": {
+    "runtime-tests": 6,
+    "runtime-fmt": 0,
+    "runtime-clippy": 2,
+    "runtime-default-check": 1,
+    "runtime-msrv-check": 2,
+    "telemetry-tests": 3,
+    "telemetry-fmt": 0,
+    "telemetry-clippy": 1
+  },
+  "public_identifiers_allowlisted": [
+    "explicitly supplied public GitHub repository/PR URL",
+    "source commit IDs and file digests",
+    "synthetic fixture IDs/numbers",
+    "public toolchain versions"
+  ],
+  "omitted": [
+    "full environment dump",
+    "credentials and secret files (not read)",
+    "build cache and toolchain binaries",
+    "external data and unverified-rights weights",
+    "E/F owned material"
+  ],
+  "scope_limitation": "Pattern checks plus independent content review; not a claim of exhaustive secret detection. Original/raw files retained locally.",
+  "independent_review": {
+    "completed_at_utc": "2026-10-02T17:07:09.002440+00:00",
+    "method": "separate agent read-only content, digest, provenance and privacy audit",
+    "original_tsv_byte_identity_count": 8,
+    "frozen_source_digest_verified_count": 18,
+    "execution_receipts_verified_count": 8,
+    "tests_verified_passed": 69,
+    "findings": 0,
+    "sha256_manifest_complete": true
+  },
+  "archival_whitespace_policy": ".gitattributes allows Rust stdout trailing blank lines only in logs/recapture/*.log; archival bytes are not trimmed."
+}

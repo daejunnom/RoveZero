@@ -129,3 +129,9 @@ crates/rz-runtime/Cargo.toml --examples`다. 네 검사는 일곱 시나리오�
 이 진입점은 D02 내부 CPU/mock 도구의 baseline이다. 같은 weights·search 의미·
 자원의 variant 대조나 D03 성능 개선 결과는 포함하지 않는다. 실제 B/C 소비자와
 목표 GPU의 전송·완료·VRAM·전체 탐색 경로, 신경망 오차와 정식 대국은 별도 인수한다.
+
+## 검증 자료 보존
+
+사용자 요청으로 회수한 원본 TSV 8개와 동일 소스 재검사 로그·영수증·입력 recipe·
+원장·SHA-256은 [D02 보존 자료](evidence/aa2fe1c-d02/README.md)에 있다.
+과거 검사 로그의 누락과 초기 trace의 미확인 소스도 그 원장에 명시한다.

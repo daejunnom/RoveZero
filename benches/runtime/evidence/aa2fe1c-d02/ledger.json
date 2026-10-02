@@ -1,0 +1,625 @@
+{
+  "format": "rove-d-evidence-ledger-v1",
+  "role": "D",
+  "created_at_utc": "2026-10-02T17:04:00.809837+00:00",
+  "source_sha_for_recapture_and_recipes": "aa2fe1c3ac38274912017412e080a9bbd14c9485",
+  "source_sha_at_original_invocation": "unknown unless separately attested; see each artifact",
+  "contract_git_revision": "67284c4f66f7a7ae9f46fa63dfd50e7410eb6845",
+  "ownership_root": "benches/runtime/",
+  "original_root": "${ORIGINAL_REPORTS}",
+  "original_artifacts": [
+    {
+      "path": "traces/original/cpu-trace-all-release.tsv",
+      "kind": "original_aggregate_tsv_stdout",
+      "bytes": 35084,
+      "original_sha256": "aecd953ec98db14f77f94445af2d4af2b077dbc41e4fb2005591ca9b94cbd3bd",
+      "published_sha256": "aecd953ec98db14f77f94445af2d4af2b077dbc41e4fb2005591ca9b94cbd3bd",
+      "byte_identity": true,
+      "redactions": 0,
+      "observed_file_mtime_utc": "2026-10-02T16:21:02.983294+00:00",
+      "execution_started_at_utc": null,
+      "source_sha_at_invocation": null,
+      "exact_original_argv": null,
+      "unknown_fields": [
+        "exact_checkout_sha_at_invocation",
+        "exact_argv_with_environment",
+        "execution_utc_timestamp",
+        "original_stdout_stderr_execution_receipt"
+      ],
+      "source_association": {
+        "sha": "aa2fe1c3ac38274912017412e080a9bbd14c9485",
+        "basis": "previous_session_execution_record_attests_relevant_source_equivalence; not embedded in TSV or a contemporaneous file receipt",
+        "certainty": "session_attestation_only"
+      },
+      "observed_config": {
+        "scenario": "all",
+        "requests_per_scenario": 32,
+        "sample_and_observation_capacity": 512,
+        "evidence": "TSV admitted counter and header capacity",
+        "build_profile": "release",
+        "build_profile_evidence": "previous session context and filename; not TSV header",
+        "toolchain": "1.99.0",
+        "toolchain_evidence": "previous session execution record; no saved rustc receipt"
+      },
+      "reproduction_source_sha": "aa2fe1c3ac38274912017412e080a9bbd14c9485",
+      "reproduction_recipe_kind": "current_frozen_source_recipe_not_recovered_historical_argv",
+      "reproduction_argv": [
+        "cargo",
+        "+1.96.0",
+        "run",
+        "--manifest-path",
+        "crates/rz-runtime/Cargo.toml",
+        "--locked",
+        "--offline",
+        "--release",
+        "--example",
+        "cpu_trace",
+        "--",
+        "--scenario",
+        "all",
+        "--requests",
+        "32",
+        "--sample-capacity",
+        "512"
+      ],
+      "input_kind": "self_generated_synthetic_integer_fixture",
+      "timing_kind": "synthetic_stage_clock_and_real_Instant_wall_clock",
+      "backend": "cpu-mock",
+      "neural_inference": false,
+      "gpu": "unexecuted",
+      "historical_byte_reproduction_expected": false
+    },
+    {
+      "path": "traces/original/cpu-trace-all-rust1.96.tsv",
+      "kind": "original_aggregate_tsv_stdout",
+      "bytes": 35085,
+      "original_sha256": "6df64036e9b527eaac33fe299d7a79d4e328e158b161d742d1123f2781e73c88",
+      "published_sha256": "6df64036e9b527eaac33fe299d7a79d4e328e158b161d742d1123f2781e73c88",
+      "byte_identity": true,
+      "redactions": 0,
+      "observed_file_mtime_utc": "2026-10-02T16:27:13.093220+00:00",
+      "execution_started_at_utc": null,
+      "source_sha_at_invocation": null,
+      "exact_original_argv": null,
+      "unknown_fields": [
+        "exact_checkout_sha_at_invocation",
+        "exact_argv_with_environment",
+        "execution_utc_timestamp",
+        "original_stdout_stderr_execution_receipt"
+      ],
+      "source_association": {
+        "sha": "aa2fe1c3ac38274912017412e080a9bbd14c9485",
+        "basis": "previous_session_execution_record_attests_relevant_source_equivalence; not embedded in TSV or a contemporaneous file receipt",
+        "certainty": "session_attestation_only"
+      },
+      "observed_config": {
+        "scenario": "all",
+        "requests_per_scenario": 32,
+        "sample_and_observation_capacity": 512,
+        "evidence": "TSV admitted counter and header capacity",
+        "build_profile": "release",
+        "build_profile_evidence": "previous session context and filename; not TSV header",
+        "toolchain": "1.96.0",
+        "toolchain_evidence": "previous session execution record; no saved rustc receipt"
+      },
+      "reproduction_source_sha": "aa2fe1c3ac38274912017412e080a9bbd14c9485",
+      "reproduction_recipe_kind": "current_frozen_source_recipe_not_recovered_historical_argv",
+      "reproduction_argv": [
+        "cargo",
+        "+1.96.0",
+        "run",
+        "--manifest-path",
+        "crates/rz-runtime/Cargo.toml",
+        "--locked",
+        "--offline",
+        "--release",
+        "--example",
+        "cpu_trace",
+        "--",
+        "--scenario",
+        "all",
+        "--requests",
+        "32",
+        "--sample-capacity",
+        "512"
+      ],
+      "input_kind": "self_generated_synthetic_integer_fixture",
+      "timing_kind": "synthetic_stage_clock_and_real_Instant_wall_clock",
+      "backend": "cpu-mock",
+      "neural_inference": false,
+      "gpu": "unexecuted",
+      "historical_byte_reproduction_expected": false
+    },
+    {
+      "path": "traces/original/cpu-trace-all.tsv",
+      "kind": "original_aggregate_tsv_stdout",
+      "bytes": 33692,
+      "original_sha256": "a9b59e32ba64d8eb7ebaf5a53aa9514f39cdecf5c48da7a14fb28b5b636fe769",
+      "published_sha256": "a9b59e32ba64d8eb7ebaf5a53aa9514f39cdecf5c48da7a14fb28b5b636fe769",
+      "byte_identity": true,
+      "redactions": 0,
+      "observed_file_mtime_utc": "2026-10-02T16:14:00.282296+00:00",
+      "execution_started_at_utc": null,
+      "source_sha_at_invocation": null,
+      "exact_original_argv": null,
+      "unknown_fields": [
+        "exact_checkout_sha_at_invocation",
+        "exact_argv_with_environment",
+        "execution_utc_timestamp",
+        "original_stdout_stderr_execution_receipt"
+      ],
+      "source_association": {
+        "sha": null,
+        "basis": "unknown; early development field version",
+        "certainty": "unknown"
+      },
+      "observed_config": {
+        "scenario": "all",
+        "requests_per_scenario": 32,
+        "sample_and_observation_capacity": 512,
+        "evidence": "TSV admitted counter and header capacity",
+        "build_profile": "dev",
+        "build_profile_evidence": "previous session context and filename; not TSV header",
+        "toolchain": null,
+        "toolchain_evidence": "unknown"
+      },
+      "reproduction_source_sha": "aa2fe1c3ac38274912017412e080a9bbd14c9485",
+      "reproduction_recipe_kind": "current_frozen_source_recipe_not_recovered_historical_argv",
+      "reproduction_argv": [
+        "cargo",
+        "+1.96.0",
+        "run",
+        "--manifest-path",
+        "crates/rz-runtime/Cargo.toml",
+        "--locked",
+        "--offline",
+        "--example",
+        "cpu_trace",
+        "--",
+        "--scenario",
+        "all",
+        "--requests",
+        "32",
+        "--sample-capacity",
+        "512"
+      ],
+      "input_kind": "self_generated_synthetic_integer_fixture",
+      "timing_kind": "synthetic_stage_clock_and_real_Instant_wall_clock",
+      "backend": "cpu-mock",
+      "neural_inference": false,
+      "gpu": "unexecuted",
+      "historical_byte_reproduction_expected": false
+    },
+    {
+      "path": "traces/original/cpu-trace-long-loss-release.tsv",
+      "kind": "original_aggregate_tsv_stdout",
+      "bytes": 4877,
+      "original_sha256": "7d7c142ab641dc33a016a8640a338b950156bc464199c2aaeaee7e31b07eb3f2",
+      "published_sha256": "7d7c142ab641dc33a016a8640a338b950156bc464199c2aaeaee7e31b07eb3f2",
+      "byte_identity": true,
+      "redactions": 0,
+      "observed_file_mtime_utc": "2026-10-02T16:21:02.995294+00:00",
+      "execution_started_at_utc": null,
+      "source_sha_at_invocation": null,
+      "exact_original_argv": null,
+      "unknown_fields": [
+        "exact_checkout_sha_at_invocation",
+        "exact_argv_with_environment",
+        "execution_utc_timestamp",
+        "original_stdout_stderr_execution_receipt"
+      ],
+      "source_association": {
+        "sha": "aa2fe1c3ac38274912017412e080a9bbd14c9485",
+        "basis": "previous_session_execution_record_attests_relevant_source_equivalence; not embedded in TSV or a contemporaneous file receipt",
+        "certainty": "session_attestation_only"
+      },
+      "observed_config": {
+        "scenario": "long",
+        "requests_per_scenario": 2048,
+        "sample_and_observation_capacity": 2,
+        "evidence": "TSV admitted counter and header capacity",
+        "build_profile": "release",
+        "build_profile_evidence": "previous session context and filename; not TSV header",
+        "toolchain": "1.99.0",
+        "toolchain_evidence": "previous session execution record; no saved rustc receipt"
+      },
+      "reproduction_source_sha": "aa2fe1c3ac38274912017412e080a9bbd14c9485",
+      "reproduction_recipe_kind": "current_frozen_source_recipe_not_recovered_historical_argv",
+      "reproduction_argv": [
+        "cargo",
+        "+1.96.0",
+        "run",
+        "--manifest-path",
+        "crates/rz-runtime/Cargo.toml",
+        "--locked",
+        "--offline",
+        "--release",
+        "--example",
+        "cpu_trace",
+        "--",
+        "--scenario",
+        "long",
+        "--requests",
+        "2048",
+        "--sample-capacity",
+        "2"
+      ],
+      "input_kind": "self_generated_synthetic_integer_fixture",
+      "timing_kind": "synthetic_stage_clock_and_real_Instant_wall_clock",
+      "backend": "cpu-mock",
+      "neural_inference": false,
+      "gpu": "unexecuted",
+      "historical_byte_reproduction_expected": false
+    },
+    {
+      "path": "traces/original/cpu-trace-long-zero-release.tsv",
+      "kind": "original_aggregate_tsv_stdout",
+      "bytes": 4856,
+      "original_sha256": "7ab43537e4528b4ab558dec2a688c80bfa0d0e4dd5cbcfe05d4207565ee16747",
+      "published_sha256": "7ab43537e4528b4ab558dec2a688c80bfa0d0e4dd5cbcfe05d4207565ee16747",
+      "byte_identity": true,
+      "redactions": 0,
+      "observed_file_mtime_utc": "2026-10-02T16:21:02.999294+00:00",
+      "execution_started_at_utc": null,
+      "source_sha_at_invocation": null,
+      "exact_original_argv": null,
+      "unknown_fields": [
+        "exact_checkout_sha_at_invocation",
+        "exact_argv_with_environment",
+        "execution_utc_timestamp",
+        "original_stdout_stderr_execution_receipt"
+      ],
+      "source_association": {
+        "sha": "aa2fe1c3ac38274912017412e080a9bbd14c9485",
+        "basis": "previous_session_execution_record_attests_relevant_source_equivalence; not embedded in TSV or a contemporaneous file receipt",
+        "certainty": "session_attestation_only"
+      },
+      "observed_config": {
+        "scenario": "long",
+        "requests_per_scenario": 2048,
+        "sample_and_observation_capacity": 0,
+        "evidence": "TSV admitted counter and header capacity",
+        "build_profile": "release",
+        "build_profile_evidence": "previous session context and filename; not TSV header",
+        "toolchain": "1.99.0",
+        "toolchain_evidence": "previous session execution record; no saved rustc receipt"
+      },
+      "reproduction_source_sha": "aa2fe1c3ac38274912017412e080a9bbd14c9485",
+      "reproduction_recipe_kind": "current_frozen_source_recipe_not_recovered_historical_argv",
+      "reproduction_argv": [
+        "cargo",
+        "+1.96.0",
+        "run",
+        "--manifest-path",
+        "crates/rz-runtime/Cargo.toml",
+        "--locked",
+        "--offline",
+        "--release",
+        "--example",
+        "cpu_trace",
+        "--",
+        "--scenario",
+        "long",
+        "--requests",
+        "2048",
+        "--sample-capacity",
+        "0"
+      ],
+      "input_kind": "self_generated_synthetic_integer_fixture",
+      "timing_kind": "synthetic_stage_clock_and_real_Instant_wall_clock",
+      "backend": "cpu-mock",
+      "neural_inference": false,
+      "gpu": "unexecuted",
+      "historical_byte_reproduction_expected": false
+    },
+    {
+      "path": "traces/original/cpu-trace-loss.tsv",
+      "kind": "original_aggregate_tsv_stdout",
+      "bytes": 4656,
+      "original_sha256": "09052c824917c1c0702f0b5156b2fbccd697943d3cb996354f494254c583dc28",
+      "published_sha256": "09052c824917c1c0702f0b5156b2fbccd697943d3cb996354f494254c583dc28",
+      "byte_identity": true,
+      "redactions": 0,
+      "observed_file_mtime_utc": "2026-10-02T16:15:08.589161+00:00",
+      "execution_started_at_utc": null,
+      "source_sha_at_invocation": null,
+      "exact_original_argv": null,
+      "unknown_fields": [
+        "exact_checkout_sha_at_invocation",
+        "exact_argv_with_environment",
+        "execution_utc_timestamp",
+        "original_stdout_stderr_execution_receipt"
+      ],
+      "source_association": {
+        "sha": null,
+        "basis": "unknown; early development field version",
+        "certainty": "unknown"
+      },
+      "observed_config": {
+        "scenario": "cold",
+        "requests_per_scenario": 9,
+        "sample_and_observation_capacity": 1,
+        "evidence": "TSV admitted counter and header capacity",
+        "build_profile": "dev",
+        "build_profile_evidence": "previous session context and filename; not TSV header",
+        "toolchain": null,
+        "toolchain_evidence": "unknown"
+      },
+      "reproduction_source_sha": "aa2fe1c3ac38274912017412e080a9bbd14c9485",
+      "reproduction_recipe_kind": "current_frozen_source_recipe_not_recovered_historical_argv",
+      "reproduction_argv": [
+        "cargo",
+        "+1.96.0",
+        "run",
+        "--manifest-path",
+        "crates/rz-runtime/Cargo.toml",
+        "--locked",
+        "--offline",
+        "--example",
+        "cpu_trace",
+        "--",
+        "--scenario",
+        "cold",
+        "--requests",
+        "9",
+        "--sample-capacity",
+        "1"
+      ],
+      "input_kind": "self_generated_synthetic_integer_fixture",
+      "timing_kind": "synthetic_stage_clock_and_real_Instant_wall_clock",
+      "backend": "cpu-mock",
+      "neural_inference": false,
+      "gpu": "unexecuted",
+      "historical_byte_reproduction_expected": false
+    },
+    {
+      "path": "traces/original/cpu-trace-one.tsv",
+      "kind": "original_aggregate_tsv_stdout",
+      "bytes": 33178,
+      "original_sha256": "14f83e2db81866244e3e16035d70b8992784296282243c3da27888b2192c615a",
+      "published_sha256": "14f83e2db81866244e3e16035d70b8992784296282243c3da27888b2192c615a",
+      "byte_identity": true,
+      "redactions": 0,
+      "observed_file_mtime_utc": "2026-10-02T16:15:08.593161+00:00",
+      "execution_started_at_utc": null,
+      "source_sha_at_invocation": null,
+      "exact_original_argv": null,
+      "unknown_fields": [
+        "exact_checkout_sha_at_invocation",
+        "exact_argv_with_environment",
+        "execution_utc_timestamp",
+        "original_stdout_stderr_execution_receipt"
+      ],
+      "source_association": {
+        "sha": null,
+        "basis": "unknown; early development field version",
+        "certainty": "unknown"
+      },
+      "observed_config": {
+        "scenario": "all",
+        "requests_per_scenario": 1,
+        "sample_and_observation_capacity": 512,
+        "evidence": "TSV admitted counter and header capacity",
+        "build_profile": "dev",
+        "build_profile_evidence": "previous session context and filename; not TSV header",
+        "toolchain": null,
+        "toolchain_evidence": "unknown"
+      },
+      "reproduction_source_sha": "aa2fe1c3ac38274912017412e080a9bbd14c9485",
+      "reproduction_recipe_kind": "current_frozen_source_recipe_not_recovered_historical_argv",
+      "reproduction_argv": [
+        "cargo",
+        "+1.96.0",
+        "run",
+        "--manifest-path",
+        "crates/rz-runtime/Cargo.toml",
+        "--locked",
+        "--offline",
+        "--example",
+        "cpu_trace",
+        "--",
+        "--scenario",
+        "all",
+        "--requests",
+        "1",
+        "--sample-capacity",
+        "512"
+      ],
+      "input_kind": "self_generated_synthetic_integer_fixture",
+      "timing_kind": "synthetic_stage_clock_and_real_Instant_wall_clock",
+      "backend": "cpu-mock",
+      "neural_inference": false,
+      "gpu": "unexecuted",
+      "historical_byte_reproduction_expected": false
+    },
+    {
+      "path": "traces/original/cpu-trace-zero.tsv",
+      "kind": "original_aggregate_tsv_stdout",
+      "bytes": 32868,
+      "original_sha256": "94800008aec1c9d86bf9a4e8e4273b98afe754e48b6320992a59c5737676923e",
+      "published_sha256": "94800008aec1c9d86bf9a4e8e4273b98afe754e48b6320992a59c5737676923e",
+      "byte_identity": true,
+      "redactions": 0,
+      "observed_file_mtime_utc": "2026-10-02T16:15:08.581161+00:00",
+      "execution_started_at_utc": null,
+      "source_sha_at_invocation": null,
+      "exact_original_argv": null,
+      "unknown_fields": [
+        "exact_checkout_sha_at_invocation",
+        "exact_argv_with_environment",
+        "execution_utc_timestamp",
+        "original_stdout_stderr_execution_receipt"
+      ],
+      "source_association": {
+        "sha": null,
+        "basis": "unknown; early development field version",
+        "certainty": "unknown"
+      },
+      "observed_config": {
+        "scenario": "all",
+        "requests_per_scenario": 16,
+        "sample_and_observation_capacity": 0,
+        "evidence": "TSV admitted counter and header capacity",
+        "build_profile": "dev",
+        "build_profile_evidence": "previous session context and filename; not TSV header",
+        "toolchain": null,
+        "toolchain_evidence": "unknown"
+      },
+      "reproduction_source_sha": "aa2fe1c3ac38274912017412e080a9bbd14c9485",
+      "reproduction_recipe_kind": "current_frozen_source_recipe_not_recovered_historical_argv",
+      "reproduction_argv": [
+        "cargo",
+        "+1.96.0",
+        "run",
+        "--manifest-path",
+        "crates/rz-runtime/Cargo.toml",
+        "--locked",
+        "--offline",
+        "--example",
+        "cpu_trace",
+        "--",
+        "--scenario",
+        "all",
+        "--requests",
+        "16",
+        "--sample-capacity",
+        "0"
+      ],
+      "input_kind": "self_generated_synthetic_integer_fixture",
+      "timing_kind": "synthetic_stage_clock_and_real_Instant_wall_clock",
+      "backend": "cpu-mock",
+      "neural_inference": false,
+      "gpu": "unexecuted",
+      "historical_byte_reproduction_expected": false
+    }
+  ],
+  "frozen_source_files": [
+    {
+      "path": "crates/rz-runtime/Cargo.lock",
+      "bytes": 452,
+      "sha256": "52a6547b9507926c3ae58cd280ea61951ee3e6673dd202a2409dcd7ff09c207a"
+    },
+    {
+      "path": "crates/rz-runtime/Cargo.toml",
+      "bytes": 516,
+      "sha256": "b2618c0b684197d95766a84dd62812c6fdd37114cfbcf17caa06428223ba84c8"
+    },
+    {
+      "path": "crates/rz-runtime/README.md",
+      "bytes": 14343,
+      "sha256": "81703c14fba15552413983c92fa84fff64e384a078639dfce0e57ee0e1cda3c4"
+    },
+    {
+      "path": "crates/rz-runtime/examples/cpu_trace.rs",
+      "bytes": 42636,
+      "sha256": "a87b741eb62ab67ed06be500b6fbb1536c50a6ff9eda7550487a1267732cc2f6"
+    },
+    {
+      "path": "crates/rz-runtime/src/boundary.rs",
+      "bytes": 7482,
+      "sha256": "6e444119abec72b1add5c22deb5643fa0f380557f20e4063619d420387778293"
+    },
+    {
+      "path": "crates/rz-runtime/src/contracts.rs",
+      "bytes": 20433,
+      "sha256": "e6c8441290e07eb6dcdfa8fa49f8a39011117b293e4c77a304a7b31d88c969b7"
+    },
+    {
+      "path": "crates/rz-runtime/src/lib.rs",
+      "bytes": 440,
+      "sha256": "4c03ae528ab96c20208edd1b2da09eb2676c912efee2b489640b825cb3826c08"
+    },
+    {
+      "path": "crates/rz-runtime/src/observation.rs",
+      "bytes": 5209,
+      "sha256": "df38333162162d9f2e39e0722ab051111da75f6b64ed23e94a5eb3a8ba6017b2"
+    },
+    {
+      "path": "crates/rz-runtime/src/scheduler.rs",
+      "bytes": 28022,
+      "sha256": "d1f977c01a660aa601e0d09d630a335e647edb391666a08770fb3da4a8d61cae"
+    },
+    {
+      "path": "crates/rz-runtime/tests/contracts.rs",
+      "bytes": 26166,
+      "sha256": "4ce51cbac0621d3e5e3b48f881fac04d4aef4c4246c02e14c9fe6f6c56105b39"
+    },
+    {
+      "path": "crates/rz-runtime/tests/lifecycle.rs",
+      "bytes": 56128,
+      "sha256": "c0cbd4c893dbf8e145ab35f0ce76be7aa4fec6fecba944cc968cbb5d175a24ce"
+    },
+    {
+      "path": "crates/rz-telemetry/Cargo.lock",
+      "bytes": 156,
+      "sha256": "48954730daa9eda89958b9a01a17a84f58e8866206772c02f7b5916e6af84df6"
+    },
+    {
+      "path": "crates/rz-telemetry/Cargo.toml",
+      "bytes": 158,
+      "sha256": "37fa7b6f1a464cbb80840a32059ae7ae965cf77e9f56047e7a5e95a140d4390e"
+    },
+    {
+      "path": "crates/rz-telemetry/PROFILE.md",
+      "bytes": 5791,
+      "sha256": "7335fe4e5d143ddc2e51d7f62602d1420dc2e9aa3b0553f81031a3a5a9620cea"
+    },
+    {
+      "path": "crates/rz-telemetry/README.md",
+      "bytes": 3557,
+      "sha256": "ba4e17fb5d4d407199ad538b7cf0a07603aeb31ddac63d0e842f18b64ca9c721"
+    },
+    {
+      "path": "crates/rz-telemetry/src/lib.rs",
+      "bytes": 18429,
+      "sha256": "00f9cf4e6eeb0c69ec514f8f5e168655e058cdb75109ca0f7e9d16268a34591e"
+    },
+    {
+      "path": "crates/rz-telemetry/src/profile.rs",
+      "bytes": 37536,
+      "sha256": "2b5f8c289315bcf2f01943db71322aad17c8884db8f925abb04d3cc01c47a1e0"
+    },
+    {
+      "path": "crates/rz-telemetry/tests/profile.rs",
+      "bytes": 17362,
+      "sha256": "3d41ace07bed505898280adfa7a0b6c5c543d30927113a5b75b2eabc3286d63e"
+    }
+  ],
+  "missing": [
+    {
+      "item": "historical_check_stdout_stderr",
+      "status": "missing_not_previously_saved",
+      "replacement": "new recapture logs only; originals cannot be recovered"
+    },
+    {
+      "item": "historical_exact_checkout_sha_argv_environment_execution_receipt",
+      "status": "missing",
+      "replacement": "unknown plus explicitly labeled session attestation where available"
+    },
+    {
+      "item": "historical_per_request_input_and_observation_event_dump",
+      "status": "missing_not_previously_saved",
+      "replacement": "source-based input recipe; aggregate TSV only"
+    },
+    {
+      "item": "historical_separate_implementation_plan_and_ledger",
+      "status": "no_separate_file_found",
+      "replacement": "new preservation plan and ledger; not historical originals"
+    },
+    {
+      "item": "E_and_F_artifacts",
+      "status": "outside_D_ownership_not_collected"
+    },
+    {
+      "item": "neural_GPU_D03_arena_training_evidence",
+      "status": "unexecuted_not_missing_success_evidence"
+    }
+  ],
+  "excluded": [
+    "build cache and compiled output",
+    "toolchain installers and binaries",
+    "external data and unverified-rights weights",
+    "credential/environment dumps"
+  ],
+  "retention": "Original TSVs and raw recapture logs remain outside Git; no deletion performed."
+}

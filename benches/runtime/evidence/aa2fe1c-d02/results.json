@@ -1,0 +1,3126 @@
+{
+  "format": "rove-d-preservation-results-v1",
+  "created_at_utc": "2026-10-02T17:04:00.809837+00:00",
+  "source_sha_for_recapture": "aa2fe1c3ac38274912017412e080a9bbd14c9485",
+  "check_count": 8,
+  "checks_all_exit_zero": true,
+  "test_results": {
+    "runtime-tests": {
+      "suites": [
+        {
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "passed": 14,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "passed": 30,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "passed": 51,
+      "failed": 0,
+      "ignored": 0
+    },
+    "telemetry-tests": {
+      "suites": [
+        {
+          "passed": 8,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "passed": 10,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "passed": 18,
+      "failed": 0,
+      "ignored": 0
+    }
+  },
+  "tests_passed": 69,
+  "tests_failed": 0,
+  "tests_ignored": 0,
+  "non_test_checks": [
+    "runtime-fmt",
+    "telemetry-fmt",
+    "runtime-clippy",
+    "telemetry-clippy",
+    "runtime-default-check",
+    "runtime-msrv-check"
+  ],
+  "traces": [
+    {
+      "path": "traces/original/cpu-trace-all-release.tsv",
+      "data_rows": 770,
+      "diagnostic": "bounded_cpu_mock_profile_with_limited_id_history",
+      "per_scenario": {
+        "cold": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": {
+            "value": "false",
+            "unit": "bool"
+          },
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "102383",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "302784.641982",
+            "unit": "requests/s"
+          }
+        },
+        "warm": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": {
+            "value": "false",
+            "unit": "bool"
+          },
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "78128",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "396784.763465",
+            "unit": "requests/s"
+          }
+        },
+        "parent-child": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": {
+            "value": "false",
+            "unit": "bool"
+          },
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "69034",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "449054.089289",
+            "unit": "requests/s"
+          }
+        },
+        "sibling": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": {
+            "value": "false",
+            "unit": "bool"
+          },
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "72988",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "424727.352441",
+            "unit": "requests/s"
+          }
+        },
+        "transposition": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": {
+            "value": "false",
+            "unit": "bool"
+          },
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "91181",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "339983.110516",
+            "unit": "requests/s"
+          }
+        },
+        "eviction": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": {
+            "value": "false",
+            "unit": "bool"
+          },
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "71355",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "434447.480905",
+            "unit": "requests/s"
+          }
+        },
+        "long": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": {
+            "value": "false",
+            "unit": "bool"
+          },
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "68226",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "454372.233459",
+            "unit": "requests/s"
+          }
+        }
+      },
+      "missing_metric_policy": "null means this field was not emitted; never substitute zero"
+    },
+    {
+      "path": "traces/original/cpu-trace-all-rust1.96.tsv",
+      "data_rows": 770,
+      "diagnostic": "bounded_cpu_mock_profile_with_limited_id_history",
+      "per_scenario": {
+        "cold": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": {
+            "value": "false",
+            "unit": "bool"
+          },
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "109868",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "282156.769942",
+            "unit": "requests/s"
+          }
+        },
+        "warm": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": {
+            "value": "false",
+            "unit": "bool"
+          },
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "114290",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "271239.828506",
+            "unit": "requests/s"
+          }
+        },
+        "parent-child": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": {
+            "value": "false",
+            "unit": "bool"
+          },
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "68765",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "450810.732204",
+            "unit": "requests/s"
+          }
+        },
+        "sibling": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": {
+            "value": "false",
+            "unit": "bool"
+          },
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "73973",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "419071.823503",
+            "unit": "requests/s"
+          }
+        },
+        "transposition": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": {
+            "value": "false",
+            "unit": "bool"
+          },
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "71515",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "433475.494651",
+            "unit": "requests/s"
+          }
+        },
+        "eviction": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": {
+            "value": "false",
+            "unit": "bool"
+          },
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "70812",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "437778.907530",
+            "unit": "requests/s"
+          }
+        },
+        "long": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": {
+            "value": "false",
+            "unit": "bool"
+          },
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "93246",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "332453.939043",
+            "unit": "requests/s"
+          }
+        }
+      },
+      "missing_metric_policy": "null means this field was not emitted; never substitute zero"
+    },
+    {
+      "path": "traces/original/cpu-trace-all.tsv",
+      "data_rows": 742,
+      "diagnostic": "bounded_cpu_mock_profile_with_limited_id_history",
+      "per_scenario": {
+        "cold": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "883707",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "35079.500332",
+            "unit": "requests/s"
+          }
+        },
+        "warm": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "620988",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "49920.449348",
+            "unit": "requests/s"
+          }
+        },
+        "parent-child": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "618994",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "50081.260885",
+            "unit": "requests/s"
+          }
+        },
+        "sibling": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "694833",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "44615.036995",
+            "unit": "requests/s"
+          }
+        },
+        "transposition": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "673448",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "46031.764888",
+            "unit": "requests/s"
+          }
+        },
+        "eviction": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "602642",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "51440.158502",
+            "unit": "requests/s"
+          }
+        },
+        "long": {
+          "admitted": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "31",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "32",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "24",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "6",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "773821",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "40060.944327",
+            "unit": "requests/s"
+          }
+        }
+      },
+      "missing_metric_policy": "null means this field was not emitted; never substitute zero"
+    },
+    {
+      "path": "traces/original/cpu-trace-long-loss-release.tsv",
+      "data_rows": 109,
+      "diagnostic": "observation_disabled_or_saturated_incomplete_profile",
+      "per_scenario": {
+        "long": {
+          "admitted": {
+            "value": "2048",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "2047",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": {
+            "value": "2047",
+            "unit": "requests"
+          },
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "9213",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "12509",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "12509",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "2038",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": {
+            "value": "true",
+            "unit": "bool"
+          },
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "5022055",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "407602.067281",
+            "unit": "requests/s"
+          }
+        }
+      },
+      "missing_metric_policy": "null means this field was not emitted; never substitute zero"
+    },
+    {
+      "path": "traces/original/cpu-trace-long-zero-release.tsv",
+      "data_rows": 109,
+      "diagnostic": "observation_disabled_or_saturated_incomplete_profile",
+      "per_scenario": {
+        "long": {
+          "admitted": {
+            "value": "2048",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "2047",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": {
+            "value": "2047",
+            "unit": "requests"
+          },
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "14591",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "12262",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "12262",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "2040",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": {
+            "value": "true",
+            "unit": "bool"
+          },
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "4395164",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "465739.162407",
+            "unit": "requests/s"
+          }
+        }
+      },
+      "missing_metric_policy": "null means this field was not emitted; never substitute zero"
+    },
+    {
+      "path": "traces/original/cpu-trace-loss.tsv",
+      "data_rows": 105,
+      "diagnostic": "observation_disabled_or_saturated_incomplete_profile",
+      "per_scenario": {
+        "cold": {
+          "admitted": {
+            "value": "9",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "8",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "51",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "24",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "24",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "285889",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "27982.888464",
+            "unit": "requests/s"
+          }
+        }
+      },
+      "missing_metric_policy": "null means this field was not emitted; never substitute zero"
+    },
+    {
+      "path": "traces/original/cpu-trace-one.tsv",
+      "data_rows": 742,
+      "diagnostic": "bounded_cpu_mock_profile_with_limited_id_history",
+      "per_scenario": {
+        "cold": {
+          "admitted": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "94938",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "0.000000",
+            "unit": "requests/s"
+          }
+        },
+        "warm": {
+          "admitted": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "35975",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "0.000000",
+            "unit": "requests/s"
+          }
+        },
+        "parent-child": {
+          "admitted": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "35778",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "0.000000",
+            "unit": "requests/s"
+          }
+        },
+        "sibling": {
+          "admitted": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "29433",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "0.000000",
+            "unit": "requests/s"
+          }
+        },
+        "transposition": {
+          "admitted": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "28017",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "0.000000",
+            "unit": "requests/s"
+          }
+        },
+        "eviction": {
+          "admitted": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "32883",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "0.000000",
+            "unit": "requests/s"
+          }
+        },
+        "long": {
+          "admitted": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "0",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "29075",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "0.000000",
+            "unit": "requests/s"
+          }
+        }
+      },
+      "missing_metric_policy": "null means this field was not emitted; never substitute zero"
+    },
+    {
+      "path": "traces/original/cpu-trace-zero.tsv",
+      "data_rows": 735,
+      "diagnostic": "observation_disabled_or_saturated_incomplete_profile",
+      "per_scenario": {
+        "cold": {
+          "admitted": {
+            "value": "16",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "15",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "113",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "70",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "70",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "8",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "285555",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "52529.285076",
+            "unit": "requests/s"
+          }
+        },
+        "warm": {
+          "admitted": {
+            "value": "16",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "15",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "113",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "70",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "70",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "8",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "192156",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "78061.574970",
+            "unit": "requests/s"
+          }
+        },
+        "parent-child": {
+          "admitted": {
+            "value": "16",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "15",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "113",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "70",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "70",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "8",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "190371",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "78793.513718",
+            "unit": "requests/s"
+          }
+        },
+        "sibling": {
+          "admitted": {
+            "value": "16",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "15",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "113",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "70",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "70",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "8",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "211042",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "71075.899584",
+            "unit": "requests/s"
+          }
+        },
+        "transposition": {
+          "admitted": {
+            "value": "16",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "15",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "113",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "70",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "70",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "8",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "269152",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "55730.590893",
+            "unit": "requests/s"
+          }
+        },
+        "eviction": {
+          "admitted": {
+            "value": "16",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "15",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "113",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "70",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "70",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "8",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "190094",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "78908.329563",
+            "unit": "requests/s"
+          }
+        },
+        "long": {
+          "admitted": {
+            "value": "16",
+            "unit": "requests"
+          },
+          "completed": {
+            "value": "15",
+            "unit": "requests"
+          },
+          "canceled": {
+            "value": "1",
+            "unit": "requests"
+          },
+          "actual_consumed_requests": null,
+          "consumed_requests": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "physical_items_completed": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "unused_items_finalized": {
+            "value": "0",
+            "unit": "requests"
+          },
+          "reserved_final.host": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.device": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "reserved_final.pinned": {
+            "value": "0",
+            "unit": "bytes"
+          },
+          "completeness.external_events_dropped": {
+            "value": "113",
+            "unit": "events"
+          },
+          "completeness.observation_errors": {
+            "value": "70",
+            "unit": "events"
+          },
+          "completeness.fixture_record_errors": {
+            "value": "70",
+            "unit": "events"
+          },
+          "completeness.tracking_capacity_rejections": {
+            "value": "8",
+            "unit": "events"
+          },
+          "completeness.request_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.execution_ids_evicted": {
+            "value": "0",
+            "unit": "ids"
+          },
+          "completeness.duplicate_checks_cover_all_ids": null,
+          "stage.transfer.p50": {
+            "value": "na",
+            "unit": "fixture-ns"
+          },
+          "actual_wall": {
+            "value": "193507",
+            "unit": "ns"
+          },
+          "actual_wall_consumed_rate": {
+            "value": "77516.575628",
+            "unit": "requests/s"
+          }
+        }
+      },
+      "missing_metric_policy": "null means this field was not emitted; never substitute zero"
+    }
+  ],
+  "interpretation": {
+    "input": "synthetic integer fixture; no chess positions or model data",
+    "stage_time": "synthetic fixture clock",
+    "wall_time": "actual CPU process execution measured with Instant",
+    "reserved_memory": "scheduler ledger; not RSS or GPU memory",
+    "aggregate_not_event_dump": true,
+    "saturation": "capacity0/1/2 traces intentionally have incomplete collector profiles; preserve all error/drop flags",
+    "identity_history": "bounded history can evict old IDs even in nominal traces; not exhaustive duplicate proof",
+    "gpu": "unexecuted",
+    "neural_inference": false,
+    "D03": "unexecuted"
+  }
+}
