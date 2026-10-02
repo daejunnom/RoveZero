@@ -94,7 +94,7 @@ pub struct ContractSearchConfig {
 #[derive(Clone, Debug)]
 pub enum ContractSearchFailure {
     Boundary(ContractError),
-    Evaluation(EvalFailure),
+    Evaluation(Box<EvalFailure>),
     Tree(SearchError),
     Cleanup {
         primary: Box<Self>,
@@ -130,6 +130,8 @@ pub enum ContractSearchStatus {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ContractSearchMetrics {
+    pub submission_attempts: u64,
+    /// Runtime이 논리적으로 수락한 제출 수. submit 호출 시도와 구별한다.
     pub submissions: u64,
     pub accepted_outputs: u64,
     /// 서로 다른 execution ID를 포함한 수락 결과 수다. 물리 완료 계측이 아니다.
@@ -163,6 +165,12 @@ pub enum ContractPumpEvent {
     },
     /// 다른 요청 또는 잘못 echo된 context는 현재 reservation을 소비하지 않는다.
     Diagnostic(ContractError),
+    /// 원래 결과·실패 원인·recovery를 보존한다. Dispatcher는 이 소유한 결과를
+    /// 실제 subscriber에게 전달하거나 이전 요청의 진단으로 기록할 수 있다.
+    RejectedResult {
+        error: ContractError,
+        result: Box<EvalResult>,
+    },
     Finished,
 }
 
@@ -183,6 +191,16 @@ pub struct ContractSearch<P: ContractPosition, S: SelectionPolicy = Puct> {
     simulations: u64,
     metrics: ContractSearchMetrics,
     accepted_executions: HashSet<ExecutionId>,
+}
+
+impl<P: ContractPosition, S: SelectionPolicy> Drop for ContractSearch<P, S> {
+    fn drop(&mut self) {
+        // Covers unwind while submit/poll owns a temporarily detached Pending as well.
+        // This revokes logical acceptance only; Runtime retains every physical lease.
+        if matches!(self.status, ContractSearchStatus::Running) || self.pending.is_some() {
+            self.config.cancellation.cancel();
+        }
+    }
 }
 
 impl<P: ContractPosition> ContractSearch<P, Puct> {
@@ -258,6 +276,9 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
     }
 
     /// 기다리지 않는 논리 상태 전이. Runtime의 각 메서드도 blocking하면 안 된다.
+    /// 이 탐색은 해당 poll stream의 단일 활성 consumer다. 이전 탐색을 논리적으로
+    /// 닫은 뒤 stream을 재사용한다. 동시 탐색은 Runtime dispatcher가 RequestId별로
+    /// 분리한 evaluator stream을 제공해야 하며 전역 poll stream을 함께 읽으면 안 된다.
     pub fn pump<R, C, L, K>(
         &mut self,
         runtime: &mut R,
@@ -448,6 +469,15 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
                 );
             }
         };
+        let attempts = match self.metrics.submission_attempts.checked_add(1) {
+            Some(count) => count,
+            None => {
+                return self.fail_ticket(
+                    &selection.ticket,
+                    ContractSearchFailure::Tree(SearchError::CounterOverflow),
+                );
+            }
+        };
         // Request construction and attestation are part of the move's own budget.
         // Read live authority and all admission boundaries after that preparation.
         let final_admission = leaf.validate_authority().and_then(|()| {
@@ -480,6 +510,7 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             );
             return ContractPumpEvent::Finished;
         }
+        self.metrics.submission_attempts = attempts;
         if let Err(error) = runtime.submit(Arc::clone(&request)) {
             return self.fail_ticket(&selection.ticket, ContractSearchFailure::Boundary(error));
         }
@@ -532,13 +563,14 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         };
         if context != pending.request.context() {
             self.pending = Some(pending);
-            return self.diagnostic(
+            return self.rejected_result(
                 runtime,
                 boundary(
                     ErrorCode::IdentityMismatch,
                     Stage::Output,
                     "foreign or malformed response context; active request remains pending",
                 ),
+                result,
             );
         }
         match result {
@@ -546,7 +578,9 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             EvalResult::Failed(failure) => {
                 self.release_ticket(
                     &pending.ticket,
-                    ContractSearchStatus::Failed(ContractSearchFailure::Evaluation(failure)),
+                    ContractSearchStatus::Failed(ContractSearchFailure::Evaluation(Box::new(
+                        failure,
+                    ))),
                 );
                 ContractPumpEvent::Finished
             }
@@ -715,10 +749,11 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         }
     }
 
-    fn diagnostic<R: Evaluator<P::State>>(
+    fn rejected_result<R: Evaluator<P::State>>(
         &mut self,
         runtime: &mut R,
         error: ContractError,
+        result: EvalResult,
     ) -> ContractPumpEvent {
         match self.metrics.diagnostics.checked_add(1) {
             Some(count) => self.metrics.diagnostics = count,
@@ -737,10 +772,12 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
                 if let Some(error) = cleanup {
                     self.record_runtime_cleanup(error);
                 }
-                return ContractPumpEvent::Finished;
             }
         }
-        ContractPumpEvent::Diagnostic(error)
+        ContractPumpEvent::RejectedResult {
+            error,
+            result: Box::new(result),
+        }
     }
 
     fn fail_ticket(

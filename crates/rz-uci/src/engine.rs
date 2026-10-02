@@ -356,6 +356,103 @@ impl Default for EngineSettings {
         }
     }
 }
+/// Fixed-size receipts preserve rejected failures without retaining foreign
+/// policy/input buffers. The current common failure has context/error/recovery;
+/// it has no separate, unbounded external backend cause field.
+#[derive(Clone, Debug)]
+pub enum WorkerDiagnosticReceipt {
+    Boundary(contract::ContractError),
+    RejectedFailure {
+        rejection: contract::ContractError,
+        failure: Box<contract::EvalFailure>,
+    },
+    RejectedCompletion {
+        rejection: contract::ContractError,
+        kind: RejectedCompletionKind,
+        context: Box<contract::CompletionContext>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RejectedCompletionKind {
+    Completed,
+    Canceled,
+    Expired,
+    Stale,
+}
+
+impl PartialEq for WorkerDiagnosticReceipt {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Boundary(left), Self::Boundary(right)) => left == right,
+            (
+                Self::RejectedFailure {
+                    rejection: left,
+                    failure: left_failure,
+                },
+                Self::RejectedFailure {
+                    rejection: right,
+                    failure: right_failure,
+                },
+            ) => {
+                left == right
+                    && left_failure.context == right_failure.context
+                    && left_failure.error == right_failure.error
+                    && left_failure.recovery == right_failure.recovery
+            }
+            (
+                Self::RejectedCompletion {
+                    rejection: left,
+                    kind: left_kind,
+                    context: left_context,
+                },
+                Self::RejectedCompletion {
+                    rejection: right,
+                    kind: right_kind,
+                    context: right_context,
+                },
+            ) => left == right && left_kind == right_kind && left_context == right_context,
+            _ => false,
+        }
+    }
+}
+impl Eq for WorkerDiagnosticReceipt {}
+impl fmt::Display for WorkerDiagnosticReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Boundary(error) => write!(formatter, "{error}"),
+            Self::RejectedFailure { rejection, failure } => write!(
+                formatter,
+                "{rejection}; rejected failure: {}; recovery={:?}; context={:?}",
+                failure.error, failure.recovery, failure.context,
+            ),
+            Self::RejectedCompletion {
+                rejection,
+                kind,
+                context,
+            } => write!(
+                formatter,
+                "{rejection}; rejected outcome={kind:?}; context={context:?}",
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DiagnosticRetentionFailure {
+    error: contract::ContractError,
+    receipt: WorkerDiagnosticReceipt,
+}
+impl fmt::Display for DiagnosticRetentionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}; original diagnostic: {}",
+            self.error, self.receipt
+        )
+    }
+}
+
 #[derive(Debug)]
 pub enum EngineError {
     Contract(contract::ContractError),
@@ -363,7 +460,7 @@ pub enum EngineError {
     Transport(Box<ServeError<EngineError>>),
     WorkerPanic,
     DrainTimeout,
-    UndeliveredDiagnostics(Vec<(contract::ContractError, u64)>),
+    UndeliveredDiagnostics(Vec<(WorkerDiagnosticReceipt, u64)>),
     Cleanup {
         primary: Box<EngineError>,
         cleanup: Vec<EngineError>,
@@ -395,7 +492,7 @@ struct Owner {
     settings: EngineSettings,
     workers: Vec<JoinHandle<Result<(), contract::ContractError>>>,
     pending_failures: VecDeque<(SearchTicket, SearchCompletion)>,
-    diagnostics: Arc<Mutex<Vec<(contract::ContractError, u64)>>>,
+    diagnostics: Arc<Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>>,
 }
 impl Owner {
     fn pending_failure(
@@ -608,6 +705,7 @@ impl Owner {
                         };
                     let mut previous_move = None;
                     let mut authority_error = None;
+                    let mut diagnostic_failure = None;
                     while !search.is_finished() {
                         if control.cancellation.load(Ordering::Acquire) {
                             authority.cancel();
@@ -641,17 +739,9 @@ impl Owner {
                                 )
                             },
                         );
-                        if let rz_search::contracts::ContractPumpEvent::Diagnostic(error) = &event {
-                            if let Err(error) = retain_diagnostic(&diagnostics, *error) {
-                                authority.cancel();
-                                authority_error = Some(error);
-                            }
-                            // The typed receipt stays shared with the owner even
-                            // when wakeup cannot enter the full bounded queue.
-                            let _ = events.try_send(Event::RejectedInput {
-                                code: "OwnerWake",
-                                message: String::new(),
-                            });
+                        if let Err(error) = consume_pump_diagnostic(&event, &diagnostics, &events) {
+                            authority.cancel();
+                            diagnostic_failure = Some(error);
                         }
                         let best = search.outcome().best_move;
                         if best != previous_move {
@@ -670,9 +760,13 @@ impl Owner {
                         }
                     }
                     let outcome = search.outcome();
-                    let completion = match (authority_error, outcome.status) {
-                        (Some(error), _) => failed_completion(error),
-                        (_, rz_search::contracts::ContractSearchStatus::Failed(error)) => {
+                    let completion = match (diagnostic_failure, authority_error, outcome.status) {
+                        (Some(error), _, _) => SearchCompletion::Failed {
+                            code: "DiagnosticRetentionFailure".into(),
+                            message: error.to_string(),
+                        },
+                        (_, Some(error), _) => failed_completion(error),
+                        (_, _, rz_search::contracts::ContractSearchStatus::Failed(error)) => {
                             SearchCompletion::Failed {
                                 code: "SearchFailed".into(),
                                 message: format!("{error:?}"),
@@ -750,29 +844,99 @@ fn append_result<S>(out: &mut SessionResult<S>, next: SessionResult<S>) {
     out.accepted &= next.accepted;
 }
 
+fn consume_pump_diagnostic(
+    event: &rz_search::contracts::ContractPumpEvent,
+    receipts: &Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>,
+    sender: &SyncSender<Event>,
+) -> Result<(), DiagnosticRetentionFailure> {
+    use rz_search::contracts::ContractPumpEvent;
+    let receipt = match event {
+        ContractPumpEvent::Diagnostic(error) => WorkerDiagnosticReceipt::Boundary(*error),
+        ContractPumpEvent::RejectedResult { error, result } => match result.as_ref() {
+            contract::EvalResult::Failed(failed) => WorkerDiagnosticReceipt::RejectedFailure {
+                rejection: *error,
+                failure: Box::new(failed.clone()),
+            },
+            result => {
+                let (kind, context) = match result {
+                    contract::EvalResult::Completed(output) => (
+                        RejectedCompletionKind::Completed,
+                        contract::CompletionContext {
+                            request: output.context,
+                            execution: output.actual.execution,
+                        },
+                    ),
+                    contract::EvalResult::Canceled(context) => {
+                        (RejectedCompletionKind::Canceled, *context)
+                    }
+                    contract::EvalResult::Expired(context) => {
+                        (RejectedCompletionKind::Expired, *context)
+                    }
+                    contract::EvalResult::Stale(context) => {
+                        (RejectedCompletionKind::Stale, *context)
+                    }
+                    contract::EvalResult::Failed(_) => unreachable!("handled failed result above"),
+                };
+                WorkerDiagnosticReceipt::RejectedCompletion {
+                    rejection: *error,
+                    kind,
+                    context: Box::new(context),
+                }
+            }
+        },
+        _ => return Ok(()),
+    };
+    let retained = retain_diagnostic(receipts, receipt);
+    // The typed receipt stays owner-held even if the bounded queue is full.
+    let _ = sender.try_send(Event::RejectedInput {
+        code: "OwnerWake",
+        message: String::new(),
+    });
+    retained
+}
+
 fn retain_diagnostic(
-    receipts: &Mutex<Vec<(contract::ContractError, u64)>>,
-    error: contract::ContractError,
-) -> Result<(), contract::ContractError> {
-    let mut receipts = receipts.lock().map_err(|_| {
-        failure(
-            contract::ErrorCode::BackendFailure,
-            "worker diagnostic receipt owner poisoned",
-        )
-    })?;
-    if let Some((_, count)) = receipts.iter_mut().find(|(existing, _)| *existing == error) {
-        *count = count.checked_add(1).ok_or_else(|| {
-            failure(
-                contract::ErrorCode::ResourceExhausted,
-                "worker diagnostic occurrence count exhausted",
-            )
-        })?;
+    receipts: &Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>,
+    receipt: WorkerDiagnosticReceipt,
+) -> Result<(), DiagnosticRetentionFailure> {
+    let mut receipts = match receipts.lock() {
+        Ok(receipts) => receipts,
+        Err(_) => {
+            return Err(DiagnosticRetentionFailure {
+                error: failure(
+                    contract::ErrorCode::BackendFailure,
+                    "worker diagnostic receipt owner poisoned",
+                ),
+                receipt,
+            });
+        }
+    };
+    if let Some((_, count)) = receipts
+        .iter_mut()
+        .find(|(existing, _)| *existing == receipt)
+    {
+        let Some(next) = count.checked_add(1) else {
+            return Err(DiagnosticRetentionFailure {
+                error: failure(
+                    contract::ErrorCode::ResourceExhausted,
+                    "worker diagnostic occurrence count exhausted",
+                ),
+                receipt,
+            });
+        };
+        *count = next;
     } else if receipts.len() < 32 {
-        receipts.push((error, 1));
+        receipts.push((receipt, 1));
     } else {
-        // The error that exceeds the finite class budget becomes the search's
-        // explicit failure; the preceding receipt classes remain owner-held.
-        return Err(error);
+        // Overflow remains an explicit completion failure containing the original
+        // receipt; it neither overwrites nor silently drops the 32 owned classes.
+        return Err(DiagnosticRetentionFailure {
+            error: failure(
+                contract::ErrorCode::ResourceExhausted,
+                "worker diagnostic receipt class limit exhausted",
+            ),
+            receipt,
+        });
     }
     Ok(())
 }
@@ -1178,8 +1342,8 @@ mod tests {
             contract::Stage::Output,
             "foreign response context",
         );
-        retain_diagnostic(&owner.diagnostics, cause).unwrap();
-        retain_diagnostic(&owner.diagnostics, cause).unwrap();
+        retain_diagnostic(&owner.diagnostics, WorkerDiagnosticReceipt::Boundary(cause)).unwrap();
+        retain_diagnostic(&owner.diagnostics, WorkerDiagnosticReceipt::Boundary(cause)).unwrap();
         assert!(
             sender
                 .try_send(Event::RejectedInput {
@@ -1199,5 +1363,193 @@ mod tests {
                     && diagnostic.message.contains("occurrences=2"))
         );
         assert!(owner.diagnostics.lock().unwrap().is_empty());
+    }
+
+    fn foreign_failure_event(
+        owner: &mut Owner,
+        session: &mut Session<RulesUciPort>,
+    ) -> rz_search::contracts::ContractPumpEvent {
+        use rz_search::contracts::{ContractPumpEvent, ContractSearch, ContractSearchConfig};
+        struct ForeignRuntime(Option<contract::EvalContext>);
+        impl contract::Evaluator<RulesState> for ForeignRuntime {
+            fn submit(
+                &mut self,
+                request: Arc<contract::EvalRequest<RulesState>>,
+            ) -> Result<(), contract::ContractError> {
+                assert!(self.0.replace(request.context()).is_none());
+                Ok(())
+            }
+            fn poll(&mut self) -> Option<contract::EvalResult> {
+                let mut context = self.0.take()?;
+                context.request.sequence += 100;
+                Some(contract::EvalResult::Failed(contract::EvalFailure {
+                    context: contract::CompletionContext {
+                        request: context,
+                        execution: Some(contract::ExecutionId::new(context.request.epoch, 51)),
+                    },
+                    error: contract::ContractError::new(
+                        contract::ErrorCode::BackendFailure,
+                        contract::Stage::Backend,
+                        "foreign physical callback failed",
+                    ),
+                    recovery: contract::RecoveryOutcome::Failed,
+                }))
+            }
+            fn cancel(&mut self, _: contract::RequestId) -> Result<(), contract::ContractError> {
+                Ok(())
+            }
+        }
+        let start = owner.handle(session, Event::Line("go nodes 1".into()));
+        let snapshot = start
+            .effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::Start { snapshot, .. } => Some(snapshot),
+                _ => None,
+            })
+            .unwrap();
+        let profile = owner.factory.profile();
+        let scope = owner.session_owner.scope();
+        let config = ContractSearchConfig {
+            scope,
+            model: profile.model,
+            precision: profile.precision,
+            compute: profile.compute,
+            bytes: profile.bytes,
+            policy_tolerance: 1e-5,
+            wdl_tolerance: 1e-5,
+            cancellation: owner.session_owner.cancellation().unwrap().token(),
+            deadlines: *owner.session_owner.deadlines().unwrap(),
+            ids: Arc::clone(&owner.ids),
+            max_simulations: 1,
+            tree_limits: owner.settings.tree,
+        };
+        let mut search = ContractSearch::new(snapshot, config).unwrap();
+        let mut runtime = ForeignRuntime(None);
+        let pump = |search: &mut ContractSearch<RulesSearchPosition>,
+                    runtime: &mut ForeignRuntime| {
+            search.pump(
+                runtime,
+                &owner.clock,
+                || scope,
+                |_, _| Ok(contract::EvalInputKey(contract::Digest([9; 32]))),
+            )
+        };
+        assert!(matches!(
+            pump(&mut search, &mut runtime),
+            ContractPumpEvent::Submitted { .. }
+        ));
+        let event = pump(&mut search, &mut runtime);
+        assert!(
+            matches!(&event, ContractPumpEvent::RejectedResult { result, .. } if matches!(result.as_ref(), contract::EvalResult::Failed(_)))
+        );
+        assert!(!search.is_finished());
+        assert_eq!(search.outcome().counters.completed_visits, 0);
+        event
+    }
+
+    #[test]
+    fn actual_rules_search_rejection_keeps_original_failure_across_full_queue_and_new_root() {
+        let (mut owner, mut session) = fixture();
+        let event = foreign_failure_event(&mut owner, &mut session);
+        // Replacement precedes delivery: a prior worker may only report causes.
+        assert!(
+            owner
+                .handle(
+                    &mut session,
+                    Event::Line("position startpos moves e2e4".into())
+                )
+                .accepted
+        );
+        let (sender, events) = mpsc::sync_channel(1);
+        sender.send(Event::Line("isready".into())).unwrap();
+        consume_pump_diagnostic(&event, &owner.diagnostics, &sender).unwrap();
+        consume_pump_diagnostic(&event, &owner.diagnostics, &sender).unwrap();
+        let mut recovered = event.clone();
+        let rz_search::contracts::ContractPumpEvent::RejectedResult { result, .. } = &mut recovered
+        else {
+            panic!("rejected result required")
+        };
+        let contract::EvalResult::Failed(failure) = result.as_mut() else {
+            panic!("original failure required")
+        };
+        failure.recovery = contract::RecoveryOutcome::Completed;
+        consume_pump_diagnostic(&recovered, &owner.diagnostics, &sender).unwrap();
+        {
+            let receipts = owner.diagnostics.lock().unwrap();
+            assert_eq!(receipts.len(), 2);
+            assert_eq!(receipts[0].1, 2);
+            assert_eq!(receipts[1].1, 1);
+            let WorkerDiagnosticReceipt::RejectedFailure { rejection, failure } = &receipts[0].0
+            else {
+                panic!("original failure required")
+            };
+            assert_eq!(rejection.code, contract::ErrorCode::IdentityMismatch);
+            assert_eq!(failure.error.code, contract::ErrorCode::BackendFailure);
+            assert_eq!(failure.error.detail, "foreign physical callback failed");
+            assert_eq!(failure.recovery, contract::RecoveryOutcome::Failed);
+            assert_eq!(failure.context.execution.unwrap().sequence, 51);
+        }
+        let out = owner.handle(&mut session, events.recv().unwrap());
+        assert_eq!(out.protocol, ["readyok"]);
+        assert!(out.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("foreign physical callback failed")
+                && diagnostic.message.contains("recovery=Failed")
+                && diagnostic.message.contains("occurrences=2")
+        }));
+        assert!(session.active_ticket().is_none());
+        assert_eq!(
+            session.snapshot().state().snapshot().side_to_move(),
+            contract::Color::Black
+        );
+    }
+
+    #[test]
+    fn rejection_receipt_limit_retains_all_owned_classes_and_overflow_source() {
+        let (mut owner, mut session) = fixture();
+        let event = foreign_failure_event(&mut owner, &mut session);
+        let rz_search::contracts::ContractPumpEvent::RejectedResult { error, result } = event
+        else {
+            panic!("rejected result required")
+        };
+        let contract::EvalResult::Failed(original) = *result else {
+            panic!("original failure required")
+        };
+        for sequence in 1..=32 {
+            let mut failure = original.clone();
+            failure.context.request.request.sequence = sequence;
+            retain_diagnostic(
+                &owner.diagnostics,
+                WorkerDiagnosticReceipt::RejectedFailure {
+                    rejection: error,
+                    failure: Box::new(failure),
+                },
+            )
+            .unwrap();
+        }
+        let mut failure = original;
+        failure.context.request.request.sequence = 33;
+        failure.recovery = contract::RecoveryOutcome::Completed;
+        let overflow = retain_diagnostic(
+            &owner.diagnostics,
+            WorkerDiagnosticReceipt::RejectedFailure {
+                rejection: error,
+                failure: Box::new(failure),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(overflow.error.code, contract::ErrorCode::ResourceExhausted);
+        let WorkerDiagnosticReceipt::RejectedFailure { failure, .. } = &overflow.receipt else {
+            panic!("overflow cause required")
+        };
+        assert_eq!(failure.context.request.request.sequence, 33);
+        assert_eq!(failure.recovery, contract::RecoveryOutcome::Completed);
+        assert_eq!(failure.error.detail, "foreign physical callback failed");
+        assert!(overflow.to_string().contains("recovery=Completed"));
+        let receipts = owner.diagnostics.lock().unwrap();
+        assert_eq!(receipts.len(), 32);
+        assert!(receipts.iter().all(|(_, count)| *count == 1));
     }
 }

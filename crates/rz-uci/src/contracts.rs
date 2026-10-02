@@ -12,6 +12,7 @@ use rz_search::contract_time::{
     ContractCancellation, ContractClock, ContractDeadlines, InstantClock,
 };
 use rz_search::driver::SearchControl;
+use rz_search::time::TimeBudgetError;
 
 use crate::bridge::{BudgetKind, BuildSearchError, BuildSearchSettings, SearchBinding, SideToMove};
 use crate::{
@@ -373,17 +374,29 @@ impl ContractSessionOwner {
         let Some(current) = self.matching_current(ticket) else {
             return stale(None);
         };
-        // Completed infinite output waiting is passive; old timers never invent
-        // a new failure or release a second bestmove.
-        if current.work_completed {
-            current.cancellation.cancel();
-            return SessionResult::default().into();
+        // A timer owns output finalization, not worker result admission. A
+        // canceled worker cannot strand an otherwise current finite UCI owner.
+        if !same_scope(current.scope, scope) {
+            return rejected(error(
+                ErrorCode::Stale,
+                "search game/root or registry scope no longer current",
+            ));
         }
-        match acceptance(current, scope, clock, now) {
+        let tick = match clock.tick_at(now.max(Instant::now())) {
+            Ok(tick) => tick,
+            Err(err) => return rejected(err),
+        };
+        match current.deadlines.hard.accepts(clock.domain(), tick) {
             Ok(()) => rejected(error(
                 ErrorCode::InvalidInput,
                 "deadline event arrived before hard boundary",
             )),
+            Err(err) if err.code == ErrorCode::Expired && current.work_completed => {
+                // Only a reached timer may close passive infinite authority.
+                // Completed output waiting never becomes a new resource failure.
+                current.cancellation.cancel();
+                SessionResult::default().into()
+            }
             Err(err) if err.code == ErrorCode::Expired => expire_current(session, current, err),
             Err(err) => rejected(err),
         }
@@ -492,6 +505,9 @@ fn map_build_error(err: BuildSearchError) -> ContractError {
         BuildSearchError::UntimedDeadlineOverflow => {
             error(ErrorCode::ResourceExhausted, "untimed deadline overflow")
         }
+        BuildSearchError::TimeBudget(
+            TimeBudgetError::DurationOverflow(detail) | TimeBudgetError::DeadlineOverflow(detail),
+        ) => error(ErrorCode::ResourceExhausted, detail),
         BuildSearchError::TimeBudget(_) => error(
             ErrorCode::InvalidInput,
             "UCI time budget could not be constructed",

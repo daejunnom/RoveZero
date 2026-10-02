@@ -239,7 +239,8 @@ fn injected_loop_preserves_io_failure_cancellation_and_shutdown() {
     )
     .unwrap_err();
     assert!(matches!(error.failure, ServeFailure::Io(_)));
-    assert_eq!(handled, 2);
+    // The owner also receives EOF cleanup when the protocol write fails.
+    assert_eq!(handled, 3);
     assert!(matches!(effects[0], Effect::Start { .. }));
     assert!(matches!(effects[1], Effect::Cancel { .. }));
     assert!(matches!(effects[2], Effect::Shutdown));

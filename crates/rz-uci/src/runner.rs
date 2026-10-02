@@ -150,8 +150,14 @@ where
         let out = handle(session, event);
         let result = emit(out, protocol, diagnostics, &mut dispatch);
         if let Err(mut error) = result {
-            let shutdown = session.end_of_input();
+            // The injected owner also holds common cancellation/generation rights.
+            // Close those through the same reducer before trying runtime cleanup.
+            let mut shutdown = handle(session, Event::EndOfInput);
+            // Preserve transport shutdown even if a custom reducer ignored EOF.
+            let fallback = session.end_of_input();
+            shutdown.effects.extend(fallback.effects);
             error.diagnostics.extend(shutdown.diagnostics);
+            error.diagnostics.extend(fallback.diagnostics);
             for effect in shutdown.effects {
                 if let Err(err) = dispatch(effect) {
                     error.cleanup_failures.push(err);
