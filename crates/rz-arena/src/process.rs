@@ -4,8 +4,9 @@
 //! a `/proc` snapshot of that group: transient forks and children escaping with
 //! a new session/group require a future cgroup adapter. A leader is not reaped
 //! while group cleanup is in progress, so its reserved PID cannot name another
-//! group. The tree API also retains this reservation after unverified cleanup;
-//! the older flat APIs retain their original terminal-child reaping behavior.
+//! group. The tree API retains the original child after unverified cleanup;
+//! a PID reservation is proven only while reaping ownership is intact. The
+//! older flat APIs retain their original terminal-child reaping behavior.
 //! This requires unchanged default SIGCHLD handling and no foreign child reaper.
 
 use crate::ArenaError;
@@ -74,12 +75,14 @@ pub struct ProcessOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     /// A leader retained after the bounded cleanup interval. For the tree API,
-    /// this includes an observed terminal leader when cleanup is Unverified:
-    /// retaining it without wait/try_wait reserves its PID and process-group ID.
-    /// A typed external owner must confirm physical cleanup before reaping or
-    /// dropping that reservation. No subsequent kill/reap/drop is automatic.
-    /// The flat APIs retain their older pending-only behavior. A handle is not
-    /// returned after ownership was lost to an unsupported external reaper.
+    /// this includes an observed terminal leader when cleanup is Unverified.
+    /// With intact ownership, not reaping reserves its PID/process-group ID.
+    /// After ownership_lost, this is only the original handle for quarantine;
+    /// it proves no reservation and grants no numeric PID wait/signal authority.
+    /// A typed external owner must resolve physical cleanup and authority before
+    /// reaping or dropping it. No subsequent kill/reap/drop is automatic.
+    /// Flat APIs retain their older pending-only behavior and return no handle
+    /// after ownership was lost to an unsupported external reaper.
     pub pending_child: Option<std::process::Child>,
 }
 
@@ -304,6 +307,9 @@ pub fn supervise_in_directory(
 /// terminal leader is returned unreaped in pending_child. The caller must keep
 /// that reservation until its typed owner confirms physical cleanup; polling
 /// Child::try_wait also reaps and therefore releases the reservation.
+/// If reaping ownership is lost, the original Child is still returned for
+/// quarantine, with ownership_lost evidence: no reservation or further numeric
+/// PID wait/signal authority is established by preserving that handle.
 pub fn supervise_in_directory_with_tree(
     program: &File,
     args: &[OsString],
@@ -601,25 +607,14 @@ mod linux {
             }
             std::thread::sleep(POLL);
         }
-        // WNOWAIT kept this PID reserved throughout every group signal. The
-        // tree owner must retain that reservation when physical cleanup is not
-        // confirmed, even if the leader itself is already terminal.
-        let retain_reservation = !ownership_lost
-            && (!leader_done
-                || (preserve_unverified && receipt.group_cleanup == CleanupStatus::Unverified));
-        if leader_done && !retain_reservation && !ownership_lost {
-            match child.wait() {
-                Ok(status) => {
-                    receipt.exit_code = status.code();
-                    receipt.exit_signal = status.signal();
-                }
-                Err(_) => evidence(&mut receipt, "process.reap"),
-            }
-        } else {
-            // A leader may still be in kernel IO, or already terminal while
-            // other cleanup is unverified. Keep the latter reservation too.
-            evidence(&mut receipt, "process.leader_unreaped");
-        }
+        let pending_child = finish_child(
+            child,
+            &mut receipt,
+            &mut stop,
+            leader_done,
+            ownership_lost,
+            preserve_unverified,
+        );
         receipt.stop = stop.unwrap_or(ProcessStop::Exited);
         receipt.elapsed_ns = u64::try_from(started.elapsed().as_nanos())
             .map_err(|_| ArenaError::Budget("process elapsed duration overflow".into()))?;
@@ -629,12 +624,52 @@ mod linux {
             receipt,
             stdout: out,
             stderr: err,
-            pending_child: if retain_reservation {
-                Some(child)
-            } else {
-                None
-            },
+            pending_child,
         })
+    }
+
+    fn finish_child(
+        mut child: std::process::Child,
+        receipt: &mut ProcessReceipt,
+        stop: &mut Option<ProcessStop>,
+        leader_done: bool,
+        ownership_lost: bool,
+        preserve_unverified: bool,
+    ) -> Option<std::process::Child> {
+        if preserve_unverified && ownership_lost {
+            // Preserve the original handle and evidence, not numeric PID
+            // authority: a foreign/automatic reaper may already have freed it.
+            receipt.group_cleanup = CleanupStatus::Unverified;
+            *stop = Some(ProcessStop::IoFailure);
+            evidence(receipt, "process.ownership_lost");
+        }
+        let retain_child = if preserve_unverified {
+            ownership_lost || !leader_done || receipt.group_cleanup == CleanupStatus::Unverified
+        } else {
+            !ownership_lost && !leader_done
+        };
+        if leader_done && !retain_child && !ownership_lost {
+            match child.wait() {
+                Ok(status) => {
+                    receipt.exit_code = status.code();
+                    receipt.exit_signal = status.signal();
+                }
+                Err(_) => {
+                    evidence(receipt, "process.reap");
+                    if preserve_unverified {
+                        receipt.group_cleanup = CleanupStatus::Unverified;
+                        *stop = Some(ProcessStop::IoFailure);
+                        evidence(receipt, "process.ownership_lost");
+                        return Some(child);
+                    }
+                }
+            }
+        } else {
+            // This supervisor did not reap it. With ownership_lost this is
+            // not a claim that a foreign reaper left the child unreaped.
+            evidence(receipt, "process.leader_unreaped");
+        }
+        retain_child.then_some(child)
     }
 
     fn native_elf(program: &File) -> Result<(), ArenaError> {
@@ -1002,6 +1037,119 @@ mod linux {
     fn evidence(receipt: &mut ProcessReceipt, code: &str) {
         if receipt.errors.len() < 16 && !receipt.errors.iter().any(|item| item == code) {
             receipt.errors.push(code.chars().take(256).collect());
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn externally_reaped_child() -> std::process::Child {
+            let child = Command::new("/bin/true")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
+            // Consume only this exact test-owned child, without a global child
+            // reaper. Child has not cached the status, so its later wait hits
+            // the real OS ECHILD boundary that a foreign reaper would create.
+            assert_eq!(
+                waitid(Id::Pid(pid), WaitPidFlag::WEXITED).unwrap(),
+                WaitStatus::Exited(pid, 0)
+            );
+            child
+        }
+
+        fn receipt(pid: u32, cleanup: CleanupStatus) -> ProcessReceipt {
+            ProcessReceipt {
+                supervisor_version: 1,
+                pid,
+                elapsed_ns: 0,
+                stop: ProcessStop::Exited,
+                exit_code: Some(0),
+                exit_signal: None,
+                group_cleanup: cleanup,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+                observed_output_bytes: 0,
+                descendant_cleanup_required: false,
+                child_limit_enforcement: "process_group_snapshot".into(),
+                watched_artifact_bytes: None,
+                artifact_limit_enforcement: None,
+                errors: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn tree_observation_ownership_loss_keeps_original_handle_without_reaping() {
+            for tree in [false, true] {
+                let child = externally_reaped_child();
+                let pid = child.id();
+                let mut receipt = receipt(pid, CleanupStatus::Unverified);
+                receipt.errors = vec![
+                    "process.wait_observation".into(),
+                    "process.ownership_lost".into(),
+                ];
+                let mut stop = Some(ProcessStop::IoFailure);
+                let pending = finish_child(child, &mut receipt, &mut stop, false, true, tree);
+                assert_eq!(
+                    pending.as_ref().map(std::process::Child::id),
+                    tree.then_some(pid)
+                );
+                assert_eq!(receipt.group_cleanup, CleanupStatus::Unverified);
+                assert_eq!(stop, Some(ProcessStop::IoFailure));
+                assert!(
+                    receipt
+                        .errors
+                        .iter()
+                        .any(|code| code == "process.ownership_lost")
+                );
+                // Ownership loss is evidence for quarantine, never permission
+                // to issue a numeric PID wait/signal from this returned handle.
+                assert!(!receipt.errors.iter().any(|code| code == "process.reap"));
+            }
+        }
+
+        #[test]
+        fn tree_reap_failure_keeps_original_handle_and_invalidates_cleanup() {
+            for tree in [false, true] {
+                let child = externally_reaped_child();
+                let pid = child.id();
+                let mut receipt = receipt(pid, CleanupStatus::Gone);
+                let mut stop = Some(ProcessStop::Exited);
+                let pending = finish_child(child, &mut receipt, &mut stop, true, false, tree);
+                assert_eq!(
+                    pending.as_ref().map(std::process::Child::id),
+                    tree.then_some(pid)
+                );
+                assert!(receipt.errors.iter().any(|code| code == "process.reap"));
+                assert_eq!(
+                    receipt.group_cleanup,
+                    if tree {
+                        CleanupStatus::Unverified
+                    } else {
+                        CleanupStatus::Gone
+                    }
+                );
+                assert_eq!(
+                    stop,
+                    Some(if tree {
+                        ProcessStop::IoFailure
+                    } else {
+                        ProcessStop::Exited
+                    })
+                );
+                assert_eq!(
+                    receipt
+                        .errors
+                        .iter()
+                        .any(|code| code == "process.ownership_lost"),
+                    tree
+                );
+            }
         }
     }
 }
