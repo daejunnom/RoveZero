@@ -97,6 +97,8 @@ pub enum Rejection {
     AlreadyFinalized,
     Canceled,
     Expired,
+    /// The consumer's live contract authority rejected the final commit.
+    AdmissionClosed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -430,6 +432,21 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
         value: f64,
         now: Instant,
     ) -> Result<Completion, SearchError> {
+        self.accept_evaluation_with_guard(ticket, moves, priors, value, now, || true)
+    }
+
+    /// The contract adapter rechecks live generations, Rules authority, cancellation
+    /// and its clock after all expansion/backup preparation. Rejection consumes the
+    /// reservation once without publishing edges or visits. It does not drain a backend.
+    pub fn accept_evaluation_with_guard(
+        &mut self,
+        ticket: &SelectionTicket,
+        moves: Vec<M>,
+        priors: &[f64],
+        value: f64,
+        now: Instant,
+        admit: impl FnOnce() -> bool,
+    ) -> Result<Completion, SearchError> {
         if let Some(completion) = self.check_acceptance(ticket, now)? {
             return Ok(completion);
         }
@@ -464,7 +481,7 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
             Ok((edges, backup)) => {
                 let pending = self.pending.as_ref().expect("checked live ticket");
                 let leaf = pending.leaf;
-                let completion = self.commit_backup(backup, now)?;
+                let completion = self.commit_backup(backup, now, admit)?;
                 if matches!(completion, Completion::Accepted { .. }) {
                     self.edge_count += edges.len();
                     self.nodes[leaf] = Node::Expanded(edges);
@@ -485,6 +502,18 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
         value: f64,
         now: Instant,
     ) -> Result<Completion, SearchError> {
+        self.accept_terminal_with_guard(ticket, value, now, || true)
+    }
+
+    /// Exact terminal traversal still belongs to the current root and game.
+    /// The final guard never creates an evaluation request for a terminal.
+    pub fn accept_terminal_with_guard(
+        &mut self,
+        ticket: &SelectionTicket,
+        value: f64,
+        now: Instant,
+        admit: impl FnOnce() -> bool,
+    ) -> Result<Completion, SearchError> {
         if let Some(completion) = self.check_acceptance(ticket, now)? {
             return Ok(completion);
         }
@@ -503,7 +532,7 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
         match prepared {
             Ok(backup) => {
                 let leaf = self.pending.as_ref().expect("checked live ticket").leaf;
-                let completion = self.commit_backup(backup, now)?;
+                let completion = self.commit_backup(backup, now, admit)?;
                 if matches!(completion, Completion::Accepted { .. }) {
                     self.nodes[leaf] = Node::Terminal(value);
                 }
@@ -548,6 +577,7 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
         &mut self,
         updates: Vec<(usize, usize, EdgeStats)>,
         supplied_now: Instant,
+        admit: impl FnOnce() -> bool,
     ) -> Result<Completion, SearchError> {
         let mut counters = self.counters;
         increment(&mut counters.reservations_released)?;
@@ -566,6 +596,16 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
             .expect("checked live ticket")
             .ticket
             .clone();
+        if let Some(completion) =
+            self.check_acceptance(&ticket, supplied_now.max(Instant::now()))?
+        {
+            return Ok(completion);
+        }
+        if !admit() {
+            return self.release(Rejection::AdmissionClosed);
+        }
+        // The external guard can perform authority checks. A local deadline or
+        // cancellation that changed during it must also leave the prepared tree untouched.
         if let Some(completion) =
             self.check_acceptance(&ticket, supplied_now.max(Instant::now()))?
         {
@@ -956,6 +996,53 @@ mod tests {
             tree.cancel(&child.ticket).unwrap(),
             Completion::Rejected(Rejection::AlreadyFinalized)
         );
+        assert_eq!(tree.counters().reservations_released, 2);
+    }
+
+    #[test]
+    fn final_contract_guard_releases_once_without_publishing_expansion() {
+        let now = Instant::now();
+        let mut tree = Tree::baseline(TreeLimits::default()).unwrap();
+        root(&mut tree, now, vec!["a"], &[1.0]);
+        let child = tree.begin_selection(now).unwrap();
+        let mut called = 0;
+        let completion = tree
+            .accept_evaluation_with_guard(&child.ticket, vec!["b"], &[1.0], -0.75, now, || {
+                called += 1;
+                false
+            })
+            .unwrap();
+        assert_eq!(called, 1);
+        assert_eq!(completion, Completion::Rejected(Rejection::AdmissionClosed));
+        assert_eq!(tree.root_stats()[0].1.visits, 0);
+        assert!(matches!(tree.nodes[1], Node::Unexpanded));
+        assert_eq!(tree.counters().reservations_released, 2);
+        assert_eq!(tree.counters().accepted_backups, 0);
+        assert_eq!(
+            tree.cancel(&child.ticket).unwrap(),
+            Completion::Rejected(Rejection::AlreadyFinalized)
+        );
+        let next = tree.begin_selection(now).unwrap();
+        assert_eq!(next.leaf, Leaf::Unexpanded);
+    }
+
+    #[test]
+    fn guarded_terminal_observes_local_cancellation_during_external_guard() {
+        let now = Instant::now();
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut tree = Tree::baseline(TreeLimits::default()).unwrap();
+        tree.set_cancellation(Arc::clone(&flag)).unwrap();
+        root(&mut tree, now, vec!["a"], &[1.0]);
+        let child = tree.begin_selection(now).unwrap();
+        let completion = tree
+            .accept_terminal_with_guard(&child.ticket, -1.0, now, || {
+                flag.store(true, Ordering::Release);
+                true
+            })
+            .unwrap();
+        assert_eq!(completion, Completion::Rejected(Rejection::Canceled));
+        assert_eq!(tree.root_stats()[0].1.visits, 0);
+        assert!(matches!(tree.nodes[1], Node::Unexpanded));
         assert_eq!(tree.counters().reservations_released, 2);
     }
 }

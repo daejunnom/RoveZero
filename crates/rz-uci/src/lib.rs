@@ -8,6 +8,7 @@
 
 pub mod bridge;
 pub mod engine;
+pub mod contracts;
 pub mod parser;
 pub mod runner;
 pub mod session;
