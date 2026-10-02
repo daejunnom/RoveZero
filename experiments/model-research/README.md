@@ -129,6 +129,14 @@ raw log를 Git에 넣지 않는다. 독립 클라우드의 예시 output root는
 환경 수명 동안 보존한다. 종료 전에 필요한 근거를 회수하고 검토된 인수 요약을
 [HANDOFF](HANDOFF.md)에 남긴다.
 
+검토한 공개 보존 사본 239개 파일은 저장소 밖
+`reports/coordinator-integration/recovered-pr-evidence/exact-blobs/F-bf38023`에 회수했다.
+전체 source Git blob identity·길이와 manifest·SHA256SUMS를 대조했다. 원본 결과,
+과거 combined log, 새 recheck, 재구성 audit, 파생 TSV와 경로 마스킹본을 구분한다.
+누락 wheel·마스킹 전 클라우드 원본까지 회수한 것으로 표시하지 않는다. 출처는
+[F 보존 커밋](https://github.com/daejunnom/RoveZero/tree/bf38023640b2882e079eafc43e437ea9384b78f9/experiments/model-research/verification/2026-10-03-f-evidence-v1),
+현재 인수와 외부 receipt는 [총괄 기록](../../docs/INTEGRATION-STATUS.md)을 따른다.
+
 ## 다음 연결 요구
 
 확인한 Rust revision 0.1과 향후 영속화 표현에 이 잠정 envelope의 adapter를

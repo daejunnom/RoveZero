@@ -92,8 +92,31 @@ Python에 재선언하지 않고 향후 F adapter가 연결할 move/order/identi
 
 ## 산출물 보존
 
-합성 fixture와 검토된 요약만 Git에 넣는다. 원시 output run과 package-check는
+일반적으로 합성 fixture와 검토된 요약을 Git에 넣는다. 원시 output run과 package-check는
 저장소 밖 이 작업의 전용 `rovezero-f01`/`rovezero-f02` output root에 두었다. 현재 클라우드 환경
 수명 동안 보존하고, 환경 종료 전에 필요한 report/package를 회수한다.
 공유 요약에서는 개인 경로·비밀·외부 가중치·raw teacher 기록을 포함하지 않는다.
 동일 run ID는 덮어쓰지 않으며 새로운 검사에는 새 run ID를 사용한다.
+
+당시 사용자 지시로 검토한 공개 검증 자료를
+[F 보존 커밋](https://github.com/daejunnom/RoveZero/tree/bf38023640b2882e079eafc43e437ea9384b78f9/experiments/model-research/verification/2026-10-03-f-evidence-v1)에 게시했다.
+원본 JSON 52개, 과거 commandExecution combined log 22개(실패 2개 포함), 실행 입력·
+recipe·split·checkpoint·receipt·export·package text metadata를 보존한다. 별도 보존용
+새 실행 13개의 stdout/stderr·명령·소스 SHA·결과, 같은 digest로 재구성한 누락 audit,
+receipt.history의 파생 TSV와 누락 원장도 포함한다. 파일별 byte SHA-256은 manifest와
+SHA256SUMS에 있다. 원래 execution-time source SHA가 없는 항목과 WIP source 미상은
+그대로 표시한다. 개인정보 경로를 마스킹하고 비밀/권리 검사를 거쳤으며 build cache·
+바이너리·외부 weights/data는 제외했다. source 구현은 변경하지 않았다. 원격 보존을
+확인한 뒤에도 원본 scratch 자료는 삭제하지 않는다.
+
+총괄은 `bf38023640b2882e079eafc43e437ea9384b78f9`의 239개 Git blob·917,150 bytes를
+저장소 밖 `reports/coordinator-integration/recovered-pr-evidence/exact-blobs/F-bf38023`에
+회수하고 모든 byte identity·길이와 외부 receipt를 확인했다. 독립 감사에서는 manifest
+237개, SHA256SUMS 238개, embedded payload digest 83개와 F02 receipt 11개가 맞았다.
+연속·pause/resume·installed resume의 model/optimizer/sampler/history/best 정합과
+elapsed time·전체 JSON byte 차이를 구분한다. source가 없는 historical 22개(실패 포함),
+source `36e619…`의 새 recheck 13개, 재구성 audit·파생 TSV·부재 wheel도 그대로 남긴다.
+마스킹 전 클라우드 원본이나 실제 Maia 학습·NN·GPU 인수의 근거로 올리지 않는다.
+과거 `bb232606…` remote receipt와 최신 사본의 byte 감사·총괄 회수 receipt는 별개다.
+외부 보존은 후속 인수와 별도 정리 지시까지 유지하며, 정확한 archive/receipt SHA와
+현재 integration 검사는 [총괄 인수 기록](../../docs/INTEGRATION-STATUS.md)을 따른다.
