@@ -99,12 +99,14 @@ impl RuntimeLibraryPin {
                 )
             })?;
         let directory = root.join(format!("ort-bootstrap-{}-{}", std::process::id(), sequence));
-        let mut builder = fs::DirBuilder::new();
+        let builder = fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
             builder.mode(0o700);
-        }
+            builder
+        };
         // create, never create_dir_all: a collision cannot be reused.
         builder
             .create(&directory)
@@ -172,11 +174,7 @@ impl RuntimeLibraryPin {
         // Only a failed, unpublished copy is eligible for local cleanup.
         if result.is_err() {
             #[cfg(windows)]
-            if let Ok(metadata) = fs::metadata(&path) {
-                let mut permissions = metadata.permissions();
-                permissions.set_readonly(false);
-                let _ = fs::set_permissions(&path, permissions);
-            }
+            let _ = clear_owned_windows_readonly_attribute(&path);
             let _ = fs::remove_file(&path);
             let _ = fs::remove_dir(&directory);
         }
@@ -195,6 +193,18 @@ impl RuntimeLibraryPin {
 
 fn io_error(detail: &'static str) -> BackendError {
     BackendError::new(K::Io, S::Backend, detail)
+}
+
+// Windows only: clear FILE_ATTRIBUTE_READONLY on this bootstrap's own copy.
+// Unlike Unix mode changes, this does not grant world write permission. Cleanup
+// calls this after its writer/pin has closed; the sharing regression also clears
+// the attribute while pinned to verify that write/delete sharing stays denied.
+#[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
+fn clear_owned_windows_readonly_attribute(path: &Path) -> std::io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions)
 }
 
 #[cfg(test)]
@@ -235,11 +245,7 @@ mod tests {
             fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
         }
         #[cfg(windows)]
-        {
-            let mut permissions = fs::metadata(&path).unwrap().permissions();
-            permissions.set_readonly(false);
-            fs::set_permissions(&path, permissions).unwrap();
-        }
+        clear_owned_windows_readonly_attribute(&path).unwrap();
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();
     }
@@ -304,9 +310,7 @@ mod tests {
             RuntimeLibraryPin::copy_verified(&source, &root, &asset::hex_sha256(FAKE_LIBRARY))
                 .unwrap();
         // Clear readonly to test OS sharing rather than just the attribute.
-        let mut permissions = fs::metadata(pin.path()).unwrap().permissions();
-        permissions.set_readonly(false);
-        fs::set_permissions(pin.path(), permissions).unwrap();
+        clear_owned_windows_readonly_attribute(pin.path()).unwrap();
         assert!(OpenOptions::new()
             .write(true)
             .share_mode(7)
