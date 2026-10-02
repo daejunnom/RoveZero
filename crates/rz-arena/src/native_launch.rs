@@ -310,6 +310,30 @@ pub(crate) mod linux {
     fn io(detail: &'static str) -> ArenaError {
         ArenaError::Io(detail.into())
     }
+    // cap_std's directory capability may use O_PATH. That descriptor can pin
+    // cwd/path authority, but Linux fchmod rejects it with EBADF. Open a real
+    // readable directory descriptor relative to the same capability instead.
+    fn readable_directory_pin(directory: &Dir) -> Result<File, ArenaError> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .follow(FollowSymlinks::No)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = directory
+            .open_with(".", &options)
+            .map_err(|_| io("cannot open readable native directory permissions pin"))?
+            .into_std();
+        if !file
+            .metadata()
+            .map_err(|_| io("cannot inspect readable native directory permissions pin"))?
+            .is_dir()
+        {
+            return Err(ArenaError::Integrity(
+                "native directory permissions pin is not a directory".into(),
+            ));
+        }
+        Ok(file)
+    }
     fn outside_git(path: &Path) -> Result<PathBuf, ArenaError> {
         let metadata =
             std::fs::symlink_metadata(path).map_err(|_| io("native output root unavailable"))?;
@@ -561,10 +585,7 @@ pub(crate) mod linux {
                 .try_clone()
                 .map_err(|_| io("cannot retain preparation evidence directory"))?,
         );
-        directory
-            .try_clone()
-            .map_err(|_| io("cannot clone native attempt permissions pin"))?
-            .into_std_file()
+        readable_directory_pin(&directory)?
             .set_permissions(Permissions::from_mode(0o700))
             .map_err(|_| io("cannot make native attempt private"))?;
         directory
@@ -573,10 +594,7 @@ pub(crate) mod linux {
         let inputs = directory
             .open_dir_nofollow("inputs")
             .map_err(|_| io("cannot pin native inputs directory"))?;
-        inputs
-            .try_clone()
-            .map_err(|_| io("cannot clone native inputs permissions pin"))?
-            .into_std_file()
+        readable_directory_pin(&inputs)?
             .set_permissions(Permissions::from_mode(0o700))
             .map_err(|_| io("cannot make native input directory private"))?;
         let path = root_path.join(label);
@@ -605,10 +623,7 @@ pub(crate) mod linux {
             pins.push(pin);
             receipts.push(receipt);
         }
-        inputs
-            .try_clone()
-            .map_err(|_| io("cannot clone native inputs seal pin"))?
-            .into_std_file()
+        readable_directory_pin(&inputs)?
             .set_permissions(Permissions::from_mode(0o500))
             .map_err(|_| io("cannot close native inputs directory to writes"))?;
         let runner_index = pins
@@ -624,10 +639,10 @@ pub(crate) mod linux {
             directory
                 .create_dir(name)
                 .map_err(|_| io("cannot create private role runtime root"))?;
-            let pin = directory
+            let role_directory = directory
                 .open_dir_nofollow(name)
-                .map_err(|_| io("cannot pin role runtime root"))?
-                .into_std_file();
+                .map_err(|_| io("cannot pin role runtime root"))?;
+            let pin = readable_directory_pin(&role_directory)?;
             pin.set_permissions(Permissions::from_mode(0o700))
                 .map_err(|_| io("cannot make role runtime root private"))?;
             runtime_root_pins.push(pin);

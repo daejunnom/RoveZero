@@ -135,6 +135,22 @@ fn native_snapshot_uses_new_inode_preserves_prior_attempt_and_fails_closed_on_pi
     .unwrap();
     fs::hard_link(source.join("input-1"), source.join("source-hardlink")).unwrap();
     let owner = prepare_native_launch(&spec, &source, &output, "attempt-one").unwrap();
+    for (relative, expected_mode) in [
+        ("attempt-one", 0o700),
+        ("attempt-one/inputs", 0o500),
+        ("attempt-one/baseline-runtime", 0o700),
+        ("attempt-one/candidate-runtime", 0o700),
+    ] {
+        assert_eq!(
+            fs::metadata(output.join(relative))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            expected_mode,
+            "owned directory permission boundary differs: {relative}"
+        );
+    }
     assert_eq!(owner.snapshots().len(), 7);
     assert!(
         owner

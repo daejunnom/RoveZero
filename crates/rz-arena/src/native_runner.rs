@@ -233,7 +233,7 @@ pub fn run_native_pair(
     #[cfg(target_os = "linux")]
     let result = linux::run(&mut bundle, cancel);
     #[cfg(not(target_os = "linux"))]
-    let result = {
+    let result: Result<(NativePairReceipt, rz_experiments::ArtifactRef), ArenaError> = {
         let _ = cancel;
         Err(ArenaError::Invalid(
             "CPU NN integration runner requires Linux".into(),
