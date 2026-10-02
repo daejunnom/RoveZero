@@ -9,4 +9,12 @@ description = "RoveZero's independent standard-chess rules and immutable positio
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+contracts = ["dep:rz-contracts", "dep:sha2"]
+
 [dependencies]
+# PR #7's reviewed 0.1 revision. The coordinator replaces this with a workspace
+# path dependency when accepting the consumers together; never track a branch.
+rz-contracts = { git = "https://github.com/daejunnom/RoveZero.git", rev = "ae7bf5c20c3acdc12ef7e20aa1a88b5853ee99c8", optional = true }
+sha2 = { version = "=0.10.9", optional = true }

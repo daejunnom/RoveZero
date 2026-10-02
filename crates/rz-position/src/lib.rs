@@ -24,6 +24,9 @@ mod outcome;
 mod position;
 mod types;
 
+#[cfg(feature = "contracts")]
+pub mod contracts;
+
 pub use outcome::*;
 pub use position::*;
 pub use types::*;

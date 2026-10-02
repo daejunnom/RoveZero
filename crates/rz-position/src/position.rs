@@ -135,6 +135,10 @@ impl PositionSnapshot {
     pub fn known_history_len(&self) -> usize {
         self.identity.history.len
     }
+    #[cfg(feature = "contracts")]
+    pub(crate) fn is_irreversible_boundary(&self) -> bool {
+        self.identity.history.irreversible
+    }
     /// Explicit audit helper. Encoding reads raw history without fabricating fill.
     pub fn known_history_fens(&self) -> Vec<String> {
         let mut result = Vec::with_capacity(self.known_history_len());
