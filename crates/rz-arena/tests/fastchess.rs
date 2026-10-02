@@ -509,6 +509,7 @@ mod fixture_mode_binary {
     //! Actual fixture binary checks, not runner/NN/strength acceptance.
     use std::{
         cell::RefCell,
+        fmt,
         io::{self, Read, Write},
         process::{Child, Command, Output, Stdio},
         rc::Rc,
@@ -523,6 +524,7 @@ mod fixture_mode_binary {
     #[derive(Debug, Default)]
     struct CleanupFailures {
         kill: Option<io::Error>,
+        initial_poll: Option<io::Error>,
         poll: Option<io::Error>,
         reap_timed_out: bool,
         readers_timed_out: bool,
@@ -531,10 +533,39 @@ mod fixture_mode_binary {
     impl CleanupFailures {
         fn is_empty(&self) -> bool {
             self.kill.is_none()
+                && self.initial_poll.is_none()
                 && self.poll.is_none()
                 && !self.reap_timed_out
                 && !self.readers_timed_out
                 && !self.reader_panicked
+        }
+    }
+    #[derive(Debug)]
+    enum AttemptFailure {
+        Io(&'static str, io::Error),
+        Channel(&'static str, mpsc::RecvTimeoutError),
+        ExitDeadline,
+        OutputLimit {
+            stdout_bytes: usize,
+            stderr_bytes: usize,
+        },
+    }
+    impl fmt::Display for AttemptFailure {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Io(stage, source) => write!(f, "{stage}: {source}"),
+                Self::Channel(stage, source) => write!(f, "{stage}: {source}"),
+                Self::ExitDeadline => {
+                    f.write_str("fixture exceeded its five-second external test deadline")
+                }
+                Self::OutputLimit {
+                    stdout_bytes,
+                    stderr_bytes,
+                } => write!(
+                    f,
+                    "fixture output exceeded {MAX_OUTPUT} bytes: stdout={stdout_bytes} stderr={stderr_bytes}"
+                ),
+            }
         }
     }
 
@@ -548,7 +579,15 @@ mod fixture_mode_binary {
     impl Drop for Attempt {
         fn drop(&mut self) {
             let mut cleanup = self.cleanup.borrow_mut();
-            if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let needs_kill = match self.child.try_wait() {
+                Ok(Some(_)) => false,
+                Ok(None) => true,
+                Err(error) => {
+                    cleanup.initial_poll = Some(error);
+                    true
+                }
+            };
+            if needs_kill {
                 cleanup.kill = self.child.kill().err();
             }
             let until = Instant::now() + Duration::from_secs(1);
@@ -614,48 +653,59 @@ mod fixture_mode_binary {
         let (stdout, out) = capture(attempt.child.stdout.take().unwrap());
         let (stderr, err) = capture(attempt.child.stderr.take().unwrap());
         attempt.readers = vec![out, err];
-        attempt
-            .child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .expect("write bounded fixture command sequence and close stdin");
-        let until = Instant::now() + WAIT;
-        let status = loop {
-            if let Some(status) = attempt.child.try_wait().expect("poll fixture exit") {
-                break status;
+        // Expected process/pipe failures return to this owner before any panic.
+        // Cleanup always runs and its independent causes join the primary error.
+        let primary = (|| -> Result<Output, AttemptFailure> {
+            attempt
+                .child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .map_err(|source| AttemptFailure::Io("write bounded fixture input", source))?;
+            let until = Instant::now() + WAIT;
+            let status = loop {
+                if let Some(status) = attempt
+                    .child
+                    .try_wait()
+                    .map_err(|source| AttemptFailure::Io("poll fixture exit", source))?
+                {
+                    break status;
+                }
+                if Instant::now() >= until {
+                    return Err(AttemptFailure::ExitDeadline);
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let stdout = stdout
+                .recv_timeout(WAIT)
+                .map_err(|source| AttemptFailure::Channel("bounded fixture stdout EOF", source))?
+                .map_err(|source| AttemptFailure::Io("read fixture stdout", source))?;
+            let stderr = stderr
+                .recv_timeout(WAIT)
+                .map_err(|source| AttemptFailure::Channel("bounded fixture stderr EOF", source))?
+                .map_err(|source| AttemptFailure::Io("read fixture stderr", source))?;
+            if stdout.len() > MAX_OUTPUT || stderr.len() > MAX_OUTPUT {
+                return Err(AttemptFailure::OutputLimit {
+                    stdout_bytes: stdout.len(),
+                    stderr_bytes: stderr.len(),
+                });
             }
-            assert!(
-                Instant::now() < until,
-                "fixture exceeded its five-second external test deadline"
-            );
-            thread::sleep(Duration::from_millis(10));
-        };
-        let stdout = stdout
-            .recv_timeout(WAIT)
-            .expect("bounded fixture stdout EOF")
-            .expect("read fixture stdout");
-        let stderr = stderr
-            .recv_timeout(WAIT)
-            .expect("bounded fixture stderr EOF")
-            .expect("read fixture stderr");
-        assert!(
-            stdout.len() <= MAX_OUTPUT && stderr.len() <= MAX_OUTPUT,
-            "bounded fixture process evidence"
-        );
-        let output = Output {
-            status,
-            stdout,
-            stderr,
-        };
+            Ok(Output {
+                status,
+                stdout,
+                stderr,
+            })
+        })();
         drop(attempt);
-        let cleanup = cleanup.borrow();
-        assert!(
-            cleanup.is_empty(),
-            "fixture cleanup failures retained: {cleanup:?}"
-        );
-        output
+        let cleanup = cleanup.replace(CleanupFailures::default());
+        match primary {
+            Ok(output) if cleanup.is_empty() => output,
+            Ok(_) => panic!("fixture cleanup failures retained: {cleanup:?}"),
+            Err(primary) => {
+                panic!("fixture primary failure: {primary}; cleanup failures retained: {cleanup:?}")
+            }
+        }
     }
     fn streams(output: &Output) -> (String, String) {
         (
