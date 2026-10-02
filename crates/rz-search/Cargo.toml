@@ -7,3 +7,4 @@ license = "MIT"
 description = "RoveZero deterministic PUCT accounting and time control"
 
 [dependencies]
+rz-contracts = { git = "https://github.com/daejunnom/RoveZero.git", rev = "67284c4f66f7a7ae9f46fa63dfd50e7410eb6845" }

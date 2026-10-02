@@ -252,6 +252,7 @@ impl<P: PositionPort> Session<P> {
     pub fn is_closed(&self) -> bool {
         self.closed
     }
+    pub fn parser_limits(&self) -> ParserLimits { self.parser_limits }
     pub fn active_ticket(&self) -> Option<SearchTicket> {
         self.active.as_ref().map(|a| a.ticket.clone())
     }
