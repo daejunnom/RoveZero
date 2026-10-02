@@ -1,7 +1,8 @@
 # E 역할 구현 계획 — TASK-E01/E02/E03
 
 작성일: 2026-10-03, Asia/Seoul. 담당: 사용자가 E 역할로 배정한 이 채팅의 에이전트.
-상태: E01 입력 단계의 첫 구현·로컬 검증 완료. 구현 진행과 실제 근거는 9절에 기록한다.
+상태: E01 입력 잠금과 E02 pair 계획·attempt 원장·원시 WDL/pentanomial 집계가
+제공됐다. 단독 검사 보고·후속 source 관찰·현재 총괄 통합 인수는 9절에서 구분한다.
 
 ## 1. 계획 수립 당시 기준과 상태
 
@@ -91,8 +92,10 @@ digest 계산용 직렬화의 필드 순서·숫자 표현·버전을 고정하�
 필수 적용 근거가 없으면 정식 비교 준비 완료로 표시하지 않는다. GPU 요구 모드의 CPU fallback도 거부한다.
 preflight에서 확인한 설정은 실행 시작 시 다시 대조하며, 평가 opening을 preflight 분석에 사용하지 않는다.
 
-설계할 CLI의 작업은 `validate → lock → plan → run → audit → report`와 `resume`이다.
-이는 구현 예정 동작이며 현재 실행 가능한 명령으로 제시하지 않는다.
+전체 CLI의 목표 흐름은 `validate → lock → plan → run → audit → report`와 `resume`이다.
+현재 제공 명령은 `rz-experiments`의 validate/lock/verify, `rz-arena`의
+plan/ledger-init/ledger-append/audit다. run·runner/process adapter·정식 통계 보고는
+후속이며 전체 흐름을 실행 가능한 현재 기능으로 제시하지 않는다.
 
 ## 5. E02 — pair 계획과 외부 실행
 
@@ -242,7 +245,36 @@ CLI 9개와 library 22개, 총 31개 테스트 및 fmt/clippy 검사를 통과�
 SHA-256을 실제 파일에서 대조했다. 의존성 resolution도 별도 lockfile로 보존한다.
 이는 입력 단계의 CPU 검사이며 CI·실제 엔진 대국·NN 수치·GPU·통계 계산 근거가 아니다.
 
-루트 workspace·Cargo.lock·CI·공통 타입은 총괄 I01 소유로 남겨 두었다.
-다음 구현 단위는 E02의 동일한 전체 시작 상태를 공유하는 color-swapped pair 계획과
-attempt/failure 원장이다. A의 상태 계약과 독립 opening 감사, runner의 실제 옵션·시계·
-종료 사건 연결 후 실행 인수를 진행한다. E03 집계·군집 통계·독립 holdout 비교는 후속이다.
+위 검사는 E 담당자가 첫 구현 당시 보고한 독립 package 결과다. 현재 통합 문서 작성에서
+그 실행을 다시 수행하지 않았으며 Linux 1.99/단독 MSRV 결과를 root 1.96.0/workspace
+1.90의 현재 SHA 검사 결과로 바꾸지 않는다.
+
+후속 PR #8 head `383eb05c55f65cd2df5c8642a7f374e50be084b5`의 source를 읽기 전용으로
+대조한 결과, `rz-arena`에도 동일 OpeningSpec의 엔진 색 배정만 교환하는 pair plan,
+plan 재생성/digest 대조, append-only attempt ledger·sequence/hash chain 감사,
+infrastructure-invalid pair 전체의 제한 재시도와 완료 pair WDL/n0..n4 집계가 제공됐다.
+이전 실패 attempt·incomplete·contract-invalid를 보존하며 engine loss를 인프라 재시도로
+숨기거나 미완료를 무승부로 집계하지 않는다. 계획의 입력 hash는 실제 A 상태 복원
+identity가 아니며 원장의 선언 결과·evidence hash도 실제 PGN/규칙/실행 인증이 아니다.
+
+source에서 manifest/CLI test 31개와 arena plan/ledger/CLI test 43개, 총 74개 선언을
+확인했다. 이 중 manifest/CLI 4개는 Unix 조건부다. 위 31개 과거 성공 보고와 이 74개
+선언 수를 현재 총괄 통합에서 실제로 74개가 실행·통과했다는 근거로 합치지 않는다.
+원시 WDL/pentanomial 회계는 제공되지만 군집 bootstrap·Elo/CI·SPRT·holdout 검정,
+실제 외부 runner/launch·UCI process·PGN 감사·시계·자원 공정성은 별도 미인수다.
+CLI의 execution_ready=false·structural_only를 유지하고 실제 adjudication adapter가
+없는 ProtocolAdjudicated 결과는 거부한다.
+
+공통 계약 PR #7은 병합됐고 총괄 I01/I02는 develop base
+`3e3cd80533a69ee2118f1c130e72a1cb0745ae8c`에서
+[Draft PR #9](https://github.com/daejunnom/RoveZero/pull/9)의 10개-crate root 통합과
+source adapter를 수동 정합 중이다. E의 standalone workspace/의존 선언도 root의
+single contract·path 의존·toolchain에 연결한다. captured E head, 총괄 변경 diff와
+최종 integration SHA의 실제 CPU 검사는 [INTEGRATION-STATUS](../../docs/INTEGRATION-STATUS.md)에
+따로 기록한다. 현재 문서 수정은 Git 작업·검사·실행 인수를 수행하지 않았다.
+
+다음 E 실행 인수는 A의 checked opening/PGN 복원·ordered legal/terminal/history,
+C의 실제 model/encoding/weight/backend/precision 근거, B의 UCI binary/옵션,
+D의 clock/drain/reset·자원 영수증과 외부 runner adapter를 연결하는 것이다.
+공통 revision 게시·A/C bridge·CPU fixture만으로 실제 NN/GPU·학습·정식 paired
+대국을 인수하지 않는다.
