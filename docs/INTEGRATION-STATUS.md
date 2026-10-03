@@ -507,3 +507,125 @@ P50/P95/P99·완전 event journal, process peak VRAM, D03 효과, 실제 학습�
 강도 판정은 pending이다. 파일 origin 감사도 exact mapped path/device/inode 범위이며
 개별 심볼 결합이나 모든 OS/driver ELF closure를 인증하지 않는다. 자세한 실행·로더 경계는
 [GPU-RUNTIME-BOOTSTRAP](GPU-RUNTIME-BOOTSTRAP.md)을 따른다.
+
+## 실제 Rules·CUDA·D 수치 연결
+
+[PR #14](https://github.com/daejunnom/RoveZero/pull/14)는 실제 A Rules→C CUDA owner→
+D scheduler→B UCI 소비와 E의 별도 GPU runner를 연결하는 후속 작업이다. 공통 계약은
+0.1을 유지하며 CPU V1 wire를 CUDA까지 확장하지 않는다. C origin·D device 예약·
+common delivery·B의 최종 guard 뒤 소비·E의 별도 DTO를 총괄이 수동으로 맞춘다.
+이 절의 수치 gate와 아래 UCI/runner 인수는 서로 다른 실행 증거로 기록한다.
+
+`f8b3ed5ea3f6fe7ed8f6fe68eb3b31c2daec6618`의 `rules_maia_check`로 실제 immutable
+Rules 상태 12개를 기존 LC0 원본 참조와 대조했다. 원본 No 5개·RepeatOldest 7개의
+입력과 출력 의미를 유지했다. 같은 binary의 명시 CPU 회귀도 별도 프로세스로 통과했다.
+UCI 첫 제품 프로필은 No이며 이 예제의 지원 encoding 범위와 구분한다.
+
+| 실제 로컬 검사 | 결과 / 범위 |
+|---|---|
+| C focused all-target/all-feature | 61 passed / 0 failed / 12 test binaries |
+| D focused all-target/all-feature | 58 passed / 0 failed / 4 test binaries |
+| B UCI/search focused all-target/all-feature | 245 passed / 0 failed / 13 test binaries; `16efe40` 관련 소스 |
+| 실제 Rules→C CUDA→D | 12개 dense input exact, legal policy 최대 오차 `8.940696716308594e-7`, WDL `4.172325134277344e-7`; 각 허용치 `1e-4` |
+| 같은 binary CPU 회귀 | 12개 dense input exact, policy `1.1920928955078125e-6`, WDL `4.76837158203125e-7`; 같은 허용치 |
+| CUDA origin·placement | 각 history profile의 actual `cuda_onnx`, device 0·arena 1 GiB·B1; 새 profile 각각 CUDA kernel 98·CPU 0 |
+| D 완료·종료 | 양 provider의 두 profile 모두 physical drained, execution/logical/host/device/pinned/request 예약 0, unexpected delivery·diagnostic 없음 |
+| 감독 종료 | 양 gate exit 0, 남은 전용 cgroup PID 없음, cgroup 제거 |
+
+예제 binary는 2,095,992 bytes,
+SHA `1d5459bdb677f10d48f1ebc7885c45b43bc9834bf81c4b168f57b20bd6aa3f22`다.
+CUDA report SHA는 `f9770dd69632793d591e8230f310699a3302d6867bc58349759c4d7b2950ded1`,
+execution receipt는 `3713afc51b390a67870dac89d10a6ef5bcd3c20effc2c0ed5e83d3826df793e9`다.
+CPU report SHA는 `4b18dcdecbeaf333079c80c985cdbd8fba869eb0e9bdbd3319e67cafa822e6c2`,
+receipt는 `ed3cfd5945ddf121d99ac6759c5135c38b590e4d81042bba12ed4861c882a8f1`다.
+새 CUDA placement의 실제 digest 두 개를 report와 독립 대조했으며, 이전 warm 파일을
+재사용하지 않았다. 작은 자료 14개·125,991 bytes를 저장소 밖
+`reports/coordinator-integration/native-gpu/captured-rules-f8b3ed5/`로 회수해 길이와
+hash를 각각 확인했다. 회수 receipt SHA는
+`bef0fd36cddd71cfdb2f4f257391cbfd0f1bbd39c2d4935ec7fdad62d0b31472`다.
+큰 native copy·weights·binary는 이 회수에 넣지 않고 Linux의 원본과 실행 사본을 보존한다.
+
+gate 상한은 wall 120초·cgroup RAM 4 GiB·swap 0·pids 128·CPU 2 core다.
+CUDA cgroup peak는 **4 GiB 상한에 도달**, max event 30,711·OOM/kill 0이었고 sampled
+RSS는 940,417,024 bytes였다. CPU cgroup peak는 96,051,200 bytes다. CUDA 16.134초와
+CPU 0.387초는 pin copy·hash·bootstrap·수치 검사를 포함하며 추론 속도 비교가 아니다.
+native 단일 파일 1 GiB·non-native 8 MiB·run 4 GiB의 관측 제한과 filesystem quota를
+구분한다. 100ms 전체 adapter 표본과 admission 선언은 process peak VRAM 증거가 아니다.
+
+독립 검토는 report·receipt·새 placement 7개, 111,379 bytes의 내용과 참조 digest를
+대조했다. binary/native byte를 재hash한 검토는 아니며 TF32 off·thread 1·fresh full-step과
+19개 세부 member는 같은 SHA의 source/closed profile 근거를 함께 사용한다. warm profile의
+model_run 하나와 case별 D 완료 12개는 별도 사실이고 전체 physical journal로 합치지 않는다.
+
+첫 WIP CI `37082982929`의 잠금 파일 누락은 `16bb00e`에서 수정했다. 후속
+`37083533259`는 Ubuntu·Windows 모두 CPU V1의 CudaOnnx 미처리 match에서 실패했으며,
+원래 job 로그를 보존했다. `16efe40`에서 typed CPU projection 거부와 CUDA 전용 DTO로
+정정하고 focused B 검사를 통과했다. 이 수치 gate만으로 B 소비/backup·GPU stop/
+deadline/root 교체·E runner의 인수를 주장하지 않는다. D02 종단 journal·process peak
+VRAM·D03 효과·실제 학습·정식 강도 비교도 별도다.
+
+## 실제 CUDA UCI 소비·합법 fallback·유한 회복
+
+`bd3e4e17b163b4b7b0917b79b07f0e73e2974eab`에서 Rust 1.96.0의 전체 workspace
+all-target/all-feature 검사는 **656 passed / 0 failed / 16 ignored**, 기본 native CLI는
+4 passed였으며 fmt와 strict clippy도 통과했다. CUDA UCI와 E arena의 release feature를
+명시해 빌드했다. CUDA는 별도 startup/final V1 DTO·파일명을 사용하고, CPU V1의 닫힌
+필드 집합에 CUDA 증거를 추가하지 않는다. 실제 CPU 회귀 receipt도 이를 대조했다.
+
+같은 source의 `rz-uci`는 2,949,408 bytes,
+SHA `eb9849946a8d9c8ae992eadd81fdf9a22a8bcb7f1d9265a1e030bf820b75718f`다.
+실제 CUDA gate receipt SHA는
+`3ee013e3e8c705620c12cdf5e5c78e9a0f98eb491aa1b89ec075703f476f815b`, CPU 회귀는
+`2acd02cc5ec1af24932b1be5b509b5ecaee997f2647fdd297ee8bbb3cfc136b0`다.
+새 CUDA placement trace의 실제 SHA는
+`d93d6e3ebcb4f98bcf225d6acc66bf5e36d7422c072d06acb1ecaa2a75c4b134`이며,
+warm probe의 Node 98개는 모두 CUDA, CPU Node는 0이었다. 이 warm trace를 D 완료
+횟수나 모든 physical inference 호출의 journal로 해석하지 않는다.
+
+| 실제 프로세스 검사 | CUDA | 명시 CPU 회귀 |
+|---|---|---|
+| 독립 opening fixture의 합법 착수 | 5개, duplicate bestmove 없음 | 같은 5개, duplicate 없음 |
+| D normal-poll computed 완료 | 45 | 51 |
+| B 최종 tree guard 뒤 소비 | root 초기화 4, non-root backup 41 | CPU V1에는 이 CUDA 전용 필드를 직렬화하지 않음 |
+| stop 직후 새 게임의 네 번째 착수 | `WorkerLimit`의 합법 fallback `a7a5` | 같은 busy fallback |
+| 별도 회복 단계 | 고정 250ms 뒤 단 한 번의 go, game 3/root 12의 computed 완료와 guarded non-root backup | 같은 game 3/root 12의 computed 완료 |
+| 종료 | exit 0, confirmed physical drain, original/collection/mapping failure 없음, 관측 손실·overflow 0 | exit 0, confirmed drain, original/collection failure 없음 |
+
+실제 transcript는 `uci/isready`, 흑백 opening 상태, `go infinite`, 연속 stop 두 번,
+`ucinewgame`, quit를 포함한다. 네 번째 수의 busy fallback과 Admission/Stale 진단을
+stderr에 보존한다. 다섯 번째 수의 실제 새 game/root 문맥으로 회복을 확인했으며,
+250ms 대기나 `isready` 응답 자체를 physical drain 증거로 쓰지 않았다. 모든 root의
+일대일 journal, 강제로 배치한 physical race, 모든 취소/deadline 조합의 실제 GPU
+검증을 완료했다고 보고하지 않는다. 기존 `6d340ea` v1의 네 번째 CUDA fallback과
+회복 미입증 결과도 원본 그대로 보존한다.
+
+외부 gate는 wall 120초·cgroup RAM 4 GiB·swap 0·pids 128·CPU 2 core·단일 파일
+1 GiB로 제한했다. run 4 GiB·non-native 8 MiB·stdout/stderr 합계 2 MiB의 감독 관측을
+구분한다. CUDA cgroup peak는 **4 GiB 상한**, max event 30,663·OOM/kill 0이었고
+sampled RSS는 940,212,224 bytes였다. observed kernel VmPeak는 38,827,732,992 bytes다.
+이 UCI gate에는 RLIMIT_AS를 설치하지 않았으므로 후속 128 GiB 제한의 실제 성공으로
+승격하지 않는다. CPU cgroup peak는 94,617,600 bytes다. 두 gate는 남은 cgroup PID 없이
+종료하고 전용 cgroup을 제거했다. 전체 adapter의 100ms 표본은 process peak VRAM이 아니다.
+
+`37085303468`의 양 OS CI는 큰 `ContractPumpEvent` payload에 대한 strict clippy로
+실패했다. `Option<Box<AcceptedEvaluation>>`와 명시 consumer borrow로 수정하고 tree
+guard·wire 의미를 유지했다. 이어 E의 불필요한 borrow와 C 예제의 cohesive profile
+인자 묶음을 수정했다. `37086216891`은 Ubuntu 성공·Windows의 Linux 전용 import
+경고 실패였으며 해당 실제 job 로그를 보존하고 cfg 범위를 맞췄다.
+
+최종 product source `e0d7e131548fe0d84bda9b38ef261adcc3390e79`의
+[CI 37086498966](https://github.com/daejunnom/RoveZero/actions/runs/37086498966)은 Ubuntu·
+Windows 모두 fmt·workspace·기본 CLI·독립 Rules·F fixture·strict clippy에 성공했다.
+`bd3e4e1` 이후 source 차이는 E의 Linux 전용 import뿐이다. 같은 설정으로 다시 빌드한
+UCI의 실제 bytes·SHA가 위 gate binary와 같음을 확인했으며 B/C/D/Rules·workspace·
+가중치·backend 입력이 바뀌지 않았다. 재사용 확인을 새 GPU 실행으로 표시하지 않는다.
+E의 현재 release binary는 별도로 빌드했으며 실제 GPU pair 인수는 후속 절에 기록한다.
+
+독립 검토는 v2 helper·build·양 gate·startup/final·stdout/stderr·새 placement 13개,
+95,488 bytes의 실제 내용을 대조했다. 별도 Windows 회수에는 adapter 표본과 최종
+재빌드 기록도 포함하여 **16개·101,340 bytes**를 저장소 밖
+`reports/coordinator-integration/native-gpu/captured-uci-bd3e4e1-v2/`에 보존하고 각 길이와
+SHA를 확인했다. 회수 receipt SHA는
+`4c1a4f12e680eb2ef919c62a0cc9199c5fd03db2ed36c762c0268e4270ec39e4`다.
+큰 native library·모델·binary를 이 metadata 회수에 넣지 않았다. 원본 Linux gate와
+private native copy는 보존하며, 이 회수는 새로운 추론 실행이 아니다.
