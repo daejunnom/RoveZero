@@ -23,6 +23,7 @@ rz-position = { workspace = true, optional = true, features = ["contracts"] }
 rz-runtime = { workspace = true, optional = true, features = ["contracts"] }
 
 [features]
+experimental-notify = ["dep:rz-runtime", "rz-runtime/experimental-notify"]
 default = []
 onnx = ["dep:ort", "dep:rz-native-loader"]
 contracts = ["dep:rz-contracts", "dep:rz-position", "dep:rz-runtime"]

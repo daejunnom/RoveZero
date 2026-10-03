@@ -271,6 +271,8 @@ impl rz_search::contract_time::ContractClock for ProcessClock {
 
 #[derive(Clone, Debug)]
 pub struct SearchAuthority {
+    #[cfg(feature = "experimental-notify")]
+    signal: Option<rz_runtime::CompletionSignal>,
     current: Arc<Mutex<contract::AcceptanceScope>>,
     cancel: contract::CancelToken,
 }
@@ -278,6 +280,8 @@ impl SearchAuthority {
     #[cfg(test)]
     pub(crate) fn isolated(scope: contract::AcceptanceScope) -> Self {
         Self {
+            #[cfg(feature = "experimental-notify")]
+            signal: None,
             current: Arc::new(Mutex::new(scope)),
             cancel: contract::CancelToken::new(),
         }
@@ -295,6 +299,10 @@ impl SearchAuthority {
     }
     pub fn cancel(&self) {
         self.cancel.cancel();
+        #[cfg(feature = "experimental-notify")]
+        if let Some(signal) = &self.signal {
+            signal.notify();
+        }
     }
 }
 
@@ -315,6 +323,11 @@ pub trait ManagedEvaluator: contract::Evaluator<RulesState> + Send {
     fn shutdown(&mut self, deadline: Instant) -> Result<(), contract::ContractError>;
 }
 pub trait EvaluatorFactory: Send + Sync + 'static {
+    #[cfg(feature = "experimental-notify")]
+    fn completion_signal(&self) -> Option<rz_runtime::CompletionSignal> {
+        None
+    }
+
     fn reset_game(&self) -> Result<(), contract::ContractError> {
         Ok(())
     }
@@ -863,6 +876,8 @@ impl Owner {
                     )
                 })?;
                 let authority = SearchAuthority {
+                    #[cfg(feature = "experimental-notify")]
+                    signal: self.factory.completion_signal(),
                     current: Arc::clone(&self.scope),
                     cancel: token.clone(),
                 };
@@ -927,6 +942,8 @@ impl Owner {
                     let mut authority_error = None;
                     let mut diagnostic_failure = None;
                     while !search.is_finished() {
+                        #[cfg(feature = "experimental-notify")]
+                        let wake_version = authority.signal.as_ref().map(|s| s.version());
                         if control.cancellation.load(Ordering::Acquire) {
                             authority.cancel();
                         }
@@ -993,6 +1010,26 @@ impl Owner {
                             }
                         }
                         if matches!(event, rz_search::contracts::ContractPumpEvent::Waiting) {
+                            #[cfg(feature = "experimental-notify")]
+                            if let (Some(signal), Some(observed)) =
+                                (&authority.signal, wake_version)
+                            {
+                                // Owner blocking only: backend poll remains cooperative.
+                                // Hard deadline bounds waits even without a completion.
+                                if !authority.cancel_token().is_canceled() {
+                                    signal.wait_changed(
+                                        observed,
+                                        control
+                                            .deadline
+                                            .saturating_duration_since(Instant::now())
+                                            .min(Duration::from_secs(1)),
+                                    );
+                                }
+                            } else {
+                                // Scripted/mock clocks have no asynchronous completion source.
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            #[cfg(not(feature = "experimental-notify"))]
                             thread::sleep(Duration::from_millis(1));
                         }
                     }

@@ -5,8 +5,12 @@
 #![forbid(unsafe_code)]
 
 mod boundary;
+#[cfg(feature = "experimental-notify")]
+mod notification;
 mod observation;
 mod scheduler;
+#[cfg(feature = "experimental-notify")]
+pub use notification::CompletionSignal;
 
 #[cfg(feature = "contracts")]
 pub mod contracts;

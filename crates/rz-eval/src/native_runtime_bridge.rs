@@ -149,6 +149,8 @@ enum DiagnosticSlot {
 }
 
 struct OwnerInner {
+    #[cfg(feature = "experimental-notify")]
+    signal: rz_runtime::CompletionSignal,
     projection: ClassicalProjection,
     origin: NativeWorkerOrigin,
     admission_policy: NativeAdmissionPolicy,
@@ -215,6 +217,8 @@ impl NativeWorkerOwner {
             .map_err(allocation_failure)?;
         diagnostics.resize_with(diagnostic_capacity, || DiagnosticSlot::Free);
         Ok(Self(Arc::new(OwnerInner {
+            #[cfg(feature = "experimental-notify")]
+            signal: worker.completion_signal(),
             projection,
             origin: NativeWorkerOrigin::Injected,
             admission_policy,
@@ -357,6 +361,11 @@ impl NativeWorkerOwner {
 
     pub fn cuda_metadata(&self) -> Option<&NativeCudaMetadata> {
         self.0.cuda_metadata.as_ref()
+    }
+
+    #[cfg(feature = "experimental-notify")]
+    pub fn completion_signal(&self) -> rz_runtime::CompletionSignal {
+        self.0.signal.clone()
     }
 
     pub fn projection(&self) -> &ClassicalProjection {

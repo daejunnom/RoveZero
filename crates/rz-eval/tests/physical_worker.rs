@@ -160,7 +160,13 @@ fn busy_and_dropped_consumers_do_not_release_active_inputs() {
 #[test]
 fn physical_completion_yields_owned_data_once() {
     let mut worker = SingleWorker::spawn(|input: &String| input.clone()).unwrap();
+    #[cfg(feature = "experimental-notify")]
+    let signal = worker.completion_signal();
+    #[cfg(feature = "experimental-notify")]
+    let version = signal.version();
     let mut lease = worker.submit("owned output".into()).unwrap();
+    #[cfg(feature = "experimental-notify")]
+    assert!(signal.wait_changed(version, std::time::Duration::from_secs(3)));
     let mut output = None;
     wait_until(|| match lease.poll() {
         PhysicalPoll::Ready(value) => {

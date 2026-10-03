@@ -1390,6 +1390,11 @@ impl ContractClock for RuntimeClock {
     }
 }
 impl EvaluatorFactory for NativeSessionFactory {
+    #[cfg(feature = "experimental-notify")]
+    fn completion_signal(&self) -> Option<rz_runtime::CompletionSignal> {
+        Some(self.owner.completion_signal())
+    }
+
     fn reset_game(&self) -> Result<(), ContractError> {
         #[cfg(feature = "experimental-raw-cache")]
         self.owner.projection().clear_raw_cache()?;
@@ -1480,6 +1485,11 @@ impl EvaluatorFactory for NativeSessionFactory {
 macro_rules! delegate_native_factory {
     ($factory:ty) => {
         impl EvaluatorFactory for $factory {
+            #[cfg(feature = "experimental-notify")]
+            fn completion_signal(&self) -> Option<rz_runtime::CompletionSignal> {
+                self.inner.completion_signal()
+            }
+
             fn reset_game(&self) -> Result<(), ContractError> {
                 self.inner.reset_game()
             }

@@ -14,6 +14,7 @@ rz-telemetry.workspace = true
 rz-contracts = { workspace = true, optional = true }
 
 [features]
+experimental-notify = []
 default = []
 contracts = ["dep:rz-contracts"]
 experimental-raw-cache = ["contracts"]
