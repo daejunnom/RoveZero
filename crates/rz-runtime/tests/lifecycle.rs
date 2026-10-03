@@ -1123,6 +1123,126 @@ fn physical_drain_can_finish_while_unread_terminal_delivery_still_reserves_budge
 }
 
 #[test]
+fn idle_and_pending_pumps_do_not_displace_lifecycle_observations() {
+    let mut fixture = Fixture::with_capacity(limits(), bytes(4, 5, 6), 16);
+    for _ in 0..128 {
+        fixture.runtime.pump();
+    }
+    let idle = fixture.runtime.take_observations();
+    assert!(idle.events.is_empty());
+    assert_eq!(idle.dropped, 0);
+
+    let ready = fixture.pending();
+    let receiver = fixture.runtime.submit(fixture.request(1)).unwrap();
+    fixture.runtime.pump();
+    for _ in 0..128 {
+        fixture.runtime.pump();
+    }
+    let dispatched = fixture.runtime.take_observations();
+    assert_eq!(dispatched.dropped, 0);
+    assert!(!dispatched.counter_overflow);
+    assert_eq!(
+        dispatched
+            .events
+            .iter()
+            .filter(|event| { matches!(event.kind, ObservationKind::ReservationChanged) })
+            .count(),
+        2
+    );
+    assert!(dispatched
+        .events
+        .iter()
+        .any(|event| { matches!(event.kind, ObservationKind::Admitted { request: 1 }) }));
+    assert!(dispatched.events.iter().any(|event| {
+        matches!(
+            event.kind,
+            ObservationKind::RequestDispatched {
+                request: 1,
+                execution: 1,
+                ..
+            }
+        )
+    }));
+
+    assert!(fixture.runtime.cancel(&1));
+    receive(&receiver, 1, Outcome::Canceled);
+    for _ in 0..128 {
+        fixture.runtime.pump();
+    }
+    let canceled = fixture.runtime.take_observations();
+    assert_eq!(canceled.dropped, 0);
+    assert_eq!(canceled.events.len(), 1);
+    assert!(matches!(
+        canceled.events[0].kind,
+        ObservationKind::Finished {
+            kind: FinishKind::Canceled,
+            ..
+        }
+    ));
+    assert_eq!(fixture.runtime.state().reserved, bytes(5, 7, 9));
+    assert_eq!(fixture.drops.leases.load(Ordering::SeqCst), 0);
+
+    ready.store(true, Ordering::SeqCst);
+    fixture.runtime.pump();
+    for _ in 0..128 {
+        fixture.runtime.pump();
+    }
+    let completed = fixture.runtime.take_observations();
+    assert_eq!(completed.dropped, 0);
+    assert_eq!(completed.events.len(), 2);
+    assert!(matches!(
+        completed.events[0].kind,
+        ObservationKind::PhysicalCompleted { execution: 1 }
+    ));
+    assert!(matches!(
+        completed.events[1].kind,
+        ObservationKind::ReservationChanged
+    ));
+    assert_eq!(completed.events[1].reserved, Resources::default());
+    assert_eq!(completed.events[1].reserved_requests, 0);
+    assert_eq!(fixture.runtime.metrics().canceled, 1);
+    assert_eq!(fixture.runtime.metrics().physical_completed, 1);
+    assert_eq!(fixture.drops.inputs.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.drops.leases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn receiver_release_is_observed_once_on_the_next_owner_pump() {
+    let mut fixture = Fixture::with_capacity(limits(), Resources::default(), 16);
+    let receiver = fixture.runtime.submit(fixture.request(1)).unwrap();
+    fixture.runtime.pump();
+    fixture.runtime.pump();
+    assert_eq!(fixture.runtime.state().reserved_requests, 1);
+    let finished = fixture.runtime.take_observations();
+    assert_eq!(finished.dropped, 0);
+    for _ in 0..128 {
+        fixture.runtime.pump();
+    }
+    let unread = fixture.runtime.take_observations();
+    assert!(unread.events.is_empty());
+    assert_eq!(unread.dropped, 0);
+    drop(receiver);
+    fixture.clock.set(7);
+    fixture.runtime.pump();
+    for _ in 0..128 {
+        fixture.runtime.pump();
+    }
+    let released = fixture.runtime.take_observations();
+    assert_eq!(released.dropped, 0);
+    assert_eq!(released.events.len(), 1);
+    assert!(matches!(
+        released.events[0].kind,
+        ObservationKind::ReservationChanged
+    ));
+    assert_eq!(released.events[0].at, 7);
+    assert_eq!(released.events[0].reserved, Resources::default());
+    assert_eq!(released.events[0].reserved_requests, 0);
+    assert_eq!(released.events[0].peak_reserved, bytes(1, 2, 3));
+    assert_eq!(fixture.runtime.metrics().completed, 1);
+    assert_eq!(fixture.runtime.metrics().physical_completed, 1);
+}
+
+#[test]
 fn canceled_observation_precedes_physical_completion_without_output_validation() {
     let mut fixture = Fixture::with_capacity(limits(), bytes(4, 5, 6), 64);
     let ready = fixture.pending();

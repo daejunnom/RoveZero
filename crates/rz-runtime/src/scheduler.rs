@@ -159,7 +159,8 @@ where
     closed: bool,
     drain_deadline: Option<A::Tick>,
     metrics: Metrics,
-    observations: Observations<A::RequestId, A::ExecutionId, A::Tick>,
+    observations: Observations<Observation<A::RequestId, A::ExecutionId, A::Tick>>,
+    last_observed_reservation: (Resources, Resources, usize),
 }
 
 impl<A, P, C> Scheduler<A, P, C>
@@ -205,6 +206,7 @@ where
             drain_deadline: None,
             metrics,
             observations,
+            last_observed_reservation: (Resources::default(), Resources::default(), 0),
         })
     }
 
@@ -230,11 +232,24 @@ where
     /// Capacity equals metric_sample_capacity. Overflow drops the oldest event;
     /// sampling never changes request outcomes. A lossy drain is incomplete.
     pub fn take_observations(&mut self) -> SchedulerObservations<A> {
-        self.observations.drain()
+        let drain = self.observations.drain();
+        ObservationDrain {
+            events: drain.events,
+            dropped: drain.dropped,
+            counter_overflow: drain.counter_overflow,
+        }
     }
 
     fn observe(&mut self, kind: ObservationKind<A::RequestId, A::ExecutionId, A::Tick>) {
         let state = self.state();
+        self.observe_state(kind, state);
+    }
+
+    fn observe_state(
+        &mut self,
+        kind: ObservationKind<A::RequestId, A::ExecutionId, A::Tick>,
+        state: State,
+    ) {
         self.observations.push(Observation {
             at: self.clock.now(),
             reserved: state.reserved,
@@ -242,6 +257,18 @@ where
             reserved_requests: state.reserved_requests,
             kind,
         });
+    }
+
+    fn observe_reservation_change(&mut self) {
+        // Compare and publish the same locked ledger snapshot. Receivers can
+        // release reservations concurrently; this does not timestamp that
+        // release or reconstruct unobserved intermediate ledger transitions.
+        let state = self.state();
+        let snapshot = (state.reserved, state.peak_reserved, state.reserved_requests);
+        if snapshot != self.last_observed_reservation {
+            self.last_observed_reservation = snapshot;
+            self.observe_state(ObservationKind::ReservationChanged, state);
+        }
     }
 
     pub fn submit(&mut self, request: A::Request) -> SubmitResult<A> {
@@ -344,7 +371,7 @@ where
         };
         budget.peak_requests = budget.peak_requests.max(requests);
         drop(budget);
-        self.observe(ObservationKind::ReservationChanged);
+        self.observe_reservation_change();
         Ok(Arc::new(Reservation {
             budget: Arc::clone(&self.budget),
             bytes,
@@ -473,7 +500,7 @@ where
         }
         // Receiver recv/drop can release its pin on another thread. This is the
         // owner's later snapshot, not an assertion of the exact release time.
-        self.observe(ObservationKind::ReservationChanged);
+        self.observe_reservation_change();
     }
 
     fn next_batch(&self) -> Vec<A::RequestId> {

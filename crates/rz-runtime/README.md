@@ -108,9 +108,37 @@ UCI 출력, GPU 전송·완료 전체를 잰 D02 종단 프로파일은 아직 �
 
 관측 tick은 deadline과 같은 owner clock이다. 예약 snapshot은 다른 스레드에서
 receipt가 해제된 정확한 시각을 뜻하지 않는다. `peak_reserved`는 lock에서 보존한
-high-water이며 이를 profiler에 별도로 전달할 수 있다. `ValidationFinished.valid`는
+high-water이며 이를 profiler에 별도로 전달할 수 있다. `ReservationChanged`는 직전
+관측의 bytes·request slots·bytes high-water와 다른 snapshot에서만 발생한다. 초기
+zero ledger와 변화 없는 idle/pending pump는 event를 만들지 않는다. receiver의
+recv/drop으로 해제된 예약은 다음 owner pump에서 관측하며, 두 snapshot 사이의
+중간 변화를 전부 복원하는 journal은 아니다. `ValidationFinished.valid`는
 payload 검증 사실이고 이후 stale/expired가 될 수 있다. `Finished.delivered`는 mailbox
 enqueue 성공이며 실제 수신·selection consume·backup을 뜻하지 않는다.
+
+common `ContractEvaluator::take_delivery_observations`는 별도의 유한 ring을 비운다.
+같은 `metric_sample_capacity`를 사용하지만 scheduler ring과 용량·손실이 독립이며,
+각 drain의 `events`·`dropped`·`counter_overflow`를 보존한다. 오래된 event를 버리고
+용량 0에서는 모두 유실로 기록한다. 저장하는 것은 복사 가능한 context·오류·시각이며
+position·model owner·policy·physical pin을 추가 보유하지 않는다. 이 ring과 반환 Vec도
+요청의 memory reservation과 별도인 metadata 예산이다.
+
+각 `DeliveryObservation`은 원래 요청의 `CompletionContext`(전체 `EvalContext`와
+launch됐다면 bound execution), owner `ClockDomain`과 결정 기록 `MonotonicTick`을
+제공한다. `DeliveryObservationKind::Accepted`는 common poll의 최종 검증을 통과한
+Completed 후보, `Rejected { error }`는 Completed 후보의 최종 거절 원인을 뜻한다.
+`Terminal { kind, error }`는 이미 Canceled/Expired/Stale/Failed인 mailbox 결과를 그대로
+반환했으며 Failed 오류를 보존한다. `MailboxDisconnected { error }`는 mailbox 단절로
+만든 기존 failure를 구별한다. 새 stream은 같은 결과에 두 번 terminal 권한을 주거나
+scheduler의 기존 finish 집계를 다시 쓰지 않는다. wrapper submit의 거절과 B의 consume은
+이 stream 밖의 별도 경계다.
+
+이 시각은 final acceptance 검사 뒤의 owner 기록 시각이다. Accepted 관측 이후에도
+scope·cancel·deadline이 변할 수 있으며 Search는 기존 최종 guard를 적용해야 한다.
+`PhysicalCompleted` 역시 owner가 backend `Poll::Ready`를 관측한 사실이다. 두 ring과
+Accepted event만으로 native source interval·B backup·GPU 장치시간·H2D·실측 VRAM이나
+전체 신경망 실행 journal을 주장하지 않는다. 관측 유실·overflow는 profiling 불완전성을
+뜻하며 Ready/lease·예약·취소·deadline·queue의 기존 결과나 권한을 바꾸지 않는다.
 
 D02의 bounded `rz-telemetry::profile::TraceCollector`는 CPU 준비·queue·dispatch·
 backend physical·validation·backup·output·종단 span을 받아 class별 percentile,

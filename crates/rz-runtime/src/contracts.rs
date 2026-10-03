@@ -3,12 +3,13 @@
 //! Rules snapshots and all shared identifiers/results remain `rz-contracts`
 //! types. This module adds scheduling metadata and a bounded evaluator mailbox.
 
+use crate::observation::Observations;
 use crate::{
     Adapter, Backend, Clock, CompletionReceiver, DrainState, Limits, Resources, RuntimeFault,
     Scheduler, SchedulerObservations, ShutdownSnapshot, State, TerminalEvent,
 };
 use rz_contracts::*;
-use rz_telemetry::Snapshot;
+use rz_telemetry::{FinishKind, Snapshot};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::sync::{mpsc, Arc, OnceLock, RwLock};
@@ -364,6 +365,48 @@ struct Pending<P> {
     receiver: CompletionReceiver<EvalResult>,
 }
 
+/// Facts at the common result transfer boundary, separate from Scheduler facts.
+/// Accepted means the completed candidate passed this boundary's checks. It
+/// grants no new physical completion, current-scope or Search backup authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryObservationKind {
+    Accepted,
+    /// A completed mailbox candidate failed the common delivery acceptance check.
+    Rejected {
+        error: ContractError,
+    },
+    /// A non-completed mailbox result was transferred without revalidation.
+    /// Canceled/Expired/Stale carry their cause in `kind`; Failed preserves error.
+    Terminal {
+        kind: FinishKind,
+        error: Option<ContractError>,
+    },
+    MailboxDisconnected {
+        error: ContractError,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeliveryObservation {
+    /// Owner time when recording the transfer decision, after acceptance checks.
+    /// This is neither backend source time nor Search's final consume time.
+    pub at: MonotonicTick,
+    pub clock: ClockDomain,
+    /// Original admitted request context and its bound execution, if launched.
+    /// Does not retain the position, policy, model owner or physical pins.
+    pub context: CompletionContext,
+    pub kind: DeliveryObservationKind,
+}
+
+/// A separate bounded stream; loss counters describe this drain only.
+/// Nonzero loss makes reconstruction of common delivery decisions incomplete.
+#[derive(Debug)]
+pub struct DeliveryObservationDrain {
+    pub events: Vec<DeliveryObservation>,
+    pub dropped: u64,
+    pub counter_overflow: bool,
+}
+
 /// A bounded, exactly-once bridge to the common logical Evaluator interface.
 ///
 /// CompletionReceiver pins stay in `pending` until common poll transfers the
@@ -382,6 +425,7 @@ where
     last_submitted_request: Option<u64>,
     scope: SharedScope,
     clock: C,
+    delivery_observations: Observations<DeliveryObservation>,
 }
 
 impl<P, B, C> ContractEvaluator<P, B, C>
@@ -413,6 +457,8 @@ where
             metric_sample_capacity,
         )
         .map_err(fault_error)?;
+        let delivery_observations =
+            Observations::try_new(metric_sample_capacity).map_err(fault_error)?;
         Ok(Self {
             scheduler,
             pending: VecDeque::new(),
@@ -420,6 +466,7 @@ where
             last_submitted_request: None,
             scope,
             clock,
+            delivery_observations,
         })
     }
 
@@ -441,6 +488,29 @@ where
     /// The caller records wrapper refusals that occur before scheduler admission.
     pub fn take_observations(&mut self) -> SchedulerObservations<ContractsAdapter<P, C>> {
         self.scheduler.take_observations()
+    }
+
+    /// Drain passive common-poll decisions without consuming any result receipt.
+    /// Capacity equals metric_sample_capacity independently of Scheduler events.
+    /// Overflow drops the oldest fact, including at zero capacity, and never
+    /// changes result acceptance, reservations, cancellation or lease ownership.
+    /// Submission refusals and Search backup remain the caller's own boundaries.
+    pub fn take_delivery_observations(&mut self) -> DeliveryObservationDrain {
+        let drain = self.delivery_observations.drain();
+        DeliveryObservationDrain {
+            events: drain.events,
+            dropped: drain.dropped,
+            counter_overflow: drain.counter_overflow,
+        }
+    }
+
+    fn observe_delivery(&mut self, request: &RuntimeRequest<P>, kind: DeliveryObservationKind) {
+        self.delivery_observations.push(DeliveryObservation {
+            at: self.clock.now(),
+            clock: self.clock.domain(),
+            context: request.completion_context(),
+            kind,
+        });
     }
 
     pub fn begin_shutdown(&mut self, deadline: Deadline) -> Result<(), ContractError> {
@@ -465,8 +535,16 @@ where
         self.scheduler.shutdown_snapshot()
     }
 
-    fn accept_delivery(&self, request: &RuntimeRequest<P>, result: EvalResult) -> EvalResult {
+    fn accept_delivery(&mut self, request: &RuntimeRequest<P>, result: EvalResult) -> EvalResult {
         let EvalResult::Completed(output) = result else {
+            let (kind, error) = match &result {
+                EvalResult::Canceled(_) => (FinishKind::Canceled, None),
+                EvalResult::Expired(_) => (FinishKind::Expired, None),
+                EvalResult::Stale(_) => (FinishKind::Stale, None),
+                EvalResult::Failed(failure) => (FinishKind::Failed, Some(failure.error)),
+                EvalResult::Completed(_) => unreachable!("completed candidate matched above"),
+            };
+            self.observe_delivery(request, DeliveryObservationKind::Terminal { kind, error });
             return result;
         };
         let checked = output
@@ -484,8 +562,14 @@ where
                 )
             });
         match checked {
-            Ok(()) => EvalResult::Completed(output),
-            Err(error) => failure_result(request.completion_context(), error),
+            Ok(()) => {
+                self.observe_delivery(request, DeliveryObservationKind::Accepted);
+                EvalResult::Completed(output)
+            }
+            Err(error) => {
+                self.observe_delivery(request, DeliveryObservationKind::Rejected { error });
+                failure_result(request.completion_context(), error)
+            }
         }
     }
 }
@@ -534,14 +618,16 @@ where
                 Ok(result) => return Some(self.accept_delivery(&pending.request, result)),
                 Err(mpsc::TryRecvError::Empty) => self.pending.push_back(pending),
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    return Some(failure_result(
-                        pending.request.completion_context(),
-                        ContractError::new(
-                            ErrorCode::BackendFailure,
-                            Stage::Output,
-                            "runtime completion mailbox disconnected",
-                        ),
-                    ));
+                    let error = ContractError::new(
+                        ErrorCode::BackendFailure,
+                        Stage::Output,
+                        "runtime completion mailbox disconnected",
+                    );
+                    self.observe_delivery(
+                        &pending.request,
+                        DeliveryObservationKind::MailboxDisconnected { error },
+                    );
+                    return Some(failure_result(pending.request.completion_context(), error));
                 }
             }
         }

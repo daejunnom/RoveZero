@@ -13,7 +13,8 @@ use rz_contracts::{
     SlotGeneration, Square, Stage, StateIdentity, StateRevision, Viewpoint, Wdl, CONTRACT_REVISION,
 };
 use rz_runtime::contracts::{
-    ContractClock, ContractEvaluator, ContractsAdapter, RuntimeRequest, SharedScope,
+    ContractClock, ContractEvaluator, ContractsAdapter, DeliveryObservationKind, RuntimeRequest,
+    SharedScope,
 };
 use rz_runtime::{
     Backend, BackendResult, Clock, DrainState, Limits, ObservationKind, Resources, Scheduler,
@@ -467,6 +468,20 @@ fn common_observations_preserve_logical_cancel_before_physical_completion() {
         Some(EvalResult::Canceled(_))
     ));
     assert_eq!(fixture.backend.lease_drops.load(Ordering::SeqCst), 0);
+    let delivery = fixture.runtime.take_delivery_observations();
+    assert_eq!(delivery.dropped, 0);
+    assert_eq!(delivery.events.len(), 1);
+    assert_eq!(delivery.events[0].context.request.request, id);
+    assert_eq!(delivery.events[0].context.execution, Some(execution));
+    assert_eq!(delivery.events[0].clock, CLOCK_DOMAIN);
+    assert_eq!(delivery.events[0].at, MonotonicTick(0));
+    assert_eq!(
+        delivery.events[0].kind,
+        DeliveryObservationKind::Terminal {
+            kind: FinishKind::Canceled,
+            error: None
+        }
+    );
     ready.store(true, Ordering::SeqCst);
     fixture.clock.set(1);
     fixture.runtime.pump();
@@ -507,28 +522,108 @@ fn common_observations_preserve_logical_cancel_before_physical_completion() {
     assert_eq!(fixture.backend.lease_drops.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.runtime.state().reserved_requests, 0);
     assert!(fixture.runtime.poll().is_none());
+    assert!(fixture
+        .runtime
+        .take_delivery_observations()
+        .events
+        .is_empty());
 }
 
 #[test]
 fn common_observation_loss_is_bounded_and_does_not_change_completion() {
     for capacity in [0, 2] {
         let mut fixture = fixture_with_capacity(1, capacity);
-        fixture.runtime.submit(request(1, 100)).unwrap();
-        assert!(matches!(
-            complete(&mut fixture.runtime),
-            EvalResult::Completed(_)
-        ));
+        for sequence in 1..=5 {
+            fixture.runtime.submit(request(sequence, 100)).unwrap();
+            assert!(matches!(
+                complete(&mut fixture.runtime),
+                EvalResult::Completed(_)
+            ));
+        }
         let observed = fixture.runtime.take_observations();
         assert!(observed.events.len() <= capacity);
         assert!(observed.dropped > 0);
         assert!(!observed.counter_overflow);
         assert_eq!(fixture.runtime.state().reserved_requests, 0);
         assert_eq!(fixture.runtime.state().reserved, Resources::default());
+        let delivered = fixture.runtime.take_delivery_observations();
+        assert_eq!(delivered.events.len(), capacity);
+        assert_eq!(delivered.dropped, 5 - capacity as u64);
+        assert!(!delivered.counter_overflow);
+        assert!(delivered.events.iter().all(|event| {
+            event.kind == DeliveryObservationKind::Accepted && event.context.execution.is_some()
+        }));
+        if capacity == 2 {
+            assert_eq!(delivered.events[0].context.request.request.sequence, 4);
+            assert_eq!(delivered.events[1].context.request.request.sequence, 5);
+        }
+        assert_eq!(fixture.runtime.metrics().completed, 5);
+        assert_eq!(fixture.backend.lease_drops.load(Ordering::SeqCst), 5);
         let second = fixture.runtime.take_observations();
         assert!(second.events.is_empty());
         assert_eq!(second.dropped, 0);
         assert!(!second.counter_overflow);
+        let second_delivery = fixture.runtime.take_delivery_observations();
+        assert!(second_delivery.events.is_empty());
+        assert_eq!(second_delivery.dropped, 0);
+        assert!(!second_delivery.counter_overflow);
     }
+}
+
+#[test]
+fn accepted_delivery_is_separate_from_mailbox_enqueue_and_physical_observation() {
+    let mut fixture = fixture_with_capacity(1, 16);
+    let original = request(1, 100);
+    fixture.runtime.submit(Arc::clone(&original)).unwrap();
+    fixture.runtime.pump();
+    fixture.clock.set(5);
+    fixture.runtime.pump();
+    let execution = fixture.backend.executions.lock().unwrap()[0];
+    assert_eq!(fixture.runtime.state().reserved_requests, 1);
+    let before = fixture.runtime.take_delivery_observations();
+    assert!(before.events.is_empty());
+    assert_eq!(before.dropped, 0);
+    let scheduler = fixture.runtime.take_observations();
+    assert!(scheduler.events.iter().any(|event| {
+        event.at == MonotonicTick(5)
+            && matches!(event.kind,
+            ObservationKind::PhysicalCompleted { execution: actual } if actual == execution)
+    }));
+    assert!(scheduler.events.iter().any(|event| {
+        event.at == MonotonicTick(5)
+            && matches!(
+                event.kind,
+                ObservationKind::Finished {
+                    kind: FinishKind::Completed,
+                    delivered: true,
+                    ..
+                }
+            )
+    }));
+
+    fixture.clock.set(10);
+    assert!(matches!(
+        fixture.runtime.poll(),
+        Some(EvalResult::Completed(_))
+    ));
+    let delivery = fixture.runtime.take_delivery_observations();
+    assert_eq!(delivery.dropped, 0);
+    assert!(!delivery.counter_overflow);
+    assert_eq!(delivery.events.len(), 1);
+    assert_eq!(delivery.events[0].context.request, original.context());
+    assert_eq!(delivery.events[0].context.execution, Some(execution));
+    assert_eq!(delivery.events[0].kind, DeliveryObservationKind::Accepted);
+    assert_eq!(delivery.events[0].at, MonotonicTick(10));
+    assert_eq!(delivery.events[0].clock, CLOCK_DOMAIN);
+    assert_eq!(fixture.runtime.state().reserved_requests, 0);
+    assert_eq!(fixture.runtime.state().reserved, Resources::default());
+    assert_eq!(fixture.runtime.metrics().completed, 1);
+    assert!(fixture.runtime.poll().is_none());
+    assert!(fixture
+        .runtime
+        .take_delivery_observations()
+        .events
+        .is_empty());
 }
 
 #[test]
@@ -809,6 +904,16 @@ fn backend_failure_retains_its_stage_detail_and_physical_context() {
         failure.recovery,
         rz_contracts::RecoveryOutcome::NotAttempted
     );
+    let observed = fixture.runtime.take_delivery_observations();
+    assert_eq!(observed.events.len(), 1);
+    assert_eq!(observed.events[0].context, failure.context);
+    assert_eq!(
+        observed.events[0].kind,
+        DeliveryObservationKind::Terminal {
+            kind: FinishKind::Failed,
+            error: Some(error)
+        }
+    );
     assert!(fixture.runtime.poll().is_none());
 }
 
@@ -961,6 +1066,30 @@ fn common_poll_revalidates_a_buffered_success_after_authority_changes() {
         );
         assert_eq!(fixture.runtime.state().reserved_requests, 0);
         assert_eq!(fixture.runtime.state().reserved, Resources::default());
+        let delivery = fixture.runtime.take_delivery_observations();
+        assert_eq!(delivery.dropped, 0);
+        assert!(!delivery.counter_overflow);
+        assert_eq!(delivery.events.len(), 1);
+        assert_eq!(delivery.events[0].context, context);
+        assert_eq!(delivery.events[0].clock, CLOCK_DOMAIN);
+        assert_eq!(delivery.events[0].at, fixture.clock.now());
+        let DeliveryObservationKind::Rejected { error } = delivery.events[0].kind else {
+            panic!("buffered success must record delivery rejection after {change}")
+        };
+        assert_eq!(
+            error.code,
+            match change {
+                "root" => ErrorCode::Stale,
+                "deadline" => ErrorCode::Expired,
+                "cancel" => ErrorCode::Canceled,
+                _ => unreachable!(),
+            }
+        );
+        // The separate delivery check does not rewrite Scheduler's earlier finish.
+        assert_eq!(fixture.runtime.metrics().completed, 1);
+        assert_eq!(fixture.runtime.metrics().canceled, 0);
+        assert_eq!(fixture.runtime.metrics().expired, 0);
+        assert_eq!(fixture.runtime.metrics().stale, 0);
         assert!(fixture.runtime.poll().is_none());
     }
 }
