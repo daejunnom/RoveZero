@@ -208,6 +208,29 @@ impl OrtRuntime {
     }
 
     fn verify_cuda_mappings(&self, include_runtime: bool) -> Result<(), BackendError> {
+        // Existing clones must observe the first latched failure too. A later
+        // filesystem/map change cannot turn a poisoned process runtime into a
+        // valid constructor input, or replace its original typed cause.
+        let mut guard = RUNTIME.lock().map_err(|error| {
+            BackendError::new(
+                K::BackendUnavailable,
+                S::Backend,
+                "CUDA runtime latch is poisoned",
+            )
+            .with_external_cause(CauseCode::RuntimeInitialize, &error)
+        })?;
+        if let Some(latch) = guard.as_ref() {
+            if latch.pin.path() != self.pin.path()
+                || latch.pin.bundle_digest() != self.pin.bundle_digest()
+            {
+                return Err(BackendError::new(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "CUDA audit differs from the process-global runtime bundle",
+                ));
+            }
+            latch.result.as_ref().map_err(Clone::clone)?;
+        }
         let libraries = self.cuda_libraries.as_ref().ok_or_else(|| {
             BackendError::new(
                 K::IdentityMismatch,
@@ -235,14 +258,12 @@ impl OrtRuntime {
         if let Err(failure) = &verified {
             // An origin audit cannot be retried into success with the same
             // process-global ORT session. Keep the first typed source and pins.
-            if let Ok(mut guard) = RUNTIME.lock() {
-                if let Some(latch) = guard.as_mut() {
-                    if latch.pin.path() == self.pin.path()
-                        && latch.pin.bundle_digest() == self.pin.bundle_digest()
-                        && latch.result.is_ok()
-                    {
-                        latch.result = Err(failure.clone());
-                    }
+            if let Some(latch) = guard.as_mut() {
+                if latch.pin.path() == self.pin.path()
+                    && latch.pin.bundle_digest() == self.pin.bundle_digest()
+                    && latch.result.is_ok()
+                {
+                    latch.result = Err(failure.clone());
                 }
             }
         }
@@ -369,6 +390,9 @@ pub struct OnnxBackend {
     asset_identity: [u8; 32],
     cuda_evidence: Option<CudaEvidence>,
     quarantine_cause: Option<BackendError>,
+    // The loaded CUDA session can re-audit its actual nineteen-library maps
+    // without accepting a caller-selected runtime or private mutable pathname.
+    cuda_runtime: Option<OrtRuntime>,
 }
 
 impl Drop for OnnxBackend {
@@ -496,6 +520,8 @@ impl OnnxBackend {
             )
             .expect("writing to an owned String cannot fail");
         }
+        let cuda_runtime =
+            matches!(config.provider, Provider::Cuda { .. }).then(|| runtime.clone());
         let mut result = Self {
             session: Some(session),
             active_input: None,
@@ -504,6 +530,7 @@ impl OnnxBackend {
             asset_identity: asset.manifest_digest(),
             cuda_evidence: None,
             quarantine_cause: None,
+            cuda_runtime,
         };
         if matches!(result.config.provider, Provider::Cuda { .. }) {
             runtime.verify_cuda_mappings(false)?;
@@ -609,6 +636,43 @@ impl OnnxBackend {
     }
     pub fn cuda_evidence(&self) -> Option<&CudaEvidence> {
         self.cuda_evidence.as_ref()
+    }
+
+    /// Actual loaded runtime metadata, not a caller-issued provider claim.
+    /// CPU identity and its single-library loading path remain unchanged.
+    pub fn runtime_bundle_digest(&self) -> Option<[u8; 32]> {
+        self.cuda_runtime
+            .as_ref()
+            .and_then(OrtRuntime::bundle_digest)
+    }
+
+    /// Re-audits the complete CUDA bundle owned by this loaded session. An
+    /// uncertain Run remains quarantined and never becomes a successful audit.
+    pub fn verify_cuda_runtime_mappings(&self) -> Result<(), BackendError> {
+        if let Some(cause) = &self.quarantine_cause {
+            return Err(cause.clone());
+        }
+        if self.active_input.is_some() {
+            return Err(BackendError::new(
+                K::BackendUnavailable,
+                S::Backend,
+                "CUDA physical completion is unconfirmed; mapped-image audit cannot release it",
+            ));
+        }
+        self.cuda_runtime
+            .as_ref()
+            .ok_or_else(|| {
+                BackendError::new(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "loaded session has no CUDA runtime bundle",
+                )
+            })?
+            .verify_cuda_runtime_mappings()
+    }
+
+    pub fn has_unconfirmed_physical_completion(&self) -> bool {
+        self.quarantine_cause.is_some() || self.active_input.is_some()
     }
 
     /// Original bounded cause of a CUDA execution with unconfirmed physical

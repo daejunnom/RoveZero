@@ -1,6 +1,6 @@
 //! One owned native physical worker at D's cooperative Backend boundary.
 //!
-//! Bootstrap loads the CPU session once. Per-root runtimes share this owner and
+//! Bootstrap loads the explicit CPU or CUDA session once. Per-root runtimes share this owner and
 //! never initialize ORT inside `dispatch`. Logical cancellation belongs to D/B;
 //! only a physically completed worker result permits Ready and pin release.
 
@@ -27,12 +27,65 @@ type NativeDelivery<C> = Vec<BackendResult<ContractsAdapter<RulesState, C>>>;
 type PreparedDispatch<C> = Result<(NativePhysicalLease, NativeDelivery<C>), PhysicalFailure>;
 
 pub const NATIVE_RUNTIME_OVERHEAD_BYTES: u64 = 4096;
+/// Fixed first CUDA baseline declaration. This is neither measured VRAM nor a
+/// total allocation hard cap; the ORT arena and external monitoring are separate.
+pub const NATIVE_CUDA_ADMISSION_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_DIAGNOSTICS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeWorkerOrigin {
     Injected,
     CpuOnnx,
+    CudaOnnx,
+}
+
+/// Admission declarations, not memory measurements or native allocation caps.
+/// D reserves `execution_resources` while a physical lease is outstanding.
+/// Bootstrap accounts for the separate session resident declaration; D must not
+/// subtract it when an individual execution completes. An injected worker may
+/// exercise this policy but cannot claim a verified CUDA origin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeAdmissionPolicy {
+    Cpu,
+    CudaOneGiB,
+}
+
+impl NativeAdmissionPolicy {
+    /// Additional D resources, beyond the EvalRequest's own ByteBudget. Adding
+    /// the same device declaration to ByteBudget would reserve it twice.
+    pub fn execution_resources(self) -> Resources {
+        Resources {
+            host_bytes: NATIVE_RUNTIME_OVERHEAD_BYTES,
+            device_bytes: match self {
+                Self::Cpu => 0,
+                Self::CudaOneGiB => NATIVE_CUDA_ADMISSION_BYTES,
+            },
+            pinned_bytes: 0,
+        }
+    }
+
+    /// Separate bootstrap declaration. It is not an observed resident peak and
+    /// is not enforced by an execution's D reservation.
+    pub fn session_resident_admission(self) -> Resources {
+        Resources {
+            host_bytes: 0,
+            device_bytes: self.execution_resources().device_bytes,
+            pinned_bytes: 0,
+        }
+    }
+}
+
+/// Metadata captured from the admitted, already loaded CUDA session. Paths and
+/// raw diagnostics stay outside this receipt; the runtime bundle digest binds
+/// the complete pinned nineteen-library profile. Warm placement proves the
+/// bootstrap probe, not that any search request has consumed a GPU result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeCudaMetadata {
+    pub device_id: i32,
+    pub arena_bytes: u64,
+    pub runtime_bundle_digest: Digest,
+    pub placement_profile_digest: Digest,
+    pub executed_cuda_nodes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +150,8 @@ enum DiagnosticSlot {
 struct OwnerInner {
     projection: ClassicalProjection,
     origin: NativeWorkerOrigin,
+    admission_policy: NativeAdmissionPolicy,
+    cuda_metadata: Option<NativeCudaMetadata>,
     state: Mutex<OwnerState>,
 }
 
@@ -116,6 +171,23 @@ impl NativeWorkerOwner {
         projection: ClassicalProjection,
         diagnostic_capacity: usize,
     ) -> Result<Self, PhysicalFailure> {
+        Self::from_worker_with_admission(
+            worker,
+            projection,
+            diagnostic_capacity,
+            NativeAdmissionPolicy::Cpu,
+        )
+    }
+
+    /// Exercises admission and quarantine with an injected physical worker.
+    /// The origin remains Injected for every policy; this API cannot attest NN
+    /// execution, warm placement or a loaded CUDA provider.
+    pub fn from_worker_with_admission(
+        worker: NativePhysicalWorker,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+        admission_policy: NativeAdmissionPolicy,
+    ) -> Result<Self, PhysicalFailure> {
         let model = projection.model();
         if diagnostic_capacity == 0 || diagnostic_capacity > MAX_DIAGNOSTICS {
             return Err(failure(
@@ -132,7 +204,7 @@ impl NativeWorkerOwner {
             return Err(failure(
                 ErrorCode::UnsupportedContract,
                 Stage::Contract,
-                "native CPU baseline requires fresh FP32 single-item inference",
+                "native baseline requires fresh FP32 single-item inference",
             )
             .into());
         }
@@ -144,6 +216,8 @@ impl NativeWorkerOwner {
         Ok(Self(Arc::new(OwnerInner {
             projection,
             origin: NativeWorkerOrigin::Injected,
+            admission_policy,
+            cuda_metadata: None,
             state: Mutex::new(OwnerState {
                 worker,
                 epoch: None,
@@ -188,8 +262,99 @@ impl NativeWorkerOwner {
         Ok(owner)
     }
 
+    /// Consumes a verified CUDA B1/FP32 session after the actual warm placement
+    /// probe. Bootstrap, not a search deadline, owns initialization. The first
+    /// profile uses one intra-op thread and a one-GiB ORT arena declaration.
+    /// No unchecked caller value can issue CudaOnnx origin or placement metadata.
+    #[cfg(feature = "onnx")]
+    pub fn from_cuda_onnx(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+    ) -> Result<Self, PhysicalFailure> {
+        use crate::onnx::Provider;
+        // Preserve the actual native cause of an earlier uncertain Run before
+        // reporting a generic profile mismatch. Drop retains its session/input.
+        if let Some(cause) = backend.physical_quarantine_cause() {
+            return Err(cause.clone().into());
+        }
+        let Provider::Cuda {
+            device_id,
+            arena_bytes,
+        } = backend.config().provider
+        else {
+            return Err(failure(
+                ErrorCode::IdentityMismatch,
+                Stage::Contract,
+                "native CUDA owner requires an explicitly loaded CUDA provider",
+            )
+            .into());
+        };
+        if device_id != 0
+            || arena_bytes as u64 != NATIVE_CUDA_ADMISSION_BYTES
+            || backend.config().max_batch != 1
+            || backend.config().intra_threads != 1
+            || projection.backend().0 != backend.identity()
+            || projection.model().handle().manifest.0 != backend.asset_identity()
+            || backend.has_unconfirmed_physical_completion()
+        {
+            return Err(failure(
+                ErrorCode::IdentityMismatch,
+                Stage::Contract,
+                "native CUDA owner differs from verified device0/B1/thread1/model/backend/arena profile",
+            )
+            .into());
+        }
+        let evidence = backend
+            .cuda_evidence()
+            .filter(|e| e.executed_cuda_nodes > 0)
+            .ok_or_else(|| {
+                failure(
+                    ErrorCode::IdentityMismatch,
+                    Stage::Contract,
+                    "native CUDA owner requires actual warm CUDA kernel placement",
+                )
+            })?;
+        let runtime_bundle_digest = backend.runtime_bundle_digest().ok_or_else(|| {
+            failure(
+                ErrorCode::IdentityMismatch,
+                Stage::Contract,
+                "native CUDA owner requires the complete pinned runtime bundle",
+            )
+        })?;
+        let metadata = NativeCudaMetadata {
+            device_id,
+            arena_bytes: arena_bytes as u64,
+            runtime_bundle_digest: Digest(runtime_bundle_digest),
+            placement_profile_digest: Digest(evidence.profile_sha256),
+            executed_cuda_nodes: evidence.executed_cuda_nodes,
+        };
+        // A successful historical probe alone does not authorize current maps.
+        // Loader failure stays typed and latched, with all native pins retained.
+        backend.verify_cuda_runtime_mappings()?;
+        let worker = crate::contracts::spawn_onnx_worker(backend)?;
+        let mut owner = Self::from_worker_with_admission(
+            worker,
+            projection,
+            diagnostic_capacity,
+            NativeAdmissionPolicy::CudaOneGiB,
+        )?;
+        let inner = Arc::get_mut(&mut owner.0).expect("new native owner is exclusively owned");
+        inner.origin = NativeWorkerOrigin::CudaOnnx;
+        inner.cuda_metadata = Some(metadata);
+        Ok(owner)
+    }
+
     pub fn origin(&self) -> NativeWorkerOrigin {
         self.0.origin
+    }
+
+    pub fn admission_policy(&self) -> NativeAdmissionPolicy {
+        self.0.admission_policy
+    }
+
+    pub fn cuda_metadata(&self) -> Option<&NativeCudaMetadata> {
+        self.0.cuda_metadata.as_ref()
     }
 
     pub fn projection(&self) -> &ClassicalProjection {
@@ -399,10 +564,12 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
     type Lease = NativeRuntimeLease<C>;
 
     fn additional_resources(&self, requests: &[Arc<RuntimeRequest<RulesState>>]) -> Resources {
+        let resources = self.owner.admission_policy().execution_resources();
+        let count = requests.len() as u64;
         Resources {
-            host_bytes: (requests.len() as u64).saturating_mul(NATIVE_RUNTIME_OVERHEAD_BYTES),
-            device_bytes: 0,
-            pinned_bytes: 0,
+            host_bytes: count.saturating_mul(resources.host_bytes),
+            device_bytes: count.saturating_mul(resources.device_bytes),
+            pinned_bytes: count.saturating_mul(resources.pinned_bytes),
         }
     }
 

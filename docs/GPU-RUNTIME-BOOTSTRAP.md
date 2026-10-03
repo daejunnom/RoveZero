@@ -59,6 +59,44 @@ CUDA `Run` 오류나 panic은 GPU 동기화 완료의 증거가 아니다. 완�
 이미 GPU 작업을 시작한 뒤의 논리 취소도 실제 완료 전에 buffer 재사용을 허용하지 않는다.
 입력 검증 단계에서 실행 전 거부한 오류와 실제 native 실행 후 오류를 구별한다.
 
+## 실제 UCI 연결의 고정 계약
+
+다음 인수는 실제 Rules 상태 → C CUDA owner → D scheduler → B UCI 탐색의 연결이다.
+`rz-uci`의 `onnx-cuda` feature와 명시적인 `--onnx-cuda` 실행 옵션이 함께 필요하며,
+기존 `onnx-cpu` 단독 실행의 provider·backend identity·V1 인수 기록은 유지한다.
+CUDA bundle 경로와 manifest raw SHA-256을 별도 옵션으로 받고, manifest의 ORT core를
+기존 runtime 파일 pin과 대조한다. manifest 파일 hash와 canonical bundle digest는
+서로 다른 근거다. 지원하지 않는 build·provider·프로필은 실행 전에 거부한다.
+
+첫 native UCI CUDA 프로필은 Linux, device `0`, FP32, TF32 off, batch `1`, intra thread
+`1`, search worker `1`, fresh/full step `1`, HistoryFill `No`, ORT arena `1 GiB`다.
+C owner는 실제로 로드한 backend·encoding·action map·모델 identity, warm-up에서
+관측한 CUDA kernel과 profile digest, 19개 native 파일의 실제 매핑을 확인한다.
+주입한 mock worker는 자원·실패를 재현할 수 있지만 `CudaOnnx` origin을 얻지 않는다.
+
+실행당 D 추가 예약은 host overhead `4096` byte, device `1 GiB`, pinned `0`이다.
+요청의 device byte에는 이 overhead를 중복 기입하지 않는다. 세션 상주 admission
+`1 GiB`는 bootstrap의 전체 예산에서 별도로 보존하며 실행 예약과 구분한다.
+이 선언과 ORT arena 한도는 실제 VRAM 측정값이나 장치 전체의 강제 상한이 아니다.
+실행 예약은 C가 물리 완료를 확인하기 전까지 보존하고, 불확실한 CUDA 실패는 원래
+원인·세션·입력·예약을 격리한 상태로 남긴다.
+
+CUDA startup/termination은 별도 V1 namespace의
+`native-cuda-startup.v1.json`과 `native-cuda-termination.v1.json`으로 보존한다.
+source·model·export·runtime·bundle·backend·encoding·action map·history·device·arena·
+placement 근거를 잠그고 실제 CUDA origin과 물리 drain을 검증한다. GPU 결과를 기존
+`actual_cpu_inference_observed` 필드나 `CpuOnnx` origin으로 표현하지 않는다.
+E는 이 GPU 형식을 직접 검증하는 별도 feature·실행 명세를 사용한다. 19개 입력과
+새 프로세스별 runtime 사본을 기존 CPU 입력·출력 예산에 억지로 맞추지 않으며,
+추가 snapshot·사본·로그·시간 예산을 실행 전에 유한하게 확정한다.
+
+D의 `Finished`는 mailbox 적재, `PhysicalCompleted`는 owner의 완료 관측이다.
+common evaluator의 최종 `poll` 검증과 B의 최종 scope·clock 검사를 통과한 소비는
+각각 별도 기록이며 root 초기화와 실제 non-root backup도 구분한다. 관측 ring의
+유실·counter overflow를 보고하고, 예약이 변한 경우에만 예약 snapshot을 적재한다.
+이 연결 관측만으로 source ORT 시작·완료 시각이나 GPU 전송·kernel 구간을 주장하지
+않는다. D02의 실제 source clock·종단 journal은 추가 인수로 남긴다.
+
 ## 실행 증거와 남은 인수
 
 실제 검증에는 source SHA·계약 revision·binary SHA·전체 bundle·원본/ONNX/참조 hash,

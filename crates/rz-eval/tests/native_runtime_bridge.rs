@@ -6,7 +6,8 @@ use rz_encoding::classical::HistoryFill;
 use rz_eval::contracts::{encoding_manifest, MaiaBinding, HOST_BYTES_PER_ITEM};
 use rz_eval::error::{BackendError, FailureKind, FailureStage, OutputCause};
 use rz_eval::native_runtime_bridge::{
-    NativeDiagnosticKind, NativeRuntimeBackend, NativeWorkerOrigin, NativeWorkerOwner,
+    NativeAdmissionPolicy, NativeDiagnosticKind, NativeRuntimeBackend, NativeWorkerOrigin,
+    NativeWorkerOwner, NATIVE_CUDA_ADMISSION_BYTES,
 };
 use rz_eval::rules_projection::ClassicalProjection;
 use rz_eval::worker::SingleWorker;
@@ -168,6 +169,12 @@ fn successful_physical_results_reuse_diagnostic_capacity_across_many_roots() {
     .unwrap();
     let owner = NativeWorkerOwner::from_worker(worker, projection.clone(), 1).unwrap();
     assert_eq!(owner.origin(), NativeWorkerOrigin::Injected);
+    assert_eq!(owner.admission_policy(), NativeAdmissionPolicy::Cpu);
+    assert!(owner.cuda_metadata().is_none());
+    assert_eq!(
+        owner.admission_policy().execution_resources().device_bytes,
+        0
+    );
     let clock = ManualClock::default();
     // More successes than B's 129 evaluations per root cannot exhaust the owner.
     for sequence in 1..=160 {
@@ -207,6 +214,134 @@ fn successful_physical_results_reuse_diagnostic_capacity_across_many_roots() {
             )))]
         )
         .is_err());
+}
+
+#[test]
+fn injected_cuda_admission_refuses_insufficient_device_budget_before_physical_launch() {
+    let projection = projection();
+    let calls = Arc::new(AtomicU64::new(0));
+    let count = Arc::clone(&calls);
+    let worker = SingleWorker::spawn(move |_: &rz_eval::contracts::PreparedBatch<RulesState>| {
+        count.fetch_add(1, Ordering::AcqRel);
+        Ok(Vec::new())
+    })
+    .unwrap();
+    let owner = NativeWorkerOwner::from_worker_with_admission(
+        worker,
+        projection.clone(),
+        1,
+        NativeAdmissionPolicy::CudaOneGiB,
+    )
+    .unwrap();
+    assert_eq!(owner.origin(), NativeWorkerOrigin::Injected);
+    assert!(owner.cuda_metadata().is_none());
+    assert_eq!(
+        owner
+            .admission_policy()
+            .session_resident_admission()
+            .device_bytes,
+        NATIVE_CUDA_ADMISSION_BYTES
+    );
+    let clock = ManualClock::default();
+    let eval = request(&projection, 1, 100);
+    let adapter =
+        ContractsAdapter::new(SharedScope::new(scope(eval.context())), clock.clone(), 1).unwrap();
+    let backend = NativeRuntimeBackend::new(owner.clone(), clock).unwrap();
+    let mut budget = limits();
+    budget.memory.device_bytes = NATIVE_CUDA_ADMISSION_BYTES - 1;
+    let mut runtime = ContractEvaluator::new(adapter, backend, budget, 64).unwrap();
+    runtime.submit(eval).unwrap();
+    match runtime
+        .poll()
+        .expect("device reservation failure is finalized")
+    {
+        EvalResult::Failed(failure) => assert_eq!(failure.error.code, ErrorCode::ResourceExhausted),
+        other => panic!("expected prelaunch admission failure: {other:?}"),
+    }
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+    assert!(!owner.try_status().unwrap().unwrap().active);
+    assert_eq!(runtime.state().reserved, Resources::default());
+    assert!(owner.take_diagnostics().unwrap().entries.is_empty());
+}
+
+#[test]
+fn injected_cuda_unknown_completion_retains_device_reservation_and_original_cause() {
+    use rz_eval::error::CauseCode;
+    use rz_eval::worker::PhysicalRun;
+    let projection = projection();
+    let original = BackendError::new(
+        FailureKind::BackendFailure,
+        FailureStage::Backend,
+        "injected CUDA completion is unconfirmed",
+    )
+    .with_external_cause(CauseCode::OrtRun, &"authored device error");
+    let cause = original.clone();
+    let worker = SingleWorker::spawn_with_outcome(
+        move |_: &rz_eval::contracts::PreparedBatch<RulesState>| -> PhysicalRun<Result<Vec<EvalOutput>, rz_eval::contracts::PhysicalFailure>> {
+            PhysicalRun::Quarantined(cause.clone())
+        },
+    ).unwrap();
+    let owner = NativeWorkerOwner::from_worker_with_admission(
+        worker,
+        projection.clone(),
+        1,
+        NativeAdmissionPolicy::CudaOneGiB,
+    )
+    .unwrap();
+    assert_eq!(owner.origin(), NativeWorkerOrigin::Injected);
+    let clock = ManualClock::default();
+    let eval = request(&projection, 1, 100);
+    let context = eval.context();
+    let weak = Arc::downgrade(&eval);
+    let adapter =
+        ContractsAdapter::new(SharedScope::new(scope(context)), clock.clone(), 1).unwrap();
+    let backend = NativeRuntimeBackend::new(owner.clone(), clock.clone()).unwrap();
+    let mut budget = limits();
+    budget.memory.device_bytes = NATIVE_CUDA_ADMISSION_BYTES;
+    let mut runtime = ContractEvaluator::new(adapter, backend, budget, 64).unwrap();
+    runtime.submit(eval).unwrap();
+    wait_until(|| {
+        assert!(
+            runtime.poll().is_none(),
+            "unknown completion cannot publish an output"
+        );
+        owner.admission_error().is_some()
+    });
+    assert!(owner.try_status().unwrap().unwrap().active);
+    assert_eq!(
+        runtime.state().reserved.device_bytes,
+        NATIVE_CUDA_ADMISSION_BYTES
+    );
+    let mut diagnostics = owner.take_diagnostics().unwrap();
+    assert_eq!(diagnostics.entries.len(), 1);
+    let receipt = diagnostics.entries.pop().unwrap();
+    assert_eq!(receipt.kind, NativeDiagnosticKind::Quarantined);
+    assert_eq!(receipt.context.request, context);
+    assert_eq!(receipt.context.execution, Some(ExecutionId::new(EPOCH, 1)));
+    assert_eq!(receipt.failure.backend, Some(original));
+    runtime
+        .begin_shutdown(Deadline {
+            clock: clock.domain(),
+            at: MonotonicTick(1),
+        })
+        .unwrap();
+    assert!(matches!(runtime.poll(), Some(EvalResult::Canceled(_))));
+    clock.0.store(1, Ordering::Release);
+    assert!(runtime.poll().is_none());
+    assert!(matches!(
+        runtime.shutdown_snapshot().drain,
+        DrainState::TimedOut { .. }
+    ));
+    assert_eq!(
+        runtime.state().reserved.device_bytes,
+        NATIVE_CUDA_ADMISSION_BYTES
+    );
+    assert!(runtime.state().reserved_requests > 0);
+    drop(runtime);
+    assert!(
+        weak.upgrade().is_some(),
+        "D retains physically uncertain input pins"
+    );
 }
 
 #[test]
