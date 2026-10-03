@@ -250,3 +250,24 @@ seed/session으로 순서를 고정한다. 독립적인 confirm 창 2·3은 해�
 3개 Rust 검사는 실제 Rules/C/D/B 소비·예약 해제·guard와 상한을, 11개 Python 검사는
 명시적 가짜 UCI controller로 runner의 실패/timeout/log/receipt 경계를 확인한다.
 후자는 실제 engine 성능이나 GPU 검사가 아니다. Ubuntu·Windows CPU CI에서 함께 실행한다.
+
+## OPT-01~12 후속 검사
+
+전체 A 담당 구현의 독립 feature·한도·소비자 계약과 실제 실행 source는
+[최적화 기록 11장](../../docs/research/PERFORMANCE-OPTIMIZATION-PLAN.md#11-opt-0112-전체-구현과-검증)에 있다.
+OPT-01~08의 독립 옵션은 위 witness와 같은 actual tensor/fixed-visit 기록으로 비교한다.
+bounded 상태 cache를 실제로 사용하도록 예제의 Rules wrapper도 retained-byte charge를
+전달한다. 새 CPU cohort는 14 비교 × 두 fixture의 2,128 fresh process이며 이전
+OPT-00의 584 표본과 합산하지 않는다.
+
+cache/notify/S1 batch의 실제 A/C/D/B 연결·한 번의 backup·취소·drain은
+`cargo test --workspace --all-targets --all-features --locked`의
+`experimental_pipeline`·runtime/native bridge·batch wakeup 검사에서 확인한다.
+이는 합성 raw head/clock을 사용한 CPU 정확성 검사이며 NN·GPU나 성능 표본이 아니다.
+S1의 virtual reservation과 완료 순서는 S0와 달라질 수 있다.
+
+위 `paired_search.py` native schema는 기존 Computed-only V1 baseline을 위한 것이다.
+새 raw cache/I/O/batch 실험의 native argv·report를 이 V1 runner에 끼워 넣지 않는다.
+buffer/binding/fixed CUDA B1 Graph의 수치 대조는 `maia_check`의 명시적인 실행 옵션과
+별도 fresh report로 수행한다. 장치 성능과 S1 품질 대조는 새로운 mode/profile을 잠근
+별도 cohort이며 기존 NN/대국 인수를 재사용하지 않는다.

@@ -298,3 +298,51 @@ GPU 미할당이면 해당 검사는 미실행이고 실제 사용 가능한 지
 
 새 유료 GPU·장시간 실행은 기존 사용자 배정과 확정 예산을 따른다. 이 계약 연결 작업은
 GPU 비용 승인이나 원시 가중치·학습 데이터·PGN·로그의 Git 반입을 추가 승인하지 않는다.
+
+## 9. PR #18 전체 최적화의 실제 소비 접점
+
+이번 OPT-01~12는 사용자가 **모든 영역의 구현을 A(Codex)에게 배정**했다.
+내부 구현 후 실제 A/C/D/B 선언과 소비자를 같은 작업 브랜치에서 맞췄다.
+`rz-contracts`의 공통 필드·revision **0.1**, state/input digest codec과 기본 FP32/full
+경로는 유지한다. routine API 연결을 위해 추가 승인을 요청하지 않으며 총괄의 최종
+통합 리뷰는 유지한다. 구현·검사 소스와 명령은 [최적화 기록 11장](research/PERFORMANCE-OPTIMIZATION-PLAN.md#11-opt-0112-전체-구현과-검증)에 고정한다.
+
+| 경계 | 실제 선언·소비자 | 호환·수명·한도 |
+|---|---|---|
+| A → C | `PositionSnapshot::piece_bitboards`, `recent_history_frames`, weak position identity → `ClassicalProjection` | 유지 중인 12 bitboard·최근 8 frame을 읽는다. 전체 known prefix의 반복 증거·unknown prefix·raw EP를 보존한다. weak identity는 같은 history node에서만 hit하며 history를 pin하지 않는다 |
+| C 준비 | private immutable projection/tensor/key/ordered indices → `MaiaBinding::prepare_rules` | 1-slot prepared cache; 같은 live state와 정확한 legal 순서만 공유. 새 request의 profile/budget/input/authority 검사를 생략하지 않는다. generic `prepare`는 독립 인코딩 경로 유지 |
+| B → A | `rz_search::contracts::ContractPosition::retained_bytes` → Rules adapter와 bounded search state cache | 기존 opaque consumer의 기본 반환값은 `None`이며 재사용하지 않는다. Rules는 공유 prefix를 과다 계산한 보수적 charge를 제공한다. 기본 64항목/8MiB, hard 1024항목/64MiB, root마다 폐기 |
+| B 진행 조회 | `ContractSearch::best_move`, `counters` → UCI | 진행 중 전체 outcome/문자열을 만들지 않는다. 최종 outcome과 통계는 기존 경로 유지 |
+| C → D raw 재사용 | `ExactRawReuse`, `ClassicalProjection::raw_cache_provider`, D `submit_reused` | 실제 tensor의 모든 float bit와 metadata 및 model/encoding/backend/precision/compute/epoch/game이 일치해야 한다. root는 namespace에 넣지 않되 새 root의 요청·legal·deadline·cancel을 다시 검사한다 |
+| worker → UCI 대기 | `CompletionSignal`, `EvaluatorFactory::completion_signal`, `ManagedEvaluator::wake_after` | sequence는 predicate 검사 전 읽는다. 결과는 기존 single consumer가 받으며 signal은 결과를 운반하지 않는다. 완료 publication·취소·quarantine/close가 알린다. 아직 물리 실행이 없는 queued batch는 최대 200µs timer로 다시 pump한다 |
+| C 실행 모드 | `BackendConfig.experiments: ExecutionExperiments` → native bootstrap/worker | public Rust struct literal consumer는 새 필드를 채워야 하며 `BackendConfig::cpu()`의 기본값은 모두 false다. 비기본 실행 모드는 backend identity에 포함한다. wire/ORT ABI 변경은 없다 |
+| 다중 요청 | B `ContractSearch::set_parallelism` / C explicit batched owner / D mixed-legal capability → native UCI `--experimental-batch=N` | 폭 1..16, 단일 물리 worker, 최대 물리 실행 1, native batch 대기 200µs. 기본 B1 owner는 유지한다. full raw heads를 제공하는 C가 명시한 경우에만 서로 다른 legal 수를 묶는다 |
+
+raw cache는 기본 runtime 설정에서 꺼져 있다. 기본 typed 한도는 64항목/4MiB,
+hard 1024항목/64MiB이고 stage 후보와 live ID도 유한하다. 실제 Computed 출력은
+**D의 최종 승인 후에만** 재사용 entry로 승격한다. 취소·만료·세대 변경·수락 실패는
+stage/live 등록을 제거하며 늦은 물리 완료가 이를 다시 만들지 못한다. hit는 정상
+admission과 새 single-consumer receipt를 거쳐 `RawEvalHit`으로 완료한다. 새 물리
+ExecutionId·Computed event를 만들지 않고 실제 출처 execution을 별도로 보존한다.
+ucinewgame은 컨테이너와 namespace를 초기화한다. B는 hit도 정상 selection 하나에
+대해 한 번만 backup한다. 취소한 물리 요청의 실제 lease는 기존 fence까지 유지한다.
+
+native typed report는 Computed 완료/초기화/backup과 raw-hit 완료/초기화/backup을
+분리한다. 기존 **Computed-only CPU/CUDA V1 attestation**은 raw-hit, 실행 옵션,
+B>1을 baseline으로 직렬화하지 않는다. 옵션과 V1 attestation의 조합은 CLI에서
+거부한다. 성공한 bootstrap placement probe·`binding_runs()`를 검색 결과의 GPU
+소비나 실제 Graph capture/replay의 증거로 승격하지 않는다.
+
+buffer pool은 정확한 shape/capacity와 반환된 소유권에 한해 재사용한다. 다른 caller가
+보존한 출력은 수정하지 않는다. I/O Binding은 고정 device input/output과 별도 host
+출력을 보유한다. CPU는 host input을 매 Run 다시 bind하며 CUDA는 synchronous ORT
+Identity copy로 입력/출력을 전송한다. 그 추가 세션 비용도 실험 비용이다. Graph는
+CUDA B1+binding만 허용한다. Run/copy/fence 실패로 물리 완료가 불명확한 CUDA
+session·input·binding은 quarantine 상태에서 보존한다. 실제 장치 수명·수치·VRAM
+검사가 없는 CPU 결과로 해당 경계를 인수하지 않는다.
+
+OPT-12는 **S 실험**이다. virtual visit/loss는 selection에만 적용하며 실제 edge 통계는
+검증된 완료의 backup에서만 바꾼다. ticket마다 예약·consume 권한을 분리하고 역순·
+중복·일부 취소·전체 취소·오류·drain에서 한 번만 반환한다. 같은 ExecutionId의
+다른 요청이 유효하면 독립 소비한다. S1과 동기 S0의 선택/완료 순서·분포가 같다는
+가정을 하지 않으며 holdout 대국과 동일 시간/메모리 자원의 인수는 별도다.
