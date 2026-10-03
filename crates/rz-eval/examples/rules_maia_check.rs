@@ -397,16 +397,25 @@ fn drain(evaluator: &mut NativeEvaluator, clock: &ContractSystemClock) -> Result
     }
 }
 
+struct ProfileExecution<'a> {
+    fill: HistoryFill,
+    profile_slot: u64,
+    cuda_profile_directory: Option<&'a Path>,
+}
+
 fn evaluate_profile(
     runtime: &OrtRuntime,
     model: &MaiaAsset,
     fixtures: &Fixtures,
-    fill: HistoryFill,
-    profile_slot: u64,
-    cuda_profile_directory: Option<&Path>,
+    execution: ProfileExecution<'_>,
     reports: &mut Vec<Value>,
     profiles: &mut Vec<Value>,
 ) -> Result<()> {
+    let ProfileExecution {
+        fill,
+        profile_slot,
+        cuda_profile_directory,
+    } = execution;
     let mut config = BackendConfig::cpu();
     config.max_batch = 1;
     if let Some(directory) = cuda_profile_directory {
@@ -695,9 +704,11 @@ fn main() -> Result<()> {
                 &runtime,
                 &model,
                 &fixtures,
-                fill,
-                slot,
-                cuda_profile_directory,
+                ProfileExecution {
+                    fill,
+                    profile_slot: slot,
+                    cuda_profile_directory,
+                },
                 &mut cases,
                 &mut profiles,
             )?;

@@ -992,7 +992,7 @@ pub(crate) mod linux {
                 encode_fastchess_native_args(&tokens)?,
             ]);
         }
-        let opening = &pin(pins, &input.opening_artifact)?.path;
+        let opening = &pin(pins, input.opening_artifact)?.path;
         args.extend([
             "-each".into(),
             "proto=uci".into(),

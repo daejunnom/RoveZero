@@ -950,8 +950,8 @@ impl Owner {
                             traversed_edges,
                             ..
                         } = &event
-                            && let Err(error) =
-                                factory.observe_search_acceptance(evaluation, *traversed_edges)
+                            && let Err(error) = factory
+                                .observe_search_acceptance(evaluation.as_ref(), *traversed_edges)
                         {
                             // The already committed tree remains untouched. Preserve
                             // an observer failure and close future logical admission.

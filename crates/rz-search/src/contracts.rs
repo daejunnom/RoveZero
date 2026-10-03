@@ -171,7 +171,7 @@ pub enum ContractPumpEvent {
         selection: SelectionId,
         traversed_edges: usize,
         /// Exact Rules terminals have no evaluator output and leave this empty.
-        evaluation: Option<AcceptedEvaluation>,
+        evaluation: Option<Box<AcceptedEvaluation>>,
     },
     /// 다른 요청 또는 잘못 echo된 context는 현재 reservation을 소비하지 않는다.
     Diagnostic(ContractError),
@@ -686,13 +686,13 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
                 self.accepted_executions.insert(execution);
             }
             if let ContractPumpEvent::Accepted { evaluation, .. } = &mut event {
-                *evaluation = Some(AcceptedEvaluation {
+                *evaluation = Some(Box::new(AcceptedEvaluation {
                     context: CompletionContext {
                         request: output.context,
                         execution: output.actual.execution,
                     },
                     actual: output.actual,
-                });
+                }));
             }
         }
         event
