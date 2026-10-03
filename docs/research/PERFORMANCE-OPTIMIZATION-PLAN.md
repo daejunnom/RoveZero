@@ -2,7 +2,7 @@
 
 작성일: 2026-10-03 UTC. 작성 담당: A(Codex). 확인한 공개 GitHub 작성자:
 [daejunnom](https://github.com/daejunnom). 갱신일: 2026-10-03 UTC.
-상태: **전체 최적화 A 담당; 내부 실험 2개 구현·CPU 진단, 후속 구현·정식 인수 대기**.
+상태: **전체 최적화 A 담당; 내부 실험 2개·OPT-00 CPU 검증 도구 구현, 다음 OPT-01·정식 인수 대기**.
 
 이 계획은 현재 소스 조사와 PR #17 재검토에 다음 사용자 지시를 반영한다.
 
@@ -21,7 +21,7 @@ revision은 명시하고 총괄의 통합 리뷰·인수 절차는 유지한다.
 [개발 기준](../ENGINEERING-STANDARDS.md), [실험 계약](../EXPERIMENTS.md),
 [공통 계약](../CONTRACTS.md)을 따른다. 여기서 E/A/S의 A는 근사·모델 변경 분류이며
 작성 담당 A와 다르다. 1~7장의 조사·검증 원칙을 유지하고, 실제 첫 구현·검사·반복 CPU
-진단은 8장, 최신 미반영 항목과 실행 순서는 9장에 기록한다. 정식 탐색 성능·GPU·대국
+진단은 8장, 최신 미반영 항목과 실행 순서는 9장, OPT-00 구현·검증은 10장에 기록한다. 정식 탐색 성능·GPU·대국
 강도 인수와 실험의 기본 활성화는 보류 상태다.
 
 ## 1. PR #17 재확인과 근거의 범위
@@ -525,9 +525,10 @@ inline review thread는 없다. 이후 구현의 manifest는 당시 최신 full 
 | 항목 | 현재 반영 상태 | 남은 일 |
 |---|---|---|
 | #16의 legal 중복 생성·부모 재-export·discarded undo·profile hash | develop에 병합됨 | 기준선에 포함; 같은 개선을 다시 구현하지 않음 |
-| claim 반복 증거·임시 전이 축소 | #18의 `experimental-claim-preview`, 기본 off | tensor/전체 탐색 소비자 대조·통제 성능 비교·통합 및 활성화 판단 |
+| claim 반복 증거·임시 전이 축소 | #18의 `experimental-claim-preview`, 기본 off; 10장의 CPU 종단 witness 일치 | 통제 성능·실제 모델 비교·통합 및 활성화 판단 |
 | FEN 버퍼·현 상태 digest 재사용 | #18의 `experimental-history-digest`, 기본 off | 같은 인수; 짧은 이력 회귀 가능성도 재확인 |
-| 유한한 public probe·상태 witness·반복 CPU/할당 진단 | 구현·실행됨, 8장에 증거 보존 | 종단 witness/runner 보강; 기존 숫자를 새 비교 표본으로 사용하지 않음 |
+| 유한한 public probe·상태 witness·반복 CPU/할당 진단 | 구현·실행됨, 8장에 증거 보존 | 기존 숫자를 새 비교 표본으로 사용하지 않음 |
+| OPT-00 실제 tensor·고정 방문 수 종단 witness·직렬 UCI runner | CPU/mock 구현·대조·실행됨, 10장 | 실제 UCI 완료 방문 수 관측·통제 세션·observer off/on·native 실행 |
 | D02 source observer | #17에 구현됐지만 현재 기준선에는 미병합 | 사용할 통합본의 선언·consumer 대조, off/on overhead와 관측 손실 검사 |
 | 아래 OPT-01~12 | 미구현 | 전부 A가 구현·소비자 연결·검증; 다른 담당에게 제안만 남기지 않음 |
 
@@ -539,8 +540,8 @@ OPT 번호는 이 계획의 작업 단위이며 기존 TASK/CARD 배정을 바�
 
 | 단위 | 미반영 산출물·주 변경 파일 | 선행 및 분리 조건 | 완료 근거 |
 |---|---|---|---|
-| OPT-00 / 다음 작업 | tensor·fixed-visit witness, 유한 종단 비교 runner; position 예제·search/uci 검사·계측 runner | 기존 probe 활용; 가짜 clock correctness와 실제 시간 성능을 분리 | 기존 두 feature까지 동일성 비교 가능, 실패·오염·상한을 기록 |
-| OPT-01 | 읽기 전용 비트보드·borrowed 이력 반복 정보; position `position.rs/types.rs`, eval `rules_projection.rs` | 비트보드 읽기와 반복 계산을 각각 비교 | 전체 입력 바이트·repeated plane·padding·합법 수 순서 일치 |
+| OPT-00 / CPU 도구 구현됨 | 실제 tensor·fixed-visit witness, 유한 종단 비교 runner; uci 예제·runtime Python 검사·CPU CI | 가짜 clock correctness와 실제 시간 성능 분리; 10장 | 5설정×2 history fill 출력 일치, 584회 CPU 진단; 정식 인수는 남음 |
+| OPT-01 / 다음 작업 | 읽기 전용 비트보드·borrowed 이력 반복 정보; position `position.rs/types.rs`, eval `rules_projection.rs` | 비트보드 읽기와 반복 계산을 각각 비교 | 전체 입력 바이트·repeated plane·padding·합법 수 순서 일치 |
 | OPT-02 | projection/encoded/input key/legal indices의 불변 준비 결과; eval `rules_projection.rs/contracts.rs`, search/uci 연결 | OPT-01 이후; 공유 객체와 새 요청의 검증을 분리 | 중복 encode 제거, 잘못된 요청·profile·budget 거부 유지 |
 | OPT-03 | input key의 작은 hash update 축소; eval `contracts.rs`, encoding 접점 | OPT-02와 별도 variant | 기존 little-endian framing·golden·key 일치 |
 | OPT-04 | PUCT·통계 작업 버퍼·best move 조회; search `policy.rs/tree.rs/contracts.rs`, uci `engine.rs` | OPT-00; 조회/argmax/버퍼를 각각 작은 비교로 분리 | tie·오류 우선순위·전체 고정 방문 trace 일치 |
@@ -553,7 +554,7 @@ OPT 번호는 이 계획의 작업 단위이며 기존 TASK/CARD 배정을 바�
 | OPT-11 | CUDA Graph capture/replay | OPT-10; Graph 단독 variant | 고정 shape/주소·오류·수명·실제 GPU 반복 실행 |
 | OPT-12 | 탐색 다중 진행 요청·batch·virtual reservation; search·runtime·eval·uci | OPT-06/07/09 이후; Graph 채택은 선행 조건이 아님 | 정확한 예약/backup·유한 대기·S trace·동일 자원 holdout |
 
-OPT-00을 먼저 구현하고 OPT-01을 첫 비용 제거 단위로 진행한다. OPT-04·08은 입력 경계와
+OPT-00의 CPU 검증 기반을 구현했으며 OPT-01을 다음 비용 제거 단위로 진행한다. OPT-04·08은 입력 경계와
 독립적으로 개발할 수 있지만 실행 비교는 직렬화한다. 기존 두 feature의 인수가 불확정이어도
 후속 CPU/mock 구현을 멈추지 않는다. 어느 비교에도 미인수 변경을 묶어서 넣지 않는다.
 
@@ -562,18 +563,24 @@ OPT-00을 먼저 구현하고 OPT-01을 첫 비용 제거 단위로 진행한다
 - 기존 합법 256-ply fixture와 짧은/긴 이력·claim·unknown-prefix 입력군을 사용한다.
   원본/default/claim/history/두 옵션에서 ordered moves·full history·classification·digest뿐
   아니라 C의 실제 tensor/input key/legal indices를 비교하는 유한 witness를 추가한다.
+  이 CPU/mock 대조는 10장에서 완료했으며 이후 각 variant의 회귀 검사에 재사용한다.
 - 같은 seed·고정 방문 수·결정적 evaluator와 가짜 clock으로 selection/leaf/value/backup 및
   최종 root 통계를 비교한다. stop/deadline/stale/overflow/resource 오류는 별도 시나리오로
   검사한다. ID 발급 차이만 정규화하고 권한·중복 소비 오류는 정규화로 숨기지 않는다.
+  10장의 witness는 cancel/expiry/stale/node limit/input/output 오류를 검사했고 overflow는
+  기존 독립 A 회귀 검사에서 검증했다. 실제 모델과 통제 장비의 소비 trace는 아직 남아 있다.
 - 실제 clock의 `go`→`bestmove` 비용·완료 방문 수·deadline·CPU·peak RSS를 수집할 runner를
   기존 실험 manifest와 연결한다. CPU/mock, 실제 CPU 모델, 목표 GPU 모델은 서로 다른
   cohort로 남긴다. load/warm-up/quit와 observer 직렬화는 탐색 구간 밖에서 별도 기록한다.
+  구현된 runner는 position 준비까지 포함한 지표와 go 구간을 분리한다. 현재 mock UCI의
+  실제 완료 방문 수 출력은 없어 null로 보존하며, 방문 처리량 검증은 후속으로 남긴다.
 - pilot과 사전 고정한 3세션×4 paired block, ABBA/BAAB의 48 fresh process 비교를 적용한다.
   baseline-baseline과 profile off/on 대조도 유지한다. 경합을 통제·관측하지 못하면 진단으로
   표시한다. 첫 두 옵션을 각각 비교하고 조합 효과는 별도 비교로 확인한다.
 
-기존 feature의 **새 전체 탐색 동일성 검사**, **통제 성능 비교**, **기본 활성화 판단**이
-남아 있다. 8장의 정확성 검사 성공을 취소하지 않으며 그 근거를 전체 탐색 인수로 확대하지
+기존 feature의 CPU/mock 고정 방문 수 전체 동일성 검사는 10장에서 완료했다.
+**실제 모델 대조**, **통제 성능 비교**, **기본 활성화 판단**은 남아 있다.
+8장의 정확성 검사 성공을 취소하지 않으며 그 근거를 전체 탐색 인수로 확대하지
 않는다. PR #17 observer는 실제 선택한 통합 SHA에서만 사용한다. lock 비용이 문제로
 측정될 때 per-worker journal 같은 변경을 별도 후보로 만들고 cache/notifier와 묶지 않는다.
 
@@ -708,7 +715,157 @@ Graph·batch 확대·precision 변경을 한 variant에 함께 넣지 않는다.
 바꾸지 않는다. 사용하지 않는 실험의 allocation/lock/worker 유입도 검사한다. 허용치는
 3장의 사전 기준을 사용하며 음성 결과와 실패를 보존한다.
 
-이번 계획 갱신은 제품 코드를 추가하지 않는다. 학습·가중치 교체·근사 cache·history 절단·
+9장의 계획 갱신은 제품 코드를 추가하지 않았고 10장은 별도 검증 도구의 구현을 기록한다.
+학습·가중치 교체·근사 cache·history 절단·
 증분 digest codec은 포함하지 않는다. GPU 실험의 코드와 검사 진입점은 구현 범위에
 포함하지만 실제 실행은 지정 장비와 기존 예산 안에서 한다. GPU 부재나 새 자원 미확정은
 CPU/mock 구현을 막지 않으며 미실행 GPU·강도 결과를 통과로 표시하지 않는다.
+
+## 10. OPT-00 구현·검증과 반복 CPU 진단
+
+### 10.1 실제 실행 소스와 검증 도구
+
+2026-10-03 UTC에 PR #18과 #17의 open/draft·head/base·inline review·필수 CI를
+재확인한 뒤 OPT-00을 구현했다. 실행 기준은 develop
+`b5ba853585cb5a78f81159f733a86cdfe085936b`, 구현·runner source는
+`05c6e5febc33d95a13d5e44128c645bd8fa79d55`다. PR #17 `81059e4`는 미병합
+참고 자료로 유지하며 이번 source에 observer를 추가하지 않았다.
+
+[`optimization_witness`](../../crates/rz-uci/examples/optimization_witness.rs)는
+실제 A Rules adapter, C `ClassicalProjection`/`MaiaBinding`, D `ContractEvaluator`와
+scripted backend, B `ContractSearch`/PUCT를 연결한다. 수동 clock과 명시적 합성
+logits/WDL을 사용하여 정확성을 검증한다. 실제 NN 실행이나 시간 성능 표본은 아니다.
+제품 library·공통 계약 revision 0.1·두 실험의 기본 off는 변경하지 않았다.
+추가된 경로는 실행 예제, 진단 runner/검사, 해당 CPU CI뿐이다.
+
+비교 출력은 다음 실제 값들을 포함한다.
+
+- leaf 경로·full known history/FEN·origin/completeness/revision, 구체/공통 classification,
+  ordered moves·order digest·semantic digest.
+- C가 실제 request에서 만든 projection·dense tensor의 little-endian 바이트·input key·
+  ordered policy indices. D 제출 직전 같은 불변 request로 prepare를 재현하고 D도 독립
+  prepare 검증을 수행한다. 장치 input buffer를 직접 관측한 기록은 아니다.
+- 실제 PUCT에 전달한 모든 edge 통계의 float bits·선택 index, accepted leaf value,
+  selection별 backup 직후 root 통계·방문/backup 카운터, 최종 상태·best move·fallback.
+- cancel/expiry/stale·node limit·잘못된 input key·비수치 output의 구체 오류,
+  shutdown 후 실제 scheduler/physical lease·예약의 drain.
+
+owner 발급 번호는 비교 출력에서 제외하지만 stale authority와 중복 소비를 정상화하여
+숨기지 않는다. 향후 상태 재사용이 `play`를 생략하더라도 `snapshot`에서 선택 leaf를
+갱신하도록 witness adapter를 구성했다. 출력 64MiB, visits 1~64,
+`visits * 16 + 64` pump/탐색·30초/탐색·64 drain step 상한을 둔다.
+
+[`paired_search.py`](../../benches/runtime/paired_search.py)는 별도의 실제 clock에서
+UCI engine을 새 process로 직렬 실행한다. shell을 사용하지 않고 source/binary hash·
+feature·compiler·명령·fixture·seed·자원 상한을 잠근다. 실제 합법 bestmove, stderr·
+late duplicate·timeout·실패 exit·quit/drain을 검사하고 실패를 원본과 함께 보존한다.
+native receipt는 PID/binary·model/encoding/backend·FP32/B1/worker/thread/revision·
+물리 drain과 CUDA의 실행/mapping 증거를 요구한다. 이번에는 native 실행을 하지 않았다.
+전체 스키마·명령·지원 범위는 [runtime 도구 문서](../../benches/runtime/README.md)에 있다.
+
+### 10.2 원본·독립 feature matrix의 전체 출력 대조
+
+기준 checkout에는 같은 witness 예제와 public trace fixture를 연결했다. 기존 probe의
+example 선언 외 제품 소스 차이는 없으며 별도 baseline worktree의 선행 자료는 보존했다.
+동일 Rust 1.96.0 release/locked/offline에서 original, current default, claim만,
+history만, 두 옵션 조합의 5설정을 빌드했다. 각 설정에서 history fill `no`와 `always`를
+별도로 실행했다. 정상 fixture 16개와 guard 6개, 정상 ongoing root당 visits 16이다.
+
+입력군은 이력 1/17/65/129/257, unknown-prefix 시작 FEN, Kiwipete, castling·EP·
+EP pin·승격/50수 intended claim, 현재/예정 3회·자동 5회 반복, mate/75수 우선순위,
+최대 카운터 상태다. 최대 카운터 fixture는 자동 75수 terminal이 먼저 판정됐다.
+**이 fixture가 overflow 오류를 발생시켰다고 보고하지 않는다.** 실제 checked transition의
+overflow 원자성은 기존 `checked_counter_overflow_is_atomic`과 독립 A 검사로 검증한다.
+
+각 fill의 witness 전체가 5설정에서 byte-for-byte 일치했다. `no` 출력에는
+22 CASE·249 LEAF·226 TENSOR-LE·329 SELECT·222 ACCEPTED/BACKUP·22 FINAL/DRAIN이 있다.
+root initialization과 completed visit/backup을 구분하며 terminal/guard를 16방문 완료로
+세지 않는다. 출력과 binary별 hash는 `${ARTIFACT_ROOT}/opt00/matrix-05c6e5f/matrix.json`에 있다.
+
+| history fill | 동일한 전체 witness SHA-256 |
+|---|---|
+| no | `2b1e60bf922f265b5b5d880608ea5876115b8bfa41243ca4f2e792e98c486599` |
+| always | `42df4440743024ce8420381ec6472af9dd7e3bda51b6f1ca093c6aa5fc2ab86a` |
+
+이는 실제 인코딩과 결정적 CPU/mock 탐색의 동등성 근거다. NN 수치 오차·GPU·통제 장비의
+deadline 성능·대국 강도나 모든 체스 상태의 동등성 증명으로 확대하지 않는다.
+
+### 10.3 실제 UCI 반복 실행: 별도 진단 cohort
+
+실행 전에 profile off, CPU mock, seed 20261003, 동일 witness에서 추출한 trace-0/256
+position·ordered legal moves, `go nodes 16`을 잠갔다. 원본→default,
+default→claim, default→history, default→both를 별도 비교했다. 내부 API probe였던
+8장 자료와 합산하지 않는다. 1차 지표는 **position 송신→bestmove 수신**이다.
+이미 position 단계에서 수행되는 준비 비용을 포함하려고 pilot 전에 고정했으며,
+3.4의 `go`→`bestmove`도 별도 지표로 보존한다. ready barrier·명령 전송은 양쪽에 동일하다.
+startup/quit는 process wall에 별도로 남는다. mock의 기존 Waiting polling도 비용에 포함된다.
+
+각 비교·fixture의 pilot은 control 3 + variant 3 block, 후속 비교는 3창×4 block,
+각 block은 사전 배정한 ABBA/BAAB 4 fresh process다. 두 fixture를 합쳐 비교당
+pilot 48·후속 96 process이며 총 **smoke 8 + pilot 192 + 후속 384 = 584 process**다.
+후속 창은 같은 VM에서 연속 실행한 **개발용 3창**이며 통제된 독립 3세션으로 보지 않는다.
+실행 시작 UTC는 17:23:35~17:25:11이다. 반복 수를 사후 축소하거나 실패·느린 표본을
+대체하지 않았으며 584개 모두 diagnostic으로 완료했다.
+
+자원 조건은 Linux 6.18.44, Xeon Platinum 8573C, Rust 1.96.0,
+container quota 4 core/16GiB, engine CPU 0·runner CPU 4다. process timeout 12초,
+run wall 60초, 관측 RSS 256MiB·run 산출물 64MiB·throttle 증가 허용치 0을 잠갔다.
+해당 실행 동안 cgroup throttle·OOM/OOM-kill/high 증가가 없었고 최대 관측 VmHWM은
+4,345,856 bytes였다. RSS는 Linux 샘플링 값이며 강제 OS limit 또는 모든 순간의
+peak를 검증한 값으로 보지 않는다. CPU/memory PSI·host 독점·clock은 unknown,
+GPU unavailable이다. 관측 증가가 없다는 사실로 외부 경합이 없었다고 확정하지 않는다.
+
+현재 mock UCI는 `info nodes`를 출력하지 않아 **584개 모두 `reported_nodes=null`**이다.
+`go nodes 16`은 요청 한도이며 실제 완료 방문 수로 대입하지 않았다. Rust witness에서
+actual visit/backup을 검증했지만 다른 UCI 실행의 방문 처리량 증거로 재사용하지 않는다.
+actual UCI counters 연결과 movetime/deadline 비교는 후속 검증 항목이다.
+
+아래 값은 후속 12개 paired block의 평균 시간 B/A 비율 중앙값이다. 구간은 창 내부
+block을 재표집한 10,000회 bootstrap의 진단용 95% percentile(seed 20261003)이며
+독립 세션의 모집단 신뢰구간으로 인수하지 않는다. 1보다 작으면 해당 실행의 시간이 짧다.
+
+| 비교 | 이력 1 비율 [진단 구간] | 이력 257 비율 [진단 구간] |
+|---|---|---|
+| original → default | 1.004 [0.984, 1.029] | 0.971 [0.955, 1.021] |
+| default → claim | 0.989 [0.942, 1.003] | 0.936 [0.928, 0.959] |
+| default → history | 0.995 [0.970, 1.007] | 0.767 [0.673, 0.806] |
+| default → both | 0.983 [0.972, 1.012] | 0.775 [0.755, 0.803] |
+
+baseline-baseline pilot도 보존했다. block 비율 범위는 짧은 이력 0.987~1.081,
+긴 이력 0.909~1.053으로 흔들렸다. 비교별 전체 지표·control·원시 로그·UTC·affinity·
+resource snapshot은 `${ARTIFACT_ROOT}/opt00/paired-05c6e5f/`에 있다. 긴 이력 비용 감소의
+진단 근거는 얻었지만 2% 전체 탐색 회귀 허용폭·기본 활성화·GPU·강도는 인수하지 않는다.
+
+### 10.4 검사·보존과 다음 작업
+
+- 로컬 `cargo test -p rz-uci --example optimization_witness --locked`: 3 passed,
+  0 failed. 실제 root 초기화·방문/backup, guard의 구체 결과와 physical drain·상한 검사.
+- 로컬 Python runner 검사: 11 passed. 명시적 fake UCI controller로 hash/argv/순서,
+  실제 nodes를 만들지 않음, illegal/duplicate/stderr/timeout/log 상한, native receipt/
+  CUDA mapping 실패를 검사한다. fake controller 결과를 실제 engine/GPU로 표시하지 않는다.
+- source `05c6e5f`의 [CI 37139504129](https://github.com/daejunnom/RoveZero/actions/runs/37139504129):
+  Ubuntu·Windows의 fmt, workspace/all-target/all-feature, native CLI,
+  release 독립 python-chess oracle/include-ignored, F/Python runner, strict Clippy
+  필수 step 모두 성공을 직접 확인했다. 기존 미지원 ignored를 통과로 세지 않는다.
+
+원시 matrix·binary·build log·witness, 모든 584 process·manifest·stdout/stderr·control과
+진단 요약을 저장소 밖에 보존했다. 실행 후 저장한 `analyze.py`는 기존 표본을 재실행하거나
+덮어쓰지 않고 모든 hash·manifest binding·출력 동일성을 재확인하여 `evidence-recheck.json`을
+생성한다. 최초 요약과 재확인 source도 각각 유지한다. 공개 source snapshot·baseline overlay
+차이·Cargo.lock hash·실제 검사/CI snapshot까지
+`${ARTIFACT_ROOT}/opt00-evidence-20261003.tar.gz`에 묶었다. payload 1,295개와 내부 hash 목록
+1개, 총 1,296개 member를 압축 파일에서 다시 읽어 전부 SHA-256 대조했다.
+패키지는 12,766,385 bytes이며 SHA-256은 다음과 같다.
+
+`c9d30797ad5766fbf39c0db9136ae9fcab6b231538905fbb4241e5177d34aaed`
+
+회수 검증은 `${ARTIFACT_ROOT}/opt00/archive-verification.json`에 있다. 산출물은 이 작업의
+cloud workspace 수명 동안 보존하며 자동 삭제하지 않는다. 회수용 패키지는 저장소 밖에
+있고 원격 영구 보관은 아직 수행하지 않았다. 초기 개발 witness는 최종 matrix와 분리해
+보존하며 현재 동일성/시간 표본에 합치지 않는다.
+
+다음 구현은 **OPT-01**이다. 비트보드 직접 읽기와 정확한 borrowed prefix 반복 계산을
+독립 opt-in 변경으로 구현하고 이 witness로 전체 입력/고정 방문 trace를 다시 대조한다.
+기존 두 feature와 새 변경을 섞어서 하나의 개선율로 보고하지 않는다. OPT-00의 CPU 기반은
+완료했지만 통제 세션·UCI actual visits·observer off/on·실제 CPU/GPU 모델·강도·기본 활성화는
+계속 미완료이며 A가 후속 구현·검증을 맡는다.

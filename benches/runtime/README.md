@@ -1,4 +1,6 @@
-# D02 CPU/mock trace 재생
+# Runtime 검증·반복 계측 도구
+
+## D02 CPU/mock trace 재생
 
 [cpu_trace 예제](../../crates/rz-runtime/examples/cpu_trace.rs)는 실제 `Scheduler`와
 `rz-telemetry::profile::TraceCollector`를 연결하는 유한한 CPU/mock 재현 진입점이다.
@@ -140,3 +142,111 @@ crates/rz-runtime/Cargo.toml --examples`다. 네 검사는 일곱 시나리오�
 과거 정확한 실행 SHA·argv·UTC·요청별 입력·event stream의 누락과 초기 trace의
 미확인 소스를 유지한다. 재수집 69개 통과는 D의 과거 standalone 구성에 대한
 결과이며 현재 root workspace의 검사나 GPU·D03 개선 근거로 재사용하지 않는다.
+
+## OPT-00 실제 입력·고정 방문 수 witness
+
+[`optimization_witness`](../../crates/rz-uci/examples/optimization_witness.rs)는 실제
+Rules adapter → C의 Classical/Maia 입력 준비 → D의 scripted runtime → B의
+`ContractSearch`와 PUCT를 연결한다. 수동 clock과 명시적 합성 policy/WDL을 쓰는
+정확성 도구이며 시간·신경망·GPU 성능 표본이 아니다. 제품 실행 경로에는 연결되지 않는다.
+
+```sh
+: "${RZ_OPT_OUTPUT_ROOT:?저장소 밖의 작업 전용 출력 루트를 지정하세요}"
+mkdir -p "$RZ_OPT_OUTPUT_ROOT/build" "$RZ_OPT_OUTPUT_ROOT/witness"
+CARGO_TARGET_DIR="$RZ_OPT_OUTPUT_ROOT/build" \
+  cargo run --release --locked --offline -p rz-uci --example optimization_witness -- \
+  --visits 16 --history-fill no \
+  > "$RZ_OPT_OUTPUT_ROOT/witness/default-no.txt"
+```
+
+인자는 `--visits 1..64`, `--fixture all|trace-0|trace-16|trace-64|trace-128|trace-256|…`,
+`--history-fill no|always`다. 기본값은 각각 16, all, no다. fixture 이름은 예제의
+`fixtures()`가 선언한다. 출력은 64MiB, 각 탐색은 `visits * 16 + 64` pump/30초,
+drain은 64 step으로 제한한다. 정상 입력 16개와 all 실행의 guard 6개는 22개 case다.
+
+`CASE/LEAF/HISTORY`는 전체 known history·classification·digest·ordered moves와
+선택 경로를, `SELECT`는 실제 PUCT edge 통계의 float bits와 선택 index를 기록한다.
+`PREPARE/TENSOR-LE`는 C가 request에서 준비한 실제 key·indices·projection과 dense
+tensor의 little-endian 바이트다. D 제출 직전에 같은 불변 request로 준비를 재현하며
+D도 독립 prepare 검증을 수행한다. GPU buffer를 관측한 기록으로 해석하지 않는다.
+`ACCEPTED/BACKUP/FINAL/DRAIN`은 실제 소비 값·backup 후 통계·종료/오류·물리 예약 해제를
+기록한다. owner 발급 번호는 비교 대상에서 제외하되 stale guard는 검사한다.
+`UCI-POSITION/UCI-LEGAL`은 반복 runner에 사용할 command와 합법 수 fixture다.
+
+`--features rz-position/experimental-claim-preview`,
+`rz-position/experimental-history-digest` 또는 두 feature의 쉼표 조합을 cargo에
+지정하여 독립 대조한다. 기준 checkout에는 같은 예제와 public trace fixture를 연결한다.
+실제 matrix와 범위의 한계는 [계획 10장](../../docs/research/PERFORMANCE-OPTIMIZATION-PLAN.md#10-opt-00-구현검증과-반복-cpu-진단)에 기록했다.
+
+## OPT-00 유한한 직렬 UCI 비교
+
+[`paired_search.py`](paired_search.py)는 외부 clock을 사용하는 진단 runner다.
+표준 Python 3.12만 필요하며 shell을 거치지 않고 manifest의 engine을 실행한다.
+새 process마다 `uci → ucinewgame/isready → position/isready → go → bestmove → quit`을
+순서대로 수행한다. 정상 합법 수 또는 terminal의 `0000`을 확인하며 늦은 중복 bestmove,
+stderr 진단·실패 exit·quit/drain timeout을 성공 표본으로 받지 않는다.
+
+manifest JSON의 schema는 `rz-opt00-paired-search/1`이며 다음 필드를 잠근다.
+
+| 필드 | 필수 내용·범위 |
+|---|---|
+| `provider`, `profile_mode`, `primary_metric` | `cpu_mock` / `onnx_cpu` / `onnx_cuda`, `off`, `position_bestmove_ns` |
+| `seed`, `witness_sha256` | unsigned 32-bit seed, 비교한 correctness witness SHA-256 |
+| `baseline`, `candidate` | 절대 binary 경로·SHA-256·40자리 source commit·build features·compiler·argv |
+| `fixtures` | 1~32개; 고유 `name`, `position`, 유한 `go`, witness의 `legal_moves`, `terminal` |
+| `timeout_ms`, `run_wall_limit_ms` | process 100~60000ms, 전체 run 100~3600000ms |
+| `max_rss_mib`, `max_run_bytes`, `max_throttled_usec` | 관측 RSS 16~65536MiB, 산출물 1MiB~1GiB, throttle 증가 허용치 |
+| `cpu_affinity`, `runner_cpu_affinity` | engine CPU 목록; 선택적인 runner CPU 목록과 겹치지 않음 |
+| `resource_notes` | host·clock·장치·창 독립성 등 available/unavailable/unknown 전제 |
+
+CPU mock argv는 `['--cpu-mock']`와 선택적인 `--mock-delay-ms=0..1000`뿐이다.
+native는 해당 provider argv와 선정 model/export/ORT/CUDA bundle 인자만 허용하며
+`expected_profile`의 model/encoding/backend digest를 요구한다. 자동 수집한 startup·
+termination receipt의 PID/binary, revision 0.1, FP32/B1/full-step 1/worker 1/thread 1,
+model·encoding·backend, 성공 종료·physical drain을 대조한다. CUDA는 verified mapping과
+실제 실행 node 증거도 필요하다. 실제 inference가 관측되지 않으면 그 값을 유지한다.
+receipt의 fixture 검사는 실제 native inference 인수를 대신하지 않는다.
+
+`go nodes 1..128` 또는 `go movetime 1..10000`을 허용한다. 프로세스 실행 전 binary hash를
+다시 검사하며 caller는 실행 중 binary·manifest·출력 루트를 독점 관리해야 한다.
+RSS는 Linux `VmHWM`을 경계에서 샘플링한 값이며 OS의 강제 메모리 제한은 아니다.
+미지원 platform의 RSS/cgroup/PSI는 unknown이다. 필요한 강제 제한·장비 통제는 외부에서
+설정한다. 각 stream은 2MiB, 한 protocol line은 64KiB, reader queue는 64개다.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python benches/runtime/paired_search.py \
+  --manifest "$RZ_OPT_OUTPUT_ROOT/comparison.json" \
+  --output "$RZ_OPT_OUTPUT_ROOT/smoke" --phase smoke --session 1
+PYTHONDONTWRITEBYTECODE=1 python benches/runtime/paired_search.py \
+  --manifest "$RZ_OPT_OUTPUT_ROOT/comparison.json" \
+  --output "$RZ_OPT_OUTPUT_ROOT/pilot" --phase pilot --session 1
+PYTHONDONTWRITEBYTECODE=1 python benches/runtime/paired_search.py \
+  --manifest "$RZ_OPT_OUTPUT_ROOT/comparison.json" \
+  --output "$RZ_OPT_OUTPUT_ROOT/confirm-1" --phase confirm --session 1
+```
+
+caller가 witness/빌드 metadata로 `comparison.json`을 만든다. 중복·미지 JSON key와
+잘못된 hash·argv·범위는 거부한다. output은 저장소 밖의 새 경로여야 한다.
+smoke는 fixture당 1 block, pilot은 baseline-baseline 3 + baseline-variant 3 block,
+confirm은 호출한 창의 fixture당 4 block이다. 한 block은 ABBA 또는 BAAB 4 fresh process이며
+seed/session으로 순서를 고정한다. 독립적인 confirm 창 2·3은 해당 `--session`과 새 output으로
+별도 호출한다. 세 번 실행했다는 사실만으로 장비나 측정 세션의 독립성을 입증하지 않는다.
+
+1차 지표는 **position 송신부터 bestmove 수신까지**이며 position 준비·ready barrier·go
+전송 비용을 포함한다. `position_ready_ns`, `go_bestmove_ns`, startup/quit를 포함한
+`process_wall_ns`도 별도 보존한다. 실제 `info nodes`만 `reported_nodes`에 기록한다.
+현재 mock UCI는 이를 출력하지 않아 null이며 요청한 nodes를 완료 방문 수로 대입하지 않는다.
+완료 방문 수의 정확성은 별도 witness에서 확인하고 이 runner의 throughput으로 옮기지 않는다.
+
+출력은 `manifest.lock.json`, process별 stdout/stderr, `processes.jsonl`,
+`execution.json`, `blocks.json`이다. 실패와 오염을 모두 보존하며 제품·인프라 실패 시
+중단한다. 느린 표본을 버리거나 자동 재시도하지 않는다. cgroup throttle 또는 OOM/high
+증가로 오염을 표시하되 실제 엔진 오류가 있으면 실패를 우선한다. unknown 압력·독점 여부를
+청정 실행으로 확정하지 않는다. block 평균 B/A 비율은 진단 자료이며 자동 정식 인수와
+신뢰구간 판정은 수행하지 않는다. source observer on/off는 후속 별도 비교다.
+
+검사 명령은 `cargo test -p rz-uci --example optimization_witness --locked`와
+`PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s benches/runtime/tests -q`다.
+3개 Rust 검사는 실제 Rules/C/D/B 소비·예약 해제·guard와 상한을, 11개 Python 검사는
+명시적 가짜 UCI controller로 runner의 실패/timeout/log/receipt 경계를 확인한다.
+후자는 실제 engine 성능이나 GPU 검사가 아니다. Ubuntu·Windows CPU CI에서 함께 실행한다.
