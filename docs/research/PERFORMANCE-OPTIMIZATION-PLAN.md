@@ -1064,7 +1064,8 @@ search-buffers 옵션에서 virtual 통계와 index mapping도 재사용하도�
 all-flags-serial을 다시 release 빌드하여 두 history fill의 전체 witness hash가 위 원본과
 같음을 확인했다. 최종 S1 buffer 정리 이후의 search 전체 feature 및 실제 A/C/D/B
 다중 요청/캐시 종단 검사도 통과했다. 전체 workspace/all-target/all-feature는 다시
-**695 passed, 16 ignored**다. 이전 A 독립 oracle/Python 도구 검사와 해당 소스 차이는
+**695 passed, 16 ignored**, 기본 설정도 **620 passed, 16 ignored**다.
+이전 A 독립 oracle/Python 도구 검사와 해당 소스 차이는
 실제 영향 범위를 기준으로 구분한다.
 
 [코드 source `a5c4c10` CI 37152168784](https://github.com/daejunnom/RoveZero/actions/runs/37152168784)의
@@ -1080,3 +1081,20 @@ Clippy 필수 step이 모두 성공했음을 직접 확인했다. `42d5868`의
 stdout/stderr·manifest/control을 유지한다. `build_matrix.py`, `verify_final_witness.py`,
 `validate.py`, `paired_diagnostics.py`, `analyze.py`와 원시 실패/성공 log도 보존한다.
 기존 8·10장 evidence와 archive는 수정·삭제하지 않았다.
+
+회수용 `allopt-evidence-20261003.tar.gz`는 **50,944,423 bytes**, payload 4,810개와
+내부 hash 목록 1개로 총 **4,811 member**다. 압축본에서 모든 member의 SHA-256을
+재대조했다. archive SHA-256은 다음과 같다.
+
+`a3892c5c69c8171aebd0ab751a306ebcf303a2eb10d805cb47004af71648c82b`
+
+이 패키지는 코드 `a5c4c10`·계측 `c73fa59`·문서 `b81625d` snapshot이며 자신의
+checksum을 기록하는 후속 문서보다 먼저 생성했다. cloud workspace 수명 동안
+보존하며 자동 삭제하지 않는다. 원격 영구 보관은 아직 수행하지 않았다.
+
+이후 테스트 전용 보강으로 폭 4+raw cache를 함께 켜 두 root를 검사했다. root 2의
+non-root cache backup도 실제 발생하며 32 completed visits·33 accepted output·
+33 reservation release·pending/resource 0을 유지한다. S1의 루트 통계를 S0와 같다고
+assert하지 않는다. 추가 테스트·후속 문서·최신 CI snapshot은 기본 보존 패키지와
+SHA로 연결한 별도 source 보존본에 남긴다. 이 보강은 제품 library와 기존 계측 표본을
+변경하지 않았으며 실제 NN·GPU의 batch/캐시 수치 대조는 여전히 미실행이다.

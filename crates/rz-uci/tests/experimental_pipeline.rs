@@ -51,7 +51,11 @@ impl rz_search::contract_time::ContractClock for Manual {
 
 #[test]
 fn actual_rules_inputs_complete_fixed_visits_with_real_multi_item_physical_batches() {
-    for width in [1, 4] {
+    #[cfg(feature = "experimental-raw-cache")]
+    let modes = [(1, true), (4, false), (4, true)];
+    #[cfg(not(feature = "experimental-raw-cache"))]
+    let modes = [(1, false), (4, false)];
+    for (width, cache_enabled) in modes {
         let owners = Arc::new(OwnerRegistry::default());
         let port = RulesUciPort::new(owners, rz_position::PositionLimits::default());
         let prepared = port
@@ -81,7 +85,7 @@ fn actual_rules_inputs_complete_fixed_visits_with_real_multi_item_physical_batch
             .unwrap(),
         );
         #[cfg(feature = "experimental-raw-cache")]
-        if width == 1 {
+        if cache_enabled {
             projection
                 .configure_raw_cache(rz_eval::raw_cache::RawCacheLimits::default())
                 .unwrap();
@@ -245,10 +249,15 @@ fn actual_rules_inputs_complete_fixed_visits_with_real_multi_item_physical_batch
                     .moves()
                     .contains(&result.best_move.unwrap())
             );
-            #[cfg(feature = "experimental-raw-cache")]
-            if root_number == 2 && width == 1 {
-                assert_eq!(result.metrics.accepted_raw_cache_hits, 33);
-                assert_eq!(invocations.load(Ordering::Acquire), before);
+            if root_number == 2 && cache_enabled {
+                // Require non-root cache backup as well as root initialization.
+                assert!(result.metrics.accepted_raw_cache_hits > 1);
+                if width == 1 {
+                    assert_eq!(result.metrics.accepted_raw_cache_hits, 33);
+                    assert_eq!(invocations.load(Ordering::Acquire), before);
+                }
+            } else {
+                assert_eq!(result.metrics.accepted_raw_cache_hits, 0);
             }
             #[cfg(not(feature = "experimental-raw-cache"))]
             let _ = before;
