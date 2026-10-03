@@ -2363,11 +2363,7 @@ mod physical_owner_tests {
             batch
                 .requests()
                 .iter()
-                .map(|request| {
-                    request
-                        .physical_output(&raw(), batch.execution())
-                        .map_err(PhysicalFailure::from)
-                })
+                .map(|request| request.physical_output(&raw(), batch.execution()))
                 .collect()
         })
         .unwrap();
