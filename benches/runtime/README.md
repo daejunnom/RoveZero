@@ -247,7 +247,7 @@ seed/session으로 순서를 고정한다. 독립적인 confirm 창 2·3은 해�
 
 검사 명령은 `cargo test -p rz-uci --example optimization_witness --locked`와
 `PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s benches/runtime/tests -q`다.
-3개 Rust 검사는 실제 Rules/C/D/B 소비·예약 해제·guard와 상한을, 11개 Python 검사는
+3개 Rust 검사는 실제 Rules/C/D/B 소비·예약 해제·guard와 상한을, 12개 Python 검사는
 명시적 가짜 UCI controller로 runner의 실패/timeout/log/receipt 경계를 확인한다.
 후자는 실제 engine 성능이나 GPU 검사가 아니다. Ubuntu·Windows CPU CI에서 함께 실행한다.
 
@@ -271,3 +271,9 @@ S1의 virtual reservation과 완료 순서는 S0와 달라질 수 있다.
 buffer/binding/fixed CUDA B1 Graph의 수치 대조는 `maia_check`의 명시적인 실행 옵션과
 별도 fresh report로 수행한다. 장치 성능과 S1 품질 대조는 새로운 mode/profile을 잠근
 별도 cohort이며 기존 NN/대국 인수를 재사용하지 않는다.
+
+native manifest는 asset의 flag/value pair를 유지한다. runner는 실제 Popen 경계에서
+각 pair를 단일 `--flag=value` argv로 변환하며, 경로의 공백·등호를 split하거나 shell에
+넘기지 않는다. 필수 asset flag는 한 번씩 있어야 한다. PR #17·#18 통합에서 실제 CPU
+프로세스의 시작·종료 영수증까지 확인했으며
+[최적화 기록 12장](../../docs/research/PERFORMANCE-OPTIMIZATION-PLAN.md)에 해당 근거를 남겼다.

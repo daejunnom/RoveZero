@@ -346,3 +346,28 @@ OPT-12는 **S 실험**이다. virtual visit/loss는 selection에만 적용하며
 중복·일부 취소·전체 취소·오류·drain에서 한 번만 반환한다. 같은 ExecutionId의
 다른 요청이 유효하면 독립 소비한다. S1과 동기 S0의 선택/완료 순서·분포가 같다는
 가정을 하지 않으며 holdout 대국과 동일 시간/메모리 자원의 인수는 별도다.
+
+## 10. PR #17·#18 총괄 수동 통합 인수
+
+2026-10-04 총괄 TASK-I02는 #17 `b830121`과 #18의 최신 선언을 대조하여 여섯 충돌
+파일을 수동 연결했다. 통합 제품 소스는 `a93569bedb802a4eb07f19b12241595715d21df1`이며,
+후속 문서 변경과 구별한다. 공통 계약 revision **0.1**과 기본 FP32/full·S0 경로를 유지한다.
+#18에 #17의 코드·후속 문서 ancestry를 보존하며 공유 이력을 force-push하지 않는다.
+
+| 접점 | 수동 연결·보완 | 인수 근거와 제한 |
+|---|---|---|
+| B/C/D → D02 | source journal을 batch owner·prepared input·native Run·출력 변환·guarded backup에 연결 | v1은 기본 B1·fresh Computed만 인수한다. profile+raw/batch/buffer/binding/Graph는 CLI의 asset 로딩 전과 C 경계에서 거부 |
+| C 출력 수명 | Run timing과 buffer 반환을 함께 유지하고 소비 전에 raw 변환 결과를 검증 | buffer/binding CPU 수치·반복 출력 보존을 검사했다. CUDA binding/Graph·device fence의 실제 인수는 별도 |
+| D 완료 → B/UCI | completion signal·queued batch timer·원래 ProcessClock·새 게임 cache 초기화를 유지 | mock 취소/역순/중복/예약 검사와 실제 CPU 다섯 모드의 합법 착수·종료를 확인 |
+| D02 종료 → 파일 | producer join 이후 64KiB 버퍼로 직렬화하고 8MiB cap·flush·sync 오류를 전달 | 첫 10초 종료 실패·부분 JSON을 보존하고 새 실제 CPU 실행의 complete timeline·confirmed drain을 확인 |
+| 실행 명세 → native CLI | manifest의 flag/value pair를 Popen 직전에 단일 `--flag=value` argv로 변환 | 공백/등호·누락/중복 flag 검사와 실제 CPU startup/termination binding을 확인. shell을 사용하지 않음 |
+
+현재 통합 소스의 두 OS CI, full witness, 실제 CPU NN·UCI·runner와 원시 보존 식별은
+[최적화 기록 12장](research/PERFORMANCE-OPTIMIZATION-PLAN.md)에 묶었다. 이전 GPU 실행은
+이번 batch/cache/I/O 옵션의 인수로 재사용하지 않는다. v1 receipt를 실험용 raw-hit/batch
+report로 확대하지 않으며, cache 재사용·물리 실행·실제 방문과 S1 품질을 각각 검사한다.
+
+코드 병합은 **#17 → #18 순서로 develop에 Merge commit**을 권고한다. #18은 #17을
+조상으로 포함하므로 #17 반영 후 추가 최적화·수동 조정이 남는다. squash/rebase로
+조상을 재작성하면 base와 충돌·검사 재사용 자격을 다시 확인한다. 병합 준비를 실제
+develop 병합·GPU 성능·정식 대국 인수로 보고하지 않는다.

@@ -1099,3 +1099,95 @@ non-root cache backup도 실제 발생하며 32 completed visits·33 accepted ou
 assert하지 않는다. 추가 테스트·후속 문서·최신 CI snapshot은 기본 보존 패키지와
 SHA로 연결한 별도 source 보존본에 남긴다. 이 보강은 제품 library와 기존 계측 표본을
 변경하지 않았으며 실제 NN·GPU의 batch/캐시 수치 대조는 여전히 미실행이다.
+
+## 12. PR #17·#18 수동 통합과 병합 준비
+
+2026-10-04 총괄 TASK-I02는 open/draft 상태의 #17과 #18, develop
+`b5ba853585cb5a78f81159f733a86cdfe085936b`, 실제 CI·리뷰와 두 작업 checkout을 확인했다.
+외부 review/review thread는 없었다. #17 source `81059e4`와 #18 source `278b146`의
+여섯 충돌 파일을 수동 연결하고, 후속 수정까지 합친 제품 소스
+`a93569bedb802a4eb07f19b12241595715d21df1`을 검사했다. #18에 #17 ancestry를
+보존했으며 공통 계약 revision은 **0.1**이다. 후속 문서 head는 제품 검사 소스와 구별한다.
+
+### 12.1 병합 전 해결한 실행·계측 오류
+
+- C worker·native owner·ORT Run timing·buffer 반환과 B/D/UCI의 profile/notification/
+  batch/backup 접점을 수동으로 맞췄다. D02 v1은 fresh Computed B1 전용이므로
+  `--profile`+raw cache/폭 2 이상/buffer/binding/Graph를 asset 로딩 전에 거부하고
+  C의 profiled worker/backend에서도 방어한다. raw-hit aggregate를 complete Computed
+  timeline으로 인수하지 않는다. 별도 cache/batch/device 계측이 필요하다.
+- OPT-00 native runner의 manifest pair가 Rust의 `--flag=value` CLI와 맞지 않던
+  오류를 실제 Popen 경계에서 수정했다. 공백·등호 유지, 누락/중복 flag 거부를 검사했다.
+- 첫 실제 CPU profile 실행 `673f3e4`는 두 합법 착수·physical drain 뒤 quit 10초
+  한도를 넘겼다. 직접 파일로 전달하던 작은 JSON write가 Windows mount에서 지연되어
+  387,606 bytes의 부분 JSON을 남겼다. #17 `b830121`은 producer 종료 후 64KiB 버퍼로
+  저장하며 8MiB cap·명시적 flush·sync·실패 전달을 유지한다. 기존 실패/부분 JSON은
+  보존했다. 한도 초과·flush 실패와 실제 write 합치기·완전 JSON 검사를 추가했다.
+
+### 12.2 현재 소스의 정확성·소비자 인수
+
+| 검사 | 제품 소스·범위 | 실제 결과 |
+|---|---|---|
+| #17 CI | `b830121`, [run 37158044723](https://github.com/daejunnom/RoveZero/actions/runs/37158044723) | Ubuntu workspace 683 passed·16 ignored, Windows 629 passed·2 ignored; 실패 0 |
+| #18 통합 CI | `a93569b`, [run 37158070152](https://github.com/daejunnom/RoveZero/actions/runs/37158070152) | Ubuntu workspace 705 passed·16 ignored, Windows 651 passed·2 ignored; 실패 0 |
+| 별도 필수 CI step | 위 두 OS | fmt·기본 native CLI·release independent Rules oracle·Python model·strict Clippy 성공. #18 runtime runner 12개도 성공 |
+| C 실제 CPU NN | `673f3e4`, ORT 1.22.0 CPU FP32, default/buffers/binding/buffers+binding | 각 12 독립 참조·B1/2/4/8/16 대조 passed. 비기본 모드는 32 반복 B1·보존 출력 불변도 passed |
+| C worker·contract | 위 수치 gate의 fixture Rules view | 물리 출력 4개·취소 거부 1개; D scheduler를 포함한 검사는 아님 |
+| full serial witness | `a93569b` all-feature serial, fill `no`와 `always` | 원본 전체 출력 hash와 동일; 각각 16,004,271 / 16,006,835 bytes |
+
+로컬 통합 직전 `be7004b`의 Rust workspace 704개·기본 native CLI 4개·release
+Rules/perft/oracle 50개·Python model 105개도 통과했다. runner 수정 뒤 12개, 통합 저장
+수정 뒤 profile 관련 7개를 새로 실행했다. 최신 소스의 full 결과는 위 실제 CI이며
+앞선 실행과 합산하지 않는다. 각 OS의 cfg별 검사 수 차이와 ignored는 그대로 남긴다.
+
+C 수치 결과는 `maia_check` binary
+`6f14806cab55b3102f91e5b40c698aa95ecf68a1c63958d2af519a4d902a412a`, export manifest
+`63e4f9c28f2ce798c0f241583bbb338bffb89ad058ccf7117d3813eff441a0c9`, ORT library
+`7520bc1b4f649ee8fa956442a66ded303e8fd3b465b0159b7e893bdc87df4e38`에 묶었다.
+`673f3e4 → a93569b` 사이의 Cargo 파일·toolchain·contracts/eval/encoding source가 같고,
+동일 환경·assets·binary·report를 확인하여 재사용했다. 새 NN 수치 실행으로 보고하지 않는다.
+full witness의 SHA-256은 fill `no`가 `2b1e60bf922f265b5b5d880608ea5876115b8bfa41243ca4f2e792e98c486599`,
+`always`가 `42df4440743024ce8420381ec6472af9dd7e3bda51b6f1ca093c6aa5fc2ab86a`다.
+
+### 12.3 실제 CPU UCI·native runner와 종료 재검사
+
+통합 소스의 새 release `rz-uci` SHA-256은
+`00f2b269ed842a164d6e8f3fe1d3ad8e344c0775976c9b7dd50821018dacd13e`다.
+ORT CPU·FP32·worker/thread 1, startup 45초·착수 20초·quit 10초·전체 90초,
+각 stdout/stderr 2MiB·queue 256·line 64KiB 한도를 고정했다. 각 root의 명령은
+`go movetime 10000 nodes 32`다. stdout에 없는 완료 방문 수를 요청 nodes로 대체하지 않는다.
+
+| fresh 프로세스 모드 | root·관측 | 결과 |
+|---|---|---|
+| 기본 +profile/+attestation | startpos / e2e4 이후, e2e4·c7c5, fresh Computed 66 | complete journal/timeline, physical 시도·완료·전달·소비 각 66, 오류·미소비 0, confirmed drain·exit 0 |
+| raw cache | 같은 startpos 두 번, ucinewgame 뒤 한 번 | 합법 착수 3개·fresh Computed 66·exit 0; 새 게임 초기화 확인 |
+| I/O Binding | startpos / e2e4 이후 | 합법 착수 2개·fresh Computed 66·exit 0 |
+| 폭 4 | startpos / e2e4 이후 | 합법 착수 2개·fresh Computed 66·exit 0 |
+| 폭 4+raw cache | 같은 startpos 두 번 | 합법 착수 2개·fresh Computed 35·exit 0; S0와 동일 방문 분포를 주장하지 않음 |
+
+다섯 모드 모두 native fatal/overflow/boundary/poison aggregate는 0이며 중복 bestmove가
+없었다. 기본 profile의 quit→exit는 **0.063678초**였다. 원시 journal/termination hash와
+실제 명령·PID·출력 hash·시간은 별도 receipt에 보존했다. raw/cache/batch 실험은 V1
+attestation을 요청하지 않았다. fresh Computed 계수만으로 전체 cache hit나 batch 실행
+분포를 만들지 않는다. 이 검사는 통제된 성능 A/B·GPU 개선·대국 강도 결과가 아니다.
+
+수정한 production `paired_search.run_process`도 기본 CPU 모드를 새 프로세스로
+실행했다. source·binary·model·encoding·backend identity와 V1 startup/termination을
+대조했고 실제 Computed 17개·합법 `e2e4`·confirmed drain을 기록했다. 분류는
+**diagnostic**, `formal_acceptance=false`다. 준비 스크립트의 첫 경로 선점 실패와 두 번째
+기존 자료까지 포함한 64MiB cap 실패도 보존했다. 세 번째는 `run()`과 같은 전용 cohort
+parent를 사용하여 동일 cap으로 통과했다. 느린 표본을 대체한 성능 cohort가 아니다.
+
+### 12.4 원시 보존·병합 방식·남은 인수
+
+Windows 저장소 밖 `reports/coordinator-integration/pr17-pr18-merge-20261004/`에
+`cpu-numerical-receipts.json`, 실패 `cpu-uci-receipts.json`, 새
+`cpu-uci-v2-receipts.json`, `cpu-runner-native-cohort-v3/`, 두 CI log와 full witness,
+원래 stdout/stderr·부분 JSON·실제 명령 recipe를 보존한다. build/native library/weights는
+공유 문서에 넣지 않는다. 후속 문서 변경은 영향 source·환경 일치를 확인한 재사용이다.
+
+준비한 코드는 **#17 → #18 순서로 develop에 Merge commit**을 권고한다. #18에 #17
+ancestry를 포함했으므로 첫 PR 이후 추가 변경만 검토할 수 있다. 현재 기록은 병합
+준비이며 실제 develop/main 변경은 실행하지 않았다. 새 I/O/batch/cache의 CUDA 수치·
+수명·VRAM, Graph capture/replay, RunPod 통제 A/B, S1 holdout 대국 품질, 실제 학습·
+정식 LC0 paired 강도·통계는 남아 있다. 기존 GPU 인수나 CPU 진단으로 승격하지 않는다.

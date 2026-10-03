@@ -1,6 +1,6 @@
 # 총괄 통합 인수 상태
 
-기준일: 2026-10-03, Asia/Seoul. TASK-I01/I02의 source 관찰·수동 연결·실제 검사와
+기준일: 2026-10-04, Asia/Seoul. TASK-I01/I02의 source 관찰·수동 연결·실제 검사와
 남은 실패를 구분하는 현재 기록이다. 상세 적용은 [CONTRACT-ADOPTION](CONTRACT-ADOPTION.md),
 작업 소유는 [IMPLEMENTATION-DIRECTIVES](IMPLEMENTATION-DIRECTIVES.md)를 따른다.
 CPU/mock 인수 소스는 `4866a0b67dfd0aac10ffb03a0debd61fa018db3d`, 후속 실제 CPU NN
@@ -897,3 +897,39 @@ interval은 2.349358/3.751160/5.041684ms다. 서로 중첩되는 단계의 분�
 해석하지 않는다. 다음 D03 단일 실험은 provenance·receipt·cache-hit 소비 계약부터 맞춰야 한다.
 이번 결과는 host-source D02 통과다. device timing·process peak VRAM·D03 통제된 GPU A/B,
 실제 학습·정식 paired 강도·통계와 RunPod 환경 인수는 남아 있다.
+
+## PR #17·#18 병합 준비 인수
+
+2026-10-04 총괄 TASK-I02는 #17 D02 계측과 #18 OPT-01~12를 제품 소스
+`a93569bedb802a4eb07f19b12241595715d21df1`에서 함께 검사했다. 각 독립 PR의 CI만으로
+호환을 판단하지 않고 B/C/D/UCI 여섯 충돌 파일의 source hook·buffer 반환·batch owner·
+signal·guard·오류·수명 접점을 수동으로 맞췄다. 공통 계약은 **0.1**을 유지한다.
+실제 조정과 병합 방식은 [계약 인수 10장](CONTRACT-ADOPTION.md), 상세 source/영수증은
+[최적화 기록 12장](research/PERFORMANCE-OPTIMIZATION-PLAN.md)에 있다.
+
+| 범위 | 현재 확인한 근거 | 상태 |
+|---|---|---|
+| #17 수정 소스 `b830121` | CI 37158044723, Ubuntu 683 passed·16 ignored / Windows 629 passed·2 ignored | 두 OS 필수 step 성공; ignored 미실행 |
+| #18 통합 소스 `a93569b` | CI 37158070152, Ubuntu 705 passed·16 ignored / Windows 651 passed·2 ignored | 두 OS 필수 step 성공; 실패 0 |
+| C 실제 CPU 신경망 | `673f3e4`의 default/buffers/binding/combined, 각 12 독립 참조·B1/2/4/8/16 | passed; 통합 뒤 영향 source·asset·binary를 대조한 재사용 |
+| A/C/D/B 실제 CPU UCI | 통합 소스의 기본 profile, raw cache 새 게임 reset, binding, 폭 4, 폭 4+cache | 다섯 모드 합법 착수·정상 종료·오류 aggregate 0 |
+| D02 저장·종료 | 기본 profile의 physical/complete/delivered/consumed 각 66, complete timeline, confirmed drain | passed; 첫 10초 종료 실패·부분 JSON 보존 |
+| OPT-00 실제 native runner | 같은 소스·모델·backend의 새 프로세스, startup/termination·17 Computed·합법 e2e4 | diagnostic; formal_acceptance=false |
+| full serial witness | 두 history fill의 16MB 전체 출력 hash가 원본과 동일 | 의미 보존 대조; NN/GPU 성능 검사가 아님 |
+
+기본 native CLI 4개, release Rules/perft/독립 oracle 50개, Python model 도구 105개와
+runtime runner 12개, fmt·strict Clippy도 통과했다. 수치 대조의 C worker와 실제 UCI의
+A/C/D/B 경로를 구분한다. 실제 UCI에서 요청한 nodes를 stdout에 없는 방문 수로
+바꾸지 않는다. 실제 cache-hit 전체 계수와 S1 물리 batch 분포는 기존 V1 receipt 범위
+밖이며 합성 계약 검사와 실험용 후속 계측을 구분한다.
+
+#17의 파일 저장은 producer 종료 후 64KiB로 모아 쓰도록 보완했다. #18의 runner는
+manifest pair를 native CLI의 `--flag=value`로 전달하도록 수정했다. D02 v1에서
+raw/batch/비기본 I/O의 실행을 asset 로딩 전에 거부해 불완전 trace를 complete로
+증명하지 않는다. native 실험 옵션은 명시적으로 선택하며 S1 기본 폭은 1이다.
+
+코드는 **#17 → #18 순서의 develop 병합 준비** 범위다. 이 기록으로 실제 병합을
+실행하거나 main을 갱신하지 않는다. 새 CUDA binding/Graph/batch/cache의 수치·수명·
+VRAM, 통제된 RunPod A/B, S1 대국 품질, 실제 학습·정식 LC0 paired 강도는 미실행이다.
+원시 근거와 실패·복구 명세는 저장소 밖의
+`reports/coordinator-integration/pr17-pr18-merge-20261004/`에 보존한다.
