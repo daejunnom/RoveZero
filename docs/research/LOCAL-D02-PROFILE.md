@@ -150,3 +150,37 @@ archive는 495,074 bytes, SHA-256은
 올바르게 해제한 새 capture v2에서 검증했다. 원래 Linux 자료·초기 pilot도 유지한다.
 native library·실행 파일·weights·cache·개인 경로는 Git 요약이나 회수 payload에 넣지 않았다.
 상세 실행 명령·고정 asset/bundle hash·자원·출처는 외부 recipe/setup/receipt에 남긴다.
+
+## PR #17·#18 병합 준비와 보고서 저장 보완
+
+2026-10-04, 총괄 TASK-I02가 PR #17의 계측과 PR #18의 최적화를 수동 연결했다.
+기존 GPU 인수는 위 실행 소스의 이력이며 이번 재검사는 **CPU·FP32**다.
+PR #17 제품 수정 소스는 `b83012145b16c959c1df4121efaf4d00503b5162`, 두 PR 통합
+재검사 소스는 `a93569bedb802a4eb07f19b12241595715d21df1`이다. 공통 계약 0.1과
+8192 record·출력 8MiB 한도는 유지한다.
+
+통합 전 첫 CPU 실행 `673f3e4`는 합법 착수 두 개와 물리 drain을 기록했지만, 종료
+10초 한도를 넘겨 실패했다. Windows에 마운트한 출력 디렉터리에서 serde의 작은
+write가 파일에 바로 전달되어 JSON 387,606 bytes가 불완전하게 남았다. 실패 로그와
+부분 JSON을 보존했다. `ProfileWriter`는 producer 종료 후 **64KiB BufWriter**로
+저장하며, byte cap 검사·명시적 flush·파일 sync와 실패 전달을 유지한다. 실제 저장
+helper의 검사로 완전한 JSON·write 합치기·8MiB 초과·flush 실패를 확인했다.
+
+통합 소스의 새 실행은 같은 CPU 모델로 두 root에 `go movetime 10000 nodes 32`를
+보냈다. 합법 착수 `e2e4, c7c5`, exit 0·confirmed drain, 실제 물리 시도/완료/전달/소비
+각 **66개**, 손실·불일치·미소비 0을 기록했다. JSON의 journal과 accepted timeline이
+완전하며 quit 송신부터 exit까지 **약 0.064초**였다. 이는 유한 종료·저장 회귀 검사
+한 회의 관측이며 통제된 성능 A/B나 GPU 결과가 아니다.
+
+PR #17 수정 소스의 [CI 37158044723](https://github.com/daejunnom/RoveZero/actions/runs/37158044723)는
+Ubuntu workspace **683 passed·16 ignored**, Windows **629 passed·2 ignored**이며
+실패 0이다. fmt·기본 native CLI·release 독립 Rules 대조·Python model 도구·strict
+Clippy도 두 OS에서 성공했다. ignored 검사는 미실행으로 유지한다. 통합 소스의
+추가 소비자 검사와 원시 근거의 논리 경로는
+[PR #18](https://github.com/daejunnom/RoveZero/pull/18)의 최적화 기록 12장에 기록한다.
+
+통합 이후 D02 v1은 **기본 B1·fresh Computed** 실행만 지원한다. `--profile`과
+raw cache·폭 2 이상·buffer 재사용·I/O Binding·CUDA Graph를 함께 요청하면 asset
+로딩 전에 명확히 거부한다. C profiled worker와 backend에서도 같은 제한을 검사한다.
+해당 실험에는 cache provenance와 batch의 물리 실행을 표현하는 별도 계측 인수가
+필요하다. 기존 GPU profile을 새 옵션의 측정으로 재사용하지 않는다.
