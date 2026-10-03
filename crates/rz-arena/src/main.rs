@@ -2,6 +2,12 @@ use rz_arena::{
     ArenaPlan, Event, Ledger, LedgerLimits, PlanLimits, decode_json, prepare_native_launch,
     run_fixture_pair, run_native_pair,
 };
+#[cfg(feature = "native-cuda")]
+use rz_arena::{prepare_native_cuda_launch, run_native_cuda_pair};
+#[cfg(feature = "native-cuda")]
+use rz_experiments::{
+    CudaIntegrationPairSpecV1, LockedCudaIntegrationPairSpecV1, MAX_CUDA_NATIVE_LAUNCH_JSON_BYTES,
+};
 use rz_experiments::{
     IntegrationPairSpecV1, LockedIntegrationPairSpecV1, LockedManifest, MAX_MANIFEST_BYTES,
     MAX_NATIVE_LAUNCH_JSON_BYTES,
@@ -69,6 +75,18 @@ enum Command {
         output_root: PathBuf,
         output_directory: OsString,
     },
+    #[cfg(feature = "native-cuda")]
+    NativeCudaLock {
+        input: PathBuf,
+        output: PathBuf,
+    },
+    #[cfg(feature = "native-cuda")]
+    NativeCudaPair {
+        locked: PathBuf,
+        artifact_root: PathBuf,
+        output_root: PathBuf,
+        output_directory: OsString,
+    },
     Execute {
         operation: Operation,
         paths: Vec<PathBuf>,
@@ -112,6 +130,28 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, String> {
             );
         }
         return Ok(Command::NativePair {
+            locked: PathBuf::from(&args[1]),
+            artifact_root: PathBuf::from(&args[2]),
+            output_root: PathBuf::from(&args[3]),
+            output_directory: args[4].clone(),
+        });
+    }
+    #[cfg(feature = "native-cuda")]
+    if command == Some("native-cuda-lock") {
+        if args.len() != 3 {
+            return Err("native-cuda-lock requires exactly INPUT OUTPUT".into());
+        }
+        return Ok(Command::NativeCudaLock {
+            input: PathBuf::from(&args[1]),
+            output: PathBuf::from(&args[2]),
+        });
+    }
+    #[cfg(feature = "native-cuda")]
+    if command == Some("native-cuda-pair") {
+        if args.len() != 5 {
+            return Err("native-cuda-pair requires exactly LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME".into());
+        }
+        return Ok(Command::NativeCudaPair {
             locked: PathBuf::from(&args[1]),
             artifact_root: PathBuf::from(&args[2]),
             output_root: PathBuf::from(&args[3]),
@@ -206,6 +246,64 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, String> {
 
 fn execute(command: Command) -> Result<String, String> {
     let command = match command {
+        #[cfg(feature = "native-cuda")]
+        Command::NativeCudaLock { input, output } => {
+            let limit = MAX_CUDA_NATIVE_LAUNCH_JSON_BYTES as u64;
+            let spec = CudaIntegrationPairSpecV1::from_json(&read_text(&input, limit)?)
+                .map_err(|e| e.to_string())?;
+            let json = spec
+                .lock()
+                .and_then(|locked| locked.to_json())
+                .map_err(|e| e.to_string())?;
+            write_new_file(&output, json.as_bytes(), limit)?;
+            return Ok(success(
+                "native CUDA integration declarations locked; execution not verified",
+            ));
+        }
+        #[cfg(feature = "native-cuda")]
+        Command::NativeCudaPair {
+            locked,
+            artifact_root,
+            output_root,
+            output_directory,
+        } => {
+            let spec = LockedCudaIntegrationPairSpecV1::from_json(&read_text(
+                &locked,
+                MAX_CUDA_NATIVE_LAUNCH_JSON_BYTES as u64,
+            )?)
+            .map_err(|e| e.to_string())?;
+            let name = output_directory
+                .to_str()
+                .ok_or_else(|| "output basename must be ASCII".to_string())?;
+            let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            #[cfg(unix)]
+            {
+                signal_hook::flag::register(signal_hook::consts::SIGINT, cancelled.clone())
+                    .map_err(|_| "cannot install SIGINT cancellation".to_string())?;
+                signal_hook::flag::register(signal_hook::consts::SIGTERM, cancelled.clone())
+                    .map_err(|_| "cannot install SIGTERM cancellation".to_string())?;
+            }
+            let owner=prepare_native_cuda_launch(&spec,&artifact_root,&output_root,name).map_err(|failure| {
+                if let Ok(receipt)=serde_json::to_string(&serde_json::json!({"preparation":failure.receipt,"receipt_artifact":failure.receipt_artifact,
+                    "persistence_error":failure.persistence_error.as_ref().map(ToString::to_string)})) {
+                    eprintln!("native_cuda_preparation_failure_receipt={receipt}");
+                }
+                failure.to_string()
+            })?;
+            let output=run_native_cuda_pair(owner,Some(&cancelled)).map_err(|failure| {
+                if let Ok(receipt)=serde_json::to_string(&serde_json::json!({"receipt":failure.receipt,"receipt_artifact":failure.receipt_artifact,
+                    "process":failure.process().map(|p|&p.receipt),"cause":failure.cause.to_string(),
+                    "ownership_scope":"unverified process ownership is retained for this CLI process lifetime; files are preserved"})) {
+                    eprintln!("native_cuda_pair_failure_receipt={receipt}");
+                }
+                failure.to_string()
+            })?;
+            return serde_json::to_string_pretty(&serde_json::json!({"execution_ready":false,"strength_eligible":false,
+                "validation_scope":output.receipt.validation_scope,"integration_checks_passed":output.receipt.integration_checks_passed,
+                "receipt":output.receipt_artifact,"provider_sessions":output.receipt.provider_sessions,"scored_games":output.receipt.scored_games,
+                "incomplete_games":output.receipt.incomplete_games,"process_cleanup":output.receipt.process.group_cleanup}))
+                .map_err(|e|e.to_string());
+        }
         Command::NativeLock { input, output } => {
             let limit = MAX_NATIVE_LAUNCH_JSON_BYTES as u64;
             let spec = IntegrationPairSpecV1::from_json(&read_text(&input, limit)?)
@@ -289,6 +387,11 @@ fn execute(command: Command) -> Result<String, String> {
         expected_tip,
     } = command
     else {
+        #[cfg(feature = "native-cuda")]
+        return Ok(format!(
+            "{USAGE}\n\nWith native-cuda feature:\n  rz-arena native-cuda-lock INPUT OUTPUT\n  rz-arena native-cuda-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME\nCUDA commands use a separate integration-only lock/profile and explicit finite input/runtime-copy/output budgets. Linux actual CUDA startup/final/placement/search/drain and Rules evidence are required; strength_eligible=false, execution_ready=false."
+        ));
+        #[cfg(not(feature = "native-cuda"))]
         return Ok(USAGE.to_string());
     };
     if matches!(operation, Operation::Plan) {

@@ -1,4 +1,4 @@
-//! Explicit, single-session Maia ONNX CPU composition.
+//! Explicit, single-session Maia ONNX composition with provider-specific guards.
 //!
 //! Assets and the native runtime are loaded once, before protocol service. A
 //! search receives only a lightweight adapter to the process-owned physical
@@ -6,6 +6,8 @@
 //! they are deliberately not a complete request journal. Fatal native causes
 //! remain owned alongside B's common-contract failures, including after quit.
 
+#[cfg(feature = "onnx-cuda")]
+use crate::native_cuda_attestation::CudaProfileV1;
 use crate::{
     bootstrap::MAX_EVALUATIONS,
     engine::{
@@ -29,6 +31,11 @@ use rz_eval::{
     onnx::{BackendConfig, IO_BYTES_PER_ITEM, OnnxBackend, OrtRuntime},
     runtime_pin::RuntimeLibraryPin,
 };
+#[cfg(all(feature = "onnx-cuda", target_os = "linux"))]
+use rz_eval::{
+    onnx::Provider,
+    runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole},
+};
 use rz_position::contracts::RulesState;
 use rz_runtime::{
     Clock, DrainState, Limits, Resources,
@@ -38,6 +45,7 @@ use std::{
     fmt, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, TryLockError},
+    task::Poll,
     thread,
     time::{Duration, Instant},
 };
@@ -46,6 +54,13 @@ const MAX_PATH_BYTES: usize = 4096;
 const MAX_FATAL_RECEIPTS: usize = 32;
 const NATIVE_DIAGNOSTIC_CAPACITY: usize = 32;
 const FINAL_COLLECTION_LIMIT: Duration = Duration::from_secs(2);
+pub const CUDA_ARENA_BYTES: usize = 1024 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeProvider {
+    Cpu,
+    Cuda,
+}
 
 fn error(code: ErrorCode, stage: Stage, detail: &'static str) -> ContractError {
     ContractError::new(code, stage, detail)
@@ -62,12 +77,18 @@ pub struct NativeConfig {
     ort_sha256: [u8; 32],
     output_root: PathBuf,
     attestation: bool,
+    provider: NativeProvider,
+    cuda_bundle: Option<PathBuf>,
+    cuda_bundle_sha256: Option<[u8; 32]>,
 }
 impl fmt::Debug for NativeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NativeConfig")
             .field("manifest_sha256", &self.manifest_sha256)
             .field("ort_sha256", &self.ort_sha256)
+            .field("provider", &self.provider)
+            .field("cuda_bundle_sha256", &self.cuda_bundle_sha256)
+            .field("cuda_bundle_selected", &self.cuda_bundle.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -75,7 +96,7 @@ impl NativeConfig {
     pub fn parse(
         arguments: impl IntoIterator<Item = String>,
     ) -> Result<Self, NativeBootstrapError> {
-        let mut native = false;
+        let mut provider = None;
         let mut source_weights = None;
         let mut onnx_model = None;
         let mut export_manifest = None;
@@ -84,6 +105,8 @@ impl NativeConfig {
         let mut ort_sha256 = None;
         let mut output_root = None;
         let mut attestation = false;
+        let mut cuda_bundle = None;
+        let mut cuda_bundle_sha256 = None;
         for argument in arguments {
             if argument == "--attestation" {
                 if std::mem::replace(&mut attestation, true) {
@@ -93,8 +116,13 @@ impl NativeConfig {
                 }
                 continue;
             }
-            if argument == "--onnx-cpu" {
-                if std::mem::replace(&mut native, true) {
+            if argument == "--onnx-cpu" || argument == "--onnx-cuda" {
+                let selected = if argument == "--onnx-cpu" {
+                    NativeProvider::Cpu
+                } else {
+                    NativeProvider::Cuda
+                };
+                if provider.replace(selected).is_some() {
                     return Err(NativeBootstrapError::Config(
                         "duplicate native provider flag",
                     ));
@@ -114,6 +142,8 @@ impl NativeConfig {
                 "--ort-library" => set_path(&mut ort_library, value)?,
                 "--ort-sha256" => set_hash(&mut ort_sha256, value)?,
                 "--output-root" => set_path(&mut output_root, value)?,
+                "--cuda-bundle" => set_path(&mut cuda_bundle, value)?,
+                "--cuda-bundle-sha256" => set_hash(&mut cuda_bundle_sha256, value)?,
                 _ => {
                     return Err(NativeBootstrapError::Config(
                         "unsupported or mixed native provider argument",
@@ -121,10 +151,21 @@ impl NativeConfig {
                 }
             }
         }
-        if !native {
-            return Err(NativeBootstrapError::Config(
-                "explicit --onnx-cpu selection is required",
-            ));
+        let provider = provider.ok_or(NativeBootstrapError::Config(
+            "explicit --onnx-cpu or --onnx-cuda selection is required",
+        ))?;
+        match provider {
+            NativeProvider::Cpu if cuda_bundle.is_some() || cuda_bundle_sha256.is_some() => {
+                return Err(NativeBootstrapError::Config(
+                    "CPU provider rejects CUDA bundle arguments",
+                ));
+            }
+            NativeProvider::Cuda if cuda_bundle.is_none() || cuda_bundle_sha256.is_none() => {
+                return Err(NativeBootstrapError::Config(
+                    "CUDA provider requires the bundle file and its explicit SHA256",
+                ));
+            }
+            _ => {}
         }
         let missing = || {
             NativeBootstrapError::Config(
@@ -140,10 +181,16 @@ impl NativeConfig {
             ort_sha256: ort_sha256.ok_or_else(missing)?,
             output_root: output_root.ok_or_else(missing)?,
             attestation,
+            provider,
+            cuda_bundle,
+            cuda_bundle_sha256,
         })
     }
     pub fn attestation_requested(&self) -> bool {
         self.attestation
+    }
+    pub fn provider(&self) -> NativeProvider {
+        self.provider
     }
     pub(crate) fn attestation_output_root(&self) -> Result<PathBuf, NativeBootstrapError> {
         private_output_root(&self.output_root).map_err(Into::into)
@@ -247,6 +294,10 @@ pub struct NativeRunReport {
     pub completed_by_runtime: u64,
     pub first_completed: Option<NativeCompletedReceipt>,
     pub last_completed: Option<NativeCompletedReceipt>,
+    /// Metadata observed only after B's unchanged final tree guard committed.
+    pub search_root_initializations: NativeSearchAggregate,
+    pub search_non_root_backups: NativeSearchAggregate,
+    pub observations: NativeObservationReport,
     pub canceled: NativeAuditAggregate,
     pub expired: NativeAuditAggregate,
     pub failures: Vec<NativeDiagnosticReceipt>,
@@ -258,6 +309,27 @@ pub struct NativeRunReport {
 pub struct NativeCompletedReceipt {
     pub context: CompletionContext,
     pub actual: ActualCompute,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeSearchConsumedReceipt {
+    pub completed: NativeCompletedReceipt,
+    pub traversed_edges: usize,
+}
+#[derive(Debug, Default)]
+pub struct NativeSearchAggregate {
+    pub count: u64,
+    pub first: Option<NativeSearchConsumedReceipt>,
+    pub last: Option<NativeSearchConsumedReceipt>,
+}
+#[derive(Debug, Default)]
+pub struct NativeObservationReport {
+    pub scheduler_events: u64,
+    pub scheduler_dropped: u64,
+    pub scheduler_counter_overflow: bool,
+    pub delivery_events: u64,
+    pub delivery_dropped: u64,
+    pub delivery_counter_overflow: bool,
+    pub drain_discarded_results: u64,
 }
 impl NativeRunReport {
     fn new(profile: &EvaluatorProfile, origin: NativeWorkerOrigin) -> Result<Self, ContractError> {
@@ -278,6 +350,9 @@ impl NativeRunReport {
             completed_by_runtime: 0,
             first_completed: None,
             last_completed: None,
+            search_root_initializations: NativeSearchAggregate::default(),
+            search_non_root_backups: NativeSearchAggregate::default(),
+            observations: NativeObservationReport::default(),
             canceled: NativeAuditAggregate::default(),
             expired: NativeAuditAggregate::default(),
             failures,
@@ -340,9 +415,14 @@ impl NativeRunReport {
 }
 impl fmt::Display for NativeRunReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let provider = match self.origin {
+            NativeWorkerOrigin::CpuOnnx => "ONNX CPU evidence",
+            NativeWorkerOrigin::CudaOnnx => "ONNX CUDA evidence",
+            NativeWorkerOrigin::Injected => "ONNX injected evidence",
+        };
         write!(
             f,
-            "ONNX CPU evidence: origin={:?} completed_by_runtime={} (fresh fullsteps=1 FP32 Computed; physical invocation count is separate), canceled={} expired={} (count+first/last; no full request journal), fatal={} overflow={} boundary={} poison={}",
+            "{provider}: origin={:?} completed_by_runtime={} (fresh fullsteps=1 FP32 Computed; physical invocation count is separate), canceled={} expired={} (count+first/last; no full request journal), fatal={} overflow={} boundary={} poison={}",
             self.origin,
             self.completed_by_runtime,
             self.canceled.count,
@@ -394,6 +474,126 @@ struct EvidenceState {
 #[derive(Clone)]
 pub struct NativeEvidenceHandle(Arc<Mutex<EvidenceState>>);
 impl NativeEvidenceHandle {
+    fn record_search(
+        &self,
+        evaluation: &rz_search::contracts::AcceptedEvaluation,
+        traversed_edges: usize,
+    ) -> Result<(), ContractError> {
+        let Some(mut state) = self.try_state()? else {
+            return Err(error(
+                ErrorCode::ResourceExhausted,
+                Stage::Output,
+                "native search evidence consumer busy",
+            ));
+        };
+        let report = state.report.as_mut().ok_or_else(|| {
+            error(
+                ErrorCode::Canceled,
+                Stage::Output,
+                "native search evidence already transferred",
+            )
+        })?;
+        if report.origin == NativeWorkerOrigin::Injected {
+            return Ok(());
+        }
+        let context = evaluation.context;
+        let actual = evaluation.actual;
+        if actual.precision != PrecisionProfile::Fp32
+            || actual.steps != 1
+            || !actual.full
+            || actual.provenance != CacheProvenance::Computed
+            || actual.backend != report.backend
+            || actual.execution.is_none()
+            || context.execution != actual.execution
+            || context.request.backend != report.backend
+            || context.request.model.manifest != report.model_manifest
+        {
+            let boundary = error(
+                ErrorCode::IdentityMismatch,
+                Stage::Backup,
+                "accepted native search metadata differs from the verified provider profile",
+            );
+            report.boundary_error.get_or_insert(boundary);
+            state.closed.get_or_insert(boundary);
+            return Err(boundary);
+        }
+        let aggregate = if traversed_edges == 0 {
+            &mut report.search_root_initializations
+        } else {
+            &mut report.search_non_root_backups
+        };
+        let receipt = NativeSearchConsumedReceipt {
+            completed: NativeCompletedReceipt { context, actual },
+            traversed_edges,
+        };
+        aggregate.first.get_or_insert(receipt);
+        aggregate.last = Some(receipt);
+        match aggregate.count.checked_add(1) {
+            Some(count) => {
+                aggregate.count = count;
+                Ok(())
+            }
+            None => {
+                let boundary = error(
+                    ErrorCode::ResourceExhausted,
+                    Stage::Output,
+                    "native search count exhausted; last original metadata retained",
+                );
+                report.boundary_error.get_or_insert(boundary);
+                state.closed.get_or_insert(boundary);
+                Err(boundary)
+            }
+        }
+    }
+    fn record_observations(&self, delta: NativeObservationReport) -> Result<(), ContractError> {
+        let Some(mut state) = self.try_state()? else {
+            return Err(error(
+                ErrorCode::ResourceExhausted,
+                Stage::Output,
+                "native observation evidence consumer busy",
+            ));
+        };
+        let report = state.report.as_mut().ok_or_else(|| {
+            error(
+                ErrorCode::Canceled,
+                Stage::Output,
+                "native observation evidence already transferred",
+            )
+        })?;
+        let observations = &mut report.observations;
+        let mut overflow = delta.scheduler_counter_overflow || delta.delivery_counter_overflow;
+        for (counter, delta) in [
+            (&mut observations.scheduler_events, delta.scheduler_events),
+            (&mut observations.scheduler_dropped, delta.scheduler_dropped),
+            (&mut observations.delivery_events, delta.delivery_events),
+            (&mut observations.delivery_dropped, delta.delivery_dropped),
+            (
+                &mut observations.drain_discarded_results,
+                delta.drain_discarded_results,
+            ),
+        ] {
+            match counter.checked_add(delta) {
+                Some(value) => *counter = value,
+                None => {
+                    *counter = u64::MAX;
+                    overflow = true;
+                }
+            }
+        }
+        observations.scheduler_counter_overflow |= delta.scheduler_counter_overflow;
+        observations.delivery_counter_overflow |= delta.delivery_counter_overflow || overflow;
+        if overflow {
+            let boundary = error(
+                ErrorCode::ResourceExhausted,
+                Stage::Output,
+                "native observation counter overflow; journal is incomplete",
+            );
+            report.boundary_error.get_or_insert(boundary);
+            state.closed.get_or_insert(boundary);
+            return Err(boundary);
+        }
+        Ok(())
+    }
     fn try_state(&self) -> Result<Option<MutexGuard<'_, EvidenceState>>, ContractError> {
         match self.0.try_lock() {
             Ok(state) => Ok(Some(state)),
@@ -440,7 +640,10 @@ impl NativeEvidenceHandle {
                 "native completion evidence already transferred",
             )
         })?;
-        if report.origin != NativeWorkerOrigin::CpuOnnx {
+        if !matches!(
+            report.origin,
+            NativeWorkerOrigin::CpuOnnx | NativeWorkerOrigin::CudaOnnx
+        ) {
             return Ok(());
         }
         if output.actual.precision != PrecisionProfile::Fp32
@@ -453,7 +656,7 @@ impl NativeEvidenceHandle {
             let boundary = error(
                 ErrorCode::UnsupportedContract,
                 Stage::Output,
-                "D-completed native output differs from fresh single-step CPU profile",
+                "D-completed native output differs from fresh single-step provider profile",
             );
             report.boundary_error.get_or_insert(boundary);
             state.closed.get_or_insert(boundary);
@@ -553,12 +756,21 @@ pub struct NativeRunError {
     pub service: Option<Box<EngineError>>,
     pub report: Option<Box<NativeRunReport>>,
     pub collection_error: Option<ContractError>,
+    /// Process-worker teardown has its own original contract/native cause. A
+    /// request-drain result must not replace failure to destroy/join the session.
+    pub worker_shutdown_error: Option<Box<PhysicalFailure>>,
+    /// Final loaded-image audit is independent of physical drain. Keep its
+    /// bounded original backend cause even when collection is also incomplete.
+    pub runtime_mapping_error: Option<Box<BackendError>>,
     pub retained_evidence: NativeEvidenceHandle,
     retained_owner: NativeWorkerOwner,
 }
 impl NativeRunError {
     pub fn retained_owner(&self) -> &NativeWorkerOwner {
         &self.retained_owner
+    }
+    pub fn worker_shutdown_failure(&self) -> Option<&PhysicalFailure> {
+        self.worker_shutdown_error.as_deref()
     }
 }
 impl fmt::Debug for NativeRunError {
@@ -567,6 +779,7 @@ impl fmt::Debug for NativeRunError {
             .field("service", &self.service)
             .field("report", &self.report)
             .field("collection_error", &self.collection_error)
+            .field("worker_shutdown_error", &self.worker_shutdown_error)
             .finish_non_exhaustive()
     }
 }
@@ -583,26 +796,57 @@ impl fmt::Display for NativeRunError {
         if let Some(error) = &self.collection_error {
             write!(f, "; collection: {error}")?;
         }
+        if let Some(error) = &self.worker_shutdown_error {
+            write!(f, "; process worker shutdown: {error}")?;
+        }
+        if let Some(error) = &self.runtime_mapping_error {
+            write!(f, "; final runtime mapping audit: {error}")?;
+        }
         Ok(())
     }
 }
-impl std::error::Error for NativeRunError {}
+impl std::error::Error for NativeRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.worker_shutdown_failure()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// One verified session/worker for the executable process. No inference-count
 /// lifetime quota: identity ledgers are constant-space and every root has B's
 /// own finite 129-request/execution range. Fatal errors close future admission.
-pub struct NativeCpuFactory {
+struct NativeSessionFactory {
     owner: NativeWorkerOwner,
     profile: EvaluatorProfile,
     evidence: NativeEvidenceHandle,
     _runtime: Option<OrtRuntime>,
     loaded_profile: Option<CpuProfileV1>,
+    #[cfg(feature = "onnx-cuda")]
+    loaded_cuda_profile: Option<CudaProfileV1>,
 }
-impl NativeCpuFactory {
-    pub fn load(
+impl NativeSessionFactory {
+    fn load_cpu(
         owners: &OwnerRegistry,
         config: &NativeConfig,
     ) -> Result<Self, NativeBootstrapError> {
+        if config.provider != NativeProvider::Cpu {
+            return Err(NativeBootstrapError::Config(
+                "CPU factory requires the explicit CPU provider",
+            ));
+        }
+        let (asset, runtime, backend, projection) = Self::load_parts(owners, config)?;
+        let loaded_profile =
+            CpuProfileV1::from_loaded(&asset, &runtime, &backend, projection.model())?;
+        let owner = NativeWorkerOwner::from_onnx(backend, projection, NATIVE_DIAGNOSTIC_CAPACITY)?;
+        let mut factory = Self::from_owner(owner, Some(runtime))?;
+        factory.loaded_profile = Some(loaded_profile);
+        Ok(factory)
+    }
+    fn load_parts(
+        owners: &OwnerRegistry,
+        config: &NativeConfig,
+    ) -> Result<(MaiaAsset, OrtRuntime, OnnxBackend, ClassicalProjection), NativeBootstrapError>
+    {
         let asset = MaiaAsset::load(
             &config.source_weights,
             &config.onnx_model,
@@ -622,13 +866,85 @@ impl NativeCpuFactory {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        let pin =
-            RuntimeLibraryPin::copy_verified(&config.ort_library, &output_root, &expected_ort)?;
-        let runtime = OrtRuntime::load(&pin)?;
         let mut backend_config = BackendConfig::cpu();
         backend_config.max_batch = 1;
         backend_config.intra_threads = 1;
         backend_config.host_io_bytes = IO_BYTES_PER_ITEM;
+        let pin = match config.provider {
+            NativeProvider::Cpu => {
+                RuntimeLibraryPin::copy_verified(&config.ort_library, &output_root, &expected_ort)?
+            }
+            NativeProvider::Cuda => {
+                #[cfg(all(feature = "onnx-cuda", target_os = "linux"))]
+                {
+                    let path = config
+                        .cuda_bundle
+                        .as_ref()
+                        .ok_or(NativeBootstrapError::Config("CUDA bundle path is absent"))?;
+                    let bytes = asset::read_bounded(path, 64 * 1024)?;
+                    if Some(asset::sha256(&bytes)) != config.cuda_bundle_sha256 {
+                        return Err(NativeBootstrapError::Config(
+                            "CUDA bundle file differs from the explicit SHA256 pin",
+                        ));
+                    }
+                    let text = std::str::from_utf8(&bytes).map_err(|_| {
+                        NativeBootstrapError::Config("CUDA bundle must be bounded UTF-8 JSON")
+                    })?;
+                    let spec = CudaRuntimeBundleSpec::from_json(text)?;
+                    let core = spec
+                        .files
+                        .iter()
+                        .find(|file| file.role == RuntimeBundleFileRole::Core)
+                        .ok_or(NativeBootstrapError::Config(
+                            "CUDA bundle lacks its core declaration",
+                        ))?;
+                    if config
+                        .ort_library
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        != Some(core.filename.as_str())
+                        || core.sha256 != expected_ort
+                    {
+                        return Err(NativeBootstrapError::Config(
+                            "explicit ORT core name/hash differs from the CUDA bundle",
+                        ));
+                    }
+                    let profile_directory =
+                        output_root.join(format!("native-cuda-placement-{}", std::process::id()));
+                    use std::os::unix::fs::DirBuilderExt;
+                    fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(&profile_directory)
+                        .map_err(|_| {
+                            NativeBootstrapError::Config(
+                                "cannot reserve a fresh private CUDA placement directory",
+                            )
+                        })?;
+                    backend_config.provider = Provider::Cuda {
+                        device_id: 0,
+                        arena_bytes: CUDA_ARENA_BYTES,
+                    };
+                    backend_config.profiling_prefix = Some(profile_directory.join("placement"));
+                    RuntimeLibraryPin::copy_cuda_bundle(
+                        config
+                            .ort_library
+                            .parent()
+                            .ok_or(NativeBootstrapError::Config(
+                                "CUDA core lacks a source parent",
+                            ))?,
+                        &output_root,
+                        &spec,
+                    )?
+                }
+                #[cfg(not(all(feature = "onnx-cuda", target_os = "linux")))]
+                {
+                    return Err(NativeBootstrapError::Config(
+                        "explicit CUDA native startup requires the onnx-cuda feature on Linux; no provider was started",
+                    ));
+                }
+            }
+        };
+        let runtime = OrtRuntime::load(&pin)?;
         let backend = OnnxBackend::load(&runtime, &asset, backend_config)?;
         let fill = HistoryFill::No;
         let encoding = EncodingHandle {
@@ -645,11 +961,39 @@ impl NativeCpuFactory {
         };
         let projection =
             ClassicalProjection::new(MaiaBinding::for_backend(&backend, model, encoding, fill)?);
-        let loaded_profile =
-            CpuProfileV1::from_loaded(&asset, &runtime, &backend, projection.model())?;
-        let owner = NativeWorkerOwner::from_onnx(backend, projection, NATIVE_DIAGNOSTIC_CAPACITY)?;
+        Ok((asset, runtime, backend, projection))
+    }
+    #[cfg(feature = "onnx-cuda")]
+    fn load_cuda(
+        owners: &OwnerRegistry,
+        config: &NativeConfig,
+    ) -> Result<Self, NativeBootstrapError> {
+        if !cfg!(target_os = "linux") {
+            return Err(NativeBootstrapError::Config(
+                "CUDA native startup is supported only on Linux; no assets or provider were loaded",
+            ));
+        }
+        if config.provider != NativeProvider::Cuda {
+            return Err(NativeBootstrapError::Config(
+                "CUDA factory requires the explicit CUDA provider",
+            ));
+        }
+        let (asset, runtime, backend, projection) = Self::load_parts(owners, config)?;
+        let loaded_profile = CudaProfileV1::from_loaded(
+            &asset,
+            &runtime,
+            &backend,
+            projection.model(),
+            config
+                .cuda_bundle_sha256
+                .ok_or(NativeBootstrapError::Config(
+                    "CUDA bundle file SHA256 is absent",
+                ))?,
+        )?;
+        let owner =
+            NativeWorkerOwner::from_cuda_onnx(backend, projection, NATIVE_DIAGNOSTIC_CAPACITY)?;
         let mut factory = Self::from_owner(owner, Some(runtime))?;
-        factory.loaded_profile = Some(loaded_profile);
+        factory.loaded_cuda_profile = Some(loaded_profile);
         Ok(factory)
     }
     fn from_owner(
@@ -667,6 +1011,8 @@ impl NativeCpuFactory {
             },
             bytes: ByteBudget {
                 host: HOST_BYTES_PER_ITEM,
+                // The frozen Rules input is host-owned. C reserves CUDA arena
+                // admission separately in its execution additional_resources.
                 device: 0,
                 pinned: 0,
             },
@@ -681,6 +1027,8 @@ impl NativeCpuFactory {
             evidence,
             _runtime: runtime,
             loaded_profile: None,
+            #[cfg(feature = "onnx-cuda")]
+            loaded_cuda_profile: None,
         })
     }
     pub(crate) fn attestation_profile(&self) -> Result<&CpuProfileV1, ContractError> {
@@ -699,38 +1047,75 @@ impl NativeCpuFactory {
             )
         })
     }
-    /// Called for serve success and failure. A busy physical owner/evidence lock
-    /// is queried without blocking; a bounded failure keeps both capabilities.
+    /// Called for serve success and failure. Request drain and process-worker
+    /// teardown share one deadline. A busy owner or pending reaper never permits
+    /// report transfer, and a bounded failure keeps the original capabilities.
     pub fn finish(
         &self,
         served: Result<(), EngineError>,
     ) -> Result<NativeRunReport, NativeRunError> {
-        let until = Instant::now() + FINAL_COLLECTION_LIMIT;
+        self.finish_until(served, Instant::now() + FINAL_COLLECTION_LIMIT)
+    }
+    fn finish_until(
+        &self,
+        served: Result<(), EngineError>,
+        until: Instant,
+    ) -> Result<NativeRunReport, NativeRunError> {
         let mut collection_error = None;
+        let mut worker_shutdown_error = None;
+        let mut worker_joined = false;
         loop {
-            match confirm_collected_drain(
-                || self.evidence.collect(&self.owner),
-                || self.owner.try_status(),
-            ) {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(error) => {
-                    collection_error = Some(error);
-                    break;
+            // Request terminal admission closure before other drain waits. A
+            // busy owner lock remains Pending until C linearizes that closure;
+            // it keeps active-lease polling available and starts its reaper only
+            // once the physical lease has drained.
+            if !worker_joined && worker_shutdown_error.is_none() {
+                match self.owner.try_shutdown() {
+                    Poll::Ready(Ok(())) => worker_joined = true,
+                    Poll::Ready(Err(failure)) => {
+                        worker_shutdown_error = Some(Box::new(failure));
+                    }
+                    Poll::Pending => {}
                 }
             }
             if Instant::now() >= until {
                 collection_error = Some(error(
                     ErrorCode::Expired,
                     Stage::Output,
-                    "native final collection deadline reached; owner and evidence retained",
+                    "native final collection or worker join deadline reached; owner and evidence retained",
                 ));
                 break;
             }
+            match confirm_collected_drain(
+                || self.evidence.collect(&self.owner),
+                || self.owner.try_status(),
+            ) {
+                Ok(true) if worker_joined => break,
+                Ok(true) => {
+                    if let Some(failure) = &worker_shutdown_error {
+                        collection_error = Some(failure.contract);
+                        break;
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    collection_error = Some(error);
+                    break;
+                }
+            }
             thread::sleep(Duration::from_millis(1));
         }
-        // If a worker/owner is still active, leave the report in its shared
-        // store. A late collector must not encounter a moved-out destination.
+        let runtime_mapping_error =
+            if collection_error.is_none() && self.owner.origin() == NativeWorkerOrigin::CudaOnnx {
+                self._runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.verify_cuda_runtime_mappings().err())
+                    .map(Box::new)
+            } else {
+                None
+            };
+        // If physical work, destructor/join or final collection is unconfirmed,
+        // leave the report in its shared store for the retained owner/collector.
         let report = if collection_error.is_none() {
             match self.evidence.try_take_report() {
                 Ok(report) => report,
@@ -745,6 +1130,8 @@ impl NativeCpuFactory {
         let service = served.err().map(Box::new);
         if service.is_none()
             && collection_error.is_none()
+            && worker_shutdown_error.is_none()
+            && runtime_mapping_error.is_none()
             && report.as_ref().is_some_and(|report| !report.has_failure())
         {
             return Ok(report.expect("checked report presence"));
@@ -753,9 +1140,94 @@ impl NativeCpuFactory {
             service,
             report: report.map(Box::new),
             collection_error,
+            worker_shutdown_error,
+            runtime_mapping_error,
             retained_evidence: self.evidence.clone(),
             retained_owner: self.owner.clone(),
         })
+    }
+}
+
+/// CPU construction and CPU V1 evidence remain guarded independently of CUDA.
+pub struct NativeCpuFactory {
+    inner: NativeSessionFactory,
+}
+impl NativeCpuFactory {
+    pub fn load(
+        owners: &OwnerRegistry,
+        config: &NativeConfig,
+    ) -> Result<Self, NativeBootstrapError> {
+        Ok(Self {
+            inner: NativeSessionFactory::load_cpu(owners, config)?,
+        })
+    }
+    #[cfg(test)]
+    fn from_owner(
+        owner: NativeWorkerOwner,
+        runtime: Option<OrtRuntime>,
+    ) -> Result<Self, ContractError> {
+        if owner.origin() == NativeWorkerOrigin::CudaOnnx
+            || owner.admission_policy()
+                != rz_eval::native_runtime_bridge::NativeAdmissionPolicy::Cpu
+        {
+            return Err(error(
+                ErrorCode::UnsupportedContract,
+                Stage::Admission,
+                "CPU factory rejects CUDA owner",
+            ));
+        }
+        Ok(Self {
+            inner: NativeSessionFactory::from_owner(owner, runtime)?,
+        })
+    }
+    pub(crate) fn attestation_profile(&self) -> Result<&CpuProfileV1, ContractError> {
+        self.inner.attestation_profile()
+    }
+    pub fn finish(
+        &self,
+        served: Result<(), EngineError>,
+    ) -> Result<NativeRunReport, NativeRunError> {
+        self.inner.finish(served)
+    }
+}
+
+#[cfg(feature = "onnx-cuda")]
+pub struct NativeCudaFactory {
+    inner: NativeSessionFactory,
+}
+#[cfg(feature = "onnx-cuda")]
+impl NativeCudaFactory {
+    pub fn load(
+        owners: &OwnerRegistry,
+        config: &NativeConfig,
+    ) -> Result<Self, NativeBootstrapError> {
+        Ok(Self {
+            inner: NativeSessionFactory::load_cuda(owners, config)?,
+        })
+    }
+    pub(crate) fn attestation_profile(&self) -> Result<&CudaProfileV1, ContractError> {
+        if self.inner.owner.origin() != NativeWorkerOrigin::CudaOnnx
+            || self.inner._runtime.is_none()
+        {
+            return Err(error(
+                ErrorCode::UnsupportedContract,
+                Stage::Output,
+                "only an actually loaded CUDA owner can issue provider evidence",
+            ));
+        }
+        self.inner.loaded_cuda_profile.as_ref().ok_or_else(|| {
+            error(
+                ErrorCode::IdentityMismatch,
+                Stage::Output,
+                "loaded CUDA provider snapshot is unavailable",
+            )
+        })
+    }
+    pub fn finish(
+        &self,
+        served: Result<(), EngineError>,
+    ) -> Result<NativeRunReport, NativeRunError> {
+        self.inner.finish(served)
     }
 }
 
@@ -828,7 +1300,18 @@ impl ContractClock for RuntimeClock {
         self.0.domain()
     }
 }
-impl EvaluatorFactory for NativeCpuFactory {
+impl EvaluatorFactory for NativeSessionFactory {
+    fn observe_search_acceptance(
+        &self,
+        evaluation: &rz_search::contracts::AcceptedEvaluation,
+        traversed_edges: usize,
+    ) -> Result<(), ContractError> {
+        let observed = self.evidence.record_search(evaluation, traversed_edges);
+        if let Err(error) = observed {
+            let _ = self.owner.try_close_admission(error);
+        }
+        observed
+    }
     fn profile(&self) -> EvaluatorProfile {
         self.profile.clone()
     }
@@ -866,13 +1349,21 @@ impl EvaluatorFactory for NativeCpuFactory {
                 deadline_reserve: Duration::ZERO,
                 memory: Resources {
                     host_bytes: HOST_BYTES_PER_ITEM + NATIVE_RUNTIME_OVERHEAD_BYTES,
-                    device_bytes: 0,
-                    pinned_bytes: 0,
+                    device_bytes: self
+                        .owner
+                        .admission_policy()
+                        .execution_resources()
+                        .device_bytes,
+                    pinned_bytes: self
+                        .owner
+                        .admission_policy()
+                        .execution_resources()
+                        .pinned_bytes,
                 },
             },
             256,
         )?;
-        Ok(Box::new(NativeCpuRuntime {
+        Ok(Box::new(NativeRuntime {
             evaluator,
             scope,
             authority,
@@ -881,10 +1372,47 @@ impl EvaluatorFactory for NativeCpuFactory {
             evidence: self.evidence.clone(),
             submissions: 0,
             pending: None,
+            observation_error: None,
         }))
     }
 }
-struct NativeCpuRuntime {
+
+macro_rules! delegate_native_factory {
+    ($factory:ty) => {
+        impl EvaluatorFactory for $factory {
+            fn observe_search_acceptance(
+                &self,
+                evaluation: &rz_search::contracts::AcceptedEvaluation,
+                traversed_edges: usize,
+            ) -> Result<(), ContractError> {
+                self.inner
+                    .observe_search_acceptance(evaluation, traversed_edges)
+            }
+            fn profile(&self) -> EvaluatorProfile {
+                self.inner.profile()
+            }
+            fn input_key(
+                &self,
+                state: &RulesState,
+                legal: &[Move],
+            ) -> Result<EvalInputKey, ContractError> {
+                self.inner.input_key(state, legal)
+            }
+            fn create(
+                &self,
+                clock: ProcessClock,
+                authority: SearchAuthority,
+            ) -> Result<Box<dyn ManagedEvaluator>, ContractError> {
+                self.inner.create(clock, authority)
+            }
+        }
+    };
+}
+delegate_native_factory!(NativeCpuFactory);
+#[cfg(feature = "onnx-cuda")]
+delegate_native_factory!(NativeCudaFactory);
+
+struct NativeRuntime {
     evaluator: ContractEvaluator<RulesState, NativeRuntimeBackend<RuntimeClock>, RuntimeClock>,
     scope: SharedScope,
     authority: SearchAuthority,
@@ -893,8 +1421,22 @@ struct NativeCpuRuntime {
     evidence: NativeEvidenceHandle,
     submissions: u64,
     pending: Option<EvalContext>,
+    observation_error: Option<ContractError>,
 }
-impl NativeCpuRuntime {
+impl NativeRuntime {
+    fn collect_observations(&mut self, drain_discarded: u64) -> Result<(), ContractError> {
+        let scheduler = self.evaluator.take_observations();
+        let delivery = self.evaluator.take_delivery_observations();
+        self.evidence.record_observations(NativeObservationReport {
+            scheduler_events: scheduler.events.len() as u64,
+            scheduler_dropped: scheduler.dropped,
+            scheduler_counter_overflow: scheduler.counter_overflow,
+            delivery_events: delivery.events.len() as u64,
+            delivery_dropped: delivery.dropped,
+            delivery_counter_overflow: delivery.counter_overflow,
+            drain_discarded_results: drain_discarded,
+        })
+    }
     fn refresh(&self) -> Result<(), ContractError> {
         self.scope.update(self.authority.current_scope()?);
         Ok(())
@@ -904,7 +1446,11 @@ impl NativeCpuRuntime {
         self.evaluator.begin_shutdown(self.clock.deadline(until)?)?;
         loop {
             self.refresh()?;
-            while self.evaluator.poll().is_some() {}
+            let mut discarded = 0_u64;
+            while self.evaluator.poll().is_some() {
+                discarded += 1;
+            }
+            self.collect_observations(discarded)?;
             self.evidence.collect(&self.owner)?;
             let snapshot = self.evaluator.shutdown_snapshot();
             match snapshot.drain {
@@ -913,14 +1459,14 @@ impl NativeCpuRuntime {
                     return Err(error(
                         ErrorCode::BackendFailure,
                         Stage::Backend,
-                        "native CPU physical drain timed out; lease remains pinned",
+                        "native physical drain timed out; lease remains pinned",
                     ));
                 }
                 _ if Instant::now() >= until => {
                     return Err(error(
                         ErrorCode::Expired,
                         Stage::Backend,
-                        "native CPU shutdown deadline reached; completion unconfirmed",
+                        "native shutdown deadline reached; completion unconfirmed",
                     ));
                 }
                 _ => thread::sleep(Duration::from_millis(1)),
@@ -928,7 +1474,7 @@ impl NativeCpuRuntime {
         }
     }
 }
-impl Evaluator<RulesState> for NativeCpuRuntime {
+impl Evaluator<RulesState> for NativeRuntime {
     fn submit(&mut self, request: Arc<EvalRequest<RulesState>>) -> Result<(), ContractError> {
         self.refresh()?;
         self.evidence.collect(&self.owner)?;
@@ -945,12 +1491,31 @@ impl Evaluator<RulesState> for NativeCpuRuntime {
         self.submissions += 1;
         self.pending = Some(request.context());
         let result = self.evaluator.submit(request);
+        if let Err(error) = self.collect_observations(0) {
+            self.observation_error.get_or_insert(error);
+            let _ = self.owner.try_close_admission(error);
+        }
         if result.is_err() {
             self.pending = None;
         }
+        // A passive observation failure must not turn an already admitted
+        // request into submit Err. Its original admission remains owned by D;
+        // poll/shutdown publish the observation failure and drain the lease.
         result
     }
     fn poll(&mut self) -> Option<EvalResult> {
+        if let Some(error) = self.observation_error
+            && let Some(request) = self.pending.take()
+        {
+            return Some(EvalResult::Failed(EvalFailure {
+                context: CompletionContext {
+                    request,
+                    execution: None,
+                },
+                error,
+                recovery: RecoveryOutcome::Failed,
+            }));
+        }
         if let Err(error) = self.refresh() {
             self.authority.cancel();
             return self.pending.take().map(|request| {
@@ -966,6 +1531,10 @@ impl Evaluator<RulesState> for NativeCpuRuntime {
         }
         let result = self.evaluator.poll();
         let collection = self.evidence.collect(&self.owner);
+        if let Err(error) = self.collect_observations(0) {
+            self.observation_error.get_or_insert(error);
+            let _ = self.owner.try_close_admission(error);
+        }
         if let Some(EvalResult::Completed(output)) = &result
             && let Err(error) = self.evidence.record_completed(output)
         {
@@ -1001,13 +1570,15 @@ impl Evaluator<RulesState> for NativeCpuRuntime {
         self.evaluator.cancel(request)
     }
 }
-impl ManagedEvaluator for NativeCpuRuntime {
+impl ManagedEvaluator for NativeRuntime {
     fn shutdown(&mut self, until: Instant) -> Result<(), ContractError> {
         let drained = self.drain(until);
         let collected = self.evidence.collect(&self.owner);
         // Common cleanup failure is retained by B; C's original cause remains in
         // the native evidence owner even when both operations fail.
-        drained.and(collected.map(|_| ()))
+        drained
+            .and(collected.map(|_| ()))
+            .and(self.observation_error.take().map_or(Ok(()), Err))
     }
 }
 
@@ -1026,7 +1597,7 @@ mod physical_owner_tests {
     use std::{
         io::Write,
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc,
         },
     };
@@ -1105,6 +1676,287 @@ mod physical_owner_tests {
             crate::native_attestation::StartupReceiptV1::capture(&factory, &clock).unwrap_err();
         assert!(denied.to_string().contains("actually loaded CPU ONNX"));
         let report = factory.finish(Ok(())).unwrap();
+        assert_eq!(report.origin, NativeWorkerOrigin::Injected);
+        assert_eq!(report.completed_by_runtime, 0);
+    }
+
+    struct SessionDropProbe {
+        dropped: Arc<AtomicBool>,
+        gate: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
+        panic_on_drop: bool,
+    }
+    impl Drop for SessionDropProbe {
+        fn drop(&mut self) {
+            if let Some((entered, release)) = &self.gate {
+                let _ = entered.try_send(());
+                assert!(
+                    release.recv_timeout(WAIT).is_ok(),
+                    "bounded injected session destructor release"
+                );
+            }
+            assert!(
+                !self.panic_on_drop,
+                "private injected session destructor panic"
+            );
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+    struct DestructorRelease(Option<mpsc::SyncSender<()>>);
+    impl DestructorRelease {
+        fn release(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.try_send(());
+            }
+        }
+    }
+    impl Drop for DestructorRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+    fn factory_with_drop_probe(
+        owners: &OwnerRegistry,
+        probe: SessionDropProbe,
+    ) -> NativeCpuFactory {
+        let worker = SingleWorker::spawn(move |batch: &PreparedBatch<RulesState>| {
+            // Keep the probe in the same long-lived closure as an ONNX session.
+            let _session = &probe;
+            batch
+                .requests()
+                .iter()
+                .map(|request| request.physical_output(&raw(), batch.execution()))
+                .collect()
+        })
+        .unwrap();
+        let owner = NativeWorkerOwner::from_worker(worker, projection(owners), 1).unwrap();
+        NativeCpuFactory::from_owner(owner, None).unwrap()
+    }
+
+    #[test]
+    fn final_report_waits_for_idle_session_destruction_and_actual_worker_join() {
+        let owners = OwnerRegistry::default();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let factory = factory_with_drop_probe(
+            &owners,
+            SessionDropProbe {
+                dropped: Arc::clone(&dropped),
+                gate: None,
+                panic_on_drop: false,
+            },
+        );
+        assert!(!dropped.load(Ordering::Acquire));
+        let report = factory.finish(Ok(())).unwrap();
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "owner idle alone cannot authorize the final report before session drop"
+        );
+        assert_eq!(report.origin, NativeWorkerOrigin::Injected);
+        assert_eq!(report.completed_by_runtime, 0);
+        assert!(!report.has_failure());
+    }
+
+    #[test]
+    fn blocked_session_destructor_keeps_service_source_and_evidence_until_join() {
+        let owners = OwnerRegistry::default();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (entered, observing) = mpsc::sync_channel(1);
+        let (release, waiting) = mpsc::sync_channel(1);
+        let mut release = DestructorRelease(Some(release));
+        let factory = factory_with_drop_probe(
+            &owners,
+            SessionDropProbe {
+                dropped: Arc::clone(&dropped),
+                gate: Some((entered, waiting)),
+                panic_on_drop: false,
+            },
+        );
+        // Establish the destructor gate before starting the short deadline;
+        // thread scheduling time is not the behavior under test.
+        assert!(matches!(factory.inner.owner.try_shutdown(), Poll::Pending));
+        observing.recv_timeout(WAIT).unwrap();
+        let service = error(
+            ErrorCode::BackendFailure,
+            Stage::Output,
+            "independent injected protocol failure",
+        );
+        // The production wrapper always uses FINAL_COLLECTION_LIMIT. This
+        // shorter injected deadline exercises the same bounded finish path.
+        let failed = factory
+            .inner
+            .finish_until(
+                Err(EngineError::Contract(service)),
+                Instant::now() + Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert!(!dropped.load(Ordering::Acquire));
+        assert_eq!(failed.collection_error.unwrap().code, ErrorCode::Expired);
+        assert!(matches!(
+            failed.service.as_deref(),
+            Some(EngineError::Contract(original)) if *original == service
+        ));
+        assert!(failed.report.is_none());
+        assert!(
+            failed
+                .retained_evidence
+                .try_state()
+                .unwrap()
+                .unwrap()
+                .report
+                .is_some()
+        );
+        assert!(failed.worker_shutdown_failure().is_none());
+        release.release();
+        let report = factory.finish(Ok(())).unwrap();
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(report.origin, NativeWorkerOrigin::Injected);
+        assert!(!report.has_failure());
+    }
+
+    #[test]
+    fn session_destructor_panic_keeps_typed_original_and_cannot_transfer_healthy_report() {
+        let owners = OwnerRegistry::default();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let factory = factory_with_drop_probe(
+            &owners,
+            SessionDropProbe {
+                dropped: Arc::clone(&dropped),
+                gate: None,
+                panic_on_drop: true,
+            },
+        );
+        let failed = factory.finish(Ok(())).unwrap_err();
+        assert!(!dropped.load(Ordering::Acquire));
+        let original = failed.worker_shutdown_failure().unwrap();
+        assert_eq!(failed.collection_error, Some(original.contract));
+        assert_eq!(original.contract.code, ErrorCode::BackendFailure);
+        assert_eq!(
+            original.backend.as_ref().unwrap().cause.unwrap().code,
+            CauseCode::RuntimePanic
+        );
+        assert!(
+            std::error::Error::source(&failed)
+                .unwrap()
+                .downcast_ref::<PhysicalFailure>()
+                .is_some()
+        );
+        assert!(failed.report.is_none());
+        assert!(
+            failed
+                .retained_evidence
+                .try_state()
+                .unwrap()
+                .unwrap()
+                .report
+                .is_some()
+        );
+        assert!(!failed.to_string().contains("private injected"));
+        assert!(!format!("{failed:?}").contains("private injected"));
+    }
+
+    #[test]
+    fn quarantined_execution_keeps_original_pinned_evidence_and_cannot_finish_successfully() {
+        let owners = Arc::new(OwnerRegistry::default());
+        let source = BackendError::new(
+            FailureKind::BackendFailure,
+            FailureStage::Backend,
+            "injected execution completion is unknown",
+        )
+        .with_external_cause(CauseCode::OrtRun, &"private-quarantine-cause");
+        let expected = source.clone();
+        let worker = SingleWorker::spawn_with_outcome(move |_: &PreparedBatch<RulesState>| {
+            rz_eval::worker::PhysicalRun::Quarantined(source.clone())
+        })
+        .unwrap();
+        let owner = NativeWorkerOwner::from_worker(worker, projection(&owners), 1).unwrap();
+        let factory = NativeCpuFactory::from_owner(owner, None).unwrap();
+        let clock = ProcessClock::new(ProcessEpoch(306));
+        let request = request(&factory, &owners, &clock, 1);
+        let context = request.context();
+        let mut runtime = factory.create(clock, authority(context)).unwrap();
+        runtime.submit(request).unwrap();
+        let until = Instant::now() + WAIT;
+        loop {
+            assert!(
+                !matches!(runtime.poll(), Some(EvalResult::Completed(_))),
+                "quarantine cannot return a completed evaluation"
+            );
+            let observed = factory
+                .inner
+                .evidence
+                .try_state()
+                .unwrap()
+                .is_some_and(|state| {
+                    state.report.as_ref().is_some_and(|report| {
+                        report
+                            .failures
+                            .iter()
+                            .any(|receipt| receipt.kind == NativeDiagnosticKind::Quarantined)
+                    })
+                });
+            if observed {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "bounded original quarantine receipt"
+            );
+            thread::yield_now();
+        }
+        let failed = factory
+            .inner
+            .finish_until(Ok(()), Instant::now() + Duration::from_millis(100))
+            .unwrap_err();
+        assert_eq!(failed.collection_error.unwrap().code, ErrorCode::Expired);
+        assert!(failed.report.is_none());
+        assert!(failed.worker_shutdown_failure().is_none());
+        let state = failed.retained_evidence.try_state().unwrap().unwrap();
+        let report = state.report.as_ref().unwrap();
+        assert_eq!(report.origin, NativeWorkerOrigin::Injected);
+        assert_eq!(report.completed_by_runtime, 0);
+        assert_eq!(report.failures.len(), 1);
+        let receipt = &report.failures[0];
+        assert_eq!(receipt.kind, NativeDiagnosticKind::Quarantined);
+        assert_eq!(receipt.context.request, context);
+        assert!(receipt.context.execution.is_some());
+        assert_eq!(receipt.failure.backend.as_ref(), Some(&expected));
+        assert!(report.has_failure());
+    }
+
+    #[test]
+    fn per_root_runtime_shutdown_preserves_the_session_until_process_finish() {
+        let owners = Arc::new(OwnerRegistry::default());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let factory = factory_with_drop_probe(
+            &owners,
+            SessionDropProbe {
+                dropped: Arc::clone(&dropped),
+                gate: None,
+                panic_on_drop: false,
+            },
+        );
+        let clock = ProcessClock::new(ProcessEpoch(305));
+        for sequence in 1..=2 {
+            let request = request(&factory, &owners, &clock, sequence);
+            let context = request.context();
+            let mut runtime = factory.create(clock.clone(), authority(context)).unwrap();
+            runtime.submit(request).unwrap();
+            let until = Instant::now() + WAIT;
+            let result = loop {
+                if let Some(result) = runtime.poll() {
+                    break result;
+                }
+                assert!(Instant::now() < until, "bounded injected root completion");
+                thread::yield_now();
+            };
+            let EvalResult::Completed(output) = result else {
+                panic!("the reusable injected session must complete both roots");
+            };
+            assert_eq!(output.context, context);
+            runtime.shutdown(Instant::now() + WAIT).unwrap();
+            assert!(!dropped.load(Ordering::Acquire));
+        }
+        let report = factory.finish(Ok(())).unwrap();
+        assert!(dropped.load(Ordering::Acquire));
         assert_eq!(report.origin, NativeWorkerOrigin::Injected);
         assert_eq!(report.completed_by_runtime, 0);
     }
@@ -1276,7 +2128,8 @@ mod physical_owner_tests {
         let factory = NativeCpuFactory::from_owner(owner, None).unwrap();
         let clock = ProcessClock::new(ProcessEpoch(302));
         let mut backend =
-            NativeRuntimeBackend::new(factory.owner.clone(), RuntimeClock(clock.clone())).unwrap();
+            NativeRuntimeBackend::new(factory.inner.owner.clone(), RuntimeClock(clock.clone()))
+                .unwrap();
         for sequence in 1..=64 {
             let eval = request(&factory, &owners, &clock, sequence);
             eval.cancel_token().cancel();
@@ -1285,7 +2138,13 @@ mod physical_owner_tests {
                 &[Arc::new(RuntimeRequest::new(eval))],
             );
             assert_eq!(refused.err().unwrap().code, ErrorCode::Canceled);
-            assert!(factory.evidence.collect(&factory.owner).unwrap());
+            assert!(
+                factory
+                    .inner
+                    .evidence
+                    .collect(&factory.inner.owner)
+                    .unwrap()
+            );
         }
         let report = factory.finish(Ok(())).unwrap();
         assert_eq!(report.canceled.count, 64);
@@ -1447,7 +2306,7 @@ mod physical_owner_tests {
         entering
             .recv_timeout(WAIT)
             .expect("first root reached the actual physical worker");
-        assert_blocked_physical_owner_active(&native.owner, "after physical worker entry");
+        assert_blocked_physical_owner_active(&native.inner.owner, "after physical worker entry");
         for line in ["position startpos moves e2e4", "go nodes 1 movetime 30000"] {
             guard.events.send(Event::Line(line.into())).unwrap();
         }
@@ -1477,7 +2336,7 @@ mod physical_owner_tests {
             "busy root fallback cannot reload/create another provider session"
         );
         assert_blocked_physical_owner_active(
-            &native.owner,
+            &native.inner.owner,
             "after current-root legal fallback before physical release",
         );
         guard.release.take().unwrap().send(()).unwrap();

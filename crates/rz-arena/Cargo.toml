@@ -8,6 +8,7 @@ description = "RoveZero paired opening plans and attempt/failure ledger"
 
 [features]
 test-fixtures = []
+native-cuda = ["dep:rz-uci", "rz-uci/onnx-cuda"]
 
 [[bin]]
 name = "rz-arena-fixture-engine"
@@ -18,6 +19,7 @@ required-features = ["test-fixtures"]
 rz-experiments.workspace = true
 rz-contracts.workspace = true
 rz-position = { workspace = true, features = ["contracts"] }
+rz-uci = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

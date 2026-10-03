@@ -553,3 +553,202 @@ fn completed_count_overflow_closes_admission_and_keeps_last_original_metadata() 
     assert_eq!(report.boundary_error, Some(boundary));
     assert!(report.has_failure());
 }
+
+#[test]
+fn cuda_selection_requires_two_pins_and_rejects_mixed_or_mutable_profiles() {
+    let mut valid = valid_arguments();
+    valid[0] = "--onnx-cuda".into();
+    valid.push(format!("--cuda-bundle={PRIVATE_MARKER}/bundle.json"));
+    valid.push(format!("--cuda-bundle-sha256={}", "ef".repeat(32)));
+    let parsed = NativeConfig::parse(valid.clone()).unwrap();
+    assert_eq!(parsed.provider(), NativeProvider::Cuda);
+    assert_eq!(parsed.cuda_bundle_sha256, Some([0xef; 32]));
+    assert!(!format!("{parsed:?}").contains(PRIVATE_MARKER));
+    for omitted in [valid.len() - 2, valid.len() - 1] {
+        let mut arguments = valid.clone();
+        arguments.remove(omitted);
+        assert_private_config_rejection(arguments);
+    }
+    for forbidden in [
+        "--onnx-cpu",
+        "--device-id=1",
+        "--arena-bytes=1",
+        "--batch=2",
+        "--tf32=true",
+    ] {
+        let mut arguments = valid.clone();
+        arguments.push(forbidden.into());
+        assert_private_config_rejection(arguments);
+    }
+    let mut cpu = valid.clone();
+    cpu[0] = "--onnx-cpu".into();
+    assert_private_config_rejection(cpu);
+    let mut bad_hash = valid;
+    *bad_hash.last_mut().unwrap() = format!("--cuda-bundle-sha256={}", "EF".repeat(32));
+    assert_private_config_rejection(bad_hash);
+}
+
+#[test]
+fn cpu_v1_typed_projection_rejects_cuda_origin_without_loading_native_assets() {
+    let fixture = Fixture::new();
+    let report = NativeRunReport::new(&fixture.profile, NativeWorkerOrigin::CudaOnnx).unwrap();
+    let rejected = crate::native_attestation::RunEvidenceV1::try_from(&report).unwrap_err();
+    assert_eq!(rejected.code, ErrorCode::UnsupportedContract);
+    #[cfg(feature = "onnx-cuda")]
+    for origin in [NativeWorkerOrigin::CpuOnnx, NativeWorkerOrigin::Injected] {
+        let report = NativeRunReport::new(&fixture.profile, origin).unwrap();
+        let rejected =
+            crate::native_cuda_attestation::CudaRunEvidenceV1::try_from(&report).unwrap_err();
+        assert_eq!(rejected.code, ErrorCode::UnsupportedContract);
+    }
+}
+
+#[test]
+fn guarded_search_metadata_separates_root_initialization_backup_and_d_return() {
+    // These are synthetic receipts, not evidence of CUDA execution or capability.
+    let fixture = Fixture::new();
+    let evidence = fixture.evidence(NativeWorkerOrigin::CudaOnnx);
+    let root = fixture.synthetic_output(1);
+    let leaf = fixture.synthetic_output(2);
+    let metadata = |output: &EvalOutput| rz_search::contracts::AcceptedEvaluation {
+        context: CompletionContext {
+            request: output.context,
+            execution: output.actual.execution,
+        },
+        actual: output.actual,
+    };
+    evidence.record_completed(&root).unwrap();
+    evidence.record_completed(&leaf).unwrap();
+    evidence.record_search(&metadata(&root), 0).unwrap();
+    evidence.record_search(&metadata(&leaf), 3).unwrap();
+    let report = evidence.try_take_report().unwrap().unwrap();
+    assert_eq!(report.completed_by_runtime, 2);
+    assert_eq!(report.search_root_initializations.count, 1);
+    assert_eq!(
+        report
+            .search_root_initializations
+            .first
+            .unwrap()
+            .completed
+            .context
+            .request,
+        root.context
+    );
+    assert_eq!(
+        report
+            .search_root_initializations
+            .last
+            .unwrap()
+            .traversed_edges,
+        0
+    );
+    assert_eq!(report.search_non_root_backups.count, 1);
+    assert_eq!(
+        report
+            .search_non_root_backups
+            .first
+            .unwrap()
+            .completed
+            .actual,
+        leaf.actual
+    );
+    assert_eq!(
+        report.search_non_root_backups.last.unwrap().traversed_edges,
+        3
+    );
+    let injected = fixture.evidence(NativeWorkerOrigin::Injected);
+    injected.record_search(&metadata(&leaf), 1).unwrap();
+    assert_eq!(
+        injected
+            .try_take_report()
+            .unwrap()
+            .unwrap()
+            .search_non_root_backups
+            .count,
+        0
+    );
+}
+
+#[test]
+fn search_observer_overflow_preserves_last_original_and_closes_admission() {
+    let fixture = Fixture::new();
+    let evidence = fixture.evidence(NativeWorkerOrigin::CudaOnnx);
+    let output = fixture.synthetic_output(2);
+    let metadata = rz_search::contracts::AcceptedEvaluation {
+        context: CompletionContext {
+            request: output.context,
+            execution: output.actual.execution,
+        },
+        actual: output.actual,
+    };
+    evidence
+        .0
+        .lock()
+        .unwrap()
+        .report
+        .as_mut()
+        .unwrap()
+        .search_non_root_backups
+        .count = u64::MAX;
+    let rejected = evidence.record_search(&metadata, 1).unwrap_err();
+    assert_eq!(evidence.admission_error().unwrap(), Some(rejected));
+    let report = evidence.try_take_report().unwrap().unwrap();
+    assert_eq!(report.search_non_root_backups.count, u64::MAX);
+    assert_eq!(
+        report
+            .search_non_root_backups
+            .last
+            .unwrap()
+            .completed
+            .context,
+        metadata.context
+    );
+    assert_eq!(
+        report
+            .search_non_root_backups
+            .last
+            .unwrap()
+            .completed
+            .actual,
+        metadata.actual
+    );
+    assert!(report.has_failure());
+}
+
+#[test]
+fn scheduler_and_final_delivery_losses_are_separate_and_never_count_as_nn_work() {
+    let fixture = Fixture::new();
+    let evidence = fixture.evidence(NativeWorkerOrigin::CudaOnnx);
+    evidence
+        .record_observations(NativeObservationReport {
+            scheduler_events: 3,
+            scheduler_dropped: 2,
+            delivery_events: 5,
+            delivery_dropped: 7,
+            drain_discarded_results: 1,
+            ..NativeObservationReport::default()
+        })
+        .unwrap();
+    let report = evidence.try_take_report().unwrap().unwrap();
+    assert_eq!(report.observations.scheduler_dropped, 2);
+    assert_eq!(report.observations.delivery_dropped, 7);
+    assert_eq!(report.observations.drain_discarded_results, 1);
+    assert_eq!(report.completed_by_runtime, 0);
+    assert_eq!(report.search_non_root_backups.count, 0);
+    let evidence = fixture.evidence(NativeWorkerOrigin::CudaOnnx);
+    let rejected = evidence
+        .record_observations(NativeObservationReport {
+            delivery_counter_overflow: true,
+            ..NativeObservationReport::default()
+        })
+        .unwrap_err();
+    assert_eq!(evidence.admission_error().unwrap(), Some(rejected));
+    assert!(
+        evidence
+            .try_take_report()
+            .unwrap()
+            .unwrap()
+            .observations
+            .delivery_counter_overflow
+    );
+}

@@ -20,6 +20,49 @@ const LEDGER_BOUNDS: [&str; 8] = [
     "65536",
 ];
 
+#[cfg(feature = "native-cuda")]
+#[test]
+fn cuda_cli_requires_exact_paths_before_assets_and_exposes_integration_only_help() {
+    for (args, expected) in [
+        (
+            vec!["native-cuda-lock"],
+            "native-cuda-lock requires exactly INPUT OUTPUT",
+        ),
+        (
+            vec!["native-cuda-lock", "missing", "out", "extra"],
+            "native-cuda-lock requires exactly INPUT OUTPUT",
+        ),
+        (
+            vec!["native-cuda-pair", "missing", "source", "output"],
+            "native-cuda-pair requires exactly LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME",
+        ),
+    ] {
+        assert!(assert_failure(&run(args)).contains(expected));
+    }
+    let help = run(["--help"]);
+    assert!(help.status.success());
+    let text = String::from_utf8(help.stdout).unwrap();
+    assert!(text.contains("native-cuda-lock INPUT OUTPUT"));
+    assert!(text.contains("native-cuda-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME"));
+    assert!(text.contains("strength_eligible=false"));
+}
+
+#[cfg(not(feature = "native-cuda"))]
+#[test]
+fn cuda_cli_is_not_enabled_by_default() {
+    assert!(
+        assert_failure(&run(["native-cuda-lock", "missing", "out"]))
+            .contains("invalid or missing command")
+    );
+    let help = run(["--help"]);
+    assert!(help.status.success());
+    assert!(
+        !String::from_utf8(help.stdout)
+            .unwrap()
+            .contains("native-cuda-lock")
+    );
+}
+
 struct TestDirectory(PathBuf);
 
 impl TestDirectory {

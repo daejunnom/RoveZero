@@ -2,10 +2,12 @@
 
 mod artifact;
 mod manifest;
+mod native_cuda;
 mod native_launch;
 mod validation;
 
 pub use manifest::*;
+pub use native_cuda::*;
 pub use native_launch::*;
 
 use serde::Deserialize;

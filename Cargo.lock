@@ -428,6 +428,7 @@ dependencies = [
  "rz-contracts",
  "rz-experiments",
  "rz-position",
+ "rz-uci",
  "serde",
  "serde_json",
  "sha2",

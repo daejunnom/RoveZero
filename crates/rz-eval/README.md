@@ -193,9 +193,54 @@ probe panic의 bounded 원문도 별도 local 진단에 보존하며 기본 오�
 이 추가 GPU 경로의 소스 제공은 실제 C03 통과가 아니다. 목표 RTX 4050에서의 실행,
 수치·kernel placement·mapped origin 인수는 총괄의 별도 실행 증거로 판정한다.
 `maia_check`의 C worker 검사에는 fixture Rules view를 사용하며 실제 A/D GPU 연결을
-증명하지 않는다. 현재 NativeRuntimeBackend/UCI 연결은 CPU 전용이다. CUDA arena cap과
+증명하지 않는다. CUDA arena cap과
 외부 sampler의 관측치를 전체 VRAM peak·종단 지연·강도 성과로 승격하지 않는다.
 총 VRAM·메모리 peak·GPU 수명·종단 계측은 별도 I02 인수가 필요하다.
+
+## 실제 A 상태의 CPU/CUDA 런타임 연결
+
+`native_runtime_bridge::NativeWorkerOwner::from_onnx`의 기존 CPU guard와 CPU backend
+identity는 유지한다. 별도 `from_cuda_onnx(backend, projection, diagnostic_capacity)`는
+이미 로드된 CUDA 세션만 소비한다. device 0·batch 1·intra thread 1·FP32 full step 1,
+정확한 model/backend identity, 실제 warm probe의 CUDA kernel placement, 현재 NVIDIA
+16개와 ORT 3개의 mapping을 확인한 뒤 `NativeWorkerOrigin::CudaOnnx`를 발급한다.
+모델 로드나 provider 초기화는 `dispatch` 또는 검색 deadline 안에서 수행하지 않는다.
+`owner.cuda_metadata()`는 실제 bundle/placement SHA와 실행 node 수를 제공하며,
+warm probe는 검색 요청의 결과 소비 증거와 구분한다.
+owner는 binding의 검증된 history/encoding을 보존한다. 수치 인수의 기존 12개 참조는
+No 5개·RepeatOldest 7개이며 원래 입력·출력을 재라벨링하지 않는다. 최초 제품 UCI의
+HistoryFillNo 고정은 B factory와 별도 CUDA attestation이 소유하는 실행 profile 제약이다.
+
+`NativeAdmissionPolicy::CudaOneGiB`의 `execution_resources()`는 요청의 `ByteBudget`에
+추가하는 D 실행 예약(host 4096B·device 1GiB·pinned 0)이다. 현재 요청 자체의 device
+budget은 0이며 같은 1GiB를 두 곳에 넣으면 중복 예약된다. 물리 완료 전에는 이 D
+예약을 유지한다. `session_resident_admission()`의 device 1GiB는 bootstrap이 별도로
+계상하는 상주 선언이며 개별 실행 완료로 해제하지 않는다. 두 선언 모두 실제 VRAM
+측정값이나 전체 native 할당 hard cap이 아니다. ORT arena 1GiB 설정도 cuDNN workspace,
+driver 등의 총 메모리 상한을 보장하지 않는다. pinned 0은 pinned buffer를 새로 제공했다는
+주장이 없음을 뜻한다.
+
+`from_worker_with_admission(..., NativeAdmissionPolicy::CudaOneGiB)`로 GPU 없는 환경에서
+device admission·Q·취소 수명을 검사할 수 있다. 이 owner의 출처는 항상 `Injected`이며
+CUDA metadata를 발급하지 않는다. CUDA Run 오류 또는 wrapper unwind로 완료가 미확정이면
+원본 cause와 session/input을 유지하고 D `Pending`을 반환한다. 논리 취소·deadline이나
+mapping audit 성공은 `Ready`, `ActualCompute`, buffer 재사용의 근거가 되지 않는다.
+기존 runtime clone도 최초 mapping 실패의 process latch와 원본 typed cause를 소비한다.
+
+`rules_maia_check`는 실제 A의 immutable 상태·이력·합법 수를 투영하여 C 추론과 D
+finalization을 독립 Eigen 참조의 12개 사례와 비교한다. 기존 CPU 인자는 유지하며,
+CUDA는 마지막 `cpu`를 `cuda PROFILE_DIRECTORY CUDA_BUNDLE.json`으로 바꾼다.
+core 경로·SHA는 GPU bundle의 선언과 일치해야 하고, profile directory는 REPORT의
+저장소 밖 부모 아래 새 직계 디렉터리여야 한다. 두 history-fill profile은 각각 새
+placement prefix를 사용한다. CUDA 인수 보고에는 provider·native origin·bundle/placement
+증거·admission 선언·최종 mapping audit·drain과 원본 진단이 함께 들어간다.
+
+이 CUDA A/D 소스 추가와 주입 검사의 작성은 실제 실행 성공이 아니다. 실제 GPU 수치
+검사와 B UCI 연결·취소/root 교체는 총괄이 같은 integration SHA에서 별도로 인수한다.
+공통 계약 0.1의 fresh `ActualCompute`는 provider를 추가하지 않으며 정확한 backend
+identity와 검증된 native 출처를 함께 대조한다. B의 CPU V1 영수증을 GPU 영수증으로
+변환하지 않는다. D의 owner 관측 완료 시각·C worker 호출 시각·B의 backup 소비량을
+구분하는 D02 계측은 후속 작업이며, 이 예제는 종단 성능·강도 인수를 주장하지 않는다.
 
 직접 Rust dependency의 라이선스는 MIT OR Apache-2.0이며 ONNX Runtime 자체는 MIT와
 포함 third-party notices를 따른다. 선정 원본/ONNX는 upstream GPL-3.0 외부 자산이다.

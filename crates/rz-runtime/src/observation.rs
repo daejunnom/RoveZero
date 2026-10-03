@@ -42,7 +42,8 @@ pub enum ObservationKind<R, E, T> {
         /// Enqueued in the completion mailbox; does not mean received/backed up.
         delivered: bool,
     },
-    /// An owner-side ledger snapshot, not the exact time of a receiver's release.
+    /// A changed owner-side ledger snapshot, not the exact time of a receiver's
+    /// release. An unchanged idle/pending pump does not emit this event.
     ReservationChanged,
 }
 
@@ -66,17 +67,24 @@ pub struct ObservationDrain<R, E, T> {
     pub counter_overflow: bool,
 }
 
-pub(crate) struct Observations<R, E, T> {
-    events: VecDeque<Observation<R, E, T>>,
+pub(crate) struct ObservationBufferDrain<E> {
+    pub(crate) events: Vec<E>,
+    pub(crate) dropped: u64,
+    pub(crate) counter_overflow: bool,
+}
+
+/// Shared bounded storage for the separate scheduler and delivery fact streams.
+pub(crate) struct Observations<E> {
+    events: VecDeque<E>,
     limit: usize,
     dropped: u64,
     counter_overflow: bool,
 }
 
-impl<R, E, T> Observations<R, E, T> {
+impl<E> Observations<E> {
     pub(crate) fn try_new(limit: usize) -> Result<Self, RuntimeFault> {
         let bytes = limit
-            .checked_mul(size_of::<Observation<R, E, T>>())
+            .checked_mul(size_of::<E>())
             .ok_or(RuntimeFault::ResourceOverflow)?;
         if bytes > isize::MAX as usize {
             return Err(RuntimeFault::ResourceOverflow);
@@ -93,7 +101,7 @@ impl<R, E, T> Observations<R, E, T> {
         })
     }
 
-    pub(crate) fn push(&mut self, event: Observation<R, E, T>) {
+    pub(crate) fn push(&mut self, event: E) {
         if self.limit == 0 || self.events.len() == self.limit {
             if self.dropped == u64::MAX {
                 self.counter_overflow = true;
@@ -108,8 +116,8 @@ impl<R, E, T> Observations<R, E, T> {
         self.events.push_back(event);
     }
 
-    pub(crate) fn drain(&mut self) -> ObservationDrain<R, E, T> {
-        ObservationDrain {
+    pub(crate) fn drain(&mut self) -> ObservationBufferDrain<E> {
+        ObservationBufferDrain {
             events: self.events.drain(..).collect(),
             dropped: std::mem::take(&mut self.dropped),
             counter_overflow: std::mem::take(&mut self.counter_overflow),
@@ -171,7 +179,7 @@ mod tests {
     #[test]
     fn event_layout_overflow_is_rejected_before_allocation() {
         assert!(matches!(
-            Observations::<u64, u64, u64>::try_new(usize::MAX),
+            Observations::<Observation<u64, u64, u64>>::try_new(usize::MAX),
             Err(RuntimeFault::ResourceOverflow)
         ));
     }

@@ -23,6 +23,7 @@ all = "warn"
 rz-contracts = { path = "crates/rz-contracts", version = "0.1.0" }
 rz-position = { path = "crates/rz-position", version = "0.1.0" }
 rz-search = { path = "crates/rz-search", version = "0.1.0" }
+rz-uci = { path = "crates/rz-uci", version = "0.1.0" }
 rz-runtime = { path = "crates/rz-runtime", version = "0.1.0" }
 rz-telemetry = { path = "crates/rz-telemetry", version = "0.1.0" }
 rz-eval = { path = "crates/rz-eval", version = "0.1.0" }

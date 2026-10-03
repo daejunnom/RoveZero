@@ -151,6 +151,14 @@ pub struct ContractSearchOutcome {
     pub policy_identity: PolicyIdentity,
 }
 
+/// Passive metadata copied only after the final tree acceptance guard commits.
+/// It cannot authorize evaluation acceptance, another visit, or another backup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcceptedEvaluation {
+    pub context: CompletionContext,
+    pub actual: ActualCompute,
+}
+
 #[derive(Clone, Debug)]
 pub enum ContractPumpEvent {
     Submitted {
@@ -162,6 +170,8 @@ pub enum ContractPumpEvent {
         request: Option<RequestId>,
         selection: SelectionId,
         traversed_edges: usize,
+        /// Exact Rules terminals have no evaluator output and leave this empty.
+        evaluation: Option<Box<AcceptedEvaluation>>,
     },
     /// 다른 요청 또는 잘못 echo된 context는 현재 reservation을 소비하지 않는다.
     Diagnostic(ContractError),
@@ -663,7 +673,7 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
                 }
             },
         );
-        let event = self.commit_result(
+        let mut event = self.commit_result(
             completion,
             &pending.ticket,
             Some(pending.request.context().request),
@@ -674,6 +684,15 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             self.metrics = prepared_metrics;
             if let Some(execution) = output.actual.execution {
                 self.accepted_executions.insert(execution);
+            }
+            if let ContractPumpEvent::Accepted { evaluation, .. } = &mut event {
+                *evaluation = Some(Box::new(AcceptedEvaluation {
+                    context: CompletionContext {
+                        request: output.context,
+                        execution: output.actual.execution,
+                    },
+                    actual: output.actual,
+                }));
             }
         }
         event
@@ -733,6 +752,7 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
                     request,
                     selection,
                     traversed_edges,
+                    evaluation: None,
                 }
             }
             Ok(Completion::Rejected(_)) => {

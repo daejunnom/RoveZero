@@ -292,7 +292,22 @@ policy index·WDL 관점·누출·seed 계약이 충족된 후 진행한다. F03
   1/2/4/8/16을 대조했다. 실제 warm profile은 CUDA 98·CPU 0 kernel 이벤트이며 C worker도
   통과했다. 같은 최종 binary의 CPU 회귀도 통과했다. 전체 19-file native bundle·오차·
   장비·자원·실패·profile·source SHA는 [통합 인수 상태](INTEGRATION-STATUS.md)에 둔다.
-- 미완료: 실제 A/D GPU 요청·수명, process peak VRAM·GPU 종단 성능, 정식 대국·실제 Maia 파인튜닝,
+- 후속 실제 Rules/D GPU 수치 부분 인수: `f8b3ed5ea3f6fe7ed8f6fe68eb3b31c2daec6618`에서
+  immutable A 상태 12개(No 5·Repeat 7)를 C CUDA owner와 D로 처리해 기존 원본 참조에
+  대조했고, physical drain·예약 0과 같은 binary의 CPU 회귀를 확인했다. 이는 C/D fixture
+  수치 연결이며 제품 B의 전체 UCI 수명·소비와 E GPU runner의 인수는 별도다.
+- 후속 실제 CUDA UCI 부분 인수: `bd3e4e1`의 B/C/D 연결에서 실제 computed 완료와
+  최종 tree guard 뒤 root/non-root 소비, stop 직후 합법 fallback, 단 한 번의 유한 새 게임
+  NN 회복과 confirmed drain을 확인했다. CPU V1 회귀도 별도 실행했다. `e0d7e13`은
+  E import cfg만 수정했으며 재빌드한 UCI byte identity를 직접 확인했다. 모든 GPU
+  취소/deadline/root 조합이나 full physical journal의 완료로 확대하지 않는다.
+- 후속 실제 CUDA runner 부분 인수: `e45dd1050d8782ff4ae3e524341cdbac52209cf5`에서
+  C process worker의 session/TLS 종료와 B final join 조건을 연결하고 CPU/CUDA UCI를
+  실제 재검사했다. E 두 판의 네 fresh process 모두 actual CUDA·guarded search·drain·
+  실제 exit 0을 확인했다. 두 판은 6 ply cutoff의 Incomplete로 scored games 0이다.
+  최초 pair의 late SIGABRT·startup 실패도 보존하며, 수정 뒤 한 번의 성공을 모든 GPU
+  수명 조합이나 원인 확정·강도 개선으로 확대하지 않는다. 상세 근거는 통합 기록에 둔다.
+- 미완료: GPU 수명의 모든 실제 조합, process peak VRAM·GPU 종단 성능, 정식 대국·실제 Maia 파인튜닝,
   외부 배포 형태의 source/notice 충족 확인. T70 권리는 보류 유지.
-- 다음 작업: 총괄 I02가 실제 A/D GPU 연결·D02 종단 계측과 E 강도 gate를 각각 인수한다.
+- 다음 작업: 총괄 I02가 GPU 수명 추가 경계, D02 종단 계측과 E 강도 gate를 각각 인수한다.
   학습·장시간 대국의 구체적 예산은 실행 전에 확정한다.

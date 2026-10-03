@@ -24,6 +24,106 @@ const MAX_INNER_ARG_BYTES: usize = 16 * 1024;
 static NATIVE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static NATIVE_ADMISSION_CLOSED: AtomicBool = AtomicBool::new(false);
 
+/// Sealed executor views share file/process ownership, never provider profiles.
+/// The CPU and CUDA declarations retain distinct public types and lock domains.
+#[doc(hidden)]
+pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 'static {
+    fn input_sha256(&self) -> &str;
+    fn view(&self) -> NativePairView<'_>;
+    fn declared_inputs(&self) -> Vec<&ArtifactRef>;
+    fn unique_bytes(&self) -> Result<u64, rz_experiments::ManifestError>;
+    fn engine_view(
+        &self,
+        role: rz_experiments::NativeEngineRole,
+    ) -> Result<NativeEngineView<'_>, rz_experiments::ManifestError>;
+    fn provider_name(&self) -> &'static str;
+    fn additional_manifest(&self) -> Option<&ArtifactRef> {
+        None
+    }
+    fn validate_additional_manifest(&self, _bytes: &[u8]) -> Result<(), ArenaError> {
+        Ok(())
+    }
+}
+pub(crate) mod sealed {
+    pub trait Sealed {}
+}
+#[doc(hidden)]
+pub struct NativeEngineView<'a> {
+    pub engine_id: &'a str,
+    pub artifacts: &'a [rz_experiments::NativeArtifactBinding],
+    pub cuda_bundle: Option<&'a rz_experiments::CudaBundleBindingV1>,
+}
+impl NativeEngineView<'_> {
+    pub fn artifact(
+        &self,
+        role: rz_experiments::NativeArtifactRole,
+    ) -> Result<&ArtifactRef, ArenaError> {
+        let mut matching = self.artifacts.iter().filter(|b| b.role == role);
+        let first = matching
+            .next()
+            .ok_or_else(|| ArenaError::Integrity("native role lacks input".into()))?;
+        if matching.next().is_some() {
+            return Err(ArenaError::Integrity(
+                "native input role is duplicated".into(),
+            ));
+        }
+        Ok(&first.artifact)
+    }
+}
+#[doc(hidden)]
+pub struct NativePairView<'a> {
+    pub pair_id: &'a str,
+    pub white_order: [rz_experiments::NativeEngineRole; 2],
+    pub opening: &'a rz_experiments::OpeningSpec,
+    pub opening_artifact: &'a ArtifactRef,
+    pub runner: &'a rz_experiments::ToolIdentity,
+    pub clock: rz_experiments::NativeMovetimeV1,
+    pub max_plies: u32,
+    pub timeouts: rz_experiments::NativeTimeoutsV1,
+    // Shared observation bounds are an executor view, not a CPU spec conversion.
+    pub budget: rz_experiments::NativeResourceBudgetV1,
+}
+impl sealed::Sealed for LockedIntegrationPairSpecV1 {}
+impl NativeLaunchDeclaration for LockedIntegrationPairSpecV1 {
+    fn input_sha256(&self) -> &str {
+        self.sha256()
+    }
+    fn view(&self) -> NativePairView<'_> {
+        let p = self.input();
+        NativePairView {
+            pair_id: &p.pair_id,
+            white_order: p.white_order,
+            opening: &p.opening,
+            opening_artifact: &p.opening_artifact,
+            runner: &p.runner,
+            clock: p.clock,
+            max_plies: p.max_plies,
+            timeouts: p.timeouts,
+            budget: p.budget,
+        }
+    }
+    fn declared_inputs(&self) -> Vec<&ArtifactRef> {
+        self.declared_artifacts()
+    }
+    fn unique_bytes(&self) -> Result<u64, rz_experiments::ManifestError> {
+        self.unique_input_bytes()
+    }
+    fn engine_view(
+        &self,
+        role: rz_experiments::NativeEngineRole,
+    ) -> Result<NativeEngineView<'_>, rz_experiments::ManifestError> {
+        let engine = self.input().engine(role)?;
+        Ok(NativeEngineView {
+            engine_id: &engine.engine_id,
+            artifacts: &engine.artifacts,
+            cuda_bundle: None,
+        })
+    }
+    fn provider_name(&self) -> &'static str {
+        "CPU"
+    }
+}
+
 /// One active lease bounds unresolved retention to one whole launch bundle.
 pub(crate) struct NativeAdmissionLease {
     _private: (),
@@ -119,21 +219,21 @@ impl std::error::Error for NativePreparationFailure {}
 /// Owns every input pin, the exact cwd and both runtime output roots. There is
 /// deliberately no automatic file deletion. A pending run must retain this
 /// owner, even after a terminal leader if its process group remains unverified.
-pub struct NativeLaunchOwner {
-    pub(crate) spec: LockedIntegrationPairSpecV1,
+pub struct NativeLaunchOwner<S: NativeLaunchDeclaration = LockedIntegrationPairSpecV1> {
+    pub(crate) spec: S,
     pub(crate) _lease: NativeAdmissionLease,
     #[cfg(target_os = "linux")]
     pub(crate) snapshot: linux::Snapshot,
 }
-impl fmt::Debug for NativeLaunchOwner {
+impl<S: NativeLaunchDeclaration> fmt::Debug for NativeLaunchOwner<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NativeLaunchOwner")
-            .field("input_sha256", &self.spec.sha256())
+            .field("input_sha256", &self.spec.input_sha256())
             .finish_non_exhaustive()
     }
 }
-impl NativeLaunchOwner {
-    pub fn spec(&self) -> &LockedIntegrationPairSpecV1 {
+impl<S: NativeLaunchDeclaration> NativeLaunchOwner<S> {
+    pub fn spec(&self) -> &S {
         &self.spec
     }
     #[cfg(target_os = "linux")]
@@ -194,14 +294,22 @@ pub fn prepare_native_launch(
     output_root: &Path,
     output_directory: &str,
 ) -> Result<NativeLaunchOwner, Box<NativePreparationFailure>> {
-    let mut receipt=NativePreparationReceipt{receipt_version:1,execution_ready:false,input_sha256:spec.sha256().into(),
+    prepare_native_launch_for(spec, source_root, output_root, output_directory)
+}
+pub(crate) fn prepare_native_launch_for<S: NativeLaunchDeclaration>(
+    spec: &S,
+    source_root: &Path,
+    output_root: &Path,
+    output_directory: &str,
+) -> Result<NativeLaunchOwner<S>, Box<NativePreparationFailure>> {
+    let mut receipt=NativePreparationReceipt{receipt_version:1,execution_ready:false,input_sha256:spec.input_sha256().into(),
         output_directory:if safe_output_basename(output_directory){output_directory.into()}else{"rejected-basename".into()},
         attempt_created:false,attempted_snapshot_relative_paths:Vec::new(),completed_snapshots:Vec::new(),child_spawned:false,writers_closed:true,input_pins_required:false,original_error:String::new(),
         subsequent_file_owner:"caller retains exclusively owned outside-Git attempt; all writers are closed and no child was spawned, so input handles may be released; retained historical files are not a process-lifetime aggregate quota".into(),automatic_retry:false};
     #[cfg(target_os = "linux")]
     {
         let mut directory = None;
-        let result: Result<NativeLaunchOwner, ArenaError> = (|| {
+        let result: Result<NativeLaunchOwner<S>, ArenaError> = (|| {
             let lease = NativeAdmissionLease::acquire()?;
             let snapshot = linux::prepare(
                 spec,
@@ -222,7 +330,11 @@ pub fn prepare_native_launch(
             Err(cause) => {
                 receipt.original_error = cause.to_string().chars().take(4096).collect();
                 let persisted = if receipt.attempt_created {
-                    linux::save_preparation_failure(directory.as_ref(), &receipt)
+                    linux::save_preparation_failure(
+                        directory.as_ref(),
+                        &receipt,
+                        spec.provider_name(),
+                    )
                 } else {
                     Ok(None)
                 };
@@ -242,8 +354,10 @@ pub fn prepare_native_launch(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (spec, source_root, output_root, output_directory);
-        let cause =
-            ArenaError::Invalid("CPU NN integration runner currently requires Linux".into());
+        let cause = ArenaError::Invalid(format!(
+            "{} NN integration runner currently requires Linux",
+            spec.provider_name()
+        ));
         receipt.original_error = cause.to_string();
         Err(Box::new(NativePreparationFailure {
             cause,
@@ -295,6 +409,7 @@ pub(crate) mod linux {
         pub watch: OwnedArtifactTreeWatch,
         pub limits: ProcessLimits,
         pub _runtime_root_pins: [File; 2],
+        pub bundle_directory: Option<Dir>,
     }
 
     pub(crate) fn pin<'a>(
@@ -361,6 +476,7 @@ pub(crate) mod linux {
     pub(super) fn save_preparation_failure(
         directory: Option<&Dir>,
         receipt: &NativePreparationReceipt,
+        provider: &str,
     ) -> Result<Option<ArtifactRef>, ArenaError> {
         let directory = directory.ok_or_else(|| {
             io("failed attempt could not retain a directory capability for evidence saving")
@@ -396,7 +512,7 @@ pub(crate) mod linux {
             ),
             sha256: format!("{:x}", Sha256::digest(&bytes)),
             bytes: bytes.len() as u64,
-            source: "RoveZero CPU NN integration preparation evidence".into(),
+            source: format!("RoveZero {provider} NN integration preparation evidence"),
             license: "MIT execution evidence; external input rights remain separate".into(),
         }))
     }
@@ -529,8 +645,8 @@ pub(crate) mod linux {
         Ok(())
     }
 
-    pub(crate) fn prepare(
-        spec: &LockedIntegrationPairSpecV1,
+    pub(crate) fn prepare<S: NativeLaunchDeclaration>(
+        spec: &S,
         source_root: &Path,
         output_root: &Path,
         label: &str,
@@ -542,8 +658,8 @@ pub(crate) mod linux {
                 "native attempt requires a safe unique basename".into(),
             ));
         }
-        let input = spec.input();
-        let opening = crate::opening_pgn_for_spec(&input.opening, input.max_plies)?;
+        let input = spec.view();
+        let opening = crate::opening_pgn_for_spec(input.opening, input.max_plies)?;
         if opening.len() as u64 != input.opening_artifact.bytes
             || format!("{:x}", Sha256::digest(opening.as_bytes())) != input.opening_artifact.sha256
         {
@@ -551,12 +667,12 @@ pub(crate) mod linux {
                 "opening artifact differs from complete A-validated trace serialization".into(),
             ));
         }
-        let total = spec.unique_input_bytes()?;
+        let total = spec.unique_bytes()?;
         if total > input.budget.max_input_bytes {
             return Err(ArenaError::Budget("native input aggregate exceeded".into()));
         }
         let mut unique = BTreeMap::new();
-        for artifact in spec.declared_artifacts() {
+        for artifact in spec.declared_inputs() {
             if let Some(prior) = unique.insert(artifact.path.clone(), artifact.clone())
                 && prior != *artifact
             {
@@ -598,30 +714,101 @@ pub(crate) mod linux {
             .set_permissions(Permissions::from_mode(0o700))
             .map_err(|_| io("cannot make native input directory private"))?;
         let path = root_path.join(label);
+        let cuda_bundle = spec.engine_view(NativeEngineRole::Baseline)?.cuda_bundle;
+        let bundle_directory = if cuda_bundle.is_some() {
+            inputs
+                .create_dir("cuda-bundle")
+                .map_err(|_| io("cannot create exclusive CUDA input directory"))?;
+            let directory = inputs
+                .open_dir_nofollow("cuda-bundle")
+                .map_err(|_| io("cannot pin CUDA input directory"))?;
+            readable_directory_pin(&directory)?
+                .set_permissions(Permissions::from_mode(0o700))
+                .map_err(|_| io("cannot make CUDA input directory private"))?;
+            Some(directory)
+        } else {
+            None
+        };
         let mut pins = Vec::new();
         let mut receipts = Vec::new();
         for (index, artifact) in unique.values().enumerate() {
-            let name = format!("pin-{index:02}");
+            let bundle_name = cuda_bundle.and_then(|bundle| {
+                if &bundle.manifest == artifact {
+                    Some("bundle.v1.json")
+                } else {
+                    bundle
+                        .files
+                        .iter()
+                        .find(|entry| &entry.artifact == artifact)
+                        .map(|entry| entry.filename.as_str())
+                }
+            });
+            let name = bundle_name.map_or_else(
+                || format!("pin-{index:02}"),
+                |name| format!("cuda-bundle/{name}"),
+            );
             trace
                 .attempted_snapshot_relative_paths
                 .push(format!("inputs/{name}"));
             let executable = artifact == &input.runner.binary
-                || input.engines.iter().any(|e| {
-                    e.artifact(NativeArtifactRole::Binary)
-                        .is_ok_and(|a| a == artifact)
-                });
+                || [NativeEngineRole::Baseline, NativeEngineRole::Candidate]
+                    .into_iter()
+                    .any(|role| {
+                        spec.engine_view(role).is_ok_and(|e| {
+                            e.artifact(NativeArtifactRole::Binary)
+                                .is_ok_and(|a| a == artifact)
+                        })
+                    });
+            let destination = if let Some(name) = bundle_name {
+                (
+                    bundle_directory.as_ref().expect("bundle directory created"),
+                    name,
+                )
+            } else {
+                (&inputs, name.as_str())
+            };
             let (pin, receipt) = readonly_copy(
                 artifact,
                 source_root,
-                &inputs,
-                &name,
+                destination.0,
+                destination.1,
                 path.join("inputs").join(&name),
                 executable,
                 input.budget.max_input_bytes,
             )?;
+            let receipt = NativeSnapshotReceipt {
+                snapshot_relative_path: format!("inputs/{name}"),
+                ..receipt
+            };
             trace.completed_snapshots.push(receipt.clone());
             pins.push(pin);
             receipts.push(receipt);
+        }
+        // Additional metadata is read only after all complete private copies
+        // exist. A malformed manifest cannot produce a native executable owner.
+        if let Some(manifest) = spec.additional_manifest() {
+            let manifest = pin(&pins, manifest)?;
+            let mut file = manifest
+                .file
+                .try_clone()
+                .map_err(|_| io("cannot clone CUDA bundle manifest pin"))?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(|_| io("cannot rewind CUDA bundle manifest pin"))?;
+            let mut bytes = Vec::new();
+            file.take(64 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| io("cannot read CUDA bundle manifest pin"))?;
+            if bytes.len() > 64 * 1024 {
+                return Err(ArenaError::Budget(
+                    "CUDA bundle manifest exceeds 64KiB".into(),
+                ));
+            }
+            spec.validate_additional_manifest(&bytes)?;
+        }
+        if let Some(bundle) = &bundle_directory {
+            readable_directory_pin(bundle)?
+                .set_permissions(Permissions::from_mode(0o500))
+                .map_err(|_| io("cannot close CUDA input directory to writes"))?;
         }
         readable_directory_pin(&inputs)?
             .set_permissions(Permissions::from_mode(0o500))
@@ -708,6 +895,7 @@ pub(crate) mod linux {
             _runtime_root_pins: runtime_root_pins.try_into().map_err(|_| {
                 ArenaError::Integrity("native runtime root pin count differs".into())
             })?,
+            bundle_directory,
         })
     }
 
@@ -722,13 +910,13 @@ pub(crate) mod linux {
         }
         Ok(format!("{key}{value}").into())
     }
-    pub(crate) fn build_invocation(
-        spec: &LockedIntegrationPairSpecV1,
+    pub(crate) fn build_invocation<S: NativeLaunchDeclaration>(
+        spec: &S,
         pins: &[InputPin],
         cwd: &Path,
         roots: &[PathBuf; 2],
     ) -> Result<FastchessInvocation, ArenaError> {
-        let input = spec.input();
+        let input = spec.view();
         if input.runner.source_url != crate::FASTCHESS_SOURCE_URL
             || input.runner.source_commit != crate::FASTCHESS_SOURCE_COMMIT
             || input.runner.version != crate::FASTCHESS_VERSION
@@ -752,14 +940,18 @@ pub(crate) mod linux {
             })?;
         let mut args = Vec::new();
         for role in input.white_order {
-            let engine = input.engine(role)?;
+            let engine = spec.engine_view(role)?;
             let binary = pin(pins, engine.artifact(NativeArtifactRole::Binary)?)?;
             let root = &roots[match role {
                 NativeEngineRole::Baseline => 0,
                 NativeEngineRole::Candidate => 1,
             }];
             let mut tokens = vec![
-                OsString::from("--onnx-cpu"),
+                OsString::from(if engine.cuda_bundle.is_some() {
+                    "--onnx-cuda"
+                } else {
+                    "--onnx-cpu"
+                }),
                 OsString::from("--attestation"),
             ];
             for (flag, kind) in [
@@ -785,6 +977,13 @@ pub(crate) mod linux {
                 .into(),
             );
             tokens.push(key_path("--output-root=", root)?);
+            if let Some(bundle) = engine.cuda_bundle {
+                tokens.push(key_path(
+                    "--cuda-bundle=",
+                    &pin(pins, &bundle.manifest)?.path,
+                )?);
+                tokens.push(format!("--cuda-bundle-sha256={}", bundle.manifest.sha256).into());
+            }
             args.extend([
                 OsString::from("-engine"),
                 key_path("cmd=", &binary.path)?,
@@ -793,7 +992,7 @@ pub(crate) mod linux {
                 encode_fastchess_native_args(&tokens)?,
             ]);
         }
-        let opening = &pin(pins, &input.opening_artifact)?.path;
+        let opening = &pin(pins, input.opening_artifact)?.path;
         args.extend([
             "-each".into(),
             "proto=uci".into(),
@@ -847,8 +1046,8 @@ pub(crate) mod linux {
             "realtime=true".into(),
             "engine=true".into(),
         ]);
-        Ok(FastchessInvocation{args,limitations:[
-            "CPU NN integration only; execution_ready=false; strength_eligible=false; same weights and search in both roles",
+        let mut limitations=[
+            "NN integration only; execution_ready=false; strength_eligible=false; same weights and search in both roles",
             "private input copies use separate inodes and closed writers; Unix readonly is an ownership convention, not a same-UID sandbox or immutable seal",
             "trusted pinned programs and parent exclusively own snapshots and runtime output ancestors throughout execution and pending retention",
             "Fastchess movetime and its internal 100ms read margin do not attest the shared whole-engine clock contract",
@@ -856,6 +1055,14 @@ pub(crate) mod linux {
             "owned-tree/process snapshots are observed limits, not aggregate RAM or kernel disk quotas; escaped/transient children are outside the process-group guarantee",
             "per-process address-space declaration requires separately recorded inherited enforcement; this library does not install RAM/CPU affinity limits",
             "process cleanup alone is not physical NN drain; matched bounded B startup/final provider records are required separately",
-        ].map(String::from).to_vec()})
+        ].map(String::from).to_vec();
+        limitations[0] = format!(
+            "{} NN integration only; execution_ready=false; strength_eligible=false; same weights and search in both roles",
+            spec.provider_name()
+        );
+        if spec.provider_name() == "CUDA" {
+            limitations.push("CUDA device0/FP32/TF32off/1GiB arena is requested admission metadata, not measured VRAM, aggregate GPU allocation or a kernel-enforced hard cap".into());
+        }
+        Ok(FastchessInvocation { args, limitations })
     }
 }

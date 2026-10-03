@@ -201,6 +201,60 @@ Rust 1.96.0·workspace MSRV 1.90을 사용하며 정확한 integration SHA와 �
 [총괄 인수 기록](../../docs/INTEGRATION-STATUS.md)에 따로 기록한다.
 receipt의 초기 contract/rules source pin을 현재 binary의 integration SHA로 해석하지 않는다.
 
+## Additive CUDA integration 소비자
+
+`native-cuda` feature는 B의 별도 `CudaStartupReceiptV1`·`CudaTerminationReceiptV1`을
+소비한다. CPU V1 profile·파일명·wire 검증은 그대로 유지하며, GPU 입력은
+`CudaIntegrationPairSpecV1`의 별도 lock domain으로 잠근다. library API는
+`prepare_native_cuda_launch`와 `run_native_cuda_pair`다. CUDA provider를 명시적으로
+선택하지 않은 CPU 경로에 GPU 설정이나 proof를 넣지 않는다.
+
+Feature를 포함해 빌드한 CLI에는 `native-cuda-lock INPUT OUTPUT`와
+`native-cuda-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME`을 제공한다.
+입력/lock은 64 KiB로 제한하고 새 output만 생성한다. Pair 명령의 SIGINT/SIGTERM은
+기존 CPU 경로와 같은 유한 supervisor 취소 신호로 전달한다. typed preparation와
+실행 실패 영수증을 stderr에도 보존하며 실패·미확인 cleanup을 성공 exit로 바꾸지 않는다.
+Default feature의 CPU 명령·기본 help와 CPU wire는 유지한다.
+
+GPU 명세는 device 0·FP32·TF32 off·batch 1·intra 1·worker 1·fresh/full 1·HistoryFill No와
+1 GiB arena admission을 요구한다. 이 설정은 측정된 VRAM이나 aggregate allocation·
+강제 hard cap의 증거가 아니다. raw manifest SHA, canonical binary-codec bundle SHA,
+ORT Core identity는 각각 잠그며 19개 알려진 library filename·role·길이·SHA를 모두
+검사한다. 두 엔진은 같은 source·asset·runtime·profile 입력을 사용한다.
+
+GPU budget은 CPU 소형 input/tree 예약과 별도로 선언한다. 고유 입력 전체와
+restart 두 판의 native process 네 개를 위한 **bundle 복사 네 회 + 18 MiB**를
+runtime 예약에 포함한다. 18 MiB는 process당 4 MiB placement trace와 512 KiB
+startup/final receipt 상한의 합이다. retained stream·PGN·config·E receipt는
+output 예약에 포함하고, 전체 artifact 예약은 input/runtime/output 상한을 덮는다.
+tree snapshot은 관측 한도이며 disk·RAM·VRAM의 kernel quota를 설치하지 않는다.
+
+준비 단계는 manifest와 19개 library를 private `inputs/cuda-bundle/`에 서로 다른
+inode·닫힌 writer·readonly 파일로 복사해 sibling basename을 보존한다. readonly
+권한은 immutable seal이나 같은 UID에 대한 sandbox가 아니다. 총괄이 ancestor와
+output을 독점하며 pinned program을 신뢰하는 실행 가정을 유지한다. 원본 오류와
+준비 실패 attempt의 파일 소유자를 보존하고 기존 attempt를 자동 재사용하지 않는다.
+spawn 후 cleanup이 미확인인 경우 입력·cwd·lease·원래 Child·receipt를 함께 보존하고
+단일 shared native admission을 닫는다. CPU와 CUDA에 각각 새 unresolved slot을 만들지 않는다.
+
+인수에는 Exited 0·Gone·pending child 부재·process 오류 부재, 네 unique native session,
+matching binary/asset/bundle/profile, CudaOnnx의 D accepted computed completion,
+최종 tree guard가 수락한 root/non-root consumption, confirmed physical drain과 A PGN
+감사를 각각 요구한다. B의 observed placement trace SHA는 사전에 잠그지 않는다.
+해당 PID의 알려진 runtime directory에 단일 bounded regular trace가 있는지 확인하고
+실제 bytes·SHA·CUDA kernel provider·node count를 사후 대조한다. 추가·모호한 후보,
+symlink·hardlink·CPU node·누락 기록·손실/overflow·원래 오류는 인수를 거부한다.
+
+합성 metadata·wire·snapshot 테스트는 parser와 거부 경로의 검사다. 이 additive
+소비자의 build/test·실제 GPU pair 실행은 source SHA별 총괄 인수로 기록한다.
+`e45dd1050d8782ff4ae3e524341cdbac52209cf5`의 실제 CUDA integration pair는 네 native
+session의 computed/search/drain과 각 PID의 Fastchess 종료 TRACE status 0을 확인했다.
+그 전의 late SIGABRT·startup timeout 실패도 보존한다. 원본과 검사 범위는
+[통합 인수 상태](../../docs/INTEGRATION-STATUS.md)에 둔다.
+성공 receipt도 `execution_ready=false`, `strength_eligible=false`,
+`scored_games=0`이며 cutoff draw는 Incomplete다. placement probe 및 process aggregate를
+모든 root/bestmove의 실제 NN 실행 수나 모델 강도 증거로 확대하지 않는다.
+
 ## 후속 실행 자료 인수
 
 E `91818e3d1309592cff561aa925688446c4a2e4e4`의 공개 보존 사본 454개 파일을

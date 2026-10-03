@@ -700,7 +700,7 @@ fn project(run: impl FnOnce(&mut Budget) -> Projection) -> CauseReceiptV1 {
 pub(crate) fn contract(error: &ContractError) -> CauseReceiptV1 {
     project(|budget| budget.contract(error, 1))
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "onnx-cuda"))]
 pub(crate) fn backend(error: &BackendError) -> CauseReceiptV1 {
     project(|budget| budget.backend(error, 1))
 }
