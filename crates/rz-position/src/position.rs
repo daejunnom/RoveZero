@@ -135,9 +135,18 @@ impl PositionSnapshot {
     pub fn known_history_len(&self) -> usize {
         self.identity.history.len
     }
-    #[cfg(feature = "contracts")]
+    #[cfg(all(feature = "contracts", not(feature = "experimental-history-digest")))]
     pub(crate) fn is_irreversible_boundary(&self) -> bool {
         self.identity.history.irreversible
+    }
+    #[cfg(feature = "experimental-history-digest")]
+    pub(crate) fn history_states(&self) -> impl Iterator<Item = (&CoreState, bool)> + '_ {
+        let mut at = Some(self.identity.history.as_ref());
+        std::iter::from_fn(move || {
+            let node = at?;
+            at = node.previous.as_deref();
+            Some((&node.state, node.irreversible))
+        })
     }
     /// Explicit audit helper. Encoding reads raw history without fabricating fill.
     pub fn known_history_fens(&self) -> Vec<String> {
@@ -600,7 +609,7 @@ impl Position {
 
     #[cfg(feature = "experimental-claim-preview")]
     pub(crate) fn repetition_evidence(&self) -> RepetitionEvidence {
-        repetition_evidence(Some(&self.history), &self.history.repetition, 0)
+        repetition_evidence(Some(self.history.as_ref()), &self.history.repetition, 0)
     }
 
     /// Check the same transition as a real move, then compare its repetition
@@ -619,7 +628,7 @@ impl Position {
                 complete: true,
             }
         } else {
-            repetition_evidence(Some(&self.history), &checked.repetition, 1)
+            repetition_evidence(Some(self.history.as_ref()), &checked.repetition, 1)
         };
         Ok((evidence, checked.state.halfmove))
     }

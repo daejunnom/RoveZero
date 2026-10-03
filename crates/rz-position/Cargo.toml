@@ -14,6 +14,8 @@ default = []
 contracts = ["dep:rz-contracts", "dep:sha2"]
 # Opt-in experiments; the existing owned claim preview remains the default.
 experimental-claim-preview = []
+# Preserve the digest codec; borrow history and memoize only this live owner.
+experimental-history-digest = ["contracts"]
 
 [dependencies]
 rz-contracts = { workspace = true, optional = true }

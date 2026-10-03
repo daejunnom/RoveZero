@@ -224,8 +224,7 @@ pub(crate) fn parse(fen: &str, limits: PositionLimits) -> Result<CoreState, Posi
     Ok(state)
 }
 
-pub(crate) fn format(state: &CoreState) -> String {
-    let mut s = String::new();
+fn format_board_fields(state: &CoreState, s: &mut String) {
     for rank in (0..8).rev() {
         let mut empty = 0u8;
         for file in 0..8 {
@@ -272,6 +271,11 @@ pub(crate) fn format(state: &CoreState) -> String {
             }
         }
     }
+}
+
+pub(crate) fn format(state: &CoreState) -> String {
+    let mut s = String::new();
+    format_board_fields(state, &mut s);
     s.push(' ');
     s.push_str(
         &state
@@ -281,4 +285,65 @@ pub(crate) fn format(state: &CoreState) -> String {
     );
     s.push_str(&format!(" {} {}", state.halfmove, state.fullmove));
     s
+}
+
+/// Reuse one buffer for the canonical digest frames. The longest representation
+/// is 64 pieces + seven '/' + side/rights/EP + two ten-digit u32 counters.
+#[cfg(feature = "experimental-history-digest")]
+pub(crate) const MAX_CANONICAL_FEN_BYTES: usize = 103;
+
+#[cfg(feature = "experimental-history-digest")]
+pub(crate) fn format_into(state: &CoreState, buffer: &mut String) {
+    use std::fmt::Write;
+    buffer.clear();
+    format_board_fields(state, buffer);
+    buffer.push(' ');
+    if let Some(target) = state.ep {
+        buffer.push(char::from(b'a' + target.file()));
+        buffer.push(char::from(b'1' + target.rank()));
+    } else {
+        buffer.push('-');
+    }
+    write!(buffer, " {} {}", state.halfmove, state.fullmove)
+        .expect("formatting into a String cannot fail");
+}
+
+#[cfg(all(test, feature = "experimental-history-digest"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reusable_fen_frames_match_owned_format_and_keep_their_capacity() {
+        let mut positions = vec![crate::Position::startpos()];
+        for input in [
+            "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+            "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2",
+            "4k3/8/8/8/3Pp3/8/8/4K3 b - d3 0 2",
+            "1r2k3/P7/8/8/8/8/7p/R3K3 w Q - 99 1",
+            "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 4294967295 4294967295",
+        ] {
+            positions.push(crate::Position::from_fen(input).unwrap());
+        }
+        let mut trace = crate::Position::startpos();
+        for index in 0..128 {
+            trace
+                .make_uci(["g1f3", "g8f6", "f3g1", "f6g8"][index % 4])
+                .unwrap();
+        }
+        positions.push(trace);
+        let mut buffer = String::with_capacity(MAX_CANONICAL_FEN_BYTES);
+        let capacity = buffer.capacity();
+        buffer.push_str("old content must be cleared");
+        for position in positions {
+            for (state, _) in position.snapshot().history_states() {
+                // Exercise reuse even after a preceding frame's different length.
+                format_into(state, &mut buffer);
+                assert_eq!(buffer, format(state));
+                assert!(buffer.len() <= MAX_CANONICAL_FEN_BYTES);
+                assert_eq!(buffer.capacity(), capacity);
+                let reparsed = parse(&buffer, PositionLimits::default()).unwrap();
+                assert_eq!(format(&reparsed), buffer);
+            }
+        }
+    }
 }

@@ -21,6 +21,14 @@ history/revision/counter 검사를 사용하며 claim 순서·unknown-prefix·�
 실험 경로를 검사한다. 이것은 의미 보존(E) 가설의 실험 구현이며 성능·GPU·강도 인수는
 별도다. [계획의 반복 측정·테스트 항목](../../docs/research/PERFORMANCE-OPTIMIZATION-PLAN.md)을 따른다.
 
+`experimental-history-digest`도 기본 비활성이며 `contracts`를 함께 활성화한다.
+현재 canonical FEN·newest-first framing을 유지하면서 하나의 직렬화 버퍼로 빌린 이력을
+해시한다. 같은 `ContractPosition`의 재-export에는 digest 한 개만 재사용하고 성공한
+make/unmake 뒤에는 폐기한다. fork는 새 owner의 빈 cache로 시작한다. 합법 수·classification·
+live-view 검사는 매번 수행한다. 이 cache는 모델 평가 cache나 증분 hash codec이 아니다.
+`cargo test -p rz-position --features experimental-history-digest --locked`로 별도 검사한다.
+두 feature는 독립적으로 비교하며 `--all-features`는 함께 켠 경로도 검사한다.
+
 ## 제공하는 동작
 
 - `Position::startpos/from_fen`: 64칸·bitboard, 차례·권리·raw EP·u32 카운터를 보존한다.
