@@ -246,8 +246,12 @@ matching binary/asset/bundle/profile, CudaOnnx의 D accepted computed completion
 symlink·hardlink·CPU node·누락 기록·손실/overflow·원래 오류는 인수를 거부한다.
 
 합성 metadata·wire·snapshot 테스트는 parser와 거부 경로의 검사다. 이 additive
-소비자의 build/test·실제 GPU pair 실행은 총괄의 동일 source SHA 인수 전까지
-미실행으로 남긴다. 성공 receipt도 `execution_ready=false`, `strength_eligible=false`,
+소비자의 build/test·실제 GPU pair 실행은 source SHA별 총괄 인수로 기록한다.
+`e45dd1050d8782ff4ae3e524341cdbac52209cf5`의 실제 CUDA integration pair는 네 native
+session의 computed/search/drain과 각 PID의 Fastchess 종료 TRACE status 0을 확인했다.
+그 전의 late SIGABRT·startup timeout 실패도 보존한다. 원본과 검사 범위는
+[통합 인수 상태](../../docs/INTEGRATION-STATUS.md)에 둔다.
+성공 receipt도 `execution_ready=false`, `strength_eligible=false`,
 `scored_games=0`이며 cutoff draw는 Incomplete다. placement probe 및 process aggregate를
 모든 root/bestmove의 실제 NN 실행 수나 모델 강도 증거로 확대하지 않는다.
 

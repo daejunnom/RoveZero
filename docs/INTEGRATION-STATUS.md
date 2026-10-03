@@ -76,10 +76,10 @@ worker당 원본 하나를 owner mailbox에 둔다. 정확한 ticket·completion
 | Source 반입·adapter | 위 source pins, 단일 계약 path와 root 10개 crate 전체 target/feature 검사 성공 | 새 head 변경마다 영향 consumer 재검증 |
 | CPU/mock binary·trace | A→C→D→B async binary, C bridge 6개, UCI library 33개·실제 binary 7개가 전체 workspace 검사에 포함돼 성공 | 명시적 `--cpu-mock`; NN·GPU 인수는 별도 |
 | 실제 CPU NN | 아래 a9a5ae7에서 선정 Maia·고정 LC0 Eigen 참조·ORT CPU와 실제 A→C→D·B UCI 연결 성공 | Linux CPU/FP32·지정 fixture·정상 완료 범위; 실제 Windows NN·목표 GPU는 별도 |
-| 목표 GPU | 아래 CUDA provider 수치·12개 실제 A 상태→D·B UCI v2를 각각 인수 | 첫 E CUDA pair 실패 보존; worker 종료 보완·pair 재검증·전체 수명·process peak VRAM·D02 종단 계측 pending |
+| 목표 GPU | 아래 CUDA provider 수치·12개 실제 A 상태→D·B UCI와 e45dd10의 실제 CUDA integration pair를 각각 인수 | 첫 실패 보존; GPU 수명의 모든 조합·process peak VRAM·D02 종단 계측 pending |
 | 실제 F02 학습 | F CPU 숫자 fixture gradient·checkpoint/export/resume 제공; 총괄 Linux F 검사 105개 성공 | 실제 Maia 학습·실제 encoder·검증 data·유한 예산·CONTROL-1→2 인수 pending |
 | E 합성 fixture | 고정 Fastchess의 실제 paired 실행·A/독립 PGN 대조·artifact 사전 거부·live 취소를 아래에서 인수 | 합성 script·Linux CPU만 해당; NN·GPU·정식 시계/자원과 구분 |
-| 정식 paired 대국 | E manifest·pair planner·attempt ledger·원시 WDL/n0..n4와 아래 CPU NN integration pair 제공 | CUDA pair·정식 시계/자원·군집 통계·holdout 및 강도 인수 pending |
+| 정식 paired 대국 | E manifest·pair planner·attempt ledger·원시 WDL/n0..n4와 아래 CPU/CUDA NN integration pair 제공 | 정식 시계/자원·군집 통계·holdout 및 강도 인수 pending |
 
 이전 E source 리뷰의 test 선언 74개(Unix 조건부 4개)는 당시의 정의 수이며 최신 E
 실행 결과로 재사용하지 않는다. F source의 test method 105개와 아래 실제 105개 성공도
@@ -682,3 +682,90 @@ all-target/all-feature 검사는 **673 passed / 0 failed / 16 ignored**, 기본 
 4 passed이며 fmt와 strict clippy도 통과했다. 새 의미 검사 17개는 destructor/TLS
 지연·생성 실패·panic·Q·admission·root 재사용과 네 PID의 종료 기록을 검사한다.
 이는 CPU/mock source 인수이며 수정 후 실제 CUDA UCI/pair는 별도 실행으로 기록한다.
+
+## worker 종료 보완 뒤 실제 CUDA pair 인수
+
+실행 source는 `e45dd1050d8782ff4ae3e524341cdbac52209cf5`이며,
+[CI 37089717057](https://github.com/daejunnom/RoveZero/actions/runs/37089717057)은
+Ubuntu·Windows 모두 성공했다. 같은 깨끗한 tree에서 CUDA feature를 명시해 release
+빌드하고 source·root lock·Rust 1.96.0·명령·binary를 외부 build receipt로 고정했다.
+WSL의 Git은 Windows worktree gitfile을 해석하지 못하므로 source HEAD와 clean 상태는
+Windows Git에서 snapshot 전후 직접 확인했다. 이는 source/binary 출처 확인이며
+기존 binary를 새로운 source의 산출물로 재명명한 결과가 아니다.
+
+| source e45dd10 산출물 | bytes | SHA-256 |
+|---|---:|---|
+| CUDA/CPU UCI binary | 3,001,096 | `d94ca3ab481335dd1414d3cb8465d97b67a99126fa96fb5f950818d1f6d05c3f` |
+| CUDA arena binary | 4,561,000 | `64f23a415a3cd87f2c74a03264b535cdc8cd93bd7ae92c32d881e890b127c9dd` |
+| 실제 build receipt | 1,244 | `1e7ce6dbea9733a12d8f1beece250a6b81b948a0a28363783cefa3a329716a9b` |
+
+새 실제 UCI v2 gate는 CUDA와 명시 CPU 모두 exit 0·confirmed drain·원래 오류 없음으로
+끝났다. 각각 다섯 opening fixture 착수는 `e2e4, c7c5, e2e4, g8f6, g8f6`이다. 이번
+stderr에는 Stale 진단이 있지만 WorkerLimit/fallback 진입 근거가 없으므로 과거 v2의
+네 번째 busy fallback 결과를 이번 실행으로 옮기지 않는다. CUDA D computed 완료는
+54개, B guarded root 초기화 5개·non-root backup 49개다. CPU D 완료는 61개다.
+마지막 문맥은 game 3/root 12이며, CUDA drain-discarded result 1개와 observation
+손실 0·overflow false를 구분한다. 모든 결과가 탐색에 소비됐다고 주장하지 않는다.
+새 CUDA warm trace는 CUDA kernel 98·CPU 0이며 실제 SHA는
+`2cd6c956ab8a2cbf9d8f9cd8eb03d76df45fb48f7dcf71d1331bf33d8409e01c`다.
+CUDA gate SHA는 `c733eec25df2467e2d917d036da68f1fd0fa96f758eefc4a2f8fe38a4473d4bd`,
+CPU gate SHA는 `164148d94a85c4e8cae83005753b8576bbc46635692f07488ec642fa2b04c2de`다.
+UCI metadata 15개·100,240 bytes를 Windows 외부 root로 회수하고 각각 hash를 확인했다.
+회수 receipt SHA는 `9fea0af9e326937f7731a6c6b32180164a47cbb12b819efa0a5d9dbee932a388`다.
+
+같은 source의 새 E attempt `pair-e45dd10-v1`은 첫 실패와 다른 namespace에서 **단 한
+번** 실행했고 실제 인수에 성공했다. 가중치·bundle·FP32·TF32 off·device 0·B1·thread/
+worker 1·HistoryFill No·같은 시작 상태를 유지했다. 준비·hash·copy·bootstrap·runner·
+최종 검증·cleanup을 포함한 전체 시간은 **199.576초**, Fastchess 자체 실행은
+174.767초다. 두 숫자를 추론 지연이나 D03 속도 효과로 사용하지 않는다.
+
+| 실제 native PID | 역할 | D computed | B guarded root / non-root | 종료 |
+|---:|---|---:|---:|---|
+| 369 | baseline, 첫 판 | 258 | 2 / 256 | final 정상, 실제 exit 0 |
+| 392 | candidate, 첫 판 | 258 | 2 / 256 | final 정상, 실제 exit 0 |
+| 414 | candidate, 둘째 판 | 258 | 2 / 256 | final 정상, 실제 exit 0 |
+| 442 | baseline, 둘째 판 | 258 | 2 / 256 | final 정상, 실제 exit 0 |
+
+네 startup/final의 loaded origin·binary·모델·encoding·backend·19개 bundle·새 placement
+digest를 맞췄다. 네 프로세스 모두 실제 CUDA 추론과 Rules search 소비를 기록하고,
+original/collection/mapping failure·report failure·overflow 없이 physical drain과
+session/worker join을 확인했다. 각 새 trace의 CUDA Node는 98개이며 CPU Node는 0이다.
+이 warm trace와 D 총 1,032개·root 8개·non-root 1,024개의 process aggregate를
+전체 physical inference journal이나 모든 root의 일대일 성능 기록으로 합치지 않는다.
+네 PID 각각의 고정 Fastchess 종료 TRACE status 0을 source gate와 별도로 확인했다.
+runner exit 0·CLI exit 0·Gone·pending child 없음·unresolved owner 없음도 확인했다.
+
+PGN은 동일 startpos의 `e2e4 e7e5`를 포함해 두 판 각각 6 ply이며 baseline/candidate의
+흑백 배정이 바뀐다. A 감사에서 두 판 모두 **Incomplete**로 분류하고 scored games는
+0이다. `integration_checks_passed=true`와 `execution_ready=false`,
+`strength_eligible=false`를 함께 유지한다. 정식 LC0 비교나 승률 개선의 증거가 아니다.
+E receipt SHA는 `c53c0c81039ca8cad21d71abbaad90c666e968d9edaea22fbfdfe5b756cc5095`,
+PGN SHA는 `5a913de0c1826065d0d7a715d8b9e42a41f1687d667264bccad4ceb3f4cd2726`다.
+
+외부 helper v2는 기존 v1의 자원·실행 통제를 유지하고 종료 시점의 owned cgroup
+`memory.current/stat/pressure` 조회만 추가했다. helper SHA는
+`a5fc34ef0b12d218f0270fdabf663a5c379586478e3bbddf8dcd078725e62007`이다.
+동일한 wall 300초·cleanup 10초·RAM 8 GiB·swap 0·CPU 2 core·pids 128·per-process
+AS 128 GiB·단일 파일 1 GiB 상한을 실제 적용했다. cgroup peak는 8 GiB 상한,
+max event 197,004·OOM/kill 0이고 sampled aggregate RSS는 1,800,077,312 bytes다.
+종료 시점 file charge는 8,512,729,088 bytes·anon 0, memory pressure full 누적은
+4,458,942 microseconds다. 이는 종료 시점/누적 관측이며 최초 SIGABRT의 원인이나
+전체 시간대별 메모리 구성의 증거가 아니다. native destructor 보완 뒤 이 한 번의
+실행에서 abort가 없었다는 사실과 근본 원인 확정·모든 종료 조합 검증을 구분한다.
+
+전용 cgroup의 잔여 PID와 original/cleanup/preservation 오류 없이 종료하고 cgroup을
+제거했다. 성공 metadata·recipe·helper·build 자료 **31개·511,927 bytes**를 저장소 밖
+`reports/coordinator-integration/native-gpu/captured-pair-e45dd10-v1/`에 회수하여 각
+길이·SHA를 확인했다. 회수 receipt SHA는
+`af7d694e1fa63f29f57f7870b41723117e261bc3b024b8bcc89729c223428c21`이다.
+첫 실패와 성공의 raw PGN·receipt·로그·private copies는 별도로 보존한다.
+
+별도 담당의 읽기 전용 감사에서도 UCI 두 gate·E의 작은 receipt/log/placement 자료,
+16개 retained artifact의 실제 bytes/hash, locked spec→26개 snapshot의 ArtifactRef→네
+startup/final·PID·TRACE를 대조해 제한된 연결 인수의 차단 사항을 찾지 못했다.
+이 감사는 binary·모델·19개 library 원시 bytes의 독립 재해시나 새 GPU 실행이 아니다.
+가장 느린 `uci`→`uciok`는 53.899초로 60초 한도 안에 들었고, `quit`→실제 종료 TRACE는
+0.701~1.302초다. TRACE 간격을 worker join 함수만의 측정값으로 사용하지 않는다.
+
+D02 GPU 종단 source clock/journal·P50/P95/P99·process peak VRAM, D03 단일 runtime
+개선, 실제 Maia F02 학습, 정식 LC0 paired 강도·통계는 여전히 별도 인수다.
