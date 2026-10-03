@@ -16,6 +16,8 @@ pub mod native_attestation;
 pub mod native_bootstrap;
 #[cfg(feature = "onnx-cuda")]
 pub mod native_cuda_attestation;
+#[cfg(feature = "onnx-cpu")]
+pub mod native_profile;
 pub mod parser;
 pub mod runner;
 pub mod session;

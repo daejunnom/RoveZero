@@ -2,8 +2,10 @@ use rz_contracts::ProcessEpoch;
 #[cfg(feature = "onnx-cpu")]
 use rz_uci::{
     EngineIdentity,
+    engine::EvaluatorFactory,
     native_attestation::{ReceiptWriter, StartupReceiptV1, TerminationReceiptV1},
     native_bootstrap::{NativeConfig, NativeCpuFactory, NativeProvider},
+    native_profile::{ProfileWriter, ProfiledWrite},
 };
 use rz_uci::{
     bootstrap::CpuMockFactory,
@@ -86,6 +88,12 @@ fn run_cpu(config: NativeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let owners = Arc::new(OwnerRegistry::default());
     let clock = ProcessClock::new(ProcessEpoch(1));
     let factory = Arc::new(NativeCpuFactory::load(&owners, &config)?);
+    let trace = factory.source_trace();
+    let mut profile_writer = if config.profiling_requested() {
+        Some(ProfileWriter::open(&config)?)
+    } else {
+        None
+    };
     let mut receipts = if config.attestation_requested() {
         Some(ReceiptWriter::open(&config)?)
     } else {
@@ -109,7 +117,7 @@ fn run_cpu(config: NativeConfig) -> Result<(), Box<dyn std::error::Error>> {
     };
     // Retain the native owner outside EngineProcess. Report/drain acceptance runs
     // for both successful protocol service and EngineError; neither implies GPU support.
-    let served = serve_process(process, settings);
+    let served = serve_native_process(process, settings, trace.clone());
     let finished = factory.finish(served);
     if let (Some(writer), Some(startup)) = (receipts.as_mut(), startup.as_ref()) {
         let receipt = match TerminationReceiptV1::from_result(startup, &finished) {
@@ -120,6 +128,11 @@ fn run_cpu(config: NativeConfig) -> Result<(), Box<dyn std::error::Error>> {
             // Publication must not replace an original service/drain failure.
             return Err(Box::new(error.retaining(finished)));
         }
+    }
+    if let (Some(writer), Some(trace)) = (profile_writer.as_mut(), trace.as_ref())
+        && let Err(error) = writer.publish(trace, &finished)
+    {
+        return Err(Box::new(error.retaining(finished)));
     }
     let report = finished?;
     eprintln!("{report}");
@@ -138,6 +151,12 @@ fn run_cuda(config: NativeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let owners = Arc::new(OwnerRegistry::default());
     let clock = ProcessClock::new(ProcessEpoch(1));
     let factory = Arc::new(NativeCudaFactory::load(&owners, &config)?);
+    let trace = factory.source_trace();
+    let mut profile_writer = if config.profiling_requested() {
+        Some(ProfileWriter::open(&config)?)
+    } else {
+        None
+    };
     let mut receipts = if config.attestation_requested() {
         Some(CudaReceiptWriter::open(&config)?)
     } else {
@@ -155,12 +174,13 @@ fn run_cuda(config: NativeConfig) -> Result<(), Box<dyn std::error::Error>> {
             name: "RoveZero Maia ONNX CUDA integration".into(),
             author: "RoveZero contributors".into(),
         });
-    let served = serve_process(
+    let served = serve_native_process(
         process,
         EngineSettings {
             max_workers: 1,
             ..EngineSettings::default()
         },
+        trace.clone(),
     );
     let finished = factory.finish(served);
     if let (Some(writer), Some(startup)) = (receipts.as_mut(), startup.as_ref()) {
@@ -171,6 +191,11 @@ fn run_cuda(config: NativeConfig) -> Result<(), Box<dyn std::error::Error>> {
         if let Err(error) = writer.termination(&receipt) {
             return Err(Box::new(error.retaining(finished)));
         }
+    }
+    if let (Some(writer), Some(trace)) = (profile_writer.as_mut(), trace.as_ref())
+        && let Err(error) = writer.publish(trace, &finished)
+    {
+        return Err(Box::new(error.retaining(finished)));
     }
     let report = finished?;
     eprintln!("{report}");
@@ -196,6 +221,31 @@ fn serve_process(
         events,
         sender,
         &mut io::stdout().lock(),
+        &mut io::stderr().lock(),
+        process,
+        settings,
+    )
+}
+
+#[cfg(feature = "onnx-cpu")]
+fn serve_native_process(
+    process: EngineProcess,
+    settings: EngineSettings,
+    trace: Option<rz_telemetry::source::SourceJournal<rz_contracts::CompletionContext>>,
+) -> Result<(), engine::EngineError> {
+    let (sender, events) = engine::event_channel();
+    let input = sender.clone();
+    thread::spawn(move || {
+        let _ = forward_lines(
+            &mut io::stdin().lock(),
+            &input,
+            settings.parser.max_line_bytes,
+        );
+    });
+    engine::serve(
+        events,
+        sender,
+        &mut ProfiledWrite::new(io::stdout().lock(), trace),
         &mut io::stderr().lock(),
         process,
         settings,

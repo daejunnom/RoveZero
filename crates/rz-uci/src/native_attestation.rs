@@ -738,7 +738,7 @@ impl AttestationError {
             native_report: None,
         }
     }
-    fn io(stage: &'static str, error: io::Error) -> Self {
+    pub(crate) fn io(stage: &'static str, error: io::Error) -> Self {
         Self {
             io_kind: Some(error.kind()),
             io_error: Some(error),

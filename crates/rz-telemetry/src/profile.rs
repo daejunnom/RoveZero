@@ -106,6 +106,15 @@ pub struct SampleSummary {
     pub p99: Option<Duration>,
 }
 
+impl SampleSummary {
+    /// Summarize a complete bounded snapshot outside the request path, using
+    /// the same nearest-rank convention as the runtime's retained samples.
+    pub fn from_complete_samples(mut samples: Vec<Duration>) -> Self {
+        samples.sort_unstable();
+        summary(samples.len() as u64, 0, &samples)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StageReport {
     pub stage: Stage,
