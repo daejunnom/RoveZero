@@ -3,6 +3,7 @@ members = [
     "crates/rz-contracts", "crates/rz-position", "crates/rz-search", "crates/rz-uci",
     "crates/rz-encoding", "crates/rz-eval", "crates/rz-runtime", "crates/rz-telemetry",
     "crates/rz-experiments", "crates/rz-arena",
+    "crates/rz-native-loader",
 ]
 resolver = "2"
 
@@ -27,6 +28,8 @@ rz-telemetry = { path = "crates/rz-telemetry", version = "0.1.0" }
 rz-eval = { path = "crates/rz-eval", version = "0.1.0" }
 rz-encoding = { path = "crates/rz-encoding", version = "0.1.0" }
 rz-experiments = { path = "crates/rz-experiments", version = "0.1.0" }
+rz-native-loader = { path = "crates/rz-native-loader", version = "0.1.0" }
+libloading = "=0.8.9"
 sha2 = "=0.10.9"
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.145"

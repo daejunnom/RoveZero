@@ -100,6 +100,14 @@ fn config_requires_finite_resources_and_cuda_evidence_destination() {
             },
             ..BackendConfig::cpu()
         },
+        BackendConfig {
+            provider: Provider::Cuda {
+                device_id: 0,
+                arena_bytes: 1024,
+            },
+            profiling_prefix: Some("relative-placement-prefix".into()),
+            ..BackendConfig::cpu()
+        },
     ] {
         assert!(invalid.validate().is_err());
     }

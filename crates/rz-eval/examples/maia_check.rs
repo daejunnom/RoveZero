@@ -8,7 +8,7 @@ use rz_encoding::classical::{self, Frame, HistoryFill, Input};
 use rz_encoding::policy;
 use rz_eval::asset::{self, MaiaAsset};
 use rz_eval::onnx::{BackendConfig, OnnxBackend, OrtRuntime, Provider};
-use rz_eval::runtime_pin::RuntimeLibraryPin;
+use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeLibraryPin};
 use rz_eval::{output, RawOutput};
 use serde::Deserialize;
 use serde_json::json;
@@ -89,9 +89,14 @@ fn verify(raw: &RawOutput, case: &Case) -> Result<serde_json::Value, Box<dyn Err
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if !(8..=9).contains(&args.len()) {
-        return Err("usage: maia_check SOURCE.pb.gz MODEL.onnx MANIFEST.json ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu|cuda [PROFILE_PREFIX]".into());
+    if !(8..=10).contains(&args.len()) {
+        return Err("usage: maia_check SOURCE.pb.gz MODEL.onnx MANIFEST.json ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu | cuda PROFILE_DIRECTORY CUDA_BUNDLE.json".into());
     }
+    let is_cuda = match args[7].as_str() {
+        "cpu" if (8..=9).contains(&args.len()) => false,
+        "cuda" if args.len() == 10 => true,
+        _ => return Err("CPU keeps its existing arguments; CUDA requires a fresh profile directory and explicit bundle manifest".into()),
+    };
     let bytes = asset::read_bounded(Path::new(&args[5]), 8 * 1024 * 1024)?;
     let fixtures: Fixtures = serde_json::from_slice(&bytes)?;
     if fixtures.schema != 1
@@ -127,20 +132,65 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err("runtime/report root must be outside a Git checkout".into());
         }
     }
-    let pin = RuntimeLibraryPin::copy_verified(Path::new(&args[3]), output_root, &args[4])?;
-    let runtime = OrtRuntime::load(&pin)?;
     let mut config = BackendConfig::cpu();
-    match args[7].as_str() {
-        "cpu" => {}
-        "cuda" => {
-            config.provider = Provider::Cuda {
-                device_id: 0,
-                arena_bytes: 1024 * 1024 * 1024,
-            };
-            config.profiling_prefix = Some(args.get(8).ok_or("CUDA needs profile prefix")?.into());
+    let bundle_spec = if is_cuda {
+        let spec_bytes = asset::read_bounded(Path::new(&args[9]), 64 * 1024)?;
+        let spec = CudaRuntimeBundleSpec::from_json(std::str::from_utf8(&spec_bytes)?)?;
+        let core = spec
+            .files
+            .iter()
+            .find(|file| file.role == RuntimeBundleFileRole::Core)
+            .ok_or("CUDA bundle has no core declaration")?;
+        let declared_core = Path::new(&args[3]);
+        if declared_core.file_name().and_then(|name| name.to_str()) != Some(core.filename.as_str())
+            || core.sha256 != args[4]
+        {
+            return Err("ORT_LIBRARY/ORT_SHA256 must match the explicit CUDA bundle core".into());
         }
-        _ => return Err("provider must be explicit cpu or cuda".into()),
+        Some(spec)
+    } else {
+        None
+    };
+    let pin = if let Some(spec) = &bundle_spec {
+        RuntimeLibraryPin::copy_cuda_bundle(
+            Path::new(&args[3])
+                .parent()
+                .ok_or("CUDA core has no bundle source parent")?,
+            output_root,
+            spec,
+        )?
+    } else {
+        RuntimeLibraryPin::copy_verified(Path::new(&args[3]), output_root, &args[4])?
+    };
+    if is_cuda {
+        let profile_directory = Path::new(&args[8]);
+        if !profile_directory.is_absolute()
+            || profile_directory
+                .parent()
+                .ok_or("profile directory has no parent")?
+                .canonicalize()?
+                != canonical_root
+        {
+            return Err("CUDA profile directory must be a fresh direct child of REPORT's caller-owned parent".into());
+        }
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        // create, rather than create_dir_all: an existing probe namespace
+        // cannot supply stale placement evidence or overwrite earlier logs.
+        builder.create(profile_directory)?;
+        config.provider = Provider::Cuda {
+            device_id: 0,
+            arena_bytes: 1024 * 1024 * 1024,
+        };
+        config.profiling_prefix = Some(profile_directory.join("placement"));
     }
+    let runtime = OrtRuntime::load(&pin)?;
     let mut backend = OnnxBackend::load(&runtime, &model, config)?;
     let mut encoded = Vec::new();
     for case in &fixtures.cases {
@@ -228,18 +278,45 @@ fn main() -> Result<(), Box<dyn Error>> {
     // A rejected call must leave the session usable.
     verify(&backend.run(&[&encoded[0]])?.remove(0), &fixtures.cases[0])?;
     let cuda_executed_nodes = backend.cuda_evidence().map(|e| e.executed_cuda_nodes);
+    let cuda_profile_sha256 = backend.cuda_evidence().map(|e| {
+        e.profile_sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    });
+    let backend_sha256 = backend
+        .identity()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     #[cfg(feature = "contracts")]
     let contract_worker = verify_contract_worker(backend, &fixtures.cases, &encoded)?;
     #[cfg(not(feature = "contracts"))]
     let contract_worker = json!({"status":"not_enabled"});
+    if is_cuda {
+        // Batch-dependent or later lazy loads must still belong to the pinned
+        // closure when final evidence is admitted, not only at the B1 probe.
+        runtime.verify_cuda_runtime_mappings()?;
+    }
     let report = json!({"status":"passed", "provider": args[7], "precision":"fp32", "tf32":false,
         "reference":fixtures.reference, "fixture_sha256":asset::hex_sha256(&bytes),
         "reference_commit":fixtures.reference_commit,"reference_module_sha256":fixtures.reference_module_sha256,
         "runtime_sha256":args[4], "runtime_build":runtime.build_info(),
+        "cuda_bundle_sha256":runtime.bundle_digest().map(|digest| digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
+        "cuda_bundle_files":pin.bundle_files().map(|files| files.iter().map(|file| {
+            let role = match file.role {
+                RuntimeBundleFileRole::Core => "core",
+                RuntimeBundleFileRole::ProvidersShared => "providers_shared",
+                RuntimeBundleFileRole::ProvidersCuda => "providers_cuda",
+                RuntimeBundleFileRole::NvidiaDependency => "nvidia_dependency",
+            };
+            json!({"role":role,"filename":file.filename,"bytes":file.bytes,"sha256":file.sha256})
+        }).collect::<Vec<_>>()),
+        "backend_sha256":backend_sha256,
         "onnx_sha256":model.manifest().onnx_sha256,
         "tolerances":{"raw_logits_atol":1e-4,"raw_logits_rtol":1e-3,"wdl_max_abs":1e-4,"legal_policy_max_abs":1e-4},
         "case_errors":errors,"batch_checks":batch_checks,
-        "cuda_executed_nodes":cuda_executed_nodes, "contract_worker": contract_worker,
+        "cuda_executed_nodes":cuda_executed_nodes,"cuda_profile_sha256":cuda_profile_sha256, "contract_worker": contract_worker,
         "gpu_acceptance": if args[7] == "cpu" { "not_run" } else { "numerical_and_provider_probe_only" }});
     std::fs::write(&args[6], serde_json::to_vec_pretty(&report)?)?;
     println!(
@@ -382,6 +459,15 @@ fn verify_contract_worker(
         match lease.poll() {
             PhysicalPoll::Ready(result) => break result?,
             PhysicalPoll::Pending if Instant::now() < stop => std::thread::yield_now(),
+            PhysicalPoll::Quarantined => {
+                return Err(lease.quarantine_cause()?.unwrap_or_else(|| {
+                    rz_eval::error::BackendError::new(
+                        rz_eval::error::FailureKind::BackendFailure,
+                        rz_eval::error::FailureStage::Backend,
+                        "physical worker completion is unknown and no quarantine receipt is available",
+                    )
+                }).into());
+            }
             _ => return Err("physical worker did not complete within fixture budget".into()),
         }
     };

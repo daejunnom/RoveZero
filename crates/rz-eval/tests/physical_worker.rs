@@ -1,5 +1,8 @@
-use rz_eval::error::{CauseCode, ExternalCause, FailureKind, FailureStage, CAUSE_PREFIX_BYTES};
-use rz_eval::worker::{PhysicalPoll, SingleWorker};
+use rz_eval::error::{
+    BackendError, CauseCode, ExternalCause, FailureKind, FailureStage, CAUSE_PREFIX_BYTES,
+};
+use rz_eval::worker::{PhysicalPoll, PhysicalRun, SingleWorker};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -95,6 +98,79 @@ fn unwind_quarantines_backend_and_pins_instead_of_claiming_completion() {
     drop(worker);
     // One tiny allocation intentionally survives this injected unknown completion.
     assert!(weak.upgrade().is_some());
+}
+
+#[test]
+fn explicit_unknown_completion_preserves_native_cause_and_retains_one_job_and_backend() {
+    struct CountDrop(Arc<AtomicUsize>);
+
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let input_drops = Arc::new(AtomicUsize::new(0));
+    let backend_drops = Arc::new(AtomicUsize::new(0));
+    let rejected_drops = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend_pin = CountDrop(Arc::clone(&backend_drops));
+    let expected = BackendError::new(
+        FailureKind::BackendFailure,
+        FailureStage::Backend,
+        "injected native run completion is unknown",
+    )
+    .with_external_cause(
+        CauseCode::OrtRun,
+        &"injected physical completion uncertainty",
+    )
+    .with_diagnostic("NativeRunUnknown", "injected native execution failure");
+    let injected = expected.clone();
+    let run_calls = Arc::clone(&calls);
+    let mut worker =
+        SingleWorker::spawn_with_outcome(move |_: &Arc<CountDrop>| -> PhysicalRun<()> {
+            let _backend_pin = &backend_pin;
+            run_calls.fetch_add(1, Ordering::SeqCst);
+            PhysicalRun::Quarantined(injected.clone())
+        })
+        .unwrap();
+    let input = Arc::new(CountDrop(Arc::clone(&input_drops)));
+    let weak = Arc::downgrade(&input);
+    let mut lease = worker.submit(input).unwrap();
+    wait_until(|| match lease.poll() {
+        PhysicalPoll::Pending => false,
+        PhysicalPoll::Quarantined => true,
+        _ => panic!("unknown native completion cannot yield an owned output"),
+    });
+    assert_eq!(lease.quarantine_cause().unwrap(), Some(expected.clone()));
+    assert_eq!(expected.cause.unwrap().code, CauseCode::OrtRun);
+    assert!(matches!(lease.poll(), PhysicalPoll::Quarantined));
+
+    // The per-job receipt may precede the global admission transition. Both
+    // Busy and Quarantined must reject this input without executing it.
+    let rejected = Arc::new(CountDrop(Arc::clone(&rejected_drops)));
+    wait_until(|| match worker.submit(Arc::clone(&rejected)) {
+        Err(error) if error.kind == FailureKind::ResourceExhausted => false,
+        Err(error) => {
+            assert_eq!(error.kind, FailureKind::BackendUnavailable);
+            assert_eq!(error.stage, FailureStage::Admission);
+            true
+        }
+        Ok(_) => panic!("quarantined worker must not admit another native job"),
+    });
+    drop(rejected);
+    assert_eq!(rejected_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(lease.poll(), PhysicalPoll::Quarantined));
+    assert_eq!(lease.quarantine_cause().unwrap(), Some(expected));
+    drop(lease);
+    drop(worker);
+    assert!(
+        weak.upgrade().is_some(),
+        "unknown native job remains pinned"
+    );
+    assert_eq!(input_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(backend_drops.load(Ordering::SeqCst), 0);
 }
 
 #[test]

@@ -14,6 +14,7 @@ pub enum CauseCode {
     RuntimePath,
     RuntimeInitialize,
     RuntimePanic,
+    RuntimeLibraryLoad,
     OrtNative,
     SessionBuilder,
     SessionConfiguration,

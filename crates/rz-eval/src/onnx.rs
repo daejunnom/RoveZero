@@ -1,9 +1,9 @@
 //! Explicit FP32 ONNX Runtime backend. No implicit runtime download or CPU fallback.
 //!
-//! `run` is synchronous and requires exclusive access. It returns only after ORT
-//! has synchronized and copied all outputs to owned host vectors. Runtime must
-//! call it on its physical worker, retaining request leases until it returns;
-//! logical cancellation cannot release those leases or terminate native work.
+//! Successful `run` is synchronous and requires exclusive access. A CUDA Run
+//! error does not prove device completion: the session and input are quarantined.
+//! Runtime must retain request leases until a physical Ready, independently of
+//! logical cancellation or deadline rejection.
 
 use crate::asset::{self, MaiaAsset, INPUT_NAME, POLICY_NAME, WDL_NAME};
 use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
@@ -15,18 +15,31 @@ use ort::tensor::TensorElementType;
 use ort::value::{Tensor, ValueType};
 use rz_encoding::classical::{EncodedInput, INPUT_VALUES};
 use rz_encoding::POLICY_SIZE;
+use rz_native_loader::{LibrarySet, LoadError, ProcessLibrarySet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const MAX_BATCH: usize = 16;
 /// Input staging plus native and owned output copies. Excludes caller features,
 /// model/session/ORT activation workspace: bootstrap must budget those too.
 pub const IO_BYTES_PER_ITEM: usize = (INPUT_VALUES + 2 * (POLICY_SIZE + 3)) * 4;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OrtRuntime {
     pin: RuntimeLibraryPin,
     build_info: String,
+    cuda_libraries: Option<ProcessLibrarySet>,
+    ort_libraries: Option<Arc<Vec<rz_native_loader::OwnedLibrary>>>,
+}
+
+impl std::fmt::Debug for OrtRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrtRuntime")
+            .field("pin", &self.pin)
+            .field("build_info", &self.build_info)
+            .field("cuda_bundle", &self.pin.bundle_digest())
+            .finish()
+    }
 }
 
 struct RuntimeLatch {
@@ -42,8 +55,9 @@ impl OrtRuntime {
     /// Bootstrap must be the sole initializer of the process-global `ort`
     /// library. Refuse prior initialization, path changes and failed retries.
     /// Requires the bootstrap-owned, verified and durably pinned copy. Mutable
-    /// caller paths cannot authorize native loading. Sibling libraries are not
-    /// copied or downloaded; missing native dependencies are an explicit error.
+    /// caller paths cannot authorize native loading. CUDA additionally requires
+    /// the complete pinned bundle; its dependency preload never changes PATH or
+    /// LD_LIBRARY_PATH. No dependencies are downloaded by this API.
     /// A hash is identity, not a sandbox for executing native code.
     pub fn load(pin: &RuntimeLibraryPin) -> Result<Self, BackendError> {
         let unavailable = || {
@@ -57,7 +71,10 @@ impl OrtRuntime {
             unavailable().with_external_cause(CauseCode::RuntimeInitialize, &error)
         })?;
         if let Some(latch) = guard.as_ref() {
-            if latch.pin.path() != pin.path() || latch.pin.binary_digest() != pin.binary_digest() {
+            if latch.pin.path() != pin.path()
+                || latch.pin.binary_digest() != pin.binary_digest()
+                || latch.pin.bundle_digest() != pin.bundle_digest()
+            {
                 return Err(BackendError::new(
                     K::IdentityMismatch,
                     S::Backend,
@@ -65,8 +82,15 @@ impl OrtRuntime {
                 ));
             }
             let runtime = latch.result.as_ref().map_err(Clone::clone)?;
-            return if runtime.pin.binary_digest() == pin.binary_digest() {
-                Ok(runtime.clone())
+            return if runtime.pin.binary_digest() == pin.binary_digest()
+                && runtime.pin.bundle_digest() == pin.bundle_digest()
+            {
+                let runtime = runtime.clone();
+                drop(guard);
+                if runtime.bundle_digest().is_some() {
+                    runtime.verify_cuda_mappings(false)?;
+                }
+                Ok(runtime)
             } else {
                 Err(BackendError::new(
                     K::IdentityMismatch,
@@ -75,10 +99,46 @@ impl OrtRuntime {
                 ))
             };
         }
-        let path_text = pin.path().to_str().ok_or_else(unavailable)?;
         // ort rc.10 panics on dlopen / API-version failure; translate that narrow
         // bootstrap boundary and latch failure. Native crashes are not recoverable.
         let result = std::panic::catch_unwind(|| {
+            let path_text = pin.path().to_str().ok_or_else(unavailable)?;
+            let ort_libraries = if pin.bundle_digest().is_some() {
+                Some(Arc::new(
+                    pin.try_clone_ort_pins()?
+                        .into_iter()
+                        .map(|library| rz_native_loader::OwnedLibrary {
+                            path: library.path,
+                            file: library.file,
+                            digest: library.digest,
+                            bytes: library.bytes,
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+            } else {
+                None
+            };
+            if let Some(libraries) = &ort_libraries {
+                // First CUDA profile is closed to the selected GPU wheel's
+                // exact bytes and digests. Validate its declarations before any
+                // NVIDIA constructor can run, using C's verified copied pins.
+                rz_native_loader::validate_runtime_profile(libraries).map_err(loader_error)?;
+            }
+            let cuda_libraries = if pin.bundle_digest().is_some() {
+                let dependencies = pin
+                    .try_clone_nvidia_pins()?
+                    .into_iter()
+                    .map(|library| rz_native_loader::OwnedLibrary {
+                        path: library.path,
+                        file: library.file,
+                        digest: library.digest,
+                        bytes: library.bytes,
+                    })
+                    .collect();
+                Some(LibrarySet::load(dependencies).map_err(loader_error)?)
+            } else {
+                None
+            };
             if !ort::init_from(path_text)
                 .with_name("RoveZero-C")
                 .commit()
@@ -107,6 +167,8 @@ impl OrtRuntime {
             Ok(Self {
                 pin: pin.clone(),
                 build_info: info.to_owned(),
+                cuda_libraries,
+                ort_libraries,
             })
         })
         .unwrap_or_else(|payload| {
@@ -133,6 +195,87 @@ impl OrtRuntime {
     pub fn build_info(&self) -> &str {
         &self.build_info
     }
+
+    pub fn bundle_digest(&self) -> Option<[u8; 32]> {
+        self.pin.bundle_digest()
+    }
+
+    /// Recheck all resident bundle images after later numerical/worker calls,
+    /// before accepting their final GPU report. This is an origin audit, not a
+    /// completion fence, VRAM measurement or device-drain operation.
+    pub fn verify_cuda_runtime_mappings(&self) -> Result<(), BackendError> {
+        self.verify_cuda_mappings(true)
+    }
+
+    fn verify_cuda_mappings(&self, include_runtime: bool) -> Result<(), BackendError> {
+        let libraries = self.cuda_libraries.as_ref().ok_or_else(|| {
+            BackendError::new(
+                K::IdentityMismatch,
+                S::Backend,
+                "CUDA requires a pinned runtime bundle",
+            )
+        })?;
+        let verified = libraries
+            .verify_mappings()
+            .and_then(|()| {
+                if include_runtime {
+                    // All three ORT images become mandatory after the actual CUDA
+                    // probe. Before that point only the explicitly preloaded NVIDIA
+                    // images are required to be resident.
+                    libraries.verify_runtime_mappings(
+                        self.ort_libraries
+                            .as_ref()
+                            .expect("CUDA runtime owns its three pinned ORT images"),
+                    )
+                } else {
+                    Ok(())
+                }
+            })
+            .map_err(loader_error);
+        if let Err(failure) = &verified {
+            // An origin audit cannot be retried into success with the same
+            // process-global ORT session. Keep the first typed source and pins.
+            if let Ok(mut guard) = RUNTIME.lock() {
+                if let Some(latch) = guard.as_mut() {
+                    if latch.pin.path() == self.pin.path()
+                        && latch.pin.bundle_digest() == self.pin.bundle_digest()
+                        && latch.result.is_ok()
+                    {
+                        latch.result = Err(failure.clone());
+                    }
+                }
+            }
+        }
+        verified
+    }
+}
+
+fn loader_error(error: LoadError) -> BackendError {
+    let failure = BackendError::new(
+        K::BackendUnavailable,
+        S::Backend,
+        "pinned CUDA dependency loading or mapping audit failed",
+    );
+    let mut failure = if let Some(message) = error.diagnostic() {
+        failure
+            .with_external_cause(CauseCode::RuntimeLibraryLoad, &message)
+            .with_diagnostic(error.cause_code(), message)
+    } else {
+        failure
+            .with_external_cause(CauseCode::RuntimeLibraryLoad, &error)
+            .with_diagnostic(error.cause_code(), error.detail)
+    };
+    // The loader has already bounded its original native text. Preserve that
+    // truncation even when its 1024-byte prefix fits C's second boundary exactly.
+    if error.diagnostic_truncated() {
+        if let Some(cause) = failure.cause.as_mut() {
+            cause.truncated = true;
+        }
+        if let Some(native) = failure.native.as_mut() {
+            native.truncated = true;
+        }
+    }
+    failure
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -185,11 +328,17 @@ impl BackendConfig {
             arena_bytes,
         } = self.provider
         {
-            if device_id < 0 || arena_bytes == 0 || self.profiling_prefix.is_none() {
+            if device_id < 0
+                || arena_bytes == 0
+                || !self
+                    .profiling_prefix
+                    .as_ref()
+                    .is_some_and(|prefix| prefix.is_absolute() && prefix.file_name().is_some())
+            {
                 return Err(BackendError::new(
                     K::InvalidInput,
                     S::Admission,
-                    "CUDA requires device, arena cap and profile path",
+                    "CUDA requires device, arena cap and absolute profile prefix",
                 ));
             }
         } else if self.profiling_prefix.is_some() {
@@ -206,11 +355,12 @@ impl BackendConfig {
 #[derive(Clone, Debug)]
 pub struct CudaEvidence {
     pub profile_path: PathBuf,
+    pub profile_sha256: [u8; 32],
     pub executed_cuda_nodes: usize,
 }
 
 pub struct OnnxBackend {
-    session: Session,
+    session: Option<Session>,
     // Kept outside the Run stack so worker quarantine also pins tensor storage
     // if a Rust wrapper unexpectedly unwinds before attesting completion.
     active_input: Option<Tensor<f32>>,
@@ -218,6 +368,20 @@ pub struct OnnxBackend {
     identity: [u8; 32],
     asset_identity: [u8; 32],
     cuda_evidence: Option<CudaEvidence>,
+    quarantine_cause: Option<BackendError>,
+}
+
+impl Drop for OnnxBackend {
+    fn drop(&mut self) {
+        if matches!(self.config.provider, Provider::Cuda { .. })
+            && (self.quarantine_cause.is_some() || self.active_input.is_some())
+        {
+            // A returned error or wrapper unwind is not a CUDA fence. The
+            // process owns these native allocations until exit, even when a
+            // direct caller drops the backend outside SingleWorker.
+            std::mem::forget((self.session.take(), self.active_input.take()));
+        }
+    }
 }
 
 impl OnnxBackend {
@@ -227,6 +391,23 @@ impl OnnxBackend {
         config: BackendConfig,
     ) -> Result<Self, BackendError> {
         config.validate()?;
+        match (config.provider, runtime.bundle_digest()) {
+            (Provider::Cuda { .. }, None) => {
+                return Err(BackendError::new(K::IdentityMismatch, S::Backend,
+                    "CUDA requires the complete pinned runtime bundle; single-library pin is CPU only"));
+            }
+            (Provider::Cpu, Some(_)) => {
+                return Err(BackendError::new(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "CUDA runtime bundle cannot be admitted as a CPU runtime",
+                ));
+            }
+            _ => {}
+        }
+        if matches!(config.provider, Provider::Cuda { .. }) {
+            runtime.verify_cuda_mappings(false)?;
+        }
         let setup_error = |code, error: ort::Error| {
             BackendError::new(
                 K::BackendUnavailable,
@@ -305,17 +486,27 @@ impl OnnxBackend {
             })?;
         validate_interface(&session)?;
         // This is a versioned C backend identity, not a new global wire codec.
-        let profile = format!("rz-maia-ort-v1;ort=1.22.0;wrapper=2.0.0-rc.10;runtime={:?};asset={:?};provider={:?};threads={};batch={};fp32;tf32=0;opt=1;sync;full=1;temp=1;sum=1e-5",
+        let mut profile = format!("rz-maia-ort-v1;ort=1.22.0;wrapper=2.0.0-rc.10;runtime={:?};asset={:?};provider={:?};threads={};batch={};fp32;tf32=0;opt=1;sync;full=1;temp=1;sum=1e-5",
             runtime.binary_digest(), asset.manifest_digest(), config.provider, config.intra_threads, config.max_batch);
+        if let Some(bundle) = runtime.bundle_digest() {
+            use std::fmt::Write;
+            write!(
+                profile,
+                ";cuda-bundle-v1={bundle:?};loader=linux-exact-global-v1"
+            )
+            .expect("writing to an owned String cannot fail");
+        }
         let mut result = Self {
-            session,
+            session: Some(session),
             active_input: None,
             config,
             identity: asset::sha256(profile.as_bytes()),
             asset_identity: asset.manifest_digest(),
             cuda_evidence: None,
+            quarantine_cause: None,
         };
         if matches!(result.config.provider, Provider::Cuda { .. }) {
+            runtime.verify_cuda_mappings(false)?;
             // A registered provider alone proves nothing. Synchronous physical
             // execution plus ORT kernel placement is required before returning.
             let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -325,25 +516,82 @@ impl OnnxBackend {
                 Ok(completed) => {
                     completed?;
                 }
-                Err(_) => {
+                Err(payload) => {
                     // Bootstrap has no runtime lease yet. Retain this session and
                     // active tensor if an unexpected unwind leaves completion unknown.
-                    std::mem::forget(result);
-                    return Err(BackendError::new(
+                    let error = BackendError::new(
                         K::BackendFailure,
                         S::Backend,
                         "CUDA probe unwound; session quarantined until process exit",
-                    ));
+                    );
+                    let message = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("non-string CUDA probe panic payload");
+                    let error = error
+                        .with_external_cause(CauseCode::RuntimePanic, &message)
+                        .with_diagnostic("CudaProbePanic", message);
+                    result.quarantine_cause = Some(error.clone());
+                    return Err(error);
                 }
             }
+            runtime.verify_cuda_mappings(true)?;
             let path = result
                 .session
+                .as_mut()
+                .ok_or_else(|| {
+                    BackendError::new(
+                        K::BackendFailure,
+                        S::Backend,
+                        "CUDA probe session is missing",
+                    )
+                })?
                 .end_profiling()
                 .map_err(|error| setup_error(CauseCode::ProfilingFinish, error))?;
+            let profile_path = Path::new(&path);
+            let profile_parent = result
+                .config
+                .profiling_prefix
+                .as_ref()
+                .and_then(|prefix| prefix.parent())
+                .ok_or_else(|| {
+                    BackendError::new(
+                        K::InvalidInput,
+                        S::Backend,
+                        "CUDA profiling parent is missing",
+                    )
+                })?;
+            let named = std::fs::symlink_metadata(profile_path).map_err(|error| {
+                BackendError::new(K::Io, S::Backend, "cannot inspect CUDA placement profile")
+                    .with_external_cause(CauseCode::ProfileParse, &error)
+            })?;
+            if !profile_path.is_absolute()
+                || !named.is_file()
+                || named.file_type().is_symlink()
+                || profile_path
+                    .parent()
+                    .and_then(|parent| parent.canonicalize().ok())
+                    != Some(profile_parent.canonicalize().map_err(|error| {
+                        BackendError::new(
+                            K::Io,
+                            S::Backend,
+                            "cannot verify CUDA placement profile owner",
+                        )
+                        .with_external_cause(CauseCode::ProfileParse, &error)
+                    })?)
+            {
+                return Err(BackendError::new(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "CUDA placement profile is outside its explicit namespace",
+                ));
+            }
             let bytes = asset::read_bounded(Path::new(&path), 4 * 1024 * 1024)?;
             let executed_cuda_nodes = verify_cuda_profile(&bytes)?;
             result.cuda_evidence = Some(CudaEvidence {
                 profile_path: path.into(),
+                profile_sha256: asset::sha256(&bytes),
                 executed_cuda_nodes,
             });
         }
@@ -361,6 +609,12 @@ impl OnnxBackend {
     }
     pub fn cuda_evidence(&self) -> Option<&CudaEvidence> {
         self.cuda_evidence.as_ref()
+    }
+
+    /// Original bounded cause of a CUDA execution with unconfirmed physical
+    /// completion. Presence forbids PhysicalReady and reservation release.
+    pub fn physical_quarantine_cause(&self) -> Option<&BackendError> {
+        self.quarantine_cause.as_ref()
     }
 
     pub fn run(&mut self, inputs: &[&EncodedInput]) -> Result<Vec<RawOutput>, BackendError> {
@@ -430,17 +684,34 @@ impl OnnxBackend {
             })?,
         );
         // No RunOptions enabling asynchronous EP execution or terminate-on-cancel.
-        // On both success and error ORT's default synchronous Run has returned
-        // before input/output storage is released. D keeps its lease throughout.
+        // Only a successful CUDA Run attests the synchronous device fence.
+        // Arbitrary CUDA errors retain the input/session instead of granting
+        // physical Ready. CPU errors keep the existing completed-error behavior.
         let run_result = self
             .session
+            .as_mut()
+            .ok_or_else(|| {
+                BackendError::new(K::BackendFailure, S::Backend, "ORT session is missing")
+            })?
             .run(ort::inputs![INPUT_NAME => self.active_input.as_ref()
             .ok_or(BackendError::new(K::BackendFailure, S::Backend, "input pin is missing"))?]);
-        self.active_input = None;
-        let outputs = run_result.map_err(|error| {
-            BackendError::new(K::BackendFailure, S::Backend, "synchronous ORT Run failed")
-                .with_ort_cause(CauseCode::OrtRun, error)
-        })?;
+        let outputs = match run_result {
+            Ok(outputs) => {
+                self.active_input = None;
+                outputs
+            }
+            Err(error) => {
+                let failure =
+                    BackendError::new(K::BackendFailure, S::Backend, "synchronous ORT Run failed")
+                        .with_ort_cause(CauseCode::OrtRun, error);
+                if matches!(self.config.provider, Provider::Cuda { .. }) {
+                    self.quarantine_cause = Some(failure.clone());
+                } else {
+                    self.active_input = None;
+                }
+                return Err(failure);
+            }
+        };
         let malformed = || {
             BackendError::new(
                 K::NumericalFailure,

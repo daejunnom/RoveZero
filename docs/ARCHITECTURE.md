@@ -68,6 +68,7 @@ Cargo workspace·빈 crates를 선제 생성하지 않는다. 실제 구현 배�
 | Rules / State / A | `crates/rz-position/` | 자체 합법 수·상태 전이·이력·종료 판정. 신경망 추정이나 제품용 외부 규칙 라이브러리로 대체하지 않는다. |
 | Encoder / C | `crates/rz-encoding/` | 칸·기물·관계 특징, `MoveDelta`, 모델별 입력·policy mapping. 방문 통계를 변경하지 않는다. |
 | Evaluator / C | `crates/rz-eval/` | 단일 지원 형식의 policy·WDL·선택적 Q/불확실성, 로딩·실제 backend. 직접 착수·대국 판정·외부 UCI neural wrapper 금지. |
+| Native loader / 총괄 I01·C03 접점 | `crates/rz-native-loader/` | 검증된 GPU 의존 라이브러리의 좁은 FFI 로딩·process lifetime pin·실제 mapping 확인. 모델·Rules·탐색·queue를 소유하지 않는다. `rz-eval`의 `forbid(unsafe_code)`를 유지하기 위해 분리한다. |
 | Feature/Raw Cache / D | `crates/rz-runtime/` | 입력 식별·버전·정밀도·수명·provenance. 근사 값·Search edge 통계와 분리한다. |
 | Refinement 경계 / B·C·D | Search 결정·공통 요청·Runtime 실행 | Search가 계산 요청을 선택하고 C가 supported steps/precision을 정의하며 D가 실행한다. 향후 후보이며 별도 controller crate를 선제 생성하지 않는다. |
 | Search / B | `crates/rz-search/` | 최소 자체 PUCT·선택·backup·루트 결정·시간 제어. 모델 입력 형식이나 backend 구현을 소유하지 않는다. |
@@ -97,6 +98,12 @@ search는 position/contracts와 주입한 evaluator 접점, eval은 contracts/en
 D의 요청·lease·완료 계약에 맞추며 D는 구체 C provider에 역의존하지 않는다.
 B `onnx-cpu` bootstrap이 asset/runtime pin·한 session·공통 clock/ID·diagnostic owner를
 조합한다. 모델 추론 코어는 D queue 정책이나 탐색 방문 통계를 소유하지 않는다.
+
+첫 CUDA bootstrap은 C의 `RuntimeLibraryPin`이 전체 네이티브 bundle 사본을 소유하고
+`rz-native-loader`가 검증한 절대 경로를 로딩하는 방향이다. 로더는 contracts·eval·runtime에
+역의존하지 않는다. CPU 단일 파일 경로와 identity를 유지하고 CUDA에만 전체 bundle
+identity를 추가한다. 상세 수명·오류·부분 인수 조건은
+[GPU-RUNTIME-BOOTSTRAP](GPU-RUNTIME-BOOTSTRAP.md)을 따른다.
 
 총괄은 루트 Cargo 파일·설정·CI·실험 목록과 consumer 영향을 관리한다. 불변
 snapshot·수명 고정 handle로 async borrow를 안전하게 연결하며 변경 후 계약

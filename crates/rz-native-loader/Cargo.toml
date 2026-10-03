@@ -1,0 +1,10 @@
+[package]
+name = "rz-native-loader"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading.workspace = true
+sha2.workspace = true

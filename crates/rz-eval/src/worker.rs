@@ -28,6 +28,14 @@ pub struct PhysicalLease<J, R> {
     quarantine_cause: Arc<Mutex<Option<BackendError>>>,
 }
 
+pub enum PhysicalRun<R> {
+    /// Native execution has physically completed and owns its output.
+    Complete(R),
+    /// Physical completion is unknown. Retain this job and backend until process
+    /// exit and publish the original typed failure without permitting reuse.
+    Quarantined(BackendError),
+}
+
 pub enum PhysicalPoll<R> {
     Pending,
     Ready(R),
@@ -45,6 +53,18 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
     where
         F: FnMut(&J) -> R + Send + 'static,
     {
+        Self::spawn_with_outcome(move |input| PhysicalRun::Complete(run(input)))
+    }
+
+    /// Complete must attest physical completion, including owned output. An
+    /// explicit Quarantined outcome or unwind permanently closes admission and
+    /// retains this job and run closure, preserving the job's original cause.
+    /// Resources still in native use must already be owned by J or captured
+    /// closure state: callback-local resources are not retained after return.
+    pub fn spawn_with_outcome<F>(mut run: F) -> Result<Self, BackendError>
+    where
+        F: FnMut(&J) -> PhysicalRun<R> + Send + 'static,
+    {
         let (sender, receiver) = mpsc::sync_channel::<Job<J, R>>(1);
         let state = Arc::new(AtomicU8::new(IDLE));
         let worker_state = Arc::clone(&state);
@@ -52,21 +72,28 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
             .name("rz-maia-physical".into())
             .spawn(move || {
                 while let Ok(job) = receiver.recv() {
-                    let result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&job.input)));
-                    match result {
-                        Ok(output) => {
+                    let outcome =
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run(&job.input)
+                        })) {
+                            Ok(outcome) => outcome,
+                            Err(payload) => {
+                                PhysicalRun::Quarantined(panic_failure(payload.as_ref()))
+                            }
+                        };
+                    match outcome {
+                        PhysicalRun::Complete(output) => {
                             // Even a dropped logical consumer does not cancel native
                             // execution. At this point run has physically completed.
                             worker_state.store(IDLE, Ordering::Release);
                             let _ = job.completion.send(output);
                         }
-                        Err(payload) => {
-                            // Rust unwinding alone cannot attest GPU synchronization.
+                        PhysicalRun::Quarantined(cause) => {
+                            // Neither unwinding nor a native failure alone attests
+                            // physical completion or GPU synchronization.
                             // Deliberately retain backend/inputs until process exit;
                             // no retry, no Ready, no reservation-release permission.
-                            let cause = panic_failure(payload.as_ref());
-                            // Per-job receipt: a later job's panic must not be
+                            // Per-job receipt: a later job's failure must not be
                             // attributed to an earlier completed physical lease.
                             match job.quarantine_cause.lock() {
                                 Ok(mut slot) => *slot = Some(cause),
@@ -140,7 +167,7 @@ impl<J, R> PhysicalLease<J, R> {
     }
 
     /// Bounded per-job evidence, not completion or permission to release pins.
-    /// A panic receipt is published before the QUARANTINED Release transition.
+    /// The failure receipt is published before the QUARANTINED Release transition.
     /// Reading raw NativeDiagnostic text remains an explicit local operation.
     pub fn quarantine_cause(&self) -> Result<Option<BackendError>, BackendError> {
         self.quarantine_cause

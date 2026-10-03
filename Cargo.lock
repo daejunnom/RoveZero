@@ -450,6 +450,7 @@ dependencies = [
  "ort",
  "rz-contracts",
  "rz-encoding",
+ "rz-native-loader",
  "rz-position",
  "rz-runtime",
  "serde",
@@ -466,6 +467,14 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "rz-native-loader"
+version = "0.1.0"
+dependencies = [
+ "libloading",
  "sha2",
 ]
 
