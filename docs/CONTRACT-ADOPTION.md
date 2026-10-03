@@ -283,6 +283,10 @@ A~F는 GPU가 없는 클라우드에서 CPU/mock·fixture 개발과 가능한 CP
 진행한다. development host의 capability와 지정한 GPU 검증 환경을 분리한다.
 초기 RTX 4050 인수는 해당 장비의 이력으로 보존하며, 후속 GPU 벤치마크는
 [외부 RunPod 준비 계획](research/RUNPOD-BENCHMARK-PLAN.md)을 따른다.
+GPU A/B 이전의 [CPU 의미 보존 최적화](research/PRE-RUNPOD-OPTIMIZATION.md)는 Rules의
+실제 owner/revision/history에 묶인 `ContractPosition::fork_from_view`로 B 접점을 수동
+갱신했다. 공통 계약 `0.1`·digest codec·순서·claim·WDL은 유지한다. 이 소스의 NN/GPU
+인수는 별도이며 Community/no network volume/초기 약 US$200·외부 회수 계획을 따른다.
 CUDA CLI 설치나 GPU 검사 skip을 실제 장치·provider 지원 또는 성공으로 해석하지 않는다.
 GPU 요구 모드를 CPU로 조용히 바꾸지 않고 BackendUnavailable 등 명시 실패를 보존한다.
 

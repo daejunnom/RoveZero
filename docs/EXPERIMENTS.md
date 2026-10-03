@@ -8,6 +8,9 @@ A~F의 클라우드 개발에는 GPU가 없을 수 있다. CPU/mock·가능한 �
 참조·fixture·계측 도구·학습 recipe를 먼저 개발하고 별도 GPU 검증 환경과 구분한다.
 초기 RTX 4050 인수 이력을 보존하고 후속 GPU 벤치마크는
 [외부 RunPod 준비 계획](research/RUNPOD-BENCHMARK-PLAN.md)에서 장비·예산을 잠근다.
+사용자 후속 지시로 GPU A/B 전에 [의미 보존 CPU 최적화](research/PRE-RUNPOD-OPTIMIZATION.md)를
+먼저 인수했다. 다음 GPU 실행에서 새 소스의 실제 수치·종단 검사를 확인한 뒤 baseline으로
+잠근다. 현재 초기 총예산·Community/no network volume·외부 회수 조건은 준비 계획을 따른다.
 GPU 검사의 skip·미실행을 통과로 처리하지 않는다. 실제 GPU·학습·정식 대국 인수는
 총괄 I02가 지원 환경의 정확한 SHA·설정·자원·실행 증거로 확인한다. 단계별 인계는
 구현 지시서의 클라우드 개발 규약을 따른다.

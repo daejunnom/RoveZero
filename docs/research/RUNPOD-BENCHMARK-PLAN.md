@@ -1,6 +1,6 @@
 # Runpod 외부 GPU 벤치 준비 계획
 
-작성일: 2026-10-03. 상태: **조사·준비 계획 / GPU 선택 및 유료 실행 미승인**.
+작성일: 2026-10-03. 상태: **CPU 사전 최적화 검증 / Community 후보 확인 / Pod 미생성**.
 
 ## 근거와 현재 범위
 
@@ -10,8 +10,12 @@
   제품 소스·실행 binary를 구분하고, 새 실행 전 실제 source SHA와 binary hash를 잠근다.
 - 이 문서는 공식 Runpod 조사와 총괄의 일반 배포 폼 관측을 정리한다.
   Pod 생성·유료 API·GPU 실행·계정 설정·Credentials 접근·MCP 설치를 수행하지 않았다.
-- 사용자는 후속 GPU benchmark를 로컬 밖에서 수행할 예정이며,
-  **이번 응답 이후 GPU를 지정한다.** 아래 두 후보 중 선택된 GPU는 아직 없다.
+- 후속 사용자 지시는 **GPU A/B 전에 의미 보존 최적화를 먼저 검증**, **network volume 미사용**,
+  **Community GPU 후보 확인**, **초기 총 지출 가능액 약 US$200**다.
+  [사전 최적화 기록](PRE-RUNPOD-OPTIMIZATION.md)의 제품 소스는
+  `1cdd707922dcaaf234b4cd162210ce9f2fa512bb`이며 새 장비의 수치·종단 검사는 남아 있다.
+- 이전의 GPU 미선정 이력을 유지한다. 현재 Community 4090을 우선 후보로 제안하며
+  GPU 최종 선택·quote·유한 실행 명세·접속 설정을 잠근 뒤 실행한다.
 - 기존 RTX 4050 6GB의 CUDA 수치·UCI·pair smoke 증거와 실패 이력을 보존한다.
   외부 GPU 결과는 새 환경 증거로 추가하며 기존 장비의 결과를 덮어쓰지 않는다.
 - 기존 6-ply pair smoke의 `strength_eligible=false`를 유지한다. 외부 자원 선택을
@@ -21,7 +25,9 @@
 
 ## 실행 상품과 장비 후보
 
-첫 실행안은 **Secure Cloud / on-demand / 단일 NVIDIA GPU Pod**다.
+첫 실행안은 **Community Cloud / on-demand / 단일 NVIDIA GPU Pod**다.
+이전 Secure Cloud 제안은 사용자 후속 지시로 대체했다. 자료의 기밀성 때문에 Secure를
+필수 조건으로 두지 않지만, loaded origin·입력 identity·자원 한도·실패 보존은 계속 검증한다.
 Pods는 컨테이너·프로세스·저장소를 직접 관리하는 환경을 제공한다.
 [Pods 개요](https://docs.runpod.io/pods/overview),
 [On-demand 과금](https://docs.runpod.io/pods/pricing)
@@ -34,27 +40,31 @@ GPU 우선순위도 설정할 수 있지만 여러 종류를 허용하면 재고
 [Endpoint 설정](https://docs.runpod.io/serverless/endpoints/endpoint-configurations),
 [Serverless 과금](https://docs.runpod.io/serverless/pricing)
 
-| 후보 / 선택 상태 | 공개 가격표 | 공개 표의 VRAM / RAM / vCPU | 일반 deploy 폼의 공개 offer 구성: 총괄 관측 |
+| 현재 Community 후보 / 선택 상태 | GPU 표시 가격 | VRAM / RAM / vCPU | Available 표시 |
 |---|---:|---|---|
-| RTX 4090 / 미선택 | $0.74/h | 24GB / 41GB / 6 | $0.74/h, 24GB / 31GB / 12 |
-| RTX A5000 / 미선택 | $0.27/h | 24GB / 25GB / 9 | 최초 $0.27/h, 24GB / 50GB / 9; 후속 조회에서 표시 없음 |
+| RTX 4090 / 우선 후보, 미배포 | $0.34/h | 24GB / 125GB / 25 | 2 max |
+| RTX A5000 / 비용 비교 후보 | $0.16/h | 24GB / 25GB / 3 | 1 max |
+| L40S / VRAM 비교 후보 | $0.79/h | 48GB / 251GB / 24 | 4 max |
 
-위 값은 2026-10-03 확인 기준이며 확정 견적·실행 장비 사양이 아니다.
-공개 가격과 실제 offer의 CPU/RAM 차이를 유지하고 배포 시 최종 quote와 실제 할당을 기록한다.
-A5000은 최초 조회 뒤 후속 deploy 조회에서 표시되지 않았다. 재고·표시가 변동하는 후보이며
-현재 available을 보장하지 않는다. 특정 지역·필터·GPU를 선택하지 않은 관측이다.
+위 값은 로그인된 일반 deploy 폼을 **2026-10-03 03:17 UTC**에 읽은 관측이며
+확정 견적·배포 성공·실제 할당 사양이 아니다. `max`를 재고 총수로 해석하지 않는다.
+조건은 Community, Any region, Available, 최소 vCPU 1·RAM/VRAM 0,
+인터넷 속도 400·CUDA Any·public IP 필수 아님이다. 템플릿은 아래 PyTorch 후보다.
+4090/A5000은 최초 Community 조회에서는 없었고 후속 조회에 나타났다. 가용성은 변한다.
+이전 Secure 관측은 4090 $0.74/h·24/31/12, A5000 $0.27/h·24/50/9였으며
+현재 Community 가격과 섞지 않는다. 최종 quote에는 disk·기타 비용도 포함한다.
 GPU 종류·개수·최소 RAM/vCPU·datacenter 조건은 지정할 수 있으나 배포 성공은 별도 확인한다.
 [공개 가격표](https://www.runpod.io/pricing),
 [Pod 배포 조건](https://docs.runpod.io/api-reference-v2/pods/create-a-pod)
 
-4090을 외부 기준 장비로 삼는 안과 A5000으로 첫 smoke 비용을 줄이는 안이 있다.
+현재 4090은 A5000보다 vCPU/RAM 여유가 있어 CPU 준비·native bootstrap을 함께 보는
+첫 외부 기준 후보로 적합하다. 이는 offer 사양에 따른 제안이며 실측 속도 비교가 아니다.
 선정 후 재고 부족을 이유로 다른 GPU나 CPU로 자동 대체하지 않는다.
 RTX 4050과 다른 GPU의 시간·처리량을 직접 합치지 않고 내부 A/B는 같은 장비에서 수행한다.
 arena 크기를 제한하는 것만으로 외부 GPU를 RTX 4050과 동등한 장비로 만들 수 없다.
 
-총괄의 Pods 이동은 신규 `/deploy` 폼으로 이어졌고 Storage에서는 안내 landing을 관측했다.
-이는 기존 Pod·volume 목록을 확인한 결과가 아니므로 **기존 리소스 없음·volume 선택 완료**로
-판정하지 않는다. live 재고·지역·최종 quote·계정 실행 capability도 아직 미확정이다.
+이 조회는 신규 `/deploy` 폼이다. 기존 리소스 부재·Pod 생성·접속·GPU 사용 가능 상태를
+확인한 결과로 확대하지 않는다. 이전에 관측한 landing도 기존 리소스 목록 증거가 아니다.
 
 ## 컨테이너·입력·native 재현성
 
@@ -108,15 +118,23 @@ custom image/template으로 환경을 재사용할 수 있으며 host CUDA compa
 SSH를 실행·회수의 기본안으로, Web terminal을 짧은 확인용으로 제안한다.
 basic proxy SSH에는 SCP/SFTP가 없고 public IP를 지원하는 full SSH에는 있다.
 JupyterLab은 템플릿·port 설정에 의존하며 Rust 벤치의 필수 조건이 아니다.
-현재 계정의 SSH 인증·파일 전송 가능 여부는 미확인이다. 실제 연결은 사용자가 지정한
-기존 접속 수단으로 준비하고 새 key·public port·접근 권한을 임의로 추가하지 않는다.
+Pod의 SSH 인증·파일 전송 가능 여부는 미확인이다. Oracle 저장 서버의 SSH 접속과
+작은 archive의 SCP 왕복은 확인했다. Pod→Oracle 경로는 새 Pod에서 별도로 검사한다.
+public IP 없는 Pod에서도 proxy SSH/Web terminal로 명령을 실행하고 outbound SSH로
+Oracle에 전송하는 안을 우선한다. inbound SCP가 꼭 필요하면 full SSH 조건을 따로 잠근다.
+인증 자료와 **Pod Env 등록은 사용자 담당**이다. 에이전트는 지정한 key를 SSH 인증
+인자로만 사용하고 내용을 읽거나 출력·hash·보고서·image·Git에 포함하지 않는다.
+새 key·port·접근 권한을 임의로 추가하지 않는다.
 [접속 방법](https://docs.runpod.io/pods/connect-to-a-pod),
 [SSH와 전송 지원](https://docs.runpod.io/pods/configuration/use-ssh)
 
-container disk는 stop/restart 때 삭제되고, Pod volume disk는 stop 후 유지되지만 terminate 때
-삭제된다. network volume은 Pod와 독립적으로 유지되며 비용도 계속된다.
-일반 network volume은 첫 1TB $0.07/GB/month이고 Secure Cloud Pod에서 위치에 맞춰 배포 시
-연결한다. volume 위치가 GPU 가용성을 제한하므로 장비·지역을 함께 정한다.
+**network volume은 생성·연결하지 않는다.** 첫 smoke는 로컬 container disk에서 실행하고,
+보존할 결과는 Oracle로 회수한다. 첫 disk 크기는 **80GB 제안**이며 image·빌드·입력·
+bounded attempt의 실제 요구량과 최종 quote로 확정한다. 80GB의 공개 월 단가 환산은
+약 $0.011/h이고 현재 4090 카드와 합친 산술 예시는 약 $0.351/h다. 최종 견적이 아니다.
+container disk는 stop/restart 때 지워진다. Pod volume disk를 쓰는 후속 선택이 생기더라도
+terminate 때 지워지므로 외부 회수를 대신하지 않는다. network/global volume으로 조용히
+대체하지 않는다.
 [스토리지 수명](https://docs.runpod.io/pods/storage/types),
 [Network volume 조건](https://docs.runpod.io/storage/network-volumes)
 
@@ -128,25 +146,53 @@ stop은 GPU를 반환하며 storage 비용은 남고, restart 시 GPU 재고가 
 [Pod 수명·회수](https://docs.runpod.io/pods/manage-pods),
 [중지 후 GPU 가용성](https://docs.runpod.io/pods/troubleshooting/zero-gpus)
 
+Oracle의 전용 저장 공간은 논리 이름 `oracle-artifacts/coordinator-20261003`으로 기록한다.
+서버 주소·개인 key 경로는 공유 문서에 넣지 않는다. 확인된 가용 공간은 약 **31.7GB**다.
+첫 보존 admission은 repository 1GiB·archive 64MiB이며 OS quota를 설정한 것은 아니다.
+D/E/F 원본 719개와 과거 E 스크립트 2개를 하나의 435,710-byte archive로 보존했다.
+721개 모두 원래 receipt의 Git blob·SHA-256·길이와 대조했고 archive SCP 왕복 hash도 확인했다.
+이 스크립트들을 새 환경에서 실행한 것은 아니다. 상세 digest는 사전 최적화 기록에 둔다.
+
+입력/native 원본은 hash별 한 사본을 재사용할 수 있지만 실행마다 필요한 readonly pin·
+별도 inode·물리 수명 검증을 없애지 않는다. 성공/실패 attempt의 raw journal·PGN·receipt는
+각각 회수하고, 동일 witness나 재생성 가능한 큰 private copy는 manifest의 논리 참조와
+원본 digest를 통해 중복 전송을 줄인다. 원시 증거 자체를 생략하거나 무승부/성공으로 바꾸지 않는다.
+31.7GB에 16GiB attempt 여러 개와 native copies를 무제한 보존할 수 있다고 가정하지 않는다.
+유한 stage마다 회수·원격 bytes/hash 확인·보존 완료 receipt를 발급한다. 저장 용량·회수 실패는
+phase 실패로 보존하며 미회수 결과를 둔 채 Pod를 종료하지 않는다.
+
 ## 유한 실행 순서와 남은 결정
 
-1. **잠금·preflight:** 단일 source/image/binary/input/bundle과 실제 GPU·driver·process VRAM
+1. **코드 사전 검사:** 의미 보존 최적화·같은 입력의 전후 CPU 측정·동일 상태 witness·
+   전체 CPU CI를 인수한다. 이 단계의 비용 감소를 GPU/D03 성공으로 승격하지 않는다.
+   이번 source의 CPU 사전 검사는 사전 최적화 기록을 따른다.
+2. **잠금·preflight:** 단일 source/image/binary/input/bundle과 실제 GPU·driver·process VRAM
    계측·cgroup capability·wall/resource/output·취소·회수·과금 중지 경계를 확정한다.
-2. **1회 bounded smoke:** 새 환경에서 CUDA parity → UCI → 6-ply pair 연결을 확인한다.
+3. **1회 bounded smoke:** 새 환경에서 CUDA parity → UCI → 6-ply pair 연결을 확인한다.
    CPU regression은 별도 결과로 남긴다. startup/termination·actual CUDA profile·whole mapping·
    physical drain·guarded 소비·실패를 보존하고 이를 강도나 전체 D02 인수로 확대하지 않는다.
-3. **D02:** 동일 장비·source/model/backend/input hash·자원 예산에서 encoding·queue·전송·
+4. **D02:** 동일 장비·source/model/backend/input hash·자원 예산에서 encoding·queue·전송·
    실제 GPU 완료·전체 자기 wallclock의 full journal과 P50/P95/P99를 유한 표본으로 측정한다.
    cold/warm을 분리하고 반복 수·입력 순서·중단 조건을 사전에 잠근다.
-4. **내부 paired A/B:** 같은 장비·W/S·hash·입력·budget을 유지하고 runtime 한 변수만 바꾼다.
+5. **내부 paired A/B:** 같은 장비·W/S·hash·입력·budget을 유지하고 runtime 한 변수만 바꾼다.
    LC0 대조는 별도 commit/weights/backend/options와 같은 장비·시계·opening·색 교대 계약으로
    수행한다. 소형 smoke나 처리량 개선을 LC0 강도 향상으로 승격하지 않는다.
 
-남은 최소 사용자 결정은 **GPU**, **최대 총 wall·총비용**, **storage 용량·지역·보존 기간**이다.
-`US$5 / 60분 / 50GB network volume`은 첫 예시 제안이며 승인된 예산·기본값이 아니다.
-50GB의 월 표시 storage 비용 $3.50은 산술 예시이며 최종 견적이 아니다.
-20GB는 최소 권장량으로 삼지 않는다. 입력 약 2.98GB와 attempt 상한 16GiB(약 17.18GB)만
-합쳐도 약 20.16GB이며, 총괄이 관측한 기존 run 약 14.86GB의 실패·성공 보존 사례도 고려한다.
-native copy·입력·bounded output·보존 attempt 수의 실제 용량을 산정한 뒤 storage를 확정한다.
-기존 volume 선택·리소스 부재·배포 가능 상태는 미확정이다. 이 결정과 구체 실행 명세가
-정해지기 전 유료 Pod·volume·API를 생성하거나 실행하지 않는다.
+초기 총 지출 한도는 사용자 지정 **약 US$200**다. 총괄의 첫 하위 실행 한도는
+**US$5 / 전체 60분 / 단일 Pod·단일 attempt**로 두며 설치·idle·회수·disk 비용을 포함한다.
+그다음 D02·첫 A/B 묶음은 추가 US$20·전체 8시간 이내의 계획으로 두고, 실행할 입력·
+반복·cold/warm·실패/중단 조건을 잠근다. 나머지 약 US$175는 후속 연구 여유분이며 자동 소비하지 않는다.
+각 단계에서 실제 누적 비용·잔여 예산·quote를 재확인하고 더 낮은 비용/시간 한도부터 종료한다.
+견적 불명·세금/추가비용 누락·외부 lifecycle controller 미검증이면 유료 실행을 시작하지 않는다.
+이 하위 한도는 초기 총예산 안의 도입 기본값이며 총예산 증액을 요구하지 않는다.
+총괄이 담당들의 관련 GPU·disk·전송 지출을 합산한다. 각 에이전트에게 별도의 US$200나
+새 Pod 실행 권한을 부여하는 규약으로 해석하지 않는다. 이번 Oracle 작업은 기존 서버의
+지정 저장 공간만 사용했으며 새 instance·volume·유료 서비스·계정 설정을 생성하지 않았다.
+
+이전 `US$5 / 60분 / 50GB network volume` 예시는 폐기하고 network volume 미사용으로
+대체했다. 입력 약 2.98GB·attempt 상한 16GiB·기존 약 14.86GB private-copy 사례·image/
+빌드 요구량을 disk admission에서 함께 계산한다. 유한 보존 기간은 초기 자동 삭제 없이
+해당 연구의 인수·회수 확인까지로 두며, 이후 정리는 소유 범위·원본 보존을 확인해 별도로 진행한다.
+남은 것은 GPU 최종 선택, 사용자 Pod Env/접속 준비, image digest/실제 할당·cgroup와
+계측 capability, 과금 종료 controller와 한 회의 잠금 명세다. 이번 작업에서 유료 Pod를
+생성하거나 GPU A/B를 실행하지 않았다.

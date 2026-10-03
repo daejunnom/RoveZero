@@ -156,19 +156,25 @@ fn attested_forks_match_reexported_children_for_special_moves_claims_and_history
     ] {
         cases.push(Position::from_fen(fen).unwrap());
     }
+    // This test's local registry also never reissues an owner to another fork.
+    let mut sequence = 20_000_u64;
+    let mut allocate = || {
+        let owner = shared::OwnerId(sequence);
+        sequence = sequence.checked_add(1).unwrap();
+        owner
+    };
     for (index, position) in cases.into_iter().enumerate() {
         let parent = ContractPosition::new(shared::OwnerId(10_000 + index as u64), position);
         let frozen = parent.export().unwrap();
         for &movement in frozen.legal_moves().moves() {
             // Independent consumer path retained as the previous API baseline:
             // clone, export its own view, apply, then export the child.
-            let mut previous =
-                ContractPosition::new(shared::OwnerId(20_000), parent.position().clone());
+            let mut previous = ContractPosition::new(allocate(), parent.position().clone());
             let previous_view = previous.export().unwrap();
             previous.make_from_view(&previous_view, movement).unwrap();
             let expected = previous.export().unwrap();
             let child = parent
-                .fork_from_view(shared::OwnerId(30_000), &frozen, movement)
+                .fork_from_view(allocate(), &frozen, movement)
                 .unwrap();
             let actual = child.export().unwrap();
             assert_eq!(

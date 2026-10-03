@@ -55,6 +55,9 @@ CUDA capability 부재는 환경 상태로 기록하고 GPU 모드를 조용히 
 초기 RTX 4050 검증은 해당 장비의 이력입니다. 후속 GPU 벤치마크는 사용자 지정
 외부 RunPod 환경에서 준비하며 [준비 계획](research/RUNPOD-BENCHMARK-PLAN.md)의
 새 host·image·GPU·driver·자원 통제·비용·산출물 회수 조건을 실제 실행 전에 잠급니다.
+GPU A/B 전에 [의미 보존 최적화](research/PRE-RUNPOD-OPTIMIZATION.md)의 CPU 검증을
+먼저 인수합니다. Community/no network volume·초기 총예산·외부 회수의 현재 결정과
+하위 실행 한도는 준비 계획을 따르며 CPU 감소율을 GPU 종단 개선으로 바꾸지 않습니다.
 다른 GPU의 용량을 6GB로 제한한 결과를 RTX 4050 성능으로 표시하지 않습니다.
 
 ## Power of Ten 조정표
