@@ -96,7 +96,7 @@ fn actual_rules_inputs_complete_fixed_visits_with_real_multi_item_physical_batch
                 largest_batch.fetch_max(batch.requests().len() as u64, Ordering::AcqRel);
                 let raw = RawOutput {
                     policy_logits: vec![0.0; rz_encoding::POLICY_SIZE],
-                    wdl: vec![0.25, 0.5, 0.25],
+                    wdl: vec![0.5, 0.3, 0.2],
                 };
                 batch
                     .requests()
@@ -154,6 +154,7 @@ fn actual_rules_inputs_complete_fixed_visits_with_real_multi_item_physical_batch
         };
         let ids = Arc::new(IdAllocator::new(EPOCH));
         let mut peaks = 0;
+        let mut previous_stats = None;
         for root_number in 1..=2 {
             let scope = AcceptanceScope {
                 root: RootGeneration(root_number),
@@ -229,6 +230,13 @@ fn actual_rules_inputs_complete_fixed_visits_with_real_multi_item_physical_batch
             assert_eq!(result.counters.reservations_released, 33);
             assert_eq!(result.metrics.accepted_outputs, 33);
             assert_eq!(search.pending_requests(), 0);
+            if width == 1 {
+                if let Some(previous) = previous_stats {
+                    assert_eq!(result.root_stats, previous);
+                }
+                previous_stats = Some(result.root_stats.clone());
+            }
+
             assert!(
                 prepared
                     .snapshot

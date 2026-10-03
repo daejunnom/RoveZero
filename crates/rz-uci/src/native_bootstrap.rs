@@ -90,9 +90,14 @@ impl fmt::Debug for NativeConfig {
             .field("manifest_sha256", &self.manifest_sha256)
             .field("ort_sha256", &self.ort_sha256)
             .field("provider", &self.provider)
-            .field("execution_experiments", &self.execution_experiments)
-            .field("raw_cache", &self.raw_cache)
-            .field("parallelism", &self.parallelism)
+            .field(
+                "experiments",
+                &(u8::from(self.execution_experiments.reuse_buffers)
+                    | (u8::from(self.execution_experiments.io_binding) << 1)
+                    | (u8::from(self.execution_experiments.cuda_graph) << 2)
+                    | (u8::from(self.raw_cache) << 3)),
+            )
+            .field("batch", &self.parallelism)
             .field("cuda_bundle_sha256", &self.cuda_bundle_sha256)
             .field("cuda_bundle_selected", &self.cuda_bundle.is_some())
             .finish_non_exhaustive()
@@ -1585,6 +1590,16 @@ impl EvaluatorFactory for NativeSessionFactory {
             evaluator.set_raw_reuse(Box::new(self.owner.projection().raw_cache_provider()));
             evaluator
         };
+        let mut other_pending = std::collections::VecDeque::new();
+        other_pending
+            .try_reserve(self.owner.max_batch().saturating_sub(1))
+            .map_err(|_| {
+                error(
+                    ErrorCode::ResourceExhausted,
+                    Stage::Admission,
+                    "native pending context allocation failed",
+                )
+            })?;
         Ok(Box::new(NativeRuntime {
             evaluator,
             scope,
@@ -1594,7 +1609,7 @@ impl EvaluatorFactory for NativeSessionFactory {
             evidence: self.evidence.clone(),
             submissions: 0,
             pending: None,
-            other_pending: std::collections::VecDeque::new(),
+            other_pending,
             observation_error: None,
         }))
     }
@@ -1846,6 +1861,13 @@ impl Evaluator<RulesState> for NativeRuntime {
     }
 }
 impl ManagedEvaluator for NativeRuntime {
+    #[cfg(feature = "experimental-notify")]
+    fn wake_after(&self) -> Option<Duration> {
+        let state = self.evaluator.state();
+        // Queued batch wait must expire even when no worker can notify yet.
+        // During physical work, its completion signal owns the wakeup.
+        (state.queued > 0 && state.executions == 0).then_some(Duration::from_micros(200))
+    }
     fn shutdown(&mut self, until: Instant) -> Result<(), ContractError> {
         let drained = self.drain(until);
         let collected = self.evidence.collect(&self.owner);
@@ -2317,6 +2339,79 @@ mod physical_owner_tests {
             encoding: context.encoding,
             backend: context.backend,
         })
+    }
+
+    #[cfg(all(feature = "experimental-batch", feature = "experimental-notify"))]
+    #[test]
+    fn queued_native_batch_timer_reaches_worker_without_an_initial_completion_signal() {
+        let owners = Arc::new(OwnerRegistry::default());
+        let original = projection(&owners);
+        let projection = ClassicalProjection::new(
+            MaiaBinding::new(
+                original.model().handle(),
+                original.model().encoding().handle,
+                HistoryFill::No,
+                original.backend(),
+                4,
+            )
+            .unwrap(),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let worker = SingleWorker::spawn(move |batch: &PreparedBatch<RulesState>| {
+            observed_calls.fetch_add(1, Ordering::AcqRel);
+            batch
+                .requests()
+                .iter()
+                .map(|request| {
+                    request
+                        .physical_output(&raw(), batch.execution())
+                        .map_err(PhysicalFailure::from)
+                })
+                .collect()
+        })
+        .unwrap();
+        let owner = NativeWorkerOwner::from_worker_batched(
+            worker,
+            projection,
+            4,
+            rz_eval::native_runtime_bridge::NativeAdmissionPolicy::Cpu,
+            4,
+        )
+        .unwrap();
+        let factory = NativeCpuFactory::from_owner(owner, None).unwrap();
+        let signal = factory.completion_signal().unwrap();
+        let clock = ProcessClock::new(ProcessEpoch(305));
+        let request = request(&factory, &owners, &clock, 1);
+        let context = request.context();
+        let mut runtime = factory.create(clock, authority(context)).unwrap();
+        runtime.submit(request).unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert_eq!(runtime.wake_after(), Some(Duration::from_micros(200)));
+        let until = Instant::now() + WAIT;
+        let result = loop {
+            // Use the same predicate/sequence/timer order as the UCI owner.
+            let observed = signal.version();
+            if let Some(result) = runtime.poll() {
+                break result;
+            }
+            assert!(Instant::now() < until, "bounded native batch wakeup");
+            signal.wait_changed(
+                observed,
+                runtime
+                    .wake_after()
+                    .unwrap_or(WAIT)
+                    .min(until.saturating_duration_since(Instant::now())),
+            );
+        };
+        let EvalResult::Completed(output) = result else {
+            panic!("queued batch must complete after its timer and worker signal");
+        };
+        assert_eq!(output.context, context);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(runtime.wake_after(), None);
+        runtime.shutdown(Instant::now() + WAIT).unwrap();
+        factory.finish(Ok(())).unwrap();
     }
 
     #[test]

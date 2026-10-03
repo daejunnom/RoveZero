@@ -1337,3 +1337,93 @@ fn parallel_requests_accept_reverse_order_once_and_cancel_all_virtual_paths() {
         }
     }
 }
+
+#[cfg(feature = "experimental-state-cache")]
+#[test]
+fn state_cache_zero_tiny_and_eviction_preserve_exact_visit_results() {
+    #[derive(Clone)]
+    struct Estimated(Position);
+    impl ContractPosition for Estimated {
+        type State = FixtureState;
+        fn snapshot(&self) -> &PositionSnapshot<Self::State> {
+            self.0.snapshot()
+        }
+        fn legal(&self) -> &LegalMoveView {
+            self.0.legal()
+        }
+        fn play(&self, movement: &Move) -> Result<Self, ContractError> {
+            self.0.play(movement).map(Self)
+        }
+        fn validate_authority(&self) -> Result<(), ContractError> {
+            self.0.validate_authority()
+        }
+        fn retained_bytes(&self) -> Option<usize> {
+            Some(512)
+        }
+    }
+    let mut golden = None;
+    for limits in [
+        StateCacheLimits {
+            max_entries: 0,
+            max_bytes: 0,
+        },
+        StateCacheLimits {
+            max_entries: 2,
+            max_bytes: 1,
+        },
+        StateCacheLimits {
+            max_entries: 1,
+            max_bytes: 8192,
+        },
+        StateCacheLimits::default(),
+    ] {
+        let mut search = ContractSearch::new(
+            Estimated(ongoing_child()),
+            config(Arc::new(IdAllocator::new(EPOCH)), 3),
+        )
+        .unwrap();
+        search.set_state_cache_limits(limits).unwrap();
+        assert!(
+            search
+                .set_state_cache_limits(StateCacheLimits {
+                    max_entries: 1025,
+                    max_bytes: 1
+                })
+                .is_err()
+        );
+        let mut runtime = ScriptedEvaluator::default();
+        let clock = ManualClock::new(1);
+        for _ in 0..24 {
+            let event = search.pump(&mut runtime, &clock, scope, |p, e| input_key(&p.0, e));
+            if let ContractPumpEvent::Submitted { .. } = event {
+                let request = runtime.submissions.last().unwrap();
+                runtime.results.push_back(EvalResult::Completed(completed(
+                    request,
+                    &[1.0],
+                    [0.4, 0.3, 0.3],
+                )));
+            }
+            let (entries, bytes, _) = search.state_cache_storage();
+            assert!(entries <= limits.max_entries);
+            assert!(bytes <= limits.max_bytes);
+            if search.is_finished() {
+                break;
+            }
+        }
+        let outcome = search.outcome();
+        assert!(matches!(outcome.status, ContractSearchStatus::Completed));
+        assert_eq!(outcome.counters.completed_visits, 3);
+        let actual = (outcome.counters, outcome.metrics, outcome.root_stats);
+        if let Some(expected) = &golden {
+            assert_eq!(&actual, expected);
+        } else {
+            golden = Some(actual);
+        }
+        let (_, _, hits) = search.state_cache_storage();
+        if limits.max_bytes >= 8192 {
+            assert!(hits > 0);
+        } else {
+            assert_eq!(hits, 0);
+        }
+    }
+}

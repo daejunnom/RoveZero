@@ -130,7 +130,7 @@ impl ClassicalProjection {
     ) -> Result<EvalInputKey, ContractError> {
         #[cfg(feature = "experimental-prepared-input")]
         {
-            return Ok(self.prepared_input(state, ordered_legal, None)?.key);
+            Ok(self.prepared_input(state, ordered_legal, None)?.key)
         }
         #[cfg(not(feature = "experimental-prepared-input"))]
         {
@@ -167,7 +167,7 @@ impl ClassicalProjection {
                 request.legal().moves(),
                 Some(&request),
             )?;
-            return self.attach_raw_cache(self.binding.prepare_rules(request, &prepared)?);
+            self.attach_raw_cache(self.binding.prepare_rules(request, &prepared)?)
         }
         #[cfg(not(feature = "experimental-prepared-input"))]
         {

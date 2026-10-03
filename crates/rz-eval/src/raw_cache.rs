@@ -120,9 +120,9 @@ impl RawCache {
             .map_err(|_| failed("raw cache owner poisoned"))?;
         store.limits = limits;
         store.profile = None;
-        store.entries.clear();
-        store.staged.clear();
-        store.live.clear();
+        store.entries = VecDeque::new();
+        store.staged = Vec::new();
+        store.live = Vec::new();
         store.stats = RawCacheStats::default();
         self.1.store(
             limits.max_entries > 0 && limits.max_bytes > 0,
@@ -134,12 +134,16 @@ impl RawCache {
         self.1.load(Ordering::Acquire)
     }
     pub fn clear(&self) -> Result<(), ContractError> {
-        let limits = self
+        let mut store = self
             .0
             .lock()
-            .map_err(|_| failed("raw cache owner poisoned"))?
-            .limits;
-        self.configure(limits)
+            .map_err(|_| failed("raw cache owner poisoned"))?;
+        store.profile = None;
+        store.entries = VecDeque::new();
+        store.staged = Vec::new();
+        store.live = Vec::new();
+        store.stats = RawCacheStats::default();
+        Ok(())
     }
     pub fn stats(&self) -> Result<RawCacheStats, ContractError> {
         let store = self
@@ -185,7 +189,7 @@ impl RawCache {
             Ok(Some(result))
         } else {
             store.stats.misses = store.stats.misses.saturating_add(1);
-            if store.live.len() < 1024 && store.live.try_reserve(1).is_ok() {
+            if store.live.len() < store.limits.max_entries && store.live.try_reserve(1).is_ok() {
                 store.live.push(context.request);
             } else {
                 store.stats.stage_failures = store.stats.stage_failures.saturating_add(1);

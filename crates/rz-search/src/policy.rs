@@ -123,7 +123,7 @@ impl SelectionPolicy for Puct {
                     best_score = score;
                 }
             }
-            return Ok(best);
+            Ok(best)
         }
         #[cfg(not(feature = "experimental-puct"))]
         {

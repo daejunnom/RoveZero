@@ -320,6 +320,11 @@ pub struct EvaluatorProfile {
 /// completion can still be queued. UCI closes shared cancellation on its own
 /// stop/root/deadline/quit or completed-output acceptance boundary.
 pub trait ManagedEvaluator: contract::Evaluator<RulesState> + Send {
+    /// Timer source for work which has not reached a physical worker yet.
+    #[cfg(feature = "experimental-notify")]
+    fn wake_after(&self) -> Option<Duration> {
+        None
+    }
     fn shutdown(&mut self, deadline: Instant) -> Result<(), contract::ContractError>;
 }
 pub trait EvaluatorFactory: Send + Sync + 'static {
@@ -1038,7 +1043,11 @@ impl Owner {
                                         control
                                             .deadline
                                             .saturating_duration_since(Instant::now())
-                                            .min(Duration::from_secs(1)),
+                                            .min(
+                                                runtime
+                                                    .wake_after()
+                                                    .unwrap_or(Duration::from_secs(1)),
+                                            ),
                                     );
                                 }
                             } else {

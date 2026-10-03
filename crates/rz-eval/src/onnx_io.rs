@@ -68,7 +68,9 @@ impl BoundBuffers {
         input: &Tensor<f32>,
         pool: &mut Vec<RawOutput>,
         reuse: bool,
+        mut timing: Option<&mut IoTimings>,
     ) -> Result<Vec<RawOutput>, BoundFailure> {
+        let transfer_started = std::time::Instant::now();
         if let Some(device) = &mut self.device_input {
             // ORT's synchronous Identity copy targets the existing allocation;
             // it does not replace the graph's input address. No async option.
@@ -78,10 +80,22 @@ impl BoundBuffers {
             self.binding.bind_input(INPUT_NAME, input)?;
         }
         self.binding.synchronize_inputs()?;
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.transfer_in = Some(transfer_started.elapsed());
+        }
+        let run_started = std::time::Instant::now();
         let mut outputs = session.run_binding(&self.binding)?;
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.run = run_started.elapsed();
+        }
+        let fence_started = std::time::Instant::now();
         self.binding.synchronize_outputs()?;
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.output_fence = Some(fence_started.elapsed());
+        }
         let copied = if let (Some(policy), Some(wdl)) = (&mut self.host_policy, &mut self.host_wdl)
         {
+            let transfer_started = std::time::Instant::now();
             outputs
                 .remove(POLICY_NAME)
                 .ok_or_else(|| ort::Error::new("missing bound policy"))?
@@ -92,10 +106,19 @@ impl BoundBuffers {
                 .ok_or_else(|| ort::Error::new("missing bound WDL"))?
                 .downcast::<TensorValueType<f32>>()?
                 .copy_into(wdl)?;
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.transfer_out = Some(transfer_started.elapsed());
+            }
+            let own_started = std::time::Instant::now();
             let (_, policy) = policy.try_extract_tensor::<f32>()?;
             let (_, wdl) = wdl.try_extract_tensor::<f32>()?;
-            pack_outputs(policy, wdl, self.batch, pool, reuse)
+            let outputs = pack_outputs(policy, wdl, self.batch, pool, reuse);
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.own_outputs = own_started.elapsed();
+            }
+            outputs
         } else {
+            let own_started = std::time::Instant::now();
             let (_, policy) = outputs
                 .get(POLICY_NAME)
                 .ok_or_else(|| ort::Error::new("missing policy"))?
@@ -104,7 +127,12 @@ impl BoundBuffers {
                 .get(WDL_NAME)
                 .ok_or_else(|| ort::Error::new("missing WDL"))?
                 .try_extract_tensor::<f32>()?;
-            pack_outputs(policy, wdl, self.batch, pool, reuse)
+            let outputs = pack_outputs(policy, wdl, self.batch, pool, reuse);
+            if let Some(timing) = timing {
+                timing.transfer_out = Some(std::time::Duration::ZERO);
+                timing.own_outputs = own_started.elapsed();
+            }
+            outputs
         };
         copied.map_err(BoundFailure::Output)
     }

@@ -370,6 +370,13 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
                     #[cfg(not(feature = "experimental-search-buffers"))]
                     let selected = {
                         let stats: Vec<_> = edges.iter().map(|e| e.stats).collect();
+                        #[cfg(feature = "experimental-batch")]
+                        if self.max_pending > 1 {
+                            0
+                        } else {
+                            self.policy.select(&stats)?
+                        }
+                        #[cfg(not(feature = "experimental-batch"))]
                         self.policy.select(&stats)?
                     };
                     #[cfg(feature = "experimental-search-buffers")]
@@ -380,6 +387,13 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
                             .map_err(|_| SearchError::AllocationFailed)?;
                         self.selection_stats
                             .extend(edges.iter().map(|edge| edge.stats));
+                        #[cfg(feature = "experimental-batch")]
+                        if self.max_pending > 1 {
+                            0
+                        } else {
+                            self.policy.select(&self.selection_stats)?
+                        }
+                        #[cfg(not(feature = "experimental-batch"))]
                         self.policy.select(&self.selection_stats)?
                     };
                     #[cfg(feature = "experimental-batch")]

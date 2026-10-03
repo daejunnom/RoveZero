@@ -24,6 +24,18 @@ use std::sync::{Arc, Mutex};
 mod io;
 const MAX_BATCH: usize = 16;
 
+/// CPU wall-clock boundaries. Run includes kernels and synchronization;
+/// these are not GPU event times. None means that transfer is inside Run.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IoTimings {
+    pub host_stage: std::time::Duration,
+    pub transfer_in: Option<std::time::Duration>,
+    pub run: std::time::Duration,
+    pub output_fence: Option<std::time::Duration>,
+    pub transfer_out: Option<std::time::Duration>,
+    pub own_outputs: std::time::Duration,
+}
+
 /// Independent, explicit experiments; compiling them does not enable them.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ExecutionExperiments {
@@ -426,6 +438,7 @@ pub struct OnnxBackend {
     bound: Option<io::BoundBuffers>,
     /// Successful synchronous binding runs. This is not proof of GPU replay.
     bound_runs: u64,
+    timings: Option<IoTimings>,
     config: BackendConfig,
     identity: [u8; 32],
     asset_identity: [u8; 32],
@@ -584,6 +597,7 @@ impl OnnxBackend {
             #[cfg(feature = "experimental-io-binding")]
             bound: None,
             bound_runs: 0,
+            timings: None,
             config,
             identity: asset::sha256(profile.as_bytes()),
             asset_identity: asset.manifest_digest(),
@@ -772,6 +786,9 @@ impl OnnxBackend {
             }
         }
     }
+    pub fn last_io_timings(&self) -> Option<IoTimings> {
+        self.timings
+    }
     pub fn binding_runs(&self) -> u64 {
         self.bound_runs
     }
@@ -810,6 +827,9 @@ impl OnnxBackend {
                 "input must be finite FP32 [112,8,8]",
             ));
         }
+        let measured = self.config.experiments != ExecutionExperiments::default();
+        let stage_started = measured.then(std::time::Instant::now);
+        self.timings = measured.then(IoTimings::default);
         #[cfg(feature = "experimental-io-buffers")]
         let spare = if self.config.experiments.reuse_buffers {
             self.spare_input
@@ -861,6 +881,10 @@ impl OnnxBackend {
             }
         };
         self.active_input = Some(tensor);
+        if let (Some(timing), Some(started)) = (&mut self.timings, stage_started) {
+            timing.host_stage = started.elapsed();
+        }
+
         #[cfg(feature = "experimental-io-binding")]
         if self.config.experiments.io_binding {
             if self
@@ -869,27 +893,35 @@ impl OnnxBackend {
                 .is_none_or(|buffers| buffers.batch != inputs.len())
             {
                 // One shape slot, changed only after the preceding physical fence.
-                self.bound = Some(
-                    io::BoundBuffers::new(
-                        self.session.as_ref().expect("loaded session"),
-                        self.config.provider,
-                        inputs.len(),
-                    )
-                    .map_err(|error| {
-                        BackendError::new(
+                let buffers = match io::BoundBuffers::new(
+                    self.session.as_ref().expect("loaded session"),
+                    self.config.provider,
+                    inputs.len(),
+                ) {
+                    Ok(buffers) => buffers,
+                    Err(error) => {
+                        let failure = BackendError::new(
                             K::BackendFailure,
                             S::Backend,
                             "fixed binding allocation failed",
                         )
-                        .with_ort_cause(CauseCode::TensorCreate, error)
-                    })?,
-                );
+                        .with_ort_cause(CauseCode::TensorCreate, error);
+                        if matches!(self.config.provider, Provider::Cuda { .. }) {
+                            self.quarantine_cause = Some(failure.clone());
+                        } else {
+                            self.active_input = None;
+                        }
+                        return Err(failure);
+                    }
+                };
+                self.bound = Some(buffers);
             }
             let result = self.bound.as_mut().expect("fixed binding").run(
                 self.session.as_mut().expect("loaded session"),
                 self.active_input.as_ref().expect("input pin"),
                 &mut self.raw_pool,
                 self.config.experiments.reuse_buffers,
+                self.timings.as_mut(),
             );
             match result {
                 Ok(outputs) => {
@@ -921,6 +953,7 @@ impl OnnxBackend {
         // Only a successful CUDA Run attests the synchronous device fence.
         // Arbitrary CUDA errors retain the input/session instead of granting
         // physical Ready. CPU errors keep the existing completed-error behavior.
+        let run_started = measured.then(std::time::Instant::now);
         let run_result = self
             .session
             .as_mut()
@@ -929,6 +962,9 @@ impl OnnxBackend {
             })?
             .run(ort::inputs![INPUT_NAME => self.active_input.as_ref()
             .ok_or(BackendError::new(K::BackendFailure, S::Backend, "input pin is missing"))?]);
+        if let (Some(timing), Some(started)) = (&mut self.timings, run_started) {
+            timing.run = started.elapsed();
+        }
         let outputs = match run_result {
             Ok(outputs) => outputs,
             Err(error) => {
@@ -970,13 +1006,18 @@ impl OnnxBackend {
         {
             return Err(malformed());
         }
-        pack_outputs(
+        let own_started = measured.then(std::time::Instant::now);
+        let result = pack_outputs(
             policy,
             wdl,
             inputs.len(),
             &mut self.raw_pool,
             self.config.experiments.reuse_buffers,
-        )
+        );
+        if let (Some(timing), Some(started)) = (&mut self.timings, own_started) {
+            timing.own_outputs = started.elapsed();
+        }
+        result
     }
 }
 
