@@ -161,6 +161,8 @@ pub struct Tree<M, P = Puct> {
     deadline: Option<Instant>,
     cancellation: Option<Arc<AtomicBool>>,
     counters: SearchCounters,
+    #[cfg(feature = "experimental-search-buffers")]
+    selection_stats: Vec<EdgeStats>,
 }
 
 impl<M: Clone + Eq> Tree<M, Puct> {
@@ -183,6 +185,8 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
             deadline: None,
             cancellation: None,
             counters: SearchCounters::default(),
+            #[cfg(feature = "experimental-search-buffers")]
+            selection_stats: Vec::new(),
         })
     }
 
@@ -239,6 +243,10 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
         }
     }
 
+    pub fn has_root_visits(&self) -> bool {
+        matches!(&self.nodes[0], Node::Expanded(edges) if edges.iter().any(|edge| edge.stats.visits > 0))
+    }
+
     /// None until root initialization or for an exact terminal root.
     pub fn best_move(&self) -> Option<&M> {
         let Node::Expanded(edges) = &self.nodes[0] else {
@@ -288,8 +296,21 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
                     if path.len() >= self.limits.max_depth {
                         return Err(SearchError::DepthLimit);
                     }
-                    let stats: Vec<_> = edges.iter().map(|e| e.stats).collect();
-                    let selected = self.policy.select(&stats)?;
+                    #[cfg(not(feature = "experimental-search-buffers"))]
+                    let selected = {
+                        let stats: Vec<_> = edges.iter().map(|e| e.stats).collect();
+                        self.policy.select(&stats)?
+                    };
+                    #[cfg(feature = "experimental-search-buffers")]
+                    let selected = {
+                        self.selection_stats.clear();
+                        self.selection_stats
+                            .try_reserve(edges.len())
+                            .map_err(|_| SearchError::AllocationFailed)?;
+                        self.selection_stats
+                            .extend(edges.iter().map(|edge| edge.stats));
+                        self.policy.select(&self.selection_stats)?
+                    };
                     let edge = edges
                         .get(selected)
                         .ok_or(SearchError::InvalidPolicySelection)?;

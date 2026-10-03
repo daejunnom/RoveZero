@@ -93,15 +93,50 @@ impl SelectionPolicy for Puct {
     }
 
     fn select(&self, edges: &[EdgeStats]) -> Result<usize, SearchError> {
-        let scores = self.scores(edges)?;
-        let mut best = 0;
-        for i in 1..scores.len() {
-            // Strict comparison preserves the supplied legal order for exact ties.
-            if scores[i] > scores[best] {
-                best = i;
+        #[cfg(feature = "experimental-puct")]
+        {
+            if edges.is_empty() {
+                return Err(SearchError::NoLegalEdges);
             }
+            let parent_visits = edges.iter().try_fold(0_u64, |sum, edge| {
+                sum.checked_add(edge.visits)
+                    .ok_or(SearchError::CounterOverflow)
+            })?;
+            let scale = (parent_visits.max(1) as f64).sqrt();
+            let mut best = 0;
+            let mut best_score = f64::NEG_INFINITY;
+            for (index, edge) in edges.iter().enumerate() {
+                if !edge.prior.is_finite()
+                    || !(0.0..=1.0).contains(&edge.prior)
+                    || !edge.value_sum.is_finite()
+                    || edge.value_sum.abs() > edge.visits as f64
+                {
+                    return Err(SearchError::InvalidStatistics);
+                }
+                let score =
+                    edge.q() + self.c_puct * edge.prior * scale / (1.0 + edge.visits as f64);
+                if !score.is_finite() {
+                    return Err(SearchError::InvalidStatistics);
+                }
+                if score > best_score {
+                    best = index;
+                    best_score = score;
+                }
+            }
+            return Ok(best);
         }
-        Ok(best)
+        #[cfg(not(feature = "experimental-puct"))]
+        {
+            let scores = self.scores(edges)?;
+            let mut best = 0;
+            for i in 1..scores.len() {
+                // Strict comparison preserves the supplied legal order for exact ties.
+                if scores[i] > scores[best] {
+                    best = i;
+                }
+            }
+            Ok(best)
+        }
     }
 }
 
@@ -191,6 +226,23 @@ mod tests {
         ];
         assert_eq!(
             Puct::default().select(&overflow),
+            Err(SearchError::CounterOverflow)
+        );
+        let trailing_bad = [
+            EdgeStats {
+                prior: 1.0,
+                visits: 0,
+                value_sum: 0.0,
+            },
+            bad[0],
+        ];
+        assert_eq!(
+            Puct::default().select(&trailing_bad),
+            Err(SearchError::InvalidStatistics)
+        );
+        let bad_and_overflow = [bad[0], overflow[0], overflow[1]];
+        assert_eq!(
+            Puct::default().select(&bad_and_overflow),
             Err(SearchError::CounterOverflow)
         );
     }

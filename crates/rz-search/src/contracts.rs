@@ -285,6 +285,20 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         }
     }
 
+    /// Allocation-free progress query, with the same zero-visit fallback rule.
+    pub fn best_move(&self) -> Option<Move> {
+        let best = if self.tree.has_root_visits() {
+            self.tree.best_move().copied()
+        } else {
+            None
+        };
+        best.or(self.fallback)
+    }
+
+    pub fn counters(&self) -> SearchCounters {
+        self.tree.counters()
+    }
+
     /// 기다리지 않는 논리 상태 전이. Runtime의 각 메서드도 blocking하면 안 된다.
     /// 이 탐색은 해당 poll stream의 단일 활성 consumer다. 이전 탐색을 논리적으로
     /// 닫은 뒤 stream을 재사용한다. 동시 탐색은 Runtime dispatcher가 RequestId별로

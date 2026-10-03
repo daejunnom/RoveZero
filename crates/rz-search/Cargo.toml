@@ -6,5 +6,10 @@ rust-version = "1.85"
 license = "MIT"
 description = "RoveZero deterministic PUCT accounting and time control"
 
+[features]
+default = []
+experimental-puct = []
+experimental-search-buffers = []
+
 [dependencies]
 rz-contracts.workspace = true

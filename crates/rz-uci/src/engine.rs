@@ -961,7 +961,11 @@ impl Owner {
                             authority.cancel();
                             diagnostic_failure = Some(error);
                         }
-                        let best = search.outcome().best_move;
+                        let best = if cfg!(feature = "experimental-best-move") {
+                            search.best_move()
+                        } else {
+                            search.outcome().best_move
+                        };
                         if best != previous_move {
                             previous_move = best;
                             if let Some(bestmove) =
