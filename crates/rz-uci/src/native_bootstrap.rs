@@ -45,6 +45,7 @@ use std::{
     fmt, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, TryLockError},
+    task::Poll,
     thread,
     time::{Duration, Instant},
 };
@@ -755,6 +756,9 @@ pub struct NativeRunError {
     pub service: Option<Box<EngineError>>,
     pub report: Option<Box<NativeRunReport>>,
     pub collection_error: Option<ContractError>,
+    /// Process-worker teardown has its own original contract/native cause. A
+    /// request-drain result must not replace failure to destroy/join the session.
+    pub worker_shutdown_error: Option<Box<PhysicalFailure>>,
     /// Final loaded-image audit is independent of physical drain. Keep its
     /// bounded original backend cause even when collection is also incomplete.
     pub runtime_mapping_error: Option<Box<BackendError>>,
@@ -765,6 +769,9 @@ impl NativeRunError {
     pub fn retained_owner(&self) -> &NativeWorkerOwner {
         &self.retained_owner
     }
+    pub fn worker_shutdown_failure(&self) -> Option<&PhysicalFailure> {
+        self.worker_shutdown_error.as_deref()
+    }
 }
 impl fmt::Debug for NativeRunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -772,6 +779,7 @@ impl fmt::Debug for NativeRunError {
             .field("service", &self.service)
             .field("report", &self.report)
             .field("collection_error", &self.collection_error)
+            .field("worker_shutdown_error", &self.worker_shutdown_error)
             .finish_non_exhaustive()
     }
 }
@@ -788,13 +796,21 @@ impl fmt::Display for NativeRunError {
         if let Some(error) = &self.collection_error {
             write!(f, "; collection: {error}")?;
         }
+        if let Some(error) = &self.worker_shutdown_error {
+            write!(f, "; process worker shutdown: {error}")?;
+        }
         if let Some(error) = &self.runtime_mapping_error {
             write!(f, "; final runtime mapping audit: {error}")?;
         }
         Ok(())
     }
 }
-impl std::error::Error for NativeRunError {}
+impl std::error::Error for NativeRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.worker_shutdown_failure()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// One verified session/worker for the executable process. No inference-count
 /// lifetime quota: identity ledgers are constant-space and every root has B's
@@ -1031,33 +1047,61 @@ impl NativeSessionFactory {
             )
         })
     }
-    /// Called for serve success and failure. A busy physical owner/evidence lock
-    /// is queried without blocking; a bounded failure keeps both capabilities.
+    /// Called for serve success and failure. Request drain and process-worker
+    /// teardown share one deadline. A busy owner or pending reaper never permits
+    /// report transfer, and a bounded failure keeps the original capabilities.
     pub fn finish(
         &self,
         served: Result<(), EngineError>,
     ) -> Result<NativeRunReport, NativeRunError> {
-        let until = Instant::now() + FINAL_COLLECTION_LIMIT;
+        self.finish_until(served, Instant::now() + FINAL_COLLECTION_LIMIT)
+    }
+    fn finish_until(
+        &self,
+        served: Result<(), EngineError>,
+        until: Instant,
+    ) -> Result<NativeRunReport, NativeRunError> {
         let mut collection_error = None;
+        let mut worker_shutdown_error = None;
+        let mut worker_joined = false;
         loop {
-            match confirm_collected_drain(
-                || self.evidence.collect(&self.owner),
-                || self.owner.try_status(),
-            ) {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(error) => {
-                    collection_error = Some(error);
-                    break;
+            // Request terminal admission closure before other drain waits. A
+            // busy owner lock remains Pending until C linearizes that closure;
+            // it keeps active-lease polling available and starts its reaper only
+            // once the physical lease has drained.
+            if !worker_joined && worker_shutdown_error.is_none() {
+                match self.owner.try_shutdown() {
+                    Poll::Ready(Ok(())) => worker_joined = true,
+                    Poll::Ready(Err(failure)) => {
+                        worker_shutdown_error = Some(Box::new(failure));
+                    }
+                    Poll::Pending => {}
                 }
             }
             if Instant::now() >= until {
                 collection_error = Some(error(
                     ErrorCode::Expired,
                     Stage::Output,
-                    "native final collection deadline reached; owner and evidence retained",
+                    "native final collection or worker join deadline reached; owner and evidence retained",
                 ));
                 break;
+            }
+            match confirm_collected_drain(
+                || self.evidence.collect(&self.owner),
+                || self.owner.try_status(),
+            ) {
+                Ok(true) if worker_joined => break,
+                Ok(true) => {
+                    if let Some(failure) = &worker_shutdown_error {
+                        collection_error = Some(failure.contract);
+                        break;
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    collection_error = Some(error);
+                    break;
+                }
             }
             thread::sleep(Duration::from_millis(1));
         }
@@ -1070,8 +1114,8 @@ impl NativeSessionFactory {
             } else {
                 None
             };
-        // If a worker/owner is still active, leave the report in its shared
-        // store. A late collector must not encounter a moved-out destination.
+        // If physical work, destructor/join or final collection is unconfirmed,
+        // leave the report in its shared store for the retained owner/collector.
         let report = if collection_error.is_none() {
             match self.evidence.try_take_report() {
                 Ok(report) => report,
@@ -1086,6 +1130,7 @@ impl NativeSessionFactory {
         let service = served.err().map(Box::new);
         if service.is_none()
             && collection_error.is_none()
+            && worker_shutdown_error.is_none()
             && runtime_mapping_error.is_none()
             && report.as_ref().is_some_and(|report| !report.has_failure())
         {
@@ -1095,6 +1140,7 @@ impl NativeSessionFactory {
             service,
             report: report.map(Box::new),
             collection_error,
+            worker_shutdown_error,
             runtime_mapping_error,
             retained_evidence: self.evidence.clone(),
             retained_owner: self.owner.clone(),
@@ -1551,7 +1597,7 @@ mod physical_owner_tests {
     use std::{
         io::Write,
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc,
         },
     };
@@ -1630,6 +1676,287 @@ mod physical_owner_tests {
             crate::native_attestation::StartupReceiptV1::capture(&factory, &clock).unwrap_err();
         assert!(denied.to_string().contains("actually loaded CPU ONNX"));
         let report = factory.finish(Ok(())).unwrap();
+        assert_eq!(report.origin, NativeWorkerOrigin::Injected);
+        assert_eq!(report.completed_by_runtime, 0);
+    }
+
+    struct SessionDropProbe {
+        dropped: Arc<AtomicBool>,
+        gate: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
+        panic_on_drop: bool,
+    }
+    impl Drop for SessionDropProbe {
+        fn drop(&mut self) {
+            if let Some((entered, release)) = &self.gate {
+                let _ = entered.try_send(());
+                assert!(
+                    release.recv_timeout(WAIT).is_ok(),
+                    "bounded injected session destructor release"
+                );
+            }
+            assert!(
+                !self.panic_on_drop,
+                "private injected session destructor panic"
+            );
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+    struct DestructorRelease(Option<mpsc::SyncSender<()>>);
+    impl DestructorRelease {
+        fn release(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.try_send(());
+            }
+        }
+    }
+    impl Drop for DestructorRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+    fn factory_with_drop_probe(
+        owners: &OwnerRegistry,
+        probe: SessionDropProbe,
+    ) -> NativeCpuFactory {
+        let worker = SingleWorker::spawn(move |batch: &PreparedBatch<RulesState>| {
+            // Keep the probe in the same long-lived closure as an ONNX session.
+            let _session = &probe;
+            batch
+                .requests()
+                .iter()
+                .map(|request| request.physical_output(&raw(), batch.execution()))
+                .collect()
+        })
+        .unwrap();
+        let owner = NativeWorkerOwner::from_worker(worker, projection(owners), 1).unwrap();
+        NativeCpuFactory::from_owner(owner, None).unwrap()
+    }
+
+    #[test]
+    fn final_report_waits_for_idle_session_destruction_and_actual_worker_join() {
+        let owners = OwnerRegistry::default();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let factory = factory_with_drop_probe(
+            &owners,
+            SessionDropProbe {
+                dropped: Arc::clone(&dropped),
+                gate: None,
+                panic_on_drop: false,
+            },
+        );
+        assert!(!dropped.load(Ordering::Acquire));
+        let report = factory.finish(Ok(())).unwrap();
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "owner idle alone cannot authorize the final report before session drop"
+        );
+        assert_eq!(report.origin, NativeWorkerOrigin::Injected);
+        assert_eq!(report.completed_by_runtime, 0);
+        assert!(!report.has_failure());
+    }
+
+    #[test]
+    fn blocked_session_destructor_keeps_service_source_and_evidence_until_join() {
+        let owners = OwnerRegistry::default();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (entered, observing) = mpsc::sync_channel(1);
+        let (release, waiting) = mpsc::sync_channel(1);
+        let mut release = DestructorRelease(Some(release));
+        let factory = factory_with_drop_probe(
+            &owners,
+            SessionDropProbe {
+                dropped: Arc::clone(&dropped),
+                gate: Some((entered, waiting)),
+                panic_on_drop: false,
+            },
+        );
+        // Establish the destructor gate before starting the short deadline;
+        // thread scheduling time is not the behavior under test.
+        assert!(matches!(factory.inner.owner.try_shutdown(), Poll::Pending));
+        observing.recv_timeout(WAIT).unwrap();
+        let service = error(
+            ErrorCode::BackendFailure,
+            Stage::Output,
+            "independent injected protocol failure",
+        );
+        // The production wrapper always uses FINAL_COLLECTION_LIMIT. This
+        // shorter injected deadline exercises the same bounded finish path.
+        let failed = factory
+            .inner
+            .finish_until(
+                Err(EngineError::Contract(service)),
+                Instant::now() + Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert!(!dropped.load(Ordering::Acquire));
+        assert_eq!(failed.collection_error.unwrap().code, ErrorCode::Expired);
+        assert!(matches!(
+            failed.service.as_deref(),
+            Some(EngineError::Contract(original)) if *original == service
+        ));
+        assert!(failed.report.is_none());
+        assert!(
+            failed
+                .retained_evidence
+                .try_state()
+                .unwrap()
+                .unwrap()
+                .report
+                .is_some()
+        );
+        assert!(failed.worker_shutdown_failure().is_none());
+        release.release();
+        let report = factory.finish(Ok(())).unwrap();
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(report.origin, NativeWorkerOrigin::Injected);
+        assert!(!report.has_failure());
+    }
+
+    #[test]
+    fn session_destructor_panic_keeps_typed_original_and_cannot_transfer_healthy_report() {
+        let owners = OwnerRegistry::default();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let factory = factory_with_drop_probe(
+            &owners,
+            SessionDropProbe {
+                dropped: Arc::clone(&dropped),
+                gate: None,
+                panic_on_drop: true,
+            },
+        );
+        let failed = factory.finish(Ok(())).unwrap_err();
+        assert!(!dropped.load(Ordering::Acquire));
+        let original = failed.worker_shutdown_failure().unwrap();
+        assert_eq!(failed.collection_error, Some(original.contract));
+        assert_eq!(original.contract.code, ErrorCode::BackendFailure);
+        assert_eq!(
+            original.backend.as_ref().unwrap().cause.unwrap().code,
+            CauseCode::RuntimePanic
+        );
+        assert!(
+            std::error::Error::source(&failed)
+                .unwrap()
+                .downcast_ref::<PhysicalFailure>()
+                .is_some()
+        );
+        assert!(failed.report.is_none());
+        assert!(
+            failed
+                .retained_evidence
+                .try_state()
+                .unwrap()
+                .unwrap()
+                .report
+                .is_some()
+        );
+        assert!(!failed.to_string().contains("private injected"));
+        assert!(!format!("{failed:?}").contains("private injected"));
+    }
+
+    #[test]
+    fn quarantined_execution_keeps_original_pinned_evidence_and_cannot_finish_successfully() {
+        let owners = Arc::new(OwnerRegistry::default());
+        let source = BackendError::new(
+            FailureKind::BackendFailure,
+            FailureStage::Backend,
+            "injected execution completion is unknown",
+        )
+        .with_external_cause(CauseCode::OrtRun, &"private-quarantine-cause");
+        let expected = source.clone();
+        let worker = SingleWorker::spawn_with_outcome(move |_: &PreparedBatch<RulesState>| {
+            rz_eval::worker::PhysicalRun::Quarantined(source.clone())
+        })
+        .unwrap();
+        let owner = NativeWorkerOwner::from_worker(worker, projection(&owners), 1).unwrap();
+        let factory = NativeCpuFactory::from_owner(owner, None).unwrap();
+        let clock = ProcessClock::new(ProcessEpoch(306));
+        let request = request(&factory, &owners, &clock, 1);
+        let context = request.context();
+        let mut runtime = factory.create(clock, authority(context)).unwrap();
+        runtime.submit(request).unwrap();
+        let until = Instant::now() + WAIT;
+        loop {
+            assert!(
+                !matches!(runtime.poll(), Some(EvalResult::Completed(_))),
+                "quarantine cannot return a completed evaluation"
+            );
+            let observed = factory
+                .inner
+                .evidence
+                .try_state()
+                .unwrap()
+                .is_some_and(|state| {
+                    state.report.as_ref().is_some_and(|report| {
+                        report
+                            .failures
+                            .iter()
+                            .any(|receipt| receipt.kind == NativeDiagnosticKind::Quarantined)
+                    })
+                });
+            if observed {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "bounded original quarantine receipt"
+            );
+            thread::yield_now();
+        }
+        let failed = factory
+            .inner
+            .finish_until(Ok(()), Instant::now() + Duration::from_millis(100))
+            .unwrap_err();
+        assert_eq!(failed.collection_error.unwrap().code, ErrorCode::Expired);
+        assert!(failed.report.is_none());
+        assert!(failed.worker_shutdown_failure().is_none());
+        let state = failed.retained_evidence.try_state().unwrap().unwrap();
+        let report = state.report.as_ref().unwrap();
+        assert_eq!(report.origin, NativeWorkerOrigin::Injected);
+        assert_eq!(report.completed_by_runtime, 0);
+        assert_eq!(report.failures.len(), 1);
+        let receipt = &report.failures[0];
+        assert_eq!(receipt.kind, NativeDiagnosticKind::Quarantined);
+        assert_eq!(receipt.context.request, context);
+        assert!(receipt.context.execution.is_some());
+        assert_eq!(receipt.failure.backend.as_ref(), Some(&expected));
+        assert!(report.has_failure());
+    }
+
+    #[test]
+    fn per_root_runtime_shutdown_preserves_the_session_until_process_finish() {
+        let owners = Arc::new(OwnerRegistry::default());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let factory = factory_with_drop_probe(
+            &owners,
+            SessionDropProbe {
+                dropped: Arc::clone(&dropped),
+                gate: None,
+                panic_on_drop: false,
+            },
+        );
+        let clock = ProcessClock::new(ProcessEpoch(305));
+        for sequence in 1..=2 {
+            let request = request(&factory, &owners, &clock, sequence);
+            let context = request.context();
+            let mut runtime = factory.create(clock.clone(), authority(context)).unwrap();
+            runtime.submit(request).unwrap();
+            let until = Instant::now() + WAIT;
+            let result = loop {
+                if let Some(result) = runtime.poll() {
+                    break result;
+                }
+                assert!(Instant::now() < until, "bounded injected root completion");
+                thread::yield_now();
+            };
+            let EvalResult::Completed(output) = result else {
+                panic!("the reusable injected session must complete both roots");
+            };
+            assert_eq!(output.context, context);
+            runtime.shutdown(Instant::now() + WAIT).unwrap();
+            assert!(!dropped.load(Ordering::Acquire));
+        }
+        let report = factory.finish(Ok(())).unwrap();
+        assert!(dropped.load(Ordering::Acquire));
         assert_eq!(report.origin, NativeWorkerOrigin::Injected);
         assert_eq!(report.completed_by_runtime, 0);
     }

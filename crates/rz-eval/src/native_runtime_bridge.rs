@@ -128,6 +128,7 @@ struct OwnerState {
     last_request: Option<u64>,
     diagnostics: Vec<DiagnosticSlot>,
     active: bool,
+    shutdown_started: bool,
     closed: Option<ContractError>,
     boundary_error: Option<ContractError>,
     poison_error: Option<ContractError>,
@@ -225,6 +226,7 @@ impl NativeWorkerOwner {
                 last_request: None,
                 diagnostics,
                 active: false,
+                shutdown_started: false,
                 closed: None,
                 boundary_error: None,
                 poison_error: None,
@@ -439,6 +441,47 @@ impl NativeWorkerOwner {
         }))
     }
 
+    /// Terminal process shutdown, distinct from per-root logical/request drain.
+    /// No owner-lock wait and no caller-side join. Once the owner lock is acquired,
+    /// close future construction and dispatch, then start its one reaper only
+    /// after every physical lease and reserved diagnostic has been finalized.
+    /// Occupied original diagnostics remain available for the final collector.
+    /// Ready(Ok) includes session/closure destruction and native-thread TLS exit.
+    /// A quarantined lease remains active and pinned, so it cannot yield success.
+    pub fn try_shutdown(&self) -> Poll<Result<(), PhysicalFailure>> {
+        let mut state = match self.0.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Poll::Pending,
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let mut state = poisoned.into_inner();
+                Self::mark_poison(&mut state);
+                state
+            }
+        };
+        // Healthy closure is neither a native boundary error nor a discarded
+        // receipt. Only this separate terminal flag closes normal admission.
+        // WouldBlock remains an unlinearized Pending request: the caller must
+        // retry within its deadline and cannot claim confirmed shutdown yet.
+        state.shutdown_started = true;
+        if state.poison_observed {
+            // Delivery of the diagnostic batch does not recover a poisoned
+            // owner or make a later shutdown acknowledgement successful.
+            return Poll::Ready(Err(owner_poison_error().into()));
+        }
+        if state.active
+            || state
+                .diagnostics
+                .iter()
+                .any(|entry| matches!(entry, DiagnosticSlot::Reserved))
+        {
+            return Poll::Pending;
+        }
+        state
+            .worker
+            .try_shutdown()
+            .map(|result| result.map_err(PhysicalFailure::from))
+    }
+
     fn take_from(
         state: &mut OwnerState,
         max_entries: usize,
@@ -489,11 +532,7 @@ impl NativeWorkerOwner {
     }
 
     fn mark_poison(state: &mut OwnerState) {
-        let error = failure(
-            ErrorCode::BackendFailure,
-            Stage::Backend,
-            "native physical/diagnostic owner poisoned; admission closed",
-        );
+        let error = owner_poison_error();
         state.closed.get_or_insert(error);
         if !state.poison_observed {
             state.boundary_error.get_or_insert(error);
@@ -532,6 +571,9 @@ impl<C: ContractClock + Send> NativeRuntimeBackend<C> {
             let state = owner.state();
             if let Some(error) = state.closed {
                 return Err(error);
+            }
+            if state.shutdown_started {
+                return Err(process_shutdown_error());
             }
             if state.epoch.is_some_and(|epoch| epoch != clock.domain().0) {
                 return Err(failure(
@@ -603,6 +645,9 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
             if let Some(error) = state.closed {
                 return Err(error);
             }
+            if state.shutdown_started {
+                return Err(process_shutdown_error());
+            }
             if state.epoch.is_some_and(|epoch| epoch != execution.epoch)
                 || state
                     .last_execution
@@ -669,6 +714,9 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
             let mut state = self.owner.state();
             if let Some(error) = state.closed {
                 return Err(error.into());
+            }
+            if state.shutdown_started {
+                return Err(process_shutdown_error().into());
             }
             if state.active {
                 return Err(failure(
@@ -830,6 +878,22 @@ fn failure(code: ErrorCode, stage: Stage, detail: &'static str) -> ContractError
     ContractError::new(code, stage, detail)
 }
 
+fn process_shutdown_error() -> ContractError {
+    failure(
+        ErrorCode::Canceled,
+        Stage::Admission,
+        "native owner process shutdown has closed admission",
+    )
+}
+
+fn owner_poison_error() -> ContractError {
+    failure(
+        ErrorCode::BackendFailure,
+        Stage::Backend,
+        "native physical/diagnostic owner poisoned; admission closed",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,6 +969,37 @@ mod tests {
     }
 
     #[test]
+    fn busy_owner_lock_is_unlinearized_pending_then_normal_shutdown_is_clean() {
+        let owner = owner();
+        {
+            let state = owner.state();
+            assert!(matches!(owner.try_shutdown(), Poll::Pending));
+            assert!(!state.shutdown_started);
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match owner.try_shutdown() {
+                Poll::Ready(result) => {
+                    result.unwrap();
+                    break;
+                }
+                Poll::Pending => {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "shutdown reaper test budget"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+        }
+        assert!(owner.state().shutdown_started);
+        let batch = owner.take_diagnostics().unwrap();
+        assert!(batch.entries.is_empty());
+        assert!(batch.boundary_error.is_none());
+        assert!(batch.poison_error.is_none());
+    }
+
+    #[test]
     fn poison_preserves_first_close_or_store_full_and_existing_slots() {
         for original in [
             failure(
@@ -953,6 +1048,12 @@ mod tests {
             assert!(
                 acknowledged.poison_error.is_none(),
                 "a retained poison fact is delivered once"
+            );
+            assert!(matches!(owner.try_shutdown(), Poll::Ready(Err(error))
+                if error.contract == owner_poison_error() && error.backend.is_none()));
+            assert_eq!(
+                owner.try_status().unwrap().unwrap().admission_error,
+                Some(original)
             );
         }
     }

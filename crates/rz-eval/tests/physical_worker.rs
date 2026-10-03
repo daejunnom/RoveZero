@@ -4,6 +4,7 @@ use rz_eval::error::{
 use rz_eval::worker::{PhysicalPoll, PhysicalRun, SingleWorker};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 fn wait_until(mut check: impl FnMut() -> bool) {
@@ -15,6 +16,119 @@ fn wait_until(mut check: impl FnMut() -> bool) {
         );
         std::thread::yield_now();
     }
+}
+
+struct DelayedDrop {
+    entered: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+impl Drop for DelayedDrop {
+    fn drop(&mut self) {
+        self.entered.send(()).unwrap();
+        self.release.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+}
+
+#[test]
+fn process_shutdown_waits_for_captured_backend_drop_and_rejects_new_jobs() {
+    let (entered, entering) = mpsc::sync_channel(1);
+    let (release, released) = mpsc::sync_channel(1);
+    let backend = DelayedDrop {
+        entered,
+        release: released,
+    };
+    let mut worker = SingleWorker::spawn(move |input: &u8| {
+        let _pin = &backend;
+        *input
+    })
+    .unwrap();
+    let mut lease = worker.submit(7).unwrap();
+    wait_until(|| matches!(lease.poll(), PhysicalPoll::Ready(7)));
+    assert!(matches!(worker.try_shutdown(), Poll::Pending));
+    entering.recv_timeout(Duration::from_secs(2)).unwrap();
+    for _ in 0..3 {
+        assert!(matches!(worker.try_shutdown(), Poll::Pending));
+        assert!(worker.submit(8).is_err());
+    }
+    release.send(()).unwrap();
+    wait_until(|| match worker.try_shutdown() {
+        Poll::Pending => false,
+        Poll::Ready(result) => {
+            result.unwrap();
+            true
+        }
+    });
+    assert!(matches!(worker.try_shutdown(), Poll::Ready(Ok(()))));
+    assert!(worker.submit(9).is_err());
+}
+
+#[test]
+fn process_shutdown_waits_for_thread_local_destruction_after_closure_returns() {
+    std::thread_local! {
+        static BACKEND_TLS: std::cell::RefCell<Option<DelayedDrop>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+    let (entered, entering) = mpsc::sync_channel(1);
+    let (release, released) = mpsc::sync_channel(1);
+    let mut backend = Some(DelayedDrop {
+        entered,
+        release: released,
+    });
+    let mut worker = SingleWorker::spawn(move |input: &u8| {
+        BACKEND_TLS.with(|slot| *slot.borrow_mut() = backend.take());
+        *input
+    })
+    .unwrap();
+    let mut lease = worker.submit(1).unwrap();
+    wait_until(|| matches!(lease.poll(), PhysicalPoll::Ready(1)));
+    assert!(matches!(worker.try_shutdown(), Poll::Pending));
+    entering.recv_timeout(Duration::from_secs(2)).unwrap();
+    // The thread closure has returned, but its TLS still owns native state.
+    assert!(matches!(worker.try_shutdown(), Poll::Pending));
+    release.send(()).unwrap();
+    wait_until(|| match worker.try_shutdown() {
+        Poll::Pending => false,
+        Poll::Ready(result) => {
+            result.unwrap();
+            true
+        }
+    });
+}
+
+#[test]
+fn captured_backend_drop_panic_is_a_sticky_typed_shutdown_failure() {
+    struct PanickingDrop;
+    impl Drop for PanickingDrop {
+        fn drop(&mut self) {
+            panic!("authored backend teardown panic");
+        }
+    }
+    let backend = PanickingDrop;
+    let mut worker = SingleWorker::spawn(move |input: &u8| {
+        let _pin = &backend;
+        *input
+    })
+    .unwrap();
+    let mut original = None;
+    wait_until(|| match worker.try_shutdown() {
+        Poll::Pending => false,
+        Poll::Ready(Err(error)) => {
+            original = Some(error);
+            true
+        }
+        Poll::Ready(Ok(())) => panic!("backend Drop panic cannot confirm shutdown"),
+    });
+    let original = original.unwrap();
+    assert_eq!(original.kind, FailureKind::BackendFailure);
+    assert_eq!(original.cause.unwrap().code, CauseCode::RuntimePanic);
+    assert_eq!(
+        original.native.as_ref().unwrap().code,
+        "WorkerShutdownPanic"
+    );
+    assert!(matches!(worker.try_shutdown(), Poll::Ready(Err(error)) if error == original));
+    assert!(worker.submit(2).is_err());
 }
 
 #[test]
@@ -162,6 +276,15 @@ fn explicit_unknown_completion_preserves_native_cause_and_retains_one_job_and_ba
     assert_eq!(rejected_drops.load(Ordering::SeqCst), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(matches!(lease.poll(), PhysicalPoll::Quarantined));
+    assert_eq!(lease.quarantine_cause().unwrap(), Some(expected.clone()));
+    wait_until(|| match worker.try_shutdown() {
+        Poll::Pending => false,
+        Poll::Ready(Err(error)) => {
+            assert_eq!(error, expected);
+            true
+        }
+        Poll::Ready(Ok(())) => panic!("joining a quarantined thread cannot release native pins"),
+    });
     assert_eq!(lease.quarantine_cause().unwrap(), Some(expected));
     drop(lease);
     drop(worker);

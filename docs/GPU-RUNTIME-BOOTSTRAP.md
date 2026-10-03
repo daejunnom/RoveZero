@@ -90,6 +90,23 @@ E는 이 GPU 형식을 직접 검증하는 별도 feature·실행 명세를 사�
 새 프로세스별 runtime 사본을 기존 CPU 입력·출력 예산에 억지로 맞추지 않으며,
 추가 snapshot·사본·로그·시간 예산을 실행 전에 유한하게 확정한다.
 
+요청의 physical drain과 process worker의 종료는 별도 사건이다. per-root 종료는
+다음 root가 같은 session을 재사용할 수 있도록 요청만 drain한다. process 최종
+종료에서는 정상 admission을 닫고 기존 lease·진단을 회수한 뒤, 캡처한 backend의
+session destructor와 worker thread join까지 확인한다. 작은 reaper가 실제 join을
+맡고 호출자는 결과 채널을 비차단 조회하므로 native destructor나 thread-local
+cleanup이 caller deadline을 무한히 막지 않는다. 전체 final collection·join·재회수는
+하나의 기존 2초 deadline을 공유한다. Pending·timeout·panic·quarantine을 성공으로
+바꾸지 않고 원래 원인·owner·evidence를 보존한다. join 성공도 quarantine된 실행의
+물리 완료를 증명하지 않으며, process에 고정된 native library의 unload를 뜻하지 않는다.
+
+CUDA E 인수는 native 성공 기록과 외부 프로세스 종료를 함께 확인한다. 검증한 네
+startup PID 각각에 대해 고정 Fastchess의 종료 TRACE가 한 번 존재하고 raw wait
+status가 정확히 0이어야 한다. 누락·중복·다른 PID·renderer 변경·비정상 상태·강제
+종료는 provider 인수 실패다. 감독자가 소유한 bounded stdout과 기존 artifact digest를
+사용하며 엔진이 `[Engine]` 출력에 인용한 TRACE는 근거로 받지 않는다. 러너 자체의
+exit 0만으로 각 엔진의 성공 종료를 추정하지 않는다. CPU V1의 필드 집합은 유지한다.
+
 D의 `Finished`는 mailbox 적재, `PhysicalCompleted`는 owner의 완료 관측이다.
 common evaluator의 최종 `poll` 검증과 B의 최종 scope·clock 검사를 통과한 소비는
 각각 별도 기록이며 root 초기화와 실제 non-root backup도 구분한다. 관측 ring의

@@ -505,6 +505,9 @@ fn quarantine_is_pending_and_keeps_original_cause_and_physical_reservation() {
         rz_eval::error::CauseCode::RuntimePanic
     );
     assert!(!format!("{error:?}").contains("injected native unwind"));
+    assert!(matches!(owner.try_shutdown(), Poll::Pending));
+    assert!(owner.try_status().unwrap().unwrap().active);
+    assert!(NativeRuntimeBackend::new(owner.clone(), clock).is_err());
     drop(runtime); // D quarantines the unknown native Lease rather than freeing it.
     assert!(weak.upgrade().is_some());
 }
@@ -610,4 +613,154 @@ fn limited_collection_keeps_reserved_pin_and_explicit_close_allows_physical_drai
     let snapshot = owner.try_status().unwrap().unwrap();
     assert!(!snapshot.active);
     assert_eq!(snapshot.reserved_diagnostics, 0);
+}
+
+#[test]
+fn process_shutdown_closes_admission_but_waits_for_lease_and_backend_destruction() {
+    struct BackendDrop {
+        entered: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Drop for BackendDrop {
+        fn drop(&mut self) {
+            self.entered.send(()).unwrap();
+            self.release.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
+    }
+    let projection = projection();
+    let (entered, entering) = mpsc::sync_channel(1);
+    let (release, released) = mpsc::sync_channel(1);
+    let (drop_entered, drop_entering) = mpsc::sync_channel(1);
+    let (drop_release, drop_released) = mpsc::sync_channel(1);
+    let native = BackendDrop {
+        entered: drop_entered,
+        release: drop_released,
+    };
+    let worker = SingleWorker::spawn(
+        move |batch: &rz_eval::contracts::PreparedBatch<RulesState>| {
+            let _pin = &native;
+            entered.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(3)).unwrap();
+            batch
+                .requests()
+                .iter()
+                .map(|item| item.physical_output(&raw(), batch.execution()))
+                .collect()
+        },
+    )
+    .unwrap();
+    let owner = NativeWorkerOwner::from_worker(worker, projection.clone(), 1).unwrap();
+    let mut backend = NativeRuntimeBackend::new(owner.clone(), ManualClock::default()).unwrap();
+    let mut lease = backend
+        .dispatch(
+            &ExecutionId::new(EPOCH, 1),
+            &[Arc::new(RuntimeRequest::new(request(&projection, 1, 100)))],
+        )
+        .unwrap();
+    entering.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert!(matches!(owner.try_shutdown(), Poll::Pending));
+    let status = owner.try_status().unwrap().unwrap();
+    assert!(status.active);
+    assert_eq!(status.reserved_diagnostics, 1);
+    assert!(
+        drop_entering.try_recv().is_err(),
+        "live lease must retain the session"
+    );
+    assert_eq!(
+        NativeRuntimeBackend::new(owner.clone(), ManualClock::default())
+            .err()
+            .unwrap()
+            .code,
+        ErrorCode::Canceled
+    );
+    assert_eq!(
+        backend
+            .dispatch(
+                &ExecutionId::new(EPOCH, 2),
+                &[Arc::new(RuntimeRequest::new(request(&projection, 2, 100)))]
+            )
+            .err()
+            .unwrap()
+            .code,
+        ErrorCode::Canceled
+    );
+    release.send(()).unwrap();
+    wait_until(|| match backend.poll(&mut lease) {
+        Poll::Pending => false,
+        Poll::Ready(mut results) => {
+            results.pop().unwrap().output.unwrap();
+            true
+        }
+    });
+    assert!(matches!(owner.try_shutdown(), Poll::Pending));
+    drop_entering.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert!(matches!(owner.try_shutdown(), Poll::Pending));
+    let status = owner.try_status().unwrap().unwrap();
+    assert!(!status.active);
+    assert_eq!(status.reserved_diagnostics, 0);
+    assert!(
+        status.admission_error.is_none(),
+        "healthy closure is not a boundary failure"
+    );
+    drop_release.send(()).unwrap();
+    wait_until(|| match owner.try_shutdown() {
+        Poll::Pending => false,
+        Poll::Ready(result) => {
+            result.unwrap();
+            true
+        }
+    });
+    assert!(matches!(owner.try_shutdown(), Poll::Ready(Ok(()))));
+    let originals = owner.take_diagnostics().unwrap();
+    assert!(originals.entries.is_empty());
+    assert!(originals.boundary_error.is_none());
+    assert!(originals.poison_error.is_none());
+}
+
+#[test]
+fn process_shutdown_keeps_original_backend_drop_panic_beside_common_error() {
+    struct BackendDrop;
+    impl Drop for BackendDrop {
+        fn drop(&mut self) {
+            panic!("authored native owner backend teardown panic");
+        }
+    }
+    let native = BackendDrop;
+    let worker = SingleWorker::spawn(move |_: &rz_eval::contracts::PreparedBatch<RulesState>| {
+        let _pin = &native;
+        Ok(Vec::new())
+    })
+    .unwrap();
+    let owner = NativeWorkerOwner::from_worker(worker, projection(), 1).unwrap();
+    let mut original = None;
+    wait_until(|| match owner.try_shutdown() {
+        Poll::Pending => false,
+        Poll::Ready(Err(error)) => {
+            original = Some(error);
+            true
+        }
+        Poll::Ready(Ok(())) => panic!("native teardown panic cannot confirm shutdown"),
+    });
+    let original = original.unwrap();
+    assert_eq!(original.contract.code, ErrorCode::BackendFailure);
+    assert_eq!(
+        original.backend.as_ref().unwrap().cause.unwrap().code,
+        rz_eval::error::CauseCode::RuntimePanic
+    );
+    assert_eq!(
+        original
+            .backend
+            .as_ref()
+            .unwrap()
+            .native
+            .as_ref()
+            .unwrap()
+            .code,
+        "WorkerShutdownPanic"
+    );
+    assert!(matches!(owner.try_shutdown(), Poll::Ready(Err(error))
+        if error.contract == original.contract && error.backend == original.backend));
+    assert!(NativeRuntimeBackend::new(owner.clone(), ManualClock::default()).is_err());
+    // Process-level failure has no invented physical request/context receipt.
+    assert!(owner.take_diagnostics().unwrap().entries.is_empty());
 }

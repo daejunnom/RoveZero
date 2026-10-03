@@ -76,10 +76,10 @@ worker당 원본 하나를 owner mailbox에 둔다. 정확한 ticket·completion
 | Source 반입·adapter | 위 source pins, 단일 계약 path와 root 10개 crate 전체 target/feature 검사 성공 | 새 head 변경마다 영향 consumer 재검증 |
 | CPU/mock binary·trace | A→C→D→B async binary, C bridge 6개, UCI library 33개·실제 binary 7개가 전체 workspace 검사에 포함돼 성공 | 명시적 `--cpu-mock`; NN·GPU 인수는 별도 |
 | 실제 CPU NN | 아래 a9a5ae7에서 선정 Maia·고정 LC0 Eigen 참조·ORT CPU와 실제 A→C→D·B UCI 연결 성공 | Linux CPU/FP32·지정 fixture·정상 완료 범위; 실제 Windows NN·목표 GPU는 별도 |
-| 목표 GPU | 목표 RTX 4050 6GB와 준비 provider를 개발 호스트와 구분 | 실제 장치·precision·batch·수치·buffer·메모리·D02 종단 계측 pending |
+| 목표 GPU | 아래 CUDA provider 수치·12개 실제 A 상태→D·B UCI v2를 각각 인수 | 첫 E CUDA pair 실패 보존; worker 종료 보완·pair 재검증·전체 수명·process peak VRAM·D02 종단 계측 pending |
 | 실제 F02 학습 | F CPU 숫자 fixture gradient·checkpoint/export/resume 제공; 총괄 Linux F 검사 105개 성공 | 실제 Maia 학습·실제 encoder·검증 data·유한 예산·CONTROL-1→2 인수 pending |
 | E 합성 fixture | 고정 Fastchess의 실제 paired 실행·A/독립 PGN 대조·artifact 사전 거부·live 취소를 아래에서 인수 | 합성 script·Linux CPU만 해당; NN·GPU·정식 시계/자원과 구분 |
-| 정식 paired 대국 | E manifest·pair planner·attempt ledger·원시 WDL/n0..n4 제공 | 실제 NN launch·시계/자원·군집 통계·holdout 및 정식 대국 인수 pending |
+| 정식 paired 대국 | E manifest·pair planner·attempt ledger·원시 WDL/n0..n4와 아래 CPU NN integration pair 제공 | CUDA pair·정식 시계/자원·군집 통계·holdout 및 강도 인수 pending |
 
 이전 E source 리뷰의 test 선언 74개(Unix 조건부 4개)는 당시의 정의 수이며 최신 E
 실행 결과로 재사용하지 않는다. F source의 test method 105개와 아래 실제 105개 성공도
@@ -674,3 +674,11 @@ physical drain 뒤 worker closure와 native session destructor의 종료가 최�
 thread join을 유한하게 확인하는 경계를 추가하고, per-root drain 및 quarantine의
 원래 pin 보존과 구분하여 재검증한다. join 추가만으로 SIGABRT가 해결됐다고
 주장하지 않는다. 이 접점과 실제 pair process gate는 PR 인수 전 남은 검사다.
+
+후속 source는 C의 단일 reaper와 B final join 조건, E의 각 native PID 종료 TRACE
+검사를 연결했다. 공통 revision 0.1·CPU/CUDA V1 키 집합·per-root session 재사용·
+기존 final 2초와 pair 자원 한도는 유지한다. 같은 수정 tree의 실제 로컬 workspace
+all-target/all-feature 검사는 **673 passed / 0 failed / 16 ignored**, 기본 native CLI는
+4 passed이며 fmt와 strict clippy도 통과했다. 새 의미 검사 17개는 destructor/TLS
+지연·생성 실패·panic·Q·admission·root 재사용과 네 PID의 종료 기록을 검사한다.
+이는 CPU/mock source 인수이며 수정 후 실제 CUDA UCI/pair는 별도 실행으로 기록한다.
