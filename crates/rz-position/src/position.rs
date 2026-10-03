@@ -400,6 +400,22 @@ impl Position {
         }
         self.make_generated(mv)
     }
+    /// A fork checks the live source's view before cloning its immutable history.
+    /// The clone owns a fresh concrete owner; the source view cannot mutate it.
+    #[cfg(feature = "contracts")]
+    pub(crate) fn fork_from_view(
+        &self,
+        view: &LegalMoveView,
+        mv: BoardMove,
+    ) -> Result<Self, PositionError> {
+        if !self.matches_snapshot(&view.snapshot) {
+            return Err(PositionError::StaleView);
+        }
+        if !view.moves.contains(&mv) {
+            return Err(PositionError::IllegalMove);
+        }
+        self.preview_generated(mv)
+    }
     /// Applies board-legal moves. Search/arena must consume classification first
     /// to enforce terminal/claim game policy; perft counts board-legal moves.
     pub fn make_move(&mut self, mv: BoardMove) -> Result<UndoToken, PositionError> {
