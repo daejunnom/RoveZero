@@ -27,6 +27,7 @@ pub(crate) fn is_attacked(state: &CoreState, square: Square, by: Color) -> bool 
     attackers(state, square, by) != 0
 }
 
+#[cfg(not(feature = "experimental-attack-tables"))]
 pub(crate) fn attackers(state: &CoreState, square: Square, by: Color) -> u64 {
     let mut mask = 0;
     let pawn_back = if by == Color::White { -1 } else { 1 };
@@ -83,6 +84,87 @@ pub(crate) fn attackers(state: &CoreState, square: Square, by: Color) -> u64 {
                 at = s.offset(df, dr);
             }
         }
+    }
+    mask
+}
+
+#[cfg(feature = "experimental-attack-tables")]
+const fn leaps(directions: [(i8, i8); 8]) -> [u64; 64] {
+    let mut table = [0; 64];
+    let mut at = 0;
+    while at < 64 {
+        let mut i = 0;
+        while i < 8 {
+            let f = (at % 8) as i8 + directions[i].0;
+            let r = (at / 8) as i8 + directions[i].1;
+            if f >= 0 && f < 8 && r >= 0 && r < 8 {
+                table[at] |= 1u64 << (r * 8 + f);
+            }
+            i += 1;
+        }
+        at += 1;
+    }
+    table
+}
+#[cfg(feature = "experimental-attack-tables")]
+const KNIGHT_ATTACKS: [u64; 64] = leaps(KNIGHT);
+#[cfg(feature = "experimental-attack-tables")]
+const KING_ATTACKS: [u64; 64] = leaps(KING);
+#[cfg(feature = "experimental-attack-tables")]
+const fn rays() -> [[u64; 8]; 64] {
+    let mut result = [[0; 8]; 64];
+    let mut at = 0;
+    while at < 64 {
+        let mut i = 0;
+        while i < 8 {
+            let mut f = (at % 8) as i8 + KING[i].0;
+            let mut r = (at / 8) as i8 + KING[i].1;
+            while f >= 0 && f < 8 && r >= 0 && r < 8 {
+                result[at][i] |= 1u64 << (r * 8 + f);
+                f += KING[i].0;
+                r += KING[i].1;
+            }
+            i += 1;
+        }
+        at += 1;
+    }
+    result
+}
+#[cfg(feature = "experimental-attack-tables")]
+const RAYS: [[u64; 8]; 64] = rays();
+#[cfg(feature = "experimental-attack-tables")]
+pub(crate) fn attackers(state: &CoreState, square: Square, by: Color) -> u64 {
+    let pieces = &state.board.bitboards;
+    let base = by.index() * 6;
+    let at = square.0 as usize;
+    let mut pawn_sources = 0;
+    let pawn_back = if by == Color::White { -1 } else { 1 };
+    for df in [-1, 1] {
+        if let Some(s) = square.offset(df, pawn_back) {
+            pawn_sources |= 1u64 << s.0;
+        }
+    }
+    let mut mask = pawn_sources & pieces[base]
+        | KNIGHT_ATTACKS[at] & pieces[base + PieceKind::Knight as usize]
+        | KING_ATTACKS[at] & pieces[base + PieceKind::King as usize];
+    let occupied = pieces.iter().fold(0, |all, board| all | board);
+    for (i, &(df, dr)) in KING.iter().enumerate() {
+        let blockers = RAYS[at][i] & occupied;
+        if blockers == 0 {
+            continue;
+        }
+        let index = if df + dr * 8 > 0 {
+            blockers.trailing_zeros()
+        } else {
+            63 - blockers.leading_zeros()
+        };
+        let slider = if df == 0 || dr == 0 {
+            PieceKind::Rook
+        } else {
+            PieceKind::Bishop
+        };
+        mask |= (1u64 << index)
+            & (pieces[base + slider as usize] | pieces[base + PieceKind::Queen as usize]);
     }
     mask
 }
@@ -213,14 +295,14 @@ fn castles(state: &CoreState, from: Square, moves: &mut Vec<BoardMove>) {
         (
             flags,
             base + 7,
-            vec![base + 5, base + 6],
+            [Some(base + 5), Some(base + 6), None],
             base + 5,
             base + 6,
         ),
         (
             flags * 2,
             base,
-            vec![base + 1, base + 2, base + 3],
+            [Some(base + 1), Some(base + 2), Some(base + 3)],
             base + 3,
             base + 2,
         ),
@@ -231,7 +313,10 @@ fn castles(state: &CoreState, from: Square, moves: &mut Vec<BoardMove>) {
                     color: state.side,
                     kind: PieceKind::Rook,
                 })
-            || empty.iter().any(|&s| state.board.get(Square(s)).is_some())
+            || empty
+                .iter()
+                .flatten()
+                .any(|&s| state.board.get(Square(s)).is_some())
         {
             continue;
         }
@@ -250,16 +335,110 @@ fn castles(state: &CoreState, from: Square, moves: &mut Vec<BoardMove>) {
     }
 }
 
+fn precise_legal(state: &CoreState, mv: BoardMove) -> bool {
+    let mut child = state.clone();
+    apply(&mut child, mv);
+    !is_attacked(&child, child.board.king(state.side), state.side.opposite())
+}
+
+#[cfg(feature = "experimental-pin-check")]
+struct KingConstraints {
+    pins: [u64; 64],
+    evasion: u64,
+}
+#[cfg(feature = "experimental-pin-check")]
+fn king_constraints(state: &CoreState) -> KingConstraints {
+    let king = state.board.king(state.side);
+    let checkers = attackers(state, king, state.side.opposite());
+    let mut constraints = KingConstraints {
+        pins: [u64::MAX; 64],
+        evasion: u64::MAX,
+    };
+    if checkers.count_ones() > 1 {
+        constraints.evasion = 0;
+    } else if checkers != 0 {
+        let checker = Square(checkers.trailing_zeros() as u8);
+        constraints.evasion = checkers;
+        let kind = state.board.get(checker).expect("checker inventory").kind;
+        if matches!(kind, PieceKind::Bishop | PieceKind::Rook | PieceKind::Queen) {
+            let df = (checker.file() as i8 - king.file() as i8).signum();
+            let dr = (checker.rank() as i8 - king.rank() as i8).signum();
+            let mut at = king.offset(df, dr);
+            while let Some(s) = at {
+                constraints.evasion |= 1u64 << s.0;
+                if s == checker {
+                    break;
+                }
+                at = s.offset(df, dr);
+            }
+        }
+    }
+    for (df, dr) in KING {
+        let slider = if df == 0 || dr == 0 {
+            PieceKind::Rook
+        } else {
+            PieceKind::Bishop
+        };
+        let mut candidate = None;
+        let mut ray = 0;
+        let mut at = king.offset(df, dr);
+        while let Some(s) = at {
+            ray |= 1u64 << s.0;
+            if let Some(piece) = state.board.get(s) {
+                if piece.color == state.side && candidate.is_none() {
+                    candidate = Some(s);
+                } else {
+                    if piece.color != state.side
+                        && (piece.kind == slider || piece.kind == PieceKind::Queen)
+                    {
+                        if let Some(pinned) = candidate {
+                            constraints.pins[pinned.0 as usize] = ray;
+                        }
+                    }
+                    break;
+                }
+            }
+            at = s.offset(df, dr);
+        }
+    }
+    constraints
+}
+
 pub(crate) fn legal(state: &CoreState) -> Vec<BoardMove> {
+    #[cfg(feature = "experimental-pin-check")]
+    let constraints = king_constraints(state);
     let mut moves: Vec<_> = pseudo(state)
         .into_iter()
         .filter(|&mv| {
-            let mut child = state.clone();
-            apply(&mut child, mv);
-            !is_attacked(&child, child.board.king(state.side), state.side.opposite())
+            #[cfg(feature = "experimental-pin-check")]
+            {
+                let piece = state.board.get(mv.from).expect("pseudo inventory");
+                // King/castling and EP may change attacks outside the destination;
+                // retain the exact clone/apply/check path for those moves.
+                let ep = piece.kind == PieceKind::Pawn
+                    && state.ep == Some(mv.to)
+                    && mv.from.file() != mv.to.file()
+                    && state.board.get(mv.to).is_none();
+                if piece.kind != PieceKind::King && !ep {
+                    return (1u64 << mv.to.0)
+                        & constraints.evasion
+                        & constraints.pins[mv.from.0 as usize]
+                        != 0;
+                }
+            }
+            precise_legal(state, mv)
         })
         .collect();
     moves.sort_unstable_by_key(|mv| mv.sort_key());
+    #[cfg(all(test, feature = "experimental-pin-check"))]
+    {
+        let mut reference: Vec<_> = pseudo(state)
+            .into_iter()
+            .filter(|&mv| precise_legal(state, mv))
+            .collect();
+        reference.sort_unstable_by_key(|mv| mv.sort_key());
+        assert_eq!(moves, reference, "pin/check differs from full transition");
+    }
     moves
 }
 

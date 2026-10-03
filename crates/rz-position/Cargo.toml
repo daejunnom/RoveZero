@@ -10,6 +10,8 @@ description = "RoveZero's independent standard-chess rules and immutable positio
 path = "src/lib.rs"
 
 [features]
+experimental-attack-tables = []
+experimental-pin-check = []
 default = []
 contracts = ["dep:rz-contracts", "dep:sha2"]
 # Opt-in experiments; the existing owned claim preview remains the default.
