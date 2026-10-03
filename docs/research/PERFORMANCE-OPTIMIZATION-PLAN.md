@@ -1,7 +1,8 @@
 # 중복 연산·자료 복제·탐색 병목 개선 계획
 
 작성일: 2026-10-03 UTC. 작성 담당: A(Codex). 확인한 공개 GitHub 작성자:
-[daejunnom](https://github.com/daejunnom). 상태: **계획 및 A 실험 구현·CPU 진단; 기본 비활성**.
+[daejunnom](https://github.com/daejunnom). 갱신일: 2026-10-03 UTC.
+상태: **전체 최적화 A 담당; 내부 실험 2개 구현·CPU 진단, 후속 구현·정식 인수 대기**.
 
 이 계획은 현재 소스 조사와 PR #17 재검토에 다음 사용자 지시를 반영한다.
 
@@ -10,12 +11,18 @@
 - 탐색 의미 또는 전체 실행 흐름이 달라질 수 있는 후보도 실험 코드로 구현한다.
   해당 PR에 실험임을 밝히고 변경에 맞는 테스트 항목을 추가한다.
 
-A의 직접 구현은 `crates/rz-position/`이다. B/C/D/E 접점은 각 담당과 총괄이 연결할
-구현 제안으로 구분한다. 공통 계약의 소유·E/A/S 분류·대국 검증은
+최신 사용자 배정인 **“이번 최적화는 전부 A, 즉 네가 진행”**를 반영한다. 이 계획의
+구현·소비 코드 연결·테스트·계측은 모두 A(Codex)가 진행한다. 범위는 `rz-position`뿐 아니라
+`rz-encoding`·`rz-eval`·`rz-search`·`rz-uci`·`rz-runtime`·`rz-telemetry`와 필요한
+runner·공통 계약 접점이다. 아래 A/B/C/D/E 표시는 소스의 영역을 설명하며 후속 담당을
+나누는 표시가 아니다. 계약 접점이 없으면 내부 구현·CPU/mock 검증을 먼저 진행하고
+완료된 선언과 소비 코드를 같은 integration SHA에서 맞춘다. 공통 계약 변경의 영향과
+revision은 명시하고 총괄의 통합 리뷰·인수 절차는 유지한다. E/A/S 분류·대국 검증은
 [개발 기준](../ENGINEERING-STANDARDS.md), [실험 계약](../EXPERIMENTS.md),
 [공통 계약](../CONTRACTS.md)을 따른다. 여기서 E/A/S의 A는 근사·모델 변경 분류이며
-작성 담당 A와 다르다. 1~7장은 초기 계획·조사 이력이며, 실제 A 구현·검사·반복 CPU
-진단은 8장에 기록한다. 정식 탐색 성능·GPU·대국 강도 인수는 보류 상태다.
+작성 담당 A와 다르다. 1~7장의 조사·검증 원칙을 유지하고, 실제 첫 구현·검사·반복 CPU
+진단은 8장, 최신 미반영 항목과 실행 순서는 9장에 기록한다. 정식 탐색 성능·GPU·대국
+강도 인수와 실험의 기본 활성화는 보류 상태다.
 
 ## 1. PR #17 재확인과 근거의 범위
 
@@ -63,21 +70,22 @@ PR #17의 off/on 전체 gate에는 bundle copy/hash·load·warm-up·종료·직�
 
 ## 2. 남은 병목과 구현 후보
 
-아래 위치는 PR #17 head를 조사한 결과다. 실제 구현 전 최신 통합 SHA에서 존재 여부를
-다시 확인한다. 우선순위는 가설이며 성능 개선율을 보장하지 않는다.
+비용 구조는 PR #17 head에서 처음 조사했다. 갱신 때 develop `b5ba853`과 로컬/PR #18
+head `15b9d50`에서 남은 구조를 재확인했다. PR #17은 여전히 별도 미병합 실험이다.
+실제 구현 전 기준 SHA를 다시 고정한다. 우선순위는 가설이며 성능 개선율을 보장하지 않는다.
 
-| 순서·담당 | 소스와 비용 구조 | 구현 후보 | 예상 분류·실험 표시 |
-|---|---|---|---|
-| 1 · A | `position.rs` 반복 횟수·완전성 별도 순회, `outcome.rs`의 모든 intended claim용 임시 child/history/owner | 반복 증거를 한 번에 계산하고 checked transition 결과만으로 claim 검사; 실제 child를 만들 때만 소유 객체 구성 | E 후보; claim 경로 변경의 동등성 검사 |
-| 2 · A | `contracts.rs::state_digest`가 export마다 전체 이력을 FEN으로 변환·해시 | 직렬화 버퍼 재사용, 불변 상태와 profile에 맞는 digest 재사용 | E 후보; memoization이 실행 경로를 바꾸면 실험 표시 |
-| 3 · A/C | `rules_projection.rs::project`가 보유 비트보드를 64칸에서 재구성하고 각 최근 frame의 전체 과거를 재순회 | 읽기 전용 비트보드·정확한 반복 metadata 제공 및 재사용 | E 후보 + 실험 표시; 모델 입력 바이트 대조 |
-| 4 · C | `input_key`와 `prepare`가 projection·dense encoding·hash·legal index 작업을 반복 | C가 생성·검증한 불변 준비 결과 재사용; 같은 little-endian 바이트를 묶어 hash update | E 후보; 준비 결과 공유는 실험 표시 |
-| 5 · B | `ContractSearch::pump`가 매 selection마다 루트부터 이동을 재생성하고 각 child를 export | root 수명 안에서 노드별 검증된 불변 상태를 유한한 용량으로 재사용 | E 가설 + 실험 표시; 선택 순서가 달라지면 S |
-| 6 · B | selection의 `Vec<EdgeStats>`, PUCT의 점수 Vec, best move 조회용 전체 outcome·문자열 생성 | 작업 버퍼 재사용, 점수 생성과 argmax 결합, 가벼운 조회 API | E 후보; f64 연산·tie·오류 순서 유지 |
-| 7 · C/D/B | computed-only 경로에서 동일 입력을 다시 추론 | 같은 game의 root 사이 bounded exact raw-eval cache | E 가설 + 실험 표시; provenance·receipt·소비 경로 변경 |
-| 8 · B/D | Waiting에서 1ms sleep 후 poll | 완료·취소 통지와 deadline을 함께 처리하는 유한 대기 | 실험 표시; 고정 방문 trace를 비교하여 E/S 판정 |
-| 9 · A | 모든 의사 합법 수에 state clone/apply/attack 검사, 기하 계산 반복 | 공격 테이블, pin/check/evasion mask, 예외 수의 정밀 검사 | E 후보 + 실험 표시; 광범위 movegen 경로 변경 |
-| 10 · C/D/B | 매 Run의 staging Vec·출력 복제, B1 단일 진행 요청 | buffer 재사용 → I/O Binding → 별도 CUDA Graph·다중 요청/batch 실험 | 앞 두 항목은 E 가설 + 실험 표시; 선택·스케줄 변경은 S |
+| 순서·영역 | 소스와 비용 구조 | 구현 후보 | 현재 상태·후속 단위 | 예상 분류·실험 표시 |
+|---|---|---|---|---|
+| 1 · A | `position.rs` 반복 횟수·완전성 별도 순회, `outcome.rs`의 intended claim용 임시 child/history/owner | 단일 반복 증거 순회·checked claim preview | #18 opt-in 구현; 인수는 9.3 | E 후보; 동등성 검사 |
+| 2 · A | `contracts.rs::state_digest`의 전체 이력 FEN·해시 반복 | FEN 버퍼·현 상태 digest 재사용 | #18 opt-in 구현; 인수는 9.3 | E 후보; 실행 경로 변경 실험 |
+| 3 · A/C | `rules_projection.rs::project`의 64칸 재구성·frame별 과거 재순회 | 읽기 전용 비트보드·정확한 반복 정보 | 미구현 / OPT-01 | E 후보 + 실험; tensor 대조 |
+| 4 · C | `input_key`·`prepare`의 projection·encoding·hash·legal index 중복 | 검증된 불변 준비 결과·동일 바이트의 묶음 hash | 미구현 / OPT-02·03 | E 후보; 준비 공유는 실험 |
+| 5 · B | `ContractSearch::pump`의 root부터 재생성·child export 반복 | 유한한 노드 상태 재사용 | 미구현 / OPT-05 | E 가설 + 실험; 의미 차이는 S 검토 |
+| 6 · B | 통계·PUCT 점수 Vec, best move 조회용 전체 outcome·문자열 | 작업 버퍼·streaming argmax·가벼운 조회 | 미구현 / OPT-04 | E 후보; f64·tie·오류 순서 유지 |
+| 7 · C/D/B | computed-only 경로의 동일 입력 재추론 | 같은 game의 root 간 bounded exact raw-eval cache | 미구현 / OPT-06 | E 가설 + 실험; provenance·receipt 변경 |
+| 8 · B/D | Waiting의 1ms sleep·poll | 완료·취소 통지와 deadline 대기 | 미구현 / OPT-07 | 실험; 고정 방문 trace로 E/S 판정 |
+| 9 · A | 모든 pseudo move의 clone/apply/attack, 기하 계산 반복 | 공격 테이블 → pin/check 기반 생성 | 미구현 / OPT-08 | E 후보 + 실험; movegen 대조 |
+| 10 · C/D/B | 매 Run의 staging·출력 복제, B1 단일 진행 요청 | buffer → I/O Binding → 독립 Graph·다중 요청/batch | 미구현 / OPT-09~12 | 장치 경계는 E 가설 + 실험; 스케줄 변경은 S |
 
 전체 이력은 persistent prefix를 공유한다. `Arc::clone()`은 일반적으로 전체 자료 복제가
 아니므로 실제 allocation/bytes/lock 비용을 확인해 대상을 고른다. 입력 검증·physical lease·
@@ -194,13 +202,15 @@ runner의 wall time으로 성능 합격/불합격을 결정하지 않는다.
 
 ## 4. 구현 순서와 실험 코드 관리
 
-| 단계 | 구현 산출물과 책임 | 다음 단계의 검증 근거 |
+| 단계 | A가 직접 구현할 산출물 | 다음 단계의 검증 근거 |
 |---|---|---|
-| 측정 준비 | A의 기존 public 호출 probe와 D/E의 runner·manifest를 연결; 위 반복·오염·off/on 조건 구현 | 작은 smoke와 오염 표시/실패 분류 확인; 기존 자료는 참고로 보존 |
-| A 내부 개선 | 반복 증거 단일 순회 → claim 임시 객체 축소 → 직렬화/digest 재사용을 각각 작은 변경으로 구현 | 규칙·오류·identity witness 일치, 각 변경의 반복 CPU 비교 |
-| 소비 경계 개선 | A 읽기 전용 metadata와 C 준비 결과 재사용, B 통계 할당 제거·노드 상태 재사용을 독립 변경으로 구현 | 입력 바이트·fixed-visit trace·수명·메모리 상한 검사 |
-| runtime 실험 | PR #17의 후속 후보인 exact raw cache를 먼저 구현; 완료 통지 개선은 별도 비교 | computed/cache provenance·receipt·exactly-once 소비·reset·취소 검사 |
-| 확장 실험 | pin/check movegen, buffer/I/O Binding, CUDA Graph, 다중 요청/batch를 각각 분리 | 해당 정확성·흐름·장치 검사; S/A 후보는 별도 탐색·수치·강도 검증 |
+| 검증 기반 보강 / OPT-00 | 기존 probe를 tensor·전체 fixed-visit trace와 연결하고 유한한 종단 runner를 보강 | 기본/각 옵션/조합 witness; 반복·오염·observer 상태 식별 |
+| 기존 내부 실험의 인수 | 이미 구현한 claim·digest의 소비자 회귀·통제 성능 비교 | 구현 상태와 기본 활성화 판정을 분리; 8장 결과는 진단으로 유지 |
+| 입력 준비 / OPT-01~03 | 비트보드·반복 정보 → 불변 준비 결과 → hash 호출 축소 | tensor/input key/legal mapping·요청 검증·메모리 상한 |
+| 탐색 CPU 비용 / OPT-04~05 | 작은 할당·조회 제거 → bounded 노드 상태 재사용 | f64/tie/오류·selection/leaf/value/backup trace·eviction |
+| runtime / OPT-06~07 | exact raw cache → 별도 완료 통지 실험 | computed/hit 계약·정확한 집계·reset·lost wakeup·취소·drain |
+| movegen·장치 경계 / OPT-08~10 | 공격 테이블 → pin/check, staging/output pool → 별도 I/O Binding | 규칙 oracle·수명·budget·실제 장치 전송/동기화 |
+| 후속 실험 / OPT-11~12 | CUDA Graph와 다중 요청/batch를 독립 구현 | capture/replay 조건; S의 예약·backup·holdout 품질 |
 
 앞 단계의 성능이 불확정이어도 후속 후보의 독립 구현과 CPU/mock 검증은 진행할 수 있다.
 미검증 변경을 하나의 성능 variant에 누적하지 않고 각 실험의 기준 소스를 고정한다.
@@ -217,7 +227,9 @@ GPU가 필요한 항목도 구현·CPU/mock 검사와 실제 GPU 인수를 분�
 사용하지 않는 경로에서 allocation·lock·worker를 만들지 않는지 확인한다. 실험을 검증하려고
 baseline과 variant의 실제 추론을 같은 탐색 안에서 동시에 실행하여 성능을 오염시키지 않는다.
 실험 실패를 조용히 기본 경로 성공으로 숨기지 않으며 정상 cache miss의 재계산은 명시 계약대로
-처리한다. 새 옵션·공통 필드·revision과 통합 인수는 해당 담당 및 총괄이 맞춘다.
+처리한다. 새 옵션·공통 필드·revision과 모든 영향 consumer는 A가 함께 구현·검사한다.
+총괄 리뷰를 위한 계약 차이·통합 인수 근거를 같은 SHA로 남긴다. 상세 의존성과 완료 조건은
+9장을 따른다.
 
 ## 5. 구현 PR에 추가할 테스트 항목
 
@@ -258,7 +270,7 @@ freshness·binding·stale 거부는 별도 검사한다. fixed-visit 동등성�
 
 - 가설·변경 한 가지·E/A/S 분류와 예상 흐름 차이:
 - 기준/변경 source·binary·config·fixture 식별, 고정 W/S와 자원:
-- 활성화 옵션·기본값·중단/복귀 방법, 영향 담당·계약 revision:
+- 활성화 옵션·기본값·중단/복귀 방법, 영향 consumer·계약 revision:
 - 구현됨 / 부분 구현 / 알려진 실패 / 미실행:
 
 - [ ] 기본 비활성 경로의 기존 동작·비용 유입 검사
@@ -293,8 +305,8 @@ freshness·binding·stale 거부는 별도 검사한다. fixed-visit 동등성�
 
 외부 구현은 설계·독립 검증 참고로 사용하고 자체 MIT 코어에 외부 GPL 소스를 복제하지 않는다.
 초기 완료 범위는 PR #17의 상태·변경·리뷰·CI 확인과 계획 문서 작성이었다. A의 후속
-실험 구현·새 반복 CPU 진단은 아래에 추가한다. 나머지 담당 후보, controlled 전체 탐색·
-GPU A/B, 실제 강도 인수는 후속 항목이다.
+실험 구현·새 반복 CPU 진단은 아래에 추가한다. 나머지 최적화도 A의 후속 구현 범위로
+갱신했으며 controlled 전체 탐색·GPU A/B·실제 강도 인수와 함께 9장에 정리한다.
 
 ## 8. A 실험 구현과 실제 검사·CPU 진단 (2026-10-03)
 
@@ -497,6 +509,206 @@ probe source hash는 `19ca8fce694a40e838944bf7c28c208217116454d629d514f87b3d894a
 
 남은 인수는 통제 장비의 전체 fixed-visit/selection/leaf/value/backup trace, 실제 C
 tensor/input key·B/D 시간/취소/물리 수명과 결합한 회귀 비교, observer off/on 비용,
-실제 모델·GPU와 동일 자원의 대국 강도다. B/C/D 후보 및 A movegen/projection 후보는
-이번 구현 범위에 포함하지 않는다. 기본 활성화 전에는 allocation 감소와 짧은 API
-개선만으로 이를 대체하지 않고 각 담당·총괄이 같은 integration SHA에서 확인한다.
+실제 모델·GPU와 동일 자원의 대국 강도다. 8장에 기록한 source `5dbd514`에는 B/C/D 후보
+및 movegen/projection 개선이 포함되지 않았다. 최신 배정으로 이 항목도 A가 구현할
+9장의 후속 범위에 포함한다. 기본 활성화 전에는 allocation 감소와 짧은 API 개선만으로
+이를 대체하지 않고 A가 소비자 검증을 연결하여 총괄 리뷰용 integration 근거를 남긴다.
+
+## 9. 전체 최적화의 미반영 항목과 실행 계획
+
+### 9.1 구현됨·미반영·인수 대기의 구분
+
+계획 갱신 전인 2026-10-03 UTC에 PR #18 `15b9d50`과 PR #17 `81059e4`가 모두 open/draft이며 develop은
+`b5ba853`임을 재확인했다. 두 head의 Ubuntu·Windows CI 필수 step은 성공했고 미해결
+inline review thread는 없다. 이후 구현의 manifest는 당시 최신 full SHA를 다시 고정한다.
+
+| 항목 | 현재 반영 상태 | 남은 일 |
+|---|---|---|
+| #16의 legal 중복 생성·부모 재-export·discarded undo·profile hash | develop에 병합됨 | 기준선에 포함; 같은 개선을 다시 구현하지 않음 |
+| claim 반복 증거·임시 전이 축소 | #18의 `experimental-claim-preview`, 기본 off | tensor/전체 탐색 소비자 대조·통제 성능 비교·통합 및 활성화 판단 |
+| FEN 버퍼·현 상태 digest 재사용 | #18의 `experimental-history-digest`, 기본 off | 같은 인수; 짧은 이력 회귀 가능성도 재확인 |
+| 유한한 public probe·상태 witness·반복 CPU/할당 진단 | 구현·실행됨, 8장에 증거 보존 | 종단 witness/runner 보강; 기존 숫자를 새 비교 표본으로 사용하지 않음 |
+| D02 source observer | #17에 구현됐지만 현재 기준선에는 미병합 | 사용할 통합본의 선언·consumer 대조, off/on overhead와 관측 손실 검사 |
+| 아래 OPT-01~12 | 미구현 | 전부 A가 구현·소비자 연결·검증; 다른 담당에게 제안만 남기지 않음 |
+
+OPT 번호는 이 계획의 작업 단위이며 기존 TASK/CARD 배정을 바꾸는 번호가 아니다.
+다음 표의 상태는 **구현 계획**이다. 지원 옵션이 선언됐거나 backend가 batch를 받을 수
+있다는 사실을 실제 탐색 경로의 구현 완료로 세지 않는다.
+
+### 9.2 우선순위와 의존성
+
+| 단위 | 미반영 산출물·주 변경 파일 | 선행 및 분리 조건 | 완료 근거 |
+|---|---|---|---|
+| OPT-00 / 다음 작업 | tensor·fixed-visit witness, 유한 종단 비교 runner; position 예제·search/uci 검사·계측 runner | 기존 probe 활용; 가짜 clock correctness와 실제 시간 성능을 분리 | 기존 두 feature까지 동일성 비교 가능, 실패·오염·상한을 기록 |
+| OPT-01 | 읽기 전용 비트보드·borrowed 이력 반복 정보; position `position.rs/types.rs`, eval `rules_projection.rs` | 비트보드 읽기와 반복 계산을 각각 비교 | 전체 입력 바이트·repeated plane·padding·합법 수 순서 일치 |
+| OPT-02 | projection/encoded/input key/legal indices의 불변 준비 결과; eval `rules_projection.rs/contracts.rs`, search/uci 연결 | OPT-01 이후; 공유 객체와 새 요청의 검증을 분리 | 중복 encode 제거, 잘못된 요청·profile·budget 거부 유지 |
+| OPT-03 | input key의 작은 hash update 축소; eval `contracts.rs`, encoding 접점 | OPT-02와 별도 variant | 기존 little-endian framing·golden·key 일치 |
+| OPT-04 | PUCT·통계 작업 버퍼·best move 조회; search `policy.rs/tree.rs/contracts.rs`, uci `engine.rs` | OPT-00; 조회/argmax/버퍼를 각각 작은 비교로 분리 | tie·오류 우선순위·전체 고정 방문 trace 일치 |
+| OPT-05 | bounded 노드 상태 재사용; search `tree.rs/contracts.rs`, Rules adapter | OPT-00; OPT-04와 분리 | replay 대조·eviction·세대/수명·메모리 상한 |
+| OPT-06 | 같은 game의 exact raw-eval cache; eval/native bridge·runtime/scheduler·search 소비자 | OPT-02·00; notifier 없이 먼저 비교 | 실제 hit/miss·fresh 요청·RawEvalHit/receipt·한 번의 backup |
+| OPT-07 | 완료·취소 알림과 deadline 대기; eval `worker.rs/native_runtime_bridge.rs`, runtime·uci | OPT-06과 별도 변경/대조; cache off에서도 검사 | lost wakeup·stop/quit·stale·physical drain·대기 지연 |
+| OPT-08 | 공격 테이블 → pin/check movegen; position `movegen.rs` | 두 변경 분리; claim/digest 옵션도 각각 대조 | 기존 perft·독립 oracle·move 순서·EP/castling 오류 보존 |
+| OPT-09 | 입력 staging·raw output buffer 재사용; eval `onnx.rs/worker.rs`, runtime ledger | 모델/shape/physical completion 경계 유지 | 할당·peak memory·출력·quarantine 검사 |
+| OPT-10 | ORT I/O Binding; eval `onnx.rs`, native loader/bridge의 capability·수명 접점 | OPT-09; 실제 ORT 1.22.0/rc.10 지원 확인 | 장치 전송/Run/동기화 분리 계측·실제 GPU 대조 |
+| OPT-11 | CUDA Graph capture/replay | OPT-10; Graph 단독 variant | 고정 shape/주소·오류·수명·실제 GPU 반복 실행 |
+| OPT-12 | 탐색 다중 진행 요청·batch·virtual reservation; search·runtime·eval·uci | OPT-06/07/09 이후; Graph 채택은 선행 조건이 아님 | 정확한 예약/backup·유한 대기·S trace·동일 자원 holdout |
+
+OPT-00을 먼저 구현하고 OPT-01을 첫 비용 제거 단위로 진행한다. OPT-04·08은 입력 경계와
+독립적으로 개발할 수 있지만 실행 비교는 직렬화한다. 기존 두 feature의 인수가 불확정이어도
+후속 CPU/mock 구현을 멈추지 않는다. 어느 비교에도 미인수 변경을 묶어서 넣지 않는다.
+
+### 9.3 OPT-00과 기존 두 실험의 남은 검증
+
+- 기존 합법 256-ply fixture와 짧은/긴 이력·claim·unknown-prefix 입력군을 사용한다.
+  원본/default/claim/history/두 옵션에서 ordered moves·full history·classification·digest뿐
+  아니라 C의 실제 tensor/input key/legal indices를 비교하는 유한 witness를 추가한다.
+- 같은 seed·고정 방문 수·결정적 evaluator와 가짜 clock으로 selection/leaf/value/backup 및
+  최종 root 통계를 비교한다. stop/deadline/stale/overflow/resource 오류는 별도 시나리오로
+  검사한다. ID 발급 차이만 정규화하고 권한·중복 소비 오류는 정규화로 숨기지 않는다.
+- 실제 clock의 `go`→`bestmove` 비용·완료 방문 수·deadline·CPU·peak RSS를 수집할 runner를
+  기존 실험 manifest와 연결한다. CPU/mock, 실제 CPU 모델, 목표 GPU 모델은 서로 다른
+  cohort로 남긴다. load/warm-up/quit와 observer 직렬화는 탐색 구간 밖에서 별도 기록한다.
+- pilot과 사전 고정한 3세션×4 paired block, ABBA/BAAB의 48 fresh process 비교를 적용한다.
+  baseline-baseline과 profile off/on 대조도 유지한다. 경합을 통제·관측하지 못하면 진단으로
+  표시한다. 첫 두 옵션을 각각 비교하고 조합 효과는 별도 비교로 확인한다.
+
+기존 feature의 **새 전체 탐색 동일성 검사**, **통제 성능 비교**, **기본 활성화 판단**이
+남아 있다. 8장의 정확성 검사 성공을 취소하지 않으며 그 근거를 전체 탐색 인수로 확대하지
+않는다. PR #17 observer는 실제 선택한 통합 SHA에서만 사용한다. lock 비용이 문제로
+측정될 때 per-worker journal 같은 변경을 별도 후보로 만들고 cache/notifier와 묶지 않는다.
+
+### 9.4 OPT-01~03: 입력 준비의 반복 계산 제거
+
+OPT-01의 첫 변경은 A가 이미 유지하는 12개 bitboard를 읽기 전용으로 제공해 C의
+64-square 재구성을 없애는 것이다. 두 번째 변경은 최근 최대 8개 frame의 반복 여부를
+borrowed 이력 한 순회에서 판별한다. frame마다 **그 frame보다 오래된 known prefix**만
+비교해야 한다. 최대 8개 target에 필요한 유한한 저장 공간부터 사용하고 전체 이력 크기의
+무제한 map을 만들지 않는다. 순회·identity 복제·할당을 각각 계측한다.
+
+C의 `repeated`는 더 오래된 동일 repetition identity가 한 번이라도 있는지 판별한다.
+claim의 3/5회 기준·irreversible 경계·증거 완전성과 그대로 호환되는 값이 아니다.
+legal EP를 포함한 동일 identity를 사용하고 origin/unknown prefix·raw EP·history fill을
+보존한다. 이력을 최근 8개로 잘라내지 않는다. 같은 보드와 최근 frame을 가지지만 과거
+이력만 다른 fixture, EP predecessor, 승격·make/unmake·fork를 기존 경로와 직접 대조한다.
+
+OPT-02는 trusted encoder가 실제 불변 Rules 상태에서 만든 projection·dense tensor·key·
+ordered policy indices를 하나의 준비 결과로 묶는다. 먼저 내부 객체를 구현한 뒤 input-key
+콜백과 runtime prepare 소비자를 연결한다. 객체의 생성 경로·필드를 제한하고 수명/용량을
+명시해 key만 같은 임의 tensor를 받아들이지 않는다. 요청마다 model/encoding/backend/
+precision/compute/history profile·현재 position/legal binding·host byte budget을 검사한다.
+같은 tensor를 다시 encode하는 비용은 제거하되 실제 입력과 요청의 일치 검증은 유지한다.
+공유 준비 결과의 bytes도 상한에 포함하고 root/game/model 교체와 stale 요청을 검사한다.
+
+OPT-03은 key의 byte codec을 유지하면서 작은 `hash.update`를 유한한 작업 버퍼로 묶는
+독립 변경이다. f32 little-endian 순서·frame/encoding framing·기존 golden을 유지하고
+digest 형식이나 precision은 바꾸지 않는다. projection/encode/key/prepare의 호출 수·
+allocation·시간, 전체 request 준비 시간을 함께 비교한다.
+
+### 9.5 OPT-04~05: 탐색 할당과 상태 재생성 제거
+
+OPT-04는 PUCT의 점수 Vec 없이 argmax를 계산한다. parent visit 합의 overflow 검사를
+먼저 수행하고 모든 edge의 유효성 검사를 유지한다. f64 식의 연산 순서·strict `>` tie와
+뒤쪽 edge 오류를 보존한다. 범용 SelectionPolicy가 받는 통계는 재사용 작업 버퍼로
+제공하고 유효 수명 동안 덮어쓰지 않는다. 이 변경과 UCI의 가벼운 best-move 조회 API를
+각각 비교한다. 조회는 root 준비 전/방문 0의 None·기존 tie를 유지하며 전체 outcome과
+policy 문자열은 최종 결과나 실제 진단 요청에서만 만든다.
+
+OPT-05는 노드에 연결된 검증된 불변 Rules 상태를 root 수명 안에서 재사용한다. node ID와
+generation을 묶고 entry/node/byte 상한·eviction·root/game/model 교체를 구현한다. miss는
+기존 경로로 재생성하며 hit도 현재 authority/terminal/legal guard를 거친다. board/FEN만
+같은 다른 이력으로 교체하지 않는다. 공유 history의 실제 보존 비용과 peak RSS를 기록하고
+runtime이 보유한 snapshot/physical lease가 끝나기 전에 강제로 해제하지 않는다.
+
+무캐시/상한 0/작은 상한/eviction/깊은 경로를 같은 고정 방문 trace로 비교한다. replay·
+export 횟수, selection 준비 시간, allocation·메모리가 1차 진단 지표다. lookup/hit를 방문,
+selection 또는 평가 횟수로 더하지 않는다.
+
+### 9.6 OPT-06~07: exact raw cache와 완료 대기를 별도 구현
+
+OPT-06은 현재 `RawOutput`의 **전체 policy logits와 WDL**을 유한한 entry/byte 상한으로
+저장한다. legal-filtered prior나 subtree를 cache하지 않는다. 같은 game의 연속 root에서
+사용하며 `ucinewgame`과 model/encoding/backend/precision/compute profile 교체에 초기화한다.
+키는 실제 tensor bytes/codec/history fill과 모든 계산 조건을 식별하고 hash collision으로
+다른 입력을 재사용하지 않게 equality 근거를 보관한다. 저장·대조 비용도 계측한다.
+
+현재 공통 선언에 `RawEvalHit { source_execution }`은 있지만 fresh runtime은 computed-only다.
+따라서 lookup 구현과 함께 C의 새 legal view 변환, D admission/finalization/receipt, B의
+최종 guarded backup을 모두 연결한다. hit는 새 request/selection/context를 사용하고
+원 계산의 provenance를 기록하며 **새 physical execution은 None**으로 둔다. 실제
+미실행 작업의 execution/worker/GPU 시각을 만들지 않는다. 실제 물리 실행 수·hit 수와
+논리 selection/accepted visit/backup 수를 분리한다.
+
+새 요청의 legal order·모델·취소·deadline·generation을 lookup 및 최종 소비 경계에서
+검사하고 host budget 검사를 우회하지 않는다. 현재 game/model scope에서 검증된 성공
+출력만 적재하며 실패·quarantine·stale 쓰기·취소 경쟁을 검사한다. cold/miss/cross-root hit/
+eviction/reset, 입력은 같지만 조건이나 이력이 다른 경우, 해시 충돌 주입을 대조한다.
+cache off/hit에서도 정상 selection당 backup은 한 번이다. 기존 72/258은 후보 근거이며
+이 실험의 hit rate나 절약량으로 사용하지 않는다.
+
+OPT-07은 UCI의 Waiting 1ms sleep을 완료·취소·scope 변경 알림과 deadline을 함께 기다리는
+방식으로 바꾼다. `pump`와 결과 소비는 nonblocking으로 유지하고 orchestration owner에서만
+유한하게 기다린다. 등록 뒤 predicate/sequence를 다시 확인해 완료 직전·직후 lost wakeup을
+막고 spurious wakeup·여러 사건의 병합을 처리한다. 결과 receipt의 소유권은 기존 owner에
+남기며 알림 수신자가 결과를 먼저 빼앗지 않는다. soft/admission/hard deadline의 용도를
+보존하고 stop/quit/root 교체도 대기를 깨운다.
+
+논리 취소는 physical 완료가 아니므로 기존 drain/quarantine/lease를 유지한다. cache
+off/on에서 race fixture를 각각 검사하되 주 성능 비교는 notifier 변경만 사용한다.
+worker 완료→ready→backup 지연, wakeup/poll 수·CPU 사용·deadline을 비교한다. 같은 고정
+방문 의미가 달라지면 원인을 고치거나 S 실험으로 명시한다.
+
+### 9.7 OPT-08: 합법 수 생성의 정밀 검사 범위 축소
+
+공격 기하 테이블과 pin/check 기반 생성은 별도 opt-in 변경으로 진행한다. 먼저 pawn/
+knight/king·ray 기하 계산을 줄이고 그다음 checkers·pinned·evasion mask로 후보를
+제한한다. king 이동·EP 발견 공격·castling·pinned move는 필요한 정밀 공격 검사를
+유지한다. double check·rook 권리 상실·legal EP repetition identity도 검사한다.
+
+기존 generator를 대조군으로 유지하고 ordered moves, Q/R/B/N 승격 순서, child FEN/
+classification·claim·digest·make/unmake·overflow를 비교한다. 기존 확장 perft와 독립
+python-chess oracle, 유한한 합법 게임 trace를 사용한다. pseudo/정밀 검사/clone 수·시간과
+전체 탐색을 함께 측정한다. 외부 GPL 구현은 참고만 하고 자체 구현한다.
+
+### 9.8 OPT-09~12: ONNX 밖의 buffer·장치·탐색 경계
+
+OPT-09는 요청/shape별 input staging과 raw output 작업 버퍼를 bounded pool로 재사용한다.
+현재 `active_input`과 CUDA 오류의 session/input quarantine를 유지한다. 물리 완료가
+입증된 slot만 반환하고 host/device/pinned 예약과 pool 보존 메모리를 집계한다. 출력
+소비자가 보유 중인 값을 덮어쓰지 않는다. shape/batch 변경·allocation 실패·출력 오류·
+취소·shutdown·quarantine를 검사하고 복제 bytes·allocation·peak RSS/VRAM을 비교한다.
+
+OPT-10은 실제 ORT/wrapper 지원을 확인한 I/O Binding 경로를 별도 구현한다. 입력/출력
+장치 주소·shape·session·stream·동기화와 실행 수명을 고정하고 지원하지 않는 capability는
+명시 오류로 남긴다. CPU/mock으로 경계 코드를 검사하고 목표 GPU에서 전송·kernel·동기화를
+분리 측정한다. Run host interval만으로 장치 절약량을 주장하지 않는다. 입력 바이트와
+policy/WDL의 사전 고정 수치 기준, 소비 trace·deadline·메모리도 비교한다.
+
+OPT-11은 고정 shape/batch·buffer 주소·session 조건의 Graph capture/replay를 독립
+실험한다. warm-up/capture 비용도 전체 자기 시간·메모리에 포함한다. 조건 변경 시
+invalidation, capture/replay 실패와 quarantine, 비동기 fence 이전의 재사용을 검사한다.
+실제 GPU 반복 실행과 해당 버전의 지원 증거가 없으면 인수 미완료로 남긴다.
+
+OPT-12는 현재 B의 단일 pending selection을 다중 ticket/virtual reservation으로 확장하는
+**S 실험**이다. 기존 runtime/backend의 batch 지원을 재사용하되 실제 search 연동을
+구현한다. 진행 요청·queue·batch size·max wait·메모리·deadline을 제한하고 각 완료/취소/
+오류/캐시 hit에서 reservation을 반환하며 selection당 backup을 한 번만 수행한다.
+selection/완료 순서의 예상 차이를 먼저 PR에 명시한다. 고정 방문 수에서 S0와 같다고
+가정하지 않으며 같은 W의 holdout·동일 CPU/GPU/시간/메모리 paired 대국으로 별도 판단한다.
+Graph·batch 확대·precision 변경을 한 variant에 함께 넣지 않는다.
+
+### 9.9 공유·인수·범위의 완료 조건
+
+현재 문서와 첫 두 실험은 Draft #18에서 유지한다. 후속도 작은 의미 단위로 commit/push하고
+같은 목표의 branch/PR를 재사용한다. 독립 비교나 충돌 격리가 필요할 때만 별도 branch/PR로
+나눈다. 각 흐름 변경 PR에 실험/default off·영향 consumer·계약 차이·예상 의미 차이와
+5장의 해당 테스트를 적고 실제 실행 후에만 완료 표시한다.
+
+각 단위의 완료 기록은 **내부 구현 → 소비자/계약 연결 → 정확성 → 반복 성능 → 장치/품질
+인수 → 기본 활성화 판단**을 구분한다. 성능 효과가 불확정이면 구현을 공유하되 기본값을
+바꾸지 않는다. 사용하지 않는 실험의 allocation/lock/worker 유입도 검사한다. 허용치는
+3장의 사전 기준을 사용하며 음성 결과와 실패를 보존한다.
+
+이번 계획 갱신은 제품 코드를 추가하지 않는다. 학습·가중치 교체·근사 cache·history 절단·
+증분 digest codec은 포함하지 않는다. GPU 실험의 코드와 검사 진입점은 구현 범위에
+포함하지만 실제 실행은 지정 장비와 기존 예산 안에서 한다. GPU 부재나 새 자원 미확정은
+CPU/mock 구현을 막지 않으며 미실행 GPU·강도 결과를 통과로 표시하지 않는다.
