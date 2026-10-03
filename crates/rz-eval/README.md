@@ -274,6 +274,15 @@ Run/전송/fence 오류에서 CUDA completion이 불확실하면 binding·input�
 capture/replay의 관측 증거가 아닙니다. ORT buffer 실제 재사용·GPU 수치·capture/replay·
 지연/VRAM은 장비 검증 항목이며 CPU 계약 테스트로 통과 처리하지 않습니다.
 
+외부 자산을 사용하는 기존 `maia_check` 수치 대조 명령 끝에도 위 세 실행 옵션을
+명시할 수 있습니다. 각 옵션의 Cargo feature를 먼저 켜며 중복·미지원 옵션은
+거부합니다. Graph는 `cuda`와 `--experimental-io-binding`을 요구하고 batch 1만
+실행합니다. 제외한 2/4/8/16은 보고서에 남깁니다. 실험 설정은 32회 B1 반복 대조,
+소유 출력 불변성, `last_io_timings()`의 host staging·전송·Run·output fence·출력
+소유화 구간을 `experimental_checks`에 기록합니다. 시계는 CPU wall clock이고 Run에
+kernel·동기화가 포함됩니다. 성공 호출 수로 capture/replay를 확인했다고 주장하지
+않습니다. GPU capture/replay·peak VRAM·quarantine 및 정식 성능 인수는 별도입니다.
+
 OPT-12의 `experimental-batch`는 explicit `NativeWorkerOwner::from_worker_batched`
 또는 `from_onnx_batched`/`from_cuda_onnx_batched`와 연결합니다. 한 물리 worker의
 실제 PreparedBatch(최대 16개), 공유 ExecutionId, 각 요청의 독립 policy/WDL 변환을

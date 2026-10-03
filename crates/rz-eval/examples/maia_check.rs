@@ -7,7 +7,7 @@
 use rz_encoding::classical::{self, Frame, HistoryFill, Input};
 use rz_encoding::policy;
 use rz_eval::asset::{self, MaiaAsset};
-use rz_eval::onnx::{BackendConfig, OnnxBackend, OrtRuntime, Provider};
+use rz_eval::onnx::{BackendConfig, ExecutionExperiments, OnnxBackend, OrtRuntime, Provider};
 use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeLibraryPin};
 use rz_eval::{output, RawOutput};
 use serde::Deserialize;
@@ -89,14 +89,23 @@ fn verify(raw: &RawOutput, case: &Case) -> Result<serde_json::Value, Box<dyn Err
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let option_start = args
+        .iter()
+        .position(|arg| arg.starts_with("--"))
+        .unwrap_or(args.len());
+    let (args, options) = args.split_at(option_start);
+    let experiments = experimental_options(options)?;
     if !(8..=10).contains(&args.len()) {
-        return Err("usage: maia_check SOURCE.pb.gz MODEL.onnx MANIFEST.json ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu | cuda PROFILE_DIRECTORY CUDA_BUNDLE.json".into());
+        return Err("usage: maia_check SOURCE.pb.gz MODEL.onnx MANIFEST.json ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu | cuda PROFILE_DIRECTORY CUDA_BUNDLE.json [--experimental-io-buffers] [--experimental-io-binding] [--experimental-cuda-graph]".into());
     }
     let is_cuda = match args[7].as_str() {
         "cpu" if (8..=9).contains(&args.len()) => false,
         "cuda" if args.len() == 10 => true,
         _ => return Err("CPU keeps its existing arguments; CUDA requires a fresh profile directory and explicit bundle manifest".into()),
     };
+    if experiments.cuda_graph && !is_cuda {
+        return Err("CUDA Graph numerical check requires explicit CUDA provider".into());
+    }
     let bytes = asset::read_bounded(Path::new(&args[5]), 8 * 1024 * 1024)?;
     let fixtures: Fixtures = serde_json::from_slice(&bytes)?;
     if fixtures.schema != 1
@@ -133,6 +142,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     let mut config = BackendConfig::cpu();
+    config.experiments = experiments;
+    if experiments.cuda_graph {
+        // Graph has one fixed B1 shape; larger batches are explicitly excluded.
+        config.max_batch = 1;
+    }
     let bundle_spec = if is_cuda {
         let spec_bytes = asset::read_bounded(Path::new(&args[9]), 64 * 1024)?;
         let spec = CudaRuntimeBundleSpec::from_json(std::str::from_utf8(&spec_bytes)?)?;
@@ -251,7 +265,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         singles.push(raw);
     }
     let mut batch_checks = Vec::new();
-    for size in [1, 2, 4, 8, 16] {
+    let batch_sizes: &[usize] = if experiments.cuda_graph {
+        &[1]
+    } else {
+        &[1, 2, 4, 8, 16]
+    };
+    for &size in batch_sizes {
         let order = (0..size)
             .map(|i| (size - 1 - i) % encoded.len())
             .collect::<Vec<_>>();
@@ -269,6 +288,43 @@ fn main() -> Result<(), Box<dyn Error>> {
             compare(&raw.wdl, &singles[i].wdl, 1e-4, 0.0)?;
         }
         batch_checks.push(json!({"batch":size,"single_vs_batch_logit_max_abs":max_abs}));
+    }
+    let mut experimental_checks = None;
+    if experiments != ExecutionExperiments::default() {
+        let mut phases = Vec::new();
+        // Same session/shape and varying actual inputs: retain independent
+        // outputs, then move only the new outputs back to the bounded pool.
+        for round in 0..32 {
+            let i = round % encoded.len();
+            let results = backend.run(&[&encoded[i]])?;
+            verify(&results[0], &fixtures.cases[i])?;
+            if let Some(timing) = backend.last_io_timings() {
+                phases.push(json!({"round":round, "case":fixtures.cases[i].name,
+                    "host_stage_seconds":timing.host_stage.as_secs_f64(),
+                    "transfer_in_seconds":timing.transfer_in.map(|d| d.as_secs_f64()),
+                    "run_seconds":timing.run.as_secs_f64(),
+                    "output_fence_seconds":timing.output_fence.map(|d| d.as_secs_f64()),
+                    "transfer_out_seconds":timing.transfer_out.map(|d| d.as_secs_f64()),
+                    "own_outputs_seconds":timing.own_outputs.as_secs_f64()}));
+            }
+            backend.recycle_outputs(results);
+        }
+        // Later reuse must not mutate outputs which the caller still owns.
+        for (raw, case) in singles.iter().zip(&fixtures.cases) {
+            verify(raw, case)?;
+        }
+        experimental_checks = Some(json!({
+            "reuse_buffers":experiments.reuse_buffers,
+            "io_binding":experiments.io_binding,
+            "cuda_graph_requested":experiments.cuda_graph,
+            "repeated_B1_calls":32, "retained_outputs_unchanged":true,
+            "binding_runs":backend.binding_runs(),
+            "phase_clock":"CPU wall boundaries; Run includes kernels/synchronization",
+            "phases":phases,
+            "excluded_batch_sizes":if experiments.cuda_graph { vec![2,4,8,16] } else { vec![] },
+            "capture_replay_observed":false,
+            "formal_performance_acceptance":false
+        }));
     }
     assert!(backend.run(&[]).is_err());
     assert!(backend.run(&[&encoded[0]; 17]).is_err());
@@ -290,7 +346,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     #[cfg(feature = "contracts")]
-    let contract_worker = verify_contract_worker(backend, &fixtures.cases, &encoded)?;
+    let contract_worker = verify_contract_worker(
+        backend,
+        &fixtures.cases,
+        &encoded,
+        if experiments.cuda_graph { 1 } else { 4 },
+    )?;
     #[cfg(not(feature = "contracts"))]
     let contract_worker = json!({"status":"not_enabled"});
     if is_cuda {
@@ -298,7 +359,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // closure when final evidence is admitted, not only at the B1 probe.
         runtime.verify_cuda_runtime_mappings()?;
     }
-    let report = json!({"status":"passed", "provider": args[7], "precision":"fp32", "tf32":false,
+    let mut report = json!({"status":"passed", "provider": args[7], "precision":"fp32", "tf32":false,
         "reference":fixtures.reference, "fixture_sha256":asset::hex_sha256(&bytes),
         "reference_commit":fixtures.reference_commit,"reference_module_sha256":fixtures.reference_module_sha256,
         "runtime_sha256":args[4], "runtime_build":runtime.build_info(),
@@ -318,13 +379,50 @@ fn main() -> Result<(), Box<dyn Error>> {
         "case_errors":errors,"batch_checks":batch_checks,
         "cuda_executed_nodes":cuda_executed_nodes,"cuda_profile_sha256":cuda_profile_sha256, "contract_worker": contract_worker,
         "gpu_acceptance": if args[7] == "cpu" { "not_run" } else { "numerical_and_provider_probe_only" }});
+    if let Some(checks) = experimental_checks {
+        report["experimental_checks"] = checks;
+    }
     std::fs::write(&args[6], serde_json::to_vec_pretty(&report)?)?;
     println!(
-        "passed: {} cases, batches 1/2/4/8/16, provider={}",
+        "passed: {} cases, batches {}, provider={}",
         encoded.len(),
+        batch_sizes
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join("/"),
         args[7]
     );
     Ok(())
+}
+
+fn experimental_options(options: &[String]) -> Result<ExecutionExperiments, Box<dyn Error>> {
+    let mut experiments = ExecutionExperiments::default();
+    for option in options {
+        let (enabled, compiled) = match option.as_str() {
+            "--experimental-io-buffers" => (
+                &mut experiments.reuse_buffers,
+                cfg!(feature = "experimental-io-buffers"),
+            ),
+            "--experimental-io-binding" => (
+                &mut experiments.io_binding,
+                cfg!(feature = "experimental-io-binding"),
+            ),
+            "--experimental-cuda-graph" => (
+                &mut experiments.cuda_graph,
+                cfg!(feature = "experimental-cuda-graph"),
+            ),
+            _ => return Err("unknown execution experiment".into()),
+        };
+        if *enabled || !compiled {
+            return Err("duplicate or uncompiled execution experiment".into());
+        }
+        *enabled = true;
+    }
+    if experiments.cuda_graph && !experiments.io_binding {
+        return Err("CUDA Graph numerical check requires explicit I/O Binding".into());
+    }
+    Ok(experiments)
 }
 
 #[cfg(feature = "contracts")]
@@ -332,6 +430,7 @@ fn verify_contract_worker(
     backend: OnnxBackend,
     cases: &[Case],
     encoded: &[classical::EncodedInput],
+    width: usize,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     use rz_contracts::*;
     use rz_eval::contracts::{self, MaiaBinding, PreparedBatch};
@@ -356,7 +455,7 @@ fn verify_contract_worker(
     let mut prepared = Vec::new();
     let mut requests = Vec::new();
     // Immutable fixture Rules views from the external oracle, not an A integration claim.
-    for (i, case) in cases.iter().take(4).enumerate() {
+    for (i, case) in cases.iter().take(width).enumerate() {
         let state = StateIdentity {
             owner: OwnerId(2),
             revision: StateRevision(i as u64),
@@ -453,7 +552,9 @@ fn verify_contract_worker(
     let execution = ExecutionId::new(epoch, 50);
     let mut worker = contracts::spawn_onnx_worker(backend)?;
     let mut lease = worker.submit(PreparedBatch::new(execution, prepared)?)?;
-    requests[0].cancel_token().cancel();
+    if width > 1 {
+        requests[0].cancel_token().cancel();
+    }
     let stop = Instant::now() + Duration::from_secs(5);
     let outputs = loop {
         match lease.poll() {
@@ -496,7 +597,7 @@ fn verify_contract_worker(
             backend: binding.backend(),
         };
         let acceptance = output.validate_for(request, scope, ClockDomain(epoch), MonotonicTick(1));
-        if i == 0 {
+        if i == 0 && width > 1 {
             assert_eq!(acceptance.unwrap_err().code, ErrorCode::Canceled);
         } else {
             acceptance?;
@@ -504,7 +605,7 @@ fn verify_contract_worker(
     }
     assert!(matches!(lease.poll(), PhysicalPoll::Consumed));
     Ok(
-        json!({"status":"passed","physical_outputs":outputs.len(),"canceled_rejected":1,
+        json!({"status":"passed","physical_outputs":outputs.len(),"canceled_rejected":usize::from(width > 1),
         "scope":"C worker plus contract 0.1; fixture Rules view; D scheduler not linked"}),
     )
 }
