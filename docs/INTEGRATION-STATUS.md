@@ -775,3 +775,99 @@ startup/final·PID·TRACE를 대조해 제한된 연결 인수의 차단 사항�
 
 D02 GPU 종단 source clock/journal·P50/P95/P99·process peak VRAM, D03 단일 runtime
 개선, 실제 Maia F02 학습, 정식 LC0 paired 강도·통계는 여전히 별도 인수다.
+
+## 최적화 소스 b5ba853의 로컬 CPU·CUDA 연결 인수
+
+2026-10-03 총괄 I02는 `develop`의 깨끗한 product source
+`b5ba853585cb5a78f81159f733a86cdfe085936b`에서 CPU 수치 회귀, 실제 A Rules→C CUDA→D,
+CPU/CUDA UCI와 E의 제한된 CUDA pair를 인수했다. 원격 open PR이 없음을 먼저 확인했다.
+[PR #16](https://github.com/daejunnom/RoveZero/pull/16)의 의미 보존 최적화를 포함한 소스이며,
+이 절 이후의 문서 head와 실행한 product SHA를 구별한다. 공통 계약은 `0.1`이다.
+실행 환경은 Ubuntu/WSL2·Rust 1.96.0·RTX 4050 Laptop 6GB·driver 610.62다.
+
+root Cargo.lock SHA는
+`e86e6deca01f9f5d74a11014cd5473dd98f6759a64540ca26377a6cb44c7b57d`다.
+Maia-1900 원본·독립 LC0 v0.32.1 Eigen reference·변환 ONNX·ORT 1.22.0을 유지했다.
+CUDA는 FP32·TF32 off·device 0이며 Rules/UCI/pair는 B1·thread/worker 1을 사용했다.
+canonical native bundle은 19개 파일,
+`12d8fe080ab22c29d9a63229f233066ef0bd1f6b4743a2d54d1be9efea20fcd3`다.
+
+| b5ba853 release 산출물 | bytes | SHA-256 |
+|---|---:|---|
+| C 수치 검사 | 1,827,936 | `ffdb36684749118578ced2f05380ef0886ed2f1ef3d55c15823d00bde6247220` |
+| 실제 Rules/C/D 수치 검사 | 2,104,584 | `36158caa6c5d14a79e48cfca27bb382411c17f5c47d3231832593ee10c3cb410` |
+| CPU/CUDA UCI | 3,002,248 | `991f6746c9f9c54c1a97bad37dfe6df59a0652ea4e9981ba94d789578fc5840d` |
+| CUDA arena | 4,562,000 | `0037315239200a9b2fb923576287a233d71a729662a20765668fc79f765cbcd5` |
+
+| 검사 | 이번 인수 근거 | 결과 |
+|---|---|---|
+| C 실제 CPU 수치 회귀 | 새 실행, 12 case·B1/2/4/8/16·LC0 reference 대조 | passed, 전체 gate 0.373초 |
+| A Rules→C CUDA→D | 새 실행, 12 case·No/RepeatOldest 두 profile·고정 projection과 D finalization | passed, 전체 gate 15.166초 |
+| CUDA UCI | 새 실행, opening fixture 착수 5개·중복 stop·새 game·후속 실제 NN 계산·quit | passed, 전체 gate 14.282초 |
+| CPU UCI | 같은 binary의 명시 CPU 경로를 새 실행, 같은 프로토콜 검사 | passed, 전체 gate 0.670초 |
+| E CUDA pair | 새 실행 `pair-b5ba853-v2`, 두 판·각 6 ply·흑백 교환·네 새 프로세스 | passed, 전체 gate 150.642초 |
+| C CUDA raw logits·batch | 같은 b5ba853의 09:01:32 UTC 실행을 입력/binary/report/profile hash로 재사용 확인 | 기존 passed, 새 GPU 실행 아님 |
+
+CPU legal-policy 최대 절대 오차는 `1.1920929e-6`이다. 실제 Rules/CUDA의 dense 입력 오차는
+0, legal-policy/WDL 최대 절대 오차는 각각 `8.9406967e-7`/`4.1723251e-7`로 `1e-4` 이내다.
+두 Rules profile은 각각 CUDA Node 98개·mapping 감사 성공·D 잔여 예약 0·physical drained를
+기록했다. 실제 Rules projection 검사와 fixture handle의 소유 범위는 production registry의
+모든 발급 경로 검증과 구분한다. 재사용한 C CUDA 검사는 12 case와 B1/2/4/8/16을 포함하며,
+raw-logit 최대 절대 오차 `1.5735626e-5`, single/batch 차이 `1.5139580e-5`다. 보고서와
+placement의 실제 bytes/hash를 다시 대조했고 CUDA Node 98개·CPU Node 0개를 확인했다.
+
+두 UCI 실행의 합법 착수는 `e2e4, c7c5, e2e4, g8f6, g8f6`이며 중복 bestmove는 없다.
+CUDA D normal-poll computed 완료 53개와 B 최종 tree guard 뒤 root 초기화 5개·non-root
+backup 48개를 확인했다. drain 과정에서 별도로 버린 결과 1개, observation 손실 0·overflow
+false를 보존한다. CPU D 완료는 61개이며 CUDA 전용 report 키를 CPU V1에 추가하지 않았다.
+마지막 실제 문맥은 game 3/root 12다. 고정 250ms 대기와 `isready` 자체를 drain 증거로
+사용하지 않는다. 두 실행은 exit 0·confirmed physical drain·원래/collection/mapping 오류
+없음으로 끝났다. 모든 root의 journal이나 강제로 만든 모든 취소 race를 검증한 결과는 아니다.
+
+E 첫 `b5ba853-v1` 감독 시도는 **프로세스 시작 전에 실패**했다. Cargo release 파일의
+하드 링크 수가 2라 단일 링크를 요구하는 기존 pin 검사에 걸렸으며 cgroup이나 GPU 대국을
+시작하지 않았다. 원래 기록을 보존하고 안전 조건을 완화하지 않았다. 같은 bytes/hash의
+단일 링크·readonly 실행 파일을 별도 소유 경로에 복사한 뒤 새 input/lock/attempt v2를
+준비했다. native 가중치·library pin과 복사 검증 조건은 유지했다.
+
+| 새 native PID | 역할 | D computed | B guarded root / non-root | 실제 종료 |
+|---:|---|---:|---:|---|
+| 380 | baseline, 첫 판 | 227 | 2 / 225 | TRACE status 0, confirmed drain |
+| 391 | candidate, 첫 판 | 243 | 2 / 241 | TRACE status 0, confirmed drain |
+| 417 | candidate, 둘째 판 | 258 | 2 / 256 | TRACE status 0, confirmed drain |
+| 431 | baseline, 둘째 판 | 251 | 2 / 249 | TRACE status 0, confirmed drain |
+
+네 startup/final·binary·모델·bundle·placement SHA와 실제 Fastchess 종료 TRACE를 직접
+대조했다. 각각 warm trace의 CUDA Node는 98개·CPU Node는 0개다. process aggregate
+D 완료 979개·root 8개·non-root 971개와 손실 없는 관측을 전체 physical inference journal로
+표현하지 않는다. retained artifact 16개·276,771 bytes의 실제 길이와 hash도 대조했다.
+runner는 exit 0/Gone, CLI도 exit 0이며 pending child·unresolved owner·남은 cgroup PID가 없다.
+
+PGN 두 판은 같은 시작 상태와 `e2e4 e7e5`를 포함해 각 6 ply이며 두 엔진의 흑백 배정이
+바뀐다. A 감사에서 모두 **Incomplete**, scored games는 **0**이다.
+`integration_checks_passed=true`, `execution_ready=false`, `strength_eligible=false`를
+함께 유지한다. 동일 모델·탐색의 연결 검사이며 LC0 강도 비교나 최적화 GPU A/B가 아니다.
+E receipt SHA는 `dba8472f11638bb0dfd68a20dae0388b87ed911243d07426767aee828b35a93b`,
+PGN SHA는 `8e29d6fe78f0a19862cfc229dc28773553b9c87fac53bf883bbc5e62b2884449`다.
+
+E 감독은 wall 300초·cleanup 10초·aggregate RAM 8 GiB·swap 0·CPU 2 core·pids 128·
+per-process AS 128 GiB·단일 파일 1 GiB를 실제 적용했다. run 16 GiB·entry 256·depth 6·
+로그 8 MiB는 감독 관측 한도다. cgroup peak는 8 GiB 상한, max event 196,989·OOM/kill 0이다.
+sampled aggregate RSS는 1,800,036,352 bytes, kernel VmPeak 관측은 38,827,769,856 bytes다.
+종료 시 file charge 8,512,806,912 bytes·anon 0을 보존했으며 cgroup peak를 live RAM이나
+VRAM peak로 해석하지 않는다. 실제 owned output은 14,861,208,917 bytes·135 entries였다.
+Fastchess 자체 시간은 124.739초다. 전체 gate 시간과 이 숫자 모두 추론 지연·D03 효과가 아니다.
+각 단일 수치/UCI gate는 별도 wall 120초·RAM 4 GiB 한도로 끝났고 OOM/kill·잔여 PID가 없다.
+모든 전용 cgroup을 제거했으며 최종 확인 때 `rz-uci/rz-arena/fastchess` 프로세스가 남지 않았다.
+
+metadata 74개·850,554 bytes와 원본 PGN 1개·1,656 bytes를 Windows 저장소 밖
+`reports/coordinator-integration/local-gpu-tests-20261003/`로 회수하여 각각 bytes/hash를
+대조했다. inventory와 두 export receipt를 별도로 보존한다. metadata 회수 receipt SHA는
+`ae8e0111a6f56912af10442168f40f18c3b1ec82699443f9cc9bbb5ec638c4ac`,
+추가 PGN 회수 receipt SHA는 `c2ee5f8e08cdac83b7658551146956ed79d93f22089f7aae3bbb38e28d9f2e5e`다.
+Linux 원본·첫 pin 실패·native private copies도 보존한다. 회수는 새 추론 실행이 아니다.
+원시 로그·PGN·모델·native library·개인 경로는 Git에 넣지 않았다.
+
+D02 source-clock/physical journal·요청별 P50/P95/P99·process peak VRAM, D03의 통제된
+GPU A/B, 실제 Maia F02 학습과 정식 LC0 paired 강도·통계는 미실행으로 유지한다.
+이번 로컬 연결 인수를 RunPod 환경 인수나 기존 ignored GPU 검사 전체의 성공으로 옮기지 않는다.

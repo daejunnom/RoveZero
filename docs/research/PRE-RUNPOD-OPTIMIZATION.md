@@ -70,9 +70,14 @@ exact WDL을 포함한다. registry owner는 실행마다 새로 발급해야 �
 - [CI run 37093554114](https://github.com/daejunnom/RoveZero/actions/runs/37093554114)는
   같은 `1cdd707`에서 Ubuntu·Windows 모두 성공했다. workflow는 위 CPU 검사와 별도로
   release extended perft·pinned python-chess/chess 대조·학습 fixture 검사를 실행한다.
-- 실제 Maia/ORT CPU 수치, 새 GPU 수치·placement·full journal·VRAM·UCI/pair/종료는 이 변경
-  소스에서 새로 인수하지 않았다. 이전 `e45dd105` 인수를 현재 소스의 성공으로 옮기지 않는다.
-  RunPod smoke에서 새 binary/input/bundle·실제 환경과 함께 인수한다.
+- 후속 통합 product source `b5ba853585cb5a78f81159f733a86cdfe085936b`에서 실제 Maia/ORT
+  CPU 수치, A Rules→C CUDA→D, CPU/CUDA UCI와 제한된 CUDA pair를 로컬 RTX 4050으로
+  새로 인수했다. C CUDA raw-logit/batch 검사는 같은 SHA의 기존 실행을 입력·binary·report·
+  placement hash로 재사용 확인했다. 범위·실패 이력·회수 근거는
+  [로컬 연결 인수](../INTEGRATION-STATUS.md#최적화-소스-b5ba853의-로컬-cpucuda-연결-인수)를 따른다.
+  이전 `e45dd105` 결과를 새 실행으로 옮기지 않았고, full journal·process peak VRAM·
+  통제된 GPU 최적화 A/B·강도는 여전히 미실행이다. RunPod에서는 그 환경의 실제 지원과
+  같은 비교 입력을 별도로 인수하며 기존 ignored 검사 전체가 통과했다고 표현하지 않는다.
 
 ## 중복 조사에서 유지한 경계
 
