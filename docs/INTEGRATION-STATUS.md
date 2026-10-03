@@ -871,3 +871,29 @@ Linux 원본·첫 pin 실패·native private copies도 보존한다. 회수는 �
 D02 source-clock/physical journal·요청별 P50/P95/P99·process peak VRAM, D03의 통제된
 GPU A/B, 실제 Maia F02 학습과 정식 LC0 paired 강도·통계는 미실행으로 유지한다.
 이번 로컬 연결 인수를 RunPod 환경 인수나 기존 ignored GPU 검사 전체의 성공으로 옮기지 않는다.
+
+## 로컬 D02 host-source journal 인수
+
+2026-10-03, 총괄 TASK-I02가 `88ea26e714a56af81f43cd1180c31df08fe813e9`의 native
+CPU/CUDA profile off/on 네 실행을 인수했다. 공통 계약 0.1·W0/S0·FP32·B1·worker/thread 1과
+CPU/CUDA V1 receipt key/type topology를 유지했다. B/C hook, D의 실제 원래 clock origin,
+execution ID·backup guard·UCI 출력·drain 접점을 수동 대조했다.
+
+각 실행은 같은 두 opening root의 128회 non-root backup, D computed 258개, 합법 착수
+`e2e4, c7c5`, exit 0·confirmed drain을 기록했다. CUDA B의 guarded root/non-root는 2/256이다.
+profile on은 각각 원래 timestamp의 journal 3896개·실제 물리 시도/완료/전달/소비 258개이며
+누락·중복·identity/시각 불일치·unconfirmed·미소비는 0이다. 같은 소스의 workspace 검사는
+682 passed·0 failed·16 ignored, fmt/strict clippy와 Ubuntu/Windows CI가 통과했다.
+
+`--profile`은 8192 metadata record·JSON 8MiB로 제한되며 passive observation 실패를 engine
+권한으로 삼지 않는다. startup placement warm-up 이후의 탐색 요청에 대한 journal이다.
+CUDA 준비→backup P50/P95/P99는 3.371108/4.621393/5.615506ms, synchronous ORT Run host
+interval은 2.349358/3.751160/5.041684ms다. 서로 중첩되는 단계의 분위수를 합산하지 않는다.
+실제 PID의 VRAM 질의는 `[N/A]`이고 device Kernel/transfer trace도 없어서 미측정으로 남긴다.
+
+73개 원본 metadata/journal/log·11,917,030 bytes를 저장소 밖으로 회수하고 bytes/hash를 확인했다.
+[D02 상세 기록](research/LOCAL-D02-PROFILE.md)에 인수·phase 분포·통제 조건·남은 항목을 묶었다.
+같은 game의 두 root 사이에서만 input key 반복 72개를 관측했으며 raw cache의 효과나 새 방문으로
+해석하지 않는다. 다음 D03 단일 실험은 provenance·receipt·cache-hit 소비 계약부터 맞춰야 한다.
+이번 결과는 host-source D02 통과다. device timing·process peak VRAM·D03 통제된 GPU A/B,
+실제 학습·정식 paired 강도·통계와 RunPod 환경 인수는 남아 있다.

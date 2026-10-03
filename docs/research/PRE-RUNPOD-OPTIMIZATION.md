@@ -75,8 +75,10 @@ exact WDL을 포함한다. registry owner는 실행마다 새로 발급해야 �
   새로 인수했다. C CUDA raw-logit/batch 검사는 같은 SHA의 기존 실행을 입력·binary·report·
   placement hash로 재사용 확인했다. 범위·실패 이력·회수 근거는
   [로컬 연결 인수](../INTEGRATION-STATUS.md#최적화-소스-b5ba853의-로컬-cpucuda-연결-인수)를 따른다.
-  이전 `e45dd105` 결과를 새 실행으로 옮기지 않았고, full journal·process peak VRAM·
-  통제된 GPU 최적화 A/B·강도는 여전히 미실행이다. RunPod에서는 그 환경의 실제 지원과
+  이전 `e45dd105` 결과를 새 실행으로 옮기지 않았다. 후속 `88ea26e`의
+  [D02 host-source 인수](LOCAL-D02-PROFILE.md)에서 탐색 요청 journal·P50/P95/P99를 실제로
+  연결했다. startup warm-up을 포함한 전체 process journal·device transfer/kernel·process peak VRAM·
+  통제된 GPU 최적화 A/B·강도는 별도 인수다. RunPod에서는 그 환경의 실제 지원과
   같은 비교 입력을 별도로 인수하며 기존 ignored 검사 전체가 통과했다고 표현하지 않는다.
 
 ## 중복 조사에서 유지한 경계
