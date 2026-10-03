@@ -3,10 +3,12 @@
 mod artifact;
 mod manifest;
 mod native_launch;
+mod native_cuda;
 mod validation;
 
 pub use manifest::*;
 pub use native_launch::*;
+pub use native_cuda::*;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
