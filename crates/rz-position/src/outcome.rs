@@ -98,8 +98,16 @@ impl Position {
         &self,
         legal: &[BoardMove],
     ) -> Result<PositionClassification, PositionError> {
-        let known_repetitions = self.known_repetition_count();
-        let repetition_complete = self.repetition_history_complete();
+        #[cfg(not(feature = "experimental-claim-preview"))]
+        let (known_repetitions, repetition_complete) = (
+            self.known_repetition_count(),
+            self.repetition_history_complete(),
+        );
+        #[cfg(feature = "experimental-claim-preview")]
+        let (known_repetitions, repetition_complete) = {
+            let evidence = self.repetition_evidence();
+            (evidence.count, evidence.complete)
+        };
         let fivefold = repetition_availability(known_repetitions, 5, repetition_complete);
         let history_evidence = HistoryEvidence {
             completeness: self.history_completeness(),
@@ -146,12 +154,21 @@ impl Position {
 
         if play_status == PlayStatus::Ongoing {
             for &mv in legal {
-                let child = self.preview_generated(mv)?;
-                let repetition = repetition_availability(
-                    child.known_repetition_count(),
-                    3,
-                    child.repetition_history_complete(),
-                );
+                #[cfg(not(feature = "experimental-claim-preview"))]
+                let (count, complete, halfmove) = {
+                    let child = self.preview_generated(mv)?;
+                    (
+                        child.known_repetition_count(),
+                        child.repetition_history_complete(),
+                        child.halfmove_clock(),
+                    )
+                };
+                #[cfg(feature = "experimental-claim-preview")]
+                let (count, complete, halfmove) = {
+                    let (evidence, halfmove) = self.intended_claim_evidence(mv)?;
+                    (evidence.count, evidence.complete, halfmove)
+                };
+                let repetition = repetition_availability(count, 3, complete);
                 if repetition != Availability::Unavailable {
                     claim_availability.push(DrawClaim {
                         reason: ClaimReason::ThreefoldRepetition,
@@ -159,7 +176,7 @@ impl Position {
                         availability: repetition,
                     });
                 }
-                if child.halfmove_clock() >= 100 {
+                if halfmove >= 100 {
                     claim_availability.push(DrawClaim {
                         reason: ClaimReason::FiftyMove,
                         evidence: ClaimEvidence::IntendedMove(mv),

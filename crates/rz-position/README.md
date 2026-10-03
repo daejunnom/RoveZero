@@ -9,6 +9,18 @@
 후속 [성능 개선 계획](../../docs/research/PERFORMANCE-OPTIMIZATION-PLAN.md)은 PR #17을
 기준으로 A 내부 개선과 소비 경계 실험, 자원 경합 통제·반복 계측·실험 PR의 검증 항목을 정리한다.
 
+## 선택적 성능 실험
+
+`experimental-claim-preview`는 기본 비활성이다. 활성화하면 현재 반복 횟수·증거 완전성을
+한 번에 계산하고, 예정 수의 claim을 checked board 전이와 빌린 이력으로 검사한다.
+이때 임시 child owner·history node를 만들지 않는다. 실제 make/fork와 동일한
+history/revision/counter 검사를 사용하며 claim 순서·unknown-prefix·원본 live view를 보존한다.
+기존 소유 child를 만드는 경로는 feature를 끄면 사용할 수 있다.
+
+`cargo test -p rz-position --features contracts,experimental-claim-preview --locked`로
+실험 경로를 검사한다. 이것은 의미 보존(E) 가설의 실험 구현이며 성능·GPU·강도 인수는
+별도다. [계획의 반복 측정·테스트 항목](../../docs/research/PERFORMANCE-OPTIMIZATION-PLAN.md)을 따른다.
+
 ## 제공하는 동작
 
 - `Position::startpos/from_fen`: 64칸·bitboard, 차례·권리·raw EP·u32 카운터를 보존한다.

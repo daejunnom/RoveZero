@@ -12,6 +12,8 @@ path = "src/lib.rs"
 [features]
 default = []
 contracts = ["dep:rz-contracts", "dep:sha2"]
+# Opt-in experiments; the existing owned claim preview remains the default.
+experimental-claim-preview = []
 
 [dependencies]
 rz-contracts = { workspace = true, optional = true }
