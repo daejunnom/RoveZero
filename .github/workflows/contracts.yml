@@ -3,10 +3,10 @@ name: Workspace CPU
 on:
   push:
     branches: [develop]
-    paths: ['Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/**', 'experiments/model-research/**', '.github/workflows/contracts.yml']
+    paths: ['Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/**', 'benches/runtime/**', 'experiments/model-research/**', '.github/workflows/contracts.yml']
   pull_request:
     branches: [develop]
-    paths: ['Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/**', 'experiments/model-research/**', '.github/workflows/contracts.yml']
+    paths: ['Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/**', 'benches/runtime/**', 'experiments/model-research/**', '.github/workflows/contracts.yml']
 
 permissions:
   contents: read
@@ -50,6 +50,9 @@ jobs:
       - run: python -m unittest discover -s experiments/model-research/tests -q
         env:
           PYTHONPATH: ${{ github.workspace }}/experiments/model-research/src
+          PYTHONDONTWRITEBYTECODE: '1'
+      - run: python -m unittest discover -s benches/runtime/tests -q
+        env:
           PYTHONDONTWRITEBYTECODE: '1'
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
         env:

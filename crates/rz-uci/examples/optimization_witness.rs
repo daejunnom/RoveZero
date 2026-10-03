@@ -23,6 +23,7 @@ use rz_search::{
         ContractPosition, ContractPumpEvent, ContractSearch, ContractSearchConfig,
         ContractSearchFailure, ContractSearchOutcome, ContractSearchStatus, IdAllocator,
     },
+    policy::{EdgeStats, PolicyIdentity, Puct, SelectionPolicy},
 };
 use rz_uci::{
     PositionBase, PositionPort, PositionSpec,
@@ -89,6 +90,8 @@ struct TrackedPosition {
 impl ContractPosition for TrackedPosition {
     type State = RulesState;
     fn snapshot(&self) -> &PositionSnapshot<RulesState> {
+        // A cached immutable leaf can be reused without another play call.
+        self.last.replace(self.leaf.clone());
         self.leaf.position.snapshot()
     }
     fn legal(&self) -> &LegalMoveView {
@@ -107,6 +110,30 @@ impl ContractPosition for TrackedPosition {
             leaf,
             last: Rc::clone(&self.last),
         })
+    }
+}
+
+#[derive(Clone)]
+struct Decision {
+    edges: Vec<EdgeStats>,
+    selected: usize,
+}
+struct WitnessPolicy(Rc<RefCell<Vec<Decision>>>);
+impl SelectionPolicy for WitnessPolicy {
+    fn identity(&self) -> PolicyIdentity {
+        Puct::default().identity()
+    }
+    fn select(&self, edges: &[EdgeStats]) -> std::result::Result<usize, rz_search::SearchError> {
+        let selected = Puct::default().select(edges)?;
+        let mut decisions = self.0.borrow_mut();
+        if decisions.len() >= 32 {
+            return Err(rz_search::SearchError::DepthLimit);
+        }
+        decisions.push(Decision {
+            edges: edges.to_vec(),
+            selected,
+        });
+        Ok(selected)
     }
 }
 
@@ -407,6 +434,20 @@ fn run_case(
         }
         Err(error) => return Err(error.into()),
     };
+    let position_text = match &spec.base {
+        PositionBase::StartPos => "position startpos".to_owned(),
+        PositionBase::Fen(fen) => format!("position fen {fen}"),
+    };
+    writeln!(
+        writer,
+        "UCI-POSITION {name} {position_text}{}",
+        if spec.moves.is_empty() {
+            String::new()
+        } else {
+            format!(" moves {}", spec.moves.join(" "))
+        }
+    )?;
+    writeln!(writer, "UCI-LEGAL {name} {:?}", prepared.legal_moves)?;
     let leaf = Leaf {
         position: prepared.snapshot,
         path: vec![],
@@ -500,7 +541,8 @@ fn run_case(
         max_legal_moves: 512,
         probability_tolerance: 1e-9,
     };
-    let mut search = ContractSearch::new(
+    let decisions = Rc::new(RefCell::new(Vec::new()));
+    let mut search = ContractSearch::with_policy(
         root.clone(),
         ContractSearchConfig {
             scope,
@@ -529,6 +571,7 @@ fn run_case(
             max_simulations: visits as u64,
             tree_limits,
         },
+        WitnessPolicy(Rc::clone(&decisions)),
     )?;
     let started = Instant::now();
     for _ in 0..(visits * 16 + 64) {
@@ -557,6 +600,18 @@ fn run_case(
                 projection.input_key(position.snapshot().state(), position.legal().moves())
             },
         );
+        for decision in decisions.borrow_mut().drain(..) {
+            writeln!(
+                runtime.writer,
+                "SELECT selected={} edge-bits={:?}",
+                decision.selected,
+                decision
+                    .edges
+                    .iter()
+                    .map(|edge| (edge.prior.to_bits(), edge.visits, edge.value_sum.to_bits()))
+                    .collect::<Vec<_>>()
+            )?;
+        }
         match event {
             ContractPumpEvent::Submitted { request, selection } => {
                 writeln!(
@@ -611,6 +666,23 @@ fn run_case(
                     request.map(|r| r.sequence),
                     value.to_bits(),
                     evaluation.is_some()
+                )?;
+                let outcome = search.outcome();
+                writeln!(
+                    runtime.writer,
+                    "BACKUP selection={} counters={:?} root-bits={:?}",
+                    selection.sequence,
+                    outcome.counters,
+                    outcome
+                        .root_stats
+                        .iter()
+                        .map(|(movement, stats)| (
+                            *movement,
+                            stats.prior.to_bits(),
+                            stats.visits,
+                            stats.value_sum.to_bits()
+                        ))
+                        .collect::<Vec<_>>()
                 )?;
             }
             ContractPumpEvent::Waiting => {}
@@ -805,10 +877,45 @@ mod tests {
                 outcome.counters.root_initializations,
                 u64::from(scenario == Scenario::NodeLimit)
             );
-            assert!(!matches!(
-                outcome.status,
-                ContractSearchStatus::Running | ContractSearchStatus::Completed
-            ));
+            use rz_search::contracts::ContractStopReason;
+            match (scenario, &outcome.status) {
+                (
+                    Scenario::Cancel,
+                    ContractSearchStatus::Stopped {
+                        reason: ContractStopReason::Canceled,
+                        ..
+                    },
+                )
+                | (
+                    Scenario::Expired,
+                    ContractSearchStatus::Stopped {
+                        reason: ContractStopReason::Expired,
+                        ..
+                    },
+                )
+                | (
+                    Scenario::Stale,
+                    ContractSearchStatus::Stopped {
+                        reason: ContractStopReason::Stale,
+                        ..
+                    },
+                )
+                | (
+                    Scenario::NodeLimit,
+                    ContractSearchStatus::Failed(ContractSearchFailure::Tree(
+                        rz_search::SearchError::NodeLimit,
+                    )),
+                ) => {}
+                (
+                    Scenario::BadInput,
+                    ContractSearchStatus::Failed(ContractSearchFailure::Boundary(error)),
+                ) => assert_eq!(error.code, ErrorCode::IdentityMismatch),
+                (
+                    Scenario::BadOutput,
+                    ContractSearchStatus::Failed(ContractSearchFailure::Evaluation(failure)),
+                ) => assert_eq!(failure.error.code, ErrorCode::NumericalFailure),
+                other => panic!("wrong guard result: {other:?}"),
+            }
         }
     }
     #[test]
