@@ -167,6 +167,67 @@ fn raw() -> RawOutput {
     }
 }
 
+#[cfg(feature = "experimental-prepared-input")]
+#[test]
+fn prepared_input_reuses_only_exact_history_and_revalidates_fresh_requests() {
+    let fixture = Fixture::new(vec![]);
+    let request = fixture.request(1, 100);
+    let first = fixture.projection.prepare(Arc::clone(&request)).unwrap();
+    let second = fixture
+        .projection
+        .clone()
+        .prepare(Arc::clone(&request))
+        .unwrap();
+    assert!(std::ptr::eq(first.encoded(), second.encoded()));
+    assert!(std::ptr::eq(
+        first.indices().as_ptr(),
+        second.indices().as_ptr()
+    ));
+    let replace = |context, bytes| {
+        Arc::new(
+            EvalRequest::try_new(
+                context,
+                request.position().clone(),
+                request.legal().clone(),
+                Arc::clone(request.model()),
+                request.deadline(),
+                request.cancel_token().clone(),
+                bytes,
+            )
+            .unwrap(),
+        )
+    };
+    let mut context = request.context();
+    context.input = EvalInputKey(Digest([0; 32]));
+    assert_eq!(
+        fixture
+            .projection
+            .prepare(replace(context, request.byte_budget()))
+            .err()
+            .unwrap()
+            .code,
+        ErrorCode::IdentityMismatch
+    );
+    let mut bytes = request.byte_budget();
+    bytes.host = 1;
+    assert_eq!(
+        fixture
+            .projection
+            .prepare(replace(request.context(), bytes))
+            .err()
+            .unwrap()
+            .code,
+        ErrorCode::ResourceExhausted
+    );
+    let rebuilt = fixture.request(2, 100); // Same FEN, independently owned prefix: conservative miss.
+    let third = fixture.projection.prepare(rebuilt).unwrap();
+    assert!(!std::ptr::eq(first.encoded(), third.encoded()));
+    assert_eq!(first.encoded(), third.encoded());
+    let fourth = fixture.projection.prepare(request).unwrap(); // One-slot eviction.
+    assert!(!std::ptr::eq(first.encoded(), fourth.encoded()));
+    assert_eq!(first.encoded(), fourth.encoded());
+}
+
 fn step(callbacks: &[u64], done: u64, cancel_ack: Option<u64>) -> Step {
     Step {
         callbacks: callbacks

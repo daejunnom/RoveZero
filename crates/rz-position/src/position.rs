@@ -1,5 +1,5 @@
 use crate::{fen, movegen, types::*};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct RepetitionIdentity {
@@ -86,6 +86,26 @@ impl PartialEq for PositionIdentity {
     }
 }
 impl Eq for PositionIdentity {}
+
+/// Weak exact prefix identity for bounded consumer memoization. Matching is
+/// deliberately conservative: separately reconstructed identical histories miss.
+/// It never retains the history chain or grants mutation authority.
+#[derive(Clone, Debug)]
+pub struct WeakPositionIdentity {
+    history: Weak<HistoryNode>,
+    completeness: HistoryCompleteness,
+    origin: HistoryOrigin,
+}
+
+impl WeakPositionIdentity {
+    pub fn matches(&self, snapshot: &PositionSnapshot) -> bool {
+        self.completeness == snapshot.identity.completeness
+            && self.origin == snapshot.identity.origin
+            && self
+                .history
+                .ptr_eq(&Arc::downgrade(&snapshot.identity.history))
+    }
+}
 
 /// An owned immutable view, including all known raw rule/model history.
 /// Its revision is a live-view token, not a repetition or model cache key.
@@ -236,6 +256,13 @@ impl PositionSnapshot {
     }
     pub fn position_identity(&self) -> PositionIdentity {
         self.identity.clone()
+    }
+    pub fn weak_position_identity(&self) -> WeakPositionIdentity {
+        WeakPositionIdentity {
+            history: Arc::downgrade(&self.identity.history),
+            completeness: self.identity.completeness,
+            origin: self.identity.origin,
+        }
     }
     pub fn repetition_identity(&self) -> RepetitionIdentity {
         self.identity.history.repetition.clone()

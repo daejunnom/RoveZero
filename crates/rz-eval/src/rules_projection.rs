@@ -14,11 +14,17 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct ClassicalProjection {
     binding: MaiaBinding,
+    #[cfg(feature = "experimental-prepared-input")]
+    prepared: Arc<std::sync::Mutex<Option<Arc<PreparedRulesInput>>>>,
 }
 
 impl ClassicalProjection {
     pub fn new(binding: MaiaBinding) -> Self {
-        Self { binding }
+        Self {
+            binding,
+            #[cfg(feature = "experimental-prepared-input")]
+            prepared: Arc::default(),
+        }
     }
     pub fn model(&self) -> &Arc<ModelDescriptor> {
         self.binding.model()
@@ -95,17 +101,24 @@ impl ClassicalProjection {
         state: &RulesState,
         ordered_legal: &[Move],
     ) -> Result<EvalInputKey, ContractError> {
-        let projection = self.project(state)?;
-        // Keep the original dense-input identity codec. Legal order is a
-        // separate attestation and is nevertheless checked for representability.
-        ordered_policy_indices(projection.input(), ordered_legal)?;
-        let encoded = classical::encode(projection.input()).map_err(|_| {
-            failed(
-                ErrorCode::InvalidInput,
-                "Rules projection cannot be encoded by this profile",
-            )
-        })?;
-        Ok(input_key(self.model().encoding().handle, &encoded))
+        #[cfg(feature = "experimental-prepared-input")]
+        {
+            return Ok(self.prepared_input(state, ordered_legal, None)?.key);
+        }
+        #[cfg(not(feature = "experimental-prepared-input"))]
+        {
+            let projection = self.project(state)?;
+            // Keep the original dense-input identity codec. Legal order is a
+            // separate attestation and is nevertheless checked for representability.
+            ordered_policy_indices(projection.input(), ordered_legal)?;
+            let encoded = classical::encode(projection.input()).map_err(|_| {
+                failed(
+                    ErrorCode::InvalidInput,
+                    "Rules projection cannot be encoded by this profile",
+                )
+            })?;
+            Ok(input_key(self.model().encoding().handle, &encoded))
+        }
     }
 
     pub fn legal_indices(
@@ -120,8 +133,110 @@ impl ClassicalProjection {
         &self,
         request: Arc<EvalRequest<RulesState>>,
     ) -> Result<PreparedRequest<RulesState>, ContractError> {
-        let projection = self.project(request.position().state())?;
-        self.binding.prepare(request, projection.input())
+        #[cfg(feature = "experimental-prepared-input")]
+        {
+            let prepared = self.prepared_input(
+                request.position().state(),
+                request.legal().moves(),
+                Some(&request),
+            )?;
+            return self.binding.prepare_rules(request, &prepared);
+        }
+        #[cfg(not(feature = "experimental-prepared-input"))]
+        {
+            let projection = self.project(request.position().state())?;
+            self.binding.prepare(request, projection.input())
+        }
+    }
+
+    #[cfg(feature = "experimental-prepared-input")]
+    fn prepared_input(
+        &self,
+        state: &RulesState,
+        legal: &[Move],
+        request: Option<&EvalRequest<RulesState>>,
+    ) -> Result<Arc<PreparedRulesInput>, ContractError> {
+        let mut memo = self
+            .prepared
+            .lock()
+            .map_err(|_| failed(ErrorCode::BackendFailure, "prepared input owner poisoned"))?;
+        if let Some(prepared) = memo.as_ref() {
+            if prepared.identity.matches(state.snapshot()) && prepared.legal.as_ref() == legal {
+                if let Some(request) = request {
+                    self.binding
+                        .validate_preparation(request, prepared.projection.input())?;
+                    check_prepared_key(prepared.key, request)?;
+                }
+                return Ok(Arc::clone(prepared));
+            }
+        }
+        let projection = self.project(state)?;
+        if let Some(request) = request {
+            self.binding
+                .validate_preparation(request, projection.input())?;
+        }
+        // Match the original error order: input_key maps moves first, while
+        // prepare validates the actual input key before mapping legal indices.
+        let indices = if request.is_none() {
+            Some(ordered_policy_indices(projection.input(), legal)?)
+        } else {
+            None
+        };
+        let encoded = classical::encode(projection.input())
+            .map_err(|_| failed(ErrorCode::InvalidInput, "invalid Rules input projection"))?;
+        let key = input_key(self.model().encoding().handle, &encoded);
+        if let Some(request) = request {
+            check_prepared_key(key, request)?;
+        }
+        let indices = match indices {
+            Some(indices) => indices,
+            None => ordered_policy_indices(projection.input(), legal)?,
+        };
+        let prepared = Arc::new(PreparedRulesInput {
+            identity: state.snapshot().weak_position_identity(),
+            legal: legal.into(),
+            projection,
+            key,
+            encoded: Arc::new(encoded),
+            indices: indices.into(),
+        });
+        // One slot, at most 112*64 f32 values + HISTORY_FRAMES + POLICY_SIZE
+        // bounded move/index arrays. The weak identity does not retain Rules.
+        *memo = Some(Arc::clone(&prepared));
+        Ok(prepared)
+    }
+}
+
+#[cfg(feature = "experimental-prepared-input")]
+fn check_prepared_key(
+    key: EvalInputKey,
+    request: &EvalRequest<RulesState>,
+) -> Result<(), ContractError> {
+    if key != request.context().input {
+        return Err(failed(
+            ErrorCode::IdentityMismatch,
+            "actual tensor identity differs from request",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-prepared-input")]
+pub(crate) struct PreparedRulesInput {
+    identity: rz_position::WeakPositionIdentity,
+    legal: Arc<[Move]>,
+    pub(crate) projection: RulesProjection,
+    pub(crate) key: EvalInputKey,
+    pub(crate) encoded: Arc<EncodedInput>,
+    pub(crate) indices: Arc<[usize]>,
+}
+
+#[cfg(feature = "experimental-prepared-input")]
+impl std::fmt::Debug for PreparedRulesInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedRulesInput")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
     }
 }
 
