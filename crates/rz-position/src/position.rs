@@ -135,9 +135,18 @@ impl PositionSnapshot {
     pub fn known_history_len(&self) -> usize {
         self.identity.history.len
     }
-    #[cfg(feature = "contracts")]
+    #[cfg(all(feature = "contracts", not(feature = "experimental-history-digest")))]
     pub(crate) fn is_irreversible_boundary(&self) -> bool {
         self.identity.history.irreversible
+    }
+    #[cfg(feature = "experimental-history-digest")]
+    pub(crate) fn history_states(&self) -> impl Iterator<Item = (&CoreState, bool)> + '_ {
+        let mut at = Some(self.identity.history.as_ref());
+        std::iter::from_fn(move || {
+            let node = at?;
+            at = node.previous.as_deref();
+            Some((&node.state, node.irreversible))
+        })
     }
     /// Explicit audit helper. Encoding reads raw history without fabricating fill.
     pub fn known_history_fens(&self) -> Vec<String> {
@@ -247,6 +256,21 @@ struct GeneratedChild {
     history: Arc<HistoryNode>,
     revision: u64,
     kind: RuleMoveKind,
+}
+// Checked board transition without a published owner or allocated history node.
+// Both materialized children and experimental claim evidence use these checks.
+struct CheckedTransition {
+    state: CoreState,
+    repetition: RepetitionIdentity,
+    revision: u64,
+    irreversible: bool,
+    kind: RuleMoveKind,
+}
+
+#[cfg(feature = "experimental-claim-preview")]
+pub(crate) struct RepetitionEvidence {
+    pub count: usize,
+    pub complete: bool,
 }
 impl Clone for Position {
     fn clone(&self) -> Self {
@@ -474,6 +498,31 @@ impl Position {
     }
     /// No state escapes until all history, revision and counter checks pass.
     fn prepare_generated(&self, mv: BoardMove) -> Result<GeneratedChild, PositionError> {
+        self.with_checked_transition(mv, |checked| {
+            let history = Arc::new(HistoryNode {
+                state: checked.state.clone(),
+                repetition: checked.repetition,
+                previous: Some(self.history.clone()),
+                len: self.history.len + 1,
+                irreversible: checked.irreversible,
+            });
+            GeneratedChild {
+                state: checked.state,
+                history,
+                revision: checked.revision,
+                kind: checked.kind,
+            }
+        })
+    }
+
+    // Consume the checked state before wrapping the final result. This avoids
+    // carrying a second large Result<CheckedTransition, _> through callers;
+    // the private FnOnce is monomorphized and introduces no heap allocation.
+    fn with_checked_transition<T>(
+        &self,
+        mv: BoardMove,
+        finish: impl FnOnce(CheckedTransition) -> T,
+    ) -> Result<T, PositionError> {
         if self.history.len >= self.limits.max_history_positions {
             return Err(PositionError::ResourceLimit("history positions"));
         }
@@ -502,19 +551,13 @@ impl Position {
                 .checked_add(1)
                 .ok_or(PositionError::CounterOverflow)?;
         }
-        let child = Arc::new(HistoryNode {
+        let irreversible =
+            piece.kind == PieceKind::Pawn || capture || child_state.castling != self.state.castling;
+        Ok(finish(CheckedTransition {
             repetition: RepetitionIdentity::of(&child_state),
-            state: child_state.clone(),
-            previous: Some(self.history.clone()),
-            len: self.history.len + 1,
-            irreversible: piece.kind == PieceKind::Pawn
-                || capture
-                || child_state.castling != self.state.castling,
-        });
-        Ok(GeneratedChild {
             state: child_state,
-            history: child,
             revision,
+            irreversible,
             kind: RuleMoveKind {
                 capture,
                 castling: piece.kind == PieceKind::King
@@ -522,7 +565,7 @@ impl Position {
                 en_passant: ep,
                 promotion: mv.promotion.is_some(),
             },
-        })
+        }))
     }
     fn install_generated(&mut self, generated: GeneratedChild) {
         self.state = generated.state;
@@ -570,6 +613,33 @@ impl Position {
         let generated = child.prepare_generated(mv)?;
         child.install_generated(generated);
         Ok(child)
+    }
+
+    #[cfg(feature = "experimental-claim-preview")]
+    pub(crate) fn repetition_evidence(&self) -> RepetitionEvidence {
+        repetition_evidence(Some(self.history.as_ref()), &self.history.repetition, 0)
+    }
+
+    /// Check the same transition as a real move, then compare its repetition
+    /// identity against borrowed history. The intended child counts once even
+    /// though no owner/history node is constructed. An irreversible child cuts
+    /// the repetition window, without completing imported model/game history.
+    #[cfg(feature = "experimental-claim-preview")]
+    pub(crate) fn intended_claim_evidence(
+        &self,
+        mv: BoardMove,
+    ) -> Result<(RepetitionEvidence, u32), PositionError> {
+        self.with_checked_transition(mv, |checked| {
+            let evidence = if checked.irreversible {
+                RepetitionEvidence {
+                    count: 1,
+                    complete: true,
+                }
+            } else {
+                repetition_evidence(Some(self.history.as_ref()), &checked.repetition, 1)
+            };
+            (evidence, checked.state.halfmove)
+        })
     }
     pub fn known_repetition_count(&self) -> usize {
         let mut count = 0;
@@ -621,6 +691,30 @@ impl Position {
             result.push((mv, count_nodes(&child, depth - 1, &mut budget)?));
         }
         Ok(result)
+    }
+}
+
+#[cfg(feature = "experimental-claim-preview")]
+fn repetition_evidence(
+    mut at: Option<&HistoryNode>,
+    identity: &RepetitionIdentity,
+    mut count: usize,
+) -> RepetitionEvidence {
+    while let Some(node) = at {
+        if node.repetition == *identity {
+            count += 1;
+        }
+        if node.irreversible {
+            return RepetitionEvidence {
+                count,
+                complete: true,
+            };
+        }
+        at = node.previous.as_deref();
+    }
+    RepetitionEvidence {
+        count,
+        complete: false,
     }
 }
 
@@ -688,5 +782,91 @@ mod tests {
         ));
         assert!(p.snapshot().same_state(&child));
         assert_eq!(p.revision(), u64::MAX);
+    }
+
+    #[cfg(feature = "experimental-claim-preview")]
+    #[test]
+    fn borrowed_claim_evidence_matches_owned_previews_and_preserves_live_views() {
+        let mut cases = vec![
+            Position::startpos(),
+            Position::from_fen(fen::START_FEN).unwrap(),
+        ];
+        for input in [
+            "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+            "4k3/8/8/3pP3/4K3/8/8/8 w - d6 0 2",
+            "4k3/8/8/r4pPK/8/8/8/8 w - f6 0 2",
+            "1r2k3/P7/8/8/8/8/7p/R3K3 w Q - 99 1",
+            "7k/8/8/8/8/8/P7/KR6 w - - 99 1",
+            "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 4294967295",
+            "7k/8/8/8/8/8/P7/KR6 w - - 4294967295 1",
+        ] {
+            cases.push(Position::from_fen(input).unwrap());
+        }
+        for start in [
+            Position::startpos(),
+            Position::from_fen(fen::START_FEN).unwrap(),
+        ] {
+            let mut repeated = start;
+            for index in 0..15 {
+                repeated
+                    .make_uci(["g1f3", "g8f6", "f3g1", "f6g8"][index % 4])
+                    .unwrap();
+                cases.push(repeated.clone());
+            }
+        }
+
+        for mut position in cases {
+            for step in 0..24 {
+                let before = position.ordered_legal_moves();
+                let evidence = position.repetition_evidence();
+                assert_eq!(evidence.count, position.known_repetition_count());
+                assert_eq!(evidence.complete, position.repetition_history_complete());
+                for &mv in before.moves() {
+                    let expected = position.preview_generated(mv).map(|child| {
+                        (
+                            child.known_repetition_count(),
+                            child.repetition_history_complete(),
+                            child.halfmove_clock(),
+                        )
+                    });
+                    let actual = position
+                        .intended_claim_evidence(mv)
+                        .map(|(evidence, halfmove)| (evidence.count, evidence.complete, halfmove));
+                    assert_eq!(actual, expected, "{} / {mv}", position.to_fen());
+                    assert!(position.matches_snapshot(before.snapshot()));
+                }
+                if before.moves().is_empty() {
+                    break;
+                }
+                let mv = before.moves()[(step * 17 + 3) % before.moves().len()];
+                if position.make_from_view(&before, mv).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "experimental-claim-preview")]
+    #[test]
+    fn claim_preview_keeps_checked_error_precedence_without_mutation() {
+        let mv = BoardMove::from_uci("e2e4").unwrap();
+        let mut position = Position::startpos_with_limits(PositionLimits {
+            max_history_positions: 1,
+            ..PositionLimits::default()
+        })
+        .unwrap();
+        position.revision = u64::MAX;
+        let before = position.snapshot();
+        assert!(matches!(
+            position.intended_claim_evidence(mv),
+            Err(PositionError::ResourceLimit("history positions"))
+        ));
+        position.limits.max_history_positions = 2;
+        assert!(matches!(
+            position.intended_claim_evidence(mv),
+            Err(PositionError::RevisionExhausted)
+        ));
+        assert!(position.matches_snapshot(&before));
+        assert!(position.snapshot().same_state(&before));
     }
 }
