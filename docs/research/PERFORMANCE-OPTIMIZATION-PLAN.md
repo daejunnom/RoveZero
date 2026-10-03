@@ -532,7 +532,7 @@ inline review thread는 없다. 이후 구현의 manifest는 당시 최신 full 
 | 유한한 public probe·상태 witness·반복 CPU/할당 진단 | 구현·실행됨, 8장에 증거 보존 | 기존 숫자를 새 비교 표본으로 사용하지 않음 |
 | OPT-00 실제 tensor·고정 방문 수 종단 witness·직렬 UCI runner | CPU/mock 구현·대조·실행됨, 10장 | 실제 UCI 완료 방문 수 관측·통제 세션·observer off/on·native 실행 |
 | D02 source observer | #17에 구현됐지만 현재 기준선에는 미병합 | 사용할 통합본의 선언·consumer 대조, off/on overhead와 관측 손실 검사 |
-| 아래 OPT-01~12 | 미구현 | 전부 A가 구현·소비자 연결·검증; 다른 담당에게 제안만 남기지 않음 |
+| 아래 OPT-01~12 | 내부 구현·소비자 연결·CPU 검사 완료; 11장 | 전부 A가 구현·소비자 연결·검증; GPU/정식 성능·품질 인수는 별도 |
 
 OPT 번호는 이 계획의 작업 단위이며 기존 TASK/CARD 배정을 바꾸는 번호가 아니다.
 다음 표는 최초 **구현 계획**과 의존성이다. OPT-01~12는 실제 소비 경로까지 구현했으며
@@ -867,7 +867,8 @@ cloud workspace 수명 동안 보존하며 자동 삭제하지 않는다. 회수
 있고 원격 영구 보관은 아직 수행하지 않았다. 초기 개발 witness는 최종 matrix와 분리해
 보존하며 현재 동일성/시간 표본에 합치지 않는다.
 
-다음 구현은 **OPT-01**이다. 비트보드 직접 읽기와 정확한 borrowed prefix 반복 계산을
+당시 다음 구현은 **OPT-01**이었다. 후속 전체 구현·검증은 11장에 기록했다.
+비트보드 직접 읽기와 정확한 borrowed prefix 반복 계산을
 독립 opt-in 변경으로 구현하고 이 witness로 전체 입력/고정 방문 trace를 다시 대조한다.
 기존 두 feature와 새 변경을 섞어서 하나의 개선율로 보고하지 않는다. OPT-00의 CPU 기반은
 완료했지만 통제 세션·UCI actual visits·observer off/on·실제 CPU/GPU 모델·강도·기본 활성화는
