@@ -6,6 +6,9 @@
 [IMPLEMENTATION-DIRECTIVES](../../docs/IMPLEMENTATION-DIRECTIVES.md), 의미 계약은
 [CONTRACTS](../../docs/CONTRACTS.md)다. 연구 `CARD-A*`와 담당 `TASK-A*`는 다르다.
 
+후속 [성능 개선 계획](../../docs/research/PERFORMANCE-OPTIMIZATION-PLAN.md)은 PR #17을
+기준으로 A 내부 개선과 소비 경계 실험, 자원 경합 통제·반복 계측·실험 PR의 검증 항목을 정리한다.
+
 ## 제공하는 동작
 
 - `Position::startpos/from_fen`: 64칸·bitboard, 차례·권리·raw EP·u32 카운터를 보존한다.
