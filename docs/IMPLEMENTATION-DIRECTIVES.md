@@ -48,8 +48,10 @@ A~F 모두에게 적용하며 각 담당은 사용자 배정에서 자신의 역
 
 ### 2.1 클라우드 개발과 GPU 인수
 
-A~F의 개발 환경은 GPU가 없을 수 있는 클라우드다. **개발 호스트의 capability와 목표
-RTX 4050 6GB에서의 실제 검증을 분리한다.** 착수 때 필요한 OS·toolchain·CPU/RAM·
+A~F의 개발 환경은 GPU가 없을 수 있는 클라우드다. **개발 호스트의 capability와 별도
+지정한 GPU에서의 실제 검증을 분리한다.** 초기 RTX 4050 6GB 인수 이력은 보존하고,
+후속 GPU 벤치마크는 [외부 RunPod 준비 계획](research/RUNPOD-BENCHMARK-PLAN.md)을
+따른다. GPU·예산·보존 조건은 선택 전까지 미결정이다. 착수 때 필요한 OS·toolchain·CPU/RAM·
 저장 공간과 실제 장치/provider 접근을 확인해 available/unavailable/unknown으로 기록한다.
 GPU가 없으면 CPU/mock 기본 조합으로 배정 작업을 계속한다. 실제 CPU 신경망 수치 대조는
 backend를 명시한 별도 증거이며 mock 또는 GPU 추론 증거와 혼합하지 않는다.

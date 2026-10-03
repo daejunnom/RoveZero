@@ -5,7 +5,9 @@
 구현·학습·프로파일링·대국을 수행했다는 보고가 아니다. 상태와 책임은 [ARCHITECTURE](ARCHITECTURE.md), 공통 계약은 [CONTRACTS](CONTRACTS.md), 결정 상태는 [DECISIONS](DECISIONS.md), 일반 변경 규약은 [ENGINEERING-STANDARDS](ENGINEERING-STANDARDS.md)를 따른다. 최소 공통 계약의 내용·revision·변경은 총괄이 직접 소유한다. TASK-A03은 그 계약을 적용·검증하는 작업이며 독립 계약 결정권자가 아니다.
 
 A~F의 클라우드 개발에는 GPU가 없을 수 있다. CPU/mock·가능한 명시적 CPU 신경망
-참조·fixture·계측 도구·학습 recipe를 먼저 개발하고 목표 RTX 4050 검증 환경과 구분한다.
+참조·fixture·계측 도구·학습 recipe를 먼저 개발하고 별도 GPU 검증 환경과 구분한다.
+초기 RTX 4050 인수 이력을 보존하고 후속 GPU 벤치마크는
+[외부 RunPod 준비 계획](research/RUNPOD-BENCHMARK-PLAN.md)에서 장비·예산을 잠근다.
 GPU 검사의 skip·미실행을 통과로 처리하지 않는다. 실제 GPU·학습·정식 대국 인수는
 총괄 I02가 지원 환경의 정확한 SHA·설정·자원·실행 증거로 확인한다. 단계별 인계는
 구현 지시서의 클라우드 개발 규약을 따른다.

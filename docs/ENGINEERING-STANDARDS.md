@@ -44,13 +44,18 @@ WIP 단계부터 공유합니다. 총괄은 실제 선행 계약·실행 근거�
 총괄 통합 인수, 연구 후보의 강도 승격은 서로 다릅니다.
 
 A~F의 클라우드 개발 환경에는 GPU가 없을 수 있습니다. CPU/mock 기본 조합과
-가능한 CPU 신경망 참조를 목표 RTX 4050 6GB의 실제 GPU 검증 환경과 구분합니다.
+가능한 CPU 신경망 참조를 별도 지정한 실제 GPU 검증 환경과 구분합니다.
 CUDA capability 부재는 환경 상태로 기록하고 GPU 모드를 조용히 CPU로 대체하지
 않습니다. GPU backend 코드·fixture·검사 진입점과 학습 recipe·resume 검사는
 지원하는 CPU/mock 범위에서 먼저 구현할 수 있습니다. CPU/mock CI 통과와 GPU
 검사의 skip·미실행은 별도 결과입니다. 총괄 I02가 지원 환경의 실제 GPU·arena·학습
 근거를 따로 인수합니다. D02 CPU 지연은 GPU 계측이 아니며 D03 GPU 성능 개선은
 실제 목표 환경 측정 후 주장합니다. 코드 인수와 실제 학습·정식 강도 인수를 혼동하지 않습니다.
+
+초기 RTX 4050 검증은 해당 장비의 이력입니다. 후속 GPU 벤치마크는 사용자 지정
+외부 RunPod 환경에서 준비하며 [준비 계획](research/RUNPOD-BENCHMARK-PLAN.md)의
+새 host·image·GPU·driver·자원 통제·비용·산출물 회수 조건을 실제 실행 전에 잠급니다.
+다른 GPU의 용량을 6GB로 제한한 결과를 RTX 4050 성능으로 표시하지 않습니다.
 
 ## Power of Ten 조정표
 
