@@ -341,6 +341,12 @@ pub trait EvaluatorFactory: Send + Sync + 'static {
     fn reset_game(&self) -> Result<(), contract::ContractError> {
         Ok(())
     }
+    /// Optional metadata journal; no payloads or engine authority are retained.
+    fn source_trace(
+        &self,
+    ) -> Option<rz_telemetry::source::SourceJournal<contract::CompletionContext>> {
+        None
+    }
     fn profile(&self) -> EvaluatorProfile;
     fn create(
         &self,
@@ -959,6 +965,7 @@ impl Owner {
                             shutdown_limit,
                         );
                     }
+                    search.set_source_trace(factory.source_trace());
                     let mut previous_move = None;
                     let mut authority_error = None;
                     let mut diagnostic_failure = None;

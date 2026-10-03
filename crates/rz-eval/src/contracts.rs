@@ -475,9 +475,27 @@ impl std::error::Error for PhysicalFailure {}
 /// into its Backend interface; no reverse dependency from C to rz-runtime.
 #[cfg(feature = "onnx")]
 pub fn spawn_onnx_worker<P: Send + Sync + 'static>(
-    mut backend: crate::onnx::OnnxBackend,
+    backend: crate::onnx::OnnxBackend,
 ) -> Result<OnnxWorker<P>, ContractError> {
+    spawn_onnx_worker_profiled(backend, None)
+}
+
+#[cfg(feature = "onnx")]
+pub fn spawn_onnx_worker_profiled<P: Send + Sync + 'static>(
+    mut backend: crate::onnx::OnnxBackend,
+    trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
+) -> Result<OnnxWorker<P>, ContractError> {
+    use rz_telemetry::source::SourceStage;
+    use std::time::Instant;
+    if trace.is_some() && !backend.config().source_profile_supported() {
+        return Err(error(
+            ErrorCode::UnsupportedContract,
+            Stage::Contract,
+            "source profiling requires default B1 native execution",
+        ));
+    }
     crate::worker::SingleWorker::spawn_with_outcome(move |batch: &PreparedBatch<P>| {
+        let started = trace.as_ref().map(|_| Instant::now());
         let completed = (|| {
             for item in batch.requests() {
                 if item.backend.0 != backend.identity()
@@ -496,7 +514,30 @@ pub fn spawn_onnx_worker<P: Send + Sync + 'static>(
                 .iter()
                 .map(PreparedRequest::encoded)
                 .collect::<Vec<_>>();
-            let raw = backend.run(&inputs).map_err(PhysicalFailure::from)?;
+            let raw = if let Some(trace) = &trace {
+                let (result, timing) = backend.run_profiled(&inputs);
+                let key = batch.requests().first().map(|item| CompletionContext {
+                    request: item.request.context(),
+                    execution: Some(batch.execution()),
+                });
+                for (stage, span, succeeded) in [
+                    (SourceStage::NativePreparation, timing.preparation, true),
+                    (
+                        SourceStage::NativeInvocation,
+                        timing.invocation,
+                        timing.completion_attested,
+                    ),
+                    (SourceStage::NativeOutput, timing.output, result.is_ok()),
+                ] {
+                    if let Some((start, end)) = span {
+                        trace.record(key, stage, start, end, succeeded);
+                    }
+                }
+                result
+            } else {
+                backend.run(&inputs)
+            }
+            .map_err(PhysicalFailure::from)?;
             let completed = batch
                 .requests()
                 .iter()
@@ -506,6 +547,19 @@ pub fn spawn_onnx_worker<P: Send + Sync + 'static>(
             backend.recycle_outputs(raw);
             completed
         })();
+        if let (Some(trace), Some(start)) = (&trace, started) {
+            let key = batch.requests().first().map(|item| CompletionContext {
+                request: item.request.context(),
+                execution: Some(batch.execution()),
+            });
+            trace.record(
+                key,
+                SourceStage::PhysicalWorker,
+                start,
+                Instant::now(),
+                completed.is_ok() && backend.physical_quarantine_cause().is_none(),
+            );
+        }
         if let Some(cause) = backend.physical_quarantine_cause() {
             // CUDA Run returned an error without a completion fence. No
             // physical_output/ActualCompute or completed error may escape as

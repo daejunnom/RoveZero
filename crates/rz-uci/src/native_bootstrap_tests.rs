@@ -72,6 +72,71 @@ fn attestation_is_explicit_optional_and_duplicate_selection_is_rejected() {
 }
 
 #[test]
+fn profile_is_opt_in_bounded_and_does_not_select_attestation() {
+    let config = NativeConfig::parse(valid_arguments()).unwrap();
+    assert!(!config.profiling_requested());
+    assert!(config.source_journal().unwrap().is_none());
+    let mut selected = valid_arguments();
+    selected.push("--profile".into());
+    let config = NativeConfig::parse(selected.clone()).unwrap();
+    assert!(config.profiling_requested());
+    assert!(!config.attestation_requested());
+    assert_eq!(
+        config
+            .source_journal()
+            .unwrap()
+            .unwrap()
+            .snapshot()
+            .capacity,
+        8192
+    );
+    selected.push("--profile".into());
+    assert_private_config_rejection(selected);
+    let mut named = valid_arguments();
+    named.push("--profile=true".into());
+    assert_private_config_rejection(named);
+}
+
+#[test]
+fn source_profile_rejects_unrepresented_runtime_modes_before_loading_assets() {
+    for experiment in [
+        "--experimental-raw-cache",
+        "--experimental-batch=4",
+        "--experimental-io-buffers",
+        "--experimental-io-binding",
+        "--experimental-cuda-graph",
+    ] {
+        let mut selected = valid_arguments();
+        selected.extend(["--profile".into(), experiment.into()]);
+        let failure = NativeConfig::parse(selected.clone()).unwrap_err();
+        assert!(failure.to_string().contains("source profile v1 requires"));
+        assert_private_config_rejection(selected);
+    }
+    let mut baseline = valid_arguments();
+    baseline.extend([
+        "--profile".into(),
+        "--attestation".into(),
+        "--experimental-batch=1".into(),
+    ]);
+    let baseline = NativeConfig::parse(baseline).unwrap();
+    assert!(baseline.profiling_requested() && baseline.attestation_requested());
+
+    // Defense below CLI: a direct C worker cannot issue B1 source records
+    // from a multi-item or experimental binding/buffer backend either.
+    let mut config = rz_eval::onnx::BackendConfig::cpu();
+    config.max_batch = 1;
+    assert!(config.source_profile_supported());
+    config.max_batch = 4;
+    assert!(!config.source_profile_supported());
+    config.max_batch = 1;
+    config.experiments.reuse_buffers = true;
+    assert!(!config.source_profile_supported());
+    config.experiments = rz_eval::onnx::ExecutionExperiments::default();
+    config.experiments.io_binding = true;
+    assert!(!config.source_profile_supported());
+}
+
+#[test]
 fn native_parser_rejects_missing_duplicate_and_mixed_provider_arguments() {
     let valid = valid_arguments();
     for omitted in 0..valid.len() {

@@ -12,6 +12,7 @@ use std::sync::{
 use std::time::Instant;
 
 use rz_contracts::*;
+use rz_telemetry::source::{SourceJournal, SourceStage};
 
 use crate::contract_time::{ContractClock, ContractDeadlines};
 use crate::policy::{EdgeStats, PolicyIdentity, Puct, SelectionPolicy};
@@ -300,6 +301,7 @@ pub struct ContractSearch<P: ContractPosition, S: SelectionPolicy = Puct> {
     accepted_executions: HashSet<ExecutionId>,
     #[cfg(feature = "experimental-state-cache")]
     state_cache: StateCache<P>,
+    source_trace: Option<SourceJournal<CompletionContext>>,
 }
 
 impl<P: ContractPosition, S: SelectionPolicy> Drop for ContractSearch<P, S> {
@@ -363,6 +365,7 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
                 bytes: 0,
                 hits: 0,
             },
+            source_trace: None,
         })
     }
 
@@ -373,6 +376,11 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
     pub fn pending_requests(&self) -> usize {
         self.pending_count()
     }
+    /// Optional passive source timestamps. Journal loss never changes acceptance.
+    pub fn set_source_trace(&mut self, trace: Option<SourceJournal<CompletionContext>>) {
+        self.source_trace = trace;
+    }
+
     pub fn pending_request(&self) -> Option<RequestId> {
         self.pending
             .as_ref()
@@ -600,6 +608,7 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             self.status = ContractSearchStatus::Completed;
             return ContractPumpEvent::Finished;
         }
+        let preparation_started = self.source_trace.as_ref().map(|_| Instant::now());
         let selection = match self.tree.begin_selection(Instant::now()) {
             Ok(selection) => selection,
             #[cfg(feature = "experimental-batch")]
@@ -798,6 +807,18 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             return ContractPumpEvent::Finished;
         }
         self.metrics.submission_attempts = attempts;
+        if let (Some(trace), Some(start)) = (&self.source_trace, preparation_started) {
+            trace.record(
+                Some(CompletionContext {
+                    request: context,
+                    execution: None,
+                }),
+                SourceStage::SearchPreparation,
+                start,
+                Instant::now(),
+                true,
+            );
+        }
         if let Err(error) = runtime.submit(Arc::clone(&request)) {
             return self.fail_ticket(&selection.ticket, ContractSearchFailure::Boundary(error));
         }
@@ -942,6 +963,7 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         let wdl = output.wdl.normalized();
         let value = wdl[0] - wdl[2];
         let mut guard_error = None;
+        let backup_started = self.source_trace.as_ref().map(|_| Instant::now());
         let completion = self.tree.accept_evaluation_with_guard(
             &pending.ticket,
             pending.request.legal().moves().to_vec(),
@@ -967,6 +989,18 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
                 }
             },
         );
+        if let (Some(trace), Some(start)) = (&self.source_trace, backup_started) {
+            trace.record(
+                Some(CompletionContext {
+                    request: output.context,
+                    execution: output.actual.execution,
+                }),
+                SourceStage::SearchBackup,
+                start,
+                Instant::now(),
+                matches!(completion, Ok(Completion::Accepted { .. })),
+            );
+        }
         let mut event = self.commit_result(
             completion,
             &pending.ticket,

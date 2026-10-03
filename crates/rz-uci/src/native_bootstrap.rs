@@ -41,6 +41,7 @@ use rz_runtime::{
     Clock, DrainState, Limits, Resources,
     contracts::{ContractClock, ContractEvaluator, ContractsAdapter, SharedScope},
 };
+use rz_telemetry::source::{SourceJournal, SourceStage};
 use std::{
     fmt, fs,
     path::{Path, PathBuf},
@@ -80,6 +81,7 @@ pub struct NativeConfig {
     ort_sha256: [u8; 32],
     output_root: PathBuf,
     attestation: bool,
+    profiling: bool,
     provider: NativeProvider,
     cuda_bundle: Option<PathBuf>,
     cuda_bundle_sha256: Option<[u8; 32]>,
@@ -119,6 +121,7 @@ impl NativeConfig {
         let mut ort_sha256 = None;
         let mut output_root = None;
         let mut attestation = false;
+        let mut profiling = false;
         let mut cuda_bundle = None;
         let mut cuda_bundle_sha256 = None;
         for argument in arguments {
@@ -133,6 +136,14 @@ impl NativeConfig {
                 if std::mem::replace(enabled, true) {
                     return Err(NativeBootstrapError::Config(
                         "duplicate execution experiment",
+                    ));
+                }
+                continue;
+            }
+            if argument == "--profile" {
+                if std::mem::replace(&mut profiling, true) {
+                    return Err(NativeBootstrapError::Config(
+                        "duplicate native profile flag",
                     ));
                 }
                 continue;
@@ -207,6 +218,17 @@ impl NativeConfig {
             _ => {}
         }
         let parallelism = parallelism.unwrap_or(1);
+        // D02 v1 records one fresh execution per accepted request. Raw hits,
+        // batching and experimental I/O need distinct provenance/timing schemas.
+        if profiling
+            && (raw_cache
+                || parallelism != 1
+                || execution_experiments != rz_eval::onnx::ExecutionExperiments::default())
+        {
+            return Err(NativeBootstrapError::Config(
+                "native source profile v1 requires default B1 execution without raw cache",
+            ));
+        }
         if !(1..=16).contains(&parallelism)
             || (parallelism > 1 && !cfg!(feature = "experimental-batch"))
             || (parallelism > 1 && (attestation || execution_experiments.cuda_graph))
@@ -247,6 +269,7 @@ impl NativeConfig {
             ort_sha256: ort_sha256.ok_or_else(missing)?,
             output_root: output_root.ok_or_else(missing)?,
             attestation,
+            profiling,
             provider,
             cuda_bundle,
             cuda_bundle_sha256,
@@ -254,6 +277,20 @@ impl NativeConfig {
     }
     pub fn attestation_requested(&self) -> bool {
         self.attestation
+    }
+    pub fn profiling_requested(&self) -> bool {
+        self.profiling
+    }
+    fn source_journal(
+        &self,
+    ) -> Result<Option<SourceJournal<CompletionContext>>, NativeBootstrapError> {
+        if self.profiling {
+            SourceJournal::try_new(8192)
+                .map(Some)
+                .map_err(NativeBootstrapError::Config)
+        } else {
+            Ok(None)
+        }
     }
     pub fn provider(&self) -> NativeProvider {
         self.provider
@@ -992,10 +1029,20 @@ impl NativeSessionFactory {
         let owner = if config.parallelism > 1 {
             NativeWorkerOwner::from_onnx_batched(backend, projection, NATIVE_DIAGNOSTIC_CAPACITY)?
         } else {
-            NativeWorkerOwner::from_onnx(backend, projection, NATIVE_DIAGNOSTIC_CAPACITY)?
+            NativeWorkerOwner::from_onnx_profiled(
+                backend,
+                projection,
+                NATIVE_DIAGNOSTIC_CAPACITY,
+                config.source_journal()?,
+            )?
         };
         #[cfg(not(feature = "experimental-batch"))]
-        let owner = NativeWorkerOwner::from_onnx(backend, projection, NATIVE_DIAGNOSTIC_CAPACITY)?;
+        let owner = NativeWorkerOwner::from_onnx_profiled(
+            backend,
+            projection,
+            NATIVE_DIAGNOSTIC_CAPACITY,
+            config.source_journal()?,
+        )?;
         let mut factory = Self::from_owner(owner, Some(runtime))?;
         factory.loaded_profile = loaded_profile;
         Ok(factory)
@@ -1167,11 +1214,20 @@ impl NativeSessionFactory {
                 NATIVE_DIAGNOSTIC_CAPACITY,
             )?
         } else {
-            NativeWorkerOwner::from_cuda_onnx(backend, projection, NATIVE_DIAGNOSTIC_CAPACITY)?
+            NativeWorkerOwner::from_cuda_onnx_profiled(
+                backend,
+                projection,
+                NATIVE_DIAGNOSTIC_CAPACITY,
+                config.source_journal()?,
+            )?
         };
         #[cfg(not(feature = "experimental-batch"))]
-        let owner =
-            NativeWorkerOwner::from_cuda_onnx(backend, projection, NATIVE_DIAGNOSTIC_CAPACITY)?;
+        let owner = NativeWorkerOwner::from_cuda_onnx_profiled(
+            backend,
+            projection,
+            NATIVE_DIAGNOSTIC_CAPACITY,
+            config.source_journal()?,
+        )?;
         let mut factory = Self::from_owner(owner, Some(runtime))?;
         factory.loaded_cuda_profile = loaded_profile;
         Ok(factory)
@@ -1510,6 +1566,9 @@ impl EvaluatorFactory for NativeSessionFactory {
         self.owner.projection().clear_raw_cache()?;
         Ok(())
     }
+    fn source_trace(&self) -> Option<SourceJournal<CompletionContext>> {
+        self.owner.source_trace().cloned()
+    }
     fn observe_search_acceptance(
         &self,
         evaluation: &rz_search::contracts::AcceptedEvaluation,
@@ -1631,6 +1690,9 @@ macro_rules! delegate_native_factory {
             fn reset_game(&self) -> Result<(), ContractError> {
                 self.inner.reset_game()
             }
+            fn source_trace(&self) -> Option<SourceJournal<CompletionContext>> {
+                self.inner.source_trace()
+            }
             fn observe_search_acceptance(
                 &self,
                 evaluation: &rz_search::contracts::AcceptedEvaluation,
@@ -1686,6 +1748,113 @@ impl NativeRuntime {
     fn collect_observations(&mut self, drain_discarded: u64) -> Result<(), ContractError> {
         let scheduler = self.evaluator.take_observations();
         let delivery = self.evaluator.take_delivery_observations();
+        if let Some(trace) = self.owner.source_trace() {
+            trace.note_external_loss(scheduler.dropped, scheduler.counter_overflow);
+            trace.note_external_loss(delivery.dropped, delivery.counter_overflow);
+            let source_clock = self.clock.b_clock();
+            for event in &scheduler.events {
+                use rz_runtime::ObservationKind as O;
+                let (request, execution, stage, start, succeeded) = match event.kind {
+                    O::Admitted { request } => {
+                        (Some(request), None, SourceStage::Admitted, event.at, true)
+                    }
+                    O::RequestDispatched {
+                        request,
+                        execution,
+                        dispatch_started_at,
+                    } => (
+                        Some(request),
+                        Some(execution),
+                        SourceStage::DispatchStarted,
+                        dispatch_started_at,
+                        true,
+                    ),
+                    O::Dispatched {
+                        execution,
+                        dispatch_started_at,
+                        ..
+                    } => (
+                        None,
+                        Some(execution),
+                        SourceStage::DispatchFinished,
+                        dispatch_started_at,
+                        true,
+                    ),
+                    O::PhysicalCompleted { execution } => (
+                        None,
+                        Some(execution),
+                        SourceStage::PhysicalReadyObserved,
+                        event.at,
+                        true,
+                    ),
+                    O::ValidationStarted { request, execution } => (
+                        Some(request),
+                        Some(execution),
+                        SourceStage::ValidationStarted,
+                        event.at,
+                        true,
+                    ),
+                    O::ValidationFinished {
+                        request,
+                        execution,
+                        valid,
+                    } => (
+                        Some(request),
+                        Some(execution),
+                        SourceStage::ValidationFinished,
+                        event.at,
+                        valid,
+                    ),
+                    O::Finished { request, kind, .. } => (
+                        Some(request),
+                        None,
+                        SourceStage::LogicalFinished,
+                        event.at,
+                        kind == rz_telemetry::FinishKind::Completed,
+                    ),
+                    O::Rejected { .. } | O::ReservationChanged => continue,
+                };
+                let key = self
+                    .pending
+                    .filter(|context| request.is_none_or(|id| id == context.request))
+                    .map(|request| CompletionContext { request, execution });
+                match (
+                    source_clock.instant_at(start),
+                    source_clock.instant_at(event.at),
+                ) {
+                    (Ok(start), Ok(end)) => trace.record(
+                        key,
+                        stage,
+                        start,
+                        if stage == SourceStage::DispatchStarted {
+                            start
+                        } else {
+                            end
+                        },
+                        succeeded,
+                    ),
+                    _ => trace.note_invalid_interval(),
+                }
+            }
+            for event in &delivery.events {
+                use rz_runtime::contracts::DeliveryObservationKind as O;
+                if event.clock != self.clock.domain() {
+                    trace.note_invalid_interval();
+                    continue;
+                }
+                let (stage, succeeded) = match event.kind {
+                    O::Accepted => (SourceStage::DeliveryAccepted, true),
+                    O::Rejected { .. } => (SourceStage::DeliveryRejected, false),
+                    O::Terminal { .. } | O::MailboxDisconnected { .. } => {
+                        (SourceStage::DeliveryTerminal, false)
+                    }
+                };
+                match source_clock.instant_at(event.at) {
+                    Ok(at) => trace.record(Some(event.context), stage, at, at, succeeded),
+                    Err(_) => trace.note_invalid_interval(),
+                }
+            }
+        }
         self.evidence.record_observations(NativeObservationReport {
             scheduler_events: scheduler.events.len() as u64,
             scheduler_dropped: scheduler.dropped,

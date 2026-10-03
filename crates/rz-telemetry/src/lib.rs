@@ -12,6 +12,7 @@ use std::mem::size_of;
 use std::time::Duration;
 
 pub mod profile;
+pub mod source;
 
 /// Failure to create the bounded sample storage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

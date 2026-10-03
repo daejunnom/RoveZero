@@ -18,6 +18,7 @@ use rz_encoding::POLICY_SIZE;
 use rz_native_loader::{LibrarySet, LoadError, ProcessLibrarySet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[cfg(feature = "experimental-io-binding")]
 #[path = "onnx_io.rs"]
@@ -44,6 +45,15 @@ pub struct ExecutionExperiments {
     pub cuda_graph: bool,
 }
 
+/// Source-thread host intervals. NativeInvocation includes synchronous ORT Run,
+/// not separately measured GPU kernels or H2D/D2H. Failed CUDA Run is unfenced.
+#[derive(Default, Debug)]
+pub struct NativeRunTimings {
+    pub preparation: Option<(Instant, Instant)>,
+    pub invocation: Option<(Instant, Instant)>,
+    pub output: Option<(Instant, Instant)>,
+    pub completion_attested: bool,
+}
 /// Input staging plus native and owned output copies. Excludes caller features,
 /// model/session/ORT activation workspace: bootstrap must budget those too.
 pub const IO_BYTES_PER_ITEM: usize = (INPUT_VALUES + 2 * (POLICY_SIZE + 3)) * 4;
@@ -352,6 +362,11 @@ pub struct BackendConfig {
 }
 
 impl BackendConfig {
+    /// Native D02 v1 has no raw-hit, batch or experimental I/O timeline schema.
+    pub fn source_profile_supported(&self) -> bool {
+        self.max_batch == 1 && self.experiments == ExecutionExperiments::default()
+    }
+
     pub fn cpu() -> Self {
         Self {
             experiments: ExecutionExperiments::default(),
@@ -803,6 +818,48 @@ impl OnnxBackend {
 
     /// Dense entry point for independent reference fixtures, still fully checked.
     pub fn run_values(&mut self, inputs: &[&[f32]]) -> Result<Vec<RawOutput>, BackendError> {
+        self.run_values_profiled(inputs, None)
+    }
+
+    pub fn run_profiled(
+        &mut self,
+        inputs: &[&EncodedInput],
+    ) -> (Result<Vec<RawOutput>, BackendError>, NativeRunTimings) {
+        let mut timings = NativeRunTimings::default();
+        if !self.config.source_profile_supported() {
+            return (
+                Err(BackendError::new(
+                    K::UnsupportedModel,
+                    S::Admission,
+                    "source profiling requires default B1 native execution",
+                )),
+                timings,
+            );
+        }
+        if inputs.len() > self.config.max_batch {
+            return (
+                Err(BackendError::new(
+                    K::ResourceExhausted,
+                    S::Admission,
+                    "batch exceeds configured limit",
+                )),
+                timings,
+            );
+        }
+        let values = inputs
+            .iter()
+            .map(|input| input.values())
+            .collect::<Vec<_>>();
+        let result = self.run_values_profiled(&values, Some(&mut timings));
+        (result, timings)
+    }
+
+    fn run_values_profiled(
+        &mut self,
+        inputs: &[&[f32]],
+        mut timings: Option<&mut NativeRunTimings>,
+    ) -> Result<Vec<RawOutput>, BackendError> {
+        let preparation_start = timings.as_ref().map(|_| Instant::now());
         if self.active_input.is_some() {
             return Err(BackendError::new(
                 K::BackendUnavailable,
@@ -954,6 +1011,12 @@ impl OnnxBackend {
         // Arbitrary CUDA errors retain the input/session instead of granting
         // physical Ready. CPU errors keep the existing completed-error behavior.
         let run_started = measured.then(std::time::Instant::now);
+        let invocation_start = timings.as_ref().map(|_| Instant::now());
+        if let (Some(start), Some(end), Some(timing)) =
+            (preparation_start, invocation_start, timings.as_deref_mut())
+        {
+            timing.preparation = Some((start, end));
+        }
         let run_result = self
             .session
             .as_mut()
@@ -964,6 +1027,13 @@ impl OnnxBackend {
             .ok_or(BackendError::new(K::BackendFailure, S::Backend, "input pin is missing"))?]);
         if let (Some(timing), Some(started)) = (&mut self.timings, run_started) {
             timing.run = started.elapsed();
+        }
+        let invocation_end = timings.as_ref().map(|_| Instant::now());
+        if let (Some(start), Some(end), Some(timing)) =
+            (invocation_start, invocation_end, timings.as_deref_mut())
+        {
+            timing.invocation = Some((start, end));
+            timing.completion_attested = run_result.is_ok();
         }
         let outputs = match run_result {
             Ok(outputs) => outputs,
@@ -1016,6 +1086,9 @@ impl OnnxBackend {
         );
         if let (Some(timing), Some(started)) = (&mut self.timings, own_started) {
             timing.own_outputs = started.elapsed();
+        }
+        if let (Some(start), Some(timing)) = (invocation_end, timings) {
+            timing.output = Some((start, Instant::now()));
         }
         result
     }

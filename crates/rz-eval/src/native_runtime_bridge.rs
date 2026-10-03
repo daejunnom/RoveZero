@@ -17,6 +17,7 @@ use rz_runtime::{Backend, BackendResult, Resources};
 use std::{
     sync::{Arc, Mutex, MutexGuard, TryLockError},
     task::Poll,
+    time::Instant,
 };
 
 pub type NativePhysicalWorker =
@@ -159,6 +160,7 @@ struct OwnerInner {
     origin: NativeWorkerOrigin,
     admission_policy: NativeAdmissionPolicy,
     cuda_metadata: Option<NativeCudaMetadata>,
+    source_trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
     state: Mutex<OwnerState>,
 }
 
@@ -255,6 +257,7 @@ impl NativeWorkerOwner {
             origin: NativeWorkerOrigin::Injected,
             admission_policy,
             cuda_metadata: None,
+            source_trace: None,
             state: Mutex::new(OwnerState {
                 worker,
                 epoch: None,
@@ -282,7 +285,17 @@ impl NativeWorkerOwner {
         projection: ClassicalProjection,
         diagnostic_capacity: usize,
     ) -> Result<Self, PhysicalFailure> {
-        Self::from_onnx_limit(backend, projection, diagnostic_capacity, 1)
+        Self::from_onnx_profiled(backend, projection, diagnostic_capacity, None)
+    }
+
+    #[cfg(feature = "onnx")]
+    pub fn from_onnx_profiled(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+        trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
+    ) -> Result<Self, PhysicalFailure> {
+        Self::from_onnx_limit(backend, projection, diagnostic_capacity, 1, trace)
     }
     #[cfg(all(feature = "onnx", feature = "experimental-batch"))]
     pub fn from_onnx_batched(
@@ -291,7 +304,7 @@ impl NativeWorkerOwner {
         diagnostic_capacity: usize,
     ) -> Result<Self, PhysicalFailure> {
         let max_batch = backend.config().max_batch;
-        Self::from_onnx_limit(backend, projection, diagnostic_capacity, max_batch)
+        Self::from_onnx_limit(backend, projection, diagnostic_capacity, max_batch, None)
     }
     #[cfg(feature = "onnx")]
     fn from_onnx_limit(
@@ -299,6 +312,7 @@ impl NativeWorkerOwner {
         projection: ClassicalProjection,
         diagnostic_capacity: usize,
         max_batch: usize,
+        trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
     ) -> Result<Self, PhysicalFailure> {
         if !matches!(backend.config().provider, crate::onnx::Provider::Cpu)
             || backend.config().max_batch != max_batch
@@ -312,7 +326,7 @@ impl NativeWorkerOwner {
             )
             .into());
         }
-        let worker = crate::contracts::spawn_onnx_worker(backend)?;
+        let worker = crate::contracts::spawn_onnx_worker_profiled(backend, trace.clone())?;
         let mut owner = Self::from_worker_limit(
             worker,
             projection,
@@ -321,9 +335,9 @@ impl NativeWorkerOwner {
             max_batch,
         )?;
         // No clone has escaped this constructor; the actual origin is immutable.
-        Arc::get_mut(&mut owner.0)
-            .expect("new native owner is exclusively owned")
-            .origin = NativeWorkerOrigin::CpuOnnx;
+        let inner = Arc::get_mut(&mut owner.0).expect("new native owner is exclusively owned");
+        inner.origin = NativeWorkerOrigin::CpuOnnx;
+        inner.source_trace = trace;
         Ok(owner)
     }
 
@@ -337,7 +351,17 @@ impl NativeWorkerOwner {
         projection: ClassicalProjection,
         diagnostic_capacity: usize,
     ) -> Result<Self, PhysicalFailure> {
-        Self::from_cuda_onnx_limit(backend, projection, diagnostic_capacity, 1)
+        Self::from_cuda_onnx_profiled(backend, projection, diagnostic_capacity, None)
+    }
+
+    #[cfg(feature = "onnx")]
+    pub fn from_cuda_onnx_profiled(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+        trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
+    ) -> Result<Self, PhysicalFailure> {
+        Self::from_cuda_onnx_limit(backend, projection, diagnostic_capacity, 1, trace)
     }
     #[cfg(all(feature = "onnx", feature = "experimental-batch"))]
     pub fn from_cuda_onnx_batched(
@@ -346,7 +370,7 @@ impl NativeWorkerOwner {
         diagnostic_capacity: usize,
     ) -> Result<Self, PhysicalFailure> {
         let max_batch = backend.config().max_batch;
-        Self::from_cuda_onnx_limit(backend, projection, diagnostic_capacity, max_batch)
+        Self::from_cuda_onnx_limit(backend, projection, diagnostic_capacity, max_batch, None)
     }
     #[cfg(feature = "onnx")]
     fn from_cuda_onnx_limit(
@@ -354,6 +378,7 @@ impl NativeWorkerOwner {
         projection: ClassicalProjection,
         diagnostic_capacity: usize,
         max_batch: usize,
+        trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
     ) -> Result<Self, PhysicalFailure> {
         // Preserve the actual native cause of an earlier uncertain Run before
         // reporting a generic profile mismatch. Drop retains its session/input.
@@ -414,7 +439,7 @@ impl NativeWorkerOwner {
         // A successful historical probe alone does not authorize current maps.
         // Loader failure stays typed and latched, with all native pins retained.
         backend.verify_cuda_runtime_mappings()?;
-        let worker = crate::contracts::spawn_onnx_worker(backend)?;
+        let worker = crate::contracts::spawn_onnx_worker_profiled(backend, trace.clone())?;
         let mut owner = Self::from_worker_limit(
             worker,
             projection,
@@ -425,6 +450,7 @@ impl NativeWorkerOwner {
         let inner = Arc::get_mut(&mut owner.0).expect("new native owner is exclusively owned");
         inner.origin = NativeWorkerOrigin::CudaOnnx;
         inner.cuda_metadata = Some(metadata);
+        inner.source_trace = trace;
         Ok(owner)
     }
 
@@ -450,6 +476,10 @@ impl NativeWorkerOwner {
     }
     pub fn projection(&self) -> &ClassicalProjection {
         &self.0.projection
+    }
+
+    pub fn source_trace(&self) -> Option<&rz_telemetry::source::SourceJournal<CompletionContext>> {
+        self.0.source_trace.as_ref()
     }
 
     pub fn admission_error(&self) -> Option<ContractError> {
@@ -861,7 +891,21 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
                     )
                     .into());
                 }
-                items.push(self.owner.projection().prepare(Arc::clone(request))?);
+                let encoding_started = self.owner.source_trace().map(|_| Instant::now());
+                let prepared = self.owner.projection().prepare(Arc::clone(request));
+                if let (Some(trace), Some(start)) = (self.owner.source_trace(), encoding_started) {
+                    trace.record(
+                        Some(CompletionContext {
+                            request: request.context(),
+                            execution: Some(*execution),
+                        }),
+                        rz_telemetry::source::SourceStage::EncodingPreparation,
+                        start,
+                        Instant::now(),
+                        prepared.is_ok(),
+                    );
+                }
+                items.push(prepared?);
             }
             let batch = PreparedBatch::new(*execution, items)?;
             let mut results = Vec::new();
