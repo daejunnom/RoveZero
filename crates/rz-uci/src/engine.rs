@@ -323,6 +323,11 @@ pub trait ManagedEvaluator: contract::Evaluator<RulesState> + Send {
     fn shutdown(&mut self, deadline: Instant) -> Result<(), contract::ContractError>;
 }
 pub trait EvaluatorFactory: Send + Sync + 'static {
+    #[cfg(feature = "experimental-batch")]
+    fn parallelism(&self) -> usize {
+        1
+    }
+
     #[cfg(feature = "experimental-notify")]
     fn completion_signal(&self) -> Option<rz_runtime::CompletionSignal> {
         None
@@ -938,6 +943,17 @@ impl Owner {
                                 );
                             }
                         };
+                    #[cfg(feature = "experimental-batch")]
+                    if let Err(error) = search.set_parallelism(factory.parallelism()) {
+                        return finish_worker(
+                            &events,
+                            ticket,
+                            WorkerCompletion::failed(WorkerFailureSource::SearchConstructor(error)),
+                            &worker_publication,
+                            Some(runtime.as_mut()),
+                            shutdown_limit,
+                        );
+                    }
                     let mut previous_move = None;
                     let mut authority_error = None;
                     let mut diagnostic_failure = None;

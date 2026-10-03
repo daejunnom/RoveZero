@@ -142,6 +142,8 @@ pub struct ContractsAdapter<P, C> {
     last_request: Option<u64>,
     last_execution: u64,
     max_batch_items: usize,
+    #[cfg(feature = "experimental-batch")]
+    mixed_legal_batching: bool,
     _position: PhantomData<fn() -> P>,
 }
 
@@ -170,8 +172,17 @@ impl<P, C: ContractClock> ContractsAdapter<P, C> {
             last_request: None,
             last_execution,
             max_batch_items,
+            #[cfg(feature = "experimental-batch")]
+            mixed_legal_batching: false,
             _position: PhantomData,
         })
+    }
+
+    /// Only a full raw-head backend with per-item legal conversion may opt in.
+    #[cfg(feature = "experimental-batch")]
+    pub fn with_mixed_legal_batching(mut self) -> Self {
+        self.mixed_legal_batching = true;
+        self
     }
 
     pub fn scope(&self) -> &SharedScope {
@@ -209,7 +220,18 @@ impl<P: Send + Sync + 'static, C: ContractClock> Adapter for ContractsAdapter<P,
             precision: context.precision,
             compute: context.compute,
             backend: context.backend,
-            legal_count: request.eval.legal().moves().len(),
+            legal_count: {
+                #[cfg(feature = "experimental-batch")]
+                if self.mixed_legal_batching {
+                    0
+                } else {
+                    request.eval.legal().moves().len()
+                }
+                #[cfg(not(feature = "experimental-batch"))]
+                {
+                    request.eval.legal().moves().len()
+                }
+            },
         }
     }
 

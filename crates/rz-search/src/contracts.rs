@@ -291,6 +291,10 @@ pub struct ContractSearch<P: ContractPosition, S: SelectionPolicy = Puct> {
     fallback: Option<Move>,
     status: ContractSearchStatus,
     pending: Option<Pending<P>>,
+    #[cfg(feature = "experimental-batch")]
+    other_pending: Vec<Pending<P>>,
+    #[cfg(feature = "experimental-batch")]
+    max_pending: usize,
     simulations: u64,
     metrics: ContractSearchMetrics,
     accepted_executions: HashSet<ExecutionId>,
@@ -302,7 +306,7 @@ impl<P: ContractPosition, S: SelectionPolicy> Drop for ContractSearch<P, S> {
     fn drop(&mut self) {
         // Covers unwind while submit/poll owns a temporarily detached Pending as well.
         // This revokes logical acceptance only; Runtime retains every physical lease.
-        if matches!(self.status, ContractSearchStatus::Running) || self.pending.is_some() {
+        if matches!(self.status, ContractSearchStatus::Running) || self.pending_count() != 0 {
             self.config.cancellation.cancel();
         }
     }
@@ -345,6 +349,10 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             fallback,
             status,
             pending: None,
+            #[cfg(feature = "experimental-batch")]
+            other_pending: Vec::new(),
+            #[cfg(feature = "experimental-batch")]
+            max_pending: 1,
             simulations: 0,
             metrics: ContractSearchMetrics::default(),
             accepted_executions: HashSet::new(),
@@ -362,6 +370,9 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         !matches!(self.status, ContractSearchStatus::Running)
     }
 
+    pub fn pending_requests(&self) -> usize {
+        self.pending_count()
+    }
     pub fn pending_request(&self) -> Option<RequestId> {
         self.pending
             .as_ref()
@@ -451,11 +462,71 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         }
     }
 
+    fn pending_count(&self) -> usize {
+        let count = usize::from(self.pending.is_some());
+        #[cfg(feature = "experimental-batch")]
+        let count = count + self.other_pending.len();
+        count
+    }
+    #[cfg(feature = "experimental-batch")]
+    pub fn set_parallelism(&mut self, max_pending: usize) -> Result<(), ContractError> {
+        if self.tree.counters().selections != 0 || self.pending_count() != 0 {
+            return Err(boundary(
+                ErrorCode::UnsupportedContract,
+                Stage::Contract,
+                "parallelism is fixed before first selection",
+            ));
+        }
+        self.tree
+            .set_parallelism(max_pending)
+            .map_err(tree_boundary)?;
+        self.other_pending.try_reserve(max_pending).map_err(|_| {
+            boundary(
+                ErrorCode::ResourceExhausted,
+                Stage::Contract,
+                "pending allocation failed",
+            )
+        })?;
+        self.max_pending = max_pending;
+        Ok(())
+    }
+    #[cfg(feature = "experimental-batch")]
+    fn cancel_pending<R: Evaluator<P::State>>(&mut self, runtime: &mut R) {
+        while let Some(pending) = self.pending.take().or_else(|| self.other_pending.pop()) {
+            if let Err(error) = runtime.cancel(pending.request.context().request) {
+                self.record_runtime_cleanup(error);
+            }
+            if let Err(error) = self.tree.cancel(&pending.ticket) {
+                self.status = ContractSearchStatus::Failed(ContractSearchFailure::Tree(error));
+            }
+        }
+    }
+    pub fn pump<R, C, L, K>(
+        &mut self,
+        runtime: &mut R,
+        clock: &C,
+        live_scope: L,
+        input_key: K,
+    ) -> ContractPumpEvent
+    where
+        R: Evaluator<P::State>,
+        C: ContractClock,
+        L: FnMut() -> AcceptanceScope,
+        K: FnMut(&P, &EncodingDescriptor) -> Result<EvalInputKey, ContractError>,
+    {
+        let event = self.pump_inner(runtime, clock, live_scope, input_key);
+        #[cfg(feature = "experimental-batch")]
+        if self.is_finished() {
+            self.cancel_pending(runtime);
+        }
+        event
+    }
+
     /// 기다리지 않는 논리 상태 전이. Runtime의 각 메서드도 blocking하면 안 된다.
     /// 이 탐색은 해당 poll stream의 단일 활성 consumer다. 이전 탐색을 논리적으로
     /// 닫은 뒤 stream을 재사용한다. 동시 탐색은 Runtime dispatcher가 RequestId별로
     /// 분리한 evaluator stream을 제공해야 하며 전역 poll stream을 함께 읽으면 안 된다.
-    pub fn pump<R, C, L, K>(
+    fn pump_inner<R, C, L, K>(
         &mut self,
         runtime: &mut R,
         clock: &C,
@@ -471,8 +542,34 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         if self.is_finished() {
             return ContractPumpEvent::Finished;
         }
+        #[cfg(feature = "experimental-batch")]
+        if self.pending.is_none() {
+            self.pending = self.other_pending.pop();
+        }
         if self.pending.is_some() {
-            return self.poll_pending(runtime, clock, &mut live_scope);
+            let event = self.poll_pending(runtime, clock, &mut live_scope);
+            #[cfg(feature = "experimental-batch")]
+            if matches!(event, ContractPumpEvent::Waiting)
+                && self.pending_count() < self.max_pending
+            {
+                let now = match clock.now() {
+                    Ok(now) => now,
+                    Err(_) => return event,
+                };
+                if now >= self.config.deadlines.admission.at
+                    || now >= self.config.deadlines.soft.at
+                    || self.simulations.saturating_add(self.pending_count() as u64)
+                        >= self.config.max_simulations
+                {
+                    return event;
+                }
+                // Continue to select another independent leaf; its virtual path
+                // reserves capacity but does not create a completed visit.
+            } else {
+                return event;
+            }
+            #[cfg(not(feature = "experimental-batch"))]
+            return event;
         }
         if let Err(error) = live_acceptance(&self.config, clock, &mut live_scope, &self.root) {
             self.status = status_for_boundary(error);
@@ -505,6 +602,10 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         }
         let selection = match self.tree.begin_selection(Instant::now()) {
             Ok(selection) => selection,
+            #[cfg(feature = "experimental-batch")]
+            Err(SearchError::Busy) if self.pending_count() != 0 => {
+                return ContractPumpEvent::Waiting;
+            }
             Err(error) => {
                 self.status = ContractSearchStatus::Failed(ContractSearchFailure::Tree(error));
                 return ContractPumpEvent::Finished;
@@ -701,6 +802,10 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             return self.fail_ticket(&selection.ticket, ContractSearchFailure::Boundary(error));
         }
         self.metrics.submissions = submissions;
+        #[cfg(feature = "experimental-batch")]
+        if let Some(previous) = self.pending.take() {
+            self.other_pending.push(previous);
+        }
         self.pending = Some(Pending {
             ticket: selection.ticket,
             selection: selection_id,
@@ -724,7 +829,8 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         C: ContractClock,
         L: FnMut() -> AcceptanceScope,
     {
-        let pending = self
+        #[allow(unused_mut)]
+        let mut pending = self
             .pending
             .take()
             .expect("pump checks pending before polling");
@@ -747,6 +853,18 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             | EvalResult::Stale(completion) => completion.request,
             EvalResult::Failed(failure) => failure.context.request,
         };
+        #[cfg(feature = "experimental-batch")]
+        if context != pending.request.context() {
+            if let Some(index) = self
+                .other_pending
+                .iter()
+                .position(|p| p.request.context() == context)
+            {
+                let matched = self.other_pending.swap_remove(index);
+                self.other_pending.push(pending);
+                pending = matched;
+            }
+        }
         if context != pending.request.context() {
             self.pending = Some(pending);
             return self.rejected_result(

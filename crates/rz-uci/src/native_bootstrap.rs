@@ -71,6 +71,7 @@ fn error(code: ErrorCode, stage: Stage, detail: &'static str) -> ContractError {
 pub struct NativeConfig {
     execution_experiments: rz_eval::onnx::ExecutionExperiments,
     raw_cache: bool,
+    parallelism: usize,
     source_weights: PathBuf,
     onnx_model: PathBuf,
     export_manifest: PathBuf,
@@ -91,6 +92,7 @@ impl fmt::Debug for NativeConfig {
             .field("provider", &self.provider)
             .field("execution_experiments", &self.execution_experiments)
             .field("raw_cache", &self.raw_cache)
+            .field("parallelism", &self.parallelism)
             .field("cuda_bundle_sha256", &self.cuda_bundle_sha256)
             .field("cuda_bundle_selected", &self.cuda_bundle.is_some())
             .finish_non_exhaustive()
@@ -102,6 +104,7 @@ impl NativeConfig {
     ) -> Result<Self, NativeBootstrapError> {
         let mut execution_experiments = rz_eval::onnx::ExecutionExperiments::default();
         let mut raw_cache = false;
+        let mut parallelism = None;
         let mut provider = None;
         let mut source_weights = None;
         let mut onnx_model = None;
@@ -156,6 +159,16 @@ impl NativeConfig {
                     "native CPU arguments require named asset/hash values",
                 ))?;
             match name {
+                "--experimental-batch" => {
+                    if parallelism.is_some() {
+                        return Err(NativeBootstrapError::Config("duplicate batch width"));
+                    }
+                    parallelism = Some(
+                        value
+                            .parse::<usize>()
+                            .map_err(|_| NativeBootstrapError::Config("invalid batch width"))?,
+                    );
+                }
                 "--source-weights" => set_path(&mut source_weights, value)?,
                 "--onnx-model" => set_path(&mut onnx_model, value)?,
                 "--export-manifest" => set_path(&mut export_manifest, value)?,
@@ -188,6 +201,15 @@ impl NativeConfig {
             }
             _ => {}
         }
+        let parallelism = parallelism.unwrap_or(1);
+        if !(1..=16).contains(&parallelism)
+            || (parallelism > 1 && !cfg!(feature = "experimental-batch"))
+            || (parallelism > 1 && (attestation || execution_experiments.cuda_graph))
+        {
+            return Err(NativeBootstrapError::Config(
+                "experimental batch requires compiled width 1..=16 and excludes CUDA Graph/B1 attestation",
+            ));
+        }
         if (execution_experiments.reuse_buffers && !cfg!(feature = "experimental-io-buffers"))
             || (execution_experiments.io_binding && !cfg!(feature = "experimental-io-binding"))
             || (execution_experiments.cuda_graph
@@ -211,6 +233,7 @@ impl NativeConfig {
         Ok(Self {
             execution_experiments,
             raw_cache,
+            parallelism,
             source_weights: source_weights.ok_or_else(missing)?,
             onnx_model: onnx_model.ok_or_else(missing)?,
             export_manifest: export_manifest.ok_or_else(missing)?,
@@ -948,11 +971,28 @@ impl NativeSessionFactory {
             ));
         }
         let (asset, runtime, backend, projection) = Self::load_parts(owners, config)?;
-        let loaded_profile =
-            CpuProfileV1::from_loaded(&asset, &runtime, &backend, projection.model())?;
+        let loaded_profile = if config.parallelism == 1
+            && config.execution_experiments == rz_eval::onnx::ExecutionExperiments::default()
+        {
+            Some(CpuProfileV1::from_loaded(
+                &asset,
+                &runtime,
+                &backend,
+                projection.model(),
+            )?)
+        } else {
+            None
+        };
+        #[cfg(feature = "experimental-batch")]
+        let owner = if config.parallelism > 1 {
+            NativeWorkerOwner::from_onnx_batched(backend, projection, NATIVE_DIAGNOSTIC_CAPACITY)?
+        } else {
+            NativeWorkerOwner::from_onnx(backend, projection, NATIVE_DIAGNOSTIC_CAPACITY)?
+        };
+        #[cfg(not(feature = "experimental-batch"))]
         let owner = NativeWorkerOwner::from_onnx(backend, projection, NATIVE_DIAGNOSTIC_CAPACITY)?;
         let mut factory = Self::from_owner(owner, Some(runtime))?;
-        factory.loaded_profile = Some(loaded_profile);
+        factory.loaded_profile = loaded_profile;
         Ok(factory)
     }
     fn load_parts(
@@ -981,9 +1021,9 @@ impl NativeSessionFactory {
             .collect();
         let mut backend_config = BackendConfig::cpu();
         backend_config.experiments = config.execution_experiments;
-        backend_config.max_batch = 1;
+        backend_config.max_batch = config.parallelism;
         backend_config.intra_threads = 1;
-        backend_config.host_io_bytes = IO_BYTES_PER_ITEM;
+        backend_config.host_io_bytes = config.parallelism * IO_BYTES_PER_ITEM;
         let pin = match config.provider {
             NativeProvider::Cpu => {
                 RuntimeLibraryPin::copy_verified(&config.ort_library, &output_root, &expected_ort)?
@@ -1097,21 +1137,38 @@ impl NativeSessionFactory {
             ));
         }
         let (asset, runtime, backend, projection) = Self::load_parts(owners, config)?;
-        let loaded_profile = CudaProfileV1::from_loaded(
-            &asset,
-            &runtime,
-            &backend,
-            projection.model(),
-            config
-                .cuda_bundle_sha256
-                .ok_or(NativeBootstrapError::Config(
-                    "CUDA bundle file SHA256 is absent",
-                ))?,
-        )?;
+        let loaded_profile = if config.parallelism == 1
+            && config.execution_experiments == rz_eval::onnx::ExecutionExperiments::default()
+        {
+            Some(CudaProfileV1::from_loaded(
+                &asset,
+                &runtime,
+                &backend,
+                projection.model(),
+                config
+                    .cuda_bundle_sha256
+                    .ok_or(NativeBootstrapError::Config(
+                        "CUDA bundle file SHA256 is absent",
+                    ))?,
+            )?)
+        } else {
+            None
+        };
+        #[cfg(feature = "experimental-batch")]
+        let owner = if config.parallelism > 1 {
+            NativeWorkerOwner::from_cuda_onnx_batched(
+                backend,
+                projection,
+                NATIVE_DIAGNOSTIC_CAPACITY,
+            )?
+        } else {
+            NativeWorkerOwner::from_cuda_onnx(backend, projection, NATIVE_DIAGNOSTIC_CAPACITY)?
+        };
+        #[cfg(not(feature = "experimental-batch"))]
         let owner =
             NativeWorkerOwner::from_cuda_onnx(backend, projection, NATIVE_DIAGNOSTIC_CAPACITY)?;
         let mut factory = Self::from_owner(owner, Some(runtime))?;
-        factory.loaded_cuda_profile = Some(loaded_profile);
+        factory.loaded_cuda_profile = loaded_profile;
         Ok(factory)
     }
     fn from_owner(
@@ -1433,6 +1490,11 @@ impl ContractClock for RuntimeClock {
     }
 }
 impl EvaluatorFactory for NativeSessionFactory {
+    #[cfg(feature = "experimental-batch")]
+    fn parallelism(&self) -> usize {
+        self.owner.max_batch()
+    }
+
     #[cfg(feature = "experimental-notify")]
     fn completion_signal(&self) -> Option<rz_runtime::CompletionSignal> {
         Some(self.owner.completion_signal())
@@ -1475,27 +1537,39 @@ impl EvaluatorFactory for NativeSessionFactory {
         let adapter = ContractsAdapter::with_execution_high_water(
             scope.clone(),
             runtime_clock.clone(),
-            1,
+            self.owner.max_batch(),
             high_water,
         )?;
+        #[cfg(feature = "experimental-batch")]
+        let adapter = if self.owner.max_batch() > 1 {
+            adapter.with_mixed_legal_batching()
+        } else {
+            adapter
+        };
         let backend = NativeRuntimeBackend::new(self.owner.clone(), runtime_clock)?;
         let evaluator = ContractEvaluator::new(
             adapter,
             backend,
             Limits {
-                max_requests: 1,
-                max_batch_items: 1,
+                max_requests: self.owner.max_batch(),
+                max_batch_items: self.owner.max_batch(),
                 max_executions: 1,
-                max_batch_wait: Duration::ZERO,
+                max_batch_wait: if self.owner.max_batch() > 1 {
+                    Duration::from_micros(200)
+                } else {
+                    Duration::ZERO
+                },
                 max_queue_age: Duration::from_secs(30),
                 deadline_reserve: Duration::ZERO,
                 memory: Resources {
-                    host_bytes: HOST_BYTES_PER_ITEM + NATIVE_RUNTIME_OVERHEAD_BYTES,
+                    host_bytes: self.owner.max_batch() as u64
+                        * (HOST_BYTES_PER_ITEM + NATIVE_RUNTIME_OVERHEAD_BYTES),
                     device_bytes: self
                         .owner
                         .admission_policy()
                         .execution_resources()
-                        .device_bytes,
+                        .device_bytes
+                        .saturating_mul(self.owner.max_batch() as u64),
                     pinned_bytes: self
                         .owner
                         .admission_policy()
@@ -1520,6 +1594,7 @@ impl EvaluatorFactory for NativeSessionFactory {
             evidence: self.evidence.clone(),
             submissions: 0,
             pending: None,
+            other_pending: std::collections::VecDeque::new(),
             observation_error: None,
         }))
     }
@@ -1528,6 +1603,11 @@ impl EvaluatorFactory for NativeSessionFactory {
 macro_rules! delegate_native_factory {
     ($factory:ty) => {
         impl EvaluatorFactory for $factory {
+            #[cfg(feature = "experimental-batch")]
+            fn parallelism(&self) -> usize {
+                self.inner.parallelism()
+            }
+
             #[cfg(feature = "experimental-notify")]
             fn completion_signal(&self) -> Option<rz_runtime::CompletionSignal> {
                 self.inner.completion_signal()
@@ -1577,9 +1657,17 @@ struct NativeRuntime {
     evidence: NativeEvidenceHandle,
     submissions: u64,
     pending: Option<EvalContext>,
+    other_pending: std::collections::VecDeque<EvalContext>,
     observation_error: Option<ContractError>,
 }
 impl NativeRuntime {
+    fn remove_pending(&mut self, context: EvalContext) {
+        if self.pending == Some(context) {
+            self.pending = self.other_pending.pop_front();
+        } else if let Some(index) = self.other_pending.iter().position(|c| *c == context) {
+            self.other_pending.remove(index);
+        }
+    }
     fn collect_observations(&mut self, drain_discarded: u64) -> Result<(), ContractError> {
         let scheduler = self.evaluator.take_observations();
         let delivery = self.evaluator.take_delivery_observations();
@@ -1645,8 +1733,21 @@ impl Evaluator<RulesState> for NativeRuntime {
             ));
         }
         self.submissions += 1;
-        self.pending = Some(request.context());
+        if usize::from(self.pending.is_some()) + self.other_pending.len() >= self.owner.max_batch()
+        {
+            return Err(error(
+                ErrorCode::ResourceExhausted,
+                Stage::Admission,
+                "native pending limit reached",
+            ));
+        }
+        let context = request.context();
         let result = self.evaluator.submit(request);
+        if result.is_ok() {
+            if let Some(previous) = self.pending.replace(context) {
+                self.other_pending.push_back(previous);
+            }
+        }
         if let Err(error) = self.collect_observations(0) {
             self.observation_error.get_or_insert(error);
             let _ = self.owner.try_close_admission(error);
@@ -1661,7 +1762,10 @@ impl Evaluator<RulesState> for NativeRuntime {
     }
     fn poll(&mut self) -> Option<EvalResult> {
         if let Some(error) = self.observation_error
-            && let Some(request) = self.pending.take()
+            && let Some(request) = self
+                .pending
+                .take()
+                .or_else(|| self.other_pending.pop_front())
         {
             return Some(EvalResult::Failed(EvalFailure {
                 context: CompletionContext {
@@ -1674,16 +1778,20 @@ impl Evaluator<RulesState> for NativeRuntime {
         }
         if let Err(error) = self.refresh() {
             self.authority.cancel();
-            return self.pending.take().map(|request| {
-                EvalResult::Failed(EvalFailure {
-                    context: CompletionContext {
-                        request,
-                        execution: None,
-                    },
-                    error,
-                    recovery: RecoveryOutcome::NotAttempted,
-                })
-            });
+            return self
+                .pending
+                .take()
+                .or_else(|| self.other_pending.pop_front())
+                .map(|request| {
+                    EvalResult::Failed(EvalFailure {
+                        context: CompletionContext {
+                            request,
+                            execution: None,
+                        },
+                        error,
+                        recovery: RecoveryOutcome::NotAttempted,
+                    })
+                });
         }
         let result = self.evaluator.poll();
         let collection = self.evidence.collect(&self.owner);
@@ -1694,7 +1802,7 @@ impl Evaluator<RulesState> for NativeRuntime {
         if let Some(EvalResult::Completed(output)) = &result
             && let Err(error) = self.evidence.record_completed(output)
         {
-            self.pending = None;
+            self.remove_pending(output.context);
             return Some(EvalResult::Failed(EvalFailure {
                 context: CompletionContext {
                     request: output.context,
@@ -1704,21 +1812,32 @@ impl Evaluator<RulesState> for NativeRuntime {
                 recovery: RecoveryOutcome::Failed,
             }));
         }
-        if result.is_some() {
-            self.pending = None;
-            return result;
+        if let Some(result) = result {
+            let context = match &result {
+                EvalResult::Completed(output) => output.context,
+                EvalResult::Canceled(c) | EvalResult::Expired(c) | EvalResult::Stale(c) => {
+                    c.request
+                }
+                EvalResult::Failed(f) => f.context.request,
+            };
+            self.remove_pending(context);
+            return Some(result);
         }
         if let Err(error) = collection {
-            return self.pending.take().map(|request| {
-                EvalResult::Failed(EvalFailure {
-                    context: CompletionContext {
-                        request,
-                        execution: None,
-                    },
-                    error,
-                    recovery: RecoveryOutcome::NotAttempted,
-                })
-            });
+            return self
+                .pending
+                .take()
+                .or_else(|| self.other_pending.pop_front())
+                .map(|request| {
+                    EvalResult::Failed(EvalFailure {
+                        context: CompletionContext {
+                            request,
+                            execution: None,
+                        },
+                        error,
+                        recovery: RecoveryOutcome::NotAttempted,
+                    })
+                });
         }
         None
     }

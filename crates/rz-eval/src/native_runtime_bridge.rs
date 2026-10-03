@@ -126,6 +126,9 @@ struct OwnerState {
     epoch: Option<ProcessEpoch>,
     last_execution: Option<u64>,
     last_request: Option<u64>,
+    batch_scope: Option<(GameGeneration, RootGeneration)>,
+    batch_floor: u64,
+    batch_seen: Vec<u64>,
     diagnostics: Vec<DiagnosticSlot>,
     active: bool,
     shutdown_started: bool,
@@ -149,6 +152,7 @@ enum DiagnosticSlot {
 }
 
 struct OwnerInner {
+    max_batch: usize,
     #[cfg(feature = "experimental-notify")]
     signal: rz_runtime::CompletionSignal,
     projection: ClassicalProjection,
@@ -191,6 +195,31 @@ impl NativeWorkerOwner {
         diagnostic_capacity: usize,
         admission_policy: NativeAdmissionPolicy,
     ) -> Result<Self, PhysicalFailure> {
+        Self::from_worker_limit(worker, projection, diagnostic_capacity, admission_policy, 1)
+    }
+    #[cfg(feature = "experimental-batch")]
+    pub fn from_worker_batched(
+        worker: NativePhysicalWorker,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+        admission_policy: NativeAdmissionPolicy,
+        max_batch: usize,
+    ) -> Result<Self, PhysicalFailure> {
+        Self::from_worker_limit(
+            worker,
+            projection,
+            diagnostic_capacity,
+            admission_policy,
+            max_batch,
+        )
+    }
+    fn from_worker_limit(
+        worker: NativePhysicalWorker,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+        admission_policy: NativeAdmissionPolicy,
+        max_batch: usize,
+    ) -> Result<Self, PhysicalFailure> {
         let model = projection.model();
         if diagnostic_capacity == 0 || diagnostic_capacity > MAX_DIAGNOSTICS {
             return Err(failure(
@@ -201,7 +230,9 @@ impl NativeWorkerOwner {
             .into());
         }
         if model.full_steps() != 1
-            || model.max_batch_items() != 1
+            || model.max_batch_items() != max_batch
+            || !(1..=16).contains(&max_batch)
+            || (max_batch > 1 && !cfg!(feature = "experimental-batch"))
             || !model.supports(PrecisionProfile::Fp32)
         {
             return Err(failure(
@@ -217,6 +248,7 @@ impl NativeWorkerOwner {
             .map_err(allocation_failure)?;
         diagnostics.resize_with(diagnostic_capacity, || DiagnosticSlot::Free);
         Ok(Self(Arc::new(OwnerInner {
+            max_batch,
             #[cfg(feature = "experimental-notify")]
             signal: worker.completion_signal(),
             projection,
@@ -228,6 +260,9 @@ impl NativeWorkerOwner {
                 epoch: None,
                 last_execution: None,
                 last_request: None,
+                batch_scope: None,
+                batch_floor: 0,
+                batch_seen: Vec::new(),
                 diagnostics,
                 active: false,
                 shutdown_started: false,
@@ -247,8 +282,26 @@ impl NativeWorkerOwner {
         projection: ClassicalProjection,
         diagnostic_capacity: usize,
     ) -> Result<Self, PhysicalFailure> {
+        Self::from_onnx_limit(backend, projection, diagnostic_capacity, 1)
+    }
+    #[cfg(all(feature = "onnx", feature = "experimental-batch"))]
+    pub fn from_onnx_batched(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+    ) -> Result<Self, PhysicalFailure> {
+        let max_batch = backend.config().max_batch;
+        Self::from_onnx_limit(backend, projection, diagnostic_capacity, max_batch)
+    }
+    #[cfg(feature = "onnx")]
+    fn from_onnx_limit(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+        max_batch: usize,
+    ) -> Result<Self, PhysicalFailure> {
         if !matches!(backend.config().provider, crate::onnx::Provider::Cpu)
-            || backend.config().max_batch != 1
+            || backend.config().max_batch != max_batch
             || projection.backend().0 != backend.identity()
             || projection.model().handle().manifest.0 != backend.asset_identity()
         {
@@ -260,7 +313,13 @@ impl NativeWorkerOwner {
             .into());
         }
         let worker = crate::contracts::spawn_onnx_worker(backend)?;
-        let mut owner = Self::from_worker(worker, projection, diagnostic_capacity)?;
+        let mut owner = Self::from_worker_limit(
+            worker,
+            projection,
+            diagnostic_capacity,
+            NativeAdmissionPolicy::Cpu,
+            max_batch,
+        )?;
         // No clone has escaped this constructor; the actual origin is immutable.
         Arc::get_mut(&mut owner.0)
             .expect("new native owner is exclusively owned")
@@ -278,13 +337,30 @@ impl NativeWorkerOwner {
         projection: ClassicalProjection,
         diagnostic_capacity: usize,
     ) -> Result<Self, PhysicalFailure> {
-        use crate::onnx::Provider;
+        Self::from_cuda_onnx_limit(backend, projection, diagnostic_capacity, 1)
+    }
+    #[cfg(all(feature = "onnx", feature = "experimental-batch"))]
+    pub fn from_cuda_onnx_batched(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+    ) -> Result<Self, PhysicalFailure> {
+        let max_batch = backend.config().max_batch;
+        Self::from_cuda_onnx_limit(backend, projection, diagnostic_capacity, max_batch)
+    }
+    #[cfg(feature = "onnx")]
+    fn from_cuda_onnx_limit(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+        max_batch: usize,
+    ) -> Result<Self, PhysicalFailure> {
         // Preserve the actual native cause of an earlier uncertain Run before
         // reporting a generic profile mismatch. Drop retains its session/input.
         if let Some(cause) = backend.physical_quarantine_cause() {
             return Err(cause.clone().into());
         }
-        let Provider::Cuda {
+        let crate::onnx::Provider::Cuda {
             device_id,
             arena_bytes,
         } = backend.config().provider
@@ -298,7 +374,7 @@ impl NativeWorkerOwner {
         };
         if device_id != 0
             || arena_bytes as u64 != NATIVE_CUDA_ADMISSION_BYTES
-            || backend.config().max_batch != 1
+            || backend.config().max_batch != max_batch
             || backend.config().intra_threads != 1
             || projection.backend().0 != backend.identity()
             || projection.model().handle().manifest.0 != backend.asset_identity()
@@ -339,11 +415,12 @@ impl NativeWorkerOwner {
         // Loader failure stays typed and latched, with all native pins retained.
         backend.verify_cuda_runtime_mappings()?;
         let worker = crate::contracts::spawn_onnx_worker(backend)?;
-        let mut owner = Self::from_worker_with_admission(
+        let mut owner = Self::from_worker_limit(
             worker,
             projection,
             diagnostic_capacity,
             NativeAdmissionPolicy::CudaOneGiB,
+            max_batch,
         )?;
         let inner = Arc::get_mut(&mut owner.0).expect("new native owner is exclusively owned");
         inner.origin = NativeWorkerOrigin::CudaOnnx;
@@ -368,6 +445,9 @@ impl NativeWorkerOwner {
         self.0.signal.clone()
     }
 
+    pub fn max_batch(&self) -> usize {
+        self.0.max_batch
+    }
     pub fn projection(&self) -> &ClassicalProjection {
         &self.0.projection
     }
@@ -569,6 +649,7 @@ pub struct NativeRuntimeLease<C: ContractClock> {
     slot: usize,
     ticket: (ExecutionId, RequestId),
     context: CompletionContext,
+    contexts: Vec<CompletionContext>,
     results: NativeDelivery<C>,
     consumed: bool,
     quarantined: bool,
@@ -629,7 +710,7 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
         execution: &ExecutionId,
         requests: &[Arc<RuntimeRequest<RulesState>>],
     ) -> Result<Self::Lease, ContractError> {
-        if requests.len() != 1 {
+        if requests.is_empty() || requests.len() > self.owner.max_batch() {
             return Err(failure(
                 ErrorCode::UnsupportedContract,
                 Stage::Admission,
@@ -638,6 +719,20 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
         }
         let request = requests[0].eval();
         let context = request.context();
+        if requests.iter().any(|item| {
+            let c = item.eval().context();
+            c.request.epoch != execution.epoch
+                || c.selection.epoch != execution.epoch
+                || c.game != context.game
+                || c.root != context.root
+                || item.execution().is_some_and(|bound| bound != *execution)
+        }) {
+            return Err(failure(
+                ErrorCode::IdentityMismatch,
+                Stage::Admission,
+                "batch epochs/scopes/execution bindings differ",
+            ));
+        }
         if execution.epoch != self.clock.domain().0
             || context.request.epoch != execution.epoch
             || context.selection.epoch != execution.epoch
@@ -649,6 +744,20 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
             ));
         }
         let ticket = (*execution, context.request);
+        let mut contexts = Vec::new();
+        contexts
+            .try_reserve_exact(requests.len() - 1)
+            .map_err(|_| {
+                failure(
+                    ErrorCode::ResourceExhausted,
+                    Stage::Admission,
+                    "batch completion context allocation failed",
+                )
+            })?;
+        contexts.extend(requests.iter().skip(1).map(|item| CompletionContext {
+            request: item.eval().context(),
+            execution: Some(*execution),
+        }));
         let slot = {
             let mut state = self.owner.state();
             if let Some(error) = state.closed {
@@ -661,9 +770,10 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
                 || state
                     .last_execution
                     .is_some_and(|last| execution.sequence <= last)
-                || state
-                    .last_request
-                    .is_some_and(|last| context.request.sequence <= last)
+                || (self.owner.max_batch() == 1
+                    && state
+                        .last_request
+                        .is_some_and(|last| context.request.sequence <= last))
             {
                 return Err(failure(
                     ErrorCode::IdentityMismatch,
@@ -671,9 +781,51 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
                     "native physical identity reused or moved backwards",
                 ));
             }
+            if self.owner.max_batch() > 1 {
+                let scope = (context.game, context.root);
+                if state.batch_scope != Some(scope) {
+                    state.batch_floor = state.last_request.unwrap_or(0);
+                    state.batch_seen.clear();
+                    state.batch_scope = Some(scope);
+                }
+                if state.batch_seen.len() + requests.len() > 1024 {
+                    return Err(failure(
+                        ErrorCode::ResourceExhausted,
+                        Stage::Admission,
+                        "experimental root physical request ledger exhausted",
+                    ));
+                }
+                state.batch_seen.try_reserve(requests.len()).map_err(|_| {
+                    failure(
+                        ErrorCode::ResourceExhausted,
+                        Stage::Admission,
+                        "batch identity allocation failed",
+                    )
+                })?;
+                let mut ids = Vec::with_capacity(requests.len());
+                for item in requests {
+                    let sequence = item.eval().context().request.sequence;
+                    if sequence <= state.batch_floor
+                        || state.batch_seen.contains(&sequence)
+                        || ids.contains(&sequence)
+                    {
+                        return Err(failure(
+                            ErrorCode::IdentityMismatch,
+                            Stage::Admission,
+                            "batch physical request identity reused",
+                        ));
+                    }
+                    ids.push(sequence);
+                }
+                state.batch_seen.extend(ids);
+            }
             state.epoch = Some(execution.epoch);
             state.last_execution = Some(execution.sequence);
-            state.last_request = Some(context.request.sequence);
+            state.last_request = requests
+                .iter()
+                .map(|r| r.eval().context().request.sequence)
+                .chain(state.last_request)
+                .max();
             let Some(slot) = state
                 .diagnostics
                 .iter()
@@ -692,33 +844,42 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
             slot
         };
         let prepared: PreparedDispatch<C> = (|| {
-            request
-                .deadline()
-                .accepts(self.clock.domain(), self.clock.now())?;
-            if request.cancel_token().is_canceled() {
-                return Err(failure(
-                    ErrorCode::Canceled,
-                    Stage::Admission,
-                    "native request canceled before launch",
-                )
-                .into());
+            let mut items = Vec::new();
+            items
+                .try_reserve_exact(requests.len())
+                .map_err(allocation_failure)?;
+            for item in requests {
+                let request = item.eval();
+                request
+                    .deadline()
+                    .accepts(self.clock.domain(), self.clock.now())?;
+                if request.cancel_token().is_canceled() {
+                    return Err(failure(
+                        ErrorCode::Canceled,
+                        Stage::Admission,
+                        "native batch canceled before preparation",
+                    )
+                    .into());
+                }
+                items.push(self.owner.projection().prepare(Arc::clone(request))?);
             }
-            let prepared = self.owner.projection().prepare(Arc::clone(request))?;
-            let batch = PreparedBatch::new(*execution, vec![prepared])?;
+            let batch = PreparedBatch::new(*execution, items)?;
             let mut results = Vec::new();
-            results.try_reserve_exact(1).map_err(allocation_failure)?;
-            // Encoding/preparation costs wall time. Repeat deadline/cancel checks
-            // at the final handoff; no implicit grace and no native termination.
-            request
-                .deadline()
-                .accepts(self.clock.domain(), self.clock.now())?;
-            if request.cancel_token().is_canceled() {
-                return Err(failure(
-                    ErrorCode::Canceled,
-                    Stage::Admission,
-                    "native request canceled during preparation",
-                )
-                .into());
+            results
+                .try_reserve_exact(requests.len())
+                .map_err(allocation_failure)?;
+            for item in requests {
+                item.eval()
+                    .deadline()
+                    .accepts(self.clock.domain(), self.clock.now())?;
+                if item.eval().cancel_token().is_canceled() {
+                    return Err(failure(
+                        ErrorCode::Canceled,
+                        Stage::Admission,
+                        "native batch canceled during preparation",
+                    )
+                    .into());
+                }
             }
             let mut state = self.owner.state();
             if let Some(error) = state.closed {
@@ -780,6 +941,7 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
                 request: context,
                 execution: Some(*execution),
             },
+            contexts,
             results,
             consumed: false,
             quarantined: false,
@@ -829,10 +991,8 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
             PhysicalPoll::Ready(result) => result,
         };
         lease.consumed = true;
-        let output = match result {
-            Ok(mut outputs) if outputs.len() == 1 => {
-                Ok(outputs.pop().expect("validated single output"))
-            }
+        let outputs = match result {
+            Ok(outputs) if outputs.len() == 1 + lease.contexts.len() => Ok(outputs),
             Ok(outputs) => Err(BackendError::new(
                 FailureKind::BackendFailure,
                 FailureStage::Output,
@@ -840,15 +1000,23 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
             )
             .with_diagnostic(
                 "NativeOutputCount",
-                &format!("expected=1 actual={}", outputs.len()),
+                &format!("expected={} actual={}", lease.contexts.len(), outputs.len()),
             )
             .into()),
             Err(error) => Err(error),
         };
-        let output = match output {
-            Ok(output) => {
+        match outputs {
+            Ok(outputs) => {
                 self.owner.state().diagnostics[lease.slot] = DiagnosticSlot::Free;
-                Ok(output)
+                for (context, output) in std::iter::once(&lease.context)
+                    .chain(&lease.contexts)
+                    .zip(outputs)
+                {
+                    lease.results.push(BackendResult {
+                        request_id: context.request.request,
+                        output: Ok(output),
+                    });
+                }
             }
             Err(error) => {
                 let contract = error.contract;
@@ -861,14 +1029,15 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
                         failure: error,
                     },
                 );
-                Err(contract)
+                for context in std::iter::once(&lease.context).chain(&lease.contexts) {
+                    lease.results.push(BackendResult {
+                        request_id: context.request.request,
+                        output: Err(contract),
+                    });
+                }
             }
-        };
+        }
         self.owner.state().active = false;
-        lease.results.push(BackendResult {
-            request_id: lease.ticket.1,
-            output,
-        });
         Poll::Ready(std::mem::take(&mut lease.results))
     }
 }

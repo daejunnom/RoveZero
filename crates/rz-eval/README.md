@@ -273,3 +273,13 @@ Run/전송/fence 오류에서 CUDA completion이 불확실하면 binding·input�
 격리 보존합니다. `binding_runs()`는 성공한 synchronous 호출 수이지 실제 GPU
 capture/replay의 관측 증거가 아닙니다. ORT buffer 실제 재사용·GPU 수치·capture/replay·
 지연/VRAM은 장비 검증 항목이며 CPU 계약 테스트로 통과 처리하지 않습니다.
+
+OPT-12의 `experimental-batch`는 explicit `NativeWorkerOwner::from_worker_batched`
+또는 `from_onnx_batched`/`from_cuda_onnx_batched`와 연결합니다. 한 물리 worker의
+실제 PreparedBatch(최대 16개), 공유 ExecutionId, 각 요청의 독립 policy/WDL 변환을
+사용합니다. 배치 일부 논리 취소는 나머지 요청을 물리 종료 전 해제하지 않습니다.
+native UCI는 `--experimental-batch=N`로 B/D/C의 폭을 함께 설정하고 최대 batch
+대기 200µs를 자체 시간에 포함합니다. Graph의 고정 B1 및 기존 V1 attestation과
+동시에 켤 수 없습니다. mixed-legal 배치는 C의 전체 raw heads 지원을 전제로만
+D에서 명시적으로 활성화합니다. 물리 ID ledger는 root당 최대 1024개로 제한하며
+서로 다른 legal 수 때문에 dispatch 순서가 달라도 중복 ID를 거절합니다.

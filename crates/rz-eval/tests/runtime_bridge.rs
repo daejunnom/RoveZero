@@ -745,3 +745,43 @@ fn actual_rules_projection_preserves_unknown_history_repetition_promotions_and_c
         .collect();
     assert_eq!(castles, vec![(2, 97), (6, 103)]);
 }
+
+#[cfg(feature = "experimental-raw-cache")]
+#[test]
+fn rejected_request_cannot_stage_a_late_physical_raw_result() {
+    for canceled in [true, false] {
+        let fixture = Fixture::new(vec![step(&[10], 10, None)]);
+        let request = fixture.request(1, if canceled { 100 } else { 5 });
+        let clock = fixture.clock.clone();
+        let projection = fixture.projection.clone();
+        projection
+            .configure_raw_cache(rz_eval::raw_cache::RawCacheLimits {
+                max_entries: 2,
+                max_bytes: 128 * 1024,
+            })
+            .unwrap();
+        let adapter =
+            ContractsAdapter::new(SharedScope::new(scope(&request)), clock.clone(), 1).unwrap();
+        let mut runtime =
+            ContractEvaluator::new(adapter, fixture.backend, runtime_limits(), 32).unwrap();
+        runtime.set_raw_reuse(Box::new(projection.raw_cache_provider()));
+        runtime.submit(request.clone()).unwrap();
+        runtime.pump();
+        clock.set(5);
+        if canceled {
+            runtime.cancel(request.context().request).unwrap();
+        }
+        assert!(matches!(
+            runtime.poll(),
+            Some(EvalResult::Canceled(_) | EvalResult::Expired(_))
+        ));
+        assert!(runtime.state().reserved.host_bytes > 0);
+        clock.set(10);
+        runtime.pump();
+        assert_eq!(runtime.state().reserved, Resources::default());
+        let cache = projection.raw_cache_stats().unwrap();
+        assert_eq!(cache.entries, 0);
+        assert_eq!(cache.staged, 0);
+        assert_eq!(cache.retained_bytes, 0);
+    }
+}
