@@ -29,6 +29,25 @@ live-view 검사는 매번 수행한다. 이 cache는 모델 평가 cache나 증
 `cargo test -p rz-position --features experimental-history-digest --locked`로 별도 검사한다.
 두 feature는 독립적으로 비교하며 `--all-features`는 함께 켠 경로도 검사한다.
 
+`examples/performance_probe.rs`는 계약을 사용하는 CPU 진단 예제다. 이력 1/17/65/129/257의
+진행 상태에서 classify, 새 owner+export, 같은 상태의 재-export, fork+export를 구분한다.
+저장된 256-ply trace는 독립 참조로 만든 합법 fixture(seed 0)이며 terminal 뒤의 이동을
+이어 붙이지 않는다. `witness`는 특수 수·청구·전체 이력·digest·수 순서와 make/unmake를
+출력한다. 새 owner ID는 프로세스 안에서 중복 없이 발급하고 비교 출력에서는 정규화한다.
+
+```sh
+cargo build --release -p rz-position --example performance_probe --features contracts --locked
+# 빌드별 실행 파일을 따로 보존한 뒤 witness 출력 전체를 대조한다.
+"$CARGO_TARGET_DIR/release/examples/performance_probe" witness
+"$CARGO_TARGET_DIR/release/examples/performance_probe" time 1000
+```
+
+예제는 실행마다 20회 warm-up과 지정 횟수(상한 10,000)의 호출을 수행한다. 라이브러리
+기본 실행에는 연결되지 않는다. 내부 호출 수를 독립 표본으로 세지 않으며, feature별
+바이너리를 먼저 빌드한 뒤 다른 build/test와 겹치지 않게 직렬 반복 비교한다. 원시 출력은
+저장소 밖에 보존하고 정식 탐색·GPU·강도 결과와 구분한다. 이번 검사·측정 상태는
+[성능 개선 계획](../../docs/research/PERFORMANCE-OPTIMIZATION-PLAN.md)에 기록한다.
+
 ## 제공하는 동작
 
 - `Position::startpos/from_fen`: 64칸·bitboard, 차례·권리·raw EP·u32 카운터를 보존한다.

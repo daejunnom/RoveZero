@@ -20,3 +20,7 @@ experimental-history-digest = ["contracts"]
 [dependencies]
 rz-contracts = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
+
+[[example]]
+name = "performance_probe"
+required-features = ["contracts"]
