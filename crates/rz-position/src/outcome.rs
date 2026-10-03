@@ -99,10 +99,9 @@ impl Position {
         legal: &[BoardMove],
     ) -> Result<PositionClassification, PositionError> {
         #[cfg(not(feature = "experimental-claim-preview"))]
-        let (known_repetitions, repetition_complete) = (
-            self.known_repetition_count(),
-            self.repetition_history_complete(),
-        );
+        let known_repetitions = self.known_repetition_count();
+        #[cfg(not(feature = "experimental-claim-preview"))]
+        let repetition_complete = self.repetition_history_complete();
         #[cfg(feature = "experimental-claim-preview")]
         let (known_repetitions, repetition_complete) = {
             let evidence = self.repetition_evidence();
@@ -155,19 +154,19 @@ impl Position {
         if play_status == PlayStatus::Ongoing {
             for &mv in legal {
                 #[cfg(not(feature = "experimental-claim-preview"))]
-                let (count, complete, halfmove) = {
-                    let child = self.preview_generated(mv)?;
-                    (
-                        child.known_repetition_count(),
-                        child.repetition_history_complete(),
-                        child.halfmove_clock(),
-                    )
-                };
+                let child = self.preview_generated(mv)?;
+                #[cfg(not(feature = "experimental-claim-preview"))]
+                let repetition = repetition_availability(
+                    child.known_repetition_count(),
+                    3,
+                    child.repetition_history_complete(),
+                );
                 #[cfg(feature = "experimental-claim-preview")]
                 let (count, complete, halfmove) = {
                     let (evidence, halfmove) = self.intended_claim_evidence(mv)?;
                     (evidence.count, evidence.complete, halfmove)
                 };
+                #[cfg(feature = "experimental-claim-preview")]
                 let repetition = repetition_availability(count, 3, complete);
                 if repetition != Availability::Unavailable {
                     claim_availability.push(DrawClaim {
@@ -176,6 +175,8 @@ impl Position {
                         availability: repetition,
                     });
                 }
+                #[cfg(not(feature = "experimental-claim-preview"))]
+                let halfmove = child.halfmove_clock();
                 if halfmove >= 100 {
                     claim_availability.push(DrawClaim {
                         reason: ClaimReason::FiftyMove,

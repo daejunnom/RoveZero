@@ -498,23 +498,31 @@ impl Position {
     }
     /// No state escapes until all history, revision and counter checks pass.
     fn prepare_generated(&self, mv: BoardMove) -> Result<GeneratedChild, PositionError> {
-        let checked = self.check_generated(mv)?;
-        let history = Arc::new(HistoryNode {
-            state: checked.state.clone(),
-            repetition: checked.repetition,
-            previous: Some(self.history.clone()),
-            len: self.history.len + 1,
-            irreversible: checked.irreversible,
-        });
-        Ok(GeneratedChild {
-            state: checked.state,
-            history,
-            revision: checked.revision,
-            kind: checked.kind,
+        self.with_checked_transition(mv, |checked| {
+            let history = Arc::new(HistoryNode {
+                state: checked.state.clone(),
+                repetition: checked.repetition,
+                previous: Some(self.history.clone()),
+                len: self.history.len + 1,
+                irreversible: checked.irreversible,
+            });
+            GeneratedChild {
+                state: checked.state,
+                history,
+                revision: checked.revision,
+                kind: checked.kind,
+            }
         })
     }
 
-    fn check_generated(&self, mv: BoardMove) -> Result<CheckedTransition, PositionError> {
+    // Consume the checked state before wrapping the final result. This avoids
+    // carrying a second large Result<CheckedTransition, _> through callers;
+    // the private FnOnce is monomorphized and introduces no heap allocation.
+    fn with_checked_transition<T>(
+        &self,
+        mv: BoardMove,
+        finish: impl FnOnce(CheckedTransition) -> T,
+    ) -> Result<T, PositionError> {
         if self.history.len >= self.limits.max_history_positions {
             return Err(PositionError::ResourceLimit("history positions"));
         }
@@ -545,7 +553,7 @@ impl Position {
         }
         let irreversible =
             piece.kind == PieceKind::Pawn || capture || child_state.castling != self.state.castling;
-        Ok(CheckedTransition {
+        Ok(finish(CheckedTransition {
             repetition: RepetitionIdentity::of(&child_state),
             state: child_state,
             revision,
@@ -557,7 +565,7 @@ impl Position {
                 en_passant: ep,
                 promotion: mv.promotion.is_some(),
             },
-        })
+        }))
     }
     fn install_generated(&mut self, generated: GeneratedChild) {
         self.state = generated.state;
@@ -621,16 +629,17 @@ impl Position {
         &self,
         mv: BoardMove,
     ) -> Result<(RepetitionEvidence, u32), PositionError> {
-        let checked = self.check_generated(mv)?;
-        let evidence = if checked.irreversible {
-            RepetitionEvidence {
-                count: 1,
-                complete: true,
-            }
-        } else {
-            repetition_evidence(Some(self.history.as_ref()), &checked.repetition, 1)
-        };
-        Ok((evidence, checked.state.halfmove))
+        self.with_checked_transition(mv, |checked| {
+            let evidence = if checked.irreversible {
+                RepetitionEvidence {
+                    count: 1,
+                    complete: true,
+                }
+            } else {
+                repetition_evidence(Some(self.history.as_ref()), &checked.repetition, 1)
+            };
+            (evidence, checked.state.halfmove)
+        })
     }
     pub fn known_repetition_count(&self) -> usize {
         let mut count = 0;
