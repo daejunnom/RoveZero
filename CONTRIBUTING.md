@@ -65,10 +65,15 @@ GPU 없이 진행할 수 있습니다. 실제 목표 GPU 인수의 미실행 때
 
 CUDA가 없는 개발 환경에서는 예상한 capability 부재를 기록합니다. GPU 요구 모드를
 조용히 CPU로 대체하지 않고 명시 CPU 모드를 별도 backend/run ID로 실행합니다.
-CPU/mock CI의 통과와 GPU job의 skip·미실행을 분리합니다. TASK-I02 총괄은 목표
-RTX 4050 6GB의 실제 추론·계측·정식 GPU 대국과 실제 학습을 지원 환경에서 별도
+CPU/mock CI의 통과와 GPU job의 skip·미실행을 분리합니다. TASK-I02 총괄은 지정한
+GPU의 실제 추론·계측·정식 GPU 대국과 실제 학습을 지원 환경에서 별도
 인수하며, 코드 완료·CPU 참조·GPU 인수·학습 완료를 각각 보고합니다. 이 규약 공유는
 새 실험이나 유료 GPU 실행을 승인하지 않습니다.
+
+초기 RTX 4050 검증은 장비별 이력으로 보존합니다. 사용자 후속 지시에 따라 GPU
+벤치마크는 외부 RunPod 환경에서 준비합니다. GPU 종류·비용·실행 시간·저장소를
+확정하기 전에는 [준비 계획](docs/research/RUNPOD-BENCHMARK-PLAN.md)의 후보를
+실제 배포나 검증 완료로 기록하지 않습니다.
 
 독립 Linux 클라우드는 Windows/WSL 내보내기 경로를 요구하지 않습니다. 저장소 밖의
 작업 전용 output root·소유자·보존 기간·작업 종료 전 회수 경로를 명시합니다.
