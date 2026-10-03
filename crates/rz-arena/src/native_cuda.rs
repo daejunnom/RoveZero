@@ -8,9 +8,11 @@ use crate::{
     ArenaError, NativeLaunchOwner, NativePairFailure, NativePairOutput, NativePairReceipt,
     NativePreparationFailure,
 };
+#[cfg(target_os = "linux")]
+use rz_experiments::CudaNativeLaunchSpecV1;
 use rz_experiments::{
-    ArtifactRef, CudaBundleFileRoleV1, CudaNativeLaunchSpecV1, LockedCudaIntegrationPairSpecV1,
-    NativeEngineRole, NativeResourceBudgetV1,
+    ArtifactRef, CudaBundleFileRoleV1, LockedCudaIntegrationPairSpecV1, NativeEngineRole,
+    NativeResourceBudgetV1,
 };
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::atomic::AtomicBool};
