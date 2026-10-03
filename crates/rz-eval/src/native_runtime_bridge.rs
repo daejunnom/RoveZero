@@ -17,6 +17,7 @@ use rz_runtime::{Backend, BackendResult, Resources};
 use std::{
     sync::{Arc, Mutex, MutexGuard, TryLockError},
     task::Poll,
+    time::Instant,
 };
 
 pub type NativePhysicalWorker =
@@ -153,6 +154,7 @@ struct OwnerInner {
     origin: NativeWorkerOrigin,
     admission_policy: NativeAdmissionPolicy,
     cuda_metadata: Option<NativeCudaMetadata>,
+    source_trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
     state: Mutex<OwnerState>,
 }
 
@@ -219,6 +221,7 @@ impl NativeWorkerOwner {
             origin: NativeWorkerOrigin::Injected,
             admission_policy,
             cuda_metadata: None,
+            source_trace: None,
             state: Mutex::new(OwnerState {
                 worker,
                 epoch: None,
@@ -243,6 +246,16 @@ impl NativeWorkerOwner {
         projection: ClassicalProjection,
         diagnostic_capacity: usize,
     ) -> Result<Self, PhysicalFailure> {
+        Self::from_onnx_profiled(backend, projection, diagnostic_capacity, None)
+    }
+
+    #[cfg(feature = "onnx")]
+    pub fn from_onnx_profiled(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+        trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
+    ) -> Result<Self, PhysicalFailure> {
         if !matches!(backend.config().provider, crate::onnx::Provider::Cpu)
             || backend.config().max_batch != 1
             || projection.backend().0 != backend.identity()
@@ -255,12 +268,12 @@ impl NativeWorkerOwner {
             )
             .into());
         }
-        let worker = crate::contracts::spawn_onnx_worker(backend)?;
+        let worker = crate::contracts::spawn_onnx_worker_profiled(backend, trace.clone())?;
         let mut owner = Self::from_worker(worker, projection, diagnostic_capacity)?;
         // No clone has escaped this constructor; the actual origin is immutable.
-        Arc::get_mut(&mut owner.0)
-            .expect("new native owner is exclusively owned")
-            .origin = NativeWorkerOrigin::CpuOnnx;
+        let inner = Arc::get_mut(&mut owner.0).expect("new native owner is exclusively owned");
+        inner.origin = NativeWorkerOrigin::CpuOnnx;
+        inner.source_trace = trace;
         Ok(owner)
     }
 
@@ -273,6 +286,16 @@ impl NativeWorkerOwner {
         backend: crate::onnx::OnnxBackend,
         projection: ClassicalProjection,
         diagnostic_capacity: usize,
+    ) -> Result<Self, PhysicalFailure> {
+        Self::from_cuda_onnx_profiled(backend, projection, diagnostic_capacity, None)
+    }
+
+    #[cfg(feature = "onnx")]
+    pub fn from_cuda_onnx_profiled(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+        trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
     ) -> Result<Self, PhysicalFailure> {
         use crate::onnx::Provider;
         // Preserve the actual native cause of an earlier uncertain Run before
@@ -334,7 +357,7 @@ impl NativeWorkerOwner {
         // A successful historical probe alone does not authorize current maps.
         // Loader failure stays typed and latched, with all native pins retained.
         backend.verify_cuda_runtime_mappings()?;
-        let worker = crate::contracts::spawn_onnx_worker(backend)?;
+        let worker = crate::contracts::spawn_onnx_worker_profiled(backend, trace.clone())?;
         let mut owner = Self::from_worker_with_admission(
             worker,
             projection,
@@ -344,6 +367,7 @@ impl NativeWorkerOwner {
         let inner = Arc::get_mut(&mut owner.0).expect("new native owner is exclusively owned");
         inner.origin = NativeWorkerOrigin::CudaOnnx;
         inner.cuda_metadata = Some(metadata);
+        inner.source_trace = trace;
         Ok(owner)
     }
 
@@ -361,6 +385,10 @@ impl NativeWorkerOwner {
 
     pub fn projection(&self) -> &ClassicalProjection {
         &self.0.projection
+    }
+
+    pub fn source_trace(&self) -> Option<&rz_telemetry::source::SourceJournal<CompletionContext>> {
+        self.0.source_trace.as_ref()
     }
 
     pub fn admission_error(&self) -> Option<ContractError> {
@@ -694,7 +722,21 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
                 )
                 .into());
             }
-            let prepared = self.owner.projection().prepare(Arc::clone(request))?;
+            let encoding_started = self.owner.source_trace().map(|_| Instant::now());
+            let prepared = self.owner.projection().prepare(Arc::clone(request));
+            if let (Some(trace), Some(start)) = (self.owner.source_trace(), encoding_started) {
+                trace.record(
+                    Some(CompletionContext {
+                        request: request.context(),
+                        execution: Some(*execution),
+                    }),
+                    rz_telemetry::source::SourceStage::EncodingPreparation,
+                    start,
+                    Instant::now(),
+                    prepared.is_ok(),
+                );
+            }
+            let prepared = prepared?;
             let batch = PreparedBatch::new(*execution, vec![prepared])?;
             let mut results = Vec::new();
             results.try_reserve_exact(1).map_err(allocation_failure)?;

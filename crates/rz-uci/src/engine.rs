@@ -307,6 +307,12 @@ pub trait ManagedEvaluator: contract::Evaluator<RulesState> + Send {
     fn shutdown(&mut self, deadline: Instant) -> Result<(), contract::ContractError>;
 }
 pub trait EvaluatorFactory: Send + Sync + 'static {
+    /// Optional metadata journal; no payloads or engine authority are retained.
+    fn source_trace(
+        &self,
+    ) -> Option<rz_telemetry::source::SourceJournal<contract::CompletionContext>> {
+        None
+    }
     fn profile(&self) -> EvaluatorProfile;
     fn create(
         &self,
@@ -908,6 +914,7 @@ impl Owner {
                                 );
                             }
                         };
+                    search.set_source_trace(factory.source_trace());
                     let mut previous_move = None;
                     let mut authority_error = None;
                     let mut diagnostic_failure = None;
