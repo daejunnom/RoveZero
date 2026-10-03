@@ -111,6 +111,14 @@ impl rz_search::contracts::ContractPosition for RulesSearchPosition {
         }
         Ok(())
     }
+    fn retained_bytes(&self) -> Option<usize> {
+        self.state
+            .rules()
+            .snapshot()
+            .retained_history_bytes()?
+            .checked_add(self.state.legal_moves().moves().len().checked_mul(256)?)?
+            .checked_add(4096)
+    }
 }
 
 #[derive(Clone, Debug)]

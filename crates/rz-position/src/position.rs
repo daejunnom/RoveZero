@@ -214,6 +214,13 @@ impl PositionSnapshot {
     pub fn known_history_len(&self) -> usize {
         self.identity.history.len
     }
+    /// Conservative charge: count the entire prefix even when Arc nodes share.
+    pub fn retained_history_bytes(&self) -> Option<usize> {
+        self.identity
+            .history
+            .len
+            .checked_mul(std::mem::size_of::<HistoryNode>() + 2 * std::mem::size_of::<usize>())
+    }
     #[cfg(all(feature = "contracts", not(feature = "experimental-history-digest")))]
     pub(crate) fn is_irreversible_boundary(&self) -> bool {
         self.identity.history.irreversible

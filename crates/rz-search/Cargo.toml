@@ -10,6 +10,7 @@ description = "RoveZero deterministic PUCT accounting and time control"
 default = []
 experimental-puct = []
 experimental-search-buffers = []
+experimental-state-cache = []
 
 [dependencies]
 rz-contracts.workspace = true

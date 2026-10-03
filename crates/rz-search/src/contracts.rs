@@ -28,6 +28,99 @@ pub trait ContractPosition: Clone {
     fn play(&self, chess_move: &Move) -> Result<Self, ContractError>;
     /// 실제 Rules 소유권·state revision·합법 수 의미·이력을 다시 검증한다.
     fn validate_authority(&self) -> Result<(), ContractError>;
+    /// Conservative retained-storage charge. Unknown implementations miss the
+    /// optional cache rather than pretending an opaque state costs zero bytes.
+    fn retained_bytes(&self) -> Option<usize> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct StateCacheLimits {
+    pub max_entries: usize,
+    pub max_bytes: usize,
+}
+impl Default for StateCacheLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 64,
+            max_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
+#[cfg(feature = "experimental-state-cache")]
+struct CachedState<P> {
+    path: Vec<Move>,
+    state: P,
+    charge: usize,
+}
+
+#[cfg(feature = "experimental-state-cache")]
+struct StateCache<P> {
+    limits: StateCacheLimits,
+    entries: std::collections::VecDeque<CachedState<P>>,
+    bytes: usize,
+    hits: u64,
+}
+
+#[cfg(feature = "experimental-state-cache")]
+impl<P: ContractPosition> StateCache<P> {
+    fn lookup(&mut self, path: &[Move]) -> Option<(usize, P)> {
+        let best = self
+            .entries
+            .iter()
+            .filter(|entry| path.starts_with(&entry.path))
+            .max_by_key(|entry| entry.path.len())?;
+        self.hits = self.hits.saturating_add(1);
+        Some((best.path.len(), best.state.clone()))
+    }
+    fn insert(&mut self, path: &[Move], state: &P) -> Result<(), ContractError> {
+        let Some(state_bytes) = state.retained_bytes() else {
+            return Ok(());
+        };
+        let charge = path
+            .len()
+            .checked_mul(std::mem::size_of::<Move>())
+            .and_then(|bytes| bytes.checked_add(state_bytes))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CachedState<P>>()));
+        let Some(charge) = charge.filter(|&bytes| bytes <= self.limits.max_bytes) else {
+            return Ok(());
+        };
+        if self.limits.max_entries == 0 || path.is_empty() {
+            return Ok(());
+        }
+        if self.entries.iter().any(|entry| entry.path == path) {
+            return Ok(());
+        }
+        while self.entries.len() >= self.limits.max_entries
+            || self.bytes > self.limits.max_bytes - charge
+        {
+            if let Some(old) = self.entries.pop_front() {
+                self.bytes -= old.charge;
+            }
+        }
+        let failure = || {
+            boundary(
+                ErrorCode::ResourceExhausted,
+                Stage::Contract,
+                "state cache allocation failed",
+            )
+        };
+        let mut owned_path = Vec::new();
+        owned_path
+            .try_reserve_exact(path.len())
+            .map_err(|_| failure())?;
+        owned_path.extend_from_slice(path);
+        self.entries.try_reserve(1).map_err(|_| failure())?;
+        self.entries.push_back(CachedState {
+            path: owned_path,
+            state: state.clone(),
+            charge,
+        });
+        self.bytes += charge;
+        Ok(())
+    }
 }
 
 /// 프로세스 epoch 전체에서 같은 Arc를 공유한다. root/newgame에서 초기화하지 않는다.
@@ -201,6 +294,8 @@ pub struct ContractSearch<P: ContractPosition, S: SelectionPolicy = Puct> {
     simulations: u64,
     metrics: ContractSearchMetrics,
     accepted_executions: HashSet<ExecutionId>,
+    #[cfg(feature = "experimental-state-cache")]
+    state_cache: StateCache<P>,
 }
 
 impl<P: ContractPosition, S: SelectionPolicy> Drop for ContractSearch<P, S> {
@@ -253,6 +348,13 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             simulations: 0,
             metrics: ContractSearchMetrics::default(),
             accepted_executions: HashSet::new(),
+            #[cfg(feature = "experimental-state-cache")]
+            state_cache: StateCache {
+                limits: StateCacheLimits::default(),
+                entries: std::collections::VecDeque::new(),
+                bytes: 0,
+                hits: 0,
+            },
         })
     }
 
@@ -297,6 +399,56 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
 
     pub fn counters(&self) -> SearchCounters {
         self.tree.counters()
+    }
+
+    pub fn set_state_cache_limits(
+        &mut self,
+        limits: StateCacheLimits,
+    ) -> Result<(), ContractError> {
+        if limits.max_entries > 1024 || limits.max_bytes > 64 * 1024 * 1024 {
+            return Err(boundary(
+                ErrorCode::ResourceExhausted,
+                Stage::Contract,
+                "state cache limit exceeds hard ceiling",
+            ));
+        }
+        #[cfg(feature = "experimental-state-cache")]
+        {
+            self.state_cache = StateCache {
+                limits,
+                entries: std::collections::VecDeque::new(),
+                bytes: 0,
+                hits: 0,
+            };
+            Ok(())
+        }
+        #[cfg(not(feature = "experimental-state-cache"))]
+        {
+            if limits.max_entries != 0 && limits.max_bytes != 0 {
+                Err(boundary(
+                    ErrorCode::UnsupportedContract,
+                    Stage::Contract,
+                    "state cache experiment is disabled",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    pub fn state_cache_storage(&self) -> (usize, usize, u64) {
+        #[cfg(feature = "experimental-state-cache")]
+        {
+            (
+                self.state_cache.entries.len(),
+                self.state_cache.bytes,
+                self.state_cache.hits,
+            )
+        }
+        #[cfg(not(feature = "experimental-state-cache"))]
+        {
+            (0, 0, 0)
+        }
     }
 
     /// 기다리지 않는 논리 상태 전이. Runtime의 각 메서드도 blocking하면 안 된다.
@@ -364,8 +516,14 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
                 return self.fail_ticket(&selection.ticket, ContractSearchFailure::Boundary(error));
             }
         };
-        let mut leaf = self.root.clone();
-        for chess_move in &selection.moves {
+        #[cfg(feature = "experimental-state-cache")]
+        let (replayed, mut leaf) = self
+            .state_cache
+            .lookup(&selection.moves)
+            .unwrap_or_else(|| (0, self.root.clone()));
+        #[cfg(not(feature = "experimental-state-cache"))]
+        let (replayed, mut leaf) = (0, self.root.clone());
+        for chess_move in &selection.moves[replayed..] {
             leaf = match leaf.play(chess_move) {
                 Ok(next) => next,
                 Err(error) => {
@@ -375,6 +533,10 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             };
         }
         if let Err(error) = validate_position(&leaf) {
+            return self.fail_ticket(&selection.ticket, ContractSearchFailure::Boundary(error));
+        }
+        #[cfg(feature = "experimental-state-cache")]
+        if let Err(error) = self.state_cache.insert(&selection.moves, &leaf) {
             return self.fail_ticket(&selection.ticket, ContractSearchFailure::Boundary(error));
         }
         let terminal = terminal_utility(&leaf);

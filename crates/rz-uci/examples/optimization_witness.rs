@@ -100,6 +100,9 @@ impl ContractPosition for TrackedPosition {
     fn validate_authority(&self) -> std::result::Result<(), ContractError> {
         self.leaf.position.validate_authority()
     }
+    fn retained_bytes(&self) -> Option<usize> {
+        self.leaf.position.retained_bytes()
+    }
     fn play(&self, movement: &Move) -> std::result::Result<Self, ContractError> {
         let position = self.leaf.position.play(movement)?;
         let mut path = self.leaf.path.clone();
