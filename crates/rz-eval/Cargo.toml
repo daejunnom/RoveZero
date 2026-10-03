@@ -23,6 +23,9 @@ rz-position = { workspace = true, optional = true, features = ["contracts"] }
 rz-runtime = { workspace = true, optional = true, features = ["contracts"] }
 
 [features]
+experimental-io-buffers = ["onnx"]
+experimental-io-binding = ["onnx"]
+experimental-cuda-graph = ["experimental-io-binding"]
 experimental-notify = ["dep:rz-runtime", "rz-runtime/experimental-notify"]
 default = []
 onnx = ["dep:ort", "dep:rz-native-loader"]

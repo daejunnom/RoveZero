@@ -262,3 +262,14 @@ metadata, 모델·encoding·backend·precision·compute·epoch·game을 대조�
 ExecutionId를 만들지 않습니다. CPU mock/native factory의 typed 설정으로 연결하고
 ucinewgame에서 초기화합니다. native typed report는 raw-hit와 Computed 집계를
 분리하며 기존 Computed-only V1 attestation으로 raw-hit 실행을 게시하지 않습니다.
+
+OPT-09~11은 `experimental-io-buffers`, `experimental-io-binding`,
+`experimental-cuda-graph`를 각각 compile한 뒤 `BackendConfig.experiments`에서
+명시적으로 선택합니다. native UCI의 같은 이름 `--experimental-*` 플래그로
+실제 worker에 연결하며 기본 설정은 모두 off입니다. Graph는 CUDA B1 + binding을
+필수로 하고, 고정 device input/output 주소를 유지합니다. host→device와
+device→host는 ORT synchronous Identity copy이며 추가 세션 비용도 계측 대상입니다.
+Run/전송/fence 오류에서 CUDA completion이 불확실하면 binding·input·session을
+격리 보존합니다. `binding_runs()`는 성공한 synchronous 호출 수이지 실제 GPU
+capture/replay의 관측 증거가 아닙니다. ORT buffer 실제 재사용·GPU 수치·capture/replay·
+지연/VRAM은 장비 검증 항목이며 CPU 계약 테스트로 통과 처리하지 않습니다.

@@ -69,6 +69,8 @@ fn error(code: ErrorCode, stage: Stage, detail: &'static str) -> ContractError {
 /// Private local paths are never rendered by Debug, Display, or parser errors.
 #[derive(Clone)]
 pub struct NativeConfig {
+    execution_experiments: rz_eval::onnx::ExecutionExperiments,
+    raw_cache: bool,
     source_weights: PathBuf,
     onnx_model: PathBuf,
     export_manifest: PathBuf,
@@ -87,6 +89,8 @@ impl fmt::Debug for NativeConfig {
             .field("manifest_sha256", &self.manifest_sha256)
             .field("ort_sha256", &self.ort_sha256)
             .field("provider", &self.provider)
+            .field("execution_experiments", &self.execution_experiments)
+            .field("raw_cache", &self.raw_cache)
             .field("cuda_bundle_sha256", &self.cuda_bundle_sha256)
             .field("cuda_bundle_selected", &self.cuda_bundle.is_some())
             .finish_non_exhaustive()
@@ -96,6 +100,8 @@ impl NativeConfig {
     pub fn parse(
         arguments: impl IntoIterator<Item = String>,
     ) -> Result<Self, NativeBootstrapError> {
+        let mut execution_experiments = rz_eval::onnx::ExecutionExperiments::default();
+        let mut raw_cache = false;
         let mut provider = None;
         let mut source_weights = None;
         let mut onnx_model = None;
@@ -108,6 +114,21 @@ impl NativeConfig {
         let mut cuda_bundle = None;
         let mut cuda_bundle_sha256 = None;
         for argument in arguments {
+            let experiment = match argument.as_str() {
+                "--experimental-io-buffers" => Some(&mut execution_experiments.reuse_buffers),
+                "--experimental-io-binding" => Some(&mut execution_experiments.io_binding),
+                "--experimental-cuda-graph" => Some(&mut execution_experiments.cuda_graph),
+                "--experimental-raw-cache" => Some(&mut raw_cache),
+                _ => None,
+            };
+            if let Some(enabled) = experiment {
+                if std::mem::replace(enabled, true) {
+                    return Err(NativeBootstrapError::Config(
+                        "duplicate execution experiment",
+                    ));
+                }
+                continue;
+            }
             if argument == "--attestation" {
                 if std::mem::replace(&mut attestation, true) {
                     return Err(NativeBootstrapError::Config(
@@ -167,12 +188,29 @@ impl NativeConfig {
             }
             _ => {}
         }
+        if (execution_experiments.reuse_buffers && !cfg!(feature = "experimental-io-buffers"))
+            || (execution_experiments.io_binding && !cfg!(feature = "experimental-io-binding"))
+            || (execution_experiments.cuda_graph
+                && (!cfg!(feature = "experimental-cuda-graph")
+                    || !execution_experiments.io_binding
+                    || provider != NativeProvider::Cuda))
+            || (raw_cache && !cfg!(feature = "experimental-raw-cache"))
+            || (attestation
+                && (raw_cache
+                    || execution_experiments != rz_eval::onnx::ExecutionExperiments::default()))
+        {
+            return Err(NativeBootstrapError::Config(
+                "unsupported experiment or Computed-only V1 attestation requested for experimental execution",
+            ));
+        }
         let missing = || {
             NativeBootstrapError::Config(
                 "native CPU requires all asset, manifest, runtime hash and private output-root arguments",
             )
         };
         Ok(Self {
+            execution_experiments,
+            raw_cache,
             source_weights: source_weights.ok_or_else(missing)?,
             onnx_model: onnx_model.ok_or_else(missing)?,
             export_manifest: export_manifest.ok_or_else(missing)?,
@@ -942,6 +980,7 @@ impl NativeSessionFactory {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         let mut backend_config = BackendConfig::cpu();
+        backend_config.experiments = config.execution_experiments;
         backend_config.max_batch = 1;
         backend_config.intra_threads = 1;
         backend_config.host_io_bytes = IO_BYTES_PER_ITEM;
@@ -1036,6 +1075,10 @@ impl NativeSessionFactory {
         };
         let projection =
             ClassicalProjection::new(MaiaBinding::for_backend(&backend, model, encoding, fill)?);
+        #[cfg(feature = "experimental-raw-cache")]
+        if config.raw_cache {
+            projection.configure_raw_cache(rz_eval::raw_cache::RawCacheLimits::default())?;
+        }
         Ok((asset, runtime, backend, projection))
     }
     #[cfg(feature = "onnx-cuda")]

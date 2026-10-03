@@ -497,12 +497,14 @@ pub fn spawn_onnx_worker<P: Send + Sync + 'static>(
                 .map(PreparedRequest::encoded)
                 .collect::<Vec<_>>();
             let raw = backend.run(&inputs).map_err(PhysicalFailure::from)?;
-            batch
+            let completed = batch
                 .requests()
                 .iter()
-                .zip(raw)
-                .map(|(request, raw)| request.physical_output(&raw, batch.execution()))
-                .collect()
+                .zip(&raw)
+                .map(|(request, raw)| request.physical_output(raw, batch.execution()))
+                .collect();
+            backend.recycle_outputs(raw);
+            completed
         })();
         if let Some(cause) = backend.physical_quarantine_cause() {
             // CUDA Run returned an error without a completion fence. No

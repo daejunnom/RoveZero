@@ -10,6 +10,9 @@ description = "RoveZero UCI parser and injected session control boundary"
 path = "src/lib.rs"
 
 [features]
+experimental-io-buffers = ["rz-eval/experimental-io-buffers"]
+experimental-io-binding = ["rz-eval/experimental-io-binding"]
+experimental-cuda-graph = ["rz-eval/experimental-cuda-graph"]
 experimental-notify = ["rz-eval/experimental-notify", "rz-runtime/experimental-notify"]
 default = []
 experimental-best-move = []
