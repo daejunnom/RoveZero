@@ -5,6 +5,8 @@
 mod contract;
 mod fastchess;
 mod ledger;
+#[cfg(feature = "native-cuda")]
+mod native_cuda;
 mod native_launch;
 mod native_runner;
 mod pgn;
@@ -15,6 +17,8 @@ mod runner;
 pub use contract::*;
 pub use fastchess::*;
 pub use ledger::*;
+#[cfg(feature = "native-cuda")]
+pub use native_cuda::*;
 pub use native_launch::*;
 pub use native_runner::*;
 pub use pgn::*;

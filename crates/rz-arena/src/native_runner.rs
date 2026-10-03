@@ -2,6 +2,7 @@
 //! Process cleanup, B's NN evidence and A's PGN audit remain separate gates.
 //! Neither this API nor a successful integration receipt permits strength runs.
 
+use crate::native_launch::NativeLaunchDeclaration;
 use crate::{
     ArenaError, CleanupStatus, NativeLaunchOwner, NativeSnapshotReceipt, PairPgnAudit,
     ProcessOutput, ProcessReceipt,
@@ -27,8 +28,68 @@ pub struct NativeProviderSessionAudit {
     pub physical_drain: String,
 }
 
+/// Provider-specific wire acceptance is distinct from shared process/PGN gates.
+#[doc(hidden)]
+pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
+    type Audit: Clone + fmt::Debug + Serialize + Send + 'static;
+    fn scope(&self) -> &'static str;
+    fn receipt_filename(&self) -> &'static str;
+    fn startup_filename(&self) -> &'static str;
+    fn termination_filename(&self) -> &'static str;
+    #[cfg(target_os = "linux")]
+    fn validate_records(
+        &self,
+        role: rz_experiments::NativeEngineRole,
+        startup: &[u8],
+        termination: &[u8],
+        session: &str,
+    ) -> Result<(Self::Audit, u32), ArenaError>;
+    #[cfg(target_os = "linux")]
+    fn verify_session_evidence(
+        &self,
+        _role: rz_experiments::NativeEngineRole,
+        _pid: u32,
+        _startup: &[u8],
+        _runtime_directory: &cap_std::fs::Dir,
+    ) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
+        Ok(Vec::new())
+    }
+}
+impl NativeProviderDeclaration for rz_experiments::LockedIntegrationPairSpecV1 {
+    type Audit = NativeProviderSessionAudit;
+    fn scope(&self) -> &'static str {
+        "cpu_nn_pair_integration_process_provider_and_native_rules"
+    }
+    fn receipt_filename(&self) -> &'static str {
+        "native-pair-receipt.v1.json"
+    }
+    fn startup_filename(&self) -> &'static str {
+        "native-cpu-startup.v1.json"
+    }
+    fn termination_filename(&self) -> &'static str {
+        "native-cpu-termination.v1.json"
+    }
+    #[cfg(target_os = "linux")]
+    fn validate_records(
+        &self,
+        role: rz_experiments::NativeEngineRole,
+        startup: &[u8],
+        termination: &[u8],
+        session: &str,
+    ) -> Result<(Self::Audit, u32), ArenaError> {
+        let audit = validate_native_provider_record_fields(
+            startup,
+            termination,
+            self.input().engine(role)?,
+            session,
+        )?;
+        let pid = audit.process_id;
+        Ok((audit, pid))
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
-pub struct NativePairReceipt {
+pub struct NativePairReceipt<A = NativeProviderSessionAudit> {
     pub receipt_version: u32,
     pub execution_ready: bool,
     pub strength_eligible: bool,
@@ -41,7 +102,7 @@ pub struct NativePairReceipt {
     pub process: ProcessReceipt,
     pub snapshots: Vec<NativeSnapshotReceipt>,
     pub artifacts: Vec<rz_experiments::ArtifactRef>,
-    pub provider_sessions: Vec<NativeProviderSessionAudit>,
+    pub provider_sessions: Vec<A>,
     pub provider_audit_error: Option<String>,
     pub pgn_audit: Option<PairPgnAudit>,
     pub pgn_audit_error: Option<String>,
@@ -55,33 +116,33 @@ pub struct NativePairReceipt {
     pub limitations: Vec<String>,
 }
 
-struct NativeRunBundle {
-    owner: Option<NativeLaunchOwner>,
+struct NativeRunBundle<S: NativeProviderDeclaration> {
+    owner: Option<NativeLaunchOwner<S>>,
     process: Option<ProcessOutput>,
-    receipt: Option<NativePairReceipt>,
+    receipt: Option<NativePairReceipt<S::Audit>>,
     receipt_artifact: Option<rz_experiments::ArtifactRef>,
     original_error: Option<String>,
 }
-impl NativeRunBundle {
+impl<S: NativeProviderDeclaration> NativeRunBundle<S> {
     fn unresolved(&self) -> bool {
         self.process.as_ref().is_some_and(|p| {
             p.receipt.group_cleanup != CleanupStatus::Gone || p.pending_child.is_some()
         })
     }
 }
-impl Drop for NativeRunBundle {
+impl<S: NativeProviderDeclaration> Drop for NativeRunBundle<S> {
     fn drop(&mut self) {
         if !self.unresolved() {
             return;
         }
         crate::native_launch::close_native_admission();
         let retained = Box::new(RetainedNativeScope {
-            _owner: self.owner.take().expect("native bundle owns its lease"),
+            _owner: Box::new(self.owner.take().expect("native bundle owns its lease")),
             process: self
                 .process
                 .take()
                 .expect("unresolved bundle owns process evidence"),
-            receipt: self.receipt.take(),
+            receipt: self.receipt.take().map(|r| Box::new(r) as Box<dyn Send>),
             original_error: self.original_error.take(),
         });
         // The active lease forbids a second unresolved bundle. Do not abort the
@@ -98,9 +159,9 @@ impl Drop for NativeRunBundle {
     }
 }
 struct RetainedNativeScope {
-    _owner: NativeLaunchOwner,
+    _owner: Box<dyn Send>,
     process: ProcessOutput,
-    receipt: Option<NativePairReceipt>,
+    receipt: Option<Box<dyn Send>>,
     original_error: Option<String>,
 }
 static QUARANTINE: Mutex<Option<Box<RetainedNativeScope>>> = Mutex::new(None);
@@ -157,47 +218,51 @@ pub fn native_quarantine_status() -> NativeQuarantineStatus {
     status
 }
 
-pub struct NativePairOutput {
-    pub receipt: NativePairReceipt,
+pub struct NativePairOutput<
+    S: NativeProviderDeclaration = rz_experiments::LockedIntegrationPairSpecV1,
+> {
+    pub receipt: NativePairReceipt<S::Audit>,
     pub receipt_artifact: rz_experiments::ArtifactRef,
-    bundle: NativeRunBundle,
+    bundle: NativeRunBundle<S>,
 }
-impl NativePairOutput {
+impl<S: NativeProviderDeclaration> NativePairOutput<S> {
     pub fn process(&self) -> &ProcessOutput {
         self.bundle
             .process
             .as_ref()
             .expect("completed wrapper retains process evidence")
     }
-    pub fn launch_owner(&self) -> &NativeLaunchOwner {
+    pub fn launch_owner(&self) -> &NativeLaunchOwner<S> {
         self.bundle
             .owner
             .as_ref()
             .expect("completed wrapper retains input owner")
     }
 }
-impl fmt::Debug for NativePairOutput {
+impl<S: NativeProviderDeclaration> fmt::Debug for NativePairOutput<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NativePairOutput")
             .field("receipt", &self.receipt)
             .finish_non_exhaustive()
     }
 }
-pub struct NativePairFailure {
+pub struct NativePairFailure<
+    S: NativeProviderDeclaration = rz_experiments::LockedIntegrationPairSpecV1,
+> {
     pub cause: ArenaError,
-    pub receipt: Option<NativePairReceipt>,
+    pub receipt: Option<NativePairReceipt<S::Audit>>,
     pub receipt_artifact: Option<rz_experiments::ArtifactRef>,
-    bundle: NativeRunBundle,
+    bundle: NativeRunBundle<S>,
 }
-impl NativePairFailure {
+impl<S: NativeProviderDeclaration> NativePairFailure<S> {
     pub fn process(&self) -> Option<&ProcessOutput> {
         self.bundle.process.as_ref()
     }
-    pub fn launch_owner(&self) -> Option<&NativeLaunchOwner> {
+    pub fn launch_owner(&self) -> Option<&NativeLaunchOwner<S>> {
         self.bundle.owner.as_ref()
     }
 }
-impl fmt::Debug for NativePairFailure {
+impl<S: NativeProviderDeclaration> fmt::Debug for NativePairFailure<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NativePairFailure")
             .field("cause", &self.cause)
@@ -205,7 +270,7 @@ impl fmt::Debug for NativePairFailure {
             .finish_non_exhaustive()
     }
 }
-impl fmt::Display for NativePairFailure {
+impl<S: NativeProviderDeclaration> fmt::Display for NativePairFailure<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -215,7 +280,7 @@ impl fmt::Display for NativePairFailure {
         )
     }
 }
-impl std::error::Error for NativePairFailure {}
+impl<S: NativeProviderDeclaration> std::error::Error for NativePairFailure<S> {}
 
 /// Consume exactly one prepared lease. Post-spawn failures retain the original
 /// process output and every input/cwd pin, including when receipt saving fails.
@@ -223,6 +288,12 @@ pub fn run_native_pair(
     owner: NativeLaunchOwner,
     cancel: Option<&AtomicBool>,
 ) -> Result<NativePairOutput, Box<NativePairFailure>> {
+    run_native_pair_for(owner, cancel)
+}
+pub(crate) fn run_native_pair_for<S: NativeProviderDeclaration>(
+    owner: NativeLaunchOwner<S>,
+    cancel: Option<&AtomicBool>,
+) -> Result<NativePairOutput<S>, Box<NativePairFailure<S>>> {
     let mut bundle = NativeRunBundle {
         owner: Some(owner),
         process: None,
@@ -233,11 +304,17 @@ pub fn run_native_pair(
     #[cfg(target_os = "linux")]
     let result = linux::run(&mut bundle, cancel);
     #[cfg(not(target_os = "linux"))]
-    let result: Result<(NativePairReceipt, rz_experiments::ArtifactRef), ArenaError> = {
+    let result: Result<(NativePairReceipt<S::Audit>, rz_experiments::ArtifactRef), ArenaError> = {
         let _ = cancel;
-        Err(ArenaError::Invalid(
-            "CPU NN integration runner requires Linux".into(),
-        ))
+        Err(ArenaError::Invalid(format!(
+            "{} NN integration runner requires Linux",
+            bundle
+                .owner
+                .as_ref()
+                .expect("prepared native owner")
+                .spec
+                .provider_name()
+        )))
     };
     match result {
         Ok((receipt, receipt_artifact)) => {
@@ -264,7 +341,7 @@ pub fn run_native_pair(
 pub use linux::validate_native_provider_record_fields;
 
 #[cfg(target_os = "linux")]
-mod linux {
+pub(crate) mod linux {
     use super::*;
     use crate::native_launch::{
         NATIVE_PAIR_METADATA_CAP,
@@ -288,22 +365,27 @@ mod linux {
         os::unix::fs::MetadataExt,
     };
     const PROVIDER_JSON_CAP: u64 = 256 * 1024;
-    const STARTUP: &str = "native-cpu-startup.v1.json";
-    const TERMINATION: &str = "native-cpu-termination.v1.json";
     fn invalid(detail: &str) -> ArenaError {
         ArenaError::Integrity(detail.into())
     }
-    fn artifact(owner: &NativeLaunchOwner, name: &str, bytes: &[u8]) -> ArtifactRef {
+    fn artifact<S: NativeLaunchDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+        name: &str,
+        bytes: &[u8],
+    ) -> ArtifactRef {
         ArtifactRef {
             path: format!("{}/{name}", owner.snapshot.output_directory),
             sha256: format!("{:x}", Sha256::digest(bytes)),
             bytes: bytes.len() as u64,
-            source: "RoveZero CPU NN integration execution evidence".into(),
+            source: format!(
+                "RoveZero {} NN integration execution evidence",
+                owner.spec.provider_name()
+            ),
             license: "MIT execution evidence; external input rights remain separate".into(),
         }
     }
-    fn put(
-        owner: &NativeLaunchOwner,
+    fn put<S: NativeLaunchDeclaration>(
+        owner: &NativeLaunchOwner<S>,
         name: &str,
         bytes: &[u8],
         cap: u64,
@@ -383,7 +465,9 @@ mod linux {
         }
         Ok(bytes)
     }
-    fn verify_inputs(owner: &mut NativeLaunchOwner) -> Result<(), ArenaError> {
+    fn verify_inputs<S: NativeLaunchDeclaration>(
+        owner: &mut NativeLaunchOwner<S>,
+    ) -> Result<(), ArenaError> {
         for item in &mut owner.snapshot.pins {
             verify_copy(&mut item.file, &item.artifact)?;
             let relative = item
@@ -398,9 +482,42 @@ mod linux {
                 .read(true)
                 .follow(FollowSymlinks::No)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-            let path_file = owner
-                .snapshot
-                .input_directory
+            let parent = relative
+                .parent()
+                .ok_or_else(|| invalid("native input has no parent"))?;
+            let directory = if parent == std::path::Path::new("inputs") {
+                &owner.snapshot.input_directory
+            } else if parent == std::path::Path::new("inputs/cuda-bundle") {
+                let held = owner
+                    .snapshot
+                    .bundle_directory
+                    .as_ref()
+                    .ok_or_else(|| invalid("CUDA input directory is not retained"))?;
+                let named = owner
+                    .snapshot
+                    .input_directory
+                    .open_dir_nofollow("cuda-bundle")
+                    .map_err(|_| invalid("CUDA input directory pathname changed"))?;
+                let held_meta = held
+                    .try_clone()
+                    .map_err(|_| invalid("cannot clone CUDA directory pin"))?
+                    .into_std_file()
+                    .metadata()
+                    .map_err(|_| invalid("CUDA input directory metadata unavailable"))?;
+                let named_meta = named
+                    .into_std_file()
+                    .metadata()
+                    .map_err(|_| invalid("CUDA named directory metadata unavailable"))?;
+                if (held_meta.dev(), held_meta.ino()) != (named_meta.dev(), named_meta.ino()) {
+                    return Err(invalid(
+                        "CUDA input directory no longer names its owned inode",
+                    ));
+                }
+                held
+            } else {
+                return Err(invalid("native input escaped closed snapshot topology"));
+            };
+            let path_file = directory
                 .open_with(name, &options)
                 .map_err(|_| invalid("native input pathname changed"))?
                 .into_std();
@@ -419,32 +536,34 @@ mod linux {
         }
         Ok(())
     }
-    fn pair(owner: &NativeLaunchOwner) -> Result<PairSpec, ArenaError> {
-        let input = owner.spec.input();
+    fn pair<S: NativeLaunchDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+    ) -> Result<PairSpec, ArenaError> {
+        let input = owner.spec.view();
         let game = |ordinal: usize| -> Result<GameSpec, ArenaError> {
-            let white = input.engine(input.white_order[ordinal])?;
-            let black = input.engine(input.white_order[ordinal].other())?;
+            let white = owner.spec.engine_view(input.white_order[ordinal])?;
+            let black = owner.spec.engine_view(input.white_order[ordinal].other())?;
             Ok(GameSpec {
                 id: format!("{}-game-{}", input.pair_id, ordinal + 1),
-                white_engine: white.engine_id.clone(),
-                black_engine: black.engine_id.clone(),
+                white_engine: white.engine_id.into(),
+                black_engine: black.engine_id.into(),
                 engine_seeds: BTreeMap::new(),
                 engine_slots: BTreeMap::new(),
             })
         };
         Ok(PairSpec {
-            id: input.pair_id.clone(),
+            id: input.pair_id.into(),
             ordinal: 0,
             opening: input.opening.clone(),
-            opening_input_sha256: canonical_sha256(&input.opening)?,
+            opening_input_sha256: canonical_sha256(input.opening)?,
             games: [game(0)?, game(1)?],
             execution_order: [0, 1],
         })
     }
-    pub(super) fn run(
-        bundle: &mut NativeRunBundle,
+    pub(super) fn run<S: NativeProviderDeclaration>(
+        bundle: &mut NativeRunBundle<S>,
         cancel: Option<&AtomicBool>,
-    ) -> Result<(NativePairReceipt, ArtifactRef), ArenaError> {
+    ) -> Result<(NativePairReceipt<S::Audit>, ArtifactRef), ArenaError> {
         let owner = bundle.owner.as_mut().expect("prepared native owner");
         verify_inputs(owner)?;
         let s = &owner.snapshot;
@@ -474,12 +593,12 @@ mod linux {
             receipt_version: 1,
             execution_ready: false,
             strength_eligible: false,
-            validation_scope: "cpu_nn_pair_integration_process_provider_and_native_rules".into(),
-            input_sha256: owner.spec.sha256().into(),
-            pair_id: owner.spec.input().pair_id.clone(),
+            validation_scope: owner.spec.scope().into(),
+            input_sha256: owner.spec.input_sha256().into(),
+            pair_id: owner.spec.view().pair_id.into(),
             contract_revision: "0.1".into(),
-            runner_source_commit: owner.spec.input().runner.source_commit.clone(),
-            runner_binary_sha256: owner.spec.input().runner.binary.sha256.clone(),
+            runner_source_commit: owner.spec.view().runner.source_commit.clone(),
+            runner_binary_sha256: owner.spec.view().runner.binary.sha256.clone(),
             process: process.receipt.clone(),
             snapshots: owner.snapshot.receipts.clone(),
             artifacts: Vec::new(),
@@ -517,7 +636,7 @@ mod linux {
         )?);
         let pgn_cap = owner
             .spec
-            .input()
+            .view()
             .budget
             .max_output_bytes
             .checked_sub(NATIVE_PAIR_METADATA_CAP)
@@ -562,12 +681,12 @@ mod linux {
                                 .map_err(|_| {
                                 ArenaError::Budget("native PGN cap cannot fit host".into())
                             })?,
-                            max_plies: owner.spec.input().max_plies,
+                            max_plies: owner.spec.view().max_plies,
                         },
                         PgnOutcomePolicy {
                             engine_failure: OutcomePolicy::Loss,
                             max_plies_outcome: OutcomePolicy::Incomplete,
-                            max_game_plies: owner.spec.input().max_plies,
+                            max_game_plies: owner.spec.view().max_plies,
                         },
                     )
                 }) {
@@ -614,7 +733,12 @@ mod linux {
             .map_err(|_| invalid("cannot serialize bounded native receipt"))?;
         let artifact = put(
             bundle.owner.as_ref().expect("receipt retains owner"),
-            "native-pair-receipt.v1.json",
+            bundle
+                .owner
+                .as_ref()
+                .expect("receipt retains owner")
+                .spec
+                .receipt_filename(),
             &bytes,
             NATIVE_PAIR_METADATA_CAP,
         )?;
@@ -627,47 +751,47 @@ mod linux {
         Ok((receipt, artifact))
     }
 
-    fn json(bytes: &[u8]) -> Result<Value, ArenaError> {
+    pub(crate) fn json(bytes: &[u8]) -> Result<Value, ArenaError> {
         let text =
             std::str::from_utf8(bytes).map_err(|_| invalid("provider receipt is not UTF-8"))?;
         Ok(rz_experiments::decode_json::<Value>(text)?)
     }
-    fn field<'a>(v: &'a Value, key: &str) -> Result<&'a Value, ArenaError> {
+    pub(crate) fn field<'a>(v: &'a Value, key: &str) -> Result<&'a Value, ArenaError> {
         v.get(key)
             .ok_or_else(|| invalid("provider receipt is missing a required field"))
     }
-    fn number(v: &Value, key: &str) -> Result<u64, ArenaError> {
+    pub(crate) fn number(v: &Value, key: &str) -> Result<u64, ArenaError> {
         field(v, key)?
             .as_u64()
             .ok_or_else(|| invalid("provider receipt integer type differs"))
     }
-    fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str, ArenaError> {
+    pub(crate) fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str, ArenaError> {
         field(v, key)?
             .as_str()
             .ok_or_else(|| invalid("provider receipt string type differs"))
     }
-    fn equals(v: &Value, key: &str, expected: &str) -> Result<(), ArenaError> {
+    pub(crate) fn equals(v: &Value, key: &str, expected: &str) -> Result<(), ArenaError> {
         if text(v, key)? != expected {
             Err(invalid("provider receipt locked string identity differs"))
         } else {
             Ok(())
         }
     }
-    fn flag(v: &Value, key: &str, expected: bool) -> Result<(), ArenaError> {
+    pub(crate) fn flag(v: &Value, key: &str, expected: bool) -> Result<(), ArenaError> {
         if field(v, key)?.as_bool() != Some(expected) {
             Err(invalid("provider receipt boolean profile differs"))
         } else {
             Ok(())
         }
     }
-    fn n(v: &Value, key: &str, expected: u64) -> Result<(), ArenaError> {
+    pub(crate) fn n(v: &Value, key: &str, expected: u64) -> Result<(), ArenaError> {
         if number(v, key)? != expected {
             Err(invalid("provider receipt numeric profile differs"))
         } else {
             Ok(())
         }
     }
-    fn none(v: &Value, key: &str) -> Result<(), ArenaError> {
+    pub(crate) fn none(v: &Value, key: &str) -> Result<(), ArenaError> {
         if !field(v, key)?.is_null() {
             Err(invalid(
                 "provider receipt preserves a failure or unexpected retained state",
@@ -676,7 +800,7 @@ mod linux {
             Ok(())
         }
     }
-    fn keys(v: &Value, expected: &[&str]) -> Result<(), ArenaError> {
+    pub(crate) fn keys(v: &Value, expected: &[&str]) -> Result<(), ArenaError> {
         let map = v
             .as_object()
             .ok_or_else(|| invalid("provider receipt object type differs"))?;
@@ -688,7 +812,7 @@ mod linux {
             Ok(())
         }
     }
-    fn registry(v: &Value) -> Result<(), ArenaError> {
+    pub(crate) fn registry(v: &Value) -> Result<(), ArenaError> {
         keys(v, &["owner", "slot", "generation", "manifest_sha256"])?;
         if number(v, "owner")? == 0 {
             return Err(invalid("provider registry owner is zero"));
@@ -697,7 +821,7 @@ mod linux {
         number(v, "generation")?;
         hash(text(v, "manifest_sha256")?)
     }
-    fn hash(value: &str) -> Result<(), ArenaError> {
+    pub(crate) fn hash(value: &str) -> Result<(), ArenaError> {
         if value.len() != 64
             || !value
                 .bytes()
@@ -858,7 +982,7 @@ mod linux {
         )?;
         Ok(())
     }
-    fn check_completion(c: &Value, startup: &Value) -> Result<(), ArenaError> {
+    pub(crate) fn check_completion(c: &Value, startup: &Value) -> Result<(), ArenaError> {
         keys(
             c,
             &[
@@ -1100,15 +1224,15 @@ mod linux {
             physical_drain: "confirmed".into(),
         })
     }
-    fn runtime_tree(
+    fn runtime_tree<S: NativeLaunchDeclaration>(
         directory: &Dir,
         depth: usize,
         files: &mut u32,
         dirs: &mut u32,
         bytes: &mut u64,
-        owner: &NativeLaunchOwner,
+        owner: &NativeLaunchOwner<S>,
     ) -> Result<(), ArenaError> {
-        let budget = owner.spec.input().budget;
+        let budget = owner.spec.view().budget;
         if depth > budget.max_runtime_depth as usize {
             return Err(ArenaError::Budget("native runtime depth exceeded".into()));
         }
@@ -1187,10 +1311,10 @@ mod linux {
         }
         Ok(())
     }
-    fn audit_providers(
-        owner: &NativeLaunchOwner,
+    fn audit_providers<S: NativeProviderDeclaration>(
+        owner: &NativeLaunchOwner<S>,
         artifacts: &mut Vec<ArtifactRef>,
-    ) -> Result<Vec<NativeProviderSessionAudit>, ArenaError> {
+    ) -> Result<Vec<S::Audit>, ArenaError> {
         let mut sessions = Vec::new();
         let mut ids = BTreeSet::new();
         let mut scanned = 0u32;
@@ -1199,7 +1323,7 @@ mod linux {
             (NativeEngineRole::Baseline, "baseline-runtime"),
             (NativeEngineRole::Candidate, "candidate-runtime"),
         ] {
-            let engine = owner.spec.input().engine(role)?;
+            let engine = owner.spec.engine_view(role)?;
             let directory = owner
                 .snapshot
                 .directory
@@ -1221,7 +1345,7 @@ mod linux {
                 scanned = scanned
                     .checked_add(1)
                     .ok_or_else(|| ArenaError::Budget("native session scan overflow".into()))?;
-                if scanned > owner.spec.input().budget.max_runtime_files {
+                if scanned > owner.spec.view().budget.max_runtime_files {
                     return Err(ArenaError::Budget(
                         "native session scan entry bound exceeded".into(),
                     ));
@@ -1246,26 +1370,36 @@ mod linux {
                 let dir = directory
                     .open_dir_nofollow(&session)
                     .map_err(|_| invalid("native session is not a real owned directory"))?;
-                let startup_bytes = read_file(&dir, STARTUP, PROVIDER_JSON_CAP)?;
-                let termination_bytes = read_file(&dir, TERMINATION, PROVIDER_JSON_CAP)?;
+                let startup_filename = owner.spec.startup_filename();
+                let termination_filename = owner.spec.termination_filename();
+                let startup_bytes = read_file(&dir, startup_filename, PROVIDER_JSON_CAP)?;
+                let termination_bytes = read_file(&dir, termination_filename, PROVIDER_JSON_CAP)?;
                 artifacts.push(artifact(
                     owner,
-                    &format!("{name}/{session}/{STARTUP}"),
+                    &format!("{name}/{session}/{startup_filename}"),
                     &startup_bytes,
                 ));
                 artifacts.push(artifact(
                     owner,
-                    &format!("{name}/{session}/{TERMINATION}"),
+                    &format!("{name}/{session}/{termination_filename}"),
                     &termination_bytes,
                 ));
                 let startup = json(&startup_bytes)?;
-                let term = json(&termination_bytes)?;
-                check_startup(&startup, engine, &session)?;
-                let completed = check_termination(&term, &startup)?;
-                let pid = u32::try_from(number(&startup, "process_id")?)
-                    .map_err(|_| invalid("provider PID exceeds native range"))?;
+                let (audit, pid) = owner.spec.validate_records(
+                    role,
+                    &startup_bytes,
+                    &termination_bytes,
+                    &session,
+                )?;
                 if !ids.insert(pid) {
                     return Err(invalid("native pair reused a process identity"));
+                }
+                for (relative, bytes) in
+                    owner
+                        .spec
+                        .verify_session_evidence(role, pid, &startup_bytes, &directory)?
+                {
+                    artifacts.push(artifact(owner, &format!("{name}/{relative}"), &bytes));
                 }
                 // Compare conversion provenance with the exact copied export
                 // manifest bytes rather than trusting additional receipt strings.
@@ -1288,20 +1422,7 @@ mod linux {
                 ] {
                     equals(p, observed, text(&manifest, declared)?)?;
                 }
-                sessions.push(NativeProviderSessionAudit {
-                    role: match role {
-                        NativeEngineRole::Baseline => "baseline",
-                        NativeEngineRole::Candidate => "candidate",
-                    }
-                    .into(),
-                    process_id: pid,
-                    process_run_id: session,
-                    startup_sha256: format!("{:x}", Sha256::digest(&startup_bytes)),
-                    termination_sha256: format!("{:x}", Sha256::digest(&termination_bytes)),
-                    completed_by_runtime: completed,
-                    actual_cpu_inference_observed: true,
-                    physical_drain: "confirmed".into(),
-                });
+                sessions.push(audit);
             }
         }
         Ok(sessions)
