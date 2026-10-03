@@ -93,6 +93,10 @@ def validate(manifest):
         else:
             require(args and args[0] == "--" + provider.replace('_', '-'), "native provider differs")
             require(len(args) % 2 == 1 and all(args[i] in NATIVE_FLAGS for i in range(1, len(args), 2)), "unsupported native argument")
+            flags = args[1::2]
+            required = NATIVE_FLAGS if provider == "onnx_cuda" else NATIVE_FLAGS - {"--cuda-bundle", "--cuda-bundle-sha256"}
+            require(len(flags) == len(set(flags)) and set(flags) == required,
+                    "native arguments must contain each required asset/hash flag exactly once")
             expected = variant.get("expected_profile", {})
             require(set(expected) == {"backend_sha256", "model_manifest_sha256", "encoding_manifest_sha256"}, "unknown native profile field")
             require(isinstance(expected, dict) and all(re.fullmatch(r"[0-9a-f]{64}", expected.get(k, "")) for k in
@@ -271,7 +275,10 @@ def run_process(manifest, role, fixture, run_dir, run_deadline=None):
         args = list(variant["args"])
         if manifest["provider"] != "cpu_mock":
             (run_dir / "native").mkdir()
-            args += ["--attestation", "--output-root", str(run_dir / "native")]
+            # The manifest retains pairs, but NativeConfig accepts named values.
+            # Build one argv item per value; no shell parsing or whitespace split.
+            args = [args[0]] + [f"{flag}={value}" for flag, value in zip(args[1::2], args[2::2])]
+            args += ["--attestation", f"--output-root={run_dir / 'native'}"]
         stage = "spawn"
         process = subprocess.Popen([variant["binary"], *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
         stage = "affinity"

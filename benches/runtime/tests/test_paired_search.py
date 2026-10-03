@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location("paired_search", Path(__file__).parents[1] / "paired_search.py")
 runner = importlib.util.module_from_spec(SPEC)
@@ -68,6 +69,49 @@ class PairedSearchTests(unittest.TestCase):
         path.write_text('{"schema":1,"schema":2}')
         with self.assertRaises(ValueError):
             runner.read_json(path)
+
+    def test_native_launch_uses_named_values_and_rejects_missing_or_duplicate_assets(self):
+        manifest = self.manifest()
+        manifest["provider"] = "onnx_cpu"
+        assets = ["--source-weights", "--onnx-model", "--export-manifest",
+                  "--manifest-sha256", "--ort-library", "--ort-sha256"]
+        variant = manifest["baseline"]
+        variant["args"] = ["--onnx-cpu"]
+        for flag in assets:
+            variant["args"] += [flag, str(self.root / "asset with spaces=exact")]
+        variant["expected_profile"] = {key: 'a' * 64 for key in
+            ("backend_sha256", "model_manifest_sha256", "encoding_manifest_sha256")}
+        manifest["candidate"] = copy.deepcopy(variant)
+        runner.validate(manifest)
+        for args in [variant["args"][:-2], variant["args"] + variant["args"][1:3]]:
+            bad = copy.deepcopy(manifest)
+            bad["baseline"]["args"] = args
+            with self.assertRaisesRegex(ValueError, "each required asset/hash"):
+                runner.validate(bad)
+
+        # Exercise run_process's actual Popen boundary with a protocol fixture.
+        # This verifies transport only; it cannot establish native NN capability.
+        captured = []
+        real_popen = runner.subprocess.Popen
+        code = ("import sys\nfor line in sys.stdin:\n"
+                " c=line.strip()\n"
+                " if c=='uci': print('uciok',flush=True)\n"
+                " elif c=='isready': print('readyok',flush=True)\n"
+                " elif c.startswith('go '): print('bestmove a2a3',flush=True)\n"
+                " elif c=='quit':\n"
+                "  print('ONNX CPU evidence: fixture',file=sys.stderr,flush=True)\n"
+                "  break\n")
+        def launch(argv, **kwargs):
+            captured.append(argv)
+            return real_popen([sys.executable, '-u', '-c', code], **kwargs)
+        with mock.patch.object(runner.subprocess, 'Popen', side_effect=launch), \
+             mock.patch.object(runner, 'native_receipts', return_value={"scope": "fixture"}):
+            result = runner.run_process(manifest, "baseline", manifest["fixtures"][0], self.root / "native-run")
+        self.assertEqual(result["classification"], "diagnostic")
+        expected = [sys.executable, '--onnx-cpu'] + [
+            f"{flag}={value}" for flag, value in zip(variant["args"][1::2], variant["args"][2::2])]
+        expected += ['--attestation', f"--output-root={self.root / 'native-run/native'}"]
+        self.assertEqual(captured, [expected])
 
     def test_serial_orders_are_repeatable_and_balanced(self):
         patterns = runner.order(71, 2, 4)
