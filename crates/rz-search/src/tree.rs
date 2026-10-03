@@ -167,6 +167,11 @@ pub struct Tree<M, P = Puct> {
     counters: SearchCounters,
     #[cfg(feature = "experimental-search-buffers")]
     selection_stats: Vec<EdgeStats>,
+    #[cfg(all(
+        feature = "experimental-search-buffers",
+        feature = "experimental-batch"
+    ))]
+    selection_indices: Vec<usize>,
 }
 
 impl<M: Clone + Eq> Tree<M, Puct> {
@@ -195,6 +200,11 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
             counters: SearchCounters::default(),
             #[cfg(feature = "experimental-search-buffers")]
             selection_stats: Vec::new(),
+            #[cfg(all(
+                feature = "experimental-search-buffers",
+                feature = "experimental-batch"
+            ))]
+            selection_indices: Vec::new(),
         })
     }
 
@@ -367,39 +377,50 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
                     if path.len() >= self.limits.max_depth {
                         return Err(SearchError::DepthLimit);
                     }
+                    #[cfg(feature = "experimental-batch")]
+                    let serial = self.max_pending == 1;
+                    #[cfg(not(feature = "experimental-batch"))]
+                    let serial = true;
                     #[cfg(not(feature = "experimental-search-buffers"))]
-                    let selected = {
+                    let selected = if serial {
                         let stats: Vec<_> = edges.iter().map(|e| e.stats).collect();
-                        #[cfg(feature = "experimental-batch")]
-                        if self.max_pending > 1 {
-                            0
-                        } else {
-                            self.policy.select(&stats)?
-                        }
-                        #[cfg(not(feature = "experimental-batch"))]
                         self.policy.select(&stats)?
+                    } else {
+                        0
                     };
                     #[cfg(feature = "experimental-search-buffers")]
-                    let selected = {
+                    let selected = if serial {
                         self.selection_stats.clear();
                         self.selection_stats
                             .try_reserve(edges.len())
                             .map_err(|_| SearchError::AllocationFailed)?;
                         self.selection_stats
                             .extend(edges.iter().map(|edge| edge.stats));
-                        #[cfg(feature = "experimental-batch")]
-                        if self.max_pending > 1 {
-                            0
-                        } else {
-                            self.policy.select(&self.selection_stats)?
-                        }
-                        #[cfg(not(feature = "experimental-batch"))]
                         self.policy.select(&self.selection_stats)?
+                    } else {
+                        0
                     };
                     #[cfg(feature = "experimental-batch")]
                     let selected = if self.max_pending > 1 {
-                        let mut indices = Vec::with_capacity(edges.len());
-                        let mut stats = Vec::with_capacity(edges.len());
+                        #[cfg(not(feature = "experimental-search-buffers"))]
+                        let (mut scratch_indices, mut scratch_stats) = (
+                            Vec::with_capacity(edges.len()),
+                            Vec::with_capacity(edges.len()),
+                        );
+                        #[cfg(not(feature = "experimental-search-buffers"))]
+                        let (indices, stats) = (&mut scratch_indices, &mut scratch_stats);
+                        #[cfg(feature = "experimental-search-buffers")]
+                        let (indices, stats) = {
+                            self.selection_indices.clear();
+                            self.selection_stats.clear();
+                            self.selection_indices
+                                .try_reserve(edges.len())
+                                .map_err(|_| SearchError::AllocationFailed)?;
+                            self.selection_stats
+                                .try_reserve(edges.len())
+                                .map_err(|_| SearchError::AllocationFailed)?;
+                            (&mut self.selection_indices, &mut self.selection_stats)
+                        };
                         for (index, edge) in edges.iter().enumerate() {
                             if edge.child.is_some_and(|child| {
                                 self.other_pending.iter().any(|p| p.leaf == child)
@@ -425,7 +446,7 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
                             return Err(SearchError::Busy);
                         }
                         *indices
-                            .get(self.policy.select(&stats)?)
+                            .get(self.policy.select(stats)?)
                             .ok_or(SearchError::InvalidPolicySelection)?
                     } else {
                         selected
