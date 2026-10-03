@@ -8,7 +8,7 @@ use rz_contracts::{
     ContractError, Digest, ErrorCode, EvalInputKey, EvalRequest, ModelDescriptor, Move, Stage,
 };
 use rz_encoding::classical::{self, EncodedInput, Frame, HistoryFill, Input, HISTORY_FRAMES};
-use rz_position::{contracts::RulesState, Color, PieceKind, Square};
+use rz_position::{contracts::RulesState, Color, Piece, PieceKind, Square};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -39,22 +39,21 @@ impl ClassicalProjection {
                 "Rules projection allocation failed",
             )
         })?;
+        #[cfg(feature = "experimental-history-frames")]
+        for history in snapshot
+            .recent_history_frames::<HISTORY_FRAMES>()
+            .iter()
+            .flatten()
+        {
+            frames.push(Frame {
+                pieces: read_pieces(history.piece_bitboards(), |square| history.piece_at(square))?,
+                repeated: history.repeated(),
+                en_passant_target: history.en_passant_target().map(Square::index),
+            });
+        }
+        #[cfg(not(feature = "experimental-history-frames"))]
         for history in snapshot.known_history().take(HISTORY_FRAMES) {
-            let mut pieces = [[0; 6]; 2];
-            for index in 0..64 {
-                if let Some(piece) = history.piece_at(Square::new(index)?) {
-                    let color = usize::from(piece.color == Color::Black);
-                    let kind = match piece.kind {
-                        PieceKind::Pawn => 0,
-                        PieceKind::Knight => 1,
-                        PieceKind::Bishop => 2,
-                        PieceKind::Rook => 3,
-                        PieceKind::Queen => 4,
-                        PieceKind::King => 5,
-                    };
-                    pieces[color][kind] |= 1u64 << index;
-                }
-            }
+            let pieces = read_pieces(history.piece_bitboards(), |square| history.piece_at(square))?;
             let identity = history.repetition_identity();
             let repeated = history
                 .known_history()
@@ -124,6 +123,33 @@ impl ClassicalProjection {
         let projection = self.project(request.position().state())?;
         self.binding.prepare(request, projection.input())
     }
+}
+
+fn read_pieces(
+    bitboards: &[u64; 12],
+    piece_at: impl Fn(Square) -> Option<Piece>,
+) -> Result<[[u64; 6]; 2], ContractError> {
+    if cfg!(feature = "experimental-bitboards") {
+        return Ok(std::array::from_fn(|color| {
+            std::array::from_fn(|kind| bitboards[color * 6 + kind])
+        }));
+    }
+    let mut pieces = [[0; 6]; 2];
+    for index in 0..64 {
+        if let Some(piece) = piece_at(Square::new(index)?) {
+            let color = usize::from(piece.color == Color::Black);
+            let kind = match piece.kind {
+                PieceKind::Pawn => 0,
+                PieceKind::Knight => 1,
+                PieceKind::Bishop => 2,
+                PieceKind::Rook => 3,
+                PieceKind::Queen => 4,
+                PieceKind::King => 5,
+            };
+            pieces[color][kind] |= 1u64 << index;
+        }
+    }
+    Ok(pieces)
 }
 
 pub struct RulesProjection {

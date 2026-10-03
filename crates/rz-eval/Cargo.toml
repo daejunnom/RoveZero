@@ -26,6 +26,9 @@ rz-runtime = { workspace = true, optional = true, features = ["contracts"] }
 default = []
 onnx = ["dep:ort", "dep:rz-native-loader"]
 contracts = ["dep:rz-contracts", "dep:rz-position", "dep:rz-runtime"]
+# Independent OPT-01 experiments; original projection remains available.
+experimental-bitboards = ["contracts"]
+experimental-history-frames = ["contracts"]
 
 [[example]]
 name = "maia_check"

@@ -95,6 +95,32 @@ pub struct PositionSnapshot {
     owner: Arc<()>,
     revision: u64,
 }
+
+/// A borrowed exact historical frame. Padding and missing history are encoder
+/// concerns; `repeated` compares only strictly older known nodes, without an
+/// irreversible cutoff. Borrowing never issues a live authority or clones Arc.
+#[derive(Clone, Copy)]
+pub struct HistoryFrame<'a> {
+    node: &'a HistoryNode,
+    repeated: bool,
+}
+
+impl HistoryFrame<'_> {
+    /// White P/N/B/R/Q/K followed by Black P/N/B/R/Q/K; a1 is bit zero.
+    pub fn piece_bitboards(&self) -> &[u64; 12] {
+        &self.node.state.board.bitboards
+    }
+    pub fn piece_at(&self, square: Square) -> Option<Piece> {
+        self.node.state.board.get(square)
+    }
+    pub fn en_passant_target(&self) -> Option<Square> {
+        self.node.state.ep
+    }
+    pub fn repeated(&self) -> bool {
+        self.repeated
+    }
+}
+
 impl PositionSnapshot {
     pub fn rules_version(&self) -> &'static str {
         RULES_VERSION
@@ -113,6 +139,39 @@ impl PositionSnapshot {
     }
     pub fn piece_at(&self, s: Square) -> Option<Piece> {
         self.identity.history.state.board.get(s)
+    }
+    /// Read-only maintained bitboards; the ordering matches HistoryFrame.
+    pub fn piece_bitboards(&self) -> &[u64; 12] {
+        &self.identity.history.state.board.bitboards
+    }
+    /// Newest-first frames with exact model repetition flags, in a single
+    /// borrowed pass over the full known prefix. Storage is bounded by N.
+    pub fn recent_history_frames<const N: usize>(&self) -> [Option<HistoryFrame<'_>>; N] {
+        let mut frames: [Option<HistoryFrame<'_>>; N] = [None; N];
+        if N == 0 {
+            return frames;
+        }
+        let mut at = Some(self.identity.history.as_ref());
+        let mut count = 0;
+        while let Some(node) = at {
+            for frame in frames.iter_mut().take(count.min(N)).flatten() {
+                if !frame.repeated && frame.node.repetition == node.repetition {
+                    frame.repeated = true;
+                }
+            }
+            if count < N {
+                frames[count] = Some(HistoryFrame {
+                    node,
+                    repeated: false,
+                });
+            }
+            count += 1;
+            if count >= N && frames.iter().flatten().all(|frame| frame.repeated) {
+                break;
+            }
+            at = node.previous.as_deref();
+        }
+        frames
     }
     pub fn halfmove_clock(&self) -> u32 {
         self.identity.history.state.halfmove

@@ -246,3 +246,10 @@ identity와 검증된 native 출처를 함께 대조한다. B의 CPU V1 영수�
 포함 third-party notices를 따른다. 선정 원본/ONNX는 upstream GPL-3.0 외부 자산이다.
 LC0 GPL 구현·테이블·protobuf 생성 코드를 제품에 복사·링크하지 않는다. 변환 산출물의
 RIGHTS.txt는 provenance 메모이며 재배포 source/notice 의무 충족 확인을 대신하지 않는다.
+# OPT-01 projection 실험
+
+`experimental-bitboards`는 Rules가 유지하는 읽기 전용 12개 bitboard를 사용한다.
+`experimental-history-frames`는 최근 8개 frame의 반복 정보를 전체 known prefix의
+borrowed 단일 순회에서 구한다. 두 옵션은 기본 off이며 독립 활성화할 수 있다.
+원래 square 재구성/owned-history 경로를 대조군으로 유지한다. 이력을 절단하거나
+unknown-prefix·raw EP·history fill 의미를 변경하지 않는다.
