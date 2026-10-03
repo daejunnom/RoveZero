@@ -3,7 +3,7 @@
 
 use rz_arena::{
     validate_cuda_bundle_manifest_fields, validate_cuda_placement_trace_fields,
-    validate_native_cuda_provider_record_fields,
+    validate_native_cuda_process_exit_trace, validate_native_cuda_provider_record_fields,
 };
 use rz_experiments::*;
 use serde_json::{Value, json};
@@ -13,6 +13,107 @@ use sha2::{Digest, Sha256};
 // inference/drain evidence is produced by these tests.
 fn sha(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn exit_trace(pid: u32, status: &str) -> String {
+    format!(
+        "[TRACE ] [10:51:44.181984] <     137433152747200> fastchess --- Process with pid: {pid} terminated with status: {status}\n"
+    )
+}
+
+fn four_exit_traces() -> String {
+    // Synthetic zero statuses using the captured fixed renderer. No child,
+    // neural computation, physical drain or Rules evidence is produced here.
+    [402, 413, 447, 455]
+        .map(|pid| exit_trace(pid, "0"))
+        .concat()
+}
+
+#[test]
+fn cuda_process_exit_trace_requires_four_distinct_validated_native_pids() {
+    let trace = four_exit_traces();
+    validate_native_cuda_process_exit_trace(trace.as_bytes(), &[455, 402, 447, 413]).unwrap();
+    for expected in [
+        vec![402, 413, 447],
+        vec![402, 413, 447, 447],
+        vec![402, 413, 447, 0],
+        vec![402, 413, 447, u32::MAX],
+    ] {
+        assert!(validate_native_cuda_process_exit_trace(trace.as_bytes(), &expected).is_err());
+    }
+}
+
+#[test]
+fn cuda_process_exit_trace_rejects_partial_duplicate_and_foreign_closure() {
+    let full = four_exit_traces();
+    let cases = [
+        full.replace(&exit_trace(455, "0"), ""),
+        format!("{full}{}", exit_trace(413, "0")),
+        full.replace(&exit_trace(455, "0"), &exit_trace(456, "0")),
+        format!("{full}{}", exit_trace(456, "0")),
+        full.trim_end_matches('\n').into(),
+    ];
+    for trace in cases {
+        assert!(
+            validate_native_cuda_process_exit_trace(trace.as_bytes(), &[402, 413, 447, 455])
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn cuda_process_exit_trace_rejects_late_abort_and_unknown_status() {
+    let full = four_exit_traces();
+    // First failed pair's numeric raw SIGABRT status must reject even when a
+    // separately validated native termination record claimed success.
+    for status in ["134", "256", "9", "-1", "00", "+0", "0 extra", ""] {
+        let trace = full.replace(&exit_trace(413, "0"), &exit_trace(413, status));
+        assert!(
+            validate_native_cuda_process_exit_trace(trace.as_bytes(), &[402, 413, 447, 455])
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn cuda_process_exit_trace_requires_closed_renderer_and_bounds() {
+    let full = four_exit_traces();
+    let cases = [
+        full.replace("[TRACE ]", "[TRACE]"),
+        full.replace("10:51:44.181984", "24:51:44.181984"),
+        full.replace("10:51:44.181984", "10:60:44.181984"),
+        full.replace("     137433152747200", "    137433152747200"),
+        full.replace("pid: 413", "pid: 0413"),
+        full.replace("pid: 413", "pid: 4294967296"),
+        format!(
+            "{full}{}",
+            exit_trace(456, "0").replace("pid: 456", "pid 456")
+        ),
+        format!(
+            "{full}[TRACE ] [10:51:44.181984] <     137433152747200> fastchess --- Force terminating process with pid: 413 0\n"
+        ),
+        format!("{full}{}\n", "x".repeat(4097)),
+        format!("{full}{}", "\n".repeat(131_073)),
+        String::new(),
+    ];
+    for trace in cases {
+        assert!(
+            validate_native_cuda_process_exit_trace(trace.as_bytes(), &[402, 413, 447, 455])
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn cuda_process_exit_trace_does_not_accept_engine_quoted_runner_records() {
+    let quoted = four_exit_traces().lines().map(|line| {
+        format!("[Engine] [10:51:44.181984] <     137433152747200> cuda-native-baseline ---> {line}\n")
+    }).collect::<String>();
+    assert!(
+        validate_native_cuda_process_exit_trace(quoted.as_bytes(), &[402, 413, 447, 455]).is_err()
+    );
+    let trace = format!("{}{quoted}", four_exit_traces());
+    validate_native_cuda_process_exit_trace(trace.as_bytes(), &[402, 413, 447, 455]).unwrap();
 }
 fn artifact(path: &str, digest: &str, bytes: u64) -> ArtifactRef {
     ArtifactRef {

@@ -38,6 +38,124 @@ pub struct NativeCudaProviderSessionAudit {
     pub cuda_profile_sha256: String,
 }
 
+/// Verify the fixed Linux Fastchess renderer, not an engine's self-report.
+/// The caller supplies four identities from validated startup records and the
+/// supervisor-owned, bounded stdout whose ArtifactRef is already retained.
+/// This pinned source logs raw wait status: only decimal `0` proves exit zero.
+/// Missing records (including earlier reaping), malformed records or renderer
+/// changes are unsupported evidence and fail closed, never inferred as success.
+pub fn validate_native_cuda_process_exit_trace(
+    stdout: &[u8],
+    expected_pids: &[u32],
+) -> Result<(), ArenaError> {
+    const MAX_BYTES: usize = 64 * 1024 * 1024;
+    const MAX_LINES: usize = 131_072;
+    const MAX_LINE_BYTES: usize = 4096;
+    let fail = |reason: &str| ArenaError::Integrity(reason.into());
+    if expected_pids.len() != 4
+        || expected_pids
+            .iter()
+            .any(|pid| *pid == 0 || *pid > i32::MAX as u32)
+        || expected_pids
+            .iter()
+            .enumerate()
+            .any(|(index, pid)| expected_pids[..index].contains(pid))
+    {
+        return Err(fail(
+            "CUDA exit trace requires exactly four distinct native PIDs",
+        ));
+    }
+    if stdout.is_empty() || stdout.len() > MAX_BYTES || !stdout.ends_with(b"\n") {
+        return Err(fail(
+            "CUDA exit trace is empty, over budget or unterminated",
+        ));
+    }
+    let text = std::str::from_utf8(stdout).map_err(|_| fail("CUDA runner stdout is not UTF-8"))?;
+    let mut seen = [false; 4];
+    for (index, line) in text.split_terminator('\n').enumerate() {
+        if index >= MAX_LINES || line.len() > MAX_LINE_BYTES {
+            return Err(fail("CUDA runner trace line budget exceeded"));
+        }
+        // Logger::readFromEngine adds its own anchored [Engine] prefix to each
+        // protocol line; a quoted TRACE-looking payload cannot supply evidence.
+        if !line.starts_with("[TRACE")
+            || !(line.contains("Process with pid")
+                || line.contains("Force terminating process with pid"))
+        {
+            continue;
+        }
+        if !line.is_ascii() {
+            return Err(fail("CUDA process exit renderer is not ASCII"));
+        }
+        let message = cuda_exit_trace_message(line)
+            .ok_or_else(|| fail("CUDA process exit renderer is malformed"))?;
+        if message.starts_with("Force terminating process with pid:") {
+            return Err(fail("CUDA native process required force termination"));
+        }
+        let (pid_text, status) = message
+            .strip_prefix("Process with pid: ")
+            .and_then(|value| value.split_once(" terminated with status: "))
+            .ok_or_else(|| fail("CUDA native process exit record is malformed"))?;
+        let pid = pid_text
+            .parse::<u32>()
+            .map_err(|_| fail("CUDA native process exit PID is malformed"))?;
+        if pid_text != pid.to_string() {
+            return Err(fail(
+                "CUDA native process exit PID is not canonical decimal",
+            ));
+        }
+        let slot = expected_pids
+            .iter()
+            .position(|expected| *expected == pid)
+            .ok_or_else(|| fail("CUDA runner trace contains a foreign native PID"))?;
+        if seen[slot] {
+            return Err(fail("CUDA native process exit evidence is duplicated"));
+        }
+        if status != "0" {
+            return Err(fail(
+                "CUDA native process exit status is nonzero or malformed",
+            ));
+        }
+        seen[slot] = true;
+    }
+    if seen.iter().any(|present| !present) {
+        return Err(fail("CUDA native process exit evidence is incomplete"));
+    }
+    Ok(())
+}
+
+fn cuda_exit_trace_message(line: &str) -> Option<&str> {
+    // Pinned logger.hpp:157: [label left-width6] [time width15]
+    // <thread right-width20> fastchess --- message. TRACE_THREAD is nonempty.
+    let (time, tail) = line.strip_prefix("[TRACE ] [")?.split_once("] <")?;
+    let time = time.as_bytes();
+    if time.len() != 15
+        || time[2] != b':'
+        || time[5] != b':'
+        || time[8] != b'.'
+        || time
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| !matches!(index, 2 | 5 | 8) && !byte.is_ascii_digit())
+        || (time[0] - b'0') * 10 + time[1] - b'0' > 23
+        || (time[3] - b'0') * 10 + time[4] - b'0' > 59
+        || (time[6] - b'0') * 10 + time[7] - b'0' > 59
+    {
+        return None;
+    }
+    let (thread, message) = tail.split_once("> fastchess --- ")?;
+    let digits = thread.trim_start_matches(' ');
+    if thread.len() != 20
+        || digits.is_empty()
+        || digits.starts_with('0')
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || digits.parse::<u64>().is_err()
+    {
+        return None;
+    }
+    Some(message)
+}
+
 impl crate::native_launch::sealed::Sealed for LockedCudaIntegrationPairSpecV1 {}
 impl NativeLaunchDeclaration for LockedCudaIntegrationPairSpecV1 {
     fn input_sha256(&self) -> &str {
@@ -110,6 +228,14 @@ impl NativeProviderDeclaration for LockedCudaIntegrationPairSpecV1 {
     }
     fn termination_filename(&self) -> &'static str {
         "native-cuda-termination.v1.json"
+    }
+    #[cfg(target_os = "linux")]
+    fn validate_process_exit_trace(
+        &self,
+        stdout: &[u8],
+        expected_pids: &[u32],
+    ) -> Result<(), ArenaError> {
+        validate_native_cuda_process_exit_trace(stdout, expected_pids)
     }
     #[cfg(target_os = "linux")]
     fn validate_records(

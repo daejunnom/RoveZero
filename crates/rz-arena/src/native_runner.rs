@@ -54,6 +54,17 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
     ) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
         Ok(Vec::new())
     }
+    /// Additional provider-specific acceptance of the supervisor-owned stdout.
+    /// CPU V1 keeps its existing gate; CUDA requires the pinned runner's exit
+    /// observations for the same four identities validated from native records.
+    #[cfg(target_os = "linux")]
+    fn validate_process_exit_trace(
+        &self,
+        _stdout: &[u8],
+        _expected_pids: &[u32],
+    ) -> Result<(), ArenaError> {
+        Ok(())
+    }
 }
 impl NativeProviderDeclaration for rz_experiments::LockedIntegrationPairSpecV1 {
     type Audit = NativeProviderSessionAudit;
@@ -700,7 +711,7 @@ pub(crate) mod linux {
                 }
                 Err(error) => receipt.pgn_audit_error = Some(error.to_string()),
             }
-            match audit_providers(owner, &mut receipt.artifacts) {
+            match audit_providers(owner, &process.stdout, &mut receipt.artifacts) {
                 Ok(sessions) => receipt.provider_sessions = sessions,
                 Err(error) => receipt.provider_audit_error = Some(error.to_string()),
             }
@@ -1313,6 +1324,7 @@ pub(crate) mod linux {
     }
     fn audit_providers<S: NativeProviderDeclaration>(
         owner: &NativeLaunchOwner<S>,
+        stdout: &[u8],
         artifacts: &mut Vec<ArtifactRef>,
     ) -> Result<Vec<S::Audit>, ArenaError> {
         let mut sessions = Vec::new();
@@ -1425,6 +1437,10 @@ pub(crate) mod linux {
                 sessions.push(audit);
             }
         }
+        let expected_pids: Vec<_> = ids.into_iter().collect();
+        owner
+            .spec
+            .validate_process_exit_trace(stdout, &expected_pids)?;
         Ok(sessions)
     }
 }
