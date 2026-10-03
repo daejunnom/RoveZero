@@ -71,9 +71,12 @@ GPU의 실제 추론·계측·정식 GPU 대국과 실제 학습을 지원 환�
 새 실험이나 유료 GPU 실행을 승인하지 않습니다.
 
 초기 RTX 4050 검증은 장비별 이력으로 보존합니다. 사용자 후속 지시에 따라 GPU
-벤치마크는 외부 RunPod 환경에서 준비합니다. GPU 종류·비용·실행 시간·저장소를
-확정하기 전에는 [준비 계획](docs/research/RUNPOD-BENCHMARK-PLAN.md)의 후보를
-실제 배포나 검증 완료로 기록하지 않습니다.
+벤치마크는 외부 RunPod 환경에서 준비합니다. 후속 사용자 지시에 따라 먼저
+[의미 보존 CPU 최적화](docs/research/PRE-RUNPOD-OPTIMIZATION.md)를 검증하고,
+Community 후보·network volume 미사용·초기 총예산 약 US$200·Oracle 회수를
+[준비 계획](docs/research/RUNPOD-BENCHMARK-PLAN.md)에 반영합니다. 총괄이 관련 지출을
+합산하며 각 담당에게 별도의 US$200 사용권을 부여하는 것은 아닙니다. GPU 종류·
+최종 quote·유한 실행과 보존·과금 종료 조건을 잠그고 실제 배포/검증 증거를 별도로 남깁니다.
 
 독립 Linux 클라우드는 Windows/WSL 내보내기 경로를 요구하지 않습니다. 저장소 밖의
 작업 전용 output root·소유자·보존 기간·작업 종료 전 회수 경로를 명시합니다.

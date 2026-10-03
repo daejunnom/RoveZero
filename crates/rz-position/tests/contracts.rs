@@ -139,6 +139,143 @@ fn shared_move(uci: &str) -> shared::Move {
     shared::Move::try_from(BoardMove::from_uci(uci).unwrap()).unwrap()
 }
 
+#[test]
+fn attested_forks_match_reexported_children_for_special_moves_claims_and_history() {
+    let mut history = Position::startpos();
+    history
+        .apply_uci_moves(&["g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1"])
+        .unwrap();
+    let mut cases = vec![Position::startpos(), history];
+    for fen in [
+        "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+        "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1",
+        "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2",
+        "4k3/P7/8/8/8/8/7p/4K3 w - - 0 1",
+        "7k/8/8/8/8/8/8/KR6 w - - 99 80",
+        "7k/8/8/8/8/8/8/KR6 w - - 149 80",
+    ] {
+        cases.push(Position::from_fen(fen).unwrap());
+    }
+    // This test's local registry also never reissues an owner to another fork.
+    let mut sequence = 20_000_u64;
+    let mut allocate = || {
+        let owner = shared::OwnerId(sequence);
+        sequence = sequence.checked_add(1).unwrap();
+        owner
+    };
+    for (index, position) in cases.into_iter().enumerate() {
+        let parent = ContractPosition::new(shared::OwnerId(10_000 + index as u64), position);
+        let frozen = parent.export().unwrap();
+        for &movement in frozen.legal_moves().moves() {
+            // Independent consumer path retained as the previous API baseline:
+            // clone, export its own view, apply, then export the child.
+            let mut previous = ContractPosition::new(allocate(), parent.position().clone());
+            let previous_view = previous.export().unwrap();
+            previous.make_from_view(&previous_view, movement).unwrap();
+            let expected = previous.export().unwrap();
+            let child = parent
+                .fork_from_view(allocate(), &frozen, movement)
+                .unwrap();
+            let actual = child.export().unwrap();
+            assert_eq!(
+                actual.snapshot().identity().semantic,
+                expected.snapshot().identity().semantic
+            );
+            assert_eq!(
+                actual.snapshot().identity().revision,
+                expected.snapshot().identity().revision
+            );
+            assert_eq!(actual.legal_moves().order(), expected.legal_moves().order());
+            assert_eq!(actual.legal_moves().moves(), expected.legal_moves().moves());
+            assert_eq!(
+                actual.rules().classification(),
+                expected.rules().classification()
+            );
+            assert_eq!(
+                actual.snapshot().classification(),
+                expected.snapshot().classification()
+            );
+            assert_eq!(actual.terminal_wdl(), expected.terminal_wdl());
+            assert!(actual
+                .rules()
+                .snapshot()
+                .same_state(expected.rules().snapshot()));
+            assert_ne!(
+                actual.snapshot().identity().owner,
+                frozen.snapshot().identity().owner
+            );
+            assert!(parent
+                .position()
+                .matches_snapshot(frozen.rules().snapshot()));
+        }
+    }
+}
+
+#[test]
+fn forks_reject_foreign_stale_illegal_terminal_and_reused_owner_without_mutation() {
+    let mut parent = ContractPosition::new(shared::OwnerId(40_000), Position::startpos());
+    let frozen = parent.export().unwrap();
+    let foreign = ContractPosition::new(shared::OwnerId(40_001), parent.position().clone())
+        .export()
+        .unwrap();
+    for (view, movement, owner, code) in [
+        (
+            &foreign,
+            shared_move("e2e4"),
+            shared::OwnerId(40_002),
+            shared::ErrorCode::Stale,
+        ),
+        (
+            &frozen,
+            shared_move("e2e5"),
+            shared::OwnerId(40_002),
+            shared::ErrorCode::InvalidInput,
+        ),
+        (
+            &frozen,
+            shared_move("e2e4"),
+            shared::OwnerId(40_000),
+            shared::ErrorCode::IdentityMismatch,
+        ),
+    ] {
+        assert_eq!(
+            parent
+                .fork_from_view(owner, view, movement)
+                .unwrap_err()
+                .code,
+            code
+        );
+        assert!(parent
+            .position()
+            .matches_snapshot(frozen.rules().snapshot()));
+    }
+    let undo = parent.make_from_view(&frozen, shared_move("e2e4")).unwrap();
+    parent.unmake(undo).unwrap();
+    let current = parent.position().snapshot();
+    assert_eq!(
+        parent
+            .fork_from_view(shared::OwnerId(40_002), &frozen, shared_move("e2e4"))
+            .unwrap_err()
+            .code,
+        shared::ErrorCode::Stale
+    );
+    assert!(parent.position().matches_snapshot(&current));
+    let terminal = imported(40_003, "7k/8/8/8/8/8/8/KR6 w - - 150 80");
+    let view = terminal.export().unwrap();
+    assert!(!view.legal_moves().moves().is_empty());
+    let movement = view.legal_moves().moves()[0];
+    assert_eq!(
+        terminal
+            .fork_from_view(shared::OwnerId(40_004), &view, movement)
+            .unwrap_err()
+            .code,
+        shared::ErrorCode::InvalidInput
+    );
+    assert!(terminal
+        .position()
+        .matches_snapshot(view.rules().snapshot()));
+}
+
 fn play(position: &mut ContractPosition, uci: &str) -> rz_position::UndoToken {
     let state = position.export().unwrap();
     position.make_from_view(&state, shared_move(uci)).unwrap()

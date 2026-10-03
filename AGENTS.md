@@ -71,7 +71,10 @@
   별도 GPU 검증 환경을 구분하며 모든 담당에게 GPU가 있다고 가정하지 않는다.
   초기 RTX 4050 6GB 인수는 해당 장비의 이력으로 보존한다. 후속 GPU 벤치마크는
   사용자 지정 외부 RunPod 환경에서 준비하며 GPU·지역·실행/보존 예산은 별도로 잠근다.
-  [RunPod 준비 계획](docs/research/RUNPOD-BENCHMARK-PLAN.md)과 결정 D033을 따른다.
+  [RunPod 준비 계획](docs/research/RUNPOD-BENCHMARK-PLAN.md)과 결정 D033/D034를 따른다.
+  GPU A/B 전에 의미 보존 중복·복제·병목을 먼저 검증하며, CPU 개선을 GPU 개선으로
+  보고하지 않는다. 후속 준비는 Community 후보·network volume 미사용·초기 총예산
+  약 US$200·Oracle 외부 회수를 기준으로 하고 Pod Env 등록은 사용자 담당이다.
   착수·재개 때 OS·CPU·메모리·저장 공간·toolchain과 사용 가능한 backend/GPU capability를
   필요한 범위에서 확인하고 available/unavailable/unknown 상태를 기록한다. CUDA 도구가
   설치됐다는 사실만으로 실제 장치 접근·추론 지원을 판정하지 않는다.

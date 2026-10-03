@@ -25,7 +25,7 @@ use crate::{
 };
 use rz_contracts as shared;
 use sha2::{Digest as _, Sha256};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub const CONTRACT_SOURCE_REVISION: &str = "67284c4f66f7a7ae9f46fa63dfd50e7410eb6845";
 
@@ -121,8 +121,10 @@ impl ContractPosition {
     /// Derive metadata from one current Rules state; no caller-provided digest,
     /// classification or move array is accepted as an attestation.
     pub fn export(&self) -> Result<ContractState, shared::ContractError> {
-        let classification = self.position.classify_position()?;
         let local_legal = self.position.ordered_legal_moves();
+        let classification = self
+            .position
+            .classify_with_generated_legal(local_legal.moves())?;
         let local_snapshot = local_legal.snapshot();
         let identity = shared::StateIdentity {
             owner: self.owner,
@@ -167,6 +169,36 @@ impl ContractPosition {
         view: &ContractState,
         mv: shared::Move,
     ) -> Result<UndoToken, shared::ContractError> {
+        self.validate_view(view)?;
+        Ok(self
+            .position
+            .make_from_view(&view.local_legal, BoardMove::try_from(mv)?)?)
+    }
+    /// Reuse this owner's attested immutable view to create one checked child.
+    /// The registry must supply a fresh nonreused owner, just as for `new`.
+    /// History, revision, intended-claim errors and legal order are unchanged;
+    /// the child is exported separately, without reclassifying its parent.
+    pub fn fork_from_view(
+        &self,
+        owner: shared::OwnerId,
+        view: &ContractState,
+        mv: shared::Move,
+    ) -> Result<Self, shared::ContractError> {
+        self.validate_view(view)?;
+        if owner == self.owner {
+            return Err(shared::ContractError::new(
+                shared::ErrorCode::IdentityMismatch,
+                shared::Stage::Admission,
+                "fork requires a fresh registry owner",
+            ));
+        }
+        Ok(Self::new(
+            owner,
+            self.position
+                .fork_from_view(&view.local_legal, BoardMove::try_from(mv)?)?,
+        ))
+    }
+    fn validate_view(&self, view: &ContractState) -> Result<(), shared::ContractError> {
         if view.snapshot.identity().owner != self.owner
             || !self.position.matches_snapshot(view.local_legal.snapshot())
         {
@@ -179,9 +211,7 @@ impl ContractPosition {
                 "exact terminal cannot accept a further game move",
             ));
         }
-        Ok(self
-            .position
-            .make_from_view(&view.local_legal, BoardMove::try_from(mv)?)?)
+        Ok(())
     }
     pub fn unmake(&mut self, token: UndoToken) -> Result<(), shared::ContractError> {
         Ok(self.position.unmake(token)?)
@@ -314,7 +344,8 @@ fn frame(hash: &mut Sha256, bytes: &[u8]) {
 
 /// Profile identity is independent of runtime owner, model and game generation.
 pub fn profile_digest() -> shared::Digest {
-    shared::Digest(Sha256::digest(IDENTITY_PROFILE.as_bytes()).into())
+    static PROFILE: OnceLock<shared::Digest> = OnceLock::new();
+    *PROFILE.get_or_init(|| shared::Digest(Sha256::digest(IDENTITY_PROFILE.as_bytes()).into()))
 }
 
 fn state_digest(snapshot: &PositionSnapshot) -> shared::Digest {

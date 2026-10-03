@@ -8,6 +8,12 @@ CPU/mock 인수 소스는 `4866a0b67dfd0aac10ffb03a0debd61fa018db3d`, 후속 실
 총괄이 관측한 실제 검사이며 GPU·학습·정식 대국과 구분한다.
 문서 후속 수정의 재사용 확인도 실제 실행과 구분한다.
 원시 근거는 저장소 밖에 보존하고 논리 경로·digest만 연결한다.
+후속 GPU A/B 이전의 의미 보존 최적화 제품 소스는
+`1cdd707922dcaaf234b4cd162210ce9f2fa512bb`다. CPU workspace 675개·strict clippy와
+양 OS CI, 같은 상태 witness와 CPU 교차 측정을 확인했다.
+[사전 최적화 기록](research/PRE-RUNPOD-OPTIMIZATION.md)을 따르며 현재 소스의 실제 NN/GPU
+실행으로 확대하지 않는다. Community 후보·network volume 미사용·초기 총예산 약 US$200과
+Oracle 보존 경로는 [외부 계획](research/RUNPOD-BENCHMARK-PLAN.md)에 기록한다.
 실제 CPU 신경망의 Fastchess pair 연결 인수 소스는
 `0f0d70dddb170e7d46729eb19da02e810f0dee61`이며 후속 절에 별도로 기록한다.
 첫 목표 CUDA 수치·provider 인수 소스는 `bde687c7f269af3c7cd501201edde14c5c8ef642`다.

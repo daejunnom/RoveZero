@@ -89,6 +89,15 @@ impl Position {
     /// Operational errors while checking intended moves are returned rather
     /// than silently dropping claim evidence.
     pub fn classify_position(&self) -> Result<PositionClassification, PositionError> {
+        self.classify_with_generated_legal(&self.legal_moves())
+    }
+
+    /// Rules callers may reuse the ordered legal array generated for this exact
+    /// immutable state. This is not a public caller-supplied legality boundary.
+    pub(crate) fn classify_with_generated_legal(
+        &self,
+        legal: &[BoardMove],
+    ) -> Result<PositionClassification, PositionError> {
         let known_repetitions = self.known_repetition_count();
         let repetition_complete = self.repetition_history_complete();
         let fivefold = repetition_availability(known_repetitions, 5, repetition_complete);
@@ -116,7 +125,6 @@ impl Position {
             },
         ];
 
-        let legal = self.legal_moves();
         let play_status = if legal.is_empty() {
             if self.in_check() {
                 PlayStatus::Terminal {
@@ -137,7 +145,7 @@ impl Position {
         };
 
         if play_status == PlayStatus::Ongoing {
-            for mv in legal {
+            for &mv in legal {
                 let child = self.preview_generated(mv)?;
                 let repetition = repetition_availability(
                     child.known_repetition_count(),

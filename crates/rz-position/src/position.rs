@@ -240,6 +240,14 @@ pub struct Position {
     revision: u64,
     limits: PositionLimits,
 }
+/// One checked transition, shared by live mutation and immutable previews.
+/// Undo deltas belong only to the mutation path, not to claim/search previews.
+struct GeneratedChild {
+    state: CoreState,
+    history: Arc<HistoryNode>,
+    revision: u64,
+    kind: RuleMoveKind,
+}
 impl Clone for Position {
     fn clone(&self) -> Self {
         Self {
@@ -400,6 +408,22 @@ impl Position {
         }
         self.make_generated(mv)
     }
+    /// A fork checks the live source's view before cloning its immutable history.
+    /// The clone owns a fresh concrete owner; the source view cannot mutate it.
+    #[cfg(feature = "contracts")]
+    pub(crate) fn fork_from_view(
+        &self,
+        view: &LegalMoveView,
+        mv: BoardMove,
+    ) -> Result<Self, PositionError> {
+        if !self.matches_snapshot(&view.snapshot) {
+            return Err(PositionError::StaleView);
+        }
+        if !view.moves.contains(&mv) {
+            return Err(PositionError::IllegalMove);
+        }
+        self.preview_generated(mv)
+    }
     /// Applies board-legal moves. Search/arena must consume classification first
     /// to enforce terminal/claim game policy; perft counts board-legal moves.
     pub fn make_move(&mut self, mv: BoardMove) -> Result<UndoToken, PositionError> {
@@ -412,6 +436,44 @@ impl Position {
         self.make_move(mv.parse()?)
     }
     fn make_generated(&mut self, mv: BoardMove) -> Result<UndoToken, PositionError> {
+        let generated = self.prepare_generated(mv)?;
+        let before = self.snapshot();
+        let mut removals = Vec::new();
+        let mut additions = Vec::new();
+        for i in 0..64 {
+            let square = Square(i);
+            let old = self.state.board.get(square);
+            let new = generated.state.board.get(square);
+            if old != new {
+                if let Some(piece) = old {
+                    removals.push(PieceChange { square, piece });
+                }
+                if let Some(piece) = new {
+                    additions.push(PieceChange { square, piece });
+                }
+            }
+        }
+        let parent = self.history.clone();
+        let child = generated.history.clone();
+        let kind = generated.kind;
+        self.install_generated(generated);
+        let delta = RuleMoveDelta {
+            mv,
+            kind,
+            removals,
+            additions,
+            before,
+            after: self.snapshot(),
+        };
+        Ok(UndoToken {
+            owner: self.owner.clone(),
+            parent,
+            child,
+            delta,
+        })
+    }
+    /// No state escapes until all history, revision and counter checks pass.
+    fn prepare_generated(&self, mv: BoardMove) -> Result<GeneratedChild, PositionError> {
         if self.history.len >= self.limits.max_history_positions {
             return Err(PositionError::ResourceLimit("history positions"));
         }
@@ -420,7 +482,6 @@ impl Position {
             .checked_add(1)
             .ok_or(PositionError::RevisionExhausted)?;
         let piece = self.state.board.get(mv.from).expect("checked legal move");
-        let before = self.snapshot();
         let mut child_state = self.state.clone();
         let ep = piece.kind == PieceKind::Pawn
             && self.state.ep == Some(mv.to)
@@ -441,21 +502,6 @@ impl Position {
                 .checked_add(1)
                 .ok_or(PositionError::CounterOverflow)?;
         }
-        let mut removals = Vec::new();
-        let mut additions = Vec::new();
-        for i in 0..64 {
-            let square = Square(i);
-            let old = self.state.board.get(square);
-            let new = child_state.board.get(square);
-            if old != new {
-                if let Some(piece) = old {
-                    removals.push(PieceChange { square, piece });
-                }
-                if let Some(piece) = new {
-                    additions.push(PieceChange { square, piece });
-                }
-            }
-        }
         let child = Arc::new(HistoryNode {
             repetition: RepetitionIdentity::of(&child_state),
             state: child_state.clone(),
@@ -465,12 +511,10 @@ impl Position {
                 || capture
                 || child_state.castling != self.state.castling,
         });
-        let parent = self.history.clone();
-        self.state = child_state;
-        self.history = child.clone();
-        self.revision = revision;
-        let delta = RuleMoveDelta {
-            mv,
+        Ok(GeneratedChild {
+            state: child_state,
+            history: child,
+            revision,
             kind: RuleMoveKind {
                 capture,
                 castling: piece.kind == PieceKind::King
@@ -478,17 +522,12 @@ impl Position {
                 en_passant: ep,
                 promotion: mv.promotion.is_some(),
             },
-            removals,
-            additions,
-            before,
-            after: self.snapshot(),
-        };
-        Ok(UndoToken {
-            owner: self.owner.clone(),
-            parent,
-            child,
-            delta,
         })
+    }
+    fn install_generated(&mut self, generated: GeneratedChild) {
+        self.state = generated.state;
+        self.history = generated.history;
+        self.revision = generated.revision;
     }
     pub fn unmake(&mut self, token: UndoToken) -> Result<(), PositionError> {
         if !Arc::ptr_eq(&self.owner, &token.owner) || !Arc::ptr_eq(&self.history, &token.child) {
@@ -528,7 +567,8 @@ impl Position {
     /// Classifier already owns a generated legal list for this immutable state.
     pub(crate) fn preview_generated(&self, mv: BoardMove) -> Result<Self, PositionError> {
         let mut child = self.clone();
-        child.make_generated(mv)?;
+        let generated = child.prepare_generated(mv)?;
+        child.install_generated(generated);
         Ok(child)
     }
     pub fn known_repetition_count(&self) -> usize {
@@ -626,6 +666,14 @@ mod tests {
         ));
         assert!(matches!(
             p.apply_uci_moves(&["e2e4"]),
+            Err(PositionError::RevisionExhausted)
+        ));
+        assert!(matches!(
+            p.preview_generated(BoardMove::from_uci("e2e4").unwrap()),
+            Err(PositionError::RevisionExhausted)
+        ));
+        assert!(matches!(
+            p.classify_position(),
             Err(PositionError::RevisionExhausted)
         ));
         assert!(p.snapshot().same_state(&before));

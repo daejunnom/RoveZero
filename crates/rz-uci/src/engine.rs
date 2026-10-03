@@ -79,10 +79,9 @@ impl CheckedPosition for RulesSearchPosition {
         Ok(self.state.legal_moves().moves().to_vec())
     }
     fn play(&self, movement: &Self::Move) -> Result<Self, Self::Error> {
-        let mut fork =
-            ContractPosition::new(self.owners.allocate()?, self.position.position().clone());
-        let fresh = fork.export()?;
-        fork.make_from_view(&fresh, *movement)?;
+        let fork = self
+            .position
+            .fork_from_view(self.owners.allocate()?, &self.state, *movement)?;
         Self::new(fork, Arc::clone(&self.owners))
     }
 }

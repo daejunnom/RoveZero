@@ -60,6 +60,7 @@
 | RZ-D031 | 총괄의 최초 Rust 계약 / 2026-10-03 | `rz-contracts` 0.1.0, SchemaVersion 0.1 exact match를 게시한다. std-only typed IDs·epoch·immutable generic snapshot·ordered legal view·모델/인코딩 descriptor·WDL/합법 policy·단조 ns deadline·취소·fresh 평가 요청/결과·오류/유한 예산을 최소 경계로 구현한다. 구체 규칙·탐색·backend·runtime 및 wire/hash codec은 consumer 소유이며 계약 crate 자체 검사와 실제 연결 인수는 구분한다. |
 | RZ-D032 | 사용자 직접 요청 / 2026-10-03 | 다른 담당의 Draft PR 계약 요청을 조사하고 공통 계약을 만든 뒤 해당 PR에 적용 코멘트를 남긴다. PR 인수 때 총괄은 최신 코드의 adapter·루트 Cargo/lock·revision·시간·오류·policy·수명 경계를 수동으로 맞추고 같은 integration SHA의 소비자 검사를 수행한다. 계약 게시만으로 소비자 통합·실제 NN/GPU 완료를 보고하지 않는다. 이번 요청은 일시중지한 후속 목표 앞의 선행 계약 작업이며 D030의 과거 main 예외를 확대하지 않는다. |
 | RZ-D033 | 사용자 후속 환경 지정 / 2026-10-03 | 후속 GPU 벤치마크는 로컬 대신 외부 환경에서 진행한다. 서브에이전트가 RunPod 공식 자료를 조사하고 총괄은 로그인된 ChatGPT 브라우저 콘솔의 공개 배포 후보를 읽기 전용으로 확인해 [준비 계획](research/RUNPOD-BENCHMARK-PLAN.md)을 작성한다. 사용자가 이번 응답 이후 GPU를 지정하므로 후보 선택·지역·실행 시간·총액·보존 조건은 미결정이다. 이 계획은 Pod 생성·유료 실행·새 credential/접근 확장의 승인이 아니다. 기존 RTX 4050 인수 이력과 외부 GPU 측정은 구분하고 내부 A/B·LC0 비교는 같은 지정 장비·조건으로 다시 잠근다. |
+| RZ-D034 | 사용자 후속 지정·CPU 최적화 검증 / 2026-10-03 | GPU A/B 전에 의미 보존 중복·자료 복제·병목을 조사·해결한다. `1cdd707`에서 Rules export/부모 fork/preview delta/불변 profile hash의 중복을 줄이고 상태 witness·CPU 교차 측정·양 OS CI를 확인했다. Community 4090 등 live 후보를 조회하며 network volume을 사용하지 않고 초기 총 지출 가능액 약 US$200 안에서 유한 하위 예산을 둔다. 사용자 지정 Oracle에는 작은 원본 연구 자료와 provenance를 검증해 보존한다. key 내용은 읽지 않고 지정 SSH 인증에만 사용하며 Pod Env 등록은 사용자 담당이다. 실제 Pod·GPU A/B는 미실행이고 GPU 선택·환경/명세·과금 종료 조건은 실행 전 잠근다. [사전 최적화](research/PRE-RUNPOD-OPTIMIZATION.md), [외부 계획](research/RUNPOD-BENCHMARK-PLAN.md)을 따른다. |
 
 ## 남은 결정과 실행 전 잠금
 
@@ -72,7 +73,7 @@
 | RZ-O003 | 부분 결정: Rust engine·첫 호환 format; backend·훈련 스택 남음 | Rust workspace와 Maia1 format은 결정했다. toolchain·target·feature·binding·변환/실행 backend와 훈련 언어는 장비·빌드 조건으로 잠근다. ORT/tract/PyO3를 자동 상속하지 않는다. |
 | RZ-O004 | 개별 G/H/C 배치와 첫 측정 변경 | D02 근거로 새 탐색 또는 D03 단일 runtime 변경을 고른다. 모든 계산의 GPU 실행·CPU 증분 우선은 전제하지 않는다. |
 | RZ-O005 | LC0 비교 identity와 첫 호환 가중치 인수 | version·binary/weights digest·search/backend/precision/options를 잠근다. 선정 조사의 권리·형식·자료상 GPU 적합성과 C02/C03 실제 수치·장비 검증은 분리한다. |
-| RZ-O006 | 부분 결정: GPU 없는 클라우드 개발·후속 외부 RunPod 벤치마크; GPU·예산 남음 | A~F 개발과 별도 실제 검증 환경을 구분한다. 초기 RTX 4050 Laptop GPU 6141MiB의 인수 이력은 보존한다. D033에 따라 후속 GPU 종류·지역·image·CPU/RAM/VRAM 상한·전력 조건·유한 실행 시간·총 비용·저장소/보존/회수·worker/drain과 Pod 과금 종료를 실행 전 정한다. GPU 선택은 사용자 응답 이후이며 카드 표시 VRAM 전체가 항상 가용하다고 가정하지 않는다. |
+| RZ-O006 | 부분 결정: Community 후보·network volume 미사용·초기 총예산 약 US$200·Oracle 회수; 실제 GPU/환경 명세 남음 | A~F CPU 개발과 별도 실제 검증을 구분하고 초기 RTX 4050 인수 이력은 보존한다. D033/D034와 외부 계획에 따라 사전 CPU 최적화 뒤 GPU 종류·최종 quote·지역/image·CPU/RAM/VRAM·유한 입력/시간·과금 종료·보존/회수를 잠근다. Oracle SSH·작은 archive SCP 왕복은 확인했으며 Pod→Oracle 연결과 사용자 Pod Env는 미설정이다. 카드 VRAM 전체를 항상 가용하다고 가정하지 않는다. |
 | RZ-O007 | T1/T2 시계·opening·seed·표본·검정·중단·승격 | 첫 결과 전에 설정한다. 100쌍 smoke, 2,000쌍 final, 95% 하한 > 0은 권고이며 이미 잠긴 프로토콜이 아니다. |
 | RZ-O008 | 첫 가중치 이후 모델 구조·반복·warm·정밀도 | 현재 가중치 호환은 C02/C03, 구조 변경은 F03이다. CARD-A05/B01/C02/C03을 모두 채택한 것으로 간주하지 않는다. 각 변경은 독립 대조한다. |
 | RZ-O009 | 부분 결정: 최소 의미 계약; 모델별 action/tensor/오차 남음 | 기본 의미·관점·수명은 D025를 따른다. 선택 모델의 policy mapping·history-fill·shape·dtype·오차·deadline 단위는 연결 전에 잠근다. |
