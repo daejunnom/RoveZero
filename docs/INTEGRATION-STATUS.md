@@ -629,3 +629,48 @@ SHA를 확인했다. 회수 receipt SHA는
 `4c1a4f12e680eb2ef919c62a0cc9199c5fd03db2ed36c762c0268e4270ec39e4`다.
 큰 native library·모델·binary를 이 metadata 회수에 넣지 않았다. 원본 Linux gate와
 private native copy는 보존하며, 이 회수는 새로운 추론 실행이 아니다.
+
+## 첫 실제 CUDA pair 실패와 종료 경계
+
+`e0d7e131548fe0d84bda9b38ef261adcc3390e79`에서 E의 CUDA 전용 lock과 실행 경로를
+사용한 첫 실제 pair는 **실패**했다. 시작 상태·원본/ONNX·19개 bundle·FP32·device 0·
+B1·thread/worker 1·HistoryFill No를 고정하고, 두 판 각각 최대 6 ply의 integration
+cutoff를 사용했다. 첫 판의 실제 PGN은 6 ply를 담지만, 둘째 판은 시작 검사를 끝내지
+못했다. 정식 완료 pair·득점·강도 자료로 사용하지 않는다.
+
+첫 판의 baseline PID 402는 D computed 완료 258개와 B root 초기화 2개·non-root
+backup 256개를 기록하고 exit 0으로 끝났다. Candidate PID 413은 각각 252·2·250개,
+confirmed physical drain·mapping failure 없음의 최종 기록을 쓴 뒤, quit 약 36.75초
+후 **SIGABRT 6 / status 134**로 종료했다. 최종 native 기록과 실제 process exit는
+서로 다른 증거다. 이 실패 뒤 새 candidate PID 447의 uciok는 약 46.63초 걸렸으며,
+baseline PID 455는 60초 startup deadline을 넘었다. 두 새 프로세스의 실제 검색
+완료 수는 0이다. native abort의 직접 원인은 아직 확인하지 않았다.
+
+E receipt는 runner exit 1과 검증한 owned-group cleanup을 보존하고 integration을
+false로 판정했다. provider와 PGN 인수는 process gate 실패 때문에 명시적으로
+미실행이며, provider sessions는 비어 있고 scored games는 0이다. 상위 CLI는 exit
+2로 끝났다. 성공으로 남은 개별 native receipt를 부분 pair 성공으로 승격하지 않았다.
+pair receipt SHA는 `6270b2c303056abd5357c68b7968163ede40ea072fcaab687df34190f9ea937a`,
+PGN SHA는 `6dfe1ab14de116cbb21062da1e0e8682509f643f588f700e183d12478e714fb4`다.
+
+감독 실행은 wall 300초·cleanup 10초·전용 cgroup RAM 8 GiB·swap 0·CPU 2 core·
+pids 128·per-process address space 128 GiB·단일 파일 1 GiB로 제한했다.
+실제 전체 시간은 228.208초, cgroup peak는 **8 GiB 상한**, max event 196,709·
+OOM/kill 0이었다. sampled aggregate RSS는 1,801,588,736 bytes이며 kernel VmPeak
+관측은 38,827,728,896 bytes다. anon/file-cache 구성과 PSI를 수집하지 않았으므로
+이 수치만으로 abort 또는 startup 지연의 원인을 판정하지 않는다. run 16 GiB·
+entry 256·non-native stream 8 MiB는 감독 관측 한도이며 filesystem quota가 아니다.
+남은 cgroup PID·cleanup/preservation 오류 없이 종료하고 전용 cgroup을 제거했다.
+
+실패 metadata 25개·426,423 bytes를 저장소 밖
+`reports/coordinator-integration/native-gpu/captured-pair-e0d7e13-v2-failed/`로 회수하여
+각 길이와 SHA를 대조했다. 회수 receipt SHA는
+`a47f1fc347438f8cb73688d64d7d4782d62716bbb610f21922619cdc83726686`이다.
+원래 로그·private copies·첫 실패 자료를 보존하고 자동 재시도하지 않았다.
+
+소스 조사에서 확정한 결손은 `SingleWorker`의 JoinHandle을 보존하지 않아 요청의
+physical drain 뒤 worker closure와 native session destructor의 종료가 최종 기록
+밖에서 진행된다는 점이다. process-owned worker의 admission 종료·native teardown·
+thread join을 유한하게 확인하는 경계를 추가하고, per-root drain 및 quarantine의
+원래 pin 보존과 구분하여 재검증한다. join 추가만으로 SIGABRT가 해결됐다고
+주장하지 않는다. 이 접점과 실제 pair process gate는 PR 인수 전 남은 검사다.
