@@ -36,6 +36,7 @@ live-view 검사는 매번 수행한다. 이 cache는 모델 평가 cache나 증
 출력한다. 새 owner ID는 프로세스 안에서 중복 없이 발급하고 비교 출력에서는 정규화한다.
 
 ```sh
+: "${CARGO_TARGET_DIR:?저장소 밖 build output root를 지정하세요}"
 cargo build --release -p rz-position --example performance_probe --features contracts --locked
 # 빌드별 실행 파일을 따로 보존한 뒤 witness 출력 전체를 대조한다.
 "$CARGO_TARGET_DIR/release/examples/performance_probe" witness
@@ -103,9 +104,10 @@ nodes도 같은 전체 노드 예산으로 센다. 카운터·revision overflow�
 
 ## 빌드·독립 검증
 
-검증한 compiler는 Rust 1.90.0, CPU Linux x86_64다. A 작업 branch는 총괄 PR #7의
-루트 변경을 포함하지 않으며 manifest 경로로 독립 빌드한다. 임시 standalone lockfile은
-crate ignore에 두며 공유 workspace 등록·root lockfile·toolchain·CI는 TASK-I01 소유다.
+초기 A standalone 검사는 Rust 1.90.0, CPU Linux x86_64에서 수행했다. 현재 통합
+workspace는 루트 toolchain의 Rust 1.96.0으로 검사한다. 공유 workspace 등록·root
+lockfile·toolchain·CI는 TASK-I01 소유다. 후속 실험의 실제
+명령·결과·동일 source CI와 측정 한계는 위 성능 개선 계획의 구현 기록을 따른다.
 선택 의존성의 metadata는 첫 Cargo 해석 시 내려받을 수 있지만, 기본 build에서는
 공통 계약과 SHA-256 구현을 컴파일하거나 규칙 코어에 연결하지 않는다.
 
