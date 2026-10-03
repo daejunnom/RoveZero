@@ -4,7 +4,7 @@
 //! These receipts disclose identities and typed causes, never local asset paths,
 //! export commands, native error strings, or a complete request journal.
 
-mod causes;
+pub(crate) mod causes;
 pub use causes::{CauseNodeV1, CauseReceiptV1};
 
 use crate::{
@@ -181,7 +181,7 @@ pub struct ExecutableIdentityV1 {
     pub identity_source: ExecutableIdentitySourceV1,
 }
 impl ExecutableIdentityV1 {
-    fn observe() -> Result<Self, AttestationError> {
+    pub(crate) fn observe() -> Result<Self, AttestationError> {
         #[cfg(target_os = "linux")]
         let (file, source) = (
             File::open("/proc/self/exe"),
@@ -350,7 +350,7 @@ impl CompletionReceiptV1 {
             actual: None,
         }
     }
-    fn completed(receipt: NativeCompletedReceipt) -> Self {
+    pub(crate) fn completed(receipt: NativeCompletedReceipt) -> Self {
         let mut result = Self::from_context(receipt.context);
         let (provenance, prior) = match receipt.actual.provenance {
             CacheProvenance::Computed => ("computed", None),
@@ -396,19 +396,34 @@ pub struct RunEvidenceV1 {
     pub boundary_error: Option<causes::CauseReceiptV1>,
     pub poison_error: Option<causes::CauseReceiptV1>,
 }
-impl From<&NativeRunReport> for RunEvidenceV1 {
-    fn from(report: &NativeRunReport) -> Self {
+impl TryFrom<&NativeRunReport> for RunEvidenceV1 {
+    type Error = ContractError;
+    fn try_from(report: &NativeRunReport) -> Result<Self, Self::Error> {
+        if report.origin == NativeWorkerOrigin::CudaOnnx {
+            return Err(ContractError::new(
+                ErrorCode::UnsupportedContract,
+                Stage::Output,
+                "CUDA evidence cannot be published as CPU V1",
+            ));
+        }
         let aggregate = |value: &crate::native_bootstrap::NativeAuditAggregate| AuditAggregateV1 {
             count: value.count,
             first: value.first.as_ref().map(causes::native),
             last: value.last.as_ref().map(causes::native),
         };
-        Self {
+        Ok(Self {
             model_manifest_sha256: hex(&report.model_manifest.0),
             backend_sha256: hex(&report.backend.0),
             origin: match report.origin {
                 NativeWorkerOrigin::CpuOnnx => "cpu_onnx",
                 NativeWorkerOrigin::Injected => "injected",
+                NativeWorkerOrigin::CudaOnnx => {
+                    return Err(ContractError::new(
+                        ErrorCode::UnsupportedContract,
+                        Stage::Output,
+                        "CUDA evidence cannot be published as CPU V1",
+                    ));
+                }
             }
             .into(),
             completed_by_runtime: report.completed_by_runtime,
@@ -422,7 +437,7 @@ impl From<&NativeRunReport> for RunEvidenceV1 {
             overflow: report.overflow.as_ref().map(causes::native),
             boundary_error: report.boundary_error.as_ref().map(causes::contract),
             poison_error: report.poison_error.as_ref().map(causes::contract),
-        }
+        })
     }
 }
 
@@ -446,7 +461,7 @@ impl TerminationReceiptV1 {
     pub fn from_result(
         startup: &StartupReceiptV1,
         result: &Result<NativeRunReport, NativeRunError>,
-    ) -> Self {
+    ) -> Result<Self, AttestationError> {
         let (report, service, collection, drain, retained) = match result {
             Ok(report) => (Some(report), None, None, "confirmed", false),
             Err(error) => (
@@ -461,7 +476,13 @@ impl TerminationReceiptV1 {
                 true,
             ),
         };
-        Self {
+        let wire_report = report
+            .map(RunEvidenceV1::try_from)
+            .transpose()
+            .map_err(|error| {
+                AttestationError::contract("CPU V1 refuses a different native origin", error)
+            })?;
+        Ok(Self {
             schema_version: SCHEMA_VERSION,
             kind: "termination".into(),
             process_run_id: startup.process_run_id.clone(),
@@ -470,11 +491,11 @@ impl TerminationReceiptV1 {
             actual_cpu_inference_observed: report
                 .is_some_and(|report| actual_cpu_observed(startup, report)),
             physical_drain: drain.into(),
-            report: report.map(Into::into),
+            report: wire_report,
             original_service_failure: service.map(causes::engine),
             collection_failure: collection.map(causes::contract),
             retained_owner_and_evidence: retained,
-        }
+        })
     }
 }
 
@@ -570,6 +591,18 @@ pub struct ReceiptWriter {
 }
 impl ReceiptWriter {
     pub fn open(config: &NativeConfig) -> Result<Self, AttestationError> {
+        if config.provider() != crate::native_bootstrap::NativeProvider::Cpu {
+            return Err(AttestationError::boundary(
+                "CPU V1 writer requires the CPU provider",
+            ));
+        }
+        Self::open_named(config, STARTUP_FILE, TERMINATION_FILE)
+    }
+    pub(crate) fn open_named(
+        config: &NativeConfig,
+        startup_name: &'static str,
+        termination_name: &'static str,
+    ) -> Result<Self, AttestationError> {
         let root = config.attestation_output_root().map_err(|error| {
             AttestationError::bootstrap("private attestation output root is invalid", error)
         })?;
@@ -600,19 +633,27 @@ impl ReceiptWriter {
                 error,
             )
         })?;
-        Self::from_directory(process_directory)
+        Self::from_directory_named(process_directory, startup_name, termination_name)
     }
+    #[cfg(test)]
     fn from_directory(directory: Dir) -> Result<Self, AttestationError> {
+        Self::from_directory_named(directory, STARTUP_FILE, TERMINATION_FILE)
+    }
+    fn from_directory_named(
+        directory: Dir,
+        startup_name: &'static str,
+        termination_name: &'static str,
+    ) -> Result<Self, AttestationError> {
         let mut options = OpenOptions::new();
         options
             .write(true)
             .create_new(true)
             .follow(FollowSymlinks::No);
         let startup = directory
-            .open_with(STARTUP_FILE, &options)
+            .open_with(startup_name, &options)
             .map_err(|error| AttestationError::io("reserve new startup receipt", error))?;
         let termination = directory
-            .open_with(TERMINATION_FILE, &options)
+            .open_with(termination_name, &options)
             .map_err(|error| AttestationError::io("reserve new termination receipt", error))?;
         Ok(Self {
             _directory: directory,
@@ -624,6 +665,12 @@ impl ReceiptWriter {
         })
     }
     pub fn startup(&mut self, receipt: &StartupReceiptV1) -> Result<(), AttestationError> {
+        self.publish_startup(receipt)
+    }
+    pub(crate) fn publish_startup(
+        &mut self,
+        receipt: &impl Serialize,
+    ) -> Result<(), AttestationError> {
         if self.startup_attempted {
             return Err(AttestationError::boundary(
                 "startup receipt publication was already attempted",
@@ -641,6 +688,12 @@ impl ReceiptWriter {
         Ok(())
     }
     pub fn termination(&mut self, receipt: &TerminationReceiptV1) -> Result<(), AttestationError> {
+        self.publish_termination(receipt)
+    }
+    pub(crate) fn publish_termination(
+        &mut self,
+        receipt: &impl Serialize,
+    ) -> Result<(), AttestationError> {
         if !self.startup_written || self.termination_attempted {
             return Err(AttestationError::boundary(
                 "termination receipt requires one issued startup receipt",
@@ -658,7 +711,7 @@ impl ReceiptWriter {
     }
 }
 
-fn process_run_id() -> String {
+pub(crate) fn process_run_id() -> String {
     format!("native-process-{}", std::process::id())
 }
 
@@ -674,7 +727,7 @@ pub struct AttestationError {
     pub native_report: Option<Box<NativeRunReport>>,
 }
 impl AttestationError {
-    fn boundary(stage: &'static str) -> Self {
+    pub(crate) fn boundary(stage: &'static str) -> Self {
         Self {
             stage,
             io_kind: None,
@@ -698,7 +751,7 @@ impl AttestationError {
             ..Self::boundary(stage)
         }
     }
-    fn contract(stage: &'static str, error: ContractError) -> Self {
+    pub(crate) fn contract(stage: &'static str, error: ContractError) -> Self {
         Self {
             contract_error: Some(error),
             ..Self::boundary(stage)

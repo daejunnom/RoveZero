@@ -320,6 +320,15 @@ pub trait EvaluatorFactory: Send + Sync + 'static {
         state: &RulesState,
         legal: &[contract::Move],
     ) -> Result<contract::EvalInputKey, contract::ContractError>;
+    /// Passive evidence after the existing final backup guard committed. The
+    /// observer grants no publication authority and cannot perform another backup.
+    fn observe_search_acceptance(
+        &self,
+        _evaluation: &rz_search::contracts::AcceptedEvaluation,
+        _traversed_edges: usize,
+    ) -> Result<(), contract::ContractError> {
+        Ok(())
+    }
 }
 
 /// The injected evaluator and Rules owner registry share this process's clock
@@ -936,6 +945,19 @@ impl Owner {
                                 )
                             },
                         );
+                        if let rz_search::contracts::ContractPumpEvent::Accepted {
+                            evaluation: Some(evaluation),
+                            traversed_edges,
+                            ..
+                        } = &event
+                            && let Err(error) =
+                                factory.observe_search_acceptance(evaluation, *traversed_edges)
+                        {
+                            // The already committed tree remains untouched. Preserve
+                            // an observer failure and close future logical admission.
+                            authority.cancel();
+                            authority_error.get_or_insert(error);
+                        }
                         if let Err(error) = consume_pump_diagnostic(&event, &diagnostics, &events) {
                             authority.cancel();
                             diagnostic_failure = Some(error);

@@ -384,13 +384,18 @@ fn artificial_terminal_tree_has_independent_visit_and_value_expectations() {
         &[0.5, 0.5],
         [0.2, 0.6, 0.2],
     )));
-    assert!(matches!(
-        pump(&mut search, &mut runtime, &clock),
-        ContractPumpEvent::Accepted {
-            traversed_edges: 0,
-            ..
-        }
-    ));
+    let event = pump(&mut search, &mut runtime, &clock);
+    let ContractPumpEvent::Accepted {
+        traversed_edges: 0,
+        evaluation: Some(metadata),
+        ..
+    } = event
+    else {
+        panic!("a validated root initialization must retain passive evaluation metadata");
+    };
+    assert_eq!(metadata.context.request, request.context());
+    assert_eq!(metadata.context.execution, metadata.actual.execution);
+    assert_eq!(metadata.actual.provenance, CacheProvenance::Computed);
     assert_eq!(search.outcome().counters.accepted_backups, 0);
     for _ in 0..3 {
         assert!(matches!(
@@ -398,6 +403,7 @@ fn artificial_terminal_tree_has_independent_visit_and_value_expectations() {
             ContractPumpEvent::Accepted {
                 request: None,
                 traversed_edges: 1,
+                evaluation: None,
                 ..
             }
         ));
@@ -855,7 +861,14 @@ fn final_rules_attestation_crossing_exact_deadline_or_cancel_blocks_commit() {
         )));
         calls.store(0, Ordering::Release);
         trigger.store(3, Ordering::Release); // pending guard, metadata authority, final Rules authority
-        pump(&mut search, &mut runtime, &clock);
+        let rejected = pump(&mut search, &mut runtime, &clock);
+        assert!(!matches!(
+            rejected,
+            ContractPumpEvent::Accepted {
+                evaluation: Some(_),
+                ..
+            }
+        ));
         assert!(
             matches!(search.outcome().status, ContractSearchStatus::Stopped { reason, .. }
             if reason == if cancel_case { ContractStopReason::Canceled } else { ContractStopReason::Expired })

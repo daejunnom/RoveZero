@@ -6,6 +6,8 @@ D runtime → B 비동기 탐색을 연결한다. `--cpu-mock`은 GPU 없는 개
 `onnx-cpu` feature로 빌드하면 명시적인 `--onnx-cpu`가 선정 Maia·검증한 ORT CPU
 FP32의 실제 신경망 평가를 연결한다. Linux에서 실제 수치·Rules·UCI 연결을 인수한
 소스와 실행 근거는 [통합 인수 기록](../../docs/INTEGRATION-STATUS.md)을 따른다.
+`onnx-cuda` feature는 Linux의 명시적 `--onnx-cuda` 연결을 추가한다. CUDA 코드·receipt
+제공과 실제 CUDA 수치·Rules·D 전달·B backup 인수는 각각 구분한다.
 목표 GPU와 정식 대국은 별도 인수다. 초기 B-local 접점에 이어
 [PR #7](https://github.com/daejunnom/RoveZero/pull/7)의 공통 0.1 계약을 연결했다.
 `rz-contracts` 의존성은 root workspace의 단일 `path` 계약 0.1.0을 사용한다.
@@ -172,6 +174,31 @@ rz-uci --onnx-cpu
 모델 로딩 성공, 실제 평가 응답, 물리 종료 확인을 구분하며 전체 root별 journal이나
 물리 추론 호출 수를 이 집계로 대신하지 않는다. [인수 기록](../../docs/INTEGRATION-STATUS.md#후속-실제-cpu-신경망-pair-인수)의
 소스·binary·명령·외부 증거가 실제 결과의 적용 범위다.
+
+CUDA는 같은 공통 입력에 `--onnx-cuda`, `--cuda-bundle=<bounded-runtime-bundle.json>`,
+`--cuda-bundle-sha256=<64 lowercase hex>`를 명시한다. bundle **원본 JSON 파일 SHA**와
+실제 pin의 **canonical bundle digest**는 별도 identity다. core 파일명·SHA는
+`--ort-library`·`--ort-sha256`와 일치하며, C의 exact nineteen-file loader와 placement
+probe를 통과해야 한다. 미지원 feature/platform/provider·불완전 bundle을 CPU로
+대체하지 않는다. device 0, arena 1 GiB, FP32·TF32 off, batch 1, intra thread 1,
+worker 1, fresh/full step 1, HistoryFill No를 고정하고 외부 인수 전에 변경하지 않는다.
+공통 native session/runtime 코어를 CPU·CUDA factory가 공유하며 실제 출처는 C owner가
+발급한다. CPU constructor와 CPU V1 projection은 CUDA 출처를 거부한다.
+
+`--attestation`의 CUDA 영수증은 역할 output root의 새 `native-process-<pid>` 아래
+`native-cuda-startup.v1.json`·`native-cuda-termination.v1.json`이다. CPU V1 파일은
+그대로 유지한다. CUDA startup은 실행 파일·모델·encoding·backend와 exact bundle,
+placement profile SHA·CUDA node·mapping 검증을 결합한다. session resident 1 GiB와
+D execution device 1 GiB는 **서로 다른 admission 선언**이며 측정 VRAM이나 전체
+hard cap이 아니다. Rules 입력 ByteBudget은 host 소유이며 device를 중복 예약하지 않는다.
+
+CUDA final은 D normal-poll 완료 집계와 B의 최종 tree guard 이후 root 초기화·non-root
+backup count+first/last를 구분한다. root 초기화의 traversal은 0이며 NN 실행 수나 새
+탐색 방문 수와 혼동하지 않는다. startup placement probe·늦은 물리 완료·D 전달·B 소비는
+각각 다른 사건이다. scheduler와 최종 delivery event의 회수 수·drop/overflow 및 drain 중
+폐기 수를 공개하지만 전체 사건 journal이나 물리 추론 총량을 이 집계로 증명하지 않는다.
+미확정 physical drain·Q·원래 실패·cleanup 실패와 최종 runtime mapping 원인을 보존한다.
+추가 passive observer는 backup 권한을 만들거나 기존 마감·취소·scope 검사를 완화하지 않는다.
 
 CPU fixture는 parser, 상태 원자성, ticket 취소와 착수 출력·event loop를 확인한다.
 `tests/search_integration.rs`는 독립 인공 트리로 UCI→PUCT→착수와 terminal 우회,
