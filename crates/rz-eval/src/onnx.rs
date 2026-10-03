@@ -724,6 +724,16 @@ impl OnnxBackend {
         inputs: &[&EncodedInput],
     ) -> (Result<Vec<RawOutput>, BackendError>, NativeRunTimings) {
         let mut timings = NativeRunTimings::default();
+        if inputs.len() > self.config.max_batch {
+            return (
+                Err(BackendError::new(
+                    K::ResourceExhausted,
+                    S::Admission,
+                    "batch exceeds configured limit",
+                )),
+                timings,
+            );
+        }
         let values = inputs
             .iter()
             .map(|input| input.values())

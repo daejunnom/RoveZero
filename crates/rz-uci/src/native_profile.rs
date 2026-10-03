@@ -269,7 +269,12 @@ impl ProfileDocument {
         let mut frames = BTreeMap::<RequestId, Frame<'_>>::new();
         let mut durations = BTreeMap::<String, Vec<Duration>>::new();
         let mut physical = BTreeSet::new();
+        let mut physical_attempts = BTreeSet::new();
+        let mut worker_failures = BTreeSet::new();
+        let mut delivered = BTreeSet::new();
+        let mut delivery_rejected = BTreeSet::new();
         let mut consumed = BTreeSet::new();
+        let mut consumed_executions = BTreeSet::new();
         let mut input_executions = BTreeMap::<_, BTreeSet<ExecutionId>>::new();
         let mut duplicates = 0;
         let mut identity_errors = 0;
@@ -303,18 +308,35 @@ impl ProfileDocument {
                     if frame.stages.insert(span.stage, span).is_some() {
                         duplicates += 1;
                     }
-                    if span.stage == SourceStage::PhysicalWorker
-                        && span.succeeded
+                    if span.stage == SourceStage::NativeInvocation
                         && let Some(execution) = key.execution
                     {
-                        physical.insert(execution);
-                        input_executions
-                            .entry(key.request.input)
-                            .or_default()
-                            .insert(execution);
+                        physical_attempts.insert(execution);
+                        if span.succeeded {
+                            physical.insert(execution);
+                            input_executions
+                                .entry(key.request.input)
+                                .or_default()
+                                .insert(execution);
+                        }
+                    }
+                    if span.stage == SourceStage::PhysicalWorker
+                        && !span.succeeded
+                        && let Some(execution) = key.execution
+                    {
+                        worker_failures.insert(execution);
+                    }
+                    if span.stage == SourceStage::DeliveryAccepted && span.succeeded {
+                        delivered.insert(key.request.request);
+                    }
+                    if span.stage == SourceStage::DeliveryRejected {
+                        delivery_rejected.insert(key.request.request);
                     }
                     if span.stage == SourceStage::SearchBackup && span.succeeded {
                         consumed.insert(key.request.request);
+                        if let Some(execution) = key.execution {
+                            consumed_executions.insert(execution);
+                        }
                     }
                 } else if span.stage != SourceStage::ProtocolWrite {
                     unbound += 1;
@@ -342,6 +364,7 @@ impl ProfileDocument {
                 SourceStage::SearchPreparation,
                 SourceStage::Admitted,
                 SourceStage::DispatchStarted,
+                SourceStage::DispatchFinished,
                 SourceStage::EncodingPreparation,
                 SourceStage::NativePreparation,
                 SourceStage::NativeInvocation,
@@ -350,6 +373,7 @@ impl ProfileDocument {
                 SourceStage::PhysicalReadyObserved,
                 SourceStage::ValidationStarted,
                 SourceStage::ValidationFinished,
+                SourceStage::LogicalFinished,
                 SourceStage::DeliveryAccepted,
                 SourceStage::SearchBackup,
             ];
@@ -358,6 +382,72 @@ impl ProfileDocument {
                     .iter()
                     .any(|stage| !frame.stages.get(stage).is_some_and(|span| span.succeeded))
             {
+                timeline_errors += 1;
+                continue;
+            }
+            // Validate physical containment and the owner's causal chain before
+            // deriving durations. Dispatch return may overlap the worker, so it
+            // is deliberately not ordered before worker start.
+            let s = &frame.stages;
+            let ordered = [
+                (
+                    s[&SourceStage::SearchPreparation].end,
+                    s[&SourceStage::Admitted].start,
+                ),
+                (
+                    s[&SourceStage::Admitted].end,
+                    s[&SourceStage::DispatchStarted].start,
+                ),
+                (
+                    s[&SourceStage::DispatchStarted].start,
+                    s[&SourceStage::EncodingPreparation].start,
+                ),
+                (
+                    s[&SourceStage::EncodingPreparation].end,
+                    s[&SourceStage::PhysicalWorker].start,
+                ),
+                (
+                    s[&SourceStage::PhysicalWorker].start,
+                    s[&SourceStage::NativePreparation].start,
+                ),
+                (
+                    s[&SourceStage::NativePreparation].end,
+                    s[&SourceStage::NativeInvocation].start,
+                ),
+                (
+                    s[&SourceStage::NativeInvocation].end,
+                    s[&SourceStage::NativeOutput].start,
+                ),
+                (
+                    s[&SourceStage::NativeOutput].end,
+                    s[&SourceStage::PhysicalWorker].end,
+                ),
+                (
+                    s[&SourceStage::PhysicalWorker].end,
+                    s[&SourceStage::PhysicalReadyObserved].start,
+                ),
+                (
+                    s[&SourceStage::PhysicalReadyObserved].end,
+                    s[&SourceStage::ValidationStarted].start,
+                ),
+                (
+                    s[&SourceStage::ValidationStarted].end,
+                    s[&SourceStage::ValidationFinished].start,
+                ),
+                (
+                    s[&SourceStage::ValidationFinished].end,
+                    s[&SourceStage::LogicalFinished].start,
+                ),
+                (
+                    s[&SourceStage::LogicalFinished].end,
+                    s[&SourceStage::DeliveryAccepted].start,
+                ),
+                (
+                    s[&SourceStage::DeliveryAccepted].end,
+                    s[&SourceStage::SearchBackup].start,
+                ),
+            ];
+            if ordered.iter().any(|(before, after)| before > after) {
                 timeline_errors += 1;
                 continue;
             }
@@ -421,14 +511,25 @@ impl ProfileDocument {
             && snapshot.invalid_intervals == 0
             && !snapshot.poisoned
             && !snapshot.counter_overflow;
-        let expected_consumed = report.map(|report| {
-            report.search_root_initializations.count + report.search_non_root_backups.count
+        let expected_consumed = report.and_then(|report| {
+            report
+                .search_root_initializations
+                .count
+                .checked_add(report.search_non_root_backups.count)
         });
         let consumed_matches = expected_consumed
             .is_some_and(|expected| usize::try_from(expected).ok() == Some(consumed.len()));
         let counts = BTreeMap::from([
             ("requests", frames.len()),
             ("physical_completions", physical.len()),
+            ("physical_attempts", physical_attempts.len()),
+            (
+                "physical_unconfirmed",
+                physical_attempts.difference(&physical).count(),
+            ),
+            ("worker_failures", worker_failures.len()),
+            ("delivered", delivered.len()),
+            ("delivery_rejected", delivery_rejected.len()),
             ("search_consumed", consumed.len()),
             (
                 "same_input_repeat_executions",
@@ -439,7 +540,7 @@ impl ProfileDocument {
             ),
             (
                 "completed_not_consumed",
-                physical.len().saturating_sub(consumed.len()),
+                physical.difference(&consumed_executions).count(),
             ),
         ]);
         Self {
@@ -487,6 +588,160 @@ fn hex(bytes: [u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rz_contracts::*;
+    fn synthetic_key() -> CompletionContext {
+        CompletionContext {
+            request: EvalContext {
+                revision: CONTRACT_REVISION,
+                request: RequestId::new(ProcessEpoch(1), 1),
+                selection: SelectionId::new(ProcessEpoch(1), 1),
+                game: GameGeneration(1),
+                root: RootGeneration(1),
+                state: StateIdentity {
+                    owner: OwnerId(1),
+                    revision: StateRevision(1),
+                    semantic: Digest([1; 32]),
+                },
+                legal_order: LegalOrderIdentity(Digest([2; 32])),
+                input: EvalInputKey(Digest([3; 32])),
+                model: ModelHandle {
+                    owner: OwnerId(2),
+                    slot: 0,
+                    generation: SlotGeneration(1),
+                    manifest: Digest([4; 32]),
+                },
+                encoding: EncodingHandle {
+                    owner: OwnerId(3),
+                    slot: 0,
+                    generation: SlotGeneration(1),
+                    manifest: Digest([5; 32]),
+                },
+                precision: PrecisionProfile::Fp32,
+                compute: ComputeBudget {
+                    min_steps: 1,
+                    max_steps: 1,
+                    require_full: true,
+                },
+                backend: Digest([6; 32]),
+            },
+            execution: Some(ExecutionId::new(ProcessEpoch(1), 1)),
+        }
+    }
+    fn synthetic_report(consumed: u64) -> NativeRunReport {
+        use crate::native_bootstrap::NativeSearchAggregate;
+        NativeRunReport {
+            model_manifest: Digest([4; 32]),
+            backend: Digest([6; 32]),
+            origin: rz_eval::native_runtime_bridge::NativeWorkerOrigin::Injected,
+            completed_by_runtime: consumed,
+            first_completed: None,
+            last_completed: None,
+            search_root_initializations: NativeSearchAggregate {
+                count: consumed,
+                ..Default::default()
+            },
+            search_non_root_backups: Default::default(),
+            observations: Default::default(),
+            canceled: Default::default(),
+            expired: Default::default(),
+            failures: Vec::new(),
+            overflow: None,
+            boundary_error: None,
+            poison_error: None,
+        }
+    }
+    fn synthetic_snapshot() -> SourceSnapshot<CompletionContext> {
+        let trace = SourceJournal::try_new(32).unwrap();
+        let origin = Instant::now();
+        // Source facts arrive in reverse transport order. Only causal timestamps
+        // are evidence; arrival order must never manufacture latency or backup.
+        for (stage, start, end) in [
+            (SourceStage::SearchPreparation, 0, 10),
+            (SourceStage::Admitted, 11, 11),
+            (SourceStage::DispatchStarted, 12, 12),
+            (SourceStage::EncodingPreparation, 13, 14),
+            (SourceStage::DispatchFinished, 12, 16),
+            (SourceStage::PhysicalWorker, 15, 28),
+            (SourceStage::NativePreparation, 16, 17),
+            (SourceStage::NativeInvocation, 18, 25),
+            (SourceStage::NativeOutput, 25, 27),
+            (SourceStage::PhysicalReadyObserved, 29, 29),
+            (SourceStage::ValidationStarted, 30, 30),
+            (SourceStage::ValidationFinished, 31, 31),
+            (SourceStage::LogicalFinished, 32, 32),
+            (SourceStage::DeliveryAccepted, 33, 33),
+            (SourceStage::SearchBackup, 34, 35),
+        ]
+        .into_iter()
+        .rev()
+        {
+            trace.record(
+                Some(synthetic_key()),
+                stage,
+                origin + Duration::from_micros(start),
+                origin + Duration::from_micros(end),
+                true,
+            );
+        }
+        trace.snapshot()
+    }
+    #[test]
+    fn accepted_timeline_requires_causal_physical_containment_and_every_source_stage() {
+        let mut snapshot = synthetic_snapshot();
+        let report = synthetic_report(1);
+        let complete = ProfileDocument::capture(&snapshot, true, Some(&report));
+        assert!(complete.accepted_request_timeline_complete);
+        let mut overflow = synthetic_report(u64::MAX);
+        overflow.search_non_root_backups.count = 1;
+        assert!(
+            !ProfileDocument::capture(&snapshot, true, Some(&overflow))
+                .accepted_request_timeline_complete
+        );
+        assert_eq!(
+            complete.distributions["PreparationToBackup"].p50_ns,
+            Some(35_000)
+        );
+        let invocation = snapshot
+            .records
+            .iter_mut()
+            .find(|span| span.stage == SourceStage::NativeInvocation)
+            .unwrap();
+        invocation.start = invocation.end + Duration::from_micros(10);
+        invocation.end = invocation.start + Duration::from_micros(1);
+        let invalid = ProfileDocument::capture(&snapshot, true, Some(&report));
+        assert!(!invalid.accepted_request_timeline_complete);
+        assert_eq!(invalid.accepted_timeline_errors, 1);
+        let mut missing = synthetic_snapshot();
+        missing
+            .records
+            .retain(|span| span.stage != SourceStage::PhysicalReadyObserved);
+        assert!(
+            !ProfileDocument::capture(&missing, true, Some(&report))
+                .accepted_request_timeline_complete
+        );
+    }
+    #[test]
+    fn physical_completion_survives_failed_output_conversion_without_inventing_consumption() {
+        let mut snapshot = synthetic_snapshot();
+        snapshot.records.retain(|span| {
+            !matches!(
+                span.stage,
+                SourceStage::DeliveryAccepted | SourceStage::SearchBackup
+            )
+        });
+        snapshot
+            .records
+            .iter_mut()
+            .find(|span| span.stage == SourceStage::PhysicalWorker)
+            .unwrap()
+            .succeeded = false;
+        let doc = ProfileDocument::capture(&snapshot, true, Some(&synthetic_report(0)));
+        assert_eq!(doc.counts["physical_completions"], 1);
+        assert_eq!(doc.counts["worker_failures"], 1);
+        assert_eq!(doc.counts["completed_not_consumed"], 1);
+        assert_eq!(doc.counts["search_consumed"], 0);
+        assert!(!doc.accepted_request_timeline_complete);
+    }
     #[test]
     fn partial_output_and_error_semantics_survive_a_full_passive_journal() {
         struct Partial(Vec<u8>);
