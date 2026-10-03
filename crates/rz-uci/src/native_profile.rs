@@ -17,7 +17,7 @@ use rz_telemetry::{
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{self, Write},
+    io::{self, BufWriter, Write},
     time::{Duration, Instant},
 };
 
@@ -130,19 +130,31 @@ impl ProfileWriter {
                 .and_then(|error| error.report.as_deref())
         });
         let document = ProfileDocument::capture(&snapshot, finished.is_ok(), report);
-        let mut bounded = BoundedWrite {
-            inner: &mut self.file,
-            written: 0,
-        };
-        serde_json::to_writer(&mut bounded, &document)
-            .map_err(|_| AttestationError::boundary("cannot encode bounded D02 profile"))?;
-        bounded
-            .write_all(b"\n")
-            .map_err(|error| AttestationError::io("finish bounded D02 profile", error))?;
+        write_profile_json(&mut self.file, &document)?;
         self.file
             .sync_all()
             .map_err(|error| AttestationError::io("sync D02 profile", error))
     }
+}
+
+fn write_profile_json<W: Write>(
+    file: &mut W,
+    document: &ProfileDocument,
+) -> Result<(), AttestationError> {
+    // serde emits many tiny writes. Batch them after producer shutdown while
+    // retaining the serialized byte cap, explicit flush and final file sync.
+    let mut bounded = BoundedWrite {
+        inner: BufWriter::with_capacity(64 * 1024, file),
+        written: 0,
+    };
+    serde_json::to_writer(&mut bounded, document)
+        .map_err(|_| AttestationError::boundary("cannot encode bounded D02 profile"))?;
+    bounded
+        .write_all(b"\n")
+        .map_err(|error| AttestationError::io("finish bounded D02 profile", error))?;
+    bounded
+        .flush()
+        .map_err(|error| AttestationError::io("flush bounded D02 profile", error))
 }
 
 struct BoundedWrite<W> {
@@ -719,6 +731,54 @@ mod tests {
             !ProfileDocument::capture(&missing, true, Some(&report))
                 .accepted_request_timeline_complete
         );
+    }
+    #[test]
+    fn profile_publication_batches_writes_without_losing_limits_or_flush_failure() {
+        #[derive(Default)]
+        struct Sink {
+            bytes: Vec<u8>,
+            writes: usize,
+            reject: bool,
+        }
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                if self.reject {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut document =
+            ProfileDocument::capture(&synthetic_snapshot(), true, Some(&synthetic_report(1)));
+        let mut sink = Sink::default();
+        write_profile_json(&mut sink, &document).unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&sink.bytes).unwrap();
+        assert_eq!(
+            wire["records"].as_array().unwrap().len(),
+            document.records.len()
+        );
+        assert_eq!(wire["accepted_request_timeline_complete"], true);
+        assert!(sink.writes < document.records.len());
+        assert_eq!(sink.bytes.last(), Some(&b'\n'));
+        assert!(
+            write_profile_json(
+                &mut Sink {
+                    reject: true,
+                    ..Default::default()
+                },
+                &document
+            )
+            .is_err()
+        );
+        document.records[0].stage = "x".repeat(MAX_PROFILE_BYTES);
+        let mut limited = Sink::default();
+        assert!(write_profile_json(&mut limited, &document).is_err());
+        assert!(limited.bytes.len() <= MAX_PROFILE_BYTES);
     }
     #[test]
     fn physical_completion_survives_failed_output_conversion_without_inventing_consumption() {
