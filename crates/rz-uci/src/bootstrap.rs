@@ -55,6 +55,13 @@ pub struct CpuMockFactory {
     delay: Duration,
 }
 impl CpuMockFactory {
+    #[cfg(feature = "experimental-raw-cache")]
+    pub fn configure_raw_cache(
+        &self,
+        limits: rz_eval::raw_cache::RawCacheLimits,
+    ) -> Result<(), ContractError> {
+        self.projection.configure_raw_cache(limits)
+    }
     pub fn new(owners: &OwnerRegistry, delay: Duration) -> Result<Self, ContractError> {
         if delay > Duration::from_secs(1) {
             return Err(error(
@@ -139,6 +146,11 @@ fn script(
     })
 }
 impl EvaluatorFactory for CpuMockFactory {
+    fn reset_game(&self) -> Result<(), ContractError> {
+        #[cfg(feature = "experimental-raw-cache")]
+        self.projection.clear_raw_cache()?;
+        Ok(())
+    }
     fn profile(&self) -> EvaluatorProfile {
         self.profile.clone()
     }
@@ -190,6 +202,12 @@ impl EvaluatorFactory for CpuMockFactory {
             },
         };
         let evaluator = ContractEvaluator::new(adapter, backend, limits, 256)?;
+        #[cfg(feature = "experimental-raw-cache")]
+        let evaluator = {
+            let mut evaluator = evaluator;
+            evaluator.set_raw_reuse(Box::new(self.projection.raw_cache_provider()));
+            evaluator
+        };
         Ok(Box::new(CpuMockRuntime {
             evaluator,
             scope,

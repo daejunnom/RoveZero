@@ -253,3 +253,12 @@ RIGHTS.txt는 provenance 메모이며 재배포 source/notice 의무 충족 확�
 borrowed 단일 순회에서 구한다. 두 옵션은 기본 off이며 독립 활성화할 수 있다.
 원래 square 재구성/owned-history 경로를 대조군으로 유지한다. 이력을 절단하거나
 unknown-prefix·raw EP·history fill 의미를 변경하지 않는다.
+
+`experimental-raw-cache`(OPT-06)는 실제 Classical 입력의 모든 f32 bit와
+metadata, 모델·encoding·backend·precision·compute·epoch·game을 대조합니다.
+`ClassicalProjection::configure_raw_cache`로 유한한 항목/바이트 상한을 지정하며
+기본 runtime 설정은 비활성입니다. D 최종 승인 후에만 전체 raw policy/WDL을
+재사용 후보로 승격합니다. hit도 새 요청을 정상 admission/완료 검증하며 새
+ExecutionId를 만들지 않습니다. CPU mock/native factory의 typed 설정으로 연결하고
+ucinewgame에서 초기화합니다. native typed report는 raw-hit와 Computed 집계를
+분리하며 기존 Computed-only V1 attestation으로 raw-hit 실행을 게시하지 않습니다.

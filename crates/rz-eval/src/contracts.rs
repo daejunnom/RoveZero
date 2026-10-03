@@ -185,6 +185,8 @@ impl MaiaBinding {
             encoded,
             indices,
             backend: self.backend,
+            #[cfg(feature = "experimental-raw-cache")]
+            raw_cache: None,
         })
     }
 
@@ -256,6 +258,8 @@ impl MaiaBinding {
             encoded: Arc::clone(&prepared.encoded),
             indices: Arc::clone(&prepared.indices),
             backend: self.backend,
+            #[cfg(feature = "experimental-raw-cache")]
+            raw_cache: None,
         })
     }
 }
@@ -265,6 +269,8 @@ pub struct PreparedRequest<P> {
     encoded: EncodedStorage,
     indices: IndexStorage,
     backend: Digest,
+    #[cfg(feature = "experimental-raw-cache")]
+    pub(crate) raw_cache: Option<crate::raw_cache::RawCache>,
 }
 
 #[cfg(not(feature = "experimental-prepared-input"))]
@@ -302,6 +308,29 @@ impl<P> PreparedRequest<P> {
     /// Physical conversion with the bounded model-validator cause retained for
     /// the runtime owner. Common-only callers can keep using `output` above.
     pub fn physical_output(
+        &self,
+        raw: &RawOutput,
+        execution: ExecutionId,
+    ) -> Result<EvalOutput, PhysicalFailure> {
+        let output = self.convert_output(raw, execution)?;
+        #[cfg(feature = "experimental-raw-cache")]
+        if let Some(cache) = &self.raw_cache {
+            cache.stage(self.request.context(), self.encoded(), raw, execution);
+        }
+        Ok(output)
+    }
+
+    #[cfg(feature = "experimental-raw-cache")]
+    pub(crate) fn reused_output(
+        &self,
+        raw: &RawOutput,
+        source: ExecutionId,
+    ) -> Result<EvalOutput, ContractError> {
+        self.convert_output(raw, source)
+            .map_err(|failure| failure.contract)
+    }
+
+    fn convert_output(
         &self,
         raw: &RawOutput,
         execution: ExecutionId,

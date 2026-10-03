@@ -323,6 +323,14 @@ pub struct CudaRunEvidenceV1 {
 impl TryFrom<&NativeRunReport> for CudaRunEvidenceV1 {
     type Error = ContractError;
     fn try_from(report: &NativeRunReport) -> Result<Self, Self::Error> {
+        #[cfg(feature = "experimental-raw-cache")]
+        if report.raw_cache_completions.count != 0 {
+            return Err(ContractError::new(
+                ErrorCode::UnsupportedContract,
+                Stage::Output,
+                "experimental raw-cache evidence requires the typed report; baseline V1 is Computed-only",
+            ));
+        }
         if report.origin != NativeWorkerOrigin::CudaOnnx {
             return Err(ContractError::new(
                 ErrorCode::UnsupportedContract,

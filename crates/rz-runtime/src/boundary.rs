@@ -134,6 +134,15 @@ pub trait Adapter {
         request: &Self::Request,
         output: &Self::Output,
     ) -> Result<(), Self::Error>;
+    /// Explicit exact raw reuse only; the fresh dispatch path remains separate.
+    #[cfg(feature = "experimental-raw-cache")]
+    fn validate_reused_output(
+        &mut self,
+        _request: &Self::Request,
+        _output: &Self::Output,
+    ) -> Result<(), Self::Error> {
+        Err(self.runtime_error(RuntimeFault::InvalidCompletion))
+    }
     /// Bind only after successful launch. Keep this infallible and bounded;
     /// failure to record metadata cannot undo already-running physical work.
     fn bind_execution(&mut self, _request: &Self::Request, _id: &Self::ExecutionId) {}

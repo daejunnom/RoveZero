@@ -16,6 +16,8 @@ pub struct ClassicalProjection {
     binding: MaiaBinding,
     #[cfg(feature = "experimental-prepared-input")]
     prepared: Arc<std::sync::Mutex<Option<Arc<PreparedRulesInput>>>>,
+    #[cfg(feature = "experimental-raw-cache")]
+    raw_cache: crate::raw_cache::RawCache,
 }
 
 impl ClassicalProjection {
@@ -24,6 +26,8 @@ impl ClassicalProjection {
             binding,
             #[cfg(feature = "experimental-prepared-input")]
             prepared: Arc::default(),
+            #[cfg(feature = "experimental-raw-cache")]
+            raw_cache: crate::raw_cache::RawCache::disabled(),
         }
     }
     pub fn model(&self) -> &Arc<ModelDescriptor> {
@@ -34,6 +38,29 @@ impl ClassicalProjection {
     }
     pub fn binding(&self) -> &MaiaBinding {
         &self.binding
+    }
+
+    #[cfg(feature = "experimental-raw-cache")]
+    pub fn configure_raw_cache(
+        &self,
+        limits: crate::raw_cache::RawCacheLimits,
+    ) -> Result<(), ContractError> {
+        self.raw_cache.configure(limits)
+    }
+    #[cfg(feature = "experimental-raw-cache")]
+    pub fn clear_raw_cache(&self) -> Result<(), ContractError> {
+        self.raw_cache.clear()
+    }
+    #[cfg(feature = "experimental-raw-cache")]
+    pub fn raw_cache_stats(&self) -> Result<crate::raw_cache::RawCacheStats, ContractError> {
+        self.raw_cache.stats()
+    }
+    #[cfg(feature = "experimental-raw-cache")]
+    pub fn raw_cache_provider(&self) -> crate::raw_cache::RawCacheProvider {
+        crate::raw_cache::RawCacheProvider {
+            projection: self.clone(),
+            cache: self.raw_cache.clone(),
+        }
     }
 
     pub fn project(&self, state: &RulesState) -> Result<RulesProjection, ContractError> {
@@ -140,13 +167,28 @@ impl ClassicalProjection {
                 request.legal().moves(),
                 Some(&request),
             )?;
-            return self.binding.prepare_rules(request, &prepared);
+            return self.attach_raw_cache(self.binding.prepare_rules(request, &prepared)?);
         }
         #[cfg(not(feature = "experimental-prepared-input"))]
         {
             let projection = self.project(request.position().state())?;
-            self.binding.prepare(request, projection.input())
+            self.attach_raw_cache(self.binding.prepare(request, projection.input())?)
         }
+    }
+
+    fn attach_raw_cache(
+        &self,
+        prepared: PreparedRequest<RulesState>,
+    ) -> Result<PreparedRequest<RulesState>, ContractError> {
+        #[cfg(feature = "experimental-raw-cache")]
+        let prepared = {
+            let mut prepared = prepared;
+            if self.raw_cache.enabled() {
+                prepared.raw_cache = Some(self.raw_cache.clone());
+            }
+            prepared
+        };
+        Ok(prepared)
     }
 
     #[cfg(feature = "experimental-prepared-input")]

@@ -292,6 +292,13 @@ pub struct NativeRunReport {
     pub origin: NativeWorkerOrigin,
     /// Completed results accepted by D, not total physical native invocations.
     pub completed_by_runtime: u64,
+    /// Experimental raw reuse is separate from physical Computed evidence.
+    #[cfg(feature = "experimental-raw-cache")]
+    pub raw_cache_completions: NativeSearchAggregate,
+    #[cfg(feature = "experimental-raw-cache")]
+    pub raw_cache_root_initializations: NativeSearchAggregate,
+    #[cfg(feature = "experimental-raw-cache")]
+    pub raw_cache_non_root_backups: NativeSearchAggregate,
     pub first_completed: Option<NativeCompletedReceipt>,
     pub last_completed: Option<NativeCompletedReceipt>,
     /// Metadata observed only after B's unchanged final tree guard committed.
@@ -321,6 +328,44 @@ pub struct NativeSearchAggregate {
     pub first: Option<NativeSearchConsumedReceipt>,
     pub last: Option<NativeSearchConsumedReceipt>,
 }
+#[cfg(feature = "experimental-raw-cache")]
+fn valid_raw_hit(
+    context: CompletionContext,
+    actual: ActualCompute,
+    report: &NativeRunReport,
+) -> bool {
+    actual.precision == PrecisionProfile::Fp32
+        && actual.steps == 1
+        && actual.full
+        && actual.backend == report.backend
+        && actual.execution.is_none()
+        && context.execution.is_none()
+        && context.request.backend == report.backend
+        && context.request.model.manifest == report.model_manifest
+        && matches!(actual.provenance, CacheProvenance::RawEvalHit { source_execution: Some(source) } if source.epoch == context.request.request.epoch)
+}
+#[cfg(feature = "experimental-raw-cache")]
+fn record_raw_receipt(
+    aggregate: &mut NativeSearchAggregate,
+    context: CompletionContext,
+    actual: ActualCompute,
+    traversed_edges: usize,
+) -> Result<(), ContractError> {
+    let receipt = NativeSearchConsumedReceipt {
+        completed: NativeCompletedReceipt { context, actual },
+        traversed_edges,
+    };
+    aggregate.first.get_or_insert(receipt);
+    aggregate.last = Some(receipt);
+    aggregate.count = aggregate.count.checked_add(1).ok_or_else(|| {
+        error(
+            ErrorCode::ResourceExhausted,
+            Stage::Output,
+            "native raw-cache receipt count exhausted",
+        )
+    })?;
+    Ok(())
+}
 #[derive(Debug, Default)]
 pub struct NativeObservationReport {
     pub scheduler_events: u64,
@@ -348,6 +393,12 @@ impl NativeRunReport {
             backend: profile.backend,
             origin,
             completed_by_runtime: 0,
+            #[cfg(feature = "experimental-raw-cache")]
+            raw_cache_completions: NativeSearchAggregate::default(),
+            #[cfg(feature = "experimental-raw-cache")]
+            raw_cache_root_initializations: NativeSearchAggregate::default(),
+            #[cfg(feature = "experimental-raw-cache")]
+            raw_cache_non_root_backups: NativeSearchAggregate::default(),
             first_completed: None,
             last_completed: None,
             search_root_initializations: NativeSearchAggregate::default(),
@@ -498,6 +549,15 @@ impl NativeEvidenceHandle {
         }
         let context = evaluation.context;
         let actual = evaluation.actual;
+        #[cfg(feature = "experimental-raw-cache")]
+        if valid_raw_hit(context, actual, report) {
+            let aggregate = if traversed_edges == 0 {
+                &mut report.raw_cache_root_initializations
+            } else {
+                &mut report.raw_cache_non_root_backups
+            };
+            return record_raw_receipt(aggregate, context, actual, traversed_edges);
+        }
         if actual.precision != PrecisionProfile::Fp32
             || actual.steps != 1
             || !actual.full
@@ -645,6 +705,21 @@ impl NativeEvidenceHandle {
             NativeWorkerOrigin::CpuOnnx | NativeWorkerOrigin::CudaOnnx
         ) {
             return Ok(());
+        }
+        #[cfg(feature = "experimental-raw-cache")]
+        {
+            let context = CompletionContext {
+                request: output.context,
+                execution: output.actual.execution,
+            };
+            if valid_raw_hit(context, output.actual, report) {
+                return record_raw_receipt(
+                    &mut report.raw_cache_completions,
+                    context,
+                    output.actual,
+                    0,
+                );
+            }
         }
         if output.actual.precision != PrecisionProfile::Fp32
             || output.actual.steps != 1
@@ -1153,6 +1228,13 @@ pub struct NativeCpuFactory {
     inner: NativeSessionFactory,
 }
 impl NativeCpuFactory {
+    #[cfg(feature = "experimental-raw-cache")]
+    pub fn configure_raw_cache(
+        &self,
+        limits: rz_eval::raw_cache::RawCacheLimits,
+    ) -> Result<(), ContractError> {
+        self.inner.owner.projection().configure_raw_cache(limits)
+    }
     pub fn load(
         owners: &OwnerRegistry,
         config: &NativeConfig,
@@ -1197,6 +1279,13 @@ pub struct NativeCudaFactory {
 }
 #[cfg(feature = "onnx-cuda")]
 impl NativeCudaFactory {
+    #[cfg(feature = "experimental-raw-cache")]
+    pub fn configure_raw_cache(
+        &self,
+        limits: rz_eval::raw_cache::RawCacheLimits,
+    ) -> Result<(), ContractError> {
+        self.inner.owner.projection().configure_raw_cache(limits)
+    }
     pub fn load(
         owners: &OwnerRegistry,
         config: &NativeConfig,
@@ -1301,6 +1390,11 @@ impl ContractClock for RuntimeClock {
     }
 }
 impl EvaluatorFactory for NativeSessionFactory {
+    fn reset_game(&self) -> Result<(), ContractError> {
+        #[cfg(feature = "experimental-raw-cache")]
+        self.owner.projection().clear_raw_cache()?;
+        Ok(())
+    }
     fn observe_search_acceptance(
         &self,
         evaluation: &rz_search::contracts::AcceptedEvaluation,
@@ -1363,6 +1457,12 @@ impl EvaluatorFactory for NativeSessionFactory {
             },
             256,
         )?;
+        #[cfg(feature = "experimental-raw-cache")]
+        let evaluator = {
+            let mut evaluator = evaluator;
+            evaluator.set_raw_reuse(Box::new(self.owner.projection().raw_cache_provider()));
+            evaluator
+        };
         Ok(Box::new(NativeRuntime {
             evaluator,
             scope,
@@ -1380,6 +1480,9 @@ impl EvaluatorFactory for NativeSessionFactory {
 macro_rules! delegate_native_factory {
     ($factory:ty) => {
         impl EvaluatorFactory for $factory {
+            fn reset_game(&self) -> Result<(), ContractError> {
+                self.inner.reset_game()
+            }
             fn observe_search_acceptance(
                 &self,
                 evaluation: &rz_search::contracts::AcceptedEvaluation,

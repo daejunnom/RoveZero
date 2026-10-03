@@ -31,6 +31,7 @@ experimental-bitboards = ["contracts"]
 experimental-history-frames = ["contracts"]
 experimental-prepared-input = ["contracts"]
 experimental-input-hash = ["contracts"]
+experimental-raw-cache = ["contracts", "rz-runtime/experimental-raw-cache"]
 
 [[example]]
 name = "maia_check"

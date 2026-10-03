@@ -16,3 +16,4 @@ rz-contracts = { workspace = true, optional = true }
 [features]
 default = []
 contracts = ["dep:rz-contracts"]
+experimental-raw-cache = ["contracts"]

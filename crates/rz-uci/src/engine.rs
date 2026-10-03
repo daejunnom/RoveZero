@@ -315,6 +315,9 @@ pub trait ManagedEvaluator: contract::Evaluator<RulesState> + Send {
     fn shutdown(&mut self, deadline: Instant) -> Result<(), contract::ContractError>;
 }
 pub trait EvaluatorFactory: Send + Sync + 'static {
+    fn reset_game(&self) -> Result<(), contract::ContractError> {
+        Ok(())
+    }
     fn profile(&self) -> EvaluatorProfile;
     fn create(
         &self,
@@ -811,7 +814,11 @@ impl Owner {
                     self.cancel();
                 }
             }
-            Effect::NewGame | Effect::Shutdown => self.cancel(),
+            Effect::NewGame => {
+                self.cancel();
+                self.factory.reset_game()?;
+            }
+            Effect::Shutdown => self.cancel(),
             Effect::Start {
                 ticket, snapshot, ..
             } => {

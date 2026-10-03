@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [features]
 default = []
 experimental-best-move = []
+experimental-raw-cache = ["rz-eval/experimental-raw-cache"]
 onnx-cpu = [
     "rz-eval/onnx", "dep:serde", "dep:serde_json", "dep:sha2",
     "dep:cap-std", "dep:cap-fs-ext",
