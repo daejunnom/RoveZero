@@ -25,7 +25,7 @@ use crate::{
 };
 use rz_contracts as shared;
 use sha2::{Digest as _, Sha256};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub const CONTRACT_SOURCE_REVISION: &str = "67284c4f66f7a7ae9f46fa63dfd50e7410eb6845";
 
@@ -344,7 +344,8 @@ fn frame(hash: &mut Sha256, bytes: &[u8]) {
 
 /// Profile identity is independent of runtime owner, model and game generation.
 pub fn profile_digest() -> shared::Digest {
-    shared::Digest(Sha256::digest(IDENTITY_PROFILE.as_bytes()).into())
+    static PROFILE: OnceLock<shared::Digest> = OnceLock::new();
+    *PROFILE.get_or_init(|| shared::Digest(Sha256::digest(IDENTITY_PROFILE.as_bytes()).into()))
 }
 
 fn state_digest(snapshot: &PositionSnapshot) -> shared::Digest {
