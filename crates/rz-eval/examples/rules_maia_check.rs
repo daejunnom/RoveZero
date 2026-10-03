@@ -572,7 +572,7 @@ fn evaluate_profile(
         "provider":if is_cuda{"cuda"}else{"cpu"},
         "native_origin":if is_cuda{"cuda_onnx"}else{"cpu_onnx"},
         "cuda":cuda_metadata,
-        "current_mapping_audit":if mapping_audit.is_ok(){"passed"}else{"failed"},
+        "current_mapping_audit":if !is_cuda{"not_applicable_cpu"}else if mapping_audit.is_ok(){"passed"}else{"failed"},
         "mapping_failure":mapping_audit.as_ref().err().map(|error|error_receipt(error.as_ref())),
         "execution_admission":{"host_bytes":execution_admission.host_bytes,
             "device_bytes":execution_admission.device_bytes,"pinned_bytes":execution_admission.pinned_bytes},
