@@ -71,3 +71,9 @@ CUDA `Run` 오류나 panic은 GPU 동기화 완료의 증거가 아니다. 완�
 거친 GPU 요청, B의 유효 소비와 backup, 취소·deadline·root 교체의 GPU 수명, peak VRAM,
 D02 종단 계측, D03 효과, 정식 paired 대국은 각각 별도 증거가 필요하다. 이 접점을
 제공했다는 사실만으로 C03 전체·G2·GPU 성능·LC0 대비 강도 향상을 완료로 보고하지 않는다.
+
+첫 실제 목표 장치 검사는 `bde687c7f269af3c7cd501201edde14c5c8ef642`에서 통과했다.
+선정한 19개 native bundle과 Maia/FP32를 고정하여 CUDA 98 kernel 이벤트, 12개 독립
+원본 참조와 batch 1/2/4/8/16, C worker와 같은 binary의 CPU 회귀를 확인했다.
+이 결과는 수치·provider probe의 부분 인수다. source CI·profile·receipt·자원 상한·
+관측값과 선행 실패, 남은 실제 A/D GPU 연결은 [통합 인수 상태](INTEGRATION-STATUS.md)에 둔다.

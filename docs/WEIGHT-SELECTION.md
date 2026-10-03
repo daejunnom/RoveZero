@@ -205,8 +205,9 @@ payload를 FP32로 풀었을 때 가중치 tensor만의 크기는 protobuf 전�
 엔진 공동 점유를 포함하지 않는다. **파일 크기만으로 6 GB 실행 성공을 확정하지 않는다.**
 
 실제 CPU 경로는 Rust `ort=2.0.0-rc.10`·ONNX Runtime 1.22.0·명시 CPU EP로 고정해
-참조 대조와 root UCI 연결을 인수했다. 목표 GPU는 명시 CUDA EP를 우선 검토하며,
-CUDA·cuDNN·driver 조합과 GPU runtime 파일 identity는 실제 장비에서 별도로 고정한다. driver가
+참조 대조와 root UCI 연결을 인수했다. 후속 첫 목표 GPU 검사는 명시 CUDA EP와
+ORT 1.22.0·CUDA 12.8 계열·cuDNN 9.8.0.87·driver 610.62의 파일 identity를 잠가 실행했다.
+수치·provider probe의 실제 근거와 남은 A/D GPU 연결은 아래 후속 인수에 구분한다. driver가
 지원하는 CUDA 최대값을 설치된 Toolkit/cuDNN 존재 증거로 쓰지 않는다.
 
 현재 ORT 문서는 release별 CUDA/cuDNN 호환표를 제공하며, cuDNN major version 간
@@ -286,7 +287,12 @@ policy index·WDL 관점·누출·seed 계약이 충족된 후 진행한다. F03
   1/2/4/8/16, 실제 A 이력·합법 수 12개를 통한 C→D 수치 대조·drain, 실제 CPU UCI를
   검사했다. source·export·runtime·reference digest와 오차·범위는
   [통합 인수 상태](INTEGRATION-STATUS.md)에 기록한다.
-- 미완료: 목표 GPU 수치 대조·VRAM·종단 성능, 정식 대국·실제 Maia 파인튜닝,
+- 후속 목표 GPU 부분 인수: `bde687c7f269af3c7cd501201edde14c5c8ef642`에서 RTX 4050
+  Laptop GPU의 CUDA/FP32·TF32 off·CPU fallback 금지로 12개 원본 참조와 batch
+  1/2/4/8/16을 대조했다. 실제 warm profile은 CUDA 98·CPU 0 kernel 이벤트이며 C worker도
+  통과했다. 같은 최종 binary의 CPU 회귀도 통과했다. 전체 19-file native bundle·오차·
+  장비·자원·실패·profile·source SHA는 [통합 인수 상태](INTEGRATION-STATUS.md)에 둔다.
+- 미완료: 실제 A/D GPU 요청·수명, process peak VRAM·GPU 종단 성능, 정식 대국·실제 Maia 파인튜닝,
   외부 배포 형태의 source/notice 충족 확인. T70 권리는 보류 유지.
-- 다음 작업: 총괄 I02가 지원 환경의 목표 GPU와 E 실행 gate를 각각 인수한다.
+- 다음 작업: 총괄 I02가 실제 A/D GPU 연결·D02 종단 계측과 E 강도 gate를 각각 인수한다.
   학습·장시간 대국의 구체적 예산은 실행 전에 확정한다.

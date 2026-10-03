@@ -10,6 +10,8 @@ CPU/mock 인수 소스는 `4866a0b67dfd0aac10ffb03a0debd61fa018db3d`, 후속 실
 원시 근거는 저장소 밖에 보존하고 논리 경로·digest만 연결한다.
 실제 CPU 신경망의 Fastchess pair 연결 인수 소스는
 `0f0d70dddb170e7d46729eb19da02e810f0dee61`이며 후속 절에 별도로 기록한다.
+첫 목표 CUDA 수치·provider 인수 소스는 `bde687c7f269af3c7cd501201edde14c5c8ef642`다.
+이 후속 검사는 C worker·fixture Rules 범위이며 실제 A/D GPU 종단 인수와 구분한다.
 
 ## 기준 조합
 
@@ -44,8 +46,9 @@ D/E/F 최신 head의 이력을 merge했다. 기존 root 접점·Windows 검사·
 
 ## TASK-I01: workspace와 단일 계약
 
-- [x] Root Cargo에 10개 member 선언: `rz-contracts`, `rz-position`, `rz-search`,
+- [x] Root Cargo의 초기 10개 member 선언: `rz-contracts`, `rz-position`, `rz-search`,
   `rz-uci`, `rz-encoding`, `rz-eval`, `rz-runtime`, `rz-telemetry`, `rz-experiments`, `rz-arena`.
+  후속 CUDA bootstrap에서 `rz-native-loader`를 추가하여 현재 member는 11개다.
 - [x] Root path 의존에서 `rz-contracts=0.1.0`을 단일 공통 계약으로 지정.
 - [x] 선언 확인: toolchain `1.96.0`, workspace rust-version `1.90`; common crate
   MSRV `1.85`는 별도 범위이며 전체 workspace의 1.85 지원을 뜻하지 않는다.
@@ -432,3 +435,75 @@ MSRV를 올려 통과시키지 않았다. 준비 실패는 원래 cause와 부�
 오류를 구분한다. postspawn ownership loss에서는 원래 Child와 입력 owner를 함께 보존하고
 입장을 닫으며, 보존을 PID signal/reap 권한 회복으로 표시하지 않는다. 문서 후속과 develop
 인수에서는 `0f0d70d`의 실행 영향 입력과 실제 CI 대상 SHA를 다시 대조한다.
+
+## 첫 목표 CUDA 수치·provider 인수
+
+[PR #13](https://github.com/daejunnom/RoveZero/pull/13)의 실제 실행 소스는
+`bde687c7f269af3c7cd501201edde14c5c8ef642`이며 공통 계약 revision 0.1을 유지한다.
+총괄은 C의 runtime pin·물리 worker·오류와 B의 native attestation을 수동 정합했다.
+새 `RuntimeLibraryLoad` cause를 B wire에 전달하고, 완료 미확정 CUDA 오류에서는
+원래 cause·session·입력·job을 격리하며 Ready/ActualCompute를 만들지 않는다.
+`rz-native-loader`는 검토한 ORT 3개·NVIDIA 16개의 exact name/bytes/SHA 실행 profile,
+dependency-first load, process latch, retained FD/handle와 실제 inode mapping을 소유한다.
+CPU pin·기존 CPU backend identity와 `rz-eval`의 `forbid(unsafe_code)`를 보존한다.
+
+| 실제 검사 | 결과와 적용 범위 |
+|---|---|
+| Local workspace test | `e95ba37`: 626 passed, 0 failed, 16 ignored, 63 test binaries |
+| Local fmt·workspace clippy | `e95ba37` 소스 통과; strict `-D warnings` |
+| Rust 1.85 검사 | loader·eval `--features onnx --locked` 통과; contracts의 A 의존은 기존 Rust 1.90 요구이므로 all-features 1.85 지원으로 보고하지 않음 |
+| 최종 소스 CPU CI | [run 37079578861](https://github.com/daejunnom/RoveZero/actions/runs/37079578861), `bde687c`, Ubuntu·Windows의 fmt/test/심화 규칙/Python fixture/clippy 모두 성공 |
+| 실제 목표 장치 | RTX 4050 Laptop GPU, 6141 MiB, driver 610.62, Linux x86_64; device 0 |
+| 실제 CUDA 실행 | FP32, TF32 off, CPU fallback 금지; warm profile의 CUDA kernel 이벤트 98개, CPU 0개 |
+| 독립 참조·batch | 원본 LC0 Eigen protobuf 참조 12개, batch 1/2/4/8/16 및 역순 대조 통과 |
+| 최대 절대 오차 | CUDA raw logit `1.5735626220703125e-5`, 합법 policy `8.940696716308594e-7`, WDL `4.172325134277344e-7`; batch logit `1.5139579772949219e-5` |
+| 입력 경계·C worker | empty/과대 batch/NaN 거부 후 정상 실행; fixture Rules의 물리 출력 4개·취소 거부 1개 |
+| 최종 CPU 회귀 | 같은 release binary·기존 CPU core·같은 참조에서 통과; GPU 파일을 CPU로 조용히 대체하지 않음 |
+| 종료 | 두 gate exit 0, 남은 cgroup PID 없음, 전용 cgroup 제거 확인 |
+
+기존 원본·ONNX·manifest·12개 참조를 hash로 잠가 재사용했다. 첫 bundle은 ORT GPU
+1.22.0, CUDA 12.8 계열, cuDNN 9.8.0.87이며 native 19개 합계는 2,970,143,952 bytes다.
+전체 canonical bundle SHA는 `12d8fe080ab22c29d9a63229f233066ef0bd1f6b4743a2d54d1be9efea20fcd3`,
+GPU backend SHA는 `fa724b400eaa5e3c632de51be76763c4d29b363f4261c1c87b044daad2369b36`다.
+CPU backend SHA는 `90724c106ce7545e1d90a8ff12c5f837f92d049ea6948dc7c61f766bc64ecb78`이며
+이는 이 검사의 batch 16 설정이다. 기존 UCI batch 1 backend와 동일하다고 표시하지 않는다.
+독립 검토자가 manifest와 profile codec으로 두 backend SHA를 재계산하고 spec/source/
+README/준비 receipt의 19개 name/bytes/SHA 일치와 실제 profile 내용을 대조했다.
+
+| 외부 산출물 | bytes | SHA256 |
+|---|---:|---|
+| 최종 `maia_check` binary | 1,811,968 | `cb803553f9b6c8667db452ea6c1b69e0cbe1d42c4476934eb0022de5f0f05af8` |
+| release build receipt | 632 | `5c3042f72b4dda4341258964c409e65658f0a6ef12a01d9a8833c035ce6ae7f9` |
+| CUDA numerical report | 8,089 | `1c1b0207c7dbd3b4b994ff20ea403dacee24c2aa6595725ee0b94ed8541b6172` |
+| CUDA execution receipt | 3,846 | `9a52f79acac78ccdde9ff8063b3690a9aad643c913ce75a4252600eb477c3bec` |
+| CUDA warm profile | 41,261 | `c3c4e0d16080a4f4142605c3366bb1a1141bf2609f9dd11478dfc14fe55e3671` |
+| CPU numerical report | 4,127 | `67855aab943047e06f2f6479b2ffd48e22c80523a2b4c2a4159ae2917e43451d` |
+| CPU execution receipt | 3,432 | `73fb8eedebba7dcfa1ea4a4e887e7daceea328d3b8507a94c82d9811c3a371fd` |
+
+원시 자료의 논리 root는 저장소 밖 `reports/coordinator-integration/native-gpu/`다.
+최종 `captured-bde687c/`에 41개·304,588 bytes를 회수해 길이·SHA를 각각 대조했다.
+회수 receipt SHA는 `a58a1739559c80e689922823fe0fde6693ff5a39c5b4c496b99bf29ac54cad8a`다.
+이 별도 회수에는 profile·stdout/stderr·adapter 표본·실패·검사·build 기록을 포함하며
+큰 native library·binary·가중치는 넣지 않는다. 준비 자료 8개·103,079 bytes도
+`captured-preparation-v2/`에 별도 보존한다. library/notice와 Linux의 private copy는 유지한다.
+
+외부 gate의 hard 제한은 wall 120초·cgroup memory 4 GiB·swap 0·pids 128·CPU 2 core·
+file 1 GiB다. non-native file 8 MiB와 전체 run 4 GiB는 감독 관측 제한이며 disk quota가 아니다.
+CUDA cgroup peak는 file cache 등을 포함하여 **4 GiB 상한에 도달**했고 max event 31,113,
+OOM/kill 0이었다. sampled RSS는 998,096,896 bytes로 cgroup peak와 다르다.
+100ms 전체 adapter 표본은 123개·10~214 MiB였으며 다른 client를 포함한다. 이를 process
+peak VRAM이나 관측 사이의 실제 peak로 보고하지 않는다. CUDA 13.1829초·CPU 0.4122초는
+서로 다른 크기의 pin copy·hash·warmup·검사를 포함한 gate 시간이며 추론 속도 비교가 아니다.
+
+첫 e95ba37 시도의 8 MiB hard file 제한이 library copy를 SIGXFSZ로 종료한 실패와,
+최종 binary에 이전 SHA를 전달하여 native 실행 전에 거부된 실패를 보존했다. 감독 조건과
+binary pin을 명시적으로 수정한 뒤 fresh namespace로 실행했고 오차·precision·batch를 바꾸지 않았다.
+e95ba37 Windows CI는 redundant profile-builder binding의 clippy 실패였으며 해당
+non-Unix 두 줄만 제거하고 최종 bde687c의 두 OS CI와 GPU/CPU 실행을 다시 관측했다.
+
+인수 범위는 **선정 Maia의 수치·provider probe와 C worker**다. 실제 A Rules→D scheduler→
+B 소비/backup의 GPU 연결, GPU 취소·deadline·root 교체의 완료 수명, D02의 종단
+P50/P95/P99·완전 event journal, process peak VRAM, D03 효과, 실제 학습·정식 paired
+강도 판정은 pending이다. 파일 origin 감사도 exact mapped path/device/inode 범위이며
+개별 심볼 결합이나 모든 OS/driver ELF closure를 인증하지 않는다. 자세한 실행·로더 경계는
+[GPU-RUNTIME-BOOTSTRAP](GPU-RUNTIME-BOOTSTRAP.md)을 따른다.
