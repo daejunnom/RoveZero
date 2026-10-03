@@ -200,6 +200,12 @@ impl OrtRuntime {
         self.pin.bundle_digest()
     }
 
+    /// Canonical descriptors of the actually retained runtime bundle. This is
+    /// loaded pin metadata, not an unchecked bootstrap JSON declaration.
+    pub fn bundle_files(&self) -> Option<&[crate::runtime_pin::RuntimeBundleFile]> {
+        self.pin.bundle_files()
+    }
+
     /// Recheck all resident bundle images after later numerical/worker calls,
     /// before accepting their final GPU report. This is an origin audit, not a
     /// completion fence, VRAM measurement or device-drain operation.

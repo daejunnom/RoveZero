@@ -1,16 +1,19 @@
-//! Actual A Rules → C ONNX CPU → D finalization numerical acceptance.
+//! Actual A Rules → explicit C ONNX CPU/CUDA → D finalization numerical acceptance.
 //!
 //! External reference frames never construct the product position or legal view.
 //! Model/encoding/position owners are assigned locally for this finite fixture;
-//! this example makes no production registry, B UCI, GPU, or strength claim.
+//! this example makes no production registry, B UCI, or strength claim. CUDA is
+//! separately selected and requires its own fresh pinned runtime/profile inputs.
 use rz_contracts::*;
 use rz_encoding::classical::{HistoryFill, HISTORY_FRAMES};
 use rz_eval::asset::{self, MaiaAsset};
 use rz_eval::contracts::{encoding_manifest, MaiaBinding, HOST_BYTES_PER_ITEM};
-use rz_eval::native_runtime_bridge::{NativeRuntimeBackend, NativeWorkerOrigin, NativeWorkerOwner};
-use rz_eval::onnx::{BackendConfig, OnnxBackend, OrtRuntime};
+use rz_eval::native_runtime_bridge::{
+    NativeRuntimeBackend, NativeWorkerOrigin, NativeWorkerOwner, NATIVE_CUDA_ADMISSION_BYTES,
+};
+use rz_eval::onnx::{BackendConfig, OnnxBackend, OrtRuntime, Provider};
 use rz_eval::rules_projection::ClassicalProjection;
-use rz_eval::runtime_pin::RuntimeLibraryPin;
+use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeLibraryPin};
 use rz_position::contracts::{ContractPosition, ContractState, RulesState};
 use rz_position::{BoardMove, Position};
 use rz_runtime::contracts::{
@@ -44,6 +47,10 @@ const CASE_NAMES: [&str; 12] = [
     "black-all-promotions",
     "short-fen-history",
 ];
+
+fn hex_digest(digest: [u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -396,11 +403,19 @@ fn evaluate_profile(
     fixtures: &Fixtures,
     fill: HistoryFill,
     profile_slot: u64,
+    cuda_profile_directory: Option<&Path>,
     reports: &mut Vec<Value>,
     profiles: &mut Vec<Value>,
 ) -> Result<()> {
     let mut config = BackendConfig::cpu();
     config.max_batch = 1;
+    if let Some(directory) = cuda_profile_directory {
+        config.provider = Provider::Cuda {
+            device_id: 0,
+            arena_bytes: NATIVE_CUDA_ADMISSION_BYTES as usize,
+        };
+        config.profiling_prefix = Some(directory.join(format!("placement-{profile_slot}")));
+    }
     let loaded = OnnxBackend::load(runtime, model, config)?;
     // Explicit local fixture ownership; these are not production-issued handles.
     let encoding = EncodingHandle {
@@ -421,9 +436,19 @@ fn evaluate_profile(
         HistoryFill::No => "no",
         HistoryFill::RepeatOldest => "repeat_oldest",
     };
-    let owner = NativeWorkerOwner::from_onnx(loaded, projection.clone(), CASE_NAMES.len())?;
-    if owner.origin() != NativeWorkerOrigin::CpuOnnx {
-        return Err("injected worker is not actual ONNX CPU evidence".into());
+    let is_cuda = cuda_profile_directory.is_some();
+    let owner = if is_cuda {
+        NativeWorkerOwner::from_cuda_onnx(loaded, projection.clone(), CASE_NAMES.len())?
+    } else {
+        NativeWorkerOwner::from_onnx(loaded, projection.clone(), CASE_NAMES.len())?
+    };
+    let expected_origin = if is_cuda {
+        NativeWorkerOrigin::CudaOnnx
+    } else {
+        NativeWorkerOrigin::CpuOnnx
+    };
+    if owner.origin() != expected_origin {
+        return Err("injected worker is not actual requested-provider ONNX evidence".into());
     }
     let clock = ContractSystemClock::new(ProcessEpoch(910 + profile_slot));
     let scope = AcceptanceScope {
@@ -445,7 +470,7 @@ fn evaluate_profile(
         deadline_reserve: Duration::ZERO,
         memory: Resources {
             host_bytes: 4 * HOST_BYTES_PER_ITEM + 8192,
-            device_bytes: 0,
+            device_bytes: owner.admission_policy().execution_resources().device_bytes,
             pinned_bytes: 0,
         },
     };
@@ -504,6 +529,15 @@ fn evaluate_profile(
     })();
     // Both failure and cleanup receipts survive even when the profile fails.
     let cleanup = drain(&mut evaluator, &clock);
+    // Current resident identity is a separate proof after the worker/drain
+    // work. It cannot release quarantined inputs or turn failed work into pass.
+    let mapping_audit = if is_cuda {
+        runtime
+            .verify_cuda_runtime_mappings()
+            .map_err(|error| Box::new(error) as Box<dyn Error>)
+    } else {
+        Ok(())
+    };
     let diagnostics = owner.take_diagnostics();
     let diagnostic_report = match &diagnostics {
         Ok(batch) => json!({"entries":batch.entries.iter().map(|receipt| json!({
@@ -525,7 +559,26 @@ fn evaluate_profile(
             .is_some_and(Vec::is_empty)
             && receipt["unexpected_delivery_overflow"] == false
     });
+    let cuda_metadata = owner.cuda_metadata().map(|metadata| {
+        json!({
+        "device_id":metadata.device_id,"arena_bytes":metadata.arena_bytes,
+        "runtime_bundle_sha256":hex_digest(metadata.runtime_bundle_digest.0),
+        "placement_profile_sha256":hex_digest(metadata.placement_profile_digest.0),
+        "executed_cuda_nodes":metadata.executed_cuda_nodes})
+    });
+    let execution_admission = owner.admission_policy().execution_resources();
+    let session_admission = owner.admission_policy().session_resident_admission();
     profiles.push(json!({"history_fill":profile,"batch_size":1,
+        "provider":if is_cuda{"cuda"}else{"cpu"},
+        "native_origin":if is_cuda{"cuda_onnx"}else{"cpu_onnx"},
+        "cuda":cuda_metadata,
+        "current_mapping_audit":if mapping_audit.is_ok(){"passed"}else{"failed"},
+        "mapping_failure":mapping_audit.as_ref().err().map(|error|error_receipt(error.as_ref())),
+        "execution_admission":{"host_bytes":execution_admission.host_bytes,
+            "device_bytes":execution_admission.device_bytes,"pinned_bytes":execution_admission.pinned_bytes},
+        "session_resident_admission":{"host_bytes":session_admission.host_bytes,
+            "device_bytes":session_admission.device_bytes,"pinned_bytes":session_admission.pinned_bytes},
+        "admission_is_measured_residency_or_total_native_hard_cap":false,
         "work_status":if work.is_ok(){"passed"}else{"failed"},
         "work_failure":work.as_ref().err().map(|error| error_receipt(error.as_ref())),
         "drain":cleanup.as_ref().ok(),
@@ -538,6 +591,7 @@ fn evaluate_profile(
     }
     work?;
     cleanup?;
+    mapping_audit?;
     if !diagnostics_clean || !cleanup_clean {
         return Err(
             "native diagnostics or unexpected deliveries prevent profile acceptance".into(),
@@ -548,9 +602,11 @@ fn evaluate_profile(
 
 fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.len() != 8 || args[7] != "cpu" {
-        return Err("usage: rules_maia_check SOURCE.pb.gz MODEL.onnx MANIFEST.json ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu".into());
-    }
+    let is_cuda = match args.get(7).map(String::as_str) {
+        Some("cpu") if args.len() == 8 => false,
+        Some("cuda") if args.len() == 10 => true,
+        _ => return Err("usage: rules_maia_check SOURCE.pb.gz MODEL.onnx MANIFEST.json ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu | cuda PROFILE_DIRECTORY CUDA_BUNDLE.json".into()),
+    };
     let report_path = Path::new(&args[6]);
     if !report_path.is_absolute() {
         return Err("REPORT must be absolute".into());
@@ -580,12 +636,60 @@ fn main() -> Result<()> {
             Path::new(&args[1]),
             Path::new(&args[2]),
         )?;
-        let pin = RuntimeLibraryPin::copy_verified(Path::new(&args[3]), output_root, &args[4])?;
+        let cuda_profile_directory = if is_cuda {
+            let directory = Path::new(&args[8]);
+            if !directory.is_absolute()
+                || directory
+                    .parent()
+                    .ok_or("profile directory has no parent")?
+                    .canonicalize()?
+                    != canonical
+            {
+                return Err("CUDA profile directory must be a fresh direct child of REPORT's caller-owned parent".into());
+            }
+            let builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            let builder = {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = builder;
+                builder.mode(0o700);
+                builder
+            };
+            builder.create(directory)?;
+            Some(directory)
+        } else {
+            None
+        };
+        let pin = if is_cuda {
+            let bytes = asset::read_bounded(Path::new(&args[9]), 64 * 1024)?;
+            let spec = CudaRuntimeBundleSpec::from_json(std::str::from_utf8(&bytes)?)?;
+            let core = spec
+                .files
+                .iter()
+                .find(|file| file.role == RuntimeBundleFileRole::Core)
+                .ok_or("CUDA bundle has no core declaration")?;
+            let core_path = Path::new(&args[3]);
+            if core_path.file_name().and_then(|name| name.to_str()) != Some(core.filename.as_str())
+                || core.sha256 != args[4]
+            {
+                return Err(
+                    "ORT_LIBRARY/ORT_SHA256 must match the explicit CUDA bundle core".into(),
+                );
+            }
+            RuntimeLibraryPin::copy_cuda_bundle(
+                core_path.parent().ok_or("CUDA core has no bundle parent")?,
+                output_root,
+                &spec,
+            )?
+        } else {
+            RuntimeLibraryPin::copy_verified(Path::new(&args[3]), output_root, &args[4])?
+        };
         let runtime = OrtRuntime::load(&pin)?;
         identity = json!({"reference":fixtures.reference,"reference_commit":fixtures.reference_commit,
             "reference_module_sha256":fixtures.reference_module_sha256,"source_sha256":fixtures.source_sha256,
             "fixture_sha256":asset::hex_sha256(&bytes),"onnx_sha256":model.manifest().onnx_sha256,
-            "runtime_sha256":args[4],"runtime_build":runtime.build_info()});
+            "runtime_sha256":args[4],"runtime_build":runtime.build_info(),
+            "runtime_bundle_sha256":runtime.bundle_digest().map(hex_digest)});
         for (fill, slot) in [(HistoryFill::No, 1), (HistoryFill::RepeatOldest, 2)] {
             evaluate_profile(
                 &runtime,
@@ -593,6 +697,7 @@ fn main() -> Result<()> {
                 &fixtures,
                 fill,
                 slot,
+                cuda_profile_directory,
                 &mut cases,
                 &mut profiles,
             )?;
@@ -600,20 +705,25 @@ fn main() -> Result<()> {
         if cases.len() != CASE_NAMES.len() {
             return Err("not all twelve actual A cases completed".into());
         }
+        if is_cuda {
+            runtime.verify_cuda_runtime_mappings()?;
+        }
         Ok(())
     })();
     let report = json!({"status":if result.is_ok(){"passed"}else{"failed"},
         "failure":result.as_ref().err().map(|error| error_receipt(error.as_ref())),"identity":identity,
-        "scope":"actual A immutable Rules projection, C ONNX CPU and D finalization",
+        "scope":if is_cuda{"actual A immutable Rules projection, C ONNX CUDA and D finalization"}else{"actual A immutable Rules projection, C ONNX CPU and D finalization"},
         "handles":"explicit local fixture ownership; no production registry issuance claim",
-        "provider":"cpu","precision":"fp32","case_count":cases.len(),"case_results":cases,
+        "provider":if is_cuda{"cuda"}else{"cpu"},"precision":"fp32","case_count":cases.len(),"case_results":cases,
         "model_rights":"external Maia GPL asset; separately identified from engine source",
         "profiles":profiles,"limits":{"fixture_bytes":8*1024*1024,"cases":12,"trace_plies":8,
             "native_batch_size":1,"max_executions":1,"request_deadline_seconds":REQUEST_SECONDS,
             "scheduler_host_reservation_limit":4*HOST_BYTES_PER_ITEM+8192,
+            "scheduler_device_admission_limit":if is_cuda{NATIVE_CUDA_ADMISSION_BYTES}else{0},
+            "bootstrap_session_resident_device_admission":if is_cuda{NATIVE_CUDA_ADMISSION_BYTES}else{0},
             "scheduler_reservations_are_resident_memory_measurements":false},
         "tolerances":{"dense_input_atol":0.0,"legal_policy_max_abs":1e-4,"wdl_max_abs":1e-4},
-        "raw_logits":"separate maia_check gate","uci":"not_run","gpu":"not_run",
+        "raw_logits":"separate maia_check gate","uci":"not_run","gpu":if is_cuda{"see_actual_profile_receipts"}else{"not_run"},
         "maia_training":"not_run","arena":"not_run","strength":"not_run"});
     report_file.write_all(&serde_json::to_vec_pretty(&report)?)?;
     report_file.write_all(b"\n")?;
