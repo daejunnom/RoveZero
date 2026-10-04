@@ -421,6 +421,9 @@ diagnostic example은 기존 factory/worker/Rules adapter를 재사용하고 B1�
 case wall 1..60초·유한 physical shutdown으로 제한한다. 일반 UCI와 별도 example에서
 실행한 근거를 구분하며, output 관측은 D/B final acceptance를 대신하지 않는다.
 exact-terminal 선택은 전체 minimax solved propagation이나 mate-distance 정보를 만들지 않는다.
+진단 example은 고정 1ms polling·전체 outcome 조회를 사용한다. 일반 UCI는 compile feature에
+따라 notify/best-move를 선택할 수 있지만 이번 실제 B1 binary에는 둘 다 꺼져 있음을 Cargo
+feature와 source branch로 대조했고, 같은 1ms polling 기준을 일반 UCI에서도 계측했다.
 
 S0/S1 probe의 source `9817647`과 후속 실제 UCI/CI source `fabe88e`를 각각 고정했다.
 후속 변경은 bounded Debug뿐이고 두 source의 search/Rules/encoding/runtime 경로 일치를

@@ -450,34 +450,47 @@ startup은 go 응답 시간에서 제외하고 CPU 2개·RAM 6 GiB·swap 0·단�
 잠갔으며 기본값 탓으로 해석하지 않는다. 고정 방문 작업에도 7.6~9.9% 편차가 관측되어
 단일 측정의 작은 차이는 개선으로 채택하지 않는다.
 
-별도 source-profile은 `cf94d07`의 두 opening·각 128 non-root visits로 실행했다.
+최초 source-profile은 `cf94d07` 진단 example의 두 opening·각 128 non-root visits로 실행했다.
 root 초기화 포함 실제 요청/완료/전달/소비가 **258회**, 모든 물리 batch가 1이다.
 8192 한도 안의 8108 metadata record, complete timeline, producer join, 누락·중복·
 identity mismatch·미소비·worker 실패 0을 확인했다. 계측은 실제 source clock을 쓴다.
 
-| 실제 host 단계 | P50 ms | P95 ms | P99 ms |
-|---|---:|---:|---:|
-| Rules replay·legal 생성·history export | 0.044608 | 0.174899 | 0.248374 |
-| C input encoding·hash·key 검사 | 0.025593 | 0.033861 | 0.064591 |
-| worker의 실제 C 인코딩 | 0.020822 | 0.027618 | 0.030322 |
-| runtime queue | 0.002907 | 0.004557 | 0.008136 |
-| synchronous ORT Run 전체 | 9.808874 | 16.202664 | 22.248237 |
-| 물리 완료→owner 관측 대기 | 0.654593 | 1.041342 | 1.158128 |
-| root 초기화/guarded backup | 0.002535 | 0.003967 | 0.005737 |
-| 최종 착수 조회 | 0.001183 | 0.003547 | 0.009757 |
+그 뒤 일반 `rz-uci`의 threaded worker를 같은 두 opening·`go nodes 128`·configuration
+cap 4096으로 다시 계측했다. source `fabe88e`, binary `2bcb3d5d…3cffec`의 실제
+build features는 `onnx-cuda,experimental-batch`다. `experimental-notify`와
+`experimental-best-move`는 꺼져 있어 **실제 기준 UCI도 1ms polling과 전체 outcome
+진행 조회**를 사용한다. 코드에 완료 신호 기능이 존재한다는 사실을 이번 실행에서
+사용했다는 증거로 바꾸지 않는다. 두 기능을 조용히 활성화하지 않았다.
 
-최종 착수 조회는 pump 중 진행 조회를 포함한 3206개 표본이다. 나머지 표의 keyed
+일반 UCI의 8182/8192 metadata·complete timeline·join·실제 요청/물리 완료/전달/소비
+258회·실패/미소비/누락/중복 0·physical drain을 확인했다. 다음 표는 이 **일반 UCI**
+profile이며 처음 진단 example의 분포는 외부 원본에 따로 보존한다.
+
+| 일반 UCI의 실제 host 단계 | P50 ms | P95 ms | P99 ms |
+|---|---:|---:|---:|
+| Rules replay·legal 생성·history export | 0.042959 | 0.201463 | 0.305329 |
+| C input encoding·hash·key 검사 | 0.030850 | 0.048060 | 0.073043 |
+| worker의 실제 C 인코딩 | 0.024717 | 0.038974 | 0.056563 |
+| runtime queue | 0.003220 | 0.006054 | 0.018149 |
+| synchronous ORT Run 전체 | 10.089241 | 15.558466 | 23.129515 |
+| 물리 완료→owner 관측 대기 | 0.601590 | 1.010235 | 1.082479 |
+| root 초기화/guarded backup | 0.002605 | 0.003916 | 0.010656 |
+| 최종 착수 조회 | 0.001549 | 0.003524 | 0.013862 |
+
+최종 착수 조회는 pump 중 진행 조회를 포함한 3235개 표본이다. 나머지 표의 keyed
 단계는 258개다. `StateReplay`에 Rules legal 생성·history export가 포함되며 별도
 `LegalValidation`은 이미 만든 authority 확인이다. SearchPreparation/PhysicalWorker와
 세부 단계는 중첩되어 분위수나 총합을 이중 합산하지 않는다.
 
-두 search의 합계 2,974.757ms 중 inclusive ORT Run interval 합계는 2,761.039ms,
-replay는 16.806ms였다. **이 두 opening/B1 표본에서 가장 큰 관측 host interval은
+두 일반 UCI의 go 응답 합계 3,022.374ms 중 inclusive ORT Run interval 합계는
+2,813.345ms(**93.084%**), replay는 17.935ms(**0.593%**)였다. **이 두 opening/B1
+표본에서 가장 큰 관측 host interval은
 ORT Run**이다. 이것은 CUDA kernel만의 시간이 아니다. 전송·provider·동기화·호스트
 작업을 포함하며, replay를 BT4의 최대 병목이라고 주장할 근거는 나오지 않았다.
 
-전체 process 250ms GPU 표본은 78개·관측 최대 VRAM 1,127MiB·최대 사용률 80%다.
-startup이 포함되어 중앙 사용률 0%를 search 사용률로 해석하지 않는다. cgroup의
+일반 UCI의 전체 process 250ms GPU 표본은 94개·관측 최대 VRAM 1,127MiB·최대 사용률
+78%다. 앞선 진단은 78개·최대 80%이며 모두 startup을 포함한다. 중앙 사용률을
+search 사용률로 해석하지 않는다. cgroup의
 RAM peak는 6 GiB·memory.max hit가 있었고 OOM/kill 0이었다. page cache·메모리 압박의
 영향은 측정 조건으로 보존한다. 첫 profile 실행은 종료/drain 영수증이 회수되지 않아
 미확정 실패로 남기고 fresh run의 성공으로 대체 기록하지 않았다.

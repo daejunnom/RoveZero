@@ -64,7 +64,9 @@ pub const TERMINAL_CASES: &[(&str, &str)] = &[
 ];
 
 /// Explicit bounds prevent this diagnostic API from becoming an unbounded runner.
-/// Uses the same B1 pump/progress query/1ms wait/drain as the native UCI worker.
+/// Reuses the native B1 Rules/factory/pump/drain with an observed 1ms polling
+/// loop. The UCI worker can use completion signals and lighter progress queries;
+/// this harness's wait/final-selection timing is not that production loop.
 pub fn run(
     factory: &dyn EvaluatorFactory,
     clock: &ProcessClock,

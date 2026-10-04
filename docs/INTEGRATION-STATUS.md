@@ -1044,7 +1044,7 @@ HistoryFillNo, 동결 BT4 FP32·TF32 off·B1·cache off를 유지한다. 최종 
 | 입력·평가 조건 | `3ef9171` parity fixture와 기존 실제 CUDA root 평가 10개, pinned LC0 Eigen original | tensor bit/ordered legal indices exact, temperature 1에서 policy 3.8314e-6/WDL 4.6194e-7. 짧은 No 참조의 source-equivalent zero padding을 명시 |
 | 이전 실제 대국 설정 | 원본 manifests/argv와 LC0 help/source | 두 엔진 HistoryFillNo·RZ cap 4096; policy temperature LC0 1.36/RZ 1.0 차이 발견. 전 대국 root 모두 재평가한 것은 아님 |
 | 동일 binary A/A | 기존 `78b7c53`/`1a4b976b…69b3`, 새 process 2·24 query | fixed `go nodes 128` 응답 CV 7.571~9.910%; timed 응답 CV 0.280~0.335%. 128은 explicit workload이며 config cap은 4096 |
-| B1 host-source profile | `cf94d07`, 두 opening/128 visits, request/physical complete/delivered/consumed 각 258 | 8108/8192 metadata·complete timeline·누락/중복/identity mismatch/미소비 0. ORT Run P50 9.808874ms, Rules replay 0.044608ms; device kernel/transfer는 미측정 |
+| B1 host-source profile | `cf94d07` 진단 뒤 `fabe88e` 일반 UCI 재확인, 두 opening/128 visits, request/physical complete/delivered/consumed 각 258 | 각각 8108/8182 records·complete timeline·누락/중복/identity mismatch/미소비 0. 일반 UCI ORT Run P50 10.089241ms, Rules replay 0.042959ms; device kernel/transfer는 미측정 |
 | 같은 tensor·batch 추론 | `3ef9171` Rust raw 20 round/B1·B16, native LC0 backendbench 같은 입력/20 round | RZ 평균 11.087/76.947ms, LC0 11.637/62.623ms; 각 20/320 NN 항목. cross-OS/runtime/CPU/RAM 차이가 남아 순수 엔진 효율·기력 인수 아님 |
 | 검사/CI | S1 로컬 workspace 714 passed·0 failed, 후속 UCI 192 passed·fmt/Clippy/release 성공; source `fabe88e` [37218841079](https://github.com/daejunnom/RoveZero/actions/runs/37218841079) | Windows·Ubuntu의 모든 필수 step SUCCESS 직접 조회; ignored는 별도 미실행. 후속 변경이 문서에만 한정됨을 대조한 CPU 결과 재사용이며 새 GPU CI 실행 아님 |
 
@@ -1053,6 +1053,10 @@ CPU 2·RAM 6 GiB·swap 0·유한 case/process time을 잠갔고 memory.max press
 kernel-only·H2D/D2H 비용을 추정하거나 kernel_time 이름만으로 device 측정이라고 하지 않는다.
 더 깊은 profiler 경로는 새 진단 환경·영향 identity와 same-input/physical completion 검사를
 잠근 뒤 연결한다. 현재 표본은 replay보다 inclusive ORT Run interval이 컸다는 근거다.
+일반 UCI의 고정 feature는 `onnx-cuda,experimental-batch`이며 notify/best-move는 꺼져 있다.
+따라서 이 기준선은 1ms polling과 전체 outcome 진행 조회를 사용한다. 소스에 존재하는
+선택 기능을 이번 binary의 활성 기능으로 보고하지 않는다. 일반 UCI go 응답 3,022.374ms
+중 inclusive Run 합계 2,813.345ms·replay 17.935ms, 각각 약 93.1%·0.59%다.
 
 첫 profile의 종료 미확정, 첫 LC0 backendbench의 CLI 거부/exit 0/결과 없음, host disk
 부족의 S0 bootstrap sync 실패를 모두 보존했다. 성공한 fresh retry만 인수했다. 원시
