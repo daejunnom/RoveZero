@@ -959,3 +959,18 @@ PGN 감사기는 기존 A Rules를 재사용하며 runner의 자동 claim 수락
 3건을 포함해 모든 판을 보존했다. 원본·정리본과 24pair PGN을 외부 reports로 회수하며,
 정리본도 A 감사 결과가 원본과 같다. 매 착수 GPU 물리 drain·시계 공정성의 정식 인수와
 per-game NN 완료 journal은 미검증으로 보존한다.
+
+## 로컬 LC0·T1 후보의 실행·변환 조사
+
+2026-10-04 후속 사용자 요청에 따라 공식 LC0 v0.32.1 Windows CUDA package와
+T1 distilled의 원본 identity·제작자 직접 허가를 확인했다. RTX 4050에서 명시적
+CUDA/FP16로 Maia/T1 각각 18회 UCI 착수·exit 0을 확인하고, 독립 oracle로 36개
+입력·착수·PV와 흑/백 mate-in-one 12개를 감사했다. T1 FP32 ONNX export/checker와
+LC0 Eigen 원본 ↔ ONNX CPU의 6개 상태·batch 2/4/8/16 수치 대조도 통과했다.
+설정·원본/변환 digest·오차·공백과 B~F 순서는 [모델 전환 계획](research/LOCAL-MODEL-BASELINE.md)에 둔다.
+
+이번에는 문서 계획과 **외부 도구의 실행/CPU 수치**를 인수했다. Rust의 T1 loader/
+encoder·ONNX CUDA parity·실제 fine-tuning·새 정식 대국은 미실행이다. Maia exact
+profile·공통 계약 0.1과 기존 48판의 `strength_eligible=false`를 유지한다. 기존 F의
+합성 linear fixture를 실제 모델 trainer로 표현하지 않는다. 문서 경로는 Workspace CPU
+workflow의 path filter에 포함되지 않아 이번 문서 PR의 CI는 자동 실행되지 않았다.

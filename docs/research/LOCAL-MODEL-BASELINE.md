@@ -41,13 +41,16 @@
 | 입력 | 시작 상태, 흑 차례 오프닝, Sicilian 이력, pawn endgame, 흑/백 mate-in-one의 6개 상태 |
 | 요청 | 모델별 각 상태의 `go nodes 128`, `go movetime 100`, `go movetime 1000`: 18회 |
 | 모델 | Maia 원본과 T1-256x10-distilled-swa-2432500 원본을 별도 process로 순차 실행 |
-| 완료 | 두 모델 모두 18회 bestmove와 exit 0, process 종료 확인 |
+| 완료 | 두 모델 모두 18회 bestmove와 exit 0, process 종료 확인; 독립 oracle로 36개 착수와 전체 PV의 합법성·printed WDL 범위/정규화 감사 |
 | GPU 메모리 | 두 모델을 순차 실행한 구간의 전체 장치 관측 최고 1,169 MiB; process peak가 아님 |
 | 상한 | process별 120초, 응답별 15초, log stream별 8 MiB, model 50 MiB 다운로드 상한 |
 
-현재 상태·bestmove/PV·WDL 독립 감사는 후속 기록에서 확정한다. 이 smoke는 실제
-GPU 실행 가능성 근거이며 강도·FP32/FP16 수치 parity·동시 두 엔진 VRAM·정식 GPU
-시간 공정성의 인수가 아니다. raw receipt/log는 저장소 밖
+`python-chess` 1.11.2로 36개 입력/착수/PV를 감사했고 흑·백 mate-in-one 12개 착수는
+실제 checkmate를 확인했다. 100 ms 요청의 bestmove 응답은 Maia 90.30~91.18 ms,
+T1 90.31~93.62 ms였고 1,000 ms 요청은 각각 990.26~991.22 / 990.29~992.38 ms였다.
+각 모델 6개의 단일 smoke 표본이며 속도 분포·전체 강도·per-move physical GPU drain을
+입증하지 않는다. 이 smoke는 실제 GPU 실행 가능성 근거이며 FP32/FP16 수치 parity·
+동시 두 엔진 VRAM·정식 GPU 시간 공정성의 인수가 아니다. raw receipt/log는 저장소 밖
 `reports/coordinator-integration/lc0-model-evaluation-20261004/`에 보존한다.
 
 첫 Windows `--help` 호출은 20초 timeout, 재시도는 exit 0이었다. 원인은 미확정이다.
@@ -65,6 +68,33 @@ lc0 --config=<empty-config> --weights=<exact-weight-file> --backend=cuda-fp16
 
 [공식 release](https://github.com/LeelaChessZero/lc0/releases/tag/v0.32.1),
 [공식 모델 목록](https://lczero.org/play/networks/bestnets/).
+
+### T1 ONNX 변환과 외부 CPU 수치 대조
+
+같은 공식 LC0 converter로 `leela2onnx --onnx-data-type=f32 --onnx-opset=17
+--onnx-batch-size=-1`을 실행해 **80,896,290 bytes**의 단일 ONNX를 만들었다.
+SHA-256은 `0e2699c19b617781d4fbe3d00286756b125836a30c0658afc620e197bec35d04`다.
+ONNX 1.18.0 checker를 통과했고 external tensor는 없다. graph는 node 555개,
+initializer 377개이며 다음 인터페이스를 직접 확인했다.
+
+| FP32 인터페이스 | shape / 출력 의미의 확인 범위 |
+|---|---|
+| `/input/planes` | `[batch,112,8,8]` |
+| `/output/policy` | `[batch,1858]`, 마지막 op Gather, raw logits로 원본 참조와 대조 |
+| `/output/wdl` | `[batch,3]`, 마지막 op Softmax, W/D/L 확률로 원본 참조와 대조 |
+| `/output/mlh` | `[batch,1]`, 마지막 op Relu; NN moves-left 출력이며 규칙 판정을 대신하지 않음 |
+
+고정 LC0 `fd71a2d921b689c5f479d3227c3806c8e272d9c5`의 Eigen backend/원본
+protobuf와 ONNX Runtime 1.22.0 CPU/FP32를 같은 LC0 입력으로 대조했다. thread 1,
+NumPy 2.2.6, 같은 6개 상태에서 실행 전 고정한 absolute tolerance는 raw logits
+`5e-4`, WDL와 합법 policy `1e-5`, batch/single `5e-4`다. 최댓값은 각각
+**1.4306e-5 / 3.1293e-7 / 8.5140e-7** 이하여서 통과했다. batch 2/4/8/16과
+single의 출력 차이 최댓값은 0이었다. Eigen module SHA-256은
+`c795ba5809490beaf3117b4d94bb42616af4f0aaee22e2e02012144356f054f4`다.
+
+이는 외부 CPU reference/export 검사다. 입력 생성도 LC0를 사용했으므로 **현재 Rust
+encoder의 T1 parity, Rust loader, ONNX CUDA·FP16 parity는 아직 인수하지 않았다.**
+raw graph/CPU reference receipt는 같은 외부 루트의 `t1-export/`에 보존한다.
 
 ## 3. 첫 강도 후보: 동결 T1 distilled
 
@@ -105,7 +135,7 @@ BT4-it332는 강한 외부 비교/교사 후보로 보존하지만 공식 약 4 
 | 1 / 총괄·B·D | WorkerLimit 3건의 정확한 요청/세대/마감 원인을 재현한다. bestmove 전에 취소된 작업의 physical drain을 확인하고, game/root/request별 fresh 실행·cache 소비·유효 backup·deadline fallback을 기록한다. 실패를 숨기거나 로그만 줄이지 않는다. |
 | 2 / B·총괄 | 128 simulation을 안전한 설정 상한과 T1/T2 시계로 분리한다. queue·tree·RAM·시간 상한과 stop/quit/drain을 유지한다. 기존 알고리즘 고정 상태에서 예산 변경을 따로 대조한다. |
 | 3 / C·총괄 | Maia의 exact profile을 보존하며 T1용 immutable model/export descriptor와 source digest·권리 근거·새 모델 ID를 추가한다. raw/exact cache namespace를 분리하고 newgame/model 교체에서 잘못된 재사용을 차단한다. |
-| 4 / C | T1 외부 ONNX export의 shape/head 의미·할당 상한을 검사한다. classical 입력은 가능한 기존 구현을 재사용하되 독립 reference로 대조한다. attention policy·WDL·미사용 moves-left head를 명시하고 미지원 모델은 거부한다. |
+| 4 / C | 확인한 T1 외부 FP32 ONNX의 80.9 MB·출력 3개를 별도 bounded profile로 연결한다. 현재 Maia의 16 MiB·출력 2개 검사는 유지한다. classical 입력은 가능한 기존 구현을 재사용하되 독립 reference로 대조한다. attention policy·WDL·moves-left의 사용/미사용을 명시한다. MLH를 제거하는 export는 P/WDL 보존 수치와 새 digest를 검증하고 미지원 모델은 거부한다. |
 | 5 / C·D·총괄 | 같은 T1 원본의 CPU reference ↔ ONNX CPU/FP32 ↔ Rust CPU ↔ 로컬 CUDA/FP32 수치 대조. batch 1/2/4/8/16, 양쪽 차례·history·반복·castling/EP/네 승격을 포함한다. FP16은 통과한 FP32 기준 이후 별도 변경으로 검사한다. |
 | 6 / E·총괄 | 다음 표의 대조군과 유한 manifest를 잠근 뒤 개발 대국을 실행한다. 같은 full start/history의 흑백 pair, 전체 PGN 감사, 실제 소비·실패·자원·물리 완료를 기록한다. 결과를 본 뒤 유리한 제외/중단을 선택하지 않는다. |
 | 7 / F·C·총괄 | 동결 강도용 모델을 실제 Rust 엔진이 사용한 기준선과 병목·실패군을 확보한 뒤, 아래 F02 학습 경로를 하나만 선택한다. |
@@ -170,6 +200,22 @@ endgame·특수 수의 tail failure와 같은 시간 paired 대국을 각각 평
 제안이다. Rust inference 결정과 training 언어는 별개다. 새 유료 GPU/장시간 학습은
 필요한 모델·데이터·시간·총비용·보존 조건이 확정된 뒤 실행한다. 이번 조사에서는
 실제 fine-tuning·교사 dataset 생성·유료 GPU 사용을 시작하지 않았다.
+
+## 6. 이번 조사 인수와 다음 실행의 경계
+
+완료한 범위는 공식 LC0 package/원본 모델 identity·T1 제작자 허가 조사, 두 모델의
+명시 CUDA/FP16 로컬 UCI smoke, 36개 입력/착수/PV 독립 감사, T1 외부 FP32 ONNX
+checker·6개 상태/다중 batch의 외부 CPU 원본 수치 대조, 총괄·B~F의 실행 계획이다.
+이 계획 PR은 문서만 변경한다. 기존 Rust source/모델 선택·공통 revision·훈련 recipe를
+변경하지 않으며 새 모델 지원과 학습 성과를 선기록하지 않는다.
+
+다음 인수는 B/D 오류·수명/예산, C의 실제 Rust T1 호환/독립 수치/GPU, E의 같은
+시간 개발 대국, F의 실제 body 학습/round-trip 순서로 관리한다. 기존 48판 A/B의
+fallback과 `strength_eligible=false`는 유지하고 새 모델의 결과로 소급 해제하지 않는다.
+
+문서 검사는 상대 링크·diff·결정/증거 범위를 확인한다. 현재 Workspace CPU workflow는
+source/Cargo/training 경로만 대상으로 하므로 이 문서 PR의 CI는 자동 실행되지 않는다.
+로컬 LC0·oracle·외부 CPU 수치 결과와 CI 미실행을 구별해 보고한다.
 
 세부 데이터/누출/학습 조건은 [TRAINING-PLAN](../TRAINING-PLAN.md), 실제 F lifecycle
 범위는 [F TRAINING](../../experiments/model-research/TRAINING.md)을 따른다.
