@@ -105,7 +105,10 @@ impl fmt::Debug for NativeConfig {
             .field("batch", &self.parallelism)
             .field("search_simulations", &self.search_simulations)
             .field("final", &self.final_move_policy)
-            .field("cuda_bundle_sha256", &self.cuda_bundle_sha256)
+            .field(
+                "bundle",
+                &(self.cuda_bundle.is_some(), &self.cuda_bundle_sha256),
+            )
             .finish_non_exhaustive()
     }
 }
