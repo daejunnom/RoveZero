@@ -9,6 +9,10 @@ description = "RoveZero UCI parser and injected session control boundary"
 [lib]
 path = "src/lib.rs"
 
+[[example]]
+name = "search_probe"
+required-features = ["onnx-cpu"]
+
 [features]
 experimental-batch = ["rz-search/experimental-batch", "rz-eval/experimental-batch"]
 experimental-io-buffers = ["rz-eval/experimental-io-buffers"]

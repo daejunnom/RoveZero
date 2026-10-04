@@ -8,6 +8,12 @@ use std::time::Instant;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SourceStage {
     SearchPreparation,
+    SearchSelection,
+    StateReplay,
+    LegalValidation,
+    InputKey,
+    TerminalBackup,
+    FinalSelection,
     EncodingPreparation,
     NativePreparation,
     NativeInvocation,

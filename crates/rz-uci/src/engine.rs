@@ -1,6 +1,8 @@
 //! Concrete Rules → UCI → search → common evaluation assembly.
 //! Model loading and physical execution remain the injected factory's responsibility.
 
+pub mod diagnostics;
+
 use crate::{bridge::BuildSearchSettings, *};
 use rz_contracts as contract;
 use rz_position::{
