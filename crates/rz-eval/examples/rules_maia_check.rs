@@ -11,7 +11,7 @@ use rz_eval::contracts::{encoding_manifest, MaiaBinding, HOST_BYTES_PER_ITEM};
 use rz_eval::native_runtime_bridge::{NativeRuntimeBackend, NativeWorkerOrigin, NativeWorkerOwner};
 use rz_eval::onnx::{BackendConfig, OnnxBackend, OrtRuntime, Provider};
 use rz_eval::rules_projection::ClassicalProjection;
-use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeLibraryPin};
+use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeCache};
 use rz_position::contracts::{ContractPosition, ContractState, RulesState};
 use rz_position::{BoardMove, Position};
 use rz_runtime::contracts::{
@@ -609,6 +609,20 @@ fn evaluate_profile(
 
 fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let option_start = args
+        .iter()
+        .position(|arg| arg.starts_with("--"))
+        .unwrap_or(args.len());
+    let (args, options) = args.split_at(option_start);
+    let mut runtime_cache_root = None;
+    for option in options {
+        let value = option
+            .strip_prefix("--runtime-cache-root=")
+            .ok_or("unsupported rules gate option")?;
+        if value.is_empty() || runtime_cache_root.replace(Path::new(value)).is_some() {
+            return Err("runtime cache root must be a unique absolute path".into());
+        }
+    }
     let is_cuda = match args.get(7).map(String::as_str) {
         Some("cpu") if args.len() == 8 => false,
         Some("cuda") if args.len() == 10 => true,
@@ -667,6 +681,8 @@ fn main() -> Result<()> {
         } else {
             None
         };
+        let runtime_cache =
+            runtime_cache_root.map_or_else(RuntimeCache::for_user, RuntimeCache::open)?;
         let pin = if is_cuda {
             let bytes = asset::read_bounded(Path::new(&args[9]), 64 * 1024)?;
             let spec = CudaRuntimeBundleSpec::from_json(std::str::from_utf8(&bytes)?)?;
@@ -683,19 +699,19 @@ fn main() -> Result<()> {
                     "ORT_LIBRARY/ORT_SHA256 must match the explicit CUDA bundle core".into(),
                 );
             }
-            RuntimeLibraryPin::copy_cuda_bundle(
+            runtime_cache.cuda_bundle(
                 core_path.parent().ok_or("CUDA core has no bundle parent")?,
-                output_root,
                 &spec,
             )?
         } else {
-            RuntimeLibraryPin::copy_verified(Path::new(&args[3]), output_root, &args[4])?
+            runtime_cache.library(Path::new(&args[3]), &args[4])?
         };
         let runtime = OrtRuntime::load(&pin)?;
         identity = json!({"reference":fixtures.reference,"reference_commit":fixtures.reference_commit,
             "reference_module_sha256":fixtures.reference_module_sha256,"source_sha256":fixtures.source_sha256,
             "fixture_sha256":asset::hex_sha256(&bytes),"onnx_sha256":model.manifest().onnx_sha256,
             "runtime_sha256":args[4],"runtime_build":runtime.build_info(),
+            "runtime_storage":pin.storage(),
             "runtime_bundle_sha256":runtime.bundle_digest().map(hex_digest)});
         for (fill, slot) in [(HistoryFill::No, 1), (HistoryFill::RepeatOldest, 2)] {
             evaluate_profile(

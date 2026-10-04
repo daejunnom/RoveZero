@@ -81,6 +81,25 @@ fn complete_native_config_keeps_private_paths_out_of_debug() {
 }
 
 #[test]
+fn runtime_cache_root_is_optional_private_and_rejects_duplicate_selection() {
+    assert!(
+        NativeConfig::parse(valid_arguments())
+            .unwrap()
+            .runtime_cache_root
+            .is_none()
+    );
+    let mut args = valid_arguments();
+    args.push(format!("--runtime-cache-root={PRIVATE_MARKER}/cache"));
+    let config = NativeConfig::parse(args.clone()).unwrap();
+    assert_eq!(
+        config.runtime_cache_root.unwrap(),
+        PathBuf::from(format!("{PRIVATE_MARKER}/cache"))
+    );
+    args.push(format!("--runtime-cache-root={PRIVATE_MARKER}/other"));
+    assert_private_config_rejection(args);
+}
+
+#[test]
 fn exact_terminal_final_policy_is_explicit_and_keeps_s0_reproducible() {
     use rz_search::tree::FinalMovePolicy;
     assert_eq!(

@@ -28,7 +28,7 @@ use rz_eval::{
         NativeDiagnosticReceipt, NativeRuntimeBackend, NativeWorkerOrigin, NativeWorkerOwner,
     },
     onnx::{BackendConfig, IO_BYTES_PER_ITEM, OnnxBackend, OrtRuntime},
-    runtime_pin::RuntimeLibraryPin,
+    runtime_pin::RuntimeCache,
 };
 #[cfg(all(feature = "onnx-cuda", target_os = "linux"))]
 use rz_eval::{
@@ -83,6 +83,7 @@ pub struct NativeConfig {
     ort_library: PathBuf,
     ort_sha256: [u8; 32],
     output_root: PathBuf,
+    runtime_cache_root: Option<PathBuf>,
     attestation: bool,
     profiling: bool,
     provider: NativeProvider,
@@ -129,6 +130,7 @@ impl NativeConfig {
         let mut ort_library = None;
         let mut ort_sha256 = None;
         let mut output_root = None;
+        let mut runtime_cache_root = None;
         let mut attestation = false;
         let mut profiling = false;
         let mut cuda_bundle = None;
@@ -233,6 +235,7 @@ impl NativeConfig {
                 "--ort-library" => set_path(&mut ort_library, value)?,
                 "--ort-sha256" => set_hash(&mut ort_sha256, value)?,
                 "--output-root" => set_path(&mut output_root, value)?,
+                "--runtime-cache-root" => set_path(&mut runtime_cache_root, value)?,
                 "--cuda-bundle" => set_path(&mut cuda_bundle, value)?,
                 "--cuda-bundle-sha256" => set_hash(&mut cuda_bundle_sha256, value)?,
                 _ => {
@@ -311,6 +314,7 @@ impl NativeConfig {
             ort_library: ort_library.ok_or_else(missing)?,
             ort_sha256: ort_sha256.ok_or_else(missing)?,
             output_root: output_root.ok_or_else(missing)?,
+            runtime_cache_root,
             attestation,
             profiling,
             provider,
@@ -1118,6 +1122,10 @@ impl NativeSessionFactory {
             .into());
         }
         let output_root = private_output_root(&config.output_root)?;
+        let runtime_cache = config
+            .runtime_cache_root
+            .as_deref()
+            .map_or_else(RuntimeCache::for_user, RuntimeCache::open)?;
         let expected_ort: String = config
             .ort_sha256
             .iter()
@@ -1129,9 +1137,7 @@ impl NativeSessionFactory {
         backend_config.intra_threads = 1;
         backend_config.host_io_bytes = config.parallelism * IO_BYTES_PER_ITEM;
         let pin = match config.provider {
-            NativeProvider::Cpu => {
-                RuntimeLibraryPin::copy_verified(&config.ort_library, &output_root, &expected_ort)?
-            }
+            NativeProvider::Cpu => runtime_cache.library(&config.ort_library, &expected_ort)?,
             NativeProvider::Cuda => {
                 #[cfg(all(feature = "onnx-cuda", target_os = "linux"))]
                 {
@@ -1183,14 +1189,13 @@ impl NativeSessionFactory {
                         arena_bytes: asset.profile().cuda_arena_bytes(),
                     };
                     backend_config.profiling_prefix = Some(profile_directory.join("placement"));
-                    RuntimeLibraryPin::copy_cuda_bundle(
+                    runtime_cache.cuda_bundle(
                         config
                             .ort_library
                             .parent()
                             .ok_or(NativeBootstrapError::Config(
                                 "CUDA core lacks a source parent",
                             ))?,
-                        &output_root,
                         &spec,
                     )?
                 }
@@ -1204,6 +1209,43 @@ impl NativeSessionFactory {
         };
         let runtime = OrtRuntime::load(&pin)?;
         let backend = OnnxBackend::load(&runtime, &asset, backend_config)?;
+        // Storage evidence is a separate sidecar, not a change to E's closed
+        // inference/attestation schema or backend identity. No private paths.
+        let storage_receipt = serde_json::json!({
+            "schema": 1,
+            "runtime_storage": pin.storage(),
+            "runtime_sha256": expected_ort,
+            "runtime_bundle_sha256": runtime.bundle_digest(),
+            "native_startup_loaded": true,
+        });
+        use std::io::Write;
+        let mut receipt = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output_root.join(format!(
+                "native-runtime-storage-{}.json",
+                std::process::id()
+            )))
+            .map_err(|cause| {
+                BackendError::new(
+                    FailureKind::Io,
+                    FailureStage::Backend,
+                    "cannot create native runtime storage receipt",
+                )
+                .with_external_cause(CauseCode::RuntimePath, &cause)
+            })?;
+        receipt
+            .write_all(&serde_json::to_vec_pretty(&storage_receipt).map_err(|_| {
+                NativeBootstrapError::Config("cannot serialize runtime storage receipt")
+            })?)
+            .map_err(|cause| {
+                BackendError::new(
+                    FailureKind::Io,
+                    FailureStage::Backend,
+                    "cannot write native runtime storage receipt",
+                )
+                .with_external_cause(CauseCode::RuntimePath, &cause)
+            })?;
         let fill = HistoryFill::No;
         let encoding = EncodingHandle {
             owner: owners.allocate()?,

@@ -3,12 +3,12 @@
 //! REPORT must be absolute. Its existing parent is also the bootstrap output
 //! root: the caller owns this private directory and controls its ancestors.
 //! It must be outside Git. No temporary-directory fallback is selected, and
-//! verified native copies are retained there for process lifetime.
+//! native libraries use a separate bounded cache and retain process-lifetime pins.
 use rz_encoding::classical::{self, Frame, HistoryFill, Input};
 use rz_encoding::policy;
 use rz_eval::asset::{self, MaiaAsset};
 use rz_eval::onnx::{BackendConfig, ExecutionExperiments, OnnxBackend, OrtRuntime, Provider};
-use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeLibraryPin};
+use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeCache};
 use rz_eval::{output, RawOutput};
 use serde::Deserialize;
 use serde_json::json;
@@ -95,12 +95,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(args.len());
     let (args, options) = args.split_at(option_start);
     let mut benchmark_rounds = None;
+    let mut runtime_cache_root = None;
     let mut execution_options = Vec::new();
     for option in options {
         if let Some(value) = option.strip_prefix("--benchmark-rounds=") {
             let count = value.parse::<usize>()?;
             if !(1..=100).contains(&count) || benchmark_rounds.replace(count).is_some() {
                 return Err("benchmark rounds must be a unique 1..=100 limit".into());
+            }
+        } else if let Some(value) = option.strip_prefix("--runtime-cache-root=") {
+            if value.is_empty() || runtime_cache_root.replace(Path::new(value)).is_some() {
+                return Err("runtime cache root must be a unique absolute path".into());
             }
         } else {
             execution_options.push(option.clone());
@@ -180,16 +185,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
+    let runtime_cache =
+        runtime_cache_root.map_or_else(RuntimeCache::for_user, RuntimeCache::open)?;
     let pin = if let Some(spec) = &bundle_spec {
-        RuntimeLibraryPin::copy_cuda_bundle(
+        runtime_cache.cuda_bundle(
             Path::new(&args[3])
                 .parent()
                 .ok_or("CUDA core has no bundle source parent")?,
-            output_root,
             spec,
         )?
     } else {
-        RuntimeLibraryPin::copy_verified(Path::new(&args[3]), output_root, &args[4])?
+        runtime_cache.library(Path::new(&args[3]), &args[4])?
     };
     if is_cuda {
         let profile_directory = Path::new(&args[8]);
@@ -401,6 +407,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "reference":fixtures.reference, "fixture_sha256":asset::hex_sha256(&bytes),
         "reference_commit":fixtures.reference_commit,"reference_module_sha256":fixtures.reference_module_sha256,
         "runtime_sha256":args[4], "runtime_build":runtime.build_info(),
+        "runtime_storage":pin.storage(),
         "cuda_bundle_sha256":runtime.bundle_digest().map(|digest| digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
         "cuda_bundle_files":pin.bundle_files().map(|files| files.iter().map(|file| {
             let role = match file.role {

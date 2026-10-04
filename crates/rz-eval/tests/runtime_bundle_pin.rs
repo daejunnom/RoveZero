@@ -363,6 +363,84 @@ mod linux {
     }
 
     #[test]
+    fn shared_bundle_reuses_all_nineteen_files_without_source_or_duplicate_copy() {
+        use rz_eval::runtime_pin::{RuntimeCache, RuntimeStorageOrigin};
+        let mut spec = spec();
+        let fixture = Fixture::new(&mut spec);
+        fs::set_permissions(&fixture.output, fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = RuntimeCache::open(&fixture.output).unwrap();
+        let first = cache.cuda_bundle(&fixture.source, &spec).unwrap();
+        assert_eq!(first.storage().origin, RuntimeStorageOrigin::CacheCreated);
+        let directory = fixture.bundle_directory();
+        for file in &spec.files {
+            fs::remove_file(fixture.source.join(&file.filename)).unwrap();
+        }
+        let second = cache.cuda_bundle(&fixture.source, &spec).unwrap();
+        assert_eq!(second.storage().origin, RuntimeStorageOrigin::CacheReused);
+        assert_eq!(first.bundle_digest(), second.bundle_digest());
+        assert_eq!(first.storage().cache_key, second.storage().cache_key);
+        assert_eq!(
+            second.storage().bytes,
+            spec.files.iter().map(|file| file.bytes).sum::<u64>()
+        );
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 19);
+        assert_eq!(fs::read_dir(&fixture.output).unwrap().count(), 1);
+        for file in &spec.files {
+            assert_eq!(
+                fs::read(directory.join(&file.filename)).unwrap(),
+                payload(file)
+            );
+        }
+        drop(first);
+        drop(second);
+        fixture.release();
+    }
+
+    #[test]
+    fn failed_cached_bundle_copy_cleans_staging_and_lock_and_can_retry() {
+        use rz_eval::runtime_pin::RuntimeCache;
+        let mut spec = spec();
+        let fixture = Fixture::new(&mut spec);
+        fs::set_permissions(&fixture.output, fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = RuntimeCache::open(&fixture.output).unwrap();
+        let last = spec.files.iter().max_by_key(|file| &file.filename).unwrap();
+        fs::write(fixture.source.join(&last.filename), b"late corrupt source").unwrap();
+        assert!(cache.cuda_bundle(&fixture.source, &spec).is_err());
+        assert_eq!(fs::read_dir(&fixture.output).unwrap().count(), 0);
+        fs::write(fixture.source.join(&last.filename), payload(last)).unwrap();
+        drop(cache.cuda_bundle(&fixture.source, &spec).unwrap());
+        fixture.release();
+    }
+
+    #[test]
+    fn changed_cached_provider_is_rejected_even_with_a_valid_original_bundle() {
+        use rz_eval::runtime_pin::RuntimeCache;
+        let mut spec = spec();
+        let fixture = Fixture::new(&mut spec);
+        fs::set_permissions(&fixture.output, fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = RuntimeCache::open(&fixture.output).unwrap();
+        drop(cache.cuda_bundle(&fixture.source, &spec).unwrap());
+        let directory = fixture.bundle_directory();
+        let provider = directory.join(CUDA);
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o600)).unwrap();
+        let size = fs::metadata(&provider).unwrap().len();
+        fs::write(&provider, vec![b'!'; size as usize]).unwrap();
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(cache.cuda_bundle(&fixture.source, &spec).is_err());
+        assert_eq!(fs::read(&provider).unwrap(), vec![b'!'; size as usize]);
+        assert_eq!(
+            fs::read(fixture.source.join(CUDA)).unwrap(),
+            payload(
+                spec.files
+                    .iter()
+                    .find(|file| file.filename == CUDA)
+                    .unwrap()
+            )
+        );
+        fixture.release();
+    }
+
+    #[test]
     fn late_hash_or_length_failure_cleans_only_unpublished_bundle() {
         for wrong_length in [false, true] {
             let mut spec = spec();
