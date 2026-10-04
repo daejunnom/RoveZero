@@ -5,10 +5,15 @@
 `cargo run --release -p rz-arena --example pair_pgn_audit -- PAIR_INPUT_JSON TWO_GAME_PGN`
 은 기존 A Rules와 `audit_pair_pgn_for_spec`으로 두 판의 시작 상태·전체 이동열·흑백
 배정·종료를 대조한다. 입력은 `schema_version=1`, 잠긴 `PairSpec`인 `pair`, 양수
-`max_plies`를 담으며 알 수 없는 필드를 거부한다. JSON은 64KiB, PGN은 4MiB 이하로
+`max_plies`, `claim_policy`를 담으며 알 수 없는 필드를 거부한다. JSON은 64KiB, PGN은 4MiB 이하로
 읽고 ply 한도는 기존 감사기의 4095 이하 제한을 따른다. 엔진 실패는 Loss, 최대 ply
 중단은 Incomplete로 분류한다. 이 예제는 실행 후 감사만 제공하며 native V1의 B1
 제약을 확장하거나 GPU·시계 공정성·정식 강도 인수를 증명하지 않는다.
+
+`claim_policy=automatic_acceptance`는 pinned Fastchess의 현재 3회 반복·50수 종료를
+A의 CurrentPosition/Available claim과 대조해 `accepted_claim`으로 분류한다. intended-move,
+Unknown 근거나 다른 종료 문구는 거부한다. 기본 인수 경로는 `explicit_claim`이며 별도
+claim 영수증을 제공하지 않은 claim 종료를 계속 거부한다.
 
 같은 opening 입력에 흑백 엔진 배정만 교환하는 pair를 만들고, 모든 game attempt의
 결과·실패를 보존한다. E01의 잠긴 입력, A의 checked Rules와 bounded Fastchess

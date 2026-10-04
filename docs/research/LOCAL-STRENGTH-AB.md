@@ -24,9 +24,9 @@ batching으로 선택·완료 분포가 바뀌는 **S 실험**이며, 의미 보
 | 장비 | 로컬 RTX 4050 Laptop 6GB, driver 610.62, WSL2 Linux; 한 번에 한 대국 |
 | 시간 | T2, 매 착수 `go movetime 100`; 양쪽 현재 탐색 상한 128회 동일 |
 | 표본 | 자가 작성한 24개 고유 opening prefix, 같은 완전 상태에서 색을 바꾼 48판 |
-| 순서 | opening 순서는 seed 20261004로 잠금, pair마다 첫 백 구성을 교차 |
+| 순서 | opening 순서는 seed 20261004로 잠금; 고정 runner의 순서로 S0 백 판 뒤 S1 백 판을 한 pair로 진행 |
 | 초기화 | 같은 원본 startpos+전체 prefix, 상대 차례 평가·ponder·game 간 cache 유입 금지 |
-| 종료 | 점수 adjudication·tablebase 비활성; 반복/50수 claim은 runner 정책을 명시하고 A로 감사 |
+| 종료 | 점수 adjudication·tablebase 비활성; runner의 현재 3회 반복·50수 claim 자동 수락을 명시하고 A로 감사 |
 | 한도 | 최대 200 full moves; cutoff는 Incomplete이며 자동 득점 제외. 실행 wall 1200초·cleanup 10초 |
 | 자원 | cohort 전용 cgroup CPU 2 core·RAM 12GiB·swap 0·pids 128; 로그·출력·단일 파일 별도 상한 |
 | 실패 | 엔진 불법 수·크래시·시간패는 loss로 보존. 인프라 실패를 유리한 판의 누락으로 처리하지 않음 |
@@ -51,3 +51,13 @@ Computed-only native V1 receipt는 B>1과 조합하지 않는다. GPU·시계·�
 동일 시작 상태·색 교대·종료를 검증하며 CPU/GPU runtime 계약이나 실행 권한을 만들지
 않는다. C 수치, 실제 native 실행, pair PGN·실패 회계, 시계/GPU 공정성과 최종 통계를
 각각 확인한다. 실제 대국과 미실행 검사 상태는 실행 후 이 기록에 추가한다.
+
+대국 결과가 나오기 전에 pinned Fastchess의 실제 scheduling을 확인하여 pair 내
+실행 순서를 S0 백 → S1 백으로 잠갔다. 양쪽의 총 백·흑 판수는 각각 24이며 전체
+순서 효과까지 검증한 조건은 아니다. 두 native 엔진을 `restart=off`로 유지하고
+`ucinewgame`에서 상태를 초기화하여 매 판 CUDA bundle의 복제를 피한다.
+
+PGN 감사의 `claim_policy=automatic_acceptance`는 Fastchess의 정확한 종료 문구와
+A가 제공한 **현재 상태**의 Available claim을 모두 요구한다. intended-move나 Unknown
+근거, 임의 adjudication은 거부하며 결과를 `accepted_claim`으로 표시한다. 기존 native
+통합 검사는 `explicit_claim`을 유지하고 별도 claim 영수증 없는 종료를 계속 거부한다.

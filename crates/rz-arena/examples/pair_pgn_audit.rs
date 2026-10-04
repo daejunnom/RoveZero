@@ -1,7 +1,7 @@
 //! Bounded post-run PGN audit using the existing A-owned Rules implementation.
 //! This checks paired games; it grants no launch, timing or strength authority.
 use rz_arena::{PairSpec, PgnLimits, PgnOutcomePolicy, audit_pair_pgn_for_spec, decode_json};
-use rz_experiments::OutcomePolicy;
+use rz_experiments::{ClaimPolicy, OutcomePolicy};
 use serde::Deserialize;
 use std::fs::File;
 use std::io::Read;
@@ -13,6 +13,7 @@ struct Input {
     schema_version: u32,
     pair: PairSpec,
     max_plies: u32,
+    claim_policy: ClaimPolicy,
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Result<String, Box<dyn std::error::Error>> {
@@ -46,6 +47,7 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
         PgnOutcomePolicy {
             engine_failure: OutcomePolicy::Loss,
             max_plies_outcome: OutcomePolicy::Incomplete,
+            claim_policy: input.claim_policy,
             max_game_plies: input.max_plies,
         },
     )?;

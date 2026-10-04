@@ -697,6 +697,7 @@ pub(crate) mod linux {
                         PgnOutcomePolicy {
                             engine_failure: OutcomePolicy::Loss,
                             max_plies_outcome: OutcomePolicy::Incomplete,
+                            claim_policy: rz_experiments::ClaimPolicy::ExplicitClaim,
                             max_game_plies: owner.spec.view().max_plies,
                         },
                     )

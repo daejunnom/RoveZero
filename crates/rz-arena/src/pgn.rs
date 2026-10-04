@@ -2,10 +2,13 @@
 //! PGN notation is E's responsibility; every move and terminal decision comes
 //! from `rz-position`, never from a second chess rules implementation.
 use crate::{ArenaError, ArenaPlan, EngineFailureKind, GameResult, GameSpec, PairSpec};
-use rz_experiments::{HistoryCompleteness, InitialPosition, OpeningSpec, OutcomePolicy};
+use rz_experiments::{
+    ClaimPolicy, HistoryCompleteness, InitialPosition, OpeningSpec, OutcomePolicy,
+};
 use rz_position::contracts::{ContractPosition, ContractState};
 use rz_position::{
-    BoardMove, Color, PieceKind, PlayStatus, Position, PositionLimits, TerminalReason,
+    Availability, BoardMove, ClaimEvidence, ClaimReason, Color, PieceKind, PlayStatus, Position,
+    PositionLimits, TerminalReason,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -39,6 +42,9 @@ pub struct PgnLimits {
 pub struct PgnOutcomePolicy {
     pub engine_failure: OutcomePolicy,
     pub max_plies_outcome: OutcomePolicy,
+    /// Only AutomaticAcceptance admits pinned runner claims checked by A.
+    /// ExplicitClaim remains unsupported without a separate claim receipt.
+    pub claim_policy: ClaimPolicy,
     /// Ceiling on the complete game, including every declared opening ply.
     pub max_game_plies: u32,
 }
@@ -575,7 +581,7 @@ fn classify_outcome(
     termination: &str,
     result: GameResult,
     final_comment: &str,
-    engine_loss_enabled: bool,
+    policy: PgnOutcomePolicy,
     max_plies_cutoff: bool,
 ) -> Result<OutcomeClassification, ArenaError> {
     let state = export(live)?;
@@ -599,6 +605,42 @@ fn classify_outcome(
             })
         }
         PlayStatus::Ongoing => {
+            if policy.claim_policy == ClaimPolicy::AutomaticAcceptance
+                && termination == "normal"
+                && result == GameResult::Draw
+            {
+                let claim = if exact_reason_suffix(final_comment, "Draw by 3-fold repetition")
+                    == Some("")
+                {
+                    Some((ClaimReason::ThreefoldRepetition, "threefold_repetition"))
+                } else if exact_reason_suffix(final_comment, "Draw by fifty moves rule") == Some("")
+                {
+                    Some((ClaimReason::FiftyMove, "fifty_move"))
+                } else {
+                    None
+                };
+                if let Some((rule, reason)) = claim {
+                    if !state
+                        .rules()
+                        .classification()
+                        .claim_availability
+                        .iter()
+                        .any(|evidence| {
+                            evidence.reason == rule
+                                && evidence.evidence == ClaimEvidence::CurrentPosition
+                                && evidence.availability == Availability::Available
+                        })
+                    {
+                        return Err(invalid("runner draw claim is not currently available in A"));
+                    }
+                    return Ok(OutcomeClassification {
+                        classification: "accepted_claim".into(),
+                        loser_engine: None,
+                        terminal_reason: Some(reason.into()),
+                        engine_failure: None,
+                    });
+                }
+            }
             // Pinned Fastchess reports its maxmoves ceiling as adjudicated Draw.
             // RoveZero's manifest classifies this exact limit as Incomplete.
             // Preserve the observed declaration without assigning draw points.
@@ -614,7 +656,7 @@ fn classify_outcome(
                     engine_failure: None,
                 });
             }
-            if !engine_loss_enabled {
+            if policy.engine_failure != OutcomePolicy::Loss {
                 return Err(invalid("manifest does not classify engine failure as loss"));
             }
             let side = live.position().side_to_move();
@@ -703,6 +745,7 @@ pub fn audit_pair_pgn(
         PgnOutcomePolicy {
             engine_failure: protocol.engine_failure,
             max_plies_outcome: protocol.max_plies_outcome,
+            claim_policy: protocol.claim_policy,
             max_game_plies: protocol.max_plies,
         },
     )
@@ -923,7 +966,7 @@ pub fn audit_pair_pgn_for_spec(
             &termination,
             header_result,
             final_comment,
-            policy.engine_failure == OutcomePolicy::Loss,
+            policy,
             policy.max_plies_outcome == OutcomePolicy::Incomplete
                 && uci_moves.len() == policy.max_game_plies as usize,
         )?;
