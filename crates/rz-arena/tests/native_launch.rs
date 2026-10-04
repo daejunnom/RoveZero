@@ -8,11 +8,12 @@ fn native_inner_arguments_are_one_complete_quoted_fastchess_value() {
         OsString::from("--attestation"),
         OsString::from("--onnx-model=/owned path/model"),
         OsString::from("--ort-sha256=abcd"),
+        OsString::from("--runtime-cache-root=/owned path/cache"),
     ];
     let encoded = encode_fastchess_native_args(&tokens).unwrap();
     assert_eq!(
         encoded.to_str().unwrap(),
-        "args=\"--onnx-cpu\" \"--attestation\" \"--onnx-model=/owned path/model\" \"--ort-sha256=abcd\""
+        "args=\"--onnx-cpu\" \"--attestation\" \"--onnx-model=/owned path/model\" \"--ort-sha256=abcd\" \"--runtime-cache-root=/owned path/cache\""
     );
     for bad in ["", "x\ny", "x\ty", "x'y", "x\"y", "x\\y"] {
         assert!(encode_fastchess_native_args(&[bad.into()]).is_err());

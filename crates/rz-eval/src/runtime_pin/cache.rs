@@ -33,6 +33,13 @@ impl std::fmt::Debug for RuntimeCache {
 }
 
 impl RuntimeCache {
+    /// Explicit local handoff to a child bootstrap. Do not render this private
+    /// path in shared diagnostics or artifact identities. Opening the cache
+    /// does not issue any library pin or authorize native code execution.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// No run ID or PID in the default slot. Platform/architecture and the
     /// entry content key isolate incompatible binaries. CI uses RUNNER_TEMP.
     pub fn for_user() -> Result<Self, BackendError> {
@@ -918,6 +925,9 @@ mod tests {
                         "runtime_pin::cache::tests::cache_child_process",
                         "--nocapture",
                     ])
+                    // E clears the runner/engine environment. Explicit cache
+                    // handoff must also work without HOME/XDG/APPDATA.
+                    .env_clear()
                     .env("RZ_RUNTIME_CACHE_TEST_ROOT", &fixture.root)
                     .env("RZ_RUNTIME_CACHE_TEST_CHILD", child.to_string())
                     .stdout(Stdio::null())

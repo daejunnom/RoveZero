@@ -939,6 +939,12 @@ pub(crate) mod linux {
                 )
             })?;
         let mut args = Vec::new();
+        // Fastchess and its engine children inherit E's cleared environment.
+        // Resolve C's owned cache in the parent and pass only its explicit root;
+        // do not propagate HOME, loader variables or other ambient settings.
+        let runtime_cache = rz_eval::runtime_pin::RuntimeCache::for_user().map_err(|error| {
+            ArenaError::Io(format!("native runtime cache preparation:{:?}", error.kind))
+        })?;
         for role in input.white_order {
             let engine = spec.engine_view(role)?;
             let binary = pin(pins, engine.artifact(NativeArtifactRole::Binary)?)?;
@@ -977,6 +983,7 @@ pub(crate) mod linux {
                 .into(),
             );
             tokens.push(key_path("--output-root=", root)?);
+            tokens.push(key_path("--runtime-cache-root=", runtime_cache.root())?);
             if let Some(bundle) = engine.cuda_bundle {
                 tokens.push(key_path(
                     "--cuda-bundle=",
@@ -1055,6 +1062,8 @@ pub(crate) mod linux {
             "owned-tree/process snapshots are observed limits, not aggregate RAM or kernel disk quotas; escaped/transient children are outside the process-group guarantee",
             "per-process address-space declaration requires separately recorded inherited enforcement; this library does not install RAM/CPU affinity limits",
             "process cleanup alone is not physical NN drain; matched bounded B startup/final provider records are required separately",
+            "runtime libraries use C's external immutable cache: at most 4 entries/8GiB per cache slot, separate from this attempt's watched artifact budget; cache reuse is not inference-cache provenance",
+            "native engine binaries must accept the explicit runtime-cache-root option; historical binaries/launchers remain reproducible at their original source pins",
         ].map(String::from).to_vec();
         limitations[0] = format!(
             "{} NN integration only; execution_ready=false; strength_eligible=false; same weights and search in both roles",
