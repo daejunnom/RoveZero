@@ -1406,11 +1406,12 @@ pub fn serve<O: Write, D: Write>(
     } = process;
     if settings.max_workers == 0
         || settings.shutdown_limit.is_zero()
-        || settings.search.max_simulations > 128
+        || settings.search.max_simulations == 0
+        || settings.search.max_simulations > 4096
     {
         return Err(failure(
             contract::ErrorCode::InvalidInput,
-            "finite workers/drain and at most 128 simulations required",
+            "finite workers/drain and 1..=4096 simulations required",
         )
         .into());
     }

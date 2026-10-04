@@ -9,7 +9,6 @@
 #[cfg(feature = "onnx-cuda")]
 use crate::native_cuda_attestation::CudaProfileV1;
 use crate::{
-    bootstrap::MAX_EVALUATIONS,
     engine::{
         EngineError, EvaluatorFactory, EvaluatorProfile, ManagedEvaluator, OwnerRegistry,
         ProcessClock, SearchAuthority,
@@ -56,6 +55,8 @@ const MAX_FATAL_RECEIPTS: usize = 32;
 const NATIVE_DIAGNOSTIC_CAPACITY: usize = 32;
 const FINAL_COLLECTION_LIMIT: Duration = Duration::from_secs(2);
 pub const CUDA_ARENA_BYTES: usize = 1024 * 1024 * 1024;
+pub const MAX_NATIVE_SIMULATIONS: u64 = 4096;
+const MAX_NATIVE_EVALUATIONS: u64 = MAX_NATIVE_SIMULATIONS + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeProvider {
@@ -73,6 +74,7 @@ pub struct NativeConfig {
     execution_experiments: rz_eval::onnx::ExecutionExperiments,
     raw_cache: bool,
     parallelism: usize,
+    search_simulations: u64,
     source_weights: PathBuf,
     onnx_model: PathBuf,
     export_manifest: PathBuf,
@@ -100,6 +102,7 @@ impl fmt::Debug for NativeConfig {
                     | (u8::from(self.raw_cache) << 3)),
             )
             .field("batch", &self.parallelism)
+            .field("search_simulations", &self.search_simulations)
             .field("cuda_bundle_sha256", &self.cuda_bundle_sha256)
             .field("cuda_bundle_selected", &self.cuda_bundle.is_some())
             .finish_non_exhaustive()
@@ -112,6 +115,7 @@ impl NativeConfig {
         let mut execution_experiments = rz_eval::onnx::ExecutionExperiments::default();
         let mut raw_cache = false;
         let mut parallelism = None;
+        let mut search_simulations = None;
         let mut provider = None;
         let mut source_weights = None;
         let mut onnx_model = None;
@@ -175,6 +179,22 @@ impl NativeConfig {
                     "native CPU arguments require named asset/hash values",
                 ))?;
             match name {
+                "--search-simulations" => {
+                    if search_simulations.is_some() {
+                        return Err(NativeBootstrapError::Config(
+                            "duplicate search simulation limit",
+                        ));
+                    }
+                    let limit = value.parse::<u64>().map_err(|_| {
+                        NativeBootstrapError::Config("invalid search simulation limit")
+                    })?;
+                    if !(1..=MAX_NATIVE_SIMULATIONS).contains(&limit) {
+                        return Err(NativeBootstrapError::Config(
+                            "native search simulation limit must be 1..=4096",
+                        ));
+                    }
+                    search_simulations = Some(limit);
+                }
                 "--experimental-batch" => {
                     if parallelism.is_some() {
                         return Err(NativeBootstrapError::Config("duplicate batch width"));
@@ -261,6 +281,7 @@ impl NativeConfig {
             execution_experiments,
             raw_cache,
             parallelism,
+            search_simulations: search_simulations.unwrap_or(128),
             source_weights: source_weights.ok_or_else(missing)?,
             onnx_model: onnx_model.ok_or_else(missing)?,
             export_manifest: export_manifest.ok_or_else(missing)?,
@@ -280,6 +301,14 @@ impl NativeConfig {
     }
     pub fn profiling_requested(&self) -> bool {
         self.profiling
+    }
+    pub fn engine_settings(&self) -> crate::engine::EngineSettings {
+        let mut settings = crate::engine::EngineSettings {
+            max_workers: 1,
+            ..crate::engine::EngineSettings::default()
+        };
+        settings.search.max_simulations = self.search_simulations;
+        settings
     }
     fn source_journal(
         &self,
@@ -1595,7 +1624,7 @@ impl EvaluatorFactory for NativeSessionFactory {
         if let Some(error) = self.evidence.admission_error()? {
             return Err(error);
         }
-        let high_water = clock.reserve_executions(MAX_EVALUATIONS)?;
+        let high_water = clock.reserve_executions(MAX_NATIVE_EVALUATIONS)?;
         let runtime_clock = RuntimeClock(clock.clone());
         let scope = SharedScope::new(authority.current_scope()?);
         let adapter = ContractsAdapter::with_execution_high_water(
@@ -1909,7 +1938,7 @@ impl Evaluator<RulesState> for NativeRuntime {
         if let Some(error) = self.evidence.admission_error()? {
             return Err(error);
         }
-        if self.submissions >= MAX_EVALUATIONS {
+        if self.submissions >= MAX_NATIVE_EVALUATIONS {
             return Err(error(
                 ErrorCode::ResourceExhausted,
                 Stage::Admission,

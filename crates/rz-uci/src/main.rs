@@ -111,10 +111,7 @@ fn run_cpu(config: NativeConfig) -> Result<(), Box<dyn std::error::Error>> {
             name: "RoveZero LC0 weights ONNX CPU integration".into(),
             author: "RoveZero contributors".into(),
         });
-    let settings = EngineSettings {
-        max_workers: 1,
-        ..EngineSettings::default()
-    };
+    let settings = config.engine_settings();
     // Retain the native owner outside EngineProcess. Report/drain acceptance runs
     // for both successful protocol service and EngineError; neither implies GPU support.
     let served = serve_native_process(process, settings, trace.clone());
@@ -174,14 +171,7 @@ fn run_cuda(config: NativeConfig) -> Result<(), Box<dyn std::error::Error>> {
             name: "RoveZero LC0 weights ONNX CUDA integration".into(),
             author: "RoveZero contributors".into(),
         });
-    let served = serve_native_process(
-        process,
-        EngineSettings {
-            max_workers: 1,
-            ..EngineSettings::default()
-        },
-        trace.clone(),
-    );
+    let served = serve_native_process(process, config.engine_settings(), trace.clone());
     let finished = factory.finish(served);
     if let (Some(writer), Some(startup)) = (receipts.as_mut(), startup.as_ref()) {
         let receipt = match CudaTerminationReceiptV1::from_result(startup, &finished) {

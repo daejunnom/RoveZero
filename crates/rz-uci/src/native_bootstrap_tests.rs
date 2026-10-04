@@ -31,6 +31,36 @@ fn assert_private_config_rejection(arguments: Vec<String>) {
 }
 
 #[test]
+fn native_search_budget_is_explicit_finite_and_default_compatible() {
+    assert_eq!(
+        NativeConfig::parse(valid_arguments())
+            .unwrap()
+            .engine_settings()
+            .search
+            .max_simulations,
+        128
+    );
+    for limit in [1, 128, MAX_NATIVE_SIMULATIONS] {
+        let mut args = valid_arguments();
+        args.push(format!("--search-simulations={limit}"));
+        let config = NativeConfig::parse(args).unwrap();
+        assert_eq!(config.engine_settings().search.max_simulations, limit);
+        assert_eq!(config.engine_settings().max_workers, 1);
+    }
+    for value in ["0", "4097", "-1", "unbounded"] {
+        let mut args = valid_arguments();
+        args.push(format!("--search-simulations={value}"));
+        assert_private_config_rejection(args);
+    }
+    let mut args = valid_arguments();
+    args.extend([
+        "--search-simulations=1".into(),
+        "--search-simulations=2".into(),
+    ]);
+    assert_private_config_rejection(args);
+}
+
+#[test]
 fn complete_native_config_keeps_private_paths_out_of_debug() {
     let config = NativeConfig::parse(valid_arguments()).unwrap();
     assert_eq!(config.manifest_sha256, [0xab; 32]);
