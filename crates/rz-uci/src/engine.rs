@@ -2387,6 +2387,131 @@ mod tests {
     }
 
     #[test]
+    fn deferred_move_is_discarded_on_root_game_or_session_replacement() {
+        for replacement in ["position startpos moves e2e4", "ucinewgame", "quit"] {
+            let (mut owner, mut session) = fixture();
+            owner.handle(&mut session, Event::Line("go infinite".into()));
+            let ticket = session.active_ticket().unwrap();
+            let (release, waiting) = mpsc::channel();
+            owner.workers.push(Worker {
+                handle: thread::spawn(move || {
+                    let _ = waiting.recv();
+                    Ok(())
+                }),
+                failure: Arc::new(Mutex::new(None)),
+            });
+            owner.handle(&mut session, Event::Line("stop".into()));
+            assert!(owner.pending_bestmove.is_some());
+            let next = owner.handle(&mut session, Event::Line(replacement.into()));
+            assert!(next.accepted);
+            assert!(next.protocol.is_empty());
+            assert!(owner.pending_bestmove.is_none());
+            release.send(()).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while !owner.workers[0].is_finished() {
+                assert!(Instant::now() < until);
+                thread::yield_now();
+            }
+            let stale = owner.handle(
+                &mut session,
+                Event::Complete {
+                    ticket,
+                    completion: SearchCompletion::Completed {
+                        bestmove: Some("e2e4".into()),
+                    },
+                },
+            );
+            assert!(stale.protocol.is_empty());
+            owner.reap().unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_or_panicking_drain_keeps_original_failure_and_emits_no_acknowledgment() {
+        for panic in [false, true] {
+            let (mut owner, mut session) = fixture();
+            owner.handle(&mut session, Event::Line("go infinite".into()));
+            let (release, waiting) = mpsc::channel();
+            let cause = failure(
+                contract::ErrorCode::BackendFailure,
+                "injected physical output fence failure",
+            );
+            owner.workers.push(Worker {
+                handle: thread::spawn(move || {
+                    let _ = waiting.recv();
+                    if panic {
+                        panic!("injected physical drain panic");
+                    }
+                    Err(EngineError::Contract(cause))
+                }),
+                failure: Arc::new(Mutex::new(None)),
+            });
+            owner.handle(&mut session, Event::Line("stop".into()));
+            release.send(()).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while !owner.workers[0].is_finished() {
+                assert!(Instant::now() < until);
+                thread::yield_now();
+            }
+            let closed = owner.handle(
+                &mut session,
+                Event::RejectedInput {
+                    code: "OwnerWake",
+                    message: String::new(),
+                },
+            );
+            assert!(closed.protocol.is_empty());
+            assert!(session.is_closed());
+            assert!(owner.pending_bestmove.is_none());
+            assert!(closed.effects.iter().any(|e| matches!(e, Effect::Shutdown)));
+            match owner.fence_failure.take().unwrap() {
+                EngineError::WorkerPanic if panic => {}
+                EngineError::Contract(original) if !panic => assert_eq!(original, cause),
+                other => panic!("physical cause was replaced: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn output_fence_timeout_is_finite_and_does_not_release_a_blocked_worker() {
+        let (mut owner, mut session) = fixture();
+        owner.settings.shutdown_limit = Duration::from_millis(1);
+        owner.handle(&mut session, Event::Line("go infinite".into()));
+        let (release, waiting) = mpsc::channel();
+        owner.workers.push(Worker {
+            handle: thread::spawn(move || {
+                let _ = waiting.recv();
+                Ok(())
+            }),
+            failure: Arc::new(Mutex::new(None)),
+        });
+        owner.handle(&mut session, Event::Line("stop".into()));
+        thread::sleep(Duration::from_millis(3));
+        let expired = owner.handle(
+            &mut session,
+            Event::RejectedInput {
+                code: "OwnerWake",
+                message: String::new(),
+            },
+        );
+        assert!(expired.protocol.is_empty());
+        assert!(session.is_closed());
+        assert!(matches!(
+            owner.fence_failure,
+            Some(EngineError::DrainTimeout)
+        ));
+        assert_eq!(owner.workers.len(), 1);
+        assert!(!owner.workers[0].is_finished());
+        release.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        while !owner.workers[0].is_finished() {
+            assert!(Instant::now() < until);
+            thread::yield_now();
+        }
+        owner.reap().unwrap();
+    }
+
+    #[test]
     fn natural_worker_completion_is_not_published_while_physical_drain_is_blocked() {
         let (mut owner, mut session) = fixture();
         owner.handle(&mut session, Event::Line("go nodes 1".into()));

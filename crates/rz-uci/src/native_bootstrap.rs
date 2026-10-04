@@ -2869,6 +2869,27 @@ mod physical_owner_tests {
     #[test]
     fn root_replacement_while_the_single_physical_worker_is_blocked_returns_current_legal_fallback_once()
      {
+        blocked_native_output_boundary(BlockedBoundary::RootReplacement);
+    }
+
+    #[test]
+    fn stop_output_waits_for_native_lease_release_and_input_owner_remains_responsive() {
+        blocked_native_output_boundary(BlockedBoundary::Stop);
+    }
+
+    #[test]
+    fn deadline_output_waits_for_native_lease_release_without_admitting_late_backup() {
+        blocked_native_output_boundary(BlockedBoundary::Deadline);
+    }
+
+    #[derive(Clone, Copy)]
+    enum BlockedBoundary {
+        RootReplacement,
+        Stop,
+        Deadline,
+    }
+
+    fn blocked_native_output_boundary(boundary: BlockedBoundary) {
         let owners = Arc::new(OwnerRegistry::default());
         let (entered, entering) = mpsc::sync_channel(1);
         let (release, released) = mpsc::sync_channel(1);
@@ -2929,20 +2950,41 @@ mod physical_owner_tests {
             release: Some(release),
             service: Some(service),
         };
-        for line in ["uci", "position startpos", "go nodes 128 movetime 30000"] {
+        let go = if matches!(boundary, BlockedBoundary::Deadline) {
+            "go nodes 128 movetime 300"
+        } else {
+            "go nodes 128 movetime 30000"
+        };
+        for line in ["uci", "position startpos", go] {
             guard.events.send(Event::Line(line.into())).unwrap();
         }
         entering
             .recv_timeout(WAIT)
             .expect("first root reached the actual physical worker");
         assert_blocked_physical_owner_active(&native.inner.owner, "after physical worker entry");
-        for line in [
-            "position startpos moves e2e4",
-            "go nodes 1 movetime 30000",
-            "isready",
-        ] {
-            guard.events.send(Event::Line(line.into())).unwrap();
+        match boundary {
+            BlockedBoundary::RootReplacement => {
+                for line in ["position startpos moves e2e4", "go nodes 1 movetime 30000"] {
+                    guard.events.send(Event::Line(line.into())).unwrap();
+                }
+            }
+            BlockedBoundary::Stop => {
+                for _ in 0..2 {
+                    guard.events.send(Event::Line("stop".into())).unwrap();
+                }
+            }
+            BlockedBoundary::Deadline => {
+                let until = Instant::now() + WAIT;
+                while !diagnostics_view.text().contains("Expired") {
+                    assert!(
+                        Instant::now() < until,
+                        "independent hard deadline must close admission"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
         }
+        guard.events.send(Event::Line("isready".into())).unwrap();
         let until = Instant::now() + WAIT;
         while !protocol_view.text().lines().any(|line| line == "readyok") {
             assert!(
@@ -2977,11 +3019,13 @@ mod physical_owner_tests {
             );
             thread::sleep(Duration::from_millis(1));
         };
-        let mut black = rz_position::Position::startpos();
-        black.make_uci("e2e4").unwrap();
+        let mut position = rz_position::Position::startpos();
+        if matches!(boundary, BlockedBoundary::RootReplacement) {
+            position.make_uci("e2e4").unwrap();
+        }
         let movement =
             rz_position::BoardMove::from_uci(bestmove.strip_prefix("bestmove ").unwrap()).unwrap();
-        assert!(black.legal_moves().contains(&movement));
+        assert!(position.legal_moves().contains(&movement));
         assert_eq!(
             factory.created.load(Ordering::Acquire),
             1,
@@ -3015,7 +3059,11 @@ mod physical_owner_tests {
                 .count(),
             1
         );
-        assert!(diagnostics_view.text().contains("WorkerLimit"));
+        if matches!(boundary, BlockedBoundary::RootReplacement) {
+            assert!(diagnostics_view.text().contains("WorkerLimit"));
+        }
+        assert_eq!(report.search_root_initializations.count, 0);
+        assert_eq!(report.search_non_root_backups.count, 0);
         assert!(!report.has_failure());
     }
 }
