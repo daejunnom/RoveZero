@@ -17,6 +17,13 @@ cache·I/O buffer/binding·CUDA Graph와 다른 E feature는 끈다. virtual res
 batching으로 선택·완료 분포가 바뀌는 **S 실험**이며, 의미 보존 E 실험으로 부르지 않는다.
 기본 활성화·가중치 승격을 이번 결과로 자동 결정하지 않는다.
 
+두 설정의 탐색 알고리즘은 모두 **`rz-puct` revision 1**이다. `c_puct=1.5`, FPU=0,
+root noise off, legal-order tie와 backup 코드를 공유한다. 폭 4는 최대 네 pending 평가를
+허용하고 이미 예약된 경로에 임시 방문·value 통계를 반영해 다른 leaf를 선택한다.
+따라서 이번 비교는 같은 PUCT의 batch·실행 스케줄 실험이며 탐색 알고리즘 교체가 아니다.
+완료 순서와 제한 시간 안에 소비하는 평가가 달라질 수 있다. 실제 처리량의 증가까지
+대국 점수나 단순 응답 시간으로 확정하지 않는다.
+
 ## 첫 고정 cohort의 사전 조건
 
 | 항목 | 잠글 값 |
@@ -94,3 +101,45 @@ cohort의 native 파일 총합은 8GiB, trace 64MiB, PGN 4MiB, stdout/stderr 각
 단일 파일은 CUDA 라이브러리 복사를 허용하는 1GiB로 제한한다. supervisor·recipe·
 wrapper·입력·asset 식별을 잠그고 wall·메모리·PID·종료 후 owned process 정리를 확인한다.
 GPU 표본은 장치 전체 관측이며 엔진별 독점 사용량이나 device kernel 시간 증거는 아니다.
+
+## 실행·PGN 감사 결과
+
+`cohort-v4`는 고정한 48판·24pair를 모두 완료했다. whole-process wall은 monotonic
+449.104초, runner exit 0, cgroup OOM 0·잔여 PID 0·owned cgroup 제거를 확인했다.
+원본 PGN SHA-256은 `411a72742d7d8ea86c11e9f22decf06436c22c3925b05bb2fc7d7bd9b2a1d073`이다.
+각 pair의 시작 상태·전체 이력·색 교대·전체 합법 수·종료를 A Rules로 감사했고
+python-chess 1.11.2 독립 oracle의 이동열·최종 FEN과 48판 모두 대조했다.
+
+| 결과 | 폭 4 후보 관점 |
+|---|---|
+| W/D/L | 20 / 8 / 20 |
+| 득점 | 24 / 48, 50.00% |
+| opening pair 95% bootstrap 구간 | 36.46~63.54%, 10,000회·seed 20261004 |
+| 내부 상대 logistic Elo·같은 구간 변환 | 0.00, -96.50~+96.50 |
+| pair pentanomial, 0·0.5·1·1.5·2점 | `[5,3,8,3,5]` |
+| 정확 종료 / 수락 claim | 체크메이트 40 / 현재 3회 반복 8 |
+| 불법 수 / process crash / runner 시간패 / cutoff | 0 / 0 / 0 / 0 |
+
+이 구간은 개발 opening cohort에 조건부인 percentile bootstrap이며 독립 holdout·
+정식 승격 구간이 아니다. 이번 표본은 폭 4의 강도 우위를 보이지 않는다. 같은 PUCT의
+처리량이 몇 배 증가했는지도 측정하지 않았다. 원본 PGN의 `/0`, `n=0`은 미보고 값의
+placeholder라 실제 평가 점수·depth·방문 수·NPS로 해석하지 않는다.
+
+원시 trace에 폭 4 `SearchFailed: WorkerLimit: previous physical worker has not drained`와
+legal fallback이 **3건** 남았다. 현재 game·마지막 position/bestmove로 연관한 판은
+22·33·34이고 해당 판을 점수에서 제외하지 않았다. 이는 per-request ID journal이 없는
+시간적 연관이며 PGN에 그 한계를 표시한다. deadline·stale·cancel 진단도 원시 로그에
+보존한다. 합법 착수와 정확 종료가 이 진단의 부재나 GPU drain 통과를 의미하지 않는다.
+
+Fastchess logger는 system-clock, 착수 판정은 steady_clock이다. 두 시계의 차이를
+timeout 증거나 search/GPU 지연으로 삼지 않는다. trace에서 `go movetime 100`과
+bestmove는 양쪽 각각 2077개, `ucinewgame`은 양쪽 각각 48개, quit은 각각 1개이며
+미응답 go는 없다. 매 착수 physical drain·외부 자기 시간의 정식 인수는 남아 있다.
+native 종료 aggregate가 Fastchess trace에 수집되지 않아 별도 실제 CUDA UCI 사전
+검사의 fresh-completed 근거를 이 48판의 per-game 완료 journal로 확대하지 않는다.
+
+PGN 정리본은 같은 48판·색·이동·결과·시작 prefix를 유지하고 batch 폭·pair/opening ID·
+source/model identity·종료 감사·관측 fallback을 표시한다. 정리한 24pair PGN을 같은
+A 감사기로 다시 검사하여 원본의 audit JSON과 전체 동일함을 확인했다. 원본과 정리본,
+24pair PGN·index·분석·README·inventory를 외부 `reports/coordinator-integration/`
+`local-strength-20261004/`에 회수한다. 원시 대국은 Git에 넣지 않는다.

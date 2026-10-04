@@ -952,5 +952,10 @@ S1 대국 우위나 RunPod 인수가 아니다. 공통 계약 0.1과 Computed-on
 T2 100ms·128회 상한·고정 표본을 [로컬 강도 기록](research/LOCAL-STRENGTH-AB.md)에 잠갔다.
 PGN 감사기는 기존 A Rules를 재사용하며 runner의 자동 claim 수락을 현재 Available
 근거와 정확한 종료 문구로 검증한다. 기존 native V1의 explicit_claim 동작을 유지한다.
-현재 대국은 진행 중이며 WDL·pair 통계·전체 PGN 감사와 실제 종료 정리는 실행 후 인수한다.
-매 착수 시 GPU 물리 drain·시계 공정성의 정식 인수는 미검증으로 보존한다.
+48판·24pair를 완료하고 A 자체 코어의 전체 PGN 감사와 독립 oracle의 이동열·최종 상태
+대조를 통과했다. 폭 4 관점 20승·8무·20패, 득점률 50.00%, pair bootstrap 95% 구간
+36.46~63.54%다. 양쪽 알고리즘은 같은 PUCT이며 동시 평가·batch 폭만 바꾼 실험이다.
+강도 우위나 실제 처리량 개선은 확인하지 못했다. 폭 4의 WorkerLimit/LegalFallback
+3건을 포함해 모든 판을 보존했다. 원본·정리본과 24pair PGN을 외부 reports로 회수하며,
+정리본도 A 감사 결과가 원본과 같다. 매 착수 GPU 물리 drain·시계 공정성의 정식 인수와
+per-game NN 완료 journal은 미검증으로 보존한다.
