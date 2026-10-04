@@ -2,7 +2,9 @@ use rz_arena::{
     ArenaPlan, GameResult, PgnLimits, PgnOutcomePolicy, PlanLimits, audit_pair_pgn,
     audit_pair_pgn_for_spec, opening_pgn, opening_pgn_for_spec,
 };
-use rz_experiments::{HistoryCompleteness, InitialPosition, OutcomePolicy, RunManifest};
+use rz_experiments::{
+    ClaimPolicy, HistoryCompleteness, InitialPosition, OutcomePolicy, RunManifest,
+};
 
 const FIXTURE: &str = include_str!("../../../experiments/baselines/fixtures/e01-input.json");
 const MATE_MOVES: &str = "1. e4 e5 2. Qh5 Nc6 3. Bc4 Nf6 4. Qxf7#";
@@ -51,6 +53,7 @@ fn policy(max_game_plies: u32) -> PgnOutcomePolicy {
     PgnOutcomePolicy {
         engine_failure: OutcomePolicy::Loss,
         max_plies_outcome: OutcomePolicy::Incomplete,
+        claim_policy: ClaimPolicy::ExplicitClaim,
         max_game_plies,
     }
 }
@@ -349,6 +352,64 @@ fn a_exact_stalemate_is_a_draw_and_a_threefold_claim_is_not_terminal() {
     let p = plan(i);
     let claim = "1. Nf3 Nf6 2. Ng1 Ng8 3. Nf3 Nf6 4. Ng1 Ng8 {Draw by 3-fold repetition}";
     assert!(audit(&p, &pair_pgn(&p, claim, "1/2-1/2", "normal", "")).is_err());
+}
+
+#[test]
+fn automatic_claim_policy_requires_current_a_evidence_and_pinned_reason() {
+    let mut i = input();
+    i.input.openings[0].moves.clear();
+    i.protocol.claim_policy = ClaimPolicy::AutomaticAcceptance;
+    let p = plan(i);
+    let moves = "1. Nf3 Nf6 2. Ng1 Ng8 3. Nf3 Nf6 4. Ng1 Ng8";
+    let valid = pair_pgn(
+        &p,
+        &format!("{moves} {{Draw by 3-fold repetition}}"),
+        "1/2-1/2",
+        "normal",
+        "",
+    );
+    let result = audit(&p, &valid).unwrap();
+    assert_eq!(result.games[0].classification, "accepted_claim");
+    assert_eq!(
+        result.games[0].terminal_reason.as_deref(),
+        Some("threefold_repetition")
+    );
+    for invalid in [
+        valid.replace("3. Nf3 Nf6 4. Ng1 Ng8", ""),
+        valid.replace("Draw by 3-fold repetition", "Draw by fifty moves rule"),
+        valid.replace("Draw by 3-fold repetition", "an assumed repetition"),
+        valid.replace("[Termination \"normal\"]", "[Termination \"adjudication\"]"),
+    ] {
+        assert!(audit(&p, &invalid).is_err());
+    }
+}
+
+#[test]
+fn automatic_fifty_move_claim_rejects_an_intended_only_claim() {
+    for (halfmoves, available) in [(99, false), (100, true)] {
+        let mut i = input();
+        let o = &mut i.input.openings[0];
+        let fen = format!("4k2r/8/8/8/8/8/8/4K2R w Kk - {halfmoves} 51");
+        o.initial = InitialPosition::Fen;
+        o.history = HistoryCompleteness::UnknownPrefix;
+        o.fen = Some(fen.clone());
+        o.moves.clear();
+        i.protocol.claim_policy = ClaimPolicy::AutomaticAcceptance;
+        let p = plan(i);
+        let tags = format!("[SetUp \"1\"]\n[FEN \"{fen}\"]\n");
+        let result = audit(
+            &p,
+            &pair_pgn(&p, "{Draw by fifty moves rule}", "1/2-1/2", "normal", &tags),
+        );
+        assert_eq!(result.is_ok(), available);
+        if let Ok(result) = result {
+            assert_eq!(result.games[0].classification, "accepted_claim");
+            assert_eq!(
+                result.games[0].terminal_reason.as_deref(),
+                Some("fifty_move")
+            );
+        }
+    }
 }
 
 #[test]
