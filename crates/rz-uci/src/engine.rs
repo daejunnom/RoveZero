@@ -1156,11 +1156,14 @@ fn finish_worker(
             }
         }
     }
-    let delivery_failed =
-        errors.is_empty() && sender.send(Event::Complete { ticket, completion }).is_err() && failed;
     // Keep the original owner-reclaimable until actual owner consumption/reap,
     // including the gap between returning this closure and handle.is_finished.
     let cleanup = runtime.and_then(|runtime| shutdown(runtime, shutdown_limit).err());
+    // Natural worker completion must follow physical drain. The independent
+    // hard-deadline/stop owner can still finalize output and remains a separate
+    // boundary; this ordering alone does not prove all per-move GPU fairness.
+    let delivery_failed =
+        errors.is_empty() && sender.send(Event::Complete { ticket, completion }).is_err() && failed;
     if delivery_failed {
         // Failed sends are reclaimed by the join result. Successful sends keep
         // the slot until the owner acknowledges consumption or closing reaps it.
@@ -1604,6 +1607,7 @@ mod tests {
         callbacks: u64,
         drained: Arc<AtomicU64>,
         cleanup: Option<contract::ContractError>,
+        drain_gate: Option<(SyncSender<()>, Receiver<()>)>,
     }
     fn injected_backend_failure() -> contract::ContractError {
         contract::ContractError::new(
@@ -1633,6 +1637,7 @@ mod tests {
                 callbacks: 0,
                 drained: Arc::clone(&self.drained),
                 cleanup: self.cleanup,
+                drain_gate: None,
             }))
         }
         fn input_key(
@@ -1677,6 +1682,10 @@ mod tests {
     }
     impl ManagedEvaluator for FailureRuntime {
         fn shutdown(&mut self, _: Instant) -> Result<(), contract::ContractError> {
+            if let Some((entered, release)) = self.drain_gate.take() {
+                entered.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
             self.drained.fetch_add(1, Ordering::AcqRel);
             if matches!(self.mode, FailureMode::PanicDrain) {
                 panic!("injected drain panic after publication");
@@ -2142,6 +2151,50 @@ mod tests {
         assert!(owner.workers.is_empty());
         let receipts = owner.diagnostics.lock().unwrap().len();
         (result, drained.load(Ordering::Acquire), receipts)
+    }
+
+    #[test]
+    fn natural_worker_completion_is_not_published_while_physical_drain_is_blocked() {
+        let (mut owner, mut session) = fixture();
+        owner.handle(&mut session, Event::Line("go nodes 1".into()));
+        let ticket = session.active_ticket().unwrap();
+        let (sender, events) = mpsc::sync_channel(1);
+        let (entered, drain_started) = mpsc::sync_channel(1);
+        let (release, drain_release) = mpsc::sync_channel(1);
+        let drained = Arc::new(AtomicU64::new(0));
+        let observed = Arc::clone(&drained);
+        let handle = thread::spawn(move || {
+            let mut runtime = FailureRuntime {
+                mode: FailureMode::NoEvaluation,
+                context: None,
+                callbacks: 0,
+                drained,
+                cleanup: None,
+                drain_gate: Some((entered, drain_release)),
+            };
+            finish_worker(
+                &sender,
+                ticket,
+                WorkerCompletion::Completed {
+                    bestmove: Some("e2e4".into()),
+                },
+                &Mutex::new(None),
+                Some(&mut runtime),
+                Duration::from_secs(2),
+            )
+        });
+        drain_started.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            events.try_recv().is_err(),
+            "completion escaped before physical drain"
+        );
+        release.send(()).unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Complete { .. }
+        ));
+        handle.join().unwrap().unwrap();
+        assert_eq!(observed.load(Ordering::Acquire), 1);
     }
 
     #[test]
