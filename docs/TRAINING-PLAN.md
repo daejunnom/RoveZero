@@ -5,7 +5,22 @@
 연구 경로는 [EXPERIMENTS](EXPERIMENTS.md), 공통 타입은 [CONTRACTS](CONTRACTS.md),
 대국·manifest는 [EVALUATION-PROTOCOL](EVALUATION-PROTOCOL.md), 전체 task 배정은
 [IMPLEMENTATION-DIRECTIVES](IMPLEMENTATION-DIRECTIVES.md)를 따른다.
-현재 학습 코드·dataset·weights·실행 검사기가 존재하거나 학습이 완료됐다는 문서가 아니다.
+이 문서는 구현·인수 지시서이며 실제 학습 완료를 뜻하지 않는다. 현재 F의 CPU 합성
+linear fixture lifecycle 범위는 [F TRAINING](../experiments/model-research/TRAINING.md),
+실제 모델/추론과 선행 인수는 [INTEGRATION-STATUS](INTEGRATION-STATUS.md)를 따른다.
+
+## 0. 2026-10-04 강도용 모델 전환의 우선순위
+
+사용자는 Maia 기반 엔진의 강도 한계를 검토하고 LC0 로컬 실행·모델 변경 또는
+추가 학습 계획을 요청했다. [로컬 모델 전환 계획](research/LOCAL-MODEL-BASELINE.md)은
+동결 T1 distilled의 호환/수치/동일 시간 기준선을 먼저 확보하고 이후 실제 F02를
+추진하는 순서를 권고한다. Maia 최초 호환 profile은 회귀 기준으로 보존한다.
+
+T1 원본 구조 fine-tuning과 작은 CNN 학생 distillation은 서로 다른 후속 경로다.
+현재 F의 `LinearFixture`는 실제 Maia/T1 trainer와 export adapter가 아니므로 새 모델의
+trainable tensor 복원·frozen round-trip·gradient/optimizer/checkpoint·ONNX parity를
+먼저 구현/인수한다. 입력/구조를 변경하는 F03과 기존 구조 F02를 혼합하지 않는다.
+256예제/200 step/20분 등의 수치는 계획의 유한 pilot 제안이며 현재 학습 실행값이 아니다.
 
 ## 1. 구현 경로와 권한
 

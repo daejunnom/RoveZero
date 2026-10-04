@@ -7,6 +7,12 @@
 
 ## 현재 선정 상태
 
+2026-10-04 후속 사용자 요청은 LC0의 로컬 실행 가능성과 강도용 모델 교체·추가 학습
+계획이다. Maia의 최초 호환 선정 이력은 유지하며, 실제 외부 LC0 CUDA 실행과 동결
+T1 distilled의 후속 호환 후보는 [로컬 모델 전환 계획](research/LOCAL-MODEL-BASELINE.md)에
+기록한다. 현재 Rust loader에 채택된 모델은 여전히 Maia이며 후보 조사를 내부 모델
+승격·실제 학습 완료로 해석하지 않는다.
+
 첫 호환 구현의 **단일 가중치를 CSSLab Maia1의 공식 v1.0 `maia-1900.pb.gz`로 선정한다.**
 6개 SE residual block, 64 channel, classical 112-plane 입력과 policy/WDL head를 갖춘
 작은 LC0 호환 네트워크다. **인간의 수를 예측하는 모델이며 호환·런타임 기준선에 사용한다.**
@@ -34,7 +40,7 @@ GPU에서 추론·peak VRAM·속도 검증은 아직 수행하지 않았다. **�
 |---|---|---|
 | Maia1 v1.0 `maia-1900.pb.gz` | 6 block × 64 channel; 직접 검사한 classical/SE/policy/WDL; 원저자의 weights GPL 적용 명시 | **단일 선정**. 호환·런타임 기준선용 인간 수 예측 모델. 실제 GPU 실행과 대국 강도는 미검증 |
 | T70 `703810` | 10 block × 128 channel; 단일 파일의 SE/입력/head 메타데이터 확인 | 권리 미확인으로 보류. 내장 license가 없고 공식 배포 정보에서도 가중치 적용 허가를 확인하지 못함 |
-| T1-256x10-distilled-swa-2432500 | 공식 표의 GPU 메모리 1.6 GB, 파일 30~40 MB | 후속 후보. 공식 표의 메모리 값을 자체 Rust backend의 보장치로 쓰지 않음. 이 파일의 구조·권리는 이번에 개별 확인하지 않음 |
+| T1-256x10-distilled-swa-2432500 | 공식 표의 GPU 메모리 1.6 GB, 파일 30~40 MB | 2026-10-04 후속 후보 조사에서 원본 digest·classical 입력·attention encoder/policy와 제작자 직접 사용 허가, 외부 LC0 로컬 CUDA 실행을 확인. 내부 Rust 호환·수치 parity·강도 승격은 남음. [후속 기록](research/LOCAL-MODEL-BASELINE.md) |
 | BT4-it332 | 공식 표의 15 block × 1024 channel, GPU 메모리 4 GB, 파일 365 MB | 별도의 강한 외부 LC0 비교 후보. 첫 작은 호환 구현에서 attention 계열 전체를 함께 지원하지 않음 |
 
 공식 메모리 표는 backend·batch·workspace·공동 점유 조건이 완전히 고정된 RoveZero 측정이
