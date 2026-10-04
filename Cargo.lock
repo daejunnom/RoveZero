@@ -454,6 +454,7 @@ dependencies = [
  "rz-native-loader",
  "rz-position",
  "rz-runtime",
+ "rz-telemetry",
  "serde",
  "serde_json",
  "sha2",
@@ -500,6 +501,7 @@ name = "rz-search"
 version = "0.1.0"
 dependencies = [
  "rz-contracts",
+ "rz-telemetry",
 ]
 
 [[package]]
@@ -518,6 +520,7 @@ dependencies = [
  "rz-position",
  "rz-runtime",
  "rz-search",
+ "rz-telemetry",
  "serde",
  "serde_json",
  "sha2",

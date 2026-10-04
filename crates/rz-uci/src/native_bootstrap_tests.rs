@@ -72,6 +72,32 @@ fn attestation_is_explicit_optional_and_duplicate_selection_is_rejected() {
 }
 
 #[test]
+fn profile_is_opt_in_bounded_and_does_not_select_attestation() {
+    let config = NativeConfig::parse(valid_arguments()).unwrap();
+    assert!(!config.profiling_requested());
+    assert!(config.source_journal().unwrap().is_none());
+    let mut selected = valid_arguments();
+    selected.push("--profile".into());
+    let config = NativeConfig::parse(selected.clone()).unwrap();
+    assert!(config.profiling_requested());
+    assert!(!config.attestation_requested());
+    assert_eq!(
+        config
+            .source_journal()
+            .unwrap()
+            .unwrap()
+            .snapshot()
+            .capacity,
+        8192
+    );
+    selected.push("--profile".into());
+    assert_private_config_rejection(selected);
+    let mut named = valid_arguments();
+    named.push("--profile=true".into());
+    assert_private_config_rejection(named);
+}
+
+#[test]
 fn native_parser_rejects_missing_duplicate_and_mixed_provider_arguments() {
     let valid = valid_arguments();
     for omitted in 0..valid.len() {

@@ -8,3 +8,4 @@ description = "RoveZero deterministic PUCT accounting and time control"
 
 [dependencies]
 rz-contracts.workspace = true
+rz-telemetry.workspace = true
