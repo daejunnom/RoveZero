@@ -462,3 +462,29 @@ RTX 4050 재사용·종료 증거를 확인했다. E 연결의 fixture와 실제
 성공으로 인수하지 않는다.** E의 BT4 artifact/profile·정식 강도·별도 physical race gate는
 그대로 남긴다. 세부 결과는 [통합 기록](INTEGRATION-STATUS.md)과
 [저장 인수](research/PERFORMANCE-OPTIMIZATION-PLAN.md#13-실행별-native-library-복제-제거와-검증된-공유-저장)에 둔다.
+
+
+## 14. B03 출력과 C/D 물리 완료의 수동 연결
+
+총괄은 stop/hard deadline의 A 합법 착수 snapshot → B Session/common guard 취소·고정 →
+C의 single physical lease·D shutdown → B owned worker 정상 join → protocol 출력 경로를
+대조한다. 논리 취소와 물리 완료 사이에는 요청/buffer/pin을 유지한다. 완료를 큐에 넣은
+사실이나 isready 응답만으로 물리 종료를 승인하지 않는다.
+
+B의 보류 출력은 common game/root/model/encoding/backend scope에 묶고 받아들인 교체에서
+폐기한다. original failed-publication slot은 실제 owner 진단/회수 전까지 유지한다.
+완료 이벤트 뒤에도 join 오류·panic을 먼저 수집하며, 실패한 drain을 성공 bestmove로
+바꾸지 않는다. 기존 유한 shutdown_limit의 출력 timeout은 final serve 오류로 보존한다.
+타이머의 wake는 내부 완료 확인이며 새 탐색/방문/평가 승인이 아니다.
+
+공통 revision 0.1·C eval output·D provenance·B PUCT/terminal policy·native V1 필드 집합은
+바꾸지 않았다. standalone Session/transport 검사와 production Engine Owner의 physical
+fence를 구분한다. 모델 session은 process lifetime 동안 resident일 수 있고 active
+평가 완료와 unload는 다르다. 출력 여유/실제 응답 시간·오류는 대국 runner가 따로 기록한다.
+
+실제 `3d90a03` source의 C/D/B CUDA와 독립 착수·종료·source journal을 인수했다.
+후속 소스에서 재사용하려면 test-only/doc 차이와 production 선언·feature·Cargo/CI·asset의
+동일성을 대조한다. develop 인수 시에도 최신 head의 직접 선언과 같은 integration SHA의
+소비자 검사를 다시 맞추며, E의 BT4 ONNX/bounds/arena/profile을 조용히 기존 Maia V1에
+넣지 않는다. 실제 runner/artifact 연결은 별도 후속 인수다.
+[상세 인수](research/LOCAL-MODEL-BASELINE.md#9-stop마감-출력의-물리-완료-경계)를 따른다.

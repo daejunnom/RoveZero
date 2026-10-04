@@ -2473,6 +2473,54 @@ mod tests {
     }
 
     #[test]
+    fn physical_fence_failure_reaches_serve_result_without_a_bestmove_acknowledgment() {
+        let (owner, session) = fixture();
+        let original = failure(
+            contract::ErrorCode::BackendFailure,
+            "injected final physical drain failure",
+        );
+        let factory = Arc::new(FailureFactory {
+            profile: owner.factory.profile(),
+            mode: FailureMode::Matching,
+            drained: Arc::new(AtomicU64::new(0)),
+            cleanup: Some(original),
+        });
+        let process =
+            EngineProcess::new(factory, Arc::clone(&session.snapshot().owners), owner.clock);
+        let (sender, receiver) = event_channel();
+        sender.send(Event::Line("go nodes 1".into())).unwrap();
+        let handle = thread::spawn(move || {
+            let mut protocol = Vec::new();
+            let mut diagnostics = Vec::new();
+            let result = serve(
+                receiver,
+                sender,
+                &mut protocol,
+                &mut diagnostics,
+                process,
+                owner.settings,
+            );
+            (result, protocol, diagnostics)
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() {
+            assert!(
+                Instant::now() < until,
+                "bounded physical fence failure must close the event loop"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let (result, protocol, diagnostics) = handle.join().unwrap();
+        assert!(result.unwrap_err().to_string().contains(original.detail));
+        assert!(!String::from_utf8(protocol).unwrap().contains("bestmove "));
+        assert!(
+            String::from_utf8(diagnostics)
+                .unwrap()
+                .contains("PhysicalFenceFailure")
+        );
+    }
+
+    #[test]
     fn output_fence_timeout_is_finite_and_does_not_release_a_blocked_worker() {
         let (mut owner, mut session) = fixture();
         owner.settings.shutdown_limit = Duration::from_millis(1);

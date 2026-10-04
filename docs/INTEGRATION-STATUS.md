@@ -1102,3 +1102,34 @@ profile 확장·정식 강도/Elo·학습·device transfer/kernel 계측을 완�
 세부 저장 경로·기본값·한도·cleanup·실제 witness는
 [저장 기록](research/PERFORMANCE-OPTIMIZATION-PLAN.md#13-실행별-native-library-복제-제거와-검증된-공유-저장)과
 [계약 연결 13장](CONTRACT-ADOPTION.md#13-런타임-저장-capability와-isolated-e-argv의-수동-연결)에 둔다.
+
+
+## stop·마감 착수 출력의 물리 완료 인수
+
+2026-10-05 재개 시 #20 `3ec439e3`·develop base `87017a27`·open/Draft·리뷰 부재와
+두 OS CI 성공을 확인했다. 총괄은 독립 stop/deadline가 논리 취소 뒤 물리 worker가
+진행 중이어도 출력하던 경계를 고정 검사로 재현하고 `62719f5`에서 보완했다.
+B03/C/D의 연결이며 공통 revision 0.1·PUCT·S0/S1·모델/입력/평가 provenance는 유지한다.
+
+실제 GPU source `3d90a0385245d3e77638186c97539c75c24bdd28`와 binary
+`f818756e…85d737f`의 기존 `onnx-cuda,experimental-batch` B1을 실행했다.
+CPU 2·RAM 6 GiB·swap 0·pids 128·유한 query/process·360초/256 MiB 전체 상한이다.
+
+| 인수 항목 | 실제 근거 |
+|---|---|
+| B의 출력 소유 | 마지막 유효 착수를 stop/hard deadline에서 고정, owned worker 모두의 정상 drain·join 뒤 한 번 출력. 보류 동안 입력/isready 처리, scope 교체/quit/EOF는 이전 착수 폐기 |
+| 오류·수명 검사 | 차단된 NativeWorkerOwner의 stop/deadline/root 교체에서 출력 전 physical active·출력 후 inactive 대조, 늦은 root/non-root backup 0. drain 오류/panic/timeout은 승인 출력 없이 원래 serve 오류·worker/pin 보존 |
+| 실제 CUDA S0/S1 | 각 8 query·마감/중복 stop/root/newgame/후속 계산, python-chess 1.11.2 독립 합법 검사. 물리 완료 53/54·실제 B 소비 48/50·미소비 5/4, D drain discard와 일치 |
+| 실제 D02 | 1829/1856 records, producer join·complete journal/accepted timeline, 누락/중복/identity mismatch/오버플로/물리 실행 중첩 0 |
+| S1 종료 회귀 | 8 go nodes 4096, 실제 백/흑 mate·네 terminal root 0000·두 draw 회피. NN 완료/소비 383·root 4/non-root 379 |
+| 최종 종료/저장 | 세 process exit 0·confirmed physical drain·mapping/service/collection 실패 없음·owned PID/OOM 0, cache reuse·실행별 library copy 0; 종료 뒤 GPU 0 MiB/0% |
+| 실제 source 검사 | workspace 733 passed·0 failed·16 ignored, fmt/strict Clippy/release 성공. [37237882649](https://github.com/daejunnom/RoveZero/actions/runs/37237882649)의 두 OS 필수 step SUCCESS 직접 확인 |
+
+첫 native 실행 뒤 측정 도구의 영수증 위치 오류와 유효 admission 구간이 없는 5ms
+workload는 별도 보존하고 수정한 fresh 50ms 검사만 인수했다. 네 50ms 응답은
+33.252~42.828ms이며 모든 장비/포지션의 wall deadline 보장이나 속도·기력 우위의 증거가 아니다.
+실제 source의 실행과 후속 테스트/문서의 검사 재사용을 구분한다. E의 BT4 launch
+artifact/bounds/profile, device transfer/kernel, holdout 동일 시간 강도/Elo·학습은 남아 있다.
+세부 source·실패·명령·원시 증거 논리 루트는
+[모델 기록 9장](research/LOCAL-MODEL-BASELINE.md#9-stop마감-출력의-물리-완료-경계)과
+`reports/coordinator-integration/physical-fence-20261005/`를 따른다.

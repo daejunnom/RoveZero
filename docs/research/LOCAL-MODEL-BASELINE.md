@@ -536,3 +536,75 @@ Windows·Ubuntu의 모든 필수 step SUCCESS를 직접 확인했다. 최신 CI 
 원본 query·terminal trace·입력·수치·AA/profile/inference·실패·supervisor·binary pin을
 외부 보존한다. 이 인수로 전체 solver, 물리 deadline/stop race, E BT4 launch V1,
 same-time holdout 기력·Elo·학습·RunPod 지원을 완료했다고 보고하지 않는다.
+
+
+## 9. stop·마감 출력의 물리 완료 경계
+
+2026-10-05 총괄은 저장 개선 뒤 남은 B03/C/D 수명 경계를 먼저 인수했다. 재개 시
+원격 #20의 head `3ec439e3`·base `87017a27`·Draft/open·두 OS CI 성공과 리뷰 부재를
+확인했다. 공통 계약 0.1·BT4 원본/ONNX/hash·FP32/TF32 off·HistoryFill No·B1·cache off,
+기준 visit-first S0와 opt-in exact-terminal S1은 유지한다.
+
+### 9.1. 재현과 변경
+
+기존 자연 완료 경로는 runtime shutdown 뒤 완료를 전달했지만 독립 stop/deadline
+소유자는 논리 취소 직후 착수를 출력했다. 물리 작업을 차단한 새 고정 검사는 이
+응답 순서를 재현해 실패했다. 논리 취소만으로 물리 완료를 주장할 수 없으므로
+`62719f5`에서 B의 production Owner에 출력 보류 경계를 추가했다.
+
+- Session은 stop/hard deadline에서 기존 guard를 닫고 **마지막 유효 착수**를 고정한다.
+  늦은 Progress/Complete로 그 착수를 교체하거나 새 backup을 승인하지 않는다.
+- Owner는 소유한 worker 모두의 정상 drain·join을 확인한 뒤 한 번만 출력한다.
+  기다리는 동안 입력·isready 처리는 계속하고 timer가 완료/시간 초과를 깨운다.
+- 보류 출력은 game/root/model/encoding/backend scope에 묶는다. 받아들인 position/go,
+  새 게임과 종료는 이전 보류 출력을 폐기한다. 중복 stop은 새 출력을 만들지 않는다.
+- 같은 유한 `shutdown_limit`을 출력 대기에도 적용한다. drain 오류·panic·시간 초과는
+  `PhysicalFenceFailure`로 전달하고 착수 승인을 내보내지 않는다. 원래 typed 원인을
+  최종 serve 오류에 보존하며, 종료 중인 물리 worker와 pin을 임의 해제하지 않는다.
+
+이는 B의 수명·출력 정확성 보완이다. PUCT selection/backup·방문 수·최종 S0/S1 정렬,
+C input/WDL·D의 물리 lease·library cache를 바꾸지 않는다. E의 닫힌 V1 집계에
+새로운 매 착수 완료 증명을 추가한 것으로 해석하지 않는다.
+
+### 9.2. 실제 BT4 CUDA 인수
+
+실제 source는 `3d90a0385245d3e77638186c97539c75c24bdd28`, binary SHA-256은
+`f818756e37f8dca59915473be344ae331ad8d7bb57d91d17837cac12d85d737f`다.
+features는 `onnx-cuda,experimental-batch`, notify/best-move 기능은 꺼진 기존
+1ms polling이다. CPU 2·RAM 6 GiB·swap 0·pids 128, 전체 360초와 유한 query/quit
+한도, 256 MiB 산출물 상한을 잠갔다. 실제 RTX 4050 6GB에서 세 프로세스를 차례로 실행했다.
+
+| 실제 검사 | 결과 |
+|---|---|
+| S0 stop/deadline/root/newgame | 8 query, 물리 추론 53회·B 소비 48회(root 8/non-root 40)·완료 뒤 미소비 5회 |
+| S1 같은 수명 검사 | 8 query, 물리 추론 54회·B 소비 50회(root 8/non-root 42)·완료 뒤 미소비 4회 |
+| C/D와 실제 source journal | 각각 1829/1856 records·producer join·complete journal/accepted timeline, 누락/중복/identity mismatch/오버플로/물리 실행 중첩 0. 미소비 5/4와 drain discard 5/4가 일치 |
+| 독립 착수 검사 | python-chess 1.11.2로 24개 응답의 합법/정확 종료 확인; 바뀐 root/game의 착수도 현재 상태에서 합법 |
+| S1 종료 회귀 | 백/흑 실제 mate, 두 stalemate·두 checkmate root의 0000, 두 패배 회피의 실제 draw; 8개 go nodes 4096. NN 완료/소비 383·root 4/non-root 379 |
+| 종료/실패 | 세 프로세스 exit 0·confirmed physical drain·runtime mapping/원래 service/collection 오류 없음, 남은 owned cgroup PID와 OOM/kill 0 |
+| 저장 재사용 | 세 프로세스 모두 기존 CUDA 19-file runtime cache 재사용, 새 실행별 라이브러리 복사 0 |
+
+두 수명 프로세스에서 실제 `go movetime 50`의 응답 네 개는 33.252~42.828ms다.
+중단/교체 뒤 응답은 1.269~12.988ms다. 이는 표본의 전체 host 응답 관측이며
+S0/S1 속도 우위나 모든 GPU/포지션의 마감 보장으로 일반화하지 않는다. source journal의
+물리 실행 완료와 **실제 소비**를 구분해, 버린 9개를 새 방문/성공 소비에 더하지 않았다.
+장치 전체 250ms 표본의 최대 VRAM은 1131 MiB이며 startup을 포함한다. 커널/전송의
+별도 device 시간과 process peak는 여전히 미측정이다. 세 프로세스 종료 뒤 장치는
+0 MiB·0%였다.
+
+첫 측정 도구는 실제 native exit 0 뒤 영수증을 역할 root에서 찾았으나 실제 위치는
+`native-process-<pid>`여서 도구 인수가 실패했다. 해당 supervisor/출력/실패를
+`s0-fence`에 보존하고 위치를 맞춘 fresh 실행만 위 표에 인수했다. 처음의
+movetime 5는 기본 출력·drain 여유보다 작아 유효 admission 구간이 없는 사례였다.
+이를 진행 중 GPU 마감의 증거로 사용하지 않고, 변경한 명시적 50ms workload를 구분한다.
+
+실제 source의 전체 workspace 검사는 733 passed·0 failed·16 ignored이며
+fmt·strict Clippy·release가 통과했다. [CI 37237882649](https://github.com/daejunnom/RoveZero/actions/runs/37237882649)의
+두 OS 필수 step 성공을 직접 확인했다. 후속 검사는 오류가 최종 serve Result까지
+전달됨을 추가 확인하며, 테스트/문서 후속과 실제 GPU 실행 source를 구분한다.
+
+원시 자료·명령·오류·binary/CI pin은 저장소 밖
+`reports/coordinator-integration/physical-fence-20261005/`에 보존한다. 다음은 E의 BT4
+artifact/bounds/profile과 같은 integration SHA의 C/D/E consumer를 맞춘 뒤, HistoryFill과
+policy temperature 등 조건을 고정한 동일 시간 holdout pair다. 현재 검사를 E BT4 인수,
+전체 solver·mate distance·device profiling·기력/Elo·학습의 완료로 승격하지 않는다.
