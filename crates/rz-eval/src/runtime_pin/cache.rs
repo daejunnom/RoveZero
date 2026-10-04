@@ -80,6 +80,11 @@ impl RuntimeCache {
         let mut current = PathBuf::new();
         for part in root.components() {
             current.push(part.as_os_str());
+            // A Windows drive/UNC/verbatim prefix alone is not an absolute
+            // directory. Inspect it only after appending its root separator.
+            if matches!(part, Component::Prefix(_)) {
+                continue;
+            }
             match fs::symlink_metadata(&current) {
                 Ok(metadata) if metadata.is_dir() && !is_link(&metadata) => {}
                 Ok(_) => {
