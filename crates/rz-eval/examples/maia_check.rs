@@ -94,7 +94,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         .position(|arg| arg.starts_with("--"))
         .unwrap_or(args.len());
     let (args, options) = args.split_at(option_start);
-    let experiments = experimental_options(options)?;
+    let mut benchmark_rounds = None;
+    let mut execution_options = Vec::new();
+    for option in options {
+        if let Some(value) = option.strip_prefix("--benchmark-rounds=") {
+            let count = value.parse::<usize>()?;
+            if !(1..=100).contains(&count) || benchmark_rounds.replace(count).is_some() {
+                return Err("benchmark rounds must be a unique 1..=100 limit".into());
+            }
+        } else {
+            execution_options.push(option.clone());
+        }
+    }
+    let experiments = experimental_options(&execution_options)?;
+    if benchmark_rounds.is_some() && experiments != ExecutionExperiments::default() {
+        return Err("inference baseline benchmark excludes execution experiments".into());
+    }
     if !(8..=10).contains(&args.len()) {
         return Err("usage: maia_check SOURCE.pb.gz MODEL.onnx MANIFEST.json ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu | cuda PROFILE_DIRECTORY CUDA_BUNDLE.json [--experimental-io-buffers] [--experimental-io-binding] [--experimental-cuda-graph]".into());
     }
@@ -264,6 +279,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         errors.push(verify(&raw, case).map_err(|e| format!("{}: {e}", case.name))?);
         singles.push(raw);
     }
+    // Same immutable start-position tensor; B1 warmed above, first B16 included.
+    // These are host wall intervals around C Run, not device kernel timings.
+    let mut inference_benchmark = Vec::new();
+    if let Some(rounds) = benchmark_rounds {
+        for size in [1, 16] {
+            let inputs = vec![&encoded[0]; size];
+            for round in 0..rounds {
+                let started = std::time::Instant::now();
+                let results = backend.run(&inputs)?;
+                let elapsed = started.elapsed();
+                if results.len() != size {
+                    return Err("benchmark batch incomplete".into());
+                }
+                for raw in &results {
+                    verify(raw, &fixtures.cases[0])?;
+                }
+                inference_benchmark.push(
+                    json!({"batch":size,"round":round,"completed_inferences":size,
+                    "host_run_ns":elapsed.as_nanos()}),
+                );
+            }
+        }
+    }
     let mut batch_checks = Vec::new();
     let batch_sizes: &[usize] = if experiments.cuda_graph {
         &[1]
@@ -379,6 +417,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         "case_errors":errors,"batch_checks":batch_checks,
         "cuda_executed_nodes":cuda_executed_nodes,"cuda_profile_sha256":cuda_profile_sha256, "contract_worker": contract_worker,
         "gpu_acceptance": if args[7] == "cpu" { "not_run" } else { "numerical_and_provider_probe_only" }});
+    if !inference_benchmark.is_empty() {
+        report["inference_benchmark"] = json!({
+            "scope":"same fixed start-position input; synchronous host C Run includes provider transfers and inference",
+            "input_f32_le_sha256":asset::hex_sha256(&encoded[0].values().iter()
+                .flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>()),
+            "history_fill":"no","cache":"disabled","warmup":"numerical B1 cases precede timing; first B16 included",
+            "samples":inference_benchmark,"device_kernel_timing":"not measured","device_transfer_timing":"not measured"});
+    }
     if let Some(checks) = experimental_checks {
         report["experimental_checks"] = checks;
     }

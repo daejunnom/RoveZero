@@ -71,13 +71,36 @@ fn probe(
         ("startpos", "startpos", ""),
         ("ruy-black", "startpos", "e2e4 e7e5 g1f3 b8c6 f1b5"),
     ];
+    let parity_cases = [
+        (
+            "pirc-eight-ply",
+            "startpos",
+            "e2e4 d7d6 d2d4 g8f6 b1c3 g7g6 g1f3 f8g7",
+        ),
+        (
+            "kings-indian-eight-ply",
+            "startpos",
+            "d2d4 g8f6 c2c4 g7g6 b1c3 f8g7 e2e4 d7d6",
+        ),
+        (
+            "italian-eight-ply",
+            "startpos",
+            "e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 d2d3 g8f6",
+        ),
+        (
+            "french-eight-ply",
+            "startpos",
+            "e2e4 e7e6 d2d4 d7d5 b1c3 g8f6 e4e5 f6d7",
+        ),
+    ];
     let fixtures: Vec<_> = match cases {
         "terminal" => diagnostics::TERMINAL_CASES
             .iter()
             .map(|&(name, fen)| (name, fen, ""))
             .collect(),
         "profile" => profile_cases.to_vec(),
-        _ => return Err("probe cases must be terminal or profile".into()),
+        "parity" => parity_cases.to_vec(),
+        _ => return Err("probe cases must be terminal, profile or parity".into()),
     };
     let port = RulesUciPort::new(owners.clone(), Default::default());
     for (index, &(name, fen, moves)) in fixtures.iter().enumerate() {
