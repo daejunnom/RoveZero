@@ -1128,7 +1128,7 @@ impl NativeSessionFactory {
                         })?;
                     backend_config.provider = Provider::Cuda {
                         device_id: 0,
-                        arena_bytes: CUDA_ARENA_BYTES,
+                        arena_bytes: asset.profile().cuda_arena_bytes(),
                     };
                     backend_config.profiling_prefix = Some(profile_directory.join("placement"));
                     RuntimeLibraryPin::copy_cuda_bundle(

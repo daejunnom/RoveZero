@@ -49,6 +49,7 @@ pub enum NativeWorkerOrigin {
 pub enum NativeAdmissionPolicy {
     Cpu,
     CudaOneGiB,
+    CudaThreeGiB,
 }
 
 impl NativeAdmissionPolicy {
@@ -60,6 +61,7 @@ impl NativeAdmissionPolicy {
             device_bytes: match self {
                 Self::Cpu => 0,
                 Self::CudaOneGiB => NATIVE_CUDA_ADMISSION_BYTES,
+                Self::CudaThreeGiB => 3 * NATIVE_CUDA_ADMISSION_BYTES,
             },
             pinned_bytes: 0,
         }
@@ -398,7 +400,7 @@ impl NativeWorkerOwner {
             .into());
         };
         if device_id != 0
-            || arena_bytes as u64 != NATIVE_CUDA_ADMISSION_BYTES
+            || arena_bytes != backend.asset_profile().cuda_arena_bytes()
             || backend.config().max_batch != max_batch
             || backend.config().intra_threads != 1
             || projection.backend().0 != backend.identity()
@@ -439,12 +441,16 @@ impl NativeWorkerOwner {
         // A successful historical probe alone does not authorize current maps.
         // Loader failure stays typed and latched, with all native pins retained.
         backend.verify_cuda_runtime_mappings()?;
+        let admission = match backend.asset_profile() {
+            crate::asset::AssetProfile::Maia1900 => NativeAdmissionPolicy::CudaOneGiB,
+            crate::asset::AssetProfile::Bt4It332 => NativeAdmissionPolicy::CudaThreeGiB,
+        };
         let worker = crate::contracts::spawn_onnx_worker_profiled(backend, trace.clone())?;
         let mut owner = Self::from_worker_limit(
             worker,
             projection,
             diagnostic_capacity,
-            NativeAdmissionPolicy::CudaOneGiB,
+            admission,
             max_batch,
         )?;
         let inner = Arc::get_mut(&mut owner.0).expect("new native owner is exclusively owned");

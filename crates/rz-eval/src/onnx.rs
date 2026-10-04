@@ -5,7 +5,7 @@
 //! Runtime must retain request leases until a physical Ready, independently of
 //! logical cancellation or deadline rejection.
 
-use crate::asset::{self, MaiaAsset, INPUT_NAME, POLICY_NAME, WDL_NAME};
+use crate::asset::{self, AssetProfile, MaiaAsset, INPUT_NAME, MLH_NAME, POLICY_NAME, WDL_NAME};
 use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
 use crate::runtime_pin::RuntimeLibraryPin;
 use crate::{output, RawOutput};
@@ -457,6 +457,7 @@ pub struct OnnxBackend {
     config: BackendConfig,
     identity: [u8; 32],
     asset_identity: [u8; 32],
+    asset_profile: AssetProfile,
     cuda_evidence: Option<CudaEvidence>,
     quarantine_cause: Option<BackendError>,
     // The loaded CUDA session can re-audit its actual nineteen-library maps
@@ -580,7 +581,7 @@ impl OnnxBackend {
                 )
                 .with_ort_cause(CauseCode::ModelLoad, error)
             })?;
-        validate_interface(&session)?;
+        validate_interface(&session, asset.profile())?;
         // This is a versioned C backend identity, not a new global wire codec.
         let mut profile = format!("rz-maia-ort-v1;ort=1.22.0;wrapper=2.0.0-rc.10;runtime={:?};asset={:?};provider={:?};threads={};batch={};fp32;tf32=0;opt=1;sync;full=1;temp=1;sum=1e-5",
             runtime.binary_digest(), asset.manifest_digest(), config.provider, config.intra_threads, config.max_batch);
@@ -616,6 +617,7 @@ impl OnnxBackend {
             config,
             identity: asset::sha256(profile.as_bytes()),
             asset_identity: asset.manifest_digest(),
+            asset_profile: asset.profile(),
             cuda_evidence: None,
             quarantine_cause: None,
             cuda_runtime,
@@ -718,6 +720,9 @@ impl OnnxBackend {
     }
     pub fn asset_identity(&self) -> [u8; 32] {
         self.asset_identity
+    }
+    pub fn asset_profile(&self) -> AssetProfile {
+        self.asset_profile
     }
     pub fn config(&self) -> &BackendConfig {
         &self.config
@@ -1131,13 +1136,13 @@ fn pack_outputs(
     Ok(result)
 }
 
-fn validate_interface(session: &Session) -> Result<(), BackendError> {
+fn validate_interface(session: &Session, profile: AssetProfile) -> Result<(), BackendError> {
     let valid = |value: &ValueType, expected: &[i64]| {
         matches!(value,
         ValueType::Tensor { ty: TensorElementType::Float32, shape, .. } if shape.as_ref() == expected)
     };
     if session.inputs.len() != 1
-        || session.outputs.len() != 2
+        || session.outputs.len() != 2 + usize::from(profile.has_moves_left_head())
         || session.inputs[0].name != INPUT_NAME
         || !valid(&session.inputs[0].input_type, &[-1, 112, 8, 8])
         || ![(POLICY_NAME, 1858), (WDL_NAME, 3)]
@@ -1148,11 +1153,16 @@ fn validate_interface(session: &Session) -> Result<(), BackendError> {
                     .iter()
                     .any(|out| out.name == *name && valid(&out.output_type, &[-1, *size]))
             })
+        || (profile.has_moves_left_head()
+            && !session
+                .outputs
+                .iter()
+                .any(|out| out.name == MLH_NAME && valid(&out.output_type, &[-1, 1])))
     {
         return Err(BackendError::new(
             K::UnsupportedModel,
             S::Asset,
-            "expected dynamic-batch FP32 Maia input/logits/WDL interface",
+            "expected selected dynamic-batch FP32 input/logits/WDL/optional MLH interface",
         ));
     }
     Ok(())

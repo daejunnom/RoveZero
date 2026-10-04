@@ -1,7 +1,7 @@
-//! The single selected Maia asset, loaded once from bounded, hashed bytes.
+//! Selected LC0 assets, loaded once from bounded, hashed bytes.
 //!
 //! This manifest is C's export provenance, not the shared model registry or a
-//! general ONNX loader. Original GPL weights and converted files stay external.
+//! general ONNX loader. Original weights and converted files stay external.
 
 use crate::error::{BackendError, FailureKind as K, FailureStage as S};
 use flate2::read::GzDecoder;
@@ -22,6 +22,58 @@ pub const MAX_ONNX_BYTES: usize = 16 * 1024 * 1024;
 pub const INPUT_NAME: &str = "/input/planes";
 pub const POLICY_NAME: &str = "/output/policy";
 pub const WDL_NAME: &str = "/output/wdl";
+pub const MLH_NAME: &str = "/output/mlh";
+pub const BT4_GZIP_SHA256: &str =
+    "e6ada9d6c4a769bfab3aa0848d82caeb809aa45f83e6c605fc58a31d21bdd618";
+pub const BT4_PROTOBUF_SHA256: &str =
+    "d6e4bbf289bea1fe312b7a0286106aeb713760b604c932ef8cdeebf16a23f36c";
+pub const BT4_GZIP_BYTES: usize = 382_645_315;
+pub const BT4_PROTOBUF_BYTES: usize = 382_616_086;
+pub const BT4_MAX_ONNX_BYTES: usize = 768 * 1024 * 1024;
+pub const BT4_LICENSE_STATUS: &str = "UNVERIFIED-local-research-only";
+
+/// A different source is a different model identity, never a relaxed Maia pin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetProfile {
+    Maia1900,
+    Bt4It332,
+}
+impl AssetProfile {
+    pub fn gzip_sha256(self) -> &'static str {
+        match self {
+            Self::Maia1900 => SOURCE_GZIP_SHA256,
+            Self::Bt4It332 => BT4_GZIP_SHA256,
+        }
+    }
+    pub fn protobuf_sha256(self) -> &'static str {
+        match self {
+            Self::Maia1900 => SOURCE_PROTOBUF_SHA256,
+            Self::Bt4It332 => BT4_PROTOBUF_SHA256,
+        }
+    }
+    fn source_sizes(self) -> (usize, usize) {
+        match self {
+            Self::Maia1900 => (SOURCE_GZIP_BYTES, SOURCE_PROTOBUF_BYTES),
+            Self::Bt4It332 => (BT4_GZIP_BYTES, BT4_PROTOBUF_BYTES),
+        }
+    }
+    pub fn max_onnx_bytes(self) -> usize {
+        match self {
+            Self::Maia1900 => MAX_ONNX_BYTES,
+            Self::Bt4It332 => BT4_MAX_ONNX_BYTES,
+        }
+    }
+    pub fn has_moves_left_head(self) -> bool {
+        self == Self::Bt4It332
+    }
+    /// ORT's arena declaration is neither total VRAM nor an external hard cap.
+    pub fn cuda_arena_bytes(self) -> usize {
+        match self {
+            Self::Maia1900 => 1024 * 1024 * 1024,
+            Self::Bt4It332 => 3 * 1024 * 1024 * 1024,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -44,28 +96,46 @@ pub struct ExportManifest {
 }
 
 impl ExportManifest {
+    pub fn profile(&self) -> Result<AssetProfile, BackendError> {
+        [AssetProfile::Maia1900, AssetProfile::Bt4It332]
+            .into_iter()
+            .find(|profile| {
+                self.source_gzip_sha256 == profile.gzip_sha256()
+                    && self.source_protobuf_sha256 == profile.protobuf_sha256()
+            })
+            .ok_or_else(|| {
+                BackendError::new(
+                    K::UnsupportedModel,
+                    S::Asset,
+                    "unknown selected asset identity",
+                )
+            })
+    }
     pub fn validate(&self) -> Result<(), BackendError> {
+        let profile = self.profile()?;
+        let license = match profile {
+            AssetProfile::Maia1900 => "GPL-3.0",
+            AssetProfile::Bt4It332 => BT4_LICENSE_STATUS,
+        };
         if self.schema != 1
-            || self.source_gzip_sha256 != SOURCE_GZIP_SHA256
-            || self.source_protobuf_sha256 != SOURCE_PROTOBUF_SHA256
             || self.converter_commit != CONVERTER_COMMIT
             || self.opset != 17
             || self.dtype != "float32"
             || self.input_name != INPUT_NAME
             || self.policy_name != POLICY_NAME
             || self.wdl_name != WDL_NAME
-            || self.weights_license != "GPL-3.0"
+            || self.weights_license != license
             || self.redistribution_ready
         {
             return Err(BackendError::new(
                 K::UnsupportedModel,
                 S::Asset,
-                "only the selected Maia FP32 export profile is supported",
+                "only selected LC0 FP32 export profiles are supported",
             ));
         }
         parse_sha256(&self.onnx_sha256)?;
         parse_sha256(&self.converter_binary_sha256)?;
-        if self.onnx_bytes == 0 || self.onnx_bytes > MAX_ONNX_BYTES {
+        if self.onnx_bytes == 0 || self.onnx_bytes > profile.max_onnx_bytes() {
             return Err(BackendError::new(
                 K::ResourceExhausted,
                 S::Asset,
@@ -90,13 +160,17 @@ impl ExportManifest {
 }
 
 #[derive(Debug)]
-pub struct MaiaAsset {
+pub struct SelectedAsset {
     manifest: ExportManifest,
     manifest_digest: [u8; 32],
     onnx: Vec<u8>,
+    profile: AssetProfile,
 }
 
-impl MaiaAsset {
+/// Compatibility name for existing consumers of the first selected profile.
+pub type MaiaAsset = SelectedAsset;
+
+impl SelectedAsset {
     /// Checks the original compressed AND decompressed identity, then verifies
     /// the exact ONNX bytes passed to ORT. No verify-path/reopen-path race.
     pub fn load(original: &Path, onnx: &Path, manifest: &Path) -> Result<Self, BackendError> {
@@ -104,20 +178,44 @@ impl MaiaAsset {
         let manifest: ExportManifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|_| BackendError::new(K::InvalidInput, S::Asset, "invalid export manifest"))?;
         manifest.validate()?;
-        let source = read_bounded(original, SOURCE_GZIP_BYTES)?;
-        check_bytes(&source, SOURCE_GZIP_BYTES, SOURCE_GZIP_SHA256)?;
-        let mut decoded = Vec::new();
-        GzDecoder::new(source.as_slice())
-            .take((SOURCE_PROTOBUF_BYTES + 1) as u64)
-            .read_to_end(&mut decoded)
-            .map_err(|_| BackendError::new(K::InvalidInput, S::Asset, "invalid gzip source"))?;
-        check_bytes(&decoded, SOURCE_PROTOBUF_BYTES, SOURCE_PROTOBUF_SHA256)?;
+        let profile = manifest.profile()?;
+        let (gzip_bytes, protobuf_bytes) = profile.source_sizes();
+        let source = read_bounded(original, gzip_bytes)?;
+        check_bytes(&source, gzip_bytes, profile.gzip_sha256())?;
+        // Stream decompression through a fixed buffer. BT4 does not need a
+        // second 365 MiB source allocation while verifying the gzip identity.
+        let mut decoded = GzDecoder::new(source.as_slice()).take((protobuf_bytes + 1) as u64);
+        let mut hash = Sha256::new();
+        let mut size = 0usize;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = decoded
+                .read(&mut buffer)
+                .map_err(|_| BackendError::new(K::InvalidInput, S::Asset, "invalid gzip source"))?;
+            if read == 0 {
+                break;
+            }
+            size += read;
+            hash.update(&buffer[..read]);
+        }
+        if size != protobuf_bytes
+            || <[u8; 32]>::from(hash.finalize()) != parse_sha256(profile.protobuf_sha256())?
+        {
+            return Err(BackendError::new(
+                K::IdentityMismatch,
+                S::Asset,
+                "decoded source length or SHA-256 differs",
+            ));
+        }
+        drop(decoded);
+        drop(source);
         let onnx = read_bounded(onnx, manifest.onnx_bytes)?;
         check_bytes(&onnx, manifest.onnx_bytes, &manifest.onnx_sha256)?;
         Ok(Self {
             manifest,
             manifest_digest: sha256(&manifest_bytes),
             onnx,
+            profile,
         })
     }
 
@@ -129,6 +227,9 @@ impl MaiaAsset {
     }
     pub fn onnx_bytes(&self) -> &[u8] {
         &self.onnx
+    }
+    pub fn profile(&self) -> AssetProfile {
+        self.profile
     }
 }
 

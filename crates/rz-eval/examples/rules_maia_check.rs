@@ -146,11 +146,11 @@ fn reference_move(movement: &ReferenceMove) -> Result<Move> {
     )?)
 }
 
-fn validate_reference(fixtures: &Fixtures) -> Result<()> {
+fn validate_reference(fixtures: &Fixtures, model: &MaiaAsset) -> Result<()> {
     if fixtures.schema != 1
         || fixtures.reference != "lc0-v0.32.1-eigen-original-protobuf"
         || fixtures.reference_commit != asset::CONVERTER_COMMIT
-        || fixtures.source_sha256 != asset::SOURCE_GZIP_SHA256
+        || fixtures.source_sha256 != model.profile().gzip_sha256()
         || fixtures.fixture_oracle != "python-chess-1.999/chess-1.11.2"
         || fixtures.cases.len() != CASE_NAMES.len()
     {
@@ -421,7 +421,7 @@ fn evaluate_profile(
     if let Some(directory) = cuda_profile_directory {
         config.provider = Provider::Cuda {
             device_id: 0,
-            arena_bytes: NATIVE_CUDA_ADMISSION_BYTES as usize,
+            arena_bytes: model.profile().cuda_arena_bytes(),
         };
         config.profiling_prefix = Some(directory.join(format!("placement-{profile_slot}")));
     }
@@ -639,12 +639,12 @@ fn main() -> Result<()> {
     let result = (|| -> Result<()> {
         let bytes = asset::read_bounded(Path::new(&args[5]), 8 * 1024 * 1024)?;
         let fixtures: Fixtures = serde_json::from_slice(&bytes)?;
-        validate_reference(&fixtures)?;
         let model = MaiaAsset::load(
             Path::new(&args[0]),
             Path::new(&args[1]),
             Path::new(&args[2]),
         )?;
+        validate_reference(&fixtures, &model)?;
         let cuda_profile_directory = if is_cuda {
             let directory = Path::new(&args[8]);
             if !directory.is_absolute()
@@ -726,7 +726,7 @@ fn main() -> Result<()> {
         "scope":if is_cuda{"actual A immutable Rules projection, C ONNX CUDA and D finalization"}else{"actual A immutable Rules projection, C ONNX CPU and D finalization"},
         "handles":"explicit local fixture ownership; no production registry issuance claim",
         "provider":if is_cuda{"cuda"}else{"cpu"},"precision":"fp32","case_count":cases.len(),"case_results":cases,
-        "model_rights":"external Maia GPL asset; separately identified from engine source",
+        "model_rights":"external selected weight; license status is recorded in the pinned export manifest",
         "profiles":profiles,"limits":{"fixture_bytes":8*1024*1024,"cases":12,"trace_plies":8,
             "native_batch_size":1,"max_executions":1,"request_deadline_seconds":REQUEST_SECONDS,
             "scheduler_host_reservation_limit":4*HOST_BYTES_PER_ITEM+8192,

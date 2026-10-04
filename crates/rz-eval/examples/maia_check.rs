@@ -108,20 +108,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let bytes = asset::read_bounded(Path::new(&args[5]), 8 * 1024 * 1024)?;
     let fixtures: Fixtures = serde_json::from_slice(&bytes)?;
-    if fixtures.schema != 1
-        || fixtures.reference != "lc0-v0.32.1-eigen-original-protobuf"
-        || fixtures.reference_commit != asset::CONVERTER_COMMIT
-        || fixtures.source_sha256 != asset::SOURCE_GZIP_SHA256
-        || fixtures.cases.len() != 12
-    {
-        return Err("reference metadata or finite fixture count differs".into());
-    }
-    asset::parse_sha256(&fixtures.reference_module_sha256)?;
     let model = MaiaAsset::load(
         Path::new(&args[0]),
         Path::new(&args[1]),
         Path::new(&args[2]),
     )?;
+    if fixtures.schema != 1
+        || fixtures.reference != "lc0-v0.32.1-eigen-original-protobuf"
+        || fixtures.reference_commit != asset::CONVERTER_COMMIT
+        || fixtures.source_sha256 != model.profile().gzip_sha256()
+        || fixtures.cases.len() != 12
+    {
+        return Err("reference metadata or finite fixture count differs".into());
+    }
+    asset::parse_sha256(&fixtures.reference_module_sha256)?;
     let report_path = Path::new(&args[6]);
     if !report_path.is_absolute() {
         return Err("REPORT must be absolute and have an existing caller-owned parent".into());
@@ -200,7 +200,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         builder.create(profile_directory)?;
         config.provider = Provider::Cuda {
             device_id: 0,
-            arena_bytes: 1024 * 1024 * 1024,
+            arena_bytes: model.profile().cuda_arena_bytes(),
         };
         config.profiling_prefix = Some(profile_directory.join("placement"));
     }

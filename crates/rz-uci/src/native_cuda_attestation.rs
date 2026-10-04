@@ -9,9 +9,9 @@ use crate::{
         ExecutableIdentityV1, ReceiptWriter, RegistryIdentityV1, causes,
     },
     native_bootstrap::{
-        CUDA_ARENA_BYTES, NativeBootstrapError, NativeCompletedReceipt, NativeConfig,
-        NativeCudaFactory, NativeObservationReport, NativeProvider, NativeRunError,
-        NativeRunReport, NativeSearchAggregate, NativeSearchConsumedReceipt,
+        NativeBootstrapError, NativeCompletedReceipt, NativeConfig, NativeCudaFactory,
+        NativeObservationReport, NativeProvider, NativeRunError, NativeRunReport,
+        NativeSearchAggregate, NativeSearchConsumedReceipt,
     },
 };
 use rz_contracts::*;
@@ -99,7 +99,7 @@ impl CudaProfileV1 {
         if config.provider
             != (Provider::Cuda {
                 device_id: 0,
-                arena_bytes: CUDA_ARENA_BYTES,
+                arena_bytes: asset.profile().cuda_arena_bytes(),
             })
             || config.max_batch != 1
             || config.intra_threads != 1
@@ -174,7 +174,7 @@ impl CudaProfileV1 {
             evaluation_mode: "fresh".into(),
             history_fill: "no".into(),
             device_id: 0,
-            arena_bytes: CUDA_ARENA_BYTES as u64,
+            arena_bytes: asset.profile().cuda_arena_bytes() as u64,
             tf32: false,
             runtime_bundle_manifest_sha256: hex(&bundle_file_sha),
             runtime_bundle_sha256: hex(&bundle_digest),
@@ -198,7 +198,7 @@ impl CudaProfileV1 {
             runtime_mapping_verified: true,
             session_resident_admission: SessionAdmissionV1 {
                 host_bytes: 0,
-                device_bytes: CUDA_ARENA_BYTES as u64,
+                device_bytes: asset.profile().cuda_arena_bytes() as u64,
                 pinned_bytes: 0,
                 scope: "declaration_not_measured_vram_or_hardcap".into(),
             },
