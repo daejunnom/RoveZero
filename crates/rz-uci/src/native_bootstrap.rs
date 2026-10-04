@@ -2936,9 +2936,32 @@ mod physical_owner_tests {
             .recv_timeout(WAIT)
             .expect("first root reached the actual physical worker");
         assert_blocked_physical_owner_active(&native.inner.owner, "after physical worker entry");
-        for line in ["position startpos moves e2e4", "go nodes 1 movetime 30000"] {
+        for line in [
+            "position startpos moves e2e4",
+            "go nodes 1 movetime 30000",
+            "isready",
+        ] {
             guard.events.send(Event::Line(line.into())).unwrap();
         }
+        let until = Instant::now() + WAIT;
+        while !protocol_view.text().lines().any(|line| line == "readyok") {
+            assert!(
+                Instant::now() < until,
+                "input owner stays responsive during physical drain"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !protocol_view
+                .text()
+                .lines()
+                .any(|line| line.starts_with("bestmove "))
+        );
+        assert_blocked_physical_owner_active(
+            &native.inner.owner,
+            "before current-root output release",
+        );
+        guard.release.take().unwrap().send(()).unwrap();
         let until = Instant::now() + WAIT;
         let bestmove = loop {
             if let Some(line) = protocol_view
@@ -2964,11 +2987,10 @@ mod physical_owner_tests {
             1,
             "busy root fallback cannot reload/create another provider session"
         );
-        assert_blocked_physical_owner_active(
-            &native.inner.owner,
-            "after current-root legal fallback before physical release",
+        assert!(
+            !native.inner.owner.try_status().unwrap().unwrap().active,
+            "bestmove cannot acknowledge an active physical worker"
         );
-        guard.release.take().unwrap().send(()).unwrap();
         guard.events.send(Event::Line("quit".into())).unwrap();
         let until = Instant::now() + WAIT;
         while !guard.service.as_ref().unwrap().is_finished() {
