@@ -531,6 +531,14 @@ impl ProfileDocument {
         });
         let consumed_matches = expected_consumed
             .is_some_and(|expected| usize::try_from(expected).ok() == Some(consumed.len()));
+        #[cfg(feature = "experimental-raw-cache")]
+        let represented_mode = report.is_some_and(|report| {
+            report.raw_cache_completions.count == 0
+                && report.raw_cache_root_initializations.count == 0
+                && report.raw_cache_non_root_backups.count == 0
+        });
+        #[cfg(not(feature = "experimental-raw-cache"))]
+        let represented_mode = true;
         let counts = BTreeMap::from([
             ("requests", frames.len()),
             ("physical_completions", physical.len()),
@@ -562,6 +570,7 @@ impl ProfileDocument {
             producers_joined: joined,
             journal_complete,
             accepted_request_timeline_complete: journal_complete
+                && represented_mode
                 && consumed_matches
                 && !consumed.is_empty()
                 && timeline_errors == 0
@@ -646,6 +655,12 @@ mod tests {
             backend: Digest([6; 32]),
             origin: rz_eval::native_runtime_bridge::NativeWorkerOrigin::Injected,
             completed_by_runtime: consumed,
+            #[cfg(feature = "experimental-raw-cache")]
+            raw_cache_completions: Default::default(),
+            #[cfg(feature = "experimental-raw-cache")]
+            raw_cache_root_initializations: Default::default(),
+            #[cfg(feature = "experimental-raw-cache")]
+            raw_cache_non_root_backups: Default::default(),
             first_completed: None,
             last_completed: None,
             search_root_initializations: NativeSearchAggregate {
@@ -731,6 +746,23 @@ mod tests {
             !ProfileDocument::capture(&missing, true, Some(&report))
                 .accepted_request_timeline_complete
         );
+    }
+    #[test]
+    #[cfg(feature = "experimental-raw-cache")]
+    fn raw_hit_report_cannot_be_attested_as_a_complete_computed_timeline() {
+        let snapshot = synthetic_snapshot();
+        for field in 0..3 {
+            let mut report = synthetic_report(1);
+            match field {
+                0 => report.raw_cache_completions.count = 1,
+                1 => report.raw_cache_root_initializations.count = 1,
+                _ => report.raw_cache_non_root_backups.count = 1,
+            }
+            assert!(
+                !ProfileDocument::capture(&snapshot, true, Some(&report))
+                    .accepted_request_timeline_complete
+            );
+        }
     }
     #[test]
     fn profile_publication_batches_writes_without_losing_limits_or_flush_failure() {

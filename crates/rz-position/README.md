@@ -6,6 +6,49 @@
 [IMPLEMENTATION-DIRECTIVES](../../docs/IMPLEMENTATION-DIRECTIVES.md), 의미 계약은
 [CONTRACTS](../../docs/CONTRACTS.md)다. 연구 `CARD-A*`와 담당 `TASK-A*`는 다르다.
 
+후속 [성능 개선 계획](../../docs/research/PERFORMANCE-OPTIMIZATION-PLAN.md)은 PR #17을
+기준으로 A 내부 개선과 소비 경계 실험, 자원 경합 통제·반복 계측·실험 PR의 검증 항목을 정리한다.
+
+## 선택적 성능 실험
+
+`experimental-claim-preview`는 기본 비활성이다. 활성화하면 현재 반복 횟수·증거 완전성을
+한 번에 계산하고, 예정 수의 claim을 checked board 전이와 빌린 이력으로 검사한다.
+이때 임시 child owner·history node를 만들지 않는다. 실제 make/fork와 동일한
+history/revision/counter 검사를 사용하며 claim 순서·unknown-prefix·원본 live view를 보존한다.
+기존 소유 child를 만드는 경로는 feature를 끄면 사용할 수 있다.
+
+`cargo test -p rz-position --features contracts,experimental-claim-preview --locked`로
+실험 경로를 검사한다. 이것은 의미 보존(E) 가설의 실험 구현이며 성능·GPU·강도 인수는
+별도다. [계획의 반복 측정·테스트 항목](../../docs/research/PERFORMANCE-OPTIMIZATION-PLAN.md)을 따른다.
+
+`experimental-history-digest`도 기본 비활성이며 `contracts`를 함께 활성화한다.
+현재 canonical FEN·newest-first framing을 유지하면서 하나의 직렬화 버퍼로 빌린 이력을
+해시한다. 같은 `ContractPosition`의 재-export에는 digest 한 개만 재사용하고 성공한
+make/unmake 뒤에는 폐기한다. fork는 새 owner의 빈 cache로 시작한다. 합법 수·classification·
+live-view 검사는 매번 수행한다. 이 cache는 모델 평가 cache나 증분 hash codec이 아니다.
+`cargo test -p rz-position --features experimental-history-digest --locked`로 별도 검사한다.
+두 feature는 독립적으로 비교하며 `--all-features`는 함께 켠 경로도 검사한다.
+
+`examples/performance_probe.rs`는 계약을 사용하는 CPU 진단 예제다. 이력 1/17/65/129/257의
+진행 상태에서 classify, 새 owner+export, 같은 상태의 재-export, fork+export를 구분한다.
+저장된 256-ply trace는 독립 참조로 만든 합법 fixture(seed 0)이며 terminal 뒤의 이동을
+이어 붙이지 않는다. `witness`는 특수 수·청구·전체 이력·digest·수 순서와 make/unmake를
+출력한다. 새 owner ID는 프로세스 안에서 중복 없이 발급하고 비교 출력에서는 정규화한다.
+
+```sh
+: "${CARGO_TARGET_DIR:?저장소 밖 build output root를 지정하세요}"
+cargo build --release -p rz-position --example performance_probe --features contracts --locked
+# 빌드별 실행 파일을 따로 보존한 뒤 witness 출력 전체를 대조한다.
+"$CARGO_TARGET_DIR/release/examples/performance_probe" witness
+"$CARGO_TARGET_DIR/release/examples/performance_probe" time 1000
+```
+
+예제는 실행마다 20회 warm-up과 지정 횟수(상한 10,000)의 호출을 수행한다. 라이브러리
+기본 실행에는 연결되지 않는다. 내부 호출 수를 독립 표본으로 세지 않으며, feature별
+바이너리를 먼저 빌드한 뒤 다른 build/test와 겹치지 않게 직렬 반복 비교한다. 원시 출력은
+저장소 밖에 보존하고 정식 탐색·GPU·강도 결과와 구분한다. 이번 검사·측정 상태는
+[성능 개선 계획](../../docs/research/PERFORMANCE-OPTIMIZATION-PLAN.md)에 기록한다.
+
 ## 제공하는 동작
 
 - `Position::startpos/from_fen`: 64칸·bitboard, 차례·권리·raw EP·u32 카운터를 보존한다.
@@ -61,9 +104,10 @@ nodes도 같은 전체 노드 예산으로 센다. 카운터·revision overflow�
 
 ## 빌드·독립 검증
 
-검증한 compiler는 Rust 1.90.0, CPU Linux x86_64다. A 작업 branch는 총괄 PR #7의
-루트 변경을 포함하지 않으며 manifest 경로로 독립 빌드한다. 임시 standalone lockfile은
-crate ignore에 두며 공유 workspace 등록·root lockfile·toolchain·CI는 TASK-I01 소유다.
+초기 A standalone 검사는 Rust 1.90.0, CPU Linux x86_64에서 수행했다. 현재 통합
+workspace는 루트 toolchain의 Rust 1.96.0으로 검사한다. 공유 workspace 등록·root
+lockfile·toolchain·CI는 TASK-I01 소유다. 후속 실험의 실제
+명령·결과·동일 source CI와 측정 한계는 위 성능 개선 계획의 구현 기록을 따른다.
 선택 의존성의 metadata는 첫 Cargo 해석 시 내려받을 수 있지만, 기본 build에서는
 공통 계약과 SHA-256 구현을 컴파일하거나 규칙 코어에 연결하지 않는다.
 

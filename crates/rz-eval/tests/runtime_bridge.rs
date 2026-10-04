@@ -167,6 +167,67 @@ fn raw() -> RawOutput {
     }
 }
 
+#[cfg(feature = "experimental-prepared-input")]
+#[test]
+fn prepared_input_reuses_only_exact_history_and_revalidates_fresh_requests() {
+    let fixture = Fixture::new(vec![]);
+    let request = fixture.request(1, 100);
+    let first = fixture.projection.prepare(Arc::clone(&request)).unwrap();
+    let second = fixture
+        .projection
+        .clone()
+        .prepare(Arc::clone(&request))
+        .unwrap();
+    assert!(std::ptr::eq(first.encoded(), second.encoded()));
+    assert!(std::ptr::eq(
+        first.indices().as_ptr(),
+        second.indices().as_ptr()
+    ));
+    let replace = |context, bytes| {
+        Arc::new(
+            EvalRequest::try_new(
+                context,
+                request.position().clone(),
+                request.legal().clone(),
+                Arc::clone(request.model()),
+                request.deadline(),
+                request.cancel_token().clone(),
+                bytes,
+            )
+            .unwrap(),
+        )
+    };
+    let mut context = request.context();
+    context.input = EvalInputKey(Digest([0; 32]));
+    assert_eq!(
+        fixture
+            .projection
+            .prepare(replace(context, request.byte_budget()))
+            .err()
+            .unwrap()
+            .code,
+        ErrorCode::IdentityMismatch
+    );
+    let mut bytes = request.byte_budget();
+    bytes.host = 1;
+    assert_eq!(
+        fixture
+            .projection
+            .prepare(replace(request.context(), bytes))
+            .err()
+            .unwrap()
+            .code,
+        ErrorCode::ResourceExhausted
+    );
+    let rebuilt = fixture.request(2, 100); // Same FEN, independently owned prefix: conservative miss.
+    let third = fixture.projection.prepare(rebuilt).unwrap();
+    assert!(!std::ptr::eq(first.encoded(), third.encoded()));
+    assert_eq!(first.encoded(), third.encoded());
+    let fourth = fixture.projection.prepare(request).unwrap(); // One-slot eviction.
+    assert!(!std::ptr::eq(first.encoded(), fourth.encoded()));
+    assert_eq!(first.encoded(), fourth.encoded());
+}
+
 fn step(callbacks: &[u64], done: u64, cancel_ack: Option<u64>) -> Step {
     Step {
         callbacks: callbacks
@@ -220,6 +281,91 @@ fn physical_result(
     let result = results.pop().unwrap();
     assert_eq!(result.request_id, expected);
     result.output
+}
+
+#[cfg(feature = "experimental-raw-cache")]
+#[test]
+fn exact_raw_cache_crosses_roots_with_fresh_receipts_and_resets_at_new_game() {
+    let fixture = Fixture::new(vec![step(&[0], 1, None); 3]);
+    fixture
+        .projection
+        .configure_raw_cache(rz_eval::raw_cache::RawCacheLimits {
+            max_entries: 2,
+            max_bytes: 128 * 1024,
+        })
+        .unwrap();
+    let projection = fixture.projection.clone();
+    let first = fixture.request(1, 100);
+    let rebuild = |sequence, root, game| {
+        let request = fixture.request(sequence, 100);
+        let mut context = request.context();
+        context.root = RootGeneration(root);
+        context.game = GameGeneration(game);
+        Arc::new(
+            EvalRequest::try_new(
+                context,
+                request.position().clone(),
+                request.legal().clone(),
+                Arc::clone(request.model()),
+                request.deadline(),
+                request.cancel_token().clone(),
+                request.byte_budget(),
+            )
+            .unwrap(),
+        )
+    };
+    let second = rebuild(2, 2, 1);
+    let third = rebuild(3, 3, 2);
+    let canceled = rebuild(4, 3, 2);
+    let shared = SharedScope::new(scope(&first));
+    let clock = fixture.clock.clone();
+    let adapter = ContractsAdapter::new(shared.clone(), clock.clone(), 1).unwrap();
+    let mut runtime =
+        ContractEvaluator::new(adapter, fixture.backend, runtime_limits(), 16).unwrap();
+    runtime.set_raw_reuse(Box::new(projection.raw_cache_provider()));
+    runtime.submit(first).unwrap();
+    runtime.pump();
+    clock.set(1);
+    let EvalResult::Completed(original) = runtime.poll().unwrap() else {
+        panic!("fresh completion");
+    };
+    assert_eq!(original.actual.provenance, CacheProvenance::Computed);
+    shared.update(scope(&second));
+    runtime.submit(second.clone()).unwrap();
+    assert_eq!(runtime.state().executions, 0);
+    let EvalResult::Completed(hit) = runtime.poll().unwrap() else {
+        panic!("exact hit");
+    };
+    assert_eq!(hit.context, second.context());
+    assert_eq!(hit.legal, *second.legal());
+    assert_eq!(hit.actual.execution, None);
+    assert_eq!(
+        hit.actual.provenance,
+        CacheProvenance::RawEvalHit {
+            source_execution: original.actual.execution
+        }
+    );
+    assert_eq!(hit.policy, original.policy);
+    assert_eq!(hit.wdl, original.wdl);
+    assert_eq!(projection.raw_cache_stats().unwrap().hits, 1);
+    shared.update(scope(&third));
+    runtime.submit(third).unwrap();
+    runtime.pump();
+    clock.set(2);
+    let EvalResult::Completed(new_game) = runtime.poll().unwrap() else {
+        panic!("new game must compute");
+    };
+    assert_eq!(new_game.actual.provenance, CacheProvenance::Computed);
+    assert_ne!(new_game.actual.execution, original.actual.execution);
+    canceled.cancel_token().cancel();
+    assert_eq!(
+        runtime.submit(canceled).unwrap_err().code,
+        ErrorCode::Canceled
+    );
+    assert_eq!(runtime.state().reserved, Resources::default());
+    assert!(projection.raw_cache_stats().unwrap().retained_bytes <= 128 * 1024);
+    projection.clear_raw_cache().unwrap();
+    assert_eq!(projection.raw_cache_stats().unwrap().entries, 0);
 }
 
 fn runtime_limits() -> Limits {
@@ -598,4 +744,44 @@ fn actual_rules_projection_preserves_unknown_history_repetition_promotions_and_c
         .map(|(mv, index)| (mv.to.index(), index))
         .collect();
     assert_eq!(castles, vec![(2, 97), (6, 103)]);
+}
+
+#[cfg(feature = "experimental-raw-cache")]
+#[test]
+fn rejected_request_cannot_stage_a_late_physical_raw_result() {
+    for canceled in [true, false] {
+        let fixture = Fixture::new(vec![step(&[10], 10, None)]);
+        let request = fixture.request(1, if canceled { 100 } else { 5 });
+        let clock = fixture.clock.clone();
+        let projection = fixture.projection.clone();
+        projection
+            .configure_raw_cache(rz_eval::raw_cache::RawCacheLimits {
+                max_entries: 2,
+                max_bytes: 128 * 1024,
+            })
+            .unwrap();
+        let adapter =
+            ContractsAdapter::new(SharedScope::new(scope(&request)), clock.clone(), 1).unwrap();
+        let mut runtime =
+            ContractEvaluator::new(adapter, fixture.backend, runtime_limits(), 32).unwrap();
+        runtime.set_raw_reuse(Box::new(projection.raw_cache_provider()));
+        runtime.submit(request.clone()).unwrap();
+        runtime.pump();
+        clock.set(5);
+        if canceled {
+            runtime.cancel(request.context().request).unwrap();
+        }
+        assert!(matches!(
+            runtime.poll(),
+            Some(EvalResult::Canceled(_) | EvalResult::Expired(_))
+        ));
+        assert!(runtime.state().reserved.host_bytes > 0);
+        clock.set(10);
+        runtime.pump();
+        assert_eq!(runtime.state().reserved, Resources::default());
+        let cache = projection.raw_cache_stats().unwrap();
+        assert_eq!(cache.entries, 0);
+        assert_eq!(cache.staged, 0);
+        assert_eq!(cache.retained_bytes, 0);
+    }
 }

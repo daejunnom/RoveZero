@@ -158,9 +158,20 @@ pub struct Tree<M, P = Puct> {
     owner: Arc<()>,
     next_serial: u64,
     pending: Option<Pending>,
+    #[cfg(feature = "experimental-batch")]
+    other_pending: Vec<Pending>,
+    #[cfg(feature = "experimental-batch")]
+    max_pending: usize,
     deadline: Option<Instant>,
     cancellation: Option<Arc<AtomicBool>>,
     counters: SearchCounters,
+    #[cfg(feature = "experimental-search-buffers")]
+    selection_stats: Vec<EdgeStats>,
+    #[cfg(all(
+        feature = "experimental-search-buffers",
+        feature = "experimental-batch"
+    ))]
+    selection_indices: Vec<usize>,
 }
 
 impl<M: Clone + Eq> Tree<M, Puct> {
@@ -180,9 +191,20 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
             owner: Arc::new(()),
             next_serial: 0,
             pending: None,
+            #[cfg(feature = "experimental-batch")]
+            other_pending: Vec::new(),
+            #[cfg(feature = "experimental-batch")]
+            max_pending: 1,
             deadline: None,
             cancellation: None,
             counters: SearchCounters::default(),
+            #[cfg(feature = "experimental-search-buffers")]
+            selection_stats: Vec::new(),
+            #[cfg(all(
+                feature = "experimental-search-buffers",
+                feature = "experimental-batch"
+            ))]
+            selection_indices: Vec::new(),
         })
     }
 
@@ -193,11 +215,47 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
         self.counters
     }
     pub fn has_pending(&self) -> bool {
-        self.pending.is_some()
+        self.pending_count() != 0
+    }
+    fn pending_count(&self) -> usize {
+        let count = usize::from(self.pending.is_some());
+        #[cfg(feature = "experimental-batch")]
+        let count = count + self.other_pending.len();
+        count
+    }
+    #[cfg(feature = "experimental-batch")]
+    pub fn set_parallelism(&mut self, max_pending: usize) -> Result<(), SearchError> {
+        if self.has_pending() {
+            return Err(SearchError::Busy);
+        }
+        if !(1..=16).contains(&max_pending) {
+            return Err(SearchError::InvalidConfiguration("parallelism 1..=16"));
+        }
+        self.other_pending
+            .try_reserve(max_pending)
+            .map_err(|_| SearchError::AllocationFailed)?;
+        self.max_pending = max_pending;
+        Ok(())
+    }
+    #[cfg(feature = "experimental-batch")]
+    fn activate(&mut self, ticket: &SelectionTicket) {
+        if !Arc::ptr_eq(&ticket.owner, &self.owner) {
+            return;
+        }
+        if let Some(index) = self
+            .other_pending
+            .iter()
+            .position(|p| p.ticket.serial == ticket.serial)
+        {
+            let selected = self.other_pending.swap_remove(index);
+            if let Some(previous) = self.pending.replace(selected) {
+                self.other_pending.push(previous);
+            }
+        }
     }
 
     pub fn set_deadline(&mut self, deadline: Instant) -> Result<(), SearchError> {
-        if self.pending.is_some() {
+        if self.has_pending() {
             return Err(SearchError::Busy);
         }
         self.deadline = Some(deadline);
@@ -205,7 +263,7 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
     }
 
     pub fn set_cancellation(&mut self, cancellation: Arc<AtomicBool>) -> Result<(), SearchError> {
-        if self.pending.is_some() {
+        if self.has_pending() {
             return Err(SearchError::Busy);
         }
         self.cancellation = Some(cancellation);
@@ -219,6 +277,13 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
             increment(&mut counters.reservations_released)?;
             increment(&mut counters.rejected_results)?;
         }
+        #[cfg(feature = "experimental-batch")]
+        for _ in &self.other_pending {
+            increment(&mut counters.reservations_released)?;
+            increment(&mut counters.rejected_results)?;
+        }
+        #[cfg(feature = "experimental-batch")]
+        self.other_pending.clear();
         self.pending = None;
         self.owner = Arc::new(());
         self.next_serial = 0;
@@ -237,6 +302,10 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
             Node::Expanded(edges) => edges.iter().map(|e| (e.mv.clone(), e.stats)).collect(),
             _ => Vec::new(),
         }
+    }
+
+    pub fn has_root_visits(&self) -> bool {
+        matches!(&self.nodes[0], Node::Expanded(edges) if edges.iter().any(|edge| edge.stats.visits > 0))
     }
 
     /// None until root initialization or for an exact terminal root.
@@ -258,6 +327,16 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
     }
 
     pub fn begin_selection(&mut self, now: Instant) -> Result<Selection<M>, SearchError> {
+        #[cfg(feature = "experimental-batch")]
+        {
+            if self.pending_count() >= self.max_pending {
+                return Err(SearchError::Busy);
+            }
+            if let Some(previous) = self.pending.take() {
+                self.other_pending.push(previous);
+            }
+        }
+        #[cfg(not(feature = "experimental-batch"))]
         if self.pending.is_some() {
             return Err(SearchError::Busy);
         }
@@ -282,14 +361,96 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
         let mut moves = Vec::new();
         let leaf = loop {
             match &self.nodes[node] {
-                Node::Unexpanded => break Leaf::Unexpanded,
+                Node::Unexpanded => {
+                    #[cfg(feature = "experimental-batch")]
+                    if self
+                        .other_pending
+                        .iter()
+                        .any(|pending| pending.leaf == node)
+                    {
+                        return Err(SearchError::Busy);
+                    }
+                    break Leaf::Unexpanded;
+                }
                 Node::Terminal(value) => break Leaf::Terminal(*value),
                 Node::Expanded(edges) => {
                     if path.len() >= self.limits.max_depth {
                         return Err(SearchError::DepthLimit);
                     }
-                    let stats: Vec<_> = edges.iter().map(|e| e.stats).collect();
-                    let selected = self.policy.select(&stats)?;
+                    #[cfg(feature = "experimental-batch")]
+                    let serial = self.max_pending == 1;
+                    #[cfg(not(feature = "experimental-batch"))]
+                    let serial = true;
+                    #[cfg(not(feature = "experimental-search-buffers"))]
+                    let selected = if serial {
+                        let stats: Vec<_> = edges.iter().map(|e| e.stats).collect();
+                        self.policy.select(&stats)?
+                    } else {
+                        0
+                    };
+                    #[cfg(feature = "experimental-search-buffers")]
+                    let selected = if serial {
+                        self.selection_stats.clear();
+                        self.selection_stats
+                            .try_reserve(edges.len())
+                            .map_err(|_| SearchError::AllocationFailed)?;
+                        self.selection_stats
+                            .extend(edges.iter().map(|edge| edge.stats));
+                        self.policy.select(&self.selection_stats)?
+                    } else {
+                        0
+                    };
+                    #[cfg(feature = "experimental-batch")]
+                    let selected = if self.max_pending > 1 {
+                        #[cfg(not(feature = "experimental-search-buffers"))]
+                        let (mut scratch_indices, mut scratch_stats) = (
+                            Vec::with_capacity(edges.len()),
+                            Vec::with_capacity(edges.len()),
+                        );
+                        #[cfg(not(feature = "experimental-search-buffers"))]
+                        let (indices, stats) = (&mut scratch_indices, &mut scratch_stats);
+                        #[cfg(feature = "experimental-search-buffers")]
+                        let (indices, stats) = {
+                            self.selection_indices.clear();
+                            self.selection_stats.clear();
+                            self.selection_indices
+                                .try_reserve(edges.len())
+                                .map_err(|_| SearchError::AllocationFailed)?;
+                            self.selection_stats
+                                .try_reserve(edges.len())
+                                .map_err(|_| SearchError::AllocationFailed)?;
+                            (&mut self.selection_indices, &mut self.selection_stats)
+                        };
+                        for (index, edge) in edges.iter().enumerate() {
+                            if edge.child.is_some_and(|child| {
+                                self.other_pending.iter().any(|p| p.leaf == child)
+                                    && matches!(self.nodes[child], Node::Unexpanded)
+                            }) {
+                                continue;
+                            }
+                            let reserved = self
+                                .other_pending
+                                .iter()
+                                .filter(|p| p.path.contains(&(node, index)))
+                                .count() as u64;
+                            let mut value = edge.stats;
+                            value.visits = value
+                                .visits
+                                .checked_add(reserved)
+                                .ok_or(SearchError::CounterOverflow)?;
+                            value.value_sum -= reserved as f64;
+                            indices.push(index);
+                            stats.push(value);
+                        }
+                        if stats.is_empty() {
+                            return Err(SearchError::Busy);
+                        }
+                        *indices
+                            .get(self.policy.select(stats)?)
+                            .ok_or(SearchError::InvalidPolicySelection)?
+                    } else {
+                        selected
+                    };
                     let edge = edges
                         .get(selected)
                         .ok_or(SearchError::InvalidPolicySelection)?;
@@ -365,6 +526,8 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
         ticket: &SelectionTicket,
         now: Instant,
     ) -> Result<Option<Completion>, SearchError> {
+        #[cfg(feature = "experimental-batch")]
+        self.activate(ticket);
         if let Some(rejection) = self.ticket_rejection(ticket) {
             return Ok(Some(Completion::Rejected(rejection)));
         }
@@ -382,6 +545,8 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
     }
 
     pub fn cancel(&mut self, ticket: &SelectionTicket) -> Result<Completion, SearchError> {
+        #[cfg(feature = "experimental-batch")]
+        self.activate(ticket);
         if let Some(rejection) = self.ticket_rejection(ticket) {
             return Ok(Completion::Rejected(rejection));
         }

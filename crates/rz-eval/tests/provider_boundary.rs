@@ -112,3 +112,35 @@ fn config_requires_finite_resources_and_cuda_evidence_destination() {
         assert!(invalid.validate().is_err());
     }
 }
+
+#[test]
+fn experimental_execution_rejects_wrong_provider_shape_and_uncompiled_modes() {
+    use rz_eval::onnx::ExecutionExperiments;
+    let mut config = BackendConfig::cpu();
+    config.experiments = ExecutionExperiments {
+        cuda_graph: true,
+        ..Default::default()
+    };
+    assert!(config.validate().is_err());
+    config.experiments.io_binding = true;
+    assert!(config.validate().is_err()); // CPU cannot capture CUDA graph
+    config.provider = Provider::Cuda {
+        device_id: 0,
+        arena_bytes: 1024,
+    };
+    config.profiling_prefix = Some(std::env::temp_dir().join("rz-graph-placement"));
+    assert!(config.validate().is_err()); // variable batch is forbidden
+    config.max_batch = 1;
+    assert_eq!(
+        config.validate().is_ok(),
+        cfg!(feature = "experimental-cuda-graph")
+    );
+    config.experiments = ExecutionExperiments {
+        reuse_buffers: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        config.validate().is_ok(),
+        cfg!(feature = "experimental-io-buffers")
+    );
+}

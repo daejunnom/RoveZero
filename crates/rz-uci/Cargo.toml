@@ -10,7 +10,14 @@ description = "RoveZero UCI parser and injected session control boundary"
 path = "src/lib.rs"
 
 [features]
+experimental-batch = ["rz-search/experimental-batch", "rz-eval/experimental-batch"]
+experimental-io-buffers = ["rz-eval/experimental-io-buffers"]
+experimental-io-binding = ["rz-eval/experimental-io-binding"]
+experimental-cuda-graph = ["rz-eval/experimental-cuda-graph"]
+experimental-notify = ["rz-eval/experimental-notify", "rz-runtime/experimental-notify"]
 default = []
+experimental-best-move = []
+experimental-raw-cache = ["rz-eval/experimental-raw-cache"]
 onnx-cpu = [
     "rz-eval/onnx", "dep:serde", "dep:serde_json", "dep:sha2",
     "dep:cap-std", "dep:cap-fs-ext",

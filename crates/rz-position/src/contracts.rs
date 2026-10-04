@@ -106,11 +106,20 @@ impl ContractState {
 pub struct ContractPosition {
     owner: shared::OwnerId,
     position: Position,
+    // One digest for this exact live state. Successful mutation invalidates it;
+    // legal/classification/live authority are always rechecked on export.
+    #[cfg(feature = "experimental-history-digest")]
+    semantic_cache: OnceLock<shared::Digest>,
 }
 
 impl ContractPosition {
     pub fn new(owner: shared::OwnerId, position: Position) -> Self {
-        Self { owner, position }
+        Self {
+            owner,
+            position,
+            #[cfg(feature = "experimental-history-digest")]
+            semantic_cache: OnceLock::new(),
+        }
     }
     pub fn position(&self) -> &Position {
         &self.position
@@ -126,10 +135,16 @@ impl ContractPosition {
             .position
             .classify_with_generated_legal(local_legal.moves())?;
         let local_snapshot = local_legal.snapshot();
+        #[cfg(not(feature = "experimental-history-digest"))]
+        let semantic = state_digest(local_snapshot);
+        #[cfg(feature = "experimental-history-digest")]
+        let semantic = *self
+            .semantic_cache
+            .get_or_init(|| state_digest(local_snapshot));
         let identity = shared::StateIdentity {
             owner: self.owner,
             revision: shared::StateRevision(local_snapshot.revision()),
-            semantic: state_digest(local_snapshot),
+            semantic,
         };
         let moves: Vec<shared::Move> = local_legal
             .moves()
@@ -170,9 +185,12 @@ impl ContractPosition {
         mv: shared::Move,
     ) -> Result<UndoToken, shared::ContractError> {
         self.validate_view(view)?;
-        Ok(self
+        let undo = self
             .position
-            .make_from_view(&view.local_legal, BoardMove::try_from(mv)?)?)
+            .make_from_view(&view.local_legal, BoardMove::try_from(mv)?)?;
+        #[cfg(feature = "experimental-history-digest")]
+        let _ = self.semantic_cache.take();
+        Ok(undo)
     }
     /// Reuse this owner's attested immutable view to create one checked child.
     /// The registry must supply a fresh nonreused owner, just as for `new`.
@@ -214,7 +232,10 @@ impl ContractPosition {
         Ok(())
     }
     pub fn unmake(&mut self, token: UndoToken) -> Result<(), shared::ContractError> {
-        Ok(self.position.unmake(token)?)
+        self.position.unmake(token)?;
+        #[cfg(feature = "experimental-history-digest")]
+        let _ = self.semantic_cache.take();
+        Ok(())
     }
 }
 
@@ -361,9 +382,19 @@ fn state_digest(snapshot: &PositionSnapshot) -> shared::Digest {
         HistoryCompleteness::UnknownPrefix => 1,
     }]);
     hash.update((snapshot.known_history_len() as u64).to_le_bytes());
+    #[cfg(not(feature = "experimental-history-digest"))]
     for state in snapshot.known_history() {
         hash.update([u8::from(state.is_irreversible_boundary())]);
         frame(&mut hash, state.to_fen().as_bytes());
+    }
+    #[cfg(feature = "experimental-history-digest")]
+    {
+        let mut buffer = String::with_capacity(crate::fen::MAX_CANONICAL_FEN_BYTES);
+        for (state, irreversible) in snapshot.history_states() {
+            crate::fen::format_into(state, &mut buffer);
+            hash.update([u8::from(irreversible)]);
+            frame(&mut hash, buffer.as_bytes());
+        }
     }
     shared::Digest(hash.finalize().into())
 }

@@ -142,6 +142,8 @@ pub struct ContractsAdapter<P, C> {
     last_request: Option<u64>,
     last_execution: u64,
     max_batch_items: usize,
+    #[cfg(feature = "experimental-batch")]
+    mixed_legal_batching: bool,
     _position: PhantomData<fn() -> P>,
 }
 
@@ -170,8 +172,17 @@ impl<P, C: ContractClock> ContractsAdapter<P, C> {
             last_request: None,
             last_execution,
             max_batch_items,
+            #[cfg(feature = "experimental-batch")]
+            mixed_legal_batching: false,
             _position: PhantomData,
         })
+    }
+
+    /// Only a full raw-head backend with per-item legal conversion may opt in.
+    #[cfg(feature = "experimental-batch")]
+    pub fn with_mixed_legal_batching(mut self) -> Self {
+        self.mixed_legal_batching = true;
+        self
     }
 
     pub fn scope(&self) -> &SharedScope {
@@ -209,7 +220,18 @@ impl<P: Send + Sync + 'static, C: ContractClock> Adapter for ContractsAdapter<P,
             precision: context.precision,
             compute: context.compute,
             backend: context.backend,
-            legal_count: request.eval.legal().moves().len(),
+            legal_count: {
+                #[cfg(feature = "experimental-batch")]
+                if self.mixed_legal_batching {
+                    0
+                } else {
+                    request.eval.legal().moves().len()
+                }
+                #[cfg(not(feature = "experimental-batch"))]
+                {
+                    request.eval.legal().moves().len()
+                }
+            },
         }
     }
 
@@ -318,6 +340,31 @@ impl<P: Send + Sync + 'static, C: ContractClock> Adapter for ContractsAdapter<P,
         self.validate_output(request, output)
     }
 
+    #[cfg(feature = "experimental-raw-cache")]
+    fn validate_reused_output(
+        &mut self,
+        request: &Self::Request,
+        output: &EvalOutput,
+    ) -> Result<(), ContractError> {
+        output.validate_for(
+            &request.eval,
+            self.scope.get(),
+            self.clock.domain(),
+            self.clock.now(),
+        )?;
+        if request.execution().is_some()
+            || output.actual.execution.is_some()
+            || !matches!(output.actual.provenance, CacheProvenance::RawEvalHit { .. })
+        {
+            return Err(ContractError::new(
+                ErrorCode::IdentityMismatch,
+                Stage::Output,
+                "raw reuse must not bind a new physical execution",
+            ));
+        }
+        Ok(())
+    }
+
     fn bind_execution(&mut self, request: &Self::Request, id: &ExecutionId) {
         request
             .execution
@@ -363,6 +410,14 @@ impl<P: Send + Sync + 'static, C: ContractClock> Adapter for ContractsAdapter<P,
 struct Pending<P> {
     request: Arc<RuntimeRequest<P>>,
     receiver: CompletionReceiver<EvalResult>,
+}
+
+#[cfg(feature = "experimental-raw-cache")]
+pub trait ExactRawReuse<P>: Send {
+    fn lookup(&mut self, request: Arc<EvalRequest<P>>)
+        -> Result<Option<EvalOutput>, ContractError>;
+    /// Only the final runtime acceptance promotes a staged raw result.
+    fn observe(&mut self, request: &EvalRequest<P>, output: Option<&EvalOutput>);
 }
 
 /// Facts at the common result transfer boundary, separate from Scheduler facts.
@@ -426,6 +481,8 @@ where
     scope: SharedScope,
     clock: C,
     delivery_observations: Observations<DeliveryObservation>,
+    #[cfg(feature = "experimental-raw-cache")]
+    raw_reuse: Option<Box<dyn ExactRawReuse<P>>>,
 }
 
 impl<P, B, C> ContractEvaluator<P, B, C>
@@ -467,11 +524,18 @@ where
             scope,
             clock,
             delivery_observations,
+            #[cfg(feature = "experimental-raw-cache")]
+            raw_reuse: None,
         })
     }
 
     pub fn pump(&mut self) {
         self.scheduler.pump();
+    }
+
+    #[cfg(feature = "experimental-raw-cache")]
+    pub fn set_raw_reuse(&mut self, reuse: Box<dyn ExactRawReuse<P>>) {
+        self.raw_reuse = Some(reuse);
     }
 
     pub fn state(&self) -> State {
@@ -537,6 +601,10 @@ where
 
     fn accept_delivery(&mut self, request: &RuntimeRequest<P>, result: EvalResult) -> EvalResult {
         let EvalResult::Completed(output) = result else {
+            #[cfg(feature = "experimental-raw-cache")]
+            if let Some(reuse) = self.raw_reuse.as_mut() {
+                reuse.observe(&request.eval, None);
+            }
             let (kind, error) = match &result {
                 EvalResult::Canceled(_) => (FinishKind::Canceled, None),
                 EvalResult::Expired(_) => (FinishKind::Expired, None),
@@ -563,10 +631,18 @@ where
             });
         match checked {
             Ok(()) => {
+                #[cfg(feature = "experimental-raw-cache")]
+                if let Some(reuse) = self.raw_reuse.as_mut() {
+                    reuse.observe(&request.eval, Some(&output));
+                }
                 self.observe_delivery(request, DeliveryObservationKind::Accepted);
                 EvalResult::Completed(output)
             }
             Err(error) => {
+                #[cfg(feature = "experimental-raw-cache")]
+                if let Some(reuse) = self.raw_reuse.as_mut() {
+                    reuse.observe(&request.eval, None);
+                }
                 self.observe_delivery(request, DeliveryObservationKind::Rejected { error });
                 failure_result(request.completion_context(), error)
             }
@@ -599,9 +675,30 @@ where
         if self.pending.len() >= self.max_requests {
             return Err(fault_error(RuntimeFault::QueueFull));
         }
+        #[cfg(feature = "experimental-raw-cache")]
+        let reused = if let Some(reuse) = self.raw_reuse.as_mut() {
+            request.validate_acceptance(self.scope.get(), self.clock.domain(), self.clock.now())?;
+            reuse.lookup(Arc::clone(&request))?
+        } else {
+            None
+        };
         let request = Arc::new(RuntimeRequest::new(request));
         // Both owners share one physical bind, while the common request remains frozen.
         let scheduled = request.as_ref().clone();
+        #[cfg(feature = "experimental-raw-cache")]
+        let receiver = match match reused {
+            Some(output) => self.scheduler.submit_reused(scheduled, output),
+            None => self.scheduler.submit(scheduled),
+        } {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                if let Some(reuse) = self.raw_reuse.as_mut() {
+                    reuse.observe(request.eval(), None);
+                }
+                return Err(error.error);
+            }
+        };
+        #[cfg(not(feature = "experimental-raw-cache"))]
         let receiver = self
             .scheduler
             .submit(scheduled)
@@ -618,6 +715,10 @@ where
                 Ok(result) => return Some(self.accept_delivery(&pending.request, result)),
                 Err(mpsc::TryRecvError::Empty) => self.pending.push_back(pending),
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    #[cfg(feature = "experimental-raw-cache")]
+                    if let Some(reuse) = self.raw_reuse.as_mut() {
+                        reuse.observe(pending.request.eval(), None);
+                    }
                     let error = ContractError::new(
                         ErrorCode::BackendFailure,
                         Stage::Output,

@@ -24,9 +24,20 @@ rz-position = { workspace = true, optional = true, features = ["contracts"] }
 rz-runtime = { workspace = true, optional = true, features = ["contracts"] }
 
 [features]
+experimental-batch = ["contracts", "rz-runtime/experimental-batch"]
+experimental-io-buffers = ["onnx"]
+experimental-io-binding = ["onnx"]
+experimental-cuda-graph = ["experimental-io-binding"]
+experimental-notify = ["dep:rz-runtime", "rz-runtime/experimental-notify"]
 default = []
 onnx = ["dep:ort", "dep:rz-native-loader"]
 contracts = ["dep:rz-contracts", "dep:rz-position", "dep:rz-runtime"]
+# Independent OPT-01 experiments; original projection remains available.
+experimental-bitboards = ["contracts"]
+experimental-history-frames = ["contracts"]
+experimental-prepared-input = ["contracts"]
+experimental-input-hash = ["contracts"]
+experimental-raw-cache = ["contracts", "rz-runtime/experimental-raw-cache"]
 
 [[example]]
 name = "maia_check"

@@ -225,6 +225,54 @@ fn checked_counter_overflow_is_atomic() {
 }
 
 #[test]
+fn borrowed_frames_preserve_full_prefix_repetition_and_maintained_bitboards() {
+    fn check(snapshot: &rz_position::PositionSnapshot) {
+        assert!(snapshot.recent_history_frames::<0>().is_empty());
+        let frames = snapshot.recent_history_frames::<8>();
+        let owned: Vec<_> = snapshot.known_history().take(8).collect();
+        assert_eq!(frames.iter().flatten().count(), owned.len());
+        for (frame, old) in frames.iter().flatten().zip(owned) {
+            let repeated = old
+                .known_history()
+                .skip(1)
+                .any(|prior| prior.repetition_identity() == old.repetition_identity());
+            assert_eq!(frame.repeated(), repeated);
+            assert_eq!(frame.en_passant_target(), old.en_passant_target());
+            let mut bits = [0; 12];
+            for index in 0..64 {
+                let square = Square::new(index).unwrap();
+                assert_eq!(frame.piece_at(square), old.piece_at(square));
+                if let Some(piece) = old.piece_at(square) {
+                    bits[piece.color as usize * 6 + piece.kind as usize] |= 1u64 << index;
+                }
+            }
+            assert_eq!(frame.piece_bitboards(), &bits);
+            assert_eq!(old.piece_bitboards(), &bits);
+        }
+    }
+    let mut position = Position::startpos();
+    let original = position.snapshot();
+    for movement in include_str!("fixtures/performance_trace.txt").split_whitespace() {
+        position.make_uci(movement).unwrap();
+        check(&position.snapshot());
+    }
+    check(&original);
+    let mut repeated = Position::startpos();
+    for _ in 0..4 {
+        for movement in ["g1f3", "g8f6", "f3g1", "f6g8"] {
+            repeated.make_uci(movement).unwrap();
+            check(&repeated.snapshot());
+        }
+    }
+    for fen in [
+        "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2",
+        "k3r3/8/8/3pP3/8/8/8/4K3 w - d6 0 2",
+    ] {
+        check(&Position::from_fen(fen).unwrap().snapshot());
+    }
+}
+
+#[test]
 fn owned_snapshots_and_legal_views_survive_mutation_but_stale_views_cannot_make() {
     let mut position = Position::startpos();
     let initial = position.snapshot();

@@ -139,6 +139,108 @@ fn shared_move(uci: &str) -> shared::Move {
     shared::Move::try_from(BoardMove::from_uci(uci).unwrap()).unwrap()
 }
 
+#[cfg(feature = "experimental-history-digest")]
+#[test]
+fn digest_reuse_preserves_make_unmake_failed_mutation_and_fresh_forks() {
+    fn verify(live: &ContractPosition) -> rz_position::contracts::ContractState {
+        let actual = live.export().unwrap();
+        let repeated = live.export().unwrap();
+        let fresh = ContractPosition::new(shared::OwnerId(800), live.position().clone())
+            .export()
+            .unwrap();
+        assert_eq!(actual.snapshot().identity(), repeated.snapshot().identity());
+        assert_eq!(
+            actual.snapshot().identity().semantic,
+            fresh.snapshot().identity().semantic
+        );
+        assert_eq!(actual.legal_moves().order(), fresh.legal_moves().order());
+        assert_eq!(actual.legal_moves().moves(), fresh.legal_moves().moves());
+        assert_eq!(
+            actual.rules().classification(),
+            fresh.rules().classification()
+        );
+        assert_eq!(
+            actual.rules().snapshot().known_history_fens(),
+            fresh.rules().snapshot().known_history_fens()
+        );
+        actual
+    }
+    let mut live = ContractPosition::new(shared::OwnerId(801), Position::startpos());
+    let root = verify(&live);
+    assert!(live.make_from_view(&root, shared_move("a1a8")).is_err());
+    assert_eq!(
+        verify(&live).snapshot().identity(),
+        root.snapshot().identity()
+    );
+    let undo = live.make_from_view(&root, shared_move("e2e4")).unwrap();
+    let child = verify(&live);
+    assert_ne!(
+        child.snapshot().identity().semantic,
+        root.snapshot().identity().semantic
+    );
+    assert!(live.make_from_view(&root, shared_move("e2e4")).is_err());
+    assert_eq!(
+        verify(&live).snapshot().identity(),
+        child.snapshot().identity()
+    );
+    let fork = live
+        .fork_from_view(shared::OwnerId(802), &child, shared_move("e7e5"))
+        .unwrap();
+    verify(&fork);
+    let mut foreign = ContractPosition::new(shared::OwnerId(803), Position::startpos());
+    let foreign_root = foreign.export().unwrap();
+    let foreign_undo = foreign
+        .make_from_view(&foreign_root, shared_move("e2e4"))
+        .unwrap();
+    assert!(live.unmake(foreign_undo).is_err());
+    assert_eq!(
+        verify(&live).snapshot().identity(),
+        child.snapshot().identity()
+    );
+    live.unmake(undo).unwrap();
+    let restored = verify(&live);
+    assert_eq!(
+        restored.snapshot().identity().semantic,
+        root.snapshot().identity().semantic
+    );
+    assert!(restored.snapshot().identity().revision > child.snapshot().identity().revision);
+    assert!(live.make_from_view(&root, shared_move("e2e4")).is_err());
+}
+
+#[cfg(feature = "experimental-history-digest")]
+#[test]
+fn concurrent_first_exports_bind_the_same_immutable_digest_and_legal_order() {
+    use std::sync::Barrier;
+    let mut position = Position::startpos();
+    position
+        .apply_uci_moves(&["e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6"])
+        .unwrap();
+    let live = Arc::new(ContractPosition::new(shared::OwnerId(810), position));
+    let ready = Arc::new(Barrier::new(5));
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let live = Arc::clone(&live);
+            let ready = Arc::clone(&ready);
+            std::thread::spawn(move || {
+                ready.wait();
+                let state = live.export().unwrap();
+                (
+                    state.snapshot().identity(),
+                    state.legal_moves().order(),
+                    state.legal_moves().moves().to_vec(),
+                    state.rules().classification().clone(),
+                    state.rules().snapshot().known_history_fens(),
+                )
+            })
+        })
+        .collect();
+    ready.wait();
+    let actual: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+    for result in &actual[1..] {
+        assert_eq!(result, &actual[0]);
+    }
+}
+
 #[test]
 fn attested_forks_match_reexported_children_for_special_moves_claims_and_history() {
     let mut history = Position::startpos();

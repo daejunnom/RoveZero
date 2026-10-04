@@ -22,6 +22,8 @@ struct Job<J, R> {
 }
 
 pub struct SingleWorker<J, R> {
+    #[cfg(feature = "experimental-notify")]
+    signal: rz_runtime::CompletionSignal,
     sender: Option<mpsc::SyncSender<Job<J, R>>>,
     state: Arc<AtomicU8>,
     // The slot, rather than the spawn closure, owns the handle until a reaper
@@ -78,6 +80,10 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
         let (sender, receiver) = mpsc::sync_channel::<Job<J, R>>(1);
         let state = Arc::new(AtomicU8::new(IDLE));
         let worker_state = Arc::clone(&state);
+        #[cfg(feature = "experimental-notify")]
+        let signal = rz_runtime::CompletionSignal::default();
+        #[cfg(feature = "experimental-notify")]
+        let worker_signal = signal.clone();
         let physical_handle = std::thread::Builder::new()
             .name("rz-maia-physical".into())
             .spawn(move || {
@@ -97,6 +103,8 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
                             // execution. At this point run has physically completed.
                             worker_state.store(IDLE, Ordering::Release);
                             let _ = job.completion.send(output);
+                            #[cfg(feature = "experimental-notify")]
+                            worker_signal.notify();
                         }
                         PhysicalRun::Quarantined(cause) => {
                             // Neither unwinding nor a native failure alone attests
@@ -112,6 +120,8 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
                             std::mem::forget(job);
                             std::mem::forget(run);
                             worker_state.store(QUARANTINED, Ordering::Release);
+                            #[cfg(feature = "experimental-notify")]
+                            worker_signal.notify();
                             // Thread termination does not prove the quarantined
                             // execution completed, nor release its leaked pins.
                             return Err(cause);
@@ -125,6 +135,8 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
                         shutdown_panic_failure(payload.as_ref(), "WorkerShutdownPanic")
                     });
                 worker_state.store(CLOSED, Ordering::Release);
+                #[cfg(feature = "experimental-notify")]
+                worker_signal.notify();
                 result
             })
             .map_err(|_| {
@@ -135,12 +147,19 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
                 )
             })?;
         Ok(Self {
+            #[cfg(feature = "experimental-notify")]
+            signal,
             sender: Some(sender),
             state,
             physical_handle: Arc::new(Mutex::new(Some(physical_handle))),
             shutdown_completion: None,
             shutdown_result: None,
         })
+    }
+
+    #[cfg(feature = "experimental-notify")]
+    pub fn completion_signal(&self) -> rz_runtime::CompletionSignal {
+        self.signal.clone()
     }
 
     /// A rejection guarantees this input was not handed to native execution.

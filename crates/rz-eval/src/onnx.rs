@@ -20,7 +20,30 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+#[cfg(feature = "experimental-io-binding")]
+#[path = "onnx_io.rs"]
+mod io;
 const MAX_BATCH: usize = 16;
+
+/// CPU wall-clock boundaries. Run includes kernels and synchronization;
+/// these are not GPU event times. None means that transfer is inside Run.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IoTimings {
+    pub host_stage: std::time::Duration,
+    pub transfer_in: Option<std::time::Duration>,
+    pub run: std::time::Duration,
+    pub output_fence: Option<std::time::Duration>,
+    pub transfer_out: Option<std::time::Duration>,
+    pub own_outputs: std::time::Duration,
+}
+
+/// Independent, explicit experiments; compiling them does not enable them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExecutionExperiments {
+    pub reuse_buffers: bool,
+    pub io_binding: bool,
+    pub cuda_graph: bool,
+}
 
 /// Source-thread host intervals. NativeInvocation includes synchronous ORT Run,
 /// not separately measured GPU kernels or H2D/D2H. Failed CUDA Run is unfenced.
@@ -329,6 +352,7 @@ pub enum Provider {
 
 #[derive(Clone, Debug)]
 pub struct BackendConfig {
+    pub experiments: ExecutionExperiments,
     pub provider: Provider,
     pub max_batch: usize,
     pub host_io_bytes: usize,
@@ -338,8 +362,14 @@ pub struct BackendConfig {
 }
 
 impl BackendConfig {
+    /// Native D02 v1 has no raw-hit, batch or experimental I/O timeline schema.
+    pub fn source_profile_supported(&self) -> bool {
+        self.max_batch == 1 && self.experiments == ExecutionExperiments::default()
+    }
+
     pub fn cpu() -> Self {
         Self {
+            experiments: ExecutionExperiments::default(),
             provider: Provider::Cpu,
             max_batch: 16,
             host_io_bytes: 16 * IO_BYTES_PER_ITEM,
@@ -349,6 +379,20 @@ impl BackendConfig {
     }
 
     pub fn validate(&self) -> Result<(), BackendError> {
+        if (self.experiments.reuse_buffers && !cfg!(feature = "experimental-io-buffers"))
+            || (self.experiments.io_binding && !cfg!(feature = "experimental-io-binding"))
+            || (self.experiments.cuda_graph && !cfg!(feature = "experimental-cuda-graph"))
+            || (self.experiments.cuda_graph
+                && (!self.experiments.io_binding
+                    || !matches!(self.provider, Provider::Cuda { .. })
+                    || self.max_batch != 1))
+        {
+            return Err(BackendError::new(
+                K::UnsupportedModel,
+                S::Admission,
+                "execution experiment unsupported or CUDA Graph lacks fixed CUDA B1 binding",
+            ));
+        }
         if self.max_batch == 0
             || self.max_batch > MAX_BATCH
             || self.intra_threads == 0
@@ -402,6 +446,14 @@ pub struct OnnxBackend {
     // Kept outside the Run stack so worker quarantine also pins tensor storage
     // if a Rust wrapper unexpectedly unwinds before attesting completion.
     active_input: Option<Tensor<f32>>,
+    #[cfg(feature = "experimental-io-buffers")]
+    spare_input: Option<Tensor<f32>>,
+    raw_pool: Vec<RawOutput>,
+    #[cfg(feature = "experimental-io-binding")]
+    bound: Option<io::BoundBuffers>,
+    /// Successful synchronous binding runs. This is not proof of GPU replay.
+    bound_runs: u64,
+    timings: Option<IoTimings>,
     config: BackendConfig,
     identity: [u8; 32],
     asset_identity: [u8; 32],
@@ -421,6 +473,8 @@ impl Drop for OnnxBackend {
             // process owns these native allocations until exit, even when a
             // direct caller drops the backend outside SingleWorker.
             std::mem::forget((self.session.take(), self.active_input.take()));
+            #[cfg(feature = "experimental-io-binding")]
+            std::mem::forget(self.bound.take());
         }
     }
 }
@@ -505,6 +559,7 @@ impl OnnxBackend {
                         .with_memory_limit(arena_bytes)
                         .with_tf32(false)
                         .with_conv_max_workspace(false)
+                        .with_cuda_graph(config.experiments.cuda_graph)
                         .build()
                         .error_on_failure()])
                     .map_err(|error| setup_error(CauseCode::ProviderRegistration, error))?;
@@ -537,11 +592,27 @@ impl OnnxBackend {
             )
             .expect("writing to an owned String cannot fail");
         }
+        if config.experiments != ExecutionExperiments::default() {
+            use std::fmt::Write;
+            write!(
+                profile,
+                ";execution-experiment-v1={:?};copy=synchronous-ort-identity",
+                config.experiments
+            )
+            .expect("String formatting");
+        }
         let cuda_runtime =
             matches!(config.provider, Provider::Cuda { .. }).then(|| runtime.clone());
         let mut result = Self {
             session: Some(session),
             active_input: None,
+            #[cfg(feature = "experimental-io-buffers")]
+            spare_input: None,
+            raw_pool: Vec::new(),
+            #[cfg(feature = "experimental-io-binding")]
+            bound: None,
+            bound_runs: 0,
+            timings: None,
             config,
             identity: asset::sha256(profile.as_bytes()),
             asset_identity: asset.manifest_digest(),
@@ -714,6 +785,37 @@ impl OnnxBackend {
         )
     }
 
+    /// Ownership must return before any raw buffer is reused. Retained outputs
+    /// in another caller are never modified. The physical worker returns these
+    /// after converting to independently owned legal policy/WDL.
+    pub fn recycle_outputs(&mut self, outputs: Vec<RawOutput>) {
+        if !self.config.experiments.reuse_buffers {
+            return;
+        }
+        for raw in outputs {
+            if self.raw_pool.len() < self.config.max_batch
+                && raw.policy_logits.capacity() == POLICY_SIZE
+                && raw.wdl.capacity() == 3
+            {
+                self.raw_pool.push(raw);
+            }
+        }
+    }
+    pub fn last_io_timings(&self) -> Option<IoTimings> {
+        self.timings
+    }
+    pub fn binding_runs(&self) -> u64 {
+        self.bound_runs
+    }
+    #[cfg(feature = "experimental-io-binding")]
+    fn release_completed_input(&mut self) {
+        #[cfg(feature = "experimental-io-buffers")]
+        if self.config.experiments.reuse_buffers {
+            self.spare_input = self.active_input.take();
+        }
+        self.active_input = None;
+    }
+
     /// Dense entry point for independent reference fixtures, still fully checked.
     pub fn run_values(&mut self, inputs: &[&[f32]]) -> Result<Vec<RawOutput>, BackendError> {
         self.run_values_profiled(inputs, None)
@@ -724,6 +826,16 @@ impl OnnxBackend {
         inputs: &[&EncodedInput],
     ) -> (Result<Vec<RawOutput>, BackendError>, NativeRunTimings) {
         let mut timings = NativeRunTimings::default();
+        if !self.config.source_profile_supported() {
+            return (
+                Err(BackendError::new(
+                    K::UnsupportedModel,
+                    S::Admission,
+                    "source profiling requires default B1 native execution",
+                )),
+                timings,
+            );
+        }
         if inputs.len() > self.config.max_batch {
             return (
                 Err(BackendError::new(
@@ -772,34 +884,133 @@ impl OnnxBackend {
                 "input must be finite FP32 [112,8,8]",
             ));
         }
-        let mut dense = Vec::new();
-        dense
-            .try_reserve_exact(inputs.len() * INPUT_VALUES)
-            .map_err(|error| {
-                BackendError::new(
-                    K::ResourceExhausted,
-                    S::Admission,
-                    "input staging allocation failed",
-                )
-                .with_external_cause(CauseCode::InputAllocation, &error)
-            })?;
-        for input in inputs {
-            dense.extend_from_slice(input);
+        let measured = self.config.experiments != ExecutionExperiments::default();
+        let stage_started = measured.then(std::time::Instant::now);
+        self.timings = measured.then(IoTimings::default);
+        #[cfg(feature = "experimental-io-buffers")]
+        let spare = if self.config.experiments.reuse_buffers {
+            self.spare_input
+                .take()
+                .filter(|tensor| tensor.shape().as_ref() == [inputs.len() as i64, 112, 8, 8])
+        } else {
+            None
+        };
+        #[cfg(not(feature = "experimental-io-buffers"))]
+        let spare: Option<Tensor<f32>> = None;
+        let tensor = match spare {
+            Some(mut tensor) => {
+                let (_, values) = tensor.try_extract_tensor_mut::<f32>().map_err(|error| {
+                    BackendError::new(
+                        K::BackendFailure,
+                        S::Backend,
+                        "cannot write exclusive input buffer",
+                    )
+                    .with_ort_cause(CauseCode::TensorCreate, error)
+                })?;
+                for (destination, input) in values.chunks_exact_mut(INPUT_VALUES).zip(inputs) {
+                    destination.copy_from_slice(input);
+                }
+                tensor
+            }
+            None => {
+                let mut dense = Vec::new();
+                dense
+                    .try_reserve_exact(inputs.len() * INPUT_VALUES)
+                    .map_err(|error| {
+                        BackendError::new(
+                            K::ResourceExhausted,
+                            S::Admission,
+                            "input staging allocation failed",
+                        )
+                        .with_external_cause(CauseCode::InputAllocation, &error)
+                    })?;
+                for input in inputs {
+                    dense.extend_from_slice(input);
+                }
+                Tensor::from_array(([inputs.len(), 112, 8, 8], dense)).map_err(|error| {
+                    BackendError::new(
+                        K::BackendFailure,
+                        S::Backend,
+                        "cannot create ORT input tensor",
+                    )
+                    .with_ort_cause(CauseCode::TensorCreate, error)
+                })?
+            }
+        };
+        self.active_input = Some(tensor);
+        if let (Some(timing), Some(started)) = (&mut self.timings, stage_started) {
+            timing.host_stage = started.elapsed();
         }
-        self.active_input = Some(
-            Tensor::from_array(([inputs.len(), 112, 8, 8], dense)).map_err(|error| {
-                BackendError::new(
-                    K::BackendFailure,
-                    S::Backend,
-                    "cannot create ORT input tensor",
-                )
-                .with_ort_cause(CauseCode::TensorCreate, error)
-            })?,
-        );
+
+        #[cfg(feature = "experimental-io-binding")]
+        if self.config.experiments.io_binding {
+            if self
+                .bound
+                .as_ref()
+                .is_none_or(|buffers| buffers.batch != inputs.len())
+            {
+                // One shape slot, changed only after the preceding physical fence.
+                let buffers = match io::BoundBuffers::new(
+                    self.session.as_ref().expect("loaded session"),
+                    self.config.provider,
+                    inputs.len(),
+                ) {
+                    Ok(buffers) => buffers,
+                    Err(error) => {
+                        let failure = BackendError::new(
+                            K::BackendFailure,
+                            S::Backend,
+                            "fixed binding allocation failed",
+                        )
+                        .with_ort_cause(CauseCode::TensorCreate, error);
+                        if matches!(self.config.provider, Provider::Cuda { .. }) {
+                            self.quarantine_cause = Some(failure.clone());
+                        } else {
+                            self.active_input = None;
+                        }
+                        return Err(failure);
+                    }
+                };
+                self.bound = Some(buffers);
+            }
+            let result = self.bound.as_mut().expect("fixed binding").run(
+                self.session.as_mut().expect("loaded session"),
+                self.active_input.as_ref().expect("input pin"),
+                &mut self.raw_pool,
+                self.config.experiments.reuse_buffers,
+                self.timings.as_mut(),
+            );
+            match result {
+                Ok(outputs) => {
+                    self.bound_runs = self.bound_runs.saturating_add(1);
+                    self.release_completed_input();
+                    return Ok(outputs);
+                }
+                Err(io::BoundFailure::Native(error)) => {
+                    let failure = BackendError::new(
+                        K::BackendFailure,
+                        S::Backend,
+                        "binding run/copy/fence failed",
+                    )
+                    .with_ort_cause(CauseCode::OrtRun, error);
+                    if matches!(self.config.provider, Provider::Cuda { .. }) {
+                        self.quarantine_cause = Some(failure.clone());
+                    } else {
+                        self.active_input = None;
+                    }
+                    return Err(failure);
+                }
+                Err(io::BoundFailure::Output(error)) => {
+                    self.release_completed_input();
+                    return Err(error);
+                }
+            }
+        }
         // No RunOptions enabling asynchronous EP execution or terminate-on-cancel.
         // Only a successful CUDA Run attests the synchronous device fence.
         // Arbitrary CUDA errors retain the input/session instead of granting
         // physical Ready. CPU errors keep the existing completed-error behavior.
+        let run_started = measured.then(std::time::Instant::now);
         let invocation_start = timings.as_ref().map(|_| Instant::now());
         if let (Some(start), Some(end), Some(timing)) =
             (preparation_start, invocation_start, timings.as_deref_mut())
@@ -814,6 +1025,9 @@ impl OnnxBackend {
             })?
             .run(ort::inputs![INPUT_NAME => self.active_input.as_ref()
             .ok_or(BackendError::new(K::BackendFailure, S::Backend, "input pin is missing"))?]);
+        if let (Some(timing), Some(started)) = (&mut self.timings, run_started) {
+            timing.run = started.elapsed();
+        }
         let invocation_end = timings.as_ref().map(|_| Instant::now());
         if let (Some(start), Some(end), Some(timing)) =
             (invocation_start, invocation_end, timings.as_deref_mut())
@@ -822,10 +1036,7 @@ impl OnnxBackend {
             timing.completion_attested = run_result.is_ok();
         }
         let outputs = match run_result {
-            Ok(outputs) => {
-                self.active_input = None;
-                outputs
-            }
+            Ok(outputs) => outputs,
             Err(error) => {
                 let failure =
                     BackendError::new(K::BackendFailure, S::Backend, "synchronous ORT Run failed")
@@ -838,6 +1049,11 @@ impl OnnxBackend {
                 return Err(failure);
             }
         };
+        #[cfg(feature = "experimental-io-buffers")]
+        if self.config.experiments.reuse_buffers {
+            self.spare_input = self.active_input.take();
+        }
+        self.active_input = None;
         let malformed = || {
             BackendError::new(
                 K::NumericalFailure,
@@ -860,28 +1076,59 @@ impl OnnxBackend {
         {
             return Err(malformed());
         }
-        let mut result = Vec::with_capacity(inputs.len());
-        for (policy, wdl) in policy.chunks_exact(POLICY_SIZE).zip(wdl.chunks_exact(3)) {
-            let raw = RawOutput {
-                policy_logits: policy.to_vec(),
-                wdl: wdl.to_vec(),
-            };
-            // Validate every raw element and WDL, before a legal view is attached.
-            output::validate_maia(&raw, &[0]).map_err(|error| {
-                BackendError::new(
-                    K::NumericalFailure,
-                    S::Output,
-                    "nonfinite or inadmissible model output",
-                )
-                .with_output_cause(&error)
-            })?;
-            result.push(raw);
+        let own_started = measured.then(std::time::Instant::now);
+        let result = pack_outputs(
+            policy,
+            wdl,
+            inputs.len(),
+            &mut self.raw_pool,
+            self.config.experiments.reuse_buffers,
+        );
+        if let (Some(timing), Some(started)) = (&mut self.timings, own_started) {
+            timing.own_outputs = started.elapsed();
         }
         if let (Some(start), Some(timing)) = (invocation_end, timings) {
             timing.output = Some((start, Instant::now()));
         }
-        Ok(result)
+        result
     }
+}
+
+fn pack_outputs(
+    policy: &[f32],
+    wdl: &[f32],
+    batch: usize,
+    pool: &mut Vec<RawOutput>,
+    reuse: bool,
+) -> Result<Vec<RawOutput>, BackendError> {
+    if policy.len() != batch * POLICY_SIZE || wdl.len() != batch * 3 {
+        return Err(BackendError::new(
+            K::NumericalFailure,
+            S::Output,
+            "bound head shape differs",
+        ));
+    }
+    let mut result = Vec::with_capacity(batch);
+    for (policy, wdl) in policy.chunks_exact(POLICY_SIZE).zip(wdl.chunks_exact(3)) {
+        let mut raw = if reuse { pool.pop() } else { None }.unwrap_or_else(|| RawOutput {
+            policy_logits: Vec::with_capacity(POLICY_SIZE),
+            wdl: Vec::with_capacity(3),
+        });
+        raw.policy_logits.clear();
+        raw.policy_logits.extend_from_slice(policy);
+        raw.wdl.clear();
+        raw.wdl.extend_from_slice(wdl);
+        output::validate_maia(&raw, &[0]).map_err(|error| {
+            BackendError::new(
+                K::NumericalFailure,
+                S::Output,
+                "nonfinite or inadmissible model output",
+            )
+            .with_output_cause(&error)
+        })?;
+        result.push(raw);
+    }
+    Ok(result)
 }
 
 fn validate_interface(session: &Session) -> Result<(), BackendError> {
@@ -960,4 +1207,34 @@ pub fn verify_cuda_profile(bytes: &[u8]) -> Result<usize, BackendError> {
         return Err(fail());
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod buffer_tests {
+    use super::*;
+    #[test]
+    fn raw_pool_reuses_returned_ownership_without_mutating_retained_outputs() {
+        let policy = vec![0.0; POLICY_SIZE];
+        let wdl = [0.5, 0.3, 0.2];
+        let mut pool = Vec::new();
+        let retained = pack_outputs(&policy, &wdl, 1, &mut pool, true)
+            .unwrap()
+            .remove(0);
+        let returned = pack_outputs(&policy, &wdl, 1, &mut pool, true)
+            .unwrap()
+            .remove(0);
+        let pointer = returned.policy_logits.as_ptr();
+        pool.push(returned);
+        let changed = vec![1.0; POLICY_SIZE];
+        let next = pack_outputs(&changed, &wdl, 1, &mut pool, true)
+            .unwrap()
+            .remove(0);
+        assert_eq!(next.policy_logits.as_ptr(), pointer);
+        assert!(retained.policy_logits.iter().all(|value| *value == 0.0));
+        assert!(next.policy_logits.iter().all(|value| *value == 1.0));
+        let mut invalid = changed;
+        invalid[POLICY_SIZE - 1] = f32::NAN;
+        assert!(pack_outputs(&invalid, &wdl, 1, &mut pool, true).is_err());
+        assert!(pack_outputs(&[], &wdl, 1, &mut pool, true).is_err());
+    }
 }

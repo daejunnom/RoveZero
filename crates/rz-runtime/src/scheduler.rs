@@ -342,6 +342,21 @@ where
         Err(Rejected { request, error })
     }
 
+    /// Use normal admission/ID/resource reservations, then finalize without
+    /// dispatch or an execution ID. The receipt retains its normal reservation.
+    #[cfg(feature = "experimental-raw-cache")]
+    pub fn submit_reused(&mut self, request: A::Request, output: A::Output) -> SubmitResult<A> {
+        let id = self.adapter.request_id(&request);
+        let receiver = self.submit(request)?;
+        let request = Arc::clone(&self.entries.get(&id).expect("new admission").request);
+        let event = match self.adapter.validate_reused_output(&request, &output) {
+            Ok(()) => TerminalEvent::Success(output),
+            Err(error) => TerminalEvent::Failure(error),
+        };
+        self.finish(&id, event);
+        Ok(receiver)
+    }
+
     fn reserve(
         &mut self,
         bytes: Resources,

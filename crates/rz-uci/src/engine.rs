@@ -111,6 +111,14 @@ impl rz_search::contracts::ContractPosition for RulesSearchPosition {
         }
         Ok(())
     }
+    fn retained_bytes(&self) -> Option<usize> {
+        self.state
+            .rules()
+            .snapshot()
+            .retained_history_bytes()?
+            .checked_add(self.state.legal_moves().moves().len().checked_mul(256)?)?
+            .checked_add(4096)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -263,6 +271,8 @@ impl rz_search::contract_time::ContractClock for ProcessClock {
 
 #[derive(Clone, Debug)]
 pub struct SearchAuthority {
+    #[cfg(feature = "experimental-notify")]
+    signal: Option<rz_runtime::CompletionSignal>,
     current: Arc<Mutex<contract::AcceptanceScope>>,
     cancel: contract::CancelToken,
 }
@@ -270,6 +280,8 @@ impl SearchAuthority {
     #[cfg(test)]
     pub(crate) fn isolated(scope: contract::AcceptanceScope) -> Self {
         Self {
+            #[cfg(feature = "experimental-notify")]
+            signal: None,
             current: Arc::new(Mutex::new(scope)),
             cancel: contract::CancelToken::new(),
         }
@@ -287,6 +299,10 @@ impl SearchAuthority {
     }
     pub fn cancel(&self) {
         self.cancel.cancel();
+        #[cfg(feature = "experimental-notify")]
+        if let Some(signal) = &self.signal {
+            signal.notify();
+        }
     }
 }
 
@@ -304,9 +320,27 @@ pub struct EvaluatorProfile {
 /// completion can still be queued. UCI closes shared cancellation on its own
 /// stop/root/deadline/quit or completed-output acceptance boundary.
 pub trait ManagedEvaluator: contract::Evaluator<RulesState> + Send {
+    /// Timer source for work which has not reached a physical worker yet.
+    #[cfg(feature = "experimental-notify")]
+    fn wake_after(&self) -> Option<Duration> {
+        None
+    }
     fn shutdown(&mut self, deadline: Instant) -> Result<(), contract::ContractError>;
 }
 pub trait EvaluatorFactory: Send + Sync + 'static {
+    #[cfg(feature = "experimental-batch")]
+    fn parallelism(&self) -> usize {
+        1
+    }
+
+    #[cfg(feature = "experimental-notify")]
+    fn completion_signal(&self) -> Option<rz_runtime::CompletionSignal> {
+        None
+    }
+
+    fn reset_game(&self) -> Result<(), contract::ContractError> {
+        Ok(())
+    }
     /// Optional metadata journal; no payloads or engine authority are retained.
     fn source_trace(
         &self,
@@ -809,7 +843,11 @@ impl Owner {
                     self.cancel();
                 }
             }
-            Effect::NewGame | Effect::Shutdown => self.cancel(),
+            Effect::NewGame => {
+                self.cancel();
+                self.factory.reset_game()?;
+            }
+            Effect::Shutdown => self.cancel(),
             Effect::Start {
                 ticket, snapshot, ..
             } => {
@@ -854,6 +892,8 @@ impl Owner {
                     )
                 })?;
                 let authority = SearchAuthority {
+                    #[cfg(feature = "experimental-notify")]
+                    signal: self.factory.completion_signal(),
                     current: Arc::clone(&self.scope),
                     cancel: token.clone(),
                 };
@@ -914,11 +954,24 @@ impl Owner {
                                 );
                             }
                         };
+                    #[cfg(feature = "experimental-batch")]
+                    if let Err(error) = search.set_parallelism(factory.parallelism()) {
+                        return finish_worker(
+                            &events,
+                            ticket,
+                            WorkerCompletion::failed(WorkerFailureSource::SearchConstructor(error)),
+                            &worker_publication,
+                            Some(runtime.as_mut()),
+                            shutdown_limit,
+                        );
+                    }
                     search.set_source_trace(factory.source_trace());
                     let mut previous_move = None;
                     let mut authority_error = None;
                     let mut diagnostic_failure = None;
                     while !search.is_finished() {
+                        #[cfg(feature = "experimental-notify")]
+                        let wake_version = authority.signal.as_ref().map(|s| s.version());
                         if control.cancellation.load(Ordering::Acquire) {
                             authority.cancel();
                         }
@@ -968,7 +1021,11 @@ impl Owner {
                             authority.cancel();
                             diagnostic_failure = Some(error);
                         }
-                        let best = search.outcome().best_move;
+                        let best = if cfg!(feature = "experimental-best-move") {
+                            search.best_move()
+                        } else {
+                            search.outcome().best_move
+                        };
                         if best != previous_move {
                             previous_move = best;
                             if let Some(bestmove) =
@@ -981,6 +1038,30 @@ impl Owner {
                             }
                         }
                         if matches!(event, rz_search::contracts::ContractPumpEvent::Waiting) {
+                            #[cfg(feature = "experimental-notify")]
+                            if let (Some(signal), Some(observed)) =
+                                (&authority.signal, wake_version)
+                            {
+                                // Owner blocking only: backend poll remains cooperative.
+                                // Hard deadline bounds waits even without a completion.
+                                if !authority.cancel_token().is_canceled() {
+                                    signal.wait_changed(
+                                        observed,
+                                        control
+                                            .deadline
+                                            .saturating_duration_since(Instant::now())
+                                            .min(
+                                                runtime
+                                                    .wake_after()
+                                                    .unwrap_or(Duration::from_secs(1)),
+                                            ),
+                                    );
+                                }
+                            } else {
+                                // Scripted/mock clocks have no asynchronous completion source.
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            #[cfg(not(feature = "experimental-notify"))]
                             thread::sleep(Duration::from_millis(1));
                         }
                     }

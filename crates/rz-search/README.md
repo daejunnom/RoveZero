@@ -117,3 +117,10 @@ fixture는 작은 인공 트리이며 표준 체스 perft·실제 신경망 수�
 실제 A/C/D adapter의 CPU/mock 연결은 `rz-uci`의 engine binary에서 검사한다.
 workspace 통합 CI와 목표 GPU·paired 대국의 실제 상태는
 [통합 인수 기록](../../docs/INTEGRATION-STATUS.md)을 따른다.
+
+`experimental-batch`(OPT-12, **S 실험**)의 `ContractSearch::set_parallelism(1..=16)`는
+첫 selection 전에만 설정할 수 있습니다. 기본은 1입니다. pending leaf 중복 확장을
+막고 virtual visit/loss를 selection에만 적용하며 실제 edge 통계는 승인된 backup만
+변경합니다. 역순 완료도 RequestId/context별로 소비하고 종료·오류·취소에서 모든
+논리 예약을 반환합니다. runtime과 backend의 배치 지원·동시 pending 상한도 같은
+설정으로 맞춰야 합니다. 다중 요청 결과는 단일 요청 탐색과 같다고 가정하지 않습니다.

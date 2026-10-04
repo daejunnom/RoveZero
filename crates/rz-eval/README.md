@@ -246,3 +246,49 @@ identity와 검증된 native 출처를 함께 대조한다. B의 CPU V1 영수�
 포함 third-party notices를 따른다. 선정 원본/ONNX는 upstream GPL-3.0 외부 자산이다.
 LC0 GPL 구현·테이블·protobuf 생성 코드를 제품에 복사·링크하지 않는다. 변환 산출물의
 RIGHTS.txt는 provenance 메모이며 재배포 source/notice 의무 충족 확인을 대신하지 않는다.
+# OPT-01 projection 실험
+
+`experimental-bitboards`는 Rules가 유지하는 읽기 전용 12개 bitboard를 사용한다.
+`experimental-history-frames`는 최근 8개 frame의 반복 정보를 전체 known prefix의
+borrowed 단일 순회에서 구한다. 두 옵션은 기본 off이며 독립 활성화할 수 있다.
+원래 square 재구성/owned-history 경로를 대조군으로 유지한다. 이력을 절단하거나
+unknown-prefix·raw EP·history fill 의미를 변경하지 않는다.
+
+`experimental-raw-cache`(OPT-06)는 실제 Classical 입력의 모든 f32 bit와
+metadata, 모델·encoding·backend·precision·compute·epoch·game을 대조합니다.
+`ClassicalProjection::configure_raw_cache`로 유한한 항목/바이트 상한을 지정하며
+기본 runtime 설정은 비활성입니다. D 최종 승인 후에만 전체 raw policy/WDL을
+재사용 후보로 승격합니다. hit도 새 요청을 정상 admission/완료 검증하며 새
+ExecutionId를 만들지 않습니다. CPU mock/native factory의 typed 설정으로 연결하고
+ucinewgame에서 초기화합니다. native typed report는 raw-hit와 Computed 집계를
+분리하며 기존 Computed-only V1 attestation으로 raw-hit 실행을 게시하지 않습니다.
+
+OPT-09~11은 `experimental-io-buffers`, `experimental-io-binding`,
+`experimental-cuda-graph`를 각각 compile한 뒤 `BackendConfig.experiments`에서
+명시적으로 선택합니다. native UCI의 같은 이름 `--experimental-*` 플래그로
+실제 worker에 연결하며 기본 설정은 모두 off입니다. Graph는 CUDA B1 + binding을
+필수로 하고, 고정 device input/output 주소를 유지합니다. host→device와
+device→host는 ORT synchronous Identity copy이며 추가 세션 비용도 계측 대상입니다.
+Run/전송/fence 오류에서 CUDA completion이 불확실하면 binding·input·session을
+격리 보존합니다. `binding_runs()`는 성공한 synchronous 호출 수이지 실제 GPU
+capture/replay의 관측 증거가 아닙니다. ORT buffer 실제 재사용·GPU 수치·capture/replay·
+지연/VRAM은 장비 검증 항목이며 CPU 계약 테스트로 통과 처리하지 않습니다.
+
+외부 자산을 사용하는 기존 `maia_check` 수치 대조 명령 끝에도 위 세 실행 옵션을
+명시할 수 있습니다. 각 옵션의 Cargo feature를 먼저 켜며 중복·미지원 옵션은
+거부합니다. Graph는 `cuda`와 `--experimental-io-binding`을 요구하고 batch 1만
+실행합니다. 제외한 2/4/8/16은 보고서에 남깁니다. 실험 설정은 32회 B1 반복 대조,
+소유 출력 불변성, `last_io_timings()`의 host staging·전송·Run·output fence·출력
+소유화 구간을 `experimental_checks`에 기록합니다. 시계는 CPU wall clock이고 Run에
+kernel·동기화가 포함됩니다. 성공 호출 수로 capture/replay를 확인했다고 주장하지
+않습니다. GPU capture/replay·peak VRAM·quarantine 및 정식 성능 인수는 별도입니다.
+
+OPT-12의 `experimental-batch`는 explicit `NativeWorkerOwner::from_worker_batched`
+또는 `from_onnx_batched`/`from_cuda_onnx_batched`와 연결합니다. 한 물리 worker의
+실제 PreparedBatch(최대 16개), 공유 ExecutionId, 각 요청의 독립 policy/WDL 변환을
+사용합니다. 배치 일부 논리 취소는 나머지 요청을 물리 종료 전 해제하지 않습니다.
+native UCI는 `--experimental-batch=N`로 B/D/C의 폭을 함께 설정하고 최대 batch
+대기 200µs를 자체 시간에 포함합니다. Graph의 고정 B1 및 기존 V1 attestation과
+동시에 켤 수 없습니다. mixed-legal 배치는 C의 전체 raw heads 지원을 전제로만
+D에서 명시적으로 활성화합니다. 물리 ID ledger는 root당 최대 1024개로 제한하며
+서로 다른 legal 수 때문에 dispatch 순서가 달라도 중복 ID를 거절합니다.

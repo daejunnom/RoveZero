@@ -20,6 +20,12 @@ protobuf·tensor 구조에 종속되지 않는다. 제품 핵심 규칙·검색�
 항목이다. R0에서 기존 LC0를 실행할 때는 해당 LC0의 실제 계약을 기록한다. 이
 문서의 새 모델 필드로 기준 LC0를 개조하거나 출력 방향을 임의 변경하지 않는다.
 
+PR #18의 OPT-01~12에서는 사용자 배정에 따라 A가 전체 소비 경계를 구현했다.
+공통 `rz-contracts` revision 0.1과 byte codec은 유지하며 raw-hit의 fresh receipt,
+완료 신호·batch timer, bounded 상태/평가 cache, 실행 모드·physical lease의 실제
+API 영향과 소비자 검사는 [적용 지시서 9장](CONTRACT-ADOPTION.md#9-pr-18-전체-최적화의-실제-소비-접점)에 기록한다.
+실험 구현이 기본 활성화나 실제 GPU·강도 인수를 뜻하지 않는다.
+
 ## 0. 최소 공통 계약의 소유자와 게시 순서
 
 **최소 공통 계약과 `crates/rz-contracts`의 논리 소유자는 총괄로 배정된 에이전트다.** 이 문서의

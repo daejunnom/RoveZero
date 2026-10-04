@@ -70,6 +70,9 @@ fn error(code: ErrorCode, stage: Stage, detail: &'static str) -> ContractError {
 /// Private local paths are never rendered by Debug, Display, or parser errors.
 #[derive(Clone)]
 pub struct NativeConfig {
+    execution_experiments: rz_eval::onnx::ExecutionExperiments,
+    raw_cache: bool,
+    parallelism: usize,
     source_weights: PathBuf,
     onnx_model: PathBuf,
     export_manifest: PathBuf,
@@ -89,6 +92,14 @@ impl fmt::Debug for NativeConfig {
             .field("manifest_sha256", &self.manifest_sha256)
             .field("ort_sha256", &self.ort_sha256)
             .field("provider", &self.provider)
+            .field(
+                "experiments",
+                &(u8::from(self.execution_experiments.reuse_buffers)
+                    | (u8::from(self.execution_experiments.io_binding) << 1)
+                    | (u8::from(self.execution_experiments.cuda_graph) << 2)
+                    | (u8::from(self.raw_cache) << 3)),
+            )
+            .field("batch", &self.parallelism)
             .field("cuda_bundle_sha256", &self.cuda_bundle_sha256)
             .field("cuda_bundle_selected", &self.cuda_bundle.is_some())
             .finish_non_exhaustive()
@@ -98,6 +109,9 @@ impl NativeConfig {
     pub fn parse(
         arguments: impl IntoIterator<Item = String>,
     ) -> Result<Self, NativeBootstrapError> {
+        let mut execution_experiments = rz_eval::onnx::ExecutionExperiments::default();
+        let mut raw_cache = false;
+        let mut parallelism = None;
         let mut provider = None;
         let mut source_weights = None;
         let mut onnx_model = None;
@@ -111,6 +125,21 @@ impl NativeConfig {
         let mut cuda_bundle = None;
         let mut cuda_bundle_sha256 = None;
         for argument in arguments {
+            let experiment = match argument.as_str() {
+                "--experimental-io-buffers" => Some(&mut execution_experiments.reuse_buffers),
+                "--experimental-io-binding" => Some(&mut execution_experiments.io_binding),
+                "--experimental-cuda-graph" => Some(&mut execution_experiments.cuda_graph),
+                "--experimental-raw-cache" => Some(&mut raw_cache),
+                _ => None,
+            };
+            if let Some(enabled) = experiment {
+                if std::mem::replace(enabled, true) {
+                    return Err(NativeBootstrapError::Config(
+                        "duplicate execution experiment",
+                    ));
+                }
+                continue;
+            }
             if argument == "--profile" {
                 if std::mem::replace(&mut profiling, true) {
                     return Err(NativeBootstrapError::Config(
@@ -146,6 +175,16 @@ impl NativeConfig {
                     "native CPU arguments require named asset/hash values",
                 ))?;
             match name {
+                "--experimental-batch" => {
+                    if parallelism.is_some() {
+                        return Err(NativeBootstrapError::Config("duplicate batch width"));
+                    }
+                    parallelism = Some(
+                        value
+                            .parse::<usize>()
+                            .map_err(|_| NativeBootstrapError::Config("invalid batch width"))?,
+                    );
+                }
                 "--source-weights" => set_path(&mut source_weights, value)?,
                 "--onnx-model" => set_path(&mut onnx_model, value)?,
                 "--export-manifest" => set_path(&mut export_manifest, value)?,
@@ -178,12 +217,50 @@ impl NativeConfig {
             }
             _ => {}
         }
+        let parallelism = parallelism.unwrap_or(1);
+        // D02 v1 records one fresh execution per accepted request. Raw hits,
+        // batching and experimental I/O need distinct provenance/timing schemas.
+        if profiling
+            && (raw_cache
+                || parallelism != 1
+                || execution_experiments != rz_eval::onnx::ExecutionExperiments::default())
+        {
+            return Err(NativeBootstrapError::Config(
+                "native source profile v1 requires default B1 execution without raw cache",
+            ));
+        }
+        if !(1..=16).contains(&parallelism)
+            || (parallelism > 1 && !cfg!(feature = "experimental-batch"))
+            || (parallelism > 1 && (attestation || execution_experiments.cuda_graph))
+        {
+            return Err(NativeBootstrapError::Config(
+                "experimental batch requires compiled width 1..=16 and excludes CUDA Graph/B1 attestation",
+            ));
+        }
+        if (execution_experiments.reuse_buffers && !cfg!(feature = "experimental-io-buffers"))
+            || (execution_experiments.io_binding && !cfg!(feature = "experimental-io-binding"))
+            || (execution_experiments.cuda_graph
+                && (!cfg!(feature = "experimental-cuda-graph")
+                    || !execution_experiments.io_binding
+                    || provider != NativeProvider::Cuda))
+            || (raw_cache && !cfg!(feature = "experimental-raw-cache"))
+            || (attestation
+                && (raw_cache
+                    || execution_experiments != rz_eval::onnx::ExecutionExperiments::default()))
+        {
+            return Err(NativeBootstrapError::Config(
+                "unsupported experiment or Computed-only V1 attestation requested for experimental execution",
+            ));
+        }
         let missing = || {
             NativeBootstrapError::Config(
                 "native CPU requires all asset, manifest, runtime hash and private output-root arguments",
             )
         };
         Ok(Self {
+            execution_experiments,
+            raw_cache,
+            parallelism,
             source_weights: source_weights.ok_or_else(missing)?,
             onnx_model: onnx_model.ok_or_else(missing)?,
             export_manifest: export_manifest.ok_or_else(missing)?,
@@ -318,6 +395,13 @@ pub struct NativeRunReport {
     pub origin: NativeWorkerOrigin,
     /// Completed results accepted by D, not total physical native invocations.
     pub completed_by_runtime: u64,
+    /// Experimental raw reuse is separate from physical Computed evidence.
+    #[cfg(feature = "experimental-raw-cache")]
+    pub raw_cache_completions: NativeSearchAggregate,
+    #[cfg(feature = "experimental-raw-cache")]
+    pub raw_cache_root_initializations: NativeSearchAggregate,
+    #[cfg(feature = "experimental-raw-cache")]
+    pub raw_cache_non_root_backups: NativeSearchAggregate,
     pub first_completed: Option<NativeCompletedReceipt>,
     pub last_completed: Option<NativeCompletedReceipt>,
     /// Metadata observed only after B's unchanged final tree guard committed.
@@ -347,6 +431,44 @@ pub struct NativeSearchAggregate {
     pub first: Option<NativeSearchConsumedReceipt>,
     pub last: Option<NativeSearchConsumedReceipt>,
 }
+#[cfg(feature = "experimental-raw-cache")]
+fn valid_raw_hit(
+    context: CompletionContext,
+    actual: ActualCompute,
+    report: &NativeRunReport,
+) -> bool {
+    actual.precision == PrecisionProfile::Fp32
+        && actual.steps == 1
+        && actual.full
+        && actual.backend == report.backend
+        && actual.execution.is_none()
+        && context.execution.is_none()
+        && context.request.backend == report.backend
+        && context.request.model.manifest == report.model_manifest
+        && matches!(actual.provenance, CacheProvenance::RawEvalHit { source_execution: Some(source) } if source.epoch == context.request.request.epoch)
+}
+#[cfg(feature = "experimental-raw-cache")]
+fn record_raw_receipt(
+    aggregate: &mut NativeSearchAggregate,
+    context: CompletionContext,
+    actual: ActualCompute,
+    traversed_edges: usize,
+) -> Result<(), ContractError> {
+    let receipt = NativeSearchConsumedReceipt {
+        completed: NativeCompletedReceipt { context, actual },
+        traversed_edges,
+    };
+    aggregate.first.get_or_insert(receipt);
+    aggregate.last = Some(receipt);
+    aggregate.count = aggregate.count.checked_add(1).ok_or_else(|| {
+        error(
+            ErrorCode::ResourceExhausted,
+            Stage::Output,
+            "native raw-cache receipt count exhausted",
+        )
+    })?;
+    Ok(())
+}
 #[derive(Debug, Default)]
 pub struct NativeObservationReport {
     pub scheduler_events: u64,
@@ -374,6 +496,12 @@ impl NativeRunReport {
             backend: profile.backend,
             origin,
             completed_by_runtime: 0,
+            #[cfg(feature = "experimental-raw-cache")]
+            raw_cache_completions: NativeSearchAggregate::default(),
+            #[cfg(feature = "experimental-raw-cache")]
+            raw_cache_root_initializations: NativeSearchAggregate::default(),
+            #[cfg(feature = "experimental-raw-cache")]
+            raw_cache_non_root_backups: NativeSearchAggregate::default(),
             first_completed: None,
             last_completed: None,
             search_root_initializations: NativeSearchAggregate::default(),
@@ -524,6 +652,15 @@ impl NativeEvidenceHandle {
         }
         let context = evaluation.context;
         let actual = evaluation.actual;
+        #[cfg(feature = "experimental-raw-cache")]
+        if valid_raw_hit(context, actual, report) {
+            let aggregate = if traversed_edges == 0 {
+                &mut report.raw_cache_root_initializations
+            } else {
+                &mut report.raw_cache_non_root_backups
+            };
+            return record_raw_receipt(aggregate, context, actual, traversed_edges);
+        }
         if actual.precision != PrecisionProfile::Fp32
             || actual.steps != 1
             || !actual.full
@@ -671,6 +808,21 @@ impl NativeEvidenceHandle {
             NativeWorkerOrigin::CpuOnnx | NativeWorkerOrigin::CudaOnnx
         ) {
             return Ok(());
+        }
+        #[cfg(feature = "experimental-raw-cache")]
+        {
+            let context = CompletionContext {
+                request: output.context,
+                execution: output.actual.execution,
+            };
+            if valid_raw_hit(context, output.actual, report) {
+                return record_raw_receipt(
+                    &mut report.raw_cache_completions,
+                    context,
+                    output.actual,
+                    0,
+                );
+            }
         }
         if output.actual.precision != PrecisionProfile::Fp32
             || output.actual.steps != 1
@@ -861,8 +1013,30 @@ impl NativeSessionFactory {
             ));
         }
         let (asset, runtime, backend, projection) = Self::load_parts(owners, config)?;
-        let loaded_profile =
-            CpuProfileV1::from_loaded(&asset, &runtime, &backend, projection.model())?;
+        let loaded_profile = if config.parallelism == 1
+            && config.execution_experiments == rz_eval::onnx::ExecutionExperiments::default()
+        {
+            Some(CpuProfileV1::from_loaded(
+                &asset,
+                &runtime,
+                &backend,
+                projection.model(),
+            )?)
+        } else {
+            None
+        };
+        #[cfg(feature = "experimental-batch")]
+        let owner = if config.parallelism > 1 {
+            NativeWorkerOwner::from_onnx_batched(backend, projection, NATIVE_DIAGNOSTIC_CAPACITY)?
+        } else {
+            NativeWorkerOwner::from_onnx_profiled(
+                backend,
+                projection,
+                NATIVE_DIAGNOSTIC_CAPACITY,
+                config.source_journal()?,
+            )?
+        };
+        #[cfg(not(feature = "experimental-batch"))]
         let owner = NativeWorkerOwner::from_onnx_profiled(
             backend,
             projection,
@@ -870,7 +1044,7 @@ impl NativeSessionFactory {
             config.source_journal()?,
         )?;
         let mut factory = Self::from_owner(owner, Some(runtime))?;
-        factory.loaded_profile = Some(loaded_profile);
+        factory.loaded_profile = loaded_profile;
         Ok(factory)
     }
     fn load_parts(
@@ -898,9 +1072,10 @@ impl NativeSessionFactory {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         let mut backend_config = BackendConfig::cpu();
-        backend_config.max_batch = 1;
+        backend_config.experiments = config.execution_experiments;
+        backend_config.max_batch = config.parallelism;
         backend_config.intra_threads = 1;
-        backend_config.host_io_bytes = IO_BYTES_PER_ITEM;
+        backend_config.host_io_bytes = config.parallelism * IO_BYTES_PER_ITEM;
         let pin = match config.provider {
             NativeProvider::Cpu => {
                 RuntimeLibraryPin::copy_verified(&config.ort_library, &output_root, &expected_ort)?
@@ -992,6 +1167,10 @@ impl NativeSessionFactory {
         };
         let projection =
             ClassicalProjection::new(MaiaBinding::for_backend(&backend, model, encoding, fill)?);
+        #[cfg(feature = "experimental-raw-cache")]
+        if config.raw_cache {
+            projection.configure_raw_cache(rz_eval::raw_cache::RawCacheLimits::default())?;
+        }
         Ok((asset, runtime, backend, projection))
     }
     #[cfg(feature = "onnx-cuda")]
@@ -1010,17 +1189,39 @@ impl NativeSessionFactory {
             ));
         }
         let (asset, runtime, backend, projection) = Self::load_parts(owners, config)?;
-        let loaded_profile = CudaProfileV1::from_loaded(
-            &asset,
-            &runtime,
-            &backend,
-            projection.model(),
-            config
-                .cuda_bundle_sha256
-                .ok_or(NativeBootstrapError::Config(
-                    "CUDA bundle file SHA256 is absent",
-                ))?,
-        )?;
+        let loaded_profile = if config.parallelism == 1
+            && config.execution_experiments == rz_eval::onnx::ExecutionExperiments::default()
+        {
+            Some(CudaProfileV1::from_loaded(
+                &asset,
+                &runtime,
+                &backend,
+                projection.model(),
+                config
+                    .cuda_bundle_sha256
+                    .ok_or(NativeBootstrapError::Config(
+                        "CUDA bundle file SHA256 is absent",
+                    ))?,
+            )?)
+        } else {
+            None
+        };
+        #[cfg(feature = "experimental-batch")]
+        let owner = if config.parallelism > 1 {
+            NativeWorkerOwner::from_cuda_onnx_batched(
+                backend,
+                projection,
+                NATIVE_DIAGNOSTIC_CAPACITY,
+            )?
+        } else {
+            NativeWorkerOwner::from_cuda_onnx_profiled(
+                backend,
+                projection,
+                NATIVE_DIAGNOSTIC_CAPACITY,
+                config.source_journal()?,
+            )?
+        };
+        #[cfg(not(feature = "experimental-batch"))]
         let owner = NativeWorkerOwner::from_cuda_onnx_profiled(
             backend,
             projection,
@@ -1028,7 +1229,7 @@ impl NativeSessionFactory {
             config.source_journal()?,
         )?;
         let mut factory = Self::from_owner(owner, Some(runtime))?;
-        factory.loaded_cuda_profile = Some(loaded_profile);
+        factory.loaded_cuda_profile = loaded_profile;
         Ok(factory)
     }
     fn from_owner(
@@ -1188,6 +1389,13 @@ pub struct NativeCpuFactory {
     inner: NativeSessionFactory,
 }
 impl NativeCpuFactory {
+    #[cfg(feature = "experimental-raw-cache")]
+    pub fn configure_raw_cache(
+        &self,
+        limits: rz_eval::raw_cache::RawCacheLimits,
+    ) -> Result<(), ContractError> {
+        self.inner.owner.projection().configure_raw_cache(limits)
+    }
     pub fn load(
         owners: &OwnerRegistry,
         config: &NativeConfig,
@@ -1232,6 +1440,13 @@ pub struct NativeCudaFactory {
 }
 #[cfg(feature = "onnx-cuda")]
 impl NativeCudaFactory {
+    #[cfg(feature = "experimental-raw-cache")]
+    pub fn configure_raw_cache(
+        &self,
+        limits: rz_eval::raw_cache::RawCacheLimits,
+    ) -> Result<(), ContractError> {
+        self.inner.owner.projection().configure_raw_cache(limits)
+    }
     pub fn load(
         owners: &OwnerRegistry,
         config: &NativeConfig,
@@ -1336,6 +1551,21 @@ impl ContractClock for RuntimeClock {
     }
 }
 impl EvaluatorFactory for NativeSessionFactory {
+    #[cfg(feature = "experimental-batch")]
+    fn parallelism(&self) -> usize {
+        self.owner.max_batch()
+    }
+
+    #[cfg(feature = "experimental-notify")]
+    fn completion_signal(&self) -> Option<rz_runtime::CompletionSignal> {
+        Some(self.owner.completion_signal())
+    }
+
+    fn reset_game(&self) -> Result<(), ContractError> {
+        #[cfg(feature = "experimental-raw-cache")]
+        self.owner.projection().clear_raw_cache()?;
+        Ok(())
+    }
     fn source_trace(&self) -> Option<SourceJournal<CompletionContext>> {
         self.owner.source_trace().cloned()
     }
@@ -1371,27 +1601,39 @@ impl EvaluatorFactory for NativeSessionFactory {
         let adapter = ContractsAdapter::with_execution_high_water(
             scope.clone(),
             runtime_clock.clone(),
-            1,
+            self.owner.max_batch(),
             high_water,
         )?;
+        #[cfg(feature = "experimental-batch")]
+        let adapter = if self.owner.max_batch() > 1 {
+            adapter.with_mixed_legal_batching()
+        } else {
+            adapter
+        };
         let backend = NativeRuntimeBackend::new(self.owner.clone(), runtime_clock)?;
         let evaluator = ContractEvaluator::new(
             adapter,
             backend,
             Limits {
-                max_requests: 1,
-                max_batch_items: 1,
+                max_requests: self.owner.max_batch(),
+                max_batch_items: self.owner.max_batch(),
                 max_executions: 1,
-                max_batch_wait: Duration::ZERO,
+                max_batch_wait: if self.owner.max_batch() > 1 {
+                    Duration::from_micros(200)
+                } else {
+                    Duration::ZERO
+                },
                 max_queue_age: Duration::from_secs(30),
                 deadline_reserve: Duration::ZERO,
                 memory: Resources {
-                    host_bytes: HOST_BYTES_PER_ITEM + NATIVE_RUNTIME_OVERHEAD_BYTES,
+                    host_bytes: self.owner.max_batch() as u64
+                        * (HOST_BYTES_PER_ITEM + NATIVE_RUNTIME_OVERHEAD_BYTES),
                     device_bytes: self
                         .owner
                         .admission_policy()
                         .execution_resources()
-                        .device_bytes,
+                        .device_bytes
+                        .saturating_mul(self.owner.max_batch() as u64),
                     pinned_bytes: self
                         .owner
                         .admission_policy()
@@ -1401,6 +1643,22 @@ impl EvaluatorFactory for NativeSessionFactory {
             },
             256,
         )?;
+        #[cfg(feature = "experimental-raw-cache")]
+        let evaluator = {
+            let mut evaluator = evaluator;
+            evaluator.set_raw_reuse(Box::new(self.owner.projection().raw_cache_provider()));
+            evaluator
+        };
+        let mut other_pending = std::collections::VecDeque::new();
+        other_pending
+            .try_reserve(self.owner.max_batch().saturating_sub(1))
+            .map_err(|_| {
+                error(
+                    ErrorCode::ResourceExhausted,
+                    Stage::Admission,
+                    "native pending context allocation failed",
+                )
+            })?;
         Ok(Box::new(NativeRuntime {
             evaluator,
             scope,
@@ -1410,6 +1668,7 @@ impl EvaluatorFactory for NativeSessionFactory {
             evidence: self.evidence.clone(),
             submissions: 0,
             pending: None,
+            other_pending,
             observation_error: None,
         }))
     }
@@ -1418,6 +1677,19 @@ impl EvaluatorFactory for NativeSessionFactory {
 macro_rules! delegate_native_factory {
     ($factory:ty) => {
         impl EvaluatorFactory for $factory {
+            #[cfg(feature = "experimental-batch")]
+            fn parallelism(&self) -> usize {
+                self.inner.parallelism()
+            }
+
+            #[cfg(feature = "experimental-notify")]
+            fn completion_signal(&self) -> Option<rz_runtime::CompletionSignal> {
+                self.inner.completion_signal()
+            }
+
+            fn reset_game(&self) -> Result<(), ContractError> {
+                self.inner.reset_game()
+            }
             fn source_trace(&self) -> Option<SourceJournal<CompletionContext>> {
                 self.inner.source_trace()
             }
@@ -1462,9 +1734,17 @@ struct NativeRuntime {
     evidence: NativeEvidenceHandle,
     submissions: u64,
     pending: Option<EvalContext>,
+    other_pending: std::collections::VecDeque<EvalContext>,
     observation_error: Option<ContractError>,
 }
 impl NativeRuntime {
+    fn remove_pending(&mut self, context: EvalContext) {
+        if self.pending == Some(context) {
+            self.pending = self.other_pending.pop_front();
+        } else if let Some(index) = self.other_pending.iter().position(|c| *c == context) {
+            self.other_pending.remove(index);
+        }
+    }
     fn collect_observations(&mut self, drain_discarded: u64) -> Result<(), ContractError> {
         let scheduler = self.evaluator.take_observations();
         let delivery = self.evaluator.take_delivery_observations();
@@ -1637,8 +1917,21 @@ impl Evaluator<RulesState> for NativeRuntime {
             ));
         }
         self.submissions += 1;
-        self.pending = Some(request.context());
+        if usize::from(self.pending.is_some()) + self.other_pending.len() >= self.owner.max_batch()
+        {
+            return Err(error(
+                ErrorCode::ResourceExhausted,
+                Stage::Admission,
+                "native pending limit reached",
+            ));
+        }
+        let context = request.context();
         let result = self.evaluator.submit(request);
+        if result.is_ok() {
+            if let Some(previous) = self.pending.replace(context) {
+                self.other_pending.push_back(previous);
+            }
+        }
         if let Err(error) = self.collect_observations(0) {
             self.observation_error.get_or_insert(error);
             let _ = self.owner.try_close_admission(error);
@@ -1653,7 +1946,10 @@ impl Evaluator<RulesState> for NativeRuntime {
     }
     fn poll(&mut self) -> Option<EvalResult> {
         if let Some(error) = self.observation_error
-            && let Some(request) = self.pending.take()
+            && let Some(request) = self
+                .pending
+                .take()
+                .or_else(|| self.other_pending.pop_front())
         {
             return Some(EvalResult::Failed(EvalFailure {
                 context: CompletionContext {
@@ -1666,16 +1962,20 @@ impl Evaluator<RulesState> for NativeRuntime {
         }
         if let Err(error) = self.refresh() {
             self.authority.cancel();
-            return self.pending.take().map(|request| {
-                EvalResult::Failed(EvalFailure {
-                    context: CompletionContext {
-                        request,
-                        execution: None,
-                    },
-                    error,
-                    recovery: RecoveryOutcome::NotAttempted,
-                })
-            });
+            return self
+                .pending
+                .take()
+                .or_else(|| self.other_pending.pop_front())
+                .map(|request| {
+                    EvalResult::Failed(EvalFailure {
+                        context: CompletionContext {
+                            request,
+                            execution: None,
+                        },
+                        error,
+                        recovery: RecoveryOutcome::NotAttempted,
+                    })
+                });
         }
         let result = self.evaluator.poll();
         let collection = self.evidence.collect(&self.owner);
@@ -1686,7 +1986,7 @@ impl Evaluator<RulesState> for NativeRuntime {
         if let Some(EvalResult::Completed(output)) = &result
             && let Err(error) = self.evidence.record_completed(output)
         {
-            self.pending = None;
+            self.remove_pending(output.context);
             return Some(EvalResult::Failed(EvalFailure {
                 context: CompletionContext {
                     request: output.context,
@@ -1696,21 +1996,32 @@ impl Evaluator<RulesState> for NativeRuntime {
                 recovery: RecoveryOutcome::Failed,
             }));
         }
-        if result.is_some() {
-            self.pending = None;
-            return result;
+        if let Some(result) = result {
+            let context = match &result {
+                EvalResult::Completed(output) => output.context,
+                EvalResult::Canceled(c) | EvalResult::Expired(c) | EvalResult::Stale(c) => {
+                    c.request
+                }
+                EvalResult::Failed(f) => f.context.request,
+            };
+            self.remove_pending(context);
+            return Some(result);
         }
         if let Err(error) = collection {
-            return self.pending.take().map(|request| {
-                EvalResult::Failed(EvalFailure {
-                    context: CompletionContext {
-                        request,
-                        execution: None,
-                    },
-                    error,
-                    recovery: RecoveryOutcome::NotAttempted,
-                })
-            });
+            return self
+                .pending
+                .take()
+                .or_else(|| self.other_pending.pop_front())
+                .map(|request| {
+                    EvalResult::Failed(EvalFailure {
+                        context: CompletionContext {
+                            request,
+                            execution: None,
+                        },
+                        error,
+                        recovery: RecoveryOutcome::NotAttempted,
+                    })
+                });
         }
         None
     }
@@ -1719,6 +2030,13 @@ impl Evaluator<RulesState> for NativeRuntime {
     }
 }
 impl ManagedEvaluator for NativeRuntime {
+    #[cfg(feature = "experimental-notify")]
+    fn wake_after(&self) -> Option<Duration> {
+        let state = self.evaluator.state();
+        // Queued batch wait must expire even when no worker can notify yet.
+        // During physical work, its completion signal owns the wakeup.
+        (state.queued > 0 && state.executions == 0).then_some(Duration::from_micros(200))
+    }
     fn shutdown(&mut self, until: Instant) -> Result<(), ContractError> {
         let drained = self.drain(until);
         let collected = self.evidence.collect(&self.owner);
@@ -2190,6 +2508,75 @@ mod physical_owner_tests {
             encoding: context.encoding,
             backend: context.backend,
         })
+    }
+
+    #[cfg(all(feature = "experimental-batch", feature = "experimental-notify"))]
+    #[test]
+    fn queued_native_batch_timer_reaches_worker_without_an_initial_completion_signal() {
+        let owners = Arc::new(OwnerRegistry::default());
+        let original = projection(&owners);
+        let projection = ClassicalProjection::new(
+            MaiaBinding::new(
+                original.model().handle(),
+                original.model().encoding().handle,
+                HistoryFill::No,
+                original.backend(),
+                4,
+            )
+            .unwrap(),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let worker = SingleWorker::spawn(move |batch: &PreparedBatch<RulesState>| {
+            observed_calls.fetch_add(1, Ordering::AcqRel);
+            batch
+                .requests()
+                .iter()
+                .map(|request| request.physical_output(&raw(), batch.execution()))
+                .collect()
+        })
+        .unwrap();
+        let owner = NativeWorkerOwner::from_worker_batched(
+            worker,
+            projection,
+            4,
+            rz_eval::native_runtime_bridge::NativeAdmissionPolicy::Cpu,
+            4,
+        )
+        .unwrap();
+        let factory = NativeCpuFactory::from_owner(owner, None).unwrap();
+        let signal = factory.completion_signal().unwrap();
+        let clock = ProcessClock::new(ProcessEpoch(305));
+        let request = request(&factory, &owners, &clock, 1);
+        let context = request.context();
+        let mut runtime = factory.create(clock, authority(context)).unwrap();
+        runtime.submit(request).unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert_eq!(runtime.wake_after(), Some(Duration::from_micros(200)));
+        let until = Instant::now() + WAIT;
+        let result = loop {
+            // Use the same predicate/sequence/timer order as the UCI owner.
+            let observed = signal.version();
+            if let Some(result) = runtime.poll() {
+                break result;
+            }
+            assert!(Instant::now() < until, "bounded native batch wakeup");
+            signal.wait_changed(
+                observed,
+                runtime
+                    .wake_after()
+                    .unwrap_or(WAIT)
+                    .min(until.saturating_duration_since(Instant::now())),
+            );
+        };
+        let EvalResult::Completed(output) = result else {
+            panic!("queued batch must complete after its timer and worker signal");
+        };
+        assert_eq!(output.context, context);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(runtime.wake_after(), None);
+        runtime.shutdown(Instant::now() + WAIT).unwrap();
+        factory.finish(Ok(())).unwrap();
     }
 
     #[test]

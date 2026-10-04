@@ -764,3 +764,126 @@ fn process_shutdown_keeps_original_backend_drop_panic_beside_common_error() {
     // Process-level failure has no invented physical request/context receipt.
     assert!(owner.take_diagnostics().unwrap().entries.is_empty());
 }
+
+#[cfg(feature = "experimental-batch")]
+#[test]
+fn real_batch_has_one_execution_and_partial_cancel_retains_physical_reservations() {
+    let original = projection();
+    let projection = ClassicalProjection::new(
+        MaiaBinding::new(
+            original.model().handle(),
+            original.model().encoding().handle,
+            HistoryFill::No,
+            original.backend(),
+            4,
+        )
+        .unwrap(),
+    );
+    let mut position = Position::startpos();
+    position.apply_uci_moves(&["e2e4", "e7e5"]).unwrap();
+    let live = ContractPosition::new(OwnerId(999), position);
+    let state = live.export().unwrap();
+    let base = request(&projection, 1, 100);
+    let mut first_context = base.context();
+    first_context.root = RootGeneration(1);
+    let first = Arc::new(
+        EvalRequest::try_new(
+            first_context,
+            base.position().clone(),
+            base.legal().clone(),
+            Arc::clone(base.model()),
+            base.deadline(),
+            CancelToken::new(),
+            base.byte_budget(),
+        )
+        .unwrap(),
+    );
+    let mut second_context = first_context;
+    second_context.request = RequestId::new(EPOCH, 2);
+    second_context.selection = SelectionId::new(EPOCH, 2);
+    second_context.state = state.snapshot().identity();
+    second_context.legal_order = state.legal_moves().order();
+    second_context.input = projection
+        .input_key(state.rules(), state.legal_moves().moves())
+        .unwrap();
+    let second = Arc::new(
+        EvalRequest::try_new(
+            second_context,
+            state.snapshot().clone(),
+            state.legal_moves().clone(),
+            Arc::clone(base.model()),
+            base.deadline(),
+            CancelToken::new(),
+            base.byte_budget(),
+        )
+        .unwrap(),
+    );
+    assert_ne!(first.legal().moves().len(), second.legal().moves().len());
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let worker = SingleWorker::spawn(
+        move |batch: &rz_eval::contracts::PreparedBatch<RulesState>| {
+            started_tx.send(batch.requests().len()).unwrap();
+            release_rx.recv().unwrap();
+            batch
+                .requests()
+                .iter()
+                .map(|item| item.physical_output(&raw(), batch.execution()))
+                .collect()
+        },
+    )
+    .unwrap();
+    let owner = NativeWorkerOwner::from_worker_batched(
+        worker,
+        projection,
+        4,
+        NativeAdmissionPolicy::Cpu,
+        4,
+    )
+    .unwrap();
+    let clock = ManualClock::default();
+    let backend = NativeRuntimeBackend::new(owner.clone(), clock.clone()).unwrap();
+    let adapter = ContractsAdapter::new(SharedScope::new(scope(first_context)), clock.clone(), 2)
+        .unwrap()
+        .with_mixed_legal_batching();
+    let mut limits = limits();
+    limits.max_requests = 4;
+    limits.max_batch_items = 2;
+    limits.memory.host_bytes = 4 * (HOST_BYTES_PER_ITEM + 8192);
+    let mut runtime = ContractEvaluator::new(adapter, backend, limits, 32).unwrap();
+    runtime.submit(first.clone()).unwrap();
+    runtime.submit(second.clone()).unwrap();
+    runtime.pump();
+    assert_eq!(started_rx.recv_timeout(Duration::from_secs(3)).unwrap(), 2);
+    runtime.cancel(second_context.request).unwrap();
+    assert!(matches!(runtime.poll(), Some(EvalResult::Canceled(_))));
+    assert!(runtime.state().reserved.host_bytes > 0);
+    assert_eq!(runtime.state().executions, 1);
+    release_tx.send(()).unwrap();
+    let mut output = None;
+    wait_until(|| {
+        if let Some(result) = runtime.poll() {
+            output = Some(result);
+            true
+        } else {
+            false
+        }
+    });
+    let EvalResult::Completed(output) = output.unwrap() else {
+        panic!("uncanceled item must complete");
+    };
+    assert_eq!(output.context, first_context);
+    assert!(output.actual.execution.is_some());
+    runtime
+        .begin_shutdown(Deadline {
+            clock: ClockDomain(EPOCH),
+            at: MonotonicTick(100),
+        })
+        .unwrap();
+    wait_until(|| {
+        runtime.pump();
+        runtime.shutdown_snapshot().drain == DrainState::Drained
+    });
+    assert_eq!(runtime.state().reserved, Resources::default());
+    assert_eq!(owner.try_status().unwrap().unwrap().reserved_diagnostics, 0);
+}

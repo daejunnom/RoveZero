@@ -29,6 +29,99 @@ pub trait ContractPosition: Clone {
     fn play(&self, chess_move: &Move) -> Result<Self, ContractError>;
     /// 실제 Rules 소유권·state revision·합법 수 의미·이력을 다시 검증한다.
     fn validate_authority(&self) -> Result<(), ContractError>;
+    /// Conservative retained-storage charge. Unknown implementations miss the
+    /// optional cache rather than pretending an opaque state costs zero bytes.
+    fn retained_bytes(&self) -> Option<usize> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct StateCacheLimits {
+    pub max_entries: usize,
+    pub max_bytes: usize,
+}
+impl Default for StateCacheLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 64,
+            max_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
+#[cfg(feature = "experimental-state-cache")]
+struct CachedState<P> {
+    path: Vec<Move>,
+    state: P,
+    charge: usize,
+}
+
+#[cfg(feature = "experimental-state-cache")]
+struct StateCache<P> {
+    limits: StateCacheLimits,
+    entries: std::collections::VecDeque<CachedState<P>>,
+    bytes: usize,
+    hits: u64,
+}
+
+#[cfg(feature = "experimental-state-cache")]
+impl<P: ContractPosition> StateCache<P> {
+    fn lookup(&mut self, path: &[Move]) -> Option<(usize, P)> {
+        let best = self
+            .entries
+            .iter()
+            .filter(|entry| path.starts_with(&entry.path))
+            .max_by_key(|entry| entry.path.len())?;
+        self.hits = self.hits.saturating_add(1);
+        Some((best.path.len(), best.state.clone()))
+    }
+    fn insert(&mut self, path: &[Move], state: &P) -> Result<(), ContractError> {
+        let Some(state_bytes) = state.retained_bytes() else {
+            return Ok(());
+        };
+        let charge = path
+            .len()
+            .checked_mul(std::mem::size_of::<Move>())
+            .and_then(|bytes| bytes.checked_add(state_bytes))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CachedState<P>>()));
+        let Some(charge) = charge.filter(|&bytes| bytes <= self.limits.max_bytes) else {
+            return Ok(());
+        };
+        if self.limits.max_entries == 0 || path.is_empty() {
+            return Ok(());
+        }
+        if self.entries.iter().any(|entry| entry.path == path) {
+            return Ok(());
+        }
+        while self.entries.len() >= self.limits.max_entries
+            || self.bytes > self.limits.max_bytes - charge
+        {
+            if let Some(old) = self.entries.pop_front() {
+                self.bytes -= old.charge;
+            }
+        }
+        let failure = || {
+            boundary(
+                ErrorCode::ResourceExhausted,
+                Stage::Contract,
+                "state cache allocation failed",
+            )
+        };
+        let mut owned_path = Vec::new();
+        owned_path
+            .try_reserve_exact(path.len())
+            .map_err(|_| failure())?;
+        owned_path.extend_from_slice(path);
+        self.entries.try_reserve(1).map_err(|_| failure())?;
+        self.entries.push_back(CachedState {
+            path: owned_path,
+            state: state.clone(),
+            charge,
+        });
+        self.bytes += charge;
+        Ok(())
+    }
 }
 
 /// 프로세스 epoch 전체에서 같은 Arc를 공유한다. root/newgame에서 초기화하지 않는다.
@@ -199,9 +292,15 @@ pub struct ContractSearch<P: ContractPosition, S: SelectionPolicy = Puct> {
     fallback: Option<Move>,
     status: ContractSearchStatus,
     pending: Option<Pending<P>>,
+    #[cfg(feature = "experimental-batch")]
+    other_pending: Vec<Pending<P>>,
+    #[cfg(feature = "experimental-batch")]
+    max_pending: usize,
     simulations: u64,
     metrics: ContractSearchMetrics,
     accepted_executions: HashSet<ExecutionId>,
+    #[cfg(feature = "experimental-state-cache")]
+    state_cache: StateCache<P>,
     source_trace: Option<SourceJournal<CompletionContext>>,
 }
 
@@ -209,7 +308,7 @@ impl<P: ContractPosition, S: SelectionPolicy> Drop for ContractSearch<P, S> {
     fn drop(&mut self) {
         // Covers unwind while submit/poll owns a temporarily detached Pending as well.
         // This revokes logical acceptance only; Runtime retains every physical lease.
-        if matches!(self.status, ContractSearchStatus::Running) || self.pending.is_some() {
+        if matches!(self.status, ContractSearchStatus::Running) || self.pending_count() != 0 {
             self.config.cancellation.cancel();
         }
     }
@@ -252,9 +351,20 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             fallback,
             status,
             pending: None,
+            #[cfg(feature = "experimental-batch")]
+            other_pending: Vec::new(),
+            #[cfg(feature = "experimental-batch")]
+            max_pending: 1,
             simulations: 0,
             metrics: ContractSearchMetrics::default(),
             accepted_executions: HashSet::new(),
+            #[cfg(feature = "experimental-state-cache")]
+            state_cache: StateCache {
+                limits: StateCacheLimits::default(),
+                entries: std::collections::VecDeque::new(),
+                bytes: 0,
+                hits: 0,
+            },
             source_trace: None,
         })
     }
@@ -263,6 +373,9 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         !matches!(self.status, ContractSearchStatus::Running)
     }
 
+    pub fn pending_requests(&self) -> usize {
+        self.pending_count()
+    }
     /// Optional passive source timestamps. Journal loss never changes acceptance.
     pub fn set_source_trace(&mut self, trace: Option<SourceJournal<CompletionContext>>) {
         self.source_trace = trace;
@@ -293,11 +406,135 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         }
     }
 
+    /// Allocation-free progress query, with the same zero-visit fallback rule.
+    pub fn best_move(&self) -> Option<Move> {
+        let best = if self.tree.has_root_visits() {
+            self.tree.best_move().copied()
+        } else {
+            None
+        };
+        best.or(self.fallback)
+    }
+
+    pub fn counters(&self) -> SearchCounters {
+        self.tree.counters()
+    }
+
+    pub fn set_state_cache_limits(
+        &mut self,
+        limits: StateCacheLimits,
+    ) -> Result<(), ContractError> {
+        if limits.max_entries > 1024 || limits.max_bytes > 64 * 1024 * 1024 {
+            return Err(boundary(
+                ErrorCode::ResourceExhausted,
+                Stage::Contract,
+                "state cache limit exceeds hard ceiling",
+            ));
+        }
+        #[cfg(feature = "experimental-state-cache")]
+        {
+            self.state_cache = StateCache {
+                limits,
+                entries: std::collections::VecDeque::new(),
+                bytes: 0,
+                hits: 0,
+            };
+            Ok(())
+        }
+        #[cfg(not(feature = "experimental-state-cache"))]
+        {
+            if limits.max_entries != 0 && limits.max_bytes != 0 {
+                Err(boundary(
+                    ErrorCode::UnsupportedContract,
+                    Stage::Contract,
+                    "state cache experiment is disabled",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    pub fn state_cache_storage(&self) -> (usize, usize, u64) {
+        #[cfg(feature = "experimental-state-cache")]
+        {
+            (
+                self.state_cache.entries.len(),
+                self.state_cache.bytes,
+                self.state_cache.hits,
+            )
+        }
+        #[cfg(not(feature = "experimental-state-cache"))]
+        {
+            (0, 0, 0)
+        }
+    }
+
+    fn pending_count(&self) -> usize {
+        let count = usize::from(self.pending.is_some());
+        #[cfg(feature = "experimental-batch")]
+        let count = count + self.other_pending.len();
+        count
+    }
+    #[cfg(feature = "experimental-batch")]
+    pub fn set_parallelism(&mut self, max_pending: usize) -> Result<(), ContractError> {
+        if self.tree.counters().selections != 0 || self.pending_count() != 0 {
+            return Err(boundary(
+                ErrorCode::UnsupportedContract,
+                Stage::Contract,
+                "parallelism is fixed before first selection",
+            ));
+        }
+        self.tree
+            .set_parallelism(max_pending)
+            .map_err(tree_boundary)?;
+        self.other_pending.try_reserve(max_pending).map_err(|_| {
+            boundary(
+                ErrorCode::ResourceExhausted,
+                Stage::Contract,
+                "pending allocation failed",
+            )
+        })?;
+        self.max_pending = max_pending;
+        Ok(())
+    }
+    #[cfg(feature = "experimental-batch")]
+    fn cancel_pending<R: Evaluator<P::State>>(&mut self, runtime: &mut R) {
+        while let Some(pending) = self.pending.take().or_else(|| self.other_pending.pop()) {
+            if let Err(error) = runtime.cancel(pending.request.context().request) {
+                self.record_runtime_cleanup(error);
+            }
+            if let Err(error) = self.tree.cancel(&pending.ticket) {
+                self.status = ContractSearchStatus::Failed(ContractSearchFailure::Tree(error));
+            }
+        }
+    }
+    pub fn pump<R, C, L, K>(
+        &mut self,
+        runtime: &mut R,
+        clock: &C,
+        live_scope: L,
+        input_key: K,
+    ) -> ContractPumpEvent
+    where
+        R: Evaluator<P::State>,
+        C: ContractClock,
+        L: FnMut() -> AcceptanceScope,
+        K: FnMut(&P, &EncodingDescriptor) -> Result<EvalInputKey, ContractError>,
+    {
+        let event = self.pump_inner(runtime, clock, live_scope, input_key);
+        #[cfg(feature = "experimental-batch")]
+        if self.is_finished() {
+            self.cancel_pending(runtime);
+        }
+        event
+    }
+
     /// 기다리지 않는 논리 상태 전이. Runtime의 각 메서드도 blocking하면 안 된다.
     /// 이 탐색은 해당 poll stream의 단일 활성 consumer다. 이전 탐색을 논리적으로
     /// 닫은 뒤 stream을 재사용한다. 동시 탐색은 Runtime dispatcher가 RequestId별로
     /// 분리한 evaluator stream을 제공해야 하며 전역 poll stream을 함께 읽으면 안 된다.
-    pub fn pump<R, C, L, K>(
+    fn pump_inner<R, C, L, K>(
         &mut self,
         runtime: &mut R,
         clock: &C,
@@ -313,8 +550,34 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         if self.is_finished() {
             return ContractPumpEvent::Finished;
         }
+        #[cfg(feature = "experimental-batch")]
+        if self.pending.is_none() {
+            self.pending = self.other_pending.pop();
+        }
         if self.pending.is_some() {
-            return self.poll_pending(runtime, clock, &mut live_scope);
+            let event = self.poll_pending(runtime, clock, &mut live_scope);
+            #[cfg(feature = "experimental-batch")]
+            if matches!(event, ContractPumpEvent::Waiting)
+                && self.pending_count() < self.max_pending
+            {
+                let now = match clock.now() {
+                    Ok(now) => now,
+                    Err(_) => return event,
+                };
+                if now >= self.config.deadlines.admission.at
+                    || now >= self.config.deadlines.soft.at
+                    || self.simulations.saturating_add(self.pending_count() as u64)
+                        >= self.config.max_simulations
+                {
+                    return event;
+                }
+                // Continue to select another independent leaf; its virtual path
+                // reserves capacity but does not create a completed visit.
+            } else {
+                return event;
+            }
+            #[cfg(not(feature = "experimental-batch"))]
+            return event;
         }
         if let Err(error) = live_acceptance(&self.config, clock, &mut live_scope, &self.root) {
             self.status = status_for_boundary(error);
@@ -348,6 +611,10 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         let preparation_started = self.source_trace.as_ref().map(|_| Instant::now());
         let selection = match self.tree.begin_selection(Instant::now()) {
             Ok(selection) => selection,
+            #[cfg(feature = "experimental-batch")]
+            Err(SearchError::Busy) if self.pending_count() != 0 => {
+                return ContractPumpEvent::Waiting;
+            }
             Err(error) => {
                 self.status = ContractSearchStatus::Failed(ContractSearchFailure::Tree(error));
                 return ContractPumpEvent::Finished;
@@ -359,8 +626,14 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
                 return self.fail_ticket(&selection.ticket, ContractSearchFailure::Boundary(error));
             }
         };
-        let mut leaf = self.root.clone();
-        for chess_move in &selection.moves {
+        #[cfg(feature = "experimental-state-cache")]
+        let (replayed, mut leaf) = self
+            .state_cache
+            .lookup(&selection.moves)
+            .unwrap_or_else(|| (0, self.root.clone()));
+        #[cfg(not(feature = "experimental-state-cache"))]
+        let (replayed, mut leaf) = (0, self.root.clone());
+        for chess_move in &selection.moves[replayed..] {
             leaf = match leaf.play(chess_move) {
                 Ok(next) => next,
                 Err(error) => {
@@ -370,6 +643,10 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             };
         }
         if let Err(error) = validate_position(&leaf) {
+            return self.fail_ticket(&selection.ticket, ContractSearchFailure::Boundary(error));
+        }
+        #[cfg(feature = "experimental-state-cache")]
+        if let Err(error) = self.state_cache.insert(&selection.moves, &leaf) {
             return self.fail_ticket(&selection.ticket, ContractSearchFailure::Boundary(error));
         }
         let terminal = terminal_utility(&leaf);
@@ -546,6 +823,10 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             return self.fail_ticket(&selection.ticket, ContractSearchFailure::Boundary(error));
         }
         self.metrics.submissions = submissions;
+        #[cfg(feature = "experimental-batch")]
+        if let Some(previous) = self.pending.take() {
+            self.other_pending.push(previous);
+        }
         self.pending = Some(Pending {
             ticket: selection.ticket,
             selection: selection_id,
@@ -569,7 +850,8 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         C: ContractClock,
         L: FnMut() -> AcceptanceScope,
     {
-        let pending = self
+        #[allow(unused_mut)]
+        let mut pending = self
             .pending
             .take()
             .expect("pump checks pending before polling");
@@ -592,6 +874,18 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             | EvalResult::Stale(completion) => completion.request,
             EvalResult::Failed(failure) => failure.context.request,
         };
+        #[cfg(feature = "experimental-batch")]
+        if context != pending.request.context() {
+            if let Some(index) = self
+                .other_pending
+                .iter()
+                .position(|p| p.request.context() == context)
+            {
+                let matched = self.other_pending.swap_remove(index);
+                self.other_pending.push(pending);
+                pending = matched;
+            }
+        }
         if context != pending.request.context() {
             self.pending = Some(pending);
             return self.rejected_result(

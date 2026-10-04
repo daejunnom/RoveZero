@@ -53,8 +53,17 @@ pub fn input_key(encoding: EncodingHandle, input: &EncodedInput) -> EvalInputKey
     hash.update((input.padded_frames as u64).to_le_bytes());
     hash.update([u8::from(input.inferred_ep_predecessor)]);
     hash.update(input.history_fill.reference_option().as_bytes());
+    #[cfg(not(feature = "experimental-input-hash"))]
     for value in input.values() {
         hash.update(value.to_le_bytes());
+    }
+    #[cfg(feature = "experimental-input-hash")]
+    for chunk in input.values().chunks(256) {
+        let mut bytes = [0u8; 1024];
+        for (value, dest) in chunk.iter().zip(bytes.chunks_exact_mut(4)) {
+            dest.copy_from_slice(&value.to_le_bytes());
+        }
+        hash.update(&bytes[..chunk.len() * 4]);
     }
     EvalInputKey(Digest(hash.finalize().into()))
 }
@@ -151,6 +160,41 @@ impl MaiaBinding {
         request: Arc<EvalRequest<P>>,
         projection: Input<'_>,
     ) -> Result<PreparedRequest<P>, ContractError> {
+        self.validate_preparation(&request, projection)?;
+        let encoded = classical::encode(projection).map_err(|_| {
+            error(
+                ErrorCode::InvalidInput,
+                Stage::Admission,
+                "invalid Rules input projection",
+            )
+        })?;
+        if input_key(request.context().encoding, &encoded) != request.context().input {
+            return Err(error(
+                ErrorCode::IdentityMismatch,
+                Stage::Admission,
+                "actual tensor identity differs from request",
+            ));
+        }
+        let indices = ordered_indices(projection, request.legal())?;
+        #[cfg(feature = "experimental-prepared-input")]
+        let encoded = Arc::new(encoded);
+        #[cfg(feature = "experimental-prepared-input")]
+        let indices: Arc<[usize]> = indices.into();
+        Ok(PreparedRequest {
+            request,
+            encoded,
+            indices,
+            backend: self.backend,
+            #[cfg(feature = "experimental-raw-cache")]
+            raw_cache: None,
+        })
+    }
+
+    pub(crate) fn validate_preparation<P>(
+        &self,
+        request: &EvalRequest<P>,
+        projection: Input<'_>,
+    ) -> Result<(), ContractError> {
         let context = request.context();
         context.revision.validate()?;
         if context.model != self.model.handle()
@@ -192,36 +236,51 @@ impl MaiaBinding {
                 "request host staging reservation is too small",
             ));
         }
-        let encoded = classical::encode(projection).map_err(|_| {
-            error(
-                ErrorCode::InvalidInput,
-                Stage::Admission,
-                "invalid Rules input projection",
-            )
-        })?;
-        if input_key(context.encoding, &encoded) != context.input {
+        Ok(())
+    }
+
+    #[cfg(feature = "experimental-prepared-input")]
+    pub(crate) fn prepare_rules(
+        &self,
+        request: Arc<EvalRequest<rz_position::contracts::RulesState>>,
+        prepared: &crate::rules_projection::PreparedRulesInput,
+    ) -> Result<PreparedRequest<rz_position::contracts::RulesState>, ContractError> {
+        self.validate_preparation(&request, prepared.projection.input())?;
+        if prepared.key != request.context().input {
             return Err(error(
                 ErrorCode::IdentityMismatch,
                 Stage::Admission,
                 "actual tensor identity differs from request",
             ));
         }
-        let indices = ordered_indices(projection, request.legal())?;
         Ok(PreparedRequest {
             request,
-            encoded,
-            indices,
+            encoded: Arc::clone(&prepared.encoded),
+            indices: Arc::clone(&prepared.indices),
             backend: self.backend,
+            #[cfg(feature = "experimental-raw-cache")]
+            raw_cache: None,
         })
     }
 }
 
 pub struct PreparedRequest<P> {
     request: Arc<EvalRequest<P>>,
-    encoded: EncodedInput,
-    indices: Vec<usize>,
+    encoded: EncodedStorage,
+    indices: IndexStorage,
     backend: Digest,
+    #[cfg(feature = "experimental-raw-cache")]
+    pub(crate) raw_cache: Option<crate::raw_cache::RawCache>,
 }
+
+#[cfg(not(feature = "experimental-prepared-input"))]
+type EncodedStorage = EncodedInput;
+#[cfg(feature = "experimental-prepared-input")]
+type EncodedStorage = Arc<EncodedInput>;
+#[cfg(not(feature = "experimental-prepared-input"))]
+type IndexStorage = Vec<usize>;
+#[cfg(feature = "experimental-prepared-input")]
+type IndexStorage = Arc<[usize]>;
 
 impl<P> PreparedRequest<P> {
     pub fn request(&self) -> &Arc<EvalRequest<P>> {
@@ -249,6 +308,29 @@ impl<P> PreparedRequest<P> {
     /// Physical conversion with the bounded model-validator cause retained for
     /// the runtime owner. Common-only callers can keep using `output` above.
     pub fn physical_output(
+        &self,
+        raw: &RawOutput,
+        execution: ExecutionId,
+    ) -> Result<EvalOutput, PhysicalFailure> {
+        let output = self.convert_output(raw, execution)?;
+        #[cfg(feature = "experimental-raw-cache")]
+        if let Some(cache) = &self.raw_cache {
+            cache.stage(self.request.context(), self.encoded(), raw, execution);
+        }
+        Ok(output)
+    }
+
+    #[cfg(feature = "experimental-raw-cache")]
+    pub(crate) fn reused_output(
+        &self,
+        raw: &RawOutput,
+        source: ExecutionId,
+    ) -> Result<EvalOutput, ContractError> {
+        self.convert_output(raw, source)
+            .map_err(|failure| failure.contract)
+    }
+
+    fn convert_output(
         &self,
         raw: &RawOutput,
         execution: ExecutionId,
@@ -405,6 +487,13 @@ pub fn spawn_onnx_worker_profiled<P: Send + Sync + 'static>(
 ) -> Result<OnnxWorker<P>, ContractError> {
     use rz_telemetry::source::SourceStage;
     use std::time::Instant;
+    if trace.is_some() && !backend.config().source_profile_supported() {
+        return Err(error(
+            ErrorCode::UnsupportedContract,
+            Stage::Contract,
+            "source profiling requires default B1 native execution",
+        ));
+    }
     crate::worker::SingleWorker::spawn_with_outcome(move |batch: &PreparedBatch<P>| {
         let started = trace.as_ref().map(|_| Instant::now());
         let completed = (|| {
@@ -449,12 +538,14 @@ pub fn spawn_onnx_worker_profiled<P: Send + Sync + 'static>(
                 backend.run(&inputs)
             }
             .map_err(PhysicalFailure::from)?;
-            batch
+            let completed = batch
                 .requests()
                 .iter()
-                .zip(raw)
-                .map(|(request, raw)| request.physical_output(&raw, batch.execution()))
-                .collect()
+                .zip(&raw)
+                .map(|(request, raw)| request.physical_output(raw, batch.execution()))
+                .collect();
+            backend.recycle_outputs(raw);
+            completed
         })();
         if let (Some(trace), Some(start)) = (&trace, started) {
             let key = batch.requests().first().map(|item| CompletionContext {

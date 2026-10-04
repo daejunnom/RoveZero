@@ -34,3 +34,5 @@ pub struct RawOutput {
     pub policy_logits: Vec<f32>,
     pub wdl: Vec<f32>,
 }
+#[cfg(feature = "experimental-raw-cache")]
+pub mod raw_cache;

@@ -1226,3 +1226,204 @@ fn unwind_inside_submit_or_poll_revokes_retained_request_authority() {
         );
     }
 }
+
+#[cfg(feature = "experimental-batch")]
+#[test]
+fn parallel_requests_accept_reverse_order_once_and_cancel_all_virtual_paths() {
+    for cancel in [false, true] {
+        let position = Position::from_nodes(vec![
+            ongoing(
+                Color::White,
+                &[
+                    (chess_move(12, 28), 1),
+                    (chess_move(11, 27), 2),
+                    (chess_move(10, 26), 3),
+                ],
+            ),
+            ongoing(Color::Black, &[(chess_move(52, 36), 4)]),
+            ongoing(Color::Black, &[(chess_move(51, 35), 4)]),
+            ongoing(Color::Black, &[(chess_move(50, 34), 4)]),
+            terminal(Color::White, None),
+        ]);
+        let mut search = new_search(position, 2);
+        search.set_parallelism(2).unwrap();
+        let mut runtime = ScriptedEvaluator::default();
+        let clock = ManualClock::new(1);
+        assert!(matches!(
+            pump(&mut search, &mut runtime, &clock),
+            ContractPumpEvent::Submitted { .. }
+        ));
+        runtime.results.push_back(EvalResult::Completed(completed(
+            &runtime.submissions[0],
+            &[0.5, 0.3, 0.2],
+            [0.3, 0.4, 0.3],
+        )));
+        assert!(matches!(
+            pump(&mut search, &mut runtime, &clock),
+            ContractPumpEvent::Accepted {
+                traversed_edges: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            pump(&mut search, &mut runtime, &clock),
+            ContractPumpEvent::Submitted { .. }
+        ));
+        assert!(matches!(
+            pump(&mut search, &mut runtime, &clock),
+            ContractPumpEvent::Submitted { .. }
+        ));
+        assert_eq!(runtime.submissions.len(), 3);
+        assert_ne!(
+            runtime.submissions[1].context().state,
+            runtime.submissions[2].context().state
+        );
+        assert_eq!(search.outcome().counters.completed_visits, 0);
+        assert!(
+            search
+                .outcome()
+                .root_stats
+                .iter()
+                .all(|(_, s)| s.visits == 0 && s.value_sum == 0.0)
+        );
+        assert!(search.set_parallelism(3).is_err());
+        if cancel {
+            clock.set(100);
+            assert!(matches!(
+                pump(&mut search, &mut runtime, &clock),
+                ContractPumpEvent::Finished
+            ));
+            assert_eq!(runtime.canceled.len(), 2);
+            assert_ne!(runtime.canceled[0], runtime.canceled[1]);
+            assert_eq!(search.outcome().counters.completed_visits, 0);
+            assert_eq!(search.outcome().counters.reservations_released, 3);
+        } else {
+            let reply = completed(&runtime.submissions[2], &[1.0], [0.2, 0.5, 0.3]);
+            runtime
+                .results
+                .push_back(EvalResult::Completed(reply.clone()));
+            assert!(matches!(
+                pump(&mut search, &mut runtime, &clock),
+                ContractPumpEvent::Accepted {
+                    traversed_edges: 1,
+                    ..
+                }
+            ));
+            runtime.results.push_back(EvalResult::Completed(reply));
+            assert!(matches!(
+                pump(&mut search, &mut runtime, &clock),
+                ContractPumpEvent::RejectedResult { .. }
+            ));
+            assert_eq!(search.outcome().counters.completed_visits, 1);
+            runtime.results.push_back(EvalResult::Completed(completed(
+                &runtime.submissions[1],
+                &[1.0],
+                [0.4, 0.3, 0.3],
+            )));
+            assert!(matches!(
+                pump(&mut search, &mut runtime, &clock),
+                ContractPumpEvent::Accepted {
+                    traversed_edges: 1,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                pump(&mut search, &mut runtime, &clock),
+                ContractPumpEvent::Finished
+            ));
+            assert_eq!(search.outcome().counters.completed_visits, 2);
+            assert_eq!(search.outcome().counters.reservations_released, 3);
+            assert_eq!(runtime.submissions.len(), 3);
+        }
+    }
+}
+
+#[cfg(feature = "experimental-state-cache")]
+#[test]
+fn state_cache_zero_tiny_and_eviction_preserve_exact_visit_results() {
+    #[derive(Clone)]
+    struct Estimated(Position);
+    impl ContractPosition for Estimated {
+        type State = FixtureState;
+        fn snapshot(&self) -> &PositionSnapshot<Self::State> {
+            self.0.snapshot()
+        }
+        fn legal(&self) -> &LegalMoveView {
+            self.0.legal()
+        }
+        fn play(&self, movement: &Move) -> Result<Self, ContractError> {
+            self.0.play(movement).map(Self)
+        }
+        fn validate_authority(&self) -> Result<(), ContractError> {
+            self.0.validate_authority()
+        }
+        fn retained_bytes(&self) -> Option<usize> {
+            Some(512)
+        }
+    }
+    let mut golden = None;
+    for limits in [
+        StateCacheLimits {
+            max_entries: 0,
+            max_bytes: 0,
+        },
+        StateCacheLimits {
+            max_entries: 2,
+            max_bytes: 1,
+        },
+        StateCacheLimits {
+            max_entries: 1,
+            max_bytes: 8192,
+        },
+        StateCacheLimits::default(),
+    ] {
+        let mut search = ContractSearch::new(
+            Estimated(ongoing_child()),
+            config(Arc::new(IdAllocator::new(EPOCH)), 3),
+        )
+        .unwrap();
+        search.set_state_cache_limits(limits).unwrap();
+        assert!(
+            search
+                .set_state_cache_limits(StateCacheLimits {
+                    max_entries: 1025,
+                    max_bytes: 1
+                })
+                .is_err()
+        );
+        let mut runtime = ScriptedEvaluator::default();
+        let clock = ManualClock::new(1);
+        for _ in 0..24 {
+            let event = search.pump(&mut runtime, &clock, scope, |p, e| input_key(&p.0, e));
+            if let ContractPumpEvent::Submitted { .. } = event {
+                let request = runtime.submissions.last().unwrap();
+                runtime.results.push_back(EvalResult::Completed(completed(
+                    request,
+                    &[1.0],
+                    [0.4, 0.3, 0.3],
+                )));
+            }
+            let (entries, bytes, _) = search.state_cache_storage();
+            assert!(entries <= limits.max_entries);
+            assert!(bytes <= limits.max_bytes);
+            if search.is_finished() {
+                break;
+            }
+        }
+        let outcome = search.outcome();
+        assert!(matches!(outcome.status, ContractSearchStatus::Completed));
+        assert_eq!(outcome.counters.completed_visits, 3);
+        let actual = (outcome.counters, outcome.metrics, outcome.root_stats);
+        if let Some(expected) = &golden {
+            assert_eq!(&actual, expected);
+        } else {
+            golden = Some(actual);
+        }
+        let (_, _, hits) = search.state_cache_storage();
+        if limits.max_bytes >= 8192 {
+            assert!(hits > 0);
+        } else {
+            assert_eq!(hits, 0);
+        }
+    }
+}
