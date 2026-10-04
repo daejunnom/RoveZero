@@ -933,3 +933,24 @@ raw/batch/비기본 I/O의 실행을 asset 로딩 전에 거부해 불완전 tra
 VRAM, 통제된 RunPod A/B, S1 대국 품질, 실제 학습·정식 LC0 paired 강도는 미실행이다.
 원시 근거와 실패·복구 명세는 저장소 밖의
 `reports/coordinator-integration/pr17-pr18-merge-20261004/`에 보존한다.
+
+## PR #17·#18 develop 통합과 로컬 내부 A/B
+
+2026-10-04 사용자 통합·로컬 강도 평가 지시에 따라 #17, #18을 순서대로 병합했다.
+#17 merge는 `0318e6fffd1840fd2f00ffcde0dac6a5a2372334`, #18 merge와 실제 엔진 소스는
+`bdd8523a915404f333497440bc6e5cd8996d7df3`이다. 최종 develop tree와 검토한 #18 head
+`d412f15`의 tree가 동일하며 main은 이번 작업에서 변경하지 않았다. develop CI
+[37198014988](https://github.com/daejunnom/RoveZero/actions/runs/37198014988)의 Windows·Ubuntu
+workspace·native CLI·release Rules 독립 대조·Python 도구·fmt/strict Clippy가 성공했다.
+
+새 엔진 binary의 CUDA 독립 수치 대조 12개·B1/2/4/8/16와 실제 CUDA node 98개,
+폭 1·4의 제한된 UCI·착수·종료를 로컬 RTX 4050에서 확인했다. 이는 수치·연결 인수이며
+S1 대국 우위나 RunPod 인수가 아니다. 공통 계약 0.1과 Computed-only native V1 B1
+경계를 유지하고, 별도 실험은 같은 W0·FP32·binary의 batch 폭만 바꾼다.
+
+사용자가 외부 LC0 비교 대신 내부 A/B를 선택했다. 고유 시작 이력 24개·흑백 교대 48판,
+T2 100ms·128회 상한·고정 표본을 [로컬 강도 기록](research/LOCAL-STRENGTH-AB.md)에 잠갔다.
+PGN 감사기는 기존 A Rules를 재사용하며 runner의 자동 claim 수락을 현재 Available
+근거와 정확한 종료 문구로 검증한다. 기존 native V1의 explicit_claim 동작을 유지한다.
+현재 대국은 진행 중이며 WDL·pair 통계·전체 PGN 감사와 실제 종료 정리는 실행 후 인수한다.
+매 착수 시 GPU 물리 drain·시계 공정성의 정식 인수는 미검증으로 보존한다.

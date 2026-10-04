@@ -47,6 +47,13 @@ Computed-only native V1 receipt는 B>1과 조합하지 않는다. GPU·시계·�
 정리했다. 실제 12개 참조·batch 수치·provider mapping의 상세 report를 원시 근거에 연결한다.
 이는 C 수치 검사이며 실제 S1 A/C/D/B·대국의 통과로 확대하지 않는다.
 
+수치 gate는 실제 CUDA 실행 node 98개를 확인했다. 독립 참조 대비 최대 오차는
+logit `1.5735626e-5`, 합법 policy `8.9406967e-7`, WDL `4.1723251e-7`이고,
+single 대 B1/2/4/8/16 최대 logit 차이는 `1.5139580e-5`다. 사전에 잠근 허용 오차
+내에서 12개 상태가 통과했다. 폭 1·4 실제 UCI에서 `go nodes 32`와 두 `movetime 100`
+착수·종료를 확인했으며 CudaOnnx fresh 완료는 각각 97·187, fatal/overflow/boundary/poison은
+0/false다. 이는 요청된 nodes가 stdout에 보고된 방문 수라는 증거는 아니다.
+
 `rz-arena`의 `pair_pgn_audit` 예제는 기존 A Rules 감사기를 직접 호출한다. 전체 이동열·
 동일 시작 상태·색 교대·종료를 검증하며 CPU/GPU runtime 계약이나 실행 권한을 만들지
 않는다. C 수치, 실제 native 실행, pair PGN·실패 회계, 시계/GPU 공정성과 최종 통계를
@@ -61,3 +68,29 @@ PGN 감사의 `claim_policy=automatic_acceptance`는 Fastchess의 정확한 종�
 A가 제공한 **현재 상태**의 Available claim을 모두 요구한다. intended-move나 Unknown
 근거, 임의 adjudication은 거부하며 결과를 `accepted_claim`으로 표시한다. 기존 native
 통합 검사는 `explicit_claim`을 유지하고 별도 claim 영수증 없는 종료를 계속 거부한다.
+
+## 잠금과 runner 연결
+
+`cohort-v4`의 실행 전 manifest SHA-256은
+`5f27c12cbfde83f544496b1abe0971a043988706dd3037c5ae8a0e21b8b696e0`,
+opening PGN은 `4b5114e71522b953ff9bd95c8e3aeb562d24d3da2c7943996a58e52c78b53f02`다.
+같은 24개 순서·전체 이동열은 [작은 재현 입력](../../experiments/baselines/local-strength-openings-v1.json)에 둔다.
+동일 보드를 만드는 다른 이력으로 바꾸지 않으며 이 표본을 독립 holdout으로 주장하지 않는다.
+
+외부 runner는 Fastchess `f618e34540f94f4719ad3817950618dabe441318`, binary SHA-256
+`ca85b6f3cbaab62352d7c98fb684f427a15c8a03d67825f0f2909eae725d9cfe`다.
+runner의 내부 로컬 사용과 외부 배포 권리 검토는 구분한다. 감사기 소스는 `3dc673f`,
+binary SHA-256은 `b5ceb926decb8f810f24d10d4efc3bda3588e2e8eff28d408bfe16c93efa7c7d`다.
+엔진 모델 초기화는 `startup-ms=60000`, game reset/ping은 각각 5000ms이며
+대국 시계의 `st=0.1`, `timemargin=0`을 늘리지 않는다.
+
+득점에 넣지 않는 사전 2판은 자체 A 규칙으로 18ply·색 교대·시작 이력을 감사했고
+두 cutoff를 Incomplete로 분류했다. Fastchess maxmoves는 opening 이후의 수를 세므로
+본 8ply prefix의 전체 400ply 한도는 `maxmoves=196`으로 맞춘다. 출력 루트 미생성,
+기본 10초 startup 초과, 초기 ply ceiling 불일치와 그 과정에서 중단한 0판 본 실행의
+실패를 원시 기록에 보존한다. 이 실패를 승패나 무승부로 바꾸지 않는다.
+
+cohort의 native 파일 총합은 8GiB, trace 64MiB, PGN 4MiB, stdout/stderr 각각 8MiB,
+단일 파일은 CUDA 라이브러리 복사를 허용하는 1GiB로 제한한다. supervisor·recipe·
+wrapper·입력·asset 식별을 잠그고 wall·메모리·PID·종료 후 owned process 정리를 확인한다.
+GPU 표본은 장치 전체 관측이며 엔진별 독점 사용량이나 device kernel 시간 증거는 아니다.
