@@ -393,3 +393,10 @@ CUDA V1 필드 집합·Computed-only B1은 유지한다. default 128과 explicit
 전체 workspace tests·strict Clippy·두 OS CI와 모델 연결은 통과했으나 독립 deadline/
 stop의 물리 fence, RZ NPS/per-root journal, 정식 paired 강도와 학습은 별도 인수다.
 관련 증거와 제한은 [통합 기록](INTEGRATION-STATUS.md)·[BT4 실행 기록](research/LOCAL-MODEL-BASELINE.md)을 따른다.
+
+E의 `NativeCudaProfileV1`은 arena 1 GiB, `NativeArtifactRole::Onnx`는 16 MiB에 고정돼
+있고 receipt verifier도 1 GiB를 요구한다. **이번 BT4의 3 GiB/741 MB를 해당 E V1의
+통과로 인수하지 않는다.** 기존 profile을 무조건 느슨하게 하지 않았으며 후속에는
+BT4 source/export pin·별도 bounds/profile revision·C/D/bootstrap·E 생성/검증·receipt를
+총괄이 함께 맞춘 뒤 같은 integration SHA로 검사한다. 이번 개발 대국은 Windows LC0와
+WSL native CLI를 직접 관리한 별도 finite runner와 E/A의 사후 PGN 감사 경로다.

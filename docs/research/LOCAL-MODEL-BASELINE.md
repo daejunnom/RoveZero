@@ -165,6 +165,23 @@ CUDA arena/session 선언은 Maia 1 GiB·BT4 3 GiB로 C/D/native receipt에 함�
 이 선언은 **전체 VRAM 실측·외부 hard cap이 아니다.** CUDA/FP32·TF32 off·CPU fallback
 금지와 실제 node placement·19-file bundle 검증을 유지한다. 공통 계약 revision은 0.1이다.
 
+기존 native CLI에 외부 산출물을 지정해 재현한다. 아래 경로는 실행 환경의 저장소 밖
+실제 파일로 바꾸며 각 manifest/runtime/bundle SHA를 확인한다. CPU는 `--onnx-cpu`와
+고정 CPU runtime을 별도 선택한다. GPU profile을 조용히 CPU로 바꾸지 않는다.
+
+```text
+rz-uci --onnx-cuda --source-weights=<BT4.pb.gz> --onnx-model=<BT4-fp32.onnx>
+       --export-manifest=<manifest.json> --manifest-sha256=<exact-manifest-SHA>
+       --ort-library=<ORT-CUDA-core> --ort-sha256=<exact-core-SHA>
+       --cuda-bundle=<nineteen-file-spec.json> --cuda-bundle-sha256=<exact-spec-SHA>
+       --output-root=<new-external-run-directory> --search-simulations=4096 --attestation
+```
+
+UCI에서는 `uci`/`isready` 후 완전한 `position startpos moves ...`와 유한 `go movetime`
+또는 `go nodes`를 전달한다. 벤치마크는 pinned original/ONNX/reference와 동일한
+immutable binary로 실행하며 최신 문서 head의 identity와 실제 실행 source를 구분한다.
+
+
 C/A/D 수치 인수 소스는 `aa0cc0247b9d7041e4525b2021363d0617cfd0bc`이며 고정 12개
 독립 LC0 Eigen 원본 참조를 사용했다. 양쪽 차례·충분/짧은 이력·반복·같은 보드와
 다른 이력·EP·양쪽 캐슬링·네 승격을 포함한다. 외부 ONNX CPU의 허용 오차는 실행 전
@@ -234,14 +251,41 @@ WorkerLimit/LegalFallback 문구는 없었다. 문구 개수는 고유 요청 �
 현재 Available인 threefold/fifty-move를 자동 수락하며 불법 수·시간패·crash는 loss,
 인프라 실패는 abort·원본 보존, cutoff는 Incomplete로 집계한다. 기존 개발 pool이며
 독립 holdout이 아니다. 시계/자원의 위 공백 때문에 `formal_strength_eligible=false`다.
-최종 결과·전체 PGN·A Rules 감사는 아래 통합 상태와 외부 보고서에 추가한다.
+8판을 563.15초에 완료했고 RoveZero 관점 **1승·2무·5패, 득점률 25%**였다.
+6판 checkmate·2판 현재 Available threefold 수락이며 시간패·불법 수·crash·cutoff 0이다.
+
+| opening | RoveZero 백 / 흑 | 쌍별 점수 / 2 |
+|---|---|---:|
+| Pirc | 패 / 패 | 0 |
+| King's Indian | 패 / 패 | 0 |
+| Italian | 무 / 무 | 1 |
+| French (fixture ID `rz-french-advance`) | 승 / 패 | 1 |
+
+두 엔진 동시 resident의 전체 장치 관측 최대는 **3,136 MiB**다. RoveZero 520회 착수의
+응답 중앙값/최대는 500.39/538.08ms, LC0 522회는 496.33/508.20ms다. 선언한
+500+100ms 경계를 넘은 착수는 없었다. 모두 끝난 뒤 두 process exit 0·실제 종료,
+RoveZero final drain confirmed와 VRAM 0 MiB를 확인했다. 전체 PGN **1,106 ply**를
+독립 `python-chess 1.999/chess 1.11.2`로 시작 prefix·색·합법 수·최종 FEN·종료 결과
+대조했다. A Rules의 기존 감사기도 정리한 4pair/8판을 모두 통과했다.
+
+PGN 원본의 `{ comment }` 공백 때문에 strict A 감사기가 pair 2의 claim 종료 문구를
+거부한 첫 실패를 보존했다. comment 양끝 공백만 제거한 정리본은 모든 header·착수·
+결과가 원본과 같음을 독립 대조한 뒤 A로 다시 감사했다. parser 구현은 바꾸지 않았고
+원본·정리본·첫 실패·재검사 receipt를 함께 보존한다. A의 reason 공백 처리 개선은
+별도 E 후속 항목이다.
+
+RoveZero 대국 process 집계는 D Computed 16,160·B guarded root 520/non-root 15,640,
+final drain-discarded 120·delivery drop 0·fatal/boundary/poison 실패 없음이다. stderr의
+Expired/Stale는 그대로 남겨 두며 집계 성공을 모든 root의 물리 시계 인수로 확대하지
+않는다. 4개 개발 opening·cross-OS·host 여유를 포함한 이 결과로 Elo/승격을 판정하거나
+모델 자체의 강도를 분리했다고 하지 않는다.
 
 | 담당 / 다음 순서 | 구현·인수 조건 |
 |---|---|
 | B·총괄 | 위 mate-in-one을 실제 root stats·확정 terminal 발견 여부로 재현한다. 확정 승패의 root 선택/solver 변경은 S 변경으로 별도 revision·CONTROL-0→1·전술 회귀·같은 weights 대국으로 검증한다. |
 | B·D·총괄 | 독립 마감/stop에서 bestmove와 물리 GPU 완료의 순서, 현재 game/root별 accepted visits·fresh/cached 실행과 지연을 계측한다. 시간 여유 확대만으로 원인을 숨기지 않는다. |
 | C·D | BT4 B1/FP32의 준비·대기·전송·GPU·backup 비용을 분리한다. batch/FP16/Graph 변경은 한 번에 하나씩 별도 수치·수명·VRAM 인수를 거친다. |
-| E·총괄 | 같은 OS·CPU 자원·정밀도·whole-wall 시계와 GPU 물리 fence를 잠근 정식 pair, 별도 holdout·사전 표본/통계/중단 기준을 마련한다. 개발 8판을 Elo로 변환하지 않는다. |
+| E·총괄 | 기존 E CUDA launch V1은 arena/session 1 GiB·ONNX artifact 16 MiB로 닫혀 있어 이번 BT4 manifest/741 MB export를 인수하지 않는다. 별도 BT4 실행 profile/schema·artifact bounds·수명/receipt 연결을 수동 대조한 뒤 같은 OS·CPU 자원·정밀도·whole-wall 시계·GPU 물리 fence·holdout·사전 통계를 잠근다. 이번 개발 pair는 직접 native CLI의 별도 runner이며 E 정식 launch 통과가 아니다. |
 | F·C | 권리와 실제 trainer/export round-trip을 확인한 뒤 학습을 검토한다. 모델 변경과 탐색 개선의 효과를 한 실험에 섞지 않는다. |
 
 원시·정리 근거의 논리 루트는 저장소 밖

@@ -1003,6 +1003,26 @@ ONNX·원본 hash·오차·옵션·cold startup·위치 benchmark와 후속 실�
 이 회수 보완은 실행 결과를 다시 만들거나 성공으로 바꾸지 않는다.
 
 개발 대국은 4쌍/8판·같은 BT4 FP32·완전한 기존 opening history·500ms/수·별도
-100ms host/transport 여유·256 total ply·전체 1,200초로 먼저 잠가 실행한다. 결과·
-PGN audit는 종료 후 추가한다. 개발 pool·미확정 물리 시계/동일 자원 때문에 정식
-강도 승격·Elo·실제 학습 인수는 하지 않는다.
+100ms host/transport 여유·256 total ply·전체 1,200초로 먼저 잠가 **8판 모두 완료**했다.
+RoveZero 1승·2무·5패·25%, checkmate 6판·현재 threefold 수락 2판, 시간패·불법 수·
+crash·cutoff 0이다. 563.15초·동시 resident 장치 관측 최대 3,136 MiB, 양 process
+exit 0·RoveZero final drain confirmed를 확인했다. 종료 뒤 장치 VRAM은 0 MiB였다.
+
+독립 python-chess와 A 자체 Rules 감사는 4pair/8판·1,106 ply의 prefix·색·이동열·최종
+상태·종료를 대조했다. PGN 원본 comment 공백 때문에 A strict claim 문구 검사의
+첫 pair 2 감사가 실패했으며 원본과 실패를 보존했다. comment 양끝 공백만 정리한
+별도 PGN은 header·착수·결과가 원본과 같음을 독립 확인하고 A 4pair 감사 exit 0을
+확인했다. parser 구현은 변경하지 않았다. private runner·정리/감사 도구와 raw/cleaned
+PGN은 외부 회수 자료에 포함하며 public source에는 넣지 않는다.
+
+대국 process 집계는 D Computed 16,160·B guarded root/non-root 520/15,640,
+drain-discarded result 120·delivery drop 0·fatal/overflow/boundary/poison 없음이다.
+RoveZero 착수 응답 520회의 중앙값/최대 500.39/538.08ms, LC0 522회는 496.33/508.20ms다.
+Expired/Stale 진단을 숨기지 않으며 process 집계·final drain을 매 root의 전체 GPU
+공정성 journal로 승격하지 않는다. 개발 pool·cross-OS·host 여유·미확정 물리 시계/
+동일 자원 때문에 정식 강도 승격·Elo·실제 학습 인수는 하지 않는다.
+
+E 정식 native CUDA V1은 기존 1 GiB arena/session·16 MiB ONNX artifact bound에 고정돼
+이번 BT4 profile을 인수하지 않는다. 위 개발 pair는 별도 private finite runner가
+native CLI를 직접 실행한 결과이며 E locked launch/정식 manifest 성공이 아니다.
+별도 BT4 artifact/profile revision과 C/D/E receipt의 수동 연결이 후속으로 남는다.
