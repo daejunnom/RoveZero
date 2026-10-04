@@ -31,6 +31,31 @@ native runtime/CUDA 설치가 필요 없다. CPU/CUDA 선택, shape/dtype, 최�
 encoding 11개(총 38개) 테스트, fmt·Clippy가 통과했고 Rust 1.85.0 all-feature
 check도 통과했다. 기본 feature 검사는 native ORT/CUDA 없이 별도로 통과했다.
 
+## 검증된 native runtime 저장
+
+`runtime_pin::RuntimeCache`가 CPU 단일 library 또는 Linux CUDA 19-file bundle의
+검증된 복사본을 공유한다. `RuntimeLibraryPin`의 명시적인 private-copy API는 보존하되
+일반 native UCI·`maia_check`·`rules_maia_check`는 공유 캐시를 기본으로 사용한다.
+`--runtime-cache-root=<absolute private cache slot>`로 별도 루트를 지정할 수 있다.
+
+기본 위치는 Windows `%APPDATA%/RoveZero/cache/native-runtime-v1/<OS>-<architecture>`,
+Linux `${XDG_CACHE_HOME:-$HOME/.cache}/rovezero/native-runtime-v1/<OS>-<architecture>`,
+CI `$RUNNER_TEMP/RoveZero/cache/native-runtime-v1/<OS>-<architecture>`다. 비밀·가중치·
+모델·로그를 넣지 않는다. root/ancestor의 소유권이 필요하며 link/Git 경로를 거부한다.
+
+cache key는 CPU의 basename+digest 또는 CUDA의 canonical bundle digest다. miss만
+private copy→writer close→readonly 검증→원자적 directory publication을 수행한다.
+hit는 mutable source를 읽지 않고 cached bytes 전체를 expected digest와 대조해 새
+파일 pin을 얻는다. 손상·누락·extra file·쓰기 권한·symlink는 성공으로 바꾸지 않는다.
+동시 creator는 bounded 60초 lock을 사용한다. 최대 4 entry/8 GiB이며 full cache·
+비정상 종료의 lock/staging은 명시적인 실패와 소유자 확인 대상으로 남긴다. 활성 library를
+자동 수리·evict/unload하지 않는다. Unix readonly는 same-UID sandbox가 아니다.
+
+저장 출처 `cache_created/cache_reused`는 별도 metadata이며 raw evaluation의
+`Computed/RawEvalHit`나 신경망 실행 수를 변경하지 않는다. 실제 인수 소스 `5558359`의
+CPU Maia/CUDA BT4 12-case·batch 1/2/4/8/16, Rules No/Repeat·mapping·physical drain과
+일반 UCI의 재사용 결과는 [저장 인수 기록](../../docs/research/PERFORMANCE-OPTIMIZATION-PLAN.md#13-실행별-native-library-복제-제거와-검증된-공유-저장)에 둔다.
+
 ## 현재 제공 범위
 
 `mock::ScriptedBackend<K>`는 수동 시계로 움직이는 **물리 backend 시험 도구**다.

@@ -434,3 +434,31 @@ S0/S1 probe의 source `9817647`과 후속 실제 UCI/CI source `fabe88e`를 각�
 PR #20의 최신 head에서 총괄이 이 접점과 실제 public 선언을 수동으로 대조했다는 기록을
 남긴다. E BT4 artifact/profile 경계는 여전히 별도 연결 대상이다. 같은 이름의 S1이나
 similar receipt를 이유로 기존 E V1·정식 강도·physical deadline gate를 자동 호환으로 인수하지 않는다.
+
+## 13. 런타임 저장 capability와 isolated E argv의 수동 연결
+
+총괄은 소스 `55583595a90bb59f611553da103101836fc9cd88`에서 C의 `RuntimeCache`→
+`RuntimeLibraryPin`→`OrtRuntime`·native loader, B native bootstrap·두 C 수치 gate,
+E의 두 native engine argv를 직접 대조했다. shared `rz-contracts` revision **0.1**과
+model/input identity·ordered policy/WDL·generation/deadline·physical lease·backup 계약은
+유지한다. `RuntimeStorage`는 별도 저장 영수증이며 `Computed/RawEvalHit` 의미가 아니다.
+
+| 접점 | 총괄 대조·검사 |
+|---|---|
+| C cache→native capability | 전체 bytes/hash·size·readonly·단일 link, source로부터 분리한 inode, hit마다 새 file pin, exact CUDA 19-file admission/mapping 유지 |
+| C storage→B startup | optional absolute cache root 또는 C default slot, model/session의 실제 load 뒤 private-path 없는 storage sidecar, 기존 provider/backend identity·V1 필드 집합 유지 |
+| C storage→수치 gate | 기본 cache miss와 explicit root/hit을 새 process로 검사. actual CPU/CUDA·Rules No/Repeat·mapping·물리 종료 각각 확인 |
+| C default root→E launcher | 총괄이 단방향 `rz-arena`→feature-less `rz-eval` 의존을 연결하고 lock을 갱신. 새 외부 package 없음. E parent에서 private cache root를 정해 두 inner argv로 전달 |
+| E process→native child | `env_clear()`·LANG/PATH 정책 유지, HOME/loader 환경을 전파하지 않음. 환경을 비운 concurrent-process fixture와 explicit root의 실제 CPU/CUDA gate 통과 |
+| 저장 관측→E 예산 | C cache는 4 entry/8 GiB로 별도 제한하며 E per-attempt artifact watch와 구분해 invocation limitations에 기록. E source snapshot·권리·pin·profile·receipt 조건 유지 |
+
+새 E launcher에는 cache option을 지원하는 engine binary가 필요하다. 과거 snapshot은
+원래 source/launcher로 재현하고 새 option 거부를 성공으로 숨기지 않는다. loader/native
+실패 뒤 CPU fallback이나 재시도/unload를 추가하지 않았다. corrupt cache를 덮어쓰거나
+활성 pin을 자동 삭제하지 않으며 비정상 종료의 lock/staging은 검증된 owned cleanup 대상이다.
+
+로컬 workspace 727 passed·0 failed·16 ignored, Windows/Ubuntu exact-source CI와 C/B 실제
+RTX 4050 재사용·종료 증거를 확인했다. E 연결의 fixture와 실제 C/B 증거를 **새 E 대국의
+성공으로 인수하지 않는다.** E의 BT4 artifact/profile·정식 강도·별도 physical race gate는
+그대로 남긴다. 세부 결과는 [통합 기록](INTEGRATION-STATUS.md)과
+[저장 인수](research/PERFORMANCE-OPTIMIZATION-PLAN.md#13-실행별-native-library-복제-제거와-검증된-공유-저장)에 둔다.

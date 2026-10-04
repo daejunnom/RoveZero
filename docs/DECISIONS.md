@@ -65,6 +65,8 @@
 | RZ-D036 | 사용자 BT4 실제 적용·벤치마크 지정 / 2026-10-04 | BT4-it332 단일 원본을 별도 source/export/model profile로 Rust CPU/CUDA에 연결하고 같은 원본의 native LC0 FP32·RoveZero FP32·별도 LC0 FP16 로컬 위치 벤치마크와 개발 pair를 실행한다. Maia exact profile·공통 계약 0.1·자체 Rules/PUCT를 유지한다. BT4 개별 license는 미확인·재배포 false로 보존하고 실제 학습은 시작하지 않는다. 기본 128 simulation은 유지하며 native에 유한 1..4096 선택을 추가한다. raw 실패·시간/물리 완료 공백·즉시 메이트 선택 한계를 보존하고 개발 표본을 정식 강도/Elo/훈련 인수로 승격하지 않는다. [실행 기록](research/LOCAL-MODEL-BASELINE.md)을 따른다. |
 | RZ-D037 | 사용자 종료 회귀·조건 일치·B1 계측 지정 / 2026-10-05 | 메이트 후보→실제 Rules 종료→관점 backup→최종 착수를 먼저 추적하고, 모델/hash·이력·입력·합법 policy·WDL 및 동일 바이너리 A/A 뒤 host 병목을 검사한다. 이전 BT4의 explicit simulations=4096을 기본 128 문제로 재해석하지 않는다. LC0의 정확한 terminal/bounds와 신경망 추정치를 구분하는 정책을 검토해, 실제 승인된 직접 자식 terminal만 우선하는 opt-in `exact-terminal-child-v1`을 독립 S 변경으로 구현한다. 기존 방문 수 우선 S0·기본값과 공통 revision 0.1은 유지하며 NN Q=±1·단일 winning descendant·미방문/거부된 완료는 증명으로 사용하지 않는다. 전체 solved bounds 전파·mate-distance solver·기력 승격은 별도 후속 인수다. [회귀·계측 기록](research/LOCAL-MODEL-BASELINE.md#8-종료-회귀조건-대조b1-계측과-별도-s1)을 따른다. |
 
+| RZ-D038 | 사용자 런타임 저장 공간 개선 / 2026-10-05 | 실행별 ORT/CUDA 전체 복제는 기본 bootstrap에서 해시별 공유 런타임 캐시로 대체한다. 이 불변 vendor 라이브러리만 OS/architecture/content identity로 checkout 간 공유하는 고정 슬롯 예외다. 가중치·모델·데이터·실행 로그는 이 캐시에 넣지 않는다. 최대 4 entry/8 GiB, hit의 전체 byte/readonly pin 검사, 직렬·원자적 publication, 손상 거부와 실패 staging 정리를 적용하고 활성 entry를 자동 교체·삭제하지 않는다. C가 저장 권한을 소유하고 B의 native CLI·수치 gate·E의 cleared child argv가 소비한다. 모델 평가 cache provenance·공통 revision 0.1·CUDA exact profile·process lifetime·기존 탐색 정책은 유지한다. [저장 공간·재사용 인수](research/PERFORMANCE-OPTIMIZATION-PLAN.md#13-실행별-native-library-복제-제거와-검증된-공유-저장)를 따른다. |
+
 ## 남은 결정과 실행 전 잠금
 
 기존 ID를 유지한다. `부분 결정`인 행의 확정 부분을 다시 미정으로 취급하지 않는다.

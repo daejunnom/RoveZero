@@ -213,6 +213,13 @@ Windows 생성물 루트는 **`%APPDATA%\RoveZero`**, CI는 **`$RUNNER_TEMP/Rove
 OS·checkout·용도별 고정 슬롯을 사용하고 PID·GUID·시각만으로 무제한 누적하지 않습니다.
 보존할 실험에는 ID·설정·seed·모델/규칙/인코딩 버전·출처를 남깁니다.
 
+native ORT/CUDA 라이브러리는 RZ-D038의 제한된 예외로 checkout 사이에 공유합니다.
+`native-runtime-v1/<OS>-<architecture>/` 고정 슬롯과 내용 식별자를 쓰며 실행 ID별
+대용량 복제를 기본값으로 만들지 않습니다. C의 캐시는 최대 4 entry/8 GiB이고 모든
+hit의 bytes·readonly pin을 검증합니다. 자동 eviction·손상 entry 교체를 하지 않으며
+비정상 종료의 publication lock·미공개 staging은 소유자와 비활성을 확인한 뒤 정리합니다.
+이 예외는 라이브러리 저장에 한정하며 모델·평가 cache·보존 증거에는 적용하지 않습니다.
+
 WSL2 일반 빌드·테스트·정적 분석·환경 구성은 사용할 수 있습니다. 재생성 가능한 Linux
 캐시·가상환경·중간 빌드는 `${XDG_CACHE_HOME:-$HOME/.cache}/rovezero`에 둘 수 있습니다.
 보존할 모델·데이터·로그·보고서는 확인한 호스트 APPDATA를 `wslpath` 등으로 변환해

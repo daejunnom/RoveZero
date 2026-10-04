@@ -1191,3 +1191,89 @@ ancestry를 포함했으므로 첫 PR 이후 추가 변경만 검토할 수 있�
 준비이며 실제 develop/main 변경은 실행하지 않았다. 새 I/O/batch/cache의 CUDA 수치·
 수명·VRAM, Graph capture/replay, RunPod 통제 A/B, S1 holdout 대국 품질, 실제 학습·
 정식 LC0 paired 강도·통계는 남아 있다. 기존 GPU 인수나 CPU 진단으로 승격하지 않는다.
+
+## 13. 실행별 native library 복제 제거와 검증된 공유 저장
+
+2026-10-05 사용자 요청에 따라 소스 `24552e1`의 C 공유 저장, `94b8d78`의 Windows
+absolute prefix 처리, `55583595a90bb59f611553da103101836fc9cd88`의 E 자식 연결을
+같은 브랜치에서 인수했다. 분류는 **E · 저장/시작 경로의 의미 보존 개선**이다.
+model hash·encoder·policy/WDL·PUCT·방문·physical lease·최종 착수 정책을 바꾸지 않는다.
+startup 시간·기력·NN throughput의 개선율을 이번 저장 검사에서 주장하지 않는다.
+
+### 13.1. 저장 권한과 publication
+
+이전 기본 bootstrap는 매 process의 output root에 `ort-bootstrap-<pid>-<ordinal>`을
+만들고 CPU core 또는 CUDA 19개를 복사한 뒤 종료 후에도 보존했다. 현재 기본 UCI와
+두 C 수치 gate는 `RuntimeCache`를 사용하고 per-run root에는 로그·placement·영수증만
+쓴다. 명시적인 isolated copy API는 호환 목적으로 남긴다.
+
+OS/architecture의 fixed slot 안에 CPU basename+digest 또는 CUDA canonical bundle
+digest로 entry를 식별한다. 처음에만 private copy·writer close·readonly pin/전체
+bytes 검사 뒤 원자적으로 directory를 게시한다. 다음 process도 cached bytes 전체의
+hash/size/type/permissions와 파일 pin을 확인한다. CUDA loader의 exact 19-file vendor
+profile, 16 NVIDIA+3 ORT mapping·단일 inode/link·one-shot/process-lifetime 검사는 유지한다.
+캐시 hit는 expected identity에 결합된 복사본을 쓰므로 mutable source가 없어도 가능하다.
+
+최대 **4 entry/8 GiB**, 동시 creator의 최대 lock 대기 **60초**다. published 손상
+entry를 덮어쓰거나 활성 entry를 자동 evict하지 않는다. 실패 copy는 자기 미공개 파일만
+정리한다. SIGKILL/crash가 남긴 lock/staging은 실패로 보존하며 소유자·활성 process/pin을
+확인하기 전에는 제거하지 않는다. cache root/ancestors는 caller ownership이고 Unix
+readonly를 hostile same-UID 보호로 주장하지 않는다. library에 한정한 checkout 간
+공유 예외이며 모델·가중치·데이터·평가 cache·보존 증거는 이 namespace에 넣지 않는다.
+
+기본 위치와 optional `--runtime-cache-root`는 [C README](../../crates/rz-eval/README.md)를
+따른다. E는 `env_clear()`를 유지하면서 **부모에서 C cache root를 결정해 두 engine의
+argv로 직접 전달**한다. cache의 8 GiB 한도는 per-attempt watched artifact budget과
+별도이며 invocation limitations에 기록한다. E input snapshot의 distinct inode/권리/
+hash와 기존 CPU/CUDA provider profile은 유지한다. 이전 binary는 원래 launcher/source
+pin으로 재현하고 새 launcher에는 cache option을 지원하는 binary pin을 사용한다.
+
+### 13.2. 기존 비활성 복사본 정리
+
+총괄 소유 coordinator 및 BT4 실행 루트의 runtime-copy directory만 확인했다. 모델·
+source bundle·venv·기존 stdout/stderr·PGN·report·receipt를 유지하고, symlink/component·
+regular file·단일 link·크기·SHA-256을 원본과 대조했다. 전체 process maps/FD에서 해당
+파일의 사용이 없음을 확인하고 검증된 library 파일만 개별 삭제했다. recursive run 삭제는
+하지 않았다. 빈 원래 디렉터리와 경로/원본 pin을 기록한 cleanup receipt를 보존한다.
+
+| 정리 범위 | 확인 결과 |
+|---|---:|
+| 발견한 기존 runtime-copy directory | 55개 · 89,617,921,760 bytes |
+| 검증 후 제거한 비활성 복사본 | 54개 · **89,609,533,152 bytes (약 83.46 GiB)** |
+| 확인할 수 없는 부분 copy | 1개 · 8,388,608 bytes · 보존 |
+
+이는 제거한 파일의 **논리 byte 합계**다. WSL 가상 디스크와 로컬 Windows C 드라이브의
+물리 여유 공간은 별도 관측하고 같은 회수량으로 표시하지 않는다. trim이 보고한 전체
+미사용 filesystem 범위를 이번 삭제량으로 해석하지 않는다.
+
+### 13.3. 같은 소스의 실제 인수
+
+로컬 소스 `5558359`의 all-target/all-feature 검사 **727 passed, 0 failed, 16 ignored**,
+fmt·strict Clippy·release build를 확인했다. ignored는 미실행이다. 최초 Windows CI의
+drive/verbatim prefix 검사 실패는 `94b8d78`에서 수정하고 원래 실패를 남겼다.
+최종 소스의 [CI 37233809881](https://github.com/daejunnom/RoveZero/actions/runs/37233809881)는
+Ubuntu·Windows의 모든 필수 step SUCCESS를 직접 확인했다. CI에는 실제 GPU가 없다.
+
+| 실제 실행 경로 | 저장/정확성/종료 관측 |
+|---|---|
+| CPU Maia `maia_check` 첫 실행 | CacheCreated, 12-case + B1/2/4/8/16 원본 수치 대조 통과 |
+| CUDA BT4 `maia_check` 첫 실행 | CacheCreated, exact bundle/mapping·FP32/TF32off·CPU fallback 금지, 12-case + B1/2/4/8/16 통과 |
+| CPU/CUDA `rules_maia_check` 다음 process | CacheReused, HOME/XDG/APPDATA 없는 explicit root, 실제 Rules의 12-case × No/Repeat·최종 승인·physical drained. CUDA mapping audit 통과 |
+| 일반 CUDA UCI 두 process | 두 opening × `go nodes 16`, explicit cap 4096/S0/B1·각 34 NN 완료/소비, 동일 합법 착수·backup·exit 0·physical drain confirmed·mapping failure 없음 |
+| 저장 불변성 | CPU 1+CUDA 19 = **20 files/2 entry/2,991,194,560 bytes**, 모든 hit 전후 파일 집합·size·device/inode 정확 동일. 새 per-run library copy **0개** |
+
+CPU/CUDA 원본 대조의 최대 WDL 오차는 각각 `4.7684e-7`/`1.7881e-7`, 합법 policy
+`1.1921e-6`/`2.8014e-6`이었다. 기존 허용 오차를 유지했다. tensor/ordered policy 검사,
+No/Repeat와 CPU/CUDA 실제 실행 근거는 따로 보존한다. 이 실행의 CUDA는 로컬 RTX 4050
+6 GB이며 CPU 2·RAM 6 GiB·swap 0·per-gate 180초·stdout/stderr/worker 종료를 제한했다.
+OS page cache의 cold 상태나 동일 작업량 startup speedup을 인수한 것은 아니다.
+
+E의 parent→argv 접점은 synthetic ownership/quoting 검사와 환경을 비운 두-process
+cache 검사로 확인했다. **새 E launcher의 실제 paired 대국은 이번에 실행하지 않았다.**
+기존 E BT4 artifact/profile 한도·정식 강도·Elo·device kernel/transfer 계측·학습 인수는
+별도 후속이다. cache 저장 성공을 해당 gate의 성공이나 새 모델 평가 cache hit로 바꾸지 않는다.
+
+외부 보존 루트는 `reports/coordinator-integration/runtime-storage-20261005/`다.
+binary/source/feature pin, cleanup plan·개별 hash receipt, 네 C gate·두 UCI process의
+원본/최종 종료와 storage sidecar, 실제 cache file/inode snapshot, CI/host disk 관측을
+보존한다. 큰 라이브러리·가중치·원시 로그를 Git에 넣지 않는다.

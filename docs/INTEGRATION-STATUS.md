@@ -1066,3 +1066,39 @@ kernel-only·H2D/D2H 비용을 추정하거나 kernel_time 이름만으로 devic
 전체 solved subtree·mate distance, deadline/stop의 독립 physical fence, E의 BT4 launch
 profile/schema, 동일 시간·자원·holdout paired 강도와 Elo, actual training은 남아 있다.
 이번 즉시 메이트 회귀 성공을 해당 gate들의 통과로 승격하지 않으며 새 대국은 실행하지 않았다.
+
+## native runtime 공유 저장·기존 복사본 정리 인수
+
+2026-10-05 사용자 요청으로 실행마다 남던 ORT/CUDA 라이브러리 복제를 검토했다.
+총괄은 C API·B startup/gate·E parent/inner argv·native loader와 root dependency를
+수동 연결하고 같은 소스 `55583595a90bb59f611553da103101836fc9cd88`에서 검증했다.
+공통 계약 0.1·모델/입력/계산 identity·추론 cache provenance·PUCT/S0/S1·물리 lease는
+유지하며 라이브러리 저장을 별도 `RuntimeStorage`로 관측한다.
+
+| 인수 범위 | 확인 결과 |
+|---|---|
+| runtime 저장 | OS/architecture·내용 key의 공유 private cache, writer close/readonly/hash 뒤 원자적 게시, hit의 전체 bytes/새 pin, 최대 4 entry/8 GiB·creator 대기 60초 |
+| 실패/경합 | 손상·누락·extra·쓰기 권한·symlink 거부, 늦은 CUDA copy 실패 정리·재시도, CPU 두 process/네 thread 중 한 creator, busy lock timeout·capacity 실패. published entry 자동 교체/삭제 없음 |
+| E consumer | env_clear 유지·부모가 C root를 두 engine argv로 전달, cache와 per-attempt watch 예산 구분. one-way workspace 의존 추가/lock 갱신; 신규 외부 package 없음 |
+| 실제 CPU/CUDA | Maia CPU와 BT4 CUDA 각 새 cache와 reuse process, 12-case/batch 1/2/4/8/16·Rules No/Repeat·최종 승인·mapping·physical drained 통과 |
+| 실제 일반 UCI | CUDA 새 process 두 개 × 두 opening/16 visits, cap 4096/B1/S0, 각 NN 완료/소비 34·root 초기화 2·non-root backup 32, 같은 합법 착수, process exit 0·physical drain confirmed |
+| 파일 불변성 | 20 files/2 entry/2,991,194,560 bytes. 모든 재사용의 경로 집합·크기·device/inode 동일, per-run `ort-bootstrap-*` 새 생성 0 |
+| 기존 owned copy 정리 | inactive maps/FD·regular/type/link/size·원본 SHA 확인 후 library 파일만 제거: 54 directory/89,609,533,152 bytes. 8 MiB 불완전 copy·모델·원본 bundle·로그/PGN/보고서 보존 |
+| 로컬 검사 | all-target/all-feature 727 passed·0 failed·16 ignored; fmt/strict Clippy/release 성공. ignored 미실행 |
+| CI | source `5558359`, [37233809881](https://github.com/daejunnom/RoveZero/actions/runs/37233809881)의 Windows/Ubuntu 필수 step 전체 SUCCESS 직접 확인. 실제 GPU CI 아님 |
+
+최초 source `24552e1`의 Windows 경로 검사 실패를 남기고 `94b8d78`의 drive/verbatim
+prefix 처리 이후 성공을 별도 확인했다. 같은 번호의 cache hit를 신경망 새 실행이나 방문으로
+집계하지 않는다. metadata와 cache key만으로 bytes 검사를 건너뛰지 않으며 root/ancestor
+ownership·same-UID 신뢰 전제와 native constructor/process lifetime을 유지한다.
+
+삭제량은 WSL 내부 파일의 논리량이며 로컬 C 드라이브 물리 반환과 구분한다. 모델/
+library 원본과 보고서는 보존했다. 저장·실행·성공·첫 실패·회수의 근거는 저장소 밖
+`reports/coordinator-integration/runtime-storage-20261005/`다. 실행된 source와 후속 문서
+head를 구분하고 영향 코드·Cargo·CI의 동일성에 근거해 검사 결과를 재사용한다.
+
+이 인수는 startup speedup·NN throughput·새 E launcher의 실제 paired 대국·E BT4
+profile 확장·정식 강도/Elo·학습·device transfer/kernel 계측을 완료한 근거가 아니다.
+세부 저장 경로·기본값·한도·cleanup·실제 witness는
+[저장 기록](research/PERFORMANCE-OPTIMIZATION-PLAN.md#13-실행별-native-library-복제-제거와-검증된-공유-저장)과
+[계약 연결 13장](CONTRACT-ADOPTION.md#13-런타임-저장-capability와-isolated-e-argv의-수동-연결)에 둔다.
