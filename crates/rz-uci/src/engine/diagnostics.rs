@@ -72,6 +72,7 @@ pub fn run(
     root_generation: u64,
     simulations: u64,
     wall: Duration,
+    final_move_policy: rz_search::tree::FinalMovePolicy,
 ) -> Result<SearchProbe, contract::ContractError> {
     #[cfg(feature = "experimental-batch")]
     let parallelism = factory.parallelism();
@@ -125,6 +126,7 @@ pub fn run(
     // Construct/validate Rules before opening the runtime. Every later exit drains it.
     let root_state = root.state.snapshot().identity();
     let mut search = ContractSearch::new(root, config)?;
+    search.set_final_move_policy(final_move_policy)?;
     search.observe_terminal_backups(true);
     search.set_source_trace(factory.source_trace());
     let mut runtime = factory.create(clock.clone(), authority.clone())?;
@@ -177,7 +179,7 @@ pub fn run(
                     }
                 }
                 ContractPumpEvent::Diagnostic(error)
-                | ContractPumpEvent::RejectedResult { error, .. } => return Err(error.clone()),
+                | ContractPumpEvent::RejectedResult { error, .. } => return Err(*error),
                 _ => {}
             }
             let next = search.outcome();
@@ -256,70 +258,77 @@ mod tests {
 
     #[test]
     fn rules_terminal_candidates_backup_and_final_choice() {
-        for &(name, fen) in TERMINAL_CASES {
-            let owners = Arc::new(OwnerRegistry::default());
-            let factory = CpuMockFactory::new(&owners, Duration::ZERO).unwrap();
-            let clock = ProcessClock::new(contract::ProcessEpoch(1));
-            let port = RulesUciPort::new(owners, PositionLimits::default());
-            let root = port
-                .prepare(&PositionSpec {
-                    base: PositionBase::Fen(fen.into()),
-                    moves: vec![],
-                })
-                .unwrap()
-                .snapshot;
-            let child_status = |mv: contract::Move| {
-                rz_search::contracts::ContractPosition::play(&root, &mv)
+        for final_policy in [
+            rz_search::tree::FinalMovePolicy::Visits,
+            rz_search::tree::FinalMovePolicy::ExactTerminal,
+        ] {
+            for &(name, fen) in TERMINAL_CASES {
+                let owners = Arc::new(OwnerRegistry::default());
+                let factory = CpuMockFactory::new(&owners, Duration::ZERO).unwrap();
+                let clock = ProcessClock::new(contract::ProcessEpoch(1));
+                let port = RulesUciPort::new(owners, PositionLimits::default());
+                let root = port
+                    .prepare(&PositionSpec {
+                        base: PositionBase::Fen(fen.into()),
+                        moves: vec![],
+                    })
                     .unwrap()
-                    .snapshot()
-                    .classification()
-                    .play_status
-            };
-            if name.ends_with("mate-one") {
-                assert!(
-                    root.legal().moves().iter().any(|&mv| matches!(
-                        child_status(mv),
-                        contract::PlayStatus::Terminal {
-                            reason: contract::TerminalReason::Checkmate,
-                            ..
-                        }
-                    )),
-                    "{name}"
-                );
-            }
-            let probe = run(
-                &factory,
-                &clock,
-                root.clone(),
-                1,
-                128,
-                Duration::from_secs(5),
-            )
-            .unwrap();
-            assert_eq!(probe.backup_errors, 0, "{name}");
-            assert_eq!(
-                probe.outcome.counters.completed_visits, probe.outcome.counters.accepted_backups,
-                "{name}"
-            );
-            if name.ends_with("-root") {
-                assert!(
-                    matches!(probe.outcome.status, ContractSearchStatus::Terminal { .. }),
-                    "{name}"
-                );
-                assert!(probe.outcome.best_move.is_none(), "{name}");
-                assert_eq!(probe.outcome.metrics.submissions, 0, "{name}");
-            } else {
-                let chosen = child_status(probe.outcome.best_move.expect(name));
-                let reason = if name.ends_with("mate-one") {
-                    contract::TerminalReason::Checkmate
-                } else {
-                    contract::TerminalReason::DeadPosition
+                    .snapshot;
+                let child_status = |mv: contract::Move| {
+                    rz_search::contracts::ContractPosition::play(&root, &mv)
+                        .unwrap()
+                        .snapshot()
+                        .classification()
+                        .play_status
                 };
-                assert!(
-                    matches!(chosen, contract::PlayStatus::Terminal { reason: found, .. } if found == reason),
-                    "{name}: {chosen:?}"
+                if name.ends_with("mate-one") {
+                    assert!(
+                        root.legal().moves().iter().any(|&mv| matches!(
+                            child_status(mv),
+                            contract::PlayStatus::Terminal {
+                                reason: contract::TerminalReason::Checkmate,
+                                ..
+                            }
+                        )),
+                        "{name}"
+                    );
+                }
+                let probe = run(
+                    &factory,
+                    &clock,
+                    root.clone(),
+                    1,
+                    128,
+                    Duration::from_secs(5),
+                    final_policy,
+                )
+                .unwrap();
+                assert_eq!(probe.backup_errors, 0, "{name}");
+                assert_eq!(
+                    probe.outcome.counters.completed_visits,
+                    probe.outcome.counters.accepted_backups,
+                    "{name}"
                 );
-                assert!(!probe.terminals.is_empty(), "{name}");
+                if name.ends_with("-root") {
+                    assert!(
+                        matches!(probe.outcome.status, ContractSearchStatus::Terminal { .. }),
+                        "{name}"
+                    );
+                    assert!(probe.outcome.best_move.is_none(), "{name}");
+                    assert_eq!(probe.outcome.metrics.submissions, 0, "{name}");
+                } else {
+                    let chosen = child_status(probe.outcome.best_move.expect(name));
+                    let reason = if name.ends_with("mate-one") {
+                        contract::TerminalReason::Checkmate
+                    } else {
+                        contract::TerminalReason::DeadPosition
+                    };
+                    assert!(
+                        matches!(chosen, contract::PlayStatus::Terminal { reason: found, .. } if found == reason),
+                        "{name}: {chosen:?}"
+                    );
+                    assert!(!probe.terminals.is_empty(), "{name}");
+                }
             }
         }
     }

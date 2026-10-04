@@ -411,6 +411,7 @@ pub struct EngineSettings {
     pub tree: TreeLimits,
     pub max_workers: usize,
     pub shutdown_limit: Duration,
+    pub final_move_policy: rz_search::tree::FinalMovePolicy,
 }
 impl Default for EngineSettings {
     fn default() -> Self {
@@ -434,6 +435,7 @@ impl Default for EngineSettings {
             },
             max_workers: 2,
             shutdown_limit: Duration::from_secs(2),
+            final_move_policy: rz_search::tree::FinalMovePolicy::Visits,
         }
     }
 }
@@ -922,6 +924,7 @@ impl Owner {
                 let factory = Arc::clone(&self.factory);
                 let clock = self.clock.clone();
                 let shutdown_limit = self.settings.shutdown_limit;
+                let self_final_move_policy = self.settings.final_move_policy;
                 let events = sender.clone();
                 let diagnostics = Arc::clone(&self.diagnostics);
                 let publication = Arc::new(Mutex::new(None));
@@ -968,6 +971,16 @@ impl Owner {
                         );
                     }
                     search.set_source_trace(factory.source_trace());
+                    if let Err(error) = search.set_final_move_policy(self_final_move_policy) {
+                        return finish_worker(
+                            &events,
+                            ticket,
+                            WorkerCompletion::failed(WorkerFailureSource::SearchConstructor(error)),
+                            &worker_publication,
+                            Some(runtime.as_mut()),
+                            shutdown_limit,
+                        );
+                    }
                     let mut previous_move = None;
                     let mut authority_error = None;
                     let mut diagnostic_failure = None;

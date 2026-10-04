@@ -81,6 +81,41 @@ fn complete_native_config_keeps_private_paths_out_of_debug() {
 }
 
 #[test]
+fn exact_terminal_final_policy_is_explicit_and_keeps_s0_reproducible() {
+    use rz_search::tree::FinalMovePolicy;
+    assert_eq!(
+        NativeConfig::parse(valid_arguments())
+            .unwrap()
+            .engine_settings()
+            .final_move_policy,
+        FinalMovePolicy::Visits
+    );
+    for (name, expected) in [
+        ("visits", FinalMovePolicy::Visits),
+        ("exact-terminal", FinalMovePolicy::ExactTerminal),
+    ] {
+        let mut args = valid_arguments();
+        args.push(format!("--final-selection={name}"));
+        assert_eq!(
+            NativeConfig::parse(args)
+                .unwrap()
+                .engine_settings()
+                .final_move_policy,
+            expected
+        );
+    }
+    let mut args = valid_arguments();
+    args.push("--final-selection=neural-mate".into());
+    assert_private_config_rejection(args);
+    let mut args = valid_arguments();
+    args.extend([
+        "--final-selection=visits".into(),
+        "--final-selection=exact-terminal".into(),
+    ]);
+    assert_private_config_rejection(args);
+}
+
+#[test]
 fn attestation_is_explicit_optional_and_duplicate_selection_is_rejected() {
     assert!(
         !NativeConfig::parse(valid_arguments())

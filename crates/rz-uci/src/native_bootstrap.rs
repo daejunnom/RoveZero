@@ -75,6 +75,7 @@ pub struct NativeConfig {
     raw_cache: bool,
     parallelism: usize,
     search_simulations: u64,
+    final_move_policy: rz_search::tree::FinalMovePolicy,
     source_weights: PathBuf,
     onnx_model: PathBuf,
     export_manifest: PathBuf,
@@ -103,8 +104,8 @@ impl fmt::Debug for NativeConfig {
             )
             .field("batch", &self.parallelism)
             .field("search_simulations", &self.search_simulations)
+            .field("final", &self.final_move_policy)
             .field("cuda_bundle_sha256", &self.cuda_bundle_sha256)
-            .field("cuda_bundle_selected", &self.cuda_bundle.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -116,6 +117,7 @@ impl NativeConfig {
         let mut raw_cache = false;
         let mut parallelism = None;
         let mut search_simulations = None;
+        let mut final_move_policy = None;
         let mut provider = None;
         let mut source_weights = None;
         let mut onnx_model = None;
@@ -179,6 +181,22 @@ impl NativeConfig {
                     "native CPU arguments require named asset/hash values",
                 ))?;
             match name {
+                "--final-selection" => {
+                    let selected = match value {
+                        "visits" => rz_search::tree::FinalMovePolicy::Visits,
+                        "exact-terminal" => rz_search::tree::FinalMovePolicy::ExactTerminal,
+                        _ => {
+                            return Err(NativeBootstrapError::Config(
+                                "unsupported final selection policy",
+                            ));
+                        }
+                    };
+                    if final_move_policy.replace(selected).is_some() {
+                        return Err(NativeBootstrapError::Config(
+                            "duplicate final selection policy",
+                        ));
+                    }
+                }
                 "--search-simulations" => {
                     if search_simulations.is_some() {
                         return Err(NativeBootstrapError::Config(
@@ -282,6 +300,7 @@ impl NativeConfig {
             raw_cache,
             parallelism,
             search_simulations: search_simulations.unwrap_or(128),
+            final_move_policy: final_move_policy.unwrap_or_default(),
             source_weights: source_weights.ok_or_else(missing)?,
             onnx_model: onnx_model.ok_or_else(missing)?,
             export_manifest: export_manifest.ok_or_else(missing)?,
@@ -308,6 +327,7 @@ impl NativeConfig {
             ..crate::engine::EngineSettings::default()
         };
         settings.search.max_simulations = self.search_simulations;
+        settings.final_move_policy = self.final_move_policy;
         settings
     }
     fn source_journal(

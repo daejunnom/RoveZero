@@ -151,6 +151,7 @@ fn probe(
             index as u64 + 1,
             config.engine_settings().search.max_simulations,
             Duration::from_millis(wall),
+            config.engine_settings().final_move_policy,
         )?;
         let final_status = probe
             .outcome

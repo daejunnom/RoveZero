@@ -400,6 +400,14 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         self.observe_terminals = enabled;
         self.terminal_observation = None;
     }
+    pub fn set_final_move_policy(
+        &mut self,
+        policy: crate::tree::FinalMovePolicy,
+    ) -> Result<(), ContractError> {
+        self.tree
+            .set_final_move_policy(policy)
+            .map_err(tree_boundary)
+    }
 
     pub fn take_terminal_observation(&mut self) -> Option<TerminalBackupObservation> {
         self.terminal_observation.take()

@@ -129,6 +129,15 @@ pub struct Selection<M> {
     pub leaf: Leaf,
 }
 
+/// S0 remains visit-first. S1 ranks only committed exact terminal children.
+/// An estimated +/-1, an unvisited child or a winning descendant is not proof.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FinalMovePolicy {
+    #[default]
+    Visits,
+    ExactTerminal,
+}
+
 #[derive(Debug)]
 struct Edge<M> {
     mv: M,
@@ -155,6 +164,7 @@ pub struct Tree<M, P = Puct> {
     edge_count: usize,
     limits: TreeLimits,
     policy: P,
+    final_move_policy: FinalMovePolicy,
     owner: Arc<()>,
     next_serial: u64,
     pending: Option<Pending>,
@@ -188,6 +198,7 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
             edge_count: 0,
             limits,
             policy,
+            final_move_policy: FinalMovePolicy::Visits,
             owner: Arc::new(()),
             next_serial: 0,
             pending: None,
@@ -209,7 +220,22 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
     }
 
     pub fn policy_identity(&self) -> PolicyIdentity {
-        self.policy.identity()
+        let mut identity = self.policy.identity();
+        if self.final_move_policy == FinalMovePolicy::ExactTerminal {
+            identity
+                .configuration
+                .push_str(";final_selection=exact-terminal-child-v1");
+        }
+        identity
+    }
+    pub fn set_final_move_policy(&mut self, policy: FinalMovePolicy) -> Result<(), SearchError> {
+        if self.counters.selections != 0 || self.has_pending() {
+            return Err(SearchError::InvalidConfiguration(
+                "final policy fixed before selection",
+            ));
+        }
+        self.final_move_policy = policy;
+        Ok(())
     }
     pub fn counters(&self) -> SearchCounters {
         self.counters
@@ -314,11 +340,26 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
             return None;
         };
         let mut best = 0;
+        let rank = |edge: &Edge<M>| {
+            if self.final_move_policy != FinalMovePolicy::ExactTerminal || edge.stats.visits == 0 {
+                return 0_i8;
+            }
+            // The child's exact utility is from its turn; root wins are -1 there.
+            match edge.child.and_then(|index| self.nodes.get(index)) {
+                Some(Node::Terminal(value)) if *value == -1.0 => 1,
+                Some(Node::Terminal(value)) if *value == 1.0 => -1,
+                _ => 0,
+            }
+        };
         for i in 1..edges.len() {
             let candidate = edges[i].stats;
             let current = edges[best].stats;
-            if candidate.visits > current.visits
-                || (candidate.visits == current.visits && candidate.q() > current.q())
+            let candidate_rank = rank(&edges[i]);
+            let current_rank = rank(&edges[best]);
+            if candidate_rank > current_rank
+                || (candidate_rank == current_rank
+                    && (candidate.visits > current.visits
+                        || (candidate.visits == current.visits && candidate.q() > current.q())))
             {
                 best = i;
             }
@@ -1048,6 +1089,70 @@ mod tests {
         };
         edges[0].stats.visits = 5;
         assert_eq!(tree.best_move(), Some(&"a"));
+    }
+
+    #[test]
+    fn exact_final_policy_never_promotes_neural_values_or_winning_descendants() {
+        let now = Instant::now();
+        let mut tree = Tree::baseline(TreeLimits::default()).unwrap();
+        tree.set_final_move_policy(FinalMovePolicy::ExactTerminal)
+            .unwrap();
+        root(
+            &mut tree,
+            now,
+            vec!["estimated", "mate", "draw"],
+            &[0.98, 0.01, 0.01],
+        );
+        // One winning continuation is not proof against all opponent replies.
+        tree.nodes.push(Node::Expanded(vec![Edge {
+            mv: "one-winning-reply",
+            stats: EdgeStats {
+                prior: 1.0,
+                visits: 1,
+                value_sum: 1.0,
+            },
+            child: Some(4),
+        }]));
+        tree.nodes.push(Node::Terminal(-1.0));
+        tree.nodes.push(Node::Terminal(0.0));
+        tree.nodes.push(Node::Terminal(-1.0));
+        let Node::Expanded(edges) = &mut tree.nodes[0] else {
+            panic!("root")
+        };
+        for (index, (visits, value_sum)) in [(1000, 1000.0), (1, 1.0), (200, 0.0)]
+            .into_iter()
+            .enumerate()
+        {
+            edges[index].child = Some(index + 1);
+            edges[index].stats.visits = visits;
+            edges[index].stats.value_sum = value_sum;
+        }
+        let before = tree.root_stats();
+        assert_eq!(tree.best_move(), Some(&"mate"));
+        assert_eq!(tree.root_stats(), before); // selection cannot invent a visit/backup
+        // An unvisited terminal-shaped child is not admitted proof.
+        let Node::Expanded(edges) = &mut tree.nodes[0] else {
+            panic!("root")
+        };
+        edges[1].stats.visits = 0;
+        edges[1].stats.value_sum = 0.0;
+        assert_eq!(tree.best_move(), Some(&"estimated"));
+    }
+
+    #[test]
+    fn rejected_terminal_guard_cannot_influence_exact_final_selection() {
+        let now = Instant::now();
+        let mut tree = Tree::baseline(TreeLimits::default()).unwrap();
+        tree.set_final_move_policy(FinalMovePolicy::ExactTerminal)
+            .unwrap();
+        root(&mut tree, now, vec!["unproved"], &[1.0]);
+        let selection = tree.begin_selection(now).unwrap();
+        let child = tree.pending.as_ref().unwrap().leaf;
+        tree.accept_terminal_with_guard(&selection.ticket, -1.0, now, || false)
+            .unwrap();
+        assert!(matches!(tree.nodes[child], Node::Unexpanded));
+        assert_eq!(tree.root_stats()[0].1.visits, 0);
+        assert!(tree.set_final_move_policy(FinalMovePolicy::Visits).is_err());
     }
 
     #[test]
