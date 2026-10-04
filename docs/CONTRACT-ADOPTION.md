@@ -371,3 +371,25 @@ report로 확대하지 않으며, cache 재사용·물리 실행·실제 방문�
 조상으로 포함하므로 #17 반영 후 추가 최적화·수동 조정이 남는다. squash/rebase로
 조상을 재작성하면 base와 충돌·검사 재사용 자격을 다시 확인한다. 병합 준비를 실제
 develop 병합·GPU 성능·정식 대국 인수로 보고하지 않는다.
+
+## 11. BT4 단일 profile의 총괄 수동 접점 대조
+
+2026-10-04 총괄은 공통 revision 0.1을 유지하면서 C asset profile·graph interface·
+classical encoder/ordered policy·manifest model ID, C/D admission과 B native bootstrap/
+CUDA receipt를 수동으로 맞췄다. Maia exact pin과 16 MiB/두 출력 검사는 유지하고
+BT4 exact gzip+protobuf pin·768 MiB/세 출력만 별도 허용했다. MLH는 탐색 미소비다.
+`MaiaAsset` 호환 별칭이나 legacy backend 이름을 모델 identity 대신 사용하지 않는다.
+BT4 개별 rights 미확인과 redistribution false도 strict manifest의 검증 대상이다.
+
+profile별 CUDA arena/session 선언은 Maia 1 GiB·BT4 3 GiB로 일치시켰다. D의 physical
+예약과 별도 session 선언은 실측 VRAM·global hard cap과 구분한다. CPU V1 의미·
+CUDA V1 필드 집합·Computed-only B1은 유지한다. default 128과 explicit native
+1..4096 simulation, root·worker·취소/완료 순서도 별도 검증했다.
+
+수치 gate는 `aa0cc024`의 actual A/C/D CPU/CUDA 12개, 후속 UCI는 `78b7c535`의
+새 release binary·실제 CUDA·guarded root 소비·18 query·confirmed final drain이다.
+두 소스 사이 변경은 B UCI 네 파일뿐임을 직접 확인했다. 이 동일성은 수치 영향
+경로의 재사용 근거이며 앞 gate가 후속 B 시계/전체 race까지 검사했다는 뜻이 아니다.
+전체 workspace tests·strict Clippy·두 OS CI와 모델 연결은 통과했으나 독립 deadline/
+stop의 물리 fence, RZ NPS/per-root journal, 정식 paired 강도와 학습은 별도 인수다.
+관련 증거와 제한은 [통합 기록](INTEGRATION-STATUS.md)·[BT4 실행 기록](research/LOCAL-MODEL-BASELINE.md)을 따른다.

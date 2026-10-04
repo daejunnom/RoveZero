@@ -63,6 +63,8 @@
 | RZ-D034 | 사용자 후속 지정·CPU 최적화 검증 / 2026-10-03 | GPU A/B 전에 의미 보존 중복·자료 복제·병목을 조사·해결한다. `1cdd707`에서 Rules export/부모 fork/preview delta/불변 profile hash의 중복을 줄이고 상태 witness·CPU 교차 측정·양 OS CI를 확인했다. Community 4090 등 live 후보를 조회하며 network volume을 사용하지 않고 초기 총 지출 가능액 약 US$200 안에서 유한 하위 예산을 둔다. 사용자 지정 Oracle에는 작은 원본 연구 자료와 provenance를 검증해 보존한다. key 내용은 읽지 않고 지정 SSH 인증에만 사용하며 Pod Env 등록은 사용자 담당이다. 실제 Pod·GPU A/B는 미실행이고 GPU 선택·환경/명세·과금 종료 조건은 실행 전 잠근다. [사전 최적화](research/PRE-RUNPOD-OPTIMIZATION.md), [외부 계획](research/RUNPOD-BENCHMARK-PLAN.md)을 따른다. |
 | RZ-D035 | 사용자 후속 요청·총괄 조사 / 2026-10-04 | Maia의 강도 한계를 검토하고 로컬 LC0 실행과 모델 교체/추가 학습 계획을 준비한다. 공식 LC0 v0.32.1 Windows CUDA package의 digest, Maia와 동결 T1 distilled의 실제 로컬 GPU smoke, T1 원본 구조/직접 제작자 허가를 확인한다. 현재 Rust Maia exact profile과 계약 0.1은 유지한다. 총괄 권고는 B/D의 WorkerLimit·물리 완료·128 simulation 상한을 별도 검증하고 C의 동결 강도용 모델 호환을 먼저 인수한 뒤 F02를 진행하는 순서다. 이번 조사는 모델 승격·실제 학습·새 유료 GPU·정식 강도 성공을 뜻하지 않는다. [전환 계획](research/LOCAL-MODEL-BASELINE.md)을 따른다. |
 
+| RZ-D036 | 사용자 BT4 실제 적용·벤치마크 지정 / 2026-10-04 | BT4-it332 단일 원본을 별도 source/export/model profile로 Rust CPU/CUDA에 연결하고 같은 원본의 native LC0 FP32·RoveZero FP32·별도 LC0 FP16 로컬 위치 벤치마크와 개발 pair를 실행한다. Maia exact profile·공통 계약 0.1·자체 Rules/PUCT를 유지한다. BT4 개별 license는 미확인·재배포 false로 보존하고 실제 학습은 시작하지 않는다. 기본 128 simulation은 유지하며 native에 유한 1..4096 선택을 추가한다. raw 실패·시간/물리 완료 공백·즉시 메이트 선택 한계를 보존하고 개발 표본을 정식 강도/Elo/훈련 인수로 승격하지 않는다. [실행 기록](research/LOCAL-MODEL-BASELINE.md)을 따른다. |
+
 ## 남은 결정과 실행 전 잠금
 
 기존 ID를 유지한다. `부분 결정`인 행의 확정 부분을 다시 미정으로 취급하지 않는다.

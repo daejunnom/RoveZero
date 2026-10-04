@@ -9,7 +9,7 @@
 
 ## 1. 현재 기준선의 한계와 확인된 사실
 
-- 현재 Rust evaluator는 Maia1 v1.0 `maia-1900`의 6개 SE residual block·64 channel
+- 최초 `develop` 기준 Rust evaluator는 Maia1 v1.0 `maia-1900`의 6개 SE residual block·64 channel
   CNN이다. 인간의 수를 예측하는 호환·런타임 기준선으로 선정했다. 이름의 1900은
   현재 RoveZero의 Elo나 엔진 강도 보장이 아니다.
 - CNN이라는 구조만으로 결함을 판정하지 않는다. 학습 목표·가중치 품질, 입력/
@@ -18,8 +18,9 @@
 - 기존 48판은 같은 Maia·같은 PUCT의 pending/batch 폭 1/4 내부 비교였고 득점률은
   50%였다. 강한 모델이나 LC0와의 대국 근거가 아니다. WorkerLimit/legal fallback
   3건과 bestmove 뒤 physical GPU 완료·소비 journal의 공백을 보존한다.
-- 현재 B의 기본값과 설정 검증에는 **128 simulation 상한**이 있다. 모델을 교체해도
-  이 상한과 시간 제어·수명 문제가 자동으로 해결되지는 않는다. LC0의 UCI nodes와
+- 최초 B의 기본값과 설정 검증에는 **128 simulation 상한**이 있었다. 후속 BT4 연결에서
+  기본값 128은 보존하고 native 실행에 `--search-simulations=1..4096`을 추가했다.
+  예산 확장과 시간 제어·수명 문제의 해결은 별도다. LC0의 UCI nodes와
   RoveZero simulation을 같은 비용·같은 방문으로 취급하지 않는다.
 
 근거: [Maia 공식 설명](https://github.com/CSSLab/maia-chess),
@@ -131,97 +132,142 @@ body enum 이름만 보고 SE CNN이라고 해석하지 않는다. 실제 encode
 [제작자 답변](https://github.com/orgs/LeelaChessZero/discussions/2430)
 
 공식 표의 약 1.6 GB는 안내값이다. 이번 장치 전체 표본의 1,169 MiB와 정의가 다르다.
-BT4-it332는 강한 외부 비교/교사 후보로 보존하지만 공식 약 4 GB 안내만으로 이 장치의
-동시 점유·속도·권리·학습 적합성을 인수하지 않는다. 이번에는 다운로드·실행하지 않았다.
+이 초기 T1 조사에서는 BT4를 실행하지 않았다. 후속 사용자 지정에 따라 아래 BT4를
+실제로 적용했다. 공식 약 4 GB 안내만으로 동시 점유·속도·권리·학습 적합성을 판단하지 않는다.
 
-## 4. 구현·인수 순서
+## 4. BT4-it332 실제 Rust 연결과 수치 인수
 
-| 순서 / 담당 | 작업과 완료 조건 |
+2026-10-04 사용자가 BT4-it332 적용과 native LC0/RoveZero 벤치마크를 지정했다.
+RoveZero의 자체 Rules·최소 PUCT·runtime은 그대로 사용하고 평가 모델만 BT4로 선택했다.
+LC0는 원본 수치 참조·converter·외부 상대이며 RoveZero의 탐색을 대신 실행하지 않는다.
+
+| 잠근 식별자 | 값 |
 |---|---|
-| 1 / 총괄·B·D | WorkerLimit 3건의 정확한 요청/세대/마감 원인을 재현한다. bestmove 전에 취소된 작업의 physical drain을 확인하고, game/root/request별 fresh 실행·cache 소비·유효 backup·deadline fallback을 기록한다. 실패를 숨기거나 로그만 줄이지 않는다. |
-| 2 / B·총괄 | 128 simulation을 안전한 설정 상한과 T1/T2 시계로 분리한다. queue·tree·RAM·시간 상한과 stop/quit/drain을 유지한다. 기존 알고리즘 고정 상태에서 예산 변경을 따로 대조한다. |
-| 3 / C·총괄 | Maia의 exact profile을 보존하며 T1용 immutable model/export descriptor와 source digest·권리 근거·새 모델 ID를 추가한다. raw/exact cache namespace를 분리하고 newgame/model 교체에서 잘못된 재사용을 차단한다. |
-| 4 / C | 확인한 T1 외부 FP32 ONNX의 80.9 MB·출력 3개를 별도 bounded profile로 연결한다. 현재 Maia의 16 MiB·출력 2개 검사는 유지한다. classical 입력은 가능한 기존 구현을 재사용하되 독립 reference로 대조한다. attention policy·WDL·moves-left의 사용/미사용을 명시한다. MLH를 제거하는 export는 P/WDL 보존 수치와 새 digest를 검증하고 미지원 모델은 거부한다. |
-| 5 / C·D·총괄 | 같은 T1 원본의 CPU reference ↔ ONNX CPU/FP32 ↔ Rust CPU ↔ 로컬 CUDA/FP32 수치 대조. batch 1/2/4/8/16, 양쪽 차례·history·반복·castling/EP/네 승격을 포함한다. FP16은 통과한 FP32 기준 이후 별도 변경으로 검사한다. |
-| 6 / E·총괄 | 다음 표의 대조군과 유한 manifest를 잠근 뒤 개발 대국을 실행한다. 같은 full start/history의 흑백 pair, 전체 PGN 감사, 실제 소비·실패·자원·물리 완료를 기록한다. 결과를 본 뒤 유리한 제외/중단을 선택하지 않는다. |
-| 7 / F·C·총괄 | 동결 강도용 모델을 실제 Rust 엔진이 사용한 기준선과 병목·실패군을 확보한 뒤, 아래 F02 학습 경로를 하나만 선택한다. |
+| 공식 원본 | [BT4-1024x15x32h-swa-6147500-policytune-332.pb.gz](https://storage.lczero.org/files/networks-contrib/BT4-1024x15x32h-swa-6147500-policytune-332.pb.gz) |
+| gzip bytes / SHA-256 | 382,645,315 / `e6ada9d6c4a769bfab3aa0848d82caeb809aa45f83e6c605fc58a31d21bdd618` |
+| protobuf bytes / SHA-256 | 382,616,086 / `d6e4bbf289bea1fe312b7a0286106aeb713760b604c932ef8cdeebf16a23f36c` |
+| 형식 | 최소 LC0 0.30.0, LINEAR16 저장, classical 112-plane, attention body/policy, WDL, MLH |
+| body | encoder 15·head 32·embedding 1024·FFN 1536, dense positional embedding |
+| 변환 | 고정 LC0 `fd71a2d921b689c5f479d3227c3806c8e272d9c5`, `leela2onnx`, FP32·opset 17·policy vanilla·value winner |
+| ONNX bytes / SHA-256 | 741,143,425 / `2839171c39fe660ca5fa35983bba7d0b403bc6e70b56a06b88a06b406d057518` |
+| graph | node 822·initializer 553·external tensor 0, 동적 batch input `[B,112,8,8]`, policy `[B,1858]`, WDL `[B,3]`, MLH `[B,1]` |
+| export manifest SHA-256 | `9aeed58b0c8a3cc5ab7a684ae9e5de567028d79f9a0ccf0c81f6fd0df861e279` |
+| 권리 | 개별 weights license 미확인, `UNVERIFIED-local-research-only`, `redistribution_ready=false`; 원본·변환본은 외부 보존 |
 
-공통 의미 계약 0.1은 이번 조사에서 변경하지 않는다. 모델의 구체 구조를 공통 search
-타입에 고정하지 않는다. 현재 `MaiaAsset`는 원본 두 digest, converter, GPL profile,
-FP32 출력 이름과 **16 MiB ONNX 상한**을 고정해 검사한다. 이를 삭제하거나 기존
-Maia ID 아래 T1을 넣는 구현은 거부한다. C/B/D 접점은 총괄이 최신 source와 수동 대조한다.
-GPU 없는 C/F 에이전트는 parser·export·CPU fixture·training adapter를 먼저 제공할 수 있다.
+`AssetProfile::Bt4It332`은 두 원본 digest가 함께 일치해야 선택된다. Maia의 exact
+source·16 MiB ONNX 상한과 기존 license 검사를 보존하고 BT4만 768 MiB 상한·세 출력으로
+분리했다. `MaiaAsset`는 `SelectedAsset`의 호환 별칭이며 모델 ID/cache namespace는
+manifest identity로 구분한다. BT4 MLH는 검증한 graph에 존재하지만 RoveZero 탐색은
+소비하지 않는다. native LC0와의 차이를 단일 PUCT 효과로 해석하지 않는다.
 
-### 모델·엔진·탐색·학습 효과의 분리
+큰 원본 검증은 64 KiB 버퍼로 gzip을 스트리밍하며 protobuf 전체 복제를 피한다.
+CUDA arena/session 선언은 Maia 1 GiB·BT4 3 GiB로 C/D/native receipt에 함께 적용했다.
+이 선언은 **전체 VRAM 실측·외부 hard cap이 아니다.** CUDA/FP32·TF32 off·CPU fallback
+금지와 실제 node placement·19-file bundle 검증을 유지한다. 공통 계약 revision은 0.1이다.
 
-| 비교 | 고정할 것 / 해석 |
+C/A/D 수치 인수 소스는 `aa0cc0247b9d7041e4525b2021363d0617cfd0bc`이며 고정 12개
+독립 LC0 Eigen 원본 참조를 사용했다. 양쪽 차례·충분/짧은 이력·반복·같은 보드와
+다른 이력·EP·양쪽 캐슬링·네 승격을 포함한다. 외부 ONNX CPU의 허용 오차는 실행 전
+raw logit `5e-4`, WDL·합법 policy `1e-4`, batch/single `5e-4`로 잠갔다. 관측 최대는
+각각 **6.4373e-5 / 4.7684e-7 / 4.5773e-6**이고 batch 2/4/8/16 차이는 0이었다.
+
+Rust C raw CPU/CUDA의 12개 참조·batch 1/2/4/8/16·worker 검사를 통과했다. Rust CUDA
+raw 검사에는 GPU에서 실행한 node 687개가 기록됐으며 batch/single 차이 최대는
+`1.9253e-5`다. 실제 A immutable 상태→C→D CPU/CUDA 검사도 각각 12개(No 5·Repeat 7)
+통과했고 physical drain·잔여 예약 0을 확인했다. 이는 수치·해당 수명 경로의 인수이며
+모든 취소 race·전체 UCI 시계 공정성·강도 인수가 아니다. CUDA 원본 수치 검사의
+raw logit 허용값은 `atol=1e-4, rtol=1e-3`, WDL·합법 policy는 `1e-4`다.
+
+## 5. 동일 BT4의 로컬 위치 벤치마크
+
+실행 소스는 `78b7c53502cadaff77fc6de5f0832eee55b9938c`, RoveZero binary SHA-256은
+`1a4b976b4110d251e21b09ed1e1f29b398b4ed01f533788a941de8dc4be969b3`다.
+6개 상태 × `go nodes 128`/`go movetime 1000`/`go movetime 5000`을 각 profile에서
+실행해 **54개 합법 착수·세 process exit 0**을 확인했다. 각 상태/조건은 단일 표본이다.
+
+| profile | 실행 조건 | 전체 장치 관측 최대 VRAM | 준비→ready |
+|---|---|---:|---:|
+| LC0 FP32 | Windows v0.32.1 `cuda`, max_batch 256/min_batch 4, minibatch 16 | 2,009 MiB | 1.79초 |
+| RoveZero FP32 | Ubuntu WSL2 ORT 1.22 CUDA, TF32 off, B1, 4096 simulation cap | 1,131 MiB | 36.41초 |
+| LC0 FP16 | 별도 정밀도 profile `cuda-fp16`, 나머지 LC0 옵션 동일 | 1,083 MiB | 2.67초 |
+
+VRAM은 250 ms 간격 `nvidia-smi`의 **전체 장치 관측값**이다. 짧은 peak·process별 peak·
+모든 batch 크기의 요구량을 보장하지 않는다. 공식 약 4 GB는 조건이 고정된 실측값이
+아니며 이번 제한된 batch에서는 6 GB 장치에 실행할 수 있었다. FP16 LC0를 FP32
+RoveZero와 같은 정밀도의 알고리즘 성능 비교로 사용하지 않는다.
+
+| 일반 opening 세 상태의 중앙 bestmove 응답 | LC0 FP32 | RoveZero FP32 | LC0 FP16 |
+|---|---:|---:|---:|
+| `nodes 128` 요청 | 1,051.10 ms | 1,679.71 ms | 272.90 ms |
+| `movetime 1000` 요청 | 991.81 ms | 1,012.76 ms | 992.15 ms |
+| `movetime 5000` 요청 | 4,998.02 ms | 5,058.68 ms | 4,997.90 ms |
+
+일반 opening은 start/Ruy-black/Sicilian이며 각각 한 번 실행했다. LC0의 실제 nodes는
+요청값보다 많을 수 있고 RoveZero simulation과 동일한 단위가 아니다. RoveZero는
+이번 UCI에서 `info nodes/nps/pv`를 제공하지 않아 NPS/PV 비교는 **미측정**이다.
+LC0의 36개 printed PV만 독립 oracle로 검증했다. raw 초기 auditor의 PV bool은
+미제공 PV도 true로 표시했으므로 별도 `positions/analysis.json`에 존재 여부와 null을
+명시했다. raw 결과는 보존하며 미제공 PV 검증을 주장하지 않는다.
+
+양쪽 차례 mate-in-one × 세 요청에서 LC0 두 profile은 각각 **6/6**, RoveZero는
+**0/6**의 즉시 메이트를 선택했다. RoveZero는 백 `g6f6`, 흑 `g3f3`을 선택했고 모두
+합법이다. 현재 root 선택은 방문 수 우선이며 확정 메이트 우선 처리나 MCTS solver가
+없다. 이 관측만으로 가치 부호 오류나 BT4 인코딩 실패라고 단정하지 않는다. 강한
+weights를 넣어도 최소 탐색이 LC0 수준이 되지는 않는다는 구체적인 후속 검증 대상이다.
+
+RoveZero 일반 상태 5초 응답의 최댓값은 5,295.06 ms다. Expired/Stale 진단을 보존했고
+WorkerLimit/LegalFallback 문구는 없었다. 문구 개수는 고유 요청 실패 수가 아니다.
+자연 완료 경로는 runtime shutdown을 완료한 뒤 Event::Complete를 게시하도록 보완하고
+일부러 shutdown을 지연하는 회귀 검사를 통과했다. 독립 hard deadline/stop의 물리 GPU
+시간 공정성은 아직 인수하지 않았다. Windows/WSL·CPU 자원·batch/runtime도 다르므로
+결과는 로컬 배치 구성 벤치마크이며 정식 강도·순수 탐색 알고리즘 우위가 아니다.
+
+첫 native 설정 `max_batch=16,min_batch=1`은 FP32/FP16 모두 CUDA invalid argument로
+실패했다. 실패 로그를 보존하고 **256/4**를 별도 설정으로 다시 잠가 성공했다.
+두 값을 함께 바꿨으므로 특정 min_batch가 원인이라고 확정하지 않는다.
+
+## 6. 개발 대국과 후속 작업
+
+같은 BT4 FP32·장치에서 서로 색을 교환하는 개발 대국 4쌍/8판을 준비했다. 기존
+개발 opening 목록 첫 4개·완전한 8-ply prefix, 수당 500 ms·별도 host/transport 여유
+100 ms, 전체 1,200초·판당 총 256 ply·worker pair 1을 실행 전 manifest에 잠갔다.
+현재 Available인 threefold/fifty-move를 자동 수락하며 불법 수·시간패·crash는 loss,
+인프라 실패는 abort·원본 보존, cutoff는 Incomplete로 집계한다. 기존 개발 pool이며
+독립 holdout이 아니다. 시계/자원의 위 공백 때문에 `formal_strength_eligible=false`다.
+최종 결과·전체 PGN·A Rules 감사는 아래 통합 상태와 외부 보고서에 추가한다.
+
+| 담당 / 다음 순서 | 구현·인수 조건 |
 |---|---|
-| LC0(Maia) ↔ LC0(T1) | 같은 LC0·시간·backend/정밀도·자원/옵션. 가중치와 구조 교체의 외부 엔진 안 효과 |
-| RoveZero(Maia) ↔ LC0(Maia) | 같은 원본 모델/입력·전체 시계/자원. 엔진 전체 차이이며 PUCT 한 요소의 효과라고 하지 않음 |
-| RoveZero(Maia) ↔ RoveZero(T1) | 같은 source·PUCT·runtime·시간/자원. 가중치/구조 교체의 내부 효과 |
-| RoveZero(T1, S0) ↔ RoveZero(T1, S1) | 같은 동결 가중치에서 탐색 변경의 CONTROL-0→1 |
-| RoveZero(T1, S1) ↔ RoveZero(T1-finetuned, S1) | 같은 탐색에서 학습 변경의 CONTROL-1→2 |
+| B·총괄 | 위 mate-in-one을 실제 root stats·확정 terminal 발견 여부로 재현한다. 확정 승패의 root 선택/solver 변경은 S 변경으로 별도 revision·CONTROL-0→1·전술 회귀·같은 weights 대국으로 검증한다. |
+| B·D·총괄 | 독립 마감/stop에서 bestmove와 물리 GPU 완료의 순서, 현재 game/root별 accepted visits·fresh/cached 실행과 지연을 계측한다. 시간 여유 확대만으로 원인을 숨기지 않는다. |
+| C·D | BT4 B1/FP32의 준비·대기·전송·GPU·backup 비용을 분리한다. batch/FP16/Graph 변경은 한 번에 하나씩 별도 수치·수명·VRAM 인수를 거친다. |
+| E·총괄 | 같은 OS·CPU 자원·정밀도·whole-wall 시계와 GPU 물리 fence를 잠근 정식 pair, 별도 holdout·사전 표본/통계/중단 기준을 마련한다. 개발 8판을 Elo로 변환하지 않는다. |
+| F·C | 권리와 실제 trainer/export round-trip을 확인한 뒤 학습을 검토한다. 모델 변경과 탐색 개선의 효과를 한 실험에 섞지 않는다. |
 
-FP16 LC0와 기존 FP32 RoveZero, Windows와 WSL의 결과를 단일 알고리즘 차이로 부르지
-않는다. 최종 같은 자원 대국에는 backend/정밀도/OS·CPU·GPU·메모리·초기화·cache·
-ponder·시간 여유까지 고정한다. 외부 LC0 프로세스는 비교/오프라인 교사이며 자체 평가
-API의 자동 fallback이나 Rust engine 구현의 대체가 아니다.
+원시·정리 근거의 논리 루트는 저장소 밖
+`reports/coordinator-integration/bt4-benchmark-20261004/`다. 고정 모델/manifest,
+참조 fixture·오차, failed native 설정, 54개 query/log/VRAM 표본, binary/source pin,
+startup/termination·감사·PGN을 보존한다. 코드·가중치·raw PGN을 문서에 내장하지 않는다.
 
-첫 후속 개발 대국의 제안은 24쌍·48판, worker 1, 수당 1초, 전체 30분/400 ply 상한이다.
-표본·오프닝·실패/미완료·시계와 실제 자원은 실행 전에 하나의 manifest로 확정한다.
-제안값은 현재 실행 권한·정식 승격 기준이 아니다. 이미 본 24오프닝은 개발 pool로
-취급하고 승격용 holdout은 별도로 잠근다.
+## 7. 학습 계획과 완료 경계
 
-## 5. 추가 학습의 두 경로와 자원 계획
+동결 BT4의 로컬 실행은 확인했지만 **BT4 개별 학습·수정·재배포 권리는 미확인**이다.
+현재 F의 `LinearFixture`는 실제 BT4/Maia/T1 trainer가 아니다. 6 GB 추론 성공을 BT4
+학습 적합성으로 사용하지 않는다. BT4 학습을 실행하기 전에 원본 tensor의 trainable
+복원·frozen round-trip·gradient/optimizer·checkpoint/resume·ONNX parity·optimizer
+메모리와 microbatch를 따로 인수한다. 권리가 확인된 T1은 작은 대안으로 보존하며,
+기존 구조 미세조정과 작은 학생 증류는 독립 후속 경로로 유지한다.
 
-**우선 경로:** T1 원본 구조를 유지한 미세조정이다. 원본 tensor→trainable checkpoint→
-동결 round-trip export가 출력을 유지해야 시작한다. 일부 parameter를 누락/랜덤으로
-채우고 원본 복원에 성공했다고 하지 않는다. policy/WDL와 moves-left의 사용 여부,
-관점·label 의미를 고정하고 강한 교사 분석과 실제 결과를 서로 다른 target으로 저장한다.
+같은 weights의 탐색 CONTROL-0→1을 먼저 비교하고 같은 S1에서 학습 CONTROL-1→2를
+분리한다. 교사 raw policy·search visits·WDL·cp의 의미, game/opening split·중복/전이
+누출·validation/holdout과 checkpoint 선택을 잠근다. 256예제/200 step/20분은 과거
+학습 smoke 제안이며 이번 실행값이 아니다. 실제 학습·교사 dataset 생성·새 유료 GPU는
+실행하지 않았다. 세부 조건은 [TRAINING-PLAN](../TRAINING-PLAN.md)을 따른다.
 
-**후속 대안:** 추론 비용이 병목이면 작은 CNN 학생에게 강한 LC0/T1 policy·WDL를
-증류한다. Maia 구조·checkpoint를 출발점으로 쓸 수 있어도 인간 수 예측을 계속 학습하는
-것과 대국 강도 목표의 교사 증류를 구분한다. T1 fine-tuning과 학생 distillation을
-한 실험에 섞지 않는다. CNN을 처음부터 재학습하거나 새 latent/recurrent 구조를
-추가하는 F03은 이 두 기준선 이후 별도 실험이다.
-
-현재 F의 `LinearFixture`는 합성 숫자 feature와 작은 CPU linear head의 loss·checkpoint·
-resume 구현이다. 실제 Maia/T1 body를 학습하거나 Rust ONNX로 export하는 trainer는
-아직 없다. recipe 파일과 lifecycle test 통과를 실제 모델 학습 인수로 승격하지 않는다.
-
-첫 **제안** 예산은 local RTX 4050에서 2,000개 position의 교사/label audit, 256개 학습
-예제로 overfit/gradient/export smoke, 최대 200 optimizer step·20분·worker 1이다.
-microbatch 1부터 VRAM을 재며 accumulation으로 유효 batch를 정한다. GPU 전체 점유
-상한·RAM·teacher 시간·data/checkpoint/output bytes와 cancellation을 manifest로
-잠그고 한 번의 실패 원인을 보존한다. OOM 뒤 batch/정밀도를 조용히 변경하지 않는다.
-추론 약 1.2 GB 관측을 6 GB training 적합성 증거로 사용하지 않는다.
-
-소규모 smoke가 통과하면 game/opening 단위 train/validation/holdout, 중복·전이 누출
-감사, frozen baseline, seed·checkpoint 선택 규칙을 고정한 bounded pilot로 확장한다.
-교사 원시 policy·search visits·WDL·cp의 의미를 구분하고 필요한 교사 출력이 없으면
-scalar score를 확률/방문 수로 만들어 채우지 않는다. validation loss·전술/유일 방어·
-endgame·특수 수의 tail failure와 같은 시간 paired 대국을 각각 평가한다.
-
-훈련 스택은 기존 F의 Python 경로에서 PyTorch 등 실제 autograd backend를 비교할
-제안이다. Rust inference 결정과 training 언어는 별개다. 새 유료 GPU/장시간 학습은
-필요한 모델·데이터·시간·총비용·보존 조건이 확정된 뒤 실행한다. 이번 조사에서는
-실제 fine-tuning·교사 dataset 생성·유료 GPU 사용을 시작하지 않았다.
-
-## 6. 이번 조사 인수와 다음 실행의 경계
-
-완료한 범위는 공식 LC0 package/원본 모델 identity·T1 제작자 허가 조사, 두 모델의
-명시 CUDA/FP16 로컬 UCI smoke, 36개 입력/착수/PV 독립 감사, T1 외부 FP32 ONNX
-checker·6개 상태/다중 batch의 외부 CPU 원본 수치 대조, 총괄·B~F의 실행 계획이다.
-이 계획 PR은 문서만 변경한다. 기존 Rust source/모델 선택·공통 revision·훈련 recipe를
-변경하지 않으며 새 모델 지원과 학습 성과를 선기록하지 않는다.
-
-다음 인수는 B/D 오류·수명/예산, C의 실제 Rust T1 호환/독립 수치/GPU, E의 같은
-시간 개발 대국, F의 실제 body 학습/round-trip 순서로 관리한다. 기존 48판 A/B의
-fallback과 `strength_eligible=false`는 유지하고 새 모델의 결과로 소급 해제하지 않는다.
-
-문서 검사는 상대 링크·diff·결정/증거 범위를 확인한다. 현재 Workspace CPU workflow는
-source/Cargo/training 경로만 대상으로 하므로 이 문서 PR의 CI는 자동 실행되지 않는다.
-로컬 LC0·oracle·외부 CPU 수치 결과와 CI 미실행을 구별해 보고한다.
-
-세부 데이터/누출/학습 조건은 [TRAINING-PLAN](../TRAINING-PLAN.md), 실제 F lifecycle
-범위는 [F TRAINING](../../experiments/model-research/TRAINING.md)을 따른다.
+로컬 전체 workspace all-target/all-feature test와 strict Clippy, release native build는
+통과했다. 소스 `78b7c53`의 [두 OS CPU CI](https://github.com/daejunnom/RoveZero/actions/runs/37208852788)도
+SUCCESS를 직접 조회했다. CI는 로컬 실제 CUDA·개발 대국의 대체 증거가 아니다.
+C/A/D 수치 gate와 이후 UCI/예산/완료 순서의 소스 pin을 구분하며 앞 gate의 재사용은
+영향 경로·feature·의존의 동일성 확인에 한정한다. 상세 상태는
+[INTEGRATION-STATUS](../INTEGRATION-STATUS.md), 수동 연결은
+[CONTRACT-ADOPTION](../CONTRACT-ADOPTION.md)을 따른다.

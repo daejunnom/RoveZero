@@ -974,3 +974,35 @@ encoder·ONNX CUDA parity·실제 fine-tuning·새 정식 대국은 미실행이
 profile·공통 계약 0.1과 기존 48판의 `strength_eligible=false`를 유지한다. 기존 F의
 합성 linear fixture를 실제 모델 trainer로 표현하지 않는다. 문서 경로는 Workspace CPU
 workflow의 path filter에 포함되지 않아 이번 문서 PR의 CI는 자동 실행되지 않았다.
+
+## BT4-it332 Rust 연결과 같은 가중치 LC0 벤치마크
+
+2026-10-04 사용자가 BT4 적용·native LC0와 RoveZero 벤치마크를 지정했다. 공통 계약
+0.1·자체 Rules/PUCT·Maia exact profile은 유지하고 C의 BT4 단일 source/export/profile,
+C/D의 3 GiB admission 선언, B native 유한 1..4096 simulation 선택을 연결했다.
+자연 worker 완료는 runtime shutdown 뒤 게시하도록 수정했으며 강제 마감·stop의
+물리 GPU 시간 공정성은 별도다. BT4의 개별 weights license는 미확인·재배포 false다.
+
+| 실제 인수 | 소스·관측 | 제한 |
+|---|---|---|
+| BT4 외부 CPU 참조 | LC0 `fd71a2d` 원본 Eigen ↔ FP32/opset17 ONNX, 12개 상태·batch 2/4/8/16 통과 | frozen 수치 대조, 학습/강도 아님 |
+| Rust C/A/D CPU·CUDA | `aa0cc0247b9d7041e4525b2021363d0617cfd0bc`, 각 raw 12개·batch 1/2/4/8/16, 자체 A 상태 12개·history fill No 5/Repeat 7, drain/잔여 예약 0 | 그 뒤 변경은 UCI 네 파일이며 Cargo·A/C/D/encoding/contracts 영향 경로 동일성 확인에 한정해 수치 결과 재사용 |
+| CUDA 실제 연산 | FP32·TF32 off·CPU fallback 없음, raw warm CUDA node 687·19파일 runtime bundle, 장치 전체 관측 최대 1,131 MiB | 개별 allocation peak/전체 VRAM hard cap/모든 race 아님 |
+| 실제 B UCI 위치 query | `78b7c53502cadaff77fc6de5f0832eee55b9938c`, immutable binary `1a4b976b4110d251e21b09ed1e1f29b398b4ed01f533788a941de8dc4be969b3`, 18개 합법 bestmove·exit 0·confirmed final drain | D Computed 2,920·B root 초기화 18·non-root 소비는 process 집계, per-root physical journal 아님 |
+| native LC0 비교 | 같은 BT4 원본, v0.32.1 Windows CUDA FP32/FP16 각 18 query·36개 printed PV 합법·exit 0 | FP16 별도 profile, Windows/WSL·CPU·batch 배치 차이를 순수 알고리즘 차이로 하지 않음 |
+| 위치 benchmark | 총 54 query, LC0 FP32/RZ FP32/LC0 FP16 전체 장치 관측 최대 2,009/1,131/1,083 MiB | 250ms sampling·조건별 한 표본·RZ UCI NPS/PV 미제공 |
+| 전술/마감의 후속 대상 | 즉시 메이트 LC0 각 6/6·RZ 0/6, RZ 일반 상태 5초 응답 최대 5,295.06ms·Expired/Stale 진단 보존 | 현 root는 방문 수 우선, 가치 부호 오류/BT4 인코딩 실패 원인 확정 아님; formal strength NO-GO 유지 |
+| 검사/CI | 전체 workspace all-target/all-feature tests·strict Clippy·release build 통과, [37208852788](https://github.com/daejunnom/RoveZero/actions/runs/37208852788)의 두 OS SUCCESS 직접 확인 | CI와 실제 로컬 GPU/arena는 별도 증거 |
+
+최초 native batch 16/min 1의 CUDA 오류와 batch 256/min 4의 후속 성공을 함께 보존한다.
+ONNX·원본 hash·오차·옵션·cold startup·위치 benchmark와 후속 실행 지시서는
+[로컬 모델 기록](research/LOCAL-MODEL-BASELINE.md)에 묶었다. 원시 자료는 저장소 밖
+`reports/coordinator-integration/bt4-benchmark-20261004/`에 회수한다. native receipt를
+처음 회수할 때 잘못된 directory glob으로 supervisor만 복사된 것을 확인하고 실제
+`native-process-*`의 startup/termination을 추가 회수해 byte digest를 대조했다.
+이 회수 보완은 실행 결과를 다시 만들거나 성공으로 바꾸지 않는다.
+
+개발 대국은 4쌍/8판·같은 BT4 FP32·완전한 기존 opening history·500ms/수·별도
+100ms host/transport 여유·256 total ply·전체 1,200초로 먼저 잠가 실행한다. 결과·
+PGN audit는 종료 후 추가한다. 개발 pool·미확정 물리 시계/동일 자원 때문에 정식
+강도 승격·Elo·실제 학습 인수는 하지 않는다.

@@ -11,16 +11,20 @@ linear fixture lifecycle 범위는 [F TRAINING](../experiments/model-research/TR
 
 ## 0. 2026-10-04 강도용 모델 전환의 우선순위
 
-사용자는 Maia 기반 엔진의 강도 한계를 검토하고 LC0 로컬 실행·모델 변경 또는
-추가 학습 계획을 요청했다. [로컬 모델 전환 계획](research/LOCAL-MODEL-BASELINE.md)은
-동결 T1 distilled의 호환/수치/동일 시간 기준선을 먼저 확보하고 이후 실제 F02를
-추진하는 순서를 권고한다. Maia 최초 호환 profile은 회귀 기준으로 보존한다.
+사용자는 Maia 강도 한계 조사 후 **BT4-it332 실제 적용·LC0/RoveZero 벤치마크**를
+지정했다. [로컬 모델 기록](research/LOCAL-MODEL-BASELINE.md)의 BT4 Rust CPU/CUDA
+수치 연결·위치 벤치마크는 실제 실행했고 Maia exact profile은 회귀 기준으로 보존한다.
+현재 최소 탐색의 즉시 메이트 선택과 마감/물리 완료를 먼저 대조한다. 강한 weights의
+추론 성공과 엔진 강도·학습 인수를 구분한다.
 
-T1 원본 구조 fine-tuning과 작은 CNN 학생 distillation은 서로 다른 후속 경로다.
-현재 F의 `LinearFixture`는 실제 Maia/T1 trainer와 export adapter가 아니므로 새 모델의
-trainable tensor 복원·frozen round-trip·gradient/optimizer/checkpoint·ONNX parity를
-먼저 구현/인수한다. 입력/구조를 변경하는 F03과 기존 구조 F02를 혼합하지 않는다.
-256예제/200 step/20분 등의 수치는 계획의 유한 pilot 제안이며 현재 학습 실행값이 아니다.
+BT4 개별 weights의 학습·수정·배포 권리는 미확인이다. 원본/변환 manifest는
+`UNVERIFIED-local-research-only`, `redistribution_ready=false`이며 T1 제작자 허가를
+BT4에 전파하지 않는다. 권리가 확인된 T1 구조 fine-tuning과 작은 학생 distillation은
+후속 대안으로 보존한다. 현재 F의 `LinearFixture`는 실제 BT4/Maia/T1 trainer나 export
+adapter가 아니므로 trainable tensor 복원·frozen round-trip·gradient/optimizer/
+checkpoint·ONNX parity와 별도 학습 메모리 인수가 선행한다. BT4의 6 GB 장치 추론
+성공을 training 적합성으로 쓰지 않는다. F03과 F02를 섞지 않으며 실제 학습은 미실행이다.
+256예제/200 step/20분은 유한 smoke 제안이며 이번 실행값이 아니다.
 
 ## 1. 구현 경로와 권한
 
