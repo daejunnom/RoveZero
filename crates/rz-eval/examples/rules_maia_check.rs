@@ -8,9 +8,7 @@ use rz_contracts::*;
 use rz_encoding::classical::{HistoryFill, HISTORY_FRAMES};
 use rz_eval::asset::{self, MaiaAsset};
 use rz_eval::contracts::{encoding_manifest, MaiaBinding, HOST_BYTES_PER_ITEM};
-use rz_eval::native_runtime_bridge::{
-    NativeRuntimeBackend, NativeWorkerOrigin, NativeWorkerOwner, NATIVE_CUDA_ADMISSION_BYTES,
-};
+use rz_eval::native_runtime_bridge::{NativeRuntimeBackend, NativeWorkerOrigin, NativeWorkerOwner};
 use rz_eval::onnx::{BackendConfig, OnnxBackend, OrtRuntime, Provider};
 use rz_eval::rules_projection::ClassicalProjection;
 use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeLibraryPin};
@@ -721,6 +719,10 @@ fn main() -> Result<()> {
         }
         Ok(())
     })();
+    let device_admission = profiles
+        .first()
+        .and_then(|profile| profile.pointer("/execution_admission/device_bytes"))
+        .cloned();
     let report = json!({"status":if result.is_ok(){"passed"}else{"failed"},
         "failure":result.as_ref().err().map(|error| error_receipt(error.as_ref())),"identity":identity,
         "scope":if is_cuda{"actual A immutable Rules projection, C ONNX CUDA and D finalization"}else{"actual A immutable Rules projection, C ONNX CPU and D finalization"},
@@ -730,8 +732,8 @@ fn main() -> Result<()> {
         "profiles":profiles,"limits":{"fixture_bytes":8*1024*1024,"cases":12,"trace_plies":8,
             "native_batch_size":1,"max_executions":1,"request_deadline_seconds":REQUEST_SECONDS,
             "scheduler_host_reservation_limit":4*HOST_BYTES_PER_ITEM+8192,
-            "scheduler_device_admission_limit":if is_cuda{NATIVE_CUDA_ADMISSION_BYTES}else{0},
-            "bootstrap_session_resident_device_admission":if is_cuda{NATIVE_CUDA_ADMISSION_BYTES}else{0},
+            "scheduler_device_admission_limit":device_admission,
+            "bootstrap_session_resident_device_admission":device_admission,
             "scheduler_reservations_are_resident_memory_measurements":false},
         "tolerances":{"dense_input_atol":0.0,"legal_policy_max_abs":1e-4,"wdl_max_abs":1e-4},
         "raw_logits":"separate maia_check gate","uci":"not_run","gpu":if is_cuda{"see_actual_profile_receipts"}else{"not_run"},

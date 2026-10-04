@@ -108,7 +108,7 @@ fn run_cpu(config: NativeConfig) -> Result<(), Box<dyn std::error::Error>> {
     };
     let process =
         EngineProcess::new(factory.clone(), owners, clock).with_identity(EngineIdentity {
-            name: "RoveZero Maia ONNX CPU integration".into(),
+            name: "RoveZero LC0 weights ONNX CPU integration".into(),
             author: "RoveZero contributors".into(),
         });
     let settings = EngineSettings {
@@ -171,7 +171,7 @@ fn run_cuda(config: NativeConfig) -> Result<(), Box<dyn std::error::Error>> {
     };
     let process =
         EngineProcess::new(factory.clone(), owners, clock).with_identity(EngineIdentity {
-            name: "RoveZero Maia ONNX CUDA integration".into(),
+            name: "RoveZero LC0 weights ONNX CUDA integration".into(),
             author: "RoveZero contributors".into(),
         });
     let served = serve_native_process(
