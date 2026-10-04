@@ -282,7 +282,7 @@ Expired/Stale는 그대로 남겨 두며 집계 성공을 모든 root의 물리 
 
 | 담당 / 다음 순서 | 구현·인수 조건 |
 |---|---|
-| B·총괄 | 위 mate-in-one을 실제 root stats·확정 terminal 발견 여부로 재현한다. 확정 승패의 root 선택/solver 변경은 S 변경으로 별도 revision·CONTROL-0→1·전술 회귀·같은 weights 대국으로 검증한다. |
+| B·총괄 | 8장의 mate/terminal 회귀와 직접 자식만 대상으로 하는 S1 인수를 참조한다. 전체 solved propagation·mate-distance와 같은 weights 동일 시간 대국은 별도 후속이다. |
 | B·D·총괄 | 독립 마감/stop에서 bestmove와 물리 GPU 완료의 순서, 현재 game/root별 accepted visits·fresh/cached 실행과 지연을 계측한다. 시간 여유 확대만으로 원인을 숨기지 않는다. |
 | C·D | BT4 B1/FP32의 준비·대기·전송·GPU·backup 비용을 분리한다. batch/FP16/Graph 변경은 한 번에 하나씩 별도 수치·수명·VRAM 인수를 거친다. |
 | E·총괄 | 기존 E CUDA launch V1은 arena/session 1 GiB·ONNX artifact 16 MiB로 닫혀 있어 이번 BT4 manifest/741 MB export를 인수하지 않는다. 별도 BT4 실행 profile/schema·artifact bounds·수명/receipt 연결을 수동 대조한 뒤 같은 OS·CPU 자원·정밀도·whole-wall 시계·GPU 물리 fence·holdout·사전 통계를 잠근다. 이번 개발 pair는 직접 native CLI의 별도 runner이며 E 정식 launch 통과가 아니다. |
@@ -315,3 +315,211 @@ C/A/D 수치 gate와 이후 UCI/예산/완료 순서의 소스 pin을 구분하�
 영향 경로·feature·의존의 동일성 확인에 한정한다. 상세 상태는
 [INTEGRATION-STATUS](../INTEGRATION-STATUS.md), 수동 연결은
 [CONTRACT-ADOPTION](../CONTRACT-ADOPTION.md)을 따른다.
+
+## 8. 종료 회귀·조건 대조·B1 계측과 별도 S1
+
+2026-10-05 사용자 지정 순서로 종료 회귀→입력·평가 조건→동일 바이너리 A/A와
+B1 계측을 진행했다. 이어 사용자가 메이트 오인 위험과 LC0 정책 확인을 지정하여
+정확한 종료 사실만 소비하는 final-selection을 별도 **S 변경**으로 연결했다.
+이 장의 S0/S1은 **최종 착수 정책**이며, 앞선 Maia 폭 1/4 실험의 S0/S1이나
+OPT-12 다중 요청 선택 정책과 혼동하지 않는다. 여기서는 양쪽 모두 동일한 PUCT,
+batch 1, 동결 BT4, FP32·TF32 off, raw cache off다.
+
+### 8.1. LC0의 증명과 추정치, RoveZero의 구현 범위
+
+고정 LC0 `fd71a2d921b689c5f479d3227c3806c8e272d9c5` classic search를 확인했다.
+실제 legal moves가 없고 check인 상태를 terminal win으로 만들며, 최종 후보 정렬에서
+방문된 terminal win/loss를 일반 신경망 Q와 구분한다. LC0의 edge 관점과 RoveZero의
+child side-to-move 관점을 혼동하지 않는다. 승리끼리는 짧은 mate distance,
+패배끼리는 긴 거리를 고른다. bounds 전파는 자식 하나의 높은 Q와 다르며, 승리는
+확정 winning child로, 패배는 모든 legal child의 확정 bound로 증명한다.
+[종료 생성](https://github.com/LeelaChessZero/lc0/blob/fd71a2d921b689c5f479d3227c3806c8e272d9c5/src/search/classic/search.cc#L1920-L1938),
+[최종 후보 정렬](https://github.com/LeelaChessZero/lc0/blob/fd71a2d921b689c5f479d3227c3806c8e272d9c5/src/search/classic/search.cc#L758-L821),
+[bounds 전파](https://github.com/LeelaChessZero/lc0/blob/fd71a2d921b689c5f479d3227c3806c8e272d9c5/src/search/classic/search.cc#L2285-L2350)
+
+RoveZero는 GPL 소스나 전체 LC0 solver를 복사하지 않고 최소 범위를 독립 구현했다.
+`--final-selection=visits`는 기존 S0이며 기본값도 그대로다.
+`--final-selection=exact-terminal`은 `exact-terminal-child-v1` S1이다. 실제 Rules
+분류와 마지막 consume guard를 통과해 **직접 자식 Node::Terminal로 승인되고 방문된**
+edge만 정확한 승패로 정렬한다. 자식의 side-to-move 값 -1은 root 승리이며 +1은
+root 패배다. 나머지는 기존 방문 수→Q→legal 순서로 정렬한다. Q=1/-1, 미방문 자식,
+거부·취소된 완료, 일부 winning descendant만으로 solved parent를 만들지 않는다.
+정책은 첫 selection 전 고정하며 선택 결과의 policy identity에 별도 suffix를 남긴다.
+
+이번 변경은 직접 자식의 확정 종료를 최종 선택에 반영한다. 전체 subtree의 승패
+bounds 전파·메이트 거리·selection 조기 중단은 구현하지 않았다. 따라서 높은 Q를
+메이트로 표시하거나 긴 강제 메이트를 모두 증명하는 기능으로 설명하지 않는다.
+종료 값은 정확한 Rules 계약의 결과이며 신경망 WDL과 별도로 보존한다.
+
+4장의 고정 artifact/runtime 인자 뒤에 `--final-selection=visits` 또는
+`--final-selection=exact-terminal`을 명시하여 실행한다. 진단 example은 동일한
+native 인자를 사용하며 `--probe-cases=terminal --probe-wall-ms=30000
+--search-simulations=4096`으로 종료를, `--probe-cases=profile --profile
+--probe-wall-ms=30000 --search-simulations=128`으로 두 opening의 B1 host journal을
+실행한다. `--probe-cases=parity --search-simulations=1`은 실제 네 opening의
+root tensor/평가 대조용이다. 각 실행은 새 외부 output root를 사용한다.
+
+### 8.2. 실제 BT4 종료 회귀와 같은 바이너리 S0/S1
+
+새 진단 소스 `cf94d07f26cbc1ce5de72f94003938512bad7290`에서 legal 후보·실제 자식
+classification·승인된 terminal backup의 경로와 root visit/value delta를 관측했다.
+관측은 승인 후의 단일 slot이며 search 권한이나 새 방문을 만들지 않는다. 신경망을
+주입한 인공 트리에서는 Q=1과 winning descendant를 오인하지 않는 경우, 마지막
+guard가 거부한 terminal, 정책 변경 거부도 검사했다.
+
+| 고정 사례 | S0 최종 착수 | S1 최종 착수 | 실제 판정 |
+|---|---|---|---|
+| 백 mate-in-one | `g6f6` | `g6h5` | S0는 ongoing, S1은 실제 checkmate |
+| 흑 mate-in-one | `g3f3` | `g3h4` | S0는 ongoing, S1은 실제 checkmate |
+| 백/흑 stalemate root | 착수 없음 | 착수 없음 | draw, 평가 제출 0 |
+| 백/흑 이미 checkmate root | 착수 없음 | 착수 없음 | 현재 차례 패배, 평가 제출 0 |
+| 백/흑 패배 회피 | `g8f8` / `g1f1` | 동일 | queen capture 뒤 dead-position draw |
+
+메이트 정답은 양쪽 각각 네 개다. 특정 UCI 한 수 일치를 요구하지 않고 실제 적용한
+자식의 checkmate 여부로 판정했다. 패배 회피 fixture의 다른 수는 상대 mate-in-one을
+허용한다. CPU/mock의 두 정책×8개 검사와 실제 C/D CUDA 두 정책×8개를 분리해 기록했다.
+
+S0에서도 네 즉시 메이트가 legal 후보에 있고 checkmate로 분류됐으며, leaf -1이
+root +1로 한 번씩 backup됐다. 백 `g6f6`은 451회 방문·Q≈0.999985, 직접 mate
+`g6h5`는 246회·Q=1이라 방문 우선 최종 선택에서 밀렸다. 따라서 이 표본에서
+Rules·관점·중복 backup 계약 위반은 발견하지 않았으며 final-selection 변경은 S다.
+
+S0/S1 비교는 소스 `9817647465cdd6d638f04023b2e49139b35ed57e`, 동일 binary SHA-256
+`581d41621de3e841add3575a8440c393e1448e968f08976615c9f46673cabd8d`,
+explicit **4096 simulations·30초 case cap**에서 정책 옵션 하나만 바꿨다.
+두 실행의 입력 tensor·legal indices·root policy/WDL·전체 root statistics·카운터와
+terminal 경로가 정확히 일치했다. 각 정책의 **16,005 terminal backup**에 대해 root
+visit delta=1·경로 길이에 따른 부호를 확인했고 오류는 0이었다. 독립 `chess 1.11.2`
+감사로 모든 후보와 종료 경로를 다시 재생했다. 매 case의 4096 완료 방문을 새 NN
+실행 수로 부르지 않는다. 양쪽 actual process는 383회 NN 완료·정상 종료를 기록했다.
+
+S0 재시도의 첫 실행은 로컬 host 디스크 부족으로 runtime bundle 동기화 단계에서
+실패했으며 비교 표본에서 제외했다. 실패·부분 복사 목록·exit 1은 보존했다. pinned
+원본 라이브러리와 일치하는 비활성 복사본만 hash 검증 후 정리하고 새 namespace에서
+동일 설정으로 재실행했다. weights·입력·batch를 바꾸거나 실패를 승리로 집계하지 않았다.
+단일 표본의 경과 시간 차이를 S1 속도 개선으로 해석하지 않는다.
+
+일반 `rz-uci`의 실제 threaded worker/CLI 경로도 수정 소스 `fabe88e86f27360a8a6172da5ce4573f7592d481`,
+binary `2bcb3d5db53ac2edcd45c562202fc031b58173b8855cf9966a963a19d03cffec`에서
+`--final-selection=exact-terminal --search-simulations=4096` 및 `go nodes 4096`으로
+같은 여덟 상태를 실행했다. 백/흑 즉시 메이트와 두 회피 수가 위 표와 일치하고
+종료 root 네 개는 `bestmove 0000`을 반환했다. 독립 oracle 감사·native startup/termination·
+process exit 0·physical drain을 확인했다. example의 관측 경로와 일반 UCI 결과를 구분한다.
+
+### 8.3. 이력·입력·legal policy·WDL 대조
+
+BT4 원본/ONNX/manifest digest는 4장과 같다. 이전 실제 대국의 LC0 `HistoryFill=no`
+및 RoveZero No, explicit simulation cap 4096을 manifest와 실행 argv로 재확인했다.
+짧은 네 terminal fixture·startpos·Ruy 5-ply·이전 실제 대국 네 opening의 완전한
+8-ply prefix, **10개 표본**을 actual Rust root 평가와 고정 LC0 Eigen FP32로 대조했다.
+모든 112×64 tensor float bit와 ordered legal policy index가 정확히 일치했다.
+temperature=1.0에서 policy 최대 차이는 **3.831388086e-6**, WDL은 **4.619359970e-7**로
+사전 `1e-4` 오차 안이다. 이는 표본 대조이며 이전 대국 모든 root를 다시 평가한 것은 아니다.
+
+LC0 Python binding의 `GameState.as_input`은 FEN_ONLY를 고정한다. 짧은 No 참조는
+독립 LC0 tensor를 생성한 뒤 pinned encoder 규칙대로 없는 13-plane history block만
+0으로 바꿨다. 해당 네 fixture에는 EP가 없고 missing history 범위를 확인했다.
+No 옵션을 직접 제공하는 binding으로 검사했다고 표현하지 않는다. 실제 8-ply opening은
+8개 known frame이 있어 padding 변환이 없다. 앞선 No 5/Repeat 7 수치 gate는 영향
+encoding/evaluator source의 동일성을 확인한 범위로 재사용한다.
+[binding 입력](https://github.com/LeelaChessZero/lc0/blob/fd71a2d921b689c5f479d3227c3806c8e272d9c5/src/python/weights.h),
+[짧은 이력 encoder](https://github.com/LeelaChessZero/lc0/blob/fd71a2d921b689c5f479d3227c3806c8e272d9c5/src/neural/encoder.cc#L235-L300)
+
+별도 조건 불일치는 **policy temperature**다. 이전 LC0 대국은 기본 **1.36**,
+RoveZero는 **1.0**이었다. 원본 로그와 설정은 보존하고 공통 temperature에서의 수치
+대조와 이전 실제 priors의 차이를 분리했다. 네 opening에서 실제 온도 차이에 따른
+합법 policy 최대 차이는 0.04253~0.18797이다. HistoryFill 오류나 기본 128을 원인으로
+지목하지 않으며, 이전 8판을 입력·탐색 조건이 모두 일치한 대국으로 재표기하지 않는다.
+[LC0 옵션](https://lczero.org/play/configuration/flags/)
+
+### 8.4. 먼저 동일 바이너리 A/A, 이후 B1 host 병목
+
+이전 baseline source `78b7c53502cadaff77fc6de5f0832eee55b9938c`와 immutable binary
+`1a4b976b4110d251e21b09ed1e1f29b398b4ed01f533788a941de8dc4be969b3`를 그대로 사용했다.
+두 새 process × 세 반복 × 두 opening × nodes/movetime, 총 **24 query**다.
+startup은 go 응답 시간에서 제외하고 CPU 2개·RAM 6 GiB·swap 0·단일 worker를 잠갔다.
+
+| 조건·각 6표본 | 응답 평균 ms | 변동계수 |
+|---|---:|---:|
+| startpos, `go nodes 128` | 1,534.571 | 9.910% |
+| Ruy-black, `go nodes 128` | 1,523.366 | 7.571% |
+| startpos, `go movetime 1000` | 984.800 | 0.280% |
+| Ruy-black, `go movetime 1000` | 985.653 | 0.335% |
+
+여기서 128은 명시한 `go nodes` workload다. native configuration의 상한은 4096으로
+잠갔으며 기본값 탓으로 해석하지 않는다. 고정 방문 작업에도 7.6~9.9% 편차가 관측되어
+단일 측정의 작은 차이는 개선으로 채택하지 않는다.
+
+별도 source-profile은 `cf94d07`의 두 opening·각 128 non-root visits로 실행했다.
+root 초기화 포함 실제 요청/완료/전달/소비가 **258회**, 모든 물리 batch가 1이다.
+8192 한도 안의 8108 metadata record, complete timeline, producer join, 누락·중복·
+identity mismatch·미소비·worker 실패 0을 확인했다. 계측은 실제 source clock을 쓴다.
+
+| 실제 host 단계 | P50 ms | P95 ms | P99 ms |
+|---|---:|---:|---:|
+| Rules replay·legal 생성·history export | 0.044608 | 0.174899 | 0.248374 |
+| C input encoding·hash·key 검사 | 0.025593 | 0.033861 | 0.064591 |
+| worker의 실제 C 인코딩 | 0.020822 | 0.027618 | 0.030322 |
+| runtime queue | 0.002907 | 0.004557 | 0.008136 |
+| synchronous ORT Run 전체 | 9.808874 | 16.202664 | 22.248237 |
+| 물리 완료→owner 관측 대기 | 0.654593 | 1.041342 | 1.158128 |
+| root 초기화/guarded backup | 0.002535 | 0.003967 | 0.005737 |
+| 최종 착수 조회 | 0.001183 | 0.003547 | 0.009757 |
+
+최종 착수 조회는 pump 중 진행 조회를 포함한 3206개 표본이다. 나머지 표의 keyed
+단계는 258개다. `StateReplay`에 Rules legal 생성·history export가 포함되며 별도
+`LegalValidation`은 이미 만든 authority 확인이다. SearchPreparation/PhysicalWorker와
+세부 단계는 중첩되어 분위수나 총합을 이중 합산하지 않는다.
+
+두 search의 합계 2,974.757ms 중 inclusive ORT Run interval 합계는 2,761.039ms,
+replay는 16.806ms였다. **이 두 opening/B1 표본에서 가장 큰 관측 host interval은
+ORT Run**이다. 이것은 CUDA kernel만의 시간이 아니다. 전송·provider·동기화·호스트
+작업을 포함하며, replay를 BT4의 최대 병목이라고 주장할 근거는 나오지 않았다.
+
+전체 process 250ms GPU 표본은 78개·관측 최대 VRAM 1,127MiB·최대 사용률 80%다.
+startup이 포함되어 중앙 사용률 0%를 search 사용률로 해석하지 않는다. cgroup의
+RAM peak는 6 GiB·memory.max hit가 있었고 OOM/kill 0이었다. page cache·메모리 압박의
+영향은 측정 조건으로 보존한다. 첫 profile 실행은 종료/drain 영수증이 회수되지 않아
+미확정 실패로 남기고 fresh run의 성공으로 대체 기록하지 않았다.
+
+GPU H2D/D2H와 kernel-only 시간은 **미측정**이다. 현재 고정 ORT bundle은 CUDA device
+profiling 빌드가 아니고 nsys/ncu도 없다. 일반 ORT placement JSON의 `kernel_time`은
+host node interval이며 실제 device trace로 승격하지 않는다. CUPTI와 CUDA profiling
+빌드가 필요한 별도 진단 경로를 준비하되, 해당 경로를 기존 B1 production 측정으로
+조용히 바꾸지 않는다. 후속은 transfer/kernel/wait를 같은 입력과 물리 completion
+fence에서 대조하는 것이다.
+[ORT profiling 요구](https://onnxruntime.ai/docs/performance/tune-performance/profiling-tools.html)
+
+### 8.5. 같은 입력·batch의 별도 추론 비교와 인수 경계
+
+소스 `3ef917199453eda9fbd151aa9af85071e27efbe8`의 `maia_check --benchmark-rounds=20`과
+pinned native LC0 `backendbench`를 별도로 실행했다. startpos/No의 동일 FP32 tensor
+SHA-256은 `c33ae28cfa8081c3ff247f2ee36881e28520e4be8d585df726b8728b7dac22b6`다.
+cache는 끄고 B1/B16 각각 20 round를 실행했다. native LC0는 threads 1,
+min_batch 1/max_batch 16·step 15·batches 20·policy temperature 1을 명시했다.
+
+| 실제 batch·20 round | RoveZero ORT host Run 평균 | LC0 CUDA backend 평균 | 완료 NN 항목 수/각 엔진 |
+|---|---:|---:|---:|
+| 1 | 11.087ms | 11.637ms | 20 |
+| 16 | 76.947ms | 62.623ms | 320 |
+
+이는 동일 입력·batch의 **배포 경로별 추론 측정**이다. Windows LC0와 WSL2 ORT,
+runtime·CPU 한도·6 GiB RAM pressure 차이는 남아 있다. 기존 서로 다른 엔진의
+nodes/NPS를 나눈 효율 지표가 아니며 같은 시간 대국의 기력 비교도 아니다. LC0가
+backendbench에 표시한 throughput의 항목 수를 탐색 nodes로 바꾸지 않는다.
+RoveZero의 기존 12-case 수치 및 B1/2/4/8/16 검사도 통과했다. 최초 LC0 호출은
+지원하지 않는 `--config`를 거부했으면서 exit 0이었으므로 미실행으로 기록하고,
+수정 호출의 두 expected batch 결과와 실제 정상 종료를 별도로 확인했다.
+
+수정 소스의 전체 workspace all-target/all-feature **714 passed·0 failed**,
+ignored 미실행, fmt/strict Clippy와 release build를 확인했다. Windows CI가 잡은
+bounded Debug의 unused CUDA path는 `fabe88e86f27360a8a6172da5ce4573f7592d481`에서
+private path를 출력하지 않는 bundle presence/digest로 보완했다. 실제 실행 소스와
+문서 head를 구분한다. 해당 소스의 [CI 37218841079](https://github.com/daejunnom/RoveZero/actions/runs/37218841079)는
+Windows·Ubuntu의 모든 필수 step SUCCESS를 직접 확인했다. 최신 CI 관측과 문서 변경의
+검사 재사용 범위는 [통합 기록](../INTEGRATION-STATUS.md)에 둔다.
+
+회수 논리 루트는 `reports/coordinator-integration/bt4-diagnostics-20261005/`다.
+원본 query·terminal trace·입력·수치·AA/profile/inference·실패·supervisor·binary pin을
+외부 보존한다. 이 인수로 전체 solver, 물리 deadline/stop race, E BT4 launch V1,
+same-time holdout 기력·Elo·학습·RunPod 지원을 완료했다고 보고하지 않는다.

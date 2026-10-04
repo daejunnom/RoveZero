@@ -400,3 +400,34 @@ E의 `NativeCudaProfileV1`은 arena 1 GiB, `NativeArtifactRole::Onnx`는 16 MiB�
 BT4 source/export pin·별도 bounds/profile revision·C/D/bootstrap·E 생성/검증·receipt를
 총괄이 함께 맞춘 뒤 같은 integration SHA로 검사한다. 이번 개발 대국은 Windows LC0와
 WSL native CLI를 직접 관리한 별도 finite runner와 E/A의 사후 PGN 감사 경로다.
+
+## 12. 종료 관측·D02 단계와 별도 최종 착수 정책의 수동 연결
+
+2026-10-05 총괄은 `cf94d07`의 관측 접점, `3ef9171`의 parity/inference 진입점,
+`9817647`의 S1과 `fabe88e`의 플랫폼 진단 보완을 같은 브랜치에서 수동 대조했다.
+공통 `rz-contracts` revision **0.1**, side-to-move WDL·typed request/generation·deadline,
+ordered legal view·model/input identity·Computed/raw-hit·physical lease 계약은 유지한다.
+
+| 실제 연결 | 선언·소비와 마지막 권한 | 인수 범위 |
+|---|---|---|
+| A exact terminal → B | Rules classification→terminal leaf→기존 final consume guard→Node::Terminal commit | 관측값/NN Q를 종료 권한으로 쓰지 않는다. 방문된 직접 terminal child만 별도 rank; guard 거부/취소/미방문이면 승패 증명 없음 |
+| terminal backup → 진단 | `observe_terminal_backups`·승인 후 single-slot observation·`take_terminal_observation` | observer는 path/side/value/selection을 보존하며 새 backup/visit를 만들지 않음. root delta=1·side 부호와 독립 replay 검사 |
+| B final policy → 실제 UCI | `FinalMovePolicy`→`EngineSettings`→threaded worker의 첫 selection 전 setter | visits 기본·exact-terminal 명시적 S1, late 변경 거부, policy identity suffix. 동일 binary의 root 통계 동일성과 실제 8 UCI 결과를 각각 확인 |
+| B/C/D → D02 세부 단계 | replay·legal authority·input key·terminal backup·final selection source spans→기존 bounded journal/writer | passive unkeyed terminal/final 관측과 keyed NN causal chain 구분. 같은 clock origin·8192 cap·V1 envelope 유지, 누락을 complete로 숨기지 않음 |
+| actual root 평가 → parity | D 정상 승인·B root 초기화와 동일 context 이후에만 관측 출력 공개 | C factory key와 별도 input dump key의 일치 확인. 실제 tensor/ordered indices·policy/WDL을 pinned independent original과 대조 |
+| native parser/진단 → 플랫폼 | explicit final-selection flag·중복/미지원 값 거부·private-path 없는 bounded Debug | Windows의 unused CUDA path를 presence/digest 관측으로 해결. parser·Debug·UCI 검사와 두 OS exact source CI 성공 |
+
+diagnostic example은 기존 factory/worker/Rules adapter를 재사용하고 B1·simulation 1..4096·
+case wall 1..60초·유한 physical shutdown으로 제한한다. 일반 UCI와 별도 example에서
+실행한 근거를 구분하며, output 관측은 D/B final acceptance를 대신하지 않는다.
+exact-terminal 선택은 전체 minimax solved propagation이나 mate-distance 정보를 만들지 않는다.
+
+S0/S1 probe의 source `9817647`과 후속 실제 UCI/CI source `fabe88e`를 각각 고정했다.
+후속 변경은 bounded Debug뿐이고 두 source의 search/Rules/encoding/runtime 경로 일치를
+대조했다. 문서 head에서 코드·Cargo·CI 경로의 동일성을 확인한 경우에만 해당 source의
+검사를 재사용한다. 자세한 수치·실패·물리 완료와 미측정 범위는
+[통합 기록](INTEGRATION-STATUS.md)과 [모델 기록 8장](research/LOCAL-MODEL-BASELINE.md#8-종료-회귀조건-대조b1-계측과-별도-s1)에 둔다.
+
+PR #20의 최신 head에서 총괄이 이 접점과 실제 public 선언을 수동으로 대조했다는 기록을
+남긴다. E BT4 artifact/profile 경계는 여전히 별도 연결 대상이다. 같은 이름의 S1이나
+similar receipt를 이유로 기존 E V1·정식 강도·physical deadline gate를 자동 호환으로 인수하지 않는다.

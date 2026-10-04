@@ -1026,3 +1026,39 @@ E 정식 native CUDA V1은 기존 1 GiB arena/session·16 MiB ONNX artifact boun
 이번 BT4 profile을 인수하지 않는다. 위 개발 pair는 별도 private finite runner가
 native CLI를 직접 실행한 결과이며 E locked launch/정식 manifest 성공이 아니다.
 별도 BT4 artifact/profile revision과 C/D/E receipt의 수동 연결이 후속으로 남는다.
+
+## BT4 종료 회귀·조건 대조·B1 분해와 정확한 직접 자식 선택
+
+2026-10-05 총괄은 사용자 지정 종료 회귀·입력 대조·동일 바이너리 A/A를 먼저 실행하고
+LC0 classic의 terminal/일반 Q/bounds를 대조했다. 공통 계약은 **0.1**이며 기존 PUCT,
+HistoryFillNo, 동결 BT4 FP32·TF32 off·B1·cache off를 유지한다. 최종 착수의
+`exact-terminal-child-v1`은 **opt-in S 변경**이고 기존 visit-first S0가 기본이다.
+상세 fixture·소스·분포·실패는 [모델 기록 8장](research/LOCAL-MODEL-BASELINE.md#8-종료-회귀조건-대조b1-계측과-별도-s1)에 묶었다.
+
+| 실제 확인 범위 | 실행 근거 | 상태와 한계 |
+|---|---|---|
+| 기존 S0 종료 흐름 | `cf94d07` actual Rules/C/D/CUDA, 8 fixed case, 4096 simulations | 네 direct mate 후보/각 색·checkmate·root +1 backup 정상; 최종 방문 우선이 delayed mate를 골랐음. 계약 부호 오류/중복 backup 미발견 |
+| 같은 binary S0/S1 | `9817647`, binary `581d4162…cabd8d`, 8 case/각 정책, 16,005 terminal backup/각 정책 | 입력·indices·root policy/WDL·전체 root stats·경로·카운터 정확 일치; 부호/visit 오류 0·독립 chess 감사. S1은 실제 백/흑 mate 선택, draw·loss avoidance 유지 |
+| 일반 native UCI의 S1 | `fabe88e`, binary `2bcb3d5d…3cffec`, 8개 `go nodes 4096` | 백/흑 mate·두 draw 회피, 종료 root 4개 `0000`; NN 완료 383·root 초기화 4·NN non-root backup 379, process exit 0·physical drain confirmed |
+| 오인 방지 검사 | 신경망 Q=1, winning descendant 하나, 미방문 terminal 형태, 최종 guard 거부, 중간 정책 변경 | 추정치로 부모를 proved win으로 만들지 않음. 전체 solved propagation/mate-distance 구현은 아님 |
+| 입력·평가 조건 | `3ef9171` parity fixture와 기존 실제 CUDA root 평가 10개, pinned LC0 Eigen original | tensor bit/ordered legal indices exact, temperature 1에서 policy 3.8314e-6/WDL 4.6194e-7. 짧은 No 참조의 source-equivalent zero padding을 명시 |
+| 이전 실제 대국 설정 | 원본 manifests/argv와 LC0 help/source | 두 엔진 HistoryFillNo·RZ cap 4096; policy temperature LC0 1.36/RZ 1.0 차이 발견. 전 대국 root 모두 재평가한 것은 아님 |
+| 동일 binary A/A | 기존 `78b7c53`/`1a4b976b…69b3`, 새 process 2·24 query | fixed `go nodes 128` 응답 CV 7.571~9.910%; timed 응답 CV 0.280~0.335%. 128은 explicit workload이며 config cap은 4096 |
+| B1 host-source profile | `cf94d07`, 두 opening/128 visits, request/physical complete/delivered/consumed 각 258 | 8108/8192 metadata·complete timeline·누락/중복/identity mismatch/미소비 0. ORT Run P50 9.808874ms, Rules replay 0.044608ms; device kernel/transfer는 미측정 |
+| 같은 tensor·batch 추론 | `3ef9171` Rust raw 20 round/B1·B16, native LC0 backendbench 같은 입력/20 round | RZ 평균 11.087/76.947ms, LC0 11.637/62.623ms; 각 20/320 NN 항목. cross-OS/runtime/CPU/RAM 차이가 남아 순수 엔진 효율·기력 인수 아님 |
+| 검사/CI | S1 로컬 workspace 714 passed·0 failed, 후속 UCI 192 passed·fmt/Clippy/release 성공; source `fabe88e` [37218841079](https://github.com/daejunnom/RoveZero/actions/runs/37218841079) | Windows·Ubuntu의 모든 필수 step SUCCESS 직접 조회; ignored는 별도 미실행. 후속 변경이 문서에만 한정됨을 대조한 CPU 결과 재사용이며 새 GPU CI 실행 아님 |
+
+CPU 2·RAM 6 GiB·swap 0·유한 case/process time을 잠갔고 memory.max pressure와 OOM/kill 0을
+보존했다. GPU의 전체 process sampling은 startup을 포함한다. host source span으로 GPU
+kernel-only·H2D/D2H 비용을 추정하거나 kernel_time 이름만으로 device 측정이라고 하지 않는다.
+더 깊은 profiler 경로는 새 진단 환경·영향 identity와 same-input/physical completion 검사를
+잠근 뒤 연결한다. 현재 표본은 replay보다 inclusive ORT Run interval이 컸다는 근거다.
+
+첫 profile의 종료 미확정, 첫 LC0 backendbench의 CLI 거부/exit 0/결과 없음, host disk
+부족의 S0 bootstrap sync 실패를 모두 보존했다. 성공한 fresh retry만 인수했다. 원시
+자료·회수 보완·binary/CI metadata와 재생성 복사본의 hash 기반 정리 목록은 저장소 밖
+`reports/coordinator-integration/bt4-diagnostics-20261005/`다. 가중치·원시 PGN은 Git에 넣지 않는다.
+
+전체 solved subtree·mate distance, deadline/stop의 독립 physical fence, E의 BT4 launch
+profile/schema, 동일 시간·자원·holdout paired 강도와 Elo, actual training은 남아 있다.
+이번 즉시 메이트 회귀 성공을 해당 gate들의 통과로 승격하지 않으며 새 대국은 실행하지 않았다.
