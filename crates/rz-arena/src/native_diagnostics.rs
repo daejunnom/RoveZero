@@ -6,6 +6,7 @@ use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(any(target_os = "linux", test))]
 const LINE_CAP: usize = 16 * 1024;
 const EVENT_CAP: u64 = 64;
 
@@ -17,11 +18,17 @@ struct Trace {
 #[derive(Default)]
 struct State {
     sequence: u64,
+    #[cfg(target_os = "linux")]
     logs: LogProbe,
+    #[cfg(target_os = "linux")]
     stdout_bytes: u64,
+    #[cfg(target_os = "linux")]
     stderr_bytes: u64,
+    #[cfg(target_os = "linux")]
     drain_batches: u64,
+    #[cfg(target_os = "linux")]
     last_stdout_ns: Option<u64>,
+    #[cfg(target_os = "linux")]
     last_stderr_ns: Option<u64>,
 }
 
@@ -85,6 +92,7 @@ pub fn emit_native_phase(phase: &'static str) {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn observe_stream(stdout: bool, bytes: &[u8]) {
     let Some(trace) = trace() else { return };
     let Ok(mut state) = trace.state.lock() else {
@@ -143,6 +151,7 @@ pub(crate) fn observe_stream(stdout: bool, bytes: &[u8]) {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn finish_logs() {
     if let Some(trace) = trace()
         && let Ok(mut state) = trace.state.lock()
@@ -160,8 +169,10 @@ pub(crate) fn finish_logs() {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 type LogEvent = (&'static str, u8, Option<u8>);
 
+#[cfg(any(target_os = "linux", test))]
 #[derive(Default)]
 struct LogProbe {
     partial: Vec<u8>,
@@ -181,6 +192,7 @@ struct Readiness {
     overlapping_requests: [u64; 2],
 }
 
+#[cfg(any(target_os = "linux", test))]
 struct Game {
     number: u8,
     names: [String; 2],
@@ -190,6 +202,7 @@ struct Game {
     readiness: Readiness,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl LogProbe {
     fn feed(&mut self, bytes: &[u8], now_ns: u64) -> Vec<LogEvent> {
         let mut events = Vec::new();
