@@ -5,7 +5,9 @@
 //! Runtime must retain request leases until a physical Ready, independently of
 //! logical cancellation or deadline rejection.
 
-use crate::asset::{self, AssetProfile, MaiaAsset, INPUT_NAME, MLH_NAME, POLICY_NAME, WDL_NAME};
+use crate::asset::{
+    self, AssetMetadata, AssetProfile, MaiaAsset, INPUT_NAME, MLH_NAME, POLICY_NAME, WDL_NAME,
+};
 use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
 use crate::runtime_pin::RuntimeLibraryPin;
 use crate::{output, RawOutput};
@@ -488,6 +490,28 @@ impl OnnxBackend {
         asset: &MaiaAsset,
         config: BackendConfig,
     ) -> Result<Self, BackendError> {
+        Self::load_model(runtime, asset.metadata(), asset.onnx_bytes(), config)
+    }
+
+    /// Consumes the verified serialized bytes, releasing that host allocation
+    /// immediately after ORT creates its session, before CUDA warm placement.
+    /// Metadata remains typed; a consumed model cannot masquerade as empty bytes.
+    pub fn load_owned(
+        runtime: &OrtRuntime,
+        asset: MaiaAsset,
+        config: BackendConfig,
+    ) -> Result<(AssetMetadata, Self), BackendError> {
+        let (metadata, bytes) = asset.into_parts();
+        let backend = Self::load_model(runtime, &metadata, bytes, config)?;
+        Ok((metadata, backend))
+    }
+
+    fn load_model(
+        runtime: &OrtRuntime,
+        asset: &AssetMetadata,
+        model: impl AsRef<[u8]>,
+        config: BackendConfig,
+    ) -> Result<Self, BackendError> {
         config.validate()?;
         match (config.provider, runtime.bundle_digest()) {
             (Provider::Cuda { .. }, None) => {
@@ -576,16 +600,16 @@ impl OnnxBackend {
                 .with_profiling(prefix)
                 .map_err(|error| setup_error(CauseCode::ProfilingStart, error))?;
         }
-        let session = builder
-            .commit_from_memory(asset.onnx_bytes())
-            .map_err(|error| {
+        let session = commit_verified_model(model, |bytes| {
+            builder.commit_from_memory(bytes).map_err(|error| {
                 BackendError::new(
                     K::BackendUnavailable,
                     S::Backend,
                     "ORT could not load the verified model with the requested provider",
                 )
                 .with_ort_cause(CauseCode::ModelLoad, error)
-            })?;
+            })
+        })?;
         validate_interface(&session, asset.profile())?;
         // This is a versioned C backend identity, not a new global wire codec.
         let mut profile = format!("rz-maia-ort-v1;ort=1.22.0;wrapper=2.0.0-rc.10;runtime={:?};asset={:?};provider={:?};threads={};batch={};fp32;tf32=0;opt=1;sync;full=1;temp=1;sum=1e-5",
@@ -1107,6 +1131,16 @@ impl OnnxBackend {
     }
 }
 
+// Normal commit_from_memory creates an owned ORT session. This scope retains
+// serialized bytes through the call and releases an owned buffer on both
+// success and error, before interface checks or physical CUDA warm placement.
+fn commit_verified_model<T>(
+    model: impl AsRef<[u8]>,
+    commit: impl FnOnce(&[u8]) -> Result<T, BackendError>,
+) -> Result<T, BackendError> {
+    commit(model.as_ref())
+}
+
 fn pack_outputs(
     policy: &[f32],
     wdl: &[f32],
@@ -1230,6 +1264,57 @@ pub fn verify_cuda_profile(bytes: &[u8]) -> Result<usize, BackendError> {
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+    #[test]
+    fn serialized_model_owner_is_released_before_postcommit_work_on_success_and_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct ModelBytes {
+            dropped: Arc<AtomicBool>,
+            bytes: Vec<u8>,
+        }
+        impl AsRef<[u8]> for ModelBytes {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        impl Drop for ModelBytes {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::Release);
+            }
+        }
+        for succeeds in [true, false] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let model = ModelBytes {
+                dropped: Arc::clone(&dropped),
+                bytes: vec![1, 2, 3, 4],
+            };
+            let result = commit_verified_model(model, |bytes| {
+                assert!(!dropped.load(Ordering::Acquire));
+                assert_eq!(bytes, &[1, 2, 3, 4]);
+                if succeeds {
+                    Ok(7)
+                } else {
+                    Err(BackendError::new(
+                        K::BackendUnavailable,
+                        S::Backend,
+                        "fixture commit failure",
+                    ))
+                }
+            });
+            assert_eq!(result.is_ok(), succeeds);
+            assert!(
+                dropped.load(Ordering::Acquire),
+                "serialized bytes overlap postcommit work"
+            );
+        }
+        // Existing callers may keep a borrowed model for independent checks.
+        let borrowed = vec![3, 2, 1];
+        assert_eq!(
+            commit_verified_model(&borrowed, |bytes| Ok(bytes.len())).unwrap(),
+            3
+        );
+        assert_eq!(borrowed, [3, 2, 1]);
+    }
+
     #[test]
     fn raw_pool_reuses_returned_ownership_without_mutating_retained_outputs() {
         let policy = vec![0.0; POLICY_SIZE];

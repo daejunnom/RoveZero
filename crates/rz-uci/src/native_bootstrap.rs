@@ -18,7 +18,7 @@ use crate::{
 use rz_contracts::*;
 use rz_encoding::classical::HistoryFill;
 use rz_eval::{
-    asset::{self, MaiaAsset},
+    asset::{self, AssetMetadata, MaiaAsset},
     contracts::{
         ClassicalProjection, HOST_BYTES_PER_ITEM, MaiaBinding, PhysicalFailure, encoding_manifest,
     },
@@ -1106,7 +1106,7 @@ impl NativeSessionFactory {
     fn load_parts(
         owners: &OwnerRegistry,
         config: &NativeConfig,
-    ) -> Result<(MaiaAsset, OrtRuntime, OnnxBackend, ClassicalProjection), NativeBootstrapError>
+    ) -> Result<(AssetMetadata, OrtRuntime, OnnxBackend, ClassicalProjection), NativeBootstrapError>
     {
         let asset = MaiaAsset::load(
             &config.source_weights,
@@ -1208,7 +1208,7 @@ impl NativeSessionFactory {
             }
         };
         let runtime = OrtRuntime::load(&pin)?;
-        let backend = OnnxBackend::load(&runtime, &asset, backend_config)?;
+        let (asset, backend) = OnnxBackend::load_owned(&runtime, asset, backend_config)?;
         // Storage evidence is a separate sidecar, not a change to E's closed
         // inference/attestation schema or backend identity. No private paths.
         let storage_receipt = serde_json::json!({

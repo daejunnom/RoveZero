@@ -161,9 +161,16 @@ impl ExportManifest {
 
 #[derive(Debug)]
 pub struct SelectedAsset {
+    metadata: AssetMetadata,
+    onnx: Vec<u8>,
+}
+
+/// Verified identity retained after the serialized model buffer is consumed.
+/// Only the bounded asset loader can construct this provenance.
+#[derive(Debug)]
+pub struct AssetMetadata {
     manifest: ExportManifest,
     manifest_digest: [u8; 32],
-    onnx: Vec<u8>,
     profile: AssetProfile,
 }
 
@@ -180,57 +187,178 @@ impl SelectedAsset {
         manifest.validate()?;
         let profile = manifest.profile()?;
         let (gzip_bytes, protobuf_bytes) = profile.source_sizes();
-        let source = read_bounded(original, gzip_bytes)?;
-        check_bytes(&source, gzip_bytes, profile.gzip_sha256())?;
-        // Stream decompression through a fixed buffer. BT4 does not need a
-        // second 365 MiB source allocation while verifying the gzip identity.
-        let mut decoded = GzDecoder::new(source.as_slice()).take((protobuf_bytes + 1) as u64);
-        let mut hash = Sha256::new();
-        let mut size = 0usize;
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            let read = decoded
-                .read(&mut buffer)
-                .map_err(|_| BackendError::new(K::InvalidInput, S::Asset, "invalid gzip source"))?;
-            if read == 0 {
-                break;
-            }
-            size += read;
-            hash.update(&buffer[..read]);
-        }
-        if size != protobuf_bytes
-            || <[u8; 32]>::from(hash.finalize()) != parse_sha256(profile.protobuf_sha256())?
-        {
-            return Err(BackendError::new(
-                K::IdentityMismatch,
-                S::Asset,
-                "decoded source length or SHA-256 differs",
-            ));
-        }
-        drop(decoded);
-        drop(source);
+        verify_source_stream(
+            original,
+            gzip_bytes,
+            profile.gzip_sha256(),
+            protobuf_bytes,
+            profile.protobuf_sha256(),
+        )?;
         let onnx = read_bounded(onnx, manifest.onnx_bytes)?;
         check_bytes(&onnx, manifest.onnx_bytes, &manifest.onnx_sha256)?;
         Ok(Self {
-            manifest,
-            manifest_digest: sha256(&manifest_bytes),
+            metadata: AssetMetadata {
+                manifest,
+                manifest_digest: sha256(&manifest_bytes),
+                profile,
+            },
             onnx,
-            profile,
         })
     }
 
+    pub fn manifest(&self) -> &ExportManifest {
+        self.metadata.manifest()
+    }
+    pub fn manifest_digest(&self) -> [u8; 32] {
+        self.metadata.manifest_digest()
+    }
+    pub fn onnx_bytes(&self) -> &[u8] {
+        &self.onnx
+    }
+    pub fn profile(&self) -> AssetProfile {
+        self.metadata.profile()
+    }
+    pub fn metadata(&self) -> &AssetMetadata {
+        &self.metadata
+    }
+    #[cfg(feature = "onnx")]
+    pub(crate) fn into_parts(self) -> (AssetMetadata, Vec<u8>) {
+        (self.metadata, self.onnx)
+    }
+}
+
+impl AssetMetadata {
     pub fn manifest(&self) -> &ExportManifest {
         &self.manifest
     }
     pub fn manifest_digest(&self) -> [u8; 32] {
         self.manifest_digest
     }
-    pub fn onnx_bytes(&self) -> &[u8] {
-        &self.onnx
-    }
     pub fn profile(&self) -> AssetProfile {
         self.profile
     }
+}
+
+struct HashedReader<R> {
+    reader: R,
+    digest: Sha256,
+    bytes: usize,
+    io_failed: bool,
+}
+
+impl<R: Read> Read for HashedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self.reader.read(buffer) {
+            Ok(size) => {
+                self.bytes += size; // The inner Take bounds this by the profile.
+                self.digest.update(&buffer[..size]);
+                Ok(size)
+            }
+            Err(error) => {
+                self.io_failed = true;
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Hash compressed and decoded bytes from one held file, without a whole gzip
+/// allocation or reopening a verified path. Preserve compressed-identity error
+/// precedence, including malformed/trailing data and bounded decoded expansion.
+fn verify_source_stream(
+    path: &Path,
+    gzip_bytes: usize,
+    gzip_digest: &str,
+    decoded_bytes: usize,
+    decoded_digest: &str,
+) -> Result<(), BackendError> {
+    let compressed_limit = gzip_bytes.checked_add(1).ok_or_else(|| {
+        BackendError::new(K::ResourceExhausted, S::Asset, "source limit overflow")
+    })?;
+    let decoded_limit = decoded_bytes.checked_add(1).ok_or_else(|| {
+        BackendError::new(K::ResourceExhausted, S::Asset, "decoded limit overflow")
+    })?;
+    let file =
+        File::open(path).map_err(|_| BackendError::new(K::Io, S::Asset, "cannot open asset"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| BackendError::new(K::Io, S::Asset, "cannot inspect asset"))?;
+    if !metadata.is_file() || metadata.len() > gzip_bytes as u64 {
+        return Err(BackendError::new(
+            K::ResourceExhausted,
+            S::Asset,
+            "asset is not a bounded regular file",
+        ));
+    }
+    let compressed = HashedReader {
+        reader: file.take(compressed_limit as u64),
+        digest: Sha256::new(),
+        bytes: 0,
+        io_failed: false,
+    };
+    let mut decoded = GzDecoder::new(compressed);
+    let mut limited = (&mut decoded).take(decoded_limit as u64);
+    let mut digest = Sha256::new();
+    let mut bytes = 0;
+    let mut buffer = [0_u8; 64 * 1024];
+    let decoded_error = loop {
+        match limited.read(&mut buffer) {
+            Ok(0) => break None,
+            Ok(size) => {
+                bytes += size;
+                digest.update(&buffer[..size]);
+            }
+            Err(error) => break Some(error),
+        }
+    };
+    // GzDecoder can stop at a member boundary or read ahead. Recover its same
+    // hashing reader and drain the remaining compressed bytes once, so trailing
+    // bytes and exact file length remain covered by the original source pin.
+    let mut compressed = decoded.into_inner();
+    loop {
+        let size = compressed
+            .read(&mut buffer)
+            .map_err(|_| BackendError::new(K::Io, S::Asset, "asset read failed"))?;
+        if size == 0 {
+            break;
+        }
+    }
+    if compressed.io_failed {
+        return Err(BackendError::new(K::Io, S::Asset, "asset read failed"));
+    }
+    if compressed.bytes > gzip_bytes {
+        return Err(BackendError::new(
+            K::ResourceExhausted,
+            S::Asset,
+            "asset grew beyond limit",
+        ));
+    }
+    if compressed.bytes != gzip_bytes
+        || <[u8; 32]>::from(compressed.digest.finalize()) != parse_sha256(gzip_digest)?
+    {
+        return Err(BackendError::new(
+            K::IdentityMismatch,
+            S::Asset,
+            "asset length or SHA-256 differs",
+        ));
+    }
+    if decoded_error.is_some() {
+        return Err(BackendError::new(
+            K::InvalidInput,
+            S::Asset,
+            "invalid gzip source",
+        ));
+    }
+    if bytes != decoded_bytes
+        || <[u8; 32]>::from(digest.finalize()) != parse_sha256(decoded_digest)?
+    {
+        return Err(BackendError::new(
+            K::IdentityMismatch,
+            S::Asset,
+            "decoded source length or SHA-256 differs",
+        ));
+    }
+    Ok(())
 }
 
 pub fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -310,4 +438,102 @@ fn check_bytes(bytes: &[u8], len: usize, digest: &str) -> Result<(), BackendErro
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+
+    #[test]
+    fn streamed_source_covers_exact_compressed_and_decoded_bytes_and_error_precedence() {
+        let path = std::env::temp_dir().join(format!("rz-stream-source-{}", std::process::id()));
+        let decoded: Vec<u8> = (0..131_113).map(|n| (n % 251) as u8).collect();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&decoded).unwrap();
+        let mut source = encoder.finish().unwrap();
+        // Old identity checking hashed all trailing compressed bytes as well.
+        source.extend_from_slice(b"bound trailing bytes");
+        std::fs::write(&path, &source).unwrap();
+        let source_digest = hex_sha256(&source);
+        let decoded_digest = hex_sha256(&decoded);
+        let verify = |size, hash: &str, output_size, output_hash: &str| {
+            verify_source_stream(&path, size, hash, output_size, output_hash)
+        };
+        verify(source.len(), &source_digest, decoded.len(), &decoded_digest).unwrap();
+        assert_eq!(
+            verify(
+                source.len() - 1,
+                &source_digest,
+                decoded.len(),
+                &decoded_digest
+            )
+            .unwrap_err()
+            .kind,
+            K::ResourceExhausted
+        );
+        assert_eq!(
+            verify(
+                source.len() + 1,
+                &source_digest,
+                decoded.len(),
+                &decoded_digest
+            )
+            .unwrap_err()
+            .kind,
+            K::IdentityMismatch
+        );
+        assert_eq!(
+            verify(
+                source.len(),
+                &"00".repeat(32),
+                decoded.len(),
+                &decoded_digest
+            )
+            .unwrap_err()
+            .kind,
+            K::IdentityMismatch
+        );
+        for output_size in [decoded.len() - 1, decoded.len() + 1] {
+            assert_eq!(
+                verify(source.len(), &source_digest, output_size, &decoded_digest)
+                    .unwrap_err()
+                    .kind,
+                K::IdentityMismatch
+            );
+        }
+        assert_eq!(
+            verify(
+                source.len(),
+                &source_digest,
+                decoded.len(),
+                &"00".repeat(32)
+            )
+            .unwrap_err()
+            .kind,
+            K::IdentityMismatch
+        );
+        source[0] ^= 0xff;
+        std::fs::write(&path, &source).unwrap();
+        // A corrupt header still reports the changed compressed pin first.
+        assert_eq!(
+            verify(source.len(), &source_digest, decoded.len(), &decoded_digest)
+                .unwrap_err()
+                .kind,
+            K::IdentityMismatch
+        );
+        assert_eq!(
+            verify(
+                source.len(),
+                &hex_sha256(&source),
+                decoded.len(),
+                &decoded_digest
+            )
+            .unwrap_err()
+            .kind,
+            K::InvalidInput
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 }

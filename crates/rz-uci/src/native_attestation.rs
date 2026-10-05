@@ -21,7 +21,7 @@ use cap_std::{
 };
 use rz_contracts::*;
 use rz_eval::{
-    asset::MaiaAsset,
+    asset::AssetMetadata,
     native_runtime_bridge::NativeWorkerOrigin,
     onnx::{OnnxBackend, OrtRuntime, Provider},
 };
@@ -108,7 +108,7 @@ pub struct CpuProfileV1 {
 }
 impl CpuProfileV1 {
     pub(crate) fn from_loaded(
-        asset: &MaiaAsset,
+        asset: &AssetMetadata,
         runtime: &OrtRuntime,
         backend: &OnnxBackend,
         model: &ModelDescriptor,

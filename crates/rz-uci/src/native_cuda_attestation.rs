@@ -16,7 +16,7 @@ use crate::{
 };
 use rz_contracts::*;
 use rz_eval::{
-    asset::MaiaAsset,
+    asset::AssetMetadata,
     native_runtime_bridge::NativeWorkerOrigin,
     onnx::{OnnxBackend, OrtRuntime, Provider},
     runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole},
@@ -148,7 +148,7 @@ pub struct CudaProfileV1 {
 }
 impl CudaProfileV1 {
     pub(crate) fn from_loaded(
-        asset: &MaiaAsset,
+        asset: &AssetMetadata,
         runtime: &OrtRuntime,
         backend: &OnnxBackend,
         model: &ModelDescriptor,
