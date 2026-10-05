@@ -3,7 +3,7 @@
 use rz_encoding::classical::{self, Frame, HistoryFill, Input};
 use rz_eval::{
     asset::{self, AssetProfile, MaiaAsset},
-    onnx::{BackendConfig, OnnxBackend, OrtRuntime, Provider},
+    onnx::{BackendConfig, ExecutionExperiments, OnnxBackend, OrtRuntime, Provider},
     runtime_pin::{CudaRuntimeBundleSpec, RuntimeCache},
 };
 use serde_json::{json, Value};
@@ -76,12 +76,63 @@ fn save(file: &mut File, report: &Value) -> Result<(), Box<dyn Error>> {
     file.sync_all()?;
     Ok(())
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunMode {
+    BatchSweep,
+    B1Buffers { reuse: bool },
+}
+impl RunMode {
+    fn parse(option: Option<&str>) -> Result<Self, Box<dyn Error>> {
+        match option {
+            None => Ok(Self::BatchSweep),
+            Some("--b1-buffers=baseline") => Ok(Self::B1Buffers { reuse: false }),
+            Some("--b1-buffers=reuse") if cfg!(feature = "experimental-io-buffers") => {
+                Ok(Self::B1Buffers { reuse: true })
+            }
+            _ => {
+                Err("unknown comparison mode or unavailable experimental-io-buffers feature".into())
+            }
+        }
+    }
+    fn widths(self) -> &'static [usize] {
+        match self {
+            Self::BatchSweep => &[1, 2, 4, 8, 16],
+            Self::B1Buffers { .. } => &[1],
+        }
+    }
+}
+
+fn recycle_checked(
+    backend: &mut OnnxBackend,
+    outputs: Vec<rz_eval::RawOutput>,
+    mode: RunMode,
+    expected: &mut Option<String>,
+) -> Result<(), Box<dyn Error>> {
+    if let RunMode::B1Buffers { .. } = mode {
+        let bytes: Vec<_> = outputs
+            .iter()
+            .flat_map(|raw| raw.policy_logits.iter().chain(&raw.wdl))
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let digest = hex(asset::sha256(&bytes));
+        if expected.as_ref().is_some_and(|prior| prior != &digest) {
+            return Err("B1 fixed input outputs changed during buffer comparison".into());
+        }
+        *expected = Some(digest);
+        // Both comparison arms return ownership at the same point. The default
+        // batch sweep retains its original measurement/drop behavior.
+        backend.recycle_outputs(outputs);
+    }
+    Ok(())
+}
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.len() != 6 {
-        return Err("usage: inference_bench SOURCE ONNX EXPORT CUDA_CORE CUDA_BUNDLE REPORT (all absolute; fresh REPORT outside Git)".into());
+    if !(args.len() == 6 || args.len() == 7) {
+        return Err("usage: inference_bench SOURCE ONNX EXPORT CUDA_CORE CUDA_BUNDLE REPORT [--b1-buffers=baseline|reuse] (all six paths absolute; fresh REPORT outside Git)".into());
     }
-    if args.iter().any(|arg| !Path::new(arg).is_absolute()) {
+    let mode = RunMode::parse(args.get(6).map(String::as_str))?;
+    if args[..6].iter().any(|arg| !Path::new(arg).is_absolute()) {
         return Err("all paths must be absolute".into());
     }
     let parent = Path::new(&args[5])
@@ -102,8 +153,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         "numerical_regression":"separate_required_not_run_here", "samples":[],
         "measurement":"host_wall_including_run_io_and_physical_completion_not_kernel_time",
         "memory":null,"failure":null});
+    if let RunMode::B1Buffers { reuse } = mode {
+        report["kind"] = json!("b1_buffer_reuse_fixed_work");
+        report["batches"] = json!([1]);
+        report["reuse_buffers"] = json!(reuse);
+        report["measurement"] = json!("host_wall_including_run_physical_completion_output_digest_and_ownership_return_not_kernel_time");
+    }
     let started = Instant::now();
-    let outcome = sweep(&args, &mut report);
+    let outcome = sweep(&args, &mut report, mode);
     report["memory"] = memory_evidence();
     report["total_wall_ns"] = json!(ns(started.elapsed()));
     match outcome {
@@ -119,7 +176,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
-fn sweep(args: &[String], report: &mut Value) -> Result<(), Box<dyn Error>> {
+fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<dyn Error>> {
     let prepare = Instant::now();
     let bundle = CudaRuntimeBundleSpec::from_json(std::str::from_utf8(&asset::read_bounded(
         Path::new(&args[4]),
@@ -149,7 +206,7 @@ fn sweep(args: &[String], report: &mut Value) -> Result<(), Box<dyn Error>> {
     report["input_sha256"] = json!(hex(asset::sha256(&input_bytes)));
     report["runtime_bundle_sha256"] = json!(runtime.bundle_digest().map(hex));
     report["runtime_prepare_ns"] = json!(ns(prepare.elapsed()));
-    for width in [1, 2, 4, 8, 16] {
+    for &width in mode.widths() {
         report["active_batch"] = json!(width);
         let preparation = Instant::now();
         let model = MaiaAsset::load(
@@ -168,6 +225,12 @@ fn sweep(args: &[String], report: &mut Value) -> Result<(), Box<dyn Error>> {
             device_id: 0,
             arena_bytes: model.profile().cuda_arena_bytes(),
         };
+        if let RunMode::B1Buffers { reuse } = mode {
+            config.experiments = ExecutionExperiments {
+                reuse_buffers: reuse,
+                ..ExecutionExperiments::default()
+            };
+        }
         let profile_dir = Path::new(&args[5]).with_extension(format!("b{width}.placement"));
         std::fs::create_dir(&profile_dir)?;
         config.profiling_prefix = Some(profile_dir.join("placement"));
@@ -179,11 +242,18 @@ fn sweep(args: &[String], report: &mut Value) -> Result<(), Box<dyn Error>> {
         let placement_record = json!({"profile_sha256":hex(placement.profile_sha256),
             "executed_cuda_nodes":placement.executed_cuda_nodes});
         let inputs = vec![&input; width];
+        let mut output_digest = None;
         let warmup = Instant::now();
         for _ in 0..3 {
             let raw = backend.run(&inputs)?;
             if raw.len() != width {
                 return Err("incomplete warmup".into());
+            }
+            if backend.has_unconfirmed_physical_completion() {
+                return Err("unconfirmed warmup physical completion".into());
+            }
+            if mode != RunMode::BatchSweep {
+                recycle_checked(&mut backend, raw, mode, &mut output_digest)?;
             }
         }
         let warmup_ns = ns(warmup.elapsed());
@@ -191,11 +261,16 @@ fn sweep(args: &[String], report: &mut Value) -> Result<(), Box<dyn Error>> {
         for _ in 0..20 {
             let run = Instant::now();
             let outputs = backend.run(&inputs)?;
-            let elapsed = ns(run.elapsed());
+            let run_ns = ns(run.elapsed());
             if outputs.len() != width || backend.has_unconfirmed_physical_completion() {
                 return Err("incomplete outputs or unconfirmed physical completion".into());
             }
-            times.push(elapsed);
+            if mode == RunMode::BatchSweep {
+                times.push(run_ns);
+            } else {
+                recycle_checked(&mut backend, outputs, mode, &mut output_digest)?;
+                times.push(ns(run.elapsed()));
+            }
         }
         backend.verify_cuda_runtime_mappings()?;
         let total: u64 = times.iter().sum();
@@ -207,6 +282,9 @@ fn sweep(args: &[String], report: &mut Value) -> Result<(), Box<dyn Error>> {
             "cuda_placement":placement_record,"memory":memory_evidence(),
             "physical_completion_confirmed":true
         }));
+        if mode != RunMode::BatchSweep {
+            report["output_sha256"] = json!(output_digest);
+        }
         // Normal drop only after confirmed completion. On an error the backend
         // retains its own unconfirmed tensors/session; no larger batch runs.
         drop(backend);
@@ -218,6 +296,22 @@ fn sweep(args: &[String], report: &mut Value) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn b1_comparison_is_explicit_and_does_not_change_default_sweep() {
+        assert_eq!(RunMode::parse(None).unwrap().widths(), &[1, 2, 4, 8, 16]);
+        assert_eq!(
+            RunMode::parse(Some("--b1-buffers=baseline")).unwrap(),
+            RunMode::B1Buffers { reuse: false }
+        );
+        let reuse = RunMode::parse(Some("--b1-buffers=reuse"));
+        assert_eq!(reuse.is_ok(), cfg!(feature = "experimental-io-buffers"));
+        if let Ok(mode) = reuse {
+            assert_eq!(mode.widths(), &[1]);
+        }
+        for bad in ["--b1-buffers=", "--b1-buffers=4", "--b1-buffers=notify"] {
+            assert!(RunMode::parse(Some(bad)).is_err());
+        }
+    }
     #[test]
     fn fixed_input_matches_previous_no_history_tensor_identity() {
         let input = start_input().unwrap();
