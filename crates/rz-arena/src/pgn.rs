@@ -68,6 +68,9 @@ pub struct GamePgnAudit {
     pub game_id: String,
     pub white_engine: String,
     pub black_engine: String,
+    /// Retained header metadata; only the V3 whole-clock gate attests it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_control: Option<String>,
     pub uci_moves: Vec<String>,
     /// Observed runner declaration. An `incomplete` cutoff can declare Draw
     /// but never grants a scored draw; callers must dispatch by classification.
@@ -974,6 +977,7 @@ pub fn audit_pair_pgn_for_spec(
             game_id: game.id.clone(),
             white_engine: game.white_engine.clone(),
             black_engine: game.black_engine.clone(),
+            time_control: tags.get("TimeControl").cloned(),
             uci_moves,
             result: header_result,
             termination,

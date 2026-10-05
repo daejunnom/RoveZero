@@ -22,6 +22,21 @@ pub struct NativeGameClockV3 {
     pub base_ms: u64,
     pub increment_ms: u64,
 }
+impl NativeGameClockV3 {
+    /// Canonical PGN seconds, without converting exact milliseconds to floats.
+    pub fn pgn_time_control(self) -> String {
+        fn seconds(ms: u64) -> String {
+            if ms % 1000 == 0 {
+                (ms / 1000).to_string()
+            } else {
+                format!("{}.{:03}", ms / 1000, ms % 1000)
+                    .trim_end_matches('0')
+                    .to_owned()
+            }
+        }
+        format!("{}+{}", seconds(self.base_ms), seconds(self.increment_ms))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -59,10 +74,17 @@ impl CudaLaunchProfile for NativeCudaProfileV3 {
         NativePairClock::Game(clock)
     }
     fn validate_clock(clock: Self::Clock, runtime_ms: u64) -> Result<(), ManifestError> {
+        let sufficient_wall = match (clock.base_ms, clock.increment_ms) {
+            (30_000, 100) => runtime_ms >= 180_000,
+            // Two 256-ply games can consume almost 1000 seconds of clock.
+            // Preserve additional startup/handshake/cleanup headroom.
+            (120_000, 1_000) => runtime_ms >= 1_300_000,
+            _ => false,
+        };
         check(
-            clock.base_ms == 30_000 && clock.increment_ms == 100 && runtime_ms >= 180_000,
+            sufficient_wall,
             "clock",
-            "pilot V3 is locked to 30s+0.1s with a bounded independent pair wall limit",
+            "pilot V3 admits locked 30s+0.1s or 120s+1s clocks with sufficient independent pair wall",
         )
     }
     fn validate_profile(&self) -> Result<(), ManifestError> {

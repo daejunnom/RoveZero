@@ -307,7 +307,13 @@ pub fn validate_pilot_clock_trace(
     }
     let mut cursor = 0;
     let mut games = Vec::new();
+    let time_control = clock.pgn_time_control();
     for g in &pgn.games {
+        if g.time_control.as_deref() != Some(time_control.as_str()) {
+            return Err(invalid(
+                "PGN TimeControl differs from locked whole-game clock",
+            ));
+        }
         if g.classification == "engine_loss" {
             return Err(invalid(
                 "engine loss retained; full pilot clock/provider gate is not reusable",

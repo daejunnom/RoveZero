@@ -4,6 +4,10 @@ use rz_arena::*;
 use rz_experiments::*;
 
 fn fixture() -> (OpeningSpec, PairPgnAudit, String) {
+    fixture_clock(clock())
+}
+
+fn fixture_clock(clock: NativeGameClockV3) -> (OpeningSpec, PairPgnAudit, String) {
     let opening = OpeningSpec {
         id: "clock-test".into(),
         initial: InitialPosition::Startpos,
@@ -36,7 +40,7 @@ fn fixture() -> (OpeningSpec, PairPgnAudit, String) {
         games,
         execution_order: [0, 1],
     };
-    let pgn=pair.games.iter().map(|g|format!("[White \"{}\"]\n[Black \"{}\"]\n[Result \"1-0\"]\n[Termination \"normal\"]\n\n1. e4 e5 2. Qh5 Nc6 3. Bc4 Nf6 4. Qxf7# 1-0\n\n",g.white_engine,g.black_engine)).collect::<String>();
+    let pgn=pair.games.iter().map(|g|format!("[White \"{}\"]\n[Black \"{}\"]\n[Result \"1-0\"]\n[Termination \"normal\"]\n[TimeControl \"{}\"]\n\n1. e4 e5 2. Qh5 Nc6 3. Bc4 Nf6 4. Qxf7# 1-0\n\n",g.white_engine,g.black_engine,clock.pgn_time_control())).collect::<String>();
     let audit = audit_pair_pgn_for_spec(
         &pair,
         &pgn,
@@ -54,7 +58,7 @@ fn fixture() -> (OpeningSpec, PairPgnAudit, String) {
     .unwrap();
     let mut trace = String::new();
     for g in &pair.games {
-        let mut remaining = [30000_u64; 2];
+        let mut remaining = [clock.base_ms; 2];
         for ply in 2..7 {
             let s = ply % 2;
             let name = if s == 0 {
@@ -63,8 +67,8 @@ fn fixture() -> (OpeningSpec, PairPgnAudit, String) {
                 &g.black_engine
             };
             let before = remaining[s];
-            remaining[s] = before - 101 + 100;
-            trace.push_str(&format!("[TRACE ] [10:51:44.181984] <     137433152747200> fastchess --- RZ_CLOCK_V1 engine={name} before={before} increment=100 elapsed_ns=100000001 after={} valid=true\n",remaining[s]));
+            remaining[s] = before - 101 + clock.increment_ms;
+            trace.push_str(&format!("[TRACE ] [10:51:44.181984] <     137433152747200> fastchess --- RZ_CLOCK_V1 engine={name} before={before} increment={} elapsed_ns=100000001 after={} valid=true\n",clock.increment_ms,remaining[s]));
         }
     }
     (opening, audit, trace)
@@ -86,6 +90,25 @@ fn whole_clock_replays_audited_pgn_and_resets_on_swapped_game() {
         assert_eq!(g.charged_ms, [303, 202]);
         assert_eq!(g.white_remaining_ms, 29997);
         assert_eq!(g.black_remaining_ms, 29998);
+    }
+}
+
+#[test]
+fn blitz_clock_preserves_fischer_increment_color_reset_and_pgn_time_control() {
+    let c = NativeGameClockV3 {
+        base_ms: 120_000,
+        increment_ms: 1_000,
+    };
+    let (o, mut p, t) = fixture_clock(c);
+    let audit = validate_pilot_clock_trace(t.as_bytes(), &p, &o, c).unwrap();
+    for game in audit.games {
+        assert_eq!(game.white_remaining_ms, 122_697);
+        assert_eq!(game.black_remaining_ms, 121_798);
+        assert_eq!(game.charged_ms, [303, 202]);
+    }
+    for tag in [None, Some("60+1".into()), Some("120+0".into())] {
+        p.games[0].time_control = tag;
+        assert!(validate_pilot_clock_trace(t.as_bytes(), &p, &o, c).is_err());
     }
 }
 

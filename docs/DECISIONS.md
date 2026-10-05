@@ -74,6 +74,7 @@
 |---|---|---|
 | RZ-D041 | 사용자 표본 확정·별도 탐색 정책 pilot | 같은 BT4 FP32/B1·PUCT에서 S0 visits와 S1 exact-terminal의 최종 선택만 비교한다. 사용자 확정은 16쌍·32판·전체 최대 120분, 시계는 30초+제시간 착수 뒤 0.1초·최대 256 ply다. 별도 CUDA V3 schema/domain·고정 cohort·흑백 교환·전체 position→bestmove 시계·자동 claim의 A 검증·고정 paired Hoeffding95를 잠근다. V2 A/A cutoff를 점수로 재해석하지 않으며 작은 pilot을 Elo·승격으로 보고하지 않는다. 실패·미완료·시작 전 엔진 실패도 원장에 남긴다. [pilot 명세와 인수](research/BT4-FINAL-SELECTION-PILOT.md)를 따른다. |
 | RZ-D042 | 사용자 할당 실패 확인·개선·계속 요청 | 기존 RAM 압박과 이번 모델 초기화 할당 실패를 구분한다. RAM 최고치·한도 사건·GPU 표본과 별도 dual 진단만으로 물리 VRAM 부족을 확정하지 않는다. CUDA arena 확장을 요청 크기로 바꾸고 backend identity를 분리한다. BT4 독립 수치·Rules No/Repeat·두 엔진 상주 메모리·물리 종료·CPU 검사/CI를 먼저 인수한다. 실패한 pilot은 보존하고 새 source/binary/backend를 잠근 16쌍을 처음부터 실행한다. 두 시도의 점수를 합치지 않고 최초 전체 120분 안에서 진단·재실행을 마감한다. 모델·FP32·TF32 off·PUCT·S0/S1·arena 상한은 유지한다. |
+| RZ-D043 | 사용자 전체 시계·피셔·엔진 blitz 기준·PGN 색별 엔진 종류·후속 진행 지정 / 2026-10-05 | 공식 CCRL Blitz의 2분+1초 시간 형식을 참조해 로컬 RTX 4050에서 새 paired pilot을 준비한다. 기존 30초+0.1초 결과를 보존하고 점수를 합치지 않는다. 같은 BT4/FP32/No/B1·PUCT·cap 4096의 S0/S1 16쌍·32판을 별도로 잠그며 후속 실행 전체 상한은 120분이다. 기준 Intel i7-4770K CPU 보정·EGTB·공식 CCRL 등록/rating은 수행한 것으로 표시하지 않는다. PGN TimeControl을 실제 부모 clock trace/잠금과 대조하고 raw White/Black에 RoveZero·BT4·S0/S1을 명시한다. SAN 검토 사본은 원본 색별 ID·binary/model/source hash·program type을 보존한다. 실패·미완료·호스트 RAM 압박·실제 인수를 기록하며 미관측 opening/기력 승격을 주장하지 않는다. |
 
 ## 남은 결정과 실행 전 잠금
 

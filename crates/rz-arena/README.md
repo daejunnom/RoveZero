@@ -358,12 +358,22 @@ source/patch/binary를 검증한다. -strict를 빼서 시간패의 PGN을 회�
 pair를 정상 인수하지 않는다.
 
 전체 시계는 position 전송 전부터 bestmove까지 부모의 단조 시간으로 측정한다.
-부분 ms 올림·제시간 착수 뒤 증분·새 게임의 30,000ms 초기화·흑백 역할을
+부분 ms 올림·제시간 착수 뒤 증분·새 게임의 잠긴 base 초기화·흑백 역할을
 A가 재생한 모든 PGN ply와 대조한다. 100ms read margin은 시간패를 연장하지 않는다.
 자동 draw claim은 A의 현재 위치 근거가 있어야 한다. 정상 종료와 인수된 claim은
 pilot의 scored_games에 포함되지만 cutoff는 Incomplete다. 네 fresh native process의
 provider/search/placement·physical drain·exit 0과 전체 clock gate를 별도로 요구하며
 execution_ready=false, strength_eligible=false는 유지한다.
+
+V3 시계는 기존 30초+0.1초 또는 명시적으로 잠근 120초+1초다. 후자는
+[CCRL Blitz 시간 형식](https://computerchess.org.uk/404/index.html)을 참조하며
+로컬 장비의 동일 시간 대국이다. CCRL 기준 장비로 보정한 공식 rating이 아니다.
+120초+1초에는 pair runtime 최소 1,300,000ms가 필요하고 실제 총 120분 감독은 별도다.
+PGN의 TimeControl을 잠금/부모 clock trace와 대조하며 누락·다른 값은 V3 인수를 거부한다.
+PGN audit의 optional time_control은 헤더 관측이고 V1/V2의 시계를 새로 증명하지 않는다.
+각 새 엔진 ID에 RoveZero·BT4-it332·S0 visits/S1 exact-terminal을 넣어 White/Black의
+색 배정을 raw PGN과 잠긴 pair에서 직접 대조한다. 사용자용 SAN 사본은 원본 ID·source·
+모델/binary SHA와 WhiteType/BlackType=program을 보존하고 원시 PGN을 수정하지 않는다.
 
 시작 실패는 해당 판의 PGN이 없을 수 있다. V3는 pinned runner의 순서가 맞는
 game-start와 FATAL startup 기록을 검사해 failure_audit.startup_losses에 패배 선언을

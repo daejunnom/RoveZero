@@ -935,3 +935,25 @@ fn pilot_clock_failure_sample_and_runner_policy_are_locked() {
         FASTCHESS_CLOCK_PATCH_SHA256
     );
 }
+
+#[test]
+fn pilot_ccrl_blitz_clock_is_explicitly_locked_with_sufficient_pair_wall() {
+    let mut spec = pilot_fixture();
+    spec.clock = NativeGameClockV3 {
+        base_ms: 120_000,
+        increment_ms: 1_000,
+    };
+    assert_eq!(spec.clock.pgn_time_control(), "120+1");
+    assert!(spec.clone().lock().is_err());
+    spec.timeouts.runtime_ms = 1_500_000;
+    let locked = spec.clone().lock().unwrap();
+    assert_eq!(
+        LockedCudaSearchPilotPairSpecV3::from_json(&locked.to_json().unwrap())
+            .unwrap()
+            .sha256(),
+        locked.sha256()
+    );
+    spec.clock.increment_ms = 100;
+    assert!(spec.lock().is_err());
+    assert_eq!(pilot_fixture().clock.pgn_time_control(), "30+0.1");
+}
