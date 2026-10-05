@@ -12,6 +12,8 @@ pub mod contracts;
 pub mod engine;
 #[cfg(feature = "onnx-cpu")]
 pub mod native_attestation;
+#[cfg(all(feature = "onnx-cuda", feature = "experimental-batch"))]
+pub mod native_batch_attestation;
 #[cfg(feature = "onnx-cpu")]
 pub mod native_bootstrap;
 #[cfg(feature = "onnx-cuda")]

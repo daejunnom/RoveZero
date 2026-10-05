@@ -669,3 +669,102 @@ fn bt4_search_receipt_binds_the_served_settings_to_exact_startup_bytes() {
         .is_err()
     );
 }
+
+#[cfg(feature = "native-cuda-batch")]
+#[test]
+fn batch_wire_is_separate_and_binds_width_consumption_and_physical_ownership() {
+    use rz_uci::{
+        engine::EngineSettings,
+        native_batch_attestation::{BatchStartupReceipt, BatchTerminationReceipt},
+        native_cuda_attestation::*,
+    };
+    let (base, mut startup, mut termination) = bt4_wire_fixture();
+    startup["profile"]["max_batch_items"] = json!(4);
+    termination["startup"] = startup.clone();
+    let mut runtime = base.profile.runtime;
+    runtime.batch_size = 4;
+    let engine = CudaNativeLaunchSpec {
+        role: base.role,
+        engine_id: base.engine_id,
+        source_commit: base.source_commit,
+        target: base.target,
+        artifacts: base.artifacts,
+        cuda_bundle: base.cuda_bundle,
+        profile: NativeCudaBatchProfileV4 {
+            runtime,
+            search: base.profile.search,
+            max_batch_wait_us: 200,
+        },
+    };
+    let provider: CudaStartupReceiptV1 = serde_json::from_value(startup).unwrap();
+    let mut settings = EngineSettings {
+        max_workers: 1,
+        ..EngineSettings::default()
+    };
+    settings.search.max_simulations = 4096;
+    let mut search = CudaSearchReceiptV1::capture(&provider, &settings).unwrap();
+    search.batch_size = 4;
+    let wrapped = BatchStartupReceipt {
+        schema_version: 1,
+        kind: "batch_experiment_startup".into(),
+        provider,
+        search,
+        max_pending: 4,
+        max_batch_wait_us: 200,
+        physical_workers: 1,
+        max_physical_executions: 1,
+        classification: "S".into(),
+    };
+    let mut start = serde_json::to_vec(&wrapped).unwrap();
+    start.push(b'\n');
+    let mut histogram = [0; 16];
+    histogram[1] = 1;
+    let mut ended = BatchTerminationReceipt {
+        schema_version: 1,
+        kind: "batch_experiment_termination".into(),
+        provider: serde_json::from_value(termination).unwrap(),
+        startup_sha256: sha(&start),
+        journal_sha256: "e".repeat(64),
+        journal_bytes: 123,
+        journal_ownership_retained: false,
+        journal_error: None,
+        journal_summary: Some(rz_eval::batch_journal::BatchJournalAudit {
+            max_pending: 4,
+            physical_dispatches: 1,
+            physical_completed: 1,
+            completed_nn_items: 2,
+            delivered_evaluations: 2,
+            consumed_evaluations: 2,
+            canceled_requests: 0,
+            unused_completed_items: 0,
+            completed_batch_distribution: histogram,
+        }),
+    };
+    let check = |record: &BatchTerminationReceipt| {
+        rz_arena::validate_batch_provider_records(
+            &start,
+            &serde_json::to_vec(record).unwrap(),
+            &engine,
+            "native-process-123",
+        )
+    };
+    assert_eq!(check(&ended).unwrap().batch.unwrap().completed_nn_items, 2);
+    ended.journal_ownership_retained = true;
+    assert!(check(&ended).is_err());
+    ended.journal_ownership_retained = false;
+    ended.journal_summary.as_mut().unwrap().consumed_evaluations = 1;
+    assert!(check(&ended).is_err());
+    ended.journal_summary.as_mut().unwrap().consumed_evaluations = 2;
+    ended.startup_sha256 = "f".repeat(64);
+    assert!(check(&ended).is_err());
+    // Synthetic wire tests prove no actual journal bytes, GPU or drain.
+    assert!(
+        validate_native_cuda_provider_record_fields(
+            &start,
+            &serde_json::to_vec(&ended).unwrap(),
+            &engine,
+            "native-process-123"
+        )
+        .is_err()
+    );
+}

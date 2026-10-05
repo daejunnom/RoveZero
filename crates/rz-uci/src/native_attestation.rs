@@ -720,6 +720,61 @@ impl ReceiptWriter {
         file.sync_all()
             .map_err(|e| AttestationError::io("sync auxiliary receipt", e))
     }
+    /// Stream a bounded experiment journal directly to its capability; no
+    /// second full JSON allocation. Partial files are explicitly incomplete.
+    #[cfg(feature = "experimental-batch")]
+    pub(crate) fn publish_large_auxiliary(
+        &self,
+        name: &'static str,
+        receipt: &impl Serialize,
+        cap: u64,
+    ) -> Result<(String, u64), AttestationError> {
+        #[cfg(unix)]
+        use cap_std::fs::OpenOptionsExt;
+        if !self.startup_written {
+            return Err(AttestationError::boundary("journal requires startup"));
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = self
+            ._directory
+            .open_with(name, &options)
+            .map_err(|e| AttestationError::io("create bounded journal", e))?;
+        struct Bounded<'a> {
+            file: &'a mut cap_std::fs::File,
+            hash: Sha256,
+            bytes: u64,
+            cap: u64,
+        }
+        impl Write for Bounded<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() as u64 > self.cap.saturating_sub(self.bytes) {
+                    return Err(std::io::Error::other("batch journal byte budget exceeded"));
+                }
+                let count = self.file.write(bytes)?;
+                self.hash.update(&bytes[..count]);
+                self.bytes += count as u64;
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.file.flush()
+            }
+        }
+        let mut writer = Bounded {
+            file: &mut file,
+            hash: Sha256::new(),
+            bytes: 0,
+            cap,
+        };
+        serde_json::to_writer(&mut writer, receipt)
+            .map_err(|_| AttestationError::boundary("serialize bounded batch journal"))?;
+        let result = (hex(&writer.hash.finalize().into()), writer.bytes);
+        file.sync_all()
+            .map_err(|e| AttestationError::io("sync bounded batch journal", e))?;
+        Ok(result)
+    }
     pub fn termination(&mut self, receipt: &TerminationReceiptV1) -> Result<(), AttestationError> {
         self.publish_termination(receipt)
     }

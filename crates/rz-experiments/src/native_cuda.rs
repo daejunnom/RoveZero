@@ -329,8 +329,16 @@ impl NativeCudaProfileV1 {
         self.validate_arena(CUDA_NATIVE_ARENA_BYTES)
     }
     pub(crate) fn validate_arena(&self, arena_bytes: u64) -> Result<(), ManifestError> {
+        self.validate_batch_arena(arena_bytes, 1)
+    }
+    pub(crate) fn validate_batch_arena(
+        &self,
+        arena_bytes: u64,
+        batch: u32,
+    ) -> Result<(), ManifestError> {
         require(
-            self.batch_size == 1
+            self.batch_size == batch
+                && (1..=16).contains(&batch)
                 && self.intra_threads == 1
                 && self.search_workers == 1
                 && self.fresh_only
@@ -858,6 +866,14 @@ fn validate_budgets<P: CudaLaunchProfile>(
         "pair runtime plus two shutdown graces must fit one day",
     )?;
     P::validate_clock(input.clock, timeouts.runtime_ms)?;
+    if matches!(P::VERSION, 4 | 5) {
+        require(
+            timeouts.shutdown_ms == 30_000,
+            "timeouts.shutdown_ms",
+            "NativeTimeoutBudget",
+            "whole-clock memory/batch checks require 30s cleanup",
+        )?;
+    }
     let budget = input.budget;
     require(
         budget.max_input_bytes > 0
@@ -894,7 +910,9 @@ fn validate_budgets<P: CudaLaunchProfile>(
         .and_then(|bytes| {
             bytes.checked_add(
                 (CUDA_PLACEMENT_TRACE_RESERVE_PER_PROCESS_BYTES
-                    + if P::VERSION == 1 {
+                    + if P::VERSION == 4 {
+                        64 * 1024 * 1024 + 768 * 1024
+                    } else if P::VERSION == 1 {
                         CUDA_RECEIPT_RESERVE_PER_PROCESS_BYTES
                     } else {
                         768 * 1024
@@ -1117,6 +1135,9 @@ pub trait CudaLaunchProfile:
     fn runtime_profile(&self) -> &NativeCudaProfileV1;
     fn search_options(&self) -> Option<crate::NativeCudaSearchV2> {
         None
+    }
+    fn max_batch(&self) -> usize {
+        1
     }
     fn artifact_limit(role: NativeArtifactRole) -> u64;
     fn validate_model(&self, _source: &ArtifactRef) -> Result<(), ManifestError> {

@@ -3,6 +3,7 @@
 mod artifact;
 mod manifest;
 mod native_cuda;
+mod native_cuda_batch;
 mod native_cuda_pilot;
 mod native_cuda_v2;
 mod native_launch;
@@ -10,6 +11,7 @@ mod validation;
 
 pub use manifest::*;
 pub use native_cuda::*;
+pub use native_cuda_batch::*;
 pub use native_cuda_pilot::*;
 pub use native_cuda_v2::*;
 pub use native_launch::*;

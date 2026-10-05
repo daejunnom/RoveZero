@@ -62,6 +62,32 @@ pub struct NativeRunTimings {
 /// model/session/ORT activation workspace: bootstrap must budget those too.
 pub const IO_BYTES_PER_ITEM: usize = (INPUT_VALUES + 2 * (POLICY_SIZE + 3)) * 4;
 
+/// Declaration identity only. This is not evidence of a loaded provider or Run.
+/// Bootstrap and the offline batch preparer use exactly the same codec.
+pub fn declared_backend_identity(
+    runtime: [u8; 32],
+    asset_manifest: [u8; 32],
+    bundle: Option<[u8; 32]>,
+    config: &BackendConfig,
+) -> [u8; 32] {
+    let mut profile=format!("rz-maia-ort-v1;ort=1.22.0;wrapper=2.0.0-rc.10;runtime={runtime:?};asset={asset_manifest:?};provider={:?};threads={};batch={};fp32;tf32=0;opt=1;sync;full=1;temp=1;sum=1e-5",config.provider,config.intra_threads,config.max_batch);
+    if let Some(bundle) = bundle {
+        profile.push_str(&format!(
+            ";cuda-bundle-v1={bundle:?};loader=linux-exact-global-v1"
+        ));
+    }
+    if matches!(config.provider, Provider::Cuda { .. }) {
+        profile.push_str(";cuda-arena-extend=same-as-requested-v1");
+    }
+    if config.experiments != ExecutionExperiments::default() {
+        profile.push_str(&format!(
+            ";execution-experiment-v1={:?};copy=synchronous-ort-identity",
+            config.experiments
+        ));
+    }
+    asset::sha256(profile.as_bytes())
+}
+
 #[derive(Clone)]
 pub struct OrtRuntime {
     pin: RuntimeLibraryPin,
@@ -625,28 +651,12 @@ impl OnnxBackend {
         let model_commit = commit_started.elapsed();
         validate_interface(&session, asset.profile())?;
         // This is a versioned C backend identity, not a new global wire codec.
-        let mut profile = format!("rz-maia-ort-v1;ort=1.22.0;wrapper=2.0.0-rc.10;runtime={:?};asset={:?};provider={:?};threads={};batch={};fp32;tf32=0;opt=1;sync;full=1;temp=1;sum=1e-5",
-            runtime.binary_digest(), asset.manifest_digest(), config.provider, config.intra_threads, config.max_batch);
-        if let Some(bundle) = runtime.bundle_digest() {
-            use std::fmt::Write;
-            write!(
-                profile,
-                ";cuda-bundle-v1={bundle:?};loader=linux-exact-global-v1"
-            )
-            .expect("writing to an owned String cannot fail");
-        }
-        if matches!(config.provider, Provider::Cuda { .. }) {
-            profile.push_str(";cuda-arena-extend=same-as-requested-v1");
-        }
-        if config.experiments != ExecutionExperiments::default() {
-            use std::fmt::Write;
-            write!(
-                profile,
-                ";execution-experiment-v1={:?};copy=synchronous-ort-identity",
-                config.experiments
-            )
-            .expect("String formatting");
-        }
+        let identity = declared_backend_identity(
+            runtime.binary_digest(),
+            asset.manifest_digest(),
+            runtime.bundle_digest(),
+            &config,
+        );
         let cuda_runtime =
             matches!(config.provider, Provider::Cuda { .. }).then(|| runtime.clone());
         let mut result = Self {
@@ -665,7 +675,7 @@ impl OnnxBackend {
                 cuda_probe_validation: None,
             },
             config,
-            identity: asset::sha256(profile.as_bytes()),
+            identity,
             asset_identity: asset.manifest_digest(),
             asset_profile: asset.profile(),
             cuda_evidence: None,
@@ -1287,6 +1297,26 @@ pub fn verify_cuda_profile(bytes: &[u8]) -> Result<usize, BackendError> {
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+    #[test]
+    fn extracted_identity_codec_preserves_published_b1_format() {
+        let mut config = BackendConfig::cpu();
+        config.max_batch = 1;
+        config.provider = Provider::Cuda {
+            device_id: 0,
+            arena_bytes: 3 * 1024 * 1024 * 1024,
+        };
+        assert_eq!(
+            declared_backend_identity([0; 32], [0; 32], Some([0; 32]), &config),
+            asset::parse_sha256("0a142d7a64dada4119e49e53015f55427ecca05cdae69b6deb9eb35af56b6644")
+                .unwrap()
+        );
+        let b1 = declared_backend_identity([0; 32], [0; 32], Some([0; 32]), &config);
+        config.max_batch = 4;
+        assert_ne!(
+            b1,
+            declared_backend_identity([0; 32], [0; 32], Some([0; 32]), &config)
+        );
+    }
     #[test]
     fn serialized_model_owner_is_released_before_postcommit_work_on_success_and_error() {
         use std::sync::atomic::{AtomicBool, Ordering};

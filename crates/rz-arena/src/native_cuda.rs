@@ -37,6 +37,20 @@ pub struct NativeCudaProviderSessionAudit {
     pub physical_drain: String,
     pub runtime_bundle_sha256: String,
     pub cuda_profile_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchSessionAudit>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct BatchSessionAudit {
+    pub max_pending: usize,
+    pub physical_dispatches: u64,
+    pub physical_completed: u64,
+    pub completed_nn_items: u64,
+    pub delivered_evaluations: u64,
+    pub consumed_evaluations: u64,
+    pub canceled_requests: u64,
+    pub unused_completed_items: u64,
+    pub completed_batch_distribution: [u64; 16],
 }
 
 /// Verify the fixed Linux Fastchess renderer, not an engine's self-report.
@@ -220,6 +234,7 @@ impl<P: CudaLaunchProfile> NativeLaunchDeclaration for LockedCudaIntegrationPair
             artifacts: &engine.artifacts,
             cuda_bundle: Some(&engine.cuda_bundle),
             search: engine.profile.search_options(),
+            batch_experiment: (P::VERSION == 4).then(|| engine.profile.max_batch()),
         })
     }
     fn provider_name(&self) -> &'static str {
@@ -245,14 +260,22 @@ impl<P: CudaLaunchProfile> NativeLaunchDeclaration for LockedCudaIntegrationPair
 impl<P: CudaLaunchProfile> NativeProviderDeclaration for LockedCudaIntegrationPairSpec<P> {
     type Audit = NativeCudaProviderSessionAudit;
     fn scope(&self) -> &'static str {
-        if P::VERSION == 3 {
+        if P::VERSION == 5 {
+            "cuda_bt4_b1_AA_clock_memory_check"
+        } else if P::VERSION == 4 {
+            "cuda_batch_S_pilot_process_provider_requests_physical_batches_whole_clock_and_rules"
+        } else if P::VERSION == 3 {
             "cuda_search_pilot_process_provider_search_whole_clock_and_native_rules"
         } else {
             "cuda_nn_pair_integration_process_provider_search_and_native_rules"
         }
     }
     fn receipt_filename(&self) -> &'static str {
-        if P::VERSION == 1 {
+        if P::VERSION == 5 {
+            "native-cuda-b1-clock-receipt.v5.json"
+        } else if P::VERSION == 4 {
+            "native-cuda-batch-pilot-receipt.v4.json"
+        } else if P::VERSION == 1 {
             "native-cuda-pair-receipt.v1.json"
         } else if P::VERSION == 2 {
             "native-cuda-pair-receipt.v2.json"
@@ -261,12 +284,23 @@ impl<P: CudaLaunchProfile> NativeProviderDeclaration for LockedCudaIntegrationPa
         }
     }
     fn startup_filename(&self) -> &'static str {
-        "native-cuda-startup.v1.json"
+        if P::VERSION == 4 {
+            "native-cuda-batch-startup.v1.json"
+        } else {
+            "native-cuda-startup.v1.json"
+        }
     }
     fn termination_filename(&self) -> &'static str {
-        "native-cuda-termination.v1.json"
+        if P::VERSION == 4 {
+            "native-cuda-batch-termination.v1.json"
+        } else {
+            "native-cuda-termination.v1.json"
+        }
     }
     fn claim_policy(&self) -> rz_experiments::ClaimPolicy {
+        if P::VERSION == 4 || P::VERSION == 5 {
+            return rz_experiments::ClaimPolicy::AutomaticAcceptance;
+        }
         self.input()
             .pilot
             .as_ref()
@@ -296,7 +330,7 @@ impl<P: CudaLaunchProfile> NativeProviderDeclaration for LockedCudaIntegrationPa
         stdout: &[u8],
         pair: &crate::PairSpec,
     ) -> Result<Option<crate::NativePilotFailureAudit>, ArenaError> {
-        if self.input().pilot.is_some() {
+        if self.input().pilot.is_some() || P::VERSION >= 4 {
             crate::native_pilot::audit_pilot_startup_failure_trace(stdout, pair)
         } else {
             Ok(None)
@@ -318,6 +352,17 @@ impl<P: CudaLaunchProfile> NativeProviderDeclaration for LockedCudaIntegrationPa
         termination: &[u8],
         session: &str,
     ) -> Result<(Self::Audit, u32), ArenaError> {
+        #[cfg(feature = "native-cuda-batch")]
+        if P::VERSION == 4 {
+            let audit = linux::validate_batch_provider_records(
+                startup,
+                termination,
+                self.input().engine(role)?,
+                session,
+            )?;
+            let pid = audit.process_id;
+            return Ok((audit, pid));
+        }
         let audit = validate_native_cuda_provider_record_fields(
             startup,
             termination,
@@ -335,6 +380,15 @@ impl<P: CudaLaunchProfile> NativeProviderDeclaration for LockedCudaIntegrationPa
         startup: &[u8],
         runtime_directory: &cap_std::fs::Dir,
     ) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
+        #[cfg(feature = "native-cuda-batch")]
+        if P::VERSION == 4 {
+            return linux::batch_session_evidence(
+                pid,
+                startup,
+                runtime_directory,
+                self.input().engine(role)?,
+            );
+        }
         let mut evidence = linux::placement_evidence(pid, startup, runtime_directory)?;
         if let Some(search) = self.input().engine(role)?.profile.search_options() {
             let relative = format!(
@@ -434,6 +488,8 @@ pub fn validate_cuda_bundle_manifest_fields(
     Ok(())
 }
 
+#[cfg(all(target_os = "linux", feature = "native-cuda-batch"))]
+pub use linux::validate_batch_provider_records;
 #[cfg(target_os = "linux")]
 pub use linux::{
     validate_cuda_placement_trace_fields, validate_native_cuda_provider_record_fields,
@@ -458,6 +514,17 @@ mod linux {
     /// Strict B CUDA V1 DTO consumption plus the fixed E declaration and final
     /// search guards. Synthetic DTOs attest only this parser's rejection rules.
     pub fn validate_native_cuda_provider_record_fields<P: CudaLaunchProfile>(
+        startup_bytes: &[u8],
+        termination_bytes: &[u8],
+        engine: &CudaNativeLaunchSpec<P>,
+        session: &str,
+    ) -> Result<NativeCudaProviderSessionAudit, ArenaError> {
+        if P::VERSION == 4 {
+            return Err(invalid("batch experiment requires the separate batch wire"));
+        }
+        validate_provider_base(startup_bytes, termination_bytes, engine, session)
+    }
+    fn validate_provider_base<P: CudaLaunchProfile>(
         startup_bytes: &[u8],
         termination_bytes: &[u8],
         engine: &CudaNativeLaunchSpec<P>,
@@ -530,7 +597,209 @@ mod linux {
             physical_drain: "confirmed".into(),
             runtime_bundle_sha256: engine.cuda_bundle.canonical_sha256.clone(),
             cuda_profile_sha256: text(field(&startup, "profile")?, "cuda_profile_sha256")?.into(),
+            batch: None,
         })
+    }
+
+    #[cfg(feature = "native-cuda-batch")]
+    fn batch_wire(
+        startup: &[u8],
+        termination: &[u8],
+    ) -> Result<
+        (
+            rz_uci::native_batch_attestation::BatchStartupReceipt,
+            rz_uci::native_batch_attestation::BatchTerminationReceipt,
+        ),
+        ArenaError,
+    > {
+        if startup.len() > 256 * 1024 || termination.len() > 256 * 1024 {
+            return Err(invalid("batch wire byte ceiling"));
+        }
+        let s = json(startup)?;
+        let t = json(termination)?;
+        keys(
+            &s,
+            &[
+                "schema_version",
+                "kind",
+                "provider",
+                "search",
+                "max_pending",
+                "max_batch_wait_us",
+                "physical_workers",
+                "max_physical_executions",
+                "classification",
+            ],
+        )?;
+        keys(
+            &t,
+            &[
+                "schema_version",
+                "kind",
+                "provider",
+                "startup_sha256",
+                "journal_sha256",
+                "journal_bytes",
+                "journal_ownership_retained",
+                "journal_summary",
+                "journal_error",
+            ],
+        )?;
+        // Keep explicit null/presence checks before typed DTO serialization.
+        keys(
+            field(&s, "provider")?,
+            &[
+                "schema_version",
+                "kind",
+                "loaded",
+                "process_id",
+                "process_run_id",
+                "process_epoch",
+                "executable",
+                "profile",
+            ],
+        )?;
+        keys(
+            field(&t, "provider")?,
+            &[
+                "schema_version",
+                "kind",
+                "process_run_id",
+                "startup",
+                "run_succeeded",
+                "actual_cuda_inference_observed",
+                "actual_rules_search_backup_observed",
+                "physical_drain",
+                "report",
+                "original_service_failure",
+                "collection_failure",
+                "runtime_mapping_failure",
+                "retained_owner_and_evidence",
+            ],
+        )?;
+        let s = serde_json::from_value::<rz_uci::native_batch_attestation::BatchStartupReceipt>(s)
+            .map_err(|_| invalid("batch startup DTO"))?;
+        let t =
+            serde_json::from_value::<rz_uci::native_batch_attestation::BatchTerminationReceipt>(t)
+                .map_err(|_| invalid("batch termination DTO"))?;
+        if s.schema_version != 1
+            || t.schema_version != 1
+            || s.kind != "batch_experiment_startup"
+            || t.kind != "batch_experiment_termination"
+            || s.classification != "S"
+            || s.physical_workers != 1
+            || s.max_physical_executions != 1
+            || t.startup_sha256 != format!("{:x}", Sha256::digest(startup))
+            || t.journal_ownership_retained
+            || t.journal_error.is_some()
+            || t.journal_summary.is_none()
+            || t.journal_bytes == 0
+            || t.journal_bytes > rz_eval::batch_journal::MAX_BATCH_RECEIPT_BYTES
+        {
+            return Err(invalid("batch experiment scope/hash/retention differs"));
+        }
+        hash(&t.journal_sha256)?;
+        Ok((s, t))
+    }
+    #[cfg(feature = "native-cuda-batch")]
+    fn dto_bytes(value: &impl Serialize) -> Result<Vec<u8>, ArenaError> {
+        let mut bytes = serde_json::to_vec(value).map_err(|_| invalid("batch provider codec"))?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+    #[cfg(feature = "native-cuda-batch")]
+    pub fn validate_batch_provider_records<P: CudaLaunchProfile>(
+        startup: &[u8],
+        termination: &[u8],
+        engine: &CudaNativeLaunchSpec<P>,
+        session: &str,
+    ) -> Result<NativeCudaProviderSessionAudit, ArenaError> {
+        if P::VERSION != 4 {
+            return Err(invalid("batch wire requires V4 lock"));
+        }
+        let (s, t) = batch_wire(startup, termination)?;
+        let width = engine.profile.max_batch();
+        if s.max_pending != width
+            || s.max_batch_wait_us != if width > 1 { 200 } else { 0 }
+            || s.search.batch_size as usize != width
+        {
+            return Err(invalid("batch width/wait differs from locked profile"));
+        }
+        let provider = dto_bytes(&s.provider)?;
+        let mut audit =
+            validate_provider_base(&provider, &dto_bytes(&t.provider)?, engine, session)?;
+        validate_search_record(
+            &dto_bytes(&s.search)?,
+            &provider,
+            engine
+                .profile
+                .search_options()
+                .ok_or_else(|| invalid("batch search declaration"))?,
+            width as u64,
+        )?;
+        let summary = t.journal_summary.unwrap();
+        if summary.max_pending != width
+            || summary.delivered_evaluations != audit.completed_by_runtime
+            || summary.consumed_evaluations
+                != audit.search_root_initializations + audit.search_non_root_backups
+        {
+            return Err(invalid(
+                "batch request consumption differs from provider/search aggregates",
+            ));
+        }
+        audit.startup_sha256 = format!("{:x}", Sha256::digest(startup));
+        audit.termination_sha256 = format!("{:x}", Sha256::digest(termination));
+        audit.batch = Some(BatchSessionAudit {
+            max_pending: width,
+            physical_dispatches: summary.physical_dispatches,
+            physical_completed: summary.physical_completed,
+            completed_nn_items: summary.completed_nn_items,
+            delivered_evaluations: summary.delivered_evaluations,
+            consumed_evaluations: summary.consumed_evaluations,
+            canceled_requests: summary.canceled_requests,
+            unused_completed_items: summary.unused_completed_items,
+            completed_batch_distribution: summary.completed_batch_distribution,
+        });
+        Ok(audit)
+    }
+    #[cfg(feature = "native-cuda-batch")]
+    pub(super) fn batch_session_evidence<P: CudaLaunchProfile>(
+        pid: u32,
+        startup: &[u8],
+        directory: &cap_std::fs::Dir,
+        engine: &CudaNativeLaunchSpec<P>,
+    ) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
+        use rz_uci::native_batch_attestation::{JOURNAL_FILE, TERMINATION_FILE};
+        let term_path = format!("native-process-{pid}/{TERMINATION_FILE}");
+        let term = crate::native_runner::linux::read_file(directory, &term_path, 256 * 1024)?;
+        let (s, t) = batch_wire(startup, &term)?;
+        let _ = validate_batch_provider_records(
+            startup,
+            &term,
+            engine,
+            &format!("native-process-{pid}"),
+        )?;
+        let path = format!("native-process-{pid}/{JOURNAL_FILE}");
+        let bytes = crate::native_runner::linux::read_file(
+            directory,
+            &path,
+            rz_eval::batch_journal::MAX_BATCH_RECEIPT_BYTES,
+        )?;
+        if bytes.len() as u64 != t.journal_bytes
+            || format!("{:x}", Sha256::digest(&bytes)) != t.journal_sha256
+        {
+            return Err(invalid("batch raw journal digest/size differs"));
+        }
+        let journal: rz_eval::batch_journal::BatchJournalReceipt =
+            serde_json::from_slice(&bytes).map_err(|_| invalid("bounded batch journal DTO"))?;
+        let summary = rz_eval::batch_journal::audit_batch_journal(&journal, true)
+            .map_err(|e| invalid(&e.to_string()))?;
+        if Some(&summary) != t.journal_summary.as_ref() || journal.physical_failed != 0 {
+            return Err(invalid("batch journal rows disagree with accepted summary"));
+        }
+        let mut evidence = placement_evidence(pid, &dto_bytes(&s.provider)?, directory)?;
+        evidence.push((path, bytes));
+        Ok(evidence)
     }
 
     fn check_startup<P: CudaLaunchProfile>(
@@ -608,8 +877,8 @@ mod linux {
         n(p, "contract_major", 0)?;
         n(p, "contract_minor", 1)?;
         n(p, "history_length", 8)?;
+        n(p, "max_batch_items", engine.profile.max_batch() as u64)?;
         for key in [
-            "max_batch_items",
             "intra_threads",
             "max_workers",
             "full_steps",
@@ -697,6 +966,14 @@ mod linux {
         startup: &[u8],
         expected: rz_experiments::NativeCudaSearchV2,
     ) -> Result<(), ArenaError> {
+        validate_search_record(bytes, startup, expected, 1)
+    }
+    fn validate_search_record(
+        bytes: &[u8],
+        startup: &[u8],
+        expected: rz_experiments::NativeCudaSearchV2,
+        width: u64,
+    ) -> Result<(), ArenaError> {
         if bytes.len() > 256 * 1024 || startup.len() > 256 * 1024 {
             return Err(ArenaError::Budget(
                 "CUDA search record exceeds budget".into(),
@@ -728,7 +1005,7 @@ mod linux {
         )?;
         flag(&receipt, "raw_cache", expected.raw_cache)?;
         for (key, value) in [
-            ("batch_size", 1),
+            ("batch_size", width),
             ("search_workers", 1),
             ("output_margin_ms", 10),
             ("drain_margin_ms", 10),

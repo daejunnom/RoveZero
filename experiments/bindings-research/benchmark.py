@@ -23,13 +23,15 @@ def main():
         raise RuntimeError("PoC requires exactly Python 3.12.3")
     if not args.cli.is_absolute() or not args.report.is_absolute():
         raise ValueError("absolute paths required")
-    if any((p / ".git").exists() for p in args.report.parent.resolve().parents):
+    if any((p / ".git").exists() for p in [args.report.parent.resolve(), *args.report.parent.resolve().parents]):
         raise ValueError("report must stay outside Git")
+    with args.cli.open("rb") as binary:
+        cli_hash = hashlib.file_digest(binary,"sha256").hexdigest()
     samples, cold = [], []
     report = {"schema_version":1,"accepted":False,"cpu_only_mock":True,
               "claim":"call_overhead_only_not_native_search_speed_or_strength",
               "limits":{"cpu":2,"memory_max_bytes":512*1024**2,"wall_s":120},
-              "cli_sha256":hashlib.file_digest(args.cli.open("rb"),"sha256").hexdigest(),
+              "cli_sha256":cli_hash,
               "cold":cold,"samples":samples}
     # Exclusive report creation precedes workload; failures retain partial data.
     with args.report.open("x", encoding="utf-8") as saved:

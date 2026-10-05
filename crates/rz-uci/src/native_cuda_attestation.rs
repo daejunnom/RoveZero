@@ -147,12 +147,13 @@ pub struct CudaProfileV1 {
     pub session_resident_admission: SessionAdmissionV1,
 }
 impl CudaProfileV1 {
-    pub(crate) fn from_loaded(
+    pub(crate) fn from_loaded_limit(
         asset: &AssetMetadata,
         runtime: &OrtRuntime,
         backend: &OnnxBackend,
         model: &ModelDescriptor,
         bundle_file_sha: [u8; 32],
+        max_batch: usize,
     ) -> Result<Self, NativeBootstrapError> {
         let config = backend.config();
         if config.provider
@@ -160,13 +161,14 @@ impl CudaProfileV1 {
                 device_id: 0,
                 arena_bytes: asset.profile().cuda_arena_bytes(),
             })
-            || config.max_batch != 1
+            || config.max_batch != max_batch
+            || !(1..=16).contains(&max_batch)
             || config.intra_threads != 1
             || backend.asset_identity() != asset.manifest_digest()
             || model.handle().manifest.0 != asset.manifest_digest()
             || !model.supports(PrecisionProfile::Fp32)
             || model.full_steps() != 1
-            || model.max_batch_items() != 1
+            || model.max_batch_items() != max_batch
             || model.encoding().handle.manifest
                 != rz_eval::contracts::encoding_manifest(rz_encoding::classical::HistoryFill::No)
         {
@@ -223,7 +225,7 @@ impl CudaProfileV1 {
             contract_minor: CONTRACT_REVISION.minor,
             provider: "cuda".into(),
             precision: "fp32".into(),
-            max_batch_items: 1,
+            max_batch_items: max_batch,
             intra_threads: 1,
             max_workers: 1,
             full_steps: 1,

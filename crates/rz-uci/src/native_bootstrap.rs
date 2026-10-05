@@ -85,6 +85,7 @@ pub struct NativeConfig {
     output_root: PathBuf,
     runtime_cache_root: Option<PathBuf>,
     attestation: bool,
+    batch_attestation: bool,
     profiling: bool,
     provider: NativeProvider,
     cuda_bundle: Option<PathBuf>,
@@ -144,6 +145,7 @@ impl NativeConfig {
         let mut output_root = None;
         let mut runtime_cache_root = None;
         let mut attestation = false;
+        let mut batch_attestation = false;
         let mut profiling = false;
         let mut cuda_bundle = None;
         let mut cuda_bundle_sha256 = None;
@@ -168,6 +170,12 @@ impl NativeConfig {
                     return Err(NativeBootstrapError::Config(
                         "duplicate native profile flag",
                     ));
+                }
+                continue;
+            }
+            if argument == "--batch-attestation" {
+                if std::mem::replace(&mut batch_attestation, true) {
+                    return Err(NativeBootstrapError::Config("duplicate batch attestation"));
                 }
                 continue;
             }
@@ -314,6 +322,21 @@ impl NativeConfig {
                 "native CPU requires all asset, manifest, runtime hash and private output-root arguments",
             )
         };
+        if batch_attestation
+            && (!cfg!(feature = "experimental-batch")
+                || provider != NativeProvider::Cuda
+                || attestation
+                || profiling
+                || raw_cache
+                || execution_experiments != rz_eval::onnx::ExecutionExperiments::default()
+                || final_move_policy.unwrap_or_default()
+                    != rz_search::tree::FinalMovePolicy::Visits
+                || search_simulations != Some(4096))
+        {
+            return Err(NativeBootstrapError::Config(
+                "batch attestation requires explicit CUDA/batch feature, visits/4096 and no other experiment or V1 attestation",
+            ));
+        }
         Ok(Self {
             execution_experiments,
             raw_cache,
@@ -329,6 +352,7 @@ impl NativeConfig {
             output_root: output_root.ok_or_else(missing)?,
             runtime_cache_root,
             attestation,
+            batch_attestation,
             profiling,
             provider,
             cuda_bundle,
@@ -337,6 +361,12 @@ impl NativeConfig {
     }
     pub fn attestation_requested(&self) -> bool {
         self.attestation
+    }
+    pub fn batch_attestation_requested(&self) -> bool {
+        self.batch_attestation
+    }
+    pub fn max_batch(&self) -> usize {
+        self.parallelism
     }
     pub fn profiling_requested(&self) -> bool {
         self.profiling
@@ -1082,7 +1112,7 @@ impl NativeSessionFactory {
             ));
         }
         let (asset, runtime, backend, projection) = Self::load_parts(owners, config)?;
-        let loaded_profile = if config.parallelism == 1
+        let loaded_profile = if (config.parallelism == 1 || config.batch_attestation)
             && config.execution_experiments == rz_eval::onnx::ExecutionExperiments::default()
         {
             Some(CpuProfileV1::from_loaded(
@@ -1317,7 +1347,7 @@ impl NativeSessionFactory {
         let loaded_profile = if config.parallelism == 1
             && config.execution_experiments == rz_eval::onnx::ExecutionExperiments::default()
         {
-            Some(CudaProfileV1::from_loaded(
+            Some(CudaProfileV1::from_loaded_limit(
                 &asset,
                 &runtime,
                 &backend,
@@ -1327,6 +1357,11 @@ impl NativeSessionFactory {
                     .ok_or(NativeBootstrapError::Config(
                         "CUDA bundle file SHA256 is absent",
                     ))?,
+                if config.batch_attestation {
+                    config.parallelism
+                } else {
+                    1
+                },
             )?)
         } else {
             None
@@ -1354,6 +1389,10 @@ impl NativeSessionFactory {
             config.source_journal()?,
         )?;
         let mut factory = Self::from_owner(owner, Some(runtime))?;
+        #[cfg(feature = "experimental-batch")]
+        if config.batch_attestation {
+            factory.owner.enable_batch_journal()?;
+        }
         factory.loaded_cuda_profile = loaded_profile;
         Ok(factory)
     }
@@ -1565,6 +1604,13 @@ pub struct NativeCudaFactory {
 }
 #[cfg(feature = "onnx-cuda")]
 impl NativeCudaFactory {
+    #[cfg(feature = "experimental-batch")]
+    pub fn batch_journal(
+        &self,
+        transfer: bool,
+    ) -> Option<rz_eval::batch_journal::BatchJournalReceipt> {
+        self.inner.owner.batch_journal_receipt(transfer)
+    }
     #[cfg(feature = "experimental-raw-cache")]
     pub fn configure_raw_cache(
         &self,
@@ -1700,6 +1746,8 @@ impl EvaluatorFactory for NativeSessionFactory {
         traversed_edges: usize,
     ) -> Result<(), ContractError> {
         let observed = self.evidence.record_search(evaluation, traversed_edges);
+        #[cfg(feature = "experimental-batch")]
+        let observed = observed.and_then(|()| self.owner.batch_consume(evaluation.context));
         if let Err(error) = observed {
             let _ = self.owner.try_close_admission(error);
         }
@@ -1863,6 +1911,21 @@ struct NativeRuntime {
     observation_error: Option<ContractError>,
 }
 impl NativeRuntime {
+    #[cfg(feature = "experimental-batch")]
+    fn record_batch_result(
+        &self,
+        result: &EvalResult,
+        discarded: bool,
+    ) -> Result<(), ContractError> {
+        let (request, status) = match result {
+            EvalResult::Completed(o) => (o.context.request, if discarded { 6 } else { 1 }),
+            EvalResult::Canceled(c) => (c.request.request, 2),
+            EvalResult::Expired(c) => (c.request.request, 3),
+            EvalResult::Stale(c) => (c.request.request, 4),
+            EvalResult::Failed(f) => (f.context.request.request, 5),
+        };
+        self.owner.batch_logical(request, status, false)
+    }
     fn remove_pending(&mut self, context: EvalContext) {
         if self.pending == Some(context) {
             self.pending = self.other_pending.pop_front();
@@ -2000,7 +2063,11 @@ impl NativeRuntime {
         loop {
             self.refresh()?;
             let mut discarded = 0_u64;
-            while self.evaluator.poll().is_some() {
+            while let Some(result) = self.evaluator.poll() {
+                #[cfg(feature = "experimental-batch")]
+                self.record_batch_result(&result, true)?;
+                #[cfg(not(feature = "experimental-batch"))]
+                let _ = result;
                 discarded += 1;
             }
             self.collect_observations(discarded)?;
@@ -2051,7 +2118,13 @@ impl Evaluator<RulesState> for NativeRuntime {
             ));
         }
         let context = request.context();
+        #[cfg(feature = "experimental-batch")]
+        self.owner.batch_register(context)?;
         let result = self.evaluator.submit(request);
+        #[cfg(feature = "experimental-batch")]
+        if result.is_err() {
+            self.owner.batch_logical(context.request, 5, false)?;
+        }
         if result.is_ok() {
             if let Some(previous) = self.pending.replace(context) {
                 self.other_pending.push_back(previous);
@@ -2122,6 +2195,11 @@ impl Evaluator<RulesState> for NativeRuntime {
             }));
         }
         if let Some(result) = result {
+            #[cfg(feature = "experimental-batch")]
+            if let Err(error) = self.record_batch_result(&result, false) {
+                self.observation_error.get_or_insert(error);
+                let _ = self.owner.try_close_admission(error);
+            }
             let context = match &result {
                 EvalResult::Completed(output) => output.context,
                 EvalResult::Canceled(c) | EvalResult::Expired(c) | EvalResult::Stale(c) => {
@@ -2151,6 +2229,8 @@ impl Evaluator<RulesState> for NativeRuntime {
         None
     }
     fn cancel(&mut self, request: RequestId) -> Result<(), ContractError> {
+        #[cfg(feature = "experimental-batch")]
+        self.owner.batch_logical(request, 0, true)?;
         self.evaluator.cancel(request)
     }
 }
@@ -2702,6 +2782,88 @@ mod physical_owner_tests {
         assert_eq!(runtime.wake_after(), None);
         runtime.shutdown(Instant::now() + WAIT).unwrap();
         factory.finish(Ok(())).unwrap();
+    }
+
+    #[cfg(feature = "experimental-batch")]
+    #[test]
+    fn batch_journal_links_four_requests_one_physical_lease_and_committed_consumption() {
+        let owners = Arc::new(OwnerRegistry::default());
+        let original = projection(&owners);
+        let projection = ClassicalProjection::new(
+            MaiaBinding::new(
+                original.model().handle(),
+                original.model().encoding().handle,
+                HistoryFill::No,
+                original.backend(),
+                4,
+            )
+            .unwrap(),
+        );
+        let worker = SingleWorker::spawn(move |batch: &PreparedBatch<RulesState>| {
+            batch
+                .requests()
+                .iter()
+                .map(|r| r.physical_output(&raw(), batch.execution()))
+                .collect()
+        })
+        .unwrap();
+        let owner = NativeWorkerOwner::from_worker_batched(
+            worker,
+            projection,
+            4,
+            rz_eval::native_runtime_bridge::NativeAdmissionPolicy::Cpu,
+            4,
+        )
+        .unwrap();
+        owner.enable_batch_journal().unwrap();
+        let journal_owner = owner.clone();
+        let factory = NativeCpuFactory::from_owner(owner, None).unwrap();
+        let clock = ProcessClock::new(ProcessEpoch(306));
+        let requests: Vec<_> = (1..=4)
+            .map(|sequence| request(&factory, &owners, &clock, sequence))
+            .collect();
+        let mut runtime = factory
+            .create(clock, authority(requests[0].context()))
+            .unwrap();
+        for request in requests {
+            runtime.submit(request).unwrap();
+        }
+        let until = Instant::now() + WAIT;
+        let mut delivered = 0;
+        while delivered < 4 {
+            assert!(Instant::now() < until);
+            if let Some(result) = runtime.poll() {
+                let EvalResult::Completed(output) = result else {
+                    panic!("mock batch completion must remain typed");
+                };
+                let accepted = rz_search::contracts::AcceptedEvaluation {
+                    context: CompletionContext {
+                        request: output.context,
+                        execution: output.actual.execution,
+                    },
+                    actual: output.actual,
+                };
+                factory.observe_search_acceptance(&accepted, 1).unwrap();
+                assert!(journal_owner.batch_consume(accepted.context).is_err()); // duplicate backup evidence is rejected
+                delivered += 1;
+            } else {
+                thread::yield_now();
+            }
+        }
+        runtime.shutdown(Instant::now() + WAIT).unwrap();
+        factory.finish(Ok(())).unwrap();
+        let receipt = journal_owner.batch_journal_receipt(true).unwrap();
+        let audit = rz_eval::batch_journal::audit_batch_journal(&receipt, true).unwrap();
+        assert_eq!(
+            (
+                audit.physical_dispatches,
+                audit.physical_completed,
+                audit.completed_nn_items,
+                audit.consumed_evaluations
+            ),
+            (1, 1, 4, 4)
+        );
+        assert_eq!(audit.completed_batch_distribution[3], 1);
     }
 
     #[test]

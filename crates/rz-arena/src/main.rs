@@ -146,13 +146,23 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, String> {
     #[cfg(feature = "native-cuda")]
     if matches!(
         command,
-        Some("native-cuda-lock" | "native-cuda-v2-lock" | "native-cuda-pilot-lock")
+        Some(
+            "native-cuda-lock"
+                | "native-cuda-v2-lock"
+                | "native-cuda-pilot-lock"
+                | "native-cuda-batch-lock"
+                | "native-cuda-b1-clock-lock"
+        )
     ) {
         if args.len() != 3 {
             return Err("native-cuda-lock requires exactly INPUT OUTPUT".into());
         }
         return Ok(Command::NativeCudaLock {
-            version: if command == Some("native-cuda-lock") {
+            version: if command == Some("native-cuda-b1-clock-lock") {
+                5
+            } else if command == Some("native-cuda-batch-lock") {
+                4
+            } else if command == Some("native-cuda-lock") {
                 1
             } else if command == Some("native-cuda-pilot-lock") {
                 3
@@ -166,13 +176,23 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, String> {
     #[cfg(feature = "native-cuda")]
     if matches!(
         command,
-        Some("native-cuda-pair" | "native-cuda-v2-pair" | "native-cuda-pilot-pair")
+        Some(
+            "native-cuda-pair"
+                | "native-cuda-v2-pair"
+                | "native-cuda-pilot-pair"
+                | "native-cuda-batch-pair"
+                | "native-cuda-b1-clock-pair"
+        )
     ) {
         if args.len() != 5 {
             return Err("native-cuda-pair requires exactly LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME".into());
         }
         return Ok(Command::NativeCudaPair {
-            version: if command == Some("native-cuda-pair") {
+            version: if command == Some("native-cuda-b1-clock-pair") {
+                5
+            } else if command == Some("native-cuda-batch-pair") {
+                4
+            } else if command == Some("native-cuda-pair") {
                 1
             } else if command == Some("native-cuda-pilot-pair") {
                 3
@@ -281,7 +301,15 @@ fn execute(command: Command) -> Result<String, String> {
         } => {
             let limit = MAX_CUDA_NATIVE_LAUNCH_JSON_BYTES as u64;
             let input = read_text(&input, limit)?;
-            let json = if version == 1 {
+            let json = if version == 5 {
+                rz_experiments::CudaB1ClockPairSpecV5::from_json(&input)
+                    .and_then(|s| s.lock())
+                    .and_then(|s| s.to_json())
+            } else if version == 4 {
+                rz_experiments::CudaBatchPilotPairSpecV4::from_json(&input)
+                    .and_then(|s| s.lock())
+                    .and_then(|s| s.to_json())
+            } else if version == 1 {
                 CudaIntegrationPairSpecV1::from_json(&input)
                     .and_then(|s| s.lock())
                     .and_then(|s| s.to_json())
@@ -311,7 +339,23 @@ fn execute(command: Command) -> Result<String, String> {
             output_directory,
         } => {
             let input = read_text(&locked, MAX_CUDA_NATIVE_LAUNCH_JSON_BYTES as u64)?;
-            return if version == 1 {
+            return if version == 5 {
+                execute_cuda_pair(
+                    rz_experiments::LockedCudaB1ClockPairSpecV5::from_json(&input)
+                        .map_err(|e| e.to_string())?,
+                    artifact_root,
+                    output_root,
+                    output_directory,
+                )
+            } else if version == 4 {
+                execute_cuda_pair(
+                    rz_experiments::LockedCudaBatchPilotPairSpecV4::from_json(&input)
+                        .map_err(|e| e.to_string())?,
+                    artifact_root,
+                    output_root,
+                    output_directory,
+                )
+            } else if version == 1 {
                 execute_cuda_pair(
                     LockedCudaIntegrationPairSpecV1::from_json(&input)
                         .map_err(|e| e.to_string())?,
@@ -424,7 +468,7 @@ fn execute(command: Command) -> Result<String, String> {
         #[cfg(feature = "native-cuda")]
         return Ok(format!(
             "{USAGE}\n\nWith native-cuda feature:\n  rz-arena native-cuda-lock INPUT OUTPUT\n  rz-arena native-cuda-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME\n  rz-arena native-cuda-v2-lock INPUT OUTPUT\n  rz-arena native-cuda-v2-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME\nV2 is BT4-only A/A with an explicit search profile; V1 limits and domain remain closed.\nCUDA commands use a separate integration-only lock/profile and explicit finite input/runtime-copy/output budgets. Linux actual CUDA startup/final/placement/search/drain and Rules evidence are required; strength_eligible=false, execution_ready=false."
-        ) + "\nV3 search pilot commands:\n  rz-arena native-cuda-pilot-lock INPUT OUTPUT\n  rz-arena native-cuda-pilot-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME\nV3 fixes BT4 S0/S1 final selection, 30s+0.1s whole-engine clock, 16-pair cohort, failures/claims and 120min total budget. Pilot receipts confer no promotion or Elo authority.");
+        ) + "\nV3 search pilot commands:\n  rz-arena native-cuda-pilot-lock INPUT OUTPUT\n  rz-arena native-cuda-pilot-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME\nV3 retains the separate BT4 S0/S1 protocol and paired cohort.\nV4 batch pilot (native-cuda-batch feature):\n  rz-arena native-cuda-batch-lock INPUT OUTPUT\n  rz-arena native-cuda-batch-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME\nV5 B1 visits A/A memory check:\n  rz-arena native-cuda-b1-clock-lock INPUT OUTPUT\n  rz-arena native-cuda-b1-clock-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME\nV4/V5 fix 120+1 Fischer, max256 ply, 15min pair wall and 30s cleanup. Pilot receipts confer no promotion or Elo authority.");
         #[cfg(not(feature = "native-cuda"))]
         return Ok(USAGE.to_string());
     };
@@ -598,6 +642,9 @@ fn execute_cuda_pair<P: rz_experiments::CudaLaunchProfile>(
     output_root: PathBuf,
     output_directory: OsString,
 ) -> Result<String, String> {
+    if P::VERSION == 4 && !cfg!(feature = "native-cuda-batch") {
+        return Err("native-cuda-batch feature is required before preparing a V4 launch".into());
+    }
     let name = output_directory
         .to_str()
         .ok_or_else(|| "output basename must be ASCII".to_string())?;

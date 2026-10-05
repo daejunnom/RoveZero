@@ -62,6 +62,7 @@ pub struct NativeEngineView<'a> {
     pub artifacts: &'a [rz_experiments::NativeArtifactBinding],
     pub cuda_bundle: Option<&'a rz_experiments::CudaBundleBindingV1>,
     pub search: Option<rz_experiments::NativeCudaSearchV2>,
+    pub batch_experiment: Option<usize>,
 }
 impl NativeEngineView<'_> {
     pub fn artifact(
@@ -128,6 +129,7 @@ impl NativeLaunchDeclaration for LockedIntegrationPairSpecV1 {
             artifacts: &engine.artifacts,
             cuda_bundle: None,
             search: None,
+            batch_experiment: None,
         })
     }
     fn provider_name(&self) -> &'static str {
@@ -982,8 +984,15 @@ pub(crate) mod linux {
                 } else {
                     "--onnx-cpu"
                 }),
-                OsString::from("--attestation"),
+                OsString::from(if engine.batch_experiment.is_some() {
+                    "--batch-attestation"
+                } else {
+                    "--attestation"
+                }),
             ];
+            if let Some(width) = engine.batch_experiment {
+                tokens.push(format!("--experimental-batch={width}").into());
+            }
             for (flag, kind) in [
                 ("--source-weights=", NativeArtifactRole::SourceWeights),
                 ("--onnx-model=", NativeArtifactRole::Onnx),

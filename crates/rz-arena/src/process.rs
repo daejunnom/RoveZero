@@ -15,6 +15,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+type StdoutObserver<'a> = &'a mut dyn FnMut(&[u8]);
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessLimits {
@@ -332,7 +333,7 @@ pub(crate) fn supervise_tree_observed(
     limits: ProcessLimits,
     cancel: Option<&AtomicBool>,
     watch: &OwnedArtifactTreeWatch,
-    stdout_observer: Option<&mut dyn FnMut(&[u8])>,
+    stdout_observer: Option<StdoutObserver<'_>>,
 ) -> Result<ProcessOutput, ArenaError> {
     limits.validate()?;
     watch.validate()?;
@@ -422,7 +423,7 @@ mod linux {
         limits: ProcessLimits,
         cancel: Option<&AtomicBool>,
         watch: Option<ArtifactObservation<'_>>,
-        mut stdout_observer: Option<&mut dyn FnMut(&[u8])>,
+        mut stdout_observer: Option<StdoutObserver<'_>>,
     ) -> Result<ProcessOutput, ArenaError> {
         native_elf(program)?;
         default_child_disposition()?;

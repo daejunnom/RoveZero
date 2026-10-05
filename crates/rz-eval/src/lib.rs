@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 
 pub mod asset;
+#[cfg(feature = "experimental-batch")]
+pub mod batch_journal;
 pub mod error;
 pub mod mock;
 pub mod output;
