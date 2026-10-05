@@ -21,6 +21,27 @@ fn valid_arguments() -> Vec<String> {
     ]
 }
 
+#[test]
+fn forwarded_source_profile_is_opt_in_and_keeps_existing_execution_guards() {
+    let ordinary = NativeConfig::parse_with_source_profile(valid_arguments(), false).unwrap();
+    let diagnostic = NativeConfig::parse_with_source_profile(valid_arguments(), true).unwrap();
+    assert!(!ordinary.profiling_requested());
+    assert!(diagnostic.profiling_requested());
+    assert_eq!(ordinary.provider(), diagnostic.provider());
+    assert_eq!(ordinary.manifest_sha256, diagnostic.manifest_sha256);
+    assert_eq!(ordinary.ort_sha256, diagnostic.ort_sha256);
+    assert_eq!(ordinary.search_simulations, diagnostic.search_simulations);
+    assert_eq!(ordinary.final_move_policy, diagnostic.final_move_policy);
+    let mut explicit = valid_arguments();
+    explicit.push("--profile".into());
+    assert!(NativeConfig::parse_with_source_profile(explicit, true).is_ok());
+    for flag in ["--experimental-raw-cache", "--experimental-io-buffers"] {
+        let mut arguments = valid_arguments();
+        arguments.push(flag.into());
+        assert!(NativeConfig::parse_with_source_profile(arguments, true).is_err());
+    }
+}
+
 fn assert_private_config_rejection(arguments: Vec<String>) {
     let rejected = NativeConfig::parse(arguments).unwrap_err();
     assert!(matches!(rejected, NativeBootstrapError::Config(_)));

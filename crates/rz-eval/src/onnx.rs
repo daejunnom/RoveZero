@@ -445,6 +445,14 @@ pub struct CudaEvidence {
     pub executed_cuda_nodes: usize,
 }
 
+/// Host startup intervals, separate from numerical output and provider claims.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StartupTimings {
+    pub backend_setup: std::time::Duration,
+    pub model_commit: std::time::Duration,
+    pub cuda_probe_validation: Option<std::time::Duration>,
+}
+
 pub struct OnnxBackend {
     session: Option<Session>,
     // Kept outside the Run stack so worker quarantine also pins tensor storage
@@ -458,6 +466,7 @@ pub struct OnnxBackend {
     /// Successful synchronous binding runs. This is not proof of GPU replay.
     bound_runs: u64,
     timings: Option<IoTimings>,
+    startup_timings: StartupTimings,
     config: BackendConfig,
     identity: [u8; 32],
     asset_identity: [u8; 32],
@@ -512,6 +521,7 @@ impl OnnxBackend {
         model: impl AsRef<[u8]>,
         config: BackendConfig,
     ) -> Result<Self, BackendError> {
+        let setup_started = Instant::now();
         config.validate()?;
         match (config.provider, runtime.bundle_digest()) {
             (Provider::Cuda { .. }, None) => {
@@ -600,6 +610,8 @@ impl OnnxBackend {
                 .with_profiling(prefix)
                 .map_err(|error| setup_error(CauseCode::ProfilingStart, error))?;
         }
+        let commit_started = Instant::now();
+        let backend_setup = commit_started.duration_since(setup_started);
         let session = commit_verified_model(model, |bytes| {
             builder.commit_from_memory(bytes).map_err(|error| {
                 BackendError::new(
@@ -610,6 +622,7 @@ impl OnnxBackend {
                 .with_ort_cause(CauseCode::ModelLoad, error)
             })
         })?;
+        let model_commit = commit_started.elapsed();
         validate_interface(&session, asset.profile())?;
         // This is a versioned C backend identity, not a new global wire codec.
         let mut profile = format!("rz-maia-ort-v1;ort=1.22.0;wrapper=2.0.0-rc.10;runtime={:?};asset={:?};provider={:?};threads={};batch={};fp32;tf32=0;opt=1;sync;full=1;temp=1;sum=1e-5",
@@ -646,6 +659,11 @@ impl OnnxBackend {
             bound: None,
             bound_runs: 0,
             timings: None,
+            startup_timings: StartupTimings {
+                backend_setup,
+                model_commit,
+                cuda_probe_validation: None,
+            },
             config,
             identity: asset::sha256(profile.as_bytes()),
             asset_identity: asset.manifest_digest(),
@@ -655,6 +673,7 @@ impl OnnxBackend {
             cuda_runtime,
         };
         if matches!(result.config.provider, Provider::Cuda { .. }) {
+            let probe_started = Instant::now();
             runtime.verify_cuda_mappings(false)?;
             // A registered provider alone proves nothing. Synchronous physical
             // execution plus ORT kernel placement is required before returning.
@@ -743,6 +762,7 @@ impl OnnxBackend {
                 profile_sha256: asset::sha256(&bytes),
                 executed_cuda_nodes,
             });
+            result.startup_timings.cuda_probe_validation = Some(probe_started.elapsed());
         }
         Ok(result)
     }
@@ -840,6 +860,9 @@ impl OnnxBackend {
     }
     pub fn last_io_timings(&self) -> Option<IoTimings> {
         self.timings
+    }
+    pub fn startup_timings(&self) -> StartupTimings {
+        self.startup_timings
     }
     pub fn binding_runs(&self) -> u64 {
         self.bound_runs

@@ -429,6 +429,9 @@ mod linux {
             .env_clear()
             .env("LANG", "C")
             .env("PATH", "/usr/bin:/bin")
+            .envs(source_profile_environment(std::env::var_os(
+                "RZ_ARENA_SOURCE_PROFILE",
+            )))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1101,6 +1104,15 @@ mod linux {
         error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(Errno::ESRCH as i32)
     }
 
+    /// One explicit passive diagnostic flag; never forward ambient variables,
+    /// library search paths, credentials or provider/precision selections.
+    fn source_profile_environment(
+        value: Option<std::ffi::OsString>,
+    ) -> Option<(&'static str, &'static str)> {
+        (value.as_deref() == Some(std::ffi::OsStr::new("1")))
+            .then_some(("RZ_NATIVE_SOURCE_PROFILE", "1"))
+    }
+
     fn signal(group: Pid, signal: Signal, receipt: &mut ProcessReceipt, step: &str) {
         match killpg(group, signal) {
             Ok(()) | Err(Errno::ESRCH) => {}
@@ -1117,6 +1129,18 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn source_profile_forwarding_is_one_exact_opt_in_value() {
+            assert_eq!(source_profile_environment(None), None);
+            for value in ["", "0", "true", "1 ", "--profile"] {
+                assert_eq!(source_profile_environment(Some(value.into())), None);
+            }
+            assert_eq!(
+                source_profile_environment(Some("1".into())),
+                Some(("RZ_NATIVE_SOURCE_PROFILE", "1"))
+            );
+        }
 
         #[test]
         fn retired_proc_group_sentinel_is_not_a_live_group_or_parse_failure() {

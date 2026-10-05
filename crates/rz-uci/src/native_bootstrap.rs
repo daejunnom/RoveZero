@@ -117,6 +117,18 @@ impl NativeConfig {
     pub fn parse(
         arguments: impl IntoIterator<Item = String>,
     ) -> Result<Self, NativeBootstrapError> {
+        // Arena forwards this one diagnostic switch explicitly; ordinary
+        // launches keep profiling off and no arbitrary environment is inherited.
+        Self::parse_with_source_profile(
+            arguments,
+            std::env::var_os("RZ_NATIVE_SOURCE_PROFILE").as_deref()
+                == Some(std::ffi::OsStr::new("1")),
+        )
+    }
+    fn parse_with_source_profile(
+        arguments: impl IntoIterator<Item = String>,
+        source_profile: bool,
+    ) -> Result<Self, NativeBootstrapError> {
         let mut execution_experiments = rz_eval::onnx::ExecutionExperiments::default();
         let mut raw_cache = false;
         let mut parallelism = None;
@@ -262,6 +274,7 @@ impl NativeConfig {
             _ => {}
         }
         let parallelism = parallelism.unwrap_or(1);
+        profiling |= source_profile;
         // D02 v1 records one fresh execution per accepted request. Raw hits,
         // batching and experimental I/O need distinct provenance/timing schemas.
         if profiling
@@ -1108,6 +1121,7 @@ impl NativeSessionFactory {
         config: &NativeConfig,
     ) -> Result<(AssetMetadata, OrtRuntime, OnnxBackend, ClassicalProjection), NativeBootstrapError>
     {
+        let parts_started = Instant::now();
         let asset = MaiaAsset::load(
             &config.source_weights,
             &config.onnx_model,
@@ -1121,6 +1135,7 @@ impl NativeSessionFactory {
             )
             .into());
         }
+        let asset_verified = Instant::now();
         let output_root = private_output_root(&config.output_root)?;
         let runtime_cache = config
             .runtime_cache_root
@@ -1207,8 +1222,12 @@ impl NativeSessionFactory {
                 }
             }
         };
+        let runtime_pinned = Instant::now();
         let runtime = OrtRuntime::load(&pin)?;
+        let runtime_loaded = Instant::now();
         let (asset, backend) = OnnxBackend::load_owned(&runtime, asset, backend_config)?;
+        let backend_loaded = Instant::now();
+        let backend_timings = backend.startup_timings();
         // Storage evidence is a separate sidecar, not a change to E's closed
         // inference/attestation schema or backend identity. No private paths.
         let storage_receipt = serde_json::json!({
@@ -1217,6 +1236,18 @@ impl NativeSessionFactory {
             "runtime_sha256": expected_ort,
             "runtime_bundle_sha256": runtime.bundle_digest(),
             "native_startup_loaded": true,
+            "startup_host_timing": {
+                "schema": 1,
+                "scope": "model_runtime_load_parts_before_profile_and_worker",
+                "asset_verification_ns": asset_verified.duration_since(parts_started).as_nanos(),
+                "runtime_pin_ns": runtime_pinned.duration_since(asset_verified).as_nanos(),
+                "runtime_load_ns": runtime_loaded.duration_since(runtime_pinned).as_nanos(),
+                "backend_load_ns": backend_loaded.duration_since(runtime_loaded).as_nanos(),
+                "backend_setup_ns": backend_timings.backend_setup.as_nanos(),
+                "ort_model_commit_ns": backend_timings.model_commit.as_nanos(),
+                "cuda_probe_validation_ns": backend_timings.cuda_probe_validation.map(|time| time.as_nanos()),
+                "total_load_parts_ns": backend_loaded.duration_since(parts_started).as_nanos(),
+            },
         });
         use std::io::Write;
         let mut receipt = fs::OpenOptions::new()
