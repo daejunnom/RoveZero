@@ -568,8 +568,9 @@ mod linux {
                     }
                     Some(snapshot)
                 }
-                Err(()) => {
+                Err(error) => {
                     evidence(&mut receipt, "process.proc_observation");
+                    evidence(&mut receipt, &error.code());
                     stop.get_or_insert(ProcessStop::IoFailure);
                     None
                 }
@@ -979,11 +980,40 @@ mod linux {
         other_members: u32,
     }
 
-    fn group_snapshot(group: u32, leader: u32) -> Result<GroupSnapshot, ()> {
+    #[derive(Debug)]
+    struct ProcObservationError {
+        stage: &'static str,
+        errno: Option<i32>,
+    }
+
+    impl ProcObservationError {
+        fn invalid(stage: &'static str) -> Self {
+            Self { stage, errno: None }
+        }
+
+        fn io(stage: &'static str, error: io::Error) -> Self {
+            Self {
+                stage,
+                errno: error.raw_os_error(),
+            }
+        }
+
+        fn code(&self) -> String {
+            format!(
+                "process.proc_observation.{}:{}",
+                self.stage,
+                self.errno.unwrap_or(0)
+            )
+        }
+    }
+
+    fn group_snapshot(group: u32, leader: u32) -> Result<GroupSnapshot, ProcObservationError> {
         let mut members = 0_u32;
         let mut other_members = 0_u32;
-        for entry in std::fs::read_dir("/proc").map_err(|_| ())? {
-            let entry = entry.map_err(|_| ())?;
+        for entry in std::fs::read_dir("/proc")
+            .map_err(|error| ProcObservationError::io("enumerate", error))?
+        {
+            let entry = entry.map_err(|error| ProcObservationError::io("entry", error))?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
@@ -993,27 +1023,26 @@ mod linux {
             let stat = match File::open(entry.path().join("stat")) {
                 Ok(file) => file,
                 Err(error) if disappeared(&error) => continue,
-                Err(_) => return Err(()),
+                Err(error) => return Err(ProcObservationError::io("stat_open", error)),
             };
             let mut bytes = Vec::new();
             match stat.take(4097).read_to_end(&mut bytes) {
                 Ok(_) if bytes.len() <= 4096 => {}
                 Err(error) if disappeared(&error) => continue,
-                _ => return Err(()),
+                Err(error) => return Err(ProcObservationError::io("stat_read", error)),
+                _ => return Err(ProcObservationError::invalid("stat_size")),
             }
-            // comm may contain spaces, ')' and non-UTF-8 bytes. Only decode the
-            // ASCII numeric suffix after its final ')' delimiter.
-            let delimiter = bytes.iter().rposition(|byte| *byte == b')').ok_or(())?;
-            let fields = std::str::from_utf8(&bytes[delimiter + 1..]).map_err(|_| ())?;
-            let pgid = fields
-                .split_whitespace()
-                .nth(2)
-                .and_then(|value| value.parse::<u32>().ok())
-                .ok_or(())?;
+            let Some(pgid) = parse_proc_group(&bytes)? else {
+                continue;
+            };
             if pgid == group {
-                members = members.checked_add(1).ok_or(())?;
+                members = members
+                    .checked_add(1)
+                    .ok_or_else(|| ProcObservationError::invalid("member_count"))?;
                 if pid != leader {
-                    other_members = other_members.checked_add(1).ok_or(())?;
+                    other_members = other_members
+                        .checked_add(1)
+                        .ok_or_else(|| ProcObservationError::invalid("member_count"))?;
                 }
             }
         }
@@ -1021,6 +1050,38 @@ mod linux {
             members,
             other_members,
         })
+    }
+
+    fn parse_proc_group(bytes: &[u8]) -> Result<Option<u32>, ProcObservationError> {
+        // comm may contain spaces, ')' and non-UTF-8 bytes. Only decode the
+        // ASCII numeric suffix after its final ')' delimiter.
+        let delimiter = bytes
+            .iter()
+            .rposition(|byte| *byte == b')')
+            .ok_or_else(|| {
+                ProcObservationError::invalid(if bytes.is_empty() {
+                    "stat_empty"
+                } else {
+                    "stat_delimiter"
+                })
+            })?;
+        let fields = std::str::from_utf8(&bytes[delimiter + 1..])
+            .map_err(|_| ProcObservationError::invalid("stat_utf8"))?;
+        let pgid = fields
+            .split_whitespace()
+            .nth(2)
+            .ok_or_else(|| ProcObservationError::invalid("stat_group_missing"))?
+            .parse::<i32>()
+            .map_err(|_| ProcObservationError::invalid("stat_group_invalid"))?;
+        // Linux do_task_stat starts pgid at -1. If the task has been retired
+        // and lock_task_sighand fails, the kernel prints that sentinel instead
+        // of a group ID. It cannot name our positive, unreaped leader's group.
+        // Malformed records and other negative IDs still fail observation.
+        match pgid {
+            -1 => Ok(None),
+            0.. => Ok(Some(pgid as u32)),
+            _ => Err(ProcObservationError::invalid("stat_group_invalid")),
+        }
     }
 
     fn disappeared(error: &io::Error) -> bool {
@@ -1043,6 +1104,58 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn retired_proc_group_sentinel_is_not_a_live_group_or_parse_failure() {
+            assert_eq!(parse_proc_group(b"12 (rz) X 1 -1 12\n").unwrap(), None);
+            assert_eq!(
+                parse_proc_group(b"12 (rz )\xff) S 1 42 12\n").unwrap(),
+                Some(42)
+            );
+            assert_eq!(parse_proc_group(b"12 (rz) S 1 0 12\n").unwrap(), Some(0));
+            for invalid in [
+                b"12 (rz) S 1 -2 12\n".as_slice(),
+                b"12 (rz) S 1 invalid 12\n",
+                b"12 (rz) S 1 2147483648 12\n",
+                b"12 (rz) S 1\n",
+                b"12 (rz) S 1 \xff 12\n",
+                b"",
+            ] {
+                assert!(parse_proc_group(invalid).is_err());
+            }
+        }
+
+        #[test]
+        fn proc_snapshot_during_owned_process_churn() {
+            let mut child = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "i=0; while [ $i -lt 3000 ]; do /bin/true; i=$((i+1)); done",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let start = Instant::now();
+            let mut failure = None;
+            while start.elapsed() < Duration::from_secs(3) && child.try_wait().unwrap().is_none() {
+                if let Err(error) = group_snapshot(pid, pid) {
+                    failure = Some(error);
+                    break;
+                }
+            }
+            if child.try_wait().unwrap().is_none() {
+                assert!(matches!(
+                    killpg(Pid::from_raw(i32::try_from(pid).unwrap()), Signal::SIGKILL),
+                    Ok(()) | Err(Errno::ESRCH)
+                ));
+                child.wait().unwrap();
+            }
+            assert!(failure.is_none(), "{failure:?}");
+        }
 
         fn externally_reaped_child() -> std::process::Child {
             let child = Command::new("/bin/true")
