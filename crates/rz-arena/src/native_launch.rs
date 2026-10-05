@@ -432,6 +432,7 @@ pub(crate) mod linux {
         pub limits: ProcessLimits,
         pub _runtime_root_pins: [File; 2],
         pub bundle_directory: Option<Dir>,
+        pub preparation_cache_hint: Option<crate::SnapshotCacheHint>,
     }
 
     pub(crate) fn pin<'a>(
@@ -756,6 +757,10 @@ pub(crate) mod linux {
         };
         let mut pins = Vec::new();
         let mut receipts = Vec::new();
+        let mut preparation_cache_hint = crate::SnapshotCacheHint::rolling(
+            spec.advise_drop_input_cache(),
+            "after_copy_each_verified",
+        );
         crate::emit_native_phase("snapshot_copy_started");
         for (index, (artifact, source)) in unique.values().zip(sources).enumerate() {
             let bundle_name = cuda_bundle.and_then(|bundle| {
@@ -793,7 +798,7 @@ pub(crate) mod linux {
             } else {
                 (&inputs, name.as_str())
             };
-            let (pin, receipt) = readonly_copy(
+            let copied = readonly_copy(
                 artifact,
                 source,
                 destination.0,
@@ -801,7 +806,19 @@ pub(crate) mod linux {
                 path.join("inputs").join(&name),
                 executable,
                 input.budget.max_input_bytes,
-            )?;
+            );
+            if copied.is_err()
+                && let Some(status) = &preparation_cache_hint
+            {
+                status.emit();
+            }
+            let (pin, receipt) = copied?;
+            // readonly_copy has synced and closed its writer, established a
+            // distinct inode and fully reverified the read-only private pin.
+            // Never advise the source handle, runtime cache or a GPU buffer.
+            if let Some(status) = &mut preparation_cache_hint {
+                status.advise(&pin.file, artifact.bytes);
+            }
             let receipt = NativeSnapshotReceipt {
                 snapshot_relative_path: format!("inputs/{name}"),
                 ..receipt
@@ -811,6 +828,9 @@ pub(crate) mod linux {
             receipts.push(receipt);
         }
         crate::emit_native_phase("snapshot_copy_complete");
+        if let Some(status) = &preparation_cache_hint {
+            status.emit();
+        }
         // Additional metadata is read only after all complete private copies
         // exist. A malformed manifest cannot produce a native executable owner.
         for (is_cohort, manifest) in [
@@ -931,6 +951,7 @@ pub(crate) mod linux {
                 ArenaError::Integrity("native runtime root pin count differs".into())
             })?,
             bundle_directory,
+            preparation_cache_hint,
         })
     }
 

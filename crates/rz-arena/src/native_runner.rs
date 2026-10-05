@@ -164,6 +164,48 @@ pub struct SnapshotCacheHint {
     pub scope: &'static str,
 }
 
+#[cfg(target_os = "linux")]
+impl SnapshotCacheHint {
+    pub(crate) fn new(phase: &str, game: Option<u8>) -> Self {
+        Self {
+            phase: phase.into(),
+            game,
+            eligible_files: 0,
+            advised_files: 0,
+            errors: Vec::new(),
+            scope: "private_verified_readonly_snapshot_fds_best_effort_not_reclamation_proof",
+        }
+    }
+
+    // Post-run callers supply eligibility only after owned cleanup. An
+    // unresolved child retains all pins and receives no new rolling advice.
+    pub(crate) fn rolling(eligible: bool, phase: &str) -> Option<Self> {
+        (cfg!(feature = "experimental-snapshot-reclaim") && eligible)
+            .then(|| Self::new(phase, None))
+    }
+
+    pub(crate) fn advise(&mut self, file: &std::fs::File, bytes: u64) {
+        if bytes >= 8 * 1024 * 1024 {
+            self.record_advice(linux::advise_input_cache(file));
+        }
+    }
+
+    fn record_advice(&mut self, result: Result<(), ArenaError>) {
+        self.eligible_files += 1;
+        match result {
+            Ok(()) => self.advised_files += 1,
+            Err(error) => self.errors.push(error.to_string()),
+        }
+    }
+
+    pub(crate) fn emit(&self) {
+        // Small status survives with tracing disabled; failure never cancels play.
+        if let Ok(json) = serde_json::to_string(self) {
+            eprintln!("native_cache_hint={json}");
+        }
+    }
+}
+
 struct NativeRunBundle<S: NativeProviderDeclaration> {
     owner: Option<NativeLaunchOwner<S>>,
     process: Option<ProcessOutput>,
@@ -516,6 +558,7 @@ pub(crate) mod linux {
     }
     fn verify_inputs<S: NativeLaunchDeclaration>(
         owner: &mut NativeLaunchOwner<S>,
+        mut cache_hint: Option<&mut SnapshotCacheHint>,
     ) -> Result<(), ArenaError> {
         for item in &mut owner.snapshot.pins {
             verify_copy(&mut item.file, &item.artifact)?;
@@ -582,13 +625,18 @@ pub(crate) mod linux {
                     "native input pathname no longer names its owned inode",
                 ));
             }
+            // The held bytes and named inode have both passed their checks.
+            // Callers exclude unresolved post-run owners from this advice.
+            if let Some(status) = cache_hint.as_mut() {
+                status.advise(&item.file, item.artifact.bytes);
+            }
         }
         Ok(())
     }
     // Only the launch owner's synced, verified private snapshots are eligible.
     // This is a best-effort kernel cache hint, not deletion, memory reclamation
     // evidence or permission to touch the source/C runtime cache/GPU buffers.
-    fn advise_input_cache(file: &File) -> Result<(), ArenaError> {
+    pub(super) fn advise_input_cache(file: &File) -> Result<(), ArenaError> {
         posix_fadvise(file, 0, 0, PosixFadviseAdvice::POSIX_FADV_DONTNEED)
             .map_err(|error| ArenaError::Io(format!("native snapshot cache hint failed: {error}")))
     }
@@ -600,29 +648,13 @@ pub(crate) mod linux {
         phase: &str,
         game: Option<u8>,
     ) -> SnapshotCacheHint {
-        let mut status = SnapshotCacheHint {
-            phase: phase.into(),
-            game,
-            eligible_files: 0,
-            advised_files: 0,
-            errors: Vec::new(),
-            scope: "private_verified_readonly_snapshot_fds_best_effort_not_reclamation_proof",
-        };
+        let mut status = SnapshotCacheHint::new(phase, game);
         if owner.spec.advise_drop_input_cache() {
             for item in &owner.snapshot.pins {
-                if item.artifact.bytes >= 8 * 1024 * 1024 {
-                    status.eligible_files += 1;
-                    match advise_input_cache(&item.file) {
-                        Ok(()) => status.advised_files += 1,
-                        Err(error) => status.errors.push(error.to_string()),
-                    }
-                }
+                status.advise(&item.file, item.artifact.bytes);
             }
         }
-        // Small status survives with tracing disabled; failure never cancels play.
-        if let Ok(json) = serde_json::to_string(&status) {
-            eprintln!("native_cache_hint={json}");
-        }
+        status.emit();
         status
     }
 
@@ -649,7 +681,12 @@ pub(crate) mod linux {
         let mut pin = File::open(&path).unwrap();
         pin.seek(SeekFrom::Start(19)).unwrap();
         let before = pin.metadata().unwrap();
-        advise_input_cache(&pin).unwrap();
+        let mut hint = SnapshotCacheHint::new("synthetic_verified_pin", None);
+        hint.advise(&pin, 8 * 1024 * 1024 - 1);
+        assert_eq!(hint.eligible_files, 0);
+        hint.advise(&pin, before.len());
+        assert_eq!((hint.eligible_files, hint.advised_files), (1, 1));
+        assert!(hint.errors.is_empty());
         assert_eq!(pin.stream_position().unwrap(), 19);
         let after = std::fs::metadata(&path).unwrap();
         assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
@@ -661,6 +698,26 @@ pub(crate) mod linux {
         drop(pin);
         std::fs::remove_file(path).unwrap();
         // Cache residency is deliberately not asserted: advice is not a seal.
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn failed_cache_advice_is_recorded_and_unresolved_owner_is_ineligible() {
+        let mut hint = SnapshotCacheHint::new("synthetic_failure", None);
+        hint.record_advice(Err(ArenaError::Io("injected fadvise failure".into())));
+        hint.record_advice(Ok(()));
+        assert_eq!((hint.eligible_files, hint.advised_files), (2, 1));
+        assert_eq!(hint.errors.len(), 1);
+        assert!(hint.errors[0].contains("injected fadvise failure"));
+        let encoded = serde_json::to_string(&hint).unwrap();
+        assert!(encoded.contains("injected fadvise failure"));
+        // The cleanup gate is false while a child/group is unresolved, even
+        // in an experimental build. Advice does not release that owner's pins.
+        assert!(SnapshotCacheHint::rolling(false, "postcheck_each_verified").is_none());
+        assert_eq!(
+            SnapshotCacheHint::rolling(true, "prelaunch_each_verified").is_some(),
+            cfg!(feature = "experimental-snapshot-reclaim")
+        );
     }
     fn pair<S: NativeLaunchDeclaration>(
         owner: &NativeLaunchOwner<S>,
@@ -692,8 +749,23 @@ pub(crate) mod linux {
     ) -> Result<(NativePairReceipt<S::Audit>, ArtifactRef), ArenaError> {
         let owner = bundle.owner.as_mut().expect("prepared native owner");
         crate::emit_native_phase("prelaunch_verification_started");
-        verify_inputs(owner)?;
-        let mut cache_hints = vec![advise_verified_input_cache(owner, "before_launch", None)];
+        let mut rolling = SnapshotCacheHint::rolling(
+            owner.spec.advise_drop_input_cache(),
+            "prelaunch_each_verified",
+        );
+        let checked = verify_inputs(owner, rolling.as_mut());
+        if let Some(status) = &rolling {
+            status.emit();
+        }
+        checked?;
+        let mut cache_hints: Vec<_> = owner
+            .snapshot
+            .preparation_cache_hint
+            .clone()
+            .into_iter()
+            .collect();
+        cache_hints.extend(rolling);
+        cache_hints.push(advise_verified_input_cache(owner, "before_launch", None));
         crate::emit_native_phase("prelaunch_verification_complete");
         let s = &owner.snapshot;
         let mut ready = crate::native_diagnostics::LogProbe::default();
@@ -871,12 +943,23 @@ pub(crate) mod linux {
         }
         bundle.receipt = Some(receipt.clone());
         crate::emit_native_phase("postlaunch_verification_started");
-        verify_inputs(
+        let mut rolling = SnapshotCacheHint::rolling(
+            receipt.cleanup_verified && owner.spec.advise_drop_input_cache(),
+            "postcheck_each_verified",
+        );
+        let checked = verify_inputs(
             bundle
                 .owner
                 .as_mut()
                 .expect("native owner retained through postcheck"),
-        )?;
+            rolling.as_mut(),
+        );
+        if let Some(status) = &rolling {
+            status.emit();
+        }
+        receipt.snapshot_cache_hints.extend(rolling);
+        bundle.receipt = Some(receipt.clone());
+        checked?;
         crate::emit_native_phase("postlaunch_verification_complete");
         let owner = bundle
             .owner
