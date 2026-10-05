@@ -1191,3 +1191,12 @@ Windows/Ubuntu 필수 step SUCCESS를 직접 확인했다. ignored는 로컬 미
 120분 안에서 유한하게 진행한다. 부분 진행을 32판 완료로 표시하지 않는다.
 최종 실행 상태·검증·실패·누락·원시 자료의 logical root는
 [pilot 기록](research/BT4-FINAL-SELECTION-PILOT.md)을 따른다. #20은 Draft다.
+
+후속 조사에서 분리 E 실행 중 Windows 가용 RAM 최저 95.8 MB와 cgroup file cache
+7.26 GB를 관측했다. 기존 allocator 오류의 VRAM 원인은 미확정이다. E source 5f40654는
+최종 hash 검사 뒤에도 검증된 main private input에 cache hint를 적용한다. NN binary/
+backend·FP32·No·B1·PUCT/선택 정책은 유지하며 actual binary SHA와 C/B 영향 경로를
+대조했다. 새 E의 145 arena 검사·fmt/strict Clippy/release와 두 OS exact-source CI를
+확인했고 첫 완료 pair의 retained private model cached page 0을 별도로 관측했다.
+추가 startup error 처리에서 cache hint 실패가 생겨도 원래 실패를 보존한다. 누적 120분
+안의 새 16-lock 시도와 기존 두 실패는 분리하고 최종 상태는 위 pilot 기록에서 갱신한다.

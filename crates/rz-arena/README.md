@@ -373,7 +373,13 @@ game-start와 FATAL startup 기록을 검사해 failure_audit.startup_losses에 
 pilot_failure_audit PAIR_SPEC_JSON RUNNER_STDOUT_LOG example은 보존한 로그의 독립
 사후 회계이며 원래 실패 영수증을 수정하지 않는다.
 
-V3도 검증된 private input copy에만 DONTNEED 힌트를 적용한다.
+CUDA V2/V3는 검증된 main private input pin(8 MiB 이상)에만 DONTNEED 힌트를 적용한다.
+launch 전과 owned child cleanup/실행 후 byte·identity 재검사 뒤에 적용해, 종료 후 hash
+검사로 다시 쌓인 source-weight/ONNX 사본의 캐시가 다음 pair까지 누적되는 것을 줄인다.
+원본·공유 runtime cache·GPU buffer와 별도로 복사한 CUDA bundle file의 삭제 정책은 유지한다.
+힌트 오류는 preparation/postcheck 실패로 남기며 원래 engine/process 실패도 보존한다.
+커널의 실제 회수는 보장되지 않는다. source 5f40654의 완료 pair에서 private source-weight와
+ONNX의 resident cache page 0을 mincore로 확인한 것은 해당 두 사본의 실행 후 관측이다.
 표본·시계 fixture·초기 할당 실패·새 CUDA 메모리 정책과 재실행 인수는
 [pilot 기록](../../docs/research/BT4-FINAL-SELECTION-PILOT.md)을 따른다. 원시 PGN·로그는
 저장소 밖에 보존하며 새 실행을 과거 실패와 합쳐 선택적으로 집계하지 않는다.

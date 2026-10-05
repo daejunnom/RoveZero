@@ -535,3 +535,11 @@ CPU/CUDA V1·V2 A/A의 wire/domain·기존 계측 의미는 유지한다.
 [pilot 인수 기록](research/BT4-FINAL-SELECTION-PILOT.md)에서 구분한다.
 develop 반영 때 최신 E argv·C backend marker·B startup/search/final·A PGN·clock/failure와
 같은 integration SHA의 소비자 검사를 다시 수동 대조한다.
+
+E source `5f40654`는 main private pin의 cache hint를 owned cleanup과 최종 byte/identity
+재검사 뒤에도 적용한다. CUDA V2/V3만 대상이며 CPU/CUDA V1·C shared cache·원본·
+GPU buffer·공통 revision은 유지한다. child read/posthash가 다시 쌓은 private 모델
+페이지를 줄이는 OS 힌트이며 실제 회수·초기 peak·buffer 오류 해결을 자동 인정하지 않는다.
+postcheck hint 실패는 정상 인수를 거부하고 원래 실패가 있으면 함께 보존한다.
+총괄은 새 E binary와 같은 NN binary/backend, hint phase receipt, byte/inode/cursor 검사,
+실제 private page 관측·boot ID·호스트 RAM과 CUDA/clock/A 인수를 별도로 연결한다.

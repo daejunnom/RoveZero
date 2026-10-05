@@ -838,9 +838,12 @@ pub(crate) mod linux {
             // Child reads and the final hash audit repopulate these pages.
             // Advise again only after owned cleanup and byte/identity recheck.
             if let Err(error) = advise_verified_input_cache(owner) {
-                receipt.primary_error = Some(format!(
-                    "verified private snapshot postcheck cache hint failed: {error}"
-                ));
+                let hint_error =
+                    format!("verified private snapshot postcheck cache hint failed: {error}");
+                receipt
+                    .primary_error
+                    .get_or_insert_with(|| hint_error.clone());
+                receipt.limitations.push(hint_error);
                 bundle.receipt = Some(receipt);
                 return Err(error);
             }

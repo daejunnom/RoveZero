@@ -120,3 +120,46 @@ game-2는 PGN 생성 전 S1 startup loss이며 새 E failure audit가 직접 보
 
 실행 요청·잠금·부분 진행을 완료한 16쌍으로 표시하지 않는다. 원시 자료의 논리 루트는 저장소 밖
 `reports/coordinator-integration/native-bt4-holdout-20261005/`다.
+
+## Windows 호스트 압력과 E postcheck cache 관리
+
+기본 ORT INFO 로그의 별도 바이너리로 dual load/search/exit 8회·16 process를 통과했고,
+실패했던 French opening의 직접 runner 진단도 네 fresh process·두 판·exit 0이었다.
+원래 E 경로로 같은 d44f059 lock의 한 쌍만 분리한 실행도 실제 process/provider/clock/A
+인수를 통과했다. 따라서 allocator 오류가 진단에서 재현되지 않아 실패한 resource
+allocator가 CPU/CUDA/CudaPinned 중 어느 것인지는 확정하지 않았다. 초기 custom logger
+진단의 timeout/비정상 종료와 INFO pipe/config/wrapper 문제는 별도 실패 자료로 보존하며
+제품 source의 model allocation 재현으로 사용하지 않는다. 진단 바이너리를 정식 PGN/점수에
+합치지 않았고 제품 NN binary SHA를 다시 빌드해 원래 a46e941c…cf1c6와 일치시켰다.
+
+분리 E 실행에서 Windows AvailableBytes 최저는 95,797,248 bytes, CommittedBytes 최고는
+30,026,153,984 bytes/CommitLimit 33,935,814,656 bytes였다. 실행 중 Linux cgroup은
+8,402,038,784 bytes이고 그중 file 7,263,191,040·anon 1,113,722,880 bytes였다.
+Linux MemAvailable·해당 cgroup OOM=0만으로 Windows 물리 호스트의 여유를 추정할 수 없다.
+이 기록은 호스트 메모리 압력의 직접 관측이며 앞선 6 MiB 실패의 정확한 allocator/원인을
+소급 확정하는 근거는 아니다. VRAM 예외 문자열과 장치 표본도 단독 확정 근거로 쓰지 않는다.
+
+E source `5f406542bb6c389f419c8f937a3ae6d39a367899`는 launch 전의 cache hint를
+main private pin의 owned cleanup·최종 hash/identity 검사 뒤에도 적용한다. 호출은
+원래 readonly FD를 사용하며 원본·shared cache·GPU buffer를 건드리지 않는다.
+별도로 복사한 CUDA bundle file의 삭제는 기존 회수/검증/비활성 절차다. kernel hint의
+존재를 일반 RAM/속도 개선으로 표시하지 않는다. 완료된 첫 pair에서 retained private
+source weight 382,645,315 bytes·ONNX 741,143,425 bytes의 cached page를 내용 재독 없이
+mincore로 조사해 각각 0을 관측했다. 같은 WSL boot ID와 phase receipt를 보존했다.
+pair 종료 당시 전체 file cache가 5,969,817,600 bytes였으므로 모든 캐시가 해제됐다고
+주장하지 않는다. inactive private input 57개·18,970,831,500 logical bytes는 별도
+hash/readonly/비활성 확인 뒤 캐시 힌트만 적용했고 파일은 삭제하지 않았다.
+
+E 변경 전후의 C/B source·compiler/feature·model/runtime 영향 입력과 actual NN binary
+a46e941c…cf1c6의 일치를 확인했다. BT4 수치 검사는 d44f059의 실제 실행을 재사용하며
+새 GPU 검사로 표시하지 않는다. 새 E에서 arena all-target/all-feature 145 passed·0 failed·
+14 ignored(로컬 미실행), fmt·strict Clippy·release를 확인했고
+[exact-source CI 37265696791](https://github.com/daejunnom/RoveZero/actions/runs/37265696791)의
+Windows/Ubuntu 모든 필수 step SUCCESS를 직접 확인했다. 처음 format 차이는 수정했다.
+
+새 E binary b06393bd…342f09·같은 NN/backend·16 input lock과 plan SHA
+b49a77d5fa6a32aa06f0268971c0ac72ddea8b5df73f63b07e6167fd419fa71a를 잠근 세 번째
+시도를 누적 120분의 남은 wall 안에서 진행한다. 시작 후 WSL boot ID·각 pair의
+memory.current/stat·guest file cache·Windows available/commit·GPU 표본을 기록한다.
+중단한 두 시도와 점수를 합치지 않고 추가 시간이나 완료되지 않은 32판을 인정하지 않는다.
+진행 상태는 최종 회수 후 갱신한다. 원시 자료는 같은 logical root의 postcheck-hint-r3/다.
