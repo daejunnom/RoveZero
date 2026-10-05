@@ -543,3 +543,11 @@ GPU buffer·공통 revision은 유지한다. child read/posthash가 다시 쌓�
 postcheck hint 실패는 정상 인수를 거부하고 원래 실패가 있으면 함께 보존한다.
 총괄은 새 E binary와 같은 NN binary/backend, hint phase receipt, byte/inode/cursor 검사,
 실제 private page 관측·boot ID·호스트 RAM과 CUDA/clock/A 인수를 별도로 연결한다.
+
+이번 5f40654 실행에서는 여섯 pair의 완전 인수와 pair-06의 시간 예산 중단을 구분했다.
+budget failure를 engine loss·startup loss·정상 draw로 재분류하지 않고 raw PGN과
+integration false/scored 0을 보존한다. 등록된 16쌍에서 미완료 10쌍을 유지하며 source가
+다른 원래 두 실패와 합치지 않는다. code head 43e90fa의 CI와 GPU source 5f40654의 실제
+provider/session·clock·A 재생 결과는 별도 증거다. 문서 커밋의 source 영향 없음 확인은
+develop의 consumer 검사를 대체하지 않는다. 최신 integration SHA에서 위 접점을 다시
+수동 정합하며 Draft/execution_ready/strength_eligible false를 유지한다.

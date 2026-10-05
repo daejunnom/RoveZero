@@ -159,7 +159,47 @@ Windows/Ubuntu 모든 필수 step SUCCESS를 직접 확인했다. 처음 format 
 
 새 E binary b06393bd…342f09·같은 NN/backend·16 input lock과 plan SHA
 b49a77d5fa6a32aa06f0268971c0ac72ddea8b5df73f63b07e6167fd419fa71a를 잠근 세 번째
-시도를 누적 120분의 남은 wall 안에서 진행한다. 시작 후 WSL boot ID·각 pair의
-memory.current/stat·guest file cache·Windows available/commit·GPU 표본을 기록한다.
-중단한 두 시도와 점수를 합치지 않고 추가 시간이나 완료되지 않은 32판을 인정하지 않는다.
-진행 상태는 최종 회수 후 갱신한다. 원시 자료는 같은 logical root의 postcheck-hint-r3/다.
+시도는 누적 120분의 wall deadline `2026-10-05T05:33:00Z`에서 중단했다.
+시작 당시 남은 1642.90초 뒤 새 작업을 중단하고 owned child 종료·회수에 약 4.89초를
+사용했다(전체 supervisor 경과 1647.79초). 모든 owned PID가 종료됐고 마지막 device
+관측은 memory/utilization 0/0이었다. 해당 중단은 시간 예산/정상 인수 gate 실패이며
+NN allocation failure나 engine loss로 바꾸지 않는다. 자동 재시도는 하지 않았다.
+
+| 세 번째 시도의 실제 범위 | 회수·검증한 결과 |
+|---|---|
+| 완전 인수 | 6쌍·12판, 24개의 provider session·4 fresh PID/pair·clock/A PGN/현재 claim·물리 종료 대조 |
+| 관측 점수 | S1 W3/D6/L3, 득점률 50%, pentanomial [0,0,6,0,0]; 이전 시도와 합치지 않음 |
+| 등록 분모·판정 | 16쌍 중 미완료 10쌍, 등록 분모의 가능한 점수 범위 0.1875~0.8125·고정 Hoeffding95 [0,1], inconclusive |
+| 실패 지점 재시도 | 과거의 pair-03/game-2를 이번에는 완전 인수; 7개 attempt의 보존 로그에서 6 MiB/명시 CUDA OOM 오류 미관측 |
+| 시간 중단 pair-06 | 첫 판의 실제 PGN 92 ply/0-1을 보존했지만 pair 인수 false/scored 0; startup loss 미관측 |
+| PGN 보존 | 실제 13판의 SAN·합법 수·10-ply opening을 독립 재생/round-trip; 12판 인수/1판 미인수 표기를 구분 |
+| GPU 표본·guest OOM | 7개 attempt의 whole-device 500ms 표본 최고 1630 MiB; memory max/oom/oom_kill 사건 모두 0 |
+| WSL 연속성 | 7개 attempt의 동일 boot ID, 재시작을 메모리 개선으로 혼동하지 않음 |
+
+첫 쌍의 cgroup peak 10,075,013,120 bytes와 postcheck file 5,969,817,600 bytes를
+보존한다. 이후 인수된 다섯 쌍의 cgroup peak는 4,222,373,888~4,222,541,824 bytes,
+postcheck file은 25,579,520~25,858,048 bytes였다. 과거 파일 페이지의 charge·회수/검증 후
+private CUDA library 삭제·동일 source 재실행이 함께 있으므로 차이를 main input hint
+한 가지의 독립 효과나 일반적인 최고 RAM 절감률로 단정하지 않는다.
+
+Windows 관측 1313개에서 AvailableBytes 최저 11,014,144 bytes(10.50 MiB), 중앙값
+1,276,329,984 bytes, 128 MiB 미만 4개 표본·1 GiB 미만 479개 표본이었다. Commit 최고는
+31,714,254,848/33,935,814,656 bytes였다. Linux guest의 낮은 후기 file charge와
+할당 실패 미재발만으로 Windows 물리 RAM 압박 전체가 해소됐다고 주장하지 않는다.
+샘플링은 매우 짧은 VRAM peak·allocator 종류를 증명하지 않으므로 물리 VRAM 부족은
+여전히 미확정이다. 후속 재실행도 Windows available/commit과 guest anon/file·GPU
+관측을 함께 보존하고, 이 부분 표본을 완료된 32판·Elo·모델 승격으로 표현하지 않는다.
+
+원시 자료는 같은 logical root의 `postcheck-hint-r3/`에 보존했고 실패 pair ZIP의
+CRC와 SHA를 확인했다. `postcheck-hint-5f40654-review-san.pgn`의 SHA는
+`2ae15d7d1413d65b9096f82480420589f147ec98b0686c43f75692041ab2b60b`다.
+검증·회수·비활성 확인 후 완료된 여섯 pair의 전용 CUDA library 17,820,863,712 logical
+bytes를 정리했다. 원본·shared cache·모델·실패 자료를 보존하며 물리 디스크 회수량으로
+표시하지 않는다. 원래 두 실패와 점수·실패 원장을 합치거나 변경하지 않았다.
+
+최신 제품 source `43e90fa24a66a3df6f7acc0144a329c5aa502c6d`의 추가 차이는
+cache hint 실패 시 원래 primary failure를 보존하는 오류 처리다.
+[CI 37267193365](https://github.com/daejunnom/RoveZero/actions/runs/37267193365)의
+Windows/Ubuntu 모든 필수 step SUCCESS를 직접 확인했다. 이번 실제 GPU/arena 실행의
+source는 5f40654이며 최신 오류 분기까지 GPU 실행했다고 보고하지 않는다. 후속 문서
+커밋은 source/Cargo/CI diff가 없는 경우 위 검사 재사용을 별도로 확인한다.

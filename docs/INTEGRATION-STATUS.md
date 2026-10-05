@@ -1198,5 +1198,19 @@ Windows/Ubuntu 필수 step SUCCESS를 직접 확인했다. ignored는 로컬 미
 backend·FP32·No·B1·PUCT/선택 정책은 유지하며 actual binary SHA와 C/B 영향 경로를
 대조했다. 새 E의 145 arena 검사·fmt/strict Clippy/release와 두 OS exact-source CI를
 확인했고 첫 완료 pair의 retained private model cached page 0을 별도로 관측했다.
-추가 startup error 처리에서 cache hint 실패가 생겨도 원래 실패를 보존한다. 누적 120분
-안의 새 16-lock 시도와 기존 두 실패는 분리하고 최종 상태는 위 pilot 기록에서 갱신한다.
+추가 startup error 처리에서 cache hint 실패가 생겨도 원래 실패를 보존한다. 최신 코드
+43e90fa의 [두 OS CI](https://github.com/daejunnom/RoveZero/actions/runs/37267193365)는
+모든 필수 step SUCCESS다. 실제 GPU/arena source 5f40654와 오류 분기 검사를 구분한다.
+
+세 번째 16-lock 시도는 6쌍·12판 완전 인수(S1 W3/D6/L3) 뒤 누적 120분 deadline에서
+pair-06을 중단했다. 이전에 실패한 pair-03/game-2를 통과했으며 이번 7개 attempt의
+보존 로그에서 allocation failure/startup loss는 미관측이다. 예산 중단 pair의 첫 판을
+포함한 실제 13판 PGN을 독립 재생하고 인수 여부를 표시했다. 16쌍 중 미완료 10쌍을
+유지하고 다른 두 시도와 합치지 않는다. 전체 강도는 inconclusive이며 #20 Draft와
+execution_ready/strength_eligible false를 유지한다.
+
+Windows 가용 RAM 최저 10.50 MiB·128 MiB 미만 4개 표본을 관측했다. 같은 boot의
+후기 cgroup peak 약 3.93 GiB·device 표본 최고 1630 MiB·guest OOM 사건 0은 전체
+호스트 RAM 압박 해결이나 물리 VRAM 원인 확정의 근거가 아니다. 예산 만료 뒤 약 4.89초의
+owned 종료·회수로 모든 PID가 종료됐고 마지막 device memory/utilization은 0/0이었다.
+최종 범위·자원 관측·PGN·실패 ZIP은 위 pilot 기록과 외부 reports에 보존한다.
