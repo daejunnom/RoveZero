@@ -582,6 +582,21 @@ pub(crate) mod linux {
             .map_err(|error| ArenaError::Io(format!("native snapshot cache hint failed: {error}")))
     }
 
+    // The caller has just verified these closed-writer private pins. Never
+    // apply this hint to an original asset, the shared runtime or GPU memory.
+    fn advise_verified_input_cache<S: NativeLaunchDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+    ) -> Result<(), ArenaError> {
+        if owner.spec.advise_drop_input_cache() {
+            for item in &owner.snapshot.pins {
+                if item.artifact.bytes >= 8 * 1024 * 1024 {
+                    advise_input_cache(&item.file)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     #[test]
     fn snapshot_cache_hint_preserves_readonly_pin_bytes_inode_and_cursor() {
@@ -648,13 +663,7 @@ pub(crate) mod linux {
     ) -> Result<(NativePairReceipt<S::Audit>, ArtifactRef), ArenaError> {
         let owner = bundle.owner.as_mut().expect("prepared native owner");
         verify_inputs(owner)?;
-        if owner.spec.advise_drop_input_cache() {
-            for item in &owner.snapshot.pins {
-                if item.artifact.bytes >= 8 * 1024 * 1024 {
-                    advise_input_cache(&item.file)?;
-                }
-            }
-        }
+        advise_verified_input_cache(owner)?;
         let s = &owner.snapshot;
         let process = supervise_in_directory_with_tree(
             &s.pins[s.runner_index].file,
@@ -821,6 +830,24 @@ pub(crate) mod linux {
                 .as_mut()
                 .expect("native owner retained through postcheck"),
         )?;
+        let owner = bundle
+            .owner
+            .as_ref()
+            .expect("native owner retained through postcheck cache hint");
+        if receipt.cleanup_verified && owner.spec.advise_drop_input_cache() {
+            // Child reads and the final hash audit repopulate these pages.
+            // Advise again only after owned cleanup and byte/identity recheck.
+            if let Err(error) = advise_verified_input_cache(owner) {
+                receipt.primary_error = Some(format!(
+                    "verified private snapshot postcheck cache hint failed: {error}"
+                ));
+                bundle.receipt = Some(receipt);
+                return Err(error);
+            }
+            receipt.limitations.push(
+                "verified private input cache hint applied before launch and after owned cleanup/postcheck; kernel reclamation is not guaranteed".into(),
+            );
+        }
         receipt.integration_checks_passed = completed
             && receipt.pgn_audit.is_some()
             && receipt.provider_audit_error.is_none()
