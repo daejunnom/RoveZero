@@ -1,0 +1,16 @@
+[package]
+name = "rz-bindings-python"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+publish = false
+
+[lib]
+name = "rz_bindings_poc"
+crate-type = ["cdylib"]
+
+[dependencies]
+rz-bindings-core = { path = "../core" }
+pyo3 = { version = "=0.27.2", features = ["extension-module"] }
+
