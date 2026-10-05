@@ -119,3 +119,79 @@ fn clock_does_not_erase_observed_engine_loss_or_accept_changed_pgn_prefix() {
     o.moves[1] = "c7c5".into();
     assert!(validate_pilot_clock_trace(t.as_bytes(), &p, &o, clock()).is_err());
 }
+
+#[test]
+fn startup_loss_is_preserved_without_a_pgn_or_a_successful_provider_receipt() {
+    let (opening, audit, _) = fixture();
+    let pair = PairSpec {
+        id: "failure-pair".into(),
+        ordinal: 0,
+        opening_input_sha256: canonical_sha256(&opening).unwrap(),
+        opening,
+        games: std::array::from_fn(|i| GameSpec {
+            id: audit.games[i].game_id.clone(),
+            white_engine: audit.games[i].white_engine.clone(),
+            black_engine: audit.games[i].black_engine.clone(),
+            engine_seeds: Default::default(),
+            engine_slots: Default::default(),
+        }),
+        execution_order: [0, 1],
+    };
+    let trace = concat!(
+        "[TRACE ] [10:51:44.181984] <     137433152747200> fastchess --- Game 1 between base and candidate starting\n",
+        "[TRACE ] [10:51:44.181984] <     137433152747200> fastchess --- Game 1 between base and candidate finished\n",
+        "[TRACE ] [10:51:44.181984] <     137433152747200> fastchess --- Game 2 between candidate and base starting\n",
+        "[FATAL ] [10:51:44.181984] <                    > fastchess --- Fatal; base engine startup failure: \"Engine didn't respond to uciok after startup\"\n",
+        "[TRACE ] [10:51:44.181984] <     137433152747200> fastchess --- Game 2 between candidate and base finished\n"
+    );
+    let a = audit_pilot_startup_failure_trace(trace.as_bytes(), &pair)
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.startup_losses.len(), 1);
+    let loss = &a.startup_losses[0];
+    assert_eq!(loss.game_id, "clock-2");
+    assert_eq!(loss.loser_engine, "base");
+    assert_eq!(loss.declared_result, GameResult::WhiteWin);
+    assert_eq!(loss.failure_stage, "startup_uci_handshake");
+    // Neither quoted stderr nor an unanchored copy of the fatal text is trusted.
+    for forged in [
+        trace.replace("[FATAL ]", "[Engine]"),
+        trace
+            .lines()
+            .filter(|l| !l.starts_with("[FATAL"))
+            .map(|l| format!("{l}\n"))
+            .collect(),
+    ] {
+        assert!(
+            audit_pilot_startup_failure_trace(forged.as_bytes(), &pair)
+                .unwrap()
+                .is_none()
+        );
+    }
+    for malformed in [
+        trace.replacen("Fatal; base", "Fatal; stranger", 1),
+        trace.replacen(
+            "Game 2 between candidate and base starting",
+            "Game 2 between base and candidate starting",
+            1,
+        ),
+        trace.replacen(
+            "[FATAL ] [10:51:44.181984]",
+            "[FATAL ] [25:51:44.181984]",
+            1,
+        ),
+        trace.replacen("[FATAL ]", "[FATALX]", 1),
+        trace
+            .lines()
+            .filter(|l| !l.ends_with("starting"))
+            .map(|l| format!("{l}\n"))
+            .collect(),
+        trace.trim_end_matches('\n').into(),
+        trace.replace(
+            "[FATAL ]",
+            "[FATAL ] [10:51:44.181984] <                    > fastchess --- unsupported\n[FATAL ]",
+        ),
+    ] {
+        assert!(audit_pilot_startup_failure_trace(malformed.as_bytes(), &pair).is_err());
+    }
+}

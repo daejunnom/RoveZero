@@ -9,7 +9,9 @@ use crate::asset::{self, AssetProfile, MaiaAsset, INPUT_NAME, MLH_NAME, POLICY_N
 use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
 use crate::runtime_pin::RuntimeLibraryPin;
 use crate::{output, RawOutput};
-use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider};
+use ort::execution_providers::{
+    ArenaExtendStrategy, CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider,
+};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::tensor::TensorElementType;
 use ort::value::{Tensor, ValueType};
@@ -558,6 +560,9 @@ impl OnnxBackend {
                     .with_execution_providers([cuda
                         .with_device_id(device_id)
                         .with_memory_limit(arena_bytes)
+                        // Avoid power-of-two pool growth crowding another resident
+                        // engine. This changes allocation, not tensors or kernels.
+                        .with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested)
                         .with_tf32(false)
                         .with_conv_max_workspace(false)
                         .with_cuda_graph(config.experiments.cuda_graph)
@@ -592,6 +597,9 @@ impl OnnxBackend {
                 ";cuda-bundle-v1={bundle:?};loader=linux-exact-global-v1"
             )
             .expect("writing to an owned String cannot fail");
+        }
+        if matches!(config.provider, Provider::Cuda { .. }) {
+            profile.push_str(";cuda-arena-extend=same-as-requested-v1");
         }
         if config.experiments != ExecutionExperiments::default() {
             use std::fmt::Write;

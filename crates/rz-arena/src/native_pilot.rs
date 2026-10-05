@@ -82,6 +82,133 @@ pub struct NativePilotGameClockAudit {
     pub black_remaining_ms: u64,
     pub charged_ms: [u64; 2],
 }
+
+/// Closed runner observations for losses that occur before any game PGN exists.
+/// The original attempt still fails its process/provider/clock acceptance gates.
+#[derive(Clone, Debug, Serialize)]
+pub struct NativePilotFailureAudit {
+    pub audit_version: u32,
+    pub source: String,
+    pub stdout_sha256: String,
+    pub startup_losses: Vec<NativePilotStartupLoss>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NativePilotStartupLoss {
+    pub game_id: String,
+    pub white_engine: String,
+    pub black_engine: String,
+    pub loser_engine: String,
+    pub declared_result: crate::GameResult,
+    pub failure_stage: String,
+    pub cause: String,
+}
+
+/// Decode only the pinned runner's FATAL startup renderer and its ordered game
+/// starts. Engine stderr can explain a cause but cannot manufacture a loss.
+/// Unsupported fatal messages remain errors, never silently excluded outcomes.
+#[cfg(feature = "native-cuda")]
+pub fn audit_pilot_startup_failure_trace(
+    stdout: &[u8],
+    pair: &crate::PairSpec,
+) -> Result<Option<NativePilotFailureAudit>, ArenaError> {
+    if stdout.is_empty()
+        || stdout.len() > 64 * 1024 * 1024
+        || !stdout.ends_with(b"\n")
+        || !matches!(pair.execution_order, [0, 1] | [1, 0])
+    {
+        return Err(invalid("startup failure trace bounds or game order differ"));
+    }
+    let text =
+        std::str::from_utf8(stdout).map_err(|_| invalid("startup failure trace is not UTF-8"))?;
+    let mut started = 0_usize;
+    let mut active = None;
+    let mut losses = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if index >= 131_072 || line.len() > 4096 {
+            return Err(invalid("startup failure trace line budget exceeded"));
+        }
+        if line.starts_with("[TRACE ] [") {
+            let Some(message) = crate::native_cuda::cuda_exit_trace_message(line) else {
+                continue;
+            };
+            if message.starts_with("Game ") && message.ends_with(" starting") {
+                if active.is_some() || started >= 2 || !losses.is_empty() {
+                    return Err(invalid(
+                        "startup failure trace has overlapping/extra starts",
+                    ));
+                }
+                let game = &pair.games[pair.execution_order[started]];
+                let expected = format!(
+                    "Game {} between {} and {} starting",
+                    started + 1,
+                    game.white_engine,
+                    game.black_engine
+                );
+                if message != expected {
+                    return Err(invalid("startup failure game colors/order differ"));
+                }
+                active = Some(started);
+                started += 1;
+            } else if message.starts_with("Game ") && message.ends_with(" finished") {
+                let ordinal = active
+                    .ok_or_else(|| invalid("startup failure trace has an unmatched game end"))?;
+                let game = &pair.games[pair.execution_order[ordinal]];
+                if message
+                    != format!(
+                        "Game {} between {} and {} finished",
+                        ordinal + 1,
+                        game.white_engine,
+                        game.black_engine
+                    )
+                {
+                    return Err(invalid("startup failure game end differs"));
+                }
+                active = None;
+            }
+        } else if line.starts_with("[FATAL") {
+            let message = crate::native_cuda::native_runner_message(line, "[FATAL ] [", false)
+                .ok_or_else(|| invalid("startup failure FATAL renderer is malformed"))?;
+            let ordinal =
+                active.ok_or_else(|| invalid("startup failure has no matching active game"))?;
+            let game = &pair.games[pair.execution_order[ordinal]];
+            let loser = message
+                .strip_prefix("Fatal; ")
+                .and_then(|v| {
+                    v.strip_suffix(
+                        " engine startup failure: \"Engine didn't respond to uciok after startup\"",
+                    )
+                })
+                .ok_or_else(|| invalid("unsupported runner fatal cause"))?;
+            if !losses.is_empty() || (loser != game.white_engine && loser != game.black_engine) {
+                return Err(invalid("startup failure has a duplicate/unknown loser"));
+            }
+            losses.push(NativePilotStartupLoss {
+                game_id: game.id.clone(),
+                white_engine: game.white_engine.clone(),
+                black_engine: game.black_engine.clone(),
+                loser_engine: loser.into(),
+                declared_result: if loser == game.white_engine {
+                    crate::GameResult::BlackWin
+                } else {
+                    crate::GameResult::WhiteWin
+                },
+                failure_stage: "startup_uci_handshake".into(),
+                cause: "pinned_runner_rejected_uci_startup".into(),
+            });
+        }
+    }
+    if losses.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(NativePilotFailureAudit {
+            audit_version: 1,
+            source: "pinned_fastchess_game_start_and_fatal_renderer".into(),
+            stdout_sha256: format!("{:x}", Sha256::digest(stdout)),
+            startup_losses: losses,
+        }))
+    }
+}
 #[cfg(feature = "native-cuda")]
 fn invalid(message: &str) -> ArenaError {
     ArenaError::Integrity(message.into())

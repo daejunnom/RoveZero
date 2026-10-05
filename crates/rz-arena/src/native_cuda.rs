@@ -126,9 +126,17 @@ pub fn validate_native_cuda_process_exit_trace(
 }
 
 pub(crate) fn cuda_exit_trace_message(line: &str) -> Option<&str> {
+    native_runner_message(line, "[TRACE ] [", true)
+}
+
+pub(crate) fn native_runner_message<'a>(
+    line: &'a str,
+    prefix: &str,
+    require_thread: bool,
+) -> Option<&'a str> {
     // Pinned logger.hpp:157: [label left-width6] [time width15]
     // <thread right-width20> fastchess --- message. TRACE_THREAD is nonempty.
-    let (time, tail) = line.strip_prefix("[TRACE ] [")?.split_once("] <")?;
+    let (time, tail) = line.strip_prefix(prefix)?.split_once("] <")?;
     let time = time.as_bytes();
     if time.len() != 15
         || time[2] != b':'
@@ -146,9 +154,14 @@ pub(crate) fn cuda_exit_trace_message(line: &str) -> Option<&str> {
     }
     let (thread, message) = tail.split_once("> fastchess --- ")?;
     let digits = thread.trim_start_matches(' ');
-    if thread.len() != 20
-        || digits.is_empty()
-        || digits.starts_with('0')
+    if thread.len() != 20 {
+        return None;
+    }
+    if digits.is_empty() {
+        if require_thread {
+            return None;
+        }
+    } else if digits.starts_with('0')
         || !digits.bytes().all(|byte| byte.is_ascii_digit())
         || digits.parse::<u64>().is_err()
     {
@@ -274,6 +287,17 @@ impl<P: CudaLaunchProfile> NativeProviderDeclaration for LockedCudaIntegrationPa
                 clock,
             )
             .map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+    fn audit_failure_trace(
+        &self,
+        stdout: &[u8],
+        pair: &crate::PairSpec,
+    ) -> Result<Option<crate::NativePilotFailureAudit>, ArenaError> {
+        if self.input().pilot.is_some() {
+            crate::native_pilot::audit_pilot_startup_failure_trace(stdout, pair)
         } else {
             Ok(None)
         }

@@ -15,6 +15,10 @@ name = "rz-arena-fixture-engine"
 path = "src/bin/fixture-engine.rs"
 required-features = ["test-fixtures"]
 
+[[example]]
+name = "pilot_failure_audit"
+required-features = ["native-cuda"]
+
 [dependencies]
 rz-experiments.workspace = true
 rz-contracts.workspace = true

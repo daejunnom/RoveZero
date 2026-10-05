@@ -46,6 +46,13 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
     ) -> Result<Option<crate::NativePilotClockAudit>, ArenaError> {
         Ok(None)
     }
+    fn audit_failure_trace(
+        &self,
+        _stdout: &[u8],
+        _pair: &crate::PairSpec,
+    ) -> Result<Option<crate::NativePilotFailureAudit>, ArenaError> {
+        Ok(None)
+    }
     #[cfg(target_os = "linux")]
     fn validate_records(
         &self,
@@ -135,6 +142,11 @@ pub struct NativePairReceipt<A = NativeProviderSessionAudit> {
     pub clock_audit: Option<crate::NativePilotClockAudit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clock_audit_error: Option<String>,
+    /// Failure accounting only; this never grants provider, clock or score acceptance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_audit: Option<crate::NativePilotFailureAudit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_audit_error: Option<String>,
     pub primary_error: Option<String>,
     pub cleanup_verified: bool,
     pub unresolved_owner_retained: bool,
@@ -687,6 +699,8 @@ pub(crate) mod linux {
             scored_games: 0,
             clock_audit: None,
             clock_audit_error: None,
+            failure_audit: None,
+            failure_audit_error: None,
             incomplete_games: if process.receipt.stop == ProcessStop::Cancelled {
                 2
             } else {
@@ -792,6 +806,13 @@ pub(crate) mod linux {
                 Some("not audited: process completion/cleanup gate failed".into());
             receipt.provider_audit_error =
                 Some("not audited: partial provider evidence is not accepted".into());
+            match owner
+                .spec
+                .audit_failure_trace(&process.stdout, &pair(owner)?)
+            {
+                Ok(audit) => receipt.failure_audit = audit,
+                Err(error) => receipt.failure_audit_error = Some(error.to_string()),
+            }
         }
         bundle.receipt = Some(receipt.clone());
         verify_inputs(
