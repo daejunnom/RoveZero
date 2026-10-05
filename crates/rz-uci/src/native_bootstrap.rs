@@ -371,6 +371,16 @@ impl NativeConfig {
     pub fn profiling_requested(&self) -> bool {
         self.profiling
     }
+    #[cfg(feature = "onnx-cuda")]
+    fn cuda_attestation_width(&self) -> Option<usize> {
+        // Only the separate batch writer may describe a multi-item provider.
+        // CLI admission keeps legacy --attestation closed to B1 and excludes
+        // buffer/binding/Graph changes from either receipt path.
+        (self.provider == NativeProvider::Cuda
+            && (self.parallelism == 1 || self.batch_attestation)
+            && self.execution_experiments == rz_eval::onnx::ExecutionExperiments::default())
+        .then_some(self.parallelism)
+    }
     pub fn engine_settings(&self) -> crate::engine::EngineSettings {
         let mut settings = crate::engine::EngineSettings {
             max_workers: 1,
@@ -1344,9 +1354,7 @@ impl NativeSessionFactory {
             ));
         }
         let (asset, runtime, backend, projection) = Self::load_parts(owners, config)?;
-        let loaded_profile = if config.parallelism == 1
-            && config.execution_experiments == rz_eval::onnx::ExecutionExperiments::default()
-        {
+        let loaded_profile = if let Some(width) = config.cuda_attestation_width() {
             Some(CudaProfileV1::from_loaded_limit(
                 &asset,
                 &runtime,
@@ -1357,11 +1365,7 @@ impl NativeSessionFactory {
                     .ok_or(NativeBootstrapError::Config(
                         "CUDA bundle file SHA256 is absent",
                     ))?,
-                if config.batch_attestation {
-                    config.parallelism
-                } else {
-                    1
-                },
+                width,
             )?)
         } else {
             None

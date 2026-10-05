@@ -202,6 +202,63 @@ fn profile_is_opt_in_bounded_and_does_not_select_attestation() {
     assert_private_config_rejection(named);
 }
 
+#[cfg(all(feature = "onnx-cuda", feature = "experimental-batch"))]
+#[test]
+fn batch_startup_keeps_loaded_provider_width_and_legacy_b1_boundary() {
+    let cuda_args = || {
+        let mut args = valid_arguments();
+        args[0] = "--onnx-cuda".into();
+        args.extend([
+            format!("--cuda-bundle={PRIVATE_MARKER}/bundle.json"),
+            format!("--cuda-bundle-sha256={}", "ef".repeat(32)),
+            "--search-simulations=4096".into(),
+            "--final-selection=visits".into(),
+        ]);
+        args
+    };
+    assert_eq!(
+        NativeConfig::parse(cuda_args())
+            .unwrap()
+            .cuda_attestation_width(),
+        Some(1)
+    );
+    for width in [1, 2, 4, 8, 16] {
+        let mut args = cuda_args();
+        args.extend([
+            "--batch-attestation".into(),
+            format!("--experimental-batch={width}"),
+        ]);
+        let config = NativeConfig::parse(args).unwrap();
+        assert_eq!(config.cuda_attestation_width(), Some(width));
+        assert!(config.batch_attestation_requested());
+        assert!(!config.attestation_requested());
+    }
+    let mut unattested = cuda_args();
+    unattested.push("--experimental-batch=4".into());
+    assert!(
+        NativeConfig::parse(unattested)
+            .unwrap()
+            .cuda_attestation_width()
+            .is_none()
+    );
+    let mut legacy = cuda_args();
+    legacy.extend(["--experimental-batch=4".into(), "--attestation".into()]);
+    assert_private_config_rejection(legacy);
+    for unsupported in [
+        "--experimental-io-buffers",
+        "--experimental-io-binding",
+        "--experimental-cuda-graph",
+    ] {
+        let mut args = cuda_args();
+        args.extend([
+            "--batch-attestation".into(),
+            "--experimental-batch=4".into(),
+            unsupported.into(),
+        ]);
+        assert_private_config_rejection(args);
+    }
+}
+
 #[test]
 fn source_profile_rejects_unrepresented_runtime_modes_before_loading_assets() {
     for experiment in [
