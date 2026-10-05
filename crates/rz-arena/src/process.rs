@@ -209,6 +209,7 @@ pub fn supervise(
             limits,
             cancel,
             None,
+            None,
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -242,6 +243,7 @@ pub fn supervise_with_watch(
             limits,
             cancel,
             Some(linux::ArtifactObservation::Flat(watch)),
+            None,
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -288,6 +290,7 @@ pub fn supervise_in_directory(
             limits,
             cancel,
             watch.map(linux::ArtifactObservation::Flat),
+            None,
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -318,6 +321,19 @@ pub fn supervise_in_directory_with_tree(
     cancel: Option<&AtomicBool>,
     watch: &OwnedArtifactTreeWatch,
 ) -> Result<ProcessOutput, ArenaError> {
+    supervise_tree_observed(program, args, directory, limits, cancel, watch, None)
+}
+
+/// Passive finite stream observer. It cannot alter output, cancellation or gates.
+pub(crate) fn supervise_tree_observed(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    stdout_observer: Option<&mut dyn FnMut(&[u8])>,
+) -> Result<ProcessOutput, ArenaError> {
     limits.validate()?;
     watch.validate()?;
     #[cfg(target_os = "linux")]
@@ -341,11 +357,12 @@ pub fn supervise_in_directory_with_tree(
             limits,
             cancel,
             Some(linux::ArtifactObservation::Tree(watch)),
+            stdout_observer,
         )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (program, args, directory, cancel);
+        let _ = (program, args, directory, cancel, stdout_observer);
         Err(ArenaError::Invalid(
             "native process supervision currently requires Linux".into(),
         ))
@@ -397,6 +414,7 @@ mod linux {
         .map_err(|_| ArenaError::Invalid("runner cwd must be a direct directory".into()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn supervise(
         program: &File,
         args: &[OsString],
@@ -404,6 +422,7 @@ mod linux {
         limits: ProcessLimits,
         cancel: Option<&AtomicBool>,
         watch: Option<ArtifactObservation<'_>>,
+        mut stdout_observer: Option<&mut dyn FnMut(&[u8])>,
     ) -> Result<ProcessOutput, ArenaError> {
         native_elf(program)?;
         default_child_disposition()?;
@@ -533,6 +552,9 @@ mod linux {
             // provider/clock acceptance still own the complete unchanged output.
             if out.len() > prior_out {
                 crate::native_diagnostics::observe_stream(true, &out[prior_out..]);
+                if let Some(observer) = stdout_observer.as_mut() {
+                    observer(&out[prior_out..]);
+                }
             }
             if err.len() > prior_err {
                 crate::native_diagnostics::observe_stream(false, &err[prior_err..]);

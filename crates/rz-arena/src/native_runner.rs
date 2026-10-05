@@ -129,6 +129,7 @@ pub struct NativePairReceipt<A = NativeProviderSessionAudit> {
     pub runner_binary_sha256: String,
     pub process: ProcessReceipt,
     pub snapshots: Vec<NativeSnapshotReceipt>,
+    pub snapshot_cache_hints: Vec<SnapshotCacheHint>,
     pub artifacts: Vec<rz_experiments::ArtifactRef>,
     pub provider_sessions: Vec<A>,
     pub provider_audit_error: Option<String>,
@@ -151,6 +152,16 @@ pub struct NativePairReceipt<A = NativeProviderSessionAudit> {
     pub cleanup_verified: bool,
     pub unresolved_owner_retained: bool,
     pub limitations: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SnapshotCacheHint {
+    pub phase: String,
+    pub game: Option<u8>,
+    pub eligible_files: usize,
+    pub advised_files: usize,
+    pub errors: Vec<String>,
+    pub scope: &'static str,
 }
 
 struct NativeRunBundle<S: NativeProviderDeclaration> {
@@ -386,7 +397,7 @@ pub(crate) mod linux {
     };
     use crate::{
         GameSpec, PairSpec, PgnLimits, PgnOutcomePolicy, ProcessStop, audit_pair_pgn_for_spec,
-        canonical_sha256, supervise_in_directory_with_tree,
+        canonical_sha256,
     };
     use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
     use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
@@ -586,15 +597,33 @@ pub(crate) mod linux {
     // apply this hint to an original asset, the shared runtime or GPU memory.
     fn advise_verified_input_cache<S: NativeLaunchDeclaration>(
         owner: &NativeLaunchOwner<S>,
-    ) -> Result<(), ArenaError> {
+        phase: &str,
+        game: Option<u8>,
+    ) -> SnapshotCacheHint {
+        let mut status = SnapshotCacheHint {
+            phase: phase.into(),
+            game,
+            eligible_files: 0,
+            advised_files: 0,
+            errors: Vec::new(),
+            scope: "private_verified_readonly_snapshot_fds_best_effort_not_reclamation_proof",
+        };
         if owner.spec.advise_drop_input_cache() {
             for item in &owner.snapshot.pins {
                 if item.artifact.bytes >= 8 * 1024 * 1024 {
-                    advise_input_cache(&item.file)?;
+                    status.eligible_files += 1;
+                    match advise_input_cache(&item.file) {
+                        Ok(()) => status.advised_files += 1,
+                        Err(error) => status.errors.push(error.to_string()),
+                    }
                 }
             }
         }
-        Ok(())
+        // Small status survives with tracing disabled; failure never cancels play.
+        if let Ok(json) = serde_json::to_string(&status) {
+            eprintln!("native_cache_hint={json}");
+        }
+        status
     }
 
     #[cfg(test)]
@@ -664,16 +693,27 @@ pub(crate) mod linux {
         let owner = bundle.owner.as_mut().expect("prepared native owner");
         crate::emit_native_phase("prelaunch_verification_started");
         verify_inputs(owner)?;
-        advise_verified_input_cache(owner)?;
+        let mut cache_hints = vec![advise_verified_input_cache(owner, "before_launch", None)];
         crate::emit_native_phase("prelaunch_verification_complete");
         let s = &owner.snapshot;
-        let process = supervise_in_directory_with_tree(
+        let mut ready = crate::native_diagnostics::LogProbe::default();
+        let mut on_stdout = |bytes: &[u8]| {
+            for game in ready.ready_games(bytes) {
+                cache_hints.push(advise_verified_input_cache(
+                    owner,
+                    "both_engines_ready",
+                    Some(game),
+                ));
+            }
+        };
+        let process = crate::process::supervise_tree_observed(
             &s.pins[s.runner_index].file,
             &s.invocation.args,
             &s.cwd,
             s.limits,
             cancel,
             &s.watch,
+            Some(&mut on_stdout),
         )?;
         crate::native_diagnostics::finish_logs();
         crate::emit_native_phase("runner_supervision_finished");
@@ -703,6 +743,7 @@ pub(crate) mod linux {
             runner_binary_sha256: owner.spec.view().runner.binary.sha256.clone(),
             process: process.receipt.clone(),
             snapshots: owner.snapshot.receipts.clone(),
+            snapshot_cache_hints: cache_hints,
             artifacts: Vec::new(),
             provider_sessions: Vec::new(),
             provider_audit_error: None,
@@ -844,18 +885,11 @@ pub(crate) mod linux {
         if receipt.cleanup_verified && owner.spec.advise_drop_input_cache() {
             // Child reads and the final hash audit repopulate these pages.
             // Advise again only after owned cleanup and byte/identity recheck.
-            if let Err(error) = advise_verified_input_cache(owner) {
-                let hint_error =
-                    format!("verified private snapshot postcheck cache hint failed: {error}");
-                receipt
-                    .primary_error
-                    .get_or_insert_with(|| hint_error.clone());
-                receipt.limitations.push(hint_error);
-                bundle.receipt = Some(receipt);
-                return Err(error);
-            }
+            receipt
+                .snapshot_cache_hints
+                .push(advise_verified_input_cache(owner, "after_postcheck", None));
             receipt.limitations.push(
-                "verified private input cache hint applied before launch and after owned cleanup/postcheck; kernel reclamation is not guaranteed".into(),
+                "private snapshot cache advice status recorded before launch, per-game both-ready and after owned cleanup/postcheck; kernel reclamation is not guaranteed".into(),
             );
         }
         receipt.integration_checks_passed = completed

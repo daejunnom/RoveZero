@@ -174,7 +174,7 @@ type LogEvent = (&'static str, u8, Option<u8>);
 
 #[cfg(any(target_os = "linux", test))]
 #[derive(Default)]
-struct LogProbe {
+pub(crate) struct LogProbe {
     partial: Vec<u8>,
     dropping: bool,
     oversized_lines: u64,
@@ -204,6 +204,18 @@ struct Game {
 
 #[cfg(any(target_os = "linux", test))]
 impl LogProbe {
+    /// Same bounded readiness parser as phase tracing, independent of its switch.
+    /// Duplicate readyok lines and malformed/oversized lines cannot repeat advice.
+    pub(crate) fn ready_games(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let ready = self
+            .feed(bytes, 0)
+            .into_iter()
+            .filter_map(|(phase, game, _)| (phase == "both_engines_ready").then_some(game))
+            .collect();
+        self.completed.clear();
+        ready
+    }
+
     fn feed(&mut self, bytes: &[u8], now_ns: u64) -> Vec<LogEvent> {
         let mut events = Vec::new();
         for &byte in bytes {
@@ -398,5 +410,25 @@ mod tests {
             probe.feed(b"[time] A ---> readyok\n", 0),
             vec![("engine_ready", 1, Some(0))]
         );
+    }
+
+    #[test]
+    fn cache_readiness_observer_is_local_and_once_per_game_without_trace() {
+        let mut probe = LogProbe::default();
+        assert!(
+            probe
+                .ready_games(b"fastchess --- Game 1 between A and B starting\n A ---> ready")
+                .is_empty()
+        );
+        assert_eq!(
+            probe.ready_games(b"ok\n B ---> readyok\n A ---> readyok\n B ---> readyok\n"),
+            [1]
+        );
+        assert!(probe.ready_games(b" B ---> readyok\n").is_empty());
+        assert_eq!(probe.ready_games(b"fastchess --- Game 2 between B and A starting\n B ---> readyok\n A ---> readyok\n"), [2]);
+        assert!(probe.ready_games(b"fastchess --- Game 2 between B and A starting\n B ---> readyok\n A ---> readyok\n").is_empty());
+        // Another invocation has its own parser; no process-global trace state.
+        let mut other = LogProbe::default();
+        assert_eq!(other.ready_games(b"fastchess --- Game 1 between A and B starting\n A ---> readyok\n B ---> readyok\n"), [1]);
     }
 }
