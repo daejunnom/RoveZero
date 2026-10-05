@@ -297,6 +297,56 @@ RTX 4050 Laptop 6GB·WSL Ubuntu에서 CPU 2개, `memory.high=6GiB`,
 전체 커밋은 unknown으로 둔다. 이 결과가 streaming 검증·모델 버퍼 조기 해제·runtime
 공유·cache hint의 변경 전후 효과를 대신 검증하지 않는다.
 
+### 4.5 private snapshot I/O 대조: 시간 개선 관측, 채택 보류
+
+2026-10-06, source `a997f6cc1914b4acd0fbccebfa1750b5181bffc2`에서 MEM-C09의
+작은 streaming chunk 호출 비용을 한 변수로 검사했다. arena의
+`experimental-snapshot-io`는 [복사·재검증 경로](../../crates/rz-arena/src/native_launch.rs)의
+블록만 기본 16KiB에서 64KiB로 바꾼다. 원본 전체 검증·복사 중 SHA·복사본 전체
+재검증·바이트 예산·writer 종료·readonly pin·distinct inode 조건은 유지한다.
+기본 feature는 바꾸지 않았으며 API·V1~V5 receipt·계약 revision도 그대로다.
+
+저장소 밖의 얇은 probe가 제품 `prepare_native_cuda_launch`를 호출했다. 동일한 기존
+V4 lock의 BT4·가중치·ORT/CUDA 파일·엔진 binary·opening 등 27개,
+4,099,789,301bytes를 여섯 실행에서 모두 다시 검증하고 private copy로 준비했다.
+lock 안의 엔진 source는 기존 `2e91cb9`이며 이 실험에서는 실행하지 않았다.
+모델 로딩·추론·prelaunch/postgame recheck·대국은 측정 범위에 포함되지 않는다.
+공통 dependency version/checksum과 helper source·Cargo.lock·두 binary digest를 고정했다.
+WSL Ubuntu·CPU2·`memory.high=6GiB`·`memory.max=12GiB`·swap0,
+실행당 240초·정리 30초·전체 1,650초·A1/B1/B2/A2/A3/B3 순서를 사전에 지정했다.
+
+Primary T는 자식 시작부터 정상 exit·pipe drain·영수증 검증·최종 cgroup 수집까지다.
+Primary P는 private file cache를 포함한 해당 cgroup의 `memory.peak`를 종료 후 한 번 읽은
+값이다. 별도 `VmHWM` 관측으로 P를 대체하지 않았다. 원본은 기존 NTFS/ext4에 있고
+새 사본은 ext4에 두었다. 전역 cache 비우기·원본 cache hint는 없으며 cold cache를 주장하지 않는다.
+
+| 쌍 | 16KiB 전체 T (s) | 64KiB 전체 T (s) | 16KiB P (MiB) | 64KiB P (MiB) | T1/T0 | P1/P0 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 34.309 | 27.978 | 6144.250 | 4027.945 | 0.815469 | 0.655563 |
+| 2 | 41.968 | 27.833 | 4028.004 | 4027.992 | 0.663209 | 0.999997 |
+| 3 | 35.293 | 28.824 | 4027.922 | 4027.887 | 0.816701 | 0.999991 |
+
+복사·복사본 재검증 구간은 각각 22.941/27.675/25.796초에서
+19.291/18.177/18.370초로 짧아졌다. 변경하지 않은 원본 검증도 11.220/14.109/9.341초와
+8.486/9.570/10.270초로 변동했다. 첫 쌍의 큰 P 감소는 나머지 쌍에서 재현되지 않았고,
+file cache의 상태·cgroup 귀속·실행 순서 영향은 분리하지 못했다. 각 실행의 종료 시점
+`memory.stat`과 RSS를 함께 보존했다. probe의 `VmHWM`은 모두 2.875MiB였지만 이는
+NN을 로딩하지 않은 준비 단계의 관측이며 전체 대국의 Rust/ORT 메모리 증거가 아니다.
+
+**채택 보류:** 시간 비율은 모두 1 미만이지만 두 쌍의 P 비율은 0.80 문턱을 충족하지
+않았다. 별도 Pareto 검토는 모든 쌍의 T/P 비악화와 각 T 감소가 기준 T 범위보다 클 것을
+사전에 요구했다. 기준 범위 7.659초에 비해 감소는 6.331/14.134/6.469초라 이 조건도
+충족하지 못했다. 관측한 시간 개선을 보존하며 기본 16KiB·실험 off를 유지한다.
+이 작은 준비 대조로 GPU 종단 지연·Windows 전체 commit·강도 개선을 판정하지 않는다.
+
+여섯 실행의 모든 해시·소유권 검사가 통과했고 OOM·강제 종료·잔류 process는 없었다.
+블록 경계를 넘는 끝부분 변조·증가·잘림, 기본/실험 검사와 strict Clippy도 통과했다.
+초기 외부 하네스의 HOME 누락과 출력 pipe 연결 오류는 실패 영수증으로 별도 보존했다.
+입력·binary·CPU·메모리 한도는 유지한 새 등록에서 위 여섯 실행을 완료했다. 성공한 실행의
+재생성 private inputs만 pin 종료·자식 부재·정확한 경로를 확인한 뒤 회수했고 원본과 실패
+사본·모든 결과는 보존했다. 원시 자료·명세·분석은 Git 밖 논리 경로
+`${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-snapshot-io-20261006-v2/`에 둔다.
+
 ## 5. 후속 구현·검증 순서
 
 할당/복사 제거 → 저장 밀도 → bounded scratch/arena/pool → 임계 구역/완료 통지 →
