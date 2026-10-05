@@ -212,6 +212,9 @@ impl<P: CudaLaunchProfile> NativeLaunchDeclaration for LockedCudaIntegrationPair
     fn provider_name(&self) -> &'static str {
         "CUDA"
     }
+    fn advise_drop_input_cache(&self) -> bool {
+        P::VERSION == 2
+    }
     fn additional_manifest(&self) -> Option<&ArtifactRef> {
         // A sealed, already-validated lock contains both roles and identical inputs.
         Some(&self.input().engines[0].cuda_bundle.manifest)

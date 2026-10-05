@@ -364,6 +364,7 @@ pub(crate) mod linux {
     };
     use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
     use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
+    use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
     use rz_experiments::{
         ArtifactRef, CpuNativeLaunchSpecV1, NativeArtifactRole, NativeEngineRole, OutcomePolicy,
     };
@@ -547,6 +548,50 @@ pub(crate) mod linux {
         }
         Ok(())
     }
+    // Only the launch owner's synced, verified private snapshots are eligible.
+    // This is a best-effort kernel cache hint, not deletion, memory reclamation
+    // evidence or permission to touch the source/C runtime cache/GPU buffers.
+    fn advise_input_cache(file: &File) -> Result<(), ArenaError> {
+        posix_fadvise(file, 0, 0, PosixFadviseAdvice::POSIX_FADV_DONTNEED)
+            .map_err(|error| ArenaError::Io(format!("native snapshot cache hint failed: {error}")))
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn snapshot_cache_hint_preserves_readonly_pin_bytes_inode_and_cursor() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+
+        let path =
+            std::env::temp_dir().join(format!("rovezero-native-cache-hint-{}", std::process::id()));
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let bytes = vec![0x5a; 8 * 1024 * 1024 + 17];
+        writer.write_all(&bytes).unwrap();
+        writer.sync_all().unwrap();
+        writer
+            .set_permissions(std::fs::Permissions::from_mode(0o400))
+            .unwrap();
+        drop(writer);
+        let mut pin = File::open(&path).unwrap();
+        pin.seek(SeekFrom::Start(19)).unwrap();
+        let before = pin.metadata().unwrap();
+        advise_input_cache(&pin).unwrap();
+        assert_eq!(pin.stream_position().unwrap(), 19);
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        assert_eq!(before.len(), after.len());
+        assert_eq!(after.permissions().mode() & 0o777, 0o400);
+        let mut observed = vec![0; bytes.len()];
+        pin.read_exact_at(&mut observed, 0).unwrap();
+        assert_eq!(observed, bytes);
+        drop(pin);
+        std::fs::remove_file(path).unwrap();
+        // Cache residency is deliberately not asserted: advice is not a seal.
+    }
     fn pair<S: NativeLaunchDeclaration>(
         owner: &NativeLaunchOwner<S>,
     ) -> Result<PairSpec, ArenaError> {
@@ -577,6 +622,13 @@ pub(crate) mod linux {
     ) -> Result<(NativePairReceipt<S::Audit>, ArtifactRef), ArenaError> {
         let owner = bundle.owner.as_mut().expect("prepared native owner");
         verify_inputs(owner)?;
+        if owner.spec.advise_drop_input_cache() {
+            for item in &owner.snapshot.pins {
+                if item.artifact.bytes >= 8 * 1024 * 1024 {
+                    advise_input_cache(&item.file)?;
+                }
+            }
+        }
         let s = &owner.snapshot;
         let process = supervise_in_directory_with_tree(
             &s.pins[s.runner_index].file,

@@ -37,6 +37,9 @@ pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 
         role: rz_experiments::NativeEngineRole,
     ) -> Result<NativeEngineView<'_>, rz_experiments::ManifestError>;
     fn provider_name(&self) -> &'static str;
+    fn advise_drop_input_cache(&self) -> bool {
+        false
+    }
     fn additional_manifest(&self) -> Option<&ArtifactRef> {
         None
     }
