@@ -264,6 +264,39 @@ startup과 warm 구간, primary peak와 반복·불확실성을 실행 전에 �
 시계 대국에서 서로 다른 방문 수가 발생한 결과나 서로 다른 source의 과거 peak를
 그 고정 작업량 대조로 대체하지 않는다. peak가 unknown이거나 비교 기준이 없으면 보류한다.
 
+### 4.4 첫 고정 작업량 GPU 대조: OPT-09 버퍼 재사용 보류
+
+2026-10-06, source `ef86138c13b2188f7ee1953eb8bed60b5fec504f`의 독립
+`inference_bench`에서 기존 `experimental-io-buffers` 한 변수만 비교했다.
+기본 B1/2/4/8/16 sweep은 유지하고, 명시적인 `--b1-buffers=baseline|reuse`
+모드만 B1 고정 작업량 대조에 사용한다. 입력·BT4-it332·FP32·HistoryFill No·TF32 off,
+단일 물리 worker, warm3/timed20은 같고 cache·dedup·I/O Binding·CUDA Graph는 끈다.
+RTX 4050 Laptop 6GB·WSL Ubuntu에서 CPU 2개, `memory.high=6GiB`,
+`memory.max=12GiB`를 양쪽에 동일 적용했다. 원시 자료·바이너리 해시·실행 명세는 Git 밖에 보존했다.
+
+측정 전에 전체 프로세스 실행·물리 완료·결과 회수 시간 T와, backend 종료 후 한 번
+읽은 프로세스 `VmHWM` peak RSS P를 primary로 지정했다. P는 모델 준비·warmup·측정·
+종료를 포함하며 VRAM이나 Windows 전체 커밋이 아니다. 순서는 A1/B1/B2/A2/A3/B3다.
+
+| 쌍 | 기준 전체 시간 (s) | 재사용 전체 시간 (s) | 기준 peak RSS (MiB) | 재사용 peak RSS (MiB) | T1/T0 | P1/P0 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 18.640 | 19.667 | 1904.117 | 1818.348 | 1.0551 | 0.9550 |
+| 2 | 13.893 | 18.214 | 1822.012 | 1818.109 | 1.3111 | 0.9979 |
+| 3 | 21.594 | 23.900 | 1820.590 | 1818.141 | 1.1068 | 0.9987 |
+
+독립 참조 수치 검사와 32회 가변 B1의 보존 출력 불변 검사는 통과했다. 여섯 대조
+실행의 23회 출력 해시는 동일하고 물리 완료·정상 종료를 확인했다. CUDA/OOM 오류,
+강제 정리와 잔류 자식은 없었다. 최초 등록 오류로 이전 benchmark 바이너리가 새 인자를
+거부한 시도는 모델/GPU 실행 전 실패로 별도 보존하고 측정 표에서 제외했다.
+올바른 build target과 복사본의 digest 및 인자 경계를 확인한 뒤 전 대조를 시작했다.
+
+**채택 보류:** 세 쌍에서 관측한 최대 시간 비율 1.3111과 peak 비율 0.9987은
+시간 1.05·peak 0.80 문턱을 충족하지 않는다. 일관된 Pareto 개선도 관측하지 못했다.
+모델·runtime 준비 시간과 RSS 편차가 있으므로 이 비율을 버퍼 재사용의 확정적인
+인과 효과로 일반화하지 않는다. 기본 off를 유지하고, 실제 VRAM 최대치·Windows
+전체 커밋은 unknown으로 둔다. 이 결과가 streaming 검증·모델 버퍼 조기 해제·runtime
+공유·cache hint의 변경 전후 효과를 대신 검증하지 않는다.
+
 ## 5. 후속 구현·검증 순서
 
 할당/복사 제거 → 저장 밀도 → bounded scratch/arena/pool → 임계 구역/완료 통지 →
