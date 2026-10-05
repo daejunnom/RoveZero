@@ -456,6 +456,7 @@ fn cuda_private_snapshot_keeps_closed_bundle_names_and_preserves_failed_preparat
     candidate.role = NativeEngineRole::Candidate;
     candidate.engine_id = "cuda-candidate".into();
     let spec = CudaIntegrationPairSpecV1 {
+        pilot: None,
         schema_version: 1,
         purpose: NativeCudaIntegrationPurpose::CudaNnIntegration,
         strength_eligible: false,

@@ -36,6 +36,16 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
     fn receipt_filename(&self) -> &'static str;
     fn startup_filename(&self) -> &'static str;
     fn termination_filename(&self) -> &'static str;
+    fn claim_policy(&self) -> rz_experiments::ClaimPolicy {
+        rz_experiments::ClaimPolicy::ExplicitClaim
+    }
+    fn validate_clock_trace(
+        &self,
+        _stdout: &[u8],
+        _pgn: &PairPgnAudit,
+    ) -> Result<Option<crate::NativePilotClockAudit>, ArenaError> {
+        Ok(None)
+    }
     #[cfg(target_os = "linux")]
     fn validate_records(
         &self,
@@ -121,6 +131,10 @@ pub struct NativePairReceipt<A = NativeProviderSessionAudit> {
     /// Integration-only runs grant no scoring authority, including valid draws.
     pub scored_games: u32,
     pub incomplete_games: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock_audit: Option<crate::NativePilotClockAudit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock_audit_error: Option<String>,
     pub primary_error: Option<String>,
     pub cleanup_verified: bool,
     pub unresolved_owner_retained: bool,
@@ -671,6 +685,8 @@ pub(crate) mod linux {
             pgn_audit_error: None,
             integration_checks_passed: false,
             scored_games: 0,
+            clock_audit: None,
+            clock_audit_error: None,
             incomplete_games: if process.receipt.stop == ProcessStop::Cancelled {
                 2
             } else {
@@ -749,7 +765,7 @@ pub(crate) mod linux {
                         PgnOutcomePolicy {
                             engine_failure: OutcomePolicy::Loss,
                             max_plies_outcome: OutcomePolicy::Incomplete,
-                            claim_policy: rz_experiments::ClaimPolicy::ExplicitClaim,
+                            claim_policy: owner.spec.claim_policy(),
                             max_game_plies: owner.spec.view().max_plies,
                         },
                     )
@@ -788,6 +804,29 @@ pub(crate) mod linux {
             && receipt.pgn_audit.is_some()
             && receipt.provider_audit_error.is_none()
             && receipt.provider_sessions.len() == 4;
+        let owner = bundle.owner.as_ref().expect("postchecked native owner");
+        if let Some(audit) = &receipt.pgn_audit {
+            match owner.spec.validate_clock_trace(&process.stdout, audit) {
+                Ok(clock) => receipt.clock_audit = clock,
+                Err(e) => {
+                    receipt.clock_audit_error = Some(e.to_string());
+                    receipt.integration_checks_passed = false;
+                }
+            }
+        }
+        if receipt.integration_checks_passed && receipt.clock_audit.is_some() {
+            receipt.scored_games = receipt.pgn_audit.as_ref().map_or(0, |p| {
+                p.games
+                    .iter()
+                    .filter(|g| {
+                        matches!(
+                            g.classification.as_str(),
+                            "rules_terminal" | "protocol_adjudicated" | "engine_loss"
+                        )
+                    })
+                    .count() as u32
+            });
+        }
         if completed && !receipt.integration_checks_passed {
             receipt.primary_error =
                 Some("native pair evidence audit rejected an integration gate".into());

@@ -8,6 +8,7 @@ mod ledger;
 #[cfg(feature = "native-cuda")]
 mod native_cuda;
 mod native_launch;
+mod native_pilot;
 mod native_runner;
 mod pgn;
 mod plan;
@@ -20,6 +21,7 @@ pub use ledger::*;
 #[cfg(feature = "native-cuda")]
 pub use native_cuda::*;
 pub use native_launch::*;
+pub use native_pilot::*;
 pub use native_runner::*;
 pub use pgn::*;
 pub use plan::*;

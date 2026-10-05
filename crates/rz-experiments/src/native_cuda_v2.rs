@@ -86,9 +86,16 @@ impl NativeCudaProfileV2 {
 
 impl crate::native_cuda::profile_sealed::Sealed for NativeCudaProfileV2 {}
 impl CudaLaunchProfile for NativeCudaProfileV2 {
+    type Clock = NativeMovetimeV1;
     const VERSION: u32 = 2;
     const DOMAIN: &'static str = CUDA_NATIVE_LAUNCH_V2_DOMAIN;
     const CANONICALIZATION: &'static str = CUDA_NATIVE_LAUNCH_V2_CANONICALIZATION;
+    fn clock_view(clock: Self::Clock) -> NativePairClock {
+        NativePairClock::Movetime(clock)
+    }
+    fn validate_clock(clock: Self::Clock, runtime_ms: u64) -> Result<(), ManifestError> {
+        <NativeCudaProfileV1 as CudaLaunchProfile>::validate_clock(clock, runtime_ms)
+    }
     fn validate_profile(&self) -> Result<(), ManifestError> {
         self.validate()
     }

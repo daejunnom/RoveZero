@@ -125,7 +125,7 @@ pub fn validate_native_cuda_process_exit_trace(
     Ok(())
 }
 
-fn cuda_exit_trace_message(line: &str) -> Option<&str> {
+pub(crate) fn cuda_exit_trace_message(line: &str) -> Option<&str> {
     // Pinned logger.hpp:157: [label left-width6] [time width15]
     // <thread right-width20> fastchess --- message. TRACE_THREAD is nonempty.
     let (time, tail) = line.strip_prefix("[TRACE ] [")?.split_once("] <")?;
@@ -176,7 +176,7 @@ impl<P: CudaLaunchProfile> NativeLaunchDeclaration for LockedCudaIntegrationPair
             opening: &p.opening,
             opening_artifact: &p.opening_artifact,
             runner: &p.runner,
-            clock: p.clock,
+            clock: P::clock_view(p.clock),
             max_plies: p.max_plies,
             timeouts: p.timeouts,
             budget: NativeResourceBudgetV1 {
@@ -213,7 +213,7 @@ impl<P: CudaLaunchProfile> NativeLaunchDeclaration for LockedCudaIntegrationPair
         "CUDA"
     }
     fn advise_drop_input_cache(&self) -> bool {
-        P::VERSION == 2
+        P::VERSION >= 2
     }
     fn additional_manifest(&self) -> Option<&ArtifactRef> {
         // A sealed, already-validated lock contains both roles and identical inputs.
@@ -222,17 +222,29 @@ impl<P: CudaLaunchProfile> NativeLaunchDeclaration for LockedCudaIntegrationPair
     fn validate_additional_manifest(&self, bytes: &[u8]) -> Result<(), ArenaError> {
         validate_cuda_bundle_manifest_fields(bytes, &self.input().engines[0].cuda_bundle)
     }
+    fn pilot_cohort(&self) -> Option<&ArtifactRef> {
+        self.input().pilot.as_ref().map(|p| &p.opening_cohort)
+    }
+    fn validate_pilot_cohort(&self, bytes: &[u8]) -> Result<(), ArenaError> {
+        crate::native_pilot::validate_pilot_cohort(bytes, self.input())
+    }
 }
 impl<P: CudaLaunchProfile> NativeProviderDeclaration for LockedCudaIntegrationPairSpec<P> {
     type Audit = NativeCudaProviderSessionAudit;
     fn scope(&self) -> &'static str {
-        "cuda_nn_pair_integration_process_provider_search_and_native_rules"
+        if P::VERSION == 3 {
+            "cuda_search_pilot_process_provider_search_whole_clock_and_native_rules"
+        } else {
+            "cuda_nn_pair_integration_process_provider_search_and_native_rules"
+        }
     }
     fn receipt_filename(&self) -> &'static str {
         if P::VERSION == 1 {
             "native-cuda-pair-receipt.v1.json"
-        } else {
+        } else if P::VERSION == 2 {
             "native-cuda-pair-receipt.v2.json"
+        } else {
+            "native-cuda-pilot-receipt.v3.json"
         }
     }
     fn startup_filename(&self) -> &'static str {
@@ -240,6 +252,31 @@ impl<P: CudaLaunchProfile> NativeProviderDeclaration for LockedCudaIntegrationPa
     }
     fn termination_filename(&self) -> &'static str {
         "native-cuda-termination.v1.json"
+    }
+    fn claim_policy(&self) -> rz_experiments::ClaimPolicy {
+        self.input()
+            .pilot
+            .as_ref()
+            .map_or(rz_experiments::ClaimPolicy::ExplicitClaim, |p| {
+                p.claim_policy
+            })
+    }
+    fn validate_clock_trace(
+        &self,
+        stdout: &[u8],
+        pgn: &crate::PairPgnAudit,
+    ) -> Result<Option<crate::NativePilotClockAudit>, ArenaError> {
+        if let rz_experiments::NativePairClock::Game(clock) = P::clock_view(self.input().clock) {
+            crate::native_pilot::validate_pilot_clock_trace(
+                stdout,
+                pgn,
+                &self.input().opening,
+                clock,
+            )
+            .map(Some)
+        } else {
+            Ok(None)
+        }
     }
     #[cfg(target_os = "linux")]
     fn validate_process_exit_trace(

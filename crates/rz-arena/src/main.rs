@@ -6,8 +6,9 @@ use rz_arena::{
 use rz_arena::{prepare_native_cuda_launch, run_native_cuda_pair};
 #[cfg(feature = "native-cuda")]
 use rz_experiments::{
-    CudaIntegrationPairSpecV1, CudaIntegrationPairSpecV2, LockedCudaIntegrationPairSpecV1,
-    LockedCudaIntegrationPairSpecV2, MAX_CUDA_NATIVE_LAUNCH_JSON_BYTES,
+    CudaIntegrationPairSpecV1, CudaIntegrationPairSpecV2, CudaSearchPilotPairSpecV3,
+    LockedCudaIntegrationPairSpecV1, LockedCudaIntegrationPairSpecV2,
+    LockedCudaSearchPilotPairSpecV3, MAX_CUDA_NATIVE_LAUNCH_JSON_BYTES,
 };
 use rz_experiments::{
     IntegrationPairSpecV1, LockedIntegrationPairSpecV1, LockedManifest, MAX_MANIFEST_BYTES,
@@ -140,13 +141,18 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, String> {
         });
     }
     #[cfg(feature = "native-cuda")]
-    if matches!(command, Some("native-cuda-lock" | "native-cuda-v2-lock")) {
+    if matches!(
+        command,
+        Some("native-cuda-lock" | "native-cuda-v2-lock" | "native-cuda-pilot-lock")
+    ) {
         if args.len() != 3 {
             return Err("native-cuda-lock requires exactly INPUT OUTPUT".into());
         }
         return Ok(Command::NativeCudaLock {
             version: if command == Some("native-cuda-lock") {
                 1
+            } else if command == Some("native-cuda-pilot-lock") {
+                3
             } else {
                 2
             },
@@ -155,13 +161,18 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, String> {
         });
     }
     #[cfg(feature = "native-cuda")]
-    if matches!(command, Some("native-cuda-pair" | "native-cuda-v2-pair")) {
+    if matches!(
+        command,
+        Some("native-cuda-pair" | "native-cuda-v2-pair" | "native-cuda-pilot-pair")
+    ) {
         if args.len() != 5 {
             return Err("native-cuda-pair requires exactly LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME".into());
         }
         return Ok(Command::NativeCudaPair {
             version: if command == Some("native-cuda-pair") {
                 1
+            } else if command == Some("native-cuda-pilot-pair") {
+                3
             } else {
                 2
             },
@@ -271,6 +282,10 @@ fn execute(command: Command) -> Result<String, String> {
                 CudaIntegrationPairSpecV1::from_json(&input)
                     .and_then(|s| s.lock())
                     .and_then(|s| s.to_json())
+            } else if version == 3 {
+                CudaSearchPilotPairSpecV3::from_json(&input)
+                    .and_then(|s| s.lock())
+                    .and_then(|s| s.to_json())
             } else {
                 CudaIntegrationPairSpecV2::from_json(&input)
                     .and_then(|s| s.lock())
@@ -294,6 +309,14 @@ fn execute(command: Command) -> Result<String, String> {
             return if version == 1 {
                 execute_cuda_pair(
                     LockedCudaIntegrationPairSpecV1::from_json(&input)
+                        .map_err(|e| e.to_string())?,
+                    artifact_root,
+                    output_root,
+                    output_directory,
+                )
+            } else if version == 3 {
+                execute_cuda_pair(
+                    LockedCudaSearchPilotPairSpecV3::from_json(&input)
                         .map_err(|e| e.to_string())?,
                     artifact_root,
                     output_root,

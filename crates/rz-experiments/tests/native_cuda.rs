@@ -61,6 +61,7 @@ fn fixture() -> CudaIntegrationPairSpecV1 {
     candidate.role = NativeEngineRole::Candidate;
     candidate.engine_id = "cuda-candidate".into();
     CudaIntegrationPairSpecV1 {
+        pilot: None,
         schema_version: 1,
         purpose: NativeCudaIntegrationPurpose::CudaNnIntegration,
         strength_eligible: false,

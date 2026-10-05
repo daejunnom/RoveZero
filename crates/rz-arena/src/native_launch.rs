@@ -46,6 +46,12 @@ pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 
     fn validate_additional_manifest(&self, _bytes: &[u8]) -> Result<(), ArenaError> {
         Ok(())
     }
+    fn pilot_cohort(&self) -> Option<&ArtifactRef> {
+        None
+    }
+    fn validate_pilot_cohort(&self, _bytes: &[u8]) -> Result<(), ArenaError> {
+        Ok(())
+    }
 }
 pub(crate) mod sealed {
     pub trait Sealed {}
@@ -81,7 +87,7 @@ pub struct NativePairView<'a> {
     pub opening: &'a rz_experiments::OpeningSpec,
     pub opening_artifact: &'a ArtifactRef,
     pub runner: &'a rz_experiments::ToolIdentity,
-    pub clock: rz_experiments::NativeMovetimeV1,
+    pub clock: rz_experiments::NativePairClock,
     pub max_plies: u32,
     pub timeouts: rz_experiments::NativeTimeoutsV1,
     // Shared observation bounds are an executor view, not a CPU spec conversion.
@@ -100,7 +106,7 @@ impl NativeLaunchDeclaration for LockedIntegrationPairSpecV1 {
             opening: &p.opening,
             opening_artifact: &p.opening_artifact,
             runner: &p.runner,
-            clock: p.clock,
+            clock: rz_experiments::NativePairClock::Movetime(p.clock),
             max_plies: p.max_plies,
             timeouts: p.timeouts,
             budget: p.budget,
@@ -791,7 +797,11 @@ pub(crate) mod linux {
         }
         // Additional metadata is read only after all complete private copies
         // exist. A malformed manifest cannot produce a native executable owner.
-        if let Some(manifest) = spec.additional_manifest() {
+        for (is_cohort, manifest) in [
+            (false, spec.additional_manifest()),
+            (true, spec.pilot_cohort()),
+        ] {
+            let Some(manifest) = manifest else { continue };
             let manifest = pin(&pins, manifest)?;
             let mut file = manifest
                 .file
@@ -808,7 +818,11 @@ pub(crate) mod linux {
                     "CUDA bundle manifest exceeds 64KiB".into(),
                 ));
             }
-            spec.validate_additional_manifest(&bytes)?;
+            if is_cohort {
+                spec.validate_pilot_cohort(&bytes)?;
+            } else {
+                spec.validate_additional_manifest(&bytes)?;
+            }
         }
         if let Some(bundle) = &bundle_directory {
             readable_directory_pin(bundle)?
@@ -925,8 +939,8 @@ pub(crate) mod linux {
         if input.runner.source_url != crate::FASTCHESS_SOURCE_URL
             || input.runner.source_commit != crate::FASTCHESS_SOURCE_COMMIT
             || input.runner.version != crate::FASTCHESS_VERSION
-            || input.runner.dirty
-            || input.runner.dirty_patch.is_some()
+            || (matches!(input.clock, rz_experiments::NativePairClock::Movetime(_))
+                && (input.runner.dirty || input.runner.dirty_patch.is_some()))
         {
             return Err(ArenaError::Invalid(
                 "unsupported or dirty native integration Fastchess".into(),
@@ -1012,11 +1026,18 @@ pub(crate) mod linux {
         args.extend([
             "-each".into(),
             "proto=uci".into(),
-            format!(
-                "st={}.{:03}",
-                input.clock.movetime_ms / 1000,
-                input.clock.movetime_ms % 1000
-            )
+            match input.clock {
+                rz_experiments::NativePairClock::Movetime(c) => {
+                    format!("st={}.{:03}", c.movetime_ms / 1000, c.movetime_ms % 1000)
+                }
+                rz_experiments::NativePairClock::Game(c) => format!(
+                    "tc={}.{:03}+{}.{:03}",
+                    c.base_ms / 1000,
+                    c.base_ms % 1000,
+                    c.increment_ms / 1000,
+                    c.increment_ms % 1000
+                ),
+            }
             .into(),
             "restart=on".into(),
             "timemargin=0".into(),
@@ -1078,6 +1099,11 @@ pub(crate) mod linux {
             "{} NN integration only; execution_ready=false; strength_eligible=false; same weights and search in both roles",
             spec.provider_name()
         );
+        if matches!(input.clock, rz_experiments::NativePairClock::Game(_)) {
+            limitations[0] = "CUDA S0/S1 pilot only; execution_ready=false; strength_eligible=false; same weights/runtime/binary; only final selection differs".into();
+            limitations[3] = "Pinned clock patch measures position transmission through bestmove with steady_clock, charges partial milliseconds and earns increment only after a timely move; the 100ms read margin is not chess time".into();
+            limitations[4] = "Fastchess automatic draw claims require independent A current-position evidence; cutoff remains Incomplete, engine failures remain Loss and stop a broken pilot gate".into();
+        }
         if spec.provider_name() == "CUDA" {
             limitations.push("CUDA device0/FP32/TF32off/selected arena is requested admission metadata, not measured VRAM, aggregate GPU allocation or a kernel-enforced hard cap".into());
         }
