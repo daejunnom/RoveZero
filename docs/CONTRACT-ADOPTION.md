@@ -551,3 +551,23 @@ integration false/scored 0을 보존한다. 등록된 16쌍에서 미완료 10�
 provider/session·clock·A 재생 결과는 별도 증거다. 문서 커밋의 source 영향 없음 확인은
 develop의 consumer 검사를 대체하지 않는다. 최신 integration SHA에서 위 접점을 다시
 수동 정합하며 Draft/execution_ready/strength_eligible false를 유지한다.
+
+## 17. E V3 2분+1초 시계와 PGN 진단 연결
+
+사용자 지시에 따라 총괄은 같은 BT4·FP32·No·B1·cap 4096의 S0/S1을 경기 전체
+120초+착수당 1초로 실행한다. 16쌍·32판과 전체 최대 120분을 사용하며 이전 30초+0.1초
+시도와 표본을 합치지 않는다. 같은 opening cohort를 다시 쓰므로 새 미관측 holdout으로
+표시하지 않는다. CCRL Blitz의 시간 형식만 참조하며 기준 CPU 보정이나 공식 rating은 없다.
+
+V3 clock은 호출자가 고른 양의 피셔 시계를 받는다. 두 고정 시계의 whitelist는 제거하고
+유한 pair wall의 checked 계산을 유지한다. PGN TimeControl 누락·차이는
+`NativePilotClockAudit.pgn_time_control_warnings`에 보존하며 실행·인수 거부 조건으로
+쓰지 않는다. `expected_pgn_time_control`은 실제 clock에서 만든 진단 값이다.
+실제 searched ply 차감·제시간 증분·게임 초기화·역할과 색의 trace 대조는 계속 수행한다.
+공통 계약 revision 0.1과 V1/V2는 유지하며 이 필드는 V3 결과 진단의 추가다.
+
+총괄은 E clock → Fastchess `tc=120.000+1.000` argv → actual parent trace → A PGN과
+B search-config/물리 종료 receipt를 수동 대조한다. raw White/Black의 RoveZero·BT4·S0/S1
+ID를 유지하고 검토용 SAN 사본에 색별 program type·binary/model/source identity를 넣는다.
+develop 인수 시 최신 head에서 선언·실제 소비자·동일 integration SHA를 다시 대조한다.
+실행 중인 대국은 완료된 강도 인수로 기록하지 않는다.

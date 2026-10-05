@@ -1214,3 +1214,23 @@ Windows 가용 RAM 최저 10.50 MiB·128 MiB 미만 4개 표본을 관측했다.
 호스트 RAM 압박 해결이나 물리 VRAM 원인 확정의 근거가 아니다. 예산 만료 뒤 약 4.89초의
 owned 종료·회수로 모든 PID가 종료됐고 마지막 device memory/utilization은 0/0이었다.
 최종 범위·자원 관측·PGN·실패 ZIP은 위 pilot 기록과 외부 reports에 보존한다.
+
+## E V3 2분+1초 로컬 blitz 실행 — 2026-10-05
+
+사용자 후속 요청으로 source `73bb7f3`에서 새 S0/S1 paired pilot을 시작했다.
+경기 전체 120초+착수당 1초, 같은 BT4·FP32·No·B1·cap 4096·PUCT를 사용한다.
+16쌍·32판, 256 ply, 전체 최대 120분이며 알려진 동일 16 opening을 다시 사용한다.
+CCRL Blitz의 시간 형식만 참조하며 공식 CPU 보정·등록·rating을 수행한 결과가 아니다.
+기존 30초+0.1초 시도와 점수나 표본을 합치지 않는다.
+
+PGN TimeControl 차이로 실행을 막는 조건과 두 고정 시계의 whitelist를 제거했다.
+차이는 V3 clock audit의 진단에 남기고 실제 매 착수 시계·증분·초기화·색 배정을 관측한다.
+raw engine ID에 RoveZero·BT4-it332·S0/S1을 명시한다. NN binary SHA는 `a46e941c…`,
+C backend는 이전 수치 검사와 같고 새 arena SHA는 `2491dd2e…`다. 결과 진단 변경을
+새 탐색 정책이나 모델 변경으로 보고하지 않는다.
+
+현재 source에서 native_cuda 22개·arena all-feature/all-target 146개가 통과했고
+arena GPU 전용 14개는 해당 CPU 검사에서 ignored다. fmt·strict workspace Clippy·release
+빌드는 통과했다. [source 73bb7f3의 CI](https://github.com/daejunnom/RoveZero/actions/runs/37290127676)는
+Windows/Ubuntu 두 job SUCCESS를 관측했다. 실제 GPU 대국과 호스트 RAM/commit 관측은 진행 중이며 완료 결과는
+[pilot 기록](research/BT4-FINAL-SELECTION-PILOT.md)에 추가한다. #20은 Draft다.
