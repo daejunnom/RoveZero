@@ -529,14 +529,13 @@ pub(crate) mod linux {
     }
     pub(crate) fn readonly_copy(
         artifact: &ArtifactRef,
-        source_root: &Path,
+        mut source: File,
         directory: &Dir,
         relative: &str,
         absolute: PathBuf,
         executable: bool,
         max_bytes: u64,
     ) -> Result<(InputPin, NativeSnapshotReceipt), ArenaError> {
-        let mut source = artifact.open_verified(source_root, max_bytes)?;
         let source_metadata = source
             .metadata()
             .map_err(|_| io("cannot inspect verified source inode"))?;
@@ -692,11 +691,13 @@ pub(crate) mod linux {
                 ));
             }
         }
-        // Verify every source before creating the attempt; subsequently copied
-        // bytes are hashed again, so same-inode writes cannot publish torn input.
-        for artifact in unique.values() {
-            drop(artifact.open_verified(source_root, input.budget.max_input_bytes)?);
-        }
+        // Verify every source before creating the attempt and keep those exact,
+        // rewound handles for copying instead of reopening and hashing again.
+        // The copy stream is still hashed, so same-inode writes fail closed.
+        let sources = unique
+            .values()
+            .map(|artifact| artifact.open_verified(source_root, input.budget.max_input_bytes))
+            .collect::<Result<Vec<_>, _>>()?;
         let root_path = outside_git(output_root)?;
         let root = Dir::open_ambient_dir(&root_path, cap_std::ambient_authority())
             .map_err(|_| io("cannot pin native output root"))?;
@@ -742,7 +743,7 @@ pub(crate) mod linux {
         };
         let mut pins = Vec::new();
         let mut receipts = Vec::new();
-        for (index, artifact) in unique.values().enumerate() {
+        for (index, (artifact, source)) in unique.values().zip(sources).enumerate() {
             let bundle_name = cuda_bundle.and_then(|bundle| {
                 if &bundle.manifest == artifact {
                     Some("bundle.v1.json")
@@ -780,7 +781,7 @@ pub(crate) mod linux {
             };
             let (pin, receipt) = readonly_copy(
                 artifact,
-                source_root,
+                source,
                 destination.0,
                 destination.1,
                 path.join("inputs").join(&name),
@@ -1117,5 +1118,66 @@ pub(crate) mod linux {
             limitations.push("CUDA device0/FP32/TF32off/selected arena is requested admission metadata, not measured VRAM, aggregate GPU allocation or a kernel-enforced hard cap".into());
         }
         Ok(FastchessInvocation { args, limitations })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn verified_source_pin_survives_path_replacement_and_rejects_same_inode_writes() {
+            let base = std::env::temp_dir()
+                .join(format!("rovezero-verified-copy-pin-{}", std::process::id()));
+            std::fs::create_dir(&base).expect("exclusive synthetic test directory");
+            let source = base.join("source");
+            let output = base.join("output");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::create_dir(&output).unwrap();
+            std::fs::write(source.join("input"), b"original").unwrap();
+            std::fs::hard_link(source.join("input"), source.join("alias")).unwrap();
+            let artifact = ArtifactRef {
+                path: "input".into(),
+                sha256: format!("{:x}", Sha256::digest(b"original")),
+                bytes: 8,
+                source: "https://example.org/synthetic-copy-pin".into(),
+                license: "Synthetic ownership fixture only".into(),
+            };
+            let original = artifact.open_verified(&source, 8).unwrap();
+            let mutation_probe = artifact.open_verified(&source, 8).unwrap();
+            std::fs::rename(source.join("input"), source.join("renamed")).unwrap();
+            std::fs::write(source.join("input"), b"replaced").unwrap();
+            let directory = Dir::open_ambient_dir(&output, cap_std::ambient_authority()).unwrap();
+            let (pin, receipt) = readonly_copy(
+                &artifact,
+                original,
+                &directory,
+                "valid",
+                output.join("valid"),
+                false,
+                8,
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(&pin.path).unwrap(), b"original");
+            assert!(receipt.distinct_source_inode && receipt.closed_writer_read_only);
+            drop(pin);
+
+            // Identical length through another name of the pinned inode must
+            // still fail the copy-stream digest, without publishing an InputPin.
+            std::fs::write(source.join("alias"), b"mutated!").unwrap();
+            let result = readonly_copy(
+                &artifact,
+                mutation_probe,
+                &directory,
+                "rejected",
+                output.join("rejected"),
+                false,
+                8,
+            );
+            assert!(matches!(result, Err(ArenaError::Integrity(_))));
+            assert_eq!(std::fs::read(output.join("valid")).unwrap(), b"original");
+            drop(directory);
+            // This exclusive synthetic tree never owned a child or NN runtime.
+            std::fs::remove_dir_all(base).unwrap();
+        }
     }
 }
