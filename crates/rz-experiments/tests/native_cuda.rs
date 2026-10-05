@@ -639,3 +639,158 @@ fn full_export_envelope_must_fit_even_if_embedded_input_and_canonical_payload_fi
     assert!(near_cap.validate().is_ok());
     code(near_cap.lock().unwrap_err(), "NativePayloadLimit");
 }
+
+fn bt4_fixture() -> CudaIntegrationPairSpecV2 {
+    let mut value = serde_json::to_value(fixture()).unwrap();
+    value["schema_version"] = json!(2);
+    for engine in value["engines"].as_array_mut().unwrap() {
+        let profile = NativeCudaProfileV2::fixed("c".repeat(64), "d".repeat(64));
+        engine["profile"] = serde_json::to_value(profile).unwrap();
+        for binding in engine["artifacts"].as_array_mut().unwrap() {
+            match binding["role"].as_str().unwrap() {
+                "source_weights" => {
+                    binding["artifact"]["sha256"] = json!(BT4_NATIVE_SOURCE_SHA256);
+                    binding["artifact"]["bytes"] = json!(BT4_NATIVE_SOURCE_BYTES);
+                }
+                "onnx" => binding["artifact"]["bytes"] = json!(741_000_000_u64),
+                _ => (),
+            }
+        }
+    }
+    value["budget"]["max_input_bytes"] = json!(2 * 1024 * 1024 * 1024_u64);
+    value["budget"]["max_runtime_bytes"] = json!(19 * 1024 * 1024_u64);
+    value["budget"]["max_artifact_bytes"] = json!(3 * 1024 * 1024 * 1024_u64);
+    CudaIntegrationPairSpecV2::from_json(&value.to_string()).unwrap()
+}
+
+#[test]
+fn bt4_v2_has_separate_closed_wire_and_lock_domains() {
+    let spec = bt4_fixture();
+    let lock = spec.clone().lock().unwrap();
+    let wire = lock.to_json().unwrap();
+    assert_eq!(
+        LockedCudaIntegrationPairSpecV2::from_json(&wire)
+            .unwrap()
+            .sha256(),
+        lock.sha256()
+    );
+    assert!(LockedCudaIntegrationPairSpecV1::from_json(&wire).is_err());
+    assert!(CudaIntegrationPairSpecV1::from_json(&serde_json::to_string(&spec).unwrap()).is_err());
+    assert!(
+        LockedCudaIntegrationPairSpecV2::from_json(&fixture().lock().unwrap().to_json().unwrap())
+            .is_err()
+    );
+    let mut envelope: Value = serde_json::from_str(&wire).unwrap();
+    assert_eq!(envelope["domain"], CUDA_NATIVE_LAUNCH_V2_DOMAIN);
+    assert_eq!(envelope["execution_ready"], false);
+    envelope["input"]["engines"][0]["profile"]["search"]["simulations"] = json!(128);
+    envelope["input"]["engines"][1]["profile"]["search"]["simulations"] = json!(128);
+    code(
+        LockedCudaIntegrationPairSpecV2::from_json(&envelope.to_string()).unwrap_err(),
+        "NativeLockDigestMismatch",
+    );
+}
+
+#[test]
+fn bt4_identity_and_bounds_do_not_relax_maia_v1() {
+    assert_eq!(NativeArtifactRole::Onnx.byte_limit(), 16 * 1024 * 1024);
+    assert_eq!(
+        NativeArtifactRole::SourceWeights.byte_limit(),
+        4 * 1024 * 1024
+    );
+    let mut engine = bt4_fixture().engines[0].clone();
+    let source = engine
+        .artifacts
+        .iter_mut()
+        .find(|a| a.role == NativeArtifactRole::SourceWeights)
+        .unwrap();
+    source.artifact.sha256 = "a".repeat(64);
+    code(
+        engine.validate().unwrap_err(),
+        "NativeModelIdentityMismatch",
+    );
+    let mut engine = bt4_fixture().engines[0].clone();
+    let onnx = engine
+        .artifacts
+        .iter_mut()
+        .find(|a| a.role == NativeArtifactRole::Onnx)
+        .unwrap();
+    onnx.artifact.bytes = BT4_NATIVE_ONNX_LIMIT;
+    assert!(engine.validate().is_ok());
+    engine
+        .artifacts
+        .iter_mut()
+        .find(|a| a.role == NativeArtifactRole::Onnx)
+        .unwrap()
+        .artifact
+        .bytes += 1;
+    code(engine.validate().unwrap_err(), "ArtifactRoleBudget");
+}
+
+#[test]
+fn bt4_v2_search_runtime_and_a_a_identity_are_locked() {
+    for (pointer, value, expected) in [
+        (
+            "/engines/0/profile/runtime/arena_bytes",
+            json!(CUDA_NATIVE_ARENA_BYTES),
+            "UnsupportedNativeProfile",
+        ),
+        (
+            "/engines/0/profile/runtime/batch_size",
+            json!(16),
+            "UnsupportedNativeProfile",
+        ),
+        (
+            "/engines/0/profile/search/simulations",
+            json!(4097),
+            "UnsupportedNativeSearch",
+        ),
+        (
+            "/engines/0/profile/search/simulations",
+            json!(0),
+            "UnsupportedNativeSearch",
+        ),
+        (
+            "/engines/0/profile/search/policy_temperature_milli",
+            json!(800),
+            "UnsupportedNativeSearch",
+        ),
+        (
+            "/engines/0/profile/search/raw_cache",
+            json!(true),
+            "UnsupportedNativeSearch",
+        ),
+        (
+            "/engines/0/profile/search/final_selection",
+            json!("exact_terminal"),
+            "IntegrationInputMismatch",
+        ),
+    ] {
+        let mut spec = serde_json::to_value(bt4_fixture()).unwrap();
+        *spec.pointer_mut(pointer).unwrap() = value;
+        code(
+            CudaIntegrationPairSpecV2::from_json(&spec.to_string()).unwrap_err(),
+            expected,
+        );
+    }
+    let mut spec = bt4_fixture();
+    for engine in &mut spec.engines {
+        engine.profile.search.final_selection = NativeFinalSelectionV2::ExactTerminal;
+    }
+    assert!(spec.lock().is_ok());
+}
+
+#[test]
+fn bt4_shared_storage_reservation_covers_four_three_file_receipt_sets() {
+    let mut spec = bt4_fixture();
+    assert_eq!(spec.budget.max_runtime_bytes, 19 * 1024 * 1024);
+    assert!(spec.clone().lock().is_ok());
+    spec.budget.max_runtime_bytes -= 1;
+    code(spec.validate().unwrap_err(), "CudaRuntimeReservation");
+    let mut value = serde_json::to_value(bt4_fixture()).unwrap();
+    value["engines"][0]["profile"]["arbitrary_option"] = json!(true);
+    assert!(matches!(
+        CudaIntegrationPairSpecV2::from_json(&value.to_string()),
+        Err(ManifestError::Parse(_))
+    ));
+}

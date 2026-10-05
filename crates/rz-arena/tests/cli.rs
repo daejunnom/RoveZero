@@ -43,6 +43,10 @@ fn cuda_cli_requires_exact_paths_before_assets_and_exposes_integration_only_help
     assert!(help.status.success());
     let text = String::from_utf8(help.stdout).unwrap();
     assert!(text.contains("native-cuda-lock INPUT OUTPUT"));
+    assert!(text.contains("native-cuda-v2-lock INPUT OUTPUT"));
+    assert!(
+        text.contains("native-cuda-v2-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME")
+    );
     assert!(text.contains("native-cuda-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME"));
     assert!(text.contains("strength_eligible=false"));
 }

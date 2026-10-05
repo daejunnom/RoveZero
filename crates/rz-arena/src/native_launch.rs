@@ -52,6 +52,7 @@ pub struct NativeEngineView<'a> {
     pub engine_id: &'a str,
     pub artifacts: &'a [rz_experiments::NativeArtifactBinding],
     pub cuda_bundle: Option<&'a rz_experiments::CudaBundleBindingV1>,
+    pub search: Option<rz_experiments::NativeCudaSearchV2>,
 }
 impl NativeEngineView<'_> {
     pub fn artifact(
@@ -117,6 +118,7 @@ impl NativeLaunchDeclaration for LockedIntegrationPairSpecV1 {
             engine_id: &engine.engine_id,
             artifacts: &engine.artifacts,
             cuda_bundle: None,
+            search: None,
         })
     }
     fn provider_name(&self) -> &'static str {
@@ -991,6 +993,10 @@ pub(crate) mod linux {
                 )?);
                 tokens.push(format!("--cuda-bundle-sha256={}", bundle.manifest.sha256).into());
             }
+            if let Some(search) = engine.search {
+                tokens.push(format!("--search-simulations={}", search.simulations).into());
+                tokens.push(format!("--final-selection={}", search.final_selection.cli()).into());
+            }
             args.extend([
                 OsString::from("-engine"),
                 key_path("cmd=", &binary.path)?,
@@ -1070,7 +1076,7 @@ pub(crate) mod linux {
             spec.provider_name()
         );
         if spec.provider_name() == "CUDA" {
-            limitations.push("CUDA device0/FP32/TF32off/1GiB arena is requested admission metadata, not measured VRAM, aggregate GPU allocation or a kernel-enforced hard cap".into());
+            limitations.push("CUDA device0/FP32/TF32off/selected arena is requested admission metadata, not measured VRAM, aggregate GPU allocation or a kernel-enforced hard cap".into());
         }
         Ok(FastchessInvocation { args, limitations })
     }

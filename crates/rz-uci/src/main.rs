@@ -162,6 +162,13 @@ fn run_cuda(config: NativeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let startup = if let Some(writer) = receipts.as_mut() {
         let startup = CudaStartupReceiptV1::capture(&factory, &clock)?;
         writer.startup(&startup)?;
+        // Capture the exact settings subsequently served. Experimental paths
+        // do not issue this fixed-profile attestation (factory guard above).
+        let search = rz_uci::native_cuda_attestation::CudaSearchReceiptV1::capture(
+            &startup,
+            &config.engine_settings(),
+        )?;
+        writer.search_config(&search)?;
         Some(startup)
     } else {
         None

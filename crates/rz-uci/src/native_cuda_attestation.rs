@@ -27,6 +27,65 @@ use sha2::{Digest as _, Sha256};
 pub const STARTUP_FILE: &str = "native-cuda-startup.v1.json";
 pub const TERMINATION_FILE: &str = "native-cuda-termination.v1.json";
 pub const SCHEMA_VERSION: u32 = 1;
+pub const SEARCH_FILE: &str = "native-cuda-search-config.v1.json";
+
+/// Separate additive search record; provider V1's closed field set is retained.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CudaSearchReceiptV1 {
+    pub schema_version: u32,
+    pub kind: String,
+    pub process_run_id: String,
+    pub startup_sha256: String,
+    pub simulations: u64,
+    pub final_selection: String,
+    pub policy_temperature_milli: u32,
+    pub raw_cache: bool,
+    pub batch_size: u32,
+    pub search_workers: usize,
+    pub output_margin_ms: u64,
+    pub drain_margin_ms: u64,
+    pub shutdown_ms: u64,
+    pub max_nodes: usize,
+    pub max_edges: usize,
+    pub max_depth: usize,
+    pub scope: String,
+}
+impl CudaSearchReceiptV1 {
+    pub fn capture(
+        startup: &CudaStartupReceiptV1,
+        settings: &crate::engine::EngineSettings,
+    ) -> Result<Self, AttestationError> {
+        let startup_bytes = native_attestation::bounded_json(startup)?;
+        let milliseconds = |duration: std::time::Duration| {
+            u64::try_from(duration.as_millis())
+                .map_err(|_| AttestationError::boundary("search duration exceeds receipt range"))
+        };
+        Ok(Self {
+            schema_version: 1,
+            kind: "search_config".into(),
+            process_run_id: startup.process_run_id.clone(),
+            startup_sha256: native_attestation::hex(&Sha256::digest(startup_bytes).into()),
+            simulations: settings.search.max_simulations,
+            final_selection: match settings.final_move_policy {
+                rz_search::tree::FinalMovePolicy::Visits => "visits",
+                rz_search::tree::FinalMovePolicy::ExactTerminal => "exact-terminal",
+            }
+            .into(),
+            policy_temperature_milli: 1000,
+            raw_cache: false,
+            batch_size: 1,
+            search_workers: settings.max_workers,
+            output_margin_ms: milliseconds(settings.search.time_config.output_margin)?,
+            drain_margin_ms: milliseconds(settings.search.time_config.drain_margin)?,
+            shutdown_ms: milliseconds(settings.shutdown_limit)?,
+            max_nodes: settings.tree.max_nodes,
+            max_edges: settings.tree.max_edges,
+            max_depth: settings.tree.max_depth,
+            scope: "startup_config_bound_to_served_settings_not_per_move_timing_or_strength".into(),
+        })
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -501,6 +560,9 @@ impl CudaReceiptWriter {
     }
     pub fn startup(&mut self, receipt: &CudaStartupReceiptV1) -> Result<(), AttestationError> {
         self.0.publish_startup(receipt)
+    }
+    pub fn search_config(&self, receipt: &CudaSearchReceiptV1) -> Result<(), AttestationError> {
+        self.0.publish_auxiliary(SEARCH_FILE, receipt)
     }
     pub fn termination(
         &mut self,

@@ -430,7 +430,7 @@ pub(crate) mod linux {
             })?;
         Ok(artifact(owner, name, bytes))
     }
-    fn read_file(directory: &Dir, name: &str, cap: u64) -> Result<Vec<u8>, ArenaError> {
+    pub(crate) fn read_file(directory: &Dir, name: &str, cap: u64) -> Result<Vec<u8>, ArenaError> {
         let mut options = OpenOptions::new();
         options
             .read(true)

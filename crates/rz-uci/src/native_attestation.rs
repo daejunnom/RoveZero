@@ -571,7 +571,7 @@ impl Write for BoundedJson {
         Ok(())
     }
 }
-fn bounded_json(value: &impl Serialize) -> Result<Vec<u8>, AttestationError> {
+pub(crate) fn bounded_json(value: &impl Serialize) -> Result<Vec<u8>, AttestationError> {
     let mut writer = BoundedJson { bytes: Vec::new() };
     writer
         .bytes
@@ -695,6 +695,31 @@ impl ReceiptWriter {
         self.startup_written = true;
         Ok(())
     }
+    pub(crate) fn publish_auxiliary(
+        &self,
+        name: &'static str,
+        receipt: &impl Serialize,
+    ) -> Result<(), AttestationError> {
+        if !self.startup_written {
+            return Err(AttestationError::boundary(
+                "auxiliary receipt requires issued startup",
+            ));
+        }
+        let bytes = bounded_json(receipt)?;
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let mut file = self
+            ._directory
+            .open_with(name, &options)
+            .map_err(|e| AttestationError::io("reserve auxiliary receipt", e))?;
+        file.write_all(&bytes)
+            .map_err(|e| AttestationError::io("write auxiliary receipt", e))?;
+        file.sync_all()
+            .map_err(|e| AttestationError::io("sync auxiliary receipt", e))
+    }
     pub fn termination(&mut self, receipt: &TerminationReceiptV1) -> Result<(), AttestationError> {
         self.publish_termination(receipt)
     }
@@ -812,6 +837,27 @@ mod tests {
         fs::create_dir(&path).unwrap();
         let directory = Dir::open_ambient_dir(&path, ambient_authority()).unwrap();
         (path, directory)
+    }
+
+    #[test]
+    fn auxiliary_receipt_requires_startup_and_refuses_overwrite() {
+        let (path, directory) = directory();
+        let mut writer = ReceiptWriter::from_directory(directory).unwrap();
+        assert!(writer.publish_auxiliary("search.json", &"config").is_err());
+        writer.publish_startup(&"startup").unwrap();
+        writer.publish_auxiliary("search.json", &"config").unwrap();
+        let original = fs::read(path.join("search.json")).unwrap();
+        assert!(
+            writer
+                .publish_auxiliary("search.json", &"replacement")
+                .is_err()
+        );
+        assert_eq!(fs::read(path.join("search.json")).unwrap(), original);
+        drop(writer);
+        for name in [STARTUP_FILE, TERMINATION_FILE, "search.json"] {
+            fs::remove_file(path.join(name)).unwrap();
+        }
+        fs::remove_dir(path).unwrap();
     }
 
     #[test]

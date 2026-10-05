@@ -12,7 +12,7 @@ use crate::{
     NativeHistoryFill, NativeMovetimeV1, NativePrecision, NativeTimeoutsV1, OpeningSpec,
     ToolIdentity, Violation, decode_json, digest,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -325,6 +325,9 @@ impl NativeCudaProfileV1 {
     }
 
     pub fn validate(&self) -> Result<(), ManifestError> {
+        self.validate_arena(CUDA_NATIVE_ARENA_BYTES)
+    }
+    pub(crate) fn validate_arena(&self, arena_bytes: u64) -> Result<(), ManifestError> {
         require(
             self.batch_size == 1
                 && self.intra_threads == 1
@@ -332,11 +335,11 @@ impl NativeCudaProfileV1 {
                 && self.fresh_only
                 && self.full_steps == 1
                 && self.device_id == 0
-                && self.arena_bytes == CUDA_NATIVE_ARENA_BYTES
+                && self.arena_bytes == arena_bytes
                 && !self.tf32,
             "profile",
             "UnsupportedNativeProfile",
-            "requires CUDA ONNX device=0 arena=1GiB tf32=false FP32 batch=1 intra_threads=1 worker=1 fresh full_steps=1 history-fill No",
+            "requires the selected CUDA ONNX arena, device=0 tf32=false FP32 batch=1 intra_threads=1 worker=1 fresh full_steps=1 history-fill No",
         )?;
         hash(
             &self.expected_backend_sha256,
@@ -354,17 +357,17 @@ impl NativeCudaProfileV1 {
 /// Fixed supported launch recipe. There is no arbitrary argv or UCI option map.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct CudaNativeLaunchSpecV1 {
+pub struct CudaNativeLaunchSpec<P> {
     pub role: NativeEngineRole,
     pub engine_id: String,
     pub source_commit: String,
     pub target: String,
     pub artifacts: Vec<NativeArtifactBinding>,
-    pub profile: NativeCudaProfileV1,
+    pub profile: P,
     pub cuda_bundle: CudaBundleBindingV1,
 }
 
-impl CudaNativeLaunchSpecV1 {
+impl<P: CudaLaunchProfile> CudaNativeLaunchSpec<P> {
     pub fn artifact(&self, role: NativeArtifactRole) -> Result<&ArtifactRef, ManifestError> {
         let mut found = self.artifacts.iter().filter(|binding| binding.role == role);
         let first = found.next().ok_or_else(|| {
@@ -407,7 +410,7 @@ impl CudaNativeLaunchSpecV1 {
         id(&self.engine_id, "engine_id")?;
         hash(&self.source_commit, 40, "source_commit")?;
         text(&self.target, 128, "target")?;
-        self.profile.validate()?;
+        self.profile.validate_profile()?;
         self.cuda_bundle.validate()?;
         require(
             self.artifacts.len() == NativeArtifactRole::ALL.len(),
@@ -426,12 +429,7 @@ impl CudaNativeLaunchSpecV1 {
             )?;
             binding.artifact.validate()?;
             require(
-                binding.artifact.bytes
-                    <= if binding.role == NativeArtifactRole::OrtLibrary {
-                        CUDA_BUNDLE_FILE_MAX_BYTES
-                    } else {
-                        binding.role.byte_limit()
-                    },
+                binding.artifact.bytes <= P::artifact_limit(binding.role),
                 "artifacts.bytes",
                 "ArtifactRoleBudget",
                 "native artifact exceeds its role byte ceiling",
@@ -443,6 +441,8 @@ impl CudaNativeLaunchSpecV1 {
                 "different native roles must not alias one logical file",
             )?;
         }
+        self.profile
+            .validate_model(self.artifact(NativeArtifactRole::SourceWeights)?)?;
         let core = self
             .cuda_bundle
             .file(CudaBundleFileRoleV1::Core, "libonnxruntime.so.1.22.0")?;
@@ -494,14 +494,14 @@ pub struct NativeCudaResourceBudgetV1 {
 /// One pair, exactly two games, no retries and no strength interpretation.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct CudaIntegrationPairSpecV1 {
+pub struct CudaIntegrationPairSpec<P> {
     pub schema_version: u32,
     pub purpose: NativeCudaIntegrationPurpose,
     pub strength_eligible: bool,
     pub contract_revision: String,
     pub run_id: String,
     pub pair_id: String,
-    pub engines: [CudaNativeLaunchSpecV1; 2],
+    pub engines: [CudaNativeLaunchSpec<P>; 2],
     /// White's role in execution order; must contain each role exactly once.
     /// The board and the complete opening trace remain identical for both games.
     pub white_order: [NativeEngineRole; 2],
@@ -515,7 +515,7 @@ pub struct CudaIntegrationPairSpecV1 {
     pub budget: NativeCudaResourceBudgetV1,
 }
 
-impl CudaIntegrationPairSpecV1 {
+impl<P: CudaLaunchProfile> CudaIntegrationPairSpec<P> {
     pub fn from_json(input: &str) -> Result<Self, ManifestError> {
         bounded_json(input)?;
         let spec: Self = decode_json(input)?;
@@ -523,7 +523,10 @@ impl CudaIntegrationPairSpecV1 {
         Ok(spec)
     }
 
-    pub fn engine(&self, role: NativeEngineRole) -> Result<&CudaNativeLaunchSpecV1, ManifestError> {
+    pub fn engine(
+        &self,
+        role: NativeEngineRole,
+    ) -> Result<&CudaNativeLaunchSpec<P>, ManifestError> {
         let mut matches = self.engines.iter().filter(|engine| engine.role == role);
         let engine = matches.next().ok_or_else(|| {
             violation(
@@ -557,10 +560,10 @@ impl CudaIntegrationPairSpecV1 {
 
     pub fn validate(&self) -> Result<(), ManifestError> {
         require(
-            self.schema_version == CUDA_NATIVE_LAUNCH_SCHEMA_VERSION && !self.strength_eligible,
+            self.schema_version == P::VERSION && !self.strength_eligible,
             "schema_version",
             "UnsupportedIntegrationScope",
-            "only schema 1 integration-only strength=false is supported",
+            "only the selected schema integration-only strength=false is supported",
         )?;
         require(
             self.contract_revision == NATIVE_ENGINE_CONTRACT_REVISION,
@@ -653,7 +656,7 @@ impl CudaIntegrationPairSpecV1 {
         bounded_json(&serde_json::to_string(self).map_err(serialization_error)?)
     }
 
-    pub fn lock(mut self) -> Result<LockedCudaIntegrationPairSpecV1, ManifestError> {
+    pub fn lock(mut self) -> Result<LockedCudaIntegrationPairSpec<P>, ManifestError> {
         self.validate()?;
         // Native role order is semantically irrelevant; normalize it before hashing.
         self.engines.sort_by_key(|engine| engine.role);
@@ -665,7 +668,7 @@ impl CudaIntegrationPairSpecV1 {
                 .sort_by(|left, right| left.filename.cmp(&right.filename));
         }
         let sha256 = digest(&canonical_bytes(&self)?);
-        let locked = LockedCudaIntegrationPairSpecV1 {
+        let locked = LockedCudaIntegrationPairSpec {
             input: self,
             sha256,
         };
@@ -676,27 +679,27 @@ impl CudaIntegrationPairSpecV1 {
 }
 
 #[derive(Clone, Debug)]
-pub struct LockedCudaIntegrationPairSpecV1 {
-    input: CudaIntegrationPairSpecV1,
+pub struct LockedCudaIntegrationPairSpec<P> {
+    input: CudaIntegrationPairSpec<P>,
     sha256: String,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NativeLockEnvelopeV1 {
+struct NativeLockEnvelope<P> {
     lock_version: u32,
     domain: String,
     canonicalization: String,
     execution_ready: bool,
     input_sha256: String,
-    input: CudaIntegrationPairSpecV1,
+    input: CudaIntegrationPairSpec<P>,
 }
 
-impl LockedCudaIntegrationPairSpecV1 {
-    pub fn input(&self) -> &CudaIntegrationPairSpecV1 {
+impl<P: CudaLaunchProfile> LockedCudaIntegrationPairSpec<P> {
+    pub fn input(&self) -> &CudaIntegrationPairSpec<P> {
         &self.input
     }
-    pub fn spec(&self) -> &CudaIntegrationPairSpecV1 {
+    pub fn spec(&self) -> &CudaIntegrationPairSpec<P> {
         &self.input
     }
     pub fn sha256(&self) -> &str {
@@ -710,10 +713,10 @@ impl LockedCudaIntegrationPairSpecV1 {
     }
 
     pub fn to_json(&self) -> Result<String, ManifestError> {
-        let json = serde_json::to_string(&NativeLockEnvelopeV1 {
+        let json = serde_json::to_string(&NativeLockEnvelope {
             lock_version: 1,
-            domain: CUDA_NATIVE_LAUNCH_DOMAIN.into(),
-            canonicalization: CUDA_NATIVE_LAUNCH_CANONICALIZATION.into(),
+            domain: P::DOMAIN.into(),
+            canonicalization: P::CANONICALIZATION.into(),
             execution_ready: false,
             input_sha256: self.sha256.clone(),
             input: self.input.clone(),
@@ -725,11 +728,11 @@ impl LockedCudaIntegrationPairSpecV1 {
 
     pub fn from_json(input: &str) -> Result<Self, ManifestError> {
         bounded_json(input)?;
-        let envelope: NativeLockEnvelopeV1 = decode_json(input)?;
+        let envelope: NativeLockEnvelope<P> = decode_json(input)?;
         require(
             envelope.lock_version == 1
-                && envelope.domain == CUDA_NATIVE_LAUNCH_DOMAIN
-                && envelope.canonicalization == CUDA_NATIVE_LAUNCH_CANONICALIZATION
+                && envelope.domain == P::DOMAIN
+                && envelope.canonicalization == P::CANONICALIZATION
                 && !envelope.execution_ready,
             "lock",
             "UnsupportedNativeLock",
@@ -747,9 +750,11 @@ impl LockedCudaIntegrationPairSpecV1 {
     }
 }
 
-fn canonical_bytes(input: &CudaIntegrationPairSpecV1) -> Result<Vec<u8>, ManifestError> {
-    let mut value = serde_json::json!({"domain": CUDA_NATIVE_LAUNCH_DOMAIN,
-        "schema_version": CUDA_NATIVE_LAUNCH_SCHEMA_VERSION, "execution_ready": false, "input": input});
+fn canonical_bytes<P: CudaLaunchProfile>(
+    input: &CudaIntegrationPairSpec<P>,
+) -> Result<Vec<u8>, ManifestError> {
+    let mut value = serde_json::json!({"domain": P::DOMAIN,
+        "schema_version": P::VERSION, "execution_ready": false, "input": input});
     value.sort_all_objects();
     let bytes = serde_json::to_vec(&value).map_err(serialization_error)?;
     require(
@@ -787,7 +792,10 @@ fn unique_input_bytes(artifacts: Vec<&ArtifactRef>) -> Result<u64, ManifestError
     })
 }
 
-fn validate_budgets(input: &CudaIntegrationPairSpecV1, bytes: u64) -> Result<(), ManifestError> {
+fn validate_budgets<P: CudaLaunchProfile>(
+    input: &CudaIntegrationPairSpec<P>,
+    bytes: u64,
+) -> Result<(), ManifestError> {
     let timeouts = input.timeouts;
     for (name, value) in [
         ("startup_ms", timeouts.startup_ms),
@@ -846,12 +854,16 @@ fn validate_budgets(input: &CudaIntegrationPairSpecV1, bytes: u64) -> Result<(),
         .engine(NativeEngineRole::Baseline)?
         .cuda_bundle
         .total_bytes()?;
-    let runtime_reservation = bundle_bytes
+    let runtime_reservation = (if P::VERSION == 1 { bundle_bytes } else { 0 })
         .checked_mul(CUDA_PROCESS_START_RESERVATIONS)
         .and_then(|bytes| {
             bytes.checked_add(
                 (CUDA_PLACEMENT_TRACE_RESERVE_PER_PROCESS_BYTES
-                    + CUDA_RECEIPT_RESERVE_PER_PROCESS_BYTES)
+                    + if P::VERSION == 1 {
+                        CUDA_RECEIPT_RESERVE_PER_PROCESS_BYTES
+                    } else {
+                        768 * 1024
+                    })
                     * CUDA_PROCESS_START_RESERVATIONS,
             )
         })
@@ -866,7 +878,7 @@ fn validate_budgets(input: &CudaIntegrationPairSpecV1, bytes: u64) -> Result<(),
         budget.max_runtime_bytes >= runtime_reservation,
         "budget.max_runtime_bytes",
         "CudaRuntimeReservation",
-        "runtime tree must reserve four complete CUDA bundle copies, four 4MiB placement traces and four 512KiB receipt allowances for process restarts",
+        "runtime tree must reserve the selected storage policy, four 4MiB placement traces and four 512KiB receipt allowances",
     )?;
     require(
         (3..=16).contains(&budget.max_child_processes)
@@ -1019,3 +1031,54 @@ fn hash(value: &str, length: usize, path: &str) -> Result<(), ManifestError> {
         "requires a nonzero lowercase hexadecimal digest of the exact length",
     )
 }
+
+pub(crate) mod profile_sealed {
+    pub trait Sealed {}
+}
+/// Closed profiles share ownership/locking algorithms. Only V1 and V2 exist;
+/// arbitrary profiles cannot widen budgets or substitute a wire domain.
+pub trait CudaLaunchProfile:
+    profile_sealed::Sealed
+    + Clone
+    + std::fmt::Debug
+    + Eq
+    + Serialize
+    + DeserializeOwned
+    + Send
+    + 'static
+{
+    const VERSION: u32;
+    const DOMAIN: &'static str;
+    const CANONICALIZATION: &'static str;
+    fn validate_profile(&self) -> Result<(), ManifestError>;
+    fn runtime_profile(&self) -> &NativeCudaProfileV1;
+    fn search_options(&self) -> Option<crate::NativeCudaSearchV2> {
+        None
+    }
+    fn artifact_limit(role: NativeArtifactRole) -> u64;
+    fn validate_model(&self, _source: &ArtifactRef) -> Result<(), ManifestError> {
+        Ok(())
+    }
+}
+impl profile_sealed::Sealed for NativeCudaProfileV1 {}
+impl CudaLaunchProfile for NativeCudaProfileV1 {
+    const VERSION: u32 = CUDA_NATIVE_LAUNCH_SCHEMA_VERSION;
+    const DOMAIN: &'static str = CUDA_NATIVE_LAUNCH_DOMAIN;
+    const CANONICALIZATION: &'static str = CUDA_NATIVE_LAUNCH_CANONICALIZATION;
+    fn validate_profile(&self) -> Result<(), ManifestError> {
+        self.validate()
+    }
+    fn runtime_profile(&self) -> &NativeCudaProfileV1 {
+        self
+    }
+    fn artifact_limit(role: NativeArtifactRole) -> u64 {
+        if role == NativeArtifactRole::OrtLibrary {
+            CUDA_BUNDLE_FILE_MAX_BYTES
+        } else {
+            role.byte_limit()
+        }
+    }
+}
+pub type CudaNativeLaunchSpecV1 = CudaNativeLaunchSpec<NativeCudaProfileV1>;
+pub type CudaIntegrationPairSpecV1 = CudaIntegrationPairSpec<NativeCudaProfileV1>;
+pub type LockedCudaIntegrationPairSpecV1 = LockedCudaIntegrationPairSpec<NativeCudaProfileV1>;

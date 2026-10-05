@@ -8,12 +8,13 @@ use crate::{
     ArenaError, NativeLaunchOwner, NativePairFailure, NativePairOutput, NativePairReceipt,
     NativePreparationFailure,
 };
-#[cfg(target_os = "linux")]
-use rz_experiments::CudaNativeLaunchSpecV1;
 use rz_experiments::{
     ArtifactRef, CudaBundleFileRoleV1, LockedCudaIntegrationPairSpecV1, NativeEngineRole,
     NativeResourceBudgetV1,
 };
+use rz_experiments::{CudaLaunchProfile, LockedCudaIntegrationPairSpec};
+#[cfg(target_os = "linux")]
+use rz_experiments::CudaNativeLaunchSpec;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::atomic::AtomicBool};
 
@@ -156,8 +157,11 @@ fn cuda_exit_trace_message(line: &str) -> Option<&str> {
     Some(message)
 }
 
-impl crate::native_launch::sealed::Sealed for LockedCudaIntegrationPairSpecV1 {}
-impl NativeLaunchDeclaration for LockedCudaIntegrationPairSpecV1 {
+impl<P: CudaLaunchProfile> crate::native_launch::sealed::Sealed
+    for LockedCudaIntegrationPairSpec<P>
+{
+}
+impl<P: CudaLaunchProfile> NativeLaunchDeclaration for LockedCudaIntegrationPairSpec<P> {
     fn input_sha256(&self) -> &str {
         self.sha256()
     }
@@ -202,6 +206,7 @@ impl NativeLaunchDeclaration for LockedCudaIntegrationPairSpecV1 {
             engine_id: &engine.engine_id,
             artifacts: &engine.artifacts,
             cuda_bundle: Some(&engine.cuda_bundle),
+            search: engine.profile.search_options(),
         })
     }
     fn provider_name(&self) -> &'static str {
@@ -215,13 +220,17 @@ impl NativeLaunchDeclaration for LockedCudaIntegrationPairSpecV1 {
         validate_cuda_bundle_manifest_fields(bytes, &self.input().engines[0].cuda_bundle)
     }
 }
-impl NativeProviderDeclaration for LockedCudaIntegrationPairSpecV1 {
+impl<P: CudaLaunchProfile> NativeProviderDeclaration for LockedCudaIntegrationPairSpec<P> {
     type Audit = NativeCudaProviderSessionAudit;
     fn scope(&self) -> &'static str {
         "cuda_nn_pair_integration_process_provider_search_and_native_rules"
     }
     fn receipt_filename(&self) -> &'static str {
-        "native-cuda-pair-receipt.v1.json"
+        if P::VERSION == 1 {
+            "native-cuda-pair-receipt.v1.json"
+        } else {
+            "native-cuda-pair-receipt.v2.json"
+        }
     }
     fn startup_filename(&self) -> &'static str {
         "native-cuda-startup.v1.json"
@@ -257,23 +266,34 @@ impl NativeProviderDeclaration for LockedCudaIntegrationPairSpecV1 {
     #[cfg(target_os = "linux")]
     fn verify_session_evidence(
         &self,
-        _role: NativeEngineRole,
+        role: NativeEngineRole,
         pid: u32,
         startup: &[u8],
         runtime_directory: &cap_std::fs::Dir,
     ) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
-        linux::placement_evidence(pid, startup, runtime_directory)
+        let mut evidence = linux::placement_evidence(pid, startup, runtime_directory)?;
+        if let Some(search) = self.input().engine(role)?.profile.search_options() {
+            let relative = format!(
+                "native-process-{pid}/{}",
+                rz_uci::native_cuda_attestation::SEARCH_FILE
+            );
+            let bytes =
+                crate::native_runner::linux::read_file(runtime_directory, &relative, 256 * 1024)?;
+            validate_native_cuda_search_record_fields(&bytes, startup, search)?;
+            evidence.push((relative, bytes));
+        }
+        Ok(evidence)
     }
 }
 
 /// Source bytes are verified and copied before any runner/native child starts.
 /// Manifest/library filenames remain siblings for C's closed bundle loader.
-pub fn prepare_native_cuda_launch(
-    spec: &LockedCudaIntegrationPairSpecV1,
+pub fn prepare_native_cuda_launch<P: CudaLaunchProfile>(
+    spec: &LockedCudaIntegrationPairSpec<P>,
     source_root: &Path,
     output_root: &Path,
     output_directory: &str,
-) -> Result<NativeCudaLaunchOwner, Box<NativePreparationFailure>> {
+) -> Result<NativeLaunchOwner<LockedCudaIntegrationPairSpec<P>>, Box<NativePreparationFailure>> {
     crate::native_launch::prepare_native_launch_for(
         spec,
         source_root,
@@ -283,10 +303,13 @@ pub fn prepare_native_cuda_launch(
 }
 /// One two-game integration pair. A cutoff remains Incomplete with zero scoring
 /// authority; unresolved cleanup retains GPU copies and the original Child.
-pub fn run_native_cuda_pair(
-    owner: NativeCudaLaunchOwner,
+pub fn run_native_cuda_pair<P: CudaLaunchProfile>(
+    owner: NativeLaunchOwner<LockedCudaIntegrationPairSpec<P>>,
     cancel: Option<&AtomicBool>,
-) -> Result<NativeCudaPairOutput, Box<NativeCudaPairFailure>> {
+) -> Result<
+    NativePairOutput<LockedCudaIntegrationPairSpec<P>>,
+    Box<NativePairFailure<LockedCudaIntegrationPairSpec<P>>>,
+> {
     crate::native_runner::run_native_pair_for(owner, cancel)
 }
 
@@ -350,6 +373,7 @@ pub fn validate_cuda_bundle_manifest_fields(
 #[cfg(target_os = "linux")]
 pub use linux::{
     validate_cuda_placement_trace_fields, validate_native_cuda_provider_record_fields,
+    validate_native_cuda_search_record_fields,
 };
 
 #[cfg(target_os = "linux")]
@@ -369,10 +393,10 @@ mod linux {
 
     /// Strict B CUDA V1 DTO consumption plus the fixed E declaration and final
     /// search guards. Synthetic DTOs attest only this parser's rejection rules.
-    pub fn validate_native_cuda_provider_record_fields(
+    pub fn validate_native_cuda_provider_record_fields<P: CudaLaunchProfile>(
         startup_bytes: &[u8],
         termination_bytes: &[u8],
-        engine: &CudaNativeLaunchSpecV1,
+        engine: &CudaNativeLaunchSpec<P>,
         session: &str,
     ) -> Result<NativeCudaProviderSessionAudit, ArenaError> {
         if startup_bytes.len() > 256 * 1024 || termination_bytes.len() > 256 * 1024 {
@@ -445,9 +469,9 @@ mod linux {
         })
     }
 
-    fn check_startup(
+    fn check_startup<P: CudaLaunchProfile>(
         startup: &Value,
-        engine: &CudaNativeLaunchSpecV1,
+        engine: &CudaNativeLaunchSpec<P>,
         session: &str,
     ) -> Result<(), ArenaError> {
         n(startup, "schema_version", 1)?;
@@ -490,7 +514,11 @@ mod linux {
             "onnx_bytes",
             engine.artifact(NativeArtifactRole::Onnx)?.bytes,
         )?;
-        equals(p, "backend_sha256", &engine.profile.expected_backend_sha256)?;
+        equals(
+            p,
+            "backend_sha256",
+            &engine.profile.runtime_profile().expected_backend_sha256,
+        )?;
         for key in [
             "source_weights_protobuf_sha256",
             "converter_binary_sha256",
@@ -528,7 +556,11 @@ mod linux {
         }
         flag(p, "require_full", true)?;
         n(p, "device_id", 0)?;
-        n(p, "arena_bytes", 1073741824)?;
+        n(
+            p,
+            "arena_bytes",
+            engine.profile.runtime_profile().arena_bytes,
+        )?;
         flag(p, "tf32", false)?;
         equals(
             p,
@@ -576,11 +608,15 @@ mod linux {
         equals(
             encoding,
             "manifest_sha256",
-            &engine.profile.expected_encoding_sha256,
+            &engine.profile.runtime_profile().expected_encoding_sha256,
         )?;
         let resident = field(p, "session_resident_admission")?;
         n(resident, "host_bytes", 0)?;
-        n(resident, "device_bytes", 1073741824)?;
+        n(
+            resident,
+            "device_bytes",
+            engine.profile.runtime_profile().arena_bytes,
+        )?;
         n(resident, "pinned_bytes", 0)?;
         equals(
             resident,
@@ -588,6 +624,62 @@ mod linux {
             "declaration_not_measured_vram_or_hardcap",
         )?;
         Ok(())
+    }
+
+    /// Exact search metadata emitted from the same EngineSettings passed to
+    /// serve. This is initialization evidence, not a per-move timing proof.
+    pub fn validate_native_cuda_search_record_fields(
+        bytes: &[u8],
+        startup: &[u8],
+        expected: rz_experiments::NativeCudaSearchV2,
+    ) -> Result<(), ArenaError> {
+        if bytes.len() > 256 * 1024 || startup.len() > 256 * 1024 {
+            return Err(ArenaError::Budget(
+                "CUDA search record exceeds budget".into(),
+            ));
+        }
+        let receipt = json(bytes)?;
+        let _: rz_uci::native_cuda_attestation::CudaSearchReceiptV1 =
+            serde_json::from_value(receipt.clone())
+                .map_err(|_| invalid("CUDA search record differs from B schema"))?;
+        let startup_json = json(startup)?;
+        n(&receipt, "schema_version", 1)?;
+        equals(&receipt, "kind", "search_config")?;
+        equals(
+            &receipt,
+            "process_run_id",
+            text(&startup_json, "process_run_id")?,
+        )?;
+        equals(
+            &receipt,
+            "startup_sha256",
+            &format!("{:x}", Sha256::digest(startup)),
+        )?;
+        n(&receipt, "simulations", expected.simulations)?;
+        equals(&receipt, "final_selection", expected.final_selection.cli())?;
+        n(
+            &receipt,
+            "policy_temperature_milli",
+            u64::from(expected.policy_temperature_milli),
+        )?;
+        flag(&receipt, "raw_cache", expected.raw_cache)?;
+        for (key, value) in [
+            ("batch_size", 1),
+            ("search_workers", 1),
+            ("output_margin_ms", 10),
+            ("drain_margin_ms", 10),
+            ("shutdown_ms", 2000),
+            ("max_nodes", 20000),
+            ("max_edges", 100000),
+            ("max_depth", 128),
+        ] {
+            n(&receipt, key, value)?;
+        }
+        equals(
+            &receipt,
+            "scope",
+            "startup_config_bound_to_served_settings_not_per_move_timing_or_strength",
+        )
     }
 
     fn check_termination(term: &Value, startup: &Value) -> Result<(u64, u64, u64), ArenaError> {
