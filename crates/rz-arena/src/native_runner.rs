@@ -953,8 +953,11 @@ pub(crate) mod linux {
         Ok(rz_experiments::decode_json::<Value>(text)?)
     }
     pub(crate) fn field<'a>(v: &'a Value, key: &str) -> Result<&'a Value, ArenaError> {
-        v.get(key)
-            .ok_or_else(|| invalid("provider receipt is missing a required field"))
+        v.get(key).ok_or_else(|| {
+            invalid(&format!(
+                "provider receipt is missing a required field: {key}"
+            ))
+        })
     }
     pub(crate) fn number(v: &Value, key: &str) -> Result<u64, ArenaError> {
         field(v, key)?
@@ -1507,6 +1510,56 @@ pub(crate) mod linux {
         }
         Ok(())
     }
+    fn verify_conversion_provenance(
+        startup: &Value,
+        manifest: &Value,
+        batch_experiment: bool,
+    ) -> Result<(), ArenaError> {
+        // The validated launch declaration selects the wire. V4 wraps both B1
+        // and B4 provider profiles; legacy CPU/CUDA records remain unwrapped.
+        let provider = if batch_experiment {
+            field(startup, "provider")?
+        } else {
+            startup
+        };
+        let profile = field(provider, "profile")?;
+        for (observed, declared) in [
+            ("source_weights_protobuf_sha256", "source_protobuf_sha256"),
+            ("converter_commit", "converter_commit"),
+            ("converter_binary_sha256", "converter_binary_sha256"),
+        ] {
+            equals(profile, observed, text(manifest, declared)?)?;
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    #[test]
+    fn export_provenance_uses_declared_batch_envelope_and_rejects_mismatch() {
+        let manifest = serde_json::json!({
+            "source_protobuf_sha256": "a".repeat(64),
+            "converter_commit": "b".repeat(40),
+            "converter_binary_sha256": "c".repeat(64)
+        });
+        let provider = serde_json::json!({"profile": {
+            "source_weights_protobuf_sha256": manifest["source_protobuf_sha256"],
+            "converter_commit": manifest["converter_commit"],
+            "converter_binary_sha256": manifest["converter_binary_sha256"]
+        }});
+        assert!(verify_conversion_provenance(&provider, &manifest, false).is_ok());
+        let wrapped = serde_json::json!({"provider": provider});
+        assert!(verify_conversion_provenance(&wrapped, &manifest, true).is_ok());
+        assert!(verify_conversion_provenance(&wrapped, &manifest, false).is_err());
+        assert!(verify_conversion_provenance(&provider, &manifest, true).is_err());
+        for field in [
+            "source_weights_protobuf_sha256",
+            "converter_commit",
+            "converter_binary_sha256",
+        ] {
+            let mut wrong = wrapped.clone();
+            wrong["provider"]["profile"][field] = serde_json::json!("0");
+            assert!(verify_conversion_provenance(&wrong, &manifest, true).is_err());
+        }
+    }
     fn audit_providers<S: NativeProviderDeclaration>(
         owner: &NativeLaunchOwner<S>,
         stdout: &[u8],
@@ -1611,14 +1664,11 @@ pub(crate) mod linux {
                         .map_err(|_| invalid("cannot clone export pin"))?,
                     64 * 1024,
                 )?)?;
-                let p = field(&startup, "profile")?;
-                for (observed, declared) in [
-                    ("source_weights_protobuf_sha256", "source_protobuf_sha256"),
-                    ("converter_commit", "converter_commit"),
-                    ("converter_binary_sha256", "converter_binary_sha256"),
-                ] {
-                    equals(p, observed, text(&manifest, declared)?)?;
-                }
+                verify_conversion_provenance(
+                    &startup,
+                    &manifest,
+                    engine.batch_experiment.is_some(),
+                )?;
                 sessions.push(audit);
             }
         }
