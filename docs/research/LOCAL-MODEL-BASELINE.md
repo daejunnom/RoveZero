@@ -608,3 +608,103 @@ fmt·strict Clippy·release가 통과했다. [CI 37237882649](https://github.com
 artifact/bounds/profile과 같은 integration SHA의 C/D/E consumer를 맞춘 뒤, HistoryFill과
 policy temperature 등 조건을 고정한 동일 시간 holdout pair다. 현재 검사를 E BT4 인수,
 전체 solver·mate distance·device profiling·기력/Elo·학습의 완료로 승격하지 않는다.
+## 10. E BT4 CUDA V2의 실제 A/A 연결 인수
+
+2026-10-05 총괄은 #20의 Draft/open·develop base `87017a27`와 담당 PR의 후속 변경
+부재를 확인한 뒤 E의 남은 BT4 접점을 연결했다. 공통 revision 0.1, C의 BT4 원본·
+export·backend, B의 PUCT/출력 fence·기존 S0/S1, provider V1 필드 집합은 유지한다.
+CUDA **launch V2**와 추가 탐색 설정 영수증을 구분하며 기존 CPU/CUDA launch V1의
+16 MiB ONNX·4 MiB source·1 GiB arena 한도를 느슨하게 바꾸지 않는다.
+
+### 10.1. 별도 선언과 수동 연결
+
+- `CudaIntegrationPairSpecV2`는 별도 schema/canonicalization/domain으로 잠근다.
+  모델은 BT4-it332 한 종류이며 source gzip의 정확한 hash·382,645,315 bytes,
+  ONNX 768 MiB 이하·selected arena 3 GiB를 검사한다. 원본은 D036의
+  `e6ada9d6…1bdd618`, export는 `2839171c…057518`로 고정한다.
+- FP32·TF32 off·HistoryFill No·full/fresh·B1·worker 1·cache off·policy temperature
+  1.0을 유지한다. `simulations=4096`은 명시한 상한이며 실제 시간 내 4096회 완료를
+  의미하지 않는다. 이번 양쪽 최종 선택은 기존 visit-first S0로 고정한다.
+- E가 실제 child argv에 simulations/최종 선택을 넣고 B는 실제 `EngineSettings`에서
+  `native-cuda-search-config.v1.json`을 기록한다. E는 정확한 startup 원시 bytes의 SHA,
+  process run ID·설정·tree/time 한도를 대조한다. 누락/변조/다른 startup은 거부한다.
+- 두 역할의 weights·binary·전체 artifacts·runtime/search 설정이 같은 **A/A integration**
+  선언이다. S0/S1 mixed pair·LC0 상대·정식 holdout의 선언으로 재사용하지 않는다.
+  총괄이 최신 선언·argv·C/D profile·B receipt·E/A audit를 직접 대조했다.
+
+### 10.2. 초기 실패·진단·V2 캐시 힌트
+
+소스 `a0682ff167e3ddebd9dbe1b50898f7be0fd221aa`의 실제 E 실행 두 번은 두 번째
+엔진의 ORT 모델 초기화 할당 오류로 실패했다. RAM 12/14 GiB를 명시한 서로 다른
+실행이며 각각 CLI exit 2·runner exit 1·빈 PGN·owned cleanup/OOM 0이었다.
+14 GiB로 높인 실행도 해결되지 않았다. 실패를 성공/무승부로 집계하거나 유리하게
+누락하지 않고 원래 typed CLI receipt·출력·supervisor를 보존했다.
+
+같은 binary·닫힌 E input copy의 별도 단일 및 두 가지 dual-resident 진단에서는
+5개 native process 모두 `go nodes 32`의 합법 `g1f3`·실제 root/non-root Computed·
+physical drain·exit 0을 확인했다. 마지막 dual 진단은 E와 같은 cwd/env 및
+RLIMIT_AS 128 GiB·NOFILE 256·FSIZE 1 GiB·CORE 0이었다. 따라서 두 BT4 모델의
+동시 실행 불가나 특정 GPU/주소 공간 제한을 실패 원인으로 확정하지 않았다.
+
+E는 검증용 입력 약 4.10 GB를 별도 readonly inode로 복사·재해시한다.
+`30ca349860f37ad07a7183d228d02138a2716718`은 실행 직전 검증된 8 MiB 이상
+private snapshot pin에만 Linux `POSIX_FADV_DONTNEED`를 적용한다. sync·내용·hash·
+inode·file cursor·실행 후 재검사는 유지하고 원본·C cache·GPU buffer는 대상에서 제외한다.
+호출 실패는 typed preparation 오류다. 이 힌트를 RAM 회수 보장으로 해석하지 않는다.
+
+| 실제 E 조건 | CLI 결과 | cgroup memory.peak | OOM·남은 owned PID |
+|---|---|---:|---|
+| a0682ff / RAM 12 GiB | 두 번째 모델 초기화 실패 | 12,587,204,608 bytes | 0/0 |
+| a0682ff / 명시 RAM 14 GiB | 두 번째 모델 초기화 실패 | 12,580,974,592 bytes | 0/0 |
+| 30ca349 / 힌트 적용, RAM 12 GiB | V2 integration_checks_passed=true | 10,073,960,448 bytes | 0/0 |
+
+새 실행이 성공하고 최고치가 낮아진 관측을 보존한다. host/WDDM 및 cache 상태가
+다르므로 단일 변경의 일반적 속도 개선이나 근본 원인이 확정됐다고 주장하지 않는다.
+기존 CPU/CUDA V1은 이 힌트를 사용하지 않는다. 디스크 snapshot 복제 제거와도 구별한다.
+
+### 10.3. 실제 두 판과 인수 범위
+
+실제 source는 `30ca349860f37ad07a7183d228d02138a2716718`, UCI binary SHA는
+`79df6e51a40f03b45838a4951b960a9ee081ae0766aa8ee31c9407795c8a275f`,
+arena binary SHA는 `2a6a42da52d49236b638c67dd3477eb878310fede87dbae6f9028c86579daa6f`다.
+launch lock SHA는 `ebc86e56ab0b9884a823627cca7f9c8e8af6db47182c5402fe01f42442c3c883`다.
+pinned Fastchess `f618e345`를 concurrency 1/restart each game·recover off로 사용했다.
+
+- opening은 startpos부터 `e2e4 e7e5`의 완전 이력이며 같은 시작 상태에서 흑백 역할을
+  교환했다. movetime 200ms·총 18 ply·두 판만 실행했다. CPU 2/RAM 12 GiB/swap 0/
+  pids 128·address space 128 GiB·전체 300초, runner startup/handshake 60초·runtime
+  180초·drain 30초·shutdown 10초를 잠갔다. 자동 retry는 없다.
+- 네 fresh process의 실제 CUDA placement·matched startup/termination·search config·
+  full drain·exit 0과 E/A PGN 감사가 통과했다. 승인된 Computed 합은 **470**,
+  root 초기화 32·non-root backup 438이다. 이는 정상 poll/first-last aggregate이며
+  총 물리 NN 실행/미소비 건수·모든 착수의 완전한 source journal을 대신하지 않는다.
+- 두 판의 36 ply는 독립 python-chess 1.11.2에서도 모두 합법이며 수순·색 교환·
+  최종 FEN을 E/A와 대조했다. 두 판의 수순은 같았다. raw PGN SHA는
+  `aa4c14bba3b3f9ba85125730cb1757acf98b95d7ff9ea29be1da11953807c061`이다.
+- Fastchess가 최대 수 제한을 PGN `1/2-1/2`·adjudication으로 썼으나 A/E는 실제
+  체스 종료가 아닌 **Incomplete 2판·scored_games 0**으로 보존했다.
+  `integration_checks_passed=true`, `execution_ready=false`, `strength_eligible=false`다.
+- 네 프로세스 모두 기존 19-file C runtime cache를 재사용했고 새 실행별 library copy는
+  0개다. E의 한 attempt 입력 snapshot에는 library 약 2.97 GB가 별도로 들어가며
+  이를 per-process 저장 감소와 혼동하지 않는다. 전체 실행은 84.143초, runner는
+  42.347초였다. 500ms 장치 전체 표본의 최고 VRAM은 2318 MiB이며 device/process
+  peak·커널/전송별 profiling이나 VRAM hard cap 증거로 쓰지 않는다.
+
+새 source의 전체 workspace all-target/all-feature 검사는 **742 passed·0 failed·
+16 ignored(미실행)**, fmt·strict Clippy·release가 통과했다.
+[CI 37252367540](https://github.com/daejunnom/RoveZero/actions/runs/37252367540)의 Windows·
+Ubuntu 필수 step SUCCESS를 직접 확인했다. 첫 WIP의 format 실패 CI 37250089464와
+수정 source CI 37250346920의 성공도 별도 보존한다.
+
+원시 실패/진단/실행 명세·잠금·PGN·영수증·binary/CI pin·독립 감사는 외부 논리 루트
+`reports/coordinator-integration/native-bt4-arena-20261005/`에 회수했다. SAN으로 변환한
+별도 열람용 PGN에도 Incomplete/strength false를 표시하고 원본을 그대로 보존했다.
+회수 자료의 hash와 활성 maps/FD 부재, 원본·57개 사본 각각의 hash/inode/권한을
+대조한 뒤 완료된 세 attempt의 CUDA/ORT library 사본만 정리했다.
+8,910,431,856 logical bytes를 제거했으며 원본·C cache·모델·PGN·로그·영수증은
+보존했다. 이는 WSL 파일의 논리 정리량이며 Windows 디스크의 물리 반환량이 아니다.
+정리 후 전체 input snapshot은 보존하지 않으며 원래 잠긴 명세와 검증 원본에서
+fresh attempt로 재생성한다. 원래 execution receipt는 정리 전 인수 증거로 보존한다.
+
+이번 인수는 E/B/C/D/A의 **BT4 CUDA A/A 연결**이다. 정식 전체 엔진 시계·S0/S1 holdout
+통계·LC0 동조건 기력·전체 solver/학습/새 RunPod 인수는 후속으로 남는다.

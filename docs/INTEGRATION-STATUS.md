@@ -1133,3 +1133,34 @@ artifact/bounds/profile, device transfer/kernel, holdout 동일 시간 강도/El
 세부 source·실패·명령·원시 증거 논리 루트는
 [모델 기록 9장](research/LOCAL-MODEL-BASELINE.md#9-stop마감-출력의-물리-완료-경계)과
 `reports/coordinator-integration/physical-fence-20261005/`를 따른다.
+## E BT4 CUDA V2 후속 인수 — 2026-10-05
+
+총괄이 CUDA launch V2의 별도 schema/domain·BT4 exact source·768 MiB ONNX·3 GiB
+arena, E child argv와 B 실제 search config 영수증, C/D profile·runtime cache·A PGN
+접점을 수동으로 연결했다. 공통 revision 0.1·CPU/CUDA V1 한도와 provider V1 닫힌 필드는
+유지한다. [수동 적용 절차](CONTRACT-ADOPTION.md),
+[상세 실행·실패·미인수](research/LOCAL-MODEL-BASELINE.md#10-e-bt4-cuda-v2의-실제-aa-연결-인수)를 따른다.
+
+실제 source `30ca349860f37ad07a7183d228d02138a2716718`에서 V2 A/A 두 판을 실행해
+네 fresh native process의 CUDA placement·정상 Computed/backup·명세와 실제 탐색 설정·
+physical drain·exit 0·전체 PGN의 A Rules/독립 합법성 대조를 통과했다. 승인된 Computed
+470·root 32/non-root 438, 같은 수순의 18 ply씩 두 판이다. 최대 수 cutoff라 **Incomplete 2,
+scored 0, strength/execution_ready false**이며 holdout·Elo 완료가 아니다.
+
+초기 source a0682ff의 실제 두 번의 second-model allocation 실패(명시 RAM 12/14 GiB),
+성공한 별도 단일/dual 진단, 검증된 private snapshot 캐시 힌트 뒤 RAM 12 GiB의 성공을
+각각 보존했다. cache hint는 원본·공유 C cache·GPU buffer의 소유 정책을 바꾸지 않는다.
+일반 속도 개선이나 GPU/호스트 실패 원인을 확정하지 않는다.
+
+소스의 fmt·strict workspace Clippy·release·**742 passed/0 failed/16 ignored**와
+[CI 37252367540](https://github.com/daejunnom/RoveZero/actions/runs/37252367540)의 두 OS
+필수 step SUCCESS를 확인했다. 원시 자료는 외부
+`reports/coordinator-integration/native-bt4-arena-20261005/`에 회수했다. 후속 문서 head의
+검사 재사용은 영향 source/Cargo/CI diff가 없는 경우에만 별도로 기록한다. #20은 Draft로
+유지하며 develop 인수 때 최신 선언·consumer·runtime/receipt·같은 integration SHA를
+다시 대조한다. S0/S1 mixed pair·LC0 opponent는 닫힌 A/A V2의 지원 범위에 포함하지 않는다.
+
+회수·hash·비활성 확인 뒤 세 완료 attempt의 검증용 library 사본 57개,
+8,910,431,856 logical bytes만 정리했다. 원본·C cache·모델·연구 증거를 보존하며
+전체 E input snapshot은 원래 잠금 명세에서 재생성한다. WSL 논리 정리량을
+Windows 디스크 물리 회수량으로 표시하지 않는다.

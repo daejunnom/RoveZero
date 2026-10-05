@@ -488,3 +488,27 @@ fence를 구분한다. 모델 session은 process lifetime 동안 resident일 수
 소비자 검사를 다시 맞추며, E의 BT4 ONNX/bounds/arena/profile을 조용히 기존 Maia V1에
 넣지 않는다. 실제 runner/artifact 연결은 별도 후속 인수다.
 [상세 인수](research/LOCAL-MODEL-BASELINE.md#9-stop마감-출력의-물리-완료-경계)를 따른다.
+
+## 15. E BT4 V2의 모델·설정·영수증 수동 연결
+
+총괄이 E의 BT4 source 382,645,315 bytes/선정 gzip SHA·ONNX 768 MiB 상한·
+3 GiB arena를 C의 selected AssetProfile과 대조한다. V2의 별도 schema/domain과
+separate expected model identity를 사용한다. V1 필드·기존 byte 한도·canonical
+의미와 공통 계약 0.1은 유지하며 두 형식을 서로 파싱하지 않는다.
+
+| 접점 | 총괄 인수 조건 |
+|---|---|
+| E 모델 선언→C 로더 | source/export/ONNX 해시·실제 bytes·고정 BT4 source, C model namespace·shape/인코딩·FP32/No·3 GiB admission |
+| E search→B | sealed V2 profile의 simulation cap·final selection을 inner argv로 전달. B 실제 served EngineSettings의 별도 receipt에서 대조 |
+| B receipt→E | 정확한 startup bytes 해시·process ID에 묶인 탐색 설정, tree/time/worker/batch 한도. provider V1·placement·Computed/root/non-root·drain/exit 검사와 별도로 확인 |
+| E 저장→C cache | input snapshot·runtime output·외부 공유 cache를 구분. V2 native output은 네 placement/세 receipt의 최소 19 MiB, unique inputs와 전체 artifact 예산은 별도 |
+| E runner→A | 같은 완전 opening과 색 교환의 실제 PGN·시계·cutoff/종료·실패를 검사. A/A 통합 cutoff는 Incomplete, 점수 부여 없음 |
+
+PR/develop 인수 때 최신 선언·source/binary/feature·actual startup/config/end와
+같은 integration SHA 소비자를 다시 수동 대조한다. 단일 엔진·동시 상주·
+GPU sample·합성 wire 검사를 성공한 E pair나 holdout 기력으로 승격하지 않는다.
+실행 예산을 바꾸면 원래 실패와 새 잠금/예산을 모두 보존하고 변경을 명시한다.
+V2 실행은 검증 완료 private input snapshot에만 DONTNEED 힌트를 적용한다.
+원본·공유 runtime cache의 보존 정책을 바꾸지 않고, descriptor·별도 inode·readonly
+권한·hash·실행 후 identity 재검사를 유지한다. 이 힌트의 존재를 실제 RAM 회수나
+GPU 개선 근거로 쓰지 않으며, 실제 실패와 같은 자원 조건의 후속 실행을 대조한다.

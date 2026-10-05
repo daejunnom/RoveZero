@@ -133,3 +133,26 @@ Rust 잠금과 일치했다. 사용한 임시 Cargo.lock의 SHA-256은
 
 실제 엔진 대국·NN reference·목표 GPU·통계 계산·CI는 미실행이다.
 GPU capability는 unknown이며 목표 RTX 4050 6GB 검증은 지원 환경의 별도 인수가 필요하다.
+
+## BT4 CUDA 통합 V2
+
+`CudaIntegrationPairSpecV2`·`NativeCudaProfileV2`는 BT4-it332의 별도 선언이다.
+V1의 구조·domain·canonicalization·16 MiB ONNX·4 MiB source·1 GiB arena 조건은
+유지한다. 잠금/자원 계산은 sealed profile의 공통 구현을 사용하며 V1/V2 입력과
+lock을 서로 거부한다. 공통 엔진 계약 revision은 `0.1`이다.
+
+| 항목 | V2 조건 |
+|---|---|
+| 모델 | `model=bt4_it332`, 원본 gzip 382,645,315 bytes와 선정 SHA-256 고정 |
+| ONNX | 최대 768 MiB, 실제 export manifest·bytes·SHA를 별도로 잠금 |
+| runtime | `runtime` 아래 device 0·FP32·TF32 off·B1·intra 1·worker 1·HistoryFill No·fresh/full 1·arena 3 GiB |
+| search | `simulations=1..4096`, `final_selection=visits` 또는 `exact_terminal`, `policy_temperature_milli=1000`, `raw_cache=false` |
+| 비교 | 동일 source·binary·model·runtime·search의 A/A 두 판. 다른 S0/S1을 섞으면 거부 |
+| 저장 예약 | C의 외부 4 entry/8 GiB 공유 cache와 E 입력 snapshot은 구별. V2 runtime 예약은 네 번의 4 MiB placement와 세 개 256 KiB receipt 상한, 합계 최소 19 MiB |
+
+V2의 domain은 `rz-e-native-cuda-integration-pair-v2`, canonicalization은
+`rz-e-native-cuda-json-v2`, input schema는 2다. `lock_version=1`은 envelope
+형식이며 domain과 input schema를 함께 검사한다. 두 역할의 전체 입력 identity와
+고유 byte 예산을 검사하며 `execution_ready=false`, `strength_eligible=false`를 유지한다.
+크기 상한·잠금·CPU 검사만으로 GPU 실행·권리 확인·대국 강도를 승인하지 않는다.
+BT4의 권리 상태는 `UNVERIFIED-local-research-only`, 재배포는 허용하지 않는다.
