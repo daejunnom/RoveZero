@@ -347,6 +347,67 @@ NN을 로딩하지 않은 준비 단계의 관측이며 전체 대국의 Rust/OR
 사본·모든 결과는 보존했다. 원시 자료·명세·분석은 Git 밖 논리 경로
 `${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-snapshot-io-20261006-v2/`에 둔다.
 
+### 4.6 private snapshot 파일별 cache hint: peak 감소 관측, 채택 보류
+
+2026-10-06, source `eaa41f36bc502a9e4b1af5b2c9d2781ca923a05e`에서 arena의
+`experimental-snapshot-reclaim`을 기본 off로 추가했다. 원본 전체 검증·private copy의
+전체 해시·writer 종료·readonly·distinct inode 조건이 끝난 파일에만 기존 Linux
+`DONTNEED`를 적용한다. 8MiB 이상이 대상이며 원본·공유 runtime cache·GPU buffer는
+대상이 아니다. 제품 prelaunch/postcheck에서는 파일의 전체 해시와 held/named inode
+검증 뒤 적용하며 postcheck는 owned cleanup이 확인된 경우에만 적용한다. 기존 전체
+파일의 before-launch·both-ready·after-postcheck 힌트는 유지한다. 실패는 경고·상태로
+보존하며 대국 성공/실패를 변경하지 않는다. 힌트 성공은 실제 회수를 보장하지 않는다.[^fadvise]
+API·V1~V5 receipt 필드·계약 revision·기본 feature를 변경하지 않았다.
+
+앞선 chunk 실험과 분리하여 기본 **16KiB**를 고정했다. 같은 V4 lock의 27개,
+4,099,789,301bytes를 제품 `prepare_native_cuda_launch`로 준비하고, 독립적인 전체
+사본 재읽기/해시/readonly/inode oracle → 기존 B1 CUDA 추론 example → 물리 완료·자식
+종료 뒤 독립 전체 사본 재검증을 수행했다. 제품 preparation의 파일별 힌트는 실제 코드로
+실행했다. 이후 oracle의 파일별 힌트는 같은 정책의 독립 적용이며 실제 native runner의
+prelaunch/postcheck를 직접 호출한 결과가 아니다. UCI·PUCT·readiness·대국은 실행하지 않았다.
+따라서 실제 두 엔진 대국이나 전체 native runner의 효과 인수로 확대하지 않는다.
+
+추론 source `ef86138c13b2188f7ee1953eb8bed60b5fec504f`와 binary digest를 양쪽에
+동일하게 고정했고 현재 C backend·인코딩·계약·Cargo.lock이 동일함을 확인했다.
+BT4·FP32·TF32 off·HistoryFill No·B1·warm3/timed20이며 buffer 재사용·notify·cache·dedup·
+I/O Binding·CUDA Graph를 끈다. RTX 4050 Laptop 6GB·WSL Ubuntu·CPU2,
+`memory.high=6GiB`·`memory.max=12GiB`·swap0, 실행당 240초·정리 30초·전체 2,160초를
+사전 등록했다. A0/B0의 전체 준비 실행을 별도 보존한 뒤 A1/B1/B2/A2/A3/B3를 실행했다.
+전역 cache 비우기·원본 hint는 없으며 warm 상태의 대조로 cold startup을 주장하지 않는다.
+
+Primary T는 자식 시작부터 exit·pipe drain·결과 검증·최종 cgroup 수집까지,
+Primary P는 file cache와 자식 Rust/ORT 메모리를 포함한 전체 `memory.peak`다.
+종료 뒤 한 번 읽은 P를 phase `memory.current`나 helper/추론 process의 `VmHWM`으로
+대체하지 않았다. phase별 file/anon·시각과 두 process의 HWM도 별도로 보존했다.
+
+| 쌍 | 기준 T (s) | 파일별 hint T (s) | 기준 P (MiB) | 파일별 hint P (MiB) | T1/T0 | P1/P0 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 60.163 | 64.354 | 4028.332 | 2766.004 | 1.069656 | 0.686638 |
+| 2 | 66.626 | 49.260 | 4028.266 | 2769.734 | 0.739350 | 0.687575 |
+| 3 | 87.194 | 88.545 | 4028.148 | 2765.941 | 1.015499 | 0.686653 |
+
+**HOLD·기본 off 유지:** P는 세 쌍 모두 약 31.3% 줄어 0.80 문턱을 충족했지만 첫 T가
+1.05를 초과했다. 사전 Pareto 조건의 모든 T/P 비악화도 충족하지 못했다. 기준 T 범위는
+27.031초이며, 변경하지 않은 원본 검증도 11.013/10.274/16.578초와
+17.417/12.846/16.895초로 변동했다. 복사·사본 검증은
+24.759/30.546/46.433초와 25.852/18.871/50.332초, B1 로딩·추론·exit는
+14.441/16.429/16.781초와 12.836/9.966/11.031초다. 메모리 감소 관측을 유지하되
+시간 차이 전체를 hint의 인과 효과로 환산하지 않는다. 추론 process HWM은 양쪽 모두
+약 1.77~1.78GiB로, 이번 관측은 ORT heap/VRAM 감소나 Windows 전체 commit 해결의
+증거가 아니다. VRAM peak와 Windows 전체 commit peak는 unknown이다.
+
+8회의 모든 private 해시·소유권·고정 시작 입력/raw output SHA·B1 물리 완료 검사가
+통과했고 실제 CUDA 실행 node는 각각 687개다. 각 실행의 명시적 warm3/timed20을
+확인했으며 기존 전체 독립 수치 suite를 새 실행으로 보고하지 않는다. 제품 preparation에서
+각 실험의 대상 15개 모두 힌트 성공으로 기록했고 힌트 오류·OOM·강제 종료·잔류 process는
+0이다. 준비 A0는 약 6GiB peak와 high 이벤트 28,907을 보였으며 비교 6회는 high0이다.
+기본/reclaim-only arena 검사는 각각 128개, all-feature는 159개 통과했고 helper 14개는
+의도된 ignored 상태다. readonly pin의 bytes/inode/cursor·작은 파일 제외·힌트 오류 보존·
+미확인 cleanup 제외 검사와 strict Clippy를 포함한다. `eaa41f3`의 Ubuntu·Windows·
+bindings CPU CI도 모두 SUCCESS로 확인했다. 성공한 비활성 재생성 사본만 pin/자식/물리
+완료와 정확한 경로를 확인한 뒤 회수했고 원본·원시 로그·명세·분석은 Git 밖 논리 경로
+`${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-snapshot-reclaim-20261006/`에 보존했다.
+
 ## 5. 후속 구현·검증 순서
 
 할당/복사 제거 → 저장 밀도 → bounded scratch/arena/pool → 임계 구역/완료 통지 →
@@ -427,6 +488,7 @@ compare·원격 head 확인이며, #20 변경/병합 시 차이를 재검토하�
 [^tcmalloc]: [TCMalloc design](https://google.github.io/tcmalloc/design.html). Per-CPU/thread cache 구조.
 [^mmap]: [memmap2](https://docs.rs/memmap2/latest/memmap2/struct.MmapOptions.html). 파일 기반 mapping의 변경·잘림·수명 안전성.
 [^os]: [Linux huge pages](https://docs.kernel.org/admin-guide/mm/transhuge.html), [NUMA policy](https://docs.kernel.org/admin-guide/mm/numa_memory_policy.html), [proc memory](https://docs.kernel.org/filesystems/proc.html). OS 메모리·관측 범위.
+[^fadvise]: [Linux posix_fadvise](https://man7.org/linux/man-pages/man2/posix_fadvise.2.html). DONTNEED는 best-effort cache hint이며 부분 page·dirty page의 실제 회수를 보장하지 않는다.
 [^pgo]: [Rust PGO](https://doc.rust-lang.org/rustc/profile-guided-optimization.html), [Cargo profiles](https://doc.rust-lang.org/cargo/reference/profiles.html). LTO·panic 전략을 구분한다.
 [^pr20]: [PR #20](https://github.com/daejunnom/RoveZero/pull/20). 동적 PR 상태 대신 본문 조사 SHA를 함께 사용한다.
 [^rz-tree]: [tree.rs @ f442c41](https://github.com/daejunnom/RoveZero/blob/f442c41aa6f1885d4ae06aab874420a4cd8f7062/crates/rz-search/src/tree.rs). Vec<Node>·Expanded(Vec<Edge>)·pending·선택/backup.
