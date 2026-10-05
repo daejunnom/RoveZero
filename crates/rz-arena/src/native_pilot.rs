@@ -72,6 +72,10 @@ pub struct NativePilotClockAudit {
     pub rounding: String,
     pub read_margin_ms: u64,
     pub trace_sha256: String,
+    pub expected_pgn_time_control: String,
+    /// Header differences are metadata diagnostics, not clock rejection gates.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pgn_time_control_warnings: Vec<String>,
     pub games: Vec<NativePilotGameClockAudit>,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -308,10 +312,12 @@ pub fn validate_pilot_clock_trace(
     let mut cursor = 0;
     let mut games = Vec::new();
     let time_control = clock.pgn_time_control();
+    let mut pgn_time_control_warnings = Vec::new();
     for g in &pgn.games {
         if g.time_control.as_deref() != Some(time_control.as_str()) {
-            return Err(invalid(
-                "PGN TimeControl differs from locked whole-game clock",
+            pgn_time_control_warnings.push(format!(
+                "{}: PGN TimeControl {:?} differs from actual clock {}; header diagnostic only",
+                g.game_id, g.time_control, time_control
             ));
         }
         if g.classification == "engine_loss" {
@@ -377,6 +383,8 @@ pub fn validate_pilot_clock_trace(
         rounding: "ceil nanoseconds to milliseconds".into(),
         read_margin_ms: 100,
         trace_sha256: format!("{:x}", trace.finalize()),
+        expected_pgn_time_control: time_control,
+        pgn_time_control_warnings,
         games,
     })
 }

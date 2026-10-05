@@ -74,17 +74,21 @@ impl CudaLaunchProfile for NativeCudaProfileV3 {
         NativePairClock::Game(clock)
     }
     fn validate_clock(clock: Self::Clock, runtime_ms: u64) -> Result<(), ManifestError> {
-        let sufficient_wall = match (clock.base_ms, clock.increment_ms) {
-            (30_000, 100) => runtime_ms >= 180_000,
-            // Two 256-ply games can consume almost 1000 seconds of clock.
-            // Preserve additional startup/handshake/cleanup headroom.
-            (120_000, 1_000) => runtime_ms >= 1_300_000,
-            _ => false,
-        };
+        // The caller chooses the Fischer clock. Only positivity, checked
+        // arithmetic and enough pair wall for two 256-ply games are enforced.
+        let clock_wall = clock.base_ms.checked_mul(4).and_then(|base| {
+            clock
+                .increment_ms
+                .checked_mul(512)
+                .and_then(|inc| base.checked_add(inc))
+        });
+        let sufficient_wall = clock.base_ms > 0
+            && clock.increment_ms > 0
+            && clock_wall.is_some_and(|wall| runtime_ms >= wall.max(180_000));
         check(
             sufficient_wall,
             "clock",
-            "pilot V3 admits locked 30s+0.1s or 120s+1s clocks with sufficient independent pair wall",
+            "pilot V3 requires a positive Fischer clock and sufficient bounded pair wall",
         )
     }
     fn validate_profile(&self) -> Result<(), ManifestError> {

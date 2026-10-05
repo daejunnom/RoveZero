@@ -209,7 +209,7 @@ source는 5f40654이며 최신 오류 분기까지 GPU 실행했다고 보고하
 사용자는 수당 제한이 아닌 전체 시계·피셔 증분과 색별 엔진 종류의 명확한 PGN,
 남은 후속 작업을 요청했고 시간 선택은 엔진 blitz 기록의 기준을 따르도록 지정했다.
 [CCRL Blitz](https://computerchess.org.uk/404/index.html)의 2분+1초 형식을 참조해
-`base_ms=120000`, `increment_ms=1000`, PGN `TimeControl=120+1`을 잠근다.
+`base_ms=120000`, `increment_ms=1000`, PGN `TimeControl=120+1`로 실행한다.
 CCRL은 Intel i7-4770K에 해당하는 시간 보정을 사용한다. 이번에는 같은 로컬 RTX 4050의
 동일 실제 wall clock을 사용하는 내부 S0/S1 pilot이며 그 CPU 보정·공식 rating·EGTB를
 실행한 것으로 표시하지 않는다. 현재 CCRL의 공식 상대·표본·하드웨어를 재현한 결과도 아니다.
@@ -224,7 +224,8 @@ CCRL은 Intel i7-4770K에 해당하는 시간 보정을 사용한다. 이번에�
   Windows 가용 RAM/commit·guest anon/file·GPU 표본·owned 종료를 기록한다.
 - raw White/Black은 `RoveZero-BT4-it332-S0-visits`와
   `RoveZero-BT4-it332-S1-exact-terminal`로 고정한다. A가 색 교환과 실제 수순을 대조한다.
-  PGN TimeControl은 잠금과 부모의 매 착수 잔여 시간/차감/증분 trace가 일치해야 한다.
+  PGN TimeControl 차이는 진단 기록에 남기고 벤치마크를 차단하지 않는다. 실제 매 착수의
+  잔여 시간/차감/증분은 부모 trace로 대조한다.
 - 사용자용 SAN 사본은 색별 program type·원본 engine ID·모델/binary/source hash를
   보존한다. 원시 PGN/receipt를 덮어쓰거나 옛 30초+0.1초의 점수와 합치지 않는다.
 - 고정 paired Hoeffding95·engine loss 보존·automatic claim의 A 검증·cutoff Incomplete와
@@ -235,5 +236,5 @@ CCRL은 Intel i7-4770K에 해당하는 시간 보정을 사용한다. 이번에�
 원시 자료의 logical root는 기존 reports의 `blitz-120-1-r4/`이며 전 단계의 실패와 점수는
 각 원래 루트에 유지한다. 과거 PGN을 명확한 엔진 이름으로 바꾼 검토 사본도 원본 hash와
 수순 동등성을 대조해 별도 보존한다. 전체 시계·PGN 헤더·흑백 reset·잘못된 증분/마감의
-CPU 검사와 실제 GPU 대국의 인수는 구분한다. 현재 단계는 구현/검사/실행 준비다.
-
+CPU 검사와 실제 GPU 대국의 인수는 구분한다. 사용자의 추가 지시에 따라 시계를 두
+상수로 제한하거나 PGN 헤더 차이로 벤치마크를 거부하는 조건은 제거했다.

@@ -365,11 +365,11 @@ pilot의 scored_games에 포함되지만 cutoff는 Incomplete다. 네 fresh nati
 provider/search/placement·physical drain·exit 0과 전체 clock gate를 별도로 요구하며
 execution_ready=false, strength_eligible=false는 유지한다.
 
-V3 시계는 기존 30초+0.1초 또는 명시적으로 잠근 120초+1초다. 후자는
+V3는 호출자가 양수의 전체 base·피셔 증분을 지정한다. 이번 후속 실행은 120초+1초이며
 [CCRL Blitz 시간 형식](https://computerchess.org.uk/404/index.html)을 참조하며
 로컬 장비의 동일 시간 대국이다. CCRL 기준 장비로 보정한 공식 rating이 아니다.
-120초+1초에는 pair runtime 최소 1,300,000ms가 필요하고 실제 총 120분 감독은 별도다.
-PGN의 TimeControl을 잠금/부모 clock trace와 대조하며 누락·다른 값은 V3 인수를 거부한다.
+pair runtime은 두 판의 가능한 전체 시계보다 짧지 않아야 하며 실제 총 120분 감독은 별도다.
+PGN의 TimeControl 차이는 부모 clock trace와 함께 진단 기록에 남기며 벤치마크를 차단하지 않는다.
 PGN audit의 optional time_control은 헤더 관측이고 V1/V2의 시계를 새로 증명하지 않는다.
 각 새 엔진 ID에 RoveZero·BT4-it332·S0 visits/S1 exact-terminal을 넣어 White/Black의
 색 배정을 raw PGN과 잠긴 pair에서 직접 대조한다. 사용자용 SAN 사본은 원본 ID·source·

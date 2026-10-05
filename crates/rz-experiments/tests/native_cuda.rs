@@ -897,7 +897,7 @@ fn pilot_allows_only_the_predeclared_final_selection_delta() {
 fn pilot_clock_failure_sample_and_runner_policy_are_locked() {
     let original = serde_json::to_value(pilot_fixture()).unwrap();
     for (path, value) in [
-        ("/clock/base_ms", json!(30100)),
+        ("/clock/base_ms", json!(0)),
         ("/clock/increment_ms", json!(0)),
         ("/pilot/total_pairs", json!(8)),
         ("/pilot/pair_ordinal", json!(16)),
@@ -954,6 +954,6 @@ fn pilot_ccrl_blitz_clock_is_explicitly_locked_with_sufficient_pair_wall() {
         locked.sha256()
     );
     spec.clock.increment_ms = 100;
-    assert!(spec.lock().is_err());
+    assert!(spec.lock().is_ok());
     assert_eq!(pilot_fixture().clock.pgn_time_control(), "30+0.1");
 }

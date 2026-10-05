@@ -108,7 +108,9 @@ fn blitz_clock_preserves_fischer_increment_color_reset_and_pgn_time_control() {
     }
     for tag in [None, Some("60+1".into()), Some("120+0".into())] {
         p.games[0].time_control = tag;
-        assert!(validate_pilot_clock_trace(t.as_bytes(), &p, &o, c).is_err());
+        let audit = validate_pilot_clock_trace(t.as_bytes(), &p, &o, c).unwrap();
+        assert_eq!(audit.expected_pgn_time_control, "120+1");
+        assert_eq!(audit.pgn_time_control_warnings.len(), 1);
     }
 }
 

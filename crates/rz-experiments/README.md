@@ -165,7 +165,7 @@ rz-e-native-cuda-search-pilot-json-v3로 구분한다. V1/V2는 이 purpose를 �
 모델·source/binary·backend/인코딩·자원·runtime 입력은 같아야 하며,
 simulation cap 4096의 S0 visits→S1 exact-terminal만 허용한다.
 
-명시적인 30,000ms+100ms 또는 120,000ms+1,000ms clock·고정 16개 cohort의 ordinal·첫 백 배정·256 ply·전체 120분,
+호출자가 지정한 양수 전체 base·피셔 증분 clock·고정 16개 cohort의 ordinal·첫 백 배정·256 ply·전체 120분,
 fixed_paired_hoeffding95·automatic claim·engine failure Loss·cutoff Incomplete를
 닫힌 pilot 선언으로 잠근다. cohort/runner patch도 ArtifactRef로 검증하고 고유 input
 예산에 포함한다. runner dirty를 일반 허용하지 않으며 정확한 source·4119-byte clock
@@ -174,7 +174,7 @@ patch SHA·수정 binary·compiler를 대조한다. lock/CPU 검사만으로 NN/
 strength_eligible=false이며 결과·미완료·실패·재실행은
 [별도 명세](../../docs/research/BT4-FINAL-SELECTION-PILOT.md)에 둔다.
 
-120초+1초 clock은 CCRL Blitz의 시간 형식을 참조한다. pair의 독립 runtime은 최소
-1,300,000ms로 종료·증분·startup 여유를 확보하며 총 120분은 별도 감독자가 집행한다.
+이번 120초+1초 clock은 CCRL Blitz의 시간 형식을 참조한다. pair runtime의 checked 계산은
+두 판의 가능한 시계보다 짧은 wall만 거부한다. 총 120분은 별도 감독자가 집행한다.
 clock 값은 input digest에 포함된다. V1/V2 wire나 공통 revision 0.1은 유지하고,
 30초+0.1초의 과거 결과와 새로운 시간 조건의 점수를 합치지 않는다.
