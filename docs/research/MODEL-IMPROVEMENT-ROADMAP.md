@@ -101,7 +101,7 @@ GPU 열은 **직접 실행 적합성의 추론/미측정**이다. CPU 보조·�
 | MODEL-21 재매개변수화·희소성·저비트 학습 | RepVGG/FastViT의 병합, SparseGPT/BitNet 및 Marlin/Sage형 실행.[^compression] | 합칠 수 없는 동적 연산·sparse kernel 부재·재학습; dense 소형 모델 비교 | A 또는 검증된 E / 하드웨어 조건부 |
 | MODEL-22 head·optimizer·적응 학습 | WDL·계산 효용·위협 보조 목표, SOAP/AdamW, LoRA/FiLM/Hypernetwork.[^training] | loss 충돌·optimizer memory·동적 weight 생성; 학습 향상을 추론 배속으로 보지 않음 | A/O / 모델·훈련별 상이 |
 | MODEL-23 세계 모델·검색 기억·데이터 연구 | MuZero latent 전이, RAG 유사 구조, Diffusion/Flow 생성, 해석·구조화 궤적.[^offline] | 정확 Rules 대체 금지·도달성·라벨 검증·누출; LLM 직접 착수는 목표 아님 | A/O / 직접 낮음~조건부 |
-| MODEL-24 DeepSeek-V4.1-Flash에서 논의한 결합 | CED/CSA2/FP4 KV/bounded replay/single-pass mHC를 재확인할 목록으로 보존.[^v41] | 이번 조회에서 원문 본문을 확보하지 못함. 세부 동작·압축률·정확성은 미확인으로 남김 | 보류 A/S / 미평가 |
+| MODEL-24 DeepSeek-V4.1-Flash에서 논의한 결합 | CED/CSA2/FP4 KV/bounded replay/single-pass mHC를 연구 목록으로 보존.[^v41] | 초기 접근 실패와 후속 v1 본문 확인을 함께 기록. BT4 호환·수치·기력은 미검증 | 보류 A/S / 체스 미평가 |
 
 원문이 체스에서 검증한 것, 타 분야에서 검증한 것, 위 표의 신규 조합을 구분한다.
 MOE·토큰 축소·희소화·극저비트에 대한 부정적 결과는 기존 등록부/핸드오프에 그대로 남긴다.
@@ -117,14 +117,32 @@ MODEL-12/14의 독립 조건과 검증이 필요하다. 고정 반복 수로 시
 용량 확대→선택적 반복 순서로 ablation하고, 기존 BT4 ONNX와의 단순 호환이라고 표시하지 않는다.
 정확한 raw 결과와 경로 의존 근사 상태는 타입·namespace·provenance가 달라야 한다.
 
-### 3.2 재확인이 필요한 DeepSeek-V4.1-Flash 항목
+### 3.2 DeepSeek-V4.1-Flash의 접근 이력과 확인 범위
 
 이전 대화에 등장한 CED/CSA2·FP4·bounded replay·single-pass mHC를 삭제하지 않되,
-이번 문서 작성에서 arXiv 원문 접근이 실패한 상태로 확정 기술·수치·원저자 주장처럼 반복하지 않는다.
+PR #21 초기 문서 작성에서 arXiv 원문 접근이 실패했던 기록을 보존한다.
 특히 global GPU KV와 host/SSD persistent cache, 전체 모델 memory를 구분하고 기존 대화의
 1/4·1/8 같은 비율을 RoveZero의 예상 절약으로 사용하지 않는다. 원문을 확보한 뒤 제목·버전·
 정확/근사 복원·실행 hardware·조건을 기록해야 한다. 그전에도 원문 확인이 가능한 YOCO/CLA,
 KIVI, MLA, Engram, IndexCache 등의 독립 가설은 평가할 수 있다.
+
+2026-10-06 총괄 재검토에서는 **DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache
+Compression**, `arXiv:2609.19969v1`(2026-09-17)의 HTML 본문에 접근했다.[^v41-verified]
+이는 아래 원저자 설계의 확인이며 RoveZero 구현·benchmark 재현이 아니다.
+
+- CSA2의 Full/Reindex/Reuse는 main KV·indexer K와 Top-K 인덱스의 공유를 구별한다.
+  각 층의 query·SWA KV·attention 출력은 계속 계산한다. 인덱스만 공유하는 것과
+  KV 저장량 감소를 혼동하지 않고 현재 BT4의 서로 다른 15개 층에 그대로 적용하지 않는다.
+- FP4 main KV는 attention 전에 복원하는 저장 형식이며 행렬곱 가속 자체가 아니다.
+  원문은 post-training QAT와 별도 SWA 정밀도를 사용한다. 동결 BT4의 무손실 E 변경으로
+  분류하지 않으며 모델·수치·지원 kernel의 독립 인수가 필요하다.
+- SWA bounded replay는 제한 구간을 다시 계산해 **근사 상태**를 복원한다. 원문은 cache-hit
+  위치에 따른 상태 차이와 post-training 적응을 설명한다. 정확 평가 캐시와 분리한 A 연구다.
+- 원문의 약 1/4은 global KV의 HBM 저장, 약 1/8은 host/SSD persistent KV의 비교다.
+  전체 weights·activation·workspace나 체스의 64칸 평가에 같은 감소율을 주장하지 않는다.
+
+CED·single-pass mHC·훈련 및 장비별 성능의 체스 전이는 후속 연구로 남긴다.
+구조·정밀도·반복·스케줄을 한 번에 활성화하지 않고 한 변수 대조와 권리 확인을 거친다.
 
 ## 4. 탐색 의미가 바뀌는 항목은 별도 S 목록
 
@@ -186,7 +204,7 @@ pair 단위 상관·holdout·사전 통계·실패 보존을 따른다. 코드 �
 
 공식 연구의 원리와 위 표의 체스 적용 가설을 구별한다. 일부 링크는 이전 핸드오프의
 추가 검토 목록을 보존한 것이며 모든 원문 코드·수식·실험을 이번에 독립 재현한 것은 아니다.
-DeepSeek-V4.1 원문은 아래에 별도로 미확인 표시했다. 실제 채택 때 버전·commit·권리·실험 조건을 잠근다.
+DeepSeek-V4.1의 초기 미확인과 후속 확인 범위는 아래 주석을 구분한다. 실제 채택 때 버전·commit·권리·실험 조건을 잠근다.
 
 [^rz-model]: [LOCAL-MODEL-BASELINE @ f442c41](https://github.com/daejunnom/RoveZero/blob/f442c41aa6f1885d4ae06aab874420a4cd8f7062/docs/research/LOCAL-MODEL-BASELINE.md). BT4 검사 body·shape·MLH·권리와 source별 실행 근거.
 [^rz-eval]: [onnx.rs @ f442c41](https://github.com/daejunnom/RoveZero/blob/f442c41aa6f1885d4ae06aab874420a4cd8f7062/crates/rz-eval/src/onnx.rs). 평가 session·입출력·실험 옵션; persistent KV 구현의 근거로 사용하지 않는다.
@@ -213,6 +231,7 @@ DeepSeek-V4.1 원문은 아래에 별도로 미확인 표시했다. 실제 채�
 [^training]: [SOAP](https://arxiv.org/abs/2409.11321), [AdamW](https://arxiv.org/abs/1711.05101), [LoRA](https://arxiv.org/abs/2106.09685), [FiLM](https://arxiv.org/abs/1709.07871), [HyperNetworks](https://arxiv.org/abs/1609.09106), [Ceres](https://github.com/dje-dev/Ceres). 학습·조건부 적응·보조 출력의 참고.
 [^offline]: [MuZero](https://arxiv.org/abs/1911.08265), [RAG](https://arxiv.org/abs/2005.11401), [Flow Matching](https://arxiv.org/abs/2210.02747), [LC0 look-ahead analysis](https://arxiv.org/abs/2406.00877). 정확 규칙·도달성·라벨·인과 개입을 별도 검증한다.
 [^v41]: 이전 대화의 출처 후보 [DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache Compression](https://arxiv.org/abs/2609.19969). **2026-10-06 이번 조회에서 abs/HTML 원문 접근 실패. 상세 원문 미확인으로 보존하며 세부 주장·수치의 확정 근거로 사용하지 않는다.**
+[^v41-verified]: [DeepSeek-V4.1-Flash v1 HTML](https://arxiv.org/html/2609.19969v1). 2026-10-06 총괄이 본문 접근과 2.3.1·2.4.4·3.2.1~3.2.2의 위 범위를 확인했다. 초기 접근 실패를 성공으로 바꾸지 않으며 체스 적용·훈련·GPU 성능은 미인수다.
 [^dspark]: [DSpark](https://arxiv.org/abs/2607.05147). Confidence-scheduled speculative decoding; 체스 배치 제어는 신규 적용 가설.
 [^gumbel]: [Policy improvement by planning with Gumbel](https://openreview.net/forum?id=bERaNdoegnO), [Mctx](https://github.com/google-deepmind/mctx). 근사 체스 value에 원문의 개선 보장이 자동 이전되지 않는다.
 [^multifidelity]: [Optimal Multi-Fidelity Best-Arm Identification](https://arxiv.org/abs/2406.03033). 체스의 편향·상관 조건은 별도 검토한다.
