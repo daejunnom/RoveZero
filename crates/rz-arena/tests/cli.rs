@@ -20,6 +20,37 @@ const LEDGER_BOUNDS: [&str; 8] = [
     "65536",
 ];
 
+#[test]
+fn native_phase_trace_is_opt_in_and_keeps_protocol_result_on_stdout() {
+    let quiet = Command::new(env!("CARGO_BIN_EXE_rz-arena"))
+        .arg("--help")
+        .env_remove("RZ_ARENA_PHASE_TRACE")
+        .output()
+        .unwrap();
+    assert!(quiet.status.success() && quiet.stderr.is_empty());
+    let traced = Command::new(env!("CARGO_BIN_EXE_rz-arena"))
+        .arg("--help")
+        .env("RZ_ARENA_PHASE_TRACE", "1")
+        .output()
+        .unwrap();
+    assert!(traced.status.success());
+    assert_eq!(quiet.stdout, traced.stdout);
+    let text = std::str::from_utf8(&traced.stderr).unwrap();
+    let records: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line.strip_prefix("native_phase=").unwrap()).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["phase"], "cli_started");
+    assert_eq!(records[1]["phase"], "cli_result_emitted");
+    assert_eq!(records[0]["sequence"], 1);
+    assert_eq!(records[1]["sequence"], 2);
+    assert!(
+        records[1]["elapsed_ns"].as_u64().unwrap() >= records[0]["elapsed_ns"].as_u64().unwrap()
+    );
+    assert!(records.iter().all(|r| r["utc_unix_ms"].as_u64().is_some()));
+}
+
 #[cfg(feature = "native-cuda")]
 #[test]
 fn cuda_cli_requires_exact_paths_before_assets_and_exposes_integration_only_help() {

@@ -100,13 +100,16 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    rz_arena::emit_native_phase("cli_started");
     match parse_command(env::args_os().skip(1).collect()).and_then(execute) {
         Ok(output) => {
             println!("{output}");
+            rz_arena::emit_native_phase("cli_result_emitted");
             ExitCode::SUCCESS
         }
         Err(error) => {
             eprintln!("rz-arena: {error}");
+            rz_arena::emit_native_phase("cli_failed");
             ExitCode::from(2)
         }
     }
@@ -383,6 +386,7 @@ fn execute(command: Command) -> Result<String, String> {
                 }
                 failure.to_string()
             })?;
+            rz_arena::emit_native_phase("preparation_complete");
             let output = run_native_pair(owner, Some(&cancelled)).map_err(|failure| {
                 if let Ok(receipt) = serde_json::to_string(&serde_json::json!({
                     "receipt": failure.receipt,
@@ -612,6 +616,7 @@ fn execute_cuda_pair<P: rz_experiments::CudaLaunchProfile>(
                 }
                 failure.to_string()
             })?;
+    rz_arena::emit_native_phase("preparation_complete");
     let output=run_native_cuda_pair(owner,Some(&cancelled)).map_err(|failure| {
                 if let Ok(receipt)=serde_json::to_string(&serde_json::json!({"receipt":failure.receipt,"receipt_artifact":failure.receipt_artifact,
                     "process":failure.process().map(|p|&p.receipt),"cause":failure.cause.to_string(),

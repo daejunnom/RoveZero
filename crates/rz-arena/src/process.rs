@@ -436,6 +436,7 @@ mod linux {
             .spawn()
             .map_err(|error| ArenaError::Io(format!("process.spawn:{:?}", error.kind())))?;
         let pid = child.id();
+        crate::emit_native_phase("runner_spawned");
         let group = Pid::from_raw(
             i32::try_from(pid).map_err(|_| ArenaError::Io("process.pid_out_of_range".into()))?,
         );
@@ -508,6 +509,8 @@ mod linux {
             }
             // Each pass drains a finite amount from each pipe, preserving time,
             // cancellation and process checks even under continuous output.
+            let prior_out = out.len();
+            let prior_err = err.len();
             for result in [
                 drain(&mut stdout, &mut out, limits.max_output_bytes, &mut receipt),
                 drain(&mut stderr, &mut err, limits.max_output_bytes, &mut receipt),
@@ -523,6 +526,14 @@ mod linux {
                     _ => {}
                 }
             }
+            // Observe only newly retained bytes; the raw pipe budget and later
+            // provider/clock acceptance still own the complete unchanged output.
+            if out.len() > prior_out {
+                crate::native_diagnostics::observe_stream(true, &out[prior_out..]);
+            }
+            if err.len() > prior_err {
+                crate::native_diagnostics::observe_stream(false, &err[prior_err..]);
+            }
             if !leader_done {
                 match waitid(
                     Id::Pid(group),
@@ -530,12 +541,14 @@ mod linux {
                 ) {
                     Ok(WaitStatus::Exited(_, code)) => {
                         leader_done = true;
+                        crate::emit_native_phase("runner_exit_observed");
                         if preserve_unverified {
                             receipt.exit_code = Some(code);
                         }
                     }
                     Ok(WaitStatus::Signaled(_, signal, _)) => {
                         leader_done = true;
+                        crate::emit_native_phase("runner_exit_observed");
                         if preserve_unverified {
                             receipt.exit_signal = Some(signal as i32);
                         }

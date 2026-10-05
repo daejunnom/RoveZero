@@ -662,8 +662,10 @@ pub(crate) mod linux {
         cancel: Option<&AtomicBool>,
     ) -> Result<(NativePairReceipt<S::Audit>, ArtifactRef), ArenaError> {
         let owner = bundle.owner.as_mut().expect("prepared native owner");
+        crate::emit_native_phase("prelaunch_verification_started");
         verify_inputs(owner)?;
         advise_verified_input_cache(owner)?;
+        crate::emit_native_phase("prelaunch_verification_complete");
         let s = &owner.snapshot;
         let process = supervise_in_directory_with_tree(
             &s.pins[s.runner_index].file,
@@ -673,6 +675,8 @@ pub(crate) mod linux {
             cancel,
             &s.watch,
         )?;
+        crate::native_diagnostics::finish_logs();
+        crate::emit_native_phase("runner_supervision_finished");
         bundle.process = Some(process);
         let owner = bundle
             .owner
@@ -736,6 +740,7 @@ pub(crate) mod linux {
             &process.stderr,
             owner.snapshot.limits.max_output_bytes,
         )?);
+        crate::emit_native_phase("runner_logs_saved");
         let pgn_cap = owner
             .spec
             .view()
@@ -824,12 +829,14 @@ pub(crate) mod linux {
             }
         }
         bundle.receipt = Some(receipt.clone());
+        crate::emit_native_phase("postlaunch_verification_started");
         verify_inputs(
             bundle
                 .owner
                 .as_mut()
                 .expect("native owner retained through postcheck"),
         )?;
+        crate::emit_native_phase("postlaunch_verification_complete");
         let owner = bundle
             .owner
             .as_ref()
@@ -897,6 +904,7 @@ pub(crate) mod linux {
             NATIVE_PAIR_METADATA_CAP,
         )?;
         bundle.receipt_artifact = Some(artifact.clone());
+        crate::emit_native_phase("receipt_saved");
         if !receipt.integration_checks_passed {
             return Err(invalid(
                 "native pair failed process, provider or Rules integration acceptance",

@@ -694,10 +694,12 @@ pub(crate) mod linux {
         // Verify every source before creating the attempt and keep those exact,
         // rewound handles for copying instead of reopening and hashing again.
         // The copy stream is still hashed, so same-inode writes fail closed.
+        crate::emit_native_phase("source_verification_started");
         let sources = unique
             .values()
             .map(|artifact| artifact.open_verified(source_root, input.budget.max_input_bytes))
             .collect::<Result<Vec<_>, _>>()?;
+        crate::emit_native_phase("source_verification_complete");
         let root_path = outside_git(output_root)?;
         let root = Dir::open_ambient_dir(&root_path, cap_std::ambient_authority())
             .map_err(|_| io("cannot pin native output root"))?;
@@ -743,6 +745,7 @@ pub(crate) mod linux {
         };
         let mut pins = Vec::new();
         let mut receipts = Vec::new();
+        crate::emit_native_phase("snapshot_copy_started");
         for (index, (artifact, source)) in unique.values().zip(sources).enumerate() {
             let bundle_name = cuda_bundle.and_then(|bundle| {
                 if &bundle.manifest == artifact {
@@ -796,6 +799,7 @@ pub(crate) mod linux {
             pins.push(pin);
             receipts.push(receipt);
         }
+        crate::emit_native_phase("snapshot_copy_complete");
         // Additional metadata is read only after all complete private copies
         // exist. A malformed manifest cannot produce a native executable owner.
         for (is_cohort, manifest) in [
