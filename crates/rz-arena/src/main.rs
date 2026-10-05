@@ -293,9 +293,11 @@ fn execute(command: Command) -> Result<String, String> {
             }
             .map_err(|e| e.to_string())?;
             write_new_file(&output, json.as_bytes(), limit)?;
-            return Ok(success(
-                "native CUDA integration declarations locked; execution not verified",
-            ));
+            return Ok(success(if version == 3 {
+                "native CUDA search pilot declarations locked; execution not verified"
+            } else {
+                "native CUDA integration declarations locked; execution not verified"
+            }));
         }
         #[cfg(feature = "native-cuda")]
         Command::NativeCudaPair {
@@ -418,7 +420,7 @@ fn execute(command: Command) -> Result<String, String> {
         #[cfg(feature = "native-cuda")]
         return Ok(format!(
             "{USAGE}\n\nWith native-cuda feature:\n  rz-arena native-cuda-lock INPUT OUTPUT\n  rz-arena native-cuda-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME\n  rz-arena native-cuda-v2-lock INPUT OUTPUT\n  rz-arena native-cuda-v2-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME\nV2 is BT4-only A/A with an explicit search profile; V1 limits and domain remain closed.\nCUDA commands use a separate integration-only lock/profile and explicit finite input/runtime-copy/output budgets. Linux actual CUDA startup/final/placement/search/drain and Rules evidence are required; strength_eligible=false, execution_ready=false."
-        ));
+        ) + "\nV3 search pilot commands:\n  rz-arena native-cuda-pilot-lock INPUT OUTPUT\n  rz-arena native-cuda-pilot-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME\nV3 fixes BT4 S0/S1 final selection, 30s+0.1s whole-engine clock, 16-pair cohort, failures/claims and 120min total budget. Pilot receipts confer no promotion or Elo authority.");
         #[cfg(not(feature = "native-cuda"))]
         return Ok(USAGE.to_string());
     };

@@ -821,7 +821,7 @@ pub(crate) mod linux {
                     .filter(|g| {
                         matches!(
                             g.classification.as_str(),
-                            "rules_terminal" | "protocol_adjudicated" | "engine_loss"
+                            "rules_terminal" | "accepted_claim" | "engine_loss"
                         )
                     })
                     .count() as u32

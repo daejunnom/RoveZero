@@ -1075,7 +1075,6 @@ pub(crate) mod linux {
             input.timeouts.handshake_ms.to_string().into(),
             "-ucinewgame-ms".into(),
             input.timeouts.drain_ms.to_string().into(),
-            "-strict".into(),
             "-log".into(),
             "file=/proc/self/fd/1".into(),
             "append=true".into(),
@@ -1083,6 +1082,16 @@ pub(crate) mod linux {
             "realtime=true".into(),
             "engine=true".into(),
         ]);
+        // Fastchess strict stops on a time-loss WARN before persisting PGN.
+        // A pilot retains both losses before E stops the next pair. Legacy
+        // integration callers preserve their original strict argument order.
+        if matches!(input.clock, rz_experiments::NativePairClock::Movetime(_)) {
+            let index = args
+                .iter()
+                .position(|arg| arg == "-log")
+                .expect("closed log argument");
+            args.insert(index, "-strict".into());
+        }
         let mut limitations=[
             "NN integration only; execution_ready=false; strength_eligible=false; same weights and search in both roles",
             "private input copies use separate inodes and closed writers; Unix readonly is an ownership convention, not a same-UID sandbox or immutable seal",

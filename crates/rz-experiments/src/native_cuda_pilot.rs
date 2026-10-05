@@ -116,9 +116,15 @@ impl CudaLaunchProfile for NativeCudaProfileV3 {
     fn validate_protocol(
         protocol: Option<&NativeSearchPilotProtocolV3>,
         max_plies: u32,
+        white_order: [NativeEngineRole; 2],
     ) -> Result<(), ManifestError> {
         let p = protocol.ok_or_else(|| fail("pilot", "a pilot protocol is required"))?;
         p.opening_cohort.validate()?;
+        let first = if p.pair_ordinal % 2 == 0 {
+            NativeEngineRole::Baseline
+        } else {
+            NativeEngineRole::Candidate
+        };
         check(
             p.total_pairs == 16
                 && p.pair_ordinal < p.total_pairs
@@ -131,6 +137,8 @@ impl CudaLaunchProfile for NativeCudaProfileV3 {
             "pilot",
             "requires 16 pairs, 120min wall, 256 plies, automatic claims, retained losses and incomplete cutoffs",
         )
+        .and_then(|()| check(white_order == [first, first.other()], "white_order",
+            "alternate the first white role by registered pair ordinal"))
     }
 }
 fn fail(path: &str, message: &str) -> ManifestError {

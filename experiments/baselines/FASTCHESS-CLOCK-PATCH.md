@@ -21,6 +21,10 @@ V1/V2 A/A에서는 이 패치를 사용하지 않는다. V3는 source commit, pa
 규칙·전체 시계는 각각 별도 gate다. 엔진 오류는 raw PGN의 Loss로 보존하고 pilot을
 중단한다. cutoff는 Incomplete이며 득점률에서 무승부로 바꾸지 않는다.
 
+Fastchess `-strict`는 time-loss WARN에서 PGN 저장 전에 중단하므로 pilot에는
+사용하지 않는다. 두 판의 오류 결과를 저장한 다음 E가 provider/clock 실패를
+거부하고 다음 pair를 중단한다. V1/V2의 strict 실행 옵션은 유지한다.
+
 ## 원본 저작권 고지
 
 MIT License

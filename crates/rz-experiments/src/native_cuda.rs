@@ -616,7 +616,7 @@ impl<P: CudaLaunchProfile> CudaIntegrationPairSpec<P> {
             "each engine role must play white once",
         )?;
         validate_opening(&self.opening, self.max_plies)?;
-        P::validate_protocol(self.pilot.as_ref(), self.max_plies)?;
+        P::validate_protocol(self.pilot.as_ref(), self.max_plies, self.white_order)?;
         self.opening_artifact.validate()?;
         self.runner.binary.validate()?;
         require(
@@ -1096,6 +1096,7 @@ pub trait CudaLaunchProfile:
     fn validate_protocol(
         protocol: Option<&crate::NativeSearchPilotProtocolV3>,
         _max_plies: u32,
+        _white_order: [NativeEngineRole; 2],
     ) -> Result<(), ManifestError> {
         require(
             protocol.is_none(),
