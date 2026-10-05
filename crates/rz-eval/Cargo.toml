@@ -44,5 +44,9 @@ name = "maia_check"
 required-features = ["onnx"]
 
 [[example]]
+name = "inference_bench"
+required-features = ["onnx"]
+
+[[example]]
 name = "rules_maia_check"
 required-features = ["onnx", "contracts"]
