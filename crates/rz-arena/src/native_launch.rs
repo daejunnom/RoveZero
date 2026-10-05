@@ -1123,7 +1123,15 @@ pub(crate) mod linux {
             spec.provider_name()
         );
         if matches!(input.clock, rz_experiments::NativePairClock::Game(_)) {
-            limitations[0] = "CUDA S0/S1 pilot only; execution_ready=false; strength_eligible=false; same weights/runtime/binary; only final selection differs".into();
+            let baseline = spec.engine_view(NativeEngineRole::Baseline)?;
+            let candidate = spec.engine_view(NativeEngineRole::Candidate)?;
+            limitations[0] = if candidate.batch_experiment.is_some() {
+                "CUDA S batch pilot only; execution_ready=false; strength_eligible=false; same weights/precision/PUCT/final visits; batch width and scheduling differ"
+            } else if baseline.search==candidate.search {
+                "CUDA B1 A/A whole-clock memory check; execution_ready=false; strength_eligible=false; same weights/runtime/binary/search"
+            } else {
+                "CUDA S0/S1 pilot only; execution_ready=false; strength_eligible=false; same weights/runtime/binary; only final selection differs"
+            }.into();
             limitations[3] = "Pinned clock patch measures position transmission through bestmove with steady_clock, charges partial milliseconds and earns increment only after a timely move; the 100ms read margin is not chess time".into();
             limitations[4] = "Fastchess automatic draw claims require independent A current-position evidence; cutoff remains Incomplete, engine failures remain Loss and stop a broken pilot gate".into();
         }

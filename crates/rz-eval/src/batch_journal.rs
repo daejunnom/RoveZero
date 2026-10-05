@@ -171,6 +171,7 @@ pub fn audit_batch_journal(
     })
 }
 pub(crate) struct BatchJournal {
+    epoch: Option<ProcessEpoch>,
     width: usize,
     rows: Vec<Option<BatchRequestRow>>,
     dispatched: [u64; 16],
@@ -196,6 +197,7 @@ impl BatchJournal {
             )
         })?;
         Ok(Self {
+            epoch: None,
             width,
             rows,
             dispatched: [0; 16],
@@ -204,6 +206,13 @@ impl BatchJournal {
         })
     }
     pub(crate) fn register(&mut self, context: EvalContext) -> Result<(), ContractError> {
+        if self
+            .epoch
+            .is_some_and(|epoch| epoch != context.request.epoch)
+            || context.request.epoch != context.selection.epoch
+        {
+            return Err(invalid());
+        }
         let index = usize::try_from(context.request.sequence)
             .map_err(|_| invalid())?
             .checked_sub(1)
@@ -221,6 +230,7 @@ impl BatchJournal {
         if self.rows[index].is_some() {
             return Err(invalid());
         }
+        self.epoch = Some(context.request.epoch);
         self.rows[index] = Some(BatchRequestRow(
             context.request.sequence,
             context.selection.sequence,
@@ -238,6 +248,9 @@ impl BatchJournal {
         &mut self,
         request: RequestId,
     ) -> Result<&mut BatchRequestRow, ContractError> {
+        if self.epoch != Some(request.epoch) {
+            return Err(invalid());
+        }
         let index = usize::try_from(request.sequence)
             .map_err(|_| invalid())?
             .checked_sub(1)
@@ -256,6 +269,9 @@ impl BatchJournal {
             return Err(invalid());
         }
         let first = contexts[0];
+        if execution.epoch != first.request.epoch {
+            return Err(invalid());
+        }
         for &context in contexts {
             if context.game != first.game
                 || context.root != first.root
@@ -266,7 +282,11 @@ impl BatchJournal {
                 return Err(invalid());
             }
             let row = self.row(context.request)?;
-            if row.4.is_some() || row.2 != context.game.0 || row.3 != context.root.0 {
+            if row.4.is_some()
+                || row.1 != context.selection.sequence
+                || row.2 != context.game.0
+                || row.3 != context.root.0
+            {
                 return Err(invalid());
             }
         }
@@ -310,7 +330,17 @@ impl BatchJournal {
     }
     pub(crate) fn consume(&mut self, context: CompletionContext) -> Result<(), ContractError> {
         let row = self.row(context.request.request)?;
-        if row.4 != context.execution.map(|e| e.sequence) || row.5 != 1 || row.7 != 1 || row.8 {
+        if row.4 != context.execution.map(|e| e.sequence)
+            || row.5 != 1
+            || row.7 != 1
+            || row.8
+            || row.1 != context.request.selection.sequence
+            || row.2 != context.request.game.0
+            || row.3 != context.request.root.0
+            || context
+                .execution
+                .is_none_or(|execution| execution.epoch != context.request.request.epoch)
+        {
             return Err(invalid());
         }
         row.8 = true;

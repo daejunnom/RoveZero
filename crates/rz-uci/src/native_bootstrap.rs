@@ -2843,6 +2843,9 @@ mod physical_owner_tests {
                     },
                     actual: output.actual,
                 };
+                let mut wrong_root = accepted.context;
+                wrong_root.request.root = RootGeneration(2);
+                assert!(journal_owner.batch_consume(wrong_root).is_err());
                 factory.observe_search_acceptance(&accepted, 1).unwrap();
                 assert!(journal_owner.batch_consume(accepted.context).is_err()); // duplicate backup evidence is rejected
                 delivered += 1;
