@@ -404,6 +404,15 @@ pub(crate) mod linux {
         path::PathBuf,
     };
 
+    // Only the syscall chunk changes. Source/copy hashes, full pin rechecks,
+    // byte budgets, closed writers and inode/path ownership stay unchanged.
+    // Keep the original 16KiB path as default until fixed-work E acceptance.
+    const SNAPSHOT_IO_BYTES: usize = if cfg!(feature = "experimental-snapshot-io") {
+        64 * 1024
+    } else {
+        16 * 1024
+    };
+
     pub(crate) struct InputPin {
         pub artifact: ArtifactRef,
         pub path: PathBuf,
@@ -554,7 +563,7 @@ pub(crate) mod linux {
             .into_std();
         let mut count = 0u64;
         let mut hasher = Sha256::new();
-        let mut buffer = [0u8; 16 * 1024];
+        let mut buffer = [0u8; SNAPSHOT_IO_BYTES];
         loop {
             let read = source
                 .read(&mut buffer)
@@ -631,7 +640,7 @@ pub(crate) mod linux {
             .map_err(|_| io("cannot rewind native copy"))?;
         let mut hasher = Sha256::new();
         let mut count = 0u64;
-        let mut buffer = [0u8; 16 * 1024];
+        let mut buffer = [0u8; SNAPSHOT_IO_BYTES];
         loop {
             let read = file
                 .read(&mut buffer)
@@ -1144,6 +1153,89 @@ pub(crate) mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn snapshot_stream_checks_tail_corruption_growth_and_truncation_across_chunks() {
+            let base = std::env::temp_dir().join(format!(
+                "rovezero-snapshot-stream-boundary-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&base).expect("exclusive synthetic stream fixture");
+            let source = base.join("source");
+            let output = base.join("output");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::create_dir(&output).unwrap();
+            let bytes: Vec<u8> = (0..(2 * 64 * 1024 + 17)).map(|i| (i % 251) as u8).collect();
+            let artifact = ArtifactRef {
+                path: "input".into(),
+                sha256: format!("{:x}", Sha256::digest(&bytes)),
+                bytes: bytes.len() as u64,
+                source: "https://example.org/synthetic-stream-boundary".into(),
+                license: "Synthetic ownership fixture only".into(),
+            };
+            let directory = Dir::open_ambient_dir(&output, cap_std::ambient_authority()).unwrap();
+            for case in ["valid", "tail", "growth", "truncation"] {
+                std::fs::write(source.join("input"), &bytes).unwrap();
+                let verified = artifact.open_verified(&source, artifact.bytes).unwrap();
+                match case {
+                    "tail" => {
+                        let mut changed = bytes.clone();
+                        *changed.last_mut().unwrap() ^= 1;
+                        std::fs::write(source.join("input"), changed).unwrap();
+                    }
+                    "growth" => {
+                        let mut writer = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(source.join("input"))
+                            .unwrap();
+                        writer.write_all(&[1]).unwrap();
+                    }
+                    "truncation" => {
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(source.join("input"))
+                            .unwrap()
+                            .set_len(artifact.bytes - 1)
+                            .unwrap();
+                    }
+                    _ => {}
+                }
+                let copied = readonly_copy(
+                    &artifact,
+                    verified,
+                    &directory,
+                    case,
+                    output.join(case),
+                    false,
+                    artifact.bytes,
+                );
+                if case == "valid" {
+                    let (mut pin, receipt) = copied.unwrap();
+                    assert!(receipt.distinct_source_inode && receipt.closed_writer_read_only);
+                    assert_eq!(std::fs::read(&pin.path).unwrap(), bytes);
+                    assert_eq!(pin.file.stream_position().unwrap(), 0);
+                    verify_copy(&mut pin.file, &artifact).unwrap();
+                    assert_eq!(pin.file.stream_position().unwrap(), 0);
+                    std::fs::set_permissions(&pin.path, Permissions::from_mode(0o600)).unwrap();
+                    let mut changed = bytes.clone();
+                    *changed.last_mut().unwrap() ^= 1;
+                    std::fs::write(&pin.path, changed).unwrap();
+                    assert!(matches!(
+                        verify_copy(&mut pin.file, &artifact),
+                        Err(ArenaError::Integrity(_))
+                    ));
+                } else {
+                    assert!(matches!(copied, Err(ArenaError::Integrity(_))));
+                    assert!(
+                        output.join(case).exists(),
+                        "failed partial copy must remain"
+                    );
+                }
+            }
+            drop(directory);
+            // This exclusive synthetic tree never owned native children/NN.
+            std::fs::remove_dir_all(base).unwrap();
+        }
 
         #[test]
         fn verified_source_pin_survives_path_replacement_and_rejects_same_inode_writes() {
