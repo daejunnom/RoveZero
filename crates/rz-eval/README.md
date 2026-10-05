@@ -21,6 +21,15 @@ native runtime/CUDA 설치가 필요 없다. CPU/CUDA 선택, shape/dtype, 최�
 실제 node placement probe를 요구한다. IO 예산과 CUDA arena cap은 전체 RAM/VRAM
 상한이 아니므로 bootstrap/실행 환경에서 activation·workspace·동시 점유를 별도 제한한다.
 
+CUDA arena는 요청 크기만큼 확장하는 SameAsRequested를 명시한다. 기본의
+power-of-two 확장으로 다른 상주 엔진의 여유를 줄이는 일을 피하려는 저장 정책이다.
+tensor·정밀도·kernel·arena 한도와 CPU backend의 설정/identity는 유지한다.
+CUDA digest에는 cuda-arena-extend=same-as-requested-v1을 포함하며 old CUDA의
+cache/실행 증거와 혼용하지 않는다. BT4 수치·No/Repeat·dual-resident 메모리·
+실패 원인 조사와 source별 인수는
+[pilot 기록](../../docs/research/BT4-FINAL-SELECTION-PILOT.md)을 따른다.
+이 설정은 물리 VRAM 부족 원인의 확정이나 모든 모델의 GPU 인수를 대신하지 않는다.
+
 선정 원본→ONNX 변환, 원본 protobuf의 **LC0 Eigen** 대비 실제 Rust ORT CPU 검사를
 통과했다. 서로 같은 ONNX를 두 언어에서 실행한 대조가 아니다. 12개 국면에서 모든
 입력 plane·합법 수 index를 정확히 비교하고 batch 1/2/4/8/16을 검사한다.

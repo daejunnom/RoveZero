@@ -25,6 +25,11 @@ Fastchess `-strict`는 time-loss WARN에서 PGN 저장 전에 중단하므로 pi
 사용하지 않는다. 두 판의 오류 결과를 저장한 다음 E가 provider/clock 실패를
 거부하고 다음 pair를 중단한다. V1/V2의 strict 실행 옵션은 유지한다.
 
+startup FATAL에서는 해당 판의 PGN이 아직 없을 수 있다. 먼저 완료된 PGN과 raw
+stdout을 보존하고, V3 startup-failure audit가 정확한 game-start/FATAL·역할/색/순서를
+검사해 패배 선언을 남긴다. 없는 PGN을 만들어 채우거나 원래 process/provider/clock
+실패를 성공으로 바꾸지 않는다.
+
 ## 원본 저작권 고지
 
 MIT License

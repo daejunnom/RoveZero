@@ -156,3 +156,20 @@ V2의 domain은 `rz-e-native-cuda-integration-pair-v2`, canonicalization은
 고유 byte 예산을 검사하며 `execution_ready=false`, `strength_eligible=false`를 유지한다.
 크기 상한·잠금·CPU 검사만으로 GPU 실행·권리 확인·대국 강도를 승인하지 않는다.
 BT4의 권리 상태는 `UNVERIFIED-local-research-only`, 재배포는 허용하지 않는다.
+
+## BT4 S0/S1 pilot V3
+
+CudaSearchPilotPairSpecV3·NativeCudaProfileV3는 purpose cuda_search_pilot,
+schema 3, domain rz-e-native-cuda-search-pilot-v3, canonicalization
+rz-e-native-cuda-search-pilot-json-v3로 구분한다. V1/V2는 이 purpose를 거부한다.
+모델·source/binary·backend/인코딩·자원·runtime 입력은 같아야 하며,
+simulation cap 4096의 S0 visits→S1 exact-terminal만 허용한다.
+
+30,000ms+100ms clock·고정 16개 cohort의 ordinal·첫 백 배정·256 ply·전체 120분,
+fixed_paired_hoeffding95·automatic claim·engine failure Loss·cutoff Incomplete를
+닫힌 pilot 선언으로 잠근다. cohort/runner patch도 ArtifactRef로 검증하고 고유 input
+예산에 포함한다. runner dirty를 일반 허용하지 않으며 정확한 source·4119-byte clock
+patch SHA·수정 binary·compiler를 대조한다. lock/CPU 검사만으로 NN/GPU·전체 시계·
+강도를 인수하지 않는다. 작은 pilot은 실행 이후에도 execution_ready=false,
+strength_eligible=false이며 결과·미완료·실패·재실행은
+[별도 명세](../../docs/research/BT4-FINAL-SELECTION-PILOT.md)에 둔다.

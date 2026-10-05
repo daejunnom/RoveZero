@@ -708,3 +708,13 @@ fresh attempt로 재생성한다. 원래 execution receipt는 정리 전 인수 
 
 이번 인수는 E/B/C/D/A의 **BT4 CUDA A/A 연결**이다. 정식 전체 엔진 시계·S0/S1 holdout
 통계·LC0 동조건 기력·전체 solver/학습/새 RunPod 인수는 후속으로 남는다.
+
+## 11. BT4 S0/S1 최종 선택 pilot과 CUDA 할당
+
+후속의 16쌍·32판·전체 120분은 사용자 확정이며 V2 A/A와 별도인 V3 선언으로
+잠근다. 같은 최소 PUCT·BT4 FP32/B1·4096 simulation cap에서 final selection만
+비교한다. 전체 시계와 사전 통계·opening·실패 처리, 처음 중단된 시도와 독립
+RAM/VRAM 조사, C 요청 크기 arena 변경·새 backend identity·수치/CI 인수·재실행은
+[BT4 최종 선택 pilot](BT4-FINAL-SELECTION-PILOT.md)에 기록한다. 실제 GPU 원시 PGN과
+로그는 동일 연구 질문의 외부 보고서에 보존한다. 한 번의 메모리 감소·부분 대국을
+holdout 기력이나 원인 확정으로 바꾸지 않고, 중단과 새 실행의 결과를 합치지 않는다.

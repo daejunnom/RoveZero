@@ -512,3 +512,26 @@ V2 실행은 검증 완료 private input snapshot에만 DONTNEED 힌트를 적�
 원본·공유 runtime cache의 보존 정책을 바꾸지 않고, descriptor·별도 inode·readonly
 권한·hash·실행 후 identity 재검사를 유지한다. 이 힌트의 존재를 실제 RAM 회수나
 GPU 개선 근거로 쓰지 않으며, 실제 실패와 같은 자원 조건의 후속 실행을 대조한다.
+
+## 16. E V3 pilot의 최종 선택·전체 시계·실패와 C 메모리 정책
+
+총괄은 V3의 purpose/schema/domain과 source·binary·모델·runtime의 동일성을
+대조하고, final selection만 달라지도록 수동 연결한다. 공통 revision 0.1과
+CPU/CUDA V1·V2 A/A의 wire/domain·기존 계측 의미는 유지한다.
+
+| 접점 | 직접 대조할 조건 |
+|---|---|
+| V3 선언→B 설정 | 두 역할 cap 4096·같은 PUCT·clock/resource·actual B search-config와 startup bytes/PID; final selection만 visits/exact-terminal |
+| E clock→runner | exact Fastchess source·patch hash/bytes·modified binary·compiler; 초기 추가 증분 0, position 전송 전부터 bestmove, ns 올림·절대 read deadline |
+| runner clock→A PGN | 역할·새 게임 reset·각 searched ply의 전후 시계·제시간 증분, 완전 opening·색 교환·A 종료/현재 claim |
+| 실패→원장 | Loss PGN 또는 pre-PGN startup loss의 pinned renderer 보존; provider/clock 실패를 유지하고 좋은 판만 집계하지 않음 |
+| C 할당→backend | 요청 크기 arena 확장 marker의 새 digest; 모델/FP32/TF32 off/3 GiB·cache provenance 유지 |
+| 재실행→새 잠금 | source/engine/backend와 16개 input hash 갱신; 원래 실패·분모를 유지하고 두 시도를 합치지 않음 |
+
+새 C 정책은 BT4 수치·dual-resident 메모리·normal Computed·물리 종료로 확인한다.
+한 번의 GPU 메모리 감소를 기존 오류의 물리 VRAM 원인이나 일반적인 속도/기력
+개선으로 바꾸지 않는다. old backend의 평가/실행 증거를 새 backend 성공으로
+자동 재사용하지 않는다. source별 CPU/CI와 GPU 인수는
+[pilot 인수 기록](research/BT4-FINAL-SELECTION-PILOT.md)에서 구분한다.
+develop 반영 때 최신 E argv·C backend marker·B startup/search/final·A PGN·clock/failure와
+같은 integration SHA의 소비자 검사를 다시 수동 대조한다.

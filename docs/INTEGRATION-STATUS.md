@@ -1164,3 +1164,30 @@ scored 0, strength/execution_ready false**이며 holdout·Elo 완료가 아니�
 8,910,431,856 logical bytes만 정리했다. 원본·C cache·모델·연구 증거를 보존하며
 전체 E input snapshot은 원래 잠금 명세에서 재생성한다. WSL 논리 정리량을
 Windows 디스크 물리 회수량으로 표시하지 않는다.
+
+## E BT4 CUDA V3 pilot과 메모리 후속 — 2026-10-05
+
+총괄이 CUDA V3 purpose/schema/domain·고정 16 opening·S0 visits/S1 exact-terminal의
+최종 선택 차이·30초+0.1초 전체 시계·256 ply·고정 paired Hoeffding95를 연결했다.
+V1/V2 A/A와 공통 revision 0.1은 유지한다. Fastchess exact source/patch/binary와
+clock trace를 A PGN·현재 draw claim·실제 B search-config/NN·physical drain/exit에
+대조하며 시작 전 실패도 별도 원장에 보존한다. 새 승인 흐름이나 merge 권한은 추가하지 않는다.
+
+초기 source f20a621의 3쌍은 인수됐지만 4번째 쌍의 두 번째 S1 model load에서
+6 MiB 할당 실패로 중단했다. 원래 E 실패·먼저 완료된 PGN과 pre-PGN startup loss를
+보존한다. 이번 RAM peak 약 3.93 GiB·한도/OOM 사건 0과 독립 dual 진단만으로
+물리 VRAM 원인을 확정하지 않는다. source d44f059의 CUDA 요청 크기 arena 변경은
+새 backend identity를 발급하며 BT4 수치·Rules No/Repeat·dual memory·물리 종료를
+별도로 검증했다. 한 번의 device memory 표본은 2398→1710 MiB였다.
+
+source d44f059에서 local workspace 749 passed·0 failed·16 ignored와 fmt/strict
+Clippy/release, [CI 37261878758](https://github.com/daejunnom/RoveZero/actions/runs/37261878758)의
+Windows/Ubuntu 필수 step SUCCESS를 직접 확인했다. ignored는 로컬 미실행이며
+실제 GPU 실행과 CPU CI를 구분한다. 새 source/binary/backend를 잠근 두 번째 시도도
+3쌍 인수 뒤 4번째 pair/game-2에서 같은 6 MiB 초기화 실패로 중단했다. 실패한 pair의
+첫 판은 독립 재생한 124 ply 무승부이고 PGN이 없는 S1 startup loss는 새 E audit에 남겼다.
+각 시도는 등록 16쌍 중 13쌍 미완료이며 점수·표본을 합치지 않는다. arena 점유 감소가
+반복 실패를 해결했다고 주장하지 않는다. allocator 구분 진단과 후속 실행은 누적
+120분 안에서 유한하게 진행한다. 부분 진행을 32판 완료로 표시하지 않는다.
+최종 실행 상태·검증·실패·누락·원시 자료의 logical root는
+[pilot 기록](research/BT4-FINAL-SELECTION-PILOT.md)을 따른다. #20은 Draft다.

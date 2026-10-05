@@ -68,6 +68,13 @@
 | RZ-D039 | 사용자 후속 진행 / 2026-10-05 | BT4 대국 후속에 앞서 B03의 독립 stop/deadline 출력 경계를 인수한다. 논리 취소 시 마지막 유효 착수를 고정하고 소유 worker의 정상 물리 drain·join 뒤에만 출력한다. 입력/isready는 유지하며 scope 교체는 보류 착수를 폐기한다. 같은 유한 shutdown_limit의 오류·panic·시간 초과는 원래 typed serve 오류로 전달하고 착수를 승인하지 않는다. 공통 revision 0.1·PUCT·WDL·S0/S1·cache provenance는 유지한다. 실제 CUDA 수명 질의와 고정 종료 회귀를 E BT4 artifact/profile·holdout 강도·device profiling 인수와 구분한다. [출력 경계 인수](research/LOCAL-MODEL-BASELINE.md#9-stop마감-출력의-물리-완료-경계)를 따른다. |
 | RZ-D040 | 사용자 후속 진행 / 2026-10-05 | E에 BT4 CUDA launch V2의 별도 schema/domain·exact source·ONNX/arena 한도와 실제 search-config receipt 대조를 추가한다. CPU/CUDA launch V1·공통 revision 0.1·provider V1·PUCT/S0/S1을 유지한다. 초기 second-model allocation 실패와 RAM 12/14 GiB 진단은 보존하며, verified private snapshot만의 캐시 힌트 뒤 같은 12 GiB에서 실제 E/B/C/D/A A/A 연결을 인수했다. 네 fresh process·CUDA/backup/drain·전체 PGN의 감사와 두 OS CI를 확인했다. 18 ply cutoff 두 판은 Incomplete·점수 대상 0·strength false이며 정식 시계·S0/S1 holdout·LC0 기력·학습 인수가 아니다. [V2 연결 인수](research/LOCAL-MODEL-BASELINE.md#10-e-bt4-cuda-v2의-실제-aa-연결-인수)를 따른다. |
 
+## BT4 pilot 후속 결정 — 2026-10-05
+
+| ID | 상태 | 기준과 근거 |
+|---|---|---|
+| RZ-D041 | 사용자 표본 확정·별도 탐색 정책 pilot | 같은 BT4 FP32/B1·PUCT에서 S0 visits와 S1 exact-terminal의 최종 선택만 비교한다. 사용자 확정은 16쌍·32판·전체 최대 120분, 시계는 30초+제시간 착수 뒤 0.1초·최대 256 ply다. 별도 CUDA V3 schema/domain·고정 cohort·흑백 교환·전체 position→bestmove 시계·자동 claim의 A 검증·고정 paired Hoeffding95를 잠근다. V2 A/A cutoff를 점수로 재해석하지 않으며 작은 pilot을 Elo·승격으로 보고하지 않는다. 실패·미완료·시작 전 엔진 실패도 원장에 남긴다. [pilot 명세와 인수](research/BT4-FINAL-SELECTION-PILOT.md)를 따른다. |
+| RZ-D042 | 사용자 할당 실패 확인·개선·계속 요청 | 기존 RAM 압박과 이번 모델 초기화 할당 실패를 구분한다. RAM 최고치·한도 사건·GPU 표본과 별도 dual 진단만으로 물리 VRAM 부족을 확정하지 않는다. CUDA arena 확장을 요청 크기로 바꾸고 backend identity를 분리한다. BT4 독립 수치·Rules No/Repeat·두 엔진 상주 메모리·물리 종료·CPU 검사/CI를 먼저 인수한다. 실패한 pilot은 보존하고 새 source/binary/backend를 잠근 16쌍을 처음부터 실행한다. 두 시도의 점수를 합치지 않고 최초 전체 120분 안에서 진단·재실행을 마감한다. 모델·FP32·TF32 off·PUCT·S0/S1·arena 상한은 유지한다. |
+
 ## 남은 결정과 실행 전 잠금
 
 기존 ID를 유지한다. `부분 결정`인 행의 확정 부분을 다시 미정으로 취급하지 않는다.

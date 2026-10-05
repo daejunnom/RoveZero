@@ -41,4 +41,82 @@ pair라는 가정 아래 고정 16쌍 평균의 95% Hoeffding 반폭은
 외부 보고서에 보존한다. 원본 모델·가중치·runtime cache는 유지하며 비활성인 전용
 E library snapshot만 검증된 증거 회수 뒤 정리한다. 원시 PGN·로그·모델은 Git 밖에 둔다.
 
-실제 실행 결과는 후속 인수 기록에 추가한다. 이 사전 선언은 GPU 실행·강도 인수 증거가 아니다.
+## 최초 시도와 실패 원인 조사
+
+실제 source `f20a621510a69e11025bf4a9a048b06bcd1c1ff8`·engine binary
+`79df6e51…a275f`·backend `2ef72d33…d6d53`의 첫 시도는 853.73초 뒤 중단했다.
+처음 세 pair/6판은 process/provider/search/전체 clock/A PGN·독립 python-chess를
+통과했다. 네 번째 pair의 첫 판은 176 ply의 정상 무승부 PGN을 남겼지만 두 번째
+판의 S1 모델 초기화에서 6,291,456-byte BFCArena 할당 오류가 발생했다.
+runner exit 1·E CLI exit 2·integration false·scored 0과 원본 로그/PGN을 보존했다.
+먼저 완료된 무승부도 그 pair의 완전한 provider/clock 인수로 승격하지 않는다.
+
+오류 당시 cgroup memory.peak는 4,222,369,792 bytes(약 3.93 GiB), max/high/oom/
+oom_kill 증가는 0, owned cleanup은 완료였다. device VRAM 표본 최고치는 2254 MiB다.
+이전 V2 실패의 약 11.72 GiB host 최고치와 구분한다. 이전에도 Linux OOM kill은 0이었고
+동일 오류 문자열만으로 RAM/VRAM 원인을 확정하지 않는다.
+[ORT BFCArena 소스](https://github.com/microsoft/onnxruntime/blob/v1.22.0/onnxruntime/core/framework/bfc_arena.cc)는
+CPU/device resource allocator를 공통으로 감싸므로 그 예외 자체가 물리 VRAM 부족의
+증거는 아니다. Windows host/WDDM·pinned host memory·순간 allocator 여유는 별도다.
+[CUDA on WSL의 pinned system memory 제약](https://docs.nvidia.com/cuda/wsl-user-guide/)도
+원인 후보이며 이번 실행의 직접 원인으로 확인한 것은 아니다.
+
+같은 old binary·두 엔진 동시 상주·RAM 12 GiB/CPU 2/AS 128 GiB의 독립 진단 두 회는
+네 process 모두 model load·32-visit search·quit exit 0을 통과했다. 오류가 재현되지
+않았으므로 단순한 두 모델 동시 실행 불가로 결론 내리지 않는다. 진단의 부모 CUDA
+메모리 조회는 다른 context의 상주/종료에도 같은 값을 반환해 aggregate VRAM 여유의
+유효한 근거로 사용하지 않았다. device 표본의 짧은 순간 peak 누락도 가능한 한계다.
+
+PGN이 없는 startup 실패를 숨기지 않도록 별도 closed audit를 추가했다. 총괄이
+보존한 pinned runner의 정확한 game-start/FATAL renderer·역할/색/순서를 대조해
+S1의 game-2 startup loss를 확인했다. parser source `d44f059`의 사후 회계이며
+f20a621의 원래 E 영수증은 변경하지 않는다. 이 loss는 정상 완료/인수 점수가 아니며
+failed attempt의 원장에 남긴다. 남은 pair를 좋은 결과만 골라 완성하거나 자동 재시도하지 않았다.
+
+## C 메모리 정책 변경과 별도 인수
+
+사용자는 오류 확인·개선 가능하면 개선·계속을 요청했다. source
+`d44f05929be1a1f6565f0c91421b2e7312da60f7`은 CUDA arena를
+`SameAsRequested`로 명시해 불필요한 power-of-two 확장을 줄인다.
+모델·입력·FP32·TF32 off·kernel·3 GiB arena 상한·PUCT·최종 선택 정책은 유지한다.
+CUDA backend identity에 `cuda-arena-extend=same-as-requested-v1`을 추가하고 old
+identity와 혼용하지 않는다. CPU 설정과 identity는 유지한다.
+[ort rc.10의 명시 옵션](https://github.com/pykeio/ort/blob/v2.0.0-rc.10/src/execution_providers/cuda.rs)과
+ORT의 allocation 구현을 대조했다. 이는 memory 정책 개선이며 오류 근본 원인을
+확정하거나 무오류 실행을 보장한 수정은 아니다.
+
+| 검사 | source d44f059의 실제 결과 |
+|---|---|
+| LC0 독립 protobuf 수치 | BT4 12-case와 batch 1/2/4/8/16 통과; logits 최대 절대 오차 6.509e-5·WDL 1.789e-7·합법 policy 2.802e-6 |
+| 실제 A→C→D | No/Repeat를 포함한 12-case의 입력 tensor 오차 0·합법수/순서·평가/finalization·물리 종료 통과 |
+| dual resident | 같은 CPU/RAM/AS와 입력에서 old/new 각각 두 process model load·32-visit search·exit 0 통과 |
+| GPU 메모리 표본 | 한 쌍의 old→new probe 최고치 2398→1710 MiB, 688 MiB 감소. observer context를 포함한 whole-device 표본, 일반적 감소율/모든 순간 peak/속도 주장 아님 |
+| 로컬 source 검사 | workspace all-target/all-feature 749 passed·0 failed·16 ignored, fmt·strict Clippy·release 성공. ignored는 로컬 미실행 |
+| exact-source CI | [37261878758](https://github.com/daejunnom/RoveZero/actions/runs/37261878758) Windows/Ubuntu 필수 step SUCCESS 직접 확인. CPU CI와 GPU 실행은 별도 |
+
+재실행 engine binary SHA는
+`a46e941c63253d6a898121fe662f8aa3981702ba5874698a8d7dac18259cf1c6`,
+B1 backend SHA는 `e5fae5b061fab8e83bcc8aabac462c42ca710e84ac30ebffa3da002c43142857`다.
+runner SHA는 `04b83c5ba8af01429db82ff1b2cabda5bf8185678ed9047134f42833a5f77d83`,
+patch/cohort와 B1/clock/seed/자원은 동일하며 16개 lock을 먼저 고정했다.
+두 역할 모두 같은 새 C backend를 사용한다. 기존 오류와 모든 점수는 보존하되
+새 시도의 결과와 합치지 않는다. 이미 관측한 cohort를 재사용한 pilot이므로
+새로운 미관측 opening holdout이라고 주장하지 않는다. 진단·재실행은 처음의 120분
+안에서 끝내며 단조 시간의 추가 한도와 누적 wall deadline을 감독자가 집행한다.
+
+source d44f059의 두 번째 시도도 818.81초 뒤 네 번째 pair/game-2의 S1 model load에서
+같은 6,291,456-byte 할당 오류로 중단했다. 세 pair/6판은 완전 인수됐고 S1 W1/D3/L2,
+pair score 합계 1.25지만 등록된 16쌍 중 13쌍은 빠져 있다. 고정 분모의 점수 가능 범위는
+0.078125~0.890625, Hoeffding 95% 범위는 [0,1]이며 전체 강도는 inconclusive다.
+첫 시도와 같은 WDL도 두 시도의 점수·표본을 합치는 근거가 아니다.
+
+실패한 pair-03의 first game은 124 ply의 insufficient-material draw로 독립 재생했다.
+game-2는 PGN 생성 전 S1 startup loss이며 새 E failure audit가 직접 보존했다.
+그 pair의 integration false/scored 0을 유지한다. 실패한 pair의 RAM peak
+4,222,263,296 bytes·memory max/oom 사건 0, device 표본 최고치 1630 MiB만으로
+물리 VRAM 부족을 확정하지 않는다. 요청 크기 arena 변경은 측정한 점유 감소를
+제공했지만 이 반복 실패를 해결하지 않았다. CPU/CUDA/pinned-host allocator를
+구별할 별도 INFO 진단을 진행하며 진단 전용 바이너리·패치와 결과를 정식 대국과 분리한다.
+
+실행 요청·잠금·부분 진행을 완료한 16쌍으로 표시하지 않는다. 원시 자료의 논리 루트는 저장소 밖
+`reports/coordinator-integration/native-bt4-holdout-20261005/`다.

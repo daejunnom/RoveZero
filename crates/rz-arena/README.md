@@ -345,3 +345,35 @@ V2에서는 실행 직전 해시·inode 대조를 마친 8 MiB 이상 private in
 실행 후 재검사는 유지한다. 이는 OS cache hint이며 실제 RAM 회수나 속도 개선을
 보장하지 않는다. 호출 오류는 typed preparation 실패로 보존한다. CPU/CUDA V1은 이
 힌트를 사용하지 않는다. 디스크의 E input snapshot 복사 자체를 제거한 변경도 아니다.
+
+## BT4 최종 선택 pilot V3
+
+별도 명령은 `native-cuda-pilot-lock INPUT OUTPUT`,
+`native-cuda-pilot-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME`이다.
+같은 verified input/process/provider 구현에 sealed V3 profile을 연결한다.
+두 역할의 source·binary·모델·runtime·자원·인코딩은 같고, simulations=4096에서
+visits와 exact-terminal의 최종 선택만 다르다. V1/V2 A/A는 유지한다.
+등록 cohort의 ordinal·opening·첫 색과 whole-game clock을 잠그고 고정된 Fastchess
+source/patch/binary를 검증한다. -strict를 빼서 시간패의 PGN을 회수하며 오류가 있는
+pair를 정상 인수하지 않는다.
+
+전체 시계는 position 전송 전부터 bestmove까지 부모의 단조 시간으로 측정한다.
+부분 ms 올림·제시간 착수 뒤 증분·새 게임의 30,000ms 초기화·흑백 역할을
+A가 재생한 모든 PGN ply와 대조한다. 100ms read margin은 시간패를 연장하지 않는다.
+자동 draw claim은 A의 현재 위치 근거가 있어야 한다. 정상 종료와 인수된 claim은
+pilot의 scored_games에 포함되지만 cutoff는 Incomplete다. 네 fresh native process의
+provider/search/placement·physical drain·exit 0과 전체 clock gate를 별도로 요구하며
+execution_ready=false, strength_eligible=false는 유지한다.
+
+시작 실패는 해당 판의 PGN이 없을 수 있다. V3는 pinned runner의 순서가 맞는
+game-start와 FATAL startup 기록을 검사해 failure_audit.startup_losses에 패배 선언을
+남긴다. 인용된 engine stderr·없는/다른 역할·중복/알 수 없는 FATAL은 인수하지 않는다.
+이 원장은 실패한 provider/clock gate를 통과시키거나 scored_games를 늘리지 않는다.
+먼저 완료된 PGN과 원래 로그를 보존하고 다음 pair를 중단한다.
+pilot_failure_audit PAIR_SPEC_JSON RUNNER_STDOUT_LOG example은 보존한 로그의 독립
+사후 회계이며 원래 실패 영수증을 수정하지 않는다.
+
+V3도 검증된 private input copy에만 DONTNEED 힌트를 적용한다.
+표본·시계 fixture·초기 할당 실패·새 CUDA 메모리 정책과 재실행 인수는
+[pilot 기록](../../docs/research/BT4-FINAL-SELECTION-PILOT.md)을 따른다. 원시 PGN·로그는
+저장소 밖에 보존하며 새 실행을 과거 실패와 합쳐 선택적으로 집계하지 않는다.
