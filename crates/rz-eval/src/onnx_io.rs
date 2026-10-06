@@ -20,47 +20,58 @@ pub(super) struct BoundBuffers {
     device_input: Option<Tensor<f32>>,
     host_policy: Option<Tensor<f32>>,
     host_wdl: Option<Tensor<f32>>,
+    // ort rc.10's Tensor::new does not retain the supplied Allocator. Native
+    // tensor copies/destruction still use its callbacks. Keep this LAST so all
+    // binding-held values and device_input drop before the allocator, also when
+    // construction fails after only some of the buffers have been created.
+    allocator: Allocator,
 }
 impl BoundBuffers {
     pub fn new(session: &Session, provider: Provider, batch: usize) -> ort::Result<Self> {
-        let mut binding = session.create_binding()?;
-        let cpu = Allocator::default();
-        let (allocator, device_input, host_policy, host_wdl) = match provider {
-            Provider::Cpu => (cpu, None, None, None),
-            Provider::Cuda { device_id, .. } => {
-                let allocator = Allocator::new(
-                    session,
-                    MemoryInfo::new(
-                        AllocationDevice::CUDA,
-                        device_id,
-                        AllocatorType::Device,
-                        MemoryType::Default,
-                    )?,
-                )?;
-                let input = Tensor::<f32>::new(&allocator, [batch, 112, 8, 8])?;
-                binding.bind_input(INPUT_NAME, &input)?;
-                (
-                    allocator,
-                    Some(input),
-                    Some(Tensor::new(&cpu, [batch, POLICY_SIZE])?),
-                    Some(Tensor::new(&cpu, [batch, 3])?),
-                )
-            }
+        let allocator = match provider {
+            Provider::Cpu => Allocator::default(),
+            Provider::Cuda { device_id, .. } => Allocator::new(
+                session,
+                MemoryInfo::new(
+                    AllocationDevice::CUDA,
+                    device_id,
+                    AllocatorType::Device,
+                    MemoryType::Default,
+                )?,
+            )?,
         };
+        // Install the allocator owner before creating any dependent tensor.
+        // Local reverse drop order would otherwise release it before binding
+        // on a later allocation/bind failure.
+        let mut buffers = Self {
+            batch,
+            binding: session.create_binding()?,
+            device_input: None,
+            host_policy: None,
+            host_wdl: None,
+            allocator,
+        };
+        if matches!(provider, Provider::Cuda { .. }) {
+            buffers.device_input = Some(Tensor::new(&buffers.allocator, [batch, 112, 8, 8])?);
+            buffers.binding.bind_input(
+                INPUT_NAME,
+                buffers.device_input.as_ref().expect("device input"),
+            )?;
+            let cpu = Allocator::default();
+            buffers.host_policy = Some(Tensor::new(&cpu, [batch, POLICY_SIZE])?);
+            buffers.host_wdl = Some(Tensor::new(&cpu, [batch, 3])?);
+        }
         // These output addresses remain fixed through capture/replay. Binding
         // owns them; results are copied before the next exclusive Run.
-        binding.bind_output(
+        buffers.binding.bind_output(
             POLICY_NAME,
-            Tensor::<f32>::new(&allocator, [batch, POLICY_SIZE])?,
+            Tensor::<f32>::new(&buffers.allocator, [batch, POLICY_SIZE])?,
         )?;
-        binding.bind_output(WDL_NAME, Tensor::<f32>::new(&allocator, [batch, 3])?)?;
-        Ok(Self {
-            batch,
-            binding,
-            device_input,
-            host_policy,
-            host_wdl,
-        })
+        buffers.binding.bind_output(
+            WDL_NAME,
+            Tensor::<f32>::new(&buffers.allocator, [batch, 3])?,
+        )?;
+        Ok(buffers)
     }
     pub fn run(
         &mut self,
