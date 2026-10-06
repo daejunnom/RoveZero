@@ -44,8 +44,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let root = RulesUciPort::new(owners, Default::default())
                 .prepare(&spec)?
                 .snapshot;
-            let input_key =
-                factory.input_key(root.state().rules(), root.state().legal_moves().moves())?;
+            // Rules terminals never submit evaluation and have no model input.
+            let input_key = if root.state().snapshot().classification().play_status
+                == PlayStatus::Ongoing
+            {
+                Some(factory.input_key(root.state().rules(), root.state().legal_moves().moves())?)
+            } else {
+                None
+            };
             let probe = diagnostics::run(
                 &factory,
                 &clock,
@@ -86,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 json!({
                     "schema":"rz-mock-adapter-equivalence/1", "name":name, "repeat":repeat,
                     "position":command, "simulation_limit":128, "final_selection":"visits",
-                    "input_key":format!("{input_key:?}"), "status":format!("{:?}", probe.outcome.status),
+                    "input_key":input_key.map(|key|format!("{key:?}")), "status":format!("{:?}", probe.outcome.status),
                     "best_move":probe.outcome.best_move.map(move_text).transpose()?,
                     "chosen_child":chosen_child.map(|child|format!("{:?}", child.snapshot().classification().play_status)),
                     "root_stats":stats, "counters":format!("{:?}", probe.outcome.counters),
