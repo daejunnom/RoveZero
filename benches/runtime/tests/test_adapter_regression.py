@@ -1,11 +1,15 @@
 """Fail-closed comparison/accumulation checks; no GPU performance test in CI."""
 import copy
+import contextlib
+import io
 from pathlib import Path
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from adapter_regression import pair_result, resource_affinity, summarize
+from adapter_regression import pair_result, resource_affinity, run, summarize
 from bounded_local import resolve_affinity
 
 
@@ -17,6 +21,44 @@ def observation(t=100., p=1000):
 
 
 class AdapterRegressionTests(unittest.TestCase):
+    def test_invalid_series_budget_cannot_create_output_or_start_a_child(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output=Path(temporary)/"comparison"
+            with patch("adapter_regression.prepare_cache") as prepare, \
+                    patch("adapter_regression.run_once") as execute:
+                for budget in (True,209,3601,3600.0,"3600"):
+                    with self.assertRaises(ValueError):
+                        run({},output,budget)
+                self.assertFalse(output.exists())
+                prepare.assert_not_called()
+                execute.assert_not_called()
+
+    def test_AA_global_drift_holds_before_AB_even_when_each_AA_pair_passes(self):
+        source={"source_commit":"a"*40,"source_patch":None,
+                "binary_sha256":"b"*64,"expected_profile":{}}
+        manifest={"baseline":source,"candidate":source,
+                  "resource_notes":{},"runtime_cache_preparation":{}}
+        # Each pair has zero local spread, but the six A runs drift by 8%.
+        observations=[observation(t) for t in (100.,100.,104.,104.,108.,108.)]
+        with tempfile.TemporaryDirectory() as temporary:
+            output=Path(temporary)/"comparison"
+            with patch("adapter_regression.resource_affinity",return_value=[0,2]), \
+                    patch("adapter_regression.prepare_cache",return_value={"status":"passed"}), \
+                    patch("adapter_regression.run_once",side_effect=observations) as execute, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(run(manifest,output,3550),2)
+                self.assertEqual(execute.call_count,6)
+                self.assertTrue(all(call.args[0] is source and call.args[3]==[0,2]
+                                    for call in execute.call_args_list))
+            import json
+            registration=json.loads((output/"registration.json").read_text())
+            summary=json.loads((output/"summary.json").read_text())
+            self.assertEqual(registration["overall_seconds"],3550)
+            self.assertEqual(summary["status"],"hold")
+            self.assertEqual(summary["pair_count"],3)
+            self.assertEqual(summary["AB_totals"]["A_time"],0)
+            self.assertIn("AA overall spread",summary["error"])
+
     def test_declared_cpu_ids_are_applied_without_an_unavailable_fallback(self):
         self.assertEqual(resolve_affinity([0,2],{0,1,2,3}),[0,2])
         self.assertEqual(resolve_affinity(None,{0,1,2,3}),[0,1])
