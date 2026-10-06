@@ -1,5 +1,7 @@
 //! Explicit V2 lock/execute entry point; inherited Linux limits are checked.
-use rz_experiments::{LockedManifestV2, RunManifestV2};
+#[cfg(target_os = "linux")]
+use rz_experiments::LockedManifestV2;
+use rz_experiments::RunManifestV2;
 use std::{
     error::Error,
     fs,

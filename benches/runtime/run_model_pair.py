@@ -7,6 +7,60 @@ from bounded_local import OwnedRun, outside_git, put
 from paired_search import read_json, require, sha256
 
 
+def gate_identities(declaration, reports):
+    """A passed report from another executable/model/opponent cannot admit play."""
+    rove=[e["configuration"] for e in declaration["engines"] if e["endpoint"]=="rove_zero"]
+    external=[e["configuration"] for e in declaration["engines"] if e["endpoint"]=="external_uci"]
+    require(len(rove)==len(external)==1,"one RoveZero and external endpoint required")
+    rove,external=rove[0],external[0]
+    launch=rove["launch"]
+    require(launch["provider"]=="lc0_cuda","this pilot requires the registered BT4 CUDA B1 recipe")
+    launch=launch["declaration"]
+    profile=launch["profile"]["runtime"]
+    artifacts={a["role"]:a["artifact"] for a in launch["artifacts"]}
+    regression=reports["adapter_regression"][0]
+    tested=regression["candidate"]
+    require(tested["binary_sha256"]==rove["tool"]["binary"]["sha256"] and
+            tested["source_commit"]==rove["tool"]["source_commit"] and
+            tested["expected_profile"]["backend_sha256"]==profile["expected_backend_sha256"] and
+            tested["expected_profile"]["encoding_manifest_sha256"]==profile["expected_encoding_sha256"] and
+            tested["expected_profile"]["model_manifest_sha256"]==artifacts["export_manifest"]["sha256"],
+            "adapter regression used a different executable or semantic profile")
+    resources=regression["resource_notes"]
+    policy=declaration["resources"]
+    require(resources["cpu_affinity"]==policy["affinity"] and
+            resources["memory_high_GiB"]*1024**3==policy["memory_high_bytes"] and
+            resources["memory_max_GiB"]*1024**3==policy["memory_max_bytes"] and
+            resources["swap"]==policy["swap_max_bytes"],"regression resource policy differs")
+    matched_raw=matched_rules=0
+    for report in reports["numerical"]:
+        if report.get("onnx_sha256")==artifacts["onnx"]["sha256"]:
+            require(report["input_f32_bytes_equal"] and report["backend_shutdown_completed"] and
+                    report["backend_sha256"]==profile["expected_backend_sha256"] and
+                    report["runtime_sha256"]==artifacts["ort_library"]["sha256"] and
+                    report["cuda_bundle_sha256"]==launch["cuda_bundle"]["canonical_sha256"] and
+                    report["provider"]=="cuda" and report["precision"]=="fp32" and not report["tf32"],
+                    "raw numerical gate used different runtime/model semantics")
+            matched_raw+=1
+        identity=report.get("identity",{})
+        if identity.get("onnx_sha256")==artifacts["onnx"]["sha256"]:
+            require(identity["runtime_sha256"]==artifacts["ort_library"]["sha256"] and
+                    identity["runtime_bundle_sha256"]==launch["cuda_bundle"]["canonical_sha256"] and
+                    report["provider"]=="cuda" and report["precision"]=="fp32",
+                    "Rules numerical gate used different runtime/model semantics")
+            matched_rules+=1
+    require(matched_raw==matched_rules==1,"one raw and Rules numerical gate for the played model required")
+    preflight=reports["external_preflight"][0]
+    probed=preflight["endpoint"]
+    for key in ("family","version","expected_uci_name","arguments","requested_options","source"):
+        require(probed[key]==external[key],"external preflight differs: "+key)
+    for key in ("sha256","bytes"):
+        require(probed["binary"][key]==external["binary"][key],"external preflight binary differs")
+    require(probed["assets"]==external["assets"] and preflight["two_fresh_processes"] and
+            preflight["quit_and_owned_group_cleanup"] and preflight["stop_legal_bestmove"] and
+            preflight["supported_requested_options"],"external lifecycle preflight incomplete")
+
+
 def run(registration, output):
     require(set(registration)=={"binary","binary_sha256","lock","lock_sha256","asset_root","gate_reports"},"pair registration fields differ")
     binary=outside_git(registration["binary"])
@@ -19,11 +73,17 @@ def run(registration, output):
     require(declaration["white_order"]==["baseline","candidate"] and declaration["opening"]["initial"]=="startpos" and not declaration["opening"]["moves"],"paired complete standard start required")
     gates=registration["gate_reports"]
     require(set(gates)=={"numerical","adapter_regression","external_preflight"},"all independent gates required")
+    reports={}
     for gate, refs in gates.items():
-        require(isinstance(refs,list) and 1<=len(refs)<=8,"finite gate reports required")
+        require(isinstance(refs,list) and len(refs)==(4 if gate=="numerical" else 1),"four numerical and one regression/preflight report required")
+        require(len({ref["sha256"] for ref in refs})==len(refs),"duplicate evidence cannot satisfy a gate")
+        reports[gate]=[]
         for ref in refs:
             path=outside_git(ref["path"])
-            require(sha256(path)==ref["sha256"] and read_json(path,1024**2).get("status")=="passed","prior gate did not pass: "+gate)
+            report=read_json(path,1024**2)
+            require(sha256(path)==ref["sha256"] and report.get("status")=="passed","prior gate did not pass: "+gate)
+            reports[gate].append(report)
+    gate_identities(declaration,reports)
     asset_root=Path(registration["asset_root"])
     require(asset_root.is_absolute() and asset_root.is_dir() and not asset_root.is_symlink(),"absolute asset root required")
     owner=OwnedRun(outside_git(output),wall=900,address_space=declaration["budget"]["address_space_per_process_bytes"])
@@ -44,7 +104,8 @@ def run(registration, output):
     finally:
         result["capture"]=owner.finish()
         c=result["capture"]
-        if c["exit_code"]!=0 or c["forced_cleanup"] or c["cleanup_error"] or c["remaining_owned_processes"]:
+        events=dict(line.split() for line in c["resources"]["memory.events"].splitlines())
+        if c["exit_code"]!=0 or c["forced_cleanup"] or c["cleanup_error"] or c["remaining_owned_processes"] or int(events["oom"]) or int(events["oom_kill"]):
             result["status"]="failed"
             result.setdefault("error","owned lifecycle cleanup gate failed")
         put(owner.directory/"result.json",result)

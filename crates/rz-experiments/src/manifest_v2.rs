@@ -36,6 +36,8 @@ pub struct ModelConfigurationV2 {
     pub history_policy: String,
     pub weights: Vec<ArtifactRef>,
     pub backend: String,
+    /// Runtime/provider configuration, excluding model-bound execution identities.
+    pub backend_configuration_sha256: String,
     pub precision: String,
     pub batch_width: u32,
     pub options: BTreeMap<String, String>,
@@ -57,6 +59,56 @@ pub enum RoveLaunchV2 {
     Lc0Cpu(CpuNativeLaunchSpecV1),
     Lc0CudaMaia(CudaNativeLaunchSpec<NativeCudaProfileV1>),
     Lc0Cuda(CudaNativeLaunchSpec<NativeCudaProfileV2>),
+}
+impl RoveLaunchV2 {
+    pub fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Lc0Cpu(_) => "onnx-runtime-1.22.0-cpu",
+            Self::Lc0CudaMaia(_) | Self::Lc0Cuda(_) => "onnx-runtime-1.22.0-cuda",
+        }
+    }
+
+    /// V2 comparison identity. Legacy cache/attestation backend hashes include
+    /// the model asset and must remain distinct from this configuration hash.
+    pub fn backend_configuration_sha256(&self) -> Result<String, ManifestError> {
+        let (target, core, profile, bundle) = match self {
+            Self::Lc0Cpu(l) => (
+                &l.target,
+                l.artifact(NativeArtifactRole::OrtLibrary)?,
+                serde_json::to_value(&l.profile),
+                None,
+            ),
+            Self::Lc0CudaMaia(l) => (
+                &l.target,
+                l.artifact(NativeArtifactRole::OrtLibrary)?,
+                serde_json::to_value(&l.profile),
+                Some(l.cuda_bundle.canonical_sha256.as_str()),
+            ),
+            Self::Lc0Cuda(l) => (
+                &l.target,
+                l.artifact(NativeArtifactRole::OrtLibrary)?,
+                serde_json::to_value(&l.profile.runtime),
+                Some(l.cuda_bundle.canonical_sha256.as_str()),
+            ),
+        };
+        let profile = profile.map_err(|e| ManifestError::Integrity(e.to_string()))?;
+        let mut configuration: BTreeMap<String, serde_json::Value> =
+            serde_json::from_value(profile).map_err(|e| ManifestError::Integrity(e.to_string()))?;
+        configuration.remove("expected_backend_sha256");
+        configuration.remove("expected_encoding_sha256");
+        let bytes = serde_json::to_vec(&(
+            "rz-v2-backend-configuration/1",
+            self.backend_name(),
+            "ort-wrapper-2.0.0-rc.10",
+            target,
+            &core.sha256,
+            core.bytes,
+            bundle,
+            configuration,
+        ))
+        .map_err(|e| ManifestError::Integrity(e.to_string()))?;
+        Ok(digest(&bytes))
+    }
 }
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -191,7 +243,11 @@ fn model_changes(a: &ModelConfigurationV2, b: &ModelConfigurationV2) -> BTreeSet
         ("value_head", a.value_head != b.value_head),
         ("history_policy", a.history_policy != b.history_policy),
         ("weights", weight_identity(a) != weight_identity(b)),
-        ("backend", a.backend != b.backend),
+        (
+            "backend",
+            a.backend != b.backend
+                || a.backend_configuration_sha256 != b.backend_configuration_sha256,
+        ),
         ("precision", a.precision != b.precision),
         ("batch_width", a.batch_width != b.batch_width),
         ("model_options", a.options != b.options),
@@ -207,10 +263,9 @@ fn validate_executed_configuration(
     e: &RoveZeroEndpointV2,
     launch: &RoveLaunchV2,
 ) -> Result<(), ManifestError> {
-    let (architecture, backend, encoding, threads, workers, search) = match launch {
+    let (architecture, encoding, threads, workers, search) = match launch {
         RoveLaunchV2::Lc0Cpu(l) => (
             "maia1900",
-            &l.profile.expected_backend_sha256,
             &l.profile.expected_encoding_sha256,
             l.profile.intra_threads,
             l.profile.search_workers,
@@ -218,7 +273,6 @@ fn validate_executed_configuration(
         ),
         RoveLaunchV2::Lc0CudaMaia(l) => (
             "maia1900",
-            &l.profile.expected_backend_sha256,
             &l.profile.expected_encoding_sha256,
             l.profile.intra_threads,
             l.profile.search_workers,
@@ -226,7 +280,6 @@ fn validate_executed_configuration(
         ),
         RoveLaunchV2::Lc0Cuda(l) => (
             "bt4-it332",
-            &l.profile.runtime.expected_backend_sha256,
             &l.profile.runtime.expected_encoding_sha256,
             l.profile.runtime.intra_threads,
             l.profile.runtime.search_workers,
@@ -237,7 +290,8 @@ fn validate_executed_configuration(
     require_v2(
         model.architecture == architecture
             && model.encoding == *encoding
-            && model.backend == *backend
+            && model.backend == launch.backend_name()
+            && model.backend_configuration_sha256 == launch.backend_configuration_sha256()?
             && model.policy_head == "lc0-policy-1858"
             && model.value_head == "stm-wdl"
             && model.history_policy == "no"
@@ -402,6 +456,7 @@ impl RunManifestV2 {
                         ]
                         .iter()
                         .all(|v| text_v2(v))
+                            && sha_v2(&m.backend_configuration_sha256, 64)
                             && (1..=16).contains(&m.batch_width)
                             && m.weights.len() <= 8
                             && map_v2(&m.options)
@@ -719,6 +774,7 @@ mod tests {
                             .unwrap_or_else(|| old.protocol.runner.binary.clone()),
                     ],
                     backend: "fixture-cpu".into(),
+                    backend_configuration_sha256: "c".repeat(64),
                     precision: "fp32".into(),
                     batch_width: 1,
                     options: BTreeMap::new(),
@@ -791,6 +847,103 @@ mod tests {
             panic!()
         };
         e
+    }
+    #[test]
+    fn weights_comparison_keeps_backend_configuration_but_not_asset_bound_execution_hash() {
+        let mut m = manifest(ComparisonV2::InternalWeights);
+        m.declared_changes.insert("weights".into());
+        for (index, endpoint) in m.engines.iter_mut().enumerate() {
+            let EngineEndpointV2::RoveZero(e) = endpoint else {
+                unreachable!()
+            };
+            let artifacts: Vec<_> = NativeArtifactRole::ALL
+                .into_iter()
+                .map(|role| {
+                    let mut artifact = e.tool.binary.clone();
+                    if role != NativeArtifactRole::Binary {
+                        artifact.path = format!("synthetic/{index}/{role:?}");
+                        artifact.bytes = 1;
+                        artifact.sha256 = if index == 1
+                            && matches!(
+                                role,
+                                NativeArtifactRole::SourceWeights | NativeArtifactRole::Onnx
+                            ) {
+                            "b".repeat(64)
+                        } else {
+                            "a".repeat(64)
+                        };
+                    }
+                    NativeArtifactBinding { role, artifact }
+                })
+                .collect();
+            let launch = RoveLaunchV2::Lc0Cpu(CpuNativeLaunchSpecV1 {
+                role: e.role,
+                engine_id: e.id.clone(),
+                source_commit: e.tool.source_commit.clone(),
+                target: e.tool.target.clone(),
+                artifacts: artifacts.clone(),
+                profile: NativeCpuProfileV1::fixed(
+                    if index == 0 {
+                        "c".repeat(64)
+                    } else {
+                        "e".repeat(64)
+                    },
+                    "d".repeat(64),
+                ),
+            });
+            e.model.architecture = "maia1900".into();
+            e.model.encoding = "d".repeat(64);
+            e.model.policy_head = "lc0-policy-1858".into();
+            e.model.backend = launch.backend_name().into();
+            e.model.backend_configuration_sha256 = launch.backend_configuration_sha256().unwrap();
+            e.model.weights = artifacts
+                .into_iter()
+                .filter_map(|a| {
+                    matches!(
+                        a.role,
+                        NativeArtifactRole::SourceWeights | NativeArtifactRole::Onnx
+                    )
+                    .then_some(a.artifact)
+                })
+                .collect();
+            e.search.options = BTreeMap::from([
+                ("simulations".into(), "128".into()),
+                ("final_selection".into(), "visits".into()),
+                ("policy_temperature_milli".into(), "1000".into()),
+                ("raw_cache".into(), "false".into()),
+            ]);
+            e.runtime.id = "single-worker-b1".into();
+            e.runtime.options = BTreeMap::from([
+                ("intra_threads".into(), "1".into()),
+                ("search_workers".into(), "1".into()),
+            ]);
+            e.launch = Some(launch);
+        }
+        m.validate().unwrap();
+        let e = candidate(&mut m);
+        let Some(RoveLaunchV2::Lc0Cpu(l)) = &mut e.launch else {
+            unreachable!()
+        };
+        l.artifacts
+            .iter_mut()
+            .find(|a| a.role == NativeArtifactRole::OrtLibrary)
+            .unwrap()
+            .artifact
+            .sha256 = "f".repeat(64);
+        // A forged unchanged declaration fails before comparison admission.
+        assert!(m.validate().is_err());
+        let e = candidate(&mut m);
+        e.model.backend_configuration_sha256 = e
+            .launch
+            .as_ref()
+            .unwrap()
+            .backend_configuration_sha256()
+            .unwrap();
+        // Correctly declaring a library change still cannot be weights-only.
+        m.declared_changes.insert("backend".into());
+        assert!(m.validate().is_err());
+        m.comparison = ComparisonV2::InternalModel;
+        m.validate().unwrap();
     }
     #[test]
     fn weights_only_never_permits_encoding_head_or_runtime_changes() {

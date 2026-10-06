@@ -223,6 +223,10 @@ def run(manifest, output):
     if error:
         result.update(status="hold", error=error)
     result["overall_wall_seconds"] = time.monotonic()-started
+    result["registration_sha256"] = sha256(output/"registration.json")
+    result["candidate"] = {k: manifest["candidate"][k] for k in
+        ("source_commit", "binary_sha256", "expected_profile")}
+    result["resource_notes"] = manifest["resource_notes"]
     put(output/"summary.json", result)
     print(json.dumps(result), flush=True)
     return 0 if result["status"] == "passed" else 2

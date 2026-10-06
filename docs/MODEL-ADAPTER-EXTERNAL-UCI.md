@@ -70,6 +70,13 @@ Runtime·InternalSearch 코드 실험과 adapter/model 비교에는 다른 실�
 대조한다. InternalModel은 선언한 구성 전체의 효과다. 개별 요소에는 별도 통제 비교가
 필요하다. batching은 S 실험이며 현재 V2 native 실행 recipe는 기존 B1을 사용한다.
 
+V2의 `backend`와 `backend_configuration_sha256`는 provider·runtime 파일/closure·
+정밀도·session 설정을 식별한다. launch에서 이 구성을 다시 계산해 선언과 대조한다.
+기존 실행·평가 캐시의 backend hash에는 모델 자산도 포함되므로 weights 변경으로
+달라질 수 있다. 이 hash와 attestation은 그대로 유지하고 V2 비교 구성 hash와 구분한다.
+따라서 weights만 바꾼 비교를 backend 변경으로 오판하지 않으며, runtime 라이브러리나
+session 설정을 함께 바꾼 비교도 weights-only로 인수하지 않는다.
+
 RoveZero 항목은 모델 구성·adapter 의미/구현·encoding·head·weights·backend·정밀도·
 탐색/runtime·native launch를 포함한다. ExternalUci 항목은 실제 binary·버전·소스/권리·
 인수·옵션·필요 자산·handshake 한도를 포함한다. 외부 엔진에 가상의 weights나 RoveZero
