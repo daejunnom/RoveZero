@@ -118,6 +118,15 @@ contracts 없이 main에서 Run/drop해도 재현했다. 자식의 tcache를 끈
 종료했지만 첫 손상 지점·portable 수정·효과 인수는 미확정이다. Allocator 설정과
 제품 기본값을 변경하지 않으며 GDB/allocator 진단을 성능 ledger에 넣지 않는다.
 
+[후속 heap 진단](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#ort-heap-first-write-diagnostic)은
+정확한 glibc free-list 오류를 확인했다. 작은 native C API의 GLOBAL/LOCAL 실행은 exit0이지만,
+원래16개 bootstrap을 LOCAL로 바꾼 전체 수치 경로는 같은 SIGABRT다. 첫 손상 원인은 unknown이다.
+관측·부분 fixture·setup 실패9개는 한 excluded collection으로 보존하고 기존30개 비교·고유57회·
+공유 기준3개·8개 series 값을 유지했다. 제외는17개이며 새로운 성능 A/B는 없다.
+[Raw cache host head 공유](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#raw-cache-shared-heads)는
+별도 소스 변경이다. CPU/mock 수명 검사는 통과했지만 GPU/전체 메모리·시간 효과는 미측정이다.
+기존 ledger나 진단 숫자를 이 변경의 성능 증거로 사용하지 않는다.
+
 ## D02 CPU/mock trace 재생
 
 [cpu_trace 예제](../../crates/rz-runtime/examples/cpu_trace.rs)는 실제 `Scheduler`와

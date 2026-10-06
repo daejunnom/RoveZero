@@ -915,6 +915,80 @@ binary/helper pin·호출 스택·수치·자원·정상/실패 종료·집계 �
 `${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-ort-shutdown-diagnostic-20261006/`에
 보존한다. 기존 실패·HOLD를 지우지 않으며 규약과 별도 문서 WIP는 수정하지 않는다.
 
+### 4.15 Free-list 검사와 독립 native 경계
+
+<a id="ort-heap-first-write-diagnostic"></a>
+
+§4.14와 같은 source33f1b86·복사형 바이너리·모델·runtime을 유지하고, 실제 glibc
+2.39-0ubuntu8.9의 debug symbol을 사용했다. `malloc_printerr`에서 확인한 오류는
+`malloc(): unsorted double linked list corrupted`이며 cuDNN 종료 callback의
+9448B 할당 처리에서 감지됐다. [고정 glibc 구현](https://github.com/bminor/glibc/blob/glibc-2.39/malloc/malloc.c)의
+free-list 연결 검사에 해당하지만 **첫 잘못된 write/free와 책임 객체는 여전히 unknown**이다.
+감지 시점의 stack이나 allocator 옵션으로 원인 수리를 주장하지 않는다.
+
+| 독립 조건 | 실제 결과 | 해석 한계 |
+|---|---|---|
+| 원래 바이너리의 종료 시 free-list watchpoint | 전체 수치·worker join·exit0 | 관측이 배치/시점을 바꿨을 수 있음; 각 marker에서 처음8개 chunk만 관측 |
+| Rust/ORT/모델 없는 cuDNN·cuBLAS handle 생성/파괴·CUDA sync | exit0 | 신경망 Run이나 제품 수명 전체를 검사하지 않음 |
+| 위 handle fixture + Memcheck | 첫 cudnnCreate 중 exit97 | WSL driver의 미추적 주소 read와 unhandled ioctl 경고; 원래 heap 손상 재현이나 driver 결함 확정이 아님 |
+| Native ORT C API22·복사형 모델·zero B1, GLOBAL / LOCAL | 각각 CUDA Run·명시적 native 해제·exit0 | CUDA node687/CPU node0 확인; 독립 참조·가변 입력·Rust 전체 경로 대조는 없음 |
+| 원래 바이너리의16개 bootstrap dlopen을 LOCAL로 변경 | 전체 수치·worker join 뒤 실제 SIGABRT | 심볼 공개 범위만 바꾸는 수정으로 해결되지 않음 |
+
+C API fixture는 [고정 ORT1.22 header](https://github.com/microsoft/onnxruntime/blob/v1.22.0/include/onnxruntime/core/session/onnxruntime_c_api.h)를
+사용하고 두 직접 참조 설정0·FP32/TF32 off·CPU fallback 금지를 유지했다. GDB scope
+실험은 native C fixture와 구분한다. 제품 loader의 GLOBAL·process lifetime 정책은
+바꾸지 않았다. Memcheck의 [공식 검사 범위](https://valgrind.org/docs/manual/mc-manual.html)를
+참고하되 WSL 경고를 무시하는 blanket suppression이나 안전 경계 우회는 적용하지 않았다.
+
+총9개 진단 시도 중 setup/기록 실패도 보존했다. 최초 chunk wrapper는 capture를 두 번
+닫아 최종 영수증 생성에 실패했으므로 원시 수치/스택만 보존하고 자원·최종 정리 계수는
+unknown이다. Scope v1의 override0은 LOCAL 실행으로 세지 않는다. V2는 합법적인
+`dlopen(NULL)`에서 debugger 예외로 멈췄으며 원시 helper의 SIGABRT 표기는 잘못된
+분류다. 후속 별도 correction에서 setup failure로 정정했다. V3는 NULL을 처리하고
+16개 변경·실제 SignalEvent(SIGABRT)를 관측했다. 실패 원본을 덮어쓰지 않았다.
+
+유효한7개 완료 영수증은 high/max/OOM·강제 정리·소유 잔류0이다. 모델 진단은
+CPU2/affinity2·high6GiB/max12GiB/swap0·pids128·AS128GiB·300초+정리30초,
+handle fixture는180초+정리30초였다. VRAM peak·Windows commit은 unknown이다.
+성공한 작은 fixture·관측으로 정상 종료한 실행·setup failure를 모두 성능 자료에서 제외한다.
+복사형 GPU 인수와 배포 가능한 수정은 **HOLD**이며 새 성능 A/B·대국은 없다.
+
+기존 **30개 비교·고유57회·공유 기준3개·8개 series/epoch**가 재집계에서 정확히 같았다.
+진단 collection 한 개를 추가해 **제외17개**다. 독립 실행 peak 합계를 시스템 동시 peak로
+해석하지 않는다. Helper·등록·원시 로그/수치·scope correction·native fixture·누적 확인은
+Git 밖 `${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-ort-heap-first-write-20261006/`에
+보존한다. 진단 스크립트를 제품 workspace나 반복 대국 준비에 추가하지 않았다.
+
+### 4.16 Raw cache hit의 불변 host head 공유
+
+<a id="raw-cache-shared-heads"></a>
+
+Source `db0c3abecaa7460eb38cd19d141df0be609c2025`에서 `rz-eval/raw_cache.rs`의
+hit가 매번 `RawOutput`의 두 Vec를 복제하던 경로를 `Arc<RawOutput>` 공유로 바꿨다.
+고정 policy1858+WDL3의 **7444B payload 복사와 두 Vec 할당**을 hit마다 제거한다.
+이는 코드의 할당 경계이며 전체 RSS/VRAM 감소 실측이 아니다. 합법 policy 투영·입력
+준비·새 물리 평가 실행의 비용은 남아 있다.
+
+Stage는 worker raw를 한 번 독립 복제해 immutable owner에 저장한다. GPU/pooled buffer를
+직접 공유하지 않는다. Hit가 owner를 pin한 뒤 cache mutex 밖에서 기존 policy/WDL을
+생성하므로 clear/eviction이 진행 중인 hit를 무효화하지 않는다. 마지막 owner가 해제되면
+raw payload도 해제된다. Retained-byte charge에 별도 RawOutput descriptor와 Arc
+counter 공간을 추가했다. Stage의 Arc 할당·hit의 atomic 참조 비용과 추가 owner 메모리를
+절약분과 함께 A/B해야 한다. Cache 밖에서 살아 있는 hit는 진행 중 요청의 임시 수명이다.
+
+새 회귀는 실제 Rules·projection·stage/accept 경로에서 두 hit의 owner 공유, 동시 clear,
+policy/WDL 일치와 마지막 owner 해제를 확인한다. WSL의 eval all-feature/all-target
+**104개**, raw-cache 최소 feature 회귀**1개**, UCI 실제 experimental pipeline**1개**와
+strict Clippy·workspace fmt가 통과했다. 최초 잘못된 `LegalPolicy.values` 검사와
+format 실패를 수정한 뒤 재검사했다. [db0c3ab CPU CI37422644706](https://github.com/daejunnom/RoveZero/actions/runs/37422644706)의
+Ubuntu·Windows·bindings 세 job도 SUCCESS로 직접 확인했다.
+
+**효과 미측정·HOLD:** 이번 GPU 진단은 이전 source33f1b86이며 이 raw-cache 변경의
+독립 GPU 수치나 동일 작업량 메모리/시간 A/B가 아니다. Default cache는 계속 off이고
+공통 계약·receipt schema·UCI 옵션·ORT loader/allocator·탐색 정책은 바꾸지 않았다.
+기존 수치·계측을 새 source의 성능으로 재사용하지 않는다. 현재104개 검사는 CPU/mock
+정확성 증거다. 채택은 §2의 전체 시간·사전 primary peak·의미/수명 문턱을 별도로 따른다.
+
 ## 5. 후속 구현·검증 순서
 
 할당/복사 제거 → 저장 밀도 → bounded scratch/arena/pool → 임계 구역/완료 통지 →
