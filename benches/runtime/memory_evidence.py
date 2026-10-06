@@ -120,7 +120,11 @@ def observation(root, item, peak_kind):
         peak = positive(int(match[1]) * 1024)
         if report["reuse_buffers"] is not item["reuse_buffers"]:
             raise ValueError("registered buffer option differs")
-        if "disable_cuda_cpu_arena" in item or report.get("kind") == "b1_cuda_cpu_arena_fixed_work":
+        if ("disable_cuda_cpu_arena" in item
+            and report.get("kind") == "b1_owned_ort_fixed_work"):
+            if item["disable_cuda_cpu_arena"] is not False:
+                raise ValueError("owned ORT comparison requires its independent CPU arena flag off")
+        elif "disable_cuda_cpu_arena" in item or report.get("kind") == "b1_cuda_cpu_arena_fixed_work":
             if (type(item.get("disable_cuda_cpu_arena")) is not bool
                 or report.get("kind") != "b1_cuda_cpu_arena_fixed_work"
                 or report.get("disable_cuda_cpu_arena") is not item["disable_cuda_cpu_arena"]
@@ -210,14 +214,16 @@ def aggregate(root, ledger):
         compat = comparison["compatibility"]
         if set(compat) != COMPAT_KEYS or any(v is None for v in compat.values()):
             raise ValueError("complete compatibility dimensions required")
-        if (compat["option"] == "owned-ort-flatbuffer"
-            or any("zero_copy_ort" in comparison[side] for side in ("baseline", "variant"))):
+        ort_comparison = (compat["option"] == "owned-ort-flatbuffer"
+            or any("zero_copy_ort" in comparison[side] for side in ("baseline", "variant")))
+        if ort_comparison:
             if (comparison["baseline"].get("zero_copy_ort") is not False
                 or comparison["variant"].get("zero_copy_ort") is not True
                 or any(comparison[side]["layout"] != "inference" for side in ("baseline", "variant"))):
                 raise ValueError("owned ORT comparison requires original baseline and direct variant")
         if (compat["option"] == "cuda-cpu-arena-off"
-            or any("disable_cuda_cpu_arena" in comparison[side] for side in ("baseline", "variant"))):
+            or (not ort_comparison
+                and any("disable_cuda_cpu_arena" in comparison[side] for side in ("baseline", "variant")))):
             if (comparison["baseline"].get("disable_cuda_cpu_arena") is not False
                 or comparison["variant"].get("disable_cuda_cpu_arena") is not True
                 or any(comparison[side]["layout"] != "inference" for side in ("baseline", "variant"))):
