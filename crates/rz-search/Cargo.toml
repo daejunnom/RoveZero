@@ -13,6 +13,7 @@ experimental-puct = []
 experimental-search-buffers = []
 experimental-state-cache = []
 experimental-flat-edges = []
+experimental-compact-child = []
 
 [dependencies]
 rz-contracts.workspace = true

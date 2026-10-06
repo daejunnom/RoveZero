@@ -142,7 +142,36 @@ pub enum FinalMovePolicy {
 struct Edge<M> {
     mv: M,
     stats: EdgeStats,
-    child: Option<usize>,
+    child: Option<ChildIndex>,
+}
+
+#[cfg(not(feature = "experimental-compact-child"))]
+type ChildIndex = usize;
+#[cfg(feature = "experimental-compact-child")]
+type ChildIndex = std::num::NonZeroUsize;
+
+#[cfg(not(feature = "experimental-compact-child"))]
+fn encode_child(index: usize) -> Result<ChildIndex, SearchError> {
+    Ok(index)
+}
+#[cfg(feature = "experimental-compact-child")]
+fn encode_child(index: usize) -> Result<ChildIndex, SearchError> {
+    // Children are appended after node zero; the root is never its own child.
+    // Store the actual index, with no offset, narrowing or arithmetic overflow.
+    std::num::NonZeroUsize::new(index).ok_or(SearchError::InconsistentLeaf)
+}
+
+impl<M> Edge<M> {
+    fn child_index(&self) -> Option<usize> {
+        #[cfg(not(feature = "experimental-compact-child"))]
+        {
+            self.child
+        }
+        #[cfg(feature = "experimental-compact-child")]
+        {
+            self.child.map(std::num::NonZeroUsize::get)
+        }
+    }
 }
 
 #[cfg(not(feature = "experimental-flat-edges"))]
@@ -398,7 +427,7 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
                 return 0_i8;
             }
             // The child's exact utility is from its turn; root wins are -1 there.
-            match edge.child.and_then(|index| self.nodes.get(index)) {
+            match edge.child_index().and_then(|index| self.nodes.get(index)) {
                 Some(Node::Terminal(value)) if *value == -1.0 => 1,
                 Some(Node::Terminal(value)) if *value == 1.0 => -1,
                 _ => 0,
@@ -517,7 +546,7 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
                             (&mut self.selection_indices, &mut self.selection_stats)
                         };
                         for (index, edge) in edges.iter().enumerate() {
-                            if edge.child.is_some_and(|child| {
+                            if edge.child_index().is_some_and(|child| {
                                 self.other_pending.iter().any(|p| p.leaf == child)
                                     && matches!(self.nodes[child], Node::Unexpanded)
                             }) {
@@ -550,7 +579,7 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
                         .get(selected)
                         .ok_or(SearchError::InvalidPolicySelection)?;
                     let mv = edge.mv.clone();
-                    let existing_child = edge.child;
+                    let existing_child = edge.child_index();
                     let child = match existing_child {
                         Some(child) => child,
                         None => {
@@ -561,12 +590,13 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
                                 .try_reserve(1)
                                 .map_err(|_| SearchError::AllocationFailed)?;
                             let child = self.nodes.len();
+                            let stored_child = encode_child(child)?;
                             self.nodes.push(Node::Unexpanded);
                             let Node::Expanded(edges) = &mut self.nodes[node] else {
                                 unreachable!()
                             };
                             edges.as_mut_slice(&mut self.edge_storage)[selected].child =
-                                Some(child);
+                                Some(stored_child);
                             child
                         }
                     };
@@ -1242,7 +1272,7 @@ mod tests {
                 visits: 1,
                 value_sum: 1.0,
             },
-            child: Some(4),
+            child: Some(encode_child(4).unwrap()),
         }];
         #[cfg(not(feature = "experimental-flat-edges"))]
         let edges = EdgeList { entries };
@@ -1268,7 +1298,7 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            edges[index].child = Some(index + 1);
+            edges[index].child = Some(encode_child(index + 1).unwrap());
             edges[index].stats.visits = visits;
             edges[index].stats.value_sum = value_sum;
         }
@@ -1481,7 +1511,7 @@ mod tests {
             };
             let edge = &edges.as_slice(&tree.edge_storage)[0];
             assert_eq!(edge.mv, index as u32);
-            assert_eq!(edge.child, (index < 256).then_some(index + 1));
+            assert_eq!(edge.child_index(), (index < 256).then_some(index + 1));
         }
     }
 
@@ -1580,6 +1610,41 @@ mod tests {
         );
         assert_eq!(tree.counters().root_initializations, 0);
         assert_eq!(tree.counters().accepted_backups, 0);
+    }
+
+    #[cfg(feature = "experimental-compact-child")]
+    #[test]
+    fn compact_child_keeps_full_usize_indices_and_the_none_niche() {
+        assert_eq!(encode_child(0), Err(SearchError::InconsistentLeaf));
+        let mut edge = Edge {
+            mv: "opaque",
+            stats: EdgeStats {
+                prior: 1.0,
+                visits: 0,
+                value_sum: 0.0,
+            },
+            child: None,
+        };
+        assert_eq!(edge.child_index(), None);
+        for index in [1, 255, 256, 65535, 65536, usize::MAX] {
+            edge.child = Some(encode_child(index).unwrap());
+            assert_eq!(edge.child_index(), Some(index));
+        }
+        edge.child = None;
+        assert_eq!(edge.child_index(), None);
+        assert_eq!(
+            std::mem::size_of::<Option<ChildIndex>>(),
+            std::mem::size_of::<usize>()
+        );
+        eprintln!(
+            "COMPACT_CHILD_LAYOUT child={} legacy_child={} edge_u16={} edge_move={} edge_align={} tree={}",
+            std::mem::size_of::<Option<ChildIndex>>(),
+            std::mem::size_of::<Option<usize>>(),
+            std::mem::size_of::<Edge<u16>>(),
+            std::mem::size_of::<Edge<rz_contracts::Move>>(),
+            std::mem::align_of::<Edge<rz_contracts::Move>>(),
+            std::mem::size_of::<Tree<rz_contracts::Move>>(),
+        );
     }
 
     #[test]
