@@ -6,7 +6,7 @@ use rz_eval::{
     onnx::{BackendConfig, ExecutionExperiments, OnnxBackend, OrtRuntime, Provider},
     runtime_pin::{CudaRuntimeBundleSpec, RuntimeCache},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     error::Error,
     fs::{File, OpenOptions},
@@ -91,6 +91,8 @@ enum RunMode {
     B1CpuArena { disabled: bool },
     B1OrtModel { direct: bool },
     B1CopiedOrt { copied: bool },
+    B1IoBinding { enabled: bool },
+    B1CudaGraph { enabled: bool },
 }
 impl RunMode {
     fn parse(option: Option<&str>) -> Result<Self, Box<dyn Error>> {
@@ -116,8 +118,18 @@ impl RunMode {
             Some("--b1-copied-ort=copied") if cfg!(feature = "experimental-ort-model") => {
                 Ok(Self::B1CopiedOrt { copied: true })
             }
+            Some("--b1-io-binding=baseline") => Ok(Self::B1IoBinding { enabled: false }),
+            Some("--b1-io-binding=enabled") if cfg!(feature = "experimental-io-binding") => {
+                Ok(Self::B1IoBinding { enabled: true })
+            }
+            Some("--b1-cuda-graph=baseline") if cfg!(feature = "experimental-io-binding") => {
+                Ok(Self::B1CudaGraph { enabled: false })
+            }
+            Some("--b1-cuda-graph=enabled") if cfg!(feature = "experimental-cuda-graph") => {
+                Ok(Self::B1CudaGraph { enabled: true })
+            }
             _ => {
-                Err("unknown comparison mode or unavailable experimental-io-buffers feature".into())
+                Err("unknown comparison mode or unavailable experimental feature".into())
             }
         }
     }
@@ -127,13 +139,19 @@ impl RunMode {
             Self::B1Buffers { .. }
             | Self::B1CpuArena { .. }
             | Self::B1OrtModel { .. }
-            | Self::B1CopiedOrt { .. } => &[1],
+            | Self::B1CopiedOrt { .. }
+            | Self::B1IoBinding { .. }
+            | Self::B1CudaGraph { .. } => &[1],
         }
     }
     fn observes_startup(self) -> bool {
         matches!(
             self,
-            Self::B1CpuArena { .. } | Self::B1OrtModel { .. } | Self::B1CopiedOrt { .. }
+            Self::B1CpuArena { .. }
+                | Self::B1OrtModel { .. }
+                | Self::B1CopiedOrt { .. }
+                | Self::B1IoBinding { .. }
+                | Self::B1CudaGraph { .. }
         )
     }
 }
@@ -164,7 +182,7 @@ fn recycle_checked(
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if !(args.len() == 6 || args.len() == 7 || args.len() == 9) {
-        return Err("usage: inference_bench SOURCE ONNX EXPORT CUDA_CORE CUDA_BUNDLE REPORT [--b1-buffers=baseline|reuse|--b1-cpu-arena=baseline|disabled] (all six paths absolute; fresh REPORT outside Git)".into());
+        return Err("usage: inference_bench SOURCE ONNX EXPORT CUDA_CORE CUDA_BUNDLE REPORT [--b1-buffers=baseline|reuse|--b1-cpu-arena=baseline|disabled|--b1-io-binding=baseline|enabled|--b1-cuda-graph=baseline|enabled] (all six paths absolute; fresh REPORT outside Git)".into());
     }
     let mode = RunMode::parse(args.get(6).map(String::as_str))?;
     if matches!(
@@ -203,7 +221,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         report["kind"] = json!("b1_buffer_reuse_fixed_work");
         report["batches"] = json!([1]);
         report["reuse_buffers"] = json!(reuse);
-        report["measurement"] = json!("host_wall_including_run_physical_completion_output_digest_and_ownership_return_not_kernel_time");
+        report["measurement"] = json!(
+            "host_wall_including_run_physical_completion_output_digest_and_ownership_return_not_kernel_time"
+        );
     }
     if let RunMode::B1CpuArena { disabled } = mode {
         report["kind"] = json!("b1_cuda_cpu_arena_fixed_work");
@@ -211,8 +231,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         report["disable_cuda_cpu_arena"] = json!(disabled);
         report["cpu_ep_fallback"] = json!(false);
         report["reuse_buffers"] = json!(false);
-        report["startup_memory_observations"] = json!("bounded self RSS endpoints and process lifetime HWM; not phase peaks, live heap, cgroup file cache, VRAM or Windows commit");
-        report["measurement"] = json!("host_wall_including_run_physical_completion_output_digest_and_ownership_return_not_kernel_time; same startup memory observations in both arms");
+        report["startup_memory_observations"] = json!(
+            "bounded self RSS endpoints and process lifetime HWM; not phase peaks, live heap, cgroup file cache, VRAM or Windows commit"
+        );
+        report["measurement"] = json!(
+            "host_wall_including_run_physical_completion_output_digest_and_ownership_return_not_kernel_time; same startup memory observations in both arms"
+        );
     }
     if let RunMode::B1OrtModel { direct } = mode {
         report["kind"] = json!("b1_owned_ort_fixed_work");
@@ -221,7 +245,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         report["cpu_ep_fallback"] = json!(false);
         report["reuse_buffers"] = json!(false);
         report["disable_cuda_cpu_arena"] = json!(false);
-        report["measurement"] = json!("host_wall_including_run_physical_completion_output_digest_and_ownership_return_not_kernel_time; same bounded startup observer in both arms");
+        report["measurement"] = json!(
+            "host_wall_including_run_physical_completion_output_digest_and_ownership_return_not_kernel_time; same bounded startup observer in both arms"
+        );
     }
     if let RunMode::B1CopiedOrt { copied } = mode {
         report["kind"] = json!("b1_copied_ort_fixed_work");
@@ -231,7 +257,35 @@ fn main() -> Result<(), Box<dyn Error>> {
         report["cpu_ep_fallback"] = json!(false);
         report["reuse_buffers"] = json!(false);
         report["disable_cuda_cpu_arena"] = json!(false);
-        report["measurement"] = json!("host_wall_including_run_physical_completion_output_digest_and_ownership_return_not_kernel_time; same bounded startup observer and early serialized release in both arms");
+        report["measurement"] = json!(
+            "host_wall_including_run_physical_completion_output_digest_and_ownership_return_not_kernel_time; same bounded startup observer and early serialized release in both arms"
+        );
+    }
+    if let RunMode::B1IoBinding { enabled } = mode {
+        report["kind"] = json!("b1_io_binding_fixed_work");
+        report["batches"] = json!([1]);
+        report["io_binding"] = json!(enabled);
+        report["cuda_graph"] = json!(false);
+        report["reuse_buffers"] = json!(false);
+    }
+    if let RunMode::B1CudaGraph { enabled } = mode {
+        report["kind"] = json!("b1_cuda_graph_option_fixed_work");
+        report["batches"] = json!([1]);
+        // Graph's control already uses binding. This changes only the graph option.
+        report["io_binding"] = json!(true);
+        report["cuda_graph"] = json!(enabled);
+        report["capture_replay_observed"] = json!(false);
+        report["reuse_buffers"] = json!(false);
+    }
+    if matches!(
+        mode,
+        RunMode::B1IoBinding { .. } | RunMode::B1CudaGraph { .. }
+    ) {
+        report["cpu_ep_fallback"] = json!(false);
+        report["disable_cuda_cpu_arena"] = json!(false);
+        report["measurement"] = json!(
+            "host_wall_including_run_physical_completion_output_digest_and_ownership_return_not_kernel_time; same bounded startup observer; CUDA Graph option is not capture/replay proof"
+        );
     }
     let started = Instant::now();
     let outcome = sweep(&args, &mut report, mode);
@@ -343,6 +397,13 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
         if let RunMode::B1CpuArena { disabled } = mode {
             config.experiments.disable_cuda_cpu_arena = disabled;
         }
+        if let RunMode::B1IoBinding { enabled } = mode {
+            config.experiments.io_binding = enabled;
+        }
+        if let RunMode::B1CudaGraph { enabled } = mode {
+            config.experiments.io_binding = true;
+            config.experiments.cuda_graph = enabled;
+        }
         config.experiments.zero_copy_ort = direct;
         config.experiments.copy_ort_model = copied;
         let profile_dir = Path::new(&args[5]).with_extension(format!("b{width}.placement"));
@@ -440,6 +501,24 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
         if mode != RunMode::BatchSweep {
             report["output_sha256"] = json!(output_digest);
         }
+        if matches!(
+            mode,
+            RunMode::B1IoBinding { .. } | RunMode::B1CudaGraph { .. }
+        ) {
+            report["successful_binding_runs"] = json!(backend.binding_runs());
+            // Count only submitted synchronous binding runs, not graph launches.
+            let expected = if matches!(
+                mode,
+                RunMode::B1IoBinding { enabled: true } | RunMode::B1CudaGraph { .. }
+            ) {
+                23
+            } else {
+                0
+            };
+            if backend.binding_runs() != expected {
+                return Err("B1 synchronous binding run count differs".into());
+            }
+        }
         // Normal drop only after confirmed completion. On an error the backend
         // retains its own unconfirmed tensors/session; no larger batch runs.
         drop(backend);
@@ -494,6 +573,30 @@ mod tests {
         }
         assert!(RunMode::parse(Some("--b1-ort-model=auto")).is_err());
         assert!(RunMode::parse(Some("--b1-copied-ort=auto")).is_err());
+        for (option, available) in [
+            ("--b1-io-binding=baseline", true),
+            (
+                "--b1-io-binding=enabled",
+                cfg!(feature = "experimental-io-binding"),
+            ),
+            (
+                "--b1-cuda-graph=baseline",
+                cfg!(feature = "experimental-io-binding"),
+            ),
+            (
+                "--b1-cuda-graph=enabled",
+                cfg!(feature = "experimental-cuda-graph"),
+            ),
+        ] {
+            let parsed = RunMode::parse(Some(option));
+            assert_eq!(parsed.is_ok(), available);
+            if let Ok(mode) = parsed {
+                assert_eq!(mode.widths(), &[1]);
+                assert!(mode.observes_startup());
+            }
+        }
+        assert!(RunMode::parse(Some("--b1-io-binding=auto")).is_err());
+        assert!(RunMode::parse(Some("--b1-cuda-graph=auto")).is_err());
     }
     #[test]
     fn fixed_input_matches_previous_no_history_tensor_identity() {
