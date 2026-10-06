@@ -439,6 +439,7 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
             OnnxBackend::load_owned(&runtime, model.ok_or("original model missing")?, config)
         };
         let (_, mut backend) = loaded?;
+        let initial_binding_runs = backend.binding_runs();
         if mode.observes_startup() {
             report["backend_sha256"] = json!(hex(backend.identity()));
             report["retained_model_bytes"] = json!(backend.retained_model_bytes());
@@ -506,6 +507,9 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
             RunMode::B1IoBinding { .. } | RunMode::B1CudaGraph { .. }
         ) {
             report["successful_binding_runs"] = json!(backend.binding_runs());
+            report["provider_probe_binding_runs"] = json!(initial_binding_runs);
+            report["warm_and_measured_binding_runs"] =
+                json!(backend.binding_runs().checked_sub(initial_binding_runs));
             // Count only submitted synchronous binding runs, not graph launches.
             let expected = if matches!(
                 mode,
@@ -515,7 +519,10 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
             } else {
                 0
             };
-            if backend.binding_runs() != expected {
+            let expected_probe = u64::from(expected != 0);
+            if initial_binding_runs != expected_probe
+                || backend.binding_runs().checked_sub(initial_binding_runs) != Some(expected)
+            {
                 return Err("B1 synchronous binding run count differs".into());
             }
         }
