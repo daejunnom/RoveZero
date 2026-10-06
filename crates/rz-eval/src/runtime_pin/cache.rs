@@ -152,7 +152,14 @@ impl RuntimeCache {
         if exists(&entry)? {
             return read(RuntimeStorageOrigin::CacheReused);
         }
-        let _lock = self.lock(LOCK_WAIT)?;
+        let _lock = match self.lock(LOCK_WAIT) {
+            Ok(lock) => lock,
+            Err(error) => {
+                return reuse_after_lock_error(&entry, error, || {
+                    read(RuntimeStorageOrigin::CacheReused)
+                })
+            }
+        };
         if exists(&entry)? {
             return read(RuntimeStorageOrigin::CacheReused);
         }
@@ -196,7 +203,14 @@ impl RuntimeCache {
             if exists(&entry)? {
                 return read(RuntimeStorageOrigin::CacheReused);
             }
-            let _lock = self.lock(LOCK_WAIT)?;
+            let _lock = match self.lock(LOCK_WAIT) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    return reuse_after_lock_error(&entry, error, || {
+                        read(RuntimeStorageOrigin::CacheReused)
+                    })
+                }
+            };
             if exists(&entry)? {
                 return read(RuntimeStorageOrigin::CacheReused);
             }
@@ -315,6 +329,24 @@ fn identity(detail: &'static str) -> BackendError {
 }
 fn cache_io(detail: &'static str, error: &std::io::Error) -> BackendError {
     io_error(detail).with_external_cause(crate::error::CauseCode::RuntimePath, error)
+}
+// A creator may publish and release its directory lock between a contender's
+// create/check calls. Windows can also report a directory pending deletion as
+// an I/O error. Only the existing full immutable-entry verifier may recover;
+// no new publication, lock stealing, cache repair or indefinite retry occurs.
+fn reuse_after_lock_error(
+    entry: &Path,
+    original: BackendError,
+    read: impl FnOnce() -> Result<RuntimeLibraryPin, BackendError>,
+) -> Result<RuntimeLibraryPin, BackendError> {
+    if !matches!(exists(entry), Ok(true)) {
+        return Err(original);
+    }
+    // BackendError formats bounded static detail and coded/hashed causes,
+    // never the private path or raw external error. Preserve the original
+    // failure even if the completed publication validates successfully.
+    eprintln!("RoveZero runtime cache: {original}; rechecking a published entry");
+    read()
 }
 fn hex(key: [u8; 32]) -> String {
     key.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -864,6 +896,39 @@ mod tests {
         drop(lock);
         drop(fixture.cache.lock(Duration::ZERO).unwrap());
         assert_eq!(fs::read_dir(&fixture.cache.root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn lock_failure_reuses_only_a_fully_verified_published_entry() {
+        let fixture = Fixture::new();
+        let original = BackendError::new(K::Io, S::Backend, "injected publication lock failure");
+        let missing = fixture.cache.root.join("not-published");
+        let unchanged = reuse_after_lock_error(&missing, original.clone(), || {
+            panic!("an absent entry cannot recover the lock failure")
+        })
+        .unwrap_err();
+        assert_eq!(unchanged, original);
+        let first = fixture.load();
+        let library = first.path().to_owned();
+        let entry = library.parent().unwrap().to_owned();
+        let reuse =
+            reuse_after_lock_error(&entry, original.clone(), || Ok(fixture.load())).unwrap();
+        assert_eq!(reuse.storage().origin, RuntimeStorageOrigin::CacheReused);
+        assert_eq!(reuse.path(), first.path());
+        assert_eq!(reuse.binary_digest(), first.binary_digest());
+        drop(reuse);
+        drop(first);
+        make_writable(&library, false);
+        fs::write(&library, b"short corrupt publication").unwrap();
+        let error = reuse_after_lock_error(&entry, original, || {
+            fixture
+                .cache
+                .library(&fixture.source, &asset::hex_sha256(PAYLOAD))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind, K::IdentityMismatch);
+        assert_eq!(fs::read(&library).unwrap(), b"short corrupt publication");
+        assert!(!fixture.cache.root.join(LOCK_NAME).exists());
     }
 
     #[test]
