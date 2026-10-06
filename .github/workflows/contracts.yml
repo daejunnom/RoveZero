@@ -3,10 +3,10 @@ name: Workspace CPU
 on:
   push:
     branches: [develop]
-    paths: ['Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/**', 'benches/runtime/**', 'experiments/model-research/**', 'experiments/bindings-research/**', '.github/workflows/contracts.yml']
+    paths: ['Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/**', 'scripts/**', 'benches/runtime/**', 'experiments/model-research/**', 'experiments/bindings-research/**', '.github/workflows/contracts.yml']
   pull_request:
     branches: [develop]
-    paths: ['Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/**', 'benches/runtime/**', 'experiments/model-research/**', 'experiments/bindings-research/**', '.github/workflows/contracts.yml']
+    paths: ['Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/**', 'scripts/**', 'benches/runtime/**', 'experiments/model-research/**', 'experiments/bindings-research/**', '.github/workflows/contracts.yml']
 
 permissions:
   contents: read
@@ -35,20 +35,21 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - name: Build and check isolated research facade
-        working-directory: experiments/bindings-research
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/RoveZero/bindings-target
         shell: bash
         run: |
-          python -m venv "$RUNNER_TEMP/RoveZero/bindings-venv"
-          source "$RUNNER_TEMP/RoveZero/bindings-venv/bin/activate"
-          python -m pip install maturin==1.15.0
-          cargo fmt --all -- --check
-          cargo test --locked -p rz-bindings-core
-          cargo build --release --locked -p rz-bindings-core
-          python -m maturin develop --release --locked
-          RZ_BINDINGS_CLI="$CARGO_TARGET_DIR/release/rz-bindings-core" python check_paths.py -q
-          cargo clippy --all-targets --locked -- -D warnings
+          python scripts/run_managed.py --timeout 600 -- bash -c '
+            set -euo pipefail
+            python -m venv "$TMPDIR/bindings-venv"
+            source "$TMPDIR/bindings-venv/bin/activate"
+            python -m pip install maturin==1.15.0
+            cd experiments/bindings-research
+            cargo fmt --all -- --check
+            cargo test --locked -p rz-bindings-core
+            cargo build --release --locked -p rz-bindings-core
+            python -m maturin develop --release --locked
+            RZ_BINDINGS_CLI="$CARGO_TARGET_DIR/release/rz-bindings-core" python check_paths.py -q
+            cargo clippy --all-targets --locked -- -D warnings
+          '
   cpu:
     strategy:
       fail-fast: false
@@ -56,6 +57,9 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: '2'
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -69,24 +73,18 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
-      - run: cargo test --workspace --all-targets --all-features --locked
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/RoveZero/workspace-target
-      - run: cargo test -p rz-uci --test native_cli --locked
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/RoveZero/workspace-target
+      - run: python scripts/run_managed.py -- cargo test --workspace --all-targets --all-features --locked
+      - run: python scripts/run_managed.py -- cargo test -p rz-uci --test native_cli --locked
       - run: python -m pip install python-chess==1.999 chess==1.11.2
-      - run: cargo test --release -p rz-position --all-features --locked -- --include-ignored
+      - run: python scripts/run_managed.py -- cargo test --release -p rz-position --all-features --locked -- --include-ignored
         env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/RoveZero/workspace-target
           RZ_CHESS_PYTHON: python
-      - run: python -m unittest discover -s experiments/model-research/tests -q
+      - run: python scripts/run_managed.py -- python -m unittest discover -s experiments/model-research/tests -q
         env:
           PYTHONPATH: ${{ github.workspace }}/experiments/model-research/src
           PYTHONDONTWRITEBYTECODE: '1'
-      - run: python -m unittest discover -s benches/runtime/tests -q
+      - run: python scripts/run_managed.py -- python -m unittest discover -s benches/runtime/tests -q
         env:
           PYTHONDONTWRITEBYTECODE: '1'
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/RoveZero/workspace-target
+      - run: python scripts/run_managed.py -- python -m unittest discover -s scripts/tests -q
+      - run: python scripts/run_managed.py -- cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

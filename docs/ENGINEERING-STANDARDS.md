@@ -246,6 +246,62 @@ OOM 뒤 worker/batch를 조용히 줄이거나 변경 없이 무한 재시도하
 소유한 비활성 재생성 캐시만 대상으로 삼습니다. 보존 모델·데이터·보고서·다른 checkout·
 진행 작업을 일반 캐시로 삭제하지 않습니다. 이 문서가 기존 자료의 삭제 승인이 되지 않습니다.
 
+### 빌드·테스트 생성물의 유한 수명
+
+로컬 Clearra의 `docs/build-system.md`와 관리 코드에서 사용하는 고정 슬롯·소유 lease·
+시작/종료 시 보존량 검사 원칙을 RoveZero에 적용합니다. 관리 접점은
+[scripts/run_managed.py](../scripts/run_managed.py)이며, 엔진 탐색 내부와 분리합니다.
+새 `scripts/` 경로는 공통 빌드·CI의 생성물 수명을 담당하며 개별 실험 복제판을 두지 않습니다.
+
+- 일반 로컬 빌드·테스트는 `python scripts/run_managed.py -- cargo ...`로 실행합니다.
+  짧은 formatting·읽기 전용 metadata 조회에는 이 접점이 필요하지 않습니다. 직접 Cargo를
+  실행하면 이 정리 경로가 적용되지 않습니다. CI의 Cargo·Python 검사는 접점을 사용합니다.
+- Windows는 `%APPDATA%/RoveZero/build/managed-v1`, Linux는
+  `${XDG_CACHE_HOME:-$HOME/.cache}/rovezero/build/managed-v1`, CI는
+  `$RUNNER_TEMP/RoveZero/build/managed-v1`를 사용합니다. 서로 다른 OS의 바이너리를 공유하지 않습니다.
+- 실제 checkout 경로의 digest로 고정 슬롯을 선택합니다. SHA·시각·PID마다 새 빌드 트리를 만들지 않고,
+  Cargo의 의존성 검증을 통해 재사용합니다. `CARGO_INCREMENTAL=0`과 슬롯의 `CARGO_TARGET_DIR`를
+  지정하며 충돌하는 target override는 거부합니다. 임시 파일은 같은 소유 슬롯의 `tmp/`로 모읍니다.
+- 기본 한도는 checkout당 **8 GiB**, 전체 관리 카탈로그 **12 GiB**, 완료 슬롯 **4개**입니다.
+  시작과 정상·실패·취소 종료에서 검사합니다. 실행 중 전체 카탈로그는 5초 간격으로 관측하며,
+  초과하면 소유 프로세스 트리만 중단합니다. 관측 사이의 증가가 가능한 길이 기반 한도이며
+  커널 디스크 quota나 물리 할당량 측정으로 표현하지 않습니다.
+- 종료 후 자식 트리의 해제가 확인되면 임시 파일을 회수합니다. 슬롯 한도를 넘은 compiler cache는
+  통째로 회수하고, 전체 한도·슬롯 수를 넘으면 오래된 **완료·소유 확인** 슬롯부터 회수합니다.
+  최근 실행 영수증 하나를 슬롯에 갱신하며 실패 코드와 정리 결과를 구분합니다.
+- 하나의 카탈로그 owner가 재사용·회수를 직렬화합니다. 활성·중단 lease, 알 수 없거나 변경된
+  소유 기록, link/junction·비밀 경로가 있으면 보존하고 실패합니다. 강제 종료 후 lease를 자동으로
+  훔치지 않습니다. 수동 복구에는 이전 소유 트리의 종료와 정확한 경로·기록의 대조가 필요합니다.
+- Windows는 실행 전 정지 상태의 자식을 Job Object에 배정하고 재개하며, Linux는 원래 leader를
+  reap하기 전에 소유 process group을 종료·확인합니다. Linux의 새 session으로 이탈한 자식까지
+  격리하는 sandbox는 아닙니다. 일반 명령 timeout은 1200초이며 명시 범위는 1~3600초입니다.
+- 관리 cache는 배포·인수 artifact의 영구 보존 위치가 아닙니다. 나중에 사용할 엔진·입력·가중치·
+  영수증·PGN은 소유 실행 안에서 정해진 보존 위치로 내보내고 식별자를 고정합니다. 기존
+  등록 binary·공유 runtime·모델·보고서·다른 checkout의 legacy 트리는 자동으로 이관·삭제하지 않습니다.
+
+### 대국 입력 복사본의 회수
+
+Linux native arena는 결과 영수증을 저장하고 입력의 bytes·inode·hash를 다시 검증한 뒤,
+소유 process group 종료와 **네 개 세션의 provider 물리 drain**이 모두 확인됐을 때
+그 실행의 비실행·비JSON 개인 입력 복사본을 회수합니다. 원본 모델·가중치와 공통 runtime cache,
+실행 파일·JSON 명세, PGN·로그·실행 영수증은 보존합니다. 준비 실패·불확실한 GPU 완료·
+postcheck 실패에서는 일반 성공 경로로 복사본을 삭제하지 않습니다.
+
+`snapshot-retention.v1.jsonl`에 원본 artifact 식별과 회수 계획을 먼저 sync하고, 각 unlink와
+완료를 기록합니다. read-only 파일 descriptor도 해제해야 공간을 회수할 수 있으므로, 삭제한
+복사본의 pin을 닫고 디렉터리를 다시 read-only로 돌립니다. 기존 receipt의 `snapshots`는
+실행 당시의 검증 기록이며 파일의 현재 존재를 보장하지 않습니다. 회수 journal로 현재 보존
+상태를 대조하고, 재실행은 원본 artifact를 검증해 새 개인 복사본을 만듭니다.
+
+같은 출력 루트의 기존 파일 길이와 새 실행 예약량 합계는 **32 GiB**를 넘을 수 없습니다.
+깊이·entry 수·link 경계도 확인합니다. 초과하면 기존 증거를 삭제하지 않고 새 준비를 거부합니다.
+같은 루트의 독립 프로세스가 동시에 쓰는 경우에는 외부 직렬화가 필요하며 이 검사는
+시스템 전체 quota가 아닙니다. 승인된 유지보수로 필요한 증거를 회수한 뒤 진행합니다.
+
+Linux 내부 파일 삭제와 Windows VHD의 물리 공간 반환은 다른 결과입니다. 테스트 종료마다
+`wsl --shutdown`이나 VHD 압축을 실행하지 않습니다. 물리 공간 반환은 별도 사용자 승인 아래
+사용 중인 배포판을 확인하고 오프라인에서 수행하며, 전후 실제 할당량으로 확인합니다.
+
 ## 공유 연구 기록
 
 협업자가 재사용할 조사·비교·성능 실험·실패 분석을 선별해 `docs/research/`에 평면

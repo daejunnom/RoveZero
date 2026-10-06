@@ -38,7 +38,15 @@ fn readable_directory(directory: &Dir) -> Result<File, ArenaError> {
 /// Existing evidence is never evicted to make room. Concurrent independent
 /// output-root writers need external serialization; this is not a disk quota.
 pub(crate) fn admit(root: &Dir, reservation: u64) -> Result<(), ArenaError> {
-    fn size(directory: &Dir, depth: usize, entries: &mut usize) -> Result<u64, ArenaError> {
+    admit_bounded(root, reservation, OUTPUT_ROOT_BUDGET_BYTES)
+}
+fn admit_bounded(root: &Dir, reservation: u64, limit: u64) -> Result<(), ArenaError> {
+    fn size(
+        directory: &Dir,
+        depth: usize,
+        entries: &mut usize,
+        limit: u64,
+    ) -> Result<u64, ArenaError> {
         if depth > 64 {
             return Err(invalid("retention root depth exceeds bound"));
         }
@@ -60,7 +68,7 @@ pub(crate) fn admit(root: &Dir, reservation: u64) -> Result<(), ArenaError> {
                 let child = directory
                     .open_dir_nofollow(&name)
                     .map_err(|_| invalid("retention directory changed"))?;
-                size(&child, depth + 1, entries)?
+                size(&child, depth + 1, entries, limit)?
             } else if kind.is_file() {
                 directory
                     .symlink_metadata(&name)
@@ -74,15 +82,15 @@ pub(crate) fn admit(root: &Dir, reservation: u64) -> Result<(), ArenaError> {
             bytes = bytes
                 .checked_add(amount)
                 .ok_or_else(|| invalid("retention size overflow"))?;
-            if bytes > OUTPUT_ROOT_BUDGET_BYTES {
+            if bytes > limit {
                 return Err(ArenaError::Budget("native output root exceeds 32 GiB; preserve evidence and perform owner-aware maintenance".into()));
             }
         }
         Ok(bytes)
     }
-    if size(root, 0, &mut 0)?
+    if size(root, 0, &mut 0, limit)?
         .checked_add(reservation)
-        .is_none_or(|n| n > OUTPUT_ROOT_BUDGET_BYTES)
+        .is_none_or(|n| n > limit)
     {
         return Err(ArenaError::Budget(
             "native output root plus reserved attempt exceeds 32 GiB".into(),
@@ -132,7 +140,12 @@ fn retire_pins(
             .file
             .metadata()
             .map_err(|_| invalid("retention pin metadata missing"))?;
-        if held.mode() & 0o111 != 0 || pin.artifact.path.ends_with(".json") {
+        if held.mode() & 0o111 != 0
+            || Path::new(&pin.artifact.path)
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("json"))
+        {
             continue;
         }
         let relative = pin
@@ -351,13 +364,14 @@ mod tests {
             input(&tree, "libonnxruntime.so", false),
             input(&tree, "runner", true),
             input(&tree, "export.json", false),
+            input(&tree, "extra.JSON", false),
         ];
         fs::set_permissions(tree.0.join("inputs"), Permissions::from_mode(0o555)).unwrap();
         let removed = retire_pins(&output, &inputs, None, &tree.0, &pins).unwrap();
         assert_eq!(removed.len(), 2);
         assert!(!pins[0].path.exists());
         assert!(!pins[1].path.exists());
-        assert!(pins[2].path.exists() && pins[3].path.exists());
+        assert!(pins[2].path.exists() && pins[3].path.exists() && pins[4].path.exists());
         assert_eq!(fs::read(original).unwrap(), b"original unchanged");
         assert_eq!(fs::read(tree.0.join("match.pgn")).unwrap(), b"saved PGN");
         let events = fs::read_to_string(tree.0.join(JOURNAL)).unwrap();
@@ -399,8 +413,9 @@ mod tests {
         let tree = Tree::new();
         let root = tree.dir();
         let file = File::create(tree.0.join("historical-evidence")).unwrap();
-        file.set_len(OUTPUT_ROOT_BUDGET_BYTES).unwrap(); // Sparse fixture, no 32GiB allocation.
-        assert!(admit(&root, 1).is_err());
+        file.set_len(1024).unwrap();
+        assert!(admit_bounded(&root, 1, 1024).is_err());
+        assert!(admit_bounded(&root, 0, 1023).is_err());
         assert!(tree.0.join("historical-evidence").exists());
         file.set_len(0).unwrap();
         std::os::unix::fs::symlink("/unopened-external-target", tree.0.join("link")).unwrap();
