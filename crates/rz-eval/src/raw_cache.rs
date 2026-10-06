@@ -65,7 +65,9 @@ struct Entry {
     profile: Profile,
     key: EvalInputKey,
     encoded: EncodedInput,
-    raw: RawOutput,
+    // Immutable host heads. A hit pins the same allocation while normalization
+    // runs outside the cache lock, even if clear/eviction removes the entry.
+    raw: Arc<RawOutput>,
     source: ExecutionId,
     charge: usize,
 }
@@ -160,7 +162,7 @@ impl RawCache {
         &self,
         context: EvalContext,
         encoded: &EncodedInput,
-    ) -> Result<Option<(RawOutput, ExecutionId)>, ContractError> {
+    ) -> Result<Option<(Arc<RawOutput>, ExecutionId)>, ContractError> {
         let mut store = self
             .0
             .lock()
@@ -183,7 +185,7 @@ impl RawCache {
         });
         if let Some(index) = index {
             let entry = store.entries.remove(index).expect("matched entry");
-            let result = (entry.raw.clone(), entry.source);
+            let result = (Arc::clone(&entry.raw), entry.source);
             store.entries.push_back(entry);
             store.stats.hits = store.stats.hits.saturating_add(1);
             Ok(Some(result))
@@ -227,6 +229,10 @@ impl RawCache {
         }
         let charge = (encoded.values().len() + raw.policy_logits.len() + raw.wdl.len()) * 4
             + std::mem::size_of::<Entry>()
+            // Arc allocates the RawOutput descriptor and its two reference
+            // counters separately from the entry and the two Vec payloads.
+            + std::mem::size_of::<RawOutput>()
+            + 2 * std::mem::size_of::<usize>()
             + 1024;
         if charge > store.limits.max_bytes
             || store
@@ -255,7 +261,7 @@ impl RawCache {
             profile,
             key: context.input,
             encoded: encoded.clone(),
-            raw: raw.clone(),
+            raw: Arc::new(raw.clone()),
             source,
             charge,
         });
@@ -333,5 +339,111 @@ impl ExactRawReuse<RulesState> for RawCacheProvider {
     }
     fn observe(&mut self, request: &EvalRequest<RulesState>, output: Option<&EvalOutput>) {
         self.cache.observe(request, output);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contracts::{encoding_manifest, MaiaBinding, HOST_BYTES_PER_ITEM};
+    use rz_encoding::classical::HistoryFill;
+    use rz_position::contracts::ContractPosition;
+    use rz_position::Position;
+
+    #[test]
+    fn in_progress_hits_survive_concurrent_clear_and_release_the_last_raw_owner() {
+        let epoch = ProcessEpoch(91);
+        let encoding = EncodingHandle {
+            owner: OwnerId(92),
+            slot: 1,
+            generation: SlotGeneration(1),
+            manifest: encoding_manifest(HistoryFill::No),
+        };
+        let model = ModelHandle {
+            owner: OwnerId(92),
+            slot: 2,
+            generation: SlotGeneration(1),
+            manifest: Digest([93; 32]),
+        };
+        let binding =
+            MaiaBinding::new(model, encoding, HistoryFill::No, Digest([94; 32]), 1).unwrap();
+        let projection = ClassicalProjection::new(binding);
+        projection
+            .configure_raw_cache(RawCacheLimits {
+                max_entries: 1,
+                max_bytes: 128 * 1024,
+            })
+            .unwrap();
+        let frozen = ContractPosition::new(OwnerId(95), Position::startpos())
+            .export()
+            .unwrap();
+        let context = EvalContext {
+            revision: CONTRACT_REVISION,
+            request: RequestId::new(epoch, 1),
+            selection: SelectionId::new(epoch, 1),
+            game: GameGeneration(1),
+            root: RootGeneration(1),
+            state: frozen.snapshot().identity(),
+            legal_order: frozen.legal_moves().order(),
+            input: projection
+                .input_key(frozen.rules(), frozen.legal_moves().moves())
+                .unwrap(),
+            model,
+            encoding,
+            precision: PrecisionProfile::Fp32,
+            compute: ComputeBudget {
+                min_steps: 1,
+                max_steps: 1,
+                require_full: true,
+            },
+            backend: projection.backend(),
+        };
+        let request = Arc::new(
+            EvalRequest::try_new(
+                context,
+                frozen.snapshot().clone(),
+                frozen.legal_moves().clone(),
+                Arc::clone(projection.model()),
+                Deadline {
+                    clock: ClockDomain(epoch),
+                    at: MonotonicTick(100),
+                },
+                CancelToken::new(),
+                ByteBudget {
+                    host: HOST_BYTES_PER_ITEM + 4096,
+                    device: 0,
+                    pinned: 0,
+                },
+            )
+            .unwrap(),
+        );
+        let cache = projection.raw_cache_provider().cache;
+        let prepared = projection.prepare(Arc::clone(&request)).unwrap();
+        assert!(cache.lookup(context, prepared.encoded()).unwrap().is_none());
+        let raw = RawOutput {
+            policy_logits: vec![0.0; rz_encoding::POLICY_SIZE],
+            wdl: vec![0.5, 0.3, 0.2],
+        };
+        let execution = ExecutionId::new(epoch, 1);
+        let original = prepared.output(&raw, execution).unwrap();
+        cache.observe(&request, Some(&original));
+        let (first, source) = cache.lookup(context, prepared.encoded()).unwrap().unwrap();
+        let (second, _) = cache.lookup(context, prepared.encoded()).unwrap().unwrap();
+        let lifetime = Arc::downgrade(&first);
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let clearing = cache.clone();
+        std::thread::spawn(move || clearing.clear().unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(cache.stats().unwrap().retained_bytes, 0);
+        assert!(cache.lookup(context, prepared.encoded()).unwrap().is_none());
+        let result = prepared.reused_output(&second, source).unwrap();
+        assert_eq!(result.policy, original.policy);
+        assert_eq!(result.wdl, original.wdl);
+        drop(first);
+        assert!(lifetime.upgrade().is_some());
+        drop(second);
+        assert!(lifetime.upgrade().is_none());
     }
 }
