@@ -471,6 +471,64 @@ OOM·max·hint 오류·강제 종료·잔류 process는0이며 마지막 종료 
 수명주기 대조이며 일반 대국의 처리량·기력·Elo 인수가 아니다. 제품 source·Cargo·feature·
 workflow·공통 계약 변경 없이 `9b5064e`의 성공한 CPU CI를 별도 근거로 재사용한다.
 
+### 4.8 ONNX 읽기·해시 결합: 정확성 통과, 효과 채택 보류
+
+<a id="onnx-read-hash-ab"></a>
+
+2026-10-06 source `f68aace26be721bd7ed2da689347b53b63f98c95`에서 독립 E 후보
+`experimental-onnx-read-hash`를 검사했다. 기존 경로는 ONNX를 bounded Vec에 읽고
+전체 SHA-256을 따로 계산한다. 실험은 읽는 동안 동일한 소유 바이트를 해시한다.
+파일 크기 기반 예약·limit+1 growth probe·길이/전체 digest·오류 관점·ORT commit 후
+직렬화 버퍼 해제를 보존한다. 추가 model-sized buffer를 제거하는 변경은 아니며 기본 off다.
+
+`rz-eval` 기본56→57개, ONNX/contracts/새 feature91→92개와 `rz-uci`199개가 WSL
+Rust1.96에서 통과했다. 증가한 한 검사는 별도의 cache 경합 복구 검사다. 같은 source의
+[CPU CI](https://github.com/daejunnom/RoveZero/actions/runs/37397210012)는 Windows·Ubuntu·
+bindings 세 job 모두 SUCCESS다. 앞선 `f93e75d`의
+[Windows CI 실패](https://github.com/daejunnom/RoveZero/actions/runs/37396381591)는 보존한다.
+새 읽기 검사와 구분되는 기존 동시 cache 게시의 lock 오류였으며, 게시 완료된 entry만
+기존 전체 검증으로 재사용하도록 수정했다. 원래 오류는 bounded stderr 경고로 남기고,
+미게시·조회 불가 entry는 원래 실패, 손상 entry는 검증 실패를 유지한다. 이 정확성 수정은
+A/B 양쪽 공통이다. Windows 로컬 검사는 컴파일됐지만 Application Control4551로 미실행이다.
+
+새 feature의 독립 CUDA 수치 suite는 LC0 v0.32.1/eigen 원본 protobuf 참조12개와 실제
+batch1/2/4/8/16을 통과했다. 최대절대차는 logits `6.50882721e-5`, 합법 policy
+`2.80141830e-6`, WDL `1.78813934e-7`이다. 기존 logits atol1e-4/rtol1e-3와
+policy/WDL1e-4를 유지하며 native 대조 앞에 별도로 실행했다.
+
+native V5 공통 arena와 같은 source의 기준/변경 UCI binary를 사용했다. 두 lock의
+차이는 engine binary identity·표시명이며, 각각27개 snapshot 약4.10GB다. BT4·FP32·
+TF32 off·HistoryFill No·B1·visits·4096 simulation 상한·120+1·최대256ply를 고정했다.
+CPU2, high6GiB/max12GiB/swap0, 실행480초+정리30초·전체3600초와 세 수 강제 메이트를
+등록했다. 64KiB I/O·rolling snapshot reclaim·buffer reuse·notify·cache·dedup·I/O Binding·
+CUDA Graph는 off다. 기존3단계 private FD hint는 양쪽 동일하다. A0/B0 conditioning 이후
+A1/B1/B2/A2/A3/B3로 실행했다.
+
+T는 CLI→정상 종료·pipe drain·production receipt/provider/PGN 검사·최종 cgroup 수집,
+P는 원본/private/shared file cache 청구와 두 엔진을 포함하는 whole cgroup memory.peak다.
+
+| 쌍 | 기준 T(s) | 결합 T(s) | 기준 P(MiB) | 결합 P(MiB) | T1/T0 | P1/P0 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 127.204 | 133.569 | 5229.434 | 4030.148 | 1.050039 | 0.770666 |
+| 2 | 110.382 | 119.024 | 4030.035 | 4029.949 | 1.078293 | 0.999979 |
+| 3 | 120.525 | 124.609 | 4030.090 | 4029.910 | 1.033889 | 0.999955 |
+
+**HOLD·기본 off:** 첫 T는 실제값에서1.05를 넘으며 반올림해 승인하지 않는다. 둘째 T와
+둘째·셋째 P도 문턱을 충족하지 않는다. 모든 T가 증가했고 기준 T 범위16.821초이므로
+사전 Pareto 조건도 미충족이다. 비교6회의 원본 검증16.811~19.281초, copy38.715~53.156초,
+게임별 ready15.848~28.481초, go0.066~0.252초였다. 읽기·해시 내부 시간을 별도로
+분해하지 않았으므로 전체 ready 차이를 제거한 scan의 인과 효과로 환산하지 않는다.
+peak에 file cache 청구가 포함되며 ORT heap·VRAM·Windows 전체 commit 절약을 입증하지 않는다.
+
+8회 모두 같은 PGN 수순·role별 완료/소비 수를 확인했다. 실행당 fresh session4개,
+D 완료16/탐색 소비16(루트6/비루트10), private bytes/inode/readonly·Rules 메이트·정확한
+흑백 표시명·실제120+1 시계·정상 process/물리 drain을 인수했다. OOM·max·강제 종료·잔류
+process·hint 오류0, 비교6회 high0이다. conditioning high29,974/21,704는 별도로 남겼다.
+마지막 GPU 관측은0MiB이며 VRAM/Windows commit peak는 unknown이다. PGN16판·등록·분석·
+로그·CI 실패 자료는 `${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-onnx-read-hash-20261006/`
+에 보존했다. 성공한 비활성 private inputs만 동일한 소유/완료 검사를 거쳐 회수했다.
+이 수명주기 진단으로 장시간 강도·Elo·기본 batch 승격을 판정하지 않는다.
+
 ## 5. 후속 구현·검증 순서
 
 할당/복사 제거 → 저장 밀도 → bounded scratch/arena/pool → 임계 구역/완료 통지 →
