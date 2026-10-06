@@ -238,7 +238,9 @@ def run_once(variant, directory, overall_deadline, affinity=None):
     return result
 
 
-def run(manifest, output):
+def run(manifest, output, overall_seconds=3600):
+    require(type(overall_seconds) is int and 210<=overall_seconds<=3600,
+            "overall budget must admit one bounded run and never exceed 3600 seconds")
     output = outside_git(output)
     output.mkdir()
     put(output/"registration.json", {"manifest": manifest, "helper_sha256": sha256(__file__),
@@ -247,14 +249,14 @@ def run(manifest, output):
         "simulations_per_input": SIMULATIONS, "AA_pairs": 3, "AB_pairs": 5,
         "tree_max_edges": TREE_MAX_EDGES, "tree_max_nodes": 20_000, "tree_max_depth": 128,
         "search_command": SEARCH_COMMAND,
-        "run_wall_seconds": 180, "cleanup_seconds": 30, "overall_seconds": 3600,
+        "run_wall_seconds": 180, "cleanup_seconds": 30, "overall_seconds": overall_seconds,
         "cache_preparation_wall_seconds":60,"cache_preparation_cleanup_seconds":30,
         "cache_condition":"shared-runtime-warm-readhash_no_residency_guarantee",
         "primary_time": "whole_wall_start_through_native_exit_receipts_and_cgroup_collection",
         "primary_peak": "fresh_cgroup_memory.peak", "each_pair_time_and_peak_ratio_max": 1.05,
         "AA_variability_max": .05, "first_failure_stops": True, "automatic_retry": False})
     started = time.monotonic()
-    deadline = started+3600
+    deadline = started+overall_seconds
     pairs=[]
     reference_work=None
     error=None
