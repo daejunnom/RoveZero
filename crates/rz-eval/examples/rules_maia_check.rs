@@ -399,6 +399,23 @@ struct ProfileExecution<'a> {
     fill: HistoryFill,
     profile_slot: u64,
     cuda_profile_directory: Option<&'a Path>,
+    raw_cache: bool,
+}
+
+fn finalized(evaluator: &mut NativeEvaluator, case: &str) -> Result<EvalOutput> {
+    let until = Instant::now() + Duration::from_secs(REQUEST_SECONDS);
+    loop {
+        if let Some(result) = evaluator.poll() {
+            return match result {
+                EvalResult::Completed(output) => Ok(output),
+                other => Err(format!("native finalized failure: {other:?}").into()),
+            };
+        }
+        if Instant::now() >= until {
+            return Err(format!("native completion timeout: {case}").into());
+        }
+        std::thread::yield_now();
+    }
 }
 
 fn evaluate_profile(
@@ -413,6 +430,7 @@ fn evaluate_profile(
         fill,
         profile_slot,
         cuda_profile_directory,
+        raw_cache,
     } = execution;
     let mut config = BackendConfig::cpu();
     config.max_batch = 1;
@@ -439,6 +457,13 @@ fn evaluate_profile(
     };
     let projection =
         ClassicalProjection::new(MaiaBinding::for_backend(&loaded, handle, encoding, fill)?);
+    #[cfg(feature = "experimental-raw-cache")]
+    if raw_cache {
+        projection.configure_raw_cache(rz_eval::raw_cache::RawCacheLimits {
+            max_entries: 16,
+            max_bytes: 2 * 1024 * 1024,
+        })?;
+    }
     let profile = match fill {
         HistoryFill::No => "no",
         HistoryFill::RepeatOldest => "repeat_oldest",
@@ -482,6 +507,14 @@ fn evaluate_profile(
         },
     };
     let mut evaluator = ContractEvaluator::new(adapter, backend, limits, 64)?;
+    #[cfg(feature = "experimental-raw-cache")]
+    if raw_cache {
+        evaluator.set_raw_reuse(Box::new(projection.raw_cache_provider()));
+    }
+    #[cfg(feature = "experimental-raw-cache")]
+    let mut replay_count = 0_u64;
+    #[cfg(not(feature = "experimental-raw-cache"))]
+    let replay_count = 0_u64;
     let work = (|| -> Result<()> {
         for (i, case) in fixtures
             .cases
@@ -493,20 +526,7 @@ fn evaluate_profile(
             let reference_policy = compare_projection(&projection, &frozen, case)?;
             let request = request(&projection, &frozen, &clock, i as u64 + 1)?;
             evaluator.submit(Arc::clone(&request))?;
-            let until = Instant::now() + Duration::from_secs(REQUEST_SECONDS);
-            let completed = loop {
-                if let Some(result) = evaluator.poll() {
-                    break result;
-                }
-                if Instant::now() >= until {
-                    return Err(format!("native completion timeout: {}", case.name).into());
-                }
-                std::thread::yield_now();
-            };
-            let output = match completed {
-                EvalResult::Completed(output) => output,
-                other => return Err(format!("native finalized failure: {other:?}").into()),
-            };
+            let output = finalized(&mut evaluator, &case.name)?;
             output.validate_for(&request, scope, clock.domain(), clock.try_now()?)?;
             if output.actual.execution.is_none()
                 || output.actual.provenance != CacheProvenance::Computed
@@ -525,6 +545,29 @@ fn evaluate_profile(
                 .collect::<Vec<_>>();
             let policy_error = compare(&policy, &reference_policy, 1e-4, 0.0)?;
             let wdl_error = compare(&output.wdl.probabilities(), &case.wdl, 1e-4, 0.0)?;
+            #[cfg(feature = "experimental-raw-cache")]
+            if raw_cache {
+                for replay in 0..2 {
+                    let reused =
+                        self::request(&projection, &frozen, &clock, 64 + i as u64 * 2 + replay)?;
+                    evaluator.submit(Arc::clone(&reused))?;
+                    let cached = finalized(&mut evaluator, &case.name)?;
+                    cached.validate_for(&reused, scope, clock.domain(), clock.try_now()?)?;
+                    if cached.policy != output.policy
+                        || cached.wdl != output.wdl
+                        || cached.actual.execution.is_some()
+                        || cached.actual.provenance
+                            != (CacheProvenance::RawEvalHit {
+                                source_execution: output.actual.execution,
+                            })
+                        || evaluator.state().executions != 0
+                        || evaluator.state().reserved != Resources::default()
+                    {
+                        return Err("raw-cache replay differs or retains physical work".into());
+                    }
+                    replay_count += 1;
+                }
+            }
             reports.push(json!({"case":case.name,"history_fill":profile,
                 "rules_origin":"literal_fen_unknown_prefix_with_actual_trace",
                 "known_frames":case.frames.len(),"frozen_after_live_advance":true,
@@ -575,7 +618,21 @@ fn evaluate_profile(
     });
     let execution_admission = owner.admission_policy().execution_resources();
     let session_admission = owner.admission_policy().session_resident_admission();
+    #[cfg(feature = "experimental-raw-cache")]
+    let cache_stats = if raw_cache {
+        let stats = projection.raw_cache_stats()?;
+        if work.is_ok() && (stats.hits != replay_count || stats.staged != 0) {
+            return Err("raw-cache replay accounting differs".into());
+        }
+        json!({"hits":stats.hits,"misses":stats.misses,"entries":stats.entries,
+            "staged":stats.staged,"retained_bytes":stats.retained_bytes})
+    } else {
+        Value::Null
+    };
+    #[cfg(not(feature = "experimental-raw-cache"))]
+    let cache_stats = Value::Null;
     profiles.push(json!({"history_fill":profile,"batch_size":1,
+        "raw_cache":raw_cache,"raw_cache_replays":replay_count,"cache_stats":cache_stats,
         "provider":if is_cuda{"cuda"}else{"cpu"},
         "native_origin":if is_cuda{"cuda_onnx"}else{"cpu_onnx"},
         "cuda":cuda_metadata,
@@ -615,7 +672,15 @@ fn main() -> Result<()> {
         .unwrap_or(args.len());
     let (args, options) = args.split_at(option_start);
     let mut runtime_cache_root = None;
+    let mut raw_cache = false;
     for option in options {
+        if option == "--experimental-raw-cache" {
+            if !cfg!(feature = "experimental-raw-cache") || raw_cache {
+                return Err("raw-cache gate requires its feature and a unique option".into());
+            }
+            raw_cache = true;
+            continue;
+        }
         let value = option
             .strip_prefix("--runtime-cache-root=")
             .ok_or("unsupported rules gate option")?;
@@ -722,6 +787,7 @@ fn main() -> Result<()> {
                     fill,
                     profile_slot: slot,
                     cuda_profile_directory,
+                    raw_cache,
                 },
                 &mut cases,
                 &mut profiles,
