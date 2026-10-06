@@ -12,4 +12,3 @@ rz-search = { path = "../../../crates/rz-search" }
 rz-contracts = { path = "../../../crates/rz-contracts" }
 serde.workspace = true
 serde_json.workspace = true
-

@@ -11,4 +11,3 @@ license = "MIT"
 [tool.maturin]
 manifest-path = "python/Cargo.toml"
 module-name = "rz_bindings_poc"
-
