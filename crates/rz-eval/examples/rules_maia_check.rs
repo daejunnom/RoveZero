@@ -31,6 +31,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 type NativeEvaluator =
     ContractEvaluator<RulesState, NativeRuntimeBackend<ContractSystemClock>, ContractSystemClock>;
 const REQUEST_SECONDS: u64 = 5;
+const SHUTDOWN_SECONDS: u64 = 5;
 const CASE_NAMES: [&str; 12] = [
     "start",
     "black-after-e4",
@@ -395,6 +396,25 @@ fn drain(evaluator: &mut NativeEvaluator, clock: &ContractSystemClock) -> Result
     }
 }
 
+fn shutdown_native(owner: &NativeWorkerOwner, budget: Duration) -> Result<Value> {
+    let until = Instant::now() + budget;
+    loop {
+        match owner.try_shutdown() {
+            std::task::Poll::Ready(result) => {
+                result?;
+                return Ok(json!({"native":"joined","session_destruction":"complete",
+                    "worker_thread_exit":"joined"}));
+            }
+            std::task::Poll::Pending if Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::task::Poll::Pending => {
+                return Err("native worker shutdown is unconfirmed within fixture budget".into());
+            }
+        }
+    }
+}
+
 struct ProfileExecution<'a> {
     fill: HistoryFill,
     profile_slot: u64,
@@ -585,7 +605,19 @@ fn evaluate_profile(
     })();
     // Both failure and cleanup receipts survive even when the profile fails.
     let cleanup = drain(&mut evaluator, &clock);
-    // Current resident identity is a separate proof after the worker/drain
+    // One bounded checkpoint survives a fatal native destructor before the
+    // final report can be written. This fixture has no periodic PID/GPU logger.
+    eprintln!(
+        "{}",
+        json!({"stage":"before_native_shutdown","history_fill":profile,
+        "work_passed":work.is_ok(),"physical_drain_confirmed":cleanup.is_ok(),
+        "fresh_cases_completed":reports.iter().filter(|report|report["history_fill"]==profile).count(),
+        "raw_cache_replays":replay_count})
+    );
+    // Empty request reservations do not include session destruction or native
+    // thread exit. Join on failed work too, before another profile or main exit.
+    let shutdown = shutdown_native(&owner, Duration::from_secs(SHUTDOWN_SECONDS));
+    // Current resident identity is a separate proof after the worker shutdown
     // work. It cannot release quarantined inputs or turn failed work into pass.
     let mapping_audit = if is_cuda {
         runtime
@@ -653,14 +685,17 @@ fn evaluate_profile(
         "work_failure":work.as_ref().err().map(|error| error_receipt(error.as_ref())),
         "drain":cleanup.as_ref().ok(),
         "drain_failure":cleanup.as_ref().err().map(|error| error_receipt(error.as_ref())),
+        "native_shutdown":shutdown.as_ref().ok(),
+        "native_shutdown_failure":shutdown.as_ref().err().map(|error|error_receipt(error.as_ref())),
         "native_diagnostics":diagnostic_report}));
-    if diagnostics.is_err() {
-        // Transfer failure leaves originals in this finite-capacity owner. Keep
-        // that owner through process exit instead of silently dropping originals.
+    if diagnostics.is_err() || shutdown.is_err() {
+        // Preserve originals or an unconfirmed native owner through process
+        // exit; a report or logical drain never permits reclaiming its pins.
         std::mem::forget(owner);
     }
     work?;
     cleanup?;
+    shutdown?;
     mapping_audit?;
     if !diagnostics_clean || !cleanup_clean {
         return Err(
@@ -819,6 +854,7 @@ fn main() -> Result<()> {
         "model_rights":"external selected weight; license status is recorded in the pinned export manifest",
         "profiles":profiles,"limits":{"fixture_bytes":8*1024*1024,"cases":12,"trace_plies":8,
             "native_batch_size":1,"max_executions":1,"request_deadline_seconds":REQUEST_SECONDS,
+            "native_shutdown_deadline_seconds":SHUTDOWN_SECONDS,
             "scheduler_host_reservation_limit":4*HOST_BYTES_PER_ITEM+8192,
             "scheduler_device_admission_limit":device_admission,
             "bootstrap_session_resident_device_admission":device_admission,
@@ -876,6 +912,129 @@ mod admission_tests {
                         .validate_admission(&RuntimeRequest::new(request))
                         .unwrap();
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn drained_request_does_not_admit_delayed_native_shutdown_on_success_or_failure() {
+        use rz_eval::error::{BackendError, FailureKind, FailureStage};
+        use rz_eval::worker::SingleWorker;
+        use std::sync::mpsc;
+
+        struct NativeDestructor(mpsc::Sender<()>, mpsc::Receiver<()>);
+        impl Drop for NativeDestructor {
+            fn drop(&mut self) {
+                self.0.send(()).unwrap();
+                self.1.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+
+        for fail in [false, true] {
+            let clock = ContractSystemClock::new(ProcessEpoch(321));
+            let model = ModelHandle {
+                owner: OwnerId(322),
+                slot: 1,
+                generation: SlotGeneration(1),
+                manifest: Digest([123; 32]),
+            };
+            let encoding = EncodingHandle {
+                owner: OwnerId(322),
+                slot: 2,
+                generation: SlotGeneration(1),
+                manifest: encoding_manifest(HistoryFill::No),
+            };
+            let projection = ClassicalProjection::new(
+                MaiaBinding::new(model, encoding, HistoryFill::No, Digest([124; 32]), 1).unwrap(),
+            );
+            let (began, destruction_started) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let native = NativeDestructor(began, released);
+            let worker = SingleWorker::spawn(
+                move |batch: &rz_eval::contracts::PreparedBatch<RulesState>| {
+                    let _keep = &native;
+                    if fail {
+                        Err(BackendError::new(
+                            FailureKind::BackendFailure,
+                            FailureStage::Backend,
+                            "injected completed physical failure",
+                        )
+                        .into())
+                    } else {
+                        let raw = rz_eval::RawOutput {
+                            policy_logits: vec![0.0; 1858],
+                            wdl: vec![0.5, 0.25, 0.25],
+                        };
+                        batch
+                            .requests()
+                            .iter()
+                            .map(|request| request.physical_output(&raw, batch.execution()))
+                            .collect()
+                    }
+                },
+            )
+            .unwrap();
+            let owner = NativeWorkerOwner::from_worker(worker, projection.clone(), 2).unwrap();
+            let scope = AcceptanceScope {
+                game: GameGeneration(1),
+                root: RootGeneration(1),
+                model,
+                encoding,
+                backend: projection.backend(),
+            };
+            let adapter = ContractsAdapter::new(SharedScope::new(scope), clock.clone(), 1).unwrap();
+            let backend = NativeRuntimeBackend::new(owner.clone(), clock.clone()).unwrap();
+            let limits = Limits {
+                max_requests: 1,
+                max_batch_items: 1,
+                max_executions: 1,
+                max_batch_wait: Duration::ZERO,
+                max_queue_age: Duration::from_secs(REQUEST_SECONDS),
+                deadline_reserve: Duration::ZERO,
+                memory: Resources {
+                    host_bytes: 4 * HOST_BYTES_PER_ITEM + 8192,
+                    device_bytes: 0,
+                    pinned_bytes: 0,
+                },
+            };
+            let mut evaluator = ContractEvaluator::new(adapter, backend, limits, 64).unwrap();
+            let frozen = ContractPosition::new(OwnerId(323), Position::startpos())
+                .export()
+                .unwrap();
+            evaluator
+                .submit(request(&projection, &frozen, &clock, 1).unwrap())
+                .unwrap();
+            let work = finalized(&mut evaluator, "native-shutdown-regression");
+            assert_eq!(work.is_err(), fail);
+            assert_eq!(
+                drain(&mut evaluator, &clock).unwrap()["physical"],
+                "drained"
+            );
+            let unconfirmed = shutdown_native(&owner, Duration::ZERO);
+            destruction_started
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            release.send(()).unwrap();
+            assert_eq!(
+                unconfirmed.unwrap_err().to_string(),
+                "native worker shutdown is unconfirmed within fixture budget"
+            );
+            assert_eq!(
+                shutdown_native(&owner, Duration::from_secs(SHUTDOWN_SECONDS)).unwrap()["native"],
+                "joined"
+            );
+            let diagnostics = owner.take_diagnostics().unwrap();
+            assert_eq!(diagnostics.entries.len(), usize::from(fail));
+            if fail {
+                assert_eq!(
+                    diagnostics.entries[0]
+                        .failure
+                        .backend
+                        .as_ref()
+                        .unwrap()
+                        .detail,
+                    "injected completed physical failure"
+                );
             }
         }
     }
