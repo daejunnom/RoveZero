@@ -87,6 +87,14 @@ class Accounting(unittest.TestCase):
         self.assertEqual(result["duplicate_comparisons_skipped"], 1)
         self.assertEqual(result["unique_compared_physical_runs"], 2)
 
+    def test_arena_comparison_cannot_label_two_baselines_or_reversed_options(self):
+        for baseline, variant in ((False, False), (True, False), (True, True)):
+            pair = self.pair("arena", option="cuda-cpu-arena-off")
+            pair["baseline"].update(layout="inference", disable_cuda_cpu_arena=baseline)
+            pair["variant"].update(layout="inference", disable_cuda_cpu_arena=variant)
+            with self.assertRaisesRegex(ValueError, "requires baseline on and variant off"):
+                self.aggregate([pair])
+
     def test_conflicting_id_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "conflicting comparison"):
             self.aggregate([self.pair("same"), self.pair("same", b=self.measurement(9, 80))])

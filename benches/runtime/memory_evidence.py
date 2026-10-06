@@ -187,6 +187,12 @@ def aggregate(root, ledger):
         compat = comparison["compatibility"]
         if set(compat) != COMPAT_KEYS or any(v is None for v in compat.values()):
             raise ValueError("complete compatibility dimensions required")
+        if (compat["option"] == "cuda-cpu-arena-off"
+            or any("disable_cuda_cpu_arena" in comparison[side] for side in ("baseline", "variant"))):
+            if (comparison["baseline"].get("disable_cuda_cpu_arena") is not False
+                or comparison["variant"].get("disable_cuda_cpu_arena") is not True
+                or any(comparison[side]["layout"] != "inference" for side in ("baseline", "variant"))):
+                raise ValueError("CUDA CPU arena comparison requires baseline on and variant off")
         group_id = hashlib.sha256(canonical(compat).encode()).hexdigest()
         pair = {side: observation(root, comparison[side], compat["peak_kind"])
                 for side in ("baseline", "variant")}
