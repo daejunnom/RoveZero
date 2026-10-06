@@ -40,6 +40,12 @@ class ModelPairGateTests(unittest.TestCase):
     def test_registered_model_runtime_and_opponent_match(self):
         gate_identities(*fixture())
 
+    def test_default_regression_does_not_admit_a_native_environment_experiment(self):
+        declaration,reports=fixture()
+        declaration["engines"][0]["configuration"]["environment"]={"variables":{"MALLOC_ARENA_MAX":"2"}}
+        with self.assertRaises(ValueError):
+            gate_identities(declaration,reports)
+
     def test_success_for_different_inputs_does_not_admit_play(self):
         mutations=[
             lambda r:r["adapter_regression"][0]["candidate"].update(binary_sha256="other-engine"),

@@ -104,6 +104,8 @@ preflight와 대국에는 같은 선언을 전달한다. 영수증은 launcher h
 제거 요청·인수 준비 상태를 기록하고, 엔진이 해석한 실제 값은 readback 없이 unknown이다.
 `readyok`를 환경 적용 증거로 사용하지 않는다. 외부 pilot gate도 preflight의 환경과
 launcher 식별이 실행 선언과 같은지 검사한다.
+이번 어댑터 회귀·첫 외부 pilot의 RoveZero 환경은 기존 기본 상태로 고정한다. native 환경을
+바꾸는 후속 runtime 실험은 이 기본 환경의 회귀 보고서를 gate로 재사용할 수 없다.
 
 ## Stockfish 19와 대국
 
@@ -204,9 +206,18 @@ unknown이다. 별도 cloud 비용·학습·정밀도/batch 정책·backend 변�
 독립 수치 검사 경로는 이 변경의 영향을 받지 않는다. 검사기·엔진·arena의 source를 구분한다.
 
 - 로컬 WSL Rust 전체 feature/all-target 820개 통과, 16개 명시적 미실행, all-feature
-  Clippy 통과. 후속 Linux recipe 검사 55개 통과. `b4924f1`의 Linux·Windows·bindings CI
-  세 job이 실제 성공했다. 55개 검사에는 유한 전체 예산 초과 거부와 쌍별 통과 후 전체
+  Clippy 통과. 후속 Linux recipe 검사 56개 통과. `b4924f1`의 Linux·Windows·bindings CI
+  세 job이 실제 성공했다. 후속 검사에는 유한 전체 예산 초과 거부와 쌍별 통과 후 전체
   A/A drift로 인한 A/B 미착수가 포함된다. CPU CI를 실제 GPU 검사로 대신하지 않는다.
+- 엔진별 환경 연결의 영향 영역 Rust all-feature/all-target 검사는 254개 통과·14개
+  명시적 미실행이며 최종 library 경계 38개·Clippy도 통과했다. 공개 값 격리·literal
+  인수·HOME 미상속·소유 process 종료·launcher snapshot 실행 권한을 검사했다.
+  실제 고정 Fastchess의 CPU fixture 두 게임/총 8 ply에서 서로 다른 두 환경과 공백·
+  `$()`·세미콜론 인수를 그대로 전달하고 네 fresh process의 정상 종료를 확인했다.
+  이 fixture는 신경망·성능·Stockfish 대국 인수가 아니다.
+- arena `dc2285e`의 새 실행 파일을 별도로 빌드·등록했다. 환경이 없는 실제 기존 V2
+  입력을 새 프로그램으로 잠갔을 때 lock 전체 byte와 digest가 기존 프로그램과 일치했다.
+  탐색 엔진은 기존 `4d715b3` 등록을 유지하며 실제 GPU 비교·대국 실행 자료와 구분한다.
 - 같은 CPU/mock 관측 예제를 기존 소스와 분리 후 소스에 연결해 10개 고정 포지션을
   각 2회 실행했다. 합법 수 순서·입력 식별·착수·종료·완료 simulation·소비 평가 수와
   root prior/방문 수/누적 가치/Q의 f64 비트가 전부 일치했다. Rules 종료 상태에는

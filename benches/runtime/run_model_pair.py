@@ -13,6 +13,8 @@ def gate_identities(declaration, reports):
     external=[e["configuration"] for e in declaration["engines"] if e["endpoint"]=="external_uci"]
     require(len(rove)==len(external)==1,"one RoveZero and external endpoint required")
     rove,external=rove[0],external[0]
+    require(rove.get("environment") is None,
+            "this adapter pilot requires the registered default RoveZero environment")
     launch=rove["launch"]
     require(launch["provider"]=="lc0_cuda","this pilot requires the registered BT4 CUDA B1 recipe")
     launch=launch["declaration"]
