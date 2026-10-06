@@ -7,6 +7,7 @@ visible even in descriptive cumulative totals. See benches/runtime/README.md.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -47,7 +48,7 @@ def read_json(path, digest=None):
     # A ledger cannot authorize reading secrets or model/library binaries.
     name = path.name.lower()
     if path.suffix.lower() != ".json" or name.startswith(".env") or any(
-        word in name for word in ("credential", "service-account", "service_account", "api-key", "ssh-key")
+        word in name for word in ("credential", "service-account", "service_account", "api-key", "api_key", "ssh-key", "ssh_key")
     ):
         raise ValueError("only explicit non-secret JSON evidence is supported")
     if any(part.is_symlink() for part in (path, *path.parents)):
@@ -202,12 +203,19 @@ def aggregate(root, ledger):
         output.append(dict(series_id=key, compatibility=group["compatibility"],
             cumulative=summarize(group["pairs"]),
             epochs=[dict(identity=json.loads(epoch), **summarize(pairs)) for epoch, pairs in group["epochs"].items()]))
-    excluded = ledger.get("excluded", [])
-    for item in excluded:
+    excluded, excluded_ids = [], {}
+    for item in ledger.get("excluded", []):
         if not item["reason"]:
             raise ValueError("exclusion requires a preserved reason")
+        fingerprint = canonical(item)
+        if item["id"] in excluded_ids:
+            if excluded_ids[item["id"]] != fingerprint:
+                raise ValueError("conflicting exclusion ID")
+            continue
         for ref in item["evidence"]:
             pinned(root, ref)
+        excluded_ids[item["id"]] = fingerprint
+        excluded.append(item)
     return dict(schema_version=1, series=output, duplicate_comparisons_skipped=duplicates,
         unique_compared_physical_runs=len(executions), excluded=excluded,
         shared_control_occurrences=2 * len(ids) - len(executions),
@@ -219,14 +227,44 @@ def aggregate(root, ledger):
             "does not launch workloads, alter prior judgments or infer Elo/confidence"])
 
 
+def combine_ledgers(paths):
+    combined = dict(schema_version=1, comparisons=[], excluded=[])
+    inputs = []
+    for path in paths:
+        path = Path(path).absolute()
+        ledger, digest = read_json(path)
+        if ledger["schema_version"] != 1:
+            raise ValueError("unsupported included ledger")
+        value = copy.deepcopy(ledger)
+        def rebase(ref):
+            ref["path"] = str((path.parent / ref["path"]).absolute())
+        for comparison in value["comparisons"]:
+            for side in ("baseline", "variant"):
+                arm = comparison[side]
+                for key in ("result", "report", "receipt", "registration"):
+                    if key in arm:
+                        rebase(arm[key])
+                for ref in arm.get("additional_evidence", []):
+                    rebase(ref)
+        for item in value.get("excluded", []):
+            for ref in item["evidence"]:
+                rebase(ref)
+        combined["comparisons"].extend(value["comparisons"])
+        combined["excluded"].extend(value.get("excluded", []))
+        inputs.append(dict(path=str(path), sha256=digest))
+    return combined, inputs
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("ledger", type=Path)
     parser.add_argument("report", type=Path, help="fresh JSON report outside Git")
+    parser.add_argument("--include-ledger", type=Path, action="append", default=[],
+                        help="preserved earlier ledger; repeat to add more epochs")
     args = parser.parse_args()
-    ledger, digest = read_json(args.ledger)
+    ledger, inputs = combine_ledgers([*args.include_ledger, args.ledger])
     result = aggregate(args.ledger.parent, ledger)
-    result["ledger_sha256"] = digest
+    result["input_ledgers"] = inputs
     if any((parent / ".git").exists() for parent in args.report.absolute().parents):
         raise ValueError("report must be outside Git")
     with args.report.open("x", encoding="utf-8") as stream:

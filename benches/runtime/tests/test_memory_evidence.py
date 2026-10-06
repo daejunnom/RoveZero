@@ -129,6 +129,15 @@ class Accounting(unittest.TestCase):
         self.assertEqual(len(result["excluded"]), 1)
         self.assertEqual(result["series"][0]["cumulative"]["pairs"], 1)
 
+    def test_repeated_exclusion_is_preserved_once_and_conflicts_rejected(self):
+        item = dict(id="failure", reason="failed", evidence=[self.pin(dict(accepted=False))])
+        result = self.aggregate([self.pair("p")], excluded=[item, copy.deepcopy(item)])
+        self.assertEqual(len(result["excluded"]), 1)
+        conflict = copy.deepcopy(item)
+        conflict["reason"] = "different failure"
+        with self.assertRaisesRegex(ValueError, "conflicting exclusion"):
+            self.aggregate([self.pair("p2")], excluded=[item, conflict])
+
     def test_duplicate_json_keys_and_secret_names_rejected(self):
         path = self.root / "ambiguous.json"
         path.write_text('{"a":1,"a":2}')
@@ -136,6 +145,20 @@ class Accounting(unittest.TestCase):
             module.read_json(path)
         with self.assertRaisesRegex(ValueError, "non-secret JSON"):
             module.read_json(self.root / "service-account.json")
+
+    def test_included_ledgers_preserve_relative_evidence_and_deduplicate_comparisons(self):
+        pair = self.pair("p")
+        ledger = dict(schema_version=1, comparisons=[pair])
+        first = self.root / "first.json"
+        second = self.root / "second.json"
+        first.write_text(json.dumps(ledger))
+        second.write_text(json.dumps(ledger))
+        combined, inputs = module.combine_ledgers([first, second])
+        self.assertEqual(len(inputs), 2)
+        self.assertTrue(Path(combined["comparisons"][0]["baseline"]["result"]["path"]).is_absolute())
+        result = module.aggregate(self.root / "unrelated", combined)
+        self.assertEqual(result["duplicate_comparisons_skipped"], 1)
+        self.assertEqual(result["series"][0]["cumulative"]["pairs"], 1)
 
 
 if __name__ == "__main__":

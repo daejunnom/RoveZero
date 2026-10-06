@@ -37,8 +37,13 @@ SHA 변조·중복 ID 충돌·같은 series의 실행 재사용·작업량 불�
 
 ```sh
 python benches/runtime/memory_evidence.py "$RZ_LEDGER_JSON" "$RZ_FRESH_REPORT_JSON"
+python benches/runtime/memory_evidence.py "$RZ_NEW_LEDGER_JSON" "$RZ_FRESH_REPORT_JSON" \
+  --include-ledger "$RZ_PRIOR_LEDGER_JSON"
 python -m unittest discover -s benches/runtime/tests -p test_memory_evidence.py -q
 ```
+
+`--include-ledger`는 반복 지정할 수 있다. 이전 ledger를 수정하지 않고 새 실행의 ledger를
+추가하며 각 입력 ledger SHA도 출력에 남긴다. 중복 comparison은 한 번만 센다.
 
 ## D02 CPU/mock trace 재생
 
