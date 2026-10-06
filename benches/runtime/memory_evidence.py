@@ -1,0 +1,231 @@
+"""Read-only cumulative paired E evidence. Never launches or promotes an engine.
+
+Raw measurements stay outside Git. A ledger references bounded, SHA-pinned JSON
+results and declares compatible workload/peak definitions. Source epochs remain
+visible even in descriptive cumulative totals. See benches/runtime/README.md.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+from pathlib import Path
+import re
+import statistics
+
+CAP = 16 * 1024 * 1024
+COMPAT_KEYS = {
+    "option", "workload", "model", "runtime", "precision", "batch", "resources",
+    "fixed_work", "time_scope", "peak_kind", "other_options",
+}
+
+
+def unique_object(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def positive(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("numeric observation required")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("finite positive observation required")
+    return value
+
+
+def read_json(path, digest=None):
+    path = Path(path)
+    # A ledger cannot authorize reading secrets or model/library binaries.
+    name = path.name.lower()
+    if path.suffix.lower() != ".json" or name.startswith(".env") or any(
+        word in name for word in ("credential", "service-account", "service_account", "api-key", "ssh-key")
+    ):
+        raise ValueError("only explicit non-secret JSON evidence is supported")
+    if any(part.is_symlink() for part in (path, *path.parents)):
+        raise ValueError("linked evidence is not supported")
+    with path.open("rb") as stream:
+        payload = stream.read(CAP + 1)
+    if len(payload) > CAP:
+        raise ValueError("evidence exceeds bounded JSON limit")
+    observed = hashlib.sha256(payload).hexdigest()
+    if digest is not None and observed != digest:
+        raise ValueError("evidence SHA mismatch")
+    return json.loads(payload, object_pairs_hook=unique_object), observed
+
+
+def pinned(root, ref):
+    if set(ref) != {"path", "sha256"} or not re.fullmatch("[0-9a-f]{64}", ref["sha256"]):
+        raise ValueError("explicit path and SHA required")
+    return read_json(root / ref["path"], ref["sha256"])[0]
+
+
+def events(text):
+    return {key: int(value) for key, value in (line.split() for line in text.splitlines())}
+
+
+def observation(root, item, peak_kind):
+    result = pinned(root, item["result"])
+    if result.get("accepted") is not True or result.get("exit_code") != 0:
+        raise ValueError("failed or incomplete run cannot enter a comparison")
+    if result.get("conditioning", False) or result.get("cancelled", False):
+        raise ValueError("conditioning or cancelled run cannot enter a comparison")
+    if result.get("forced_cgroup_cleanup") is not False:
+        raise ValueError("normal owned cleanup must be confirmed")
+    if result.get("marker_errors") or result.get("phase_memory_errors"):
+        raise ValueError("incomplete measurement evidence")
+    legacy = item["layout"] == "inference"
+    if item["layout"] not in ("native", "prepare", "oracle", "inference"):
+        raise ValueError("unknown evidence layout")
+    remaining = "remaining_after_cleanup" if legacy else "remaining_owned_processes"
+    if result.get(remaining) != [] or result.get("errors") or result.get("timed_out") or result.get("host_cancelled"):
+        raise ValueError("owned exit, error and deadline checks must pass")
+    resources = result["cgroup" if legacy else "resources"]
+    counters = events(resources["memory.events"])
+    if any(counters.get(key, 0) for key in ("max", "oom", "oom_kill", "oom_group_kill")):
+        raise ValueError("allocation or OOM failure cannot be averaged away")
+    time = positive(result["elapsed_s" if legacy else "whole_wall_seconds"])
+    fixed_work = result.get("fixed_work")
+    if legacy:
+        report = pinned(root, item["report"])
+        if report.get("accepted") is not True or report.get("failure") is not None:
+            raise ValueError("inference report not accepted")
+        if report["batches"] != [1] or report["warmup_runs"] != 3 or report["measured_runs"] != 20:
+            raise ValueError("fixed B1 workload required")
+        sample, = report["samples"]
+        if sample["completed_nn_items"] != 20 or sample["physical_completion_confirmed"] is not True:
+            raise ValueError("physical fixed-work completion required")
+        fixed_work = {key: report[key] for key in (
+            "input_sha256", "output_sha256", "model_sha256", "export_manifest_sha256",
+            "runtime_bundle_sha256", "precision", "history_fill", "tf32", "cache", "dedup",
+            "io_binding", "cuda_graph", "warmup_runs", "measured_runs",
+        )}
+        fixed_work["completed_nn_items"] = sample["completed_nn_items"]
+        if peak_kind != "process_vm_hwm_bytes":
+            raise ValueError("inference series must keep its registered RSS peak")
+        match = re.fullmatch(r"([0-9]+) kB", report["memory"]["self_vm_hwm"])
+        if match is None:
+            raise ValueError("peak RSS was not observed")
+        peak = positive(int(match[1]) * 1024)
+        if report["reuse_buffers"] is not item["reuse_buffers"]:
+            raise ValueError("registered buffer option differs")
+    else:
+        if peak_kind != "cgroup_memory_peak_bytes":
+            raise ValueError("cgroup series must keep its registered whole-group peak")
+        peak = positive(int(resources["memory.peak"]))
+        if item["layout"] == "native":
+            receipt = pinned(root, item["receipt"])
+            if not receipt["integration_checks_passed"] or not receipt["cleanup_verified"] or receipt["unresolved_owner_retained"]:
+                raise ValueError("production integration and physical cleanup evidence missing")
+            if receipt["incomplete_games"] != 0 or len(receipt["provider_sessions"]) != 4 or not fixed_work:
+                raise ValueError("four fresh native sessions and fixed work required")
+    # Optional additional small evidence is verified without replacing the raw metrics.
+    for ref in item.get("additional_evidence", []):
+        pinned(root, ref)
+    return dict(id=item["result"]["sha256"], time_seconds=time, peak_bytes=peak,
+                source_commit=result["source_commit"], fixed_work=fixed_work,
+                high_events=counters.get("high", 0))
+
+
+def summarize(pairs):
+    def totals(side):
+        values = [pair[side] for pair in pairs]
+        return dict(time_seconds=math.fsum(value["time_seconds"] for value in values),
+                    peak_observation_sum_bytes=sum(value["peak_bytes"] for value in values),
+                    mean_run_peak_bytes=statistics.mean(value["peak_bytes"] for value in values))
+    baseline, variant = totals("baseline"), totals("variant")
+    ratios = {key: [pair["variant"][field] / pair["baseline"][field] for pair in pairs]
+              for key, field in (("time", "time_seconds"), ("peak", "peak_bytes"))}
+    return dict(pairs=len(pairs), baseline=baseline, variant=variant,
+                cumulative_time_ratio=variant["time_seconds"] / baseline["time_seconds"],
+                cumulative_peak_ratio=variant["peak_observation_sum_bytes"] / baseline["peak_observation_sum_bytes"],
+                paired_ratios={key: dict(min=min(values), median=statistics.median(values), max=max(values),
+                    geometric_mean=math.exp(statistics.mean(math.log(v) for v in values)))
+                    for key, values in ratios.items()})
+
+
+def aggregate(root, ledger):
+    if ledger["schema_version"] != 1 or not ledger["comparisons"]:
+        raise ValueError("nonempty ledger schema 1 required")
+    groups, ids, executions, used_in_series = {}, {}, {}, set()
+    duplicates = 0
+    for comparison in ledger["comparisons"]:
+        identifier = comparison["id"]
+        fingerprint = canonical(comparison)
+        if identifier in ids:
+            if ids[identifier] != fingerprint:
+                raise ValueError("conflicting comparison ID")
+            duplicates += 1
+            continue
+        ids[identifier] = fingerprint
+        compat = comparison["compatibility"]
+        if set(compat) != COMPAT_KEYS or any(v is None for v in compat.values()):
+            raise ValueError("complete compatibility dimensions required")
+        group_id = hashlib.sha256(canonical(compat).encode()).hexdigest()
+        pair = {side: observation(root, comparison[side], compat["peak_kind"])
+                for side in ("baseline", "variant")}
+        if pair["baseline"]["id"] == pair["variant"]["id"]:
+            raise ValueError("same physical run cannot be both comparison arms")
+        if pair["baseline"]["fixed_work"] != pair["variant"]["fixed_work"]:
+            raise ValueError("paired completed work or output differs")
+        epoch = canonical(dict(environment=comparison["environment_epoch"],
+                              sources=[pair[side]["source_commit"] for side in ("baseline", "variant")]))
+        for value in pair.values():
+            key = (group_id, value["id"])
+            if key in used_in_series:
+                raise ValueError("physical run reused inside the same option series")
+            used_in_series.add(key)
+            if value["id"] in executions and executions[value["id"]] != value:
+                raise ValueError("conflicting physical run identity")
+            executions[value["id"]] = value
+        group = groups.setdefault(group_id, dict(compatibility=compat, pairs=[], epochs={}))
+        group["pairs"].append(pair)
+        group["epochs"].setdefault(epoch, []).append(pair)
+    output = []
+    for key, group in groups.items():
+        output.append(dict(series_id=key, compatibility=group["compatibility"],
+            cumulative=summarize(group["pairs"]),
+            epochs=[dict(identity=json.loads(epoch), **summarize(pairs)) for epoch, pairs in group["epochs"].items()]))
+    excluded = ledger.get("excluded", [])
+    for item in excluded:
+        if not item["reason"]:
+            raise ValueError("exclusion requires a preserved reason")
+        for ref in item["evidence"]:
+            pinned(root, ref)
+    return dict(schema_version=1, series=output, duplicate_comparisons_skipped=duplicates,
+        unique_compared_physical_runs=len(executions), excluded=excluded,
+        shared_control_occurrences=2 * len(ids) - len(executions),
+        default_changed=False, promotion_decision="not_made_by_aggregation",
+        limitations=["peak sums describe independent run observations, not simultaneous/system peak",
+            "cumulative ratios are descriptive; source/environment epochs remain separately visible",
+            "shared controls across options are correlated, not independent repetitions",
+            "conditioning and failures stay visible; no RSS/cgroup/VRAM substitution",
+            "does not launch workloads, alter prior judgments or infer Elo/confidence"])
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("ledger", type=Path)
+    parser.add_argument("report", type=Path, help="fresh JSON report outside Git")
+    args = parser.parse_args()
+    ledger, digest = read_json(args.ledger)
+    result = aggregate(args.ledger.parent, ledger)
+    result["ledger_sha256"] = digest
+    if any((parent / ".git").exists() for parent in args.report.absolute().parents):
+        raise ValueError("report must be outside Git")
+    with args.report.open("x", encoding="utf-8") as stream:
+        json.dump(result, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        stream.write("\n")
+    print(json.dumps({key: result[key] for key in ("unique_compared_physical_runs", "shared_control_occurrences", "duplicate_comparisons_skipped")}))
+
+
+if __name__ == "__main__":
+    main()

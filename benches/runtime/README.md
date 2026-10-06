@@ -1,5 +1,43 @@
 # Runtime 검증·반복 계측 도구
 
+## 메모리 E 대조 자료의 누적 집계
+
+[memory_evidence.py](memory_evidence.py)는 이전·현재 **동일 작업량의 쌍별 자료**를
+읽기 전용으로 집계한다. 엔진·GPU·CPU PoC를 실행하거나 기본 옵션을 활성화하지 않는다.
+원시 결과와 ledger·집계 JSON은 저장소 밖에 보존한다. 기존 보류·실패 판정을 덮어쓰지 않는다.
+
+Ledger schema 1의 `comparisons`에는 전역 고유 `id`, `environment_epoch`,
+`compatibility`, `baseline`, `variant`를 둔다. Compatibility의 필수 차원은
+`option/workload/model/runtime/precision/batch/resources/fixed_work/time_scope/peak_kind/other_options`다.
+다른 작업·시간 구간·메모리 정의는 별도 series다. 같은 질문의 소스·환경 변화는
+epoch로 보존하며 그 사이 합계는 기술 통계다. 역사적 binary 크기·입력 차이는
+해당 manifest에서 확인하고, 호환성을 확인하지 못한 결과는 합산하지 않는다.
+
+각 arm에는 `layout=native|prepare|oracle|inference`와
+`result={"path":"원시-result.json","sha256":"64자리 digest"}`를 지정한다.
+Path는 ledger 기준 상대 경로나 실행 호스트의 절대 경로다. Native에는 `receipt`,
+inference에는 `report`와 `reuse_buffers`도 지정한다. 추가 작은 JSON 증거는
+`additional_evidence`로 묶는다. 이 도구는 raw 결과의 실제 시간·peak를 사용하며,
+전달된 요약 숫자로 대체하지 않는다. Ledger·증거 JSON은 파일마다 16MiB로 제한한다.
+
+각 series는 기준·변경 T 합계와 `sum(T1)/sum(T0)`, 실행별 peak 관측값의 합계·평균과
+`sum(P1)/sum(P0)`, 쌍별 비율의 범위·중앙값·기하평균을 함께 남긴다. **Peak의 합계는
+독립 실행 관측값의 합이며 동시에 필요한 메모리나 시스템 peak가 아니다.** RSS와
+cgroup peak를 합치지 않으며 VRAM·Windows commit 미관측을 대체하지 않는다.
+공유 기준 실행은 옵션별 비교에 표시하되 실제 실행 건수에서는 한 번 센다.
+따라서 공유 기준을 사용하는 옵션 결과는 서로 독립 표본이 아니다.
+
+SHA 변조·중복 ID 충돌·같은 series의 실행 재사용·작업량 불일치·OOM·강제 종료·취소를
+거부한다. 동일 comparison의 중복 입력은 한 번만 센다. Conditioning과 실패는
+`excluded=[{"id":"...","reason":"...","evidence":[{"path":"...","sha256":"..."}]}]`
+에 보존하고 비교 합계와 구분한다. 누적 평균만으로 이전 실패를 통과 처리하지 않는다.
+[채택 기준](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#adoption-gate)은 별도로 적용한다.
+
+```sh
+python benches/runtime/memory_evidence.py "$RZ_LEDGER_JSON" "$RZ_FRESH_REPORT_JSON"
+python -m unittest discover -s benches/runtime/tests -p test_memory_evidence.py -q
+```
+
 ## D02 CPU/mock trace 재생
 
 [cpu_trace 예제](../../crates/rz-runtime/examples/cpu_trace.rs)는 실제 `Scheduler`와
