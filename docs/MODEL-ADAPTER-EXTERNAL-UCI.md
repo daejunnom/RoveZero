@@ -153,6 +153,14 @@ ponder·평가 기반 조기 판정 off다. Stockfish CPU와 RoveZero CPU+RTX 40
    때문에 개별 P가 호스트 전체·공유 캐시·VRAM의 총 peak는 아니다. 이 범위와 관측 불명을
    명시하며 이전 cold/warm 혼합 자료를 새 비교의 분모에 넣지 않는다. 외부 pilot의
    evaluation_policy도 `shared-runtime-warm-readhash`를 선언하고 준비 증거를 gate로 연결한다.
+   후속 통제 조건에서는 동일한 해시의 원본 weights·ONNX·export manifest를 한 개의
+   읽기 전용 WSL 입력 슬롯에 준비한다. 두 엔진에 같은 경로를 전달하고 복사·해시 검증
+   비용과 shared bytes를 별도 보존하며 전체 실행 예산에서 준비 비용을 차감한다.
+   affinity는 WSL이 서로 다른 core로 보고한 CPU 0·2를 명시한다. 이는 Windows 호스트의
+   물리 코어 독점 보장이 아니다. 명세의 CPU ID를 실제 자식에 적용하고 미가용 ID나
+   다른 memory/precision/history/batch 선언은 거부한다. 이 통제 조건은 기존 비교와
+   분리해 등록하며 작업량·T/P·5% 문턱은 유지한다. 쌍별 A/A가 모두 통과해도 여섯 실행의
+   전체 편차가 5%를 넘으면 A/B를 시작하지 않는다.
 4. 신경망 동등성과 회귀가 모두 통과한 뒤 외부 두 판을 실행한다. 서로 다른 엔진 nodes를
    같은 작업량으로 환산하지 않으며 물리 NN 완료와 탐색 소비를 분리한다.
 5. CPU CI·GPU 수치·회귀·외부 UCI/대국을 각각 인수한다. 첫 할당·CUDA·물리 완료 실패에서
@@ -167,17 +175,28 @@ unknown이다. 별도 cloud 비용·학습·정밀도/batch 정책·backend 변�
 ## 현재 인수 상태 (2026-10-07)
 
 구현·CPU 인수와 실제 GPU 수치 인수는 제공했으며 성능 회귀·대국 인수는 HOLD다.
-엔진/arena 바이너리 source는 `4d715b3`, cache 준비 recipe source는 `94bfcc3`이다.
-후자의 변경은 Python recipe·검사·이 문서에 한정되고 Rust/Cargo 소스는 동일하다.
+등록된 엔진/arena 바이너리 source는 `4d715b3`이다. 후속 recipe의 affinity·유한 예산
+변경은 `acf9669`·`b4924f1`, CPU root 통계 관측 예제는 `121bcf6`·`1307cc8`이다.
+생산 Rules·encoding·adapter·search·runtime·UCI·arena와 루트 Cargo/lock/toolchain 소스의
+일치를 확인했다. `rz-uci/Cargo.toml`은 기존 dependency/feature를 유지하고 예제 선언만
+추가했다. 검사기의 source와 실제 실행 바이너리 source를 구분한다.
 
 - 로컬 WSL Rust 전체 feature/all-target 820개 통과, 16개 명시적 미실행, all-feature
-  Clippy 통과. Linux recipe 검사 51개 통과. `94bfcc3`의 Linux·Windows·bindings CI
-  세 job이 실제 성공했다. CPU CI를 실제 GPU 검사로 대신하지 않는다.
+  Clippy 통과. 후속 Linux recipe 검사 55개 통과. `b4924f1`의 Linux·Windows·bindings CI
+  세 job이 실제 성공했다. 55개 검사에는 유한 전체 예산 초과 거부와 쌍별 통과 후 전체
+  A/A drift로 인한 A/B 미착수가 포함된다. CPU CI를 실제 GPU 검사로 대신하지 않는다.
+- 같은 CPU/mock 관측 예제를 기존 소스와 분리 후 소스에 연결해 10개 고정 포지션을
+  각 2회 실행했다. 합법 수 순서·입력 식별·착수·종료·완료 simulation·소비 평가 수와
+  root prior/방문 수/누적 가치/Q의 f64 비트가 전부 일치했다. Rules 종료 상태에는
+  모델 요청을 만들지 않는다. 첫 관측 예제의 terminal 입력 admission 오류는 실패
+  기록으로 보존하고 수정 후 대조했다. 이 증거는 CPU 바인딩 성능이나 GPU 기력이 아니다.
 - `f8983cf`의 실제 CUDA Maia/BT4 raw·Rules 네 독립 검사에서 각각 No/Repeat 12사례,
-  raw 입력 byte 일치·Rules dense 입력 차이 0·합법 policy·WDL·물리 종료를 확인했다.
+  raw·Rules 입력의 f32 byte 일치·합법 policy·WDL·물리 종료를 확인했다. Rules 검사도
+  절대차 0에 더해 `to_bits()`를 대조하므로 signed zero 등 비트 차이를 허용하지 않는다.
   BT4 raw logits 최대 절대차
   6.50883e-5, policy 2.80142e-6, WDL 1.78814e-7이다. 이후 해당 adapter·encoding·
-  Rules·search·contracts·native runtime·Cargo/toolchain 소스 일치로 수치 증거를 재사용한다.
+  Rules·search·contracts·native runtime·dependency/feature·toolchain 소스 일치로 수치
+  증거를 재사용한다. 추가 CPU 관측 예제는 native 수치 경로를 변경하지 않는다.
 - 원래 기준의 30초/edge 한도 실패 기록과 새 cap의 첫 A/A cold/warm HOLD를 보존했다.
   새 cap은 두 입력의 4096 simulation을 각각 완료했으며, 각 실행의 NN root 소비 2개·
   backup 소비 8192개·runtime 완료 8194개가 일치했다. 물리 NN 실행 수를 이 합계로
@@ -192,10 +211,22 @@ unknown이다. 별도 cloud 비용·학습·정밀도/batch 정책·backend 변�
 
 네 실행 모두 작업량·착수·정상 물리 종료가 일치했고 memory.high/max·OOM 이벤트는
 0이었다. 두 번째 쌍은 ready에서 약 3.75초, 두 검색의 합에서 약 4.57초 차이가 났다.
+native 시작 영수증을 분해하면 두 번째 쌍의 모델 자산 검증 차이는 2.40초로 ready 차이의
+약 64%였다. 이는 파일 I/O·hash·압축 해제·호스트 경쟁 중 하나를 특정한 측정은 아니다.
 원인을 GPU clock·호스트 부하·어댑터 결함으로 확정하지 않는다. A/A 두 쌍만 완료했으며
 첫 초과에서 종료했으므로 A/B는 0쌍이다. 기준을 완화하거나 과거 자료를 섞지 않는다.
 
 Stockfish 19 CPU preflight·옵션·stop·quit·소유 process 종료는 통과했고 V2 실행 선언은
 제공했다. 회귀 gate가 HOLD라 paired 두 판은 실행하지 않았으며 실제 대국 PGN도 없다.
-다음 GPU 인수는 ready·검색 편차의 조건을 분리해 새로운 비교로 등록한 뒤 A/A 3쌍과
-A/B 5쌍을 통과하는 순서다. 그 전에는 성능 회귀 없음·외부 강도 검증 완료를 선언하지 않는다.
+후속 native 입력 슬롯은 파일 3개/1,123,789,653바이트를 11.86초에 복사·해시 검증했고
+한 슬롯·2GiB 상한·읽기 전용·유한 수명을 기록했다. 원본 자산은 보존하며 이 복사 비용을
+개별 엔진 개선으로 주장하지 않는다. CPU 0·2와 새 입력 조건을 동일하게 선언한 새
+비교를 준비했고 자산·바이너리·기존 수치 증거 식별 검증을 통과했다. 외부 V2 선언은
+dot-prefix를 포함하는 논리 자산 경로를 거부하므로 같은 read-only inode의 유한 입력 view를
+사용했다. 추가 모델 복사 없이 독립된 논리 경로로 lock을 생성했으며 기존 경로 검증을
+완화하지 않았다. arena의 private snapshot은 여전히 별도 inode의 복사이고 hardlink가
+아니다. view는 원본 입력 슬롯보다 먼저 정리하는 수명 조건을 기록했다. lock 생성은
+실제 엔진 실행·대국 인수가 아니며 `execution_ready=false`다.
+GPU를 점유한 다른 사용자 작업이 정리될 때까지 새 비교는 미실행이다.
+다음 GPU 인수는 이 등록으로 A/A 3쌍과 A/B 5쌍을 통과하는 순서다. 그 전에는 성능
+회귀 없음·외부 강도 검증 완료를 선언하지 않는다.
