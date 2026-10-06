@@ -59,6 +59,9 @@ fn unsupported() -> ArenaError {
 }
 impl crate::native_launch::sealed::Sealed for LockedManifestV2 {}
 impl NativeLaunchDeclaration for LockedManifestV2 {
+    fn rove_tree_max_edges(&self) -> Option<u32> {
+        Some(self.input().rove_tree_max_edges)
+    }
     fn input_sha256(&self) -> &str {
         self.sha256()
     }
@@ -317,11 +320,23 @@ impl NativeProviderDeclaration for LockedManifestV2 {
             RoveLaunchV2::Lc0Cpu(_) => Ok(Vec::new()),
             #[cfg(feature = "native-cuda")]
             RoveLaunchV2::Lc0Cuda(l) => {
-                crate::native_cuda::verify_cuda_endpoint_evidence(l, pid, startup, directory)
+                crate::native_cuda::verify_cuda_endpoint_evidence_with_tree_limit(
+                    l,
+                    pid,
+                    startup,
+                    directory,
+                    self.input().rove_tree_max_edges,
+                )
             }
             #[cfg(feature = "native-cuda")]
             RoveLaunchV2::Lc0CudaMaia(l) => {
-                crate::native_cuda::verify_cuda_endpoint_evidence(l, pid, startup, directory)
+                crate::native_cuda::verify_cuda_endpoint_evidence_with_tree_limit(
+                    l,
+                    pid,
+                    startup,
+                    directory,
+                    self.input().rove_tree_max_edges,
+                )
             }
             #[cfg(not(feature = "native-cuda"))]
             _ => {

@@ -82,6 +82,34 @@ fn native_search_budget_is_explicit_finite_and_default_compatible() {
 }
 
 #[test]
+fn explicit_tree_envelope_preserves_defaults_and_rejects_unbounded_or_duplicate_limits() {
+    let original = NativeConfig::parse(valid_arguments())
+        .unwrap()
+        .engine_settings();
+    assert_eq!(original.tree.max_edges, 100_000);
+    for limit in [1, 262_144, MAX_NATIVE_TREE_EDGES] {
+        let mut args = valid_arguments();
+        args.push(format!("--search-max-edges={limit}"));
+        let settings = NativeConfig::parse(args).unwrap().engine_settings();
+        assert_eq!(settings.tree.max_edges, limit);
+        assert_eq!(settings.tree.max_nodes, original.tree.max_nodes);
+        assert_eq!(settings.tree.max_depth, original.tree.max_depth);
+        assert_eq!(settings.search, original.search);
+    }
+    for limit in ["0", "4194305", "-1", "unbounded"] {
+        let mut args = valid_arguments();
+        args.push(format!("--search-max-edges={limit}"));
+        assert_private_config_rejection(args);
+    }
+    let mut args = valid_arguments();
+    args.extend([
+        "--search-max-edges=262144".into(),
+        "--search-max-edges=100000".into(),
+    ]);
+    assert_private_config_rejection(args);
+}
+
+#[test]
 fn complete_native_config_keeps_private_paths_out_of_debug() {
     let config = NativeConfig::parse(valid_arguments()).unwrap();
     assert_eq!(config.manifest_sha256, [0xab; 32]);

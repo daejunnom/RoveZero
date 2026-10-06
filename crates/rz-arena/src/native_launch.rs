@@ -40,6 +40,9 @@ pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 
     fn seed(&self) -> u64 {
         1
     }
+    fn rove_tree_max_edges(&self) -> Option<u32> {
+        None
+    }
     fn validate_execution(&self) -> Result<(), ArenaError> {
         Ok(())
     }
@@ -1109,6 +1112,9 @@ pub(crate) mod linux {
             if let Some(search) = engine.search {
                 tokens.push(format!("--search-simulations={}", search.simulations).into());
                 tokens.push(format!("--final-selection={}", search.final_selection.cli()).into());
+            }
+            if let Some(max_edges) = spec.rove_tree_max_edges() {
+                tokens.push(format!("--search-max-edges={max_edges}").into());
             }
             args.extend([
                 OsString::from("-engine"),

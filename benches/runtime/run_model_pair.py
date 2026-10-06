@@ -19,6 +19,8 @@ def gate_identities(declaration, reports):
     profile=launch["profile"]["runtime"]
     artifacts={a["role"]:a["artifact"] for a in launch["artifacts"]}
     regression=reports["adapter_regression"][0]
+    require(regression["tree_max_edges"]==declaration["rove_tree_max_edges"],
+            "adapter regression used a different tree envelope")
     tested=regression["candidate"]
     require(tested["binary_sha256"]==rove["tool"]["binary"]["sha256"] and
             tested["source_commit"]==rove["tool"]["source_commit"] and

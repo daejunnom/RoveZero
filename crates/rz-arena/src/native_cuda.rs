@@ -271,15 +271,52 @@ pub(crate) fn verify_cuda_endpoint_evidence<P: CudaLaunchProfile>(
     startup: &[u8],
     runtime_directory: &cap_std::fs::Dir,
 ) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
+    verify_cuda_endpoint_evidence_inner(
+        pid,
+        startup,
+        runtime_directory,
+        100_000,
+        engine.profile.search_options(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_cuda_endpoint_evidence_with_tree_limit<P: CudaLaunchProfile>(
+    engine: &CudaNativeLaunchSpec<P>,
+    pid: u32,
+    startup: &[u8],
+    runtime_directory: &cap_std::fs::Dir,
+    max_edges: u32,
+) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
+    let search = engine
+        .profile
+        .search_options()
+        .unwrap_or(rz_experiments::NativeCudaSearchV2 {
+            simulations: 128,
+            final_selection: rz_experiments::NativeFinalSelectionV2::Visits,
+            policy_temperature_milli: 1000,
+            raw_cache: false,
+        });
+    verify_cuda_endpoint_evidence_inner(pid, startup, runtime_directory, max_edges, Some(search))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_cuda_endpoint_evidence_inner(
+    pid: u32,
+    startup: &[u8],
+    runtime_directory: &cap_std::fs::Dir,
+    max_edges: u32,
+    search: Option<rz_experiments::NativeCudaSearchV2>,
+) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
     let mut evidence = linux::placement_evidence(pid, startup, runtime_directory)?;
-    if let Some(search) = engine.profile.search_options() {
+    if let Some(search) = search {
         let relative = format!(
             "native-process-{pid}/{}",
             rz_uci::native_cuda_attestation::SEARCH_FILE
         );
         let bytes =
             crate::native_runner::linux::read_file(runtime_directory, &relative, 256 * 1024)?;
-        validate_native_cuda_search_record_fields(&bytes, startup, search)?;
+        linux::validate_search_record(&bytes, startup, search, 1, u64::from(max_edges))?;
         evidence.push((relative, bytes));
     }
     Ok(evidence)
@@ -617,6 +654,7 @@ pub(crate) mod linux {
                 .search_options()
                 .ok_or_else(|| invalid("batch search declaration"))?,
             width as u64,
+            100_000,
         )?;
         let summary = t.journal_summary.unwrap();
         if summary.max_pending != width
@@ -847,13 +885,14 @@ pub(crate) mod linux {
         startup: &[u8],
         expected: rz_experiments::NativeCudaSearchV2,
     ) -> Result<(), ArenaError> {
-        validate_search_record(bytes, startup, expected, 1)
+        validate_search_record(bytes, startup, expected, 1, 100_000)
     }
-    fn validate_search_record(
+    pub(super) fn validate_search_record(
         bytes: &[u8],
         startup: &[u8],
         expected: rz_experiments::NativeCudaSearchV2,
         width: u64,
+        max_edges: u64,
     ) -> Result<(), ArenaError> {
         if bytes.len() > 256 * 1024 || startup.len() > 256 * 1024 {
             return Err(ArenaError::Budget(
@@ -892,7 +931,7 @@ pub(crate) mod linux {
             ("drain_margin_ms", 10),
             ("shutdown_ms", 2000),
             ("max_nodes", 20000),
-            ("max_edges", 100000),
+            ("max_edges", max_edges),
             ("max_depth", 128),
         ] {
             n(&receipt, key, value)?;

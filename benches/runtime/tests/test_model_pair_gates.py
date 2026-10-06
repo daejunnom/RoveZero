@@ -18,11 +18,11 @@ def fixture():
     external={"family":"stockfish","version":"19","expected_uci_name":"Stockfish 19",
               "arguments":[],"requested_options":{"Threads":"2"},"source":{"commit":"sf-source"},
               "binary":{"sha256":"sf-binary","bytes":100},"assets":[]}
-    declaration={"engines":[{"endpoint":"rove_zero","configuration":rove},
+    declaration={"rove_tree_max_edges":262144,"engines":[{"endpoint":"rove_zero","configuration":rove},
                             {"endpoint":"external_uci","configuration":external}],
                  "resources":{"affinity":[0,1],"memory_high_bytes":6*1024**3,
                               "memory_max_bytes":12*1024**3,"swap_max_bytes":0}}
-    regression={"candidate":{"binary_sha256":"engine","source_commit":"source",
+    regression={"tree_max_edges":262144,"candidate":{"binary_sha256":"engine","source_commit":"source",
                  "expected_profile":{"backend_sha256":"backend","encoding_manifest_sha256":"encoding",
                                      "model_manifest_sha256":"export_manifest"}},
                 "resource_notes":{"cpu_affinity":[0,1],"memory_high_GiB":6,"memory_max_GiB":12,"swap":0}}
@@ -43,6 +43,7 @@ class ModelPairGateTests(unittest.TestCase):
     def test_success_for_different_inputs_does_not_admit_play(self):
         mutations=[
             lambda r:r["adapter_regression"][0]["candidate"].update(binary_sha256="other-engine"),
+            lambda r:r["adapter_regression"][0].update(tree_max_edges=100000),
             lambda r:r["adapter_regression"][0]["resource_notes"].update(memory_max_GiB=24),
             lambda r:r["numerical"][0].update(onnx_sha256="other-model"),
             lambda r:r["numerical"][0].update(runtime_sha256="other-ORT"),

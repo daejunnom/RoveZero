@@ -15,13 +15,14 @@ from paired_search import native_receipts, read_json, require, sha256
 SCHEMA = "rz-adapter-regression/1"
 POSITIONS = ["position startpos", "position startpos moves e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1 f8e7 f1e1 b7b5 a4b3 d7d6 c2c3 e8g8"]
 SIMULATIONS = 4096
+TREE_MAX_EDGES = 262_144
 # An untimed `go nodes` inherits the engine's 30-second resource wall. Give
 # fixed work explicit headroom; the independent whole-run 180-second cap remains.
 SEARCH_COMMAND = "go nodes 4096 movetime 75000"
 PROFILE_KEYS = {"backend_sha256", "model_manifest_sha256", "encoding_manifest_sha256"}
 ARGUMENTS = {"--source-weights", "--onnx-model", "--export-manifest", "--manifest-sha256",
              "--ort-library", "--ort-sha256", "--cuda-bundle", "--cuda-bundle-sha256",
-             "--runtime-cache-root", "--search-simulations", "--final-selection"}
+             "--runtime-cache-root", "--search-simulations", "--search-max-edges", "--final-selection"}
 
 
 def validate(manifest):
@@ -29,8 +30,13 @@ def validate(manifest):
     require(manifest["schema"] == SCHEMA, "unsupported adapter regression schema")
     for role in ("baseline", "candidate"):
         variant = manifest[role]
-        require(set(variant) == {"binary", "binary_sha256", "source_commit", "build_features", "compiler", "args", "expected_profile"}, "variant fields differ")
+        require(set(variant) == {"binary", "binary_sha256", "source_commit", "source_patch", "build_features", "compiler", "args", "expected_profile"}, "variant fields differ")
         require(re.fullmatch(r"[0-9a-f]{40}", variant["source_commit"]) is not None, "full source commit required")
+        patch = variant["source_patch"]
+        if patch is not None:
+            require(set(patch) == {"path", "bytes", "sha256"}, "source patch identity invalid")
+            path = outside_git(patch["path"])
+            require(path.is_file() and 0 < path.stat().st_size == patch["bytes"] <= 1024**2 and sha256(path) == patch["sha256"], "registered source patch differs")
         binary = outside_git(variant["binary"])
         require(binary.is_file() and binary.stat().st_size <= 64*1024**2 and sha256(binary) == variant["binary_sha256"], "registered engine binary differs")
         require(variant["build_features"] == ["onnx-cuda"], "this recipe fixes the B1 onnx-cuda build")
@@ -45,6 +51,7 @@ def validate(manifest):
             flags[key] = value
         require(set(flags) == ARGUMENTS, "all native asset, cache and search arguments must be fixed")
         require(flags["--search-simulations"] == "4096" and flags["--final-selection"] == "visits", "search configuration differs")
+        require(flags["--search-max-edges"] == str(TREE_MAX_EDGES), "shared explicit tree envelope differs")
         require(set(variant["expected_profile"]) == PROFILE_KEYS and all(re.fullmatch(r"[0-9a-f]{64}", v) for v in variant["expected_profile"].values()), "semantic profile identity missing")
     for field in ("args", "compiler", "build_features", "expected_profile"):
         require(manifest["baseline"][field] == manifest["candidate"][field], "adapter control changed " + field)
@@ -98,7 +105,7 @@ def summarize(pairs):
 
 def run_once(variant, directory, overall_deadline):
     owner = OwnedRun(directory, wall=min(180, overall_deadline-time.monotonic()))
-    result = {"source_commit": variant["source_commit"], "binary_sha256": variant["binary_sha256"], "accepted": False}
+    result = {"source_commit": variant["source_commit"], "source_patch": variant["source_patch"], "binary_sha256": variant["binary_sha256"], "accepted": False}
     stage = "binary_verification"
     try:
         require(sha256(variant["binary"]) == variant["binary_sha256"], "binary changed after registration")
@@ -166,6 +173,7 @@ def run_once(variant, directory, overall_deadline):
         export=read_json(flags["--export-manifest"],64*1024)
         require(served["history_fill"] == "no" and served["tf32"] is False and served["onnx_sha256"] == export["onnx_sha256"] and served["source_weights_gzip_sha256"] == export["source_gzip_sha256"] and served["runtime_bundle_manifest_sha256"] == flags["--cuda-bundle-sha256"], "served model/input semantics differ")
         require(profile["simulations"] == SIMULATIONS and profile["final_selection"] == "visits" and profile["policy_temperature_milli"] == 1000 and profile["batch_size"] == 1 and profile["search_workers"] == 1 and not profile["raw_cache"], "served search configuration differs")
+        require(profile["max_edges"] == TREE_MAX_EDGES and profile["max_nodes"] == 20_000 and profile["max_depth"] == 128, "served tree envelope differs")
         result["work"] = {"inputs": work, "nn_root_consumed": roots, "nn_backup_consumed": backups, "completed_by_runtime": report["completed_by_runtime"], "physical_invocations": "unknown_not_a_full_physical_journal"}
         result["native"] = native
         result["accepted"] = True
@@ -191,6 +199,7 @@ def run(manifest, output):
     put(output/"registration.json", {"manifest": manifest, "helper_sha256": sha256(__file__),
         "owner_sha256": sha256(Path(__file__).with_name("bounded_local.py")), "positions": POSITIONS,
         "simulations_per_input": SIMULATIONS, "AA_pairs": 3, "AB_pairs": 5,
+        "tree_max_edges": TREE_MAX_EDGES, "tree_max_nodes": 20_000, "tree_max_depth": 128,
         "search_command": SEARCH_COMMAND,
         "run_wall_seconds": 180, "cleanup_seconds": 30, "overall_seconds": 3600,
         "primary_time": "whole_wall_start_through_native_exit_receipts_and_cgroup_collection",
@@ -234,6 +243,7 @@ def run(manifest, output):
     result["candidate"] = {k: manifest["candidate"][k] for k in
         ("source_commit", "binary_sha256", "expected_profile")}
     result["resource_notes"] = manifest["resource_notes"]
+    result["tree_max_edges"] = TREE_MAX_EDGES
     put(output/"summary.json", result)
     print(json.dumps(result), flush=True)
     return 0 if result["status"] == "passed" else 2

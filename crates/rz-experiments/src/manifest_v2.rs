@@ -194,6 +194,9 @@ pub struct RunManifestV2 {
     pub rules_profile: String,
     pub evaluation_policy: String,
     pub resources: ResourcePolicyV2,
+    /// One explicit tree envelope for every RoveZero endpoint in this control.
+    /// External UCI engines do not receive this native setting.
+    pub rove_tree_max_edges: u32,
     pub engines: [EngineEndpointV2; 2],
     pub white_order: [NativeEngineRole; 2],
     pub opening: OpeningSpec,
@@ -374,6 +377,10 @@ impl RunManifestV2 {
             "clock/plies outside bounded pilot",
         )?;
         let r = &self.resources;
+        require_v2(
+            (1..=4_194_304).contains(&self.rove_tree_max_edges),
+            "RoveZero edge envelope invalid",
+        )?;
         require_v2(
             (1..=64).contains(&r.cpu_threads)
                 && r.affinity.len() == r.cpu_threads as usize
@@ -809,6 +816,7 @@ mod tests {
                 gpu: None,
                 gpu_vram_bytes: 0,
             },
+            rove_tree_max_edges: 262_144,
             engines: [
                 make(0, NativeEngineRole::Baseline),
                 make(1, NativeEngineRole::Candidate),
@@ -1039,6 +1047,28 @@ mod tests {
             m.validate().unwrap();
             candidate(&mut m).tool.compiler = "another-compiler".into();
             assert!(m.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn tree_envelope_is_explicit_finite_and_bound_to_the_v2_digest() {
+        let mut m = manifest(ComparisonV2::InternalWeights);
+        let EngineEndpointV2::RoveZero(base) = &m.engines[0] else {
+            unreachable!()
+        };
+        let model = base.model.clone();
+        candidate(&mut m).model = model;
+        candidate(&mut m).model.weights[0].path = "synthetic/tree-candidate-weights".into();
+        candidate(&mut m).model.weights[0].sha256 = "b".repeat(64);
+        m.declared_changes.insert("weights".into());
+        let initial_digest = m.clone().lock().unwrap().sha256().to_owned();
+        let mut changed = m.clone();
+        changed.rove_tree_max_edges = 100_000;
+        assert_ne!(changed.lock().unwrap().sha256(), initial_digest);
+        for invalid in [0, 4_194_305] {
+            let mut changed = m.clone();
+            changed.rove_tree_max_edges = invalid;
+            assert!(changed.validate().is_err());
         }
     }
 
