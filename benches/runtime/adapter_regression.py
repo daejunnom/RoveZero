@@ -2,6 +2,7 @@
 """Preregistered B1 adapter equivalence: fresh cgroups, fixed work, AA then AB."""
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -150,7 +151,14 @@ def run_once(variant, directory, overall_deadline):
         require(all(report["observations"][k] == 0 for k in ("scheduler_dropped", "scheduler_counter_overflow", "delivery_dropped", "delivery_counter_overflow", "drain_discarded_results")), "observation loss")
         roots, backups = report["search_root_initializations"]["count"], report["search_non_root_backups"]["count"]
         require(roots == 2 and backups == 2*SIMULATIONS and report["completed_by_runtime"] == roots+backups, "fixed 8192 NN-backed simulations plus two roots not reconciled; terminal work is not silently substituted")
-        profile = term["startup"]["profile"]["search"]
+        profile = read_json(term_path.with_name("native-cuda-search-config.v1.json"), 64*1024)
+        require(profile["process_run_id"] == term["process_run_id"], "search configuration belongs to another process")
+        startup_bytes=(json.dumps(term["startup"],ensure_ascii=False,separators=(",",":"))+"\n").encode("utf-8")
+        require(profile["startup_sha256"] == hashlib.sha256(startup_bytes).hexdigest(), "search configuration startup digest differs")
+        served=term["startup"]["profile"]
+        flags=dict(arg.split("=",1) for arg in variant["args"][1:])
+        export=read_json(flags["--export-manifest"],64*1024)
+        require(served["history_fill"] == "no" and served["tf32"] is False and served["onnx_sha256"] == export["onnx_sha256"] and served["source_weights_gzip_sha256"] == export["source_gzip_sha256"] and served["runtime_bundle_manifest_sha256"] == flags["--cuda-bundle-sha256"], "served model/input semantics differ")
         require(profile["simulations"] == SIMULATIONS and profile["final_selection"] == "visits" and profile["policy_temperature_milli"] == 1000 and profile["batch_size"] == 1 and profile["search_workers"] == 1 and not profile["raw_cache"], "served search configuration differs")
         result["work"] = {"inputs": work, "nn_root_consumed": roots, "nn_backup_consumed": backups, "completed_by_runtime": report["completed_by_runtime"], "physical_invocations": "unknown_not_a_full_physical_journal"}
         result["native"] = native

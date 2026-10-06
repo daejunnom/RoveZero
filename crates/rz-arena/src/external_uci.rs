@@ -1,5 +1,6 @@
 //! External UCI protocol observations do not imply neural/provider attestation.
 use crate::{ArenaError, ProcessReceipt};
+#[cfg(target_os = "linux")]
 use rz_experiments::ExternalUciEndpointV2;
 use serde::Serialize;
 use std::collections::BTreeMap;
