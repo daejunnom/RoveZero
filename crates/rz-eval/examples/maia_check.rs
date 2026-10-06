@@ -465,7 +465,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         if experiments.cuda_graph { 1 } else { 4 },
     )?;
     #[cfg(not(feature = "contracts"))]
-    let contract_worker = json!({"status":"not_enabled"});
+    let contract_worker = {
+        // Run returning owned outputs does not destroy the native session.
+        // Complete destruction before publishing this process's acceptance.
+        drop(backend);
+        json!({"status":"not_enabled"})
+    };
     if is_cuda {
         // Batch-dependent or later lazy loads must still belong to the pinned
         // closure when final evidence is admitted, not only at the B1 probe.
@@ -491,6 +496,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "tolerances":{"raw_logits_atol":1e-4,"raw_logits_rtol":1e-3,"wdl_max_abs":1e-4,"legal_policy_max_abs":1e-4},
         "case_errors":errors,"batch_checks":batch_checks,
         "cuda_executed_nodes":cuda_executed_nodes,"cuda_profile_sha256":cuda_profile_sha256, "contract_worker": contract_worker,
+        "backend_shutdown_completed":true,
         "gpu_acceptance": if args[7] == "cpu" { "not_run" } else { "numerical_and_provider_probe_only" }});
     if !inference_benchmark.is_empty() {
         report["inference_benchmark"] = json!({
@@ -681,9 +687,9 @@ fn verify_contract_worker(
         requests[0].cancel_token().cancel();
     }
     let stop = Instant::now() + Duration::from_secs(5);
-    let outputs = loop {
+    let completed_result = loop {
         match lease.poll() {
-            PhysicalPoll::Ready(result) => break result?,
+            PhysicalPoll::Ready(result) => break result,
             PhysicalPoll::Pending if Instant::now() < stop => std::thread::yield_now(),
             PhysicalPoll::Quarantined => {
                 return Err(lease.quarantine_cause()?.unwrap_or_else(|| {
@@ -697,6 +703,12 @@ fn verify_contract_worker(
             _ => return Err("physical worker did not complete within fixture budget".into()),
         }
     };
+    assert!(matches!(lease.poll(), PhysicalPoll::Consumed));
+    // Ready covers one Run, not worker TLS or native session destruction.
+    // Join before checking/publishing results, including a completed Run error.
+    let shutdown_result = wait_for_worker_shutdown(&mut worker, Duration::from_secs(5));
+    let outputs = completed_result?;
+    shutdown_result?;
     if outputs.len() != requests.len() {
         return Err("physical result count differs".into());
     }
@@ -728,9 +740,84 @@ fn verify_contract_worker(
             acceptance?;
         }
     }
-    assert!(matches!(lease.poll(), PhysicalPoll::Consumed));
     Ok(
         json!({"status":"passed","physical_outputs":outputs.len(),"canceled_rejected":usize::from(width > 1),
+        "shutdown_joined":true,
         "scope":"C worker plus contract 0.1; fixture Rules view; D scheduler not linked"}),
     )
+}
+
+#[cfg(feature = "contracts")]
+fn wait_for_worker_shutdown<J: Send + Sync + 'static, R: Send + 'static>(
+    worker: &mut rz_eval::worker::SingleWorker<J, R>,
+    budget: std::time::Duration,
+) -> Result<(), rz_eval::error::BackendError> {
+    use rz_eval::error::{BackendError, FailureKind, FailureStage};
+    use std::task::Poll;
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + budget;
+    loop {
+        match worker.try_shutdown() {
+            Poll::Ready(result) => return result,
+            Poll::Pending if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Poll::Pending => {
+                return Err(BackendError::new(
+                    FailureKind::BackendFailure,
+                    FailureStage::Backend,
+                    "physical worker shutdown is unconfirmed within fixture budget",
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "contracts"))]
+mod shutdown_tests {
+    use super::wait_for_worker_shutdown;
+    use rz_eval::worker::{PhysicalPoll, SingleWorker};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn completed_output_does_not_admit_an_unjoined_native_destructor() {
+        struct NativeOwner(mpsc::Sender<()>, mpsc::Receiver<()>);
+        impl Drop for NativeOwner {
+            fn drop(&mut self) {
+                self.0.send(()).unwrap();
+                self.1.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+        let (began, destruction_started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let native = NativeOwner(began, released);
+        let mut worker = SingleWorker::spawn(move |_: &()| {
+            let _keep = &native;
+            42
+        })
+        .unwrap();
+        let mut lease = worker.submit(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match lease.poll() {
+                PhysicalPoll::Ready(value) => {
+                    assert_eq!(value, 42);
+                    break;
+                }
+                PhysicalPoll::Pending if Instant::now() < deadline => std::thread::yield_now(),
+                _ => panic!("mock physical run did not complete"),
+            }
+        }
+        let result = wait_for_worker_shutdown(&mut worker, Duration::ZERO);
+        destruction_started
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            result.unwrap_err().detail,
+            "physical worker shutdown is unconfirmed within fixture budget"
+        );
+        wait_for_worker_shutdown(&mut worker, Duration::from_secs(5)).unwrap();
+    }
 }
