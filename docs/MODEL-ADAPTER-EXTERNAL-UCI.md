@@ -129,6 +129,8 @@ ponder·평가 기반 조기 판정 off다. Stockfish CPU와 RoveZero CPU+RTX 40
 3. 분리 전/후 binary·source·compiler·feature·자산을 먼저 등록한다.
    `benches/runtime/adapter_regression.py`는 startpos와 지정 Ruy Lopez 16-ply를 순차 처리하고
    매 입력을 새 게임으로 초기화한다. 입력당 4096 simulation, 실행당 180초+정리 30초,
+   `go nodes 4096 movetime 75000`으로 기존 untimed nodes의 30초 자원 한도를 피한다.
+   movetime은 검사 작업의 여유 한도이며 목표 작업량을 줄이는 성공 조건이 아니다.
    전체 3600초다. A/A 3쌍의 쌍별/전체 편차가 5% 이하일 때만 교차 순서 A/B 5쌍을 실행한다.
    준비/ready·검색·drain·전체와 fresh cgroup memory.peak를 기록한다. 각 유효 쌍의
    T_B/T_A≤1.05 **및** P_B/P_A≤1.05를 요구한다. 작업량·결과·peak 불명이나 수명 실패는

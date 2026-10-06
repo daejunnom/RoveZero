@@ -15,6 +15,9 @@ from paired_search import native_receipts, read_json, require, sha256
 SCHEMA = "rz-adapter-regression/1"
 POSITIONS = ["position startpos", "position startpos moves e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1 f8e7 f1e1 b7b5 a4b3 d7d6 c2c3 e8g8"]
 SIMULATIONS = 4096
+# An untimed `go nodes` inherits the engine's 30-second resource wall. Give
+# fixed work explicit headroom; the independent whole-run 180-second cap remains.
+SEARCH_COMMAND = "go nodes 4096 movetime 75000"
 PROFILE_KEYS = {"backend_sha256", "model_manifest_sha256", "encoding_manifest_sha256"}
 ARGUMENTS = {"--source-weights", "--onnx-model", "--export-manifest", "--manifest-sha256",
              "--ort-library", "--ort-sha256", "--cuda-bundle", "--cuda-bundle-sha256",
@@ -118,7 +121,7 @@ def run_once(variant, directory, overall_deadline):
             owner.send(position)
             owner.send("isready")
             owner.until(lambda line: line == "readyok")
-            owner.send("go nodes 4096")
+            owner.send(SEARCH_COMMAND)
             reported = []
             def observe(line):
                 if line.startswith("info "):
@@ -185,6 +188,7 @@ def run(manifest, output):
     put(output/"registration.json", {"manifest": manifest, "helper_sha256": sha256(__file__),
         "owner_sha256": sha256(Path(__file__).with_name("bounded_local.py")), "positions": POSITIONS,
         "simulations_per_input": SIMULATIONS, "AA_pairs": 3, "AB_pairs": 5,
+        "search_command": SEARCH_COMMAND,
         "run_wall_seconds": 180, "cleanup_seconds": 30, "overall_seconds": 3600,
         "primary_time": "whole_wall_start_through_native_exit_receipts_and_cgroup_collection",
         "primary_peak": "fresh_cgroup_memory.peak", "each_pair_time_and_peak_ratio_max": 1.05,
