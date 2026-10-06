@@ -87,6 +87,73 @@ class Accounting(unittest.TestCase):
         self.assertEqual(result["duplicate_comparisons_skipped"], 1)
         self.assertEqual(result["unique_compared_physical_runs"], 2)
 
+    def binding_measurement(self, io, graph, kind, seconds=10, peak_kb=100):
+        result=self.pin(dict(accepted=True,exit_code=0,conditioning=False,
+            forced_cgroup_cleanup=False,remaining_after_cleanup=[],source_commit="source0",
+            elapsed_s=seconds,cgroup={"memory.events":"max 0\noom 0\noom_kill 0\n"}))
+        report=dict(accepted=True,failure=None,schema_version=1,kind=kind,
+            cpu_ep_fallback=False,reuse_buffers=False,disable_cuda_cpu_arena=False,
+            batches=[1],warmup_runs=3,measured_runs=20,
+            samples=[dict(batch=1,completed_nn_items=20,warmup_nn_items=3,
+                physical_completion_confirmed=True,cuda_placement=dict(executed_cuda_nodes=687))],
+            memory={"self_vm_hwm":f"{peak_kb} kB"},
+            input_sha256="1"*64,output_sha256="2"*64,model_sha256="3"*64,
+            export_manifest_sha256="4"*64,runtime_bundle_sha256="5"*64,
+            precision="fp32",history_fill="no",tf32=False,cache=False,dedup=False,
+            io_binding=io,cuda_graph=graph,provider_probe_binding_runs=int(io),
+            warm_and_measured_binding_runs=23 if io else 0,
+            successful_binding_runs=24 if io else 0,capture_replay_observed=False)
+        item=dict(layout="inference",result=result,report=self.pin(report),
+            reuse_buffers=False,io_binding=io,cuda_graph=graph)
+        return item,report
+
+    def test_binding_and_graph_have_closed_independent_families(self):
+        for option,kind,fixed in (("io-binding","b1_io_binding_fixed_work",False),
+                                 ("cuda-graph","b1_cuda_graph_option_fixed_work",True)):
+            baseline,_=self.binding_measurement(fixed,False,kind)
+            variant,report=self.binding_measurement(True,option=="cuda-graph",kind,seconds=9,peak_kb=90)
+            pair=self.pair(option,a=baseline,b=variant,option=option)
+            pair["compatibility"]["peak_kind"]="process_vm_hwm_bytes"
+            result=self.aggregate([pair])
+            self.assertEqual(result["series"][0]["cumulative"]["cumulative_peak_ratio"],.9)
+            for flag,value in (("reuse_buffers",True),("cuda_graph",not variant["cuda_graph"]),
+                               ("io_binding",not variant["io_binding"]),("cpu_ep_fallback",True),
+                               ("zero_copy_ort",True),("disable_cuda_cpu_arena",True),
+                               ("copy_ort_model",True),("cache",True),("tf32",True),
+                               ("successful_binding_runs",23),("provider_probe_binding_runs",True),
+                               ("warm_and_measured_binding_runs",24),("precision","fp16"),
+                               ("schema_version",2),("output_sha256","6"*64)):
+                invalid=copy.deepcopy(pair)
+                invalid["variant"]["report"]=self.pin(dict(report,**{flag:value}))
+                with self.subTest(option=option,flag=flag),self.assertRaises(ValueError):
+                    self.aggregate([invalid])
+            invalid=copy.deepcopy(pair)
+            invalid["compatibility"]["option"]="cuda-cpu-arena-off"
+            with self.assertRaises(ValueError):self.aggregate([invalid])
+
+    def test_binding_probe_cannot_substitute_measured_or_actual_cuda_work(self):
+        item,report=self.binding_measurement(True,False,"b1_io_binding_fixed_work")
+        for changes in (dict(warmup_nn_items=2),dict(batch=2),
+                        dict(cuda_placement=dict(executed_cuda_nodes=0)),
+                        dict(physical_completion_confirmed=False),dict(completed_nn_items=24)):
+            invalid=copy.deepcopy(report)
+            invalid["samples"][0].update(changes)
+            with self.subTest(changes=changes),self.assertRaises(ValueError):
+                module.observation(self.root,dict(item,report=self.pin(invalid)),"process_vm_hwm_bytes")
+        item,report=self.binding_measurement(True,True,"b1_cuda_graph_option_fixed_work")
+        with self.assertRaisesRegex(ValueError,"capture/replay"):
+            module.observation(self.root,dict(item,report=self.pin(dict(report,capture_replay_observed=True))),"process_vm_hwm_bytes")
+
+    def test_binding_reversed_or_uncontrolled_flags_cannot_form_a_pair(self):
+        baseline,_=self.binding_measurement(False,False,"b1_io_binding_fixed_work")
+        variant,_=self.binding_measurement(True,False,"b1_io_binding_fixed_work")
+        pair=self.pair("binding",a=baseline,b=variant,option="io-binding")
+        pair["compatibility"]["peak_kind"]="process_vm_hwm_bytes"
+        for side,flag,value in (("variant","io_binding",False),("baseline","io_binding",True),
+                                ("variant","cuda_graph",True),("variant","io_binding",1)):
+            invalid=copy.deepcopy(pair);invalid[side][flag]=value
+            with self.subTest(side=side,flag=flag),self.assertRaises(ValueError):self.aggregate([invalid])
+
     def owned_ort_measurement(self, seconds=10, peak_kb=100, direct=True, derived=None, copied=None):
         result=self.pin(dict(accepted=True,exit_code=0,conditioning=False,
             forced_cgroup_cleanup=False,remaining_after_cleanup=[],source_commit="source0",

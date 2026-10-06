@@ -75,6 +75,48 @@ def events(text):
     return {key: int(value) for key, value in (line.split() for line in text.splitlines())}
 
 
+def binding_fixed_work(report, sample, item, fixed_work):
+    """Validate a single controlled B1 option before normalizing its work.
+
+    Binding runs include a separate provider probe. They are not CUDA Graph
+    capture/replay counts, and the two option families must keep distinct ledgers.
+    Existing inference families retain their original compatibility fingerprints.
+    """
+    kind = report.get("kind")
+    kinds = {"b1_io_binding_fixed_work", "b1_cuda_graph_option_fixed_work"}
+    if kind not in kinds or report.get("schema_version") != 1:
+        raise ValueError("registered B1 binding family required")
+    for flag in ("io_binding", "cuda_graph"):
+        if type(item.get(flag)) is not bool or report.get(flag) is not item[flag]:
+            raise ValueError("registered B1 binding option differs")
+    if ((kind == "b1_io_binding_fixed_work" and item["cuda_graph"] is not False)
+        or (kind == "b1_cuda_graph_option_fixed_work" and item["io_binding"] is not True)):
+        raise ValueError("only the registered binding or graph option may change")
+    if (report.get("precision") != "fp32" or report.get("history_fill") != "no"
+        or any(report.get(flag) is not False for flag in (
+            "tf32", "cache", "dedup", "reuse_buffers", "cpu_ep_fallback", "disable_cuda_cpu_arena"))
+        or any(report.get(flag, False) is not False for flag in ("zero_copy_ort", "copy_ort_model"))
+        or sample.get("batch") != 1 or sample.get("warmup_nn_items") != 3):
+        raise ValueError("independent fixed CUDA B1 work differs")
+    positive(sample.get("cuda_placement", {}).get("executed_cuda_nodes"))
+    for key in ("input_sha256", "output_sha256", "model_sha256", "export_manifest_sha256", "runtime_bundle_sha256"):
+        if not re.fullmatch("[0-9a-f]{64}", report.get(key, "")):
+            raise ValueError("binding fixed-work identity missing")
+    expected = {"provider_probe_binding_runs": 1, "warm_and_measured_binding_runs": 23,
+                "successful_binding_runs": 24} if item["io_binding"] else {
+                    "provider_probe_binding_runs": 0, "warm_and_measured_binding_runs": 0,
+                    "successful_binding_runs": 0}
+    if any(type(report.get(key)) is not int or report[key] != count for key, count in expected.items()):
+        raise ValueError("provider probe and measured binding counts differ")
+    if kind == "b1_cuda_graph_option_fixed_work" and report.get("capture_replay_observed") is not False:
+        raise ValueError("graph option receipt cannot attest capture/replay")
+    # Only the closed, validated option differs. Output/model/input identities
+    # still have to match, and family identity prevents cross-family reuse.
+    fixed_work.pop("io_binding")
+    fixed_work.pop("cuda_graph")
+    fixed_work.update(binding_family=kind, warmup_nn_items=3, provider_probe_separate=True)
+
+
 def observation(root, item, peak_kind):
     result = pinned(root, item["result"])
     if result.get("accepted") is not True or result.get("exit_code") != 0:
@@ -122,6 +164,10 @@ def observation(root, item, peak_kind):
         peak = positive(int(match[1]) * 1024)
         if report["reuse_buffers"] is not item["reuse_buffers"]:
             raise ValueError("registered buffer option differs")
+        binding = (report.get("kind") in ("b1_io_binding_fixed_work", "b1_cuda_graph_option_fixed_work")
+            or any(flag in item for flag in ("io_binding", "cuda_graph")))
+        if binding:
+            binding_fixed_work(report, sample, item, fixed_work)
         if ("disable_cuda_cpu_arena" in item
             and report.get("kind") in ("b1_owned_ort_fixed_work", "b1_copied_ort_fixed_work")):
             if item["disable_cuda_cpu_arena"] is not False:
@@ -222,6 +268,19 @@ def aggregate(root, ledger):
         compat = comparison["compatibility"]
         if set(compat) != COMPAT_KEYS or any(v is None for v in compat.values()):
             raise ValueError("complete compatibility dimensions required")
+        binding_comparison = (compat["option"] in ("io-binding", "cuda-graph")
+            or any(flag in comparison[side] for flag in ("io_binding", "cuda_graph") for side in ("baseline", "variant")))
+        if binding_comparison:
+            option = compat["option"]
+            flag = "io_binding" if option == "io-binding" else "cuda_graph"
+            fixed_flag = "cuda_graph" if option == "io-binding" else "io_binding"
+            expected_fixed = option == "cuda-graph"
+            if (option not in ("io-binding", "cuda-graph")
+                or comparison["baseline"].get(flag) is not False
+                or comparison["variant"].get(flag) is not True
+                or any(comparison[side].get(fixed_flag) is not expected_fixed
+                    or comparison[side]["layout"] != "inference" for side in ("baseline", "variant"))):
+                raise ValueError("binding comparison requires its single controlled baseline and variant")
         copied_comparison = (compat["option"] == "copied-ort-flatbuffer"
             or any("copy_ort_model" in comparison[side] for side in ("baseline", "variant")))
         ort_comparison = (copied_comparison or compat["option"] == "owned-ort-flatbuffer"
