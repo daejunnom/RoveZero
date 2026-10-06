@@ -67,6 +67,12 @@ phase peak·live heap·cgroup file cache·VRAM·Windows commit과 구분한다.
 
 ## Owned ORT flatbuffer 한 변수 연구
 
+**현재 HOLD:** 2026-10-06의 별도 CUDA 수치 실행은 계산 후 native heap 오류와
+SIGABRT로 종료했다. 보고서의 `status=passed`만으로 인수하지 않으며 A/B 계측은
+실행하지 않았다. Worker join을 먼저 확인하는 수정은 CPU 검사만 완료했다.
+수정 SHA의 별도 수치 검사·정상 프로세스 종료를 확인하기 전에는 아래 A/B를 진행하지 않는다.
+[실패·수명 수정·누적 자료](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#owned-ort-flatbuffer-ab)를 따른다.
+
 `experimental-ort-model`은 기본 off이며 UCI·기존 B1 대국에 적용하지 않는다.
 `ort_export SOURCE ONNX EXPORT CUDA_CORE CUDA_BUNDLE NEW_ORT NEW_MANIFEST`로
 기존 CUDA FP32·TF32 off·Level1 경로에서 파생 모델을 별도 생성한다. 일곱 경로는

@@ -677,6 +677,76 @@ Native 대국·PGN은 이번 단일 추론 연구에서 새로 생성하지 않�
 후속 큰 peak 후보는 session commit 중 직렬화·graph/initializer의 동시 생존량이며,
 CPU arena의 준비 완료 RSS 감소와 분리해 조사한다.
 
+### 4.11 Rust 소유 ORT flatbuffer와 native 종료 실패
+
+<a id="owned-ort-flatbuffer-ab"></a>
+
+2026-10-06, source `238629a25d4fda0a32200d317d806e2f29909860`에서
+`experimental-ort-model`을 **기본 off·별도 연구 진입점**으로 추가했다.
+직전 §4.10의 peak가 session commit 직후까지 약1.8GiB로 상승한 것을 따라,
+직렬화 모델을 직접 참조해 graph/initializer 복제를 줄일 수 있는지 조사한다.
+원본 BT4 graph의822 node 중 입력 전부가 initializer인 node는 없었다.
+이 관측만으로 ConstantFolding 비활성화를 큰 절약 후보로 삼지 않았다.
+기존 runner도 첫 엔진의 uciok 이후 두 번째 엔진에 uci를 보냈으므로
+새 startup 직렬화를 구현한 효과로 세지 않는다.
+
+[ORT 공식 문서](https://onnxruntime.ai/docs/performance/model-optimizations/ort-format-models.html#load-ort-format-model-from-an-in-memory-byte-array)와
+[고정 ort rc.10 구현](https://github.com/pykeio/ort/blob/v2.0.0-rc.10/src/session/builder/impl_commit.rs#L122)을 대조했다.
+`session.use_ort_model_bytes_directly`와 `session.use_ort_model_bytes_for_initializers`는
+ORT flatbuffer의 직접 참조 옵션이다. Rust 소유 Vec를 private session owner 안에
+유지하고 native session을 먼저 해제한다. Direct 경로의 출력은 Rust 소유 값으로 복사하고
+native Value는 함수 안에서 해제한다. I/O Binding·buffer reuse·CUDA Graph는 함께 켜지 않는다.
+불확실 CUDA 완료 때 session·모델·입력을 함께 보존한다. CPU provider와
+미컴파일 선택·CPU arena 동시 변경도 거부한다. 기존 ONNX 조기 해제 경로는 유지한다.
+
+`ort_export`는 동일 CUDA runtime1.22·Level1·FP32·TF32 off에서 caller가
+독점 생성한 새 FD에 파생 ORT/manifest를 기록한다. 원본 gzip/protobuf/export/ONNX와
+runtime core/bundle을 검증하고 파생 모델의 hash·크기·변환 조건을 추가로 식별한다.
+원본 ONNX 검증은64KiB streaming hash를 사용하며 그 파일의 전체 Vec를 추가로 만들지 않는다.
+기존 `maia_check`의 독립 수치 검사를 재사용하고 `inference_bench`에는
+`--b1-ort-model=baseline|direct`를 추가했다. B1/warm3/timed20·출력 digest·수명 조건을
+유지하며 ledger는 실제 옵션·파생 provenance·retained bytes와 비교 방향을 확인한다.
+UCI·기본 feature·receipt schema·공통 계약0.1·기본 대국 모델은 변경하지 않았다.
+
+별도 변환은39.921s·정상 종료로 완료했다. 파생 모델은741,414,656B,
+SHA256 `f616299c0f69606741b8390e3581a277ad34d03f27469bf12f9b7147662dd4b3`다.
+원본 ONNX741,143,425B보다271,231B 크며 양자화나 가중치 압축을 적용하지 않았다.
+변환 성공·placement probe는 새 경로의 GPU 수치/수명 인수를 대신하지 않는다.
+
+**HOLD·GPU 인수 실패:** 이어진 독립 수치 실행은12개 No/Repeat 참조,
+batch1/2/4/8/16과 가변 B1 32회를 계산한 뒤 `status=passed` 보고서를 썼지만,
+프로세스 종료 중 `malloc(): unsorted double linked list corrupted`와
+SIGABRT(exit -6)가 발생했다. 계산된 수치와 보고서 상태는 진단 자료로만 보존한다.
+전체 정상 종료가 없으므로 수치 인수·성능 표본으로 인정하지 않는다.
+이 단계의 wall52.547s와 cgroup peak4053.750MiB는 성능 A/B 값이 아니다.
+CPU quota2/affinity2·high6GiB/max12GiB·swap0·pids128·AS128GiB,
+실행300초+정리30초를 유지했다. High/max/OOM/강제 정리/잔류 process는0이다.
+이 자료로 RAM/VRAM 부족이나 ORT 자체 결함을 원인으로 확정하지 않는다.
+VRAM/Windows commit peak는 unknown이다.
+
+코드에서 별도로 확인한 누락은 수치 검사의 `PhysicalPoll::Ready` 이후
+`SingleWorker::try_shutdown`의 join을 기다리지 않고 성공을 기록한 점이다.
+수정 source `dd521d79cfc2b929f519770f8b2ceca1ed63e76e`는5초의 유한 shutdown 확인을
+추가했다. Run 결과와 session/TLS 파괴를 구분하고 완료 Run 오류에서도 먼저 종료를
+확인한다. Contracts 없이 실행할 때에도 직접 backend를 해제한 후 보고서를 기록한다.
+Pending destructor를 성공으로 승인하지 않는 CPU 회귀와 오류 전파/수명 검사를 확인했다.
+**수정의 GPU 재실행은 미실행이며 이번 heap 오류의 원인과 해결 여부는 미확정**이다.
+첫 실패에서 후속 GPU 작업을 중단했고 A/B 사전 등록·성능 실행·새 PGN은 생성하지 않았다.
+다음 실험의 선행 조건은 수정 source를 새로 고정한 독립 수치 실행의 정상 물리 종료다.
+
+로컬 CPU는 최초 source의 ONNX/contracts92·ORT/contracts93·all-feature99개,
+shutdown 수정의 all-feature/all-target103개·contracts 없는 수치 진입점 컴파일,
+strict Clippy/fmt·누적 도구21개를 통과했다. 최초 source의
+[CPU CI37411071663](https://github.com/daejunnom/RoveZero/actions/runs/37411071663)는
+Ubuntu·Windows·bindings 세 job SUCCESS다. 이후 SHA의 CI와 GPU 미실행을 구분한다.
+
+기존 **27개 비교·실제51회·공유 기준3개**와7개 series/epoch 값은 그대로다.
+새 수치 실패를 별도 제외 기록으로 연결해 기존13개에 더한 **14개 제외 기록**을 보존했다.
+실패 시간·peak를 이전 성공 A/B의 합계에 더하지 않는다.
+원시 모델·등록·종료 영수증·수치/오류 로그·누적 ledger/JSON은 Git 밖
+`${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-ort-zero-copy-20261006/`에 둔다.
+기존 비교 기준과 모든 보류 판정, 별도 문서 WIP와 작업 규약을 보존했다.
+
 ## 5. 후속 구현·검증 순서
 
 할당/복사 제거 → 저장 밀도 → bounded scratch/arena/pool → 임계 구역/완료 통지 →
