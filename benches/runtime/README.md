@@ -112,6 +112,12 @@ variant=true, `zero_copy_ort`는 양쪽 false다. Retained bytes는 양쪽0이�
 오류·SIGABRT로 종료했다. A/B 사전 등록·실행은 중단했으며 [실패 기록](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#copied-ort-flatbuffer-ab)을
 보존했다. 수치 보고서 `passed`와 CPU CI 성공으로 전체 GPU 실행을 승인하지 않는다.
 
+[종료 진단](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#ort-native-shutdown-diagnostic)은
+cuDNN의 exit callback이 `calloc`할 때 heap 손상을 감지한 스택을 확보했다.
+contracts 없이 main에서 Run/drop해도 재현했다. 자식의 tcache를 끈 두 진단은 정상
+종료했지만 첫 손상 지점·portable 수정·효과 인수는 미확정이다. Allocator 설정과
+제품 기본값을 변경하지 않으며 GDB/allocator 진단을 성능 ledger에 넣지 않는다.
+
 ## D02 CPU/mock trace 재생
 
 [cpu_trace 예제](../../crates/rz-runtime/examples/cpu_trace.rs)는 실제 `Scheduler`와

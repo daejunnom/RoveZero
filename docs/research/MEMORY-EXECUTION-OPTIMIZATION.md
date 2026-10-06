@@ -845,6 +845,75 @@ Ubuntu·Windows·bindings 세 job SUCCESS지만 GPU 실패를 대체하지 않�
 Git 밖 `${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-ort-copy-20261006/`에 둔다.
 규약·두 별도 문서 WIP·UCI·기본 모델·공통 계약·기존 PGN은 유지했다.
 
+### 4.14 Native 종료 호출 스택과 allocator 진단
+
+<a id="ort-native-shutdown-diagnostic"></a>
+
+2026-10-06, §4.13의 **동일 source33f1b86·바이너리·BT4·파생 ORT·runtime**을
+GDB에서 한 번 실행해 SIGABRT 호출 스택을 확보했다. 현재 문서 HEAD24037d7은
+해당 Rust 소스·의존성·feature·workflow가 같다. Core dump와 외부 symbol 자동
+다운로드를 끄고 진단 스크립트·원시 자료를 Git 밖에 두었다. 비용·학습·대국은 없다.
+
+수치·backend/worker 종료 보고 뒤 `exit`의 callback이
+`libcudnn_engines_precompiled.so.9`에서 `calloc`을 호출할 때 glibc가 heap 손상을
+발견했다. 이는 **오류를 감지한 종료 위치**이며 처음 잘못 쓴 메모리나 잘못 해제한
+객체의 위치를 확정하지 않는다. 해당 스택에는 `ReleaseEnv`가 나타나지 않는다.
+모델 버퍼·native allocator·라이브러리 전역/TLS의 책임을 아직 확정하지 않았다.
+
+| 독립 진단 | 결과 | 확인한 경계 |
+|---|---|---|
+| 기존 contracts 포함 바이너리 + GDB | SIGABRT, 정상 exit 아님 | worker join 뒤 cuDNN 종료 callback의 `calloc`에서 감지 |
+| contracts 없는 example + GDB | 같은 종료 스택의 SIGABRT | main에서 Run/drop해도 재현; worker 이동은 재현의 필수 조건 아님 |
+| 기존 바이너리 + tcache0/perturb165 + GDB | 수치·worker 종료·exit0 | 두 allocator 조건을 바꾼 진단; 성능 인수 아님 |
+| 기존 바이너리 + tcache0만 + GDB | 수치·worker 종료·exit0 | 한 allocator 조건의 별도 진단; 원인 해결·기본 설정 채택 아님 |
+
+contracts 없는 빌드는 main의12개 No/Repeat 참조·batch1/2/4/8/16·가변 B1 32회와
+잘못된 입력 거부/후속 유효 실행을 유지하되 네 worker 계약 요청은 실행하지 않는다.
+따라서 전체 workload가 동일한 성능 비교로 보지 않는다. 네 실행의 logits 최대절대
+6.508827209e-5·policy2.801418304e-6·WDL1.788139343e-7은 기존 오차 범위다.
+앞의 두 실행은 정상 exit가 없어 GPU 수치/수명 인수 실패다. 뒤의 두 실행은 정상 종료한
+진단이지만, 변경된 allocator 환경을 제품이나 기존 GPU 인수로 대체하지 않는다.
+
+`glibc.malloc.tcache_count=0`은 thread cache를 끄며 `glibc.malloc.perturb=165`는
+할당/해제 메모리의 내용에 영향을 준다. [glibc 공식 계약](https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Tunables.html)을
+참고해 **해당 자식 환경에만** 적용했다. Heap 배치·시점 변화가 잠복 오류를 드러내지
+않았을 가능성을 남긴다. 두 정상 진단으로 portable한 수정·메모리/속도 개선·안전한
+기본 승격을 주장하지 않는다. Session leak·강제 `_exit`·완료 전 버퍼 해제는 없다.
+
+추가로 정확한 NVIDIA 의존16개만 `dlopen`하고 끝내는 작은 native 검사는 exit0이었다.
+이는 모델/session/GPU 연산을 실행하지 않은 경계 검사다. ORT provider 초기화를
+생략하고19개를 직접 `dlopen`한 최초 fixture는 CUDA provider의 constructor에서
+SIGSEGV가 났다. 이 setup은 제품 초기화 순서와 달라 엔진/cuDNN 종료 오류의 재현으로
+취급하지 않는다. 실패·GDB 로그를 보존했다. 짧은 loader 로그는 capture close 후
+marker를 재확인했으며, 중간 분류와 후속 확인을 별도 자료로 남겼다.
+
+[ort #609](https://github.com/pykeio/ort/issues/609)와 [수정 #610](https://github.com/pykeio/ort/pull/610)은
+계산 뒤 native 종료 heap 오류를 다루지만 rc13/ORT1.27의 global environment 해제
+조건이다. 현재 rc10/ORT1.22와 관측 스택이 달라 같은 원인으로 보지 않으며 runtime이나
+의존성을 바꾸지 않았다. [고정 rc10 환경 구현](https://github.com/pykeio/ort/blob/v2.0.0-rc.10/src/environment.rs)을
+함께 확인했다. 첫 손상 지점과 배포 가능한 수정은 여전히 **unknown·HOLD**다.
+
+각 모델 진단은 CPU quota2·affinity 두 core·high6GiB/max12GiB·swap0·pids128·
+AS128GiB, 300초+정리30초와 로그/core 상한을 사용했다. Loader 진단은60초+정리30초다.
+High/max/OOM·강제 정리·소유 잔류는0이며, VRAM peak와 Windows commit은 unknown이다.
+진단의 시간/peak는 성능 분모·분자에 넣지 않는다. 새로운 성능 A/B·대국은 실행하지 않았다.
+
+집계 source `cfb99f60602a5d34e0706d9abf6d9ec68577d10f`는 명시적
+`diagnostic_only=true`/`performance_measurement=false`를 `accepted=true`·exit0일
+때에도 거부한다. 성공한 진단은 제외 근거로 보존한다. WSL Python3.12 도구38개가
+통과했다. 최초 Windows 기본 Python3.11 실행은 기존 `Path.is_junction`의3.12 요구로
+35개 오류가 나 실패로 남겼으며 검사 성공에 포함하지 않는다. Python 요건을 낮추거나
+link 검사를 우회하지 않았다.
+[cfb99f6 CPU CI37418772386](https://github.com/daejunnom/RoveZero/actions/runs/37418772386)는
+Ubuntu·Windows·bindings 세 job SUCCESS로 직접 확인했으며 GPU heap 문제의 해결
+증거로 쓰지 않는다.
+
+새 ledger로 전부 다시 계산해 기존 **30개 비교·고유57회·공유 기준3개·8개 series/epoch**가
+정확히 같음을 확인했다. 진단 collection 한 개만 추가해 **제외16개**다. 원시 source/
+binary/helper pin·호출 스택·수치·자원·정상/실패 종료·집계 확인은
+`${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-ort-shutdown-diagnostic-20261006/`에
+보존한다. 기존 실패·HOLD를 지우지 않으며 규약과 별도 문서 WIP는 수정하지 않는다.
+
 ## 5. 후속 구현·검증 순서
 
 할당/복사 제거 → 저장 밀도 → bounded scratch/arena/pool → 임계 구역/완료 통지 →
