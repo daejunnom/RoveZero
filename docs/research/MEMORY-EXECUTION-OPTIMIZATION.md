@@ -681,6 +681,8 @@ CPU arena의 준비 완료 RSS 감소와 분리해 조사한다.
 
 <a id="owned-ort-flatbuffer-ab"></a>
 
+아래는 최초 실행과 수정 당시의 기록이다. 수정 후 GPU 재검사와 A/B는 §4.12에 추가한다.
+
 2026-10-06, source `238629a25d4fda0a32200d317d806e2f29909860`에서
 `experimental-ort-model`을 **기본 off·별도 연구 진입점**으로 추가했다.
 직전 §4.10의 peak가 session commit 직후까지 약1.8GiB로 상승한 것을 따라,
@@ -746,6 +748,102 @@ Ubuntu·Windows·bindings 세 job SUCCESS다. 이후 SHA의 CI와 GPU 미실행�
 원시 모델·등록·종료 영수증·수치/오류 로그·누적 ledger/JSON은 Git 밖
 `${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-ort-zero-copy-20261006/`에 둔다.
 기존 비교 기준과 모든 보류 판정, 별도 문서 WIP와 작업 규약을 보존했다.
+
+### 4.12 종료 수정 재검사와 retained-direct ORT A/B
+
+<a id="owned-ort-recheck-ab"></a>
+
+2026-10-06, source `f9ed02a37b3c13ced140f60f3d3dc5c3cfed70b1`의
+새 release 바이너리에서 §4.11의 shutdown 수정을 다시 검사했다.
+독립 CUDA 수치 검사는23.013s·exit0으로 정상 종료했다. 12개 No/Repeat 참조,
+batch1/2/4/8/16·가변 B1 32회·보존 출력·잘못된 입력 거부 뒤 유효 실행을 확인했다.
+Logits 최대절대6.508827209e-5·합법 policy2.801418304e-6·WDL1.788139343e-7이며
+기존 허용 오차를 유지했다. `backend_shutdown_completed`와 worker `shutdown_joined`를
+둘 다 요구했다. High/max/OOM/강제 정리/잔류 process는0이다. 최초 SIGABRT는 제외
+기록으로 보존하며, 한 번의 정상 재검사로 heap 오류의 정확한 원인을 확정하지 않는다.
+
+수치·정상 종료 인수 뒤 같은 바이너리의 원본 ONNX(A)와 retained-direct ORT(B)를
+`A1 B1 B2 A2 A3 B3` 순서로 세 쌍 비교했다. 파생 모델·manifest와 원본/runtime hash는
+§4.11과 동일하며 변환은 다시 실행하지 않았다. BT4 FP32/TF32 off·HistoryFill No·
+실제 B1·warm3/timed20·출력 digest·물리 완료와 모든 다른 옵션 off를 고정했다.
+CPU quota2·기존 전체 affinity·high6GiB/max12GiB/swap0·pids128·AS128GiB,
+개별300초+정리30초·전체900초를 등록했고 실제 여섯 실행은154.935s에 완료했다.
+
+T는 같은 supervisor의 입력·등록 검증부터 모델/runtime 준비, warm/Run, 출력 digest,
+native 파괴, 보고서 인수와 cgroup 종료 영수증까지다. 변환·독립 수치는 별도다.
+Primary P는 fresh-process VmHWM이며 cgroup/file cache 관측을 대신 쓰지 않는다.
+
+| 쌍 | A T(s) | B T(s) | A P(MiB) | B P(MiB) | T1/T0 | P1/P0 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 25.287 | 24.392 | 1820.316 | 1380.152 | 0.964605 | 0.758194 |
+| 2 | 20.699 | 30.817 | 1820.750 | 1380.488 | 1.488832 | 0.758198 |
+| 3 | 22.426 | 27.025 | 1912.371 | 1380.418 | 1.205042 | 0.721836 |
+
+**HOLD·기본 off:** T 합계68.412→82.234s(비율1.202033), P 평균1851.146→
+1380.353MiB(비율0.745675)다. 모든 쌍의20% peak 감소 문턱은 만족하지만 두 쌍의
+시간 증가가5%를 넘는다. Baseline T spread4.588s이며 all-pair Pareto도 미충족이다.
+준비 완료 RSS 평균은789.724→1380.311MiB로590.587MiB 늘었다. Direct는
+741,414,656B 직렬화 모델을 session 전체 수명에 유지한다. Startup peak 절약과
+ready 이후 상주량 증가는 각각 판단해야 하며, 이 자료로 native 두 엔진의 메모리나
+대국 성과를 승인하지 않는다. 평균 Run12.253→13.130ms도 작은 표본의 기술 통계다.
+VRAM·Windows commit·phase peak·live heap은 unknown이다.
+
+집계 source `9187c10b8efef63a5dec08a43cb41efc0b5f7fed`는 ORT arm에 명시한
+비활성 `disable_cuda_cpu_arena=false`를 별도 arena 비교로 오인한 분류 오류만 고쳤다.
+Offline 분석 실패 JSON을 보존하고 GPU 실행은 반복하지 않았다. 도구 회귀22개·
+런타임 도구 전체34개가 통과했고 [CPU CI37414687874](https://github.com/daejunnom/RoveZero/actions/runs/37414687874)는
+Ubuntu·Windows·bindings 세 job SUCCESS다. 집계 SHA와 실제 GPU source SHA를 구분한다.
+
+기존7개 series/epoch 값과14개 제외 기록은 그대로다. 새 독립 series를 더해
+**30개 비교·고유57회·공유 기준3개**가 됐다. 원시 등록·수치·각 실행·누적 ledger·분석은
+Git 밖 `${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-ort-zero-copy-recheck-20261006/`에 보존한다.
+UCI·기본 batch·공통 계약·대국 receipt는 그대로이며 새 대국/PGN은 생성하지 않았다.
+
+### 4.13 Native copy ORT와 반복된 종료 실패
+
+<a id="copied-ort-flatbuffer-ab"></a>
+
+§4.12에서 ready RSS가 상승했으므로 source
+`33f1b865ae6eb6bdac0dc108963314928e79e420`에 **별도 복사형 ORT 실험**을 추가했다.
+같은 파생 모델과 export runtime을 사용하고 두 직접 참조 옵션을 모두0으로 고정한다.
+Native copy가 반환된 뒤 기존 `commit_verified_model`의 성공/오류 버퍼 해제 경계를
+재사용한다. Direct 경로의 backing bytes는 계속 session 전체 수명 동안 유지한다.
+[공개 config 계약](https://github.com/microsoft/onnxruntime/blob/v1.22.0/include/onnxruntime/core/session/onnxruntime_session_options_config_keys.h#L102)과
+[ort rc.10의 일반 commit](https://github.com/pykeio/ort/blob/v2.0.0-rc.10/src/session/builder/impl_commit.rs#L136)을 따랐다.
+[고정 native 구현](https://github.com/microsoft/onnxruntime/blob/v1.22.0/onnxruntime/core/session/inference_session.cc#L1337)의
+초기화 뒤 span 해제를 근거로 direct buffer 수명을 임의 단축하지 않는다.
+복사형도 직렬화 중복 때문에 startup peak가 증가할 수 있어 실측 전 개선으로 보지 않는다.
+
+컴파일 feature는 기존 `experimental-ort-model`이며 기본 off다. 독립 수치는 기존 파생
+모델·manifest 인자에 `--experimental-ort-copy`를 추가한다. 성능 진입점은
+`--b1-copied-ort=baseline|copied`, report kind는 `b1_copied_ort_fixed_work`,
+ledger option은 `copied-ort-flatbuffer`다. 원본/직접 참조/복사형의 identity를 구분한다.
+집계기는 실제 mode·출처·retained bytes0·다른 옵션 off를 검증하며 이 series를
+§4.12와 합산하지 않는다. 포함 ledger의 상대 `derived_manifest` 경로도 해당
+ledger 디렉터리 기준으로 정규화해 기존 자료의 위치를 잃지 않게 했다.
+
+**HOLD·GPU 인수 실패:** 복사형의 첫 독립 수치 실행은12개 No/Repeat 참조와
+batch1/2/4/8/16·가변 B1 32회를 계산했고 `backend_shutdown_completed=true`·
+worker `shutdown_joined=true` 보고서를 쓴 뒤, 프로세스 종료 중 동일
+`malloc(): unsorted double linked list corrupted`와 SIGABRT(exit -6)로 실패했다.
+전체59.310s·cgroup peak5351.059MiB이며 high/max/OOM·강제 정리·잔류 process는0이다.
+Logits 최대절대6.508827209e-5·합법 policy2.801418304e-6·WDL1.788139343e-7은
+진단 값이다. 정상 프로세스 종료가 없으므로 수치/수명 성공이나 성능 표본으로 세지 않는다.
+Join 수정만으로 native heap 오류가 해결됐다고 판단하지 않는다. 이 실패가 모델
+버퍼·ORT·CUDA·worker·전역 종료 중 어디서 시작됐는지는 unknown이며 OOM으로 분류하지 않는다.
+
+첫 실패에서 후속 GPU 작업을 중단했다. 복사형 성능 A/B 사전 등록·실행·대국/PGN은 없다.
+실험 코드는 기본 off로 보존하고 다음 GPU 실행 전에 native 종료 경로와 손상 지점을
+좁히는 독립 진단을 준비한다. 강제 `_exit`나 buffer leak로 정상 종료를 꾸미지 않는다.
+로컬 all-feature/all-target103·ONNX/contracts96개, contracts 없는 ORT examples check,
+strict Clippy/fmt·런타임 도구36개가 통과했다. [33f1b86 CPU CI37415577209](https://github.com/daejunnom/RoveZero/actions/runs/37415577209)는
+Ubuntu·Windows·bindings 세 job SUCCESS지만 GPU 실패를 대체하지 않는다.
+
+누적 **30개 비교·고유57회·공유 기준3개**와8개 series/epoch 값은 그대로다.
+복사형 실패를 제외 기록에 추가해 **15개 제외 기록**을 보존했다. 실패 시간/peak는
+성공 비교 합계에 더하지 않는다. 원시 source·binary/입력 pin·수치·종료 로그·실패 ledger는
+Git 밖 `${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-ort-copy-20261006/`에 둔다.
+규약·두 별도 문서 WIP·UCI·기본 모델·공통 계약·기존 PGN은 유지했다.
 
 ## 5. 후속 구현·검증 순서
 

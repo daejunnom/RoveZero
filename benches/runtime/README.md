@@ -105,6 +105,9 @@ Ledger arm에는 `zero_copy_ort`와 `derived_manifest` pin을 지정한다. 집�
 variant=true, `zero_copy_ort`는 양쪽 false다. Retained bytes는 양쪽0이며
 다른 옵션은 계속 off다. 별도 수치·정상 종료 인수 전에는 이 A/B를 실행하지 않는다.
 복사형 결과를 직접 참조형 누적 series에 합산하거나 UCI 기본 경로로 적용하지 않는다.
+**복사형도 HOLD:** source `33f1b86`의 첫 수치 실행은 worker join 뒤 native heap
+오류·SIGABRT로 종료했다. A/B 사전 등록·실행은 중단했으며 [실패 기록](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#copied-ort-flatbuffer-ab)을
+보존했다. 수치 보고서 `passed`와 CPU CI 성공으로 전체 GPU 실행을 승인하지 않는다.
 
 ## D02 CPU/mock trace 재생
 
