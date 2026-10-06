@@ -51,6 +51,13 @@ pub struct ExecutionExperiments {
     pub disable_cuda_cpu_arena: bool,
     /// Independent derived-model trial. Its native session owns the backing bytes.
     pub zero_copy_ort: bool,
+    /// Independent ORT trial with native copying and post-commit Rust buffer release.
+    pub copy_ort_model: bool,
+}
+impl ExecutionExperiments {
+    pub fn uses_ort_model(self) -> bool {
+        self.zero_copy_ort || self.copy_ort_model
+    }
 }
 
 /// Source-thread host intervals. NativeInvocation includes synchronous ORT Run,
@@ -97,6 +104,9 @@ pub fn declared_backend_identity(
     }
     if experiments.zero_copy_ort {
         profile.push_str(";ort-flatbuffer=owned-direct-initializers-v1");
+    }
+    if experiments.copy_ort_model {
+        profile.push_str(";ort-flatbuffer=native-copy-serialized-release-v1");
     }
     asset::sha256(profile.as_bytes())
 }
@@ -426,9 +436,10 @@ impl BackendConfig {
             || (self.experiments.disable_cuda_cpu_arena
                 && (!cfg!(feature = "experimental-ort-cpu-arena")
                     || !matches!(self.provider, Provider::Cuda { .. })))
-            || (self.experiments.zero_copy_ort
+            || (self.experiments.uses_ort_model()
                 && (!cfg!(feature = "experimental-ort-model")
                     || !matches!(self.provider, Provider::Cuda { .. })
+                    || (self.experiments.zero_copy_ort && self.experiments.copy_ort_model)
                     || self.experiments.io_binding
                     || self.experiments.cuda_graph
                     || self.experiments.reuse_buffers
@@ -647,7 +658,7 @@ impl OnnxBackend {
         config: BackendConfig,
         mut observe: impl FnMut(StartupPhase),
     ) -> Result<(AssetMetadata, Self), BackendError> {
-        if !config.experiments.zero_copy_ort
+        if !config.experiments.uses_ort_model()
             || asset::parse_sha256(&asset.manifest.runtime_core_sha256)? != runtime.binary_digest()
             || Some(asset::parse_sha256(&asset.manifest.runtime_bundle_sha256)?)
                 != runtime.bundle_digest()
@@ -723,7 +734,7 @@ impl OnnxBackend {
             VerifiedModel::OwnedOrt { .. } => true,
             _ => false,
         };
-        if config.experiments.zero_copy_ort != is_ort {
+        if config.experiments.uses_ort_model() != is_ort {
             return Err(BackendError::new(
                 K::InvalidInput,
                 S::Admission,
@@ -862,25 +873,46 @@ impl OnnxBackend {
                 bytes,
                 manifest_digest,
             } => {
-                // ort rc.10's InMemorySession cannot be stored next to its owner
-                // without a self-reference. These are the same two documented
-                // ORT options; SessionStorage carries the lifetime obligation.
-                // Moving Vec preserves its allocation. It stays private and
-                // immutable until after native destruction, including failures.
-                observe(StartupPhase::OrtModelRetained);
+                let direct = config.experiments.zero_copy_ort;
                 builder = builder
                     .with_config_entry("session.load_model_format", "ORT")
                     .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?
-                    .with_config_entry("session.use_ort_model_bytes_directly", "1")
+                    .with_config_entry(
+                        "session.use_ort_model_bytes_directly",
+                        if direct { "1" } else { "0" },
+                    )
                     .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?
-                    .with_config_entry("session.use_ort_model_bytes_for_initializers", "1")
+                    .with_config_entry(
+                        "session.use_ort_model_bytes_for_initializers",
+                        if direct { "1" } else { "0" },
+                    )
                     .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?;
-                let native = builder.commit_from_memory(&bytes).map_err(model_error)?;
-                let storage = SessionStorage {
-                    native,
-                    retained_model: Some(bytes),
+                let storage = if direct {
+                    // Same two documented options as ort rc.10's borrowed
+                    // InMemorySession. Vec stays private and immutable until
+                    // after native destruction, including errors and quarantine.
+                    observe(StartupPhase::OrtModelRetained);
+                    let native = builder.commit_from_memory(&bytes).map_err(model_error)?;
+                    let storage = SessionStorage {
+                        native,
+                        retained_model: Some(bytes),
+                    };
+                    observe(StartupPhase::SessionCommittedWithOrtModelRetained);
+                    storage
+                } else {
+                    // Both direct-reference options are explicitly off. Normal
+                    // commit_from_memory owns its native copy; reuse the existing
+                    // success/error buffer-release boundary, never shorten the
+                    // lifetime of a direct-reference session's backing bytes.
+                    SessionStorage {
+                        native: commit_verified_model(
+                            bytes,
+                            |bytes| builder.commit_from_memory(bytes).map_err(model_error),
+                            observe,
+                        )?,
+                        retained_model: None,
+                    }
                 };
-                observe(StartupPhase::SessionCommittedWithOrtModelRetained);
                 (storage, Some(manifest_digest))
             }
             model => (
@@ -1621,10 +1653,24 @@ mod buffer_tests {
         config.experiments.io_binding = false;
         let direct = declared_backend_identity([0; 32], [0; 32], Some([0; 32]), &config);
         config.experiments.zero_copy_ort = false;
-        assert_ne!(
-            direct,
-            declared_backend_identity([0; 32], [0; 32], Some([0; 32]), &config)
+        let baseline = declared_backend_identity([0; 32], [0; 32], Some([0; 32]), &config);
+        assert_ne!(direct, baseline);
+        config.experiments.copy_ort_model = true;
+        assert_eq!(
+            config.validate().is_ok(),
+            cfg!(feature = "experimental-ort-model")
         );
+        let copied = declared_backend_identity([0; 32], [0; 32], Some([0; 32]), &config);
+        assert_ne!(copied, baseline);
+        assert_ne!(copied, direct);
+        config.experiments.zero_copy_ort = true;
+        assert!(
+            config.validate().is_err(),
+            "direct and copied are mutually exclusive"
+        );
+        config.experiments.zero_copy_ort = false;
+        config.provider = Provider::Cpu;
+        assert!(config.validate().is_err());
     }
     #[test]
     fn extracted_identity_codec_preserves_published_b1_format() {

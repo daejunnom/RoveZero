@@ -87,7 +87,7 @@ class Accounting(unittest.TestCase):
         self.assertEqual(result["duplicate_comparisons_skipped"], 1)
         self.assertEqual(result["unique_compared_physical_runs"], 2)
 
-    def owned_ort_measurement(self, seconds=10, peak_kb=100, direct=True, derived=None):
+    def owned_ort_measurement(self, seconds=10, peak_kb=100, direct=True, derived=None, copied=None):
         result=self.pin(dict(accepted=True,exit_code=0,conditioning=False,
             forced_cgroup_cleanup=False,remaining_after_cleanup=[],source_commit="source0",
             elapsed_s=seconds,cgroup={"memory.events":"max 0\noom 0\noom_kill 0\n"}))
@@ -102,7 +102,49 @@ class Accounting(unittest.TestCase):
             runtime_bundle_sha256="bundle",precision="fp32",history_fill="no",tf32=False,cache=False,dedup=False,
             io_binding=False,cuda_graph=False,serialized_model_sha256="derived",derived_manifest_sha256=derived["sha256"],retained_model_bytes=80 if direct else 0)
         item=dict(layout="inference",result=result,report=self.pin(report),reuse_buffers=False,zero_copy_ort=direct,derived_manifest=derived)
+        if copied is not None:
+            report.update(kind="b1_copied_ort_fixed_work",copy_ort_model=copied)
+            item.update(copy_ort_model=copied,report=self.pin(report))
         return item,report,derived
+
+    def test_copied_ort_checks_storage_and_keeps_its_own_comparison(self):
+        baseline,_,derived=self.owned_ort_measurement(direct=False,copied=False)
+        variant,report,_=self.owned_ort_measurement(seconds=10.1,peak_kb=75,direct=False,copied=True,derived=derived)
+        baseline["disable_cuda_cpu_arena"]=False
+        variant["disable_cuda_cpu_arena"]=False
+        pair=self.pair("copied-ort",a=baseline,b=variant,option="copied-ort-flatbuffer")
+        pair["compatibility"]["peak_kind"]="process_vm_hwm_bytes"
+        self.assertEqual(self.aggregate([pair])["unique_compared_physical_runs"],2)
+        for changes in ({"copy_ort_model":False},{"zero_copy_ort":True},{"retained_model_bytes":80},
+            {"kind":"b1_owned_ort_fixed_work"},{"derived_manifest_sha256":"other"},
+            {"cpu_ep_fallback":True},{"disable_cuda_cpu_arena":True}):
+            invalid=copy.deepcopy(pair)
+            invalid["variant"]["report"]=self.pin(dict(report,**changes))
+            with self.subTest(changes=changes),self.assertRaises(ValueError):
+                self.aggregate([invalid])
+        for a,b in ((False,False),(True,False),(True,True),(False,1),(False,None)):
+            invalid=copy.deepcopy(pair)
+            invalid["baseline"]["copy_ort_model"]=a
+            invalid["variant"]["copy_ort_model"]=b
+            with self.subTest(a=a,b=b),self.assertRaises(ValueError):
+                self.aggregate([invalid])
+        for option in ("owned-ort-flatbuffer","cuda-cpu-arena-off"):
+            invalid=copy.deepcopy(pair)
+            invalid["compatibility"]["option"]=option
+            with self.assertRaises(ValueError):
+                self.aggregate([invalid])
+
+    def test_included_ort_ledger_rebases_relative_derived_manifest(self):
+        baseline,_,derived=self.owned_ort_measurement(direct=False)
+        variant,_,_=self.owned_ort_measurement(seconds=10.1,peak_kb=75,derived=derived)
+        pair=self.pair("ort",a=baseline,b=variant,option="owned-ort-flatbuffer")
+        pair["compatibility"]["peak_kind"]="process_vm_hwm_bytes"
+        for arm in (baseline,variant):
+            for key in ("result","report","derived_manifest"):
+                arm[key]["path"]=Path(arm[key]["path"]).name
+        ledger=self.pin(dict(schema_version=1,comparisons=[pair]))
+        combined,_=module.combine_ledgers([self.root/ledger["path"]])
+        self.assertEqual(module.aggregate(self.root/"different-root",combined)["unique_compared_physical_runs"],2)
 
     def test_owned_ort_checks_actual_provenance_retention_and_independent_flags(self):
         item,report,_=self.owned_ort_measurement()

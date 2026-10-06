@@ -99,6 +99,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut execution_options = Vec::new();
     let mut ort_model_path = None;
     let mut ort_manifest_path = None;
+    let mut copy_ort_model = false;
     for option in options {
         if let Some(value) = option.strip_prefix("--benchmark-rounds=") {
             let count = value.parse::<usize>()?;
@@ -116,6 +117,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             {
                 return Err("ORT model requires a unique absolute path and its feature".into());
             }
+        } else if option == "--experimental-ort-copy" {
+            if !cfg!(feature = "experimental-ort-model") || copy_ort_model {
+                return Err("ORT copy mode requires its feature and a unique flag".into());
+            }
+            copy_ort_model = true;
         } else if let Some(value) = option.strip_prefix("--experimental-ort-manifest=") {
             if !cfg!(feature = "experimental-ort-model")
                 || !Path::new(value).is_absolute()
@@ -130,8 +136,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     if ort_model_path.is_some() != ort_manifest_path.is_some() {
         return Err("ORT model and manifest must be specified together".into());
     }
+    if copy_ort_model && ort_model_path.is_none() {
+        return Err("ORT copy mode requires the derived model and manifest".into());
+    }
     let mut experiments = experimental_options(&execution_options)?;
-    experiments.zero_copy_ort = ort_model_path.is_some();
+    experiments.zero_copy_ort = ort_model_path.is_some() && !copy_ort_model;
+    experiments.copy_ort_model = copy_ort_model;
     if benchmark_rounds.is_some() && experiments != ExecutionExperiments::default() {
         return Err("inference baseline benchmark excludes execution experiments".into());
     }
@@ -148,7 +158,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let bytes = asset::read_bounded(Path::new(&args[5]), 8 * 1024 * 1024)?;
     let fixtures: Fixtures = serde_json::from_slice(&bytes)?;
-    let model = if experiments.zero_copy_ort {
+    let model = if experiments.uses_ort_model() {
         None
     } else {
         Some(MaiaAsset::load(
@@ -429,6 +439,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "cuda_graph_requested":experiments.cuda_graph,
             "disable_cuda_cpu_arena":experiments.disable_cuda_cpu_arena,
             "zero_copy_ort":experiments.zero_copy_ort,
+            "copy_ort_model":experiments.copy_ort_model,
             "repeated_B1_calls":32, "retained_outputs_unchanged":true,
             "binding_runs":backend.binding_runs(),
             "phase_clock":"CPU wall boundaries; Run includes kernels/synchronization",

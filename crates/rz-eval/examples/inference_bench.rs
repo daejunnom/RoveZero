@@ -90,6 +90,7 @@ enum RunMode {
     B1Buffers { reuse: bool },
     B1CpuArena { disabled: bool },
     B1OrtModel { direct: bool },
+    B1CopiedOrt { copied: bool },
 }
 impl RunMode {
     fn parse(option: Option<&str>) -> Result<Self, Box<dyn Error>> {
@@ -109,6 +110,12 @@ impl RunMode {
             Some("--b1-ort-model=direct") if cfg!(feature = "experimental-ort-model") => {
                 Ok(Self::B1OrtModel { direct: true })
             }
+            Some("--b1-copied-ort=baseline") if cfg!(feature = "experimental-ort-model") => {
+                Ok(Self::B1CopiedOrt { copied: false })
+            }
+            Some("--b1-copied-ort=copied") if cfg!(feature = "experimental-ort-model") => {
+                Ok(Self::B1CopiedOrt { copied: true })
+            }
             _ => {
                 Err("unknown comparison mode or unavailable experimental-io-buffers feature".into())
             }
@@ -117,11 +124,17 @@ impl RunMode {
     fn widths(self) -> &'static [usize] {
         match self {
             Self::BatchSweep => &[1, 2, 4, 8, 16],
-            Self::B1Buffers { .. } | Self::B1CpuArena { .. } | Self::B1OrtModel { .. } => &[1],
+            Self::B1Buffers { .. }
+            | Self::B1CpuArena { .. }
+            | Self::B1OrtModel { .. }
+            | Self::B1CopiedOrt { .. } => &[1],
         }
     }
     fn observes_startup(self) -> bool {
-        matches!(self, Self::B1CpuArena { .. } | Self::B1OrtModel { .. })
+        matches!(
+            self,
+            Self::B1CpuArena { .. } | Self::B1OrtModel { .. } | Self::B1CopiedOrt { .. }
+        )
     }
 }
 
@@ -154,7 +167,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("usage: inference_bench SOURCE ONNX EXPORT CUDA_CORE CUDA_BUNDLE REPORT [--b1-buffers=baseline|reuse|--b1-cpu-arena=baseline|disabled] (all six paths absolute; fresh REPORT outside Git)".into());
     }
     let mode = RunMode::parse(args.get(6).map(String::as_str))?;
-    if matches!(mode, RunMode::B1OrtModel { .. }) != (args.len() == 9)
+    if matches!(
+        mode,
+        RunMode::B1OrtModel { .. } | RunMode::B1CopiedOrt { .. }
+    ) != (args.len() == 9)
         || (args.len() == 9 && args[7..].iter().any(|p| !Path::new(p).is_absolute()))
     {
         return Err(
@@ -206,6 +222,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         report["reuse_buffers"] = json!(false);
         report["disable_cuda_cpu_arena"] = json!(false);
         report["measurement"] = json!("host_wall_including_run_physical_completion_output_digest_and_ownership_return_not_kernel_time; same bounded startup observer in both arms");
+    }
+    if let RunMode::B1CopiedOrt { copied } = mode {
+        report["kind"] = json!("b1_copied_ort_fixed_work");
+        report["batches"] = json!([1]);
+        report["copy_ort_model"] = json!(copied);
+        report["zero_copy_ort"] = json!(false);
+        report["cpu_ep_fallback"] = json!(false);
+        report["reuse_buffers"] = json!(false);
+        report["disable_cuda_cpu_arena"] = json!(false);
+        report["measurement"] = json!("host_wall_including_run_physical_completion_output_digest_and_ownership_return_not_kernel_time; same bounded startup observer and early serialized release in both arms");
     }
     let started = Instant::now();
     let outcome = sweep(&args, &mut report, mode);
@@ -263,7 +289,8 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
             report["startup_memory"] = json!(memory_points);
         }
         let direct = matches!(mode, RunMode::B1OrtModel { direct: true });
-        let model = if direct {
+        let copied = matches!(mode, RunMode::B1CopiedOrt { copied: true });
+        let model = if direct || copied {
             None
         } else {
             Some(MaiaAsset::load(
@@ -273,7 +300,7 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
             )?)
         };
         #[cfg(feature = "experimental-ort-model")]
-        let derived = if direct {
+        let derived = if direct || copied {
             Some(rz_eval::ort_model::OwnedOrtAsset::load(
                 Path::new(&args[0]),
                 Path::new(&args[1]),
@@ -317,10 +344,11 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
             config.experiments.disable_cuda_cpu_arena = disabled;
         }
         config.experiments.zero_copy_ort = direct;
+        config.experiments.copy_ort_model = copied;
         let profile_dir = Path::new(&args[5]).with_extension(format!("b{width}.placement"));
         std::fs::create_dir(&profile_dir)?;
         config.profiling_prefix = Some(profile_dir.join("placement"));
-        let loaded = if direct {
+        let loaded = if direct || copied {
             #[cfg(feature = "experimental-ort-model")]
             {
                 let derived = derived.ok_or("derived model missing")?;
@@ -453,13 +481,19 @@ mod tests {
             cfg!(feature = "experimental-ort-cpu-arena")
         );
         assert!(RunMode::parse(Some("--b1-cpu-arena=auto")).is_err());
-        for mode in ["--b1-ort-model=baseline", "--b1-ort-model=direct"] {
+        for mode in [
+            "--b1-ort-model=baseline",
+            "--b1-ort-model=direct",
+            "--b1-copied-ort=baseline",
+            "--b1-copied-ort=copied",
+        ] {
             assert_eq!(
                 RunMode::parse(Some(mode)).is_ok(),
                 cfg!(feature = "experimental-ort-model")
             );
         }
         assert!(RunMode::parse(Some("--b1-ort-model=auto")).is_err());
+        assert!(RunMode::parse(Some("--b1-copied-ort=auto")).is_err());
     }
     #[test]
     fn fixed_input_matches_previous_no_history_tensor_identity() {

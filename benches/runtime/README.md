@@ -67,10 +67,11 @@ phase peak·live heap·cgroup file cache·VRAM·Windows commit과 구분한다.
 
 ## Owned ORT flatbuffer 한 변수 연구
 
-**현재 HOLD:** 2026-10-06의 별도 CUDA 수치 실행은 계산 후 native heap 오류와
-SIGABRT로 종료했다. 보고서의 `status=passed`만으로 인수하지 않으며 A/B 계측은
-실행하지 않았다. Worker join을 먼저 확인하는 수정은 CPU 검사만 완료했다.
-수정 SHA의 별도 수치 검사·정상 프로세스 종료를 확인하기 전에는 아래 A/B를 진행하지 않는다.
+**현재 HOLD:** 최초 별도 CUDA 수치 실행은 계산 후 native heap 오류와 SIGABRT로
+종료했다. 실패는 보존한다. Worker join 수정 뒤 source `f9ed02a`의 재검사는
+12개 참조·batch1/2/4/8/16·native shutdown·exit0을 확인했다. 후속 세 쌍에서
+direct ORT의 primary peak RSS는 약25.4% 낮았지만 준비 완료 RSS는 약590.6MiB
+높고 전체 T 합계는 약20.2% 늘어 채택 문턱을 통과하지 못했다.
 [실패·수명 수정·누적 자료](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#owned-ort-flatbuffer-ab)를 따른다.
 
 `experimental-ort-model`은 기본 off이며 UCI·기존 B1 대국에 적용하지 않는다.
@@ -94,6 +95,16 @@ Direct 경로는 Rust 소유 flatbuffer를 session 전체 수명 동안 유지�
 Ledger arm에는 `zero_copy_ort`와 `derived_manifest` pin을 지정한다. 집계기는 실제
 옵션·파생 provenance·retained bytes를 대조하고 baseline=false/variant=true를 요구한다.
 해당 series의 기본 채택이나 기존 누적 자료의 판정 변경은 자동화하지 않는다.
+
+`--b1-copied-ort=baseline|copied`는 같은 여섯 인자와 파생 모델·manifest 두 경로를
+사용하는 독립 비교다. 수치 검사는 기존 파생 경로 인자에 `--experimental-ort-copy`를
+추가한다. 이 옵션은 두 직접 참조 설정을 모두0으로 고정하고 정상 native copy가
+끝난 뒤 기존 버퍼 해제 함수를 재사용한다. Direct 수명을 짧게 해석하지 않는다.
+새 backend identity·report kind `b1_copied_ort_fixed_work`와 ledger option
+`copied-ort-flatbuffer`를 사용하며 arm의 `copy_ort_model`은 baseline=false,
+variant=true, `zero_copy_ort`는 양쪽 false다. Retained bytes는 양쪽0이며
+다른 옵션은 계속 off다. 별도 수치·정상 종료 인수 전에는 이 A/B를 실행하지 않는다.
+복사형 결과를 직접 참조형 누적 series에 합산하거나 UCI 기본 경로로 적용하지 않는다.
 
 ## D02 CPU/mock trace 재생
 

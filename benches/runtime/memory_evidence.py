@@ -121,7 +121,7 @@ def observation(root, item, peak_kind):
         if report["reuse_buffers"] is not item["reuse_buffers"]:
             raise ValueError("registered buffer option differs")
         if ("disable_cuda_cpu_arena" in item
-            and report.get("kind") == "b1_owned_ort_fixed_work"):
+            and report.get("kind") in ("b1_owned_ort_fixed_work", "b1_copied_ort_fixed_work")):
             if item["disable_cuda_cpu_arena"] is not False:
                 raise ValueError("owned ORT comparison requires its independent CPU arena flag off")
         elif "disable_cuda_cpu_arena" in item or report.get("kind") == "b1_cuda_cpu_arena_fixed_work":
@@ -131,10 +131,16 @@ def observation(root, item, peak_kind):
                 or report.get("cpu_ep_fallback") is not False
                 or report["reuse_buffers"] is not False):
                 raise ValueError("registered CUDA CPU arena option or fallback differs")
-        if "zero_copy_ort" in item or report.get("kind") == "b1_owned_ort_fixed_work":
-            if (type(item.get("zero_copy_ort")) is not bool
-                or report.get("kind") != "b1_owned_ort_fixed_work"
-                or report.get("zero_copy_ort") is not item["zero_copy_ort"]
+        copied_ort = "copy_ort_model" in item or report.get("kind") == "b1_copied_ort_fixed_work"
+        if copied_ort or "zero_copy_ort" in item or report.get("kind") == "b1_owned_ort_fixed_work":
+            flag = "copy_ort_model" if copied_ort else "zero_copy_ort"
+            kind = "b1_copied_ort_fixed_work" if copied_ort else "b1_owned_ort_fixed_work"
+            if (type(item.get(flag)) is not bool
+                or report.get("kind") != kind
+                or report.get(flag) is not item[flag]
+                or (copied_ort and (item.get("zero_copy_ort") is not False
+                    or report.get("zero_copy_ort") is not False))
+                or (not copied_ort and report.get("copy_ort_model", False) is not False)
                 or report.get("cpu_ep_fallback") is not False
                 or report.get("disable_cuda_cpu_arena") is not False
                 or report["reuse_buffers"] is not False):
@@ -148,10 +154,10 @@ def observation(root, item, peak_kind):
                 or derived["provider"] != "cuda" or derived["precision"] != "fp32"
                 or derived["tf32"] is not False or derived["redistribution_ready"] is not False):
                 raise ValueError("derived ORT provenance differs")
-            expected_retained = derived["ort_bytes"] if item["zero_copy_ort"] else 0
+            expected_retained = derived["ort_bytes"] if not copied_ort and item[flag] else 0
             if report.get("retained_model_bytes") != expected_retained:
                 raise ValueError("owned ORT lifetime/storage receipt differs")
-            if item["zero_copy_ort"] and (report.get("serialized_model_sha256") != derived["ort_sha256"]
+            if item[flag] and (report.get("serialized_model_sha256") != derived["ort_sha256"]
                 or report.get("derived_manifest_sha256") != item["derived_manifest"]["sha256"]):
                 raise ValueError("actual ORT serialization identity differs")
     else:
@@ -214,9 +220,18 @@ def aggregate(root, ledger):
         compat = comparison["compatibility"]
         if set(compat) != COMPAT_KEYS or any(v is None for v in compat.values()):
             raise ValueError("complete compatibility dimensions required")
-        ort_comparison = (compat["option"] == "owned-ort-flatbuffer"
+        copied_comparison = (compat["option"] == "copied-ort-flatbuffer"
+            or any("copy_ort_model" in comparison[side] for side in ("baseline", "variant")))
+        ort_comparison = (copied_comparison or compat["option"] == "owned-ort-flatbuffer"
             or any("zero_copy_ort" in comparison[side] for side in ("baseline", "variant")))
-        if ort_comparison:
+        if copied_comparison:
+            if (compat["option"] != "copied-ort-flatbuffer"
+                or comparison["baseline"].get("copy_ort_model") is not False
+                or comparison["variant"].get("copy_ort_model") is not True
+                or any(comparison[side].get("zero_copy_ort") is not False
+                    or comparison[side]["layout"] != "inference" for side in ("baseline", "variant"))):
+                raise ValueError("copied ORT comparison requires original baseline and copied variant")
+        elif ort_comparison:
             if (comparison["baseline"].get("zero_copy_ort") is not False
                 or comparison["variant"].get("zero_copy_ort") is not True
                 or any(comparison[side]["layout"] != "inference" for side in ("baseline", "variant"))):
@@ -291,7 +306,7 @@ def combine_ledgers(paths):
         for comparison in value["comparisons"]:
             for side in ("baseline", "variant"):
                 arm = comparison[side]
-                for key in ("result", "report", "receipt", "registration"):
+                for key in ("result", "report", "receipt", "registration", "derived_manifest"):
                     if key in arm:
                         rebase(arm[key])
                 for ref in arm.get("additional_evidence", []):
