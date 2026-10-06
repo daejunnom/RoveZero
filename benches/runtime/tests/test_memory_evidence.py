@@ -102,6 +102,16 @@ class Accounting(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "completed work"):
             self.aggregate([self.pair("p", b=self.measurement(10, 80, fixed_work={"completed": 17}))])
 
+    def test_legacy_source_requires_pinned_registration_and_cannot_conflict(self):
+        pair = self.pair("p", a=self.measurement(10, 100, source_commit=None))
+        with self.assertRaisesRegex(ValueError, "source registration required"):
+            self.aggregate([pair])
+        pair["baseline"]["registration"] = self.pin(dict(source_commit="source0"))
+        self.assertEqual(len(self.aggregate([pair])["series"][0]["epochs"]), 1)
+        pair["variant"]["registration"] = self.pin(dict(source_commit="source1"))
+        with self.assertRaisesRegex(ValueError, "raw source differs"):
+            self.aggregate([pair])
+
     def test_peak_definition_is_not_substituted(self):
         pair = self.pair("p")
         pair["compatibility"]["peak_kind"] = "process_vm_hwm_bytes"

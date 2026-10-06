@@ -130,8 +130,16 @@ def observation(root, item, peak_kind):
     # Optional additional small evidence is verified without replacing the raw metrics.
     for ref in item.get("additional_evidence", []):
         pinned(root, ref)
+    source = result.get("source_commit")
+    if "registration" in item:
+        registered_source = pinned(root, item["registration"])["source_commit"]
+        if source is not None and source != registered_source:
+            raise ValueError("raw source differs from pinned registration")
+        source = registered_source
+    if not source:
+        raise ValueError("raw source or pinned source registration required")
     return dict(id=item["result"]["sha256"], time_seconds=time, peak_bytes=peak,
-                source_commit=result["source_commit"], fixed_work=fixed_work,
+                source_commit=source, fixed_work=fixed_work,
                 high_events=counters.get("high", 0))
 
 

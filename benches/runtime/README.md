@@ -19,6 +19,8 @@ Path는 ledger 기준 상대 경로나 실행 호스트의 절대 경로다. Nat
 inference에는 `report`와 `reuse_buffers`도 지정한다. 추가 작은 JSON 증거는
 `additional_evidence`로 묶는다. 이 도구는 raw 결과의 실제 시간·peak를 사용하며,
 전달된 요약 숫자로 대체하지 않는다. Ledger·증거 JSON은 파일마다 16MiB로 제한한다.
+이전 결과에 source SHA가 없으면 `registration={"path":"...","sha256":"..."}`의
+고정 source를 요구한다. Raw source가 있으면 registration과 일치해야 한다.
 
 각 series는 기준·변경 T 합계와 `sum(T1)/sum(T0)`, 실행별 peak 관측값의 합계·평균과
 `sum(P1)/sum(P0)`, 쌍별 비율의 범위·중앙값·기하평균을 함께 남긴다. **Peak의 합계는
