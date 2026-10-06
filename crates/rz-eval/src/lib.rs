@@ -5,20 +5,22 @@
 
 #![forbid(unsafe_code)]
 
-pub mod asset;
+pub mod adapters;
+pub use adapters::lc0::{asset, output};
 #[cfg(feature = "experimental-batch")]
 pub mod batch_journal;
 pub mod error;
 pub mod mock;
-pub mod output;
 pub mod runtime_pin;
 pub mod worker;
 
 #[cfg(feature = "contracts")]
-pub mod contracts;
+pub use adapters::lc0::contracts;
+#[cfg(feature = "contracts")]
+pub mod model_adapter;
 
 #[cfg(feature = "contracts")]
-pub mod rules_projection;
+pub use adapters::lc0::rules_projection;
 
 #[cfg(feature = "contracts")]
 pub mod runtime_bridge;
@@ -27,17 +29,12 @@ pub mod runtime_bridge;
 pub mod native_runtime_bridge;
 
 #[cfg(feature = "onnx")]
-pub mod onnx;
+pub use adapters::lc0::onnx;
 
 #[cfg(feature = "experimental-ort-model")]
 pub mod ort_model;
 
-/// Untrusted output at the model adapter boundary. Missing heads, bad shapes,
-/// and non-finite values are deliberately representable for fault injection.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RawOutput {
-    pub policy_logits: Vec<f32>,
-    pub wdl: Vec<f32>,
-}
+/// Compatibility alias for the supported LC0 raw heads, not a universal model output.
+pub use adapters::lc0::RawOutput;
 #[cfg(feature = "experimental-raw-cache")]
 pub mod raw_cache;

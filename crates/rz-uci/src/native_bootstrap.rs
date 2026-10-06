@@ -130,6 +130,23 @@ impl NativeConfig {
         arguments: impl IntoIterator<Item = String>,
         source_profile: bool,
     ) -> Result<Self, NativeBootstrapError> {
+        let mut selected_adapter = false;
+        let mut filtered = Vec::new();
+        for argument in arguments {
+            if let Some(adapter) = argument.strip_prefix("--model-adapter=") {
+                if selected_adapter || adapter != "lc0" {
+                    return Err(NativeBootstrapError::Contract(error(
+                        ErrorCode::UnsupportedContract,
+                        Stage::Admission,
+                        "unsupported or duplicate native model adapter",
+                    )));
+                }
+                selected_adapter = true;
+            } else {
+                filtered.push(argument);
+            }
+        }
+        let arguments = filtered;
         let mut execution_experiments = rz_eval::onnx::ExecutionExperiments::default();
         let mut raw_cache = false;
         let mut parallelism = None;

@@ -4,15 +4,76 @@
 //! option. The original C model-input codec and ordered action map are reused.
 
 use crate::contracts::{input_key, ordered_policy_indices, MaiaBinding, PreparedRequest};
+use crate::model_adapter::{ModelAdapter, ModelCapabilities, PhysicalFailure};
 use rz_contracts::{
     ContractError, Digest, ErrorCode, EvalInputKey, EvalRequest, ModelDescriptor, Move, Stage,
 };
+use rz_contracts::{EvalOutput, ExecutionId, PrecisionProfile};
 use rz_encoding::classical::{self, EncodedInput, Frame, HistoryFill, Input, HISTORY_FRAMES};
 use rz_position::{contracts::RulesState, Color, Piece, PieceKind, Square};
 use std::sync::Arc;
 
+impl ModelAdapter for Lc0ModelAdapter {
+    type PreparedInput = PreparedRequest<RulesState>;
+    type PreparedBatch = crate::contracts::PreparedBatch<RulesState>;
+    type RawOutput = super::RawOutput;
+    fn model(&self) -> &Arc<ModelDescriptor> {
+        self.model()
+    }
+    fn backend(&self) -> Digest {
+        self.backend()
+    }
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            input: "lc0-classical112",
+            policy_head: "lc0-1858",
+            host_bytes_per_item: crate::contracts::HOST_BYTES_PER_ITEM,
+            mixed_legal_batching: true,
+        }
+    }
+    fn input_key(&self, state: &RulesState, legal: &[Move]) -> Result<EvalInputKey, ContractError> {
+        self.input_key(state, legal)
+    }
+    fn prepare(
+        &self,
+        request: Arc<EvalRequest<RulesState>>,
+    ) -> Result<Self::PreparedInput, ContractError> {
+        self.prepare(request)
+    }
+    fn batch(
+        &self,
+        execution: ExecutionId,
+        items: Vec<Self::PreparedInput>,
+    ) -> Result<Self::PreparedBatch, ContractError> {
+        crate::contracts::PreparedBatch::new(execution, items)
+    }
+    fn decode(
+        &self,
+        input: &Self::PreparedInput,
+        raw: &Self::RawOutput,
+        execution: ExecutionId,
+    ) -> Result<EvalOutput, PhysicalFailure> {
+        input.physical_output(raw, execution)
+    }
+    fn validate_runtime(&self, max_batch: usize) -> Result<(), ContractError> {
+        if self.model().full_steps() != 1
+            || self.model().max_batch_items() != max_batch
+            || !self.model().supports(PrecisionProfile::Fp32)
+        {
+            return Err(failed(
+                ErrorCode::UnsupportedContract,
+                "LC0 baseline requires fresh FP32 inference",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Legacy name retained without an allocation or wrapper.
+pub type ClassicalProjection = Lc0ModelAdapter;
+
 #[derive(Clone, Debug)]
-pub struct ClassicalProjection {
+pub struct Lc0ModelAdapter {
     binding: MaiaBinding,
     #[cfg(feature = "experimental-prepared-input")]
     prepared: Arc<std::sync::Mutex<Option<Arc<PreparedRulesInput>>>>,
@@ -20,7 +81,7 @@ pub struct ClassicalProjection {
     raw_cache: crate::raw_cache::RawCache,
 }
 
-impl ClassicalProjection {
+impl Lc0ModelAdapter {
     pub fn new(binding: MaiaBinding) -> Self {
         Self {
             binding,

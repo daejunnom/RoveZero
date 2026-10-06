@@ -672,3 +672,13 @@ mod streaming_tests {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[cfg(feature = "contracts")]
+impl AssetProfile {
+    pub fn admission_policy(self) -> super::NativeAdmissionPolicy {
+        match self {
+            Self::Maia1900 => super::NativeAdmissionPolicy::CudaOneGiB,
+            Self::Bt4It332 => super::NativeAdmissionPolicy::CudaThreeGiB,
+        }
+    }
+}
