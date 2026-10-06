@@ -408,6 +408,69 @@ bindings CPU CI도 모두 SUCCESS로 확인했다. 성공한 비활성 재생성
 완료와 정확한 경로를 확인한 뒤 회수했고 원본·원시 로그·명세·분석은 Git 밖 논리 경로
 `${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-snapshot-reclaim-20261006/`에 보존했다.
 
+### 4.7 실제 native runner 대조: file cache 감소, 채택 보류
+
+2026-10-06, 동일 source `9b5064e49cb9cc0359a52dce87459d672aa19597`의 기본 arena와
+`experimental-snapshot-reclaim` arena로 실제 V5 preparation → prelaunch → 두 fresh
+B1 엔진 → readiness → 대국 → provider/Rules/PGN/clock 검사 → postcheck 경로를
+비교했다. 4.6의 독립 재읽기 oracle을 제품 prelaunch/postcheck 인수로 재사용하지 않았다.
+엔진 source `ef86138c13b2188f7ee1953eb8bed60b5fec504f`와 binary는 양쪽에 같으며,
+BT4·FP32·TF32 off·HistoryFill No·4096 simulation **상한**·visits·120+1·16KiB를
+고정했다. buffer reuse·notify·cache·dedup·I/O Binding·CUDA Graph·chunk 변경은 off다.
+
+초기 한 수 메이트 진단은 흑 엔진이 평가를 실행하지 않고 백도 비루트 NN backup이 없어
+기존 integration gate에서 거부됐다. GPU/Rules 실패로 해석하지 않고 원본 failed receipt·
+PGN·사본을 보존했다. 제품 gate를 완화하지 않았다. 자체 Rust Rules와 독립 python-chess로
+전체 분기를 확인한 세 수 메이트를 새 등록했다. FEN의 과거 이력은 `unknown_prefix`이며,
+흑·백 fixture는 CPU 규칙으로 확인하고 실제 GPU 실행에는 백 메이트 fixture를 사용했다.
+첫 두 선택은 모두 세 수 메이트이며 이후 수는 강제된다. 매 실행의 두 PGN 수순과 네
+role/session 순서의 완료·소비 평가 수가 conditioning A0와 같아야 비교에 포함했다.
+
+새 V5 lock은 `f658a21d0bcdd85311815eae20ae5fae4f3e7cf1fc16e6aeb6e5c54a6b08f0a7`,
+27개·4,099,789,320bytes다. RTX 4050 Laptop 6GB·WSL Ubuntu·CPU2,
+`memory.high=6GiB`·`memory.max=12GiB`·swap0, 실행당 480초·정리30초·전체3600초를
+사전 등록했다. 제품 pair 한도900초는 유지하고 외부 소유 감독이 더 짧은480초를 적용했다.
+A0/B0 conditioning 뒤 A1/B1/B2/A2/A3/B3를 실행했다. Primary T는 실제 CLI 시작부터
+정상 종료·pipe drain·receipt/provider/PGN 검사·최종 cgroup 수집까지다. Primary P는
+청구된 원본/private/shared file cache와 두 엔진의 Rust/ORT를 포함한 전체 `memory.peak`다.
+일반 성능 실행에서 반복 GPU/PID 조사나 전체 수치 회귀 suite는 실행하지 않았다.
+
+| 쌍 | 기준 T (s) | 파일별 hint T (s) | 기준 P (MiB) | 파일별 hint P (MiB) | T1/T0 | P1/P0 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 126.531 | 131.101 | 4691.426 | 3461.570 | 1.036119 | 0.737850 |
+| 2 | 114.162 | 109.336 | 4029.922 | 3384.137 | 0.957723 | 0.839752 |
+| 3 | 110.804 | 113.787 | 4030.230 | 3465.633 | 1.026921 | 0.859909 |
+
+**HOLD·기본 off 유지:** T는 모두 1.05 이내지만 두 P 비율이 0.80을 초과했다.
+P 감소는 26.2%/16.0%/14.0%로, 독립 준비·추론의 약31.3%를 실제 native 인수로
+확대하지 않는다. Pareto 조건도 첫째·셋째 T 악화와 기준 T 범위15.727초 때문에 미충족이다.
+변경하지 않은 원본 검증은 기준16.715/16.456/17.454초와 실험22.641/15.838/17.037초다.
+copy는 기준42.082/43.802/40.911초와 실험56.508/44.042/48.113초이며,
+prelaunch는 기준6.213/3.176/2.899초와 실험6.099/6.408/5.351초,
+postcheck는 기준8.707/6.724/5.883초와 실험5.936/5.564/5.878초다.
+각 게임 시작→both-ready는16.135~30.609초, first-go→종료는0.158~0.201초였다.
+긴 구간은 모델 로딩·검증·복사이며 반복 isready 응답·로그 배출을 주 병목으로 단정하지 않는다.
+
+최대64개의 기존 phase marker를 수집할 때 `memory.current/stat`를 읽은 보조 관측에서,
+copy 종료 file cache는 기준3913~4575MiB와 실험약26MiB, postcheck 종료 file cache는
+기준3908~4571MiB와 실험약28MiB였다. 두 엔진 ready에서 anon은 양쪽 약1051~1066MiB다.
+이 endpoint를 정확한 phase peak나 heap peak로 대체하지 않는다. 관측된 감소는 file cache에
+집중하며 ORT heap·VRAM·Windows 전체 commit 해결을 입증하지 않는다. VRAM/Windows
+commit peak는 unknown이다. 원본 hint·전역 cache 비우기를 적용하지 않았고 warm 조건·
+cgroup cache 청구의 재귀속·시간 편차를 보존한다. conditioning A0/B0의 high 이벤트는
+29,949/1,841이며 비교6회는 high0이다.
+
+8회 모두 fresh session4개와 실행당 D 완료16개·탐색 소비16개(루트6/비루트10), private
+bytes/inode/readonly·Rules 메이트·흑백 엔진명·실제120+1 시계·process 및 물리 drain을
+인수했다. 완료/소비 수에 startup provider 검사나 terminal traversal을 포함하지 않는다.
+OOM·max·hint 오류·강제 종료·잔류 process는0이며 마지막 종료 후 GPU 사용 메모리0MiB를
+확인했다. 성공한 비활성 private inputs만 소유권·pin·자식·물리 완료를 확인하고 회수했다.
+초기 실패 사본과 모든 PGN·명세·로그·분석은 Git 밖 논리 경로
+`${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-native-reclaim-20261006-v2/`와
+초기 실패 경로 `pr20-native-reclaim-20261006/`에 보존했다. 이 세 수 진단은 실제 native
+수명주기 대조이며 일반 대국의 처리량·기력·Elo 인수가 아니다. 제품 source·Cargo·feature·
+workflow·공통 계약 변경 없이 `9b5064e`의 성공한 CPU CI를 별도 근거로 재사용한다.
+
 ## 5. 후속 구현·검증 순서
 
 할당/복사 제거 → 저장 밀도 → bounded scratch/arena/pool → 임계 구역/완료 통지 →
