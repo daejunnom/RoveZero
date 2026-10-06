@@ -22,6 +22,7 @@ experimental-notify = ["rz-eval/experimental-notify", "rz-runtime/experimental-n
 experimental-onnx-read-hash = ["rz-eval/experimental-onnx-read-hash"]
 experimental-policy-buffer = ["rz-eval/experimental-policy-buffer"]
 experimental-projection-frames = ["rz-eval/experimental-projection-frames"]
+experimental-flat-edges = ["rz-search/experimental-flat-edges"]
 default = []
 experimental-best-move = []
 experimental-raw-cache = ["rz-eval/experimental-raw-cache"]

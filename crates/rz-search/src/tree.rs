@@ -145,10 +145,54 @@ struct Edge<M> {
     child: Option<usize>,
 }
 
+#[cfg(not(feature = "experimental-flat-edges"))]
+type EdgeStorage<M> = std::marker::PhantomData<M>;
+#[cfg(feature = "experimental-flat-edges")]
+type EdgeStorage<M> = Vec<Edge<M>>;
+
+/// Edge indices stay local to their node. The opt-in storage uses stable ranges,
+/// never pointers into the reallocating arena. Neither representation changes
+/// policy order, backup arithmetic, child indices or ownership of move values.
+#[derive(Debug)]
+struct EdgeList<M> {
+    #[cfg(not(feature = "experimental-flat-edges"))]
+    entries: Vec<Edge<M>>,
+    #[cfg(feature = "experimental-flat-edges")]
+    start: usize,
+    #[cfg(feature = "experimental-flat-edges")]
+    len: usize,
+    #[cfg(feature = "experimental-flat-edges")]
+    marker: std::marker::PhantomData<M>,
+}
+
+impl<M> EdgeList<M> {
+    #[cfg(not(feature = "experimental-flat-edges"))]
+    fn as_slice<'a>(&'a self, _storage: &'a EdgeStorage<M>) -> &'a [Edge<M>] {
+        &self.entries
+    }
+    #[cfg(feature = "experimental-flat-edges")]
+    fn as_slice<'a>(&self, storage: &'a EdgeStorage<M>) -> &'a [Edge<M>] {
+        &storage[self.start..self.start + self.len]
+    }
+    #[cfg(not(feature = "experimental-flat-edges"))]
+    fn as_mut_slice<'a>(&'a mut self, _storage: &'a mut EdgeStorage<M>) -> &'a mut [Edge<M>] {
+        &mut self.entries
+    }
+    #[cfg(feature = "experimental-flat-edges")]
+    fn as_mut_slice<'a>(&self, storage: &'a mut EdgeStorage<M>) -> &'a mut [Edge<M>] {
+        &mut storage[self.start..self.start + self.len]
+    }
+}
+
+#[cfg(not(feature = "experimental-flat-edges"))]
+type PreparedEdges<M> = Vec<Edge<M>>;
+#[cfg(feature = "experimental-flat-edges")]
+type PreparedEdges<M> = Vec<M>;
+
 #[derive(Debug)]
 enum Node<M> {
     Unexpanded,
-    Expanded(Vec<Edge<M>>),
+    Expanded(EdgeList<M>),
     Terminal(f64),
 }
 
@@ -161,6 +205,7 @@ struct Pending {
 /// One-owner, one-selection reference tree. There is no board-only transposition table.
 pub struct Tree<M, P = Puct> {
     nodes: Vec<Node<M>>,
+    edge_storage: EdgeStorage<M>,
     edge_count: usize,
     limits: TreeLimits,
     policy: P,
@@ -195,6 +240,7 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
         limits.validate()?;
         Ok(Self {
             nodes: vec![Node::Unexpanded],
+            edge_storage: EdgeStorage::default(),
             edge_count: 0,
             limits,
             policy,
@@ -315,6 +361,8 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
         self.next_serial = 0;
         self.nodes.clear();
         self.nodes.push(Node::Unexpanded);
+        #[cfg(feature = "experimental-flat-edges")]
+        self.edge_storage.clear();
         self.edge_count = 0;
         // The caller explicitly supplies a new session deadline after reset.
         self.deadline = None;
@@ -325,13 +373,17 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
 
     pub fn root_stats(&self) -> Vec<(M, EdgeStats)> {
         match &self.nodes[0] {
-            Node::Expanded(edges) => edges.iter().map(|e| (e.mv.clone(), e.stats)).collect(),
+            Node::Expanded(edges) => edges
+                .as_slice(&self.edge_storage)
+                .iter()
+                .map(|e| (e.mv.clone(), e.stats))
+                .collect(),
             _ => Vec::new(),
         }
     }
 
     pub fn has_root_visits(&self) -> bool {
-        matches!(&self.nodes[0], Node::Expanded(edges) if edges.iter().any(|edge| edge.stats.visits > 0))
+        matches!(&self.nodes[0], Node::Expanded(edges) if edges.as_slice(&self.edge_storage).iter().any(|edge| edge.stats.visits > 0))
     }
 
     /// None until root initialization or for an exact terminal root.
@@ -339,6 +391,7 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
         let Node::Expanded(edges) = &self.nodes[0] else {
             return None;
         };
+        let edges = edges.as_slice(&self.edge_storage);
         let mut best = 0;
         let rank = |edge: &Edge<M>| {
             if self.final_move_policy != FinalMovePolicy::ExactTerminal || edge.stats.visits == 0 {
@@ -415,6 +468,7 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
                 }
                 Node::Terminal(value) => break Leaf::Terminal(*value),
                 Node::Expanded(edges) => {
+                    let edges = edges.as_slice(&self.edge_storage);
                     if path.len() >= self.limits.max_depth {
                         return Err(SearchError::DepthLimit);
                     }
@@ -511,7 +565,8 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
                             let Node::Expanded(edges) = &mut self.nodes[node] else {
                                 unreachable!()
                             };
-                            edges[selected].child = Some(child);
+                            edges.as_mut_slice(&mut self.edge_storage)[selected].child =
+                                Some(child);
                             child
                         }
                     };
@@ -629,6 +684,92 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
         Ok(())
     }
 
+    /// Reserve before the admission/backup linearization point. Growth is bounded
+    /// by the configured logical edge limit instead of reserving the entire limit
+    /// up front. A rejected result can leave spare capacity, never published edges.
+    #[cfg(feature = "experimental-flat-edges")]
+    fn reserve_edges(&mut self, additional: usize) -> Result<(), SearchError> {
+        let required = self
+            .edge_storage
+            .len()
+            .checked_add(additional)
+            .filter(|&count| count <= self.limits.max_edges)
+            .ok_or(SearchError::EdgeLimit)?;
+        if required > self.edge_storage.capacity() {
+            let capacity = self
+                .edge_storage
+                .capacity()
+                .saturating_mul(2)
+                .max(required)
+                .min(self.limits.max_edges);
+            self.edge_storage
+                .try_reserve_exact(capacity - self.edge_storage.len())
+                .map_err(|_| SearchError::AllocationFailed)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "experimental-flat-edges"))]
+    fn prepare_edges(
+        &mut self,
+        moves: Vec<M>,
+        priors: &[f64],
+    ) -> Result<PreparedEdges<M>, SearchError> {
+        let mut edges = Vec::new();
+        edges
+            .try_reserve_exact(moves.len())
+            .map_err(|_| SearchError::AllocationFailed)?;
+        for (mv, &prior) in moves.into_iter().zip(priors) {
+            edges.push(Edge {
+                mv,
+                stats: EdgeStats {
+                    prior,
+                    visits: 0,
+                    value_sum: 0.0,
+                },
+                child: None,
+            });
+        }
+        Ok(edges)
+    }
+
+    #[cfg(feature = "experimental-flat-edges")]
+    fn prepare_edges(
+        &mut self,
+        moves: Vec<M>,
+        _priors: &[f64],
+    ) -> Result<PreparedEdges<M>, SearchError> {
+        self.reserve_edges(moves.len())?;
+        Ok(moves)
+    }
+
+    #[cfg(not(feature = "experimental-flat-edges"))]
+    fn publish_edges(&mut self, entries: PreparedEdges<M>, _priors: &[f64]) -> EdgeList<M> {
+        EdgeList { entries }
+    }
+
+    #[cfg(feature = "experimental-flat-edges")]
+    fn publish_edges(&mut self, moves: PreparedEdges<M>, priors: &[f64]) -> EdgeList<M> {
+        let edges = EdgeList {
+            start: self.edge_storage.len(),
+            len: moves.len(),
+            marker: std::marker::PhantomData,
+        };
+        // Capacity and all validation were prepared before committing visits.
+        // The exact-size iterator cannot allocate and only moves owned values.
+        self.edge_storage
+            .extend(moves.into_iter().zip(priors).map(|(mv, &prior)| Edge {
+                mv,
+                stats: EdgeStats {
+                    prior,
+                    visits: 0,
+                    value_sum: 0.0,
+                },
+                child: None,
+            }));
+        edges
+    }
+
     /// The adapter supplies legal moves in the checked Rules order and v = W-L from the leaf's actual turn.
     pub fn accept_evaluation(
         &mut self,
@@ -666,21 +807,7 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
                 return Err(SearchError::InconsistentLeaf);
             }
             let backup = self.prepare_backup(value)?;
-            let mut edges = Vec::new();
-            edges
-                .try_reserve_exact(moves.len())
-                .map_err(|_| SearchError::AllocationFailed)?;
-            for (mv, &prior) in moves.into_iter().zip(priors) {
-                edges.push(Edge {
-                    mv,
-                    stats: EdgeStats {
-                        prior,
-                        visits: 0,
-                        value_sum: 0.0,
-                    },
-                    child: None,
-                });
-            }
+            let edges = self.prepare_edges(moves, priors)?;
             Ok((edges, backup))
         })();
         match prepared {
@@ -689,7 +816,8 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
                 let leaf = pending.leaf;
                 let completion = self.commit_backup(backup, now, admit)?;
                 if matches!(completion, Completion::Accepted { .. }) {
-                    self.edge_count += edges.len();
+                    let edges = self.publish_edges(edges, priors);
+                    self.edge_count += edges.as_slice(&self.edge_storage).len();
                     self.nodes[leaf] = Node::Expanded(edges);
                 }
                 Ok(completion)
@@ -765,7 +893,7 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
             let Node::Expanded(edges) = &self.nodes[node] else {
                 return Err(SearchError::InconsistentLeaf);
             };
-            let mut stats = edges[edge].stats;
+            let mut stats = edges.as_slice(&self.edge_storage)[edge].stats;
             stats.visits = stats
                 .visits
                 .checked_add(1)
@@ -822,7 +950,7 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
             let Node::Expanded(edges) = &mut self.nodes[node] else {
                 unreachable!()
             };
-            edges[edge].stats = stats;
+            edges.as_mut_slice(&mut self.edge_storage)[edge].stats = stats;
         }
         self.counters = counters;
         self.pending = None;
@@ -895,6 +1023,7 @@ mod tests {
         let Node::Expanded(edges) = &tree.nodes[1] else {
             panic!("expanded child")
         };
+        let edges = edges.as_slice(&tree.edge_storage);
         assert_eq!(edges[0].stats.visits, 1);
         assert_eq!(edges[0].stats.value_sum, -0.75);
     }
@@ -1073,6 +1202,7 @@ mod tests {
         let Node::Expanded(edges) = &mut tree.nodes[0] else {
             panic!("root")
         };
+        let edges = edges.as_mut_slice(&mut tree.edge_storage);
         edges[0].stats = EdgeStats {
             prior: 0.5,
             visits: 4,
@@ -1087,6 +1217,7 @@ mod tests {
         let Node::Expanded(edges) = &mut tree.nodes[0] else {
             panic!("root")
         };
+        let edges = edges.as_mut_slice(&mut tree.edge_storage);
         edges[0].stats.visits = 5;
         assert_eq!(tree.best_move(), Some(&"a"));
     }
@@ -1104,7 +1235,7 @@ mod tests {
             &[0.98, 0.01, 0.01],
         );
         // One winning continuation is not proof against all opponent replies.
-        tree.nodes.push(Node::Expanded(vec![Edge {
+        let entries = vec![Edge {
             mv: "one-winning-reply",
             stats: EdgeStats {
                 prior: 1.0,
@@ -1112,13 +1243,27 @@ mod tests {
                 value_sum: 1.0,
             },
             child: Some(4),
-        }]));
+        }];
+        #[cfg(not(feature = "experimental-flat-edges"))]
+        let edges = EdgeList { entries };
+        #[cfg(feature = "experimental-flat-edges")]
+        let edges = {
+            let edges = EdgeList {
+                start: tree.edge_storage.len(),
+                len: entries.len(),
+                marker: std::marker::PhantomData,
+            };
+            tree.edge_storage.extend(entries);
+            edges
+        };
+        tree.nodes.push(Node::Expanded(edges));
         tree.nodes.push(Node::Terminal(-1.0));
         tree.nodes.push(Node::Terminal(0.0));
         tree.nodes.push(Node::Terminal(-1.0));
         let Node::Expanded(edges) = &mut tree.nodes[0] else {
             panic!("root")
         };
+        let edges = edges.as_mut_slice(&mut tree.edge_storage);
         for (index, (visits, value_sum)) in [(1000, 1000.0), (1, 1.0), (200, 0.0)]
             .into_iter()
             .enumerate()
@@ -1134,6 +1279,7 @@ mod tests {
         let Node::Expanded(edges) = &mut tree.nodes[0] else {
             panic!("root")
         };
+        let edges = edges.as_mut_slice(&mut tree.edge_storage);
         edges[1].stats.visits = 0;
         edges[1].stats.value_sum = 0.0;
         assert_eq!(tree.best_move(), Some(&"estimated"));
@@ -1288,12 +1434,152 @@ mod tests {
         assert!(matches!(tree.nodes[1], Node::Unexpanded));
         assert_eq!(tree.counters().reservations_released, 2);
         assert_eq!(tree.counters().accepted_backups, 0);
+        #[cfg(feature = "experimental-flat-edges")]
+        assert_eq!(tree.edge_storage.len(), 1);
         assert_eq!(
             tree.cancel(&child.ticket).unwrap(),
             Completion::Rejected(Rejection::AlreadyFinalized)
         );
         let next = tree.begin_selection(now).unwrap();
         assert_eq!(next.leaf, Leaf::Unexpanded);
+    }
+
+    #[test]
+    fn edge_storage_growth_keeps_indices_and_exact_backup_order() {
+        let now = Instant::now();
+        let mut tree = Tree::baseline(TreeLimits {
+            max_depth: 300,
+            max_nodes: 301,
+            max_edges: 300,
+            ..TreeLimits::default()
+        })
+        .unwrap();
+        let init = tree.begin_selection(now).unwrap();
+        tree.accept_evaluation(&init.ticket, vec![0_u32], &[1.0], 0.0, now)
+            .unwrap();
+        let mut expected_root_value = 0.0_f64;
+        for depth in 1..=256_u32 {
+            let selection = tree.begin_selection(now).unwrap();
+            assert_eq!(selection.moves, (0..depth).collect::<Vec<_>>());
+            tree.accept_evaluation(&selection.ticket, vec![depth], &[1.0], 0.5, now)
+                .unwrap();
+            expected_root_value += if depth % 2 == 0 { 0.5 } else { -0.5 };
+            let (_, stats) = tree.root_stats()[0];
+            assert_eq!(stats.visits, u64::from(depth));
+            assert_eq!(stats.value_sum.to_bits(), expected_root_value.to_bits());
+            assert_eq!(tree.best_move(), Some(&0));
+            assert_eq!(tree.edge_count, depth as usize + 1);
+            #[cfg(feature = "experimental-flat-edges")]
+            {
+                assert_eq!(tree.edge_storage.len(), tree.edge_count);
+                assert!(tree.edge_storage.capacity() <= tree.limits.max_edges);
+            }
+        }
+        for (index, node) in tree.nodes.iter().enumerate() {
+            let Node::Expanded(edges) = node else {
+                panic!("all selected nodes expanded")
+            };
+            let edge = &edges.as_slice(&tree.edge_storage)[0];
+            assert_eq!(edge.mv, index as u32);
+            assert_eq!(edge.child, (index < 256).then_some(index + 1));
+        }
+    }
+
+    #[test]
+    fn rejected_edges_and_reset_release_owned_moves_without_late_root_changes() {
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct OwnedMove {
+            id: u32,
+            token: Arc<()>,
+        }
+        let now = Instant::now();
+        let mut tree = Tree::baseline(TreeLimits::default()).unwrap();
+        let root_token = Arc::new(());
+        let root_weak = Arc::downgrade(&root_token);
+        let initial = tree.begin_selection(now).unwrap();
+        tree.accept_evaluation(
+            &initial.ticket,
+            vec![OwnedMove {
+                id: 0,
+                token: root_token,
+            }],
+            &[1.0],
+            0.0,
+            now,
+        )
+        .unwrap();
+        let selected = tree.begin_selection(now).unwrap();
+        let child_ticket = selected.ticket.clone();
+        drop(selected); // no external move consumer remains
+        let rejected_token = Arc::new(());
+        let rejected_weak = Arc::downgrade(&rejected_token);
+        assert_eq!(
+            tree.accept_evaluation_with_guard(
+                &child_ticket,
+                vec![OwnedMove {
+                    id: 1,
+                    token: rejected_token
+                }],
+                &[1.0],
+                -1.0,
+                now,
+                || false,
+            )
+            .unwrap(),
+            Completion::Rejected(Rejection::AdmissionClosed)
+        );
+        assert!(rejected_weak.upgrade().is_none());
+        assert_eq!(tree.edge_count, 1);
+        assert_eq!(tree.root_stats()[0].1.visits, 0);
+        #[cfg(feature = "experimental-flat-edges")]
+        let retained_capacity = {
+            assert_eq!(tree.edge_storage.len(), 1);
+            tree.edge_storage.capacity()
+        };
+        tree.reset().unwrap();
+        assert!(root_weak.upgrade().is_none());
+        assert!(tree.root_stats().is_empty());
+        assert_eq!(tree.edge_count, 0);
+        #[cfg(feature = "experimental-flat-edges")]
+        {
+            assert!(tree.edge_storage.is_empty());
+            assert_eq!(tree.edge_storage.capacity(), retained_capacity);
+        }
+        let counters = tree.counters();
+        assert_eq!(
+            tree.accept_terminal(&child_ticket, -1.0, now).unwrap(),
+            Completion::Rejected(Rejection::Stale)
+        );
+        assert_eq!(tree.counters(), counters);
+        assert!(tree.root_stats().is_empty());
+    }
+
+    #[cfg(feature = "experimental-flat-edges")]
+    #[test]
+    fn arena_capacity_overflow_never_publishes_or_commits_pending_root() {
+        let now = Instant::now();
+        let mut tree = Tree::<u8>::baseline(TreeLimits {
+            max_edges: usize::MAX,
+            ..TreeLimits::default()
+        })
+        .unwrap();
+        let initial = tree.begin_selection(now).unwrap();
+        let counters = tree.counters();
+        assert_eq!(
+            tree.reserve_edges(usize::MAX),
+            Err(SearchError::AllocationFailed)
+        );
+        assert!(tree.edge_storage.is_empty());
+        assert_eq!(tree.edge_storage.capacity(), 0);
+        assert_eq!(tree.edge_count, 0);
+        assert_eq!(tree.counters(), counters);
+        assert!(matches!(tree.nodes[0], Node::Unexpanded));
+        assert_eq!(
+            tree.cancel(&initial.ticket).unwrap(),
+            Completion::Rejected(Rejection::Canceled)
+        );
+        assert_eq!(tree.counters().root_initializations, 0);
+        assert_eq!(tree.counters().accepted_backups, 0);
     }
 
     #[test]
