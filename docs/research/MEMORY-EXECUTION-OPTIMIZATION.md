@@ -2,7 +2,8 @@
 
 기준일: 2026-10-06. 조사 기준은 PR #20의 `f442c41aa6f1885d4ae06aab874420a4cd8f7062`다.
 이 문서는 사용자 요청으로 일반 기법과 RoveZero 적용 가설을 분리한 설계·코드 리뷰 기준이다.
-이번 문서 작성은 엔진 코드·Cargo·CI·모델·실행 옵션의 변경이나 성능 실험을 포함하지 않는다.
+초기 문서 작성은 엔진 코드·Cargo·CI·모델·실행 옵션의 변경이나 성능 실험을 포함하지 않았다.
+후속 사용자 배정의 실제 source·수명 수정·독립 측정·처리 상태는4.4~4.27에 구분해 기록한다.
 후속으로 배정되는 소스 변경은 이 기준과 기존 역할·계약·검증 절차를 함께 따른다.
 
 [AGENTS](../../AGENTS.md), [CONTRIBUTING](../../CONTRIBUTING.md),
@@ -1246,6 +1247,368 @@ collection**이다. 세 allocator trace·CPU setup·두 GPU 수치 검사는 성
 allocator 한 변수, immutable 모델 mmap, 기존 I/O Binding/CUDA Graph의 실제 효과 인수다.
 관측 lock 경합·표본 분포·장비 capability에 따라 나머지 MEM 후보의 구체 적용 여부를
 기록한다. 두 CPU HOLD와 수치 gate 완료를 남은 최적화 전체 완료로 보고하지 않는다.
+
+### 4.20 Tree 저장소와 정확한 child index: CPU 이득과 GPU 보류 구분
+
+<a id="tree-storage-index-ab"></a>
+
+총괄의 후속 인수는 같은 정책의 저장 표현만 바꾼 E 실험이다.
+`experimental-flat-edges`(source `46983f8`), `experimental-compact-child`
+(`b78b15b`), `experimental-backup-scratch`(`b909f1d`)는 각각 독립 feature이며 기본 off다.
+루트0·정확한 child index·합법 수 순서·f64 계산 순서·최종 `visits`를 유지한다.
+
+평탄화는 각 node의 edge 목록을 전체 Vec의 start/len으로 표현한다. 최대 node/edge/depth
+admission과 실패 원자성을 유지하며 재할당되는 요소의 포인터를 보관하지 않는다.
+Compact child는 `Option<usize>`를 `Option<NonZeroUsize>`로 바꾼다. 실제 index를 그대로
+저장하고 0만 거부한다. 오프셋·정수 축소·bit truncation은 없다. 1·255·256·65535·65536·
+`usize::MAX`와 None 복원을 검사했다. 이번 x86_64 target에서 child 필드는16→8B,
+`Edge<Move>`는48→40B다. 임의 모델·ABI의 크기 보장으로 확대하지 않는다.
+
+Scratch는 실제 선택 경로에 한정한 `(node, edge, EdgeStats)` staging을 owner가 보관한다.
+`mem::take`로 소유권을 옮기고 final admission 이후 같은 순서로 commit한다. 취소·만료·
+late·overflow·admission 거부 시 staging을 clear/return하며 기존 통계를 수정하지 않는다.
+reset에 남는 capacity와 최종 Tree Drop의 회수를 구분한다.
+
+별도 Rust allocator trace는 기존 System에 위임하며 timing과 분리했다.
+여섯 합성 tree, 너비2/4/8/16/32/64, 각4096 완료 방문을 고정했다. 실제 Rules/C/D/B의
+독립 witness도 No·Repeat에서 byte-identical이다. trace는 Rules·NN·GPU·native malloc을
+계측하지 않는다.
+
+| arm | trace 할당 호출 | 누적 요청 bytes | 닫힌 구간 새 live peak bytes | 최종 잔류 bytes |
+|---|---:|---:|---:|---:|
+| baseline | 445,486 | 89,335,044 | 12,784,656 | 0 |
+| flat edges | 425,015 | 162,467,460 | 25,364,496 | 0 |
+| compact child | 445,486 | 85,269,812 | 10,686,992 | 0 |
+| backup scratch | 420,934 | 85,566,764 | 12,784,736 | 0 |
+
+Flat의 가장 넓은 입력은 전체 Vec capacity가 경계를 넘어 두 배로 성장했다. reset 뒤
+25,362,448B가 남았고 baseline은196,624B였다. 할당 호출 감소를 메모리 감소로 해석하지 않는다.
+Scratch의 reset 보존 증가량은 이번 입력에서80~120B지만 전체 peak 효과는 별도 실측한다.
+
+CPU 성능은 hook 없이 각 실행3,145,728 완료 방문(여섯 tree×4096×128), 후보별3쌍으로
+고정했다. CPU2·high=max512MiB·swap0·pids128·AS2GiB·실행120초/정리30초다.
+전체 시작→작업→정상 종료→report/cgroup 영수증의 시간과 cgroup peak를 사용한다.
+
+| 후보 | 전체 시간 합계비 T1/T0 | primary peak 관측 합계비 P1/P0 | 판정 |
+|---|---:|---:|---|
+| flat edges | 0.865199 | 1.953355 | HOLD: peak 증가 |
+| compact child | 0.949556 | 0.848415 | CPU Pareto 문턱만 통과 |
+| backup scratch | 1.035549 | 1.010700 | HOLD: peak·일부 쌍 시간 증가 |
+
+Compact의 CPU 통과는 target GPU 채택과 다르다. 같은 `b78b15b`의 독립 두 바이너리로
+BT4·FP32·TF32 off·No·B1·원래 PUCT/`visits`, production UCI를 실제 실행했다.
+시작 상태의 **비루트 완료 방문2048**, configured simulation 상한4096, movetime180초를
+고정했다. 이 입력은 모든 방문이 NN backup이며 root 초기화1회·완료 비루트 NN backup2048·
+runtime computed2049를 각각 확인했다. 실제 `info nodes`나 독립 physical invocation journal이
+없는 경우 그 값을 임의 대입하지 않는다. 모든 착수는 `d2d4`이며 native drain/exit0이다.
+
+컨디셔닝 A0/B0 뒤 `A1 B1 B2 A2 A3 B3` 세 쌍의 전체 시간비는1.062284,
+cgroup peak 관측 합계비는0.995925, baseline 시간 spread는3.423896초다.
+GPU 효과는 **HOLD**이며 기본값을 승격하지 않는다. 서로 다른 작업량 controller의
+사전 실패·root count 해석 오류·컨디셔닝은 제외 자료로 보존한다. CUDA placement의687
+node는 NN 실행 횟수가 아니다. VRAM/Windows commit peak는 unknown, 강도 대국은 미실행이다.
+
+Search default/개별/all-feature, UCI 소비자·취소·수명 검사와 strict Clippy/fmt를 통과했다.
+원시 자료는 `${ARTIFACT_ROOT}/reports/coordinator-integration/` 아래
+`pr20-flat-edge-storage-20261006/`, `pr20-compact-child-20261006/`,
+`pr20-backup-scratch-20261006/`에 보존한다.
+
+### 4.21 System·mimalloc·jemalloc·gperftools TCMalloc 단일 변수 대조
+
+<a id="allocator-fixed-work-ab"></a>
+
+`b78b15b`의 **같은 System baseline binary**를 사용하고 Linux child의 `LD_PRELOAD`만
+바꿨다. 제품 GlobalAlloc/Cargo 의존성·전역 환경·ORT·CUDA allocator를 변경하지 않았다.
+CPU 작업량·primary cgroup peak·자원/유한 종료 조건은4.20과 같다. 라이브러리·Ubuntu
+패키지 hash, 버전과 라이선스를 저장소 밖에 고정했다.
+
+mimalloc은2.1.2+ds-2(MIT), jemalloc은5.3.0-2build1(BSD-2-Clause 등 포함 고지),
+gperftools TCMalloc은2.15-3build1(BSD-3-Clause)다. 배포판 packaging의 GPL-2+ 고지는
+별도로 보존하며 package/library를 제품에 재배포하지 않는다. 여기서 검사한
+gperftools의 thread-cache TCMalloc은 별도의 현대 Google per-CPU TCMalloc과 구분한다.
+[jemalloc 고정 원문](https://github.com/jemalloc/jemalloc/tree/5.3.0)과
+[gperftools 고정 원문](https://github.com/gperftools/gperftools/tree/gperftools-2.15)을 따른다.
+
+실제 Rules/C/D/B witness의 No·Repeat 출력은 모두 동일하다. Rust trace의 요청 할당 수·
+누적 bytes·닫힌 구간 잔류도 System과 같다. 이는 실제 allocator 내부 reserved bytes가
+같다는 뜻이 아니다. jemalloc/TCMalloc은 실제 Rust trace/perf 바이너리의 ELF
+`malloc/calloc/realloc/free/posix_memalign` binding을 별도 진단에서 확인했다.
+초기 Python dladdr probe는 Python 실행 파일의 심볼을 관측하므로 Rust interposition
+증거로 사용할 수 없었다. 이 setup 진단은 성능 합계에서 제외한다.
+
+| 후보 | CPU 전체 시간 합계비 | primary peak 관측 합계비 | 판정 |
+|---|---:|---:|---|
+| mimalloc | 0.928081 | 1.073640 | HOLD: 모든 peak 증가·한 쌍 시간 증가 |
+| jemalloc | 0.947685 | 1.352048 | HOLD: 모든 peak 증가 |
+| gperftools TCMalloc | 0.847962 | 1.964236 | HOLD: 모든 peak 증가 |
+
+mimalloc은 독립3쌍이다. jemalloc/TCMalloc은 `A1 J1 T1 T2 J2 A2 A3 J3 T3`의
+물리9회에서 control3개를 공유한다. 두 후보를 서로 독립된 control6회로 세지 않는다.
+System보다 빠르다는 관측만으로 메모리 최적화를 승인하지 않는다. CPU gate가 실패해
+native ORT/GPU allocator 효과 측정과 제품 allocator 교체는 진행하지 않았다.
+CPU witness에 포함된 thread 경계를 native CUDA allocator의 cross-thread free 증명으로
+확대하지 않는다.
+
+모든 인정된 timed 실행은 정상 exit·max/OOM·강제 정리·소유 잔류0이며 자동 튜닝·재시도는
+없다. 원시 자료는 `pr20-mimalloc-20261006/`, `pr20-allocator-remaining-20261006/`에 둔다.
+
+### 4.22 Immutable 모델 mapping의 실제 capability 제한
+
+<a id="immutable-mapping-capability"></a>
+
+모델 mmap은 mutable 파일의 변경·잘림을 read-only view만으로 막을 수 없으므로,
+먼저 owned64KiB fixture에서 write/grow/shrink/seal을 고정한 memfd와 fs-verity를 조사했다.
+WRITE/GROW/SHRINK/SEAL의 적용 및 pwrite·grow·shrink·shared-write의 EPERM은 확인했다.
+그러나 해당 환경의 sealed descriptor에 대한 `mmap ACCESS_READ`는 EPERM으로 실패했고,
+owned filesystem의 fs-verity ioctl은 EOPNOTSUPP(errno95)였다. 최초 syscall 거절의
+원인은 unknown이며 일반 Linux 전체의 미지원으로 확대하지 않는다.
+
+readonly mapping이 생성되지 않아 view 수명 검사는 미실행이다. finally에서 FD는 닫혔다.
+BT4·ORT·성능 측정은 실행하지 않았고, 보호가 약한 파일 mapping·원본 변경 허용·전역
+mount/kernel 조정으로 우회하지 않았다. **환경 capability HOLD**로 종료한다.
+[fs-verity 문서](https://docs.kernel.org/filesystems/fsverity.html)와
+[memfd 문서](https://man7.org/linux/man-pages/man2/memfd_create.2.html)의 보호 조건을 유지한다.
+NUMA possible node는0, THP는 `madvise`, shmem THP는 `never`, reserved huge pages는0을
+관측했다. 이 관측은 환경 설정 변경이나 hugepage 효과 인수가 아니다.
+`pr20-mmap-feasibility-20261006/report.json`은 성능 합계에서 제외한다.
+
+### 4.23 I/O Binding 변수 수명 수정과 실제 B1 효과 보류
+
+<a id="binding-lifetime-fixed-work"></a>
+
+기존 고정 I/O Binding의 실행 인수에서 `446c281`의 GPU 수치 검사가 SIGSEGV로 종료했다.
+Max/OOM 계수는0이다. bounded gdb에서 `Tensor::copy_into → IoBinding::bind_output_mut`
+경계의 native allocator callback 사용을 확인했다. GPU 수치 부족·메모리 부족으로 숨기지 않았다.
+
+고정 의존성 `ort 2.0.0-rc.10`과 ORT1.22.0 source를 직접 대조했다. 다음 세 소유 경계를
+`ac6ab03`, `be789c6`에서 수정했다.
+
+| 경계 | 최종 소유·해제 규칙 |
+|---|---|
+| allocator-backed tensor | BoundBuffers가 allocator를 마지막 필드로 보유. 중간 생성 실패에도 binding/tensor가 먼저 Drop |
+| synchronous copy helper | process-global `Tensor::copy_into` helper 대신 owner 내부의 작은 ONNX Identity copy session/binding. 성공한 copy/fence 뒤 alias clear; 실패 시 quarantine owner가 보존 |
+| fixed native output | caller가 이미 소유한 고정 output을 직접 읽음. thin native RunWithBinding 경계가 중복 GetBoundOutputValues를 취득하지 않음 |
+
+ORT1.22.0의
+[GetBoundOutputValues 구현](https://github.com/microsoft/onnxruntime/blob/v1.22.0/onnxruntime/core/session/onnxruntime_c_api.cc#L901-L932)은
+각 output의 새 native OrtValue를 반환한다. Rust rc.10의 fixed-output 경로가 그 native
+복제본을 Rust alias로 대체한 뒤 pointer-array만 회수하는 접점을 피했다.
+새 FFI는 `rz-native-loader`의 기본 off `ort-bindings` feature에 한정한다.
+Eval의 unsafe 금지는 유지한다. matching API의 native status를 RAII로 한 번만 release하고
+원래 error code와 native message를 최대1024-byte 읽어 복사하고 truncated 표식을 남기는
+CPU 검사를 추가했다.
+기존 workspace의 ORT 버전을 재사용하며 새 package/version이나 backend를 추가하지 않는다.
+Binding profile identity만 `synchronous-owned-onnx-identity-v2`로 구분하고 B1 기본 profile은 유지한다.
+
+`be789c6`의 실제 RTX4050·원본 BT4 ONNX·FP32·TF32 off 수치 검사는12개 독립 입력과
+batch1/2/4/8/16, 반복B1 32회·retained output 불변·정상 native exit를 통과했다.
+기존 raw logits atol1e-4/rtol1e-3, legal policy/WDL max abs1e-4를 유지했다.
+실제 CUDA fault injection 전체나 native allocator 내부의 완전한 안전성 증명은 아니다.
+
+효과 cohort는 Graph=false의 **별도 binding family**다. warm3·timed20·B1, exact start input,
+cache/dedup/reuse off·원본 ONNX·기본 CPU arena를 양쪽에 고정했다.
+Variant마다 provider probe binding1회와 warm+timed binding23회(총24회)를 따로 기록한다.
+NN 입력20개는 모두 실제 완료되며 동일 input/output digest다. 정상 backend 파괴와
+process exit·pipe/report·마지막 cgroup 영수증까지 시간을 포함한다.
+
+| 쌍 | 기준 전체 시간 초 | Binding 시간 초 | T1/T0 | VmHWM 관측비 P1/P0 |
+|---|---:|---:|---:|---:|
+| 1 | 17.434344 | 19.496241 | 1.118266 | 1.000949 |
+| 2 | 16.454910 | 16.466689 | 1.000716 | 1.001327 |
+| 3 | 22.112330 | 19.806764 | 0.895734 | 1.000019 |
+
+시간 합계비0.995859·primary process VmHWM 관측 합계비1.000765, baseline 시간 spread5.657420초다.
+모든 쌍의 primary peak가 증가하고 시간 차이가 일정하지 않아 **HOLD**다.
+Model 준비가 포함된 B1 전체 시간과 NN latency P50/P95를 분리해 기록했다. 한 쌍의
+P95 감소나 반복 Run 수만으로 전체 최적화를 채택하지 않는다.
+자원은 CPU2·high6GiB/max12GiB·swap0·pids128·AS128GiB·실행300초/정리30초다.
+컨디셔닝 A0/B0은 합계에서 제외한다. 전역 host 독점 여부는 unknown이고 작은 Windows
+Python 정확성 검사가 cohort 일부와 겹쳤음을 보존한다. 이를 청정 정식 성능 증거로 승격하지 않는다.
+VRAM/Windows commit peak는 unknown이다.
+
+초기 controller의 XDG cache 환경 누락은 native 실행 전 setup 실패로 별도 보존했다.
+CPU all-feature 빌드의 최초 SIGBUS도 max/OOM0으로 기록하고 같은 source/자원에서
+bounded continuation이 통과했음을 구분한다. 원인은 unknown이다.
+수치/실패/FFI build 증거는 `pr20-binding-graph-20261006/`,
+`pr20-binding-lifetime-20261006/`, `pr20-binding-owned-copy-20261006/`,
+성능 cohort는 `pr20-binding-fixed-work-20261006/`에 보존한다.
+
+### 4.24 CUDA Graph 종료 실패를 숫자 성공과 분리
+
+<a id="cuda-graph-native-exit-hold"></a>
+
+`be789c6`의 fixed CUDA B1 Graph는12개 input·retained output 수치 검사와 backend Drop 뒤
+report의 `passed`까지 도달했지만 process 종료 중 SIGABRT로 끝났다.
+`malloc(): unsorted double linked list corrupted`가 발생했다. cgroup peak1,750,990,848B,
+high/max/OOM0·강제 정리/소유 잔류0이다. 수치 report는 정상 process 종료 영수증이 아니다.
+
+한 번의 bounded gdb 진단에서도 target의 SIGABRT를 재현했다. 관측 stack은 glibc allocator
+검사→cuDNN precompiled-engine→exit handler다. 최초 heap 손상 지점은 unknown이며
+특정 Rust 쓰기 또는 cuDNN 자체의 결함으로 확정하지 않는다.
+Debugger 자체 exit0·raw diagnostic accepted 필드와 target 실패를 별도 interpretation JSON으로
+구분하며 성능 ledger는 모든 diagnostic을 거부한다.
+
+Graph 성능 A/B는 시작하지 않았다. `8ebd900`부터 현재 pinned runtime의 Graph 요청은
+BackendUnavailable/Admission으로 명시적으로 거부한다. 고정 B1·feature가 있어도 이 guard를
+우회하지 않는다. Graph를 몰래 끄거나 native owner를 영원히 유지하거나 destructor를 건너뛰어
+성공으로 만들지 않는다. I/O Binding의 독립 profile과 기본 엔진은 영향을 받지 않는다.
+[ORT CUDA EP 조건](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html)에 맞는
+shape/address·single session 조건과 실제 capture/replay 증거, 정상 native exit를 모두 확인한
+새 단일 변수 수정이 나오기 전까지 **정확성/수명 HOLD**다.
+옵션 true·binding run count·좋은 출력만으로 capture/replay 성과를 주장하지 않는다.
+
+### 4.25 완료 알림의 독립 production UCI fixed-work 대조
+
+<a id="notification-fixed-work-ab"></a>
+
+55개 처리 표의 마지막 대조에서 알림은 CPU lost-wakeup·deadline·취소 인수와 실제
+native 효과가 구분돼야 함을 확인했다. 측정 전까지 효과 미측정인 상태를 실측 HOLD로
+표기하지 않는다. 다음 실행은 source `8ebd900`의 동일 frozen tree에서
+`onnx-cuda`와 `onnx-cuda,experimental-notify`만 각각 빌드한 별도 E 대조다.
+
+같은 runtime/model/encoding·BT4 FP32·TF32 off·No·B1·온도1·PUCT/visits를 유지했다.
+Production UCI의 `go nodes 2048 movetime 180000`, configured 상한4096이다.
+양쪽 모두 root 초기화1회·비루트 완료 NN backup2048·runtime completed2049·동일
+착수 `d2d4`를 확인했다. Terminal backup은0이다. 독립 physical journal과 stdout
+`info nodes`가 없으므로 해당 값은 unknown/null 그대로다. Cache·batch·reuse·Binding·
+Graph·새 tree 표현은 끄고, publication 이후 owner의 1ms polling/wait 접점만 바꿨다.
+단일 pending과 충분한 deadline의 이 fixed-work 결과를 같은 시간의 기력으로 확대하지 않는다.
+
+측정 전 해당 feature만 켠 CPU UCI89개·all-target strict Clippy를 통과했다.
+알림 sequence는 pump 전에 읽고, 완료/취소 신호가 그 사이에 오면 blocking하지 않는다.
+신호는 결과 자체나 GPU fence가 아니며 정상 runtime 소비와 물리 drain 증거가 필요하다.
+Runtime 완료·취소·대기 source를 수동 대조하고 기존 all-feature 수명 검사를 재사용했다.
+이 대조 중 새로운 CPU 정확성/성능 검사를 함께 실행하지 않았다. 전역 host 독점은 unknown이다.
+
+A0/B0 conditioning 뒤 `A1 B1 B2 A2 A3 B3`, 세 쌍은 다음과 같다.
+T는 모델 검증·준비→position→고정 방문→quit/native destruction→pipe/report/cgroup의
+전체 시간이며 primary P는 사전 등록한 전체 cgroup memory.peak다. Search 시간은 별도다.
+
+| 쌍 | 기준 전체 시간 초 | 알림 전체 시간 초 | T1/T0 | cgroup peak 관측비 P1/P0 |
+|---|---:|---:|---:|---:|
+| 1 | 45.230750 | 44.054998 | 0.974005 | 1.000870 |
+| 2 | 45.930331 | 43.839601 | 0.954480 | 0.945127 |
+| 3 | 45.473698 | 42.722316 | 0.939495 | 1.001312 |
+
+시간 합계비0.955957, peak 관측 합계비0.981723,
+baseline 시간 spread0.699582초다. 모든 시간 감소가 이번 spread보다 크지만
+두 쌍의 peak가 소폭 증가하여 all-pair Pareto를 만족하지 않고 20% memory 문턱도 실패한다.
+**효과 HOLD·기본 off**이며 소폭 증가를 모든 환경에서의 악화로 일반화하지 않는다.
+
+CPU2·affinity2·high6GiB/max12GiB·swap0·pids128·AS128GiB,
+각260초+정리30초·전체1200초를 등록했다. Conditioning 포함 실제8회는365.474577초,
+모두 exit0·high/max/OOM·강제 정리·소유 잔류0이다. VRAM/Windows commit peak는 unknown이다.
+원시 자료·명세·binary/feature/hash·phase 시간·정상 종료 receipts·독립 ledger는
+`pr20-notify-fixed-work-20261006/`에 보존한다.
+
+### 4.26 55개 MEM 기법의 현재 처리 상태와 재검토 조건
+
+<a id="mem-technique-disposition"></a>
+
+아래 표는3장의 **55개 기법을 빠짐없이** 실제 소유 경로·장비·측정과 대조한 처리 기록이다.
+`유지`는 이미 있는 구조의 확인, `실측 HOLD`는 문턱 실패, `검토 HOLD`는 현재 profile에서
+적용 근거나 전제가 부족한 후보, `별도 S`는 탐색/동시 실행 변경이다.
+검토 종료를 해당 기법의 구현·성능 성공으로 표현하지 않는다. 미래 하드웨어·workload·
+새 source에 다시 적용할 조건을 남기며 후보 자체를 삭제하지 않는다.
+
+| ID | 현재 처리와 근거 | 재검토 조건 |
+|---|---|---|
+| MEM-A01 | 유지: Tree의 Vec<Node>·index, worker 단일 owner. 개별 node 포인터 없음 | 별도 안정 주소가 필요한 소비자 등장 |
+| MEM-A02 | 실측 HOLD: flat edge의 capacity 성장·reset retention·peak 증가(4.20) | 청크/정확 capacity의 독립 변경과 같은 작업 A/B |
+| MEM-A03 | 검토 HOLD: selection/backup은 edge의 Move·prior/N/Q·child를 사용. trace 여섯 중 다섯 tree는 expanded4097/terminal0, expanded payload가 드물지 않음 | 실제 field 접근·cache-miss profile와 sparse cold 비율, sidecar 비용 포함 |
+| MEM-A04 | 검토 HOLD: 현재 객체 전체 edge scan/backup에 AoS 사용. 새 SIMD reduction 순서는 E 검증 전제 미충족 | 실제 scalar AoS/SoA의 모든 계산 순서·동률 일치 및 전체 A/B |
+| MEM-A05 | 실측 HOLD: 정확 NonZeroUsize child는 CPU Pareto 통과·GPU 문턱 실패 | 새 동일 작업 GPU 반복과 안정된 CPU 이득; index 전체 범위 보존 |
+| MEM-A06 | 검토 HOLD: node Expanded는 위 trace에서 흔함. Native 실패 slot은 실행 전 무할당 예약으로 오류 보존 | 드문 payload 분포와 부분 실패 Drop/receipt 예약을 보존하는 표현 |
+| MEM-A07 | 확인: child/Edge 실제 target 크기·정렬 측정, native Drop 순서 수정 | layout 감소와 ABI·Drop·양쪽 target 검증; 필드 재배치 단독 A/B |
+| MEM-A08 | 검토 HOLD: one physical writer, false sharing 관측 없음. 일괄 padding은 footprint 증가 | 실제 두 writer의 perf c2c/경합 증거 |
+| MEM-A09 | 유지: generic Tree<M,P>/PUCT·Rules의 정적 dispatch | 측정한 virtual-call hot path; code size/compile 비용 포함 |
+| MEM-A10 | 검토 HOLD: raw LRU 기본64·상한1024, 정확 input 비교와 eviction이 필요 | lookup 비중·분포 측정 후 hash collision/full-input 대조 포함 |
+| MEM-B01 | 실측 HOLD: 모델8-frame inline history의 CPU 결과(4.19) | 더 큰 projection 크기 포함 새 동일 작업 A/B |
+| MEM-B02 | 검토 HOLD: 기존 frame 상한 구현으로 무할당/overflow 처리; ArrayVec 중복 도입 근거 없음 | 새로운 엄격 상한 자료형과 MSRV/오류 의미 |
+| MEM-B03 | 검토 HOLD: 최대 합법 수를 node마다 inline으로 예약하면 live 객체가 커짐 | 실제 길이·spill·동시량 분포로 N 선택; 초과 절단 금지 |
+| MEM-B04 | 유지/검토 HOLD: 실제 필요량 reserve. flat 전체 Vec의 과예약이 peak를 키움 | 정확 growth/capacity 한 변수와 allocation 실패 원자성 |
+| MEM-B05 | 실측 HOLD: backup scratch의 할당 감소와 peak/시간 효과 불일치(4.20) | 다른 실제 path 분포; bounded reset retention까지 포함 |
+| MEM-B06 | 검토 HOLD: 고정 합법 목록 Box slice의 새 변환/enum layout 비용은 미측정 | 실제 여유 capacity·재할당·node size·전체 시간 A/B |
+| MEM-B07 | 유지/검토 HOLD: 스트리밍 read와 단일 policy 생성은 기존 경로; unsafe uninit 추가 안 함 | 측정된 중복 초기화가 남아 있고 partial initialization Drop을 증명할 때 |
+| MEM-B08 | 실측 HOLD: policy buffer(4.19)·입출력 재사용(4.4/4.9)의 독립 결과 | 물리 완료와 반환 소유권을 유지한 새 단일 변수 효과 |
+| MEM-C01 | 확인/실측 HOLD: 원본 모델 소유권 이동·조기 drop은 유지. raw head borrow와 binding alias는 정상 소비 완료까지 pin | 실제 clone 비용·외부 소비자 수명·Drop 증거 포함 |
+| MEM-C02 | 검토 HOLD: 매 traversal에서 상태와 path가 달라짐. Cow는 거의 항상 owned 변환 가능 | 읽기-only 비율과 backing retention이 실제 이득일 때 |
+| MEM-C03 | 확인/실측 HOLD: thread 경계 Arc 유지; RawOutput 공유 CPU 효과 HOLD(4.17/4.18) | 동일 workload 새 A/B, cross-thread 마지막 owner 검사 |
+| MEM-C04 | 검토 HOLD: input/output의 정확 typed Arc/소유 buffer 사용. 작은 view의 장기 원본 retention은 금지 | 큰 payload 여러 view의 실제 동시량·회수 시점 증거 |
+| MEM-C05 | 검토 HOLD: flat Vec로 tree region 후보 대조 완료, 별도 bump는 Vec/Arc/native Drop 책임을 추가함 | 충분한 짧은 동질 allocation과 destructor-aware arena/오류 인수 |
+| MEM-C06 | 확인/검토 HOLD: search/root·worker/native·runtime pin·report 수명을 구분. region 추가 자체의 절약 미측정 | 회수 지연량·allocator 청크 낭비의 실제 증거 |
+| MEM-C07 | 검토 HOLD: one-shape binding·bounded scratch의 재사용 실험 완료. 동적 node 삭제/free-list 없음 | 실제 반복 생성/삭제와 generation/ABA 안전성 |
+| MEM-C08 | 검토 HOLD: 물리 worker1, 새 thread별 pool의 추가 재고·cross-thread 회수 효과 미확인 | 다중 producer 실제 allocation/free topology와 상한 |
+| MEM-C09 | 유지/실측 HOLD: 가중치 streaming·serialized model 조기 drop 유지, snapshot/cache hint/reader의 효과 문턱 보류(4.5~4.13) | 같은 모델·작업량·primary peak 새 A/B; 최종 native 참조까지 보존 |
+| MEM-C10 | 유지: request/root/game generation 검증·ucinewgame 초기화. tag만 바꾸고 자원을 누락시키는 reset 금지 | 큰 clear hotspot 측정·wrap/stale/Drop 의미 유지 |
+| MEM-D01 | 유지: SingleWorker의 one-owner·one physical execution | 새 실제 동시 writer 및 별도 계약 |
+| MEM-D02 | 확인: native owner의 reservation lock을 prepare/native Run 전에 release. prepared memo의 one-slot lock은 miss 계산을 직렬화 | 실제 lock 보유/대기 비중, version·오류 순서 보존 |
+| MEM-D03 | 검토 HOLD: serial B1의 독립 producer/경합 관측 없음. LRU hit는 쓰기·순서 갱신 | 실제 경합과 shard별 용량/eviction 의미 |
+| MEM-D04 | 검토 HOLD: sync_channel(1)·shutdown/reaper·lease가 이미 bounded. SPSC 전제 미검증 | producer topology·close/full/cancel/late를 보존한 별도 대조 |
+| MEM-D05 | 검토 HOLD: consumer1/physical execution1에 MPMC 추가 근거 없음 | 실제 다중 consumer와 memory/ordering 인수 |
+| MEM-D06 | 유지/검토 HOLD: 일반 대국 상세 telemetry off·작은 종료 receipt 유지; 제어 counter 지연 합산 안 함 | 실제 통계 atomic 경합; 관측용 값만 분리 |
+| MEM-D07 | 확인: IDLE/BUSY/CLOSED/QUARANTINED publication은 Release/Acquire·CAS AcqRel 필요 | 개별 happens-before 근거·ISA별 효과, 일괄 Relaxed 금지 |
+| MEM-D08 | 실측 HOLD: sequence/Condvar·lost-wakeup/취소/마감 인수와 독립 native 세 쌍(4.25) | 시간 감소 신호와 peak 문턱을 모두 만족하는 새 fixed-work 증거 |
+| MEM-D09 | 검토 HOLD: memo/cache hit가 slot/LRU를 갱신하므로 read-only snapshot 전제 부족 | read-mostly hot 구조와 느린 reader의 retention 상한 |
+| MEM-D10 | 검토 HOLD: 비원자 snapshot/pointer의 data race를 재시도로 고치지 못함 | 작은 Copy snapshot·모든 원자 접근·수명/병목 근거 |
+| MEM-E01 | 수정/실측 HOLD: allocator·copy binding·native output 수명 수정, 실제 B1 효과(4.23) | 같은 source/모델의 안정된 전체 시간·peak A/B |
+| MEM-E02 | 별도 S/검토 HOLD: serial B1은 독립 다음 leaf가 준비되지 않음. pinned RAM·async lease 인수 없음 | 실제 독립 transfer/compute, 물리 event·cancel·pinned 상한을 별도 실험 |
+| MEM-E03 | 별도 S/검토 HOLD: buffer 수 증가만으로 overlap 보장 못 함; speculative selection은 S | dependency-safe overlap·같은 완료 순서 또는 새 S 품질 평가 |
+| MEM-E04 | 검토 HOLD: RTX4050의 반복 tensor 읽기를 mapped host로 옮기는 것은 PCIe 경로 변경 | 작은 한 번 읽는 workload·실제 capability·수치/성능 대조 |
+| MEM-E05 | 유지/검토 HOLD: ORT CUDA arena 상한·SameAsRequested 유지. 외부 stream pool로 opaque native buffer 회수 안 함 | 동일 pinned provider의 실제 allocator 지원·fence/reserved 증거 |
+| MEM-E06 | 검토 HOLD: ORT가 관리하는 내부 tensor workspace의 liveness를 외부에서 알 수 없음 | 지원된 planning API·alias proof·dynamic shape/실패 인수 |
+| MEM-E07 | 정확성 HOLD: native exit SIGABRT 재현 후 현재 Graph admission 거부(4.24) | 최초 손상 원인 수정·정상 exit·실제 capture/replay·독립 A/B |
+| MEM-F01 | 유지: 제품 System, 실험 control 출처/버전 보존 | 새 장비·allocation topology에서 다시 control 확보 |
+| MEM-F02 | 실측 HOLD: CPU 시간 이득과 peak 증가(4.21) | 실제 memory gate·native 수명·host/device allocator 별도 인수 |
+| MEM-F03 | 실측 HOLD: jemalloc5.3 CPU peak 증가(4.21) | 튜닝 한 변수의 새로운 사전 등록; 전역 교체 금지 |
+| MEM-F04 | 실측 HOLD: gperftools2.15 CPU peak 증가. 현대 Google 구현은 별도 미실행 | 구현/ISA·CPU cache 정책을 잠근 새 workload, native 경계 확인 |
+| MEM-G01 | 환경 HOLD: sealed readonly mmap EPERM·fsverity EOPNOTSUPP(4.22) | 안전한 immutable mapping capability가 있는 지정 환경 |
+| MEM-G02 | 검토 HOLD: reserved hugepages0·THP madvise, TLB 병목 미관측 | 사용자 범위의 owned mapping capability·TLB 효과; 전역 설정 안 바꿈 |
+| MEM-G03 | 현재 조건 비해당: NUMA possible node0. CPU2 affinity는 모든 대조에 동일 | 실제 다중 NUMA target과 first-touch/remote-access 증거 |
+| MEM-G04 | 검토 HOLD: edge 전체 선택 scan/이력 순서 유지. flat 지역성 실험도 peak HOLD | cache-miss·대역폭 profile와 정답/오류/계산 순서가 같은 재배치 |
+| MEM-G05 | 검토 HOLD: 대표 training/holdout compiler profile 없음. LTO/PGO/inline 효과를 추정하지 않음 | 별도 source/ISA·binary/profile digest·고정 workload 단일 compiler 옵션 대조 |
+| MEM-G06 | 유지/실측 HOLD: exact prepared memo·raw cache의 key/encoded/history/version 일치와 한 번 소비를 검사 | 새 hit/miss 분포·bounded retained/eviction·fixed visit 효과 인수 |
+
+표의 검토 HOLD는 효과가 없다는 실측 결론이 아니다. 현재 전제에서 무차별 구현을
+추가하지 않는 처리다. 모델 압축·새 backend·FP16·quantization·Graph bypass·engine 간
+session 공유·온라인 학습·게임 간 reuse는 이 E 인수에 포함하지 않았다.
+B1/B4 batching은 S 실험이고 기력은 paired 대국으로 별도 판단한다. CPU maturin 성능
+PoC는 사용자가 실행하는 기존 구분을 유지한다. CPU CI가 그 성능·GPU·대국을 대체하지 않는다.
+
+### 4.27 누적 증거와 인수 종료 범위
+
+<a id="memory-optimization-closeout"></a>
+
+이전17개 series와 모든 입력 ledger SHA·집계의 일치를 먼저 확인하고 새9개 비교를 더한
+중간66개 snapshot을 보존했다. 이어 알림3쌍을 추가할 때 그20개 series와 입력 hash/집계도
+완전히 같음을 확인했다. 현재 **69개 비교·고유129회·공유 control9개·21개 series·
+제외68개 collection**이다. source/environment epoch를 유지하며 서로 다른 작업·peak를
+하나의 개선률로 만들지 않는다. 독립 peak 관측의 합계는 동시 RAM·Windows 전체 commit이 아니다.
+
+`memory_evidence.py`는 새로운 Binding/Graph family에만 단일 옵션의 닫힌 validation을
+적용한다. provider probe와 timed work, typed flags·CUDA 배치·원본/derived model·정확한
+input/output hash를 확인한 뒤에만 controlled flag를 fixed-work 비교에서 정규화한다.
+다른 옵션이나 reversed/two-baseline pair·false physical completion·probe 대체·잘못된 graph
+capture 주장·진단 실행은 거부한다. 기존 ledger의 compatibility fingerprint는 그대로다.
+
+`8ebd900`에서 native-loader/eval/UCI all-feature·개별 Binding·example·strict Clippy/fmt를
+통과했다. [CPU CI37458430373](https://github.com/daejunnom/RoveZero/actions/runs/37458430373)의
+Ubuntu·Windows·bindings 세 job SUCCESS를 확인했다. Local Python memory evidence29개,
+전체 runtime helper41개 검사도 통과했다. CI의 CPU binding 정확성은 사용자 수행 maturin
+성능과 구분한다. GPU 수치/효과 source `be789c6`와 Graph guard source `8ebd900`을 구분한다.
+
+현재 장비/profile에 적용 가능한 선택 후보의 구현·의미/수명 확인·단일 변수 측정·부정적
+결과 보존 및 전체55개 기법의 적용 전제·처리 결과를 이 기록에서 마감한다. **새 기본값 승격은 없다.**
+Native Graph 최초 손상 지점·복사형 ORT heap 원인·mmap capability·미관측 VRAM/Windows peak는
+해결했다고 보고하지 않으며 명시한 HOLD와 재검토 조건을 유지한다. 정식 강도·배치 기본값·
+모델/엔진 승격도 이 메모리 실험의 완료 범위가 아니다.
+
+누적 보존·동일성·setup/정확성/Graph 실패는
+`${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-optimization-closeout-20261006/`의
+중간 `cumulative-total.json`·`cumulative-verification.json`, 최종
+`cumulative-final.json`·`cumulative-final-verification.json`에 있다. 원시 자료는 각 원래
+report 경로에 그대로 둔다. protected 문서 WIP·공통 계약 revision·AGENTS/CONTRIBUTING은
+변경하지 않는다. PR #20은 develop 대상 Draft이며 실제 merge는 별도 인수다.
 
 ## 5. 후속 구현·검증 순서
 
