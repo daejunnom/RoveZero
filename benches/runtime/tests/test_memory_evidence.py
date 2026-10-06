@@ -87,6 +87,36 @@ class Accounting(unittest.TestCase):
         self.assertEqual(result["duplicate_comparisons_skipped"], 1)
         self.assertEqual(result["unique_compared_physical_runs"], 2)
 
+    def test_owned_ort_checks_actual_provenance_retention_and_independent_flags(self):
+        result=self.pin(dict(accepted=True,exit_code=0,conditioning=False,
+            forced_cgroup_cleanup=False,remaining_after_cleanup=[],source_commit="source0",
+            elapsed_s=10,cgroup={"memory.events":"max 0\noom 0\noom_kill 0\n"}))
+        derived=self.pin(dict(schema=1,source_onnx_sha256="model",source_export_manifest_sha256="manifest",
+            ort_sha256="derived",ort_bytes=80,runtime_core_sha256="core",runtime_bundle_sha256="bundle",
+            runtime_version="1.22.0",optimization_level=1,provider="cuda",precision="fp32",tf32=False,redistribution_ready=False))
+        report=dict(accepted=True,failure=None,kind="b1_owned_ort_fixed_work",zero_copy_ort=True,
+            cpu_ep_fallback=False,reuse_buffers=False,disable_cuda_cpu_arena=False,
+            batches=[1],warmup_runs=3,measured_runs=20,
+            samples=[dict(completed_nn_items=20,physical_completion_confirmed=True)],memory={"self_vm_hwm":"100 kB"},
+            input_sha256="input",output_sha256="output",model_sha256="model",export_manifest_sha256="manifest",
+            runtime_bundle_sha256="bundle",precision="fp32",history_fill="no",tf32=False,cache=False,dedup=False,
+            io_binding=False,cuda_graph=False,serialized_model_sha256="derived",derived_manifest_sha256=derived["sha256"],retained_model_bytes=80)
+        item=dict(layout="inference",result=result,report=self.pin(report),reuse_buffers=False,zero_copy_ort=True,derived_manifest=derived)
+        self.assertEqual(module.observation(self.root,item,"process_vm_hwm_bytes")["peak_bytes"],102400)
+        for changes in ({"zero_copy_ort":False},{"cpu_ep_fallback":True},{"disable_cuda_cpu_arena":True},
+            {"reuse_buffers":True},{"retained_model_bytes":0},{"serialized_model_sha256":"other"},
+            {"derived_manifest_sha256":"other"},{"model_sha256":"other"}):
+            with self.subTest(changes=changes),self.assertRaises(ValueError):
+                module.observation(self.root,dict(item,report=self.pin(dict(report,**changes))),"process_vm_hwm_bytes")
+
+    def test_ort_comparison_rejects_two_baselines_and_reversed_arms(self):
+        for a,b in ((False,False),(True,False),(True,True)):
+            pair=self.pair("ort",option="owned-ort-flatbuffer")
+            pair["baseline"].update(layout="inference",zero_copy_ort=a)
+            pair["variant"].update(layout="inference",zero_copy_ort=b)
+            with self.assertRaisesRegex(ValueError,"requires original baseline and direct variant"):
+                self.aggregate([pair])
+
     def test_arena_comparison_cannot_label_two_baselines_or_reversed_options(self):
         for baseline, variant in ((False, False), (True, False), (True, True)):
             pair = self.pair("arena", option="cuda-cpu-arena-off")

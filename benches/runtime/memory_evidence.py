@@ -127,6 +127,29 @@ def observation(root, item, peak_kind):
                 or report.get("cpu_ep_fallback") is not False
                 or report["reuse_buffers"] is not False):
                 raise ValueError("registered CUDA CPU arena option or fallback differs")
+        if "zero_copy_ort" in item or report.get("kind") == "b1_owned_ort_fixed_work":
+            if (type(item.get("zero_copy_ort")) is not bool
+                or report.get("kind") != "b1_owned_ort_fixed_work"
+                or report.get("zero_copy_ort") is not item["zero_copy_ort"]
+                or report.get("cpu_ep_fallback") is not False
+                or report.get("disable_cuda_cpu_arena") is not False
+                or report["reuse_buffers"] is not False):
+                raise ValueError("registered owned ORT option or other experiment differs")
+            derived = pinned(root, item["derived_manifest"])
+            if (derived["source_onnx_sha256"] != report["model_sha256"]
+                or derived["source_export_manifest_sha256"] != report["export_manifest_sha256"]
+                or derived["runtime_bundle_sha256"] != report["runtime_bundle_sha256"]
+                or derived["runtime_version"] != "1.22.0"
+                or derived["optimization_level"] != 1
+                or derived["provider"] != "cuda" or derived["precision"] != "fp32"
+                or derived["tf32"] is not False or derived["redistribution_ready"] is not False):
+                raise ValueError("derived ORT provenance differs")
+            expected_retained = derived["ort_bytes"] if item["zero_copy_ort"] else 0
+            if report.get("retained_model_bytes") != expected_retained:
+                raise ValueError("owned ORT lifetime/storage receipt differs")
+            if item["zero_copy_ort"] and (report.get("serialized_model_sha256") != derived["ort_sha256"]
+                or report.get("derived_manifest_sha256") != item["derived_manifest"]["sha256"]):
+                raise ValueError("actual ORT serialization identity differs")
     else:
         if peak_kind != "cgroup_memory_peak_bytes":
             raise ValueError("cgroup series must keep its registered whole-group peak")
@@ -187,6 +210,12 @@ def aggregate(root, ledger):
         compat = comparison["compatibility"]
         if set(compat) != COMPAT_KEYS or any(v is None for v in compat.values()):
             raise ValueError("complete compatibility dimensions required")
+        if (compat["option"] == "owned-ort-flatbuffer"
+            or any("zero_copy_ort" in comparison[side] for side in ("baseline", "variant"))):
+            if (comparison["baseline"].get("zero_copy_ort") is not False
+                or comparison["variant"].get("zero_copy_ort") is not True
+                or any(comparison[side]["layout"] != "inference" for side in ("baseline", "variant"))):
+                raise ValueError("owned ORT comparison requires original baseline and direct variant")
         if (compat["option"] == "cuda-cpu-arena-off"
             or any("disable_cuda_cpu_arena" in comparison[side] for side in ("baseline", "variant"))):
             if (comparison["baseline"].get("disable_cuda_cpu_arena") is not False

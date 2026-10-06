@@ -65,6 +65,30 @@ phase peak·live heap·cgroup file cache·VRAM·Windows commit과 구분한다.
 이 옵션은 ORT 내부 CPU allocator의 arena만 끄며 CPU node fallback 금지·CUDA 배치 증거·
 물리 완료 조건을 유지한다. 새 backend identity는 별도이며 기존 I/O 옵션의 identity는 보존한다.
 
+## Owned ORT flatbuffer 한 변수 연구
+
+`experimental-ort-model`은 기본 off이며 UCI·기존 B1 대국에 적용하지 않는다.
+`ort_export SOURCE ONNX EXPORT CUDA_CORE CUDA_BUNDLE NEW_ORT NEW_MANIFEST`로
+기존 CUDA FP32·TF32 off·Level1 경로에서 파생 모델을 별도 생성한다. 일곱 경로는
+절대 경로이고 두 출력은 저장소 밖의 새 파일이다. 변환·placement probe는 독립
+수치 인수를 대신하지 않는다. 원본 가중치·ONNX·export identity를 유지하고 파생
+ORT·manifest·export runtime을 추가로 식별한다.
+
+`maia_check`에 `--experimental-ort-model=ORT_ABSOLUTE_PATH`와
+`--experimental-ort-manifest=MANIFEST_ABSOLUTE_PATH`를 함께 전달해 먼저 검증한다.
+그 뒤 `inference_bench`의 기존 여섯 인자에 `--b1-ort-model=baseline|direct`,
+ORT 절대 경로, 파생 manifest 절대 경로를 추가해 동일 바이너리·B1·warm3/timed20을
+대조한다. Cache·buffer reuse·CPU arena 변경·I/O Binding·CUDA Graph는 함께 켜지 않는다.
+
+Direct 경로는 Rust 소유 flatbuffer를 session 전체 수명 동안 유지한다. Native session을
+먼저 파괴하며 CUDA 완료가 미확정이면 session·모델·입력을 함께 보존한다. 원본 ONNX의
+조기 해제 경로와 달리 ready 이후에도 모델 바이트가 남으므로 startup peak와 ready RSS를
+별도로 평가한다. ORT의 두 직접 참조 옵션은 ONNX protobuf에 적용하지 않는다.
+
+Ledger arm에는 `zero_copy_ort`와 `derived_manifest` pin을 지정한다. 집계기는 실제
+옵션·파생 provenance·retained bytes를 대조하고 baseline=false/variant=true를 요구한다.
+해당 series의 기본 채택이나 기존 누적 자료의 판정 변경은 자동화하지 않는다.
+
 ## D02 CPU/mock trace 재생
 
 [cpu_trace 예제](../../crates/rz-runtime/examples/cpu_trace.rs)는 실제 `Scheduler`와

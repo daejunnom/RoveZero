@@ -29,6 +29,9 @@ pub mod native_runtime_bridge;
 #[cfg(feature = "onnx")]
 pub mod onnx;
 
+#[cfg(feature = "experimental-ort-model")]
+pub mod ort_model;
+
 /// Untrusted output at the model adapter boundary. Missing heads, bad shapes,
 /// and non-finite values are deliberately representable for fault injection.
 #[derive(Clone, Debug, PartialEq)]

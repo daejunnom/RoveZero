@@ -89,6 +89,7 @@ enum RunMode {
     BatchSweep,
     B1Buffers { reuse: bool },
     B1CpuArena { disabled: bool },
+    B1OrtModel { direct: bool },
 }
 impl RunMode {
     fn parse(option: Option<&str>) -> Result<Self, Box<dyn Error>> {
@@ -102,6 +103,12 @@ impl RunMode {
             Some("--b1-cpu-arena=disabled") if cfg!(feature = "experimental-ort-cpu-arena") => {
                 Ok(Self::B1CpuArena { disabled: true })
             }
+            Some("--b1-ort-model=baseline") if cfg!(feature = "experimental-ort-model") => {
+                Ok(Self::B1OrtModel { direct: false })
+            }
+            Some("--b1-ort-model=direct") if cfg!(feature = "experimental-ort-model") => {
+                Ok(Self::B1OrtModel { direct: true })
+            }
             _ => {
                 Err("unknown comparison mode or unavailable experimental-io-buffers feature".into())
             }
@@ -110,8 +117,11 @@ impl RunMode {
     fn widths(self) -> &'static [usize] {
         match self {
             Self::BatchSweep => &[1, 2, 4, 8, 16],
-            Self::B1Buffers { .. } | Self::B1CpuArena { .. } => &[1],
+            Self::B1Buffers { .. } | Self::B1CpuArena { .. } | Self::B1OrtModel { .. } => &[1],
         }
+    }
+    fn observes_startup(self) -> bool {
+        matches!(self, Self::B1CpuArena { .. } | Self::B1OrtModel { .. })
     }
 }
 
@@ -140,10 +150,18 @@ fn recycle_checked(
 }
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if !(args.len() == 6 || args.len() == 7) {
+    if !(args.len() == 6 || args.len() == 7 || args.len() == 9) {
         return Err("usage: inference_bench SOURCE ONNX EXPORT CUDA_CORE CUDA_BUNDLE REPORT [--b1-buffers=baseline|reuse|--b1-cpu-arena=baseline|disabled] (all six paths absolute; fresh REPORT outside Git)".into());
     }
     let mode = RunMode::parse(args.get(6).map(String::as_str))?;
+    if matches!(mode, RunMode::B1OrtModel { .. }) != (args.len() == 9)
+        || (args.len() == 9 && args[7..].iter().any(|p| !Path::new(p).is_absolute()))
+    {
+        return Err(
+            "ORT comparison requires absolute ORT/model-manifest paths after its explicit mode"
+                .into(),
+        );
+    }
     if args[..6].iter().any(|arg| !Path::new(arg).is_absolute()) {
         return Err("all paths must be absolute".into());
     }
@@ -179,6 +197,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         report["reuse_buffers"] = json!(false);
         report["startup_memory_observations"] = json!("bounded self RSS endpoints and process lifetime HWM; not phase peaks, live heap, cgroup file cache, VRAM or Windows commit");
         report["measurement"] = json!("host_wall_including_run_physical_completion_output_digest_and_ownership_return_not_kernel_time; same startup memory observations in both arms");
+    }
+    if let RunMode::B1OrtModel { direct } = mode {
+        report["kind"] = json!("b1_owned_ort_fixed_work");
+        report["batches"] = json!([1]);
+        report["zero_copy_ort"] = json!(direct);
+        report["cpu_ep_fallback"] = json!(false);
+        report["reuse_buffers"] = json!(false);
+        report["disable_cuda_cpu_arena"] = json!(false);
+        report["measurement"] = json!("host_wall_including_run_physical_completion_output_digest_and_ownership_return_not_kernel_time; same bounded startup observer in both arms");
     }
     let started = Instant::now();
     let outcome = sweep(&args, &mut report, mode);
@@ -231,25 +258,54 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
         report["active_batch"] = json!(width);
         let preparation = Instant::now();
         let mut memory_points = Vec::new();
-        if matches!(mode, RunMode::B1CpuArena { .. }) {
+        if mode.observes_startup() {
             observe_memory(&mut memory_points, preparation, "BeforeAssetLoad");
             report["startup_memory"] = json!(memory_points);
         }
-        let model = MaiaAsset::load(
-            Path::new(&args[0]),
-            Path::new(&args[1]),
-            Path::new(&args[2]),
-        )?;
-        if model.profile() != AssetProfile::Bt4It332 {
+        let direct = matches!(mode, RunMode::B1OrtModel { direct: true });
+        let model = if direct {
+            None
+        } else {
+            Some(MaiaAsset::load(
+                Path::new(&args[0]),
+                Path::new(&args[1]),
+                Path::new(&args[2]),
+            )?)
+        };
+        #[cfg(feature = "experimental-ort-model")]
+        let derived = if direct {
+            Some(rz_eval::ort_model::OwnedOrtAsset::load(
+                Path::new(&args[0]),
+                Path::new(&args[1]),
+                Path::new(&args[2]),
+                Path::new(&args[7]),
+                Path::new(&args[8]),
+            )?)
+        } else {
+            None
+        };
+        let metadata = if let Some(model) = model.as_ref() {
+            model.metadata()
+        } else {
+            #[cfg(feature = "experimental-ort-model")]
+            {
+                derived.as_ref().ok_or("derived model missing")?.metadata()
+            }
+            #[cfg(not(feature = "experimental-ort-model"))]
+            {
+                return Err("derived ORT feature unavailable".into());
+            }
+        };
+        if metadata.profile() != AssetProfile::Bt4It332 {
             return Err("this sweep requires BT4-it332".into());
         }
-        report["model_sha256"] = json!(model.manifest().onnx_sha256);
-        report["export_manifest_sha256"] = json!(hex(model.manifest_digest()));
+        report["model_sha256"] = json!(metadata.manifest().onnx_sha256);
+        report["export_manifest_sha256"] = json!(hex(metadata.manifest_digest()));
         let mut config = BackendConfig::cpu();
         config.max_batch = width;
         config.provider = Provider::Cuda {
             device_id: 0,
-            arena_bytes: model.profile().cuda_arena_bytes(),
+            arena_bytes: metadata.profile().cuda_arena_bytes(),
         };
         if let RunMode::B1Buffers { reuse } = mode {
             config.experiments = ExecutionExperiments {
@@ -260,21 +316,43 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
         if let RunMode::B1CpuArena { disabled } = mode {
             config.experiments.disable_cuda_cpu_arena = disabled;
         }
+        config.experiments.zero_copy_ort = direct;
         let profile_dir = Path::new(&args[5]).with_extension(format!("b{width}.placement"));
         std::fs::create_dir(&profile_dir)?;
         config.profiling_prefix = Some(profile_dir.join("placement"));
-        let loaded = if matches!(mode, RunMode::B1CpuArena { .. }) {
-            let loaded = OnnxBackend::load_owned_observed(&runtime, model, config, |phase| {
-                observe_memory(&mut memory_points, preparation, &format!("{phase:?}"))
-            });
+        let loaded = if direct {
+            #[cfg(feature = "experimental-ort-model")]
+            {
+                let derived = derived.ok_or("derived model missing")?;
+                report["serialized_model_sha256"] = json!(derived.manifest().ort_sha256);
+                report["derived_manifest_sha256"] = json!(hex(derived.manifest_digest()));
+                let loaded =
+                    OnnxBackend::load_owned_ort_observed(&runtime, derived, config, |phase| {
+                        observe_memory(&mut memory_points, preparation, &format!("{phase:?}"))
+                    });
+                report["startup_memory"] = json!(memory_points);
+                loaded
+            }
+            #[cfg(not(feature = "experimental-ort-model"))]
+            {
+                return Err("derived ORT feature unavailable".into());
+            }
+        } else if mode.observes_startup() {
+            let loaded = OnnxBackend::load_owned_observed(
+                &runtime,
+                model.ok_or("original model missing")?,
+                config,
+                |phase| observe_memory(&mut memory_points, preparation, &format!("{phase:?}")),
+            );
             report["startup_memory"] = json!(memory_points);
             loaded
         } else {
-            OnnxBackend::load_owned(&runtime, model, config)
+            OnnxBackend::load_owned(&runtime, model.ok_or("original model missing")?, config)
         };
         let (_, mut backend) = loaded?;
-        if matches!(mode, RunMode::B1CpuArena { .. }) {
+        if mode.observes_startup() {
             report["backend_sha256"] = json!(hex(backend.identity()));
+            report["retained_model_bytes"] = json!(backend.retained_model_bytes());
         }
         let prep_ns = ns(preparation.elapsed());
         let placement = backend
@@ -298,7 +376,7 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
             }
         }
         let warmup_ns = ns(warmup.elapsed());
-        if matches!(mode, RunMode::B1CpuArena { .. }) {
+        if mode.observes_startup() {
             observe_memory(&mut memory_points, preparation, "AfterWarmup");
             report["startup_memory"] = json!(memory_points);
         }
@@ -318,7 +396,7 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
             }
         }
         backend.verify_cuda_runtime_mappings()?;
-        if matches!(mode, RunMode::B1CpuArena { .. }) {
+        if mode.observes_startup() {
             observe_memory(&mut memory_points, preparation, "AfterMeasuredRuns");
             report["startup_memory"] = json!(memory_points);
         }
@@ -337,7 +415,7 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
         // Normal drop only after confirmed completion. On an error the backend
         // retains its own unconfirmed tensors/session; no larger batch runs.
         drop(backend);
-        if matches!(mode, RunMode::B1CpuArena { .. }) {
+        if mode.observes_startup() {
             observe_memory(&mut memory_points, preparation, "AfterBackendDrop");
             report["startup_memory"] = json!(memory_points);
         }
@@ -375,6 +453,13 @@ mod tests {
             cfg!(feature = "experimental-ort-cpu-arena")
         );
         assert!(RunMode::parse(Some("--b1-cpu-arena=auto")).is_err());
+        for mode in ["--b1-ort-model=baseline", "--b1-ort-model=direct"] {
+            assert_eq!(
+                RunMode::parse(Some(mode)).is_ok(),
+                cfg!(feature = "experimental-ort-model")
+            );
+        }
+        assert!(RunMode::parse(Some("--b1-ort-model=auto")).is_err());
     }
     #[test]
     fn fixed_input_matches_previous_no_history_tensor_identity() {

@@ -49,6 +49,8 @@ pub struct ExecutionExperiments {
     pub cuda_graph: bool,
     /// CUDA's implicit CPU allocator only; never enables CPU node fallback.
     pub disable_cuda_cpu_arena: bool,
+    /// Independent derived-model trial. Its native session owns the backing bytes.
+    pub zero_copy_ort: bool,
 }
 
 /// Source-thread host intervals. NativeInvocation includes synchronous ORT Run,
@@ -92,6 +94,9 @@ pub fn declared_backend_identity(
     }
     if experiments.disable_cuda_cpu_arena {
         profile.push_str(";cuda-cpu-arena=disabled-v1");
+    }
+    if experiments.zero_copy_ort {
+        profile.push_str(";ort-flatbuffer=owned-direct-initializers-v1");
     }
     asset::sha256(profile.as_bytes())
 }
@@ -421,6 +426,13 @@ impl BackendConfig {
             || (self.experiments.disable_cuda_cpu_arena
                 && (!cfg!(feature = "experimental-ort-cpu-arena")
                     || !matches!(self.provider, Provider::Cuda { .. })))
+            || (self.experiments.zero_copy_ort
+                && (!cfg!(feature = "experimental-ort-model")
+                    || !matches!(self.provider, Provider::Cuda { .. })
+                    || self.experiments.io_binding
+                    || self.experiments.cuda_graph
+                    || self.experiments.reuse_buffers
+                    || self.experiments.disable_cuda_cpu_arena))
             || (self.experiments.io_binding && !cfg!(feature = "experimental-io-binding"))
             || (self.experiments.cuda_graph && !cfg!(feature = "experimental-cuda-graph"))
             || (self.experiments.cuda_graph
@@ -498,10 +510,51 @@ pub enum StartupPhase {
     SessionCommittedBeforeSerializedRelease,
     SerializedModelReleased,
     ProviderReady,
+    OrtModelRetained,
+    SessionCommittedWithOrtModelRetained,
+}
+
+// Native must be destroyed before the bytes it references. Keeping both in one
+// private owner also pins the model on early errors, Run quarantine and unwinds.
+// No native session handle can escape this owner. Rust drops fields in order.
+struct SessionStorage<N = Session, M = Vec<u8>> {
+    native: N,
+    retained_model: Option<M>,
+}
+impl std::ops::Deref for SessionStorage {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        &self.native
+    }
+}
+impl std::ops::DerefMut for SessionStorage {
+    fn deref_mut(&mut self) -> &mut Session {
+        &mut self.native
+    }
+}
+
+enum VerifiedModel<'a> {
+    BorrowedOnnx(&'a [u8]),
+    OwnedOnnx(Vec<u8>),
+    #[cfg(feature = "experimental-ort-model")]
+    OwnedOrt {
+        bytes: Vec<u8>,
+        manifest_digest: [u8; 32],
+    },
+}
+impl AsRef<[u8]> for VerifiedModel<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::BorrowedOnnx(bytes) => bytes,
+            Self::OwnedOnnx(bytes) => bytes,
+            #[cfg(feature = "experimental-ort-model")]
+            Self::OwnedOrt { bytes, .. } => bytes,
+        }
+    }
 }
 
 pub struct OnnxBackend {
-    session: Option<Session>,
+    session: Option<SessionStorage>,
     // Kept outside the Run stack so worker quarantine also pins tensor storage
     // if a Rust wrapper unexpectedly unwinds before attesting completion.
     active_input: Option<Tensor<f32>>,
@@ -549,9 +602,10 @@ impl OnnxBackend {
         Self::load_model(
             runtime,
             asset.metadata(),
-            asset.onnx_bytes(),
+            VerifiedModel::BorrowedOnnx(asset.onnx_bytes()),
             config,
             &mut |_| {},
+            None,
         )
     }
 
@@ -575,19 +629,107 @@ impl OnnxBackend {
         mut observe: impl FnMut(StartupPhase),
     ) -> Result<(AssetMetadata, Self), BackendError> {
         let (metadata, bytes) = asset.into_parts();
-        let backend = Self::load_model(runtime, &metadata, bytes, config, &mut observe)?;
+        let backend = Self::load_model(
+            runtime,
+            &metadata,
+            VerifiedModel::OwnedOnnx(bytes),
+            config,
+            &mut observe,
+            None,
+        )?;
+        Ok((metadata, backend))
+    }
+
+    #[cfg(feature = "experimental-ort-model")]
+    pub fn load_owned_ort_observed(
+        runtime: &OrtRuntime,
+        asset: crate::ort_model::OwnedOrtAsset,
+        config: BackendConfig,
+        mut observe: impl FnMut(StartupPhase),
+    ) -> Result<(AssetMetadata, Self), BackendError> {
+        if !config.experiments.zero_copy_ort
+            || asset::parse_sha256(&asset.manifest.runtime_core_sha256)? != runtime.binary_digest()
+            || Some(asset::parse_sha256(&asset.manifest.runtime_bundle_sha256)?)
+                != runtime.bundle_digest()
+        {
+            return Err(BackendError::new(
+                K::IdentityMismatch,
+                S::Admission,
+                "derived ORT requires explicit mode and its exact export runtime",
+            ));
+        }
+        let backend = Self::load_model(
+            runtime,
+            &asset.source,
+            VerifiedModel::OwnedOrt {
+                bytes: asset.bytes,
+                manifest_digest: asset.manifest_digest,
+            },
+            config,
+            &mut observe,
+            None,
+        )?;
+        Ok((asset.source, backend))
+    }
+
+    /// Separate conversion, never part of a benchmark's measured workload.
+    /// The caller owns a fresh regular output FD; ORT writes that exact inode.
+    #[cfg(all(feature = "experimental-ort-model", target_os = "linux"))]
+    pub fn export_owned_ort(
+        runtime: &OrtRuntime,
+        asset: MaiaAsset,
+        config: BackendConfig,
+        output: &std::fs::File,
+    ) -> Result<(AssetMetadata, Self), BackendError> {
+        let metadata = output
+            .metadata()
+            .map_err(|_| BackendError::new(K::Io, S::Asset, "cannot inspect ORT export FD"))?;
+        if !metadata.is_file()
+            || metadata.len() != 0
+            || !matches!(config.provider, Provider::Cuda { .. })
+            || config.experiments != ExecutionExperiments::default()
+            || asset.profile() != AssetProfile::Bt4It332
+        {
+            return Err(BackendError::new(
+                K::InvalidInput,
+                S::Admission,
+                "ORT export requires fresh FD, BT4 and baseline CUDA",
+            ));
+        }
+        let (metadata, bytes) = asset.into_parts();
+        let backend = Self::load_model(
+            runtime,
+            &metadata,
+            VerifiedModel::OwnedOnnx(bytes),
+            config,
+            &mut |_| {},
+            Some(output),
+        )?;
         Ok((metadata, backend))
     }
 
     fn load_model(
         runtime: &OrtRuntime,
         asset: &AssetMetadata,
-        model: impl AsRef<[u8]>,
+        model: VerifiedModel<'_>,
         config: BackendConfig,
         observe: &mut impl FnMut(StartupPhase),
+        export: Option<&std::fs::File>,
     ) -> Result<Self, BackendError> {
         let setup_started = Instant::now();
         config.validate()?;
+        let is_ort = match &model {
+            #[cfg(feature = "experimental-ort-model")]
+            VerifiedModel::OwnedOrt { .. } => true,
+            _ => false,
+        };
+        if config.experiments.zero_copy_ort != is_ort {
+            return Err(BackendError::new(
+                K::InvalidInput,
+                S::Admission,
+                "model storage and explicit ORT mode differ",
+            ));
+        }
         match (config.provider, runtime.bundle_digest()) {
             (Provider::Cuda { .. }, None) => {
                 return Err(BackendError::new(K::IdentityMismatch, S::Backend,
@@ -687,31 +829,87 @@ impl OnnxBackend {
                 .with_profiling(prefix)
                 .map_err(|error| setup_error(CauseCode::ProfilingStart, error))?;
         }
+        if let Some(_output) = export {
+            #[cfg(all(feature = "experimental-ort-model", target_os = "linux"))]
+            {
+                use std::os::fd::AsRawFd;
+                builder = builder
+                    .with_config_entry("session.save_model_format", "ORT")
+                    .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?
+                    .with_optimized_model_path(format!("/proc/self/fd/{}", _output.as_raw_fd()))
+                    .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?;
+            }
+            #[cfg(not(all(feature = "experimental-ort-model", target_os = "linux")))]
+            return Err(BackendError::new(
+                K::UnsupportedModel,
+                S::Admission,
+                "ORT export requires its feature on Linux",
+            ));
+        }
         let commit_started = Instant::now();
         let backend_setup = commit_started.duration_since(setup_started);
-        let session = commit_verified_model(
-            model,
-            |bytes| {
-                builder.commit_from_memory(bytes).map_err(|error| {
-                    BackendError::new(
-                        K::BackendUnavailable,
-                        S::Backend,
-                        "ORT could not load the verified model with the requested provider",
-                    )
-                    .with_ort_cause(CauseCode::ModelLoad, error)
-                })
-            },
-            observe,
-        )?;
+        let model_error = |error| {
+            BackendError::new(
+                K::BackendUnavailable,
+                S::Backend,
+                "ORT could not load the verified model with the requested provider",
+            )
+            .with_ort_cause(CauseCode::ModelLoad, error)
+        };
+        let (session, derived_manifest): (_, Option<[u8; 32]>) = match model {
+            #[cfg(feature = "experimental-ort-model")]
+            VerifiedModel::OwnedOrt {
+                bytes,
+                manifest_digest,
+            } => {
+                // ort rc.10's InMemorySession cannot be stored next to its owner
+                // without a self-reference. These are the same two documented
+                // ORT options; SessionStorage carries the lifetime obligation.
+                // Moving Vec preserves its allocation. It stays private and
+                // immutable until after native destruction, including failures.
+                observe(StartupPhase::OrtModelRetained);
+                builder = builder
+                    .with_config_entry("session.load_model_format", "ORT")
+                    .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?
+                    .with_config_entry("session.use_ort_model_bytes_directly", "1")
+                    .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?
+                    .with_config_entry("session.use_ort_model_bytes_for_initializers", "1")
+                    .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?;
+                let native = builder.commit_from_memory(&bytes).map_err(model_error)?;
+                let storage = SessionStorage {
+                    native,
+                    retained_model: Some(bytes),
+                };
+                observe(StartupPhase::SessionCommittedWithOrtModelRetained);
+                (storage, Some(manifest_digest))
+            }
+            model => (
+                SessionStorage {
+                    native: commit_verified_model(
+                        model,
+                        |bytes| builder.commit_from_memory(bytes).map_err(model_error),
+                        observe,
+                    )?,
+                    retained_model: None,
+                },
+                None,
+            ),
+        };
         let model_commit = commit_started.elapsed();
         validate_interface(&session, asset.profile())?;
         // This is a versioned C backend identity, not a new global wire codec.
-        let identity = declared_backend_identity(
+        let mut identity = declared_backend_identity(
             runtime.binary_digest(),
             asset.manifest_digest(),
             runtime.bundle_digest(),
             &config,
         );
+        if let Some(digest) = derived_manifest {
+            let mut identified = b"rz-derived-ort-backend-v1\0".to_vec();
+            identified.extend_from_slice(&identity);
+            identified.extend_from_slice(&digest);
+            identity = asset::sha256(&identified);
+        }
         let cuda_runtime =
             matches!(config.provider, Provider::Cuda { .. }).then(|| runtime.clone());
         let mut result = Self {
@@ -831,6 +1029,14 @@ impl OnnxBackend {
         }
         observe(StartupPhase::ProviderReady);
         Ok(result)
+    }
+
+    /// Owned model storage, not total ORT or GPU memory.
+    pub fn retained_model_bytes(&self) -> usize {
+        self.session
+            .as_ref()
+            .and_then(|s| s.retained_model.as_ref())
+            .map_or(0, Vec::len)
     }
 
     pub fn identity(&self) -> [u8; 32] {
@@ -1361,6 +1567,65 @@ pub fn verify_cuda_profile(bytes: &[u8]) -> Result<usize, BackendError> {
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+    #[test]
+    fn native_storage_drops_before_borrowed_model_on_success_error_and_unwind() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Native(Arc<AtomicBool>);
+        impl Drop for Native {
+            fn drop(&mut self) {
+                assert!(!self.0.load(Ordering::SeqCst));
+            }
+        }
+        struct Model(Arc<AtomicBool>);
+        impl Drop for Model {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        for mode in 0..3 {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let outcome = std::panic::catch_unwind(|| {
+                let storage = SessionStorage {
+                    native: Native(Arc::clone(&dropped)),
+                    retained_model: Some(Model(Arc::clone(&dropped))),
+                };
+                if mode == 1 {
+                    return Err::<(), _>("postcommit validation failed");
+                }
+                if mode == 2 {
+                    panic!("probe unwound");
+                }
+                drop(storage);
+                Ok(())
+            });
+            assert_eq!(outcome.is_err(), mode == 2);
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+    }
+    #[test]
+    fn ort_mode_is_explicit_cuda_only_and_keeps_legacy_b1_identity() {
+        let mut config = BackendConfig::cpu();
+        config.experiments.zero_copy_ort = true;
+        assert!(config.validate().is_err());
+        config.provider = Provider::Cuda {
+            device_id: 0,
+            arena_bytes: 3 * 1024 * 1024 * 1024,
+        };
+        config.profiling_prefix = Some(std::env::temp_dir().join("ort-mode-test/placement"));
+        assert_eq!(
+            config.validate().is_ok(),
+            cfg!(feature = "experimental-ort-model")
+        );
+        config.experiments.io_binding = true;
+        assert!(config.validate().is_err());
+        config.experiments.io_binding = false;
+        let direct = declared_backend_identity([0; 32], [0; 32], Some([0; 32]), &config);
+        config.experiments.zero_copy_ort = false;
+        assert_ne!(
+            direct,
+            declared_backend_identity([0; 32], [0; 32], Some([0; 32]), &config)
+        );
+    }
     #[test]
     fn extracted_identity_codec_preserves_published_b1_format() {
         let mut config = BackendConfig::cpu();

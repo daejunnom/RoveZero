@@ -97,6 +97,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut benchmark_rounds = None;
     let mut runtime_cache_root = None;
     let mut execution_options = Vec::new();
+    let mut ort_model_path = None;
+    let mut ort_manifest_path = None;
     for option in options {
         if let Some(value) = option.strip_prefix("--benchmark-rounds=") {
             let count = value.parse::<usize>()?;
@@ -107,11 +109,29 @@ fn main() -> Result<(), Box<dyn Error>> {
             if value.is_empty() || runtime_cache_root.replace(Path::new(value)).is_some() {
                 return Err("runtime cache root must be a unique absolute path".into());
             }
+        } else if let Some(value) = option.strip_prefix("--experimental-ort-model=") {
+            if !cfg!(feature = "experimental-ort-model")
+                || !Path::new(value).is_absolute()
+                || ort_model_path.replace(Path::new(value)).is_some()
+            {
+                return Err("ORT model requires a unique absolute path and its feature".into());
+            }
+        } else if let Some(value) = option.strip_prefix("--experimental-ort-manifest=") {
+            if !cfg!(feature = "experimental-ort-model")
+                || !Path::new(value).is_absolute()
+                || ort_manifest_path.replace(Path::new(value)).is_some()
+            {
+                return Err("ORT manifest requires a unique absolute path and its feature".into());
+            }
         } else {
             execution_options.push(option.clone());
         }
     }
-    let experiments = experimental_options(&execution_options)?;
+    if ort_model_path.is_some() != ort_manifest_path.is_some() {
+        return Err("ORT model and manifest must be specified together".into());
+    }
+    let mut experiments = experimental_options(&execution_options)?;
+    experiments.zero_copy_ort = ort_model_path.is_some();
     if benchmark_rounds.is_some() && experiments != ExecutionExperiments::default() {
         return Err("inference baseline benchmark excludes execution experiments".into());
     }
@@ -128,15 +148,44 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let bytes = asset::read_bounded(Path::new(&args[5]), 8 * 1024 * 1024)?;
     let fixtures: Fixtures = serde_json::from_slice(&bytes)?;
-    let model = MaiaAsset::load(
-        Path::new(&args[0]),
-        Path::new(&args[1]),
-        Path::new(&args[2]),
-    )?;
+    let model = if experiments.zero_copy_ort {
+        None
+    } else {
+        Some(MaiaAsset::load(
+            Path::new(&args[0]),
+            Path::new(&args[1]),
+            Path::new(&args[2]),
+        )?)
+    };
+    #[cfg(feature = "experimental-ort-model")]
+    let derived = if let (Some(ort), Some(manifest)) = (ort_model_path, ort_manifest_path) {
+        Some(rz_eval::ort_model::OwnedOrtAsset::load(
+            Path::new(&args[0]),
+            Path::new(&args[1]),
+            Path::new(&args[2]),
+            ort,
+            manifest,
+        )?)
+    } else {
+        None
+    };
+    let metadata = if let Some(model) = model.as_ref() {
+        model.metadata()
+    } else {
+        #[cfg(feature = "experimental-ort-model")]
+        {
+            derived.as_ref().ok_or("derived model missing")?.metadata()
+        }
+        #[cfg(not(feature = "experimental-ort-model"))]
+        {
+            return Err("derived ORT feature unavailable".into());
+        }
+    };
+    let source_onnx_sha256 = metadata.manifest().onnx_sha256.clone();
     if fixtures.schema != 1
         || fixtures.reference != "lc0-v0.32.1-eigen-original-protobuf"
         || fixtures.reference_commit != asset::CONVERTER_COMMIT
-        || fixtures.source_sha256 != model.profile().gzip_sha256()
+        || fixtures.source_sha256 != metadata.profile().gzip_sha256()
         || fixtures.cases.len() != 12
     {
         return Err("reference metadata or finite fixture count differs".into());
@@ -221,12 +270,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         builder.create(profile_directory)?;
         config.provider = Provider::Cuda {
             device_id: 0,
-            arena_bytes: model.profile().cuda_arena_bytes(),
+            arena_bytes: metadata.profile().cuda_arena_bytes(),
         };
         config.profiling_prefix = Some(profile_directory.join("placement"));
     }
     let runtime = OrtRuntime::load(&pin)?;
-    let mut backend = OnnxBackend::load(&runtime, &model, config)?;
+    let mut backend = if let Some(model) = model.as_ref() {
+        OnnxBackend::load(&runtime, model, config)?
+    } else {
+        #[cfg(feature = "experimental-ort-model")]
+        {
+            OnnxBackend::load_owned_ort_observed(
+                &runtime,
+                derived.ok_or("derived model missing")?,
+                config,
+                |_| {},
+            )?
+            .1
+        }
+        #[cfg(not(feature = "experimental-ort-model"))]
+        {
+            return Err("derived ORT feature unavailable".into());
+        }
+    };
     let mut encoded = Vec::new();
     for case in &fixtures.cases {
         let history = case
@@ -362,6 +428,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "io_binding":experiments.io_binding,
             "cuda_graph_requested":experiments.cuda_graph,
             "disable_cuda_cpu_arena":experiments.disable_cuda_cpu_arena,
+            "zero_copy_ort":experiments.zero_copy_ort,
             "repeated_B1_calls":32, "retained_outputs_unchanged":true,
             "binding_runs":backend.binding_runs(),
             "phase_clock":"CPU wall boundaries; Run includes kernels/synchronization",
@@ -420,7 +487,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             json!({"role":role,"filename":file.filename,"bytes":file.bytes,"sha256":file.sha256})
         }).collect::<Vec<_>>()),
         "backend_sha256":backend_sha256,
-        "onnx_sha256":model.manifest().onnx_sha256,
+        "onnx_sha256":source_onnx_sha256,
         "tolerances":{"raw_logits_atol":1e-4,"raw_logits_rtol":1e-3,"wdl_max_abs":1e-4,"legal_policy_max_abs":1e-4},
         "case_errors":errors,"batch_checks":batch_checks,
         "cuda_executed_nodes":cuda_executed_nodes,"cuda_profile_sha256":cuda_profile_sha256, "contract_worker": contract_worker,

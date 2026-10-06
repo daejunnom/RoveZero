@@ -27,6 +27,7 @@ rz-runtime = { workspace = true, optional = true, features = ["contracts"] }
 experimental-batch = ["contracts", "rz-runtime/experimental-batch"]
 experimental-io-buffers = ["onnx"]
 experimental-ort-cpu-arena = ["onnx"]
+experimental-ort-model = ["onnx"]
 experimental-io-binding = ["onnx"]
 experimental-cuda-graph = ["experimental-io-binding"]
 experimental-notify = ["dep:rz-runtime", "rz-runtime/experimental-notify"]
@@ -49,6 +50,10 @@ required-features = ["onnx"]
 [[example]]
 name = "inference_bench"
 required-features = ["onnx"]
+
+[[example]]
+name = "ort_export"
+required-features = ["experimental-ort-model"]
 
 [[example]]
 name = "rules_maia_check"

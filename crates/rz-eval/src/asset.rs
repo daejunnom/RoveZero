@@ -181,19 +181,8 @@ impl SelectedAsset {
     /// Checks the original compressed AND decompressed identity, then verifies
     /// the exact ONNX bytes passed to ORT. No verify-path/reopen-path race.
     pub fn load(original: &Path, onnx: &Path, manifest: &Path) -> Result<Self, BackendError> {
-        let manifest_bytes = read_bounded(manifest, 64 * 1024)?;
-        let manifest: ExportManifest = serde_json::from_slice(&manifest_bytes)
-            .map_err(|_| BackendError::new(K::InvalidInput, S::Asset, "invalid export manifest"))?;
-        manifest.validate()?;
-        let profile = manifest.profile()?;
-        let (gzip_bytes, protobuf_bytes) = profile.source_sizes();
-        verify_source_stream(
-            original,
-            gzip_bytes,
-            profile.gzip_sha256(),
-            protobuf_bytes,
-            profile.protobuf_sha256(),
-        )?;
+        let metadata = AssetMetadata::load_source(original, manifest)?;
+        let manifest = metadata.manifest();
         #[cfg(not(feature = "experimental-onnx-read-hash"))]
         let onnx = {
             let bytes = read_bounded(onnx, manifest.onnx_bytes)?;
@@ -202,14 +191,7 @@ impl SelectedAsset {
         };
         #[cfg(feature = "experimental-onnx-read-hash")]
         let onnx = read_verified_onnx(onnx, manifest.onnx_bytes, &manifest.onnx_sha256)?;
-        Ok(Self {
-            metadata: AssetMetadata {
-                manifest,
-                manifest_digest: sha256(&manifest_bytes),
-                profile,
-            },
-            onnx,
-        })
+        Ok(Self { metadata, onnx })
     }
 
     pub fn manifest(&self) -> &ExportManifest {
@@ -234,6 +216,26 @@ impl SelectedAsset {
 }
 
 impl AssetMetadata {
+    pub(crate) fn load_source(original: &Path, manifest: &Path) -> Result<Self, BackendError> {
+        let manifest_bytes = read_bounded(manifest, 64 * 1024)?;
+        let manifest: ExportManifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|_| BackendError::new(K::InvalidInput, S::Asset, "invalid export manifest"))?;
+        manifest.validate()?;
+        let profile = manifest.profile()?;
+        let (gzip_bytes, protobuf_bytes) = profile.source_sizes();
+        verify_source_stream(
+            original,
+            gzip_bytes,
+            profile.gzip_sha256(),
+            protobuf_bytes,
+            profile.protobuf_sha256(),
+        )?;
+        Ok(Self {
+            manifest,
+            manifest_digest: sha256(&manifest_bytes),
+            profile,
+        })
+    }
     pub fn manifest(&self) -> &ExportManifest {
         &self.manifest
     }
