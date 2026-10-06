@@ -402,6 +402,11 @@ struct ProfileExecution<'a> {
     raw_cache: bool,
 }
 
+fn case_sequence(index: usize, raw_cache: bool) -> u64 {
+    // Reserve adjacent IDs for both replays before the next physical case.
+    index as u64 * if raw_cache { 3 } else { 1 } + 1
+}
+
 fn finalized(evaluator: &mut NativeEvaluator, case: &str) -> Result<EvalOutput> {
     let until = Instant::now() + Duration::from_secs(REQUEST_SECONDS);
     loop {
@@ -524,7 +529,8 @@ fn evaluate_profile(
         {
             let frozen = restore(case, OwnerId(1000 + i as u64))?;
             let reference_policy = compare_projection(&projection, &frozen, case)?;
-            let request = request(&projection, &frozen, &clock, i as u64 + 1)?;
+            let sequence = case_sequence(i, raw_cache);
+            let request = request(&projection, &frozen, &clock, sequence)?;
             evaluator.submit(Arc::clone(&request))?;
             let output = finalized(&mut evaluator, &case.name)?;
             output.validate_for(&request, scope, clock.domain(), clock.try_now()?)?;
@@ -549,7 +555,7 @@ fn evaluate_profile(
             if raw_cache {
                 for replay in 0..2 {
                     let reused =
-                        self::request(&projection, &frozen, &clock, 64 + i as u64 * 2 + replay)?;
+                        self::request(&projection, &frozen, &clock, sequence + replay + 1)?;
                     evaluator.submit(Arc::clone(&reused))?;
                     let cached = finalized(&mut evaluator, &case.name)?;
                     cached.validate_for(&reused, scope, clock.domain(), clock.try_now()?)?;
@@ -823,4 +829,54 @@ fn main() -> Result<()> {
     report_file.write_all(&serde_json::to_vec_pretty(&report)?)?;
     report_file.write_all(b"\n")?;
     result
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use rz_runtime::contracts::RuntimeRequest;
+    use rz_runtime::Adapter;
+
+    #[test]
+    fn physical_and_replay_ids_pass_actual_monotonic_admission() {
+        let clock = ContractSystemClock::new(ProcessEpoch(211));
+        let encoding = EncodingHandle {
+            owner: OwnerId(212),
+            slot: 1,
+            generation: SlotGeneration(1),
+            manifest: encoding_manifest(HistoryFill::No),
+        };
+        let model = ModelHandle {
+            owner: OwnerId(212),
+            slot: 2,
+            generation: SlotGeneration(1),
+            manifest: Digest([213; 32]),
+        };
+        let projection = ClassicalProjection::new(
+            MaiaBinding::new(model, encoding, HistoryFill::No, Digest([214; 32]), 1).unwrap(),
+        );
+        let frozen = ContractPosition::new(OwnerId(215), Position::startpos())
+            .export()
+            .unwrap();
+        let scope = AcceptanceScope {
+            game: GameGeneration(1),
+            root: RootGeneration(1),
+            model,
+            encoding,
+            backend: projection.backend(),
+        };
+        for raw_cache in [false, true] {
+            let mut adapter =
+                ContractsAdapter::new(SharedScope::new(scope), clock.clone(), 1).unwrap();
+            for index in 0..CASE_NAMES.len() {
+                let sequence = case_sequence(index, raw_cache);
+                for offset in 0..if raw_cache { 3 } else { 1 } {
+                    let request = request(&projection, &frozen, &clock, sequence + offset).unwrap();
+                    adapter
+                        .validate_admission(&RuntimeRequest::new(request))
+                        .unwrap();
+                }
+            }
+        }
+    }
 }
