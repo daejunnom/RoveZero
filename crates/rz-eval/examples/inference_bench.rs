@@ -6,7 +6,7 @@ use rz_eval::{
     onnx::{BackendConfig, ExecutionExperiments, OnnxBackend, OrtRuntime, Provider},
     runtime_pin::{CudaRuntimeBundleSpec, RuntimeCache},
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     error::Error,
     fs::{File, OpenOptions},
@@ -128,9 +128,7 @@ impl RunMode {
             Some("--b1-cuda-graph=enabled") if cfg!(feature = "experimental-cuda-graph") => {
                 Ok(Self::B1CudaGraph { enabled: true })
             }
-            _ => {
-                Err("unknown comparison mode or unavailable experimental feature".into())
-            }
+            _ => Err("unknown comparison mode or unavailable experimental feature".into()),
         }
     }
     fn widths(self) -> &'static [usize] {
