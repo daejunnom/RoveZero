@@ -1,5 +1,9 @@
 # 아키텍처와 구현 책임
 
+현재 모델/외부 대국 교체 경계는 [모델 어댑터·외부 UCI](MODEL-ADAPTER-EXTERNAL-UCI.md)를
+따른다. associated input/raw 타입으로 LC0와 entity mock을 연결하며 Rules·PUCT·평가
+계약 revision 0.1·runtime 물리 수명은 유지한다. 외부 UCI는 대국 계층에 독립 연결한다.
+
 이 문서는 [RoveZero v0.2.0 핸드오프](reference/RoveZero_Handoff_v0.2.0_KO.md)의
 3~4장과 14~17장 및 이번 사용자 지시를 바탕으로 책임·의존 방향·검증 경계를 정한다.
 사용자가 지정한 독립 Rust 구현의 책임과 의존 방향을 정한다. 현재 구현·실행 인수

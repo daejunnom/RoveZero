@@ -4,10 +4,12 @@
 //! never initialize ORT inside `dispatch`. Logical cancellation belongs to D/B;
 //! only a physically completed worker result permits Ready and pin release.
 
+#[cfg(any(feature = "onnx", test))]
+use crate::rules_projection::ClassicalProjection;
 use crate::{
     error::{BackendError, CauseCode, FailureKind, FailureStage},
     model_adapter::{backend_error, AdapterAdmission, ModelAdapter, PhysicalFailure},
-    rules_projection::{ClassicalProjection, Lc0ModelAdapter},
+    rules_projection::Lc0ModelAdapter,
     worker::{PhysicalLease, PhysicalPoll, SingleWorker},
 };
 use rz_contracts::*;

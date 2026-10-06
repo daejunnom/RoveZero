@@ -872,6 +872,7 @@ mod tests {
             let b = candidate(&mut m);
             b.model = base;
             b.tool.source_commit = "b".repeat(40);
+            b.tool.binary.path = "bin/runtime-or-search-variant".into();
             b.tool.binary.sha256 = "b".repeat(64);
             if comparison == ComparisonV2::Runtime {
                 b.runtime.id = "declared-runtime-variant".into();

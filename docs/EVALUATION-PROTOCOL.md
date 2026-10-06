@@ -1,5 +1,11 @@
 # 평가 기반 구현 지시서
 
+모델과 외부 UCI 교체의 현재 V2 구현/인수는
+[모델 어댑터·외부 UCI](MODEL-ADAPTER-EXTERNAL-UCI.md)를 따른다. 외부 엔진에는 내부
+policy/WDL/ORT 증거를 요구하지 않는다. Stockfish 19 첫 pilot은 120초+1초·흑백 2판이며,
+두 RoveZero native session과 두 외부 UCI exit·옵션/시계/PGN을 각각 검사한다. 신경망
+동등성과 어댑터 성능 회귀를 통과하기 전에는 대국을 인수 단계로 진행하지 않는다.
+
 이 문서는 [v0.2.0 핸드오프](reference/RoveZero_Handoff_v0.2.0_KO.md)의 2장,
 11~12장, 14장, 17장을 R0 기준선·R1 계측·최종 대국의 구현 작업으로 풀어 쓴다.
 연구 순서·승격 원칙은 [EXPERIMENTS](EXPERIMENTS.md), 상태·요청 타입은

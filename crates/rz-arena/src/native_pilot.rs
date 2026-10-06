@@ -8,6 +8,7 @@ use rz_experiments::OpeningSpec;
 use rz_experiments::{CudaIntegrationPairSpec, CudaLaunchProfile};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "native-cuda")]
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

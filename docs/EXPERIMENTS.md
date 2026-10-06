@@ -1,5 +1,10 @@
 # 실험·대국 계약
 
+새 V2의 Runtime, AdapterEquivalence, InternalWeights, InternalModel, InternalSearch,
+ExternalEngine은 [모델 어댑터·외부 UCI](MODEL-ADAPTER-EXTERNAL-UCI.md)의 고정 조건과
+허용 변경을 따른다. V1 codec/기록은 보존하고 자동 변환하지 않는다. 어댑터 분리의
+시간/peak 회귀 5% 문턱과 기존 E 최적화 채택 문턱을 구분하며 batching은 계속 S 실험이다.
+
 이 문서는 [RoveZero v0.2.0 핸드오프](reference/RoveZero_Handoff_v0.2.0_KO.md)의 2장, 10~12장, 14~17장을 실험의 목표·연구 분류·해석 경계로 정리한다. 현재 사용자 결정과 실제 작업 의존성은 [IMPLEMENTATION-DIRECTIVES](IMPLEMENTATION-DIRECTIVES.md)가 우선한다. 상세 manifest·러너·계측·통계 구현은 [EVALUATION-PROTOCOL](EVALUATION-PROTOCOL.md), 데이터·미세조정·새 구조 실험은 [TRAINING-PLAN](TRAINING-PLAN.md), 전체 76개 후보의 최소 작업·검증·보류 조건은 [CANDIDATE-REGISTER](CANDIDATE-REGISTER.md)를 따른다.
 
 구현·학습·프로파일링·대국을 수행했다는 보고가 아니다. 상태와 책임은 [ARCHITECTURE](ARCHITECTURE.md), 공통 계약은 [CONTRACTS](CONTRACTS.md), 결정 상태는 [DECISIONS](DECISIONS.md), 일반 변경 규약은 [ENGINEERING-STANDARDS](ENGINEERING-STANDARDS.md)를 따른다. 최소 공통 계약의 내용·revision·변경은 총괄이 직접 소유한다. TASK-A03은 그 계약을 적용·검증하는 작업이며 독립 계약 결정권자가 아니다.
