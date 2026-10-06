@@ -3,6 +3,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -145,6 +146,17 @@ class Accounting(unittest.TestCase):
             module.read_json(path)
         with self.assertRaisesRegex(ValueError, "non-secret JSON"):
             module.read_json(self.root / "service-account.json")
+
+    def test_non_regular_json_cannot_block_the_reader(self):
+        directory = self.root / "directory.json"
+        directory.mkdir()
+        with self.assertRaisesRegex(ValueError, "regular JSON"):
+            module.read_json(directory)
+        if hasattr(os, "mkfifo"):
+            fifo = self.root / "pipe.json"
+            os.mkfifo(fifo)
+            with self.assertRaisesRegex(ValueError, "regular JSON"):
+                module.read_json(fifo)
 
     def test_included_ledgers_preserve_relative_evidence_and_deduplicate_comparisons(self):
         pair = self.pair("p")

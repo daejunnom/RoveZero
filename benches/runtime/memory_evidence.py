@@ -51,8 +51,10 @@ def read_json(path, digest=None):
         word in name for word in ("credential", "service-account", "service_account", "api-key", "api_key", "ssh-key", "ssh_key")
     ):
         raise ValueError("only explicit non-secret JSON evidence is supported")
-    if any(part.is_symlink() for part in (path, *path.parents)):
+    if any(part.is_symlink() or part.is_junction() for part in (path, *path.parents)):
         raise ValueError("linked evidence is not supported")
+    if not path.is_file():
+        raise ValueError("regular JSON evidence required")
     with path.open("rb") as stream:
         payload = stream.read(CAP + 1)
     if len(payload) > CAP:

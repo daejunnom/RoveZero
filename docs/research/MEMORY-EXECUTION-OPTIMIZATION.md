@@ -529,6 +529,83 @@ process·hint 오류0, 비교6회 high0이다. conditioning high29,974/21,704는
 에 보존했다. 성공한 비활성 private inputs만 동일한 소유/완료 검사를 거쳐 회수했다.
 이 수명주기 진단으로 장시간 강도·Elo·기본 batch 승격을 판정하지 않는다.
 
+### 4.9 누적 ledger와 보류 옵션 재대조
+
+<a id="memory-cumulative"></a>
+2026-10-06 사용자 지시에 따라 이전·현재 계측을 함께 보존하는
+[누적 도구](../../benches/runtime/memory_evidence.py)와
+[사용법](../../benches/runtime/README.md)을 추가했다. 원시 결과·실행 명세·ledger SHA를
+고정하고, 같은 옵션·모델·작업량·시간 구간·자원 정책·primary peak별로 합산한다.
+소스·binary·snapshot bytes·환경 변화는 별도 epoch로 남긴다. 현재 재대조 build source는
+`a3a350c26026e691fd53d8c14e6001fcce274f5c`, Rust 실행 코드와 재사용한 기본 UCI/arena는
+`f68aace26be721bd7ed2da689347b53b63f98c95`다. 두 SHA 사이 소스·Cargo·feature·workflow가
+같다는 재사용 근거를 보존했다. 이전 binary와 current binary를 동일 SHA로 표기하지 않는다.
+
+`--include-ledger`로 이전 ledger를 수정하지 않고 새 ledger를 추가한다. 동일 comparison은
+한 번만 세며 ID 충돌·raw SHA 변조·동일 series의 실행 재사용·작업량/출력 불일치·OOM·
+취소·강제 종료를 거부한다. 같은 기준을 두 옵션이 공유한 경우 각 비교에 표시하면서
+실제 실행 건수에서는 중복을 제거한다. 누적 값은 `sum(T1)/sum(T0)`와
+`sum(P1)/sum(P0)`, 쌍별 범위·중앙값·기하평균·epoch별 합계를 함께 남긴다.
+**P 합계는 독립 실행 peak 관측값의 합이며 동시에 필요한 메모리나 시스템 peak가 아니다.**
+아래 P는 그 합계를 쌍 수로 나눈 평균이다. 버퍼 series는 RSS, 나머지는 cgroup peak다.
+준비-only·독립 oracle·native를 서로 합산하지 않는다. 기존 HOLD·실패·conditioning은
+유지하며, 누적 평균만으로 기존 채택 문턱이나 실패를 통과 처리하지 않는다.
+
+실제 native는 같은 V5 lock `3c2013f74026da31db81673e5c8efacb7235eac74a3159103c5a36454d265938`,
+27개·4,099,796,728bytes·동일 두 B1 engine·BT4 FP32·TF32 off·HistoryFill No·
+4096 simulation 상한·visits·120+1·세 수 메이트로 진행했다. 원본·사본 검증·prelaunch·
+readiness·provider/Rules/PGN·postcheck·정상 물리 drain을 그대로 포함한다.
+기본/rolling/64KiB arena를 별도로 빌드해 두 옵션을 각각 한 변수로 비교했다.
+A0/R0/I0 conditioning 뒤 A1/R1/I1/I2/R2/A2/R3/A3/I3를 사전 등록했다.
+세 기준을 공유한 6개 비교는 독립적인 12회 실행으로 세지 않는다.
+CPU2·high6GiB/max12GiB·swap0, 실행당480초+정리30초·전체3600초다.
+호스트에 swap32GiB가 관측됐으나 실험 cgroup의 swap0은 유지했다.
+단일 추론 버퍼 재대조는 기존 supervised helper의 전체 시간 정의와 CPU quota를 유지하고,
+warm3/timed20·A1/B1/B2/A2/A3/B3·실행당600초+정리30초·전체900초로 고정했다.
+CPU PoC 성능 실행이나 cloud 작업은 수행하지 않았다.
+
+| 옵션·구간 | 쌍 / epoch | 기준 T 합계(s) | 변경 T 합계(s) | sum(T1)/sum(T0) | 기준/변경 P 평균(MiB) | sum(P1)/sum(P0) |
+|---|---:|---:|---:|---:|---:|---:|
+| B1 버퍼 재사용 · 단일 추론 | 6 / 2 | 111.999 | 114.454 | 1.021922 | 1833.660 / 1817.142 | 0.990992 |
+| 64KiB I/O · 준비만 (이전) | 3 / 1 | 111.569 | 84.635 | 0.758585 | 4733.392 / 4027.941 | 0.850963 |
+| 파일별 hint · 독립 oracle/추론 (이전) | 3 / 1 | 213.983 | 202.159 | 0.944743 | 4028.249 / 2767.227 | 0.686955 |
+| 파일별 hint · 실제 native | 6 / 2 | 716.835 | 700.842 | 0.977688 | 4140.361 / 3421.758 | 0.826439 |
+| 읽기·해시 결합 · 실제 native (이전) | 3 / 1 | 358.111 | 377.202 | 1.053312 | 4429.853 / 4030.003 | 0.909737 |
+| 64KiB I/O · 실제 native (신규) | 3 / 1 | 365.339 | 329.735 | 0.902547 | 4030.197 / 4030.234 | 1.000009 |
+
+**모두 HOLD·기본 off:** native hint의 누적 T는 약2.2% 감소했지만 P 감소는 약17.4%로
+20% 문턱에 못 미쳤다. 이번 세 쌍 P는14.3~16.1% 감소했지만 마지막 T는 약8.2% 증가했다.
+버퍼 재사용은 이번 epoch에서 T 합계가 줄었으나 이전·현재 누적 T는 약2.2% 증가,
+P는 약0.9% 감소이며, 이번 마지막 쌍 T도 약12.3% 증가했다.
+64KiB native의 T 합계는 약9.7% 감소했지만 P는 사실상 동일하고 세 번째 T는 약10.3%
+증가했다. 이번 기준 T 범위는37.703초다.
+새 비교도 사전 all-pair tradeoff/Pareto 조건을 충족하지 않았다. 준비-only의 시간 개선이나
+oracle의31.3% P 감소를 native 인수로 확대하지 않는다. 미세한 P 차이를 확정 악화/개선으로
+일반화하지 않으며 새 승인 문턱을 사후에 만들지 않는다.
+
+현재 native12회와 버퍼6회는 모두 정상 완료했다. 비교에 사용한 measured15회는 high0,
+OOM/max/강제 종료/잔류 process0이며 conditioning high는 별도 보존했다.
+Native는 실행마다 fresh session4개, NN 완료16/소비16(루트6/비루트10), 같은 두 PGN
+수순을 확인했다. Startup placement와 terminal traversal은 이 평가 수에 포함하지 않는다.
+누적24개 비교는 중복 제거 후 실제45회 실행이다. 이전15개 comparison을 재포함한 검사에서
+15개를 한 번만 계산했고 공유 기준3개도 실제 건수에서 한 번만 세었다.
+
+이번 버퍼 수치 검사는 독립 LC0 참조12개·batch1/2/4/8/16·가변 B1 32회와 보존 출력 불변을
+확인했다. 기존 logits atol1e-4/rtol1e-3, policy/WDL1e-4를 유지했다.
+여섯 버퍼 실행의23회 출력 digest는 이전과 동일하다. GPU suite는 별도로 실행했으며
+각 performance 호출 앞에 반복하지 않았다. Rust CPU eval98개, arena159개 통과,
+helper14개 ignored는 구분한다. 누적 도구의 CPU 검사와 실제 CI는 해당 보고서 SHA로
+별도 기록한다. API·receipt·공통 계약·엔진 기본 feature·규약과 기존 별도 문서 WIP는
+변경하지 않았다.
+
+현재 cgroup peak에는 source/private/shared file cache가 포함된다. 이벤트 endpoint의
+anon/file은 phase peak나 ORT heap peak가 아니며, VRAM·Windows commit peak는 unknown이다.
+후속 E 후보는 모델/session 준비의 동시 생존량과 반복 원본/사본 I/O 비용을 구분하여
+선택한다. 이번 결과만으로 버퍼 재사용을 큰 모델 메모리 해결책으로 채택하지 않는다.
+원시 자료·누적 JSON·명세·24판 진단 PGN은 Git 밖 논리 경로
+`${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-memory-cumulative-20261006/`에 보존했다.
+이 세 수 진단은 기력·Elo 평가가 아니다.
+
 ## 5. 후속 구현·검증 순서
 
 할당/복사 제거 → 저장 밀도 → bounded scratch/arena/pool → 임계 구역/완료 통지 →
