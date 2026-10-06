@@ -143,6 +143,9 @@ def run_once(variant, directory, overall_deadline):
         result["drain_seconds"] = time.monotonic()-drain_started
         for file in owner.logs.values():
             file.flush()
+        errors=(directory/"stderr.log").read_text(encoding="utf-8").splitlines()
+        failure=next((line for line in errors if line.startswith("SearchFailed:")),None)
+        require(failure is None,"fixed-work search failed: "+str(failure))
         stage = "native_evidence"
         native = native_receipts(directory, variant, "onnx_cuda", child.pid)
         term_path = next((directory/"native").glob("*/native-cuda-termination.v1.json"))
