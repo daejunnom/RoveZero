@@ -249,6 +249,8 @@ pub struct Tree<M, P = Puct> {
     deadline: Option<Instant>,
     cancellation: Option<Arc<AtomicBool>>,
     counters: SearchCounters,
+    #[cfg(feature = "experimental-backup-scratch")]
+    backup_scratch: Vec<(usize, usize, EdgeStats)>,
     #[cfg(feature = "experimental-search-buffers")]
     selection_stats: Vec<EdgeStats>,
     #[cfg(all(
@@ -284,6 +286,8 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
             deadline: None,
             cancellation: None,
             counters: SearchCounters::default(),
+            #[cfg(feature = "experimental-backup-scratch")]
+            backup_scratch: Vec::new(),
             #[cfg(feature = "experimental-search-buffers")]
             selection_stats: Vec::new(),
             #[cfg(all(
@@ -837,7 +841,13 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
                 return Err(SearchError::InconsistentLeaf);
             }
             let backup = self.prepare_backup(value)?;
-            let edges = self.prepare_edges(moves, priors)?;
+            let edges = match self.prepare_edges(moves, priors) {
+                Ok(edges) => edges,
+                Err(error) => {
+                    self.recycle_backup(backup);
+                    return Err(error);
+                }
+            };
             Ok((edges, backup))
         })();
         match prepared {
@@ -910,36 +920,75 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
     }
 
     fn prepare_backup(
-        &self,
+        &mut self,
         mut value: f64,
     ) -> Result<Vec<(usize, usize, EdgeStats)>, SearchError> {
-        let pending = self.pending.as_ref().expect("checked live ticket");
+        #[cfg(feature = "experimental-backup-scratch")]
+        let mut updates = std::mem::take(&mut self.backup_scratch);
+        #[cfg(not(feature = "experimental-backup-scratch"))]
         let mut updates = Vec::new();
-        updates
-            .try_reserve_exact(pending.path.len())
-            .map_err(|_| SearchError::AllocationFailed)?;
-        for &(node, edge) in pending.path.iter().rev() {
-            value = -value;
-            let Node::Expanded(edges) = &self.nodes[node] else {
-                return Err(SearchError::InconsistentLeaf);
-            };
-            let mut stats = edges.as_slice(&self.edge_storage)[edge].stats;
-            stats.visits = stats
-                .visits
-                .checked_add(1)
-                .ok_or(SearchError::CounterOverflow)?;
-            stats.value_sum += value;
-            if !stats.value_sum.is_finite() {
-                return Err(SearchError::InvalidStatistics);
+        // Only this tree's single mutable consumer can prepare/commit a backup.
+        // Retention grows to observed path length, bounded by max_depth, never
+        // to the node count or an in-flight native input's lifetime.
+        debug_assert!(updates.is_empty());
+        let prepared = (|| {
+            let pending = self.pending.as_ref().expect("checked live ticket");
+            updates
+                .try_reserve_exact(pending.path.len())
+                .map_err(|_| SearchError::AllocationFailed)?;
+            for &(node, edge) in pending.path.iter().rev() {
+                value = -value;
+                let Node::Expanded(edges) = &self.nodes[node] else {
+                    return Err(SearchError::InconsistentLeaf);
+                };
+                let mut stats = edges.as_slice(&self.edge_storage)[edge].stats;
+                stats.visits = stats
+                    .visits
+                    .checked_add(1)
+                    .ok_or(SearchError::CounterOverflow)?;
+                stats.value_sum += value;
+                if !stats.value_sum.is_finite() {
+                    return Err(SearchError::InvalidStatistics);
+                }
+                updates.push((node, edge, stats));
             }
-            updates.push((node, edge, stats));
+            Ok(())
+        })();
+        if let Err(error) = prepared {
+            self.recycle_backup(updates);
+            return Err(error);
         }
         Ok(updates)
+    }
+
+    fn recycle_backup(&mut self, updates: Vec<(usize, usize, EdgeStats)>) {
+        #[cfg(feature = "experimental-backup-scratch")]
+        {
+            let mut updates = updates;
+            updates.clear();
+            debug_assert!(updates.capacity() <= self.limits.max_depth);
+            self.backup_scratch = updates;
+        }
+        #[cfg(not(feature = "experimental-backup-scratch"))]
+        drop(updates);
     }
 
     fn commit_backup(
         &mut self,
         updates: Vec<(usize, usize, EdgeStats)>,
+        supplied_now: Instant,
+        admit: impl FnOnce() -> bool,
+    ) -> Result<Completion, SearchError> {
+        let completion = self.commit_prepared_backup(&updates, supplied_now, admit);
+        // Recycle on success, failed arithmetic, late cancellation/deadline and
+        // admission rejection. No prepared statistic survives into another root.
+        self.recycle_backup(updates);
+        completion
+    }
+
+    fn commit_prepared_backup(
+        &mut self,
+        updates: &[(usize, usize, EdgeStats)],
         supplied_now: Instant,
         admit: impl FnOnce() -> bool,
     ) -> Result<Completion, SearchError> {
@@ -976,7 +1025,7 @@ impl<M: Clone + Eq, P: SelectionPolicy> Tree<M, P> {
             return Ok(completion);
         }
         let count = updates.len();
-        for (node, edge, stats) in updates {
+        for &(node, edge, stats) in updates {
             let Node::Expanded(edges) = &mut self.nodes[node] else {
                 unreachable!()
             };
@@ -1472,6 +1521,61 @@ mod tests {
         );
         let next = tree.begin_selection(now).unwrap();
         assert_eq!(next.leaf, Leaf::Unexpanded);
+    }
+
+    #[cfg(feature = "experimental-backup-scratch")]
+    #[test]
+    fn backup_scratch_clears_rejected_and_failed_statistics_before_next_root() {
+        let now = Instant::now();
+        let mut tree = Tree::baseline(TreeLimits::default()).unwrap();
+        let root = tree.begin_selection(now).unwrap();
+        tree.accept_evaluation(&root.ticket, vec![7_u16], &[1.0], 0.0, now)
+            .unwrap();
+        let child = tree.begin_selection(now).unwrap();
+        assert_eq!(
+            tree.accept_terminal_with_guard(&child.ticket, 1.0, now, || false)
+                .unwrap(),
+            Completion::Rejected(Rejection::AdmissionClosed)
+        );
+        assert!(tree.backup_scratch.is_empty());
+        assert_eq!(tree.backup_scratch.capacity(), 1);
+        let address = tree.backup_scratch.as_ptr();
+        assert_eq!(tree.root_stats()[0].1.visits, 0);
+
+        let child = tree.begin_selection(now).unwrap();
+        let Node::Expanded(edges) = &mut tree.nodes[0] else {
+            unreachable!()
+        };
+        edges.as_mut_slice(&mut tree.edge_storage)[0].stats.visits = u64::MAX;
+        let before = tree.root_stats();
+        assert_eq!(
+            tree.accept_terminal(&child.ticket, -1.0, now),
+            Err(SearchError::CounterOverflow)
+        );
+        assert_eq!(tree.root_stats(), before);
+        assert!(!tree.has_pending());
+        assert!(tree.backup_scratch.is_empty());
+        assert_eq!(tree.backup_scratch.as_ptr(), address);
+
+        tree.reset().unwrap();
+        assert!(tree.backup_scratch.is_empty());
+        assert_eq!(tree.backup_scratch.as_ptr(), address);
+        assert_eq!(
+            tree.accept_terminal(&child.ticket, 0.0, now).unwrap(),
+            Completion::Rejected(Rejection::Stale)
+        );
+        let root = tree.begin_selection(now).unwrap();
+        tree.accept_evaluation(&root.ticket, vec![9_u16], &[1.0], 0.0, now)
+            .unwrap();
+        let child = tree.begin_selection(now).unwrap();
+        tree.accept_terminal(&child.ticket, -1.0, now).unwrap();
+        assert_eq!(
+            tree.root_stats()[0].1.value_sum.to_bits(),
+            1.0_f64.to_bits()
+        );
+        assert_eq!(tree.root_stats()[0].1.visits, 1);
+        assert!(tree.backup_scratch.is_empty());
+        assert_eq!(tree.backup_scratch.as_ptr(), address);
     }
 
     #[test]
