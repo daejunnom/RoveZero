@@ -34,7 +34,10 @@ cgroup peak를 합치지 않으며 VRAM·Windows commit 미관측을 대체하�
 따라서 공유 기준을 사용하는 옵션 결과는 서로 독립 표본이 아니다.
 
 SHA 변조·중복 ID 충돌·같은 series의 실행 재사용·작업량 불일치·OOM·강제 종료·취소를
-거부한다. 동일 comparison의 중복 입력은 한 번만 센다. Conditioning과 실패는
+거부한다. `diagnostic_only=true` 또는 `performance_measurement=false`인 실행도
+`accepted=true`·exit0 여부와 관계없이 성능 comparison에 넣지 않는다. 이 표식을
+추가하기 전의 고정 작업량 자료는 기존 실제 receipt와 registration 검사로 대조한다.
+동일 comparison의 중복 입력은 한 번만 센다. Conditioning과 실패·성공한 진단은
 `excluded=[{"id":"...","reason":"...","evidence":[{"path":"...","sha256":"..."}]}]`
 에 보존하고 비교 합계와 구분한다. 누적 평균만으로 이전 실패를 통과 처리하지 않는다.
 [채택 기준](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#adoption-gate)은 별도로 적용한다.

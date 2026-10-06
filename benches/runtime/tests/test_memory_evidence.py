@@ -258,6 +258,24 @@ class Accounting(unittest.TestCase):
         self.assertEqual(len(result["excluded"]), 1)
         self.assertEqual(result["series"][0]["cumulative"]["pairs"], 1)
 
+    def test_successful_diagnostic_cannot_enter_either_comparison_arm(self):
+        # An exit-zero numerical/debugger run is not a fixed-work performance
+        # sample, even if another producer accidentally marks it accepted.
+        for fields in (dict(diagnostic_only=True), dict(performance_measurement=False)):
+            for arm in ("a", "b"):
+                with self.subTest(fields=fields, arm=arm):
+                    pair = self.pair("diagnostic", **{arm: self.measurement(10, 100, **fields)})
+                    with self.assertRaisesRegex(ValueError, "non-performance"):
+                        self.aggregate([pair])
+
+    def test_successful_diagnostic_is_preserved_as_excluded_evidence(self):
+        ref = self.pin(dict(accepted=False, exit_code=0, diagnostic_only=True,
+                            performance_measurement=False))
+        result = self.aggregate([self.pair("p")], excluded=[dict(
+            id="normal-diagnostic", reason="allocator debugging; not a performance sample", evidence=[ref])])
+        self.assertEqual(len(result["excluded"]), 1)
+        self.assertEqual(result["series"][0]["cumulative"]["pairs"], 1)
+
     def test_repeated_exclusion_is_preserved_once_and_conflicts_rejected(self):
         item = dict(id="failure", reason="failed", evidence=[self.pin(dict(accepted=False))])
         result = self.aggregate([self.pair("p")], excluded=[item, copy.deepcopy(item)])

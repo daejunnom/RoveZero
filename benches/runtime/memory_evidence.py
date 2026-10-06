@@ -79,6 +79,8 @@ def observation(root, item, peak_kind):
     result = pinned(root, item["result"])
     if result.get("accepted") is not True or result.get("exit_code") != 0:
         raise ValueError("failed or incomplete run cannot enter a comparison")
+    if result.get("diagnostic_only") or result.get("performance_measurement") is False:
+        raise ValueError("diagnostic or non-performance run cannot enter a comparison")
     if result.get("conditioning", False) or result.get("cancelled", False):
         raise ValueError("conditioning or cancelled run cannot enter a comparison")
     if result.get("forced_cgroup_cleanup") is not False:
