@@ -394,6 +394,15 @@ pub fn supervise_protocol_in_directory(
     }
     #[cfg(target_os = "linux")]
     {
+        if !directory
+            .metadata()
+            .map_err(|_| ArenaError::Io("process.cwd_metadata".into()))?
+            .is_dir()
+        {
+            return Err(ArenaError::Invalid(
+                "process working descriptor is not a directory".into(),
+            ));
+        }
         let directory = directory
             .try_clone()
             .map_err(|_| ArenaError::Io("process.cwd_clone".into()))?;

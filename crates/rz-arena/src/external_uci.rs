@@ -240,6 +240,7 @@ pub fn uci_preflight_commands(
     }
     Ok(text.into_bytes())
 }
+#[cfg(target_os = "linux")]
 pub(crate) fn audit_external_game_protocol(
     stdout: &[u8],
     e: &ExternalUciEndpointV2,

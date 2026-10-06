@@ -279,6 +279,14 @@ fn compare_projection(
     }
     let encoded = projection.encode(frozen.rules())?;
     compare(encoded.values(), &case.input, 0.0, 0.0)?;
+    if encoded
+        .values()
+        .iter()
+        .zip(&case.input)
+        .any(|(a, b)| a.to_bits() != b.to_bits())
+    {
+        return Err("Rules/adapter input bytes differ from the independent reference".into());
+    }
     let actual_moves = frozen.legal_moves().moves();
     let reference_moves = case
         .legal_moves

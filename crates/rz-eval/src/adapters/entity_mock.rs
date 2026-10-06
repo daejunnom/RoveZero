@@ -39,12 +39,12 @@ pub struct EntityInput {
     pub candidates: Vec<Move>,
 }
 pub struct PreparedEntity {
-    pub request: Arc<EvalRequest<RulesState>>,
-    pub input: EntityInput,
+    request: Arc<EvalRequest<RulesState>>,
+    input: EntityInput,
 }
 pub struct EntityBatch {
-    pub execution: ExecutionId,
-    pub items: Vec<PreparedEntity>,
+    execution: ExecutionId,
+    items: Vec<PreparedEntity>,
 }
 #[derive(Clone, Debug)]
 pub struct CandidateRaw {

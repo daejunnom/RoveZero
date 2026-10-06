@@ -567,13 +567,10 @@ impl RunManifestV2 {
             _ => unreachable!(),
         };
         require_v2(changes.is_subset(&allowed), "confounded control")?;
-        if !matches!(
-            self.comparison,
-            ComparisonV2::AdapterEquivalence | ComparisonV2::InternalModel
-        ) {
+        if self.comparison == ComparisonV2::InternalWeights {
             require_v2(
                 a.tool == b.tool,
-                "binary/build inputs differ outside adapter/model comparison",
+                "weights-only comparison requires the identical executable/build",
             )?;
         } else {
             require_v2(
@@ -862,6 +859,33 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn runtime_and_search_code_changes_keep_model_and_build_envelope() {
+        for comparison in [ComparisonV2::Runtime, ComparisonV2::InternalSearch] {
+            let mut m = manifest(comparison);
+            let base = match &m.engines[0] {
+                EngineEndpointV2::RoveZero(e) => e.model.clone(),
+                _ => unreachable!(),
+            };
+            let b = candidate(&mut m);
+            b.model = base;
+            b.tool.source_commit = "b".repeat(40);
+            b.tool.binary.sha256 = "b".repeat(64);
+            if comparison == ComparisonV2::Runtime {
+                b.runtime.id = "declared-runtime-variant".into();
+                m.change = ChangeV2::MeaningPreserving;
+                m.declared_changes.insert("runtime".into());
+            } else {
+                b.search.id = "declared-search-variant".into();
+                m.change = ChangeV2::Search;
+                m.declared_changes.insert("search".into());
+            }
+            m.validate().unwrap();
+            candidate(&mut m).tool.compiler = "another-compiler".into();
+            assert!(m.validate().is_err());
+        }
     }
 
     #[test]

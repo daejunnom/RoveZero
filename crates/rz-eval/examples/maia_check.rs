@@ -100,8 +100,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut ort_model_path = None;
     let mut ort_manifest_path = None;
     let mut copy_ort_model = false;
+    let mut single_only = false;
     for option in options {
-        if let Some(value) = option.strip_prefix("--benchmark-rounds=") {
+        if option == "--single-only" {
+            if single_only {
+                return Err("single-only must be unique".into());
+            }
+            single_only = true;
+        } else if let Some(value) = option.strip_prefix("--benchmark-rounds=") {
             let count = value.parse::<usize>()?;
             if !(1..=100).contains(&count) || benchmark_rounds.replace(count).is_some() {
                 return Err("benchmark rounds must be a unique 1..=100 limit".into());
@@ -144,6 +150,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     experiments.copy_ort_model = copy_ort_model;
     if benchmark_rounds.is_some() && experiments != ExecutionExperiments::default() {
         return Err("inference baseline benchmark excludes execution experiments".into());
+    }
+    if single_only && benchmark_rounds.is_some() {
+        return Err("B1 numerical validation is separate from benchmarking".into());
     }
     if !(8..=10).contains(&args.len()) {
         return Err("usage: maia_check SOURCE.pb.gz MODEL.onnx MANIFEST.json ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu | cuda PROFILE_DIRECTORY CUDA_BUNDLE.json [--experimental-io-buffers] [--experimental-io-binding] [--experimental-cuda-graph] [--experimental-ort-cpu-arena]".into());
@@ -222,8 +231,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let mut config = BackendConfig::cpu();
     config.experiments = experiments;
-    if experiments.cuda_graph {
-        // Graph has one fixed B1 shape; larger batches are explicitly excluded.
+    if experiments.cuda_graph || single_only {
+        // B1 validation and graph execution do not admit larger batches.
         config.max_batch = 1;
     }
     let bundle_spec = if is_cuda {
@@ -328,6 +337,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         })?;
         compare(input.values(), &case.input, 0.0, 0.0)
             .map_err(|e| format!("{} encoding: {e}", case.name))?;
+        if input
+            .values()
+            .iter()
+            .zip(&case.input)
+            .any(|(a, b)| a.to_bits() != b.to_bits())
+        {
+            return Err(format!("{} input bytes differ", case.name).into());
+        }
         let mut indices = Vec::new();
         for m in &case.legal_moves {
             let from = policy::canonical_square(m.from_square, case.black_to_move)?;
@@ -385,7 +402,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     let mut batch_checks = Vec::new();
-    let batch_sizes: &[usize] = if experiments.cuda_graph {
+    let batch_sizes: &[usize] = if experiments.cuda_graph || single_only {
         &[1]
     } else {
         &[1, 2, 4, 8, 16]
@@ -444,7 +461,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "binding_runs":backend.binding_runs(),
             "phase_clock":"CPU wall boundaries; Run includes kernels/synchronization",
             "phases":phases,
-            "excluded_batch_sizes":if experiments.cuda_graph { vec![2,4,8,16] } else { vec![] },
+            "excluded_batch_sizes":if experiments.cuda_graph || single_only { vec![2,4,8,16] } else { vec![] },
             "capture_replay_observed":false,
             "formal_performance_acceptance":false
         }));
@@ -473,7 +490,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         backend,
         &fixtures.cases,
         &encoded,
-        if experiments.cuda_graph { 1 } else { 4 },
+        if experiments.cuda_graph || single_only {
+            1
+        } else {
+            4
+        },
     )?;
     #[cfg(not(feature = "contracts"))]
     let contract_worker = {
@@ -488,6 +509,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         runtime.verify_cuda_runtime_mappings()?;
     }
     let mut report = json!({"status":"passed", "provider": args[7], "precision":"fp32", "tf32":false,
+        "validation_mode":if single_only {"B1_only"} else {"B1_to_B16"},
+        "input_f32_bytes_equal":true,
+        "excluded_batch_sizes":if single_only {vec![2,4,8,16]} else {vec![]},
         "reference":fixtures.reference, "fixture_sha256":asset::hex_sha256(&bytes),
         "reference_commit":fixtures.reference_commit,"reference_module_sha256":fixtures.reference_module_sha256,
         "runtime_sha256":args[4], "runtime_build":runtime.build_info(),
