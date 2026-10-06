@@ -882,7 +882,7 @@ mod tests {
             requested_options: BTreeMap::from([("Threads".into(), "2".into())]),
             handshake_timeout_ms: 30_000,
         }));
-        let json = m.lock().unwrap().to_json().unwrap();
+        let json = m.clone().lock().unwrap().to_json().unwrap();
         assert_eq!(
             LockedManifestV2::from_json(&json)
                 .unwrap()

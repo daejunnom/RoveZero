@@ -37,6 +37,12 @@ pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 
         role: rz_experiments::NativeEngineRole,
     ) -> Result<NativeEngineView<'_>, rz_experiments::ManifestError>;
     fn provider_name(&self) -> &'static str;
+    fn seed(&self) -> u64 {
+        1
+    }
+    fn validate_execution(&self) -> Result<(), ArenaError> {
+        Ok(())
+    }
     fn advise_drop_input_cache(&self) -> bool {
         false
     }
@@ -63,12 +69,22 @@ pub struct NativeEngineView<'a> {
     pub cuda_bundle: Option<&'a rz_experiments::CudaBundleBindingV1>,
     pub search: Option<rz_experiments::NativeCudaSearchV2>,
     pub batch_experiment: Option<usize>,
+    pub external: Option<&'a rz_experiments::ExternalUciEndpointV2>,
 }
 impl NativeEngineView<'_> {
     pub fn artifact(
         &self,
         role: rz_experiments::NativeArtifactRole,
     ) -> Result<&ArtifactRef, ArenaError> {
+        if let Some(external) = self.external {
+            return if role == rz_experiments::NativeArtifactRole::Binary {
+                Ok(&external.binary)
+            } else {
+                Err(ArenaError::Invalid(
+                    "external UCI endpoint has no native NN role".into(),
+                ))
+            };
+        }
         let mut matching = self.artifacts.iter().filter(|b| b.role == role);
         let first = matching
             .next()
@@ -130,6 +146,7 @@ impl NativeLaunchDeclaration for LockedIntegrationPairSpecV1 {
             cuda_bundle: None,
             search: None,
             batch_experiment: None,
+            external: None,
         })
     }
     fn provider_name(&self) -> &'static str {
@@ -680,6 +697,7 @@ pub(crate) mod linux {
                 "native attempt requires a safe unique basename".into(),
             ));
         }
+        spec.validate_execution()?;
         let input = spec.view();
         let opening = crate::opening_pgn_for_spec(input.opening, input.max_plies)?;
         if opening.len() as u64 != input.opening_artifact.bytes
@@ -747,7 +765,10 @@ pub(crate) mod linux {
             .set_permissions(Permissions::from_mode(0o700))
             .map_err(|_| io("cannot make native input directory private"))?;
         let path = root_path.join(label);
-        let cuda_bundle = spec.engine_view(NativeEngineRole::Baseline)?.cuda_bundle;
+        let cuda_bundle = spec
+            .engine_view(NativeEngineRole::Baseline)?
+            .cuda_bundle
+            .or(spec.engine_view(NativeEngineRole::Candidate)?.cuda_bundle);
         let bundle_directory = if cuda_bundle.is_some() {
             inputs
                 .create_dir("cuda-bundle")
@@ -1011,6 +1032,30 @@ pub(crate) mod linux {
         for role in input.white_order {
             let engine = spec.engine_view(role)?;
             let binary = pin(pins, engine.artifact(NativeArtifactRole::Binary)?)?;
+            if let Some(external) = engine.external {
+                args.extend([
+                    OsString::from("-engine"),
+                    key_path("cmd=", &binary.path)?,
+                    key_path("dir=", cwd)?,
+                    format!("name={}", engine.engine_id).into(),
+                ]);
+                if !external.arguments.is_empty() {
+                    let tokens = external
+                        .arguments
+                        .iter()
+                        .map(|arg| {
+                            crate::external_uci::resolve_asset_tokens(arg, external, pins)
+                                .map(OsString::from)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    args.push(encode_fastchess_native_args(&tokens)?);
+                }
+                for (name, value) in &external.requested_options {
+                    let value = crate::external_uci::resolve_asset_tokens(value, external, pins)?;
+                    args.push(format!("option.{name}={value}").into());
+                }
+                continue;
+            }
             let root = &roots[match role {
                 NativeEngineRole::Baseline => 0,
                 NativeEngineRole::Candidate => 1,
@@ -1106,7 +1151,7 @@ pub(crate) mod linux {
             "-concurrency".into(),
             "1".into(),
             "-srand".into(),
-            "1".into(),
+            spec.seed().to_string().into(),
             "-maxmoves".into(),
             (remaining / 2).to_string().into(),
             "-pgnout".into(),
@@ -1162,7 +1207,9 @@ pub(crate) mod linux {
         if matches!(input.clock, rz_experiments::NativePairClock::Game(_)) {
             let baseline = spec.engine_view(NativeEngineRole::Baseline)?;
             let candidate = spec.engine_view(NativeEngineRole::Candidate)?;
-            limitations[0] = if candidate.batch_experiment.is_some() {
+            limitations[0] = if baseline.external.is_some() || candidate.external.is_some() {
+                "V2 external UCI paired pilot only; distinct engine resources/statistics; no Elo or model promotion"
+            } else if candidate.batch_experiment.is_some() {
                 "CUDA S batch pilot only; execution_ready=false; strength_eligible=false; same weights/precision/PUCT/final visits; batch width and scheduling differ"
             } else if baseline.search==candidate.search {
                 "CUDA B1 A/A whole-clock memory check; execution_ready=false; strength_eligible=false; same weights/runtime/binary/search"

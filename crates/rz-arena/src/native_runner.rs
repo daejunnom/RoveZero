@@ -34,6 +34,18 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
     type Audit: Clone + fmt::Debug + Serialize + Send + 'static;
     fn scope(&self) -> &'static str;
     fn receipt_filename(&self) -> &'static str;
+    fn receipt_version(&self) -> u32 {
+        1
+    }
+    fn expected_provider_sessions(&self) -> usize {
+        4
+    }
+    fn role_startup_filename(&self, _role: rz_experiments::NativeEngineRole) -> &'static str {
+        self.startup_filename()
+    }
+    fn role_termination_filename(&self, _role: rz_experiments::NativeEngineRole) -> &'static str {
+        self.termination_filename()
+    }
     fn startup_filename(&self) -> &'static str;
     fn termination_filename(&self) -> &'static str;
     fn claim_policy(&self) -> rz_experiments::ClaimPolicy {
@@ -69,6 +81,14 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
         _startup: &[u8],
         _runtime_directory: &cap_std::fs::Dir,
     ) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
+        Ok(Vec::new())
+    }
+    #[cfg(target_os = "linux")]
+    fn external_exit_ids(
+        &self,
+        _stdout: &[u8],
+        _native_pids: &[u32],
+    ) -> Result<Vec<u32>, ArenaError> {
         Ok(Vec::new())
     }
     /// Additional provider-specific acceptance of the supervisor-owned stdout.
@@ -132,6 +152,12 @@ pub struct NativePairReceipt<A = NativeProviderSessionAudit> {
     pub snapshot_cache_hints: Vec<SnapshotCacheHint>,
     pub artifacts: Vec<rz_experiments::ArtifactRef>,
     pub provider_sessions: Vec<A>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub external_preflight: Vec<crate::ExternalUciPreflight>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub external_execution: Vec<crate::ExternalGameObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_audit_error: Option<String>,
     pub provider_audit_error: Option<String>,
     pub pgn_audit: Option<PairPgnAudit>,
     pub pgn_audit_error: Option<String>,
@@ -743,10 +769,200 @@ pub(crate) mod linux {
             execution_order: [0, 1],
         })
     }
+    fn preflight_endpoints<S: NativeProviderDeclaration>(
+        bundle: &mut NativeRunBundle<S>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<crate::ExternalUciPreflight>, ArenaError> {
+        let mut receipts = Vec::new();
+        for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+            let owner = bundle.owner.as_ref().expect("preflight owns snapshot");
+            let Some(e) = owner.spec.engine_view(role)?.external.cloned() else {
+                continue;
+            };
+            let binary = pin(&owner.snapshot.pins, &e.binary)?;
+            let args = e
+                .arguments
+                .iter()
+                .map(|s| {
+                    crate::external_uci::resolve_asset_tokens(s, &e, &owner.snapshot.pins)
+                        .map(std::ffi::OsString::from)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let requested = e
+                .requested_options
+                .iter()
+                .map(|(k, v)| {
+                    crate::external_uci::resolve_asset_tokens(v, &e, &owner.snapshot.pins)
+                        .map(|v| (k.clone(), v))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            let limits = crate::ProcessLimits {
+                wall_ms: e.handshake_timeout_ms,
+                shutdown_grace_ms: owner.spec.view().timeouts.shutdown_ms,
+                max_output_bytes: 256 * 1024,
+                max_child_processes: owner.spec.view().budget.max_child_processes,
+            };
+            let process = crate::supervise_protocol_in_directory(
+                &binary.file,
+                &args,
+                &owner.snapshot.cwd,
+                limits,
+                cancel,
+                &owner.snapshot.watch,
+                b"uci\nquit\n",
+            )?;
+            bundle.process = Some(process);
+            let process = bundle.process.as_ref().expect("probe process retained");
+            let tag = match role {
+                NativeEngineRole::Baseline => "baseline",
+                NativeEngineRole::Candidate => "candidate",
+            };
+            put(
+                owner,
+                &format!("external-{tag}-identification.stdout.log"),
+                &process.stdout,
+                256 * 1024,
+            )?;
+            put(
+                owner,
+                &format!("external-{tag}-identification.stderr.log"),
+                &process.stderr,
+                256 * 1024,
+            )?;
+            let clean = |p: &ProcessOutput| {
+                p.receipt.stop == ProcessStop::Exited
+                    && p.receipt.exit_code == Some(0)
+                    && p.receipt.group_cleanup == CleanupStatus::Gone
+                    && p.pending_child.is_none()
+                    && p.receipt.errors.is_empty()
+            };
+            if !clean(process) {
+                return Err(invalid(
+                    "external identification failed process/cleanup gate",
+                ));
+            }
+            let identification_process = process.receipt.clone();
+            put(
+                owner,
+                &format!("external-{tag}-identification-process.v2.json"),
+                &serde_json::to_vec_pretty(&process.receipt)
+                    .map_err(|_| invalid("preflight process receipt encoding failed"))?,
+                64 * 1024,
+            )?;
+            let advertisement = crate::parse_uci_advertisement(&process.stdout)?;
+            crate::validate_uci_options(&advertisement, &e.expected_uci_name, &requested)?;
+            let commands = crate::uci_preflight_commands(&requested, e.family == "stockfish")?;
+            let process = crate::supervise_protocol_in_directory(
+                &binary.file,
+                &args,
+                &owner.snapshot.cwd,
+                limits,
+                cancel,
+                &owner.snapshot.watch,
+                &commands,
+            )?;
+            bundle.process = Some(process);
+            let process = bundle.process.as_ref().expect("readiness process retained");
+            put(
+                owner,
+                &format!("external-{tag}-readiness.stdout.log"),
+                &process.stdout,
+                256 * 1024,
+            )?;
+            put(
+                owner,
+                &format!("external-{tag}-readiness.stderr.log"),
+                &process.stderr,
+                256 * 1024,
+            )?;
+            put(
+                owner,
+                &format!("external-{tag}-readiness-process.v2.json"),
+                &serde_json::to_vec_pretty(&process.receipt)
+                    .map_err(|_| invalid("preflight process receipt encoding failed"))?,
+                64 * 1024,
+            )?;
+            if !clean(process) {
+                return Err(invalid(
+                    "external readiness/stop/quit failed process/cleanup gate",
+                ));
+            }
+            if crate::parse_uci_advertisement(&process.stdout)? != advertisement {
+                return Err(invalid(
+                    "external advertisements differ across preflight sessions",
+                ));
+            }
+            let output = std::str::from_utf8(&process.stdout)
+                .map_err(|_| invalid("external readiness output is not UTF-8"))?;
+            let state = rz_position::Position::startpos();
+            let legal = state.legal_moves();
+            let legal_bestmove = output
+                .lines()
+                .filter_map(|line| line.strip_prefix("bestmove "))
+                .filter_map(|line| line.split_whitespace().next())
+                .any(|value| legal.iter().any(|m| m.to_string() == value));
+            if output.lines().filter(|line| *line == "readyok").count() != 2 || !legal_bestmove {
+                return Err(invalid(
+                    "external readiness or bounded search/stop witness missing",
+                ));
+            }
+            let options = requested
+                .into_iter()
+                .map(|(name, value)| {
+                    let advertised = advertisement.options[&name].clone();
+                    (
+                        name,
+                        crate::ExternalOptionObservation {
+                            requested: value,
+                            advertised,
+                            value_supported: true,
+                            sent_to_preflight: true,
+                            readiness_barrier_observed: true,
+                            actual_value: None,
+                        },
+                    )
+                })
+                .collect();
+            let receipt = crate::ExternalUciPreflight {
+                schema_version: 2,
+                engine_id: e.id.clone(),
+                advertisement,
+                options,
+                identification_process,
+                readiness_process: process.receipt.clone(),
+                stop_and_legal_bestmove_observed: true,
+                compiler_information: output
+                    .lines()
+                    .filter(|line| {
+                        line.contains("Compiled by")
+                            || line.contains("Compilation settings")
+                            || line.contains("using SSE")
+                            || line.contains("using AVX")
+                    })
+                    .map(String::from)
+                    .collect(),
+                selected_isa: None,
+                scope: "independent pinned-binary CPU UCI preflight; readyok is a barrier, not option readback or game-process attestation",
+            };
+            let bytes = serde_json::to_vec_pretty(&receipt)
+                .map_err(|_| invalid("external preflight serialization failed"))?;
+            put(
+                owner,
+                &format!("external-{tag}-preflight.v2.json"),
+                &bytes,
+                64 * 1024,
+            )?;
+            receipts.push(receipt);
+            bundle.process = None;
+        }
+        Ok(receipts)
+    }
     pub(super) fn run<S: NativeProviderDeclaration>(
         bundle: &mut NativeRunBundle<S>,
         cancel: Option<&AtomicBool>,
     ) -> Result<(NativePairReceipt<S::Audit>, ArtifactRef), ArenaError> {
+        let run_started = std::time::Instant::now();
+        let external_preflight = preflight_endpoints(bundle, cancel)?;
         let owner = bundle.owner.as_mut().expect("prepared native owner");
         crate::emit_native_phase("prelaunch_verification_started");
         let mut rolling = SnapshotCacheHint::rolling(
@@ -778,11 +994,17 @@ pub(crate) mod linux {
                 ));
             }
         };
+        let mut limits = s.limits;
+        limits.wall_ms = limits
+            .wall_ms
+            .checked_sub(u64::try_from(run_started.elapsed().as_millis()).unwrap_or(u64::MAX))
+            .filter(|n| *n > 0)
+            .ok_or_else(|| invalid("V2 prelaunch consumed whole pair runtime budget"))?;
         let process = crate::process::supervise_tree_observed(
             &s.pins[s.runner_index].file,
             &s.invocation.args,
             &s.cwd,
-            s.limits,
+            limits,
             cancel,
             &s.watch,
             Some(&mut on_stdout),
@@ -804,7 +1026,7 @@ pub(crate) mod linux {
             && process.pending_child.is_none()
             && process.receipt.errors.is_empty();
         let mut receipt = NativePairReceipt {
-            receipt_version: 1,
+            receipt_version: owner.spec.receipt_version(),
             execution_ready: false,
             strength_eligible: false,
             validation_scope: owner.spec.scope().into(),
@@ -818,6 +1040,9 @@ pub(crate) mod linux {
             snapshot_cache_hints: cache_hints,
             artifacts: Vec::new(),
             provider_sessions: Vec::new(),
+            external_preflight,
+            external_execution: Vec::new(),
+            external_audit_error: None,
             provider_audit_error: None,
             pgn_audit: None,
             pgn_audit_error: None,
@@ -922,7 +1147,34 @@ pub(crate) mod linux {
                 Err(error) => receipt.pgn_audit_error = Some(error.to_string()),
             }
             match audit_providers(owner, &process.stdout, &mut receipt.artifacts) {
-                Ok(sessions) => receipt.provider_sessions = sessions,
+                Ok((sessions, pids)) => {
+                    receipt.provider_sessions = sessions;
+                    for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+                        if let Some(e) = owner.spec.engine_view(role)?.external {
+                            let options = e
+                                .requested_options
+                                .iter()
+                                .map(|(k, v)| {
+                                    crate::external_uci::resolve_asset_tokens(
+                                        v,
+                                        e,
+                                        &owner.snapshot.pins,
+                                    )
+                                    .map(|v| (k.clone(), v))
+                                })
+                                .collect::<Result<BTreeMap<_, _>, _>>()?;
+                            match crate::external_uci::audit_external_game_protocol(
+                                &process.stdout,
+                                e,
+                                &options,
+                                &pids,
+                            ) {
+                                Ok(a) => receipt.external_execution.push(a),
+                                Err(e) => receipt.external_audit_error = Some(e.to_string()),
+                            }
+                        }
+                    }
+                }
                 Err(error) => receipt.provider_audit_error = Some(error.to_string()),
             }
         } else {
@@ -978,7 +1230,8 @@ pub(crate) mod linux {
         receipt.integration_checks_passed = completed
             && receipt.pgn_audit.is_some()
             && receipt.provider_audit_error.is_none()
-            && receipt.provider_sessions.len() == 4;
+            && receipt.external_audit_error.is_none()
+            && receipt.provider_sessions.len() == owner.spec.expected_provider_sessions();
         let owner = bundle.owner.as_ref().expect("postchecked native owner");
         if let Some(audit) = &receipt.pgn_audit {
             match owner.spec.validate_clock_trace(&process.stdout, audit) {
@@ -1024,7 +1277,8 @@ pub(crate) mod linux {
         crate::emit_native_phase("receipt_saved");
         // Keep receipts/PGN first. Process exit alone grants no NN-drain claim.
         // Each accepted provider session includes its matched physical drain.
-        if crate::native_retention::eligible(
+        if crate::native_retention::eligible_expected(
+            owner.spec.expected_provider_sessions(),
             receipt.cleanup_verified,
             receipt.provider_audit_error.is_none(),
             receipt.provider_sessions.len(),
@@ -1663,7 +1917,7 @@ pub(crate) mod linux {
         owner: &NativeLaunchOwner<S>,
         stdout: &[u8],
         artifacts: &mut Vec<ArtifactRef>,
-    ) -> Result<Vec<S::Audit>, ArenaError> {
+    ) -> Result<(Vec<S::Audit>, Vec<u32>), ArenaError> {
         let mut sessions = Vec::new();
         let mut ids = BTreeSet::new();
         let mut scanned = 0u32;
@@ -1673,6 +1927,9 @@ pub(crate) mod linux {
             (NativeEngineRole::Candidate, "candidate-runtime"),
         ] {
             let engine = owner.spec.engine_view(role)?;
+            if engine.external.is_some() {
+                continue;
+            }
             let directory = owner
                 .snapshot
                 .directory
@@ -1719,8 +1976,8 @@ pub(crate) mod linux {
                 let dir = directory
                     .open_dir_nofollow(&session)
                     .map_err(|_| invalid("native session is not a real owned directory"))?;
-                let startup_filename = owner.spec.startup_filename();
-                let termination_filename = owner.spec.termination_filename();
+                let startup_filename = owner.spec.role_startup_filename(role);
+                let termination_filename = owner.spec.role_termination_filename(role);
                 let startup_bytes = read_file(&dir, startup_filename, PROVIDER_JSON_CAP)?;
                 let termination_bytes = read_file(&dir, termination_filename, PROVIDER_JSON_CAP)?;
                 artifacts.push(artifact(
@@ -1775,6 +2032,7 @@ pub(crate) mod linux {
         owner
             .spec
             .validate_process_exit_trace(stdout, &expected_pids)?;
-        Ok(sessions)
+        let external = owner.spec.external_exit_ids(stdout, &expected_pids)?;
+        Ok((sessions, external))
     }
 }

@@ -15,8 +15,18 @@ use std::{
 pub(crate) const OUTPUT_ROOT_BUDGET_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const JOURNAL: &str = "snapshot-retention.v1.jsonl";
 
+#[cfg(test)]
 pub(crate) fn eligible(cleanup_verified: bool, provider_ok: bool, sessions: usize) -> bool {
-    cleanup_verified && provider_ok && sessions == 4
+    eligible_expected(4, cleanup_verified, provider_ok, sessions)
+}
+
+pub(crate) fn eligible_expected(
+    expected: usize,
+    cleanup_verified: bool,
+    provider_ok: bool,
+    sessions: usize,
+) -> bool {
+    matches!(expected, 2 | 4) && cleanup_verified && provider_ok && sessions == expected
 }
 
 fn invalid(message: &str) -> ArenaError {
@@ -233,7 +243,7 @@ fn retire_pins(
         &mut journal,
         &json!({
             "schema": "rovezero.snapshot-retention.v1", "event": "planned",
-            "eligibility": "saved_receipt_verified_process_cleanup_postcheck_and_four_provider_drains",
+            "eligibility": "saved_receipt_verified_process_cleanup_postcheck_and_declared_provider_drains",
             "copies": candidates.iter().map(|(pin, _, _, relative)| json!({
                 "path": relative, "artifact": pin.artifact
             })).collect::<Vec<_>>(),

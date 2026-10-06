@@ -353,6 +353,42 @@ fn actual_binary_handshake_and_one_simulation_return_a_rules_legal_move() {
 }
 
 #[test]
+fn entity_candidate_adapter_uses_the_existing_runtime_search_and_root_lifecycle() {
+    let mut engine = Engine::spawn(&["--cpu-mock", "--model-adapter=entity-candidate-mock"]);
+    engine.handshake();
+    for command in ["position startpos", "position startpos moves e2e4"] {
+        engine.send("ucinewgame");
+        engine.ready();
+        engine.send(command);
+        let mut position = Position::startpos();
+        if command.ends_with("e2e4") {
+            position
+                .make_move(BoardMove::from_uci("e2e4").unwrap())
+                .unwrap();
+        }
+        let after = engine.mark();
+        engine.send("go nodes 8");
+        assert_legal(&position, &engine.bestmove(after));
+    }
+    engine.send("go infinite");
+    engine.ready();
+    engine.send(&format!("position fen {TERMINAL_FEN}"));
+    let after = engine.mark();
+    engine.send("go nodes 8");
+    assert_eq!(engine.bestmove(after), "0000");
+    engine.quiet_bestmoves(3);
+    engine.quit();
+    assert!(
+        !engine
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("SearchFailed") || line.contains("shutdown unconfirmed")),
+        "{:?}",
+        engine.diagnostics
+    );
+}
+
+#[test]
 fn rejected_trace_preserves_the_root_and_root_replacement_newgame_are_distinct() {
     let mut engine = Engine::spawn(&["--cpu-mock"]);
     engine.handshake();
