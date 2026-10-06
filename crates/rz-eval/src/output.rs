@@ -80,6 +80,26 @@ pub fn validate_maia(
     raw: &RawOutput,
     ordered_legal_indices: &[usize],
 ) -> Result<ValidatedHeads, OutputError> {
+    let (policy, wdl) = validate_policy(raw, ordered_legal_indices, |p| p, f64::from)?;
+    Ok(ValidatedHeads { policy, wdl })
+}
+
+/// Write contract probabilities once, preserving the baseline's f32 rounding
+/// before widening. This changes storage only, never softmax/reduction order.
+#[cfg(feature = "experimental-policy-buffer")]
+pub(crate) fn validate_maia_contract(
+    raw: &RawOutput,
+    ordered_legal_indices: &[usize],
+) -> Result<(Vec<f64>, [f32; 3]), OutputError> {
+    validate_policy(raw, ordered_legal_indices, f64::from, |p| p)
+}
+
+fn validate_policy<T: Copy>(
+    raw: &RawOutput,
+    ordered_legal_indices: &[usize],
+    store: impl Fn(f32) -> T,
+    widen: impl Fn(T) -> f64,
+) -> Result<(Vec<T>, [f32; 3]), OutputError> {
     for (head, values, expected) in [
         (Head::Policy, raw.policy_logits.as_slice(), POLICY_SIZE),
         (Head::Wdl, raw.wdl.as_slice(), 3),
@@ -134,18 +154,95 @@ pub fn validate_maia(
         .try_reserve_exact(ordered_legal_indices.len())
         .map_err(|_| OutputError::AllocationFailed)?;
     for &index in ordered_legal_indices {
-        policy.push((weight(index) / denominator) as f32);
+        policy.push(store((weight(index) / denominator) as f32));
     }
-    let sum: f64 = policy.iter().map(|&p| f64::from(p)).sum();
+    let sum: f64 = policy.iter().map(|&p| widen(p)).sum();
     if policy
         .iter()
-        .any(|p| !p.is_finite() || !(0.0..=1.0).contains(p))
+        .map(|&p| widen(p))
+        .any(|p| !p.is_finite() || !(0.0..=1.0).contains(&p))
         || (sum - 1.0).abs() > PROBABILITY_SUM_TOLERANCE
     {
         return Err(OutputError::InvalidPolicyNormalization);
     }
-    Ok(ValidatedHeads {
-        policy,
-        wdl: [raw.wdl[0], raw.wdl[1], raw.wdl[2]],
-    })
+    Ok((policy, [raw.wdl[0], raw.wdl[1], raw.wdl[2]]))
+}
+
+#[cfg(all(test, feature = "experimental-policy-buffer"))]
+mod contract_policy_tests {
+    use super::*;
+
+    fn raw() -> RawOutput {
+        RawOutput {
+            policy_logits: (0..POLICY_SIZE).map(|i| (i % 17) as f32 * 0.125).collect(),
+            wdl: vec![0.5, 0.3, 0.2],
+        }
+    }
+
+    #[test]
+    fn direct_contract_storage_preserves_rounding_order_and_bits() {
+        let mut raw = raw();
+        for indices in [vec![3], vec![12, 7, 1401], (0..POLICY_SIZE).rev().collect()] {
+            let baseline = validate_maia(&raw, &indices).unwrap();
+            let (policy, wdl) = validate_maia_contract(&raw, &indices).unwrap();
+            assert_eq!(wdl.map(f32::to_bits), baseline.wdl().map(f32::to_bits));
+            assert_eq!(
+                policy.iter().map(|p| p.to_bits()).collect::<Vec<_>>(),
+                baseline
+                    .policy()
+                    .iter()
+                    .map(|&p| f64::from(p).to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+        raw.policy_logits.fill(0.0);
+        let (policy, _) = validate_maia_contract(&raw, &[12, 7, 1401]).unwrap();
+        assert_eq!(policy, vec![f64::from(1.0_f32 / 3.0); 3]);
+        assert_ne!(policy[0].to_bits(), (1.0_f64 / 3.0).to_bits());
+        raw.policy_logits[12] = f32::MAX;
+        raw.policy_logits[7] = -f32::MAX;
+        assert_eq!(
+            validate_maia_contract(&raw, &[7, 12]).unwrap().0,
+            vec![0.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn direct_contract_storage_keeps_validation_and_error_precedence() {
+        let raw = raw();
+        for indices in [
+            vec![],
+            vec![12, 12],
+            vec![usize::MAX],
+            vec![0; POLICY_SIZE + 1],
+        ] {
+            assert_eq!(
+                validate_maia_contract(&raw, &indices).unwrap_err(),
+                validate_maia(&raw, &indices).unwrap_err()
+            );
+        }
+        let mut cases = Vec::new();
+        let mut malformed = raw.clone();
+        malformed.policy_logits.pop();
+        malformed.wdl.pop();
+        cases.push(malformed);
+        let mut masked_nan = raw.clone();
+        masked_nan.policy_logits[99] = f32::NAN;
+        masked_nan.wdl.pop();
+        cases.push(masked_nan);
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.1, 1.1] {
+            let mut invalid = raw.clone();
+            invalid.wdl[0] = value;
+            cases.push(invalid);
+        }
+        let mut invalid_sum = raw;
+        invalid_sum.wdl.fill(0.0);
+        cases.push(invalid_sum);
+        for raw in cases {
+            assert_eq!(
+                validate_maia_contract(&raw, &[]).unwrap_err(),
+                validate_maia(&raw, &[]).unwrap_err()
+            );
+        }
+    }
 }

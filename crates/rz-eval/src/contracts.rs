@@ -344,7 +344,11 @@ impl<P> PreparedRequest<P> {
             )
             .into());
         }
-        let heads = output::validate_maia(raw, &self.indices).map_err(|failure| {
+        #[cfg(feature = "experimental-policy-buffer")]
+        let heads = output::validate_maia_contract(raw, &self.indices);
+        #[cfg(not(feature = "experimental-policy-buffer"))]
+        let heads = output::validate_maia(raw, &self.indices);
+        let heads = heads.map_err(|failure| {
             let kind = if matches!(failure, output::OutputError::AllocationFailed) {
                 FailureKind::ResourceExhausted
             } else {
@@ -355,14 +359,16 @@ impl<P> PreparedRequest<P> {
                     .with_output_cause(&failure),
             )
         })?;
+        #[cfg(feature = "experimental-policy-buffer")]
+        let (policy, [w, d, l]) = heads;
+        #[cfg(not(feature = "experimental-policy-buffer"))]
         let [w, d, l] = heads.wdl();
+        #[cfg(not(feature = "experimental-policy-buffer"))]
+        let policy = heads.policy().iter().map(|&p| f64::from(p)).collect();
         Ok(EvalOutput {
             context,
             legal: self.request.legal().clone(),
-            policy: LegalPolicy::try_new(
-                heads.policy().iter().map(|&p| f64::from(p)).collect(),
-                output::PROBABILITY_SUM_TOLERANCE,
-            )?,
+            policy: LegalPolicy::try_new(policy, output::PROBABILITY_SUM_TOLERANCE)?,
             wdl: Wdl::try_new(w, d, l, output::PROBABILITY_SUM_TOLERANCE as f32)?,
             viewpoint: Viewpoint::SideToMove,
             actual: ActualCompute {
