@@ -47,6 +47,8 @@ pub struct ExecutionExperiments {
     pub reuse_buffers: bool,
     pub io_binding: bool,
     pub cuda_graph: bool,
+    /// CUDA's implicit CPU allocator only; never enables CPU node fallback.
+    pub disable_cuda_cpu_arena: bool,
 }
 
 /// Source-thread host intervals. NativeInvocation includes synchronous ORT Run,
@@ -79,11 +81,17 @@ pub fn declared_backend_identity(
     if matches!(config.provider, Provider::Cuda { .. }) {
         profile.push_str(";cuda-arena-extend=same-as-requested-v1");
     }
-    if config.experiments != ExecutionExperiments::default() {
+    let experiments = config.experiments;
+    if experiments.reuse_buffers || experiments.io_binding || experiments.cuda_graph {
+        // Preserve the published codec of the three pre-existing I/O modes.
+        // Adding an independent allocator option must not rename old backends.
         profile.push_str(&format!(
-            ";execution-experiment-v1={:?};copy=synchronous-ort-identity",
-            config.experiments
+            ";execution-experiment-v1=ExecutionExperiments {{ reuse_buffers: {}, io_binding: {}, cuda_graph: {} }};copy=synchronous-ort-identity",
+            experiments.reuse_buffers, experiments.io_binding, experiments.cuda_graph
         ));
+    }
+    if experiments.disable_cuda_cpu_arena {
+        profile.push_str(";cuda-cpu-arena=disabled-v1");
     }
     asset::sha256(profile.as_bytes())
 }
@@ -410,6 +418,9 @@ impl BackendConfig {
 
     pub fn validate(&self) -> Result<(), BackendError> {
         if (self.experiments.reuse_buffers && !cfg!(feature = "experimental-io-buffers"))
+            || (self.experiments.disable_cuda_cpu_arena
+                && (!cfg!(feature = "experimental-ort-cpu-arena")
+                    || !matches!(self.provider, Provider::Cuda { .. })))
             || (self.experiments.io_binding && !cfg!(feature = "experimental-io-binding"))
             || (self.experiments.cuda_graph && !cfg!(feature = "experimental-cuda-graph"))
             || (self.experiments.cuda_graph
@@ -479,6 +490,16 @@ pub struct StartupTimings {
     pub cuda_probe_validation: Option<std::time::Duration>,
 }
 
+/// Synchronous startup boundaries for opt-in, bounded host-memory research.
+/// These are observation points, not phase peaks or GPU completion fences.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupPhase {
+    SerializedModelReady,
+    SessionCommittedBeforeSerializedRelease,
+    SerializedModelReleased,
+    ProviderReady,
+}
+
 pub struct OnnxBackend {
     session: Option<Session>,
     // Kept outside the Run stack so worker quarantine also pins tensor storage
@@ -525,7 +546,13 @@ impl OnnxBackend {
         asset: &MaiaAsset,
         config: BackendConfig,
     ) -> Result<Self, BackendError> {
-        Self::load_model(runtime, asset.metadata(), asset.onnx_bytes(), config)
+        Self::load_model(
+            runtime,
+            asset.metadata(),
+            asset.onnx_bytes(),
+            config,
+            &mut |_| {},
+        )
     }
 
     /// Consumes the verified serialized bytes, releasing that host allocation
@@ -536,8 +563,19 @@ impl OnnxBackend {
         asset: MaiaAsset,
         config: BackendConfig,
     ) -> Result<(AssetMetadata, Self), BackendError> {
+        Self::load_owned_observed(runtime, asset, config, |_| {})
+    }
+
+    /// Opt-in startup observations only. The caller receives no model storage,
+    /// tensors or session handles. The normal constructor uses a no-op observer.
+    pub fn load_owned_observed(
+        runtime: &OrtRuntime,
+        asset: MaiaAsset,
+        config: BackendConfig,
+        mut observe: impl FnMut(StartupPhase),
+    ) -> Result<(AssetMetadata, Self), BackendError> {
         let (metadata, bytes) = asset.into_parts();
-        let backend = Self::load_model(runtime, &metadata, bytes, config)?;
+        let backend = Self::load_model(runtime, &metadata, bytes, config, &mut observe)?;
         Ok((metadata, backend))
     }
 
@@ -546,6 +584,7 @@ impl OnnxBackend {
         asset: &AssetMetadata,
         model: impl AsRef<[u8]>,
         config: BackendConfig,
+        observe: &mut impl FnMut(StartupPhase),
     ) -> Result<Self, BackendError> {
         let setup_started = Instant::now();
         config.validate()?;
@@ -603,6 +642,18 @@ impl OnnxBackend {
                 device_id,
                 arena_bytes,
             } => {
+                if config.experiments.disable_cuda_cpu_arena {
+                    // In ort rc.10 this changes DisableCpuMemArena on the session
+                    // options; it does not append an explicit CPU provider. ORT
+                    // 1.22 still creates its implicit CPU allocator, while the
+                    // disable_cpu_ep_fallback check and CUDA placement remain.
+                    builder = builder
+                        .with_execution_providers([CPUExecutionProvider::default()
+                            .with_arena_allocator(false)
+                            .build()
+                            .error_on_failure()])
+                        .map_err(|error| setup_error(CauseCode::SessionConfiguration, error))?;
+                }
                 let cuda = CUDAExecutionProvider::default();
                 if !cuda
                     .is_available()
@@ -638,16 +689,20 @@ impl OnnxBackend {
         }
         let commit_started = Instant::now();
         let backend_setup = commit_started.duration_since(setup_started);
-        let session = commit_verified_model(model, |bytes| {
-            builder.commit_from_memory(bytes).map_err(|error| {
-                BackendError::new(
-                    K::BackendUnavailable,
-                    S::Backend,
-                    "ORT could not load the verified model with the requested provider",
-                )
-                .with_ort_cause(CauseCode::ModelLoad, error)
-            })
-        })?;
+        let session = commit_verified_model(
+            model,
+            |bytes| {
+                builder.commit_from_memory(bytes).map_err(|error| {
+                    BackendError::new(
+                        K::BackendUnavailable,
+                        S::Backend,
+                        "ORT could not load the verified model with the requested provider",
+                    )
+                    .with_ort_cause(CauseCode::ModelLoad, error)
+                })
+            },
+            observe,
+        )?;
         let model_commit = commit_started.elapsed();
         validate_interface(&session, asset.profile())?;
         // This is a versioned C backend identity, not a new global wire codec.
@@ -774,6 +829,7 @@ impl OnnxBackend {
             });
             result.startup_timings.cuda_probe_validation = Some(probe_started.elapsed());
         }
+        observe(StartupPhase::ProviderReady);
         Ok(result)
     }
 
@@ -1170,8 +1226,16 @@ impl OnnxBackend {
 fn commit_verified_model<T>(
     model: impl AsRef<[u8]>,
     commit: impl FnOnce(&[u8]) -> Result<T, BackendError>,
+    observe: &mut impl FnMut(StartupPhase),
 ) -> Result<T, BackendError> {
-    commit(model.as_ref())
+    observe(StartupPhase::SerializedModelReady);
+    let result = commit(model.as_ref());
+    if result.is_ok() {
+        observe(StartupPhase::SessionCommittedBeforeSerializedRelease);
+    }
+    drop(model);
+    observe(StartupPhase::SerializedModelReleased);
+    result
 }
 
 fn pack_outputs(
@@ -1340,20 +1404,44 @@ mod buffer_tests {
                 dropped: Arc::clone(&dropped),
                 bytes: vec![1, 2, 3, 4],
             };
-            let result = commit_verified_model(model, |bytes| {
-                assert!(!dropped.load(Ordering::Acquire));
-                assert_eq!(bytes, &[1, 2, 3, 4]);
-                if succeeds {
-                    Ok(7)
-                } else {
-                    Err(BackendError::new(
-                        K::BackendUnavailable,
-                        S::Backend,
-                        "fixture commit failure",
-                    ))
-                }
-            });
+            let mut phases = Vec::new();
+            let result = commit_verified_model(
+                model,
+                |bytes| {
+                    assert!(!dropped.load(Ordering::Acquire));
+                    assert_eq!(bytes, &[1, 2, 3, 4]);
+                    if succeeds {
+                        Ok(7)
+                    } else {
+                        Err(BackendError::new(
+                            K::BackendUnavailable,
+                            S::Backend,
+                            "fixture commit failure",
+                        ))
+                    }
+                },
+                &mut |phase| {
+                    assert_eq!(
+                        dropped.load(Ordering::Acquire),
+                        phase == StartupPhase::SerializedModelReleased
+                    );
+                    phases.push(phase);
+                },
+            );
             assert_eq!(result.is_ok(), succeeds);
+            let expected = if succeeds {
+                vec![
+                    StartupPhase::SerializedModelReady,
+                    StartupPhase::SessionCommittedBeforeSerializedRelease,
+                    StartupPhase::SerializedModelReleased,
+                ]
+            } else {
+                vec![
+                    StartupPhase::SerializedModelReady,
+                    StartupPhase::SerializedModelReleased,
+                ]
+            };
+            assert_eq!(phases, expected);
             assert!(
                 dropped.load(Ordering::Acquire),
                 "serialized bytes overlap postcommit work"
@@ -1362,7 +1450,7 @@ mod buffer_tests {
         // Existing callers may keep a borrowed model for independent checks.
         let borrowed = vec![3, 2, 1];
         assert_eq!(
-            commit_verified_model(&borrowed, |bytes| Ok(bytes.len())).unwrap(),
+            commit_verified_model(&borrowed, |bytes| Ok(bytes.len()), &mut |_| {}).unwrap(),
             3
         );
         assert_eq!(borrowed, [3, 2, 1]);

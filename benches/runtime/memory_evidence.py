@@ -120,6 +120,13 @@ def observation(root, item, peak_kind):
         peak = positive(int(match[1]) * 1024)
         if report["reuse_buffers"] is not item["reuse_buffers"]:
             raise ValueError("registered buffer option differs")
+        if "disable_cuda_cpu_arena" in item or report.get("kind") == "b1_cuda_cpu_arena_fixed_work":
+            if (type(item.get("disable_cuda_cpu_arena")) is not bool
+                or report.get("kind") != "b1_cuda_cpu_arena_fixed_work"
+                or report.get("disable_cuda_cpu_arena") is not item["disable_cuda_cpu_arena"]
+                or report.get("cpu_ep_fallback") is not False
+                or report["reuse_buffers"] is not False):
+                raise ValueError("registered CUDA CPU arena option or fallback differs")
     else:
         if peak_kind != "cgroup_memory_peak_bytes":
             raise ValueError("cgroup series must keep its registered whole-group peak")

@@ -144,3 +144,28 @@ fn experimental_execution_rejects_wrong_provider_shape_and_uncompiled_modes() {
         cfg!(feature = "experimental-io-buffers")
     );
 }
+
+#[test]
+fn cuda_cpu_arena_experiment_is_explicit_cuda_only_and_separately_identified() {
+    use rz_eval::onnx::declared_backend_identity;
+    let mut config = BackendConfig::cpu();
+    config.experiments.disable_cuda_cpu_arena = true;
+    assert!(config.validate().is_err()); // Does not silently alter CPU inference.
+    config.provider = Provider::Cuda {
+        device_id: 0,
+        arena_bytes: 1024,
+    };
+    config.profiling_prefix = Some(std::env::temp_dir().join("rz-cpu-arena-placement"));
+    assert_eq!(
+        config.validate().is_ok(),
+        cfg!(feature = "experimental-ort-cpu-arena")
+    );
+    let experiment = declared_backend_identity([0; 32], [0; 32], Some([0; 32]), &config);
+    config.experiments.disable_cuda_cpu_arena = false;
+    config.validate().unwrap();
+    assert_ne!(
+        experiment,
+        declared_backend_identity([0; 32], [0; 32], Some([0; 32]), &config)
+    );
+    assert_eq!(config.experiments, Default::default());
+}

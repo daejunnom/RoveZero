@@ -26,6 +26,7 @@ rz-runtime = { workspace = true, optional = true, features = ["contracts"] }
 [features]
 experimental-batch = ["contracts", "rz-runtime/experimental-batch"]
 experimental-io-buffers = ["onnx"]
+experimental-ort-cpu-arena = ["onnx"]
 experimental-io-binding = ["onnx"]
 experimental-cuda-graph = ["experimental-io-binding"]
 experimental-notify = ["dep:rz-runtime", "rz-runtime/experimental-notify"]

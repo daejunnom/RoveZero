@@ -22,6 +22,10 @@ inference에는 `report`와 `reuse_buffers`도 지정한다. 추가 작은 JSON 
 이전 결과에 source SHA가 없으면 `registration={"path":"...","sha256":"..."}`의
 고정 source를 요구한다. Raw source가 있으면 registration과 일치해야 한다.
 
+CUDA CPU arena 비교의 inference arm에는 `disable_cuda_cpu_arena`도 명시한다.
+새 report kind와 실제 옵션·fallback off·buffer reuse off를 대조하여 양쪽 옵션이
+뒤바뀌거나 다른 실행을 같은 비교로 집계하지 않는다. 이전 ledger는 그대로 읽을 수 있다.
+
 각 series는 기준·변경 T 합계와 `sum(T1)/sum(T0)`, 실행별 peak 관측값의 합계·평균과
 `sum(P1)/sum(P0)`, 쌍별 비율의 범위·중앙값·기하평균을 함께 남긴다. **Peak의 합계는
 독립 실행 관측값의 합이며 동시에 필요한 메모리나 시스템 peak가 아니다.** RSS와
@@ -44,6 +48,22 @@ python -m unittest discover -s benches/runtime/tests -p test_memory_evidence.py 
 
 `--include-ledger`는 반복 지정할 수 있다. 이전 ledger를 수정하지 않고 새 실행의 ledger를
 추가하며 각 입력 ledger SHA도 출력에 남긴다. 중복 comparison은 한 번만 센다.
+
+## CUDA session의 CPU arena 한 변수 연구
+
+`rz-eval`의 `experimental-ort-cpu-arena`는 기본 off이며 컴파일만으로 활성화되지 않는다.
+`inference_bench --b1-cpu-arena=baseline|disabled`는 동일 바이너리의 BT4 FP32 B1,
+warm3/timed20과 출력 digest를 대조한다. 여섯 절대 경로 인자는 기존 진입점과 같다.
+`maia_check`의 `--experimental-ort-cpu-arena`로 독립 수치·수명 검사를 먼저 실행한다.
+기본 batch sweep·UCI 대국 설정에는 적용하지 않는다.
+
+두 비교 arm 모두 준비 단계의 `/proc/self/status`를 8개 경계에서 읽는다.
+Session commit 직후에는 직렬화 원본이 아직 살아 있고 다음 관측은 owned 원본 해제 후다.
+기존 생성자는 no-op observer를 사용하므로 일반 대국에 반복 PID/GPU 조사를 추가하지 않는다.
+실패 보고서는 도달한 관측만 남긴다. RSS endpoint와 process-lifetime VmHWM은
+phase peak·live heap·cgroup file cache·VRAM·Windows commit과 구분한다.
+이 옵션은 ORT 내부 CPU allocator의 arena만 끄며 CPU node fallback 금지·CUDA 배치 증거·
+물리 완료 조건을 유지한다. 새 backend identity는 별도이며 기존 I/O 옵션의 identity는 보존한다.
 
 ## D02 CPU/mock trace 재생
 

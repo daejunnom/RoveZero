@@ -116,7 +116,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("inference baseline benchmark excludes execution experiments".into());
     }
     if !(8..=10).contains(&args.len()) {
-        return Err("usage: maia_check SOURCE.pb.gz MODEL.onnx MANIFEST.json ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu | cuda PROFILE_DIRECTORY CUDA_BUNDLE.json [--experimental-io-buffers] [--experimental-io-binding] [--experimental-cuda-graph]".into());
+        return Err("usage: maia_check SOURCE.pb.gz MODEL.onnx MANIFEST.json ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu | cuda PROFILE_DIRECTORY CUDA_BUNDLE.json [--experimental-io-buffers] [--experimental-io-binding] [--experimental-cuda-graph] [--experimental-ort-cpu-arena]".into());
     }
     let is_cuda = match args[7].as_str() {
         "cpu" if (8..=9).contains(&args.len()) => false,
@@ -361,6 +361,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "reuse_buffers":experiments.reuse_buffers,
             "io_binding":experiments.io_binding,
             "cuda_graph_requested":experiments.cuda_graph,
+            "disable_cuda_cpu_arena":experiments.disable_cuda_cpu_arena,
             "repeated_B1_calls":32, "retained_outputs_unchanged":true,
             "binding_runs":backend.binding_runs(),
             "phase_clock":"CPU wall boundaries; Run includes kernels/synchronization",
@@ -464,6 +465,10 @@ fn experimental_options(options: &[String]) -> Result<ExecutionExperiments, Box<
             "--experimental-cuda-graph" => (
                 &mut experiments.cuda_graph,
                 cfg!(feature = "experimental-cuda-graph"),
+            ),
+            "--experimental-ort-cpu-arena" => (
+                &mut experiments.disable_cuda_cpu_arena,
+                cfg!(feature = "experimental-ort-cpu-arena"),
             ),
             _ => return Err("unknown execution experiment".into()),
         };

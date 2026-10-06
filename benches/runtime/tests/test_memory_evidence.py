@@ -57,6 +57,30 @@ class Accounting(unittest.TestCase):
         self.assertAlmostEqual(total["cumulative_time_ratio"], 29 / 30)
         self.assertAlmostEqual(total["cumulative_peak_ratio"], 230 / 300)
 
+    def test_cuda_cpu_arena_requires_actual_explicit_option_and_no_fallback(self):
+        result = self.pin(dict(accepted=True, exit_code=0, conditioning=False,
+            forced_cgroup_cleanup=False, remaining_after_cleanup=[], source_commit="source0",
+            elapsed_s=10, cgroup={"memory.events":"max 0\noom 0\noom_kill 0\n"}))
+        report = dict(accepted=True, failure=None, kind="b1_cuda_cpu_arena_fixed_work",
+            disable_cuda_cpu_arena=True, cpu_ep_fallback=False, reuse_buffers=False,
+            batches=[1], warmup_runs=3, measured_runs=20,
+            samples=[dict(completed_nn_items=20, physical_completion_confirmed=True)],
+            memory={"self_vm_hwm":"100 kB"}, input_sha256="input", output_sha256="output",
+            model_sha256="model", export_manifest_sha256="manifest", runtime_bundle_sha256="bundle",
+            precision="fp32", history_fill="no", tf32=False, cache=False, dedup=False,
+            io_binding=False, cuda_graph=False)
+        item = dict(layout="inference", result=result, report=self.pin(report),
+            reuse_buffers=False, disable_cuda_cpu_arena=True)
+        self.assertEqual(module.observation(self.root, item, "process_vm_hwm_bytes")["peak_bytes"], 102400)
+        for changes in ({"disable_cuda_cpu_arena":False}, {"cpu_ep_fallback":True}, {"reuse_buffers":True}):
+            invalid = dict(item, report=self.pin(dict(report, **changes)))
+            with self.assertRaises(ValueError):
+                module.observation(self.root, invalid, "process_vm_hwm_bytes")
+        for value in (False, 1, None):
+            invalid = dict(item, disable_cuda_cpu_arena=value)
+            with self.assertRaises(ValueError):
+                module.observation(self.root, invalid, "process_vm_hwm_bytes")
+
     def test_identical_comparison_is_counted_once(self):
         pair = self.pair("p1")
         result = self.aggregate([pair, copy.deepcopy(pair)])

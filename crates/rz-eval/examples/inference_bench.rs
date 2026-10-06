@@ -63,6 +63,8 @@ fn memory_evidence() -> Value {
             })
         };
         json!({"self_vm_hwm":field("VmHWM:"),"self_vm_rss":field("VmRSS:"),
+            "self_rss_anon":field("RssAnon:"),"self_rss_file":field("RssFile:"),
+            "self_rss_shmem":field("RssShmem:"),"self_vm_size":field("VmSize:"),
             "peak_vram":"unknown","scope":"final_proc_self_rss_not_gpu_or_global_commit"})
     }
     #[cfg(not(target_os = "linux"))]
@@ -76,11 +78,17 @@ fn save(file: &mut File, report: &Value) -> Result<(), Box<dyn Error>> {
     file.sync_all()?;
     Ok(())
 }
+fn observe_memory(points: &mut Vec<Value>, started: Instant, phase: &str) {
+    points.push(
+        json!({"phase":phase,"since_prepare_ns":ns(started.elapsed()),"memory":memory_evidence()}),
+    );
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RunMode {
     BatchSweep,
     B1Buffers { reuse: bool },
+    B1CpuArena { disabled: bool },
 }
 impl RunMode {
     fn parse(option: Option<&str>) -> Result<Self, Box<dyn Error>> {
@@ -90,6 +98,10 @@ impl RunMode {
             Some("--b1-buffers=reuse") if cfg!(feature = "experimental-io-buffers") => {
                 Ok(Self::B1Buffers { reuse: true })
             }
+            Some("--b1-cpu-arena=baseline") => Ok(Self::B1CpuArena { disabled: false }),
+            Some("--b1-cpu-arena=disabled") if cfg!(feature = "experimental-ort-cpu-arena") => {
+                Ok(Self::B1CpuArena { disabled: true })
+            }
             _ => {
                 Err("unknown comparison mode or unavailable experimental-io-buffers feature".into())
             }
@@ -98,7 +110,7 @@ impl RunMode {
     fn widths(self) -> &'static [usize] {
         match self {
             Self::BatchSweep => &[1, 2, 4, 8, 16],
-            Self::B1Buffers { .. } => &[1],
+            Self::B1Buffers { .. } | Self::B1CpuArena { .. } => &[1],
         }
     }
 }
@@ -109,7 +121,7 @@ fn recycle_checked(
     mode: RunMode,
     expected: &mut Option<String>,
 ) -> Result<(), Box<dyn Error>> {
-    if let RunMode::B1Buffers { .. } = mode {
+    if mode != RunMode::BatchSweep {
         let bytes: Vec<_> = outputs
             .iter()
             .flat_map(|raw| raw.policy_logits.iter().chain(&raw.wdl))
@@ -129,7 +141,7 @@ fn recycle_checked(
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if !(args.len() == 6 || args.len() == 7) {
-        return Err("usage: inference_bench SOURCE ONNX EXPORT CUDA_CORE CUDA_BUNDLE REPORT [--b1-buffers=baseline|reuse] (all six paths absolute; fresh REPORT outside Git)".into());
+        return Err("usage: inference_bench SOURCE ONNX EXPORT CUDA_CORE CUDA_BUNDLE REPORT [--b1-buffers=baseline|reuse|--b1-cpu-arena=baseline|disabled] (all six paths absolute; fresh REPORT outside Git)".into());
     }
     let mode = RunMode::parse(args.get(6).map(String::as_str))?;
     if args[..6].iter().any(|arg| !Path::new(arg).is_absolute()) {
@@ -158,6 +170,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         report["batches"] = json!([1]);
         report["reuse_buffers"] = json!(reuse);
         report["measurement"] = json!("host_wall_including_run_physical_completion_output_digest_and_ownership_return_not_kernel_time");
+    }
+    if let RunMode::B1CpuArena { disabled } = mode {
+        report["kind"] = json!("b1_cuda_cpu_arena_fixed_work");
+        report["batches"] = json!([1]);
+        report["disable_cuda_cpu_arena"] = json!(disabled);
+        report["cpu_ep_fallback"] = json!(false);
+        report["reuse_buffers"] = json!(false);
+        report["startup_memory_observations"] = json!("bounded self RSS endpoints and process lifetime HWM; not phase peaks, live heap, cgroup file cache, VRAM or Windows commit");
+        report["measurement"] = json!("host_wall_including_run_physical_completion_output_digest_and_ownership_return_not_kernel_time; same startup memory observations in both arms");
     }
     let started = Instant::now();
     let outcome = sweep(&args, &mut report, mode);
@@ -209,6 +230,11 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
     for &width in mode.widths() {
         report["active_batch"] = json!(width);
         let preparation = Instant::now();
+        let mut memory_points = Vec::new();
+        if matches!(mode, RunMode::B1CpuArena { .. }) {
+            observe_memory(&mut memory_points, preparation, "BeforeAssetLoad");
+            report["startup_memory"] = json!(memory_points);
+        }
         let model = MaiaAsset::load(
             Path::new(&args[0]),
             Path::new(&args[1]),
@@ -231,10 +257,25 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
                 ..ExecutionExperiments::default()
             };
         }
+        if let RunMode::B1CpuArena { disabled } = mode {
+            config.experiments.disable_cuda_cpu_arena = disabled;
+        }
         let profile_dir = Path::new(&args[5]).with_extension(format!("b{width}.placement"));
         std::fs::create_dir(&profile_dir)?;
         config.profiling_prefix = Some(profile_dir.join("placement"));
-        let (_, mut backend) = OnnxBackend::load_owned(&runtime, model, config)?;
+        let loaded = if matches!(mode, RunMode::B1CpuArena { .. }) {
+            let loaded = OnnxBackend::load_owned_observed(&runtime, model, config, |phase| {
+                observe_memory(&mut memory_points, preparation, &format!("{phase:?}"))
+            });
+            report["startup_memory"] = json!(memory_points);
+            loaded
+        } else {
+            OnnxBackend::load_owned(&runtime, model, config)
+        };
+        let (_, mut backend) = loaded?;
+        if matches!(mode, RunMode::B1CpuArena { .. }) {
+            report["backend_sha256"] = json!(hex(backend.identity()));
+        }
         let prep_ns = ns(preparation.elapsed());
         let placement = backend
             .cuda_evidence()
@@ -257,6 +298,10 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
             }
         }
         let warmup_ns = ns(warmup.elapsed());
+        if matches!(mode, RunMode::B1CpuArena { .. }) {
+            observe_memory(&mut memory_points, preparation, "AfterWarmup");
+            report["startup_memory"] = json!(memory_points);
+        }
         let mut times = Vec::with_capacity(20);
         for _ in 0..20 {
             let run = Instant::now();
@@ -273,6 +318,10 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
             }
         }
         backend.verify_cuda_runtime_mappings()?;
+        if matches!(mode, RunMode::B1CpuArena { .. }) {
+            observe_memory(&mut memory_points, preparation, "AfterMeasuredRuns");
+            report["startup_memory"] = json!(memory_points);
+        }
         let total: u64 = times.iter().sum();
         report["samples"].as_array_mut().unwrap().push(json!({
             "batch":width,"prepare_ns":prep_ns,"warmup_ns":warmup_ns,"latency_ns":times,
@@ -288,6 +337,10 @@ fn sweep(args: &[String], report: &mut Value, mode: RunMode) -> Result<(), Box<d
         // Normal drop only after confirmed completion. On an error the backend
         // retains its own unconfirmed tensors/session; no larger batch runs.
         drop(backend);
+        if matches!(mode, RunMode::B1CpuArena { .. }) {
+            observe_memory(&mut memory_points, preparation, "AfterBackendDrop");
+            report["startup_memory"] = json!(memory_points);
+        }
     }
     report["active_batch"] = Value::Null;
     Ok(())
@@ -311,6 +364,17 @@ mod tests {
         for bad in ["--b1-buffers=", "--b1-buffers=4", "--b1-buffers=notify"] {
             assert!(RunMode::parse(Some(bad)).is_err());
         }
+        assert_eq!(
+            RunMode::parse(Some("--b1-cpu-arena=baseline"))
+                .unwrap()
+                .widths(),
+            &[1]
+        );
+        assert_eq!(
+            RunMode::parse(Some("--b1-cpu-arena=disabled")).is_ok(),
+            cfg!(feature = "experimental-ort-cpu-arena")
+        );
+        assert!(RunMode::parse(Some("--b1-cpu-arena=auto")).is_err());
     }
     #[test]
     fn fixed_input_matches_previous_no_history_tensor_identity() {
