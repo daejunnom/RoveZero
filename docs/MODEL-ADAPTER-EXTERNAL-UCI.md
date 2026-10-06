@@ -163,3 +163,39 @@ swap=0을 사용한다. `bounded_local.py`는 정상 quit/drain을 본 실행 �
 정리를 총 30초로 제한한다. 정확한 자식과 자신의 새 cgroup만 종료하며 비어 있음/reap
 확인 후 자신의 tmp만 정리한다. 자료는 보존하고 미관측 VRAM/Windows commit peak는
 unknown이다. 별도 cloud 비용·학습·정밀도/batch 정책·backend 변경·session 공유는 제외한다.
+
+## 현재 인수 상태 (2026-10-07)
+
+구현·CPU 인수와 실제 GPU 수치 인수는 제공했으며 성능 회귀·대국 인수는 HOLD다.
+엔진/arena 바이너리 source는 `4d715b3`, cache 준비 recipe source는 `94bfcc3`이다.
+후자의 변경은 Python recipe·검사·이 문서에 한정되고 Rust/Cargo 소스는 동일하다.
+
+- 로컬 WSL Rust 전체 feature/all-target 820개 통과, 16개 명시적 미실행, all-feature
+  Clippy 통과. Linux recipe 검사 51개 통과. `94bfcc3`의 Linux·Windows·bindings CI
+  세 job이 실제 성공했다. CPU CI를 실제 GPU 검사로 대신하지 않는다.
+- `f8983cf`의 실제 CUDA Maia/BT4 raw·Rules 네 독립 검사에서 각각 No/Repeat 12사례,
+  raw 입력 byte 일치·Rules dense 입력 차이 0·합법 policy·WDL·물리 종료를 확인했다.
+  BT4 raw logits 최대 절대차
+  6.50883e-5, policy 2.80142e-6, WDL 1.78814e-7이다. 이후 해당 adapter·encoding·
+  Rules·search·contracts·native runtime·Cargo/toolchain 소스 일치로 수치 증거를 재사용한다.
+- 원래 기준의 30초/edge 한도 실패 기록과 새 cap의 첫 A/A cold/warm HOLD를 보존했다.
+  새 cap은 두 입력의 4096 simulation을 각각 완료했으며, 각 실행의 NN root 소비 2개·
+  backup 소비 8192개·runtime 완료 8194개가 일치했다. 물리 NN 실행 수를 이 합계로
+  대신하지 않는다.
+- 별도 shared runtime 준비에서 sealed 파일 19개/2,970,143,952바이트를 3.30초에
+  읽기·해시 검증했다. 준비 비용·shared bytes·cgroup peak를 개별 엔진 측정과 구분한다.
+
+| shared-cache A/A | 첫 실행 T / P | 두 번째 T / P | 쌍별 판정 |
+|---|---|---|---|
+| 쌍 1 | 128.63초 / 1.629GiB | 125.45초 / 1.627GiB | 시간·peak 통과 |
+| 쌍 2 | 126.03초 / 1.629GiB | 134.33초 / 1.683GiB | 시간 비율 1.06583로 HOLD, peak 비율 1.03370 |
+
+네 실행 모두 작업량·착수·정상 물리 종료가 일치했고 memory.high/max·OOM 이벤트는
+0이었다. 두 번째 쌍은 ready에서 약 3.75초, 두 검색의 합에서 약 4.57초 차이가 났다.
+원인을 GPU clock·호스트 부하·어댑터 결함으로 확정하지 않는다. A/A 두 쌍만 완료했으며
+첫 초과에서 종료했으므로 A/B는 0쌍이다. 기준을 완화하거나 과거 자료를 섞지 않는다.
+
+Stockfish 19 CPU preflight·옵션·stop·quit·소유 process 종료는 통과했고 V2 실행 선언은
+제공했다. 회귀 gate가 HOLD라 paired 두 판은 실행하지 않았으며 실제 대국 PGN도 없다.
+다음 GPU 인수는 ready·검색 편차의 조건을 분리해 새로운 비교로 등록한 뒤 A/A 3쌍과
+A/B 5쌍을 통과하는 순서다. 그 전에는 성능 회귀 없음·외부 강도 검증 완료를 선언하지 않는다.
