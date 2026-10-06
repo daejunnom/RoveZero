@@ -1068,6 +1068,87 @@ hash·raw receipts·correction·누적 ledger는 Git 밖
 `${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-raw-cache-ownership-ab-20261006-v2/`에
 보존한다. 새 CPU harness/allocator trace를 제품·CI·일반 대국 준비에 추가하지 않았다.
 
+### 4.18 Raw cache gate의 native 종료 수정·긴 CPU A/B
+
+<a id="raw-cache-native-shutdown-long-ab"></a>
+
+§4.17의 GPU 오류 뒤 실제 종료 경계를 대조했다. `rules_maia_check`의 request drain은
+예약과 요청이 비었음을 확인하지만 native session·worker thread/TLS 파괴를 기다리지
+않았다. Source `b39dc4aa4d34719134456967d2b9b36b8975388a`는 기존
+`NativeWorkerOwner::try_shutdown()`을 **수치 검사 예제에 연결**하고 최대5초 안의 join을
+별도 영수증으로 남긴다. 성공·실패한 work 모두 같은 정리를 거치며 원래 오류를 보존한다.
+종료/진단 회수가 미확정이면 owner를 보존한다. Native 파괴 전 작은 stderr checkpoint를
+남겨 C++ abort가 모든 진행 근거를 지우지 않게 했다. 반복 PID/GPU 조사기는 추가하지 않았다.
+
+제품 UCI의 `finish_until`은 이미 이 join을 확인하고 있었다. UCI·backend·allocator·
+공통 계약·기본 feature는 이번 수정에서 바꾸지 않았다. 고정
+[ORT1.22 pinned allocator](https://github.com/microsoft/onnxruntime/blob/v1.22.0/onnxruntime/core/providers/cuda/cuda_allocator.cc#L90)의
+`cudaFreeHost` 오류를 숨기는 수정도 아니다. 이전 driver-shutdown SIGABRT와 복사형
+ORT의 malloc/free-list 손상이 같은 원인인지 아직 확인하지 않았다.
+
+CPU 회귀는 실제 ContractEvaluator/NativeWorkerOwner 경계에서 정상 요청과 물리 실패
+요청의 native destructor를 지연했다. 예약0 뒤에도 join은 Pending이며, 정리를 허용한
+뒤에만 완료된다. 원래 실패 진단도 보존한다. Eval all-feature/all-target **106개**,
+최소 onnx/contracts 예제 **2개**, strict example Clippy·workspace fmt·release gate build가
+통과했다. [b39dc4a CI37429555483](https://github.com/daejunnom/RoveZero/actions/runs/37429555483)의
+Ubuntu·Windows·bindings 세 job SUCCESS를 직접 확인했다. CPU CI와 다음 실제 GPU 근거는
+각각 보존한다.
+
+수치 gate는 같은 원본 BT4 ONNX·FP32·TF32 off·B1·RTX4050에서 No/Repeat를 실행했다.
+**Fresh 요청 출력12개·cache replay24개**, 두 profile의 native join·process exit0을
+확인했다. Provider 준비 probe 두 개는 요청 출력12개와 별개다. 입력 최대 오차0,
+합법 policy 최대 오차`2.8014183044433594e-6`, WDL 최대 오차`1.7881393432617188e-7`이다.
+각 profile의 CUDA placement687node/CPU fallback0을 확인했다. 전체21.285788초,
+cgroup peak5,087,748,096B이며 high/max/OOM·강제 정리·소유 잔류는0이다.
+
+실패 work의 정리는 Git 밖에 원본 reference의 사본을 만들고 두 번째 No case의 WDL을
+의도적으로 틀린 유효 확률 벡터로 바꿔 별도 검사했다. 원본 참조는 보존했다. 제품 report는
+**failed·exit1**, 원래 `numerical mismatch: absolute error=0.831609234213829`를 유지하면서
+native join을 완료했다. Validation accepted는 **예상 실패와 정리의 확인**이며 신경망
+수치 통과가 아니다. 전체19.866445초, peak4,829,409,280B, high/max/OOM·강제 정리·잔류0이다.
+이 두 실행에서 native abort는 재현되지 않았다. VRAM peak·Windows commit peak는 unknown이다.
+
+이 gate는 Rules 입력·합법 policy/WDL·cache 재사용·native 정상/실패 정리의 근거다.
+Raw logits와 batch1/2/4/8/16 독립 수치 suite는 별도다. 전체 시간/peak를 이전 실패한
+부분 실행과 나누어 개선율로 만들지 않는다. GPU 성능 A/B·대국·Elo 인수는 없다.
+**복사형 ORT heap 문제는 별도 HOLD이며 이번에 수정하거나 다시 검사하지 않았다.**
+
+짧은 CPU 표본의 startup 편차를 줄이기 위해 같은 baseline0566fb9/variant7d6311c·여섯
+Rules 상태·결정적 raw head에서 **1,572,864 cache hit**의 새 series를 사전 등록했다.
+공통 harness의 repeat만4096→262144로 늘렸다. 측정에는 allocator hook·NN·GPU·search/D
+없음, 출력 digest·seed6개·모든 작업은 양쪽 동일이다. 이전24,576-hit series와 조건/epoch를
+분리한다. Source7d6311c 이후 b39dc4a까지 제품 Rust/Cargo 변경이 수치 gate 예제에만 있음을
+확인했지만 성능 source 식별은 계속7d6311c다. §4.17 할당 trace를 새 RAM/VRAM 절약량으로
+환산하거나 반복 배수만큼 새 실측으로 확대하지 않는다.
+
+순서는 `A1 B1 B2 A2 A3 B3`, CPU2/affinity2·high=max512MiB/swap0·pids128·AS2GiB·
+실행120초+정리30초·전체900초다. Primary peak는 전체 cgroup `memory.peak`이고,
+시간은 자식 startup·고정 작업·종료·report·cgroup 영수증까지다.
+
+| 쌍 | A 전체 초 | B 전체 초 | T1/T0 | A peak bytes | B peak bytes | P1/P0 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 34.198197 | 34.795707 | 1.017472 | 1,597,440 | 1,589,248 | 0.994872 |
+| 2 | 34.125705 | 33.740120 | 0.988701 | 1,593,344 | 1,335,296 | 0.838046 |
+| 3 | 34.217314 | 34.867408 | 1.018999 | 1,523,712 | 1,593,344 | 1.045699 |
+
+누적 시간은**102.541216→103.403235초**, 비율**1.008407**이다. 실행 peak 관측 평균은
+**1,571,498.67→1,505,962.67B**, 관측 합계비**0.958297**이다. Baseline 시간 spread는
+0.091610초다. 시간은 약0.84% 늘고 평균 관측 peak는 약4.17% 줄었지만, 세 번째 쌍은
+peak가 늘고 두 쌍은 느려졌다. All-pair 상충/Pareto 문턱을 모두 충족하지 않아
+**HOLD·기본 cache off**다. 여섯 실행은 exit0·같은 출력 digest·high/max/OOM/강제 정리/잔류0이다.
+이 작은 CPU fixture의 peak를 실제 GPU 엔진 메모리로 확대하지 않으며 독립 peak 합계를
+동시 메모리 사용량으로 해석하지 않는다.
+
+기존9개 series 집계의 완전 일치를 확인하고 긴 CPU3쌍만 추가했다. 누적은
+**36개 비교·고유69회·공유 기준3개·10개 series/epoch·제외20개 collection**이다.
+정상 GPU/예상 실패 GPU와 setup·compile 수정은 별도 제외 collection으로 보존한다.
+Windows worktree Git metadata를 WSL에서 읽은 preflight 실패는 Windows Git의 source 확인과
+WSL byte hash로 바로잡았으며 `.git`은 바꾸지 않았다. 초기 CPU 회귀의 타입 오류와 집계
+helper의 schema/non-JSON evidence 오류도 correction과 함께 보존했다. 집계기·제품 guard·
+원시 측정값은 바꾸지 않았다. 원시 등록·hash·report·receipt·CI·누적 동일성 근거는 Git 밖
+`${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-native-cache-shutdown-20261006/`에 둔다.
+별도 성능 harness는 제품·CI·일반 대국 준비에 추가하지 않았다.
+
 ## 5. 후속 구현·검증 순서
 
 할당/복사 제거 → 저장 밀도 → bounded scratch/arena/pool → 임계 구역/완료 통지 →
