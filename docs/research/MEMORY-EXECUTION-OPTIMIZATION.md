@@ -989,6 +989,85 @@ Ubuntu·Windows·bindings 세 job도 SUCCESS로 직접 확인했다.
 기존 수치·계측을 새 source의 성능으로 재사용하지 않는다. 현재104개 검사는 CPU/mock
 정확성 증거다. 채택은 §2의 전체 시간·사전 primary peak·의미/수명 문턱을 별도로 따른다.
 
+### 4.17 Raw cache 공유의 CPU 할당 추적·고정 작업 A/B
+
+<a id="raw-cache-shared-heads-cpu-ab"></a>
+
+§4.16의 후속 검증은 baseline `0566fb90b3d2bfe9da9d085b097c9dfc019b7e4e`와
+variant `7d6311cde5e16eb07b4fdd5085ea9176ff74b23d`를 같은 독립 harness로 빌드했다.
+실제 Rules의 여섯 상태·No history·결정적 raw logits/WDL을 사용하고, 여섯 seed 평가 후
+**24,576회 exact raw cache hit**를 수행했다. 신경망·GPU·search/D scheduler는 실행하지
+않았다. 다른 합법 수 투영·반복 상태·counter가 포함되며 출력 digest와 원래 수명 검사를
+양쪽에서 대조했다. 초기 fixture는 서로 다른 Rules 이력이 같은 No 입력이 되는 사례를
+miss로 잘못 기대했다. 제품의 exact hit가 맞았으며 실패를 보존하고 구별되는 counter로
+fixture를 수정해 새 digest의 별도 조건으로 등록했다.
+
+제품 allocator는 바꾸지 않았다. Git 밖의 allocation trace는
+[System](https://doc.rust-lang.org/std/alloc/struct.System.html)에 그대로 위임하고
+[GlobalAlloc의 재진입·unwind 제한](https://doc.rust-lang.org/std/alloc/trait.GlobalAlloc.html)을
+지키는 작은 관측 경계다. 이 관측이 시간을 교란하므로 trace와 **관측 hook이 없는 성능
+바이너리**를 따로 빌드했다. 다음 값은 trace의 host 요청 할당이며 native/VRAM 실측이 아니다.
+
+| 24,576 hit의 trace | baseline | 공유 variant |
+|---|---:|---:|
+| 할당 요청 수 | 245,760 | 196,608 |
+| 누적 요청 bytes | 939,622,400 | 756,678,656 |
+| 관측 phase의 새 live 할당 peak bytes | 37,616 | 30,408 |
+| 여섯 entry의 cache retained charge bytes | 225,096 | 225,240 |
+
+Hit당 **두 할당·7444B 요청** 제거를 관측했다. 누적 **182,943,744B(174.47MiB)**는
+할당 요청 총량의 차이이며 RAM/VRAM 절약량이 아니다. 추가 owner charge는 전체144B다.
+관측 phase 종료의 잔류는0이고 정상 cache/owner 해제를 확인했다.
+
+성능은 세 쌍을 `A1 B1 B2 A2 A3 B3` 순서로 사전 등록했다. CPU2/affinity2,
+high=max512MiB/swap0·pids128·AS2GiB·실행120초+정리30초·전체900초다.
+전체 시간은 자식 startup·작업·종료·report 인수·최종 cgroup 영수증까지 포함하고,
+build·allocation trace·독립 GPU gate를 제외한다. Primary peak는 전체 cgroup `memory.peak`다.
+
+| 쌍 | A 전체 초 | B 전체 초 | T1/T0 | A peak bytes | B peak bytes | P1/P0 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 0.675944 | 0.560630 | 0.82940 | 1,335,296 | 1,335,296 | 1.00000 |
+| 2 | 0.587666 | 0.686395 | 1.16800 | 1,335,296 | 1,589,248 | 1.19018 |
+| 3 | 0.692256 | 0.582547 | 0.84152 | 1,335,296 | 1,593,344 | 1.19325 |
+
+누적 시간비는 **0.93543**, 실행 peak 관측 합계비는 **1.12781**이다. Baseline 시간
+spread는0.104591초다. 짧은 실행·환경 편차가 크고 두 번째 쌍이 더 느리며 primary peak도
+개선되지 않아 §2의 상충/Pareto 문턱 모두 실패한다. **HOLD·기본 cache off**를 유지한다.
+분모가 다른 GPU series와 시간을 합쳐 개선율을 만들지 않고, peak 합계를 동시 사용량으로
+해석하지 않는다. 여섯 CPU 실행의 high/max/OOM·강제 정리·소유 잔류는0이다.
+
+`rules_maia_check --experimental-raw-cache`는 실제 Rules→원본 BT4 ONNX FP32 B1→D
+fresh 결과와 요청 ID가 다른 두 cache replay의 합법 policy/WDL·물리 실행 없음·예약0을
+대조하는 선택적 수치 진입점이다. No/Repeat 전체 검사를 계획했으나 GPU 인수는 실패했다.
+최초 잘못된 runtime cache 부모 root는 session 이전에 거부됐다. 별도 수정 조건은 No의
+fresh1개와 replay2개를 관측한 뒤 검사 예제의 ID `1→64→65→2` 역행을 실제 계약이 거부했다.
+이어 `cudaFreeHost(p)`에서 **CUDA failure4 driver shutting down·SIGABRT**가 발생했다.
+이 오류를 앞선 malloc unsorted/free-list 실패의 재현으로 분류하지 않는다. 공통 원인은
+unknown이며 원본 ONNX gate로 복사형 ORT 수명 문제를 해결했다고 주장하지 않는다.
+
+관측된 한 case의 policy/WDL 최대 오차는 각각 `5.2154e-7`/`1.1921e-7`이지만 부분 자료다.
+실패 GPU 실행의 peak는4,724,609,024B, high/max/OOM·강제 정리·소유 잔류는0이다.
+VRAM peak·Windows commit은 unknown이다. 첫 CUDA 실패 뒤 후속 GPU 실행·A/B·대국을
+중단했다. Numerical report·drain/예약0으로 native 정상 종료를 대체하지 않는다.
+
+후속 source `c74735dbfddafac8a4897a9c0950f012f4bb0637`은 예제 ID를 연속 세 개씩
+배정하고 default stream은 유지했다. 두 stream을 실제 admission adapter로 검사하는
+CPU 회귀를 추가했다. Eval all-feature/all-target **105개**, 최소 onnx/contracts 예제1개,
+strict example Clippy·workspace fmt가 통과했다. 이는 ID 수정과 CPU 정확성 증거이며
+GPU를 다시 실행한 결과가 아니다. 성능 바이너리/기록은 계속7d6311c로 식별한다.
+[7d6311c CI37425154376](https://github.com/daejunnom/RoveZero/actions/runs/37425154376)의
+Ubuntu·Windows·bindings 세 job SUCCESS와 후속 source 검사 결과를 구별한다.
+[c74735d CI37427203372](https://github.com/daejunnom/RoveZero/actions/runs/37427203372)도
+같은 세 job의 SUCCESS를 직접 확인했다. 이 workflow는 CPU 검사이며 GPU native 종료
+실패를 해결하거나 인수하지 않는다.
+
+기존8개 series의 집계가 정확히 같은지 확인하고 새 CPU series를 추가했다. 누적은
+**33개 비교·고유63회·공유 기준3개·9개 series/epoch·제외19개**다. 초기 fixture 실패와
+trace/GPU 진단 collection을 제외해 실패·관측을 성능 성공으로 세지 않는다. 등록·바이너리
+hash·raw receipts·correction·누적 ledger는 Git 밖
+`${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-raw-cache-ownership-ab-20261006-v2/`에
+보존한다. 새 CPU harness/allocator trace를 제품·CI·일반 대국 준비에 추가하지 않았다.
+
 ## 5. 후속 구현·검증 순서
 
 할당/복사 제거 → 저장 밀도 → bounded scratch/arena/pool → 임계 구역/완료 통지 →

@@ -127,6 +127,14 @@ contracts 없이 main에서 Run/drop해도 재현했다. 자식의 tcache를 끈
 별도 소스 변경이다. CPU/mock 수명 검사는 통과했지만 GPU/전체 메모리·시간 효과는 미측정이다.
 기존 ledger나 진단 숫자를 이 변경의 성능 증거로 사용하지 않는다.
 
+[후속 CPU 할당·A/B](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#raw-cache-shared-heads-cpu-ab)는
+고정24,576 hit에서 두 할당/hit 제거를 관측했다. Hook 없는 세 쌍은 합산 시간비0.93543,
+peak 관측비1.12781로 HOLD다. 새 series를 분리해 누적33개 비교·고유63회·9개 series·
+제외19개로 보존했다. `rules_maia_check --experimental-raw-cache`는 해당 feature에서만
+활성화하는 독립 수치 gate다. 첫 GPU 실행은 예제 ID 역행 후 CUDA 종료 오류로 실패했으며,
+ID 수정은 CPU admission 회귀로만 검증했다. 부분 수치·예약0을 GPU 전체 인수로 세지 않고
+후속 GPU A/B·대국은 정상 종료를 포함한 독립 수치 인수 뒤에 진행한다.
+
 ## D02 CPU/mock trace 재생
 
 [cpu_trace 예제](../../crates/rz-runtime/examples/cpu_trace.rs)는 실제 `Scheduler`와
