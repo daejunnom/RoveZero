@@ -295,14 +295,38 @@ HOLD였다. 전체 peak 편차는 2.21%였으며 A/B는 0쌍이다.
 OOM·cgroup CPU throttling은 0이다. 회귀 인수는 HOLD이며 A/B·Stockfish paired 대국은
 실행하지 않았다. 두 등록 조건의 합계와 원시 자료는 각각 보존하고 서로 분모를 섞지 않는다.
 두 조건과 유한 준비·사이의 경과 시간을 합한 등록된 GPU 비교 비용은 1931.79초였다.
+이번 UCI 경로의 입력별 `info nodes`는 제공되지 않아 null이다. 입력별 작업량은 확인된
+두 `go nodes 4096`의 제어 상한과 전체 backup 8192로 대조한다. 개별 전수 NN 로그나
+관측하지 않은 UCI node 보고가 있다고 표시하지 않는다.
 
 준비 후 A/A의 ready는 10.75~17.59초, 탐색은 111.39~117.12초였다. 별도 시작 영수증에서
 한 실행의 runtime pin 6.87초와 다른 실행의 backend load 7.90초를 확인했다. 단계 시간은
 관측된 지연 범위이며 파일 I/O·검증 CPU·할당·호스트 경쟁·clock 중 원인을 특정하지 않는다.
 기존 memory.stat는 종료 뒤 수치이므로 높은 peak가 생긴 구간과 anon/file/kernel 구성은
 unknown이다. 이를 확인할 별도 진단은 성능 표본이 아니며 성공하더라도 HOLD나 5% 기준을
-대체하지 않는다. checkpoint 추가의 CPU recipe 58개가 통과했으며 Rust·엔진 binary는
-변경하지 않았다. 기존 CPU CI의 실제 성공 SHA `55017cf`와 후속 recipe SHA를 구분한다.
+대체하지 않는다. checkpoint와 진단 분류의 후속 CPU recipe 59개가 통과했으며 Rust·엔진
+binary는 변경하지 않았다. 기존 CPU CI의 실제 성공 SHA `55017cf`와 후속 recipe SHA를
+구분한다.
+
+`cfc0b02` recipe로 기준 바이너리의 고정 작업량 진단을 한 번 실행했다. 원시 capture에는
+`diagnostic_only=true`, `performance_measurement=false`를 기록하고 두 비교 arm의 admission이
+이를 거부한다. 정상 작업량·물리 종료·정리와 네 checkpoint를 확인했다. 이 실행은
+110.03초였지만 통제된 성능 표본이 아니므로 개선률·회귀 통과로 사용하지 않는다.
+
+| 진단 checkpoint | 경과 시간 | 누적 memory.peak | 해당 시점 memory.current |
+|---|---|---|---|
+| model ready | 8.835초 | 1.626GiB | 619.61MiB |
+| 입력 1 완료 | 58.309초 | 1.626GiB | 625.82MiB |
+| 입력 2 완료 | 109.354초 | 1.626GiB | 626.62MiB |
+| 물리 process 종료 | 109.972초 | 1.626GiB | 0.875MiB |
+
+이 진단에서는 ready 때 이미 최종 peak 1,746,296,832바이트에 도달했고 두 탐색이 이후의
+최대치를 올리지 않았다. 따라서 이 한 실행의 최고치가 준비 구간에 발생했음을 구분한다.
+ready의 anon/file/kernel은 순차 읽기 현재 값이며 이전 peak의 구성이 아니다. 앞선 높은
+peak 사례의 원인이나 구간을 이 한 실행으로 소급하지 않는다. 네 읽기 비용의 합은 약
+4.96ms였으며 전체 T에 포함했다. 진단 종료 때 앞선 실행·준비·경과 시간을 포함한 동일한
+3600초 창의 누적 비용은 2464.51초였고 상한 초과·OOM·강제 종료·소유 process 잔류는
+없었다. 원래 HOLD와 비교 분모는 유지하며 추가 전체 비교를 자동으로 재등록하지 않는다.
 
 다음 GPU 인수는 진단 근거에 따른 통제 조건을 등록하고 A/A 3쌍·A/B 5쌍을 통과한 뒤
 Stockfish 두 판을 실행하는 순서다. 현재 성능 회귀 없음·외부 강도 검증 완료를 선언하지 않는다.
