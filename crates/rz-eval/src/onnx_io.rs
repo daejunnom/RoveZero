@@ -3,7 +3,7 @@
 use super::*;
 use ort::io_binding::IoBinding;
 use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
-use ort::value::TensorValueType;
+use rz_native_loader::ort_binding::run_fixed_binding;
 
 pub(super) enum BoundFailure {
     Native(ort::Error),
@@ -14,10 +14,88 @@ impl From<ort::Error> for BoundFailure {
         Self::Native(e)
     }
 }
+
+fn owned_alias(value: &Tensor<f32>) -> ort::Result<Tensor<f32>> {
+    // Shares the existing native value; Clone would instead perform a device
+    // copy. The alias never leaves the exclusive binding owner.
+    value
+        .view()
+        .try_upgrade()
+        .map_err(|_| ort::Error::new("owned tensor view cannot upgrade"))
+}
+
+struct CopySession {
+    binding: IoBinding,
+    session: Session,
+}
+impl CopySession {
+    fn new(device_id: i32, to_device: bool) -> ort::Result<Self> {
+        let cpu = CPUExecutionProvider::default()
+            .with_arena_allocator(false)
+            .build()
+            .error_on_failure();
+        let cuda = CUDAExecutionProvider::default()
+            .with_device_id(device_id)
+            .with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested)
+            .with_conv_max_workspace(false)
+            .with_tf32(false)
+            .build()
+            .error_on_failure();
+        let providers = if to_device { [cpu, cuda] } else { [cuda, cpu] };
+        let session = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Disable)?
+            .with_intra_threads(1)?
+            .with_inter_threads(1)?
+            .with_intra_op_spinning(false)?
+            .with_inter_op_spinning(false)?
+            .with_memory_pattern(false)?
+            .with_allocator(MemoryInfo::new(
+                AllocationDevice::CPU,
+                0,
+                AllocatorType::Device,
+                MemoryType::Default,
+            )?)?
+            .with_no_environment_execution_providers()?
+            .with_execution_providers(providers)?
+            .commit_from_memory(COPY_MODEL)?;
+        Ok(Self {
+            binding: session.create_binding()?,
+            session,
+        })
+    }
+    fn copy(&mut self, source: &Tensor<f32>, target: &mut Tensor<f32>) -> ort::Result<()> {
+        if source.shape() != target.shape() {
+            return Err(ort::Error::new("copy target shape differs"));
+        }
+        self.binding.bind_input("input", source)?;
+        self.binding.bind_output("output", owned_alias(target)?)?;
+        self.binding.synchronize_inputs()?;
+        run_fixed_binding(&mut self.session, &self.binding)?;
+        self.binding.synchronize_outputs()?;
+        // Success only: failure leaves every native alias with the physical
+        // owner's quarantine. No process-global helper retains these tensors.
+        self.binding.clear();
+        Ok(())
+    }
+}
+
+// Self-authored ONNX IR8/opset13 Identity, FLOAT input/output of unknown rank.
+// Used only for synchronous tensor copies; BT4 weights/precision are unchanged.
+const COPY_MODEL: &[u8] = &[
+    8, 8, 18, 8, 82, 111, 118, 101, 90, 101, 114, 111, 58, 71, 10, 25, 10, 5, 105, 110, 112, 117,
+    116, 18, 6, 111, 117, 116, 112, 117, 116, 34, 8, 73, 100, 101, 110, 116, 105, 116, 121, 18, 11,
+    114, 122, 45, 99, 111, 112, 121, 45, 102, 51, 50, 90, 13, 10, 5, 105, 110, 112, 117, 116, 18,
+    4, 10, 2, 8, 1, 98, 14, 10, 6, 111, 117, 116, 112, 117, 116, 18, 4, 10, 2, 8, 1, 66, 2, 16, 13,
+];
 pub(super) struct BoundBuffers {
     pub batch: usize,
     binding: IoBinding,
+    // Private copy bindings drop before all allocator-backed tensors.
+    copy_in: Option<CopySession>,
+    copy_out: Option<CopySession>,
     device_input: Option<Tensor<f32>>,
+    policy: Option<Tensor<f32>>,
+    wdl: Option<Tensor<f32>>,
     host_policy: Option<Tensor<f32>>,
     host_wdl: Option<Tensor<f32>>,
     // ort rc.10's Tensor::new does not retain the supplied Allocator. Native
@@ -46,12 +124,18 @@ impl BoundBuffers {
         let mut buffers = Self {
             batch,
             binding: session.create_binding()?,
+            copy_in: None,
+            copy_out: None,
             device_input: None,
+            policy: None,
+            wdl: None,
             host_policy: None,
             host_wdl: None,
             allocator,
         };
-        if matches!(provider, Provider::Cuda { .. }) {
+        if let Provider::Cuda { device_id, .. } = provider {
+            buffers.copy_in = Some(CopySession::new(device_id, true)?);
+            buffers.copy_out = Some(CopySession::new(device_id, false)?);
             buffers.device_input = Some(Tensor::new(&buffers.allocator, [batch, 112, 8, 8])?);
             buffers.binding.bind_input(
                 INPUT_NAME,
@@ -63,14 +147,15 @@ impl BoundBuffers {
         }
         // These output addresses remain fixed through capture/replay. Binding
         // owns them; results are copied before the next exclusive Run.
+        buffers.policy = Some(Tensor::new(&buffers.allocator, [batch, POLICY_SIZE])?);
+        buffers.wdl = Some(Tensor::new(&buffers.allocator, [batch, 3])?);
         buffers.binding.bind_output(
             POLICY_NAME,
-            Tensor::<f32>::new(&buffers.allocator, [batch, POLICY_SIZE])?,
+            owned_alias(buffers.policy.as_ref().expect("policy"))?,
         )?;
-        buffers.binding.bind_output(
-            WDL_NAME,
-            Tensor::<f32>::new(&buffers.allocator, [batch, 3])?,
-        )?;
+        buffers
+            .binding
+            .bind_output(WDL_NAME, owned_alias(buffers.wdl.as_ref().expect("WDL"))?)?;
         Ok(buffers)
     }
     pub fn run(
@@ -83,9 +168,11 @@ impl BoundBuffers {
     ) -> Result<Vec<RawOutput>, BoundFailure> {
         let transfer_started = std::time::Instant::now();
         if let Some(device) = &mut self.device_input {
-            // ORT's synchronous Identity copy targets the existing allocation;
-            // it does not replace the graph's input address. No async option.
-            input.copy_into(device)?;
+            // Synchronous private copy into the same graph input address.
+            self.copy_in
+                .as_mut()
+                .expect("CUDA input copy")
+                .copy(input, device)?;
         } else {
             // CPU binding must be rebound after host contents change.
             self.binding.bind_input(INPUT_NAME, input)?;
@@ -95,7 +182,7 @@ impl BoundBuffers {
             timing.transfer_in = Some(transfer_started.elapsed());
         }
         let run_started = std::time::Instant::now();
-        let mut outputs = session.run_binding(&self.binding)?;
+        run_fixed_binding(session, &self.binding)?;
         if let Some(timing) = timing.as_deref_mut() {
             timing.run = run_started.elapsed();
         }
@@ -107,16 +194,9 @@ impl BoundBuffers {
         let copied = if let (Some(policy), Some(wdl)) = (&mut self.host_policy, &mut self.host_wdl)
         {
             let transfer_started = std::time::Instant::now();
-            outputs
-                .remove(POLICY_NAME)
-                .ok_or_else(|| ort::Error::new("missing bound policy"))?
-                .downcast::<TensorValueType<f32>>()?
-                .copy_into(policy)?;
-            outputs
-                .remove(WDL_NAME)
-                .ok_or_else(|| ort::Error::new("missing bound WDL"))?
-                .downcast::<TensorValueType<f32>>()?
-                .copy_into(wdl)?;
+            let copy = self.copy_out.as_mut().expect("CUDA output copy");
+            copy.copy(self.policy.as_ref().expect("owned policy"), policy)?;
+            copy.copy(self.wdl.as_ref().expect("owned WDL"), wdl)?;
             if let Some(timing) = timing.as_deref_mut() {
                 timing.transfer_out = Some(transfer_started.elapsed());
             }
@@ -130,13 +210,15 @@ impl BoundBuffers {
             outputs
         } else {
             let own_started = std::time::Instant::now();
-            let (_, policy) = outputs
-                .get(POLICY_NAME)
-                .ok_or_else(|| ort::Error::new("missing policy"))?
+            let (_, policy) = self
+                .policy
+                .as_ref()
+                .expect("owned policy")
                 .try_extract_tensor::<f32>()?;
-            let (_, wdl) = outputs
-                .get(WDL_NAME)
-                .ok_or_else(|| ort::Error::new("missing WDL"))?
+            let (_, wdl) = self
+                .wdl
+                .as_ref()
+                .expect("owned WDL")
                 .try_extract_tensor::<f32>()?;
             let outputs = pack_outputs(policy, wdl, self.batch, pool, reuse);
             if let Some(timing) = timing {
@@ -145,6 +227,11 @@ impl BoundBuffers {
             }
             outputs
         };
+        if self.device_input.is_none() {
+            // Physical Run/output fence and copying have completed. Release the
+            // CPU input alias before the parent returns its exclusive input.
+            self.binding.clear_inputs();
+        }
         copied.map_err(BoundFailure::Output)
     }
 }

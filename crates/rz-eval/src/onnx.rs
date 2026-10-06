@@ -92,10 +92,15 @@ pub fn declared_backend_identity(
     }
     let experiments = config.experiments;
     if experiments.reuse_buffers || experiments.io_binding || experiments.cuda_graph {
-        // Preserve the published codec of the three pre-existing I/O modes.
-        // Adding an independent allocator option must not rename old backends.
+        // Keep the original buffer-only codec. Binding now owns its copy
+        // sessions and never acquires duplicate native output handles.
+        let copy = if experiments.io_binding {
+            "synchronous-owned-onnx-identity-v2"
+        } else {
+            "synchronous-ort-identity"
+        };
         profile.push_str(&format!(
-            ";execution-experiment-v1=ExecutionExperiments {{ reuse_buffers: {}, io_binding: {}, cuda_graph: {} }};copy=synchronous-ort-identity",
+            ";execution-experiment-v1=ExecutionExperiments {{ reuse_buffers: {}, io_binding: {}, cuda_graph: {} }};copy={copy}",
             experiments.reuse_buffers, experiments.io_binding, experiments.cuda_graph
         ));
     }

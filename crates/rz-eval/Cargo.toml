@@ -28,7 +28,7 @@ experimental-batch = ["contracts", "rz-runtime/experimental-batch"]
 experimental-io-buffers = ["onnx"]
 experimental-ort-cpu-arena = ["onnx"]
 experimental-ort-model = ["onnx"]
-experimental-io-binding = ["onnx"]
+experimental-io-binding = ["onnx", "rz-native-loader/ort-bindings"]
 experimental-cuda-graph = ["experimental-io-binding"]
 experimental-notify = ["dep:rz-runtime", "rz-runtime/experimental-notify"]
 # Hash the exact owned ONNX bytes during their bounded read; independent E trial.
