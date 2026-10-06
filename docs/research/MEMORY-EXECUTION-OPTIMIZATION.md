@@ -606,6 +606,77 @@ anon/file은 phase peak나 ORT heap peak가 아니며, VRAM·Windows commit peak
 `${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-memory-cumulative-20261006/`에 보존했다.
 이 세 수 진단은 기력·Elo 평가가 아니다.
 
+### 4.10 CUDA 내부 CPU arena와 session 준비 메모리
+
+<a id="cuda-cpu-arena-ab"></a>
+
+2026-10-06, source `9aa6fdbcadd2176a6b489a367dc030f89eb07e51`에서
+`experimental-ort-cpu-arena`를 **기본 off·명시 선택**으로 추가했다.
+ORT 1.22는 CUDA에서 CPU node fallback을 금지해도 내부 CPU provider를 생성한다.
+[ORT 생성 경로](https://github.com/microsoft/onnxruntime/blob/v1.22.0/onnxruntime/core/session/inference_session.cc#L1667)와
+[ort rc.10 CPU 옵션 구현](https://github.com/pykeio/ort/blob/v2.0.0-rc.10/src/execution_providers/cpu.rs#L39)을 대조했다.
+후자의 CPU 설정 호출은 session option의 DisableCpuMemArena이며 명시 CPU EP를 append하지 않는다.
+실험은 CUDA의 내부 CPU allocator arena만 끄고 fallback 금지·CUDA 실제 배치·FP32·TF32 off·
+물리 완료를 유지한다. 미컴파일 옵션과 CPU provider 선택은 거부한다.
+
+[단일 추론 진입점](../../crates/rz-eval/examples/inference_bench.rs)의
+`--b1-cpu-arena=baseline|disabled`로 같은 바이너리의 한 변수를 비교했다.
+입력·출력 버퍼 재사용/cache/dedup/I/O Binding/CUDA Graph는 off다.
+`load_owned_observed`는 준비 시점만 관측하는 additive C backend Rust API이며
+일반 생성자는 no-op observer를 사용한다. 일반 대국의 PID/GPU 반복 조사는 추가하지 않는다.
+새 옵션의 backend identity는 분리하고 기존 B1·I/O 옵션의 identity codec은 보존했다.
+UCI 대국 옵션·기본 feature·receipt schema·공통 계약 revision은 변경하지 않았다.
+
+별도 GPU 수치 검사 뒤 A1/B1/B2/A2/A3/B3를 사전 등록했다.
+RTX4050 6GB·driver610.62·WSL Ubuntu·CPU quota2/기존 전체 affinity,
+high6GiB/max12GiB·swap0·pids128·AS128GiB, 실행당300초+정리30초·전체900초다.
+BT4 모델/runtime/입력 hash와 FP32·TF32 off·HistoryFill No를 유지했다.
+Fresh process/session에서 placement probe와 warm3/timed20을 실행하고 두 arm 모두
+출력 digest와 ownership 반환을 측정 구간에 포함했다. 수치 suite는 각 측정 앞에 반복하지 않았다.
+
+T는 기존 supervised helper의 전체 elapsed로 등록 검증·모델/runtime 준비·추론·
+출력/물리 완료·보고서/최종 cgroup 수집을 포함한다.
+Primary P는 fresh process 전체의 VmHWM이다. 준비 완료 RSS/anon과 cgroup peak는 보조 지표다.
+사전 tradeoff all-pair T≤1.05/P≤0.80 및 Pareto 조건을 유지하며, 관측 후 primary를 바꾸지 않는다.
+
+| 쌍 | 기준/변경 T(s) | T 비율 | 기준/변경 P(MiB) | P 비율 |
+|---|---:|---:|---:|---:|
+| 1 | 19.831 / 17.506 | 0.882754 | 1815.863 / 1818.008 | 1.001181 |
+| 2 | 18.925 / 16.197 | 0.855826 | 1818.664 / 1816.191 | 0.998640 |
+| 3 | 17.495 / 17.455 | 0.997678 | 1818.555 / 1816.074 | 0.998636 |
+
+**HOLD·기본 off:** T 합계56.252→51.158s(비율0.909437), P 평균1817.694→1816.758MiB
+(비율0.999485)다. 준비 완료 RSS는 평균788.896→676.146MiB로112.750MiB(약14.3%) 낮았고,
+anon은529.271→416.521MiB였다. 이 endpoint 감소를 전체 peak의20% 감소로 바꾸지 않는다.
+첫 쌍 P가 소폭 높고 마지막 T 절약은 기준 T 범위2.336s보다 작아 all-pair Pareto도 미충족이다.
+세 쌍의 시간 감소는 이 단일 프로세스·준비/추론 작업의 관측이며 대국 속도 개선으로 승격하지 않는다.
+
+두 arm 모두 asset load 전·직렬화 검증 후·session commit 직후 원본 해제 전·해제 후·
+provider ready·warm 후·측정 후·backend drop 후의8개 self status를 남겼다.
+모든 실행에서 commit 직후 원본 해제 전까지 VmHWM이 약1.8GiB로 상승했고,
+owned 원본 해제 직후 RSS는706.8125MiB 감소했다. 기존 조기 해제가 실제 동작함을 확인했으며
+새로 구현한 절약으로 세지 않는다. Commit 내부의 graph/initializer/allocator별 peak는 미분해다.
+Endpoint RSS/anon은 live heap·phase peak가 아니며 VRAM/Windows 전체 commit peak는 unknown이다.
+보조 cgroup peak는 첫 기준4504.578MiB, 나머지1664~1667MiB였다. 공유 file cache의 청구 시점이
+다르므로 그 차이를 CPU arena의 전체 RAM 절약으로 환산하거나 첫 기준을 사후 제외하지 않는다.
+
+6회 모두 정상 종료·완료 NN20/warm3·동일23회 output digest를 확인했다.
+OOM/max/high/강제 종료/잔류 process는0이며 backend identity는 arm별 고정·서로 달랐다.
+독립 LC0 원본 참조12개·No/Repeat·batch1/2/4/8/16 및 가변 B1 32회/보존 출력 불변을 통과했다.
+Logits 최대절대차6.5088272e-5, 합법 policy2.8014183e-6, WDL1.7881393e-7로
+기존 허용오차를 유지했다. Linux CPU eval ONNX/새 feature 각각69개·all-feature99개,
+UCI CUDA/batch202개·누적 도구18개·fmt/strict Clippy 통과다. 후속 ledger 검사는
+양쪽 baseline·뒤바뀐 옵션을 거부하는 사례를 추가해 현재19개가 통과했다.
+
+누적 ledger는 이전24개에 새3개를 추가해 **27개 비교·실제51회**다.
+이전6개 series의 전체 누적/epoch 결과가 그대로임을 재대조했다. 공유 기준3개와
+기존 실패/conditioning13개는 별도로 유지하고 다른 option/작업량/peak를 합산하지 않는다.
+원시 자료·등록·수치 검사·누적 JSON·분석은 Git 밖 논리 경로
+`${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-ort-cpu-arena-20261006/`에 보존한다.
+Native 대국·PGN은 이번 단일 추론 연구에서 새로 생성하지 않았다.
+후속 큰 peak 후보는 session commit 중 직렬화·graph/initializer의 동시 생존량이며,
+CPU arena의 준비 완료 RSS 감소와 분리해 조사한다.
+
 ## 5. 후속 구현·검증 순서
 
 할당/복사 제거 → 저장 밀도 → bounded scratch/arena/pool → 임계 구역/완료 통지 →
