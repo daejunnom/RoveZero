@@ -115,6 +115,9 @@ def prepare_cache(spec, output, deadline, affinity=None):
 
 
 def capture_valid(result):
+    require(result.get("diagnostic_only", False) is False and
+            result.get("performance_measurement", True) is True,
+            "diagnostic evidence is not an AA/AB performance sample")
     require(result.get("accepted") is True, "failed fixed-work run")
     capture = result["capture"]
     require(capture["exit_code"] == 0 and not capture["forced_cleanup"] and not capture["cleanup_error"] and not capture["remaining_owned_processes"], "natural process/physical drain missing")
@@ -148,9 +151,11 @@ def summarize(pairs):
             "all_individual_pair_gates_required": True, "past_other_experiments_in_denominator": False}
 
 
-def run_once(variant, directory, overall_deadline, affinity=None):
+def run_once(variant, directory, overall_deadline, affinity=None, *, diagnostic_only=False):
+    require(type(diagnostic_only) is bool, "explicit diagnostic classification required")
     owner = OwnedRun(directory, wall=min(180, overall_deadline-time.monotonic()),affinity=affinity)
-    result = {"source_commit": variant["source_commit"], "source_patch": variant["source_patch"], "binary_sha256": variant["binary_sha256"], "accepted": False}
+    result = {"source_commit": variant["source_commit"], "source_patch": variant["source_patch"], "binary_sha256": variant["binary_sha256"], "accepted": False,
+              "diagnostic_only": diagnostic_only, "performance_measurement": not diagnostic_only}
     stage = "binary_verification"
     try:
         require(sha256(variant["binary"]) == variant["binary_sha256"], "binary changed after registration")

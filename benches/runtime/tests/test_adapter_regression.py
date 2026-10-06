@@ -130,6 +130,14 @@ class AdapterRegressionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pair_result(observation(), changed, "AB")
 
+    def test_successful_diagnostic_is_rejected_from_both_comparison_arms(self):
+        for fields in ({"diagnostic_only":True}, {"performance_measurement":False},
+                       {"diagnostic_only":1}, {"performance_measurement":1}):
+            diagnostic={**observation(), **fields}
+            for left,right in ((diagnostic,observation()),(observation(),diagnostic)):
+                with self.subTest(fields=fields), self.assertRaisesRegex(ValueError,"diagnostic evidence"):
+                    pair_result(left,right,"AB")
+
     def test_sum_never_overrides_failed_pair_or_missing_runs(self):
         aa=pair_result(observation(),observation(),"AA")
         ab=pair_result(observation(),observation(99.,990),"AB")
