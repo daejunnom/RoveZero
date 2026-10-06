@@ -6,13 +6,14 @@ import hashlib
 import json
 import math
 import re
+import sys
 import time
 from pathlib import Path
 
 from bounded_local import OwnedRun, outside_git, put
 from paired_search import native_receipts, read_json, require, sha256
 
-SCHEMA = "rz-adapter-regression/1"
+SCHEMA = "rz-adapter-regression/2"
 POSITIONS = ["position startpos", "position startpos moves e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1 f8e7 f1e1 b7b5 a4b3 d7d6 c2c3 e8g8"]
 SIMULATIONS = 4096
 TREE_MAX_EDGES = 262_144
@@ -26,7 +27,7 @@ ARGUMENTS = {"--source-weights", "--onnx-model", "--export-manifest", "--manifes
 
 
 def validate(manifest):
-    require(set(manifest) == {"schema", "baseline", "candidate", "assets", "numerical_witnesses", "resource_notes"}, "unknown or missing registration field")
+    require(set(manifest) == {"schema", "baseline", "candidate", "assets", "numerical_witnesses", "resource_notes", "runtime_cache_preparation"}, "unknown or missing registration field")
     require(manifest["schema"] == SCHEMA, "unsupported adapter regression schema")
     for role in ("baseline", "candidate"):
         variant = manifest[role]
@@ -66,7 +67,41 @@ def validate(manifest):
         path = outside_git(witness["path"])
         require(sha256(path) == witness["sha256"] and read_json(path, 1024**2).get("status") == "passed", "numerical witness was not passed")
     require(isinstance(manifest["resource_notes"], dict), "observation scope required")
+    from shared_runtime_cache import validate as validate_cache
+    cache=manifest["runtime_cache_preparation"]
+    root,_=validate_cache(cache)
+    flags=dict(arg.split("=",1) for arg in manifest["baseline"]["args"][1:])
+    require(root.parent==Path(flags["--runtime-cache-root"]),"cache preparation targets a different runtime root")
+    bundle=read_json(flags["--cuda-bundle"],64*1024)
+    files=[{k:f[k] for k in ("filename","bytes","sha256")} for f in bundle["files"]]
+    require(sorted(cache["files"],key=lambda f:f["filename"])==sorted(files,key=lambda f:f["filename"]),"cache preparation differs from registered bundle")
+    played=next(a for a in manifest["assets"] if a["path"]==flags["--onnx-model"])
+    raw=[read_json(w["path"],1024**2) for w in manifest["numerical_witnesses"]]
+    raw=[w for w in raw if w.get("onnx_sha256")==played["sha256"]]
+    require(len(raw)==1 and raw[0]["cuda_bundle_sha256"]==cache["canonical_sha256"],"cache canonical identity lacks the played model's numerical proof")
     return manifest
+
+
+def prepare_cache(spec, output, deadline):
+    directory=output/"cache-preparation"
+    owner=OwnedRun(directory,wall=min(60,deadline-time.monotonic()))
+    report=None
+    try:
+        put(directory/"spec.json",spec)
+        owner.spawn([sys.executable,str(Path(__file__).with_name("shared_runtime_cache.py")),
+                     str(directory/"spec.json"),str(directory/"report.json")])
+        require(owner.wait_exit()==0,"shared runtime cache preparation failed")
+        report=read_json(directory/"report.json",64*1024)
+        require(report["status"]=="passed","shared runtime preparation did not pass")
+    finally:
+        capture=owner.finish()
+        put(directory/"capture.json",capture)
+    events=dict(line.split() for line in capture["resources"]["memory.events"].splitlines())
+    require(capture["exit_code"]==0 and not capture["forced_cleanup"] and not capture["cleanup_error"] and
+            not capture["remaining_owned_processes"] and not int(events["oom"]) and not int(events["oom_kill"]),
+            "cache preparation resource or process drain failed")
+    return {"status":"passed","report_sha256":sha256(directory/"report.json"),
+            "capture_sha256":sha256(directory/"capture.json"),"report":report,"capture":capture}
 
 
 def capture_valid(result):
@@ -197,11 +232,14 @@ def run(manifest, output):
     output = outside_git(output)
     output.mkdir()
     put(output/"registration.json", {"manifest": manifest, "helper_sha256": sha256(__file__),
+        "cache_reader_sha256": sha256(Path(__file__).with_name("shared_runtime_cache.py")),
         "owner_sha256": sha256(Path(__file__).with_name("bounded_local.py")), "positions": POSITIONS,
         "simulations_per_input": SIMULATIONS, "AA_pairs": 3, "AB_pairs": 5,
         "tree_max_edges": TREE_MAX_EDGES, "tree_max_nodes": 20_000, "tree_max_depth": 128,
         "search_command": SEARCH_COMMAND,
         "run_wall_seconds": 180, "cleanup_seconds": 30, "overall_seconds": 3600,
+        "cache_preparation_wall_seconds":60,"cache_preparation_cleanup_seconds":30,
+        "cache_condition":"shared-runtime-warm-readhash_no_residency_guarantee",
         "primary_time": "whole_wall_start_through_native_exit_receipts_and_cgroup_collection",
         "primary_peak": "fresh_cgroup_memory.peak", "each_pair_time_and_peak_ratio_max": 1.05,
         "AA_variability_max": .05, "first_failure_stops": True, "automatic_retry": False})
@@ -210,7 +248,9 @@ def run(manifest, output):
     pairs=[]
     reference_work=None
     error=None
+    cache_preparation=None
     try:
+        cache_preparation=prepare_cache(manifest["runtime_cache_preparation"],output,deadline)
         for index in range(8):
             comparison = "AA" if index<3 else "AB"
             order = ("baseline", "baseline") if comparison=="AA" else (("baseline", "candidate") if index%2 else ("candidate", "baseline"))
@@ -244,6 +284,8 @@ def run(manifest, output):
         ("source_commit", "binary_sha256", "expected_profile")}
     result["resource_notes"] = manifest["resource_notes"]
     result["tree_max_edges"] = TREE_MAX_EDGES
+    result["cache_preparation"] = cache_preparation
+    result["memory_accounting_scope"] = "fresh_engine_cgroup_peak_after_shared_file_read_hash_preparation_not_whole_host_peak"
     put(output/"summary.json", result)
     print(json.dumps(result), flush=True)
     return 0 if result["status"] == "passed" else 2

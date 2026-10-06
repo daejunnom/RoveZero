@@ -19,6 +19,11 @@ def gate_identities(declaration, reports):
     profile=launch["profile"]["runtime"]
     artifacts={a["role"]:a["artifact"] for a in launch["artifacts"]}
     regression=reports["adapter_regression"][0]
+    cache=regression["cache_preparation"]
+    require(cache["status"]=="passed" and cache["report"]["canonical_sha256"]==launch["cuda_bundle"]["canonical_sha256"] and
+            not cache["report"]["native_code_loaded"] and not cache["report"]["GPU_used"] and not cache["report"]["files_modified"],
+            "registered shared runtime read/hash preparation incomplete")
+    require("shared-runtime-warm-readhash" in declaration["evaluation_policy"],"external pilot cache condition differs")
     require(regression["tree_max_edges"]==declaration["rove_tree_max_edges"],
             "adapter regression used a different tree envelope")
     tested=regression["candidate"]

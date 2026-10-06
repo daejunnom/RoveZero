@@ -143,6 +143,16 @@ ponder·평가 기반 조기 판정 off다. Stockfish CPU와 RoveZero CPU+RTX 40
    HOLD다. NN-backed 8192 simulation와 추가 root 2개의 소비를 영수증으로 대조하며
    다른/종료 작업을 조용히 대체하지 않는다. 같은 등록 비교의 합계를 누적하되 다른 과거
    E 실험을 분모에 섞지 않는다. 기존 E 채택의 20% 메모리 절약 문턱과 구분한다.
+   첫 새 A/A는 작업량을 완료했지만 파일 캐시 귀속·ready 편차로 HOLD였다. 사용자 승인 후
+   regression recipe v2는 기존 sealed runtime cache 파일 19개를 별도 60초+정리 30초
+   준비 단계에서 읽기·해시 검증한다. native 코드·GPU를 실행하거나 cache를 수정·회수하지
+   않는다. 준비 비용·shared file bytes·해시·inode와 별도 cgroup peak를 보존하고 전체
+   3600초 예산에 포함한다. 개별 엔진 T와 fresh cgroup P는 유지하며 공유 캐시가 준비된
+   조건으로 다시 등록한다. 읽기 완료는 page residency 고정의 증거가 아니다.
+   [cgroup memory ownership](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#memory-ownership)
+   때문에 개별 P가 호스트 전체·공유 캐시·VRAM의 총 peak는 아니다. 이 범위와 관측 불명을
+   명시하며 이전 cold/warm 혼합 자료를 새 비교의 분모에 넣지 않는다. 외부 pilot의
+   evaluation_policy도 `shared-runtime-warm-readhash`를 선언하고 준비 증거를 gate로 연결한다.
 4. 신경망 동등성과 회귀가 모두 통과한 뒤 외부 두 판을 실행한다. 서로 다른 엔진 nodes를
    같은 작업량으로 환산하지 않으며 물리 NN 완료와 탐색 소비를 분리한다.
 5. CPU CI·GPU 수치·회귀·외부 UCI/대국을 각각 인수한다. 첫 할당·CUDA·물리 완료 실패에서
