@@ -163,6 +163,7 @@ def run_once(variant, directory, overall_deadline, affinity=None):
         owner.until(lambda line: line == "readyok")
         ready = time.monotonic()
         result["ready_seconds"] = ready-owner.started
+        result["resource_checkpoints"] = [owner.resource_checkpoint("model_ready")]
         work = []
         for position in POSITIONS:
             stage = "fixed_work_search"
@@ -185,6 +186,7 @@ def run_once(variant, directory, overall_deadline, affinity=None):
             require(re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", move) is not None, "nonterminal fixed input returned invalid move syntax")
             work.append({"position": position, "bestmove": move, "requested_simulations": SIMULATIONS})
             result.setdefault("searches", []).append({"position_bestmove_seconds": time.monotonic()-began, "reported_nodes": reported[-1] if reported else None})
+            result["resource_checkpoints"].append(owner.resource_checkpoint(f"input_{len(work)}_complete"))
         stage = "natural_quit_and_physical_drain"
         drain_started = time.monotonic()
         owner.send("quit")
@@ -193,6 +195,7 @@ def run_once(variant, directory, overall_deadline, affinity=None):
         require(owner.wait_exit(no_duplicate) == 0, "native process failed")
         result["search_sequence_seconds"] = drain_started-ready
         result["drain_seconds"] = time.monotonic()-drain_started
+        result["resource_checkpoints"].append(owner.resource_checkpoint("physical_process_exited"))
         for file in owner.logs.values():
             file.flush()
         errors=(directory/"stderr.log").read_text(encoding="utf-8").splitlines()

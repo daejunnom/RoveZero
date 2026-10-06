@@ -113,6 +113,26 @@ class OwnedRun:
         if time.monotonic()>=self.deadline:
             raise TimeoutError("registered process wall limit exceeded")
 
+    def resource_checkpoint(self, stage):
+        """A few owned-group reads, not polling or a decomposition of peak."""
+        if not isinstance(stage, str) or not 1 <= len(stage) <= 64 or not all(
+                character in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in stage):
+            raise ValueError("bounded checkpoint stage required")
+        self.check_deadline()
+        began = time.monotonic()
+        result = {"stage": stage, "elapsed_before_read_seconds": began-self.started,
+                  "scope": "owned_cgroup_sequential_point_reads_not_atomic_or_peak_components",
+                  "peak_scope": "memory.peak_is_historical_since_fresh_group_creation_not_reset"}
+        try:
+            result["resources"] = {key: (self.group/key).read_text() for key in
+                                   ("memory.peak", "memory.current", "memory.stat", "cpu.stat")}
+        except OSError as exc:
+            # Supplemental diagnosis must not kill an otherwise valid engine.
+            # The mandatory whole-run primary peak is still collected at finish.
+            result["error"] = f"{type(exc).__name__}: {exc}"
+        result["read_wall_seconds"] = time.monotonic()-began
+        return result
+
     def pump(self):
         for key, _ in self.selector.select(timeout=.01):
             chunk = os.read(key.fileobj.fileno(), 65536)

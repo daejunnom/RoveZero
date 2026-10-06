@@ -5,12 +5,13 @@ import io
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from adapter_regression import pair_result, resource_affinity, run, summarize
-from bounded_local import resolve_affinity
+from bounded_local import OwnedRun, resolve_affinity
 
 
 def observation(t=100., p=1000):
@@ -21,6 +22,39 @@ def observation(t=100., p=1000):
 
 
 class AdapterRegressionTests(unittest.TestCase):
+    def test_checkpoint_keeps_historical_peak_separate_from_point_memory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner=OwnedRun.__new__(OwnedRun)
+            owner.group=Path(temporary)
+            owner.started=time.monotonic()
+            owner.deadline=owner.started+30
+            files={"memory.peak":"5000\n", "memory.current":"1000\n",
+                   "memory.stat":"anon 700\nfile 200\nkernel 100\n",
+                   "cpu.stat":"usage_usec 20\n"}
+            for name,value in files.items():
+                (owner.group/name).write_text(value)
+            checkpoint=owner.resource_checkpoint("model_ready")
+            self.assertEqual(checkpoint["resources"],files)
+            self.assertIn("not_atomic_or_peak_components",checkpoint["scope"])
+            self.assertIn("historical",checkpoint["peak_scope"])
+            self.assertTrue(all((owner.group/name).read_text()==value for name,value in files.items()))
+            self.assertGreaterEqual(checkpoint["read_wall_seconds"],0)
+            for stage in ("", "../foreign", "a"*65, None):
+                with self.assertRaises(ValueError):
+                    owner.resource_checkpoint(stage)
+
+    def test_supplemental_checkpoint_read_failure_is_visible_without_resetting_peak(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner=OwnedRun.__new__(OwnedRun)
+            owner.group=Path(temporary)
+            owner.started=time.monotonic()
+            owner.deadline=owner.started+30
+            (owner.group/"memory.peak").write_text("5000\n")
+            checkpoint=owner.resource_checkpoint("model_ready")
+            self.assertIn("FileNotFoundError",checkpoint["error"])
+            self.assertNotIn("resources",checkpoint)
+            self.assertEqual((owner.group/"memory.peak").read_text(),"5000\n")
+
     def test_invalid_series_budget_cannot_create_output_or_start_a_child(self):
         with tempfile.TemporaryDirectory() as temporary:
             output=Path(temporary)/"comparison"
