@@ -49,6 +49,7 @@ pub enum NativeWorkerOrigin {
 pub enum NativeAdmissionPolicy {
     Cpu,
     CudaOneGiB,
+    CudaThreeGiB,
 }
 
 impl NativeAdmissionPolicy {
@@ -60,6 +61,7 @@ impl NativeAdmissionPolicy {
             device_bytes: match self {
                 Self::Cpu => 0,
                 Self::CudaOneGiB => NATIVE_CUDA_ADMISSION_BYTES,
+                Self::CudaThreeGiB => 3 * NATIVE_CUDA_ADMISSION_BYTES,
             },
             pinned_bytes: 0,
         }
@@ -123,6 +125,8 @@ pub struct NativeOwnerStatus {
 }
 
 struct OwnerState {
+    #[cfg(feature = "experimental-batch")]
+    batch_journal: Option<crate::batch_journal::BatchJournal>,
     worker: NativePhysicalWorker,
     epoch: Option<ProcessEpoch>,
     last_execution: Option<u64>,
@@ -173,6 +177,68 @@ struct OwnerInner {
 pub struct NativeWorkerOwner(Arc<OwnerInner>);
 
 impl NativeWorkerOwner {
+    #[cfg(feature = "experimental-batch")]
+    pub fn enable_batch_journal(&self) -> Result<(), ContractError> {
+        let mut state = self.state();
+        if state.active || state.last_request.is_some() || state.batch_journal.is_some() {
+            return Err(failure(
+                ErrorCode::InvalidInput,
+                Stage::Admission,
+                "batch journal must be enabled before any request",
+            ));
+        }
+        state.batch_journal = Some(crate::batch_journal::BatchJournal::new(self.max_batch())?);
+        Ok(())
+    }
+    #[cfg(feature = "experimental-batch")]
+    pub fn batch_register(&self, context: EvalContext) -> Result<(), ContractError> {
+        if let Some(journal) = &mut self.state().batch_journal {
+            journal.register(context)?;
+        }
+        Ok(())
+    }
+    #[cfg(feature = "experimental-batch")]
+    pub fn batch_logical(
+        &self,
+        request: RequestId,
+        outcome: u8,
+        cancel: bool,
+    ) -> Result<(), ContractError> {
+        if let Some(journal) = &mut self.state().batch_journal {
+            let row = journal.row(request)?;
+            if outcome > 6 || (outcome != 0 && row.7 != 0 && row.7 != outcome) {
+                return Err(failure(
+                    ErrorCode::InvalidInput,
+                    Stage::Output,
+                    "batch logical outcome cannot be rewritten",
+                ));
+            }
+            row.6 |= cancel;
+            if outcome != 0 {
+                row.7 = outcome;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(feature = "experimental-batch")]
+    pub fn batch_consume(&self, context: CompletionContext) -> Result<(), ContractError> {
+        if let Some(journal) = &mut self.state().batch_journal {
+            journal.consume(context)?;
+        }
+        Ok(())
+    }
+    #[cfg(feature = "experimental-batch")]
+    pub fn batch_journal_receipt(
+        &self,
+        transfer: bool,
+    ) -> Option<crate::batch_journal::BatchJournalReceipt> {
+        let mut state = self.state();
+        if transfer && !state.active {
+            state.batch_journal.take().map(|mut j| j.take())
+        } else {
+            state.batch_journal.as_ref().map(|j| j.snapshot())
+        }
+    }
     /// Injection exercises the same physical Lease bridge without claiming NN
     /// execution. The supplied closure must satisfy SingleWorker's Run contract.
     pub fn from_worker(
@@ -259,6 +325,8 @@ impl NativeWorkerOwner {
             cuda_metadata: None,
             source_trace: None,
             state: Mutex::new(OwnerState {
+                #[cfg(feature = "experimental-batch")]
+                batch_journal: None,
                 worker,
                 epoch: None,
                 last_execution: None,
@@ -398,7 +466,7 @@ impl NativeWorkerOwner {
             .into());
         };
         if device_id != 0
-            || arena_bytes as u64 != NATIVE_CUDA_ADMISSION_BYTES
+            || arena_bytes != backend.asset_profile().cuda_arena_bytes()
             || backend.config().max_batch != max_batch
             || backend.config().intra_threads != 1
             || projection.backend().0 != backend.identity()
@@ -439,12 +507,16 @@ impl NativeWorkerOwner {
         // A successful historical probe alone does not authorize current maps.
         // Loader failure stays typed and latched, with all native pins retained.
         backend.verify_cuda_runtime_mappings()?;
+        let admission = match backend.asset_profile() {
+            crate::asset::AssetProfile::Maia1900 => NativeAdmissionPolicy::CudaOneGiB,
+            crate::asset::AssetProfile::Bt4It332 => NativeAdmissionPolicy::CudaThreeGiB,
+        };
         let worker = crate::contracts::spawn_onnx_worker_profiled(backend, trace.clone())?;
         let mut owner = Self::from_worker_limit(
             worker,
             projection,
             diagnostic_capacity,
-            NativeAdmissionPolicy::CudaOneGiB,
+            admission,
             max_batch,
         )?;
         let inner = Arc::get_mut(&mut owner.0).expect("new native owner is exclusively owned");
@@ -951,7 +1023,30 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
                 )
                 .into());
             }
-            let physical = state.worker.submit(batch).map_err(PhysicalFailure::from)?;
+            #[cfg(feature = "experimental-batch")]
+            let journal_contexts = state.batch_journal.as_ref().map(|_| {
+                let mut contexts = [context; 16];
+                for (slot, request) in contexts.iter_mut().zip(requests) {
+                    *slot = request.eval().context();
+                }
+                contexts
+            });
+            #[cfg(feature = "experimental-batch")]
+            if let (Some(journal), Some(contexts)) = (&mut state.batch_journal, &journal_contexts) {
+                journal.dispatch(&contexts[..requests.len()], *execution)?;
+            }
+            let physical = match state.worker.submit(batch) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    #[cfg(feature = "experimental-batch")]
+                    if let (Some(journal), Some(contexts)) =
+                        (&mut state.batch_journal, &journal_contexts)
+                    {
+                        journal.undo_dispatch(&contexts[..requests.len()]);
+                    }
+                    return Err(PhysicalFailure::from(error));
+                }
+            };
             // Every fallible operation precedes successful native handoff. The
             // returned lease is registered even if the worker already failed.
             state.active = true;
@@ -1049,6 +1144,19 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
             .into()),
             Err(error) => Err(error),
         };
+        #[cfg(feature = "experimental-batch")]
+        {
+            let mut state = self.owner.state();
+            if let Some(journal) = &mut state.batch_journal {
+                if let Err(error) = journal.physical(
+                    std::iter::once(lease.context).chain(lease.contexts.iter().copied()),
+                    outputs.is_ok(),
+                ) {
+                    state.closed.get_or_insert(error);
+                    state.boundary_error.get_or_insert(error);
+                }
+            }
+        }
         match outputs {
             Ok(outputs) => {
                 self.owner.state().diagnostics[lease.slot] = DiagnosticSlot::Free;

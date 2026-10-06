@@ -108,13 +108,10 @@ fn run_cpu(config: NativeConfig) -> Result<(), Box<dyn std::error::Error>> {
     };
     let process =
         EngineProcess::new(factory.clone(), owners, clock).with_identity(EngineIdentity {
-            name: "RoveZero Maia ONNX CPU integration".into(),
+            name: "RoveZero LC0 weights ONNX CPU integration".into(),
             author: "RoveZero contributors".into(),
         });
-    let settings = EngineSettings {
-        max_workers: 1,
-        ..EngineSettings::default()
-    };
+    let settings = config.engine_settings();
     // Retain the native owner outside EngineProcess. Report/drain acceptance runs
     // for both successful protocol service and EngineError; neither implies GPU support.
     let served = serve_native_process(process, settings, trace.clone());
@@ -152,6 +149,23 @@ fn run_cuda(config: NativeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let clock = ProcessClock::new(ProcessEpoch(1));
     let factory = Arc::new(NativeCudaFactory::load(&owners, &config)?);
     let trace = factory.source_trace();
+    #[cfg(feature = "experimental-batch")]
+    let mut batch_writer = if config.batch_attestation_requested() {
+        Some(rz_uci::native_batch_attestation::BatchReceiptWriter::open(
+            &config,
+        )?)
+    } else {
+        None
+    };
+    #[cfg(feature = "experimental-batch")]
+    let batch_startup = if let Some(writer) = batch_writer.as_mut() {
+        Some(writer.startup(
+            CudaStartupReceiptV1::capture(&factory, &clock)?,
+            &config.engine_settings(),
+        )?)
+    } else {
+        None
+    };
     let mut profile_writer = if config.profiling_requested() {
         Some(ProfileWriter::open(&config)?)
     } else {
@@ -165,24 +179,30 @@ fn run_cuda(config: NativeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let startup = if let Some(writer) = receipts.as_mut() {
         let startup = CudaStartupReceiptV1::capture(&factory, &clock)?;
         writer.startup(&startup)?;
+        // Capture the exact settings subsequently served. Experimental paths
+        // do not issue this fixed-profile attestation (factory guard above).
+        let search = rz_uci::native_cuda_attestation::CudaSearchReceiptV1::capture(
+            &startup,
+            &config.engine_settings(),
+        )?;
+        writer.search_config(&search)?;
         Some(startup)
     } else {
         None
     };
     let process =
         EngineProcess::new(factory.clone(), owners, clock).with_identity(EngineIdentity {
-            name: "RoveZero Maia ONNX CUDA integration".into(),
+            name: "RoveZero LC0 weights ONNX CUDA integration".into(),
             author: "RoveZero contributors".into(),
         });
-    let served = serve_native_process(
-        process,
-        EngineSettings {
-            max_workers: 1,
-            ..EngineSettings::default()
-        },
-        trace.clone(),
-    );
+    let served = serve_native_process(process, config.engine_settings(), trace.clone());
     let finished = factory.finish(served);
+    #[cfg(feature = "experimental-batch")]
+    if let (Some(writer), Some(startup)) = (batch_writer.as_mut(), batch_startup.as_ref()) {
+        if let Err(error) = writer.termination(startup, &factory, &finished) {
+            return Err(Box::new(error.retaining(finished)));
+        }
+    }
     if let (Some(writer), Some(startup)) = (receipts.as_mut(), startup.as_ref()) {
         let receipt = match CudaTerminationReceiptV1::from_result(startup, &finished) {
             Ok(receipt) => receipt,

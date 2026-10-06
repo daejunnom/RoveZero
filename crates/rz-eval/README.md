@@ -21,6 +21,15 @@ native runtime/CUDA 설치가 필요 없다. CPU/CUDA 선택, shape/dtype, 최�
 실제 node placement probe를 요구한다. IO 예산과 CUDA arena cap은 전체 RAM/VRAM
 상한이 아니므로 bootstrap/실행 환경에서 activation·workspace·동시 점유를 별도 제한한다.
 
+CUDA arena는 요청 크기만큼 확장하는 SameAsRequested를 명시한다. 기본의
+power-of-two 확장으로 다른 상주 엔진의 여유를 줄이는 일을 피하려는 저장 정책이다.
+tensor·정밀도·kernel·arena 한도와 CPU backend의 설정/identity는 유지한다.
+CUDA digest에는 cuda-arena-extend=same-as-requested-v1을 포함하며 old CUDA의
+cache/실행 증거와 혼용하지 않는다. BT4 수치·No/Repeat·dual-resident 메모리·
+실패 원인 조사와 source별 인수는
+[pilot 기록](../../docs/research/BT4-FINAL-SELECTION-PILOT.md)을 따른다.
+이 설정은 물리 VRAM 부족 원인의 확정이나 모든 모델의 GPU 인수를 대신하지 않는다.
+
 선정 원본→ONNX 변환, 원본 protobuf의 **LC0 Eigen** 대비 실제 Rust ORT CPU 검사를
 통과했다. 서로 같은 ONNX를 두 언어에서 실행한 대조가 아니다. 12개 국면에서 모든
 입력 plane·합법 수 index를 정확히 비교하고 batch 1/2/4/8/16을 검사한다.
@@ -30,6 +39,31 @@ native runtime/CUDA 설치가 필요 없다. CPU/CUDA 선택, shape/dtype, 최�
 [CPU 인수 기록](validation/maia-cpu.json)에 고정했다. Rust 1.96.0에서 eval 27개와
 encoding 11개(총 38개) 테스트, fmt·Clippy가 통과했고 Rust 1.85.0 all-feature
 check도 통과했다. 기본 feature 검사는 native ORT/CUDA 없이 별도로 통과했다.
+
+## 검증된 native runtime 저장
+
+`runtime_pin::RuntimeCache`가 CPU 단일 library 또는 Linux CUDA 19-file bundle의
+검증된 복사본을 공유한다. `RuntimeLibraryPin`의 명시적인 private-copy API는 보존하되
+일반 native UCI·`maia_check`·`rules_maia_check`는 공유 캐시를 기본으로 사용한다.
+`--runtime-cache-root=<absolute private cache slot>`로 별도 루트를 지정할 수 있다.
+
+기본 위치는 Windows `%APPDATA%/RoveZero/cache/native-runtime-v1/<OS>-<architecture>`,
+Linux `${XDG_CACHE_HOME:-$HOME/.cache}/rovezero/native-runtime-v1/<OS>-<architecture>`,
+CI `$RUNNER_TEMP/RoveZero/cache/native-runtime-v1/<OS>-<architecture>`다. 비밀·가중치·
+모델·로그를 넣지 않는다. root/ancestor의 소유권이 필요하며 link/Git 경로를 거부한다.
+
+cache key는 CPU의 basename+digest 또는 CUDA의 canonical bundle digest다. miss만
+private copy→writer close→readonly 검증→원자적 directory publication을 수행한다.
+hit는 mutable source를 읽지 않고 cached bytes 전체를 expected digest와 대조해 새
+파일 pin을 얻는다. 손상·누락·extra file·쓰기 권한·symlink는 성공으로 바꾸지 않는다.
+동시 creator는 bounded 60초 lock을 사용한다. 최대 4 entry/8 GiB이며 full cache·
+비정상 종료의 lock/staging은 명시적인 실패와 소유자 확인 대상으로 남긴다. 활성 library를
+자동 수리·evict/unload하지 않는다. Unix readonly는 same-UID sandbox가 아니다.
+
+저장 출처 `cache_created/cache_reused`는 별도 metadata이며 raw evaluation의
+`Computed/RawEvalHit`나 신경망 실행 수를 변경하지 않는다. 실제 인수 소스 `5558359`의
+CPU Maia/CUDA BT4 12-case·batch 1/2/4/8/16, Rules No/Repeat·mapping·physical drain과
+일반 UCI의 재사용 결과는 [저장 인수 기록](../../docs/research/PERFORMANCE-OPTIMIZATION-PLAN.md#13-실행별-native-library-복제-제거와-검증된-공유-저장)에 둔다.
 
 ## 현재 제공 범위
 

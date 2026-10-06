@@ -959,3 +959,278 @@ PGN 감사기는 기존 A Rules를 재사용하며 runner의 자동 claim 수락
 3건을 포함해 모든 판을 보존했다. 원본·정리본과 24pair PGN을 외부 reports로 회수하며,
 정리본도 A 감사 결과가 원본과 같다. 매 착수 GPU 물리 drain·시계 공정성의 정식 인수와
 per-game NN 완료 journal은 미검증으로 보존한다.
+
+## 로컬 LC0·T1 후보의 실행·변환 조사
+
+2026-10-04 후속 사용자 요청에 따라 공식 LC0 v0.32.1 Windows CUDA package와
+T1 distilled의 원본 identity·제작자 직접 허가를 확인했다. RTX 4050에서 명시적
+CUDA/FP16로 Maia/T1 각각 18회 UCI 착수·exit 0을 확인하고, 독립 oracle로 36개
+입력·착수·PV와 흑/백 mate-in-one 12개를 감사했다. T1 FP32 ONNX export/checker와
+LC0 Eigen 원본 ↔ ONNX CPU의 6개 상태·batch 2/4/8/16 수치 대조도 통과했다.
+설정·원본/변환 digest·오차·공백과 B~F 순서는 [모델 전환 계획](research/LOCAL-MODEL-BASELINE.md)에 둔다.
+
+이번에는 문서 계획과 **외부 도구의 실행/CPU 수치**를 인수했다. Rust의 T1 loader/
+encoder·ONNX CUDA parity·실제 fine-tuning·새 정식 대국은 미실행이다. Maia exact
+profile·공통 계약 0.1과 기존 48판의 `strength_eligible=false`를 유지한다. 기존 F의
+합성 linear fixture를 실제 모델 trainer로 표현하지 않는다. 문서 경로는 Workspace CPU
+workflow의 path filter에 포함되지 않아 이번 문서 PR의 CI는 자동 실행되지 않았다.
+
+## BT4-it332 Rust 연결과 같은 가중치 LC0 벤치마크
+
+2026-10-04 사용자가 BT4 적용·native LC0와 RoveZero 벤치마크를 지정했다. 공통 계약
+0.1·자체 Rules/PUCT·Maia exact profile은 유지하고 C의 BT4 단일 source/export/profile,
+C/D의 3 GiB admission 선언, B native 유한 1..4096 simulation 선택을 연결했다.
+자연 worker 완료는 runtime shutdown 뒤 게시하도록 수정했으며 강제 마감·stop의
+물리 GPU 시간 공정성은 별도다. BT4의 개별 weights license는 미확인·재배포 false다.
+
+| 실제 인수 | 소스·관측 | 제한 |
+|---|---|---|
+| BT4 외부 CPU 참조 | LC0 `fd71a2d` 원본 Eigen ↔ FP32/opset17 ONNX, 12개 상태·batch 2/4/8/16 통과 | frozen 수치 대조, 학습/강도 아님 |
+| Rust C/A/D CPU·CUDA | `aa0cc0247b9d7041e4525b2021363d0617cfd0bc`, 각 raw 12개·batch 1/2/4/8/16, 자체 A 상태 12개·history fill No 5/Repeat 7, drain/잔여 예약 0 | 그 뒤 변경은 UCI 네 파일이며 Cargo·A/C/D/encoding/contracts 영향 경로 동일성 확인에 한정해 수치 결과 재사용 |
+| CUDA 실제 연산 | FP32·TF32 off·CPU fallback 없음, raw warm CUDA node 687·19파일 runtime bundle, 장치 전체 관측 최대 1,131 MiB | 개별 allocation peak/전체 VRAM hard cap/모든 race 아님 |
+| 실제 B UCI 위치 query | `78b7c53502cadaff77fc6de5f0832eee55b9938c`, immutable binary `1a4b976b4110d251e21b09ed1e1f29b398b4ed01f533788a941de8dc4be969b3`, 18개 합법 bestmove·exit 0·confirmed final drain | D Computed 2,920·B root 초기화 18·non-root 소비는 process 집계, per-root physical journal 아님 |
+| native LC0 비교 | 같은 BT4 원본, v0.32.1 Windows CUDA FP32/FP16 각 18 query·36개 printed PV 합법·exit 0 | FP16 별도 profile, Windows/WSL·CPU·batch 배치 차이를 순수 알고리즘 차이로 하지 않음 |
+| 위치 benchmark | 총 54 query, LC0 FP32/RZ FP32/LC0 FP16 전체 장치 관측 최대 2,009/1,131/1,083 MiB | 250ms sampling·조건별 한 표본·RZ UCI NPS/PV 미제공 |
+| 전술/마감의 후속 대상 | 즉시 메이트 LC0 각 6/6·RZ 0/6, RZ 일반 상태 5초 응답 최대 5,295.06ms·Expired/Stale 진단 보존 | 현 root는 방문 수 우선, 가치 부호 오류/BT4 인코딩 실패 원인 확정 아님; formal strength NO-GO 유지 |
+| 검사/CI | 전체 workspace all-target/all-feature tests·strict Clippy·release build 통과, [37208852788](https://github.com/daejunnom/RoveZero/actions/runs/37208852788)의 두 OS SUCCESS 직접 확인 | CI와 실제 로컬 GPU/arena는 별도 증거 |
+
+최초 native batch 16/min 1의 CUDA 오류와 batch 256/min 4의 후속 성공을 함께 보존한다.
+ONNX·원본 hash·오차·옵션·cold startup·위치 benchmark와 후속 실행 지시서는
+[로컬 모델 기록](research/LOCAL-MODEL-BASELINE.md)에 묶었다. 원시 자료는 저장소 밖
+`reports/coordinator-integration/bt4-benchmark-20261004/`에 회수한다. native receipt를
+처음 회수할 때 잘못된 directory glob으로 supervisor만 복사된 것을 확인하고 실제
+`native-process-*`의 startup/termination을 추가 회수해 byte digest를 대조했다.
+이 회수 보완은 실행 결과를 다시 만들거나 성공으로 바꾸지 않는다.
+
+개발 대국은 4쌍/8판·같은 BT4 FP32·완전한 기존 opening history·500ms/수·별도
+100ms host/transport 여유·256 total ply·전체 1,200초로 먼저 잠가 **8판 모두 완료**했다.
+RoveZero 1승·2무·5패·25%, checkmate 6판·현재 threefold 수락 2판, 시간패·불법 수·
+crash·cutoff 0이다. 563.15초·동시 resident 장치 관측 최대 3,136 MiB, 양 process
+exit 0·RoveZero final drain confirmed를 확인했다. 종료 뒤 장치 VRAM은 0 MiB였다.
+
+독립 python-chess와 A 자체 Rules 감사는 4pair/8판·1,106 ply의 prefix·색·이동열·최종
+상태·종료를 대조했다. PGN 원본 comment 공백 때문에 A strict claim 문구 검사의
+첫 pair 2 감사가 실패했으며 원본과 실패를 보존했다. comment 양끝 공백만 정리한
+별도 PGN은 header·착수·결과가 원본과 같음을 독립 확인하고 A 4pair 감사 exit 0을
+확인했다. parser 구현은 변경하지 않았다. private runner·정리/감사 도구와 raw/cleaned
+PGN은 외부 회수 자료에 포함하며 public source에는 넣지 않는다.
+
+대국 process 집계는 D Computed 16,160·B guarded root/non-root 520/15,640,
+drain-discarded result 120·delivery drop 0·fatal/overflow/boundary/poison 없음이다.
+RoveZero 착수 응답 520회의 중앙값/최대 500.39/538.08ms, LC0 522회는 496.33/508.20ms다.
+Expired/Stale 진단을 숨기지 않으며 process 집계·final drain을 매 root의 전체 GPU
+공정성 journal로 승격하지 않는다. 개발 pool·cross-OS·host 여유·미확정 물리 시계/
+동일 자원 때문에 정식 강도 승격·Elo·실제 학습 인수는 하지 않는다.
+
+E 정식 native CUDA V1은 기존 1 GiB arena/session·16 MiB ONNX artifact bound에 고정돼
+이번 BT4 profile을 인수하지 않는다. 위 개발 pair는 별도 private finite runner가
+native CLI를 직접 실행한 결과이며 E locked launch/정식 manifest 성공이 아니다.
+별도 BT4 artifact/profile revision과 C/D/E receipt의 수동 연결이 후속으로 남는다.
+
+## BT4 종료 회귀·조건 대조·B1 분해와 정확한 직접 자식 선택
+
+2026-10-05 총괄은 사용자 지정 종료 회귀·입력 대조·동일 바이너리 A/A를 먼저 실행하고
+LC0 classic의 terminal/일반 Q/bounds를 대조했다. 공통 계약은 **0.1**이며 기존 PUCT,
+HistoryFillNo, 동결 BT4 FP32·TF32 off·B1·cache off를 유지한다. 최종 착수의
+`exact-terminal-child-v1`은 **opt-in S 변경**이고 기존 visit-first S0가 기본이다.
+상세 fixture·소스·분포·실패는 [모델 기록 8장](research/LOCAL-MODEL-BASELINE.md#8-종료-회귀조건-대조b1-계측과-별도-s1)에 묶었다.
+
+| 실제 확인 범위 | 실행 근거 | 상태와 한계 |
+|---|---|---|
+| 기존 S0 종료 흐름 | `cf94d07` actual Rules/C/D/CUDA, 8 fixed case, 4096 simulations | 네 direct mate 후보/각 색·checkmate·root +1 backup 정상; 최종 방문 우선이 delayed mate를 골랐음. 계약 부호 오류/중복 backup 미발견 |
+| 같은 binary S0/S1 | `9817647`, binary `581d4162…cabd8d`, 8 case/각 정책, 16,005 terminal backup/각 정책 | 입력·indices·root policy/WDL·전체 root stats·경로·카운터 정확 일치; 부호/visit 오류 0·독립 chess 감사. S1은 실제 백/흑 mate 선택, draw·loss avoidance 유지 |
+| 일반 native UCI의 S1 | `fabe88e`, binary `2bcb3d5d…3cffec`, 8개 `go nodes 4096` | 백/흑 mate·두 draw 회피, 종료 root 4개 `0000`; NN 완료 383·root 초기화 4·NN non-root backup 379, process exit 0·physical drain confirmed |
+| 오인 방지 검사 | 신경망 Q=1, winning descendant 하나, 미방문 terminal 형태, 최종 guard 거부, 중간 정책 변경 | 추정치로 부모를 proved win으로 만들지 않음. 전체 solved propagation/mate-distance 구현은 아님 |
+| 입력·평가 조건 | `3ef9171` parity fixture와 기존 실제 CUDA root 평가 10개, pinned LC0 Eigen original | tensor bit/ordered legal indices exact, temperature 1에서 policy 3.8314e-6/WDL 4.6194e-7. 짧은 No 참조의 source-equivalent zero padding을 명시 |
+| 이전 실제 대국 설정 | 원본 manifests/argv와 LC0 help/source | 두 엔진 HistoryFillNo·RZ cap 4096; policy temperature LC0 1.36/RZ 1.0 차이 발견. 전 대국 root 모두 재평가한 것은 아님 |
+| 동일 binary A/A | 기존 `78b7c53`/`1a4b976b…69b3`, 새 process 2·24 query | fixed `go nodes 128` 응답 CV 7.571~9.910%; timed 응답 CV 0.280~0.335%. 128은 explicit workload이며 config cap은 4096 |
+| B1 host-source profile | `cf94d07` 진단 뒤 `fabe88e` 일반 UCI 재확인, 두 opening/128 visits, request/physical complete/delivered/consumed 각 258 | 각각 8108/8182 records·complete timeline·누락/중복/identity mismatch/미소비 0. 일반 UCI ORT Run P50 10.089241ms, Rules replay 0.042959ms; device kernel/transfer는 미측정 |
+| 같은 tensor·batch 추론 | `3ef9171` Rust raw 20 round/B1·B16, native LC0 backendbench 같은 입력/20 round | RZ 평균 11.087/76.947ms, LC0 11.637/62.623ms; 각 20/320 NN 항목. cross-OS/runtime/CPU/RAM 차이가 남아 순수 엔진 효율·기력 인수 아님 |
+| 검사/CI | S1 로컬 workspace 714 passed·0 failed, 후속 UCI 192 passed·fmt/Clippy/release 성공; source `fabe88e` [37218841079](https://github.com/daejunnom/RoveZero/actions/runs/37218841079) | Windows·Ubuntu의 모든 필수 step SUCCESS 직접 조회; ignored는 별도 미실행. 후속 변경이 문서에만 한정됨을 대조한 CPU 결과 재사용이며 새 GPU CI 실행 아님 |
+
+CPU 2·RAM 6 GiB·swap 0·유한 case/process time을 잠갔고 memory.max pressure와 OOM/kill 0을
+보존했다. GPU의 전체 process sampling은 startup을 포함한다. host source span으로 GPU
+kernel-only·H2D/D2H 비용을 추정하거나 kernel_time 이름만으로 device 측정이라고 하지 않는다.
+더 깊은 profiler 경로는 새 진단 환경·영향 identity와 same-input/physical completion 검사를
+잠근 뒤 연결한다. 현재 표본은 replay보다 inclusive ORT Run interval이 컸다는 근거다.
+일반 UCI의 고정 feature는 `onnx-cuda,experimental-batch`이며 notify/best-move는 꺼져 있다.
+따라서 이 기준선은 1ms polling과 전체 outcome 진행 조회를 사용한다. 소스에 존재하는
+선택 기능을 이번 binary의 활성 기능으로 보고하지 않는다. 일반 UCI go 응답 3,022.374ms
+중 inclusive Run 합계 2,813.345ms·replay 17.935ms, 각각 약 93.1%·0.59%다.
+
+첫 profile의 종료 미확정, 첫 LC0 backendbench의 CLI 거부/exit 0/결과 없음, host disk
+부족의 S0 bootstrap sync 실패를 모두 보존했다. 성공한 fresh retry만 인수했다. 원시
+자료·회수 보완·binary/CI metadata와 재생성 복사본의 hash 기반 정리 목록은 저장소 밖
+`reports/coordinator-integration/bt4-diagnostics-20261005/`다. 가중치·원시 PGN은 Git에 넣지 않는다.
+
+전체 solved subtree·mate distance, deadline/stop의 독립 physical fence, E의 BT4 launch
+profile/schema, 동일 시간·자원·holdout paired 강도와 Elo, actual training은 남아 있다.
+이번 즉시 메이트 회귀 성공을 해당 gate들의 통과로 승격하지 않으며 새 대국은 실행하지 않았다.
+
+## native runtime 공유 저장·기존 복사본 정리 인수
+
+2026-10-05 사용자 요청으로 실행마다 남던 ORT/CUDA 라이브러리 복제를 검토했다.
+총괄은 C API·B startup/gate·E parent/inner argv·native loader와 root dependency를
+수동 연결하고 같은 소스 `55583595a90bb59f611553da103101836fc9cd88`에서 검증했다.
+공통 계약 0.1·모델/입력/계산 identity·추론 cache provenance·PUCT/S0/S1·물리 lease는
+유지하며 라이브러리 저장을 별도 `RuntimeStorage`로 관측한다.
+
+| 인수 범위 | 확인 결과 |
+|---|---|
+| runtime 저장 | OS/architecture·내용 key의 공유 private cache, writer close/readonly/hash 뒤 원자적 게시, hit의 전체 bytes/새 pin, 최대 4 entry/8 GiB·creator 대기 60초 |
+| 실패/경합 | 손상·누락·extra·쓰기 권한·symlink 거부, 늦은 CUDA copy 실패 정리·재시도, CPU 두 process/네 thread 중 한 creator, busy lock timeout·capacity 실패. published entry 자동 교체/삭제 없음 |
+| E consumer | env_clear 유지·부모가 C root를 두 engine argv로 전달, cache와 per-attempt watch 예산 구분. one-way workspace 의존 추가/lock 갱신; 신규 외부 package 없음 |
+| 실제 CPU/CUDA | Maia CPU와 BT4 CUDA 각 새 cache와 reuse process, 12-case/batch 1/2/4/8/16·Rules No/Repeat·최종 승인·mapping·physical drained 통과 |
+| 실제 일반 UCI | CUDA 새 process 두 개 × 두 opening/16 visits, cap 4096/B1/S0, 각 NN 완료/소비 34·root 초기화 2·non-root backup 32, 같은 합법 착수, process exit 0·physical drain confirmed |
+| 파일 불변성 | 20 files/2 entry/2,991,194,560 bytes. 모든 재사용의 경로 집합·크기·device/inode 동일, per-run `ort-bootstrap-*` 새 생성 0 |
+| 기존 owned copy 정리 | inactive maps/FD·regular/type/link/size·원본 SHA 확인 후 library 파일만 제거: 54 directory/89,609,533,152 bytes. 8 MiB 불완전 copy·모델·원본 bundle·로그/PGN/보고서 보존 |
+| 로컬 검사 | all-target/all-feature 727 passed·0 failed·16 ignored; fmt/strict Clippy/release 성공. ignored 미실행 |
+| CI | source `5558359`, [37233809881](https://github.com/daejunnom/RoveZero/actions/runs/37233809881)의 Windows/Ubuntu 필수 step 전체 SUCCESS 직접 확인. 실제 GPU CI 아님 |
+
+최초 source `24552e1`의 Windows 경로 검사 실패를 남기고 `94b8d78`의 drive/verbatim
+prefix 처리 이후 성공을 별도 확인했다. 같은 번호의 cache hit를 신경망 새 실행이나 방문으로
+집계하지 않는다. metadata와 cache key만으로 bytes 검사를 건너뛰지 않으며 root/ancestor
+ownership·same-UID 신뢰 전제와 native constructor/process lifetime을 유지한다.
+
+삭제량은 WSL 내부 파일의 논리량이며 로컬 C 드라이브 물리 반환과 구분한다. 모델/
+library 원본과 보고서는 보존했다. 저장·실행·성공·첫 실패·회수의 근거는 저장소 밖
+`reports/coordinator-integration/runtime-storage-20261005/`다. 실행된 source와 후속 문서
+head를 구분하고 영향 코드·Cargo·CI의 동일성에 근거해 검사 결과를 재사용한다.
+
+이 인수는 startup speedup·NN throughput·새 E launcher의 실제 paired 대국·E BT4
+profile 확장·정식 강도/Elo·학습·device transfer/kernel 계측을 완료한 근거가 아니다.
+세부 저장 경로·기본값·한도·cleanup·실제 witness는
+[저장 기록](research/PERFORMANCE-OPTIMIZATION-PLAN.md#13-실행별-native-library-복제-제거와-검증된-공유-저장)과
+[계약 연결 13장](CONTRACT-ADOPTION.md#13-런타임-저장-capability와-isolated-e-argv의-수동-연결)에 둔다.
+
+
+## stop·마감 착수 출력의 물리 완료 인수
+
+2026-10-05 재개 시 #20 `3ec439e3`·develop base `87017a27`·open/Draft·리뷰 부재와
+두 OS CI 성공을 확인했다. 총괄은 독립 stop/deadline가 논리 취소 뒤 물리 worker가
+진행 중이어도 출력하던 경계를 고정 검사로 재현하고 `62719f5`에서 보완했다.
+B03/C/D의 연결이며 공통 revision 0.1·PUCT·S0/S1·모델/입력/평가 provenance는 유지한다.
+
+실제 GPU source `3d90a0385245d3e77638186c97539c75c24bdd28`와 binary
+`f818756e…85d737f`의 기존 `onnx-cuda,experimental-batch` B1을 실행했다.
+CPU 2·RAM 6 GiB·swap 0·pids 128·유한 query/process·360초/256 MiB 전체 상한이다.
+
+| 인수 항목 | 실제 근거 |
+|---|---|
+| B의 출력 소유 | 마지막 유효 착수를 stop/hard deadline에서 고정, owned worker 모두의 정상 drain·join 뒤 한 번 출력. 보류 동안 입력/isready 처리, scope 교체/quit/EOF는 이전 착수 폐기 |
+| 오류·수명 검사 | 차단된 NativeWorkerOwner의 stop/deadline/root 교체에서 출력 전 physical active·출력 후 inactive 대조, 늦은 root/non-root backup 0. drain 오류/panic/timeout은 승인 출력 없이 원래 serve 오류·worker/pin 보존 |
+| 실제 CUDA S0/S1 | 각 8 query·마감/중복 stop/root/newgame/후속 계산, python-chess 1.11.2 독립 합법 검사. 물리 완료 53/54·실제 B 소비 48/50·미소비 5/4, D drain discard와 일치 |
+| 실제 D02 | 1829/1856 records, producer join·complete journal/accepted timeline, 누락/중복/identity mismatch/오버플로/물리 실행 중첩 0 |
+| S1 종료 회귀 | 8 go nodes 4096, 실제 백/흑 mate·네 terminal root 0000·두 draw 회피. NN 완료/소비 383·root 4/non-root 379 |
+| 최종 종료/저장 | 세 process exit 0·confirmed physical drain·mapping/service/collection 실패 없음·owned PID/OOM 0, cache reuse·실행별 library copy 0; 종료 뒤 GPU 0 MiB/0% |
+| 실제 source 검사 | workspace 733 passed·0 failed·16 ignored, fmt/strict Clippy/release 성공. [37237882649](https://github.com/daejunnom/RoveZero/actions/runs/37237882649)의 두 OS 필수 step SUCCESS 직접 확인 |
+
+첫 native 실행 뒤 측정 도구의 영수증 위치 오류와 유효 admission 구간이 없는 5ms
+workload는 별도 보존하고 수정한 fresh 50ms 검사만 인수했다. 네 50ms 응답은
+33.252~42.828ms이며 모든 장비/포지션의 wall deadline 보장이나 속도·기력 우위의 증거가 아니다.
+실제 source의 실행과 후속 테스트/문서의 검사 재사용을 구분한다. E의 BT4 launch
+artifact/bounds/profile, device transfer/kernel, holdout 동일 시간 강도/Elo·학습은 남아 있다.
+세부 source·실패·명령·원시 증거 논리 루트는
+[모델 기록 9장](research/LOCAL-MODEL-BASELINE.md#9-stop마감-출력의-물리-완료-경계)과
+`reports/coordinator-integration/physical-fence-20261005/`를 따른다.
+## E BT4 CUDA V2 후속 인수 — 2026-10-05
+
+총괄이 CUDA launch V2의 별도 schema/domain·BT4 exact source·768 MiB ONNX·3 GiB
+arena, E child argv와 B 실제 search config 영수증, C/D profile·runtime cache·A PGN
+접점을 수동으로 연결했다. 공통 revision 0.1·CPU/CUDA V1 한도와 provider V1 닫힌 필드는
+유지한다. [수동 적용 절차](CONTRACT-ADOPTION.md),
+[상세 실행·실패·미인수](research/LOCAL-MODEL-BASELINE.md#10-e-bt4-cuda-v2의-실제-aa-연결-인수)를 따른다.
+
+실제 source `30ca349860f37ad07a7183d228d02138a2716718`에서 V2 A/A 두 판을 실행해
+네 fresh native process의 CUDA placement·정상 Computed/backup·명세와 실제 탐색 설정·
+physical drain·exit 0·전체 PGN의 A Rules/독립 합법성 대조를 통과했다. 승인된 Computed
+470·root 32/non-root 438, 같은 수순의 18 ply씩 두 판이다. 최대 수 cutoff라 **Incomplete 2,
+scored 0, strength/execution_ready false**이며 holdout·Elo 완료가 아니다.
+
+초기 source a0682ff의 실제 두 번의 second-model allocation 실패(명시 RAM 12/14 GiB),
+성공한 별도 단일/dual 진단, 검증된 private snapshot 캐시 힌트 뒤 RAM 12 GiB의 성공을
+각각 보존했다. cache hint는 원본·공유 C cache·GPU buffer의 소유 정책을 바꾸지 않는다.
+일반 속도 개선이나 GPU/호스트 실패 원인을 확정하지 않는다.
+
+소스의 fmt·strict workspace Clippy·release·**742 passed/0 failed/16 ignored**와
+[CI 37252367540](https://github.com/daejunnom/RoveZero/actions/runs/37252367540)의 두 OS
+필수 step SUCCESS를 확인했다. 원시 자료는 외부
+`reports/coordinator-integration/native-bt4-arena-20261005/`에 회수했다. 후속 문서 head의
+검사 재사용은 영향 source/Cargo/CI diff가 없는 경우에만 별도로 기록한다. #20은 Draft로
+유지하며 develop 인수 때 최신 선언·consumer·runtime/receipt·같은 integration SHA를
+다시 대조한다. S0/S1 mixed pair·LC0 opponent는 닫힌 A/A V2의 지원 범위에 포함하지 않는다.
+
+회수·hash·비활성 확인 뒤 세 완료 attempt의 검증용 library 사본 57개,
+8,910,431,856 logical bytes만 정리했다. 원본·C cache·모델·연구 증거를 보존하며
+전체 E input snapshot은 원래 잠금 명세에서 재생성한다. WSL 논리 정리량을
+Windows 디스크 물리 회수량으로 표시하지 않는다.
+
+## E BT4 CUDA V3 pilot과 메모리 후속 — 2026-10-05
+
+총괄이 CUDA V3 purpose/schema/domain·고정 16 opening·S0 visits/S1 exact-terminal의
+최종 선택 차이·30초+0.1초 전체 시계·256 ply·고정 paired Hoeffding95를 연결했다.
+V1/V2 A/A와 공통 revision 0.1은 유지한다. Fastchess exact source/patch/binary와
+clock trace를 A PGN·현재 draw claim·실제 B search-config/NN·physical drain/exit에
+대조하며 시작 전 실패도 별도 원장에 보존한다. 새 승인 흐름이나 merge 권한은 추가하지 않는다.
+
+초기 source f20a621의 3쌍은 인수됐지만 4번째 쌍의 두 번째 S1 model load에서
+6 MiB 할당 실패로 중단했다. 원래 E 실패·먼저 완료된 PGN과 pre-PGN startup loss를
+보존한다. 이번 RAM peak 약 3.93 GiB·한도/OOM 사건 0과 독립 dual 진단만으로
+물리 VRAM 원인을 확정하지 않는다. source d44f059의 CUDA 요청 크기 arena 변경은
+새 backend identity를 발급하며 BT4 수치·Rules No/Repeat·dual memory·물리 종료를
+별도로 검증했다. 한 번의 device memory 표본은 2398→1710 MiB였다.
+
+source d44f059에서 local workspace 749 passed·0 failed·16 ignored와 fmt/strict
+Clippy/release, [CI 37261878758](https://github.com/daejunnom/RoveZero/actions/runs/37261878758)의
+Windows/Ubuntu 필수 step SUCCESS를 직접 확인했다. ignored는 로컬 미실행이며
+실제 GPU 실행과 CPU CI를 구분한다. 새 source/binary/backend를 잠근 두 번째 시도도
+3쌍 인수 뒤 4번째 pair/game-2에서 같은 6 MiB 초기화 실패로 중단했다. 실패한 pair의
+첫 판은 독립 재생한 124 ply 무승부이고 PGN이 없는 S1 startup loss는 새 E audit에 남겼다.
+각 시도는 등록 16쌍 중 13쌍 미완료이며 점수·표본을 합치지 않는다. arena 점유 감소가
+반복 실패를 해결했다고 주장하지 않는다. allocator 구분 진단과 후속 실행은 누적
+120분 안에서 유한하게 진행한다. 부분 진행을 32판 완료로 표시하지 않는다.
+최종 실행 상태·검증·실패·누락·원시 자료의 logical root는
+[pilot 기록](research/BT4-FINAL-SELECTION-PILOT.md)을 따른다. #20은 Draft다.
+
+후속 조사에서 분리 E 실행 중 Windows 가용 RAM 최저 95.8 MB와 cgroup file cache
+7.26 GB를 관측했다. 기존 allocator 오류의 VRAM 원인은 미확정이다. E source 5f40654는
+최종 hash 검사 뒤에도 검증된 main private input에 cache hint를 적용한다. NN binary/
+backend·FP32·No·B1·PUCT/선택 정책은 유지하며 actual binary SHA와 C/B 영향 경로를
+대조했다. 새 E의 145 arena 검사·fmt/strict Clippy/release와 두 OS exact-source CI를
+확인했고 첫 완료 pair의 retained private model cached page 0을 별도로 관측했다.
+추가 startup error 처리에서 cache hint 실패가 생겨도 원래 실패를 보존한다. 최신 코드
+43e90fa의 [두 OS CI](https://github.com/daejunnom/RoveZero/actions/runs/37267193365)는
+모든 필수 step SUCCESS다. 실제 GPU/arena source 5f40654와 오류 분기 검사를 구분한다.
+
+세 번째 16-lock 시도는 6쌍·12판 완전 인수(S1 W3/D6/L3) 뒤 누적 120분 deadline에서
+pair-06을 중단했다. 이전에 실패한 pair-03/game-2를 통과했으며 이번 7개 attempt의
+보존 로그에서 allocation failure/startup loss는 미관측이다. 예산 중단 pair의 첫 판을
+포함한 실제 13판 PGN을 독립 재생하고 인수 여부를 표시했다. 16쌍 중 미완료 10쌍을
+유지하고 다른 두 시도와 합치지 않는다. 전체 강도는 inconclusive이며 #20 Draft와
+execution_ready/strength_eligible false를 유지한다.
+
+Windows 가용 RAM 최저 10.50 MiB·128 MiB 미만 4개 표본을 관측했다. 같은 boot의
+후기 cgroup peak 약 3.93 GiB·device 표본 최고 1630 MiB·guest OOM 사건 0은 전체
+호스트 RAM 압박 해결이나 물리 VRAM 원인 확정의 근거가 아니다. 예산 만료 뒤 약 4.89초의
+owned 종료·회수로 모든 PID가 종료됐고 마지막 device memory/utilization은 0/0이었다.
+최종 범위·자원 관측·PGN·실패 ZIP은 위 pilot 기록과 외부 reports에 보존한다.
+
+## E V3 2분+1초 로컬 blitz 실행 — 2026-10-05
+
+사용자 후속 요청으로 source `73bb7f3`에서 새 S0/S1 paired pilot을 시작했다.
+경기 전체 120초+착수당 1초, 같은 BT4·FP32·No·B1·cap 4096·PUCT를 사용한다.
+16쌍·32판, 256 ply, 전체 최대 120분이며 알려진 동일 16 opening을 다시 사용한다.
+CCRL Blitz의 시간 형식만 참조하며 공식 CPU 보정·등록·rating을 수행한 결과가 아니다.
+기존 30초+0.1초 시도와 점수나 표본을 합치지 않는다.
+
+PGN TimeControl 차이로 실행을 막는 조건과 두 고정 시계의 whitelist를 제거했다.
+차이는 V3 clock audit의 진단에 남기고 실제 매 착수 시계·증분·초기화·색 배정을 관측한다.
+raw engine ID에 RoveZero·BT4-it332·S0/S1을 명시한다. NN binary SHA는 `a46e941c…`,
+C backend는 이전 수치 검사와 같고 새 arena SHA는 `2491dd2e…`다. 결과 진단 변경을
+새 탐색 정책이나 모델 변경으로 보고하지 않는다.
+
+현재 source에서 native_cuda 22개·arena all-feature/all-target 146개가 통과했고
+arena GPU 전용 14개는 해당 CPU 검사에서 ignored다. fmt·strict workspace Clippy·release
+빌드는 통과했다. [source 73bb7f3의 CI](https://github.com/daejunnom/RoveZero/actions/runs/37290127676)는
+Windows/Ubuntu 두 job SUCCESS를 관측했다. 실제 GPU 대국과 호스트 RAM/commit 관측은 진행 중이며 완료 결과는
+[pilot 기록](research/BT4-FINAL-SELECTION-PILOT.md)에 추가한다. #20은 Draft다.

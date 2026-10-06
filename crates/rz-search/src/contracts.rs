@@ -253,6 +253,17 @@ pub struct AcceptedEvaluation {
     pub actual: ActualCompute,
 }
 
+/// Optional, single-slot observation of an exact Rules terminal after commit.
+/// The observer cannot mark nodes solved or change selection/backup authority.
+#[derive(Clone, Debug)]
+pub struct TerminalBackupObservation {
+    pub selection: SelectionId,
+    pub path: Vec<Move>,
+    pub classification: PlayStatus,
+    pub leaf_side: Color,
+    pub leaf_value: f64,
+}
+
 #[derive(Clone, Debug)]
 pub enum ContractPumpEvent {
     Submitted {
@@ -302,6 +313,8 @@ pub struct ContractSearch<P: ContractPosition, S: SelectionPolicy = Puct> {
     #[cfg(feature = "experimental-state-cache")]
     state_cache: StateCache<P>,
     source_trace: Option<SourceJournal<CompletionContext>>,
+    observe_terminals: bool,
+    terminal_observation: Option<TerminalBackupObservation>,
 }
 
 impl<P: ContractPosition, S: SelectionPolicy> Drop for ContractSearch<P, S> {
@@ -366,6 +379,8 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
                 hits: 0,
             },
             source_trace: None,
+            observe_terminals: false,
+            terminal_observation: None,
         })
     }
 
@@ -381,6 +396,23 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         self.source_trace = trace;
     }
 
+    pub fn observe_terminal_backups(&mut self, enabled: bool) {
+        self.observe_terminals = enabled;
+        self.terminal_observation = None;
+    }
+    pub fn set_final_move_policy(
+        &mut self,
+        policy: crate::tree::FinalMovePolicy,
+    ) -> Result<(), ContractError> {
+        self.tree
+            .set_final_move_policy(policy)
+            .map_err(tree_boundary)
+    }
+
+    pub fn take_terminal_observation(&mut self) -> Option<TerminalBackupObservation> {
+        self.terminal_observation.take()
+    }
+
     pub fn pending_request(&self) -> Option<RequestId> {
         self.pending
             .as_ref()
@@ -388,6 +420,7 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
     }
 
     pub fn outcome(&self) -> ContractSearchOutcome {
+        let started = self.source_trace.as_ref().map(|_| Instant::now());
         let root_stats = self.tree.root_stats();
         let visited = root_stats.iter().any(|(_, edge)| edge.visits > 0);
         let best = if visited {
@@ -395,7 +428,7 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         } else {
             None
         };
-        ContractSearchOutcome {
+        let outcome = ContractSearchOutcome {
             best_move: best.or(self.fallback),
             fallback_used: best.is_none() && self.fallback.is_some(),
             status: self.status.clone(),
@@ -403,7 +436,17 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             metrics: self.metrics,
             root_stats,
             policy_identity: self.tree.policy_identity(),
+        };
+        if let (Some(trace), Some(start)) = (&self.source_trace, started) {
+            trace.record(
+                None,
+                SourceStage::FinalSelection,
+                start,
+                Instant::now(),
+                true,
+            );
         }
+        outcome
     }
 
     /// Allocation-free progress query, with the same zero-visit fallback rule.
@@ -626,6 +669,7 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
                 return self.fail_ticket(&selection.ticket, ContractSearchFailure::Boundary(error));
             }
         };
+        let replay_started = self.source_trace.as_ref().map(|_| Instant::now());
         #[cfg(feature = "experimental-state-cache")]
         let (replayed, mut leaf) = self
             .state_cache
@@ -642,6 +686,7 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
                 }
             };
         }
+        let replay_finished = self.source_trace.as_ref().map(|_| Instant::now());
         if let Err(error) = validate_position(&leaf) {
             return self.fail_ticket(&selection.ticket, ContractSearchFailure::Boundary(error));
         }
@@ -650,6 +695,7 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             return self.fail_ticket(&selection.ticket, ContractSearchFailure::Boundary(error));
         }
         let terminal = terminal_utility(&leaf);
+        let validation_finished = self.source_trace.as_ref().map(|_| Instant::now());
         if let Leaf::Terminal(expected) = selection.leaf {
             if terminal != Some(expected) {
                 return self.fail_ticket(
@@ -663,6 +709,25 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             }
         }
         if let Some(value) = terminal {
+            if let (Some(trace), Some(start), Some(replay), Some(replayed), Some(validated)) = (
+                &self.source_trace,
+                preparation_started,
+                replay_started,
+                replay_finished,
+                validation_finished,
+            ) {
+                trace.record(None, SourceStage::SearchPreparation, start, validated, true);
+                trace.record(None, SourceStage::SearchSelection, start, replay, true);
+                trace.record(None, SourceStage::StateReplay, replay, replayed, true);
+                trace.record(
+                    None,
+                    SourceStage::LegalValidation,
+                    replayed,
+                    validated,
+                    true,
+                );
+            }
+            let backup_started = self.source_trace.as_ref().map(|_| Instant::now());
             let mut guard_error = None;
             let completion = self.tree.accept_terminal_with_guard(
                 &selection.ticket,
@@ -676,13 +741,33 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
                     }
                 },
             );
-            return self.commit_result(
+            let event = self.commit_result(
                 completion,
                 &selection.ticket,
                 None,
                 selection_id,
                 guard_error,
             );
+            let accepted = matches!(event, ContractPumpEvent::Accepted { .. });
+            if let (Some(trace), Some(start)) = (&self.source_trace, backup_started) {
+                trace.record(
+                    None,
+                    SourceStage::TerminalBackup,
+                    start,
+                    Instant::now(),
+                    accepted,
+                );
+            }
+            if accepted && self.observe_terminals {
+                self.terminal_observation = Some(TerminalBackupObservation {
+                    selection: selection_id,
+                    path: selection.moves,
+                    classification: leaf.snapshot().classification().play_status,
+                    leaf_side: leaf.snapshot().side_to_move(),
+                    leaf_value: value,
+                });
+            }
+            return event;
         }
         if leaf.legal().moves().len() > self.config.tree_limits.max_legal_moves {
             return self.fail_ticket(
@@ -690,12 +775,14 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
                 ContractSearchFailure::Tree(SearchError::EdgeLimit),
             );
         }
+        let input_started = self.source_trace.as_ref().map(|_| Instant::now());
         let input = match input_key(&leaf, self.config.model.encoding()) {
             Ok(input) => input,
             Err(error) => {
                 return self.fail_ticket(&selection.ticket, ContractSearchFailure::Boundary(error));
             }
         };
+        let input_finished = self.source_trace.as_ref().map(|_| Instant::now());
         if let Err(error) = live_acceptance(&self.config, clock, &mut live_scope, &leaf) {
             self.release_ticket(&selection.ticket, status_for_boundary(error));
             return ContractPumpEvent::Finished;
@@ -808,6 +895,28 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         }
         self.metrics.submission_attempts = attempts;
         if let (Some(trace), Some(start)) = (&self.source_trace, preparation_started) {
+            let key = Some(CompletionContext {
+                request: context,
+                execution: None,
+            });
+            if let (
+                Some(replay),
+                Some(replayed),
+                Some(validated),
+                Some(input_start),
+                Some(input_end),
+            ) = (
+                replay_started,
+                replay_finished,
+                validation_finished,
+                input_started,
+                input_finished,
+            ) {
+                trace.record(key, SourceStage::SearchSelection, start, replay, true);
+                trace.record(key, SourceStage::StateReplay, replay, replayed, true);
+                trace.record(key, SourceStage::LegalValidation, replayed, validated, true);
+                trace.record(key, SourceStage::InputKey, input_start, input_end, true);
+            }
             trace.record(
                 Some(CompletionContext {
                     request: context,

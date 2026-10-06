@@ -305,3 +305,91 @@ LL/DL/DD/WL/WD/WW 선언의 손계산과 W=D=L=4, `n=[1,1,2,1,1]`, 완료 pair 6
 `reports/e02/`, `runs/e02-synthetic-*/`에 보존한다. arena 임시 Cargo.lock의 SHA-256은
 `d890a0f527543df34e5a47942a99ce3eeeefb2c687682b4e54c84e2531cdbcac`이다.
 E01 lockfile은 기존 `3f0688d9…`와 같다. 환경 종료 전 회수와 I01 정식 lockfile 인계가 필요하다.
+
+## BT4 V2 실행과 탐색 설정 대조
+
+`native-cuda` feature의 별도 명령은 다음과 같다. 기존 CUDA V1 명령은 유지한다.
+
+```text
+rz-arena native-cuda-v2-lock INPUT OUTPUT
+rz-arena native-cuda-v2-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME
+```
+
+`prepare_native_cuda_launch`·`run_native_cuda_pair`는 sealed V1/V2 타입에 대해
+같은 source verification·exclusive readonly snapshot·process/watch·Rules 감사
+구현을 사용한다. V2는 명세의 `--search-simulations`와 `--final-selection`을
+각 자식 argv에 전달한다. `env_clear`와 부모가 정한 명시 runtime cache root는 유지한다.
+CPU/기존 CUDA V1의 원래 byte·arena·wire 범위를 BT4로 확대하지 않는다.
+
+B는 실제 서비스에 쓰는 EngineSettings에서 별도
+`native-cuda-search-config.v1.json`을 작성한다. E V2는 정확한 startup **원시 바이트**
+SHA·process ID, simulations·최종 선택·policy 온도·cache·worker·batch, tree 한도와
+10ms 출력/10ms drain/2s shutdown 설정을 검증한다. 누락·변조·다른 startup·다른
+정책은 거부한다. provider V1 파일의 닫힌 필드 집합과 CUDA placement·실제
+Computed/root/non-root·physical drain·네 PID의 exit 0 조건은 그대로 요구한다.
+
+새 pair는 두 판의 색 교환과 전체 opening trace를 A로 감사한다. 최대 수 cutoff는
+`Incomplete`, scored_games=0이며 기력/Elo 결과가 아니다. 실패한 startup·부분
+receipt·빈 PGN은 성공으로 집계하지 않고 원래 process/provider 원인을 보존한다.
+별도 단일/동시 상주 진단도 E의 성공한 두 판을 대신하지 않는다.
+
+V2 runtime 19 MiB 예약은 공유 cache 사용을 전제로 한 native output 예약이다.
+E의 검증 입력 snapshot에는 고유 model/runtime bytes가 별도로 포함되고 C의
+4 entry/8 GiB cache도 외부 budget이다. per-process address space와 별도
+aggregate RAM·CPU·GPU·wall-time 한도를 잠그고 측정해야 한다. arena 요청이나
+낮은 GPU 사용량 표본만으로 전체 VRAM·할당 실패의 원인을 판정하지 않는다.
+
+V2에서는 실행 직전 해시·inode 대조를 마친 8 MiB 이상 private input copy에만
+`POSIX_FADV_DONTNEED` 힌트를 적용한다. 복사 때 `sync_all`한 파일의 열린 readonly pin을
+사용하며 원본·C의 공유 runtime cache·GPU buffer는 대상이 아니다. 파일·offset·해시·
+실행 후 재검사는 유지한다. 이는 OS cache hint이며 실제 RAM 회수나 속도 개선을
+보장하지 않는다. 호출 오류는 typed preparation 실패로 보존한다. CPU/CUDA V1은 이
+힌트를 사용하지 않는다. 디스크의 E input snapshot 복사 자체를 제거한 변경도 아니다.
+
+## BT4 최종 선택 pilot V3
+
+별도 명령은 `native-cuda-pilot-lock INPUT OUTPUT`,
+`native-cuda-pilot-pair LOCKED ARTIFACT_ROOT OUTPUT_ROOT NEW_OUTPUT_BASENAME`이다.
+같은 verified input/process/provider 구현에 sealed V3 profile을 연결한다.
+두 역할의 source·binary·모델·runtime·자원·인코딩은 같고, simulations=4096에서
+visits와 exact-terminal의 최종 선택만 다르다. V1/V2 A/A는 유지한다.
+등록 cohort의 ordinal·opening·첫 색과 whole-game clock을 잠그고 고정된 Fastchess
+source/patch/binary를 검증한다. -strict를 빼서 시간패의 PGN을 회수하며 오류가 있는
+pair를 정상 인수하지 않는다.
+
+전체 시계는 position 전송 전부터 bestmove까지 부모의 단조 시간으로 측정한다.
+부분 ms 올림·제시간 착수 뒤 증분·새 게임의 잠긴 base 초기화·흑백 역할을
+A가 재생한 모든 PGN ply와 대조한다. 100ms read margin은 시간패를 연장하지 않는다.
+자동 draw claim은 A의 현재 위치 근거가 있어야 한다. 정상 종료와 인수된 claim은
+pilot의 scored_games에 포함되지만 cutoff는 Incomplete다. 네 fresh native process의
+provider/search/placement·physical drain·exit 0과 전체 clock gate를 별도로 요구하며
+execution_ready=false, strength_eligible=false는 유지한다.
+
+V3는 호출자가 양수의 전체 base·피셔 증분을 지정한다. 이번 후속 실행은 120초+1초이며
+[CCRL Blitz 시간 형식](https://computerchess.org.uk/404/index.html)을 참조하며
+로컬 장비의 동일 시간 대국이다. CCRL 기준 장비로 보정한 공식 rating이 아니다.
+pair runtime은 두 판의 가능한 전체 시계보다 짧지 않아야 하며 실제 총 120분 감독은 별도다.
+PGN의 TimeControl 차이는 부모 clock trace와 함께 진단 기록에 남기며 벤치마크를 차단하지 않는다.
+PGN audit의 optional time_control은 헤더 관측이고 V1/V2의 시계를 새로 증명하지 않는다.
+각 새 엔진 ID에 RoveZero·BT4-it332·S0 visits/S1 exact-terminal을 넣어 White/Black의
+색 배정을 raw PGN과 잠긴 pair에서 직접 대조한다. 사용자용 SAN 사본은 원본 ID·source·
+모델/binary SHA와 WhiteType/BlackType=program을 보존하고 원시 PGN을 수정하지 않는다.
+
+시작 실패는 해당 판의 PGN이 없을 수 있다. V3는 pinned runner의 순서가 맞는
+game-start와 FATAL startup 기록을 검사해 failure_audit.startup_losses에 패배 선언을
+남긴다. 인용된 engine stderr·없는/다른 역할·중복/알 수 없는 FATAL은 인수하지 않는다.
+이 원장은 실패한 provider/clock gate를 통과시키거나 scored_games를 늘리지 않는다.
+먼저 완료된 PGN과 원래 로그를 보존하고 다음 pair를 중단한다.
+pilot_failure_audit PAIR_SPEC_JSON RUNNER_STDOUT_LOG example은 보존한 로그의 독립
+사후 회계이며 원래 실패 영수증을 수정하지 않는다.
+
+CUDA V2/V3는 검증된 main private input pin(8 MiB 이상)에만 DONTNEED 힌트를 적용한다.
+launch 전과 owned child cleanup/실행 후 byte·identity 재검사 뒤에 적용해, 종료 후 hash
+검사로 다시 쌓인 source-weight/ONNX 사본의 캐시가 다음 pair까지 누적되는 것을 줄인다.
+원본·공유 runtime cache·GPU buffer와 별도로 복사한 CUDA bundle file의 삭제 정책은 유지한다.
+힌트 오류는 preparation/postcheck 실패로 남기며 원래 engine/process 실패도 보존한다.
+커널의 실제 회수는 보장되지 않는다. source 5f40654의 완료 pair에서 private source-weight와
+ONNX의 resident cache page 0을 mincore로 확인한 것은 해당 두 사본의 실행 후 관측이다.
+표본·시계 fixture·초기 할당 실패·새 CUDA 메모리 정책과 재실행 인수는
+[pilot 기록](../../docs/research/BT4-FINAL-SELECTION-PILOT.md)을 따른다. 원시 PGN·로그는
+저장소 밖에 보존하며 새 실행을 과거 실패와 합쳐 선택적으로 집계하지 않는다.

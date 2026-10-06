@@ -21,6 +21,27 @@ fn valid_arguments() -> Vec<String> {
     ]
 }
 
+#[test]
+fn forwarded_source_profile_is_opt_in_and_keeps_existing_execution_guards() {
+    let ordinary = NativeConfig::parse_with_source_profile(valid_arguments(), false).unwrap();
+    let diagnostic = NativeConfig::parse_with_source_profile(valid_arguments(), true).unwrap();
+    assert!(!ordinary.profiling_requested());
+    assert!(diagnostic.profiling_requested());
+    assert_eq!(ordinary.provider(), diagnostic.provider());
+    assert_eq!(ordinary.manifest_sha256, diagnostic.manifest_sha256);
+    assert_eq!(ordinary.ort_sha256, diagnostic.ort_sha256);
+    assert_eq!(ordinary.search_simulations, diagnostic.search_simulations);
+    assert_eq!(ordinary.final_move_policy, diagnostic.final_move_policy);
+    let mut explicit = valid_arguments();
+    explicit.push("--profile".into());
+    assert!(NativeConfig::parse_with_source_profile(explicit, true).is_ok());
+    for flag in ["--experimental-raw-cache", "--experimental-io-buffers"] {
+        let mut arguments = valid_arguments();
+        arguments.push(flag.into());
+        assert!(NativeConfig::parse_with_source_profile(arguments, true).is_err());
+    }
+}
+
 fn assert_private_config_rejection(arguments: Vec<String>) {
     let rejected = NativeConfig::parse(arguments).unwrap_err();
     assert!(matches!(rejected, NativeBootstrapError::Config(_)));
@@ -28,6 +49,36 @@ fn assert_private_config_rejection(arguments: Vec<String>) {
         assert!(!rendered.contains(PRIVATE_MARKER));
         assert!(rendered.len() <= 256, "parser errors must remain bounded");
     }
+}
+
+#[test]
+fn native_search_budget_is_explicit_finite_and_default_compatible() {
+    assert_eq!(
+        NativeConfig::parse(valid_arguments())
+            .unwrap()
+            .engine_settings()
+            .search
+            .max_simulations,
+        128
+    );
+    for limit in [1, 128, MAX_NATIVE_SIMULATIONS] {
+        let mut args = valid_arguments();
+        args.push(format!("--search-simulations={limit}"));
+        let config = NativeConfig::parse(args).unwrap();
+        assert_eq!(config.engine_settings().search.max_simulations, limit);
+        assert_eq!(config.engine_settings().max_workers, 1);
+    }
+    for value in ["0", "4097", "-1", "unbounded"] {
+        let mut args = valid_arguments();
+        args.push(format!("--search-simulations={value}"));
+        assert_private_config_rejection(args);
+    }
+    let mut args = valid_arguments();
+    args.extend([
+        "--search-simulations=1".into(),
+        "--search-simulations=2".into(),
+    ]);
+    assert_private_config_rejection(args);
 }
 
 #[test]
@@ -48,6 +99,60 @@ fn complete_native_config_keeps_private_paths_out_of_debug() {
     assert!(!public.contains("weights.pb.gz"));
     assert!(!public.contains("runtime-library"));
     assert!(public.len() <= 512);
+}
+
+#[test]
+fn runtime_cache_root_is_optional_private_and_rejects_duplicate_selection() {
+    assert!(
+        NativeConfig::parse(valid_arguments())
+            .unwrap()
+            .runtime_cache_root
+            .is_none()
+    );
+    let mut args = valid_arguments();
+    args.push(format!("--runtime-cache-root={PRIVATE_MARKER}/cache"));
+    let config = NativeConfig::parse(args.clone()).unwrap();
+    assert_eq!(
+        config.runtime_cache_root.unwrap(),
+        PathBuf::from(format!("{PRIVATE_MARKER}/cache"))
+    );
+    args.push(format!("--runtime-cache-root={PRIVATE_MARKER}/other"));
+    assert_private_config_rejection(args);
+}
+
+#[test]
+fn exact_terminal_final_policy_is_explicit_and_keeps_s0_reproducible() {
+    use rz_search::tree::FinalMovePolicy;
+    assert_eq!(
+        NativeConfig::parse(valid_arguments())
+            .unwrap()
+            .engine_settings()
+            .final_move_policy,
+        FinalMovePolicy::Visits
+    );
+    for (name, expected) in [
+        ("visits", FinalMovePolicy::Visits),
+        ("exact-terminal", FinalMovePolicy::ExactTerminal),
+    ] {
+        let mut args = valid_arguments();
+        args.push(format!("--final-selection={name}"));
+        assert_eq!(
+            NativeConfig::parse(args)
+                .unwrap()
+                .engine_settings()
+                .final_move_policy,
+            expected
+        );
+    }
+    let mut args = valid_arguments();
+    args.push("--final-selection=neural-mate".into());
+    assert_private_config_rejection(args);
+    let mut args = valid_arguments();
+    args.extend([
+        "--final-selection=visits".into(),
+        "--final-selection=exact-terminal".into(),
+    ]);
+    assert_private_config_rejection(args);
 }
 
 #[test]
@@ -95,6 +200,63 @@ fn profile_is_opt_in_bounded_and_does_not_select_attestation() {
     let mut named = valid_arguments();
     named.push("--profile=true".into());
     assert_private_config_rejection(named);
+}
+
+#[cfg(all(feature = "onnx-cuda", feature = "experimental-batch"))]
+#[test]
+fn batch_startup_keeps_loaded_provider_width_and_legacy_b1_boundary() {
+    let cuda_args = || {
+        let mut args = valid_arguments();
+        args[0] = "--onnx-cuda".into();
+        args.extend([
+            format!("--cuda-bundle={PRIVATE_MARKER}/bundle.json"),
+            format!("--cuda-bundle-sha256={}", "ef".repeat(32)),
+            "--search-simulations=4096".into(),
+            "--final-selection=visits".into(),
+        ]);
+        args
+    };
+    assert_eq!(
+        NativeConfig::parse(cuda_args())
+            .unwrap()
+            .cuda_attestation_width(),
+        Some(1)
+    );
+    for width in [1, 2, 4, 8, 16] {
+        let mut args = cuda_args();
+        args.extend([
+            "--batch-attestation".into(),
+            format!("--experimental-batch={width}"),
+        ]);
+        let config = NativeConfig::parse(args).unwrap();
+        assert_eq!(config.cuda_attestation_width(), Some(width));
+        assert!(config.batch_attestation_requested());
+        assert!(!config.attestation_requested());
+    }
+    let mut unattested = cuda_args();
+    unattested.push("--experimental-batch=4".into());
+    assert!(
+        NativeConfig::parse(unattested)
+            .unwrap()
+            .cuda_attestation_width()
+            .is_none()
+    );
+    let mut legacy = cuda_args();
+    legacy.extend(["--experimental-batch=4".into(), "--attestation".into()]);
+    assert_private_config_rejection(legacy);
+    for unsupported in [
+        "--experimental-io-buffers",
+        "--experimental-io-binding",
+        "--experimental-cuda-graph",
+    ] {
+        let mut args = cuda_args();
+        args.extend([
+            "--batch-attestation".into(),
+            "--experimental-batch=4".into(),
+            unsupported.into(),
+        ]);
+        assert_private_config_rejection(args);
+    }
 }
 
 #[test]

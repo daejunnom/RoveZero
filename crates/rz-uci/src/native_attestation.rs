@@ -21,7 +21,7 @@ use cap_std::{
 };
 use rz_contracts::*;
 use rz_eval::{
-    asset::MaiaAsset,
+    asset::AssetMetadata,
     native_runtime_bridge::NativeWorkerOrigin,
     onnx::{OnnxBackend, OrtRuntime, Provider},
 };
@@ -108,7 +108,7 @@ pub struct CpuProfileV1 {
 }
 impl CpuProfileV1 {
     pub(crate) fn from_loaded(
-        asset: &MaiaAsset,
+        asset: &AssetMetadata,
         runtime: &OrtRuntime,
         backend: &OnnxBackend,
         model: &ModelDescriptor,
@@ -571,7 +571,7 @@ impl Write for BoundedJson {
         Ok(())
     }
 }
-fn bounded_json(value: &impl Serialize) -> Result<Vec<u8>, AttestationError> {
+pub(crate) fn bounded_json(value: &impl Serialize) -> Result<Vec<u8>, AttestationError> {
     let mut writer = BoundedJson { bytes: Vec::new() };
     writer
         .bytes
@@ -695,6 +695,86 @@ impl ReceiptWriter {
         self.startup_written = true;
         Ok(())
     }
+    pub(crate) fn publish_auxiliary(
+        &self,
+        name: &'static str,
+        receipt: &impl Serialize,
+    ) -> Result<(), AttestationError> {
+        if !self.startup_written {
+            return Err(AttestationError::boundary(
+                "auxiliary receipt requires issued startup",
+            ));
+        }
+        let bytes = bounded_json(receipt)?;
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let mut file = self
+            ._directory
+            .open_with(name, &options)
+            .map_err(|e| AttestationError::io("reserve auxiliary receipt", e))?;
+        file.write_all(&bytes)
+            .map_err(|e| AttestationError::io("write auxiliary receipt", e))?;
+        file.sync_all()
+            .map_err(|e| AttestationError::io("sync auxiliary receipt", e))
+    }
+    /// Stream a bounded experiment journal directly to its capability; no
+    /// second full JSON allocation. Partial files are explicitly incomplete.
+    #[cfg(feature = "experimental-batch")]
+    pub(crate) fn publish_large_auxiliary(
+        &self,
+        name: &'static str,
+        receipt: &impl Serialize,
+        cap: u64,
+    ) -> Result<(String, u64), AttestationError> {
+        #[cfg(unix)]
+        use cap_std::fs::OpenOptionsExt;
+        if !self.startup_written {
+            return Err(AttestationError::boundary("journal requires startup"));
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = self
+            ._directory
+            .open_with(name, &options)
+            .map_err(|e| AttestationError::io("create bounded journal", e))?;
+        struct Bounded<'a> {
+            file: &'a mut cap_std::fs::File,
+            hash: Sha256,
+            bytes: u64,
+            cap: u64,
+        }
+        impl Write for Bounded<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() as u64 > self.cap.saturating_sub(self.bytes) {
+                    return Err(std::io::Error::other("batch journal byte budget exceeded"));
+                }
+                let count = self.file.write(bytes)?;
+                self.hash.update(&bytes[..count]);
+                self.bytes += count as u64;
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.file.flush()
+            }
+        }
+        let mut writer = Bounded {
+            file: &mut file,
+            hash: Sha256::new(),
+            bytes: 0,
+            cap,
+        };
+        serde_json::to_writer(&mut writer, receipt)
+            .map_err(|_| AttestationError::boundary("serialize bounded batch journal"))?;
+        let result = (hex(&writer.hash.finalize().into()), writer.bytes);
+        file.sync_all()
+            .map_err(|e| AttestationError::io("sync bounded batch journal", e))?;
+        Ok(result)
+    }
     pub fn termination(&mut self, receipt: &TerminationReceiptV1) -> Result<(), AttestationError> {
         self.publish_termination(receipt)
     }
@@ -812,6 +892,27 @@ mod tests {
         fs::create_dir(&path).unwrap();
         let directory = Dir::open_ambient_dir(&path, ambient_authority()).unwrap();
         (path, directory)
+    }
+
+    #[test]
+    fn auxiliary_receipt_requires_startup_and_refuses_overwrite() {
+        let (path, directory) = directory();
+        let mut writer = ReceiptWriter::from_directory(directory).unwrap();
+        assert!(writer.publish_auxiliary("search.json", &"config").is_err());
+        writer.publish_startup(&"startup").unwrap();
+        writer.publish_auxiliary("search.json", &"config").unwrap();
+        let original = fs::read(path.join("search.json")).unwrap();
+        assert!(
+            writer
+                .publish_auxiliary("search.json", &"replacement")
+                .is_err()
+        );
+        assert_eq!(fs::read(path.join("search.json")).unwrap(), original);
+        drop(writer);
+        for name in [STARTUP_FILE, TERMINATION_FILE, "search.json"] {
+            fs::remove_file(path.join(name)).unwrap();
+        }
+        fs::remove_dir(path).unwrap();
     }
 
     #[test]

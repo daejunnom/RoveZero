@@ -26,9 +26,13 @@ rz-runtime = { workspace = true, optional = true, features = ["contracts"] }
 [features]
 experimental-batch = ["contracts", "rz-runtime/experimental-batch"]
 experimental-io-buffers = ["onnx"]
-experimental-io-binding = ["onnx"]
+experimental-ort-cpu-arena = ["onnx"]
+experimental-ort-model = ["onnx"]
+experimental-io-binding = ["onnx", "rz-native-loader/ort-bindings"]
 experimental-cuda-graph = ["experimental-io-binding"]
 experimental-notify = ["dep:rz-runtime", "rz-runtime/experimental-notify"]
+# Hash the exact owned ONNX bytes during their bounded read; independent E trial.
+experimental-onnx-read-hash = []
 default = []
 onnx = ["dep:ort", "dep:rz-native-loader"]
 contracts = ["dep:rz-contracts", "dep:rz-position", "dep:rz-runtime"]
@@ -38,10 +42,21 @@ experimental-history-frames = ["contracts"]
 experimental-prepared-input = ["contracts"]
 experimental-input-hash = ["contracts"]
 experimental-raw-cache = ["contracts", "rz-runtime/experimental-raw-cache"]
+# Independent E trials; defaults and the public f32 head API remain unchanged.
+experimental-policy-buffer = ["contracts"]
+experimental-projection-frames = ["contracts"]
 
 [[example]]
 name = "maia_check"
 required-features = ["onnx"]
+
+[[example]]
+name = "inference_bench"
+required-features = ["onnx"]
+
+[[example]]
+name = "ort_export"
+required-features = ["experimental-ort-model"]
 
 [[example]]
 name = "rules_maia_check"

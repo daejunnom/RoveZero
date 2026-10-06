@@ -350,7 +350,16 @@ impl ProfileDocument {
                             consumed_executions.insert(execution);
                         }
                     }
-                } else if span.stage != SourceStage::ProtocolWrite {
+                } else if !matches!(
+                    span.stage,
+                    SourceStage::ProtocolWrite
+                        | SourceStage::FinalSelection
+                        | SourceStage::SearchPreparation
+                        | SourceStage::SearchSelection
+                        | SourceStage::StateReplay
+                        | SourceStage::LegalValidation
+                        | SourceStage::TerminalBackup
+                ) {
                     unbound += 1;
                 }
                 SpanWire {

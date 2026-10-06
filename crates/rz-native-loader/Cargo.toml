@@ -5,6 +5,12 @@ edition = "2021"
 rust-version = "1.85"
 license.workspace = true
 
+[dependencies]
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic", "cuda"], optional = true }
+
+[features]
+ort-bindings = ["dep:ort"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading.workspace = true
 sha2.workspace = true

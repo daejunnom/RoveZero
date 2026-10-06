@@ -7,6 +7,9 @@
 Cargo.lock text eol=lf
 .gitignore text eol=lf
 .gitattributes text eol=lf
+# Unified-diff context blank lines contain a required space; keep patch bytes exact.
+experiments/baselines/*.patch text eol=lf -whitespace
+experiments/baselines/bt4-final-selection-openings-v3.json -text
 
 # Preserve the supplied handoff snapshots byte for byte.
 docs/reference/PlyZero_Handoff_v0.1.0_KO.md -text

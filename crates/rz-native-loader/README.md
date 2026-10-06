@@ -10,6 +10,13 @@ native constructor를 실행하는 좁은 경계만 이 crate가 소유한다.
 복사한 readonly file capability를 넘긴다. 16개 파일을 모두 받고 지정 순서로
 정렬하여 로딩한다. 허용되지 않은 이름·중복·부분 집합은 거부한다. 입력 한도는
 파일마다 1 GiB, 총 4 GiB, count 32이며 실제 지원 profile은 정확히 16개다.
+
+bootstrap의 `RuntimeCache`는 같은 bytes를 해시별 공유 디렉터리에 한 번 게시할 수
+있다. cache hit마다 전체 파일을 다시 검증하고 프로세스마다 새 readonly descriptor를
+넘긴다. loader의 exact admission·단일 link·path/device/inode·실제 mapping·one-shot
+latch·process-lifetime pin 검사는 그대로다. cache key나 저장 재사용 표시가 native
+실행·신경망 평가의 성공 증거를 대신하지 않는다.
+
 실행 admission은 `TRUSTED_NATIVE_PROFILE`의 exact 19개 이름·크기·SHA-256에
 고정한다. 같은 basename 아래 다른 ELF를 놓고 caller가 새로운 hash를 선언해도
 거부한다. 다른 native release는 총괄이 provenance와 실제 backend를 검토한 source

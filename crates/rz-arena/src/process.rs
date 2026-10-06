@@ -15,6 +15,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+type StdoutObserver<'a> = &'a mut dyn FnMut(&[u8]);
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessLimits {
@@ -209,6 +210,7 @@ pub fn supervise(
             limits,
             cancel,
             None,
+            None,
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -242,6 +244,7 @@ pub fn supervise_with_watch(
             limits,
             cancel,
             Some(linux::ArtifactObservation::Flat(watch)),
+            None,
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -288,6 +291,7 @@ pub fn supervise_in_directory(
             limits,
             cancel,
             watch.map(linux::ArtifactObservation::Flat),
+            None,
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -318,6 +322,19 @@ pub fn supervise_in_directory_with_tree(
     cancel: Option<&AtomicBool>,
     watch: &OwnedArtifactTreeWatch,
 ) -> Result<ProcessOutput, ArenaError> {
+    supervise_tree_observed(program, args, directory, limits, cancel, watch, None)
+}
+
+/// Passive finite stream observer. It cannot alter output, cancellation or gates.
+pub(crate) fn supervise_tree_observed(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    stdout_observer: Option<StdoutObserver<'_>>,
+) -> Result<ProcessOutput, ArenaError> {
     limits.validate()?;
     watch.validate()?;
     #[cfg(target_os = "linux")]
@@ -341,11 +358,12 @@ pub fn supervise_in_directory_with_tree(
             limits,
             cancel,
             Some(linux::ArtifactObservation::Tree(watch)),
+            stdout_observer,
         )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (program, args, directory, cancel);
+        let _ = (program, args, directory, cancel, stdout_observer);
         Err(ArenaError::Invalid(
             "native process supervision currently requires Linux".into(),
         ))
@@ -397,6 +415,7 @@ mod linux {
         .map_err(|_| ArenaError::Invalid("runner cwd must be a direct directory".into()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn supervise(
         program: &File,
         args: &[OsString],
@@ -404,6 +423,7 @@ mod linux {
         limits: ProcessLimits,
         cancel: Option<&AtomicBool>,
         watch: Option<ArtifactObservation<'_>>,
+        mut stdout_observer: Option<StdoutObserver<'_>>,
     ) -> Result<ProcessOutput, ArenaError> {
         native_elf(program)?;
         default_child_disposition()?;
@@ -429,6 +449,9 @@ mod linux {
             .env_clear()
             .env("LANG", "C")
             .env("PATH", "/usr/bin:/bin")
+            .envs(source_profile_environment(std::env::var_os(
+                "RZ_ARENA_SOURCE_PROFILE",
+            )))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -436,6 +459,7 @@ mod linux {
             .spawn()
             .map_err(|error| ArenaError::Io(format!("process.spawn:{:?}", error.kind())))?;
         let pid = child.id();
+        crate::emit_native_phase("runner_spawned");
         let group = Pid::from_raw(
             i32::try_from(pid).map_err(|_| ArenaError::Io("process.pid_out_of_range".into()))?,
         );
@@ -508,6 +532,8 @@ mod linux {
             }
             // Each pass drains a finite amount from each pipe, preserving time,
             // cancellation and process checks even under continuous output.
+            let prior_out = out.len();
+            let prior_err = err.len();
             for result in [
                 drain(&mut stdout, &mut out, limits.max_output_bytes, &mut receipt),
                 drain(&mut stderr, &mut err, limits.max_output_bytes, &mut receipt),
@@ -523,6 +549,17 @@ mod linux {
                     _ => {}
                 }
             }
+            // Observe only newly retained bytes; the raw pipe budget and later
+            // provider/clock acceptance still own the complete unchanged output.
+            if out.len() > prior_out {
+                crate::native_diagnostics::observe_stream(true, &out[prior_out..]);
+                if let Some(observer) = stdout_observer.as_mut() {
+                    observer(&out[prior_out..]);
+                }
+            }
+            if err.len() > prior_err {
+                crate::native_diagnostics::observe_stream(false, &err[prior_err..]);
+            }
             if !leader_done {
                 match waitid(
                     Id::Pid(group),
@@ -530,12 +567,14 @@ mod linux {
                 ) {
                     Ok(WaitStatus::Exited(_, code)) => {
                         leader_done = true;
+                        crate::emit_native_phase("runner_exit_observed");
                         if preserve_unverified {
                             receipt.exit_code = Some(code);
                         }
                     }
                     Ok(WaitStatus::Signaled(_, signal, _)) => {
                         leader_done = true;
+                        crate::emit_native_phase("runner_exit_observed");
                         if preserve_unverified {
                             receipt.exit_signal = Some(signal as i32);
                         }
@@ -568,8 +607,9 @@ mod linux {
                     }
                     Some(snapshot)
                 }
-                Err(()) => {
+                Err(error) => {
                     evidence(&mut receipt, "process.proc_observation");
+                    evidence(&mut receipt, &error.code());
                     stop.get_or_insert(ProcessStop::IoFailure);
                     None
                 }
@@ -979,11 +1019,40 @@ mod linux {
         other_members: u32,
     }
 
-    fn group_snapshot(group: u32, leader: u32) -> Result<GroupSnapshot, ()> {
+    #[derive(Debug)]
+    struct ProcObservationError {
+        stage: &'static str,
+        errno: Option<i32>,
+    }
+
+    impl ProcObservationError {
+        fn invalid(stage: &'static str) -> Self {
+            Self { stage, errno: None }
+        }
+
+        fn io(stage: &'static str, error: io::Error) -> Self {
+            Self {
+                stage,
+                errno: error.raw_os_error(),
+            }
+        }
+
+        fn code(&self) -> String {
+            format!(
+                "process.proc_observation.{}:{}",
+                self.stage,
+                self.errno.unwrap_or(0)
+            )
+        }
+    }
+
+    fn group_snapshot(group: u32, leader: u32) -> Result<GroupSnapshot, ProcObservationError> {
         let mut members = 0_u32;
         let mut other_members = 0_u32;
-        for entry in std::fs::read_dir("/proc").map_err(|_| ())? {
-            let entry = entry.map_err(|_| ())?;
+        for entry in std::fs::read_dir("/proc")
+            .map_err(|error| ProcObservationError::io("enumerate", error))?
+        {
+            let entry = entry.map_err(|error| ProcObservationError::io("entry", error))?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
@@ -993,27 +1062,26 @@ mod linux {
             let stat = match File::open(entry.path().join("stat")) {
                 Ok(file) => file,
                 Err(error) if disappeared(&error) => continue,
-                Err(_) => return Err(()),
+                Err(error) => return Err(ProcObservationError::io("stat_open", error)),
             };
             let mut bytes = Vec::new();
             match stat.take(4097).read_to_end(&mut bytes) {
                 Ok(_) if bytes.len() <= 4096 => {}
                 Err(error) if disappeared(&error) => continue,
-                _ => return Err(()),
+                Err(error) => return Err(ProcObservationError::io("stat_read", error)),
+                _ => return Err(ProcObservationError::invalid("stat_size")),
             }
-            // comm may contain spaces, ')' and non-UTF-8 bytes. Only decode the
-            // ASCII numeric suffix after its final ')' delimiter.
-            let delimiter = bytes.iter().rposition(|byte| *byte == b')').ok_or(())?;
-            let fields = std::str::from_utf8(&bytes[delimiter + 1..]).map_err(|_| ())?;
-            let pgid = fields
-                .split_whitespace()
-                .nth(2)
-                .and_then(|value| value.parse::<u32>().ok())
-                .ok_or(())?;
+            let Some(pgid) = parse_proc_group(&bytes)? else {
+                continue;
+            };
             if pgid == group {
-                members = members.checked_add(1).ok_or(())?;
+                members = members
+                    .checked_add(1)
+                    .ok_or_else(|| ProcObservationError::invalid("member_count"))?;
                 if pid != leader {
-                    other_members = other_members.checked_add(1).ok_or(())?;
+                    other_members = other_members
+                        .checked_add(1)
+                        .ok_or_else(|| ProcObservationError::invalid("member_count"))?;
                 }
             }
         }
@@ -1023,8 +1091,49 @@ mod linux {
         })
     }
 
+    fn parse_proc_group(bytes: &[u8]) -> Result<Option<u32>, ProcObservationError> {
+        // comm may contain spaces, ')' and non-UTF-8 bytes. Only decode the
+        // ASCII numeric suffix after its final ')' delimiter.
+        let delimiter = bytes
+            .iter()
+            .rposition(|byte| *byte == b')')
+            .ok_or_else(|| {
+                ProcObservationError::invalid(if bytes.is_empty() {
+                    "stat_empty"
+                } else {
+                    "stat_delimiter"
+                })
+            })?;
+        let fields = std::str::from_utf8(&bytes[delimiter + 1..])
+            .map_err(|_| ProcObservationError::invalid("stat_utf8"))?;
+        let pgid = fields
+            .split_whitespace()
+            .nth(2)
+            .ok_or_else(|| ProcObservationError::invalid("stat_group_missing"))?
+            .parse::<i32>()
+            .map_err(|_| ProcObservationError::invalid("stat_group_invalid"))?;
+        // Linux do_task_stat starts pgid at -1. If the task has been retired
+        // and lock_task_sighand fails, the kernel prints that sentinel instead
+        // of a group ID. It cannot name our positive, unreaped leader's group.
+        // Malformed records and other negative IDs still fail observation.
+        match pgid {
+            -1 => Ok(None),
+            0.. => Ok(Some(pgid as u32)),
+            _ => Err(ProcObservationError::invalid("stat_group_invalid")),
+        }
+    }
+
     fn disappeared(error: &io::Error) -> bool {
         error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(Errno::ESRCH as i32)
+    }
+
+    /// One explicit passive diagnostic flag; never forward ambient variables,
+    /// library search paths, credentials or provider/precision selections.
+    fn source_profile_environment(
+        value: Option<std::ffi::OsString>,
+    ) -> Option<(&'static str, &'static str)> {
+        (value.as_deref() == Some(std::ffi::OsStr::new("1")))
+            .then_some(("RZ_NATIVE_SOURCE_PROFILE", "1"))
     }
 
     fn signal(group: Pid, signal: Signal, receipt: &mut ProcessReceipt, step: &str) {
@@ -1043,6 +1152,70 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn source_profile_forwarding_is_one_exact_opt_in_value() {
+            assert_eq!(source_profile_environment(None), None);
+            for value in ["", "0", "true", "1 ", "--profile"] {
+                assert_eq!(source_profile_environment(Some(value.into())), None);
+            }
+            assert_eq!(
+                source_profile_environment(Some("1".into())),
+                Some(("RZ_NATIVE_SOURCE_PROFILE", "1"))
+            );
+        }
+
+        #[test]
+        fn retired_proc_group_sentinel_is_not_a_live_group_or_parse_failure() {
+            assert_eq!(parse_proc_group(b"12 (rz) X 1 -1 12\n").unwrap(), None);
+            assert_eq!(
+                parse_proc_group(b"12 (rz )\xff) S 1 42 12\n").unwrap(),
+                Some(42)
+            );
+            assert_eq!(parse_proc_group(b"12 (rz) S 1 0 12\n").unwrap(), Some(0));
+            for invalid in [
+                b"12 (rz) S 1 -2 12\n".as_slice(),
+                b"12 (rz) S 1 invalid 12\n",
+                b"12 (rz) S 1 2147483648 12\n",
+                b"12 (rz) S 1\n",
+                b"12 (rz) S 1 \xff 12\n",
+                b"",
+            ] {
+                assert!(parse_proc_group(invalid).is_err());
+            }
+        }
+
+        #[test]
+        fn proc_snapshot_during_owned_process_churn() {
+            let mut child = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "i=0; while [ $i -lt 3000 ]; do /bin/true; i=$((i+1)); done",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let start = Instant::now();
+            let mut failure = None;
+            while start.elapsed() < Duration::from_secs(3) && child.try_wait().unwrap().is_none() {
+                if let Err(error) = group_snapshot(pid, pid) {
+                    failure = Some(error);
+                    break;
+                }
+            }
+            if child.try_wait().unwrap().is_none() {
+                assert!(matches!(
+                    killpg(Pid::from_raw(i32::try_from(pid).unwrap()), Signal::SIGKILL),
+                    Ok(()) | Err(Errno::ESRCH)
+                ));
+                child.wait().unwrap();
+            }
+            assert!(failure.is_none(), "{failure:?}");
+        }
 
         fn externally_reaped_child() -> std::process::Child {
             let child = Command::new("/bin/true")

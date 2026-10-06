@@ -33,6 +33,11 @@ CASES = [
     ("short-fen-history", "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 17 1", ["a1a2", "h8h7"]),
 ]
 
+PROFILES = {
+    "maia-1900": (1_262_607, "e2f565f42d7cd9f122557e6dc4eb84e5bbaedceda1d404dc485d3611c7c97a12"),
+    "bt4-it332": (382_645_315, "e6ada9d6c4a769bfab3aa0848d82caeb809aa45f83e6c605fc58a31d21bdd618"),
+}
+
 
 def frame(board):
     return dict(pieces=[[int(board.pieces(piece, color)) for piece in range(1, 7)]
@@ -50,9 +55,12 @@ def main(args):
     if args.output.exists():
         raise ValueError("existing reference evidence is preserved; use a new output path")
     source = args.source.resolve()
+    expected_bytes, expected_hash = PROFILES[args.profile]
+    if source.stat().st_size != expected_bytes:
+        raise ValueError("reference source size differs from selected profile")
     with source.open("rb") as stream:
         source_hash = hashlib.file_digest(stream, "sha256").hexdigest()
-    if source_hash != "e2f565f42d7cd9f122557e6dc4eb84e5bbaedceda1d404dc485d3611c7c97a12":
+    if source_hash != expected_hash:
         raise ValueError("wrong reference source")
     backend = backends.Backend(weights=backends.Weights(str(source)), backend="eigen",
                                options="threads=1,batch_size=16")
@@ -113,4 +121,5 @@ if __name__ == "__main__":
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--lc0-source", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--profile", choices=PROFILES, default="maia-1900")
     main(parser.parse_args())

@@ -131,9 +131,21 @@ fn experimental_execution_rejects_wrong_provider_shape_and_uncompiled_modes() {
     config.profiling_prefix = Some(std::env::temp_dir().join("rz-graph-placement"));
     assert!(config.validate().is_err()); // variable batch is forbidden
     config.max_batch = 1;
+    let failure = config.validate().unwrap_err();
+    if cfg!(feature = "experimental-cuda-graph") {
+        assert_eq!(
+            failure.kind,
+            rz_eval::error::FailureKind::BackendUnavailable
+        );
+        assert!(failure
+            .to_string()
+            .contains("normal native-exit acceptance"));
+    }
+    // The guard must not change the independently available binding profile.
+    config.experiments.cuda_graph = false;
     assert_eq!(
         config.validate().is_ok(),
-        cfg!(feature = "experimental-cuda-graph")
+        cfg!(feature = "experimental-io-binding")
     );
     config.experiments = ExecutionExperiments {
         reuse_buffers: true,
@@ -143,4 +155,29 @@ fn experimental_execution_rejects_wrong_provider_shape_and_uncompiled_modes() {
         config.validate().is_ok(),
         cfg!(feature = "experimental-io-buffers")
     );
+}
+
+#[test]
+fn cuda_cpu_arena_experiment_is_explicit_cuda_only_and_separately_identified() {
+    use rz_eval::onnx::declared_backend_identity;
+    let mut config = BackendConfig::cpu();
+    config.experiments.disable_cuda_cpu_arena = true;
+    assert!(config.validate().is_err()); // Does not silently alter CPU inference.
+    config.provider = Provider::Cuda {
+        device_id: 0,
+        arena_bytes: 1024,
+    };
+    config.profiling_prefix = Some(std::env::temp_dir().join("rz-cpu-arena-placement"));
+    assert_eq!(
+        config.validate().is_ok(),
+        cfg!(feature = "experimental-ort-cpu-arena")
+    );
+    let experiment = declared_backend_identity([0; 32], [0; 32], Some([0; 32]), &config);
+    config.experiments.disable_cuda_cpu_arena = false;
+    config.validate().unwrap();
+    assert_ne!(
+        experiment,
+        declared_backend_identity([0; 32], [0; 32], Some([0; 32]), &config)
+    );
+    assert_eq!(config.experiments, Default::default());
 }

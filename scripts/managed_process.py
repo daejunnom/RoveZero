@@ -1,0 +1,193 @@
+"""Finite owned command trees used by the build-storage boundary."""
+from __future__ import annotations
+import ctypes
+import os
+import signal
+import subprocess
+import time
+
+
+def run_group(argv, cwd, env, timeout, admission_check):
+    if os.name == "nt":
+        return _run_windows(argv, cwd, env, timeout, admission_check)
+    if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
+        raise RuntimeError("non-reaping process supervision requires Linux waitid")
+    child = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True)
+    started = time.monotonic()
+    next_check = started
+    requested_exit = None
+    failure = None
+    try:
+        while True:
+            status = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            if status is not None:
+                break
+            now = time.monotonic()
+            if now >= next_check:
+                admission_check()
+                next_check = now + 5
+            if now - started > timeout:
+                requested_exit = 124
+                break
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        requested_exit = 130
+    except Exception as exc:
+        requested_exit, failure = 125, str(exc)
+    # The unreaped leader reserves this exact process/group ID while signaling.
+    # Normal exits must also drain descendants before scratch is reclaimed.
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(child.pid, sig)
+        except ProcessLookupError:
+            break
+        if sig == signal.SIGTERM:
+            time.sleep(0.2)
+    deadline = time.monotonic() + 3
+    gone = False
+    while time.monotonic() < deadline:
+        live = False
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdecimal():
+                continue
+            try:
+                with open(f"{entry.path}/stat", encoding="utf-8") as stream:
+                    fields = stream.read().rsplit(")", 1)[1].split()
+                # /proc stat: state, ppid, pgrp after the closing comm parenthesis.
+                if int(fields[2]) == child.pid and fields[0] not in {"Z", "X"}:
+                    live = True
+                    break
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except (OSError, ValueError, IndexError):
+                live = True
+                break
+        if not live:
+            gone = True
+            break
+        time.sleep(0.05)
+    if gone:
+        result = child.wait()
+    else:
+        # Do not reap an unresolved leader and lose its reserved group identity.
+        result = 125
+        child.returncode = 125
+    return requested_exit if requested_exit is not None else result, gone, failure
+
+
+def _run_windows(argv, cwd, env, timeout, admission_check):
+    # Assign the suspended root to a kill-on-close Job before it can fork.
+    # No cmd.exe, taskkill by a recycled PID, or unrelated process termination.
+    from ctypes import wintypes as w
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    ULONG_PTR = ctypes.c_size_t
+
+    class IO(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint64) for name in ("read_ops", "write_ops", "other_ops", "read_bytes", "write_bytes", "other_bytes")]
+
+    class Basic(ctypes.Structure):
+        _fields_ = [("process_time", ctypes.c_int64), ("job_time", ctypes.c_int64),
+                    ("flags", w.DWORD), ("minimum", ULONG_PTR), ("maximum", ULONG_PTR),
+                    ("processes", w.DWORD), ("affinity", ULONG_PTR),
+                    ("priority", w.DWORD), ("scheduling", w.DWORD)]
+
+    class Extended(ctypes.Structure):
+        _fields_ = [("basic", Basic), ("io", IO), ("process_memory", ULONG_PTR),
+                    ("job_memory", ULONG_PTR), ("peak_process", ULONG_PTR), ("peak_job", ULONG_PTR)]
+
+    class Accounting(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_int64) for name in ("user", "kernel", "period_user", "period_kernel")] + [
+            ("faults", w.DWORD), ("total", w.DWORD), ("active", w.DWORD), ("terminated", w.DWORD)]
+
+    class Startup(ctypes.Structure):
+        _fields_ = [("cb", w.DWORD), ("reserved", w.LPWSTR), ("desktop", w.LPWSTR), ("title", w.LPWSTR)] + [
+            (name, w.DWORD) for name in ("x", "y", "width", "height", "chars_x", "chars_y", "fill", "flags")] + [
+            ("show", w.WORD), ("reserved_bytes", w.WORD), ("reserved_data", ctypes.POINTER(ctypes.c_byte)),
+            ("stdin", w.HANDLE), ("stdout", w.HANDLE), ("stderr", w.HANDLE)]
+
+    class ProcessInfo(ctypes.Structure):
+        _fields_ = [("process", w.HANDLE), ("thread", w.HANDLE), ("pid", w.DWORD), ("tid", w.DWORD)]
+
+    signatures = {
+        "CreateJobObjectW": ([ctypes.c_void_p, w.LPCWSTR], w.HANDLE),
+        "SetInformationJobObject": ([w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD], w.BOOL),
+        "QueryInformationJobObject": ([w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD, ctypes.c_void_p], w.BOOL),
+        "AssignProcessToJobObject": ([w.HANDLE, w.HANDLE], w.BOOL),
+        "TerminateJobObject": ([w.HANDLE, w.UINT], w.BOOL),
+        "CloseHandle": ([w.HANDLE], w.BOOL),
+        "GetStdHandle": ([w.DWORD], w.HANDLE),
+        "CreateProcessW": ([w.LPCWSTR, w.LPWSTR, ctypes.c_void_p, ctypes.c_void_p, w.BOOL, w.DWORD,
+                            ctypes.c_void_p, w.LPCWSTR, ctypes.POINTER(Startup), ctypes.POINTER(ProcessInfo)], w.BOOL),
+        "ResumeThread": ([w.HANDLE], w.DWORD),
+        "WaitForSingleObject": ([w.HANDLE, w.DWORD], w.DWORD),
+        "GetExitCodeProcess": ([w.HANDLE, ctypes.POINTER(w.DWORD)], w.BOOL),
+        "TerminateProcess": ([w.HANDLE, w.UINT], w.BOOL),
+    }
+    for name, (args, result) in signatures.items():
+        fn = getattr(k, name)
+        fn.argtypes, fn.restype = args, result
+
+    def require(value):
+        if not value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return value
+
+    job = require(k.CreateJobObjectW(None, None))
+    info = ProcessInfo()
+    created = False
+    assigned = False
+    failure = None
+    requested_exit = None
+    try:
+        limits = Extended()
+        limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        require(k.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)))
+        startup = Startup()
+        startup.cb, startup.flags = ctypes.sizeof(startup), 0x100
+        startup.stdin, startup.stdout, startup.stderr = [k.GetStdHandle(n & 0xffffffff) for n in (-10, -11, -12)]
+        command = ctypes.create_unicode_buffer(subprocess.list2cmdline([str(arg) for arg in argv]))
+        block = ctypes.create_unicode_buffer("\0".join(f"{key}={value}" for key, value in sorted(env.items(), key=lambda p: p[0].upper())) + "\0\0")
+        # suspended | unicode environment | new process group | no new window
+        require(k.CreateProcessW(None, command, None, None, True, 0x4 | 0x400 | 0x200 | 0x8000000,
+                                 block, str(cwd), ctypes.byref(startup), ctypes.byref(info)))
+        created = True
+        require(k.AssignProcessToJobObject(job, info.process))
+        assigned = True
+        if k.ResumeThread(info.thread) == 0xffffffff:
+            raise ctypes.WinError(ctypes.get_last_error())
+        started = time.monotonic()
+        next_check = started
+        try:
+            while k.WaitForSingleObject(info.process, 100) == 0x102:
+                now = time.monotonic()
+                if now >= next_check:
+                    admission_check()
+                    next_check = now + 5
+                if now - started > timeout:
+                    requested_exit = 124
+                    break
+        except KeyboardInterrupt:
+            requested_exit = 130
+        except Exception as exc:
+            requested_exit, failure = 125, str(exc)
+        result = w.DWORD()
+        if requested_exit is None:
+            require(k.GetExitCodeProcess(info.process, ctypes.byref(result)))
+        require(k.TerminateJobObject(job, requested_exit or result.value))
+        gone = False
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            accounting = Accounting()
+            require(k.QueryInformationJobObject(job, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None))
+            if accounting.active == 0:
+                gone = True
+                break
+            time.sleep(0.05)
+        return requested_exit if requested_exit is not None else result.value, gone, failure
+    finally:
+        if created and not assigned:
+            k.TerminateProcess(info.process, 125)  # Still suspended; never executed.
+            k.WaitForSingleObject(info.process, 3000)
+        for handle in (info.thread, info.process, job):
+            if handle:
+                k.CloseHandle(handle)

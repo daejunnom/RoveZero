@@ -8,12 +8,10 @@ use rz_contracts::*;
 use rz_encoding::classical::{HistoryFill, HISTORY_FRAMES};
 use rz_eval::asset::{self, MaiaAsset};
 use rz_eval::contracts::{encoding_manifest, MaiaBinding, HOST_BYTES_PER_ITEM};
-use rz_eval::native_runtime_bridge::{
-    NativeRuntimeBackend, NativeWorkerOrigin, NativeWorkerOwner, NATIVE_CUDA_ADMISSION_BYTES,
-};
+use rz_eval::native_runtime_bridge::{NativeRuntimeBackend, NativeWorkerOrigin, NativeWorkerOwner};
 use rz_eval::onnx::{BackendConfig, OnnxBackend, OrtRuntime, Provider};
 use rz_eval::rules_projection::ClassicalProjection;
-use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeLibraryPin};
+use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeCache};
 use rz_position::contracts::{ContractPosition, ContractState, RulesState};
 use rz_position::{BoardMove, Position};
 use rz_runtime::contracts::{
@@ -33,6 +31,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 type NativeEvaluator =
     ContractEvaluator<RulesState, NativeRuntimeBackend<ContractSystemClock>, ContractSystemClock>;
 const REQUEST_SECONDS: u64 = 5;
+const SHUTDOWN_SECONDS: u64 = 5;
 const CASE_NAMES: [&str; 12] = [
     "start",
     "black-after-e4",
@@ -146,11 +145,11 @@ fn reference_move(movement: &ReferenceMove) -> Result<Move> {
     )?)
 }
 
-fn validate_reference(fixtures: &Fixtures) -> Result<()> {
+fn validate_reference(fixtures: &Fixtures, model: &MaiaAsset) -> Result<()> {
     if fixtures.schema != 1
         || fixtures.reference != "lc0-v0.32.1-eigen-original-protobuf"
         || fixtures.reference_commit != asset::CONVERTER_COMMIT
-        || fixtures.source_sha256 != asset::SOURCE_GZIP_SHA256
+        || fixtures.source_sha256 != model.profile().gzip_sha256()
         || fixtures.fixture_oracle != "python-chess-1.999/chess-1.11.2"
         || fixtures.cases.len() != CASE_NAMES.len()
     {
@@ -397,10 +396,51 @@ fn drain(evaluator: &mut NativeEvaluator, clock: &ContractSystemClock) -> Result
     }
 }
 
+fn shutdown_native(owner: &NativeWorkerOwner, budget: Duration) -> Result<Value> {
+    let until = Instant::now() + budget;
+    loop {
+        match owner.try_shutdown() {
+            std::task::Poll::Ready(result) => {
+                result?;
+                return Ok(json!({"native":"joined","session_destruction":"complete",
+                    "worker_thread_exit":"joined"}));
+            }
+            std::task::Poll::Pending if Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::task::Poll::Pending => {
+                return Err("native worker shutdown is unconfirmed within fixture budget".into());
+            }
+        }
+    }
+}
+
 struct ProfileExecution<'a> {
     fill: HistoryFill,
     profile_slot: u64,
     cuda_profile_directory: Option<&'a Path>,
+    raw_cache: bool,
+}
+
+fn case_sequence(index: usize, raw_cache: bool) -> u64 {
+    // Reserve adjacent IDs for both replays before the next physical case.
+    index as u64 * if raw_cache { 3 } else { 1 } + 1
+}
+
+fn finalized(evaluator: &mut NativeEvaluator, case: &str) -> Result<EvalOutput> {
+    let until = Instant::now() + Duration::from_secs(REQUEST_SECONDS);
+    loop {
+        if let Some(result) = evaluator.poll() {
+            return match result {
+                EvalResult::Completed(output) => Ok(output),
+                other => Err(format!("native finalized failure: {other:?}").into()),
+            };
+        }
+        if Instant::now() >= until {
+            return Err(format!("native completion timeout: {case}").into());
+        }
+        std::thread::yield_now();
+    }
 }
 
 fn evaluate_profile(
@@ -415,13 +455,14 @@ fn evaluate_profile(
         fill,
         profile_slot,
         cuda_profile_directory,
+        raw_cache,
     } = execution;
     let mut config = BackendConfig::cpu();
     config.max_batch = 1;
     if let Some(directory) = cuda_profile_directory {
         config.provider = Provider::Cuda {
             device_id: 0,
-            arena_bytes: NATIVE_CUDA_ADMISSION_BYTES as usize,
+            arena_bytes: model.profile().cuda_arena_bytes(),
         };
         config.profiling_prefix = Some(directory.join(format!("placement-{profile_slot}")));
     }
@@ -441,6 +482,13 @@ fn evaluate_profile(
     };
     let projection =
         ClassicalProjection::new(MaiaBinding::for_backend(&loaded, handle, encoding, fill)?);
+    #[cfg(feature = "experimental-raw-cache")]
+    if raw_cache {
+        projection.configure_raw_cache(rz_eval::raw_cache::RawCacheLimits {
+            max_entries: 16,
+            max_bytes: 2 * 1024 * 1024,
+        })?;
+    }
     let profile = match fill {
         HistoryFill::No => "no",
         HistoryFill::RepeatOldest => "repeat_oldest",
@@ -484,6 +532,14 @@ fn evaluate_profile(
         },
     };
     let mut evaluator = ContractEvaluator::new(adapter, backend, limits, 64)?;
+    #[cfg(feature = "experimental-raw-cache")]
+    if raw_cache {
+        evaluator.set_raw_reuse(Box::new(projection.raw_cache_provider()));
+    }
+    #[cfg(feature = "experimental-raw-cache")]
+    let mut replay_count = 0_u64;
+    #[cfg(not(feature = "experimental-raw-cache"))]
+    let replay_count = 0_u64;
     let work = (|| -> Result<()> {
         for (i, case) in fixtures
             .cases
@@ -493,22 +549,10 @@ fn evaluate_profile(
         {
             let frozen = restore(case, OwnerId(1000 + i as u64))?;
             let reference_policy = compare_projection(&projection, &frozen, case)?;
-            let request = request(&projection, &frozen, &clock, i as u64 + 1)?;
+            let sequence = case_sequence(i, raw_cache);
+            let request = request(&projection, &frozen, &clock, sequence)?;
             evaluator.submit(Arc::clone(&request))?;
-            let until = Instant::now() + Duration::from_secs(REQUEST_SECONDS);
-            let completed = loop {
-                if let Some(result) = evaluator.poll() {
-                    break result;
-                }
-                if Instant::now() >= until {
-                    return Err(format!("native completion timeout: {}", case.name).into());
-                }
-                std::thread::yield_now();
-            };
-            let output = match completed {
-                EvalResult::Completed(output) => output,
-                other => return Err(format!("native finalized failure: {other:?}").into()),
-            };
+            let output = finalized(&mut evaluator, &case.name)?;
             output.validate_for(&request, scope, clock.domain(), clock.try_now()?)?;
             if output.actual.execution.is_none()
                 || output.actual.provenance != CacheProvenance::Computed
@@ -527,6 +571,29 @@ fn evaluate_profile(
                 .collect::<Vec<_>>();
             let policy_error = compare(&policy, &reference_policy, 1e-4, 0.0)?;
             let wdl_error = compare(&output.wdl.probabilities(), &case.wdl, 1e-4, 0.0)?;
+            #[cfg(feature = "experimental-raw-cache")]
+            if raw_cache {
+                for replay in 0..2 {
+                    let reused =
+                        self::request(&projection, &frozen, &clock, sequence + replay + 1)?;
+                    evaluator.submit(Arc::clone(&reused))?;
+                    let cached = finalized(&mut evaluator, &case.name)?;
+                    cached.validate_for(&reused, scope, clock.domain(), clock.try_now()?)?;
+                    if cached.policy != output.policy
+                        || cached.wdl != output.wdl
+                        || cached.actual.execution.is_some()
+                        || cached.actual.provenance
+                            != (CacheProvenance::RawEvalHit {
+                                source_execution: output.actual.execution,
+                            })
+                        || evaluator.state().executions != 0
+                        || evaluator.state().reserved != Resources::default()
+                    {
+                        return Err("raw-cache replay differs or retains physical work".into());
+                    }
+                    replay_count += 1;
+                }
+            }
             reports.push(json!({"case":case.name,"history_fill":profile,
                 "rules_origin":"literal_fen_unknown_prefix_with_actual_trace",
                 "known_frames":case.frames.len(),"frozen_after_live_advance":true,
@@ -538,7 +605,19 @@ fn evaluate_profile(
     })();
     // Both failure and cleanup receipts survive even when the profile fails.
     let cleanup = drain(&mut evaluator, &clock);
-    // Current resident identity is a separate proof after the worker/drain
+    // One bounded checkpoint survives a fatal native destructor before the
+    // final report can be written. This fixture has no periodic PID/GPU logger.
+    eprintln!(
+        "{}",
+        json!({"stage":"before_native_shutdown","history_fill":profile,
+        "work_passed":work.is_ok(),"physical_drain_confirmed":cleanup.is_ok(),
+        "fresh_cases_completed":reports.iter().filter(|report|report["history_fill"]==profile).count(),
+        "raw_cache_replays":replay_count})
+    );
+    // Empty request reservations do not include session destruction or native
+    // thread exit. Join on failed work too, before another profile or main exit.
+    let shutdown = shutdown_native(&owner, Duration::from_secs(SHUTDOWN_SECONDS));
+    // Current resident identity is a separate proof after the worker shutdown
     // work. It cannot release quarantined inputs or turn failed work into pass.
     let mapping_audit = if is_cuda {
         runtime
@@ -577,7 +656,30 @@ fn evaluate_profile(
     });
     let execution_admission = owner.admission_policy().execution_resources();
     let session_admission = owner.admission_policy().session_resident_admission();
+    #[cfg(feature = "experimental-raw-cache")]
+    let cache_stats: Result<Value> = if raw_cache {
+        // A poisoned stats owner or accounting error must not bypass the
+        // original work/cleanup receipts or preservation of an unconfirmed
+        // native owner. Collect the error here and return it after those steps.
+        (|| {
+            let stats = projection.raw_cache_stats()?;
+            if work.is_ok() && (stats.hits != replay_count || stats.staged != 0) {
+                return Err("raw-cache replay accounting differs".into());
+            }
+            Ok(
+                json!({"hits":stats.hits,"misses":stats.misses,"entries":stats.entries,
+                "staged":stats.staged,"retained_bytes":stats.retained_bytes}),
+            )
+        })()
+    } else {
+        Ok(Value::Null)
+    };
+    #[cfg(not(feature = "experimental-raw-cache"))]
+    let cache_stats: Result<Value> = Ok(Value::Null);
     profiles.push(json!({"history_fill":profile,"batch_size":1,
+        "raw_cache":raw_cache,"raw_cache_replays":replay_count,
+        "cache_stats":cache_stats.as_ref().ok(),
+        "cache_stats_failure":cache_stats.as_ref().err().map(|error|error_receipt(error.as_ref())),
         "provider":if is_cuda{"cuda"}else{"cpu"},
         "native_origin":if is_cuda{"cuda_onnx"}else{"cpu_onnx"},
         "cuda":cuda_metadata,
@@ -592,15 +694,19 @@ fn evaluate_profile(
         "work_failure":work.as_ref().err().map(|error| error_receipt(error.as_ref())),
         "drain":cleanup.as_ref().ok(),
         "drain_failure":cleanup.as_ref().err().map(|error| error_receipt(error.as_ref())),
+        "native_shutdown":shutdown.as_ref().ok(),
+        "native_shutdown_failure":shutdown.as_ref().err().map(|error|error_receipt(error.as_ref())),
         "native_diagnostics":diagnostic_report}));
-    if diagnostics.is_err() {
-        // Transfer failure leaves originals in this finite-capacity owner. Keep
-        // that owner through process exit instead of silently dropping originals.
+    if diagnostics.is_err() || shutdown.is_err() {
+        // Preserve originals or an unconfirmed native owner through process
+        // exit; a report or logical drain never permits reclaiming its pins.
         std::mem::forget(owner);
     }
     work?;
     cleanup?;
+    shutdown?;
     mapping_audit?;
+    cache_stats?;
     if !diagnostics_clean || !cleanup_clean {
         return Err(
             "native diagnostics or unexpected deliveries prevent profile acceptance".into(),
@@ -611,6 +717,28 @@ fn evaluate_profile(
 
 fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let option_start = args
+        .iter()
+        .position(|arg| arg.starts_with("--"))
+        .unwrap_or(args.len());
+    let (args, options) = args.split_at(option_start);
+    let mut runtime_cache_root = None;
+    let mut raw_cache = false;
+    for option in options {
+        if option == "--experimental-raw-cache" {
+            if !cfg!(feature = "experimental-raw-cache") || raw_cache {
+                return Err("raw-cache gate requires its feature and a unique option".into());
+            }
+            raw_cache = true;
+            continue;
+        }
+        let value = option
+            .strip_prefix("--runtime-cache-root=")
+            .ok_or("unsupported rules gate option")?;
+        if value.is_empty() || runtime_cache_root.replace(Path::new(value)).is_some() {
+            return Err("runtime cache root must be a unique absolute path".into());
+        }
+    }
     let is_cuda = match args.get(7).map(String::as_str) {
         Some("cpu") if args.len() == 8 => false,
         Some("cuda") if args.len() == 10 => true,
@@ -639,12 +767,12 @@ fn main() -> Result<()> {
     let result = (|| -> Result<()> {
         let bytes = asset::read_bounded(Path::new(&args[5]), 8 * 1024 * 1024)?;
         let fixtures: Fixtures = serde_json::from_slice(&bytes)?;
-        validate_reference(&fixtures)?;
         let model = MaiaAsset::load(
             Path::new(&args[0]),
             Path::new(&args[1]),
             Path::new(&args[2]),
         )?;
+        validate_reference(&fixtures, &model)?;
         let cuda_profile_directory = if is_cuda {
             let directory = Path::new(&args[8]);
             if !directory.is_absolute()
@@ -669,6 +797,8 @@ fn main() -> Result<()> {
         } else {
             None
         };
+        let runtime_cache =
+            runtime_cache_root.map_or_else(RuntimeCache::for_user, RuntimeCache::open)?;
         let pin = if is_cuda {
             let bytes = asset::read_bounded(Path::new(&args[9]), 64 * 1024)?;
             let spec = CudaRuntimeBundleSpec::from_json(std::str::from_utf8(&bytes)?)?;
@@ -685,19 +815,19 @@ fn main() -> Result<()> {
                     "ORT_LIBRARY/ORT_SHA256 must match the explicit CUDA bundle core".into(),
                 );
             }
-            RuntimeLibraryPin::copy_cuda_bundle(
+            runtime_cache.cuda_bundle(
                 core_path.parent().ok_or("CUDA core has no bundle parent")?,
-                output_root,
                 &spec,
             )?
         } else {
-            RuntimeLibraryPin::copy_verified(Path::new(&args[3]), output_root, &args[4])?
+            runtime_cache.library(Path::new(&args[3]), &args[4])?
         };
         let runtime = OrtRuntime::load(&pin)?;
         identity = json!({"reference":fixtures.reference,"reference_commit":fixtures.reference_commit,
             "reference_module_sha256":fixtures.reference_module_sha256,"source_sha256":fixtures.source_sha256,
             "fixture_sha256":asset::hex_sha256(&bytes),"onnx_sha256":model.manifest().onnx_sha256,
             "runtime_sha256":args[4],"runtime_build":runtime.build_info(),
+            "runtime_storage":pin.storage(),
             "runtime_bundle_sha256":runtime.bundle_digest().map(hex_digest)});
         for (fill, slot) in [(HistoryFill::No, 1), (HistoryFill::RepeatOldest, 2)] {
             evaluate_profile(
@@ -708,6 +838,7 @@ fn main() -> Result<()> {
                     fill,
                     profile_slot: slot,
                     cuda_profile_directory,
+                    raw_cache,
                 },
                 &mut cases,
                 &mut profiles,
@@ -721,17 +852,22 @@ fn main() -> Result<()> {
         }
         Ok(())
     })();
+    let device_admission = profiles
+        .first()
+        .and_then(|profile| profile.pointer("/execution_admission/device_bytes"))
+        .cloned();
     let report = json!({"status":if result.is_ok(){"passed"}else{"failed"},
         "failure":result.as_ref().err().map(|error| error_receipt(error.as_ref())),"identity":identity,
         "scope":if is_cuda{"actual A immutable Rules projection, C ONNX CUDA and D finalization"}else{"actual A immutable Rules projection, C ONNX CPU and D finalization"},
         "handles":"explicit local fixture ownership; no production registry issuance claim",
         "provider":if is_cuda{"cuda"}else{"cpu"},"precision":"fp32","case_count":cases.len(),"case_results":cases,
-        "model_rights":"external Maia GPL asset; separately identified from engine source",
+        "model_rights":"external selected weight; license status is recorded in the pinned export manifest",
         "profiles":profiles,"limits":{"fixture_bytes":8*1024*1024,"cases":12,"trace_plies":8,
             "native_batch_size":1,"max_executions":1,"request_deadline_seconds":REQUEST_SECONDS,
+            "native_shutdown_deadline_seconds":SHUTDOWN_SECONDS,
             "scheduler_host_reservation_limit":4*HOST_BYTES_PER_ITEM+8192,
-            "scheduler_device_admission_limit":if is_cuda{NATIVE_CUDA_ADMISSION_BYTES}else{0},
-            "bootstrap_session_resident_device_admission":if is_cuda{NATIVE_CUDA_ADMISSION_BYTES}else{0},
+            "scheduler_device_admission_limit":device_admission,
+            "bootstrap_session_resident_device_admission":device_admission,
             "scheduler_reservations_are_resident_memory_measurements":false},
         "tolerances":{"dense_input_atol":0.0,"legal_policy_max_abs":1e-4,"wdl_max_abs":1e-4},
         "raw_logits":"separate maia_check gate","uci":"not_run","gpu":if is_cuda{"see_actual_profile_receipts"}else{"not_run"},
@@ -739,4 +875,177 @@ fn main() -> Result<()> {
     report_file.write_all(&serde_json::to_vec_pretty(&report)?)?;
     report_file.write_all(b"\n")?;
     result
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use rz_runtime::contracts::RuntimeRequest;
+    use rz_runtime::Adapter;
+
+    #[test]
+    fn physical_and_replay_ids_pass_actual_monotonic_admission() {
+        let clock = ContractSystemClock::new(ProcessEpoch(211));
+        let encoding = EncodingHandle {
+            owner: OwnerId(212),
+            slot: 1,
+            generation: SlotGeneration(1),
+            manifest: encoding_manifest(HistoryFill::No),
+        };
+        let model = ModelHandle {
+            owner: OwnerId(212),
+            slot: 2,
+            generation: SlotGeneration(1),
+            manifest: Digest([213; 32]),
+        };
+        let projection = ClassicalProjection::new(
+            MaiaBinding::new(model, encoding, HistoryFill::No, Digest([214; 32]), 1).unwrap(),
+        );
+        let frozen = ContractPosition::new(OwnerId(215), Position::startpos())
+            .export()
+            .unwrap();
+        let scope = AcceptanceScope {
+            game: GameGeneration(1),
+            root: RootGeneration(1),
+            model,
+            encoding,
+            backend: projection.backend(),
+        };
+        for raw_cache in [false, true] {
+            let mut adapter =
+                ContractsAdapter::new(SharedScope::new(scope), clock.clone(), 1).unwrap();
+            for index in 0..CASE_NAMES.len() {
+                let sequence = case_sequence(index, raw_cache);
+                for offset in 0..if raw_cache { 3 } else { 1 } {
+                    let request = request(&projection, &frozen, &clock, sequence + offset).unwrap();
+                    adapter
+                        .validate_admission(&RuntimeRequest::new(request))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn drained_request_does_not_admit_delayed_native_shutdown_on_success_or_failure() {
+        use rz_eval::error::{BackendError, FailureKind, FailureStage};
+        use rz_eval::worker::SingleWorker;
+        use std::sync::mpsc;
+
+        struct NativeDestructor(mpsc::Sender<()>, mpsc::Receiver<()>);
+        impl Drop for NativeDestructor {
+            fn drop(&mut self) {
+                self.0.send(()).unwrap();
+                self.1.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+
+        for fail in [false, true] {
+            let clock = ContractSystemClock::new(ProcessEpoch(321));
+            let model = ModelHandle {
+                owner: OwnerId(322),
+                slot: 1,
+                generation: SlotGeneration(1),
+                manifest: Digest([123; 32]),
+            };
+            let encoding = EncodingHandle {
+                owner: OwnerId(322),
+                slot: 2,
+                generation: SlotGeneration(1),
+                manifest: encoding_manifest(HistoryFill::No),
+            };
+            let projection = ClassicalProjection::new(
+                MaiaBinding::new(model, encoding, HistoryFill::No, Digest([124; 32]), 1).unwrap(),
+            );
+            let (began, destruction_started) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let native = NativeDestructor(began, released);
+            let worker = SingleWorker::spawn(
+                move |batch: &rz_eval::contracts::PreparedBatch<RulesState>| {
+                    let _keep = &native;
+                    if fail {
+                        Err(BackendError::new(
+                            FailureKind::BackendFailure,
+                            FailureStage::Backend,
+                            "injected completed physical failure",
+                        )
+                        .into())
+                    } else {
+                        let raw = rz_eval::RawOutput {
+                            policy_logits: vec![0.0; 1858],
+                            wdl: vec![0.5, 0.25, 0.25],
+                        };
+                        batch
+                            .requests()
+                            .iter()
+                            .map(|request| request.physical_output(&raw, batch.execution()))
+                            .collect()
+                    }
+                },
+            )
+            .unwrap();
+            let owner = NativeWorkerOwner::from_worker(worker, projection.clone(), 2).unwrap();
+            let scope = AcceptanceScope {
+                game: GameGeneration(1),
+                root: RootGeneration(1),
+                model,
+                encoding,
+                backend: projection.backend(),
+            };
+            let adapter = ContractsAdapter::new(SharedScope::new(scope), clock.clone(), 1).unwrap();
+            let backend = NativeRuntimeBackend::new(owner.clone(), clock.clone()).unwrap();
+            let limits = Limits {
+                max_requests: 1,
+                max_batch_items: 1,
+                max_executions: 1,
+                max_batch_wait: Duration::ZERO,
+                max_queue_age: Duration::from_secs(REQUEST_SECONDS),
+                deadline_reserve: Duration::ZERO,
+                memory: Resources {
+                    host_bytes: 4 * HOST_BYTES_PER_ITEM + 8192,
+                    device_bytes: 0,
+                    pinned_bytes: 0,
+                },
+            };
+            let mut evaluator = ContractEvaluator::new(adapter, backend, limits, 64).unwrap();
+            let frozen = ContractPosition::new(OwnerId(323), Position::startpos())
+                .export()
+                .unwrap();
+            evaluator
+                .submit(request(&projection, &frozen, &clock, 1).unwrap())
+                .unwrap();
+            let work = finalized(&mut evaluator, "native-shutdown-regression");
+            assert_eq!(work.is_err(), fail);
+            assert_eq!(
+                drain(&mut evaluator, &clock).unwrap()["physical"],
+                "drained"
+            );
+            let unconfirmed = shutdown_native(&owner, Duration::ZERO);
+            destruction_started
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            release.send(()).unwrap();
+            assert_eq!(
+                unconfirmed.unwrap_err().to_string(),
+                "native worker shutdown is unconfirmed within fixture budget"
+            );
+            assert_eq!(
+                shutdown_native(&owner, Duration::from_secs(SHUTDOWN_SECONDS)).unwrap()["native"],
+                "joined"
+            );
+            let diagnostics = owner.take_diagnostics().unwrap();
+            assert_eq!(diagnostics.entries.len(), usize::from(fail));
+            if fail {
+                assert_eq!(
+                    diagnostics.entries[0]
+                        .failure
+                        .backend
+                        .as_ref()
+                        .unwrap()
+                        .detail,
+                    "injected completed physical failure"
+                );
+            }
+        }
+    }
 }

@@ -1,6 +1,8 @@
 //! Concrete Rules → UCI → search → common evaluation assembly.
 //! Model loading and physical execution remain the injected factory's responsibility.
 
+pub mod diagnostics;
+
 use crate::{bridge::BuildSearchSettings, *};
 use rz_contracts as contract;
 use rz_position::{
@@ -409,6 +411,7 @@ pub struct EngineSettings {
     pub tree: TreeLimits,
     pub max_workers: usize,
     pub shutdown_limit: Duration,
+    pub final_move_policy: rz_search::tree::FinalMovePolicy,
 }
 impl Default for EngineSettings {
     fn default() -> Self {
@@ -432,6 +435,7 @@ impl Default for EngineSettings {
             },
             max_workers: 2,
             shutdown_limit: Duration::from_secs(2),
+            final_move_policy: rz_search::tree::FinalMovePolicy::Visits,
         }
     }
 }
@@ -633,7 +637,23 @@ struct Owner {
     settings: EngineSettings,
     workers: Vec<Worker>,
     pending_failures: VecDeque<(SearchTicket, SearchCompletion)>,
+    pending_bestmove: Option<PendingBestMove>,
+    fence_failure: Option<EngineError>,
     diagnostics: Arc<Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>>,
+}
+struct PendingBestMove {
+    scope: contract::AcceptanceScope,
+    line: String,
+    until: Instant,
+}
+impl PendingBestMove {
+    fn matches_scope(&self, scope: contract::AcceptanceScope) -> bool {
+        self.scope.game == scope.game
+            && self.scope.root == scope.root
+            && self.scope.model == scope.model
+            && self.scope.encoding == scope.encoding
+            && self.scope.backend == scope.backend
+    }
 }
 impl Owner {
     fn pending_failure(
@@ -681,13 +701,16 @@ impl Owner {
             }
         }
         while let Some((ticket, completion)) = self.pending_failures.pop_front() {
+            let mut failed = SessionResult::default();
             append_contract_result(
-                &mut out,
+                &mut failed,
                 self.session_owner
                     .handle_event(session, Event::Complete { ticket, completion }),
             );
+            self.defer_bestmove(session, &mut failed);
+            append_result(&mut out, failed);
         }
-        let next = match event {
+        let mut next = match event {
             Event::RejectedInput {
                 code: "OwnerWake", ..
             } => SessionResult::default(),
@@ -752,8 +775,103 @@ impl Owner {
                 append_result(&mut out, session.end_of_input());
             }
         }
+        self.defer_bestmove(session, &mut next);
         append_result(&mut out, next);
+        self.finish_physical_output(session, &mut out);
         out
+    }
+
+    /// Session closes logical admission and freezes its last valid move at the
+    /// stop/deadline boundary. Publishing that move waits for every owned worker
+    /// to drain and join successfully. Ready/input handling stays cooperative.
+    fn defer_bestmove(
+        &mut self,
+        session: &mut Session<RulesUciPort>,
+        out: &mut SessionResult<RulesSearchPosition>,
+    ) {
+        let scope = self.session_owner.scope();
+        if session.is_closed()
+            || self
+                .pending_bestmove
+                .as_ref()
+                .is_some_and(|p| !p.matches_scope(scope))
+        {
+            self.pending_bestmove = None;
+        }
+        if session.is_closed() || self.workers.is_empty() {
+            return;
+        }
+        for line in std::mem::take(&mut out.protocol) {
+            if !line.starts_with("bestmove ") {
+                out.protocol.push(line);
+                continue;
+            }
+            if self.pending_bestmove.is_some() {
+                self.close_physical_fence(
+                    session,
+                    out,
+                    failure(
+                        contract::ErrorCode::IdentityMismatch,
+                        "duplicate deferred bestmove",
+                    )
+                    .into(),
+                );
+                return;
+            }
+            let Some(until) = Instant::now().checked_add(self.settings.shutdown_limit) else {
+                self.close_physical_fence(
+                    session,
+                    out,
+                    failure(
+                        contract::ErrorCode::ResourceExhausted,
+                        "output drain deadline overflow",
+                    )
+                    .into(),
+                );
+                return;
+            };
+            self.pending_bestmove = Some(PendingBestMove { scope, line, until });
+        }
+    }
+
+    fn finish_physical_output(
+        &mut self,
+        session: &mut Session<RulesUciPort>,
+        out: &mut SessionResult<RulesSearchPosition>,
+    ) {
+        if session.is_closed() {
+            self.pending_bestmove = None;
+            return;
+        }
+        if self.pending_bestmove.is_none() {
+            return;
+        }
+        if let Err(error) = self.reap() {
+            self.close_physical_fence(session, out, error);
+            return;
+        }
+        if self.workers.is_empty() {
+            out.protocol
+                .push(self.pending_bestmove.take().unwrap().line);
+        } else if Instant::now() >= self.pending_bestmove.as_ref().unwrap().until {
+            self.close_physical_fence(session, out, EngineError::DrainTimeout);
+        }
+    }
+
+    fn close_physical_fence(
+        &mut self,
+        session: &mut Session<RulesUciPort>,
+        out: &mut SessionResult<RulesSearchPosition>,
+        error: EngineError,
+    ) {
+        self.pending_bestmove = None;
+        out.protocol.retain(|line| !line.starts_with("bestmove "));
+        out.diagnostics.push(Diagnostic {
+            code: "PhysicalFenceFailure",
+            message: error.to_string(),
+        });
+        self.fence_failure = Some(error);
+        append_result(out, session.end_of_input());
     }
     fn cancel(&self) {
         if let Some(active) = &self.active {
@@ -920,6 +1038,7 @@ impl Owner {
                 let factory = Arc::clone(&self.factory);
                 let clock = self.clock.clone();
                 let shutdown_limit = self.settings.shutdown_limit;
+                let self_final_move_policy = self.settings.final_move_policy;
                 let events = sender.clone();
                 let diagnostics = Arc::clone(&self.diagnostics);
                 let publication = Arc::new(Mutex::new(None));
@@ -966,6 +1085,16 @@ impl Owner {
                         );
                     }
                     search.set_source_trace(factory.source_trace());
+                    if let Err(error) = search.set_final_move_policy(self_final_move_policy) {
+                        return finish_worker(
+                            &events,
+                            ticket,
+                            WorkerCompletion::failed(WorkerFailureSource::SearchConstructor(error)),
+                            &worker_publication,
+                            Some(runtime.as_mut()),
+                            shutdown_limit,
+                        );
+                    }
                     let mut previous_move = None;
                     let mut authority_error = None;
                     let mut diagnostic_failure = None;
@@ -1156,11 +1285,14 @@ fn finish_worker(
             }
         }
     }
-    let delivery_failed =
-        errors.is_empty() && sender.send(Event::Complete { ticket, completion }).is_err() && failed;
     // Keep the original owner-reclaimable until actual owner consumption/reap,
     // including the gap between returning this closure and handle.is_finished.
     let cleanup = runtime.and_then(|runtime| shutdown(runtime, shutdown_limit).err());
+    // Natural completion follows physical drain. The owner also fences frozen
+    // stop/deadline output until this closure has successfully returned and all
+    // owned workers have joined; a cleanup error never acknowledges completion.
+    let delivery_failed =
+        errors.is_empty() && sender.send(Event::Complete { ticket, completion }).is_err() && failed;
     if delivery_failed {
         // Failed sends are reclaimed by the join result. Successful sends keep
         // the slot until the owner acknowledges consumption or closing reaps it.
@@ -1406,11 +1538,12 @@ pub fn serve<O: Write, D: Write>(
     } = process;
     if settings.max_workers == 0
         || settings.shutdown_limit.is_zero()
-        || settings.search.max_simulations > 128
+        || settings.search.max_simulations == 0
+        || settings.search.max_simulations > 4096
     {
         return Err(failure(
             contract::ErrorCode::InvalidInput,
-            "finite workers/drain and at most 128 simulations required",
+            "finite workers/drain and 1..=4096 simulations required",
         )
         .into());
     }
@@ -1438,6 +1571,8 @@ pub fn serve<O: Write, D: Write>(
         settings,
         workers: Vec::new(),
         pending_failures: VecDeque::new(),
+        pending_bestmove: None,
+        fence_failure: None,
         diagnostics: Arc::new(Mutex::new(Vec::new())),
     }));
     let mut session = Session::new(
@@ -1455,6 +1590,14 @@ pub fn serve<O: Write, D: Write>(
         let mut delivered = None;
         while !timer_flag.load(Ordering::Acquire) {
             if let Ok(owner) = timer_owner.lock() {
+                if owner.pending_bestmove.as_ref().is_some_and(|pending| {
+                    Instant::now() >= pending.until || owner.workers.iter().any(Worker::is_finished)
+                }) {
+                    let _ = timer_events.try_send(Event::RejectedInput {
+                        code: "OwnerWake",
+                        message: String::new(),
+                    });
+                }
                 if let Some(active) = &owner.active {
                     if delivered.as_ref() != Some(&active.ticket)
                         && Instant::now() >= active.control.deadline
@@ -1533,7 +1676,10 @@ pub fn serve<O: Write, D: Write>(
         );
     }
     match owner.lock() {
-        Ok(owner) => {
+        Ok(mut owner) => {
+            if let Some(error) = owner.fence_failure.take() {
+                cleanup.push(error);
+            }
             // A timed-out/panicking drain does not discard failures that were
             // already published by workers which have not yet finished joining.
             cleanup.extend(owner.collect_unconsumed_failures());
@@ -1603,6 +1749,7 @@ mod tests {
         callbacks: u64,
         drained: Arc<AtomicU64>,
         cleanup: Option<contract::ContractError>,
+        drain_gate: Option<(SyncSender<()>, Receiver<()>)>,
     }
     fn injected_backend_failure() -> contract::ContractError {
         contract::ContractError::new(
@@ -1632,6 +1779,7 @@ mod tests {
                 callbacks: 0,
                 drained: Arc::clone(&self.drained),
                 cleanup: self.cleanup,
+                drain_gate: None,
             }))
         }
         fn input_key(
@@ -1676,6 +1824,10 @@ mod tests {
     }
     impl ManagedEvaluator for FailureRuntime {
         fn shutdown(&mut self, _: Instant) -> Result<(), contract::ContractError> {
+            if let Some((entered, release)) = self.drain_gate.take() {
+                entered.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
             self.drained.fetch_add(1, Ordering::AcqRel);
             if matches!(self.mode, FailureMode::PanicDrain) {
                 panic!("injected drain panic after publication");
@@ -1776,6 +1928,8 @@ mod tests {
             settings,
             workers: Vec::new(),
             pending_failures: VecDeque::new(),
+            pending_bestmove: None,
+            fence_failure: None,
             diagnostics: Arc::new(Mutex::new(Vec::new())),
         };
         let session = Session::new(
@@ -1815,7 +1969,7 @@ mod tests {
                 .iter()
                 .filter(|line| line.starts_with("bestmove "))
                 .count(),
-            1
+            0
         );
         assert!(out.protocol.iter().any(|line| line == "readyok"));
         assert!(
@@ -1826,7 +1980,26 @@ mod tests {
         assert!(owner.pending_failures.is_empty());
         assert!(session.active_ticket().is_none());
         release.send(()).unwrap();
-        owner.workers.pop().unwrap().handle.join().unwrap().unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        while !owner.workers[0].is_finished() {
+            assert!(Instant::now() < until);
+            thread::yield_now();
+        }
+        let out = owner.handle(
+            &mut session,
+            Event::RejectedInput {
+                code: "OwnerWake",
+                message: String::new(),
+            },
+        );
+        assert_eq!(
+            out.protocol
+                .iter()
+                .filter(|line| line.starts_with("bestmove "))
+                .count(),
+            1
+        );
+        assert!(owner.workers.is_empty());
     }
 
     #[test]
@@ -2144,6 +2317,293 @@ mod tests {
     }
 
     #[test]
+    fn stop_and_deadline_keep_output_private_until_owned_physical_worker_finishes() {
+        for stop in [true, false] {
+            let (mut owner, mut session) = fixture();
+            owner.handle(&mut session, Event::Line("go movetime 30".into()));
+            let ticket = session.active_ticket().unwrap();
+            let preferred = "e2e4";
+            owner.handle(
+                &mut session,
+                Event::Progress {
+                    ticket: ticket.clone(),
+                    bestmove: preferred.into(),
+                },
+            );
+            let (release, waiting) = mpsc::channel();
+            owner.workers.push(Worker {
+                handle: thread::spawn(move || {
+                    let _ = waiting.recv();
+                    Ok(())
+                }),
+                failure: Arc::new(Mutex::new(None)),
+            });
+            let event = if stop {
+                Event::Line("stop".into())
+            } else {
+                let until = owner.session_owner.control().unwrap().deadline;
+                thread::sleep(
+                    until.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+                Event::Deadline(ticket.clone())
+            };
+            let canceled = owner.handle(&mut session, event);
+            assert!(
+                !canceled
+                    .protocol
+                    .iter()
+                    .any(|line| line.starts_with("bestmove ")),
+                "stop/deadline exposed output while an owned physical worker was still blocked"
+            );
+            assert!(session.active_ticket().is_none());
+            let ready = owner.handle(&mut session, Event::Line("isready".into()));
+            assert_eq!(ready.protocol, ["readyok"]);
+            let repeated = owner.handle(&mut session, Event::Line("stop".into()));
+            assert!(repeated.protocol.is_empty());
+            release.send(()).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while !owner.workers[0].is_finished() {
+                assert!(Instant::now() < until);
+                thread::yield_now();
+            }
+            let finished = owner.handle(
+                &mut session,
+                Event::Complete {
+                    ticket,
+                    completion: SearchCompletion::Completed {
+                        bestmove: Some("d2d4".into()),
+                    },
+                },
+            );
+            assert_eq!(finished.protocol, [format!("bestmove {preferred}")]);
+            assert!(owner.workers.is_empty());
+            assert!(
+                owner
+                    .handle(&mut session, Event::Line("stop".into()))
+                    .protocol
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_move_is_discarded_on_root_game_or_session_replacement() {
+        for replacement in ["position startpos moves e2e4", "ucinewgame", "quit"] {
+            let (mut owner, mut session) = fixture();
+            owner.handle(&mut session, Event::Line("go infinite".into()));
+            let ticket = session.active_ticket().unwrap();
+            let (release, waiting) = mpsc::channel();
+            owner.workers.push(Worker {
+                handle: thread::spawn(move || {
+                    let _ = waiting.recv();
+                    Ok(())
+                }),
+                failure: Arc::new(Mutex::new(None)),
+            });
+            owner.handle(&mut session, Event::Line("stop".into()));
+            assert!(owner.pending_bestmove.is_some());
+            let next = owner.handle(&mut session, Event::Line(replacement.into()));
+            assert!(next.accepted);
+            assert!(next.protocol.is_empty());
+            assert!(owner.pending_bestmove.is_none());
+            release.send(()).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while !owner.workers[0].is_finished() {
+                assert!(Instant::now() < until);
+                thread::yield_now();
+            }
+            let stale = owner.handle(
+                &mut session,
+                Event::Complete {
+                    ticket,
+                    completion: SearchCompletion::Completed {
+                        bestmove: Some("e2e4".into()),
+                    },
+                },
+            );
+            assert!(stale.protocol.is_empty());
+            owner.reap().unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_or_panicking_drain_keeps_original_failure_and_emits_no_acknowledgment() {
+        for panic in [false, true] {
+            let (mut owner, mut session) = fixture();
+            owner.handle(&mut session, Event::Line("go infinite".into()));
+            let (release, waiting) = mpsc::channel();
+            let cause = failure(
+                contract::ErrorCode::BackendFailure,
+                "injected physical output fence failure",
+            );
+            owner.workers.push(Worker {
+                handle: thread::spawn(move || {
+                    let _ = waiting.recv();
+                    if panic {
+                        panic!("injected physical drain panic");
+                    }
+                    Err(EngineError::Contract(cause))
+                }),
+                failure: Arc::new(Mutex::new(None)),
+            });
+            owner.handle(&mut session, Event::Line("stop".into()));
+            release.send(()).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while !owner.workers[0].is_finished() {
+                assert!(Instant::now() < until);
+                thread::yield_now();
+            }
+            let closed = owner.handle(
+                &mut session,
+                Event::RejectedInput {
+                    code: "OwnerWake",
+                    message: String::new(),
+                },
+            );
+            assert!(closed.protocol.is_empty());
+            assert!(session.is_closed());
+            assert!(owner.pending_bestmove.is_none());
+            assert!(closed.effects.iter().any(|e| matches!(e, Effect::Shutdown)));
+            match owner.fence_failure.take().unwrap() {
+                EngineError::WorkerPanic if panic => {}
+                EngineError::Contract(original) if !panic => assert_eq!(original, cause),
+                other => panic!("physical cause was replaced: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn physical_fence_failure_reaches_serve_result_without_a_bestmove_acknowledgment() {
+        let (owner, session) = fixture();
+        let original = failure(
+            contract::ErrorCode::BackendFailure,
+            "injected final physical drain failure",
+        );
+        let factory = Arc::new(FailureFactory {
+            profile: owner.factory.profile(),
+            mode: FailureMode::Matching,
+            drained: Arc::new(AtomicU64::new(0)),
+            cleanup: Some(original),
+        });
+        let process =
+            EngineProcess::new(factory, Arc::clone(&session.snapshot().owners), owner.clock);
+        let (sender, receiver) = event_channel();
+        sender.send(Event::Line("go nodes 1".into())).unwrap();
+        let handle = thread::spawn(move || {
+            let mut protocol = Vec::new();
+            let mut diagnostics = Vec::new();
+            let result = serve(
+                receiver,
+                sender,
+                &mut protocol,
+                &mut diagnostics,
+                process,
+                owner.settings,
+            );
+            (result, protocol, diagnostics)
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() {
+            assert!(
+                Instant::now() < until,
+                "bounded physical fence failure must close the event loop"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let (result, protocol, diagnostics) = handle.join().unwrap();
+        assert!(result.unwrap_err().to_string().contains(original.detail));
+        assert!(!String::from_utf8(protocol).unwrap().contains("bestmove "));
+        assert!(
+            String::from_utf8(diagnostics)
+                .unwrap()
+                .contains("PhysicalFenceFailure")
+        );
+    }
+
+    #[test]
+    fn output_fence_timeout_is_finite_and_does_not_release_a_blocked_worker() {
+        let (mut owner, mut session) = fixture();
+        owner.settings.shutdown_limit = Duration::from_millis(1);
+        owner.handle(&mut session, Event::Line("go infinite".into()));
+        let (release, waiting) = mpsc::channel();
+        owner.workers.push(Worker {
+            handle: thread::spawn(move || {
+                let _ = waiting.recv();
+                Ok(())
+            }),
+            failure: Arc::new(Mutex::new(None)),
+        });
+        owner.handle(&mut session, Event::Line("stop".into()));
+        thread::sleep(Duration::from_millis(3));
+        let expired = owner.handle(
+            &mut session,
+            Event::RejectedInput {
+                code: "OwnerWake",
+                message: String::new(),
+            },
+        );
+        assert!(expired.protocol.is_empty());
+        assert!(session.is_closed());
+        assert!(matches!(
+            owner.fence_failure,
+            Some(EngineError::DrainTimeout)
+        ));
+        assert_eq!(owner.workers.len(), 1);
+        assert!(!owner.workers[0].is_finished());
+        release.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        while !owner.workers[0].is_finished() {
+            assert!(Instant::now() < until);
+            thread::yield_now();
+        }
+        owner.reap().unwrap();
+    }
+
+    #[test]
+    fn natural_worker_completion_is_not_published_while_physical_drain_is_blocked() {
+        let (mut owner, mut session) = fixture();
+        owner.handle(&mut session, Event::Line("go nodes 1".into()));
+        let ticket = session.active_ticket().unwrap();
+        let (sender, events) = mpsc::sync_channel(1);
+        let (entered, drain_started) = mpsc::sync_channel(1);
+        let (release, drain_release) = mpsc::sync_channel(1);
+        let drained = Arc::new(AtomicU64::new(0));
+        let observed = Arc::clone(&drained);
+        let handle = thread::spawn(move || {
+            let mut runtime = FailureRuntime {
+                mode: FailureMode::NoEvaluation,
+                context: None,
+                callbacks: 0,
+                drained,
+                cleanup: None,
+                drain_gate: Some((entered, drain_release)),
+            };
+            finish_worker(
+                &sender,
+                ticket,
+                WorkerCompletion::Completed {
+                    bestmove: Some("e2e4".into()),
+                },
+                &Mutex::new(None),
+                Some(&mut runtime),
+                Duration::from_secs(2),
+            )
+        });
+        drain_started.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            events.try_recv().is_err(),
+            "completion escaped before physical drain"
+        );
+        release.send(()).unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Complete { .. }
+        ));
+        handle.join().unwrap().unwrap();
+        assert_eq!(observed.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
     fn closed_receiver_preserves_factory_source_in_actual_worker_join() {
         let (result, drained, _) = closed_receiver_worker(FailureMode::Factory, false, None);
         let EngineError::UndeliveredWorkerFailure(failure) = result.unwrap_err() else {
@@ -2334,8 +2794,7 @@ mod tests {
                 .message
                 .contains(injected_backend_failure().detail)
         }));
-        assert!(owner.workers[0].failure.lock().unwrap().is_none());
-        owner.reap().unwrap();
+        // Publication acknowledgment and the physical output fence reap it.
         assert!(owner.workers.is_empty());
         let next = owner.handle(&mut session, Event::Line("go nodes 1".into()));
         assert!(next.accepted);

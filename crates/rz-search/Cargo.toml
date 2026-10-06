@@ -12,6 +12,9 @@ default = []
 experimental-puct = []
 experimental-search-buffers = []
 experimental-state-cache = []
+experimental-flat-edges = []
+experimental-compact-child = []
+experimental-backup-scratch = []
 
 [dependencies]
 rz-contracts.workspace = true

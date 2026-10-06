@@ -3,12 +3,12 @@
 //! REPORT must be absolute. Its existing parent is also the bootstrap output
 //! root: the caller owns this private directory and controls its ancestors.
 //! It must be outside Git. No temporary-directory fallback is selected, and
-//! verified native copies are retained there for process lifetime.
+//! native libraries use a separate bounded cache and retain process-lifetime pins.
 use rz_encoding::classical::{self, Frame, HistoryFill, Input};
 use rz_encoding::policy;
 use rz_eval::asset::{self, MaiaAsset};
 use rz_eval::onnx::{BackendConfig, ExecutionExperiments, OnnxBackend, OrtRuntime, Provider};
-use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeLibraryPin};
+use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeCache};
 use rz_eval::{output, RawOutput};
 use serde::Deserialize;
 use serde_json::json;
@@ -94,9 +94,59 @@ fn main() -> Result<(), Box<dyn Error>> {
         .position(|arg| arg.starts_with("--"))
         .unwrap_or(args.len());
     let (args, options) = args.split_at(option_start);
-    let experiments = experimental_options(options)?;
+    let mut benchmark_rounds = None;
+    let mut runtime_cache_root = None;
+    let mut execution_options = Vec::new();
+    let mut ort_model_path = None;
+    let mut ort_manifest_path = None;
+    let mut copy_ort_model = false;
+    for option in options {
+        if let Some(value) = option.strip_prefix("--benchmark-rounds=") {
+            let count = value.parse::<usize>()?;
+            if !(1..=100).contains(&count) || benchmark_rounds.replace(count).is_some() {
+                return Err("benchmark rounds must be a unique 1..=100 limit".into());
+            }
+        } else if let Some(value) = option.strip_prefix("--runtime-cache-root=") {
+            if value.is_empty() || runtime_cache_root.replace(Path::new(value)).is_some() {
+                return Err("runtime cache root must be a unique absolute path".into());
+            }
+        } else if let Some(value) = option.strip_prefix("--experimental-ort-model=") {
+            if !cfg!(feature = "experimental-ort-model")
+                || !Path::new(value).is_absolute()
+                || ort_model_path.replace(Path::new(value)).is_some()
+            {
+                return Err("ORT model requires a unique absolute path and its feature".into());
+            }
+        } else if option == "--experimental-ort-copy" {
+            if !cfg!(feature = "experimental-ort-model") || copy_ort_model {
+                return Err("ORT copy mode requires its feature and a unique flag".into());
+            }
+            copy_ort_model = true;
+        } else if let Some(value) = option.strip_prefix("--experimental-ort-manifest=") {
+            if !cfg!(feature = "experimental-ort-model")
+                || !Path::new(value).is_absolute()
+                || ort_manifest_path.replace(Path::new(value)).is_some()
+            {
+                return Err("ORT manifest requires a unique absolute path and its feature".into());
+            }
+        } else {
+            execution_options.push(option.clone());
+        }
+    }
+    if ort_model_path.is_some() != ort_manifest_path.is_some() {
+        return Err("ORT model and manifest must be specified together".into());
+    }
+    if copy_ort_model && ort_model_path.is_none() {
+        return Err("ORT copy mode requires the derived model and manifest".into());
+    }
+    let mut experiments = experimental_options(&execution_options)?;
+    experiments.zero_copy_ort = ort_model_path.is_some() && !copy_ort_model;
+    experiments.copy_ort_model = copy_ort_model;
+    if benchmark_rounds.is_some() && experiments != ExecutionExperiments::default() {
+        return Err("inference baseline benchmark excludes execution experiments".into());
+    }
     if !(8..=10).contains(&args.len()) {
-        return Err("usage: maia_check SOURCE.pb.gz MODEL.onnx MANIFEST.json ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu | cuda PROFILE_DIRECTORY CUDA_BUNDLE.json [--experimental-io-buffers] [--experimental-io-binding] [--experimental-cuda-graph]".into());
+        return Err("usage: maia_check SOURCE.pb.gz MODEL.onnx MANIFEST.json ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu | cuda PROFILE_DIRECTORY CUDA_BUNDLE.json [--experimental-io-buffers] [--experimental-io-binding] [--experimental-cuda-graph] [--experimental-ort-cpu-arena]".into());
     }
     let is_cuda = match args[7].as_str() {
         "cpu" if (8..=9).contains(&args.len()) => false,
@@ -108,20 +158,49 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let bytes = asset::read_bounded(Path::new(&args[5]), 8 * 1024 * 1024)?;
     let fixtures: Fixtures = serde_json::from_slice(&bytes)?;
+    let model = if experiments.uses_ort_model() {
+        None
+    } else {
+        Some(MaiaAsset::load(
+            Path::new(&args[0]),
+            Path::new(&args[1]),
+            Path::new(&args[2]),
+        )?)
+    };
+    #[cfg(feature = "experimental-ort-model")]
+    let derived = if let (Some(ort), Some(manifest)) = (ort_model_path, ort_manifest_path) {
+        Some(rz_eval::ort_model::OwnedOrtAsset::load(
+            Path::new(&args[0]),
+            Path::new(&args[1]),
+            Path::new(&args[2]),
+            ort,
+            manifest,
+        )?)
+    } else {
+        None
+    };
+    let metadata = if let Some(model) = model.as_ref() {
+        model.metadata()
+    } else {
+        #[cfg(feature = "experimental-ort-model")]
+        {
+            derived.as_ref().ok_or("derived model missing")?.metadata()
+        }
+        #[cfg(not(feature = "experimental-ort-model"))]
+        {
+            return Err("derived ORT feature unavailable".into());
+        }
+    };
+    let source_onnx_sha256 = metadata.manifest().onnx_sha256.clone();
     if fixtures.schema != 1
         || fixtures.reference != "lc0-v0.32.1-eigen-original-protobuf"
         || fixtures.reference_commit != asset::CONVERTER_COMMIT
-        || fixtures.source_sha256 != asset::SOURCE_GZIP_SHA256
+        || fixtures.source_sha256 != metadata.profile().gzip_sha256()
         || fixtures.cases.len() != 12
     {
         return Err("reference metadata or finite fixture count differs".into());
     }
     asset::parse_sha256(&fixtures.reference_module_sha256)?;
-    let model = MaiaAsset::load(
-        Path::new(&args[0]),
-        Path::new(&args[1]),
-        Path::new(&args[2]),
-    )?;
     let report_path = Path::new(&args[6]);
     if !report_path.is_absolute() {
         return Err("REPORT must be absolute and have an existing caller-owned parent".into());
@@ -165,16 +244,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
+    let runtime_cache =
+        runtime_cache_root.map_or_else(RuntimeCache::for_user, RuntimeCache::open)?;
     let pin = if let Some(spec) = &bundle_spec {
-        RuntimeLibraryPin::copy_cuda_bundle(
+        runtime_cache.cuda_bundle(
             Path::new(&args[3])
                 .parent()
                 .ok_or("CUDA core has no bundle source parent")?,
-            output_root,
             spec,
         )?
     } else {
-        RuntimeLibraryPin::copy_verified(Path::new(&args[3]), output_root, &args[4])?
+        runtime_cache.library(Path::new(&args[3]), &args[4])?
     };
     if is_cuda {
         let profile_directory = Path::new(&args[8]);
@@ -200,12 +280,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         builder.create(profile_directory)?;
         config.provider = Provider::Cuda {
             device_id: 0,
-            arena_bytes: 1024 * 1024 * 1024,
+            arena_bytes: metadata.profile().cuda_arena_bytes(),
         };
         config.profiling_prefix = Some(profile_directory.join("placement"));
     }
     let runtime = OrtRuntime::load(&pin)?;
-    let mut backend = OnnxBackend::load(&runtime, &model, config)?;
+    let mut backend = if let Some(model) = model.as_ref() {
+        OnnxBackend::load(&runtime, model, config)?
+    } else {
+        #[cfg(feature = "experimental-ort-model")]
+        {
+            OnnxBackend::load_owned_ort_observed(
+                &runtime,
+                derived.ok_or("derived model missing")?,
+                config,
+                |_| {},
+            )?
+            .1
+        }
+        #[cfg(not(feature = "experimental-ort-model"))]
+        {
+            return Err("derived ORT feature unavailable".into());
+        }
+    };
     let mut encoded = Vec::new();
     for case in &fixtures.cases {
         let history = case
@@ -264,6 +361,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         errors.push(verify(&raw, case).map_err(|e| format!("{}: {e}", case.name))?);
         singles.push(raw);
     }
+    // Same immutable start-position tensor; B1 warmed above, first B16 included.
+    // These are host wall intervals around C Run, not device kernel timings.
+    let mut inference_benchmark = Vec::new();
+    if let Some(rounds) = benchmark_rounds {
+        for size in [1, 16] {
+            let inputs = vec![&encoded[0]; size];
+            for round in 0..rounds {
+                let started = std::time::Instant::now();
+                let results = backend.run(&inputs)?;
+                let elapsed = started.elapsed();
+                if results.len() != size {
+                    return Err("benchmark batch incomplete".into());
+                }
+                for raw in &results {
+                    verify(raw, &fixtures.cases[0])?;
+                }
+                inference_benchmark.push(
+                    json!({"batch":size,"round":round,"completed_inferences":size,
+                    "host_run_ns":elapsed.as_nanos()}),
+                );
+            }
+        }
+    }
     let mut batch_checks = Vec::new();
     let batch_sizes: &[usize] = if experiments.cuda_graph {
         &[1]
@@ -317,6 +437,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             "reuse_buffers":experiments.reuse_buffers,
             "io_binding":experiments.io_binding,
             "cuda_graph_requested":experiments.cuda_graph,
+            "disable_cuda_cpu_arena":experiments.disable_cuda_cpu_arena,
+            "zero_copy_ort":experiments.zero_copy_ort,
+            "copy_ort_model":experiments.copy_ort_model,
             "repeated_B1_calls":32, "retained_outputs_unchanged":true,
             "binding_runs":backend.binding_runs(),
             "phase_clock":"CPU wall boundaries; Run includes kernels/synchronization",
@@ -353,7 +476,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         if experiments.cuda_graph { 1 } else { 4 },
     )?;
     #[cfg(not(feature = "contracts"))]
-    let contract_worker = json!({"status":"not_enabled"});
+    let contract_worker = {
+        // Run returning owned outputs does not destroy the native session.
+        // Complete destruction before publishing this process's acceptance.
+        drop(backend);
+        json!({"status":"not_enabled"})
+    };
     if is_cuda {
         // Batch-dependent or later lazy loads must still belong to the pinned
         // closure when final evidence is admitted, not only at the B1 probe.
@@ -363,6 +491,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "reference":fixtures.reference, "fixture_sha256":asset::hex_sha256(&bytes),
         "reference_commit":fixtures.reference_commit,"reference_module_sha256":fixtures.reference_module_sha256,
         "runtime_sha256":args[4], "runtime_build":runtime.build_info(),
+        "runtime_storage":pin.storage(),
         "cuda_bundle_sha256":runtime.bundle_digest().map(|digest| digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
         "cuda_bundle_files":pin.bundle_files().map(|files| files.iter().map(|file| {
             let role = match file.role {
@@ -374,11 +503,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             json!({"role":role,"filename":file.filename,"bytes":file.bytes,"sha256":file.sha256})
         }).collect::<Vec<_>>()),
         "backend_sha256":backend_sha256,
-        "onnx_sha256":model.manifest().onnx_sha256,
+        "onnx_sha256":source_onnx_sha256,
         "tolerances":{"raw_logits_atol":1e-4,"raw_logits_rtol":1e-3,"wdl_max_abs":1e-4,"legal_policy_max_abs":1e-4},
         "case_errors":errors,"batch_checks":batch_checks,
         "cuda_executed_nodes":cuda_executed_nodes,"cuda_profile_sha256":cuda_profile_sha256, "contract_worker": contract_worker,
+        "backend_shutdown_completed":true,
         "gpu_acceptance": if args[7] == "cpu" { "not_run" } else { "numerical_and_provider_probe_only" }});
+    if !inference_benchmark.is_empty() {
+        report["inference_benchmark"] = json!({
+            "scope":"same fixed start-position input; synchronous host C Run includes provider transfers and inference",
+            "input_f32_le_sha256":asset::hex_sha256(&encoded[0].values().iter()
+                .flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>()),
+            "history_fill":"no","cache":"disabled","warmup":"numerical B1 cases precede timing; first B16 included",
+            "samples":inference_benchmark,"device_kernel_timing":"not measured","device_transfer_timing":"not measured"});
+    }
     if let Some(checks) = experimental_checks {
         report["experimental_checks"] = checks;
     }
@@ -411,6 +549,10 @@ fn experimental_options(options: &[String]) -> Result<ExecutionExperiments, Box<
             "--experimental-cuda-graph" => (
                 &mut experiments.cuda_graph,
                 cfg!(feature = "experimental-cuda-graph"),
+            ),
+            "--experimental-ort-cpu-arena" => (
+                &mut experiments.disable_cuda_cpu_arena,
+                cfg!(feature = "experimental-ort-cpu-arena"),
             ),
             _ => return Err("unknown execution experiment".into()),
         };
@@ -556,9 +698,9 @@ fn verify_contract_worker(
         requests[0].cancel_token().cancel();
     }
     let stop = Instant::now() + Duration::from_secs(5);
-    let outputs = loop {
+    let completed_result = loop {
         match lease.poll() {
-            PhysicalPoll::Ready(result) => break result?,
+            PhysicalPoll::Ready(result) => break result,
             PhysicalPoll::Pending if Instant::now() < stop => std::thread::yield_now(),
             PhysicalPoll::Quarantined => {
                 return Err(lease.quarantine_cause()?.unwrap_or_else(|| {
@@ -572,6 +714,12 @@ fn verify_contract_worker(
             _ => return Err("physical worker did not complete within fixture budget".into()),
         }
     };
+    assert!(matches!(lease.poll(), PhysicalPoll::Consumed));
+    // Ready covers one Run, not worker TLS or native session destruction.
+    // Join before checking/publishing results, including a completed Run error.
+    let shutdown_result = wait_for_worker_shutdown(&mut worker, Duration::from_secs(5));
+    let outputs = completed_result?;
+    shutdown_result?;
     if outputs.len() != requests.len() {
         return Err("physical result count differs".into());
     }
@@ -603,9 +751,84 @@ fn verify_contract_worker(
             acceptance?;
         }
     }
-    assert!(matches!(lease.poll(), PhysicalPoll::Consumed));
     Ok(
         json!({"status":"passed","physical_outputs":outputs.len(),"canceled_rejected":usize::from(width > 1),
+        "shutdown_joined":true,
         "scope":"C worker plus contract 0.1; fixture Rules view; D scheduler not linked"}),
     )
+}
+
+#[cfg(feature = "contracts")]
+fn wait_for_worker_shutdown<J: Send + Sync + 'static, R: Send + 'static>(
+    worker: &mut rz_eval::worker::SingleWorker<J, R>,
+    budget: std::time::Duration,
+) -> Result<(), rz_eval::error::BackendError> {
+    use rz_eval::error::{BackendError, FailureKind, FailureStage};
+    use std::task::Poll;
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + budget;
+    loop {
+        match worker.try_shutdown() {
+            Poll::Ready(result) => return result,
+            Poll::Pending if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Poll::Pending => {
+                return Err(BackendError::new(
+                    FailureKind::BackendFailure,
+                    FailureStage::Backend,
+                    "physical worker shutdown is unconfirmed within fixture budget",
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "contracts"))]
+mod shutdown_tests {
+    use super::wait_for_worker_shutdown;
+    use rz_eval::worker::{PhysicalPoll, SingleWorker};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn completed_output_does_not_admit_an_unjoined_native_destructor() {
+        struct NativeOwner(mpsc::Sender<()>, mpsc::Receiver<()>);
+        impl Drop for NativeOwner {
+            fn drop(&mut self) {
+                self.0.send(()).unwrap();
+                self.1.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+        let (began, destruction_started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let native = NativeOwner(began, released);
+        let mut worker = SingleWorker::spawn(move |_: &()| {
+            let _keep = &native;
+            42
+        })
+        .unwrap();
+        let mut lease = worker.submit(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match lease.poll() {
+                PhysicalPoll::Ready(value) => {
+                    assert_eq!(value, 42);
+                    break;
+                }
+                PhysicalPoll::Pending if Instant::now() < deadline => std::thread::yield_now(),
+                _ => panic!("mock physical run did not complete"),
+            }
+        }
+        let result = wait_for_worker_shutdown(&mut worker, Duration::ZERO);
+        destruction_started
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            result.unwrap_err().detail,
+            "physical worker shutdown is unconfirmed within fixture budget"
+        );
+        wait_for_worker_shutdown(&mut worker, Duration::from_secs(5)).unwrap();
+    }
 }

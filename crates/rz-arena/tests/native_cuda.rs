@@ -456,6 +456,7 @@ fn cuda_private_snapshot_keeps_closed_bundle_names_and_preserves_failed_preparat
     candidate.role = NativeEngineRole::Candidate;
     candidate.engine_id = "cuda-candidate".into();
     let spec = CudaIntegrationPairSpecV1 {
+        pilot: None,
         schema_version: 1,
         purpose: NativeCudaIntegrationPurpose::CudaNnIntegration,
         strength_eligible: false,
@@ -555,4 +556,215 @@ fn cuda_private_snapshot_keeps_closed_bundle_names_and_preserves_failed_preparat
         }
     }
     fs::remove_dir_all(base).unwrap();
+}
+
+fn bt4_wire_fixture() -> (CudaNativeLaunchSpecV2, Value, Value) {
+    let (engine, mut startup, mut termination) = fixture();
+    let mut engine = CudaNativeLaunchSpecV2 {
+        role: engine.role,
+        engine_id: engine.engine_id,
+        source_commit: engine.source_commit,
+        target: engine.target,
+        artifacts: engine.artifacts,
+        cuda_bundle: engine.cuda_bundle,
+        profile: NativeCudaProfileV2::fixed("b".repeat(64), "d".repeat(64)),
+    };
+    let source = engine
+        .artifacts
+        .iter_mut()
+        .find(|a| a.role == NativeArtifactRole::SourceWeights)
+        .unwrap();
+    source.artifact.sha256 = BT4_NATIVE_SOURCE_SHA256.into();
+    source.artifact.bytes = BT4_NATIVE_SOURCE_BYTES;
+    startup["profile"]["source_weights_gzip_sha256"] = json!(BT4_NATIVE_SOURCE_SHA256);
+    startup["profile"]["arena_bytes"] = json!(BT4_NATIVE_ARENA_BYTES);
+    startup["profile"]["session_resident_admission"]["device_bytes"] =
+        json!(BT4_NATIVE_ARENA_BYTES);
+    termination["startup"] = startup.clone();
+    (engine, startup, termination)
+}
+
+#[test]
+fn bt4_provider_consumes_v1_receipt_fields_under_its_separate_v2_profile() {
+    let (engine, startup, termination) = bt4_wire_fixture();
+    let check = |startup: &Value, termination: &Value| {
+        validate_native_cuda_provider_record_fields(
+            &serde_json::to_vec(startup).unwrap(),
+            &serde_json::to_vec(termination).unwrap(),
+            &engine,
+            "native-process-123",
+        )
+    };
+    assert!(check(&startup, &termination).is_ok());
+    for pointer in [
+        "/profile/arena_bytes",
+        "/profile/session_resident_admission/device_bytes",
+    ] {
+        let mut changed = startup.clone();
+        *changed.pointer_mut(pointer).unwrap() = json!(CUDA_NATIVE_ARENA_BYTES);
+        let mut term = termination.clone();
+        term["startup"] = changed.clone();
+        assert!(check(&changed, &term).is_err());
+    }
+    let mut changed = startup.clone();
+    changed["profile"]["source_weights_gzip_sha256"] = json!("a".repeat(64));
+    let mut term = termination;
+    term["startup"] = changed.clone();
+    assert!(check(&changed, &term).is_err());
+}
+
+#[test]
+fn bt4_search_receipt_binds_the_served_settings_to_exact_startup_bytes() {
+    use rz_uci::{
+        engine::EngineSettings,
+        native_cuda_attestation::{CudaSearchReceiptV1, CudaStartupReceiptV1},
+    };
+    let (mut engine, startup, _) = bt4_wire_fixture();
+    let startup: CudaStartupReceiptV1 = serde_json::from_value(startup).unwrap();
+    let mut settings = EngineSettings {
+        max_workers: 1,
+        ..EngineSettings::default()
+    };
+    settings.search.max_simulations = 4096;
+    let mut startup_bytes = serde_json::to_vec(&startup).unwrap();
+    startup_bytes.push(b'\n');
+    let captured = CudaSearchReceiptV1::capture(&startup, &settings).unwrap();
+    let receipt = serde_json::to_value(captured).unwrap();
+    let check = |value: &Value, startup: &[u8]| {
+        rz_arena::validate_native_cuda_search_record_fields(
+            &serde_json::to_vec(value).unwrap(),
+            startup,
+            engine.profile.search,
+        )
+    };
+    assert!(check(&receipt, &startup_bytes).is_ok());
+    for (key, wrong) in [
+        ("simulations", json!(128)),
+        ("final_selection", json!("exact-terminal")),
+        ("startup_sha256", json!("a".repeat(64))),
+        ("raw_cache", json!(true)),
+        ("policy_temperature_milli", json!(800)),
+        ("process_run_id", json!("native-process-124")),
+        ("output_margin_ms", json!(0)),
+    ] {
+        let mut changed = receipt.clone();
+        changed[key] = wrong;
+        assert!(check(&changed, &startup_bytes).is_err(), "accepted {key}");
+    }
+    assert!(check(&receipt, &serde_json::to_vec(&startup).unwrap()).is_err());
+    let mut absent = receipt.clone();
+    absent.as_object_mut().unwrap().remove("raw_cache");
+    assert!(check(&absent, &startup_bytes).is_err());
+    let mut unknown = receipt.clone();
+    unknown["extra"] = json!(true);
+    assert!(check(&unknown, &startup_bytes).is_err());
+    engine.profile.search.final_selection = NativeFinalSelectionV2::ExactTerminal;
+    // Baseline captured Visits cannot satisfy an ExactTerminal lock.
+    assert!(
+        rz_arena::validate_native_cuda_search_record_fields(
+            &serde_json::to_vec(&receipt).unwrap(),
+            &startup_bytes,
+            engine.profile.search
+        )
+        .is_err()
+    );
+}
+
+#[cfg(feature = "native-cuda-batch")]
+#[test]
+fn batch_wire_is_separate_and_binds_width_consumption_and_physical_ownership() {
+    use rz_uci::{
+        engine::EngineSettings,
+        native_batch_attestation::{BatchStartupReceipt, BatchTerminationReceipt},
+        native_cuda_attestation::*,
+    };
+    let (base, mut startup, mut termination) = bt4_wire_fixture();
+    startup["profile"]["max_batch_items"] = json!(4);
+    termination["startup"] = startup.clone();
+    let mut runtime = base.profile.runtime;
+    runtime.batch_size = 4;
+    let engine = CudaNativeLaunchSpec {
+        role: base.role,
+        engine_id: base.engine_id,
+        source_commit: base.source_commit,
+        target: base.target,
+        artifacts: base.artifacts,
+        cuda_bundle: base.cuda_bundle,
+        profile: NativeCudaBatchProfileV4 {
+            runtime,
+            search: base.profile.search,
+            max_batch_wait_us: 200,
+        },
+    };
+    let provider: CudaStartupReceiptV1 = serde_json::from_value(startup).unwrap();
+    let mut settings = EngineSettings {
+        max_workers: 1,
+        ..EngineSettings::default()
+    };
+    settings.search.max_simulations = 4096;
+    let mut search = CudaSearchReceiptV1::capture(&provider, &settings).unwrap();
+    search.batch_size = 4;
+    let wrapped = BatchStartupReceipt {
+        schema_version: 1,
+        kind: "batch_experiment_startup".into(),
+        provider,
+        search,
+        max_pending: 4,
+        max_batch_wait_us: 200,
+        physical_workers: 1,
+        max_physical_executions: 1,
+        classification: "S".into(),
+    };
+    let mut start = serde_json::to_vec(&wrapped).unwrap();
+    start.push(b'\n');
+    let mut histogram = [0; 16];
+    histogram[1] = 1;
+    let mut ended = BatchTerminationReceipt {
+        schema_version: 1,
+        kind: "batch_experiment_termination".into(),
+        provider: serde_json::from_value(termination).unwrap(),
+        startup_sha256: sha(&start),
+        journal_sha256: "e".repeat(64),
+        journal_bytes: 123,
+        journal_ownership_retained: false,
+        journal_error: None,
+        journal_summary: Some(rz_eval::batch_journal::BatchJournalAudit {
+            max_pending: 4,
+            physical_dispatches: 1,
+            physical_completed: 1,
+            completed_nn_items: 2,
+            delivered_evaluations: 2,
+            consumed_evaluations: 2,
+            canceled_requests: 0,
+            unused_completed_items: 0,
+            completed_batch_distribution: histogram,
+        }),
+    };
+    let check = |record: &BatchTerminationReceipt| {
+        rz_arena::validate_batch_provider_records(
+            &start,
+            &serde_json::to_vec(record).unwrap(),
+            &engine,
+            "native-process-123",
+        )
+    };
+    assert_eq!(check(&ended).unwrap().batch.unwrap().completed_nn_items, 2);
+    ended.journal_ownership_retained = true;
+    assert!(check(&ended).is_err());
+    ended.journal_ownership_retained = false;
+    ended.journal_summary.as_mut().unwrap().consumed_evaluations = 1;
+    assert!(check(&ended).is_err());
+    ended.journal_summary.as_mut().unwrap().consumed_evaluations = 2;
+    ended.startup_sha256 = "f".repeat(64);
+    assert!(check(&ended).is_err());
+    // Synthetic wire tests prove no actual journal bytes, GPU or drain.
+    assert!(
+        validate_native_cuda_provider_record_fields(
+            &start,
+            &serde_json::to_vec(&ended).unwrap(),
+            &engine,
+            "native-process-123"
+        )
+        .is_err()
+    );
 }

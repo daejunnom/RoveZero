@@ -371,3 +371,203 @@ report로 확대하지 않으며, cache 재사용·물리 실행·실제 방문�
 조상으로 포함하므로 #17 반영 후 추가 최적화·수동 조정이 남는다. squash/rebase로
 조상을 재작성하면 base와 충돌·검사 재사용 자격을 다시 확인한다. 병합 준비를 실제
 develop 병합·GPU 성능·정식 대국 인수로 보고하지 않는다.
+
+## 11. BT4 단일 profile의 총괄 수동 접점 대조
+
+2026-10-04 총괄은 공통 revision 0.1을 유지하면서 C asset profile·graph interface·
+classical encoder/ordered policy·manifest model ID, C/D admission과 B native bootstrap/
+CUDA receipt를 수동으로 맞췄다. Maia exact pin과 16 MiB/두 출력 검사는 유지하고
+BT4 exact gzip+protobuf pin·768 MiB/세 출력만 별도 허용했다. MLH는 탐색 미소비다.
+`MaiaAsset` 호환 별칭이나 legacy backend 이름을 모델 identity 대신 사용하지 않는다.
+BT4 개별 rights 미확인과 redistribution false도 strict manifest의 검증 대상이다.
+
+profile별 CUDA arena/session 선언은 Maia 1 GiB·BT4 3 GiB로 일치시켰다. D의 physical
+예약과 별도 session 선언은 실측 VRAM·global hard cap과 구분한다. CPU V1 의미·
+CUDA V1 필드 집합·Computed-only B1은 유지한다. default 128과 explicit native
+1..4096 simulation, root·worker·취소/완료 순서도 별도 검증했다.
+
+수치 gate는 `aa0cc024`의 actual A/C/D CPU/CUDA 12개, 후속 UCI는 `78b7c535`의
+새 release binary·실제 CUDA·guarded root 소비·18 query·confirmed final drain이다.
+두 소스 사이 변경은 B UCI 네 파일뿐임을 직접 확인했다. 이 동일성은 수치 영향
+경로의 재사용 근거이며 앞 gate가 후속 B 시계/전체 race까지 검사했다는 뜻이 아니다.
+전체 workspace tests·strict Clippy·두 OS CI와 모델 연결은 통과했으나 독립 deadline/
+stop의 물리 fence, RZ NPS/per-root journal, 정식 paired 강도와 학습은 별도 인수다.
+관련 증거와 제한은 [통합 기록](INTEGRATION-STATUS.md)·[BT4 실행 기록](research/LOCAL-MODEL-BASELINE.md)을 따른다.
+
+E의 `NativeCudaProfileV1`은 arena 1 GiB, `NativeArtifactRole::Onnx`는 16 MiB에 고정돼
+있고 receipt verifier도 1 GiB를 요구한다. **이번 BT4의 3 GiB/741 MB를 해당 E V1의
+통과로 인수하지 않는다.** 기존 profile을 무조건 느슨하게 하지 않았으며 후속에는
+BT4 source/export pin·별도 bounds/profile revision·C/D/bootstrap·E 생성/검증·receipt를
+총괄이 함께 맞춘 뒤 같은 integration SHA로 검사한다. 이번 개발 대국은 Windows LC0와
+WSL native CLI를 직접 관리한 별도 finite runner와 E/A의 사후 PGN 감사 경로다.
+
+## 12. 종료 관측·D02 단계와 별도 최종 착수 정책의 수동 연결
+
+2026-10-05 총괄은 `cf94d07`의 관측 접점, `3ef9171`의 parity/inference 진입점,
+`9817647`의 S1과 `fabe88e`의 플랫폼 진단 보완을 같은 브랜치에서 수동 대조했다.
+공통 `rz-contracts` revision **0.1**, side-to-move WDL·typed request/generation·deadline,
+ordered legal view·model/input identity·Computed/raw-hit·physical lease 계약은 유지한다.
+
+| 실제 연결 | 선언·소비와 마지막 권한 | 인수 범위 |
+|---|---|---|
+| A exact terminal → B | Rules classification→terminal leaf→기존 final consume guard→Node::Terminal commit | 관측값/NN Q를 종료 권한으로 쓰지 않는다. 방문된 직접 terminal child만 별도 rank; guard 거부/취소/미방문이면 승패 증명 없음 |
+| terminal backup → 진단 | `observe_terminal_backups`·승인 후 single-slot observation·`take_terminal_observation` | observer는 path/side/value/selection을 보존하며 새 backup/visit를 만들지 않음. root delta=1·side 부호와 독립 replay 검사 |
+| B final policy → 실제 UCI | `FinalMovePolicy`→`EngineSettings`→threaded worker의 첫 selection 전 setter | visits 기본·exact-terminal 명시적 S1, late 변경 거부, policy identity suffix. 동일 binary의 root 통계 동일성과 실제 8 UCI 결과를 각각 확인 |
+| B/C/D → D02 세부 단계 | replay·legal authority·input key·terminal backup·final selection source spans→기존 bounded journal/writer | passive unkeyed terminal/final 관측과 keyed NN causal chain 구분. 같은 clock origin·8192 cap·V1 envelope 유지, 누락을 complete로 숨기지 않음 |
+| actual root 평가 → parity | D 정상 승인·B root 초기화와 동일 context 이후에만 관측 출력 공개 | C factory key와 별도 input dump key의 일치 확인. 실제 tensor/ordered indices·policy/WDL을 pinned independent original과 대조 |
+| native parser/진단 → 플랫폼 | explicit final-selection flag·중복/미지원 값 거부·private-path 없는 bounded Debug | Windows의 unused CUDA path를 presence/digest 관측으로 해결. parser·Debug·UCI 검사와 두 OS exact source CI 성공 |
+
+diagnostic example은 기존 factory/worker/Rules adapter를 재사용하고 B1·simulation 1..4096·
+case wall 1..60초·유한 physical shutdown으로 제한한다. 일반 UCI와 별도 example에서
+실행한 근거를 구분하며, output 관측은 D/B final acceptance를 대신하지 않는다.
+exact-terminal 선택은 전체 minimax solved propagation이나 mate-distance 정보를 만들지 않는다.
+진단 example은 고정 1ms polling·전체 outcome 조회를 사용한다. 일반 UCI는 compile feature에
+따라 notify/best-move를 선택할 수 있지만 이번 실제 B1 binary에는 둘 다 꺼져 있음을 Cargo
+feature와 source branch로 대조했고, 같은 1ms polling 기준을 일반 UCI에서도 계측했다.
+
+S0/S1 probe의 source `9817647`과 후속 실제 UCI/CI source `fabe88e`를 각각 고정했다.
+후속 변경은 bounded Debug뿐이고 두 source의 search/Rules/encoding/runtime 경로 일치를
+대조했다. 문서 head에서 코드·Cargo·CI 경로의 동일성을 확인한 경우에만 해당 source의
+검사를 재사용한다. 자세한 수치·실패·물리 완료와 미측정 범위는
+[통합 기록](INTEGRATION-STATUS.md)과 [모델 기록 8장](research/LOCAL-MODEL-BASELINE.md#8-종료-회귀조건-대조b1-계측과-별도-s1)에 둔다.
+
+PR #20의 최신 head에서 총괄이 이 접점과 실제 public 선언을 수동으로 대조했다는 기록을
+남긴다. E BT4 artifact/profile 경계는 여전히 별도 연결 대상이다. 같은 이름의 S1이나
+similar receipt를 이유로 기존 E V1·정식 강도·physical deadline gate를 자동 호환으로 인수하지 않는다.
+
+## 13. 런타임 저장 capability와 isolated E argv의 수동 연결
+
+총괄은 소스 `55583595a90bb59f611553da103101836fc9cd88`에서 C의 `RuntimeCache`→
+`RuntimeLibraryPin`→`OrtRuntime`·native loader, B native bootstrap·두 C 수치 gate,
+E의 두 native engine argv를 직접 대조했다. shared `rz-contracts` revision **0.1**과
+model/input identity·ordered policy/WDL·generation/deadline·physical lease·backup 계약은
+유지한다. `RuntimeStorage`는 별도 저장 영수증이며 `Computed/RawEvalHit` 의미가 아니다.
+
+| 접점 | 총괄 대조·검사 |
+|---|---|
+| C cache→native capability | 전체 bytes/hash·size·readonly·단일 link, source로부터 분리한 inode, hit마다 새 file pin, exact CUDA 19-file admission/mapping 유지 |
+| C storage→B startup | optional absolute cache root 또는 C default slot, model/session의 실제 load 뒤 private-path 없는 storage sidecar, 기존 provider/backend identity·V1 필드 집합 유지 |
+| C storage→수치 gate | 기본 cache miss와 explicit root/hit을 새 process로 검사. actual CPU/CUDA·Rules No/Repeat·mapping·물리 종료 각각 확인 |
+| C default root→E launcher | 총괄이 단방향 `rz-arena`→feature-less `rz-eval` 의존을 연결하고 lock을 갱신. 새 외부 package 없음. E parent에서 private cache root를 정해 두 inner argv로 전달 |
+| E process→native child | `env_clear()`·LANG/PATH 정책 유지, HOME/loader 환경을 전파하지 않음. 환경을 비운 concurrent-process fixture와 explicit root의 실제 CPU/CUDA gate 통과 |
+| 저장 관측→E 예산 | C cache는 4 entry/8 GiB로 별도 제한하며 E per-attempt artifact watch와 구분해 invocation limitations에 기록. E source snapshot·권리·pin·profile·receipt 조건 유지 |
+
+새 E launcher에는 cache option을 지원하는 engine binary가 필요하다. 과거 snapshot은
+원래 source/launcher로 재현하고 새 option 거부를 성공으로 숨기지 않는다. loader/native
+실패 뒤 CPU fallback이나 재시도/unload를 추가하지 않았다. corrupt cache를 덮어쓰거나
+활성 pin을 자동 삭제하지 않으며 비정상 종료의 lock/staging은 검증된 owned cleanup 대상이다.
+
+로컬 workspace 727 passed·0 failed·16 ignored, Windows/Ubuntu exact-source CI와 C/B 실제
+RTX 4050 재사용·종료 증거를 확인했다. E 연결의 fixture와 실제 C/B 증거를 **새 E 대국의
+성공으로 인수하지 않는다.** E의 BT4 artifact/profile·정식 강도·별도 physical race gate는
+그대로 남긴다. 세부 결과는 [통합 기록](INTEGRATION-STATUS.md)과
+[저장 인수](research/PERFORMANCE-OPTIMIZATION-PLAN.md#13-실행별-native-library-복제-제거와-검증된-공유-저장)에 둔다.
+
+
+## 14. B03 출력과 C/D 물리 완료의 수동 연결
+
+총괄은 stop/hard deadline의 A 합법 착수 snapshot → B Session/common guard 취소·고정 →
+C의 single physical lease·D shutdown → B owned worker 정상 join → protocol 출력 경로를
+대조한다. 논리 취소와 물리 완료 사이에는 요청/buffer/pin을 유지한다. 완료를 큐에 넣은
+사실이나 isready 응답만으로 물리 종료를 승인하지 않는다.
+
+B의 보류 출력은 common game/root/model/encoding/backend scope에 묶고 받아들인 교체에서
+폐기한다. original failed-publication slot은 실제 owner 진단/회수 전까지 유지한다.
+완료 이벤트 뒤에도 join 오류·panic을 먼저 수집하며, 실패한 drain을 성공 bestmove로
+바꾸지 않는다. 기존 유한 shutdown_limit의 출력 timeout은 final serve 오류로 보존한다.
+타이머의 wake는 내부 완료 확인이며 새 탐색/방문/평가 승인이 아니다.
+
+공통 revision 0.1·C eval output·D provenance·B PUCT/terminal policy·native V1 필드 집합은
+바꾸지 않았다. standalone Session/transport 검사와 production Engine Owner의 physical
+fence를 구분한다. 모델 session은 process lifetime 동안 resident일 수 있고 active
+평가 완료와 unload는 다르다. 출력 여유/실제 응답 시간·오류는 대국 runner가 따로 기록한다.
+
+실제 `3d90a03` source의 C/D/B CUDA와 독립 착수·종료·source journal을 인수했다.
+후속 소스에서 재사용하려면 test-only/doc 차이와 production 선언·feature·Cargo/CI·asset의
+동일성을 대조한다. develop 인수 시에도 최신 head의 직접 선언과 같은 integration SHA의
+소비자 검사를 다시 맞추며, E의 BT4 ONNX/bounds/arena/profile을 조용히 기존 Maia V1에
+넣지 않는다. 실제 runner/artifact 연결은 별도 후속 인수다.
+[상세 인수](research/LOCAL-MODEL-BASELINE.md#9-stop마감-출력의-물리-완료-경계)를 따른다.
+
+## 15. E BT4 V2의 모델·설정·영수증 수동 연결
+
+총괄이 E의 BT4 source 382,645,315 bytes/선정 gzip SHA·ONNX 768 MiB 상한·
+3 GiB arena를 C의 selected AssetProfile과 대조한다. V2의 별도 schema/domain과
+separate expected model identity를 사용한다. V1 필드·기존 byte 한도·canonical
+의미와 공통 계약 0.1은 유지하며 두 형식을 서로 파싱하지 않는다.
+
+| 접점 | 총괄 인수 조건 |
+|---|---|
+| E 모델 선언→C 로더 | source/export/ONNX 해시·실제 bytes·고정 BT4 source, C model namespace·shape/인코딩·FP32/No·3 GiB admission |
+| E search→B | sealed V2 profile의 simulation cap·final selection을 inner argv로 전달. B 실제 served EngineSettings의 별도 receipt에서 대조 |
+| B receipt→E | 정확한 startup bytes 해시·process ID에 묶인 탐색 설정, tree/time/worker/batch 한도. provider V1·placement·Computed/root/non-root·drain/exit 검사와 별도로 확인 |
+| E 저장→C cache | input snapshot·runtime output·외부 공유 cache를 구분. V2 native output은 네 placement/세 receipt의 최소 19 MiB, unique inputs와 전체 artifact 예산은 별도 |
+| E runner→A | 같은 완전 opening과 색 교환의 실제 PGN·시계·cutoff/종료·실패를 검사. A/A 통합 cutoff는 Incomplete, 점수 부여 없음 |
+
+PR/develop 인수 때 최신 선언·source/binary/feature·actual startup/config/end와
+같은 integration SHA 소비자를 다시 수동 대조한다. 단일 엔진·동시 상주·
+GPU sample·합성 wire 검사를 성공한 E pair나 holdout 기력으로 승격하지 않는다.
+실행 예산을 바꾸면 원래 실패와 새 잠금/예산을 모두 보존하고 변경을 명시한다.
+V2 실행은 검증 완료 private input snapshot에만 DONTNEED 힌트를 적용한다.
+원본·공유 runtime cache의 보존 정책을 바꾸지 않고, descriptor·별도 inode·readonly
+권한·hash·실행 후 identity 재검사를 유지한다. 이 힌트의 존재를 실제 RAM 회수나
+GPU 개선 근거로 쓰지 않으며, 실제 실패와 같은 자원 조건의 후속 실행을 대조한다.
+
+## 16. E V3 pilot의 최종 선택·전체 시계·실패와 C 메모리 정책
+
+총괄은 V3의 purpose/schema/domain과 source·binary·모델·runtime의 동일성을
+대조하고, final selection만 달라지도록 수동 연결한다. 공통 revision 0.1과
+CPU/CUDA V1·V2 A/A의 wire/domain·기존 계측 의미는 유지한다.
+
+| 접점 | 직접 대조할 조건 |
+|---|---|
+| V3 선언→B 설정 | 두 역할 cap 4096·같은 PUCT·clock/resource·actual B search-config와 startup bytes/PID; final selection만 visits/exact-terminal |
+| E clock→runner | exact Fastchess source·patch hash/bytes·modified binary·compiler; 초기 추가 증분 0, position 전송 전부터 bestmove, ns 올림·절대 read deadline |
+| runner clock→A PGN | 역할·새 게임 reset·각 searched ply의 전후 시계·제시간 증분, 완전 opening·색 교환·A 종료/현재 claim |
+| 실패→원장 | Loss PGN 또는 pre-PGN startup loss의 pinned renderer 보존; provider/clock 실패를 유지하고 좋은 판만 집계하지 않음 |
+| C 할당→backend | 요청 크기 arena 확장 marker의 새 digest; 모델/FP32/TF32 off/3 GiB·cache provenance 유지 |
+| 재실행→새 잠금 | source/engine/backend와 16개 input hash 갱신; 원래 실패·분모를 유지하고 두 시도를 합치지 않음 |
+
+새 C 정책은 BT4 수치·dual-resident 메모리·normal Computed·물리 종료로 확인한다.
+한 번의 GPU 메모리 감소를 기존 오류의 물리 VRAM 원인이나 일반적인 속도/기력
+개선으로 바꾸지 않는다. old backend의 평가/실행 증거를 새 backend 성공으로
+자동 재사용하지 않는다. source별 CPU/CI와 GPU 인수는
+[pilot 인수 기록](research/BT4-FINAL-SELECTION-PILOT.md)에서 구분한다.
+develop 반영 때 최신 E argv·C backend marker·B startup/search/final·A PGN·clock/failure와
+같은 integration SHA의 소비자 검사를 다시 수동 대조한다.
+
+E source `5f40654`는 main private pin의 cache hint를 owned cleanup과 최종 byte/identity
+재검사 뒤에도 적용한다. CUDA V2/V3만 대상이며 CPU/CUDA V1·C shared cache·원본·
+GPU buffer·공통 revision은 유지한다. child read/posthash가 다시 쌓은 private 모델
+페이지를 줄이는 OS 힌트이며 실제 회수·초기 peak·buffer 오류 해결을 자동 인정하지 않는다.
+postcheck hint 실패는 정상 인수를 거부하고 원래 실패가 있으면 함께 보존한다.
+총괄은 새 E binary와 같은 NN binary/backend, hint phase receipt, byte/inode/cursor 검사,
+실제 private page 관측·boot ID·호스트 RAM과 CUDA/clock/A 인수를 별도로 연결한다.
+
+이번 5f40654 실행에서는 여섯 pair의 완전 인수와 pair-06의 시간 예산 중단을 구분했다.
+budget failure를 engine loss·startup loss·정상 draw로 재분류하지 않고 raw PGN과
+integration false/scored 0을 보존한다. 등록된 16쌍에서 미완료 10쌍을 유지하며 source가
+다른 원래 두 실패와 합치지 않는다. code head 43e90fa의 CI와 GPU source 5f40654의 실제
+provider/session·clock·A 재생 결과는 별도 증거다. 문서 커밋의 source 영향 없음 확인은
+develop의 consumer 검사를 대체하지 않는다. 최신 integration SHA에서 위 접점을 다시
+수동 정합하며 Draft/execution_ready/strength_eligible false를 유지한다.
+
+## 17. E V3 2분+1초 시계와 PGN 진단 연결
+
+사용자 지시에 따라 총괄은 같은 BT4·FP32·No·B1·cap 4096의 S0/S1을 경기 전체
+120초+착수당 1초로 실행한다. 16쌍·32판과 전체 최대 120분을 사용하며 이전 30초+0.1초
+시도와 표본을 합치지 않는다. 같은 opening cohort를 다시 쓰므로 새 미관측 holdout으로
+표시하지 않는다. CCRL Blitz의 시간 형식만 참조하며 기준 CPU 보정이나 공식 rating은 없다.
+
+V3 clock은 호출자가 고른 양의 피셔 시계를 받는다. 두 고정 시계의 whitelist는 제거하고
+유한 pair wall의 checked 계산을 유지한다. PGN TimeControl 누락·차이는
+`NativePilotClockAudit.pgn_time_control_warnings`에 보존하며 실행·인수 거부 조건으로
+쓰지 않는다. `expected_pgn_time_control`은 실제 clock에서 만든 진단 값이다.
+실제 searched ply 차감·제시간 증분·게임 초기화·역할과 색의 trace 대조는 계속 수행한다.
+공통 계약 revision 0.1과 V1/V2는 유지하며 이 필드는 V3 결과 진단의 추가다.
+
+총괄은 E clock → Fastchess `tc=120.000+1.000` argv → actual parent trace → A PGN과
+B search-config/물리 종료 receipt를 수동 대조한다. raw White/Black의 RoveZero·BT4·S0/S1
+ID를 유지하고 검토용 SAN 사본에 색별 program type·binary/model/source identity를 넣는다.
+develop 인수 시 최신 head에서 선언·실제 소비자·동일 integration SHA를 다시 대조한다.
+실행 중인 대국은 완료된 강도 인수로 기록하지 않는다.

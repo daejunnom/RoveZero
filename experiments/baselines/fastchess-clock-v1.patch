@@ -1,0 +1,83 @@
+--- a/app/src/engine/process/process_posix.hpp
++++ b/app/src/engine/process/process_posix.hpp
+@@ -264,6 +264,7 @@
+         lines.clear();
+ 
+         const int poll_timeout_ms = normalize_poll_timeout_ms(threshold);
++        const auto rz_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(0, poll_timeout_ms));
+ 
+         std::array<pollfd, 3> fds;
+         size_t fds_count = 0;
+@@ -286,7 +287,16 @@
+             // We prefer to use poll instead of select because
+             // poll is more efficient and select has a filedescriptor limit of 1024
+             // which can be a problem when running with a high concurrency
+-            const int ready = poll(fds.data(), static_cast<nfds_t>(fds_count), poll_timeout_ms);
++            int rz_wait_ms = poll_timeout_ms;
++            if (poll_timeout_ms >= 0) {
++                const auto left = rz_deadline - std::chrono::steady_clock::now();
++                if (left <= std::chrono::steady_clock::duration::zero()) {
++                    flush_partials_on_timeout(lines);
++                    return Result{Status::TIMEOUT, "timeout"};
++                }
++                rz_wait_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(left).count()) + 1;
++            }
++            const int ready = poll(fds.data(), static_cast<nfds_t>(fds_count), rz_wait_ms);
+ 
+             if (ready == -1) return Result::Error("poll failed");
+             if (ready == 0) {
+--- a/app/src/game/timecontrol/timecontrol.cpp
++++ b/app/src/game/timecontrol/timecontrol.cpp
+@@ -15,7 +15,7 @@
+     if (limits_.fixed_time != 0) {
+         time_left_ = limits_.fixed_time;
+     } else {
+-        time_left_ = limits_.time + limits_.increment;
++        time_left_ = limits_.time;  // RZ clock V1: increment is earned after a timely move.
+     }
+ 
+     moves_left_ = limits_.moves;
+--- a/app/src/matchmaking/match/match.cpp
++++ b/app/src/matchmaking/match/match.cpp
+@@ -453,6 +453,9 @@
+     // make sure the engine is not in an invalid state
+     if (!validConnection(us, them)) return false;
+ 
++    // RZ clock V1: own clock includes state transmission, go, search and bestmove.
++    const auto t0 = clock::now();
++    const auto remaining_before = us.getTimeControl().getTimeLeft();
+     // write new uci position
+     if (!us.engine.position(data_.getMoves(), start_position_)) {
+         setEngineCrashStatus(us, them);
+@@ -474,8 +477,9 @@
+     us.engine.setupReadEngine();
+ 
+     // wait for output line starting with "bestmove"
+-    const auto t0     = clock::now();
+-    const auto status = us.engine.readEngineLowLat("bestmove", us.getTimeoutThreshold());
++    const auto before_read = chrono::duration_cast<chrono::milliseconds>(clock::now() - t0);
++    const auto read_budget = std::max(chrono::milliseconds(1), us.getTimeoutThreshold() - before_read);
++    const auto status = us.engine.readEngineLowLat("bestmove", read_budget);
+     const auto t1     = clock::now();
+ 
+     LOG_TRACE_THREAD("Engine {} is done thinking", name);
+@@ -503,7 +507,9 @@
+ 
+     LOG_TRACE_THREAD("Engine {} is in a ready state", name);
+ 
+-    const auto elapsed_ms = chrono::duration_cast<chrono::milliseconds>(t1 - t0).count();
++    const auto elapsed_ns = chrono::duration_cast<chrono::nanoseconds>(t1 - t0).count();
++    // Charge partial milliseconds; the 100ms read margin never extends the chess clock.
++    const auto elapsed_ms = (elapsed_ns + 999999) / 1000000;
+ 
+     // calculate latency
+     const auto last_time = us.engine.lastTime().count();
+@@ -519,6 +525,8 @@
+     const auto timeout    = us.hasTimeControl() ? !us.getTimeControl().updateTime(elapsed_ms) : false;
+     const auto timeleft   = us.hasTimeControl() ? us.getTimeControl().getTimeLeft() : 0;
+     const auto overrun_ms = timeleft < 0 ? -timeleft : 0;
++    LOG_TRACE_THREAD("RZ_CLOCK_V1 engine={} before={} increment={} elapsed_ns={} after={} valid={}",
++                     name, remaining_before, us.getTimeControl().getIncrement(), elapsed_ns, timeleft, !timeout);
+ 
+     if (best_move) {
+         addMoveData(us, *best_move, elapsed_ms, latency, timeleft, legal);

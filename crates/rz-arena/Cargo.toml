@@ -8,16 +8,28 @@ description = "RoveZero paired opening plans and attempt/failure ledger"
 
 [features]
 test-fixtures = []
+experimental-snapshot-io = []
+experimental-snapshot-reclaim = []
 native-cuda = ["dep:rz-uci", "rz-uci/onnx-cuda"]
+native-cuda-batch = ["native-cuda", "rz-uci/experimental-batch", "rz-eval/experimental-batch"]
 
 [[bin]]
 name = "rz-arena-fixture-engine"
 path = "src/bin/fixture-engine.rs"
 required-features = ["test-fixtures"]
 
+[[example]]
+name = "pilot_failure_audit"
+required-features = ["native-cuda"]
+
+[[example]]
+name = "native_batch_prepare"
+required-features = ["native-cuda-batch"]
+
 [dependencies]
 rz-experiments.workspace = true
 rz-contracts.workspace = true
+rz-eval.workspace = true
 rz-position = { workspace = true, features = ["contracts"] }
 rz-uci = { workspace = true, optional = true }
 serde.workspace = true

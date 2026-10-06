@@ -7,7 +7,11 @@ mod fastchess;
 mod ledger;
 #[cfg(feature = "native-cuda")]
 mod native_cuda;
+mod native_diagnostics;
 mod native_launch;
+mod native_pilot;
+#[cfg(target_os = "linux")]
+mod native_retention;
 mod native_runner;
 mod pgn;
 mod plan;
@@ -19,7 +23,9 @@ pub use fastchess::*;
 pub use ledger::*;
 #[cfg(feature = "native-cuda")]
 pub use native_cuda::*;
+pub use native_diagnostics::emit_native_phase;
 pub use native_launch::*;
+pub use native_pilot::*;
 pub use native_runner::*;
 pub use pgn::*;
 pub use plan::*;

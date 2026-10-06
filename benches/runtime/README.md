@@ -1,5 +1,149 @@
 # Runtime 검증·반복 계측 도구
 
+## 메모리 E 대조 자료의 누적 집계
+
+[memory_evidence.py](memory_evidence.py)는 이전·현재 **동일 작업량의 쌍별 자료**를
+읽기 전용으로 집계한다. 엔진·GPU·CPU PoC를 실행하거나 기본 옵션을 활성화하지 않는다.
+원시 결과와 ledger·집계 JSON은 저장소 밖에 보존한다. 기존 보류·실패 판정을 덮어쓰지 않는다.
+
+Ledger schema 1의 `comparisons`에는 전역 고유 `id`, `environment_epoch`,
+`compatibility`, `baseline`, `variant`를 둔다. Compatibility의 필수 차원은
+`option/workload/model/runtime/precision/batch/resources/fixed_work/time_scope/peak_kind/other_options`다.
+다른 작업·시간 구간·메모리 정의는 별도 series다. 같은 질문의 소스·환경 변화는
+epoch로 보존하며 그 사이 합계는 기술 통계다. 역사적 binary 크기·입력 차이는
+해당 manifest에서 확인하고, 호환성을 확인하지 못한 결과는 합산하지 않는다.
+
+각 arm에는 `layout=native|prepare|oracle|inference`와
+`result={"path":"원시-result.json","sha256":"64자리 digest"}`를 지정한다.
+Path는 ledger 기준 상대 경로나 실행 호스트의 절대 경로다. Native에는 `receipt`,
+inference에는 `report`와 `reuse_buffers`도 지정한다. 추가 작은 JSON 증거는
+`additional_evidence`로 묶는다. 이 도구는 raw 결과의 실제 시간·peak를 사용하며,
+전달된 요약 숫자로 대체하지 않는다. Ledger·증거 JSON은 파일마다 16MiB로 제한한다.
+이전 결과에 source SHA가 없으면 `registration={"path":"...","sha256":"..."}`의
+고정 source를 요구한다. Raw source가 있으면 registration과 일치해야 한다.
+
+CUDA CPU arena 비교의 inference arm에는 `disable_cuda_cpu_arena`도 명시한다.
+새 report kind와 실제 옵션·fallback off·buffer reuse off를 대조하여 양쪽 옵션이
+뒤바뀌거나 다른 실행을 같은 비교로 집계하지 않는다. 이전 ledger는 그대로 읽을 수 있다.
+
+각 series는 기준·변경 T 합계와 `sum(T1)/sum(T0)`, 실행별 peak 관측값의 합계·평균과
+`sum(P1)/sum(P0)`, 쌍별 비율의 범위·중앙값·기하평균을 함께 남긴다. **Peak의 합계는
+독립 실행 관측값의 합이며 동시에 필요한 메모리나 시스템 peak가 아니다.** RSS와
+cgroup peak를 합치지 않으며 VRAM·Windows commit 미관측을 대체하지 않는다.
+공유 기준 실행은 옵션별 비교에 표시하되 실제 실행 건수에서는 한 번 센다.
+따라서 공유 기준을 사용하는 옵션 결과는 서로 독립 표본이 아니다.
+
+SHA 변조·중복 ID 충돌·같은 series의 실행 재사용·작업량 불일치·OOM·강제 종료·취소를
+거부한다. `diagnostic_only=true` 또는 `performance_measurement=false`인 실행도
+`accepted=true`·exit0 여부와 관계없이 성능 comparison에 넣지 않는다. 이 표식을
+추가하기 전의 고정 작업량 자료는 기존 실제 receipt와 registration 검사로 대조한다.
+동일 comparison의 중복 입력은 한 번만 센다. Conditioning과 실패·성공한 진단은
+`excluded=[{"id":"...","reason":"...","evidence":[{"path":"...","sha256":"..."}]}]`
+에 보존하고 비교 합계와 구분한다. 누적 평균만으로 이전 실패를 통과 처리하지 않는다.
+[채택 기준](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#adoption-gate)은 별도로 적용한다.
+
+```sh
+python benches/runtime/memory_evidence.py "$RZ_LEDGER_JSON" "$RZ_FRESH_REPORT_JSON"
+python benches/runtime/memory_evidence.py "$RZ_NEW_LEDGER_JSON" "$RZ_FRESH_REPORT_JSON" \
+  --include-ledger "$RZ_PRIOR_LEDGER_JSON"
+python -m unittest discover -s benches/runtime/tests -p test_memory_evidence.py -q
+```
+
+`--include-ledger`는 반복 지정할 수 있다. 이전 ledger를 수정하지 않고 새 실행의 ledger를
+추가하며 각 입력 ledger SHA도 출력에 남긴다. 중복 comparison은 한 번만 센다.
+
+## CUDA session의 CPU arena 한 변수 연구
+
+`rz-eval`의 `experimental-ort-cpu-arena`는 기본 off이며 컴파일만으로 활성화되지 않는다.
+`inference_bench --b1-cpu-arena=baseline|disabled`는 동일 바이너리의 BT4 FP32 B1,
+warm3/timed20과 출력 digest를 대조한다. 여섯 절대 경로 인자는 기존 진입점과 같다.
+`maia_check`의 `--experimental-ort-cpu-arena`로 독립 수치·수명 검사를 먼저 실행한다.
+기본 batch sweep·UCI 대국 설정에는 적용하지 않는다.
+
+두 비교 arm 모두 준비 단계의 `/proc/self/status`를 8개 경계에서 읽는다.
+Session commit 직후에는 직렬화 원본이 아직 살아 있고 다음 관측은 owned 원본 해제 후다.
+기존 생성자는 no-op observer를 사용하므로 일반 대국에 반복 PID/GPU 조사를 추가하지 않는다.
+실패 보고서는 도달한 관측만 남긴다. RSS endpoint와 process-lifetime VmHWM은
+phase peak·live heap·cgroup file cache·VRAM·Windows commit과 구분한다.
+이 옵션은 ORT 내부 CPU allocator의 arena만 끄며 CPU node fallback 금지·CUDA 배치 증거·
+물리 완료 조건을 유지한다. 새 backend identity는 별도이며 기존 I/O 옵션의 identity는 보존한다.
+
+## Owned ORT flatbuffer 한 변수 연구
+
+**현재 HOLD:** 최초 별도 CUDA 수치 실행은 계산 후 native heap 오류와 SIGABRT로
+종료했다. 실패는 보존한다. Worker join 수정 뒤 source `f9ed02a`의 재검사는
+12개 참조·batch1/2/4/8/16·native shutdown·exit0을 확인했다. 후속 세 쌍에서
+direct ORT의 primary peak RSS는 약25.4% 낮았지만 준비 완료 RSS는 약590.6MiB
+높고 전체 T 합계는 약20.2% 늘어 채택 문턱을 통과하지 못했다.
+[실패·수명 수정·누적 자료](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#owned-ort-flatbuffer-ab)를 따른다.
+
+`experimental-ort-model`은 기본 off이며 UCI·기존 B1 대국에 적용하지 않는다.
+`ort_export SOURCE ONNX EXPORT CUDA_CORE CUDA_BUNDLE NEW_ORT NEW_MANIFEST`로
+기존 CUDA FP32·TF32 off·Level1 경로에서 파생 모델을 별도 생성한다. 일곱 경로는
+절대 경로이고 두 출력은 저장소 밖의 새 파일이다. 변환·placement probe는 독립
+수치 인수를 대신하지 않는다. 원본 가중치·ONNX·export identity를 유지하고 파생
+ORT·manifest·export runtime을 추가로 식별한다.
+
+`maia_check`에 `--experimental-ort-model=ORT_ABSOLUTE_PATH`와
+`--experimental-ort-manifest=MANIFEST_ABSOLUTE_PATH`를 함께 전달해 먼저 검증한다.
+그 뒤 `inference_bench`의 기존 여섯 인자에 `--b1-ort-model=baseline|direct`,
+ORT 절대 경로, 파생 manifest 절대 경로를 추가해 동일 바이너리·B1·warm3/timed20을
+대조한다. Cache·buffer reuse·CPU arena 변경·I/O Binding·CUDA Graph는 함께 켜지 않는다.
+
+Direct 경로는 Rust 소유 flatbuffer를 session 전체 수명 동안 유지한다. Native session을
+먼저 파괴하며 CUDA 완료가 미확정이면 session·모델·입력을 함께 보존한다. 원본 ONNX의
+조기 해제 경로와 달리 ready 이후에도 모델 바이트가 남으므로 startup peak와 ready RSS를
+별도로 평가한다. ORT의 두 직접 참조 옵션은 ONNX protobuf에 적용하지 않는다.
+
+Ledger arm에는 `zero_copy_ort`와 `derived_manifest` pin을 지정한다. 집계기는 실제
+옵션·파생 provenance·retained bytes를 대조하고 baseline=false/variant=true를 요구한다.
+해당 series의 기본 채택이나 기존 누적 자료의 판정 변경은 자동화하지 않는다.
+
+`--b1-copied-ort=baseline|copied`는 같은 여섯 인자와 파생 모델·manifest 두 경로를
+사용하는 독립 비교다. 수치 검사는 기존 파생 경로 인자에 `--experimental-ort-copy`를
+추가한다. 이 옵션은 두 직접 참조 설정을 모두0으로 고정하고 정상 native copy가
+끝난 뒤 기존 버퍼 해제 함수를 재사용한다. Direct 수명을 짧게 해석하지 않는다.
+새 backend identity·report kind `b1_copied_ort_fixed_work`와 ledger option
+`copied-ort-flatbuffer`를 사용하며 arm의 `copy_ort_model`은 baseline=false,
+variant=true, `zero_copy_ort`는 양쪽 false다. Retained bytes는 양쪽0이며
+다른 옵션은 계속 off다. 별도 수치·정상 종료 인수 전에는 이 A/B를 실행하지 않는다.
+복사형 결과를 직접 참조형 누적 series에 합산하거나 UCI 기본 경로로 적용하지 않는다.
+**복사형도 HOLD:** source `33f1b86`의 첫 수치 실행은 worker join 뒤 native heap
+오류·SIGABRT로 종료했다. A/B 사전 등록·실행은 중단했으며 [실패 기록](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#copied-ort-flatbuffer-ab)을
+보존했다. 수치 보고서 `passed`와 CPU CI 성공으로 전체 GPU 실행을 승인하지 않는다.
+
+[종료 진단](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#ort-native-shutdown-diagnostic)은
+cuDNN의 exit callback이 `calloc`할 때 heap 손상을 감지한 스택을 확보했다.
+contracts 없이 main에서 Run/drop해도 재현했다. 자식의 tcache를 끈 두 진단은 정상
+종료했지만 첫 손상 지점·portable 수정·효과 인수는 미확정이다. Allocator 설정과
+제품 기본값을 변경하지 않으며 GDB/allocator 진단을 성능 ledger에 넣지 않는다.
+
+[후속 heap 진단](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#ort-heap-first-write-diagnostic)은
+정확한 glibc free-list 오류를 확인했다. 작은 native C API의 GLOBAL/LOCAL 실행은 exit0이지만,
+원래16개 bootstrap을 LOCAL로 바꾼 전체 수치 경로는 같은 SIGABRT다. 첫 손상 원인은 unknown이다.
+관측·부분 fixture·setup 실패9개는 한 excluded collection으로 보존하고 기존30개 비교·고유57회·
+공유 기준3개·8개 series 값을 유지했다. 제외는17개이며 새로운 성능 A/B는 없다.
+[Raw cache host head 공유](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#raw-cache-shared-heads)는
+별도 소스 변경이다. CPU/mock 수명 검사는 통과했지만 GPU/전체 메모리·시간 효과는 미측정이다.
+기존 ledger나 진단 숫자를 이 변경의 성능 증거로 사용하지 않는다.
+
+[후속 CPU 할당·A/B](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#raw-cache-shared-heads-cpu-ab)는
+고정24,576 hit에서 두 할당/hit 제거를 관측했다. Hook 없는 세 쌍은 합산 시간비0.93543,
+peak 관측비1.12781로 HOLD다. 새 series를 분리해 누적33개 비교·고유63회·9개 series·
+제외19개로 보존했다. `rules_maia_check --experimental-raw-cache`는 해당 feature에서만
+활성화하는 독립 수치 gate다. 첫 GPU 실행은 예제 ID 역행 후 CUDA 종료 오류로 실패했으며,
+ID 수정은 CPU admission 회귀로만 검증했다. 부분 수치·예약0을 GPU 전체 인수로 세지 않고
+후속 GPU A/B·대국은 정상 종료를 포함한 독립 수치 인수 뒤에 진행한다.
+
+[Native 종료 수정·긴 CPU A/B](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#raw-cache-native-shutdown-long-ab)에서는
+수치 gate 예제의 request drain 뒤 native join 누락을 수정했다. 제품 UCI는 이미 join을
+확인하고 있었다. 통계 수집 오류도 원래 work/정리 영수증과 owner 보존을 건너뛰지 않게 했다.
+원본 BT4 B1 No/Repeat의 fresh12/cache24·두 profile join·exit0을 source b39dc4a에서 확인했고,
+별도 의도적 WDL 오류는 원래 failed/exit1을 보존하며 정리했다. 이는 GPU 성능/대국 인수가 아니다.
+복사형 ORT heap 문제는 별도 HOLD다. 고정1,572,864-hit CPU 세 쌍은 합산 시간비1.008407,
+peak 관측비0.958297·문턱 실패로 cache 기본 off/HOLD다. 이전 짧은 조건과 분리하여 누적
+36개 비교·고유69회·공유control3·10개 series/epoch·제외20개를 보존한다.
+
 ## D02 CPU/mock trace 재생
 
 [cpu_trace 예제](../../crates/rz-runtime/examples/cpu_trace.rs)는 실제 `Scheduler`와

@@ -68,6 +68,37 @@ fn strict_digest_and_manifest_parsing() {
 }
 
 #[test]
+fn bt4_is_an_independent_pinned_profile_with_its_own_size_and_rights_status() {
+    let mut bt4 = manifest();
+    bt4.source_gzip_sha256 = asset::BT4_GZIP_SHA256.into();
+    bt4.source_protobuf_sha256 = asset::BT4_PROTOBUF_SHA256.into();
+    bt4.onnx_bytes = 741_143_425;
+    bt4.weights_license = asset::BT4_LICENSE_STATUS.into();
+    bt4.validate().unwrap();
+    assert_eq!(bt4.profile().unwrap(), asset::AssetProfile::Bt4It332);
+    assert!(bt4.profile().unwrap().has_moves_left_head());
+    // Neither a mixed source identity nor a code-license guess authorizes
+    // the BT4 asset. Maia keeps its original 16 MiB export bound.
+    for change in [
+        |m: &mut ExportManifest| m.source_protobuf_sha256 = asset::SOURCE_PROTOBUF_SHA256.into(),
+        |m: &mut ExportManifest| m.weights_license = "GPL-3.0".into(),
+        |m: &mut ExportManifest| m.redistribution_ready = true,
+    ] {
+        let mut changed = bt4.clone();
+        change(&mut changed);
+        assert_eq!(
+            changed.validate().unwrap_err().kind,
+            FailureKind::UnsupportedModel
+        );
+    }
+    bt4.onnx_bytes = asset::BT4_MAX_ONNX_BYTES + 1;
+    assert_eq!(
+        bt4.validate().unwrap_err().kind,
+        FailureKind::ResourceExhausted
+    );
+}
+
+#[test]
 fn file_read_has_a_real_byte_limit() {
     let path = std::env::temp_dir().join(format!("rz-c-asset-limit-{}", std::process::id()));
     std::fs::write(&path, b"bounded data").unwrap();

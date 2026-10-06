@@ -37,10 +37,19 @@ pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 
         role: rz_experiments::NativeEngineRole,
     ) -> Result<NativeEngineView<'_>, rz_experiments::ManifestError>;
     fn provider_name(&self) -> &'static str;
+    fn advise_drop_input_cache(&self) -> bool {
+        false
+    }
     fn additional_manifest(&self) -> Option<&ArtifactRef> {
         None
     }
     fn validate_additional_manifest(&self, _bytes: &[u8]) -> Result<(), ArenaError> {
+        Ok(())
+    }
+    fn pilot_cohort(&self) -> Option<&ArtifactRef> {
+        None
+    }
+    fn validate_pilot_cohort(&self, _bytes: &[u8]) -> Result<(), ArenaError> {
         Ok(())
     }
 }
@@ -52,6 +61,8 @@ pub struct NativeEngineView<'a> {
     pub engine_id: &'a str,
     pub artifacts: &'a [rz_experiments::NativeArtifactBinding],
     pub cuda_bundle: Option<&'a rz_experiments::CudaBundleBindingV1>,
+    pub search: Option<rz_experiments::NativeCudaSearchV2>,
+    pub batch_experiment: Option<usize>,
 }
 impl NativeEngineView<'_> {
     pub fn artifact(
@@ -77,7 +88,7 @@ pub struct NativePairView<'a> {
     pub opening: &'a rz_experiments::OpeningSpec,
     pub opening_artifact: &'a ArtifactRef,
     pub runner: &'a rz_experiments::ToolIdentity,
-    pub clock: rz_experiments::NativeMovetimeV1,
+    pub clock: rz_experiments::NativePairClock,
     pub max_plies: u32,
     pub timeouts: rz_experiments::NativeTimeoutsV1,
     // Shared observation bounds are an executor view, not a CPU spec conversion.
@@ -96,7 +107,7 @@ impl NativeLaunchDeclaration for LockedIntegrationPairSpecV1 {
             opening: &p.opening,
             opening_artifact: &p.opening_artifact,
             runner: &p.runner,
-            clock: p.clock,
+            clock: rz_experiments::NativePairClock::Movetime(p.clock),
             max_plies: p.max_plies,
             timeouts: p.timeouts,
             budget: p.budget,
@@ -117,6 +128,8 @@ impl NativeLaunchDeclaration for LockedIntegrationPairSpecV1 {
             engine_id: &engine.engine_id,
             artifacts: &engine.artifacts,
             cuda_bundle: None,
+            search: None,
+            batch_experiment: None,
         })
     }
     fn provider_name(&self) -> &'static str {
@@ -391,6 +404,15 @@ pub(crate) mod linux {
         path::PathBuf,
     };
 
+    // Only the syscall chunk changes. Source/copy hashes, full pin rechecks,
+    // byte budgets, closed writers and inode/path ownership stay unchanged.
+    // Keep the original 16KiB path as default until fixed-work E acceptance.
+    const SNAPSHOT_IO_BYTES: usize = if cfg!(feature = "experimental-snapshot-io") {
+        64 * 1024
+    } else {
+        16 * 1024
+    };
+
     pub(crate) struct InputPin {
         pub artifact: ArtifactRef,
         pub path: PathBuf,
@@ -410,6 +432,7 @@ pub(crate) mod linux {
         pub limits: ProcessLimits,
         pub _runtime_root_pins: [File; 2],
         pub bundle_directory: Option<Dir>,
+        pub preparation_cache_hint: Option<crate::SnapshotCacheHint>,
     }
 
     pub(crate) fn pin<'a>(
@@ -518,14 +541,13 @@ pub(crate) mod linux {
     }
     pub(crate) fn readonly_copy(
         artifact: &ArtifactRef,
-        source_root: &Path,
+        mut source: File,
         directory: &Dir,
         relative: &str,
         absolute: PathBuf,
         executable: bool,
         max_bytes: u64,
     ) -> Result<(InputPin, NativeSnapshotReceipt), ArenaError> {
-        let mut source = artifact.open_verified(source_root, max_bytes)?;
         let source_metadata = source
             .metadata()
             .map_err(|_| io("cannot inspect verified source inode"))?;
@@ -542,7 +564,7 @@ pub(crate) mod linux {
             .into_std();
         let mut count = 0u64;
         let mut hasher = Sha256::new();
-        let mut buffer = [0u8; 16 * 1024];
+        let mut buffer = [0u8; SNAPSHOT_IO_BYTES];
         loop {
             let read = source
                 .read(&mut buffer)
@@ -619,7 +641,7 @@ pub(crate) mod linux {
             .map_err(|_| io("cannot rewind native copy"))?;
         let mut hasher = Sha256::new();
         let mut count = 0u64;
-        let mut buffer = [0u8; 16 * 1024];
+        let mut buffer = [0u8; SNAPSHOT_IO_BYTES];
         loop {
             let read = file
                 .read(&mut buffer)
@@ -681,14 +703,25 @@ pub(crate) mod linux {
                 ));
             }
         }
-        // Verify every source before creating the attempt; subsequently copied
-        // bytes are hashed again, so same-inode writes cannot publish torn input.
-        for artifact in unique.values() {
-            drop(artifact.open_verified(source_root, input.budget.max_input_bytes)?);
-        }
+        // Verify every source before creating the attempt and keep those exact,
+        // rewound handles for copying instead of reopening and hashing again.
+        // The copy stream is still hashed, so same-inode writes fail closed.
+        crate::emit_native_phase("source_verification_started");
+        let sources = unique
+            .values()
+            .map(|artifact| artifact.open_verified(source_root, input.budget.max_input_bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::emit_native_phase("source_verification_complete");
         let root_path = outside_git(output_root)?;
         let root = Dir::open_ambient_dir(&root_path, cap_std::ambient_authority())
             .map_err(|_| io("cannot pin native output root"))?;
+        crate::native_retention::admit(
+            &root,
+            total
+                .checked_add(input.budget.max_output_bytes)
+                .and_then(|n| n.checked_add(NATIVE_PAIR_METADATA_CAP))
+                .ok_or_else(|| io("native retention reservation overflow"))?,
+        )?;
         root.create_dir(label).map_err(|_| {
             io("cannot create exclusive native attempt; existing outputs preserved")
         })?;
@@ -731,7 +764,12 @@ pub(crate) mod linux {
         };
         let mut pins = Vec::new();
         let mut receipts = Vec::new();
-        for (index, artifact) in unique.values().enumerate() {
+        let mut preparation_cache_hint = crate::SnapshotCacheHint::rolling(
+            spec.advise_drop_input_cache(),
+            "after_copy_each_verified",
+        );
+        crate::emit_native_phase("snapshot_copy_started");
+        for (index, (artifact, source)) in unique.values().zip(sources).enumerate() {
             let bundle_name = cuda_bundle.and_then(|bundle| {
                 if &bundle.manifest == artifact {
                     Some("bundle.v1.json")
@@ -767,15 +805,27 @@ pub(crate) mod linux {
             } else {
                 (&inputs, name.as_str())
             };
-            let (pin, receipt) = readonly_copy(
+            let copied = readonly_copy(
                 artifact,
-                source_root,
+                source,
                 destination.0,
                 destination.1,
                 path.join("inputs").join(&name),
                 executable,
                 input.budget.max_input_bytes,
-            )?;
+            );
+            if copied.is_err()
+                && let Some(status) = &preparation_cache_hint
+            {
+                status.emit();
+            }
+            let (pin, receipt) = copied?;
+            // readonly_copy has synced and closed its writer, established a
+            // distinct inode and fully reverified the read-only private pin.
+            // Never advise the source handle, runtime cache or a GPU buffer.
+            if let Some(status) = &mut preparation_cache_hint {
+                status.advise(&pin.file, artifact.bytes);
+            }
             let receipt = NativeSnapshotReceipt {
                 snapshot_relative_path: format!("inputs/{name}"),
                 ..receipt
@@ -784,9 +834,17 @@ pub(crate) mod linux {
             pins.push(pin);
             receipts.push(receipt);
         }
+        crate::emit_native_phase("snapshot_copy_complete");
+        if let Some(status) = &preparation_cache_hint {
+            status.emit();
+        }
         // Additional metadata is read only after all complete private copies
         // exist. A malformed manifest cannot produce a native executable owner.
-        if let Some(manifest) = spec.additional_manifest() {
+        for (is_cohort, manifest) in [
+            (false, spec.additional_manifest()),
+            (true, spec.pilot_cohort()),
+        ] {
+            let Some(manifest) = manifest else { continue };
             let manifest = pin(&pins, manifest)?;
             let mut file = manifest
                 .file
@@ -803,7 +861,11 @@ pub(crate) mod linux {
                     "CUDA bundle manifest exceeds 64KiB".into(),
                 ));
             }
-            spec.validate_additional_manifest(&bytes)?;
+            if is_cohort {
+                spec.validate_pilot_cohort(&bytes)?;
+            } else {
+                spec.validate_additional_manifest(&bytes)?;
+            }
         }
         if let Some(bundle) = &bundle_directory {
             readable_directory_pin(bundle)?
@@ -896,6 +958,7 @@ pub(crate) mod linux {
                 ArenaError::Integrity("native runtime root pin count differs".into())
             })?,
             bundle_directory,
+            preparation_cache_hint,
         })
     }
 
@@ -920,8 +983,8 @@ pub(crate) mod linux {
         if input.runner.source_url != crate::FASTCHESS_SOURCE_URL
             || input.runner.source_commit != crate::FASTCHESS_SOURCE_COMMIT
             || input.runner.version != crate::FASTCHESS_VERSION
-            || input.runner.dirty
-            || input.runner.dirty_patch.is_some()
+            || (matches!(input.clock, rz_experiments::NativePairClock::Movetime(_))
+                && (input.runner.dirty || input.runner.dirty_patch.is_some()))
         {
             return Err(ArenaError::Invalid(
                 "unsupported or dirty native integration Fastchess".into(),
@@ -939,6 +1002,12 @@ pub(crate) mod linux {
                 )
             })?;
         let mut args = Vec::new();
+        // Fastchess and its engine children inherit E's cleared environment.
+        // Resolve C's owned cache in the parent and pass only its explicit root;
+        // do not propagate HOME, loader variables or other ambient settings.
+        let runtime_cache = rz_eval::runtime_pin::RuntimeCache::for_user().map_err(|error| {
+            ArenaError::Io(format!("native runtime cache preparation:{:?}", error.kind))
+        })?;
         for role in input.white_order {
             let engine = spec.engine_view(role)?;
             let binary = pin(pins, engine.artifact(NativeArtifactRole::Binary)?)?;
@@ -952,8 +1021,15 @@ pub(crate) mod linux {
                 } else {
                     "--onnx-cpu"
                 }),
-                OsString::from("--attestation"),
+                OsString::from(if engine.batch_experiment.is_some() {
+                    "--batch-attestation"
+                } else {
+                    "--attestation"
+                }),
             ];
+            if let Some(width) = engine.batch_experiment {
+                tokens.push(format!("--experimental-batch={width}").into());
+            }
             for (flag, kind) in [
                 ("--source-weights=", NativeArtifactRole::SourceWeights),
                 ("--onnx-model=", NativeArtifactRole::Onnx),
@@ -977,12 +1053,17 @@ pub(crate) mod linux {
                 .into(),
             );
             tokens.push(key_path("--output-root=", root)?);
+            tokens.push(key_path("--runtime-cache-root=", runtime_cache.root())?);
             if let Some(bundle) = engine.cuda_bundle {
                 tokens.push(key_path(
                     "--cuda-bundle=",
                     &pin(pins, &bundle.manifest)?.path,
                 )?);
                 tokens.push(format!("--cuda-bundle-sha256={}", bundle.manifest.sha256).into());
+            }
+            if let Some(search) = engine.search {
+                tokens.push(format!("--search-simulations={}", search.simulations).into());
+                tokens.push(format!("--final-selection={}", search.final_selection.cli()).into());
             }
             args.extend([
                 OsString::from("-engine"),
@@ -996,11 +1077,18 @@ pub(crate) mod linux {
         args.extend([
             "-each".into(),
             "proto=uci".into(),
-            format!(
-                "st={}.{:03}",
-                input.clock.movetime_ms / 1000,
-                input.clock.movetime_ms % 1000
-            )
+            match input.clock {
+                rz_experiments::NativePairClock::Movetime(c) => {
+                    format!("st={}.{:03}", c.movetime_ms / 1000, c.movetime_ms % 1000)
+                }
+                rz_experiments::NativePairClock::Game(c) => format!(
+                    "tc={}.{:03}+{}.{:03}",
+                    c.base_ms / 1000,
+                    c.base_ms % 1000,
+                    c.increment_ms / 1000,
+                    c.increment_ms % 1000
+                ),
+            }
             .into(),
             "restart=on".into(),
             "timemargin=0".into(),
@@ -1038,7 +1126,6 @@ pub(crate) mod linux {
             input.timeouts.handshake_ms.to_string().into(),
             "-ucinewgame-ms".into(),
             input.timeouts.drain_ms.to_string().into(),
-            "-strict".into(),
             "-log".into(),
             "file=/proc/self/fd/1".into(),
             "append=true".into(),
@@ -1046,6 +1133,16 @@ pub(crate) mod linux {
             "realtime=true".into(),
             "engine=true".into(),
         ]);
+        // Fastchess strict stops on a time-loss WARN before persisting PGN.
+        // A pilot retains both losses before E stops the next pair. Legacy
+        // integration callers preserve their original strict argument order.
+        if matches!(input.clock, rz_experiments::NativePairClock::Movetime(_)) {
+            let index = args
+                .iter()
+                .position(|arg| arg == "-log")
+                .expect("closed log argument");
+            args.insert(index, "-strict".into());
+        }
         let mut limitations=[
             "NN integration only; execution_ready=false; strength_eligible=false; same weights and search in both roles",
             "private input copies use separate inodes and closed writers; Unix readonly is an ownership convention, not a same-UID sandbox or immutable seal",
@@ -1055,14 +1152,173 @@ pub(crate) mod linux {
             "owned-tree/process snapshots are observed limits, not aggregate RAM or kernel disk quotas; escaped/transient children are outside the process-group guarantee",
             "per-process address-space declaration requires separately recorded inherited enforcement; this library does not install RAM/CPU affinity limits",
             "process cleanup alone is not physical NN drain; matched bounded B startup/final provider records are required separately",
+            "runtime libraries use C's external immutable cache: at most 4 entries/8GiB per cache slot, separate from this attempt's watched artifact budget; cache reuse is not inference-cache provenance",
+            "native engine binaries must accept the explicit runtime-cache-root option; historical binaries/launchers remain reproducible at their original source pins",
         ].map(String::from).to_vec();
         limitations[0] = format!(
             "{} NN integration only; execution_ready=false; strength_eligible=false; same weights and search in both roles",
             spec.provider_name()
         );
+        if matches!(input.clock, rz_experiments::NativePairClock::Game(_)) {
+            let baseline = spec.engine_view(NativeEngineRole::Baseline)?;
+            let candidate = spec.engine_view(NativeEngineRole::Candidate)?;
+            limitations[0] = if candidate.batch_experiment.is_some() {
+                "CUDA S batch pilot only; execution_ready=false; strength_eligible=false; same weights/precision/PUCT/final visits; batch width and scheduling differ"
+            } else if baseline.search==candidate.search {
+                "CUDA B1 A/A whole-clock memory check; execution_ready=false; strength_eligible=false; same weights/runtime/binary/search"
+            } else {
+                "CUDA S0/S1 pilot only; execution_ready=false; strength_eligible=false; same weights/runtime/binary; only final selection differs"
+            }.into();
+            limitations[3] = "Pinned clock patch measures position transmission through bestmove with steady_clock, charges partial milliseconds and earns increment only after a timely move; the 100ms read margin is not chess time".into();
+            limitations[4] = "Fastchess automatic draw claims require independent A current-position evidence; cutoff remains Incomplete, engine failures remain Loss and stop a broken pilot gate".into();
+        }
         if spec.provider_name() == "CUDA" {
-            limitations.push("CUDA device0/FP32/TF32off/1GiB arena is requested admission metadata, not measured VRAM, aggregate GPU allocation or a kernel-enforced hard cap".into());
+            limitations.push("CUDA device0/FP32/TF32off/selected arena is requested admission metadata, not measured VRAM, aggregate GPU allocation or a kernel-enforced hard cap".into());
         }
         Ok(FastchessInvocation { args, limitations })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn snapshot_stream_checks_tail_corruption_growth_and_truncation_across_chunks() {
+            let base = std::env::temp_dir().join(format!(
+                "rovezero-snapshot-stream-boundary-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&base).expect("exclusive synthetic stream fixture");
+            let source = base.join("source");
+            let output = base.join("output");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::create_dir(&output).unwrap();
+            let bytes: Vec<u8> = (0..(2 * 64 * 1024 + 17)).map(|i| (i % 251) as u8).collect();
+            let artifact = ArtifactRef {
+                path: "input".into(),
+                sha256: format!("{:x}", Sha256::digest(&bytes)),
+                bytes: bytes.len() as u64,
+                source: "https://example.org/synthetic-stream-boundary".into(),
+                license: "Synthetic ownership fixture only".into(),
+            };
+            let directory = Dir::open_ambient_dir(&output, cap_std::ambient_authority()).unwrap();
+            for case in ["valid", "tail", "growth", "truncation"] {
+                std::fs::write(source.join("input"), &bytes).unwrap();
+                let verified = artifact.open_verified(&source, artifact.bytes).unwrap();
+                match case {
+                    "tail" => {
+                        let mut changed = bytes.clone();
+                        *changed.last_mut().unwrap() ^= 1;
+                        std::fs::write(source.join("input"), changed).unwrap();
+                    }
+                    "growth" => {
+                        let mut writer = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(source.join("input"))
+                            .unwrap();
+                        writer.write_all(&[1]).unwrap();
+                    }
+                    "truncation" => {
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(source.join("input"))
+                            .unwrap()
+                            .set_len(artifact.bytes - 1)
+                            .unwrap();
+                    }
+                    _ => {}
+                }
+                let copied = readonly_copy(
+                    &artifact,
+                    verified,
+                    &directory,
+                    case,
+                    output.join(case),
+                    false,
+                    artifact.bytes,
+                );
+                if case == "valid" {
+                    let (mut pin, receipt) = copied.unwrap();
+                    assert!(receipt.distinct_source_inode && receipt.closed_writer_read_only);
+                    assert_eq!(std::fs::read(&pin.path).unwrap(), bytes);
+                    assert_eq!(pin.file.stream_position().unwrap(), 0);
+                    verify_copy(&mut pin.file, &artifact).unwrap();
+                    assert_eq!(pin.file.stream_position().unwrap(), 0);
+                    std::fs::set_permissions(&pin.path, Permissions::from_mode(0o600)).unwrap();
+                    let mut changed = bytes.clone();
+                    *changed.last_mut().unwrap() ^= 1;
+                    std::fs::write(&pin.path, changed).unwrap();
+                    assert!(matches!(
+                        verify_copy(&mut pin.file, &artifact),
+                        Err(ArenaError::Integrity(_))
+                    ));
+                } else {
+                    assert!(matches!(copied, Err(ArenaError::Integrity(_))));
+                    assert!(
+                        output.join(case).exists(),
+                        "failed partial copy must remain"
+                    );
+                }
+            }
+            drop(directory);
+            // This exclusive synthetic tree never owned native children/NN.
+            std::fs::remove_dir_all(base).unwrap();
+        }
+
+        #[test]
+        fn verified_source_pin_survives_path_replacement_and_rejects_same_inode_writes() {
+            let base = std::env::temp_dir()
+                .join(format!("rovezero-verified-copy-pin-{}", std::process::id()));
+            std::fs::create_dir(&base).expect("exclusive synthetic test directory");
+            let source = base.join("source");
+            let output = base.join("output");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::create_dir(&output).unwrap();
+            std::fs::write(source.join("input"), b"original").unwrap();
+            std::fs::hard_link(source.join("input"), source.join("alias")).unwrap();
+            let artifact = ArtifactRef {
+                path: "input".into(),
+                sha256: format!("{:x}", Sha256::digest(b"original")),
+                bytes: 8,
+                source: "https://example.org/synthetic-copy-pin".into(),
+                license: "Synthetic ownership fixture only".into(),
+            };
+            let original = artifact.open_verified(&source, 8).unwrap();
+            let mutation_probe = artifact.open_verified(&source, 8).unwrap();
+            std::fs::rename(source.join("input"), source.join("renamed")).unwrap();
+            std::fs::write(source.join("input"), b"replaced").unwrap();
+            let directory = Dir::open_ambient_dir(&output, cap_std::ambient_authority()).unwrap();
+            let (pin, receipt) = readonly_copy(
+                &artifact,
+                original,
+                &directory,
+                "valid",
+                output.join("valid"),
+                false,
+                8,
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(&pin.path).unwrap(), b"original");
+            assert!(receipt.distinct_source_inode && receipt.closed_writer_read_only);
+            drop(pin);
+
+            // Identical length through another name of the pinned inode must
+            // still fail the copy-stream digest, without publishing an InputPin.
+            std::fs::write(source.join("alias"), b"mutated!").unwrap();
+            let result = readonly_copy(
+                &artifact,
+                mutation_probe,
+                &directory,
+                "rejected",
+                output.join("rejected"),
+                false,
+                8,
+            );
+            assert!(matches!(result, Err(ArenaError::Integrity(_))));
+            assert_eq!(std::fs::read(output.join("valid")).unwrap(), b"original");
+            drop(directory);
+            // This exclusive synthetic tree never owned a child or NN runtime.
+            std::fs::remove_dir_all(base).unwrap();
+        }
     }
 }

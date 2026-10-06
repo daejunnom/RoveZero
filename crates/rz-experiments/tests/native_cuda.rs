@@ -61,6 +61,7 @@ fn fixture() -> CudaIntegrationPairSpecV1 {
     candidate.role = NativeEngineRole::Candidate;
     candidate.engine_id = "cuda-candidate".into();
     CudaIntegrationPairSpecV1 {
+        pilot: None,
         schema_version: 1,
         purpose: NativeCudaIntegrationPurpose::CudaNnIntegration,
         strength_eligible: false,
@@ -638,4 +639,321 @@ fn full_export_envelope_must_fit_even_if_embedded_input_and_canonical_payload_fi
     assert!(raw.len() + envelope_overhead > MAX_CUDA_NATIVE_LAUNCH_JSON_BYTES);
     assert!(near_cap.validate().is_ok());
     code(near_cap.lock().unwrap_err(), "NativePayloadLimit");
+}
+
+fn bt4_fixture() -> CudaIntegrationPairSpecV2 {
+    let mut value = serde_json::to_value(fixture()).unwrap();
+    value["schema_version"] = json!(2);
+    for engine in value["engines"].as_array_mut().unwrap() {
+        let profile = NativeCudaProfileV2::fixed("c".repeat(64), "d".repeat(64));
+        engine["profile"] = serde_json::to_value(profile).unwrap();
+        for binding in engine["artifacts"].as_array_mut().unwrap() {
+            match binding["role"].as_str().unwrap() {
+                "source_weights" => {
+                    binding["artifact"]["sha256"] = json!(BT4_NATIVE_SOURCE_SHA256);
+                    binding["artifact"]["bytes"] = json!(BT4_NATIVE_SOURCE_BYTES);
+                }
+                "onnx" => binding["artifact"]["bytes"] = json!(741_000_000_u64),
+                _ => (),
+            }
+        }
+    }
+    value["budget"]["max_input_bytes"] = json!(2 * 1024 * 1024 * 1024_u64);
+    value["budget"]["max_runtime_bytes"] = json!(19 * 1024 * 1024_u64);
+    value["budget"]["max_artifact_bytes"] = json!(3 * 1024 * 1024 * 1024_u64);
+    CudaIntegrationPairSpecV2::from_json(&value.to_string()).unwrap()
+}
+
+#[test]
+fn bt4_v2_has_separate_closed_wire_and_lock_domains() {
+    let spec = bt4_fixture();
+    let lock = spec.clone().lock().unwrap();
+    let wire = lock.to_json().unwrap();
+    assert_eq!(
+        LockedCudaIntegrationPairSpecV2::from_json(&wire)
+            .unwrap()
+            .sha256(),
+        lock.sha256()
+    );
+    assert!(LockedCudaIntegrationPairSpecV1::from_json(&wire).is_err());
+    assert!(CudaIntegrationPairSpecV1::from_json(&serde_json::to_string(&spec).unwrap()).is_err());
+    assert!(
+        LockedCudaIntegrationPairSpecV2::from_json(&fixture().lock().unwrap().to_json().unwrap())
+            .is_err()
+    );
+    let mut envelope: Value = serde_json::from_str(&wire).unwrap();
+    assert_eq!(envelope["domain"], CUDA_NATIVE_LAUNCH_V2_DOMAIN);
+    assert_eq!(envelope["execution_ready"], false);
+    envelope["input"]["engines"][0]["profile"]["search"]["simulations"] = json!(128);
+    envelope["input"]["engines"][1]["profile"]["search"]["simulations"] = json!(128);
+    code(
+        LockedCudaIntegrationPairSpecV2::from_json(&envelope.to_string()).unwrap_err(),
+        "NativeLockDigestMismatch",
+    );
+}
+
+#[test]
+fn bt4_identity_and_bounds_do_not_relax_maia_v1() {
+    assert_eq!(NativeArtifactRole::Onnx.byte_limit(), 16 * 1024 * 1024);
+    assert_eq!(
+        NativeArtifactRole::SourceWeights.byte_limit(),
+        4 * 1024 * 1024
+    );
+    let mut engine = bt4_fixture().engines[0].clone();
+    let source = engine
+        .artifacts
+        .iter_mut()
+        .find(|a| a.role == NativeArtifactRole::SourceWeights)
+        .unwrap();
+    source.artifact.sha256 = "a".repeat(64);
+    code(
+        engine.validate().unwrap_err(),
+        "NativeModelIdentityMismatch",
+    );
+    let mut engine = bt4_fixture().engines[0].clone();
+    let onnx = engine
+        .artifacts
+        .iter_mut()
+        .find(|a| a.role == NativeArtifactRole::Onnx)
+        .unwrap();
+    onnx.artifact.bytes = BT4_NATIVE_ONNX_LIMIT;
+    assert!(engine.validate().is_ok());
+    engine
+        .artifacts
+        .iter_mut()
+        .find(|a| a.role == NativeArtifactRole::Onnx)
+        .unwrap()
+        .artifact
+        .bytes += 1;
+    code(engine.validate().unwrap_err(), "ArtifactRoleBudget");
+}
+
+#[test]
+fn bt4_v2_search_runtime_and_a_a_identity_are_locked() {
+    for (pointer, value, expected) in [
+        (
+            "/engines/0/profile/runtime/arena_bytes",
+            json!(CUDA_NATIVE_ARENA_BYTES),
+            "UnsupportedNativeProfile",
+        ),
+        (
+            "/engines/0/profile/runtime/batch_size",
+            json!(16),
+            "UnsupportedNativeProfile",
+        ),
+        (
+            "/engines/0/profile/search/simulations",
+            json!(4097),
+            "UnsupportedNativeSearch",
+        ),
+        (
+            "/engines/0/profile/search/simulations",
+            json!(0),
+            "UnsupportedNativeSearch",
+        ),
+        (
+            "/engines/0/profile/search/policy_temperature_milli",
+            json!(800),
+            "UnsupportedNativeSearch",
+        ),
+        (
+            "/engines/0/profile/search/raw_cache",
+            json!(true),
+            "UnsupportedNativeSearch",
+        ),
+        (
+            "/engines/0/profile/search/final_selection",
+            json!("exact_terminal"),
+            "IntegrationInputMismatch",
+        ),
+    ] {
+        let mut spec = serde_json::to_value(bt4_fixture()).unwrap();
+        *spec.pointer_mut(pointer).unwrap() = value;
+        code(
+            CudaIntegrationPairSpecV2::from_json(&spec.to_string()).unwrap_err(),
+            expected,
+        );
+    }
+    let mut spec = bt4_fixture();
+    for engine in &mut spec.engines {
+        engine.profile.search.final_selection = NativeFinalSelectionV2::ExactTerminal;
+    }
+    assert!(spec.lock().is_ok());
+}
+
+#[test]
+fn bt4_shared_storage_reservation_covers_four_three_file_receipt_sets() {
+    let mut spec = bt4_fixture();
+    assert_eq!(spec.budget.max_runtime_bytes, 19 * 1024 * 1024);
+    assert!(spec.clone().lock().is_ok());
+    spec.budget.max_runtime_bytes -= 1;
+    code(spec.validate().unwrap_err(), "CudaRuntimeReservation");
+    let mut value = serde_json::to_value(bt4_fixture()).unwrap();
+    value["engines"][0]["profile"]["arbitrary_option"] = json!(true);
+    assert!(matches!(
+        CudaIntegrationPairSpecV2::from_json(&value.to_string()),
+        Err(ManifestError::Parse(_))
+    ));
+}
+
+fn pilot_fixture() -> CudaSearchPilotPairSpecV3 {
+    let mut value = serde_json::to_value(bt4_fixture()).unwrap();
+    value["schema_version"] = json!(3);
+    value["purpose"] = json!("cuda_search_pilot");
+    value["clock"] = json!({"base_ms":30000,"increment_ms":100});
+    value["max_plies"] = json!(256);
+    value["white_order"] = json!(["baseline", "candidate"]);
+    value["timeouts"]["runtime_ms"] = json!(600000);
+    value["engines"][1]["profile"]["search"]["final_selection"] = json!("exact_terminal");
+    let mut patch = artifact("runner/clock.patch", FASTCHESS_CLOCK_PATCH_BYTES);
+    patch.sha256 = FASTCHESS_CLOCK_PATCH_SHA256.into();
+    value["runner"]["source_url"] = json!("https://github.com/Disservin/fastchess");
+    value["runner"]["binary"]["source"] = value["runner"]["source_url"].clone();
+    value["runner"]["source_commit"] = json!("f618e34540f94f4719ad3817950618dabe441318");
+    value["runner"]["dirty"] = json!(true);
+    value["runner"]["dirty_patch"] = serde_json::to_value(patch).unwrap();
+    value["pilot"] = serde_json::to_value(NativeSearchPilotProtocolV3 {
+        pair_ordinal: 0,
+        total_pairs: 16,
+        opening_cohort: artifact("inputs/cohort.json", 1024),
+        total_wall_ms: 7_200_000,
+        statistics: NativePilotStatistics::FixedPairedHoeffding95,
+        claim_policy: ClaimPolicy::AutomaticAcceptance,
+        engine_failure: OutcomePolicy::Loss,
+        cutoff: OutcomePolicy::Incomplete,
+    })
+    .unwrap();
+    CudaSearchPilotPairSpecV3::from_json(&value.to_string()).unwrap()
+}
+
+#[test]
+fn pilot_v3_is_separate_from_both_historical_integration_domains() {
+    let lock = pilot_fixture().lock().unwrap();
+    let wire = lock.to_json().unwrap();
+    assert_eq!(
+        LockedCudaSearchPilotPairSpecV3::from_json(&wire)
+            .unwrap()
+            .sha256(),
+        lock.sha256()
+    );
+    assert!(LockedCudaIntegrationPairSpecV2::from_json(&wire).is_err());
+    assert!(LockedCudaIntegrationPairSpecV1::from_json(&wire).is_err());
+    assert!(
+        LockedCudaSearchPilotPairSpecV3::from_json(
+            &bt4_fixture().lock().unwrap().to_json().unwrap()
+        )
+        .is_err()
+    );
+    let mut envelope: Value = serde_json::from_str(&wire).unwrap();
+    assert_eq!(envelope["domain"], CUDA_SEARCH_PILOT_V3_DOMAIN);
+    assert_eq!(envelope["execution_ready"], false);
+    envelope["input"]["pilot"]["pair_ordinal"] = json!(2);
+    code(
+        LockedCudaSearchPilotPairSpecV3::from_json(&envelope.to_string()).unwrap_err(),
+        "NativeLockDigestMismatch",
+    );
+    let mut legacy = serde_json::to_value(bt4_fixture()).unwrap();
+    legacy["purpose"] = json!("cuda_search_pilot");
+    assert!(CudaIntegrationPairSpecV2::from_json(&legacy.to_string()).is_err());
+}
+
+#[test]
+fn pilot_allows_only_the_predeclared_final_selection_delta() {
+    let mut value = serde_json::to_value(pilot_fixture()).unwrap();
+    let original = value.clone();
+    for (path, replacement) in [
+        (
+            "/engines/0/profile/search/final_selection",
+            json!("exact_terminal"),
+        ),
+        ("/engines/1/profile/search/final_selection", json!("visits")),
+        ("/engines/0/profile/search/simulations", json!(128)),
+        (
+            "/engines/1/profile/runtime/expected_encoding_sha256",
+            json!("e".repeat(64)),
+        ),
+        (
+            "/engines/1/artifacts/0/artifact/license",
+            json!("Changed provenance"),
+        ),
+    ] {
+        value = original.clone();
+        *value.pointer_mut(path).unwrap() = replacement;
+        assert!(
+            CudaSearchPilotPairSpecV3::from_json(&value.to_string()).is_err(),
+            "{path}"
+        );
+    }
+    let spec = pilot_fixture();
+    assert!(!spec.engines[0].same_inputs_as(&spec.engines[1]).unwrap());
+    assert!(
+        spec.engines[0]
+            .same_pinned_inputs_as(&spec.engines[1])
+            .unwrap()
+    );
+}
+
+#[test]
+fn pilot_clock_failure_sample_and_runner_policy_are_locked() {
+    let original = serde_json::to_value(pilot_fixture()).unwrap();
+    for (path, value) in [
+        ("/clock/base_ms", json!(0)),
+        ("/clock/increment_ms", json!(0)),
+        ("/pilot/total_pairs", json!(8)),
+        ("/pilot/pair_ordinal", json!(16)),
+        ("/pilot/total_wall_ms", json!(7_200_001)),
+        ("/max_plies", json!(258)),
+        ("/pilot/claim_policy", json!("explicit_claim")),
+        ("/pilot/engine_failure", json!("incomplete")),
+        ("/pilot/cutoff", json!("draw")),
+        ("/runner/dirty", json!(false)),
+        ("/runner/dirty_patch/sha256", json!("a".repeat(64))),
+        (
+            "/runner/dirty_patch/bytes",
+            json!(FASTCHESS_CLOCK_PATCH_BYTES + 1),
+        ),
+        ("/strength_eligible", json!(true)),
+    ] {
+        let mut altered = original.clone();
+        *altered.pointer_mut(path).unwrap() = value;
+        assert!(
+            CudaSearchPilotPairSpecV3::from_json(&altered.to_string()).is_err(),
+            "{path}"
+        );
+    }
+    let mut missing = original.clone();
+    missing.as_object_mut().unwrap().remove("pilot");
+    assert!(CudaSearchPilotPairSpecV3::from_json(&missing.to_string()).is_err());
+    let mut extra = original.clone();
+    extra["clock"]["timeout_grace_ms"] = json!(100);
+    assert!(CudaSearchPilotPairSpecV3::from_json(&extra.to_string()).is_err());
+    let patch = include_bytes!("../../../experiments/baselines/fastchess-clock-v1.patch");
+    use sha2::{Digest, Sha256};
+    assert_eq!(patch.len() as u64, FASTCHESS_CLOCK_PATCH_BYTES);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(patch)),
+        FASTCHESS_CLOCK_PATCH_SHA256
+    );
+}
+
+#[test]
+fn pilot_ccrl_blitz_clock_is_explicitly_locked_with_sufficient_pair_wall() {
+    let mut spec = pilot_fixture();
+    spec.clock = NativeGameClockV3 {
+        base_ms: 120_000,
+        increment_ms: 1_000,
+    };
+    assert_eq!(spec.clock.pgn_time_control(), "120+1");
+    assert!(spec.clone().lock().is_err());
+    spec.timeouts.runtime_ms = 1_500_000;
+    let locked = spec.clone().lock().unwrap();
+    assert_eq!(
+        LockedCudaSearchPilotPairSpecV3::from_json(&locked.to_json().unwrap())
+            .unwrap()
+            .sha256(),
+        locked.sha256()
+    );
+    spec.clock.increment_ms = 100;
+    assert!(spec.lock().is_ok());
+    assert_eq!(pilot_fixture().clock.pgn_time_control(), "30+0.1");
 }

@@ -36,6 +36,23 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
     fn receipt_filename(&self) -> &'static str;
     fn startup_filename(&self) -> &'static str;
     fn termination_filename(&self) -> &'static str;
+    fn claim_policy(&self) -> rz_experiments::ClaimPolicy {
+        rz_experiments::ClaimPolicy::ExplicitClaim
+    }
+    fn validate_clock_trace(
+        &self,
+        _stdout: &[u8],
+        _pgn: &PairPgnAudit,
+    ) -> Result<Option<crate::NativePilotClockAudit>, ArenaError> {
+        Ok(None)
+    }
+    fn audit_failure_trace(
+        &self,
+        _stdout: &[u8],
+        _pair: &crate::PairSpec,
+    ) -> Result<Option<crate::NativePilotFailureAudit>, ArenaError> {
+        Ok(None)
+    }
     #[cfg(target_os = "linux")]
     fn validate_records(
         &self,
@@ -112,6 +129,7 @@ pub struct NativePairReceipt<A = NativeProviderSessionAudit> {
     pub runner_binary_sha256: String,
     pub process: ProcessReceipt,
     pub snapshots: Vec<NativeSnapshotReceipt>,
+    pub snapshot_cache_hints: Vec<SnapshotCacheHint>,
     pub artifacts: Vec<rz_experiments::ArtifactRef>,
     pub provider_sessions: Vec<A>,
     pub provider_audit_error: Option<String>,
@@ -121,10 +139,71 @@ pub struct NativePairReceipt<A = NativeProviderSessionAudit> {
     /// Integration-only runs grant no scoring authority, including valid draws.
     pub scored_games: u32,
     pub incomplete_games: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock_audit: Option<crate::NativePilotClockAudit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock_audit_error: Option<String>,
+    /// Failure accounting only; this never grants provider, clock or score acceptance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_audit: Option<crate::NativePilotFailureAudit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_audit_error: Option<String>,
     pub primary_error: Option<String>,
     pub cleanup_verified: bool,
     pub unresolved_owner_retained: bool,
     pub limitations: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SnapshotCacheHint {
+    pub phase: String,
+    pub game: Option<u8>,
+    pub eligible_files: usize,
+    pub advised_files: usize,
+    pub errors: Vec<String>,
+    pub scope: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+impl SnapshotCacheHint {
+    pub(crate) fn new(phase: &str, game: Option<u8>) -> Self {
+        Self {
+            phase: phase.into(),
+            game,
+            eligible_files: 0,
+            advised_files: 0,
+            errors: Vec::new(),
+            scope: "private_verified_readonly_snapshot_fds_best_effort_not_reclamation_proof",
+        }
+    }
+
+    // Post-run callers supply eligibility only after owned cleanup. An
+    // unresolved child retains all pins and receives no new rolling advice.
+    pub(crate) fn rolling(eligible: bool, phase: &str) -> Option<Self> {
+        (cfg!(feature = "experimental-snapshot-reclaim") && eligible)
+            .then(|| Self::new(phase, None))
+    }
+
+    pub(crate) fn advise(&mut self, file: &std::fs::File, bytes: u64) {
+        if bytes >= 8 * 1024 * 1024 {
+            self.record_advice(linux::advise_input_cache(file));
+        }
+    }
+
+    fn record_advice(&mut self, result: Result<(), ArenaError>) {
+        self.eligible_files += 1;
+        match result {
+            Ok(()) => self.advised_files += 1,
+            Err(error) => self.errors.push(error.to_string()),
+        }
+    }
+
+    pub(crate) fn emit(&self) {
+        // Small status survives with tracing disabled; failure never cancels play.
+        if let Ok(json) = serde_json::to_string(self) {
+            eprintln!("native_cache_hint={json}");
+        }
+    }
 }
 
 struct NativeRunBundle<S: NativeProviderDeclaration> {
@@ -360,10 +439,11 @@ pub(crate) mod linux {
     };
     use crate::{
         GameSpec, PairSpec, PgnLimits, PgnOutcomePolicy, ProcessStop, audit_pair_pgn_for_spec,
-        canonical_sha256, supervise_in_directory_with_tree,
+        canonical_sha256,
     };
     use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
     use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
+    use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
     use rz_experiments::{
         ArtifactRef, CpuNativeLaunchSpecV1, NativeArtifactRole, NativeEngineRole, OutcomePolicy,
     };
@@ -430,7 +510,7 @@ pub(crate) mod linux {
             })?;
         Ok(artifact(owner, name, bytes))
     }
-    fn read_file(directory: &Dir, name: &str, cap: u64) -> Result<Vec<u8>, ArenaError> {
+    pub(crate) fn read_file(directory: &Dir, name: &str, cap: u64) -> Result<Vec<u8>, ArenaError> {
         let mut options = OpenOptions::new();
         options
             .read(true)
@@ -478,6 +558,7 @@ pub(crate) mod linux {
     }
     fn verify_inputs<S: NativeLaunchDeclaration>(
         owner: &mut NativeLaunchOwner<S>,
+        mut cache_hint: Option<&mut SnapshotCacheHint>,
     ) -> Result<(), ArenaError> {
         for item in &mut owner.snapshot.pins {
             verify_copy(&mut item.file, &item.artifact)?;
@@ -544,8 +625,99 @@ pub(crate) mod linux {
                     "native input pathname no longer names its owned inode",
                 ));
             }
+            // The held bytes and named inode have both passed their checks.
+            // Callers exclude unresolved post-run owners from this advice.
+            if let Some(status) = cache_hint.as_mut() {
+                status.advise(&item.file, item.artifact.bytes);
+            }
         }
         Ok(())
+    }
+    // Only the launch owner's synced, verified private snapshots are eligible.
+    // This is a best-effort kernel cache hint, not deletion, memory reclamation
+    // evidence or permission to touch the source/C runtime cache/GPU buffers.
+    pub(super) fn advise_input_cache(file: &File) -> Result<(), ArenaError> {
+        posix_fadvise(file, 0, 0, PosixFadviseAdvice::POSIX_FADV_DONTNEED)
+            .map_err(|error| ArenaError::Io(format!("native snapshot cache hint failed: {error}")))
+    }
+
+    // The caller has just verified these closed-writer private pins. Never
+    // apply this hint to an original asset, the shared runtime or GPU memory.
+    fn advise_verified_input_cache<S: NativeLaunchDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+        phase: &str,
+        game: Option<u8>,
+    ) -> SnapshotCacheHint {
+        let mut status = SnapshotCacheHint::new(phase, game);
+        if owner.spec.advise_drop_input_cache() {
+            for item in &owner.snapshot.pins {
+                status.advise(&item.file, item.artifact.bytes);
+            }
+        }
+        status.emit();
+        status
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn snapshot_cache_hint_preserves_readonly_pin_bytes_inode_and_cursor() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+
+        let path =
+            std::env::temp_dir().join(format!("rovezero-native-cache-hint-{}", std::process::id()));
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let bytes = vec![0x5a; 8 * 1024 * 1024 + 17];
+        writer.write_all(&bytes).unwrap();
+        writer.sync_all().unwrap();
+        writer
+            .set_permissions(std::fs::Permissions::from_mode(0o400))
+            .unwrap();
+        drop(writer);
+        let mut pin = File::open(&path).unwrap();
+        pin.seek(SeekFrom::Start(19)).unwrap();
+        let before = pin.metadata().unwrap();
+        let mut hint = SnapshotCacheHint::new("synthetic_verified_pin", None);
+        hint.advise(&pin, 8 * 1024 * 1024 - 1);
+        assert_eq!(hint.eligible_files, 0);
+        hint.advise(&pin, before.len());
+        assert_eq!((hint.eligible_files, hint.advised_files), (1, 1));
+        assert!(hint.errors.is_empty());
+        assert_eq!(pin.stream_position().unwrap(), 19);
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        assert_eq!(before.len(), after.len());
+        assert_eq!(after.permissions().mode() & 0o777, 0o400);
+        let mut observed = vec![0; bytes.len()];
+        pin.read_exact_at(&mut observed, 0).unwrap();
+        assert_eq!(observed, bytes);
+        drop(pin);
+        std::fs::remove_file(path).unwrap();
+        // Cache residency is deliberately not asserted: advice is not a seal.
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn failed_cache_advice_is_recorded_and_unresolved_owner_is_ineligible() {
+        let mut hint = SnapshotCacheHint::new("synthetic_failure", None);
+        hint.record_advice(Err(ArenaError::Io("injected fadvise failure".into())));
+        hint.record_advice(Ok(()));
+        assert_eq!((hint.eligible_files, hint.advised_files), (2, 1));
+        assert_eq!(hint.errors.len(), 1);
+        assert!(hint.errors[0].contains("injected fadvise failure"));
+        let encoded = serde_json::to_string(&hint).unwrap();
+        assert!(encoded.contains("injected fadvise failure"));
+        // The cleanup gate is false while a child/group is unresolved, even
+        // in an experimental build. Advice does not release that owner's pins.
+        assert!(SnapshotCacheHint::rolling(false, "postcheck_each_verified").is_none());
+        assert_eq!(
+            SnapshotCacheHint::rolling(true, "prelaunch_each_verified").is_some(),
+            cfg!(feature = "experimental-snapshot-reclaim")
+        );
     }
     fn pair<S: NativeLaunchDeclaration>(
         owner: &NativeLaunchOwner<S>,
@@ -576,16 +748,47 @@ pub(crate) mod linux {
         cancel: Option<&AtomicBool>,
     ) -> Result<(NativePairReceipt<S::Audit>, ArtifactRef), ArenaError> {
         let owner = bundle.owner.as_mut().expect("prepared native owner");
-        verify_inputs(owner)?;
+        crate::emit_native_phase("prelaunch_verification_started");
+        let mut rolling = SnapshotCacheHint::rolling(
+            owner.spec.advise_drop_input_cache(),
+            "prelaunch_each_verified",
+        );
+        let checked = verify_inputs(owner, rolling.as_mut());
+        if let Some(status) = &rolling {
+            status.emit();
+        }
+        checked?;
+        let mut cache_hints: Vec<_> = owner
+            .snapshot
+            .preparation_cache_hint
+            .clone()
+            .into_iter()
+            .collect();
+        cache_hints.extend(rolling);
+        cache_hints.push(advise_verified_input_cache(owner, "before_launch", None));
+        crate::emit_native_phase("prelaunch_verification_complete");
         let s = &owner.snapshot;
-        let process = supervise_in_directory_with_tree(
+        let mut ready = crate::native_diagnostics::LogProbe::default();
+        let mut on_stdout = |bytes: &[u8]| {
+            for game in ready.ready_games(bytes) {
+                cache_hints.push(advise_verified_input_cache(
+                    owner,
+                    "both_engines_ready",
+                    Some(game),
+                ));
+            }
+        };
+        let process = crate::process::supervise_tree_observed(
             &s.pins[s.runner_index].file,
             &s.invocation.args,
             &s.cwd,
             s.limits,
             cancel,
             &s.watch,
+            Some(&mut on_stdout),
         )?;
+        crate::native_diagnostics::finish_logs();
+        crate::emit_native_phase("runner_supervision_finished");
         bundle.process = Some(process);
         let owner = bundle
             .owner
@@ -612,6 +815,7 @@ pub(crate) mod linux {
             runner_binary_sha256: owner.spec.view().runner.binary.sha256.clone(),
             process: process.receipt.clone(),
             snapshots: owner.snapshot.receipts.clone(),
+            snapshot_cache_hints: cache_hints,
             artifacts: Vec::new(),
             provider_sessions: Vec::new(),
             provider_audit_error: None,
@@ -619,6 +823,10 @@ pub(crate) mod linux {
             pgn_audit_error: None,
             integration_checks_passed: false,
             scored_games: 0,
+            clock_audit: None,
+            clock_audit_error: None,
+            failure_audit: None,
+            failure_audit_error: None,
             incomplete_games: if process.receipt.stop == ProcessStop::Cancelled {
                 2
             } else {
@@ -645,6 +853,7 @@ pub(crate) mod linux {
             &process.stderr,
             owner.snapshot.limits.max_output_bytes,
         )?);
+        crate::emit_native_phase("runner_logs_saved");
         let pgn_cap = owner
             .spec
             .view()
@@ -697,7 +906,7 @@ pub(crate) mod linux {
                         PgnOutcomePolicy {
                             engine_failure: OutcomePolicy::Loss,
                             max_plies_outcome: OutcomePolicy::Incomplete,
-                            claim_policy: rz_experiments::ClaimPolicy::ExplicitClaim,
+                            claim_policy: owner.spec.claim_policy(),
                             max_game_plies: owner.spec.view().max_plies,
                         },
                     )
@@ -724,18 +933,75 @@ pub(crate) mod linux {
                 Some("not audited: process completion/cleanup gate failed".into());
             receipt.provider_audit_error =
                 Some("not audited: partial provider evidence is not accepted".into());
+            match owner
+                .spec
+                .audit_failure_trace(&process.stdout, &pair(owner)?)
+            {
+                Ok(audit) => receipt.failure_audit = audit,
+                Err(error) => receipt.failure_audit_error = Some(error.to_string()),
+            }
         }
         bundle.receipt = Some(receipt.clone());
-        verify_inputs(
+        crate::emit_native_phase("postlaunch_verification_started");
+        let mut rolling = SnapshotCacheHint::rolling(
+            receipt.cleanup_verified && owner.spec.advise_drop_input_cache(),
+            "postcheck_each_verified",
+        );
+        let checked = verify_inputs(
             bundle
                 .owner
                 .as_mut()
                 .expect("native owner retained through postcheck"),
-        )?;
+            rolling.as_mut(),
+        );
+        if let Some(status) = &rolling {
+            status.emit();
+        }
+        receipt.snapshot_cache_hints.extend(rolling);
+        bundle.receipt = Some(receipt.clone());
+        checked?;
+        crate::emit_native_phase("postlaunch_verification_complete");
+        let owner = bundle
+            .owner
+            .as_ref()
+            .expect("native owner retained through postcheck cache hint");
+        if receipt.cleanup_verified && owner.spec.advise_drop_input_cache() {
+            // Child reads and the final hash audit repopulate these pages.
+            // Advise again only after owned cleanup and byte/identity recheck.
+            receipt
+                .snapshot_cache_hints
+                .push(advise_verified_input_cache(owner, "after_postcheck", None));
+            receipt.limitations.push(
+                "private snapshot cache advice status recorded before launch, per-game both-ready and after owned cleanup/postcheck; kernel reclamation is not guaranteed".into(),
+            );
+        }
         receipt.integration_checks_passed = completed
             && receipt.pgn_audit.is_some()
             && receipt.provider_audit_error.is_none()
             && receipt.provider_sessions.len() == 4;
+        let owner = bundle.owner.as_ref().expect("postchecked native owner");
+        if let Some(audit) = &receipt.pgn_audit {
+            match owner.spec.validate_clock_trace(&process.stdout, audit) {
+                Ok(clock) => receipt.clock_audit = clock,
+                Err(e) => {
+                    receipt.clock_audit_error = Some(e.to_string());
+                    receipt.integration_checks_passed = false;
+                }
+            }
+        }
+        if receipt.integration_checks_passed && receipt.clock_audit.is_some() {
+            receipt.scored_games = receipt.pgn_audit.as_ref().map_or(0, |p| {
+                p.games
+                    .iter()
+                    .filter(|g| {
+                        matches!(
+                            g.classification.as_str(),
+                            "rules_terminal" | "accepted_claim" | "engine_loss"
+                        )
+                    })
+                    .count() as u32
+            });
+        }
         if completed && !receipt.integration_checks_passed {
             receipt.primary_error =
                 Some("native pair evidence audit rejected an integration gate".into());
@@ -755,6 +1021,23 @@ pub(crate) mod linux {
             NATIVE_PAIR_METADATA_CAP,
         )?;
         bundle.receipt_artifact = Some(artifact.clone());
+        crate::emit_native_phase("receipt_saved");
+        // Keep receipts/PGN first. Process exit alone grants no NN-drain claim.
+        // Each accepted provider session includes its matched physical drain.
+        if crate::native_retention::eligible(
+            receipt.cleanup_verified,
+            receipt.provider_audit_error.is_none(),
+            receipt.provider_sessions.len(),
+        ) {
+            crate::native_retention::retire(
+                &mut bundle
+                    .owner
+                    .as_mut()
+                    .expect("saved receipt retains owner")
+                    .snapshot,
+            )?;
+            crate::emit_native_phase("private_input_retirement_complete");
+        }
         if !receipt.integration_checks_passed {
             return Err(invalid(
                 "native pair failed process, provider or Rules integration acceptance",
@@ -769,8 +1052,11 @@ pub(crate) mod linux {
         Ok(rz_experiments::decode_json::<Value>(text)?)
     }
     pub(crate) fn field<'a>(v: &'a Value, key: &str) -> Result<&'a Value, ArenaError> {
-        v.get(key)
-            .ok_or_else(|| invalid("provider receipt is missing a required field"))
+        v.get(key).ok_or_else(|| {
+            invalid(&format!(
+                "provider receipt is missing a required field: {key}"
+            ))
+        })
     }
     pub(crate) fn number(v: &Value, key: &str) -> Result<u64, ArenaError> {
         field(v, key)?
@@ -1323,6 +1609,56 @@ pub(crate) mod linux {
         }
         Ok(())
     }
+    fn verify_conversion_provenance(
+        startup: &Value,
+        manifest: &Value,
+        batch_experiment: bool,
+    ) -> Result<(), ArenaError> {
+        // The validated launch declaration selects the wire. V4 wraps both B1
+        // and B4 provider profiles; legacy CPU/CUDA records remain unwrapped.
+        let provider = if batch_experiment {
+            field(startup, "provider")?
+        } else {
+            startup
+        };
+        let profile = field(provider, "profile")?;
+        for (observed, declared) in [
+            ("source_weights_protobuf_sha256", "source_protobuf_sha256"),
+            ("converter_commit", "converter_commit"),
+            ("converter_binary_sha256", "converter_binary_sha256"),
+        ] {
+            equals(profile, observed, text(manifest, declared)?)?;
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    #[test]
+    fn export_provenance_uses_declared_batch_envelope_and_rejects_mismatch() {
+        let manifest = serde_json::json!({
+            "source_protobuf_sha256": "a".repeat(64),
+            "converter_commit": "b".repeat(40),
+            "converter_binary_sha256": "c".repeat(64)
+        });
+        let provider = serde_json::json!({"profile": {
+            "source_weights_protobuf_sha256": manifest["source_protobuf_sha256"],
+            "converter_commit": manifest["converter_commit"],
+            "converter_binary_sha256": manifest["converter_binary_sha256"]
+        }});
+        assert!(verify_conversion_provenance(&provider, &manifest, false).is_ok());
+        let wrapped = serde_json::json!({"provider": provider});
+        assert!(verify_conversion_provenance(&wrapped, &manifest, true).is_ok());
+        assert!(verify_conversion_provenance(&wrapped, &manifest, false).is_err());
+        assert!(verify_conversion_provenance(&provider, &manifest, true).is_err());
+        for field in [
+            "source_weights_protobuf_sha256",
+            "converter_commit",
+            "converter_binary_sha256",
+        ] {
+            let mut wrong = wrapped.clone();
+            wrong["provider"]["profile"][field] = serde_json::json!("0");
+            assert!(verify_conversion_provenance(&wrong, &manifest, true).is_err());
+        }
+    }
     fn audit_providers<S: NativeProviderDeclaration>(
         owner: &NativeLaunchOwner<S>,
         stdout: &[u8],
@@ -1427,14 +1763,11 @@ pub(crate) mod linux {
                         .map_err(|_| invalid("cannot clone export pin"))?,
                     64 * 1024,
                 )?)?;
-                let p = field(&startup, "profile")?;
-                for (observed, declared) in [
-                    ("source_weights_protobuf_sha256", "source_protobuf_sha256"),
-                    ("converter_commit", "converter_commit"),
-                    ("converter_binary_sha256", "converter_binary_sha256"),
-                ] {
-                    equals(p, observed, text(&manifest, declared)?)?;
-                }
+                verify_conversion_provenance(
+                    &startup,
+                    &manifest,
+                    engine.batch_experiment.is_some(),
+                )?;
                 sessions.push(audit);
             }
         }

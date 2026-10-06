@@ -210,3 +210,18 @@ stop/newgame/deadline·전송 실패의 취소를 대조한다. `tests/engine_bi
 실행 파일에서 A/C/D 연결·시간 마감·root 교체·중복 stop·유한 quit/EOF를 검사한다.
 standalone fixture 검사와 실제 연결 검사의 결과를 구분한다. GPU, 실제 neural 평가와
 정식 대국 강도는 별도 인수다.
+
+## 소유 물리 작업과 착수 출력
+
+production Engine Owner는 stop/hard deadline에서 Session의 마지막 유효 착수를 고정한 뒤
+모든 소유 worker의 정상 drain과 join을 확인하여 한 번 출력한다. 늦은 평가/Progress가
+고정한 착수나 backup을 바꾸지 않는다. 입력과 isready는 대기 중에도 처리하고,
+받아들인 root/game/registry 교체와 quit/EOF는 이전 scope의 보류 출력을 폐기한다.
+별도 Session/transport reducer만 사용하면 이 physical fence를 제공한 것이 아니다.
+
+출력 대기는 기존 유한 shutdown_limit을 사용한다. drain 오류·panic·시간 초과는
+PhysicalFenceFailure와 원래 typed serve 오류로 전달하고 성공 착수를 승인하지 않는다.
+소유 worker/pin을 임의 해제하지 않는다. GPU session의 모델은 계속 resident일 수 있으며
+물리 평가 작업 완료와 모델 unload는 별도다. 이 수명 수정은 PUCT/backup·WDL·기본 S0와
+opt-in exact-terminal S1을 바꾸지 않는다. 정확한 시간 예산과 인수 범위는
+[BT4 출력 경계 기록](../../docs/research/LOCAL-MODEL-BASELINE.md#9-stop마감-출력의-물리-완료-경계)을 따른다.

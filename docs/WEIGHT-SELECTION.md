@@ -7,6 +7,13 @@
 
 ## 현재 선정 상태
 
+2026-10-04 후속 사용자 요청은 LC0의 로컬 실행 가능성과 강도용 모델 교체·추가 학습
+계획이다. Maia의 최초 호환 선정 이력은 유지하며, 실제 외부 LC0 CUDA 실행과 동결
+T1 distilled의 초기 후보와 **후속 사용자 지정 BT4-it332 실제 Rust 적용**은
+[로컬 모델 기록](research/LOCAL-MODEL-BASELINE.md)에 둔다. Maia exact profile을
+보존하고 BT4만 별도 immutable source/export/model namespace로 지원한다. 현재
+BT4 CPU/CUDA 수치 연결·위치 벤치마크는 실행했고 실제 학습·정식 강도 인수는 남았다.
+
 첫 호환 구현의 **단일 가중치를 CSSLab Maia1의 공식 v1.0 `maia-1900.pb.gz`로 선정한다.**
 6개 SE residual block, 64 channel, classical 112-plane 입력과 policy/WDL head를 갖춘
 작은 LC0 호환 네트워크다. **인간의 수를 예측하는 모델이며 호환·런타임 기준선에 사용한다.**
@@ -34,8 +41,8 @@ GPU에서 추론·peak VRAM·속도 검증은 아직 수행하지 않았다. **�
 |---|---|---|
 | Maia1 v1.0 `maia-1900.pb.gz` | 6 block × 64 channel; 직접 검사한 classical/SE/policy/WDL; 원저자의 weights GPL 적용 명시 | **단일 선정**. 호환·런타임 기준선용 인간 수 예측 모델. 실제 GPU 실행과 대국 강도는 미검증 |
 | T70 `703810` | 10 block × 128 channel; 단일 파일의 SE/입력/head 메타데이터 확인 | 권리 미확인으로 보류. 내장 license가 없고 공식 배포 정보에서도 가중치 적용 허가를 확인하지 못함 |
-| T1-256x10-distilled-swa-2432500 | 공식 표의 GPU 메모리 1.6 GB, 파일 30~40 MB | 후속 후보. 공식 표의 메모리 값을 자체 Rust backend의 보장치로 쓰지 않음. 이 파일의 구조·권리는 이번에 개별 확인하지 않음 |
-| BT4-it332 | 공식 표의 15 block × 1024 channel, GPU 메모리 4 GB, 파일 365 MB | 별도의 강한 외부 LC0 비교 후보. 첫 작은 호환 구현에서 attention 계열 전체를 함께 지원하지 않음 |
+| T1-256x10-distilled-swa-2432500 | 공식 표의 GPU 메모리 1.6 GB, 파일 30~40 MB | 2026-10-04 후속 후보 조사에서 원본 digest·classical 입력·attention encoder/policy와 제작자 직접 사용 허가, 외부 LC0 로컬 CUDA 실행을 확인. 내부 Rust 호환·수치 parity·강도 승격은 남음. [후속 기록](research/LOCAL-MODEL-BASELINE.md) |
+| BT4-it332 | 공식 표의 15 block × 1024 channel, GPU 메모리 약 4 GB, 파일 365 MB | 2026-10-04 사용자 지정으로 이 단일 파일만 별도 profile로 실제 연결. CPU/CUDA 독립 수치·native LC0/RoveZero 로컬 실행 통과. 개별 권리 미확인·학습/배포/정식 강도 인수 남음 |
 
 공식 메모리 표는 backend·batch·workspace·공동 점유 조건이 완전히 고정된 RoveZero 측정이
 아니다. 특히 같은 6 GB GPU에서 두 엔진을 동시에 올릴 때의 합산 사용량을 보장하지 않는다.
@@ -311,3 +318,24 @@ policy index·WDL 관점·누출·seed 계약이 충족된 후 진행한다. F03
   외부 배포 형태의 source/notice 충족 확인. T70 권리는 보류 유지.
 - 다음 작업: 총괄 I02가 GPU 수명 추가 경계, D02 종단 계측과 E 강도 gate를 각각 인수한다.
   학습·장시간 대국의 구체적 예산은 실행 전에 확정한다.
+
+## 후속 BT4 단일 파일 연결
+
+사용자의 로컬 적용 요청으로 `AssetProfile::Bt4It332`를 추가했다. 공식 단일 파일의
+압축·protobuf digest를 모두 대조하고 768 MiB FP32 ONNX 상한·policy/WDL/MLH
+인터페이스를 별도 검증한다. Maia의 digest·16 MiB·GPL 검사와 기존 ID는 유지한다.
+BT4의 본문은 attention이며 classical 112-plane 입력의 실제 Rust history·좌표·
+승격·합법 policy/WDL을 고정 LC0 Eigen 원본 참조 12개로 CPU/CUDA 대조했다.
+MLH는 지원 graph에 존재하되 현재 자체 탐색에서는 소비하지 않는다.
+
+BT4 gzip SHA-256은 `e6ada9d6c4a769bfab3aa0848d82caeb809aa45f83e6c605fc58a31d21bdd618`,
+ONNX는 `2839171c39fe660ca5fa35983bba7d0b403bc6e70b56a06b88a06b406d057518`다.
+`UNVERIFIED-local-research-only`와 `redistribution_ready=false`를 strict manifest에
+명시했다. protobuf에 license가 없으며 LC0 코드의 GPL·제삼자 mirror 표기를 weights
+허가로 대신하지 않는다. T1의 직접 허가도 이 파일에 적용하지 않는다. 원본/변환본은
+Git·배포물에 포함하지 않는다. 실제 학습·수정·재배포 전 별도 권리 확인이 남는다.
+
+이 단일 profile의 인수와 기존 첫 선정 이력은 구분한다. 장치·원본 전체 hash·오차·
+실패 설정·실행 pin·VRAM·벤치마크·공정성 공백은
+[로컬 모델 기록](research/LOCAL-MODEL-BASELINE.md)에 함께 둔다. 전체 LC0 모델 지원이나
+모델 강도 승격·실제 학습 성공으로 표현하지 않는다.

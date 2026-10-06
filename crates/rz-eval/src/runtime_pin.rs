@@ -6,7 +6,9 @@
 //! The caller must supply a private output root whose ancestors it controls.
 //! Its owner must not chmod, replace or remove bootstrap copies. This is an
 //! ownership contract, not protection against hostile code with the same OS UID.
-//! Runtime copies are retained for process lifetime once passed to ORT. No
+//! Shared content-addressed copies are verified again on every cache hit. The
+//! legacy private-copy API remains available for explicitly isolated callers.
+//! Runtime pins are retained for process lifetime once passed to ORT. No
 //! runtime/provider assets are downloaded. CPU copies contain one library. A
 //! Linux CUDA bundle copies only the explicitly declared, verified libraries;
 //! resolving and loading their complete dependency closure is a separate gate.
@@ -16,6 +18,7 @@ use crate::{
     error::{BackendError, FailureKind as K, FailureStage as S},
 };
 use serde::Deserialize;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
 use std::io::{Read, Seek, SeekFrom};
@@ -56,6 +59,26 @@ const NVIDIA_FILENAMES: &[&str] = &[
     "libcudnn_heuristic.so.9",
 ];
 static NEXT_COPY: AtomicU64 = AtomicU64::new(0);
+
+mod cache;
+pub use cache::RuntimeCache;
+
+/// Storage provenance is distinct from model-evaluation cache provenance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStorageOrigin {
+    PrivateCopy,
+    CacheCreated,
+    CacheReused,
+}
+
+/// No private paths. Reuse still requires byte verification and live file pins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct RuntimeStorage {
+    pub origin: RuntimeStorageOrigin,
+    pub cache_key: Option<[u8; 32]>,
+    pub bytes: u64,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -262,6 +285,7 @@ struct OwnedCopy {
     // Windows denies write/delete sharing; Unix retains the exact owned inode.
     _pin: File,
     bundle: Option<OwnedCudaBundle>,
+    storage: RuntimeStorage,
 }
 
 /// Capability issued only after an owned copy has been verified and pinned.
@@ -400,6 +424,11 @@ impl RuntimeLibraryPin {
                 digest: expected,
                 _pin: pin,
                 bundle: None,
+                storage: RuntimeStorage {
+                    origin: RuntimeStorageOrigin::PrivateCopy,
+                    cache_key: None,
+                    bytes: bytes.len() as u64,
+                },
             })))
         })();
         // Only a failed, unpublished copy is eligible for local cleanup.
@@ -414,6 +443,10 @@ impl RuntimeLibraryPin {
 
     pub fn binary_digest(&self) -> [u8; 32] {
         self.0.digest
+    }
+
+    pub fn storage(&self) -> RuntimeStorage {
+        self.0.storage
     }
 
     pub fn bundle_digest(&self) -> Option<[u8; 32]> {
@@ -632,6 +665,11 @@ impl RuntimeLibraryPin {
                     files,
                     _pins: pins,
                 }),
+                storage: RuntimeStorage {
+                    origin: RuntimeStorageOrigin::PrivateCopy,
+                    cache_key: None,
+                    bytes: spec.files.iter().map(|file| file.bytes).sum(),
+                },
             })))
         })();
         if result.is_err() {

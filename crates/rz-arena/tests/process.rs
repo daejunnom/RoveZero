@@ -273,6 +273,7 @@ fn tree_snapshot_rejects_links_and_special_files_without_payload_access() {
         let outside_file = outside.0.join("payload");
         std::fs::write(&outside_file, b"outside unchanged\n").unwrap();
         let bad = scratch.0.join("bad");
+        let directory = File::open(&scratch.0).unwrap();
         let mut listener = None;
         let expected = match case {
             "symlink_file" => {
@@ -292,13 +293,18 @@ fn tree_snapshot_rejects_links_and_special_files_without_payload_access() {
                 "process.artifact_tree.kind"
             }
             "socket" => {
-                listener = Some(UnixListener::bind(&bad).unwrap());
+                use std::os::fd::AsRawFd;
+                // Managed TMPDIR may exceed AF_UNIX's pathname limit. Bind
+                // through this held directory, still creating the same inode.
+                listener = Some(
+                    UnixListener::bind(format!("/proc/self/fd/{}/bad", directory.as_raw_fd(),))
+                        .unwrap(),
+                );
                 "process.artifact_tree.kind"
             }
             _ => unreachable!(),
         };
         let program = File::open(std::env::current_exe().unwrap()).unwrap();
-        let directory = File::open(&scratch.0).unwrap();
         let result = supervise_in_directory_with_tree(
             &program,
             &fixture_args("fixture_sleep"),
