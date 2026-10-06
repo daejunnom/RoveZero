@@ -43,6 +43,7 @@ pub fn stockfish19_endpoint(
             ("nodestime".into(), "0".into()),
             ("SyzygyProbeLimit".into(), "0".into()),
         ]),
+        environment: None,
         handshake_timeout_ms: 30_000,
     }
 }
@@ -97,6 +98,7 @@ impl NativeLaunchDeclaration for LockedManifestV2 {
                 search: None,
                 batch_experiment: None,
                 external: Some(e),
+                environment: e.environment.as_ref(),
             }),
             EngineEndpointV2::RoveZero(e) => {
                 let launch = e.launch.as_ref().ok_or_else(|| {
@@ -120,6 +122,7 @@ impl NativeLaunchDeclaration for LockedManifestV2 {
                     search,
                     batch_experiment: None,
                     external: None,
+                    environment: e.environment.as_ref(),
                 })
             }
         }

@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod contract;
+mod engine_environment;
 mod external_uci;
 mod fastchess;
 mod ledger;
@@ -22,6 +23,7 @@ mod process;
 mod runner;
 
 pub use contract::*;
+pub use engine_environment::EngineEnvironmentObservation;
 pub use external_uci::*;
 pub use fastchess::*;
 pub use ledger::*;

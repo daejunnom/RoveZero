@@ -156,6 +156,8 @@ pub struct NativePairReceipt<A = NativeProviderSessionAudit> {
     pub external_preflight: Vec<crate::ExternalUciPreflight>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub external_execution: Vec<crate::ExternalGameObservation>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub environments: std::collections::BTreeMap<String, crate::EngineEnvironmentObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_audit_error: Option<String>,
     pub provider_audit_error: Option<String>,
@@ -796,6 +798,31 @@ pub(crate) mod linux {
                         .map(|v| (k.clone(), v))
                 })
                 .collect::<Result<BTreeMap<_, _>, _>>()?;
+            let variables = e
+                .environment
+                .as_ref()
+                .map(|environment| {
+                    environment
+                        .variables
+                        .iter()
+                        .map(|(name, value)| {
+                            crate::external_uci::resolve_asset_tokens(
+                                value,
+                                &e,
+                                &owner.snapshot.pins,
+                            )
+                            .map(|value| (name.clone(), value))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, _>>()
+                })
+                .transpose()?;
+            let launch = crate::engine_environment::prepare(
+                binary,
+                args,
+                e.environment.as_ref(),
+                variables.as_ref(),
+                &owner.snapshot.pins,
+            )?;
             let limits = crate::ProcessLimits {
                 wall_ms: e.handshake_timeout_ms,
                 shutdown_grace_ms: owner.spec.view().timeouts.shutdown_ms,
@@ -803,8 +830,8 @@ pub(crate) mod linux {
                 max_child_processes: owner.spec.view().budget.max_child_processes,
             };
             let process = crate::supervise_protocol_in_directory(
-                &binary.file,
-                &args,
+                &launch.program.file,
+                &launch.arguments,
                 &owner.snapshot.cwd,
                 limits,
                 cancel,
@@ -853,8 +880,8 @@ pub(crate) mod linux {
             crate::validate_uci_options(&advertisement, &e.expected_uci_name, &requested)?;
             let commands = crate::uci_preflight_commands(&requested, e.family == "stockfish")?;
             let process = crate::supervise_protocol_in_directory(
-                &binary.file,
-                &args,
+                &launch.program.file,
+                &launch.arguments,
                 &owner.snapshot.cwd,
                 limits,
                 cancel,
@@ -928,6 +955,10 @@ pub(crate) mod linux {
                 engine_id: e.id.clone(),
                 advertisement,
                 options,
+                environment: e
+                    .environment
+                    .as_ref()
+                    .map(crate::engine_environment::observation),
                 identification_process,
                 readiness_process: process.receipt.clone(),
                 stop_and_legal_bestmove_observed: true,
@@ -1042,6 +1073,20 @@ pub(crate) mod linux {
             provider_sessions: Vec::new(),
             external_preflight,
             external_execution: Vec::new(),
+            environments: [NativeEngineRole::Baseline, NativeEngineRole::Candidate]
+                .into_iter()
+                .map(|role| owner.spec.engine_view(role))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter_map(|engine| {
+                    engine.environment.map(|environment| {
+                        (
+                            engine.engine_id.to_owned(),
+                            crate::engine_environment::observation(environment),
+                        )
+                    })
+                })
+                .collect(),
             external_audit_error: None,
             provider_audit_error: None,
             pgn_audit: None,

@@ -47,6 +47,8 @@ pub struct ExternalUciPreflight {
     pub engine_id: String,
     pub advertisement: ExternalUciAdvertisement,
     pub options: BTreeMap<String, ExternalOptionObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::EngineEnvironmentObservation>,
     pub identification_process: ProcessReceipt,
     pub readiness_process: ProcessReceipt,
     pub stop_and_legal_bestmove_observed: bool,
@@ -63,6 +65,8 @@ pub struct ExternalGameObservation {
     pub quit_count: u32,
     pub requested_options_sent_per_game: bool,
     pub actual_options: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::EngineEnvironmentObservation>,
     pub external_process_ids: Vec<u32>,
     pub process_id_scope: &'static str,
 }
@@ -306,6 +310,10 @@ pub(crate) fn audit_external_game_protocol(
         quit_count,
         requested_options_sent_per_game: options_ok,
         actual_options: None,
+        environment: e
+            .environment
+            .as_ref()
+            .map(crate::engine_environment::observation),
         external_process_ids: external_pids.to_vec(),
         process_id_scope: "two non-native exit identities in the same supervised four-engine pair; game-to-PID mapping unknown",
     })

@@ -120,6 +120,9 @@ pub struct RoveZeroEndpointV2 {
     pub model: ModelConfigurationV2,
     pub search: ComponentConfigurationV2,
     pub runtime: ComponentConfigurationV2,
+    /// Public launch settings only; absent preserves the original V2 encoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EngineEnvironmentV2>,
     /// A future unsupported model can be planned, but cannot be launched by this recipe.
     pub launch: Option<RoveLaunchV2>,
 }
@@ -129,6 +132,71 @@ pub struct ExternalSourceV2 {
     pub url: String,
     pub commit: String,
     pub license: String,
+}
+/// A verified `env` executable clears inherited variables before exec. Settings
+/// are public experiment inputs, never ambient credentials or env-file imports.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EngineEnvironmentV2 {
+    pub launcher: ArtifactRef,
+    pub variables: BTreeMap<String, String>,
+}
+impl EngineEnvironmentV2 {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        self.launcher.validate()?;
+        require_v2(
+            self.launcher.bytes <= 4 * 1024 * 1024 && self.variables.len() <= 16,
+            "environment launcher/variable budget exceeded",
+        )?;
+        let mut bytes = 0usize;
+        for (name, value) in &self.variables {
+            let upper = name.to_ascii_uppercase();
+            let sensitive = [
+                "SECRET",
+                "TOKEN",
+                "PASSWORD",
+                "CREDENTIAL",
+                "AUTHORIZATION",
+                "PRIVATE_KEY",
+                "API_KEY",
+                "ACCESS_KEY",
+            ]
+            .iter()
+            .any(|term| upper.contains(term));
+            require_v2(
+                !name.is_empty()
+                    && name.len() <= 64
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                    && !name.as_bytes()[0].is_ascii_digit()
+                    && !sensitive
+                    && value.len() <= 4096
+                    && name.len() + value.len() < 4096
+                    && !value
+                        .chars()
+                        .any(|c| c.is_control() || matches!(c, '\"' | '\'' | '\\')),
+                "environment requires bounded public variable names and literal values",
+            )?;
+            bytes += name.len() + value.len() + 2;
+        }
+        require_v2(bytes <= 8192, "environment combined byte budget exceeded")
+    }
+    pub fn validate_native(&self) -> Result<(), ManifestError> {
+        self.validate()?;
+        // The closed LC0 recipe owns provider/precision/session configuration.
+        // Locale and allocator settings cannot override that semantic identity.
+        require_v2(
+            self.variables
+                .iter()
+                .all(|(name, value)| match name.as_str() {
+                    "LANG" | "LC_ALL" | "TZ" => true,
+                    "MALLOC_ARENA_MAX" => value.parse::<u32>().is_ok_and(|n| (1..=32).contains(&n)),
+                    _ => false,
+                }),
+            "native environment cannot override model/provider/session configuration",
+        )
+    }
 }
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -143,6 +211,8 @@ pub struct ExternalUciEndpointV2 {
     pub arguments: Vec<String>,
     pub assets: Vec<ArtifactRef>,
     pub requested_options: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EngineEnvironmentV2>,
     pub handshake_timeout_ms: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -442,6 +512,9 @@ impl RunManifestV2 {
             match engine {
                 EngineEndpointV2::RoveZero(e) => {
                     e.tool.binary.validate()?;
+                    if let Some(environment) = &e.environment {
+                        environment.validate()?;
+                    }
                     require_v2(
                         sha_v2(&e.tool.source_commit, 40)
                             && sha_v2(&e.adapter_implementation_sha256, 64),
@@ -475,6 +548,9 @@ impl RunManifestV2 {
                         w.validate()?;
                     }
                     if let Some(launch) = &e.launch {
+                        if let Some(environment) = &e.environment {
+                            environment.validate_native()?;
+                        }
                         let (role, id, source, binary) = match launch {
                             RoveLaunchV2::Lc0Cpu(l) => {
                                 l.validate()?;
@@ -535,11 +611,17 @@ impl RunManifestV2 {
                 }
                 EngineEndpointV2::ExternalUci(e) => {
                     e.binary.validate()?;
+                    if let Some(environment) = &e.environment {
+                        environment.validate()?;
+                    }
                     require_v2(
                         text_v2(&e.family)
                             && text_v2(&e.version)
                             && text_v2(&e.expected_uci_name)
                             && e.arguments.len() <= 32
+                            && e.environment.as_ref().is_none_or(|environment| {
+                                e.arguments.len() + environment.variables.len() + 5 <= 32
+                            })
                             && e.arguments.iter().all(|a| text_v2(a))
                             && e.assets.len() <= 16
                             && map_v2(&e.requested_options)
@@ -592,6 +674,9 @@ impl RunManifestV2 {
         if a.search != b.search {
             changes.insert("search".into());
         }
+        if a.environment != b.environment {
+            changes.insert("environment".into());
+        }
         require_v2(
             changes == self.declared_changes && !changes.is_empty(),
             "declared changes differ from actual comparison",
@@ -599,7 +684,7 @@ impl RunManifestV2 {
         let allowed = match self.comparison {
             ComparisonV2::Runtime => {
                 require_v2(self.change == ChangeV2::MeaningPreserving, "runtime is E")?;
-                BTreeSet::from(["runtime".into()])
+                BTreeSet::from(["runtime".into(), "environment".into()])
             }
             ComparisonV2::AdapterEquivalence => {
                 require_v2(
@@ -621,7 +706,9 @@ impl RunManifestV2 {
                     self.change == ChangeV2::Model
                         && !changes.contains("runtime")
                         && !changes.contains("search")
-                        && changes.iter().any(|c| c != "adapter_implementation"),
+                        && changes
+                            .iter()
+                            .any(|c| c != "adapter_implementation" && c != "environment"),
                     "model configuration keeps search/runtime and changes a model component",
                 )?;
                 changes.clone()
@@ -652,10 +739,16 @@ impl RunManifestV2 {
                 EngineEndpointV2::ExternalUci(e) => {
                     assets.push(&e.binary);
                     assets.extend(e.assets.iter());
+                    if let Some(environment) = &e.environment {
+                        assets.push(&environment.launcher);
+                    }
                 }
                 EngineEndpointV2::RoveZero(e) => {
                     assets.push(&e.tool.binary);
                     assets.extend(e.model.weights.iter());
+                    if let Some(environment) = &e.environment {
+                        assets.push(&environment.launcher);
+                    }
                     if let Some(l) = &e.launch {
                         match l {
                             RoveLaunchV2::Lc0Cpu(l) => {
@@ -756,6 +849,89 @@ impl LockedManifestV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn environment() -> EngineEnvironmentV2 {
+        EngineEnvironmentV2 {
+            launcher: ArtifactRef {
+                path: "tools/env".into(),
+                sha256: "a".repeat(64),
+                bytes: 1024,
+                source: "https://www.gnu.org/software/coreutils/".into(),
+                license: "Synthetic test declaration only".into(),
+            },
+            variables: BTreeMap::from([("MALLOC_ARENA_MAX".into(), "2".into())]),
+        }
+    }
+    #[test]
+    fn absent_environment_preserves_v2_encoding_and_explicit_null_lock_identity() {
+        let lock = manifest(ComparisonV2::Fixture).lock().unwrap();
+        let json = lock.to_json().unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let engine = &mut legacy["input"]["engines"][0]["configuration"];
+        assert!(engine.get("environment").is_none());
+        engine["environment"] = serde_json::Value::Null;
+        let reread = LockedManifestV2::from_json(&legacy.to_string()).unwrap();
+        assert_eq!(reread.sha256(), lock.sha256());
+        assert_eq!(reread.to_json().unwrap(), json);
+    }
+    #[test]
+    fn public_environment_budgets_and_native_semantics_are_checked() {
+        let base = environment();
+        base.validate_native().unwrap();
+        for (name, value) in [
+            ("9INVALID", "fixture"),
+            ("HAS=EQUAL", "fixture"),
+            ("CREDENTIAL", "fixture"),
+            ("API_KEY", "fixture"),
+            ("SAFE", "line\nfeed"),
+            ("SAFE", "double\"quote"),
+            ("SAFE", "single'quote"),
+            ("SAFE", "back\\slash"),
+        ] {
+            let mut e = base.clone();
+            e.variables = BTreeMap::from([(name.into(), value.into())]);
+            assert!(e.validate().is_err());
+        }
+        let mut e = base.clone();
+        e.variables = (0..17)
+            .map(|i| (format!("PUBLIC_{i}"), "fixture".into()))
+            .collect();
+        assert!(e.validate().is_err());
+        e.variables = BTreeMap::from([
+            ("PUBLIC_A".into(), "x".repeat(4096)),
+            ("PUBLIC_B".into(), "x".repeat(4096)),
+        ]);
+        assert!(e.validate().is_err());
+        e.variables = BTreeMap::from([("CUDA_VISIBLE_DEVICES".into(), "0".into())]);
+        e.validate().unwrap();
+        assert!(e.validate_native().is_err());
+        e.variables = BTreeMap::from([("MALLOC_ARENA_MAX".into(), "0".into())]);
+        assert!(e.validate_native().is_err());
+        e.variables = BTreeMap::from([("PUBLIC".into(), "x".repeat(4096))]);
+        assert!(e.validate().is_err());
+    }
+    #[test]
+    fn environment_is_an_explicit_runtime_change_and_cannot_confound_weights() {
+        let mut m = manifest(ComparisonV2::Fixture);
+        let base = match &m.engines[0] {
+            EngineEndpointV2::RoveZero(e) => e.clone(),
+            _ => unreachable!(),
+        };
+        candidate(&mut m).model = base.model.clone();
+        candidate(&mut m).environment = Some(environment());
+        m.comparison = ComparisonV2::Runtime;
+        m.change = ChangeV2::MeaningPreserving;
+        m.declared_changes = BTreeSet::from(["environment".into()]);
+        m.validate().unwrap();
+        assert!(m.declared_artifacts().iter().any(|a| a.path == "tools/env"));
+        m.comparison = ComparisonV2::InternalWeights;
+        m.change = ChangeV2::Model;
+        candidate(&mut m).model.weights[0].sha256 = "c".repeat(64);
+        candidate(&mut m).model.weights[0].path = "new-env-comparison-weights.bin".into();
+        m.declared_changes.insert("weights".into());
+        assert!(m.validate().is_err());
+        m.comparison = ComparisonV2::InternalModel;
+        m.validate().unwrap();
+    }
     fn manifest(comparison: ComparisonV2) -> RunManifestV2 {
         let old = RunManifest::from_json(include_str!(
             "../../../experiments/baselines/fixtures/e01-input.json"
@@ -766,6 +942,7 @@ mod tests {
             EngineEndpointV2::RoveZero(Box::new(RoveZeroEndpointV2 {
                 id: e.id.clone(),
                 role,
+                environment: None,
                 tool: old.protocol.runner.clone(),
                 adapter_implementation_sha256: "a".repeat(64),
                 model: ModelConfigurationV2 {
@@ -1088,6 +1265,7 @@ mod tests {
             arguments: vec![],
             assets: vec![],
             requested_options: BTreeMap::from([("Threads".into(), "2".into())]),
+            environment: None,
             handshake_timeout_ms: 30_000,
         }));
         let json = m.clone().lock().unwrap().to_json().unwrap();
@@ -1098,6 +1276,16 @@ mod tests {
                 .comparison,
             ComparisonV2::ExternalEngine
         );
+        let mut with_environment = m.clone();
+        if let EngineEndpointV2::ExternalUci(endpoint) = &mut with_environment.engines[1] {
+            endpoint.environment = Some(environment());
+            endpoint.arguments = vec!["bounded".into(); 26];
+        }
+        with_environment.validate().unwrap();
+        if let EngineEndpointV2::ExternalUci(endpoint) = &mut with_environment.engines[1] {
+            endpoint.arguments.push("overflow".into());
+        }
+        assert!(with_environment.validate().is_err());
         m.change = ChangeV2::MeaningPreserving;
         assert!(m.validate().is_err());
         m.change = ChangeV2::ExternalComparison;

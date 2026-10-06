@@ -61,6 +61,8 @@ def gate_identities(declaration, reports):
     probed=preflight["endpoint"]
     for key in ("family","version","expected_uci_name","arguments","requested_options","source"):
         require(probed[key]==external[key],"external preflight differs: "+key)
+    require(probed.get("environment")==external.get("environment"),
+            "external preflight used a different declared environment or launcher")
     for key in ("sha256","bytes"):
         require(probed["binary"][key]==external["binary"][key],"external preflight binary differs")
     require(probed["assets"]==external["assets"] and preflight["two_fresh_processes"] and

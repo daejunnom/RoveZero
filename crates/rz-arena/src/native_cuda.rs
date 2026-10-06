@@ -106,6 +106,7 @@ impl<P: CudaLaunchProfile> NativeLaunchDeclaration for LockedCudaIntegrationPair
             search: engine.profile.search_options(),
             batch_experiment: (P::VERSION == 4).then(|| engine.profile.max_batch()),
             external: None,
+            environment: None,
         })
     }
     fn provider_name(&self) -> &'static str {

@@ -51,6 +51,7 @@ class ModelPairGateTests(unittest.TestCase):
             lambda r:r["numerical"][1]["identity"].update(runtime_bundle_sha256="other-CUDA"),
             lambda r:r["external_preflight"][0]["endpoint"]["binary"].update(sha256="other-Stockfish"),
             lambda r:r["external_preflight"][0]["endpoint"]["requested_options"].update(Threads="8"),
+            lambda r:r["external_preflight"][0]["endpoint"].update(environment={"variables":{"RZ_PUBLIC_FIXTURE":"other"}}),
         ]
         for mutate in mutations:
             declaration,reports=fixture()

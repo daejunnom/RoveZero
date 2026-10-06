@@ -58,7 +58,7 @@ digest·기록을 자동 변환하지 않는다. V2 lock도 `execution_ready=fal
 
 | 비교 | 고정·허용 변화 | 분류 |
 |---|---|---|
-| Runtime | 모델 구성·weights·입력·탐색·backend·정밀도 고정, 선언한 runtime 변화 | E |
+| Runtime | 모델 구성·weights·입력·탐색·backend·정밀도 고정, 선언한 runtime·공개 환경 변화 | E |
 | AdapterEquivalence | 모델·입력 의미·runtime·탐색·backend·정밀도·batch 고정, 어댑터 구현/연결만 변화 | E |
 | InternalWeights | 동일 실행 파일·구조·encoding·head·adapter 의미·backend·정밀도·탐색·runtime, weights만 변화 | A |
 | InternalModel | Rules·평가 절차·탐색·runtime·시계·자원 고정, 모델 구성과 필요한 실행 차이를 사전 선언 | A |
@@ -80,10 +80,30 @@ session 설정을 함께 바꾼 비교도 weights-only로 인수하지 않는다
 RoveZero 항목은 모델 구성·adapter 의미/구현·encoding·head·weights·backend·정밀도·
 탐색/runtime·native launch를 포함한다. ExternalUci 항목은 실제 binary·버전·소스/권리·
 인수·옵션·필요 자산·handshake 한도를 포함한다. 외부 엔진에 가상의 weights나 RoveZero
-policy/WDL/ORT attestation을 요구하지 않는다. 인수/옵션의 `{{asset:0}}` 참조는 검증된
-private asset pin에 연결한다. 첫 recipe는 공통으로 정리된 runner 환경을 상속하며 임의의
-엔진별 환경 override를 조용히 적용하지 않는다. 미구현 launch, 미지원 backend 또는 서로
-다른 native CUDA bundle을 이 recipe에서 실행하지 않는다.
+policy/WDL/ORT attestation을 요구하지 않는다. 인수/옵션/공개 환경 값의 `{{asset:0}}` 참조는
+검증된 private asset pin에 연결한다. 미구현 launch, 미지원 backend 또는 서로 다른
+native CUDA bundle을 이 recipe에서 실행하지 않는다.
+
+엔진별 `environment`는 선택 필드다. 생략하거나 null이면 기존 V2 직렬화·digest와
+실행 파일·인수를 유지하며 공통으로 정리된 runner 환경을 상속한다. 지정하면 GNU `env`를
+별도 artifact로 고정·해시 검증·private snapshot하고 `-i --` 뒤에 선언한 공개 값과
+엔진 인수를 전달한다. snapshot의 실행 권한과 독립 inode·닫힌 writer·정리 조건을
+runner/엔진과 동일하게 적용한다. shell이나 지속 proxy를 추가하지 않고 exec하므로
+기존 PID·cgroup·process 종료 경로를 유지한다. 기본 LANG=C·PATH=/usr/bin:/bin 이후
+변수별 요청값을 전달하고 ambient HOME·loader·인증 정보를 수집하거나 env 파일을 읽지 않는다.
+
+한 엔진당 변수 16개·합계 8KiB, launcher 4MiB, Fastchess 내부 인수 32개·16KiB 상한을
+검사한다. 이름은 대문자 ASCII·숫자·underscore이며 제어 문자·quote·backslash를 거부한다.
+이는 고정 Fastchess tokenizer가 지원하는 literal 인수 범위다. 기존 LC0 native 실행은
+LANG/LC_ALL/TZ와 MALLOC_ARENA_MAX=1..32만 허용하며 모델·provider·정밀도·session 구성은
+닫힌 프로필이 계속 소유한다. 환경 차이는 비교의 `declared_changes`에서 명시한다.
+AdapterEquivalence·InternalWeights·InternalSearch에는 환경 차이를 허용하지 않으며,
+InternalModel은 실제 모델 구성 변화와 함께 선언한 환경 차이만 허용한다.
+
+preflight와 대국에는 같은 선언을 전달한다. 영수증은 launcher hash·선언값·상속 환경
+제거 요청·인수 준비 상태를 기록하고, 엔진이 해석한 실제 값은 readback 없이 unknown이다.
+`readyok`를 환경 적용 증거로 사용하지 않는다. 외부 pilot gate도 preflight의 환경과
+launcher 식별이 실행 선언과 같은지 검사한다.
 
 ## Stockfish 19와 대국
 
@@ -175,11 +195,13 @@ unknown이다. 별도 cloud 비용·학습·정밀도/batch 정책·backend 변�
 ## 현재 인수 상태 (2026-10-07)
 
 구현·CPU 인수와 실제 GPU 수치 인수는 제공했으며 성능 회귀·대국 인수는 HOLD다.
-등록된 엔진/arena 바이너리 source는 `4d715b3`이다. 후속 recipe의 affinity·유한 예산
+기존 등록된 엔진/arena 바이너리 source는 `4d715b3`이다. 후속 recipe의 affinity·유한 예산
 변경은 `acf9669`·`b4924f1`, CPU root 통계 관측 예제는 `121bcf6`·`1307cc8`이다.
-생산 Rules·encoding·adapter·search·runtime·UCI·arena와 루트 Cargo/lock/toolchain 소스의
+이후 생산 Rules·encoding·adapter·search·runtime·UCI와 루트 Cargo/lock/toolchain 소스의
 일치를 확인했다. `rz-uci/Cargo.toml`은 기존 dependency/feature를 유지하고 예제 선언만
-추가했다. 검사기의 source와 실제 실행 바이너리 source를 구분한다.
+추가했다. 엔진별 환경 연결은 arena·V2 명세를 변경하므로 새 arena 실행 파일을 별도로
+등록하고, 환경이 없는 기존 V2 lock의 동일성을 다시 대조한다. 등록된 탐색 엔진과
+독립 수치 검사 경로는 이 변경의 영향을 받지 않는다. 검사기·엔진·arena의 source를 구분한다.
 
 - 로컬 WSL Rust 전체 feature/all-target 820개 통과, 16개 명시적 미실행, all-feature
   Clippy 통과. 후속 Linux recipe 검사 55개 통과. `b4924f1`의 Linux·Windows·bindings CI
