@@ -65,13 +65,7 @@ impl ClassicalProjection {
 
     pub fn project(&self, state: &RulesState) -> Result<RulesProjection, ContractError> {
         let snapshot = state.snapshot();
-        let mut frames = Vec::new();
-        frames.try_reserve_exact(HISTORY_FRAMES).map_err(|_| {
-            failed(
-                ErrorCode::ResourceExhausted,
-                "Rules projection allocation failed",
-            )
-        })?;
+        let mut frames = ProjectionFrames::try_new()?;
         #[cfg(feature = "experimental-history-frames")]
         for history in snapshot
             .recent_history_frames::<HISTORY_FRAMES>()
@@ -82,7 +76,7 @@ impl ClassicalProjection {
                 pieces: read_pieces(history.piece_bitboards(), |square| history.piece_at(square))?,
                 repeated: history.repeated(),
                 en_passant_target: history.en_passant_target().map(Square::index),
-            });
+            })?;
         }
         #[cfg(not(feature = "experimental-history-frames"))]
         for history in snapshot.known_history().take(HISTORY_FRAMES) {
@@ -96,7 +90,7 @@ impl ClassicalProjection {
                 pieces,
                 repeated,
                 en_passant_target: history.en_passant_target().map(Square::index),
-            });
+            })?;
         }
         let rights = snapshot.castling_rights();
         Ok(RulesProjection {
@@ -309,8 +303,75 @@ fn read_pieces(
     Ok(pieces)
 }
 
-pub struct RulesProjection {
+/// Model-only storage: the eight-frame bound never truncates Rules history.
+/// The inline trial removes one allocation but increases the owner's inline
+/// size; its actual stack/move/retention cost must be measured independently.
+struct ProjectionFrames {
+    #[cfg(not(feature = "experimental-projection-frames"))]
     frames: Vec<Frame>,
+    #[cfg(feature = "experimental-projection-frames")]
+    frames: [Frame; HISTORY_FRAMES],
+    #[cfg(feature = "experimental-projection-frames")]
+    len: usize,
+}
+
+impl ProjectionFrames {
+    fn try_new() -> Result<Self, ContractError> {
+        #[cfg(not(feature = "experimental-projection-frames"))]
+        {
+            let mut frames = Vec::new();
+            frames.try_reserve_exact(HISTORY_FRAMES).map_err(|_| {
+                failed(
+                    ErrorCode::ResourceExhausted,
+                    "Rules projection allocation failed",
+                )
+            })?;
+            Ok(Self { frames })
+        }
+        #[cfg(feature = "experimental-projection-frames")]
+        {
+            Ok(Self {
+                frames: [Frame {
+                    pieces: [[0; 6]; 2],
+                    repeated: false,
+                    en_passant_target: None,
+                }; HISTORY_FRAMES],
+                len: 0,
+            })
+        }
+    }
+
+    fn push(&mut self, frame: Frame) -> Result<(), ContractError> {
+        if self.as_slice().len() == HISTORY_FRAMES {
+            return Err(failed(
+                ErrorCode::ResourceExhausted,
+                "Rules projection frame bound exceeded",
+            ));
+        }
+        #[cfg(not(feature = "experimental-projection-frames"))]
+        self.frames.push(frame);
+        #[cfg(feature = "experimental-projection-frames")]
+        {
+            self.frames[self.len] = frame;
+            self.len += 1;
+        }
+        Ok(())
+    }
+
+    fn as_slice(&self) -> &[Frame] {
+        #[cfg(not(feature = "experimental-projection-frames"))]
+        {
+            &self.frames
+        }
+        #[cfg(feature = "experimental-projection-frames")]
+        {
+            &self.frames[..self.len]
+        }
+    }
+}
+
+pub struct RulesProjection {
+    frames: ProjectionFrames,
     black_to_move: bool,
     castling: [bool; 4],
     halfmove_clock: u32,
@@ -320,7 +381,7 @@ pub struct RulesProjection {
 impl RulesProjection {
     pub fn input(&self) -> Input<'_> {
         Input {
-            history: &self.frames,
+            history: self.frames.as_slice(),
             black_to_move: self.black_to_move,
             castling: self.castling,
             halfmove_clock: self.halfmove_clock,
@@ -331,4 +392,149 @@ impl RulesProjection {
 
 fn failed(code: ErrorCode, detail: &'static str) -> ContractError {
     ContractError::new(code, Stage::Admission, detail)
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    use crate::contracts::encoding_manifest;
+    use rz_contracts::{EncodingHandle, ModelHandle, OwnerId, SlotGeneration};
+    use rz_position::{contracts::ContractPosition, Position};
+
+    fn projection(fill: HistoryFill) -> ClassicalProjection {
+        ClassicalProjection::new(
+            MaiaBinding::new(
+                ModelHandle {
+                    owner: OwnerId(71),
+                    slot: 1,
+                    generation: SlotGeneration(1),
+                    manifest: Digest([72; 32]),
+                },
+                EncodingHandle {
+                    owner: OwnerId(71),
+                    slot: 2,
+                    generation: SlotGeneration(1),
+                    manifest: encoding_manifest(fill),
+                },
+                fill,
+                Digest([73; 32]),
+                1,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn bounded_storage_rejects_overflow_without_changing_frames() {
+        let mut storage = ProjectionFrames::try_new().unwrap();
+        assert!(storage.as_slice().is_empty());
+        let frame = Frame {
+            pieces: [[0; 6]; 2],
+            repeated: true,
+            en_passant_target: Some(20),
+        };
+        for _ in 0..HISTORY_FRAMES {
+            storage.push(frame).unwrap();
+        }
+        assert_eq!(storage.as_slice(), &[frame; HISTORY_FRAMES]);
+        assert_eq!(
+            storage.push(frame).unwrap_err().code,
+            ErrorCode::ResourceExhausted
+        );
+        assert_eq!(storage.as_slice(), &[frame; HISTORY_FRAMES]);
+    }
+
+    #[test]
+    fn projection_storage_matches_full_history_reference_and_input_identity() {
+        let mut traced = Position::startpos();
+        traced.apply_uci_moves(&["e2e4", "e7e5", "g1f3"]).unwrap();
+        let mut repeated = Position::startpos();
+        repeated
+            .apply_uci_moves(&[
+                "g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8",
+            ])
+            .unwrap();
+        let positions = [
+            Position::startpos(),
+            traced,
+            repeated,
+            Position::from_fen("rnbqkbnr/pppp1ppp/8/4p3/8/8/PPPPPPPP/RNBQKBNR w KQkq e6 0 2")
+                .unwrap(),
+            Position::from_fen("1r2k3/P7/8/8/8/8/8/4K3 w - - 0 1").unwrap(),
+        ];
+        for fill in [HistoryFill::No, HistoryFill::RepeatOldest] {
+            let projection = projection(fill);
+            for position in positions.iter().cloned() {
+                let frozen = ContractPosition::new(OwnerId(80), position)
+                    .export()
+                    .unwrap();
+                let snapshot = frozen.rules().snapshot();
+                // Independent complete-prefix reference, including repetition
+                // before the model's oldest retained frame.
+                let reference: Vec<_> = snapshot
+                    .known_history()
+                    .take(HISTORY_FRAMES)
+                    .map(|history| {
+                        let identity = history.repetition_identity();
+                        Frame {
+                            pieces: std::array::from_fn(|color| {
+                                std::array::from_fn(|kind| {
+                                    history.piece_bitboards()[color * 6 + kind]
+                                })
+                            }),
+                            repeated: history
+                                .known_history()
+                                .skip(1)
+                                .any(|prior| prior.repetition_identity() == identity),
+                            en_passant_target: history.en_passant_target().map(Square::index),
+                        }
+                    })
+                    .collect();
+                let actual = projection.project(frozen.rules()).unwrap();
+                assert_eq!(actual.input().history, reference.as_slice());
+                let encoded = classical::encode(actual.input()).unwrap();
+                let expected = classical::encode(Input {
+                    history: &reference,
+                    ..actual.input()
+                })
+                .unwrap();
+                assert_eq!(encoded, expected);
+                assert_eq!(
+                    input_key(projection.model().encoding().handle, &encoded),
+                    input_key(projection.model().encoding().handle, &expected)
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "experimental-prepared-input")]
+    #[test]
+    fn one_slot_replacement_keeps_external_consumer_until_its_last_drop() {
+        let projection = projection(HistoryFill::No);
+        let first_state = ContractPosition::new(OwnerId(81), Position::startpos())
+            .export()
+            .unwrap();
+        let first = projection
+            .prepared_input(first_state.rules(), first_state.legal_moves().moves(), None)
+            .unwrap();
+        let old_payload = Arc::downgrade(&first.encoded);
+        let mut moved = Position::startpos();
+        moved.apply_uci_moves(&["e2e4"]).unwrap();
+        let second_state = ContractPosition::new(OwnerId(82), moved).export().unwrap();
+        let second = projection
+            .prepared_input(
+                second_state.rules(),
+                second_state.legal_moves().moves(),
+                None,
+            )
+            .unwrap();
+        assert!(old_payload.upgrade().is_some());
+        drop(first);
+        assert!(old_payload.upgrade().is_none());
+        let current_payload = Arc::downgrade(&second.encoded);
+        drop(second);
+        assert!(current_payload.upgrade().is_some()); // The bounded memo owns it.
+        drop(projection);
+        assert!(current_payload.upgrade().is_none());
+    }
 }

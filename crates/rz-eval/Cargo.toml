@@ -44,6 +44,7 @@ experimental-input-hash = ["contracts"]
 experimental-raw-cache = ["contracts", "rz-runtime/experimental-raw-cache"]
 # Independent E trials; defaults and the public f32 head API remain unchanged.
 experimental-policy-buffer = ["contracts"]
+experimental-projection-frames = ["contracts"]
 
 [[example]]
 name = "maia_check"
