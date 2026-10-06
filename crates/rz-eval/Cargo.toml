@@ -29,6 +29,8 @@ experimental-io-buffers = ["onnx"]
 experimental-io-binding = ["onnx"]
 experimental-cuda-graph = ["experimental-io-binding"]
 experimental-notify = ["dep:rz-runtime", "rz-runtime/experimental-notify"]
+# Hash the exact owned ONNX bytes during their bounded read; independent E trial.
+experimental-onnx-read-hash = []
 default = []
 onnx = ["dep:ort", "dep:rz-native-loader"]
 contracts = ["dep:rz-contracts", "dep:rz-position", "dep:rz-runtime"]

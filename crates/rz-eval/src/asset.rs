@@ -194,8 +194,14 @@ impl SelectedAsset {
             protobuf_bytes,
             profile.protobuf_sha256(),
         )?;
-        let onnx = read_bounded(onnx, manifest.onnx_bytes)?;
-        check_bytes(&onnx, manifest.onnx_bytes, &manifest.onnx_sha256)?;
+        #[cfg(not(feature = "experimental-onnx-read-hash"))]
+        let onnx = {
+            let bytes = read_bounded(onnx, manifest.onnx_bytes)?;
+            check_bytes(&bytes, manifest.onnx_bytes, &manifest.onnx_sha256)?;
+            bytes
+        };
+        #[cfg(feature = "experimental-onnx-read-hash")]
+        let onnx = read_verified_onnx(onnx, manifest.onnx_bytes, &manifest.onnx_sha256)?;
         Ok(Self {
             metadata: AssetMetadata {
                 manifest,
@@ -393,6 +399,20 @@ pub fn parse_sha256(text: &str) -> Result<[u8; 32], BackendError> {
 }
 
 pub fn read_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, BackendError> {
+    read_bounded_using(path, max_bytes, |file, limit, bytes| {
+        file.take(limit).read_to_end(bytes).map(|_| ())
+    })
+    .map(|(bytes, ())| bytes)
+}
+
+// Both paths keep one held file, exact metadata-based reservation, the same
+// limit+1 growth probe and error precedence. The reader writes directly into
+// the owned Vec; the hashing path needs no second model-sized allocation.
+fn read_bounded_using<T>(
+    path: &Path,
+    max_bytes: usize,
+    read: impl FnOnce(File, u64, &mut Vec<u8>) -> std::io::Result<T>,
+) -> Result<(Vec<u8>, T), BackendError> {
     let limit = max_bytes.checked_add(1).ok_or(BackendError::new(
         K::ResourceExhausted,
         S::Asset,
@@ -416,8 +436,7 @@ pub fn read_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, BackendErr
         .map_err(|_| {
             BackendError::new(K::ResourceExhausted, S::Asset, "asset allocation failed")
         })?;
-    file.take(limit as u64)
-        .read_to_end(&mut bytes)
+    let result = read(file, limit as u64, &mut bytes)
         .map_err(|_| BackendError::new(K::Io, S::Asset, "asset read failed"))?;
     if bytes.len() > max_bytes {
         return Err(BackendError::new(
@@ -426,9 +445,38 @@ pub fn read_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, BackendErr
             "asset grew beyond limit",
         ));
     }
+    Ok((bytes, result))
+}
+
+#[cfg(any(feature = "experimental-onnx-read-hash", test))]
+fn read_hashed_onnx(file: File, limit: u64, bytes: &mut Vec<u8>) -> std::io::Result<[u8; 32]> {
+    let mut reader = HashedReader {
+        reader: file.take(limit),
+        digest: Sha256::new(),
+        bytes: 0,
+        io_failed: false,
+    };
+    reader.read_to_end(bytes)?;
+    Ok(reader.digest.finalize().into())
+}
+
+#[cfg(any(feature = "experimental-onnx-read-hash", test))]
+fn read_verified_onnx(path: &Path, len: usize, digest: &str) -> Result<Vec<u8>, BackendError> {
+    let (bytes, actual_digest) = read_bounded_using(path, len, read_hashed_onnx)?;
+    if bytes.len() != len || actual_digest != parse_sha256(digest)? {
+        return Err(BackendError::new(
+            K::IdentityMismatch,
+            S::Asset,
+            "asset length or SHA-256 differs",
+        ));
+    }
+    // ORT still commits these verified, Rust-owned bytes. No verified-path
+    // reopen or mutable file mapping is introduced, and post-commit release
+    // continues to belong to commit_verified_model.
     Ok(bytes)
 }
 
+#[cfg(any(not(feature = "experimental-onnx-read-hash"), test))]
 fn check_bytes(bytes: &[u8], len: usize, digest: &str) -> Result<(), BackendError> {
     if bytes.len() != len || sha256(bytes) != parse_sha256(digest)? {
         return Err(BackendError::new(
@@ -445,6 +493,91 @@ mod streaming_tests {
     use super::*;
     use flate2::{write::GzEncoder, Compression};
     use std::io::Write;
+
+    #[test]
+    fn onnx_stream_hash_matches_owned_bytes_and_identity_error_precedence() {
+        let path = std::env::temp_dir().join(format!("rz-onnx-read-hash-{}", std::process::id()));
+        for len in [0, 1, 65_535, 65_536, 65_537, 131_113] {
+            let input: Vec<u8> = (0..len).map(|n| (n % 251) as u8).collect();
+            std::fs::write(&path, &input).unwrap();
+            let baseline = read_bounded(&path, len).unwrap();
+            let digest = hex_sha256(&input);
+            check_bytes(&baseline, len, &digest).unwrap();
+            assert_eq!(read_verified_onnx(&path, len, &digest).unwrap(), baseline);
+            for (expected_len, expected_hash) in [
+                (len, "00".repeat(32)),
+                (len, "bad".into()),
+                (len + 1, digest.clone()),
+                (len + 1, "bad".into()),
+            ] {
+                let old = check_bytes(&baseline, expected_len, &expected_hash).unwrap_err();
+                let new = read_verified_onnx(&path, expected_len, &expected_hash).unwrap_err();
+                assert_eq!(new, old);
+            }
+        }
+        let input = b"abc";
+        std::fs::write(&path, input).unwrap();
+        let bytes = read_verified_onnx(&path, input.len(), &hex_sha256(input)).unwrap();
+        std::fs::write(&path, b"mutated after verification").unwrap();
+        assert_eq!(bytes, input);
+        assert_eq!(
+            read_verified_onnx(&path, input.len(), &hex_sha256(input))
+                .unwrap_err()
+                .kind,
+            K::ResourceExhausted
+        );
+        assert_eq!(
+            read_verified_onnx(&path, usize::MAX, "bad").unwrap_err(),
+            read_bounded(&path, usize::MAX).unwrap_err()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn onnx_hash_read_preserves_growth_truncation_and_io_failure() {
+        let path = std::env::temp_dir().join(format!("rz-onnx-grow-hash-{}", std::process::id()));
+        for hashed in [false, true] {
+            std::fs::write(&path, b"abc").unwrap();
+            let grown = read_bounded_using(&path, 3, |file, limit, bytes| {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)?
+                    .write_all(b"d")?;
+                if hashed {
+                    read_hashed_onnx(file, limit, bytes).map(|_| ())
+                } else {
+                    file.take(limit).read_to_end(bytes).map(|_| ())
+                }
+            });
+            assert_eq!(grown.unwrap_err().kind, K::ResourceExhausted);
+            std::fs::write(&path, b"abc").unwrap();
+            let (bytes, digest) = read_bounded_using(&path, 3, |file, limit, bytes| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)?
+                    .set_len(1)?;
+                read_hashed_onnx(file, limit, bytes)
+            })
+            .unwrap();
+            assert_eq!(bytes, b"a");
+            assert_eq!(digest, sha256(b"a"));
+            assert_eq!(
+                check_bytes(&bytes, 3, &hex_sha256(b"abc"))
+                    .unwrap_err()
+                    .kind,
+                K::IdentityMismatch
+            );
+        }
+        let error = read_bounded_using(&path, 3, |_file, _limit, _bytes| {
+            Err::<(), _>(std::io::Error::other("injected read error"))
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            BackendError::new(K::Io, S::Asset, "asset read failed")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn streamed_source_covers_exact_compressed_and_decoded_bytes_and_error_precedence() {
