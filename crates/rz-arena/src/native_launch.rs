@@ -715,6 +715,12 @@ pub(crate) mod linux {
         let root_path = outside_git(output_root)?;
         let root = Dir::open_ambient_dir(&root_path, cap_std::ambient_authority())
             .map_err(|_| io("cannot pin native output root"))?;
+        crate::native_retention::admit(
+            &root,
+            total
+                .checked_add(input.budget.max_output_bytes)
+                .ok_or_else(|| io("native retention reservation overflow"))?,
+        )?;
         root.create_dir(label).map_err(|_| {
             io("cannot create exclusive native attempt; existing outputs preserved")
         })?;

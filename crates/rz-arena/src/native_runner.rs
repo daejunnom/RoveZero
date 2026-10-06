@@ -1022,6 +1022,22 @@ pub(crate) mod linux {
         )?;
         bundle.receipt_artifact = Some(artifact.clone());
         crate::emit_native_phase("receipt_saved");
+        // Keep receipts/PGN first. Process exit alone grants no NN-drain claim.
+        // Each accepted provider session includes its matched physical drain.
+        if crate::native_retention::eligible(
+            receipt.cleanup_verified,
+            receipt.provider_audit_error.is_none(),
+            receipt.provider_sessions.len(),
+        ) {
+            crate::native_retention::retire(
+                &mut bundle
+                    .owner
+                    .as_mut()
+                    .expect("saved receipt retains owner")
+                    .snapshot,
+            )?;
+            crate::emit_native_phase("private_input_retirement_complete");
+        }
         if !receipt.integration_checks_passed {
             return Err(invalid(
                 "native pair failed process, provider or Rules integration acceptance",

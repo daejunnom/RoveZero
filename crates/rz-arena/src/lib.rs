@@ -10,6 +10,8 @@ mod native_cuda;
 mod native_diagnostics;
 mod native_launch;
 mod native_pilot;
+#[cfg(target_os = "linux")]
+mod native_retention;
 mod native_runner;
 mod pgn;
 mod plan;
