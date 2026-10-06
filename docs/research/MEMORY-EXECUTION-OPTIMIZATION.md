@@ -901,9 +901,10 @@ High/max/OOM·강제 정리·소유 잔류는0이며, VRAM peak와 Windows commi
 집계 source `cfb99f60602a5d34e0706d9abf6d9ec68577d10f`는 명시적
 `diagnostic_only=true`/`performance_measurement=false`를 `accepted=true`·exit0일
 때에도 거부한다. 성공한 진단은 제외 근거로 보존한다. WSL Python3.12 도구38개가
-통과했다. 최초 Windows 기본 Python3.11 실행은 기존 `Path.is_junction`의3.12 요구로
+통과했다. 최초 Windows 기본 Python 실행은 기존 `Path.is_junction`의3.12 요구로
 35개 오류가 나 실패로 남겼으며 검사 성공에 포함하지 않는다. Python 요건을 낮추거나
-link 검사를 우회하지 않았다.
+link 검사를 우회하지 않았다. 기본 인터프리터를 실제 조회한 버전은3.10.11이며,
+진단 초안의3.11 표기를 정정했다. 실패 분류와3.12 재검사 결과는 같다.
 [cfb99f6 CPU CI37418772386](https://github.com/daejunnom/RoveZero/actions/runs/37418772386)는
 Ubuntu·Windows·bindings 세 job SUCCESS로 직접 확인했으며 GPU heap 문제의 해결
 증거로 쓰지 않는다.
