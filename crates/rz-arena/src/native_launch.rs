@@ -719,6 +719,7 @@ pub(crate) mod linux {
             &root,
             total
                 .checked_add(input.budget.max_output_bytes)
+                .and_then(|n| n.checked_add(NATIVE_PAIR_METADATA_CAP))
                 .ok_or_else(|| io("native retention reservation overflow"))?,
         )?;
         root.create_dir(label).map_err(|_| {

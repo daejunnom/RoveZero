@@ -39,7 +39,7 @@ jobs:
         run: |
           python scripts/run_managed.py --timeout 600 -- bash -c '
             set -euo pipefail
-            python -m venv "$TMPDIR/bindings-venv"
+            python -m venv --copies "$TMPDIR/bindings-venv"
             source "$TMPDIR/bindings-venv/bin/activate"
             python -m pip install maturin==1.15.0
             cd experiments/bindings-research

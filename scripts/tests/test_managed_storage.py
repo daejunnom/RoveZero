@@ -133,6 +133,21 @@ class StorageTests(unittest.TestCase):
         with self.assertRaises(StorageError):
             ManagedBuild(self.source / "target", self.source)
 
+    def test_internal_venv_link_is_removed_without_traversal(self):
+        owner = self.acquire()
+        (owner.scratch / "lib").mkdir()
+        (owner.scratch / "lib" / "owned-copy").write_bytes(b"owned")
+        link = owner.scratch / "lib64"
+        try:
+            link.symlink_to("lib", target_is_directory=True)
+        except OSError:
+            self.skipTest("symlink creation unavailable on this Windows account")
+        amount = tree_size(owner.slot)
+        self.assertGreater(amount, 0)
+        owner.finish(exit_code=0, tree_gone=True)
+        self.assertFalse(owner.scratch.exists())
+        self.assertEqual(self.model.read_bytes(), b"retained-original")
+
     def test_live_sampling_allows_disappearance_but_cleanup_preflight_does_not(self):
         original_scandir = os.scandir
         class VanishingScan:
@@ -181,4 +196,3 @@ class ProcessTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

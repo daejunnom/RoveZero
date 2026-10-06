@@ -270,7 +270,8 @@ OOM 뒤 worker/batch를 조용히 줄이거나 변경 없이 무한 재시도하
   통째로 회수하고, 전체 한도·슬롯 수를 넘으면 오래된 **완료·소유 확인** 슬롯부터 회수합니다.
   최근 실행 영수증 하나를 슬롯에 갱신하며 실패 코드와 정리 결과를 구분합니다.
 - 하나의 카탈로그 owner가 재사용·회수를 직렬화합니다. 활성·중단 lease, 알 수 없거나 변경된
-  소유 기록, link/junction·비밀 경로가 있으면 보존하고 실패합니다. 강제 종료 후 lease를 자동으로
+  소유 기록, 외부 link/junction·비밀 경로가 있으면 보존하고 실패합니다. 소유 영역 안의
+  symlink는 대상을 따라가지 않고 링크만 회수합니다. 강제 종료 후 lease를 자동으로
   훔치지 않습니다. 수동 복구에는 이전 소유 트리의 종료와 정확한 경로·기록의 대조가 필요합니다.
 - Windows는 실행 전 정지 상태의 자식을 Job Object에 배정하고 재개하며, Linux는 원래 leader를
   reap하기 전에 소유 process group을 종료·확인합니다. Linux의 새 session으로 이탈한 자식까지
@@ -287,7 +288,7 @@ Linux native arena는 결과 영수증을 저장하고 입력의 bytes·inode·h
 실행 파일·JSON 명세, PGN·로그·실행 영수증은 보존합니다. 준비 실패·불확실한 GPU 완료·
 postcheck 실패에서는 일반 성공 경로로 복사본을 삭제하지 않습니다.
 
-`snapshot-retention.v1.jsonl`에 원본 artifact 식별과 회수 계획을 먼저 sync하고, 각 unlink와
+64 KiB로 제한한 `snapshot-retention.v1.jsonl`에 원본 artifact 식별과 회수 계획을 먼저 sync하고, 각 unlink와
 완료를 기록합니다. read-only 파일 descriptor도 해제해야 공간을 회수할 수 있으므로, 삭제한
 복사본의 pin을 닫고 디렉터리를 다시 read-only로 돌립니다. 기존 receipt의 `snapshots`는
 실행 당시의 검증 기록이며 파일의 현재 존재를 보장하지 않습니다. 회수 journal로 현재 보존

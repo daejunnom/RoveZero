@@ -191,4 +191,3 @@ def _run_windows(argv, cwd, env, timeout, admission_check):
         for handle in (info.thread, info.process, job):
             if handle:
                 k.CloseHandle(handle)
-

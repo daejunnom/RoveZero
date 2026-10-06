@@ -1,6 +1,6 @@
 //! Retire only the launch owner's verified private copies after evidence is saved.
 //! Shared runtimes, source assets, executable pins and JSON evidence are retained.
-use crate::{ArenaError, native_launch::linux::Snapshot};
+use crate::{ArenaError, NATIVE_PAIR_METADATA_CAP, native_launch::linux::Snapshot};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
 use serde_json::json;
@@ -100,10 +100,24 @@ fn admit_bounded(root: &Dir, reservation: u64, limit: u64) -> Result<(), ArenaEr
 }
 
 fn write_event(journal: &mut File, event: &serde_json::Value) -> Result<(), ArenaError> {
-    serde_json::to_writer(&mut *journal, event)
+    let bytes = serde_json::to_vec(event)
         .map_err(|_| invalid("cannot encode snapshot retirement event"))?;
+    let length = journal
+        .metadata()
+        .map_err(|_| invalid("cannot measure retirement journal"))?
+        .len();
+    if length
+        .checked_add(bytes.len() as u64)
+        .and_then(|n| n.checked_add(1))
+        .is_none_or(|n| n > NATIVE_PAIR_METADATA_CAP)
+    {
+        return Err(ArenaError::Budget(
+            "snapshot retirement journal exceeds 64 KiB; remaining copies preserved".into(),
+        ));
+    }
     journal
-        .write_all(b"\n")
+        .write_all(&bytes)
+        .and_then(|()| journal.write_all(b"\n"))
         .and_then(|()| journal.sync_all())
         .map_err(|_| ArenaError::Io("cannot persist snapshot retirement journal".into()))
 }
@@ -407,6 +421,15 @@ mod tests {
             assert!(retire_pins(&output, &inputs, None, &tree.0, &pins).is_err());
             assert!(pins[0].path.exists() && pins[1].path.exists());
         }
+    }
+    #[test]
+    fn journal_budget_rejects_without_appending_partial_event() {
+        let tree = Tree::new();
+        let mut journal = File::create(tree.0.join(JOURNAL)).unwrap();
+        journal.write_all(b"prior\n").unwrap();
+        let event = json!({"oversize": "x".repeat(NATIVE_PAIR_METADATA_CAP as usize)});
+        assert!(write_event(&mut journal, &event).is_err());
+        assert_eq!(fs::read(tree.0.join(JOURNAL)).unwrap(), b"prior\n");
     }
     #[test]
     fn admission_rejects_oversize_history_links_and_reservation_without_deleting() {

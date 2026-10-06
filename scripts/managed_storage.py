@@ -20,13 +20,18 @@ class StorageError(RuntimeError):
     pass
 
 
-def checked(path: Path) -> Path:
-    path = Path(os.path.abspath(path))
+def reject_credential_names(path: Path) -> None:
     for part in (path, *path.parents):
         if part.name.lower().startswith(".env") or part.name.lower() in {
             "credentials", "service-account.json", "id_rsa", "id_ed25519",
         }:
             raise StorageError("credential path is not a managed storage target")
+
+
+def checked(path: Path) -> Path:
+    path = Path(os.path.abspath(path))
+    reject_credential_names(path)
+    for part in (path, *path.parents):
         try:
             info = part.lstat()
         except FileNotFoundError:
@@ -39,7 +44,7 @@ def checked(path: Path) -> Path:
 
 
 def tree_size(path: Path, *, allow_disappearing=False) -> int:
-    checked(path)
+    path = checked(path)
     if not path.exists():
         return 0
     total = 0
@@ -49,11 +54,22 @@ def tree_size(path: Path, *, allow_disappearing=False) -> int:
     while pending:
         current = pending.pop()
         try:
-            checked(current)
+            reject_credential_names(current)
             info = current.lstat()
             entries += 1
             if entries > MAX_ENTRIES:
                 raise StorageError("managed tree entry bound exceeded")
+            if stat.S_ISLNK(info.st_mode):
+                checked(current.parent)
+                if not allow_disappearing:
+                    # The link itself is retired. Never traverse it or inspect
+                    # an external target (venv lib64 -> lib stays in this root).
+                    target = Path(os.path.abspath(current.parent / os.readlink(current)))
+                    if not target.is_relative_to(path) or not checked(target).is_relative_to(path):
+                        raise StorageError("managed symlink escapes its owned tree")
+                total += info.st_size
+                continue
+            checked(current)
             if stat.S_ISDIR(info.st_mode):
                 with os.scandir(current) as children:
                     for item in children:
@@ -65,7 +81,7 @@ def tree_size(path: Path, *, allow_disappearing=False) -> int:
                 if identity not in seen:
                     total += info.st_size
                     seen.add(identity)
-            else:
+            elif not allow_disappearing:
                 raise StorageError("unsupported managed tree entry")
         except FileNotFoundError:
             if not allow_disappearing:
@@ -301,4 +317,3 @@ class ManagedBuild:
         self.lock.unlink()
         self.finished = True
         return result
-
