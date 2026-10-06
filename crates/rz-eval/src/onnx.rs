@@ -462,6 +462,18 @@ impl BackendConfig {
                 "execution experiment unsupported or CUDA Graph lacks fixed CUDA B1 binding",
             ));
         }
+        if self.experiments.cuda_graph {
+            // The pinned ORT 1.22.0/cuDNN profile passed numeric checks, then
+            // aborted in a native exit handler (also reproduced under gdb).
+            // A Run/output fence cannot attest process teardown. Keep this
+            // failed experiment unavailable rather than hiding it by retaining
+            // sessions forever, exiting without destructors, or disabling Graph.
+            return Err(BackendError::new(
+                K::BackendUnavailable,
+                S::Admission,
+                "CUDA Graph blocked: pinned runtime failed normal native-exit acceptance",
+            ));
+        }
         if self.max_batch == 0
             || self.max_batch > MAX_BATCH
             || self.intra_threads == 0

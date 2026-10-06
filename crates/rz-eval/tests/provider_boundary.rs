@@ -131,9 +131,21 @@ fn experimental_execution_rejects_wrong_provider_shape_and_uncompiled_modes() {
     config.profiling_prefix = Some(std::env::temp_dir().join("rz-graph-placement"));
     assert!(config.validate().is_err()); // variable batch is forbidden
     config.max_batch = 1;
+    let failure = config.validate().unwrap_err();
+    if cfg!(feature = "experimental-cuda-graph") {
+        assert_eq!(
+            failure.kind,
+            rz_eval::error::FailureKind::BackendUnavailable
+        );
+        assert!(failure
+            .to_string()
+            .contains("normal native-exit acceptance"));
+    }
+    // The guard must not change the independently available binding profile.
+    config.experiments.cuda_graph = false;
     assert_eq!(
         config.validate().is_ok(),
-        cfg!(feature = "experimental-cuda-graph")
+        cfg!(feature = "experimental-io-binding")
     );
     config.experiments = ExecutionExperiments {
         reuse_buffers: true,
