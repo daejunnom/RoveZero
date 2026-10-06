@@ -1156,6 +1156,97 @@ helper의 schema/non-JSON evidence 오류도 correction과 함께 보존했다. 
 `${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-native-cache-shutdown-20261006/`에 둔다.
 별도 성능 harness는 제품·CI·일반 대국 준비에 추가하지 않았다.
 
+### 4.19 Policy 단일 buffer·고정 history 저장·변수 수명 검사
+
+<a id="policy-frame-lifetime-ab"></a>
+
+2026-10-06 source `96e76c23d3c503a212c9216ce878919e35965754`에서 두 E 후보를
+독립 feature로 구현했다. `experimental-policy-buffer`는 MEM-B08의 중간
+`Vec<f32>`를 제거하고 계약의 `Vec<f64>`에 직접 기록한다. **기존 f32 반올림 뒤
+f64 변환**, softmax/reduction 순서, 합법 수 순서, shape/유한값/WDL/오류 우선순위를
+유지한다. 공개 f32 head API는 유지한다. `experimental-projection-frames`는 MEM-B01의
+8-frame 고정 배열+사용 길이를 비교한다. ArrayVec 라이브러리를 도입한 실험은 아니다.
+전체 Rules 이력·반복·raw EP·No/Repeat·입력 key를 유지하고 초과는 잘라내지 않는다.
+두 feature는 기본 off이며 동시에 켠 결과를 각 후보의 효과로 사용하지 않는다.
+루트 dependency·Cargo.lock·공통 revision·wire·backend·정밀도는 바꾸지 않았다.
+
+변수의 마지막 사용, Drop, 공유 소비 종료, capacity 보존을 별도로 확인했다.
+
+| 대상 | 확인한 수명·검사 | 유지할 경계 |
+|---|---|---|
+| policy 임시 값 | baseline f32 저장과 계약 f64 저장의 겹침 제거. 1/3 반올림·극단 logits·전체 index·복수 오류 순서 검사 | 계산 순서·정규화·원래 오류 보존 |
+| projection frame | 짧은/8개 초과 전체 이력·흑백·반복·EP·승격에서 원래 frame/tensor/key 대조. 9번째 push는 실패하며 기존 8개 불변 | 모델의 8개 저장 상한과 Rules 전체 이력 분리 |
+| prepared-input memo | 슬롯 교체 후에도 외부 소비자가 잡은 encoded payload 유지. 마지막 외부 소비자 Drop 뒤 구 payload 회수. 현 payload는 memo 최종 Drop 뒤 회수 | bounded 1-slot·weak Rules identity·공유 소비자 수명 |
+| request/prepare/output | 아래 별도 allocator trace의 닫힌 구간 종료 뒤 새 추적 할당 잔류0 | 논리 요청 종료를 GPU 완료로 간주하지 않음 |
+| native/model/input | 실제 GPU No/Repeat 각각 drain과 native join·exit 확인 | session이 참조 bytes보다 먼저 파괴; 미확정 CUDA buffer/owner 보존 |
+
+MEM-A07 필드 재배치나 조기 해제도 native Drop 순서를 보존해야 한다.
+`Tree::reset()`의 바깥 node Vec 및 scratch capacity는 재사용을 위해 남을 수 있다.
+그 보존량·상한·회수 시점은 후속 tree 저장 실험에서 별도로 측정한다. 이번에 매 착수의
+일괄 shrink, GPU 미완료 입력 해제, cache 소비자 강제 회수를 추가하지 않았다.
+
+정책 단계 CPU default57·policy83·all-feature108개, 후속 frame-only83·contracts83·
+eval all-feature111·UCI all-feature204개가 통과했다. 엄격한 Clippy·workspace fmt도
+통과했다. [96e76c2 CPU CI37439346041](https://github.com/daejunnom/RoveZero/actions/runs/37439346041)의
+Ubuntu·Windows·bindings 세 job SUCCESS를 확인했다. CPU CI와 다음 실제 GPU 증거는 구분한다.
+
+독립 CPU fixture는 실제 Rules/C prepare/output/공통 acceptance를 연결했다. 시작 상태·
+실제 수순·8개 초과 반복 이력·raw EP·흑 캐슬링·승격의 여섯 입력, No·결정적 raw heads를
+고정했다. NN/GPU/search/D/cache는 실행하지 않았다. Source archive와 각 arm의 dependency
+lock·harness·binary hash를 고정하고 baseline/정책-only/frame-only를 같은 source에서 빌드했다.
+
+할당 관측은 24,576개 변환에서 System에 위임한 닫힌 Rust 구간만 기록했다.
+
+| arm | 할당 호출 | 누적 요청 bytes | 구간 새 heap peak bytes | 구간 종료 잔류 bytes | projection size bytes |
+|---|---:|---:|---:|---:|---:|
+| baseline | 196,608 | 756,678,656 | 30,408 | 0 | 40 |
+| policy-only | 172,032 | 754,581,504 | 30,408 | 0 | 40 |
+| frame-only | 172,032 | 736,231,424 | 30,172 | 0 | 856 |
+
+경계 underflow는0이다. 두 후보 모두 요청당8→7회지만 policy의 heap peak는 같고,
+frame은 projection의 inline 크기가 커졌다. 이 수치는 Rust 할당 요청이며 RSS·전체
+heap·VRAM·Windows commit이 아니다. 2MiB/19.5MiB의 누적 요청 감소를 resident 절약으로
+환산하거나 다음 긴 측정의 실측으로 확대하지 않는다. 관측 코드는 제품·일반 준비에 없다.
+
+성능 구간은 allocator hook 없이 각 실행 **1,572,864개 변환**으로 고정했다.
+순서는 `A1 P1 F1 F2 P2 A2 A3 P3 F3`, 후보별3쌍·물리9회이며 control3회를 공유한다.
+CPU2/affinity2·high=max512MiB/swap0·pids128·AS2GiB·실행120초+정리30초·전체1800초다.
+시간은 startup·고정 작업·종료·report·cgroup 영수증 전체, primary peak는 전체 cgroup
+`memory.peak`다. 모든 arm의 policy/WDL bit digest·완료 작업이 같다.
+
+| 후보 | A 전체 시간 합계 초 | 후보 합계 초 | T1/T0 | peak 관측 합계비 P1/P0 | 판정 |
+|---|---:|---:|---:|---:|---|
+| policy-only | 101.724358 | 100.630007 | 0.989242 | 0.823591 | HOLD |
+| frame-only | 101.724358 | 100.619629 | 0.989140 | 0.983299 | HOLD |
+
+기준선 시간 spread는0.813286초다. Policy의 쌍별 시간 이득은 이 편차보다 작다.
+Frame은 두 쌍에서 peak가 늘고 한 쌍에서 느려졌다. 사전 등록한 all-pair 상충/Pareto
+문턱을 충족하지 않아 두 옵션을 기본 off로 유지한다. 독립 peak의 합계는 동시 메모리
+사용량이 아니다. 여섯 작은 CPU 입력의 결과를 실제 GPU 엔진 효과로 확대하지 않는다.
+아홉 실행은 모두 exit0·high/max/OOM·강제 정리·소유 잔류0이다.
+
+GPU 정확성은 각 옵션을 따로 빌드해 같은 원본 BT4 ONNX·FP32·TF32 off·B1·RTX4050에서
+No/Repeat를 검사했다. 각 arm의 fresh 요청 출력12개·cache replay24개, 두 profile의
+CUDA687node/CPU fallback0·native join·exit0을 확인했다. 입력 최대 오차0,
+합법 policy `2.8014183044433594e-6`, WDL `1.7881393432617188e-7`로 두 arm이 같다.
+Provider 준비 probe는 요청 출력과 별개다. High/max/OOM·강제 정리·소유 잔류0이다.
+GPU gate는40.158342초/37.822505초, cgroup peak5,084,160,000B/2,108,690,432B였다.
+같은 환경의 성능 baseline/variant 및 file-cache 조건 대조를 수행하지 않았으므로 이
+차이에서 메모리·시간 개선률을 만들지 않는다. VRAM/Windows commit peak는 unknown이다.
+Raw logits·batch1/2/4/8/16 독립 suite·GPU 성능 A/B·대국 인수는 이 gate와 별도다.
+복사형 ORT heap 문제는 별도 HOLD다.
+
+이전10개 series/epoch와 원시 ledger hash·집계의 완전 일치를 확인하고 새6개 비교만
+추가했다. 누적은 **42개 비교·고유78회·공유 control6개·12개 series/epoch·제외26개
+collection**이다. 세 allocator trace·CPU setup·두 GPU 수치 검사는 성능 합계에서 제외한다.
+원시 등록·source/lock/binary hash·trace·CPU/GPU report·CI·누적 동일성은 Git 밖
+`${ARTIFACT_ROOT}/reports/coordinator-integration/pr20-policy-frame-lifetime-20261006/`에 보존한다.
+
+전체 목표의 남은 후보는 edge 평탄화·hot/cold/실제 layout, 수명별 scratch/arena/pool,
+allocator 한 변수, immutable 모델 mmap, 기존 I/O Binding/CUDA Graph의 실제 효과 인수다.
+관측 lock 경합·표본 분포·장비 capability에 따라 나머지 MEM 후보의 구체 적용 여부를
+기록한다. 두 CPU HOLD와 수치 gate 완료를 남은 최적화 전체 완료로 보고하지 않는다.
+
 ## 5. 후속 구현·검증 순서
 
 할당/복사 제거 → 저장 밀도 → bounded scratch/arena/pool → 임계 구역/완료 통지 →
