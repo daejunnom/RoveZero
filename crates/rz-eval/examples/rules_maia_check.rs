@@ -657,20 +657,29 @@ fn evaluate_profile(
     let execution_admission = owner.admission_policy().execution_resources();
     let session_admission = owner.admission_policy().session_resident_admission();
     #[cfg(feature = "experimental-raw-cache")]
-    let cache_stats = if raw_cache {
-        let stats = projection.raw_cache_stats()?;
-        if work.is_ok() && (stats.hits != replay_count || stats.staged != 0) {
-            return Err("raw-cache replay accounting differs".into());
-        }
-        json!({"hits":stats.hits,"misses":stats.misses,"entries":stats.entries,
-            "staged":stats.staged,"retained_bytes":stats.retained_bytes})
+    let cache_stats: Result<Value> = if raw_cache {
+        // A poisoned stats owner or accounting error must not bypass the
+        // original work/cleanup receipts or preservation of an unconfirmed
+        // native owner. Collect the error here and return it after those steps.
+        (|| {
+            let stats = projection.raw_cache_stats()?;
+            if work.is_ok() && (stats.hits != replay_count || stats.staged != 0) {
+                return Err("raw-cache replay accounting differs".into());
+            }
+            Ok(
+                json!({"hits":stats.hits,"misses":stats.misses,"entries":stats.entries,
+                "staged":stats.staged,"retained_bytes":stats.retained_bytes}),
+            )
+        })()
     } else {
-        Value::Null
+        Ok(Value::Null)
     };
     #[cfg(not(feature = "experimental-raw-cache"))]
-    let cache_stats = Value::Null;
+    let cache_stats: Result<Value> = Ok(Value::Null);
     profiles.push(json!({"history_fill":profile,"batch_size":1,
-        "raw_cache":raw_cache,"raw_cache_replays":replay_count,"cache_stats":cache_stats,
+        "raw_cache":raw_cache,"raw_cache_replays":replay_count,
+        "cache_stats":cache_stats.as_ref().ok(),
+        "cache_stats_failure":cache_stats.as_ref().err().map(|error|error_receipt(error.as_ref())),
         "provider":if is_cuda{"cuda"}else{"cpu"},
         "native_origin":if is_cuda{"cuda_onnx"}else{"cpu_onnx"},
         "cuda":cuda_metadata,
@@ -697,6 +706,7 @@ fn evaluate_profile(
     cleanup?;
     shutdown?;
     mapping_audit?;
+    cache_stats?;
     if !diagnostics_clean || !cleanup_clean {
         return Err(
             "native diagnostics or unexpected deliveries prevent profile acceptance".into(),

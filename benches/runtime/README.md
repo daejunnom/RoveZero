@@ -137,7 +137,8 @@ ID 수정은 CPU admission 회귀로만 검증했다. 부분 수치·예약0을 
 
 [Native 종료 수정·긴 CPU A/B](../../docs/research/MEMORY-EXECUTION-OPTIMIZATION.md#raw-cache-native-shutdown-long-ab)에서는
 수치 gate 예제의 request drain 뒤 native join 누락을 수정했다. 제품 UCI는 이미 join을
-확인하고 있었다. 원본 BT4 B1 No/Repeat의 fresh12/cache24·두 profile join·exit0을 확인했고,
+확인하고 있었다. 통계 수집 오류도 원래 work/정리 영수증과 owner 보존을 건너뛰지 않게 했다.
+원본 BT4 B1 No/Repeat의 fresh12/cache24·두 profile join·exit0을 source b39dc4a에서 확인했고,
 별도 의도적 WDL 오류는 원래 failed/exit1을 보존하며 정리했다. 이는 GPU 성능/대국 인수가 아니다.
 복사형 ORT heap 문제는 별도 HOLD다. 고정1,572,864-hit CPU 세 쌍은 합산 시간비1.008407,
 peak 관측비0.958297·문턱 실패로 cache 기본 off/HOLD다. 이전 짧은 조건과 분리하여 누적

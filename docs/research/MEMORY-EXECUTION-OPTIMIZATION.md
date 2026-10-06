@@ -1094,6 +1094,13 @@ CPU 회귀는 실제 ContractEvaluator/NativeWorkerOwner 경계에서 정상 요
 Ubuntu·Windows·bindings 세 job SUCCESS를 직접 확인했다. CPU CI와 다음 실제 GPU 근거는
 각각 보존한다.
 
+후속 오류 경로 검토에서는 cache 통계 조회/불일치가 profile 영수증과 owner 보존 전에
+반환될 수 있음을 확인했다. 통계 결과를 `Result`로 수집하고 오류를 profile에 함께 기록한
+뒤 원래 work·drain·native join 오류부터 반환하도록 보완했다. 이 보완도 수치 예제에만
+적용했다. Eval106개·최소 예제2개·strict Clippy/fmt·release build로 CPU 검사했으며,
+초기 formatting check 실패와 후속 수정은 별도 로그로 보존한다. 다음 GPU 근거의 실제
+실행 source는 계속b39dc4a이며 통계 영수증 보완 뒤 GPU 재실행으로 표시하지 않는다.
+
 수치 gate는 같은 원본 BT4 ONNX·FP32·TF32 off·B1·RTX4050에서 No/Repeat를 실행했다.
 **Fresh 요청 출력12개·cache replay24개**, 두 profile의 native join·process exit0을
 확인했다. Provider 준비 probe 두 개는 요청 출력12개와 별개다. 입력 최대 오차0,
