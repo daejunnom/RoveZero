@@ -15,7 +15,7 @@ def run(registration, output):
     envelope=read_json(lock,1024**2)
     require(envelope["lock_version"]==2 and envelope["domain"]=="rz-e01-model-endpoints-v2" and envelope["execution_ready"] is False,"separate V2 lock required")
     declaration=envelope["input"]
-    require(declaration["comparison"]=="external_engine" and declaration["seed"]==1 and declaration["max_plies"]==256 and declaration["clock"]=={"base_ms":120000,"increment_ms":1000,"ponder":False},"first external pilot conditions differ")
+    require(declaration["comparison"]=="external_engine" and declaration["seed"]==1 and declaration["max_plies"]==256 and declaration["clock"]=={"base_ms":120000,"increment_ms":1000},"first external pilot conditions differ")
     require(declaration["white_order"]==["baseline","candidate"] and declaration["opening"]["initial"]=="startpos" and not declaration["opening"]["moves"],"paired complete standard start required")
     gates=registration["gate_reports"]
     require(set(gates)=={"numerical","adapter_regression","external_preflight"},"all independent gates required")
