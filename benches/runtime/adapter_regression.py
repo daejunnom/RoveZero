@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from bounded_local import OwnedRun, outside_git, put
+from bounded_local import OwnedRun, outside_git, put, resolve_affinity
 from paired_search import native_receipts, read_json, require, sha256
 
 SCHEMA = "rz-adapter-regression/2"
@@ -24,6 +24,16 @@ PROFILE_KEYS = {"backend_sha256", "model_manifest_sha256", "encoding_manifest_sh
 ARGUMENTS = {"--source-weights", "--onnx-model", "--export-manifest", "--manifest-sha256",
              "--ort-library", "--ort-sha256", "--cuda-bundle", "--cuda-bundle-sha256",
              "--runtime-cache-root", "--search-simulations", "--search-max-edges", "--final-selection"}
+
+def resource_affinity(notes, allowed=None):
+    require(isinstance(notes, dict), "registered resource policy required")
+    affinity=resolve_affinity(notes.get("cpu_affinity"),allowed)
+    require(notes.get("cpu_affinity")==affinity,"explicit sorted CPU affinity required")
+    fixed={"memory_high_GiB":6,"memory_max_GiB":12,"swap":0,"precision":"fp32",
+           "tf32":False,"history_fill":"no","batch":1}
+    require(all(type(notes.get(key)) is type(value) and notes.get(key)==value
+                for key,value in fixed.items()),"registered fixed resource/input policy differs")
+    return affinity
 
 
 def validate(manifest):
@@ -66,7 +76,7 @@ def validate(manifest):
     for witness in manifest["numerical_witnesses"]:
         path = outside_git(witness["path"])
         require(sha256(path) == witness["sha256"] and read_json(path, 1024**2).get("status") == "passed", "numerical witness was not passed")
-    require(isinstance(manifest["resource_notes"], dict), "observation scope required")
+    resource_affinity(manifest["resource_notes"])
     from shared_runtime_cache import validate as validate_cache
     cache=manifest["runtime_cache_preparation"]
     root,_=validate_cache(cache)
@@ -82,9 +92,9 @@ def validate(manifest):
     return manifest
 
 
-def prepare_cache(spec, output, deadline):
+def prepare_cache(spec, output, deadline, affinity=None):
     directory=output/"cache-preparation"
-    owner=OwnedRun(directory,wall=min(60,deadline-time.monotonic()))
+    owner=OwnedRun(directory,wall=min(60,deadline-time.monotonic()),affinity=affinity)
     report=None
     try:
         put(directory/"spec.json",spec)
@@ -138,8 +148,8 @@ def summarize(pairs):
             "all_individual_pair_gates_required": True, "past_other_experiments_in_denominator": False}
 
 
-def run_once(variant, directory, overall_deadline):
-    owner = OwnedRun(directory, wall=min(180, overall_deadline-time.monotonic()))
+def run_once(variant, directory, overall_deadline, affinity=None):
+    owner = OwnedRun(directory, wall=min(180, overall_deadline-time.monotonic()),affinity=affinity)
     result = {"source_commit": variant["source_commit"], "source_patch": variant["source_patch"], "binary_sha256": variant["binary_sha256"], "accepted": False}
     stage = "binary_verification"
     try:
@@ -250,14 +260,15 @@ def run(manifest, output):
     error=None
     cache_preparation=None
     try:
-        cache_preparation=prepare_cache(manifest["runtime_cache_preparation"],output,deadline)
+        affinity=resource_affinity(manifest["resource_notes"])
+        cache_preparation=prepare_cache(manifest["runtime_cache_preparation"],output,deadline,affinity)
         for index in range(8):
             comparison = "AA" if index<3 else "AB"
             order = ("baseline", "baseline") if comparison=="AA" else (("baseline", "candidate") if index%2 else ("candidate", "baseline"))
             results=[]
             for ordinal, role in enumerate(order):
                 require(time.monotonic()+210 < deadline, "overall budget cannot admit another bounded run")
-                result = run_once(manifest[role], output/f"{comparison}-{index:02}-{ordinal}-{role}", deadline)
+                result = run_once(manifest[role], output/f"{comparison}-{index:02}-{ordinal}-{role}", deadline,affinity)
                 require(result["accepted"], result.get("error", "fixed work failed"))
                 if reference_work is None:
                     reference_work=result["work"]

@@ -5,7 +5,8 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from adapter_regression import pair_result, summarize
+from adapter_regression import pair_result, resource_affinity, summarize
+from bounded_local import resolve_affinity
 
 
 def observation(t=100., p=1000):
@@ -16,6 +17,24 @@ def observation(t=100., p=1000):
 
 
 class AdapterRegressionTests(unittest.TestCase):
+    def test_declared_cpu_ids_are_applied_without_an_unavailable_fallback(self):
+        self.assertEqual(resolve_affinity([0,2],{0,1,2,3}),[0,2])
+        self.assertEqual(resolve_affinity(None,{0,1,2,3}),[0,1])
+        for requested in ([0,0],[0,9],[False,1],[0],[0,1,2],"0,2"):
+            with self.assertRaises(ValueError):
+                resolve_affinity(requested,{0,1,2,3})
+
+    def test_registration_cannot_misstate_applied_cpu_memory_or_input_policy(self):
+        notes=dict(cpu_affinity=[0,2],memory_high_GiB=6,memory_max_GiB=12,swap=0,
+                   precision="fp32",tf32=False,history_fill="no",batch=1)
+        self.assertEqual(resource_affinity(notes,{0,1,2,3}),[0,2])
+        for key,value in (("cpu_affinity",[2,0]),("memory_high_GiB",7),("memory_max_GiB",13),
+                          ("swap",1),("precision","fp16"),("tf32",True),("history_fill","repeat"),
+                          ("batch",4),("batch",True)):
+            changed={**notes,key:value}
+            with self.assertRaises(ValueError):
+                resource_affinity(changed,{0,1,2,3})
+
     def test_both_time_and_peak_are_per_pair_gates(self):
         self.assertTrue(pair_result(observation(), observation(105.,1050), "AB")["passed"])
         self.assertFalse(pair_result(observation(), observation(105.01,800), "AB")["passed"])

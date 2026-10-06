@@ -29,11 +29,22 @@ def outside_git(path):
             raise ValueError("generated evidence stays outside Git")
     return path
 
+def resolve_affinity(requested=None, allowed=None):
+    """Two declared logical CPUs; unavailable choices never fall back silently."""
+    available = set(os.sched_getaffinity(0) if allowed is None else allowed)
+    cpus = sorted(available)[:2] if requested is None else requested
+    if (not isinstance(cpus, list) or len(cpus) != 2 or
+            any(type(cpu) is not int or cpu < 0 for cpu in cpus) or
+            len(set(cpus)) != 2 or not set(cpus).issubset(available)):
+        raise ValueError("exactly two distinct available CPU IDs required")
+    return sorted(cpus)
+
 class OwnedRun:
     """Only this fresh cgroup and exact child group are signaled or removed."""
-    def __init__(self, directory, wall=180, address_space=2**40):
+    def __init__(self, directory, wall=180, address_space=2**40, affinity=None):
         if os.name != "posix" or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise ValueError("local cgroup-v2 Linux execution required")
+        self.affinity = resolve_affinity(affinity)
         self.started = time.monotonic()
         self.deadline = self.started + wall
         self.directory = outside_git(directory)
@@ -47,7 +58,6 @@ class OwnedRun:
         self.pending = bytearray()
         self.total = 0
         self.forced = False
-        self.affinity = sorted(os.sched_getaffinity(0))[:2]
         self.address_space = address_space
         try:
             if len(self.affinity) != 2:

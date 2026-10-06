@@ -93,7 +93,8 @@ def run(registration, output):
     gate_identities(declaration,reports)
     asset_root=Path(registration["asset_root"])
     require(asset_root.is_absolute() and asset_root.is_dir() and not asset_root.is_symlink(),"absolute asset root required")
-    owner=OwnedRun(outside_git(output),wall=900,address_space=declaration["budget"]["address_space_per_process_bytes"])
+    owner=OwnedRun(outside_git(output),wall=900,address_space=declaration["budget"]["address_space_per_process_bytes"],
+                   affinity=declaration["resources"]["affinity"])
     result={"status":"failed","strength_eligible":False,"lock_sha256":registration["lock_sha256"]}
     try:
         put(owner.directory/"registration.json",registration)
