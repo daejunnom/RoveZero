@@ -5,6 +5,37 @@ PR #20 통합 `9e450d5325a51b570e72472efd54368a36dab81b`를 분리 전 기준으
 revision `0.1`, Rules, PUCT, runtime의 취소·세대·물리 수명은 유지한다. 구현 제공,
 CPU 검사, 실제 신경망 수치 검사, 성능 회귀, 외부 대국은 별도 인수다.
 
+## 5% 기준의 적용 범위
+
+2026-10-07 사용자 정정에 따라 **현재 모델 어댑터·외부 UCI 통합 작업의 등록·진행에는
+5% 조건을 적용하지 않는다.** 이 기준은 의미 변화가 없는 자료형·레이아웃·소유권 표현
+변경 등 리팩터링의 성능 회귀를 따로 평가할 때 사용하는 기준이다. 비교 이름이
+AdapterEquivalence 또는 분류가 E라는 이유만으로 현재 통합 전체에 자동 적용하지 않는다.
+대상 변경과 고정 조건을 명시한 별도 리팩터링 A/B에서만 시간·peak의 5% 문턱을 선택한다.
+
+A/A의 시간·메모리 편차는 환경 변동을 설명하는 관측값이다. 5%를 넘었다는 이유만으로
+비교 등록·A/B 실행·외부 엔진 연결을 차단하지 않는다. InternalWeights·InternalModel·
+InternalSearch·ExternalEngine의 모델·탐색·기력 차이를 이 문턱으로 판정하지 않는다.
+기존 E 최적화의 [메모리·속도 상충 채택 기준](research/MEMORY-EXECUTION-OPTIMIZATION.md#adoption-gate)은
+해당 의미 보존 변경의 효과 인수에 적용하며 현재 통합의 일반 등록 조건으로 확대하지 않는다.
+
+후속 recipe는 `--acceptance-scope=integration_observation`을 명시한다. 시간·peak·쌍별
+비율·같은 조건의 합계를 보존하되 `performance_acceptance=not_applicable`로 남긴다.
+완료된 측정의 `status=passed`는 작업량·결과·물리 수명·증거가 유효하다는 뜻이며 성능
+회귀 없음의 선언이 아니다. 별도 리팩터링은 `semantic_preserving_refactor`를 선택하고
+각 A/B 쌍에 T_B/T_A≤1.05 및 P_B/P_A≤1.05를 적용한다. 두 범위 모두 A/A 편차는 gate가 아니다.
+
+기존 원시 자료·등록·HOLD·도구 SHA는 당시 판정 이력으로 보존한다. 적용 범위 정정만으로
+실행하지 않은 A/B나 Stockfish 대국을 통과로 바꾸지 않는다. 입력·작업량·수치·물리 완료·
+할당·종료·정리 검사는 계속 요구하고 유한 실행 예산은 별도 조건으로 유지한다.
+
+범위 분리 도구 `fe355dc`의 CPU recipe는 WSL Python 3.12.3에서 62개 통과했고 Windows
+Python 3.14에서 58개 통과·Linux 전용 4개 미실행이었다. A/A 8% drift 뒤에도 통합 A/B를
+수집하는 경로, 별도 리팩터링의 쌍별 5% 초과 거부, 범위 혼합·미지정 거부, 진단·작업량·
+수명 실패 거부를 mock으로 확인했다. Windows Python 3.10의 첫 검사는 기존
+`Path.is_junction` API 부재로 실패했으며 지원 버전 결과와 구분한다. 이 CPU 검사는
+실제 GPU 측정·새 A/B·Stockfish 대국 증거가 아니다. 새 CI의 실행 SHA·상태도 별도로 기록한다.
+
 ## 제품 경계
 
 ```mermaid
@@ -159,10 +190,10 @@ ponder·평가 기반 조기 판정 off다. Stockfish CPU와 RoveZero CPU+RTX 40
    원래 실패 자료는 보존하고 유효 A/A·A/B의 분모에서 제외한다. 기본값 100,000과
    PUCT는 변경하지 않는다. V2는 `rove_tree_max_edges`를 잠그고 실제 영수증과 대조하며
    외부 엔진에는 전달하지 않는다. 기존 V1의 edge 100,000 검증은 그대로 유지한다.
-   전체 3600초다. A/A 3쌍의 쌍별/전체 편차가 5% 이하일 때만 교차 순서 A/B 5쌍을 실행한다.
-   준비/ready·검색·drain·전체와 fresh cgroup memory.peak를 기록한다. 각 유효 쌍의
-   T_B/T_A≤1.05 **및** P_B/P_A≤1.05를 요구한다. 작업량·결과·peak 불명이나 수명 실패는
-   HOLD다. NN-backed 8192 simulation와 추가 root 2개의 소비를 영수증으로 대조하며
+   전체 3600초다. A/A 3쌍으로 환경 편차를 기록한 뒤 교차 순서 A/B 5쌍을 측정한다.
+   현재 통합은 `integration_observation`으로 등록하고 A/A·A/B의 5% gate를 사용하지 않는다.
+   준비/ready·검색·drain·전체와 fresh cgroup memory.peak, 쌍별 비율과 합계를 기록한다.
+   작업량·결과·peak 불명이나 수명 실패는 HOLD다. NN-backed 8192 simulation와 추가 root 2개의 소비를 영수증으로 대조하며
    다른/종료 작업을 조용히 대체하지 않는다. 같은 등록 비교의 합계를 누적하되 다른 과거
    E 실험을 분모에 섞지 않는다. 기존 E 채택의 20% 메모리 절약 문턱과 구분한다.
    첫 새 A/A는 작업량을 완료했지만 파일 캐시 귀속·ready 편차로 HOLD였다. 사용자 승인 후
@@ -181,15 +212,16 @@ ponder·평가 기반 조기 판정 off다. Stockfish CPU와 RoveZero CPU+RTX 40
    affinity는 WSL이 서로 다른 core로 보고한 CPU 0·2를 명시한다. 이는 Windows 호스트의
    물리 코어 독점 보장이 아니다. 명세의 CPU ID를 실제 자식에 적용하고 미가용 ID나
    다른 memory/precision/history/batch 선언은 거부한다. 이 통제 조건은 기존 비교와
-   분리해 등록하며 작업량·T/P·5% 문턱은 유지한다. 쌍별 A/A가 모두 통과해도 여섯 실행의
-   전체 편차가 5%를 넘으면 A/B를 시작하지 않는다.
+   분리해 등록하며 작업량과 T/P 관측 범위를 유지한다. 여섯 A/A 실행의 전체 편차도
+   원시 자료와 함께 보고하며 특정 비율을 넘었다는 이유만으로 A/B를 차단하지 않는다.
    후속 recipe는 model ready·각 고정 입력 완료·물리 process 종료의 네 시점에서 자신의
    cgroup memory.peak/current/stat와 cpu.stat만 읽는다. 반복 polling·GPU 조사·peak reset은
    하지 않으며 읽기 비용도 전체 T에 포함한다. memory.peak는 그룹 생성 후 누적 최대치이고
    current/stat는 순차적인 현재 값이므로 원자적 표본이나 peak 구성으로 해석하지 않는다.
    추가 읽기 실패는 checkpoint 오류로 남기고 정상 엔진을 종료하지 않는다. 필수 종료 시
    주 peak 검증은 유지한다. 이 관측이 없는 과거 자료의 peak 구간·구성을 추정하지 않는다.
-4. 신경망 동등성과 회귀가 모두 통과한 뒤 외부 두 판을 실행한다. 서로 다른 엔진 nodes를
+4. 신경망 동등성과 고정 작업량·물리 수명·측정 증거를 확인한 뒤 외부 두 판을 실행한다.
+   현재 통합의 시간·peak 관측과 외부 대국 인수를 구분한다. 서로 다른 엔진 nodes를
    같은 작업량으로 환산하지 않으며 물리 NN 완료와 탐색 소비를 분리한다.
 5. CPU CI·GPU 수치·회귀·외부 UCI/대국을 각각 인수한다. 첫 할당·CUDA·물리 완료 실패에서
    후속 GPU 실행을 중단하고 자료를 보존한다. 복구는 등록된 A와 기존 V1 경로다.
@@ -202,7 +234,9 @@ unknown이다. 별도 cloud 비용·학습·정밀도/batch 정책·backend 변�
 
 ## 현재 인수 상태 (2026-10-07)
 
-구현·CPU 인수와 실제 GPU 수치 인수는 제공했으며 성능 회귀·대국 인수는 HOLD다.
+구현·CPU 인수와 실제 GPU 수치 인수는 제공했다. 현재 통합의 5% 성능 인수는 적용 대상이
+아니며, A/B 측정과 실제 Stockfish 대국은 미실행이다. 아래 5% 초과 HOLD는 적용 범위
+정정 전 도구의 판정 이력이며 현재 등록을 차단하는 조건이나 어댑터 회귀의 증거가 아니다.
 기존 등록된 엔진/arena 바이너리 source는 `4d715b3`이다. 후속 recipe의 affinity·유한 예산
 변경은 `acf9669`·`b4924f1`, CPU root 통계 관측 예제는 `121bcf6`·`1307cc8`이다.
 이후 생산 Rules·encoding·adapter·search·runtime·UCI와 루트 Cargo/lock/toolchain 소스의
@@ -253,10 +287,11 @@ unknown이다. 별도 cloud 비용·학습·정밀도/batch 정책·backend 변�
 native 시작 영수증을 분해하면 두 번째 쌍의 모델 자산 검증 차이는 2.40초로 ready 차이의
 약 64%였다. 이는 파일 I/O·hash·압축 해제·호스트 경쟁 중 하나를 특정한 측정은 아니다.
 원인을 GPU clock·호스트 부하·어댑터 결함으로 확정하지 않는다. A/A 두 쌍만 완료했으며
-첫 초과에서 종료했으므로 A/B는 0쌍이다. 기준을 완화하거나 과거 자료를 섞지 않는다.
+당시 첫 초과에서 종료했으므로 A/B는 0쌍이다. 원시 값과 당시 판정은 보존하고 서로 다른
+조건의 자료를 섞지 않는다. 현재 적용 범위는 위 사용자 정정을 따른다.
 
 Stockfish 19 CPU preflight·옵션·stop·quit·소유 process 종료는 통과했고 V2 실행 선언은
-제공했다. 회귀 gate가 HOLD라 paired 두 판은 실행하지 않았으며 실제 대국 PGN도 없다.
+제공했다. 당시 회귀 gate가 HOLD라 paired 두 판은 실행하지 않았으며 실제 대국 PGN도 없다.
 후속 native 입력 슬롯은 파일 3개/1,123,789,653바이트를 11.86초에 복사·해시 검증했고
 한 슬롯·2GiB 상한·읽기 전용·유한 수명을 기록했다. 원본 자산은 보존하며 이 복사 비용을
 개별 엔진 개선으로 주장하지 않는다. CPU 0·2와 새 입력 조건을 동일하게 선언한 새
@@ -292,7 +327,7 @@ HOLD였다. 전체 peak 편차는 2.21%였으며 A/B는 0쌍이다.
 여섯 실행의 전체 시간 편차는 7.24%, peak 편차는 5.51%다. 모든 실행에서 두 입력당
 4096 simulation·착수 `d2d4`/`h2h3`·root 소비 2개·backup 소비 8192개·runtime 완료
 8194개가 일치했고 정상 물리 종료와 자신의 임시 저장소 정리를 확인했다. memory.high/max·
-OOM·cgroup CPU throttling은 0이다. 회귀 인수는 HOLD이며 A/B·Stockfish paired 대국은
+OOM·cgroup CPU throttling은 0이다. 당시 회귀 판정은 HOLD였으며 A/B·Stockfish paired 대국은
 실행하지 않았다. 두 등록 조건의 합계와 원시 자료는 각각 보존하고 서로 분모를 섞지 않는다.
 두 조건과 유한 준비·사이의 경과 시간을 합한 등록된 GPU 비교 비용은 1931.79초였다.
 이번 UCI 경로의 입력별 `info nodes`는 제공되지 않아 null이다. 입력별 작업량은 확인된
@@ -303,8 +338,8 @@ OOM·cgroup CPU throttling은 0이다. 회귀 인수는 HOLD이며 A/B·Stockfis
 한 실행의 runtime pin 6.87초와 다른 실행의 backend load 7.90초를 확인했다. 단계 시간은
 관측된 지연 범위이며 파일 I/O·검증 CPU·할당·호스트 경쟁·clock 중 원인을 특정하지 않는다.
 기존 memory.stat는 종료 뒤 수치이므로 높은 peak가 생긴 구간과 anon/file/kernel 구성은
-unknown이다. 이를 확인할 별도 진단은 성능 표본이 아니며 성공하더라도 HOLD나 5% 기준을
-대체하지 않는다. checkpoint와 진단 분류의 후속 CPU recipe 59개가 통과했으며 Rust·엔진
+unknown이다. 이를 확인할 별도 진단은 성능 표본이 아니며 성공하더라도 A/B 측정을
+대체하지 않는다. checkpoint와 진단 분류의 당시 CPU recipe 59개가 통과했으며 Rust·엔진
 binary는 변경하지 않았다. 기존 CPU CI의 실제 성공 SHA `55017cf`와 후속 recipe SHA를
 구분한다.
 
@@ -328,5 +363,7 @@ peak 사례의 원인이나 구간을 이 한 실행으로 소급하지 않는�
 3600초 창의 누적 비용은 2464.51초였고 상한 초과·OOM·강제 종료·소유 process 잔류는
 없었다. 원래 HOLD와 비교 분모는 유지하며 추가 전체 비교를 자동으로 재등록하지 않는다.
 
-다음 GPU 인수는 진단 근거에 따른 통제 조건을 등록하고 A/A 3쌍·A/B 5쌍을 통과한 뒤
-Stockfish 두 판을 실행하는 순서다. 현재 성능 회귀 없음·외부 강도 검증 완료를 선언하지 않는다.
+다음 GPU 작업은 새 유한 실행 창과 통제 조건을 등록하고 A/A 3쌍·A/B 5쌍의 유효 측정
+증거를 남긴 뒤 Stockfish 두 판을 실행하는 순서다. 5% 편차를 새 창의 등록 조건으로
+사용하지 않는다. 기존 3600초 창의 종료와 새 창의 실행 선택은 이 적용 범위 정정과 별개다.
+현재 성능 회귀 없음·외부 강도 검증 완료를 선언하지 않는다.
