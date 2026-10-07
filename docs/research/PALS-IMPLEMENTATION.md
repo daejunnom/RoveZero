@@ -1398,3 +1398,62 @@ CPU fixture를 통과했다. source/test 전후 pin 일치·managed temporary �
 test는 `4652166797a046c6836bc38227917fe94835431e8ffe7fd05b643f21cb9f3327`이다.
 원시 로그는 같은 관리 경로의 `whole-line-model-tests-75.log`와 supervisor 기록에
 보존하며 실제 before-criterion root74 인수와 구분한다.
+
+### 새 사전 criterion의 실제 whole-line 인수
+
+root74는 이전 root67 factual 영수증을 읽지 않고 새 Rust child를 실행했다. 등록된
+root66 binary의 실제 capabilities child 1회(CPU 0) 뒤, actual63의 strict current
+Propose root와 첫 Repair의 두 3ply line을 독립 원시 source pin으로 연결했다. 새
+criterion·selection을 durable 게시하고 Rules-only child 2회(CPU 0)로 endpoint를
+준비한 뒤 최종 before-plan을 저장하고 fresh continuation child 2회(CPU 2)를 실행했다.
+
+`maximize_root_surrogate`·L3·H2·N100000·TT16·q4·margin1·score limit20000을 사전에
+고정했다. 두 black endpoint의 raw 값은 0/8, criterion의 root surrogate는 0/-8이며
+조건부 known pair 1개·sign1을 인수했다. 원시 점수의 의미는 유지했고 강제 전체 line의
+유한 endpoint 비교를 minimax·반박·Repair 성공으로 바꾸지 않았다. 두 line은 같은
+첫 move를 갖기 때문에 이 pair를 다른 Repair next-move 두 후보로 만들지도 않는다.
+ordinary policy·C slot·WDL·학습 target·loss·role projection은 생성하지 않았다.
+
+immutable binary는 8MiB 출력 은행 밖의 exact path/pin으로 참조하며 reload 때 실제
+bytes를 다시 읽었다. criterion·before-plan·request·receipt·launch·process 관측과
+독립 pins를 저장한 뒤 strict frozen parent도 새 객체로 reload하여 같은 factory와
+verify 결과를 확인했다. capabilities/Rules/continuation 5개 child 모두 loaded inode를
+stdin 전에 확인했고 exit 0·reap·EOF·group 부재·빈 stderr·cleanup error 없음·원래
+allowance를 관측했다. historical build66/source `83b886c`를 재사용한 것이며 이번
+새 빌드나 현재 Rust source 비교로 표현하지 않는다. 모델 생성·forward·checkpoint
+읽기·optimizer·backward·학습·GPU는 0이다.
+
+실제 driver exit·pipe·group 정리까지는 14.128초, CPU 환경 설치를 포함한 service는
+54.369초였다. 기능 인수이며 성능 비교가 아니다. 실행 전 affinity 0/2·high 6GiB/max
+12GiB·swap 0·pids 128과 managed temporary/tree cleanup을 확인했다. 실제 peak는
+unknown이다. 원시 자료는 `runs/pals/actual-whole-line-ordinal-cpu-74/`와 continuation의
+root74 supervisor 기록에 보존한다. `root-result.json` SHA-256은
+`ad1ada19b4db4406d5d4d9176ae86ac2fa49f456e575b51001e2566bc1b945d8`다.
+
+### 제품 CPU 등록과 외부 helper의 동일 PID 기능 검사
+
+root72는 별도 debug·CPU ONNX feature·locked/offline 빌드에서 Rust/Cargo source 230개를
+전후 대조하고 UCI와 main arena 바이너리를 등록했다. Windows Git worktree pointer를
+WSL Git이 해석하지 못한 root71 preflight 실패는 Cargo 시작 전 실패로 보존했으며
+Git 설정을 수정하지 않았다. 기준 Git SHA는 Windows에서 고정하고 WSL에서 같은
+file bytes를 확인했다. 등록 자체는 제품 NN·대국 인수가 아니다. PALS pair 실행의
+실제 진입점은 main arena와 다른 `pals_pair_prepare` example이므로 이를 대체하지 않는다.
+
+root76은 기존 Stockfish 19 pin·T2·Hash16MiB profile을 사용한 새 helper CPU03 기능
+검사다. 실제 `/proc/PID/exe`를 첫 stdin 전에 확인한 단일 PID에서 startpos 및
+`startpos moves e2e4 e7e5`를 차례로 입력하고 각 `go depth 2 nodes 4096 movetime 900`
+뒤 ready barrier를 확인했다. 보고된 depth2 nodes는 148/73, bestmove는 e2e4/g1f3이며
+stop·마감 도달·재시작·출력 잘림 없이 종료했다. 옵션은 광고 type/range·설정 명령·
+readyok로 확인했지만 query 불가능한 실제 적용값까지 관측했다고 표현하지 않는다.
+
+정상 quit exit 0, unreaped leader의 TERM/KILL 뒤 실제 reap·두 pipe EOF·group 부재를
+확인했다. 최종 stdout부터 실제 driver exit·EOF·group 정리까지 0.722초였고 최초
+60초·합산 output1MiB·line16KiB·stdin4KiB를 지켰다. managed temporary/tree 정리도
+verified다. foreign UCI가 보고한 nodes 검사이며 물리 hard-node cap·합법 수·PALS
+제품 소비자·paired 강도·RoveZero NN·GPU 인수가 아니다. 실제 memory peak와 이
+standalone probe의 inherited affinity는 별도 관측하지 않았으므로 unknown이다.
+
+원시 자료는 `external-helper-pair-cpu-03/attempt-01/`과 continuation의
+`stockfish-helper-supervisor-76.json`에 보존했다. 기존 CPU02의 node256 실패와
+불완전 paired 결과를 이 성공으로 대체하지 않는다. 새 paired 실행은 제품 UCI와
+PALS example의 별도 등록, 새 조건·source·manifest digest 및 종단 인수를 요구한다.
