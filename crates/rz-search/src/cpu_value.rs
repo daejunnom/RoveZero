@@ -606,23 +606,14 @@ impl CpuFloatValue {
         // pass uses immutable weights and independent columns, so a failure
         // cannot leave a partially applied delta; no per-node matrix clone.
         for perspective in [Color::White, Color::Black] {
-            for column in 0..CPU_ACCUMULATOR_WIDTH {
-                self.changed_sum(
-                    exact[perspective as usize][column],
-                    column,
-                    changes.for_side(perspective),
-                    direction,
-                )?;
+            for (column, value) in exact[perspective as usize].iter().enumerate() {
+                self.changed_sum(*value, column, changes.for_side(perspective), direction)?;
             }
         }
         for perspective in [Color::White, Color::Black] {
-            for column in 0..CPU_ACCUMULATOR_WIDTH {
-                exact[perspective as usize][column] = self.changed_sum(
-                    exact[perspective as usize][column],
-                    column,
-                    changes.for_side(perspective),
-                    direction,
-                )?;
+            for (column, value) in exact[perspective as usize].iter_mut().enumerate() {
+                *value =
+                    self.changed_sum(*value, column, changes.for_side(perspective), direction)?;
             }
         }
         Ok(())

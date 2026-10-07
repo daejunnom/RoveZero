@@ -847,6 +847,9 @@ impl<M: RoleModel> PalsEngine<M> {
         counters.examined_edges += 1;
         Ok(child)
     }
+    // Keep borrowed role context separate from the cancellation/deadline and
+    // mutable work ledger; no role input may own or retain those controls.
+    #[allow(clippy::too_many_arguments)]
     fn ranked(
         &mut self,
         node: usize,
@@ -917,6 +920,9 @@ impl<M: RoleModel> PalsEngine<M> {
         });
         Ok(indices.into_iter().map(|i| legal[i]).collect())
     }
+    // A bounded continuation mutates only its legal prefix and work ledger;
+    // proposal/counterexample slices and logical controls remain borrowed.
+    #[allow(clippy::too_many_arguments)]
     fn follow(
         &mut self,
         from: usize,

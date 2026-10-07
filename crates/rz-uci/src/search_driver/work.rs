@@ -160,6 +160,10 @@ fn fault() -> ContractError {
         "search work receipt owner unavailable or counter exhausted",
     )
 }
+// One fixed-size counter snapshot lives on the stack per admitted go, never
+// per node. Keeping it inline avoids a heap allocation on failure/cancel
+// accounting paths; this bounded scalar snapshot has no owned buffers.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum AttemptObservation {
     NoWork,
     CpuStarted,

@@ -1265,7 +1265,9 @@ mod tests {
             cpu_binary_sha256: BTreeSet::from([hash("own-cpu-binary")]),
             input_sources: BTreeSet::from([cpu_source(None)]),
         };
-        let audit = registry.audit(&[a.clone()], &single_game_split()).unwrap();
+        let audit = registry
+            .audit(std::slice::from_ref(&a), &single_game_split())
+            .unwrap();
         assert_eq!(audit.records, 1);
         assert_eq!(audit.masked_value_records, 1);
         assert_eq!(audit.training_records, 1);
@@ -1317,7 +1319,9 @@ mod tests {
         };
         assert!(registry.validate().is_err());
         registry.cpu_binary_sha256.insert(hash("own-cpu-binary"));
-        registry.audit(&[a.clone()], &single_game_split()).unwrap();
+        registry
+            .audit(std::slice::from_ref(&a), &single_game_split())
+            .unwrap();
         for changed_source in [
             PalsInputSource::OwnCpu {
                 cpu_binary_sha256: hash("different-cpu-binary"),
@@ -1792,7 +1796,7 @@ mod tests {
         let split = PalsDatasetSplit {
             games: BTreeMap::from([("a".into(), PalsSplit::Train)]),
         };
-        assert!(registry.audit(&[a.clone()], &split).is_err());
+        assert!(registry.audit(std::slice::from_ref(&a), &split).is_err());
         if let PalsTargetProvenance::OwnedCpu { engine_sha256, .. } =
             &mut a.future_label.as_mut().unwrap().provenance
         {
