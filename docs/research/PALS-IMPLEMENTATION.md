@@ -7,6 +7,10 @@
 승인으로 확대하지 않는다. 현재 목표는 **독자 Rust 엔진과 모델·학습 준비의 구현이며,
 실제 optimizer 학습은 제외**한다. 생성 가중치는 미학습 초기화 자산이고 기력 인수는 없다.
 
+Rust 제품의 실제 startup·역할 소비·취소·게임 수명·최종 증거 인수와 Python reference의
+export·frozen forward·dataset preparation을 구분한다. Python 준비 성공을 Rust 제품의
+실행 인수·학습·강도 결과로 승격하지 않는다.
+
 ## 처리 흐름과 소유 경계
 
 제품 경로는 기존 UCI에서 탐색을 선택한 뒤 Rules의 정확한 상태·이력·합법 수를 사용한다.
@@ -120,6 +124,9 @@ GPU 05~07의 등록 실행 기준은 `5bd8c59`, CPU paired 03의 등록 source�
 이전 전체 workspace 검사·후속 좁은 재검사·정확한 CI run과 등록 binary 실행을 구분한다.
 `e604125`의 UCI pending-close 수정 직후 검사 전 기록은 보존하고, 후속 `134bbe1` 검사와
 명시적 native loader 후보 `fc59b77`의 제한된 CPU 검사를 아래에서 별도로 기록한다.
+후속 `bca916d`·`f78ecf0`의 독립 GPU 수치 검사와 `b952008`의 제품 startup 변경·CPU
+검사·compile-only 등록도 별도 source·binary로 식별한다. 제품 재검사와 paired 대국의
+남은 인수를 독립 checker의 정상 종료로 대신하지 않는다.
 
 | 실제 자료 | 확인된 결과 | 해석의 한계 |
 |---|---|---|
@@ -129,6 +136,7 @@ GPU 05~07의 등록 실행 기준은 `5bd8c59`, CPU paired 03의 등록 source�
 | `6979bdf` 전체 검사와 `5bd8c59` 후속 재검사 | `6979bdf` workspace 1,074개 통과·16개 ignored. 후속 `5bd8c59`의 optional CUDA launch payload boxing 2줄 수정에 대해 arena 69개 재검사와 전체 clippy 성공을 총괄이 확인했다. | 전체 workspace 실행 SHA와 좁은 재검사 SHA를 합치지 않는다. ignored는 미실행이며 GPU 종료·실제 학습·기력을 증명하지 않는다. |
 | 정확한 `5bd8c59` CI | [CI run 37594871853](https://github.com/daejunnom/RoveZero/actions/runs/37594871853)의 Linux·Windows·모델·CPU bindings 4개 job 모두 성공을 총괄이 확인했다. | 해당 SHA의 CI 성공이다. 실제 CUDA 프로세스 종료, paired 대국과 source 밖 자료의 실행 인수를 대신하지 않는다. |
 | `134bbe1` UCI 검사·CI | 후속 UCI all-feature 검사의 실행 결과 합계 249개 통과·workspace all-feature clippy 성공. [정확한 CI run 37597576640](https://github.com/daejunnom/RoveZero/actions/runs/37597576640)의 Linux·Windows·모델·CPU bindings 4개 job 모두 성공을 총괄이 확인했다. | `uci-final-08.log`와 `clippy-final-08.log`의 종료 0을 별도로 대조했다. GPU 05~07 종료 실패·paired 03 provider identity gate를 대신 인수하지 않는다. |
+| `bca916d`·`f78ecf0` CI와 CPU 검사 | 총괄은 정확한 `bca916d` CI 4개 job 성공, `f78ecf0` all-feature 검사 1,092개 통과·16개 ignored·clippy/default UCI 검사 종료 0을 확인했다. [정확한 `f78ecf0` CI run 37604692688](https://github.com/daejunnom/RoveZero/actions/runs/37604692688)도 Linux·Windows·모델·CPU bindings 4개 job 모두 성공했다. | 각각의 source 검사다. GPU checker의 실행·제품 startup·paired 최종 저장은 별도 인수하며 ignored는 미실행으로 유지한다. |
 | `binary-registration-06` | compiler-artifact JSON의 target·profile·features·binary SHA/크기와 `rz-uci-build-capability/1` metadata를 등록했다. source는 `5bd8c59`, UCI binary는 `7b283fea62af3518275b73bd53f6a15aadbb99d789f20f9ec04d4bcda7ab5a03`, CUDA numeric binary는 `a07495dec676c4fefd3d3bc6b367c746ee08395e6b46aced22181524968b4fd5`다. | compile capability만 확인한다. 영수증의 runtime/model loaded는 false이며, `--all-features` 명령 이력이나 source SHA만으로 다른 경로의 나중 바이너리를 같은 feature 빌드로 취급하지 않는다. |
 | `model-reference-07` | wrapper 영수증 `success`, CLI exit 0. 모델 13개+학습 준비 20개, 총 33개 검사 통과. | 초기화 자산의 CPU 검사다. 실제 학습·GPU 결과가 아니다. |
 | `actual-collection-01` frozen 검사 | 실제 9행 모두 한 번씩 소비. P 9/C 0. policy 4행 활성·5행 mask, WDL 9행 미관측 mask. parameter SHA 전후 동일, optimizer 미생성·backward 없음·steps 0. | 실제 C 조건부 collection, V context, 신경망 collector와 학습을 검증하지 않았다. C head 숫자 fixture와 실제 C 데이터는 별도다. |
@@ -143,13 +151,23 @@ GPU 05~07의 등록 실행 기준은 `5bd8c59`, CPU paired 03의 등록 source�
 | `gpu-numeric-05` | 등록 source `5bd8c59`와 CUDA numeric binary로 실제 실행했다. `numeric.json`은 6개 CUDA FP32 사례·private repeat·cache/fresh·새 게임·물리 ACK·shutdown 통과를 기록했다. 완료 NN 입력 20개 = public 6+role 14. 그러나 보고서 저장 뒤 `malloc(): unsorted double linked list corrupted`로 프로세스 exit `-6`; execution은 failed, 전체 173.926초·cgroup peak 3,693,518,848 bytes·OOM 0·cleanup 확인·종료 뒤 GPU 사용 0을 총괄이 확인했다. | **GPU 실행 전체 인수는 실패다.** 수치 보고서의 완료/ACK와 프로세스의 정상 종료는 다른 증거다. VRAM peak·native allocator peak는 unknown이며 heap 오류 원인을 확정하지 않는다. CPU 자료나 후속 재실행으로 원래 실패를 덮지 않는다. |
 | `gpu-teardown-06` GDB 진단 | 05와 같은 source·binary를 GDB의 기본 ASLR 비활성 조건에서 실행했다. stdout은 inferior의 정상 종료, stderr는 `No stack.`을 기록했다. execution의 GDB exit 0, 전체 141.735초·cgroup peak 3,840,204,800 bytes·OOM 0·cleanup 확인. | 상태는 `diagnostic_only_not_acceptance`다. 총괄은 진단 controller의 exit 1을 의도한 비인수 반환으로 확인했다. GDB·ASLR 조건이 달라 05의 수정이나 정상 실행 인수로 취급하지 않으며 heap 오류가 재현되지 않았다는 사실만 남긴다. 후속 07은 별도 행으로 기록한다. |
 | `gpu-teardown-07-aslr` GDB 진단 | 05/06과 같은 `5bd8c59` checker binary·자산 pin에 ASLR을 켰다. 수치 보고서는 완료 NN 입력 20개 = public 6+role 14와 물리 ACK·shutdown을 기록했으나 inferior가 SIGABRT로 중단했다. stack에는 `libcudnn_engines_precompiled.so.9`와 `__run_exit_handlers`가 있고 stderr는 heap 손상을 기록했다. 전체 140.258초·cgroup peak 3,877,982,208 bytes·OOM 0·cleanup 확인. | GDB 자체 exit 0과 native inferior의 실패를 구분한다. 상태는 `diagnostic_only_not_acceptance`이며 **정상 GPU 종료 인수는 실패다.** 종료 중 cuDNN 호출 경로를 확인했지만 최초 메모리 손상 위치·책임자를 이 stack만으로 확정하지 않는다. |
-| `fc59b77` 명시적 native loader 후보 | 총괄이 별도 명시 선택 후보를 커밋·push하고 all-target/all-feature CPU 검사 종료 0(eval unit 63개·loader 18개 및 해당 integration 검사), workspace all-feature clippy 종료 0을 확인했다. | 전체 test 수 합계는 주장하지 않는다. 기본 loader 선택은 유지하며 새 후보의 GPU 실행은 아직 인수 전이다. CPU 검사와 후보 구현을 05/07 heap 오류의 수정·정상 native 종료 증거로 취급하지 않는다. |
+| `fc59b77` 명시적 native loader 후보 | 총괄이 별도 명시 선택 후보를 커밋·push하고 all-target/all-feature CPU 검사 종료 0(eval unit 63개·loader 18개 및 해당 integration 검사), workspace all-feature clippy 종료 0을 확인했다. | 전체 test 수 합계는 주장하지 않는다. 이 CPU 검사 시점에는 새 후보의 GPU 실행이 인수 전이었다. 후속 08/09는 별도 행으로 연결하며 기본 선택을 유지한다. CPU 검사만으로 05/07 heap 오류의 수정·정상 native 종료를 주장하지 않는다. |
+| `gpu-numeric-08-shim` 독립 checker | source `bca916d`·binary `1dee8ab061c60f78262460ccfbeb5ebb10f64fc244ad6b3d16e196898a873636`의 CUDA FP32 6사례·물리 NN 완료 20개(public 6+role 14)·runtime mapping ACK·물리 shutdown을 확인했다. execution passed·exit 0, 169.917초, cgroup peak 3,679,145,984 bytes·OOM 0·cleanup 확인. | 이 등록 조건의 독립 검사는 정상 종료했다. VRAM peak는 unknown이며 제품 UCI·arena GPU 실행 인수가 아니다. 이전 05/07 abort의 최초 원인을 확정하지 않는다. |
+| `gpu-numeric-09-shim` 독립 checker | source `f78ecf0`·binary `f341e79407f2631d4b468b0cad0b208254abcc17ca5b5247dc34a8b04b76b28a`의 CUDA FP32 6사례·NN 완료 20개(public 6+role 14)·물리 ACK·shutdown 확인. execution passed·exit 0, 162.483초, cgroup peak 3,680,698,368 bytes·OOM 0·cleanup 확인. 총괄은 독립 메모리 검토 PASS도 확인했다. | 독립 GPU 수치·수명 검사의 PASS다. VRAM peak는 unknown이며 제품 startup·취소·새 게임·paired 대국을 대신 인수하지 않는다. 정상 실행을 과거 heap 손상의 최초 원인 제거 증명으로 해석하지 않는다. |
+| `gpu-uci-smoke-09` 제품 startup | source `f78ecf0`·제품 binary `897c43cc17da8f79379098d623f8ac0c8139bd7687be8c35b1e7085a40a5434f`에서 `uciok`·ready 전에 stdout이 닫혔다. exit 2·97.414초, cgroup peak 3,600,363,520 bytes·OOM 0. stderr는 `PhysicalCompletionUnknown`, 물리 shutdown 실패와 startup mapping ACK `None`으로 인한 receipt publication 실패를 기록했다. | **제품 GPU startup 인수는 실패다.** transcript는 `uci` 송신 한 건이며 예정된 go 2회를 실제 실행으로 세지 않는다. 이 자료에서 정상 완료 NN 수·provider 영수증을 확정하지 않는다. 종료 뒤 GPU 0MiB 복귀는 총괄이 확인했으나 정상 NN 완료·startup과 다른 증거다. |
 | 유한 runner 종료 검사 | clock+reap combined patch를 clean upstream에 적용한 별도 binary 빌드와 production-method syscall seam 14개 통과. | 실제 paired 대국은 별도 인수다. 원래 clock-only binary·patch·과거 자료는 보존한다. |
 | `own-paired-cpu-01` 감사 정정 | 원래 입력·실행 자료를 수정하지 않은 append-only 정정으로, 복사한 UCI hash는 정확하지만 실제 binary에 `onnx-cpu` feature가 없었음을 확인했다. identification preflight에서 exit 1, provider·NN·readiness·게임 모두 시작 전이며 게임/NN 수는 0이다. | 대국·기력 실패로 집계하지 않는다. pair/process 영수증 생성 전 실패여서 실제 native cleanup 시간은 미관측이다. 결합 process/cleanup gate 문구만으로 물리 cleanup 실패라고 판정하지 않는다. |
 | `own-paired-cpu-02` 준비 | `binary-registration-06` compiler proof와 compile-only capability를 입력 등록 전에 재확인했다. lock·opening·prepare-only 3개 명령 exit 0, private snapshot 9개를 준비했다. 준비 영수증의 engines started/NN ready는 false다. | 새 유한 CPU paired 기능 실행의 준비 자료다. 경기 실행·시계·PGN·정상 종료·강도 결과는 별도 실행 영수증이 도착할 때까지 미인수로 둔다. |
 | `own-paired-cpu-02` 실제 preflight | 준비 이후 실제 readiness process는 exit 2·1.017초, `group_cleanup=gone`·errors 0으로 종료했다. stderr의 `UndeliveredDiagnostics`에는 PALS rounds·CPU nodes·소비 role 모두 0이다. supervisor의 service exit는 1, 회수 완료, 전체 16.343초 = service wait 10.808초+recovery 5.520초 등으로 기록했다. 경기 0·경기 PGN 없음. | readiness 실패이며 기력 대국 결과가 아니다. supervisor 시간은 실제 경기 시계·native cleanup 시간이 아니다. 회수된 process 영수증의 cleanup 276,164ns와 group 종료 증거를 별도로 보존한다. 준비된 opening PGN을 경기 PGN으로 세지 않는다. |
 | `e604125` UCI 수정 | stop 이후 pending 착수·진단을 닫고 pipelined quit을 처리하는 후속 소스 수정을 총괄이 커밋·push했다. | 최초 기록 시점은 후속 root Cargo 검사 전이었다. 후속 `134bbe1` 검사·CI 성공은 위 별도 행으로 연결하며 이전 `5bd8c59`의 결과를 소급하지 않는다. 새 바이너리·readiness·paired 실행은 별도로 인수한다. |
 | `own-paired-cpu-03` 실제 paired 실행 | source `134bbe1` 등록 binary로 120초+1초·흑백 교환 두 판을 실행했다. Rules PGN 감사에서 own CPU가 흑·백 모두 체크메이트로 승리했고 시계 감사 오류는 없다. Fastchess exit 0·group gone·cleanup 확인·process errors 0. supervisor service exit 1·회수 완료·전체 494.462초. | native provider 감사의 `native model/adapter/epoch identity differs` 때문에 integration gate가 거부됐다. 실행 영수증은 execution ready/strength eligible false·scored games 0이다. 두 판의 PGN·승패를 보존하되 정상 native integration 인수·Elo·모델 승격으로 사용하지 않는다. runner 종료만으로 NN provider identity·물리 종료를 대신 증명하지 않는다. |
+| `own-paired-cpu-04` 실행과 append-only 감사 | source `bca916d`의 원래 production Debug에서 두 판의 Rules 체크메이트·시계·native provider gate 통과·scored 2를 관측했다. own CPU가 흑·백 모두 승리했다. 그러나 원래 operation은 `native evidence exceeds reserved bytes`로 최종 persistence exit 1이며 canonical pair receipt·Core가 없다. | 감사는 원본을 수정하거나 성공 영수증을 재생성해 저장하지 않았다. preflight부터 필수 최종 영수증까지의 전체 시간은 unknown이다. 64KiB 개별 pretty cap 대비 진단 재구성 67,622 bytes·초과 2,086 bytes는 Rust typed 재직렬화 미확인 값이며 전체 16MiB output cap 소진을 주장하지 않는다. 최종 저장·기력 인수는 실패 상태를 유지한다. |
+| `f78ecf0` 증거 저장 예약과 `own-paired-gpu-05` 준비 | 고정 2MiB pair metadata 예약을 구현했다. GPU paired 05 준비 명령 2개 exit 0. 고유 input 3,143,597,770 bytes, input+output+runtime 필요량 3,227,483,850 bytes. artifact·failure recovery 각 4GiB, runtime 64MiB, output 16MiB 안에 pair metadata 2MiB를 예약했다. | execute command·engine·NN ready·GPU execution observed는 모두 false이며 GPU paired 경기는 **미실행**이다. cap·선언을 RAM/VRAM peak나 최종 저장 인수로 해석하지 않는다. CPU 04의 원래 실패를 소급해서 성공 처리하지 않는다. |
+| `b952008` startup 변경·로컬 검사·CI | 실패 startup publication·진단·유한 단계 timing과 명시 CUDA startup probe 예산(1~180,000ms, 생략 기본 15,000ms)을 제품·manifest에 연결했다. 새 GPU 준비의 선택값은 120,000ms이며 실제 미실행이다. all-feature CPU 검사 1,103개 통과·16개 ignored, clippy와 default UCI·arena 검사 종료 0을 대조했다. CI의 중간 관측은 3개 성공·Windows 진행이었고, 총괄은 [정확한 CI run 37609418913](https://github.com/daejunnom/RoveZero/actions/runs/37609418913)의 최종 4개 job 성공을 확인했다(Windows 10:50:31 UTC 완료). | source 구현·CPU 검사·정확한 CI의 증거다. 새 제품 GPU startup·물리 수명·paired 저장 성공은 아직 인수 전이며 16개 ignored는 미실행이다. 새 예산 선언을 실제 실행시간이나 정상 완료로 바꾸지 않는다. |
+| `binary-registration-10` | source `b952008`의 compiler-artifact 등록을 완료했다. `onnx_cpu`·`onnx_cuda`·experimental I/O binding compile feature와 CUDA path 컴파일을 기록했다. | compile-only다. runtime/model loaded와 GPU started는 false이며 모델 실행·provider ready·새 smoke의 성공 증거가 아니다. |
+| `gpu-uci-smoke-10` 메모리 입구 | Windows `GetPerformanceInfo`의 커밋 여유 4,781,965,312 bytes가 등록된 최소 6GiB(6,442,450,944 bytes)보다 작아 admission이 거부됐다. systemd·GPU는 시작하지 않았다. 이후 사용자는 이번 세션 GPU 검증 보류를 선택했다. | 실제 CUDA 할당·startup 실패로 세지 않는다. 실행 중 Windows 커밋/VRAM peak는 미관측이다. 미실행·사용자 보류 상태를 성공·자동 재시도 근거로 바꾸지 않는다. |
+| `gpu-uci-smoke-11` 실행 준비 | 총괄은 source `b952008`·등록 10·CAS를 고정한 바깥 launcher를 준비·freeze했다. probe 120,000ms·ready 180,000ms, 전체 240초 안에서 drain 최대 30초를 선언했다. | 준비 완료·실제 GPU 미실행·`user-deferred`다. 새 측정 조건·launcher 고정은 provider ready·NN 완료·정상 종료의 증거가 아니며 후속 사용자 재개와 메모리 입구 확인 뒤 실행 자료를 따로 인수한다. |
+| 사용자 GPU 검증 보류 | 사용자가 이번 세션의 GPU 검증을 보류했다. 제품 smoke 11·최종 `b952008` source의 독립 numeric 10·새 GPU paired 06은 이번 세션에서 실제 실행하지 않는다. | 해당 항목은 `user-deferred` 후속 인수다. 준비·정적 검사와 과거 source의 08/09 PASS를 새 제품·최종 source 수치·paired 인수로 승격하지 않는다. CPU 검사·정확한 CI 4개 성공과 실제 학습 0은 유지한다. |
 
 작은 실행·결과 JSON을 읽기 전용으로 대조한 자료의 논리 ID와 실제 파일 SHA-256은 다음과
 같다. 원시 파일은 관리 루트의 `runs/pals/` 아래에 보존하며 개인 경로·command 원문·호스트
@@ -176,8 +194,17 @@ GPU 05~07의 등록 실행 기준은 `5bd8c59`, CPU paired 03의 등록 source�
 | `gpu-teardown-07-aslr/numeric.json` | `25bdb7502e87dd41f3a706eb2302ef92f2885f409faa90f23452ee2fb83bceb9` |
 | `gpu-teardown-07-aslr/stdout.log` | `4e461f99f68c4833b6913e6cf34e4051ed7c52a855282f6e90a7d1e546169ad0` |
 | `gpu-teardown-07-aslr/stderr.log` | `8c621c067a186e39cf0ccbdac91566da29eb0e72149c1f398801907f9cbaeb76` |
+| `gpu-numeric-08-shim/execution.json` | `78a06c96c02aff7df136dda0ade0f71123dca1d1c0c637302a47e3d5251189ac` |
+| `gpu-numeric-08-shim/numeric.json` | `53fa4c164d9521f0c82c5290c3aceb53818ac227852e85179c466bc3c90fe071` |
+| `gpu-numeric-09-shim/execution.json` | `ab03cf96f2ce3fadeb5e8729adf11c4e9a937af0e82361bca058c0bed75d6704` |
+| `gpu-numeric-09-shim/numeric.json` | `48bf0e8dbb68c89d090de8b287eadbcf4aeb0abc7a79407a228365e4208c5fa7` |
+| `gpu-uci-smoke-09/execution.json` | `51eebc8551946eea3ea3bc45dec5a1c452bb177b07ab04a8fa1cf623d5c60fc8` |
+| `gpu-uci-smoke-09/stderr.log` | `ed9336fa078865ac1beee592e9bd9c05a655b76217331d0ee5cbff975ac7ff97` |
+| `gpu-uci-smoke-09/transcript.json` | `cb0355b3571d41feb7f394c69b7a01ce389f29037660fb17e99723fc3e585639` |
 | `binary-registration-06/registration.json` | `fad9dc73fddb2ea089d463a612869a4e6ca73d43eac9bf71502fa38335e594c2` |
 | `binary-registration-06/build-capabilities.json` | `4cef04dfa2e6560226c2453fc0cdfb69afa49661608f0cb3bbb5a43c571e96ad` |
+| `binary-registration-10/registration.json` | `b17293546dd33c419d5ccdd4861e7fec6e3a9e2d94bcef5a8c1f6772dd11012d` |
+| `binary-registration-10/build-capabilities.json` | `4cef04dfa2e6560226c2453fc0cdfb69afa49661608f0cb3bbb5a43c571e96ad` |
 | `own-paired-cpu-01/audit-correction-01.json` | `99cc4d96bd73ecd154228526c7035843294d51101a1c098b0265ba81c50a19c0` |
 | `own-paired-cpu-02/preparation-receipt.json` | `19e331e67bb6cc4b79d815c65c9fc5ffac46f64095c0225ae60a8b262696c7fc` |
 | `own-paired-cpu-02/execution-result.json` | `4cd480a94e6300a6bf139f4c1b959318075ddf8f8bf02c1c606d2790a2932d94` |
@@ -186,20 +213,31 @@ GPU 05~07의 등록 실행 기준은 `5bd8c59`, CPU paired 03의 등록 source�
 | `own-paired-cpu-03/execution-result.json` | `ffa9dafedc3641f73d94b7b861776433cf7d50d7894e2d420d2118f015d3f363` |
 | `own-paired-cpu-03/recovered/attempt-01/pals-arena-pair-receipt.v3.json` | `8f7c8002cd1e5c5aff8d5d84f97f9cb4ab254c663e5f7ef4e29997334955a2da` |
 | `own-paired-cpu-03/recovered/attempt-01/match.pgn` | `96cabf2d1642d7e2be325b7816f923a41ecbc9b673b296ae0793f1d9ab65e0d0` |
+| `own-paired-cpu-04/audit-persistence-failure-01.json` | `8251d84cc6c54e6733309a8cd5ba3ff9efccfb438093e666820c1caf96baa5e6` |
+| `own-paired-gpu-05/preparation-receipt.json` | `91528fd5b8be3c6bb1a693c34894ba2cf82c9ca46400cdd58270da2c31b9dced` |
+| `gpu-uci-smoke-10/windows-commit-preflight.json` | `ba2ae8c58df480787aa261f09dd01dd5c99b7967053df83ae5389362776ebe35` |
 | `workspace-check-03/uci-final-08.log` | `80ffbd12a9a30fb539719aafe9432766e0ae7a851f9398c5702e090b25c781a4` |
 | `workspace-check-03/clippy-final-08.log` | `da3ea705553fbf108819b87159fbbebcbfaa02c2a277f7759fe59d823761905b` |
+| `workspace-check-03/tests-startup-11.log` | `f18f4c1c3124984b92cf945baea7ef74a924a2f636b0bd084e426d55f32e390d` |
+| `workspace-check-03/clippy-startup-11.log` | `59de3c77f10ebcd6e216f7137279adcd0faf20406f27967dd45bb2019176a360` |
+| `workspace-check-03/default-startup-11.log` | `30c85c88ef3cb6a15ba22311e2050f490f6ab85af1bed63e610fdaaa50aa6248` |
+
+정확한 `b952008`의 최종 CI 조회는 관리 루트의 `reports/pals/ci-b952008-final.json`에
+보존했다. 직접 대조한 head SHA는 `b95200864825b2e88ca46ef86dd23ba6ff7a20a5`, 상태는
+completed/success이며 4개 job이 모두 성공했다. 이 작은 조회 영수증의 SHA-256은
+`97e11a1ca99e259e31229bd86181078a8b064e8868d8037e3614b15c12b17599`다.
 
 ## 남은 인수와 진행 순서
 
 | 순서 | 필요한 확인 | 현재 상태·책임 |
 |---|---|---|
-| 1 | mapping 감사·등록된 CUDA transfer 근거·실제 placement witness, 보고서 저장 이후 heap 오류와 완전 종료 | GPU 시도 02/03/04/05의 실패와 06의 GDB·ASLR 비활성 미재현을 보존한다. 07은 ASLR 활성 GDB에서 native 종료 중 SIGABRT·cuDNN exit stack을 확보했으며 최초 손상 위치는 미확정이다. 명시적 loader 후보 `fc59b77`는 CPU 검사만 통과했다. 기본 선택을 유지하고 별도 등록한 유한 실제 GPU 실행에서 후보와 정상 종료를 검증한다. |
-| 2 | 같은 pin의 GPU 공개 K/V·P/C raw·policy/WDL, cache on/off, `If` inactive 연산, 취소·늦은 완료·drain·buffer 수명 | 05의 CUDA FP32 6개 사례·cache/fresh·새 게임·물리 ACK·shutdown 보고서는 확인했다. 프로세스 종료 실패 때문에 GPU 실행 전체 인수는 남아 있으며, 제품 UCI의 취소·늦은 완료까지 통과한 증거로 확대하지 않는다. C/D와 총괄이 정상 종료와 해당 실행 경로를 별도로 확인한다. |
-| 3 | 제품 UCI의 GPU 연결과 실제 affinity·메모리·GPU 자원 관측 | 명시적 CPU/CUDA 선택·startup probe·placement witness 검증·영수증 접점은 구현했다. 실제 GPU UCI 실행·중단·새 게임·drain·종료와 자원 관측은 미인수다. CPU 수치·CLI 검사를 대신 사용하지 않는다. |
+| 1 | 독립 checker의 GPU 수치·mapping·물리 shutdown과 과거 heap 실패 경계 | 08/09 독립 checker의 정상 exit 0·수치/물리 ACK PASS를 확인했다. 이전 02~07 실패·GDB 조건은 보존하며 05/07의 최초 손상 위치는 확정하지 않는다. 현재 제품 기본 선택과 명시 profile을 구분하고 단독 결과를 제품 startup 인수로 확대하지 않는다. |
+| 2 | 제품 UCI의 startup·GPU 수치·취소·늦은 완료·drain·buffer 수명 | 제품 smoke 09는 `PhysicalCompletionUnknown`과 실패 영수증 publication에서 실패했다. `b952008`에서 진단·유한 timing·명시 startup 예산 지원을 구현하고 검사했다. 현재 GPU 준비값은 120초이며 생략 기본값은 15초다. smoke 10은 Windows 커밋 입구에서 GPU 시작 전 거부됐다. 새 smoke 11은 준비 완료·미실행·`user-deferred`이며 후속 실제 startup·물리 수명 자료가 필요하다. |
+| 3 | 최종 source 독립 GPU 수치·제품 자원·실패 증거의 저장 | 등록 10은 compile-only다. 이전 08/09의 cgroup peak·OOM 0을 기록했으나 VRAM peak는 unknown이다. 최종 `b952008`의 numeric 10과 새 제품 자원·startup/ready/종료·실패 영수증·저장은 `user-deferred`다. 이번 세션에는 새 GPU 실행을 하지 않고 후속 인수에서 등록 조건·메모리 입구를 다시 확인한다. |
 | 4 | 실제 NN 기반 own collection 및 C 이탈·V task context, frozen epoch·mask·split·누출 | CPU ORT collector 6행과 frozen preparation 전체 소비, 별도 private V→CPU_T 유한 producer 실행을 확인했다. GPU collector, C divergence head의 명시 학습 context, 유효한 정책·결과·작업 효용 목표와 더 넓은 split/holdout 자료는 별도 인수다. |
-| 5 | record별 증분 인코딩·device warm-start·CPU/GPU overlap과 shared reader의 native prepack·VRAM residency·peak | 미인수. 확인한 host bank는 whole-input cache다. serialized sharing과 실제 메모리 효과를 구분하며 고정 작업량·새 세션·관측 해상도를 등록한다. |
-| 6 | V-free PALS+Own CPU_R의 유한 paired 실행·시계·PGN·실패·완전 종료 | 01 feature 누락과 02 readiness 실패를 보존했다. 03은 readiness를 지나 두 판의 체크메이트·시계·Rules PGN·runner 종료를 확인했지만 native model/adapter/epoch 식별 gate가 실패했다. 실제 선언과 startup/final 증거의 불일치를 조사하고 교정한 새 등록으로 인수한다. 원래 경기·실패를 삭제하거나 후속 결과로 덮지 않으며 두 판으로 Elo를 확정하지 않는다. |
-| 7 | 최종 통합 SHA의 영향 feature·consumer·CPU CI와 GPU 증거 연결 | `6979bdf` 전체 CPU 검사·`5bd8c59` 좁은 후속 검사/정확한 CI·`134bbe1` UCI 249개/clippy/정확한 CI 4개 job을 각각 연결했다. `fc59b77` 후보의 CPU 검사와 GPU 인수 전 상태도 분리한다. 이전 실패, 독립 collector binary와 reference 09 dirty-source pin을 보존한다. 정확한 CI 성공은 GPU 05/07의 native 실패나 paired 03 identity gate 실패를 해소하지 않는다. |
+| 5 | 후속 record별 증분 인코딩·device warm-start·CPU/GPU overlap과 실제 공유 메모리 실험 | 확인한 host bank는 whole-input cache이며 현재 fresh 역할 계산을 기준으로 한다. record별 증분 인코딩·warm latent·overlap과 native prepack/VRAM 효과는 후속 별도 실험·미인수다. 의미 보존 E와 근사 A·스케줄 S를 구분하고 새 고정 작업량·비교 질문·자원·peak 관측을 등록한다. |
+| 6 | V-free PALS+Own CPU_R의 유한 paired 실행·시계·PGN·native 최종 receipt/Core | CPU 01/02 입구 실패와 03 identity gate 실패를 보존했다. CPU 04는 경기·native gate를 통과했지만 최종 persistence 실패·receipt/Core 부재다. 2MiB 증거 예약을 구현·등록했고 GPU paired 05 metadata 준비를 마쳤으나 경기는 미실행이다. 새 GPU paired 06은 `user-deferred`이며 제품 startup·수명 인수 뒤 실제 경기·최종 저장을 확인한다. 원래 실패·unknown 시간을 덮지 않고 두 판으로 Elo를 확정하지 않는다. |
+| 7 | 정확한 통합 SHA·CPU CI·독립 GPU·제품·paired 인수 연결 | 이전 source 검사와 `f78ecf0`/`b952008` 정확한 CI 4개 성공, `b952008` CPU 1,103개·clippy/default 종료 0을 연결했다. 08/09 독립 GPU PASS와 제품 09 실패·10 GPU 미시작, CPU 04 저장 실패를 보존한다. 새 제품 11·최종 source numeric 10·GPU paired 06은 `user-deferred`이며 정적 준비를 실제 인수로 승격하지 않는다. |
 
 능동 CPU 대체 응수의 후보·반박·수선 연결, evaluator identity를 포함한 근거 namespace,
 실제 착수 뒤의 완료 근거·paused 작업 재개, CPU adapter 교체 경계도 별도로 인수한다.
@@ -212,8 +250,9 @@ GPU 05~07의 등록 실행 기준은 `5bd8c59`, CPU paired 03의 등록 source�
 GPU 05의 heap 오류는 보고서의 수치·물리 ACK만으로 원인을 확정할 수 없다. 등록된 source·
 binary·자산·runtime·placement 조건과 실패 자료를 보존하고, teardown의 실제 경계와 오류
 발생 시점을 좁혀 확인한다. GDB·ASLR 변경 후의 미재현도 원인 제거를 증명하지 않으며,
-07의 cuDNN exit-handler stack도 최초 손상 위치를 확정하지 않는다. 기본값을 바꾸지 않은
-명시적 loader 후보는 별도 실행 인수 전까지 수정 성공으로 보고하지 않는다.
+07의 cuDNN exit-handler stack도 최초 손상 위치를 확정하지 않는다. 명시적 loader 조건의
+독립 checker 08/09는 정상 종료했지만 그 사실만으로 원래 heap 손상 원인 제거·제품 startup·
+모든 실행 경로의 정상 수명을 확정하지 않는다.
 조건 변경·CPU fallback·무한 재시도로 원래 실행을 성공 처리하지 않는다.
 
 실제 optimizer 학습은 이 목표의 남은 필수 실행에 포함하지 않는다. 이후 학습을 진행할

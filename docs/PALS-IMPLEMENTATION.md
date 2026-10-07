@@ -88,6 +88,23 @@ P/C 작업·CPU 요청/완료/소비/노드 수를 구별한다. 외부 엔진�
 UCI 옵션 이름의 대소문자 중복과 Ponder·Chess960·thread 한도·typed 모델 선택을
 덮어쓰는 옵션을 거부한다. GPU 요청 모델명과 실제 UUID는 같은 표현이라고 가정하지 않는다.
 
+CUDA 제품 시작은 runtime·모델·session의 cold 준비와, 준비된 backend에서 수행하는
+P/C·제어 ACK probe를 분리한다. `--pals-startup-probe-timeout-ms`는 후자의 명시적
+예산이며 범위는 1~180,000ms다. 생략하면 기존 15,000ms와 기존 JSON 생략 형식을
+유지한다. V3 CUDA launch의 선택값을 시작·종료 execution에서 정확히 대조하고,
+외부 `handshake_max_ms`는 cold 준비와 프로토콜을 포함한다. CPU CLI에는 이 CUDA
+옵션을 허용하지 않는다. probe 예산이 handshake 이하여도 실제 cold 준비 여유가
+보장되는 것은 아니며, 전체 pair 창·물리 drain·quarantine 조건은 늘리지 않는다.
+
+시작 실패는 성공 readiness와 별도 게시 경로로 보존한다. 없는 mapping·placement
+ACK는 없는 상태로 남기고, 관측된 ACK는 실제 소유 identity와 대조한다. 원래 오류·
+부분 계수·논리 마감·미확정 물리 fence를 저장하며 실패한 시작을 성공 종료로 바꾸지
+않는다. 진단은 최대 7개 제어 명령과 2개 역할 요청·64개 backend 단계만 기록한다.
+lock 경합·poison·overflow는 진단 부재로 표시하며 실행 결과나 buffer 수명을 바꾸지
+않는다. 명시 예산의 정상 실행에서는 실제 factory·probe 시간을 별도로 남기고,
+일반 `go`에서는 startup 단계 기록을 닫는다. 단계 반환 사건 자체는 NN 완료 계수나
+독립적인 물리 완료 증거가 아니다.
+
 각 판의 백·흑 엔진, 실제 시계, 결과·종료 이유와 PGN hash를 보존한다. 엔진 크래시·불법 수·
 시간패는 해당 엔진의 패배로 남긴다. 인프라 실패·실행 시간 한도·최대 ply 도달은 incomplete로
 남기며 자동 무승부나 유효 대국으로 만들지 않는다. 불완전 영수증도 검증 가능한 증거로
