@@ -188,6 +188,33 @@ class RoleExpert(nn.Module):
             outputs += (self.task_head(context),)
         return outputs
 
+    def forward_from_initial(self, reader_blocks, move_embedding, key, value, mask,
+                             candidates, candidate_mask, divergence_features,
+                             divergence_mask, initial_latent):
+        """Parameter-free approximate entry point; seed is the whole start state.
+
+        The legacy forward above is intentionally unchanged, including its
+        exported execution path. Keep this recurrent/head body numerically
+        checked against that path, rather than silently rewriting old exports.
+        Query has already conditioned an accepted final seed and is not added
+        again. Private latent K/V is recomputed by every existing reader call.
+        """
+        latent = initial_latent
+        for _ in range(self.config.iterations):
+            for index, reader in enumerate(reader_blocks):
+                latent = reader(latent, key, value, mask)
+                latent = latent + self.ffns[index](self.ffn_norms[index](latent))
+        context = latent.mean(dim=1)
+        candidate_logits = self.policy_head(move_embedding(candidates) * context[:, None, :]).squeeze(-1)
+        candidate_logits = candidate_logits.masked_fill(~candidate_mask, -1e9)
+        outputs = (candidate_logits, self.wdl_head(context), latent)
+        if self.role == "critic":
+            divergences = self.divergence_head(self.divergence_projection(divergence_features) * context[:, None, :]).squeeze(-1)
+            outputs += (divergences.masked_fill(~divergence_mask, -1e9),)
+        if self.role == "validator":
+            outputs += (self.task_head(context),)
+        return outputs
+
 
 class RoleGraph(nn.Module):
     """An exported graph contains exactly one private expert, never a router."""
@@ -198,6 +225,42 @@ class RoleGraph(nn.Module):
     def forward(self, key, value, mask, candidates, candidate_mask, divergence_features, divergence_mask, query):
         return self.expert(self.reader_blocks, self.move_embedding, key, value, mask, candidates,
                            candidate_mask, divergence_features, divergence_mask, query)
+
+
+class WarmRoleGraph(RoleGraph):
+    """CPU reference for the separate approximate P/C artifact domain.
+
+    This wrapper is not traced through torch.onnx.export: onnx_warm constructs
+    a real ONNX If. The scalar mode applies to the complete physical batch;
+    there is no per-row router. Shape/dtype/finite checks apply in both modes.
+    Caller seed acceptance/Rules context is certified by the Rust owner, not
+    by this numerical wrapper. There is no implicit seed-zero => Fresh rule.
+    """
+    def __init__(self, reader_blocks, move_embedding, expert):
+        if expert.role not in ("proposer", "critic"):
+            raise ValueError("private warm graph is P/C-only; validator is unsupported")
+        super().__init__(reader_blocks, move_embedding, expert)
+
+    def forward(self, key, value, mask, candidates, candidate_mask,
+                divergence_features, divergence_mask, query, initial_latent,
+                warm_start):
+        config = self.expert.config
+        config.validate()
+        batch = key.shape[0] if key.ndim == 4 else 0
+        if not isinstance(initial_latent, torch.Tensor) or batch < 1 or initial_latent.shape != (batch, config.latent_slots, config.width):
+            raise ValueError("private warm initial latent shape must be [batch,16,384]")
+        if initial_latent.dtype != torch.float32 or not torch.all(torch.isfinite(initial_latent)):
+            raise ValueError("private warm seed requires finite FP32")
+        if not isinstance(warm_start, torch.Tensor) or warm_start.shape != () or warm_start.dtype != torch.bool:
+            raise ValueError("private warm mode must be one scalar bool tensor")
+        if initial_latent.device != key.device or warm_start.device != key.device:
+            raise ValueError("private warm seed/mode is on a different device")
+        if not bool(warm_start.item()):
+            return super().forward(key, value, mask, candidates, candidate_mask,
+                                   divergence_features, divergence_mask, query)
+        return self.expert.forward_from_initial(
+            self.reader_blocks, self.move_embedding, key, value, mask, candidates,
+            candidate_mask, divergence_features, divergence_mask, initial_latent)
 
 
 class PalsModel(nn.Module):
@@ -216,6 +279,11 @@ class PalsModel(nn.Module):
         if role not in self.experts:
             raise ValueError("role absent from frozen model")
         return RoleGraph(self.reader_blocks, self.move_embedding, self.experts[role])
+
+    def warm_role_graph(self, role):
+        if role not in self.experts:
+            raise ValueError("role absent from frozen model")
+        return WarmRoleGraph(self.reader_blocks, self.move_embedding, self.experts[role])
 
     def without_validator(self):
         result = copy.deepcopy(self)
