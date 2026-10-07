@@ -451,6 +451,14 @@ impl Sink {
         {
             return Err(role_error("native prepared trace row limit"));
         }
+        // Reject exhausted native credit before the producer can mutate its
+        // exact prepared journal. A producer rejection after this reservation
+        // still keeps the prepaid input/sidecar/lineage/descriptor below.
+        self.reserve(
+            exact_bytes
+                .checked_add(RAW_RESERVE + STAGE_RESERVE)
+                .ok_or_else(|| role_error("native dispatch reservation overflow"))?,
+        )?;
         let producer_capture = if let Some(producer) = &self.producer {
             producer
                 .verify_source(&self.source)
@@ -468,11 +476,6 @@ impl Sink {
         } else {
             Ok(())
         };
-        self.reserve(
-            exact_bytes
-                .checked_add(RAW_RESERVE + STAGE_RESERVE)
-                .ok_or_else(|| role_error("native dispatch reservation overflow"))?,
-        )?;
         // The immutable snapshot and actual tensor are sealed before returning
         // to native submit. No later observation is admitted into these bytes.
         self.trace.sequence = sequence;
@@ -1666,6 +1669,7 @@ mod tests {
         assert_eq!(written.last(), Some(&b'\n'));
         drop(s);
         let limited = sink(&position, credit);
+        let producer = fixture_producer(&limited, 8 * 1024);
         assert!(
             Observer(Arc::clone(&limited))
                 .prepared(
@@ -1679,6 +1683,21 @@ mod tests {
         assert!(s.trace.rows.is_empty());
         assert!(s.calls.is_empty());
         assert_eq!(s.total_rows, 0);
+        assert_eq!(s.trace.sequence, 4);
+        assert_eq!(s.trace.reserved_bytes, 0);
+        assert!(producer.journal_snapshot().is_empty());
+        drop(s);
+        // Native credit rejection did not poison or append the producer. The
+        // same undispatched request remains admissible with explicit credit.
+        limited.lock().unwrap().context.as_mut().unwrap().max_bytes = 1024 * 1024;
+        Observer(Arc::clone(&limited))
+            .prepared(
+                id(1),
+                &prepared,
+                NativePreparedContext::Divergence { query: &query },
+            )
+            .unwrap();
+        assert_eq!(producer.journal_snapshot().len(), 1);
     }
     #[test]
     fn producer_quota_rejects_submit_but_preserves_exact_prepared_rows_and_journal() {
