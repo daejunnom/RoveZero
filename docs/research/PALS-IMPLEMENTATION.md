@@ -713,3 +713,62 @@ task별 raw history의 완전성으로 해석하지 않는다. 이 probe는 aren
 
 실제 학습 제외와 이번 세션 GPU user-deferred 조건을 유지한다. 비교 목표·divergence
 adapter·V 의미 입력·warm seed의 실제 native 소비·새 paired 실행은 계속 별도 인수한다.
+
+### 2026-10-08 후속 단위 — private seed와 외부 helper 소비 계약
+
+`4004e09`는 opt-in approximate private seed의 Rust 소유권 단위다. P/C별 1~2개 slot,
+6144개 유한 FP32 비트, 모델·인코딩·checkpoint epoch·수치 frozen epoch·게임·탐색
+세대와 exact Rules context를 구별한다. Fresh 입력·public K/V·공통 revision 0.1은
+유지하고 approximate invocation에 accepted seed seal을 결합한다. 원래 취소 토큰과
+마감을 staging·commit까지 보존하며, known physical completion 뒤에만 provisional
+latent를 만들고 채택한다. unknown/drop에서는 owner와 pin을 격리 보존하고 실제 fence를
+확인한 복구 뒤에도 해당 결과를 accepted seed로 승격하지 않는다. 예산·slot 교체
+거절은 기존 valid seed를 제거하기 전에 확인한다.
+
+중앙 eval all-feature library 92개와 all-target Clippy가 통과했다. 이 중 신규 seed
+fixture는 14개이며 검사 수를 중복 합산하지 않는다. 호출자는 실제 Rules encoder와
+동일 snapshot 및 backend fence를 연결해야 한다. caller completion enum이나 weak
+context identity만으로 임의 tensor의 Rules 의미나 Native 물리 완료가 증명되지는 않는다.
+현재 export에는 initial-latent 입력이 없어 **Native warm-start는 계속 Unsupported**다.
+이 단위의 성공을 실제 warm graph 소비·오차·속도·기력의 인수로 확대하지 않는다.
+
+`5003243`는 실제 loaded helper profile에 기반한 startup/termination 검증기,
+preflight 소비 훅과 별도 foreign work receipt 타입을 추가한다. profile 파일·canonical·
+registration, model-WDL resolver, checkpoint·encoding·process epoch, independent parent PID,
+ready 시점 cgroup/namespace/affinity/direct limit 및 historical helper identity와 known
+exit/drain을 대조한다. Native physical closure와 game reset은 별도 확인한다. 외부
+작업의 dispatch·report·reserved budget·reported nodes·consumption을 Own counters와
+구분하고, producer가 제공하지 않는 completed/reused 합계는 unknown으로 유지한다.
+서로 다른 물리 작업 단위를 임의 부등식으로 동일시하지 않는다.
+
+중앙 arena all-feature library 102개, experiments library 70개와 영향 all-target Clippy가
+통과했다. Own V3 기록은 optional foreign projection을 생략하는 기존 직렬화를 유지한다.
+이 단위에서는 실제 arena preflight override·game collector·Core assembly의 외부 실행
+guard를 해제하지 않았다. typed API와 fixture를 실제 종단 인수로 표시하지 않는다.
+
+`8d885c8`의 CI run `37657068556`과 `4004e09`의 최신 PR checks는 Linux·Windows·
+CPU bindings·model CPU 네 job의 실제 성공을 확인했다. 앞선 formatter/positive producer
+fixture 실패와 superseded run 기록은 보존한다. `5003243` 이후 변경은 정확한 해당
+SHA의 CI 완료 결과로 따로 인수한다. GPU는 이번 세션 user-deferred이고 실제 학습은
+범위에서 제외한다.
+`6771470`는 `rz-pals-comparative-overlay/1`의 첫 Rust/Python 계약 단위다. 현재 입력의
+raw/split/current/producer 봉인, 준비 input/tensor/lineage 실제 bytes와 parent receipt pin,
+독립 criterion 및 checker namespace·조건을 연결한다. P 후보와 C 응답의 candidate-only
+restriction은 서로 다른 task ID를 가지되 같은 상태·이력·epoch·revision·profile·horizon·
+node budget·관점을 요구한다. 후보는 captured 합법 수의 순서를 유지한다. Partial,
+cancelled, unknown, missing은 masked 상태만 허용한다. 기존 input/raw/current domain과
+공통 revision은 유지하며 Python에 DG05 selector를 복제하지 않는다.
+
+모든 audit는 metadata_only이며 requires_actual_checker_admission=true다. 선언된
+completed/preference, evidence hash 또는 supplied current anchor만으로 실제 CPU 요청·
+완료·criterion utility·양의 target·loss의 인수를 얻지 않는다. Divergence는 별도
+auxiliary adapter가 필요하다. 중앙 Python stdlib 8개, experiments library 78개(신규
+comparative fixture 8개 포함), all-target Clippy가 통과했다. 두 언어의 literal vector는
+한글 UTF-8, sorted compact JSON, null, array order 및 정확한 u64 9007199254740993을
+대조한다. 최초 Rust fixture의 세 문자열 타입 추론 실패를 보존하고 명시적 String
+선언만 수정한 뒤 인수했다. 이후 실제 checker 증거와 no-step target 소비를 연결한다.
+
+`4004e09`의 실제 CI run은 `37658544013`이며 네 job 모두 성공했다. 후속 helper 및
+comparative source는 위 중앙 검사와 새 SHA의 CI를 구분한다. 관리 build slot은 마지막
+검사 후 약 4.77GiB, 임시 child tree 정리 verified이며 기존 8GiB slot/12GiB catalog
+상한을 유지했다. 이 크기는 모델 peak/RSS/VRAM 성능 결과가 아니다.
