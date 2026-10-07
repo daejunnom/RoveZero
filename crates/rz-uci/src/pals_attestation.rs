@@ -126,6 +126,21 @@ impl PalsReceiptWriter {
         search_work: Option<ProcessSearchWorkReceipt>,
     ) -> Result<(), ProcessReceiptError> {
         self.validate_execution(&native)?;
+        if service_exit_success
+            && native.execution.provider == "cuda"
+            && (native.final_runtime_mapping_confirmed != Some(true)
+                || !native.startup_probe.as_ref().is_some_and(|probe| {
+                    probe.completed_proposer_calls == 1
+                        && probe.completed_critic_calls == 1
+                        && probe.runtime_mapping_confirmed
+                        && probe.cuda_placement_witness.is_some()
+                        && probe.reset_completed
+                }))
+        {
+            return Err(ProcessReceiptError::boundary(
+                "successful PALS CUDA service requires actual placement and final origin ACKs",
+            ));
+        }
         let receipt = self.envelope(
             TERMINATION_DOMAIN,
             native,
@@ -145,10 +160,28 @@ impl PalsReceiptWriter {
             || !matches!(native.execution.provider, "cpu" | "cuda")
             || (native.execution.provider == "cuda")
                 != native.execution.runtime_bundle_sha256.is_some()
+            || (native.execution.provider == "cpu"
+                && native.execution.cuda_control_inventory_sha256.is_some())
         {
             return Err(ProcessReceiptError::boundary(
                 "PALS actual provider/runtime pin differs from receipt identity",
             ));
+        }
+        if let Some(witness) = native
+            .startup_probe
+            .as_ref()
+            .and_then(|probe| probe.cuda_placement_witness.as_ref())
+        {
+            if native.execution.provider != "cuda"
+                || native.execution.cuda_control_inventory_sha256 != Some(witness.inventory_sha256)
+                || native.export_manifest_sha256 != witness.manifest_sha256
+                || native.execution.runtime_sha256 != witness.runtime_sha256
+                || native.execution.runtime_bundle_sha256 != Some(witness.runtime_bundle_sha256)
+            {
+                return Err(ProcessReceiptError::boundary(
+                    "PALS actual placement witness differs from its pinned execution identity",
+                ));
+            }
         }
         Ok(())
     }

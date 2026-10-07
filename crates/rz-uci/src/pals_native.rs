@@ -491,8 +491,8 @@ mod native {
     use rz_eval::error::BackendError;
     use rz_eval::pals_model::PALS_ENCODING_SCHEMA;
     use rz_eval::pals_onnx::{
-        PalsBackendStats, PalsNativeCommand, PalsNativeResult, PalsOnnxBackend,
-        PalsSessionResidency,
+        PalsBackendStats, PalsCudaControlPolicy, PalsCudaPlacementWitness, PalsNativeCommand,
+        PalsNativeResult, PalsOnnxBackend, PalsSessionResidency,
     };
     use rz_eval::worker::{PhysicalLease, PhysicalPoll, SingleWorker};
     use rz_position::contracts::ContractPosition;
@@ -625,6 +625,9 @@ mod native {
         pub session_arena_bytes: Option<u64>,
         pub runtime_sha256: [u8; 32],
         pub runtime_bundle_sha256: Option<[u8; 32]>,
+        /// Identity of the explicitly loaded metadata-only control inventory.
+        /// None means strict CUDA or CPU, not an observed placement witness.
+        pub cuda_control_inventory_sha256: Option<[u8; 32]>,
         pub transient_request_device_bytes: u64,
         pub transient_execution_device_bytes: u64,
         pub pinned_request_bytes: u64,
@@ -636,6 +639,9 @@ mod native {
         pub completed_proposer_calls: u64,
         pub completed_critic_calls: u64,
         pub runtime_mapping_confirmed: bool,
+        /// Same-worker NN-zero ACK after physically completed public/P/C probes.
+        /// Library origin confirmation alone never supplies this evidence.
+        pub cuda_placement_witness: Option<Box<PalsCudaPlacementWitness>>,
         pub reset_completed: bool,
         /// Actual cumulative snapshot after probe and reset; final statistics
         /// include this work and must not be reported as search-only inputs.
@@ -714,6 +720,7 @@ mod native {
             session_arena_bytes,
             runtime_sha256: backend.runtime_binary_digest(),
             runtime_bundle_sha256: backend.runtime_bundle_digest(),
+            cuda_control_inventory_sha256: backend.cuda_control_inventory_digest(),
             transient_request_device_bytes: request,
             transient_execution_device_bytes: physical,
             // Rust owns pageable host tensors in this first host-K/V path.
@@ -721,6 +728,55 @@ mod native {
             pinned_request_bytes: 0,
             device_public_memory: backend.config().device_public_memory,
         })
+    }
+    fn validate_startup_cuda_witness(
+        witness: &PalsCudaPlacementWitness,
+        execution: &NativeExecutionReceipt,
+        manifest: [u8; 32],
+        residency: &PalsSessionResidency,
+    ) -> Result<(), RoleError> {
+        // The backend owns exact opcode/provenance/profile validation. This
+        // worker boundary separately binds its typed ACK to this actual owner.
+        let matching_graphs = witness.initialization.len() == 2
+            && ["public", "shared_pc"].iter().all(|role| {
+                let mut placements = witness
+                    .initialization
+                    .iter()
+                    .filter(|placement| placement.role == *role);
+                let Some(placement) = placements.next() else {
+                    return false;
+                };
+                placements.next().is_none()
+                    && placement.assigned_nodes > 0
+                    && placement.cuda_nodes > 0
+                    && placement
+                        .cuda_nodes
+                        .checked_add(placement.approved_cpu_control_nodes)
+                        == Some(placement.assigned_nodes)
+                    && residency
+                        .graphs
+                        .iter()
+                        .any(|graph| graph.role == *role && graph.sha256 == placement.graph_sha256)
+            });
+        if execution.provider != "cuda"
+            || execution.cuda_control_inventory_sha256 != Some(witness.inventory_sha256)
+            || witness.manifest_sha256 != manifest
+            || witness.runtime_sha256 != execution.runtime_sha256
+            || execution.runtime_bundle_sha256 != Some(witness.runtime_bundle_sha256)
+            || witness.schema != "rovezero.pals-cuda-metadata-control.v1"
+            || !matching_graphs
+            || witness.public.cuda_kernels == 0
+            || witness.public.neural_kernels == 0
+            || witness.shared_pc.cuda_kernels == 0
+            || witness.shared_pc.proposer_private_kernels == 0
+            || witness.shared_pc.critic_private_kernels == 0
+        {
+            return Err(RoleError::Backend(
+                "PALS CUDA placement ACK is incomplete or belongs to a different pinned owner"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
     /// Only an acknowledged exclusive worker snapshot supplies these counters.
     /// No semantic role completion count is expanded into guessed graph work.
@@ -1203,7 +1259,8 @@ mod native {
                 Ok(
                     PalsNativeResult::NewGame
                     | PalsNativeResult::Stats(_)
-                    | PalsNativeResult::RuntimeVerified,
+                    | PalsNativeResult::RuntimeVerified
+                    | PalsNativeResult::CudaPlacementVerified(_),
                 ) => {
                     self.owner.validation_failed.fetch_add(1, Ordering::AcqRel);
                     Err(fault(
@@ -1315,6 +1372,27 @@ mod native {
                 .map_err(model_error)?;
             Self::new_with_drain_limit(backend, drain_limit)
         }
+        pub fn load_pinned_with_cuda_control_policy(
+            export: &std::path::Path,
+            expected_export_sha256: &str,
+            pin: &rz_eval::runtime_pin::RuntimeLibraryPin,
+            config: rz_eval::pals_onnx::PalsOnnxConfig,
+            policy: PalsCudaControlPolicy,
+            profile_root: &std::path::Path,
+            drain_limit: Duration,
+        ) -> Result<Self, RoleError> {
+            let runtime = rz_eval::onnx::OrtRuntime::load(pin).map_err(model_error)?;
+            let backend = PalsOnnxBackend::load_with_cuda_control_policy(
+                export,
+                expected_export_sha256,
+                runtime,
+                config,
+                policy,
+                profile_root,
+            )
+            .map_err(model_error)?;
+            Self::new_with_drain_limit(backend, drain_limit)
+        }
         pub fn new(backend: PalsOnnxBackend) -> Result<Self, RoleError> {
             Self::new_with_drain_limit(backend, DEFAULT_DRAIN_LIMIT)
         }
@@ -1415,6 +1493,7 @@ mod native {
                     completed_proposer_calls: 0,
                     completed_critic_calls: 0,
                     runtime_mapping_confirmed: false,
+                    cuda_placement_witness: None,
                     reset_completed: false,
                     backend_stats: None,
                 })),
@@ -1569,6 +1648,27 @@ mod native {
                     .as_mut()
                     .ok_or(RoleError::Unavailable)?
                     .runtime_mapping_confirmed = true;
+                if self.owner.execution.provider == "cuda" {
+                    let witness = match self
+                        .startup_command(PalsNativeCommand::VerifyCudaPlacement, until)?
+                    {
+                        PalsNativeResult::CudaPlacementVerified(witness) => witness,
+                        _ => return Err(RoleError::InvalidOutput),
+                    };
+                    validate_startup_cuda_witness(
+                        &witness,
+                        &self.owner.execution,
+                        self.owner.manifest_digest,
+                        &self.owner.residency,
+                    )?;
+                    self.owner
+                        .startup_probe
+                        .lock()
+                        .map_err(|_| RoleError::Unavailable)?
+                        .as_mut()
+                        .ok_or(RoleError::Unavailable)?
+                        .cuda_placement_witness = Some(witness);
+                }
                 if !matches!(
                     self.startup_command(PalsNativeCommand::NewGame, until)?,
                     PalsNativeResult::NewGame
@@ -1600,13 +1700,6 @@ mod native {
                 }
                 if Instant::now() >= until {
                     return Err(RoleError::Deadline);
-                }
-                if self.owner.execution.provider == "cuda" {
-                    // The current backend exposes origin auditing, not an
-                    // executed public/P/C kernel placement witness. A pinned
-                    // CUDA bundle and fenced probe cannot substitute for that
-                    // missing acceptance evidence, so never publish readyok.
-                    return Err(RoleError::Backend("PALS CUDA major NN placement witness is not registered; readiness denied without CPU fallback".into()));
                 }
                 self.owner.startup_ready.store(true, Ordering::Release);
                 Ok(())
@@ -1771,7 +1864,8 @@ mod native {
                             Ok(
                                 PalsNativeResult::Evaluation(_)
                                 | PalsNativeResult::Stats(_)
-                                | PalsNativeResult::RuntimeVerified,
+                                | PalsNativeResult::RuntimeVerified
+                                | PalsNativeResult::CudaPlacementVerified(_),
                             ) => {
                                 self.unusable = true;
                                 return Err(RoleError::Backend(
@@ -2181,6 +2275,95 @@ mod native {
         use rz_eval::pals_model::PalsRawOutput;
         use rz_eval::worker::PhysicalRun;
 
+        fn unexpected_cuda_placement() -> PhysicalRun<Result<PalsNativeResult, BackendError>> {
+            PhysicalRun::Complete(Err(BackendError::new(
+                FailureKind::BackendUnavailable,
+                FailureStage::Admission,
+                "CPU lifecycle fixture has no CUDA placement witness",
+            )))
+        }
+
+        #[test]
+        fn startup_cuda_witness_requires_owner_pins_and_both_private_branches() {
+            use rz_eval::pals_onnx::{PalsGraphPlacement, PalsKernelWitness};
+            // Synthetic boundary evidence exercises admission only; it is not
+            // a CUDA device, physical kernel or native placement attestation.
+            let execution = NativeExecutionReceipt {
+                provider: "cuda",
+                device_id: Some(0),
+                session_arena_bytes: Some(2 * 1024 * 1024 * 1024),
+                runtime_sha256: [1; 32],
+                runtime_bundle_sha256: Some([2; 32]),
+                cuda_control_inventory_sha256: Some([3; 32]),
+                transient_request_device_bytes: 0,
+                transient_execution_device_bytes: 0,
+                pinned_request_bytes: 0,
+                device_public_memory: false,
+            };
+            let graphs: Vec<_> = ["public", "shared_pc"]
+                .into_iter()
+                .map(|role| rz_eval::pals_onnx::PalsGraphIdentity {
+                    role: role.into(),
+                    sha256: [4; 32],
+                    serialized_bytes: 1,
+                })
+                .collect();
+            let residency = PalsSessionResidency {
+                graphs,
+                native_sessions: 2,
+                layout: "synthetic-boundary-test".into(),
+                reader_initializer_bank: None,
+                role_reader_weights_shared: None,
+                native_resident_parameter_bytes: None,
+                vram_peak_bytes: None,
+            };
+            let kernels = PalsKernelWitness {
+                profile_sha256: [5; 32],
+                cuda_kernels: 2,
+                approved_cpu_control_kernels: 1,
+                neural_kernels: 2,
+                proposer_private_kernels: 1,
+                critic_private_kernels: 1,
+            };
+            let mut witness = PalsCudaPlacementWitness {
+                schema: "rovezero.pals-cuda-metadata-control.v1".into(),
+                inventory_sha256: [3; 32],
+                manifest_sha256: [6; 32],
+                runtime_sha256: [1; 32],
+                runtime_bundle_sha256: [2; 32],
+                initialization: ["public", "shared_pc"]
+                    .into_iter()
+                    .map(|role| PalsGraphPlacement {
+                        role: role.into(),
+                        graph_sha256: [4; 32],
+                        log_sha256: [7; 32],
+                        assigned_nodes: 3,
+                        cuda_nodes: 2,
+                        approved_cpu_control_nodes: 1,
+                        recursive_coverage: "synthetic-boundary-test".into(),
+                    })
+                    .collect(),
+                public: kernels.clone(),
+                shared_pc: kernels,
+                category_provenance: "synthetic-boundary-test".into(),
+            };
+            assert!(
+                validate_startup_cuda_witness(&witness, &execution, [6; 32], &residency).is_ok()
+            );
+            assert!(
+                validate_startup_cuda_witness(&witness, &execution, [8; 32], &residency).is_err()
+            );
+            witness.shared_pc.critic_private_kernels = 0;
+            assert!(
+                validate_startup_cuda_witness(&witness, &execution, [6; 32], &residency).is_err()
+            );
+            witness.shared_pc.critic_private_kernels = 1;
+            witness.initialization[0].graph_sha256 = [8; 32];
+            assert!(
+                validate_startup_cuda_witness(&witness, &execution, [6; 32], &residency).is_err()
+            );
+        }
+
         fn fixture_model<F>(run: F) -> NativeRoleModel
         where
             F: FnMut(&PalsNativeCommand) -> PhysicalRun<Result<PalsNativeResult, BackendError>>
@@ -2246,6 +2429,7 @@ mod native {
                     session_arena_bytes: None,
                     runtime_sha256: [0; 32],
                     runtime_bundle_sha256: None,
+                    cuda_control_inventory_sha256: None,
                     transient_request_device_bytes: 0,
                     transient_execution_device_bytes: 0,
                     pinned_request_bytes: 0,
@@ -2363,6 +2547,7 @@ mod native {
                         stats.new_game_resets += 1;
                         PalsNativeResult::NewGame
                     }
+                    PalsNativeCommand::VerifyCudaPlacement => return unexpected_cuda_placement(),
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
                     PalsNativeCommand::SnapshotStats => PalsNativeResult::Stats(stats.clone()),
                 }))
@@ -2374,6 +2559,7 @@ mod native {
                 completed_proposer_calls: 0,
                 completed_critic_calls: 0,
                 runtime_mapping_confirmed: false,
+                cuda_placement_witness: None,
                 reset_completed: false,
                 backend_stats: None,
             });
@@ -2459,6 +2645,7 @@ mod native {
                         output(input)
                     }
                     PalsNativeCommand::NewGame => PalsNativeResult::NewGame,
+                    PalsNativeCommand::VerifyCudaPlacement => return unexpected_cuda_placement(),
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
                     PalsNativeCommand::SnapshotStats => {
                         PalsNativeResult::Stats(PalsBackendStats::default())
@@ -2505,6 +2692,7 @@ mod native {
                 PhysicalRun::Complete(Ok(match command {
                     PalsNativeCommand::Evaluate(input) => output(input),
                     PalsNativeCommand::NewGame => PalsNativeResult::NewGame,
+                    PalsNativeCommand::VerifyCudaPlacement => return unexpected_cuda_placement(),
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
                     PalsNativeCommand::SnapshotStats => {
                         PalsNativeResult::Stats(PalsBackendStats::default())
@@ -2563,6 +2751,7 @@ mod native {
                 PhysicalRun::Complete(Ok(match command {
                     PalsNativeCommand::Evaluate(input) => output(input),
                     PalsNativeCommand::NewGame => PalsNativeResult::NewGame,
+                    PalsNativeCommand::VerifyCudaPlacement => return unexpected_cuda_placement(),
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
                     PalsNativeCommand::SnapshotStats => {
                         PalsNativeResult::Stats(PalsBackendStats::default())
@@ -2618,6 +2807,7 @@ mod native {
                     PalsNativeCommand::SnapshotStats => {
                         PalsNativeResult::Stats(PalsBackendStats::default())
                     }
+                    PalsNativeCommand::VerifyCudaPlacement => return unexpected_cuda_placement(),
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
                 }))
             });
@@ -2671,6 +2861,7 @@ mod native {
                 PalsNativeCommand::SnapshotStats => {
                     PhysicalRun::Complete(Ok(PalsNativeResult::Stats(PalsBackendStats::default())))
                 }
+                PalsNativeCommand::VerifyCudaPlacement => unexpected_cuda_placement(),
                 PalsNativeCommand::VerifyRuntime => {
                     PhysicalRun::Complete(Ok(PalsNativeResult::RuntimeVerified))
                 }
@@ -2703,6 +2894,7 @@ mod native {
                     PalsNativeCommand::SnapshotStats => PhysicalRun::Complete(Ok(
                         PalsNativeResult::Stats(PalsBackendStats::default()),
                     )),
+                    PalsNativeCommand::VerifyCudaPlacement => unexpected_cuda_placement(),
                     PalsNativeCommand::VerifyRuntime => {
                         PhysicalRun::Complete(Ok(PalsNativeResult::RuntimeVerified))
                     }
@@ -2788,6 +2980,7 @@ mod native {
                     FailureStage::Backend,
                     "unknown Stats fixture completion",
                 )),
+                PalsNativeCommand::VerifyCudaPlacement => unexpected_cuda_placement(),
                 PalsNativeCommand::VerifyRuntime => {
                     PhysicalRun::Complete(Ok(PalsNativeResult::RuntimeVerified))
                 }
@@ -2816,6 +3009,7 @@ mod native {
                 PhysicalRun::Complete(Ok(match command {
                     PalsNativeCommand::Evaluate(input) => output(input),
                     PalsNativeCommand::NewGame => PalsNativeResult::NewGame,
+                    PalsNativeCommand::VerifyCudaPlacement => return unexpected_cuda_placement(),
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
                     PalsNativeCommand::SnapshotStats => PalsNativeResult::Stats(PalsBackendStats {
                         completed_nn_inputs: 1,

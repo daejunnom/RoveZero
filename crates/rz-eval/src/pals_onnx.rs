@@ -26,6 +26,10 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
+mod cuda_control;
+pub use cuda_control::{
+    PalsCudaControlPolicy, PalsCudaPlacementWitness, PalsGraphPlacement, PalsKernelWitness,
+};
 
 const MAX_MANIFEST_BYTES: usize = 128 * 1024;
 const MAX_GRAPH_BYTES: usize = 256 * 1024 * 1024;
@@ -782,7 +786,12 @@ fn validate_session(
     }
     Ok(())
 }
-fn load_session(bytes: Vec<u8>, config: PalsOnnxConfig) -> Result<Session, BackendError> {
+fn load_session(
+    bytes: Vec<u8>,
+    config: PalsOnnxConfig,
+    role: &str,
+    audit: Option<(&PalsCudaControlPolicy, &Path)>,
+) -> Result<(Session, Option<PalsGraphPlacement>), BackendError> {
     let configure = |e| {
         native(
             CauseCode::SessionConfiguration,
@@ -828,7 +837,12 @@ fn load_session(bytes: Vec<u8>, config: PalsOnnxConfig) -> Result<Session, Backe
                 ));
             }
             builder
-                .with_config_entry("session.disable_cpu_ep_fallback", "1")
+                // Strict is unchanged unless the caller registered an exact
+                // metadata-only policy. Its complete init gate runs before Run.
+                .with_config_entry(
+                    "session.disable_cpu_ep_fallback",
+                    if audit.is_some() { "0" } else { "1" },
+                )
                 .map_err(configure)?
                 .with_execution_providers([cuda
                     .with_device_id(device_id)
@@ -841,11 +855,33 @@ fn load_session(bytes: Vec<u8>, config: PalsOnnxConfig) -> Result<Session, Backe
                 .map_err(configure)?
         }
     };
+    let placement_log = if let Some((policy, root)) = audit {
+        let (configured, log) =
+            policy.configure(builder, role, &root.join(format!("pals-{role}-kernels")))?;
+        builder = configured;
+        Some(log)
+    } else {
+        None
+    };
     // Default native copying; no direct-reference initializer option is enabled.
     // Serialized owned bytes are freed immediately after successful/failed load.
-    builder
-        .commit_from_memory(&bytes)
-        .map_err(|e| native(CauseCode::ModelLoad, "PALS ONNX loading failed", e))
+    let loaded = builder.commit_from_memory(&bytes);
+    let recorded = if let (Some((_, root)), Some(log)) = (audit, &placement_log) {
+        cuda_control::record_initial_log(log, &root.join(format!("{role}-initial-placement.log")))
+    } else {
+        Ok(())
+    };
+    // Preserve the primary native initialization failure; successful sessions
+    // require both a saved bounded log and the independent pre-Run gate.
+    let session =
+        loaded.map_err(|e| native(CauseCode::ModelLoad, "PALS ONNX loading failed", e))?;
+    recorded?;
+    let placement = if let (Some((policy, _)), Some(log)) = (audit, placement_log) {
+        Some(policy.verify_initialization(role, &log)?)
+    } else {
+        None
+    };
+    Ok((session, placement))
 }
 
 struct ActiveInputs {
@@ -929,12 +965,14 @@ pub enum PalsNativeCommand {
     NewGame,
     SnapshotStats,
     VerifyRuntime,
+    VerifyCudaPlacement,
 }
 pub enum PalsNativeResult {
     Evaluation(PalsRawOutput),
     NewGame,
     Stats(PalsBackendStats),
     RuntimeVerified,
+    CudaPlacementVerified(Box<PalsCudaPlacementWitness>),
 }
 /// Native graph evidence, cumulative across games for one frozen backend.
 /// These are typed counters; a caller must choose its own receipt schema.
@@ -1032,6 +1070,7 @@ pub struct PalsOnnxBackend {
     residency: PalsSessionResidency,
     stats: PalsBackendStats,
     cuda_mapping_audit: RefCell<CudaMappingAudit>,
+    cuda_control_audit: Option<CudaControlAudit>,
     // The bank keeps one immutable whole-input owner. Only the current physical
     // invocation holds an external pin; idle retained cache pages are unpinned.
     // Option permits preserving the complete bank on unknown native completion.
@@ -1048,12 +1087,56 @@ pub struct PalsOnnxBackend {
     pub public_encodes: u64,
     pub public_cache_hits: u64,
 }
+struct CudaControlAudit {
+    policy: PalsCudaControlPolicy,
+    profile_root: std::path::PathBuf,
+    initialization: Vec<PalsGraphPlacement>,
+    proposer_seen: bool,
+    critic_seen: bool,
+    witness: Option<PalsCudaPlacementWitness>,
+    rejected: Option<BackendError>,
+}
 impl PalsOnnxBackend {
     pub fn load(
         path: &Path,
         expected_manifest_sha256: &str,
         runtime: OrtRuntime,
         config: PalsOnnxConfig,
+    ) -> Result<Self, BackendError> {
+        Self::load_inner(path, expected_manifest_sha256, runtime, config, None)
+    }
+    /// Optional, separately registered CUDA mode. CPU neural fallback remains
+    /// forbidden by the complete pre-Run exact-flow placement gate.
+    pub fn load_with_cuda_control_policy(
+        path: &Path,
+        expected_manifest_sha256: &str,
+        runtime: OrtRuntime,
+        config: PalsOnnxConfig,
+        policy: PalsCudaControlPolicy,
+        profile_root: &Path,
+    ) -> Result<Self, BackendError> {
+        if !matches!(config.provider, Provider::Cuda { .. }) || config.device_public_memory {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Admission,
+                "PALS metadata-control v1 requires explicit CUDA with host public memory",
+            ));
+        }
+        let root = cuda_control::owned_profile_root(profile_root)?;
+        Self::load_inner(
+            path,
+            expected_manifest_sha256,
+            runtime,
+            config,
+            Some((policy, root)),
+        )
+    }
+    fn load_inner(
+        path: &Path,
+        expected_manifest_sha256: &str,
+        runtime: OrtRuntime,
+        config: PalsOnnxConfig,
+        audit: Option<(PalsCudaControlPolicy, std::path::PathBuf)>,
     ) -> Result<Self, BackendError> {
         config.validate()?;
         if !path.is_absolute() {
@@ -1114,7 +1197,11 @@ impl PalsOnnxBackend {
         let mut sessions = BTreeMap::new();
         let mut graph_identities = Vec::with_capacity(3);
         let mut total = 0_u64;
+        let mut placements = Vec::new();
         for graph in &manifest.graphs {
+            if let Some((policy, _)) = &audit {
+                policy.validate_pins(manifest_digest, graph)?;
+            }
             let graph_bytes = asset::read_bounded(&parent.join(&graph.file), MAX_GRAPH_BYTES)?;
             total = total.checked_add(graph_bytes.len() as u64).ok_or_else(|| {
                 fail(
@@ -1143,18 +1230,36 @@ impl PalsOnnxBackend {
                 sha256: graph_digest,
                 serialized_bytes: graph_bytes.len() as u64,
             });
-            let session = load_session(graph_bytes, config).map_err(|mut failure| {
+            let (session, placement) = load_session(
+                graph_bytes,
+                config,
+                &graph.role,
+                audit
+                    .as_ref()
+                    .map(|(policy, root)| (policy, root.as_path())),
+            )
+            .map_err(|mut failure| {
                 // Bounded role/phase context identifies partial-constructor
                 // failure without retaining graph bytes or retrying native init.
-                failure.detail = match graph.role.as_str() {
-                    "public" => "PALS public graph session creation failed",
-                    "shared_pc" => "PALS shared P/C graph session creation failed",
-                    "proposer" => "PALS proposer graph session creation failed",
-                    "critic" => "PALS critic graph session creation failed",
-                    _ => "PALS graph session creation failed",
-                };
+                // Preserve the exact pre-Run policy/configuration diagnostic;
+                // only a native model-load failure receives constructor context.
+                if failure
+                    .cause
+                    .is_some_and(|cause| cause.code == CauseCode::ModelLoad)
+                {
+                    failure.detail = match graph.role.as_str() {
+                        "public" => "PALS public graph session creation failed",
+                        "shared_pc" => "PALS shared P/C graph session creation failed",
+                        "proposer" => "PALS proposer graph session creation failed",
+                        "critic" => "PALS critic graph session creation failed",
+                        _ => "PALS graph session creation failed",
+                    };
+                }
                 failure
             })?;
+            if let Some(placement) = placement {
+                placements.push(placement);
+            }
             validate_session(&session, graph, &manifest)?;
             sessions.insert(graph.role.clone(), session);
         }
@@ -1201,6 +1306,15 @@ impl PalsOnnxBackend {
             },
             stats: PalsBackendStats::default(),
             cuda_mapping_audit: RefCell::default(),
+            cuda_control_audit: audit.map(|(policy, profile_root)| CudaControlAudit {
+                policy,
+                profile_root,
+                initialization: placements,
+                proposer_seen: false,
+                critic_seen: false,
+                witness: None,
+                rejected: None,
+            }),
             memory: Some(memory),
             cached_memory_key: None,
             active_memory: None,
@@ -1387,6 +1501,89 @@ impl PalsOnnxBackend {
         }
         Ok(())
     }
+    pub fn cuda_placement_witness(&self) -> Option<&PalsCudaPlacementWitness> {
+        self.cuda_control_audit
+            .as_ref()
+            .and_then(|audit| audit.witness.as_ref())
+    }
+    pub fn cuda_control_inventory_digest(&self) -> Option<[u8; 32]> {
+        self.cuda_control_audit
+            .as_ref()
+            .map(|audit| audit.policy.inventory)
+    }
+    /// NN-zero control operation after both physically completed, validated
+    /// startup P/C queries. Origin validation remains a separate control ACK.
+    pub fn verify_cuda_placement(&mut self) -> Result<PalsCudaPlacementWitness, BackendError> {
+        if let Some(cause) = &self.quarantine {
+            return Err(cause.clone());
+        }
+        if self.active.is_some() || self.active_memory.is_some() {
+            return Err(fail(
+                K::BackendFailure,
+                S::Backend,
+                "PALS CUDA placement requires physical idle",
+            ));
+        }
+        let audit = self.cuda_control_audit.as_mut().ok_or_else(|| {
+            fail(
+                K::BackendUnavailable,
+                S::Backend,
+                "PALS CUDA placement has no separately registered explicit control policy",
+            )
+        })?;
+        if let Some(cause) = &audit.rejected {
+            return Err(cause.clone());
+        }
+        if let Some(witness) = &audit.witness {
+            return Ok(witness.clone());
+        }
+        let verified = (|| {
+            if !audit.proposer_seen || !audit.critic_seen {
+                return Err(fail(
+                    K::BackendUnavailable,
+                    S::Backend,
+                    "PALS CUDA witness requires actual validated P and C startup queries",
+                ));
+            }
+            let public = cuda_control::finish_profile(
+                self.public.as_mut().expect("public session"),
+                &audit.profile_root,
+            )?;
+            let shared = cuda_control::finish_profile(
+                self.shared_pc.as_mut().ok_or_else(|| {
+                    fail(
+                        K::UnsupportedModel,
+                        S::Backend,
+                        "PALS metadata-control supports shared P/C sessions only",
+                    )
+                })?,
+                &audit.profile_root,
+            )?;
+            audit.policy.verify_profiles(
+                &public,
+                &shared,
+                audit.initialization.clone(),
+                self.runtime.binary_digest(),
+                self.runtime.bundle_digest().ok_or_else(|| {
+                    fail(
+                        K::IdentityMismatch,
+                        S::Backend,
+                        "PALS CUDA runtime bundle absent",
+                    )
+                })?,
+            )
+        })();
+        match verified {
+            Ok(witness) => {
+                audit.witness = Some(witness.clone());
+                Ok(witness)
+            }
+            Err(error) => {
+                audit.rejected = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
     pub fn worker(
         mut self,
     ) -> Result<SingleWorker<PalsModelInput, Result<PalsRawOutput, BackendError>>, BackendError>
@@ -1417,6 +1614,9 @@ impl PalsOnnxBackend {
                 PalsNativeCommand::VerifyRuntime => self
                     .verify_runtime()
                     .map(|()| PalsNativeResult::RuntimeVerified),
+                PalsNativeCommand::VerifyCudaPlacement => self
+                    .verify_cuda_placement()
+                    .map(|witness| PalsNativeResult::CudaPlacementVerified(Box::new(witness))),
             };
             match self.quarantine.as_ref() {
                 Some(cause) => PhysicalRun::Quarantined(cause.clone()),
@@ -1429,6 +1629,13 @@ impl PalsOnnxBackend {
             return Err(cause.clone());
         }
         self.cuda_mapping_audit.borrow().allow_run()?;
+        if let Some(cause) = self
+            .cuda_control_audit
+            .as_ref()
+            .and_then(|audit| audit.rejected.as_ref())
+        {
+            return Err(cause.clone());
+        }
         input.validate(&self.model_config).map_err(model_input)?;
         if input.model_epoch != self.epoch {
             return Err(fail(
@@ -1490,6 +1697,12 @@ impl PalsOnnxBackend {
                 .after_run(result.is_ok(), || {
                     self.runtime.verify_cuda_runtime_mappings()
                 })?;
+        }
+        if result.is_ok() {
+            if let Some(audit) = &mut self.cuda_control_audit {
+                audit.proposer_seen |= input.role == PalsRole::Proposer;
+                audit.critic_seen |= input.role == PalsRole::Critic;
+            }
         }
         result
     }

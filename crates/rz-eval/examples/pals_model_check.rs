@@ -6,8 +6,8 @@ use rz_eval::pals_model::{
     PalsModelConfig, PalsModelInput, PalsRawOutput, PalsRole, PALS_MODEL_SCHEMA,
 };
 use rz_eval::pals_onnx::{
-    PalsBackendStats, PalsNativeCommand, PalsNativeResult, PalsOnnxBackend, PalsOnnxConfig,
-    PalsPublicMemoryWitness,
+    PalsBackendStats, PalsCudaControlPolicy, PalsNativeCommand, PalsNativeResult, PalsOnnxBackend,
+    PalsOnnxConfig, PalsPublicMemoryWitness,
 };
 use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeCache};
 use rz_eval::worker::PhysicalPoll;
@@ -230,12 +230,20 @@ fn stats_json(stats: &PalsBackendStats) -> serde_json::Value {
 }
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if !(8..=9).contains(&args.len()) {
-        return Err("usage: pals_model_check EXPORT.json EXPORT_SHA256 ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu|cuda|cuda-device CACHE_ROOT [CUDA_BUNDLE.json]".into());
+    if args.len() == 3 && args[0] == "--check-cuda-control-policy" {
+        // Pure bounded source-policy parsing: no runtime load, session, Run or
+        // provider claim. The external owner preserves stdout as evidence.
+        PalsCudaControlPolicy::from_inventory(Path::new(&args[1]), &args[2])?;
+        println!("Pinned static PALS CUDA control policy accepted; native placement and GPU execution not observed");
+        return Ok(());
+    }
+    if !matches!(args.len(), 8 | 9 | 11) {
+        return Err("usage: pals_model_check EXPORT.json EXPORT_SHA256 ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu|cuda|cuda-device|cuda-control CACHE_ROOT [CUDA_BUNDLE.json] [INVENTORY_V2.json INVENTORY_SHA256]".into());
     }
     let is_cuda = match (args[6].as_str(), args.len()) {
         ("cpu", 8) => false,
         ("cuda" | "cuda-device", 9) => true,
+        ("cuda-control", 11) => true,
         _ => return Err("CUDA requires its explicit pinned bundle; CPU excludes it".into()),
     };
     let report = Path::new(&args[5]);
@@ -277,6 +285,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         failure
     })?;
     let runtime_digest = runtime.binary_digest();
+    let control_policy = if args[6] == "cuda-control" {
+        Some(PalsCudaControlPolicy::from_inventory(
+            Path::new(&args[9]),
+            &args[10],
+        )?)
+    } else {
+        None
+    };
     let mut config = PalsOnnxConfig::cpu();
     if is_cuda {
         config.provider = Provider::Cuda {
@@ -285,8 +301,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         config.device_public_memory = args[6] == "cuda-device";
     }
-    let mut backend =
-        PalsOnnxBackend::load(Path::new(&args[0]), &args[1], runtime.clone(), config)?;
+    let load = |runtime, config, suffix: &str| {
+        if let Some(policy) = &control_policy {
+            PalsOnnxBackend::load_with_cuda_control_policy(
+                Path::new(&args[0]),
+                &args[1],
+                runtime,
+                config,
+                policy.clone(),
+                &report.with_extension(format!("cuda-control-{suffix}")),
+            )
+        } else {
+            PalsOnnxBackend::load(Path::new(&args[0]), &args[1], runtime, config)
+        }
+    };
+    let mut backend = load(runtime.clone(), config, "primary")?;
     let epoch = backend.model_epoch();
     if epoch != asset::parse_sha256(&fixtures.checkpoint_sha256)?
         || backend.is_trained() != fixtures.trained
@@ -304,6 +333,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let began = Instant::now();
     let mut reports = Vec::new();
     let mut raw_outputs = Vec::new();
+    let mut proposer_seen = false;
+    let mut critic_seen = false;
+    let mut placement_witness = None;
     for case in &fixtures.cases {
         if began.elapsed() >= Duration::from_secs(120) {
             return Err("finite numeric window exhausted before next physical Run".into());
@@ -327,6 +359,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         let repeated = backend.run(&case.input)?;
         if repeated != raw {
             return Err("fresh private-role repeat changed exact PALS result".into());
+        }
+        proposer_seen |= case.input.role == PalsRole::Proposer;
+        critic_seen |= case.input.role == PalsRole::Critic;
+        if control_policy.is_some() && proposer_seen && critic_seen && placement_witness.is_none() {
+            placement_witness = Some(backend.verify_cuda_placement()?);
         }
         raw_outputs.push(raw);
     }
@@ -363,7 +400,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Separate sessions verify cache eviction/fresh encode equivalence. No
     // measured performance improvement is inferred from these correctness calls.
     config.cache_public_memory = false;
-    let mut fresh = PalsOnnxBackend::load(Path::new(&args[0]), &args[1], runtime, config)?;
+    let mut fresh = load(runtime, config, "fresh")?;
+    let mut fresh_proposer_seen = false;
+    let mut fresh_critic_seen = false;
+    let mut fresh_placement_witness = None;
     for (case, expected) in fixtures.cases.iter().zip(&raw_outputs) {
         if fresh.run(&case.input)? != *expected {
             return Err("public memory cache changed exact PALS output".into());
@@ -371,6 +411,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         let pages = fresh.host_public_page_snapshot();
         if pages.entries != 0 || pages.reserved_bytes != 0 || pages.pinned_entries != 0 {
             return Err("disabled cache retained a completed host public page".into());
+        }
+        fresh_proposer_seen |= case.input.role == PalsRole::Proposer;
+        fresh_critic_seen |= case.input.role == PalsRole::Critic;
+        if control_policy.is_some()
+            && fresh_proposer_seen
+            && fresh_critic_seen
+            && fresh_placement_witness.is_none()
+        {
+            fresh_placement_witness = Some(fresh.verify_cuda_placement()?);
         }
     }
     fresh.verify_runtime()?;
@@ -391,6 +440,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             PhysicalPoll::Ready(Ok(PalsNativeResult::RuntimeVerified)) => {
                 return Err("cache reset unexpectedly returned runtime verification".into())
+            }
+            PhysicalPoll::Ready(Ok(PalsNativeResult::CudaPlacementVerified(_))) => {
+                return Err("cache reset unexpectedly returned CUDA placement verification".into())
             }
             PhysicalPoll::Quarantined => {
                 return Err("new game cache reset remains quarantined".into())
@@ -421,6 +473,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     PalsNativeResult::RuntimeVerified => {
                         return Err("evaluation unexpectedly returned runtime verification".into())
+                    }
+                    PalsNativeResult::CudaPlacementVerified(_) => {
+                        return Err(
+                            "evaluation unexpectedly returned CUDA placement verification".into(),
+                        )
                     }
                 }
                 break;
@@ -456,6 +513,38 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             PhysicalPoll::Pending => {
                 return Err("runtime verification has no physical ACK before deadline".into())
+            }
+        }
+    }
+    if let Some(expected) = &placement_witness {
+        let mut verification = worker.submit(PalsNativeCommand::VerifyCudaPlacement)?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match verification.poll() {
+                PhysicalPoll::Ready(Ok(PalsNativeResult::CudaPlacementVerified(witness)))
+                    if *witness == *expected =>
+                {
+                    break
+                }
+                PhysicalPoll::Ready(Err(error)) => return Err(error.into()),
+                PhysicalPoll::Ready(Ok(_)) => {
+                    return Err(
+                        "CUDA placement control returned a different immutable witness or response"
+                            .into(),
+                    )
+                }
+                PhysicalPoll::Quarantined => {
+                    return Err("CUDA placement control has unknown physical completion".into())
+                }
+                PhysicalPoll::Consumed => {
+                    return Err("CUDA placement control completed twice".into())
+                }
+                PhysicalPoll::Pending if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+                PhysicalPoll::Pending => {
+                    return Err("CUDA placement control has no finite physical ACK".into())
+                }
             }
         }
     }
@@ -505,7 +594,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             Poll::Pending => return Err("physical owner has not completed shutdown".into()),
         }
     }
-    let receipt = json!({"schema": PALS_MODEL_SCHEMA,"status":"passed","trained":trained,"rules_certified":false,
+    let host_page_evidence = json!({"scope":"direct_owner_after_numeric_cases_before_worker",
+        "page_kind":"whole_input","frozen_numeric_epoch":0,
+        "weight_epoch_identity":"full_checkpoint_digest_in_exact_content_key",
+        "bank_max_entries":pages_before_reset.max_entries,"bank_max_bytes":pages_before_reset.max_bytes,
+        "before_new_game":{"entries":pages_before_reset.entries,"reserved_bytes":pages_before_reset.reserved_bytes,
+            "pinned_entries":pages_before_reset.pinned_entries,"pinned_bytes":pages_before_reset.pinned_bytes},
+        "after_new_game":{"entries":pages_after_reset.entries,"reserved_bytes":pages_after_reset.reserved_bytes,
+            "pinned_entries":pages_after_reset.pinned_entries,"pinned_bytes":pages_after_reset.pinned_bytes},
+        "cache_off_completed_page_retirement":"passed","runtime_allocator_peak":"unknown","vram_peak":"unknown"});
+    let cuda_evidence = json!({"cuda_mode":args[6],
+        "cuda_control_inventory_sha256":control_policy.as_ref().map(|_| args[10].as_str()),
+        "cuda_placement_witness":placement_witness,"fresh_cuda_placement_witness":fresh_placement_witness});
+    let mut receipt = json!({"schema": PALS_MODEL_SCHEMA,"status":"passed","trained":trained,"rules_certified":false,
         "model_epoch":hex_digest(&epoch),"manifest_sha256":args[1],"fixture_sha256":hex_digest(&fixture_digest),
         "runtime_sha256":hex_digest(&runtime_digest),"runtime":"1.22.0","rust_ort":"2.0.0-rc.10",
         "provider":if is_cuda {"CUDAExecutionProvider"} else {"CPUExecutionProvider"},"precision":"fp32","tf32":false,
@@ -516,16 +617,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         "stats_physical_ack":"confirmed","control_neural_runs":"zero","backend_stats":stats_json(&stats),
         "runtime_verify_physical_ack":"confirmed",
         "backend_stats_scope":"backend_lifetime_through_final_snapshot_ack",
-        "host_public_page_ownership":{"scope":"direct_owner_after_numeric_cases_before_worker",
-            "page_kind":"whole_input","frozen_numeric_epoch":0,
-            "weight_epoch_identity":"full_checkpoint_digest_in_exact_content_key",
-            "bank_max_entries":pages_before_reset.max_entries,"bank_max_bytes":pages_before_reset.max_bytes,
-            "before_new_game":{"entries":pages_before_reset.entries,"reserved_bytes":pages_before_reset.reserved_bytes,
-                "pinned_entries":pages_before_reset.pinned_entries,"pinned_bytes":pages_before_reset.pinned_bytes},
-            "after_new_game":{"entries":pages_after_reset.entries,"reserved_bytes":pages_after_reset.reserved_bytes,
-                "pinned_entries":pages_after_reset.pinned_entries,"pinned_bytes":pages_after_reset.pinned_bytes},
-            "cache_off_completed_page_retirement":"passed","runtime_allocator_peak":"unknown","vram_peak":"unknown"},
         "device_public_memory":config.device_public_memory,"session_residency":residency,"vram_peak":"unknown","cases":reports});
+    let fields = receipt
+        .as_object_mut()
+        .ok_or("acceptance receipt is not an object")?;
+    fields.insert("host_public_page_ownership".into(), host_page_evidence);
+    fields.extend(
+        cuda_evidence
+            .as_object()
+            .ok_or("CUDA evidence is not an object")?
+            .clone(),
+    );
     let mut output = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)

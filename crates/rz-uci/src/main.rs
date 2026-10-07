@@ -159,6 +159,30 @@ fn run_pals(
             {
                 return Err("duplicate PALS device public memory option".into());
             }
+        } else if let Some(value) = argument.strip_prefix("--pals-cuda-control-mode=") {
+            if native.cuda_control_mode.replace(value.to_owned()).is_some() {
+                return Err("duplicate PALS CUDA control mode".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-cuda-control-inventory=") {
+            if native
+                .cuda_control_inventory
+                .replace(value.to_owned())
+                .is_some()
+            {
+                return Err("duplicate PALS CUDA control inventory".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-cuda-control-inventory-sha256=") {
+            if native
+                .cuda_control_inventory_hash
+                .replace(value.to_owned())
+                .is_some()
+            {
+                return Err("duplicate PALS CUDA control inventory hash".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-cuda-profile-root=") {
+            if native.cuda_profile_root.replace(value.to_owned()).is_some() {
+                return Err("duplicate PALS CUDA profile root".into());
+            }
         } else {
             return Err("PALS requires an explicit model and finite PALS flags; LC0/ORT arguments are not implicitly reused".into());
         }
@@ -166,8 +190,10 @@ fn run_pals(
     let max_cpu_nodes = cpu_nodes.unwrap_or(100_000);
     let rounds = rounds.unwrap_or(16);
     let cpu_depth = cpu_depth.unwrap_or(2);
-    let mut config = rz_search::pals::engine::PalsConfig::default();
-    config.max_nodes = situations.unwrap_or(4096);
+    let config = rz_search::pals::engine::PalsConfig {
+        max_nodes: situations.unwrap_or(4096),
+        ..Default::default()
+    };
     config.validate()?;
     if rounds == 0
         || rounds > 1_000_000
@@ -227,6 +253,10 @@ struct PalsNativeOptions {
     cuda_device: Option<i32>,
     cuda_session_arena: Option<u64>,
     device_public_memory: Option<bool>,
+    cuda_control_mode: Option<String>,
+    cuda_control_inventory: Option<String>,
+    cuda_control_inventory_hash: Option<String>,
+    cuda_profile_root: Option<String>,
 }
 impl PalsNativeOptions {
     fn any(&self) -> bool {
@@ -244,6 +274,10 @@ impl PalsNativeOptions {
             || self.cuda_device.is_some()
             || self.cuda_session_arena.is_some()
             || self.device_public_memory.is_some()
+            || self.cuda_control_mode.is_some()
+            || self.cuda_control_inventory.is_some()
+            || self.cuda_control_inventory_hash.is_some()
+            || self.cuda_profile_root.is_some()
     }
 }
 
@@ -291,13 +325,41 @@ fn run_native_pals(
             || native.cuda_bundle_hash.is_some()
             || native.cuda_device.is_some()
             || native.cuda_session_arena.is_some()
-            || native.device_public_memory.unwrap_or(false))
+            || native.device_public_memory.unwrap_or(false)
+            || native.cuda_control_mode.is_some()
+            || native.cuda_control_inventory.is_some()
+            || native.cuda_control_inventory_hash.is_some()
+            || native.cuda_profile_root.is_some())
     {
         return Err("PALS CPU selection cannot accept CUDA bundle/device/allocator options".into());
     }
     if native.device_public_memory.unwrap_or(false) && !cfg!(feature = "experimental-io-binding") {
         return Err("PALS device public memory requires explicit experimental-io-binding; no binding fallback was started".into());
     }
+    let cuda_control = match (
+        native.cuda_control_mode,
+        native.cuda_control_inventory,
+        native.cuda_control_inventory_hash,
+        native.cuda_profile_root,
+    ) {
+        (None, None, None, None) => None,
+        (Some(mode), Some(inventory), Some(hash), Some(profile))
+            if mode == "inventory-v2" && provider == "cuda" =>
+        {
+            if native.device_public_memory.unwrap_or(false) {
+                return Err("PALS inventory-v2 control mode requires host public memory; no device-binding fallback was started".into());
+            }
+            let inventory = std::path::PathBuf::from(inventory);
+            let profile = std::path::PathBuf::from(profile);
+            if !inventory.is_absolute() || !profile.is_absolute() {
+                return Err("PALS control inventory and profile root must be absolute".into());
+            }
+            rz_eval::asset::parse_sha256(&hash)?;
+            let policy = rz_eval::pals_onnx::PalsCudaControlPolicy::from_inventory(&inventory, &hash)?;
+            Some((policy, profile))
+        }
+        _ => return Err("PALS CUDA control mode requires inventory-v2, inventory path, inventory SHA-256 and a fresh owned profile root together; strict mode is the default".into()),
+    };
     let receipt_config =
         match (native.output_root, native.launch_hash, native.endpoint_id) {
             (None, None, None) => None,
@@ -391,13 +453,26 @@ fn run_native_pals(
     };
     let mut settings = EngineSettings::default();
     settings.search.max_simulations = cpu_nodes;
-    let mut model = rz_uci::pals_native::NativeRoleModel::load_pinned(
-        &manifest,
-        &manifest_hash,
-        &pin,
-        backend_config,
-        settings.shutdown_limit,
-    )?;
+    let mut model = match cuda_control {
+        Some((policy, profile)) => {
+            rz_uci::pals_native::NativeRoleModel::load_pinned_with_cuda_control_policy(
+                &manifest,
+                &manifest_hash,
+                &pin,
+                backend_config,
+                policy,
+                &profile,
+                settings.shutdown_limit,
+            )?
+        }
+        None => rz_uci::pals_native::NativeRoleModel::load_pinned(
+            &manifest,
+            &manifest_hash,
+            &pin,
+            backend_config,
+            settings.shutdown_limit,
+        )?,
+    };
     let finish = model.finish_handle();
     if let Err(primary) =
         model.prepare_startup(std::time::Instant::now() + std::time::Duration::from_secs(15))
@@ -629,9 +704,11 @@ fn run_own_cpu(
     }
     let max_nodes = max_nodes.unwrap_or(100_000);
     // Explicit finite limits: default profile is own bootstrap CPU_R, not NNUE.
-    let mut config = rz_search::cpu::CpuConfig::default();
-    config.max_depth = max_depth.unwrap_or(8);
-    config.tt_entries = tt_entries.unwrap_or(65_536);
+    let config = rz_search::cpu::CpuConfig {
+        max_depth: max_depth.unwrap_or(8),
+        tt_entries: tt_entries.unwrap_or(65_536),
+        ..Default::default()
+    };
     let driver = Arc::new(rz_uci::search_driver::CpuSessionDriver::new(
         config, max_nodes,
     )?);
@@ -757,8 +834,11 @@ struct SearchWorkFinishError {
 #[cfg(feature = "search-work-receipts")]
 impl std::fmt::Display for SearchWorkFinishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "search finish failed: primary={:?}, observation={:?}, publication={:?}",
-            self.primary, self.observation, self.publication)
+        write!(
+            f,
+            "search finish failed: primary={:?}, observation={:?}, publication={:?}",
+            self.primary, self.observation, self.publication
+        )
     }
 }
 #[cfg(feature = "search-work-receipts")]
