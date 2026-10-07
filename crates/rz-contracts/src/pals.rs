@@ -181,10 +181,11 @@ impl RoleOutput {
                 candidate_logits.len() == request.candidates.len() && finite(candidate_logits),
             (RolePayload::Counterexample { candidate_logits, divergence_logits, .. }, Role::Critic) =>
                 candidate_logits.len() == request.candidates.len() && finite(candidate_logits)
-                    && !divergence_logits.is_empty() && divergence_logits.len() <= 16
+                    && (!candidate_logits.is_empty() || !divergence_logits.is_empty())
+                    && divergence_logits.len() <= 128
                     && finite(divergence_logits),
             (RolePayload::TaskRanking { task_logits }, Role::Validator) =>
-                !task_logits.is_empty() && task_logits.len() <= 256 && finite(task_logits),
+                !task_logits.is_empty() && task_logits.len() <= 7 && finite(task_logits),
             _ => false,
         };
         if !valid || self.private_latent.len() != 16 * 384 || !finite(&self.private_latent) {
@@ -197,6 +198,48 @@ impl RoleOutput {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum CpuProblemKind { AnalyzePosition, RootMoves, Divergence, Resume }
+
+#[derive(Clone, Debug)]
+pub struct CpuProblem<P> {
+    pub id: RequestId,
+    pub authority: SearchAuthority,
+    pub state: Arc<P>,
+    pub state_identity: StateIdentity,
+    pub kind: CpuProblemKind,
+    pub prefix: Arc<[Move16]>,
+    pub root_moves: Arc<[Move16]>,
+    pub requested_depth: u16,
+    pub max_nodes: u64,
+    pub deadline: Deadline,
+    pub cancel: CancelToken,
+    pub profile: Digest,
+    pub conditions: Digest,
+    /// Resume is an opaque engine-owned condition-bound token, not a foreign TT.
+    pub resume: Option<Digest>,
+}
+
+impl<P> CpuProblem<P> {
+    pub fn validate(&self, clock: ClockDomain, now: MonotonicTick) -> Result<(), ContractError> {
+        if self.id.epoch != self.authority.epoch || self.deadline.clock.0 != self.authority.epoch {
+            return Err(ContractError::new(ErrorCode::IdentityMismatch, Stage::Admission,
+                "CPU request authority mismatch"));
+        }
+        if self.requested_depth == 0 || self.requested_depth > 128 || self.max_nodes == 0
+            || self.prefix.len() > 256 || self.root_moves.len() > 256 {
+            return Err(invalid("CPU problem exceeds finite limits"));
+        }
+        if (self.kind == CpuProblemKind::Resume) != self.resume.is_some()
+            || (self.kind == CpuProblemKind::RootMoves && self.root_moves.is_empty()) {
+            return Err(invalid("CPU problem payload does not match capability"));
+        }
+        for movement in self.prefix.iter().chain(self.root_moves.iter()) { movement.decode()?; }
+        if self.cancel.is_canceled() {
+            return Err(ContractError::new(ErrorCode::Canceled, Stage::Admission,
+                "CPU problem canceled"));
+        }
+        self.deadline.accepts(clock, now)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Bound { ExactAtDepth, LowerAtDepth, UpperAtDepth, Unknown }
