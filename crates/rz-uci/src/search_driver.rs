@@ -134,6 +134,10 @@ struct PalsCheckerLifecycle {
     last_attempt: Option<CheckerAttempt>,
     shutdown: Option<CheckerShutdown>,
     startup_uci: Option<ExternalUciIdentity>,
+    #[cfg(feature = "search-work-receipts")]
+    startup_resources: Option<crate::pals_attestation::checker::resource::ReadyBoundaryResources>,
+    #[cfg(feature = "search-work-receipts")]
+    startup_resource_unavailable: Option<&'static str>,
 }
 struct PalsActiveLease<'a> {
     lifecycle: &'a Mutex<PalsCheckerLifecycle>,
@@ -387,6 +391,23 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
         let startup = engine.start_checker(deadline, &cancel);
         self.capture_checker(&engine)?;
         startup.map_err(|error| pals_failure("PalsCheckerStartup", &error, &engine))?;
+        #[cfg(feature = "search-work-receipts")]
+        let startup_resources =
+            if matches!(self.registration.identity, CheckerIdentity::ExternalUci(_)) {
+                let process = engine
+                    .checker_last_attempt()
+                    .and_then(|attempt| attempt.external.as_ref())
+                    .and_then(|external| external.process.process_identity);
+                crate::pals_attestation::checker::resource::observe(process, deadline, &cancel)
+                    .map_err(|error| {
+                        SearchSessionFailure::debug("PalsCheckerStartupResource", &error)
+                    })?
+            } else {
+                crate::pals_attestation::checker::resource::ResourceObservation {
+                    snapshot: None,
+                    unavailable: None,
+                }
+            };
         // An adapter returning after control expiry does not gain ready status.
         if cancel.load(Ordering::Acquire)
             || Instant::now() >= deadline
@@ -398,10 +419,16 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
                 detail: "checker startup returned after its admission controls".into(),
             });
         }
-        self.checker_lifecycle
+        let mut lifecycle = self
+            .checker_lifecycle
             .lock()
-            .map_err(|_| checker_owner_unknown("PalsCheckerStartupEvidence"))?
-            .startup_uci = engine.checker_startup_uci();
+            .map_err(|_| checker_owner_unknown("PalsCheckerStartupEvidence"))?;
+        lifecycle.startup_uci = engine.checker_startup_uci();
+        #[cfg(feature = "search-work-receipts")]
+        if lifecycle.startup_resources.is_none() {
+            lifecycle.startup_resources = startup_resources.snapshot;
+            lifecycle.startup_resource_unavailable = startup_resources.unavailable;
+        }
         self.checker_started.store(true, Ordering::Release);
         Ok(())
     }
@@ -410,6 +437,27 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
             .lock()
             .map(|state| state.startup_uci.clone())
             .map_err(|_| checker_owner_unknown("PalsCheckerStartupEvidence"))
+    }
+    #[cfg(feature = "search-work-receipts")]
+    pub fn checker_startup_resources(
+        &self,
+    ) -> Result<
+        Option<crate::pals_attestation::checker::resource::ReadyBoundaryResources>,
+        SearchSessionFailure,
+    > {
+        self.checker_lifecycle
+            .lock()
+            .map(|state| state.startup_resources.clone())
+            .map_err(|_| checker_owner_unknown("PalsCheckerStartupResource"))
+    }
+    #[cfg(feature = "search-work-receipts")]
+    pub fn checker_startup_resource_unavailable(
+        &self,
+    ) -> Result<Option<&'static str>, SearchSessionFailure> {
+        self.checker_lifecycle
+            .lock()
+            .map(|state| state.startup_resource_unavailable)
+            .map_err(|_| checker_owner_unknown("PalsCheckerStartupResource"))
     }
 
     /// Latest-search physical attempts only. The latest lifecycle snapshot is
@@ -559,6 +607,21 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> SearchSessionDriver for Pa
     }
     fn checker_startup_uci(&self) -> Result<Option<ExternalUciIdentity>, SearchSessionFailure> {
         PalsSessionDriver::checker_startup_uci(self)
+    }
+    #[cfg(feature = "search-work-receipts")]
+    fn checker_startup_resources(
+        &self,
+    ) -> Result<
+        Option<crate::pals_attestation::checker::resource::ReadyBoundaryResources>,
+        SearchSessionFailure,
+    > {
+        PalsSessionDriver::checker_startup_resources(self)
+    }
+    #[cfg(feature = "search-work-receipts")]
+    fn checker_startup_resource_unavailable(
+        &self,
+    ) -> Result<Option<&'static str>, SearchSessionFailure> {
+        PalsSessionDriver::checker_startup_resource_unavailable(self)
     }
     fn start_checker(
         &self,
@@ -1048,6 +1111,21 @@ pub trait SearchSessionDriver: Send + Sync + 'static {
         None
     }
     fn checker_startup_uci(&self) -> Result<Option<ExternalUciIdentity>, SearchSessionFailure> {
+        Ok(None)
+    }
+    #[cfg(feature = "search-work-receipts")]
+    fn checker_startup_resources(
+        &self,
+    ) -> Result<
+        Option<crate::pals_attestation::checker::resource::ReadyBoundaryResources>,
+        SearchSessionFailure,
+    > {
+        Ok(None)
+    }
+    #[cfg(feature = "search-work-receipts")]
+    fn checker_startup_resource_unavailable(
+        &self,
+    ) -> Result<Option<&'static str>, SearchSessionFailure> {
         Ok(None)
     }
     fn start_checker(
@@ -1653,6 +1731,62 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
             )
             .unwrap();
+    }
+
+    #[cfg(feature = "search-work-receipts")]
+    #[test]
+    fn historical_ready_resource_snapshot_is_preserved_after_helper_cleanup() {
+        let state = Arc::new(CheckerProbeState::default());
+        let driver = checker_driver(state);
+        assert!(driver.checker_startup_resources().unwrap().is_none());
+        assert!(
+            driver
+                .checker_startup_resource_unavailable()
+                .unwrap()
+                .is_none()
+        );
+        start_probe(&driver);
+        // In-process probes have no real helper PID, hence actual observation
+        // remains None. Inject a pure snapshot only to test historical storage.
+        assert!(driver.checker_startup_resources().unwrap().is_none());
+        assert_eq!(
+            driver.checker_startup_resource_unavailable().unwrap(),
+            Some("helper_process_identity_not_observed")
+        );
+        let fixture = crate::pals_attestation::checker::resource::fixture();
+        {
+            let mut lifecycle = driver.checker_lifecycle.lock().unwrap();
+            lifecycle.startup_resources = Some(fixture.clone());
+            lifecycle.startup_resource_unavailable = None;
+        }
+        let before = crate::pals_attestation::checker::PalsCheckerProcessReceipt::observe(
+            &driver,
+            &"a".repeat(64),
+            &"b".repeat(64),
+        )
+        .unwrap();
+        driver
+            .finish_checker(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(driver.checker_startup_resources().unwrap(), Some(fixture));
+        let after = crate::pals_attestation::checker::PalsCheckerProcessReceipt::observe(
+            &driver,
+            &"a".repeat(64),
+            &"b".repeat(64),
+        )
+        .unwrap();
+        let before = serde_json::to_value(before).unwrap();
+        let after = serde_json::to_value(after).unwrap();
+        assert_eq!(
+            before["startup_resource_observation"],
+            after["startup_resource_observation"]
+        );
+        assert_eq!(
+            after["startup_resource_observation"]["helper"]["proc_start_ticks_after"],
+            456
+        );
+        assert_eq!(after["applied_option_values"], "unknown");
+        assert!(after.get("startup_resource_unavailable").is_none());
     }
     fn wait_probe(flag: &AtomicBool) {
         let deadline = Instant::now() + Duration::from_secs(2);

@@ -39,7 +39,7 @@ experimental-raw-cache = ["rz-eval/experimental-raw-cache"]
 onnx-cpu = [
     "rz-eval/onnx", "search-work-receipts",
 ]
-search-work-receipts = ["dep:serde", "dep:serde_json", "dep:cap-std", "dep:cap-fs-ext"]
+search-work-receipts = ["dep:serde", "dep:serde_json", "dep:cap-std", "dep:cap-fs-ext", "dep:nix"]
 onnx-cuda = ["onnx-cpu"]
 
 [dependencies]
@@ -55,3 +55,7 @@ serde_json = { workspace = true, optional = true }
 sha2.workspace = true
 cap-std = { workspace = true, optional = true }
 cap-fs-ext = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Safe Linux proc/cgroup filesystem checks and nonblocking observer opens.
+nix = { workspace = true, optional = true }

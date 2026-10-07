@@ -523,6 +523,7 @@ version = "0.1.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "nix",
  "rz-contracts",
  "rz-encoding",
  "rz-eval",

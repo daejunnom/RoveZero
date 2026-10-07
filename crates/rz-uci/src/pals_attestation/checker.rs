@@ -11,6 +11,7 @@ use rz_search::pals::engine::RoleModel;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+pub mod resource;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PalsCheckerProcessReceipt {
@@ -22,6 +23,14 @@ pub struct PalsCheckerProcessReceipt {
     registration: Value,
     startup_handshake_completed: bool,
     observed_uci: Option<Value>,
+    /// First successful startup's immutable ready-boundary resource snapshot.
+    /// Exit/cleanup does not replace this historical observation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    startup_resource_observation: Option<resource::ReadyBoundaryResources>,
+    /// A missing snapshot preserves the bounded observation's unavailable
+    /// reason; it never stands for zero use or successful resource enforcement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    startup_resource_unavailable: Option<&'static str>,
     /// This startup barrier verified advertised types/ranges and sent options.
     /// UCI does not confirm each applied value; that observation stays unknown.
     requested_option_checks_completed: bool,
@@ -102,6 +111,8 @@ impl PalsCheckerProcessReceipt {
             observed_uci: driver
                 .checker_startup_uci()?
                 .map(|observed| json!({"name": observed.name, "author": observed.author})),
+            startup_resource_observation: driver.checker_startup_resources()?,
+            startup_resource_unavailable: driver.checker_startup_resource_unavailable()?,
             requested_option_checks_completed: started,
             applied_option_values: "unknown",
             latest_attempt: driver
@@ -129,6 +140,8 @@ impl PalsCheckerProcessReceipt {
             && self.profile_canonical_sha256 == other.profile_canonical_sha256
             && self.registration_sha256 == other.registration_sha256
             && self.registration == other.registration
+            && self.startup_resource_observation == other.startup_resource_observation
+            && self.startup_resource_unavailable == other.startup_resource_unavailable
     }
     pub(super) fn cleanup_complete(&self) -> bool {
         self.startup_handshake_completed
