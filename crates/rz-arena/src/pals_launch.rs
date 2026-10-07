@@ -1664,6 +1664,14 @@ pub fn validate_pals_native_records(
     )?;
     let sn = &s["native"];
     let tn = &t["native"];
+    // The native owner allocates a checked, domain-scoped process epoch; it is
+    // neither an OS PID nor a fixed first-owner value. Its paired records are
+    // already bound to the same executable/launch/PID and session directory.
+    let process_epoch = count(sn, "process_epoch")?;
+    require(
+        process_epoch > 0 && process_epoch == count(tn, "process_epoch")?,
+        "native process epoch must be nonzero and match the bound startup/termination pair",
+    )?;
     let mut startup_nn = (0, 0, 0);
     let mut cuda_placement = None;
     if let Some(cuda) = cuda {
@@ -1787,8 +1795,7 @@ pub fn validate_pals_native_records(
             && array_hash(&sn["export_manifest_sha256"])? == native.export.sha256
             && array_hash(&sn["encoding_semantic_sha256"])? == native.encoding_semantic_sha256
             && array_hash(&sn["adapter_source_sha256"])? == native.adapter_source_sha256
-            && sn["trained"] == trained
-            && count(sn, "process_epoch")? == 1,
+            && sn["trained"] == trained,
         "native model/adapter/epoch identity differs",
     )?;
     require(
@@ -3944,6 +3951,51 @@ mod tests {
         assert_eq!(pid, 100);
         assert_eq!(audit.completed_role_inputs, 3);
         assert_eq!(audit.search_consumed_role_inputs, 1);
+        let validate_epoch_pair = |s: &serde_json::Value, t: &serde_json::Value| {
+            validate_pals_native_records(
+                &lock,
+                NativeEngineRole::Baseline,
+                &serde_json::to_vec(s).unwrap(),
+                &serde_json::to_vec(t).unwrap(),
+                "native-process-100",
+            )
+        };
+        // Actual native domain issuance and later owners are not epoch 1 or
+        // PID 100. Legacy synthetic epoch 1 above remains a valid wire.
+        let domain = 0x5041_4c53_0000_0000u64;
+        let mut epoch_start = start.clone();
+        let mut epoch_end = end.clone();
+        for epoch in [domain, domain + 8] {
+            epoch_start["native"]["process_epoch"] = epoch.into();
+            epoch_end["native"]["process_epoch"] = epoch.into();
+            let (observed, pid) = validate_epoch_pair(&epoch_start, &epoch_end).unwrap();
+            assert_eq!(pid, 100);
+            assert_eq!(observed.raw_native["process_epoch"], epoch);
+        }
+        epoch_start["native"]["process_epoch"] = 0.into();
+        epoch_end["native"]["process_epoch"] = 0.into();
+        assert!(validate_epoch_pair(&epoch_start, &epoch_end).is_err());
+        epoch_start["native"]["process_epoch"] = domain.into();
+        epoch_end["native"]["process_epoch"] = (domain + 1).into();
+        assert!(validate_epoch_pair(&epoch_start, &epoch_end).is_err());
+        epoch_start["native"]["process_epoch"] = "forged counter".into();
+        epoch_end["native"]["process_epoch"] = "forged counter".into();
+        assert!(validate_epoch_pair(&epoch_start, &epoch_end).is_err());
+        epoch_start["native"]
+            .as_object_mut()
+            .unwrap()
+            .remove("process_epoch");
+        epoch_end["native"]
+            .as_object_mut()
+            .unwrap()
+            .remove("process_epoch");
+        assert!(validate_epoch_pair(&epoch_start, &epoch_end).is_err());
+        epoch_start["native"]["process_epoch"] = domain.into();
+        epoch_end["native"]["process_epoch"] = domain.into();
+        epoch_end["process_id"] = 101.into();
+        assert!(validate_epoch_pair(&epoch_start, &epoch_end).is_err());
+        epoch_start["process_id"] = 101.into();
+        assert!(validate_epoch_pair(&epoch_start, &epoch_end).is_err());
         assert!(lock.input.require_actual_native_epoch().is_ok());
         let mut historical = native_fixture();
         let PalsEngineV3::Pals(e) = &mut historical.semantic_lock.manifest.engines[0] else {
