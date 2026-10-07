@@ -5,6 +5,8 @@ board/record features under a distinct private query encoding, seals the fresh
 V input before dispatch, and preserves CPU results as future evidence. Random
 V logits select a task; they are never targets. One observed action supplies no
 comparative preference rank, so seven-task loss remains explicitly masked.
+Only current P/C parents are selected; all admitted raw parent history remains
+preserved and checked independently of this selection view.
 No optimizer is created, no backward runs, and no weights are updated.
 """
 import argparse
@@ -902,6 +904,8 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
                                       max_input_bytes=remaining)
         if any(row["input"]["snapshot"]["role"] not in ("proposer", "critic") for row in data.records):
             raise ValueError("V private producer requires admitted public P/C parents")
+        data._verify_raw_integrity()
+        current_parent_indices = data.current_view.current_indices
         parent_identity = _hash("rz-pals-private-immutable-parents/1", data.records)
         if any(identity not in {row["input"]["sha256"] for row in data.records} for identity in control_map):
             raise ValueError("control refers to an unobserved parent input")
@@ -937,9 +941,10 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
         # No inherited CPU report is treated as a completed check under this
         # freshly registered profile/context; baseline is executed by Rust.
         with torch.inference_mode():
-            for index, parent in enumerate(data.records):
-                if index >= max_steps:
+            for selection_index, parent_index in enumerate(current_parent_indices):
+                if selection_index >= max_steps:
                     break
+                parent = data.records[parent_index]
                 snapshot = parent["input"]["snapshot"]
                 if snapshot["game_id"] not in limits.games and len(limits.games) >= max_games:
                     break
@@ -1061,6 +1066,7 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
         after = _parameter_digest(model)
         if before != after or any(value.requires_grad or value.grad is not None for value in model.parameters()):
             raise ValueError("private verifier producer changed parameters or gradients")
+        data._verify_raw_integrity()
         if _hash("rz-pals-private-immutable-parents/1", data.records) != parent_identity:
             raise ValueError("historical P/C parents changed during private production")
         _file(binary, cpu_binary_sha256, max_input_bytes)
@@ -1074,6 +1080,9 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
                               "encoding_schema_sha256": encoding_sha, "checkpoint_sha256": checkpoint_sha256,
                               "collection_receipt_sha256": receipt_sha256, "controls_sha256": controls_sha256,
                               "parent_records_available": len(data.records), "parent_records_selected": counts["selections"],
+                              "parent_records_sha256": parent_identity,
+                              "current_parent_records_available": len(current_parent_indices),
+                              "parent_current_view_sha256": data.current_view.sha256,
                               "parameters_sha256_before": before, "parameters_sha256_after": after,
                               "parameters_unchanged": True, "parent_inputs_unchanged": True,
                               "trained": False, "selection_weights": "own_random_initialization_untrained",

@@ -1,8 +1,9 @@
 """Bounded collected-data → frozen P/C forward → loss preparation check.
 
 This command creates no optimizer, performs no backward pass and updates no
-weights. It consumes every admitted collected P/C row exactly once, including
-its immutable split. Targets and numeric loss values are preparation evidence,
+weights. It consumes every current P/C row exactly once, including its immutable
+split, while preserving and checking the complete admitted raw history. Targets
+and numeric loss values are preparation evidence,
 not training, chess strength, backward-FLOPs or GPU acceptance evidence.
 """
 import argparse
@@ -16,7 +17,7 @@ import torch
 
 from .artifacts import atomic_json, load_checkpoint, output_directory
 from .config import SCHEMA as MODEL_SCHEMA
-from .training import load_collected_dataset, masked_losses
+from .training import _canonical, load_collected_dataset, masked_losses
 
 SCHEMA = "rz-pals-collected-preparation-check/1"
 
@@ -82,6 +83,9 @@ def _run_preparation_check(*, collection, receipt_sha256, encoder_source_sha256,
         raise ValueError("collection rows exceed registered check limit")
     if any(row["input"]["snapshot"]["role"] not in ("proposer", "critic") for row in data.records):
         raise ValueError("this collected frozen check accepts P/C rows only")
+    data._verify_raw_integrity()
+    current_indices = frozenset(data.current_view.current_indices)
+    raw_identity = _canonical("rz-pals-preparation-immutable-records/1", data.records)
     admit_time()
     model, metadata = load_checkpoint(checkpoint)
     if metadata.get("trained") is not False or metadata.get("training_steps") != 0:
@@ -140,17 +144,22 @@ def _run_preparation_check(*, collection, receipt_sha256, encoder_source_sha256,
                                              "loss": {name: float(value) for name, value in loss.items()}})
                         consumed.update(selected)
                         admit_time()
-        if consumed != set(range(len(data.records))):
-            raise ValueError("not all collected records were consumed exactly once")
+        if consumed != current_indices:
+            raise ValueError("not all current collected records were consumed exactly once")
         after = _parameter_digest(model)
         if before != after or any(parameter.requires_grad or parameter.grad is not None for parameter in model.parameters()):
             raise ValueError("frozen check changed parameters or created gradients")
+        data._verify_raw_integrity()
+        if _canonical("rz-pals-preparation-immutable-records/1", data.records) != raw_identity:
+            raise ValueError("raw collected history changed during frozen preparation")
         elapsed = admit_time()
         report = {"schema": SCHEMA, "status": "checks_passed_before_report_write", "training_executed": False, "backward_executed": False,
                   "optimizer_created": False, "optimizer_steps": 0, "gpu_executed": False,
                   "provider": "pytorch_cpu_fp32", "trained": False, "training_steps": 0,
                   "checkpoint_sha256": metadata["checkpoint_sha256"], "collection_receipt_sha256": receipt_sha256,
                   "encoder_source_sha256": encoder_source_sha256, "records": len(data.records),
+                  "raw_records_sha256": raw_identity, "raw_records_unchanged": True,
+                  "current_records": len(current_indices), "current_view_sha256": data.current_view.sha256,
                   "records_consumed": len(consumed), "consumed_exactly_once": True, "role_counts": counts,
                   "target_masks": masks, "require_masked_value": require_masked_value,
                   "parameters_sha256_before": before, "parameters_sha256_after": after,
