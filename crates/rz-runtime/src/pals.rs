@@ -187,6 +187,7 @@ pub struct PalsBatchKey {
     mode: ExecutionMode,
     recurrent_steps: u16,
     max_records: u16,
+    divergence_count: u16,
     candidates: usize,
     records: usize,
 }
@@ -287,6 +288,7 @@ impl<P: Send + Sync + 'static, C: ContractClock> Adapter for PalsAdapter<P, C> {
             mode: request.role.mode,
             recurrent_steps: request.role.recurrent_steps,
             max_records: request.role.max_records,
+            divergence_count: request.role.divergence_count,
             candidates: request.role.candidates.len(),
             records: request.role.public_records.len(),
         }
@@ -763,8 +765,8 @@ fn minimum_output_bytes<P>(request: &RoleRequest<P>) -> u64 {
     let floats = 16 * 384
         + match request.role {
             Role::Proposer => request.candidates.len(),
-            Role::Critic => request.candidates.len() + 16,
-            Role::Validator => 256,
+            Role::Critic => request.candidates.len() + usize::from(request.divergence_count),
+            Role::Validator => 7,
         };
     (size_of::<PhysicalRoleOutput>() + floats * size_of::<f32>()) as u64
 }
@@ -1034,6 +1036,7 @@ mod tests {
             )]),
             public_records: Arc::from([Digest([8; 32])]),
             max_records: 128,
+            divergence_count: 0,
             recurrent_steps: 2,
             deadline: Deadline {
                 clock: ClockDomain(EPOCH),
@@ -1065,15 +1068,33 @@ mod tests {
                 },
                 Role::Critic => RolePayload::Counterexample {
                     candidate_logits: vec![0.25; request.candidates.len()],
-                    divergence_logits: vec![0.0],
+                    divergence_logits: vec![0.0; usize::from(request.divergence_count)],
                     wdl: Wdl::try_new(0.3, 0.4, 0.3, 1e-4).unwrap(),
                 },
                 Role::Validator => RolePayload::TaskRanking {
-                    task_logits: vec![0.0],
+                    task_logits: vec![0.0; 7],
                 },
             },
             private_latent: vec![0.0; 16 * 384],
         }
+    }
+    fn request_as_role(
+        sequence: u64,
+        role: Role,
+        divergence_count: u16,
+        mode: ExecutionMode,
+    ) -> RuntimeRoleRequest<Input> {
+        let mut request = request(sequence, dropped());
+        let common = Arc::get_mut(&mut request.role).unwrap();
+        common.role = role;
+        common.key.role = role;
+        common.mode = mode;
+        common.divergence_count = divergence_count;
+        request
+            .representation
+            .update(representation(&request))
+            .unwrap();
+        request
     }
     fn limits() -> Limits {
         Limits {
@@ -1384,6 +1405,84 @@ mod tests {
             runtime.submit(request(1, dropped())).unwrap_err().code,
             ErrorCode::IdentityMismatch
         );
+    }
+    #[test]
+    fn critic_batch_and_output_match_the_declared_divergence_count() {
+        for divergence_count in [0, 1, 128] {
+            let request =
+                request_as_role(1, Role::Critic, divergence_count, ExecutionMode::Deployment);
+            let mut adapter: TestAdapter =
+                PalsAdapter::new(SharedPalsScope::new(scope()), ManualClock::default()).unwrap();
+            adapter.validate_admission(&request).unwrap();
+            let execution = adapter.allocate_execution_id().unwrap();
+            adapter.bind_execution(&request, &execution);
+            let mut output = PhysicalRoleOutput {
+                execution,
+                output: valid_output(request.role()),
+            };
+            adapter.validate_output(&request, &output).unwrap();
+            if let RolePayload::Counterexample {
+                divergence_logits, ..
+            } = &mut output.output.payload
+            {
+                divergence_logits.push(0.0);
+            }
+            assert_eq!(
+                adapter.validate_output(&request, &output).unwrap_err().code,
+                ErrorCode::NumericalFailure
+            );
+        }
+        let adapter: TestAdapter =
+            PalsAdapter::new(SharedPalsScope::new(scope()), ManualClock::default()).unwrap();
+        let a = request_as_role(1, Role::Critic, 1, ExecutionMode::Deployment);
+        let b = request_as_role(2, Role::Critic, 2, ExecutionMode::Deployment);
+        assert_ne!(adapter.batch_key(&a), adapter.batch_key(&b));
+        assert_eq!(
+            minimum_output_bytes(b.role()) - minimum_output_bytes(a.role()),
+            4
+        );
+    }
+    #[test]
+    fn validator_has_exactly_seven_task_logits_and_no_divergence_head() {
+        let request = request_as_role(1, Role::Validator, 0, ExecutionMode::Collection);
+        let mut adapter: TestAdapter = PalsAdapter::new(
+            SharedPalsScope::new(PalsScope {
+                mode: ExecutionMode::Collection,
+                ..scope()
+            }),
+            ManualClock::default(),
+        )
+        .unwrap();
+        adapter.validate_admission(&request).unwrap();
+        let execution = adapter.allocate_execution_id().unwrap();
+        adapter.bind_execution(&request, &execution);
+        let mut output = PhysicalRoleOutput {
+            execution,
+            output: valid_output(request.role()),
+        };
+        adapter.validate_output(&request, &output).unwrap();
+        if let RolePayload::TaskRanking { task_logits } = &mut output.output.payload {
+            task_logits.pop();
+        }
+        assert_eq!(
+            adapter.validate_output(&request, &output).unwrap_err().code,
+            ErrorCode::NumericalFailure
+        );
+        for (role, mode, divergence_count) in [
+            (Role::Proposer, ExecutionMode::Deployment, 1),
+            (Role::Validator, ExecutionMode::Collection, 1),
+            (Role::Critic, ExecutionMode::Deployment, 129),
+        ] {
+            let invalid = request_as_role(2, role, divergence_count, mode);
+            assert_eq!(
+                invalid
+                    .role
+                    .validate(ClockDomain(EPOCH), MonotonicTick(0))
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidInput
+            );
+        }
     }
     #[test]
     fn already_executed_request_clone_is_refused_before_a_new_dispatch() {
