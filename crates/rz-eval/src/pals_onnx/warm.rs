@@ -1120,8 +1120,7 @@ fn same_file_stamp(a: &Metadata, b: &Metadata) -> bool {
     if !a.is_file()
         || !b.is_file()
         || a.len() != b.len()
-        || a
-            .modified()
+        || a.modified()
             .ok()
             .zip(b.modified().ok())
             .is_none_or(|(a, b)| a != b)
