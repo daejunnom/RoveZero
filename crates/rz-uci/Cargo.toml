@@ -33,9 +33,9 @@ default = []
 experimental-best-move = []
 experimental-raw-cache = ["rz-eval/experimental-raw-cache"]
 onnx-cpu = [
-    "rz-eval/onnx", "dep:serde", "dep:serde_json", "dep:sha2",
-    "dep:cap-std", "dep:cap-fs-ext",
+    "rz-eval/onnx", "search-work-receipts",
 ]
+search-work-receipts = ["dep:serde", "dep:serde_json", "dep:cap-std", "dep:cap-fs-ext"]
 onnx-cuda = ["onnx-cpu"]
 
 [dependencies]
@@ -48,6 +48,6 @@ rz-encoding.workspace = true
 rz-telemetry.workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
+sha2.workspace = true
 cap-std = { workspace = true, optional = true }
 cap-fs-ext = { workspace = true, optional = true }

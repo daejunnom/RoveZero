@@ -14,11 +14,9 @@ use crate::{
         NativeRunError, NativeRunReport,
     },
 };
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
-use cap_std::{
-    ambient_authority,
-    fs::{Dir, OpenOptions},
-};
+
+#[cfg(test)]
+use cap_std::{ambient_authority, fs::Dir};
 use rz_contracts::*;
 use rz_eval::{
     asset::AssetMetadata,
@@ -27,17 +25,12 @@ use rz_eval::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::{
-    fmt,
-    fs::File,
-    io::{self, Read, Write},
-};
+use std::{fmt, io};
 
 pub const STARTUP_FILE: &str = "native-cpu-startup.v1.json";
 pub const TERMINATION_FILE: &str = "native-cpu-termination.v1.json";
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_RECEIPT_BYTES: usize = 256 * 1024;
-const MAX_EXECUTABLE_BYTES: u64 = 128 * 1024 * 1024;
 
 pub(crate) fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|value| format!("{value:02x}")).collect()
@@ -163,64 +156,7 @@ impl CpuProfileV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutableIdentitySourceV1 {
-    /// The handle follows Linux's current mapped executable inode, including
-    /// when its original pathname was replaced or unlinked after launch.
-    LinuxProcSelfExe,
-    /// A file observed at the platform's current_exe path. This is not proof of
-    /// every byte in the operating system's already mapped process image.
-    CurrentExecutableFile,
-}
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutableIdentityV1 {
-    pub sha256: String,
-    pub bytes: u64,
-    pub identity_source: ExecutableIdentitySourceV1,
-}
-impl ExecutableIdentityV1 {
-    pub(crate) fn observe() -> Result<Self, AttestationError> {
-        #[cfg(target_os = "linux")]
-        let (file, source) = (
-            File::open("/proc/self/exe"),
-            ExecutableIdentitySourceV1::LinuxProcSelfExe,
-        );
-        #[cfg(not(target_os = "linux"))]
-        let (file, source) = (
-            std::env::current_exe().and_then(File::open),
-            ExecutableIdentitySourceV1::CurrentExecutableFile,
-        );
-        let mut file = file.map_err(|error| AttestationError::io("observe executable", error))?;
-        let mut bytes = 0_u64;
-        let mut hash = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let count = file
-                .read(&mut buffer)
-                .map_err(|error| AttestationError::io("read executable", error))?;
-            if count == 0 {
-                break;
-            }
-            bytes = bytes
-                .checked_add(count as u64)
-                .filter(|count| *count <= MAX_EXECUTABLE_BYTES)
-                .ok_or_else(|| {
-                    AttestationError::boundary("executable identity byte budget exceeded")
-                })?;
-            hash.update(&buffer[..count]);
-        }
-        if bytes == 0 {
-            return Err(AttestationError::boundary("executable identity is empty"));
-        }
-        Ok(Self {
-            sha256: hex(&hash.finalize().into()),
-            bytes,
-            identity_source: source,
-        })
-    }
-}
+pub use crate::process_receipts::{ExecutableIdentitySourceV1, ExecutableIdentityV1};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -556,47 +492,14 @@ fn actual_cpu_observed(startup: &StartupReceiptV1, report: &NativeRunReport) -> 
         && report.last_completed.is_some_and(valid)
 }
 
-struct BoundedJson {
-    bytes: Vec<u8>,
-}
-impl Write for BoundedJson {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > MAX_RECEIPT_BYTES.saturating_sub(self.bytes.len()) {
-            return Err(io::Error::other("attestation JSON byte budget exceeded"));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 pub(crate) fn bounded_json(value: &impl Serialize) -> Result<Vec<u8>, AttestationError> {
-    let mut writer = BoundedJson { bytes: Vec::new() };
-    writer
-        .bytes
-        .try_reserve_exact(MAX_RECEIPT_BYTES)
-        .map_err(|_| AttestationError::boundary("cannot reserve bounded receipt bytes"))?;
-    serde_json::to_writer(&mut writer, value)
-        .map_err(|_| AttestationError::boundary("cannot encode bounded public receipt"))?;
-    writer
-        .write_all(b"\n")
-        .map_err(|error| AttestationError::io("finish bounded receipt encoding", error))?;
-    Ok(writer.bytes)
+    crate::process_receipts::bounded_json(value).map_err(Into::into)
 }
-
 /// The caller must exclusively own the existing private output directory and
 /// prevent outside mutation during this process. Both names are fixed; opened
 /// file handles and the directory capability survive later pathname changes.
 /// Empty or partially written files after failure are incomplete receipts.
-pub struct ReceiptWriter {
-    _directory: Dir,
-    startup: cap_std::fs::File,
-    termination: cap_std::fs::File,
-    startup_written: bool,
-    startup_attempted: bool,
-    termination_attempted: bool,
-}
+pub struct ReceiptWriter(crate::process_receipts::ProcessReceiptWriter);
 impl ReceiptWriter {
     pub fn open(config: &NativeConfig) -> Result<Self, AttestationError> {
         if config.provider() != crate::native_bootstrap::NativeProvider::Cpu {
@@ -614,63 +517,30 @@ impl ReceiptWriter {
         let root = config.attestation_output_root().map_err(|error| {
             AttestationError::bootstrap("private attestation output root is invalid", error)
         })?;
-        let parent = root.parent().ok_or_else(|| {
-            AttestationError::boundary("attestation requires a dedicated private output directory")
-        })?;
-        let name = root.file_name().ok_or_else(|| {
-            AttestationError::boundary("attestation requires a named private output directory")
-        })?;
-        let parent = Dir::open_ambient_dir(parent, ambient_authority())
-            .map_err(|error| AttestationError::io("pin output parent directory", error))?;
-        let directory = parent.open_dir_nofollow(name).map_err(|error| {
-            AttestationError::io(
-                "pin private output directory without following symlinks",
-                error,
-            )
-        })?;
-        // Fastchess may restart each role for the second game. Each executable
-        // instance owns a fresh bounded ASCII slot; PID reuse never overwrites
-        // an older run. The launcher validates each slot separately.
-        let run_id = process_run_id();
-        directory.create_dir(&run_id).map_err(|error| {
-            AttestationError::io("reserve fresh process receipt directory", error)
-        })?;
-        let process_directory = directory.open_dir_nofollow(&run_id).map_err(|error| {
-            AttestationError::io(
-                "pin process receipt directory without following symlinks",
-                error,
-            )
-        })?;
-        Self::from_directory_named(process_directory, startup_name, termination_name)
+        Self::open_named_root(&root, startup_name, termination_name)
     }
-    #[cfg(test)]
-    fn from_directory(directory: Dir) -> Result<Self, AttestationError> {
-        Self::from_directory_named(directory, STARTUP_FILE, TERMINATION_FILE)
-    }
-    fn from_directory_named(
-        directory: Dir,
+    pub(crate) fn open_named_root(
+        root: &std::path::Path,
         startup_name: &'static str,
         termination_name: &'static str,
     ) -> Result<Self, AttestationError> {
-        let mut options = OpenOptions::new();
-        options
-            .write(true)
-            .create_new(true)
-            .follow(FollowSymlinks::No);
-        let startup = directory
-            .open_with(startup_name, &options)
-            .map_err(|error| AttestationError::io("reserve new startup receipt", error))?;
-        let termination = directory
-            .open_with(termination_name, &options)
-            .map_err(|error| AttestationError::io("reserve new termination receipt", error))?;
-        Ok(Self {
-            _directory: directory,
-            startup,
-            termination,
-            startup_written: false,
-            startup_attempted: false,
-            termination_attempted: false,
-        })
+        Ok(Self(
+            crate::process_receipts::ProcessReceiptWriter::open_named_root(
+                root,
+                startup_name,
+                termination_name,
+            )?,
+        ))
+    }
+    #[cfg(test)]
+    fn from_directory(directory: Dir) -> Result<Self, AttestationError> {
+        Ok(Self(
+            crate::process_receipts::ProcessReceiptWriter::from_directory_named(
+                directory,
+                STARTUP_FILE,
+                TERMINATION_FILE,
+            )?,
+        ))
     }
     pub fn startup(&mut self, receipt: &StartupReceiptV1) -> Result<(), AttestationError> {
         self.publish_startup(receipt)
@@ -679,49 +549,15 @@ impl ReceiptWriter {
         &mut self,
         receipt: &impl Serialize,
     ) -> Result<(), AttestationError> {
-        if self.startup_attempted {
-            return Err(AttestationError::boundary(
-                "startup receipt publication was already attempted",
-            ));
-        }
-        let bytes = bounded_json(receipt)?;
-        self.startup_attempted = true;
-        self.startup
-            .write_all(&bytes)
-            .map_err(|error| AttestationError::io("write startup receipt", error))?;
-        self.startup
-            .sync_all()
-            .map_err(|error| AttestationError::io("sync startup receipt", error))?;
-        self.startup_written = true;
-        Ok(())
+        self.0.publish_startup(receipt).map_err(Into::into)
     }
     pub(crate) fn publish_auxiliary(
         &self,
         name: &'static str,
         receipt: &impl Serialize,
     ) -> Result<(), AttestationError> {
-        if !self.startup_written {
-            return Err(AttestationError::boundary(
-                "auxiliary receipt requires issued startup",
-            ));
-        }
-        let bytes = bounded_json(receipt)?;
-        let mut options = OpenOptions::new();
-        options
-            .write(true)
-            .create_new(true)
-            .follow(FollowSymlinks::No);
-        let mut file = self
-            ._directory
-            .open_with(name, &options)
-            .map_err(|e| AttestationError::io("reserve auxiliary receipt", e))?;
-        file.write_all(&bytes)
-            .map_err(|e| AttestationError::io("write auxiliary receipt", e))?;
-        file.sync_all()
-            .map_err(|e| AttestationError::io("sync auxiliary receipt", e))
+        self.0.publish_auxiliary(name, receipt).map_err(Into::into)
     }
-    /// Stream a bounded experiment journal directly to its capability; no
-    /// second full JSON allocation. Partial files are explicitly incomplete.
     #[cfg(feature = "experimental-batch")]
     pub(crate) fn publish_large_auxiliary(
         &self,
@@ -729,51 +565,9 @@ impl ReceiptWriter {
         receipt: &impl Serialize,
         cap: u64,
     ) -> Result<(String, u64), AttestationError> {
-        #[cfg(unix)]
-        use cap_std::fs::OpenOptionsExt;
-        if !self.startup_written {
-            return Err(AttestationError::boundary("journal requires startup"));
-        }
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = self
-            ._directory
-            .open_with(name, &options)
-            .map_err(|e| AttestationError::io("create bounded journal", e))?;
-        struct Bounded<'a> {
-            file: &'a mut cap_std::fs::File,
-            hash: Sha256,
-            bytes: u64,
-            cap: u64,
-        }
-        impl Write for Bounded<'_> {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                if bytes.len() as u64 > self.cap.saturating_sub(self.bytes) {
-                    return Err(std::io::Error::other("batch journal byte budget exceeded"));
-                }
-                let count = self.file.write(bytes)?;
-                self.hash.update(&bytes[..count]);
-                self.bytes += count as u64;
-                Ok(count)
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                self.file.flush()
-            }
-        }
-        let mut writer = Bounded {
-            file: &mut file,
-            hash: Sha256::new(),
-            bytes: 0,
-            cap,
-        };
-        serde_json::to_writer(&mut writer, receipt)
-            .map_err(|_| AttestationError::boundary("serialize bounded batch journal"))?;
-        let result = (hex(&writer.hash.finalize().into()), writer.bytes);
-        file.sync_all()
-            .map_err(|e| AttestationError::io("sync bounded batch journal", e))?;
-        Ok(result)
+        self.0
+            .publish_large_auxiliary(name, receipt, cap)
+            .map_err(Into::into)
     }
     pub fn termination(&mut self, receipt: &TerminationReceiptV1) -> Result<(), AttestationError> {
         self.publish_termination(receipt)
@@ -782,23 +576,9 @@ impl ReceiptWriter {
         &mut self,
         receipt: &impl Serialize,
     ) -> Result<(), AttestationError> {
-        if !self.startup_written || self.termination_attempted {
-            return Err(AttestationError::boundary(
-                "termination receipt requires one issued startup receipt",
-            ));
-        }
-        let bytes = bounded_json(receipt)?;
-        self.termination_attempted = true;
-        self.termination
-            .write_all(&bytes)
-            .map_err(|error| AttestationError::io("write termination receipt", error))?;
-        self.termination
-            .sync_all()
-            .map_err(|error| AttestationError::io("sync termination receipt", error))?;
-        Ok(())
+        self.0.publish_termination(receipt).map_err(Into::into)
     }
 }
-
 pub(crate) fn process_run_id() -> String {
     format!("native-process-{}", std::process::id())
 }
@@ -813,6 +593,16 @@ pub struct AttestationError {
     pub contract_error: Option<ContractError>,
     pub native_run: Option<Box<NativeRunError>>,
     pub native_report: Option<Box<NativeRunReport>>,
+}
+impl From<crate::process_receipts::ProcessReceiptError> for AttestationError {
+    fn from(error: crate::process_receipts::ProcessReceiptError) -> Self {
+        Self {
+            stage: error.stage,
+            io_kind: error.io_kind,
+            io_error: error.io_error,
+            ..Self::boundary(error.stage)
+        }
+    }
 }
 impl AttestationError {
     pub(crate) fn boundary(stage: &'static str) -> Self {
