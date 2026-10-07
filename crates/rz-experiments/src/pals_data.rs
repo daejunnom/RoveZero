@@ -6,6 +6,7 @@ use crate::{ManifestError, decode_json, digest};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod comparative;
 pub mod frozen_producer;
 
 /// Version 2 replaces the version 1 mandatory model-weight declaration with an
