@@ -53,6 +53,12 @@ PALS 계약 식별은 `pals/0.1`이며 기존 policy/WDL 평가 계약 revision 
 미학습 초기 파라미터, 기존 학습 체크포인트는 서로 다른 타입이다. 파일 메타데이터 검증과
 실제 파일의 hash 확인·모델 로딩·provider readiness는 다른 증거다.
 
+생성 PGN의 native 참조는 실행 설명을 보존한다. Core의 공통 `ArtifactRef`에 연결할
+때에는 `source`만 잠긴 Fastchess producer의 공개 HTTPS 소스 URL로 투영하고,
+path·SHA-256·bytes·license는 유지한다. `pgn_provenance`에 원래 native 참조와
+producer 소스 commit·바이너리 SHA를 따로 남긴다. URL은 로컬 PGN의 공개 다운로드
+위치를 뜻하지 않으며, 공통 URL 검증·실패·시계·물리 수명·인수 조건을 완화하지 않는다.
+
 | 비교 질문 | 고정·변경 조건 |
 |---|---|
 | `System` | PALS 전체 구성과 자체 CPU 또는 BT4/LC0 구성의 효과. 모델·탐색 전체가 달라지는 비교를 단일 축 효과로 보고하지 않는다. |

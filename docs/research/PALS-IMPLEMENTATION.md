@@ -162,6 +162,9 @@ GPU 05~07의 등록 실행 기준은 `5bd8c59`, CPU paired 03의 등록 source�
 | `e604125` UCI 수정 | stop 이후 pending 착수·진단을 닫고 pipelined quit을 처리하는 후속 소스 수정을 총괄이 커밋·push했다. | 최초 기록 시점은 후속 root Cargo 검사 전이었다. 후속 `134bbe1` 검사·CI 성공은 위 별도 행으로 연결하며 이전 `5bd8c59`의 결과를 소급하지 않는다. 새 바이너리·readiness·paired 실행은 별도로 인수한다. |
 | `own-paired-cpu-03` 실제 paired 실행 | source `134bbe1` 등록 binary로 120초+1초·흑백 교환 두 판을 실행했다. Rules PGN 감사에서 own CPU가 흑·백 모두 체크메이트로 승리했고 시계 감사 오류는 없다. Fastchess exit 0·group gone·cleanup 확인·process errors 0. supervisor service exit 1·회수 완료·전체 494.462초. | native provider 감사의 `native model/adapter/epoch identity differs` 때문에 integration gate가 거부됐다. 실행 영수증은 execution ready/strength eligible false·scored games 0이다. 두 판의 PGN·승패를 보존하되 정상 native integration 인수·Elo·모델 승격으로 사용하지 않는다. runner 종료만으로 NN provider identity·물리 종료를 대신 증명하지 않는다. |
 | `own-paired-cpu-04` 실행과 append-only 감사 | source `bca916d`의 원래 production Debug에서 두 판의 Rules 체크메이트·시계·native provider gate 통과·scored 2를 관측했다. own CPU가 흑·백 모두 승리했다. 그러나 원래 operation은 `native evidence exceeds reserved bytes`로 최종 persistence exit 1이며 canonical pair receipt·Core가 없다. | 감사는 원본을 수정하거나 성공 영수증을 재생성해 저장하지 않았다. preflight부터 필수 최종 영수증까지의 전체 시간은 unknown이다. 64KiB 개별 pretty cap 대비 진단 재구성 67,622 bytes·초과 2,086 bytes는 Rust typed 재직렬화 미확인 값이며 전체 16MiB output cap 소진을 주장하지 않는다. 최종 저장·기력 인수는 실패 상태를 유지한다. |
+| `own-paired-cpu-05` 실제 저장·Core 경계 | source `b952008`·등록 10의 CPU ORT 실행에서 흑백 두 판·Rules·시계·native integration gate를 통과했다. 첫 판은 PALS 백·own CPU 흑의 49 ply 3회 반복 무승부, 둘째 판은 own CPU 백의 37 ply 체크메이트 승리다. native receipt **68,102 bytes**가 2MiB 예약 안에서 실제 저장됐으며 PGN·Core 조립 진단도 보존했다. NN 완료 입력 12,266개·완료 role 6,133개·탐색 소비 role 6,123개, PALS session 2개의 물리 shutdown·buffer 해제·in-flight 0·quarantine 없음을 확인했다. | native 저장 수정의 실제 증거지만 **전체 실행은 exit 1**이다. Core 조립은 생성 PGN의 자유 서술 `source`가 공통 공개 HTTPS 계약과 충돌해 `core=null`·`artifact.source [InvalidSource]`로 거부됐다. 원래 실패·PGN·영수증을 변경하지 않는다. preflight부터 필수 native receipt까지 553,546ms, process cleanup 426,396ns, supervisor 전체 565.470초와 회수 3.810초는 서로 다른 관측 범위다. raw service peak 263,614,464 bytes는 Windows 전체 커밋·GPU·native allocator peak가 아니며 OOM 계수는 미관측이다. PALS failed search return 1과 취소·마감 진단도 원래 trace에 보존한다. |
+| Core PGN producer 출처 연결 수정 | `project_pals_core_pgn`은 Core 참조의 `source`만 실제 locked Fastchess의 HTTPS 소스 URL로 투영한다. 원본 path·SHA·bytes·license·실행 설명과 producer 소스 commit·binary SHA를 `pgn_provenance`에 별도로 보존한다. 수정 파일 SHA는 `437e0a528bc72255e099ca1a4b9888f1b77aa0e9dca093a1a61ee3fbe2a479bd`다. 총괄은 arena all-target/all-feature CPU 검사 **221 pass·0 fail·14 ignored**, 기본 feature lib **55 pass·0 fail**, Clippy `-D warnings` exit 0과 독립 소스 검토를 확인했다. | URL은 이 로컬 PGN의 공개 다운로드 위치가 아니다. 공통 HTTPS 검증과 경기·시계·물리 수명·failure gate는 유지한다. 이 검사는 계약 fixture이며 CPU 05를 성공으로 다시 저장하지 않았다. 현재 production assembly는 live owner와 Serialize-only 증거를 요구하므로 typed 종단 replay 또는 수정된 새 paired 실행은 미실행·미인수다. 이를 JSON 재구성으로 대체하지 않는다. |
+| GPU paired 06 준비의 후속 상태 | 기존 등록 10의 arena에는 위 Core 조립 결함이 있으므로 GPU 06 준비는 `superseded_prepared_not_run`·`execution_eligible=false`다. 원래 prepare/source proof는 불변으로 두고 별도 상태 파일에 새 arena 등록·새 실행 명세 필요를 기록했다. | GPU는 계속 `user-deferred`이며 새 GPU 실행은 없다. 오래된 준비 스크립트를 새 수정의 실제 실행 증거로 사용하지 않는다. |
 | `f78ecf0` 증거 저장 예약과 `own-paired-gpu-05` 준비 | 고정 2MiB pair metadata 예약을 구현했다. GPU paired 05 준비 명령 2개 exit 0. 고유 input 3,143,597,770 bytes, input+output+runtime 필요량 3,227,483,850 bytes. artifact·failure recovery 각 4GiB, runtime 64MiB, output 16MiB 안에 pair metadata 2MiB를 예약했다. | execute command·engine·NN ready·GPU execution observed는 모두 false이며 GPU paired 경기는 **미실행**이다. cap·선언을 RAM/VRAM peak나 최종 저장 인수로 해석하지 않는다. CPU 04의 원래 실패를 소급해서 성공 처리하지 않는다. |
 | `b952008` startup 변경·로컬 검사·CI | 실패 startup publication·진단·유한 단계 timing과 명시 CUDA startup probe 예산(1~180,000ms, 생략 기본 15,000ms)을 제품·manifest에 연결했다. 새 GPU 준비의 선택값은 120,000ms이며 실제 미실행이다. all-feature CPU 검사 1,103개 통과·16개 ignored, clippy와 default UCI·arena 검사 종료 0을 대조했다. CI의 중간 관측은 3개 성공·Windows 진행이었고, 총괄은 [정확한 CI run 37609418913](https://github.com/daejunnom/RoveZero/actions/runs/37609418913)의 최종 4개 job 성공을 확인했다(Windows 10:50:31 UTC 완료). | source 구현·CPU 검사·정확한 CI의 증거다. 새 제품 GPU startup·물리 수명·paired 저장 성공은 아직 인수 전이며 16개 ignored는 미실행이다. 새 예산 선언을 실제 실행시간이나 정상 완료로 바꾸지 않는다. |
 | `binary-registration-10` | source `b952008`의 compiler-artifact 등록을 완료했다. `onnx_cpu`·`onnx_cuda`·experimental I/O binding compile feature와 CUDA path 컴파일을 기록했다. | compile-only다. runtime/model loaded와 GPU started는 false이며 모델 실행·provider ready·새 smoke의 성공 증거가 아니다. |
@@ -214,6 +217,13 @@ GPU 05~07의 등록 실행 기준은 `5bd8c59`, CPU paired 03의 등록 source�
 | `own-paired-cpu-03/recovered/attempt-01/pals-arena-pair-receipt.v3.json` | `8f7c8002cd1e5c5aff8d5d84f97f9cb4ab254c663e5f7ef4e29997334955a2da` |
 | `own-paired-cpu-03/recovered/attempt-01/match.pgn` | `96cabf2d1642d7e2be325b7816f923a41ecbc9b673b296ae0793f1d9ab65e0d0` |
 | `own-paired-cpu-04/audit-persistence-failure-01.json` | `8251d84cc6c54e6733309a8cd5ba3ff9efccfb438093e666820c1caf96baa5e6` |
+| `own-paired-cpu-05/execution-result.json` | `5a882e43b5db9fa382e5c18333ba1448f294fdfc3329822c35a86d1f55079aa6` |
+| `own-paired-cpu-05/recovered/attempt-01/pals-arena-pair-receipt.v3.json` | `2cf19f0bf36f67e41e87715dcc6ee4a8c7459a7a91ca6e75ff5248749a58558e` |
+| `own-paired-cpu-05/recovered/attempt-01/pals-core-assembly.v3.json` | `e753eb40400485f429f2cf3da9546ba11a70895e4e1eca85f1c3bfd6bc7fe226` |
+| `own-paired-cpu-05/recovered/attempt-01/match.pgn` | `0afaad928f9b7f81bbe209cd5f827a25f0c722c2a5c20468f768730b80888f2f` |
+| `own-paired-cpu-05/observed-audit-01.json` | `83f647de93e604670c1dabfc3608602c21628d610433e7f4fb15d8b5d08b032f` |
+| `core-provenance-check-01/checks.json` | `2e150c34c862e559b868d58e55d27e6a82ef4427bc52d073d88d522031918531` |
+| `own-paired-gpu-06/superseded-01.json` | `6fc33f3da9acc77221ed6e167439d0d32f02cc9a900772f1f89ef34ea2a248b7` |
 | `own-paired-gpu-05/preparation-receipt.json` | `91528fd5b8be3c6bb1a693c34894ba2cf82c9ca46400cdd58270da2c31b9dced` |
 | `gpu-uci-smoke-10/windows-commit-preflight.json` | `ba2ae8c58df480787aa261f09dd01dd5c99b7967053df83ae5389362776ebe35` |
 | `workspace-check-03/uci-final-08.log` | `80ffbd12a9a30fb539719aafe9432766e0ae7a851f9398c5702e090b25c781a4` |
@@ -227,6 +237,13 @@ GPU 05~07의 등록 실행 기준은 `5bd8c59`, CPU paired 03의 등록 source�
 completed/success이며 4개 job이 모두 성공했다. 이 작은 조회 영수증의 SHA-256은
 `97e11a1ca99e259e31229bd86181078a8b064e8868d8037e3614b15c12b17599`다.
 
+문서만 갱신한 `0b47000d2192a7862f6274e3f0c834fd1acec728`의
+[CI run 37613007601](https://github.com/daejunnom/RoveZero/actions/runs/37613007601)도
+4개 job 모두 completed/success를 확인했다. 조회 영수증은
+`reports/pals/ci-0b47000-final.json`에 보존하며 SHA-256은
+`dc236278403e7001399e987c6bc30d3500936b57d76e3e3899533ced4b4138c9`다.
+이 CI와 CPU 05의 실제 실행 source `b952008`·등록 10은 구분한다.
+
 ## 남은 인수와 진행 순서
 
 | 순서 | 필요한 확인 | 현재 상태·책임 |
@@ -236,7 +253,7 @@ completed/success이며 4개 job이 모두 성공했다. 이 작은 조회 영�
 | 3 | 최종 source 독립 GPU 수치·제품 자원·실패 증거의 저장 | 등록 10은 compile-only다. 이전 08/09의 cgroup peak·OOM 0을 기록했으나 VRAM peak는 unknown이다. 최종 `b952008`의 numeric 10과 새 제품 자원·startup/ready/종료·실패 영수증·저장은 `user-deferred`다. 이번 세션에는 새 GPU 실행을 하지 않고 후속 인수에서 등록 조건·메모리 입구를 다시 확인한다. |
 | 4 | 실제 NN 기반 own collection 및 C 이탈·V task context, frozen epoch·mask·split·누출 | CPU ORT collector 6행과 frozen preparation 전체 소비, 별도 private V→CPU_T 유한 producer 실행을 확인했다. GPU collector, C divergence head의 명시 학습 context, 유효한 정책·결과·작업 효용 목표와 더 넓은 split/holdout 자료는 별도 인수다. |
 | 5 | 후속 record별 증분 인코딩·device warm-start·CPU/GPU overlap과 실제 공유 메모리 실험 | 확인한 host bank는 whole-input cache이며 현재 fresh 역할 계산을 기준으로 한다. record별 증분 인코딩·warm latent·overlap과 native prepack/VRAM 효과는 후속 별도 실험·미인수다. 의미 보존 E와 근사 A·스케줄 S를 구분하고 새 고정 작업량·비교 질문·자원·peak 관측을 등록한다. |
-| 6 | V-free PALS+Own CPU_R의 유한 paired 실행·시계·PGN·native 최종 receipt/Core | CPU 01/02 입구 실패와 03 identity gate 실패를 보존했다. CPU 04는 경기·native gate를 통과했지만 최종 persistence 실패·receipt/Core 부재다. 2MiB 증거 예약을 구현·등록했고 GPU paired 05 metadata 준비를 마쳤으나 경기는 미실행이다. 새 GPU paired 06은 `user-deferred`이며 제품 startup·수명 인수 뒤 실제 경기·최종 저장을 확인한다. 원래 실패·unknown 시간을 덮지 않고 두 판으로 Elo를 확정하지 않는다. |
+| 6 | V-free PALS+Own CPU_R의 유한 paired 실행·시계·PGN·native 최종 receipt/Core | CPU 01/02 입구 실패와 03 identity gate 실패를 보존했다. CPU 04는 경기·native gate를 통과했지만 최종 persistence 실패·receipt/Core 부재다. CPU 05는 2MiB 예약에서 native receipt 68,102 bytes 저장을 실제 확인했으나 Core PGN 출처 계약 오류로 전체 exit 1이다. 원래 자료를 보존하며 생성 증거와 공개 producer 출처의 접점을 따로 검증한다. GPU paired 05 metadata 준비 뒤 경기는 미실행이고 새 GPU paired 06은 `user-deferred`다. 원래 실패·unknown 시간을 덮지 않고 두 판으로 Elo를 확정하지 않는다. |
 | 7 | 정확한 통합 SHA·CPU CI·독립 GPU·제품·paired 인수 연결 | 이전 source 검사와 `f78ecf0`/`b952008` 정확한 CI 4개 성공, `b952008` CPU 1,103개·clippy/default 종료 0을 연결했다. 08/09 독립 GPU PASS와 제품 09 실패·10 GPU 미시작, CPU 04 저장 실패를 보존한다. 새 제품 11·최종 source numeric 10·GPU paired 06은 `user-deferred`이며 정적 준비를 실제 인수로 승격하지 않는다. |
 
 능동 CPU 대체 응수의 후보·반박·수선 연결, evaluator identity를 포함한 근거 namespace,

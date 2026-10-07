@@ -2906,6 +2906,39 @@ pub fn validate_pals_game_process_trace(
     Ok(result)
 }
 
+/// Separates the generated PGN's native description from its public producer
+/// source URL. This URL does not claim that the local PGN is publicly hosted.
+#[derive(Clone, Debug, Serialize)]
+pub struct PalsPgnProvenanceV3 {
+    pub native_artifact: ArtifactRef,
+    pub producer_source_url: String,
+    pub producer_source_commit: String,
+    pub producer_binary_sha256: String,
+    pub description: String,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn project_pals_core_pgn(
+    lock: &LockedPalsArenaLaunchV3,
+    native_artifact: &ArtifactRef,
+) -> Result<(ArtifactRef, PalsPgnProvenanceV3), ArenaError> {
+    // Generated native artifacts use source as an execution description. Core's
+    // ArtifactRef contract requires a public producer URL instead; retain the
+    // original reference and description without changing the recorded bytes.
+    let runner = &lock.input.runner;
+    let mut artifact = native_artifact.clone();
+    artifact.source = runner.source_url.clone();
+    artifact.validate()?;
+    let provenance = PalsPgnProvenanceV3 {
+        native_artifact: native_artifact.clone(),
+        producer_source_url: runner.source_url.clone(),
+        producer_source_commit: runner.source_commit.clone(),
+        producer_binary_sha256: runner.binary.sha256.clone(),
+        description: "Generated match PGN from the pinned Fastchess execution; the public URL identifies the producer's source repository, not a public download location for this local PGN. The original native reference preserves its execution description, path, digest, size and license.".into(),
+    };
+    Ok((artifact, provenance))
+}
+
 /// A missing observation leaves the numeric Core receipt absent. The original
 /// native receipt and PGN remain authoritative evidence of failures, never an
 /// empty-success or an omitted engine loss.
@@ -2919,6 +2952,8 @@ pub struct PalsCoreAssemblyV3 {
     pub timing_scope: String,
     pub game_process_correspondence: String,
     pub work: Vec<PalsProcessWorkAuditV3>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pgn_provenance: Option<PalsPgnProvenanceV3>,
     pub core: Option<PalsRunReceiptV3>,
     pub assembly_error: Option<String>,
     pub training_executed: bool,
@@ -2936,7 +2971,7 @@ pub fn assemble_pals_core_receipt(
         native_receipt: native.receipt_artifact.clone(), wall_time_ms: Some(output.wall_time_ms), cleanup_time_ms,
         timing_scope: "UCI preflight through mandatory arena postcheck/receipt; snapshot preparation separate; cleanup is supervisor-owned measured interval".into(),
         game_process_correspondence: "pinned Fastchess 1.8.2 source: one synchronous worker, restart=on, recover=false; TRACE/renderer game id and color plus finished-white-exit-black-exit windows; separate native/owned-group completion gates required".into(),
-        work: vec![], core: None, assembly_error: None, training_executed: false };
+        work: vec![], pgn_provenance: None, core: None, assembly_error: None, training_executed: false };
     let result: Result<PalsRunReceiptV3, ArenaError> = (|| {
         lock.input.require_reap_status_runner()?;
         lock.input.require_actual_native_epoch()?;
@@ -3012,12 +3047,13 @@ pub fn assemble_pals_core_receipt(
                 &per_role[index],
             )?;
         }
-        let pgn_artifact = receipts
+        let native_pgn_artifact = receipts
             .artifacts
             .iter()
             .find(|a| a.path.ends_with("/match.pgn"))
-            .ok_or_else(|| invalid("retained PGN artifact absent"))?
-            .clone();
+            .ok_or_else(|| invalid("retained PGN artifact absent"))?;
+        let (pgn_artifact, provenance) = project_pals_core_pgn(lock, native_pgn_artifact)?;
+        assembly.pgn_provenance = Some(provenance);
         let m = &lock.input.semantic_lock.manifest;
         let mut failures = BTreeSet::new();
         if output.wall_time_ms > m.pilot.wall_time_max_ms {
@@ -4994,6 +5030,107 @@ mod tests {
         };
         n.graphs[1].role = "validator".into();
         assert!(bad.lock().is_err());
+    }
+    #[test]
+    fn pals_core_projects_generated_pgn_provenance_without_relaxing_artifact_validation() {
+        // Contract fixture only: no engine, model, game or physical execution.
+        let lock = fixture().lock().unwrap();
+        let mut native_pgn = asset("attempt-01/match.pgn");
+        native_pgn.source = "RoveZero PALS-V3 NN integration execution evidence".into();
+        let original = native_pgn.clone();
+        assert!(native_pgn.validate().is_err());
+        let (projected, provenance) = project_pals_core_pgn(&lock, &native_pgn).unwrap();
+        assert_eq!(native_pgn, original);
+        assert_eq!(provenance.native_artifact, original);
+        assert_eq!(projected.source, lock.input.runner.source_url);
+        assert_eq!(provenance.producer_source_url, projected.source);
+        assert_eq!(
+            provenance.producer_source_commit,
+            lock.input.runner.source_commit
+        );
+        assert_eq!(
+            provenance.producer_binary_sha256,
+            lock.input.runner.binary.sha256
+        );
+        assert!(
+            provenance
+                .description
+                .contains("not a public download location")
+        );
+        let mut only_source_changed = projected.clone();
+        only_source_changed.source = original.source.clone();
+        assert_eq!(only_source_changed, original);
+        projected.validate().unwrap();
+        let engines: [PalsEndpointReceiptV3; 2] = std::array::from_fn(|index| {
+            let id = lock.input.semantic_lock.manifest.engines[index].id();
+            let work = PalsProcessWorkAuditV3 {
+                endpoint_id: id.into(),
+                process_id: 101 + index as u32,
+                startup_sha256: "d".repeat(64),
+                termination_sha256: "e".repeat(64),
+                startup_bytes: 1,
+                termination_bytes: 1,
+                search_work: work_fixture(if index == 0 { "pals" } else { "cpu" }),
+            };
+            endpoint_work_receipt(
+                &lock,
+                if index == 0 {
+                    NativeEngineRole::Baseline
+                } else {
+                    NativeEngineRole::Candidate
+                },
+                Some(&work),
+                None,
+                &preflight_fixture(id),
+            )
+            .unwrap()
+        });
+        let manifest = &lock.input.semantic_lock.manifest;
+        let games = (0..2)
+            .map(|index| PalsGameReceiptV3 {
+                game_index: index,
+                white_endpoint: manifest.pilot.white_order[index as usize].clone(),
+                black_endpoint: manifest.pilot.white_order[1 - index as usize].clone(),
+                base_ms: manifest.pilot.base_ms,
+                increment_ms: manifest.pilot.increment_ms,
+                plies: 0,
+                result: PalsResultV3::Draw,
+                termination: PalsTerminationV3::RulesDraw,
+                failed_endpoint: None,
+                engines: engines.clone(),
+                pgn: projected.clone(),
+            })
+            .collect();
+        let core = PalsRunReceiptV3 {
+            domain: PALS_RECEIPT_V3_DOMAIN.into(),
+            run_id: manifest.run_id.clone(),
+            pair_id: manifest.pair_id.clone(),
+            lock_sha256: lock.input.semantic_lock.canonical_sha256.clone(),
+            training_executed: false,
+            wall_time_ms: 1,
+            cleanup_time_ms: 1,
+            pair_eligible: true,
+            failures: BTreeSet::new(),
+            games,
+        };
+        core.validate_against(&lock.input.semantic_lock).unwrap();
+        let mut old_projection = core.clone();
+        old_projection.games[0].pgn = original.clone();
+        assert!(
+            old_projection
+                .validate_against(&lock.input.semantic_lock)
+                .is_err()
+        );
+        for source in [
+            "http://example.org/source",
+            "https://user@example.org/source",
+            "https://example.org/source?query",
+            "https://example.org/source#fragment",
+        ] {
+            let mut invalid_producer = lock.clone();
+            invalid_producer.input.runner.source_url = source.into();
+            assert!(project_pals_core_pgn(&invalid_producer, &original).is_err());
+        }
     }
     #[test]
     fn pals_game_process_mapping_requires_game_color_and_synchronous_exit_windows() {
