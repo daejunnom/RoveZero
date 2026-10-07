@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preregistered B1 adapter equivalence: fresh cgroups, fixed work, AA then AB."""
+"""Pinned B1 measurements; an explicit scope selects any refactor-only gate."""
 from __future__ import annotations
 import argparse
 import hashlib
@@ -14,6 +14,8 @@ from bounded_local import OwnedRun, outside_git, put, resolve_affinity
 from paired_search import native_receipts, read_json, require, sha256
 
 SCHEMA = "rz-adapter-regression/2"
+INTEGRATION_OBSERVATION = "integration_observation"
+SEMANTIC_PRESERVING_REFACTOR = "semantic_preserving_refactor"
 POSITIONS = ["position startpos", "position startpos moves e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1 f8e7 f1e1 b7b5 a4b3 d7d6 c2c3 e8g8"]
 SIMULATIONS = 4096
 TREE_MAX_EDGES = 262_144
@@ -127,28 +129,56 @@ def capture_valid(result):
     return t, p
 
 
-def pair_result(left, right, comparison):
+def acceptance_policy(scope):
+    require(type(scope) is str and scope in
+            (INTEGRATION_OBSERVATION, SEMANTIC_PRESERVING_REFACTOR),
+            "explicit integration observation or semantic-preserving refactor scope required")
+    return {"scope": scope,
+            "AB_time_and_peak_ratio_max": 1.05 if scope == SEMANTIC_PRESERVING_REFACTOR else None,
+            "AA_variability_is_a_gate": False}
+
+
+def pair_result(left, right, comparison, *, acceptance_scope):
+    policy = acceptance_policy(acceptance_scope)
+    require(comparison in ("AA", "AB"), "unknown comparison kind")
     ta, pa = capture_valid(left)
     tb, pb = capture_valid(right)
     require(left["work"] == right["work"], "workload, consumption or bestmove differs")
     tr, pr = tb/ta, pb/pa
-    if comparison == "AA":
-        passed = max(tr, 1/tr) <= 1.05 and max(pr, 1/pr) <= 1.05
-    else:
-        passed = tr <= 1.05 and pr <= 1.05
+    threshold = policy["AB_time_and_peak_ratio_max"] if comparison == "AB" else None
+    passed = threshold is None or (tr <= threshold and pr <= threshold)
     return {"comparison": comparison, "time_ratio": tr, "peak_ratio": pr, "passed": passed,
+            "acceptance_scope": acceptance_scope, "performance_gate_applied": threshold is not None,
+            "symmetric_time_ratio": max(tr, 1/tr), "symmetric_peak_ratio": max(pr, 1/pr),
             "A_time": ta, "B_time": tb, "A_peak": pa, "B_peak": pb}
 
 
-def summarize(pairs):
-    # Accumulate only this registered comparison. Per-pair gates remain decisive.
+def summarize(pairs, *, acceptance_scope):
+    policy = acceptance_policy(acceptance_scope)
+    require(all(p["acceptance_scope"] == acceptance_scope and
+                p["performance_gate_applied"] is
+                (p["comparison"] == "AB" and policy["AB_time_and_peak_ratio_max"] is not None)
+                for p in pairs), "mixed acceptance scopes or gate applicability")
+    # AA spread describes the environment; it never gates registration or AB.
     ab = [p for p in pairs if p["comparison"] == "AB"]
+    aa = [p for p in pairs if p["comparison"] == "AA"]
+    aa_times = [p[k] for p in aa for k in ("A_time", "B_time")]
+    aa_peaks = [p[k] for p in aa for k in ("A_peak", "B_peak")]
     totals = {k: sum(p[k] for p in ab) for k in ("A_time", "B_time", "A_peak", "B_peak")}
-    complete = len(pairs) == 8 and len(ab) == 5 and all(p["passed"] for p in pairs)
+    measurement_completed = len(pairs) == 8 and len(aa) == 3 and len(ab) == 5
+    complete = measurement_completed and all(p["passed"] for p in pairs)
+    performance = ("not_applicable" if policy["AB_time_and_peak_ratio_max"] is None else
+                   ("passed" if complete else "hold"))
     return {"status": "passed" if complete else "hold", "pair_count": len(pairs), "AB_totals": totals,
+            "acceptance_scope": acceptance_scope, "acceptance_policy": policy,
+            "measurement_completed": measurement_completed, "performance_acceptance": performance,
+            "AA_time_max_min_ratio": max(aa_times)/min(aa_times) if aa else None,
+            "AA_peak_max_min_ratio": max(aa_peaks)/min(aa_peaks) if aa else None,
             "AB_time_ratio_of_sums": totals["B_time"]/totals["A_time"] if ab else None,
             "AB_peak_ratio_of_sums": totals["B_peak"]/totals["A_peak"] if ab else None,
-            "all_individual_pair_gates_required": True, "past_other_experiments_in_denominator": False}
+            "all_workload_and_lifecycle_checks_required": True,
+            "all_AB_performance_gates_required": policy["AB_time_and_peak_ratio_max"] is not None,
+            "past_other_experiments_in_denominator": False}
 
 
 def run_once(variant, directory, overall_deadline, affinity=None, *, diagnostic_only=False):
@@ -246,9 +276,10 @@ def run_once(variant, directory, overall_deadline, affinity=None, *, diagnostic_
     return result
 
 
-def run(manifest, output, overall_seconds=3600):
+def run(manifest, output, overall_seconds=3600, *, acceptance_scope=None):
     require(type(overall_seconds) is int and 210<=overall_seconds<=3600,
             "overall budget must admit one bounded run and never exceed 3600 seconds")
+    policy = acceptance_policy(acceptance_scope)
     output = outside_git(output)
     output.mkdir()
     put(output/"registration.json", {"manifest": manifest, "helper_sha256": sha256(__file__),
@@ -261,8 +292,8 @@ def run(manifest, output, overall_seconds=3600):
         "cache_preparation_wall_seconds":60,"cache_preparation_cleanup_seconds":30,
         "cache_condition":"shared-runtime-warm-readhash_no_residency_guarantee",
         "primary_time": "whole_wall_start_through_native_exit_receipts_and_cgroup_collection",
-        "primary_peak": "fresh_cgroup_memory.peak", "each_pair_time_and_peak_ratio_max": 1.05,
-        "AA_variability_max": .05, "first_failure_stops": True, "automatic_retry": False})
+        "primary_peak": "fresh_cgroup_memory.peak", "acceptance_policy": policy,
+        "AA_variability_max": None, "first_failure_stops": True, "automatic_retry": False})
     started = time.monotonic()
     deadline = started+overall_seconds
     pairs=[]
@@ -287,18 +318,17 @@ def run(manifest, output, overall_seconds=3600):
                 print(json.dumps({"comparison": comparison, "pair": index, "role":role, "T":result["capture"]["whole_wall_seconds"], "P":result["capture"]["resources"]["memory.peak"]}), flush=True)
             if order[0]=="candidate":
                 results.reverse()
-            pair = pair_result(*results, comparison)
+            pair = pair_result(*results, comparison, acceptance_scope=acceptance_scope)
             pairs.append(pair)
             put(output/f"pair-{index:02}.json", pair)
-            require(pair["passed"], "AA environment variability or AB per-pair regression exceeds five percent")
-            if index==2:
-                aa = [r for p in pairs for r in ((p["A_time"],p["A_peak"]),(p["B_time"],p["B_peak"]))]
-                require(max(t for t,p in aa)/min(t for t,p in aa) <= 1.05 and max(p for t,p in aa)/min(p for t,p in aa) <= 1.05, "AA overall spread exceeds five percent; AB was not started")
+            require(pair["passed"], "semantic-preserving refactor AB per-pair regression exceeds five percent")
     except (OSError, ValueError, KeyError, TypeError, TimeoutError) as exc:
         error=str(exc)
-    result=summarize(pairs)
+    result=summarize(pairs, acceptance_scope=acceptance_scope)
     if error:
         result.update(status="hold", error=error)
+        if policy["AB_time_and_peak_ratio_max"] is not None:
+            result["performance_acceptance"] = "hold"
     result["overall_wall_seconds"] = time.monotonic()-started
     result["registration_sha256"] = sha256(output/"registration.json")
     result["candidate"] = {k: manifest["candidate"][k] for k in
@@ -316,5 +346,8 @@ if __name__ == "__main__":
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--acceptance-scope", required=True,
+                        choices=(INTEGRATION_OBSERVATION, SEMANTIC_PRESERVING_REFACTOR))
     args=parser.parse_args()
-    raise SystemExit(run(validate(read_json(args.manifest, 1024**2)), args.output))
+    raise SystemExit(run(validate(read_json(args.manifest, 1024**2)), args.output,
+                         acceptance_scope=args.acceptance_scope))

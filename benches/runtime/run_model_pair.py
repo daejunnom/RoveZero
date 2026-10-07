@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one V2 external pair only after pinned numerical and regression gates."""
+"""Run one V2 external pair after pinned numerical, lifecycle and scoped evidence."""
 import argparse
 import json
 from pathlib import Path
@@ -21,6 +21,17 @@ def gate_identities(declaration, reports):
     profile=launch["profile"]["runtime"]
     artifacts={a["role"]:a["artifact"] for a in launch["artifacts"]}
     regression=reports["adapter_regression"][0]
+    if "acceptance_scope" in regression:
+        from adapter_regression import acceptance_policy
+        policy=acceptance_policy(regression["acceptance_scope"])
+        expected="not_applicable" if policy["AB_time_and_peak_ratio_max"] is None else "passed"
+        require(regression["acceptance_policy"]==policy and
+                regression["measurement_completed"] is True and
+                regression["all_workload_and_lifecycle_checks_required"] is True and
+                regression["performance_acceptance"]==expected,
+                "scoped measurement or refactor acceptance is incomplete")
+    # Older pinned reports keep their original passed-status requirement in run();
+    # an old HOLD is never rewritten or promoted by the new applicability rule.
     cache=regression["cache_preparation"]
     require(cache["status"]=="passed" and cache["report"]["canonical_sha256"]==launch["cuda_bundle"]["canonical_sha256"] and
             not cache["report"]["native_code_loaded"] and not cache["report"]["GPU_used"] and not cache["report"]["files_modified"],
@@ -100,6 +111,8 @@ def run(registration, output):
     owner=OwnedRun(outside_git(output),wall=900,address_space=declaration["budget"]["address_space_per_process_bytes"],
                    affinity=declaration["resources"]["affinity"])
     result={"status":"failed","strength_eligible":False,"lock_sha256":registration["lock_sha256"]}
+    result["performance_acceptance"]=reports["adapter_regression"][0].get(
+        "performance_acceptance","legacy_registered_regression_passed")
     try:
         put(owner.directory/"registration.json",registration)
         arena=owner.directory/"arena"

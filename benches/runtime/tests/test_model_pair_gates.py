@@ -6,6 +6,7 @@ import unittest
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from run_model_pair import gate_identities
+from adapter_regression import INTEGRATION_OBSERVATION, SEMANTIC_PRESERVING_REFACTOR, acceptance_policy
 
 
 def fixture():
@@ -25,7 +26,11 @@ def fixture():
     regression={"cache_preparation":{"status":"passed","report":{"canonical_sha256":"bundle","native_code_loaded":False,"GPU_used":False,"files_modified":False}},"tree_max_edges":262144,"candidate":{"binary_sha256":"engine","source_commit":"source",
                  "expected_profile":{"backend_sha256":"backend","encoding_manifest_sha256":"encoding",
                                      "model_manifest_sha256":"export_manifest"}},
-                "resource_notes":{"cpu_affinity":[0,1],"memory_high_GiB":6,"memory_max_GiB":12,"swap":0}}
+                "resource_notes":{"cpu_affinity":[0,1],"memory_high_GiB":6,"memory_max_GiB":12,"swap":0},
+                "acceptance_scope":INTEGRATION_OBSERVATION,
+                "acceptance_policy":acceptance_policy(INTEGRATION_OBSERVATION),
+                "measurement_completed":True,"all_workload_and_lifecycle_checks_required":True,
+                "performance_acceptance":"not_applicable"}
     raw={"onnx_sha256":"onnx","input_f32_bytes_equal":True,"backend_shutdown_completed":True,
          "backend_sha256":"backend","runtime_sha256":"ort_library","cuda_bundle_sha256":"bundle",
          "provider":"cuda","precision":"fp32","tf32":False}
@@ -40,6 +45,16 @@ class ModelPairGateTests(unittest.TestCase):
     def test_registered_model_runtime_and_opponent_match(self):
         gate_identities(*fixture())
 
+    def test_refactor_scope_requires_its_own_performance_pass(self):
+        declaration,reports=fixture()
+        report=reports["adapter_regression"][0]
+        report.update(acceptance_scope=SEMANTIC_PRESERVING_REFACTOR,
+                      acceptance_policy=acceptance_policy(SEMANTIC_PRESERVING_REFACTOR))
+        with self.assertRaisesRegex(ValueError,"scoped measurement"):
+            gate_identities(declaration,reports)
+        report["performance_acceptance"]="passed"
+        gate_identities(declaration,reports)
+
     def test_default_regression_does_not_admit_a_native_environment_experiment(self):
         declaration,reports=fixture()
         declaration["engines"][0]["configuration"]["environment"]={"variables":{"MALLOC_ARENA_MAX":"2"}}
@@ -48,6 +63,10 @@ class ModelPairGateTests(unittest.TestCase):
 
     def test_success_for_different_inputs_does_not_admit_play(self):
         mutations=[
+            lambda r:r["adapter_regression"][0].update(measurement_completed=False),
+            lambda r:r["adapter_regression"][0].update(performance_acceptance="passed"),
+            lambda r:r["adapter_regression"][0].update(acceptance_scope="external_engine"),
+            lambda r:r["adapter_regression"][0]["acceptance_policy"].update(AB_time_and_peak_ratio_max=1.05),
             lambda r:r["adapter_regression"][0]["candidate"].update(binary_sha256="other-engine"),
             lambda r:r["adapter_regression"][0].update(tree_max_edges=100000),
             lambda r:r["adapter_regression"][0]["cache_preparation"].update(status="failed"),
