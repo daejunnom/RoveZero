@@ -1161,7 +1161,7 @@ pub(crate) mod linux {
             .view()
             .budget
             .max_output_bytes
-            .checked_sub(NATIVE_PAIR_METADATA_CAP)
+            .checked_sub(owner.spec.pair_metadata_cap())
             .and_then(|n| n.checked_sub(owner.snapshot.limits.max_output_bytes))
             .ok_or_else(|| ArenaError::Budget("native PGN reservation underflow".into()))?;
         let pgn_bytes = read_file(&owner.snapshot.directory, "match.pgn", pgn_cap);
@@ -1356,7 +1356,7 @@ pub(crate) mod linux {
                 .spec
                 .receipt_filename(),
             &bytes,
-            NATIVE_PAIR_METADATA_CAP,
+            owner.spec.pair_metadata_cap(),
         )?;
         bundle.receipt_artifact = Some(artifact.clone());
         crate::emit_native_phase("receipt_saved");

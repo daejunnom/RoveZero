@@ -114,6 +114,7 @@ impl PalsReceiptWriter {
         search_work: Option<ProcessSearchWorkReceipt>,
     ) -> Result<(), ProcessReceiptError> {
         self.validate_execution(&native)?;
+        self.validate_loading_mapping(&native, false)?;
         let receipt = self.envelope(STARTUP_DOMAIN, native, false, search_work);
         self.writer.publish_startup(&receipt)
     }
@@ -126,6 +127,11 @@ impl PalsReceiptWriter {
         search_work: Option<ProcessSearchWorkReceipt>,
     ) -> Result<(), ProcessReceiptError> {
         self.validate_execution(&native)?;
+        // An unsuccessful service may legitimately lack the final observation.
+        // Preserve its original failure and partially completed evidence.
+        if service_exit_success {
+            self.validate_loading_mapping(&native, true)?;
+        }
         if service_exit_success
             && native.execution.provider == "cuda"
             && (native.final_runtime_mapping_confirmed != Some(true)
@@ -149,6 +155,45 @@ impl PalsReceiptWriter {
         );
         self.writer.publish_termination(&receipt)
     }
+    fn validate_loading_mapping(
+        &self,
+        native: &NativeRoleReceipt,
+        require_final: bool,
+    ) -> Result<(), ProcessReceiptError> {
+        if native.execution.cuda_loading_profile.is_none() {
+            return Ok(());
+        }
+        let startup = native
+            .startup_probe
+            .as_ref()
+            .and_then(|probe| probe.runtime_loading_mapping.as_ref())
+            .ok_or_else(|| {
+                ProcessReceiptError::boundary(
+                    "selected PALS CUDA loading profile requires an actual startup mapping ACK",
+                )
+            })?;
+        crate::pals_native::validate_runtime_loading_mapping(startup, &native.execution).map_err(
+            |_| {
+                ProcessReceiptError::boundary(
+                    "PALS startup loading mapping differs from its pinned actual execution",
+                )
+            },
+        )?;
+        if require_final {
+            let final_mapping = native.final_runtime_loading_mapping.as_ref().ok_or_else(|| {
+                ProcessReceiptError::boundary(
+                    "successful selected PALS CUDA loading profile requires a final mapping ACK",
+                )
+            })?;
+            crate::pals_native::validate_runtime_loading_mapping(final_mapping, &native.execution)
+                .map_err(|_| {
+                    ProcessReceiptError::boundary(
+                        "PALS final loading mapping differs from its pinned actual execution",
+                    )
+                })?;
+        }
+        Ok(())
+    }
     fn validate_execution(&self, native: &NativeRoleReceipt) -> Result<(), ProcessReceiptError> {
         let runtime: String = native
             .execution
@@ -161,7 +206,8 @@ impl PalsReceiptWriter {
             || (native.execution.provider == "cuda")
                 != native.execution.runtime_bundle_sha256.is_some()
             || (native.execution.provider == "cpu"
-                && native.execution.cuda_control_inventory_sha256.is_some())
+                && (native.execution.cuda_control_inventory_sha256.is_some()
+                    || native.execution.cuda_loading_profile.is_some()))
         {
             return Err(ProcessReceiptError::boundary(
                 "PALS actual provider/runtime pin differs from receipt identity",

@@ -6,7 +6,7 @@
 //! buffers. Public memory is exact and role-neutral; role latents start fresh.
 use crate::asset::{self, parse_sha256};
 use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
-use crate::onnx::{OrtRuntime, Provider};
+use crate::onnx::{NativeLoadingProfile, NativeMappingObservation, OrtRuntime, Provider};
 use crate::pals_model::{
     PalsModelConfig, PalsModelInput, PalsRawOutput, PalsRole, PreparedPalsTensors,
     PALS_ENCODING_SCHEMA, PALS_MODEL_SCHEMA, V_TASK_NAMES,
@@ -89,6 +89,25 @@ impl PalsOnnxConfig {
         }
         Ok(())
     }
+}
+
+fn validate_native_loading_path(
+    profile: Option<NativeLoadingProfile>,
+    config: PalsOnnxConfig,
+    explicit_control: bool,
+) -> Result<(), BackendError> {
+    if profile == Some(NativeLoadingProfile::CuDnnShimLazyV1)
+        && (!explicit_control
+            || !matches!(config.provider, Provider::Cuda { .. })
+            || config.device_public_memory)
+    {
+        return Err(fail(
+            K::BackendUnavailable,
+            S::Admission,
+            "experimental PALS shim loading requires explicit CUDA control with host public memory",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -990,6 +1009,7 @@ pub enum PalsNativeCommand {
     SnapshotStats,
     VerifyRuntime,
     VerifyCudaPlacement,
+    ObserveRuntimeMappings,
 }
 pub enum PalsNativeResult {
     Evaluation(PalsRawOutput),
@@ -997,6 +1017,85 @@ pub enum PalsNativeResult {
     Stats(PalsBackendStats),
     RuntimeVerified,
     CudaPlacementVerified(Box<PalsCudaPlacementWitness>),
+    RuntimeMappingsObserved(Box<PalsNativeMappingWitness>),
+}
+
+/// NN-zero metadata observation from the exclusive physical worker. A full
+/// origin audit requires an already completed CUDA Run; it is not a kernel,
+/// VRAM, device-drain, or successful-process-exit witness.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PalsNativeMappingWitness {
+    pub schema: &'static str,
+    pub runtime_sha256: [u8; 32],
+    pub runtime_bundle_sha256: [u8; 32],
+    pub loading_profile: &'static str,
+    pub loading_profile_sha256: [u8; 32],
+    pub scope: &'static str,
+    pub declared_nvidia_files: usize,
+    pub required_nvidia_files: Vec<String>,
+    pub mapped_nvidia_files: Vec<String>,
+    pub deferred_nvidia_not_mapped: Vec<String>,
+    pub mapped_ort_files: Vec<String>,
+}
+
+fn native_mapping_witness(
+    observed: NativeMappingObservation,
+    profile: NativeLoadingProfile,
+    runtime_sha256: [u8; 32],
+    runtime_bundle_sha256: [u8; 32],
+    loading_profile_sha256: [u8; 32],
+) -> Result<PalsNativeMappingWitness, BackendError> {
+    let expected_roots: Vec<_> = profile
+        .eager_indices()
+        .iter()
+        .map(|&index| rz_native_loader::NVIDIA_LOAD_ORDER[index])
+        .collect();
+    let expected_mapped: Vec<_> = rz_native_loader::NVIDIA_LOAD_ORDER
+        .iter()
+        .copied()
+        .filter(|name| observed.mapped_nvidia_files.contains(name))
+        .collect();
+    let expected_absent: Vec<_> = rz_native_loader::NVIDIA_LOAD_ORDER
+        .iter()
+        .copied()
+        .filter(|name| !expected_roots.contains(name) && !expected_mapped.contains(name))
+        .collect();
+    if observed.profile != profile
+        || observed.declared_nvidia_files != rz_native_loader::NVIDIA_LOAD_ORDER.len()
+        || observed.required_nvidia_files != expected_roots
+        || observed.mapped_nvidia_files != expected_mapped
+        || expected_roots
+            .iter()
+            .any(|name| !expected_mapped.contains(name))
+        || observed.deferred_nvidia_not_mapped != expected_absent
+        || observed.mapped_ort_files.as_deref()
+            != Some(rz_native_loader::ORT_LIBRARY_NAMES.as_slice())
+        || loading_profile_sha256 != asset::sha256(profile.canonical_descriptor().as_bytes())
+    {
+        return Err(fail(
+            K::IdentityMismatch,
+            S::Backend,
+            "full PALS runtime observation differs from the admitted loading profile",
+        ));
+    }
+    let owned = |names: Vec<&'static str>| names.into_iter().map(str::to_owned).collect();
+    Ok(PalsNativeMappingWitness {
+        schema: "rovezero.pals-native-mapping-witness.v1",
+        runtime_sha256,
+        runtime_bundle_sha256,
+        loading_profile: profile.identifier(),
+        loading_profile_sha256,
+        scope: "exclusive_physical_worker_full_runtime_origin",
+        declared_nvidia_files: observed.declared_nvidia_files,
+        required_nvidia_files: owned(observed.required_nvidia_files),
+        mapped_nvidia_files: owned(observed.mapped_nvidia_files),
+        deferred_nvidia_not_mapped: owned(observed.deferred_nvidia_not_mapped),
+        mapped_ort_files: owned(
+            observed
+                .mapped_ort_files
+                .expect("full audit checked ORT images"),
+        ),
+    })
 }
 /// Native graph evidence, cumulative across games for one frozen backend.
 /// These are typed counters; a caller must choose its own receipt schema.
@@ -1163,6 +1262,7 @@ impl PalsOnnxBackend {
         audit: Option<(PalsCudaControlPolicy, std::path::PathBuf)>,
     ) -> Result<Self, BackendError> {
         config.validate()?;
+        validate_native_loading_path(runtime.native_loading_profile(), config, audit.is_some())?;
         if !path.is_absolute() {
             return Err(fail(
                 K::InvalidInput,
@@ -1365,6 +1465,12 @@ impl PalsOnnxBackend {
     pub fn runtime_bundle_digest(&self) -> Option<[u8; 32]> {
         self.runtime.bundle_digest()
     }
+    pub fn native_loading_profile(&self) -> Option<NativeLoadingProfile> {
+        self.runtime.native_loading_profile()
+    }
+    pub fn native_loading_profile_digest(&self) -> Option<[u8; 32]> {
+        self.runtime.native_loading_profile_digest()
+    }
     /// Export provenance declaration only. Loading a checkpoint cannot attest
     /// that the declared optimizer steps were actually executed.
     pub fn is_trained(&self) -> bool {
@@ -1528,6 +1634,63 @@ impl PalsOnnxBackend {
         }
         Ok(())
     }
+
+    /// Same immutable failure latch as VerifyRuntime, returned as a separately
+    /// acknowledged NN-zero control operation. Unknown physical ownership or
+    /// an uncompleted first Run can never produce a success witness.
+    pub fn runtime_mapping_witness(&self) -> Result<PalsNativeMappingWitness, BackendError> {
+        if let Some(cause) = &self.quarantine {
+            return Err(cause.clone());
+        }
+        if self.active.is_some() || self.active_memory.is_some() {
+            return Err(fail(
+                K::BackendFailure,
+                S::Backend,
+                "PALS runtime observation requires physical idle",
+            ));
+        }
+        if !matches!(self.config.provider, Provider::Cuda { .. }) {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Backend,
+                "PALS full runtime mapping observation requires explicit CUDA",
+            ));
+        }
+        let profile = self.native_loading_profile().ok_or_else(|| {
+            fail(
+                K::IdentityMismatch,
+                S::Backend,
+                "PALS native loading profile absent",
+            )
+        })?;
+        let bundle = self.runtime_bundle_digest().ok_or_else(|| {
+            fail(
+                K::IdentityMismatch,
+                S::Backend,
+                "PALS native runtime bundle absent",
+            )
+        })?;
+        let digest = self.native_loading_profile_digest().ok_or_else(|| {
+            fail(
+                K::IdentityMismatch,
+                S::Backend,
+                "PALS native loading identity absent",
+            )
+        })?;
+        let mut witness = None;
+        self.cuda_mapping_audit.borrow_mut().final_audit(|| {
+            let observed = self.runtime.cuda_mapping_observation(true)?;
+            witness = Some(native_mapping_witness(
+                observed,
+                profile,
+                self.runtime_binary_digest(),
+                bundle,
+                digest,
+            )?);
+            Ok(())
+        })?;
+        Ok(witness.expect("successful full audit produced an origin witness"))
+    }
     pub fn cuda_placement_witness(&self) -> Option<&PalsCudaPlacementWitness> {
         self.cuda_control_audit
             .as_ref()
@@ -1644,6 +1807,9 @@ impl PalsOnnxBackend {
                 PalsNativeCommand::VerifyCudaPlacement => self
                     .verify_cuda_placement()
                     .map(|witness| PalsNativeResult::CudaPlacementVerified(Box::new(witness))),
+                PalsNativeCommand::ObserveRuntimeMappings => self
+                    .runtime_mapping_witness()
+                    .map(|witness| PalsNativeResult::RuntimeMappingsObserved(Box::new(witness))),
             };
             match self.quarantine.as_ref() {
                 Some(cause) => PhysicalRun::Quarantined(cause.clone()),
@@ -2461,6 +2627,95 @@ mod device {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shim_product_admission_requires_explicit_host_cuda_control() {
+        let cpu = PalsOnnxConfig::cpu();
+        let shim = Some(NativeLoadingProfile::CuDnnShimLazyV1);
+        validate_native_loading_path(None, cpu, false).unwrap();
+        assert!(validate_native_loading_path(shim, cpu, true).is_err());
+        let mut cuda = cpu;
+        cuda.provider = Provider::Cuda {
+            device_id: 0,
+            arena_bytes: 2 * 1024 * 1024 * 1024,
+        };
+        validate_native_loading_path(Some(NativeLoadingProfile::EagerCuda12Cudnn9V1), cuda, false)
+            .unwrap();
+        assert!(validate_native_loading_path(shim, cuda, false).is_err());
+        validate_native_loading_path(shim, cuda, true).unwrap();
+        cuda.device_public_memory = true;
+        assert!(validate_native_loading_path(shim, cuda, true).is_err());
+    }
+
+    fn shim_observation() -> NativeMappingObservation {
+        let profile = NativeLoadingProfile::CuDnnShimLazyV1;
+        let required_nvidia_files: Vec<_> = profile
+            .eager_indices()
+            .iter()
+            .map(|&index| rz_native_loader::NVIDIA_LOAD_ORDER[index])
+            .collect();
+        NativeMappingObservation {
+            profile,
+            declared_nvidia_files: 16,
+            mapped_nvidia_files: required_nvidia_files.clone(),
+            required_nvidia_files,
+            deferred_nvidia_not_mapped: rz_native_loader::NVIDIA_LOAD_ORDER[8..15].to_vec(),
+            mapped_ort_files: Some(rz_native_loader::ORT_LIBRARY_NAMES.to_vec()),
+        }
+    }
+
+    #[test]
+    fn full_mapping_witness_preserves_actual_partial_residency_and_profile() {
+        let profile = NativeLoadingProfile::CuDnnShimLazyV1;
+        let digest = asset::sha256(profile.canonical_descriptor().as_bytes());
+        let witness =
+            native_mapping_witness(shim_observation(), profile, [7; 32], [8; 32], digest).unwrap();
+        assert_eq!(witness.loading_profile, "experimental-cudnn-shim-lazy-v1");
+        assert_eq!(witness.mapped_nvidia_files.len(), 9);
+        assert_eq!(witness.deferred_nvidia_not_mapped.len(), 7);
+        assert_eq!(witness.mapped_ort_files.len(), 3);
+        assert_eq!(witness.loading_profile_sha256, digest);
+        let serialized = serde_json::to_value(&witness).unwrap();
+        assert_eq!(
+            serialized["scope"],
+            "exclusive_physical_worker_full_runtime_origin"
+        );
+        assert_eq!(
+            serialized["schema"],
+            "rovezero.pals-native-mapping-witness.v1"
+        );
+    }
+
+    #[test]
+    fn full_mapping_witness_rejects_wrong_scope_profile_and_missing_root() {
+        let profile = NativeLoadingProfile::CuDnnShimLazyV1;
+        let digest = asset::sha256(profile.canonical_descriptor().as_bytes());
+        for invalid in 0..7 {
+            let mut observed = shim_observation();
+            match invalid {
+                0 => observed.mapped_ort_files = None,
+                1 => {
+                    observed.mapped_ort_files.as_mut().unwrap().pop();
+                }
+                2 => observed.profile = NativeLoadingProfile::EagerCuda12Cudnn9V1,
+                3 => {
+                    observed.mapped_nvidia_files.pop();
+                }
+                4 => {
+                    observed.required_nvidia_files.pop();
+                }
+                5 => observed.mapped_nvidia_files.push("libcudnn.so.8"),
+                _ => {
+                    observed.deferred_nvidia_not_mapped.pop();
+                }
+            }
+            assert!(native_mapping_witness(observed, profile, [7; 32], [8; 32], digest).is_err());
+        }
+        assert!(
+            native_mapping_witness(shim_observation(), profile, [7; 32], [8; 32], [0; 32]).is_err()
+        );
+    }
+
     #[test]
     fn explicit_cuda_control_disables_rewrites_without_changing_cpu_or_strict_cuda() {
         let cpu = PalsOnnxConfig::cpu();

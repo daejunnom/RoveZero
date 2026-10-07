@@ -484,6 +484,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             PhysicalPoll::Ready(Ok(PalsNativeResult::CudaPlacementVerified(_))) => {
                 return Err("cache reset unexpectedly returned CUDA placement verification".into())
             }
+            PhysicalPoll::Ready(Ok(PalsNativeResult::RuntimeMappingsObserved(_))) => {
+                return Err("cache reset unexpectedly returned runtime mapping observation".into())
+            }
             PhysicalPoll::Quarantined => {
                 return Err("new game cache reset remains quarantined".into())
             }
@@ -517,6 +520,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     PalsNativeResult::CudaPlacementVerified(_) => {
                         return Err(
                             "evaluation unexpectedly returned CUDA placement verification".into(),
+                        )
+                    }
+                    PalsNativeResult::RuntimeMappingsObserved(_) => {
+                        return Err(
+                            "evaluation unexpectedly returned runtime mapping observation".into(),
                         )
                     }
                 }

@@ -221,6 +221,22 @@ fn run_pals(
             {
                 return Err("duplicate PALS CUDA profile parent".into());
             }
+        } else if let Some(value) = argument.strip_prefix("--pals-cuda-loading-profile=") {
+            if native
+                .cuda_loading_profile
+                .replace(value.to_owned())
+                .is_some()
+            {
+                return Err("duplicate PALS CUDA loading profile".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-cuda-loading-profile-sha256=") {
+            if native
+                .cuda_loading_profile_hash
+                .replace(value.to_owned())
+                .is_some()
+            {
+                return Err("duplicate PALS CUDA loading profile SHA-256".into());
+            }
         } else {
             return Err("PALS requires an explicit model and finite PALS flags; LC0/ORT arguments are not implicitly reused".into());
         }
@@ -296,6 +312,8 @@ struct PalsNativeOptions {
     cuda_control_inventory_hash: Option<String>,
     cuda_profile_root: Option<String>,
     cuda_profile_parent: Option<String>,
+    cuda_loading_profile: Option<String>,
+    cuda_loading_profile_hash: Option<String>,
 }
 impl PalsNativeOptions {
     fn any(&self) -> bool {
@@ -318,6 +336,8 @@ impl PalsNativeOptions {
             || self.cuda_control_inventory_hash.is_some()
             || self.cuda_profile_root.is_some()
             || self.cuda_profile_parent.is_some()
+            || self.cuda_loading_profile.is_some()
+            || self.cuda_loading_profile_hash.is_some()
     }
 }
 
@@ -370,13 +390,22 @@ fn run_native_pals(
             || native.cuda_control_inventory.is_some()
             || native.cuda_control_inventory_hash.is_some()
             || native.cuda_profile_root.is_some()
-            || native.cuda_profile_parent.is_some())
+            || native.cuda_profile_parent.is_some()
+            || native.cuda_loading_profile.is_some()
+            || native.cuda_loading_profile_hash.is_some())
     {
         return Err("PALS CPU selection cannot accept CUDA bundle/device/allocator options".into());
     }
     if native.device_public_memory.unwrap_or(false) && !cfg!(feature = "experimental-io-binding") {
         return Err("PALS device public memory requires explicit experimental-io-binding; no binding fallback was started".into());
     }
+    let loading_profile = pals_cuda_loading_profile(
+        native.cuda_loading_profile.as_deref(),
+        native.cuda_loading_profile_hash.as_deref(),
+        provider,
+        native.cuda_control_mode.as_deref() == Some("inventory-v2"),
+        native.device_public_memory.unwrap_or(false),
+    )?;
     let profile_root = pals_profile_root(native.cuda_profile_root, native.cuda_profile_parent)?;
     let cuda_control = match (
         native.cuda_control_mode,
@@ -495,8 +524,21 @@ fn run_native_pals(
     let mut settings = EngineSettings::default();
     settings.search.max_simulations = cpu_nodes;
     let mut model = match cuda_control {
-        Some((policy, profile)) => {
-            rz_uci::pals_native::NativeRoleModel::load_pinned_with_cuda_control_policy(
+        Some((policy, profile)) => match loading_profile {
+            Some(loading) => {
+                let runtime =
+                    rz_eval::onnx::OrtRuntime::load_with_cuda_loading_profile(&pin, loading)?;
+                rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_control_policy(
+                    &manifest,
+                    &manifest_hash,
+                    runtime,
+                    backend_config,
+                    policy,
+                    &profile,
+                    settings.shutdown_limit,
+                )?
+            }
+            None => rz_uci::pals_native::NativeRoleModel::load_pinned_with_cuda_control_policy(
                 &manifest,
                 &manifest_hash,
                 &pin,
@@ -504,8 +546,8 @@ fn run_native_pals(
                 policy,
                 &profile,
                 settings.shutdown_limit,
-            )?
-        }
+            )?,
+        },
         None => rz_uci::pals_native::NativeRoleModel::load_pinned(
             &manifest,
             &manifest_hash,
@@ -691,6 +733,31 @@ fn run_native_pals(
 }
 
 #[cfg(feature = "onnx-cpu")]
+fn pals_cuda_loading_profile(
+    profile: Option<&str>,
+    expected_hash: Option<&str>,
+    provider: &str,
+    inventory_control: bool,
+    device_public_memory: bool,
+) -> Result<Option<rz_eval::onnx::NativeLoadingProfile>, Box<dyn std::error::Error>> {
+    match (profile, expected_hash) {
+        (None, None) => Ok(None),
+        (Some("experimental-cudnn-shim-lazy-v1"), Some(hash))
+            if provider == "cuda" && inventory_control && !device_public_memory =>
+        {
+            let profile = rz_eval::onnx::NativeLoadingProfile::CuDnnShimLazyV1;
+            if rz_eval::asset::parse_sha256(hash)?
+                != rz_eval::asset::sha256(profile.canonical_descriptor().as_bytes())
+            {
+                return Err("PALS CUDA loading profile canonical SHA-256 differs; no native loading was started".into());
+            }
+            Ok(Some(profile))
+        }
+        _ => Err("PALS experimental CUDA loading profile and canonical SHA-256 must be selected together with CUDA inventory-v2 host control; no loading-profile or CPU fallback was started".into()),
+    }
+}
+
+#[cfg(feature = "onnx-cpu")]
 fn pals_profile_root(
     root: Option<String>,
     parent: Option<String>,
@@ -729,7 +796,51 @@ fn pals_profile_root(
 
 #[cfg(all(test, feature = "onnx-cpu"))]
 mod pals_profile_tests {
-    use super::pals_profile_root;
+    use super::{pals_cuda_loading_profile, pals_profile_root};
+
+    #[test]
+    fn loading_profile_is_an_explicit_canonical_host_control_selection() {
+        const SHIM: &str = "experimental-cudnn-shim-lazy-v1";
+        const SHA: &str = "3084f27e678d6a6750713265bfb921e90687f199fb71484ff2c475000982ee6d";
+        assert_eq!(
+            pals_cuda_loading_profile(None, None, "cpu", false, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            pals_cuda_loading_profile(None, None, "cuda", false, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            pals_cuda_loading_profile(Some(SHIM), Some(SHA), "cuda", true, false).unwrap(),
+            Some(rz_eval::onnx::NativeLoadingProfile::CuDnnShimLazyV1)
+        );
+        // These are pure option checks. No cache, file, model or native runtime
+        // is opened, including the unsupported device/public-memory case.
+        for (profile, digest, provider, control, device) in [
+            (Some(SHIM), None, "cuda", true, false),
+            (None, Some(SHA), "cuda", true, false),
+            (Some(SHIM), Some(SHA), "cpu", true, false),
+            (Some(SHIM), Some(SHA), "cuda", false, false),
+            (Some(SHIM), Some(SHA), "cuda", true, true),
+            (
+                Some("eager-cuda12-cudnn9-v1"),
+                Some(SHA),
+                "cuda",
+                true,
+                false,
+            ),
+            (Some(SHIM), Some("00"), "cuda", true, false),
+            (
+                Some(SHIM),
+                Some("0000000000000000000000000000000000000000000000000000000000000000"),
+                "cuda",
+                true,
+                false,
+            ),
+        ] {
+            assert!(pals_cuda_loading_profile(profile, digest, provider, control, device).is_err());
+        }
+    }
 
     #[test]
     fn exact_root_and_absent_control_preserve_existing_arguments() {

@@ -20,6 +20,17 @@ use std::{
 };
 
 pub const NATIVE_PAIR_METADATA_CAP: u64 = 64 * 1024;
+pub(crate) fn pair_stream_cap(output_bytes: u64, metadata_cap: u64) -> Result<u64, ArenaError> {
+    output_bytes
+        .checked_sub(metadata_cap)
+        .and_then(|n| n.checked_div(2))
+        .filter(|n| *n > 0 && metadata_cap > 0)
+        .ok_or_else(|| {
+            ArenaError::Budget(
+                "native output budget needs receipt, PGN/config and stream reservations".into(),
+            )
+        })
+}
 const MAX_INNER_ARG_BYTES: usize = 16 * 1024;
 static NATIVE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static NATIVE_ADMISSION_CLOSED: AtomicBool = AtomicBool::new(false);
@@ -37,6 +48,11 @@ pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 
         role: rz_experiments::NativeEngineRole,
     ) -> Result<NativeEngineView<'_>, rz_experiments::ManifestError>;
     fn provider_name(&self) -> &'static str;
+    /// Fixed receipt reservation selected before input copying or child spawn.
+    /// Legacy declarations keep their original 64 KiB receipt and stream split.
+    fn pair_metadata_cap(&self) -> u64 {
+        NATIVE_PAIR_METADATA_CAP
+    }
     /// Arguments needed only by the two game sessions, after option preflight.
     fn runtime_arguments(
         &self,
@@ -853,6 +869,8 @@ pub(crate) mod linux {
         }
         spec.validate_execution()?;
         let input = spec.view();
+        let metadata_cap = spec.pair_metadata_cap();
+        let stream_cap = pair_stream_cap(input.budget.max_output_bytes, metadata_cap)?;
         crate::validate_opening_artifact_for_spec(
             input.opening,
             input.max_plies,
@@ -923,7 +941,7 @@ pub(crate) mod linux {
             &root,
             total
                 .checked_add(input.budget.max_output_bytes)
-                .and_then(|n| n.checked_add(NATIVE_PAIR_METADATA_CAP))
+                .and_then(|n| n.checked_add(metadata_cap))
                 .ok_or_else(|| io("native retention reservation overflow"))?,
         )?;
         root.create_dir(label).map_err(|_| {
@@ -1101,17 +1119,6 @@ pub(crate) mod linux {
                 "native artifact budget needs input/runtime/output reservations".into(),
             ));
         }
-        let stream_cap = input
-            .budget
-            .max_output_bytes
-            .checked_sub(NATIVE_PAIR_METADATA_CAP)
-            .and_then(|n| n.checked_div(2))
-            .filter(|n| *n > 0)
-            .ok_or_else(|| {
-                ArenaError::Budget(
-                    "native output budget needs receipt, PGN/config and stream reservations".into(),
-                )
-            })?;
         let max_files = usize::try_from(input.budget.max_runtime_files)
             .map_err(|_| ArenaError::Budget("native file count cannot fit host".into()))?
             .checked_add(pins.len())

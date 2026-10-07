@@ -145,6 +145,44 @@ pub struct PalsOnnxCudaLaunchV3 {
 #[serde(deny_unknown_fields)]
 pub struct PalsCudaControlBindingV3 {
     pub inventory: ArtifactRef,
+    /// Explicit experimental loading policy, independent of the unchanged
+    /// nineteen-file binary bundle and the control/NN placement inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loading_profile: Option<PalsCudaLoadingBindingV1>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum PalsCudaLoadingProfileV1 {
+    #[serde(rename = "experimental-cudnn-shim-lazy-v1")]
+    ExperimentalCudnnShimLazyV1,
+}
+impl PalsCudaLoadingProfileV1 {
+    fn native(self) -> rz_native_loader::NativeLoadingProfile {
+        match self {
+            Self::ExperimentalCudnnShimLazyV1 => {
+                rz_native_loader::NativeLoadingProfile::CuDnnShimLazyV1
+            }
+        }
+    }
+    pub fn canonical_sha256(self) -> String {
+        digest(self.native().canonical_descriptor().as_bytes())
+    }
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsCudaLoadingBindingV1 {
+    pub profile: PalsCudaLoadingProfileV1,
+    /// SHA-256 of NativeLoadingProfile's canonical descriptor bytes, never an
+    /// inventory file hash or a replacement CUDA library bundle digest.
+    pub canonical_sha256: String,
+}
+impl PalsCudaLoadingBindingV1 {
+    fn validate(&self) -> Result<(), ArenaError> {
+        require(
+            hash(&self.canonical_sha256)
+                && self.canonical_sha256 == self.profile.canonical_sha256(),
+            "experimental CUDA loading descriptor canonical hash differs",
+        )
+    }
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(
@@ -676,6 +714,19 @@ impl PalsArenaLaunchV3 {
                                 control.inventory.sha256
                             ),
                         ]);
+                        if let Some(loading) = &control.loading_profile {
+                            loading.validate()?;
+                            args.extend([
+                                format!(
+                                    "--pals-cuda-loading-profile={}",
+                                    loading.profile.native().identifier()
+                                ),
+                                format!(
+                                    "--pals-cuda-loading-profile-sha256={}",
+                                    loading.canonical_sha256
+                                ),
+                            ]);
+                        }
                     }
                 }
                 (
@@ -1075,6 +1126,10 @@ impl LockedPalsArenaLaunchV3 {
     }
 }
 impl crate::native_launch::sealed::Sealed for LockedPalsArenaLaunchV3 {}
+// Fixed admission reservation, not a measured peak or an unbounded grow-on-save
+// retry. PALS retains nested native/work/mapping evidence for up to four game
+// sessions. Individual provider records remain bounded separately at 256 KiB.
+const PALS_PAIR_METADATA_CAP: u64 = 2 * 1024 * 1024;
 impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
     fn input_sha256(&self) -> &str {
         &self.sha256
@@ -1133,6 +1188,9 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
     fn provider_name(&self) -> &'static str {
         "PALS-V3"
     }
+    fn pair_metadata_cap(&self) -> u64 {
+        PALS_PAIR_METADATA_CAP
+    }
     fn amend_execution_limitations(&self, limitations: &mut Vec<String>) {
         if let Some(scope) = limitations.get_mut(0) {
             *scope="PALS V3 whole-system or explicitly controlled paired pilot; P/C native sessions and CPU/reference UCI processes are distinct; no Elo, training or model promotion".into();
@@ -1142,6 +1200,7 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
         }
         limitations.push("CPU TT byte admission covers the compiled inline slot layout; retained identity heaps, allocator overhead and total peak are separately bounded by the verified inherited memory cgroup".into());
         limitations.push("CPU_T profile is preserved as declared identity only; this pilot executes CPU_R and P/C, with V absent and training_executed=false".into());
+        limitations.push("PALS reserves a fixed 2MiB pair receipt before input copying/spawn within the declared output budget; insufficient admission and oversized final metadata remain errors. Legacy V1/V2 keep their original 64KiB reservation".into());
         limitations.push(format!("PALS runner status patch: {:?}; legacy clock-only records remain readable, while new execution/Core requires the separately registered clock+reap-status runner", self.input.runner_status_patch()));
         if self
             .input
@@ -1151,12 +1210,30 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
         {
             limitations.push("PALS CUDA recipe fixes FP32/TF32 off, physical B1, host K/V, device 0 and per-session 2GiB arena declaration; CPU fallback/I/O binding/CUDA Graph are disabled; arena declarations and summed model device budget do not attest observed VRAM peak".into());
         }
+        if self
+            .input
+            .endpoints
+            .iter()
+            .filter_map(PalsEndpointLaunchV3::cuda_model)
+            .any(|cuda| {
+                cuda.cuda_control
+                    .as_ref()
+                    .is_some_and(|control| control.loading_profile.is_some())
+            })
+        {
+            limitations.push("Explicit experimental cuDNN shim loading changes native loading order only; the full nineteen-file bundle/cache pins remain unchanged. Mapping witnesses prove bounded origin observations, not NN/kernel placement, VRAM, normal exit, root cause or default adoption".into());
+        }
     }
     fn seed(&self) -> u64 {
         self.input.semantic_lock.manifest.pilot.seed
     }
     fn validate_execution(&self) -> Result<(), ArenaError> {
-        self.input.validate()
+        self.input.validate()?;
+        crate::native_launch::pair_stream_cap(
+            self.input.budget.max_output_bytes,
+            self.pair_metadata_cap(),
+        )?;
+        Ok(())
     }
     fn advise_drop_input_cache(&self) -> bool {
         true
@@ -1258,6 +1335,8 @@ pub struct PalsNativeSessionAuditV3 {
     pub execution: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cuda_placement: Option<PalsCudaPlacementAuditV3>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cuda_loading: Option<PalsCudaLoadingAuditV1>,
     pub raw_native: serde_json::Value,
     pub raw_search_work: serde_json::Value,
 }
@@ -1273,6 +1352,133 @@ pub struct PalsCudaPlacementAuditV3 {
     pub proposer_private_kernels: u64,
     pub critic_private_kernels: u64,
     pub device_id: i32,
+}
+/// Two actual origin observations at exclusive worker boundaries. These are
+/// neither kernel/NN counters nor allocator/VRAM/normal-exit evidence.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct PalsCudaLoadingAuditV1 {
+    pub profile: PalsCudaLoadingProfileV1,
+    pub canonical_sha256: String,
+    pub startup: PalsNativeMappingAuditV1,
+    pub final_mapping: PalsNativeMappingAuditV1,
+}
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct PalsNativeMappingAuditV1 {
+    pub required_nvidia_files: Vec<String>,
+    pub mapped_nvidia_files: Vec<String>,
+    pub deferred_nvidia_not_mapped: Vec<String>,
+    pub mapped_ort_files: Vec<String>,
+}
+fn mapping_names(v: &serde_json::Value, allowed: &[&str]) -> Result<Vec<String>, ArenaError> {
+    let values = v
+        .as_array()
+        .ok_or_else(|| invalid("runtime mapping filenames unobserved"))?;
+    require(
+        values.len() <= allowed.len(),
+        "runtime mapping filename count exceeds profile",
+    )?;
+    let mut names = Vec::with_capacity(values.len());
+    let mut unique = BTreeSet::new();
+    for value in values {
+        let filename = value
+            .as_str()
+            .ok_or_else(|| invalid("runtime mapping filename malformed"))?;
+        require(
+            allowed.contains(&filename) && unique.insert(filename),
+            "runtime mapping filename unknown or duplicated",
+        )?;
+        names.push(filename.to_owned());
+    }
+    Ok(names)
+}
+fn validate_native_loading_mapping(
+    cuda: &PalsOnnxCudaLaunchV3,
+    loading: &PalsCudaLoadingBindingV1,
+    witness: &serde_json::Value,
+) -> Result<PalsNativeMappingAuditV1, ArenaError> {
+    loading.validate()?;
+    require(
+        witness.is_object()
+            && witness["schema"] == "rovezero.pals-native-mapping-witness.v1"
+            && array_hash(&witness["runtime_sha256"])? == cuda.model.runtime.sha256
+            && array_hash(&witness["runtime_bundle_sha256"])? == cuda.cuda_bundle.canonical_sha256
+            && witness["loading_profile"] == loading.profile.native().identifier()
+            && array_hash(&witness["loading_profile_sha256"])? == loading.canonical_sha256
+            && witness["scope"] == "exclusive_physical_worker_full_runtime_origin"
+            && count(witness, "declared_nvidia_files")?
+                == rz_native_loader::NVIDIA_LOAD_ORDER.len() as u64,
+        "experimental loading mapping identity/scope differs",
+    )?;
+    let nvidia = &rz_native_loader::NVIDIA_LOAD_ORDER;
+    let required = mapping_names(&witness["required_nvidia_files"], nvidia)?;
+    let mapped = mapping_names(&witness["mapped_nvidia_files"], nvidia)?;
+    let deferred = mapping_names(&witness["deferred_nvidia_not_mapped"], nvidia)?;
+    let ort = mapping_names(
+        &witness["mapped_ort_files"],
+        &rz_native_loader::ORT_LIBRARY_NAMES,
+    )?;
+    let required_set: BTreeSet<_> = required.iter().map(String::as_str).collect();
+    let expected_required: BTreeSet<_> = loading
+        .profile
+        .native()
+        .eager_indices()
+        .iter()
+        .map(|&i| nvidia[i])
+        .collect();
+    let mapped_set: BTreeSet<_> = mapped.iter().map(String::as_str).collect();
+    let deferred_set: BTreeSet<_> = deferred.iter().map(String::as_str).collect();
+    let all: BTreeSet<_> = nvidia.iter().copied().collect();
+    require(
+        required_set == expected_required
+            && required_set.is_subset(&mapped_set)
+            && mapped_set.is_disjoint(&deferred_set)
+            && mapped_set
+                .union(&deferred_set)
+                .copied()
+                .collect::<BTreeSet<_>>()
+                == all
+            && ort.iter().map(String::as_str).collect::<BTreeSet<_>>()
+                == rz_native_loader::ORT_LIBRARY_NAMES.into_iter().collect(),
+        "experimental runtime mapping lacks exact required/deferred NVIDIA partition or full ORT3",
+    )?;
+    Ok(PalsNativeMappingAuditV1 {
+        required_nvidia_files: required,
+        mapped_nvidia_files: mapped,
+        deferred_nvidia_not_mapped: deferred,
+        mapped_ort_files: ort,
+    })
+}
+fn validate_native_loading_evidence(
+    cuda: &PalsOnnxCudaLaunchV3,
+    execution: &serde_json::Value,
+    probe: &serde_json::Value,
+    final_mapping: &serde_json::Value,
+) -> Result<Option<PalsCudaLoadingAuditV1>, ArenaError> {
+    let loading = cuda
+        .cuda_control
+        .as_ref()
+        .and_then(|control| control.loading_profile.as_ref());
+    let actual = &execution["cuda_loading_profile"];
+    let startup_mapping = &probe["runtime_loading_mapping"];
+    let Some(loading) = loading else {
+        require(
+            actual.is_null() && startup_mapping.is_null() && final_mapping.is_null(),
+            "legacy/default CUDA loading cannot claim an unregistered experimental profile or mapping",
+        )?;
+        return Ok(None);
+    };
+    require(
+        actual.is_object()
+            && actual["profile"] == loading.profile.native().identifier()
+            && array_hash(&actual["canonical_sha256"])? == loading.canonical_sha256,
+        "actual experimental CUDA loading profile/hash differs",
+    )?;
+    Ok(Some(PalsCudaLoadingAuditV1 {
+        profile: loading.profile,
+        canonical_sha256: loading.canonical_sha256.clone(),
+        startup: validate_native_loading_mapping(cuda, loading, startup_mapping)?,
+        final_mapping: validate_native_loading_mapping(cuda, loading, final_mapping)?,
+    }))
 }
 fn validate_cuda_placement_witness(
     cuda: &PalsOnnxCudaLaunchV3,
@@ -1664,6 +1870,10 @@ pub fn validate_pals_native_records(
     )?;
     let sn = &s["native"];
     let tn = &t["native"];
+    require(
+        sn["final_runtime_loading_mapping"].is_null(),
+        "startup cannot claim a later final loading observation",
+    )?;
     // The native owner allocates a checked, domain-scoped process epoch; it is
     // neither an OS PID nor a fixed first-owner value. Its paired records are
     // already bound to the same executable/launch/PID and session directory.
@@ -1674,6 +1884,7 @@ pub fn validate_pals_native_records(
     )?;
     let mut startup_nn = (0, 0, 0);
     let mut cuda_placement = None;
+    let mut cuda_loading = None;
     if let Some(cuda) = cuda {
         require(
             s["runtime_bundle_sha256"] == cuda.cuda_bundle.canonical_sha256,
@@ -1722,6 +1933,12 @@ pub fn validate_pals_native_records(
             "CUDA declared budget does not cover actual tensor reservations plus session declarations",
         )?;
         let probe = &sn["startup_probe"];
+        cuda_loading = validate_native_loading_evidence(
+            cuda,
+            execution,
+            probe,
+            &tn["final_runtime_loading_mapping"],
+        )?;
         cuda_placement = validate_cuda_placement_witness(cuda, &probe["cuda_placement_witness"])?;
         require(
             count(probe, "completed_proposer_calls")? == 1
@@ -1742,7 +1959,8 @@ pub fn validate_pals_native_records(
         require(
             sn["startup_probe"].is_null()
                 && tn["startup_probe"].is_null()
-                && s["runtime_bundle_sha256"].is_null(),
+                && s["runtime_bundle_sha256"].is_null()
+                && tn["final_runtime_loading_mapping"].is_null(),
             "CPU recipe cannot claim CUDA initialization work",
         )?;
         require(
@@ -1758,6 +1976,7 @@ pub fn validate_pals_native_records(
                     && sn["execution"]["session_arena_bytes"].is_null()
                     && sn["execution"]["runtime_bundle_sha256"].is_null()
                     && sn["execution"]["cuda_control_inventory_sha256"].is_null()
+                    && sn["execution"]["cuda_loading_profile"].is_null()
                     && count(&sn["execution"], "transient_request_device_bytes")? == 0
                     && count(&sn["execution"], "transient_execution_device_bytes")? == 0
                     && count(&sn["execution"], "pinned_request_bytes")? == 0
@@ -1922,6 +2141,7 @@ pub fn validate_pals_native_records(
                 .map(|_| sn["startup_probe"].clone()),
             execution: sn["execution"].as_object().map(|_| sn["execution"].clone()),
             cuda_placement,
+            cuda_loading,
             raw_native: tn.clone(),
             raw_search_work: t["search_work"].clone(),
         },
@@ -3305,7 +3525,10 @@ mod tests {
         let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut f.endpoints[0] else {
             unreachable!()
         };
-        cuda.cuda_control = Some(Box::new(PalsCudaControlBindingV3 { inventory }));
+        cuda.cuda_control = Some(Box::new(PalsCudaControlBindingV3 {
+            inventory,
+            loading_profile: None,
+        }));
         (f, bytes)
     }
     fn attach_control_witness(
@@ -3332,6 +3555,37 @@ mod tests {
                 hash_array(&inventory.sha256).into();
             record["native"]["startup_probe"]["cuda_placement_witness"] = witness.clone();
         }
+    }
+    fn loading_binding_fixture() -> PalsCudaLoadingBindingV1 {
+        let profile = PalsCudaLoadingProfileV1::ExperimentalCudnnShimLazyV1;
+        PalsCudaLoadingBindingV1 {
+            profile,
+            canonical_sha256: profile.canonical_sha256(),
+        }
+    }
+    fn mapping_fixture(
+        cuda: &PalsOnnxCudaLaunchV3,
+        loading: &PalsCudaLoadingBindingV1,
+        additional: &[usize],
+    ) -> serde_json::Value {
+        let eager = loading.profile.native().eager_indices();
+        let mapped: Vec<_> = rz_native_loader::NVIDIA_LOAD_ORDER
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| eager.contains(i) || additional.contains(i))
+            .map(|(_, n)| *n)
+            .collect();
+        let absent: Vec<_> = rz_native_loader::NVIDIA_LOAD_ORDER
+            .iter()
+            .filter(|n| !mapped.contains(n))
+            .copied()
+            .collect();
+        serde_json::json!({"schema":"rovezero.pals-native-mapping-witness.v1",
+            "runtime_sha256":hash_array(&cuda.model.runtime.sha256),"runtime_bundle_sha256":hash_array(&cuda.cuda_bundle.canonical_sha256),
+            "loading_profile":loading.profile.native().identifier(),"loading_profile_sha256":hash_array(&loading.canonical_sha256),
+            "scope":"exclusive_physical_worker_full_runtime_origin","declared_nvidia_files":16,
+            "required_nvidia_files":eager.iter().map(|&i|rz_native_loader::NVIDIA_LOAD_ORDER[i]).collect::<Vec<_>>(),
+            "mapped_nvidia_files":mapped,"deferred_nvidia_not_mapped":absent,"mapped_ort_files":rz_native_loader::ORT_LIBRARY_NAMES})
     }
     fn hash_array(hex: &str) -> Vec<u8> {
         (0..hex.len())
@@ -3393,6 +3647,7 @@ mod tests {
         let lock = fixture().lock().unwrap();
         let decoded = LockedPalsArenaLaunchV3::from_json(&lock.to_json().unwrap()).unwrap();
         assert_eq!(decoded.sha256(), lock.sha256());
+        assert_eq!(decoded.pair_metadata_cap(), PALS_PAIR_METADATA_CAP);
         let pals = decoded.engine_view(NativeEngineRole::Baseline).unwrap();
         let cpu = decoded.engine_view(NativeEngineRole::Candidate).unwrap();
         assert!(
@@ -3441,6 +3696,35 @@ mod tests {
         let mut value: serde_json::Value = serde_json::from_str(&lock.to_json().unwrap()).unwrap();
         value["input"]["endpoints"][0]["configuration"]["max_rounds"] = 17.into();
         assert!(LockedPalsArenaLaunchV3::from_json(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn pals_receipt_reservation_is_admitted_before_snapshot_or_process_work() {
+        let mut input = fixture();
+        input.budget.max_output_bytes = PALS_PAIR_METADATA_CAP;
+        // Small historical declarations remain parseable. They cannot launch
+        // under the new fixed metadata reservation or silently grow on save.
+        let lock = input.lock().unwrap();
+        let decoded = LockedPalsArenaLaunchV3::from_json(&lock.to_json().unwrap()).unwrap();
+        assert!(matches!(
+            decoded.validate_execution(),
+            Err(ArenaError::Budget(_))
+        ));
+        assert!(crate::native_launch::pair_stream_cap(65_536, 65_536).is_err());
+        assert!(crate::native_launch::pair_stream_cap(65_537, 65_536).is_err());
+        assert!(crate::native_launch::pair_stream_cap(u64::MAX, 0).is_err());
+        let output = 8 * 1024 * 1024;
+        let legacy_stream = crate::native_launch::pair_stream_cap(
+            output,
+            crate::native_launch::NATIVE_PAIR_METADATA_CAP,
+        )
+        .unwrap();
+        let pals_stream =
+            crate::native_launch::pair_stream_cap(output, PALS_PAIR_METADATA_CAP).unwrap();
+        assert_eq!(legacy_stream, (output - 65_536) / 2);
+        assert_eq!(pals_stream, 3 * 1024 * 1024);
+        assert_eq!(2 * pals_stream + decoded.pair_metadata_cap(), output);
+        assert!(fixture().lock().unwrap().validate_execution().is_ok());
     }
     #[test]
     fn pals_runner_registers_new_patch_and_binary_without_rewriting_legacy_locks() {
@@ -3678,6 +3962,161 @@ mod tests {
         };
         c.cuda_control.as_mut().unwrap().inventory.bytes = MAX_CONTROL_INVENTORY_BYTES + 1;
         assert!(oversized.lock().is_err());
+    }
+    #[test]
+    fn pals_experimental_loading_binding_preserves_legacy_canonical_and_all_binary_pins() {
+        let (legacy, _) = cuda_control_fixture();
+        let old = legacy.lock().unwrap();
+        let old_json = serde_json::to_string(&legacy).unwrap();
+        assert!(!old_json.contains("loading_profile"));
+        let mut explicit_none = json(old_json.as_bytes()).unwrap();
+        explicit_none["endpoints"][0]["configuration"]["cuda_control"]["loading_profile"] =
+            serde_json::Value::Null;
+        assert_eq!(
+            PalsArenaLaunchV3::from_json(&explicit_none.to_string())
+                .unwrap()
+                .lock()
+                .unwrap()
+                .sha256(),
+            old.sha256()
+        );
+        let binding = loading_binding_fixture();
+        assert_eq!(
+            binding.canonical_sha256,
+            "3084f27e678d6a6750713265bfb921e90687f199fb71484ff2c475000982ee6d"
+        );
+        let mut explicit = legacy.clone();
+        let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut explicit.endpoints[0] else {
+            unreachable!()
+        };
+        cuda.cuda_control.as_mut().unwrap().loading_profile = Some(binding.clone());
+        let new = explicit.lock().unwrap();
+        assert_ne!(new.sha256(), old.sha256());
+        assert_eq!(new.input.semantic_lock, old.input.semantic_lock);
+        assert_eq!(new.declared_inputs(), old.declared_inputs());
+        let old_view = old.engine_view(NativeEngineRole::Baseline).unwrap();
+        let new_view = new.engine_view(NativeEngineRole::Baseline).unwrap();
+        assert_eq!(new_view.cuda_bundle, old_view.cuda_bundle);
+        let old_engine = old_view.external.unwrap();
+        let new_engine = new_view.external.unwrap();
+        assert_eq!(new_engine.assets, old_engine.assets);
+        assert_eq!(new_engine.environment, old_engine.environment);
+        assert_eq!(
+            new_engine.arguments[..old_engine.arguments.len()],
+            old_engine.arguments
+        );
+        assert_eq!(
+            &new_engine.arguments[old_engine.arguments.len()..],
+            &[
+                "--pals-cuda-loading-profile=experimental-cudnn-shim-lazy-v1".to_owned(),
+                format!(
+                    "--pals-cuda-loading-profile-sha256={}",
+                    binding.canonical_sha256
+                )
+            ]
+        );
+        let mut bad = explicit.clone();
+        let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut bad.endpoints[0] else {
+            unreachable!()
+        };
+        cuda.cuda_control
+            .as_mut()
+            .unwrap()
+            .loading_profile
+            .as_mut()
+            .unwrap()
+            .canonical_sha256 = "f".repeat(64);
+        assert!(bad.lock().is_err());
+        let mut unsupported = json(serde_json::to_string(&explicit).unwrap().as_bytes()).unwrap();
+        unsupported["endpoints"][0]["configuration"]["cuda_control"]["loading_profile"]["profile"] =
+            "automatic-fallback".into();
+        assert!(PalsArenaLaunchV3::from_json(&unsupported.to_string()).is_err());
+    }
+    #[test]
+    fn pals_loading_mapping_is_actual_bounded_origin_evidence_not_invented_nn_work() {
+        let (mut f, _) = cuda_control_fixture();
+        let binding = loading_binding_fixture();
+        let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut f.endpoints[0] else {
+            unreachable!()
+        };
+        cuda.cuda_control.as_mut().unwrap().loading_profile = Some(binding.clone());
+        let lock = f.lock().unwrap();
+        let cuda = lock.input.endpoints[0].cuda_model().unwrap();
+        let (mut start, mut end) = cuda_records_fixture(&lock);
+        attach_control_witness(&lock, &mut start, &mut end);
+        let execution = serde_json::json!({"profile":binding.profile,"canonical_sha256":hash_array(&binding.canonical_sha256)});
+        for record in [&mut start, &mut end] {
+            record["native"]["execution"]["cuda_loading_profile"] = execution.clone();
+            record["native"]["startup_probe"]["runtime_loading_mapping"] =
+                mapping_fixture(cuda, &binding, &[]);
+        }
+        end["native"]["final_runtime_loading_mapping"] = mapping_fixture(cuda, &binding, &[10, 11]);
+        let validate = |s: &serde_json::Value, t: &serde_json::Value| {
+            validate_pals_native_records(
+                &lock,
+                NativeEngineRole::Baseline,
+                &serde_json::to_vec(s).unwrap(),
+                &serde_json::to_vec(t).unwrap(),
+                "native-process-100",
+            )
+        };
+        let (audit, _) = validate(&start, &end).unwrap();
+        let loading = audit.cuda_loading.as_ref().unwrap();
+        assert_eq!(
+            (
+                loading.startup.mapped_nvidia_files.len(),
+                loading.final_mapping.mapped_nvidia_files.len()
+            ),
+            (9, 11)
+        );
+        assert_eq!(
+            (
+                audit.startup_nn_inputs_completed,
+                audit.completed_role_inputs,
+                audit.search_consumed_role_inputs
+            ),
+            (3, 3, 1)
+        );
+        let mut wrong = end.clone();
+        wrong["native"]["final_runtime_loading_mapping"] = serde_json::Value::Null;
+        assert!(validate(&start, &wrong).is_err());
+        let mut wrong = end.clone();
+        wrong["native"]["final_runtime_loading_mapping"]["mapped_ort_files"] =
+            serde_json::json!([]);
+        assert!(validate(&start, &wrong).is_err());
+        let mut wrong = end.clone();
+        wrong["native"]["final_runtime_loading_mapping"]["mapped_nvidia_files"][0] =
+            "untrusted.so".into();
+        assert!(validate(&start, &wrong).is_err());
+        let mut wrong = end.clone();
+        wrong["native"]["final_runtime_loading_mapping"]["required_nvidia_files"][0] =
+            rz_native_loader::NVIDIA_LOAD_ORDER[8].into();
+        assert!(validate(&start, &wrong).is_err());
+        let mut wrong = end.clone();
+        wrong["native"]["final_runtime_loading_mapping"]["loading_profile_sha256"] =
+            hash_array(&"f".repeat(64)).into();
+        assert!(validate(&start, &wrong).is_err());
+        let (old, _) = cuda_control_fixture();
+        let old_cuda = old.endpoints[0].cuda_model().unwrap();
+        assert!(
+            validate_native_loading_evidence(
+                old_cuda,
+                &start["native"]["execution"],
+                &start["native"]["startup_probe"],
+                &end["native"]["final_runtime_loading_mapping"]
+            )
+            .is_err()
+        );
+        assert!(
+            validate_native_loading_evidence(
+                old_cuda,
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                &serde_json::Value::Null
+            )
+            .unwrap()
+            .is_none()
+        );
     }
     #[test]
     fn pals_cuda_control_witness_requires_exact_source_and_both_selected_branches() {
@@ -4293,6 +4732,7 @@ mod tests {
             startup_probe: None,
             execution: None,
             cuda_placement: None,
+            cuda_loading: None,
             raw_native: serde_json::json!({"backend_stats_observation":"exclusive_worker_before_shutdown","observer_failures":0,"last_observer_failure":null,"frozen_epoch":1,
                 "backend_stats":{"public_nn_runs_completed":1,"role_nn_runs_completed":3,"completed_nn_inputs":4,"public_cache_hits":2,
                     "public_nn_runs_failed_known":0,"role_nn_runs_failed_known":0,"public_nn_runs_attempted":1,"role_nn_runs_attempted":3,

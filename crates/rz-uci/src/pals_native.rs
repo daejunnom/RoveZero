@@ -492,7 +492,8 @@ mod native {
     use rz_eval::pals_model::PALS_ENCODING_SCHEMA;
     use rz_eval::pals_onnx::{
         PalsBackendStats, PalsCudaControlPolicy, PalsCudaPlacementWitness, PalsGraphOptimization,
-        PalsNativeCommand, PalsNativeResult, PalsOnnxBackend, PalsSessionResidency,
+        PalsNativeCommand, PalsNativeMappingWitness, PalsNativeResult, PalsOnnxBackend,
+        PalsSessionResidency,
     };
     use rz_eval::worker::{PhysicalLease, PhysicalPoll, SingleWorker};
     use rz_position::contracts::ContractPosition;
@@ -557,6 +558,7 @@ mod native {
         startup_probe: Mutex<Option<NativeStartupProbeReceipt>>,
         startup_ready: AtomicBool,
         final_mapping_confirmed: AtomicBool,
+        final_loading_mapping: Mutex<Option<Box<PalsNativeMappingWitness>>>,
         observer: Mutex<Option<Box<dyn NativeRoleObserver>>>,
         observer_failures: AtomicU64,
         last_observer_failure: Mutex<Option<NativeFailureReceipt>>,
@@ -617,6 +619,11 @@ mod native {
         }
     }
     /// Provider and admission declarations are not measured native/VRAM peaks.
+    #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+    pub struct NativeCudaLoadingIdentity {
+        pub profile: &'static str,
+        pub canonical_sha256: [u8; 32],
+    }
     #[derive(Clone, Debug, serde::Serialize)]
     pub struct NativeExecutionReceipt {
         pub provider: &'static str,
@@ -628,6 +635,10 @@ mod native {
         /// Identity of the explicitly loaded metadata-only control inventory.
         /// None means strict CUDA or CPU, not an observed placement witness.
         pub cuda_control_inventory_sha256: Option<[u8; 32]>,
+        /// Only the actual explicitly selected nondefault runtime profile is
+        /// recorded here. Missing preserves historic eager/CPU wire formats.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cuda_loading_profile: Option<NativeCudaLoadingIdentity>,
         pub transient_request_device_bytes: u64,
         pub transient_execution_device_bytes: u64,
         pub pinned_request_bytes: u64,
@@ -639,6 +650,8 @@ mod native {
         pub completed_proposer_calls: u64,
         pub completed_critic_calls: u64,
         pub runtime_mapping_confirmed: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub runtime_loading_mapping: Option<Box<PalsNativeMappingWitness>>,
         /// Same-worker NN-zero ACK after physically completed public/P/C probes.
         /// Library origin confirmation alone never supplies this evidence.
         pub cuda_placement_witness: Option<Box<PalsCudaPlacementWitness>>,
@@ -714,6 +727,23 @@ mod native {
                     )
                 }
             };
+        let cuda_loading_profile = match backend.native_loading_profile() {
+            Some(rz_eval::onnx::NativeLoadingProfile::CuDnnShimLazyV1) => {
+                if provider != "cuda"
+                    || backend.config().device_public_memory
+                    || backend.cuda_control_inventory_digest().is_none()
+                {
+                    return Err(RoleError::Backend("PALS experimental loading policy requires explicit CUDA host/control startup".into()));
+                }
+                Some(NativeCudaLoadingIdentity {
+                    profile: rz_eval::onnx::NativeLoadingProfile::CuDnnShimLazyV1.identifier(),
+                    canonical_sha256: backend
+                        .native_loading_profile_digest()
+                        .ok_or(RoleError::InvalidOutput)?,
+                })
+            }
+            Some(rz_eval::onnx::NativeLoadingProfile::EagerCuda12Cudnn9V1) | None => None,
+        };
         Ok(NativeExecutionReceipt {
             provider,
             device_id,
@@ -721,6 +751,7 @@ mod native {
             runtime_sha256: backend.runtime_binary_digest(),
             runtime_bundle_sha256: backend.runtime_bundle_digest(),
             cuda_control_inventory_sha256: backend.cuda_control_inventory_digest(),
+            cuda_loading_profile,
             transient_request_device_bytes: request,
             transient_execution_device_bytes: physical,
             // Rust owns pageable host tensors in this first host-K/V path.
@@ -728,6 +759,69 @@ mod native {
             pinned_request_bytes: 0,
             device_public_memory: backend.config().device_public_memory,
         })
+    }
+    pub(crate) fn validate_runtime_loading_mapping(
+        witness: &PalsNativeMappingWitness,
+        execution: &NativeExecutionReceipt,
+    ) -> Result<(), BackendError> {
+        let identity = execution.cuda_loading_profile.as_ref();
+        fn set(names: &[String]) -> std::collections::BTreeSet<&str> {
+            names.iter().map(String::as_str).collect()
+        }
+        let required = set(&witness.required_nvidia_files);
+        let mapped = set(&witness.mapped_nvidia_files);
+        let absent = set(&witness.deferred_nvidia_not_mapped);
+        let ort = set(&witness.mapped_ort_files);
+        let declared = std::collections::BTreeSet::from(rz_eval::onnx::NVIDIA_LOAD_ORDER);
+        let expected_required: std::collections::BTreeSet<_> =
+            rz_eval::onnx::NativeLoadingProfile::CuDnnShimLazyV1
+                .eager_indices()
+                .iter()
+                .map(|&index| rz_eval::onnx::NVIDIA_LOAD_ORDER[index])
+                .collect();
+        if execution.provider != "cuda"
+            || witness.schema != "rovezero.pals-native-mapping-witness.v1"
+            || witness.scope != "exclusive_physical_worker_full_runtime_origin"
+            || witness.runtime_sha256 != execution.runtime_sha256
+            || execution.runtime_bundle_sha256 != Some(witness.runtime_bundle_sha256)
+            || !identity.is_some_and(|identity| {
+                identity.profile == witness.loading_profile
+                    && identity.profile
+                        == rz_eval::onnx::NativeLoadingProfile::CuDnnShimLazyV1.identifier()
+                    && identity.canonical_sha256 == witness.loading_profile_sha256
+                    && identity.canonical_sha256
+                        == rz_eval::asset::sha256(
+                            rz_eval::onnx::NativeLoadingProfile::CuDnnShimLazyV1
+                                .canonical_descriptor()
+                                .as_bytes(),
+                        )
+            })
+            || witness.declared_nvidia_files != 16
+            || required.len() != witness.required_nvidia_files.len()
+            || required != expected_required
+            || mapped.len() != witness.mapped_nvidia_files.len()
+            || absent.len() != witness.deferred_nvidia_not_mapped.len()
+            || !required.is_subset(&mapped)
+            || !mapped.is_disjoint(&absent)
+            || mapped
+                .union(&absent)
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                != declared
+            || mapped
+                .iter()
+                .chain(absent.iter())
+                .any(|name| name.is_empty() || name.len() > 128 || !name.is_ascii())
+            || ort.len() != witness.mapped_ort_files.len()
+            || ort != std::collections::BTreeSet::from(rz_eval::onnx::ORT_LIBRARY_NAMES)
+        {
+            return Err(BackendError::new(
+                rz_eval::error::FailureKind::IdentityMismatch,
+                rz_eval::error::FailureStage::Output,
+                "PALS runtime loading mapping ACK differs from its actual pinned execution identity",
+            ));
+        }
+        Ok(())
     }
     fn validate_startup_cuda_witness(
         witness: &PalsCudaPlacementWitness,
@@ -930,6 +1024,8 @@ mod native {
         pub startup_probe: Option<NativeStartupProbeReceipt>,
         /// None means not observed/applicable, not a failed or successful audit.
         pub final_runtime_mapping_confirmed: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub final_runtime_loading_mapping: Option<Box<PalsNativeMappingWitness>>,
         pub observer_failures: u64,
         pub last_observer_failure: Option<NativeFailureReceipt>,
     }
@@ -994,6 +1090,12 @@ mod native {
                     .final_mapping_confirmed
                     .load(Ordering::Acquire)
                     .then_some(true),
+                final_runtime_loading_mapping: self
+                    .owner
+                    .final_loading_mapping
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
                 observer_failures: self.owner.observer_failures.load(Ordering::Acquire),
                 last_observer_failure: self
                     .owner
@@ -1014,6 +1116,13 @@ mod native {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .is_some()
+                    && (self.owner.execution.cuda_loading_profile.is_none()
+                        || self
+                            .owner
+                            .final_loading_mapping
+                            .lock()
+                            .map_err(|_| RoleError::PhysicalCompletionUnknown)?
+                            .is_some())
                 {
                     return Ok(());
                 }
@@ -1033,6 +1142,15 @@ mod native {
                                 && !self.owner.final_mapping_confirmed.load(Ordering::Acquire)
                             {
                                 PalsNativeCommand::VerifyRuntime
+                            } else if self.owner.execution.cuda_loading_profile.is_some()
+                                && self
+                                    .owner
+                                    .final_loading_mapping
+                                    .lock()
+                                    .map_err(|_| RoleError::PhysicalCompletionUnknown)?
+                                    .is_none()
+                            {
+                                PalsNativeCommand::ObserveRuntimeMappings
                             } else {
                                 PalsNativeCommand::SnapshotStats
                             },
@@ -1045,19 +1163,42 @@ mod native {
                     *slot = Some(lease);
                 }
                 if let Some(lease) = slot.as_mut() {
+                    let expected_verify = matches!(lease.input(), PalsNativeCommand::VerifyRuntime);
+                    let expected_mapping =
+                        matches!(lease.input(), PalsNativeCommand::ObserveRuntimeMappings);
+                    let expected_stats = matches!(lease.input(), PalsNativeCommand::SnapshotStats);
                     match lease.poll() {
                         PhysicalPoll::Ready(result) => {
                             self.owner.in_flight.fetch_sub(1, Ordering::AcqRel);
                             *slot = None;
                             match result {
                                 Ok(PalsNativeResult::RuntimeVerified)
-                                    if self.owner.execution.provider == "cuda" =>
+                                    if self.owner.execution.provider == "cuda"
+                                        && expected_verify =>
                                 {
                                     self.owner
                                         .final_mapping_confirmed
                                         .store(true, Ordering::Release);
                                 }
-                                Ok(PalsNativeResult::Stats(stats)) => {
+                                Ok(PalsNativeResult::RuntimeMappingsObserved(witness))
+                                    if expected_mapping =>
+                                {
+                                    validate_runtime_loading_mapping(
+                                        &witness,
+                                        &self.owner.execution,
+                                    )
+                                    .map_err(|error| {
+                                        self.owner.remember_failure(&error);
+                                        model_error(error)
+                                    })?;
+                                    *self
+                                        .owner
+                                        .final_loading_mapping
+                                        .lock()
+                                        .map_err(|_| RoleError::PhysicalCompletionUnknown)? =
+                                        Some(witness);
+                                }
+                                Ok(PalsNativeResult::Stats(stats)) if expected_stats => {
                                     stats.validate().map_err(|error| {
                                         self.owner.remember_failure(&error);
                                         model_error(error)
@@ -1264,7 +1405,8 @@ mod native {
                     PalsNativeResult::NewGame
                     | PalsNativeResult::Stats(_)
                     | PalsNativeResult::RuntimeVerified
-                    | PalsNativeResult::CudaPlacementVerified(_),
+                    | PalsNativeResult::CudaPlacementVerified(_)
+                    | PalsNativeResult::RuntimeMappingsObserved(_),
                 ) => {
                     self.owner.validation_failed.fetch_add(1, Ordering::AcqRel);
                     Err(fault(
@@ -1386,6 +1528,27 @@ mod native {
             drain_limit: Duration,
         ) -> Result<Self, RoleError> {
             let runtime = rz_eval::onnx::OrtRuntime::load(pin).map_err(model_error)?;
+            Self::load_with_runtime_and_cuda_control_policy(
+                export,
+                expected_export_sha256,
+                runtime,
+                config,
+                policy,
+                profile_root,
+                drain_limit,
+            )
+        }
+        /// A bootstrap-pinned runtime may carry an explicitly registered CUDA
+        /// loading policy. The default pinned factory above still uses load().
+        pub fn load_with_runtime_and_cuda_control_policy(
+            export: &std::path::Path,
+            expected_export_sha256: &str,
+            runtime: rz_eval::onnx::OrtRuntime,
+            config: rz_eval::pals_onnx::PalsOnnxConfig,
+            policy: PalsCudaControlPolicy,
+            profile_root: &std::path::Path,
+            drain_limit: Duration,
+        ) -> Result<Self, RoleError> {
             let backend = PalsOnnxBackend::load_with_cuda_control_policy(
                 export,
                 expected_export_sha256,
@@ -1497,12 +1660,14 @@ mod native {
                     completed_proposer_calls: 0,
                     completed_critic_calls: 0,
                     runtime_mapping_confirmed: false,
+                    runtime_loading_mapping: None,
                     cuda_placement_witness: None,
                     reset_completed: false,
                     backend_stats: None,
                 })),
                 startup_ready: AtomicBool::new(!is_cuda),
                 final_mapping_confirmed: AtomicBool::new(false),
+                final_loading_mapping: Mutex::new(None),
                 observer: Mutex::new(None),
                 observer_failures: AtomicU64::new(0),
                 last_observer_failure: Mutex::new(None),
@@ -1653,6 +1818,27 @@ mod native {
                     .ok_or(RoleError::Unavailable)?
                     .runtime_mapping_confirmed = true;
                 if self.owner.execution.provider == "cuda" {
+                    if self.owner.execution.cuda_loading_profile.is_some() {
+                        let mapping = match self
+                            .startup_command(PalsNativeCommand::ObserveRuntimeMappings, until)?
+                        {
+                            PalsNativeResult::RuntimeMappingsObserved(witness) => witness,
+                            _ => return Err(RoleError::InvalidOutput),
+                        };
+                        validate_runtime_loading_mapping(&mapping, &self.owner.execution).map_err(
+                            |error| {
+                                self.owner.remember_failure(&error);
+                                model_error(error)
+                            },
+                        )?;
+                        self.owner
+                            .startup_probe
+                            .lock()
+                            .map_err(|_| RoleError::Unavailable)?
+                            .as_mut()
+                            .ok_or(RoleError::Unavailable)?
+                            .runtime_loading_mapping = Some(mapping);
+                    }
                     let witness = match self
                         .startup_command(PalsNativeCommand::VerifyCudaPlacement, until)?
                     {
@@ -1869,7 +2055,8 @@ mod native {
                                 PalsNativeResult::Evaluation(_)
                                 | PalsNativeResult::Stats(_)
                                 | PalsNativeResult::RuntimeVerified
-                                | PalsNativeResult::CudaPlacementVerified(_),
+                                | PalsNativeResult::CudaPlacementVerified(_)
+                                | PalsNativeResult::RuntimeMappingsObserved(_),
                             ) => {
                                 self.unusable = true;
                                 return Err(RoleError::Backend(
@@ -2299,6 +2486,7 @@ mod native {
                 runtime_sha256: [1; 32],
                 runtime_bundle_sha256: Some([2; 32]),
                 cuda_control_inventory_sha256: Some([3; 32]),
+                cuda_loading_profile: None,
                 transient_request_device_bytes: 0,
                 transient_execution_device_bytes: 0,
                 pinned_request_bytes: 0,
@@ -2383,6 +2571,17 @@ mod native {
                 + Send
                 + 'static,
         {
+            fixture_model_with_execution(run, None)
+        }
+        fn fixture_model_with_execution<F>(
+            run: F,
+            execution: Option<NativeExecutionReceipt>,
+        ) -> NativeRoleModel
+        where
+            F: FnMut(&PalsNativeCommand) -> PhysicalRun<Result<PalsNativeResult, BackendError>>
+                + Send
+                + 'static,
+        {
             let epoch = ProcessEpoch(next(&EPOCHS).unwrap());
             let model = Digest([3; 32]);
             let encoding = Digest(pals_rules_encoding_semantic_digest());
@@ -2436,21 +2635,23 @@ mod native {
                     native_resident_parameter_bytes: None,
                     vram_peak_bytes: None,
                 },
-                execution: NativeExecutionReceipt {
+                execution: execution.unwrap_or(NativeExecutionReceipt {
                     provider: "cpu",
                     device_id: None,
                     session_arena_bytes: None,
                     runtime_sha256: [0; 32],
                     runtime_bundle_sha256: None,
                     cuda_control_inventory_sha256: None,
+                    cuda_loading_profile: None,
                     transient_request_device_bytes: 0,
                     transient_execution_device_bytes: 0,
                     pinned_request_bytes: 0,
                     device_public_memory: false,
-                },
+                }),
                 startup_probe: Mutex::new(None),
                 startup_ready: AtomicBool::new(true),
                 final_mapping_confirmed: AtomicBool::new(false),
+                final_loading_mapping: Mutex::new(None),
                 observer: Mutex::new(None),
                 observer_failures: AtomicU64::new(0),
                 last_observer_failure: Mutex::new(None),
@@ -2531,6 +2732,141 @@ mod native {
             // A transient tensor reservation never becomes a session/peak claim.
             assert!(execution < 2 * 1024 * 1024 * 1024);
         }
+        fn loading_mapping_fixture() -> (NativeExecutionReceipt, PalsNativeMappingWitness) {
+            let profile = rz_eval::onnx::NativeLoadingProfile::CuDnnShimLazyV1;
+            let digest = rz_eval::asset::sha256(profile.canonical_descriptor().as_bytes());
+            let execution = NativeExecutionReceipt {
+                provider: "cuda",
+                device_id: Some(0),
+                session_arena_bytes: Some(2 * 1024 * 1024 * 1024),
+                runtime_sha256: [1; 32],
+                runtime_bundle_sha256: Some([2; 32]),
+                cuda_control_inventory_sha256: Some([3; 32]),
+                cuda_loading_profile: Some(NativeCudaLoadingIdentity {
+                    profile: profile.identifier(),
+                    canonical_sha256: digest,
+                }),
+                transient_request_device_bytes: 0,
+                transient_execution_device_bytes: 0,
+                pinned_request_bytes: 0,
+                device_public_memory: false,
+            };
+            let roots: Vec<_> = profile
+                .eager_indices()
+                .iter()
+                .map(|&index| rz_eval::onnx::NVIDIA_LOAD_ORDER[index].to_owned())
+                .collect();
+            let absent: Vec<_> = rz_eval::onnx::NVIDIA_LOAD_ORDER
+                .iter()
+                .filter(|name| !roots.iter().any(|root| root.as_str() == **name))
+                .map(|name| (*name).to_owned())
+                .collect();
+            let witness = PalsNativeMappingWitness {
+                schema: "rovezero.pals-native-mapping-witness.v1",
+                runtime_sha256: execution.runtime_sha256,
+                runtime_bundle_sha256: execution.runtime_bundle_sha256.unwrap(),
+                loading_profile: profile.identifier(),
+                loading_profile_sha256: digest,
+                scope: "exclusive_physical_worker_full_runtime_origin",
+                declared_nvidia_files: 16,
+                required_nvidia_files: roots.clone(),
+                mapped_nvidia_files: roots,
+                deferred_nvidia_not_mapped: absent,
+                mapped_ort_files: rz_eval::onnx::ORT_LIBRARY_NAMES
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect(),
+            };
+            (execution, witness)
+        }
+        #[test]
+        fn loading_mapping_ack_requires_exact_pin_profile_partition_and_full_ort() {
+            let (execution, witness) = loading_mapping_fixture();
+            assert!(validate_runtime_loading_mapping(&witness, &execution).is_ok());
+            for mutation in 0..6 {
+                let mut changed = witness.clone();
+                match mutation {
+                    0 => changed.runtime_sha256 = [9; 32],
+                    1 => changed.loading_profile_sha256 = [9; 32],
+                    2 => {
+                        changed.mapped_ort_files.pop().unwrap();
+                    }
+                    3 => changed
+                        .mapped_nvidia_files
+                        .push(changed.mapped_nvidia_files[0].clone()),
+                    4 => {
+                        changed.deferred_nvidia_not_mapped[0] =
+                            changed.mapped_nvidia_files[0].clone()
+                    }
+                    _ => changed.required_nvidia_files[0] = "unpinned-library.so".into(),
+                }
+                assert!(validate_runtime_loading_mapping(&changed, &execution).is_err());
+            }
+            let mut cpu = execution.clone();
+            cpu.provider = "cpu";
+            assert!(validate_runtime_loading_mapping(&witness, &cpu).is_err());
+            cpu.cuda_loading_profile = None;
+            let encoded = serde_json::to_value(cpu).unwrap();
+            assert!(encoded.get("cuda_loading_profile").is_none());
+        }
+        #[test]
+        fn final_loading_mapping_control_ack_is_nn_zero_and_failure_is_preserved() {
+            for invalid in [false, true] {
+                let (execution, mut witness) = loading_mapping_fixture();
+                if invalid {
+                    witness.runtime_sha256 = [9; 32];
+                }
+                let commands = Arc::new(Mutex::new(Vec::new()));
+                let observed = Arc::clone(&commands);
+                let model = fixture_model_with_execution(
+                    move |command| {
+                        let (kind, output) = match command {
+                            PalsNativeCommand::VerifyRuntime => {
+                                ("verify", PalsNativeResult::RuntimeVerified)
+                            }
+                            PalsNativeCommand::ObserveRuntimeMappings => (
+                                "mapping",
+                                PalsNativeResult::RuntimeMappingsObserved(Box::new(
+                                    witness.clone(),
+                                )),
+                            ),
+                            PalsNativeCommand::SnapshotStats => (
+                                "stats",
+                                PalsNativeResult::Stats(PalsBackendStats::default()),
+                            ),
+                            _ => return unexpected_cuda_placement(),
+                        };
+                        observed.lock().unwrap().push(kind);
+                        PhysicalRun::Complete(Ok(output))
+                    },
+                    Some(execution),
+                );
+                // A synthetic worker tests receipt and lease accounting only.
+                // It neither initializes CUDA nor advertises native readiness.
+                let finish = model.finish_handle();
+                let result = finish.finish(Instant::now() + Duration::from_secs(2));
+                assert_eq!(result.is_ok(), !invalid);
+                let receipt = finish.receipt();
+                assert!(receipt.physical_shutdown_confirmed && receipt.native_buffers_released);
+                assert!(!receipt.quarantined);
+                assert_eq!(receipt.completed_role_inputs, 0);
+                assert_eq!(receipt.physically_completed_role_calls, 0);
+                assert_eq!(receipt.delivered_role_inputs, 0);
+                assert_eq!(receipt.search_consumed_role_inputs, 0);
+                assert_eq!(receipt.physical_runs_in_flight, 0);
+                if invalid {
+                    assert!(receipt.last_failure.is_some());
+                    assert!(receipt.final_runtime_loading_mapping.is_none());
+                    assert!(receipt.backend_stats.is_none());
+                    assert_eq!(*commands.lock().unwrap(), ["verify", "mapping"]);
+                } else {
+                    assert!(receipt.last_failure.is_none());
+                    assert!(receipt.final_runtime_loading_mapping.is_some());
+                    assert_eq!(receipt.backend_stats.unwrap().completed_nn_inputs, 0);
+                    assert_eq!(*commands.lock().unwrap(), ["verify", "mapping", "stats"]);
+                }
+            }
+        }
         #[test]
         fn startup_worker_probe_does_not_create_search_consumption() {
             let mut stats = PalsBackendStats::default();
@@ -2560,7 +2896,10 @@ mod native {
                         stats.new_game_resets += 1;
                         PalsNativeResult::NewGame
                     }
-                    PalsNativeCommand::VerifyCudaPlacement => return unexpected_cuda_placement(),
+                    PalsNativeCommand::VerifyCudaPlacement
+                    | PalsNativeCommand::ObserveRuntimeMappings => {
+                        return unexpected_cuda_placement();
+                    }
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
                     PalsNativeCommand::SnapshotStats => PalsNativeResult::Stats(stats.clone()),
                 }))
@@ -2572,6 +2911,7 @@ mod native {
                 completed_proposer_calls: 0,
                 completed_critic_calls: 0,
                 runtime_mapping_confirmed: false,
+                runtime_loading_mapping: None,
                 cuda_placement_witness: None,
                 reset_completed: false,
                 backend_stats: None,
@@ -2658,7 +2998,10 @@ mod native {
                         output(input)
                     }
                     PalsNativeCommand::NewGame => PalsNativeResult::NewGame,
-                    PalsNativeCommand::VerifyCudaPlacement => return unexpected_cuda_placement(),
+                    PalsNativeCommand::VerifyCudaPlacement
+                    | PalsNativeCommand::ObserveRuntimeMappings => {
+                        return unexpected_cuda_placement();
+                    }
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
                     PalsNativeCommand::SnapshotStats => {
                         PalsNativeResult::Stats(PalsBackendStats::default())
@@ -2705,7 +3048,10 @@ mod native {
                 PhysicalRun::Complete(Ok(match command {
                     PalsNativeCommand::Evaluate(input) => output(input),
                     PalsNativeCommand::NewGame => PalsNativeResult::NewGame,
-                    PalsNativeCommand::VerifyCudaPlacement => return unexpected_cuda_placement(),
+                    PalsNativeCommand::VerifyCudaPlacement
+                    | PalsNativeCommand::ObserveRuntimeMappings => {
+                        return unexpected_cuda_placement();
+                    }
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
                     PalsNativeCommand::SnapshotStats => {
                         PalsNativeResult::Stats(PalsBackendStats::default())
@@ -2764,7 +3110,10 @@ mod native {
                 PhysicalRun::Complete(Ok(match command {
                     PalsNativeCommand::Evaluate(input) => output(input),
                     PalsNativeCommand::NewGame => PalsNativeResult::NewGame,
-                    PalsNativeCommand::VerifyCudaPlacement => return unexpected_cuda_placement(),
+                    PalsNativeCommand::VerifyCudaPlacement
+                    | PalsNativeCommand::ObserveRuntimeMappings => {
+                        return unexpected_cuda_placement();
+                    }
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
                     PalsNativeCommand::SnapshotStats => {
                         PalsNativeResult::Stats(PalsBackendStats::default())
@@ -2820,7 +3169,10 @@ mod native {
                     PalsNativeCommand::SnapshotStats => {
                         PalsNativeResult::Stats(PalsBackendStats::default())
                     }
-                    PalsNativeCommand::VerifyCudaPlacement => return unexpected_cuda_placement(),
+                    PalsNativeCommand::VerifyCudaPlacement
+                    | PalsNativeCommand::ObserveRuntimeMappings => {
+                        return unexpected_cuda_placement();
+                    }
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
                 }))
             });
@@ -2874,7 +3226,8 @@ mod native {
                 PalsNativeCommand::SnapshotStats => {
                     PhysicalRun::Complete(Ok(PalsNativeResult::Stats(PalsBackendStats::default())))
                 }
-                PalsNativeCommand::VerifyCudaPlacement => unexpected_cuda_placement(),
+                PalsNativeCommand::VerifyCudaPlacement
+                | PalsNativeCommand::ObserveRuntimeMappings => unexpected_cuda_placement(),
                 PalsNativeCommand::VerifyRuntime => {
                     PhysicalRun::Complete(Ok(PalsNativeResult::RuntimeVerified))
                 }
@@ -2907,7 +3260,8 @@ mod native {
                     PalsNativeCommand::SnapshotStats => PhysicalRun::Complete(Ok(
                         PalsNativeResult::Stats(PalsBackendStats::default()),
                     )),
-                    PalsNativeCommand::VerifyCudaPlacement => unexpected_cuda_placement(),
+                    PalsNativeCommand::VerifyCudaPlacement
+                    | PalsNativeCommand::ObserveRuntimeMappings => unexpected_cuda_placement(),
                     PalsNativeCommand::VerifyRuntime => {
                         PhysicalRun::Complete(Ok(PalsNativeResult::RuntimeVerified))
                     }
@@ -2993,7 +3347,8 @@ mod native {
                     FailureStage::Backend,
                     "unknown Stats fixture completion",
                 )),
-                PalsNativeCommand::VerifyCudaPlacement => unexpected_cuda_placement(),
+                PalsNativeCommand::VerifyCudaPlacement
+                | PalsNativeCommand::ObserveRuntimeMappings => unexpected_cuda_placement(),
                 PalsNativeCommand::VerifyRuntime => {
                     PhysicalRun::Complete(Ok(PalsNativeResult::RuntimeVerified))
                 }
@@ -3022,7 +3377,10 @@ mod native {
                 PhysicalRun::Complete(Ok(match command {
                     PalsNativeCommand::Evaluate(input) => output(input),
                     PalsNativeCommand::NewGame => PalsNativeResult::NewGame,
-                    PalsNativeCommand::VerifyCudaPlacement => return unexpected_cuda_placement(),
+                    PalsNativeCommand::VerifyCudaPlacement
+                    | PalsNativeCommand::ObserveRuntimeMappings => {
+                        return unexpected_cuda_placement();
+                    }
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
                     PalsNativeCommand::SnapshotStats => PalsNativeResult::Stats(PalsBackendStats {
                         completed_nn_inputs: 1,
@@ -3054,10 +3412,13 @@ mod native {
     }
 }
 #[cfg(feature = "onnx-cpu")]
+pub(crate) use native::validate_runtime_loading_mapping;
+#[cfg(feature = "onnx-cpu")]
 pub use native::{
-    NativeBackendStatsReceipt, NativeExecutionReceipt, NativeFailureReceipt, NativePreparedContext,
-    NativeRoleFinishHandle, NativeRoleModel, NativeRoleObserver, NativeRoleReceipt,
-    NativeRoleRejection, NativeRoleSourceIdentity, NativeStartupProbeReceipt,
+    NativeBackendStatsReceipt, NativeCudaLoadingIdentity, NativeExecutionReceipt,
+    NativeFailureReceipt, NativePreparedContext, NativeRoleFinishHandle, NativeRoleModel,
+    NativeRoleObserver, NativeRoleReceipt, NativeRoleRejection, NativeRoleSourceIdentity,
+    NativeStartupProbeReceipt,
 };
 
 #[cfg(test)]

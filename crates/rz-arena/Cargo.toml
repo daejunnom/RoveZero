@@ -36,6 +36,7 @@ required-features = ["pals-collection"]
 rz-experiments.workspace = true
 rz-contracts.workspace = true
 rz-eval.workspace = true
+rz-native-loader.workspace = true
 rz-search.workspace = true
 rz-position = { workspace = true, features = ["contracts"] }
 rz-uci = { workspace = true, optional = true }

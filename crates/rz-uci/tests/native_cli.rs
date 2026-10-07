@@ -217,3 +217,64 @@ fn native_runtime_asset_mixed_with_mock_is_rejected_without_private_value_output
     assert!(!diagnostic.contains("vendor-library"));
     assert!(diagnostic.len() <= 512, "startup error must remain bounded");
 }
+
+#[test]
+fn pals_loading_profile_duplicates_and_mock_mixing_are_rejected_before_protocol() {
+    for (arguments, expected) in [
+        (
+            vec![
+                "--search=pals",
+                "--pals-model=onnx",
+                "--pals-cuda-loading-profile=private-profile-marker",
+                "--pals-cuda-loading-profile=private-profile-marker",
+            ],
+            "duplicate PALS CUDA loading profile",
+        ),
+        (
+            vec![
+                "--search=pals",
+                "--pals-model=onnx",
+                "--pals-cuda-loading-profile-sha256=private-profile-marker",
+                "--pals-cuda-loading-profile-sha256=private-profile-marker",
+            ],
+            "duplicate PALS CUDA loading profile SHA-256",
+        ),
+        (
+            vec![
+                "--search=pals",
+                "--pals-model=legal-order-mock",
+                "--pals-cuda-loading-profile=private-profile-marker",
+            ],
+            "PALS mock selection cannot accept neural assets",
+        ),
+    ] {
+        let (status, protocol, diagnostic) = rejected(&arguments);
+        assert_eq!(status.code(), Some(2));
+        assert!(protocol.is_empty(), "rejected profile started UCI");
+        assert!(diagnostic.contains(expected));
+        assert!(!diagnostic.contains("private-profile-marker"));
+        assert!(diagnostic.len() <= 512);
+    }
+}
+
+#[test]
+#[cfg(feature = "onnx-cpu")]
+fn pals_cpu_rejects_cuda_loading_profile_before_any_asset_or_runtime_lookup() {
+    for profile_argument in [
+        "--pals-cuda-loading-profile=private-profile-marker",
+        "--pals-cuda-loading-profile-sha256=private-profile-marker",
+    ] {
+        let (status, protocol, diagnostic) = rejected(&[
+            "--search=pals",
+            "--pals-model=onnx",
+            "--pals-provider=cpu",
+            profile_argument,
+        ]);
+        assert_eq!(status.code(), Some(2));
+        assert!(protocol.is_empty());
+        assert!(diagnostic.contains("PALS CPU selection cannot accept CUDA"));
+        assert!(!diagnostic.contains("private-profile-marker"));
+        assert!(!diagnostic.contains("manifest is required"));
+        assert!(diagnostic.len() <= 512);
+    }
+}

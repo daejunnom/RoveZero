@@ -19,8 +19,9 @@ use ort::tensor::TensorElementType;
 use ort::value::{Tensor, ValueType};
 use rz_encoding::classical::{EncodedInput, INPUT_VALUES};
 use rz_encoding::POLICY_SIZE;
-use rz_native_loader::{
-    LibrarySet, LoadError, NativeLoadingProfile, NativeMappingObservation, ProcessLibrarySet,
+use rz_native_loader::{LibrarySet, LoadError, ProcessLibrarySet};
+pub use rz_native_loader::{
+    NativeLoadingProfile, NativeMappingObservation, NVIDIA_LOAD_ORDER, ORT_LIBRARY_NAMES,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
