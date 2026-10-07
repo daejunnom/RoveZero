@@ -386,3 +386,108 @@ warm-start·스케줄 후보도 보존하며, PALS 전체 도입에는 의미 �
 | `runs/pals/own-paired-cpu-06/execution-result.json` | `1a2f9c2cfa11a16b6f4e4746836ad2038b2b4da24945f77709a50361da77dd77` |
 | `runs/pals/own-paired-cpu-06/recovered/attempt-01/match.pgn` | `7b407a18753646b4517eb6ef2c972f6ca52929cc3f6c90bd23b88b531ae9674b` |
 | `runs/pals/model-reference-10/validation.json` | `98b7f745e7a83facbbc2dbc384c093241608022f403e53dbc91c4df8c0ba263b` |
+
+## 2026-10-07 후속 진행 — 현재 라벨과 외부 checker의 탐색 소비
+
+이 절은 앞선 실패·인수 기록을 보존한 추가 상태다. GPU는 사용자 지시에 따라 이번
+세션에서 보류한다. 실제 optimizer 학습은 여전히 제외하며 CPU 검사의 성공을 GPU·
+학습·기력 인수로 바꾸지 않는다. PR #23은 `develop` 대상 Draft로 유지한다.
+
+### 라벨 계보와 실제 소비자
+
+`9c91128`은 선행 라벨의 존재, 같은 immutable input 귀속, 엄격히 증가하는 관측
+sequence와 단일 causal chain을 검증한다. fork·duplicate·missing predecessor·cycle·
+다중 labeled root를 거부하고 원시 행·raw digest·split은 보존한다. 최신 whole label만
+현재 학습 view에 들어간다. 최신 라벨이 policy/value를 mask하면 이전 target을 자동
+병합하거나 되살리지 않는다. unlabeled capture는 labeled chain의 별도 root가 아니다.
+
+Rust/Python의 새 `rz-pals-label/1`과 current view는 확률의 f64 bit 표현을 정규화하여
+같은 식별을 계산한다. 기존 input·raw dataset·split·checkpoint domain은 바꾸지 않는다.
+Private V context는 공개 label seal 밖에서 별도 실제 query·control 검증을 계속한다.
+현재 leaf만 읽어 원시 이력의 변경을 생략하는 입장은 허용하지 않는다.
+
+`5ee8f1c`는 준비 프로그램과 V producer에 이 current view를 연결한다. 모든 원시
+자료의 검증을 유지하면서 현재 input을 한 번만 선택하며, V의 `max_steps`는 raw row
+index가 아닌 선택된 input의 순번에 적용한다. 준비 영수증은 raw count·raw hash와
+current count·view hash를 따로 기록한다. 기존 읽기 경로를 실제 학습 실행으로 표시하지
+않는다. 총괄의 Rust data 검사 25개와 후속 Python 전체 72개가 통과했다. Python 검사는
+CPU fixture·준비·소비 경계이며 optimizer update와 GPU 실행은 0이다.
+
+엄격한 계보 검사를 연결한 뒤 실제 collection producer의 결함도 드러났다. 기존
+OwnedCpu policy와 후속 ActualGame 결과가 같은 input에 각각 predecessor 없는 labeled
+root를 만들었다. 최신 `5ee8f1c` CI의 Linux/Windows 수집기 4개 실패도 이 경계를
+확인했다. CPU bindings와 model CPU job의 성공은 이 실패와 구분한다. 수정 중인
+producer는 실제 append에 성공한 선행 라벨의 digest만 연결하며 저장 실패 후 rows·
+predecessor index를 진행시키지 않는다. 원래 실패 로그는 보존한다. 이 수정의 최종
+검사·커밋·CI는 별도 후속 증거로 기록하며 이 절에서 성공으로 미리 선언하지 않는다.
+
+### 외부 checker와 모델 WDL의 탐색 접점
+
+`86affc1`은 search의 checker 소비와 Native 모델 값 접점을 공유한 WIP다. 외부 보고서의
+cp·mate·bound·reported depth·선택적 탐색·미관측 작업량은 자체 CPU raw score나
+완료 iteration, WDL 또는 Rules 증명으로 변환하지 않는다. raw 보고서와 실제 관측
+작업량, 예약한 node 예산을 독립 보존한다. unknown nodes는 unknown으로 남긴다.
+
+외부 PV를 정확한 Rules 상태·이력으로 재생한 뒤 해당 후보의 frontier를 선택한 모델의
+기존 contextual WDL로 다시 평가한다. `ModelValueIdentity`와 실제 prepared input key를
+검증하고 W/L 관점 반전과 draw 보존을 적용한다. 미검사 방어를 전체 게임의 승패로
+확정하지 않는다. 직접 현재 상태의 Rules terminal과 제한된 경로의 terminal 전파는
+`RulesTerminal`·`RestrictedRulesLine`으로 구분한다. 별도 resolver는 CP 보정·평균·
+unknown의 0점 대체를 수행하지 않는다.
+
+Native 값 조회는 기존 Proposer forward의 shared WDL을 사용한다. 새로운 candidate
+value head·인코딩을 도입하지 않는다. 물리 실행 전에 만든 input key를 실제 반환에서
+전달하고, 조회 완료와 탐색 소비를 구분한다. 뒤늦게 남은 시간 특징을 다시 해시하여
+준비 입력을 바꾸지 않는다. 기존 단일 물리 worker·buffer 소유권·finish fence를 유지한다.
+
+총괄의 마지막 중앙 library 검사에서 search 163개·UCI 135개가 통과했고 두 패키지의
+all-target/all-feature Clippy `-D warnings`도 통과했다. 앞선 컴파일 오류와 fixture 실패를
+보존했다. 검사 수는 각각 해당 실행의 수이며 과거 겹치는 검사를 합쳐 고유 검사 수나
+현재 통합 전체 성공으로 표시하지 않는다.
+
+외부 helper의 제품 CLI·등록 profile·두 owner의 독립 종료·receipt·실제 arena 인수는
+후속 연결이다. `86affc1`의 search 소비 성공이 이 경계의 완료를 뜻하지 않는다. 공개
+foreign WDL 결론 특징, record별 native K/V 소비, 역할별 warm-start, DG01~04·DG06~07의
+남은 학습 준비 계약도 위 전체 목표 감사와 함께 유지한다.
+
+### 후속 중앙 인수 — producer 수정과 제품 checker 수명
+
+`0ee4669`는 실제 collection producer가 같은 input의 후속 label을 저장할 때 마지막
+성공 append의 digest를 predecessor로 연결한다. 서로 다른 label owner를 독립 유지하며,
+실패한 append 뒤 rows·causal index를 진행시키지 않는다. 중앙 collection 검사는 순차
+21개와 네 test thread의 21개가 각각 통과했다. `5ee8f1c`의 네 CI 실패는 보존하며,
+`0ee4669`의 CI run `37631162901`에서 Linux·Windows·CPU bindings·model CPU 네 job이
+모두 성공한 것을 확인했다. 이 결과는 후속 dirty 소스나 다른 SHA의 CI 성공이 아니다.
+
+`af775ad`는 외부 helper의 등록·실제 startup·게임 초기화·유한 종료를 제품 driver와
+CLI에 연결한다. 기본 own 경로의 v1 identity를 보존하고 명시적 external checker에는
+별도 resolver·등록 digest를 사용한다. helper는 unstarted 상태로 구성하며, 모델 준비와
+driver 구성 이후 유한 시계·취소 아래 실제 시작한다. 준비 실패·영수증 저장 실패·대국
+서비스 실패에서는 Native와 helper의 종료를 각각 시도하고 각 원인을 보존한다.
+
+제품 선택은 `--pals-cpu-checker=external-uci`, `--pals-cpu-profile`,
+`--pals-cpu-profile-sha256`로 명시한다. 첫 profile은 내장 NNUE Stockfish의 제한된
+등록 형식이며 파일 SHA·canonical SHA·지원 옵션 검사와 실제 UCI 식별을 구분한다.
+`readyok`나 설정 송신만으로 적용값·학습 이력·모델 로딩을 관측했다고 표시하지 않는다.
+contextual 모델 WDL을 제공하지 않는 mock에 외부 checker를 조용히 연결하지 않는다.
+
+V3 Native 영수증의 선택적 `cpu_checker`는 두 owner의 근거를 분리한다. 시작 전
+실제 cleanup과 시작된 process의 exit·pipe drain을 구별하고, 미관측 값은 null/unknown으로
+남긴다. work 관측이 실패하면 서비스 종료를 성공으로 게시하지 않는다. 외부 cp·mate·
+reported bound가 Native 물리 완료나 Rules 증명을 대신하지 않는다.
+
+소스 pin을 고정한 `rz-search`·`rz-uci` all-target/all-feature 중앙 검사 468개와 Clippy
+`-D warnings`가 통과했다. 앞선 API 접점의 컴파일 실패 로그를 보존했다. 관리 build
+slot은 이 검사 종료 후 정책 상한을 넘은 재생성 산출물만 회수했으며 소스·인수 자료는
+보존했다. 이 회수는 테스트 성공이나 메모리 성능 개선의 대체 근거가 아니다.
+
+`969099e`는 arena의 기존 own V3 소비자가 새 work completeness boolean을 잘못
+u64로 읽는 경계를 수정한다. 해당 필드만 PALS의 bool/null로 읽고 startup의 true·
+CPU 경로 혼입·잘못된 타입은 거부한다. 기존 mandatory numerical counter 조건은
+유지한다. 중앙 `pals_launch` 검사 24개가 통과했다.
+
+위 제품 단위의 CPU 성공과 실제 외부 helper·arena 인수는 구분한다. 기존 own V3의
+raw resolver·자원·Core counter 조건은 외부 profile에 그대로 사용할 수 없다. 명시적
+외부-helper launch 등록, helper 자산 snapshot·합산 자원·종료 영수증, 실제 Stockfish
+실행과 수정 이후 paired 종단 인수는 여전히 후속 작업이다. DG06 metadata 구현도
+live producer·loader·resume 입장과 구분하여 별도 중앙 검사로 인수한다.
