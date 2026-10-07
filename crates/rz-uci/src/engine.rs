@@ -2965,7 +2965,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_move_is_discarded_on_root_game_or_session_replacement() {
+    fn deferred_move_is_discarded_on_root_game_replacement_but_flushed_before_quit() {
         for replacement in ["position startpos moves e2e4", "ucinewgame", "quit"] {
             let (mut owner, mut session) = fixture();
             owner.handle(&mut session, Event::Line("go infinite".into()));
@@ -2980,10 +2980,19 @@ mod tests {
             });
             owner.handle(&mut session, Event::Line("stop".into()));
             assert!(owner.pending_bestmove.is_some());
+            let frozen = owner.pending_bestmove.as_ref().unwrap().line.clone();
             let next = owner.handle(&mut session, Event::Line(replacement.into()));
             assert!(next.accepted);
             assert!(next.protocol.is_empty());
-            assert!(owner.pending_bestmove.is_none());
+            if replacement == "quit" {
+                assert!(!session.is_closed());
+                assert!(owner.pending_bestmove.is_some());
+                assert!(owner.pending_close.is_some());
+                assert!(!next.effects.iter().any(|e| matches!(e, Effect::Shutdown)));
+            } else {
+                assert!(owner.pending_bestmove.is_none());
+                assert!(owner.pending_close.is_none());
+            }
             release.send(()).unwrap();
             let until = Instant::now() + Duration::from_secs(2);
             while !owner.workers[0].is_finished() {
@@ -2999,8 +3008,19 @@ mod tests {
                     },
                 },
             );
-            assert!(stale.protocol.is_empty());
+            if replacement == "quit" {
+                assert_eq!(stale.protocol, [frozen]);
+                assert!(session.is_closed());
+                assert!(stale.effects.iter().any(|e| matches!(e, Effect::Shutdown)));
+                assert!(owner.pending_bestmove.is_none());
+                assert!(owner.pending_close.is_none());
+                assert!(owner.fence_failure.is_none());
+            } else {
+                assert!(stale.protocol.is_empty());
+                assert!(!session.is_closed());
+            }
             owner.reap().unwrap();
+            assert!(owner.workers.is_empty());
         }
     }
 
