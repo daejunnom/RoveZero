@@ -556,28 +556,21 @@ def encoded_from_sidecar(sidecar, record, *, expected_encoder_source_sha256, exp
     return result
 
 
-def load_collected_dataset(directory, *, expected_receipt_sha256, expected_encoder_source_sha256,
-                           max_input_bytes=64 * 1024 * 1024):
-    """Read only fixed collector filenames after independent receipt admission.
+class _CollectionArtifactReader:
+    """One aggregate budget for stable regular-file reads, including registrations."""
 
-    Every consumed JSONL file is byte/digest checked before parsing. A failed or
-    incomplete collection never becomes an admitted training dataset. This only
-    loads data; it neither collects games nor updates an optimizer.
-    """
-    _sha(expected_receipt_sha256)
-    _sha(expected_encoder_source_sha256)
-    if _uint(max_input_bytes, 1024 * 1024 * 1024) == 0:
-        raise ValueError("finite collection input byte limit required")
-    directory = Path(directory).expanduser().resolve()
-    consumed = 0
-    def read(name, asset=None):
-        nonlocal consumed
-        path = directory / name
+    def __init__(self, maximum):
+        if _uint(maximum, 1024 * 1024 * 1024) == 0:
+            raise ValueError("finite collection input byte limit required")
+        self.maximum, self.consumed = maximum, 0
+
+    def read(self, path, asset=None, *, maximum=None):
+        path = Path(path)
         before = path.lstat()
         if not stat.S_ISREG(before.st_mode):
             raise ValueError("collection file must be a regular file")
-        remaining = max_input_bytes - consumed
-        if before.st_size > remaining:
+        remaining = self.maximum - self.consumed
+        if before.st_size > remaining or (maximum is not None and before.st_size > maximum):
             raise ValueError("collection input allocation budget exceeded")
         def identity(metadata):
             return (metadata.st_dev, metadata.st_ino, metadata.st_size,
@@ -607,12 +600,30 @@ def load_collected_dataset(directory, *, expected_receipt_sha256, expected_encod
                 or not stat.S_ISREG(after.st_mode) or not stat.S_ISREG(final.st_mode)
                 or identity(after) != identity(before) or identity(final) != identity(before)):
             raise ValueError("collection file changed or exceeded allocation budget")
-        consumed += len(data)
+        self.consumed += len(data)
         if asset is not None:
             asset = _fields(asset, ("sha256", "bytes"), "collection artifact")
             if _uint(asset["bytes"]) != len(data) or _sha(asset["sha256"]) != hashlib.sha256(data).hexdigest():
                 raise ValueError("collection artifact byte identity mismatch")
         return data
+
+
+def load_collected_dataset(directory, *, expected_receipt_sha256, expected_encoder_source_sha256,
+                           max_input_bytes=64 * 1024 * 1024):
+    """Read only fixed collector filenames after independent receipt admission.
+
+    Every consumed JSONL file is byte/digest checked before parsing. A failed or
+    incomplete collection never becomes an admitted training dataset. This only
+    loads data; it neither collects games nor updates an optimizer.
+    """
+    _sha(expected_receipt_sha256)
+    _sha(expected_encoder_source_sha256)
+    directory = Path(directory).expanduser().resolve()
+    reader = _CollectionArtifactReader(max_input_bytes)
+
+    def read(name, asset=None):
+        return reader.read(directory / name, asset)
+
     receipt_bytes = read("receipt.json")
     if hashlib.sha256(receipt_bytes).hexdigest() != expected_receipt_sha256:
         raise ValueError("collection receipt differs from independently registered digest")
@@ -668,6 +679,352 @@ def load_collected_dataset(directory, *, expected_receipt_sha256, expected_encod
     return result
 
 
+FROZEN_ADMISSION_DOMAIN = "rz-pals-frozen-collected-admission/1"
+PRODUCER_REGISTRATION_DOMAIN = "rz-pals-collector-producer-registration/1"
+CHECKED_SOURCE_DOMAIN = "rz-pals-collector-checked-source/1"
+PREPARED_PRODUCER_DOMAIN = "rz-pals-collector-prepared-producer/1"
+
+
+def _collection_jsonl(raw, *, max_rows=65536):
+    if not raw.endswith(b"\n"):
+        raise ValueError("complete exact JSONL newline required")
+    lines = raw.split(b"\n")[:-1]
+    if not 1 <= len(lines) <= max_rows or any(not line or len(line) > 2 * 1024 * 1024 for line in lines):
+        raise ValueError("collection JSONL record/line bound")
+    return [(line, _unique_json(line.decode("utf-8"))) for line in lines]
+
+
+def _byte_pin(raw):
+    return {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def _epoch_hex(value):
+    if not isinstance(value, list) or len(value) != 32:
+        raise ValueError("checked native epoch shape")
+    for byte in value:
+        _uint(byte, 255)
+    return bytes(value).hex()
+
+
+def _checked_producer_source(raw, registration, pin):
+    """Inspect actual independently pinned driver facts, never infer a teacher."""
+    value = _unique_json(raw.decode("utf-8"))
+    if not isinstance(value, list) or len(value) != 2 or value[0] != CHECKED_SOURCE_DOMAIN:
+        raise ValueError("actual checked producer source artifact required")
+    source = value[1]
+    names = ("mode", "source", "cpu_profile_sha256", "implementation_sha256", "encoding_sha256",
+             "encoder_source_sha256", "configuration", "model_epoch", "model_epoch_kind", "frozen_epoch")
+    if not isinstance(source, dict) or not set(names) <= set(source) or set(source) - set(names) - {"native"}:
+        raise ValueError("checked producer source facts fields")
+    policy = pin["encoding_policy"]
+    if policy["kind"] != "native_exact":
+        raise ValueError("private producer requires an explicit checked derived adapter")
+    if (source["source"] != pin["source"] or source["frozen_epoch"] != pin["frozen_epoch"]
+            or source["encoding_sha256"] != policy["encoding_sha256"]
+            or source["encoder_source_sha256"] != policy["encoder_source_sha256"]
+            or _byte_pin(raw)["sha256"] != registration["checked_source_sha256"]):
+        raise ValueError("actual checked source differs from independent producer pin")
+    _identity(source["mode"])
+    for name in ("cpu_profile_sha256", "implementation_sha256", "encoding_sha256", "encoder_source_sha256"):
+        _sha(source[name])
+    _uint(source["frozen_epoch"])
+    if not isinstance(source["configuration"], dict):
+        raise ValueError("actual producer configuration required")
+    epoch = _epoch_hex(source["model_epoch"])
+    if pin["source"]["kind"] == "own_cpu":
+        identity = source["configuration"].get("value_identity")
+        if (source["implementation_sha256"] != pin["source"]["cpu_binary_sha256"]
+                or source["cpu_profile_sha256"] != pin["source"]["evaluator_configuration_sha256"]
+                or not isinstance(identity, dict)
+                or identity.get("weights_sha256") != pin["source"]["model_weights_sha256"]
+                or not isinstance(identity.get("training"), dict) or not isinstance(identity.get("semantics"), str)
+                or epoch != "0" * 64 or source["model_epoch_kind"] != "encoding_only_zero"
+                or source["frozen_epoch"] != 0 or source.get("native") is not None):
+            raise ValueError("actual CPU evaluator/binary/encoding-only source mismatch")
+    else:
+        native = source.get("native")
+        if not isinstance(native, dict):
+            raise ValueError("actual loaded native source facts required")
+        registry, loaded = native.get("independent_registry"), native.get("loaded_source")
+        if not isinstance(registry, dict) or not isinstance(loaded, dict) or not isinstance(loaded.get("execution"), dict):
+            raise ValueError("native independent registry/loaded constructor facts required")
+        execution = loaded["execution"]
+        if (registry.get("version") != "rz-pals-native-collection-registry/1"
+                or registry.get("training_state") != "untrained" or loaded.get("trained") is not False
+                or native.get("training_state") != "Untrained" or native.get("actual_training_executed") is not False
+                or native.get("precision") != "fp32" or execution.get("provider") != "cpu"
+                or source["implementation_sha256"] != registry.get("collector_binary_sha256")
+                or pin["source"]["model_weights_sha256"] != registry.get("checkpoint_sha256")
+                or epoch != pin["source"]["model_weights_sha256"]
+                or epoch != policy["native_model_epoch"].get("sha256")
+                or epoch != _epoch_hex(loaded.get("checkpoint_sha256"))
+                or source["model_epoch_kind"] != "frozen_model_epoch" or source["frozen_epoch"] == 0
+                or source["frozen_epoch"] != loaded.get("frozen_epoch") or source["frozen_epoch"] != registry.get("frozen_epoch")
+                or pin["source"]["model_configuration_sha256"] != registry.get("model_configuration_sha256")
+                or source["configuration"] != registry.get("model_configuration")
+                or source["configuration"] != loaded.get("model_configuration")
+                or source["encoding_sha256"] != registry.get("encoding_sha256")
+                or source["encoder_source_sha256"] != registry.get("encoder_source_sha256")
+                or registry.get("export_manifest_sha256") != _epoch_hex(loaded.get("export_manifest_sha256"))
+                or registry.get("runtime_sha256") != _epoch_hex(execution.get("runtime_sha256"))
+                or registry.get("provider") != execution.get("provider") or native.get("provider") != execution.get("provider")):
+            raise ValueError("actual native checkpoint/epoch/encoder/runtime source mismatch")
+        declared_graphs, loaded_graphs = registry.get("graphs"), native.get("graphs")
+        if not isinstance(declared_graphs, list) or not 1 <= len(declared_graphs) <= 4 or not isinstance(loaded_graphs, list):
+            raise ValueError("actual native graph inventory required")
+        def graph_key(graph):
+            _fields(graph, ("role", "sha256", "serialized_bytes"), "native graph source")
+            _identity(graph["role"])
+            if _uint(graph["serialized_bytes"], 256 * 1024 * 1024) == 0:
+                raise ValueError("actual native graph bytes required")
+            return graph["role"], _sha(graph["sha256"]), graph["serialized_bytes"]
+        expected = sorted(graph_key(graph) for graph in declared_graphs)
+        actual = sorted(graph_key(graph) for graph in loaded_graphs)
+        if len({key[0] for key in expected}) != len(expected) or actual != expected:
+            raise ValueError("actual loaded graph identities differ from registry")
+    return source
+
+
+def load_frozen_collected_dataset(directory, *, expected_receipt_sha256, producer_registrations,
+                                  max_input_bytes=64 * 1024 * 1024):
+    """Strict CPU preparation admission; a missing/failed artifact never retries legacy.
+
+    Each independent entry supplies ``pin`` (the complete game/producer roster
+    declaration), ``registration_path`` (prior registered bytes), and
+    ``checked_source_path`` (actual checked driver facts). The registration file
+    bytes SHA is the pin's registration_sha256. The owner's independent receipt
+    pin must come from the completed collector/audit, not this loader's output.
+    Native callbacks and raw row bytes are checked in addition to metadata.
+    Private derived encodings require a separate adapter and are refused here.
+    """
+    from . import frozen_producer as metadata
+
+    _sha(expected_receipt_sha256)
+    directory = Path(directory).expanduser().resolve()
+    reader = _CollectionArtifactReader(max_input_bytes)
+    cache = {}
+
+    def read(path, asset=None, maximum=None):
+        path = Path(path).expanduser().absolute()
+        key = str(path)
+        if key not in cache:
+            cache[key] = reader.read(path, asset, maximum=maximum)
+        raw = cache[key]
+        if maximum is not None and len(raw) > maximum:
+            raise ValueError("frozen artifact byte extent")
+        if asset is not None and _fields(asset, ("bytes", "sha256"), "frozen artifact") != _byte_pin(raw):
+            raise ValueError("frozen artifact differs from actual byte pin")
+        return raw
+
+    receipt_bytes = read(directory / "receipt.json", maximum=metadata.MAX_MANIFEST_BYTES)
+    if _byte_pin(receipt_bytes)["sha256"] != expected_receipt_sha256:
+        raise ValueError("frozen collection receipt differs from independent pin")
+    receipt = _unique_json(receipt_bytes.decode("utf-8"))
+    if (not isinstance(receipt, dict) or receipt.get("version") != "rz-pals-own-collector/1"
+            or receipt.get("complete") is not True or receipt.get("failure") is not None
+            or receipt.get("actual_training_executed") is not False or receipt.get("external_teacher_used") is not False
+            or not isinstance(receipt.get("audit"), dict) or not isinstance(receipt.get("artifacts"), dict)):
+        raise ValueError("strict frozen collection requires a completed owned raw audit")
+    required = ("records.jsonl", "native-inputs.jsonl", "source-registry.jsonl", "split.jsonl",
+                "inputs.jsonl", "input-lineage.jsonl", "producer-registration.json", "producer-source.json",
+                "producer-roster.json", "producer-captures.json", "producer-envelope.json", "producer-audit.json",
+                "producer-prepared.jsonl")
+    artifacts, raw_files = receipt["artifacts"], {}
+    for name in required:
+        if name not in artifacts:
+            raise ValueError("strict collection missing required producer artifact: " + name)
+        cap = metadata.MAX_MANIFEST_BYTES if name.endswith(".json") else max_input_bytes
+        raw_files[name] = read(directory / name, artifacts[name], cap)
+    roster = metadata.load_roster(raw_files["producer-roster.json"])
+    capture = metadata.load_capture(raw_files["producer-captures.json"])
+    envelope = metadata.load_envelope(raw_files["producer-envelope.json"])
+    if not isinstance(producer_registrations, (list, tuple)) or not 1 <= len(producer_registrations) <= 65536:
+        raise ValueError("independent actual producer registrations required")
+    supplied, sources, source_digests, registration_assets = [], {}, {}, []
+    for entry in producer_registrations:
+        _fields(entry, ("pin", "registration_path", "checked_source_path"), "independent producer registration")
+        pin = metadata.normalize_roster({"version": metadata.ROSTER_DOMAIN, "game_producers": [entry["pin"]]})["game_producers"][0]
+        if pin["encoding_policy"]["kind"] != "native_exact":
+            raise ValueError("private producer requires an explicit checked derived adapter")
+        registration_bytes = read(entry["registration_path"], maximum=metadata.MAX_MANIFEST_BYTES)
+        if _byte_pin(registration_bytes)["sha256"] != pin["registration_sha256"]:
+            raise ValueError("actual producer registration bytes differ from owner pin")
+        registration = _fields(_unique_json(registration_bytes.decode("utf-8")),
+                               ("version", "producer_id", "source", "frozen_epoch", "encoding_policy", "checked_source_sha256"),
+                               "actual producer registration")
+        _identity(registration["producer_id"])
+        _uint(registration["frozen_epoch"])
+        if registration["version"] != PRODUCER_REGISTRATION_DOMAIN or any(registration[name] != pin[name] for name in ("producer_id", "source", "frozen_epoch", "encoding_policy")):
+            raise ValueError("actual prior registration differs from independent game producer")
+        _sha(registration["checked_source_sha256"])
+        checked_bytes = read(entry["checked_source_path"], maximum=metadata.MAX_MANIFEST_BYTES)
+        checked = _checked_producer_source(checked_bytes, registration, pin)
+        key = pin["game_id"], pin["producer_id"]
+        if key in sources:
+            raise ValueError("duplicate independent game producer registration")
+        supplied.append(pin)
+        sources[key] = checked
+        source_digests[key] = _byte_pin(checked_bytes)["sha256"]
+        registration_assets.append({"pin": pin, "registration": _byte_pin(registration_bytes), "checked_source": _byte_pin(checked_bytes)})
+    declarations = roster["roster"]["game_producers"]
+    if metadata.normalize_roster({"version": metadata.ROSTER_DOMAIN, "game_producers": supplied})["game_producers"] != declarations:
+        raise ValueError("actual required producer roster differs from independent registration set")
+    own_registration_sha = _byte_pin(raw_files["producer-registration.json"])["sha256"]
+    own_source_sha = _byte_pin(raw_files["producer-source.json"])["sha256"]
+    if not any(asset["registration"]["sha256"] == own_registration_sha and asset["checked_source"]["sha256"] == own_source_sha for asset in registration_assets):
+        raise ValueError("collector's actual registration/source bytes lack independent authority")
+    own_description = _unique_json(raw_files["producer-source.json"].decode("utf-8"))[1]
+    if receipt.get("source") != own_description:
+        raise ValueError("receipt source differs from actual checked collector source bytes")
+    parsed = {name: _collection_jsonl(raw_files[name], max_rows=65536 * 8 if name in ("input-lineage.jsonl", "producer-prepared.jsonl") else 65536)
+              for name in ("records.jsonl", "native-inputs.jsonl", "source-registry.jsonl", "split.jsonl", "inputs.jsonl", "input-lineage.jsonl", "producer-prepared.jsonl")}
+    if len(parsed["source-registry.jsonl"]) != 1 or len(parsed["split.jsonl"]) != 1:
+        raise ValueError("one actual source registry and split required")
+    rows = [value for _, value in parsed["records.jsonl"]]
+    registry, split = parsed["source-registry.jsonl"][0][1], parsed["split.jsonl"][0][1]
+    result = ValidatedDataset(rows, split, registry, {})
+    audit = metadata.audit_metadata(roster_bytes=raw_files["producer-roster.json"],
+                                    envelope_bytes=raw_files["producer-envelope.json"], capture_bytes=raw_files["producer-captures.json"],
+                                    independently_registered=supplied, source_registry_bytes=raw_files["source-registry.jsonl"],
+                                    raw_receipt_bytes=receipt_bytes, records_bytes=raw_files["records.jsonl"],
+                                    expected_raw_receipt_sha256=expected_receipt_sha256,
+                                    checked_current_view_sha256=result.current_view.sha256, max_input_bytes=max_input_bytes)
+    if audit["requires_derived_adapter"]:
+        raise ValueError("metadata acceptance requires an explicit checked derived adapter")
+    actual_audit = _fields(_unique_json(raw_files["producer-audit.json"].decode("utf-8")),
+                           ("scope", "raw_records", "unique_inputs", "roster_sha256", "envelope_sha256", "capture_sha256",
+                            "native_exact_metadata_inputs", "requires_derived_adapter"), "actual producer audit")
+    for name in ("raw_records", "unique_inputs", "native_exact_metadata_inputs"):
+        _uint(actual_audit[name], 65536)
+    for name in ("roster_sha256", "envelope_sha256", "capture_sha256"):
+        _sha(actual_audit[name])
+    if actual_audit != audit:
+        raise ValueError("actual producer audit differs from checked whole-history metadata")
+    bindings = {value["input_sha256"]: value for value in capture["capture"]["bindings"]}
+    pins = {(pin["game_id"], pin["producer_id"]): pin for pin in declarations}
+    frozen = {row["input"]["sha256"]: row for row in rows}
+    actual_game_values = {row["input"]["sha256"] for row in rows if row["future_label"] is not None
+                          and row["future_label"]["provenance"].get("source") == "actual_game"
+                          and row["future_label"]["value_wdl"] is not None}
+    journals = {}
+    for _, journal in parsed["producer-prepared.jsonl"]:
+        _fields(journal, ("prepared", "sha256"), "actual prepared producer evidence")
+        body = _fields(journal["prepared"], ("version", "producer_id", "registration_sha256", "roster_sha256", "checked_source_sha256", "game_id", "input_sha256", "capture_sequence", "input_json", "tensor_sidecar_json", "lineage_json", "native_request", "learning_input", "publication"), "prepared producer evidence")
+        if body["version"] != PREPARED_PRODUCER_DOMAIN or _sha(journal["sha256"]) != _sorted_canonical(PREPARED_PRODUCER_DOMAIN, body):
+            raise ValueError("actual prepared evidence seal mismatch")
+        for name in ("producer_id", "game_id"):
+            _identity(body[name])
+        for name in ("registration_sha256", "roster_sha256", "checked_source_sha256"):
+            _sha(body[name])
+        _uint(body["capture_sequence"])
+        _sha(body["input_sha256"])
+        for name in ("input_json", "tensor_sidecar_json", "lineage_json"):
+            asset = _fields(body[name], ("bytes", "sha256"), "prepared exact row bytes")
+            if _uint(asset["bytes"], 2 * 1024 * 1024) == 0:
+                raise ValueError("empty prepared exact row evidence")
+            _sha(asset["sha256"])
+        if type(body["learning_input"]) is not bool:
+            raise ValueError("prepared learning admission flag")
+        if body["publication"] not in ("append-before-analysis; sync-at-receipt-close", "seal-before-submit; prepaid-drain-after-search"):
+            raise ValueError("prepared publication contract")
+        if body["native_request"] is not None:
+            if not isinstance(body["native_request"], list) or len(body["native_request"]) != 2:
+                raise ValueError("prepared native request shape")
+            for item in body["native_request"]:
+                _uint(item)
+        if journal["sha256"] in journals:
+            raise ValueError("duplicate actual prepared evidence")
+        journals[journal["sha256"]] = body
+    def exact_rows(name, identity_name):
+        result = {}
+        for line, value in parsed[name]:
+            identity = value.get(identity_name) if isinstance(value, dict) else None
+            _sha(identity)
+            result.setdefault(identity, []).append((_byte_pin(line), value))
+        return result
+    actual_inputs = exact_rows("inputs.jsonl", "sha256")
+    actual_sidecars = exact_rows("native-inputs.jsonl", "input_sha256")
+    actual_lineage = exact_rows("input-lineage.jsonl", "input_sha256")
+    native_events = None
+    encodings, admitted_inputs = {}, []
+    for identity, binding in bindings.items():
+        row = frozen[identity]
+        pin = pins[(binding["game_id"], binding["producer_id"])]
+        prepared = journals.get(binding["capture_evidence_sha256"])
+        if prepared is None or prepared["learning_input"] is not True:
+            raise ValueError("missing actual learning-input prepared evidence")
+        if (prepared["input_sha256"] != identity or prepared["game_id"] != binding["game_id"]
+                or prepared["producer_id"] != binding["producer_id"] or prepared["capture_sequence"] != binding["capture_sequence"]
+                or prepared["registration_sha256"] != pin["registration_sha256"] or prepared["roster_sha256"] != roster["sha256"]
+                or prepared["checked_source_sha256"] != source_digests[(binding["game_id"], binding["producer_id"])]):
+            raise ValueError("actual capture journal producer/input/source attribution mismatch")
+        def matching(name, pin_name, candidates):
+            matches = [value for asset, value in candidates.get(identity, []) if asset == prepared[pin_name]]
+            if len(matches) != 1:
+                raise ValueError("prepared evidence lacks exact actual " + name + " row bytes")
+            return matches[0]
+        actual_input = matching("input", "input_json", actual_inputs)
+        sidecar = matching("tensor sidecar", "tensor_sidecar_json", actual_sidecars)
+        lineage = matching("lineage", "lineage_json", actual_lineage)
+        if actual_input != row["input"] or lineage.get("game_id") != binding["game_id"] or lineage.get("actual_played_history") != row["input"]["snapshot"]["actual_history"]:
+            raise ValueError("actual prepared input/lineage differs from admitted historical input")
+        if type(lineage.get("actual_outcome_eligible")) is not bool:
+            raise ValueError("actual lineage outcome eligibility must be explicit")
+        if identity in actual_game_values and not lineage["actual_outcome_eligible"]:
+            raise ValueError("counterfactual input cannot consume actual-game WDL")
+        request = prepared["native_request"]
+        if pin["source"]["kind"] == "own_cpu":
+            if request is not None or prepared["publication"] != "append-before-analysis; sync-at-receipt-close":
+                raise ValueError("CPU capture claims an unsupported native request/publication")
+        else:
+            if not isinstance(request, list) or len(request) != 2 or prepared["publication"] != "seal-before-submit; prepaid-drain-after-search":
+                raise ValueError("native prepared request evidence required")
+            for item in request:
+                _uint(item)
+            if lineage.get("process_epoch") != request[0] or lineage.get("request_sequence") != request[1]:
+                raise ValueError("native prepared lineage request mismatch")
+            _uint(lineage["process_epoch"])
+            _uint(lineage["request_sequence"])
+            if native_events is None:
+                if "native-events.jsonl" not in artifacts:
+                    raise ValueError("native prepared evidence lacks actual observer events")
+                event_bytes = read(directory / "native-events.jsonl", artifacts["native-events.jsonl"])
+                raw_files["native-events.jsonl"] = event_bytes
+                native_events = {}
+                for _, event in _collection_jsonl(event_bytes, max_rows=65536 * 8):
+                    if not isinstance(event, dict) or event.get("domain") != "rz-pals-native-call-event/1":
+                        raise ValueError("actual prepared observer event domain")
+                    _uint(event.get("process_epoch"))
+                    _uint(event.get("request_sequence"))
+                    _sha(event.get("input_sha256"))
+                    _identity(event.get("game_id"))
+                    _identity(event.get("stage"))
+                    if event["stage"] == "prepared":
+                        key = event["game_id"], event["input_sha256"], event["process_epoch"], event["request_sequence"]
+                        native_events[key] = native_events.get(key, 0) + 1
+            if native_events.get((binding["game_id"], identity, request[0], request[1])) != 1:
+                raise ValueError("native request lacks one actual prepared observer event")
+        policy = pin["encoding_policy"]
+        expected_epoch = policy["native_model_epoch"].get("sha256")
+        if sidecar.get("model_epoch_kind") != policy["native_model_epoch"]["kind"]:
+            raise ValueError("sidecar epoch kind differs from input's actual producer")
+        encoding = encoded_from_sidecar(sidecar, row, expected_encoder_source_sha256=policy["encoder_source_sha256"], expected_model_epoch=expected_epoch)
+        encodings[identity] = encoding
+        admitted_inputs.append({"binding": binding, "producer": pin, "prepared_evidence_sha256": binding["capture_evidence_sha256"]})
+    if set(encodings) != set(frozen):
+        raise ValueError("strict frozen collection lacks per-input producer encoding")
+    result._attach_encodings(encodings)
+    result.collection_receipt = copy.deepcopy(receipt)
+    result._attach_frozen_admission({"version": FROZEN_ADMISSION_DOMAIN, "receipt": _byte_pin(receipt_bytes),
+                                     "artifacts": {name: _byte_pin(raw) for name, raw in raw_files.items()},
+                                     "producer_registrations": registration_assets, "inputs": admitted_inputs,
+                                     "metadata_audit": audit, "owned_sources": registry,
+                                     "raw_dataset_sha256": envelope["envelope"]["raw_dataset_sha256"],
+                                     "split_sha256": envelope["envelope"]["split_sha256"],
+                                     "current_view_sha256": result.current_view.sha256})
+    return result
+
+
 @dataclass(frozen=True)
 class TrainingBatch:
     role: str
@@ -716,6 +1073,8 @@ class ValidatedDataset:
         if set(split) != present:
             raise ValueError("split includes an unobserved game")
         self.records, self.split = copy.deepcopy(records), dict(split)
+        self.owned_sources = copy.deepcopy(authority)
+        self.frozen_admission, self._frozen_admission_identity = None, None
         self._row_identities = tuple(_canonical("rz-pals-python-immutable-row/1", row) for row in self.records)
         self._split_identity = _canonical("rz-pals-python-immutable-split/1", self.split)
         self._current_view = current_label_view(self.records)
@@ -733,8 +1092,46 @@ class ValidatedDataset:
             raise ValueError("immutable raw dataset history changed after admission")
         if _canonical("rz-pals-python-immutable-split/1", self.split) != self._split_identity:
             raise ValueError("immutable dataset split changed after admission")
+        self._verify_frozen_admission()
+
+    def _attach_frozen_admission(self, admission):
+        if self._frozen_admission_identity is not None:
+            raise ValueError("checked frozen admission cannot be replaced")
+        self.frozen_admission = copy.deepcopy(admission)
+        self.frozen_admission["encoding_identities_sha256"] = _sorted_canonical(
+            "rz-pals-checked-native-encodings/1", self._encoding_identities)
+        self._frozen_admission_identity = _sorted_canonical(FROZEN_ADMISSION_DOMAIN, self.frozen_admission)
+        self._frozen_receipt_identity = _canonical("rz-pals-frozen-receipt-view/1", self.collection_receipt)
+        self._verify_frozen_admission()
+
+    def _verify_frozen_admission(self):
+        if self._frozen_admission_identity is None:
+            if self.frozen_admission is not None:
+                raise ValueError("unchecked metadata cannot enroll a frozen dataset")
+            return
+        if (not isinstance(self.frozen_admission, dict)
+                or _sorted_canonical(FROZEN_ADMISSION_DOMAIN, self.frozen_admission) != self._frozen_admission_identity):
+            raise ValueError("checked frozen admission identity changed")
+        if self.owned_sources != self.frozen_admission["owned_sources"]:
+            raise ValueError("checked producer source authority changed")
+        view = current_label_view(self.records)
+        if (view != self._current_view or frozenset(view.current_indices) != self._current_indices
+                or view.sha256 != self.frozen_admission["current_view_sha256"]):
+            raise ValueError("checked frozen current label view changed")
+        if _canonical("rz-pals-frozen-receipt-view/1", self.collection_receipt) != self._frozen_receipt_identity:
+            raise ValueError("checked frozen receipt provenance changed")
+        if (_sorted_canonical("rz-pals-checked-native-encodings/1", self._encoding_identities)
+                != self.frozen_admission["encoding_identities_sha256"]):
+            raise ValueError("checked frozen encoding admission changed")
+        if set(self.encodings) != set(self._encoding_identities) or any(
+                not isinstance(value, EncodedSnapshot)
+                or _canonical("rz-pals-python-immutable-encoding/1", asdict(value)) != self._encoding_identities.get(key)
+                for key, value in self.encodings.items()):
+            raise ValueError("checked frozen per-input encoding changed")
 
     def _attach_encodings(self, encodings):
+        if self._frozen_admission_identity is not None:
+            raise ValueError("checked frozen encodings cannot be replaced")
         self.encodings = copy.deepcopy(dict(encodings))
         self._encoding_identities = {}
         for key, value in self.encodings.items():

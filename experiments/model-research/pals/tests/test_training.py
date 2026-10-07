@@ -22,7 +22,8 @@ from rz_pals_model.config import ModelConfig, TASKS
 from rz_pals_model.training import (BudgetLedger, DivergenceContext, EncodedSnapshot, ResumableSampler,
                                    TaskContext, ValidatedDataset, _fen_board, _canonical, capture_rng,
                                    _label_digest_value, _private_fp32_bits, current_label_view, label_digest,
-                                   encoded_from_sidecar, load_collected_dataset, load_preparation_checkpoint, masked_losses,
+                                   encoded_from_sidecar, load_collected_dataset, load_frozen_collected_dataset,
+                                   load_preparation_checkpoint, masked_losses,
                                    prepare_adamw, restore_rng, save_preparation_checkpoint, seal_snapshot,
                                    validate_recipe)
 
@@ -122,6 +123,188 @@ def write_fixture_collection(directory, row, sidecar, *, version="rz-pals-own-co
     data = json.dumps(receipt).encode()
     (Path(directory) / "receipt.json").write_bytes(data)
     return hashlib.sha256(data).hexdigest()
+
+
+def frozen_fixture_bytes(value):
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+
+
+def write_frozen_fixture_collection(directory, *, kinds=("cpu",)):
+    """Synthetic DG06 artifact contracts; no collected/loaded runtime claim."""
+    from rz_pals_model import frozen_producer as metadata
+    root = Path(directory)
+    rows, sidecars, inputs, lineage, journals, pins, registrations, descriptions, events = [], [], [], [], [], [], [], [], []
+    for index, kind in enumerate(kinds):
+        producer_id = "fixture-producer-" + str(index)
+        row = fixture(game="frozen-fixture-game")
+        source = copy.deepcopy(SOURCE)
+        epoch, frozen_epoch, native = [0] * 32, 0, None
+        configuration = {"value_identity": {"semantics": "bootstrap-material-pst-v1", "weights_sha256": None,
+                                             "training": {"kind": "bootstrap"}}}
+        if kind == "native":
+            weights, config_sha = sha("fixture-native-weights-" + str(index)), sha("fixture-native-config-" + str(index))
+            source = {"kind": "own_pals", "model_configuration_sha256": config_sha, "model_weights_sha256": weights}
+            epoch, frozen_epoch, configuration = list(bytes.fromhex(weights)), index + 1, {"fixture_model": index + 1}
+            graph = {"role": "proposer", "sha256": sha("fixture-graph-" + str(index)), "serialized_bytes": 32}
+            export_sha, runtime_sha = sha("fixture-export-" + str(index)), sha("fixture-runtime-" + str(index))
+            native_registry = {"version": "rz-pals-native-collection-registry/1", "collector_binary_sha256": CPU,
+                               "model_configuration": configuration, "model_configuration_sha256": config_sha,
+                               "checkpoint_sha256": weights, "export_manifest_sha256": export_sha,
+                               "graphs": [graph], "runtime_sha256": runtime_sha,
+                               "encoding_sha256": row["input"]["snapshot"]["encoding_sha256"],
+                               "encoder_source_sha256": sha("fixture-encoder-source"), "frozen_epoch": frozen_epoch,
+                               "provider": "cpu", "training_state": "untrained"}
+            native = {"independent_registry": native_registry,
+                      "loaded_source": {"checkpoint_sha256": epoch, "frozen_epoch": frozen_epoch,
+                                        "export_manifest_sha256": list(bytes.fromhex(export_sha)),
+                                        "model_configuration": configuration, "trained": False,
+                                        "execution": {"runtime_sha256": list(bytes.fromhex(runtime_sha)), "provider": "cpu"}},
+                      "graphs": [graph], "provider": "cpu", "precision": "fp32", "training_state": "Untrained",
+                      "actual_training_executed": False}
+        row["input"]["snapshot"].update(source=source, frozen_epoch=frozen_epoch)
+        row["input"]["sha256"] = seal_snapshot(row["input"]["snapshot"])
+        description = {"mode": "fixture-" + kind, "source": source, "cpu_profile_sha256": SOURCE["evaluator_configuration_sha256"],
+                       "implementation_sha256": CPU, "encoding_sha256": row["input"]["snapshot"]["encoding_sha256"],
+                       "encoder_source_sha256": sha("fixture-encoder-source"), "configuration": configuration,
+                       "model_epoch": epoch, "model_epoch_kind": "frozen_model_epoch" if kind == "native" else "encoding_only_zero",
+                       "frozen_epoch": frozen_epoch}
+        if native is not None:
+            description["native"] = native
+        checked_bytes = frozen_fixture_bytes(["rz-pals-collector-checked-source/1", description])
+        policy = {"kind": "native_exact", "encoding_sha256": description["encoding_sha256"],
+                  "encoder_source_sha256": description["encoder_source_sha256"],
+                  "native_model_epoch": {"kind": description["model_epoch_kind"]}}
+        if kind == "native":
+            policy["native_model_epoch"]["sha256"] = source["model_weights_sha256"]
+        registration = {"version": "rz-pals-collector-producer-registration/1", "producer_id": producer_id,
+                        "source": source, "frozen_epoch": frozen_epoch, "encoding_policy": policy,
+                        "checked_source_sha256": hashlib.sha256(checked_bytes).hexdigest()}
+        registration_bytes = frozen_fixture_bytes(registration)
+        pin = {"game_id": row["input"]["snapshot"]["game_id"], "producer_id": producer_id,
+               "registration_sha256": hashlib.sha256(registration_bytes).hexdigest(),
+               "source": source, "frozen_epoch": frozen_epoch, "encoding_policy": policy}
+        registration_path = root / ("producer-registration.json" if index == 0 else "fixture-registration-" + str(index) + ".json")
+        checked_path = root / ("producer-source.json" if index == 0 else "fixture-source-" + str(index) + ".json")
+        registration_path.write_bytes(registration_bytes)
+        checked_path.write_bytes(checked_bytes)
+        registrations.append({"pin": pin, "registration_path": registration_path, "checked_source_path": checked_path})
+        descriptions.append(description)
+        pins.append(pin)
+        rows.append(row)
+        sidecar = native_sidecar(row)
+        if kind == "native":
+            tensor = json.loads(sidecar["tensor_json"])
+            tensor["model_epoch"] = epoch
+            sidecar.update(model_epoch_kind="frozen_model_epoch", tensor_json=json.dumps(tensor, separators=(",", ":")))
+            reseal_sidecar(sidecar)
+        sidecars.append(sidecar)
+        inputs.append(row["input"])
+        branch = {"input_sha256": row["input"]["sha256"], "game_id": pin["game_id"],
+                  "actual_played_history": row["input"]["snapshot"]["actual_history"], "actual_outcome_eligible": True}
+        request = [1, index + 1] if kind == "native" else None
+        if request is not None:
+            branch.update(process_epoch=request[0], request_sequence=request[1])
+            events.append({"domain": "rz-pals-native-call-event/1", "game_id": pin["game_id"],
+                           "input_sha256": row["input"]["sha256"], "process_epoch": request[0],
+                           "request_sequence": request[1], "stage": "prepared"})
+        lineage.append(branch)
+        body = {"version": "rz-pals-collector-prepared-producer/1", "producer_id": producer_id,
+                "registration_sha256": pin["registration_sha256"], "roster_sha256": "",
+                "checked_source_sha256": registration["checked_source_sha256"], "game_id": pin["game_id"],
+                "input_sha256": row["input"]["sha256"], "capture_sequence": row["input"]["snapshot"]["capture_sequence"],
+                "input_json": {}, "tensor_sidecar_json": {}, "lineage_json": {}, "native_request": request,
+                "learning_input": True,
+                "publication": "seal-before-submit; prepaid-drain-after-search" if kind == "native" else "append-before-analysis; sync-at-receipt-close"}
+        for name, value in (("input_json", row["input"]), ("tensor_sidecar_json", sidecar), ("lineage_json", branch)):
+            raw = frozen_fixture_bytes(value)
+            body[name] = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+        journals.append({"prepared": body, "sha256": ""})
+    registry = {"cpu_binary_sha256": [CPU], "input_sources": [pin["source"] for pin in pins]}
+    roster = metadata.seal_roster({"version": metadata.ROSTER_DOMAIN, "game_producers": pins})
+    bindings = []
+    for journal, pin in zip(journals, pins):
+        body = journal["prepared"]
+        body["roster_sha256"] = roster["sha256"]
+        journal["sha256"] = hashlib.sha256(frozen_fixture_bytes([body["version"], body])).hexdigest()
+        bindings.append({"input_sha256": body["input_sha256"], "game_id": pin["game_id"], "producer_id": pin["producer_id"],
+                         "capture_sequence": body["capture_sequence"], "capture_evidence_sha256": journal["sha256"]})
+    capture = metadata.seal_capture({"version": metadata.CAPTURE_DOMAIN, "bindings": bindings})
+    capture_bytes = frozen_fixture_bytes(capture)
+    raw_rows = rows
+    split = {"games": {"frozen-fixture-game": "train"}}
+    checked = ValidatedDataset(raw_rows, split, registry, {})
+    envelope = metadata.seal_envelope({"version": metadata.ENVELOPE_DOMAIN, "roster_sha256": roster["sha256"],
+                                      "owned_sources_sha256": metadata.owned_sources_digest(registry),
+                                      "raw_dataset_sha256": sha("fixture-raw-rust-audit"), "split_sha256": sha("fixture-split-rust-audit"),
+                                      "current_view_sha256": checked.current_view.sha256, "raw_records": len(raw_rows),
+                                      "unique_inputs": len(bindings), "capture_sha256": capture["sha256"],
+                                      "capture_artifact": {"bytes": len(capture_bytes), "sha256": hashlib.sha256(capture_bytes).hexdigest()}})
+    jsonl = {"records.jsonl": raw_rows, "native-inputs.jsonl": sidecars, "source-registry.jsonl": [registry],
+             "split.jsonl": [split], "inputs.jsonl": inputs, "input-lineage.jsonl": lineage, "producer-prepared.jsonl": journals}
+    if events:
+        jsonl["native-events.jsonl"] = events
+    artifacts = {}
+    for name, values in jsonl.items():
+        (root / name).write_bytes(b"".join(frozen_fixture_bytes(value) + b"\n" for value in values))
+    producer_audit = {"scope": "metadata_only", "raw_records": len(raw_rows), "unique_inputs": len(bindings),
+                      "roster_sha256": roster["sha256"], "envelope_sha256": envelope["sha256"], "capture_sha256": capture["sha256"],
+                      "native_exact_metadata_inputs": len(bindings), "requires_derived_adapter": []}
+    for name, value in (("producer-roster.json", roster), ("producer-captures.json", capture),
+                        ("producer-envelope.json", envelope), ("producer-audit.json", producer_audit)):
+        (root / name).write_bytes(frozen_fixture_bytes(value))
+    for name in (*jsonl, "producer-registration.json", "producer-source.json", "producer-roster.json",
+                 "producer-captures.json", "producer-envelope.json", "producer-audit.json"):
+        data = (root / name).read_bytes()
+        artifacts[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    receipt = {"version": "rz-pals-own-collector/1", "complete": True, "failure": None, "actual_training_executed": False,
+               "external_teacher_used": False, "source": descriptions[0], "artifacts": artifacts,
+               "audit": {"records": len(raw_rows), "canonical_dataset_sha256": envelope["envelope"]["raw_dataset_sha256"],
+                         "canonical_split_sha256": envelope["envelope"]["split_sha256"]}}
+    (root / "receipt.json").write_bytes(frozen_fixture_bytes(receipt))
+    return {"expected_receipt_sha256": hashlib.sha256((root / "receipt.json").read_bytes()).hexdigest(),
+            "producer_registrations": registrations}
+
+
+def repin_frozen_fixture_artifact(directory, configuration, name):
+    """Re-pin outer bytes to exercise a deeper contract failure in synthetic data."""
+    root = Path(directory)
+    receipt = json.loads((root / "receipt.json").read_bytes())
+    raw = (root / name).read_bytes()
+    receipt["artifacts"][name] = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+    encoded = frozen_fixture_bytes(receipt)
+    (root / "receipt.json").write_bytes(encoded)
+    configuration["expected_receipt_sha256"] = hashlib.sha256(encoded).hexdigest()
+
+
+def reseal_frozen_fixture_journals(directory, configuration, journals):
+    from rz_pals_model import frozen_producer as metadata
+    root = Path(directory)
+    evidence = {}
+    for journal in journals:
+        body = journal["prepared"]
+        journal["sha256"] = hashlib.sha256(frozen_fixture_bytes([body["version"], body])).hexdigest()
+        evidence[body["input_sha256"]] = journal["sha256"]
+    (root / "producer-prepared.jsonl").write_bytes(b"".join(frozen_fixture_bytes(value) + b"\n" for value in journals))
+    repin_frozen_fixture_artifact(directory, configuration, "producer-prepared.jsonl")
+    capture_path = root / "producer-captures.json"
+    capture = json.loads(capture_path.read_bytes())["capture"]
+    for binding in capture["bindings"]:
+        binding["capture_evidence_sha256"] = evidence[binding["input_sha256"]]
+    sealed = metadata.seal_capture(capture)
+    capture_path.write_bytes(frozen_fixture_bytes(sealed))
+    repin_frozen_fixture_artifact(directory, configuration, "producer-captures.json")
+    envelope_path = root / "producer-envelope.json"
+    envelope = json.loads(envelope_path.read_bytes())["envelope"]
+    envelope.update(capture_sha256=sealed["sha256"],
+                    capture_artifact={"bytes": capture_path.stat().st_size, "sha256": hashlib.sha256(capture_path.read_bytes()).hexdigest()})
+    sealed_envelope = metadata.seal_envelope(envelope)
+    envelope_path.write_bytes(frozen_fixture_bytes(sealed_envelope))
+    repin_frozen_fixture_artifact(directory, configuration, "producer-envelope.json")
+    audit_path = root / "producer-audit.json"
+    audit = json.loads(audit_path.read_bytes())
+    audit.update(capture_sha256=sealed["sha256"], envelope_sha256=sealed_envelope["sha256"])
+    audit_path.write_bytes(frozen_fixture_bytes(audit))
+    repin_frozen_fixture_artifact(directory, configuration, "producer-audit.json")
 
 
 class CollectionReadProbe:
@@ -733,6 +916,171 @@ class TrainingPreparationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_collected_dataset(temporary, expected_receipt_sha256=expected_receipt,
                                          expected_encoder_source_sha256=expected_encoder)
+
+    def test_frozen_loader_cpu_and_native_actual_artifacts_enter_cpu_collate(self):
+        for kinds in (("cpu",), ("native",), ("native", "native")):
+            with self.subTest(kinds=kinds), tempfile.TemporaryDirectory(prefix="pals-frozen-fixture-") as temporary:
+                configuration = write_frozen_fixture_collection(temporary, kinds=kinds)
+                loaded = load_frozen_collected_dataset(temporary, **configuration)
+                self.assertEqual(loaded.indices("proposer"), list(loaded.current_view.current_indices))
+                batch = loaded.collate(loaded.indices("proposer"), "proposer")
+                self.assertEqual(len(batch.input_sha256), len(kinds))
+                self.assertEqual(batch.inputs.board.device.type, "cpu")
+                self.assertFalse(batch.wdl_mask.any())
+                self.assertFalse(batch.policy_mask.any())
+                self.assertEqual(loaded.frozen_admission["current_view_sha256"], loaded.current_view.sha256)
+                self.assertEqual(len(loaded.frozen_admission["inputs"]), len(kinds))
+                self.assertIn("producer-prepared.jsonl", loaded.frozen_admission["artifacts"])
+
+    def test_frozen_loader_same_game_two_models_use_input_binding_not_turn(self):
+        with tempfile.TemporaryDirectory(prefix="pals-frozen-fixture-") as temporary:
+            configuration = write_frozen_fixture_collection(temporary, kinds=("native", "native"))
+            loaded = load_frozen_collected_dataset(temporary, **configuration)
+            snapshots = [row["input"]["snapshot"] for row in loaded.records]
+            self.assertEqual(snapshots[0]["game_id"], snapshots[1]["game_id"])
+            self.assertEqual(snapshots[0]["white_to_move"], snapshots[1]["white_to_move"])
+            self.assertNotEqual(snapshots[0]["source"]["model_weights_sha256"], snapshots[1]["source"]["model_weights_sha256"])
+            self.assertEqual(len(loaded.collate(loaded.indices("proposer"), "proposer").input_sha256), 2)
+
+    def test_frozen_loader_missing_required_artifacts_never_retries_legacy(self):
+        required = ("producer-registration.json", "producer-source.json", "producer-roster.json",
+                    "producer-captures.json", "producer-envelope.json", "producer-audit.json",
+                    "producer-prepared.jsonl", "input-lineage.jsonl")
+        for name in required:
+            with self.subTest(name=name), tempfile.TemporaryDirectory(prefix="pals-frozen-fixture-") as temporary:
+                configuration = write_frozen_fixture_collection(temporary)
+                (Path(temporary) / name).unlink()
+                with patch("rz_pals_model.training.load_collected_dataset", side_effect=AssertionError("legacy retry prohibited")):
+                    with self.assertRaises((ValueError, OSError)):
+                        load_frozen_collected_dataset(temporary, **configuration)
+
+    def test_frozen_loader_receipt_failure_and_required_byte_tamper_fail_closed(self):
+        for name in ("records.jsonl", "native-inputs.jsonl", "source-registry.jsonl", "split.jsonl",
+                     "producer-registration.json", "producer-source.json", "producer-roster.json",
+                     "producer-captures.json", "producer-envelope.json", "producer-audit.json", "producer-prepared.jsonl"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory(prefix="pals-frozen-fixture-") as temporary:
+                configuration = write_frozen_fixture_collection(temporary)
+                with (Path(temporary) / name).open("ab") as stream:
+                    stream.write(b" ")
+                with self.assertRaises(ValueError):
+                    load_frozen_collected_dataset(temporary, **configuration)
+        with tempfile.TemporaryDirectory(prefix="pals-frozen-fixture-") as temporary:
+            configuration = write_frozen_fixture_collection(temporary)
+            path = Path(temporary) / "receipt.json"
+            receipt = json.loads(path.read_bytes())
+            receipt.update(complete=False, failure={"stage": "prepared"})
+            path.write_bytes(frozen_fixture_bytes(receipt))
+            configuration["expected_receipt_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            with self.assertRaises(ValueError):
+                load_frozen_collected_dataset(temporary, **configuration)
+
+    def test_frozen_loader_epoch_and_encoder_follow_each_input_producer(self):
+        for field in ("model_epoch", "encoder_source_sha256"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory(prefix="pals-frozen-fixture-") as temporary:
+                configuration = write_frozen_fixture_collection(temporary, kinds=("native", "native"))
+                path = Path(temporary) / "native-inputs.jsonl"
+                values = [json.loads(line) for line in path.read_bytes().splitlines()]
+                if field == "model_epoch":
+                    tensor = json.loads(values[1]["tensor_json"])
+                    tensor["model_epoch"] = json.loads(values[0]["tensor_json"])["model_epoch"]
+                    values[1]["tensor_json"] = json.dumps(tensor, separators=(",", ":"))
+                else:
+                    values[1][field] = sha("another-encoder")
+                reseal_sidecar(values[1])
+                path.write_bytes(b"".join(frozen_fixture_bytes(value) + b"\n" for value in values))
+                repin_frozen_fixture_artifact(temporary, configuration, "native-inputs.jsonl")
+                # Also rebind exact row bytes in the synthetic journal; the
+                # producer epoch/encoder policy must still reject the change.
+                journal_path = Path(temporary) / "producer-prepared.jsonl"
+                journals = [json.loads(line) for line in journal_path.read_bytes().splitlines()]
+                exact = frozen_fixture_bytes(values[1])
+                body = journals[1]["prepared"]
+                body["tensor_sidecar_json"] = {"bytes": len(exact), "sha256": hashlib.sha256(exact).hexdigest()}
+                reseal_frozen_fixture_journals(temporary, configuration, journals)
+                with self.assertRaisesRegex(ValueError, "epoch|encoder"):
+                    load_frozen_collected_dataset(temporary, **configuration)
+
+    def test_frozen_loader_actual_evidence_and_native_request_attribution(self):
+        for field, value in (("checked_source_sha256", sha("wrong-checked-source")),
+                             ("native_request", [1, 99]), ("learning_input", False)):
+            with self.subTest(field=field), tempfile.TemporaryDirectory(prefix="pals-frozen-fixture-") as temporary:
+                configuration = write_frozen_fixture_collection(temporary, kinds=("native",))
+                path = Path(temporary) / "producer-prepared.jsonl"
+                journal = json.loads(path.read_bytes())
+                journal["prepared"][field] = value
+                reseal_frozen_fixture_journals(temporary, configuration, [journal])
+                with self.assertRaises(ValueError):
+                    load_frozen_collected_dataset(temporary, **configuration)
+        with tempfile.TemporaryDirectory(prefix="pals-frozen-fixture-") as temporary:
+            configuration = write_frozen_fixture_collection(temporary, kinds=("native",))
+            (Path(temporary) / "native-events.jsonl").write_bytes(frozen_fixture_bytes({"stage": "prepared"}) + b"\n")
+            repin_frozen_fixture_artifact(temporary, configuration, "native-events.jsonl")
+            with self.assertRaisesRegex(ValueError, "actual prepared observer event"):
+                load_frozen_collected_dataset(temporary, **configuration)
+
+    def test_frozen_loader_independent_registration_and_source_facts_are_required(self):
+        for part in ("registration", "source"):
+            with self.subTest(part=part), tempfile.TemporaryDirectory(prefix="pals-frozen-fixture-") as temporary:
+                configuration = write_frozen_fixture_collection(temporary)
+                name = "producer-registration.json" if part == "registration" else "producer-source.json"
+                path = Path(temporary) / name
+                value = json.loads(path.read_bytes())
+                if part == "registration":
+                    value["producer_id"] = "unregistered-producer"
+                else:
+                    value[1]["implementation_sha256"] = sha("another-actual-binary")
+                path.write_bytes(frozen_fixture_bytes(value))
+                repin_frozen_fixture_artifact(temporary, configuration, name)
+                with self.assertRaisesRegex(ValueError, "registration bytes|actual checked source"):
+                    load_frozen_collected_dataset(temporary, **configuration)
+
+    def test_frozen_loader_aggregate_read_budget_covers_external_registration_bytes(self):
+        with tempfile.TemporaryDirectory(prefix="pals-frozen-fixture-") as temporary:
+            configuration = write_frozen_fixture_collection(temporary, kinds=("native", "native"))
+            total = sum(path.stat().st_size for path in Path(temporary).iterdir() if path.is_file())
+            loaded = load_frozen_collected_dataset(temporary, max_input_bytes=total, **configuration)
+            self.assertEqual(len(loaded.indices("proposer")), 2)
+            with self.assertRaisesRegex(ValueError, "allocation budget"):
+                load_frozen_collected_dataset(temporary, max_input_bytes=total - 1, **configuration)
+
+    def test_frozen_loader_per_input_row_byte_cap_precedes_json_parse(self):
+        with tempfile.TemporaryDirectory(prefix="pals-frozen-fixture-") as temporary:
+            configuration = write_frozen_fixture_collection(temporary)
+            path = Path(temporary) / "native-inputs.jsonl"
+            path.write_bytes(path.read_bytes().rstrip(b"\n") + b" " * (2 * 1024 * 1024 + 1) + b"\n")
+            repin_frozen_fixture_artifact(temporary, configuration, "native-inputs.jsonl")
+            with self.assertRaisesRegex(ValueError, "JSONL record/line bound"):
+                load_frozen_collected_dataset(temporary, **configuration)
+
+    def test_frozen_admission_mutation_is_checked_by_indices_and_collate(self):
+        for mutation in ("admission", "source", "receipt", "encoding"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory(prefix="pals-frozen-fixture-") as temporary:
+                configuration = write_frozen_fixture_collection(temporary)
+                loaded = load_frozen_collected_dataset(temporary, **configuration)
+                selected = loaded.indices("proposer")
+                if mutation == "admission":
+                    loaded.frozen_admission["metadata_audit"]["capture_sha256"] = sha("tampered-capture")
+                elif mutation == "source":
+                    loaded.owned_sources["cpu_binary_sha256"] = [sha("changed-authority")]
+                elif mutation == "receipt":
+                    loaded.collection_receipt["audit"]["records"] += 1
+                else:
+                    key = next(iter(loaded.encodings))
+                    loaded.encodings[key] = replace(loaded.encodings[key], query=tuple([1.0] * 16))
+                with self.assertRaises(ValueError):
+                    loaded.indices("proposer")
+                with self.assertRaises(ValueError):
+                    loaded.collate(selected, "proposer")
+
+    def test_frozen_loader_refuses_private_derived_policy_without_adapter(self):
+        with tempfile.TemporaryDirectory(prefix="pals-frozen-fixture-") as temporary:
+            configuration = write_frozen_fixture_collection(temporary, kinds=("native",))
+            configuration["producer_registrations"][0]["pin"]["encoding_policy"] = {
+                "kind": "private_checked_derived_query", "encoding_schema_sha256": sha("private-schema"),
+                "private_encoder_source_sha256": sha("private-source"), "parent_encoding_sha256": sha("parent-encoding"),
+                "parent_encoder_source_sha256": sha("parent-source")}
+            with self.assertRaisesRegex(ValueError, "explicit checked derived adapter"):
+                load_frozen_collected_dataset(temporary, **configuration)
 
     def test_collection_loader_reads_only_remaining_total_byte_budget_plus_one(self):
         row, reads = fixture(), []
