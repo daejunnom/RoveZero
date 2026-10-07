@@ -157,8 +157,12 @@ SyzygyProbeLimit=0, 기본 내장 NNUE를 사용한다. 광고된 이름·옵션
 `stockfish_check` CPU example은 pin·광고·옵션·readiness·합법 bestmove·stop·quit·
 process group 종료를 독립 검사한다. 대국은 기존 Fastchess·입력 snapshot·process 관리·
 Rules PGN 감사·벽시계 차감/증분/시간패 감사·정리를 재사용한다. 외부 엔진에 native
-ORT/CUDA/attestation 인수를 전달하지 않는다. V2 진입점은 `model-pair lock INPUT_JSON
-NEW_LOCK_JSON`과 `model-pair execute LOCK_JSON ASSET_ROOT OUTPUT_ROOT UNIQUE_LABEL`이다.
+ORT/CUDA/attestation 인수를 전달하지 않는다. V2 진입점은 `model-pair opening INPUT_JSON
+NEW_PGN`, `model-pair lock INPUT_JSON NEW_LOCK_JSON`과 `model-pair execute LOCK_JSON
+ASSET_ROOT OUTPUT_ROOT UNIQUE_LABEL`이다. `opening`은 Rules가 검증한 완전 시작 상태를
+기존 직렬화로 기록하는 CPU 전용 준비 명령이며 기존 파일을 덮어쓰지 않는다. `lock`도
+이 직렬화의 크기·SHA-256과 opening artifact 선언을 대조하므로 수순이 같은 임의의 PGN
+헤더를 대신 사용하지 않는다. 생성·잠금은 신경망이나 대국 실행이 아니다.
 모든 경로는 절대 경로이고 결과는 Git 밖에 둔다. 실제 affinity와 cgroup memory.high/max/
 swap을 명세와 대조한다. CPU preflight와 게임 process 증거는 구분한다. 두 판의 RoveZero
 CUDA session **2개**와 외부 UCI exit **2개**를 검사하며 내부 V1의 native 4개 조건을
@@ -234,10 +238,14 @@ unknown이다. 별도 cloud 비용·학습·정밀도/batch 정책·backend 변�
 
 ## 현재 인수 상태 (2026-10-07)
 
-구현·CPU 인수와 실제 GPU 수치 인수는 제공했다. 현재 통합의 5% 성능 인수는 적용 대상이
-아니며, A/B 측정과 실제 Stockfish 대국은 미실행이다. 아래 5% 초과 HOLD는 적용 범위
-정정 전 도구의 판정 이력이며 현재 등록을 차단하는 조건이나 어댑터 회귀의 증거가 아니다.
-기존 등록된 엔진/arena 바이너리 source는 `4d715b3`이다. 후속 recipe의 affinity·유한 예산
+구현·CPU 인수와 실제 GPU 수치 인수를 제공했고, 범위 정정 뒤 새 A/A 3쌍·A/B 5쌍의
+작업량·종료·측정 증거를 확인했다. 현재 통합의 5% 성능 인수는 적용 대상이 아니며,
+`integration_observation`의 성능 인수 상태는 `not_applicable`이다. 아래 이전 5% 초과
+HOLD는 적용 범위 정정 전 도구의 판정 이력이며 현재 등록을 차단하는 조건이나 어댑터
+회귀의 증거가 아니다. Stockfish 19와의 새 흑백 교환 두 판은 Rules·시계·물리 수명·
+정상 종료·회수를 확인해 pilot 인수를 완료했다. 최신 측정과 실제 대국 상태는 문서
+마지막의 새 통합 결과를 따른다. 최초 등록한 엔진/arena 바이너리 source는 `4d715b3`이다.
+후속 recipe의 affinity·유한 예산
 변경은 `acf9669`·`b4924f1`, CPU root 통계 관측 예제는 `121bcf6`·`1307cc8`이다.
 이후 생산 Rules·encoding·adapter·search·runtime·UCI와 루트 Cargo/lock/toolchain 소스의
 일치를 확인했다. `rz-uci/Cargo.toml`은 기존 dependency/feature를 유지하고 예제 선언만
@@ -363,7 +371,113 @@ peak 사례의 원인이나 구간을 이 한 실행으로 소급하지 않는�
 3600초 창의 누적 비용은 2464.51초였고 상한 초과·OOM·강제 종료·소유 process 잔류는
 없었다. 원래 HOLD와 비교 분모는 유지하며 추가 전체 비교를 자동으로 재등록하지 않는다.
 
-다음 GPU 작업은 새 유한 실행 창과 통제 조건을 등록하고 A/A 3쌍·A/B 5쌍의 유효 측정
-증거를 남긴 뒤 Stockfish 두 판을 실행하는 순서다. 5% 편차를 새 창의 등록 조건으로
-사용하지 않는다. 기존 3600초 창의 종료와 새 창의 실행 선택은 이 적용 범위 정정과 별개다.
-현재 성능 회귀 없음·외부 강도 검증 완료를 선언하지 않는다.
+이전 3600초 창은 종료된 상태로 보존한다. 사용자 선택으로 연 새 비교 창과 아래 대국
+시도는 이 창의 자동 연장이나 이전 HOLD의 성공 전환이 아니다.
+
+## 새 통합 측정과 대국 시도 (2026-10-07)
+
+범위 정정 뒤 새 3600초 창에서 A/A 3쌍과 교차 순서 A/B 5쌍을 모두 완료했다.
+전체 비용은 준비를 포함해 1937.59초였으며 `regression-scoped-control-01/summary.json`의
+SHA-256은 `9defc4347357ff5784760d922433ba7db009df9e88edb29e8a5ba205a6d69dbf`다.
+공유 runtime 파일 19개/2,970,143,952바이트의 별도 읽기·해시 검증은 3.10초, 준비 capture는
+3.45초였다. 개별 측정은 공유 runtime이 준비된 조건의 fresh engine cgroup이며 공유 파일의
+호스트 전체 메모리와 준비 cgroup peak는 개별 P에 포함되지 않는다. page residency 고정은
+보장하지 않는다. 모델·runtime·입력·CPU 0/2·memory.high 6GiB/max 12GiB·B1을 고정했다.
+
+| 새 A/B 쌍 | A 전체 T | B 전체 T | T_B/T_A | P_B/P_A |
+|---|---|---|---|---|
+| 1 | 124.392초 | 120.432초 | 0.96817 | 1.05944 |
+| 2, B 먼저 | 118.663초 | 121.877초 | 1.02709 | 1.00129 |
+| 3 | 123.239초 | 125.391초 | 1.01746 | 1.00127 |
+| 4, B 먼저 | 121.671초 | 117.319초 | 0.96423 | 0.99998 |
+| 5 | 123.730초 | 120.093초 | 0.97060 | 1.01382 |
+
+A/B의 시간 합계는 A 611.695초, B 605.111초이고 비율은 0.98924다. 각 실행의 peak를
+더한 값은 A 8,742,035,456바이트, B 8,874,491,904바이트이고 비율은 1.01515다. 이는
+**개별 peak의 합계**이며 동시 사용량이나 호스트 전체 peak가 아니다. A/A 여섯 실행의
+시간 max/min은 1.10955, peak max/min은 1.01105였다. 관측된 약 1.08% 시간 감소와
+약 1.52% peak 합계 증가는 환경 편차·표본 범위와 함께 보고하며 속도 개선·회귀 없음으로
+단정하지 않는다. 첫 A/B의 peak 증가가 5%를 넘었다는 이유로 현재 통합을 거부하지 않는다.
+
+16회 모두 startpos·지정 16-ply 입력에서 각각 4096 simulation을 완료하고 `d2d4`·`h2h3`를
+반환했다. 각 실행의 root 소비 2개·backup 소비 8192개·runtime 완료 8194개가 일치했다.
+합계는 root 32개·backup 131,072개·runtime 완료 131,104개다. 물리 NN 실행 수는 전수
+물리 journal 부재로 unknown이며 이 합계로 대체하지 않는다. 모든 실행에서 정상 exit 0·
+물리 종료·소유 process 잔류 없음·임시 저장소 정리를 확인했고 memory.high/max·OOM
+이벤트는 0이었다. 첫 A/A 쌍의 CPU throttling은 각각 1회/28,149µs와 6회/488,409µs이며
+나머지는 0이다. 이를 미발생으로 덮거나 호스트 경쟁의 원인으로 확정하지 않는다.
+
+16회 모두 model ready의 누적 memory.peak가 최종 peak와 같았다. 이 표본에서는 준비
+구간이 최대치에 도달했고 이후 탐색이 최고치를 올리지 않았다. checkpoint current/stat는
+순차적인 현재 값으로 peak의 구성은 아니다. 전체 64회 checkpoint 읽기 비용은 29.47ms로
+전체 T에 포함했다. 미관측 VRAM·Windows commit peak는 unknown이다. 다른 과거 실험과
+진단은 이 비교의 분모에 넣지 않는다.
+
+실제 Stockfish 연결의 첫 준비는 임의 PGN 헤더가 Rules 직렬화의 pin과 달라 실행 전에
+거부됐으며 game process는 생성하지 않았다. `22d3c85`에서 기존 Rules opening 생성기를
+노출하는 `opening` 명령과 lock 단계 pin 검사를 추가했다. arena all-feature/all-target
+CPU 검사 171개 통과·14개 명시적 미실행, Clippy 통과 및 Linux·Windows·CPU bindings CI
+세 job의 성공을 확인했다. production Rules·encoding·adapter·search·runtime·UCI·공통
+계약·루트 dependency/feature/toolchain의 기존 등록과 일치를 재확인했고 독립 수치 검사와
+탐색 바이너리는 재사용했다. 수정한 arena 실행 파일은 별도로 등록했다.
+
+수정한 opening을 사용한 Windows private snapshot 시도는 900초 제한 뒤 정리까지
+915.16초에 종료했다. 첫 판 PGN은 RoveZero 백·Stockfish 흑, 146 ply, `0-1`, 정상 메이트,
+120+1이며 GameDuration 358초였다. 두 번째 판은 완료하지 않았으므로 유효 paired 결과가
+아니다. 원시 PGN·부분 결과·강제 종료 기록을 보존하며 무승부나 정상 두 판으로 처리하지
+않는다. 소유 process 잔류·정리 오류·OOM은 없었지만 memory.high 이벤트 18,412회와
+peak 6,443,184,128바이트를 관측했다. cache hint는 적용됐어도 실제 회수를 보장하지 않으며
+이 자료만으로 파일 저장 위치나 GPU가 지연의 원인이라고 확정하지 않는다.
+
+사용자 선택으로 새 900초+정리 30초 창을 열어 private snapshot만 소유한 WSL Linux 임시
+저장소에 두고 같은 두 판을 실행했다. 완료 PGN·로그·영수증은 작은 파일 allowlist·개별
+8MiB/전체 16MiB/256개 상한으로 Windows에 byte·hash 대조하여 회수한다. private 입력은
+내보내지 않는다. 유효 완료·process 종료·검증된 회수 후에만 정확한 소유 임시 루트를
+정리하고 실패·불명 완료는 보존한다. 이는 별도 대국 인수이며 저장 위치 변경의 시간·
+메모리 효과를 분리한 A/B가 아니다.
+
+새 `stockfish-linux-storage-pilot-01`은 **793.162초**에 정상 종료했고 두 판 모두 인수했다.
+25개 파일/2,538,731바이트를 Windows에 회수하여 byte·SHA-256을 다시 대조했으며 정확한
+소유 Linux 임시 루트가 제거된 것을 확인했다. 영수증은 `scored_games=2`,
+`incomplete_games=0`, `integration_checks_passed=true`, `cleanup_verified=true`이고
+`strength_eligible=false`다. `execution_ready=false`라는 V2 잠금 표시는 실제 실행 증거와
+별개로 유지한다. 새로운 실행의 유효 pilot 결과를 이 잠금 플래그나 두 판의 Elo 승인으로
+확대하지 않는다.
+
+| 새 paired pilot | 백 | 흑 | 결과 | ply / Rules 종료 | GameDuration / 실제 차감 합 |
+|---|---|---|---|---|---|
+| 1 | RoveZero BT4 FP32/HNo/B1/visits/s4096/e262144 | Stockfish 19 T2/H256 | 1/2-1/2 | 142 / 3회 반복 | 361초 / 361.561초 |
+| 2 | Stockfish 19 T2/H256 | RoveZero BT4 FP32/HNo/B1/visits/s4096/e262144 | 1-0 | 131 / 체크메이트 | 341초 / 341.293초 |
+
+완전 startpos·색 교환·120+1 피셔·256 ply 상한을 대조했다. 차감은 고정 runner의
+steady_clock으로 position 송신 전부터 bestmove 수신까지 측정하고 착수가 제때 완료된
+경우에만 증분을 지급한다. 두 게임의 차감 합계는 702.854초이며 GameDuration의 초 단위
+표시와 일치하는 범위였다. runner의 전체 벽시계는 752.677초로 차감 합보다 49.823초
+길고, 실행 owner의 준비·후처리까지 더한 비용은 runner보다 40.485초 길었다. 이 차이는
+여러 비차감 작업을 포함하며 모두 readiness라고 특정한 측정이 아니다. PGN의 달력 시각을
+steady_clock의 차감·벽시계 대신 사용하지 않는다.
+
+RoveZero는 0승 1무 1패·0.5/2점이었다. 기존 미완료 시도의 첫 판 패배는 별도 실패 시도의
+부분 결과로 계속 보존하며 새 쌍의 분모에 넣거나 유리하게 지우지 않는다. 표본 두 판은
+외부 엔진 연결·시계·실패 정책의 pilot이며 Elo·모델 승격·일반 기력을 확정하지 않는다.
+
+두 fresh CUDA session의 정상 물리 drain과 실제 CUDA 실행을 확인했다. runtime 완료는
+각각 11,679·11,512개, root 소비는 71·65개, non-root backup 소비는 11,608·11,447개였다.
+전체 runtime 완료 23,191개와 root 136개+backup 23,055개가 일치한다. 개별 전수 물리
+journal은 없으므로 실제 NN invocation 수는 unknown으로 유지한다. Stockfish 두 fresh
+process의 UCI 식별·옵션 송신·quit 2회와 전체 process group 소멸을 확인했다. 실제 옵션
+readback과 외부 게임별 PID 매핑은 unknown이며 요청값을 실제 관측값으로 승격하지 않는다.
+
+메모리 peak는 **6,444,539,904바이트**, memory.high 이벤트는 **38,524회**였고 max·OOM·
+OOM kill은 0이었다. CPU throttling은 2,484회/7,956,145µs였다. 정상 완료했어도 회수
+압력·CPU 제한이 없었다고 보고하지 않는다. 종료 시점 file 값 3,476,488,192바이트는
+최고치의 파일 구성이나 저장 위치 변경의 독립 효과가 아니다. 미관측 VRAM·Windows
+commit peak는 unknown이고 snapshot cache hint는 실제 회수 보장이 아니다. 일반 대국에
+반복 GPU/PID polling이나 상세 NN journal을 추가하지 않았다.
+
+원시 자료는 저장소 밖에 보존한다. `match.pgn`의 SHA-256은
+`17dd374b19fb54b7058cb9a1ff8e6a65c98b21b64057929a23c0ea03d59798c7`,
+V2 pair receipt는 `076e2de775e63eeabd545ef4a145551d242e4631d055300736404a0600530143`,
+종단 검증 요약은 `linux-stockfish-pilot-verification-20261007.json`이다. 원본 영수증의
+Linux 경로는 당시 실행 출처이며 회수 후 Windows의 해시가 같은 자료로 해석한다.
+새 결과 요약만 문서에 반영하고 원시 PGN·로그·가중치·개인 경로는 Git에 포함하지 않는다.
