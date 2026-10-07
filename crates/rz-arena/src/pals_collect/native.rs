@@ -13,6 +13,9 @@ use rz_uci::pals_native::{
 };
 use std::sync::{Arc, Mutex};
 
+#[path = "divergence.rs"]
+mod divergence;
+
 const REGISTRY_VERSION: &str = "rz-pals-native-collection-registry/1";
 const RAW_RESERVE: u64 = 128 * 1024;
 const STAGE_RESERVE: u64 = 32 * 1024;
@@ -377,12 +380,32 @@ impl Sink {
         ))
         .map_err(role_error)?;
         let divergence = kind == NativeQueryKind::Divergence;
-        let lineage = serde_json::json!({"input_sha256":input.sha256(),"game_id":game,
+        let divergence_context = match context {
+            NativePreparedContext::Divergence { query } => Some(divergence::prepare_context(
+                id, &input, &sidecar, prepared, query,
+            )?),
+            NativePreparedContext::Role { .. } => None,
+        };
+        let mut lineage = serde_json::json!({"input_sha256":input.sha256(),"game_id":game,
             "process_epoch":id.epoch.0,"request_sequence":id.sequence,"native_query_kind":format!("{:?}",kind),
             "actual_played_history":pack(&actual_moves).map_err(role_error)?,"virtual_prefix":pack(prefix).map_err(role_error)?,
             "proposal":pack(proposal).map_err(role_error)?,"counterexample":counterexample.map(pack).transpose().map_err(role_error)?,
             "divergence_plies":divergences,"actual_outcome_eligible":eligible,
             "counterfactual_wdl":"masked","training_admission":if divergence{"deferred_divergence_head"}else{"ordinary_role"}});
+        // Descriptor -> lineage -> exact prepared producer journal. The
+        // descriptor never hashes the lineage or journal that references it.
+        let divergence_row = divergence_context
+            .as_ref()
+            .map(|context| {
+                lineage["native_divergence_context_sha256"] = serde_json::json!(context.sha256);
+                bounded_json(context, MAX_JSON_RECORD_BYTES, false)
+                    .map(|json| PalsNativeTraceRow {
+                        artifact: divergence::CONTEXT_ARTIFACT,
+                        json,
+                    })
+                    .map_err(role_error)
+            })
+            .transpose()?;
         let rows = [
             PalsNativeTraceRow {
                 artifact: if divergence {
@@ -407,11 +430,27 @@ impl Sink {
         ];
         let exact_bytes = rows
             .iter()
+            .chain(divergence_row.iter())
             .chain(raw_rows.iter().map(|(_, r)| r))
             .try_fold(0_u64, |n, r| {
                 n.checked_add(r.json.len() as u64 + 1)
                     .ok_or_else(|| role_error("prepared native bytes overflow"))
             })?;
+        let added_rows = rows
+            .len()
+            .checked_add(raw_rows.len())
+            .and_then(|n| n.checked_add(usize::from(divergence_row.is_some())))
+            .and_then(|n| n.checked_add(1)) // the prepaid prepared event
+            .ok_or_else(|| role_error("native prepared row count overflow"))?;
+        if self
+            .trace
+            .rows
+            .len()
+            .checked_add(added_rows)
+            .is_none_or(|n| n > MAX_ROWS * 8)
+        {
+            return Err(role_error("native prepared trace row limit"));
+        }
         let producer_capture = if let Some(producer) = &self.producer {
             producer
                 .verify_source(&self.source)
@@ -443,6 +482,7 @@ impl Sink {
             self.trace.rows.push(row);
         }
         self.trace.rows.extend(rows);
+        self.trace.rows.extend(divergence_row);
         if !divergence {
             self.trace.inputs.push((input.clone(), eligible));
         }
@@ -988,6 +1028,36 @@ mod tests {
     use rz_search::pals::engine::{DivergenceQuery, RoleQuery};
     use rz_uci::pals_native::{prepare_divergence_input, prepare_role_input};
 
+    static NEXT_NATIVE_OUTPUT: AtomicU64 = AtomicU64::new(1);
+    struct NativeTestOutput(PathBuf);
+    impl NativeTestOutput {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "rz-pals-native-descriptor-test-{}-{}",
+                std::process::id(),
+                NEXT_NATIVE_OUTPUT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+    }
+    impl Drop for NativeTestOutput {
+        fn drop(&mut self) {
+            let (Ok(root), Ok(temp)) = (self.0.canonicalize(), std::env::temp_dir().canonicalize())
+            else {
+                return;
+            };
+            if root.parent() == Some(temp.as_path())
+                && root.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with("rz-pals-native-descriptor-test-")
+                })
+            {
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+    }
+
     // Declared fake weight identities are confined to this observer fixture:
     // these tests never load, register, execute or claim an actual NN asset.
     fn sink(position: &Position, credit: u64) -> Arc<Mutex<Sink>> {
@@ -1357,6 +1427,30 @@ mod tests {
                 .iter()
                 .any(|r| r.artifact == "native-divergence-sidecars.jsonl")
         );
+        let context_row = s
+            .trace
+            .rows
+            .iter()
+            .find(|r| r.artifact == divergence::CONTEXT_ARTIFACT)
+            .unwrap();
+        let context: divergence::NativeDivergenceContext =
+            serde_json::from_slice(&context_row.json).unwrap();
+        assert_eq!(context.native_request, [17, 2]);
+        assert_eq!(context.captured_input_revision, 10);
+        assert_eq!(context.divergence_sites.len(), 1);
+        assert_eq!(context.divergence_sites[0].divergence_ply, 1);
+        let lineage: Vec<_> = s
+            .trace
+            .rows
+            .iter()
+            .filter(|r| r.artifact == "input-lineage.jsonl")
+            .map(|r| serde_json::from_slice::<serde_json::Value>(&r.json).unwrap())
+            .collect();
+        assert!(lineage[0].get("native_divergence_context_sha256").is_none());
+        assert_eq!(
+            lineage[1]["native_divergence_context_sha256"],
+            context.sha256
+        );
         let journal = producer.journal_snapshot();
         assert_eq!(journal.len(), 2);
         for (index, line) in journal.iter().enumerate() {
@@ -1379,6 +1473,212 @@ mod tests {
                 .unwrap()
             );
         }
+    }
+    #[test]
+    fn divergence_context_preserves_unsorted_slots_and_exact_journal_binding() {
+        let position = Position::startpos();
+        let proposal = ["e2e4", "e7e5", "g1f3", "b8c6"].map(|mv| BoardMove::from_uci(mv).unwrap());
+        let cancel = AtomicBool::new(false);
+        let query = DivergenceQuery {
+            root: &position,
+            proposal: &proposal,
+            candidates: &[3, 1],
+            records: &[],
+            revision: 12,
+            deadline: Instant::now() + Duration::from_secs(2),
+            cancel: &cancel,
+        };
+        let prepared = prepare_divergence_input(&query, [7; 32]).unwrap();
+        let shared = sink(&position, 2 * 1024 * 1024);
+        let producer = fixture_producer(&shared, 16 * 1024);
+        Observer(Arc::clone(&shared))
+            .prepared(
+                id(1),
+                &prepared,
+                NativePreparedContext::Divergence { query: &query },
+            )
+            .unwrap();
+        let s = shared.lock().unwrap();
+        let row = |artifact| {
+            s.trace
+                .rows
+                .iter()
+                .find(|r| r.artifact == artifact)
+                .unwrap()
+        };
+        let context_row = row(divergence::CONTEXT_ARTIFACT);
+        let context: divergence::NativeDivergenceContext =
+            serde_json::from_slice(&context_row.json).unwrap();
+        assert_eq!(context.version, divergence::CONTEXT_VERSION);
+        assert_eq!(context.proposal_move16, pack(&proposal).unwrap());
+        assert_eq!(
+            context.challenged_line_sha256,
+            canonical_sha256(&(
+                "rz-pals-challenged-line/1",
+                state_sha(&position).unwrap(),
+                pack(&proposal).unwrap(),
+            ))
+            .unwrap()
+        );
+        for (slot, ply) in [3, 1].into_iter().enumerate() {
+            let site = &context.divergence_sites[slot];
+            let (prefix, _) = replay_line(&position, &proposal[..ply]).unwrap();
+            assert_eq!(site.slot, u32::try_from(slot).unwrap());
+            assert_eq!(site.divergence_ply, u32::try_from(ply).unwrap());
+            assert_eq!(site.prefix_rules_state_sha256, state_sha(&prefix).unwrap());
+            assert_eq!(
+                site.prefix_rules_history_sha256,
+                hex(rz_uci::pals_native::pals_history_digest(&prefix).unwrap())
+            );
+        }
+        let sidecar: PalsNativeInputSidecar =
+            serde_json::from_slice(&row("native-divergence-sidecars.jsonl").json).unwrap();
+        assert_eq!(context.tensor_sidecar_sha256, sidecar.sha256);
+        assert_eq!(context.input_sha256, sidecar.input_sha256);
+        let mut body = serde_json::to_value(&context).unwrap();
+        let _ = body.as_object_mut().unwrap().remove("sha256");
+        assert_eq!(
+            context.sha256,
+            canonical_sha256(&(divergence::CONTEXT_VERSION, body)).unwrap()
+        );
+        let lineage_row = row("input-lineage.jsonl");
+        let lineage: serde_json::Value = serde_json::from_slice(&lineage_row.json).unwrap();
+        assert_eq!(lineage["native_divergence_context_sha256"], context.sha256);
+        assert_eq!(lineage["training_admission"], "deferred_divergence_head");
+        let journal = producer.journal_snapshot();
+        let journal: serde_json::Value = serde_json::from_slice(&journal[0]).unwrap();
+        assert_eq!(journal["prepared"]["learning_input"], false);
+        assert_eq!(
+            journal["prepared"]["lineage_json"]["sha256"],
+            format!("{:x}", Sha256::digest(&lineage_row.json))
+        );
+        assert_eq!(
+            journal["prepared"]["lineage_json"]["bytes"],
+            lineage_row.json.len() as u64
+        );
+        assert!(!s.calls[&id(1)].physical);
+        assert!(s.trace.inputs.is_empty());
+    }
+    #[test]
+    fn divergence_descriptor_rejects_invalid_sites_and_feature_order_before_submit() {
+        let position = Position::startpos();
+        let proposal = ["e2e4", "e7e5", "g1f3", "b8c6"].map(|mv| BoardMove::from_uci(mv).unwrap());
+        let cancel = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let query = DivergenceQuery {
+            root: &position,
+            proposal: &proposal,
+            candidates: &[3, 1],
+            records: &[],
+            revision: 12,
+            deadline,
+            cancel: &cancel,
+        };
+        let prepared = prepare_divergence_input(&query, [7; 32]).unwrap();
+        for candidates in [&[1, 1][..], &[0][..], &[4][..]] {
+            let invalid = DivergenceQuery {
+                root: &position,
+                proposal: &proposal,
+                candidates,
+                records: &[],
+                revision: 12,
+                deadline,
+                cancel: &cancel,
+            };
+            let shared = sink(&position, 2 * 1024 * 1024);
+            assert!(
+                Observer(Arc::clone(&shared))
+                    .prepared(
+                        id(1),
+                        &prepared,
+                        NativePreparedContext::Divergence { query: &invalid },
+                    )
+                    .is_err()
+            );
+            let s = shared.lock().unwrap();
+            assert!(s.trace.rows.is_empty());
+            assert!(s.calls.is_empty());
+        }
+        let mut reordered = prepared;
+        reordered.divergence_features.swap(0, 1);
+        let shared = sink(&position, 2 * 1024 * 1024);
+        assert!(
+            Observer(Arc::clone(&shared))
+                .prepared(
+                    id(1),
+                    &reordered,
+                    NativePreparedContext::Divergence { query: &query },
+                )
+                .is_err()
+        );
+        assert!(shared.lock().unwrap().calls.is_empty());
+    }
+    #[test]
+    fn divergence_descriptor_bytes_are_reserved_before_trace_commit() {
+        let position = Position::startpos();
+        let proposal = ["e2e4", "e7e5"].map(|mv| BoardMove::from_uci(mv).unwrap());
+        let cancel = AtomicBool::new(false);
+        let query = DivergenceQuery {
+            root: &position,
+            proposal: &proposal,
+            candidates: &[1],
+            records: &[],
+            revision: 12,
+            deadline: Instant::now() + Duration::from_secs(2),
+            cancel: &cancel,
+        };
+        let prepared = prepare_divergence_input(&query, [7; 32]).unwrap();
+        let full = sink(&position, 2 * 1024 * 1024);
+        Observer(Arc::clone(&full))
+            .prepared(
+                id(1),
+                &prepared,
+                NativePreparedContext::Divergence { query: &query },
+            )
+            .unwrap();
+        let s = full.lock().unwrap();
+        let bytes: u64 = s
+            .trace
+            .rows
+            .iter()
+            .filter(|r| r.artifact != "native-events.jsonl")
+            .map(|r| r.json.len() as u64 + 1)
+            .sum();
+        assert_eq!(s.trace.reserved_bytes, bytes + RAW_RESERVE + STAGE_RESERVE);
+        let credit = s.trace.reserved_bytes - 1;
+        let stored = s
+            .trace
+            .rows
+            .iter()
+            .find(|r| r.artifact == divergence::CONTEXT_ARTIFACT)
+            .unwrap()
+            .json
+            .clone();
+        let temp = NativeTestOutput::new();
+        let mut output = Output::new(&temp.0, "descriptor-storage", 2 * 1024 * 1024).unwrap();
+        output.native_trace(&s.trace).unwrap();
+        assert_eq!(output.bytes, s.trace.reserved_bytes);
+        let path = output.directory.join(divergence::CONTEXT_ARTIFACT);
+        drop(output);
+        let written = std::fs::read(path).unwrap();
+        assert_eq!(written.len(), stored.len() + 1);
+        assert_eq!(&written[..stored.len()], stored.as_slice());
+        assert_eq!(written.last(), Some(&b'\n'));
+        drop(s);
+        let limited = sink(&position, credit);
+        assert!(
+            Observer(Arc::clone(&limited))
+                .prepared(
+                    id(1),
+                    &prepared,
+                    NativePreparedContext::Divergence { query: &query },
+                )
+                .is_err()
+        );
+        let s = limited.lock().unwrap();
+        assert!(s.trace.rows.is_empty());
+        assert!(s.calls.is_empty());
+        assert_eq!(s.total_rows, 0);
     }
     #[test]
     fn producer_quota_rejects_submit_but_preserves_exact_prepared_rows_and_journal() {

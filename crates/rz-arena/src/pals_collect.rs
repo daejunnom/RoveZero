@@ -1034,6 +1034,7 @@ impl Output {
                     | "public-record-sources.jsonl"
                     | "native-divergence-inputs.jsonl"
                     | "native-divergence-sidecars.jsonl"
+                    | "native-divergence-contexts.jsonl"
                     | "native-work-summary.jsonl"
             ) || row.json.len() > MAX_JSON_RECORD_BYTES
             {
