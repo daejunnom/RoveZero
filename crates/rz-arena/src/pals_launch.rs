@@ -10,8 +10,9 @@ use crate::{
 use rz_experiments::{
     ArtifactRef, EngineEnvironmentV2, ExternalSourceV2, ExternalUciEndpointV2, HistoryCompleteness,
     InitialPosition, ManifestError, NativeEngineRole, NativeGameClockV3, NativePairClock,
-    NativeResourceBudgetV1, NativeTimeoutsV1, OpeningSpec, PalsEngineV3, PalsInputLockV3,
-    PalsModelBackendV3, PalsPrecisionV3, PalsRunReceiptV3, PalsWeightIdentityV3, ToolIdentity,
+    NativeResourceBudgetV1, NativeTimeoutsV1, OpeningSpec, PalsCpuRSelectionV3, PalsEngineV3,
+    PalsExternalCpuRV3, PalsInputLockV3, PalsModelBackendV3, PalsPrecisionV3, PalsRunReceiptV3,
+    PalsWeightIdentityV3, ToolIdentity,
 };
 #[cfg(target_os = "linux")]
 use rz_experiments::{
@@ -27,7 +28,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     io::Read,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
 };
 
 pub const PALS_ARENA_V3_DOMAIN: &str = "rz-pals-arena-launch-v3/1";
@@ -44,6 +45,173 @@ pub const PALS_CLOCK_REAP_RUNNER_BYTES: u64 = 2466608;
 const MAX_JSON_BYTES: usize = 256 * 1024;
 const MAX_CONTROL_INVENTORY_BYTES: u64 = 1024 * 1024;
 const MAX_STARTUP_PROBE_TIMEOUT_MS: u64 = 180_000;
+
+/// An actual bounded profile-file observation, separate from process startup.
+/// Registered paths are compared exactly; the hashed profile is never rewritten
+/// to point at an arena snapshot. Binary execution still requires the checker's
+/// own ELF/FD/hash verification on its finite startup clock.
+#[derive(Clone, Debug, Serialize)]
+pub struct PalsExternalCpuRProfileAuditV3 {
+    pub domain: &'static str,
+    pub endpoint_id: String,
+    pub semantic_lock_sha256: String,
+    pub profile_file_sha256: String,
+    pub profile_canonical_sha256: String,
+    pub profile_file_bytes: u64,
+    pub registered_binary_sha256: String,
+    pub registered_program: String,
+    pub registered_working_directory: String,
+    pub profile_registration: serde_json::Value,
+    pub profile_file_verification_performed: bool,
+    /// The binary hash above is independently registered metadata compared with
+    /// the loaded profile identity, not an observation of executable bytes.
+    pub binary_file_verification_performed: bool,
+    pub execution_admission_completed: bool,
+    pub child_spawned: bool,
+    pub options_application_observed: Option<bool>,
+    pub model_loading_observed: Option<bool>,
+    pub inherited_resource_join_observed: Option<bool>,
+    pub physical_shutdown_observed: Option<bool>,
+}
+
+/// Verify actual profile bytes/canonical identity against a prepared semantic
+/// lock and explicit registered Linux CAS program/cwd paths. This starts no
+/// checker or NN, reads no executable/model, and grants no arena launch/Core
+/// eligibility. Time, cgroup, preflight and owner closure remain separate gates.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "pals-collection-onnx", feature = "native-cuda")
+))]
+pub fn verify_pals_external_cpu_r_profile(
+    semantic_lock: &PalsInputLockV3,
+    role: NativeEngineRole,
+    source_root: &Path,
+    registered_program: &Path,
+    registered_cwd: &Path,
+) -> Result<PalsExternalCpuRProfileAuditV3, ArenaError> {
+    use rz_experiments::PalsCpuRSelectionV3;
+    use rz_uci::pals_checker_profile::{PalsCheckerProfile, PalsCheckerSelection};
+
+    semantic_lock.verify()?;
+    let manifest = &semantic_lock.manifest;
+    let PalsEngineV3::Pals(endpoint) = &manifest.engines[role_index(role)] else {
+        return Err(invalid("external CPU_R profile requires a PALS endpoint"));
+    };
+    let PalsCpuRSelectionV3::ExternalUci(declaration) = &endpoint.cpu_r else {
+        return Err(invalid(
+            "own CPU_R selection cannot inherit an external profile",
+        ));
+    };
+    require_public_artifact(&declaration.profile)?;
+    require_public_artifact(&declaration.binary)?;
+    require(
+        source_root.is_absolute()
+            && registered_program.is_absolute()
+            && registered_cwd.is_absolute(),
+        "external CPU_R profile root and registered program/cwd must be absolute",
+    )?;
+    let program = registered_program
+        .to_str()
+        .ok_or_else(|| invalid("registered CPU_R program is not UTF-8"))?;
+    let cwd = registered_cwd
+        .to_str()
+        .ok_or_else(|| invalid("registered CPU_R cwd is not UTF-8"))?;
+    // Validate only path names here. These are not executable/cwd opens; the
+    // owner performs its independent pinned-FD verification before spawn.
+    let mut registered_name = declaration.binary.clone();
+    registered_name.path = program.trim_start_matches('/').into();
+    require_public_artifact(&registered_name)?;
+    let loaded = PalsCheckerProfile::load(
+        &source_root.join(&declaration.profile.path),
+        &declaration.profile.sha256,
+    )
+    .map_err(|error| invalid(format!("external CPU_R profile load: {error}")))?;
+    let profile = loaded.profile();
+    let registration = loaded.registration();
+    require(
+        loaded.canonical_sha256() == declaration.profile_canonical_sha256
+            && registration.file_bytes == declaration.profile.bytes
+            && profile.selection == PalsCheckerSelection::StockfishEmbeddedNnue
+            && profile.program == program
+            && profile.working_directory == cwd,
+        "external CPU_R actual profile canonical/size/selection or registered paths differ",
+    )?;
+    require(
+        profile.identity.binary_sha256 == declaration.binary.sha256
+            && profile.identity.declared_source == declaration.binary.source
+            && profile.identity.declared_license == declaration.binary.license,
+        "external CPU_R loaded profile differs from independently registered binary/source/license",
+    )?;
+    require(
+        declaration.resolver.version == rz_search::pals::value::MODEL_WDL_RESOLVER_VERSION
+            && declaration.resolver.semantics_sha256
+                == digest(rz_search::pals::value::MODEL_WDL_RESOLVER_SEMANTICS.as_bytes()),
+        "external CPU_R resolver declaration differs from actual model-WDL semantics",
+    )?;
+    let policy = &declaration.policy;
+    let option_number = |name: &str| -> Result<u32, ArenaError> {
+        profile
+            .identity
+            .options
+            .get(name)
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(|| invalid(format!("external CPU_R profile {name} cap missing")))
+    };
+    require(
+        option_number("Threads")? <= policy.threads_max
+            && option_number("Hash")? <= policy.hash_mib_max
+            && u32::from(profile.max_depth) <= policy.max_depth
+            && profile.max_prefix_plies as u64 <= u64::from(policy.max_prefix_plies)
+            && profile.handshake_timeout_ms <= policy.handshake_max_ms
+            && profile.max_task_wall_time_ms <= policy.task_wall_time_max_ms
+            && profile.stop_grace_ms <= policy.stop_grace_max_ms
+            && profile.shutdown_grace_ms <= policy.shutdown_grace_max_ms
+            && profile.max_output_bytes as u64 <= policy.lifetime_output_bytes_max
+            && profile.max_line_bytes as u64 <= policy.line_bytes_max,
+        "external CPU_R actual profile exceeds registered inherited task/time/output ceilings",
+    )?;
+    // The loader enforces the exact first-selection option whitelist, empty
+    // argv/assets, and unknown embedded model metadata. Preserve that complete
+    // declaration with unknown observations; readyok cannot fill those fields.
+    let profile_registration = serde_json::to_value(registration)
+        .map_err(|error| invalid(format!("external CPU_R profile audit encoding: {error}")))?;
+    Ok(PalsExternalCpuRProfileAuditV3 {
+        domain: "rz-pals-external-cpu-r-profile-audit-v3/1",
+        endpoint_id: endpoint.id.clone(),
+        semantic_lock_sha256: semantic_lock.canonical_sha256.clone(),
+        profile_file_sha256: loaded.file_sha256().into(),
+        profile_canonical_sha256: loaded.canonical_sha256().into(),
+        profile_file_bytes: declaration.profile.bytes,
+        registered_binary_sha256: declaration.binary.sha256.clone(),
+        registered_program: program.into(),
+        registered_working_directory: cwd.into(),
+        profile_registration,
+        profile_file_verification_performed: true,
+        binary_file_verification_performed: false,
+        execution_admission_completed: false,
+        child_spawned: false,
+        options_application_observed: None,
+        model_loading_observed: None,
+        inherited_resource_join_observed: None,
+        physical_shutdown_observed: None,
+    })
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    any(feature = "pals-collection-onnx", feature = "native-cuda")
+)))]
+pub fn verify_pals_external_cpu_r_profile(
+    _semantic_lock: &PalsInputLockV3,
+    _role: NativeEngineRole,
+    _source_root: &Path,
+    _registered_program: &Path,
+    _registered_cwd: &Path,
+) -> Result<PalsExternalCpuRProfileAuditV3, ArenaError> {
+    Err(invalid(
+        "unsupported external CPU_R profile verification: Linux and pals-collection-onnx or native-cuda are required; no fallback or process was started",
+    ))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -128,6 +296,40 @@ pub struct PalsOnnxLaunchV3 {
     pub encoding_semantic_sha256: String,
     pub adapter_source_sha256: String,
     pub search: PalsSearchLaunchV3,
+    /// Exact paths in the independently registered Linux CAS. The unchanged
+    /// profile is retained in the private input snapshot and still names this
+    /// program/cwd; the retained binary copy is evidence, not the executed path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_cpu_r: Option<PalsExternalCpuRLaunchV3>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsExternalCpuRLaunchV3 {
+    pub registered_program: String,
+    pub registered_working_directory: String,
+}
+impl PalsExternalCpuRLaunchV3 {
+    fn validate(&self) -> Result<(), ArenaError> {
+        for path in [&self.registered_program, &self.registered_working_directory] {
+            require(
+                path.len() <= 4096
+                    && path.starts_with('/')
+                    && !path.contains('\\')
+                    && !path.chars().any(char::is_control)
+                    && path
+                        .split('/')
+                        .skip(1)
+                        .all(|part| !part.is_empty() && part != "." && part != ".."),
+                "external CPU_R registered program/cwd requires a bounded exact absolute Linux path",
+            )?;
+            require_public_artifact_path(path)?;
+        }
+        require(
+            Path::new(&self.registered_program).parent()
+                == Some(Path::new(&self.registered_working_directory)),
+            "external CPU_R registered program must reside in its exact registered CAS cwd",
+        )
+    }
 }
 /// Explicit CUDA execution identity; the session arena is a declaration, never
 /// an observed device peak. Host K/V and physical B1 remain the first recipe.
@@ -250,6 +452,39 @@ pub struct LockedPalsArenaLaunchV3 {
     endpoint_views: [ExternalUciEndpointV2; 2],
 }
 impl PalsArenaLaunchV3 {
+    fn external_cpu_r_binding(
+        &self,
+        i: usize,
+    ) -> Result<Option<(&PalsExternalCpuRV3, &PalsExternalCpuRLaunchV3)>, ArenaError> {
+        let binding = self.endpoints[i]
+            .native_model()
+            .and_then(|native| native.external_cpu_r.as_ref());
+        match &self.semantic_lock.manifest.engines[i] {
+            PalsEngineV3::Pals(endpoint) => match &endpoint.cpu_r {
+                PalsCpuRSelectionV3::Own => {
+                    require(
+                        binding.is_none(),
+                        "own CPU_R cannot inherit an external launch binding",
+                    )?;
+                    Ok(None)
+                }
+                PalsCpuRSelectionV3::ExternalUci(declaration) => {
+                    let binding = binding.ok_or_else(|| {
+                        invalid("external CPU_R requires an explicit native P/C launch binding")
+                    })?;
+                    binding.validate()?;
+                    Ok(Some((declaration, binding)))
+                }
+            },
+            _ => {
+                require(
+                    binding.is_none(),
+                    "non-PALS endpoint cannot inherit an external CPU_R launch binding",
+                )?;
+                Ok(None)
+            }
+        }
+    }
     pub fn from_json(text: &str) -> Result<Self, ArenaError> {
         require(text.len() <= MAX_JSON_BYTES, "launch JSON budget exceeded")?;
         let input: Self = crate::decode_json(text)?;
@@ -461,6 +696,20 @@ impl PalsArenaLaunchV3 {
     }
     fn named_assets(&self) -> Vec<(&ArtifactRef, String)> {
         let mut result = Vec::new();
+        for engine in &self.semantic_lock.manifest.engines {
+            if let PalsEngineV3::Pals(endpoint) = engine
+                && let PalsCpuRSelectionV3::ExternalUci(helper) = &endpoint.cpu_r
+            {
+                result.push((
+                    &helper.profile,
+                    format!("pals-helper-profile-{}/profile.json", helper.profile.sha256),
+                ));
+                result.push((
+                    &helper.binary,
+                    format!("pals-helper-binary-{}/binary", helper.binary.sha256),
+                ));
+            }
+        }
         for recipe in &self.endpoints {
             if let Some(n) = recipe.native_model() {
                 let namespace = format!("pals-{}", n.export.sha256);
@@ -501,6 +750,9 @@ impl PalsArenaLaunchV3 {
             match engine {
                 PalsEngineV3::Pals(e) => {
                     result.push(&e.binary);
+                    if let PalsCpuRSelectionV3::ExternalUci(helper) = &e.cpu_r {
+                        result.extend([&helper.profile, &helper.binary]);
+                    }
                     if let PalsWeightIdentityV3::Untrained { artifact, .. }
                     | PalsWeightIdentityV3::Trained { artifact, .. } = &e.model.weights
                     {
@@ -557,6 +809,7 @@ impl PalsArenaLaunchV3 {
         Ok(total)
     }
     fn endpoint(&self, i: usize) -> Result<ExternalUciEndpointV2, ArenaError> {
+        let helper = self.external_cpu_r_binding(i)?;
         let m = &self.semantic_lock.manifest;
         let role = if i == 0 {
             NativeEngineRole::Baseline
@@ -754,13 +1007,27 @@ impl PalsArenaLaunchV3 {
                         args.push(format!("--pals-startup-probe-timeout-ms={probe_ms}"));
                     }
                 }
+                if let Some((helper, _)) = helper {
+                    let index = assets.len();
+                    assets.extend([helper.profile.clone(), helper.binary.clone()]);
+                    args.extend([
+                        "--pals-cpu-checker=external-uci".into(),
+                        format!("--pals-cpu-profile={{{{asset:{index}}}}}"),
+                        format!("--pals-cpu-profile-sha256={}", helper.profile.sha256),
+                    ]);
+                }
                 (
                     &e.binary,
                     "rovezero-pals",
                     "pals/0.1",
                     format!(
-                        "RoveZero PALS P/C ONNX {} + own CPU_R",
-                        if cuda.is_some() { "CUDA" } else { "CPU" }
+                        "RoveZero PALS P/C ONNX {} + {} CPU_R",
+                        if cuda.is_some() { "CUDA" } else { "CPU" },
+                        if helper.is_some() {
+                            "external UCI"
+                        } else {
+                            "own"
+                        }
                     ),
                     Some(ExternalSourceV2 {
                         url: e.binary.source.clone(),
@@ -898,15 +1165,39 @@ fn validate_pals_search(
     s: &PalsSearchLaunchV3,
     wall: u64,
 ) -> Result<(), ArenaError> {
-    validate_cpu_profile(&e.cpu, wall)?;
+    let (max_depth, max_nodes_per_task) = match &e.cpu_r {
+        PalsCpuRSelectionV3::Own => {
+            validate_cpu_profile(&e.cpu, wall)?;
+            require(
+                rz_search::cpu::CpuConfig::default()
+                    .tt_allocation_bytes()
+                    .map_err(|e| invalid(e.to_string()))?
+                    <= e.cpu.max_tt_bytes,
+                "PALS own CPU default TT slot allocation exceeds declared byte limit",
+            )?;
+            (e.cpu.max_depth, e.cpu.max_nodes_per_task)
+        }
+        PalsCpuRSelectionV3::ExternalUci(helper) => {
+            // CPU_T/legacy own declarations remain in the lock; they are not
+            // runtime authority for the explicitly selected foreign CPU_R.
+            (helper.policy.max_depth, helper.policy.max_nodes_per_task)
+        }
+    };
     require(
         (1..=1_000_000).contains(&s.max_rounds)
             && s.max_cpu_nodes > 0
             && s.cpu_depth > 0
             && s.cpu_depth <= 16
-            && u32::from(s.cpu_depth) <= e.cpu.max_depth
+            && u32::from(s.cpu_depth) <= max_depth
             && (257..=65_536).contains(&s.max_situations)
-            && e.cpu.max_nodes_per_task >= 4096,
+            && max_nodes_per_task
+                >= if e.cpu_r.is_own() {
+                    4096
+                } else {
+                    rz_search::pals::engine::PalsConfig::default()
+                        .cpu_nodes_per_task
+                        .min(s.max_cpu_nodes)
+                },
         "PALS executable work/profile bounds invalid",
     )?;
     let p = &e.pools;
@@ -923,13 +1214,6 @@ fn validate_pals_search(
         "declared pool bounds do not cover the closed PALS executable recipe",
     )?;
     require(
-        rz_search::cpu::CpuConfig::default()
-            .tt_allocation_bytes()
-            .map_err(|e| invalid(e.to_string()))?
-            <= e.cpu.max_tt_bytes,
-        "PALS own CPU default TT slot allocation exceeds declared byte limit",
-    )?;
-    require(
         e.search.semantic_id == "pals"
             && e.runtime.semantic_id == "single-owner/1"
             && e.search.options.is_empty()
@@ -942,7 +1226,10 @@ fn validate_pals_search(
     )
 }
 fn require_public_artifact(a: &ArtifactRef) -> Result<(), ArenaError> {
-    for part in a.path.split('/') {
+    require_public_artifact_path(&a.path)
+}
+fn require_public_artifact_path(path: &str) -> Result<(), ArenaError> {
+    for part in path.split('/') {
         let p = part.to_ascii_lowercase();
         require(
             !p.starts_with(".env")
@@ -1332,12 +1619,58 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
             runtime_root.is_absolute(),
             "preflight cache root must be absolute",
         )?;
+        let isolated_root = self
+            .input
+            .external_cpu_r_binding(role_index(role))?
+            .map(|_| pals_external_cpu_r_preflight_root(role, runtime_root))
+            .transpose()?;
+        let evidence_root = isolated_root.as_deref().unwrap_or(runtime_root);
         let mut arguments = vec![pals_shared_runtime_argument()?];
-        if let Some(profile) = self.cuda_profile_argument(role, runtime_root)? {
+        if let Some(profile) = self.cuda_profile_argument(role, evidence_root)? {
             arguments.push(profile);
+        }
+        if isolated_root.is_some() {
+            let root = evidence_root
+                .to_str()
+                .ok_or_else(|| invalid("external CPU_R preflight evidence root is not UTF-8"))?;
+            arguments.extend([
+                format!("--pals-output-root={root}").into(),
+                format!("--pals-launch-sha256={}", self.sha256).into(),
+                format!(
+                    "--pals-endpoint-id={}",
+                    self.endpoint_views[role_index(role)].id
+                )
+                .into(),
+            ]);
         }
         Ok(arguments)
     }
+}
+
+/// Prospective preflight evidence directory, separate from the exactly two
+/// game process slots. This is path planning only: the Native capability owner
+/// must create, pin and budget this sibling before the external launch guard
+/// can be removed. No directory, process or cache is created here.
+pub fn pals_external_cpu_r_preflight_root(
+    role: NativeEngineRole,
+    runtime_root: &Path,
+) -> Result<PathBuf, ArenaError> {
+    let name = match role {
+        NativeEngineRole::Baseline => "baseline-runtime",
+        NativeEngineRole::Candidate => "candidate-runtime",
+    };
+    require(
+        runtime_root.is_absolute() && runtime_root.file_name().is_some_and(|file| file == name),
+        "external CPU_R preflight requires the bound role game-runtime root",
+    )?;
+    let isolated = match role {
+        NativeEngineRole::Baseline => "external-baseline-preflight-runtime",
+        NativeEngineRole::Candidate => "external-candidate-preflight-runtime",
+    };
+    Ok(runtime_root
+        .parent()
+        .ok_or_else(|| invalid("external CPU_R preflight attempt parent missing"))?
+        .join(isolated))
 }
 
 /// Accepted native evidence is recorded in the existing arena receipt. The
@@ -1923,6 +2256,20 @@ pub fn validate_pals_native_records(
     )?;
     let sn = &s["native"];
     let tn = &t["native"];
+    // This launch revision registers only the whole-input public graph path.
+    // Optional product observations cannot silently select a different cache,
+    // layout or host-memory policy that is absent from the semantic lock.
+    for record in [sn, tn] {
+        require(
+            record["execution"]["host_record_pages"].is_null()
+                && record["host_record_page_observation"].is_null(),
+            "unsupported undeclared host record-page execution/observation: the arena lock registers the whole-input public graph only",
+        )?;
+    }
+    require(
+        s["cpu_checker"].is_null() && t["cpu_checker"].is_null(),
+        "unsupported external CPU_R native receipt: independent helper resource and closure projection is not admitted",
+    )?;
     require(
         sn["final_runtime_loading_mapping"].is_null(),
         "startup cannot claim a later final loading observation",
@@ -3238,10 +3585,15 @@ pub fn save_pals_core_assembly(
 
 /// Independently checks descriptor contents before preparation, using the same
 /// bounded no-follow artifact verifier as every actual launch input.
+///
+/// External profile verification is intentionally first. It is still only a
+/// preparation observation; unsupported execution/resource/closure admission
+/// remains fail-closed in `PalsArenaLaunchV3::validate`.
 pub fn verify_pals_launch_exports(
     spec: &LockedPalsArenaLaunchV3,
     source_root: &Path,
 ) -> Result<(), ArenaError> {
+    verify_pals_launch_external_cpu_r_profiles(&spec.input, source_root)?;
     for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
         if spec.uses_provider_records(role)? {
             let n = spec.native(role)?;
@@ -3272,6 +3624,30 @@ pub fn verify_pals_launch_exports(
         }
     }
     Ok(())
+}
+
+/// Read-only preparation entry point for a not-yet-executable external launch.
+/// Compares the unchanged source profile with its independently registered
+/// Linux program/cwd and semantic pins before any child admission is attempted.
+/// This deliberately does not call `lock()` or authorize execution/Core output.
+pub fn verify_pals_launch_external_cpu_r_profiles(
+    input: &PalsArenaLaunchV3,
+    source_root: &Path,
+) -> Result<Vec<PalsExternalCpuRProfileAuditV3>, ArenaError> {
+    input.semantic_lock.verify()?;
+    let mut observations = Vec::new();
+    for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+        if let Some((_, binding)) = input.external_cpu_r_binding(role_index(role))? {
+            observations.push(verify_pals_external_cpu_r_profile(
+                &input.semantic_lock,
+                role,
+                source_root,
+                Path::new(&binding.registered_program),
+                Path::new(&binding.registered_working_directory),
+            )?);
+        }
+    }
+    Ok(observations)
 }
 
 /// Checks inherited limits; this does not install limits or claim a GPU peak.
@@ -3573,6 +3949,377 @@ mod tests {
             assert!(f.lock().is_err());
         }
     }
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "pals-collection-onnx", feature = "native-cuda")
+    ))]
+    struct ExternalProfileFixture {
+        root: std::path::PathBuf,
+        program: std::path::PathBuf,
+        cwd: std::path::PathBuf,
+        lock: PalsInputLockV3,
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "pals-collection-onnx", feature = "native-cuda")
+    ))]
+    impl ExternalProfileFixture {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "rz-pals-profile-crosscheck-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::create_dir(&root).unwrap();
+            // Neither the program nor cwd exists. This fixture verifies only
+            // profile bytes/declared identities and must not open or spawn them.
+            let cwd = root.join("registered-cas");
+            let program = cwd.join("stockfish");
+            let wire = serde_json::json!({
+                "schema":"rz-pals-external-checker-profile/1",
+                "selection":"stockfish_embedded_nnue",
+                "program":program,
+                "working_directory":cwd,
+                "arguments":[],
+                "identity":{
+                    "adapter_semantics":rz_search::external_cpu::EXTERNAL_UCI_SCORE_SEMANTICS,
+                    "binary_sha256":"a".repeat(64),
+                    "launch_arguments_sha256":rz_search::external_cpu::arguments_sha256(&[]),
+                    "declared_name":"Stockfish profile fixture",
+                    "declared_version":"fixture-1",
+                    "declared_source":"https://github.com/official-stockfish/Stockfish",
+                    "declared_license":"GPL-3.0-or-later",
+                    "options":{
+                        "Threads":"2","Hash":"16","Ponder":"false",
+                        "UCI_Chess960":"false","MultiPV":"1",
+                        "SyzygyPath":"","SyzygyProbeLimit":"0"
+                    },
+                    "assets":[],
+                    "model_metadata":{
+                        "weights_sha256":null,"training":"unknown",
+                        "declared_rights":null,"precision":null
+                    }
+                },
+                "expected_uci_name":"Stockfish profile fixture",
+                "max_depth":8,"max_prefix_plies":64,"handshake_timeout_ms":1000,
+                "max_task_wall_time_ms":1000,"stop_grace_ms":100,"shutdown_grace_ms":100,
+                "max_output_bytes":4096,"max_line_bytes":1024
+            });
+            let bytes = serde_json::to_vec(&wire).unwrap();
+            let profile_path = root.join("profile.json");
+            std::fs::write(&profile_path, &bytes).unwrap();
+            let file_sha256 = digest(&bytes);
+            let loaded =
+                rz_uci::pals_checker_profile::PalsCheckerProfile::load(&profile_path, &file_sha256)
+                    .unwrap();
+            let mut f = fixture();
+            let PalsEngineV3::Pals(e) = &mut f.semantic_lock.manifest.engines[0] else {
+                unreachable!()
+            };
+            let mut profile = asset("profile.json");
+            profile.sha256 = file_sha256;
+            profile.bytes = bytes.len() as u64;
+            let mut binary = asset("helper/stockfish");
+            binary.source = "https://github.com/official-stockfish/Stockfish".into();
+            binary.license = "GPL-3.0-or-later".into();
+            e.cpu_r = PalsCpuRSelectionV3::ExternalUci(Box::new(PalsExternalCpuRV3 {
+                selection: PalsExternalCpuRSelectionV3::StockfishEmbeddedNnue,
+                profile,
+                profile_canonical_sha256: loaded.canonical_sha256().into(),
+                binary,
+                resolver: PalsExternalCpuRResolverV3 {
+                    version: rz_search::pals::value::MODEL_WDL_RESOLVER_VERSION.into(),
+                    semantics_sha256: digest(
+                        rz_search::pals::value::MODEL_WDL_RESOLVER_SEMANTICS.as_bytes(),
+                    ),
+                },
+                policy: PalsExternalCpuRPolicyV3 {
+                    resource_scope: PalsExternalCpuRResourceScopeV3::InheritedParentCgroup,
+                    max_owners: 1,
+                    max_active_tasks: 1,
+                    max_process_leaders: 1,
+                    inherited_kernel_tasks_max: 128,
+                    threads_max: 2,
+                    hash_mib_max: 16,
+                    max_depth: 8,
+                    max_prefix_plies: 64,
+                    max_nodes_per_task: 10_000,
+                    handshake_max_ms: 1000,
+                    task_wall_time_max_ms: 1000,
+                    stop_grace_max_ms: 100,
+                    shutdown_grace_max_ms: 100,
+                    lifetime_output_bytes_max: 4096,
+                    line_bytes_max: 1024,
+                },
+            }));
+            Self {
+                root,
+                program,
+                cwd,
+                lock: f.semantic_lock.manifest.lock().unwrap(),
+            }
+        }
+        fn verify(&self) -> Result<PalsExternalCpuRProfileAuditV3, ArenaError> {
+            verify_pals_external_cpu_r_profile(
+                &self.lock,
+                NativeEngineRole::Baseline,
+                &self.root,
+                &self.program,
+                &self.cwd,
+            )
+        }
+        fn native_launch(&self) -> PalsArenaLaunchV3 {
+            let mut input = native_fixture();
+            let PalsEngineV3::Pals(source) = &self.lock.manifest.engines[0] else {
+                unreachable!()
+            };
+            let PalsEngineV3::Pals(target) = &mut input.semantic_lock.manifest.engines[0] else {
+                unreachable!()
+            };
+            target.cpu_r = source.cpu_r.clone();
+            input.semantic_lock = input.semantic_lock.manifest.lock().unwrap();
+            let PalsEndpointLaunchV3::OnnxCpu(model) = &mut input.endpoints[0] else {
+                unreachable!()
+            };
+            model.external_cpu_r = Some(PalsExternalCpuRLaunchV3 {
+                registered_program: self.program.to_str().unwrap().into(),
+                registered_working_directory: self.cwd.to_str().unwrap().into(),
+            });
+            input
+        }
+        fn mutate_declaration(&mut self, change: fn(&mut PalsExternalCpuRV3)) {
+            let PalsEngineV3::Pals(e) = &mut self.lock.manifest.engines[0] else {
+                unreachable!()
+            };
+            let PalsCpuRSelectionV3::ExternalUci(c) = &mut e.cpu_r else {
+                unreachable!()
+            };
+            change(c);
+            self.lock = self.lock.manifest.lock().unwrap();
+        }
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "pals-collection-onnx", feature = "native-cuda")
+    ))]
+    impl Drop for ExternalProfileFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "pals-collection-onnx", feature = "native-cuda")
+    ))]
+    #[test]
+    fn external_launch_preparation_retains_pins_without_rewriting_or_admitting_a_child() {
+        let fixture = ExternalProfileFixture::new();
+        let input = fixture.native_launch();
+        let observed = verify_pals_launch_external_cpu_r_profiles(&input, &fixture.root).unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(
+            observed[0].registered_program,
+            fixture.program.to_str().unwrap()
+        );
+        assert!(!observed[0].child_spawned && !observed[0].execution_admission_completed);
+        let (helper, _) = input.external_cpu_r_binding(0).unwrap().unwrap();
+        assert!(input.declared_artifacts().contains(&&helper.profile));
+        assert!(input.declared_artifacts().contains(&&helper.binary));
+        assert!(
+            input
+                .named_assets()
+                .iter()
+                .any(|(artifact, path)| *artifact == &helper.profile
+                    && path
+                        == &format!("pals-helper-profile-{}/profile.json", helper.profile.sha256))
+        );
+        let view = input.endpoint(0).unwrap();
+        assert_eq!(
+            view.expected_uci_name,
+            "RoveZero PALS P/C ONNX CPU + external UCI CPU_R"
+        );
+        let index = view
+            .assets
+            .iter()
+            .position(|asset| asset == &helper.profile)
+            .unwrap();
+        assert!(
+            view.arguments
+                .contains(&format!("--pals-cpu-profile={{{{asset:{index}}}}}"))
+        );
+        assert!(view.arguments.contains(&format!(
+            "--pals-cpu-profile-sha256={}",
+            helper.profile.sha256
+        )));
+        assert!(view.assets.contains(&helper.binary));
+        assert!(
+            !view
+                .arguments
+                .iter()
+                .any(|argument| argument.contains(fixture.program.to_str().unwrap()))
+        );
+        assert!(input.lock().is_err());
+        let mut wrong = input.clone();
+        let PalsEndpointLaunchV3::OnnxCpu(model) = &mut wrong.endpoints[0] else {
+            unreachable!()
+        };
+        model.external_cpu_r.as_mut().unwrap().registered_program =
+            fixture.cwd.join("another-program").to_str().unwrap().into();
+        assert!(verify_pals_launch_external_cpu_r_profiles(&wrong, &fixture.root).is_err());
+        let mut own = native_fixture();
+        let PalsEndpointLaunchV3::OnnxCpu(model) = &mut own.endpoints[0] else {
+            unreachable!()
+        };
+        model.external_cpu_r = input.endpoints[0]
+            .native_model()
+            .unwrap()
+            .external_cpu_r
+            .clone();
+        assert!(own.lock().is_err());
+        assert!(verify_pals_launch_external_cpu_r_profiles(&own, &fixture.root).is_err());
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "pals-collection-onnx", feature = "native-cuda")
+    ))]
+    #[test]
+    fn external_preflight_evidence_is_separate_from_two_game_process_slots() {
+        let fixture = ExternalProfileFixture::new();
+        let input = fixture.native_launch();
+        // Construct only a prospective argv view. Public lock/admission remains
+        // unsupported, and this fixture does not prepare or execute a process.
+        let view = LockedPalsArenaLaunchV3 {
+            sha256: crate::canonical_sha256(&input).unwrap(),
+            opening: input.opening(),
+            endpoint_views: [input.endpoint(0).unwrap(), input.endpoint(1).unwrap()],
+            input,
+        };
+        assert!(view.validate_execution().is_err());
+        let game_root = fixture.root.join("baseline-runtime");
+        let preflight_root = fixture.root.join("external-baseline-preflight-runtime");
+        let preflight = view
+            .preflight_arguments(NativeEngineRole::Baseline, &game_root)
+            .unwrap();
+        let runtime = view
+            .runtime_arguments(NativeEngineRole::Baseline, &game_root)
+            .unwrap();
+        assert!(
+            preflight.contains(&format!("--pals-output-root={}", preflight_root.display()).into())
+        );
+        assert!(runtime.contains(&format!("--pals-output-root={}", game_root.display()).into()));
+        for arguments in [&preflight, &runtime] {
+            assert!(arguments.contains(&format!("--pals-launch-sha256={}", view.sha256).into()));
+            assert!(arguments.contains(&OsString::from("--pals-endpoint-id=pals")));
+        }
+        assert!(!preflight.contains(&format!("--pals-output-root={}", game_root.display()).into()));
+        assert!(
+            pals_external_cpu_r_preflight_root(NativeEngineRole::Candidate, &game_root).is_err()
+        );
+        assert!(!game_root.exists() && !preflight_root.exists());
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "pals-collection-onnx", feature = "native-cuda")
+    ))]
+    #[test]
+    fn actual_external_profile_verification_is_separate_from_execution_observation() {
+        let f = ExternalProfileFixture::new();
+        let original = std::fs::read(f.root.join("profile.json")).unwrap();
+        let audit = f.verify().unwrap();
+        assert!(audit.profile_file_verification_performed);
+        assert!(!audit.binary_file_verification_performed);
+        assert!(!audit.execution_admission_completed);
+        assert!(!audit.child_spawned);
+        assert_eq!(audit.options_application_observed, None);
+        assert_eq!(audit.model_loading_observed, None);
+        assert_eq!(audit.inherited_resource_join_observed, None);
+        assert_eq!(audit.physical_shutdown_observed, None);
+        assert_eq!(audit.profile_file_bytes, original.len() as u64);
+        assert_eq!(audit.profile_file_sha256, digest(&original));
+        assert_eq!(audit.registered_program, f.program.to_str().unwrap());
+        assert_eq!(audit.profile_registration["process_start_performed"], false);
+        assert!(audit.profile_registration["model_loading_observed"].is_null());
+        assert!(audit.profile_registration["options_application_observed"].is_null());
+        assert_eq!(
+            std::fs::read(f.root.join("profile.json")).unwrap(),
+            original
+        );
+        assert!(!f.program.exists() && !f.cwd.exists());
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "pals-collection-onnx", feature = "native-cuda")
+    ))]
+    #[test]
+    fn actual_external_profile_must_match_independent_lock_paths_and_caps() {
+        let changes: &[fn(&mut PalsExternalCpuRV3)] = &[
+            |c| c.profile.sha256 = "f".repeat(64),
+            |c| c.profile.bytes += 1,
+            |c| c.profile_canonical_sha256 = "f".repeat(64),
+            |c| c.binary.sha256 = "f".repeat(64),
+            |c| c.binary.source = "https://github.com/official-stockfish/Stockfish/tree/pin".into(),
+            |c| c.resolver.semantics_sha256 = "f".repeat(64),
+            |c| c.policy.threads_max = 1,
+            |c| c.policy.hash_mib_max = 8,
+            |c| c.policy.max_depth = 4,
+            |c| c.policy.max_prefix_plies = 32,
+            |c| c.policy.handshake_max_ms = 500,
+            |c| c.policy.task_wall_time_max_ms = 500,
+            |c| c.policy.stop_grace_max_ms = 50,
+            |c| c.policy.shutdown_grace_max_ms = 50,
+            |c| c.policy.lifetime_output_bytes_max = 2048,
+            |c| c.policy.line_bytes_max = 512,
+        ];
+        for (index, change) in changes.iter().enumerate() {
+            let mut f = ExternalProfileFixture::new();
+            f.mutate_declaration(*change);
+            assert!(
+                f.verify().is_err(),
+                "accepted actual profile mismatch {index}"
+            );
+        }
+        let mut f = ExternalProfileFixture::new();
+        f.program = f.program.with_file_name("different-program");
+        assert!(f.verify().is_err());
+        let mut f = ExternalProfileFixture::new();
+        f.cwd = f.root.join("different-cwd");
+        assert!(f.verify().is_err());
+        let mut f = ExternalProfileFixture::new();
+        let PalsEngineV3::Pals(e) = &mut f.lock.manifest.engines[0] else {
+            unreachable!()
+        };
+        e.cpu_r = PalsCpuRSelectionV3::Own;
+        f.lock = f.lock.manifest.lock().unwrap();
+        assert!(
+            f.verify()
+                .unwrap_err()
+                .to_string()
+                .contains("own CPU_R selection")
+        );
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        any(feature = "pals-collection-onnx", feature = "native-cuda")
+    )))]
+    #[test]
+    fn external_profile_verification_has_no_feature_or_platform_fallback() {
+        let lock = fixture().semantic_lock;
+        let error = verify_pals_external_cpu_r_profile(
+            &lock,
+            NativeEngineRole::Baseline,
+            Path::new("/missing-source"),
+            Path::new("/missing-program"),
+            Path::new("/missing-cwd"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported external CPU_R profile verification")
+        );
+    }
     fn native_fixture() -> PalsArenaLaunchV3 {
         let mut f = fixture();
         let PalsEngineV3::Pals(e) = &mut f.semantic_lock.manifest.engines[0] else {
@@ -3606,8 +4353,47 @@ mod tests {
                 cpu_depth: 2,
                 max_situations: 4096,
             },
+            external_cpu_r: None,
         });
         f
+    }
+    #[test]
+    fn own_native_launch_omits_external_binding_and_rejects_unregistered_paths() {
+        let input = native_fixture();
+        let text = serde_json::to_string(&input).unwrap();
+        let legacy: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            legacy["endpoints"][0]["configuration"]
+                .get("external_cpu_r")
+                .is_none()
+        );
+        let decoded = PalsArenaLaunchV3::from_json(&text).unwrap();
+        assert_eq!(
+            crate::canonical_sha256(&decoded).unwrap(),
+            crate::canonical_sha256(&input).unwrap()
+        );
+        let valid = PalsExternalCpuRLaunchV3 {
+            registered_program: "/registered-cas/stockfish".into(),
+            registered_working_directory: "/registered-cas".into(),
+        };
+        assert!(valid.validate().is_ok());
+        for path in [
+            "relative/stockfish",
+            "/registered-cas/../stockfish",
+            "/registered-cas/./stockfish",
+            "/registered-cas//stockfish",
+            "/registered-cas/.env",
+            "/registered-cas/id_ed25519",
+            "/registered-cas/stockfish\n",
+            "C:\\registered-cas\\stockfish",
+        ] {
+            let mut bad = valid.clone();
+            bad.registered_program = path.into();
+            assert!(bad.validate().is_err());
+        }
+        let mut mismatched = valid.clone();
+        mismatched.registered_working_directory = "/other-cas".into();
+        assert!(mismatched.validate().is_err());
     }
     fn cuda_fixture() -> (PalsArenaLaunchV3, Vec<u8>) {
         let mut f = native_fixture();
@@ -3800,6 +4586,75 @@ mod tests {
         end["native"]["backend_stats_observation"] = "exclusive_worker_before_shutdown".into();
         end["native"]["backend_stats"] = stats_fixture(2, 5);
         (start, end)
+    }
+    #[test]
+    fn undeclared_host_record_pages_cannot_be_accepted_as_whole_input_native_execution() {
+        let (input, _) = cuda_fixture();
+        let lock = input.lock().unwrap();
+        let (start, end) = cuda_records_fixture(&lock);
+        let validate = |s: &serde_json::Value, t: &serde_json::Value| {
+            validate_pals_native_records(
+                &lock,
+                NativeEngineRole::Baseline,
+                &serde_json::to_vec(s).unwrap(),
+                &serde_json::to_vec(t).unwrap(),
+                "native-process-100",
+            )
+        };
+        assert!(validate(&start, &end).is_ok());
+        let mut legacy_start = start.clone();
+        let mut legacy_end = end.clone();
+        for record in [&mut legacy_start, &mut legacy_end] {
+            record["native"]["execution"]["host_record_pages"] = serde_json::Value::Null;
+            record["native"]["host_record_page_observation"] = serde_json::Value::Null;
+        }
+        assert!(validate(&legacy_start, &legacy_end).is_ok());
+        for startup in [true, false] {
+            for declaration in [true, false] {
+                for selected in [
+                    serde_json::json!({"schema":"rz-pals-host-record-page-observation/1"}),
+                    serde_json::json!({}),
+                    serde_json::json!(false),
+                ] {
+                    let mut s = start.clone();
+                    let mut t = end.clone();
+                    let record = if startup { &mut s } else { &mut t };
+                    if declaration {
+                        record["native"]["execution"]["host_record_pages"] = selected;
+                    } else {
+                        record["native"]["host_record_page_observation"] = selected;
+                    }
+                    let error = validate(&s, &t).unwrap_err();
+                    assert!(
+                        matches!(error, ArenaError::Integrity(ref detail) if detail.contains("unsupported undeclared host record-page"))
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn independent_helper_evidence_cannot_silently_attest_default_own_cpu_r() {
+        let (input, _) = cuda_fixture();
+        let lock = input.lock().unwrap();
+        let (start, end) = cuda_records_fixture(&lock);
+        for startup in [true, false] {
+            let mut s = start.clone();
+            let mut t = end.clone();
+            let record = if startup { &mut s } else { &mut t };
+            record["cpu_checker"] =
+                serde_json::json!({"schema_version":1,"domain":"rz-pals-checker-process/1"});
+            let error = validate_pals_native_records(
+                &lock,
+                NativeEngineRole::Baseline,
+                &serde_json::to_vec(&s).unwrap(),
+                &serde_json::to_vec(&t).unwrap(),
+                "native-process-100",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, ArenaError::Integrity(ref detail) if detail.contains("unsupported external CPU_R native receipt"))
+            );
+        }
     }
     #[test]
     fn pals_v3_launch_lock_has_own_identity_and_actual_endpoint_cli() {
