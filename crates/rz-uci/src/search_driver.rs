@@ -251,7 +251,7 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> SearchSessionDriver for Pa
                     cpu_depth: self.cpu_depth,
                 },
                 &context.control.cancellation,
-                progress,
+                &mut *progress,
             );
             if let Some(counters) = engine.last_search_counters() {
                 observation = AttemptObservation::Pals {
