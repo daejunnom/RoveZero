@@ -8,8 +8,10 @@ output directory outside the checkout. GPU validation is a different stage.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 import subprocess
@@ -31,11 +33,28 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--runtime-store", type=Path,
+                        help="External immutable content-addressed CPU runtime asset store")
+    parser.add_argument("--source-commit", help="Coordinator-verified HEAD for a cross-OS worktree")
+    parser.add_argument("--source-dirty", action="store_true")
+    parser.add_argument("--layout", choices=("separate_pc", "shared_pc_if"), default="separate_pc")
+    parser.add_argument("--rules-profile-json", type=Path,
+                        help="Registered descriptor emitted by the Rust Rules encoder")
     args = parser.parse_args()
     if not 0 <= args.seed <= 2**63 - 1:
         parser.error("seed must fit nonnegative signed int64")
+    if args.source_commit and not re.fullmatch(r"[0-9a-f]{40}", args.source_commit):
+        parser.error("source commit must be a full lowercase SHA-1")
     source = Path(__file__).resolve().parent.parent
     output = checked(args.output)
+    runtime_store = checked(args.runtime_store) if args.runtime_store else None
+    rules_profile = checked(args.rules_profile_json) if args.rules_profile_json else None
+    if args.layout == "shared_pc_if" and rules_profile is None:
+        parser.error("shared_pc_if requires a registered Rules descriptor")
+    if rules_profile and (not rules_profile.is_file() or rules_profile.stat().st_size > 64 * 1024):
+        parser.error("Rules descriptor must be a bounded regular file")
+    if runtime_store and (runtime_store.is_relative_to(source) or source.is_relative_to(runtime_store)):
+        parser.error("runtime store must be outside the checkout")
     if output.is_relative_to(source) or source.is_relative_to(output) or output.exists():
         parser.error("output must be a fresh directory outside the checkout")
     scratch = os.environ.get("TMPDIR")
@@ -45,6 +64,29 @@ def main():
     receipt = {"schema": "rovezero.pals-cpu-model-validation.v1", "status": "running",
                "training_executed": False, "training_steps": 0,
                "provider": "cpu", "gpu_validation": "not_run", "stages": {}}
+    receipt["seed"] = args.seed
+    receipt["layout"] = args.layout
+    if rules_profile:
+        receipt["rules_profile"] = {"sha256": hashlib.sha256(rules_profile.read_bytes()).hexdigest(),
+                                    "bytes": rules_profile.stat().st_size}
+    if args.source_commit:
+        receipt["source_commit"] = args.source_commit
+        receipt["source_dirty"] = args.source_dirty
+        receipt["source_commit_method"] = "coordinator_registered_cross_os_worktree"
+    else:
+        receipt["source_commit"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
+        receipt["source_dirty"] = subprocess.run(
+            ["git", "diff", "--quiet", "--no-ext-diff"], cwd=source, check=False).returncode != 0
+        receipt["source_commit_method"] = "local_git"
+    package = source / "experiments/model-research/pals"
+    source_files = [Path(__file__).resolve(), source / "crates/rz-eval/src/pals_model.rs"]
+    source_files.extend(sorted((package / "src/rz_pals_model").glob("*.py")))
+    source_files.extend(sorted((package / "tests").glob("*.py")))
+    receipt["source_files"] = {str(p.relative_to(source)).replace("\\", "/"):
+        hashlib.sha256(p.read_bytes()).hexdigest() for p in source_files}
+    receipt["versions"] = {"torch": "2.8.0", "numpy": "2.2.6", "onnx": "1.19.0",
+                           "onnxruntime": "1.22.0"}
     started = time.monotonic()
     environment = os.environ.copy()
     environment.update({"PYTHONDONTWRITEBYTECODE": "1", "PIP_NO_CACHE_DIR": "1",
@@ -60,7 +102,6 @@ def main():
                 str(python), "-m", "pip", "install", "torch==2.8.0",
                 "--index-url", "https://download.pytorch.org/whl/cpu"],
                 cwd=source, environment=environment, seconds=600)
-            package = source / "experiments/model-research/pals"
             stages["reference_install_seconds"] = run([
                 str(python), "-m", "pip", "install", "numpy==2.2.6", "onnx==1.19.0",
                 "onnxruntime==1.22.0"], cwd=source, environment=environment)
@@ -74,8 +115,11 @@ def main():
             stages["initialize_seconds"] = run(cli + ["init", "--seed", str(args.seed),
                 "--output", str(initialization)], cwd=source, environment=environment)
             checkpoint = initialization / "untrained.pt"
-            stages["export_seconds"] = run(cli + ["export", "--checkpoint", str(checkpoint),
-                "--output", str(export)], cwd=source, environment=environment)
+            export_command = cli + ["export", "--checkpoint", str(checkpoint),
+                "--output", str(export), "--layout", args.layout]
+            if rules_profile:
+                export_command += ["--rules-profile-json", str(rules_profile)]
+            stages["export_seconds"] = run(export_command, cwd=source, environment=environment)
             stages["numeric_seconds"] = run(cli + ["numeric-check", "--checkpoint",
                 str(checkpoint), "--export", str(export)], cwd=source, environment=environment)
             stages["rust_fixtures_seconds"] = run(cli + ["rust-fixtures", "--checkpoint",
@@ -87,9 +131,25 @@ def main():
                 "import onnxruntime,pathlib; p=pathlib.Path(onnxruntime.__file__).parent/'capi'; "
                 "print(next(p.glob('libonnxruntime.so.1.22.0')))"],
                 cwd=source, env=environment, text=True).strip()
-            runtime_dir = output / "native-runtime"
-            runtime_dir.mkdir(exist_ok=False)
-            shutil.copyfile(runtime_path, runtime_dir / "libonnxruntime.so.1.22.0")
+            runtime_sha256 = hashlib.sha256(Path(runtime_path).read_bytes()).hexdigest()
+            runtime_dir = (runtime_store / runtime_sha256) if runtime_store else output / "native-runtime"
+            runtime_dir = checked(runtime_dir)
+            runtime_dir.mkdir(parents=True, exist_ok=runtime_store is not None)
+            runtime_asset = checked(runtime_dir / "libonnxruntime.so.1.22.0")
+            if runtime_asset.exists():
+                if hashlib.sha256(runtime_asset.read_bytes()).hexdigest() != runtime_sha256:
+                    raise OSError("immutable CPU runtime store digest mismatch")
+            else:
+                # Exclusive create prevents replacing an already registered runtime.
+                with open(runtime_path, "rb") as origin, runtime_asset.open("xb") as destination:
+                    shutil.copyfileobj(origin, destination, 1024 * 1024)
+            receipt["runtime"] = {"path": str(runtime_asset), "sha256": runtime_sha256,
+                                  "bytes": runtime_asset.stat().st_size}
+            if any(hashlib.sha256((source / relative).read_bytes()).hexdigest() != digest
+                   for relative, digest in receipt["source_files"].items()):
+                raise OSError("validation source changed during the registered run")
+            if rules_profile and hashlib.sha256(rules_profile.read_bytes()).hexdigest() != receipt["rules_profile"]["sha256"]:
+                raise OSError("registered Rules descriptor changed during validation")
             receipt["status"] = "success"
     except (OSError, subprocess.SubprocessError) as error:
         receipt["status"] = "failed"

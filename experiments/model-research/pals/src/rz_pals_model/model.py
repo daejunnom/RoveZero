@@ -229,7 +229,9 @@ def initialize(seed, config=ModelConfig()):
     if not isinstance(seed, int) or not 0 <= seed < 2**63:
         raise ValueError("seed must be a nonnegative 63-bit integer")
     with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(seed)
+        # torch.manual_seed also resets CUDA/MPS/XPU generators, which this
+        # CPU-only fork does not save. Touch only the scoped CPU generator.
+        torch.random.default_generator.manual_seed(seed)
         return PalsModel(config).eval()
 
 

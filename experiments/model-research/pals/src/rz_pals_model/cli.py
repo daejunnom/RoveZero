@@ -15,6 +15,8 @@ def main(argv=None):
     export.add_argument("--checkpoint", required=True)
     export.add_argument("--output", required=True)
     export.add_argument("--include-validator", action="store_true")
+    export.add_argument("--layout", choices=("separate_pc", "shared_pc_if"), default="separate_pc")
+    export.add_argument("--rules-profile-json")
     check = commands.add_parser("numeric-check")
     check.add_argument("--checkpoint", required=True)
     check.add_argument("--export", required=True)
@@ -39,7 +41,7 @@ def main(argv=None):
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         if args.command == "init": result = initialize_checkpoint(args.output, args.seed)
-        elif args.command == "export": result = export_checkpoint(args.checkpoint, args.output, args.include_validator)
+        elif args.command == "export": result = export_checkpoint(args.checkpoint, args.output, args.include_validator, args.layout, args.rules_profile_json)
         elif args.command == "rust-fixtures": result = rust_fixtures(args.checkpoint, args.export, args.output)
         else: result = numeric_check(args.checkpoint, args.export)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False))
