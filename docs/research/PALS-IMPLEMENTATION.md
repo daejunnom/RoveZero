@@ -1234,3 +1234,59 @@ Clippy `-D warnings`, workspace format 검사를 통과했다. 독립 source fre
 child·독립 durable caller anchor·후속 비교 소비는 아직 미실행이다. 실제 비학습
 Repair next-move 준비·C divergence ranking·외부 helper의 paired 종단 인수도 별도다.
 GPU 검증과 실제 학습은 이번 실행에서 계속 제외한다.
+
+### 실제 최초 Repair의 causal·ordinal CPU 소비
+
+root63은 등록된 root58 수집기를 재사용하되 line 3ply·rounds 1·최대 1ply 게임으로
+새 실행 조건과 source 등록을 고정했다. 기존 line 2ply에서 opponent reply 뒤의 prefix가
+line 상한에 도달하여 실제 Repair 모델 호출이 생기지 않았던 경로와 구분한다.
+ordinary 7행·native 역할 호출 8건(Propose 3/Divergence 1/Reply 2/Repair 2), NN 입력
+16개(public 8/role 8)를 회수했다. 물리 역할 완료·탐색 소비는 각각 8건이며 정상 shutdown·
+buffer 해제·in-flight 0·process reap/EOF/group 부재를 확인했다. ply-limit은 unknown이다.
+수집기 loaded inode를 stdin 이전에 관측했다고 소급하지 않으며 실제 caller path/group
+증거를 사용한다. 이 실행은 새 source를 빌드했다는 주장이 아니라 root58의 독립 build
+등록·immutable binary를 재사용한 실제 collection이다.
+
+root64는 outcome 이전에 첫 Repair `request_sequence=6`, proposal `[1609,3063,1487]`,
+counterexample `[1609,2745,1032]`, prefix `[1609,2745]`와 Rules 순서의 첫·마지막 합법
+후보를 고정했다. historical root52/source `638858f`의 등록 binary에서 Rules-only child
+2개로 정확한 root/proposal/prefix/tail을 확인했고 CPU 탐색은 0회였다. 별도 fresh candidate
+child 2개는 H2·N100000·TT16·q4·각 10초의 같은 조건으로 실행했다. binary loaded inode를
+stdin 전에 대조하고 exit 0·reap·EOF·owned group 부재를 각각 확인했다.
+
+persisted bank의 실제 bytes를 독립 pin한 뒤 strict reload가 반환한 새 parent 객체에
+동일 causal bytes를 재인수했다. 이 재연결을 Rules child 재실행으로 세지 않는다.
+Repair 입력 SHA `0aeb5caaf2cf03a39b9091d9f0639e9b7c4225a8544116ba07209c65f3ce0e52`의
+활성 ordinal pair 1개·sign -1과 frozen softplus loss `1.1267693042755127`을 확인했다.
+full V를 보존한 checkpoint `b07a2af…`의 parameter SHA는 전후 동일한 `eedfe35…`였다.
+optimizer 생성·backward·update·GPU는 0이다. 이 목표는 다음 Repair 수의 조건부 유한 깊이
+순위이며 strategic repair validity·counterexample validity·counterfactual WDL·C divergence
+ranking을 인수하지 않는다.
+
+driver 검토에서 all-masked 분기에도 dispatch/identity/cleanup 실패를 먼저 거절하도록
+공통 검사를 강화했다. 정상 partial/tie만 HOLD이며 실패 producer를 HOLD로 숨기지 않는다.
+final artifact fsync와 stdout 뒤에도 원래 180초를 확인한다. driver의 사전 publication 시간과
+supervisor의 실제 exit/pipe/cleanup 시간은 별도로 기록했다. 후자는 19.657초·exit 0이며
+copied CPU 환경 설치를 포함한 service는 59.630초였다. 성능 비교 자료로 사용하지 않는다.
+managed temporary 제거·tree cleanup은 verified이고 실제 peak는 unknown으로 둔다.
+
+원시 자료는 `runs/pals/strict-native-divergence-capture-cpu-63/`,
+`actual-native-repair-cpu-64/`와 continuation의 root64 supervisor 기록에 보존한다.
+root64 `root-result.json` SHA-256은
+`0fa09d08eeefffdd419ac13ad314bf11244a3f64b884b3c5c6c422541e226bde`다.
+root64의 CPU checker source 재사용을 다음 root66의 새 Rust continuation 인수로 대체하지 않는다.
+
+### 새 continuation binary 등록과 정확한 CI
+
+root66은 `83b886c4bd65e738bcf0738ecff7265081313fbb`의 Git-tracked Rust/Cargo 230개를
+빌드 전후 대조했다. immutable CPU 바이너리는 39,208,872 bytes·SHA-256
+`6c6ec1ebf8ab12353059a104ee3760f30adbbdc228a8f8769a70d6feb9906ed6`이며 debug·
+default+search-work-receipts·locked/offline·Rust 1.96.0을 기록했다. Cargo의 compiler artifact
+`fresh=false`도 보존한다. build exit 0·source 전후 일치·managed cleanup을 확인했으며 이
+등록만으로 실제 새 continuation child나 비교 소비를 인수하지 않는다.
+
+public source lookup 수정 `c8f22cb`의 [CI 37695229359](https://github.com/daejunnom/RoveZero/actions/runs/37695229359)와
+Rust continuation source `83b886c`의 [CI 37696418278](https://github.com/daejunnom/RoveZero/actions/runs/37696418278)는
+Linux·Windows·CPU bindings·model CPU 네 job 모두 실제 성공했다. 후자의 Windows job은
+2026-10-07 22:34:48 UTC에 완료했다. 이전 진행 중 관측과 최종 성공 관측을 구분하고,
+GPU·전체 paired 인수·후속 source의 검사를 대신하지 않는다.
