@@ -2356,6 +2356,19 @@ pub fn validate_pals_process_work(
         work_count(&work[totals], field)?;
     }
     for (field, value) in work[totals].as_object().unwrap() {
+        if field == "external_checker_work_incomplete" {
+            require(
+                kind == "pals" && (value.is_boolean() || value.is_null()),
+                "external checker work completeness type invalid",
+            )?;
+            if startup {
+                require(
+                    value.as_bool() != Some(true),
+                    "startup already observed incomplete external checker work",
+                )?;
+            }
+            continue;
+        }
         if !matches!(
             field.as_str(),
             "retained_situations_peak" | "unknown_root_children" | "max_completed_depth"
@@ -4831,6 +4844,30 @@ mod tests {
         assert!(validate_pals_process_work(&cpu, "cpu", true).is_err());
         work["pals_resolver"]["semantics_sha256"][0] = 256.into();
         assert!(validate_pals_process_work(&work, "pals", true).is_err());
+    }
+    #[test]
+    fn additive_external_work_completeness_keeps_boolean_and_unknown_distinct() {
+        let mut work = work_fixture("pals");
+        // Historical receipts omit the field; current own-checker receipts
+        // explicitly observe that no incomplete foreign work exists.
+        assert!(validate_pals_process_work(&work, "pals", true).is_ok());
+        for value in [serde_json::Value::Null, false.into()] {
+            work["pals"]["external_checker_work_incomplete"] = value;
+            assert!(validate_pals_process_work(&work, "pals", true).is_ok());
+        }
+        work["pals"]["external_checker_work_incomplete"] = true.into();
+        assert!(validate_pals_process_work(&work, "pals", true).is_err());
+        assert!(validate_pals_process_work(&work, "pals", false).is_ok());
+        for value in [0.into(), "false".into(), serde_json::json!({})] {
+            work["pals"]["external_checker_work_incomplete"] = value;
+            assert!(validate_pals_process_work(&work, "pals", false).is_err());
+        }
+        let mut cpu = work_fixture("cpu");
+        cpu["cpu"]["external_checker_work_incomplete"] = false.into();
+        assert!(validate_pals_process_work(&cpu, "cpu", false).is_err());
+        work["pals"]["external_checker_work_incomplete"] = false.into();
+        work["pals"]["completed_cpu_tasks"] = serde_json::Value::Null;
+        assert!(validate_pals_process_work(&work, "pals", false).is_err());
     }
     #[test]
     fn pals_core_projection_separates_cpu_evidence_reuse_from_nn_and_actual_consumption() {
