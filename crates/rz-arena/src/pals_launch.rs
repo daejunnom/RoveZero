@@ -1604,6 +1604,15 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
         }
         Ok(arguments)
     }
+    fn uses_separate_preflight_runtime_root(
+        &self,
+        role: NativeEngineRole,
+    ) -> Result<bool, ArenaError> {
+        Ok(self
+            .input
+            .external_cpu_r_binding(role_index(role))?
+            .is_some())
+    }
     fn preflight_arguments(
         &self,
         role: NativeEngineRole,
@@ -1619,17 +1628,30 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
             runtime_root.is_absolute(),
             "preflight cache root must be absolute",
         )?;
-        let isolated_root = self
+        let isolated = self
             .input
             .external_cpu_r_binding(role_index(role))?
-            .map(|_| pals_external_cpu_r_preflight_root(role, runtime_root))
-            .transpose()?;
-        let evidence_root = isolated_root.as_deref().unwrap_or(runtime_root);
+            .is_some();
+        // The Native capability owner creates and pins this exact root. Do not
+        // derive an unowned sibling from a game path at the argv boundary.
+        if isolated {
+            let expected = match role {
+                NativeEngineRole::Baseline => "external-baseline-preflight-runtime",
+                NativeEngineRole::Candidate => "external-candidate-preflight-runtime",
+            };
+            require(
+                runtime_root
+                    .file_name()
+                    .is_some_and(|name| name == expected),
+                "external CPU_R preflight requires the owner-selected role root",
+            )?;
+        }
+        let evidence_root = runtime_root;
         let mut arguments = vec![pals_shared_runtime_argument()?];
         if let Some(profile) = self.cuda_profile_argument(role, evidence_root)? {
             arguments.push(profile);
         }
-        if isolated_root.is_some() {
+        if isolated {
             let root = evidence_root
                 .to_str()
                 .ok_or_else(|| invalid("external CPU_R preflight evidence root is not UTF-8"))?;
@@ -4199,8 +4221,21 @@ mod tests {
         assert!(view.validate_execution().is_err());
         let game_root = fixture.root.join("baseline-runtime");
         let preflight_root = fixture.root.join("external-baseline-preflight-runtime");
+        assert!(
+            view.uses_separate_preflight_runtime_root(NativeEngineRole::Baseline)
+                .unwrap()
+        );
+        assert!(
+            !view
+                .uses_separate_preflight_runtime_root(NativeEngineRole::Candidate)
+                .unwrap()
+        );
+        assert!(
+            view.preflight_arguments(NativeEngineRole::Baseline, &game_root)
+                .is_err()
+        );
         let preflight = view
-            .preflight_arguments(NativeEngineRole::Baseline, &game_root)
+            .preflight_arguments(NativeEngineRole::Baseline, &preflight_root)
             .unwrap();
         let runtime = view
             .runtime_arguments(NativeEngineRole::Baseline, &game_root)

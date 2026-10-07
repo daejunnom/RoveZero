@@ -637,6 +637,7 @@ pub(crate) mod linux {
         owner: &mut NativeLaunchOwner<S>,
         mut cache_hint: Option<&mut SnapshotCacheHint>,
     ) -> Result<(), ArenaError> {
+        crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot)?;
         crate::native_launch::linux::verify_input_directories(
             &owner.snapshot.directory,
             &owner.snapshot.input_directory,
@@ -805,10 +806,7 @@ pub(crate) mod linux {
             let binary = pin(&owner.snapshot.pins, &e.binary)?;
             // Option identification/readiness probes must not create game-only
             // provider records in the role runtime directory.
-            let runtime_root = owner.snapshot.path.join(match role {
-                NativeEngineRole::Baseline => "baseline-runtime",
-                NativeEngineRole::Candidate => "candidate-runtime",
-            });
+            let runtime_root = owner.snapshot.preflight_runtime_path(role);
             let args = crate::native_launch::linux::external_arguments(
                 &owner.spec,
                 role,
@@ -855,6 +853,7 @@ pub(crate) mod linux {
                 max_output_bytes: 256 * 1024,
                 max_child_processes: owner.spec.view().budget.max_child_processes,
             };
+            preflight_runtime_totals(owner)?;
             let process = crate::supervise_protocol_in_directory(
                 &launch.program.file,
                 &launch.arguments,
@@ -866,6 +865,8 @@ pub(crate) mod linux {
             )?;
             bundle.process = Some(process);
             let process = bundle.process.as_ref().expect("probe process retained");
+            let root_recheck =
+                crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot);
             let tag = match role {
                 NativeEngineRole::Baseline => "baseline",
                 NativeEngineRole::Candidate => "candidate",
@@ -894,6 +895,8 @@ pub(crate) mod linux {
                     "external identification failed process/cleanup gate",
                 ));
             }
+            root_recheck?;
+            preflight_runtime_totals(owner)?;
             let identification_process = process.receipt.clone();
             put(
                 owner,
@@ -905,6 +908,7 @@ pub(crate) mod linux {
             let advertisement = crate::parse_uci_advertisement(&process.stdout)?;
             crate::validate_uci_options(&advertisement, &e.expected_uci_name, &requested)?;
             let commands = crate::uci_preflight_commands(&requested, e.family == "stockfish")?;
+            preflight_runtime_totals(owner)?;
             let process = crate::supervise_protocol_in_directory(
                 &launch.program.file,
                 &launch.arguments,
@@ -916,6 +920,8 @@ pub(crate) mod linux {
             )?;
             bundle.process = Some(process);
             let process = bundle.process.as_ref().expect("readiness process retained");
+            let root_recheck =
+                crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot);
             put(
                 owner,
                 &format!("external-{tag}-readiness.stdout.log"),
@@ -940,6 +946,8 @@ pub(crate) mod linux {
                     "external readiness/stop/quit failed process/cleanup gate",
                 ));
             }
+            root_recheck?;
+            preflight_runtime_totals(owner)?;
             if crate::parse_uci_advertisement(&process.stdout)? != advertisement {
                 return Err(invalid(
                     "external advertisements differ across preflight sessions",
@@ -1861,15 +1869,14 @@ pub(crate) mod linux {
             physical_drain: "confirmed".into(),
         })
     }
-    fn runtime_tree<S: NativeLaunchDeclaration>(
+    fn runtime_tree(
         directory: &Dir,
         depth: usize,
         files: &mut u32,
         dirs: &mut u32,
         bytes: &mut u64,
-        owner: &NativeLaunchOwner<S>,
+        budget: rz_experiments::NativeResourceBudgetV1,
     ) -> Result<(), ArenaError> {
-        let budget = owner.spec.view().budget;
         if depth > budget.max_runtime_depth as usize {
             return Err(ArenaError::Budget("native runtime depth exceeded".into()));
         }
@@ -1905,7 +1912,7 @@ pub(crate) mod linux {
                     files,
                     dirs,
                     bytes,
-                    owner,
+                    budget,
                 )?;
             } else if metadata.is_file() {
                 *files = files.checked_add(1).ok_or_else(|| {
@@ -1947,6 +1954,108 @@ pub(crate) mod linux {
             }
         }
         Ok(())
+    }
+    /// Additional roots and all their children consume the existing shared
+    /// runtime entry/byte limits. The periodic whole-attempt watch remains
+    /// unchanged; this stage barrier does not create a kernel filesystem quota.
+    fn preflight_runtime_totals<S: NativeLaunchDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+    ) -> Result<(u32, u32, u64), ArenaError> {
+        crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot)?;
+        if owner
+            .snapshot
+            .preflight_runtime_roots
+            .iter()
+            .all(Option::is_none)
+        {
+            return Ok((0, 0, 0));
+        }
+        let mut files = 0u32;
+        let mut dirs = owner
+            .snapshot
+            .preflight_runtime_roots
+            .iter()
+            .flatten()
+            .count() as u32;
+        let mut bytes = 0u64;
+        if dirs > owner.spec.view().budget.max_runtime_files {
+            return Err(ArenaError::Budget(
+                "native preflight roots exceed runtime entry budget".into(),
+            ));
+        }
+        for root in owner.snapshot.preflight_runtime_roots.iter().flatten() {
+            runtime_tree(
+                &root.directory,
+                0,
+                &mut files,
+                &mut dirs,
+                &mut bytes,
+                owner.spec.view().budget,
+            )?;
+        }
+        Ok((files, dirs, bytes))
+    }
+    #[cfg(test)]
+    #[test]
+    fn preflight_and_game_runtime_trees_consume_one_unchanged_aggregate() {
+        let base = std::env::temp_dir().join(format!(
+            "rovezero-preflight-runtime-quota-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&base).unwrap();
+        for name in ["preflight", "game"] {
+            std::fs::create_dir(base.join(name)).unwrap();
+            std::fs::write(base.join(name).join("receipt.json"), b"abc").unwrap();
+        }
+        let directory = Dir::open_ambient_dir(&base, cap_std::ambient_authority()).unwrap();
+        let preflight = directory.open_dir_nofollow("preflight").unwrap();
+        let game = directory.open_dir_nofollow("game").unwrap();
+        let budget = rz_experiments::NativeResourceBudgetV1 {
+            max_input_bytes: 1,
+            max_output_bytes: 1,
+            max_runtime_bytes: 6,
+            max_artifact_bytes: 8,
+            max_child_processes: 1,
+            max_runtime_files: 3,
+            max_runtime_depth: 0,
+            address_space_per_process_bytes: 0,
+        };
+        let scan = |budget| {
+            // Only the additional preflight root consumes a new fixed runtime
+            // directory entry. The historical game-root accounting is unchanged.
+            let (mut files, mut dirs, mut bytes) = (0, 1, 0);
+            runtime_tree(&preflight, 0, &mut files, &mut dirs, &mut bytes, budget)?;
+            runtime_tree(&game, 0, &mut files, &mut dirs, &mut bytes, budget)?;
+            Ok::<_, ArenaError>((files, dirs, bytes))
+        };
+        assert_eq!(scan(budget).unwrap(), (2, 1, 6));
+        assert!(matches!(
+            scan(rz_experiments::NativeResourceBudgetV1 {
+                max_runtime_bytes: 5,
+                ..budget
+            }),
+            Err(ArenaError::Budget(_))
+        ));
+        assert!(matches!(
+            scan(rz_experiments::NativeResourceBudgetV1 {
+                max_runtime_files: 2,
+                ..budget
+            }),
+            Err(ArenaError::Budget(_))
+        ));
+        std::fs::create_dir(base.join("preflight/nested")).unwrap();
+        assert!(matches!(scan(budget), Err(ArenaError::Budget(_))));
+        std::fs::remove_dir(base.join("preflight/nested")).unwrap();
+        std::os::unix::fs::symlink(base.join("game/receipt.json"), base.join("preflight/alias"))
+            .unwrap();
+        assert!(matches!(scan(budget), Err(ArenaError::Integrity(_))));
+        std::fs::remove_file(base.join("preflight/alias")).unwrap();
+        std::fs::hard_link(base.join("game/receipt.json"), base.join("preflight/alias")).unwrap();
+        assert!(matches!(scan(budget), Err(ArenaError::Integrity(_))));
+        drop(preflight);
+        drop(game);
+        drop(directory);
+        std::fs::remove_dir_all(base).unwrap();
     }
     pub(super) fn verify_conversion_provenance(
         startup: &Value,
@@ -2006,7 +2115,7 @@ pub(crate) mod linux {
         let mut sessions = Vec::new();
         let mut ids = BTreeSet::new();
         let mut scanned = 0u32;
-        let (mut tree_files, mut tree_dirs, mut tree_bytes) = (0, 0, 0);
+        let (mut tree_files, mut tree_dirs, mut tree_bytes) = preflight_runtime_totals(owner)?;
         for (role, name) in [
             (NativeEngineRole::Baseline, "baseline-runtime"),
             (NativeEngineRole::Candidate, "candidate-runtime"),
@@ -2026,7 +2135,7 @@ pub(crate) mod linux {
                 &mut tree_files,
                 &mut tree_dirs,
                 &mut tree_bytes,
-                owner,
+                owner.spec.view().budget,
             )?;
             let mut session_names = Vec::new();
             for entry in directory

@@ -69,6 +69,16 @@ pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 
     ) -> Result<Vec<OsString>, ArenaError> {
         Ok(Vec::new())
     }
+    /// Default probes retain the historical role runtime path. A selected
+    /// separate root is created and pinned by the Native owner, with a fixed
+    /// role-specific sibling name; declarations cannot supply arbitrary paths.
+    /// Its entries consume the existing runtime aggregate, never a new quota.
+    fn uses_separate_preflight_runtime_root(
+        &self,
+        _role: rz_experiments::NativeEngineRole,
+    ) -> Result<bool, ArenaError> {
+        Ok(false)
+    }
     fn amend_execution_limitations(&self, _limitations: &mut Vec<String>) {}
     /// A bounded path below `inputs`; native declarations keep their old names.
     fn snapshot_relative_path(&self, _artifact: &ArtifactRef) -> Option<String> {
@@ -486,6 +496,40 @@ pub(crate) mod linux {
         pub path: PathBuf,
         pub file: File,
     }
+    pub(crate) struct PreflightRuntimeRoot {
+        pub name: &'static str,
+        pub path: PathBuf,
+        pub directory: Dir,
+        pub file: File,
+    }
+    fn preflight_runtime_name(role: NativeEngineRole) -> &'static str {
+        match role {
+            NativeEngineRole::Baseline => "external-baseline-preflight-runtime",
+            NativeEngineRole::Candidate => "external-candidate-preflight-runtime",
+        }
+    }
+    fn create_preflight_runtime_root(
+        parent: &Dir,
+        parent_path: &Path,
+        role: NativeEngineRole,
+    ) -> Result<PreflightRuntimeRoot, ArenaError> {
+        let name = preflight_runtime_name(role);
+        parent
+            .create_dir(name)
+            .map_err(|_| io("cannot create exclusive native preflight runtime root"))?;
+        let directory = parent
+            .open_dir_nofollow(name)
+            .map_err(|_| io("cannot pin native preflight runtime root"))?;
+        let file = readable_directory_pin(&directory)?;
+        file.set_permissions(Permissions::from_mode(0o700))
+            .map_err(|_| io("cannot make native preflight runtime root private"))?;
+        Ok(PreflightRuntimeRoot {
+            name,
+            path: parent_path.join(name),
+            directory,
+            file,
+        })
+    }
     pub(crate) struct Snapshot {
         pub directory: Dir,
         pub input_directory: Dir,
@@ -499,8 +543,123 @@ pub(crate) mod linux {
         pub watch: OwnedArtifactTreeWatch,
         pub limits: ProcessLimits,
         pub _runtime_root_pins: [File; 2],
+        pub preflight_runtime_roots: [Option<PreflightRuntimeRoot>; 2],
         pub input_subdirectories: BTreeMap<PathBuf, Dir>,
         pub preparation_cache_hint: Option<crate::SnapshotCacheHint>,
+    }
+    impl Snapshot {
+        pub(crate) fn preflight_runtime_path(&self, role: NativeEngineRole) -> PathBuf {
+            let index = match role {
+                NativeEngineRole::Baseline => 0,
+                NativeEngineRole::Candidate => 1,
+            };
+            self.preflight_runtime_roots[index].as_ref().map_or_else(
+                || {
+                    self.path.join(match role {
+                        NativeEngineRole::Baseline => "baseline-runtime",
+                        NativeEngineRole::Candidate => "candidate-runtime",
+                    })
+                },
+                |root| root.path.clone(),
+            )
+        }
+    }
+
+    /// The optional roots retain both the directory capability and a readable
+    /// permissions/inode pin. Reopening the direct name without following links
+    /// binds the argv path to that retained inode before and after every probe.
+    pub(crate) fn verify_preflight_runtime_roots(snapshot: &Snapshot) -> Result<(), ArenaError> {
+        verify_preflight_runtime_root_pins(
+            &snapshot.directory,
+            &snapshot.path,
+            &snapshot.preflight_runtime_roots,
+        )
+    }
+    fn verify_preflight_runtime_root_pins(
+        parent: &Dir,
+        parent_path: &Path,
+        roots: &[Option<PreflightRuntimeRoot>; 2],
+    ) -> Result<(), ArenaError> {
+        if roots.iter().all(Option::is_none) {
+            return Ok(());
+        }
+        let mut inodes = std::collections::BTreeSet::new();
+        // The crate forbids unsafe code. Read the effective UID from the same
+        // trusted procfs self observation used for Linux arena admission.
+        let mut status = Vec::new();
+        File::open("/proc/self/status")
+            .map_err(|_| io("cannot observe native preflight owner UID"))?
+            .take(16 * 1024 + 1)
+            .read_to_end(&mut status)
+            .map_err(|_| io("cannot read native preflight owner UID"))?;
+        if status.len() > 16 * 1024 {
+            return Err(ArenaError::Budget(
+                "native preflight owner observation exceeds 16KiB".into(),
+            ));
+        }
+        let status = std::str::from_utf8(&status)
+            .map_err(|_| io("native preflight owner UID observation is not UTF-8"))?;
+        let mut uid_lines = status.lines().filter_map(|line| line.strip_prefix("Uid:"));
+        let values = uid_lines
+            .next()
+            .ok_or_else(|| io("native preflight effective UID is unavailable"))?
+            .split_whitespace()
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| io("native preflight effective UID is invalid"))?;
+        if values.len() != 4 || uid_lines.next().is_some() {
+            return Err(ArenaError::Integrity(
+                "native preflight UID observation is not one complete identity".into(),
+            ));
+        }
+        let owner_uid = values[1];
+        for (role, root) in [NativeEngineRole::Baseline, NativeEngineRole::Candidate]
+            .into_iter()
+            .zip(roots)
+        {
+            let Some(root) = root else { continue };
+            let name = preflight_runtime_name(role);
+            if root.name != name || root.path != parent_path.join(name) {
+                return Err(ArenaError::Integrity(
+                    "native preflight root role/name/path differs from the closed sibling plan"
+                        .into(),
+                ));
+            }
+            let named = parent.open_dir_nofollow(name).map_err(|_| {
+                ArenaError::Integrity("native preflight root pathname changed".into())
+            })?;
+            let named_file = readable_directory_pin(&named)?;
+            let capability_file = readable_directory_pin(&root.directory)?;
+            let held = root
+                .file
+                .metadata()
+                .map_err(|_| io("native preflight held root metadata unavailable"))?;
+            let named = named_file
+                .metadata()
+                .map_err(|_| io("native preflight named root metadata unavailable"))?;
+            let capability = capability_file
+                .metadata()
+                .map_err(|_| io("native preflight capability metadata unavailable"))?;
+            for metadata in [&held, &named, &capability] {
+                if !metadata.is_dir()
+                    || metadata.uid() != owner_uid
+                    || metadata.mode() & 0o7777 != 0o700
+                {
+                    return Err(ArenaError::Integrity(
+                        "native preflight root is not a private owner directory".into(),
+                    ));
+                }
+            }
+            if (held.dev(), held.ino()) != (named.dev(), named.ino())
+                || (held.dev(), held.ino()) != (capability.dev(), capability.ino())
+                || !inodes.insert((held.dev(), held.ino()))
+            {
+                return Err(ArenaError::Integrity(
+                    "native preflight root no longer names its distinct owned inode".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn pin<'a>(
@@ -880,6 +1039,29 @@ pub(crate) mod linux {
         if total > input.budget.max_input_bytes {
             return Err(ArenaError::Budget("native input aggregate exceeded".into()));
         }
+        let separate_preflight = [
+            spec.uses_separate_preflight_runtime_root(NativeEngineRole::Baseline)?,
+            spec.uses_separate_preflight_runtime_root(NativeEngineRole::Candidate)?,
+        ];
+        let preflight_root_count = separate_preflight
+            .iter()
+            .filter(|selected| **selected)
+            .count() as u32;
+        if preflight_root_count > input.budget.max_runtime_files {
+            return Err(ArenaError::Budget(
+                "native preflight root reservation exceeds existing runtime entry budget".into(),
+            ));
+        }
+        for (selected, role) in separate_preflight
+            .into_iter()
+            .zip([NativeEngineRole::Baseline, NativeEngineRole::Candidate])
+        {
+            if selected && spec.engine_view(role)?.external.is_none() {
+                return Err(ArenaError::Integrity(
+                    "a separate native preflight root requires an external UCI endpoint".into(),
+                ));
+            }
+        }
         let mut unique = BTreeMap::new();
         for artifact in spec.declared_inputs() {
             if let Some(prior) = unique.insert(artifact.path.clone(), artifact.clone())
@@ -1105,6 +1287,18 @@ pub(crate) mod linux {
                 .map_err(|_| io("cannot make role runtime root private"))?;
             runtime_root_pins.push(pin);
         }
+        let mut preflight_runtime_roots: [Option<PreflightRuntimeRoot>; 2] = [None, None];
+        for (index, role) in [NativeEngineRole::Baseline, NativeEngineRole::Candidate]
+            .into_iter()
+            .enumerate()
+        {
+            if !separate_preflight[index] {
+                continue;
+            }
+            preflight_runtime_roots[index] =
+                Some(create_preflight_runtime_root(&directory, &path, role)?);
+        }
+        verify_preflight_runtime_root_pins(&directory, &path, &preflight_runtime_roots)?;
         let cwd = directory
             .try_clone()
             .map_err(|_| io("cannot clone native cwd"))?
@@ -1156,6 +1350,7 @@ pub(crate) mod linux {
             _runtime_root_pins: runtime_root_pins.try_into().map_err(|_| {
                 ArenaError::Integrity("native runtime root pin count differs".into())
             })?,
+            preflight_runtime_roots,
             input_subdirectories,
             preparation_cache_hint,
         })
@@ -1535,6 +1730,104 @@ pub(crate) mod linux {
         }
 
         #[test]
+        fn preflight_runtime_roots_are_exclusive_private_fixed_role_pins() {
+            let base = std::env::temp_dir().join(format!(
+                "rovezero-preflight-root-pins-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&base).unwrap();
+            let directory = Dir::open_ambient_dir(&base, cap_std::ambient_authority()).unwrap();
+            assert!(
+                !RuntimeArgumentsFixture
+                    .uses_separate_preflight_runtime_root(NativeEngineRole::Baseline)
+                    .unwrap()
+            );
+            assert!(
+                !RuntimeArgumentsFixture
+                    .uses_separate_preflight_runtime_root(NativeEngineRole::Candidate)
+                    .unwrap()
+            );
+            let mut roots = [
+                Some(
+                    create_preflight_runtime_root(&directory, &base, NativeEngineRole::Baseline)
+                        .unwrap(),
+                ),
+                Some(
+                    create_preflight_runtime_root(&directory, &base, NativeEngineRole::Candidate)
+                        .unwrap(),
+                ),
+            ];
+            verify_preflight_runtime_root_pins(&directory, &base, &roots).unwrap();
+            assert!(
+                create_preflight_runtime_root(&directory, &base, NativeEngineRole::Baseline)
+                    .is_err()
+            );
+            assert_ne!(
+                roots[0].as_ref().unwrap().file.metadata().unwrap().ino(),
+                roots[1].as_ref().unwrap().file.metadata().unwrap().ino()
+            );
+            let original_name = roots[0].as_ref().unwrap().name;
+            for invalid in [
+                "inputs",
+                "baseline-runtime",
+                "../escape",
+                "nested/root",
+                "external-candidate-preflight-runtime",
+            ] {
+                roots[0].as_mut().unwrap().name = invalid;
+                assert!(verify_preflight_runtime_root_pins(&directory, &base, &roots).is_err());
+            }
+            roots[0].as_mut().unwrap().name = original_name;
+            roots[0]
+                .as_ref()
+                .unwrap()
+                .file
+                .set_permissions(Permissions::from_mode(0o755))
+                .unwrap();
+            assert!(verify_preflight_runtime_root_pins(&directory, &base, &roots).is_err());
+            roots[0]
+                .as_ref()
+                .unwrap()
+                .file
+                .set_permissions(Permissions::from_mode(0o700))
+                .unwrap();
+            verify_preflight_runtime_root_pins(&directory, &base, &roots).unwrap();
+            drop(roots);
+            drop(directory);
+            std::fs::remove_dir_all(base).unwrap();
+        }
+        #[test]
+        fn preflight_runtime_root_recheck_rejects_symlink_and_replaced_inode() {
+            let base = std::env::temp_dir().join(format!(
+                "rovezero-preflight-root-replace-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&base).unwrap();
+            let directory = Dir::open_ambient_dir(&base, cap_std::ambient_authority()).unwrap();
+            let roots = [
+                Some(
+                    create_preflight_runtime_root(&directory, &base, NativeEngineRole::Baseline)
+                        .unwrap(),
+                ),
+                None,
+            ];
+            let path = roots[0].as_ref().unwrap().path.clone();
+            let old = base.join("retained-original");
+            std::fs::rename(&path, &old).unwrap();
+            std::os::unix::fs::symlink(&old, &path).unwrap();
+            assert!(verify_preflight_runtime_root_pins(&directory, &base, &roots).is_err());
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, Permissions::from_mode(0o700)).unwrap();
+            assert!(verify_preflight_runtime_root_pins(&directory, &base, &roots).is_err());
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::rename(&old, &path).unwrap();
+            verify_preflight_runtime_root_pins(&directory, &base, &roots).unwrap();
+            drop(roots);
+            drop(directory);
+            std::fs::remove_dir_all(base).unwrap();
+        }
+        #[test]
         fn runtime_admission_failure_precedes_preflight_and_retains_original_owner() {
             let base = std::env::temp_dir()
                 .join(format!("rovezero-runtime-admission-{}", std::process::id()));
@@ -1551,6 +1844,7 @@ pub(crate) mod linux {
                         directory.try_clone().unwrap().into_std_file(),
                         directory.try_clone().unwrap().into_std_file(),
                     ],
+                    preflight_runtime_roots: [None, None],
                     directory,
                     input_directory,
                     path: base.clone(),
