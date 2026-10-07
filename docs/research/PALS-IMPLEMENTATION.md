@@ -824,3 +824,124 @@ build의 8GiB slot/12GiB catalog 상한을 유지했다. 초기 WSL 시작 실�
 새 cloud 비용은 실행하지 않았다. CPU 기능·수치·소유권 결과를 GPU·속도·기력
 개선으로 확대하지 않는다. PR #24의 별도 자원·Ponder 변경은 읽기 전용으로 확인했으며
 이 branch의 Ponder off·기존 실행 identity에 합치지 않았다.
+
+### 2026-10-08 후속 CPU 인수 — 실제 P/C 목표·Native Warm·외부 helper pair
+
+이번 절은 앞선 candidate consumer·private Warm export·외부 helper 연결 뒤에
+확인한 CPU 인수를 소스 단위와 실행별로 추가한다. 기존 실패·마스킹·부분 완료
+기록을 유지하며 문서 인수가 실제 학습·전체 PALS Search·GPU·기력 인수로 바뀌지는
+않는다. 아래 경로는 관리 생성물 루트에 상대적인 논리 경로다. short SHA는 해당
+소스 단위를 가리키며 서로 다른 실행의 검사 수를 고유 검사 수로 합산하지 않는다.
+
+#### Warm graph와 Native owner의 연결
+
+`e287e908`은 CPU Warm graph 로더와 full accepted seed binding을 연결한 단위다.
+private latent의 일부 summary를 seed 대신 사용하지 않고 기존 full seed 계약으로
+입력을 결합한다. 이 로더의 연결과 실제 Search/Native seed 소비는 별도 인수다.
+`d287988`은 Native warm worker·exact revocation·arena의 undeclared-Warm guard를
+연결한다. 원래 Fresh domain, public K/V, exact state와 approximate seed의 구분을
+유지하고, 선언되지 않은 Warm 선택으로 기존 제품 경로가 암묵 변경되지 않게 한다.
+
+root29에서 eval library 105개, UCI 185개, arena 106개가 통과했다. 이는 해당
+warm/revocation/arena 연결의 CPU 검사 근거이며 뒤의 실제 Warm harness 결과와
+구분한다. root37에서는 eval 105개, search 183개, UCI 185개와 workspace
+all-target/all-feature Clippy `-D warnings`가 통과했다. 겹치는 suite의 수를 합산하지
+않으며 이 로컬 검사와 후속 commit의 실제 CI 완료는 별도 인수한다.
+
+#### 실제 bounded P/C producer와 zero-step 목표 소비
+
+`777fe7a`은 bounded candidate producer 단위다. root27의 합성 fixture 16개는
+실제 candidate 생성·launch·checker 소비의 종단 인수와 별도다. root30은 실제 P와
+C에서 각각 한 comparative pair를 생성했고 네 checker 호출을 각각 fresh Rust
+child로 실행했다. 실행 상태는 `completed_with_targets`, elapsed는 4,739ms였다.
+독립 strict 재로딩 뒤 frozen CPU forward에서 P loss `0.893405199`, C loss
+`1.150353670`을 계산했다. 파라미터의 실행 전후 digest는 같은
+`6d5d8fad…e39d87`이었다. 이 표기는 원본 전체 digest의 축약이며 독립 artifact
+pin으로 대신 쓰지 않는다. 정확한 digest는 원본 준비 report에 보존한다.
+
+이 결과는 **DG01의 P 후보와 C 응답 비교 목표**에 한정한 실제 target/no-step loss
+소비 근거다. 해당 source의 candidate-only checker·strict frozen loader·독립 source와
+launch pin을 유지한다. `completed_with_targets`를 backward·optimizer step·파라미터
+학습 완료로 해석하지 않으며 divergence adapter·repair 목표·V 학습·모든 비교 목표의
+완료를 주장하지 않는다. 실제 checker 네 child와 P/C pair 두 개, 계산된 loss 두 개는
+서로 다른 계수이므로 같은 작업량으로 환산하지 않는다.
+
+#### 외부 helper paired CPU02의 기능·실패 경계
+
+`external-helper-pair-cpu-02`는 실제 외부 helper의 paired runner/Core 연결과 cleanup을
+확인한 CPU 실행이다. `core_integration=true`, `cleanup=true`를 기록했으나 두 판을
+완료된 강도 pair로 인수하지 않는다. 한 판은 16 ply limit의 incomplete, 다른 판은
+15 ply의 mate로 끝났다. 제한까지의 기능 실행과 완료된 경기 결과를 구분한다.
+
+failed go는 총 11개다. 그중 두 개는 reserved node budget 256에 대해 reported
+nodes 451/893이 발생한 node overshoot이고, 후속 아홉 개는
+`checker_not_available` 실패(6개+3개)다. 각 원본 failure를 보존하고 서로 다른
+원인을 helper unavailable 11개로 합치거나 정상 자체 평가로 치환하지 않았다.
+`strength=false`를 유지하며 post-unit observer가
+없어 supervisor가 실패한 사실도 별도 기록한다. Core 연결·cleanup true가 node budget
+준수·전체 helper 수명 관측·완료 pair·기력의 성공을 보장하지 않는다. recovered PGN은
+해당 실행의 실제 경과 자료이며 원래 실패 영수증을 덮어쓰는 성공 자료가 아니다.
+
+#### Native Warm34의 실제 CPU 역할 harness
+
+Warm34는 public checked role harness에서 P/C의 Fresh/Warm을 독립 수행한 실제 CPU
+검사다. NN count는 8, 탐색 소비는 6, accepted seed는 5였다. ValueFresh는 seed bank를
+변경하지 않았고 실제 newgame fence, cancel 및 늦은 결과 거절을 확인했다. Native shutdown·
+buffer release·process group 소멸과 exit 0도 각각 관측했다. 이 역할 harness의 실제
+Native seed 소비를 앞선 metadata/export/loader fixture의 성공과 구분한다.
+
+Warm34 elapsed는 4,749ms, cgroup peak는 239,513,600 bytes, OOM은 0이었다.
+이 값은 해당 bounded CPU harness의 실행·관측 값이며 full PALS Search의 완성,
+시간 개선·기력·GPU·다른 workload의 메모리 성능으로 일반화하지 않는다. NN count,
+소비된 평가와 accepted seed는 별도 카운터이며 새 방문 또는 새 네트워크 실행의
+동일한 수량으로 합치지 않는다.
+
+Warm33의 runtime copy는 RLIMIT_FSIZE에 따른 `SIGXFSZ`로 실패했다. 이 원본
+실패를 Warm34 성공으로 덮지 않는다. Warm34의 managed cleanup도 read-only parent
+때문에 실패했고 원본을 보존했다. root35는 종료가 확인된 정확한 owner의 managed scratch
+runtime 21,050,608 bytes만 복구·정리하고 lease 해제를 verified했다. 이는 소유 범위의
+후속 복구 성공이며 원래 managed cleanup이 성공했다는 뜻이 아니다. 다른 runtime·
+실행 증거·모델·보고서를 이 복구 범위에 포함하지 않는다.
+
+후속 cleanup은 `PermissionError`일 때만 삭제 대상 내부 부모 디렉터리에 owner
+write/search 권한을 보완한다. POSIX에서는 no-follow FD와 inode 검사를 사용하고,
+일반 파일의 권한은 바꾸지 않는다. tree-gone·owner token·경로·링크·secret·예산
+검사는 유지한다. root38의 저장소·프로세스 회귀 검사 18개가 통과했고, Warm39는
+같은 등록 CPU 바이너리와 입력에서 역할 검사·known native 종료·process group
+소멸·관리 scratch 정리까지 모두 exit 0이었다. 출력 47,381 bytes, NN 8·소비 6·seed
+승인 5, cgroup peak 236,920,832 bytes·OOM 0을 기록했다. 이 peak는 fresh service
+cgroup의 보조 관측이며 Windows 전체 커밋·VRAM·native allocator peak가 아니다.
+cleanup 재검증을 위한 재실행이며 Warm34 대비 속도·메모리 개선률을 계산하지 않는다.
+
+#### 실행별 논리 근거와 남은 인수
+
+| 소스·실행 단위 | 관리 루트 아래 논리 자료 | 확인 범위 |
+|---|---|---|
+| `d287988` / root29 | `runs/pals/continuation-cpu-check-03/warm-revocation-arena-tests-29.log` | eval 105·UCI 185·arena 106의 CPU 검사 |
+| `777fe7a` / root27 | `runs/pals/continuation-cpu-check-03/comparative-consumer-tests-27.log` | 합성 fixture 16개. 실제 producer 자료와 구분 |
+| root30 실제 P/C | `runs/pals/actual-candidate-comparative-cpu-30/frozen-pc-ordinal-preparation.json` | 실제 P/C target, strict 재로딩, frozen loss·파라미터 불변 |
+| 외부 helper CPU02 | `runs/pals/external-helper-pair-cpu-02/root-functional-audit.json` | Core 연결·cleanup과 node 초과·unavailable·supervisor 실패 |
+| 외부 helper CPU02 PGN | `runs/pals/external-helper-pair-cpu-02/recovered/attempt-01/match.pgn` | 16-ply incomplete·15-ply mate의 실제 경기 경과 |
+| Warm33 실패 | `runs/pals/continuation-cpu-check-03/native-warm-execution-33.json` | runtime copy SIGXFSZ 원본 실패 |
+| Warm34 감독·실행 | `runs/pals/continuation-cpu-check-03/native-warm-supervisor-34.log`, `native-warm-execution-34.json` | 유한 실행·cgroup peak·OOM·종료 및 cleanup 실패 |
+| Warm34 역할 결과 | `runs/pals/continuation-cpu-check-03/native-warm-actual-34.stdout.json` | public checked P/C Fresh/Warm, 실제 seed·fence·취소·물리 종료 |
+| root35 복구 | `runs/pals/continuation-cpu-check-03/native-warm-cleanup-recovery-35.json` | exact stopped owner runtime만 정리·lease 해제 verified |
+| root38 정리 검사 | `runs/pals/continuation-cpu-check-03/storage-correctness-38.log` | 저장소·프로세스 검사 18개와 관리 scratch 정리 |
+| Warm39 최종 실행 | `runs/pals/continuation-cpu-check-03/native-warm-execution-39.json`, `native-warm-supervisor-39.log` | 역할 검사와 실제 종료, stdout/stderr 제한·정리까지 exit 0 |
+
+`777fe7a`의 CI에서는 CPU bindings·model CPU가 성공했으며 Linux·Windows는
+Clippy `nonminimal_bool`에서 실패했다. 그 실패와 해당 SHA를 보존한다. 후속
+수정 뒤 `675f3a5`는 nonminimal-bool CI 수정, `0c9aaf4`는 CPU Warm harness와
+known-fence reset, `f7b0070`은 실제 실패 external namespace의 admission을 새 NN
+실행 전에 차단하는 단위를 각각 commit·push했다. 실제 원본 attempt와 실패 이유는
+보존한다. root37의 로컬 Clippy 성공을 이 새 head의 CI 성공으로 보고하지 않으며
+해당 head의 실제 완료 CI는 아직 미확인이다. 원래 Warm34의 기능 성공·managed
+cleanup 실패·root35 복구를 유지한 채 root38 fixture와 Warm39 실제 bounded 재실행을
+위처럼 별도 인수했다. 실제 실행 바이너리는 build32의 dirty-source 등록이며,
+문서 통합 SHA나 후속 clean HEAD에서 새로 빌드한 바이너리로 표시하지 않는다.
+
+GPU는 사용자 지시에 따라 보류 중이고 실제 training·backward·optimizer·새 cloud
+실행은 하지 않았다. 이후에는 정확한 새 SHA의 CI, node 초과·helper unavailable·
+supervisor의 원인별 인수, 충분히 완료된 paired
+실행을 각각 진행 단위로 추적한다. P/C target 준비·실제 Warm 역할 소비가 전체
+PALS Search·divergence/repair/V 학습·속도·기력의 완료를 뜻하지 않는다.
