@@ -7,6 +7,7 @@ mod engine_environment;
 mod external_uci;
 mod fastchess;
 mod ledger;
+mod match_execution;
 mod model_endpoints;
 #[cfg(feature = "native-cuda")]
 mod native_cuda;
@@ -27,6 +28,7 @@ pub use engine_environment::EngineEnvironmentObservation;
 pub use external_uci::*;
 pub use fastchess::*;
 pub use ledger::*;
+pub use match_execution::*;
 pub use model_endpoints::*;
 #[cfg(feature = "native-cuda")]
 pub use native_cuda::*;
@@ -57,6 +59,10 @@ pub enum ArenaError {
     Integrity(String),
     Budget(String),
     Io(String),
+    HardwareProbe {
+        cause: String,
+        process: Box<ProcessOutput>,
+    },
 }
 
 impl fmt::Display for ArenaError {
@@ -73,6 +79,11 @@ impl fmt::Display for ArenaError {
             Self::Integrity(reason) => write!(f, "arena integrity: {reason}"),
             Self::Budget(reason) => write!(f, "arena budget: {reason}"),
             Self::Io(reason) => write!(f, "arena IO: {reason}"),
+            Self::HardwareProbe { cause, process } => write!(
+                f,
+                "arena hardware probe: {cause}; pid={} cleanup={:?}",
+                process.receipt.pid, process.receipt.group_cleanup
+            ),
         }
     }
 }

@@ -1,0 +1,213 @@
+diff --git a/app/src/engine/process/process_posix.hpp b/app/src/engine/process/process_posix.hpp
+index e196d85..da7e90c 100644
+--- a/app/src/engine/process/process_posix.hpp
++++ b/app/src/engine/process/process_posix.hpp
+@@ -264,6 +264,7 @@ class Process : public IProcess {
+         lines.clear();
+ 
+         const int poll_timeout_ms = normalize_poll_timeout_ms(threshold);
++        const auto rz_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(0, poll_timeout_ms));
+ 
+         std::array<pollfd, 3> fds;
+         size_t fds_count = 0;
+@@ -286,7 +287,16 @@ class Process : public IProcess {
+             // We prefer to use poll instead of select because
+             // poll is more efficient and select has a filedescriptor limit of 1024
+             // which can be a problem when running with a high concurrency
+-            const int ready = poll(fds.data(), static_cast<nfds_t>(fds_count), poll_timeout_ms);
++            int rz_wait_ms = poll_timeout_ms;
++            if (poll_timeout_ms >= 0) {
++                const auto left = rz_deadline - std::chrono::steady_clock::now();
++                if (left <= std::chrono::steady_clock::duration::zero()) {
++                    flush_partials_on_timeout(lines);
++                    return Result{Status::TIMEOUT, "timeout"};
++                }
++                rz_wait_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(left).count()) + 1;
++            }
++            const int ready = poll(fds.data(), static_cast<nfds_t>(fds_count), rz_wait_ms);
+ 
+             if (ready == -1) return Result::Error("poll failed");
+             if (ready == 0) {
+diff --git a/app/src/engine/uci_engine.cpp b/app/src/engine/uci_engine.cpp
+index 8ddb429..75dcea7 100644
+--- a/app/src/engine/uci_engine.cpp
++++ b/app/src/engine/uci_engine.cpp
+@@ -117,9 +117,9 @@ bool UciEngine::position(const std::vector<std::string_view>& moves, const std::
+     return writeEngine(command);
+ }
+ 
+-bool UciEngine::go(const TimeControl& our_tc, const TimeControl& enemy_tc, chess::Color stm) {
++bool UciEngine::go(const TimeControl& our_tc, const TimeControl& enemy_tc, chess::Color stm, bool ponder) {
+     std::stringstream input;
+-    input << "go";
++    input << (ponder ? "go ponder" : "go");
+ 
+     if (config_.limit.nodes) {
+         input << " nodes " << config_.limit.nodes;
+@@ -164,6 +164,8 @@ bool UciEngine::go(const TimeControl& our_tc, const TimeControl& enemy_tc, chess
+ }
+ 
+ bool UciEngine::ucinewgame() {
++    if (!rzStopPonder(getPingTime())) return false;
++    if (rzPonderEnabled()) LOG_TRACE_THREAD("RZ_PONDER_POLICY_V1 engine={} enabled=true", config_.name);
+     LOG_TRACE_THREAD("Sending ucinewgame to engine {}", config_.name);
+     auto res = writeEngine("ucinewgame");
+ 
+@@ -470,6 +472,25 @@ std::optional<std::string> UciEngine::bestmove(bool warn_on_error) const {
+     return *bm;
+ }
+ 
++bool UciEngine::rzPonderEnabled() const {
++    for (const auto& option : config_.options) if (option.first == "Ponder") return option.second == "true";
++    return false;
++}
++std::optional<std::string> UciEngine::rzPonderMove() const {
++    const auto lines = getStdoutLines();
++    if (lines.empty()) return std::nullopt;
++    const auto result = str_utils::findElement<std::string>(str_utils::splitString(lines.back()->line, ' '), "ponder");
++    return result.has_value() ? std::optional<std::string>(*result) : std::nullopt;
++}
++bool UciEngine::rzStopPonder(std::chrono::milliseconds timeout) {
++    if (!rz_ponder_prediction) return true;
++    setupReadEngine();
++    const bool valid = writeEngine("stop") && readEngineLowLat("bestmove", timeout).code == process::Status::OK;
++    rz_ponder_prediction.reset();
++    LOG_TRACE_THREAD("RZ_PONDER_V1 engine={} event=stop valid={}", config_.name, valid);
++    return valid;
++}
++
+ std::chrono::milliseconds UciEngine::lastTime() const {
+     std::vector<std::string> last_reported_time_info;
+ 
+diff --git a/app/src/engine/uci_engine.hpp b/app/src/engine/uci_engine.hpp
+index 59fa8a1..2809c5d 100644
+--- a/app/src/engine/uci_engine.hpp
++++ b/app/src/engine/uci_engine.hpp
+@@ -59,7 +59,11 @@ class UciEngine {
+     // Sends "position" to the engine and waits for a response.
+     [[nodiscard]] bool position(const std::vector<std::string_view>& moves, const std::string& fen);
+ 
+-    [[nodiscard]] bool go(const TimeControl& our_tc, const TimeControl& enemy_tc, chess::Color stm);
++    [[nodiscard]] bool go(const TimeControl& our_tc, const TimeControl& enemy_tc, chess::Color stm, bool ponder = false);
++    std::optional<std::string> rz_ponder_prediction;
++    [[nodiscard]] std::optional<std::string> rzPonderMove() const;
++    bool rzPonderEnabled() const;
++    bool rzStopPonder(std::chrono::milliseconds timeout);
+ 
+     void quit();
+ 
+diff --git a/app/src/game/timecontrol/timecontrol.cpp b/app/src/game/timecontrol/timecontrol.cpp
+index 763201c..97aedf1 100644
+--- a/app/src/game/timecontrol/timecontrol.cpp
++++ b/app/src/game/timecontrol/timecontrol.cpp
+@@ -15,7 +15,7 @@ TimeControl::TimeControl(const Limits& limits) : limits_(limits) {
+     if (limits_.fixed_time != 0) {
+         time_left_ = limits_.fixed_time;
+     } else {
+-        time_left_ = limits_.time + limits_.increment;
++        time_left_ = limits_.time;  // RZ clock V1: increment is earned after a timely move.
+     }
+ 
+     moves_left_ = limits_.moves;
+diff --git a/app/src/matchmaking/match/match.cpp b/app/src/matchmaking/match/match.cpp
+index 1f21648..3bece95 100644
+--- a/app/src/matchmaking/match/match.cpp
++++ b/app/src/matchmaking/match/match.cpp
+@@ -419,6 +419,12 @@ void Match::gameLoop(Player& first, Player& second) {
+ 
+     while (takeTurn(first, second) && takeTurn(second, first)) {
+     }
++    // No speculative request crosses a game/newgame boundary, including cutoff.
++    const bool rz_first_drained = first.engine.rzStopPonder(engine::UciEngine::getPingTime());
++    const bool rz_second_drained = second.engine.rzStopPonder(engine::UciEngine::getPingTime());
++    if (!rz_first_drained || !rz_second_drained) {
++        LOG_TRACE_THREAD("RZ_PONDER_FAILURE_V1 cleanup=false");
++    }
+ 
+     assert(data_.termination != MatchTermination::None);
+     assert(first.getResult() != GameResult::NONE);
+@@ -453,6 +459,20 @@ bool Match::playMove(Player& us, Player& them) {
+     // make sure the engine is not in an invalid state
+     if (!validConnection(us, them)) return false;
+ 
++    // RZ clock V1: own clock includes state transmission, go, search and bestmove.
++    const auto t0 = clock::now();
++    const auto remaining_before = us.getTimeControl().getTimeLeft();
++    const bool rz_hit = us.engine.rz_ponder_prediction && !data_.getMoves().empty() &&
++                        *us.engine.rz_ponder_prediction == data_.getMoves().back();
++    if (us.engine.rz_ponder_prediction && !rz_hit && !us.engine.rzStopPonder(us.getTimeoutThreshold())) {
++        setEngineCrashStatus(us, them); return false;
++    }
++    if (rz_hit) {
++        us.engine.rz_ponder_prediction.reset();
++        us.engine.setupReadEngine();
++        if (!us.engine.writeEngine("ponderhit")) { setEngineCrashStatus(us, them); return false; }
++        LOG_TRACE_THREAD("RZ_PONDER_V1 engine={} event=hit valid=true", name);
++    } else {
+     // write new uci position
+     if (!us.engine.position(data_.getMoves(), start_position_)) {
+         setEngineCrashStatus(us, them);
+@@ -472,10 +492,12 @@ bool Match::playMove(Player& us, Player& them) {
+ 
+     // prepare the engine for reading
+     us.engine.setupReadEngine();
++    }
+ 
+     // wait for output line starting with "bestmove"
+-    const auto t0     = clock::now();
+-    const auto status = us.engine.readEngineLowLat("bestmove", us.getTimeoutThreshold());
++    const auto before_read = chrono::duration_cast<chrono::milliseconds>(clock::now() - t0);
++    const auto read_budget = std::max(chrono::milliseconds(1), us.getTimeoutThreshold() - before_read);
++    const auto status = us.engine.readEngineLowLat("bestmove", read_budget);
+     const auto t1     = clock::now();
+ 
+     LOG_TRACE_THREAD("Engine {} is done thinking", name);
+@@ -503,7 +525,9 @@ bool Match::playMove(Player& us, Player& them) {
+ 
+     LOG_TRACE_THREAD("Engine {} is in a ready state", name);
+ 
+-    const auto elapsed_ms = chrono::duration_cast<chrono::milliseconds>(t1 - t0).count();
++    const auto elapsed_ns = chrono::duration_cast<chrono::nanoseconds>(t1 - t0).count();
++    // Charge partial milliseconds; the 100ms read margin never extends the chess clock.
++    const auto elapsed_ms = (elapsed_ns + 999999) / 1000000;
+ 
+     // calculate latency
+     const auto last_time = us.engine.lastTime().count();
+@@ -513,12 +537,15 @@ bool Match::playMove(Player& us, Player& them) {
+     }
+ 
+     const auto best_move = us.engine.bestmove(status.code == engine::process::Status::OK);
++    const auto rz_prediction = us.engine.rzPonderMove();
+     const auto move      = best_move && uci::isUciMove(*best_move) ? uci::uciToMove(board_, *best_move) : Move::NO_MOVE;
+     const auto legal     = isLegal(move);
+ 
+     const auto timeout    = us.hasTimeControl() ? !us.getTimeControl().updateTime(elapsed_ms) : false;
+     const auto timeleft   = us.hasTimeControl() ? us.getTimeControl().getTimeLeft() : 0;
+     const auto overrun_ms = timeleft < 0 ? -timeleft : 0;
++    LOG_TRACE_THREAD("RZ_CLOCK_V1 engine={} before={} increment={} elapsed_ns={} after={} valid={}",
++                     name, remaining_before, us.getTimeControl().getIncrement(), elapsed_ns, timeleft, !timeout);
+ 
+     if (best_move) {
+         addMoveData(us, *best_move, elapsed_ms, latency, timeleft, legal);
+@@ -571,6 +598,20 @@ bool Match::playMove(Player& us, Player& them) {
+ 
+     checkMateScoreSignMismatch(them, us, board_, start_position_, data_);
+ 
++    if (us.engine.rzPonderEnabled()) {
++        if (rz_prediction && uci::isUciMove(*rz_prediction) &&
++            isLegal(uci::uciToMove(board_, *rz_prediction)) && board_.isGameOver().first == chess::GameResultReason::NONE) {
++            auto rz_moves = data_.getMoves();
++            rz_moves.push_back(*rz_prediction);
++            if (!us.engine.position(rz_moves, start_position_) ||
++                !us.engine.go(us.getTimeControl(), them.getTimeControl(), ~board_.sideToMove(), true)) {
++                setEngineCrashStatus(us, them); return false;
++            }
++            us.engine.rz_ponder_prediction = *rz_prediction;
++            LOG_TRACE_THREAD("RZ_PONDER_V1 engine={} event=start valid=true", name);
++        }
++    }
++
+     return true;
+ }
+ 
+

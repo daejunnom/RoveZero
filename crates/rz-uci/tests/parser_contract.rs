@@ -49,13 +49,13 @@ fn multiline_non_ascii_and_control_bytes_are_rejected() {
 
 #[test]
 fn unsupported_modes_and_unknown_commands_remain_distinct() {
-    assert_eq!(
-        parse_default("ponderhit"),
-        Err(ParseError::Unsupported("ponderhit".into()))
-    );
+    assert_eq!(parse_default("ponderhit"), Ok(Command::PonderHit));
     assert_eq!(
         parse_default("go ponder"),
-        Err(ParseError::Unsupported("ponder".into()))
+        Ok(Command::Go(GoLimits {
+            ponder: true,
+            ..GoLimits::default()
+        }))
     );
     assert_eq!(
         parse_default("go depth 3"),

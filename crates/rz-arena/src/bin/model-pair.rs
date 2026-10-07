@@ -33,6 +33,13 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("hardware") if args.len() == 1 => { println!("{}",serde_json::to_string_pretty(&rz_arena::probe_match_hardware()?)?); Ok(()) },
+        Some("engine-exec") if args.len() >= 4 => engine_exec(&args[1..]),
+        Some("resource-plan") if args.len() == 2 => {
+            let input = RunManifestV2::from_json(&read(Path::new(&args[1]))?)?;
+            let execution = input.match_execution.as_ref().ok_or("match_execution is required")?;
+            println!("{}", serde_json::to_string_pretty(&execution.plan()?)?); Ok(())
+        },
         Some("lock") if args.len()==3=>{
             let input=RunManifestV2::from_json(&read(Path::new(&args[1]))?)?;
             rz_arena::validate_opening_artifact_for_spec(&input.opening,input.max_plies,&input.opening_artifact)?;
@@ -48,8 +55,56 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(())
         },
         Some("execute") if args.len()==5=>execute(&args[1..]),
-        _=>Err("usage: model-pair opening INPUT_JSON NEW_PGN | lock INPUT_JSON NEW_LOCK_JSON | execute LOCK_JSON ASSET_ROOT OUTPUT_ROOT UNIQUE_LABEL".into()),
+        _=>Err("usage: model-pair hardware | resource-plan INPUT_JSON | opening INPUT_JSON NEW_PGN | lock INPUT_JSON NEW_LOCK_JSON | execute LOCK_JSON ASSET_ROOT OUTPUT_ROOT UNIQUE_LABEL | engine-exec CPU_IDS GPU_IDS_OR_DASH PROGRAM [ARGS...]".into()),
     }
+}
+#[cfg(not(target_os = "linux"))]
+fn engine_exec(_args: &[String]) -> Result<(), Box<dyn Error>> {
+    Err("engine placement requires Linux".into())
+}
+#[cfg(target_os = "linux")]
+fn engine_exec(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use nix::{
+        sched::{CpuSet, sched_getaffinity, sched_setaffinity},
+        unistd::Pid,
+    };
+    use std::{os::unix::process::CommandExt, process::Command};
+    if args[0].len() > 8192 || args[1].len() > 1296 || !Path::new(&args[2]).is_absolute() {
+        return Err("invalid placement argv".into());
+    }
+    let mut cpus = CpuSet::new();
+    let mut ids = std::collections::BTreeSet::new();
+    for text in args[0].split(',') {
+        let cpu = text.parse::<usize>()?;
+        if !ids.insert(cpu) {
+            return Err("placement CPU is duplicated".into());
+        }
+        cpus.set(cpu)?;
+    }
+    let gpu_mask = if args[1] == "-" { "" } else { &args[1] };
+    if !gpu_mask.is_empty()
+        && !gpu_mask.split(',').all(|id| {
+            !id.is_empty()
+                && id.len() <= 80
+                && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+    {
+        return Err("invalid GPU mask".into());
+    }
+    sched_setaffinity(Pid::from_raw(0), &cpus)?;
+    if sched_getaffinity(Pid::from_raw(0))? != cpus {
+        return Err("CPU placement readback differs".into());
+    }
+    eprintln!(
+        "RZ_PLACEMENT_V1 cpus={} gpus={} gpu_memory_enforcement=false",
+        args[0], args[1]
+    );
+    let error = Command::new(&args[2])
+        .args(&args[3..])
+        .env("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+        .env("CUDA_VISIBLE_DEVICES", gpu_mask)
+        .exec();
+    Err(error.into())
 }
 #[cfg(not(target_os = "linux"))]
 fn execute(_args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -103,6 +158,10 @@ fn execute(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
     }
     eprintln!("model_pair_resource_policy=affinity_and_memory_cgroup_verified gpu_peak=unknown");
+    if let Some(execution) = &lock.input().match_execution {
+        let plan = execution.plan()?;
+        eprintln!("match_resource_plan={}", serde_json::to_string(&plan)?);
+    }
     let cancel = Arc::new(AtomicBool::new(false));
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         signal_hook::flag::register(signal, Arc::clone(&cancel))?;

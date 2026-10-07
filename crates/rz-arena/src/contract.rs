@@ -62,6 +62,11 @@ pub fn contract_error(error: &ArenaError) -> ContractError {
             Stage::Backend,
             "arena process or IO operation failed",
         ),
+        ArenaError::HardwareProbe { .. } => ContractError::new(
+            ErrorCode::BackendFailure,
+            Stage::Backend,
+            "arena hardware probe cleanup could not be confirmed",
+        ),
         ArenaError::Manifest(error) => match error {
             ManifestError::Parse(_) | ManifestError::Validation(_) => ContractError::new(
                 ErrorCode::InvalidInput,

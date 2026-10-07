@@ -466,17 +466,76 @@ impl RunManifestV2 {
         )?;
         if let Some(execution) = &self.match_execution {
             let plan = execution.plan()?;
-            let available: BTreeSet<_> = execution.hardware.cpu_cores.iter().flatten().copied().collect();
-            require_v2(available == r.affinity.iter().copied().collect(), "match CPU inventory differs from inherited envelope")?;
-            require_v2(execution.hardware.gpus.is_empty() == r.gpu.is_none(), "match GPU inventory differs from envelope")?;
-            let reserved = plan.engines.iter().try_fold(0u64, |n,a| a.gpu_memory_bytes.checked_mul(a.gpu_ids.len() as u64).and_then(|m| n.checked_add(m)));
-            require_v2(reserved.is_some_and(|n| n <= r.gpu_vram_bytes), "match GPU reservations exceed envelope")?;
+            require_v2(
+                self.engines.iter().all(|e| {
+                    e.id()
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+                }),
+                "match engine IDs must be single bounded protocol tokens",
+            )?;
+            if execution.ponder {
+                let patch = self.runner.dirty_patch.as_ref().ok_or_else(|| {
+                    ManifestError::Integrity(
+                        "ponder requires the pinned Fastchess clock/ponder V2 patch".into(),
+                    )
+                })?;
+                require_v2(
+                    self.runner.dirty
+                        && patch.sha256
+                            == digest(include_bytes!(
+                                "../../../experiments/baselines/fastchess-clock-ponder-v2.patch"
+                            )),
+                    "ponder runner patch identity differs",
+                )?;
+            }
+            let available: BTreeSet<_> = execution
+                .hardware
+                .cpu_cores
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
+            require_v2(
+                available == r.affinity.iter().copied().collect(),
+                "match CPU inventory differs from inherited envelope",
+            )?;
+            require_v2(
+                execution.hardware.gpus.is_empty() == r.gpu.is_none(),
+                "match GPU inventory differs from envelope",
+            )?;
+            let reserved = plan.engines.iter().try_fold(0u64, |n, a| {
+                a.gpu_memory_bytes
+                    .checked_mul(a.gpu_ids.len() as u64)
+                    .and_then(|m| n.checked_add(m))
+            });
+            require_v2(
+                reserved.is_some_and(|n| n <= r.gpu_vram_bytes),
+                "match GPU reservations exceed envelope",
+            )?;
             for allocation in &plan.engines {
+                let environment = match self.engine(allocation.role)? {
+                    EngineEndpointV2::ExternalUci(e) => e.environment.as_ref(),
+                    EngineEndpointV2::RoveZero(e) => e.environment.as_ref(),
+                };
+                require_v2(
+                    environment.is_none_or(|e| {
+                        !e.variables.contains_key("CUDA_VISIBLE_DEVICES")
+                            && !e.variables.contains_key("CUDA_DEVICE_ORDER")
+                    }),
+                    "resource policy owns CUDA visibility; remove conflicting public environment variables",
+                )?;
                 if let EngineEndpointV2::RoveZero(e) = self.engine(allocation.role)? {
                     let cpu = matches!(e.launch, Some(RoveLaunchV2::Lc0Cpu(_)));
-                    require_v2(cpu == (allocation.kind == EngineComputeKind::Cpu), "native provider differs from compute kind")?;
+                    require_v2(
+                        cpu == (allocation.kind == EngineComputeKind::Cpu),
+                        "native provider differs from compute kind",
+                    )?;
                     // Current closed native profiles select logical CUDA device 0.
-                    require_v2(allocation.gpu_ids.len() <= 1, "native recipe supports one assigned GPU")?;
+                    require_v2(
+                        allocation.gpu_ids.len() <= 1,
+                        "native recipe supports one assigned GPU",
+                    )?;
                 }
             }
         }
@@ -753,7 +812,14 @@ impl RunManifestV2 {
     }
     pub fn declared_artifacts(&self) -> Vec<&ArtifactRef> {
         let mut assets = vec![&self.runner.binary, &self.opening_artifact];
-        if let Some(execution) = &self.match_execution { assets.push(&execution.executor); }
+        if let Some(execution) = &self.match_execution {
+            assets.push(&execution.executor);
+        }
+        if self.match_execution.as_ref().is_some_and(|e| e.ponder) {
+            if let Some(patch) = &self.runner.dirty_patch {
+                assets.push(patch);
+            }
+        }
         for e in &self.engines {
             match e {
                 EngineEndpointV2::ExternalUci(e) => {
@@ -809,7 +875,10 @@ impl RunManifestV2 {
         )?;
         Ok(total)
     }
-    pub fn lock(self) -> Result<LockedManifestV2, ManifestError> {
+    pub fn lock(mut self) -> Result<LockedManifestV2, ManifestError> {
+        if let Some(execution) = &mut self.match_execution {
+            execution.resolved_resources = Some(execution.plan()?);
+        }
         self.validate()?;
         let sha256 = digest(&canonical_v2(&self)?);
         Ok(LockedManifestV2 {

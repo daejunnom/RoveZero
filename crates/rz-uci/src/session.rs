@@ -408,6 +408,12 @@ impl<P: PositionPort> Session<P> {
             Command::Position(spec) => return self.replace_position(&spec, false),
             Command::NewGame => return self.replace_position(&PositionSpec::default(), true),
             Command::Go(limits) => {
+                if limits.ponder {
+                    return SessionResult::reject(
+                        "PonderNeedsOwner",
+                        "ponder requires the concrete engine owner",
+                    );
+                }
                 self.cancel(&mut out, CancelReason::ReplacedSearch);
                 if self.position.exact_terminal && !limits.infinite {
                     out.protocol.push("bestmove 0000".into());
@@ -429,6 +435,12 @@ impl<P: PositionPort> Session<P> {
                         });
                     }
                 }
+            }
+            Command::PonderHit => {
+                return SessionResult::reject(
+                    "PonderNeedsOwner",
+                    "ponderhit requires the concrete engine owner",
+                );
             }
             Command::Stop => self.finish(&mut out, Some(CancelReason::Stop)),
             Command::Quit => return self.close(CancelReason::Quit),

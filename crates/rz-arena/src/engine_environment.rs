@@ -38,6 +38,53 @@ pub(crate) struct EngineProcessLaunch<'a> {
     pub arguments: Vec<OsString>,
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn place<'a>(
+    mut launch: EngineProcessLaunch<'a>,
+    execution: Option<&rz_experiments::MatchExecutionV1>,
+    role: rz_experiments::NativeEngineRole,
+    clear_environment: bool,
+    pins: &'a [InputPin],
+) -> Result<EngineProcessLaunch<'a>, ArenaError> {
+    let Some(execution) = execution else {
+        return Ok(launch);
+    };
+    let plan = execution.plan()?;
+    let allocation = plan
+        .engines
+        .iter()
+        .find(|a| a.role == role)
+        .expect("validated role");
+    let cpus = allocation
+        .cpu_ids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let gpus = allocation.gpu_ids.join(",");
+    // An inner pinned env -i must preserve the resource mask applied by engine-exec.
+    if clear_environment {
+        launch
+            .arguments
+            .insert(4, format!("CUDA_VISIBLE_DEVICES={gpus}").into());
+        launch
+            .arguments
+            .insert(4, "CUDA_DEVICE_ORDER=PCI_BUS_ID".into());
+    }
+    let gpu_arg = if gpus.is_empty() { "-".into() } else { gpus };
+    let mut arguments = vec![
+        "engine-exec".into(),
+        cpus.into(),
+        gpu_arg.into(),
+        launch.program.path.as_os_str().to_owned(),
+    ];
+    arguments.extend(launch.arguments);
+    Ok(EngineProcessLaunch {
+        program: pin(pins, &execution.executor)?,
+        arguments,
+    })
+}
+
 /// `env` performs exec rather than introducing a shell or persistent proxy.
 /// The default branch preserves the prior executable/argv exactly.
 #[cfg(target_os = "linux")]
