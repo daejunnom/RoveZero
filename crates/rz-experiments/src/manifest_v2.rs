@@ -264,6 +264,9 @@ pub struct RunManifestV2 {
     pub rules_profile: String,
     pub evaluation_policy: String,
     pub resources: ResourcePolicyV2,
+    /// Omitted preserves historical V2 locks and ponder-off execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_execution: Option<MatchExecutionV1>,
     /// One explicit tree envelope for every RoveZero endpoint in this control.
     /// External UCI engines do not receive this native setting.
     pub rove_tree_max_edges: u32,
@@ -452,7 +455,7 @@ impl RunManifestV2 {
             "RoveZero edge envelope invalid",
         )?;
         require_v2(
-            (1..=64).contains(&r.cpu_threads)
+            (1..=2048).contains(&r.cpu_threads)
                 && r.affinity.len() == r.cpu_threads as usize
                 && r.affinity.iter().collect::<BTreeSet<_>>().len() == r.affinity.len()
                 && r.memory_high_bytes > 0
@@ -461,6 +464,22 @@ impl RunManifestV2 {
                 && (r.gpu.is_some() == (r.gpu_vram_bytes > 0)),
             "resource envelope invalid",
         )?;
+        if let Some(execution) = &self.match_execution {
+            let plan = execution.plan()?;
+            let available: BTreeSet<_> = execution.hardware.cpu_cores.iter().flatten().copied().collect();
+            require_v2(available == r.affinity.iter().copied().collect(), "match CPU inventory differs from inherited envelope")?;
+            require_v2(execution.hardware.gpus.is_empty() == r.gpu.is_none(), "match GPU inventory differs from envelope")?;
+            let reserved = plan.engines.iter().try_fold(0u64, |n,a| a.gpu_memory_bytes.checked_mul(a.gpu_ids.len() as u64).and_then(|m| n.checked_add(m)));
+            require_v2(reserved.is_some_and(|n| n <= r.gpu_vram_bytes), "match GPU reservations exceed envelope")?;
+            for allocation in &plan.engines {
+                if let EngineEndpointV2::RoveZero(e) = self.engine(allocation.role)? {
+                    let cpu = matches!(e.launch, Some(RoveLaunchV2::Lc0Cpu(_)));
+                    require_v2(cpu == (allocation.kind == EngineComputeKind::Cpu), "native provider differs from compute kind")?;
+                    // Current closed native profiles select logical CUDA device 0.
+                    require_v2(allocation.gpu_ids.len() <= 1, "native recipe supports one assigned GPU")?;
+                }
+            }
+        }
         require_v2(
             self.timeouts.runtime_ms > 0
                 && self.timeouts.runtime_ms <= 3_600_000
@@ -734,6 +753,7 @@ impl RunManifestV2 {
     }
     pub fn declared_artifacts(&self) -> Vec<&ArtifactRef> {
         let mut assets = vec![&self.runner.binary, &self.opening_artifact];
+        if let Some(execution) = &self.match_execution { assets.push(&execution.executor); }
         for e in &self.engines {
             match e {
                 EngineEndpointV2::ExternalUci(e) => {
@@ -993,6 +1013,7 @@ mod tests {
                 gpu: None,
                 gpu_vram_bytes: 0,
             },
+            match_execution: None,
             rove_tree_max_edges: 262_144,
             engines: [
                 make(0, NativeEngineRole::Baseline),

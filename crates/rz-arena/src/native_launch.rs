@@ -43,6 +43,19 @@ pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 
     fn rove_tree_max_edges(&self) -> Option<u32> {
         None
     }
+    fn match_execution(&self) -> Option<&rz_experiments::MatchExecutionV1> { None }
+    fn external_options(&self, role: rz_experiments::NativeEngineRole) -> Result<std::collections::BTreeMap<String, String>, ArenaError> {
+        let view = self.engine_view(role)?;
+        let mut options = view.external.map(|e| e.requested_options.clone()).unwrap_or_default();
+        if let Some(execution) = self.match_execution() {
+            let plan = execution.plan()?;
+            let allocation = plan.engines.iter().find(|a| a.role == role).expect("validated role");
+            // These values are locked by the resource policy and checked against advertisement.
+            options.insert("Ponder".into(), execution.ponder.to_string());
+            options.insert("Threads".into(), allocation.threads.to_string());
+        }
+        Ok(options)
+    }
     fn validate_execution(&self) -> Result<(), ArenaError> {
         Ok(())
     }
