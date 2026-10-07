@@ -228,6 +228,18 @@ pub struct PrivateSeedProvenance {
     pub seal: [u8; 32],
 }
 
+/// Exact post-commit withdrawal, not a physical completion or count rollback.
+/// A missing/already-removed authority returns `revoked=false` and removes no
+/// bytes. Remaining entries describe the bank after this single operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrivateSeedRevocation {
+    pub provenance: PrivateSeedProvenance,
+    pub reason: PrivateCancelReason,
+    pub revoked: bool,
+    pub removed_bank_bytes: u64,
+    pub remaining_entries_per_role: [usize; 3],
+}
+
 struct Seed {
     provenance: PrivateSeedProvenance,
     context: PrivateRulesContext,
@@ -321,6 +333,10 @@ pub struct PrivateSeedSnapshot {
     pub admission_closed: bool,
     pub last_failure: Option<PrivateSeedError>,
     pub counts: PrivateSeedCounts,
+    /// Withdrawn accepted entries; historical accepted/physical counts remain.
+    pub revoked_seeds: u64,
+    /// One bounded last successful removal, with its original reason.
+    pub last_revocation: Option<PrivateSeedRevocation>,
 }
 
 struct Active {
@@ -359,6 +375,8 @@ struct State {
     last_completed_lease: Option<u64>,
     last_physical_completion: Option<PhysicalSeedCompletion>,
     counts: PrivateSeedCounts,
+    revoked_seeds: u64,
+    last_revocation: Option<PrivateSeedRevocation>,
     // A single bounded cycle holds physical-unknown state even if user handles
     // are dropped. Known fence recovery explicitly breaks it; never auto-retry.
     quarantine_owner: Option<Arc<Mutex<State>>>,
@@ -409,6 +427,8 @@ impl PrivateSeedBank {
                 admission_closed: false,
                 last_failure: None,
                 counts: PrivateSeedCounts::default(),
+                revoked_seeds: 0,
+                last_revocation: None,
                 last_cancel_reason: None,
                 last_completed_lease: None,
                 last_physical_completion: None,
@@ -419,6 +439,82 @@ impl PrivateSeedBank {
 
     pub const fn warm_support(&self) -> PrivateWarmSupport {
         PrivateWarmSupport::RustConsumerBoundaryOnly
+    }
+
+    /// Remove only an idle stored seed equal to the full authority returned by
+    /// `commit`. A failed final caller guard may use this without pretending that
+    /// commit or its physical completion never happened. No older evicted seed
+    /// is restored, and a later miss must use an explicitly Fresh invocation.
+    ///
+    /// Active, pending or unknown ownership closes admission and refuses removal.
+    /// Neither those pins nor a previous failure are replaced by a new fence,
+    /// reset, cancellation token or generation. All fallible preflight precedes
+    /// deletion; counter/byte failure leaves the exact seed pinned in the bank.
+    pub fn revoke_committed(
+        &self,
+        provenance: &PrivateSeedProvenance,
+        reason: PrivateCancelReason,
+    ) -> Result<PrivateSeedRevocation, PrivateSeedError> {
+        let mut state = lock(&self.inner)?;
+        let result = (|| {
+            if state.quarantine_owner.is_some()
+                || state.active.as_ref().is_some_and(|active| active.unknown)
+            {
+                return Err(PrivateSeedError::PhysicalCompletionUnknown);
+            }
+            if state.active.is_some() {
+                return Err(PrivateSeedError::ActivePhysicalLease);
+            }
+            if state.pending.is_some() {
+                return Err(PrivateSeedError::PendingFinalization);
+            }
+            let role = role_index(provenance.role);
+            let Some(index) = state.slots[role]
+                .iter()
+                .position(|seed| seed.provenance == *provenance)
+            else {
+                return Ok(PrivateSeedRevocation {
+                    provenance: *provenance,
+                    reason,
+                    revoked: false,
+                    removed_bank_bytes: 0,
+                    remaining_entries_per_role: std::array::from_fn(|i| state.slots[i].len()),
+                });
+            };
+            let seed = &state.slots[role][index];
+            if Arc::strong_count(seed) != 1 {
+                return Err(PrivateSeedError::PhysicalCompletionUnknown);
+            }
+            let removed_bank_bytes = seed.charged_bytes;
+            let remaining_bytes = state
+                .bank_bytes
+                .checked_sub(removed_bank_bytes)
+                .filter(|bytes| *bytes >= state.base_bytes)
+                .ok_or(PrivateSeedError::Budget)?;
+            let revoked_seeds = state
+                .revoked_seeds
+                .checked_add(1)
+                .ok_or(PrivateSeedError::GenerationExhausted)?;
+            // Exact full authority, exclusive ownership, count and reservation
+            // are now checked. Vec removal cannot allocate or grow the bank.
+            drop(state.slots[role].remove(index));
+            state.bank_bytes = remaining_bytes;
+            state.revoked_seeds = revoked_seeds;
+            let receipt = PrivateSeedRevocation {
+                provenance: *provenance,
+                reason,
+                revoked: true,
+                removed_bank_bytes,
+                remaining_entries_per_role: std::array::from_fn(|i| state.slots[i].len()),
+            };
+            state.last_revocation = Some(receipt);
+            Ok(receipt)
+        })();
+        if let Err(error) = result {
+            state.admission_closed = true;
+            state.last_failure = Some(error);
+        }
+        result
     }
 
     pub fn begin(
@@ -653,6 +749,8 @@ impl PrivateSeedBank {
             admission_closed: state.admission_closed,
             last_failure: state.last_failure,
             counts: state.counts,
+            revoked_seeds: state.revoked_seeds,
+            last_revocation: state.last_revocation,
         })
     }
 }
@@ -1235,6 +1333,229 @@ mod tests {
             PrivateSeedBank::new(exact, 1),
             Err(PrivateSeedError::Budget)
         ));
+    }
+    #[test]
+    fn exact_revocation_is_idempotent_and_preserves_other_authorities_and_counts() {
+        let position = Position::startpos();
+        let snapshot = position.snapshot();
+        let bank = PrivateSeedBank::new(limits(), 1).unwrap();
+        let proposer = request(&snapshot, &input(PalsRole::Proposer));
+        let critic = request(&snapshot, &input(PalsRole::Critic));
+        let (older, _) = accepted(&bank, &proposer, &snapshot, PrivateInvocationMode::Fresh);
+        let (target, _) = accepted(&bank, &proposer, &snapshot, PrivateInvocationMode::Fresh);
+        let (other_role, _) = accepted(&bank, &critic, &snapshot, PrivateInvocationMode::Fresh);
+        let before = bank.snapshot().unwrap();
+        let changed: [fn(&mut PrivateSeedProvenance); 5] = [
+            |authority| authority.role = PalsRole::Critic,
+            |authority| authority.model.encoding[0] ^= 1,
+            |authority| authority.source_non_record_context[0] ^= 1,
+            |authority| authority.source_lease_id += 1,
+            |authority| authority.seal[0] ^= 1,
+        ];
+        for change in changed {
+            let mut different = target;
+            change(&mut different);
+            let refusal = bank
+                .revoke_committed(&different, PrivateCancelReason::Cancelled)
+                .unwrap();
+            assert!(!refusal.revoked);
+            assert_eq!(refusal.removed_bank_bytes, 0);
+            assert_eq!(refusal.remaining_entries_per_role, before.entries_per_role);
+            assert_eq!(bank.snapshot().unwrap(), before);
+        }
+        let target_bytes = bank.inner.lock().unwrap().slots[0][1].charged_bytes;
+        let removed = bank
+            .revoke_committed(&target, PrivateCancelReason::Cancelled)
+            .unwrap();
+        assert!(removed.revoked);
+        assert_eq!(removed.provenance, target);
+        assert_eq!(removed.removed_bank_bytes, target_bytes);
+        assert_eq!(removed.remaining_entries_per_role, [1, 1, 0]);
+        let after = bank.snapshot().unwrap();
+        assert_eq!(
+            after.reserved_bank_bytes,
+            before.reserved_bank_bytes - target_bytes
+        );
+        assert_eq!(after.counts, before.counts);
+        assert_eq!(after.revoked_seeds, 1);
+        assert_eq!(after.last_revocation, Some(removed));
+        let repeated = bank
+            .revoke_committed(&target, PrivateCancelReason::Deadline)
+            .unwrap();
+        assert!(!repeated.revoked);
+        assert_eq!(repeated.removed_bank_bytes, 0);
+        assert_eq!(bank.snapshot().unwrap(), after);
+        let state = bank.inner.lock().unwrap();
+        assert_eq!(state.slots[0][0].provenance, older);
+        assert_eq!(state.slots[1][0].provenance, other_role);
+    }
+    #[test]
+    fn revocation_does_not_restore_an_evicted_seed_and_a_missing_seed_can_start_fresh() {
+        let position = Position::startpos();
+        let snapshot = position.snapshot();
+        let mut one_slot = limits();
+        one_slot.slots_per_role = 1;
+        let bank = PrivateSeedBank::new(one_slot, 1).unwrap();
+        let req = request(&snapshot, &input(PalsRole::Proposer));
+        let (evicted, _) = accepted(&bank, &req, &snapshot, PrivateInvocationMode::Fresh);
+        let (target, _) = accepted(&bank, &req, &snapshot, PrivateInvocationMode::ApproxWarmV1);
+        let before = bank.snapshot().unwrap();
+        assert!(
+            bank.revoke_committed(&target, PrivateCancelReason::Deadline)
+                .unwrap()
+                .revoked
+        );
+        assert!(
+            !bank
+                .revoke_committed(&evicted, PrivateCancelReason::Deadline)
+                .unwrap()
+                .revoked
+        );
+        let after = bank.snapshot().unwrap();
+        assert_eq!(after.entries_per_role, [0; 3]);
+        assert_eq!(after.counts, before.counts);
+        assert_eq!(after.revoked_seeds, 1);
+        let cancelled = CancelToken::new();
+        assert!(matches!(
+            bank.begin(
+                req.clone(),
+                &snapshot,
+                PrivateInvocationMode::ApproxWarmV1,
+                &cancelled,
+                deadline()
+            ),
+            Err(PrivateSeedError::MissingSeed)
+        ));
+        let fresh = bank
+            .begin(
+                req,
+                &snapshot,
+                PrivateInvocationMode::Fresh,
+                &cancelled,
+                deadline(),
+            )
+            .unwrap();
+        assert!(matches!(
+            fresh.invocation(),
+            PrivateInvocation::Fresh { .. }
+        ));
+        assert!(fresh.seed_bits().is_none());
+        // This bank-boundary fixture acknowledges failure only to clean up its
+        // logical fixture lease; it is not Native numerical/fence evidence.
+        drop(
+            fresh
+                .complete_known(PhysicalSeedCompletion::Failed)
+                .unwrap(),
+        );
+    }
+    #[test]
+    fn revocation_closes_admission_without_releasing_active_pending_or_unknown_pins() {
+        let position = Position::startpos();
+        let snapshot = position.snapshot();
+        let req = request(&snapshot, &input(PalsRole::Proposer));
+        for mode in 0..3 {
+            let bank = PrivateSeedBank::new(limits(), 1).unwrap();
+            let (target, _) = accepted(&bank, &req, &snapshot, PrivateInvocationMode::Fresh);
+            let cancelled = CancelToken::new();
+            let lease = bank
+                .begin(
+                    req.clone(),
+                    &snapshot,
+                    PrivateInvocationMode::ApproxWarmV1,
+                    &cancelled,
+                    deadline(),
+                )
+                .unwrap();
+            let id = lease.id();
+            let mut active = Some(lease);
+            let mut pending = None;
+            let error = match mode {
+                0 => PrivateSeedError::ActivePhysicalLease,
+                1 => {
+                    let lease = active.take().unwrap();
+                    let values = consume(&lease);
+                    pending = Some(
+                        lease
+                            .complete_known(PhysicalSeedCompletion::Succeeded)
+                            .unwrap()
+                            .stage_output(&values)
+                            .unwrap(),
+                    );
+                    PrivateSeedError::PendingFinalization
+                }
+                _ => {
+                    drop(active.take());
+                    PrivateSeedError::PhysicalCompletionUnknown
+                }
+            };
+            let before = bank.snapshot().unwrap();
+            assert_eq!(
+                bank.revoke_committed(&target, PrivateCancelReason::Cancelled),
+                Err(error)
+            );
+            let after = bank.snapshot().unwrap();
+            assert!(after.admission_closed);
+            assert_eq!(after.last_failure, Some(error));
+            assert_eq!(after.entries_per_role, before.entries_per_role);
+            assert_eq!(after.reserved_bank_bytes, before.reserved_bank_bytes);
+            assert_eq!(after.provisional_bytes, before.provisional_bytes);
+            assert_eq!(after.active_lease, before.active_lease);
+            assert_eq!(after.active_seed_bytes, before.active_seed_bytes);
+            assert_eq!(after.pinned_entries, before.pinned_entries);
+            assert_eq!(after.quarantined, before.quarantined);
+            assert_eq!(after.counts, before.counts);
+            assert_eq!(after.revoked_seeds, 0);
+            assert!(after.last_revocation.is_none());
+            assert!(!cancelled.is_canceled());
+            if let Some(lease) = active.take() {
+                assert_eq!(lease.seed_provenance(), Some(&target));
+                drop(
+                    lease
+                        .complete_known(PhysicalSeedCompletion::Failed)
+                        .unwrap(),
+                );
+            } else if mode == 2 {
+                bank.resolve_unknown_known_completion(id, PhysicalSeedCompletion::Failed)
+                    .unwrap();
+            }
+            drop(pending);
+        }
+    }
+    #[test]
+    fn revocation_counter_and_byte_preflight_failure_preserve_the_exact_seed() {
+        let position = Position::startpos();
+        let snapshot = position.snapshot();
+        let req = request(&snapshot, &input(PalsRole::Proposer));
+        for count_overflow in [true, false] {
+            let bank = PrivateSeedBank::new(limits(), 1).unwrap();
+            let (target, _) = accepted(&bank, &req, &snapshot, PrivateInvocationMode::Fresh);
+            {
+                let mut state = bank.inner.lock().unwrap();
+                if count_overflow {
+                    state.revoked_seeds = u64::MAX;
+                } else {
+                    state.bank_bytes = state.base_bytes + state.slots[0][0].charged_bytes - 1;
+                }
+            }
+            let before = bank.snapshot().unwrap();
+            let expected = if count_overflow {
+                PrivateSeedError::GenerationExhausted
+            } else {
+                PrivateSeedError::Budget
+            };
+            assert_eq!(
+                bank.revoke_committed(&target, PrivateCancelReason::Deadline),
+                Err(expected)
+            );
+            let after = bank.snapshot().unwrap();
+            assert!(after.admission_closed);
+            assert_eq!(after.entries_per_role, before.entries_per_role);
+            assert_eq!(after.reserved_bank_bytes, before.reserved_bank_bytes);
+            assert_eq!(after.counts, before.counts);
+            assert_eq!(after.revoked_seeds, before.revoked_seeds);
+            assert!(after.last_revocation.is_none());
+            assert_eq!(bank.inner.lock().unwrap().slots[0][0].provenance, target);
+        }
     }
     #[test]
     fn actual_seed_consumption_changes_output_and_preserves_fresh_keys() {

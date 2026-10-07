@@ -306,6 +306,7 @@ pub fn validate_pals_external_cpu_r_session(
                 && n["host_record_page_observation"].is_null(),
             "external helper native checkpoint/model/encoding/epoch or undeclared host mode differs",
         )?;
+        require_no_undeclared_private_warm(n)?;
         let execution = &n["execution"];
         require(
             execution.is_object()
@@ -3171,6 +3172,18 @@ fn graph_stats(v: &serde_json::Value) -> Result<(u64, u64, u64), ArenaError> {
     )?;
     Ok((inputs, calls, role))
 }
+// This launch revision registers Fresh whole-input execution. Optional Warm
+// producer fields remain readable only as absent/null; observations or an
+// unavailable marker cannot authorize an undeclared private execution mode.
+fn require_no_undeclared_private_warm(record: &serde_json::Value) -> Result<(), ArenaError> {
+    require(
+        record["execution"]["private_warm"].is_null()
+            && record["private_warm_observation"].is_null()
+            && record["private_warm_observation_unavailable"].is_null(),
+        "unsupported undeclared private warm execution/observation: the arena lock registers Fresh whole-input execution only",
+    )
+}
+
 /// Pure wire validation. No self-reported field replaces process exit or PGN.
 pub fn validate_pals_native_records(
     lock: &LockedPalsArenaLaunchV3,
@@ -3249,6 +3262,7 @@ fn validate_pals_native_records_inner(
                 && record["host_record_page_observation"].is_null(),
             "unsupported undeclared host record-page execution/observation: the arena lock registers the whole-input public graph only",
         )?;
+        require_no_undeclared_private_warm(record)?;
     }
     if lock
         .input
@@ -6016,6 +6030,9 @@ mod tests {
             |v| v["cpu_checker"]["shutdown"]["exit_code"] = 1.into(),
             |v| v["cpu_checker"]["shutdown"]["ownership_lost"] = true.into(),
             |v| v["native"]["physical_shutdown_confirmed"] = false.into(),
+            |v| v["native"]["execution"]["private_warm"] = serde_json::json!({}),
+            |v| v["native"]["private_warm_observation"] = serde_json::json!({}),
+            |v| v["native"]["private_warm_observation_unavailable"] = false.into(),
             |v| v["search_work"]["pals"]["cpu_nodes"] = 20.into(),
         ];
         for (i, mutate) in mutations.iter().enumerate() {
@@ -6448,6 +6465,63 @@ mod tests {
                     let error = validate(&s, &t).unwrap_err();
                     assert!(
                         matches!(error, ArenaError::Integrity(ref detail) if detail.contains("unsupported undeclared host record-page"))
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn undeclared_private_warm_cannot_be_accepted_as_fresh_whole_input_execution() {
+        let (input, _) = cuda_fixture();
+        let lock = input.lock().unwrap();
+        let (start, end) = cuda_records_fixture(&lock);
+        let validate = |s: &serde_json::Value, t: &serde_json::Value| {
+            validate_pals_native_records(
+                &lock,
+                NativeEngineRole::Baseline,
+                &serde_json::to_vec(s).unwrap(),
+                &serde_json::to_vec(t).unwrap(),
+                "native-process-100",
+            )
+        };
+        assert!(validate(&start, &end).is_ok());
+        let fields = [
+            "private_warm",
+            "private_warm_observation",
+            "private_warm_observation_unavailable",
+        ];
+        let set = |record: &mut serde_json::Value, field: &str, value: serde_json::Value| {
+            if field == "private_warm" {
+                record["native"]["execution"][field] = value;
+            } else {
+                record["native"][field] = value;
+            }
+        };
+        let mut null_start = start.clone();
+        let mut null_end = end.clone();
+        for record in [&mut null_start, &mut null_end] {
+            for field in fields {
+                set(record, field, serde_json::Value::Null);
+            }
+        }
+        assert!(validate(&null_start, &null_end).is_ok());
+        for startup in [true, false] {
+            for field in fields {
+                for value in [
+                    serde_json::json!({"schema_version": 1}),
+                    serde_json::json!({}),
+                    serde_json::json!(false),
+                    serde_json::json!(true),
+                    serde_json::json!(0),
+                    serde_json::json!("unavailable"),
+                ] {
+                    let mut s = start.clone();
+                    let mut t = end.clone();
+                    set(if startup { &mut s } else { &mut t }, field, value);
+                    let error = validate(&s, &t).unwrap_err();
+                    assert!(
+                        matches!(error, ArenaError::Integrity(ref detail) if detail.contains("unsupported undeclared private warm")),
+                        "startup={startup}, field={field}"
                     );
                 }
             }

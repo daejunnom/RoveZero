@@ -206,6 +206,14 @@ fn run_pals(
             {
                 return Err("duplicate PALS host record page option".into());
             }
+        } else if let Some(value) = argument.strip_prefix("--pals-private-warm=") {
+            if native
+                .private_warm
+                .replace(value.parse::<bool>()?)
+                .is_some()
+            {
+                return Err("duplicate PALS private warm option".into());
+            }
         } else if let Some(value) = argument.strip_prefix("--pals-device-public-memory=") {
             if native
                 .device_public_memory
@@ -347,6 +355,7 @@ struct PalsNativeOptions {
     cuda_device: Option<i32>,
     cuda_session_arena: Option<u64>,
     host_record_pages: Option<bool>,
+    private_warm: Option<bool>,
     device_public_memory: Option<bool>,
     cuda_control_mode: Option<String>,
     cuda_control_inventory: Option<String>,
@@ -440,6 +449,7 @@ impl PalsNativeOptions {
             || self.cuda_session_arena.is_some()
             || self.device_public_memory.is_some()
             || self.host_record_pages.is_some()
+            || self.private_warm.is_some()
             || self.cuda_control_mode.is_some()
             || self.cuda_control_inventory.is_some()
             || self.cuda_control_inventory_hash.is_some()
@@ -522,6 +532,11 @@ fn run_native_pals(
     }
     if native.host_record_pages.unwrap_or(false) && native.device_public_memory.unwrap_or(false) {
         return Err("PALS host record pages and device public memory are mutually exclusive; no fallback was started".into());
+    }
+    if native.private_warm.unwrap_or(false)
+        && (provider != "cpu" || native.device_public_memory.unwrap_or(false))
+    {
+        return Err("PALS private warm requires a separately pinned CPU/host warm export; CUDA/device/V are unsupported".into());
     }
     let loading_profile = pals_cuda_loading_profile(
         native.cuda_loading_profile.as_deref(),
@@ -691,6 +706,15 @@ fn run_native_pals(
                 )?
             }
         },
+        None if native.private_warm.unwrap_or(false) => {
+            rz_uci::pals_native::NativeRoleModel::load_pinned_cpu_private_warm_with_options(
+                &manifest,
+                &manifest_hash,
+                &pin,
+                backend_config,
+                owner_options,
+            )?
+        }
         None => rz_uci::pals_native::NativeRoleModel::load_pinned_with_options(
             &manifest,
             &manifest_hash,
