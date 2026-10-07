@@ -691,14 +691,15 @@ fn new_game_resets_position_cancels_worker_and_requests_game_state_clear() {
 fn malformed_go_does_not_cancel_a_running_search() {
     let mut session = session(FixturePort::default());
     let ticket = start(&mut session);
-    for line in [
-        "go movetime -1",
-        "go ponder",
-        "position startpos moves e2e9",
+    for (line, code) in [
+        ("go movetime -1", "InvalidCommand"),
+        ("go ponder", "PonderNeedsOwner"),
+        ("ponderhit", "PonderNeedsOwner"),
+        ("position startpos moves e2e9", "InvalidCommand"),
     ] {
         let out = session.handle_line(line);
         assert!(!out.accepted);
-        assert!(has_code(&out, "InvalidCommand"));
+        assert!(has_code(&out, code));
         assert!(out.effects.is_empty());
         assert_eq!(session.active_ticket(), Some(ticket.clone()));
     }

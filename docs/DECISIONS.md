@@ -77,6 +77,12 @@
 | RZ-D043 | 사용자 전체 시계·피셔·엔진 blitz 기준·PGN 색별 엔진 종류·후속 진행 지정 / 2026-10-05 | 공식 CCRL Blitz의 2분+1초 시간 형식을 참조해 로컬 RTX 4050에서 새 paired pilot을 실행한다. 기존 30초+0.1초 결과를 보존하고 점수를 합치지 않는다. 같은 BT4/FP32/No/B1·PUCT·cap 4096의 S0/S1 16쌍·32판을 별도로 실행하며 전체 상한은 120분이다. 기준 Intel i7-4770K CPU 보정·EGTB·공식 CCRL 등록/rating은 수행한 것으로 표시하지 않는다. PGN TimeControl을 실제 부모 clock trace와 대조하며 표기 차이는 D044에 따라 진단으로 남긴다. raw White/Black에 RoveZero·BT4·S0/S1을 명시하고 SAN 검토 사본은 원본 색별 ID·binary/model/source hash·program type을 보존한다. 실패·미완료·호스트 RAM 압박·실제 인수를 기록하며 미관측 opening/기력 승격을 주장하지 않는다. |
 | RZ-D044 | 사용자 PGN 표기 조건으로 차단하지 말고 벤치마크 진행 / 2026-10-05 | PGN TimeControl 누락·차이는 진단 기록으로 보존하고 벤치마크를 차단하지 않는다. 시계도 두 상수의 허용 목록으로 제한하지 않는다. 이번 실행은 120초+1초이며 실제 부모 시계·증분·초기화·엔진 색 배정·출력·실패는 계속 관측한다. |
 
+## 대결 폰더링과 자원 배분 — 2026-10-07
+
+| ID | 상태·근거 | 결정·검증 범위 |
+|---|---|---|
+| RZ-D045 | 사용자 PR #24 구현 지정 | 대결 Ponder on/off를 명시하고 기본 off를 유지한다. CPU/GPU/Hybrid별 가중치로 자원을 자동 배분하되 caller가 CPU pin·Threads·GPU UUID·VRAM 예약을 지정할 수 있다. isolated에서 물리 코어/SMT·GPU를 분리하고 공유는 명시적으로만 허용한다. V2 잠금은 파생 배분까지 고정하며 실제 Linux host·exec affinity·CUDA mask·UCI 옵션·runner 폰더링 수명과 감사에 연결한다. Fastchess clock/ponder V2 patch는 원 MIT copyright/license를 보존한다. CPU/mock 프로토콜·Rules·시계/종료 검증과 실제 NN/GPU·강도·공유 GPU compute quota 인수를 구분한다. 상세 형식은 [arena](../crates/rz-arena/README.md#폰더링과-동시-엔진-자원-배분)를 따른다. |
+
 ## 남은 결정과 실행 전 잠금
 
 기존 ID를 유지한다. `부분 결정`인 행의 확정 부분을 다시 미정으로 취급하지 않는다.

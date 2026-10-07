@@ -7,6 +7,44 @@ SHA-256과 정책을 재검증한다. E의 내부 직렬화 형식이며 총괄�
 통합본은 root workspace·lockfile을 공유한다. root Cargo·CI는 I01의 소유이며 이 도구의
 source 제공과 실제 실행·대국 인수는 [통합 인수 기록](../../docs/INTEGRATION-STATUS.md)을 따른다.
 
+## 대결 V2의 선택적 실행·자원 잠금
+
+`RunManifestV2.match_execution`은 폰더링과 동시 실행 자원 계획을 선택적으로 선언한다.
+필드를 생략한 기존 V2 잠금은 직렬 차례·Ponder off와 기존 canonical identity를 유지한다.
+V1 및 공통 계약 revision 0.1은 바꾸지 않는다. `ponder`는 명시적인 bool이며 on/off는
+별도 잠금으로 비교한다. 실행 접점은 [model-pair](../rz-arena/README.md#폰더링과-동시-엔진-자원-배분)다.
+
+`hardware.cpu_cores`는 현재 affinity 안의 물리 코어별 SMT sibling ID 목록이고,
+`hardware.gpus`는 실제 UUID·VRAM byte 목록이다. 두 `engines` 요청은 `baseline`과
+`candidate` 역할을 정확히 하나씩 가진다. 요청은 예를 들어 다음처럼 자동 할당한다.
+
+```json
+[{"role":"baseline","kind":"cpu"}, {"role":"candidate","kind":"hybrid"}]
+```
+
+기본 CPU 가중치는 CPU:Hybrid:GPU = 4:2:1이다. runner용 물리 코어 하나를 제외하고
+엔진마다 최소 한 코어를 먼저 주며 남은 코어는 가중치에 따라 배분한다. 9개의 단일
+thread 코어에서 CPU/GPU는 runner 1·CPU 6·GPU 2, CPU/Hybrid는 1·5·3이다.
+SMT sibling을 다른 엔진에 나누지 않는다. 자동 Threads는 CPU의 할당 logical CPU 수,
+Hybrid 최대 2, GPU 1이다. 가중치는 측정된 처리량·기력 균형을 뜻하지 않는다.
+
+GPU/Hybrid는 GPU가 필요하며 GPU:Hybrid 가중치 4:2의 순서로 큰 VRAM 장치부터
+서로 다른 UUID를 우선 배정한다. 현재 자동 할당은 GPU 사용 엔진마다 한 장이다.
+추가 장치 사용은 caller의 `gpu_ids`로 지정한다. `isolated`가 기본 권고이며 CPU/GPU
+중복·부족은 거부한다. 한 GPU를 공유하려면 `sharing="shared"`를 명시한다.
+공유 GPU의 기본 VRAM 예약은 가중치로 분배하고 명시적 예약은 먼저 보존한다.
+장치별 합이 용량을 넘거나 공유 CPU의 Threads 합이 가용 CPU 수를 넘으면 거부한다.
+VRAM은 예약 선언이고 CUDA allocator 강제 cap·GPU 연산시간 quota는 아니다.
+
+caller는 `cpu_ids`, `threads`, `gpu_ids`, 장치당 `gpu_memory_bytes`를 명시하거나
+`cpu_weight`/`gpu_weight`(1~64)를 조정할 수 있다. 명시적 할당을 자동으로 재분배하지 않는다.
+전체 `resources.affinity`는 inventory와 일치하고 runner·양 엔진을 포함해야 한다.
+`executor`는 `engine-exec`을 제공하는 실제 model-pair binary의 ArtifactRef다.
+`lock()`은 파생 `resolved_resources`까지 input digest에 고정한다. 재독해·실행에서
+다른 계획/version을 계산하면 거부하며, 변경하려면 해당 필드를 지우고 명시적으로 다시 잠근다.
+자원 mask와 충돌하는 endpoint 환경 변수는 거부한다. 미래 선언만 있는 native endpoint는
+provider 실행을 주장하지 않으며 현재 CPU/CUDA launch recipe는 별도 검증한다.
+
 ## 제공하는 동작
 
 - `validate`: 필수 타입·단위·digest·source·CARD·history 표시·유한 예산·실패 정책 검사.

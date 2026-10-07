@@ -49,13 +49,13 @@ fn multiline_non_ascii_and_control_bytes_are_rejected() {
 
 #[test]
 fn unsupported_modes_and_unknown_commands_remain_distinct() {
-    assert_eq!(
-        parse_default("ponderhit"),
-        Err(ParseError::Unsupported("ponderhit".into()))
-    );
+    assert_eq!(parse_default("ponderhit"), Ok(Command::PonderHit));
     assert_eq!(
         parse_default("go ponder"),
-        Err(ParseError::Unsupported("ponder".into()))
+        Ok(Command::Go(GoLimits {
+            ponder: true,
+            ..GoLimits::default()
+        }))
     );
     assert_eq!(
         parse_default("go depth 3"),
@@ -128,6 +128,9 @@ fn go_rejects_conflicts_missing_fields_duplicates_and_overflow() {
         "go infinite nodes 1",
         "go infinite wtime 1 btime 1",
         "go infinite infinite",
+        "go ponder ponder",
+        "go ponder infinite",
+        "ponderhit extra",
         "go nodes 1 nodes 2",
         "go movetime 1 movetime 2",
         "go wtime 1 btime 1 winc 1 winc 2",

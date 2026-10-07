@@ -638,6 +638,8 @@ struct Owner {
     workers: Vec<Worker>,
     pending_failures: VecDeque<(SearchTicket, SearchCompletion)>,
     pending_bestmove: Option<PendingBestMove>,
+    ponder: Option<(contract::AcceptanceScope, Option<u64>)>,
+    held_ponder_bestmove: Option<String>,
     fence_failure: Option<EngineError>,
     diagnostics: Arc<Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>>,
 }
@@ -656,6 +658,182 @@ impl PendingBestMove {
     }
 }
 impl Owner {
+    fn command_line(
+        &mut self,
+        session: &mut Session<RulesUciPort>,
+        line: &str,
+    ) -> SessionResult<RulesSearchPosition> {
+        let parsed = parse(line, session.parser_limits());
+        let enabled = matches!(
+            session.option_values().get("Ponder"),
+            Some(OptionValue::Check(true))
+        );
+        let mut out = SessionResult::default();
+        match &parsed {
+            Ok(Command::Go(limits)) if limits.ponder => {
+                if !enabled || limits.nodes.is_some_and(|n| n > 4096) {
+                    out.accepted = false;
+                    out.diagnostics.push(Diagnostic {
+                        code: "PonderRejected",
+                        message:
+                            "Ponder must be enabled and the node limit must fit the engine envelope"
+                                .into(),
+                    });
+                    return out;
+                }
+                // The opponent's elapsed time is never debited from the supplied own clock.
+                // A finite resource wall and simulation ceiling still bound speculative work.
+                append_contract_result(
+                    &mut out,
+                    self.session_owner.handle_line(session, "go infinite", |s| {
+                        Ok(s.state.snapshot().side_to_move())
+                    }),
+                );
+                if out.accepted {
+                    self.held_ponder_bestmove = None;
+                    self.ponder = Some((self.session_owner.scope(), limits.nodes));
+                }
+            }
+            Ok(Command::PonderHit) => {
+                if !self.ponder.as_ref().is_some_and(|(scope, _)| {
+                    let live = self.session_owner.scope();
+                    scope.game == live.game
+                        && scope.root == live.root
+                        && scope.model == live.model
+                        && scope.encoding == live.encoding
+                        && scope.backend == live.backend
+                }) {
+                    out.accepted = false;
+                    out.diagnostics.push(Diagnostic {
+                        code: "StalePonderHit",
+                        message: "no current predicted-root search".into(),
+                    });
+                    return out;
+                }
+                self.ponder = None;
+                // This baseline finishes the precomputed candidate on hit. It does not
+                // restart, spend the opponent's time, or reopen an expired request.
+                append_contract_result(
+                    &mut out,
+                    self.session_owner
+                        .handle_line(session, "stop", |s| Ok(s.state.snapshot().side_to_move())),
+                );
+                if let Some(line) = self.held_ponder_bestmove.take() {
+                    out.protocol.push(line);
+                }
+            }
+            Ok(Command::SetOption { name, .. })
+                if name.eq_ignore_ascii_case("Ponder")
+                    && (session.active_ticket().is_some() || self.ponder.is_some()) =>
+            {
+                out.accepted = false;
+                out.diagnostics.push(Diagnostic {
+                    code: "PonderRejected",
+                    message: "change Ponder while idle".into(),
+                });
+            }
+            _ => {
+                append_contract_result(
+                    &mut out,
+                    self.session_owner
+                        .handle_line(session, line, |s| Ok(s.state.snapshot().side_to_move())),
+                );
+                if out.accepted && matches!(parsed, Ok(Command::Stop)) {
+                    if let Some(line) = self.held_ponder_bestmove.take() {
+                        out.protocol.push(line);
+                    }
+                }
+                if out.accepted
+                    && matches!(
+                        parsed,
+                        Ok(Command::Go(_)
+                            | Command::Position(_)
+                            | Command::NewGame
+                            | Command::Stop
+                            | Command::Quit)
+                    )
+                {
+                    self.ponder = None;
+                    self.held_ponder_bestmove = None;
+                }
+            }
+        }
+        out
+    }
+    fn annotate_ponder(
+        &self,
+        session: &Session<RulesUciPort>,
+        out: &mut SessionResult<RulesSearchPosition>,
+    ) {
+        if !matches!(
+            session.option_values().get("Ponder"),
+            Some(OptionValue::Check(true))
+        ) {
+            return;
+        }
+        for line in &mut out.protocol {
+            let Some(text) = line
+                .strip_prefix("bestmove ")
+                .filter(|s| *s != "0000" && !s.contains(' '))
+            else {
+                continue;
+            };
+            let prediction = (|| -> Result<Option<String>, contract::ContractError> {
+                let movement = contract::Move::try_from(BoardMove::from_uci(text)?)?;
+                let child = CheckedPosition::play(session.snapshot(), &movement)?;
+                if child.state.terminal_wdl().is_some() {
+                    return Ok(None);
+                }
+                child
+                    .state
+                    .legal_moves()
+                    .moves()
+                    .first()
+                    .copied()
+                    .map(move_text)
+                    .transpose()
+            })();
+            match prediction {
+                Ok(Some(prediction)) => {
+                    line.push_str(" ponder ");
+                    line.push_str(&prediction);
+                }
+                Ok(None) => {}
+                Err(error) => out.diagnostics.push(Diagnostic {
+                    code: "PonderPredictionFailed",
+                    message: format!("{error:?}"),
+                }),
+            }
+        }
+    }
+    fn hold_ponder_output(
+        &mut self,
+        session: &Session<RulesUciPort>,
+        out: &mut SessionResult<RulesSearchPosition>,
+    ) {
+        if session.is_closed() {
+            self.ponder = None;
+            self.held_ponder_bestmove = None;
+            return;
+        }
+        if self.ponder.is_none() {
+            return;
+        }
+        for line in std::mem::take(&mut out.protocol) {
+            if !line.starts_with("bestmove ") {
+                out.protocol.push(line);
+                continue;
+            }
+            if self.held_ponder_bestmove.is_some() {
+                out.diagnostics.push(Diagnostic {
+                    code: "DuplicatePonderOutput",
+                    message: "retained first completed predicted-root move".into(),
+                });
+            } else {
+                self.held_ponder_bestmove = Some(line);
+            }
+        }
+    }
     fn pending_failure(
         &mut self,
         sender: &SyncSender<Event>,
@@ -707,6 +885,8 @@ impl Owner {
                 self.session_owner
                     .handle_event(session, Event::Complete { ticket, completion }),
             );
+            self.annotate_ponder(session, &mut failed);
+            self.hold_ponder_output(session, &mut failed);
             self.defer_bestmove(session, &mut failed);
             append_result(&mut out, failed);
         }
@@ -714,14 +894,7 @@ impl Owner {
             Event::RejectedInput {
                 code: "OwnerWake", ..
             } => SessionResult::default(),
-            Event::Line(line) => {
-                let next = self.session_owner.handle_line(session, &line, |snapshot| {
-                    Ok(snapshot.state.snapshot().side_to_move())
-                });
-                let mut out = SessionResult::default();
-                append_contract_result(&mut out, next);
-                out
-            }
+            Event::Line(line) => self.command_line(session, &line),
             event => {
                 let next = self.session_owner.handle_event(session, event);
                 let mut out = SessionResult::default();
@@ -775,6 +948,8 @@ impl Owner {
                 append_result(&mut out, session.end_of_input());
             }
         }
+        self.annotate_ponder(session, &mut next);
+        self.hold_ponder_output(session, &mut next);
         self.defer_bestmove(session, &mut next);
         append_result(&mut out, next);
         self.finish_physical_output(session, &mut out);
@@ -981,12 +1156,15 @@ impl Owner {
                     );
                     return Ok(());
                 }
-                let control = self.session_owner.control().cloned().ok_or_else(|| {
+                let mut control = self.session_owner.control().cloned().ok_or_else(|| {
                     failure(
                         contract::ErrorCode::IdentityMismatch,
                         "UCI start has no checked B control",
                     )
                 })?;
+                if let Some((_, Some(nodes))) = self.ponder {
+                    control.max_simulations = control.max_simulations.min(nodes);
+                }
                 let token = self
                     .session_owner
                     .cancellation()
@@ -1228,6 +1406,7 @@ impl Owner {
                     failure: publication,
                 });
             }
+            Effect::OptionChanged { name, .. } if name.eq_ignore_ascii_case("Ponder") => {}
             Effect::OptionChanged { .. } | Effect::Button { .. } => {
                 return Err(failure(
                     contract::ErrorCode::UnsupportedContract,
@@ -1572,13 +1751,18 @@ pub fn serve<O: Write, D: Write>(
         workers: Vec::new(),
         pending_failures: VecDeque::new(),
         pending_bestmove: None,
+        ponder: None,
+        held_ponder_bestmove: None,
         fence_failure: None,
         diagnostics: Arc::new(Mutex::new(Vec::new())),
     }));
     let mut session = Session::new(
         RulesUciPort::new(owners, settings.position),
         identity,
-        Vec::new(),
+        vec![OptionSpec {
+            name: "Ponder".into(),
+            kind: OptionKind::Check { default: false },
+        }],
         settings.parser,
     )
     .map_err(EngineError::Session)?;
@@ -1929,6 +2113,8 @@ mod tests {
             workers: Vec::new(),
             pending_failures: VecDeque::new(),
             pending_bestmove: None,
+            ponder: None,
+            held_ponder_bestmove: None,
             fence_failure: None,
             diagnostics: Arc::new(Mutex::new(Vec::new())),
         };
@@ -1938,7 +2124,10 @@ mod tests {
                 name: "actual Rules refusal fixture".into(),
                 author: "test".into(),
             },
-            Vec::new(),
+            vec![OptionSpec {
+                name: "Ponder".into(),
+                kind: OptionKind::Check { default: false },
+            }],
             settings.parser,
         )
         .unwrap();
@@ -3028,6 +3217,165 @@ mod tests {
     }
 
     #[test]
+    fn pondering_is_explicit_and_keeps_the_normal_search_root_on_rejection() {
+        let (mut owner, mut session) = fixture();
+        let scope = owner.session_owner.scope();
+        let rejected = owner.handle(
+            &mut session,
+            Event::Line("go ponder wtime 1000 btime 1000".into()),
+        );
+        assert!(!rejected.accepted && rejected.effects.is_empty());
+        assert_eq!(owner.session_owner.scope().root, scope.root);
+        assert!(session.active_ticket().is_none());
+        owner.handle(
+            &mut session,
+            Event::Line("setoption name Ponder value true".into()),
+        );
+        let started = owner.handle(&mut session, Event::Line("go ponder nodes 1".into()));
+        assert!(started.accepted);
+        assert!(started.protocol.is_empty());
+        assert_eq!(owner.ponder.unwrap().1, Some(1));
+        assert!(owner.session_owner.control().unwrap().deadline > Instant::now());
+    }
+
+    #[test]
+    fn completed_ponder_waits_for_hit_and_returns_the_candidate_exactly_once() {
+        let (mut owner, mut session) = fixture();
+        owner.handle(
+            &mut session,
+            Event::Line("setoption name Ponder value true".into()),
+        );
+        owner.handle(
+            &mut session,
+            Event::Line("go ponder wtime 1 btime 1".into()),
+        );
+        let ticket = session.active_ticket().unwrap();
+        let token = owner.session_owner.cancellation().unwrap().token();
+        let complete = owner.handle(
+            &mut session,
+            Event::Complete {
+                ticket: ticket.clone(),
+                completion: SearchCompletion::Completed {
+                    bestmove: Some("e2e4".into()),
+                },
+            },
+        );
+        assert!(complete.protocol.is_empty());
+        assert_eq!(
+            owner
+                .handle(&mut session, Event::Line("isready".into()))
+                .protocol,
+            ["readyok"]
+        );
+        let hit = owner.handle(&mut session, Event::Line("ponderhit".into()));
+        assert!(hit.accepted);
+        assert!(hit.protocol[0].starts_with("bestmove e2e4 ponder "));
+        assert!(token.is_canceled());
+        assert!(session.active_ticket().is_none());
+        assert!(
+            owner
+                .handle(&mut session, Event::Line("ponderhit".into()))
+                .protocol
+                .is_empty()
+        );
+        assert!(
+            owner
+                .handle(
+                    &mut session,
+                    Event::Complete {
+                        ticket,
+                        completion: SearchCompletion::Completed {
+                            bestmove: Some("d2d4".into())
+                        }
+                    }
+                )
+                .protocol
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_ponder_preserves_diagnostics_and_holds_fallback_until_stop() {
+        let (mut owner, mut session) = fixture();
+        owner.handle(
+            &mut session,
+            Event::Line("setoption name Ponder value true".into()),
+        );
+        owner.handle(&mut session, Event::Line("go ponder".into()));
+        let ticket = session.active_ticket().unwrap();
+        let failed = owner.handle(
+            &mut session,
+            Event::Complete {
+                ticket,
+                completion: SearchCompletion::Failed {
+                    code: "InjectedPonderFailure".into(),
+                    message: "original source".into(),
+                },
+            },
+        );
+        assert!(failed.protocol.is_empty());
+        assert!(
+            failed
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("original source"))
+        );
+        let stop = owner.handle(&mut session, Event::Line("stop".into()));
+        assert_eq!(
+            stop.protocol
+                .iter()
+                .filter(|s| s.starts_with("bestmove "))
+                .count(),
+            1
+        );
+        assert!(
+            owner
+                .handle(&mut session, Event::Line("stop".into()))
+                .protocol
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn accepted_position_replacement_suppresses_an_old_held_ponder_failure() {
+        let (mut owner, mut session) = fixture();
+        owner.handle(
+            &mut session,
+            Event::Line("setoption name Ponder value true".into()),
+        );
+        owner.handle(&mut session, Event::Line("go ponder".into()));
+        let ticket = session.active_ticket().unwrap();
+        owner.handle(
+            &mut session,
+            Event::Complete {
+                ticket,
+                completion: SearchCompletion::Failed {
+                    code: "Injected".into(),
+                    message: "retained".into(),
+                },
+            },
+        );
+        assert!(owner.held_ponder_bestmove.is_some());
+        let bad = owner.handle(
+            &mut session,
+            Event::Line("position startpos moves e2e5".into()),
+        );
+        assert!(!bad.accepted && owner.held_ponder_bestmove.is_some());
+        let good = owner.handle(
+            &mut session,
+            Event::Line("position startpos moves e2e4".into()),
+        );
+        assert!(good.accepted && good.protocol.is_empty());
+        assert!(owner.ponder.is_none() && owner.held_ponder_bestmove.is_none());
+        assert!(
+            owner
+                .handle(&mut session, Event::Line("ponderhit".into()))
+                .protocol
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn injected_identity_reaches_uci_and_newline_identity_is_rejected_before_output() {
         let run = |name: &str| {
             let (owner, session) = fixture();
@@ -3063,6 +3411,7 @@ mod tests {
             [
                 "id name RoveZero native CPU identity fixture",
                 "id author RoveZero identity fixture",
+                "option name Ponder type check default false",
                 "uciok",
             ]
         );

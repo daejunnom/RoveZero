@@ -22,8 +22,8 @@ SelectionId, GameGeneration, RootGeneration을 대체하는 정의가 아니다.
 
 - 지원: `uci`, `isready`, `setoption`, `position startpos|fen <6 fields> [moves ...]`,
   `go movetime`, 양쪽 `wtime/btime` 및 `winc/binc/movestogo`, `nodes`, `infinite`,
-  `stop`, `quit`, `ucinewgame`. `nodes`는 movetime 또는 clock과 함께 사용할 수 있다.
-- `go ponder/searchmoves/depth/mate`, `ponderhit`, 알려진 명령의 잘못된 인수는
+  `ponder`, `ponderhit`, `stop`, `quit`, `ucinewgame`. `nodes`는 movetime 또는 clock과 함께 사용할 수 있다.
+- `go searchmoves/depth/mate`, 알려진 명령의 잘못된 인수는
   명시적으로 거부한다. 시간 mode 충돌·중복 field·정수 overflow도 거부한다.
   별도 한도 없는 `go`는 거부한다. 다른 미지 명령은 진단하고 무시한다.
 - line 기본 한도 16 KiB, trace 2,048 ply, option name 128 byte/value 1,024 byte,
@@ -48,6 +48,26 @@ SelectionId, GameGeneration, RootGeneration을 대체하는 정의가 아니다.
   거부한다. `ucinewgame`은 startpos와 game-owned namespace/history/search/correction
   초기화 effect를 발행한다. 이전 raw-cache game generation을 무효화하고 model
   weights는 보존하는 것은 runtime adapter의 책임이다.
+
+## 폰더링 on/off
+
+실제 `rz-uci` 실행 파일은 `option name Ponder type check default false`를 게시한다.
+idle에서 `setoption name Ponder value true`를 설정하면 정상 `bestmove` 뒤에
+합법적인 상대 예상 수를 `ponder`로 붙인다. 현재 예상은 A Rules의 ordered legal
+첫 수이며 탐색 PV·기력 개선의 증거가 아니다. terminal 다음에는 예상 수를 붙이지 않는다.
+
+호출자는 자기 착수와 예상 상대 수를 포함한 `position` 다음에 `go ponder`를 보낸다.
+이 요청은 상대 차례 동안 자기 시계를 차감하지 않으며 기존 finite resource wall과
+simulation 한도 안에서 계산한다. `nodes`를 추가하면 그 상한도 적용한다(최대 4096).
+정상 완료·terminal·실패의 합법 fallback은 `ponderhit`/`stop`까지 보류하고 원래 실패
+진단은 보존한다. 적중 시 이 기준선은 계산한 후보를 즉시 확정하고 물리 worker가
+drain된 뒤 한 번 출력한다. 적중 후 남은 자기 시계로 탐색을 연장하는 기능은 없다.
+예측이 틀리면 `stop`의 출력·drain을 받은 뒤 실제 `position`과 새 `go`를 보낸다.
+새 root/game·quit·EOF는 이전 예상 결과를 폐기하고 중복·늦은 hit를 거부한다.
+
+범용 `Session`/공통 시간 bridge만 사용하는 adapter는 `PonderNeedsOwner`로
+거부한다. 실제 engine owner의 출력 보류·세대·취소·물리 수명 처리가 있어야 실행할 수 있다.
+대결의 옵션·자원 배분·runner patch는 [arena 문서](../rz-arena/README.md#폰더링과-동시-엔진-자원-배분)를 따른다.
 
 ## 공통 계약 owner
 

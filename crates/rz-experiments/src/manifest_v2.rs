@@ -264,6 +264,9 @@ pub struct RunManifestV2 {
     pub rules_profile: String,
     pub evaluation_policy: String,
     pub resources: ResourcePolicyV2,
+    /// Omitted preserves historical V2 locks and ponder-off execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_execution: Option<MatchExecutionV1>,
     /// One explicit tree envelope for every RoveZero endpoint in this control.
     /// External UCI engines do not receive this native setting.
     pub rove_tree_max_edges: u32,
@@ -452,7 +455,7 @@ impl RunManifestV2 {
             "RoveZero edge envelope invalid",
         )?;
         require_v2(
-            (1..=64).contains(&r.cpu_threads)
+            (1..=2048).contains(&r.cpu_threads)
                 && r.affinity.len() == r.cpu_threads as usize
                 && r.affinity.iter().collect::<BTreeSet<_>>().len() == r.affinity.len()
                 && r.memory_high_bytes > 0
@@ -461,6 +464,84 @@ impl RunManifestV2 {
                 && (r.gpu.is_some() == (r.gpu_vram_bytes > 0)),
             "resource envelope invalid",
         )?;
+        if let Some(execution) = &self.match_execution {
+            let plan = execution.plan()?;
+            require_v2(
+                self.engines.iter().all(|e| {
+                    e.id()
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+                }),
+                "match engine IDs must be single bounded protocol tokens",
+            )?;
+            if execution.ponder {
+                let patch = self.runner.dirty_patch.as_ref().ok_or_else(|| {
+                    ManifestError::Integrity(
+                        "ponder requires the pinned Fastchess clock/ponder V2 patch".into(),
+                    )
+                })?;
+                require_v2(
+                    self.runner.dirty
+                        && patch.sha256
+                            == digest(include_bytes!(
+                                "../../../experiments/baselines/fastchess-clock-ponder-v2.patch"
+                            )),
+                    "ponder runner patch identity differs",
+                )?;
+            }
+            let available: BTreeSet<_> = execution
+                .hardware
+                .cpu_cores
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
+            require_v2(
+                available == r.affinity.iter().copied().collect(),
+                "match CPU inventory differs from inherited envelope",
+            )?;
+            require_v2(
+                execution.hardware.gpus.is_empty() == r.gpu.is_none(),
+                "match GPU inventory differs from envelope",
+            )?;
+            let reserved = plan.engines.iter().try_fold(0u64, |n, a| {
+                a.gpu_memory_bytes
+                    .checked_mul(a.gpu_ids.len() as u64)
+                    .and_then(|m| n.checked_add(m))
+            });
+            require_v2(
+                reserved.is_some_and(|n| n <= r.gpu_vram_bytes),
+                "match GPU reservations exceed envelope",
+            )?;
+            for allocation in &plan.engines {
+                let environment = match self.engine(allocation.role)? {
+                    EngineEndpointV2::ExternalUci(e) => e.environment.as_ref(),
+                    EngineEndpointV2::RoveZero(e) => e.environment.as_ref(),
+                };
+                require_v2(
+                    environment.is_none_or(|e| {
+                        !e.variables.contains_key("CUDA_VISIBLE_DEVICES")
+                            && !e.variables.contains_key("CUDA_DEVICE_ORDER")
+                    }),
+                    "resource policy owns CUDA visibility; remove conflicting public environment variables",
+                )?;
+                if let EngineEndpointV2::RoveZero(e) = self.engine(allocation.role)? {
+                    let Some(launch) = e.launch.as_ref() else {
+                        continue;
+                    };
+                    let cpu = matches!(launch, RoveLaunchV2::Lc0Cpu(_));
+                    require_v2(
+                        cpu == (allocation.kind == EngineComputeKind::Cpu),
+                        "native provider differs from compute kind",
+                    )?;
+                    // Current closed native profiles select logical CUDA device 0.
+                    require_v2(
+                        allocation.gpu_ids.len() <= 1,
+                        "native recipe supports one assigned GPU",
+                    )?;
+                }
+            }
+        }
         require_v2(
             self.timeouts.runtime_ms > 0
                 && self.timeouts.runtime_ms <= 3_600_000
@@ -734,6 +815,14 @@ impl RunManifestV2 {
     }
     pub fn declared_artifacts(&self) -> Vec<&ArtifactRef> {
         let mut assets = vec![&self.runner.binary, &self.opening_artifact];
+        if let Some(execution) = &self.match_execution {
+            assets.push(&execution.executor);
+        }
+        if self.match_execution.as_ref().is_some_and(|e| e.ponder) {
+            if let Some(patch) = &self.runner.dirty_patch {
+                assets.push(patch);
+            }
+        }
         for e in &self.engines {
             match e {
                 EngineEndpointV2::ExternalUci(e) => {
@@ -789,7 +878,10 @@ impl RunManifestV2 {
         )?;
         Ok(total)
     }
-    pub fn lock(self) -> Result<LockedManifestV2, ManifestError> {
+    pub fn lock(mut self) -> Result<LockedManifestV2, ManifestError> {
+        if let Some(execution) = &mut self.match_execution {
+            execution.resolved_resources = Some(execution.plan()?);
+        }
         self.validate()?;
         let sha256 = digest(&canonical_v2(&self)?);
         Ok(LockedManifestV2 {
@@ -840,6 +932,13 @@ impl LockedManifestV2 {
             v.lock_version == 2 && v.domain == MANIFEST_V2_DOMAIN && !v.execution_ready,
             "wrong V2 lock domain/authority",
         )?;
+        require_v2(
+            v.input
+                .match_execution
+                .as_ref()
+                .is_none_or(|e| e.resolved_resources.is_some()),
+            "locked match is missing its resolved placement",
+        )?;
         let locked = v.input.lock()?;
         require_v2(locked.sha256 == v.input_sha256, "V2 digest mismatch")?;
         Ok(locked)
@@ -872,6 +971,60 @@ mod tests {
         let reread = LockedManifestV2::from_json(&legacy.to_string()).unwrap();
         assert_eq!(reread.sha256(), lock.sha256());
         assert_eq!(reread.to_json().unwrap(), json);
+    }
+    #[test]
+    fn v2_lock_freezes_automatic_placement_and_rejects_missing_or_modified_plan() {
+        use crate::{EngineResourceRequest, MatchHardware, ResourceSharing};
+        let mut input = manifest(ComparisonV2::Fixture);
+        input.resources.cpu_threads = 3;
+        input.resources.affinity = vec![0, 1, 2];
+        input.match_execution = Some(MatchExecutionV1 {
+            ponder: false,
+            sharing: ResourceSharing::Isolated,
+            hardware: MatchHardware {
+                cpu_cores: vec![vec![0], vec![1], vec![2]],
+                gpus: vec![],
+            },
+            engines: [NativeEngineRole::Baseline, NativeEngineRole::Candidate].map(|role| {
+                EngineResourceRequest {
+                    role,
+                    kind: EngineComputeKind::Cpu,
+                    cpu_ids: None,
+                    threads: None,
+                    gpu_ids: None,
+                    gpu_memory_bytes: None,
+                    cpu_weight: None,
+                    gpu_weight: None,
+                }
+            }),
+            executor: input.runner.binary.clone(),
+            resolved_resources: None,
+        });
+        let expected = input.match_execution.as_ref().unwrap().plan().unwrap();
+        let lock = input.lock().unwrap();
+        assert_eq!(
+            lock.input()
+                .match_execution
+                .as_ref()
+                .unwrap()
+                .resolved_resources,
+            Some(expected)
+        );
+        let json = lock.to_json().unwrap();
+        assert_eq!(
+            LockedManifestV2::from_json(&json).unwrap().sha256(),
+            lock.sha256()
+        );
+        let mut changed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        changed["input"]["match_execution"]["resolved_resources"]["engines"][0]["cpu_ids"] =
+            serde_json::json!([2]);
+        assert!(LockedManifestV2::from_json(&changed.to_string()).is_err());
+        let mut removed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        removed["input"]["match_execution"]
+            .as_object_mut()
+            .unwrap()
+            .remove("resolved_resources");
+        assert!(LockedManifestV2::from_json(&removed.to_string()).is_err());
     }
     #[test]
     fn public_environment_budgets_and_native_semantics_are_checked() {
@@ -993,6 +1146,7 @@ mod tests {
                 gpu: None,
                 gpu_vram_bytes: 0,
             },
+            match_execution: None,
             rove_tree_max_edges: 262_144,
             engines: [
                 make(0, NativeEngineRole::Baseline),
