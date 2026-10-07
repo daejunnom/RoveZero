@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import random
 import stat
+import struct
 import sys
 import time
 import zipfile
@@ -30,6 +31,8 @@ from .config import ModelConfig, TASKS
 from .model import TensorInput
 
 DATA_DOMAIN = "rz-pals-data/2"
+LABEL_DOMAIN = "rz-pals-label/1"
+CURRENT_LABEL_VIEW_DOMAIN = "rz-pals-current-label-view/1"
 CHECKPOINT_SCHEMA = "rz-pals-python-preparation-checkpoint/1"
 U64_MAX = 2**64 - 1
 ROLE_NAMES = {"proposer": "proposer", "critic": "critic", "verifier": "validator"}
@@ -77,6 +80,26 @@ def _identity(value):
 def _canonical(domain, value):
     return hashlib.sha256(json.dumps([domain, value], ensure_ascii=False, allow_nan=False,
                                      separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _sorted_canonical(domain, value):
+    return hashlib.sha256(json.dumps([domain, value], sort_keys=True, ensure_ascii=False,
+                                     allow_nan=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _private_fp32_bits(value):
+    if type(value) not in (int, float):
+        raise ValueError("V private latent requires finite FP32 numbers")
+    try:
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("V private latent requires finite FP32 numbers")
+        encoded = struct.pack(">f", number)
+    except (OverflowError, struct.error) as error:
+        raise ValueError("V private latent exceeds finite FP32") from error
+    if not math.isfinite(struct.unpack(">f", encoded)[0]):
+        raise ValueError("V private latent exceeds finite FP32")
+    return encoded.hex()
 
 
 def _source(value):
@@ -148,7 +171,7 @@ def _validate_record(record, owned_cpu, sources):
         if _uint(public["situation_revision"]) > s["input_revision"]:
             raise ValueError("future public record leaked into input")
     source = _source(s["source"])
-    if source not in sources or (source["kind"] == "own_cpu" and source["cpu_binary_sha256"] not in owned_cpu):
+    if (sources is not None and source not in sources) or (owned_cpu is not None and source["kind"] == "own_cpu" and source["cpu_binary_sha256"] not in owned_cpu):
         raise ValueError("unregistered own input source")
     if _sha(frozen["sha256"]) != seal_snapshot(s):
         raise ValueError("historical /2 input seal mismatch")
@@ -157,8 +180,10 @@ def _validate_record(record, owned_cpu, sources):
         private = _fields(private, ("task_kind", "control_sha256", "private_latent"), "verifier private")
         _identity(private["task_kind"])
         _sha(private["control_sha256"])
-        if s["role"] != "verifier" or not isinstance(private["private_latent"], list) or len(private["private_latent"]) > 16 * 384 or not all(type(v) in (int, float) and math.isfinite(v) for v in private["private_latent"]):
+        if s["role"] != "verifier" or not isinstance(private["private_latent"], list) or len(private["private_latent"]) > 16 * 384:
             raise ValueError("V private data is not permitted in P/C inputs")
+        for value in private["private_latent"]:
+            _private_fp32_bits(value)
     label = record["future_label"]
     if label is None:
         return
@@ -174,7 +199,7 @@ def _validate_record(record, owned_cpu, sources):
         p = _fields(p, ("source", "engine_sha256", "profile_sha256", "task_sha256", "completed_depth", "nodes", "raw_evidence_sha256"), "owned CPU target")
         for name in ("engine_sha256", "profile_sha256", "task_sha256", "raw_evidence_sha256"):
             _sha(p[name])
-        if p["engine_sha256"] not in owned_cpu or _uint(p["completed_depth"], 2**32 - 1) < 1:
+        if (owned_cpu is not None and p["engine_sha256"] not in owned_cpu) or _uint(p["completed_depth"], 2**32 - 1) < 1:
             raise ValueError("unregistered or unfinished CPU target")
         _uint(p["nodes"])
         if label["value_wdl"] is not None:
@@ -207,6 +232,10 @@ def _validate_record(record, owned_cpu, sources):
     if label["policy"] is not None:
         policy = _fields(label["policy"], ("moves", "probabilities"), "policy target")
         probabilities = policy["probabilities"]
+        if not isinstance(policy["moves"], list) or len(policy["moves"]) > 256:
+            raise ValueError("policy move allocation bound")
+        for move in policy["moves"]:
+            _uint(move, 65535)
         if s["role"] == "verifier" or not s["legal_moves"] or policy["moves"] != s["legal_moves"] or not isinstance(probabilities, list) or len(probabilities) != len(s["legal_moves"]) or not all(type(v) in (int, float) and math.isfinite(v) and 0 <= v <= 1 for v in probabilities) or abs(sum(probabilities) - 1) > 1e-6:
             raise ValueError("invalid policy target/legal move order")
     if label["counterexample"] is not None:
@@ -242,6 +271,112 @@ def _validate_record(record, owned_cpu, sources):
                 _sha(task["information_gain_evidence_sha256"])
             if rank is not None and (_uint(rank, len(tasks) - 1) < 0 or task["information_gain_evidence_sha256"] is None):
                 raise ValueError("ranked V task needs observed information gain")
+
+
+def _label_digest_value(input_sha256, label):
+    value = copy.deepcopy(label)
+    if value["policy"] is not None:
+        value["policy"]["probabilities"] = [struct.pack(">d", float(v)).hex() for v in value["policy"]["probabilities"]]
+    if value["value_wdl"] is not None:
+        value["value_wdl"] = [struct.pack(">d", float(v)).hex() for v in value["value_wdl"]]
+    return _sorted_canonical(LABEL_DOMAIN, {"input_sha256": input_sha256, "label": value})
+
+
+def label_digest(record):
+    """New input-bound identity matching Rust PalsLearningRecord.label_digest.
+
+    Minimal UTF-8 JSON is [domain,{input_sha256,label}], with recursively sorted
+    object keys and unchanged array order. Label probabilities/WDL alone become
+    16-digit lowercase binary64 bit strings. None labels have no digest. Private
+    V controls are compared separately by current_label_view. This validates the
+    record shape/seal, but neither enrolls a source nor admits a dataset split.
+    Existing input/raw-row/dataset digests are not converted to this domain.
+    """
+    _validate_record(record, None, None)
+    label = record["future_label"]
+    return None if label is None else _label_digest_value(record["input"]["sha256"], label)
+
+
+def _private_context_digest(private):
+    value = copy.deepcopy(private)
+    if value is not None:
+        value["private_latent"] = [_private_fp32_bits(v) for v in value["private_latent"]]
+    return _sorted_canonical("rz-pals-verifier-private-context/1", value)
+
+
+@dataclass(frozen=True)
+class CurrentLabelView:
+    current_indices: tuple
+    sha256: str
+
+
+def current_label_view(records):
+    """Audit <=65,536 raw rows without mutation; select whole current labels.
+
+    Input SHA order fixes view order regardless of raw row order. Sources/split
+    still need independent admission through ValidatedDataset. The separate view
+    digest binds each input, current label and exact V-private FP32 context.
+    """
+    if not isinstance(records, list) or not 1 <= len(records) <= 65536:
+        raise ValueError("dataset record extent")
+    groups, labels, digests, contexts = {}, {}, [], []
+    for index, row in enumerate(records):
+        digest = label_digest(row)
+        if digest is not None:
+            if digest in labels:
+                raise ValueError("duplicate label identity")
+            labels[digest] = index
+        groups.setdefault(row["input"]["sha256"], []).append(index)
+        digests.append(digest)
+        contexts.append(_private_context_digest(row["verifier_private"]))
+    children = {}
+    for index, row in enumerate(records):
+        label = row["future_label"]
+        predecessor = None if label is None else label["supersedes_label_sha256"]
+        if predecessor is not None:
+            if predecessor not in labels:
+                raise ValueError("missing predecessor label")
+            prior = labels[predecessor]
+            if row["input"] != records[prior]["input"]:
+                raise ValueError("label predecessor belongs to a different input")
+            if prior in children:
+                raise ValueError("forked label supersession")
+            children[prior] = index
+    selected, descriptors = [], []
+    for input_sha256, indices in sorted(groups.items()):
+        first = indices[0]
+        for index in indices:
+            if records[index]["input"] != records[first]["input"]:
+                raise ValueError("immutable input identity collision")
+            if contexts[index] != contexts[first]:
+                raise ValueError("different V private contexts share an input label chain")
+        unlabeled = [i for i in indices if digests[i] is None]
+        labeled = [i for i in indices if digests[i] is not None]
+        if len(unlabeled) > 1:
+            raise ValueError("duplicate unlabeled input")
+        if not labeled:
+            current = unlabeled[0]
+        else:
+            roots = [i for i in labeled if records[i]["future_label"]["supersedes_label_sha256"] is None]
+            if len(roots) != 1:
+                raise ValueError("cyclic or multiple-root label chain")
+            visited, current = set(), roots[0]
+            while True:
+                if current in visited:
+                    raise ValueError("cyclic label supersession")
+                visited.add(current)
+                if current not in children:
+                    break
+                successor = children[current]
+                if records[successor]["future_label"]["observed_sequence"] <= records[current]["future_label"]["observed_sequence"]:
+                    raise ValueError("label supersession sequence must strictly increase")
+                current = successor
+            if len(visited) != len(labeled):
+                raise ValueError("disconnected or cyclic label chain")
+        selected.append(current)
+        descriptors.append({"input_sha256": input_sha256, "label_sha256": digests[current],
+                            "verifier_private_sha256": contexts[current]})
+    return CurrentLabelView(tuple(selected), _sorted_canonical(CURRENT_LABEL_VIEW_DOMAIN, descriptors))
 
 
 @dataclass(frozen=True)
@@ -583,7 +718,21 @@ class ValidatedDataset:
         self.records, self.split = copy.deepcopy(records), dict(split)
         self._row_identities = tuple(_canonical("rz-pals-python-immutable-row/1", row) for row in self.records)
         self._split_identity = _canonical("rz-pals-python-immutable-split/1", self.split)
+        self._current_view = current_label_view(self.records)
+        self._current_indices = frozenset(self._current_view.current_indices)
         self._attach_encodings(encodings)
+
+    @property
+    def current_view(self):
+        return self._current_view
+
+    def _verify_raw_integrity(self):
+        if len(self.records) != len(self._row_identities) or any(
+                _canonical("rz-pals-python-immutable-row/1", row) != identity
+                for row, identity in zip(self.records, self._row_identities)):
+            raise ValueError("immutable raw dataset history changed after admission")
+        if _canonical("rz-pals-python-immutable-split/1", self.split) != self._split_identity:
+            raise ValueError("immutable dataset split changed after admission")
 
     def _attach_encodings(self, encodings):
         self.encodings = copy.deepcopy(dict(encodings))
@@ -599,7 +748,8 @@ class ValidatedDataset:
     def indices(self, role, split="train"):
         if role not in ROLE_NAMES or split not in ("train", "validation", "holdout"):
             raise ValueError("invalid role/split selection")
-        return [i for i, r in enumerate(self.records) if r["input"]["snapshot"]["role"] == role and self.split[r["input"]["snapshot"]["game_id"]] == split]
+        self._verify_raw_integrity()
+        return [i for i in self._current_view.current_indices if self.records[i]["input"]["snapshot"]["role"] == role and self.split[self.records[i]["input"]["snapshot"]["game_id"]] == split]
 
     def collate(self, indices, role, *, split="train", task_contexts=None, device="cpu"):
         """V ranks use softmax(-rank) within one explicit context, temperature 1.
@@ -614,11 +764,12 @@ class ValidatedDataset:
             raise ValueError("V requires one explicit branch/profile/budget context per row")
         if role != "verifier" and task_contexts is not None:
             raise ValueError("P/C must not consume V task controls")
-        if _canonical("rz-pals-python-immutable-split/1", self.split) != self._split_identity:
-            raise ValueError("immutable dataset split changed after admission")
+        self._verify_raw_integrity()
         rows, encoded = [], []
         for index in indices:
             _uint(index, len(self.records) - 1)
+            if index not in self._current_indices:
+                raise ValueError("historical or superseded raw row cannot enter current training batches")
             row = self.records[index]
             if _canonical("rz-pals-python-immutable-row/1", row) != self._row_identities[index]:
                 raise ValueError("immutable dataset input/target changed after admission")

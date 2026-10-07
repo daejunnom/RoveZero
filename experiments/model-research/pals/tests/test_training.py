@@ -21,6 +21,7 @@ from torch import nn
 from rz_pals_model.config import ModelConfig, TASKS
 from rz_pals_model.training import (BudgetLedger, DivergenceContext, EncodedSnapshot, ResumableSampler,
                                    TaskContext, ValidatedDataset, _fen_board, _canonical, capture_rng,
+                                   _label_digest_value, _private_fp32_bits, current_label_view, label_digest,
                                    encoded_from_sidecar, load_collected_dataset, load_preparation_checkpoint, masked_losses,
                                    prepare_adamw, restore_rng, save_preparation_checkpoint, seal_snapshot,
                                    validate_recipe)
@@ -66,6 +67,15 @@ def encoding(row, *, divergences=(), task_queries=()):
     return EncodedSnapshot(row["input"]["sha256"], s["encoding_sha256"], _fen_board(s["board_fen"]),
                            tuple([0.0] * 16), tuple((v["observation_sha256"], v["situation_revision"], tuple([0.0] * 16)) for v in s["public_records"]),
                            tuple([0.0] * 16), tuple(divergences), tuple(task_queries))
+
+
+def label_chain_rows():
+    raw = fixture()
+    masked, resolved = copy.deepcopy(raw), copy.deepcopy(raw)
+    masked["future_label"] = outcome_label(masked, policy=False, outcome="unknown", ending="unresolved")
+    resolved["future_label"] = outcome_label(resolved)
+    resolved["future_label"].update(observed_sequence=9, supersedes_label_sha256=label_digest(masked))
+    return [raw, masked, resolved]
 
 
 def dataset(rows, encodings=None, assignments=None):
@@ -229,6 +239,159 @@ class TrainingPreparationTests(unittest.TestCase):
         row["future_label"]["value_wdl"] = [0.0, 0.0, 1.0]
         with self.assertRaises(ValueError):
             dataset([row])
+
+    def test_label_digest_shared_utf8_binary64_vector_and_input_binding(self):
+        row = fixture()
+        label = outcome_label(row)
+        label["observed_sequence"] = 9007199254740993
+        label["policy"] = {"moves": [1292, 1804], "probabilities": [0.1, 0.9]}
+        label["provenance"]["result"].update(game_id="경기", raw_evidence_sha256="b" * 64)
+        canonical = '["rz-pals-label/1",{"input_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","label":{"counterexample":null,"observed_sequence":9007199254740993,"policy":{"moves":[1292,1804],"probabilities":["3fb999999999999a","3feccccccccccccd"]},"provenance":{"result":{"ending":"repetition","game_id":"경기","outcome":"draw","raw_evidence_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"actual_game"},"supersedes_label_sha256":null,"value_wdl":["0000000000000000","3ff0000000000000","0000000000000000"],"verifier_tasks":null,"white_to_move":true}}]'
+        expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        self.assertEqual(_label_digest_value("a" * 64, label), expected)
+        label["value_wdl"] = [0, 1, 0]
+        reordered = json.loads(json.dumps(label, sort_keys=True, ensure_ascii=False))
+        self.assertEqual(_label_digest_value("a" * 64, reordered), expected)
+        self.assertNotEqual(_label_digest_value("c" * 64, label), expected)
+        label["value_wdl"][0] = -0.0
+        self.assertNotEqual(_label_digest_value("a" * 64, label), expected)
+        self.assertIsNone(label_digest(row))
+        row["future_label"] = outcome_label(row)
+        original = label_digest(row)
+        row["future_label"]["value_wdl"] = [0, 1, 0]
+        self.assertEqual(label_digest(row), original)
+        row["future_label"]["value_wdl"][0] = True
+        with self.assertRaises(ValueError):
+            label_digest(row)
+
+    def test_label_digest_rejects_noninteger_policy_moves(self):
+        for kind in ("float", "bool"):
+            row = fixture()
+            if kind == "bool":
+                row["input"]["snapshot"]["legal_moves"] = [move(1, 0)]
+                row["input"]["sha256"] = seal_snapshot(row["input"]["snapshot"])
+            row["future_label"] = outcome_label(row)
+            policy = row["future_label"]["policy"]
+            policy["moves"] = [float(v) for v in policy["moves"]] if kind == "float" else [True]
+            if kind == "bool":
+                policy["probabilities"] = [1.0]
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                label_digest(row)
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                dataset([row])
+
+    def test_current_label_view_preserves_raw_history_and_only_collates_leaf(self):
+        rows = label_chain_rows()
+        original = copy.deepcopy(rows)
+        admitted = dataset(rows)
+        self.assertEqual(len(admitted.records), 3)
+        self.assertEqual(admitted.records, original)
+        self.assertEqual(admitted.indices("proposer"), [2])
+        batch = admitted.collate([2], "proposer")
+        self.assertTrue(batch.policy_mask.all())
+        self.assertTrue(batch.wdl_mask.all())
+        for old_index in (0, 1):
+            with self.assertRaisesRegex(ValueError, "historical or superseded"):
+                admitted.collate([old_index], "proposer")
+        shuffled = dataset([rows[2], rows[0], rows[1]])
+        self.assertEqual(shuffled.indices("proposer"), [0])
+        self.assertEqual(shuffled.current_view.sha256, admitted.current_view.sha256)
+        self.assertEqual(dataset(rows[:1]).indices("proposer"), [0])
+        self.assertEqual(dataset(rows[1:2]).indices("proposer"), [0])
+        # A new masked whole label does not inherit prior resolved policy/WDL.
+        masked_latest = copy.deepcopy(rows[1])
+        masked_latest["future_label"].update(observed_sequence=10, supersedes_label_sha256=label_digest(rows[2]))
+        latest = dataset(rows + [masked_latest])
+        self.assertEqual(latest.indices("proposer"), [3])
+        latest_batch = latest.collate([3], "proposer")
+        self.assertFalse(latest_batch.policy_mask.any())
+        self.assertFalse(latest_batch.wdl_mask.any())
+
+    def test_label_chain_rejects_missing_duplicate_fork_roots_and_foreign_input(self):
+        rows = label_chain_rows()
+        invalid = [[rows[0], rows[2]], rows + [copy.deepcopy(rows[1])], [rows[0], copy.deepcopy(rows[0])]]
+        fork = copy.deepcopy(rows[2])
+        fork["future_label"]["observed_sequence"] = 10
+        invalid.append(rows + [fork])
+        roots = copy.deepcopy(rows)
+        roots[2]["future_label"]["supersedes_label_sha256"] = None
+        invalid.append(roots)
+        foreign = fixture(game="foreign")
+        foreign["future_label"] = outcome_label(foreign)
+        foreign["future_label"].update(observed_sequence=9, supersedes_label_sha256=label_digest(rows[1]))
+        invalid.append([rows[1], foreign])
+        for case in invalid:
+            with self.subTest(rows=len(case)), self.assertRaises(ValueError):
+                dataset(case)
+        for sequence in (7, 8):
+            invalid_sequence = copy.deepcopy(rows)
+            invalid_sequence[2]["future_label"]["observed_sequence"] = sequence
+            with self.subTest(sequence=sequence), self.assertRaisesRegex(ValueError, "strictly increase"):
+                dataset(invalid_sequence)
+        # Synthetic graph IDs exercise cycles; constructing SHA fixed points
+        # for self-containing content-addressed predecessor IDs is not claimed.
+        cyclic = copy.deepcopy(rows[1:])
+        ids = [sha("synthetic-cycle-a"), sha("synthetic-cycle-b")]
+        cyclic[0]["future_label"]["supersedes_label_sha256"] = ids[1]
+        cyclic[1]["future_label"]["supersedes_label_sha256"] = ids[0]
+        with patch("rz_pals_model.training.label_digest", side_effect=ids), self.assertRaisesRegex(ValueError, "cyclic"):
+            current_label_view(cyclic)
+
+    def test_current_label_view_rejects_raw_history_mutation_after_admission(self):
+        for mutation in ("predecessor", "append", "remove"):
+            admitted = dataset(label_chain_rows())
+            if mutation == "predecessor":
+                admitted.records[1]["future_label"]["observed_sequence"] = 7
+            elif mutation == "append":
+                admitted.records.append(fixture(game="added"))
+            else:
+                admitted.records.pop(0)
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(ValueError, "raw dataset history"):
+                admitted.indices("proposer")
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(ValueError, "raw dataset history"):
+                admitted.collate([2], "proposer")
+
+    def test_label_chain_requires_exact_verifier_private_fp32_context(self):
+        root = fixture("verifier")
+        root["verifier_private"] = {"task_kind": "resume_task", "control_sha256": sha("control"), "private_latent": [0.0]}
+        root["future_label"] = outcome_label(root, policy=False, outcome="unknown", ending="unresolved")
+        successor = copy.deepcopy(root)
+        successor["future_label"].update(observed_sequence=9, supersedes_label_sha256=label_digest(root))
+        self.assertEqual(dataset([root, successor]).indices("verifier"), [1])
+        for change in ("signed_zero", "control", "task", "absence"):
+            changed = copy.deepcopy(successor)
+            if change == "signed_zero":
+                changed["verifier_private"]["private_latent"][0] = -0.0
+            elif change == "control":
+                changed["verifier_private"]["control_sha256"] = sha("other-control")
+            elif change == "task":
+                changed["verifier_private"]["task_kind"] = "defer"
+            else:
+                changed["verifier_private"] = None
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "different V private contexts"):
+                dataset([root, changed])
+        private_only = copy.deepcopy(root)
+        private_only["future_label"] = None
+        before = dataset([private_only]).current_view.sha256
+        private_only["verifier_private"]["private_latent"][0] = -0.0
+        self.assertNotEqual(before, dataset([private_only]).current_view.sha256)
+        private_only["verifier_private"]["private_latent"][0] = 1e100
+        with self.assertRaises(ValueError):
+            dataset([private_only])
+
+    def test_verifier_private_accepts_rust_fp32_max_shortest_json_and_rejects_overflow(self):
+        row = fixture("verifier")
+        row["verifier_private"] = {"task_kind": "resume_task", "control_sha256": sha("control"),
+                                   "private_latent": [3.4028235e38, -3.4028235e38]}
+        self.assertEqual(_private_fp32_bits(3.4028235e38), "7f7fffff")
+        self.assertEqual(_private_fp32_bits(-3.4028235e38), "ff7fffff")
+        shortest = dataset([row]).current_view.sha256
+        row["verifier_private"]["private_latent"] = [float(np.finfo(np.float32).max), -float(np.finfo(np.float32).max)]
+        self.assertEqual(dataset([row]).current_view.sha256, shortest)
+        for value in (1e100, -1e100, float("inf"), float("nan"), True, 10**400):
+            row["verifier_private"]["private_latent"] = [value]
+            with self.subTest(value=repr(value)), self.assertRaises(ValueError):
+                dataset([row])
 
     def test_rules_terminal_checkmate_requires_captured_side_loss_or_mask(self):
         # Reuse rz-position's independently checked black mate and its color

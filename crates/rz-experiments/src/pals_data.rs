@@ -10,6 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 /// explicit CPU/model source. Old snapshots are not implicitly reinterpreted.
 pub const PALS_DATA_DOMAIN: &str = "rz-pals-data/2";
 pub const PALS_CHECKPOINT_DOMAIN: &str = "rz-pals-training-checkpoint/1";
+/// New label identity; existing input, raw dataset and checkpoint seals retain
+/// their original domains and are never implicitly converted to this digest.
+pub const PALS_LABEL_DOMAIN: &str = "rz-pals-label/1";
+pub const PALS_CURRENT_LABEL_VIEW_DOMAIN: &str = "rz-pals-current-label-view/1";
 const MAX_HISTORY: usize = 16_384;
 const MAX_RECORDS: usize = 65_536;
 
@@ -33,6 +37,64 @@ fn canonical_sha<T: Serialize>(domain: &str, value: &T) -> Result<String, Manife
     let bytes = serde_json::to_vec(&(domain, value))
         .map_err(|e| ManifestError::Integrity(e.to_string()))?;
     Ok(digest(&bytes))
+}
+fn sorted_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .map(|(key, value)| (key, sorted_json(value)))
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(sorted_json).collect())
+        }
+        value => value,
+    }
+}
+fn sorted_canonical_sha(domain: &str, value: serde_json::Value) -> Result<String, ManifestError> {
+    canonical_sha(domain, &sorted_json(value))
+}
+fn label_digest_value(
+    input_sha256: &str,
+    label: &PalsFutureLabel,
+) -> Result<String, ManifestError> {
+    let mut value =
+        serde_json::to_value(label).map_err(|e| ManifestError::Integrity(e.to_string()))?;
+    if let Some(policy) = &label.policy {
+        value["policy"]["probabilities"] = serde_json::Value::Array(
+            policy
+                .probabilities
+                .iter()
+                .map(|value| serde_json::Value::String(format!("{:016x}", value.to_bits())))
+                .collect(),
+        );
+    }
+    if let Some(wdl) = &label.value_wdl {
+        value["value_wdl"] = serde_json::Value::Array(
+            wdl.iter()
+                .map(|value| serde_json::Value::String(format!("{:016x}", value.to_bits())))
+                .collect(),
+        );
+    }
+    sorted_canonical_sha(
+        PALS_LABEL_DOMAIN,
+        serde_json::json!({"input_sha256": input_sha256, "label": value}),
+    )
+}
+fn private_context_digest(private: &Option<PalsVerifierPrivate>) -> Result<String, ManifestError> {
+    let value = match private {
+        Some(private) => serde_json::json!({
+            "task_kind": private.task_kind,
+            "control_sha256": private.control_sha256,
+            "private_latent": private.private_latent.iter()
+                .map(|value| format!("{:08x}", value.to_bits())).collect::<Vec<_>>()
+        }),
+        None => serde_json::Value::Null,
+    };
+    sorted_canonical_sha("rz-pals-verifier-private-context/1", value)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -476,6 +538,19 @@ pub struct PalsLearningRecord {
     pub verifier_private: Option<PalsVerifierPrivate>,
 }
 impl PalsLearningRecord {
+    /// SHA-256 of minimal UTF-8 JSON `[domain,{input_sha256,label}]`, with every
+    /// object key recursively sorted and array order retained. Only label f64
+    /// probabilities/WDL become 16-digit lowercase IEEE754 bit strings. Private
+    /// V controls are outside this public label digest and are compared exactly
+    /// by the dataset chain audit. None labels have no label digest. This checks
+    /// the record contract; it does not enroll an owned source or validate split.
+    pub fn label_digest(&self) -> Result<Option<String>, ManifestError> {
+        self.validate()?;
+        self.future_label
+            .as_ref()
+            .map(|label| label_digest_value(self.input.sha256(), label))
+            .transpose()
+    }
     pub fn validate(&self) -> Result<(), ManifestError> {
         self.input.verify()?;
         let input = self.input.snapshot();
@@ -610,6 +685,158 @@ impl PalsLearningRecord {
     }
 }
 
+/// Current whole-label projection into preserved raw rows, ordered by immutable
+/// input SHA. A view never merges targets from old labels. Its separate digest
+/// binds selected label identities and exact V-private f32 contexts, but does
+/// not change the raw dataset digest or any historical row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PalsCurrentLabelView {
+    current_indices: Vec<usize>,
+    sha256: String,
+}
+impl PalsCurrentLabelView {
+    pub fn indices(&self) -> &[usize] {
+        &self.current_indices
+    }
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+fn current_chain_leaf(
+    records: &[PalsLearningRecord],
+    labeled: &[usize],
+    children: &BTreeMap<usize, usize>,
+) -> Result<usize, ManifestError> {
+    let roots: Vec<_> = labeled
+        .iter()
+        .copied()
+        .filter(|&i| {
+            records[i]
+                .future_label
+                .as_ref()
+                .unwrap()
+                .supersedes_label_sha256
+                .is_none()
+        })
+        .collect();
+    ensure(roots.len() == 1, "cyclic or multiple-root label chain")?;
+    let mut visited = BTreeSet::new();
+    let mut current = roots[0];
+    loop {
+        ensure(visited.insert(current), "cyclic label supersession")?;
+        let Some(&next) = children.get(&current) else {
+            break;
+        };
+        ensure(
+            records[next]
+                .future_label
+                .as_ref()
+                .unwrap()
+                .observed_sequence
+                > records[current]
+                    .future_label
+                    .as_ref()
+                    .unwrap()
+                    .observed_sequence,
+            "label supersession sequence must strictly increase",
+        )?;
+        current = next;
+    }
+    ensure(
+        visited.len() == labeled.len(),
+        "disconnected or cyclic label chain",
+    )?;
+    Ok(current)
+}
+
+/// Bounded, row-order-independent chain validation. Source and split authority
+/// are still required; use PalsOwnedSources::current_training_view for admission.
+pub fn current_label_view(
+    records: &[PalsLearningRecord],
+) -> Result<PalsCurrentLabelView, ManifestError> {
+    ensure(
+        !records.is_empty() && records.len() <= MAX_RECORDS,
+        "dataset record limit",
+    )?;
+    let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    let mut labels = BTreeMap::new();
+    let mut digests = Vec::with_capacity(records.len());
+    let mut contexts = Vec::with_capacity(records.len());
+    for (index, record) in records.iter().enumerate() {
+        let label_digest = record.label_digest()?;
+        if let Some(digest) = &label_digest {
+            ensure(
+                labels.insert(digest.clone(), index).is_none(),
+                "duplicate label identity",
+            )?;
+        }
+        groups.entry(record.input.sha256()).or_default().push(index);
+        digests.push(label_digest);
+        contexts.push(private_context_digest(&record.verifier_private)?);
+    }
+    let mut children = BTreeMap::new();
+    for (index, record) in records.iter().enumerate() {
+        if let Some(predecessor) = record
+            .future_label
+            .as_ref()
+            .and_then(|label| label.supersedes_label_sha256.as_ref())
+        {
+            let prior = *labels
+                .get(predecessor)
+                .ok_or_else(|| ManifestError::Integrity("missing predecessor label".into()))?;
+            ensure(
+                record.input == records[prior].input,
+                "label predecessor belongs to a different input",
+            )?;
+            ensure(
+                children.insert(prior, index).is_none(),
+                "forked label supersession",
+            )?;
+        }
+    }
+    let mut current_indices = Vec::with_capacity(groups.len());
+    let mut descriptors = Vec::with_capacity(groups.len());
+    for (input_sha256, indices) in groups {
+        let first = indices[0];
+        for &index in &indices {
+            ensure(
+                records[index].input == records[first].input,
+                "immutable input identity collision",
+            )?;
+            ensure(
+                contexts[index] == contexts[first],
+                "different V private contexts share an input label chain",
+            )?;
+        }
+        let unlabeled: Vec<_> = indices
+            .iter()
+            .copied()
+            .filter(|&i| digests[i].is_none())
+            .collect();
+        ensure(unlabeled.len() <= 1, "duplicate unlabeled input")?;
+        let labeled: Vec<_> = indices
+            .iter()
+            .copied()
+            .filter(|&i| digests[i].is_some())
+            .collect();
+        let current = if labeled.is_empty() {
+            unlabeled[0]
+        } else {
+            current_chain_leaf(records, &labeled, &children)?
+        };
+        current_indices.push(current);
+        descriptors.push(serde_json::json!({
+            "input_sha256": input_sha256,
+            "label_sha256": digests[current],
+            "verifier_private_sha256": contexts[current]
+        }));
+    }
+    Ok(PalsCurrentLabelView {
+        current_indices,
+        sha256: sorted_canonical_sha(PALS_CURRENT_LABEL_VIEW_DOMAIN, descriptors.into())?,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq, Ord, PartialOrd)]
 #[serde(rename_all = "snake_case")]
 pub enum PalsSplit {
@@ -715,8 +942,27 @@ impl PalsOwnedSources {
         records: &[PalsLearningRecord],
         split: &PalsDatasetSplit,
     ) -> Result<PalsDatasetAudit, ManifestError> {
+        self.audit_with_current_view(records, split)
+            .map(|(audit, _)| audit)
+    }
+    pub fn current_training_view(
+        &self,
+        records: &[PalsLearningRecord],
+        split: &PalsDatasetSplit,
+    ) -> Result<PalsCurrentLabelView, ManifestError> {
+        self.audit_with_current_view(records, split)
+            .map(|(_, view)| view)
+    }
+    /// Existing audit counts and dataset/split hashes still describe all raw
+    /// rows. The additional view is the admitted projection for training.
+    pub fn audit_with_current_view(
+        &self,
+        records: &[PalsLearningRecord],
+        split: &PalsDatasetSplit,
+    ) -> Result<(PalsDatasetAudit, PalsCurrentLabelView), ManifestError> {
         self.validate()?;
         split.validate(records)?;
+        let current_view = current_label_view(records)?;
         let mut report = PalsDatasetAudit {
             records: records.len() as u64,
             labeled_records: 0,
@@ -754,7 +1000,7 @@ impl PalsOwnedSources {
                 report.masked_value_records += 1;
             }
         }
-        Ok(report)
+        Ok((report, current_view))
     }
 }
 
@@ -1670,6 +1916,186 @@ mod tests {
             };
             a.validate().unwrap();
         }
+    }
+    #[test]
+    fn label_digest_shared_utf8_binary64_vector_and_input_binding() {
+        let mut label = outcome_label(
+            PalsGameEnd::Repetition,
+            PalsOutcome::Draw,
+            Some([0.0, 1.0, 0.0]),
+        );
+        label.observed_sequence = 9_007_199_254_740_993;
+        label.white_to_move = true;
+        label.policy = Some(PalsPolicyTarget {
+            moves: vec![1292, 1804],
+            probabilities: vec![0.1, 0.9],
+        });
+        if let PalsTargetProvenance::ActualGame { result } = &mut label.provenance {
+            result.game_id = "경기".into();
+            result.raw_evidence_sha256 = "b".repeat(64);
+        }
+        // The exact same canonical vector is asserted by Python; integers are
+        // never cast through f64 and Unicode is minimal, unnormalized UTF-8.
+        let canonical = r#"["rz-pals-label/1",{"input_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","label":{"counterexample":null,"observed_sequence":9007199254740993,"policy":{"moves":[1292,1804],"probabilities":["3fb999999999999a","3feccccccccccccd"]},"provenance":{"result":{"ending":"repetition","game_id":"경기","outcome":"draw","raw_evidence_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"actual_game"},"supersedes_label_sha256":null,"value_wdl":["0000000000000000","3ff0000000000000","0000000000000000"],"verifier_tasks":null,"white_to_move":true}}]"#;
+        let expected = hash(canonical);
+        assert_eq!(
+            label_digest_value(&"a".repeat(64), &label).unwrap(),
+            expected
+        );
+        let encoded = serde_json::to_string(&label)
+            .unwrap()
+            .replace("\"value_wdl\":[0.0,1.0,0.0]", "\"value_wdl\":[0,1,0]");
+        let integer_wdl: PalsFutureLabel = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            label_digest_value(&"a".repeat(64), &integer_wdl).unwrap(),
+            expected
+        );
+        assert_ne!(
+            label_digest_value(&"c".repeat(64), &label).unwrap(),
+            expected
+        );
+        label.value_wdl.as_mut().unwrap()[0] = -0.0;
+        assert_ne!(
+            label_digest_value(&"a".repeat(64), &label).unwrap(),
+            expected
+        );
+    }
+    fn label_chain() -> Vec<PalsLearningRecord> {
+        let unlabelled = record("a", "oa", "la");
+        let mut masked = unlabelled.clone();
+        masked.future_label = Some(outcome_label(
+            PalsGameEnd::Unresolved,
+            PalsOutcome::Unknown,
+            None,
+        ));
+        let mut resolved = unlabelled.clone();
+        let mut label = outcome_label(
+            PalsGameEnd::Repetition,
+            PalsOutcome::Draw,
+            Some([0.0, 1.0, 0.0]),
+        );
+        label.observed_sequence = 11;
+        label.supersedes_label_sha256 = masked.label_digest().unwrap();
+        resolved.future_label = Some(label);
+        vec![unlabelled, masked, resolved]
+    }
+    #[test]
+    fn current_label_view_keeps_raw_audit_and_is_independent_of_row_order() {
+        let rows = label_chain();
+        let original = rows.clone();
+        let registry = PalsOwnedSources {
+            cpu_binary_sha256: BTreeSet::new(),
+            input_sources: BTreeSet::from([rows[0].input.snapshot().source.clone()]),
+        };
+        let (audit, view) = registry
+            .audit_with_current_view(&rows, &single_game_split())
+            .unwrap();
+        assert_eq!(view.indices(), &[2]);
+        assert_eq!(audit.records, 3);
+        assert_eq!(audit.labeled_records, 2);
+        assert_eq!(audit.masked_value_records, 2);
+        assert_eq!(audit.training_records, 3);
+        assert_eq!(
+            audit.canonical_dataset_sha256,
+            canonical_sha("rz-pals-dataset/2", &rows).unwrap()
+        );
+        assert_eq!(rows, original);
+        let shuffled = vec![rows[2].clone(), rows[0].clone(), rows[1].clone()];
+        let shuffled_view = registry
+            .current_training_view(&shuffled, &single_game_split())
+            .unwrap();
+        assert_eq!(shuffled_view.indices(), &[0]);
+        assert_eq!(shuffled_view.sha256(), view.sha256());
+        assert_eq!(current_label_view(&rows[..1]).unwrap().indices(), &[0]);
+        assert_eq!(current_label_view(&rows[1..2]).unwrap().indices(), &[0]);
+    }
+    #[test]
+    fn label_chain_rejects_missing_duplicate_fork_root_and_nonincreasing_sequences() {
+        let rows = label_chain();
+        assert!(current_label_view(&[rows[0].clone(), rows[2].clone()]).is_err());
+        let mut duplicate = rows.clone();
+        duplicate.push(rows[1].clone());
+        assert!(current_label_view(&duplicate).is_err());
+        assert!(current_label_view(&[rows[0].clone(), rows[0].clone()]).is_err());
+        let mut fork = rows.clone();
+        let mut sibling = rows[2].clone();
+        sibling.future_label.as_mut().unwrap().observed_sequence = 12;
+        fork.push(sibling);
+        assert!(current_label_view(&fork).is_err());
+        let mut roots = rows.clone();
+        roots[2]
+            .future_label
+            .as_mut()
+            .unwrap()
+            .supersedes_label_sha256 = None;
+        assert!(current_label_view(&roots).is_err());
+        for sequence in [9, 10] {
+            let mut invalid = rows.clone();
+            invalid[2].future_label.as_mut().unwrap().observed_sequence = sequence;
+            assert!(current_label_view(&invalid).is_err());
+        }
+        let mut foreign = record("b", "ob", "lb");
+        let mut label = rows[2].future_label.clone().unwrap();
+        if let PalsTargetProvenance::ActualGame { result } = &mut label.provenance {
+            result.game_id = "b".into();
+        }
+        foreign.future_label = Some(label);
+        assert!(current_label_view(&[rows[1].clone(), foreign]).is_err());
+        // A synthetic topology exercises cycle rejection without claiming to
+        // construct a content-address SHA fixed point that includes its parent.
+        let mut cyclic = rows[1..].to_vec();
+        cyclic[0]
+            .future_label
+            .as_mut()
+            .unwrap()
+            .supersedes_label_sha256 = Some(hash("cycle"));
+        assert!(current_chain_leaf(&cyclic, &[0, 1], &BTreeMap::from([(0, 1), (1, 0)])).is_err());
+    }
+    #[test]
+    fn label_chain_requires_exact_verifier_private_fp32_context() {
+        let mut root = record("a", "oa", "la");
+        let mut input = root.input.snapshot().clone();
+        input.role = PalsDataRole::Verifier;
+        root.input = input.seal().unwrap();
+        root.verifier_private = Some(PalsVerifierPrivate {
+            task_kind: "resume_task".into(),
+            control_sha256: hash("control"),
+            private_latent: vec![0.0],
+        });
+        root.future_label = Some(outcome_label(
+            PalsGameEnd::Unresolved,
+            PalsOutcome::Unknown,
+            None,
+        ));
+        let mut next = root.clone();
+        next.future_label.as_mut().unwrap().observed_sequence = 11;
+        next.future_label.as_mut().unwrap().supersedes_label_sha256 = root.label_digest().unwrap();
+        let view = current_label_view(&[root.clone(), next.clone()]).unwrap();
+        assert_eq!(view.indices(), &[1]);
+        next.verifier_private.as_mut().unwrap().private_latent[0] = -0.0;
+        assert!(current_label_view(&[root, next.clone()]).is_err());
+        assert!(current_label_view(std::slice::from_ref(&next)).is_err()); // Its parent is still required.
+        next.future_label = None;
+        let negative_zero_view = current_label_view(std::slice::from_ref(&next)).unwrap();
+        next.verifier_private.as_mut().unwrap().private_latent[0] = 0.0;
+        let positive_zero_view = current_label_view(&[next]).unwrap();
+        assert_ne!(negative_zero_view.sha256(), positive_zero_view.sha256());
+        let mut limits = record("a", "oa", "la");
+        let mut input = limits.input.snapshot().clone();
+        input.role = PalsDataRole::Verifier;
+        limits.input = input.seal().unwrap();
+        limits.verifier_private = Some(PalsVerifierPrivate {
+            task_kind: "resume_task".into(),
+            control_sha256: hash("control"),
+            private_latent: vec![f32::MAX, -f32::MAX],
+        });
+        let roundtrip = PalsLearningRecord::from_json(&limits.to_json().unwrap()).unwrap();
+        assert_eq!(
+            current_label_view(std::slice::from_ref(&limits))
+                .unwrap()
+                .sha256(),
+            current_label_view(&[roundtrip]).unwrap().sha256(),
+        );
     }
     #[test]
     fn input_is_sealed_and_future_labels_do_not_change_it() {
