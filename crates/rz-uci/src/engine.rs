@@ -692,6 +692,7 @@ struct Owner {
     workers: Vec<Worker>,
     pending_failures: VecDeque<(SearchTicket, SearchCompletion)>,
     pending_bestmove: Option<PendingBestMove>,
+    pending_close: Option<Event>,
     fence_failure: Option<EngineError>,
     diagnostics: Arc<Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>>,
 }
@@ -723,7 +724,7 @@ impl Owner {
     fn handle(
         &mut self,
         session: &mut Session<RulesUciPort>,
-        event: Event,
+        mut event: Event,
     ) -> SessionResult<RulesSearchPosition> {
         let mut out = SessionResult::default();
         let from_driver_report = matches!(
@@ -755,6 +756,27 @@ impl Owner {
             let error = finish_errors(primary, poisoned.into_iter().collect()).unwrap_err();
             self.close_physical_fence(session, &mut out, error);
             return out;
+        }
+        let requested_close = matches!(&event, Event::EndOfInput)
+            || matches!(&event, Event::Line(line) if matches!(crate::parse(line, self.settings.parser), Ok(Command::Quit)));
+        if self.pending_bestmove.is_some() && requested_close {
+            // stop/deadline has already committed this move logically. A
+            // pipelined quit/EOF must not erase it while its physical fence
+            // drains. Keep one closing event; never admit later input work.
+            if self.pending_close.is_none() {
+                self.pending_close = Some(event);
+            }
+            event = Event::RejectedInput {
+                code: "OwnerWake",
+                message: String::new(),
+            };
+        } else if self.pending_close.is_some()
+            && matches!(&event, Event::Line(_) | Event::EndOfInput)
+        {
+            event = Event::RejectedInput {
+                code: "OwnerWake",
+                message: String::new(),
+            };
         }
         let completion_receipt = match &event {
             Event::Complete {
@@ -876,6 +898,16 @@ impl Owner {
         self.defer_bestmove(session, &mut next, admitted_driver_report);
         append_result(&mut out, next);
         self.finish_physical_output(session, &mut out);
+        if !session.is_closed()
+            && self.pending_bestmove.is_none()
+            && self.workers.is_empty()
+            && let Some(close) = self.pending_close.take()
+        {
+            // The joined worker may have retained its final work receipt
+            // after the first diagnostic drain. Process closing through
+            // the same reducer once, preserving that evidence and errors.
+            append_result(&mut out, self.handle(session, close));
+        }
         out
     }
 
@@ -980,6 +1012,7 @@ impl Owner {
         error: EngineError,
     ) {
         self.pending_bestmove = None;
+        self.pending_close = None;
         out.protocol.retain(|line| !line.starts_with("bestmove "));
         out.diagnostics.push(Diagnostic {
             code: "PhysicalFenceFailure",
@@ -1842,6 +1875,7 @@ pub fn serve<O: Write, D: Write>(
         workers: Vec::new(),
         pending_failures: VecDeque::new(),
         pending_bestmove: None,
+        pending_close: None,
         fence_failure: None,
         diagnostics: Arc::new(Mutex::new(Vec::new())),
     }));
@@ -2111,6 +2145,95 @@ mod tests {
             Ok(())
         }
     }
+    #[test]
+    fn pipelined_close_preserves_stopped_move_and_late_work_receipt_until_join() {
+        for close in [Event::Line("quit".into()), Event::EndOfInput] {
+            let (mut owner, mut session) = fixture();
+            let expected = format!(
+                "bestmove {}",
+                session.snapshot().rules_position().legal_moves()[0]
+            );
+            let start = owner.handle(&mut session, Event::Line("go nodes 1".into()));
+            assert!(
+                start
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::Start { .. }))
+            );
+            let (release, waiting) = mpsc::channel();
+            let receipts = Arc::clone(&owner.diagnostics);
+            owner.workers.push(Worker {
+                handle: thread::spawn(move || {
+                    waiting
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("bounded fixture release after pipelined close");
+                    retain_diagnostic(
+                        &receipts,
+                        WorkerDiagnosticReceipt::DriverWork {
+                            kind: crate::search_driver::SearchKind::Pals,
+                            work: crate::search_driver::DriverWork::Pals {
+                                rounds: 0,
+                                cpu_nodes: 0,
+                                completed_tasks: 0,
+                                consumed_role_outputs: 0,
+                                retained_situations: 0,
+                            },
+                        },
+                    )
+                    .map_err(|error| {
+                        EngineError::UndeliveredDiagnostics(vec![(error.receipt, 1)])
+                    })?;
+                    Ok(())
+                }),
+                failure: Arc::new(Mutex::new(None)),
+            });
+            let stopped = owner.handle(&mut session, Event::Line("stop".into()));
+            assert!(stopped.protocol.is_empty());
+            assert!(owner.pending_bestmove.is_some());
+            assert_eq!(
+                owner
+                    .handle(&mut session, Event::Line("isready".into()))
+                    .protocol,
+                ["readyok"]
+            );
+            let scope = owner.session_owner.lifecycle_scope();
+            let closing = owner.handle(&mut session, close);
+            assert!(closing.protocol.is_empty());
+            assert!(!session.is_closed());
+            assert!(owner.pending_close.is_some());
+            for command in ["go nodes 1", "position startpos moves e2e4", "quit"] {
+                let ignored = owner.handle(&mut session, Event::Line(command.into()));
+                assert!(ignored.protocol.is_empty());
+                assert!(ignored.effects.is_empty());
+                assert_eq!(owner.session_owner.lifecycle_scope(), scope);
+            }
+            release.send(()).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while !owner.workers[0].is_finished() {
+                assert!(Instant::now() < until, "bounded fixture worker join");
+                thread::sleep(Duration::from_millis(1));
+            }
+            let ended = owner.handle(
+                &mut session,
+                Event::RejectedInput {
+                    code: "OwnerWake",
+                    message: String::new(),
+                },
+            );
+            assert_eq!(ended.protocol, [expected]);
+            assert!(session.is_closed());
+            assert!(ended.effects.iter().any(|e| matches!(e, Effect::Shutdown)));
+            assert!(ended.diagnostics.iter().any(|d| {
+                d.code == "SearchDiagnostic" && d.message.contains("search_kind=Pals")
+            }));
+            assert!(owner.workers.is_empty());
+            assert!(owner.diagnostics.lock().unwrap().is_empty());
+            assert!(owner.pending_bestmove.is_none());
+            assert!(owner.pending_close.is_none());
+            assert!(owner.fence_failure.is_none());
+        }
+    }
+
     #[test]
     fn late_completed_event_cannot_acknowledge_the_guard_rejected_report() {
         let (mut owner, mut session) = fixture();
@@ -2383,6 +2506,7 @@ mod tests {
             workers: Vec::new(),
             pending_failures: VecDeque::new(),
             pending_bestmove: None,
+            pending_close: None,
             fence_failure: None,
             diagnostics: Arc::new(Mutex::new(Vec::new())),
         };
