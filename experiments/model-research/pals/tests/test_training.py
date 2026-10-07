@@ -7,6 +7,7 @@ import copy
 from dataclasses import replace
 import hashlib
 import json
+import os
 from pathlib import Path
 import random
 import tempfile
@@ -113,6 +114,28 @@ def write_fixture_collection(directory, row, sidecar, *, version="rz-pals-own-co
     return hashlib.sha256(data).hexdigest()
 
 
+class CollectionReadProbe:
+    def __init__(self, stream, reads, before_read=None, max_chunk=None):
+        self.stream, self.reads, self.before_read = stream, reads, before_read
+        self.max_chunk = max_chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return self.stream.__exit__(*args)
+
+    def fileno(self):
+        return self.stream.fileno()
+
+    def read(self, size):
+        if self.before_read is not None:
+            self.before_read()
+        data = self.stream.read(size if self.max_chunk is None else min(size, self.max_chunk))
+        self.reads.append((size, len(data)))
+        return data
+
+
 def outputs(batch, *, policy=None, extra=None):
     b = batch.inputs.board.shape[0]
     policy = torch.zeros_like(batch.policy, requires_grad=True) if policy is None else policy
@@ -206,6 +229,56 @@ class TrainingPreparationTests(unittest.TestCase):
         row["future_label"]["value_wdl"] = [0.0, 0.0, 1.0]
         with self.assertRaises(ValueError):
             dataset([row])
+
+    def test_rules_terminal_checkmate_requires_captured_side_loss_or_mask(self):
+        # Reuse rz-position's independently checked black mate and its color
+        # exchange plus 180-degree board rotation for the white mate.
+        for white_to_move, fen, winner, wrong_winner in (
+                (True, "8/8/8/8/8/2k5/1q6/K7 w - - 0 1", "black_win", "white_win"),
+                (False, "7k/6Q1/5K2/8/8/8/8/8 b - - 0 1", "white_win", "black_win")):
+            with self.subTest(white_to_move=white_to_move):
+                row = fixture(terminal=True)
+                snapshot = row["input"]["snapshot"]
+                snapshot.update(board_fen=fen, position_command="position fen " + fen,
+                                white_to_move=white_to_move, rules_state_sha256=sha(fen),
+                                transposition_sha256=sha(fen))
+                row["input"]["sha256"] = seal_snapshot(snapshot)
+                label = outcome_label(row, policy=False, outcome=winner, ending="checkmate")
+                label["white_to_move"] = white_to_move
+                label["provenance"].update(source="rules_terminal", rules_state_sha256=snapshot["rules_state_sha256"])
+                row["future_label"] = label
+                label["value_wdl"] = [0.0, 0.0, 1.0]
+                batch = dataset([row]).collate([0], "proposer")
+                self.assertTrue(batch.wdl_mask.all())
+                torch.testing.assert_close(batch.wdl, torch.tensor([[0.0, 0.0, 1.0]]))
+                label["value_wdl"] = None
+                self.assertFalse(dataset([row]).collate([0], "proposer").wdl_mask.any())
+                label["value_wdl"] = [1.0, 0.0, 0.0]
+                with self.assertRaises(ValueError):
+                    dataset([row])
+                label["provenance"]["result"]["outcome"] = wrong_winner
+                for value in (None, [1.0, 0.0, 0.0]):
+                    label["value_wdl"] = value
+                    with self.assertRaisesRegex(ValueError, "captured checkmate must defeat the side to move"):
+                        dataset([row])
+
+    def test_actual_game_future_checkmate_can_be_won_by_captured_side(self):
+        for white_to_move, winner in ((True, "white_win"), (False, "black_win")):
+            with self.subTest(white_to_move=white_to_move):
+                row = fixture()
+                snapshot = row["input"]["snapshot"]
+                if not white_to_move:
+                    snapshot["board_fen"] = snapshot["board_fen"].replace(" w ", " b ")
+                    snapshot["position_command"] = "position fen " + snapshot["board_fen"]
+                    snapshot["legal_moves"] = [move(60, 52), move(60, 53)]
+                snapshot["white_to_move"] = white_to_move
+                row["input"]["sha256"] = seal_snapshot(snapshot)
+                label = outcome_label(row, policy=False, outcome=winner, ending="checkmate")
+                label.update(white_to_move=white_to_move, value_wdl=[1.0, 0.0, 0.0])
+                row["future_label"] = label
+                batch = dataset([row]).collate([0], "proposer")
+                self.assertTrue(batch.wdl_mask.all())
+                torch.testing.assert_close(batch.wdl, torch.tensor([[1.0, 0.0, 0.0]]))
 
     def test_masked_losses_do_not_dilute_known_row_and_prepare_gradients(self):
         known, unknown = fixture(game="known"), fixture(game="unknown")
@@ -497,6 +570,102 @@ class TrainingPreparationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_collected_dataset(temporary, expected_receipt_sha256=expected_receipt,
                                          expected_encoder_source_sha256=expected_encoder)
+
+    def test_collection_loader_reads_only_remaining_total_byte_budget_plus_one(self):
+        row, reads = fixture(), []
+        original_fdopen = os.fdopen
+        with tempfile.TemporaryDirectory(prefix="pals-collection-fixture-") as temporary:
+            expected_receipt = write_fixture_collection(temporary, row, native_sidecar(row))
+            names = ("receipt.json", "records.jsonl", "native-inputs.jsonl", "source-registry.jsonl", "split.jsonl")
+            total = sum((Path(temporary) / name).stat().st_size for name in names)
+            with patch("rz_pals_model.training.os.fdopen", side_effect=lambda fd, mode, **options: CollectionReadProbe(original_fdopen(fd, mode, **options), reads)):
+                loaded = load_collected_dataset(temporary, expected_receipt_sha256=expected_receipt,
+                                                expected_encoder_source_sha256=sha("fixture-encoder-source"),
+                                                max_input_bytes=total)
+            self.assertEqual(loaded.indices("proposer"), [0])
+            self.assertGreaterEqual(len(reads), len(names))
+            remaining = total
+            for cap, actual in reads:
+                self.assertLessEqual(cap, 65536)
+                self.assertLessEqual(cap, remaining + 1)
+                self.assertLessEqual(actual, cap)
+                self.assertLessEqual(actual, remaining)
+                remaining -= actual
+            self.assertEqual(remaining, 0)
+
+    def test_collection_loader_stable_short_reads_preserve_bounded_admission(self):
+        row, reads = fixture(), []
+        original_fdopen = os.fdopen
+        with tempfile.TemporaryDirectory(prefix="pals-collection-fixture-") as temporary:
+            expected_receipt = write_fixture_collection(temporary, row, native_sidecar(row))
+            names = ("receipt.json", "records.jsonl", "native-inputs.jsonl", "source-registry.jsonl", "split.jsonl")
+            total = sum((Path(temporary) / name).stat().st_size for name in names)
+            with patch("rz_pals_model.training.os.fdopen", side_effect=lambda fd, mode, **options: CollectionReadProbe(original_fdopen(fd, mode, **options), reads, max_chunk=17)):
+                loaded = load_collected_dataset(temporary, expected_receipt_sha256=expected_receipt,
+                                                expected_encoder_source_sha256=sha("fixture-encoder-source"),
+                                                max_input_bytes=total)
+            self.assertEqual(loaded.indices("proposer"), [0])
+            self.assertEqual(sum(actual for _, actual in reads), total)
+            self.assertTrue(any(0 < actual < cap for cap, actual in reads))
+            remaining = total
+            for cap, actual in reads:
+                self.assertLessEqual(cap, min(65536, remaining + 1))
+                self.assertLessEqual(actual, min(17, cap))
+                remaining -= actual
+            self.assertEqual(remaining, 0)
+
+    def test_collection_loader_growth_during_read_is_bounded_before_rejection(self):
+        row, reads = fixture(), []
+        original_fdopen = os.fdopen
+        with tempfile.TemporaryDirectory(prefix="pals-collection-fixture-") as temporary:
+            expected_receipt = write_fixture_collection(temporary, row, native_sidecar(row))
+            path = Path(temporary) / "receipt.json"
+            maximum = path.stat().st_size
+            def grow():
+                with path.open("ab") as stream:
+                    stream.write(b" " * 4096)
+            with patch("rz_pals_model.training.os.fdopen", side_effect=lambda fd, mode, **options: CollectionReadProbe(original_fdopen(fd, mode, **options), reads, grow)):
+                with self.assertRaisesRegex(ValueError, "changed or exceeded allocation budget"):
+                    load_collected_dataset(temporary, expected_receipt_sha256=expected_receipt,
+                                           expected_encoder_source_sha256=sha("fixture-encoder-source"),
+                                           max_input_bytes=maximum)
+            self.assertEqual(reads, [(maximum + 1, maximum + 1)])
+
+    def test_collection_loader_rejects_initial_oversize_and_nonregular_without_open(self):
+        row = fixture()
+        with tempfile.TemporaryDirectory(prefix="pals-collection-fixture-") as temporary:
+            expected_receipt = write_fixture_collection(temporary, row, native_sidecar(row))
+            path = Path(temporary) / "receipt.json"
+            with patch("rz_pals_model.training.os.open") as opened:
+                with self.assertRaisesRegex(ValueError, "allocation budget exceeded"):
+                    load_collected_dataset(temporary, expected_receipt_sha256=expected_receipt,
+                                           expected_encoder_source_sha256=sha("fixture-encoder-source"),
+                                           max_input_bytes=path.stat().st_size - 1)
+                opened.assert_not_called()
+            path.unlink()
+            path.mkdir()
+            with patch("rz_pals_model.training.os.open") as opened:
+                with self.assertRaisesRegex(ValueError, "regular file"):
+                    load_collected_dataset(temporary, expected_receipt_sha256=expected_receipt,
+                                           expected_encoder_source_sha256=sha("fixture-encoder-source"))
+                opened.assert_not_called()
+
+    def test_collection_loader_rejects_same_size_path_replacement_before_open(self):
+        row, reads = fixture(), []
+        original_open, original_fdopen = os.open, os.fdopen
+        with tempfile.TemporaryDirectory(prefix="pals-collection-fixture-") as temporary:
+            expected_receipt = write_fixture_collection(temporary, row, native_sidecar(row))
+            path = Path(temporary) / "receipt.json"
+            replacement = Path(temporary) / "replacement.json"
+            replacement.write_bytes(path.read_bytes())
+            def replace_before_open(opened_path, flags):
+                os.replace(replacement, path)
+                return original_open(opened_path, flags)
+            with patch("rz_pals_model.training.os.open", side_effect=replace_before_open), patch("rz_pals_model.training.os.fdopen", side_effect=lambda fd, mode, **options: CollectionReadProbe(original_fdopen(fd, mode, **options), reads)):
+                with self.assertRaisesRegex(ValueError, "changed before bounded read"):
+                    load_collected_dataset(temporary, expected_receipt_sha256=expected_receipt,
+                                           expected_encoder_source_sha256=sha("fixture-encoder-source"))
+            self.assertEqual(reads, [])
 
 
 if __name__ == "__main__":

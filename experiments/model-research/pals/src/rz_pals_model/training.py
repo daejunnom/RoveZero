@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import random
+import stat
 import sys
 import time
 import zipfile
@@ -193,6 +194,8 @@ def _validate_record(record, owned_cpu, sources):
             raise ValueError("result/termination mismatch")
         if p["source"] == "rules_terminal" and (p["rules_state_sha256"] != s["rules_state_sha256"] or result["ending"] not in draws | {"checkmate"} or (result["ending"] in {"checkmate", "stalemate"} and s["legal_moves"])):
             raise ValueError("terminal label does not describe captured Rules state")
+        if p["source"] == "rules_terminal" and result["ending"] == "checkmate" and result["outcome"] != ("black_win" if s["white_to_move"] else "white_win"):
+            raise ValueError("captured checkmate must defeat the side to move")
         if label["value_wdl"] is not None:
             _vector(label["value_wdl"], 3)
             win = (result["outcome"] == "white_win") == s["white_to_move"]
@@ -435,15 +438,41 @@ def load_collected_dataset(directory, *, expected_receipt_sha256, expected_encod
     def read(name, asset=None):
         nonlocal consumed
         path = directory / name
-        if path.is_symlink() or not path.is_file():
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode):
             raise ValueError("collection file must be a regular file")
-        size = path.stat().st_size
-        if consumed + size > max_input_bytes:
+        remaining = max_input_bytes - consumed
+        if before.st_size > remaining:
             raise ValueError("collection input allocation budget exceeded")
-        data = path.read_bytes()
-        consumed += len(data)
-        if len(data) != size or consumed > max_input_bytes:
+        def identity(metadata):
+            return (metadata.st_dev, metadata.st_ino, metadata.st_size,
+                    metadata.st_mtime_ns, metadata.st_ctime_ns)
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(path, flags)
+        try:
+            stream = os.fdopen(descriptor, "rb", buffering=0)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with stream:
+            opened = os.fstat(stream.fileno())
+            if not stat.S_ISREG(opened.st_mode) or identity(opened) != identity(before):
+                raise ValueError("collection file changed before bounded read")
+            limit = min(before.st_size + 1, remaining + 1)
+            content = bytearray()
+            while len(content) < limit:
+                block = stream.read(min(65536, limit - len(content)))
+                if not block:
+                    break
+                content.extend(block)
+            data = bytes(content)
+            after = os.fstat(stream.fileno())
+        final = path.lstat()
+        if (len(data) != before.st_size or len(data) > remaining
+                or not stat.S_ISREG(after.st_mode) or not stat.S_ISREG(final.st_mode)
+                or identity(after) != identity(before) or identity(final) != identity(before)):
             raise ValueError("collection file changed or exceeded allocation budget")
+        consumed += len(data)
         if asset is not None:
             asset = _fields(asset, ("sha256", "bytes"), "collection artifact")
             if _uint(asset["bytes"]) != len(data) or _sha(asset["sha256"]) != hashlib.sha256(data).hexdigest():

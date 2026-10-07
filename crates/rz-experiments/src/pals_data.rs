@@ -361,6 +361,14 @@ impl PalsTargetProvenance {
                     "terminal mate/stalemate input still has legal moves",
                 )?;
                 ensure(
+                    result.ending != PalsGameEnd::Checkmate
+                        || matches!(
+                            (result.outcome, input.white_to_move),
+                            (PalsOutcome::BlackWin, true) | (PalsOutcome::WhiteWin, false)
+                        ),
+                    "captured checkmate must defeat the side to move",
+                )?;
+                ensure(
                     rules_state_sha256 == &input.rules_state_sha256
                         && result.game_id == input.game_id
                         && result.ending.rules_terminal(),
@@ -1567,6 +1575,100 @@ mod tests {
             counterexample: None,
             verifier_tasks: None,
             supersedes_label_sha256: None,
+        }
+    }
+    #[test]
+    fn rules_terminal_checkmate_defeats_captured_side_with_optional_loss_target() {
+        // The black mate is the independent rz-position outcome fixture; the
+        // white mate rotates that board by 180 degrees and exchanges colors.
+        for (fen, white_to_move, winner, wrong_winner) in [
+            (
+                "8/8/8/8/8/2k5/1q6/K7 w - - 0 1",
+                true,
+                PalsOutcome::BlackWin,
+                PalsOutcome::WhiteWin,
+            ),
+            (
+                "7k/6Q1/5K2/8/8/8/8/8 b - - 0 1",
+                false,
+                PalsOutcome::WhiteWin,
+                PalsOutcome::BlackWin,
+            ),
+        ] {
+            let mut input = snapshot("a", "oa", "la");
+            input.position_command = format!("position fen {fen}");
+            input.board_fen = fen.into();
+            input.actual_history.clear();
+            input.rules_state_sha256 = hash(fen);
+            input.transposition_sha256 = hash(fen);
+            input.white_to_move = white_to_move;
+            input.legal_moves.clear();
+            let mut a = PalsLearningRecord {
+                input: input.seal().unwrap(),
+                future_label: None,
+                verifier_private: None,
+            };
+            let mut label = outcome_label(PalsGameEnd::Checkmate, winner, None);
+            label.white_to_move = white_to_move;
+            let result = label.provenance.result().unwrap().clone();
+            label.provenance = PalsTargetProvenance::RulesTerminal {
+                rules_state_sha256: a.input.snapshot().rules_state_sha256.clone(),
+                result,
+            };
+            for value in [None, Some([0.0, 0.0, 1.0])] {
+                label.value_wdl = value;
+                a.future_label = Some(label.clone());
+                a.validate().unwrap();
+            }
+            label.value_wdl = Some([1.0, 0.0, 0.0]);
+            a.future_label = Some(label.clone());
+            assert!(a.validate().is_err());
+            if let PalsTargetProvenance::RulesTerminal { result, .. } = &mut label.provenance {
+                result.outcome = wrong_winner;
+            }
+            // A win target agrees with the wrong winner under the generic WDL
+            // viewpoint check, so rejection must come from exact provenance.
+            for value in [None, Some([1.0, 0.0, 0.0])] {
+                label.value_wdl = value;
+                a.future_label = Some(label.clone());
+                assert!(matches!(
+                    a.validate(),
+                    Err(ManifestError::Integrity(message))
+                        if message == "captured checkmate must defeat the side to move"
+                ));
+            }
+        }
+    }
+    #[test]
+    fn actual_game_future_checkmate_can_be_won_by_captured_side() {
+        for (white_to_move, winner, fen, legal_moves) in [
+            (
+                true,
+                PalsOutcome::WhiteWin,
+                "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1",
+                vec![1292, 1804],
+            ),
+            (
+                false,
+                PalsOutcome::BlackWin,
+                "4k3/8/8/8/8/8/4P3/4K3 b - - 0 1",
+                vec![3388, 3452],
+            ),
+        ] {
+            let mut input = snapshot("a", "oa", "la");
+            input.position_command = format!("position fen {fen}");
+            input.board_fen = fen.into();
+            input.actual_history.clear();
+            input.white_to_move = white_to_move;
+            input.legal_moves = legal_moves;
+            let mut label = outcome_label(PalsGameEnd::Checkmate, winner, Some([1.0, 0.0, 0.0]));
+            label.white_to_move = white_to_move;
+            let a = PalsLearningRecord {
+                input: input.seal().unwrap(),
+                future_label: Some(label),
+                verifier_private: None,
+            };
+            a.validate().unwrap();
         }
     }
     #[test]
