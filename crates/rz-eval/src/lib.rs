@@ -14,6 +14,8 @@ pub mod mock;
 pub mod pals_model;
 #[cfg(all(feature = "onnx", feature = "contracts"))]
 pub mod pals_onnx;
+#[cfg(feature = "contracts")]
+pub mod pals_private;
 pub mod runtime_pin;
 pub mod worker;
 
