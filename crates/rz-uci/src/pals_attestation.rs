@@ -25,6 +25,8 @@ pub struct PalsNativeReceiptV3 {
     pub process_id: u32,
     pub binary_sha256: String,
     pub runtime_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_bundle_sha256: Option<String>,
     pub provider: &'static str,
     pub precision: &'static str,
     pub service_exit_success: bool,
@@ -95,7 +97,11 @@ impl PalsReceiptWriter {
             process_id: std::process::id(),
             binary_sha256: self.binary_sha256.clone(),
             runtime_sha256: self.runtime_sha256.clone(),
-            provider: "cpu",
+            provider: native.execution.provider,
+            runtime_bundle_sha256: native
+                .execution
+                .runtime_bundle_sha256
+                .map(|digest| digest.iter().map(|byte| format!("{byte:02x}")).collect()),
             precision: "fp32",
             service_exit_success,
             native,
@@ -107,6 +113,7 @@ impl PalsReceiptWriter {
         native: NativeRoleReceipt,
         search_work: Option<ProcessSearchWorkReceipt>,
     ) -> Result<(), ProcessReceiptError> {
+        self.validate_execution(&native)?;
         let receipt = self.envelope(STARTUP_DOMAIN, native, false, search_work);
         self.writer.publish_startup(&receipt)
     }
@@ -118,6 +125,7 @@ impl PalsReceiptWriter {
         service_exit_success: bool,
         search_work: Option<ProcessSearchWorkReceipt>,
     ) -> Result<(), ProcessReceiptError> {
+        self.validate_execution(&native)?;
         let receipt = self.envelope(
             TERMINATION_DOMAIN,
             native,
@@ -125,6 +133,24 @@ impl PalsReceiptWriter {
             search_work,
         );
         self.writer.publish_termination(&receipt)
+    }
+    fn validate_execution(&self, native: &NativeRoleReceipt) -> Result<(), ProcessReceiptError> {
+        let runtime: String = native
+            .execution
+            .runtime_sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if runtime != self.runtime_sha256
+            || !matches!(native.execution.provider, "cpu" | "cuda")
+            || (native.execution.provider == "cuda")
+                != native.execution.runtime_bundle_sha256.is_some()
+        {
+            return Err(ProcessReceiptError::boundary(
+                "PALS actual provider/runtime pin differs from receipt identity",
+            ));
+        }
+        Ok(())
     }
 }
 

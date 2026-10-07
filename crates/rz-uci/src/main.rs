@@ -131,6 +131,34 @@ fn run_pals(
             if native.provider.replace(value.to_owned()).is_some() {
                 return Err("duplicate PALS provider".into());
             }
+        } else if let Some(value) = argument.strip_prefix("--pals-cuda-bundle=") {
+            if native.cuda_bundle.replace(value.to_owned()).is_some() {
+                return Err("duplicate PALS CUDA bundle".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-cuda-bundle-sha256=") {
+            if native.cuda_bundle_hash.replace(value.to_owned()).is_some() {
+                return Err("duplicate PALS CUDA bundle hash".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-cuda-device=") {
+            if native.cuda_device.replace(value.parse::<i32>()?).is_some() {
+                return Err("duplicate PALS CUDA device".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-cuda-session-arena-bytes=") {
+            if native
+                .cuda_session_arena
+                .replace(value.parse::<u64>()?)
+                .is_some()
+            {
+                return Err("duplicate PALS CUDA session allocator limit".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-device-public-memory=") {
+            if native
+                .device_public_memory
+                .replace(value.parse::<bool>()?)
+                .is_some()
+            {
+                return Err("duplicate PALS device public memory option".into());
+            }
         } else {
             return Err("PALS requires an explicit model and finite PALS flags; LC0/ORT arguments are not implicitly reused".into());
         }
@@ -194,6 +222,11 @@ struct PalsNativeOptions {
     output_root: Option<String>,
     launch_hash: Option<String>,
     endpoint_id: Option<String>,
+    cuda_bundle: Option<String>,
+    cuda_bundle_hash: Option<String>,
+    cuda_device: Option<i32>,
+    cuda_session_arena: Option<u64>,
+    device_public_memory: Option<bool>,
 }
 impl PalsNativeOptions {
     fn any(&self) -> bool {
@@ -206,6 +239,11 @@ impl PalsNativeOptions {
             || self.output_root.is_some()
             || self.launch_hash.is_some()
             || self.endpoint_id.is_some()
+            || self.cuda_bundle.is_some()
+            || self.cuda_bundle_hash.is_some()
+            || self.cuda_device.is_some()
+            || self.cuda_session_arena.is_some()
+            || self.device_public_memory.is_some()
     }
 }
 
@@ -233,8 +271,32 @@ fn run_native_pals(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // PALS owns a distinct manifest and tensors. LC0 NativeConfig and its
     // attestation cannot authorize or describe this model.
-    if native.provider.as_deref() != Some("cpu") {
-        return Err("PALS requires explicit --pals-provider=cpu; CUDA bindings are not enabled by this path".into());
+    let provider = match native.provider.as_deref() {
+        Some("cpu") => "cpu",
+        Some("cuda") if cfg!(all(feature = "onnx-cuda", target_os = "linux")) => "cuda",
+        Some("cuda") => {
+            return Err(
+                "PALS CUDA requires onnx-cuda on Linux; no CPU fallback was started".into(),
+            );
+        }
+        _ => {
+            return Err(
+                "PALS requires explicit --pals-provider=cpu or cuda; no fallback was started"
+                    .into(),
+            );
+        }
+    };
+    if provider == "cpu"
+        && (native.cuda_bundle.is_some()
+            || native.cuda_bundle_hash.is_some()
+            || native.cuda_device.is_some()
+            || native.cuda_session_arena.is_some()
+            || native.device_public_memory.unwrap_or(false))
+    {
+        return Err("PALS CPU selection cannot accept CUDA bundle/device/allocator options".into());
+    }
+    if native.device_public_memory.unwrap_or(false) && !cfg!(feature = "experimental-io-binding") {
+        return Err("PALS device public memory requires explicit experimental-io-binding; no binding fallback was started".into());
     }
     let receipt_config =
         match (native.output_root, native.launch_hash, native.endpoint_id) {
@@ -277,21 +339,106 @@ fn run_native_pals(
         }
         None => rz_eval::runtime_pin::RuntimeCache::for_user()?,
     };
-    let pin = cache.library(&runtime_path, &runtime_hash)?;
-    let runtime = rz_eval::onnx::OrtRuntime::load(&pin)?;
-    let backend = rz_eval::pals_onnx::PalsOnnxBackend::load(
-        &manifest,
-        &manifest_hash,
-        runtime,
-        rz_eval::pals_onnx::PalsOnnxConfig::cpu(),
-    )?;
+    let mut backend_config = rz_eval::pals_onnx::PalsOnnxConfig::cpu();
+    let pin = if provider == "cpu" {
+        cache.library(&runtime_path, &runtime_hash)?
+    } else {
+        let bundle_path =
+            std::path::PathBuf::from(native.cuda_bundle.ok_or("PALS CUDA bundle is required")?);
+        if !bundle_path.is_absolute() {
+            return Err("PALS CUDA bundle path must be absolute".into());
+        }
+        let bundle_hash = native
+            .cuda_bundle_hash
+            .ok_or("PALS CUDA bundle SHA-256 is required")?;
+        let expected_bundle = rz_eval::asset::parse_sha256(&bundle_hash)?;
+        let bytes = rz_eval::asset::read_bounded(&bundle_path, 64 * 1024)?;
+        if rz_eval::asset::sha256(&bytes) != expected_bundle {
+            return Err("PALS CUDA bundle descriptor differs from its SHA-256 pin".into());
+        }
+        let spec =
+            rz_eval::runtime_pin::CudaRuntimeBundleSpec::from_json(std::str::from_utf8(&bytes)?)?;
+        let core = spec
+            .files
+            .iter()
+            .find(|entry| entry.role == rz_eval::runtime_pin::RuntimeBundleFileRole::Core)
+            .ok_or("PALS CUDA bundle core is absent")?;
+        if runtime_path.file_name().and_then(|name| name.to_str()) != Some(core.filename.as_str())
+            || core.sha256 != runtime_hash
+        {
+            return Err("PALS explicit ORT core filename/hash differs from CUDA bundle".into());
+        }
+        let device_id = native
+            .cuda_device
+            .ok_or("PALS CUDA device ID is required")?;
+        let arena = native
+            .cuda_session_arena
+            .ok_or("PALS per-session CUDA allocator limit is required")?;
+        if device_id != 0 || arena != 2 * 1024 * 1024 * 1024 {
+            return Err("first PALS CUDA profile requires device 0 and 2GiB per-session allocator declaration; this is not a measured peak".into());
+        }
+        backend_config.provider = rz_eval::onnx::Provider::Cuda {
+            device_id,
+            arena_bytes: usize::try_from(arena)?,
+        };
+        backend_config.device_public_memory = native.device_public_memory.unwrap_or(false);
+        cache.cuda_bundle(
+            runtime_path
+                .parent()
+                .ok_or("PALS CUDA core parent is absent")?,
+            &spec,
+        )?
+    };
     let mut settings = EngineSettings::default();
     settings.search.max_simulations = cpu_nodes;
-    let model = rz_uci::pals_native::NativeRoleModel::new_with_drain_limit(
-        backend,
+    let mut model = rz_uci::pals_native::NativeRoleModel::load_pinned(
+        &manifest,
+        &manifest_hash,
+        &pin,
+        backend_config,
         settings.shutdown_limit,
     )?;
     let finish = model.finish_handle();
+    if let Err(primary) =
+        model.prepare_startup(std::time::Instant::now() + std::time::Duration::from_secs(15))
+    {
+        let mut publication = None;
+        let mut failure_writer = match receipt_config.as_ref() {
+            Some((root, launch, endpoint)) => {
+                match rz_uci::pals_attestation::PalsReceiptWriter::open(
+                    root,
+                    endpoint,
+                    launch,
+                    &runtime_hash,
+                ) {
+                    Ok(mut writer) => match writer.startup(finish.receipt(), None) {
+                        Ok(()) => Some(writer),
+                        Err(error) => {
+                            publication = Some(error);
+                            None
+                        }
+                    },
+                    Err(error) => {
+                        publication = Some(error);
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let cleanup = finish
+            .finish(std::time::Instant::now() + settings.shutdown_limit)
+            .err();
+        if let Some(writer) = failure_writer.as_mut() {
+            publication = writer.termination(finish.receipt(), false, None).err();
+        }
+        return Err(Box::new(PalsFinishError {
+            primary: Some(Box::new(primary)),
+            cleanup,
+            publication,
+            work_observation: None,
+        }));
+    }
     let driver = match rz_uci::search_driver::PalsSessionDriver::new(
         config,
         model,
@@ -300,7 +447,10 @@ fn run_native_pals(
         cpu_nodes,
         cpu_depth,
         rz_uci::EngineIdentity {
-            name: "RoveZero PALS P/C ONNX CPU + own CPU_R".into(),
+            name: format!(
+                "RoveZero PALS P/C ONNX {} + own CPU_R",
+                if provider == "cpu" { "CPU" } else { "CUDA" }
+            ),
             author: "RoveZero contributors".into(),
         },
     ) {
@@ -607,7 +757,8 @@ struct SearchWorkFinishError {
 #[cfg(feature = "search-work-receipts")]
 impl std::fmt::Display for SearchWorkFinishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        write!(f, "search finish failed: primary={:?}, observation={:?}, publication={:?}",
+            self.primary, self.observation, self.publication)
     }
 }
 #[cfg(feature = "search-work-receipts")]

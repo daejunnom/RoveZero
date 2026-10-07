@@ -543,18 +543,21 @@ impl SearchSessionDriver for CpuSessionDriver {
                 deadline: Some(context.control.admission_deadline),
             };
             observation = AttemptObservation::CpuStarted;
-            let report = engine
-                .analyze_with_progress(
-                    position,
-                    limits,
-                    &context.control.cancellation,
-                    |iteration| {
-                        if let Some(movement) = iteration.best_move {
-                            progress(movement);
-                        }
-                    },
-                )
-                .map_err(|error| SearchSessionFailure::debug("CpuSearch", &error))?;
+            let attempted = engine.analyze_with_progress(
+                position,
+                limits,
+                &context.control.cancellation,
+                |iteration| {
+                    if let Some(movement) = iteration.best_move {
+                        progress(movement);
+                    }
+                },
+            );
+            if let Some(work) = engine.last_attempt_work() {
+                observation = AttemptObservation::CpuFailed(work);
+            }
+            let report =
+                attempted.map_err(|error| SearchSessionFailure::debug("CpuSearch", &error))?;
             observation = AttemptObservation::cpu(&report, limits.max_depth);
             if context.accepts().map_err(|error| SearchSessionFailure {
                 physical_completion: DriverPhysicalCompletion::Confirmed,

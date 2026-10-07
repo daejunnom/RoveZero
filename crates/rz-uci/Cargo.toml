@@ -17,6 +17,10 @@ required-features = ["onnx-cpu"]
 name = "mock_adapter_check"
 required-features = ["onnx-cpu"]
 
+[[example]]
+name = "pals_cpu_task"
+required-features = ["search-work-receipts"]
+
 [features]
 experimental-batch = ["rz-search/experimental-batch", "rz-eval/experimental-batch"]
 experimental-io-buffers = ["rz-eval/experimental-io-buffers"]

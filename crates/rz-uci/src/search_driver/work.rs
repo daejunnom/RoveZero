@@ -4,7 +4,7 @@ use super::{SearchKind, SearchSessionContext, SearchSessionFailure, SearchSessio
 use rz_contracts::{ContractError, ErrorCode, Stage, pals::SearchAuthority};
 use rz_position::BoardMove;
 use rz_search::{
-    cpu::{CpuReport, CpuScoreScope},
+    cpu::{CpuReport, CpuScoreScope, CpuWork},
     pals::engine::PalsCounters,
 };
 use std::sync::Mutex;
@@ -83,7 +83,7 @@ impl CpuWorkTotals {
     }
     fn failed_attempt(&mut self) {
         add(&mut self.tasks_requested, 1);
-        // CpuError exposes no work report; earlier successful totals cannot be
+        // No actual work snapshot was observed; earlier successful totals cannot be
         // presented as the full sum of this process after the missing attempt.
         self.nodes = None;
         self.quiescence_nodes = None;
@@ -167,6 +167,7 @@ fn fault() -> ContractError {
 pub(super) enum AttemptObservation {
     NoWork,
     CpuStarted,
+    CpuFailed(CpuWork),
     Cpu(CpuObservation),
     PalsStarted,
     Pals {
@@ -307,6 +308,20 @@ impl ProcessWorkJournal {
             AttemptObservation::CpuStarted => {
                 receipt.cpu.as_mut().ok_or_else(fault)?.failed_attempt();
                 unknown = true;
+            }
+            AttemptObservation::CpuFailed(work) => {
+                let totals = receipt.cpu.as_mut().ok_or_else(fault)?;
+                add(&mut totals.tasks_requested, 1);
+                add(&mut totals.nodes, work.nodes);
+                add(&mut totals.quiescence_nodes, work.quiescence_nodes);
+                add(&mut totals.tt_hits, work.tt_hits);
+                if work.nodes > 0 {
+                    // The invocation observed actual work but supplied no
+                    // report of its last completed iteration. Preserve that
+                    // distinct missing gauge rather than inventing depth 0.
+                    totals.max_completed_depth = None;
+                    unknown = true;
+                }
             }
             AttemptObservation::Pals {
                 counters,
@@ -506,6 +521,45 @@ mod tests {
         assert_eq!(totals.reports_returned, Some(0));
         assert_eq!(totals.nodes, None);
         assert_eq!(totals.quiescence_nodes, None);
+    }
+    #[test]
+    fn failed_cpu_work_is_retained_without_inventing_a_completed_report() {
+        for (work, unknown, depth) in [
+            (
+                CpuWork {
+                    nodes: 3,
+                    quiescence_nodes: 1,
+                    tt_hits: 2,
+                },
+                1,
+                None,
+            ),
+            (CpuWork::default(), 0, Some(0)),
+        ] {
+            let journal = ProcessWorkJournal::new(SearchKind::Cpu);
+            let context = context();
+            journal.begin().unwrap();
+            journal
+                .finish(
+                    &context,
+                    &Err(SearchSessionFailure::debug(
+                        "CpuSearch",
+                        &"observed failure",
+                    )),
+                    AttemptObservation::CpuFailed(work),
+                )
+                .unwrap();
+            let receipt = journal.snapshot().unwrap();
+            assert_eq!(receipt.unobserved_work_invocations, unknown);
+            let totals = receipt.cpu.unwrap();
+            assert_eq!(totals.tasks_requested, Some(1));
+            assert_eq!(totals.reports_returned, Some(0));
+            assert_eq!(totals.nodes, Some(work.nodes));
+            assert_eq!(totals.quiescence_nodes, Some(work.quiescence_nodes));
+            assert_eq!(totals.tt_hits, Some(work.tt_hits));
+            assert_eq!(totals.max_completed_depth, depth);
+            assert_eq!(totals.completed_reports_accepted_for_uci_output, Some(0));
+        }
     }
     #[test]
     fn cpu_completion_is_consumed_only_at_the_exact_natural_output_handoff() {
