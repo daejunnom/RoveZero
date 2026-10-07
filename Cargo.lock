@@ -429,6 +429,7 @@ dependencies = [
  "rz-eval",
  "rz-experiments",
  "rz-position",
+ "rz-search",
  "rz-uci",
  "serde",
  "serde_json",
@@ -503,7 +504,11 @@ name = "rz-search"
 version = "0.1.0"
 dependencies = [
  "rz-contracts",
+ "rz-position",
  "rz-telemetry",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
