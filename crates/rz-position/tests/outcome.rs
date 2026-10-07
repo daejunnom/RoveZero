@@ -110,12 +110,10 @@ fn fifth_known_occurrence_is_an_automatic_draw() {
         classification.history_evidence.fivefold_repetition,
         Availability::Available
     );
-    assert!(
-        classification
-            .claim_availability
-            .iter()
-            .all(|claim| { claim.evidence == ClaimEvidence::CurrentPosition })
-    );
+    assert!(classification
+        .claim_availability
+        .iter()
+        .all(|claim| { claim.evidence == ClaimEvidence::CurrentPosition }));
 }
 
 #[test]
@@ -140,27 +138,23 @@ fn unknown_prefix_preserves_uncertainty_but_known_occurrences_prove_repetition()
         initial_classification.history_evidence.fivefold_repetition,
         Availability::Unknown
     );
-    assert!(
-        initial_classification
-            .claim_availability
-            .iter()
-            .any(|claim| {
-                claim.reason == ClaimReason::ThreefoldRepetition
-                    && claim.evidence
-                        == ClaimEvidence::IntendedMove(BoardMove::from_uci("g1f3").unwrap())
-                    && claim.availability == Availability::Unknown
-            })
-    );
-    assert!(
-        !initial_classification
-            .claim_availability
-            .iter()
-            .any(|claim| {
-                claim.reason == ClaimReason::ThreefoldRepetition
-                    && claim.evidence
-                        == ClaimEvidence::IntendedMove(BoardMove::from_uci("e2e4").unwrap())
-            })
-    );
+    assert!(initial_classification
+        .claim_availability
+        .iter()
+        .any(|claim| {
+            claim.reason == ClaimReason::ThreefoldRepetition
+                && claim.evidence
+                    == ClaimEvidence::IntendedMove(BoardMove::from_uci("g1f3").unwrap())
+                && claim.availability == Availability::Unknown
+        }));
+    assert!(!initial_classification
+        .claim_availability
+        .iter()
+        .any(|claim| {
+            claim.reason == ClaimReason::ThreefoldRepetition
+                && claim.evidence
+                    == ClaimEvidence::IntendedMove(BoardMove::from_uci("e2e4").unwrap())
+        }));
 
     for _ in 0..2 {
         moves(&mut position, &KNIGHT_CYCLE);

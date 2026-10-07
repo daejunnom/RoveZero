@@ -846,10 +846,67 @@ pub struct PalsPublicMemoryWitness {
 pub enum PalsNativeCommand {
     Evaluate(PalsModelInput),
     NewGame,
+    SnapshotStats,
 }
 pub enum PalsNativeResult {
     Evaluation(PalsRawOutput),
     NewGame,
+    Stats(PalsBackendStats),
+}
+/// Native graph evidence, cumulative across games for one frozen backend.
+/// These are typed counters; a caller must choose its own receipt schema.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PalsBackendStats {
+    pub admitted_role_requests: u64,
+    pub public_cache_hits: u64,
+    pub public_cache_misses: u64,
+    pub public_nn_runs_attempted: u64,
+    pub public_nn_runs_completed: u64,
+    pub public_nn_runs_failed_known: u64,
+    pub role_nn_runs_attempted: u64,
+    pub role_nn_runs_completed: u64,
+    pub role_nn_runs_failed_known: u64,
+    /// Physical B1 inputs from both public and role graphs that returned and
+    /// completed their physical fence; output validation is a separate count.
+    pub completed_nn_inputs: u64,
+    /// Full shape/finite/mask acceptance in the host-cache path. Device K/V
+    /// currently has no independent host witness, so this stays zero there.
+    pub validated_public_outputs: u64,
+    pub validated_role_outputs: u64,
+    pub new_game_resets: u64,
+    pub live_public_cache_entries: u64,
+}
+impl PalsBackendStats {
+    pub fn validate(&self) -> Result<(), BackendError> {
+        if self.live_public_cache_entries > 1
+            || self
+                .public_nn_runs_completed
+                .checked_add(self.public_nn_runs_failed_known)
+                .is_none_or(|n| n > self.public_nn_runs_attempted)
+            || self
+                .role_nn_runs_completed
+                .checked_add(self.role_nn_runs_failed_known)
+                .is_none_or(|n| n > self.role_nn_runs_attempted)
+            || self
+                .public_nn_runs_completed
+                .checked_add(self.role_nn_runs_completed)
+                != Some(self.completed_nn_inputs)
+            || self.validated_public_outputs > self.public_nn_runs_completed
+            || self.validated_role_outputs > self.role_nn_runs_completed
+            || self.role_nn_runs_attempted > self.admitted_role_requests
+            || self
+                .public_cache_hits
+                .checked_add(self.public_cache_misses)
+                .is_none_or(|n| n > self.admitted_role_requests)
+        {
+            return Err(fail(
+                K::BackendFailure,
+                S::Backend,
+                "PALS native graph counters violate completion accounting",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -890,6 +947,7 @@ pub struct PalsOnnxBackend {
     rules_input_profile: Option<String>,
     rules_input_semantic_sha256: Option<[u8; 32]>,
     residency: PalsSessionResidency,
+    stats: PalsBackendStats,
     memory: Option<PublicMemory>,
     active: Option<ActiveInputs>,
     #[cfg(feature = "experimental-io-binding")]
@@ -1025,6 +1083,7 @@ impl PalsOnnxBackend {
                 native_resident_parameter_bytes: None,
                 vram_peak_bytes: None,
             },
+            stats: PalsBackendStats::default(),
             memory: None,
             active: None,
             quarantine: None,
@@ -1123,7 +1182,28 @@ impl PalsOnnxBackend {
             self.device_role = None;
             self.device_memory = None;
         }
+        self.stats.new_game_resets = self.stats.new_game_resets.saturating_add(1);
         Ok(())
+    }
+    pub fn snapshot_stats(&self) -> Result<PalsBackendStats, BackendError> {
+        if let Some(cause) = &self.quarantine {
+            return Err(cause.clone());
+        }
+        if self.active.is_some() {
+            return Err(fail(
+                K::BackendFailure,
+                S::Backend,
+                "PALS stats require the physical invocation boundary",
+            ));
+        }
+        let mut stats = self.stats.clone();
+        stats.live_public_cache_entries = u64::from(self.memory.is_some());
+        #[cfg(feature = "experimental-io-binding")]
+        if self.device_memory.is_some() {
+            stats.live_public_cache_entries += 1;
+        }
+        stats.validate()?;
+        Ok(stats)
     }
     pub fn config(&self) -> PalsOnnxConfig {
         self.config
@@ -1158,6 +1238,9 @@ impl PalsOnnxBackend {
                 PalsNativeCommand::NewGame => self
                     .clear_public_memory()
                     .map(|()| PalsNativeResult::NewGame),
+                PalsNativeCommand::SnapshotStats => {
+                    self.snapshot_stats().map(PalsNativeResult::Stats)
+                }
             };
             match self.quarantine.as_ref() {
                 Some(cause) => PhysicalRun::Quarantined(cause.clone()),
@@ -1189,6 +1272,7 @@ impl PalsOnnxBackend {
             .map_err(model_input)?;
         let key = prepared.public_memory_key;
         self.active = Some(ActiveInputs::new(prepared, input.role == PalsRole::Critic)?);
+        self.stats.admitted_role_requests = self.stats.admitted_role_requests.saturating_add(1);
         let result = {
             #[cfg(feature = "experimental-io-binding")]
             if self.config.device_public_memory {
@@ -1218,7 +1302,9 @@ impl PalsOnnxBackend {
             && self.device_memory.as_ref().is_some_and(|m| m.key == key);
         if cached {
             self.public_cache_hits = self.public_cache_hits.saturating_add(1);
+            self.stats.public_cache_hits = self.stats.public_cache_hits.saturating_add(1);
         } else {
+            self.stats.public_cache_misses = self.stats.public_cache_misses.saturating_add(1);
             let tokens = self
                 .model_config
                 .public_memory_tokens(input.records.len())
@@ -1247,6 +1333,7 @@ impl PalsOnnxBackend {
                 .run(
                     self.public.as_mut().expect("public session"),
                     self.active.as_ref().expect("physical inputs pinned"),
+                    &mut self.stats,
                 );
             if let Err(error) = result {
                 let failure = native(
@@ -1310,6 +1397,7 @@ impl PalsOnnxBackend {
                 session,
                 self.active.as_ref().expect("physical inputs pinned"),
                 self.device_memory.as_ref().expect("public memory pinned"),
+                &mut self.stats,
             );
         if let Err(error) = result {
             let failure = native(
@@ -1328,6 +1416,7 @@ impl PalsOnnxBackend {
         output
             .decode(input, &self.model_config)
             .map_err(model_input)?;
+        self.stats.validated_role_outputs = self.stats.validated_role_outputs.saturating_add(1);
         // No private role latent is fed into another invocation. After the
         // physical fence the private binding's aliases can be released.
         self.device_role = None;
@@ -1342,8 +1431,12 @@ impl PalsOnnxBackend {
             self.config.cache_public_memory && self.memory.as_ref().is_some_and(|m| m.key == key);
         if cached {
             self.public_cache_hits = self.public_cache_hits.saturating_add(1);
+            self.stats.public_cache_hits = self.stats.public_cache_hits.saturating_add(1);
         } else {
+            self.stats.public_cache_misses = self.stats.public_cache_misses.saturating_add(1);
             let active = self.active.as_ref().expect("owned input installed");
+            self.stats.public_nn_runs_attempted =
+                self.stats.public_nn_runs_attempted.saturating_add(1);
             let result = self.public.as_mut().expect("loaded public session").run(ort::inputs!["board" => &active.board, "metadata" => &active.metadata, "records" => &active.records, "record_mask" => &active.record_mask]);
             let outputs = match result {
                 Ok(outputs) => outputs,
@@ -1355,10 +1448,16 @@ impl PalsOnnxBackend {
                     );
                     if matches!(self.config.provider, Provider::Cuda { .. }) {
                         self.quarantine = Some(failure.clone());
+                    } else {
+                        self.stats.public_nn_runs_failed_known =
+                            self.stats.public_nn_runs_failed_known.saturating_add(1);
                     }
                     return Err(failure);
                 }
             };
+            self.stats.public_nn_runs_completed =
+                self.stats.public_nn_runs_completed.saturating_add(1);
+            self.stats.completed_nn_inputs = self.stats.completed_nn_inputs.saturating_add(1);
             let tokens = self
                 .model_config
                 .public_memory_tokens(input.records.len())
@@ -1433,6 +1532,8 @@ impl PalsOnnxBackend {
                 mask,
             });
             self.public_encodes = self.public_encodes.saturating_add(1);
+            self.stats.validated_public_outputs =
+                self.stats.validated_public_outputs.saturating_add(1);
         }
         let active = self.active.as_ref().expect("owned inputs remain installed");
         let memory = self
@@ -1447,6 +1548,7 @@ impl PalsOnnxBackend {
         );
         let critic = input.role == PalsRole::Critic;
         let shared = self.layout == Layout::SharedPcIf;
+        self.stats.role_nn_runs_attempted = self.stats.role_nn_runs_attempted.saturating_add(1);
         let result = if shared {
             self.shared_pc.as_mut().expect("loaded shared P/C session").run(ort::inputs!["role_is_critic" => &active.role_is_critic, "memory_key" => &memory.memory_key, "memory_value" => &memory.memory_value, "memory_mask" => &memory.mask, "candidates" => &active.candidates, "candidate_mask" => &active.candidate_mask, "query" => &active.query, "divergence_features" => &active.divergences, "divergence_mask" => &active.divergence_mask])
         } else if critic {
@@ -1464,10 +1566,15 @@ impl PalsOnnxBackend {
                 );
                 if matches!(self.config.provider, Provider::Cuda { .. }) {
                     self.quarantine = Some(failure.clone());
+                } else {
+                    self.stats.role_nn_runs_failed_known =
+                        self.stats.role_nn_runs_failed_known.saturating_add(1);
                 }
                 return Err(failure);
             }
         };
+        self.stats.role_nn_runs_completed = self.stats.role_nn_runs_completed.saturating_add(1);
+        self.stats.completed_nn_inputs = self.stats.completed_nn_inputs.saturating_add(1);
         let extract = |name: &str, expected: &[i64]| -> Result<Vec<f32>, BackendError> {
             let (shape, values) = outputs[name].try_extract_tensor::<f32>().map_err(|e| {
                 native(
@@ -1539,6 +1646,7 @@ impl PalsOnnxBackend {
         output
             .decode(input, &self.model_config)
             .map_err(model_input)?;
+        self.stats.validated_role_outputs = self.stats.validated_role_outputs.saturating_add(1);
         Ok(output)
     }
 }
@@ -1667,15 +1775,23 @@ mod device {
                 _allocator: owned.allocator,
             })
         }
-        pub fn run(&mut self, session: &mut Session, active: &ActiveInputs) -> ort::Result<()> {
+        pub fn run(
+            &mut self,
+            session: &mut Session,
+            active: &ActiveInputs,
+            stats: &mut PalsBackendStats,
+        ) -> ort::Result<()> {
             self.binding.bind_input("board", &active.board)?;
             self.binding.bind_input("metadata", &active.metadata)?;
             self.binding.bind_input("records", &active.records)?;
             self.binding
                 .bind_input("record_mask", &active.record_mask)?;
             self.binding.synchronize_inputs()?;
+            stats.public_nn_runs_attempted = stats.public_nn_runs_attempted.saturating_add(1);
             run_fixed_binding(session, &self.binding)?;
             self.binding.synchronize_outputs()?;
+            stats.public_nn_runs_completed = stats.public_nn_runs_completed.saturating_add(1);
+            stats.completed_nn_inputs = stats.completed_nn_inputs.saturating_add(1);
             self.binding.clear_inputs();
             Ok(())
         }
@@ -1756,6 +1872,7 @@ mod device {
             session: &mut Session,
             active: &ActiveInputs,
             memory: &DeviceMemory,
+            stats: &mut PalsBackendStats,
         ) -> ort::Result<()> {
             if self.is_critic.is_some() {
                 // CUDA If's condition has OrtMemTypeCPUInput. This is an
@@ -1778,8 +1895,11 @@ mod device {
                     .bind_input("divergence_mask", &active.divergence_mask)?;
             }
             self.binding.synchronize_inputs()?;
+            stats.role_nn_runs_attempted = stats.role_nn_runs_attempted.saturating_add(1);
             run_fixed_binding(session, &self.binding)?;
             self.binding.synchronize_outputs()?;
+            stats.role_nn_runs_completed = stats.role_nn_runs_completed.saturating_add(1);
+            stats.completed_nn_inputs = stats.completed_nn_inputs.saturating_add(1);
             self.binding.clear_inputs();
             Ok(())
         }
@@ -2080,5 +2200,32 @@ mod tests {
         validate_role_tag(&[], &[true], true).unwrap();
         assert!(validate_role_tag(&[1], &[true], true).is_err());
         assert!(validate_role_tag(&[], &[false], true).is_err());
+    }
+    #[test]
+    fn native_stats_separate_requests_graphs_inputs_and_validated_outputs() {
+        let mut stats = PalsBackendStats {
+            admitted_role_requests: 2,
+            public_cache_hits: 1,
+            public_cache_misses: 1,
+            public_nn_runs_attempted: 1,
+            public_nn_runs_completed: 1,
+            role_nn_runs_attempted: 2,
+            role_nn_runs_completed: 2,
+            completed_nn_inputs: 3,
+            validated_public_outputs: 1,
+            validated_role_outputs: 2,
+            new_game_resets: 2,
+            live_public_cache_entries: 1,
+            ..Default::default()
+        };
+        stats.validate().unwrap();
+        stats.completed_nn_inputs = 2;
+        assert!(stats.validate().is_err());
+        stats.completed_nn_inputs = 3;
+        stats.validated_role_outputs = 3;
+        assert!(stats.validate().is_err());
+        stats.validated_role_outputs = 2;
+        stats.live_public_cache_entries = 2;
+        assert!(stats.validate().is_err());
     }
 }

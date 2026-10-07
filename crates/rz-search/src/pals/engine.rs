@@ -259,15 +259,51 @@ pub struct PalsCounters {
     pub supported_refutations: u64,
     pub supported_repairs: u64,
     pub role_calls: u64,
+    pub proposer_calls: u64,
+    /// Includes critic divergence ranking and legal reply ranking calls.
+    pub critic_calls: u64,
+    pub repair_calls: u64,
+    /// Shape-valid role outputs returned, before final logical acceptance.
+    pub completed_proposer_calls: u64,
+    pub completed_critic_calls: u64,
+    pub completed_repair_calls: u64,
     pub consumed_role_outputs: u64,
+    pub accepted_proposer_outputs: u64,
+    pub accepted_critic_outputs: u64,
+    pub accepted_repair_outputs: u64,
+    /// CPU API calls started, including calls which return CpuError.
+    pub cpu_tasks_requested: u64,
+    /// Physical CPU reports returned; not a requested-coverage completion count.
     pub cpu_tasks: u64,
+    /// A CPU call failed without returning its actual node/work report. Reported
+    /// counts are then a lower bound, not a complete observation of CPU work.
+    pub cpu_work_observation_incomplete: bool,
     pub cpu_nodes: u64,
     pub cpu_quiescence_nodes: u64,
     pub cpu_tt_hits: u64,
+    /// New physical CPU executions satisfying the requested depth and scope.
+    /// A completed shallower iteration is retained as partial evidence instead.
     pub completed_cpu_tasks: u64,
+    /// Physical reports with a completed iteration below the requested depth.
+    pub partial_cpu_iterations: u64,
+    /// Completed TaskTable consumer results accepted into the current search;
+    /// includes completed-task reuse, excludes partial/frontier estimates.
+    pub consumed_cpu_tasks: u64,
+    /// Only TaskAdmission::Reuse accepted consumers; excludes the existing-node
+    /// evidence fast path. Direct new-completion consumption is total minus this.
+    pub reused_completed_cpu_tasks_consumed: u64,
+    /// Accepted shallower completed-iteration values, never completed requests.
+    pub consumed_partial_cpu_values: u64,
+    /// Accepted provisional values with no completed CPU iteration.
+    pub consumed_frontier_cpu_values: u64,
+    /// Existing depth-sufficient evidence or completed-task reuse accepted here.
+    pub consumed_cached_cpu_values: u64,
     pub evidence_cache_hits: u64,
     pub examined_edges: u64,
     pub retained_situations: usize,
+    /// Root-value/unknown-child accounting inspected every legal root move.
+    /// This is observation coverage, never a claim that every branch is solved.
+    pub root_scope_observation_complete: bool,
     pub unknown_root_children: usize,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -388,6 +424,7 @@ pub struct PalsEngine<M: RoleModel> {
     stores: PalsStores,
     clock_origin: Instant,
     consumer_id: u64,
+    last_search_counters: Option<PalsCounters>,
 }
 impl<M: RoleModel> PalsEngine<M> {
     pub fn new(config: PalsConfig, model: M, cpu: CpuEngine) -> Result<Self, PalsError> {
@@ -411,6 +448,7 @@ impl<M: RoleModel> PalsEngine<M> {
             stores,
             clock_origin: Instant::now(),
             consumer_id: 0,
+            last_search_counters: None,
         })
     }
     pub fn new_game(&mut self) {
@@ -421,6 +459,7 @@ impl<M: RoleModel> PalsEngine<M> {
         self.revision = 0;
         self.stores = PalsStores::new(Self::store_limits(&self.config));
         self.consumer_id = 0;
+        self.last_search_counters = None;
     }
     pub fn retained_situations(&self) -> usize {
         self.nodes.len()
@@ -430,6 +469,11 @@ impl<M: RoleModel> PalsEngine<M> {
     }
     pub fn model_identity(&self) -> &str {
         self.model.identity()
+    }
+    /// Snapshot of the most recent entered search, including errors. Read after
+    /// that search returns; the caller owns cumulative per-process accounting.
+    pub fn last_search_counters(&self) -> Option<PalsCounters> {
+        self.last_search_counters
     }
     pub fn stores(&self) -> &PalsStores {
         &self.stores
@@ -468,7 +512,24 @@ impl<M: RoleModel> PalsEngine<M> {
         position: &Position,
         limits: PalsLimits,
         cancel: &AtomicBool,
+        progress: F,
+    ) -> Result<PalsResult, PalsError> {
+        let mut counters = PalsCounters::default();
+        let result = self.search_inner(position, limits, cancel, progress, &mut counters);
+        if let Ok(report) = &result {
+            counters = report.counters;
+        }
+        counters.retained_situations = self.nodes.len();
+        self.last_search_counters = Some(counters);
+        result
+    }
+    fn search_inner<F: FnMut(BoardMove)>(
+        &mut self,
+        position: &Position,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
         mut progress: F,
+        counters: &mut PalsCounters,
     ) -> Result<PalsResult, PalsError> {
         if limits.max_rounds == 0
             || limits.max_cpu_nodes == 0
@@ -490,15 +551,16 @@ impl<M: RoleModel> PalsEngine<M> {
         };
         self.refresh_projection(self.nodes[root].state);
         let legal = position.legal_moves();
-        let mut counters = PalsCounters::default();
         if let Some((reason, value)) = self.nodes[root].terminal {
+            counters.retained_situations = self.nodes.len();
+            counters.root_scope_observation_complete = true;
             return Ok(PalsResult {
                 best_move: None,
                 score: Some(value),
                 value_scope: PalsValueScope::RulesTerminal,
                 terminal: Some(reason),
                 completion: PalsCompletion::Terminal,
-                counters,
+                counters: *counters,
                 root_values: Vec::new(),
                 elapsed: started.elapsed(),
                 model_identity: self.model.identity().to_owned(),
@@ -517,7 +579,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 child.classify_position()?.play_status,
                 PlayStatus::Terminal { .. }
             ) {
-                match self.connect(root, movement, child, &mut counters) {
+                match self.connect(root, movement, child, counters) {
                     Ok(_) => {}
                     Err(PalsError::Capacity) => {
                         completion = PalsCompletion::Capacity;
@@ -526,12 +588,14 @@ impl<M: RoleModel> PalsEngine<M> {
                     Err(error) => return Err(error),
                 }
                 match self.publish_choice(root, limits, cancel, &mut progress) {
-                    Ok(()) => {},
+                    Ok(()) => {}
                     Err(PalsError::Role(RoleError::Canceled)) => {
-                        completion = PalsCompletion::Canceled; break;
+                        completion = PalsCompletion::Canceled;
+                        break;
                     }
                     Err(PalsError::Role(RoleError::Deadline)) => {
-                        completion = PalsCompletion::Deadline; break;
+                        completion = PalsCompletion::Deadline;
+                        break;
                     }
                     Err(error) => return Err(error),
                 }
@@ -553,7 +617,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 completion = PalsCompletion::RoleCallLimit;
                 break;
             }
-            let result = self.refine(root, round, limits, cancel, &mut counters, &mut progress);
+            let result = self.refine(root, round, limits, cancel, counters, &mut progress);
             match result {
                 Ok(()) => counters.rounds += 1,
                 Err(PalsError::Role(RoleError::Canceled)) => {
@@ -629,13 +693,14 @@ impl<M: RoleModel> PalsEngine<M> {
             });
         }
         counters.retained_situations = self.nodes.len();
+        counters.root_scope_observation_complete = true;
         Ok(PalsResult {
             best_move: best,
             score,
             value_scope: scope,
             terminal: None,
             completion,
-            counters,
+            counters: *counters,
             root_values,
             elapsed: started.elapsed(),
             model_identity: self.model.identity().to_owned(),
@@ -688,7 +753,12 @@ impl<M: RoleModel> PalsEngine<M> {
             },
             counters: PalsCounters {
                 retained_situations: self.nodes.len(),
-                unknown_root_children: position.legal_moves().len(),
+                unknown_root_children: if terminal.is_some() {
+                    0
+                } else {
+                    position.legal_moves().len()
+                },
+                root_scope_observation_complete: true,
                 ..PalsCounters::default()
             },
             root_values: if terminal.is_some() {
@@ -809,12 +879,22 @@ impl<M: RoleModel> PalsEngine<M> {
         };
         query.check_control()?;
         counters.role_calls += 1;
+        match call {
+            Call::Propose => counters.proposer_calls += 1,
+            Call::Reply => counters.critic_calls += 1,
+            Call::Repair => counters.repair_calls += 1,
+        }
         let evaluation = match call {
             Call::Propose => self.model.propose(query)?,
             Call::Reply => self.model.reply(query)?,
             Call::Repair => self.model.repair(query)?,
         };
         evaluation.validate(legal.len())?;
+        match call {
+            Call::Propose => counters.completed_proposer_calls += 1,
+            Call::Reply => counters.completed_critic_calls += 1,
+            Call::Repair => counters.completed_repair_calls += 1,
+        }
         // Reject a late response even if the provider did not observe cancellation.
         if cancel.load(Ordering::Acquire) {
             return Err(RoleError::Canceled.into());
@@ -824,6 +904,11 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         self.model.accepted_output();
         counters.consumed_role_outputs += 1;
+        match call {
+            Call::Propose => counters.accepted_proposer_outputs += 1,
+            Call::Reply => counters.accepted_critic_outputs += 1,
+            Call::Repair => counters.accepted_repair_outputs += 1,
+        }
         let mut indices: Vec<_> = (0..legal.len()).collect();
         indices.sort_by(|&a, &b| {
             evaluation.logits[b]
@@ -872,10 +957,14 @@ impl<M: RoleModel> PalsEngine<M> {
         if self.nodes[node].terminal.is_some() {
             return Ok(());
         }
+        if self.stopped(limits, cancel).is_some() {
+            return Ok(());
+        }
         if self.nodes[node].evidence.as_ref().is_some_and(|e| {
             e.depth >= limits.cpu_depth && e.scope == CpuScoreScope::CompletedIteration
         }) {
             counters.evidence_cache_hits += 1;
+            counters.consumed_cached_cpu_values += 1;
             return Ok(());
         }
         let remaining = limits.max_cpu_nodes.saturating_sub(counters.cpu_nodes);
@@ -954,6 +1043,9 @@ impl<M: RoleModel> PalsEngine<M> {
                             scope: CpuScoreScope::CompletedIteration,
                         });
                         counters.evidence_cache_hits += 1;
+                        counters.consumed_cpu_tasks += 1;
+                        counters.reused_completed_cpu_tasks_consumed += 1;
+                        counters.consumed_cached_cpu_values += 1;
                     }
                 }
                 return Ok(());
@@ -983,6 +1075,7 @@ impl<M: RoleModel> PalsEngine<M> {
             max_nodes: task_nodes,
             deadline: Some(limits.deadline),
         };
+        counters.cpu_tasks_requested += 1;
         let report = match if matches!(admission, TaskAdmission::Resume { .. }) {
             self.cpu.resume(
                 &self.nodes[node].position,
@@ -999,6 +1092,7 @@ impl<M: RoleModel> PalsEngine<M> {
         } {
             Ok(report) => report,
             Err(error) => {
+                counters.cpu_work_observation_incomplete = true;
                 self.stores.tasks.fail(execution)?;
                 return Err(error.into());
             }
@@ -1007,12 +1101,22 @@ impl<M: RoleModel> PalsEngine<M> {
         counters.cpu_nodes += report.nodes;
         counters.cpu_quiescence_nodes += report.quiescence_nodes;
         counters.cpu_tt_hits += report.tt_hits;
-        if report.score_scope == CpuScoreScope::CompletedIteration {
+        let requested_coverage_complete = report.score_scope == CpuScoreScope::CompletedIteration
+            && report.completed_depth >= limits.cpu_depth;
+        // Actual CPU coverage is complete even when later evidence publication
+        // cannot fit in a bounded store. Publication and consumption are separate.
+        if requested_coverage_complete {
             counters.completed_cpu_tasks += 1;
+        }
+        if report.score_scope == CpuScoreScope::CompletedIteration
+            && report.completed_depth > 0
+            && report.completed_depth < limits.cpu_depth
+        {
+            counters.partial_cpu_iterations += 1;
         }
         // A stopped task retains completed depth evidence, but never pretends to
         // have examined the requested remaining depth or to prove a mate.
-        let observation = self.stores.append_observation(Observation {
+        let observation = match self.stores.append_observation(Observation {
             state: self.nodes[node].state,
             line: None,
             source: stable_id(report.score_provenance),
@@ -1038,21 +1142,36 @@ impl<M: RoleModel> PalsEngine<M> {
             kind: ObservationKind::CpuAnalysis,
             supersedes: None,
             execution: Some(execution),
-        })?;
-        if report.completed_depth >= limits.cpu_depth
-            && report.score_scope == CpuScoreScope::CompletedIteration
-        {
-            self.stores.complete_task(execution, observation)?;
+        }) {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.nodes[node].resume = None;
+                self.stores.tasks.fail(execution)?;
+                return Err(error.into());
+            }
+        };
+        if requested_coverage_complete {
+            if let Err(error) = self.stores.complete_task(execution, observation) {
+                self.nodes[node].resume = None;
+                self.stores.tasks.fail(execution)?;
+                return Err(error.into());
+            }
             self.nodes[node].resume = None;
         } else if let Some(token) = report.resume {
             self.nodes[node].resume = Some(token);
-            self.stores
-                .pause_task(execution, node as u64, Some(observation))?;
+            if let Err(error) = self
+                .stores
+                .pause_task(execution, node as u64, Some(observation))
+            {
+                self.nodes[node].resume = None;
+                self.stores.tasks.fail(execution)?;
+                return Err(error.into());
+            }
         } else {
             self.stores.tasks.fail(execution)?;
         }
         if self.stopped(limits, cancel).is_none() {
-            if report.completed_depth >= limits.cpu_depth {
+            if requested_coverage_complete {
                 match self
                     .stores
                     .consume_task(execution, consumer_id, self.tick_at(Instant::now()))
@@ -1070,6 +1189,13 @@ impl<M: RoleModel> PalsEngine<M> {
                 depth: report.completed_depth,
                 scope: report.score_scope,
             });
+            if requested_coverage_complete {
+                counters.consumed_cpu_tasks += 1;
+            } else if report.score_scope == CpuScoreScope::CompletedIteration {
+                counters.consumed_partial_cpu_values += 1;
+            } else if report.score_scope == CpuScoreScope::FrontierOnly {
+                counters.consumed_frontier_cpu_values += 1;
+            }
             // Register exactly the situation and active root which depend on this
             // evidence. Evicting derived model memory will not remove these facts.
             self.stores
@@ -1295,6 +1421,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 .into());
             }
             counters.role_calls += 1;
+            counters.critic_calls += 1;
             let scores = self.model.divergences(DivergenceQuery {
                 root: &self.nodes[root].position,
                 proposal: &proposal,
@@ -1307,6 +1434,7 @@ impl<M: RoleModel> PalsEngine<M> {
             if scores.len() != divergences.len() || scores.iter().any(|v| !v.is_finite()) {
                 return Err(RoleError::InvalidOutput.into());
             }
+            counters.completed_critic_calls += 1;
             if cancel.load(Ordering::Acquire) {
                 return Err(RoleError::Canceled.into());
             }
@@ -1315,6 +1443,7 @@ impl<M: RoleModel> PalsEngine<M> {
             }
             self.model.accepted_output();
             counters.consumed_role_outputs += 1;
+            counters.accepted_critic_outputs += 1;
             let mut ranked: Vec<_> = (0..divergences.len()).collect();
             ranked.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
             // Aging rotates among divergence sites: low-prior sites eventually run.
@@ -1502,8 +1631,11 @@ impl<M: RoleModel> PalsEngine<M> {
         progress: &mut dyn FnMut(BoardMove),
     ) -> Result<(), PalsError> {
         if let Some(stop) = self.stopped(limits, cancel) {
-            return Err(match stop { PalsCompletion::Canceled => RoleError::Canceled,
-                _ => RoleError::Deadline }.into());
+            return Err(match stop {
+                PalsCompletion::Canceled => RoleError::Canceled,
+                _ => RoleError::Deadline,
+            }
+            .into());
         }
         let mut best = None;
         let mut best_score = None;
@@ -1532,8 +1664,11 @@ impl<M: RoleModel> PalsEngine<M> {
         // trigger stop. A final round must not report RoundLimit after that
         // callback crossed the deadline/cancellation boundary.
         if let Some(stop) = self.stopped(limits, cancel) {
-            return Err(match stop { PalsCompletion::Canceled => RoleError::Canceled,
-                _ => RoleError::Deadline }.into());
+            return Err(match stop {
+                PalsCompletion::Canceled => RoleError::Canceled,
+                _ => RoleError::Deadline,
+            }
+            .into());
         }
         Ok(())
     }
@@ -1761,6 +1896,90 @@ mod tests {
         assert_eq!(result.counters.supported_repairs, 0);
     }
     #[test]
+    fn completed_shallower_iteration_remains_partial_and_does_not_complete_the_requested_task() {
+        let position = Position::startpos();
+        let config = CpuConfig {
+            max_depth: 4,
+            tt_entries: 128,
+            quiescence_ply: 8,
+            ..CpuConfig::default()
+        };
+        // Obtain the actual work needed for depth one using a fresh identical
+        // CPU owner. Give the depth-two request exactly that finite node budget.
+        let depth_one = CpuEngine::new(config.clone())
+            .unwrap()
+            .analyze(
+                &position,
+                CpuLimits {
+                    max_depth: 1,
+                    max_nodes: 100_000,
+                    deadline: None,
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(depth_one.completed_depth, 1);
+        assert_eq!(depth_one.score_scope, CpuScoreScope::CompletedIteration);
+        let mut engine = PalsEngine::new(
+            PalsConfig {
+                cpu_nodes_per_task: depth_one.nodes,
+                ..PalsConfig::default()
+            },
+            LegalOrderRoleMock,
+            CpuEngine::new(config).unwrap(),
+        )
+        .unwrap();
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine.intern(position).unwrap();
+        let mut counters = PalsCounters::default();
+        engine
+            .verify(
+                root,
+                &[],
+                PalsLimits {
+                    cpu_depth: 2,
+                    max_cpu_nodes: depth_one.nodes,
+                    ..limits()
+                },
+                &AtomicBool::new(false),
+                &mut counters,
+            )
+            .unwrap();
+        assert_eq!(counters.cpu_tasks, 1);
+        assert_eq!(counters.completed_cpu_tasks, 0);
+        assert_eq!(counters.partial_cpu_iterations, 1);
+        assert_eq!(counters.consumed_cpu_tasks, 0);
+        assert_eq!(counters.consumed_partial_cpu_values, 1);
+        assert_eq!(counters.consumed_frontier_cpu_values, 0);
+        let partial = engine.nodes[root].evidence.as_ref().unwrap();
+        assert_eq!(partial.depth, 1);
+        assert_eq!(partial.scope, CpuScoreScope::CompletedIteration);
+        assert_eq!(engine.value(root, 0), Some(partial.score));
+        assert_eq!(engine.completed_line_value(root, 0, 2), None);
+        let task = engine
+            .stores
+            .tasks
+            .get(super::super::store::ExecutionId(0))
+            .unwrap();
+        assert_eq!(task.key.requested_depth, 2);
+        assert!(matches!(
+            task.status,
+            super::super::store::TaskStatus::Paused {
+                evidence: Some(_),
+                ..
+            }
+        ));
+        let partial_record = engine.records().last().unwrap();
+        assert_eq!(partial_record.completed_depth, 1);
+        assert_eq!(
+            partial_record.score_scope,
+            Some(CpuScoreScope::CompletedIteration)
+        );
+    }
+    #[test]
     fn role_budget_is_not_storage_failure_and_unexamined_reply_count_is_unknown() {
         let mut engine = PalsEngine::new(
             PalsConfig {
@@ -1810,6 +2029,18 @@ mod tests {
         assert!(position.legal_moves().contains(&result.best_move.unwrap()));
         assert_eq!(result.value_scope, PalsValueScope::Unknown);
         assert_eq!(engine.retained_situations(), 257);
+        // A capacity fallback still classifies Rules-terminal positions. Legal
+        // geometric moves in an automatic draw are not unknown game branches.
+        let terminal = Position::from_fen("8/8/8/8/8/8/6k1/K7 w - - 0 1").unwrap();
+        assert!(!terminal.legal_moves().is_empty());
+        let result = engine
+            .search(&terminal, limits(), &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(result.completion, PalsCompletion::Terminal);
+        assert!(result.terminal.is_some());
+        assert!(result.root_values.is_empty());
+        assert_eq!(result.counters.unknown_root_children, 0);
+        assert!(result.counters.root_scope_observation_complete);
     }
     #[test]
     fn widening_admits_low_prior_roots_and_derived_eviction_keeps_completed_work() {
@@ -1910,7 +2141,14 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    enum AcceptanceBehavior { Normal, Malformed, LateCancel, LateDivergence, KnownDeadline, PhysicalUnknown }
+    enum AcceptanceBehavior {
+        Normal,
+        Malformed,
+        LateCancel,
+        LateDivergence,
+        KnownDeadline,
+        PhysicalUnknown,
+    }
 
     struct AcceptanceProbe {
         accepted: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -1919,20 +2157,31 @@ mod tests {
         bad_divergences: bool,
     }
     impl RoleModel for AcceptanceProbe {
-        fn identity(&self) -> &str { "acceptance-probe-test" }
+        fn identity(&self) -> &str {
+            "acceptance-probe-test"
+        }
         fn propose(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
             let mut output = LegalOrderRoleMock::evaluate(RoleQuery {
-                position: query.position, legal: query.legal, prefix: query.prefix,
-                proposal: query.proposal, counterexample: query.counterexample,
-                records: query.records, revision: query.revision, deadline: query.deadline,
+                position: query.position,
+                legal: query.legal,
+                prefix: query.prefix,
+                proposal: query.proposal,
+                counterexample: query.counterexample,
+                records: query.records,
+                revision: query.revision,
+                deadline: query.deadline,
                 cancel: query.cancel,
             })?;
             match self.behavior {
-                AcceptanceBehavior::Normal | AcceptanceBehavior::LateDivergence => {},
-                AcceptanceBehavior::Malformed => { output.logits.pop(); },
+                AcceptanceBehavior::Normal | AcceptanceBehavior::LateDivergence => {}
+                AcceptanceBehavior::Malformed => {
+                    output.logits.pop();
+                }
                 AcceptanceBehavior::LateCancel => query.cancel.store(true, Ordering::Release),
                 AcceptanceBehavior::KnownDeadline => return Err(RoleError::Deadline),
-                AcceptanceBehavior::PhysicalUnknown => return Err(RoleError::PhysicalCompletionUnknown),
+                AcceptanceBehavior::PhysicalUnknown => {
+                    return Err(RoleError::PhysicalCompletionUnknown);
+                }
             }
             self.returned.fetch_add(1, Ordering::SeqCst);
             Ok(output)
@@ -1948,70 +2197,331 @@ mod tests {
             if matches!(self.behavior, AcceptanceBehavior::LateDivergence) {
                 query.cancel.store(true, Ordering::Release);
             }
-            Ok(if self.bad_divergences { Vec::new() } else { vec![0.0; query.candidates.len()] })
+            Ok(if self.bad_divergences {
+                Vec::new()
+            } else {
+                vec![0.0; query.candidates.len()]
+            })
         }
-        fn accepted_output(&mut self) { self.accepted.fetch_add(1, Ordering::SeqCst); }
+        fn accepted_output(&mut self) {
+            self.accepted.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
-    fn acceptance_probe(behavior: AcceptanceBehavior, bad_divergences: bool)
-        -> (PalsEngine<Box<dyn RoleModel>>, std::sync::Arc<std::sync::atomic::AtomicU64>,
-            std::sync::Arc<std::sync::atomic::AtomicU64>) {
+    fn acceptance_probe(
+        behavior: AcceptanceBehavior,
+        bad_divergences: bool,
+    ) -> (
+        PalsEngine<Box<dyn RoleModel>>,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
         let accepted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let returned = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let model: Box<dyn RoleModel> = Box::new(AcceptanceProbe {
-            accepted: accepted.clone(), returned: returned.clone(), behavior, bad_divergences,
+            accepted: accepted.clone(),
+            returned: returned.clone(),
+            behavior,
+            bad_divergences,
         });
-        (PalsEngine::new(PalsConfig::default(), model,
-            CpuEngine::new(CpuConfig::default()).unwrap()).unwrap(), accepted, returned)
+        (
+            PalsEngine::new(
+                PalsConfig::default(),
+                model,
+                CpuEngine::new(CpuConfig::default()).unwrap(),
+            )
+            .unwrap(),
+            accepted,
+            returned,
+        )
     }
 
     #[test]
     fn accepted_hook_counts_actual_consumption_including_boxed_divergences() {
         let (mut engine, accepted, returned) = acceptance_probe(AcceptanceBehavior::Normal, false);
-        let result = engine.search(&Position::startpos(), limits(), &AtomicBool::new(false)).unwrap();
+        let result = engine
+            .search(&Position::startpos(), limits(), &AtomicBool::new(false))
+            .unwrap();
         assert!(result.counters.refutations > 0);
-        assert_eq!(accepted.load(Ordering::SeqCst), result.counters.consumed_role_outputs);
-        assert_eq!(accepted.load(Ordering::SeqCst), returned.load(Ordering::SeqCst));
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            result.counters.consumed_role_outputs
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            returned.load(Ordering::SeqCst)
+        );
         assert!(accepted.load(Ordering::SeqCst) > 0);
     }
 
     #[test]
     fn malformed_and_late_outputs_do_not_acknowledge_consumption() {
-        for behavior in [AcceptanceBehavior::Malformed, AcceptanceBehavior::LateCancel] {
+        for behavior in [
+            AcceptanceBehavior::Malformed,
+            AcceptanceBehavior::LateCancel,
+        ] {
             let (mut engine, accepted, returned) = acceptance_probe(behavior, false);
             let result = engine.search(&Position::startpos(), limits(), &AtomicBool::new(false));
             match behavior {
-                AcceptanceBehavior::Malformed => assert!(matches!(result,
-                    Err(PalsError::Role(RoleError::InvalidOutput)))),
-                AcceptanceBehavior::LateCancel => assert_eq!(result.unwrap().completion, PalsCompletion::Canceled),
+                AcceptanceBehavior::Malformed => assert!(matches!(
+                    result,
+                    Err(PalsError::Role(RoleError::InvalidOutput))
+                )),
+                AcceptanceBehavior::LateCancel => {
+                    assert_eq!(result.unwrap().completion, PalsCompletion::Canceled)
+                }
                 _ => unreachable!(),
             }
             assert_eq!(returned.load(Ordering::SeqCst), 1);
             assert_eq!(accepted.load(Ordering::SeqCst), 0);
         }
         let (mut engine, accepted, returned) = acceptance_probe(AcceptanceBehavior::Normal, true);
-        assert!(matches!(engine.search(&Position::startpos(), limits(), &AtomicBool::new(false)),
-            Err(PalsError::Role(RoleError::InvalidOutput))));
-        assert_eq!(returned.load(Ordering::SeqCst), accepted.load(Ordering::SeqCst) + 1);
-        let (mut engine, accepted, returned) = acceptance_probe(AcceptanceBehavior::LateDivergence, false);
-        let result = engine.search(&Position::startpos(), limits(), &AtomicBool::new(false)).unwrap();
+        assert!(matches!(
+            engine.search(&Position::startpos(), limits(), &AtomicBool::new(false)),
+            Err(PalsError::Role(RoleError::InvalidOutput))
+        ));
+        assert_eq!(
+            returned.load(Ordering::SeqCst),
+            accepted.load(Ordering::SeqCst) + 1
+        );
+        let (mut engine, accepted, returned) =
+            acceptance_probe(AcceptanceBehavior::LateDivergence, false);
+        let result = engine
+            .search(&Position::startpos(), limits(), &AtomicBool::new(false))
+            .unwrap();
         assert_eq!(result.completion, PalsCompletion::Canceled);
-        assert_eq!(returned.load(Ordering::SeqCst), accepted.load(Ordering::SeqCst) + 1);
-        assert_eq!(result.counters.consumed_role_outputs, accepted.load(Ordering::SeqCst));
+        assert_eq!(
+            returned.load(Ordering::SeqCst),
+            accepted.load(Ordering::SeqCst) + 1
+        );
+        assert_eq!(
+            result.counters.consumed_role_outputs,
+            accepted.load(Ordering::SeqCst)
+        );
     }
 
     #[test]
     fn known_deadline_and_unknown_physical_completion_have_different_outcomes_and_no_consumption() {
-        for behavior in [AcceptanceBehavior::KnownDeadline, AcceptanceBehavior::PhysicalUnknown] {
+        for behavior in [
+            AcceptanceBehavior::KnownDeadline,
+            AcceptanceBehavior::PhysicalUnknown,
+        ] {
             let (mut engine, accepted, _) = acceptance_probe(behavior, false);
             let result = engine.search(&Position::startpos(), limits(), &AtomicBool::new(false));
             match behavior {
-                AcceptanceBehavior::KnownDeadline => assert_eq!(result.unwrap().completion, PalsCompletion::Deadline),
-                AcceptanceBehavior::PhysicalUnknown => assert!(matches!(result,
-                    Err(PalsError::Role(RoleError::PhysicalCompletionUnknown)))),
+                AcceptanceBehavior::KnownDeadline => {
+                    assert_eq!(result.unwrap().completion, PalsCompletion::Deadline)
+                }
+                AcceptanceBehavior::PhysicalUnknown => assert!(matches!(
+                    result,
+                    Err(PalsError::Role(RoleError::PhysicalCompletionUnknown))
+                )),
                 _ => unreachable!(),
             }
             assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn task_reuse_consumption_is_distinct_from_existing_node_evidence_reuse() {
+        let position = Position::startpos();
+        let mut engine = engine();
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine.intern(position).unwrap();
+        let mut initial = PalsCounters::default();
+        engine
+            .verify(root, &[], limits(), &AtomicBool::new(false), &mut initial)
+            .unwrap();
+        assert_eq!(initial.cpu_tasks_requested, 1);
+        assert_eq!(initial.completed_cpu_tasks, 1);
+        assert_eq!(initial.consumed_cpu_tasks, 1);
+        assert_eq!(initial.reused_completed_cpu_tasks_consumed, 0);
+        let mut node_reuse = PalsCounters::default();
+        engine
+            .verify(
+                root,
+                &[],
+                limits(),
+                &AtomicBool::new(false),
+                &mut node_reuse,
+            )
+            .unwrap();
+        assert_eq!(node_reuse.evidence_cache_hits, 1);
+        assert_eq!(node_reuse.consumed_cached_cpu_values, 1);
+        assert_eq!(node_reuse.reused_completed_cpu_tasks_consumed, 0);
+        assert_eq!(node_reuse.consumed_cpu_tasks, 0);
+        // Evict only the derived node projection, retaining the immutable
+        // completed task and observation. A new task consumer can now reuse it.
+        engine.nodes[root].evidence = None;
+        let mut task_reuse = PalsCounters::default();
+        engine
+            .verify(
+                root,
+                &[],
+                limits(),
+                &AtomicBool::new(false),
+                &mut task_reuse,
+            )
+            .unwrap();
+        assert_eq!(task_reuse.cpu_tasks_requested, 0);
+        assert_eq!(task_reuse.completed_cpu_tasks, 0);
+        assert_eq!(task_reuse.consumed_cpu_tasks, 1);
+        assert_eq!(task_reuse.reused_completed_cpu_tasks_consumed, 1);
+        assert_eq!(task_reuse.consumed_cached_cpu_values, 1);
+    }
+
+    #[test]
+    fn completed_cpu_report_survives_failed_bounded_evidence_publication_without_consumption() {
+        let position = Position::startpos();
+        let mut engine = engine();
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine.intern(position).unwrap();
+        // A zero-capacity evidence store simulates exhausted retained evidence;
+        // CPU work must still be observed and its in-flight task must be closed.
+        engine.stores.observations = super::super::store::ObservationStore::new(0);
+        let mut counters = PalsCounters::default();
+        assert!(matches!(
+            engine.verify(root, &[], limits(), &AtomicBool::new(false), &mut counters),
+            Err(PalsError::Capacity)
+        ));
+        assert_eq!(counters.cpu_tasks_requested, 1);
+        assert_eq!(counters.cpu_tasks, 1);
+        assert!(counters.cpu_nodes > 0);
+        assert_eq!(counters.completed_cpu_tasks, 1);
+        assert_eq!(counters.consumed_cpu_tasks, 0);
+        assert!(!counters.cpu_work_observation_incomplete);
+        assert!(matches!(
+            engine
+                .stores
+                .tasks
+                .get(super::super::store::ExecutionId(0))
+                .unwrap()
+                .status,
+            super::super::store::TaskStatus::Failed
+        ));
+        assert!(engine.nodes[root].evidence.is_none());
+        assert!(engine.nodes[root].resume.is_none());
+    }
+
+    #[test]
+    fn failed_cpu_execution_keeps_requested_work_snapshot_and_marks_missing_report() {
+        use crate::cpu_value::{
+            BootstrapCpuValue, CpuAccumulator, CpuAccumulatorUndo, CpuValueError,
+            CpuValueEvaluator, CpuValueIdentity,
+        };
+        struct FailingCpuValue {
+            base: BootstrapCpuValue,
+            scores: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        }
+        impl CpuValueEvaluator for FailingCpuValue {
+            fn identity(&self) -> &CpuValueIdentity {
+                self.base.identity()
+            }
+            fn provenance(&self) -> &'static str {
+                "failing-after-root-value-test"
+            }
+            fn initialize(&self, position: &Position) -> Result<CpuAccumulator, CpuValueError> {
+                self.base.initialize(position)
+            }
+            fn score(
+                &self,
+                accumulator: &CpuAccumulator,
+                position: &Position,
+            ) -> Result<i32, CpuValueError> {
+                let value = self.base.score(accumulator, position)?;
+                if self.scores.fetch_add(1, Ordering::SeqCst) > 0 {
+                    Err(CpuValueError::NonFiniteForward)
+                } else {
+                    Ok(value)
+                }
+            }
+            fn apply_delta(
+                &self,
+                accumulator: &mut CpuAccumulator,
+                delta: &rz_position::RuleMoveDelta,
+            ) -> Result<CpuAccumulatorUndo, CpuValueError> {
+                self.base.apply_delta(accumulator, delta)
+            }
+            fn restore(
+                &self,
+                accumulator: &mut CpuAccumulator,
+                undo: CpuAccumulatorUndo,
+                position: &Position,
+            ) -> Result<(), CpuValueError> {
+                self.base.restore(accumulator, undo, position)
+            }
+        }
+        let scores = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cpu = CpuEngine::with_evaluator(
+            CpuConfig::default(),
+            std::sync::Arc::new(FailingCpuValue {
+                base: BootstrapCpuValue::default(),
+                scores: scores.clone(),
+            }),
+        )
+        .unwrap();
+        let mut engine = PalsEngine::new(PalsConfig::default(), LegalOrderRoleMock, cpu).unwrap();
+        assert!(matches!(
+            engine.search(&Position::startpos(), limits(), &AtomicBool::new(false)),
+            Err(PalsError::Cpu(CpuError::Value(
+                CpuValueError::NonFiniteForward
+            )))
+        ));
+        let snapshot = engine.last_search_counters().unwrap();
+        assert_eq!(snapshot.cpu_tasks_requested, 1);
+        assert_eq!(snapshot.cpu_tasks, 0);
+        assert_eq!(snapshot.completed_cpu_tasks, 0);
+        assert_eq!(snapshot.consumed_cpu_tasks, 0);
+        assert!(snapshot.cpu_work_observation_incomplete);
+        assert!(!snapshot.root_scope_observation_complete);
+        assert!(scores.load(Ordering::SeqCst) >= 2);
+        assert!(snapshot.proposer_calls > 0);
+        assert_eq!(
+            snapshot.accepted_proposer_outputs,
+            snapshot.completed_proposer_calls
+        );
+        assert_eq!(
+            snapshot.role_calls,
+            snapshot.proposer_calls + snapshot.critic_calls + snapshot.repair_calls
+        );
+        engine.new_game();
+        assert_eq!(engine.last_search_counters(), None);
+    }
+
+    #[test]
+    fn role_error_and_late_valid_output_keep_distinct_dispatch_completion_consumption_snapshots() {
+        for behavior in [
+            AcceptanceBehavior::PhysicalUnknown,
+            AcceptanceBehavior::LateCancel,
+        ] {
+            let (mut engine, accepted, _) = acceptance_probe(behavior, false);
+            let result = engine.search(&Position::startpos(), limits(), &AtomicBool::new(false));
+            let snapshot = engine.last_search_counters().unwrap();
+            assert_eq!(snapshot.role_calls, 1);
+            assert_eq!(snapshot.proposer_calls, 1);
+            assert_eq!(snapshot.accepted_proposer_outputs, 0);
+            assert_eq!(snapshot.consumed_role_outputs, 0);
+            assert_eq!(accepted.load(Ordering::SeqCst), 0);
+            match behavior {
+                AcceptanceBehavior::PhysicalUnknown => {
+                    assert!(matches!(
+                        result,
+                        Err(PalsError::Role(RoleError::PhysicalCompletionUnknown))
+                    ));
+                    assert_eq!(snapshot.completed_proposer_calls, 0);
+                }
+                AcceptanceBehavior::LateCancel => {
+                    assert_eq!(result.unwrap().completion, PalsCompletion::Canceled);
+                    assert_eq!(snapshot.completed_proposer_calls, 1);
+                }
+                _ => unreachable!(),
+            }
         }
     }
 
@@ -2020,17 +2530,34 @@ mod tests {
         let (mut engine, accepted, returned) = acceptance_probe(AcceptanceBehavior::Normal, false);
         let deadline = Instant::now() + Duration::from_millis(500);
         let mut progress_calls = 0;
-        let result = engine.search_with_progress(&Position::startpos(), PalsLimits {
-            deadline, ..limits()
-        }, &AtomicBool::new(false), |_| {
-            progress_calls += 1;
-            std::thread::sleep(deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(2));
-        }).unwrap();
+        let result = engine
+            .search_with_progress(
+                &Position::startpos(),
+                PalsLimits {
+                    deadline,
+                    ..limits()
+                },
+                &AtomicBool::new(false),
+                |_| {
+                    progress_calls += 1;
+                    std::thread::sleep(
+                        deadline.saturating_duration_since(Instant::now())
+                            + Duration::from_millis(2),
+                    );
+                },
+            )
+            .unwrap();
         assert_eq!(progress_calls, 1);
         assert_eq!(result.completion, PalsCompletion::Deadline);
         assert_eq!(result.counters.refutations, 0);
         assert_eq!(result.counters.repairs, 0);
-        assert_eq!(accepted.load(Ordering::SeqCst), returned.load(Ordering::SeqCst));
-        assert_eq!(result.counters.consumed_role_outputs, accepted.load(Ordering::SeqCst));
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            returned.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            result.counters.consumed_role_outputs,
+            accepted.load(Ordering::SeqCst)
+        );
     }
 }

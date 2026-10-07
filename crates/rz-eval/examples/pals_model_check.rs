@@ -6,7 +6,8 @@ use rz_eval::pals_model::{
     PalsModelConfig, PalsModelInput, PalsRawOutput, PalsRole, PALS_MODEL_SCHEMA,
 };
 use rz_eval::pals_onnx::{
-    PalsNativeCommand, PalsNativeResult, PalsOnnxBackend, PalsOnnxConfig, PalsPublicMemoryWitness,
+    PalsBackendStats, PalsNativeCommand, PalsNativeResult, PalsOnnxBackend, PalsOnnxConfig,
+    PalsPublicMemoryWitness,
 };
 use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeCache};
 use rz_eval::worker::PhysicalPoll;
@@ -217,6 +218,16 @@ fn outside_git(path: &Path) -> Result<(), Box<dyn Error>> {
 fn hex_digest(value: &[u8; 32]) -> String {
     value.iter().map(|v| format!("{v:02x}")).collect()
 }
+fn stats_json(stats: &PalsBackendStats) -> serde_json::Value {
+    json!({"admitted_role_requests":stats.admitted_role_requests,
+        "public_cache_hits":stats.public_cache_hits,"public_cache_misses":stats.public_cache_misses,
+        "public_nn_runs_attempted":stats.public_nn_runs_attempted,"public_nn_runs_completed":stats.public_nn_runs_completed,
+        "public_nn_runs_failed_known":stats.public_nn_runs_failed_known,
+        "role_nn_runs_attempted":stats.role_nn_runs_attempted,"role_nn_runs_completed":stats.role_nn_runs_completed,
+        "role_nn_runs_failed_known":stats.role_nn_runs_failed_known,"completed_nn_inputs":stats.completed_nn_inputs,
+        "validated_public_outputs":stats.validated_public_outputs,"validated_role_outputs":stats.validated_role_outputs,
+        "new_game_resets":stats.new_game_resets,"live_public_cache_entries":stats.live_public_cache_entries})
+}
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if !(8..=9).contains(&args.len()) {
@@ -334,6 +345,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     fresh.verify_runtime()?;
     drop(fresh);
+    let before_worker_stats = backend.snapshot_stats()?;
     let mut worker = backend.controlled_worker()?;
     let mut reset = worker.submit(PalsNativeCommand::NewGame)?;
     let reset_deadline = Instant::now() + Duration::from_secs(30);
@@ -343,6 +355,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             PhysicalPoll::Ready(Err(error)) => return Err(error.into()),
             PhysicalPoll::Ready(Ok(PalsNativeResult::Evaluation(_))) => {
                 return Err("cache reset unexpectedly returned a neural evaluation".into());
+            }
+            PhysicalPoll::Ready(Ok(PalsNativeResult::Stats(_))) => {
+                return Err("cache reset unexpectedly returned native statistics".into())
             }
             PhysicalPoll::Quarantined => {
                 return Err("new game cache reset remains quarantined".into())
@@ -368,6 +383,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     PalsNativeResult::NewGame => {
                         return Err("evaluation unexpectedly returned a cache reset".into())
                     }
+                    PalsNativeResult::Stats(_) => {
+                        return Err("evaluation unexpectedly returned native statistics".into())
+                    }
                 }
                 break;
             }
@@ -381,6 +399,39 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err("physical lease still live at finite check deadline".into());
         }
         std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut snapshot = worker.submit(PalsNativeCommand::SnapshotStats)?;
+    let stats_deadline = Instant::now() + Duration::from_secs(30);
+    let stats = loop {
+        match snapshot.poll() {
+            PhysicalPoll::Ready(Ok(PalsNativeResult::Stats(stats))) => break stats,
+            PhysicalPoll::Ready(Err(error)) => return Err(error.into()),
+            PhysicalPoll::Ready(Ok(_)) => {
+                return Err("native statistics returned another command response".into())
+            }
+            PhysicalPoll::Quarantined => {
+                return Err("native statistics cannot confirm unknown physical completion".into())
+            }
+            PhysicalPoll::Consumed => return Err("native statistics completed twice".into()),
+            PhysicalPoll::Pending if Instant::now() < stats_deadline => {
+                std::thread::sleep(Duration::from_millis(1))
+            }
+            PhysicalPoll::Pending => {
+                return Err("native statistics have no physical ACK before deadline".into())
+            }
+        }
+    };
+    stats.validate()?;
+    if stats.admitted_role_requests != before_worker_stats.admitted_role_requests + 1
+        || stats.role_nn_runs_attempted != before_worker_stats.role_nn_runs_attempted + 1
+        || stats.role_nn_runs_completed != before_worker_stats.role_nn_runs_completed + 1
+        || stats.public_nn_runs_attempted != before_worker_stats.public_nn_runs_attempted + 1
+        || stats.public_nn_runs_completed != before_worker_stats.public_nn_runs_completed + 1
+        || stats.completed_nn_inputs != before_worker_stats.completed_nn_inputs + 2
+        || stats.new_game_resets != before_worker_stats.new_game_resets + 1
+        || stats.live_public_cache_entries != 1
+    {
+        return Err("NewGame/SnapshotStats control changed NN accounting or failed to force fresh public encode".into());
     }
     let shutdown_deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -401,7 +452,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         "provider":if is_cuda {"CUDAExecutionProvider"} else {"CPUExecutionProvider"},"precision":"fp32","tf32":false,
         "physical_completion":"confirmed","physical_shutdown":"confirmed","public_encodes":public_encodes,
         "public_cache_hits":public_cache_hits,"fresh_cache_equivalence":"passed","private_role_repeat":"passed",
+        "public_counter_scope":"six_reference_cases_before_new_game_checks",
         "v_rejection":"passed","new_game_cache_reset":"passed","new_game_physical_ack":"confirmed",
+        "stats_physical_ack":"confirmed","control_neural_runs":"zero","backend_stats":stats_json(&stats),
+        "backend_stats_scope":"backend_lifetime_through_final_snapshot_ack",
         "device_public_memory":config.device_public_memory,"session_residency":residency,"vram_peak":"unknown","cases":reports});
     let mut output = std::fs::OpenOptions::new()
         .create_new(true)

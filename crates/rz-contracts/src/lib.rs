@@ -5,9 +5,9 @@
 #![forbid(unsafe_code)]
 
 mod evaluation;
+pub mod pals;
 mod primitives;
 mod state;
-pub mod pals;
 
 pub use evaluation::*;
 pub use primitives::*;

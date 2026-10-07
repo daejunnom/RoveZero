@@ -2,11 +2,11 @@
 #![forbid(unsafe_code)]
 
 pub mod contract_time;
+pub mod contracts;
 pub mod cpu;
 pub mod cpu_value;
-pub mod pals;
-pub mod contracts;
 pub mod driver;
+pub mod pals;
 pub mod policy;
 pub mod time;
 pub mod tree;

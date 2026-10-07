@@ -70,6 +70,30 @@ impl Default for CpuConfig {
     }
 }
 
+impl CpuConfig {
+    /// Requested contiguous TT slot layout in bytes on the current build target.
+    /// Zero slots disables the TT and returns zero. This excludes allocations
+    /// retained by entry identities, allocator rounding/bookkeeping, the Vec
+    /// header and search history; it is neither total TT usage nor memory peak.
+    /// `try_reserve_exact` may still receive a larger capacity from the allocator.
+    pub fn tt_allocation_bytes(&self) -> Result<u64, CpuError> {
+        if self.tt_entries > MAX_TT_ENTRIES {
+            return Err(CpuError::InvalidConfig("TT exceeds 1,048,576 slots"));
+        }
+        checked_inline_slot_bytes(self.tt_entries, std::mem::size_of::<Option<TtEntry>>())
+    }
+}
+
+fn checked_inline_slot_bytes(entries: usize, slot_bytes: usize) -> Result<u64, CpuError> {
+    let bytes = entries
+        .checked_mul(slot_bytes)
+        .ok_or(CpuError::InvalidConfig(
+            "TT slot bytes overflow address space",
+        ))?;
+    u64::try_from(bytes)
+        .map_err(|_| CpuError::InvalidConfig("TT slot bytes cannot be represented as u64"))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct CpuLimits {
     pub max_depth: u16,
@@ -260,9 +284,7 @@ impl CpuEngine {
         config: CpuConfig,
         evaluator: Arc<dyn CpuValueEvaluator>,
     ) -> Result<Self, CpuError> {
-        if config.tt_entries > MAX_TT_ENTRIES {
-            return Err(CpuError::InvalidConfig("TT exceeds 1,048,576 slots"));
-        }
+        config.tt_allocation_bytes()?;
         if config.max_depth == 0 || config.max_depth > MAX_DEPTH {
             return Err(CpuError::InvalidConfig("depth must be in 1..=64"));
         }
@@ -1478,6 +1500,38 @@ mod tests {
             from_tt_score(to_tt_score(CPU_MATE_SCORE - 5, 3), 1),
             CPU_MATE_SCORE - 3
         );
+    }
+
+    #[test]
+    fn tt_slot_allocation_bytes_are_bounded_layout_not_peak() {
+        let slot_bytes = std::mem::size_of::<Option<TtEntry>>();
+        for entries in [0, 1, 8192, MAX_TT_ENTRIES] {
+            let config = CpuConfig {
+                tt_entries: entries,
+                ..CpuConfig::default()
+            };
+            assert_eq!(
+                config.tt_allocation_bytes().unwrap(),
+                (entries * slot_bytes) as u64
+            );
+        }
+        for entries in [MAX_TT_ENTRIES + 1, usize::MAX] {
+            assert!(matches!(
+                CpuConfig {
+                    tt_entries: entries,
+                    ..CpuConfig::default()
+                }
+                .tt_allocation_bytes(),
+                Err(CpuError::InvalidConfig(_))
+            ));
+        }
+        assert_eq!(checked_inline_slot_bytes(0, usize::MAX).unwrap(), 0);
+        assert!(matches!(
+            checked_inline_slot_bytes(usize::MAX, 2),
+            Err(CpuError::InvalidConfig(
+                "TT slot bytes overflow address space"
+            ))
+        ));
     }
 
     #[test]
