@@ -10,6 +10,10 @@ pub const PALS_MODEL_SCHEMA: &str = "rovezero.pals-model.v1";
 pub const PALS_ENCODING_SCHEMA: &str = "rovezero.pals-board-records.v1";
 pub const METADATA_FEATURES: usize = 16;
 pub const RECORD_FEATURES: usize = 16;
+/// Only the registered encoder's independent record projection, never the
+/// full observation/task identity or an assertion of numerical equivalence.
+pub const INDEPENDENT_RECORD_PROJECTION_SEMANTICS: &str =
+    "rz-pals-independent-record-fp32/1;16-feature-bits;four-fields;no-record-position;no-cross-record-context";
 pub const QUERY_FEATURES: usize = 16;
 pub const DIVERGENCE_FEATURES: usize = 8;
 /// Same ordered vocabulary as the versioned verifier-data contract.
@@ -157,6 +161,46 @@ pub struct PalsModelInput {
     pub model_epoch: [u8; 32],
 }
 impl PalsModelInput {
+    /// Physical projection identities leave the full canonical input unchanged.
+    /// The empty view keeps its actual zero-feature, false-mask padding slot.
+    pub fn independent_public_plan(
+        &self,
+        config: &PalsModelConfig,
+    ) -> Result<IndependentPublicPlan, PalsModelError> {
+        self.validate(config)?;
+        let mut board = Sha256::new();
+        board.update(b"rz-pals-contextual-board-fp32/1");
+        board.update(self.model_epoch);
+        board.update(&self.board);
+        for value in self.metadata {
+            board.update(value.to_bits().to_le_bytes());
+        }
+        let features: Vec<_> = if self.records.is_empty() {
+            vec![[0.; RECORD_FEATURES]]
+        } else {
+            self.records.iter().map(|record| record.features).collect()
+        };
+        let record_contents = features
+            .iter()
+            .map(|values| {
+                let mut hash = Sha256::new();
+                hash.update(INDEPENDENT_RECORD_PROJECTION_SEMANTICS.as_bytes());
+                hash.update(self.model_epoch);
+                for value in values {
+                    hash.update(value.to_bits().to_le_bytes());
+                }
+                hash.finalize().into()
+            })
+            .collect();
+        Ok(IndependentPublicPlan {
+            board_content: board.finalize().into(),
+            record_contents,
+            features,
+            record_mask: (0..self.records.len().max(1))
+                .map(|index| index < self.records.len())
+                .collect(),
+        })
+    }
     pub fn validate(&self, config: &PalsModelConfig) -> Result<(), PalsModelError> {
         config.validate()?;
         if self.board.len() != 64 || self.board.iter().any(|v| *v > 12) {
@@ -348,6 +392,17 @@ impl PalsModelInput {
             semantic_divergences: self.divergence_features.len(),
         })
     }
+}
+
+/// Ordered full view, with separate allocation identities. Reordering/ID or
+/// critical changes still change the existing full key, even if these exact
+/// independent feature pages can be physically reused.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndependentPublicPlan {
+    pub board_content: [u8; 32],
+    pub record_contents: Vec<[u8; 32]>,
+    pub features: Vec<[f32; RECORD_FEATURES]>,
+    pub record_mask: Vec<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -570,6 +625,127 @@ mod tests {
         assert_ne!(
             a.canonical_input_key(&config).unwrap(),
             b.canonical_input_key(&config).unwrap()
+        );
+    }
+    #[test]
+    fn independent_projection_keeps_full_identity_and_bit_exact_feature_namespace() {
+        let config = PalsModelConfig::baseline();
+        let original = input();
+        let mut changed = original.clone();
+        changed.records[0].record_id = 40;
+        changed.records[0].revision += 1;
+        changed.records[0].critical = false;
+        changed.required_critical_records.clear();
+        changed.history_digest[0] += 1;
+        changed.situation_revision += 1;
+        assert_ne!(
+            original.canonical_input_key(&config).unwrap(),
+            changed.canonical_input_key(&config).unwrap()
+        );
+        assert_ne!(
+            original.public_memory_key(&config).unwrap(),
+            changed.public_memory_key(&config).unwrap()
+        );
+        assert_eq!(
+            original.independent_public_plan(&config).unwrap(),
+            changed.independent_public_plan(&config).unwrap()
+        );
+        let mut negative_zero = original.clone();
+        negative_zero.records[0].features[0] = -0.;
+        assert_ne!(
+            original
+                .independent_public_plan(&config)
+                .unwrap()
+                .record_contents,
+            negative_zero
+                .independent_public_plan(&config)
+                .unwrap()
+                .record_contents
+        );
+        changed = original.clone();
+        changed.metadata[2] = 1.;
+        assert_ne!(
+            original
+                .independent_public_plan(&config)
+                .unwrap()
+                .board_content,
+            changed
+                .independent_public_plan(&config)
+                .unwrap()
+                .board_content
+        );
+        changed = original.clone();
+        changed.model_epoch[0] += 1;
+        assert_ne!(
+            original
+                .independent_public_plan(&config)
+                .unwrap()
+                .record_contents,
+            changed
+                .independent_public_plan(&config)
+                .unwrap()
+                .record_contents
+        );
+    }
+    #[test]
+    fn record_eviction_id_shift_and_reorder_only_change_the_full_view() {
+        let config = PalsModelConfig::baseline();
+        let mut original = input();
+        original.required_critical_records.clear();
+        original.records = (0..128)
+            .map(|index| PalsRecordToken {
+                record_id: index + 1,
+                revision: index + 10,
+                critical: false,
+                features: [index as f32; 16],
+            })
+            .collect();
+        let old = original.independent_public_plan(&config).unwrap();
+        let mut next = original.clone();
+        next.records.remove(0);
+        for (index, record) in next.records.iter_mut().enumerate() {
+            record.record_id = index as u64 + 1;
+        }
+        next.records.push(PalsRecordToken {
+            record_id: 128,
+            revision: 200,
+            critical: false,
+            features: [200.; 16],
+        });
+        let fresh = next.independent_public_plan(&config).unwrap();
+        assert_eq!(&old.record_contents[1..], &fresh.record_contents[..127]);
+        assert_ne!(
+            original.canonical_input_key(&config).unwrap(),
+            next.canonical_input_key(&config).unwrap()
+        );
+        next.records.reverse();
+        assert_eq!(
+            fresh.record_contents.into_iter().rev().collect::<Vec<_>>(),
+            next.independent_public_plan(&config)
+                .unwrap()
+                .record_contents
+        );
+    }
+    #[test]
+    fn empty_record_view_keeps_zero_feature_projection_with_false_mask() {
+        let config = PalsModelConfig::baseline();
+        let present = input();
+        let mut empty = present.clone();
+        empty.records.clear();
+        empty.required_critical_records.clear();
+        let padding = empty.independent_public_plan(&config).unwrap();
+        assert_eq!(padding.features, vec![[0.; 16]]);
+        assert_eq!(padding.record_mask, vec![false]);
+        assert_eq!(
+            padding.record_contents,
+            present
+                .independent_public_plan(&config)
+                .unwrap()
+                .record_contents
+        );
+        assert_ne!(
+            empty.canonical_input_key(&config).unwrap(),
+            present.canonical_input_key(&config).unwrap()
         );
     }
     #[test]

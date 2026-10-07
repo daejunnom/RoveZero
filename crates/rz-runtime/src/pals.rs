@@ -619,6 +619,10 @@ pub enum PublicPageKind {
     /// All 66 board/metadata tokens are contextualized together. Changing any
     /// board input requires a different content identity for this entire page.
     ContextualBoard,
+    /// Only the model's actual independent record feature projection. Record
+    /// IDs, revisions and critical flags remain in the full canonical view;
+    /// this allocation identity does not merge observations or CPU tasks.
+    IndependentRecordProjection,
     ImmutableRecord {
         record_id: u64,
         revision: u64,
@@ -708,9 +712,17 @@ pub struct MemoryBankSnapshot {
     pub pinned_bytes: u64,
     pub max_entries: usize,
     pub max_bytes: u64,
+    /// Actual VecDeque slot capacity, separate from the caller-charged value
+    /// backing. No allocator rounding or native residency is inferred.
+    pub entry_backing_bytes: u64,
 }
 
 impl<T> MemoryBank<T> {
+    /// Inline slot size for this concrete value type, excluding allocator
+    /// rounding. Used only for finite container backing admission.
+    pub const fn entry_slot_bytes() -> u64 {
+        size_of::<MemoryEntry<T>>() as u64
+    }
     pub fn new(max_entries: usize, max_bytes: u64) -> Result<Self, ContractError> {
         if max_entries == 0 || max_bytes == 0 {
             return Err(fault_error(RuntimeFault::InvalidLimits));
@@ -737,6 +749,7 @@ impl<T> MemoryBank<T> {
             reserved_bytes: self.bytes,
             max_entries: self.max_entries,
             max_bytes: self.max_bytes,
+            entry_backing_bytes: (self.entries.capacity() * size_of::<MemoryEntry<T>>()) as u64,
             ..MemoryBankSnapshot::default()
         };
         for entry in &self.entries {
@@ -841,6 +854,119 @@ impl<T> MemoryBank<T> {
         });
         self.bytes += bytes;
         Ok(MemoryPin { value })
+    }
+
+    /// Check a complete insertion transaction without changing LRU, entries or
+    /// reservations. Callers pin every page required by their current view
+    /// before this check; no successful partial insertion can evict that view.
+    pub fn preflight_batch(&self, additions: &[(MemoryKey, u64)]) -> Result<(), ContractError> {
+        self.batch_evictions(additions).map(|_| ())
+    }
+
+    /// Reserve the complete entry-slot backing before a native operation.
+    /// Refusal leaves all existing value identities/reservations intact.
+    pub fn reserve_batch_backing(
+        &mut self,
+        additions: &[(MemoryKey, u64)],
+        max_backing_bytes: u64,
+    ) -> Result<u64, ContractError> {
+        self.batch_evictions(additions)?;
+        let required = self
+            .entries
+            .len()
+            .checked_add(additions.len())
+            .ok_or_else(|| fault_error(RuntimeFault::ResourceOverflow))?;
+        if (required as u64)
+            .checked_mul(size_of::<MemoryEntry<T>>() as u64)
+            .is_none_or(|bytes| bytes > max_backing_bytes)
+        {
+            return Err(fault_error(RuntimeFault::ResourceLimit));
+        }
+        self.entries
+            .try_reserve_exact(additions.len())
+            .map_err(|_| fault_error(RuntimeFault::ResourceLimit))?;
+        let actual = (self.entries.capacity() * size_of::<MemoryEntry<T>>()) as u64;
+        if actual > max_backing_bytes {
+            return Err(fault_error(RuntimeFault::ResourceLimit));
+        }
+        Ok(actual)
+    }
+
+    fn batch_evictions(&self, additions: &[(MemoryKey, u64)]) -> Result<Vec<usize>, ContractError> {
+        let mut future_bytes = self.bytes;
+        let mut future_len = self.entries.len();
+        for (index, (key, bytes)) in additions.iter().enumerate() {
+            if *bytes == 0 || *bytes > self.max_bytes {
+                return Err(fault_error(RuntimeFault::ResourceLimit));
+            }
+            if self.entries.iter().any(|entry| entry.key == *key)
+                || additions[..index]
+                    .iter()
+                    .any(|(previous, _)| previous == key)
+            {
+                return Err(identity(
+                    Stage::Admission,
+                    "memory batch identity already exists",
+                ));
+            }
+            future_bytes = future_bytes
+                .checked_add(*bytes)
+                .ok_or_else(|| fault_error(RuntimeFault::ResourceOverflow))?;
+            future_len = future_len
+                .checked_add(1)
+                .ok_or_else(|| fault_error(RuntimeFault::ResourceOverflow))?;
+        }
+        let mut evictions = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            if future_bytes <= self.max_bytes && future_len <= self.max_entries {
+                break;
+            }
+            if Arc::strong_count(&entry.value) == 1 {
+                future_bytes -= entry.bytes;
+                future_len -= 1;
+                evictions.push(index);
+            }
+        }
+        if future_bytes > self.max_bytes || future_len > self.max_entries {
+            return Err(fault_error(RuntimeFault::ResourceLimit));
+        }
+        Ok(evictions)
+    }
+
+    /// Atomic budget/ownership admission. A refused batch preserves every old
+    /// entry. All fallible identity/capacity checks precede the first eviction.
+    /// Values must already own their entire finite backing allocations.
+    pub fn insert_batch(
+        &mut self,
+        additions: Vec<(MemoryKey, T, u64)>,
+    ) -> Result<Vec<MemoryPin<T>>, ContractError> {
+        let sizes: Vec<_> = additions
+            .iter()
+            .map(|(key, _, bytes)| (*key, *bytes))
+            .collect();
+        let evictions = self.batch_evictions(&sizes)?;
+        // Allocate owners and result storage before changing retained pages.
+        let owners: Vec<_> = additions
+            .into_iter()
+            .map(|(key, value, bytes)| (key, Arc::new(MemoryValue(value)), bytes))
+            .collect();
+        let mut pins = Vec::with_capacity(owners.len());
+        self.entries.reserve(owners.len());
+        for index in evictions.into_iter().rev() {
+            let removed = self
+                .entries
+                .remove(index)
+                .expect("preflight eviction exists");
+            self.bytes -= removed.bytes;
+        }
+        for (key, value, bytes) in owners {
+            pins.push(MemoryPin {
+                value: Arc::clone(&value),
+            });
+            self.entries.push_back(MemoryEntry { key, value, bytes });
+            self.bytes += bytes;
+        }
+        Ok(pins)
     }
 }
 
@@ -1823,5 +1949,45 @@ mod tests {
         );
         assert_eq!(bank.acquire(key).unwrap().as_ref(), &[1]);
         assert_eq!(bank.snapshot().reserved_bytes, 10);
+    }
+    #[test]
+    fn public_page_batch_budget_and_pins_refuse_without_partial_eviction() {
+        let first = public_page(PublicPageKind::ContextualBoard);
+        let second = public_page(PublicPageKind::WholeInput);
+        let third = public_page(PublicPageKind::IndependentRecordProjection);
+        let mut bank = MemoryBank::new(2, 20).unwrap();
+        drop(bank.insert(first, vec![1], 10).unwrap());
+        let pin = bank.insert(second, vec![2], 10).unwrap();
+        let before = bank.snapshot();
+        assert!(bank.preflight_batch(&[(third, 15)]).is_err());
+        assert!(bank.insert_batch(vec![(third, vec![3], 15)]).is_err());
+        assert_eq!(bank.snapshot(), before);
+        assert_eq!(bank.get(first), Some(&vec![1]));
+        assert_eq!(bank.get(second), Some(&vec![2]));
+        assert!(bank
+            .insert_batch(vec![(third, vec![3], 5), (third, vec![4], 5)])
+            .is_err());
+        assert_eq!(bank.snapshot(), before);
+        let pins = bank.insert_batch(vec![(third, vec![3], 10)]).unwrap();
+        assert!(bank.get(first).is_none());
+        assert!(bank.get(second).is_some());
+        assert_eq!(pins[0].as_ref(), &vec![3]);
+        assert!(bank.clear().is_err());
+        drop(pin);
+        drop(pins);
+        bank.clear().unwrap();
+    }
+    #[test]
+    fn entry_backing_admission_is_finite_and_never_removes_values_on_refusal() {
+        let mut bank = MemoryBank::new(3, 30).unwrap();
+        let first = public_page(PublicPageKind::ContextualBoard);
+        let second = public_page(PublicPageKind::IndependentRecordProjection);
+        drop(bank.insert(first, vec![1], 10).unwrap());
+        assert!(bank.reserve_batch_backing(&[(second, 10)], 0).is_err());
+        assert_eq!(bank.get(first), Some(&vec![1]));
+        let actual = bank.reserve_batch_backing(&[(second, 10)], 65536).unwrap();
+        assert_eq!(actual, bank.snapshot().entry_backing_bytes);
+        drop(bank.insert_batch(vec![(second, vec![2], 10)]).unwrap());
+        assert_eq!(bank.get(first), Some(&vec![1]));
     }
 }

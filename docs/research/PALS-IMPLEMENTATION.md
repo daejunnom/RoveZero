@@ -524,3 +524,30 @@ budget 안의 roster/capture/envelope 영수증과 strict loader/resume이다. N
 증거로 보고하지 않는다. prepared journal 전체와 raw learning history의 unique input binding을
 구분해 divergence·거절·실패 입력을 보존한다. 기존 legacy loader/checkpoint에는 새 pin을
 자동 생성하여 strict 인수로 승격하지 않는다.
+
+### 외부 CPU_R 선택과 host record projection page의 첫 연결
+
+`3e2125b`는 명시적 `cpu_r` 선택을 V3 명세·lock에 보존한다. 기존 Own 선택의
+직렬화 bytes와 canonical digest는 유지하며, 외부 profile·binary·모델 WDL resolver·
+자원 및 유한 수명 선언을 별도 타입으로 검증한다. 중앙 manifest library 검사 21개가
+통과했다. 현재 실제 arena launcher·helper cgroup·Core projection 인수는 연결 전이므로
+외부 선택의 실행 검증은 거부한다. 선언을 읽었다는 사실을 실제 자원 적용으로 표시하지 않는다.
+
+명시적 `enable_host_record_pages`는 기존 whole-input 캐시와 별도의 물리 projection
+page 경로다. 실제 16개 FP32 feature bit와 public graph·checkpoint·encoding·game을
+식별에 묶고, 전체 canonical input·관측·CPU task identity는 그대로 보존한다. missing
+record를 하나의 subset Run으로 공급하고 원래 head-major 순서의 K/V와 mask를 join하여
+기존 private P/C Run에 전달한다. 빈 record의 false-mask padding도 실제 zero-feature
+projection을 사용한다. 같은 feature의 물리 page 공유가 관측·방문·CPU 검사 재사용을 뜻하지 않는다.
+
+페이지 budget은 entry backing과 실제 소유 배열을 포함하며 transient reservation은
+준비 입력·subset·join·출력·page 복사의 겹치는 수명을 포함한다. known completion에서만
+pin과 scratch를 해제하고 unknown physical completion에서는 session·full input·subset·
+page·pin·unfinished join을 같은 owner에 보존한다. ORT workspace·allocator overhead·
+프로세스 peak·VRAM peak는 이 호스트 예약으로 관측했다고 주장하지 않는다.
+
+동결한 4개 소스의 중앙 `rz-eval` library 76개와 `rz-runtime` library 29개, 두 패키지
+all-feature library Clippy `-D warnings`가 통과했다. actual CPU whole/page 수치 동등성은
+별도 검증 전이며 제품 CLI·Native receipt 선택은 아직 연결하지 않았다. subset Run에서도
+기존 public graph는 board 66개 토큰을 다시 계산한다. page hit·encoded record slots·
+physical B1 NN 입력·탐색 소비 수를 구분하며 속도·메모리 개선을 주장하지 않는다.

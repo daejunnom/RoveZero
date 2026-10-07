@@ -30,10 +30,12 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 mod cuda_control;
+mod public_pages;
 pub use cuda_control::{
     PalsControlTransfer, PalsControlTransferKind, PalsCudaControlPolicy, PalsCudaPlacementWitness,
     PalsGraphOptimization, PalsGraphPlacement, PalsKernelWitness,
 };
+pub use public_pages::{HostRecordPagePolicy, HostRecordPageSnapshot, HostRecordPageStats};
 
 const MAX_MANIFEST_BYTES: usize = 128 * 1024;
 const MAX_GRAPH_BYTES: usize = 256 * 1024 * 1024;
@@ -1224,6 +1226,9 @@ fn load_session(
 }
 
 struct ActiveInputs {
+    /// Entire known prepared backing capacities, before ownership moves into
+    /// OrtValues. Native session/allocator overhead remains unobserved.
+    host_bytes: u64,
     // ONNX If consumes its scalar condition on CPU, including CUDA sessions.
     role_is_critic: Tensor<bool>,
     board: Tensor<i64>,
@@ -1242,7 +1247,19 @@ impl ActiveInputs {
         let r = value.record_mask.len();
         let c = value.candidate_mask.len();
         let d = value.divergence_mask.len();
+        let host_bytes = (std::mem::size_of::<Self>()
+            + (value.board.capacity() + value.candidates.capacity()) * 8
+            + (value.metadata.capacity()
+                + value.records.capacity()
+                + value.query.capacity()
+                + value.divergences.capacity())
+                * 4
+            + value.record_mask.capacity()
+            + value.candidate_mask.capacity()
+            + value.divergence_mask.capacity()
+            + 1) as u64;
         Ok(Self {
+            host_bytes,
             role_is_critic: Tensor::from_array((Vec::<usize>::new(), vec![critic]))
                 .map_err(tensor_error)?,
             board: Tensor::from_array(([1, 64], value.board)).map_err(tensor_error)?,
@@ -1496,6 +1513,7 @@ pub struct PalsOnnxBackend {
     memory: Option<MemoryBank<PublicMemory>>,
     cached_memory_key: Option<MemoryKey>,
     active_memory: Option<MemoryPin<PublicMemory>>,
+    record_pages: Option<public_pages::HostRecordPages>,
     game_generation: u64,
     active: Option<ActiveInputs>,
     #[cfg(feature = "experimental-io-binding")]
@@ -1739,6 +1757,7 @@ impl PalsOnnxBackend {
             memory: Some(memory),
             cached_memory_key: None,
             active_memory: None,
+            record_pages: None,
             game_generation: 0,
             active: None,
             quarantine: None,
@@ -1790,12 +1809,16 @@ impl PalsOnnxBackend {
         if self.config.device_public_memory {
             return Ok(None);
         }
-        self.cached_memory_key
-            .and_then(|key| {
-                self.memory
-                    .as_ref()
-                    .expect("public bank installed")
-                    .get(key)
+        self.record_pages
+            .as_ref()
+            .and_then(|pages| pages.joined())
+            .or_else(|| {
+                self.cached_memory_key.and_then(|key| {
+                    self.memory
+                        .as_ref()
+                        .expect("public bank installed")
+                        .get(key)
+                })
             })
             .map(|memory| {
                 let copy = |tensor: &Tensor<f32>| -> Result<Vec<f32>, BackendError> {
@@ -1846,6 +1869,9 @@ impl PalsOnnxBackend {
     /// Bounded host page ownership evidence. This is neither an ORT allocator
     /// observation nor a VRAM peak. A quarantine may retain actual active pins.
     pub fn host_public_page_snapshot(&self) -> MemoryBankSnapshot {
+        if let Some(pages) = &self.record_pages {
+            return pages.bank_snapshot();
+        }
         self.memory
             .as_ref()
             .expect("public bank installed")
@@ -1888,6 +1914,9 @@ impl PalsOnnxBackend {
             .expect("public bank installed")
             .clear()
             .map_err(public_bank_error)?;
+        if let Some(pages) = &mut self.record_pages {
+            pages.clear()?;
+        }
         self.cached_memory_key = None;
         #[cfg(feature = "experimental-io-binding")]
         {
@@ -1910,7 +1939,10 @@ impl PalsOnnxBackend {
             ));
         }
         let mut stats = self.stats.clone();
-        stats.live_public_cache_entries = self.host_public_page_snapshot().entries as u64;
+        // Preserve the existing whole-input cache counter. Independent host
+        // pages have their own snapshot rather than pretending to be one entry.
+        stats.live_public_cache_entries =
+            self.memory.as_ref().expect("public bank installed").len() as u64;
         #[cfg(feature = "experimental-io-binding")]
         if self.device_memory.is_some() {
             stats.live_public_cache_entries += 1;
@@ -2206,6 +2238,9 @@ impl PalsOnnxBackend {
             // Both native Runs are synchronously fenced, or the CPU failure is
             // known complete. CUDA unknown retains this pin and its owner bank.
             self.active_memory = None;
+            if let Some(pages) = &mut self.record_pages {
+                pages.release_completed();
+            }
             if !self.config.cache_public_memory {
                 self.memory
                     .as_mut()
@@ -2410,159 +2445,170 @@ impl PalsOnnxBackend {
         key: [u8; 32],
         trace: Option<&StartupRoleTrace>,
     ) -> Result<PalsRawOutput, BackendError> {
-        let page_key = self.public_page_key(key);
-        self.active_memory = self
-            .config
-            .cache_public_memory
-            .then(|| {
-                self.memory
-                    .as_mut()
-                    .expect("public bank installed")
-                    .acquire(page_key)
-            })
-            .flatten();
-        let cached = self.active_memory.is_some();
-        if cached {
-            if let Some(trace) = trace {
-                trace.record(
-                    PalsStartupBackendStage::PublicCacheHit,
-                    PalsStartupStageBoundary::Observed,
-                );
-            }
-            self.public_cache_hits = self.public_cache_hits.saturating_add(1);
-            self.stats.public_cache_hits = self.stats.public_cache_hits.saturating_add(1);
+        if self.record_pages.is_some() {
+            self.prepare_record_pages(input, trace)?;
         } else {
-            self.stats.public_cache_misses = self.stats.public_cache_misses.saturating_add(1);
-            let active = self.active.as_ref().expect("owned input installed");
-            self.stats.public_nn_runs_attempted =
-                self.stats.public_nn_runs_attempted.saturating_add(1);
-            startup_enter(trace, PalsStartupBackendStage::PublicRun);
-            let result = self.public.as_mut().expect("loaded public session").run(ort::inputs!["board" => &active.board, "metadata" => &active.metadata, "records" => &active.records, "record_mask" => &active.record_mask]);
-            startup_return(trace, PalsStartupBackendStage::PublicRun, result.is_ok());
-            let outputs = match result {
-                Ok(outputs) => outputs,
-                Err(error) => {
-                    let failure = native(
-                        CauseCode::OrtRun,
-                        "PALS public-memory native Run failed",
-                        error,
+            let page_key = self.public_page_key(key);
+            self.active_memory = self
+                .config
+                .cache_public_memory
+                .then(|| {
+                    self.memory
+                        .as_mut()
+                        .expect("public bank installed")
+                        .acquire(page_key)
+                })
+                .flatten();
+            let cached = self.active_memory.is_some();
+            if cached {
+                if let Some(trace) = trace {
+                    trace.record(
+                        PalsStartupBackendStage::PublicCacheHit,
+                        PalsStartupStageBoundary::Observed,
                     );
-                    if matches!(self.config.provider, Provider::Cuda { .. }) {
-                        self.quarantine = Some(failure.clone());
-                    } else {
-                        self.stats.public_nn_runs_failed_known =
-                            self.stats.public_nn_runs_failed_known.saturating_add(1);
-                    }
-                    return Err(failure);
                 }
-            };
-            self.stats.public_nn_runs_completed =
-                self.stats.public_nn_runs_completed.saturating_add(1);
-            self.stats.completed_nn_inputs = self.stats.completed_nn_inputs.saturating_add(1);
-            startup_enter(trace, PalsStartupBackendStage::PublicOutputPreparation);
-            let tokens = self
-                .model_config
-                .public_memory_tokens(input.records.len())
-                .map_err(model_input)?;
-            let extract = |name: &str| -> Result<Vec<f32>, BackendError> {
-                let (shape, values) = outputs[name].try_extract_tensor::<f32>().map_err(|e| {
-                    native(
-                        CauseCode::PolicyExtract,
-                        "PALS public-memory extraction failed",
-                        e,
-                    )
-                })?;
-                if shape.as_ref() != [1, 2, tokens as i64, 64]
-                    || values.iter().any(|v| !v.is_finite())
+                self.public_cache_hits = self.public_cache_hits.saturating_add(1);
+                self.stats.public_cache_hits = self.stats.public_cache_hits.saturating_add(1);
+            } else {
+                self.stats.public_cache_misses = self.stats.public_cache_misses.saturating_add(1);
+                let active = self.active.as_ref().expect("owned input installed");
+                self.stats.public_nn_runs_attempted =
+                    self.stats.public_nn_runs_attempted.saturating_add(1);
+                startup_enter(trace, PalsStartupBackendStage::PublicRun);
+                let result = self.public.as_mut().expect("loaded public session").run(ort::inputs!["board" => &active.board, "metadata" => &active.metadata, "records" => &active.records, "record_mask" => &active.record_mask]);
+                startup_return(trace, PalsStartupBackendStage::PublicRun, result.is_ok());
+                let outputs = match result {
+                    Ok(outputs) => outputs,
+                    Err(error) => {
+                        let failure = native(
+                            CauseCode::OrtRun,
+                            "PALS public-memory native Run failed",
+                            error,
+                        );
+                        if matches!(self.config.provider, Provider::Cuda { .. }) {
+                            self.quarantine = Some(failure.clone());
+                        } else {
+                            self.stats.public_nn_runs_failed_known =
+                                self.stats.public_nn_runs_failed_known.saturating_add(1);
+                        }
+                        return Err(failure);
+                    }
+                };
+                self.stats.public_nn_runs_completed =
+                    self.stats.public_nn_runs_completed.saturating_add(1);
+                self.stats.completed_nn_inputs = self.stats.completed_nn_inputs.saturating_add(1);
+                startup_enter(trace, PalsStartupBackendStage::PublicOutputPreparation);
+                let tokens = self
+                    .model_config
+                    .public_memory_tokens(input.records.len())
+                    .map_err(model_input)?;
+                let extract = |name: &str| -> Result<Vec<f32>, BackendError> {
+                    let (shape, values) =
+                        outputs[name].try_extract_tensor::<f32>().map_err(|e| {
+                            native(
+                                CauseCode::PolicyExtract,
+                                "PALS public-memory extraction failed",
+                                e,
+                            )
+                        })?;
+                    if shape.as_ref() != [1, 2, tokens as i64, 64]
+                        || values.iter().any(|v| !v.is_finite())
+                    {
+                        return Err(fail(
+                            K::NumericalFailure,
+                            S::Output,
+                            "PALS public-memory output shape/finite check failed",
+                        ));
+                    }
+                    Ok(values.to_vec())
+                };
+                let key_values = extract("memory_key")?;
+                let key_capacity = key_values.capacity();
+                let memory_key =
+                    Tensor::from_array(([1, 2, tokens, 64], key_values)).map_err(|e| {
+                        native(
+                            CauseCode::TensorCreate,
+                            "PALS public-memory ownership failed",
+                            e,
+                        )
+                    })?;
+                let value_values = extract("memory_value")?;
+                let value_capacity = value_values.capacity();
+                let memory_value =
+                    Tensor::from_array(([1, 2, tokens, 64], value_values)).map_err(|e| {
+                        native(
+                            CauseCode::TensorCreate,
+                            "PALS public-memory ownership failed",
+                            e,
+                        )
+                    })?;
+                let (shape, values) = outputs["memory_mask"]
+                    .try_extract_tensor::<bool>()
+                    .map_err(|e| {
+                        native(
+                            CauseCode::PolicyExtract,
+                            "PALS public-memory mask extraction failed",
+                            e,
+                        )
+                    })?;
+                if shape.as_ref() != [1, tokens as i64]
+                    || values[..66].iter().any(|v| !*v)
+                    || values[66..].iter().filter(|v| **v).count() != input.records.len()
                 {
                     return Err(fail(
                         K::NumericalFailure,
                         S::Output,
-                        "PALS public-memory output shape/finite check failed",
+                        "PALS public-memory mask differs from admitted records",
                     ));
                 }
-                Ok(values.to_vec())
-            };
-            let key_values = extract("memory_key")?;
-            let key_capacity = key_values.capacity();
-            let memory_key = Tensor::from_array(([1, 2, tokens, 64], key_values)).map_err(|e| {
-                native(
-                    CauseCode::TensorCreate,
-                    "PALS public-memory ownership failed",
-                    e,
-                )
-            })?;
-            let value_values = extract("memory_value")?;
-            let value_capacity = value_values.capacity();
-            let memory_value =
-                Tensor::from_array(([1, 2, tokens, 64], value_values)).map_err(|e| {
+                let mask_values = values.to_vec();
+                let mask_capacity = mask_values.capacity();
+                let mask = Tensor::from_array(([1, tokens], mask_values)).map_err(|e| {
                     native(
                         CauseCode::TensorCreate,
-                        "PALS public-memory ownership failed",
+                        "PALS public-memory mask ownership failed",
                         e,
                     )
                 })?;
-            let (shape, values) = outputs["memory_mask"]
-                .try_extract_tensor::<bool>()
-                .map_err(|e| {
-                    native(
-                        CauseCode::PolicyExtract,
-                        "PALS public-memory mask extraction failed",
-                        e,
-                    )
-                })?;
-            if shape.as_ref() != [1, tokens as i64]
-                || values[..66].iter().any(|v| !*v)
-                || values[66..].iter().filter(|v| **v).count() != input.records.len()
-            {
-                return Err(fail(
-                    K::NumericalFailure,
-                    S::Output,
-                    "PALS public-memory mask differs from admitted records",
-                ));
+                drop(outputs);
+                let memory = PublicMemory {
+                    tokens,
+                    memory_key,
+                    memory_value,
+                    mask,
+                };
+                self.active_memory = Some(
+                    self.memory
+                        .as_mut()
+                        .expect("public bank installed")
+                        .insert(
+                            page_key,
+                            memory,
+                            public_owner_bytes(key_capacity, value_capacity, mask_capacity),
+                        )
+                        .map_err(public_bank_error)?,
+                );
+                self.cached_memory_key = Some(page_key);
+                self.public_encodes = self.public_encodes.saturating_add(1);
+                self.stats.validated_public_outputs =
+                    self.stats.validated_public_outputs.saturating_add(1);
+                startup_return(
+                    trace,
+                    PalsStartupBackendStage::PublicOutputPreparation,
+                    true,
+                );
             }
-            let mask_values = values.to_vec();
-            let mask_capacity = mask_values.capacity();
-            let mask = Tensor::from_array(([1, tokens], mask_values)).map_err(|e| {
-                native(
-                    CauseCode::TensorCreate,
-                    "PALS public-memory mask ownership failed",
-                    e,
-                )
-            })?;
-            drop(outputs);
-            let memory = PublicMemory {
-                tokens,
-                memory_key,
-                memory_value,
-                mask,
-            };
-            self.active_memory = Some(
-                self.memory
-                    .as_mut()
-                    .expect("public bank installed")
-                    .insert(
-                        page_key,
-                        memory,
-                        public_owner_bytes(key_capacity, value_capacity, mask_capacity),
-                    )
-                    .map_err(public_bank_error)?,
-            );
-            self.cached_memory_key = Some(page_key);
-            self.public_encodes = self.public_encodes.saturating_add(1);
-            self.stats.validated_public_outputs =
-                self.stats.validated_public_outputs.saturating_add(1);
-            startup_return(
-                trace,
-                PalsStartupBackendStage::PublicOutputPreparation,
-                true,
-            );
         }
         let active = self.active.as_ref().expect("owned inputs remain installed");
-        let memory = self
-            .active_memory
-            .as_ref()
-            .expect("public memory installed after successful fence");
+        let memory: &PublicMemory = if let Some(pages) = &self.record_pages {
+            pages
+                .joined()
+                .expect("page join installed after successful fence")
+        } else {
+            self.active_memory
+                .as_ref()
+                .expect("public memory installed after successful fence")
+        };
         debug_assert_eq!(
             memory.tokens,
             self.model_config
@@ -2705,6 +2751,11 @@ impl Drop for PalsOnnxBackend {
             if let Some(memory) = self.memory.take() {
                 std::mem::forget(memory);
             }
+            if let Some(pages) = self.record_pages.take() {
+                // Retain independent cache owners, actual pins, unfinished join
+                // backing and subset OrtValues together on unknown completion.
+                std::mem::forget(pages);
+            }
             if let Some(pin) = self.active_memory.take() {
                 std::mem::forget(pin);
             }
@@ -2727,6 +2778,7 @@ impl Drop for PalsOnnxBackend {
             }
             self.active_memory.take();
             self.memory.take();
+            self.record_pages.take();
             self.active.take();
         }
     }
