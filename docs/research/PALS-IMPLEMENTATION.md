@@ -296,3 +296,93 @@ E 최적화가 필요하면 해당 변경의 baseline·peak·작업량·채택 �
 복구는 등록된 이전 바이너리·자산·profile 및 기존 V1/V2·PUCT 또는 Own CPU의 명시적
 실행 선택으로 한다. PALS 오류 뒤 숨은 mock·LC0·Stockfish fallback으로 정상 성공을
 만들지 않는다. 계약·정확성·수명·대국 증거와 다른 작업의 WIP를 보존하며 총괄이 인수한다.
+
+## 2026-10-07 후속 진행 — CPU06 실패와 CPU 준비 수정
+
+이 절은 위 기록을 보존한 후속 상태다. `30f2a0d`의 완료 감사와 등록 11의 실제 CPU06,
+후속 개별 수정·CPU 모델 준비 검사를 서로 구분한다. **전체 목표는 아직 미완료이며,
+CPU06은 integration 실패, GPU 검증은 사용자 보류 상태다.** 아래 좁은 검사나 원시
+프로세스 종료 성공을 최종 Core·대국·GPU·학습 인수로 바꾸지 않는다.
+
+### CPU06의 실제 결과와 두 실패 경계
+
+`own-paired-cpu-06`은 등록 11의 source
+`30f2a0dc6d49a79fd73fb27adc84209ea0b60a53`로 실행했다. Ponder off, 엔진별 선언
+CPU 2·동일 affinity `0,2`, GPU 없음, 120초+1초 피셔, 흑백 교환 두 판의 기존 조건을
+유지했다. `failure-review-02.json`과 supervisor 결과를 읽기 전용으로 대조했다.
+
+| 관측 | 실제 결과 | 인수 범위 |
+|---|---|---|
+| runner 프로세스·정리 | native process exit 0, process group `gone`, `cleanup_verified=true`, unresolved owner 없음. | runner 종료·정리 증거다. 서비스 전체·NN·시계·Core 성공과 동일하지 않다. |
+| 서비스·자료 보존 | service exit 1, `recovery_complete=true`, `integration_checks_passed=false`. native pair 영수증과 원래 PGN·로그를 보존했다. | 실패 실행과 회수 성공을 함께 기록한다. 원본 실패를 소급 성공으로 바꾸지 않는다. |
+| 첫 경기 | 백 `pals-onnx-cpu`, 흑 `own-cpu`, PGN 결과 `0-1`, PALS 백의 시간패 초과 5ms. | 실제 패배 기록이다. 두 번째 판과 함께 보존하며 표본 부족이나 감사 오류를 이유로 유리하게 누락하지 않는다. |
+| 두 번째 경기 | 백 `own-cpu`, 흑 `pals-onnx-cpu`, PGN 결과 `1-0`, PALS 흑의 시간패 초과 7ms. | 실제 패배 기록이다. pilot 두 판으로 Elo·모델·탐색 승격을 확정하지 않는다. |
+| PGN 감사·Core | `PGN engine loss winner disagrees with A side to move`, `scored_games=0`, Core collection `not_reached`. | 정식 집계·Core 인수가 이 실행에서 이뤄지지 않았다는 뜻이다. 두 시간패가 없었다거나 무승부였다는 뜻이 아니다. |
+
+고정 Fastchess는 반환된 후보를 PGN에 먼저 기록한 뒤 시간패를 검사하며, 시간패 후보는
+실제 board에 적용하지 않는다. 현재 arena의 재생은 마지막 늦은 후보를 실제 적용수로
+읽어 실패 색과 차례를 뒤집었다. 이는 PGN 감사의 별도 정확성 문제다. **native full-clock
+감사의 `engine_loss` 거부는 실제 시간패에 대한 유효한 별도 판정**으로 보존한다. PGN
+감사를 수정해도 5ms·7ms 시간패가 사라지거나 full-clock·Core가 통과한 것으로 표시하지
+않는다. 원시 PGN을 덮어쓰지 않고 실제 적용수와 기록된 늦은 후보의 경계를 감사한다.
+
+### 후속 수정과 CPU 모델 준비의 확인 범위
+
+아래 검사 수는 총괄이 확인한 개별 실행 범위다. `model-reference-10/validation.json`은
+CPU provider·상태·source pin을 직접 대조했으나 개별 unittest 개수는 담지 않는다.
+clean `30f2a0d` CI와 dirty-source 모델 검사, 후속 커밋의 좁은 검사를 합쳐 같은 통합 SHA의
+전체 성공으로 표시하지 않는다. 이번 절은 후속 HEAD의 새 CI 성공을 선언하지 않는다.
+
+| 변경·자료 | 확인된 구현·검사 | 남은 경계 |
+|---|---|---|
+| `dcb312c` | Rules의 정확한 상태·이력을 사용하는 유한 UCI 수순 재생 접점을 추가했다. 총괄이 CPU 검사 52개 통과·2개 ignored를 확인했다. | ignored는 미실행이다. 외부 checker의 실제 소비·실행 인수를 대신하지 않는다. |
+| `02b01a8` | RulesTerminal 체크메이트의 승자와 차례 일관성(MF-01), 잔여 예산에 따른 collection 실제 읽기 제한(MF-02)을 수정했다. 총괄이 Rust data 검사 21개 통과를 확인했다. | 정상 ActualGame 후속 결과와 RulesTerminal을 구분한다. 새 모델·전체 학습 준비·paired 인수로 확대하지 않는다. |
+| `361c782` | 성공한 CPU_T capture 뒤 quota·저장 실패에도 조건·실제 반환·원래 오류를 회수하도록 MF-03 보존 경계를 수정했다. | source 수정과 해당 실패 보존 검사를 실제 학습·GPU 또는 모든 producer 경로의 종단 성공으로 바꾸지 않는다. |
+| `model-reference-10` | source `30f2a0d`+dirty의 개별 source 파일 pin으로 CPU unittest 58개, 미학습 `shared_pc_if` export와 독립 CPU 수치 검사를 총괄이 확인했다. 소형 영수증은 `status=success`, provider CPU, 학습 0 step, GPU `not_run`이다. | 초기 파라미터의 CPU 준비 증거다. source pin 없이 clean `30f2a0d` CI나 후속 커밋 전체에 재사용하지 않으며 학습·기력·제품 GPU 성공으로 승격하지 않는다. |
+| `4a8a446` checker 교체 경계 | 자체·외부 report를 분리한 인터페이스와 유한 Linux UCI owner를 추가했다. 첫 search 전체 171개와 후속 checker 집중 16개가 통과했다. 후속 정적 검사의 Copy 정리도 통과했다. | 집중 검사는 이전 전체 검사의 일부와 겹치므로 개수를 더해 고유 검사 수로 표시하지 않는다. 외부 CPU_R의 PALS 탐색·제품 CLI·receipt 소비는 아직 미완료다. |
+| `e330c7c` PALS 작업 마감 | 기존 soft/admission 중 이른 시각을 작업 deadline으로 전달했다. 해당 소비자 회귀를 포함한 UCI lib 133개가 통과했다. 전역 시계·물리 완료 fence는 유지했다. | 실제 두 판에서 시간패가 해소됐는지는 새 등록·실행 전까지 미검증이다. |
+| `5f9f037` timeout PGN 감사 | 실제 적용수와 기록된 늦은 후보를 구분했다. PGN 29개와 native pilot 5개가 통과했다. 영향 패키지의 Clippy `-D warnings`와 workspace fmt 검사도 통과했다. | 기존 CPU06 실패를 성공·Core로 바꾸지 않는다. 새 필드는 failure-only이며 원시 PGN은 보존한다. |
+
+### 전체 목표에 남은 구현과 별도 실험
+
+`completion-audit-30f2a0d-02.md`의 감사 시점은 `30f2a0d`다. 감사 뒤 수정과 실행은
+위처럼 추가 기록하며, 감사의 구현 공백을 과거 검사·모델 fixture로 소급 완료 처리하지
+않는다. 실제 optimizer 학습 제외는 데이터·계약·학습 준비 API의 미구현을 제외한다는
+뜻이 아니다.
+
+| 항목 | 남은 구현·인수 |
+|---|---|
+| 외부 CPU_R checker 소비 | 대국 상대 UCI 연결·`CpuSearcher` trait·mock을 넘어, 실제 문제 조건·capability·authority·raw CP/WDL/mate/bound·deadline·generation·`stop`/`bestmove`·프로세스 종료와 실패를 내부 checker가 소비하는 경로를 인수한다. 현재 WIP를 완료로 표시하지 않는다. |
+| record별 공개 K/V | 현재 whole-input cache와 독립 record encoder를 구분한다. record/chunk delta→새 page→기존 page 재사용→native join·pin·evict의 실제 소비 경로와, 표현 회수 후 완료 CPU 근거 보존을 구현·검사한다. page key 타입만으로 구현 완료를 주장하지 않는다. |
+| 역할별 private warm-start | 현재 fresh 역할 latent를 기준으로 남긴다. 다음 query의 역할 상태 재사용 경로와 fresh/warm 의미·오차·실제 비용 대조는 미인수다. warm-start·device 상주·압축·overlap의 효과는 후속 A/S/E 비교이며 구조적 준비와 연구 성과를 구분한다. |
+| P 동일 시작 상태 비교(DG-01) | 같은 시작 상태의 후보를 묶는 pair/context, 별도 comparison target·collation·loss API가 남는다. 일반 policy loss를 이 비교의 대체 구현으로 표시하지 않는다. |
+| C native divergence(DG-02) | `pals_collect/native.rs`의 `NativePreparedContext::Divergence`가 실제 divergence 입력과 sidecar에 capture하는 경로는 존재한다. 현재 `training_admission=deferred_divergence_head`, `counterfactual_wdl=masked`이며, 남은 것은 전용 감독 context/envelope·loader 입장·target/ranking 연결이다. 별도 capture와 조건부 BCE를 후보 ranking 완료로 해석하지 않는다. |
+| V 비교 감독·문제 입력(DG-03/04) | 실제 조건부 관측의 comparative utility target producer·유효한 owned ranking 자료, 같은 parent·예산에서도 다른 branch/question을 구별하는 의미 입력이 남는다. provenance SHA는 branch 표현을 대신하지 않으며 미관측 rank를 만들어 채우지 않는다. 제품 V-free 조건은 유지한다. |
+| 후속 label chain(DG-05) | 선행 label 존재·동일 immutable input 귀속·causal revision·cycle/missing predecessor 거부·현재 학습 view 선택 감사가 남는다. canonical observation revision과 dataset label revision은 다른 소비 경계다. |
+| 일반 dataset frozen identity(DG-06) | 등록된 game·producer별 OwnPals source·model·frozen epoch의 일관성을 일반 admission에서도 검사하는 계약이 필요하다. 단일 native collector의 보장을 임의 등록 dataset의 보장으로 확대하지 않는다. 서로 다른 두 엔진의 모델이 다를 수 있으므로, 선언된 engine roster를 구분하지 않고 game 전체에 하나의 모델을 강제하지 않는다. |
+| 양의 owned target 자료(DG-07) | positive fixture loss와 실제 owned 양의 target 자료를 구분한다. 기존 6행의 all-masked 전체 소비와 V의 unknown mask는 올바른 미관측 처리이며 학습 개선이나 API 미구현의 대체 증거가 아니다. |
+| 수정된 최종 종단 인수 | 새 검사·정확한 source/binary 등록 뒤 유한 typed/Core 저장·시계·PGN·실패 보존을 따로 인수한다. CPU06의 runner 정리 성공이나 과거 Core projection fixture를 새 live-owner 종단 성공으로 바꾸지 않는다. |
+
+후속 담당의 source 확인에 따라 C divergence의 미완료 범위를 위 연결부로 명시한다.
+기존 감사의 미완료 판정을 **native capture 전체가 없다는 뜻으로 확대하지 않는다.**
+기존 감사 원문은 보존하며, 실제 capture·학습 입장 보류·counterfactual WDL mask와 남은
+감독·loader·ranking 준비를 이 정정 기록에서 구분한다.
+
+제품 GPU startup·독립 수치·취소·물리 drain·paired는 계속 `user-deferred`다. 이 문서
+갱신은 새 GPU 실행·자동 재시도 권한을 추가하지 않는다. 원문 후속 모델 구조·압축·
+warm-start·스케줄 후보도 보존하며, PALS 전체 도입에는 의미 보존 변경의 5% 문턱을
+적용하지 않는다. 실제 학습과 학습된 기력 검증은 이번 목표의 제외 범위로 유지한다.
+
+### 후속 근거 식별
+
+작은 JSON·감사 문서의 아래 식별을 대조했다. 원시 PGN의 식별은 CPU06 failure review가
+연결한 보존 자산이며 이 절에서 PGN을 재작성하거나 새 경기 결과로 변환하지 않았다.
+원시 로그·개인 경로·호스트 정보는 소스 문서에 옮기지 않는다.
+
+| 관리 루트 기준 논리 자료 | SHA-256 |
+|---|---|
+| `reports/pals/completion-audit-30f2a0d-02.md` | `3c827e6c48e2d83579df53a1ca2c76755518f88d0ce7fa076ebad6a19b3aea8b` |
+| `runs/pals/own-paired-cpu-06/failure-review-02.json` | `9c196441d84efc080241c7de5589a3000581613089237dae2e2b6a60dc4dd799` |
+| `runs/pals/own-paired-cpu-06/execution-result.json` | `1a2f9c2cfa11a16b6f4e4746836ad2038b2b4da24945f77709a50361da77dd77` |
+| `runs/pals/own-paired-cpu-06/recovered/attempt-01/match.pgn` | `7b407a18753646b4517eb6ef2c972f6ca52929cc3f6c90bd23b88b531ae9674b` |
+| `runs/pals/model-reference-10/validation.json` | `98b7f745e7a83facbbc2dbc384c093241608022f403e53dbc91c4df8c0ba263b` |
