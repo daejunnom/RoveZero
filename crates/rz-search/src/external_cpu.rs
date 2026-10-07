@@ -922,6 +922,36 @@ impl CpuChecker for ExternalUciCpuChecker {
     fn conditions(&self) -> &str {
         &self.conditions
     }
+    fn validate_namespace(&self) -> Result<(), CheckerError> {
+        self.identity.validate()?;
+        // Preserve CpuChecker's metadata boundary before checking availability.
+        if self.conditions.is_empty()
+            || self.conditions.len() > 8192
+            || self.conditions.chars().any(char::is_control)
+        {
+            return Err(CheckerError::Invalid(
+                "checker conditions exceed finite bound",
+            ));
+        }
+        if self.failed || self.active {
+            return Err(error("admission", "checker_not_available"));
+        }
+        // No owner is expected before explicit startup. A retained owner's
+        // terminal evidence never grants a new search or resets its old attempt.
+        if let Some(owner) = &self.owner {
+            let state = owner.evidence();
+            if state.quarantined {
+                return Err(error("admission", "owner_quarantined"));
+            }
+            if state.ownership_lost {
+                return Err(error("admission", "owner_ownership_lost"));
+            }
+            if state.cleanup_complete {
+                return Err(error("admission", "owner_closed"));
+            }
+        }
+        Ok(())
+    }
     fn capabilities(&self) -> CheckerCapabilities {
         CheckerCapabilities {
             max_depth: self.config.max_depth,
@@ -1989,13 +2019,50 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn namespace_admission_preserves_unstarted_checker_and_checks_metadata_first() {
+        let mut checker = ExternalUciCpuChecker::create(fixture_config("fake_uci_normal")).unwrap();
+        checker.validate_namespace().unwrap();
+        assert!(checker.owner.is_none());
+        assert!(checker.last_attempt().is_none());
+        assert_eq!(checker.request_id, 0);
+
+        checker.active = true;
+        assert_eq!(
+            checker.validate_namespace(),
+            Err(error("admission", "checker_not_available"))
+        );
+        checker.active = false;
+        checker.validate_namespace().unwrap();
+        checker.failed = true;
+        assert_eq!(
+            checker.validate_namespace(),
+            Err(error("admission", "checker_not_available"))
+        );
+        checker.conditions.clear();
+        assert_eq!(
+            checker.validate_namespace(),
+            Err(CheckerError::Invalid(
+                "checker conditions exceed finite bound"
+            ))
+        );
+        assert!(checker.failed);
+        assert!(!checker.active);
+        assert!(checker.owner.is_none());
+        assert!(checker.last_attempt().is_none());
+        assert_eq!(checker.request_id, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn native_fixture_root_divergence_and_reset_are_external_reports() {
         let _guard = FIXTURE_LOCK.lock().unwrap();
         let cancel = AtomicBool::new(false);
         let mut checker = ExternalUciCpuChecker::create(fixture_config("fake_uci_normal")).unwrap();
+        checker.validate_namespace().unwrap();
         checker
             .start(Instant::now() + Duration::from_secs(10), &cancel)
             .unwrap();
+        checker.validate_namespace().unwrap();
         let startup_identity = checker
             .last_attempt()
             .unwrap()
@@ -2038,6 +2105,7 @@ mod tests {
         checker
             .new_game(Instant::now() + Duration::from_secs(1), &cancel)
             .unwrap();
+        checker.validate_namespace().unwrap();
         let CheckerReport::ExternalUci(branch) = checker
             .analyze_divergence(
                 &Position::startpos(),
@@ -2064,6 +2132,12 @@ mod tests {
         );
         assert!(!process.ownership_lost && !process.quarantined);
         assert_eq!(process.process_identity, Some(startup_identity));
+        let original_attempt = format!("{:?}", checker.last_attempt());
+        assert_eq!(
+            checker.validate_namespace(),
+            Err(error("admission", "owner_closed"))
+        );
+        assert_eq!(format!("{:?}", checker.last_attempt()), original_attempt);
     }
 
     #[cfg(target_os = "linux")]
@@ -2105,6 +2179,22 @@ mod tests {
             .unwrap();
         assert_eq!(partial.completion, ExternalCompletion::Pending);
         assert_eq!(partial.best_move, None);
+        let original_attempt = format!("{:?}", checker.last_attempt());
+        let original_request_id = checker.request_id;
+        let (stdout, stderr) = checker.diagnostic_output();
+        let original_output = (stdout.to_owned(), stderr.to_owned());
+        for _ in 0..2 {
+            assert_eq!(
+                checker.validate_namespace(),
+                Err(error("admission", "checker_not_available"))
+            );
+        }
+        assert_eq!(format!("{:?}", checker.last_attempt()), original_attempt);
+        assert_eq!(checker.request_id, original_request_id);
+        assert_eq!(
+            checker.diagnostic_output(),
+            (original_output.0.as_slice(), original_output.1.as_slice())
+        );
     }
 
     #[cfg(target_os = "linux")]
