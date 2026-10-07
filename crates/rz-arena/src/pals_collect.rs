@@ -41,9 +41,14 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "pals-collection-onnx")]
 mod native;
+mod producer;
 #[cfg(feature = "pals-collection-onnx")]
 pub use native::{
     OwnPalsOnnxCollectionDriver, PalsCollectionGraphPin, PalsNativeCollectionRegistry,
+};
+pub use producer::{
+    CheckedProducerOwner, PalsProducerCollectionConfig, RegisteredProducerHandle,
+    pals_producer_registration_description,
 };
 
 pub const PALS_COLLECT_VERSION: &str = "rz-pals-own-collector/1";
@@ -237,6 +242,22 @@ pub struct PalsNativeInputSidecar {
 /// drivers are exposed by the executable example.
 pub trait PalsCollectionDriver {
     fn description(&self) -> &PalsCollectionSourceDescription;
+    /// Opt-in only from an actual checked constructor, not from a row or label.
+    /// Legacy/custom/mock drivers do not acquire strict producer authority.
+    fn checked_producer_owner(&mut self) -> Result<Option<CheckedProducerOwner<'_>>, ArenaError> {
+        Ok(None)
+    }
+    fn set_registered_producer(
+        &mut self,
+        producer: Option<RegisteredProducerHandle>,
+    ) -> Result<(), ArenaError> {
+        if producer.is_some() && self.records_actual_native_calls() {
+            return Err(invalid(
+                "native driver cannot install strict producer observer",
+            ));
+        }
+        Ok(())
+    }
     fn new_game(&mut self);
     fn analyze(
         &mut self,
@@ -573,6 +594,13 @@ impl PalsCollectionDriver for OwnCpuCollectionDriver {
     fn description(&self) -> &PalsCollectionSourceDescription {
         &self.description
     }
+    fn checked_producer_owner(&mut self) -> Result<Option<CheckedProducerOwner<'_>>, ArenaError> {
+        // Measure the actual owned evaluator, including its immutable value
+        // identity. Declared teacher metadata is not consulted here.
+        let source =
+            source_description(&self.engine, "own-cpu-bootstrap", serde_json::Value::Null)?;
+        Ok(Some(CheckedProducerOwner::new(self, source)))
+    }
     fn new_game(&mut self) {
         self.engine.clear();
     }
@@ -755,6 +783,8 @@ struct Output {
     max_bytes: u64,
     bytes: u64,
     failed_artifacts: BTreeSet<&'static str>,
+    producer: Option<RegisteredProducerHandle>,
+    producer_prepaid: u64,
 }
 fn inside_git(path: &Path) -> bool {
     path.ancestors()
@@ -843,6 +873,8 @@ impl Output {
             max_bytes,
             bytes: 0,
             failed_artifacts: BTreeSet::new(),
+            producer: None,
+            producer_prepaid: 0,
         })
     }
     fn write(
@@ -905,11 +937,79 @@ impl Output {
     }
     fn json<T: Serialize>(&mut self, name: &'static str, value: &T) -> Result<String, ArenaError> {
         let bytes = bounded_json(value, MAX_JSON_RECORD_BYTES, false)?;
-        let digest = format!("{:x}", Sha256::digest(&bytes));
-        let mut line = bytes;
+        self.json_payload(name, &bytes)
+    }
+    fn json_payload(&mut self, name: &'static str, bytes: &[u8]) -> Result<String, ArenaError> {
+        if bytes.len() > MAX_JSON_RECORD_BYTES {
+            return Err(invalid("collector JSON payload byte bound"));
+        }
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let mut line = bytes.to_vec();
         line.push(b'\n');
         self.write(name, &line, false)?;
         Ok(digest)
+    }
+    fn reserve_producer(&mut self, bytes: u64) -> Result<(), ArenaError> {
+        if self.producer_prepaid != 0 {
+            return Err(invalid("producer metadata credit already delegated"));
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .filter(|n| *n <= self.max_bytes - RECEIPT_RESERVE)
+            .ok_or_else(|| {
+                ArenaError::Budget(
+                    "producer metadata close credit unavailable before dispatch".into(),
+                )
+            })?;
+        self.producer_prepaid = bytes;
+        Ok(())
+    }
+    fn write_prepaid(
+        &mut self,
+        name: &'static str,
+        bytes: &[u8],
+        newline: bool,
+    ) -> Result<(), ArenaError> {
+        let admitted = bytes.len() as u64 + u64::from(newline);
+        if admitted > self.producer_prepaid || self.failed_artifacts.contains(name) {
+            return Err(invalid(
+                "producer publication exceeds remaining prepaid credit",
+            ));
+        }
+        // Never refund a failed/partial write reservation. This credit was
+        // charged before any dispatch and is not charged a second time here.
+        self.producer_prepaid -= admitted;
+        if !self.files.contains_key(name) {
+            let file = match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(self.directory.join(name))
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    self.failed_artifacts.insert(name);
+                    return Err(io(error));
+                }
+            };
+            self.files.insert(name, file);
+        }
+        let file = self
+            .files
+            .get_mut(name)
+            .ok_or_else(|| invalid("producer artifact file missing"))?;
+        let result = file.write_all(bytes).and_then(|_| {
+            if newline {
+                file.write_all(b"\n")
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = result {
+            self.failed_artifacts.insert(name);
+            return Err(io(error));
+        }
+        Ok(())
     }
     fn native_credit(&self) -> u64 {
         (self.max_bytes - RECEIPT_RESERVE).saturating_sub(self.bytes)
@@ -1225,6 +1325,9 @@ impl Collection {
             .ok_or_else(|| invalid("native CPU task counter overflow"))?;
         self.work_incomplete |= trace.cpu_work_observation_incomplete;
         output.native_trace(&trace)?;
+        if let Some(producer) = output.producer.clone() {
+            producer.flush_journal(output)?;
+        }
         self.sequence = trace.sequence;
         let exceeded_nodes = trace.cpu_nodes > limits.max_nodes;
         self.inputs
@@ -1325,7 +1428,8 @@ impl Collection {
             public_records: selected.clone(),
         }
         .seal()?;
-        output.json("inputs.jsonl", &input)?;
+        let input_json = bounded_json(&input, MAX_JSON_RECORD_BYTES, false)?;
+        output.json_payload("inputs.jsonl", &input_json)?;
         let tensor_json = serde_json::to_string(&prepared).map_err(|e| invalid(e.to_string()))?;
         let tensor_sha256 = format!("{:x}", Sha256::digest(tensor_json.as_bytes()));
         let mut sidecar = PalsNativeInputSidecar {
@@ -1353,8 +1457,26 @@ impl Collection {
             sidecar.tensor_sha256.as_str(),
             &sidecar.record_sources,
         ))?;
-        output.json("native-inputs.jsonl", &sidecar)?;
-        output.json("input-lineage.jsonl",&serde_json::json!({"input_sha256":input.sha256(),"game_id":game,"actual_played_history":pack(actual_moves)?,"virtual_branch":!outcome_eligible,"actual_outcome_eligible":outcome_eligible}))?;
+        let sidecar_json = bounded_json(&sidecar, MAX_JSON_RECORD_BYTES, false)?;
+        output.json_payload("native-inputs.jsonl", &sidecar_json)?;
+        let lineage_json = bounded_json(
+            &serde_json::json!({"input_sha256":input.sha256(),"game_id":game,"actual_played_history":pack(actual_moves)?,"virtual_branch":!outcome_eligible,"actual_outcome_eligible":outcome_eligible}),
+            MAX_JSON_RECORD_BYTES,
+            false,
+        )?;
+        output.json_payload("input-lineage.jsonl", &lineage_json)?;
+        if let Some(producer) = output.producer.clone() {
+            producer.verify_source(source)?;
+            producer.capture(
+                &input,
+                &input_json,
+                &sidecar_json,
+                &lineage_json,
+                None,
+                true,
+            )?;
+            producer.flush_journal(output)?;
+        }
         self.inputs.push(CapturedInput {
             input: input.clone(),
             outcome_eligible,
@@ -1727,9 +1849,33 @@ pub fn collect_pals_own_data(
     registry: &PalsOwnedSources,
     cancel: &AtomicBool,
 ) -> Result<PalsCollectionReceipt, ArenaError> {
+    collect_pals_own_data_with_producer(config, output_root, driver, registry, cancel, None)
+}
+
+/// Optional strict producer capture. A requested registration failure never
+/// falls back to legacy collection. Existing receipt fields/domains are intact.
+pub fn collect_pals_own_data_with_producer(
+    config: PalsCollectionConfig,
+    output_root: &Path,
+    driver: &mut dyn PalsCollectionDriver,
+    registry: &PalsOwnedSources,
+    cancel: &AtomicBool,
+    producer_config: Option<&PalsProducerCollectionConfig>,
+) -> Result<PalsCollectionReceipt, ArenaError> {
     let started = Instant::now();
     config.validate()?;
     registry.validate()?;
+    // Strict dispatch uses the private capability's actual owner. A custom
+    // wrapper cannot borrow a real owner's proof and then run its own analyze.
+    let (driver, producer_source) = if producer_config.is_some() {
+        let owner = driver
+            .checked_producer_owner()?
+            .ok_or_else(|| invalid("strict producer requires checked actual driver constructor"))?;
+        let (actual_driver, source) = owner.into_parts();
+        (actual_driver, Some(source))
+    } else {
+        (driver, None)
+    };
     let description = driver.description().clone();
     checked_source(&description)?;
     if !registry.input_sources.contains(&description.source)
@@ -1745,7 +1891,21 @@ pub fn collect_pals_own_data(
             "collector executable differs from registered CPU implementation",
         ));
     }
+    let producer = if let Some(pin) = producer_config {
+        let actual = producer_source
+            .ok_or_else(|| invalid("strict producer has no actual owner capability"))?;
+        let handle = RegisteredProducerHandle::admit(pin, &config, &actual)?;
+        handle.verify_source(&description)?;
+        Some(handle)
+    } else {
+        None
+    };
+    driver.set_registered_producer(producer.clone())?;
     let mut output = Output::new(output_root, &config.run_id, config.max_output_bytes)?;
+    if let (Some(handle), Some(pin)) = (&producer, producer_config) {
+        handle.start(pin, &mut output)?;
+    }
+    output.producer = producer.clone();
     output.json("source-registry.jsonl", registry)?;
     output.json("run-spec.jsonl", &config)?;
     let deadline = started
@@ -2175,6 +2335,33 @@ pub fn collect_pals_own_data(
         failure = Some(failure_text(format!(
             "collector executable stability failed: {error}; prior={failure:?}"
         )));
+    }
+    if let Some(handle) = &producer {
+        let checked = driver
+            .checked_producer_owner()
+            .and_then(|source| {
+                source.ok_or_else(|| invalid("producer lost checked source after collection"))
+            })
+            .and_then(|owner| handle.verify_source(owner.source()));
+        if let Err(error) = checked {
+            failure = Some(failure_text(format!(
+                "producer source stability failed: {error}; prior={failure:?}"
+            )));
+        }
+        let split = PalsDatasetSplit {
+            games: state.assignments.clone(),
+        };
+        if let Err(error) = handle.close(
+            &mut output,
+            &state.rows,
+            &split,
+            registry,
+            failure.is_none(),
+        ) {
+            failure = Some(failure_text(format!(
+                "producer evidence/envelope preservation failed: {error}; prior={failure:?}"
+            )));
+        }
     }
     let audit = if failure.is_none() {
         Some(registry.audit(
@@ -3545,5 +3732,406 @@ mod tests {
         let escaped = failure_text("\0".repeat(8192));
         assert!(bounded_json(&escaped, 8192, false).is_ok());
         assert!(escaped.contains("message truncated"));
+    }
+    fn producer_config(cpu: &mut OwnCpuCollectionDriver) -> PalsProducerCollectionConfig {
+        let bytes = serde_json::to_vec(
+            &pals_producer_registration_description(cpu, "primary-owner").unwrap(),
+        )
+        .unwrap();
+        let pin = format!("{:x}", Sha256::digest(&bytes));
+        PalsProducerCollectionConfig::from_registration_bytes(&bytes, &pin)
+            .unwrap()
+            .with_metadata_limits(16 * 1024, 16 * 1024)
+            .unwrap()
+    }
+    #[test]
+    fn strict_cpu_producer_pins_actual_bytes_and_preserves_raw_label_history() {
+        let output = OwnedTemp::new();
+        let mut cpu = driver();
+        let registration = producer_config(&mut cpu);
+        let registry = own_collection_registry(&cpu).unwrap();
+        let receipt = collect_pals_own_data_with_producer(
+            small_config(),
+            &output.0,
+            &mut cpu,
+            &registry,
+            &AtomicBool::new(false),
+            Some(&registration),
+        )
+        .unwrap();
+        assert!(receipt.complete, "{:?}", receipt.failure);
+        let run = output.0.join(&receipt.run_id);
+        for artifact in [
+            "producer-registration.json",
+            "producer-source.json",
+            "producer-roster.json",
+            "producer-prepared.jsonl",
+            "producer-captures.json",
+            "producer-envelope.json",
+            "producer-audit.json",
+        ] {
+            let bytes = std::fs::read(run.join(artifact)).unwrap();
+            let pin = &receipt.artifacts[artifact];
+            assert_eq!(pin.bytes, bytes.len() as u64);
+            assert_eq!(pin.sha256, format!("{:x}", Sha256::digest(&bytes)));
+        }
+        let records: Vec<PalsLearningRecord> = rows(&run.join("records.jsonl"));
+        let view = rz_experiments::current_label_view(&records).unwrap();
+        assert!(records.len() > view.indices().len());
+        let raw_inputs: BTreeSet<_> = records
+            .iter()
+            .map(|row| row.input.sha256().to_owned())
+            .collect();
+        let current_inputs: BTreeSet<_> = view
+            .indices()
+            .iter()
+            .map(|index| records[*index].input.sha256().to_owned())
+            .collect();
+        assert_eq!(current_inputs, raw_inputs);
+        assert_eq!(view.indices().len(), current_inputs.len());
+        // Capture occurs before the ply-limit check: this one-move fixture
+        // preserves both the initial input and the post-move final input.
+        assert_eq!(receipt.results[0].ending, PalsGameEnd::PlyLimit);
+        let raw_byte_rows = |artifact: &str, frozen_input: bool| {
+            let bytes = std::fs::read(run.join(artifact)).unwrap();
+            let mut result = BTreeMap::new();
+            for line in bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+            {
+                let input_sha256 = if frozen_input {
+                    let input: PalsFrozenInput = serde_json::from_slice(line).unwrap();
+                    input.verify().unwrap();
+                    input.sha256().to_owned()
+                } else {
+                    let row: serde_json::Value = serde_json::from_slice(line).unwrap();
+                    row["input_sha256"].as_str().unwrap().to_owned()
+                };
+                assert!(
+                    result.insert(input_sha256, line.to_vec()).is_none(),
+                    "duplicate actual byte row in {artifact}"
+                );
+            }
+            result
+        };
+        let byte_rows = [
+            ("input_json", raw_byte_rows("inputs.jsonl", true)),
+            (
+                "tensor_sidecar_json",
+                raw_byte_rows("native-inputs.jsonl", false),
+            ),
+            ("lineage_json", raw_byte_rows("input-lineage.jsonl", false)),
+        ];
+        for (_, rows) in &byte_rows {
+            assert_eq!(rows.keys().cloned().collect::<BTreeSet<_>>(), raw_inputs);
+        }
+        let actual_inputs: BTreeMap<_, PalsFrozenInput> = byte_rows[0]
+            .1
+            .iter()
+            .map(|(sha, bytes)| (sha.clone(), serde_json::from_slice(bytes).unwrap()))
+            .collect();
+        assert_eq!(
+            actual_inputs
+                .values()
+                .map(|input| input.snapshot().actual_history.len())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1])
+        );
+        let capture = rz_experiments::frozen_producer::ProducerCaptureArtifact::from_json(
+            &std::fs::read_to_string(run.join("producer-captures.json")).unwrap(),
+        )
+        .unwrap();
+        let mut bindings = BTreeMap::new();
+        for binding in &capture.body().bindings {
+            assert!(
+                bindings
+                    .insert(binding.input_sha256.clone(), binding)
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            bindings.keys().cloned().collect::<BTreeSet<_>>(),
+            raw_inputs
+        );
+        let journal: Vec<serde_json::Value> = rows(&run.join("producer-prepared.jsonl"));
+        let mut prepared_by_input = BTreeMap::new();
+        for entry in &journal {
+            let input_sha = entry["prepared"]["input_sha256"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(prepared_by_input.insert(input_sha, entry).is_none());
+        }
+        assert_eq!(
+            prepared_by_input.keys().cloned().collect::<BTreeSet<_>>(),
+            raw_inputs
+        );
+        let roster = rz_experiments::frozen_producer::FrozenProducerRoster::from_json(
+            &std::fs::read_to_string(run.join("producer-roster.json")).unwrap(),
+        )
+        .unwrap();
+        for (input_sha, input) in &actual_inputs {
+            let entry = prepared_by_input[input_sha];
+            let prepared = &entry["prepared"];
+            let binding = bindings[input_sha];
+            assert_eq!(prepared["producer_id"], "primary-owner");
+            assert_eq!(prepared["native_request"], serde_json::Value::Null);
+            assert_eq!(prepared["learning_input"], true);
+            assert_eq!(
+                prepared["publication"],
+                "append-before-analysis; sync-at-receipt-close"
+            );
+            assert_eq!(
+                prepared["capture_sequence"],
+                input.snapshot().capture_sequence
+            );
+            assert_eq!(prepared["game_id"], input.snapshot().game_id);
+            assert_eq!(prepared["roster_sha256"], roster.sha256());
+            assert_eq!(
+                prepared["registration_sha256"],
+                receipt.artifacts["producer-registration.json"].sha256
+            );
+            assert_eq!(
+                prepared["checked_source_sha256"],
+                receipt.artifacts["producer-source.json"].sha256
+            );
+            assert_eq!(
+                entry["sha256"],
+                canonical_sha256(&("rz-pals-collector-prepared-producer/1", prepared)).unwrap()
+            );
+            assert_eq!(
+                binding.capture_evidence_sha256,
+                entry["sha256"].as_str().unwrap()
+            );
+            assert_eq!(binding.capture_sequence, input.snapshot().capture_sequence);
+            assert_eq!(binding.game_id, input.snapshot().game_id);
+            assert_eq!(binding.producer_id, "primary-owner");
+            for (field, rows) in &byte_rows {
+                let line = &rows[input_sha];
+                assert_eq!(prepared[*field]["bytes"], line.len() as u64);
+                assert_eq!(
+                    prepared[*field]["sha256"],
+                    format!("{:x}", Sha256::digest(line))
+                );
+            }
+        }
+        let envelope = rz_experiments::frozen_producer::FrozenProducerEnvelope::from_json(
+            &std::fs::read_to_string(run.join("producer-envelope.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(envelope.body().raw_records, records.len() as u64);
+        assert_eq!(envelope.body().unique_inputs, raw_inputs.len() as u64);
+        assert_eq!(envelope.body().current_view_sha256, view.sha256());
+        assert_eq!(
+            envelope.body().raw_dataset_sha256,
+            receipt.audit.as_ref().unwrap().canonical_dataset_sha256
+        );
+        assert_eq!(envelope.body().capture_sha256, capture.sha256());
+        assert_eq!(envelope.body().roster_sha256, roster.sha256());
+        assert_eq!(
+            envelope.body().capture_artifact.bytes,
+            receipt.artifacts["producer-captures.json"].bytes
+        );
+        assert_eq!(
+            envelope.body().capture_artifact.sha256,
+            receipt.artifacts["producer-captures.json"].sha256
+        );
+        let audit: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(run.join("producer-audit.json")).unwrap())
+                .unwrap();
+        assert_eq!(audit["scope"], "metadata_only");
+        assert_eq!(audit["raw_records"], records.len() as u64);
+        assert_eq!(audit["unique_inputs"], raw_inputs.len() as u64);
+        assert_eq!(audit["envelope_sha256"], envelope.sha256());
+        assert_eq!(audit["capture_sha256"], capture.sha256());
+        assert_eq!(audit["roster_sha256"], roster.sha256());
+        assert!(!receipt.actual_training_executed);
+        assert!(receipt.data_output_bytes <= receipt.reserved_output_bytes);
+    }
+    #[test]
+    fn strict_registration_mismatch_and_unchecked_mock_never_fall_back() {
+        let output = OwnedTemp::new();
+        let mut registered = driver();
+        let registration = producer_config(&mut registered);
+        let mut changed = OwnCpuCollectionDriver::new(CpuConfig {
+            tt_entries: 128,
+            ..CpuConfig::default()
+        })
+        .unwrap();
+        let registry = own_collection_registry(&changed).unwrap();
+        assert!(
+            collect_pals_own_data_with_producer(
+                small_config(),
+                &output.0,
+                &mut changed,
+                &registry,
+                &AtomicBool::new(false),
+                Some(&registration)
+            )
+            .is_err()
+        );
+        assert!(!output.0.join(small_config().run_id).exists());
+        let mut mock =
+            OwnPalsMockCollectionDriver::new(CpuConfig::default(), PalsConfig::default()).unwrap();
+        let registry = own_collection_registry(&mock).unwrap();
+        assert!(
+            collect_pals_own_data_with_producer(
+                small_config(),
+                &output.0,
+                &mut mock,
+                &registry,
+                &AtomicBool::new(false),
+                Some(&registration)
+            )
+            .is_err()
+        );
+        assert!(!output.0.join(small_config().run_id).exists());
+    }
+    #[test]
+    fn producer_close_credit_is_reserved_before_first_capture() {
+        let output = OwnedTemp::new();
+        let mut cpu = driver();
+        let bytes = serde_json::to_vec(
+            &pals_producer_registration_description(&mut cpu, "primary-owner").unwrap(),
+        )
+        .unwrap();
+        let registration = PalsProducerCollectionConfig::from_registration_bytes(
+            &bytes,
+            &format!("{:x}", Sha256::digest(&bytes)),
+        )
+        .unwrap();
+        let registry = own_collection_registry(&cpu).unwrap();
+        assert!(
+            collect_pals_own_data_with_producer(
+                small_config(),
+                &output.0,
+                &mut cpu,
+                &registry,
+                &AtomicBool::new(false),
+                Some(&registration)
+            )
+            .is_err()
+        );
+        let run = output.0.join(small_config().run_id);
+        assert!(!run.join("inputs.jsonl").exists());
+        assert!(!run.join("producer-prepared.jsonl").exists());
+    }
+    #[test]
+    fn prior_registration_requires_actual_pin_unique_keys_and_integer_epoch() {
+        let mut cpu = driver();
+        let description =
+            pals_producer_registration_description(&mut cpu, "primary-owner").unwrap();
+        let bytes = serde_json::to_vec(&description).unwrap();
+        assert!(
+            PalsProducerCollectionConfig::from_registration_bytes(&bytes, &"0".repeat(64)).is_err()
+        );
+        let duplicate = format!(
+            "{{\"producer_id\":\"another-owner\",{}",
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .strip_prefix('{')
+                .unwrap()
+        );
+        assert!(
+            PalsProducerCollectionConfig::from_registration_bytes(
+                duplicate.as_bytes(),
+                &format!("{:x}", Sha256::digest(duplicate.as_bytes()))
+            )
+            .is_err()
+        );
+        let mut fractional = description;
+        fractional["frozen_epoch"] = serde_json::json!(0.5);
+        let bytes = serde_json::to_vec(&fractional).unwrap();
+        assert!(
+            PalsProducerCollectionConfig::from_registration_bytes(
+                &bytes,
+                &format!("{:x}", Sha256::digest(&bytes))
+            )
+            .is_err()
+        );
+    }
+    struct CustomOwnerWrapper {
+        inner: OwnCpuCollectionDriver,
+        delegate_owner: bool,
+        custom_dispatches: usize,
+    }
+    impl PalsCollectionDriver for CustomOwnerWrapper {
+        fn description(&self) -> &PalsCollectionSourceDescription {
+            self.inner.description()
+        }
+        fn checked_producer_owner(
+            &mut self,
+        ) -> Result<Option<CheckedProducerOwner<'_>>, ArenaError> {
+            if self.delegate_owner {
+                self.inner.checked_producer_owner()
+            } else {
+                Ok(None)
+            }
+        }
+        fn new_game(&mut self) {
+            self.custom_dispatches += 1;
+        }
+        fn analyze(
+            &mut self,
+            _: &Position,
+            _: &PalsFrozenInput,
+            _: &PalsModelInput,
+            _: CpuLimits,
+            _: &AtomicBool,
+        ) -> Result<PalsCollectionDecision, ArenaError> {
+            self.custom_dispatches += 1;
+            Err(invalid(
+                "unverified custom dispatch must not receive strict authority",
+            ))
+        }
+        fn finish_collection(
+            &mut self,
+            _: Instant,
+        ) -> Result<Option<serde_json::Value>, ArenaError> {
+            self.custom_dispatches += 1;
+            Err(invalid(
+                "unverified custom finish must not receive strict authority",
+            ))
+        }
+    }
+    #[test]
+    fn opaque_owner_rejects_declaration_and_routes_delegated_proof_to_actual_dispatcher() {
+        let output = OwnedTemp::new();
+        let mut wrapper = CustomOwnerWrapper {
+            inner: driver(),
+            delegate_owner: false,
+            custom_dispatches: 0,
+        };
+        // Matching bytes and source facts alone cannot enroll this custom owner.
+        let registration = producer_config(&mut wrapper.inner);
+        let registry = own_collection_registry(&wrapper).unwrap();
+        assert!(
+            collect_pals_own_data_with_producer(
+                small_config(),
+                &output.0,
+                &mut wrapper,
+                &registry,
+                &AtomicBool::new(false),
+                Some(&registration)
+            )
+            .is_err()
+        );
+        assert_eq!(wrapper.custom_dispatches, 0);
+        assert!(!output.0.join(small_config().run_id).exists());
+        // Borrowing the actual owner capability redirects every dispatch and
+        // lifecycle hook to that owner; it does not authorize wrapper methods.
+        wrapper.delegate_owner = true;
+        let receipt = collect_pals_own_data_with_producer(
+            small_config(),
+            &output.0,
+            &mut wrapper,
+            &registry,
+            &AtomicBool::new(false),
+            Some(&registration),
+        )
+        .unwrap();
+        assert!(receipt.complete, "{:?}", receipt.failure);
+        assert_eq!(wrapper.custom_dispatches, 0);
+        assert!(receipt.artifacts.contains_key("producer-envelope.json"));
     }
 }

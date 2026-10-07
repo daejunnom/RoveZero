@@ -1,8 +1,9 @@
 //! Finite own-data producer. No external teachers, optimizer or cloud launch.
 use rz_arena::pals_collect::{
     OwnCpuCollectionDriver, OwnPalsMockCollectionDriver, PalsCollectionConfig,
-    PalsCollectionDriver, collect_pals_own_data, own_collection_registry,
-    pals_collection_registration_description, validate_pals_collection_output,
+    PalsCollectionDriver, PalsProducerCollectionConfig, collect_pals_own_data_with_producer,
+    own_collection_registry, pals_collection_registration_description,
+    pals_producer_registration_description, validate_pals_collection_output,
 };
 #[cfg(feature = "pals-collection-onnx")]
 use rz_arena::pals_collect::{OwnPalsOnnxCollectionDriver, PalsNativeCollectionRegistry};
@@ -26,9 +27,13 @@ fn usage() {
         --checkpoint ABSOLUTE --runtime ABSOLUTE --source-registry ABSOLUTE\n\
         --source-registry-sha256 SHA256 [--runtime-cache ABSOLUTE]\n\
         [--beam-width N] [--line-plies N] [--max-role-calls N] [--pals-rounds N]\n\
+        [--producer-registration ABSOLUTE --producer-registration-sha256 SHA256]\n\
+        [--producer-journal-bytes N --producer-capture-bytes N]\n\
         CPU/mock sources have no neural weights. Limits are mandatory finite defaults.\n\
         Actual ONNX mode accepts independently registered Untrained P/C on explicit CPU only.\n\
         --describe-registration prints read-only executable/CPU/encoder/model-config facts and exits.\n\
+        --describe-producer ID constructs the checked CPU/native owner, prints registration facts and exits.\n\
+        Strict producer mode requires independent prior registration bytes; failure has no legacy fallback.\n\
         Output preserves seals, actual native tensors, physical raw/delivery/consumption, masks, PGN and failure receipt."
     );
 }
@@ -43,6 +48,11 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let mut runtime_cache = None;
     let mut source_registry = None;
     let mut source_registry_sha256 = None;
+    let mut producer_registration = None;
+    let mut producer_registration_sha256 = None;
+    let mut producer_journal_bytes = None;
+    let mut producer_capture_bytes = None;
+    let mut describe_producer = None;
     let mut pals = PalsConfig::default();
     let mut pals_rounds = 2_u64;
     let mut args = std::env::args().skip(1);
@@ -75,6 +85,11 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             "--runtime-cache" => runtime_cache = Some(PathBuf::from(value)),
             "--source-registry" => source_registry = Some(PathBuf::from(value)),
             "--source-registry-sha256" => source_registry_sha256 = Some(value),
+            "--producer-registration" => producer_registration = Some(PathBuf::from(value)),
+            "--producer-registration-sha256" => producer_registration_sha256 = Some(value),
+            "--producer-journal-bytes" => producer_journal_bytes = Some(value.parse::<u64>()?),
+            "--producer-capture-bytes" => producer_capture_bytes = Some(value.parse::<u64>()?),
+            "--describe-producer" => describe_producer = Some(value),
             "--beam-width" => pals.beam_width = value.parse()?,
             "--line-plies" => pals.line_plies = value.parse()?,
             "--max-role-calls" => pals.max_role_calls = value.parse()?,
@@ -110,13 +125,43 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             _ => return Err(format!("unknown argument {flag}").into()),
         }
     }
-    let output =
-        output.ok_or("--output-root is required and must be absolute outside the checkout")?;
+    if describe_producer.is_some()
+        && (producer_registration.is_some()
+            || producer_registration_sha256.is_some()
+            || producer_journal_bytes.is_some()
+            || producer_capture_bytes.is_some())
+    {
+        return Err("--describe-producer cannot enroll or consume a strict registration".into());
+    }
+    let producer_config = match (producer_registration, producer_registration_sha256) {
+        (None, None) => {
+            if producer_journal_bytes.is_some() || producer_capture_bytes.is_some() {
+                return Err("producer metadata limits require independent registration".into());
+            }
+            None
+        }
+        (Some(path), Some(sha256)) => Some(
+            PalsProducerCollectionConfig::read_pinned(&path, &sha256)?.with_metadata_limits(
+                producer_journal_bytes.unwrap_or(512 * 1024),
+                producer_capture_bytes.unwrap_or(512 * 1024),
+            )?,
+        ),
+        _ => {
+            return Err(
+                "producer registration path and independent SHA256 are both required".into(),
+            );
+        }
+    };
+    if describe_producer.is_none() && output.is_none() {
+        return Err("--output-root is required and must be absolute outside the checkout".into());
+    }
     config.validate()?;
     if !(1..=16).contains(&pals_rounds) {
         return Err("--pals-rounds must be 1..=16".into());
     }
-    validate_pals_collection_output(&output, &config.run_id)?;
+    if let Some(output) = &output {
+        validate_pals_collection_output(output, &config.run_id)?;
+    }
     let native_flags = provider.is_some()
         || export.is_some()
         || checkpoint.is_some()
@@ -191,17 +236,29 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             );
         }
     };
+    if let Some(producer_id) = describe_producer {
+        println!(
+            "{}",
+            serde_json::to_string(&pals_producer_registration_description(
+                driver.as_mut(),
+                &producer_id
+            )?)?
+        );
+        return Ok(true);
+    }
+    let output = output.ok_or("--output-root is required")?;
     let cancelled = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         signal_hook::flag::register(signal, Arc::clone(&cancelled))?;
     }
-    let receipt = collect_pals_own_data(
+    let receipt = collect_pals_own_data_with_producer(
         config,
         &output,
         driver.as_mut(),
         &registry,
         cancelled.as_ref(),
+        producer_config.as_ref(),
     )?;
     println!("{}", serde_json::to_string_pretty(&receipt)?);
     Ok(receipt.complete)

@@ -158,6 +158,7 @@ struct Sink {
     calls: BTreeMap<RequestId, Call>,
     raw_sources: BTreeSet<String>,
     total_rows: usize,
+    producer: Option<RegisteredProducerHandle>,
 }
 fn role_error(error: impl std::fmt::Display) -> RoleError {
     RoleError::Backend(failure_text(error))
@@ -411,6 +412,23 @@ impl Sink {
                 n.checked_add(r.json.len() as u64 + 1)
                     .ok_or_else(|| role_error("prepared native bytes overflow"))
             })?;
+        let producer_capture = if let Some(producer) = &self.producer {
+            producer
+                .verify_source(&self.source)
+                .and_then(|()| {
+                    producer.capture(
+                        &input,
+                        &rows[0].json,
+                        &rows[1].json,
+                        &rows[2].json,
+                        Some((id.epoch.0, id.sequence)),
+                        !divergence,
+                    )
+                })
+                .map_err(role_error)
+        } else {
+            Ok(())
+        };
         self.reserve(
             exact_bytes
                 .checked_add(RAW_RESERVE + STAGE_RESERVE)
@@ -439,7 +457,14 @@ impl Sink {
                 physical_unknown: false,
             },
         );
-        self.event(id,"prepared",serde_json::json!({"prepared_before_submit":true,"native_query_kind":format!("{:?}",kind)}))
+        let mut detail = serde_json::json!({"prepared_before_submit":true,"native_query_kind":format!("{:?}",kind)});
+        if self.producer.is_some() {
+            detail["producer_metadata_admitted"] = serde_json::json!(producer_capture.is_ok());
+        }
+        self.event(id, "prepared", detail)?;
+        // A metadata rejection still preserves the prepaid exact prepared rows,
+        // but the observer returns an error before the runtime can submit.
+        producer_capture
     }
 }
 struct Observer(Arc<Mutex<Sink>>);
@@ -755,6 +780,7 @@ impl OwnPalsOnnxCollectionDriver {
             calls: BTreeMap::new(),
             raw_sources: BTreeSet::new(),
             total_rows: 0,
+            producer: None,
         }));
         model
             .set_observer(Box::new(Observer(Arc::clone(&sink))))
@@ -772,6 +798,31 @@ impl OwnPalsOnnxCollectionDriver {
 impl PalsCollectionDriver for OwnPalsOnnxCollectionDriver {
     fn description(&self) -> &PalsCollectionSourceDescription {
         &self.description
+    }
+    fn checked_producer_owner(&mut self) -> Result<Option<CheckedProducerOwner<'_>>, ArenaError> {
+        // This description is created only after the constructor compares actual
+        // loaded epoch, graphs, runtime and executable against independent pins.
+        let source = self.description.clone();
+        Ok(Some(CheckedProducerOwner::new(self, source)))
+    }
+    fn set_registered_producer(
+        &mut self,
+        producer: Option<RegisteredProducerHandle>,
+    ) -> Result<(), ArenaError> {
+        let mut sink = self
+            .sink
+            .lock()
+            .map_err(|_| invalid("native collector sink poisoned"))?;
+        if sink.context.is_some() || !sink.trace.rows.is_empty() {
+            return Err(invalid(
+                "producer handle must be fixed before native dispatch",
+            ));
+        }
+        if let Some(handle) = &producer {
+            handle.verify_source(&self.description)?;
+        }
+        sink.producer = producer;
+        Ok(())
     }
     fn new_game(&mut self) {
         self.engine.new_game();
@@ -974,6 +1025,7 @@ mod tests {
             calls: BTreeMap::new(),
             raw_sources: BTreeSet::new(),
             total_rows: 0,
+            producer: None,
         }))
     }
     fn raw(count: usize) -> PalsRawOutput {
@@ -987,6 +1039,34 @@ mod tests {
     }
     fn id(sequence: u64) -> RequestId {
         RequestId::new(ProcessEpoch(17), sequence)
+    }
+    fn fixture_producer(shared: &Arc<Mutex<Sink>>, journal_bytes: u64) -> RegisteredProducerHandle {
+        let source = shared.lock().unwrap().source.clone();
+        let registration = serde_json::json!({"version":"rz-pals-collector-producer-registration/1",
+            "producer_id":"observer-fixture-owner","source":source.source,"frozen_epoch":source.frozen_epoch,
+            "encoding_policy":{"kind":"native_exact","encoding_sha256":source.encoding_sha256,
+                "encoder_source_sha256":source.encoder_source_sha256,
+                "native_model_epoch":{"kind":"frozen_model_epoch","sha256":hex(source.model_epoch)}},
+            "checked_source_sha256":canonical_sha256(&("rz-pals-collector-checked-source/1",&source)).unwrap()});
+        let bytes = serde_json::to_vec(&registration).unwrap();
+        let config = PalsProducerCollectionConfig::from_registration_bytes(
+            &bytes,
+            &format!("{:x}", Sha256::digest(&bytes)),
+        )
+        .unwrap()
+        .with_metadata_limits(journal_bytes, 16 * 1024)
+        .unwrap();
+        let handle = RegisteredProducerHandle::admit(
+            &config,
+            &PalsCollectionConfig {
+                run_id: "fixture".into(),
+                ..PalsCollectionConfig::default()
+            },
+            &source,
+        )
+        .unwrap();
+        shared.lock().unwrap().producer = Some(handle.clone());
+        handle
     }
     #[test]
     fn wrong_epoch_rejects_before_reservation_or_dispatch_evidence() {
@@ -1229,6 +1309,7 @@ mod tests {
         };
         let prepared = prepare_role_input(&query, NativeQueryKind::Repair, [7; 32]).unwrap();
         let shared = sink(&position, 2 * 1024 * 1024);
+        let producer = fixture_producer(&shared, 16 * 1024);
         let mut observer = Observer(Arc::clone(&shared));
         observer
             .prepared(
@@ -1276,6 +1357,93 @@ mod tests {
                 .iter()
                 .any(|r| r.artifact == "native-divergence-sidecars.jsonl")
         );
+        let journal = producer.journal_snapshot();
+        assert_eq!(journal.len(), 2);
+        for (index, line) in journal.iter().enumerate() {
+            let evidence: serde_json::Value = serde_json::from_slice(line).unwrap();
+            assert_eq!(
+                evidence["prepared"]["native_request"],
+                serde_json::json!([17, index + 1])
+            );
+            assert_eq!(evidence["prepared"]["learning_input"], index == 0);
+            assert_eq!(
+                evidence["prepared"]["publication"],
+                "seal-before-submit; prepaid-drain-after-search"
+            );
+            assert_eq!(
+                evidence["sha256"],
+                canonical_sha256(&(
+                    "rz-pals-collector-prepared-producer/1",
+                    &evidence["prepared"]
+                ))
+                .unwrap()
+            );
+        }
+    }
+    #[test]
+    fn producer_quota_rejects_submit_but_preserves_exact_prepared_rows_and_journal() {
+        let position = Position::startpos();
+        let legal = position.legal_moves();
+        let cancel = AtomicBool::new(false);
+        let query = RoleQuery {
+            position: &position,
+            legal: &legal,
+            prefix: &[],
+            proposal: &[],
+            counterexample: None,
+            records: &[],
+            revision: 9,
+            deadline: Instant::now() + Duration::from_secs(2),
+            cancel: &cancel,
+        };
+        let prepared = prepare_role_input(&query, NativeQueryKind::Propose, [7; 32]).unwrap();
+        let shared = sink(&position, 16 * 1024 * 1024);
+        let producer = fixture_producer(&shared, 8 * 1024);
+        let mut observer = Observer(Arc::clone(&shared));
+        let mut rejected = None;
+        for request in 1..=32 {
+            if observer
+                .prepared(
+                    id(request),
+                    &prepared,
+                    NativePreparedContext::Role {
+                        query: &query,
+                        kind: NativeQueryKind::Propose,
+                    },
+                )
+                .is_err()
+            {
+                rejected = Some(id(request));
+                break;
+            }
+        }
+        let rejected = rejected.expect("finite producer journal must reject before a submit");
+        let journal = producer.journal_snapshot();
+        let last: serde_json::Value = serde_json::from_slice(journal.last().unwrap()).unwrap();
+        assert_eq!(last["stage"], "prepared-rejected-before-submit");
+        assert_eq!(
+            last["prepared"]["native_request"],
+            serde_json::json!([rejected.epoch.0, rejected.sequence])
+        );
+        let sink = shared.lock().unwrap();
+        let call = &sink.calls[&rejected];
+        assert!(!call.physical && !call.delivered && !call.accepted);
+        let input = sink
+            .trace
+            .rows
+            .iter()
+            .rev()
+            .find(|row| row.artifact == "inputs.jsonl")
+            .unwrap();
+        assert_eq!(
+            last["prepared"]["input_json"]["sha256"],
+            format!("{:x}", Sha256::digest(&input.json))
+        );
+        assert_eq!(
+            last["prepared"]["input_json"]["bytes"],
+            input.json.len() as u64
+        );
+        assert!(sink.trace.failure.is_some());
     }
     #[test]
     fn delegated_credit_reserves_raw_and_close_events_before_any_dispatch() {
