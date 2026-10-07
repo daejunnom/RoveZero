@@ -1230,9 +1230,9 @@ Clippy `-D warnings`, workspace format 검사를 통과했다. 독립 source fre
 `continuation-lib-65.log`, `continuation-cli-65.log`, `continuation-clippy-65.log`와
 `continuation-format-65.log`다.
 
-현재 확인은 library·CLI correctness 범위이며, 새 source의 등록된 실제 continuation
-child·독립 durable caller anchor·후속 비교 소비는 아직 미실행이다. 실제 비학습
-Repair next-move 준비·C divergence ranking·외부 helper의 paired 종단 인수도 별도다.
+이 절의 초기 확인은 library·CLI correctness 범위다. 이후 새 source의 실제 child와
+durable caller anchor를 인수한 root67은 아래에 별도로 기록한다. Repair next-move의
+root64 인수와 C divergence ranking·외부 helper paired 종단은 서로 다른 범위다.
 GPU 검증과 실제 학습은 이번 실행에서 계속 제외한다.
 
 ### 실제 최초 Repair의 causal·ordinal CPU 소비
@@ -1290,3 +1290,66 @@ Rust continuation source `83b886c`의 [CI 37696418278](https://github.com/daejun
 Linux·Windows·CPU bindings·model CPU 네 job 모두 실제 성공했다. 후자의 Windows job은
 2026-10-07 22:34:48 UTC에 완료했다. 이전 진행 중 관측과 최종 성공 관측을 구분하고,
 GPU·전체 paired 인수·후속 source의 검사를 대신하지 않는다.
+
+### 등록된 전체 수순 continuation의 실제 CPU 인수
+
+root67은 root66의 immutable binary와 Rust/Cargo 230개 source 등록을 재사용했다.
+actual63의 첫 Repair에서 outcome 이전에 선택한 proposal·counterexample 두 3-ply
+수순과 같은 startpos의 사전 지정 Fool's Mate 수순을 검사했다. Rules-only child 3개를
+모두 마친 뒤 각각의 정확한 root·endpoint·전체 known history·합법 수 순서를 caller의
+durable anchor에 고정하고 continuation child 3개를 실행했다. 두 단계는 같은 자체
+Rules 구현을 사용하며 독립 규칙 oracle 대조라고 표현하지 않는다.
+
+ongoing 두 endpoint는 모두 black-to-move이며 fresh H2·N100000·TT16·q4 CPU를 각각
+1회 호출했다. 완료 깊이 2·depth_limit·completed iteration의 raw endpoint 점수는
+proposal 0, counterexample 8이었다. nodes는 각각 137/278, quiescence nodes는
+116/253, TT hits는 0/1이다. 순서가 고정된 전체 3ply와 정확한 endpoint에서 관측한
+raw 값이며 root 관점 순위·전략적 반박·수선 성공·WDL 목표로 자동 변환하지 않는다.
+terminal 수순은 black winner의 Checkmate·white-to-move·CPU 0회·report null을 확인했다.
+
+6개 Rust child 모두 실제 loaded executable inode를 stdin 전달 전에 대조했고 exit 0·
+reap·stdout/stderr EOF·owned group 부재·원래 caller deadline을 확인했다. supervisor의
+실제 driver exit·pipe·group 정리까지는 14.267초, managed service는 17.854초였다.
+모델·Torch import·optimizer·backward·GPU·target 생성은 0이며 성능 비교가 아니다.
+CPU affinity 0/2·high 6GiB/max 12GiB·swap 0·pids 128, managed temporary 제거와
+tree cleanup을 확인했다. 종료 후 service가 보고한 작은 peak는 실행 peak 근거로
+채택하지 않으며 실제 memory/VRAM peak는 unknown이다.
+
+원시 자료는 `runs/pals/actual-line-continuation-cpu-67/`와 continuation의 root67
+supervisor 기록에 보존한다. `root-result.json` SHA-256은
+`fcdfa0e500259a9c6ff9008125eaea217a07077f3c17f6969b493a9317c9ebfe`다.
+원래 factual receipt의 before-result anchor는 ordinal criterion이 아니므로 후속
+ordinal consumer에 소급하여 인수하지 않는다.
+
+실행 전 독립 검토에서는 기존 helper55의 child 생성 이후 selector 초기화 실패가
+cleanup 밖에 있던 경로를 발견했다. 과거 원시 자료와 helper55는 보존하고 새 helper67을
+별도 pin했다. selector·buffer를 spawn 전에 준비하고 모든 post-spawn 설정을 같은
+try/finally로 보호했다. root70의 오류 주입 6개는 no-spawn·Popen failure·실제 child의
+register failure·selector close diagnostic·wrong image·timeout·aggregate overflow를
+검사했고 모두 통과했다. 실제 child의 signal·reap·group 부재·pipe 정리를 포함하지만
+이 outside-Git 실행 보조의 성공을 제품 arena 전체 오류 처리 인수로 확대하지 않는다.
+
+### 이탈 후보 수집의 관측 범위와 후속 순위 준비
+
+root68/69는 root58/source `2840283`의 등록 CPU native collector를 재사용한 별도
+유한 수집이다. 같은 untrained 모델·CPU ORT에서 최대 1ply·line5·rounds2·beam1을
+고정했고 root68은 per-go node 1024/total 8192, root69는 결과 전에 새 질문으로
+per-go 32768/total 32768을 선언했다. 원래 실패·제한 자료의 예산을 소급 변경하지 않았다.
+
+root68은 ordinary 9행·auxiliary context 1건, root69는 ordinary 26행·context 2건을
+회수했다. 각 proposal에는 opponent-to-move slot 2개가 있으나 현재 제품 탐색은
+round마다 slot 하나를 선택한다. 다음 round에서는 public revision과 proposal이
+바뀔 수 있으므로 다른 context의 Repair를 첫 D 입력의 두 번째 slot 증거로 묶지 않는다.
+이는 beam 폭의 의미나 단순 node 예산 부족과 구별한다. 현재 자료에는 같은 exact
+auxiliary 입력에서 비교 가능한 slot 두 개의 실제 Repair 결과가 없으며 C pointer의
+known ranking pair는 아직 만들지 않았다. 미검사 slot은 not-examined로 유지한다.
+
+두 수집의 process exit 0·reap·EOF·owned group 부재·native 물리 종료·buffer 해제·
+in-flight 0과 managed temporary 정리를 확인했다. collector의 loaded inode를 stdin
+전에 관측했다는 소급 주장은 하지 않는다. ply-limit 결과는 unknown이며 target·학습·
+기력으로 승격하지 않는다. 원시 자료는 `strict-native-divergence-capture-cpu-68/`,
+`strict-native-divergence-capture-cpu-69/` 관리 경로에 보존한다.
+
+문서 커밋 `866f5b2`의 [CI 37697648405](https://github.com/daejunnom/RoveZero/actions/runs/37697648405)는
+Linux·Windows·CPU bindings·model CPU 네 job 모두 실제 성공했다. root67/68/69의
+실제 실행 source·기능 인수와 CI 커밋은 각각 구분하며 GPU 검증은 계속 보류한다.
