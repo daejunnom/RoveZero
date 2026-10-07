@@ -637,3 +637,79 @@ ticket 종료 후 결과를 받아들이지 않는 비치명 경로로 추적됐
 DG05의 label chain/current view와 DG06 metadata·CPU strict 소비는 위 후속 근거로
 구분한다. 남은 비교 목표·divergence 전용 adapter·V 의미 입력·private warm-start·
 외부 helper 종단·새 paired 인수와 GPU 실행은 이전 전체 목표 감사에서 계속 추적한다.
+
+### 취소 분류, preflight 소유권과 양의 WDL 준비 자료
+
+`b7774ad`는 실제 소유한 취소 ticket의 늦은 Progress/성공 Complete만 bounded
+history로 식별한다. 이 결과는 새로운 착수·작업량·backup으로 받아들이지 않고
+`CanceledSearchResultIgnored` 진단으로 남긴다. foreign/unknown/evicted ticket,
+자연 완료 뒤 중복 응답과 실제 실패는 기존 typed 오류를 유지한다. 오래된 timer도
+현재 active ticket을 다시 확인한다. 물리 완료 불명 fence를 이 분류로 우회하지 않는다.
+
+`041f778`의 Native owner는 외부 checker 선택에서 identification/readiness용
+preflight root를 game root와 별도로 생성·pin한다. root는 역할별 exclusive directory이며
+inode·UID·mode·nofollow 조건을 재검사한다. 기존 runtime의 file·byte·depth 합산 상한에
+preflight tree도 포함하며 상한을 늘리지 않는다. PALS argv는 실제 owner가 전달한 root를
+사용한다. 예상 경로를 계산하는 순수 API는 파일 생성·소유권의 증거가 아니다.
+Own 선택은 기존 root/argv를 유지한다. 이 변경만으로 external execution/Core guard를
+해제하지 않는다.
+
+두 소스 단위의 중앙 검사는 UCI all-target/all-feature 297개, arena all-feature
+library 100개, default-feature launch 29개와 관련 Clippy·format·제품 build가 통과했다.
+서로 겹치는 검사 개수를 고유 검사 수로 합산하지 않는다. `041f778`의 CI run
+`37654377439`는 Windows·CPU bindings·model CPU 성공, Linux 실패다. Linux의 두
+정상 producer fixture는 병렬 실행 중 실제 테스트 executable 해시 비용 때문에 기존
+10초 창을 넘겼다. `a1c09b5`는 이 두 정확성 fixture에만 유한한 120초 창을 적용했다.
+제품 기본값과 명시적인 timeout 실패 fixture는 유지한다. 관련 26개 검사는 four-thread
+실행에서 통과했고 arena all-feature Clippy도 통과했다. 새 CI는 정확한 SHA의 실제
+완료 결과로 별도 인수하며 이전 실패 기록을 덮지 않는다.
+
+`host-pages-product-cpu-02`는 `a1c09b5`의 등록 binary로 실제 CPU ONNX 제품의
+startpos·스테일메이트·stop·quit를 다시 검사했다. physical role input 17개 완료,
+탐색 소비 16개와 취소 1개를 구분했다. 마지막 page snapshot의 active pin·buffer·
+transient reservation은 0이고 physical shutdown·native buffer release가 확인됐다.
+이전 `SharedContractError` 진단은 관측하지 않았다. 종료 전 cache page 2개와 retained
+join 68,707 bytes는 정상 보존 snapshot이며 owner drop 후의 zero 관측이 아니다.
+상속 cgroup 자료로 새 memory peak 비교나 성능 개선을 주장하지 않는다.
+
+`strict-producer-positive-cpu-02`는 동일한 등록 소스의 실제 Own CPU producer로
+백의 mate-in-one 상태를 수집했다. 자체 Rules가 실제 체크메이트·백 승리를 확정했고,
+raw history 3행에서 current 2행을 strict independently registered loader가 각각 한 번
+소비했다. 기존 untrained checkpoint의 frozen CPU forward는 두 행 모두 nonmasked
+WDL 목표를 받아 유한한 양의 WDL loss를 계산했다. 파라미터·raw history·current view·
+frozen admission은 불변이며 backward·optimizer 생성/step·GPU는 모두 미실행이다.
+이 자료는 DG07의 **실제 owned 결과 기반 WDL 준비 경로**에 한정한다. P/C 비교 policy,
+divergence·V utility·모든 양의 목표 또는 실제 학습의 완료 근거가 아니다. 외부 확인
+스크립트의 trailing summary가 CLI receipt와 전체 report를 혼동한 실패를 보존했으며,
+모델을 재실행하지 않고 실제 산출물의 pin·loss·불변성을 독립 확인했다.
+
+`external-helper-product-cpu-01`은 등록된 Stockfish 19 binary를 PALS 내부 checker로
+실제 시작·소비·종료한 CPU 제품 검사다. GPL source/license와 binary를 MIT 소스 밖에
+분리했다. Stockfish의 pin된 source header는 GPL-3.0-or-later를 명시한다.
+[공식 source header](https://github.com/official-stockfish/Stockfish/blob/edb0d9db6731067ec50ce619ff372b463bc4dd5d/src/engine.cpp).
+실제 profile bytes·canonical/registration SHA·전체 checker identity·model-WDL resolver·
+checkpoint epoch·encoding을 Native 시작/종료 영수증과 대조했다. ready 시점의 parent와
+helper는 같은 cgroup/namespace와 CPU 0/2를 관측했고 직접 high 6GiB·max 12GiB·
+swap 0·pids 128을 확인했다. 이 scope는 ancestor effective limit·전체 수명 thread/option
+준수·NNUE 실제 loading의 관측이 아니다. 종료 후 사라진 transient unit에 대한 기본값
+조회는 실행 policy 근거에서 제외했다.
+
+helper의 별도 역사 `(pid, pgid, start ticks)`와 native parent PID를 연결했고, known
+PGID owner의 exit 0·stdout/stderr drain·cleanup, Native의 물리 완료·buffer release를
+각각 확인했다. 외부 dispatched/report/consumed는 각각 1, reported nodes는 20,
+reserved node budget은 256이며 Own CPU task/node 합계는 0이다. model-WDL value call
+3개는 native NN 합계에 중복 가산하지 않는다. foreign completed task·reused consumption
+별도 합계는 여전히 unknown이다. `work_incomplete=true`는 실제 qnode/TT 등의 미관측을
+포함하므로 owner 물리 미완료로 환산하지 않는다. 새 게임 후 `latest_attempt=null`을
+task별 raw history의 완전성으로 해석하지 않는다. 이 probe는 arena preflight/Core·paired
+인수를 대체하지 않으며 외부 arena guard는 후속 typed 소비 검사까지 유지한다.
+
+| 관리 루트 기준 추가 자료 | SHA-256 |
+|---|---|
+| `runs/pals/host-pages-product-cpu-02`의 Native 종료 영수증 | `30bb3fe8b4244f4b44f2f47230dd5ca9a47c8bf9fc8456a1931de040acc7a481` |
+| `runs/pals/strict-producer-positive-cpu-02/collection/strict-positive-cpu-02/receipt.json` | `508e4f52777aa7359282b2932a04f7b0b1a6d323457767738aa18843668bcea6` |
+| `runs/pals/strict-producer-positive-cpu-02/preparation-report-02.json` | `0e1ef14593373fd38e814492e994a83843fb7df7250cd82a41ce3ef880c221cd` |
+| `runs/pals/external-helper-product-cpu-01`의 Native 종료 영수증 | `8ae93d3fc1488893e8dcdb4cfb8ed88ac6c01b46a31a9c656dc2ae149b699a6e` |
+
+실제 학습 제외와 이번 세션 GPU user-deferred 조건을 유지한다. 비교 목표·divergence
+adapter·V 의미 입력·warm seed의 실제 native 소비·새 paired 실행은 계속 별도 인수한다.
