@@ -72,6 +72,55 @@ ORT profile을 사용해 선택된 private branch만 실행됐는지 확인하�
 이 witness를 GPU·제품 최적화 경로의 성능 또는 물리 수명 증거로 승격하지 않습니다.
 Rust fixture는 public K/V·mask의 독립 Torch 수치도 함께 전달합니다.
 
+`training.py`는 실제 학습을 시작하지 않고 데이터·loss·AdamW·재개 상태를 준비하는
+라이브러리입니다. `load_collected_dataset`은 외부에서 따로 등록한 collector receipt SHA와
+encoder source SHA를 받아 `records.jsonl`, `native-inputs.jsonl`, `source-registry.jsonl`,
+`split.jsonl`의 식별을 검사합니다. 실제 own CPU 수집 기록의 `rz-pals-data/2` 입력 seal과
+native tensor sidecar를 함께 요구합니다. FEN·관측 hash만으로 metadata·이력·public record
+특징을 임의 복원하지 않으며 target을 encoder 입력에 섞지 않습니다. sidecar의 원래 tensor
+JSON byte SHA, encoding·history·model epoch, record 순서·revision·critical 표시와 합법
+후보 순서를 확인한 다음 같은 입력에 연결합니다.
+
+collator는 record·candidate의 padding mask와 policy·WDL·C divergence·V task의 target
+mask를 각각 반환합니다. 값이 미완료·미관측이면 WDL target을 mask하며 임의 0점·무승부를
+정답으로 넣지 않습니다. C 이탈·V 작업에는 해당 line/ply 및 branch/profile/budget의
+명시적 context가 필요합니다. 현재 native role-query sidecar만으로 이를 만들어 내지
+않습니다. `masked_losses`는 활성 후보만 policy 정규화에 넣고, 역할별로 유효한 target만
+loss에 포함합니다. 모든 target이 mask된 항목은 미관측이라는 의미를 유지합니다.
+
+`prepare_adamw`는 `pc_bootstrap`과 `pcv_preparation` recipe를 검사하고 parameter를
+object identity로 한 번씩 분할합니다. P 또는 C 준비에는 공유 encoder·reader·후보
+임베딩과 해당 private expert만 선택합니다. V 준비의 데이터 역할 이름 `verifier`는
+모델의 `experts.validator`에 연결하며, **V private expert만** 선택하고 공유 세 영역과
+P/C private expert를 모두 동결합니다. 동결은 선언 flag뿐 아니라 실제 `requires_grad`
+상태로 확인합니다. 이 함수는 zero-step AdamW를 구성하며 update 명령은 제공하지 않습니다.
+
+`ResumableSampler`, `capture_rng`/`restore_rng`, `save_preparation_checkpoint` 및
+`load_preparation_checkpoint`는 role별 permutation·cursor, Python/NumPy/Torch CPU RNG,
+명시한 장치의 RNG, recipe·dataset·split·구현 식별, 모델·zero-step AdamW 설정과 유한
+usage를 보존하도록 준비되어 있습니다. checkpoint는 pending gradient가 없는 경계에서만
+저장하며 `training_steps=0`과 optimizer state의 비어 있음을 확인합니다. immutable
+checkpoint 안의 usage snapshot과 파일 저장·hash 완료 후의 **final usage receipt**를
+구분하고, 재개에는 신뢰한 checkpoint SHA와 final receipt를 함께 요구합니다. 이 접점은
+optimizer update를 실행한 학습 checkpoint의 인수를 대신하지 않습니다.
+
+실제 수집 자료를 통한 유한 검사의 CLI는 `preparation_check.py`에 있습니다.
+`COLLECTION_ROOT`와 아래 SHA는 원래 collection의 독립 등록 자료에서 가져와야 합니다.
+다음은 실행 경로와 상한을 보여 주는 준비 예시이며 실제 dataset 검사 성공 기록은
+총괄이 별도 확인한 뒤 연결합니다.
+
+```bash
+python -m rz_pals_model.preparation_check --collection "$COLLECTION_ROOT" --receipt-sha256 "$COLLECTION_RECEIPT_SHA256" --encoder-source-sha256 "$ENCODER_SOURCE_SHA256" --checkpoint "$OUTPUT_ROOT/initialization/untrained.pt" --output "$OUTPUT_ROOT/preparation/check.json" --max-records 64 --max-wall-time-ms 120000 --max-output-bytes 1048576 --max-input-bytes 134217728 --batch-size 1 --threads 1
+```
+
+이 검사는 P/C 기록을 한 번씩 소비하고 CPU FP32 forward·명시 mask·finite loss를 검사하며,
+모든 parameter를 동결한 상태에서 전후 SHA가 같고 gradient가 없음을 확인합니다.
+optimizer를 생성하지 않으며 backward·optimizer step·GPU 실행은 하지 않습니다.
+입력·보고서 byte 및 준비·정리까지의 전체 벽시계 상한도 검사합니다. 값 target이 모두
+미관측이어야 하는 collection에는 `--require-masked-value`를 명시해 그 조건을 확인할 수
+있습니다. 현재 범위는 **단계 0의 준비이며 실제 학습은 미실행**입니다. 생성된 loss 숫자나
+zero-step 재개 검사를 학습 진행·모델 개선·기력·성능의 증거로 해석하지 않습니다.
+
 공개 K/V graph와 role graph를 나눈 것은 Rust 실행에서 공개 memory를 GPU에 유지할
 접점입니다. Python reference는 CPU에서 검사하며 GPU resident KV나 물리 수명을
 증명하지 않습니다. Rust runtime은 ORT I/O binding·worker lease·완료/격리 규칙을

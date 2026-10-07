@@ -40,15 +40,27 @@ def main():
     parser.add_argument("--layout", choices=("separate_pc", "shared_pc_if"), default="separate_pc")
     parser.add_argument("--rules-profile-json", type=Path,
                         help="Registered descriptor emitted by the Rust Rules encoder")
+    parser.add_argument("--dataset-run", type=Path,
+                        help="Registered own-data collection directory for no-step preparation")
+    parser.add_argument("--dataset-receipt-sha256")
+    parser.add_argument("--dataset-encoder-source-sha256")
     args = parser.parse_args()
     if not 0 <= args.seed <= 2**63 - 1:
         parser.error("seed must fit nonnegative signed int64")
     if args.source_commit and not re.fullmatch(r"[0-9a-f]{40}", args.source_commit):
         parser.error("source commit must be a full lowercase SHA-1")
+    dataset_args = (args.dataset_run, args.dataset_receipt_sha256,
+                    args.dataset_encoder_source_sha256)
+    if any(dataset_args) and not all(dataset_args):
+        parser.error("dataset run, receipt digest, and encoder source digest must be supplied together")
+    for digest in dataset_args[1:]:
+        if digest is not None and not re.fullmatch(r"[0-9a-f]{64}", digest):
+            parser.error("dataset identity requires lowercase SHA-256")
     source = Path(__file__).resolve().parent.parent
     output = checked(args.output)
     runtime_store = checked(args.runtime_store) if args.runtime_store else None
     rules_profile = checked(args.rules_profile_json) if args.rules_profile_json else None
+    dataset_run = checked(args.dataset_run) if args.dataset_run else None
     if args.layout == "shared_pc_if" and rules_profile is None:
         parser.error("shared_pc_if requires a registered Rules descriptor")
     if rules_profile and (not rules_profile.is_file() or rules_profile.stat().st_size > 64 * 1024):
@@ -69,6 +81,12 @@ def main():
     if rules_profile:
         receipt["rules_profile"] = {"sha256": hashlib.sha256(rules_profile.read_bytes()).hexdigest(),
                                     "bytes": rules_profile.stat().st_size}
+    if dataset_run:
+        receipt["preparation_dataset"] = {
+            "receipt_sha256": args.dataset_receipt_sha256,
+            "encoder_source_sha256": args.dataset_encoder_source_sha256,
+            "optimizer_updates": 0,
+        }
     if args.source_commit:
         receipt["source_commit"] = args.source_commit
         receipt["source_dirty"] = args.source_dirty
@@ -115,6 +133,18 @@ def main():
             stages["initialize_seconds"] = run(cli + ["init", "--seed", str(args.seed),
                 "--output", str(initialization)], cwd=source, environment=environment)
             checkpoint = initialization / "untrained.pt"
+            if dataset_run:
+                stages["preparation_check_seconds"] = run([
+                    str(python), "-m", "rz_pals_model.preparation_check",
+                    "--collection", str(dataset_run),
+                    "--receipt-sha256", args.dataset_receipt_sha256,
+                    "--encoder-source-sha256", args.dataset_encoder_source_sha256,
+                    "--checkpoint", str(checkpoint),
+                    "--output", str(output / "preparation-check.json"),
+                    "--max-records", "256", "--max-wall-time-ms", "120000",
+                    "--max-output-bytes", "1048576", "--threads", "2",
+                    "--batch-size", "1", "--require-masked-value",
+                ], cwd=source, environment=environment)
             export_command = cli + ["export", "--checkpoint", str(checkpoint),
                 "--output", str(export), "--layout", args.layout]
             if rules_profile:
