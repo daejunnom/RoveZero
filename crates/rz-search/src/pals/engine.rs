@@ -18,7 +18,9 @@ use crate::cpu_checker::{
     ExternalCheckerReport, ExternalCompletion, OwnedCheckerDescriptor, OwnedCpuChecker,
 };
 use crate::cpu_value::CpuValueIdentity;
-use rz_position::{BoardMove, Color, PlayStatus, Position, PositionError, TerminalReason};
+use rz_position::{
+    BoardMove, Color, PlayStatus, Position, PositionError, PositionSnapshot, TerminalReason,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -152,6 +154,64 @@ pub struct RoleRecord {
     pub critical: bool,
 }
 
+/// Search-owned logical question, independent of a native physical execution ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum RoleQueryPurpose {
+    ProposePolicy,
+    ReplyPolicy,
+    RepairPolicy,
+    DivergencePolicy,
+    /// Frontier WDL always uses a fresh evaluation, never a policy warm seed.
+    ValueFresh,
+}
+
+/// Current checked store handles and complete ordered continuation identity.
+/// Numeric handles do not replace exact Rules/history or a prepared model input.
+/// Record revisions remain acceptance metadata; they are not warm seed keys.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleLogicalContext {
+    pub game_generation: u64,
+    pub search_generation: u64,
+    pub situation: SituationId,
+    pub state: StateId,
+    pub focus: LineId,
+    pub purpose: RoleQueryPurpose,
+    pub prefix: Vec<BoardMove>,
+    pub focus_sha256: [u8; 32],
+    pub prefix_sha256: [u8; 32],
+    pub proposal_sha256: [u8; 32],
+    pub refutation_sha256: Option<[u8; 32]>,
+    pub divergence_sha256: [u8; 32],
+    pub public_revision: u64,
+    pub situation_revision: u64,
+}
+impl RoleLogicalContext {
+    /// Structural digest only. Current records/revisions must still be encoded
+    /// in the actual input and checked at acceptance; this grants no cache hit.
+    pub fn focus_prefix_sha256(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"rz-pals-role-focus-prefix/1\0");
+        digest.update(self.focus_sha256);
+        digest.update(self.prefix_sha256);
+        digest.finalize().into()
+    }
+}
+
+/// Final search acknowledgement with the original controls and current Rules
+/// snapshot. A provider may commit provisional state only after checking this
+/// against its delivered request; this hook grants no physical completion.
+pub struct RoleAcceptance<'a> {
+    pub snapshot: &'a PositionSnapshot,
+    pub context: &'a RoleLogicalContext,
+    pub deadline: Instant,
+    pub cancel: &'a AtomicBool,
+}
+impl RoleAcceptance<'_> {
+    pub fn check_control(&self) -> Result<(), RoleError> {
+        check_role_control(self.deadline, self.cancel)
+    }
+}
+
 pub struct RoleQuery<'a> {
     pub position: &'a Position,
     /// Exact legal order for this prefix, never a neural action vocabulary.
@@ -166,14 +226,17 @@ pub struct RoleQuery<'a> {
 }
 impl RoleQuery<'_> {
     pub fn check_control(&self) -> Result<(), RoleError> {
-        if self.cancel.load(Ordering::Acquire) {
-            return Err(RoleError::Canceled);
-        }
-        if Instant::now() >= self.deadline {
-            return Err(RoleError::Deadline);
-        }
-        Ok(())
+        check_role_control(self.deadline, self.cancel)
     }
+}
+fn check_role_control(deadline: Instant, cancel: &AtomicBool) -> Result<(), RoleError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(RoleError::Canceled);
+    }
+    if Instant::now() >= deadline {
+        return Err(RoleError::Deadline);
+    }
+    Ok(())
 }
 pub struct DivergenceQuery<'a> {
     pub root: &'a Position,
@@ -232,15 +295,65 @@ pub trait RoleModel: Send {
     fn reply(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError>;
     fn repair(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError>;
     fn divergences(&mut self, query: DivergenceQuery<'_>) -> Result<Vec<f32>, RoleError>;
+    /// Additive logical context keeps existing callers and Fresh mocks intact.
+    /// Opt-in providers must also seal the exact prepared input and query bits.
+    fn propose_with_context(
+        &mut self,
+        query: RoleQuery<'_>,
+        _context: &RoleLogicalContext,
+    ) -> Result<RoleEvaluation, RoleError> {
+        self.propose(query)
+    }
+    fn reply_with_context(
+        &mut self,
+        query: RoleQuery<'_>,
+        _context: &RoleLogicalContext,
+    ) -> Result<RoleEvaluation, RoleError> {
+        self.reply(query)
+    }
+    fn repair_with_context(
+        &mut self,
+        query: RoleQuery<'_>,
+        _context: &RoleLogicalContext,
+    ) -> Result<RoleEvaluation, RoleError> {
+        self.repair(query)
+    }
+    fn divergences_with_context(
+        &mut self,
+        query: DivergenceQuery<'_>,
+        _context: &RoleLogicalContext,
+    ) -> Result<Vec<f32>, RoleError> {
+        self.divergences(query)
+    }
+    fn evaluate_value_with_context(
+        &mut self,
+        query: RoleQuery<'_>,
+        _context: &RoleLogicalContext,
+    ) -> Result<ModelValueOutput, RoleError> {
+        self.evaluate_value(query)
+    }
     /// Accounting-only acknowledgement for the most recent output. Returning
     /// from inference is not consumption: the search calls this exactly once
     /// after output validation and its final deadline/cancellation acceptance.
     /// This hook must not dispatch work or perform a search.
     fn accepted_output(&mut self) {}
+    /// Fallible acknowledgement. Search consumption is recorded only on success.
+    /// A warm provider checks its pending context/snapshot and original controls,
+    /// relays cancellation to its admitted token, and commits at most once.
+    fn accepted_output_checked(&mut self, acceptance: RoleAcceptance<'_>) -> Result<(), RoleError> {
+        acceptance.check_control()?;
+        self.accepted_output();
+        Ok(())
+    }
     /// Close only delivered-output accounting at this logical search boundary.
     /// Physical leases, drain, and quarantine remain the backend owner's job.
     fn finish_search(&mut self, _reason: RoleSearchClosure) {}
     fn new_game(&mut self) {}
+    /// None means logical generation exhaustion; no later question is admitted.
+    /// This reset does not assert native drain or a worker reset acknowledgement.
+    fn new_game_with_generation(&mut self, _game_generation: Option<u64>) {
+        self.new_game();
+    }
 }
 
 impl<M: RoleModel + ?Sized> RoleModel for Box<M> {
@@ -265,14 +378,55 @@ impl<M: RoleModel + ?Sized> RoleModel for Box<M> {
     fn divergences(&mut self, query: DivergenceQuery<'_>) -> Result<Vec<f32>, RoleError> {
         (**self).divergences(query)
     }
+    fn propose_with_context(
+        &mut self,
+        query: RoleQuery<'_>,
+        context: &RoleLogicalContext,
+    ) -> Result<RoleEvaluation, RoleError> {
+        (**self).propose_with_context(query, context)
+    }
+    fn reply_with_context(
+        &mut self,
+        query: RoleQuery<'_>,
+        context: &RoleLogicalContext,
+    ) -> Result<RoleEvaluation, RoleError> {
+        (**self).reply_with_context(query, context)
+    }
+    fn repair_with_context(
+        &mut self,
+        query: RoleQuery<'_>,
+        context: &RoleLogicalContext,
+    ) -> Result<RoleEvaluation, RoleError> {
+        (**self).repair_with_context(query, context)
+    }
+    fn divergences_with_context(
+        &mut self,
+        query: DivergenceQuery<'_>,
+        context: &RoleLogicalContext,
+    ) -> Result<Vec<f32>, RoleError> {
+        (**self).divergences_with_context(query, context)
+    }
+    fn evaluate_value_with_context(
+        &mut self,
+        query: RoleQuery<'_>,
+        context: &RoleLogicalContext,
+    ) -> Result<ModelValueOutput, RoleError> {
+        (**self).evaluate_value_with_context(query, context)
+    }
     fn accepted_output(&mut self) {
         (**self).accepted_output();
+    }
+    fn accepted_output_checked(&mut self, acceptance: RoleAcceptance<'_>) -> Result<(), RoleError> {
+        (**self).accepted_output_checked(acceptance)
     }
     fn finish_search(&mut self, reason: RoleSearchClosure) {
         (**self).finish_search(reason);
     }
     fn new_game(&mut self) {
         (**self).new_game();
+    }
+    fn new_game_with_generation(&mut self, game_generation: Option<u64>) {
+        (**self).new_game_with_generation(game_generation);
     }
 }
 
@@ -562,6 +716,14 @@ enum Call {
     Reply,
     Repair,
 }
+#[derive(Clone, Copy)]
+struct RoleQuestion<'a> {
+    purpose: RoleQueryPurpose,
+    prefix: &'a [BoardMove],
+    proposal: &'a [BoardMove],
+    refutation: Option<&'a [BoardMove]>,
+    divergences: &'a [usize],
+}
 
 /// Persistent exact situations and public evidence survive a normal root change.
 /// `new_game` is the only automatic game-wide invalidation boundary.
@@ -579,6 +741,9 @@ pub struct PalsEngine<M: RoleModel> {
     nodes: Vec<Node>,
     records: Vec<RoleRecord>,
     revision: u64,
+    // Store handles may restart from zero after reset; this checked namespace
+    // prevents old-game logical questions from acquiring the new authority.
+    game_generation: Option<u64>,
     stores: PalsStores,
     clock_origin: Instant,
     consumer_id: u64,
@@ -701,6 +866,7 @@ impl<M: RoleModel> PalsEngine<M> {
             nodes,
             records,
             revision: 0,
+            game_generation: Some(0),
             stores,
             clock_origin: Instant::now(),
             consumer_id: 0,
@@ -708,6 +874,9 @@ impl<M: RoleModel> PalsEngine<M> {
         })
     }
     pub fn new_game(&mut self) {
+        self.game_generation = self
+            .game_generation
+            .and_then(|generation| generation.checked_add(1));
         self.nodes.clear();
         self.records.clear();
         // Preserve the old synchronous own clear. A foreign reset can fail and
@@ -721,7 +890,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 .new_game(Instant::now() + Duration::from_secs(1), &never_cancel)
                 .is_err();
         }
-        self.model.new_game();
+        self.model.new_game_with_generation(self.game_generation);
         self.revision = 0;
         self.stores = PalsStores::new(Self::store_limits(&self.config));
         self.consumer_id = 0;
@@ -883,6 +1052,9 @@ impl<M: RoleModel> PalsEngine<M> {
         cancel: &AtomicBool,
         progress: F,
     ) -> Result<PalsResult, PalsError> {
+        if self.game_generation.is_none() {
+            return Err(PalsError::Capacity);
+        }
         let mut counters = PalsCounters::default();
         self.external_attempts.clear();
         // Actual prepared RoleQuery includes records, revision and deadline.
@@ -1314,6 +1486,18 @@ impl<M: RoleModel> PalsEngine<M> {
         if legal.len() > 256 {
             return Err(PalsError::Capacity);
         }
+        let question = RoleQuestion {
+            purpose: match call {
+                Call::Propose => RoleQueryPurpose::ProposePolicy,
+                Call::Reply => RoleQueryPurpose::ReplyPolicy,
+                Call::Repair => RoleQueryPurpose::RepairPolicy,
+            },
+            prefix,
+            proposal,
+            refutation,
+            divergences: &[],
+        };
+        let context = self.role_context(node, question)?;
         let query = RoleQuery {
             position,
             legal: &legal,
@@ -1333,9 +1517,9 @@ impl<M: RoleModel> PalsEngine<M> {
             Call::Repair => counters.repair_calls += 1,
         }
         let evaluation = match call {
-            Call::Propose => self.model.propose(query)?,
-            Call::Reply => self.model.reply(query)?,
-            Call::Repair => self.model.repair(query)?,
+            Call::Propose => self.model.propose_with_context(query, &context)?,
+            Call::Reply => self.model.reply_with_context(query, &context)?,
+            Call::Repair => self.model.repair_with_context(query, &context)?,
         };
         evaluation.validate(legal.len())?;
         match call {
@@ -1350,7 +1534,7 @@ impl<M: RoleModel> PalsEngine<M> {
         if Instant::now() >= limits.deadline {
             return Err(RoleError::Deadline.into());
         }
-        self.model.accepted_output();
+        self.accept_role_output(node, &context, question, limits, cancel)?;
         counters.consumed_role_outputs += 1;
         match call {
             Call::Propose => counters.accepted_proposer_outputs += 1,
@@ -1364,6 +1548,85 @@ impl<M: RoleModel> PalsEngine<M> {
                 .then(a.cmp(&b))
         });
         Ok(indices.into_iter().map(|i| legal[i]).collect())
+    }
+
+    fn role_context(
+        &self,
+        node: usize,
+        question: RoleQuestion<'_>,
+    ) -> Result<RoleLogicalContext, PalsError> {
+        let game_generation = self.game_generation.ok_or(PalsError::Capacity)?;
+        let node = self
+            .nodes
+            .get(node)
+            .ok_or(StoreError::InvalidHandle("role node"))?;
+        let situation = self.stores.situations.get(node.situation)?;
+        if situation.state != node.state
+            || !self
+                .stores
+                .states
+                .get(node.state)?
+                .same_state(&node.position.snapshot())
+            || self.stores.lines.get(situation.focus)?.start_state != node.state
+        {
+            return Err(StoreError::InvalidHandle("role checked situation/state/focus").into());
+        }
+        if question.prefix.len() > self.config.line_plies
+            || question.proposal.len() > self.config.line_plies
+            || question
+                .refutation
+                .is_some_and(|line| line.len() > self.config.line_plies)
+            || question.divergences.len() > self.config.line_plies
+        {
+            return Err(PalsError::Capacity);
+        }
+        let focus = self.stores.lines.moves(situation.focus)?;
+        let mut prefix = Vec::new();
+        prefix
+            .try_reserve_exact(question.prefix.len())
+            .map_err(|_| PalsError::Capacity)?;
+        prefix.extend_from_slice(question.prefix);
+        Ok(RoleLogicalContext {
+            game_generation,
+            search_generation: self.stores.generation(),
+            situation: node.situation,
+            state: node.state,
+            focus: situation.focus,
+            purpose: question.purpose,
+            prefix,
+            focus_sha256: role_line_sha256(b"focus", &focus)?,
+            prefix_sha256: role_line_sha256(b"prefix", question.prefix)?,
+            proposal_sha256: role_line_sha256(b"proposal", question.proposal)?,
+            refutation_sha256: question
+                .refutation
+                .map(|line| role_line_sha256(b"refutation", line))
+                .transpose()?,
+            divergence_sha256: role_divergence_sha256(question.divergences)?,
+            public_revision: self.revision,
+            situation_revision: situation.revision,
+        })
+    }
+
+    fn accept_role_output(
+        &mut self,
+        node: usize,
+        prepared: &RoleLogicalContext,
+        question: RoleQuestion<'_>,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+    ) -> Result<(), PalsError> {
+        let current = self.role_context(node, question)?;
+        if current != *prepared {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        let snapshot = self.nodes[node].position.snapshot();
+        self.model.accepted_output_checked(RoleAcceptance {
+            snapshot: &snapshot,
+            context: &current,
+            deadline: limits.deadline,
+            cancel,
+        })?;
+        Ok(())
     }
     // A bounded continuation mutates only its legal prefix and work ledger;
     // proposal/counterexample slices and logical controls remain borrowed.
@@ -1745,6 +2008,14 @@ impl<M: RoleModel> PalsEngine<M> {
         if legal.len() > 256 {
             return Err(PalsError::Capacity);
         }
+        let question = RoleQuestion {
+            purpose: RoleQueryPurpose::ValueFresh,
+            prefix: line,
+            proposal: line,
+            refutation: None,
+            divergences: &[],
+        };
+        let context = self.role_context(node, question)?;
         let query = RoleQuery {
             position: &self.nodes[node].position,
             legal: &legal,
@@ -1759,7 +2030,7 @@ impl<M: RoleModel> PalsEngine<M> {
         query.check_control()?;
         counters.role_calls += 1;
         counters.value_calls += 1;
-        let output = self.model.evaluate_value(query)?;
+        let output = self.model.evaluate_value_with_context(query, &context)?;
         output.validate(&self.nodes[node].position, &identity)?;
         counters.completed_value_calls += 1;
         // Keep the full actual input identity; numeric scope IDs are metadata.
@@ -1817,7 +2088,7 @@ impl<M: RoleModel> PalsEngine<M> {
         if Instant::now() >= limits.deadline {
             return Err(RoleError::Deadline.into());
         }
-        self.model.accepted_output();
+        self.accept_role_output(node, &context, question, limits, cancel)?;
         counters.consumed_role_outputs += 1;
         counters.accepted_value_outputs += 1;
         self.nodes[node].model_value = Some(output);
@@ -3092,15 +3363,26 @@ impl<M: RoleModel> PalsEngine<M> {
             }
             counters.role_calls += 1;
             counters.critic_calls += 1;
-            let scores = self.model.divergences(DivergenceQuery {
-                root: &self.nodes[root].position,
+            let question = RoleQuestion {
+                purpose: RoleQueryPurpose::DivergencePolicy,
+                prefix: &[],
                 proposal: &proposal,
-                candidates: &divergences,
-                records: &self.records,
-                revision: self.revision,
-                deadline: limits.deadline,
-                cancel,
-            })?;
+                refutation: None,
+                divergences: &divergences,
+            };
+            let context = self.role_context(root, question)?;
+            let scores = self.model.divergences_with_context(
+                DivergenceQuery {
+                    root: &self.nodes[root].position,
+                    proposal: &proposal,
+                    candidates: &divergences,
+                    records: &self.records,
+                    revision: self.revision,
+                    deadline: limits.deadline,
+                    cancel,
+                },
+                &context,
+            )?;
             if scores.len() != divergences.len() || scores.iter().any(|v| !v.is_finite()) {
                 return Err(RoleError::InvalidOutput.into());
             }
@@ -3111,7 +3393,7 @@ impl<M: RoleModel> PalsEngine<M> {
             if Instant::now() >= limits.deadline {
                 return Err(RoleError::Deadline.into());
             }
-            self.model.accepted_output();
+            self.accept_role_output(root, &context, question, limits, cancel)?;
             counters.consumed_role_outputs += 1;
             counters.accepted_critic_outputs += 1;
             let mut ranked: Vec<_> = (0..divergences.len()).collect();
@@ -3723,6 +4005,44 @@ fn better_root_choice(
 
 // Local provenance handles only. These never authorize exact NN cache identity;
 // neural adapters carry their full canonical model/input digests separately.
+fn role_line_sha256(domain: &[u8], line: &[BoardMove]) -> Result<[u8; 32], StoreError> {
+    let mut digest = Sha256::new();
+    digest.update(b"rz-pals-role-ordered-move16/1\0");
+    digest.update(
+        u64::try_from(domain.len())
+            .map_err(|_| StoreError::Capacity("role digest domain"))?
+            .to_le_bytes(),
+    );
+    digest.update(domain);
+    digest.update(
+        u64::try_from(line.len())
+            .map_err(|_| StoreError::Capacity("role digest line"))?
+            .to_le_bytes(),
+    );
+    for &movement in line {
+        digest.update(Move16::pack(movement)?.bits().to_le_bytes());
+    }
+    Ok(digest.finalize().into())
+}
+
+fn role_divergence_sha256(candidates: &[usize]) -> Result<[u8; 32], StoreError> {
+    let mut digest = Sha256::new();
+    digest.update(b"rz-pals-role-ordered-divergence/1\0");
+    digest.update(
+        u64::try_from(candidates.len())
+            .map_err(|_| StoreError::Capacity("role divergence length"))?
+            .to_le_bytes(),
+    );
+    for &candidate in candidates {
+        digest.update(
+            u64::try_from(candidate)
+                .map_err(|_| StoreError::Capacity("role divergence index"))?
+                .to_le_bytes(),
+        );
+    }
+    Ok(digest.finalize().into())
+}
+
 fn stable_id(value: &str) -> u64 {
     value.bytes().fold(0xcbf29ce484222325, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
@@ -4476,6 +4796,406 @@ mod tests {
             max_cpu_nodes: 2000,
             cpu_depth: 1,
         }
+    }
+
+    #[derive(Default)]
+    struct LogicalProbe {
+        pending: Option<(RoleLogicalContext, PositionSnapshot, Instant, usize)>,
+        accepted: Vec<RoleLogicalContext>,
+        failure: Option<RoleError>,
+        resets: Vec<Option<u64>>,
+    }
+    impl LogicalProbe {
+        fn prepare(
+            &mut self,
+            position: &Position,
+            context: &RoleLogicalContext,
+            deadline: Instant,
+            cancel: &AtomicBool,
+        ) {
+            assert!(self.pending.is_none());
+            self.pending = Some((
+                context.clone(),
+                position.snapshot(),
+                deadline,
+                cancel as *const AtomicBool as usize,
+            ));
+        }
+    }
+    impl RoleModel for LogicalProbe {
+        fn identity(&self) -> &str {
+            LegalOrderRoleMock.identity()
+        }
+        fn value_identity(&self) -> Option<&ModelValueIdentity> {
+            LegalOrderRoleMock.value_identity()
+        }
+        fn propose(&mut self, _: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+            Err(RoleError::Backend("contextless test dispatch".into()))
+        }
+        fn reply(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+            self.propose(query)
+        }
+        fn repair(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+            self.propose(query)
+        }
+        fn divergences(&mut self, _: DivergenceQuery<'_>) -> Result<Vec<f32>, RoleError> {
+            Err(RoleError::Backend("contextless test divergence".into()))
+        }
+        fn propose_with_context(
+            &mut self,
+            query: RoleQuery<'_>,
+            context: &RoleLogicalContext,
+        ) -> Result<RoleEvaluation, RoleError> {
+            assert_eq!(context.purpose, RoleQueryPurpose::ProposePolicy);
+            self.prepare(query.position, context, query.deadline, query.cancel);
+            LegalOrderRoleMock::evaluate(query)
+        }
+        fn reply_with_context(
+            &mut self,
+            query: RoleQuery<'_>,
+            context: &RoleLogicalContext,
+        ) -> Result<RoleEvaluation, RoleError> {
+            assert_eq!(context.purpose, RoleQueryPurpose::ReplyPolicy);
+            self.prepare(query.position, context, query.deadline, query.cancel);
+            LegalOrderRoleMock::evaluate(query)
+        }
+        fn repair_with_context(
+            &mut self,
+            query: RoleQuery<'_>,
+            context: &RoleLogicalContext,
+        ) -> Result<RoleEvaluation, RoleError> {
+            assert_eq!(context.purpose, RoleQueryPurpose::RepairPolicy);
+            self.prepare(query.position, context, query.deadline, query.cancel);
+            LegalOrderRoleMock::evaluate(query)
+        }
+        fn divergences_with_context(
+            &mut self,
+            query: DivergenceQuery<'_>,
+            context: &RoleLogicalContext,
+        ) -> Result<Vec<f32>, RoleError> {
+            assert_eq!(context.purpose, RoleQueryPurpose::DivergencePolicy);
+            self.prepare(query.root, context, query.deadline, query.cancel);
+            LegalOrderRoleMock.divergences(query)
+        }
+        fn evaluate_value_with_context(
+            &mut self,
+            query: RoleQuery<'_>,
+            context: &RoleLogicalContext,
+        ) -> Result<ModelValueOutput, RoleError> {
+            assert_eq!(context.purpose, RoleQueryPurpose::ValueFresh);
+            self.prepare(query.position, context, query.deadline, query.cancel);
+            LegalOrderRoleMock.evaluate_value(query)
+        }
+        fn accepted_output_checked(
+            &mut self,
+            acceptance: RoleAcceptance<'_>,
+        ) -> Result<(), RoleError> {
+            acceptance.check_control()?;
+            let (context, snapshot, deadline, cancel) =
+                self.pending.as_ref().ok_or(RoleError::InvalidOutput)?;
+            assert_eq!(context, acceptance.context);
+            assert!(snapshot.same_state(acceptance.snapshot));
+            assert_eq!(*deadline, acceptance.deadline);
+            assert_eq!(*cancel, acceptance.cancel as *const AtomicBool as usize);
+            if let Some(error) = &self.failure {
+                return Err(error.clone());
+            }
+            self.accepted.push(context.clone());
+            self.pending = None;
+            Ok(())
+        }
+        fn new_game_with_generation(&mut self, generation: Option<u64>) {
+            self.pending = None;
+            self.resets.push(generation);
+        }
+        fn finish_search(&mut self, _: RoleSearchClosure) {
+            self.pending = None;
+        }
+    }
+    fn logical_probe() -> PalsEngine<Box<LogicalProbe>> {
+        PalsEngine::new(
+            PalsConfig::default(),
+            Box::new(LogicalProbe::default()),
+            CpuEngine::new(CpuConfig::default()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn logical_context_digests_preserve_order_length_domain_and_promotions() {
+        let first = BoardMove::from_uci("e2e4").unwrap();
+        let second = BoardMove::from_uci("e7e5").unwrap();
+        assert_ne!(
+            role_line_sha256(b"prefix", &[first, second]).unwrap(),
+            role_line_sha256(b"prefix", &[second, first]).unwrap()
+        );
+        assert_ne!(
+            role_line_sha256(b"prefix", &[first]).unwrap(),
+            role_line_sha256(b"proposal", &[first]).unwrap()
+        );
+        assert_ne!(
+            role_line_sha256(b"prefix", &[first]).unwrap(),
+            role_line_sha256(b"prefix", &[first, second]).unwrap()
+        );
+        let promotions: HashSet<_> = ["a7a8q", "a7a8r", "a7a8b", "a7a8n"]
+            .into_iter()
+            .map(|movement| {
+                role_line_sha256(b"proposal", &[BoardMove::from_uci(movement).unwrap()]).unwrap()
+            })
+            .collect();
+        assert_eq!(promotions.len(), 4);
+        assert_ne!(
+            role_divergence_sha256(&[1, 3]).unwrap(),
+            role_divergence_sha256(&[3, 1]).unwrap()
+        );
+    }
+
+    #[test]
+    fn logical_context_uses_current_checked_store_and_separates_record_metadata() {
+        let mut engine = engine();
+        let position = Position::startpos();
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine.intern(position).unwrap();
+        let prefix = [BoardMove::from_uci("e2e4").unwrap()];
+        let question = RoleQuestion {
+            purpose: RoleQueryPurpose::ProposePolicy,
+            prefix: &prefix,
+            proposal: &prefix,
+            refutation: None,
+            divergences: &[],
+        };
+        let original = engine.role_context(root, question).unwrap();
+        assert_eq!(original.situation, engine.nodes[root].situation);
+        assert_eq!(original.state, engine.nodes[root].state);
+        assert_eq!(original.search_generation, engine.stores.generation());
+        assert_eq!(original.prefix, prefix);
+        engine.revision += 1;
+        engine
+            .stores
+            .situations
+            .get_mut(original.situation)
+            .unwrap()
+            .revision += 1;
+        let revised = engine.role_context(root, question).unwrap();
+        assert_ne!(original, revised);
+        assert_eq!(
+            original.focus_prefix_sha256(),
+            revised.focus_prefix_sha256()
+        );
+        assert_eq!(original.proposal_sha256, revised.proposal_sha256);
+        let empty_refutation = engine
+            .role_context(
+                root,
+                RoleQuestion {
+                    refutation: Some(&[]),
+                    ..question
+                },
+            )
+            .unwrap();
+        assert_ne!(
+            revised.refutation_sha256,
+            empty_refutation.refutation_sha256
+        );
+        engine.stores.situations.remove(original.situation).unwrap();
+        assert!(matches!(
+            engine.role_context(root, question),
+            Err(PalsError::Store(StoreError::InvalidHandle(_)))
+        ));
+    }
+
+    #[test]
+    fn boxed_contextual_dispatch_checks_original_controls_and_counts_only_acceptance() {
+        let mut engine = logical_probe();
+        let report = engine
+            .search(&Position::startpos(), limits(), &AtomicBool::new(false))
+            .unwrap();
+        assert!(
+            engine
+                .model
+                .accepted
+                .iter()
+                .any(|c| c.purpose == RoleQueryPurpose::DivergencePolicy)
+        );
+        assert_eq!(
+            report.counters.consumed_role_outputs as usize,
+            engine.model.accepted.len()
+        );
+        assert!(
+            engine
+                .model
+                .accepted
+                .iter()
+                .all(|c| c.game_generation == 0 && c.search_generation == 1)
+        );
+        assert!(engine.model.pending.is_none());
+    }
+
+    #[test]
+    fn checked_acceptance_failure_is_propagated_without_consumption() {
+        let mut engine = logical_probe();
+        engine.model.failure = Some(RoleError::Backend("provisional commit rejected".into()));
+        assert!(matches!(
+            engine.search(&Position::startpos(), limits(), &AtomicBool::new(false)),
+            Err(PalsError::Role(RoleError::Backend(message))) if message == "provisional commit rejected"
+        ));
+        let counters = engine.last_search_counters().unwrap();
+        assert_eq!(counters.completed_proposer_calls, 1);
+        assert_eq!(counters.consumed_role_outputs, 0);
+        assert_eq!(counters.accepted_proposer_outputs, 0);
+        assert!(engine.model.accepted.is_empty());
+        assert!(engine.model.pending.is_none());
+    }
+
+    #[test]
+    fn logical_acceptance_rejects_new_focus_and_changed_records_before_provider_commit() {
+        let mut engine = logical_probe();
+        let position = Position::startpos();
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine.intern(position.clone()).unwrap();
+        let question = RoleQuestion {
+            purpose: RoleQueryPurpose::ProposePolicy,
+            prefix: &[],
+            proposal: &[],
+            refutation: None,
+            divergences: &[],
+        };
+        let control = limits();
+        let cancel = AtomicBool::new(false);
+        let prepared = engine.role_context(root, question).unwrap();
+        engine
+            .model
+            .prepare(&position, &prepared, control.deadline, &cancel);
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        assert!(matches!(
+            engine.accept_role_output(root, &prepared, question, control, &cancel),
+            Err(PalsError::Role(RoleError::InvalidOutput))
+        ));
+        assert!(engine.model.accepted.is_empty());
+        engine.model.pending = None;
+        let current = engine.role_context(root, question).unwrap();
+        engine
+            .model
+            .prepare(&position, &current, control.deadline, &cancel);
+        engine.revision += 1;
+        assert!(matches!(
+            engine.accept_role_output(root, &current, question, control, &cancel),
+            Err(PalsError::Role(RoleError::InvalidOutput))
+        ));
+        assert!(engine.model.accepted.is_empty());
+    }
+
+    #[test]
+    fn checked_acceptance_keeps_deadline_and_cancellation_live_after_delivery() {
+        let mut engine = logical_probe();
+        let position = Position::startpos();
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine.intern(position.clone()).unwrap();
+        let question = RoleQuestion {
+            purpose: RoleQueryPurpose::ProposePolicy,
+            prefix: &[],
+            proposal: &[],
+            refutation: None,
+            divergences: &[],
+        };
+        let context = engine.role_context(root, question).unwrap();
+        let cancel = AtomicBool::new(false);
+        let control = limits();
+        engine
+            .model
+            .prepare(&position, &context, control.deadline, &cancel);
+        cancel.store(true, Ordering::Release);
+        assert!(matches!(
+            engine.accept_role_output(root, &context, question, control, &cancel),
+            Err(PalsError::Role(RoleError::Canceled))
+        ));
+        assert!(engine.model.accepted.is_empty());
+        engine.model.pending = None;
+        cancel.store(false, Ordering::Release);
+        let expired = PalsLimits {
+            deadline: Instant::now(),
+            ..control
+        };
+        engine
+            .model
+            .prepare(&position, &context, expired.deadline, &cancel);
+        assert!(matches!(
+            engine.accept_role_output(root, &context, question, expired, &cancel),
+            Err(PalsError::Role(RoleError::Deadline))
+        ));
+        assert!(engine.model.accepted.is_empty());
+    }
+
+    #[test]
+    fn value_dispatch_and_acceptance_are_always_explicitly_fresh() {
+        let mut engine = PalsEngine::new_with_checker(
+            PalsConfig::default(),
+            Box::new(LogicalProbe::default()),
+            ForeignFixture::new(ForeignFixtureMode::Normal(0)),
+        )
+        .unwrap();
+        let position = Position::startpos();
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine.intern(position).unwrap();
+        let mut counters = PalsCounters::default();
+        engine
+            .evaluate_model_value(root, &[], limits(), &AtomicBool::new(false), &mut counters)
+            .unwrap();
+        assert_eq!(engine.model.accepted.len(), 1);
+        assert_eq!(
+            engine.model.accepted[0].purpose,
+            RoleQueryPurpose::ValueFresh
+        );
+        assert_eq!(counters.accepted_value_outputs, 1);
+        assert_eq!(counters.proposer_calls, 0);
+        assert_eq!(counters.consumed_role_outputs, 1);
+    }
+
+    #[test]
+    fn logical_game_reset_and_generation_exhaustion_cannot_reissue_authority() {
+        let mut engine = logical_probe();
+        engine
+            .search(&Position::startpos(), limits(), &AtomicBool::new(false))
+            .unwrap();
+        let old = engine.model.accepted[0].clone();
+        engine.new_game();
+        engine
+            .search(&Position::startpos(), limits(), &AtomicBool::new(false))
+            .unwrap();
+        let new = engine
+            .model
+            .accepted
+            .iter()
+            .find(|c| c.game_generation == 1)
+            .unwrap();
+        assert_eq!(old.situation, new.situation);
+        assert_eq!(old.search_generation, new.search_generation);
+        assert_ne!(old.game_generation, new.game_generation);
+        assert_eq!(engine.model.resets, [Some(1)]);
+        engine.game_generation = Some(u64::MAX);
+        engine.new_game();
+        assert_eq!(engine.game_generation, None);
+        assert_eq!(engine.model.resets.last(), Some(&None));
+        assert!(matches!(
+            engine.search(&Position::startpos(), limits(), &AtomicBool::new(false)),
+            Err(PalsError::Capacity)
+        ));
+        engine.new_game();
+        assert_eq!(engine.game_generation, None);
     }
     #[test]
     fn boxed_role_accounting_closes_each_search_once_without_claiming_physical_completion() {

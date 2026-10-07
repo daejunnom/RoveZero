@@ -772,3 +772,55 @@ comparative fixture 8개 포함), all-target Clippy가 통과했다. 두 언어�
 comparative source는 위 중앙 검사와 새 SHA의 CI를 구분한다. 관리 build slot은 마지막
 검사 후 약 4.77GiB, 임시 child tree 정리 verified이며 기존 8GiB slot/12GiB catalog
 상한을 유지했다. 이 크기는 모델 peak/RSS/VRAM 성능 결과가 아니다.
+
+### 2026-10-08 후속 CPU 연결 — 수집·후보 검사·Warm 분기
+
+`ab6e4d5`는 외부 helper의 실제 arena owner·독립 profile·preflight·게임별 PID·
+종료·foreign 작업을 Core까지 연결하는 구현 단위다. Own 작업 합계와 외부 checker
+합계는 분리하고, 미관측 완료·재사용·옵션 적용은 unknown으로 남긴다. experiments
+78개, arena 105개, UCI 175개 및 CPU task CLI 3개가 중앙 검사에서 통과했다.
+이후 작은 error 표현·fixture 순회 수정에는 해당 검사와 영향 all-target Clippy를
+다시 적용했다. 실제 외부 helper paired arena/Core 실행 인수는 아직 남아 있다.
+
+`506114e`는 `pals_cpu_task --candidate-only`의 별도 단일 후보 dispatcher다.
+새 Own CPU engine·TT를 한 요청에 한 번 사용하며 Rules 상태·이력·합법 수 순서와
+PV를 검증한다. raw scalar는 차례 관점의 미보정 단위다. captured/checker/선행 계획
+식별은 caller 선언이며, CLI가 실제 실행 파일을 확인한 범위와 caller가 독립적으로
+등록·관측한 범위를 구분한다. 기존 V task CLI와 schema는 유지한다.
+
+`71ddf7c`는 독립 등록·관측 자료를 받는 비교 consumer다. 기존 strict frozen
+loader·current selector를 재사용하고 실제 request·stdout/stderr·launch·선행 계획·
+criterion·CPU source/binary pin을 대조한다. 전체 시간은
+`report.elapsed_ms ≤ receipt.elapsed_ms ≤ caller launch.elapsed_ms`를 요구한다.
+partial·취소·실패·missing·terminal·mate band·tie는 masked로 보존한다. 별도 ordinal
+softplus 준비는 frozen CPU FP32 forward/loss만 수행하며 기존 policy/WDL·repair·
+divergence 인수와 분리한다. 합성 fixture 12개와 독립 source 리뷰가 통과했지만,
+실제 launcher·strict 재로딩·P/C nonmasked target·no-step loss의 종단 인수는 남아 있다.
+
+`48e4fe1`는 별도 private Warm export domain을 제공한다. legacy Fresh graph와
+파라미터는 보존하고 full 6144 FP32 accepted-latent 입력·명시적인 Warm Bool·P/C
+역할 분기를 추가했다. bounded manifest와 graph는 한 번 읽은 동일한 검증 bytes로
+audit·CPU ORT 실행한다. root17에서 신규 14개·기존 13개 검사 및 실제 CPU export와
+6개 수치 사례가 통과했다. 최대 절대 차이는 policy `1.641e-7`, WDL `2.863e-7`이었다.
+이는 CPU 텐서 분기·수치 대조의 근거이며 실제 Search accepted seed의 Native 재사용
+인수는 아니다. legacy 제품 실행은 계속 Fresh이고 Native Warm 연결은 별도 구현한다.
+
+실제 CPU 제품 자료도 실행별 source와 scope를 나눠 보존했다.
+
+| 관리 루트 아래 자료 | 실제 확인한 범위 | 남은 경계 |
+|---|---|---|
+| `runs/pals/continuation-cpu-check-03/cpu-products-registration-20.json` | `48e4fe1`의 CPU UCI·후보 dispatcher·arena 실행 파일과 compiler feature·hash 등록 | 새 소스의 바이너리로 자동 재사용하지 않음 |
+| 같은 루트 `actual-candidate-check-22.json` | 기존 실제 proposer capture의 후보 2개를 각 fresh child에서 검사. Rules·PV·단일 root·완료·전체 시간·self-image 대조 | 정식 comparative bank·critic target·양의 loss를 생성한 검사 아님 |
+| `runs/pals/strict-native-comparative-capture-cpu-23/capture-execution.json` | 별도 등록한 이전 `a1c09b5` collector와 고정 untrained checkpoint의 실제 CPU P/C capture 12행 | 1게임·2 ply 기능 검사. `ply_limit`/`unknown` 유지, 비교 target 인수 전 |
+| `reports/pals/ci-48e4fe1-final.json` | 해당 SHA의 Linux·Windows·CPU bindings·model CPU 네 CI job 성공 | 후속 SHA와 GPU 성공을 대신하지 않음 |
+
+root13의 CPU graph 수치 성공 뒤 managed venv symlink 정리 실패는 실패 기록으로
+보존했다. 소유 token·비활성 child tree를 확인한 좁은 복구 후 root17부터 `venv
+--copies`를 사용했다. root17·21·22·23의 임시 tree 정리는 verified이고 managed
+build의 8GiB slot/12GiB catalog 상한을 유지했다. 초기 WSL 시작 실패는 workload가
+시작되기 전의 별도 진단이며 원인을 GPU·모델·물리 RAM으로 확정하지 않는다.
+
+이번 세션 GPU 검증은 사용자 지시에 따라 보류한다. 실제 학습·optimizer·backward와
+새 cloud 비용은 실행하지 않았다. CPU 기능·수치·소유권 결과를 GPU·속도·기력
+개선으로 확대하지 않는다. PR #24의 별도 자원·Ponder 변경은 읽기 전용으로 확인했으며
+이 branch의 Ponder off·기존 실행 identity에 합치지 않았다.
