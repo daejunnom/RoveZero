@@ -551,3 +551,18 @@ all-feature library Clippy `-D warnings`가 통과했다. actual CPU whole/page 
 별도 검증 전이며 제품 CLI·Native receipt 선택은 아직 연결하지 않았다. subset Run에서도
 기존 public graph는 board 66개 토큰을 다시 계산한다. page hit·encoded record slots·
 physical B1 NN 입력·탐색 소비 수를 구분하며 속도·메모리 개선을 주장하지 않는다.
+
+`record-pages-numeric-01`은 `c6ead34`와 별도 예제 source pin의 실제 CPU ONNX
+정확성 인수다. 기존 PyTorch reference 6개의 whole 결과를 유지하며 page 경로도 같은
+6개 reference에 대조했다. 추가 whole/page 파생 입력 15개는 0/1/2/128 records,
+padding과 실제 zero-feature record, append·correction·reorder·critical·ID 이동·삭제·
+P/C 순서를 포함한다. 최대 policy 절대 차이 `5.96046448e-8`, WDL `8.94069672e-8`,
+K/V key `1.19209290e-6`, private latent `1.66893005e-6`는 기존 허용 오차를 만족했다.
+mask는 정확히 일치했다. 파생 입력은 모델 tensor 수치 검사이며 Rules 인증·CPU 관측·
+학습 목표의 증거가 아니다.
+
+반복·reorder·critical·ID 변경에서는 public Run이 늘지 않았고, 단일 append·correction은
+missing record 한 슬롯만 공급했다. clear는 NN 실행 없이 page와 witness를 비웠으며
+새 게임 이후에는 실제 public Run을 확인했다. 완료 뒤 pin·subset·join scratch·prepared
+input·transient reservation이 해제됐고 프로세스 exit 0과 관리 supervisor의 자식 정리도
+확인했다. 예제 all-feature Clippy가 통과했다. 실제 학습은 0 step이며 GPU는 user-deferred다.
