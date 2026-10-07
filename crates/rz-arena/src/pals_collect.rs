@@ -3750,8 +3750,14 @@ mod tests {
         let mut cpu = driver();
         let registration = producer_config(&mut cpu);
         let registry = own_collection_registry(&cpu).unwrap();
+        let mut config = small_config();
+        // This correctness fixture hashes the actual test executable while
+        // other CI tests run concurrently. Keep a finite admission window,
+        // without treating executable hashing/scheduling as a speed assertion.
+        // Production defaults and explicit timeout/failure fixtures stay fixed.
+        config.max_wall_time_ms = 120_000;
         let receipt = collect_pals_own_data_with_producer(
-            small_config(),
+            config,
             &output.0,
             &mut cpu,
             &registry,
@@ -4121,8 +4127,12 @@ mod tests {
         // Borrowing the actual owner capability redirects every dispatch and
         // lifecycle hook to that owner; it does not authorize wrapper methods.
         wrapper.delegate_owner = true;
+        let mut config = small_config();
+        // This positive owner-routing fixture also pins the actual test
+        // executable under parallel CI; its wall-time is not a speed assertion.
+        config.max_wall_time_ms = 120_000;
         let receipt = collect_pals_own_data_with_producer(
-            small_config(),
+            config,
             &output.0,
             &mut wrapper,
             &registry,
