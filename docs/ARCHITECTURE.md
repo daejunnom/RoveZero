@@ -188,6 +188,9 @@ deadline·상주 메모리를 먼저 정의한다. model 구조·history 입력�
 
 ## 구현·연구의 진행 축
 
+PALS 독자 엔진의 실제 연결·책임 경계와 남은 인수는
+[PALS 구현 현황과 후속 인수 지시서](research/PALS-IMPLEMENTATION.md)를 참고한다.
+
 20개 TASK의 실제 순서와 병렬 의존성은 [구현 지시서](IMPLEMENTATION-DIRECTIVES.md)를
 따른다. 총괄의 최소 공통 계약 → A/B/C01/D01/E/F01 mock 병렬 → 독립 규칙·UCI·
 CPU/mock 인수 → 단일 가중치의 실제 Rust 추론 → 종단 계측 → 한 검색/런타임
