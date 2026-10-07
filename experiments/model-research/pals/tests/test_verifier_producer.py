@@ -85,6 +85,28 @@ def parent():
     return {"input": frozen, "future_label": None, "verifier_private": None}, encoding
 
 
+def cpu_storage_fixture():
+    original, encoding = parent()
+    context, req = TaskContext(SHA, SHA, 0), request()
+    source = {"kind": "own_pals", "model_configuration_sha256": "b" * 64, "model_weights_sha256": "c" * 64}
+    row, _ = producer.verifier_input(original, encoding, source, context, (0.0,) * 16, "d" * 64, 1)
+    actual = response(req)
+    evidence = {"input_sha256": row["input"]["sha256"], "context": producer.asdict(context),
+                "request": req, "response": actual, "observed_information": producer.observed_gain(req, actual)}
+    evidence_sha = producer._hash(producer.GAIN_SCHEMA, evidence)
+    label = producer.future_label(row["input"]["snapshot"], context, "resume_task", req, actual, evidence_sha)
+    private = {"task_kind": "resume_task", "control_sha256": req["context_sha256"], "private_latent": [0.25]}
+    artifacts = (
+        ("cpu-evidence.jsonl", {"evidence_sha256": evidence_sha, **evidence}),
+        ("future-labels.jsonl", {"input_sha256": row["input"]["sha256"], "future_label": label,
+                                 "observed_information_evidence_sha256": evidence_sha}),
+        ("private-records.jsonl", {"record": dict(row, future_label=label, verifier_private=private),
+                                  "evidence_sha256": evidence_sha, "task_context": producer.asdict(context),
+                                  "loss": {"task": 0.0}, "comparative_training_target": False}),
+    )
+    return row, context, req, private, artifacts, producer._json(actual) + b"\n"
+
+
 class VerifierProducerTests(unittest.TestCase):
     def setUp(self):
         self.step_guard = patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer updates forbidden"))
@@ -246,6 +268,134 @@ class VerifierProducerTests(unittest.TestCase):
             actual = producer._parse((bank.root / "receipt.json").read_bytes())
             self.assertEqual(actual["optimizer_steps"], 0)
             self.assertFalse(actual["product_verifier_enabled"])
+
+    def test_cpu_dispatch_output_and_nodes_admission_is_atomic(self):
+        row, context, req, private, _, _ = cpu_storage_fixture()
+        with tempfile.TemporaryDirectory() as temporary:
+            limits = producer.Limits(max_games=1, max_steps=1, max_nodes=1000, max_wall_time_ms=10000,
+                                     max_output_bytes=65536, max_forward_flops=1000)
+            bank = producer.PrivateBank(Path(temporary) / "admission", limits)
+            before = dict(limits.usage)
+            with self.assertRaisesRegex(ValueError, "resource limit: output_bytes"):
+                bank.reserve_cpu(req, row, private, context)
+            self.assertEqual(limits.usage, before)
+            self.assertFalse(any(bank.root.iterdir()))
+
+    def test_successful_cpu_capture_survives_each_post_result_storage_failure(self):
+        row, context, req, private, artifacts, raw = cpu_storage_fixture()
+        sealed = copy.deepcopy(row)
+        for failed_name in (name for name, _ in artifacts):
+            with self.subTest(stage=failed_name), tempfile.TemporaryDirectory() as temporary:
+                limits = producer.Limits(max_games=1, max_steps=1, max_nodes=1000, max_wall_time_ms=10000,
+                                         max_output_bytes=262144, max_forward_flops=1000)
+                bank = producer.PrivateBank(Path(temporary) / "write-failure", limits)
+                bank.append("inputs.jsonl", row["input"])
+                inputs_before = (bank.root / "inputs.jsonl").read_bytes()
+                evidence, recovery, pipe = bank.reserve_cpu(req, row, private, context)
+                pipe.consume(len(raw))
+                pipe.release()
+                limits.usage["nodes"] -= 2 * req["max_nodes_per_check"] - 30
+                # Fill all unreserved bytes: recovery must use its own credit,
+                # even when the ordinary run output quota has no headroom.
+                limits.charge("output_bytes", limits.maximum["output_bytes"] - limits.usage["output_bytes"])
+                primary = OSError("injected post-result write failure")
+                real_open = Path.open
+
+                def fail_artifact(path, *args, **kwargs):
+                    if path == bank.root / failed_name:
+                        raise primary
+                    return real_open(path, *args, **kwargs)
+
+                counts = {"selections": 1, "cpu_dispatches": 1, "cpu_checks_observed": 2, "future_labels": 0}
+                capture = {"stdout": raw, "stderr": b"", "spawned": True, "exit_code": 0, "reaped": True}
+                with patch.object(Path, "open", new=fail_artifact), self.assertRaises(OSError) as raised:
+                    try:
+                        for name, value in artifacts:
+                            bank.append(name, value, reservation=evidence)
+                    except OSError as error:
+                        producer._record_producer_failure(bank, error, counts=counts,
+                                                          checkpoint_sha256=SHA, cpu_binary_sha256=SHA,
+                                                          capture=capture, reservations=(evidence, recovery, pipe), stage=failed_name)
+                        raise
+                self.assertIs(raised.exception, primary)
+                receipt = producer._parse((bank.root / "receipt.json").read_bytes())
+                self.assertFalse(receipt["complete"])
+                self.assertEqual(receipt["failure"]["type"], "OSError")
+                self.assertEqual(receipt["failure"]["stage"], failed_name)
+                self.assertTrue(receipt["failure"]["cpu_raw_output_preserved"])
+                self.assertEqual(receipt["failure"]["cpu_observation"]["exit_code"], 0)
+                self.assertEqual(receipt["failure"]["cpu_observation"]["stdout_sha256"], hashlib.sha256(raw).hexdigest())
+                self.assertEqual(receipt["counts"], counts)
+                self.assertEqual((bank.root / "failed-cpu-stdout.bin").read_bytes(), raw)
+                self.assertEqual((bank.root / "inputs.jsonl").read_bytes(), inputs_before)
+                self.assertEqual(row, sealed)
+                self.assertEqual(limits.usage["nodes"], 30)
+                self.assertLessEqual(limits.usage["output_bytes"], limits.maximum["output_bytes"])
+                self.assertLessEqual(sum(path.stat().st_size for path in bank.root.iterdir()), limits.maximum["output_bytes"])
+
+    def test_post_result_quota_failure_preserves_raw_with_reserved_credit(self):
+        row, context, req, private, _, raw = cpu_storage_fixture()
+        with tempfile.TemporaryDirectory() as temporary:
+            limits = producer.Limits(max_games=1, max_steps=1, max_nodes=1000, max_wall_time_ms=10000,
+                                     max_output_bytes=262144, max_forward_flops=1000)
+            bank = producer.PrivateBank(Path(temporary) / "quota-failure", limits)
+            evidence, recovery, pipe = bank.reserve_cpu(req, row, private, context)
+            pipe.consume(len(raw))
+            pipe.release()
+            capture = {"stdout": raw, "stderr": b"", "spawned": True, "exit_code": 0, "reaped": True}
+            with self.assertRaisesRegex(ValueError, "sealed output reservation") as raised:
+                try:
+                    bank.append("cpu-evidence.jsonl", {"oversized": "x" * evidence.bounds["cpu-evidence.jsonl"]},
+                                reservation=evidence)
+                except ValueError as error:
+                    producer._record_producer_failure(bank, error, counts={"cpu_dispatches": 1},
+                                                      checkpoint_sha256=SHA, cpu_binary_sha256=SHA,
+                                                      capture=capture, reservations=(evidence, recovery, pipe), stage="cpu-evidence.jsonl")
+                    raise
+            receipt = producer._parse((bank.root / "receipt.json").read_bytes())
+            self.assertEqual(receipt["failure"]["message"], str(raised.exception))
+            self.assertTrue(receipt["failure"]["cpu_raw_output_preserved"])
+            self.assertEqual((bank.root / "failed-cpu-stdout.bin").read_bytes(), raw)
+            self.assertLessEqual(limits.usage["output_bytes"], limits.maximum["output_bytes"])
+
+    def test_raw_and_receipt_retention_failures_do_not_replace_primary_error(self):
+        row, context, req, private, _, raw = cpu_storage_fixture()
+        for failed_stage in ("raw", "receipt"):
+            with self.subTest(stage=failed_stage), tempfile.TemporaryDirectory() as temporary:
+                limits = producer.Limits(max_games=1, max_steps=1, max_nodes=1000, max_wall_time_ms=10000,
+                                         max_output_bytes=262144, max_forward_flops=1000)
+                bank = producer.PrivateBank(Path(temporary) / "retention-failure", limits)
+                reservations = bank.reserve_cpu(req, row, private, context)
+                capture = {"stdout": raw, "stderr": b"diagnostic", "spawned": True, "exit_code": 1, "reaped": True}
+                primary = ValueError("original post-result failure")
+                real_failed_bytes = bank.failed_cpu_bytes
+
+                def fail_stdout(name, content, **kwargs):
+                    if name == "failed-cpu-stdout.bin":
+                        raise OSError("injected raw retention failure")
+                    return real_failed_bytes(name, content, **kwargs)
+
+                target = patch.object(bank, "failed_cpu_bytes", side_effect=fail_stdout) if failed_stage == "raw" else patch.object(bank, "finish", side_effect=OSError("injected receipt failure"))
+                with target, self.assertRaises(ValueError) as raised:
+                    try:
+                        raise primary
+                    except ValueError as error:
+                        producer._record_producer_failure(bank, error, counts={"cpu_dispatches": 1},
+                                                          checkpoint_sha256=SHA, cpu_binary_sha256=SHA,
+                                                          capture=capture, reservations=reservations, stage="private-records.jsonl")
+                        raise
+                self.assertIs(raised.exception, primary)
+                self.assertLessEqual(limits.usage["output_bytes"], limits.maximum["output_bytes"])
+                if failed_stage == "raw":
+                    receipt = producer._parse((bank.root / "receipt.json").read_bytes())
+                    self.assertFalse(receipt["failure"]["cpu_raw_output_preserved"])
+                    self.assertEqual(receipt["failure"]["retention_failures"][0]["stream"], "stdout")
+                    self.assertEqual((bank.root / "failed-cpu-stderr.bin").read_bytes(), b"diagnostic")
+                else:
+                    self.assertEqual(primary.preservation_failures[0]["stage"], "failure_receipt")
+                    self.assertEqual(primary.producer_failure["counts"], {"cpu_dispatches": 1})
+                    self.assertFalse(primary.producer_failure["complete"])
+                    self.assertEqual((bank.root / "failed-cpu-stdout.bin").read_bytes(), raw)
 
     def test_private_bank_reload_checks_query_context_native_parent_and_future_label(self):
         original, native = parent()

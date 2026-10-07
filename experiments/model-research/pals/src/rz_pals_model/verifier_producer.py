@@ -40,6 +40,11 @@ PROFILE = "cpu-plan-assisted-conservative-v1"
 RECHECK_PROFILE = "cpu-independent-conservative-v1"
 CPU_SEARCH = "rz-cpu-pvs/0.1"
 CPU_VALUE = "bootstrap-material-pst-v1"
+# Current generated gain scalars, seven-task/provenance label, and masked loss
+# fields have separate finite allowances; append rechecks every sealed bound.
+CPU_GAIN_OUTPUT_RESERVE = 4096
+CPU_LABEL_OUTPUT_RESERVE = 8192
+CPU_LOSS_OUTPUT_RESERVE = 4096
 # Source declaration of the exact own PVS namespace, not a learned claim.
 CPU_CONDITIONS = "iterative-deepening:1..requested;root-window:full-first,aspiration40-following,full-when-mate-or-fail-inclusive;pvs:first-full,following-zero-window,strict-interior-research;qsearch:tactical-capture-ep-promotion,all-check-evasions,no-check-standpat;q-limit:checked-abort;tt:direct-mapped,full-history-value-profile,equal-remaining-depth,completed-nodes-only;selectivity:no-reductions-no-nullmove;ties:Rules-order;score:side-to-move-raw"
 
@@ -216,10 +221,16 @@ class Limits:
         return max(1, self.max_wall_time_ms - self.check())
 
     def charge(self, name, value):
-        _integer(value, 0, 2**63 - 1, name)
-        if name not in self.usage or self.usage[name] + value > self.maximum[name]:
-            raise ValueError("private verifier producer resource limit: " + name)
-        self.usage[name] += value
+        self.charge_many({name: value})
+
+    def charge_many(self, charges):
+        # Admit all dispatch costs before updating any counter or spawning.
+        for name, value in charges.items():
+            _integer(value, 0, 2**63 - 1, name)
+            if name not in self.usage or self.usage[name] + value > self.maximum[name]:
+                raise ValueError("private verifier producer resource limit: " + name)
+        for name, value in charges.items():
+            self.usage[name] += value
 
     def step(self, game):
         self.check()
@@ -227,6 +238,20 @@ class Limits:
             self.charge("games", 1)
             self.games.add(game)
         self.charge("steps", 1)
+
+
+class _OutputCredit:
+    """Finite output bytes already charged by one atomic admission."""
+    def __init__(self, limits, maximum):
+        self.limits, self.maximum, self.remaining = limits, maximum, maximum
+
+    def consume(self, value):
+        _integer(value, 0, self.remaining, "reserved output bytes")
+        self.remaining -= value  # Keep attempted/partial writes charged.
+
+    def release(self):
+        self.limits.usage["output_bytes"] -= self.remaining
+        self.remaining = 0
 
 
 class PrivateBank:
@@ -249,22 +274,54 @@ class PrivateBank:
         # Reserve final receipt bytes; failed/partial inputs are never admitted.
         self.limits.charge("output_bytes", 16384)
 
-    def append(self, name, value):
+    def reserve_cpu(self, request, row, private, context):
+        """Reserve pipe, raw recovery and capped post-result files together."""
+        self.limits.check()
+        cap = _integer(request["max_output_bytes"], 1024, 1024 * 1024, "CPU response output")
+        # Known envelopes are sized exactly. The only future payloads are the
+        # response (capped below), bounded gain/label fields, and masked losses.
+        envelopes = (
+            {"evidence_sha256": "0" * 64, "input_sha256": row["input"]["sha256"],
+             "context": asdict(context), "request": request, "response": None, "observed_information": None},
+            {"input_sha256": row["input"]["sha256"], "future_label": None,
+             "observed_information_evidence_sha256": "0" * 64},
+            {"record": dict(row, verifier_private=private), "evidence_sha256": "0" * 64,
+             "task_context": asdict(context), "loss": None, "comparative_training_target": False},
+        )
+        bounds = dict(zip(("cpu-evidence.jsonl", "future-labels.jsonl", "private-records.jsonl"),
+                          (len(_json(envelopes[0])) + 1 + cap + CPU_GAIN_OUTPUT_RESERVE,
+                           len(_json(envelopes[1])) + 1 + CPU_LABEL_OUTPUT_RESERVE,
+                           len(_json(envelopes[2])) + 1 + CPU_LABEL_OUTPUT_RESERVE + CPU_LOSS_OUTPUT_RESERVE)))
+        artifact_bytes = sum(bounds.values())
+        self.limits.charge_many({"output_bytes": artifact_bytes + 2 * cap,
+                                 "nodes": 2 * request["max_nodes_per_check"]})
+        evidence, recovery, pipe = (_OutputCredit(self.limits, value) for value in (artifact_bytes, cap, cap))
+        evidence.bounds = bounds
+        return evidence, recovery, pipe
+
+    def append(self, name, value, *, reservation=None):
         if name not in self.FILES:
             raise ValueError("unknown private artifact")
         self.limits.check()
         content = _json(value) + b"\n"
-        self._append_bytes(name, content)
+        if reservation is not None and len(content) > reservation.bounds.get(name, 0):
+            raise ValueError("private CPU artifact exceeds sealed output reservation")
+        self._append_bytes(name, content, reservation=reservation)
 
-    def failed_cpu_bytes(self, name, content):
+    def failed_cpu_bytes(self, name, content, *, reservation=None):
         if name not in self.FAILURE_FILES or not isinstance(content, bytes):
             raise ValueError("unknown private CPU failure artifact")
         # Failure recovery can retain bounded observed bytes after a deadline;
         # it can never produce an admitted complete receipt or task label.
-        self._append_bytes(name, content)
+        self._append_bytes(name, content, reservation=reservation)
 
-    def _append_bytes(self, name, content):
-        self.limits.charge("output_bytes", len(content))
+    def _append_bytes(self, name, content, *, reservation=None):
+        if reservation is None:
+            self.limits.charge("output_bytes", len(content))
+        else:
+            if reservation.limits is not self.limits:
+                raise ValueError("private output reservation belongs to another run")
+            reservation.consume(len(content))
         path = self.root / name
         _path(path)
         first = name not in self.artifacts
@@ -299,21 +356,22 @@ class CpuBridgeFailure(RuntimeError):
         super().__init__(f"CPU_T {type(cause).__name__}: {str(cause)[:512]}")
         self.capture = {key: bytes(capture.get(key, b"")) for key in ("stdout", "stderr")}
         self.details = {"cause_type": type(cause).__name__, "exit_code": capture.get("exit_code"),
+                        "spawned": capture.get("spawned", False),
                         "reaped": capture.get("reaped", False),
                         "stdout_bytes": len(self.capture["stdout"]), "stderr_bytes": len(self.capture["stderr"]),
                         "stdout_sha256": hashlib.sha256(self.capture["stdout"]).hexdigest(),
                         "stderr_sha256": hashlib.sha256(self.capture["stderr"]).hexdigest()}
 
 
-def run_cpu_bridge(binary, request, limits, *, capture=None):
+def run_cpu_bridge(binary, request, limits, *, capture=None, pipe_reservation=None):
     capture = {} if capture is None else capture
     try:
-        return _run_cpu_bridge(binary, request, limits, capture)
+        return _run_cpu_bridge(binary, request, limits, capture, pipe_reservation)
     except BaseException as error:
         raise CpuBridgeFailure(error, capture) from error
 
 
-def _run_cpu_bridge(binary, request, limits, capture):
+def _run_cpu_bridge(binary, request, limits, capture, pipe_reservation=None):
     """One own no-child Rust worker; capped pipes, timeout/cancel kill and reap."""
     raw = _json(request) + b"\n"
     if len(raw) > 512 * 1024:
@@ -321,10 +379,25 @@ def _run_cpu_bridge(binary, request, limits, capture):
     limits.check()
     cap = request["max_output_bytes"]
     _integer(cap, 1024, 1024 * 1024, "CPU response output")
-    limits.charge("output_bytes", 2 * cap)  # pipe + bounded failure preservation
+    fallback_recovery = None
+    if pipe_reservation is None:
+        # Preserve direct callers' existing two-cap pre-spawn admission. The
+        # producer passes separate recovery credit that survives this return.
+        limits.charge("output_bytes", 2 * cap)
+        pipe_reservation = _OutputCredit(limits, cap)
+        fallback_recovery = _OutputCredit(limits, cap)
+    if pipe_reservation.limits is not limits or pipe_reservation.remaining != cap:
+        raise ValueError("CPU_T pipe reservation differs from registered bound")
     started = time.monotonic()
-    proc = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, shell=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        proc = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, shell=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except BaseException:
+        pipe_reservation.release()  # A rejected spawn produced no pipe bytes.
+        if fallback_recovery is not None:
+            fallback_recovery.release()
+        raise
+    capture["spawned"] = True
     output, errors, failures, lock = bytearray(), bytearray(), [], threading.Lock()
     capture.update(stdout=output, stderr=errors)
 
@@ -377,6 +450,8 @@ def _run_cpu_bridge(binary, request, limits, capture):
         if errors:
             raise ValueError("CPU_T emitted unexpected diagnostic output")
         response = _parse(bytes(output))
+        if len(_json(response)) > cap:
+            raise ValueError("CPU_T canonical response exceeds registered output bound")
         limits.check()
     finally:
         if proc.poll() is None:
@@ -388,14 +463,69 @@ def _run_cpu_bridge(binary, request, limits, capture):
                 worker.join(timeout=1)
         for pipe in (proc.stdin, proc.stdout, proc.stderr):
             pipe.close()
-        if not failures and not any(worker.is_alive() for worker in workers):
-            limits.usage["output_bytes"] -= 2 * cap - len(output) - len(errors)
-        else:
-            limits.usage["output_bytes"] -= cap  # unknown pipe cost remains reserved
+        retained = len(output) + len(errors) if not failures and not any(worker.is_alive() for worker in workers) else cap
+        pipe_reservation.consume(retained)  # Unknown pipe cost stays reserved.
+        pipe_reservation.release()
+        if fallback_recovery is not None:
+            fallback_recovery.release()
     if (time.monotonic() - started) * 1000 >= request["max_wall_time_ms"]:
         raise TimeoutError("CPU_T task including spawn/parse/cleanup exceeded wall bound")
     limits.check()
     return response
+
+
+def _record_producer_failure(bank, error, *, counts, checkpoint_sha256, cpu_binary_sha256,
+                             capture=None, reservations=(), reserved_nodes=0, stage=None):
+    """Best-effort bounded recovery must never replace the primary exception."""
+    failure = {"type": type(error).__name__, "message": str(error)[:512]}
+    evidence, recovery, pipe = reservations if reservations else (None, None, None)
+    if isinstance(error, CpuBridgeFailure):
+        # The wrapper froze the streams together with these hashes. A late
+        # reader must not change the bytes later copied into failure evidence.
+        capture = error.capture
+    if capture is not None:
+        failure["stage"] = stage
+        failure["cpu_observation"] = (error.details if isinstance(error, CpuBridgeFailure)
+                                      else CpuBridgeFailure(error, capture).details)
+        if reserved_nodes and not failure["cpu_observation"]["spawned"]:
+            bank.limits.usage["nodes"] -= reserved_nodes
+        if pipe is not None and pipe.remaining and failure["cpu_observation"]["spawned"]:
+            pipe.consume(pipe.remaining)  # Cleanup did not confirm pipe usage.
+        retention_errors = []
+        for stream in ("stdout", "stderr"):
+            content = bytes(capture.get(stream, b""))
+            if content:
+                try:
+                    bank.failed_cpu_bytes("failed-cpu-" + stream + ".bin", content, reservation=recovery)
+                except BaseException as retention_error:
+                    retention_errors.append({"stream": stream, "type": type(retention_error).__name__,
+                                             "message": str(retention_error)[:512]})
+        failure["cpu_raw_output_preserved"] = not retention_errors
+        if retention_errors:
+            failure["retention_failures"] = retention_errors
+            error.__dict__.setdefault("preservation_failures", []).extend(
+                dict(item, stage="cpu_raw_retention") for item in retention_errors)
+    for reservation in (evidence, recovery, pipe):
+        if reservation is not None:
+            reservation.release()
+    try:
+        bank.finish({"complete": False, "failure": failure, "counts": counts,
+                     "parameters_unchanged": None, "checkpoint_sha256": checkpoint_sha256,
+                     "cpu_binary_sha256": cpu_binary_sha256,
+                     "resources": {"maximum": bank.limits.maximum, "usage": bank.limits.usage}})
+    except BaseException as receipt_error:
+        # Keep a bounded secondary diagnostic on the exception even when disk
+        # failure prevents publishing the failure receipt itself.
+        diagnostic = {"stage": "failure_receipt", "type": type(receipt_error).__name__,
+                      "message": str(receipt_error)[:512]}
+        error.__dict__.setdefault("preservation_failures", []).append(diagnostic)
+        error.__dict__["producer_failure"] = {"complete": False, "failure": failure,
+                                               "counts": copy.deepcopy(counts),
+                                               "resources": {"maximum": dict(bank.limits.maximum),
+                                                             "usage": dict(bank.limits.usage)}}
+        if hasattr(error, "add_note"):
+            error.add_note("failure receipt could not be preserved: " + type(receipt_error).__name__)
+    return failure
 
 
 def _report(value, request, profile, *, after=False):
@@ -730,6 +860,7 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
     _integer(max_input_bytes, 1, 1024 * 1024 * 1024, "input bytes")
     initial_threads = torch.get_num_threads()
     bank = None
+    cpu_capture, cpu_reservations, cpu_reserved_nodes, cpu_stage = None, (), 0, None
     try:
         torch.set_num_threads(2)
         checkpoint, binary = _path(checkpoint), _path(cpu_binary)
@@ -870,14 +1001,18 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
                             "selection_weights": "own_random_initialization_untrained", "trained": False,
                             "checkpoint_sha256": checkpoint_sha256, "verifier_private": private}
                 bank.append("decisions.jsonl", decision)
-                # Reserve worst-case nodes before spawning, never retry or
-                # silently reduce the registered task after an admission error.
-                limits.charge("nodes", 2 * max_nodes_per_check)
-                if 2 * request["max_output_bytes"] + limits.usage["output_bytes"] > max_output_bytes:
-                    raise ValueError("sealed CPU output reservation exceeds remaining run bound")
+                # Admit nodes plus pipe, all post-result files and raw recovery
+                # atomically. Keep recovery credit until the entire row commits.
+                cpu_stage = "dispatch_admission"
+                cpu_reservations = bank.reserve_cpu(request, row, private, context)
+                evidence_reservation, recovery_reservation, pipe_reservation = cpu_reservations
+                cpu_reserved_nodes = 2 * max_nodes_per_check
                 counts["cpu_dispatches"] += 1
                 cpu_capture = {}
-                response = run_cpu_bridge(binary, request, limits, capture=cpu_capture)
+                cpu_stage = "cpu_bridge"
+                response = run_cpu_bridge(binary, request, limits, capture=cpu_capture,
+                                          pipe_reservation=pipe_reservation)
+                cpu_stage = "response_validation"
                 try:
                     gain = observed_gain(request, response)
                 except BaseException as protocol_error:
@@ -886,6 +1021,7 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
                 # is unknown, never silently recorded as zero. Only validated
                 # successful responses reconcile it to observed node count.
                 limits.usage["nodes"] -= 2 * max_nodes_per_check - response["nodes"]
+                cpu_reserved_nodes = 0
                 if response["status"] == "observed":
                     counts["cpu_checks_observed"] += 2
                     counts["completed_questions"] += int(gain["actual_question_complete"])
@@ -895,10 +1031,15 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
                 evidence = {"input_sha256": row["input"]["sha256"], "context": asdict(context),
                             "request": request, "response": response, "observed_information": gain}
                 evidence_sha = _hash(GAIN_SCHEMA, evidence)
-                bank.append("cpu-evidence.jsonl", {"evidence_sha256": evidence_sha, **evidence})
+                cpu_stage = "cpu-evidence.jsonl"
+                bank.append("cpu-evidence.jsonl", {"evidence_sha256": evidence_sha, **evidence},
+                            reservation=evidence_reservation)
+                cpu_stage = "future-labels.jsonl"
                 label = future_label(row["input"]["snapshot"], context, task, request, response, evidence_sha)
                 bank.append("future-labels.jsonl", {"input_sha256": row["input"]["sha256"], "future_label": label,
-                                                     "observed_information_evidence_sha256": evidence_sha})
+                                                     "observed_information_evidence_sha256": evidence_sha},
+                            reservation=evidence_reservation)
+                cpu_stage = "target_validation"
                 row = dict(row, future_label=label, verifier_private=private)
                 ready = ValidatedDataset([row], split, authority, {encoding.input_sha256: encoding})
                 target_batch = ready.collate([0], "verifier", split=data.split[snapshot["game_id"]], task_contexts=[context])
@@ -907,11 +1048,16 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
                 losses = masked_losses(actual, target_batch)
                 if target_batch.task_mask.any() or any(value.requires_grad or not torch.isfinite(value) or float(value) != 0.0 for value in losses.values()):
                     raise ValueError("single action must preserve unresolved masked V loss")
+                cpu_stage = "private-records.jsonl"
                 bank.append("private-records.jsonl", {"record": row, "evidence_sha256": evidence_sha,
                                                        "task_context": asdict(context), "loss": {k: float(v) for k, v in losses.items()},
-                                                       "comparative_training_target": False})
+                                                        "comparative_training_target": False}, reservation=evidence_reservation)
                 counts["future_labels"] += int(label is not None)
+                cpu_stage = "row_completion"
                 limits.check()
+                for reservation in cpu_reservations:
+                    reservation.release()
+                cpu_capture, cpu_reservations, cpu_stage = None, (), None
         after = _parameter_digest(model)
         if before != after or any(value.requires_grad or value.grad is not None for value in model.parameters()):
             raise ValueError("private verifier producer changed parameters or gradients")
@@ -956,21 +1102,10 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
                       private_bank_reloaded=True, reloaded_records=len(reloaded.records))
     except BaseException as error:
         if bank is not None and not (bank.root / "receipt.json").exists():
-            failure = {"type": type(error).__name__, "message": str(error)[:512]}
-            if isinstance(error, CpuBridgeFailure):
-                failure["cpu_observation"] = error.details
-                try:
-                    for stream in ("stdout", "stderr"):
-                        if error.capture[stream]:
-                            bank.failed_cpu_bytes("failed-cpu-" + stream + ".bin", error.capture[stream])
-                    failure["cpu_raw_output_preserved"] = True
-                except (ValueError, OSError) as retention_error:
-                    failure["cpu_raw_output_preserved"] = False
-                    failure["retention_failure"] = type(retention_error).__name__
-            bank.finish({"complete": False, "failure": failure,
-                         "counts": locals().get("counts"), "parameters_unchanged": None,
-                         "checkpoint_sha256": checkpoint_sha256, "cpu_binary_sha256": cpu_binary_sha256,
-                         "resources": {"maximum": limits.maximum, "usage": limits.usage}})
+            _record_producer_failure(bank, error, counts=locals().get("counts"),
+                                     checkpoint_sha256=checkpoint_sha256, cpu_binary_sha256=cpu_binary_sha256,
+                                     capture=cpu_capture, reservations=cpu_reservations,
+                                     reserved_nodes=cpu_reserved_nodes, stage=cpu_stage)
         raise
     finally:
         torch.set_num_threads(initial_threads)
