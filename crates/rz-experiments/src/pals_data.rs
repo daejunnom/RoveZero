@@ -6,7 +6,9 @@ use crate::{ManifestError, decode_json, digest};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const PALS_DATA_DOMAIN: &str = "rz-pals-data/1";
+/// Version 2 replaces the version 1 mandatory model-weight declaration with an
+/// explicit CPU/model source. Old snapshots are not implicitly reinterpreted.
+pub const PALS_DATA_DOMAIN: &str = "rz-pals-data/2";
 pub const PALS_CHECKPOINT_DOMAIN: &str = "rz-pals-training-checkpoint/1";
 const MAX_HISTORY: usize = 16_384;
 const MAX_RECORDS: usize = 65_536;
@@ -50,6 +52,50 @@ pub struct PalsPublicRecord {
     pub situation_revision: u64,
 }
 
+/// Identity of the implementation that produced this input. A CPU evaluator
+/// without a neural model records `None`; it must never invent a weight hash.
+/// A PALS neural model always records its actual configuration and weight hashes.
+/// These declarations are matched against collector-verified sources at audit.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PalsInputSource {
+    OwnCpu {
+        /// Hash of the actual CPU engine binary, identifying its implementation.
+        cpu_binary_sha256: String,
+        /// Hash of the evaluator's actual, canonical configuration description.
+        evaluator_configuration_sha256: String,
+        /// Present only when this CPU evaluator really consumed model weights.
+        model_weights_sha256: Option<String>,
+    },
+    OwnPals {
+        model_configuration_sha256: String,
+        model_weights_sha256: String,
+    },
+}
+impl PalsInputSource {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        match self {
+            Self::OwnCpu {
+                cpu_binary_sha256,
+                evaluator_configuration_sha256,
+                model_weights_sha256,
+            } => ensure(
+                sha(cpu_binary_sha256)
+                    && sha(evaluator_configuration_sha256)
+                    && model_weights_sha256.as_ref().is_none_or(|value| sha(value)),
+                "invalid CPU input implementation/configuration/weight identity",
+            ),
+            Self::OwnPals {
+                model_configuration_sha256,
+                model_weights_sha256,
+            } => ensure(
+                sha(model_configuration_sha256) && sha(model_weights_sha256),
+                "PALS model input requires configuration and actual weight identities",
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PalsInputSnapshot {
@@ -66,8 +112,7 @@ pub struct PalsInputSnapshot {
     /// and move genealogy. Used only for leakage checks, never cache reuse.
     pub transposition_sha256: String,
     pub encoding_sha256: String,
-    pub model_configuration_sha256: String,
-    pub model_weights_sha256: String,
+    pub source: PalsInputSource,
     pub frozen_epoch: u64,
     pub input_revision: u64,
     pub capture_sequence: u64,
@@ -113,13 +158,12 @@ impl PalsInputSnapshot {
                 &self.rules_history_sha256,
                 &self.transposition_sha256,
                 &self.encoding_sha256,
-                &self.model_configuration_sha256,
-                &self.model_weights_sha256,
             ]
             .into_iter()
             .all(|s| sha(s)),
             "invalid snapshot digest",
         )?;
+        self.source.validate()?;
         ensure(
             self.legal_moves
                 .iter()
@@ -352,7 +396,10 @@ pub struct PalsPolicyTarget {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum PalsConditionalValidity {
+    /// The counterexample remains supported against the recorded P repair.
+    /// This is conditional attack support, not a proven game outcome.
     SupportedAfterRepair,
+    /// The recorded P repair refutes this counterexample/attack.
     RefutedByRepair,
     NotExamined,
     Disputed,
@@ -612,8 +659,13 @@ impl PalsDatasetSplit {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PalsOwnedSources {
+    /// Actual CPU binaries permitted to supply CPU targets. CPU input sources
+    /// must use one of these same implementations. Can be empty for PALS-only
+    /// inputs whose targets come solely from Rules or actual games.
     pub cpu_binary_sha256: BTreeSet<String>,
-    pub model_weights_sha256: BTreeSet<String>,
+    /// Exact source tuples, including weight absence. Registering one model's
+    /// configuration and another model's weights never authorizes their mixture.
+    pub input_sources: BTreeSet<PalsInputSource>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -628,23 +680,34 @@ pub struct PalsDatasetAudit {
     pub canonical_split_sha256: String,
 }
 impl PalsOwnedSources {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        ensure(
+            self.cpu_binary_sha256.len() <= 64
+                && self.cpu_binary_sha256.iter().all(|s| sha(s))
+                && !self.input_sources.is_empty()
+                && self.input_sources.len() <= 256,
+            "invalid owned source registry",
+        )?;
+        for source in &self.input_sources {
+            source.validate()?;
+            if let PalsInputSource::OwnCpu {
+                cpu_binary_sha256, ..
+            } = source
+            {
+                ensure(
+                    self.cpu_binary_sha256.contains(cpu_binary_sha256),
+                    "CPU input implementation is absent from the owned binary registry",
+                )?;
+            }
+        }
+        Ok(())
+    }
     pub fn audit(
         &self,
         records: &[PalsLearningRecord],
         split: &PalsDatasetSplit,
     ) -> Result<PalsDatasetAudit, ManifestError> {
-        ensure(
-            !self.cpu_binary_sha256.is_empty()
-                && self.cpu_binary_sha256.len() <= 64
-                && !self.model_weights_sha256.is_empty()
-                && self.model_weights_sha256.len() <= 256
-                && self
-                    .cpu_binary_sha256
-                    .iter()
-                    .chain(self.model_weights_sha256.iter())
-                    .all(|s| sha(s)),
-            "invalid owned source registry",
-        )?;
+        self.validate()?;
         split.validate(records)?;
         let mut report = PalsDatasetAudit {
             records: records.len() as u64,
@@ -653,14 +716,13 @@ impl PalsOwnedSources {
             training_records: 0,
             validation_records: 0,
             holdout_records: 0,
-            canonical_dataset_sha256: canonical_sha("rz-pals-dataset/1", &records)?,
+            canonical_dataset_sha256: canonical_sha("rz-pals-dataset/2", &records)?,
             canonical_split_sha256: canonical_sha("rz-pals-split/1", split)?,
         };
         for record in records {
             ensure(
-                self.model_weights_sha256
-                    .contains(&record.input.snapshot().model_weights_sha256),
-                "unregistered model weights in dataset",
+                self.input_sources.contains(&record.input.snapshot().source),
+                "unregistered input source in dataset",
             )?;
             match split.games[&record.input.snapshot().game_id] {
                 PalsSplit::Train => report.training_records += 1,
@@ -814,6 +876,48 @@ impl PalsTrainingUsage {
     }
 }
 
+/// Preparation phases declare which role passes may be configured. Selecting a
+/// phase does not execute training or authorize an optimizer update.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PalsTrainingPhase {
+    PcBootstrap,
+    PcvPreparation,
+}
+impl PalsTrainingPhase {
+    pub fn role_order(self) -> &'static [PalsDataRole] {
+        match self {
+            Self::PcBootstrap => &[PalsDataRole::Proposer, PalsDataRole::Critic],
+            Self::PcvPreparation => &[
+                PalsDataRole::Proposer,
+                PalsDataRole::Critic,
+                PalsDataRole::Verifier,
+            ],
+        }
+    }
+    pub fn allows(self, role: PalsDataRole) -> bool {
+        self.role_order().contains(&role)
+    }
+}
+
+/// Shared groups that must be frozen during a V role pass. Consumers must
+/// derive an observed instance from actual parameter trainability; copying the
+/// recipe declaration is not evidence that the parameter groups are frozen.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsVerifierFreezePolicy {
+    pub encoder: bool,
+    pub public_reader: bool,
+    pub move_embedding: bool,
+}
+impl PalsVerifierFreezePolicy {
+    pub const ALL_SHARED_FROZEN: Self = Self {
+        encoder: true,
+        public_reader: true,
+        move_embedding: true,
+    };
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PalsTrainingRecipe {
@@ -823,8 +927,9 @@ pub struct PalsTrainingRecipe {
     pub epsilon: f64,
     pub weight_decay: f64,
     pub gradient_accumulation_steps: u32,
+    pub phase: PalsTrainingPhase,
     pub role_order: Vec<PalsDataRole>,
-    pub shared_encoder_frozen_for_verifier: bool,
+    pub verifier_freeze: Option<PalsVerifierFreezePolicy>,
     pub model: PalsComputeProfile,
     pub budget: PalsTrainingBudget,
     pub implementation_sha256: String,
@@ -852,13 +957,13 @@ impl PalsTrainingRecipe {
         )?;
         ensure(
             self.optimizer == "adamw"
-                && self.role_order
-                    == [
-                        PalsDataRole::Proposer,
-                        PalsDataRole::Critic,
-                        PalsDataRole::Verifier,
-                    ]
-                && self.shared_encoder_frozen_for_verifier,
+                && self.role_order == self.phase.role_order()
+                && match self.phase {
+                    PalsTrainingPhase::PcBootstrap => self.verifier_freeze.is_none(),
+                    PalsTrainingPhase::PcvPreparation => {
+                        self.verifier_freeze == Some(PalsVerifierFreezePolicy::ALL_SHARED_FROZEN)
+                    }
+                },
             "unsupported initial role/optimizer recipe",
         )?;
         ensure(
@@ -874,7 +979,35 @@ impl PalsTrainingRecipe {
     }
     pub fn sha256(&self) -> Result<String, ManifestError> {
         self.validate()?;
-        canonical_sha("rz-pals-training-recipe/1", self)
+        canonical_sha("rz-pals-training-recipe/2", self)
+    }
+    /// Check a role against the declared phase, then verify observed shared
+    /// parameter state for V. P/C role passes may train shared groups; V may
+    /// only train its private expert, which the model consumer selects.
+    pub fn validate_role_parameter_state(
+        &self,
+        role: PalsDataRole,
+        observed_freeze: &PalsVerifierFreezePolicy,
+    ) -> Result<(), ManifestError> {
+        self.validate()?;
+        ensure(
+            self.phase.allows(role),
+            "role is absent from the recipe phase",
+        )?;
+        ensure(
+            role != PalsDataRole::Verifier
+                || observed_freeze == &PalsVerifierFreezePolicy::ALL_SHARED_FROZEN,
+            "V requires the actual encoder, public reader, and move embedding to be frozen",
+        )
+    }
+    pub fn to_json(&self) -> Result<String, ManifestError> {
+        self.validate()?;
+        serde_json::to_string(self).map_err(|e| ManifestError::Integrity(e.to_string()))
+    }
+    pub fn from_json(input: &str) -> Result<Self, ManifestError> {
+        let value: Self = decode_json(input)?;
+        value.validate()?;
+        Ok(value)
     }
 }
 
@@ -1077,8 +1210,10 @@ mod tests {
             rules_history_sha256: hash("history"),
             transposition_sha256: hash(game),
             encoding_sha256: hash("encoding"),
-            model_configuration_sha256: hash("model"),
-            model_weights_sha256: hash("weights"),
+            source: PalsInputSource::OwnPals {
+                model_configuration_sha256: hash("model"),
+                model_weights_sha256: hash("weights"),
+            },
             frozen_epoch: 1,
             input_revision: 3,
             capture_sequence: 8,
@@ -1098,6 +1233,157 @@ mod tests {
             verifier_private: None,
         }
     }
+    fn cpu_source(weights: Option<&str>) -> PalsInputSource {
+        PalsInputSource::OwnCpu {
+            cpu_binary_sha256: hash("own-cpu-binary"),
+            evaluator_configuration_sha256: hash("own-cpu-evaluator-configuration"),
+            model_weights_sha256: weights.map(hash),
+        }
+    }
+    fn single_game_split() -> PalsDatasetSplit {
+        PalsDatasetSplit {
+            games: BTreeMap::from([("a".into(), PalsSplit::Train)]),
+        }
+    }
+    #[test]
+    fn weightless_cpu_inputs_roundtrip_and_audit_without_invented_model_assets() {
+        let mut input = snapshot("a", "oa", "la");
+        input.source = cpu_source(None);
+        let a = PalsLearningRecord {
+            input: input.seal().unwrap(),
+            future_label: None,
+            verifier_private: None,
+        };
+        let encoded = a.to_json().unwrap();
+        let serialized: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let source = &serialized["input"]["snapshot"]["source"];
+        assert_eq!(source["kind"], "own_cpu");
+        assert!(source["model_weights_sha256"].is_null());
+        assert!(source.get("model_configuration_sha256").is_none());
+        assert_eq!(PalsLearningRecord::from_json(&encoded).unwrap(), a);
+        let registry = PalsOwnedSources {
+            cpu_binary_sha256: BTreeSet::from([hash("own-cpu-binary")]),
+            input_sources: BTreeSet::from([cpu_source(None)]),
+        };
+        let audit = registry.audit(&[a.clone()], &single_game_split()).unwrap();
+        assert_eq!(audit.records, 1);
+        assert_eq!(audit.masked_value_records, 1);
+        assert_eq!(audit.training_records, 1);
+        let mut registry_with_weights = registry;
+        registry_with_weights.input_sources = BTreeSet::from([cpu_source(Some("actual-weights"))]);
+        assert!(
+            registry_with_weights
+                .audit(&[a], &single_game_split())
+                .is_err()
+        );
+    }
+    #[test]
+    fn pals_model_sources_require_actual_weight_identity() {
+        let model = PalsInputSource::OwnPals {
+            model_configuration_sha256: hash("model"),
+            model_weights_sha256: hash("actual-parameter-bytes"),
+        };
+        model.validate().unwrap();
+        let mut encoded = serde_json::to_value(&model).unwrap();
+        encoded["model_weights_sha256"] = serde_json::Value::String(String::new());
+        let missing_weight: PalsInputSource = serde_json::from_value(encoded.clone()).unwrap();
+        assert!(missing_weight.validate().is_err());
+        encoded["model_weights_sha256"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<PalsInputSource>(encoded.clone()).is_err());
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("model_weights_sha256");
+        assert!(serde_json::from_value::<PalsInputSource>(encoded).is_err());
+        let mut cpu = cpu_source(None);
+        if let PalsInputSource::OwnCpu {
+            model_weights_sha256,
+            ..
+        } = &mut cpu
+        {
+            *model_weights_sha256 = Some(String::new());
+        }
+        assert!(cpu.validate().is_err());
+    }
+    #[test]
+    fn source_registry_rejects_cpu_identity_and_model_pair_mismatches() {
+        let mut a = record("a", "oa", "la");
+        let mut cpu_input = a.input.snapshot().clone();
+        cpu_input.source = cpu_source(None);
+        a.input = cpu_input.seal().unwrap();
+        let mut registry = PalsOwnedSources {
+            cpu_binary_sha256: BTreeSet::new(),
+            input_sources: BTreeSet::from([cpu_source(None)]),
+        };
+        assert!(registry.validate().is_err());
+        registry.cpu_binary_sha256.insert(hash("own-cpu-binary"));
+        registry.audit(&[a.clone()], &single_game_split()).unwrap();
+        for changed_source in [
+            PalsInputSource::OwnCpu {
+                cpu_binary_sha256: hash("different-cpu-binary"),
+                evaluator_configuration_sha256: hash("own-cpu-evaluator-configuration"),
+                model_weights_sha256: None,
+            },
+            PalsInputSource::OwnCpu {
+                cpu_binary_sha256: hash("own-cpu-binary"),
+                evaluator_configuration_sha256: hash("different-cpu-evaluator-configuration"),
+                model_weights_sha256: None,
+            },
+            cpu_source(Some("actual-weights")),
+        ] {
+            let mut input = a.input.snapshot().clone();
+            input.source = changed_source;
+            let changed = PalsLearningRecord {
+                input: input.seal().unwrap(),
+                ..a.clone()
+            };
+            assert!(registry.audit(&[changed], &single_game_split()).is_err());
+        }
+        let mut model_input = a.input.snapshot().clone();
+        model_input.source = PalsInputSource::OwnPals {
+            model_configuration_sha256: hash("model-a"),
+            model_weights_sha256: hash("weights-b"),
+        };
+        let model_record = PalsLearningRecord {
+            input: model_input.seal().unwrap(),
+            ..a
+        };
+        let model_registry = PalsOwnedSources {
+            cpu_binary_sha256: BTreeSet::new(),
+            input_sources: BTreeSet::from([
+                PalsInputSource::OwnPals {
+                    model_configuration_sha256: hash("model-a"),
+                    model_weights_sha256: hash("weights-a"),
+                },
+                PalsInputSource::OwnPals {
+                    model_configuration_sha256: hash("model-b"),
+                    model_weights_sha256: hash("weights-b"),
+                },
+            ]),
+        };
+        model_registry.validate().unwrap();
+        assert!(
+            model_registry
+                .audit(&[model_record], &single_game_split())
+                .is_err()
+        );
+    }
+    #[test]
+    fn version_one_inputs_and_changed_sources_cannot_reuse_input_seals() {
+        let a = record("a", "oa", "la");
+        let mut old_seal = a.input.clone();
+        old_seal.sha256 = canonical_sha("rz-pals-data/1", old_seal.snapshot()).unwrap();
+        assert!(old_seal.verify().is_err());
+        let mut encoded = serde_json::to_value(&a).unwrap();
+        let fields = encoded["input"]["snapshot"].as_object_mut().unwrap();
+        fields.remove("source");
+        fields.insert("model_configuration_sha256".into(), hash("model").into());
+        fields.insert("model_weights_sha256".into(), hash("weights").into());
+        assert!(PalsLearningRecord::from_json(&encoded.to_string()).is_err());
+        let mut changed_source = a.input;
+        changed_source.snapshot.source = cpu_source(None);
+        assert!(changed_source.verify().is_err());
+    }
     fn budget() -> PalsTrainingBudget {
         PalsTrainingBudget {
             max_flops: 100_000,
@@ -1110,6 +1396,151 @@ mod tests {
             max_spend_usd_micros: 1000,
             max_output_bytes: 1000,
         }
+    }
+    fn recipe(phase: PalsTrainingPhase) -> PalsTrainingRecipe {
+        PalsTrainingRecipe {
+            optimizer: "adamw".into(),
+            learning_rate: 0.001,
+            betas: [0.9, 0.999],
+            epsilon: 1e-8,
+            weight_decay: 0.01,
+            gradient_accumulation_steps: 2,
+            phase,
+            role_order: phase.role_order().to_vec(),
+            verifier_freeze: match phase {
+                PalsTrainingPhase::PcBootstrap => None,
+                PalsTrainingPhase::PcvPreparation => {
+                    Some(PalsVerifierFreezePolicy::ALL_SHARED_FROZEN)
+                }
+            },
+            model: PalsComputeProfile {
+                width: 384,
+                latent_slots: 16,
+                recurrent_blocks: 2,
+                recurrent_iterations: 2,
+                query_heads: 6,
+                kv_heads: 2,
+                head_dimension: 64,
+                ffn_width: 1024,
+                fma_flops: 2,
+                counted_operator_sha256: hash("counted-operator-fixture"),
+                uncounted_operators: vec!["normalization".into()],
+                forward_flops_per_sample: 500,
+                backward_flops_per_sample: 1000,
+            },
+            budget: budget(),
+            implementation_sha256: hash("training-consumer"),
+            dataset_sha256: hash("dataset"),
+            split_sha256: hash("split"),
+        }
+    }
+    #[test]
+    fn pc_bootstrap_recipe_has_no_fictitious_verifier_phase() {
+        let pc = recipe(PalsTrainingPhase::PcBootstrap);
+        let trainable_shared = PalsVerifierFreezePolicy {
+            encoder: false,
+            public_reader: false,
+            move_embedding: false,
+        };
+        pc.validate().unwrap();
+        assert_eq!(
+            pc.role_order,
+            [PalsDataRole::Proposer, PalsDataRole::Critic]
+        );
+        assert!(pc.verifier_freeze.is_none());
+        for role in [PalsDataRole::Proposer, PalsDataRole::Critic] {
+            pc.validate_role_parameter_state(role, &trainable_shared)
+                .unwrap();
+        }
+        assert!(
+            pc.validate_role_parameter_state(
+                PalsDataRole::Verifier,
+                &PalsVerifierFreezePolicy::ALL_SHARED_FROZEN,
+            )
+            .is_err()
+        );
+        let encoded = pc.to_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["phase"], "pc_bootstrap");
+        assert!(value["verifier_freeze"].is_null());
+        assert_eq!(PalsTrainingRecipe::from_json(&encoded).unwrap(), pc);
+    }
+    #[test]
+    fn pcv_recipe_requires_each_declared_and_observed_shared_freeze() {
+        let pcv = recipe(PalsTrainingPhase::PcvPreparation);
+        pcv.validate().unwrap();
+        pcv.validate_role_parameter_state(
+            PalsDataRole::Verifier,
+            &PalsVerifierFreezePolicy::ALL_SHARED_FROZEN,
+        )
+        .unwrap();
+        for partially_trainable in [
+            PalsVerifierFreezePolicy {
+                encoder: false,
+                ..PalsVerifierFreezePolicy::ALL_SHARED_FROZEN
+            },
+            PalsVerifierFreezePolicy {
+                public_reader: false,
+                ..PalsVerifierFreezePolicy::ALL_SHARED_FROZEN
+            },
+            PalsVerifierFreezePolicy {
+                move_embedding: false,
+                ..PalsVerifierFreezePolicy::ALL_SHARED_FROZEN
+            },
+        ] {
+            let mut invalid_declaration = pcv.clone();
+            invalid_declaration.verifier_freeze = Some(partially_trainable);
+            assert!(invalid_declaration.validate().is_err());
+            assert!(
+                pcv.validate_role_parameter_state(PalsDataRole::Verifier, &partially_trainable)
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            PalsTrainingRecipe::from_json(&pcv.to_json().unwrap()).unwrap(),
+            pcv,
+        );
+    }
+    #[test]
+    fn recipe_role_allowlists_and_freeze_declarations_cannot_cross_phases() {
+        for phase in [
+            PalsTrainingPhase::PcBootstrap,
+            PalsTrainingPhase::PcvPreparation,
+        ] {
+            let mut wrong_order = recipe(phase);
+            wrong_order.role_order.swap(0, 1);
+            assert!(wrong_order.validate().is_err());
+            wrong_order.role_order.clear();
+            assert!(wrong_order.validate().is_err());
+        }
+        let mut pc = recipe(PalsTrainingPhase::PcBootstrap);
+        pc.role_order.push(PalsDataRole::Verifier);
+        assert!(pc.validate().is_err());
+        pc.role_order.pop();
+        pc.verifier_freeze = Some(PalsVerifierFreezePolicy::ALL_SHARED_FROZEN);
+        assert!(pc.validate().is_err());
+        let mut pcv = recipe(PalsTrainingPhase::PcvPreparation);
+        pcv.role_order.pop();
+        assert!(pcv.validate().is_err());
+        pcv.role_order.push(PalsDataRole::Verifier);
+        pcv.verifier_freeze = None;
+        assert!(pcv.validate().is_err());
+    }
+    #[test]
+    fn recipe_version_two_identity_includes_phase_and_rejects_old_fields() {
+        let pc = recipe(PalsTrainingPhase::PcBootstrap);
+        let pcv = recipe(PalsTrainingPhase::PcvPreparation);
+        assert_ne!(pc.sha256().unwrap(), pcv.sha256().unwrap());
+        assert_ne!(
+            pc.sha256().unwrap(),
+            canonical_sha("rz-pals-training-recipe/1", &pc).unwrap(),
+        );
+        let mut old = serde_json::to_value(&pcv).unwrap();
+        let fields = old.as_object_mut().unwrap();
+        fields.remove("phase");
+        fields.remove("verifier_freeze");
+        fields.insert("shared_encoder_frozen_for_verifier".into(), true.into());
+        assert!(PalsTrainingRecipe::from_json(&old.to_string()).is_err());
     }
     fn outcome_label(
         ending: PalsGameEnd,
@@ -1356,7 +1787,7 @@ mod tests {
         a.future_label = Some(label);
         let registry = PalsOwnedSources {
             cpu_binary_sha256: BTreeSet::from([hash("own")]),
-            model_weights_sha256: BTreeSet::from([hash("weights")]),
+            input_sources: BTreeSet::from([a.input.snapshot().source.clone()]),
         };
         let split = PalsDatasetSplit {
             games: BTreeMap::from([("a".into(), PalsSplit::Train)]),
