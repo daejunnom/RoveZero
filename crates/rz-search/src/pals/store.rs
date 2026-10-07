@@ -7,7 +7,9 @@
 //! that its physical work has finished.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Weak};
 
+use crate::cpu_value::CpuValueIdentity;
 use rz_position::{
     BoardMove, Color, PieceKind, PlayStatus, Position, PositionSnapshot, RepetitionIdentity, Square,
 };
@@ -140,6 +142,7 @@ impl Move16 {
 
 #[derive(Debug)]
 pub struct StateStore {
+    identity: Arc<()>,
     snapshots: Vec<PositionSnapshot>,
     index: HashMap<RepetitionIdentity, Vec<StateId>>,
     limit: usize,
@@ -150,6 +153,7 @@ pub struct StateStore {
 impl StateStore {
     pub fn new(limit: usize, retained_history_bytes: usize) -> Self {
         Self {
+            identity: Arc::new(()),
             snapshots: Vec::new(),
             index: HashMap::new(),
             limit,
@@ -233,6 +237,9 @@ impl LineChunk {
 
 #[derive(Debug)]
 pub struct LinePool {
+    /// A weak attestation retains this allocation, so replacing a public pool
+    /// cannot reissue its checked numeric handles under a new owner.
+    identity: Arc<()>,
     chunks: Vec<LineChunk>,
     roots: BTreeMap<StateId, LineId>,
     index: BTreeMap<(LineId, Vec<Move16>), LineId>,
@@ -243,6 +250,7 @@ pub struct LinePool {
 impl LinePool {
     pub fn new(limit: usize, ply_limit: usize) -> Self {
         Self {
+            identity: Arc::new(()),
             chunks: Vec::new(),
             roots: BTreeMap::new(),
             index: BTreeMap::new(),
@@ -444,6 +452,15 @@ pub struct Observation {
     pub line: Option<LineId>,
     pub source: u64,
     pub epoch: u64,
+    /// Exact immutable CPU evaluator namespace. It is independent of neural
+    /// model/epoch handles and preserves real weight absence or checkpoint ID.
+    pub value_identity: Option<CpuValueIdentity>,
+    /// Exact canonical search implementation/configuration/capability and task
+    /// conditions, including ordered restrictions. Numeric IDs are metadata.
+    pub cpu_condition: Option<String>,
+    /// An immutable, sequentially Rules-checked CPU PV prefix from `state`.
+    /// The prefix and finite CPU estimate never certify a terminal outcome.
+    pub cpu_pv: Option<LineId>,
     pub scope: EvidenceScope,
     pub score: RawScore,
     pub budget: u64,
@@ -454,6 +471,29 @@ pub struct Observation {
 
 impl Observation {
     fn validate(&self) -> Result<(), StoreError> {
+        let cpu_scope = matches!(self.scope, EvidenceScope::DepthLimited { .. });
+        if cpu_scope != self.value_identity.is_some()
+            || cpu_scope != self.cpu_condition.is_some()
+            || (self.cpu_pv.is_some() && !cpu_scope)
+        {
+            return Err(StoreError::InvalidEvidence(
+                "CPU scope requires its exact value namespace and PV scope",
+            ));
+        }
+        if let Some(identity) = &self.value_identity {
+            identity.validate().map_err(|_| {
+                StoreError::InvalidEvidence("invalid or unbounded CPU value namespace")
+            })?;
+        }
+        if self
+            .cpu_condition
+            .as_ref()
+            .is_some_and(|value| value.capacity() > 2048 || !valid_cpu_condition(value))
+        {
+            return Err(StoreError::InvalidEvidence(
+                "invalid or unbounded exact CPU conditions",
+            ));
+        }
         match self.score {
             RawScore::Estimate { value, .. } if !value.is_finite() => {
                 return Err(StoreError::InvalidEvidence("non-finite estimate"));
@@ -797,6 +837,13 @@ pub struct TaskKey {
     pub root_moves: Vec<Move16>,
     pub model: u64,
     pub epoch: u64,
+    /// CPU tasks use the complete immutable value namespace, never a truncated
+    /// model hash or a fictitious neural epoch. Model tasks leave this absent.
+    pub value_identity: Option<CpuValueIdentity>,
+    /// Full canonical CPU implementation/configuration/capability, task kind,
+    /// ordered root restrictions, profile and window. An immutable exact key;
+    /// `condition` is only an auxiliary numeric identifier.
+    pub cpu_condition: Option<String>,
     pub profile: u64,
     /// Issuer-owned identity for exact search conditions, not a truncated hash.
     /// Model/profile IDs likewise name immutable registered configurations.
@@ -868,6 +915,10 @@ pub struct TaskTable {
     root_move_limit: usize,
 }
 
+fn valid_cpu_condition(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= 2048 && !value.chars().any(char::is_control)
+}
+
 impl TaskTable {
     pub fn new(executions: usize, consumers: usize, root_moves_per_task: usize) -> Self {
         Self {
@@ -894,15 +945,41 @@ impl TaskTable {
         {
             return Err(StoreError::Capacity("task root moves"));
         }
-        if matches!(
+        let cpu_question = matches!(
             key.question,
             TaskQuestion::AnalyzePosition
                 | TaskQuestion::AnalyzeRootMoves
                 | TaskQuestion::FindAlternative { .. }
-        ) && (key.requested_depth == 0 || key.node_budget == 0)
+        );
+        if cpu_question != key.value_identity.is_some()
+            || cpu_question != key.cpu_condition.is_some()
         {
             return Err(StoreError::InvalidConditions(
+                "CPU task requires an exact evaluator namespace",
+            ));
+        }
+        if let Some(identity) = &key.value_identity {
+            identity.validate().map_err(|_| {
+                StoreError::InvalidConditions("invalid or unbounded CPU value namespace")
+            })?;
+        }
+        if key
+            .cpu_condition
+            .as_ref()
+            .is_some_and(|value| value.capacity() > 2048 || !valid_cpu_condition(value))
+        {
+            return Err(StoreError::InvalidConditions(
+                "invalid or unbounded exact CPU conditions",
+            ));
+        }
+        if cpu_question && (key.requested_depth == 0 || key.node_budget == 0) {
+            return Err(StoreError::InvalidConditions(
                 "CPU task requires a finite positive budget",
+            ));
+        }
+        if key.question == TaskQuestion::AnalyzeRootMoves && key.root_moves.is_empty() {
+            return Err(StoreError::InvalidConditions(
+                "restricted CPU task requires ordered root moves",
             ));
         }
         if self.consumers.contains(&consumer.id) {
@@ -1170,6 +1247,12 @@ impl DerivedCache {
     }
 }
 
+#[derive(Debug)]
+struct CheckedCpuPv {
+    line_pool: Weak<()>,
+    state_store: Weak<()>,
+}
+
 /// Single-writer facade validates cross-store handles before publishing a fact.
 #[derive(Debug)]
 pub struct PalsStores {
@@ -1183,6 +1266,7 @@ pub struct PalsStores {
     limits: StoreLimits,
     root: Option<SituationId>,
     generation: u64,
+    checked_cpu_pvs: BTreeMap<LineId, CheckedCpuPv>,
 }
 
 impl PalsStores {
@@ -1202,6 +1286,7 @@ impl PalsStores {
             limits,
             root: None,
             generation: 0,
+            checked_cpu_pvs: BTreeMap::new(),
         }
     }
 
@@ -1240,6 +1325,58 @@ impl PalsStores {
         self.lines.append(prefix, checked_moves)
     }
 
+    /// Mint a CPU PV handle only after replay through the Rules owner from the
+    /// complete registered state. The checked-handle set is bounded by the
+    /// existing immutable line-chunk limit and does not store duplicate moves.
+    pub fn append_cpu_pv(
+        &mut self,
+        position: &Position,
+        moves: &[BoardMove],
+    ) -> Result<LineId, StoreError> {
+        if moves.len() > self.limits.line_plies {
+            return Err(StoreError::Capacity("CPU PV plies"));
+        }
+        let state = self
+            .states
+            .find(&position.snapshot())
+            .ok_or(StoreError::InvalidEvidence(
+                "CPU PV starts at an unregistered exact state",
+            ))?;
+        let mut replay = position.clone();
+        for movement in moves {
+            replay
+                .make_move(*movement)
+                .map_err(|_| StoreError::InvalidEvidence("CPU PV failed Rules replay"))?;
+        }
+        let root = self.lines.root(state)?;
+        let line = self.lines.append(root, moves)?;
+        if self.checked_cpu_pvs.get(&line).is_some_and(|checked| {
+            !checked
+                .line_pool
+                .ptr_eq(&Arc::downgrade(&self.lines.identity))
+                || !checked
+                    .state_store
+                    .ptr_eq(&Arc::downgrade(&self.states.identity))
+        }) {
+            return Err(StoreError::InvalidEvidence(
+                "checked CPU PV handle cannot be reissued by another store",
+            ));
+        }
+        if !self.checked_cpu_pvs.contains_key(&line)
+            && self.checked_cpu_pvs.len() >= self.limits.line_chunks
+        {
+            return Err(StoreError::Capacity("checked CPU PV handles"));
+        }
+        self.checked_cpu_pvs.insert(
+            line,
+            CheckedCpuPv {
+                line_pool: Arc::downgrade(&self.lines.identity),
+                state_store: Arc::downgrade(&self.states.identity),
+            },
+        );
+        Ok(line)
+    }
+
     pub fn append_observation(
         &mut self,
         observation: Observation,
@@ -1267,12 +1404,51 @@ impl PalsStores {
                 return Err(StoreError::InvalidEvidence("line starts at another state"));
             }
         }
+        if let Some(pv) = observation.cpu_pv {
+            let checked = self
+                .checked_cpu_pvs
+                .get(&pv)
+                .ok_or(StoreError::InvalidEvidence(
+                    "CPU PV lacks matching exact-state Rules replay",
+                ))?;
+            if self.lines.get(pv)?.start_state != observation.state
+                || !checked
+                    .line_pool
+                    .ptr_eq(&Arc::downgrade(&self.lines.identity))
+                || !checked
+                    .state_store
+                    .ptr_eq(&Arc::downgrade(&self.states.identity))
+            {
+                return Err(StoreError::InvalidEvidence(
+                    "CPU PV lacks matching exact-state Rules replay",
+                ));
+            }
+        }
         if let Some(execution) = observation.execution {
             let task = self.tasks.get(execution)?;
-            if task.key.state != observation.state || task.key.line != observation.line {
+            if task.key.state != observation.state
+                || task.key.line != observation.line
+                || task.key.value_identity != observation.value_identity
+                || task.key.cpu_condition != observation.cpu_condition
+            {
                 return Err(StoreError::InvalidEvidence(
                     "task and observation conditions differ",
                 ));
+            }
+            if let Some(pv) = observation.cpu_pv {
+                if !task.key.root_moves.is_empty() {
+                    let first = self
+                        .lines
+                        .first_move(pv)?
+                        .ok_or(StoreError::InvalidEvidence(
+                            "restricted CPU PV has no first move",
+                        ))?;
+                    if !task.key.root_moves.contains(&Move16::pack(first)?) {
+                        return Err(StoreError::InvalidEvidence(
+                            "CPU PV first move is outside the admitted root restriction",
+                        ));
+                    }
+                }
             }
         }
         Ok(())
@@ -1308,6 +1484,9 @@ impl PalsStores {
             line: None,
             source,
             epoch,
+            value_identity: None,
+            cpu_condition: None,
+            cpu_pv: None,
             scope: EvidenceScope::RulesTerminal,
             score: RawScore::Terminal { winner },
             budget: 0,
@@ -1495,11 +1674,14 @@ impl PalsStores {
         if evidence.execution != Some(execution)
             || evidence.state != task.key.state
             || evidence.line != task.key.line
+            || evidence.value_identity != task.key.value_identity
+            || evidence.cpu_condition != task.key.cpu_condition
         {
             return Err(StoreError::InvalidEvidence(
                 "completed task record mismatch",
             ));
         }
+        self.validate_observation_handles(evidence)?;
         if evidence.epoch != task.key.epoch || evidence.budget > task.key.node_budget {
             return Err(StoreError::InvalidEvidence(
                 "completed task epoch or budget mismatch",
@@ -1555,8 +1737,38 @@ impl PalsStores {
             if evidence.execution != Some(execution)
                 || evidence.state != task.key.state
                 || evidence.line != task.key.line
+                || evidence.value_identity != task.key.value_identity
+                || evidence.cpu_condition != task.key.cpu_condition
             {
                 return Err(StoreError::InvalidEvidence("paused task record mismatch"));
+            }
+            self.validate_observation_handles(evidence)?;
+            if evidence.epoch != task.key.epoch || evidence.budget > task.key.node_budget {
+                return Err(StoreError::InvalidEvidence(
+                    "paused task epoch or budget mismatch",
+                ));
+            }
+            match evidence.scope {
+                EvidenceScope::DepthLimited {
+                    profile, condition, ..
+                } if task.key.value_identity.is_none()
+                    || profile != task.key.profile
+                    || condition != task.key.condition =>
+                {
+                    return Err(StoreError::InvalidEvidence(
+                        "paused CPU scope does not satisfy task",
+                    ));
+                }
+                EvidenceScope::Model { model, input, .. }
+                    if task.key.value_identity.is_some()
+                        || model != task.key.model
+                        || input != task.key.input_revision =>
+                {
+                    return Err(StoreError::InvalidEvidence(
+                        "paused model scope does not satisfy task",
+                    ));
+                }
+                _ => {}
             }
         }
         self.tasks.pause(execution, checkpoint, partial)
@@ -1568,6 +1780,9 @@ impl PalsStores {
         consumer_id: u64,
         now_tick: u64,
     ) -> Result<ObservationId, StoreError> {
+        if let TaskStatus::Completed(observation) = self.tasks.get(execution)?.status {
+            self.validate_observation_handles(self.observations.get(observation)?)?;
+        }
         self.tasks.consume(
             execution,
             consumer_id,
@@ -1587,6 +1802,14 @@ mod tests {
     use super::*;
     use rz_position::Position;
 
+    fn cpu_value_identity() -> CpuValueIdentity {
+        CpuValueIdentity {
+            semantics: crate::cpu::BOOTSTRAP_SCORE_VERSION.into(),
+            weights_sha256: None,
+            training: crate::cpu_value::CpuTrainingState::Bootstrap,
+        }
+    }
+
     fn moves(text: &str) -> Vec<BoardMove> {
         text.split_whitespace()
             .map(|mv| BoardMove::from_uci(mv).unwrap())
@@ -1599,6 +1822,9 @@ mod tests {
             line,
             source: 1,
             epoch: 1,
+            value_identity: Some(cpu_value_identity()),
+            cpu_condition: Some("fixture-cpu-search-conditions-v1".into()),
+            cpu_pv: None,
             scope: EvidenceScope::DepthLimited {
                 depth: 4,
                 profile: 1,
@@ -1620,12 +1846,341 @@ mod tests {
             root_moves: Vec::new(),
             model: 1,
             epoch: 1,
+            value_identity: Some(cpu_value_identity()),
+            cpu_condition: Some("fixture-cpu-search-conditions-v1".into()),
             profile: 1,
             condition: 1,
             input_revision: 0,
             requested_depth: 4,
             node_budget: 128,
         }
+    }
+
+    fn float_value_identity(weight_digit: char) -> CpuValueIdentity {
+        CpuValueIdentity {
+            semantics: crate::cpu_value::CPU_VALUE_ARCHITECTURE.into(),
+            weights_sha256: Some(weight_digit.to_string().repeat(64)),
+            training: crate::cpu_value::CpuTrainingState::Untrained,
+        }
+    }
+
+    #[test]
+    fn cpu_checkpoint_reuse_requires_the_complete_typed_value_namespace() {
+        let mut stores = PalsStores::new(StoreLimits::default());
+        let root = stores
+            .focus_actual_moves(Position::startpos().snapshot())
+            .unwrap();
+        let state = stores.situations.get(root).unwrap().state;
+        let original_key = key(state);
+        let requester = consumer(&stores, root, 1, 100);
+        let original = match stores
+            .request_task(original_key.clone(), requester, 0)
+            .unwrap()
+        {
+            TaskAdmission::Start(id) => id,
+            _ => panic!("start"),
+        };
+        stores.pause_task(original, 7, None).unwrap();
+        let mut learned = float_value_identity('1');
+        learned.training = crate::cpu_value::CpuTrainingState::Learned {
+            run_id: "declared-run".into(),
+            steps: 1,
+            dataset_sha256: "3".repeat(64),
+        };
+        for (index, identity) in [
+            float_value_identity('1'),
+            float_value_identity('2'),
+            learned,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut changed = original_key.clone();
+            changed.value_identity = Some(identity);
+            let requester = consumer(&stores, root, index as u64 + 2, 100);
+            assert!(matches!(
+                stores.request_task(changed, requester, 1).unwrap(),
+                TaskAdmission::Start(_)
+            ));
+        }
+        let requester = consumer(&stores, root, 5, 100);
+        assert!(matches!(
+            stores.request_task(original_key, requester, 1).unwrap(),
+            TaskAdmission::Resume { previous, checkpoint: 7, .. } if previous == original
+        ));
+        let mut changed_conditions = key(state);
+        changed_conditions.cpu_condition = Some("fixture-cpu-search-conditions-v2".into());
+        let requester = consumer(&stores, root, 6, 100);
+        assert!(matches!(
+            stores
+                .request_task(changed_conditions, requester, 1)
+                .unwrap(),
+            TaskAdmission::Start(_)
+        ));
+    }
+
+    #[test]
+    fn wrong_cpu_namespace_cannot_publish_complete_or_pause_a_task() {
+        let mut stores = PalsStores::new(StoreLimits::default());
+        let root = stores
+            .focus_actual_moves(Position::startpos().snapshot())
+            .unwrap();
+        let state = stores.situations.get(root).unwrap().state;
+        let requester = consumer(&stores, root, 1, 100);
+        let execution = match stores.request_task(key(state), requester, 0).unwrap() {
+            TaskAdmission::Start(id) => id,
+            _ => panic!("start"),
+        };
+        let mut wrong = observation(state, None, ObservationKind::CpuAnalysis);
+        wrong.execution = Some(execution);
+        wrong.value_identity = Some(float_value_identity('1'));
+        assert!(stores.append_observation(wrong.clone()).is_err());
+        let unchecked = stores.observations.append(wrong).unwrap();
+        assert!(stores.complete_task(execution, unchecked).is_err());
+        assert!(stores.pause_task(execution, 7, Some(unchecked)).is_err());
+        assert_eq!(
+            stores.tasks.get(execution).unwrap().status,
+            TaskStatus::InFlight
+        );
+        let mut missing = key(state);
+        missing.value_identity = None;
+        let requester = consumer(&stores, root, 2, 100);
+        assert!(stores.request_task(missing, requester, 1).is_err());
+        let mut wrong_conditions = observation(state, None, ObservationKind::CpuAnalysis);
+        wrong_conditions.execution = Some(execution);
+        wrong_conditions.cpu_condition = Some("different-cpu-search-conditions".into());
+        assert!(stores.append_observation(wrong_conditions.clone()).is_err());
+        let unchecked = stores.observations.append(wrong_conditions).unwrap();
+        assert!(stores.complete_task(execution, unchecked).is_err());
+        assert!(stores.pause_task(execution, 7, Some(unchecked)).is_err());
+        for invalid_conditions in [String::new(), "\n".into(), "a".repeat(2049)] {
+            let mut invalid = key(state);
+            invalid.cpu_condition = Some(invalid_conditions);
+            let requester = consumer(&stores, root, 2, 100);
+            assert!(stores.request_task(invalid, requester, 1).is_err());
+        }
+        let mut oversized_allocation = String::with_capacity(4096);
+        oversized_allocation.push_str("short");
+        let mut invalid = key(state);
+        let mut oversized_key = String::with_capacity(4096);
+        oversized_key.push_str("short");
+        invalid.cpu_condition = Some(oversized_key);
+        let requester = consumer(&stores, root, 2, 100);
+        assert!(stores.request_task(invalid, requester, 1).is_err());
+        let mut invalid = observation(state, None, ObservationKind::CpuAnalysis);
+        invalid.cpu_condition = Some(oversized_allocation);
+        assert!(stores.append_observation(invalid).is_err());
+    }
+
+    #[test]
+    fn paused_cpu_evidence_obeys_epoch_budget_profile_and_conditions() {
+        let mut stores = PalsStores::new(StoreLimits::default());
+        let root = stores
+            .focus_actual_moves(Position::startpos().snapshot())
+            .unwrap();
+        let state = stores.situations.get(root).unwrap().state;
+        let requester = consumer(&stores, root, 1, 100);
+        let execution = match stores.request_task(key(state), requester, 0).unwrap() {
+            TaskAdmission::Start(id) => id,
+            _ => panic!("start"),
+        };
+        let mut partial = observation(state, None, ObservationKind::CpuAnalysis);
+        partial.execution = Some(execution);
+        partial.scope = EvidenceScope::DepthLimited {
+            depth: 1,
+            profile: 1,
+            condition: 1,
+        };
+        partial.budget = 20;
+        for (epoch, budget, profile, condition) in
+            [(2, 20, 1, 1), (1, 129, 1, 1), (1, 20, 2, 1), (1, 20, 1, 2)]
+        {
+            let mut invalid = partial.clone();
+            invalid.epoch = epoch;
+            invalid.budget = budget;
+            invalid.scope = EvidenceScope::DepthLimited {
+                depth: 1,
+                profile,
+                condition,
+            };
+            let stored = stores.append_observation(invalid).unwrap();
+            assert!(stores.pause_task(execution, 7, Some(stored)).is_err());
+            assert_eq!(
+                stores.tasks.get(execution).unwrap().status,
+                TaskStatus::InFlight
+            );
+        }
+        let stored = stores.append_observation(partial).unwrap();
+        stores.pause_task(execution, 7, Some(stored)).unwrap();
+        assert!(matches!(
+            stores.tasks.get(execution).unwrap().status,
+            TaskStatus::Paused { checkpoint: 7, evidence: Some(id) } if id == stored
+        ));
+    }
+
+    #[test]
+    fn cpu_pv_publication_preserves_the_admitted_root_restriction() {
+        let position = Position::startpos();
+        let mut stores = PalsStores::new(StoreLimits::default());
+        let root = stores.focus_actual_moves(position.snapshot()).unwrap();
+        let state = stores.situations.get(root).unwrap().state;
+        let mut query = key(state);
+        query.question = TaskQuestion::AnalyzeRootMoves;
+        let requester = consumer(&stores, root, 1, 100);
+        assert!(stores.request_task(query.clone(), requester, 0).is_err());
+        query.root_moves = vec![Move16::pack(BoardMove::from_uci("e2e4").unwrap()).unwrap()];
+        let requester = consumer(&stores, root, 1, 100);
+        let execution = match stores.request_task(query, requester, 0).unwrap() {
+            TaskAdmission::Start(id) => id,
+            _ => panic!("start"),
+        };
+        let outside = stores.append_cpu_pv(&position, &moves("d2d4")).unwrap();
+        let mut record = observation(state, None, ObservationKind::CpuAnalysis);
+        record.execution = Some(execution);
+        record.cpu_pv = Some(outside);
+        assert!(stores.append_observation(record.clone()).is_err());
+        let stored = stores.observations.append(record.clone()).unwrap();
+        assert!(stores.complete_task(execution, stored).is_err());
+        assert!(stores.pause_task(execution, 7, Some(stored)).is_err());
+        record.cpu_pv = Some(stores.append_cpu_pv(&position, &moves("e2e4")).unwrap());
+        let stored = stores.append_observation(record).unwrap();
+        stores.complete_task(execution, stored).unwrap();
+    }
+
+    #[test]
+    fn cpu_pv_handles_require_rules_replay_from_the_exact_registered_state() {
+        let position = Position::startpos();
+        let mut stores = PalsStores::new(StoreLimits::default());
+        let root = stores.focus_actual_moves(position.snapshot()).unwrap();
+        let state = stores.situations.get(root).unwrap().state;
+        let legal = moves("e2e4 e7e5 g1f3");
+        let checked = stores.append_cpu_pv(&position, &legal).unwrap();
+        assert_eq!(stores.lines.moves(checked).unwrap(), legal);
+        assert_eq!(stores.append_cpu_pv(&position, &legal).unwrap(), checked);
+        let mut record = observation(state, None, ObservationKind::CpuAnalysis);
+        record.cpu_pv = Some(checked);
+        stores.append_observation(record.clone()).unwrap();
+        let lines_before = stores.lines.len();
+        assert!(stores.append_cpu_pv(&position, &moves("e2e5")).is_err());
+        assert!(
+            stores
+                .append_cpu_pv(&position, &moves("e2e4 e7e4"))
+                .is_err()
+        );
+        assert_eq!(stores.lines.len(), lines_before);
+        let mut played = position;
+        played
+            .apply_uci_moves(&["g1f3", "g8f6", "f3g1", "f6g8"])
+            .unwrap();
+        stores.insert_situation(played.snapshot()).unwrap();
+        let missing_history = Position::from_fen(&played.to_fen()).unwrap();
+        assert!(
+            stores
+                .append_cpu_pv(&missing_history, &moves("e2e4"))
+                .is_err()
+        );
+        let foreign_root = stores.lines.root(state).unwrap();
+        let unverified = stores.lines.append(foreign_root, &moves("d2d5")).unwrap();
+        record.cpu_pv = Some(unverified);
+        assert!(stores.append_observation(record).is_err());
+    }
+
+    #[test]
+    fn cpu_pv_attestation_is_rechecked_at_completion_and_survives_no_pool_reissue() {
+        let position = Position::startpos();
+        let mut stores = PalsStores::new(StoreLimits::default());
+        let root = stores.focus_actual_moves(position.snapshot()).unwrap();
+        let state = stores.situations.get(root).unwrap().state;
+        let requester = consumer(&stores, root, 1, 100);
+        let execution = match stores.request_task(key(state), requester, 0).unwrap() {
+            TaskAdmission::Start(id) => id,
+            _ => panic!("start"),
+        };
+        let checked = stores.append_cpu_pv(&position, &moves("e2e4")).unwrap();
+        let mut record = observation(state, None, ObservationKind::CpuAnalysis);
+        record.execution = Some(execution);
+        record.cpu_pv = Some(checked);
+        let verified = stores.append_observation(record.clone()).unwrap();
+        stores.complete_task(execution, verified).unwrap();
+        let requester = consumer(&stores, root, 2, 100);
+        assert!(matches!(
+            stores.request_task(key(state), requester, 1).unwrap(),
+            TaskAdmission::Reuse { observation, .. } if observation == verified
+        ));
+        assert_eq!(
+            stores.observations.get(verified).unwrap().cpu_pv,
+            Some(checked)
+        );
+        stores.lines = LinePool::new(32, 256);
+        let reissued_root = stores.lines.root(state).unwrap();
+        let reissued = stores.lines.append(reissued_root, &moves("d2d4")).unwrap();
+        assert_eq!(reissued, checked);
+        assert_eq!(
+            stores.append_cpu_pv(&position, &moves("d2d4")),
+            Err(StoreError::InvalidEvidence(
+                "checked CPU PV handle cannot be reissued by another store",
+            )),
+        );
+        record.cpu_pv = Some(reissued);
+        assert!(stores.append_observation(record.clone()).is_err());
+        assert_eq!(
+            stores.consume_task(execution, 2, 2),
+            Err(StoreError::InvalidEvidence(
+                "CPU PV lacks matching exact-state Rules replay",
+            )),
+        );
+        let requester = consumer(&stores, root, 3, 100);
+        let mut changed = key(state);
+        changed.requested_depth = 5;
+        let other = match stores.request_task(changed, requester, 1).unwrap() {
+            TaskAdmission::Start(id) => id,
+            _ => panic!("start"),
+        };
+        record.execution = Some(other);
+        record.scope = EvidenceScope::DepthLimited {
+            depth: 5,
+            profile: 1,
+            condition: 1,
+        };
+        let unchecked = stores.observations.append(record).unwrap();
+        assert_eq!(
+            stores.complete_task(other, unchecked),
+            Err(StoreError::InvalidEvidence(
+                "CPU PV lacks matching exact-state Rules replay",
+            )),
+        );
+        assert_eq!(
+            stores.pause_task(other, 7, Some(unchecked)),
+            Err(StoreError::InvalidEvidence(
+                "CPU PV lacks matching exact-state Rules replay",
+            )),
+        );
+        assert_eq!(
+            stores.tasks.get(other).unwrap().status,
+            TaskStatus::InFlight
+        );
+    }
+
+    #[test]
+    fn checked_cpu_pv_cannot_rebind_to_a_reissued_state_store() {
+        let position = Position::startpos();
+        let mut stores = PalsStores::new(StoreLimits::default());
+        let root = stores.focus_actual_moves(position.snapshot()).unwrap();
+        let state = stores.situations.get(root).unwrap().state;
+        let checked = stores.append_cpu_pv(&position, &moves("e2e4")).unwrap();
+        let mut record = observation(state, None, ObservationKind::CpuAnalysis);
+        record.cpu_pv = Some(checked);
+        stores.append_observation(record.clone()).unwrap();
+        stores.states = StateStore::new(32, 1024 * 1024);
+        let reissued = stores.states.insert(position.snapshot()).unwrap();
+        assert_eq!(reissued, state);
+        assert_eq!(
+            stores.append_cpu_pv(&position, &moves("e2e4")),
+            Err(StoreError::InvalidEvidence(
+                "checked CPU PV handle cannot be reissued by another store",
+            )),
+        );
+        assert!(stores.append_observation(record).is_err());
     }
 
     fn consumer(

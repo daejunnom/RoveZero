@@ -1,11 +1,15 @@
 //! Restricted-game PALS refinement. These edges are examined continuations,
 //! not PUCT visits. Only Rules can certify a terminal position.
 use super::store::{
-    BoundKind, EvidenceScope, LineId, Observation, ObservationId, ObservationKind, PalsStores,
-    RawScore, SituationId, StateId, StoreError, StoreLimits, TaskAdmission, TaskConsumer, TaskKey,
-    TaskQuestion,
+    BoundKind, EvidenceScope, LineId, Move16, Observation, ObservationId, ObservationKind,
+    PalsStores, RawScore, SituationId, StateId, StoreError, StoreLimits, TaskAdmission,
+    TaskConsumer, TaskKey, TaskQuestion,
 };
-use crate::cpu::{CPU_MATE_SCORE, CpuEngine, CpuError, CpuLimits, CpuResumeToken, CpuScoreScope};
+use crate::cpu::{
+    CPU_MATE_SCORE, CpuEngine, CpuError, CpuLimits, CpuReport, CpuResumeToken, CpuScoreScope,
+    CpuSearcher,
+};
+use crate::cpu_value::CpuValueIdentity;
 use rz_position::{BoardMove, Color, PlayStatus, Position, PositionError, TerminalReason};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -114,6 +118,9 @@ pub struct RoleRecord {
     pub value: Option<i32>,
     pub completed_depth: u16,
     pub score_scope: Option<CpuScoreScope>,
+    /// CPU-created candidate projection refers to its actual divergence-state
+    /// observation, rather than inventing neural generation or a leaf score.
+    pub cpu_observation: Option<ObservationId>,
     pub perspective: Color,
     pub critical: bool,
 }
@@ -163,6 +170,14 @@ pub enum RoleError {
     PhysicalCompletionUnknown,
     Backend(String),
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoleSearchClosure {
+    Completed,
+    Canceled,
+    Deadline,
+    Failed,
+    PhysicalCompletionUnknown,
+}
 impl std::fmt::Display for RoleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
@@ -184,6 +199,9 @@ pub trait RoleModel: Send {
     /// after output validation and its final deadline/cancellation acceptance.
     /// This hook must not dispatch work or perform a search.
     fn accepted_output(&mut self) {}
+    /// Close only delivered-output accounting at this logical search boundary.
+    /// Physical leases, drain, and quarantine remain the backend owner's job.
+    fn finish_search(&mut self, _reason: RoleSearchClosure) {}
     fn new_game(&mut self) {}
 }
 
@@ -205,6 +223,9 @@ impl<M: RoleModel + ?Sized> RoleModel for Box<M> {
     }
     fn accepted_output(&mut self) {
         (**self).accepted_output();
+    }
+    fn finish_search(&mut self, reason: RoleSearchClosure) {
+        (**self).finish_search(reason);
     }
     fn new_game(&mut self) {
         (**self).new_game();
@@ -404,6 +425,15 @@ struct CpuEvidence {
     score: i32,
     depth: u16,
     scope: CpuScoreScope,
+    value_identity: CpuValueIdentity,
+}
+struct CpuCandidate {
+    pv: Vec<BoardMove>,
+    observation: ObservationId,
+    generation: u64,
+    root: SituationId,
+    root_revision: u64,
+    deadline: Instant,
 }
 #[derive(Clone, Copy)]
 enum Call {
@@ -417,7 +447,9 @@ enum Call {
 pub struct PalsEngine<M: RoleModel> {
     config: PalsConfig,
     model: M,
-    cpu: CpuEngine,
+    cpu: Box<dyn CpuSearcher>,
+    cpu_registered_value: CpuValueIdentity,
+    cpu_registered_condition: String,
     nodes: Vec<Node>,
     records: Vec<RoleRecord>,
     revision: u64,
@@ -428,7 +460,42 @@ pub struct PalsEngine<M: RoleModel> {
 }
 impl<M: RoleModel> PalsEngine<M> {
     pub fn new(config: PalsConfig, model: M, cpu: CpuEngine) -> Result<Self, PalsError> {
+        Self::new_with_cpu(config, model, cpu)
+    }
+    pub fn new_with_cpu<C: CpuSearcher + 'static>(
+        config: PalsConfig,
+        model: M,
+        cpu: C,
+    ) -> Result<Self, PalsError> {
+        Self::new_with_boxed_cpu(config, model, Box::new(cpu))
+    }
+    pub fn new_with_boxed_cpu(
+        config: PalsConfig,
+        model: M,
+        cpu: Box<dyn CpuSearcher>,
+    ) -> Result<Self, PalsError> {
         config.validate()?;
+        cpu.value_identity().validate().map_err(CpuError::Value)?;
+        let capabilities = cpu.capabilities();
+        if !capabilities.divergence || !capabilities.root_moves {
+            return Err(CpuError::Unsupported(
+                "PALS independent CPU divergence/root-move discovery",
+            )
+            .into());
+        }
+        if capabilities.max_depth == 0
+            || cpu.config().max_depth == 0
+            || cpu.config().max_depth > 64
+            || cpu.config().quiescence_ply > 32
+            || capabilities.max_depth < cpu.config().max_depth
+            || capabilities.max_prefix_plies < config.line_plies.saturating_sub(1)
+            || capabilities.max_root_moves < 256
+            || cpu.search_identity().is_empty()
+        {
+            return Err(CpuError::Unsupported("PALS CPU bounded search capabilities").into());
+        }
+        let cpu_registered_value = cpu.value_identity().clone();
+        let cpu_registered_condition = Self::cpu_condition_for(cpu.as_ref());
         let mut nodes = Vec::new();
         nodes
             .try_reserve(config.max_nodes)
@@ -442,6 +509,8 @@ impl<M: RoleModel> PalsEngine<M> {
             config,
             model,
             cpu,
+            cpu_registered_value,
+            cpu_registered_condition,
             nodes,
             records,
             revision: 0,
@@ -521,6 +590,18 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         counters.retained_situations = self.nodes.len();
         self.last_search_counters = Some(counters);
+        let closure = match &result {
+            Ok(report) => match report.completion {
+                PalsCompletion::Canceled => RoleSearchClosure::Canceled,
+                PalsCompletion::Deadline => RoleSearchClosure::Deadline,
+                _ => RoleSearchClosure::Completed,
+            },
+            Err(PalsError::Role(RoleError::PhysicalCompletionUnknown)) => {
+                RoleSearchClosure::PhysicalCompletionUnknown
+            }
+            Err(_) => RoleSearchClosure::Failed,
+        };
+        self.model.finish_search(closure);
         result
     }
     fn search_inner<F: FnMut(BoardMove)>(
@@ -531,10 +612,19 @@ impl<M: RoleModel> PalsEngine<M> {
         mut progress: F,
         counters: &mut PalsCounters,
     ) -> Result<PalsResult, PalsError> {
+        if self.cpu.value_identity() != &self.cpu_registered_value
+            || self.cpu_condition() != self.cpu_registered_condition
+        {
+            return Err(StoreError::InvalidConditions(
+                "startup-selected CPU search/value identity changed",
+            )
+            .into());
+        }
         if limits.max_rounds == 0
             || limits.max_cpu_nodes == 0
             || limits.cpu_depth == 0
             || limits.cpu_depth > self.cpu.config().max_depth
+            || limits.cpu_depth > self.cpu.capabilities().max_depth
         {
             return Err(PalsError::InvalidLimits);
         }
@@ -967,7 +1057,9 @@ impl<M: RoleModel> PalsEngine<M> {
             return Ok(());
         }
         if self.nodes[node].evidence.as_ref().is_some_and(|e| {
-            e.depth >= limits.cpu_depth && e.scope == CpuScoreScope::CompletedIteration
+            e.depth >= limits.cpu_depth
+                && e.scope == CpuScoreScope::CompletedIteration
+                && &e.value_identity == self.cpu.value_identity()
         }) {
             counters.evidence_cache_hits += 1;
             counters.consumed_cached_cpu_values += 1;
@@ -979,9 +1071,11 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         let task_nodes = remaining.min(self.config.cpu_nodes_per_task);
         let profile = stable_id(self.cpu.config().profile.identity());
+        let value_identity = self.cpu.value_identity().clone();
+        let cpu_condition = self.cpu_condition();
         let condition = stable_id(&format!(
             "{};q={}",
-            crate::cpu::CPU_SEARCH_VERSION,
+            self.cpu.search_identity(),
             self.cpu.config().quiescence_ply
         ));
         self.consumer_id = self.consumer_id.checked_add(1).ok_or(PalsError::Capacity)?;
@@ -1003,6 +1097,8 @@ impl<M: RoleModel> PalsEngine<M> {
                 line: None,
                 question: TaskQuestion::AnalyzePosition,
                 root_moves: Vec::new(),
+                value_identity: Some(value_identity.clone()),
+                cpu_condition: Some(cpu_condition.clone()),
                 model: 0,
                 epoch: 0,
                 profile,
@@ -1047,6 +1143,7 @@ impl<M: RoleModel> PalsEngine<M> {
                             score: value,
                             depth,
                             scope: CpuScoreScope::CompletedIteration,
+                            value_identity: self.cpu.value_identity().clone(),
                         });
                         counters.evidence_cache_hits += 1;
                         counters.consumed_cpu_tasks += 1;
@@ -1062,7 +1159,10 @@ impl<M: RoleModel> PalsEngine<M> {
                 checkpoint,
                 ..
             } => {
-                if checkpoint != node as u64 || self.nodes[node].resume.is_none() {
+                if checkpoint != node as u64
+                    || self.nodes[node].resume.is_none()
+                    || !self.cpu.capabilities().completed_iteration_resume
+                {
                     return Err(
                         StoreError::InvalidConditions("CPU checkpoint owner mismatch").into(),
                     );
@@ -1098,27 +1198,24 @@ impl<M: RoleModel> PalsEngine<M> {
         } {
             Ok(report) => report,
             Err(error) => {
-                counters.cpu_work_observation_incomplete = true;
+                self.observe_cpu_failure(counters, task_nodes);
                 self.stores.tasks.fail(execution)?;
                 return Err(error.into());
             }
         };
-        counters.cpu_tasks += 1;
-        counters.cpu_nodes += report.nodes;
-        counters.cpu_quiescence_nodes += report.quiescence_nodes;
-        counters.cpu_tt_hits += report.tt_hits;
-        let requested_coverage_complete = report.score_scope == CpuScoreScope::CompletedIteration
-            && report.completed_depth >= limits.cpu_depth;
-        // Actual CPU coverage is complete even when later evidence publication
-        // cannot fit in a bounded store. Publication and consumption are separate.
-        if requested_coverage_complete {
-            counters.completed_cpu_tasks += 1;
-        }
-        if report.score_scope == CpuScoreScope::CompletedIteration
-            && report.completed_depth > 0
-            && report.completed_depth < limits.cpu_depth
-        {
-            counters.partial_cpu_iterations += 1;
+        let admission = self.validate_cpu_report(
+            &self.nodes[node].position,
+            &report,
+            &value_identity,
+            &cpu_condition,
+            false,
+            cpu_limits,
+        );
+        let requested_coverage_complete =
+            Self::observe_cpu_report(counters, &report, limits.cpu_depth, admission.is_ok());
+        if let Err(error) = admission {
+            self.stores.tasks.fail(execution)?;
+            return Err(error);
         }
         // A stopped task retains completed depth evidence, but never pretends to
         // have examined the requested remaining depth or to prove a mate.
@@ -1144,6 +1241,9 @@ impl<M: RoleModel> PalsEngine<M> {
                     bound: BoundKind::ExactWithinSearch,
                 }
             },
+            value_identity: Some(report.value_identity.clone()),
+            cpu_condition: Some(cpu_condition.clone()),
+            cpu_pv: None,
             budget: report.nodes,
             kind: ObservationKind::CpuAnalysis,
             supersedes: None,
@@ -1194,6 +1294,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 score: report.score,
                 depth: report.completed_depth,
                 scope: report.score_scope,
+                value_identity: report.value_identity.clone(),
             });
             if requested_coverage_complete {
                 counters.consumed_cpu_tasks += 1;
@@ -1221,6 +1322,512 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         Ok(())
     }
+
+    fn cpu_condition(&self) -> String {
+        Self::cpu_condition_for(self.cpu.as_ref())
+    }
+    fn cpu_condition_for(cpu: &dyn CpuSearcher) -> String {
+        format!(
+            "{};conditions={};profile={:?};q={};tt={};maxdepth={};capabilities={:?}",
+            cpu.search_identity(),
+            cpu.search_conditions(),
+            cpu.config().profile,
+            cpu.config().quiescence_ply,
+            cpu.config().tt_entries,
+            cpu.config().max_depth,
+            cpu.capabilities()
+        )
+    }
+
+    fn validate_cpu_report(
+        &self,
+        position: &Position,
+        report: &CpuReport,
+        value_identity: &CpuValueIdentity,
+        cpu_condition: &str,
+        restricted: bool,
+        limits: CpuLimits,
+    ) -> Result<(), PalsError> {
+        if &report.value_identity != value_identity
+            || self.cpu.value_identity() != value_identity
+            || self.cpu_condition() != cpu_condition
+            || report.search_version != self.cpu.search_identity()
+            || report.profile != self.cpu.config().profile
+            || report.root_restricted != restricted
+            || report.completed_depth > limits.max_depth
+            || report.reused_completed_depth > report.completed_depth
+            || report.nodes > limits.max_nodes
+            || report.quiescence_nodes > report.nodes
+            || report.best_move != report.pv.first().copied()
+            || report.score.unsigned_abs() > CPU_MATE_SCORE as u32
+            || (report.score_scope == CpuScoreScope::FrontierOnly
+                && report.score.unsigned_abs() > crate::cpu::CPU_FRONTIER_SCORE_LIMIT as u32)
+            || report.score_scope == CpuScoreScope::RulesTerminal
+            || (report.score_scope == CpuScoreScope::CompletedIteration
+                && report.completed_depth == 0)
+            || (report.score_scope == CpuScoreScope::FrontierOnly && report.completed_depth != 0)
+            || report.pv.is_empty()
+            || report.pv.len()
+                > limits.max_depth as usize + self.cpu.config().quiescence_ply as usize
+            || (report.resume.is_some() && !self.cpu.capabilities().completed_iteration_resume)
+        {
+            return Err(StoreError::InvalidEvidence(
+                "CPU report differs from admitted immutable search/value conditions",
+            )
+            .into());
+        }
+        let mut checked = position.clone();
+        for &movement in &report.pv {
+            if !matches!(
+                checked.classify_position()?.play_status,
+                PlayStatus::Ongoing
+            ) {
+                return Err(StoreError::InvalidEvidence(
+                    "CPU PV continues after exact Rules terminal",
+                )
+                .into());
+            }
+            checked.make_move(movement)?;
+        }
+        Ok(())
+    }
+
+    fn observe_cpu_report(
+        counters: &mut PalsCounters,
+        report: &CpuReport,
+        requested_depth: u16,
+        admitted: bool,
+    ) -> bool {
+        counters.cpu_tasks += 1;
+        if admitted {
+            counters.cpu_nodes += report.nodes;
+            counters.cpu_quiescence_nodes += report.quiescence_nodes;
+            counters.cpu_tt_hits += report.tt_hits;
+        } else {
+            counters.cpu_work_observation_incomplete = true;
+        }
+        let complete = admitted
+            && report.score_scope == CpuScoreScope::CompletedIteration
+            && report.completed_depth >= requested_depth;
+        // Physical coverage precedes immutable publication and consumer acceptance.
+        if complete {
+            counters.completed_cpu_tasks += 1;
+        } else if admitted
+            && report.score_scope == CpuScoreScope::CompletedIteration
+            && report.completed_depth > 0
+        {
+            counters.partial_cpu_iterations += 1;
+        }
+        complete
+    }
+
+    fn observe_cpu_failure(&self, counters: &mut PalsCounters, requested_nodes: u64) {
+        if let Some(work) = self
+            .cpu
+            .last_attempt_work()
+            .filter(|work| work.nodes <= requested_nodes && work.quiescence_nodes <= work.nodes)
+        {
+            counters.cpu_nodes += work.nodes;
+            counters.cpu_quiescence_nodes += work.quiescence_nodes;
+            counters.cpu_tt_hits += work.tt_hits;
+        } else {
+            counters.cpu_work_observation_incomplete = true;
+        }
+    }
+
+    /// CPU discoveries are separate from an unrestricted node-value cache. A
+    /// restricted root score belongs to this task, never to its newly found leaf.
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_candidate(
+        &mut self,
+        root: usize,
+        divergence: usize,
+        prefix: &[BoardMove],
+        alternatives: Option<&[BoardMove]>,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        counters: &mut PalsCounters,
+    ) -> Result<Option<CpuCandidate>, PalsError> {
+        if self.stopped(limits, cancel).is_some() || self.nodes[divergence].terminal.is_some() {
+            return Ok(None);
+        }
+        let mut checked = self.nodes[root].position.clone();
+        for &movement in prefix {
+            checked.make_move(movement)?;
+        }
+        if checked.position_identity() != self.nodes[divergence].position.position_identity()
+            || self.stores.root().is_none_or(|situation| {
+                self.stores
+                    .situations
+                    .get(situation)
+                    .map_or(true, |s| s.state != self.nodes[root].state)
+            })
+        {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        let remaining = limits.max_cpu_nodes.saturating_sub(counters.cpu_nodes);
+        if remaining == 0 || alternatives.is_some_and(|moves| moves.is_empty()) {
+            return Ok(None);
+        }
+        let generation = self.stores.generation();
+        let active_root = self.stores.root().ok_or(StoreError::StaleConsumer)?;
+        let root_revision = self.stores.situations.get(active_root)?.revision;
+        let task_nodes = remaining.min(self.config.cpu_nodes_per_task);
+        let profile = stable_id(self.cpu.config().profile.identity());
+        let condition = stable_id(&format!(
+            "{};q={}",
+            self.cpu.search_identity(),
+            self.cpu.config().quiescence_ply
+        ));
+        let value_identity = self.cpu.value_identity().clone();
+        let search_condition = self.cpu_condition();
+        let question = if alternatives.is_some() {
+            TaskQuestion::AnalyzeRootMoves
+        } else {
+            TaskQuestion::FindAlternative {
+                divergence_ply: prefix.len() as u16,
+            }
+        };
+        let root_moves: Vec<_> = alternatives
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            .map(Move16::pack)
+            .collect::<Result<_, _>>()?;
+        let ordered_mask: String = root_moves
+            .iter()
+            .map(|movement| format!("{:04x}", movement.bits()))
+            .collect();
+        let cpu_condition = format!(
+            "{};question={:?};ordered-root-mask={};prefix-plies={}",
+            search_condition,
+            question,
+            ordered_mask,
+            prefix.len()
+        );
+        self.consumer_id = self.consumer_id.checked_add(1).ok_or(PalsError::Capacity)?;
+        let consumer_id = self.consumer_id;
+        let consumer = TaskConsumer {
+            id: consumer_id,
+            situation: self.nodes[divergence].situation,
+            revision: self
+                .stores
+                .situations
+                .get(self.nodes[divergence].situation)?
+                .revision,
+            generation,
+            deadline_tick: self.tick_at(limits.deadline),
+        };
+        let admission = match self.stores.request_task(
+            TaskKey {
+                state: self.nodes[divergence].state,
+                line: None,
+                question,
+                root_moves,
+                value_identity: Some(value_identity.clone()),
+                cpu_condition: Some(cpu_condition.clone()),
+                model: 0,
+                epoch: 0,
+                profile,
+                condition,
+                // Projected prefix length is part of the bounded continuation question.
+                input_revision: prefix.len() as u64,
+                requested_depth: limits.cpu_depth,
+                node_budget: task_nodes,
+            },
+            consumer,
+            self.tick_at(Instant::now()),
+        ) {
+            Ok(admission) => admission,
+            Err(StoreError::ExpiredConsumer) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let execution = match admission {
+            TaskAdmission::Reuse {
+                execution,
+                observation,
+            } => {
+                let evidence = self.stores.observations.get(observation)?;
+                let Some(line) = evidence.cpu_pv else {
+                    return Ok(None);
+                };
+                let pv = self.stores.lines.moves(line)?;
+                if self.stopped(limits, cancel).is_some() || generation != self.stores.generation()
+                {
+                    return Ok(None);
+                }
+                match self
+                    .stores
+                    .consume_task(execution, consumer_id, self.tick_at(Instant::now()))
+                {
+                    Ok(_) => {}
+                    Err(StoreError::ExpiredConsumer) => return Ok(None),
+                    Err(error) => return Err(error.into()),
+                }
+                if self.stopped(limits, cancel).is_some() {
+                    return Ok(None);
+                }
+                counters.evidence_cache_hits += 1;
+                counters.consumed_cpu_tasks += 1;
+                counters.reused_completed_cpu_tasks_consumed += 1;
+                counters.consumed_cached_cpu_values += 1;
+                return Ok(Some(CpuCandidate {
+                    pv,
+                    observation,
+                    generation,
+                    root: active_root,
+                    root_revision,
+                    deadline: limits.deadline,
+                }));
+            }
+            TaskAdmission::Start(execution) => execution,
+            // Discovery tasks deliberately do not reuse AnalyzePosition's token.
+            TaskAdmission::Join(_) | TaskAdmission::Resume { .. } => {
+                return Err(StoreError::InvalidConditions(
+                    "CPU discovery has no shared in-flight/resume owner",
+                )
+                .into());
+            }
+        };
+        let cpu_limits = CpuLimits {
+            max_depth: limits.cpu_depth,
+            max_nodes: task_nodes,
+            deadline: Some(limits.deadline),
+        };
+        counters.cpu_tasks_requested += 1;
+        let report = match alternatives {
+            Some(moves) => self.cpu.analyze_root_moves(
+                &self.nodes[divergence].position,
+                moves,
+                cpu_limits,
+                cancel,
+            ),
+            None => {
+                self.cpu
+                    .analyze_divergence(&self.nodes[root].position, prefix, cpu_limits, cancel)
+            }
+        };
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                self.observe_cpu_failure(counters, task_nodes);
+                self.stores.tasks.fail(execution)?;
+                return Err(error.into());
+            }
+        };
+        let admission = self
+            .validate_cpu_report(
+                &self.nodes[divergence].position,
+                &report,
+                &value_identity,
+                &search_condition,
+                alternatives.is_some(),
+                cpu_limits,
+            )
+            .and_then(|()| {
+                if alternatives.is_some_and(|moves| {
+                    report
+                        .best_move
+                        .is_none_or(|movement| !moves.contains(&movement))
+                }) {
+                    Err(StoreError::InvalidEvidence(
+                        "CPU candidate is outside the admitted ordered root mask",
+                    )
+                    .into())
+                } else {
+                    Ok(())
+                }
+            });
+        let complete =
+            Self::observe_cpu_report(counters, &report, limits.cpu_depth, admission.is_ok());
+        if let Err(error) = admission {
+            self.stores.tasks.fail(execution)?;
+            return Err(error);
+        }
+        // The store facade independently checks the entire CPU PV with Rules.
+        // Only the portion fitting the registered PALS line enters its graph.
+        let pv: Vec<_> = report
+            .pv
+            .iter()
+            .copied()
+            .take(self.config.line_plies.saturating_sub(prefix.len()))
+            .collect();
+        let pv_line = match self
+            .stores
+            .append_cpu_pv(&self.nodes[divergence].position, &pv)
+        {
+            Ok(line) => line,
+            Err(error) => {
+                self.stores.tasks.fail(execution)?;
+                return Err(error.into());
+            }
+        };
+        let observation = match self.stores.append_observation(Observation {
+            state: self.nodes[divergence].state,
+            line: None,
+            source: stable_id(report.score_provenance),
+            epoch: 0,
+            scope: EvidenceScope::DepthLimited {
+                depth: report.completed_depth,
+                profile,
+                condition,
+            },
+            value_identity: Some(report.value_identity.clone()),
+            cpu_condition: Some(cpu_condition.clone()),
+            cpu_pv: Some(pv_line),
+            score: if report.score_scope == CpuScoreScope::FrontierOnly {
+                RawScore::Estimate {
+                    value: report.score as f32,
+                    perspective: self.nodes[divergence].position.side_to_move(),
+                }
+            } else {
+                RawScore::Cpu {
+                    value: report.score,
+                    perspective: self.nodes[divergence].position.side_to_move(),
+                    bound: BoundKind::ExactWithinSearch,
+                }
+            },
+            budget: report.nodes,
+            kind: ObservationKind::CpuAnalysis,
+            supersedes: None,
+            execution: Some(execution),
+        }) {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.stores.tasks.fail(execution)?;
+                return Err(error.into());
+            }
+        };
+        if complete {
+            if let Err(error) = self.stores.complete_task(execution, observation) {
+                self.stores.tasks.fail(execution)?;
+                return Err(error.into());
+            }
+        } else {
+            // Partial discovery evidence survives, but no generic node resume
+            // token is borrowed for a differently restricted CPU question.
+            self.stores.tasks.fail(execution)?;
+        }
+        if self.stopped(limits, cancel).is_some() || generation != self.stores.generation() {
+            return Ok(None);
+        }
+        if complete {
+            match self
+                .stores
+                .consume_task(execution, consumer_id, self.tick_at(Instant::now()))
+            {
+                Ok(_) => {}
+                Err(StoreError::ExpiredConsumer) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if self.stopped(limits, cancel).is_some() {
+            return Ok(None);
+        }
+        if complete {
+            counters.consumed_cpu_tasks += 1;
+        } else if report.score_scope == CpuScoreScope::CompletedIteration {
+            counters.consumed_partial_cpu_values += 1;
+        } else {
+            counters.consumed_frontier_cpu_values += 1;
+        }
+        self.stores
+            .dependencies
+            .add(observation, self.nodes[divergence].situation)?;
+        self.stores
+            .dependencies
+            .add(observation, self.nodes[root].situation)?;
+        Ok(Some(CpuCandidate {
+            pv,
+            observation,
+            generation,
+            root: active_root,
+            root_revision,
+            deadline: limits.deadline,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_cpu_candidate(
+        &mut self,
+        root: usize,
+        divergence: usize,
+        prefix: &[BoardMove],
+        proposal: &[BoardMove],
+        candidate: &CpuCandidate,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        counters: &mut PalsCounters,
+    ) -> Result<Option<(usize, usize, Vec<BoardMove>)>, PalsError> {
+        if self.stopped(limits, cancel).is_some() || Instant::now() >= candidate.deadline {
+            return Ok(None);
+        }
+        if candidate.generation != self.stores.generation()
+            || self.stores.root() != Some(candidate.root)
+            || self.stores.situations.get(candidate.root)?.revision != candidate.root_revision
+        {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        let Some(response) = candidate.pv.first().copied() else {
+            return Ok(None);
+        };
+        if proposal.get(prefix.len()).copied() == Some(response) {
+            return Ok(None);
+        }
+        if candidate.pv.len() > self.config.line_plies.saturating_sub(prefix.len()) {
+            return Err(StoreError::Capacity("CPU candidate exceeds registered PALS line").into());
+        }
+        let evidence = self.stores.observations.get(candidate.observation)?;
+        if evidence.value_identity.as_ref() != Some(self.cpu.value_identity())
+            || evidence.cpu_pv.is_none_or(|line| {
+                self.stores
+                    .lines
+                    .moves(line)
+                    .map_or(true, |pv| pv != candidate.pv)
+            })
+        {
+            return Err(StoreError::InvalidEvidence(
+                "CPU candidate lost checked PV or value namespace",
+            )
+            .into());
+        }
+        let mut checked = self.nodes[root].position.clone();
+        for &movement in prefix {
+            checked.make_move(movement)?;
+        }
+        if checked.position_identity() != self.nodes[divergence].position.position_identity()
+            || self.stores.root().is_none_or(|situation| {
+                self.stores
+                    .situations
+                    .get(situation)
+                    .map_or(true, |s| s.state != self.nodes[root].state)
+            })
+            || self.stores.observations.get(candidate.observation)?.state
+                != self.nodes[divergence].state
+        {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        for &movement in &candidate.pv {
+            checked.make_move(movement)?;
+        }
+        if self.stopped(limits, cancel).is_some() {
+            return Ok(None);
+        }
+        let mut line = prefix.to_vec();
+        let mut current = divergence;
+        let mut first = None;
+        for &movement in &candidate.pv {
+            if self.stopped(limits, cancel).is_some() {
+                return Ok(None);
+            }
+            let mut next = self.nodes[current].position.clone();
+            next.make_move(movement)?;
+            current = self.connect(current, movement, next, counters)?;
+            first.get_or_insert(current);
+            line.push(movement);
+        }
+        Ok(Some((first.expect("nonempty checked PV"), current, line)))
+    }
     fn tick_at(&self, instant: Instant) -> u64 {
         instant
             .saturating_duration_since(self.clock_origin)
@@ -1235,6 +1842,29 @@ impl<M: RoleModel> PalsEngine<M> {
         completed_depth: u16,
         score_scope: Option<CpuScoreScope>,
         perspective: Option<Color>,
+    ) -> Result<Option<(LineId, ObservationId)>, PalsError> {
+        self.record_with_cpu(
+            kind,
+            line,
+            value,
+            completed_depth,
+            score_scope,
+            perspective,
+            None,
+        )
+    }
+    // Immutable CPU evidence is an explicit source, while the public line is
+    // anchored at the active root and does not inherit the CPU state's value.
+    #[allow(clippy::too_many_arguments)]
+    fn record_with_cpu(
+        &mut self,
+        kind: RecordKind,
+        line: &[BoardMove],
+        value: Option<i32>,
+        completed_depth: u16,
+        score_scope: Option<CpuScoreScope>,
+        perspective: Option<Color>,
+        cpu_observation: Option<ObservationId>,
     ) -> Result<Option<(LineId, ObservationId)>, PalsError> {
         self.revision = self.revision.checked_add(1).ok_or(PalsError::Capacity)?;
         let root = self.stores.root().ok_or(PalsError::Capacity)?;
@@ -1269,10 +1899,11 @@ impl<M: RoleModel> PalsEngine<M> {
             value,
             completed_depth,
             score_scope,
+            cpu_observation,
             perspective,
             critical: true,
         });
-        if kind == RecordKind::CpuVerification {
+        if kind == RecordKind::CpuVerification || cpu_observation.is_some() {
             return Ok(None);
         }
         let line_id = self
@@ -1288,6 +1919,9 @@ impl<M: RoleModel> PalsEngine<M> {
                 encoding: stable_id("pals-role-query-v1"),
                 input: self.revision,
             },
+            value_identity: None,
+            cpu_condition: None,
+            cpu_pv: None,
             score: RawScore::Unknown,
             budget: 0,
             kind: match kind {
@@ -1456,6 +2090,51 @@ impl<M: RoleModel> PalsEngine<M> {
             let ply = divergences[ranked[round as usize % ranked.len()]];
             let divergence = path[ply];
             let prefix = &proposal[..ply];
+            // At most two finite CPU questions per divergence: unrestricted
+            // independent discovery, then an explicitly restricted alternative
+            // question only if its best move kept the original continuation.
+            let mut cpu_discovery =
+                self.cpu_candidate(root, divergence, prefix, None, limits, cancel, counters)?;
+            if cpu_discovery
+                .as_ref()
+                .is_none_or(|candidate| candidate.pv.first().copied() == Some(proposal[ply]))
+            {
+                let alternatives: Vec<_> = self.nodes[divergence]
+                    .position
+                    .legal_moves()
+                    .into_iter()
+                    .filter(|movement| *movement != proposal[ply])
+                    .collect();
+                cpu_discovery = self.cpu_candidate(
+                    root,
+                    divergence,
+                    prefix,
+                    Some(&alternatives),
+                    limits,
+                    cancel,
+                    counters,
+                )?;
+            }
+            let cpu_line = if let Some(candidate) = &cpu_discovery {
+                self.insert_cpu_candidate(
+                    root, divergence, prefix, &proposal, candidate, limits, cancel, counters,
+                )?
+            } else {
+                None
+            };
+            if let (Some((_, _, line)), Some(candidate)) = (&cpu_line, &cpu_discovery) {
+                self.record_with_cpu(
+                    RecordKind::Counterexample,
+                    line,
+                    None,
+                    0,
+                    None,
+                    None,
+                    Some(candidate.observation),
+                )?;
+            }
+            // C receives the actual CPU-created candidate projection before its
+            // next query; P repair below also starts after that exact response.
             let replies = self.ranked(
                 divergence,
                 Call::Reply,
@@ -1466,6 +2145,21 @@ impl<M: RoleModel> PalsEngine<M> {
                 cancel,
                 counters,
             )?;
+            // Retain the independent CPU branch and one distinct C-selected
+            // branch. Both are bounded, evaluated, and repaired; C output is
+            // never acknowledged merely to discard its discovered response.
+            let mut branches = Vec::with_capacity(2);
+            let cpu_response = cpu_line.as_ref().map(|(_, _, line)| line[ply]);
+            if let Some((response_node, leaf, line)) = cpu_line {
+                branches.push((
+                    response_node,
+                    leaf,
+                    line,
+                    cpu_discovery
+                        .as_ref()
+                        .map(|candidate| candidate.observation),
+                ));
+            }
             let examined: Vec<_> = self.nodes[divergence]
                 .edges
                 .iter()
@@ -1474,94 +2168,128 @@ impl<M: RoleModel> PalsEngine<M> {
             let response = replies
                 .iter()
                 .copied()
-                .find(|mv| *mv != proposal[ply] && !examined.contains(mv))
-                .or_else(|| replies.iter().copied().find(|mv| *mv != proposal[ply]));
-            let Some(response) = response else {
-                continue;
-            };
-            let mut state = self.nodes[divergence].position.clone();
-            state.make_move(response)?;
-            let response_node = self.connect(divergence, response, state, counters)?;
-            let mut refutation = prefix.to_vec();
-            refutation.push(response);
-            let counter_leaf = self.follow(
-                response_node,
-                &mut refutation,
-                &proposal,
-                None,
-                Call::Reply,
-                limits,
-                cancel,
-                counters,
-            )?;
-            counters.refutations += 1;
-            self.record(RecordKind::Counterexample, &refutation, None, 0, None, None)?;
-            self.verify(counter_leaf, &refutation, limits, cancel, counters)?;
-            self.publish_choice(root, limits, cancel, progress)?;
-            let counter_value =
-                self.completed_line_value(counter_leaf, refutation.len(), limits.cpu_depth);
-            // The conclusion is conditional on one recorded line and on finite
-            // CPU estimates. An unexamined/lower-ranked reply alone cannot refute
-            // a proposal, and this never labels the first move permanently lost.
-            let supported_refutation = match (proposal_record, proposal_value, counter_value) {
-                (Some((line, _)), Some(old), Some(counter))
-                    if counter < old && self.stopped(limits, cancel).is_none() =>
-                {
-                    let evidence = self.conclusion_observation(
-                        root,
-                        line,
-                        ObservationKind::Refutation,
-                        counter,
-                        None,
-                    )?;
-                    self.stores
-                        .refute_continuation(self.nodes[root].situation, line, evidence)?;
-                    counters.supported_refutations += 1;
-                    Some((line, evidence, counter))
+                .find(|mv| {
+                    *mv != proposal[ply] && Some(*mv) != cpu_response && !examined.contains(mv)
+                })
+                .or_else(|| {
+                    replies
+                        .iter()
+                        .copied()
+                        .find(|mv| *mv != proposal[ply] && Some(*mv) != cpu_response)
+                });
+            if let Some(response) = response.filter(|_| self.stopped(limits, cancel).is_none()) {
+                let mut state = self.nodes[divergence].position.clone();
+                state.make_move(response)?;
+                let response_node = self.connect(divergence, response, state, counters)?;
+                let mut line = prefix.to_vec();
+                line.push(response);
+                branches.push((response_node, response_node, line, None));
+            }
+            for (response_node, counter_leaf, mut refutation, cpu_source) in branches {
+                if self.stopped(limits, cancel).is_some() {
+                    break;
                 }
-                _ => None,
-            };
-            // Repair resumes AFTER the response. The first move remains in the
-            // frontier; this conditional counterexample never blacklists it.
-            let mut repair = prefix.to_vec();
-            repair.push(response);
-            let repair_leaf = self.follow(
-                response_node,
-                &mut repair,
-                &proposal,
-                Some(&refutation),
-                Call::Repair,
-                limits,
-                cancel,
-                counters,
-            )?;
-            counters.repairs += 1;
-            let repair_record = self.record(RecordKind::Repair, &repair, None, 0, None, None)?;
-            self.verify(repair_leaf, &repair, limits, cancel, counters)?;
-            self.publish_choice(root, limits, cancel, progress)?;
-            if let (
-                Some((old_line, old_evidence, old_value)),
-                Some((new_line, _)),
-                Some(new_value),
-            ) = (
-                supported_refutation,
-                repair_record,
-                self.completed_line_value(repair_leaf, repair.len(), limits.cpu_depth),
-            ) {
-                if new_line != old_line
-                    && new_value > old_value
-                    && self.stopped(limits, cancel).is_none()
-                {
-                    let evidence = self.conclusion_observation(
-                        root,
-                        new_line,
-                        ObservationKind::Repair,
-                        new_value,
-                        Some(old_evidence),
+                // A short checked CPU PV may still need C's bounded continuation.
+                let counter_leaf = self.follow(
+                    counter_leaf,
+                    &mut refutation,
+                    &proposal,
+                    None,
+                    Call::Reply,
+                    limits,
+                    cancel,
+                    counters,
+                )?;
+                let response = refutation[ply];
+                counters.refutations += 1;
+                if cpu_source.is_some() {
+                    self.record_with_cpu(
+                        RecordKind::Counterexample,
+                        &refutation,
+                        None,
+                        0,
+                        None,
+                        None,
+                        cpu_source,
                     )?;
-                    self.stores
-                        .repair(self.nodes[root].situation, old_line, new_line, evidence)?;
-                    counters.supported_repairs += 1;
+                } else {
+                    self.record(RecordKind::Counterexample, &refutation, None, 0, None, None)?;
+                }
+                self.verify(counter_leaf, &refutation, limits, cancel, counters)?;
+                self.publish_choice(root, limits, cancel, progress)?;
+                let counter_value =
+                    self.completed_line_value(counter_leaf, refutation.len(), limits.cpu_depth);
+                // The conclusion is conditional on one recorded line and on finite
+                // CPU estimates. An unexamined/lower-ranked reply alone cannot refute
+                // a proposal, and this never labels the first move permanently lost.
+                let supported_refutation = match (proposal_record, proposal_value, counter_value) {
+                    (Some((line, _)), Some(old), Some(counter))
+                        if counter < old && self.stopped(limits, cancel).is_none() =>
+                    {
+                        let evidence = self.conclusion_observation(
+                            root,
+                            line,
+                            ObservationKind::Refutation,
+                            counter,
+                            None,
+                        )?;
+                        self.stores.refute_continuation(
+                            self.nodes[root].situation,
+                            line,
+                            evidence,
+                        )?;
+                        counters.supported_refutations += 1;
+                        Some((line, evidence, counter))
+                    }
+                    _ => None,
+                };
+                // Repair resumes AFTER the response. The first move remains in the
+                // frontier; this conditional counterexample never blacklists it.
+                let mut repair = prefix.to_vec();
+                repair.push(response);
+                let repair_leaf = self.follow(
+                    response_node,
+                    &mut repair,
+                    &proposal,
+                    Some(&refutation),
+                    Call::Repair,
+                    limits,
+                    cancel,
+                    counters,
+                )?;
+                counters.repairs += 1;
+                let repair_record =
+                    self.record(RecordKind::Repair, &repair, None, 0, None, None)?;
+                self.verify(repair_leaf, &repair, limits, cancel, counters)?;
+                self.publish_choice(root, limits, cancel, progress)?;
+                if let (
+                    Some((old_line, old_evidence, old_value)),
+                    Some((new_line, _)),
+                    Some(new_value),
+                ) = (
+                    supported_refutation,
+                    repair_record,
+                    self.completed_line_value(repair_leaf, repair.len(), limits.cpu_depth),
+                ) {
+                    if new_line != old_line
+                        && new_value > old_value
+                        && self.stopped(limits, cancel).is_none()
+                    {
+                        let evidence = self.conclusion_observation(
+                            root,
+                            new_line,
+                            ObservationKind::Repair,
+                            new_value,
+                            Some(old_evidence),
+                        )?;
+                        self.stores.repair(
+                            self.nodes[root].situation,
+                            old_line,
+                            new_line,
+                            evidence,
+                        )?;
+                        counters.supported_repairs += 1;
+                    }
                 }
             }
         }
@@ -1582,7 +2310,10 @@ impl<M: RoleModel> PalsEngine<M> {
                 return Some(value);
             }
         }
-        node.evidence.as_ref().map(|e| e.score)
+        node.evidence
+            .as_ref()
+            .filter(|e| e.value_identity == self.cpu_registered_value)
+            .map(|e| e.score)
     }
     fn completed_line_value(&self, leaf: usize, plies: usize, required_depth: u16) -> Option<i32> {
         let value = self.nodes[leaf]
@@ -1593,7 +2324,9 @@ impl<M: RoleModel> PalsEngine<M> {
                     .evidence
                     .as_ref()
                     .filter(|e| {
-                        e.scope == CpuScoreScope::CompletedIteration && e.depth >= required_depth
+                        e.scope == CpuScoreScope::CompletedIteration
+                            && e.depth >= required_depth
+                            && e.value_identity == self.cpu_registered_value
                     })
                     .map(|e| e.score)
             })?;
@@ -1619,6 +2352,9 @@ impl<M: RoleModel> PalsEngine<M> {
                 encoding: stable_id("pals-restricted-summary-v1"),
                 input: self.revision,
             },
+            value_identity: None,
+            cpu_condition: None,
+            cpu_pv: None,
             score: RawScore::Estimate {
                 value: value as f32,
                 perspective: self.nodes[root].position.side_to_move(),
@@ -1733,6 +2469,636 @@ mod tests {
             max_rounds: 1,
             max_cpu_nodes: 2000,
             cpu_depth: 1,
+        }
+    }
+    #[test]
+    fn boxed_role_accounting_closes_each_search_once_without_claiming_physical_completion() {
+        struct FinishRole {
+            failure: Option<RoleError>,
+            closed: std::sync::Arc<std::sync::Mutex<Vec<RoleSearchClosure>>>,
+        }
+        impl RoleModel for FinishRole {
+            fn identity(&self) -> &str {
+                "search-closure-test"
+            }
+            fn propose(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+                if let Some(error) = &self.failure {
+                    return Err(error.clone());
+                }
+                LegalOrderRoleMock.propose(query)
+            }
+            fn reply(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+                LegalOrderRoleMock.reply(query)
+            }
+            fn repair(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+                LegalOrderRoleMock.repair(query)
+            }
+            fn divergences(&mut self, query: DivergenceQuery<'_>) -> Result<Vec<f32>, RoleError> {
+                LegalOrderRoleMock.divergences(query)
+            }
+            fn finish_search(&mut self, reason: RoleSearchClosure) {
+                self.closed.lock().unwrap().push(reason);
+            }
+        }
+        for (failure, cancel, expired, expected) in [
+            (None, false, false, RoleSearchClosure::Completed),
+            (None, true, false, RoleSearchClosure::Canceled),
+            (None, false, true, RoleSearchClosure::Deadline),
+            (
+                Some(RoleError::Unavailable),
+                false,
+                false,
+                RoleSearchClosure::Failed,
+            ),
+            (
+                Some(RoleError::PhysicalCompletionUnknown),
+                false,
+                false,
+                RoleSearchClosure::PhysicalCompletionUnknown,
+            ),
+        ] {
+            let closed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let role: Box<dyn RoleModel> = Box::new(FinishRole {
+                failure,
+                closed: closed.clone(),
+            });
+            let mut engine = PalsEngine::new(
+                PalsConfig::default(),
+                role,
+                CpuEngine::new(CpuConfig::default()).unwrap(),
+            )
+            .unwrap();
+            let mut run_limits = limits();
+            if expired {
+                run_limits.deadline = Instant::now();
+            }
+            let _ = engine.search(&Position::startpos(), run_limits, &AtomicBool::new(cancel));
+            assert_eq!(*closed.lock().unwrap(), vec![expected]);
+            engine.new_game();
+            assert_eq!(closed.lock().unwrap().len(), 1);
+        }
+    }
+    #[test]
+    fn independent_cpu_defense_enters_graph_and_affected_critic_and_repair_with_exact_history() {
+        #[derive(Default)]
+        struct Seen {
+            critic_saw_cpu: bool,
+            repairs: Vec<(
+                Vec<BoardMove>,
+                Vec<BoardMove>,
+                rz_position::PositionSnapshot,
+            )>,
+        }
+        struct BlindRole(std::sync::Arc<std::sync::Mutex<Seen>>);
+        impl BlindRole {
+            fn rank(query: RoleQuery<'_>, repair: bool) -> Result<RoleEvaluation, RoleError> {
+                query.check_control()?;
+                let preferred = if repair {
+                    &["h3h4", "a1b1", "h8h7"][..]
+                } else {
+                    &["h2h3", "h8h7", "a1b1", "h7h8"][..]
+                };
+                let chosen = preferred
+                    .iter()
+                    .filter_map(|text| BoardMove::from_uci(text).ok())
+                    .find(|movement| query.legal.contains(movement));
+                Ok(RoleEvaluation {
+                    logits: query
+                        .legal
+                        .iter()
+                        .map(|movement| if Some(*movement) == chosen { 10.0 } else { 0.0 })
+                        .collect(),
+                    wdl: [0.3, 0.4, 0.3],
+                })
+            }
+        }
+        impl RoleModel for BlindRole {
+            fn identity(&self) -> &str {
+                "blind-to-rook-capture-test"
+            }
+            fn propose(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+                Self::rank(query, false)
+            }
+            fn reply(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+                self.0.lock().unwrap().critic_saw_cpu |= query
+                    .records
+                    .iter()
+                    .any(|record| record.cpu_observation.is_some());
+                Self::rank(query, false)
+            }
+            fn repair(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+                self.0.lock().unwrap().repairs.push((
+                    query.prefix.to_vec(),
+                    query.counterexample.unwrap().to_vec(),
+                    query.position.snapshot(),
+                ));
+                Self::rank(query, true)
+            }
+            fn divergences(&mut self, query: DivergenceQuery<'_>) -> Result<Vec<f32>, RoleError> {
+                if query.cancel.load(Ordering::Acquire) {
+                    return Err(RoleError::Canceled);
+                }
+                if Instant::now() >= query.deadline {
+                    return Err(RoleError::Deadline);
+                }
+                Ok(query.candidates.iter().map(|ply| -(*ply as f32)).collect())
+            }
+        }
+        let start = Position::from_fen("2r4k/8/8/8/2Q5/8/7P/K7 w - - 0 1").unwrap();
+        let first = BoardMove::from_uci("h2h3").unwrap();
+        let defense = BoardMove::from_uci("c8c4").unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Seen::default()));
+        let mut engine = PalsEngine::new(
+            PalsConfig {
+                beam_width: 1,
+                ..PalsConfig::default()
+            },
+            BlindRole(seen.clone()),
+            CpuEngine::new(CpuConfig::default()).unwrap(),
+        )
+        .unwrap();
+        let result = engine
+            .search(&start, limits(), &AtomicBool::new(false))
+            .unwrap();
+        assert!(result.counters.cpu_nodes <= limits().max_cpu_nodes);
+        let candidate = engine
+            .records()
+            .iter()
+            .find(|record| {
+                record.kind == RecordKind::Counterexample && record.cpu_observation.is_some()
+            })
+            .unwrap();
+        assert_eq!(&candidate.line[..2], &[first, defense]);
+        assert_eq!(candidate.value, None);
+        let observation = engine
+            .stores
+            .observations
+            .get(candidate.cpu_observation.unwrap())
+            .unwrap();
+        assert_eq!(observation.kind, ObservationKind::CpuAnalysis);
+        assert_eq!(
+            observation.value_identity.as_ref(),
+            Some(engine.cpu.value_identity())
+        );
+        assert!(matches!(
+            observation.scope,
+            EvidenceScope::DepthLimited { .. }
+        ));
+        let mut divergence = start.clone();
+        divergence.make_move(first).unwrap();
+        assert_eq!(
+            engine
+                .stores
+                .states
+                .get(observation.state)
+                .unwrap()
+                .position_identity(),
+            divergence.position_identity()
+        );
+        assert_eq!(
+            engine
+                .stores
+                .lines
+                .moves(observation.cpu_pv.unwrap())
+                .unwrap()[0],
+            defense
+        );
+        let seen = seen.lock().unwrap();
+        assert!(seen.critic_saw_cpu);
+        let repaired = seen
+            .repairs
+            .iter()
+            .find(|(prefix, counterexample, _)| {
+                prefix.starts_with(&[first, defense])
+                    && counterexample.starts_with(&[first, defense])
+            })
+            .unwrap();
+        let mut repair_state = start.clone();
+        for movement in &repaired.0 {
+            repair_state.make_move(*movement).unwrap();
+        }
+        assert_eq!(
+            repair_state.position_identity(),
+            repaired.2.position_identity()
+        );
+        for record in engine.records().iter().filter(|record| {
+            record.kind == RecordKind::Counterexample || record.kind == RecordKind::Repair
+        }) {
+            assert_eq!(record.line.first().copied(), Some(first));
+            let mut checked = start.clone();
+            for &movement in &record.line {
+                checked.make_move(movement).unwrap();
+            }
+            assert!(
+                engine
+                    .nodes
+                    .iter()
+                    .any(|node| node.position.position_identity() == checked.position_identity())
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_candidate_reuse_preserves_pv_and_restricted_query_namespace() {
+        let position = Position::from_fen("2r4k/8/8/8/2Q5/8/7P/K7 b - - 0 1").unwrap();
+        let mut engine = engine();
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine.intern(position.clone()).unwrap();
+        let mut first = PalsCounters::default();
+        let candidate = engine
+            .cpu_candidate(
+                root,
+                root,
+                &[],
+                None,
+                limits(),
+                &AtomicBool::new(false),
+                &mut first,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.pv[0], BoardMove::from_uci("c8c4").unwrap());
+        assert!(engine.nodes[root].evidence.is_none());
+        let mut reused = PalsCounters::default();
+        let cached = engine
+            .cpu_candidate(
+                root,
+                root,
+                &[],
+                None,
+                limits(),
+                &AtomicBool::new(false),
+                &mut reused,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.pv, candidate.pv);
+        assert_eq!(reused.cpu_tasks_requested, 0);
+        assert_eq!(reused.reused_completed_cpu_tasks_consumed, 1);
+        let alternatives: Vec<_> = position
+            .legal_moves()
+            .into_iter()
+            .filter(|movement| *movement != candidate.pv[0])
+            .collect();
+        let mut restricted = PalsCounters::default();
+        let other = engine
+            .cpu_candidate(
+                root,
+                root,
+                &[],
+                Some(&alternatives),
+                limits(),
+                &AtomicBool::new(false),
+                &mut restricted,
+            )
+            .unwrap()
+            .unwrap();
+        assert_ne!(other.pv[0], candidate.pv[0]);
+        assert_eq!(restricted.cpu_tasks_requested, 1);
+        assert_eq!(restricted.reused_completed_cpu_tasks_consumed, 0);
+        assert!(engine.nodes[root].evidence.is_none());
+        assert!(matches!(
+            engine
+                .stores
+                .tasks
+                .get(
+                    engine
+                        .stores
+                        .observations
+                        .get(other.observation)
+                        .unwrap()
+                        .execution
+                        .unwrap()
+                )
+                .unwrap()
+                .key
+                .question,
+            TaskQuestion::AnalyzeRootMoves
+        ));
+    }
+
+    #[test]
+    fn cpu_candidate_rejects_wrong_prefix_cancel_and_old_root_and_distinguishes_unknown_history() {
+        let start = Position::from_fen("2r4k/8/8/8/2Q5/8/7P/K7 w - - 0 1").unwrap();
+        let movement = BoardMove::from_uci("h2h3").unwrap();
+        let mut actual = start.clone();
+        actual.make_move(movement).unwrap();
+        let mut engine = engine();
+        engine.stores.focus_actual_moves(start.snapshot()).unwrap();
+        let root = engine.intern(start.clone()).unwrap();
+        let divergence = engine.intern(actual.clone()).unwrap();
+        let mut counters = PalsCounters::default();
+        assert!(matches!(
+            engine.cpu_candidate(
+                root,
+                divergence,
+                &[BoardMove::from_uci("h2h4").unwrap()],
+                None,
+                limits(),
+                &AtomicBool::new(false),
+                &mut counters
+            ),
+            Err(PalsError::Store(StoreError::StaleConsumer))
+        ));
+        assert_eq!(counters.cpu_tasks_requested, 0);
+        let mut candidate = engine
+            .cpu_candidate(
+                root,
+                divergence,
+                &[movement],
+                None,
+                limits(),
+                &AtomicBool::new(false),
+                &mut counters,
+            )
+            .unwrap()
+            .unwrap();
+        let proposal = vec![movement, BoardMove::from_uci("h8h7").unwrap()];
+        let before = engine.nodes.len();
+        assert!(
+            engine
+                .insert_cpu_candidate(
+                    root,
+                    divergence,
+                    &[movement],
+                    &proposal,
+                    &candidate,
+                    limits(),
+                    &AtomicBool::new(true),
+                    &mut counters
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(engine.nodes.len(), before);
+        let original_deadline = candidate.deadline;
+        candidate.deadline = Instant::now();
+        assert!(
+            engine
+                .insert_cpu_candidate(
+                    root,
+                    divergence,
+                    &[movement],
+                    &proposal,
+                    &candidate,
+                    limits(),
+                    &AtomicBool::new(false),
+                    &mut counters
+                )
+                .unwrap()
+                .is_none()
+        );
+        candidate.deadline = original_deadline;
+        assert_eq!(engine.nodes.len(), before);
+        engine.stores.focus_actual_moves(start.snapshot()).unwrap();
+        assert!(matches!(
+            engine.insert_cpu_candidate(
+                root,
+                divergence,
+                &[movement],
+                &proposal,
+                &candidate,
+                limits(),
+                &AtomicBool::new(false),
+                &mut counters
+            ),
+            Err(PalsError::Store(StoreError::StaleConsumer))
+        ));
+        assert_eq!(engine.nodes.len(), before);
+        engine.stores.focus_actual_moves(actual.snapshot()).unwrap();
+        assert!(matches!(
+            engine.insert_cpu_candidate(
+                root,
+                divergence,
+                &[movement],
+                &proposal,
+                &candidate,
+                limits(),
+                &AtomicBool::new(false),
+                &mut counters
+            ),
+            Err(PalsError::Store(StoreError::StaleConsumer))
+        ));
+        assert_eq!(engine.nodes.len(), before);
+        // The same FEN loses earlier known repetition history and is another
+        // exact task state; it cannot reuse the old discovery execution/PV.
+        let without_history = Position::from_fen(&actual.to_fen()).unwrap();
+        assert_ne!(
+            actual.position_identity(),
+            without_history.position_identity()
+        );
+        engine
+            .stores
+            .focus_actual_moves(without_history.snapshot())
+            .unwrap();
+        let new_root = engine.intern(without_history).unwrap();
+        let mut fresh = PalsCounters::default();
+        engine
+            .cpu_candidate(
+                new_root,
+                new_root,
+                &[],
+                None,
+                limits(),
+                &AtomicBool::new(false),
+                &mut fresh,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.cpu_tasks_requested, 1);
+        assert_eq!(fresh.reused_completed_cpu_tasks_consumed, 0);
+    }
+
+    #[test]
+    fn replaceable_cpu_rejects_unsupported_mixed_identity_mask_leak_and_late_discovery() {
+        #[derive(Clone, Copy)]
+        enum Mode {
+            Unsupported,
+            ChangedIdentity,
+            Late,
+            UnknownFailure,
+            MaskLeak,
+            ScoreLeak,
+            IllegalPv,
+        }
+        struct ControlledCpu {
+            inner: CpuEngine,
+            mode: Mode,
+            changed: bool,
+            changed_value: CpuValueIdentity,
+        }
+        impl CpuSearcher for ControlledCpu {
+            fn config(&self) -> &CpuConfig {
+                self.inner.config()
+            }
+            fn value_identity(&self) -> &CpuValueIdentity {
+                if self.changed {
+                    &self.changed_value
+                } else {
+                    self.inner.value_identity()
+                }
+            }
+            fn search_identity(&self) -> &'static str {
+                self.inner.search_identity()
+            }
+            fn search_conditions(&self) -> String {
+                self.inner.search_conditions()
+            }
+            fn capabilities(&self) -> crate::cpu::CpuCapabilities {
+                let mut caps = self.inner.capabilities();
+                if matches!(self.mode, Mode::Unsupported) {
+                    caps.divergence = false;
+                }
+                caps
+            }
+            fn clear(&mut self) {
+                self.inner.clear();
+            }
+            fn analyze(
+                &mut self,
+                p: &Position,
+                l: CpuLimits,
+                c: &AtomicBool,
+            ) -> Result<CpuReport, CpuError> {
+                let mut report = self.inner.analyze(p, l, c)?;
+                if matches!(self.mode, Mode::IllegalPv) {
+                    report.best_move = Some(BoardMove::from_uci("e2e5").unwrap());
+                    report.pv = vec![report.best_move.unwrap()];
+                }
+                Ok(report)
+            }
+            fn analyze_root_moves(
+                &mut self,
+                p: &Position,
+                moves: &[BoardMove],
+                l: CpuLimits,
+                c: &AtomicBool,
+            ) -> Result<CpuReport, CpuError> {
+                if matches!(self.mode, Mode::MaskLeak) {
+                    let mut report = self.inner.analyze(p, l, c)?;
+                    report.root_restricted = true;
+                    Ok(report)
+                } else {
+                    self.inner.analyze_root_moves(p, moves, l, c)
+                }
+            }
+            fn analyze_divergence(
+                &mut self,
+                p: &Position,
+                prefix: &[BoardMove],
+                l: CpuLimits,
+                c: &AtomicBool,
+            ) -> Result<CpuReport, CpuError> {
+                if matches!(self.mode, Mode::UnknownFailure) {
+                    return Err(CpuError::Unsupported("injected unobserved CPU failure"));
+                }
+                let mut report = self.inner.analyze_divergence(p, prefix, l, c)?;
+                if matches!(self.mode, Mode::ChangedIdentity) {
+                    self.changed = true;
+                }
+                if matches!(self.mode, Mode::Late) {
+                    c.store(true, Ordering::Release);
+                }
+                if matches!(self.mode, Mode::ScoreLeak) {
+                    report.score = i32::MIN;
+                }
+                Ok(report)
+            }
+        }
+        let make_cpu = |mode| {
+            let inner = CpuEngine::new(CpuConfig::default()).unwrap();
+            let mut changed_value = inner.value_identity().clone();
+            changed_value.semantics = "mixed-checkpoint-test".into();
+            ControlledCpu {
+                inner,
+                mode,
+                changed: false,
+                changed_value,
+            }
+        };
+        assert!(matches!(
+            PalsEngine::new_with_cpu(
+                PalsConfig::default(),
+                LegalOrderRoleMock,
+                make_cpu(Mode::Unsupported)
+            ),
+            Err(PalsError::Cpu(CpuError::Unsupported(_)))
+        ));
+        let position = Position::from_fen("2r4k/8/8/8/2Q5/8/7P/K7 b - - 0 1").unwrap();
+        for mode in [
+            Mode::ChangedIdentity,
+            Mode::Late,
+            Mode::UnknownFailure,
+            Mode::MaskLeak,
+            Mode::ScoreLeak,
+            Mode::IllegalPv,
+        ] {
+            let mut engine = PalsEngine::new_with_boxed_cpu(
+                PalsConfig::default(),
+                LegalOrderRoleMock,
+                Box::new(make_cpu(mode)),
+            )
+            .unwrap();
+            engine
+                .stores
+                .focus_actual_moves(position.snapshot())
+                .unwrap();
+            let root = engine.intern(position.clone()).unwrap();
+            let alternatives: Vec<_> = position
+                .legal_moves()
+                .into_iter()
+                .filter(|movement| *movement != BoardMove::from_uci("c8c4").unwrap())
+                .collect();
+            let mut counters = PalsCounters::default();
+            if matches!(mode, Mode::IllegalPv) {
+                assert!(matches!(
+                    engine.verify(root, &[], limits(), &AtomicBool::new(false), &mut counters),
+                    Err(PalsError::Rules(_))
+                ));
+                assert_eq!(counters.cpu_tasks_requested, 1);
+                assert_eq!(counters.consumed_cpu_tasks, 0);
+                assert!(engine.nodes[root].evidence.is_none());
+                continue;
+            }
+            let result = engine.cpu_candidate(
+                root,
+                root,
+                &[],
+                if matches!(mode, Mode::MaskLeak) {
+                    Some(&alternatives)
+                } else {
+                    None
+                },
+                limits(),
+                &AtomicBool::new(false),
+                &mut counters,
+            );
+            assert_eq!(counters.cpu_tasks_requested, 1);
+            assert_eq!(counters.consumed_cpu_tasks, 0);
+            assert!(engine.nodes[root].edges.is_empty());
+            assert!(engine.nodes[root].evidence.is_none());
+            match mode {
+                Mode::Late => {
+                    assert!(result.unwrap().is_none());
+                    assert_eq!(counters.cpu_tasks, 1);
+                    assert_eq!(engine.stores.observations.len(), 1);
+                }
+                Mode::UnknownFailure => {
+                    assert!(matches!(result, Err(PalsError::Cpu(_))));
+                    assert_eq!(counters.cpu_tasks, 0);
+                    assert!(counters.cpu_work_observation_incomplete);
+                }
+                _ => {
+                    assert!(matches!(
+                        result,
+                        Err(PalsError::Store(StoreError::InvalidEvidence(_)))
+                    ));
+                    assert_eq!(counters.cpu_tasks, 1);
+                }
+            }
         }
     }
     #[test]
@@ -1854,6 +3220,7 @@ mod tests {
             score: -25,
             depth: 1,
             scope: CpuScoreScope::CompletedIteration,
+            value_identity: engine.cpu.value_identity().clone(),
         });
         assert_eq!(engine.value(root, 4), Some(25));
     }
@@ -1983,6 +3350,47 @@ mod tests {
         assert_eq!(
             partial_record.score_scope,
             Some(CpuScoreScope::CompletedIteration)
+        );
+        let previous_generation = engine.stores.generation();
+        engine
+            .stores
+            .focus_actual_moves(engine.nodes[root].position.snapshot())
+            .unwrap();
+        assert_ne!(engine.stores.generation(), previous_generation);
+        let mut resumed = PalsCounters::default();
+        engine
+            .verify(
+                root,
+                &[],
+                PalsLimits {
+                    cpu_depth: 2,
+                    max_cpu_nodes: depth_one.nodes,
+                    ..limits()
+                },
+                &AtomicBool::new(false),
+                &mut resumed,
+            )
+            .unwrap();
+        assert_eq!(resumed.cpu_tasks_requested, 1);
+        assert_eq!(
+            engine
+                .stores
+                .tasks
+                .get(super::super::store::ExecutionId(1))
+                .unwrap()
+                .resumed_from,
+            Some(super::super::store::ExecutionId(0))
+        );
+        assert_eq!(
+            engine
+                .stores
+                .tasks
+                .get(super::super::store::ExecutionId(1))
+                .unwrap()
+                .key
+                .value_identity
+                .as_ref(),
+            Some(engine.cpu.value_identity())
         );
     }
     #[test]
@@ -2416,7 +3824,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_cpu_execution_keeps_requested_work_snapshot_and_marks_missing_report() {
+    fn failed_cpu_execution_keeps_requested_work_snapshot_and_actual_observed_nodes() {
         use crate::cpu_value::{
             BootstrapCpuValue, CpuAccumulator, CpuAccumulatorUndo, CpuValueError,
             CpuValueEvaluator, CpuValueIdentity,
@@ -2484,7 +3892,8 @@ mod tests {
         assert_eq!(snapshot.cpu_tasks, 0);
         assert_eq!(snapshot.completed_cpu_tasks, 0);
         assert_eq!(snapshot.consumed_cpu_tasks, 0);
-        assert!(snapshot.cpu_work_observation_incomplete);
+        assert!(!snapshot.cpu_work_observation_incomplete);
+        assert!(snapshot.cpu_nodes > 0);
         assert!(!snapshot.root_scope_observation_complete);
         assert!(scores.load(Ordering::SeqCst) >= 2);
         assert!(snapshot.proposer_calls > 0);

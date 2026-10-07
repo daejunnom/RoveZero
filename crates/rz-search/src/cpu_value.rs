@@ -192,7 +192,7 @@ impl FeatureChanges {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CpuTrainingState {
     Bootstrap,
@@ -205,13 +205,78 @@ pub enum CpuTrainingState {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CpuValueIdentity {
     pub semantics: String,
     /// Digest of actual float parameter bytes, not of a path or a label.
     pub weights_sha256: Option<String>,
     pub training: CpuTrainingState,
+}
+
+impl CpuValueIdentity {
+    /// Validate bounded namespace declarations. Learned metadata is not proof
+    /// that training occurred, and a supplied digest is not proof of its bytes.
+    /// The checkpoint owner separately validates and hashes actual parameters.
+    pub fn validate(&self) -> Result<(), CpuValueError> {
+        if self.semantics.trim().is_empty()
+            || self.semantics.len() > 256
+            || self.semantics.capacity() > 256
+            || self.semantics.chars().any(char::is_control)
+        {
+            return Err(CpuValueError::InvalidCheckpoint(
+                "invalid value semantics identity",
+            ));
+        }
+        if self
+            .weights_sha256
+            .as_ref()
+            .is_some_and(|hash| hash.capacity() > 64 || !valid_digest(hash))
+        {
+            return Err(CpuValueError::InvalidCheckpoint(
+                "invalid value weights digest",
+            ));
+        }
+        match &self.training {
+            CpuTrainingState::Bootstrap if self.weights_sha256.is_some() => {
+                return Err(CpuValueError::InvalidCheckpoint(
+                    "bootstrap identity cannot claim float weights",
+                ));
+            }
+            CpuTrainingState::Untrained | CpuTrainingState::Learned { .. }
+                if self.weights_sha256.is_none() =>
+            {
+                return Err(CpuValueError::InvalidCheckpoint(
+                    "float value identity requires weights digest",
+                ));
+            }
+            _ => {}
+        }
+        validate_training_declaration(&self.training)
+    }
+}
+
+fn validate_training_declaration(training: &CpuTrainingState) -> Result<(), CpuValueError> {
+    if let CpuTrainingState::Learned {
+        run_id,
+        steps,
+        dataset_sha256,
+    } = training
+    {
+        if run_id.trim().is_empty()
+            || run_id.len() > 128
+            || run_id.capacity() > 128
+            || run_id.chars().any(char::is_control)
+            || *steps == 0
+            || dataset_sha256.capacity() > 64
+            || !valid_digest(dataset_sha256)
+        {
+            return Err(CpuValueError::InvalidCheckpoint(
+                "missing or invalid declared training metadata",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -443,31 +508,12 @@ impl CpuFloatCheckpoint {
                 "non-finite or excessive parameter",
             ));
         }
-        match &self.training {
-            CpuTrainingState::Bootstrap => {
-                return Err(CpuValueError::InvalidCheckpoint(
-                    "float weights cannot claim bootstrap provenance",
-                ));
-            }
-            CpuTrainingState::Learned {
-                run_id,
-                steps,
-                dataset_sha256,
-            } => {
-                if run_id.is_empty()
-                    || run_id.len() > 128
-                    || run_id.chars().any(char::is_control)
-                    || *steps == 0
-                    || !valid_digest(dataset_sha256)
-                {
-                    return Err(CpuValueError::InvalidCheckpoint(
-                        "missing or invalid declared training metadata",
-                    ));
-                }
-            }
-            CpuTrainingState::Untrained => {}
+        if self.training == CpuTrainingState::Bootstrap {
+            return Err(CpuValueError::InvalidCheckpoint(
+                "float weights cannot claim bootstrap provenance",
+            ));
         }
-        Ok(())
+        validate_training_declaration(&self.training)
     }
 
     pub fn weights_sha256(&self) -> String {
@@ -501,6 +547,7 @@ impl CpuFloatValue {
             weights_sha256: Some(checkpoint.weights_sha256()),
             training: checkpoint.training.clone(),
         };
+        identity.validate()?;
         Ok(Self {
             checkpoint: Arc::new(checkpoint),
             identity: Arc::new(identity),
@@ -848,6 +895,50 @@ mod tests {
     use crate::cpu::{CpuConfig, CpuEngine, CpuLimits};
     use rz_position::BoardMove;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn value_namespace_admission_is_bounded_and_keeps_complete_training_identity() {
+        let bootstrap = BootstrapCpuValue::default().identity().clone();
+        bootstrap.validate().unwrap();
+        let mut value = bootstrap.clone();
+        value.semantics = " ".into();
+        assert!(value.validate().is_err());
+        value.semantics = "x".repeat(257);
+        assert!(value.validate().is_err());
+        value.semantics = String::with_capacity(4096);
+        value.semantics.push_str("small-but-overallocated");
+        assert!(value.validate().is_err());
+        value = bootstrap.clone();
+        value.weights_sha256 = Some("0".repeat(64));
+        assert!(value.validate().is_err());
+        value.training = CpuTrainingState::Untrained;
+        value.validate().unwrap();
+        let first = value.clone();
+        value.weights_sha256 = Some("1".repeat(64));
+        assert_ne!(first.cmp(&value), std::cmp::Ordering::Equal);
+        value.training = CpuTrainingState::Learned {
+            run_id: "declared-only".into(),
+            steps: 1,
+            dataset_sha256: "2".repeat(64),
+        };
+        value.validate().unwrap();
+        assert_ne!(first.cmp(&value), std::cmp::Ordering::Equal);
+        value.weights_sha256 = None;
+        assert!(value.validate().is_err());
+        value.weights_sha256 = Some("A".repeat(64));
+        assert!(value.validate().is_err());
+        let mut overallocated_hash = String::with_capacity(4096);
+        overallocated_hash.push_str(&"0".repeat(64));
+        value.weights_sha256 = Some(overallocated_hash);
+        assert!(value.validate().is_err());
+        value.weights_sha256 = Some("0".repeat(64));
+        value.training = CpuTrainingState::Learned {
+            run_id: " ".into(),
+            steps: 0,
+            dataset_sha256: "2".repeat(64),
+        };
+        assert!(value.validate().is_err());
+    }
 
     fn model() -> CpuFloatValue {
         let mut checkpoint = CpuFloatCheckpoint::zeros_untrained();

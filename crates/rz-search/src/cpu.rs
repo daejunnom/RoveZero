@@ -21,13 +21,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub const CPU_SEARCH_VERSION: &str = "rz-cpu-pvs/0.1";
+pub const CPU_SEARCH_CONDITIONS: &str = "iterative-deepening:1..requested;root-window:full-first,aspiration40-following,full-when-mate-or-fail-inclusive;pvs:first-full,following-zero-window,strict-interior-research;qsearch:tactical-capture-ep-promotion,all-check-evasions,no-check-standpat;q-limit:checked-abort;tt:direct-mapped,full-history-value-profile,equal-remaining-depth,completed-nodes-only;selectivity:no-reductions-no-nullmove;ties:Rules-order;score:side-to-move-raw";
 pub const BOOTSTRAP_SCORE_VERSION: &str = "bootstrap-material-pst-v1";
 pub const CPU_MATE_SCORE: i32 = 30_000;
+pub const CPU_MATE_THRESHOLD: i32 = 29_000;
+pub const CPU_FRONTIER_SCORE_LIMIT: i32 = 20_000;
 const INFINITY: i32 = 32_000;
-const MATE_THRESHOLD: i32 = 29_000;
+const MATE_THRESHOLD: i32 = CPU_MATE_THRESHOLD;
 const MAX_DEPTH: u16 = 64;
 const MAX_QUIESCENCE_PLY: u16 = 32;
 const MAX_TT_ENTRIES: usize = 1_048_576;
+const MAX_ROOT_MOVES: usize = 256;
 const MAX_KNOWN_HISTORY: usize = 4096;
 const ASPIRATION_WINDOW: i32 = 40;
 
@@ -169,6 +173,15 @@ pub struct CpuIterationProgress {
     pub nodes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CpuWork {
+    /// Actual positions visited by this invocation only, including qsearch.
+    /// Reused completed depth does not re-charge the previous invocation.
+    pub nodes: u64,
+    pub quiescence_nodes: u64,
+    pub tt_hits: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct CpuResumeToken {
     root: PositionIdentity,
@@ -176,6 +189,7 @@ pub struct CpuResumeToken {
     profile: CpuProfile,
     quiescence_ply: u16,
     value_identity: CpuValueIdentity,
+    search_conditions: String,
     completed_depth: u16,
     score: i32,
     pv: Vec<BoardMove>,
@@ -187,6 +201,7 @@ pub enum CpuError {
     InvalidLimits(&'static str),
     InvalidRootMoves(&'static str),
     ResumeMismatch(&'static str),
+    Unsupported(&'static str),
     Allocation,
     Rules(PositionError),
     Value(CpuValueError),
@@ -199,6 +214,7 @@ impl std::fmt::Display for CpuError {
             Self::InvalidLimits(message) => write!(f, "CPU limits: {message}"),
             Self::InvalidRootMoves(message) => write!(f, "CPU root moves: {message}"),
             Self::ResumeMismatch(message) => write!(f, "CPU resume: {message}"),
+            Self::Unsupported(message) => write!(f, "CPU capability unavailable: {message}"),
             Self::Allocation => f.write_str("CPU TT allocation refused"),
             Self::Rules(error) => write!(f, "CPU rules failure: {error}"),
             Self::Value(error) => write!(f, "CPU value failure: {error}"),
@@ -241,6 +257,197 @@ pub struct CpuEngine {
     history: Box<[[[i32; 64]; 64]; 2]>,
     evaluator: Arc<dyn CpuValueEvaluator>,
     value_identity: Arc<CpuValueIdentity>,
+    last_attempt_work: Option<CpuWork>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CpuCapabilities {
+    pub max_depth: u16,
+    pub max_prefix_plies: usize,
+    pub max_root_moves: usize,
+    pub root_moves: bool,
+    pub divergence: bool,
+    pub completed_iteration_resume: bool,
+    pub selective_reductions: bool,
+}
+
+/// Startup-selected own CPU checker. Value identity and search implementation
+/// identity are independent immutable namespaces. Consumers validate returned
+/// report identities and may not transfer TT or opaque resume tokens between
+/// implementations. Unsupported capabilities fail explicitly; no fallback.
+pub trait CpuSearcher: Send {
+    fn config(&self) -> &CpuConfig;
+    fn value_identity(&self) -> &CpuValueIdentity;
+    fn search_identity(&self) -> &'static str;
+    /// Exact immutable implementation/configuration declaration. Custom
+    /// checkers must declare their own conditions rather than inheriting PVS.
+    fn search_conditions(&self) -> String;
+    fn capabilities(&self) -> CpuCapabilities;
+    /// None means work was not observed. Never substitute invented zero work.
+    /// The default preserves unknown accounting for custom implementations.
+    fn last_attempt_work(&self) -> Option<CpuWork> {
+        None
+    }
+    fn clear(&mut self);
+    fn analyze(
+        &mut self,
+        position: &Position,
+        limits: CpuLimits,
+        cancel: &AtomicBool,
+    ) -> Result<CpuReport, CpuError>;
+    fn analyze_root_moves(
+        &mut self,
+        _position: &Position,
+        _moves: &[BoardMove],
+        _limits: CpuLimits,
+        _cancel: &AtomicBool,
+    ) -> Result<CpuReport, CpuError> {
+        Err(CpuError::Unsupported("root moves"))
+    }
+    fn analyze_divergence(
+        &mut self,
+        _position: &Position,
+        _prefix: &[BoardMove],
+        _limits: CpuLimits,
+        _cancel: &AtomicBool,
+    ) -> Result<CpuReport, CpuError> {
+        Err(CpuError::Unsupported("divergence"))
+    }
+    fn resume(
+        &mut self,
+        _position: &Position,
+        _token: &CpuResumeToken,
+        _limits: CpuLimits,
+        _cancel: &AtomicBool,
+    ) -> Result<CpuReport, CpuError> {
+        Err(CpuError::Unsupported("completed iteration resume"))
+    }
+}
+
+impl<C: CpuSearcher + ?Sized> CpuSearcher for Box<C> {
+    fn config(&self) -> &CpuConfig {
+        (**self).config()
+    }
+    fn value_identity(&self) -> &CpuValueIdentity {
+        (**self).value_identity()
+    }
+    fn search_identity(&self) -> &'static str {
+        (**self).search_identity()
+    }
+    fn search_conditions(&self) -> String {
+        (**self).search_conditions()
+    }
+    fn capabilities(&self) -> CpuCapabilities {
+        (**self).capabilities()
+    }
+    fn last_attempt_work(&self) -> Option<CpuWork> {
+        (**self).last_attempt_work()
+    }
+    fn clear(&mut self) {
+        (**self).clear();
+    }
+    fn analyze(
+        &mut self,
+        p: &Position,
+        l: CpuLimits,
+        c: &AtomicBool,
+    ) -> Result<CpuReport, CpuError> {
+        (**self).analyze(p, l, c)
+    }
+    fn analyze_root_moves(
+        &mut self,
+        p: &Position,
+        m: &[BoardMove],
+        l: CpuLimits,
+        c: &AtomicBool,
+    ) -> Result<CpuReport, CpuError> {
+        (**self).analyze_root_moves(p, m, l, c)
+    }
+    fn analyze_divergence(
+        &mut self,
+        p: &Position,
+        m: &[BoardMove],
+        l: CpuLimits,
+        c: &AtomicBool,
+    ) -> Result<CpuReport, CpuError> {
+        (**self).analyze_divergence(p, m, l, c)
+    }
+    fn resume(
+        &mut self,
+        p: &Position,
+        t: &CpuResumeToken,
+        l: CpuLimits,
+        c: &AtomicBool,
+    ) -> Result<CpuReport, CpuError> {
+        (**self).resume(p, t, l, c)
+    }
+}
+
+impl CpuSearcher for CpuEngine {
+    fn config(&self) -> &CpuConfig {
+        CpuEngine::config(self)
+    }
+    fn value_identity(&self) -> &CpuValueIdentity {
+        CpuEngine::value_identity(self)
+    }
+    fn search_identity(&self) -> &'static str {
+        CPU_SEARCH_VERSION
+    }
+    fn search_conditions(&self) -> String {
+        CpuEngine::search_conditions(self)
+    }
+    fn capabilities(&self) -> CpuCapabilities {
+        CpuCapabilities {
+            max_depth: self.config.max_depth,
+            max_prefix_plies: 64,
+            max_root_moves: MAX_ROOT_MOVES,
+            root_moves: true,
+            divergence: true,
+            completed_iteration_resume: true,
+            selective_reductions: false,
+        }
+    }
+    fn last_attempt_work(&self) -> Option<CpuWork> {
+        CpuEngine::last_attempt_work(self)
+    }
+    fn clear(&mut self) {
+        CpuEngine::clear(self);
+    }
+    fn analyze(
+        &mut self,
+        p: &Position,
+        l: CpuLimits,
+        c: &AtomicBool,
+    ) -> Result<CpuReport, CpuError> {
+        CpuEngine::analyze(self, p, l, c)
+    }
+    fn analyze_root_moves(
+        &mut self,
+        p: &Position,
+        m: &[BoardMove],
+        l: CpuLimits,
+        c: &AtomicBool,
+    ) -> Result<CpuReport, CpuError> {
+        CpuEngine::analyze_root_moves(self, p, m, l, c)
+    }
+    fn analyze_divergence(
+        &mut self,
+        p: &Position,
+        m: &[BoardMove],
+        l: CpuLimits,
+        c: &AtomicBool,
+    ) -> Result<CpuReport, CpuError> {
+        CpuEngine::analyze_divergence(self, p, m, l, c)
+    }
+    fn resume(
+        &mut self,
+        p: &Position,
+        t: &CpuResumeToken,
+        l: CpuLimits,
+        c: &AtomicBool,
+    ) -> Result<CpuReport, CpuError> {
+        CpuEngine::resume(self, p, t, l, c)
+    }
 }
 
 struct Control<'a> {
@@ -285,6 +492,7 @@ impl CpuEngine {
         evaluator: Arc<dyn CpuValueEvaluator>,
     ) -> Result<Self, CpuError> {
         config.tt_allocation_bytes()?;
+        evaluator.identity().validate().map_err(CpuError::Value)?;
         if config.max_depth == 0 || config.max_depth > MAX_DEPTH {
             return Err(CpuError::InvalidConfig("depth must be in 1..=64"));
         }
@@ -301,6 +509,7 @@ impl CpuEngine {
             history: Box::new([[[0; 64]; 64]; 2]),
             value_identity: Arc::new(evaluator.identity().clone()),
             evaluator,
+            last_attempt_work: None,
         })
     }
 
@@ -308,10 +517,33 @@ impl CpuEngine {
         &self.config
     }
 
+    /// Full immutable value namespace used by this engine's TT and resume.
+    pub fn value_identity(&self) -> &CpuValueIdentity {
+        &self.value_identity
+    }
+
+    pub fn search_conditions(&self) -> String {
+        format!(
+            "{CPU_SEARCH_CONDITIONS};profile={};max_depth={};q_plies={};tt_entries={}",
+            self.config.profile.identity(),
+            self.config.max_depth,
+            self.config.quiescence_ply,
+            self.config.tt_entries
+        )
+    }
+
+    /// Actual counters for the last normally returned attempt, including
+    /// errors. Before the first attempt or after clear there is no observation.
+    /// An admission error has observed zero searched positions, not a result.
+    pub fn last_attempt_work(&self) -> Option<CpuWork> {
+        self.last_attempt_work
+    }
+
     /// New game ownership boundary; no TT/history evidence crosses this call.
     pub fn clear(&mut self) {
         self.tt.iter_mut().for_each(|entry| *entry = None);
         *self.history = [[[0; 64]; 64]; 2];
+        self.last_attempt_work = None;
     }
 
     pub fn analyze(
@@ -361,6 +593,7 @@ impl CpuEngine {
         limits: CpuLimits,
         cancellation: &AtomicBool,
     ) -> Result<CpuReport, CpuError> {
+        self.last_attempt_work = Some(CpuWork::default());
         if prefix.len() > MAX_DEPTH as usize {
             return Err(CpuError::InvalidLimits("divergence prefix exceeds 64 ply"));
         }
@@ -378,6 +611,7 @@ impl CpuEngine {
         limits: CpuLimits,
         cancellation: &AtomicBool,
     ) -> Result<CpuReport, CpuError> {
+        self.last_attempt_work = Some(CpuWork::default());
         if token.root != position.position_identity() {
             return Err(CpuError::ResumeMismatch(
                 "Rules state or full known history changed",
@@ -386,9 +620,10 @@ impl CpuEngine {
         if token.profile != self.config.profile
             || token.quiescence_ply != self.config.quiescence_ply
             || token.value_identity != *self.value_identity
+            || token.search_conditions != self.search_conditions()
         {
             return Err(CpuError::ResumeMismatch(
-                "CPU profile or quiescence semantics changed",
+                "CPU search conditions or value namespace changed",
             ));
         }
         if limits.max_depth < token.completed_depth {
@@ -415,12 +650,16 @@ impl CpuEngine {
         resume: Option<&CpuResumeToken>,
         observer: &mut dyn FnMut(CpuIterationProgress),
     ) -> Result<CpuReport, CpuError> {
+        self.last_attempt_work = Some(CpuWork::default());
         self.validate_limits(position, limits)?;
         let started = Instant::now();
         let root_view = position.ordered_legal_moves();
         let status = position.play_status_from_view(&root_view)?;
         let mut legal = root_view.moves().to_vec();
         if let Some(requested) = root_moves {
+            if requested.len() > MAX_ROOT_MOVES {
+                return Err(CpuError::InvalidRootMoves("restriction exceeds 256 moves"));
+            }
             if requested.is_empty() {
                 return Err(CpuError::InvalidRootMoves("empty restriction"));
             }
@@ -536,7 +775,10 @@ impl CpuEngine {
                     completion = reason;
                     break;
                 }
-                Err(Abort::Error(error)) => return Err(error),
+                Err(Abort::Error(error)) => {
+                    self.last_attempt_work = Some(control.actual_work());
+                    return Err(error);
+                }
             }
         }
         // Observers are outside node search and may cancel or consume time.
@@ -544,12 +786,14 @@ impl CpuEngine {
         if let Err(Abort::Stop(reason)) = control.check_stop() {
             completion = reason;
         }
+        self.last_attempt_work = Some(control.actual_work());
         let token = (completed_depth > 0).then(|| CpuResumeToken {
             root: position.position_identity(),
             root_moves: root_moves.map(<[BoardMove]>::to_vec),
             profile: self.config.profile,
             quiescence_ply: self.config.quiescence_ply,
             value_identity: (*self.value_identity).clone(),
+            search_conditions: self.search_conditions(),
             completed_depth,
             score,
             pv: best.clone(),
@@ -603,7 +847,7 @@ impl CpuEngine {
         position: &Position,
     ) -> Result<i32, CpuValueError> {
         let score = self.evaluator.score(&control.value, position)?;
-        if !(-20_000..=20_000).contains(&score) {
+        if !(-CPU_FRONTIER_SCORE_LIMIT..=CPU_FRONTIER_SCORE_LIMIT).contains(&score) {
             return Err(CpuValueError::ScoreOutsideFrontierNamespace);
         }
         Ok(score)
@@ -932,6 +1176,14 @@ impl CpuEngine {
 }
 
 impl Control<'_> {
+    fn actual_work(&self) -> CpuWork {
+        CpuWork {
+            nodes: self.nodes,
+            quiescence_nodes: self.quiescence_nodes,
+            tt_hits: self.tt_hits,
+        }
+    }
+
     fn check_stop(&self) -> Result<(), Abort> {
         if self.cancellation.load(Ordering::Acquire) {
             Err(Abort::Stop(CpuCompletion::Canceled))
@@ -1326,6 +1578,22 @@ mod tests {
             independent.resume(&position, &token, limits(2), &AtomicBool::new(false)),
             Err(CpuError::ResumeMismatch(_))
         ));
+        for config in [
+            CpuConfig {
+                tt_entries: cpu.config.tt_entries + 1,
+                ..cpu.config.clone()
+            },
+            CpuConfig {
+                max_depth: cpu.config.max_depth - 1,
+                ..cpu.config.clone()
+            },
+        ] {
+            let mut changed_conditions = CpuEngine::new(config).unwrap();
+            assert!(matches!(
+                changed_conditions.resume(&position, &token, limits(2), &AtomicBool::new(false)),
+                Err(CpuError::ResumeMismatch(_))
+            ));
+        }
         let canceled = cpu
             .resume(&position, &token, limits(1), &AtomicBool::new(true))
             .unwrap();
@@ -1500,6 +1768,146 @@ mod tests {
             from_tt_score(to_tt_score(CPU_MATE_SCORE - 5, 3), 1),
             CPU_MATE_SCORE - 3
         );
+    }
+
+    #[test]
+    fn failed_search_retains_actual_work_and_clear_removes_observation() {
+        use crate::cpu_value::{CpuAccumulatorUndo, CpuValueEvaluator};
+        use rz_position::RuleMoveDelta;
+        use std::sync::atomic::AtomicUsize;
+        struct InjectFailure {
+            base: BootstrapCpuValue,
+            scores: AtomicUsize,
+        }
+        impl CpuValueEvaluator for InjectFailure {
+            fn identity(&self) -> &CpuValueIdentity {
+                self.base.identity()
+            }
+            fn provenance(&self) -> &'static str {
+                self.base.provenance()
+            }
+            fn initialize(&self, p: &Position) -> Result<CpuAccumulator, CpuValueError> {
+                self.base.initialize(p)
+            }
+            fn score(&self, a: &CpuAccumulator, p: &Position) -> Result<i32, CpuValueError> {
+                if self.scores.fetch_add(1, Ordering::Relaxed) > 0 {
+                    return Err(CpuValueError::NonFiniteForward);
+                }
+                self.base.score(a, p)
+            }
+            fn apply_delta(
+                &self,
+                a: &mut CpuAccumulator,
+                d: &RuleMoveDelta,
+            ) -> Result<CpuAccumulatorUndo, CpuValueError> {
+                self.base.apply_delta(a, d)
+            }
+            fn restore(
+                &self,
+                a: &mut CpuAccumulator,
+                u: CpuAccumulatorUndo,
+                p: &Position,
+            ) -> Result<(), CpuValueError> {
+                self.base.restore(a, u, p)
+            }
+        }
+        let position = Position::startpos();
+        let before = position.snapshot();
+        let mut cpu = CpuEngine::with_evaluator(
+            CpuConfig::default(),
+            Arc::new(InjectFailure {
+                base: BootstrapCpuValue::default(),
+                scores: AtomicUsize::new(0),
+            }),
+        )
+        .unwrap();
+        assert_eq!(cpu.last_attempt_work(), None);
+        assert!(matches!(
+            cpu.analyze(&position, limits(1), &AtomicBool::new(false)),
+            Err(CpuError::Value(CpuValueError::NonFiniteForward))
+        ));
+        let actual = cpu.last_attempt_work().unwrap();
+        assert!(actual.nodes > 0 && actual.nodes <= limits(1).max_nodes);
+        assert!(actual.quiescence_nodes > 0 && actual.quiescence_nodes <= actual.nodes);
+        assert!(before.same_state(&position.snapshot()));
+        assert!(
+            cpu.analyze(
+                &position,
+                CpuLimits {
+                    max_nodes: 0,
+                    ..limits(1)
+                },
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
+        assert_eq!(cpu.last_attempt_work(), Some(CpuWork::default()));
+        cpu.clear();
+        assert_eq!(cpu.last_attempt_work(), None);
+    }
+
+    #[test]
+    fn cpu_checker_is_replaceable_and_unsupported_resume_is_explicit() {
+        struct NoResumeMock {
+            base: CpuEngine,
+        }
+        impl CpuSearcher for NoResumeMock {
+            fn config(&self) -> &CpuConfig {
+                self.base.config()
+            }
+            fn value_identity(&self) -> &CpuValueIdentity {
+                self.base.value_identity()
+            }
+            fn search_identity(&self) -> &'static str {
+                "explicit-cpu-boundary-mock-v1"
+            }
+            fn search_conditions(&self) -> String {
+                format!(
+                    "explicit-no-resume-test-wrapper;{}",
+                    self.base.search_conditions()
+                )
+            }
+            fn capabilities(&self) -> CpuCapabilities {
+                CpuCapabilities {
+                    root_moves: false,
+                    divergence: false,
+                    completed_iteration_resume: false,
+                    ..self.base.capabilities()
+                }
+            }
+            fn clear(&mut self) {
+                self.base.clear();
+            }
+            fn analyze(
+                &mut self,
+                p: &Position,
+                l: CpuLimits,
+                c: &AtomicBool,
+            ) -> Result<CpuReport, CpuError> {
+                let mut r = self.base.analyze(p, l, c)?;
+                r.search_version = self.search_identity();
+                r.resume = None;
+                Ok(r)
+            }
+        }
+        let position = Position::from_fen("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1").unwrap();
+        let mut checker: Box<dyn CpuSearcher> = Box::new(engine());
+        let first = checker
+            .analyze(&position, limits(1), &AtomicBool::new(false))
+            .unwrap();
+        let token = first.resume.unwrap();
+        checker = Box::new(NoResumeMock { base: engine() });
+        assert!(!checker.capabilities().completed_iteration_resume);
+        assert!(matches!(
+            checker.resume(&position, &token, limits(2), &AtomicBool::new(false)),
+            Err(CpuError::Unsupported(_))
+        ));
+        let second = checker
+            .analyze(&position, limits(1), &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(second.search_version, "explicit-cpu-boundary-mock-v1");
+        assert_eq!(second.value_identity, first.value_identity);
+        assert_eq!(checker.last_attempt_work(), None);
     }
 
     #[test]
