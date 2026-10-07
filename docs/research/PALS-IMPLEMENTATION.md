@@ -566,3 +566,74 @@ missing record 한 슬롯만 공급했다. clear는 NN 실행 없이 page와 wit
 새 게임 이후에는 실제 public Run을 확인했다. 완료 뒤 pin·subset·join scratch·prepared
 input·transient reservation이 해제됐고 프로세스 exit 0과 관리 supervisor의 자식 정리도
 확인했다. 예제 all-feature Clippy가 통과했다. 실제 학습은 0 step이며 GPU는 user-deferred다.
+
+### Strict producer 소비와 제품 host page의 CPU 인수
+
+`7e3f236`·`33121b8`은 strict producer loader와 no-step 준비 진입점을 연결한다.
+독립 등록 파일·checked source·game/producer roster·actual capture bytes·raw history·
+current label view를 함께 대조하며 실패 시 legacy loader로 재시도하지 않는다.
+중앙 Python CPU 검사는 각각 95개·102개가 통과했다. `33121b8`의 CI run
+`37647447914`는 Linux·Windows·CPU bindings·model CPU 네 job 모두 성공했다.
+이 CI 결과는 이후 Rust 변경이나 GPU 인수의 성공이 아니다.
+
+`03f4dcd`는 실제 helper ready 시점의 PID/PGID/start ticks·cgroup v2 membership·
+namespace·CPU 허용 목록·직접 resource limit을 보존한다. 관측 불가는 명시적인 이유로
+남기며, 직접 limit과 ancestor effective limit·peak·옵션 적용을 구분한다. 파일 종류·
+filesystem·byte·thread 상한과 caller deadline 내 cooperative 창을 적용하지만 진행 중인
+kernel syscall의 강제 취소 보장은 아니다. 실제 외부 helper arena 인수는 별도로 남는다.
+
+`f66a635`는 caller의 단일 deadline 안에 분석과 stop grace를 함께 예약한다. known
+pre-go 거절은 PALS task·예약·작업량을 만들기 전에 확인하고 마지막 Rules 합법 착수를
+유지한다. partial·unknown·실제 dispatch 실패를 빈 CPU 보고서로 바꾸지 않는다.
+
+`339bb9a`의 actual checked owner와 prior registration은 수집 시점에 frozen producer를
+고정한다. prepared input·tensor sidecar·lineage의 실제 JSON bytes와 journal/capture를
+예산 안에서 보존한다. `strict-producer-cpu-01`은 등록한 Rust CPU producer가 원시
+라벨 3행·고유 입력 2개를 만든 실제 경로다. strict Python loader와 untrained P/C CPU
+forward는 raw history를 보존하고 current label 2행을 정확히 한 번씩 소비했다.
+parameter digest는 불변이고 backward·optimizer·GPU는 실행하지 않았다. 현재 두 행의
+policy·WDL·divergence 목표는 모두 masked다. 이 결과는 actual CPU producer 소비의
+인수이며 Native producer 전체·DG01/02/07의 양의 목표·실제 학습의 인수가 아니다.
+외부 확인 스크립트의 roster wrapper·보고서 경로·CLI receipt 구분 오류는 원래 로그로
+보존했고, 실제 수집물을 다시 만들지 않고 별도 확인 자료에서 올바른 경계를 대조했다.
+
+`d11385b`는 외부 CPU_R profile bytes·등록 program/source/resolver·유한 helper CLI를
+확인하는 준비 단위다. Own 직렬화를 유지하고 undeclared host page 선택을 기존
+whole-input mode로 인수하지 않는다. profile 확인과 실제 executable·자원·owner closure
+인수는 다르며 외부 arena execution/Core guard는 계속 닫혀 있다.
+
+`80a358d`는 host record page를 명시적으로 선택하는 제품 CLI·Native owner·영수증을
+연결한다. 두 owner의 종료는 같은 절대 deadline을 사용하고 만료된 유휴 Native에는
+새 최종 control을 제출하지 않는다. 이미 제출한 control의 물리 완료는 먼저 확인하고,
+완료 불명일 때 기존 owner·input·pin을 보존한다. 이전 registered integration의
+search/UCI all-target/all-feature 487개, eval library 78개와 arena `pals_` 65개가
+통과했다. 종료 경계 수정 후 affected Native 30개와 eval/UCI Clippy·제품 build도
+통과했다. 겹치는 검사 수를 합쳐 고유 검사 수로 보고하지 않는다.
+
+`host-pages-product-cpu-01`은 실제 CPU ONNX 제품에서 시작 위치·Rules 스테일메이트·
+stop을 처리하고 exit 0으로 끝났다. NN input은 17개 완료·16개 탐색 소비, 취소는
+1개다. 마지막 실제 `SnapshotStats`의 ordinal 20에서 page pin·active input/subset/join
+backing·transient reservation은 0이며 physical shutdown과 native buffer release를
+확인했다. 종료 전 stats snapshot에는 cached page 2개와 retained join 68,707 bytes가
+남아 있으므로 이를 owner drop 이후의 zero 측정으로 표현하지 않는다. 상속된 cgroup
+관측은 새 cgroup peak·enforcement·메모리 성능 증거가 아니다.
+
+stop 뒤 공통 ticket의 늦은 응답에서 `Admission/Stale` 진단도 관측했다. 이는 active
+ticket 종료 후 결과를 받아들이지 않는 비치명 경로로 추적됐으며 실패 반환이나 새 착수를
+만들지 않는다. 정상 취소와 foreign/unknown ticket을 구분하는 진단 개선은 별도 후속
+단위다. 이 분류와 Native 물리 수명 인수는 서로 대체하지 않는다.
+
+`80a358d`의 CI run `37650932282`는 model CPU 성공, 나머지 세 job은 eval formatter
+검사에서 실패했다. `rz-eval`의 edition 2021에 맞춰 `0b2ba83`에서 형식만 수정했으며,
+그 SHA의 CI는 관측 전까지 pending으로 둔다. 실패 기록과 source/binary의 실제 CPU
+인수 SHA를 보존한다. 이번 세션의 GPU 검증 보류와 실제 학습 제외 조건은 유지한다.
+
+| 관리 루트 기준 인수 자료 | SHA-256 |
+|---|---|
+| `runs/pals/strict-producer-cpu-01/preparation-report-02.json` | `b3bb0d8c93b0d6d1d01a503261e681b22350a5f64e818c5e9f966299c5849047` |
+| `runs/pals/strict-producer-cpu-01/collection/strict-cpu-01/receipt.json` | `bf47edb4420a1d94e31af47445dc215c3e7791b4f05e6c726122ce337105f29d` |
+| `runs/pals/host-pages-product-cpu-01`의 실제 Native 종료 영수증 | `b40d770328385e674c174af42c6ee797c47f25b2982091d590d5e311c4cefdba` |
+
+DG05의 label chain/current view와 DG06 metadata·CPU strict 소비는 위 후속 근거로
+구분한다. 남은 비교 목표·divergence 전용 adapter·V 의미 입력·private warm-start·
+외부 helper 종단·새 paired 인수와 GPU 실행은 이전 전체 목표 감사에서 계속 추적한다.
