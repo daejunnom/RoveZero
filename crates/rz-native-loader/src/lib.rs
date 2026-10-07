@@ -37,6 +37,57 @@ pub const NVIDIA_LOAD_ORDER: [&str; 16] = [
     "libcudnn.so.9",
 ];
 
+const EAGER_INDICES: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+const SHIM_LAZY_INDICES: [usize; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 15];
+
+/// Loading behavior is separate from the unchanged, complete 19-file trust
+/// profile. The lazy profile is an explicit diagnostic candidate, not a new
+/// default or evidence that preload caused a native termination failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeLoadingProfile {
+    EagerCuda12Cudnn9V1,
+    CuDnnShimLazyV1,
+}
+
+impl NativeLoadingProfile {
+    pub const fn identifier(self) -> &'static str {
+        match self {
+            Self::EagerCuda12Cudnn9V1 => "eager-cuda12-cudnn9-v1",
+            Self::CuDnnShimLazyV1 => "experimental-cudnn-shim-lazy-v1",
+        }
+    }
+
+    /// Canonical policy bytes; callers may hash these separately from the
+    /// unchanged binary bundle digest. Indices refer to NVIDIA_LOAD_ORDER.
+    pub const fn canonical_descriptor(self) -> &'static str {
+        match self {
+            Self::EagerCuda12Cudnn9V1 => "rz-native-loading-profile/1;eager-cuda12-cudnn9-v1;declared-nvidia=16;declared-ort=3;rtld=now-global;eager=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15;deferred=none;resident=exact-pins",
+            Self::CuDnnShimLazyV1 => "rz-native-loading-profile/1;experimental-cudnn-shim-lazy-v1;declared-nvidia=16;declared-ort=3;rtld=now-global;eager=0,1,2,3,4,5,6,7,15;deferred=8,9,10,11,12,13,14;resident=exact-pins",
+        }
+    }
+
+    pub const fn eager_indices(self) -> &'static [usize] {
+        match self {
+            Self::EagerCuda12Cudnn9V1 => &EAGER_INDICES,
+            Self::CuDnnShimLazyV1 => &SHIM_LAZY_INDICES,
+        }
+    }
+}
+
+/// A bounded origin observation at one audit boundary. An absent deferred
+/// image is not claimed resident or unused. This is not kernel placement,
+/// device completion, allocator residency, VRAM, or normal-process-exit proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeMappingObservation {
+    pub profile: NativeLoadingProfile,
+    pub declared_nvidia_files: usize,
+    pub required_nvidia_files: Vec<&'static str>,
+    pub mapped_nvidia_files: Vec<&'static str>,
+    pub deferred_nvidia_not_mapped: Vec<&'static str>,
+    /// None means the ORT images were outside this audit's scope.
+    pub mapped_ort_files: Option<Vec<&'static str>>,
+}
+
 pub const MAX_LIBRARY_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_TOTAL_BYTES: u64 = 4 * MAX_LIBRARY_BYTES;
 pub const MAX_LIBRARY_COUNT: usize = 32;
@@ -326,12 +377,23 @@ pub struct LibrarySet;
 impl LibrarySet {
     /// 명시적인 초기 GPU bootstrap에서 한 번 호출한다. ambient loader 환경은 변경하지 않는다.
     pub fn load(libraries: Vec<OwnedLibrary>) -> Result<ProcessLibrarySet, LoadError> {
+        Self::load_with_profile(libraries, NativeLoadingProfile::EagerCuda12Cudnn9V1)
+    }
+
+    /// Explicit experimental bootstrap. Every NVIDIA file must still be
+    /// declared, hash-checked and pinned; the policy changes only direct load
+    /// order and the mandatory mapped subset. Never selected after a failure.
+    pub fn load_with_profile(
+        libraries: Vec<OwnedLibrary>,
+        profile: NativeLoadingProfile,
+    ) -> Result<ProcessLibrarySet, LoadError> {
         #[cfg(target_os = "linux")]
         {
-            linux::load(libraries)
+            linux::load(libraries, profile)
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = profile;
             drop(libraries);
             Err(LoadError::new(
                 LoadErrorKind::UnsupportedPlatform,
@@ -349,6 +411,18 @@ pub struct ProcessLibrarySet {
 }
 
 impl ProcessLibrarySet {
+    pub fn loading_profile(&self) -> NativeLoadingProfile {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.profile
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // A token cannot be constructed on these platforms.
+            NativeLoadingProfile::EagerCuda12Cudnn9V1
+        }
+    }
+
     /// ORT session 초기화 전후와 warm probe 전후에 호출한다.
     ///
     /// NVIDIA mapping만 검증한다. ORT core/providers는 원래 ORT bootstrap가 별도
@@ -360,6 +434,17 @@ impl ProcessLibrarySet {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            self.mapping_observation().map(|_| ())
+        }
+    }
+
+    pub fn mapping_observation(&self) -> Result<NativeMappingObservation, LoadError> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::observe(self)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
             Err(LoadError::new(
                 LoadErrorKind::UnsupportedPlatform,
                 "NVIDIA ELF mapping verification is supported only on Linux",
@@ -367,7 +452,9 @@ impl ProcessLibrarySet {
         }
     }
 
-    /// ORT 초기화와 첫 provider/warm probe 이후 exact ORT 3개와 NVIDIA 16개를 함께 확인한다.
+    /// ORT 초기화와 첫 provider/warm probe 이후 exact ORT 3개와 NVIDIA 전체 pin을 확인한다.
+    /// eager는 16개 resident가 필수이며, 명시적 shim-lazy는 roots9가 필수다.
+    /// resident인 모든 deferred image도 동일한 전체 pin과 대조한다.
     ///
     /// ORT 원래 소유자가 넘긴 readonly descriptor를 최초 호출에서 복제하여 process pin에
     /// 추가한다. 이후 다른 ORT bundle은 거부하며 모든 추가 검증 실패도 최초 실패로 latch된다.
@@ -375,6 +462,20 @@ impl ProcessLibrarySet {
         #[cfg(target_os = "linux")]
         {
             linux::verify_runtime(self, ort)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.runtime_mapping_observation(ort).map(|_| ())
+        }
+    }
+
+    pub fn runtime_mapping_observation(
+        &self,
+        ort: &[OwnedLibrary],
+    ) -> Result<NativeMappingObservation, LoadError> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::observe_runtime(self, ort)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -392,6 +493,7 @@ impl fmt::Debug for ProcessLibrarySet {
         formatter
             .debug_struct("ProcessLibrarySet")
             .field("nvidia_library_count", &NVIDIA_LOAD_ORDER.len())
+            .field("loading_profile", &self.loading_profile())
             .finish_non_exhaustive()
     }
 }
@@ -451,6 +553,7 @@ mod linux {
 
     pub(super) struct ProcessPin {
         fingerprint: [u8; 32],
+        pub(super) profile: NativeLoadingProfile,
         files: Vec<FilePin>,
         handles: Vec<ManuallyDrop<Library>>,
         expected: Vec<ExpectedMapping>,
@@ -475,6 +578,17 @@ mod linux {
     }
 
     impl Attempt {
+        fn check_profile(&mut self, profile: NativeLoadingProfile) -> Result<(), LoadError> {
+            if self.pin.profile != profile {
+                let error = LoadError::new(
+                    LoadErrorKind::DifferentBundle,
+                    "process already attempted another native loading policy",
+                );
+                return Err(self.retain_failure(error));
+            }
+            self.outcome.clone()
+        }
+
         fn check_bundle(&self, fingerprint: [u8; 32]) -> Result<(), LoadError> {
             if self.fingerprint != fingerprint {
                 return Err(LoadError::new(
@@ -507,17 +621,22 @@ mod linux {
         )
     }
 
-    pub(super) fn load(mut libraries: Vec<OwnedLibrary>) -> Result<ProcessLibrarySet, LoadError> {
+    pub(super) fn load(
+        mut libraries: Vec<OwnedLibrary>,
+        profile: NativeLoadingProfile,
+    ) -> Result<ProcessLibrarySet, LoadError> {
         let mut latch = process().lock().map_err(|_| poisoned())?;
         let sorted = sort_inputs(&mut libraries);
         let fingerprint = input_fingerprint(&libraries);
         if let Some(attempt) = &mut latch.attempt {
             attempt.check_bundle(fingerprint)?;
+            attempt.check_profile(profile)?;
             // 같은 manifest라도 새 descriptor/path를 신뢰하지 않고 다시 확인한다.
-            let mut supplied = ProcessPin::new(fingerprint, libraries);
+            let mut supplied = ProcessPin::new(fingerprint, profile, libraries);
             let checked = sorted.and_then(|()| preflight(&mut supplied));
             close_temporary_files(supplied.files);
-            if let Err(error) = checked.and_then(|()| audit(&attempt.pin, NVIDIA_LOAD_ORDER.len()))
+            if let Err(error) =
+                checked.and_then(|()| audit(&attempt.pin, profile.eager_indices()).map(|_| ()))
             {
                 return Err(attempt.retain_failure(error));
             }
@@ -528,7 +647,7 @@ mod linux {
 
         // File/handle는 preflight 및 native 실패·Rust unwind에도 Drop으로 해제하지 않는다.
         // static latch가 보존되며 lock poison 이후에도 프로세스 restart만 허용한다.
-        let mut pin = ProcessPin::new(fingerprint, libraries);
+        let mut pin = ProcessPin::new(fingerprint, profile, libraries);
         let outcome = sorted.and_then(|()| initialize(&mut pin));
         let pin = Arc::new(pin);
         latch.attempt = Some(Attempt {
@@ -542,9 +661,14 @@ mod linux {
     }
 
     impl ProcessPin {
-        fn new(fingerprint: [u8; 32], libraries: Vec<OwnedLibrary>) -> Self {
+        fn new(
+            fingerprint: [u8; 32],
+            profile: NativeLoadingProfile,
+            libraries: Vec<OwnedLibrary>,
+        ) -> Self {
             Self {
                 fingerprint,
+                profile,
                 files: libraries
                     .into_iter()
                     .take(MAX_LIBRARY_COUNT)
@@ -557,6 +681,14 @@ mod linux {
     }
 
     pub(super) fn verify(set: &ProcessLibrarySet) -> Result<(), LoadError> {
+        verify_seen(set).map(|_| ())
+    }
+
+    pub(super) fn observe(set: &ProcessLibrarySet) -> Result<NativeMappingObservation, LoadError> {
+        verify_seen(set).map(|seen| observation(set.inner.profile, &seen, false))
+    }
+
+    fn verify_seen(set: &ProcessLibrarySet) -> Result<BTreeSet<usize>, LoadError> {
         let mut latch = process().lock().map_err(|_| poisoned())?;
         let attempt = latch.attempt.as_mut().ok_or_else(poisoned)?;
         if attempt.fingerprint != set.inner.fingerprint || !Arc::ptr_eq(&attempt.pin, &set.inner) {
@@ -566,16 +698,30 @@ mod linux {
             ));
         }
         attempt.outcome.clone()?;
-        if let Err(error) = audit(&set.inner, NVIDIA_LOAD_ORDER.len()) {
-            return Err(attempt.retain_failure(error));
+        match audit(&set.inner, set.inner.profile.eager_indices()) {
+            Ok(observed) => Ok(observed),
+            Err(error) => Err(attempt.retain_failure(error)),
         }
-        Ok(())
     }
 
     pub(super) fn verify_runtime(
         set: &ProcessLibrarySet,
         ort: &[OwnedLibrary],
     ) -> Result<(), LoadError> {
+        verify_runtime_seen(set, ort).map(|_| ())
+    }
+
+    pub(super) fn observe_runtime(
+        set: &ProcessLibrarySet,
+        ort: &[OwnedLibrary],
+    ) -> Result<NativeMappingObservation, LoadError> {
+        verify_runtime_seen(set, ort).map(|seen| observation(set.inner.profile, &seen, true))
+    }
+
+    fn verify_runtime_seen(
+        set: &ProcessLibrarySet,
+        ort: &[OwnedLibrary],
+    ) -> Result<BTreeSet<usize>, LoadError> {
         let mut latch = process().lock().map_err(|_| poisoned())?;
         let attempt = latch.attempt.as_mut().ok_or_else(poisoned)?;
         attempt.check_bundle(set.inner.fingerprint)?;
@@ -634,7 +780,7 @@ mod linux {
                     // 새 복제 FD는 native handle을 소유하지 않는다. immutable 동일 bundle 검사 후 닫는다.
                     close_temporary_files(copies);
                 }
-                audit(&set.inner, NVIDIA_LOAD_ORDER.len())?;
+                audit(&set.inner, set.inner.profile.eager_indices())?;
                 let runtime = attempt.runtime.as_ref().ok_or_else(poisoned)?;
                 let current = preflight_files(&runtime.files, &ORT_LIBRARY_NAMES)?;
                 if current.iter().zip(&runtime.expected).any(|(left, right)| {
@@ -650,12 +796,15 @@ mod linux {
                 }
                 let mut expected = set.inner.expected.clone();
                 expected.extend(runtime.expected.iter().cloned());
-                audit_entries(&expected, expected.len(), &read_maps()?, true)
+                let mut required = set.inner.profile.eager_indices().to_vec();
+                required.extend(NVIDIA_LOAD_ORDER.len()..expected.len());
+                let seen = audit_entries_required(&expected, &required, &read_maps()?, true)?;
+                Ok(seen)
             })();
-        if let Err(error) = checked {
-            return Err(attempt.retain_failure(error));
+        match checked {
+            Ok(observed) => Ok(observed),
+            Err(error) => Err(attempt.retain_failure(error)),
         }
-        Ok(())
     }
 
     fn sort_inputs(libraries: &mut [OwnedLibrary]) -> Result<(), LoadError> {
@@ -799,7 +948,8 @@ mod linux {
         reject_ambient()?;
         reject_resident(&read_maps()?)?;
         preflight(pin)?;
-        for index in 0..pin.files.len() {
+        let mut required = Vec::with_capacity(pin.profile.eager_indices().len());
+        for &index in pin.profile.eager_indices() {
             // SAFETY: 원래 bootstrap가 신뢰한 고정 NVIDIA profile만 admission한다.
             // 아래까지 모든 파일의 identity/hash/readonly capability를 검증했고,
             // dynamic lookup 대신 해당 absolute copied path를 직접 사용한다.
@@ -815,9 +965,10 @@ mod linux {
                         .with_diagnostic(original.to_string())
                     })?;
             pin.handles.push(ManuallyDrop::new(handle));
-            audit(pin, index + 1)?;
+            required.push(index);
+            audit(pin, &required)?;
         }
-        audit(pin, NVIDIA_LOAD_ORDER.len())
+        audit(pin, pin.profile.eager_indices()).map(|_| ())
     }
 
     fn reject_ambient() -> Result<(), LoadError> {
@@ -1147,7 +1298,7 @@ mod linux {
         )
     }
 
-    fn audit(pin: &ProcessPin, required: usize) -> Result<(), LoadError> {
+    fn audit(pin: &ProcessPin, required: &[usize]) -> Result<BTreeSet<usize>, LoadError> {
         reject_ambient()?;
         for (file, expected) in pin.files.iter().zip(&pin.expected) {
             let metadata = validate_file(file)?;
@@ -1163,15 +1314,71 @@ mod linux {
                 ));
             }
         }
-        audit_entries(&pin.expected, required, &read_maps()?, false)
+        audit_entries_required(&pin.expected, required, &read_maps()?, false)
     }
 
+    fn observation(
+        profile: NativeLoadingProfile,
+        seen: &BTreeSet<usize>,
+        include_ort: bool,
+    ) -> NativeMappingObservation {
+        NativeMappingObservation {
+            profile,
+            declared_nvidia_files: NVIDIA_LOAD_ORDER.len(),
+            required_nvidia_files: profile
+                .eager_indices()
+                .iter()
+                .map(|&index| NVIDIA_LOAD_ORDER[index])
+                .collect(),
+            mapped_nvidia_files: NVIDIA_LOAD_ORDER
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| seen.contains(index))
+                .map(|(_, &name)| name)
+                .collect(),
+            deferred_nvidia_not_mapped: NVIDIA_LOAD_ORDER
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| {
+                    !profile.eager_indices().contains(index) && !seen.contains(index)
+                })
+                .map(|(_, &name)| name)
+                .collect(),
+            mapped_ort_files: include_ort.then(|| {
+                ORT_LIBRARY_NAMES
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| seen.contains(&(NVIDIA_LOAD_ORDER.len() + index)))
+                    .map(|(_, &name)| name)
+                    .collect()
+            }),
+        }
+    }
+
+    #[cfg(test)]
     fn audit_entries(
         expected: &[ExpectedMapping],
         required: usize,
         entries: &[MapEntry],
         include_ort: bool,
     ) -> Result<(), LoadError> {
+        let required: Vec<_> = (0..required).collect();
+        audit_entries_required(expected, &required, entries, include_ort).map(|_| ())
+    }
+
+    fn audit_entries_required(
+        expected: &[ExpectedMapping],
+        required: &[usize],
+        entries: &[MapEntry],
+        include_ort: bool,
+    ) -> Result<BTreeSet<usize>, LoadError> {
+        if required.len() > expected.len() || required.iter().any(|&index| index >= expected.len())
+        {
+            return Err(LoadError::new(
+                LoadErrorKind::InvalidBundle,
+                "mapping requirement differs from the complete pinned profile",
+            ));
+        }
         let mut seen = BTreeSet::new();
         for entry in entries {
             let Some(path) = &entry.path else {
@@ -1204,13 +1411,13 @@ mod linux {
             }
             seen.insert(index);
         }
-        if (0..required).any(|index| !seen.contains(&index)) {
+        if required.iter().any(|index| !seen.contains(index)) {
             return Err(LoadError::new(
                 LoadErrorKind::MissingMapping,
                 "an expected NVIDIA library is not mapped",
             ));
         }
-        Ok(())
+        Ok(seen)
     }
 
     #[cfg(test)]
@@ -1233,6 +1440,118 @@ mod linux {
             assert_eq!(entries[0].inode, 19);
             assert!(entries[1].path.is_none());
             assert!(audit_entries(&expected(), 1, &entries, false).is_ok());
+        }
+
+        fn whole_expected() -> Vec<ExpectedMapping> {
+            NVIDIA_LOAD_ORDER
+                .iter()
+                .chain(&ORT_LIBRARY_NAMES)
+                .enumerate()
+                .map(|(index, name)| ExpectedMapping {
+                    path: PathBuf::from(format!("/private native/{name}")),
+                    dev_major: 8,
+                    dev_minor: 2,
+                    inode: 19 + index as u64,
+                })
+                .collect()
+        }
+
+        fn mapped(expected: &[ExpectedMapping], indices: &[usize]) -> Vec<MapEntry> {
+            indices
+                .iter()
+                .map(|&index| {
+                    let pin = &expected[index];
+                    MapEntry {
+                        dev_major: pin.dev_major,
+                        dev_minor: pin.dev_minor,
+                        inode: pin.inode,
+                        path: Some(pin.path.clone()),
+                        deleted: false,
+                    }
+                })
+                .collect()
+        }
+
+        #[test]
+        fn shim_requires_nonprefix_roots_but_exact_deferred_subset_is_optional() {
+            let expected = whole_expected();
+            let profile = NativeLoadingProfile::CuDnnShimLazyV1;
+            let roots = profile.eager_indices();
+            let mut entries = mapped(&expected, roots);
+            let seen = audit_entries_required(&expected[..16], roots, &entries, false).unwrap();
+            let observed = observation(profile, &seen, false);
+            assert_eq!(observed.required_nvidia_files.len(), 9);
+            assert_eq!(observed.mapped_nvidia_files.len(), 9);
+            assert_eq!(observed.deferred_nvidia_not_mapped.len(), 7);
+            assert_eq!(observed.mapped_ort_files, None);
+            assert!(observed.required_nvidia_files.contains(&"libcudnn.so.9"));
+            entries.extend(mapped(&expected, &[8, 12]));
+            let seen = audit_entries_required(&expected[..16], roots, &entries, false).unwrap();
+            let observed = observation(profile, &seen, false);
+            assert_eq!(observed.mapped_nvidia_files.len(), 11);
+            assert_eq!(observed.deferred_nvidia_not_mapped.len(), 5);
+            assert_eq!(
+                audit_entries_required(
+                    &expected[..16],
+                    NativeLoadingProfile::EagerCuda12Cudnn9V1.eager_indices(),
+                    &entries,
+                    false,
+                )
+                .unwrap_err()
+                .kind,
+                LoadErrorKind::MissingMapping
+            );
+            entries.remove(8); // facade, not the eighth prefix image, is mandatory
+            assert_eq!(
+                audit_entries_required(&expected[..16], roots, &entries, false)
+                    .unwrap_err()
+                    .kind,
+                LoadErrorKind::MissingMapping
+            );
+        }
+
+        #[test]
+        fn shim_deferred_mapping_still_rejects_foreign_deleted_and_wrong_identity() {
+            let expected = whole_expected();
+            let roots = NativeLoadingProfile::CuDnnShimLazyV1.eager_indices();
+            for bad in 0..4 {
+                let mut entries = mapped(&expected, roots);
+                let mut deferred = mapped(&expected, &[12]).pop().unwrap();
+                match bad {
+                    0 => {
+                        deferred.path =
+                            Some(PathBuf::from("/ambient/libcudnn_engines_precompiled.so.9"))
+                    }
+                    1 => deferred.deleted = true,
+                    2 => deferred.inode += 1,
+                    _ => deferred.dev_minor += 1,
+                }
+                entries.push(deferred);
+                assert!(audit_entries_required(&expected[..16], roots, &entries, false).is_err());
+            }
+        }
+
+        #[test]
+        fn shim_full_audit_adds_three_mandatory_ort_images() {
+            let expected = whole_expected();
+            let profile = NativeLoadingProfile::CuDnnShimLazyV1;
+            let mut required = profile.eager_indices().to_vec();
+            required.extend(16..19);
+            let entries = mapped(&expected, &required);
+            let seen = audit_entries_required(&expected, &required, &entries, true).unwrap();
+            let observed = observation(profile, &seen, true);
+            assert_eq!(observed.mapped_ort_files.as_ref().unwrap().len(), 3);
+            assert_eq!(observed.deferred_nvidia_not_mapped.len(), 7);
+            for omitted in 9..12 {
+                let mut incomplete = mapped(&expected, &required);
+                incomplete.remove(omitted);
+                assert_eq!(
+                    audit_entries_required(&expected, &required, &incomplete, true)
+                        .unwrap_err()
+                        .kind,
+                    LoadErrorKind::MissingMapping
+                );
+            }
         }
 
         #[test]
@@ -1396,11 +1715,75 @@ mod linux {
         }
 
         #[test]
+        fn shim_keeps_complete_deferred_declarations_before_any_native_constructor() {
+            let mut declared: Vec<_> = TRUSTED_NATIVE_PROFILE[..16]
+                .iter()
+                .map(|entry| OwnedLibrary {
+                    path: PathBuf::from(format!("/private native/{}", entry.filename)),
+                    file: File::open("/dev/null").unwrap(),
+                    digest: entry.digest,
+                    bytes: entry.bytes,
+                })
+                .collect();
+            sort_inputs(&mut declared).unwrap();
+            // Only declaration seams are exercised: /dev/null is never passed
+            // to native loading or treated as content-hash verification.
+            declared[12].digest[0] ^= 1;
+            assert_eq!(
+                sort_inputs(&mut declared).unwrap_err().kind,
+                LoadErrorKind::UntrustedProfile
+            );
+            declared.remove(12);
+            assert_eq!(
+                sort_inputs(&mut declared).unwrap_err().kind,
+                LoadErrorKind::InvalidBundle
+            );
+        }
+
+        #[test]
+        fn identical_bundle_cannot_switch_loading_policy_or_clear_first_failure() {
+            let fingerprint = [7; 32];
+            let mut attempt = Attempt {
+                fingerprint,
+                pin: Arc::new(ProcessPin::new(
+                    fingerprint,
+                    NativeLoadingProfile::CuDnnShimLazyV1,
+                    Vec::new(),
+                )),
+                outcome: Ok(()),
+                runtime: None,
+            };
+            attempt.check_bundle(fingerprint).unwrap();
+            attempt
+                .check_profile(NativeLoadingProfile::CuDnnShimLazyV1)
+                .unwrap();
+            let first = attempt
+                .check_profile(NativeLoadingProfile::EagerCuda12Cudnn9V1)
+                .unwrap_err();
+            assert_eq!(first.kind, LoadErrorKind::DifferentBundle);
+            assert_eq!(
+                attempt
+                    .check_profile(NativeLoadingProfile::CuDnnShimLazyV1)
+                    .unwrap_err()
+                    .detail,
+                first.detail
+            );
+            assert_eq!(
+                attempt.check_bundle(fingerprint).unwrap_err().detail,
+                first.detail
+            );
+        }
+
+        #[test]
         fn failure_latch_preserves_first_error_and_rejects_another_bundle() {
             let fingerprint = [7; 32];
             let first = LoadError::new(LoadErrorKind::NativeLoad, "first failure")
                 .with_diagnostic("bounded original cause".to_owned());
-            let pin = Arc::new(ProcessPin::new(fingerprint, Vec::new()));
+            let pin = Arc::new(ProcessPin::new(
+                fingerprint,
+                NativeLoadingProfile::EagerCuda12Cudnn9V1,
+                Vec::new(),
+            ));
             let mut attempt = Attempt {
                 fingerprint,
                 pin,

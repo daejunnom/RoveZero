@@ -11,6 +11,7 @@ use rz_eval::pals_onnx::{
 };
 use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeCache};
 use rz_eval::worker::PhysicalPoll;
+use rz_native_loader::{NativeLoadingProfile, NativeMappingObservation};
 use serde::Deserialize;
 use serde_json::json;
 use std::error::Error;
@@ -228,6 +229,21 @@ fn stats_json(stats: &PalsBackendStats) -> serde_json::Value {
         "validated_public_outputs":stats.validated_public_outputs,"validated_role_outputs":stats.validated_role_outputs,
         "new_game_resets":stats.new_game_resets,"live_public_cache_entries":stats.live_public_cache_entries})
 }
+
+fn mapping_json(phase: &str, observed: &NativeMappingObservation) -> serde_json::Value {
+    json!({"phase":phase,"scope":"proc_self_maps_at_audit_boundary",
+        "loading_profile":observed.profile.identifier(),
+        "declared_nvidia_files":observed.declared_nvidia_files,
+        "required_nvidia_files":observed.required_nvidia_files,
+        "mapped_nvidia_files":observed.mapped_nvidia_files,
+        "mapped_nvidia_count":observed.mapped_nvidia_files.len(),
+        "deferred_nvidia_not_mapped":observed.deferred_nvidia_not_mapped,
+        "deferred_absence_meaning":"not_mapped_at_observation_not_unused",
+        "mapped_ort_files":observed.mapped_ort_files,
+        "kernel_placement":"separate_cuda_placement_witness",
+        "vram_residency":"unknown","normal_process_exit":"requires_external_supervisor"})
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() == 3 && args[0] == "--check-cuda-control-policy" {
@@ -238,12 +254,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     if !matches!(args.len(), 8 | 9 | 11) {
-        return Err("usage: pals_model_check EXPORT.json EXPORT_SHA256 ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu|cuda|cuda-device|cuda-control CACHE_ROOT [CUDA_BUNDLE.json] [INVENTORY_V2.json INVENTORY_SHA256]".into());
+        return Err("usage: pals_model_check EXPORT.json EXPORT_SHA256 ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu|cuda|cuda-device|cuda-control|cuda-control-shim CACHE_ROOT [CUDA_BUNDLE.json] [INVENTORY_V2.json INVENTORY_SHA256]".into());
     }
     let is_cuda = match (args[6].as_str(), args.len()) {
         ("cpu", 8) => false,
         ("cuda" | "cuda-device", 9) => true,
-        ("cuda-control", 11) => true,
+        ("cuda-control" | "cuda-control-shim", 11) => true,
         _ => return Err("CUDA requires its explicit pinned bundle; CPU excludes it".into()),
     };
     let report = Path::new(&args[5]);
@@ -278,14 +294,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         cache.library(Path::new(&args[2]), &args[3])?
     };
-    let runtime = OrtRuntime::load(&pin).map_err(|mut failure| {
+    // Shim lazy is an explicitly registered diagnostic variable. Other modes,
+    // including the existing cuda-control mode, retain eager16 bootstrap.
+    let runtime = (if args[6] == "cuda-control-shim" {
+        OrtRuntime::load_with_cuda_loading_profile(&pin, NativeLoadingProfile::CuDnnShimLazyV1)
+    } else {
+        OrtRuntime::load(&pin)
+    })
+    .map_err(|mut failure| {
         if is_cuda {
             failure.detail = "PALS CUDA runtime bootstrap failed before session creation";
         }
         failure
     })?;
     let runtime_digest = runtime.binary_digest();
-    let control_policy = if args[6] == "cuda-control" {
+    let runtime_bundle_digest = runtime.bundle_digest();
+    let loading_profile = runtime.native_loading_profile();
+    let loading_profile_digest = runtime.native_loading_profile_digest();
+    let mut loading_observations = Vec::new();
+    if is_cuda {
+        loading_observations.push(mapping_json(
+            "dependencies_before_sessions",
+            &runtime.cuda_mapping_observation(false)?,
+        ));
+    }
+    let control_policy = if matches!(args[6].as_str(), "cuda-control" | "cuda-control-shim") {
         Some(PalsCudaControlPolicy::from_inventory(
             Path::new(&args[9]),
             &args[10],
@@ -377,6 +410,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let public_encodes = backend.public_encodes;
     let public_cache_hits = backend.public_cache_hits;
     backend.verify_runtime()?;
+    if is_cuda {
+        loading_observations.push(mapping_json(
+            "primary_numeric_physical_completion",
+            &runtime.cuda_mapping_observation(true)?,
+        ));
+    }
     let trained = backend.is_trained();
     let residency = backend.residency().clone();
     let pages_before_reset = backend.host_public_page_snapshot();
@@ -401,7 +440,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Separate sessions verify cache eviction/fresh encode equivalence. No
     // measured performance improvement is inferred from these correctness calls.
     config.cache_public_memory = false;
-    let mut fresh = load(runtime, config, "fresh")?;
+    let mut fresh = load(runtime.clone(), config, "fresh")?;
     let mut fresh_proposer_seen = false;
     let mut fresh_critic_seen = false;
     let mut fresh_placement_witness = None;
@@ -595,6 +634,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             Poll::Pending => return Err("physical owner has not completed shutdown".into()),
         }
     }
+    if is_cuda {
+        loading_observations.push(mapping_json(
+            "final_worker_joined",
+            &runtime.cuda_mapping_observation(true)?,
+        ));
+    }
     let host_page_evidence = json!({"scope":"direct_owner_after_numeric_cases_before_worker",
         "page_kind":"whole_input","frozen_numeric_epoch":0,
         "weight_epoch_identity":"full_checkpoint_digest_in_exact_content_key",
@@ -623,6 +668,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         .as_object_mut()
         .ok_or("acceptance receipt is not an object")?;
     fields.insert("host_public_page_ownership".into(), host_page_evidence);
+    fields.insert(
+        "native_loading".into(),
+        json!({
+        "schema":"rovezero.native-loading-observation.v1",
+        "profile":loading_profile.map(NativeLoadingProfile::identifier),
+        "profile_sha256":loading_profile_digest.as_ref().map(hex_digest),
+        "experimental_candidate":loading_profile == Some(NativeLoadingProfile::CuDnnShimLazyV1),
+        "runtime_bundle_sha256":runtime_bundle_digest.as_ref().map(hex_digest),
+        "declared_bundle_file_count":if is_cuda {19} else {1},
+        "mapping_observations":loading_observations,
+        "native_termination_acceptance":"requires_external_process_exit_zero_and_cleanup",
+        "preload_cause":"not_proven"}),
+    );
     fields.extend(
         cuda_evidence
             .as_object()
