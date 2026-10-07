@@ -2,7 +2,7 @@
 //! 실제 Rules/registry는 caller가 공급한다. 이 owner는 체스 상태나 digest를 만들지
 //! 않으며 Runtime의 raw-cache namespace 초기화와 물리 buffer drain을 대체하지 않는다.
 
-use std::time::Instant;
+use std::{collections::VecDeque, time::Instant};
 
 use rz_contracts::{
     AcceptanceScope, Color, ContractError, ErrorCode, GameGeneration, ProcessEpoch, RootGeneration,
@@ -16,8 +16,8 @@ use rz_search::time::TimeBudgetError;
 
 use crate::bridge::{BudgetKind, BuildSearchError, BuildSearchSettings, SearchBinding, SideToMove};
 use crate::{
-    Command, Diagnostic, Effect, Event, PositionPort, SearchCompletion, SearchTicket, Session,
-    SessionResult, handle_event, parse,
+    CancelReason, Command, Diagnostic, Effect, Event, PositionPort, SearchCompletion, SearchTicket,
+    Session, SessionResult, handle_event, parse,
 };
 
 /// UCI publication authority is independent of the selected search algorithm.
@@ -103,6 +103,11 @@ struct CurrentSearch {
     work_completed: bool,
 }
 
+struct RetiredCancellation {
+    ticket: SearchTicket,
+    reason: CancelReason,
+}
+
 /// One Session owner's acceptance authority. Epoch, model/encoding/backend
 /// handles, and initial generations are explicit inputs from their real owners.
 /// Reusing this owner with an independently active Session is rejected.
@@ -114,6 +119,11 @@ pub struct ContractSessionOwner {
     last_dispatch: Instant,
     ticket: Option<SearchTicket>,
     current: Option<CurrentSearch>,
+    // Opaque identities only: no position, search work or reusable authority.
+    // A service supplies its existing worker bound; old standalone constructors
+    // retain their original typed-Stale behavior with a zero-length history.
+    retired_cancellations: VecDeque<RetiredCancellation>,
+    max_retired_cancellations: usize,
 }
 
 impl ContractSessionOwner {
@@ -131,6 +141,19 @@ impl ContractSessionOwner {
         clock: InstantClock,
         settings: BuildSearchSettings,
     ) -> Result<Self, ContractError> {
+        Self::new_scope_with_cancel_history(scope, epoch, clock, settings, 0)
+    }
+
+    /// Explicit service-only diagnostic history, bounded by its worker limit.
+    /// Remembering a canceled identity never reopens result/work admission.
+    /// The zero-history mode preserves the standalone constructor behavior.
+    pub fn new_scope_with_cancel_history(
+        scope: SessionScope,
+        epoch: ProcessEpoch,
+        clock: InstantClock,
+        settings: BuildSearchSettings,
+        max_retired_cancellations: usize,
+    ) -> Result<Self, ContractError> {
         if clock.domain().0 != epoch {
             return Err(error(
                 ErrorCode::IdentityMismatch,
@@ -146,6 +169,15 @@ impl ContractSessionOwner {
             ));
         }
         clock.now()?;
+        let mut retired_cancellations = VecDeque::new();
+        retired_cancellations
+            .try_reserve_exact(max_retired_cancellations)
+            .map_err(|_| {
+                error(
+                    ErrorCode::ResourceExhausted,
+                    "bounded canceled-ticket diagnostic history allocation failed",
+                )
+            })?;
         Ok(Self {
             scope,
             epoch,
@@ -154,6 +186,8 @@ impl ContractSessionOwner {
             last_dispatch: Instant::now(),
             ticket: None,
             current: None,
+            retired_cancellations,
+            max_retired_cancellations,
         })
     }
 
@@ -260,6 +294,7 @@ impl ContractSessionOwner {
         } else {
             None
         };
+        let previous_ticket = self.current.as_ref().map(|c| c.binding.ticket().clone());
         let mut out = ContractSessionOutcome::from(session.handle_line(line));
         if !out.session.accepted {
             return out;
@@ -335,6 +370,7 @@ impl ContractSessionOwner {
                 out.session.effects.push(effect);
             }
         }
+        self.remember_actual_cancellations(previous_ticket.as_ref(), &out.session.effects);
         self.synchronize(session);
         out
     }
@@ -363,6 +399,7 @@ impl ContractSessionOwner {
         }
         let now = now.max(Instant::now()).max(self.last_dispatch);
         self.last_dispatch = now;
+        let previous_ticket = self.current.as_ref().map(|c| c.binding.ticket().clone());
         let out = match event {
             Event::Progress { ticket, bestmove } => self.progress(session, &ticket, &bestmove, now),
             Event::Complete { ticket, completion } => {
@@ -381,6 +418,7 @@ impl ContractSessionOwner {
             }
             event => handle_event(session, event).into(),
         };
+        self.remember_actual_cancellations(previous_ticket.as_ref(), &out.session.effects);
         self.synchronize(session);
         // The common cancellation clone is authoritative even when an invalid
         // candidate returned before its final guard. Mirror it into legacy work.
@@ -400,7 +438,7 @@ impl ContractSessionOwner {
         let scope = self.scope;
         let clock = self.clock;
         let Some(current) = self.matching_current(ticket) else {
-            return stale(None);
+            return self.late_result(ticket, "Progress", None);
         };
         if current.work_completed {
             return stale(None);
@@ -427,7 +465,7 @@ impl ContractSessionOwner {
         let scope = self.scope;
         let clock = self.clock;
         let Some(current) = self.matching_current(ticket) else {
-            return stale(Some(completion));
+            return self.late_result(ticket, "Complete", Some(completion));
         };
         if current.work_completed {
             return stale(Some(completion));
@@ -522,6 +560,73 @@ impl ContractSessionOwner {
             current.cancellation.cancel();
         }
         self.ticket = None;
+    }
+    fn remember_actual_cancellations<S>(
+        &mut self,
+        previous_ticket: Option<&SearchTicket>,
+        effects: &[Effect<S>],
+    ) {
+        if self.max_retired_cancellations == 0 {
+            return;
+        }
+        let Some(previous_ticket) = previous_ticket else {
+            return;
+        };
+        // Only a real Session-generated Cancel effect for this owner's prior
+        // common binding qualifies. Rejected commands and foreign events cannot
+        // mint a diagnostic exemption; natural completion has no Cancel effect.
+        for effect in effects {
+            let Effect::Cancel { ticket, reason } = effect else {
+                continue;
+            };
+            if ticket != previous_ticket
+                || self
+                    .retired_cancellations
+                    .iter()
+                    .any(|c| c.ticket == *ticket)
+            {
+                continue;
+            }
+            if self.retired_cancellations.len() == self.max_retired_cancellations {
+                self.retired_cancellations.pop_front();
+            }
+            self.retired_cancellations.push_back(RetiredCancellation {
+                ticket: ticket.clone(),
+                reason: *reason,
+            });
+        }
+    }
+    fn late_result<S>(
+        &self,
+        ticket: &SearchTicket,
+        event_kind: &'static str,
+        completion: Option<SearchCompletion>,
+    ) -> ContractSessionOutcome<S> {
+        // A real failed publication must retain its typed Stale and SearchFailed
+        // causes even when its ticket was canceled normally. Physical-unknown
+        // publications are fenced by the engine owner before this reducer.
+        if !matches!(completion.as_ref(), Some(SearchCompletion::Failed { .. }))
+            && let Some(cancellation) = self
+                .retired_cancellations
+                .iter()
+                .find(|c| c.ticket == *ticket)
+        {
+            let mut out = SessionResult {
+                accepted: false,
+                ..SessionResult::default()
+            };
+            out.diagnostics.push(Diagnostic {
+                code: "CanceledSearchResultIgnored",
+                message: format!(
+                    "ignored late {event_kind} after owned {:?} cancellation; no result or work admission",
+                    cancellation.reason
+                ),
+            });
+            return out.into();
+        }
+        // Eviction only reduces the classification window. It never admits an
+        // unknown/foreign ticket or removes a failure's original cause.
+        stale(completion)
     }
     fn synchronize<P: PositionPort>(&mut self, session: &Session<P>) {
         self.ticket = session.active_ticket();

@@ -708,6 +708,21 @@ impl PendingBestMove {
     }
 }
 impl Owner {
+    fn deadline_ticket(
+        &self,
+        delivered: Option<&SearchTicket>,
+        now: Instant,
+    ) -> Option<SearchTicket> {
+        let active = self.active.as_ref()?;
+        // Stop/root replacement can leave this physical binding alive while its
+        // workers drain. Only the current, uncanceled logical owner may produce
+        // a new Deadline; the common consumer guards remain authoritative.
+        (self.session_owner.active_ticket() == Some(&active.ticket)
+            && !active.control.cancellation.load(Ordering::Acquire)
+            && delivered != Some(&active.ticket)
+            && now >= active.control.deadline)
+            .then(|| active.ticket.clone())
+    }
     fn pending_failure(
         &mut self,
         sender: &SyncSender<Event>,
@@ -1856,11 +1871,12 @@ pub fn serve<O: Write, D: Write>(
                 .implementation(),
         })
     };
-    let session_owner = crate::contracts::ContractSessionOwner::new_scope(
+    let session_owner = crate::contracts::ContractSessionOwner::new_scope_with_cancel_history(
         scope,
         clock.epoch(),
         clock.b_clock(),
         settings.search,
+        settings.max_workers,
     )?;
     let owner = Arc::new(Mutex::new(Owner {
         session_owner,
@@ -1902,15 +1918,12 @@ pub fn serve<O: Write, D: Write>(
                         message: String::new(),
                     });
                 }
-                if let Some(active) = &owner.active {
-                    if delivered.as_ref() != Some(&active.ticket)
-                        && Instant::now() >= active.control.deadline
-                        && timer_events
-                            .try_send(Event::Deadline(active.ticket.clone()))
-                            .is_ok()
-                    {
-                        delivered = Some(active.ticket.clone());
-                    }
+                if let Some(ticket) = owner.deadline_ticket(delivered.as_ref(), Instant::now())
+                    && timer_events
+                        .try_send(Event::Deadline(ticket.clone()))
+                        .is_ok()
+                {
+                    delivered = Some(ticket);
                 }
             }
             thread::sleep(Duration::from_millis(1));
@@ -2521,6 +2534,397 @@ mod tests {
         )
         .unwrap();
         (owner, session)
+    }
+
+    fn fixture_with_cancel_history(capacity: usize) -> (Owner, Session<RulesUciPort>) {
+        let (mut owner, session) = fixture();
+        owner.session_owner =
+            crate::contracts::ContractSessionOwner::new_scope_with_cancel_history(
+                owner.session_owner.lifecycle_scope(),
+                owner.clock.epoch(),
+                owner.clock.b_clock(),
+                owner.settings.search,
+                capacity,
+            )
+            .unwrap();
+        (owner, session)
+    }
+
+    fn assert_canceled_result_ignored(out: &SessionResult<RulesSearchPosition>) {
+        assert!(!out.accepted);
+        assert!(out.protocol.is_empty());
+        assert!(out.effects.is_empty());
+        assert_eq!(out.diagnostics.len(), 1);
+        assert_eq!(out.diagnostics[0].code, "CanceledSearchResultIgnored");
+        assert!(
+            out.diagnostics[0]
+                .message
+                .contains("no result or work admission")
+        );
+    }
+
+    #[test]
+    fn service_history_distinguishes_owned_cancellation_from_foreign_and_failed_results() {
+        let (mut owner, mut session) = fixture_with_cancel_history(1);
+        owner.handle(&mut session, Event::Line("go infinite".into()));
+        let ticket = session.active_ticket().unwrap();
+        owner.handle(
+            &mut session,
+            Event::Progress {
+                ticket: ticket.clone(),
+                bestmove: "e2e4".into(),
+            },
+        );
+        let stopped = owner.handle(&mut session, Event::Line("stop".into()));
+        assert_eq!(stopped.protocol, ["bestmove e2e4"]);
+        let scope = owner.session_owner.lifecycle_scope();
+        for event in [
+            Event::Progress {
+                ticket: ticket.clone(),
+                bestmove: "d2d4".into(),
+            },
+            Event::Complete {
+                ticket: ticket.clone(),
+                completion: SearchCompletion::Completed {
+                    bestmove: Some("d2d4".into()),
+                },
+            },
+        ] {
+            assert_canceled_result_ignored(&owner.handle(&mut session, event));
+            assert_eq!(owner.session_owner.lifecycle_scope(), scope);
+            assert!(session.active_ticket().is_none());
+            assert!(owner.diagnostics.lock().unwrap().is_empty());
+        }
+        let (mut foreign, mut other_session) = fixture();
+        foreign.handle(&mut other_session, Event::Line("go infinite".into()));
+        let foreign_result = owner.handle(
+            &mut session,
+            Event::Complete {
+                ticket: other_session.active_ticket().unwrap(),
+                completion: SearchCompletion::Completed {
+                    bestmove: Some("e2e4".into()),
+                },
+            },
+        );
+        assert!(!foreign_result.accepted);
+        assert!(foreign_result.protocol.is_empty());
+        assert!(foreign_result.effects.is_empty());
+        assert!(foreign_result.diagnostics.iter().any(|d| {
+            d.code == "SharedContractError" && d.message.contains("inactive or foreign")
+        }));
+        assert!(
+            !foreign_result
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "CanceledSearchResultIgnored")
+        );
+        let failed = owner.handle(
+            &mut session,
+            Event::Complete {
+                ticket,
+                completion: SearchCompletion::Failed {
+                    code: "LateBackendFailure".into(),
+                    message: "original late physical callback failure".into(),
+                },
+            },
+        );
+        assert!(!failed.accepted);
+        assert!(failed.protocol.is_empty());
+        assert!(failed.effects.is_empty());
+        assert!(
+            failed
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "SharedContractError")
+        );
+        assert!(failed.diagnostics.iter().any(|d| {
+            d.code == "SearchFailed"
+                && d.message == "LateBackendFailure: original late physical callback failure"
+        }));
+        assert!(
+            !failed
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "CanceledSearchResultIgnored")
+        );
+    }
+
+    #[test]
+    fn canceled_ticket_history_eviction_and_natural_completion_remain_typed_stale() {
+        let (mut owner, mut session) = fixture_with_cancel_history(1);
+        let mut tickets = Vec::new();
+        for _ in 0..2 {
+            owner.handle(&mut session, Event::Line("go infinite".into()));
+            tickets.push(session.active_ticket().unwrap());
+            owner.handle(&mut session, Event::Line("stop".into()));
+        }
+        let evicted = owner.session_owner.handle_event(
+            &mut session,
+            Event::Progress {
+                ticket: tickets[0].clone(),
+                bestmove: "e2e4".into(),
+            },
+        );
+        assert_eq!(evicted.errors.len(), 1);
+        assert_eq!(evicted.errors[0].code, contract::ErrorCode::Stale);
+        assert!(evicted.session.protocol.is_empty());
+        let retained = owner.session_owner.handle_event(
+            &mut session,
+            Event::Progress {
+                ticket: tickets[1].clone(),
+                bestmove: "e2e4".into(),
+            },
+        );
+        assert!(retained.errors.is_empty());
+        assert_canceled_result_ignored(&retained.session);
+        owner.handle(&mut session, Event::Line("go nodes 1".into()));
+        let natural = session.active_ticket().unwrap();
+        let completed = owner.handle(
+            &mut session,
+            Event::Complete {
+                ticket: natural.clone(),
+                completion: SearchCompletion::Completed {
+                    bestmove: Some("e2e4".into()),
+                },
+            },
+        );
+        assert_eq!(completed.protocol, ["bestmove e2e4"]);
+        let duplicate = owner.session_owner.handle_event(
+            &mut session,
+            Event::Complete {
+                ticket: natural,
+                completion: SearchCompletion::Completed {
+                    bestmove: Some("d2d4".into()),
+                },
+            },
+        );
+        assert_eq!(duplicate.errors.len(), 1);
+        assert_eq!(duplicate.errors[0].code, contract::ErrorCode::Stale);
+        assert!(duplicate.session.protocol.is_empty());
+        assert!(duplicate.session.effects.is_empty());
+    }
+
+    #[test]
+    fn only_actual_cancel_effects_record_reasons_and_closed_owners_never_reenter() {
+        for (command, reason) in [
+            ("stop", "Stop"),
+            ("go infinite", "ReplacedSearch"),
+            ("position startpos moves e2e4", "ReplacedPosition"),
+            ("ucinewgame", "NewGame"),
+            ("quit", "Quit"),
+            ("EOF", "EndOfInput"),
+        ] {
+            let (mut owner, mut session) = fixture_with_cancel_history(1);
+            owner.handle(&mut session, Event::Line("go infinite".into()));
+            let ticket = session.active_ticket().unwrap();
+            let scope = owner.session_owner.lifecycle_scope();
+            let rejected = owner.handle(&mut session, Event::Line("stop extra".into()));
+            assert!(!rejected.accepted);
+            assert_eq!(session.active_ticket(), Some(ticket.clone()));
+            assert_eq!(owner.session_owner.lifecycle_scope(), scope);
+            let close = if command == "EOF" {
+                Event::EndOfInput
+            } else {
+                Event::Line(command.into())
+            };
+            owner.handle(&mut session, close);
+            let late = owner.session_owner.handle_event(
+                &mut session,
+                Event::Progress {
+                    ticket,
+                    bestmove: "d2d4".into(),
+                },
+            );
+            assert!(late.errors.is_empty(), "{command}: {late:?}");
+            assert_canceled_result_ignored(&late.session);
+            assert!(late.session.diagnostics[0].message.contains(reason));
+            if matches!(command, "quit" | "EOF") {
+                let closed_scope = owner.session_owner.lifecycle_scope();
+                let new_go = owner.handle(&mut session, Event::Line("go infinite".into()));
+                assert!(!new_go.accepted);
+                assert!(new_go.protocol.is_empty());
+                assert!(new_go.effects.is_empty());
+                assert!(session.active_ticket().is_none());
+                assert_eq!(owner.session_owner.lifecycle_scope(), closed_scope);
+            }
+        }
+    }
+
+    #[test]
+    fn actual_deadline_cancel_is_recorded_but_old_timer_production_is_closed() {
+        let (mut owner, mut session) = fixture_with_cancel_history(1);
+        owner.handle(&mut session, Event::Line("go movetime 1000".into()));
+        let ticket = session.active_ticket().unwrap();
+        let control = owner.session_owner.control().unwrap().clone();
+        owner.active = Some(ActiveBinding {
+            ticket: ticket.clone(),
+            control: control.clone(),
+            authority: None,
+        });
+        assert_eq!(
+            owner.deadline_ticket(None, control.deadline),
+            Some(ticket.clone())
+        );
+        assert!(
+            owner
+                .deadline_ticket(Some(&ticket), control.deadline)
+                .is_none()
+        );
+        let expired = owner.session_owner.handle_event_at(
+            &mut session,
+            Event::Deadline(ticket.clone()),
+            control.deadline + Duration::from_millis(1),
+        );
+        assert_eq!(expired.session.protocol.len(), 1);
+        assert!(expired.session.effects.iter().any(|e| {
+            matches!(e, Effect::Cancel { ticket: t, reason: crate::CancelReason::Deadline } if t == &ticket)
+        }));
+        assert!(owner.deadline_ticket(None, control.deadline).is_none());
+        let late = owner.session_owner.handle_event(
+            &mut session,
+            Event::Complete {
+                ticket,
+                completion: SearchCompletion::Completed {
+                    bestmove: Some("d2d4".into()),
+                },
+            },
+        );
+        assert!(late.errors.is_empty());
+        assert_canceled_result_ignored(&late.session);
+        assert!(late.session.diagnostics[0].message.contains("Deadline"));
+        // A new active root still owns its own timer, independently of this
+        // still-retained old physical binding.
+        owner.handle(&mut session, Event::Line("go infinite".into()));
+        assert!(owner.deadline_ticket(None, control.deadline).is_none());
+        owner.handle(&mut session, Event::Line("stop".into()));
+    }
+
+    #[test]
+    fn known_cancellation_never_masks_a_physical_unknown_publication() {
+        let (mut owner, mut session) = fixture_with_cancel_history(1);
+        owner.handle(&mut session, Event::Line("go infinite".into()));
+        let ticket = session.active_ticket().unwrap();
+        let (release, waiting) = mpsc::channel();
+        let publication = Arc::new(Mutex::new(None));
+        owner.workers.push(Worker {
+            handle: thread::spawn(move || {
+                waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(())
+            }),
+            failure: Arc::clone(&publication),
+        });
+        let stopped = owner.handle(&mut session, Event::Line("stop".into()));
+        assert!(stopped.protocol.is_empty());
+        assert!(owner.pending_bestmove.is_some());
+        let error = crate::search_driver::SearchSessionFailure::physical_completion_unknown();
+        let completion = SearchCompletion::Failed {
+            code: error.code.into(),
+            message: error.detail.clone(),
+        };
+        *publication.lock().unwrap() = Some(Box::new(UndeliveredWorkerFailure {
+            ticket: ticket.clone(),
+            completion,
+            source: WorkerFailureSource::Driver(error),
+        }));
+        let out = owner.handle(
+            &mut session,
+            Event::Complete {
+                ticket,
+                completion: SearchCompletion::Completed {
+                    bestmove: Some("e2e4".into()),
+                },
+            },
+        );
+        assert!(out.protocol.is_empty());
+        assert!(session.is_closed());
+        assert!(owner.fence_failure.is_some());
+        assert!(out.diagnostics.iter().any(|d| {
+            d.code == "PhysicalFenceFailure" && d.message.contains("PhysicalCompletionUnknown")
+        }));
+        assert!(
+            !out.diagnostics
+                .iter()
+                .any(|d| d.code == "CanceledSearchResultIgnored")
+        );
+        assert!(owner.pending_bestmove.is_none());
+        release.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        while !owner.workers[0].is_finished() {
+            assert!(Instant::now() < until);
+            thread::yield_now();
+        }
+        owner.reap_workers(true).unwrap();
+        assert!(owner.workers.is_empty());
+    }
+
+    #[test]
+    fn canceled_failure_publication_preserves_original_cause_until_owner_consumption_and_join() {
+        let (mut owner, mut session) = fixture_with_cancel_history(1);
+        owner.handle(&mut session, Event::Line("go infinite".into()));
+        let ticket = session.active_ticket().unwrap();
+        owner.handle(
+            &mut session,
+            Event::Progress {
+                ticket: ticket.clone(),
+                bestmove: "e2e4".into(),
+            },
+        );
+        let (sender, events) = mpsc::sync_channel(1);
+        let (release, waiting) = mpsc::channel();
+        let publication = Arc::new(Mutex::new(None));
+        let worker_publication = Arc::clone(&publication);
+        let shutdown_limit = owner.settings.shutdown_limit;
+        owner.workers.push(Worker {
+            handle: thread::spawn(move || {
+                waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+                finish_worker(
+                    &sender,
+                    ticket,
+                    WorkerCompletion::failed(WorkerFailureSource::Factory(
+                        injected_backend_failure(),
+                    )),
+                    &worker_publication,
+                    None,
+                    shutdown_limit,
+                )
+            }),
+            failure: Arc::clone(&publication),
+        });
+        let stopped = owner.handle(&mut session, Event::Line("stop".into()));
+        assert!(stopped.protocol.is_empty());
+        assert!(owner.pending_bestmove.is_some());
+        release.send(()).unwrap();
+        let event = events.recv_timeout(Duration::from_secs(2)).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        while !owner.workers[0].is_finished() {
+            assert!(Instant::now() < until);
+            thread::yield_now();
+        }
+        assert!(publication.lock().unwrap().is_some());
+        owner.reap().unwrap();
+        assert_eq!(
+            owner.workers.len(),
+            1,
+            "unconsumed failed publication retains its slot"
+        );
+        let out = owner.handle(&mut session, event);
+        assert_eq!(out.protocol, ["bestmove e2e4"]);
+        assert!(out.diagnostics.iter().any(|d| {
+            d.code == "SearchFailed" && d.message.contains(injected_backend_failure().detail)
+        }));
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.code == "SharedContractError")
+        );
+        assert!(
+            !out.diagnostics
+                .iter()
+                .any(|d| d.code == "CanceledSearchResultIgnored")
+        );
+        assert!(publication.lock().unwrap().is_none());
+        assert!(owner.workers.is_empty());
+        assert!(owner.fence_failure.is_none());
     }
 
     #[test]
