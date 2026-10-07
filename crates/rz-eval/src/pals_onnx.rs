@@ -8,14 +8,14 @@ use crate::asset::{self, parse_sha256};
 use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
 use crate::onnx::{NativeLoadingProfile, NativeMappingObservation, OrtRuntime, Provider};
 use crate::pals_model::{
-    PALS_ENCODING_SCHEMA, PALS_MODEL_SCHEMA, PalsModelConfig, PalsModelInput, PalsRawOutput,
-    PalsRole, PreparedPalsTensors, V_TASK_NAMES,
+    PalsModelConfig, PalsModelInput, PalsRawOutput, PalsRole, PreparedPalsTensors,
+    PALS_ENCODING_SCHEMA, PALS_MODEL_SCHEMA, V_TASK_NAMES,
 };
 use crate::worker::{PhysicalRun, SingleWorker};
 use ort::execution_providers::{
     ArenaExtendStrategy, CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider,
 };
-use ort::session::{Session, builder::GraphOptimizationLevel};
+use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::tensor::TensorElementType;
 use ort::value::{Tensor, ValueType};
 use rz_contracts::{Digest, PrecisionProfile};
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 mod cuda_control;
@@ -3365,14 +3365,12 @@ mod tests {
         );
         let poisoned = HostRecordPageObservationHandle::new(host_page_observation_fixture());
         let other = poisoned.clone();
-        assert!(
-            std::thread::spawn(move || {
-                let _guard = other.0.latest.lock().unwrap();
-                panic!("poison metadata-only host page observation fixture");
-            })
-            .join()
-            .is_err()
-        );
+        assert!(std::thread::spawn(move || {
+            let _guard = other.0.latest.lock().unwrap();
+            panic!("poison metadata-only host page observation fixture");
+        })
+        .join()
+        .is_err());
         let snapshot = poisoned.snapshot();
         assert_eq!(snapshot.status, HostRecordPageObservationStatus::Poisoned);
         assert!(snapshot.latest.is_some());
@@ -3410,18 +3408,14 @@ mod tests {
         );
         assert_eq!(observed.events[1].role, PalsRole::Proposer);
         assert_eq!(observed.events[1].request_ordinal, 1);
-        assert!(
-            observed
-                .events
-                .windows(2)
-                .all(|pair| pair[0].elapsed_ns <= pair[1].elapsed_ns)
-        );
-        assert!(
-            observed
-                .events
-                .iter()
-                .all(|event| event.elapsed_ns <= observed.snapshot_elapsed_ns.unwrap())
-        );
+        assert!(observed
+            .events
+            .windows(2)
+            .all(|pair| pair[0].elapsed_ns <= pair[1].elapsed_ns));
+        assert!(observed
+            .events
+            .iter()
+            .all(|event| event.elapsed_ns <= observed.snapshot_elapsed_ns.unwrap()));
         // A late native return cannot mutate the already frozen startup view,
         // arm a new capture, or be mistaken for an observed physical fence.
         startup_return(Some(&trace), PalsStartupBackendStage::PublicRun, true);
@@ -3530,14 +3524,12 @@ mod tests {
     fn startup_stage_probe_poison_is_explicit_and_does_not_rearm() {
         let probe = PalsStartupStageProbe::new();
         let other = probe.clone();
-        assert!(
-            std::thread::spawn(move || {
-                let _held = other.shared.ledger.lock().unwrap();
-                panic!("poison metadata-only startup diagnostic fixture");
-            })
-            .join()
-            .is_err()
-        );
+        assert!(std::thread::spawn(move || {
+            let _held = other.shared.ledger.lock().unwrap();
+            panic!("poison metadata-only startup diagnostic fixture");
+        })
+        .join()
+        .is_err());
         assert!(!probe.start(Instant::now()));
         assert!(probe.begin_role(PalsRole::Proposer).is_none());
         let snapshot = probe.snapshot_and_stop();
@@ -3955,13 +3947,11 @@ mod tests {
             failure
         );
         let mut final_rejected = CudaMappingAudit::default();
-        assert!(
-            final_rejected
-                .final_audit(|| panic!(
-                    "final audit cannot require lazy provider images before first Run"
-                ))
-                .is_err()
-        );
+        assert!(final_rejected
+            .final_audit(|| panic!(
+                "final audit cannot require lazy provider images before first Run"
+            ))
+            .is_err());
         final_rejected.after_run(true, || Ok(())).unwrap();
         let failure = final_rejected
             .final_audit(|| {
