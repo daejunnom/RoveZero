@@ -215,6 +215,9 @@ impl NativeWarmState {
             .lock()
             .map_or(true, |owner| owner.is_some())
     }
+    // Keep the original request identity, Rules snapshot and two independent
+    // cancellation authorities explicit at this ownership boundary.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &self,
         id: RequestId,
@@ -537,7 +540,10 @@ impl NativeWarmState {
         }
     }
     pub fn reset_after_known_fence(&self, game: u64) -> Result<(), RoleError> {
-        if self.is_closed() {
+        // Production calls this only after its actual worker NewGame Ready.
+        // A logical final-control rejection with a successfully revoked seed
+        // is recoverable; an unknown physical owner/pin remains quarantined.
+        if self.is_quarantined() {
             return Err(RoleError::PhysicalCompletionUnknown);
         }
         self.reject_output(None);
@@ -546,6 +552,7 @@ impl NativeWarmState {
         for role in &mut *frozen {
             role.clear();
         }
+        self.closed.store(false, Ordering::Release);
         Ok(())
     }
     pub fn snapshot(&self) -> Result<NativePrivateWarmObservation, RoleError> {
@@ -1105,6 +1112,38 @@ mod tests {
                 observation.last_event,
                 Some("control_changed_exact_commit_revoked_prior_seed_not_restored")
             );
+            // Known completion plus the caller's new-game fence permits a new
+            // logical game. This Rust owner fixture does not attest a native
+            // worker response; production supplies that fence before this call.
+            core.reset_after_known_fence(1).unwrap();
+            let reset = core.snapshot().unwrap();
+            assert!(!reset.admission_closed && !reset.quarantined);
+            assert_eq!(reset.game_generation, 1);
+            assert_eq!(reset.frozen_contexts_per_role, [0, 0]);
+            let next_cancel = AtomicBool::new(false);
+            let mut next_context = context.clone();
+            next_context.game_generation = 1;
+            next_context.search_generation += 1;
+            next_context.situation.generation += 1;
+            let fresh = core
+                .begin(prepared(
+                    &core,
+                    &position,
+                    &next_context,
+                    3,
+                    &next_cancel,
+                    until,
+                ))
+                .unwrap();
+            assert!(matches!(
+                fresh.invocation().unwrap(),
+                PrivateInvocation::Fresh { .. }
+            ));
+            core.completed(fresh, None).unwrap();
+            let fresh_result = core.snapshot().unwrap();
+            assert_eq!(fresh_result.known_seed_completions, 3);
+            assert_eq!(fresh_result.accepted_seeds, 2);
+            assert_eq!(fresh_result.revoked_seeds, 1);
         }
     }
     #[test]

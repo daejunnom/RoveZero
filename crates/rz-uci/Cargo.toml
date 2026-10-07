@@ -21,6 +21,10 @@ required-features = ["onnx-cpu"]
 name = "pals_cpu_task"
 required-features = ["search-work-receipts"]
 
+[[example]]
+name = "pals_private_warm_cpu_check"
+required-features = ["onnx-cpu"]
+
 [features]
 experimental-batch = ["rz-search/experimental-batch", "rz-eval/experimental-batch"]
 experimental-io-buffers = ["rz-eval/experimental-io-buffers"]
