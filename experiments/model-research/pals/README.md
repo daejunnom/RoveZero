@@ -184,6 +184,21 @@ candidates에는 한 개의 false-mask padding만 둡니다. 정책·WDL·task·
 감독 mask는 모두 false입니다. 원래 native raw logits는 정답으로 사용하지 않습니다.
 이 접점의 실제 frozen CPU C 대조도 ranking·수선 성공·학습·기력 인수와 구분합니다.
 
+`repair_context`는 strict ordinary dataset의 현재 native Propose root와 최초
+Repair decision을 연결합니다. 원래 true-learning prepared journal·tensor·lineage·
+물리 완료·탐색 소비와 두 Rust Rules-only capability를 확인하고, counterexample의
+첫 상대 응답이 proposal과 다르며 그 prefix가 실제 Repair 상태·이력·합법 수 순서에
+도달하는지 검사합니다. `checked_existing_prepared_lineage`는 기존 기록을 현재
+검사한 provenance이며 과거 before-dispatch descriptor로 표현하지 않습니다.
+
+`bind_repair_candidate_pairs`는 같은 strict parent의 정확한 Repair current input에
+대한 기존 proposer 후보 비교만 연결합니다. 부분 결과의 mask·관점·sign은 유지하고
+all-masked 비교를 양의 준비 성공으로 바꾸지 않습니다. `frozen_repair_preparation`은
+전후 CPU FP32·전체 module eval·gradient 부재·autocast 비활성·parameter digest를
+검사하면서 기존 softplus ordinal loss를 소비합니다. 이번 목표는 다음 Repair 수의
+조건부 ordinal 준비이며 전략적 수선 성공·counterexample 유효성·WDL·C divergence
+ranking이나 학습 update를 인수하지 않습니다.
+
 FLOPs 보고는 FMA=2 기준의 실제 선언 shape에 따른 matrix product 산술입니다.
 encoder와 role 반복 비용을 구분하고 cached memory를 호출마다 중복 계산하지 않습니다.
 softmax·RMSNorm·SwiGLU activation·lookup·이동·CPU 탐색과 backward는 제외 사실을

@@ -1109,6 +1109,46 @@ Torch RSS/cgroup peak와 VRAM peak는 unknown이다. 논리 자료는
 새 descriptor의 실제 fresh collection 소비·C 이탈 ranking·P 수선의 인과/비교 목표·
 완전한 external helper pair는 이 legacy-input 대조만으로 완료되지 않는다.
 
-소스 b7bdb5의 [CI 37692482991](https://github.com/daejunnom/RoveZero/actions/runs/37692482991)는
+소스 `ab7bdb5`의 [CI 37692482991](https://github.com/daejunnom/RoveZero/actions/runs/37692482991)는
 Linux·Windows·CPU bindings·model CPU 네 job 모두 실제 성공했다. 마지막 Windows job은
 2026-10-07 21:59:30 UTC에 완료됐다. 다음 Repair 구현의 검사와 별개다.
+
+### 최초 Repair 입력의 인과 연결과 후보 비교 준비
+
+`repair_context.py`는 strict ordinary dataset에 이미 인수된 current native Propose
+root와 최초 Repair decision의 별도 immutable capability를 추가한다. 원래 capture의
+source·export·launch·prepared journal·입력·sidecar·lineage·물리 출력·탐색 소비를
+독립 pin으로 검사한다. 같은 producer 요구는 이 root→Repair 인과 연결에만 적용하며
+game 전체에 같은 모델을 강제하지 않는다. auxiliary false-learning 입력이나 물리
+완료만 된 응답은 이 current Repair 입력을 대신할 수 없다.
+
+두 Rust Rules-only capability는 root proposal의 합법성과 counterexample prefix가
+실제 Repair 상태·이력·FEN·차례·보드·합법 수 순서에 도달하는지를 각각 확인한다.
+첫 상대 응답은 원래 proposal의 같은 ply와 달라야 한다. Python에서 체스 Rules를
+재구현하지 않으며 원시 CPU 점수·native prediction·`search_consumed`를 수선 성공의
+증명으로 사용하지 않는다. Context provenance는 `checked_existing_prepared_lineage`다.
+후속 `CheckedComparativePairs`는 같은 parent의 정확한 Repair input SHA·row index·
+proposer role에만 연결하고, 기존 next-move ordinal 관점·sign·partial mask를 유지한다.
+
+root56의 집중 CPU 검사 18개는 15 PASS / 3 errors였다. 새 fixture가 Repair 후보를
+바꾸면서 overlay restriction에 이전 후보를 남긴 것이 원인이었다. 원래 실패 자료를
+보존하고 fixture만 맞췄으며 기존 comparative validator를 완화하지 않았다. 별도
+독립 검토에서 forward 후 frozen 모델의 eval·requires-grad 플래그를 재확인하지
+않는 누락을 발견했다. 전후 공통 `frozen_digest()`로 module eval·CPU/CUDA autocast
+비활성·requires-grad false·gradient 부재·유한한 CPU FP32 bytes를 다시 검사한다.
+같은 parameter bytes를 유지하며 `train()` 또는 `requires_grad_(True)`로 바꾸는
+두 음성 사례를 추가했다.
+
+수정 후 root57의 CPU fixture 20개가 모두 통과했다. 최종 source SHA-256은
+`96ad2df260918de323637a28673e7ba8e1e79c261243ddb9d1cbf9608ac56829`, test SHA-256은
+`a3b55668c229d3e735db559d1a8fbecb7247327759c2f6657a154c4e5a955dc8`다. 최종 freeze의
+독립 재검토에서 추가 must-fix는 없었다. CPU 0/2·memory.high 6GiB/max 12GiB·swap 0·
+pids 128을 실행 전에 확인했고 managed scratch의 종료·제거가 verified였다.
+root56의 18개와 root57의 20개는 겹치는 suite이며 고유 검사 수로 합산하지 않는다.
+
+이 fixture는 실제 strict·semantic·candidate factory를 소비하지만 source·launch·
+Rules·native 출력은 합성 자료다. 실제 fresh child/모델/수집의 성공으로 보고하지 않는다.
+양의 frozen ordinal loss도 strategic repair validity·counterexample validity·WDL·
+divergence ranking·학습·기력 인수와 구분한다. 원시 자료는 관리 루트의
+`runs/pals/continuation-cpu-check-03/repair-model-tests-56.log`와
+`repair-model-tests-57.log`에 보존하며 GPU 검증은 계속 보류한다.
