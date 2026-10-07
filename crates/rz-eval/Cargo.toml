@@ -55,6 +55,10 @@ name = "inference_bench"
 required-features = ["onnx"]
 
 [[example]]
+name = "pals_model_check"
+required-features = ["onnx", "contracts"]
+
+[[example]]
 name = "ort_export"
 required-features = ["experimental-ort-model"]
 
