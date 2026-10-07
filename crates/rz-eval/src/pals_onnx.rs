@@ -28,7 +28,8 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path};
 mod cuda_control;
 pub use cuda_control::{
-    PalsCudaControlPolicy, PalsCudaPlacementWitness, PalsGraphPlacement, PalsKernelWitness,
+    PalsControlTransfer, PalsControlTransferKind, PalsCudaControlPolicy, PalsCudaPlacementWitness,
+    PalsGraphOptimization, PalsGraphPlacement, PalsKernelWitness,
 };
 
 const MAX_MANIFEST_BYTES: usize = 128 * 1024;
@@ -786,6 +787,13 @@ fn validate_session(
     }
     Ok(())
 }
+fn session_optimization(config: PalsOnnxConfig, explicit_control: bool) -> PalsGraphOptimization {
+    if explicit_control && matches!(config.provider, Provider::Cuda { .. }) {
+        PalsGraphOptimization::Disable
+    } else {
+        PalsGraphOptimization::Level1
+    }
+}
 fn load_session(
     bytes: Vec<u8>,
     config: PalsOnnxConfig,
@@ -815,7 +823,12 @@ fn load_session(
         .map_err(configure)?
         .with_memory_pattern(false)
         .map_err(configure)?
-        .with_optimization_level(GraphOptimizationLevel::Level1)
+        // Explicit control v2 is separately attested. Disabling graph rewrites
+        // keeps named source metadata chains; strict CUDA and CPU retain L1.
+        .with_optimization_level(match session_optimization(config, audit.is_some()) {
+            PalsGraphOptimization::Disable => GraphOptimizationLevel::Disable,
+            PalsGraphOptimization::Level1 => GraphOptimizationLevel::Level1,
+        })
         .map_err(configure)?;
     builder = match config.provider {
         Provider::Cpu => builder
@@ -1503,6 +1516,9 @@ impl PalsOnnxBackend {
     }
     pub fn config(&self) -> PalsOnnxConfig {
         self.config
+    }
+    pub fn graph_optimization(&self) -> PalsGraphOptimization {
+        session_optimization(self.config, self.cuda_control_audit.is_some())
     }
     pub fn verify_runtime(&self) -> Result<(), BackendError> {
         if matches!(self.config.provider, Provider::Cuda { .. }) {
@@ -2445,6 +2461,35 @@ mod device {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_cuda_control_disables_rewrites_without_changing_cpu_or_strict_cuda() {
+        let cpu = PalsOnnxConfig::cpu();
+        assert_eq!(
+            session_optimization(cpu, false),
+            PalsGraphOptimization::Level1
+        );
+        assert_eq!(
+            session_optimization(cpu, true),
+            PalsGraphOptimization::Level1
+        );
+        let mut cuda = cpu;
+        cuda.provider = Provider::Cuda {
+            device_id: 0,
+            arena_bytes: 2 * 1024 * 1024 * 1024,
+        };
+        assert_eq!(
+            session_optimization(cuda, false),
+            PalsGraphOptimization::Level1
+        );
+        assert_eq!(
+            session_optimization(cuda, true),
+            PalsGraphOptimization::Disable
+        );
+        assert_eq!(
+            serde_json::to_value(PalsGraphOptimization::Disable).unwrap(),
+            "disable"
+        );
+    }
     use crate::pals_model::{PalsCandidateToken, PalsRecordToken};
     fn input() -> PalsModelInput {
         PalsModelInput {

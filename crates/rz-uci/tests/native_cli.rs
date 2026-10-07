@@ -1,5 +1,5 @@
 //! Provider and asset arguments must be rejected safely before UCI starts.
-//! This exercises argument admission only; it does not load models or prove inference.
+//! Build-capability registration and argument admission do not load models or prove inference.
 
 use std::{
     io::{self, Read},
@@ -95,6 +95,53 @@ fn rejected(arguments: &[&str]) -> (ExitStatus, String, String) {
         String::from_utf8(output).expect("ASCII protocol"),
         String::from_utf8(diagnostic).expect("public UTF-8 startup error"),
     )
+}
+
+#[test]
+fn build_capability_json_exactly_registers_this_feature_and_target_build_without_loading() {
+    let (status, output, diagnostic) = rejected(&["--build-capabilities-json"]);
+    assert!(
+        status.success(),
+        "capability registration failed: {diagnostic}"
+    );
+    assert!(diagnostic.is_empty());
+    let expected = format!(
+        "{{\"schema\":\"rz-uci-build-capability/1\",\"target_os\":\"{}\",\"target_arch\":\"{}\",\"package_version\":\"{}\",\"compile_features\":{{\"onnx_cpu\":{},\"onnx_cuda\":{},\"experimental_io_binding\":{}}},\"cuda_path_compiled\":{},\"native_runtime_loaded\":false,\"native_model_loaded\":false}}\n",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        env!("CARGO_PKG_VERSION"),
+        cfg!(feature = "onnx-cpu"),
+        cfg!(feature = "onnx-cuda"),
+        cfg!(feature = "experimental-io-binding"),
+        cfg!(all(feature = "onnx-cuda", target_os = "linux")),
+    );
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn build_capability_mode_rejects_all_additional_arguments_without_provider_or_mock_fallback() {
+    for arguments in [
+        vec!["--build-capabilities-json", "--cpu-mock"],
+        vec!["--build-capabilities-json", "--onnx-cpu"],
+        vec!["--onnx-cuda", "--build-capabilities-json"],
+        vec!["--search=pals", "--build-capabilities-json"],
+        vec!["--build-capabilities-json", "--build-capabilities-json"],
+        vec![
+            "--build-capabilities-json",
+            "--pals-export-manifest=private-asset-marker/manifest.json",
+        ],
+    ] {
+        let (status, output, diagnostic) = rejected(&arguments);
+        assert_eq!(status.code(), Some(2));
+        assert!(
+            output.is_empty(),
+            "mixed registration mode emitted engine output"
+        );
+        assert!(diagnostic.contains("must be the only argument"));
+        assert!(diagnostic.contains("no runtime, model or engine was started"));
+        assert!(!diagnostic.contains("private-asset-marker"));
+        assert!(diagnostic.len() <= 512);
+    }
 }
 
 #[test]

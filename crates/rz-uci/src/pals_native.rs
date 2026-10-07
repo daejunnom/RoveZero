@@ -491,8 +491,8 @@ mod native {
     use rz_eval::error::BackendError;
     use rz_eval::pals_model::PALS_ENCODING_SCHEMA;
     use rz_eval::pals_onnx::{
-        PalsBackendStats, PalsCudaControlPolicy, PalsCudaPlacementWitness, PalsNativeCommand,
-        PalsNativeResult, PalsOnnxBackend, PalsSessionResidency,
+        PalsBackendStats, PalsCudaControlPolicy, PalsCudaPlacementWitness, PalsGraphOptimization,
+        PalsNativeCommand, PalsNativeResult, PalsOnnxBackend, PalsSessionResidency,
     };
     use rz_eval::worker::{PhysicalLease, PhysicalPoll, SingleWorker};
     use rz_position::contracts::ContractPosition;
@@ -749,6 +749,7 @@ mod native {
                 placements.next().is_none()
                     && placement.assigned_nodes > 0
                     && placement.cuda_nodes > 0
+                    && placement.optimization == PalsGraphOptimization::Disable
                     && placement
                         .cuda_nodes
                         .checked_add(placement.approved_cpu_control_nodes)
@@ -763,11 +764,14 @@ mod native {
             || witness.manifest_sha256 != manifest
             || witness.runtime_sha256 != execution.runtime_sha256
             || execution.runtime_bundle_sha256 != Some(witness.runtime_bundle_sha256)
-            || witness.schema != "rovezero.pals-cuda-metadata-control.v1"
+            || witness.schema != "rovezero.pals-cuda-metadata-control.v2"
+            || witness.optimization != PalsGraphOptimization::Disable
             || !matching_graphs
             || witness.public.cuda_kernels == 0
+            || witness.public.cuda_transfer_kernels != 0
             || witness.public.neural_kernels == 0
             || witness.shared_pc.cuda_kernels == 0
+            || witness.shared_pc.cuda_transfer_kernels > witness.shared_pc.cuda_kernels
             || witness.shared_pc.proposer_private_kernels == 0
             || witness.shared_pc.critic_private_kernels == 0
         {
@@ -2320,17 +2324,19 @@ mod native {
             let kernels = PalsKernelWitness {
                 profile_sha256: [5; 32],
                 cuda_kernels: 2,
+                cuda_transfer_kernels: 0,
                 approved_cpu_control_kernels: 1,
                 neural_kernels: 2,
                 proposer_private_kernels: 1,
                 critic_private_kernels: 1,
             };
             let mut witness = PalsCudaPlacementWitness {
-                schema: "rovezero.pals-cuda-metadata-control.v1".into(),
+                schema: "rovezero.pals-cuda-metadata-control.v2".into(),
                 inventory_sha256: [3; 32],
                 manifest_sha256: [6; 32],
                 runtime_sha256: [1; 32],
                 runtime_bundle_sha256: [2; 32],
+                optimization: PalsGraphOptimization::Disable,
                 initialization: ["public", "shared_pc"]
                     .into_iter()
                     .map(|role| PalsGraphPlacement {
@@ -2340,6 +2346,8 @@ mod native {
                         assigned_nodes: 3,
                         cuda_nodes: 2,
                         approved_cpu_control_nodes: 1,
+                        optimization: PalsGraphOptimization::Disable,
+                        approved_transfers: Vec::new(),
                         recursive_coverage: "synthetic-boundary-test".into(),
                     })
                     .collect(),
@@ -2353,6 +2361,11 @@ mod native {
             assert!(
                 validate_startup_cuda_witness(&witness, &execution, [8; 32], &residency).is_err()
             );
+            witness.optimization = PalsGraphOptimization::Level1;
+            assert!(
+                validate_startup_cuda_witness(&witness, &execution, [6; 32], &residency).is_err()
+            );
+            witness.optimization = PalsGraphOptimization::Disable;
             witness.shared_pc.critic_private_kernels = 0;
             assert!(
                 validate_startup_cuda_witness(&witness, &execution, [6; 32], &residency).is_err()

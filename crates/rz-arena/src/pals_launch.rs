@@ -10,10 +10,16 @@ use crate::{
 use rz_experiments::{
     ArtifactRef, EngineEnvironmentV2, ExternalSourceV2, ExternalUciEndpointV2, HistoryCompleteness,
     InitialPosition, ManifestError, NativeEngineRole, NativeGameClockV3, NativePairClock,
-    NativeResourceBudgetV1, NativeTimeoutsV1, OpeningSpec, PALS_RECEIPT_V3_DOMAIN,
-    PalsEndpointReceiptV3, PalsEngineV3, PalsGameReceiptV3, PalsInputLockV3, PalsModelBackendV3,
-    PalsObservedV3, PalsOptionReceiptV3, PalsPhysicalStateV3, PalsPrecisionV3, PalsResultV3,
-    PalsRunFailureV3, PalsRunReceiptV3, PalsTerminationV3, PalsWeightIdentityV3, ToolIdentity,
+    NativeResourceBudgetV1, NativeTimeoutsV1, OpeningSpec, PalsEngineV3, PalsInputLockV3,
+    PalsModelBackendV3, PalsPrecisionV3, PalsRunReceiptV3, PalsWeightIdentityV3, ToolIdentity,
+};
+#[cfg(target_os = "linux")]
+use rz_experiments::{
+    PALS_RECEIPT_V3_DOMAIN, PalsGameReceiptV3, PalsResultV3, PalsRunFailureV3, PalsTerminationV3,
+};
+#[cfg(any(target_os = "linux", test))]
+use rz_experiments::{
+    PalsEndpointReceiptV3, PalsObservedV3, PalsOptionReceiptV3, PalsPhysicalStateV3,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,6 +42,7 @@ pub const PALS_CLOCK_REAP_RUNNER_SHA256: &str =
     "29e89312bc4ec16a32ec185d8b53c60b0cdbad17eaac294f987491e36b8d29ff";
 pub const PALS_CLOCK_REAP_RUNNER_BYTES: u64 = 2466608;
 const MAX_JSON_BYTES: usize = 256 * 1024;
+const MAX_CONTROL_INVENTORY_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -130,6 +137,14 @@ pub struct PalsOnnxCudaLaunchV3 {
     pub cuda_bundle: rz_experiments::CudaBundleBindingV1,
     pub device_id: i32,
     pub session_arena_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_control: Option<PalsCudaControlBindingV3>,
+}
+/// Explicit reviewed metadata inventory; it does not declare GPU success.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsCudaControlBindingV3 {
+    pub inventory: ArtifactRef,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(
@@ -354,6 +369,7 @@ impl PalsArenaLaunchV3 {
             _ => Err(invalid("runner patch hash/bytes not registered")),
         }
     }
+    #[cfg(any(target_os = "linux", test))]
     fn require_reap_status_runner(&self) -> Result<(), ArenaError> {
         require(
             self.runner_status_patch()? == PalsRunnerStatusPatchV3::ClockAndReapStatus
@@ -362,6 +378,7 @@ impl PalsArenaLaunchV3 {
             "new PALS execution/Core requires the registered clock+reap-status patch and actual runner binary; legacy evidence is preserved without promotion",
         )
     }
+    #[cfg(any(target_os = "linux", test))]
     fn require_actual_native_epoch(&self) -> Result<(), ArenaError> {
         for (engine, recipe) in self
             .semantic_lock
@@ -400,6 +417,18 @@ impl PalsArenaLaunchV3 {
                         .iter()
                         .map(|g| (&g.artifact, format!("{namespace}/{}", g.file))),
                 );
+            }
+            if let Some(control) = recipe
+                .cuda_model()
+                .and_then(|cuda| cuda.cuda_control.as_ref())
+            {
+                result.push((
+                    &control.inventory,
+                    format!(
+                        "pals-control-{}/inventory.v2.json",
+                        control.inventory.sha256
+                    ),
+                ));
             }
         }
         result
@@ -441,6 +470,9 @@ impl PalsArenaLaunchV3 {
                     result.extend([&n.export, &n.runtime, &cuda.cuda_bundle.manifest]);
                     result.extend(n.graphs.iter().map(|g| &g.artifact));
                     result.extend(cuda.cuda_bundle.files.iter().map(|f| &f.artifact));
+                    if let Some(control) = &cuda.cuda_control {
+                        result.push(&control.inventory);
+                    }
                 }
                 PalsEndpointLaunchV3::ReferenceUci {
                     environment: Some(e),
@@ -627,6 +659,24 @@ impl PalsArenaLaunchV3 {
                         ),
                         "--pals-device-public-memory=false".into(),
                     ]);
+                    if let Some(control) = &cuda.cuda_control {
+                        control.inventory.validate()?;
+                        require_public_artifact(&control.inventory)?;
+                        require(
+                            (1..=MAX_CONTROL_INVENTORY_BYTES).contains(&control.inventory.bytes),
+                            "CUDA control inventory must have a finite one-MiB input bound",
+                        )?;
+                        let index = assets.len();
+                        assets.push(control.inventory.clone());
+                        args.extend([
+                            "--pals-cuda-control-mode=inventory-v2".into(),
+                            format!("--pals-cuda-control-inventory={{{{asset:{index}}}}}"),
+                            format!(
+                                "--pals-cuda-control-inventory-sha256={}",
+                                control.inventory.sha256
+                            ),
+                        ]);
+                    }
                 }
                 (
                     &e.binary,
@@ -955,6 +1005,74 @@ impl LockedPalsArenaLaunchV3 {
         )?;
         Ok(())
     }
+    fn validate_control_inventory(
+        &self,
+        role: NativeEngineRole,
+        bytes: &[u8],
+    ) -> Result<(), ArenaError> {
+        let cuda = self.input.endpoints[role_index(role)]
+            .cuda_model()
+            .ok_or_else(|| invalid("endpoint has no CUDA recipe"))?;
+        let control = cuda
+            .cuda_control
+            .as_ref()
+            .ok_or_else(|| invalid("endpoint has no registered control inventory"))?;
+        require(
+            bytes.len() as u64 == control.inventory.bytes
+                && bytes.len() as u64 <= MAX_CONTROL_INVENTORY_BYTES
+                && digest(bytes) == control.inventory.sha256,
+            "control inventory byte/hash differs",
+        )?;
+        let value = json(bytes)?;
+        require(
+            value["schema"] == "rovezero.pals-static-control-inventory.v2"
+                && value["scope"] == "read_only_serialized_graph_metadata_no_runtime"
+                && value["manifest_sha256"] == cuda.model.export.sha256
+                && value["actual_provider_placement"] == "not_observed"
+                && value["cpu_allowlist"] == "not_created"
+                && (1..=5000).contains(&count(&value, "total_nodes")?),
+            "registered control inventory metadata differs",
+        )?;
+        let graphs = value["graphs"]
+            .as_array()
+            .ok_or_else(|| invalid("control inventory graph list missing"))?;
+        require(
+            graphs.len() == 2
+                && cuda.model.graphs.iter().all(|declared| {
+                    graphs
+                        .iter()
+                        .filter(|g| {
+                            g["role"] == declared.role && g["sha256"] == declared.artifact.sha256
+                        })
+                        .count()
+                        == 1
+                }),
+            "control inventory is not the pinned public/shared-P/C graph pair",
+        )
+    }
+    fn cuda_profile_argument(
+        &self,
+        role: NativeEngineRole,
+        runtime_root: &Path,
+    ) -> Result<Option<OsString>, ArenaError> {
+        if self.input.endpoints[role_index(role)]
+            .cuda_model()
+            .and_then(|cuda| cuda.cuda_control.as_ref())
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let path = runtime_root
+            .to_str()
+            .ok_or_else(|| invalid("CUDA profile parent is not UTF-8"))?;
+        require(
+            runtime_root.is_absolute() && path.len() <= 4096 && !path.chars().any(char::is_control),
+            "CUDA profile parent must be a bounded owned absolute runtime root",
+        )?;
+        // Fastchess reuses argv between games. The UCI child derives an
+        // exclusive PID+nonce directory here for each preflight/game process.
+        Ok(Some(format!("--pals-cuda-profile-parent={path}").into()))
+    }
 }
 impl crate::native_launch::sealed::Sealed for LockedPalsArenaLaunchV3 {}
 impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
@@ -1081,7 +1199,7 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
                 .into(),
             ]);
         }
-        Ok(vec![
+        let mut arguments = vec![
             format!("--pals-output-root={root}").into(),
             format!("--pals-launch-sha256={}", self.sha256).into(),
             format!(
@@ -1090,7 +1208,11 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
             )
             .into(),
             pals_shared_runtime_argument()?,
-        ])
+        ];
+        if let Some(profile) = self.cuda_profile_argument(role, runtime_root)? {
+            arguments.push(profile);
+        }
+        Ok(arguments)
     }
     fn preflight_arguments(
         &self,
@@ -1107,7 +1229,11 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
             runtime_root.is_absolute(),
             "preflight cache root must be absolute",
         )?;
-        Ok(vec![pals_shared_runtime_argument()?])
+        let mut arguments = vec![pals_shared_runtime_argument()?];
+        if let Some(profile) = self.cuda_profile_argument(role, runtime_root)? {
+            arguments.push(profile);
+        }
+        Ok(arguments)
     }
 }
 
@@ -1130,8 +1256,163 @@ pub struct PalsNativeSessionAuditV3 {
     pub startup_role_inputs_completed: u64,
     pub startup_probe: Option<serde_json::Value>,
     pub execution: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cuda_placement: Option<PalsCudaPlacementAuditV3>,
     pub raw_native: serde_json::Value,
     pub raw_search_work: serde_json::Value,
+}
+/// Compact validated linkage; the original typed producer witness remains in
+/// startup_probe. Device index is the exercised producer's configured index,
+/// never a physical GPU UUID/model-name or VRAM-peak observation.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct PalsCudaPlacementAuditV3 {
+    pub inventory_sha256: String,
+    pub public_profile_sha256: String,
+    pub shared_pc_profile_sha256: String,
+    pub public_neural_kernels: u64,
+    pub proposer_private_kernels: u64,
+    pub critic_private_kernels: u64,
+    pub device_id: i32,
+}
+fn validate_cuda_placement_witness(
+    cuda: &PalsOnnxCudaLaunchV3,
+    witness: &serde_json::Value,
+) -> Result<Option<PalsCudaPlacementAuditV3>, ArenaError> {
+    let Some(control) = &cuda.cuda_control else {
+        require(
+            witness.is_null(),
+            "strict CUDA cannot claim an unregistered control-policy witness",
+        )?;
+        return Ok(None);
+    };
+    require(
+        witness.is_object()
+            && witness["schema"] == "rovezero.pals-cuda-metadata-control.v2"
+            && witness["optimization"] == "disable"
+            && witness["category_provenance"]
+                == "rc10-category-unavailable-id-location-message-used"
+            && array_hash(&witness["inventory_sha256"])? == control.inventory.sha256
+            && array_hash(&witness["manifest_sha256"])? == cuda.model.export.sha256
+            && array_hash(&witness["runtime_sha256"])? == cuda.model.runtime.sha256
+            && array_hash(&witness["runtime_bundle_sha256"])? == cuda.cuda_bundle.canonical_sha256,
+        "CUDA placement witness does not match the registered control/model/runtime source",
+    )?;
+    let graphs = witness["initialization"]
+        .as_array()
+        .ok_or_else(|| invalid("CUDA pre-Run graph coverage absent"))?;
+    require(
+        graphs.len() == 2,
+        "CUDA pre-Run witness requires two physical graphs",
+    )?;
+    for declared in &cuda.model.graphs {
+        let entries: Vec<_> = graphs
+            .iter()
+            .filter(|g| g["role"] == declared.role)
+            .collect();
+        require(
+            entries.len() == 1,
+            "CUDA graph placement duplicated or missing",
+        )?;
+        let g = entries[0];
+        let assigned = count(g, "assigned_nodes")?;
+        let gpu = count(g, "cuda_nodes")?;
+        let cpu = count(g, "approved_cpu_control_nodes")?;
+        require(
+            array_hash(&g["graph_sha256"])? == declared.artifact.sha256
+                && hash(&array_hash(&g["log_sha256"])?)
+                && (1..=5000).contains(&assigned)
+                && gpu > 0
+                && gpu.checked_add(cpu) == Some(assigned)
+                && g["optimization"] == "disable"
+                && g["recursive_coverage"]
+                    == "ort-1.22-finalize-recursive-exact-named-provider-coverage-before-first-run",
+            "CUDA placement lacks complete pinned pre-Run node coverage",
+        )?;
+        let transfers = g["approved_transfers"]
+            .as_array()
+            .ok_or_else(|| invalid("CUDA placement transfer declaration absent"))?;
+        require(
+            transfers.len() <= if declared.role == "shared_pc" { 1 } else { 0 },
+            "CUDA placement permits only the pinned shared-P/C scalar transfer",
+        )?;
+        for transfer in transfers {
+            let conditions = transfer["host_condition_nodes"]
+                .as_array()
+                .ok_or_else(|| invalid("CUDA transfer condition source absent"))?;
+            let names: Option<BTreeSet<_>> = conditions.iter().map(|v| v.as_str()).collect();
+            require(
+                transfer["kind"] == "bool_scalar_host_to_device"
+                    && array_hash(&transfer["graph_sha256"])? == declared.artifact.sha256
+                    && transfer["source_scope"] == "shared_pc"
+                    && transfer["runtime_graph_name"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty() && s.len() <= 256)
+                    && transfer["node_name"] == "Memcpy"
+                    && transfer["opcode"] == "MemcpyFromHost"
+                    && transfer["provider"] == "CUDAExecutionProvider"
+                    && transfer["source_value"] == "role_is_critic"
+                    && transfer["source_dtype"] == "BOOL"
+                    && transfer["source_shape"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty)
+                    && transfer["destination_node"] == "output_is_critic"
+                    && transfer["destination_opcode"] == "Identity"
+                    && transfer["destination_input_index"] == 0
+                    && transfer["destination_output"] == "is_critic"
+                    && names.is_some_and(|n| {
+                        n.len() == 6 && n.iter().all(|s| !s.is_empty() && s.len() <= 256)
+                    })
+                    && conditions.len() == 6
+                    && transfer["provenance"]
+                        == "ort-1.22-disable-source-io-addcopy-origin-single-recursive-cuda-transfer",
+                "CUDA generated transfer differs from pinned scalar source evidence",
+            )?;
+        }
+    }
+    let public = &witness["public"];
+    let pc = &witness["shared_pc"];
+    for kernels in [public, pc] {
+        require(
+            (1..=20_000).contains(&count(kernels, "cuda_kernels")?)
+                && count(kernels, "cuda_transfer_kernels")? <= count(kernels, "cuda_kernels")?
+                && count(kernels, "approved_cpu_control_kernels")? <= 20_000,
+            "CUDA selected-kernel counts are absent or unbounded",
+        )?;
+    }
+    let public_neural = count(public, "neural_kernels")?;
+    let proposer = count(pc, "proposer_private_kernels")?;
+    let critic = count(pc, "critic_private_kernels")?;
+    let pc_cuda = count(pc, "cuda_kernels")?;
+    let pc_neural = count(pc, "neural_kernels")?;
+    require(
+        public_neural > 0
+            && count(public, "cuda_transfer_kernels")? == 0
+            && public_neural <= count(public, "cuda_kernels")?
+            && proposer > 0
+            && critic > 0
+            && pc_neural > 0
+            && (count(pc, "cuda_transfer_kernels")? == 0
+                || graphs.iter().any(|g| {
+                    g["role"] == "shared_pc"
+                        && g["approved_transfers"]
+                            .as_array()
+                            .is_some_and(|v| v.len() == 1)
+                }))
+            && pc_neural
+                .checked_add(count(pc, "cuda_transfer_kernels")?)
+                .is_some_and(|n| n <= pc_cuda)
+            && proposer.checked_add(critic).is_some_and(|n| n <= pc_neural),
+        "CUDA witness must exercise public NN and both selected private P/C branches",
+    )?;
+    Ok(Some(PalsCudaPlacementAuditV3 {
+        inventory_sha256: control.inventory.sha256.clone(),
+        public_profile_sha256: array_hash(&public["profile_sha256"])?,
+        shared_pc_profile_sha256: array_hash(&pc["profile_sha256"])?,
+        public_neural_kernels: public_neural,
+        proposer_private_kernels: proposer,
+        critic_private_kernels: critic,
+        device_id: cuda.device_id,
+    }))
 }
 impl NativeProviderDeclaration for LockedPalsArenaLaunchV3 {
     type Audit = PalsNativeSessionAuditV3;
@@ -1384,6 +1665,7 @@ pub fn validate_pals_native_records(
     let sn = &s["native"];
     let tn = &t["native"];
     let mut startup_nn = (0, 0, 0);
+    let mut cuda_placement = None;
     if let Some(cuda) = cuda {
         require(
             s["runtime_bundle_sha256"] == cuda.cuda_bundle.canonical_sha256,
@@ -1394,6 +1676,17 @@ pub fn validate_pals_native_records(
             "CUDA execution/probe identity changed",
         )?;
         let execution = &sn["execution"];
+        match &cuda.cuda_control {
+            Some(control) => require(
+                array_hash(&execution["cuda_control_inventory_sha256"])?
+                    == control.inventory.sha256,
+                "CUDA loaded control-policy identity differs",
+            )?,
+            None => require(
+                execution["cuda_control_inventory_sha256"].is_null(),
+                "strict CUDA cannot claim a control-policy identity",
+            )?,
+        }
         require(
             execution["provider"] == "cuda"
                 && execution["device_id"] == cuda.device_id
@@ -1421,6 +1714,7 @@ pub fn validate_pals_native_records(
             "CUDA declared budget does not cover actual tensor reservations plus session declarations",
         )?;
         let probe = &sn["startup_probe"];
+        cuda_placement = validate_cuda_placement_witness(cuda, &probe["cuda_placement_witness"])?;
         require(
             count(probe, "completed_proposer_calls")? == 1
                 && count(probe, "completed_critic_calls")? == 1
@@ -1455,6 +1749,7 @@ pub fn validate_pals_native_records(
                     && sn["execution"]["device_id"].is_null()
                     && sn["execution"]["session_arena_bytes"].is_null()
                     && sn["execution"]["runtime_bundle_sha256"].is_null()
+                    && sn["execution"]["cuda_control_inventory_sha256"].is_null()
                     && count(&sn["execution"], "transient_request_device_bytes")? == 0
                     && count(&sn["execution"], "transient_execution_device_bytes")? == 0
                     && count(&sn["execution"], "pinned_request_bytes")? == 0
@@ -1619,6 +1914,7 @@ pub fn validate_pals_native_records(
                 .as_object()
                 .map(|_| sn["startup_probe"].clone()),
             execution: sn["execution"].as_object().map(|_| sn["execution"].clone()),
+            cuda_placement,
             raw_native: tn.clone(),
             raw_search_work: t["search_work"].clone(),
         },
@@ -1993,6 +2289,7 @@ pub fn collect_pals_process_work(
     Ok(records)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn endpoint_work_receipt(
     lock: &LockedPalsArenaLaunchV3,
     role: NativeEngineRole,
@@ -2141,15 +2438,29 @@ fn endpoint_work_receipt(
                     "native role completion/search consumption differs from observed search work",
                 )?;
                 receipt.physical_state = PalsPhysicalStateV3::Completed;
-                // Provider/device declarations and a mapped-runtime audit do
-                // not observe graph node placement. Preserve Unknown until a
-                // separate actual major-NN CUDA placement witness is supplied.
+                if let Some(cuda) = lock.input.endpoints[index].cuda_model() {
+                    let observed = validate_cuda_placement_witness(
+                        cuda,
+                        &n.raw_native["startup_probe"]["cuda_placement_witness"],
+                    )?;
+                    require(
+                        observed == n.cuda_placement,
+                        "Core CUDA placement projection differs from raw startup evidence",
+                    )?;
+                    if let Some(placement) = observed {
+                        receipt.gpu_device=PalsObservedV3::Observed {
+                            value:format!("cuda:{}",placement.device_id),
+                            method:"pinned producer CUDA EP index exercised by exact pre-Run coverage and actual public/P/C neural kernel profiles; physical GPU UUID/model and VRAM peak unobserved".into(),
+                        };
+                    }
+                }
             }
         }
     }
     Ok(receipt)
 }
 
+#[cfg(target_os = "linux")]
 fn core_game_outcome(
     game: &crate::GamePgnAudit,
 ) -> Result<(PalsResultV3, PalsTerminationV3, Option<String>), ArenaError> {
@@ -2616,6 +2927,15 @@ pub fn verify_pals_launch_exports(
             file.read_to_end(&mut bytes)
                 .map_err(|e| ArenaError::Io(e.to_string()))?;
             spec.validate_cuda_bundle(role, &bytes)?;
+            if let Some(control) = &cuda.cuda_control {
+                let mut file = control
+                    .inventory
+                    .open_verified(source_root, MAX_CONTROL_INVENTORY_BYTES)?;
+                let mut bytes = Vec::with_capacity(control.inventory.bytes as usize);
+                file.read_to_end(&mut bytes)
+                    .map_err(|e| ArenaError::Io(e.to_string()))?;
+                spec.validate_control_inventory(role, &bytes)?;
+            }
         }
     }
     Ok(())
@@ -2949,6 +3269,7 @@ mod tests {
             cuda_bundle: bundle,
             device_id: 0,
             session_arena_bytes: 2 << 30,
+            cuda_control: None,
         });
         f.budget.max_runtime_bytes = 4 << 30;
         f.budget.max_artifact_bytes = 8 << 30;
@@ -2959,6 +3280,51 @@ mod tests {
             "completed_nn_inputs":public+role,"public_nn_runs_attempted":public,"role_nn_runs_attempted":role,
             "public_nn_runs_failed_known":0,"role_nn_runs_failed_known":0,"validated_public_outputs":public,
             "validated_role_outputs":role,"live_public_cache_entries":0,"new_game_resets":1})
+    }
+    fn cuda_control_fixture() -> (PalsArenaLaunchV3, Vec<u8>) {
+        let (mut f, _) = cuda_fixture();
+        let cuda = f.endpoints[0].cuda_model().unwrap();
+        // Static metadata/receipt linkage fixture, never native CUDA evidence.
+        let bytes=serde_json::to_vec(&serde_json::json!({
+            "schema":"rovezero.pals-static-control-inventory.v2",
+            "scope":"read_only_serialized_graph_metadata_no_runtime",
+            "manifest_sha256":cuda.model.export.sha256,
+            "actual_provider_placement":"not_observed","cpu_allowlist":"not_created","total_nodes":6,
+            "graphs":cuda.model.graphs.iter().map(|g|serde_json::json!({"role":g.role,"sha256":g.artifact.sha256})).collect::<Vec<_>>()
+        })).unwrap();
+        let mut inventory = asset("research/control-inventory.v2.json");
+        inventory.sha256 = digest(&bytes);
+        inventory.bytes = bytes.len() as u64;
+        let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut f.endpoints[0] else {
+            unreachable!()
+        };
+        cuda.cuda_control = Some(PalsCudaControlBindingV3 { inventory });
+        (f, bytes)
+    }
+    fn attach_control_witness(
+        lock: &LockedPalsArenaLaunchV3,
+        start: &mut serde_json::Value,
+        end: &mut serde_json::Value,
+    ) {
+        let cuda = lock.input.endpoints[0].cuda_model().unwrap();
+        let inventory = &cuda.cuda_control.as_ref().unwrap().inventory;
+        let kernels = serde_json::json!({"profile_sha256":hash_array(&"d".repeat(64)),"cuda_kernels":3,"cuda_transfer_kernels":0,
+            "approved_cpu_control_kernels":1,"neural_kernels":3,"proposer_private_kernels":1,"critic_private_kernels":1});
+        let witness = serde_json::json!({"schema":"rovezero.pals-cuda-metadata-control.v2",
+            "optimization":"disable",
+            "category_provenance":"rc10-category-unavailable-id-location-message-used",
+            "inventory_sha256":hash_array(&inventory.sha256),"manifest_sha256":hash_array(&cuda.model.export.sha256),
+            "runtime_sha256":hash_array(&cuda.model.runtime.sha256),"runtime_bundle_sha256":hash_array(&cuda.cuda_bundle.canonical_sha256),
+            "initialization":cuda.model.graphs.iter().map(|g|serde_json::json!({"role":g.role,"graph_sha256":hash_array(&g.artifact.sha256),
+                "log_sha256":hash_array(&"e".repeat(64)),"assigned_nodes":3,"cuda_nodes":2,"approved_cpu_control_nodes":1,
+                "optimization":"disable","approved_transfers":[],
+                "recursive_coverage":"ort-1.22-finalize-recursive-exact-named-provider-coverage-before-first-run"})).collect::<Vec<_>>(),
+            "public":kernels,"shared_pc":kernels});
+        for record in [start, end] {
+            record["native"]["execution"]["cuda_control_inventory_sha256"] =
+                hash_array(&inventory.sha256).into();
+            record["native"]["startup_probe"]["cuda_placement_witness"] = witness.clone();
+        }
     }
     fn hash_array(hex: &str) -> Vec<u8> {
         (0..hex.len())
@@ -3224,6 +3590,171 @@ mod tests {
         assert!(
             lock.validate_cuda_bundle(NativeEngineRole::Baseline, &wrong)
                 .is_err()
+        );
+    }
+    #[test]
+    fn pals_cuda_control_binding_preserves_strict_lock_and_owns_profile_parent() {
+        let (strict, _) = cuda_fixture();
+        let strict_lock = strict.lock().unwrap();
+        let encoded = serde_json::to_string(&strict).unwrap();
+        assert!(!encoded.contains("cuda_control"));
+        assert_eq!(
+            PalsArenaLaunchV3::from_json(&encoded)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .sha256(),
+            strict_lock.sha256()
+        );
+        let (f, bytes) = cuda_control_fixture();
+        let lock = f.lock().unwrap();
+        assert_ne!(lock.sha256(), strict_lock.sha256());
+        assert_eq!(
+            lock.input.semantic_lock.canonical_sha256,
+            strict.semantic_lock.canonical_sha256
+        );
+        lock.validate_control_inventory(NativeEngineRole::Baseline, &bytes)
+            .unwrap();
+        let external = lock
+            .engine_view(NativeEngineRole::Baseline)
+            .unwrap()
+            .external
+            .unwrap();
+        assert_eq!(external.assets.len(), 24);
+        assert!(
+            external
+                .arguments
+                .contains(&"--pals-cuda-control-mode=inventory-v2".into())
+        );
+        assert!(
+            external
+                .arguments
+                .contains(&"--pals-cuda-control-inventory={{asset:23}}".into())
+        );
+        let inventory = &f.endpoints[0]
+            .cuda_model()
+            .unwrap()
+            .cuda_control
+            .as_ref()
+            .unwrap()
+            .inventory;
+        assert!(lock.declared_inputs().contains(&inventory));
+        assert_eq!(
+            lock.snapshot_relative_path(inventory).unwrap(),
+            format!("pals-control-{}/inventory.v2.json", inventory.sha256)
+        );
+        let root = std::env::temp_dir().join("rovezero-pals-control-owned-parent");
+        let expected = OsString::from(format!("--pals-cuda-profile-parent={}", root.display()));
+        let runtime = lock
+            .runtime_arguments(NativeEngineRole::Baseline, &root)
+            .unwrap();
+        let preflight = lock
+            .preflight_arguments(NativeEngineRole::Baseline, &root)
+            .unwrap();
+        assert_eq!(runtime.len(), 5);
+        assert_eq!(preflight.len(), 2);
+        assert_eq!(runtime.last(), Some(&expected));
+        assert_eq!(preflight.last(), Some(&expected));
+        assert_eq!(runtime[3], preflight[0]); // Runtime cache stays shared outside the profile tree.
+        let mut wrong = json(&bytes).unwrap();
+        wrong["graphs"][0]["sha256"] = "0".repeat(64).into();
+        assert!(
+            lock.validate_control_inventory(
+                NativeEngineRole::Baseline,
+                &serde_json::to_vec(&wrong).unwrap()
+            )
+            .is_err()
+        );
+        let mut oversized = f;
+        let PalsEndpointLaunchV3::OnnxCuda(c) = &mut oversized.endpoints[0] else {
+            unreachable!()
+        };
+        c.cuda_control.as_mut().unwrap().inventory.bytes = MAX_CONTROL_INVENTORY_BYTES + 1;
+        assert!(oversized.lock().is_err());
+    }
+    #[test]
+    fn pals_cuda_control_witness_requires_exact_source_and_both_selected_branches() {
+        let (f, _) = cuda_control_fixture();
+        let lock = f.lock().unwrap();
+        let (mut start, mut end) = cuda_records_fixture(&lock);
+        let validate = |s: &serde_json::Value, t: &serde_json::Value| {
+            validate_pals_native_records(
+                &lock,
+                NativeEngineRole::Baseline,
+                &serde_json::to_vec(s).unwrap(),
+                &serde_json::to_vec(t).unwrap(),
+                "native-process-100",
+            )
+        };
+        assert!(validate(&start, &end).is_err()); // Origin/probe alone cannot authorize control mode.
+        attach_control_witness(&lock, &mut start, &mut end);
+        let (audit, _) = validate(&start, &end).unwrap();
+        let mut work = work_fixture("pals");
+        work["pals"]["consumed_role_outputs"] = 1.into();
+        work["pals"]["completed_proposer_calls"] = 1.into();
+        let work = PalsProcessWorkAuditV3 {
+            endpoint_id: "pals".into(),
+            process_id: 100,
+            startup_sha256: "a".repeat(64),
+            termination_sha256: "b".repeat(64),
+            startup_bytes: 100,
+            termination_bytes: 200,
+            search_work: work,
+        };
+        let core = endpoint_work_receipt(
+            &lock,
+            NativeEngineRole::Baseline,
+            Some(&work),
+            Some(&audit),
+            &preflight_fixture("pals"),
+        )
+        .unwrap();
+        assert!(
+            matches!(core.gpu_device,PalsObservedV3::Observed{ref value,..} if value=="cuda:0")
+        );
+        assert_eq!(core.vram_peak_bytes, PalsObservedV3::Unknown);
+        assert_eq!(core.nn_inputs_completed, 4); // Three startup inputs are still subtracted.
+        for field in [
+            "inventory_sha256",
+            "manifest_sha256",
+            "runtime_sha256",
+            "runtime_bundle_sha256",
+        ] {
+            let mut s = start.clone();
+            let mut t = end.clone();
+            s["native"]["startup_probe"]["cuda_placement_witness"][field] =
+                hash_array(&"0".repeat(64)).into();
+            t["native"]["startup_probe"] = s["native"]["startup_probe"].clone();
+            assert!(validate(&s, &t).is_err());
+        }
+        let mut s = start.clone();
+        let mut t = end.clone();
+        s["native"]["startup_probe"]["cuda_placement_witness"]["optimization"] = "level1".into();
+        t["native"]["startup_probe"] = s["native"]["startup_probe"].clone();
+        assert!(validate(&s, &t).is_err());
+        let mut s = start.clone();
+        let mut t = end.clone();
+        s["native"]["startup_probe"]["cuda_placement_witness"]["shared_pc"]["cuda_transfer_kernels"] =
+            1.into();
+        t["native"]["startup_probe"] = s["native"]["startup_probe"].clone();
+        assert!(validate(&s, &t).is_err()); // No source transfer was registered in this fixture.
+        let mut s = start.clone();
+        let mut t = end.clone();
+        s["native"]["startup_probe"]["cuda_placement_witness"]["shared_pc"]["critic_private_kernels"] =
+            0.into();
+        t["native"]["startup_probe"] = s["native"]["startup_probe"].clone();
+        assert!(validate(&s, &t).is_err());
+        let mut forged = audit;
+        forged.cuda_placement = None;
+        assert!(
+            endpoint_work_receipt(
+                &lock,
+                NativeEngineRole::Baseline,
+                Some(&work),
+                Some(&forged),
+                &preflight_fixture("pals")
+            )
+            .is_err()
         );
     }
     #[test]
@@ -3709,6 +4240,7 @@ mod tests {
             startup_role_inputs_completed: 0,
             startup_probe: None,
             execution: None,
+            cuda_placement: None,
             raw_native: serde_json::json!({"backend_stats_observation":"exclusive_worker_before_shutdown","observer_failures":0,"last_observer_failure":null,"frozen_epoch":1,
                 "backend_stats":{"public_nn_runs_completed":1,"role_nn_runs_completed":3,"completed_nn_inputs":4,"public_cache_hits":2,
                     "public_nn_runs_failed_known":0,"role_nn_runs_failed_known":0,"public_nn_runs_attempted":1,"role_nn_runs_attempted":3,

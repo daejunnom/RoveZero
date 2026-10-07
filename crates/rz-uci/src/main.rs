@@ -28,6 +28,15 @@ fn main() {
 }
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments: Vec<_> = std::env::args().skip(1).collect();
+    if arguments
+        .iter()
+        .any(|argument| argument == "--build-capabilities-json")
+    {
+        if arguments.len() != 1 {
+            return Err("--build-capabilities-json must be the only argument; no runtime, model or engine was started".into());
+        }
+        return print_build_capabilities();
+    }
     let work_receipts = SearchWorkOptions::take(&mut arguments)?;
     let mut search = None;
     arguments.retain(|argument| {
@@ -58,6 +67,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return run_native(arguments);
     }
     run_mock(arguments)
+}
+
+fn print_build_capabilities() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    // This branch runs before every provider/model/driver parser. These are
+    // compile-time facts and the current no-load state, never runtime/provider
+    // availability or an inference-admission/placement witness. Semver and
+    // Rust target constants are JSON-safe without the optional serde feature.
+    writeln!(
+        io::stdout().lock(),
+        "{{\"schema\":\"rz-uci-build-capability/1\",\"target_os\":\"{}\",\"target_arch\":\"{}\",\"package_version\":\"{}\",\"compile_features\":{{\"onnx_cpu\":{},\"onnx_cuda\":{},\"experimental_io_binding\":{}}},\"cuda_path_compiled\":{},\"native_runtime_loaded\":false,\"native_model_loaded\":false}}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        env!("CARGO_PKG_VERSION"),
+        cfg!(feature = "onnx-cpu"),
+        cfg!(feature = "onnx-cuda"),
+        cfg!(feature = "experimental-io-binding"),
+        cfg!(all(feature = "onnx-cuda", target_os = "linux")),
+    )?;
+    Ok(())
 }
 
 fn run_pals(
@@ -183,6 +213,14 @@ fn run_pals(
             if native.cuda_profile_root.replace(value.to_owned()).is_some() {
                 return Err("duplicate PALS CUDA profile root".into());
             }
+        } else if let Some(value) = argument.strip_prefix("--pals-cuda-profile-parent=") {
+            if native
+                .cuda_profile_parent
+                .replace(value.to_owned())
+                .is_some()
+            {
+                return Err("duplicate PALS CUDA profile parent".into());
+            }
         } else {
             return Err("PALS requires an explicit model and finite PALS flags; LC0/ORT arguments are not implicitly reused".into());
         }
@@ -257,6 +295,7 @@ struct PalsNativeOptions {
     cuda_control_inventory: Option<String>,
     cuda_control_inventory_hash: Option<String>,
     cuda_profile_root: Option<String>,
+    cuda_profile_parent: Option<String>,
 }
 impl PalsNativeOptions {
     fn any(&self) -> bool {
@@ -278,6 +317,7 @@ impl PalsNativeOptions {
             || self.cuda_control_inventory.is_some()
             || self.cuda_control_inventory_hash.is_some()
             || self.cuda_profile_root.is_some()
+            || self.cuda_profile_parent.is_some()
     }
 }
 
@@ -329,18 +369,20 @@ fn run_native_pals(
             || native.cuda_control_mode.is_some()
             || native.cuda_control_inventory.is_some()
             || native.cuda_control_inventory_hash.is_some()
-            || native.cuda_profile_root.is_some())
+            || native.cuda_profile_root.is_some()
+            || native.cuda_profile_parent.is_some())
     {
         return Err("PALS CPU selection cannot accept CUDA bundle/device/allocator options".into());
     }
     if native.device_public_memory.unwrap_or(false) && !cfg!(feature = "experimental-io-binding") {
         return Err("PALS device public memory requires explicit experimental-io-binding; no binding fallback was started".into());
     }
+    let profile_root = pals_profile_root(native.cuda_profile_root, native.cuda_profile_parent)?;
     let cuda_control = match (
         native.cuda_control_mode,
         native.cuda_control_inventory,
         native.cuda_control_inventory_hash,
-        native.cuda_profile_root,
+        profile_root,
     ) {
         (None, None, None, None) => None,
         (Some(mode), Some(inventory), Some(hash), Some(profile))
@@ -350,7 +392,6 @@ fn run_native_pals(
                 return Err("PALS inventory-v2 control mode requires host public memory; no device-binding fallback was started".into());
             }
             let inventory = std::path::PathBuf::from(inventory);
-            let profile = std::path::PathBuf::from(profile);
             if !inventory.is_absolute() || !profile.is_absolute() {
                 return Err("PALS control inventory and profile root must be absolute".into());
             }
@@ -358,7 +399,7 @@ fn run_native_pals(
             let policy = rz_eval::pals_onnx::PalsCudaControlPolicy::from_inventory(&inventory, &hash)?;
             Some((policy, profile))
         }
-        _ => return Err("PALS CUDA control mode requires inventory-v2, inventory path, inventory SHA-256 and a fresh owned profile root together; strict mode is the default".into()),
+        _ => return Err("PALS CUDA control mode requires inventory-v2, inventory path, inventory SHA-256 and a fresh owned profile root or exclusive process-profile parent together; strict mode is the default".into()),
     };
     let receipt_config =
         match (native.output_root, native.launch_hash, native.endpoint_id) {
@@ -646,6 +687,77 @@ fn run_native_pals(
             publication: None,
             work_observation: None,
         })),
+    }
+}
+
+#[cfg(feature = "onnx-cpu")]
+fn pals_profile_root(
+    root: Option<String>,
+    parent: Option<String>,
+) -> Result<Option<std::path::PathBuf>, Box<dyn std::error::Error>> {
+    let path = match (root, parent) {
+        (None, None) => None,
+        (Some(root), None) => Some(std::path::PathBuf::from(root)),
+        (None, Some(parent)) => {
+            let parent = std::path::PathBuf::from(parent);
+            if !parent.is_absolute() {
+                return Err("PALS CUDA profile parent must be absolute".into());
+            }
+            let metadata = std::fs::symlink_metadata(&parent)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err("PALS CUDA profile parent must be an existing owned directory".into());
+            }
+            // Fastchess uses the same launch arguments across games. Derive a
+            // fresh process-owned child here, then leave exclusive creation to
+            // the backend: a reused PID or nonce never authorizes overwriting.
+            let nonce = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos(),
+            )?;
+            Some(parent.join(format!(
+                "pals-cuda-profile-{}-{nonce:016x}",
+                std::process::id()
+            )))
+        }
+        (Some(_), Some(_)) => {
+            return Err("PALS CUDA profile root and parent are mutually exclusive".into());
+        }
+    };
+    Ok(path)
+}
+
+#[cfg(all(test, feature = "onnx-cpu"))]
+mod pals_profile_tests {
+    use super::pals_profile_root;
+
+    #[test]
+    fn exact_root_and_absent_control_preserve_existing_arguments() {
+        assert_eq!(pals_profile_root(None, None).unwrap(), None);
+        let exact = std::env::temp_dir().join("pals-explicit-profile-root");
+        assert_eq!(
+            pals_profile_root(Some(exact.to_string_lossy().into_owned()), None).unwrap(),
+            Some(exact)
+        );
+        assert!(pals_profile_root(Some("root".into()), Some("parent".into())).is_err());
+    }
+
+    #[test]
+    fn process_profile_parent_derives_but_does_not_create_a_child() {
+        let parent = std::env::temp_dir();
+        let child = pals_profile_root(None, Some(parent.to_string_lossy().into_owned()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.parent(), Some(parent.as_path()));
+        assert!(
+            child
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!("pals-cuda-profile-{}-", std::process::id()))
+        );
+        assert!(!child.exists());
+        assert!(pals_profile_root(None, Some("relative-profile-parent".into())).is_err());
     }
 }
 

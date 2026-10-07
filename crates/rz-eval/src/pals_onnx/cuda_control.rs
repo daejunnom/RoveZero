@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-const POLICY_SCHEMA: &str = "rovezero.pals-cuda-metadata-control.v1";
+const POLICY_SCHEMA: &str = "rovezero.pals-cuda-metadata-control.v2";
 const MAX_INVENTORY_BYTES: usize = 1024 * 1024;
 const MAX_PLACEMENT_BYTES: usize = 1024 * 1024;
 const MAX_PROFILE_BYTES: usize = 4 * 1024 * 1024;
@@ -34,6 +34,13 @@ struct GraphPolicy {
     major: BTreeMap<String, String>,
     proposer_private: BTreeMap<String, String>,
     critic_private: BTreeMap<String, String>,
+    role_transfer: Option<RoleTransferPolicy>,
+}
+#[derive(Clone)]
+struct RoleTransferPolicy {
+    scope: String,
+    destination_node: String,
+    host_condition_nodes: Vec<String>,
 }
 #[derive(Deserialize)]
 struct Inventory {
@@ -55,6 +62,8 @@ struct InventoryGraph {
 struct InventoryScope {
     path: String,
     inputs: Vec<InventoryInput>,
+    #[serde(default)]
+    outputs: Vec<InventoryInput>,
     integral_initializers: Vec<IntegralSeed>,
     nodes: Vec<InventoryNode>,
     subgraphs: Vec<InventoryScope>,
@@ -163,6 +172,7 @@ impl PalsCudaControlPolicy {
                 major: BTreeMap::new(),
                 proposer_private: BTreeMap::new(),
                 critic_private: BTreeMap::new(),
+                role_transfer: None,
             };
             let mut names = BTreeSet::new();
             inspect_scope(
@@ -172,6 +182,7 @@ impl PalsCudaControlPolicy {
                 &mut names,
                 &mut count,
             )?;
+            policy.role_transfer = role_transfer_policy(&graph.role, &graph.inventory);
             if policy.major.is_empty() {
                 return Err(policy_error(
                     "PALS control inventory has no neural computation",
@@ -241,6 +252,14 @@ impl PalsCudaControlPolicy {
                         if let Ok(mut log) = captured.lock() {
                             log.capture(message);
                         }
+                    } else if id == expected_id
+                        && location.contains("transformer_memcpy.cc")
+                        && ((level == LogLevel::Info && location.contains("AddCopyNode"))
+                            || (level == LogLevel::Warning && location.contains("ApplyImpl")))
+                    {
+                        if let Ok(mut log) = captured.lock() {
+                            log.capture_transfer(message);
+                        }
                     }
                 }))
             })
@@ -285,7 +304,10 @@ impl PalsCudaControlPolicy {
                 !roles.insert(placement.role.clone())
                 || placement.graph_sha256 != graph.digest
                 || placement.assigned_nodes == 0
-                || placement.assigned_nodes > graph.nodes.len()
+                || placement.optimization != PalsGraphOptimization::Disable
+                || placement.assigned_nodes
+                    > graph.nodes.len() + placement.approved_transfers.len()
+                || !valid_transfers(graph, &placement.approved_transfers)
                 || placement.cuda_nodes == 0
                 || placement
                     .cuda_nodes
@@ -299,8 +321,15 @@ impl PalsCudaControlPolicy {
                 "PALS kernel witness lacks both pinned pre-Run graph placements",
             ));
         }
-        let public = verify_profile(public, &self.graphs["public"])?;
-        let shared = verify_profile(shared, &self.graphs["shared_pc"])?;
+        let transfers = |role: &str| {
+            placements
+                .iter()
+                .find(|placement| placement.role == role)
+                .map(|placement| placement.approved_transfers.as_slice())
+                .unwrap_or(&[])
+        };
+        let public = verify_profile(public, &self.graphs["public"], transfers("public"))?;
+        let shared = verify_profile(shared, &self.graphs["shared_pc"], transfers("shared_pc"))?;
         if public.neural_kernels == 0
             || shared.proposer_private_kernels == 0
             || shared.critic_private_kernels == 0
@@ -315,6 +344,7 @@ impl PalsCudaControlPolicy {
             manifest_sha256: self.manifest,
             runtime_sha256: runtime,
             runtime_bundle_sha256: bundle,
+            optimization: PalsGraphOptimization::Disable,
             initialization: placements,
             public,
             shared_pc: shared,
@@ -540,29 +570,141 @@ fn inspect_scope(
     Ok(())
 }
 
+fn role_transfer_policy(role: &str, scope: &InventoryScope) -> Option<RoleTransferPolicy> {
+    // This is one pinned root-scope scalar route, not a Memcpy/opcode exception.
+    // With graph optimizations disabled, the only non-host role consumer is
+    // the original Identity. The six CUDA If kernels require CPU input 0 in
+    // the registered ORT 1.22 implementation; their private NN stays CUDA.
+    if role != "shared_pc"
+        || scope.path != "shared_pc"
+        || scope
+            .inputs
+            .iter()
+            .filter(|input| input.name == "role_is_critic")
+            .count()
+            != 1
+        || !scope.inputs.iter().any(|input| {
+            input.name == "role_is_critic"
+                && input.dtype == "BOOL"
+                && input.shape == serde_json::json!([])
+        })
+        || !scope.outputs.iter().any(|output| {
+            output.name == "is_critic"
+                && output.dtype == "BOOL"
+                && output.shape == serde_json::json!([])
+        })
+    {
+        return None;
+    }
+    let mut conditions = Vec::new();
+    let mut destination = None;
+    for node in &scope.nodes {
+        if !node.inputs.iter().any(|input| input == "role_is_critic") {
+            continue;
+        }
+        if node.inputs != ["role_is_critic"] {
+            return None;
+        }
+        match node.op.as_str() {
+            "If" if node.static_annotation == "role_if_dispatch_candidate" => {
+                conditions.push(node.name.clone());
+            }
+            "Identity"
+                if node.name == "output_is_critic"
+                    && node.outputs == ["is_critic"]
+                    && node.static_annotation == "role_scalar_identity_candidate"
+                    && destination.is_none() =>
+            {
+                destination = Some(node.name.clone());
+            }
+            _ => return None,
+        }
+    }
+    fn nested_role_consumer(scope: &InventoryScope) -> bool {
+        scope
+            .nodes
+            .iter()
+            .any(|node| node.inputs.iter().any(|input| input == "role_is_critic"))
+            || scope.subgraphs.iter().any(nested_role_consumer)
+    }
+    if conditions.len() != 6 || scope.subgraphs.iter().any(nested_role_consumer) {
+        return None;
+    }
+    Some(RoleTransferPolicy {
+        scope: scope.path.clone(),
+        destination_node: destination?,
+        host_condition_nodes: conditions,
+    })
+}
+
 #[derive(Default)]
 pub(super) struct PlacementLog {
     lines: Vec<String>,
+    transfer_lines: Vec<String>,
     bytes: usize,
     overflow: bool,
 }
 impl PlacementLog {
     fn capture(&mut self, message: &str) {
+        if self.reserve_message(message) {
+            self.lines.push(message.to_owned());
+        }
+    }
+    fn capture_transfer(&mut self, message: &str) {
+        if self.reserve_message(message) {
+            self.transfer_lines.push(message.to_owned());
+        }
+    }
+    fn reserve_message(&mut self, message: &str) -> bool {
         if self.overflow {
-            return;
+            return false;
         }
         let Some(bytes) = self.bytes.checked_add(message.len()) else {
             self.overflow = true;
-            return;
+            return false;
         };
-        if bytes > MAX_PLACEMENT_BYTES || self.lines.len() > MAX_NODES + 8 {
+        if bytes > MAX_PLACEMENT_BYTES
+            || self.lines.len() + self.transfer_lines.len() >= MAX_NODES + 32
+        {
             self.overflow = true;
-            return;
+            return false;
         }
         self.bytes = bytes;
-        self.lines.push(message.to_owned());
+        true
     }
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PalsGraphOptimization {
+    Level1,
+    Disable,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PalsControlTransferKind {
+    BoolScalarHostToDevice,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PalsControlTransfer {
+    pub kind: PalsControlTransferKind,
+    pub graph_sha256: [u8; 32],
+    pub source_scope: String,
+    pub runtime_graph_name: String,
+    pub node_name: String,
+    pub opcode: String,
+    pub provider: String,
+    pub source_value: String,
+    pub source_dtype: String,
+    pub source_shape: Vec<usize>,
+    pub destination_node: String,
+    pub destination_opcode: String,
+    pub destination_input_index: usize,
+    pub destination_output: String,
+    pub host_condition_nodes: Vec<String>,
+    pub provenance: String,
+}
+const TRANSFER_PROVENANCE: &str =
+    "ort-1.22-disable-source-io-addcopy-origin-single-recursive-cuda-transfer";
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PalsGraphPlacement {
     pub role: String,
@@ -571,12 +713,16 @@ pub struct PalsGraphPlacement {
     pub assigned_nodes: usize,
     pub cuda_nodes: usize,
     pub approved_cpu_control_nodes: usize,
+    pub optimization: PalsGraphOptimization,
+    pub approved_transfers: Vec<PalsControlTransfer>,
     pub recursive_coverage: String,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PalsKernelWitness {
     pub profile_sha256: [u8; 32],
     pub cuda_kernels: usize,
+    /// Actual transfer kernel events, not NN inputs or CPU model computation.
+    pub cuda_transfer_kernels: usize,
     pub approved_cpu_control_kernels: usize,
     pub neural_kernels: usize,
     pub proposer_private_kernels: usize,
@@ -589,6 +735,7 @@ pub struct PalsCudaPlacementWitness {
     pub manifest_sha256: [u8; 32],
     pub runtime_sha256: [u8; 32],
     pub runtime_bundle_sha256: [u8; 32],
+    pub optimization: PalsGraphOptimization,
     pub initialization: Vec<PalsGraphPlacement>,
     pub public: PalsKernelWitness,
     pub shared_pc: PalsKernelWitness,
@@ -599,6 +746,177 @@ fn placement_header(line: &str, prefix: &str) -> Option<(String, usize)> {
     let (provider, count) = rest.split_once("]. Number of nodes: ")?;
     let count = count.parse::<usize>().ok()?;
     Some((provider.into(), count))
+}
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CopyMetadata {
+    Origin {
+        opcode: String,
+        source_value: String,
+        provider: String,
+    },
+    Summary {
+        graph_name: String,
+        count: usize,
+        provider: String,
+    },
+}
+fn copy_metadata(line: &str) -> Option<CopyMetadata> {
+    if let Some(rest) = line.strip_prefix("Add ") {
+        let (opcode, rest) = rest.split_once(" after ")?;
+        let (source_value, provider) = rest.split_once(" for ")?;
+        if opcode != "MemcpyFromHost"
+            || source_value.is_empty()
+            || source_value.len() > 256
+            || provider != CUDA
+        {
+            return None;
+        }
+        return Some(CopyMetadata::Origin {
+            opcode: opcode.into(),
+            source_value: source_value.into(),
+            provider: provider.into(),
+        });
+    }
+    let (count, rest) = line.split_once(" Memcpy nodes are added to the graph ")?;
+    let (graph_name, rest) = rest.split_once(" for ")?;
+    let provider = rest.strip_suffix(". It might have negative impact on performance (including unable to run CUDA graph). Set session_options.log_severity_level=1 to see the detail logs before this message.")?;
+    let count = count.parse::<usize>().ok()?;
+    if graph_name.is_empty()
+        || graph_name.len() > 256
+        || count == 0
+        || count > MAX_NODES
+        || provider != CUDA
+    {
+        return None;
+    }
+    Some(CopyMetadata::Summary {
+        graph_name: graph_name.into(),
+        count,
+        provider: provider.into(),
+    })
+}
+fn valid_transfers(policy: &GraphPolicy, transfers: &[PalsControlTransfer]) -> bool {
+    if transfers.is_empty() {
+        return true;
+    }
+    let Some(source) = &policy.role_transfer else {
+        return false;
+    };
+    if transfers.len() != 1 {
+        return false;
+    }
+    let transfer = &transfers[0];
+    transfer.kind == PalsControlTransferKind::BoolScalarHostToDevice
+        && transfer.graph_sha256 == policy.digest
+        && transfer.source_scope == source.scope
+        && !transfer.runtime_graph_name.is_empty()
+        && transfer.runtime_graph_name.len() <= 256
+        && transfer.node_name == "Memcpy"
+        && !policy.nodes.contains_key(&transfer.node_name)
+        && transfer.opcode == "MemcpyFromHost"
+        && transfer.provider == CUDA
+        && transfer.source_value == "role_is_critic"
+        && transfer.source_dtype == "BOOL"
+        && transfer.source_shape.is_empty()
+        && transfer.destination_node == source.destination_node
+        && transfer.destination_opcode == "Identity"
+        && transfer.destination_input_index == 0
+        && transfer.destination_output == "is_critic"
+        && transfer.host_condition_nodes == source.host_condition_nodes
+        && transfer.provenance == TRANSFER_PROVENANCE
+}
+fn verify_control_transfer(
+    policy: &GraphPolicy,
+    log: &PlacementLog,
+    nodes: &BTreeMap<String, (String, String)>,
+    copies: &[String],
+) -> Result<Vec<PalsControlTransfer>, BackendError> {
+    if log.transfer_lines.is_empty() && copies.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The ORT origin INFO omits generated-node IO and scope. Admission therefore
+    // requires Disable, the pinned unique root IO route, one recursive copy,
+    // its one official graph summary, and every original consumer's exact CUDA
+    // placement. Multiple copies/scopes or any unsupported source stay denied.
+    let Some(source) = &policy.role_transfer else {
+        return Err(policy_error(
+            "PALS generated transfer lacks a pinned scalar source route",
+        ));
+    };
+    if copies != ["Memcpy"] || log.transfer_lines.len() != 2 {
+        return Err(policy_error(
+            "PALS generated transfer has ambiguous copy count or origin",
+        ));
+    }
+    let mut origin = None;
+    let mut graph_name = None;
+    for line in &log.transfer_lines {
+        match copy_metadata(line.trim()) {
+            Some(CopyMetadata::Origin {
+                opcode,
+                source_value,
+                provider,
+            }) if origin.is_none()
+                && opcode == "MemcpyFromHost"
+                && source_value == "role_is_critic"
+                && provider == CUDA =>
+            {
+                origin = Some(());
+            }
+            Some(CopyMetadata::Summary {
+                graph_name: name,
+                count: 1,
+                provider,
+            }) if graph_name.is_none() && provider == CUDA => {
+                graph_name = Some(name);
+            }
+            _ => {
+                return Err(policy_error(
+                    "PALS generated transfer origin/count metadata is unapproved",
+                ))
+            }
+        }
+    }
+    if origin.is_none()
+        || !nodes
+            .get(&source.destination_node)
+            .is_some_and(|(op, provider)| op == "Identity" && provider == CUDA)
+        || source.host_condition_nodes.iter().any(|name| {
+            !nodes
+                .get(name)
+                .is_some_and(|(op, provider)| op == "If" && provider == CUDA)
+        })
+    {
+        return Err(policy_error(
+            "PALS scalar transfer lacks exact CUDA destination/host-condition consumers",
+        ));
+    }
+    let transfer = PalsControlTransfer {
+        kind: PalsControlTransferKind::BoolScalarHostToDevice,
+        graph_sha256: policy.digest,
+        source_scope: source.scope.clone(),
+        runtime_graph_name: graph_name
+            .ok_or_else(|| policy_error("PALS transfer graph summary is missing"))?,
+        node_name: copies[0].clone(),
+        opcode: "MemcpyFromHost".into(),
+        provider: CUDA.into(),
+        source_value: "role_is_critic".into(),
+        source_dtype: "BOOL".into(),
+        source_shape: Vec::new(),
+        destination_node: source.destination_node.clone(),
+        destination_opcode: "Identity".into(),
+        destination_input_index: 0,
+        destination_output: "is_critic".into(),
+        host_condition_nodes: source.host_condition_nodes.clone(),
+        provenance: TRANSFER_PROVENANCE.into(),
+    };
+    if !valid_transfers(policy, std::slice::from_ref(&transfer)) {
+        return Err(policy_error(
+            "PALS transfer attestation differs from pinned source route",
+        ));
+    }
+    Ok(vec![transfer])
 }
 fn verify_placement(
     role: &str,
@@ -613,6 +931,8 @@ fn verify_placement(
     let mut observed: BTreeMap<String, usize> = BTreeMap::new();
     let mut selected = None;
     let mut names = BTreeSet::new();
+    let mut nodes = BTreeMap::new();
+    let mut copies = Vec::new();
     for line in &log.lines {
         let line = line.trim();
         if line == "Node placements" {
@@ -653,16 +973,23 @@ fn verify_placement(
                 .split_once(" (")
                 .and_then(|(op, rest)| rest.strip_suffix(')').map(|name| (op, name)))
                 .ok_or_else(|| policy_error("PALS placement node record is incomplete"))?;
+            let original = policy.nodes.get(name).map(String::as_str) == Some(op);
+            let copy_candidate =
+                !original && name == "Memcpy" && op == "MemcpyFromHost" && provider == CUDA;
             if !names.insert(name.to_owned())
                 || name.len() > 256
                 || op.is_empty()
-                || policy.nodes.get(name).map(String::as_str) != Some(op)
+                || (!original && !copy_candidate)
                 || (provider == CPU && policy.controls.get(name).map(String::as_str) != Some(op))
             {
                 return Err(policy_error(
                     "PALS unknown/fused or unapproved exact node placement",
                 ));
             }
+            if copy_candidate {
+                copies.push(name.to_owned());
+            }
+            nodes.insert(name.to_owned(), (op.to_owned(), provider.clone()));
             *observed.entry(provider.clone()).or_default() += 1;
         } else {
             return Err(policy_error(
@@ -676,16 +1003,26 @@ fn verify_placement(
         ));
     }
     let (cuda_nodes, cpu_nodes) = (headers[CUDA], headers[CPU]);
-    if !began || cuda_nodes + cpu_nodes > policy.nodes.len() {
+    let approved_transfers = verify_control_transfer(policy, log, &nodes, &copies)?;
+    if !began || cuda_nodes + cpu_nodes > policy.nodes.len() + approved_transfers.len() {
         return Err(policy_error("PALS placement evidence missing"));
     }
     Ok(PalsGraphPlacement {
         role: role.into(),
         graph_sha256: policy.digest,
-        log_sha256: asset::sha256(log.lines.join("\n").as_bytes()),
+        log_sha256: asset::sha256(
+            format!(
+                "placement\n{}\ncopy\n{}",
+                log.lines.join("\n"),
+                log.transfer_lines.join("\n")
+            )
+            .as_bytes(),
+        ),
         assigned_nodes: cuda_nodes + cpu_nodes,
         cuda_nodes,
         approved_cpu_control_nodes: cpu_nodes,
+        optimization: PalsGraphOptimization::Disable,
+        approved_transfers,
         recursive_coverage:
             "ort-1.22-finalize-recursive-exact-named-provider-coverage-before-first-run".into(),
     })
@@ -715,7 +1052,11 @@ fn bounded_metadata_output(value: &serde_json::Value) -> bool {
                 })
         })
 }
-fn verify_profile(bytes: &[u8], graph: &GraphPolicy) -> Result<PalsKernelWitness, BackendError> {
+fn verify_profile(
+    bytes: &[u8],
+    graph: &GraphPolicy,
+    transfers: &[PalsControlTransfer],
+) -> Result<PalsKernelWitness, BackendError> {
     if bytes.len() > MAX_PROFILE_BYTES {
         return Err(policy_error("PALS kernel profile exceeds bounded output"));
     }
@@ -726,6 +1067,7 @@ fn verify_profile(bytes: &[u8], graph: &GraphPolicy) -> Result<PalsKernelWitness
     let mut witness = PalsKernelWitness {
         profile_sha256: asset::sha256(bytes),
         cuda_kernels: 0,
+        cuda_transfer_kernels: 0,
         approved_cpu_control_kernels: 0,
         neural_kernels: 0,
         proposer_private_kernels: 0,
@@ -756,9 +1098,18 @@ fn verify_profile(bytes: &[u8], graph: &GraphPolicy) -> Result<PalsKernelWitness
         match provider {
             Some(CUDA) => {
                 if graph.nodes.get(node).map(String::as_str) != Some(op) {
-                    return Err(policy_error(
-                        "PALS actual CUDA kernel has unknown/fused identity or opcode",
-                    ));
+                    if !valid_transfers(graph, transfers)
+                        || !transfers
+                            .iter()
+                            .any(|transfer| transfer.node_name == node && transfer.opcode == op)
+                        || event.pointer("/args/output_type_shape")
+                            != Some(&serde_json::json!([{"bool":[]}]))
+                    {
+                        return Err(policy_error(
+                            "PALS actual CUDA kernel has unknown/fused identity or transfer output",
+                        ));
+                    }
+                    witness.cuda_transfer_kernels += 1;
                 }
                 witness.cuda_kernels += 1;
                 if graph.major.get(node).map(String::as_str) == Some(op) {
@@ -839,6 +1190,8 @@ pub(super) fn record_initial_log(
     let mut headers = Vec::new();
     let mut nodes = Vec::new();
     let mut unparsed = Vec::new();
+    let mut transfer_metadata = Vec::new();
+    let mut transfer_unparsed = Vec::new();
     let mut began = false;
     for (sequence, line) in log.lines.iter().enumerate() {
         let line = line.trim();
@@ -887,9 +1240,20 @@ pub(super) fn record_initial_log(
             line_sha256: asset::sha256(line.as_bytes()),
         });
     }
+    for (sequence, line) in log.transfer_lines.iter().enumerate() {
+        if let Some(metadata) = copy_metadata(line.trim()) {
+            transfer_metadata.push(metadata);
+        } else {
+            transfer_unparsed.push(PlacementUnparsed {
+                sequence,
+                line_sha256: asset::sha256(line.as_bytes()),
+            });
+        }
+    }
     let evidence = PlacementFile {
-        schema: "rovezero.pals-initial-placement.v1",
-        source: "ort-1.22-finalize-recursive-verbose-node-metadata",
+        schema: "rovezero.pals-initial-placement.v2",
+        source: "ort-1.22-finalize-recursive-plus-memcpy-origin-metadata",
+        optimization: PalsGraphOptimization::Disable,
         role,
         session_created,
         before_first_neural_run: true,
@@ -906,6 +1270,11 @@ pub(super) fn record_initial_log(
         provider_headers: headers,
         nodes,
         unparsed,
+        transfer_metadata,
+        transfer_unparsed,
+        approved_transfers: gate
+            .and_then(|result| result.as_ref().ok())
+            .map(|placement| placement.approved_transfers.as_slice()),
     };
     let mut json = BoundedPlacementJson { bytes: Vec::new() };
     serde_json::to_writer_pretty(&mut json, &evidence).map_err(|error| {
@@ -955,6 +1324,7 @@ struct PlacementUnparsed {
 struct PlacementFile<'a> {
     schema: &'static str,
     source: &'static str,
+    optimization: PalsGraphOptimization,
     role: &'a str,
     session_created: bool,
     before_first_neural_run: bool,
@@ -965,6 +1335,9 @@ struct PlacementFile<'a> {
     provider_headers: Vec<PlacementHeader>,
     nodes: Vec<PlacementNode<'a>>,
     unparsed: Vec<PlacementUnparsed>,
+    transfer_metadata: Vec<CopyMetadata>,
+    transfer_unparsed: Vec<PlacementUnparsed>,
+    approved_transfers: Option<&'a [PalsControlTransfer]>,
 }
 struct BoundedPlacementJson {
     bytes: Vec<u8>,
@@ -1084,6 +1457,7 @@ mod tests {
             .into(),
             proposer_private: [("p_nn".into(), "Gemm".into())].into(),
             critic_private: [("c_nn".into(), "Gemm".into())].into(),
+            role_transfer: None,
         }
     }
     fn log(lines: &[&str]) -> PlacementLog {
@@ -1092,6 +1466,172 @@ mod tests {
             result.capture(line);
         }
         result
+    }
+    const COPY_SUMMARY: &str = "1 Memcpy nodes are added to the graph shared_role_graph for CUDAExecutionProvider. It might have negative impact on performance (including unable to run CUDA graph). Set session_options.log_severity_level=1 to see the detail logs before this message.";
+    fn transfer_scope() -> InventoryScope {
+        let mut nodes: Vec<_> = (0..6)
+            .map(|i| {
+                serde_json::json!({
+                    "index":i,"name":format!("if_{i}"),"domain":"","op":"If",
+                    "inputs":["role_is_critic"],"outputs":[format!("latent_{i}")],
+                    "input_origins":["role_control"],"constant_integral_seeds":[],
+                    "static_annotation":"role_if_dispatch_candidate","actual_provider":"unknown"
+                })
+            })
+            .collect();
+        nodes.push(serde_json::json!({"index":6,"name":"output_is_critic","domain":"","op":"Identity",
+            "inputs":["role_is_critic"],"outputs":["is_critic"],"input_origins":["role_control"],
+            "constant_integral_seeds":[],"static_annotation":"role_scalar_identity_candidate","actual_provider":"unknown"}));
+        serde_json::from_value(serde_json::json!({"path":"shared_pc",
+            "inputs":[{"name":"role_is_critic","dtype":"BOOL","shape":[]}],
+            "outputs":[{"name":"is_critic","dtype":"BOOL","shape":[]}],
+            "integral_initializers":[],"nodes":nodes,"subgraphs":[]}))
+        .unwrap()
+    }
+    fn transfer_graph_log() -> (GraphPolicy, PlacementLog) {
+        let scope = transfer_scope();
+        let mut policy = graph();
+        policy.nodes.remove("p_nn");
+        policy.nodes.remove("c_nn");
+        for node in &scope.nodes {
+            policy.nodes.insert(node.name.clone(), node.op.clone());
+        }
+        policy
+            .controls
+            .insert("output_is_critic".into(), "Identity".into());
+        policy.role_transfer = role_transfer_policy("shared_pc", &scope);
+        let mut captured = log(&[
+            "Node placements",
+            "Node(s) placed on [CPUExecutionProvider]. Number of nodes: 1",
+            "Shape (shape_node)",
+            "Node(s) placed on [CUDAExecutionProvider]. Number of nodes: 9",
+            "MatMul (nn)",
+            "If (if_0)",
+            "If (if_1)",
+            "If (if_2)",
+            "If (if_3)",
+            "If (if_4)",
+            "If (if_5)",
+            "Identity (output_is_critic)",
+            "MemcpyFromHost (Memcpy)",
+        ]);
+        captured
+            .capture_transfer("Add MemcpyFromHost after role_is_critic for CUDAExecutionProvider");
+        captured.capture_transfer(COPY_SUMMARY);
+        (policy, captured)
+    }
+    #[test]
+    fn role_transfer_source_requires_scalar_bool_unique_root_destination_and_six_host_conditions() {
+        let mut scope = transfer_scope();
+        assert!(role_transfer_policy("shared_pc", &scope).is_some());
+        assert!(role_transfer_policy("public", &scope).is_none());
+        scope.inputs[0].shape = serde_json::json!([1]);
+        assert!(role_transfer_policy("shared_pc", &scope).is_none());
+        scope.inputs[0].shape = serde_json::json!([]);
+        scope.outputs[0].dtype = "FLOAT".into();
+        assert!(role_transfer_policy("shared_pc", &scope).is_none());
+        scope.outputs[0].dtype = "BOOL".into();
+        scope.nodes[6].outputs = vec!["unrelated_tag".into()];
+        assert!(role_transfer_policy("shared_pc", &scope).is_none());
+        scope.nodes[6].outputs = vec!["is_critic".into()];
+        scope.nodes.push(
+            serde_json::from_value(serde_json::json!({"index":7,"name":"extra",
+            "domain":"","op":"Cast","inputs":["role_is_critic"],"outputs":["float_role"],
+            "input_origins":["role_control"],"constant_integral_seeds":[],
+            "static_annotation":"none","actual_provider":"unknown"}))
+            .unwrap(),
+        );
+        assert!(role_transfer_policy("shared_pc", &scope).is_none());
+    }
+    #[test]
+    fn scalar_transfer_pre_run_gate_requires_actual_origin_count_and_cuda_consumers() {
+        let (policy, captured) = transfer_graph_log();
+        let placement = verify_placement("shared_pc", &policy, &captured).unwrap();
+        assert_eq!(placement.assigned_nodes, policy.nodes.len() + 1);
+        assert_eq!(placement.approved_transfers.len(), 1);
+        assert_eq!(
+            placement.approved_transfers[0].source_value,
+            "role_is_critic"
+        );
+        assert_eq!(placement.optimization, PalsGraphOptimization::Disable);
+        let (_, mut missing) = transfer_graph_log();
+        missing.transfer_lines.clear();
+        assert!(verify_placement("shared_pc", &policy, &missing).is_err());
+        let (_, mut wrong) = transfer_graph_log();
+        wrong.transfer_lines[0] = "Add MemcpyFromHost after query for CUDAExecutionProvider".into();
+        assert!(verify_placement("shared_pc", &policy, &wrong).is_err());
+        let (_, mut doubled) = transfer_graph_log();
+        doubled
+            .capture_transfer("Add MemcpyFromHost after role_is_critic for CUDAExecutionProvider");
+        assert!(verify_placement("shared_pc", &policy, &doubled).is_err());
+        let (_, mut wrong_count) = transfer_graph_log();
+        wrong_count.transfer_lines[1] = COPY_SUMMARY.replacen("1 Memcpy", "2 Memcpy", 1);
+        assert!(verify_placement("shared_pc", &policy, &wrong_count).is_err());
+        let (_, mut unknown_name) = transfer_graph_log();
+        *unknown_name.lines.last_mut().unwrap() = "MemcpyFromHost (Memcpy_token_1)".into();
+        assert!(verify_placement("shared_pc", &policy, &unknown_name).is_err());
+        let (_, mut missing_destination) = transfer_graph_log();
+        missing_destination.lines[11] = "Identity (unregistered_destination)".into();
+        assert!(verify_placement("shared_pc", &policy, &missing_destination).is_err());
+        assert!(verify_placement("shared_pc", &graph(), &captured).is_err());
+        let mut tampered = placement.approved_transfers;
+        tampered[0].source_shape = vec![1];
+        assert!(!valid_transfers(&policy, &tampered));
+    }
+    #[test]
+    fn cuda_scalar_copy_kernel_is_separate_from_neural_work_and_requires_bool_output() {
+        let (policy, captured) = transfer_graph_log();
+        let transfers = verify_placement("shared_pc", &policy, &captured)
+            .unwrap()
+            .approved_transfers;
+        let mut events = serde_json::json!([
+            {"cat":"Node","name":"nn_kernel_time","args":{"provider":CUDA,"op_name":"MatMul"}},
+            {"cat":"Node","name":"Memcpy_kernel_time","args":{"provider":CUDA,"op_name":"MemcpyFromHost","output_type_shape":[{"bool":[]}]}}
+        ]);
+        let bytes = serde_json::to_vec(&events).unwrap();
+        let witness = verify_profile(&bytes, &policy, &transfers).unwrap();
+        assert_eq!(witness.cuda_transfer_kernels, 1);
+        assert_eq!(witness.cuda_kernels, 2);
+        assert_eq!(witness.neural_kernels, 1);
+        assert!(verify_profile(&bytes, &policy, &[]).is_err());
+        events[1]["args"]["output_type_shape"] = serde_json::json!([{"float":[]}]);
+        assert!(
+            verify_profile(&serde_json::to_vec(&events).unwrap(), &policy, &transfers).is_err()
+        );
+        events[1]["args"]["output_type_shape"] = serde_json::json!([{"bool":[1]}]);
+        assert!(
+            verify_profile(&serde_json::to_vec(&events).unwrap(), &policy, &transfers).is_err()
+        );
+    }
+    #[test]
+    fn pre_run_copy_origin_is_bounded_and_saved_as_metadata_without_raw_logger_text() {
+        let root = io_root();
+        let (policy, captured) = transfer_graph_log();
+        let gate = verify_placement("shared_pc", &policy, &captured);
+        let captured = Arc::new(Mutex::new(captured));
+        let path = root.0.join("shared_pc-initial-placement.json");
+        record_initial_log(&captured, &path, "shared_pc", true, Some(&gate)).unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let file: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(file["optimization"], "disable");
+        assert_eq!(
+            file["transfer_metadata"][0]["source_value"],
+            "role_is_critic"
+        );
+        assert_eq!(
+            file["approved_transfers"][0]["kind"],
+            "bool_scalar_host_to_device"
+        );
+        assert!(!std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("Add MemcpyFromHost after"));
+        let mut full = PlacementLog {
+            bytes: MAX_PLACEMENT_BYTES,
+            ..Default::default()
+        };
+        full.capture_transfer("x");
+        assert!(full.overflow);
+        assert!(full.transfer_lines.is_empty());
     }
     #[test]
     fn rejected_pre_run_metadata_is_saved_exclusively_without_nn_values() {
@@ -1168,6 +1708,7 @@ mod tests {
         };
         let mut scope = InventoryScope {
             path: "public".into(),
+            outputs: Vec::new(),
             inputs: vec![InventoryInput {
                 name: "data".into(),
                 dtype: "FLOAT".into(),
@@ -1280,20 +1821,20 @@ mod tests {
         let control = serde_json::json!({"cat":"Node","name":"shape_node_kernel_time","args":{"provider":CPU,"op_name":"Shape","output_type_shape":[{"int64":[4]}]}});
         let profile = |events| serde_json::to_vec(&events).unwrap();
         assert_eq!(
-            verify_profile(&profile(vec![cuda.clone(), control.clone()]), &graph())
+            verify_profile(&profile(vec![cuda.clone(), control.clone()]), &graph(), &[])
                 .unwrap()
                 .approved_cpu_control_kernels,
             1
         );
         let mut bad = control.clone();
         bad["args"]["output_type_shape"] = serde_json::json!([{"float":[4]}]);
-        assert!(verify_profile(&profile(vec![cuda.clone(), bad]), &graph()).is_err());
+        assert!(verify_profile(&profile(vec![cuda.clone(), bad]), &graph(), &[]).is_err());
         let mut bad = control;
         bad["args"]["output_type_shape"] = serde_json::json!([{"int64":[65]}]);
-        assert!(verify_profile(&profile(vec![cuda, bad]), &graph()).is_err());
+        assert!(verify_profile(&profile(vec![cuda, bad]), &graph(), &[]).is_err());
         let fake_nn = serde_json::json!({"cat":"Node","name":"nn_kernel_time","args":{"provider":CUDA,"op_name":"Shape"}});
-        assert!(verify_profile(&profile(vec![fake_nn]), &graph()).is_err());
-        assert!(verify_profile(b"[]", &graph()).is_err());
+        assert!(verify_profile(&profile(vec![fake_nn]), &graph(), &[]).is_err());
+        assert!(verify_profile(b"[]", &graph(), &[]).is_err());
     }
 
     #[test]
@@ -1317,6 +1858,8 @@ mod tests {
             assigned_nodes: 2,
             cuda_nodes: 1,
             approved_cpu_control_nodes: 1,
+            optimization: PalsGraphOptimization::Disable,
+            approved_transfers: Vec::new(),
             recursive_coverage:
                 "ort-1.22-finalize-recursive-exact-named-provider-coverage-before-first-run".into(),
         };

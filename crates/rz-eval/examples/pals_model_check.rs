@@ -234,7 +234,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Pure bounded source-policy parsing: no runtime load, session, Run or
         // provider claim. The external owner preserves stdout as evidence.
         PalsCudaControlPolicy::from_inventory(Path::new(&args[1]), &args[2])?;
-        println!("Pinned static PALS CUDA control policy accepted; native placement and GPU execution not observed");
+        println!("Pinned static PALS CUDA control v2 accepted; explicit graph optimization=disable; native placement and GPU execution not observed");
         return Ok(());
     }
     if !matches!(args.len(), 8 | 9 | 11) {
@@ -316,6 +316,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     let mut backend = load(runtime.clone(), config, "primary")?;
+    let graph_optimization = backend.graph_optimization();
     let epoch = backend.model_epoch();
     if epoch != asset::parse_sha256(&fixtures.checkpoint_sha256)?
         || backend.is_trained() != fixtures.trained
@@ -603,7 +604,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "after_new_game":{"entries":pages_after_reset.entries,"reserved_bytes":pages_after_reset.reserved_bytes,
             "pinned_entries":pages_after_reset.pinned_entries,"pinned_bytes":pages_after_reset.pinned_bytes},
         "cache_off_completed_page_retirement":"passed","runtime_allocator_peak":"unknown","vram_peak":"unknown"});
-    let cuda_evidence = json!({"cuda_mode":args[6],
+    let cuda_evidence = json!({"cuda_mode":args[6],"graph_optimization":graph_optimization,
         "cuda_control_inventory_sha256":control_policy.as_ref().map(|_| args[10].as_str()),
         "cuda_placement_witness":placement_witness,"fresh_cuda_placement_witness":fresh_placement_witness});
     let mut receipt = json!({"schema": PALS_MODEL_SCHEMA,"status":"passed","trained":trained,"rules_certified":false,
