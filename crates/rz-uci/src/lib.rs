@@ -23,6 +23,8 @@ pub mod native_profile;
 #[cfg(feature = "search-work-receipts")]
 pub mod pals_attestation;
 #[cfg(feature = "search-work-receipts")]
+pub mod pals_checker_profile;
+#[cfg(feature = "search-work-receipts")]
 pub mod pals_cpu_task;
 pub mod pals_native;
 pub mod parser;

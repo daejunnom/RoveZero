@@ -348,6 +348,21 @@ pub trait CpuChecker: Send {
     fn identity(&self) -> &CheckerIdentity;
     fn conditions(&self) -> &str;
     fn capabilities(&self) -> CheckerCapabilities;
+    /// Actual successful UCI handshake identity, not the declared profile name.
+    /// Own checkers and failed/partial startup observations remain None.
+    fn startup_uci(&self) -> Option<ExternalUciIdentity> {
+        None
+    }
+    /// Explicit finite startup. Synchronous own checkers have no process to
+    /// spawn; external adapters must override this with their real handshake.
+    fn start(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<(), CheckerError> {
+        if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return Err(CheckerError::Invalid(
+                "startup canceled or deadline expired",
+            ));
+        }
+        self.validate_namespace()
+    }
     /// Admission-only immutable namespace check. This must not dispatch work,
     /// reset an attempt ledger, transfer a resume token or count a cache visit.
     fn validate_namespace(&self) -> Result<(), CheckerError> {

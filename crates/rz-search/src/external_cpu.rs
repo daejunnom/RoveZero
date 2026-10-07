@@ -838,6 +838,13 @@ fn empty_shutdown() -> CheckerShutdown {
 }
 
 impl CpuChecker for ExternalUciCpuChecker {
+    fn startup_uci(&self) -> Option<ExternalUciIdentity> {
+        (self.owner.is_some() && !self.failed && !self.observed_uci.name.is_empty())
+            .then(|| self.observed_uci.clone())
+    }
+    fn start(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<(), CheckerError> {
+        ExternalUciCpuChecker::start(self, deadline, cancel)
+    }
     fn identity(&self) -> &CheckerIdentity {
         &self.identity
     }
@@ -926,6 +933,22 @@ impl CpuChecker for ExternalUciCpuChecker {
     }
     fn shutdown(&mut self, deadline: Instant) -> Result<CheckerShutdown, CheckerError> {
         let Some(owner) = self.owner.as_mut() else {
+            // A failed spawn can return actual proof that this owner never
+            // acquired a process, or completed its setup cleanup. Reuse only
+            // that exact request-0 state; do not invent exit or drained pipes.
+            let cleanup = self.last_attempt.as_ref().and_then(|attempt| {
+                attempt.external.as_ref().filter(|external| {
+                    self.failed
+                        && external.request_id == 0
+                        && external.partial_report.is_none()
+                        && external.process.cleanup_complete
+                        && !external.process.quarantined
+                        && !external.process.ownership_lost
+                })
+            });
+            if let Some(evidence) = cleanup {
+                return Ok(evidence.process);
+            }
             return Err(error("shutdown", "owner_closed"));
         };
         let result = owner.shutdown(deadline, self.active);
@@ -1943,5 +1966,81 @@ mod tests {
             assert_eq!(partial.best_move, None);
             assert!(attempt.process.cleanup_complete);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_spawn_shutdown_reuses_only_actual_request_zero_cleanup() {
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let mut config = fixture_config("fake_uci_normal");
+        config.identity.binary_sha256 = "0".repeat(64);
+        let mut checker = ExternalUciCpuChecker::create(config).unwrap();
+        assert!(matches!(
+            checker.shutdown(Instant::now() + Duration::from_secs(1)),
+            Err(CheckerError::External {
+                code: "owner_closed",
+                ..
+            })
+        ));
+        assert!(checker.last_attempt().is_none());
+        let failure = checker.start(
+            Instant::now() + Duration::from_secs(10),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(
+            failure,
+            Err(CheckerError::External {
+                code: "program_hash_mismatch",
+                ..
+            })
+        ));
+        let actual = checker
+            .last_attempt()
+            .unwrap()
+            .external
+            .as_ref()
+            .unwrap()
+            .process;
+        assert!(actual.cleanup_complete);
+        assert!(!actual.exit_observed && !actual.stdout_drained && !actual.stderr_drained);
+        assert_eq!(
+            checker
+                .shutdown(Instant::now() + Duration::from_secs(1))
+                .unwrap(),
+            actual
+        );
+        assert_eq!(
+            checker
+                .shutdown(Instant::now() + Duration::from_secs(1))
+                .unwrap(),
+            actual
+        );
+        let evidence = checker
+            .last_attempt
+            .as_mut()
+            .unwrap()
+            .external
+            .as_mut()
+            .unwrap();
+        evidence.process.quarantined = true;
+        assert!(
+            checker
+                .shutdown(Instant::now() + Duration::from_secs(1))
+                .is_err()
+        );
+        let evidence = checker
+            .last_attempt
+            .as_mut()
+            .unwrap()
+            .external
+            .as_mut()
+            .unwrap();
+        evidence.process.quarantined = false;
+        evidence.request_id = 1;
+        assert!(
+            checker
+                .shutdown(Instant::now() + Duration::from_secs(1))
+                .is_err()
+        );
     }
 }

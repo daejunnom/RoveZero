@@ -17,14 +17,17 @@ pub struct PalsResolverIdentity {
     pub semantics_sha256: [u8; 32],
 }
 impl PalsResolverIdentity {
-    fn registered() -> Self {
+    pub fn from_semantics(version: &'static str, semantics: &'static str) -> Self {
         Self {
-            version: rz_search::pals::engine::PALS_VALUE_RESOLVER_VERSION.into(),
-            semantics_sha256: Sha256::digest(
-                rz_search::pals::engine::PALS_VALUE_RESOLVER_SEMANTICS.as_bytes(),
-            )
-            .into(),
+            version: version.into(),
+            semantics_sha256: Sha256::digest(semantics.as_bytes()).into(),
         }
+    }
+    fn registered() -> Self {
+        Self::from_semantics(
+            rz_search::pals::engine::PALS_VALUE_RESOLVER_VERSION,
+            rz_search::pals::engine::PALS_VALUE_RESOLVER_SEMANTICS,
+        )
     }
 }
 
@@ -126,11 +129,15 @@ macro_rules! pals_totals {
             $(pub $field: Option<u64>,)+
             pub retained_situations_peak: Option<usize>,
             pub unknown_root_children: Option<u64>,
+            /// Observed foreign nodes remain a partial observed sum if this is
+            /// true. Neither zero nor a reserved budget replaces missing work.
+            pub external_checker_work_incomplete: Option<bool>,
         }
         impl PalsWorkTotals {
-            fn zero() -> Self { Self { $($field: Some(0),)+ retained_situations_peak: Some(0), unknown_root_children: Some(0) } }
+            fn zero() -> Self { Self { $($field: Some(0),)+ retained_situations_peak: Some(0), unknown_root_children: Some(0), external_checker_work_incomplete: Some(false) } }
             fn observe(&mut self, counters: PalsCounters, root_coverage_observed: bool) {
                 $(add(&mut self.$field, counters.$field);)+
+                self.external_checker_work_incomplete = self.external_checker_work_incomplete.map(|was_incomplete| was_incomplete || counters.external_checker_work_incomplete);
                 self.retained_situations_peak = self.retained_situations_peak.map(|value| value.max(counters.retained_situations));
                 if root_coverage_observed { add(&mut self.unknown_root_children, counters.unknown_root_children as u64); }
                 else { self.unknown_root_children = None; }
@@ -138,7 +145,7 @@ macro_rules! pals_totals {
                     self.cpu_nodes = None; self.cpu_quiescence_nodes = None; self.cpu_tt_hits = None;
                 }
             }
-            fn unknown(&mut self) { $(self.$field = None;)+ self.retained_situations_peak = None; self.unknown_root_children = None; }
+            fn unknown(&mut self) { $(self.$field = None;)+ self.retained_situations_peak = None; self.unknown_root_children = None; self.external_checker_work_incomplete = None; }
         }
     };
 }
@@ -160,6 +167,14 @@ pals_totals!(
     accepted_proposer_outputs,
     accepted_critic_outputs,
     accepted_repair_outputs,
+    value_calls,
+    completed_value_calls,
+    accepted_value_outputs,
+    external_checker_tasks,
+    external_checker_reports,
+    external_checker_nodes_observed,
+    external_checker_node_budget_reserved,
+    consumed_external_checker_tasks,
     cpu_tasks_requested,
     cpu_tasks,
     cpu_nodes,
@@ -236,6 +251,15 @@ pub(super) struct ProcessWorkJournal {
 }
 impl ProcessWorkJournal {
     pub fn new(kind: SearchKind) -> Self {
+        Self::with_resolver(
+            kind,
+            (kind == SearchKind::Pals).then(PalsResolverIdentity::registered),
+        )
+    }
+    pub fn new_pals(resolver: PalsResolverIdentity) -> Self {
+        Self::with_resolver(SearchKind::Pals, Some(resolver))
+    }
+    fn with_resolver(kind: SearchKind, resolver: Option<PalsResolverIdentity>) -> Self {
         Self {
             receipt: Mutex::new(ProcessSearchWorkReceipt {
                 schema_version: 1,
@@ -250,7 +274,7 @@ impl ProcessWorkJournal {
                 unobserved_work_invocations: 0,
                 cpu: (kind == SearchKind::Cpu).then(CpuWorkTotals::zero),
                 pals: (kind == SearchKind::Pals).then(PalsWorkTotals::zero),
-                pals_resolver: (kind == SearchKind::Pals).then(PalsResolverIdentity::registered),
+                pals_resolver: resolver,
             }),
             pending_cpu: Mutex::new(Vec::with_capacity(16)),
         }
@@ -454,6 +478,80 @@ mod tests {
             shutdown_deadline: until,
             current: Arc::new(Mutex::new(SessionScope::Search(authority))),
         }
+    }
+    #[test]
+    fn foreign_work_and_model_values_keep_the_selected_resolver_and_unknown_scope() {
+        let resolver = PalsResolverIdentity::from_semantics(
+            rz_search::pals::value::MODEL_WDL_RESOLVER_VERSION,
+            rz_search::pals::value::MODEL_WDL_RESOLVER_SEMANTICS,
+        );
+        let journal = ProcessWorkJournal::new_pals(resolver.clone());
+        let context = context();
+        for counters in [
+            PalsCounters {
+                value_calls: 3,
+                completed_value_calls: 2,
+                accepted_value_outputs: 1,
+                external_checker_tasks: 2,
+                external_checker_reports: 1,
+                external_checker_nodes_observed: 7,
+                external_checker_node_budget_reserved: 40,
+                consumed_external_checker_tasks: 1,
+                external_checker_work_incomplete: true,
+                ..PalsCounters::default()
+            },
+            PalsCounters {
+                value_calls: 1,
+                completed_value_calls: 1,
+                external_checker_tasks: 1,
+                external_checker_reports: 1,
+                external_checker_nodes_observed: 3,
+                external_checker_node_budget_reserved: 20,
+                ..PalsCounters::default()
+            },
+        ] {
+            journal.begin().unwrap();
+            journal
+                .finish(
+                    &context,
+                    &Err(SearchSessionFailure::debug("CheckerRejected", &"fixture")),
+                    AttemptObservation::Pals {
+                        counters,
+                        root_coverage_observed: false,
+                    },
+                )
+                .unwrap();
+        }
+        let receipt = journal.snapshot().unwrap();
+        assert_eq!(receipt.pals_resolver, Some(resolver));
+        let totals = receipt.pals.unwrap();
+        assert_eq!(totals.value_calls, Some(4));
+        assert_eq!(totals.completed_value_calls, Some(3));
+        assert_eq!(totals.accepted_value_outputs, Some(1));
+        assert_eq!(totals.external_checker_tasks, Some(3));
+        assert_eq!(totals.external_checker_reports, Some(2));
+        assert_eq!(totals.external_checker_nodes_observed, Some(10));
+        assert_eq!(totals.external_checker_node_budget_reserved, Some(60));
+        assert_eq!(totals.consumed_external_checker_tasks, Some(1));
+        assert_eq!(totals.external_checker_work_incomplete, Some(true));
+        assert_eq!(totals.cpu_nodes, Some(0));
+        assert_eq!(totals.completed_cpu_tasks, Some(0));
+        assert_eq!(totals.unknown_root_children, None);
+
+        // Losing the entire attempt ledger also loses whether foreign work was
+        // completely observed. Existing sums cannot describe an unknown attempt.
+        journal.begin().unwrap();
+        journal
+            .finish(
+                &context,
+                &Err(SearchSessionFailure::physical_completion_unknown()),
+                AttemptObservation::PalsStarted,
+            )
+            .unwrap();
+        let totals = journal.snapshot().unwrap().pals.unwrap();
+        assert_eq!(totals.external_checker_nodes_observed, None);
+        assert_eq!(totals.external_checker_work_incomplete, None);
+        assert_eq!(totals.value_calls, None);
     }
     #[test]
     fn failed_and_canceled_calls_keep_real_work_and_distinguish_root_unknown() {

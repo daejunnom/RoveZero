@@ -117,6 +117,23 @@ fn run_pals(
             if cpu_depth.replace(value.parse::<u16>()?).is_some() {
                 return Err("duplicate PALS CPU depth".into());
             }
+        } else if let Some(value) = argument.strip_prefix("--pals-cpu-checker=") {
+            if native.checker.selection.replace(value.to_owned()).is_some() {
+                return Err("duplicate PALS CPU checker selection".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-cpu-profile=") {
+            if native.checker.profile.replace(value.to_owned()).is_some() {
+                return Err("duplicate PALS CPU checker profile".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-cpu-profile-sha256=") {
+            if native
+                .checker
+                .profile_hash
+                .replace(value.to_owned())
+                .is_some()
+            {
+                return Err("duplicate PALS CPU checker profile digest".into());
+            }
         } else if let Some(value) = argument.strip_prefix("--pals-max-situations=") {
             if situations.replace(value.parse::<usize>()?).is_some() {
                 return Err("duplicate PALS situation capacity".into());
@@ -259,6 +276,10 @@ fn run_pals(
         ..Default::default()
     };
     config.validate()?;
+    let external_checker = native.checker.is_external()?;
+    if external_checker && model.as_deref() != Some("onnx") {
+        return Err("external PALS CPU checker requires the explicit contextual-WDL ONNX model; the legal-order mock has no model-value endpoint".into());
+    }
     if rounds == 0
         || rounds > 1_000_000
         || max_cpu_nodes == 0
@@ -303,6 +324,7 @@ fn run_pals(
 
 #[derive(Default)]
 struct PalsNativeOptions {
+    checker: PalsCheckerOptions,
     manifest: Option<String>,
     manifest_hash: Option<String>,
     runtime: Option<String>,
@@ -325,6 +347,72 @@ struct PalsNativeOptions {
     cuda_loading_profile: Option<String>,
     cuda_loading_profile_hash: Option<String>,
     startup_probe_timeout_ms: Option<u64>,
+}
+#[derive(Default)]
+struct PalsCheckerOptions {
+    selection: Option<String>,
+    profile: Option<String>,
+    profile_hash: Option<String>,
+}
+impl PalsCheckerOptions {
+    fn is_external(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        match (
+            self.selection.as_deref().unwrap_or("own"),
+            &self.profile,
+            &self.profile_hash,
+        ) {
+            ("own", None, None) => Ok(false),
+            ("external-uci", Some(path), Some(hash)) if !path.is_empty() && !hash.is_empty() => Ok(true),
+            _ => Err("PALS CPU checker expects own without a profile, or external-uci with both absolute profile path and SHA-256; no fallback was started".into()),
+        }
+    }
+    #[cfg(feature = "onnx-cpu")]
+    fn load(
+        &self,
+    ) -> Result<
+        Option<rz_uci::pals_checker_profile::LoadedPalsCheckerProfile>,
+        Box<dyn std::error::Error>,
+    > {
+        if !self.is_external()? {
+            return Ok(None);
+        }
+        Ok(Some(
+            rz_uci::pals_checker_profile::PalsCheckerProfile::load(
+                std::path::Path::new(self.profile.as_deref().ok_or("missing checker profile")?),
+                self.profile_hash
+                    .as_deref()
+                    .ok_or("missing checker profile pin")?,
+            )?,
+        ))
+    }
+}
+#[cfg(test)]
+mod pals_checker_option_tests {
+    use super::PalsCheckerOptions;
+
+    #[test]
+    fn helper_selection_requires_an_explicit_complete_profile_without_fallback() {
+        assert!(!PalsCheckerOptions::default().is_external().unwrap());
+        for (selection, path, hash, accepted) in [
+            ("own", None, None, true),
+            ("own", Some("/profile.json"), Some("pin"), false),
+            ("external-uci", None, None, false),
+            ("external-uci", Some("/profile.json"), None, false),
+            ("external-uci", None, Some("pin"), false),
+            ("external-uci", Some(""), Some("pin"), false),
+            ("external-uci", Some("/profile.json"), Some("pin"), true),
+            ("unknown", None, None, false),
+        ] {
+            let options = PalsCheckerOptions {
+                selection: Some(selection.into()),
+                profile: path.map(str::to_owned),
+                profile_hash: hash.map(str::to_owned),
+            };
+            assert_eq!(options.is_external().is_ok(), accepted, "{selection}");
+        }
+        // This parser only selects a branch. Absolute paths, byte/canonical pin,
+        // assets and supported options are independently checked by the loader.
+    }
 }
 impl PalsNativeOptions {
     fn any(&self) -> bool {
@@ -377,6 +465,16 @@ fn run_native_pals(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // PALS owns a distinct manifest and tensors. LC0 NativeConfig and its
     // attestation cannot authorize or describe this model.
+    let checker_profile = native.checker.load()?;
+    let checker = checker_profile
+        .as_ref()
+        .map(|profile| profile.create_checker())
+        .transpose()?;
+    let checker_handshake_timeout = checker_profile
+        .as_ref()
+        .map(|profile| profile.config().map(|config| config.handshake_timeout))
+        .transpose()?
+        .unwrap_or(Duration::ZERO); // unused for the synchronous own checker
     let provider = match native.provider.as_deref() {
         Some("cpu") => "cpu",
         Some("cuda") if cfg!(all(feature = "onnx-cuda", target_os = "linux")) => "cuda",
@@ -459,6 +557,9 @@ fn run_native_pals(
                     .into(),
             ),
         };
+    if checker_profile.is_some() && receipt_config.is_none() {
+        return Err("external PALS checker requires the combined output root, launch digest and endpoint ID for independent owner evidence".into());
+    }
     let manifest =
         std::path::PathBuf::from(native.manifest.ok_or("PALS export manifest is required")?);
     let runtime_path =
@@ -614,25 +715,40 @@ fn run_native_pals(
         return Err(Box::new(PalsFinishError {
             primary: Some(Box::new(primary)),
             cleanup,
+            checker_cleanup: None,
+            checker_observation: None,
             publication,
             work_observation: None,
         }));
     }
-    let driver = match rz_uci::search_driver::PalsSessionDriver::new(
-        config,
-        model,
-        rz_search::cpu::CpuConfig::default(),
-        rounds,
-        cpu_nodes,
-        cpu_depth,
-        rz_uci::EngineIdentity {
-            name: format!(
-                "RoveZero PALS P/C ONNX {} + own CPU_R",
-                if provider == "cpu" { "CPU" } else { "CUDA" }
-            ),
-            author: "RoveZero contributors".into(),
-        },
-    ) {
+    let identity = rz_uci::EngineIdentity {
+        name: format!(
+            "RoveZero PALS P/C ONNX {} + {} CPU_R",
+            if provider == "cpu" { "CPU" } else { "CUDA" },
+            if checker.is_some() {
+                "external UCI"
+            } else {
+                "own"
+            },
+        ),
+        author: "RoveZero contributors".into(),
+    };
+    // The helper is unstarted through every fallible constructor. No foreign
+    // process can disappear into a constructor Drop without a shutdown receipt.
+    let driver = match match checker {
+        Some(checker) => rz_uci::search_driver::PalsSessionDriver::new_with_checker(
+            config, model, checker, rounds, cpu_nodes, cpu_depth, identity,
+        ),
+        None => rz_uci::search_driver::PalsSessionDriver::new(
+            config,
+            model,
+            rz_search::cpu::CpuConfig::default(),
+            rounds,
+            cpu_nodes,
+            cpu_depth,
+            identity,
+        ),
+    } {
         Ok(driver) => Arc::new(driver),
         Err(primary) => {
             let cleanup = finish
@@ -641,6 +757,93 @@ fn run_native_pals(
             return Err(Box::new(PalsFinishError {
                 primary: Some(Box::new(primary)),
                 cleanup,
+                checker_cleanup: None,
+                checker_observation: None,
+                publication: None,
+                work_observation: None,
+            }));
+        }
+    };
+    if let Some(profile) = checker_profile.as_ref() {
+        let control = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let startup = driver.start_checker(
+            std::time::Instant::now() + checker_handshake_timeout,
+            control,
+        );
+        if let Err(primary) = startup {
+            // Both owners are attempted independently. A failed helper start is
+            // not a Native startup failure and does not invent a ready helper.
+            let checker_cleanup = driver
+                .finish_checker(std::time::Instant::now() + settings.shutdown_limit)
+                .err();
+            let cleanup = finish
+                .finish(std::time::Instant::now() + settings.shutdown_limit)
+                .err();
+            let observed_work = driver.work_receipt();
+            let observed_checker =
+                rz_uci::pals_attestation::checker::PalsCheckerProcessReceipt::observe(
+                    &driver,
+                    profile.file_sha256(),
+                    profile.canonical_sha256(),
+                );
+            let mut publication = None;
+            if let Some((root, launch, endpoint)) = receipt_config.as_ref() {
+                let result = (|| {
+                    let mut writer = rz_uci::pals_attestation::PalsReceiptWriter::open(
+                        root,
+                        endpoint,
+                        launch,
+                        &runtime_hash,
+                    )?;
+                    if let Ok(evidence) = &observed_checker {
+                        writer.observe_checker(evidence.clone())?;
+                    }
+                    writer.startup(
+                        finish.receipt(),
+                        observed_work.as_ref().ok().cloned().flatten(),
+                    )?;
+                    writer.termination(
+                        finish.receipt(),
+                        false,
+                        observed_work.as_ref().ok().cloned().flatten(),
+                    )
+                })();
+                publication = result.err();
+            }
+            return Err(Box::new(PalsFinishError {
+                primary: Some(Box::new(primary)),
+                cleanup,
+                checker_cleanup,
+                checker_observation: observed_checker.err(),
+                publication,
+                work_observation: observed_work.err(),
+            }));
+        }
+    }
+    let startup_checker = checker_profile
+        .as_ref()
+        .map(|profile| {
+            rz_uci::pals_attestation::checker::PalsCheckerProcessReceipt::observe(
+                &driver,
+                profile.file_sha256(),
+                profile.canonical_sha256(),
+            )
+        })
+        .transpose();
+    let startup_checker = match startup_checker {
+        Ok(evidence) => evidence,
+        Err(checker_observation) => {
+            let checker_cleanup = driver
+                .finish_checker(std::time::Instant::now() + settings.shutdown_limit)
+                .err();
+            let cleanup = finish
+                .finish(std::time::Instant::now() + settings.shutdown_limit)
+                .err();
+            return Err(Box::new(PalsFinishError {
+                primary: None,
+                cleanup,
+                checker_cleanup,
+                checker_observation: Some(checker_observation),
                 publication: None,
                 work_observation: None,
             }));
@@ -649,12 +852,17 @@ fn run_native_pals(
     let startup_work = match driver.work_receipt() {
         Ok(work) => work,
         Err(work_observation) => {
+            let checker_cleanup = driver
+                .finish_checker(std::time::Instant::now() + settings.shutdown_limit)
+                .err();
             let cleanup = finish
                 .finish(std::time::Instant::now() + settings.shutdown_limit)
                 .err();
             return Err(Box::new(PalsFinishError {
                 primary: None,
                 cleanup,
+                checker_cleanup,
+                checker_observation: None,
                 publication: None,
                 work_observation: Some(work_observation),
             }));
@@ -669,27 +877,42 @@ fn run_native_pals(
                 &runtime_hash,
             );
             match opened {
-                Ok(mut writer) => match writer.startup(finish.receipt(), startup_work.clone()) {
+                Ok(mut writer) => match (|| {
+                    if let Some(evidence) = startup_checker.as_ref() {
+                        writer.observe_checker(evidence.clone())?;
+                    }
+                    writer.startup(finish.receipt(), startup_work.clone())
+                })() {
                     Ok(()) => Some(writer),
                     Err(publication) => {
+                        let checker_cleanup = driver
+                            .finish_checker(std::time::Instant::now() + settings.shutdown_limit)
+                            .err();
                         let cleanup = finish
                             .finish(std::time::Instant::now() + settings.shutdown_limit)
                             .err();
                         return Err(Box::new(PalsFinishError {
                             primary: None,
                             cleanup,
+                            checker_cleanup,
+                            checker_observation: None,
                             publication: Some(publication),
                             work_observation: None,
                         }));
                     }
                 },
                 Err(publication) => {
+                    let checker_cleanup = driver
+                        .finish_checker(std::time::Instant::now() + settings.shutdown_limit)
+                        .err();
                     let cleanup = finish
                         .finish(std::time::Instant::now() + settings.shutdown_limit)
                         .err();
                     return Err(Box::new(PalsFinishError {
                         primary: None,
                         cleanup,
+                        checker_cleanup,
+                        checker_observation: None,
                         publication: Some(publication),
                         work_observation: None,
                     }));
@@ -702,23 +925,50 @@ fn run_native_pals(
     let clock = ProcessClock::new(ProcessEpoch(1));
     let process = EngineProcess::with_search_driver(driver.clone(), owners, clock);
     let served = serve_process(process, settings);
+    let checker_finished =
+        driver.finish_checker(std::time::Instant::now() + settings.shutdown_limit);
     let finished = finish.finish(std::time::Instant::now() + settings.shutdown_limit);
     let observed_work = driver.work_receipt();
+    let observed_checker = checker_profile
+        .as_ref()
+        .map(|profile| {
+            rz_uci::pals_attestation::checker::PalsCheckerProcessReceipt::observe(
+                &driver,
+                profile.file_sha256(),
+                profile.canonical_sha256(),
+            )
+        })
+        .transpose();
     let publication = receipts.as_mut().and_then(|writer| {
+        if let Ok(Some(evidence)) = &observed_checker {
+            if let Err(error) = writer.observe_checker(evidence.clone()) {
+                return Some(error);
+            }
+        }
         writer
             .termination(
                 finish.receipt(),
-                served.is_ok(),
+                served.is_ok()
+                    && finished.is_ok()
+                    && checker_finished.is_ok()
+                    && observed_work.is_ok()
+                    && observed_checker.is_ok(),
                 observed_work.as_ref().ok().cloned().flatten(),
             )
             .err()
     });
-    if publication.is_some() || observed_work.is_err() {
+    if publication.is_some()
+        || observed_work.is_err()
+        || checker_finished.is_err()
+        || observed_checker.is_err()
+    {
         return Err(Box::new(PalsFinishError {
             primary: served
                 .err()
                 .map(|error| Box::new(error) as Box<dyn std::error::Error>),
             cleanup: finished.err(),
+            checker_cleanup: checker_finished.err(),
+            checker_observation: observed_checker.err(),
             publication,
             work_observation: observed_work.err(),
         }));
@@ -747,6 +997,8 @@ fn run_native_pals(
                 .err()
                 .map(|error| Box::new(error) as Box<dyn std::error::Error>),
             cleanup: Some(cleanup),
+            checker_cleanup: None,
+            checker_observation: None,
             publication: None,
             work_observation: None,
         })),
@@ -898,6 +1150,8 @@ mod pals_profile_tests {
 struct PalsFinishError {
     primary: Option<Box<dyn std::error::Error>>,
     cleanup: Option<rz_search::pals::engine::RoleError>,
+    checker_cleanup: Option<rz_uci::search_driver::SearchSessionFailure>,
+    checker_observation: Option<rz_uci::search_driver::SearchSessionFailure>,
     publication: Option<rz_uci::process_receipts::ProcessReceiptError>,
     work_observation: Option<rz_contracts::ContractError>,
 }
@@ -909,6 +1163,15 @@ impl std::fmt::Display for PalsFinishError {
         }
         if let Some(cleanup) = &self.cleanup {
             write!(formatter, "PALS physical shutdown failed: {cleanup}; ")?;
+        }
+        if let Some(cleanup) = &self.checker_cleanup {
+            write!(formatter, "PALS CPU helper shutdown failed: {cleanup}; ")?;
+        }
+        if let Some(observation) = &self.checker_observation {
+            write!(
+                formatter,
+                "PALS CPU helper observation failed: {observation}; "
+            )?;
         }
         if let Some(publication) = &self.publication {
             write!(formatter, "PALS receipt publication failed: {publication}")?;

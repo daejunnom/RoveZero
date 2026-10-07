@@ -9,6 +9,7 @@ use crate::{
 };
 use serde::Serialize;
 use std::path::Path;
+pub mod checker;
 
 pub const STARTUP_FILE: &str = "pals-native-startup.v3.json";
 pub const TERMINATION_FILE: &str = "pals-native-termination.v3.json";
@@ -35,6 +36,10 @@ pub struct PalsNativeReceiptV3 {
     pub startup_failure: Option<NativeStartupErrorKind>,
     pub native: NativeRoleReceipt,
     pub search_work: Option<ProcessSearchWorkReceipt>,
+    /// Optional external helper evidence. Native NN and helper completion are
+    /// independent owner fences; historical V3 receipts omit this member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_checker: Option<checker::PalsCheckerProcessReceipt>,
 }
 
 /// Existing private root, fresh process slot, fixed names, bounded encoding,
@@ -47,6 +52,7 @@ pub struct PalsReceiptWriter {
     binary_sha256: String,
     runtime_sha256: String,
     startup_failure: Option<NativeStartupErrorKind>,
+    cpu_checker: Option<checker::PalsCheckerProcessReceipt>,
 }
 #[cfg(feature = "onnx-cpu")]
 impl PalsReceiptWriter {
@@ -85,7 +91,24 @@ impl PalsReceiptWriter {
             binary_sha256: binary.sha256,
             runtime_sha256: runtime_sha256.into(),
             startup_failure: None,
+            cpu_checker: None,
         })
+    }
+    pub fn observe_checker(
+        &mut self,
+        observation: checker::PalsCheckerProcessReceipt,
+    ) -> Result<(), ProcessReceiptError> {
+        if self
+            .cpu_checker
+            .as_ref()
+            .is_some_and(|previous| !previous.same_registration(&observation))
+        {
+            return Err(ProcessReceiptError::boundary(
+                "PALS helper registration changed after startup observation",
+            ));
+        }
+        self.cpu_checker = Some(observation);
+        Ok(())
     }
     fn envelope(
         &self,
@@ -112,6 +135,7 @@ impl PalsReceiptWriter {
             startup_failure: self.startup_failure,
             native,
             search_work,
+            cpu_checker: self.cpu_checker.clone(),
         }
     }
     pub fn startup(
@@ -147,6 +171,16 @@ impl PalsReceiptWriter {
         search_work: Option<ProcessSearchWorkReceipt>,
     ) -> Result<(), ProcessReceiptError> {
         self.validate_execution(&native)?;
+        if service_exit_success
+            && self
+                .cpu_checker
+                .as_ref()
+                .is_some_and(|checker| !checker.cleanup_complete())
+        {
+            return Err(ProcessReceiptError::boundary(
+                "successful PALS service requires independent external helper cleanup",
+            ));
+        }
         // An unsuccessful service may legitimately lack the final observation.
         // Preserve its original failure and partially completed evidence.
         if service_exit_success {

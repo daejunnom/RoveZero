@@ -745,6 +745,26 @@ impl<M: RoleModel> PalsEngine<M> {
     pub fn shutdown_checker(&mut self, deadline: Instant) -> Result<CheckerShutdown, PalsError> {
         Ok(self.cpu.shutdown(deadline)?)
     }
+    pub fn start_checker(
+        &mut self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), PalsError> {
+        self.validate_checker_namespace()?;
+        if self.cpu.identity() != &self.checker_registered_identity
+            || self.cpu_condition() != self.cpu_registered_condition
+        {
+            return Err(StoreError::InvalidConditions("checker startup namespace changed").into());
+        }
+        self.cpu.start(deadline, cancel)?;
+        self.validate_checker_namespace()?;
+        if self.cpu.identity() != &self.checker_registered_identity
+            || self.cpu_condition() != self.cpu_registered_condition
+        {
+            return Err(StoreError::InvalidConditions("checker startup namespace changed").into());
+        }
+        Ok(())
+    }
     pub fn checker_identity(&self) -> &CheckerIdentity {
         &self.checker_registered_identity
     }
@@ -752,6 +772,14 @@ impl<M: RoleModel> PalsEngine<M> {
     /// Bounded per search; raw foreign scores do not enter the own resolver.
     pub fn checker_attempts(&self) -> &[CheckerAttempt] {
         &self.external_attempts
+    }
+    /// Latest actual adapter ledger, including lifecycle updates after a search.
+    /// This is not a second physical attempt or an additional work charge.
+    pub fn checker_last_attempt(&self) -> Option<&CheckerAttempt> {
+        self.cpu.last_attempt()
+    }
+    pub fn checker_startup_uci(&self) -> Option<crate::cpu_checker::ExternalUciIdentity> {
+        self.cpu.startup_uci()
     }
     fn is_external(&self) -> bool {
         matches!(
