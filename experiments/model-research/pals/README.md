@@ -126,6 +126,24 @@ zero-step 재개 검사를 학습 진행·모델 개선·기력·성능의 증�
 증명하지 않습니다. Rust runtime은 ORT I/O binding·worker lease·완료/격리 규칙을
 별도로 연결해야 하며 node마다 Python callback을 호출하지 않습니다.
 
+`rz_pals_model.verifier_producer`는 별도로 등록한 own collection의 공개 P/C 입력에서
+학습 전용 V query를 만들고 **V forward와 CPU 실행 전에** 입력을 봉인합니다. frozen
+미학습 V가 작업을 선택하면 자체 Rust `pals_cpu_task`에 최대 두 개의 유한 CPU 질문을
+발주합니다. 제품의 V-free 경로에는 연결하지 않습니다. 원래 P/C 입력은 불변으로
+보존하며 별도 private bank에 선택, 실제 CPU 조건·완료 깊이·중단 이유·비용과 후속
+evidence를 기록하고 다시 읽어 검증합니다. 단일 작업 관측의 일곱 `preference_rank`는
+모두 `None`이며 task target mask는 비어 있고 CE는 0입니다. 미실행 작업의 효용이나
+WDL·전체 메이트 증명을 만들어 내지 않습니다. CPU threads는 2개, optimizer·backward는
+없으며 parameter SHA가 전후 같아야 합니다. 문법·unit fixture와 실제 Rust dispatch
+자료의 인수는 구분합니다.
+
+중앙 `scripts/pals_model_validate.py`에 등록된 dataset과
+`--verifier-cpu-binary`·`--verifier-cpu-binary-sha256`를 함께 주면 `resume_task` 하나에
+대해 최대 8,192 CPU nodes·120초·4MiB·1 game·1 step의 실행과 private bank 재로딩을
+검사합니다. 실제 자기 바이너리 SHA와 Rules 상태·이력·profile·검색 조건을 확인하며,
+완료 iteration token이 없으면 실제 baseline과 unavailable 이유를 그대로 남깁니다.
+이를 seven-way 효용 학습이나 기력 인수로 해석하지 않습니다.
+
 FLOPs 보고는 FMA=2 기준의 실제 선언 shape에 따른 matrix product 산술입니다.
 encoder와 role 반복 비용을 구분하고 cached memory를 호출마다 중복 계산하지 않습니다.
 softmax·RMSNorm·SwiGLU activation·lookup·이동·CPU 탐색과 backward는 제외 사실을

@@ -44,6 +44,9 @@ def main():
                         help="Registered own-data collection directory for no-step preparation")
     parser.add_argument("--dataset-receipt-sha256")
     parser.add_argument("--dataset-encoder-source-sha256")
+    parser.add_argument("--verifier-cpu-binary", type=Path,
+                        help="Registered own Rust training-private CPU task dispatcher")
+    parser.add_argument("--verifier-cpu-binary-sha256")
     args = parser.parse_args()
     if not 0 <= args.seed <= 2**63 - 1:
         parser.error("seed must fit nonnegative signed int64")
@@ -56,11 +59,19 @@ def main():
     for digest in dataset_args[1:]:
         if digest is not None and not re.fullmatch(r"[0-9a-f]{64}", digest):
             parser.error("dataset identity requires lowercase SHA-256")
+    verifier_args = (args.verifier_cpu_binary, args.verifier_cpu_binary_sha256)
+    if any(verifier_args) and (not all(verifier_args) or not all(dataset_args)):
+        parser.error("private verifier requires binary/digest and a registered own dataset")
+    if args.verifier_cpu_binary_sha256 and not re.fullmatch(r"[0-9a-f]{64}", args.verifier_cpu_binary_sha256):
+        parser.error("private verifier binary requires lowercase SHA-256")
     source = Path(__file__).resolve().parent.parent
     output = checked(args.output)
     runtime_store = checked(args.runtime_store) if args.runtime_store else None
     rules_profile = checked(args.rules_profile_json) if args.rules_profile_json else None
     dataset_run = checked(args.dataset_run) if args.dataset_run else None
+    verifier_binary = checked(args.verifier_cpu_binary) if args.verifier_cpu_binary else None
+    if verifier_binary and (not verifier_binary.is_file() or not 1 <= verifier_binary.stat().st_size <= 1024**3):
+        parser.error("private verifier dispatcher must be a bounded regular executable")
     if args.layout == "shared_pc_if" and rules_profile is None:
         parser.error("shared_pc_if requires a registered Rules descriptor")
     if rules_profile and (not rules_profile.is_file() or rules_profile.stat().st_size > 64 * 1024):
@@ -145,6 +156,25 @@ def main():
                     "--max-output-bytes", "1048576", "--threads", "2",
                     "--batch-size", "1", "--require-masked-value",
                 ], cwd=source, environment=environment)
+                if verifier_binary:
+                    with checkpoint.open("rb") as stream:
+                        checkpoint_sha = hashlib.file_digest(stream, "sha256").hexdigest()
+                    stages["private_verifier_seconds"] = run([
+                        str(python), "-B", "-m", "rz_pals_model.verifier_producer",
+                        "--collection", str(dataset_run),
+                        "--receipt-sha256", args.dataset_receipt_sha256,
+                        "--encoder-source-sha256", args.dataset_encoder_source_sha256,
+                        "--checkpoint", str(checkpoint), "--checkpoint-sha256", checkpoint_sha,
+                        "--cpu-binary", str(verifier_binary),
+                        "--cpu-binary-sha256", args.verifier_cpu_binary_sha256,
+                        "--output", str(output / "private-verifier"),
+                        "--allowed-task", "resume_task", "--max-games", "1", "--max-steps", "1",
+                        "--max-nodes", "8192", "--max-wall-time-ms", "120000",
+                        "--max-output-bytes", "4194304", "--max-forward-flops", "10000000000",
+                        "--baseline-depth", "1", "--requested-depth", "2",
+                        "--max-nodes-per-check", "4096", "--max-task-wall-time-ms", "5000",
+                        "--max-cpu-output-bytes", "65536",
+                    ], cwd=source, environment=environment, seconds=150)
             export_command = cli + ["export", "--checkpoint", str(checkpoint),
                 "--output", str(export), "--layout", args.layout]
             if rules_profile:
