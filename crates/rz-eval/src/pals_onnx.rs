@@ -8,14 +8,14 @@ use crate::asset::{self, parse_sha256};
 use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
 use crate::onnx::{NativeLoadingProfile, NativeMappingObservation, OrtRuntime, Provider};
 use crate::pals_model::{
-    PalsModelConfig, PalsModelInput, PalsRawOutput, PalsRole, PreparedPalsTensors,
-    PALS_ENCODING_SCHEMA, PALS_MODEL_SCHEMA, V_TASK_NAMES,
+    PALS_ENCODING_SCHEMA, PALS_MODEL_SCHEMA, PalsModelConfig, PalsModelInput, PalsRawOutput,
+    PalsRole, PreparedPalsTensors, V_TASK_NAMES,
 };
 use crate::worker::{PhysicalRun, SingleWorker};
 use ort::execution_providers::{
     ArenaExtendStrategy, CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider,
 };
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::tensor::TensorElementType;
 use ort::value::{Tensor, ValueType};
 use rz_contracts::{Digest, PrecisionProfile};
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 mod cuda_control;
@@ -36,6 +36,163 @@ pub use cuda_control::{
     PalsGraphOptimization, PalsGraphPlacement, PalsKernelWitness,
 };
 pub use public_pages::{HostRecordPagePolicy, HostRecordPageSnapshot, HostRecordPageStats};
+
+/// Implementation provenance only. Changing this source digest does not
+/// change the public input, model epoch or encoding semantic namespace.
+pub fn host_record_page_implementation_digest() -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    static DIGEST: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    *DIGEST.get_or_init(|| {
+        let mut digest = Sha256::new();
+        digest.update(b"rz-pals-host-record-pages-implementation/1");
+        for source in [
+            include_bytes!("pals_onnx/public_pages.rs").as_slice(),
+            include_bytes!("pals_model.rs").as_slice(),
+            include_bytes!("pals_onnx.rs").as_slice(),
+            include_bytes!("../../rz-runtime/src/pals.rs").as_slice(),
+        ] {
+            digest.update((source.len() as u64).to_le_bytes());
+            digest.update(source);
+        }
+        digest.finalize().into()
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostRecordPageObservationBoundary {
+    BeforeWorker,
+    Evaluate,
+    NewGame,
+    SnapshotStats,
+    VerifyRuntime,
+    VerifyCudaPlacement,
+    ObserveRuntimeMappings,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostRecordPageObservationOutcome {
+    BeforeWorker,
+    ReturnedOk,
+    ReturnedError,
+    PhysicalCompletionUnknown,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostRecordPageObservationStatus {
+    Available,
+    Unavailable,
+    Contended,
+    Poisoned,
+    OrdinalExhausted,
+}
+/// A command-return observation, never a new physical completion fence.
+#[derive(Clone, Debug)]
+pub struct HostRecordPageObservation {
+    pub command_ordinal: u64,
+    pub boundary: HostRecordPageObservationBoundary,
+    pub outcome: HostRecordPageObservationOutcome,
+    pub snapshot: HostRecordPageSnapshot,
+}
+#[derive(Clone, Debug)]
+pub struct HostRecordPageObservationSnapshot {
+    pub status: HostRecordPageObservationStatus,
+    pub attempted_command_ordinal: u64,
+    /// May be the last earlier observation on failure; its ordinal and status
+    /// must be preserved instead of reporting invented current/zero counters.
+    pub latest: Option<HostRecordPageObservation>,
+}
+struct HostRecordPageObservationLedger {
+    latest: Mutex<Option<HostRecordPageObservation>>,
+    ordinal: AtomicU64,
+    contended: AtomicBool,
+    poisoned: AtomicBool,
+    ordinal_exhausted: AtomicBool,
+}
+/// Bounded metadata only. This handle owns no session, native value, page pin
+/// or worker. The backend remains with its physical owner through shutdown or
+/// quarantine. try_lock keeps observations from delaying the native worker.
+#[derive(Clone)]
+pub struct HostRecordPageObservationHandle(Arc<HostRecordPageObservationLedger>);
+pub type HostRecordPageObservedWorker = (
+    SingleWorker<PalsNativeCommand, Result<PalsNativeResult, BackendError>>,
+    HostRecordPageObservationHandle,
+);
+impl HostRecordPageObservationHandle {
+    fn new(initial: HostRecordPageSnapshot) -> Self {
+        Self(Arc::new(HostRecordPageObservationLedger {
+            latest: Mutex::new(Some(HostRecordPageObservation {
+                command_ordinal: 0,
+                boundary: HostRecordPageObservationBoundary::BeforeWorker,
+                outcome: HostRecordPageObservationOutcome::BeforeWorker,
+                snapshot: initial,
+            })),
+            ordinal: AtomicU64::new(0),
+            contended: AtomicBool::new(false),
+            poisoned: AtomicBool::new(false),
+            ordinal_exhausted: AtomicBool::new(false),
+        }))
+    }
+    fn record(
+        &self,
+        boundary: HostRecordPageObservationBoundary,
+        outcome: HostRecordPageObservationOutcome,
+        snapshot: Option<HostRecordPageSnapshot>,
+    ) {
+        let ordinal = match self
+            .0
+            .ordinal
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+        {
+            Ok(previous) => previous + 1,
+            Err(_) => {
+                self.0.ordinal_exhausted.store(true, Ordering::Release);
+                return;
+            }
+        };
+        match self.0.latest.try_lock() {
+            Ok(mut latest) => {
+                *latest = snapshot.map(|snapshot| HostRecordPageObservation {
+                    command_ordinal: ordinal,
+                    boundary,
+                    outcome,
+                    snapshot,
+                });
+            }
+            Err(TryLockError::WouldBlock) => self.0.contended.store(true, Ordering::Release),
+            Err(TryLockError::Poisoned(_)) => self.0.poisoned.store(true, Ordering::Release),
+        }
+    }
+    pub fn snapshot(&self) -> HostRecordPageObservationSnapshot {
+        let ordinal = self.0.ordinal.load(Ordering::Acquire);
+        let (mut status, latest) = match self.0.latest.try_lock() {
+            Ok(latest) => (HostRecordPageObservationStatus::Available, latest.clone()),
+            Err(TryLockError::WouldBlock) => (HostRecordPageObservationStatus::Contended, None),
+            Err(TryLockError::Poisoned(error)) => (
+                HostRecordPageObservationStatus::Poisoned,
+                error.into_inner().clone(),
+            ),
+        };
+        if self.0.ordinal_exhausted.load(Ordering::Acquire) {
+            status = HostRecordPageObservationStatus::OrdinalExhausted;
+        } else if self.0.poisoned.load(Ordering::Acquire) {
+            status = HostRecordPageObservationStatus::Poisoned;
+        } else if self.0.contended.load(Ordering::Acquire)
+            || latest
+                .as_ref()
+                .is_some_and(|entry| entry.command_ordinal != ordinal)
+        {
+            status = HostRecordPageObservationStatus::Contended;
+        } else if latest.is_none() {
+            status = HostRecordPageObservationStatus::Unavailable;
+        }
+        HostRecordPageObservationSnapshot {
+            status,
+            attempted_command_ordinal: ordinal,
+            latest,
+        }
+    }
+}
 
 const MAX_MANIFEST_BYTES: usize = 128 * 1024;
 const MAX_GRAPH_BYTES: usize = 256 * 1024 * 1024;
@@ -760,7 +917,7 @@ fn validate_manifest(manifest: &ExportManifest) -> Result<[u8; 32], BackendError
                 K::IdentityMismatch,
                 S::Asset,
                 "PALS Rules semantic profile/digest is missing or invalid",
-            ))
+            ));
         }
     }
     for digest in [
@@ -1615,7 +1772,7 @@ impl PalsOnnxBackend {
                     K::IdentityMismatch,
                     S::Backend,
                     "PALS provider and verified native runtime bundle differ",
-                ))
+                ));
             }
             (Provider::Cuda { .. }, Some(_)) => {
                 runtime.verify_cuda_dependencies().map_err(|mut failure| {
@@ -2126,10 +2283,51 @@ impl PalsOnnxBackend {
             .clone()
     }
     pub fn controlled_worker(
+        self,
+    ) -> Result<SingleWorker<PalsNativeCommand, Result<PalsNativeResult, BackendError>>, BackendError>
+    {
+        self.controlled_worker_inner(None)
+    }
+    /// Opt-in checked metadata channel. Capture occurs on actual command
+    /// return, including a latched unknown-completion failure, before its
+    /// physical outcome is published. A diagnostic failure never creates a
+    /// successful result or releases the backend's quarantined native owners.
+    pub fn controlled_worker_with_host_record_page_observations(
+        self,
+    ) -> Result<HostRecordPageObservedWorker, BackendError> {
+        let initial = self.host_record_page_snapshot().ok_or_else(|| {
+            fail(
+                K::InvalidInput,
+                S::Admission,
+                "host record page observation requires an enabled page policy",
+            )
+        })?;
+        let handle = HostRecordPageObservationHandle::new(initial);
+        let worker = self.controlled_worker_inner(Some(handle.clone()))?;
+        Ok((worker, handle))
+    }
+    fn controlled_worker_inner(
         mut self,
+        observer: Option<HostRecordPageObservationHandle>,
     ) -> Result<SingleWorker<PalsNativeCommand, Result<PalsNativeResult, BackendError>>, BackendError>
     {
         SingleWorker::spawn_with_outcome(move |command| {
+            let boundary = match &command {
+                PalsNativeCommand::Evaluate(_) => HostRecordPageObservationBoundary::Evaluate,
+                PalsNativeCommand::NewGame => HostRecordPageObservationBoundary::NewGame,
+                PalsNativeCommand::SnapshotStats => {
+                    HostRecordPageObservationBoundary::SnapshotStats
+                }
+                PalsNativeCommand::VerifyRuntime => {
+                    HostRecordPageObservationBoundary::VerifyRuntime
+                }
+                PalsNativeCommand::VerifyCudaPlacement => {
+                    HostRecordPageObservationBoundary::VerifyCudaPlacement
+                }
+                PalsNativeCommand::ObserveRuntimeMappings => {
+                    HostRecordPageObservationBoundary::ObserveRuntimeMappings
+                }
+            };
             let result = match command {
                 PalsNativeCommand::Evaluate(input) => {
                     self.run(input).map(PalsNativeResult::Evaluation)
@@ -2150,6 +2348,16 @@ impl PalsOnnxBackend {
                     .runtime_mapping_witness()
                     .map(|witness| PalsNativeResult::RuntimeMappingsObserved(Box::new(witness))),
             };
+            if let Some(observer) = &observer {
+                let outcome = if self.quarantine.is_some() {
+                    HostRecordPageObservationOutcome::PhysicalCompletionUnknown
+                } else if result.is_ok() {
+                    HostRecordPageObservationOutcome::ReturnedOk
+                } else {
+                    HostRecordPageObservationOutcome::ReturnedError
+                };
+                observer.record(boundary, outcome, self.host_record_page_snapshot());
+            }
             match self.quarantine.as_ref() {
                 Some(cause) => PhysicalRun::Quarantined(cause.clone()),
                 None => PhysicalRun::Complete(result),
@@ -3073,6 +3281,102 @@ mod device {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn host_page_observation_fixture() -> HostRecordPageSnapshot {
+        HostRecordPageSnapshot {
+            policy: HostRecordPagePolicy::for_registered_graph([4; 32]),
+            bank: MemoryBankSnapshot::default(),
+            stats: HostRecordPageStats::default(),
+            active_pin_count: 0,
+            retained_join_bytes: 0,
+            active_subset_bytes: 0,
+            active_join_backing_bytes: 0,
+            active_full_input_bytes: 0,
+            transient_reservation_bytes: 0,
+            quarantined: false,
+        }
+    }
+    #[test]
+    fn host_page_observation_keeps_actual_command_unknown_and_stale_status() {
+        let initial = host_page_observation_fixture();
+        let handle = HostRecordPageObservationHandle::new(initial.clone());
+        let observation = handle.snapshot();
+        assert_eq!(
+            observation.status,
+            HostRecordPageObservationStatus::Available
+        );
+        assert_eq!(
+            observation.latest.unwrap().boundary,
+            HostRecordPageObservationBoundary::BeforeWorker
+        );
+        let mut unknown = initial;
+        unknown.quarantined = true;
+        unknown.active_pin_count = 2;
+        unknown.active_full_input_bytes = 123;
+        handle.record(
+            HostRecordPageObservationBoundary::Evaluate,
+            HostRecordPageObservationOutcome::PhysicalCompletionUnknown,
+            Some(unknown),
+        );
+        let captured = handle.snapshot();
+        let latest = captured.latest.unwrap();
+        assert_eq!(captured.attempted_command_ordinal, 1);
+        assert_eq!(latest.command_ordinal, 1);
+        assert_eq!(
+            latest.outcome,
+            HostRecordPageObservationOutcome::PhysicalCompletionUnknown
+        );
+        assert_eq!(latest.snapshot.active_full_input_bytes, 123);
+        assert!(latest.snapshot.quarantined);
+        let held = handle.0.latest.lock().unwrap();
+        handle.record(
+            HostRecordPageObservationBoundary::SnapshotStats,
+            HostRecordPageObservationOutcome::ReturnedError,
+            Some(host_page_observation_fixture()),
+        );
+        drop(held);
+        let stale = handle.snapshot();
+        assert_eq!(stale.status, HostRecordPageObservationStatus::Contended);
+        assert_eq!(stale.attempted_command_ordinal, 2);
+        assert_eq!(stale.latest.unwrap().command_ordinal, 1);
+    }
+    #[test]
+    fn host_page_observation_poison_missing_and_ordinal_exhaustion_are_explicit() {
+        let missing = HostRecordPageObservationHandle::new(host_page_observation_fixture());
+        missing.record(
+            HostRecordPageObservationBoundary::NewGame,
+            HostRecordPageObservationOutcome::ReturnedError,
+            None,
+        );
+        assert_eq!(
+            missing.snapshot().status,
+            HostRecordPageObservationStatus::Unavailable
+        );
+        assert!(missing.snapshot().latest.is_none());
+        let exhausted = HostRecordPageObservationHandle::new(host_page_observation_fixture());
+        exhausted.0.ordinal.store(u64::MAX, Ordering::Release);
+        exhausted.record(
+            HostRecordPageObservationBoundary::NewGame,
+            HostRecordPageObservationOutcome::ReturnedOk,
+            Some(host_page_observation_fixture()),
+        );
+        assert_eq!(
+            exhausted.snapshot().status,
+            HostRecordPageObservationStatus::OrdinalExhausted
+        );
+        let poisoned = HostRecordPageObservationHandle::new(host_page_observation_fixture());
+        let other = poisoned.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = other.0.latest.lock().unwrap();
+                panic!("poison metadata-only host page observation fixture");
+            })
+            .join()
+            .is_err()
+        );
+        let snapshot = poisoned.snapshot();
+        assert_eq!(snapshot.status, HostRecordPageObservationStatus::Poisoned);
+        assert!(snapshot.latest.is_some());
+    }
 
     #[test]
     fn startup_stage_probe_preserves_partial_stage_and_shared_clock_without_retry() {
@@ -3106,14 +3410,18 @@ mod tests {
         );
         assert_eq!(observed.events[1].role, PalsRole::Proposer);
         assert_eq!(observed.events[1].request_ordinal, 1);
-        assert!(observed
-            .events
-            .windows(2)
-            .all(|pair| pair[0].elapsed_ns <= pair[1].elapsed_ns));
-        assert!(observed
-            .events
-            .iter()
-            .all(|event| event.elapsed_ns <= observed.snapshot_elapsed_ns.unwrap()));
+        assert!(
+            observed
+                .events
+                .windows(2)
+                .all(|pair| pair[0].elapsed_ns <= pair[1].elapsed_ns)
+        );
+        assert!(
+            observed
+                .events
+                .iter()
+                .all(|event| event.elapsed_ns <= observed.snapshot_elapsed_ns.unwrap())
+        );
         // A late native return cannot mutate the already frozen startup view,
         // arm a new capture, or be mistaken for an observed physical fence.
         startup_return(Some(&trace), PalsStartupBackendStage::PublicRun, true);
@@ -3222,12 +3530,14 @@ mod tests {
     fn startup_stage_probe_poison_is_explicit_and_does_not_rearm() {
         let probe = PalsStartupStageProbe::new();
         let other = probe.clone();
-        assert!(std::thread::spawn(move || {
-            let _held = other.shared.ledger.lock().unwrap();
-            panic!("poison metadata-only startup diagnostic fixture");
-        })
-        .join()
-        .is_err());
+        assert!(
+            std::thread::spawn(move || {
+                let _held = other.shared.ledger.lock().unwrap();
+                panic!("poison metadata-only startup diagnostic fixture");
+            })
+            .join()
+            .is_err()
+        );
         assert!(!probe.start(Instant::now()));
         assert!(probe.begin_role(PalsRole::Proposer).is_none());
         let snapshot = probe.snapshot_and_stop();
@@ -3645,11 +3955,13 @@ mod tests {
             failure
         );
         let mut final_rejected = CudaMappingAudit::default();
-        assert!(final_rejected
-            .final_audit(|| panic!(
-                "final audit cannot require lazy provider images before first Run"
-            ))
-            .is_err());
+        assert!(
+            final_rejected
+                .final_audit(|| panic!(
+                    "final audit cannot require lazy provider images before first Run"
+                ))
+                .is_err()
+        );
         final_rejected.after_run(true, || Ok(())).unwrap();
         let failure = final_rejected
             .final_audit(|| {

@@ -190,6 +190,9 @@ impl PalsReceiptWriter {
                 ));
             }
             self.validate_loading_mapping(&native, true)?;
+            crate::pals_native::validate_host_record_page_evidence(&native, true).map_err(|_| {
+                ProcessReceiptError::boundary("successful PALS host record pages require actual final snapshot, declared bounds and physical join evidence")
+            })?;
         }
         if service_exit_success
             && native.execution.provider == "cuda"
@@ -254,6 +257,9 @@ impl PalsReceiptWriter {
         Ok(())
     }
     fn validate_execution(&self, native: &NativeRoleReceipt) -> Result<(), ProcessReceiptError> {
+        crate::pals_native::validate_host_record_page_evidence(native, false).map_err(|_| {
+            ProcessReceiptError::boundary("PALS host record page declaration/observation differs from its actual execution identity or bounds")
+        })?;
         let runtime: String = native
             .execution
             .runtime_sha256

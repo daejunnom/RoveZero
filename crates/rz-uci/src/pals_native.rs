@@ -491,6 +491,9 @@ mod native {
     use rz_eval::error::BackendError;
     use rz_eval::pals_model::PALS_ENCODING_SCHEMA;
     use rz_eval::pals_onnx::{
+        HostRecordPageObservationBoundary, HostRecordPageObservationHandle,
+        HostRecordPageObservationOutcome, HostRecordPageObservationSnapshot,
+        HostRecordPageObservationStatus, HostRecordPagePolicy, HostRecordPageSnapshot,
         PalsBackendStats, PalsCudaControlPolicy, PalsCudaPlacementWitness, PalsGraphOptimization,
         PalsNativeCommand, PalsNativeMappingWitness, PalsNativeResult, PalsOnnxBackend,
         PalsSessionResidency, PalsStartupStageProbe, PalsStartupStageSnapshot,
@@ -571,6 +574,8 @@ mod native {
         final_stats: Mutex<Option<NativeBackendStatsReceipt>>,
         stats_lease: Mutex<Option<NativePhysicalLease>>,
         execution: NativeExecutionReceipt,
+        additional_host_bytes: u64,
+        host_record_page_observer: Option<HostRecordPageObservationHandle>,
         // Zero preserves the legacy absent/default wire; explicit selection
         // is copied into immutable receipt snapshots, never worker inputs.
         startup_probe_timeout_ms: AtomicU64,
@@ -644,6 +649,307 @@ mod native {
         pub profile: &'static str,
         pub canonical_sha256: [u8; 32],
     }
+    /// Explicit owner selection. These are bounded allocation declarations,
+    /// not measured process, ORT workspace or VRAM peaks.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct NativeHostRecordPageLimits {
+        pub max_page_entries: usize,
+        pub max_page_bytes: u64,
+        pub max_transient_bytes: u64,
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct NativeOwnerOptions {
+        pub drain_limit: Duration,
+        pub host_record_pages: Option<NativeHostRecordPageLimits>,
+    }
+    impl NativeOwnerOptions {
+        fn validate(self, config: &rz_eval::pals_onnx::PalsOnnxConfig) -> Result<(), RoleError> {
+            if self.drain_limit.is_zero() || Instant::now().checked_add(self.drain_limit).is_none()
+            {
+                return Err(RoleError::Backend(
+                    "PALS drain limit must be positive and finite".into(),
+                ));
+            }
+            if let Some(limits) = self.host_record_pages {
+                if config.device_public_memory || !config.cache_public_memory {
+                    return Err(RoleError::Backend("PALS host record pages require host caching; device public memory combination is unsupported".into()));
+                }
+                if !(2..=1024).contains(&limits.max_page_entries)
+                    || !(1..=16 * 1024 * 1024).contains(&limits.max_page_bytes)
+                    || !(1..=16 * 1024 * 1024).contains(&limits.max_transient_bytes)
+                {
+                    return Err(RoleError::Backend(
+                        "PALS host record page declarations are invalid".into(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+    #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+    pub struct NativeHostRecordPageDeclaration {
+        pub schema: &'static str,
+        pub public_graph_sha256: [u8; 32],
+        pub projection_semantics: &'static str,
+        pub precision: &'static str,
+        /// Source provenance of the implementation, separate from the frozen
+        /// model, weights and full Rules/input encoding meaning.
+        pub implementation_sha256: [u8; 32],
+        pub max_page_entries: usize,
+        pub max_page_bytes: u64,
+        pub max_transient_bytes: u64,
+    }
+    impl NativeHostRecordPageDeclaration {
+        fn from_policy(policy: HostRecordPagePolicy) -> Self {
+            Self {
+                schema: "rz-pals-host-record-pages/1",
+                public_graph_sha256: policy.public_graph_sha256,
+                projection_semantics: policy.projection_semantics,
+                precision: "fp32",
+                implementation_sha256: rz_eval::pals_onnx::host_record_page_implementation_digest(),
+                max_page_entries: policy.max_page_entries,
+                max_page_bytes: policy.max_page_bytes,
+                max_transient_bytes: policy.max_transient_bytes,
+            }
+        }
+        fn reserved_host_bytes(&self) -> Result<u64, RoleError> {
+            self.max_page_bytes
+                .checked_add(self.max_transient_bytes)
+                .ok_or(RoleError::InvalidOutput)
+        }
+    }
+    #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+    pub struct NativeHostRecordPageBankReceipt {
+        pub entries: usize,
+        pub reserved_bytes: u64,
+        pub pinned_entries: usize,
+        pub pinned_bytes: u64,
+        pub max_entries: usize,
+        pub max_bytes: u64,
+        pub entry_backing_bytes: u64,
+    }
+    #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+    pub struct NativeHostRecordPageStatsReceipt {
+        pub view_hits: u64,
+        pub view_misses: u64,
+        pub board_hits: u64,
+        pub board_misses: u64,
+        pub record_hits: u64,
+        pub record_misses: u64,
+        pub public_calls_attempted: u64,
+        pub public_calls_completed: u64,
+        pub encoded_record_tokens: u64,
+        pub submitted_record_tokens: u64,
+        pub contextual_board_encodes_completed: u64,
+        pub joins_completed: u64,
+        pub joined_bytes: u64,
+        pub evicted_pages: u64,
+        pub max_reserved_host_transient_bytes: u64,
+    }
+    #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+    pub struct NativeHostRecordPageSnapshotReceipt {
+        pub declaration: NativeHostRecordPageDeclaration,
+        pub bank: NativeHostRecordPageBankReceipt,
+        pub stats: NativeHostRecordPageStatsReceipt,
+        pub active_pin_count: usize,
+        pub retained_join_bytes: u64,
+        pub active_subset_bytes: u64,
+        pub active_join_backing_bytes: u64,
+        pub active_full_input_bytes: u64,
+        pub transient_reservation_bytes: u64,
+        pub quarantined: bool,
+    }
+    impl From<HostRecordPageSnapshot> for NativeHostRecordPageSnapshotReceipt {
+        fn from(snapshot: HostRecordPageSnapshot) -> Self {
+            let bank = snapshot.bank;
+            let stats = snapshot.stats;
+            Self {
+                declaration: NativeHostRecordPageDeclaration::from_policy(snapshot.policy),
+                bank: NativeHostRecordPageBankReceipt {
+                    entries: bank.entries,
+                    reserved_bytes: bank.reserved_bytes,
+                    pinned_entries: bank.pinned_entries,
+                    pinned_bytes: bank.pinned_bytes,
+                    max_entries: bank.max_entries,
+                    max_bytes: bank.max_bytes,
+                    entry_backing_bytes: bank.entry_backing_bytes,
+                },
+                stats: NativeHostRecordPageStatsReceipt {
+                    view_hits: stats.view_hits,
+                    view_misses: stats.view_misses,
+                    board_hits: stats.board_hits,
+                    board_misses: stats.board_misses,
+                    record_hits: stats.record_hits,
+                    record_misses: stats.record_misses,
+                    public_calls_attempted: stats.public_calls_attempted,
+                    public_calls_completed: stats.public_calls_completed,
+                    encoded_record_tokens: stats.encoded_record_tokens,
+                    submitted_record_tokens: stats.submitted_record_tokens,
+                    contextual_board_encodes_completed: stats.contextual_board_encodes_completed,
+                    joins_completed: stats.joins_completed,
+                    joined_bytes: stats.joined_bytes,
+                    evicted_pages: stats.evicted_pages,
+                    max_reserved_host_transient_bytes: stats.max_reserved_host_transient_bytes,
+                },
+                active_pin_count: snapshot.active_pin_count,
+                retained_join_bytes: snapshot.retained_join_bytes,
+                active_subset_bytes: snapshot.active_subset_bytes,
+                active_join_backing_bytes: snapshot.active_join_backing_bytes,
+                active_full_input_bytes: snapshot.active_full_input_bytes,
+                transient_reservation_bytes: snapshot.transient_reservation_bytes,
+                quarantined: snapshot.quarantined,
+            }
+        }
+    }
+    #[derive(Clone, Debug, serde::Serialize)]
+    pub struct NativeHostRecordPageCommandReceipt {
+        pub command_ordinal: u64,
+        pub boundary: HostRecordPageObservationBoundary,
+        pub outcome: HostRecordPageObservationOutcome,
+        pub snapshot: NativeHostRecordPageSnapshotReceipt,
+    }
+    #[derive(Clone, Debug, serde::Serialize)]
+    pub struct NativeHostRecordPageObservationReceipt {
+        pub schema: &'static str,
+        pub status: HostRecordPageObservationStatus,
+        pub attempted_command_ordinal: u64,
+        /// Last actually captured command; missing/old remains explicit.
+        pub latest: Option<NativeHostRecordPageCommandReceipt>,
+    }
+    /// Validate actual metadata without upgrading it to a native completion
+    /// fence or a process peak measurement. Failed paths may retain an older
+    /// snapshot and explicit diagnostic/physical-unknown status.
+    pub(crate) fn validate_host_record_page_evidence(
+        native: &NativeRoleReceipt,
+        require_final: bool,
+    ) -> Result<(), RoleError> {
+        let Some(declaration) = &native.execution.host_record_pages else {
+            return if native.host_record_page_observation.is_none() {
+                Ok(())
+            } else {
+                Err(RoleError::InvalidOutput)
+            };
+        };
+        if native.execution.device_public_memory
+            || declaration.schema != "rz-pals-host-record-pages/1"
+            || declaration.precision != "fp32"
+            || declaration.projection_semantics
+                != rz_eval::pals_model::INDEPENDENT_RECORD_PROJECTION_SEMANTICS
+            || declaration.implementation_sha256
+                != rz_eval::pals_onnx::host_record_page_implementation_digest()
+            || !(2..=1024).contains(&declaration.max_page_entries)
+            || !(1..=16 * 1024 * 1024).contains(&declaration.max_page_bytes)
+            || !(1..=16 * 1024 * 1024).contains(&declaration.max_transient_bytes)
+            || native
+                .residency
+                .graphs
+                .iter()
+                .filter(|graph| graph.role == "public")
+                .count()
+                != 1
+            || !native.residency.graphs.iter().any(|graph| {
+                graph.role == "public" && graph.sha256 == declaration.public_graph_sha256
+            })
+        {
+            return Err(RoleError::InvalidOutput);
+        }
+        declaration.reserved_host_bytes()?;
+        let Some(observation) = &native.host_record_page_observation else {
+            return if require_final {
+                Err(RoleError::InvalidOutput)
+            } else {
+                Ok(())
+            };
+        };
+        if observation.schema != "rz-pals-host-record-page-observation/1" {
+            return Err(RoleError::InvalidOutput);
+        }
+        if observation.status == HostRecordPageObservationStatus::Available
+            && !observation.latest.as_ref().is_some_and(|latest| {
+                latest.command_ordinal == observation.attempted_command_ordinal
+            })
+        {
+            return Err(RoleError::InvalidOutput);
+        }
+        if let Some(latest) = &observation.latest {
+            let snapshot = &latest.snapshot;
+            let bank = &snapshot.bank;
+            let stats = &snapshot.stats;
+            if snapshot.declaration != *declaration
+                || latest.command_ordinal > observation.attempted_command_ordinal
+                || (latest.command_ordinal == 0)
+                    != (latest.boundary == HostRecordPageObservationBoundary::BeforeWorker
+                        && latest.outcome == HostRecordPageObservationOutcome::BeforeWorker)
+                || bank.max_entries != declaration.max_page_entries
+                || bank.entries > bank.max_entries
+                || bank.pinned_entries > bank.entries
+                || bank.pinned_bytes > bank.reserved_bytes
+                || bank.reserved_bytes > bank.max_bytes
+                || bank
+                    .max_bytes
+                    .checked_add(bank.entry_backing_bytes)
+                    .is_none_or(|bytes| bytes > declaration.max_page_bytes)
+                || stats.public_calls_completed > stats.public_calls_attempted
+                || stats.encoded_record_tokens > stats.submitted_record_tokens
+                || stats.contextual_board_encodes_completed != stats.public_calls_completed
+                || stats.max_reserved_host_transient_bytes > declaration.max_transient_bytes
+                || snapshot.transient_reservation_bytes > declaration.max_transient_bytes
+                || snapshot.retained_join_bytes > declaration.max_transient_bytes
+                || snapshot.active_subset_bytes > declaration.max_transient_bytes
+                || snapshot.active_join_backing_bytes > declaration.max_transient_bytes
+                || snapshot.active_full_input_bytes > declaration.max_transient_bytes
+                || (latest.outcome == HostRecordPageObservationOutcome::PhysicalCompletionUnknown
+                    && !snapshot.quarantined)
+            {
+                return Err(RoleError::InvalidOutput);
+            }
+        }
+        if require_final {
+            let latest = observation
+                .latest
+                .as_ref()
+                .ok_or(RoleError::InvalidOutput)?;
+            let snapshot = &latest.snapshot;
+            if observation.status != HostRecordPageObservationStatus::Available
+                || latest.command_ordinal != observation.attempted_command_ordinal
+                || latest.command_ordinal == 0
+                || latest.boundary != HostRecordPageObservationBoundary::SnapshotStats
+                || latest.outcome != HostRecordPageObservationOutcome::ReturnedOk
+                || snapshot.quarantined
+                || snapshot.bank.pinned_entries != 0
+                || snapshot.bank.pinned_bytes != 0
+                || snapshot.active_pin_count != 0
+                || snapshot.active_subset_bytes != 0
+                || snapshot.active_join_backing_bytes != 0
+                || snapshot.active_full_input_bytes != 0
+                || snapshot.transient_reservation_bytes != 0
+                || native.quarantined
+                || native.physical_runs_in_flight != 0
+                || !native.physical_shutdown_confirmed
+                || !native.native_buffers_released
+            {
+                return Err(RoleError::InvalidOutput);
+            }
+        }
+        Ok(())
+    }
+    impl From<HostRecordPageObservationSnapshot> for NativeHostRecordPageObservationReceipt {
+        fn from(observation: HostRecordPageObservationSnapshot) -> Self {
+            Self {
+                schema: "rz-pals-host-record-page-observation/1",
+                status: observation.status,
+                attempted_command_ordinal: observation.attempted_command_ordinal,
+                latest: observation
+                    .latest
+                    .map(|latest| NativeHostRecordPageCommandReceipt {
+                        command_ordinal: latest.command_ordinal,
+                        boundary: latest.boundary,
+                        outcome: latest.outcome,
+                        snapshot: latest.snapshot.into(),
+                    }),
+            }
+        }
+    }
     #[derive(Clone, Debug, serde::Serialize)]
     pub struct NativeExecutionReceipt {
         pub provider: &'static str,
@@ -665,6 +971,8 @@ mod native {
         pub transient_execution_device_bytes: u64,
         pub pinned_request_bytes: u64,
         pub device_public_memory: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub host_record_pages: Option<NativeHostRecordPageDeclaration>,
     }
     /// Initialization work is never converted into search role consumption.
     #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
@@ -852,6 +1160,9 @@ mod native {
             // Unknown internal ORT staging is not a claimed observed zero.
             pinned_request_bytes: 0,
             device_public_memory: backend.config().device_public_memory,
+            host_record_pages: backend
+                .host_record_page_snapshot()
+                .map(|snapshot| NativeHostRecordPageDeclaration::from_policy(snapshot.policy)),
         })
     }
     pub(crate) fn validate_runtime_loading_mapping(
@@ -1120,6 +1431,8 @@ mod native {
         /// native cache buffers survive the subsequent confirmed worker join.
         pub backend_stats: Option<NativeBackendStatsReceipt>,
         pub backend_stats_observation: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub host_record_page_observation: Option<NativeHostRecordPageObservationReceipt>,
         pub execution: NativeExecutionReceipt,
         pub startup_probe: Option<NativeStartupProbeReceipt>,
         /// None means not observed/applicable, not a failed or successful audit.
@@ -1178,6 +1491,11 @@ mod native {
                     .clone(),
                 backend_stats,
                 backend_stats_observation,
+                host_record_page_observation: self
+                    .owner
+                    .host_record_page_observer
+                    .as_ref()
+                    .map(|observer| observer.snapshot().into()),
                 execution: self.owner.execution_receipt(),
                 startup_probe: self
                     .owner
@@ -1232,11 +1550,19 @@ mod native {
                     .lock()
                     .map_err(|_| RoleError::PhysicalCompletionUnknown)?;
                 if slot.is_none() && self.owner.in_flight.load(Ordering::Acquire) == 0 {
-                    let lease = self
+                    let mut worker = self
                         .owner
                         .worker
                         .lock()
-                        .map_err(|_| RoleError::PhysicalCompletionUnknown)?
+                        .map_err(|_| RoleError::PhysicalCompletionUnknown)?;
+                    // The other owner may have consumed this shared cleanup
+                    // window. Expiry never admits a new NN-zero control. The
+                    // worker is known idle here; finish may still attempt its
+                    // shutdown without converting this into unknown Run work.
+                    if Instant::now() >= until {
+                        return Err(RoleError::Deadline);
+                    }
+                    let lease = worker
                         .submit(
                             if self.owner.execution.provider == "cuda"
                                 && !self.owner.final_mapping_confirmed.load(Ordering::Acquire)
@@ -1333,10 +1659,15 @@ mod native {
                     }
                 }
                 if Instant::now() >= until {
-                    // The owner retains an admitted Stats lease on timeout, or
-                    // the role runtime retains the preceding active role lease.
-                    self.owner.quarantined.store(true, Ordering::Release);
-                    return Err(RoleError::PhysicalCompletionUnknown);
+                    if slot.is_some() || self.owner.in_flight.load(Ordering::Acquire) != 0 {
+                        // An already admitted control/role remains physically
+                        // pending. Keep its owners and original unknown state.
+                        self.owner.quarantined.store(true, Ordering::Release);
+                        return Err(RoleError::PhysicalCompletionUnknown);
+                    }
+                    // A completed Verify/Mapping control is a known fence,
+                    // but expiry does not permit the next Stats admission.
+                    return Err(RoleError::Deadline);
                 }
                 drop(slot);
                 std::thread::sleep(Duration::from_millis(1));
@@ -1413,7 +1744,7 @@ mod native {
         type Lease = Lease;
         fn additional_resources(&self, _: &[Arc<RuntimeRoleRequest<PalsModelInput>>]) -> Resources {
             Resources {
-                host_bytes: REQUEST_BYTES,
+                host_bytes: self.owner.additional_host_bytes,
                 device_bytes: self.owner.execution.transient_execution_device_bytes,
                 pinned_bytes: 0,
             }
@@ -1618,10 +1949,29 @@ mod native {
             config: rz_eval::pals_onnx::PalsOnnxConfig,
             drain_limit: Duration,
         ) -> Result<Self, RoleError> {
+            Self::load_pinned_with_options(
+                export,
+                expected_export_sha256,
+                pin,
+                config,
+                NativeOwnerOptions {
+                    drain_limit,
+                    host_record_pages: None,
+                },
+            )
+        }
+        pub fn load_pinned_with_options(
+            export: &std::path::Path,
+            expected_export_sha256: &str,
+            pin: &rz_eval::runtime_pin::RuntimeLibraryPin,
+            config: rz_eval::pals_onnx::PalsOnnxConfig,
+            options: NativeOwnerOptions,
+        ) -> Result<Self, RoleError> {
+            options.validate(&config)?;
             let runtime = rz_eval::onnx::OrtRuntime::load(pin).map_err(model_error)?;
             let backend = PalsOnnxBackend::load(export, expected_export_sha256, runtime, config)
                 .map_err(model_error)?;
-            Self::new_with_drain_limit(backend, drain_limit)
+            Self::new_with_options(backend, options)
         }
         pub fn load_pinned_with_cuda_control_policy(
             export: &std::path::Path,
@@ -1654,6 +2004,29 @@ mod native {
             profile_root: &std::path::Path,
             drain_limit: Duration,
         ) -> Result<Self, RoleError> {
+            Self::load_with_runtime_and_cuda_control_policy_with_options(
+                export,
+                expected_export_sha256,
+                runtime,
+                config,
+                policy,
+                profile_root,
+                NativeOwnerOptions {
+                    drain_limit,
+                    host_record_pages: None,
+                },
+            )
+        }
+        pub fn load_with_runtime_and_cuda_control_policy_with_options(
+            export: &std::path::Path,
+            expected_export_sha256: &str,
+            runtime: rz_eval::onnx::OrtRuntime,
+            config: rz_eval::pals_onnx::PalsOnnxConfig,
+            policy: PalsCudaControlPolicy,
+            profile_root: &std::path::Path,
+            options: NativeOwnerOptions,
+        ) -> Result<Self, RoleError> {
+            options.validate(&config)?;
             let backend = PalsOnnxBackend::load_with_cuda_control_policy(
                 export,
                 expected_export_sha256,
@@ -1663,7 +2036,7 @@ mod native {
                 profile_root,
             )
             .map_err(model_error)?;
-            Self::new_with_drain_limit(backend, drain_limit)
+            Self::new_with_options(backend, options)
         }
         pub fn new(backend: PalsOnnxBackend) -> Result<Self, RoleError> {
             Self::new_with_drain_limit(backend, DEFAULT_DRAIN_LIMIT)
@@ -1672,15 +2045,52 @@ mod native {
         /// limit. There is no independent 30-second native tail hidden behind
         /// a shorter protocol fence.
         pub fn new_with_drain_limit(
-            mut backend: PalsOnnxBackend,
+            backend: PalsOnnxBackend,
             drain_limit: Duration,
         ) -> Result<Self, RoleError> {
-            if drain_limit.is_zero() || Instant::now().checked_add(drain_limit).is_none() {
-                return Err(RoleError::Backend(
-                    "PALS drain limit must be positive and finite".into(),
-                ));
+            Self::new_with_options(
+                backend,
+                NativeOwnerOptions {
+                    drain_limit,
+                    host_record_pages: None,
+                },
+            )
+        }
+        /// Install explicit record pages before native worker ownership and
+        /// before the first chess P/C admission. Already-selected backend
+        /// policies remain explicit selections and are attested as such.
+        pub fn new_with_options(
+            mut backend: PalsOnnxBackend,
+            options: NativeOwnerOptions,
+        ) -> Result<Self, RoleError> {
+            options.validate(&backend.config())?;
+            let drain_limit = options.drain_limit;
+            if let Some(limits) = options.host_record_pages {
+                let graph = backend
+                    .residency()
+                    .graphs
+                    .iter()
+                    .find(|graph| graph.role == "public")
+                    .ok_or(RoleError::InvalidOutput)?;
+                let mut policy = HostRecordPagePolicy::for_registered_graph(graph.sha256);
+                policy.max_page_entries = limits.max_page_entries;
+                policy.max_page_bytes = limits.max_page_bytes;
+                policy.max_transient_bytes = limits.max_transient_bytes;
+                backend
+                    .enable_host_record_pages(policy)
+                    .map_err(model_error)?;
             }
             let execution = execution_receipt(&backend)?;
+            let page_reservation = execution
+                .host_record_pages
+                .as_ref()
+                .map_or(Ok(0), NativeHostRecordPageDeclaration::reserved_host_bytes)?;
+            let additional_host_bytes = REQUEST_BYTES
+                .checked_add(page_reservation)
+                .ok_or(RoleError::InvalidOutput)?;
+            let runtime_host_bytes = (4 * REQUEST_BYTES)
+                .checked_add(page_reservation)
+                .ok_or(RoleError::InvalidOutput)?;
             let is_cuda = execution.provider == "cuda";
             // Dormant until prepare_startup establishes the shared clock.
             // Successful default startup discards the optional diagnostics.
@@ -1739,8 +2149,16 @@ mod native {
                 frozen_epoch: DEPLOYMENT_FROZEN_EPOCH,
                 mode: ExecutionMode::Deployment,
             });
+            let (worker, host_record_page_observer) = if execution.host_record_pages.is_some() {
+                let (worker, observer) = backend
+                    .controlled_worker_with_host_record_page_observations()
+                    .map_err(model_error)?;
+                (worker, Some(observer))
+            } else {
+                (backend.controlled_worker().map_err(model_error)?, None)
+            };
             let owner = Arc::new(WorkerOwner {
-                worker: Mutex::new(backend.controlled_worker().map_err(model_error)?),
+                worker: Mutex::new(worker),
                 physical_completed: AtomicU64::new(0),
                 completed: AtomicU64::new(0),
                 physical_failed: AtomicU64::new(0),
@@ -1768,6 +2186,8 @@ mod native {
                 final_stats: Mutex::new(None),
                 stats_lease: Mutex::new(None),
                 execution: execution.clone(),
+                additional_host_bytes,
+                host_record_page_observer,
                 startup_probe_timeout_ms: AtomicU64::new(0),
                 startup_stage_probe,
                 startup_probe: Mutex::new(is_cuda.then_some(NativeStartupProbeReceipt {
@@ -1802,7 +2222,7 @@ mod native {
                     max_queue_age: Duration::from_secs(180),
                     deadline_reserve: Duration::ZERO,
                     memory: Resources {
-                        host_bytes: 4 * REQUEST_BYTES,
+                        host_bytes: runtime_host_bytes,
                         device_bytes: execution
                             .transient_request_device_bytes
                             .checked_add(execution.transient_execution_device_bytes)
@@ -2843,6 +3263,7 @@ mod native {
                 transient_execution_device_bytes: 0,
                 pinned_request_bytes: 0,
                 device_public_memory: false,
+                host_record_pages: None,
             };
             let graphs: Vec<_> = ["public", "shared_pc"]
                 .into_iter()
@@ -2917,6 +3338,273 @@ mod native {
             );
         }
 
+        #[test]
+        fn host_page_options_reject_device_combination_before_owner_construction() {
+            let options = NativeOwnerOptions {
+                drain_limit: Duration::from_secs(1),
+                host_record_pages: Some(NativeHostRecordPageLimits {
+                    max_page_entries: 257,
+                    max_page_bytes: 2 * 1024 * 1024,
+                    max_transient_bytes: 2 * 1024 * 1024,
+                }),
+            };
+            let mut config = rz_eval::pals_onnx::PalsOnnxConfig::cpu();
+            options.validate(&config).unwrap();
+            config.device_public_memory = true;
+            assert!(options.validate(&config).is_err());
+            config.device_public_memory = false;
+            config.cache_public_memory = false;
+            assert!(options.validate(&config).is_err());
+            config.cache_public_memory = true;
+            let mut invalid = options;
+            invalid.host_record_pages.as_mut().unwrap().max_page_entries = 1;
+            assert!(invalid.validate(&config).is_err());
+            invalid = options;
+            invalid.drain_limit = Duration::ZERO;
+            assert!(invalid.validate(&config).is_err());
+        }
+        #[test]
+        fn host_page_receipt_distinguishes_default_declaration_observation_and_fence() {
+            let model = fixture_model(|command| {
+                PhysicalRun::Complete(Ok(match command {
+                    PalsNativeCommand::SnapshotStats => {
+                        PalsNativeResult::Stats(PalsBackendStats::default())
+                    }
+                    _ => PalsNativeResult::NewGame,
+                }))
+            });
+            let handle = model.finish_handle();
+            let default = handle
+                .finish(Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            let bytes = serde_json::to_string(&default).unwrap();
+            assert!(!bytes.contains("host_record_page"));
+            validate_host_record_page_evidence(&default, true).unwrap();
+            // Pure synthetic metadata admission checks; neither this fixture
+            // nor a declaration is a native ONNX/GPU execution attestation.
+            let mut selected = default;
+            selected
+                .residency
+                .graphs
+                .push(rz_eval::pals_onnx::PalsGraphIdentity {
+                    role: "public".into(),
+                    sha256: [9; 32],
+                    serialized_bytes: 1,
+                });
+            let declaration = NativeHostRecordPageDeclaration::from_policy(
+                HostRecordPagePolicy::for_registered_graph([9; 32]),
+            );
+            assert_eq!(
+                declaration.reserved_host_bytes().unwrap(),
+                4 * REQUEST_BYTES
+            );
+            selected.execution.host_record_pages = Some(declaration.clone());
+            let snapshot = NativeHostRecordPageSnapshotReceipt {
+                declaration,
+                bank: NativeHostRecordPageBankReceipt {
+                    entries: 1,
+                    reserved_bytes: 100,
+                    pinned_entries: 0,
+                    pinned_bytes: 0,
+                    max_entries: 257,
+                    max_bytes: REQUEST_BYTES,
+                    entry_backing_bytes: 64,
+                },
+                stats: NativeHostRecordPageStatsReceipt {
+                    view_hits: 1,
+                    view_misses: 1,
+                    board_hits: 1,
+                    board_misses: 1,
+                    record_hits: 2,
+                    record_misses: 1,
+                    public_calls_attempted: 1,
+                    public_calls_completed: 1,
+                    encoded_record_tokens: 1,
+                    submitted_record_tokens: 1,
+                    contextual_board_encodes_completed: 1,
+                    joins_completed: 2,
+                    joined_bytes: 200,
+                    evicted_pages: 0,
+                    max_reserved_host_transient_bytes: 1000,
+                },
+                active_pin_count: 0,
+                retained_join_bytes: 100,
+                active_subset_bytes: 0,
+                active_join_backing_bytes: 0,
+                active_full_input_bytes: 0,
+                transient_reservation_bytes: 0,
+                quarantined: false,
+            };
+            selected.host_record_page_observation = Some(NativeHostRecordPageObservationReceipt {
+                schema: "rz-pals-host-record-page-observation/1",
+                status: HostRecordPageObservationStatus::Available,
+                attempted_command_ordinal: 3,
+                latest: Some(NativeHostRecordPageCommandReceipt {
+                    command_ordinal: 3,
+                    boundary: HostRecordPageObservationBoundary::SnapshotStats,
+                    outcome: HostRecordPageObservationOutcome::ReturnedOk,
+                    snapshot,
+                }),
+            });
+            validate_host_record_page_evidence(&selected, true).unwrap();
+            let mut wrong = selected.clone();
+            wrong
+                .execution
+                .host_record_pages
+                .as_mut()
+                .unwrap()
+                .implementation_sha256 = [0; 32];
+            assert!(validate_host_record_page_evidence(&wrong, false).is_err());
+            wrong = selected.clone();
+            wrong
+                .host_record_page_observation
+                .as_mut()
+                .unwrap()
+                .latest
+                .as_mut()
+                .unwrap()
+                .snapshot
+                .bank
+                .reserved_bytes = 3 * REQUEST_BYTES;
+            assert!(validate_host_record_page_evidence(&wrong, false).is_err());
+            wrong = selected.clone();
+            wrong.host_record_page_observation.as_mut().unwrap().status =
+                HostRecordPageObservationStatus::Contended;
+            validate_host_record_page_evidence(&wrong, false).unwrap();
+            assert!(validate_host_record_page_evidence(&wrong, true).is_err());
+            wrong = selected.clone();
+            let actual = wrong
+                .host_record_page_observation
+                .as_mut()
+                .unwrap()
+                .latest
+                .as_mut()
+                .unwrap();
+            actual.outcome = HostRecordPageObservationOutcome::PhysicalCompletionUnknown;
+            actual.snapshot.quarantined = true;
+            actual.snapshot.active_pin_count = 1;
+            actual.snapshot.bank.pinned_entries = 1;
+            actual.snapshot.bank.pinned_bytes = 100;
+            actual.snapshot.active_full_input_bytes = 200;
+            actual.snapshot.transient_reservation_bytes = 1000;
+            wrong.quarantined = true;
+            wrong.physical_shutdown_confirmed = false;
+            wrong.native_buffers_released = false;
+            validate_host_record_page_evidence(&wrong, false).unwrap();
+            assert!(validate_host_record_page_evidence(&wrong, true).is_err());
+            // Missing selected observations remain missing on failure, never
+            // converted into an all-zero successful final snapshot.
+            selected.host_record_page_observation = None;
+            validate_host_record_page_evidence(&selected, false).unwrap();
+            assert!(validate_host_record_page_evidence(&selected, true).is_err());
+        }
+        fn complete_admitted_deadline_control(model: &NativeRoleModel, command: PalsNativeCommand) {
+            let lease = model.owner.worker.lock().unwrap().submit(command).unwrap();
+            model.owner.in_flight.fetch_add(1, Ordering::AcqRel);
+            *model.owner.stats_lease.lock().unwrap() = Some(lease);
+            // The in-process fixture's actual join makes this admitted output
+            // available without consuming its physical lease. No GPU/process
+            // proof or fresh product cleanup window is claimed by this helper.
+            let until = Instant::now() + Duration::from_secs(1);
+            loop {
+                match model.owner.worker.lock().unwrap().try_shutdown() {
+                    Poll::Ready(Ok(())) => break,
+                    Poll::Ready(Err(error)) => panic!("deadline fixture worker failed: {error:?}"),
+                    Poll::Pending => {
+                        assert!(
+                            Instant::now() < until,
+                            "deadline fixture join exceeded its bound"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+        }
+        #[test]
+        fn expired_idle_final_stats_never_admit_a_new_control() {
+            let calls = Arc::new(AtomicU64::new(0));
+            let actual_calls = Arc::clone(&calls);
+            let model = fixture_model(move |command| {
+                actual_calls.fetch_add(1, Ordering::AcqRel);
+                PhysicalRun::Complete(Ok(match command {
+                    PalsNativeCommand::SnapshotStats => {
+                        PalsNativeResult::Stats(PalsBackendStats::default())
+                    }
+                    _ => PalsNativeResult::RuntimeVerified,
+                }))
+            });
+            let handle = model.finish_handle();
+            assert!(matches!(
+                handle.collect_final_stats(Instant::now()),
+                Err(RoleError::Deadline)
+            ));
+            assert_eq!(calls.load(Ordering::Acquire), 0);
+            let receipt = handle.receipt();
+            assert_eq!(receipt.physical_runs_in_flight, 0);
+            assert!(!receipt.quarantined);
+            assert!(receipt.backend_stats.is_none());
+            assert!(handle.owner.stats_lease.lock().unwrap().is_none());
+            // Test-only explicit later cleanup; the product caller receives
+            // Deadline and never grants itself a second owner drain window.
+            let receipt = handle
+                .finish(Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            assert!(receipt.physical_shutdown_confirmed && receipt.native_buffers_released);
+            assert_eq!(calls.load(Ordering::Acquire), 1);
+        }
+        #[test]
+        fn already_completed_stats_are_preserved_after_the_shared_deadline() {
+            let model = fixture_model(|command| {
+                PhysicalRun::Complete(Ok(match command {
+                    PalsNativeCommand::SnapshotStats => {
+                        PalsNativeResult::Stats(PalsBackendStats::default())
+                    }
+                    _ => PalsNativeResult::RuntimeVerified,
+                }))
+            });
+            complete_admitted_deadline_control(&model, PalsNativeCommand::SnapshotStats);
+            let handle = model.finish_handle();
+            let receipt = handle.finish(Instant::now()).unwrap();
+            assert!(receipt.backend_stats.is_some());
+            assert!(receipt.physical_shutdown_confirmed && receipt.native_buffers_released);
+            assert!(!receipt.quarantined);
+            assert_eq!(receipt.physical_runs_in_flight, 0);
+            assert_eq!(receipt.physically_completed_role_calls, 0);
+            assert!(handle.owner.stats_lease.lock().unwrap().is_none());
+        }
+        #[test]
+        fn completed_verify_expiry_preserves_idle_fence_without_new_stats_admission() {
+            let (mut execution, _) = loading_mapping_fixture();
+            execution.cuda_loading_profile = None;
+            let calls = Arc::new(AtomicU64::new(0));
+            let actual_calls = Arc::clone(&calls);
+            // Synthetic CUDA metadata only; this is a known in-process control
+            // return, not a real CUDA mapping/NN execution attestation.
+            let model = fixture_model_with_execution(
+                move |command| {
+                    actual_calls.fetch_add(1, Ordering::AcqRel);
+                    PhysicalRun::Complete(Ok(match command {
+                        PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
+                        _ => PalsNativeResult::Stats(PalsBackendStats::default()),
+                    }))
+                },
+                Some(execution),
+            );
+            complete_admitted_deadline_control(&model, PalsNativeCommand::VerifyRuntime);
+            let handle = model.finish_handle();
+            assert!(matches!(
+                handle.finish(Instant::now()),
+                Err(RoleError::Deadline)
+            ));
+            let receipt = handle.receipt();
+            assert_eq!(calls.load(Ordering::Acquire), 1);
+            assert!(receipt.final_runtime_mapping_confirmed == Some(true));
+            assert!(receipt.backend_stats.is_none());
+            assert_eq!(receipt.physical_runs_in_flight, 0);
+            assert!(receipt.physical_shutdown_confirmed && receipt.native_buffers_released);
+            assert!(!receipt.quarantined);
+            assert!(handle.owner.stats_lease.lock().unwrap().is_none());
+        }
         fn fixture_model<F>(run: F) -> NativeRoleModel
         where
             F: FnMut(&PalsNativeCommand) -> PhysicalRun<Result<PalsNativeResult, BackendError>>
@@ -2978,6 +3666,8 @@ mod native {
                 last_failure: Mutex::new(None),
                 final_stats: Mutex::new(None),
                 stats_lease: Mutex::new(None),
+                additional_host_bytes: REQUEST_BYTES,
+                host_record_page_observer: None,
                 residency: PalsSessionResidency {
                     graphs: vec![],
                     native_sessions: 0,
@@ -3000,6 +3690,7 @@ mod native {
                     transient_execution_device_bytes: 0,
                     pinned_request_bytes: 0,
                     device_public_memory: false,
+                    host_record_pages: None,
                 }),
                 startup_probe: Mutex::new(None),
                 startup_probe_timeout_ms: AtomicU64::new(0),
@@ -3201,6 +3892,7 @@ mod native {
                 transient_execution_device_bytes: 0,
                 pinned_request_bytes: 0,
                 device_public_memory: false,
+                host_record_pages: None,
             };
             let roots: Vec<_> = profile
                 .eager_indices()
@@ -4154,14 +4846,20 @@ mod native {
     }
 }
 #[cfg(feature = "onnx-cpu")]
+pub(crate) use native::validate_host_record_page_evidence;
+#[cfg(feature = "onnx-cpu")]
 pub(crate) use native::validate_runtime_loading_mapping;
 #[cfg(feature = "onnx-cpu")]
 pub use native::{
     NativeBackendStatsReceipt, NativeCudaLoadingIdentity, NativeExecutionReceipt,
-    NativeFailureReceipt, NativePreparedContext, NativeRoleFinishHandle, NativeRoleModel,
-    NativeRoleObserver, NativeRoleReceipt, NativeRoleRejection, NativeRoleSourceIdentity,
-    NativeStartupCommandObservation, NativeStartupErrorKind, NativeStartupFailureDiagnostic,
-    NativeStartupProbeReceipt, NativeStartupTimingObservation,
+    NativeFailureReceipt, NativeHostRecordPageBankReceipt, NativeHostRecordPageCommandReceipt,
+    NativeHostRecordPageDeclaration, NativeHostRecordPageLimits,
+    NativeHostRecordPageObservationReceipt, NativeHostRecordPageSnapshotReceipt,
+    NativeHostRecordPageStatsReceipt, NativeOwnerOptions, NativePreparedContext,
+    NativeRoleFinishHandle, NativeRoleModel, NativeRoleObserver, NativeRoleReceipt,
+    NativeRoleRejection, NativeRoleSourceIdentity, NativeStartupCommandObservation,
+    NativeStartupErrorKind, NativeStartupFailureDiagnostic, NativeStartupProbeReceipt,
+    NativeStartupTimingObservation,
 };
 
 #[cfg(test)]

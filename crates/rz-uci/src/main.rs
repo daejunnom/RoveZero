@@ -198,6 +198,14 @@ fn run_pals(
             {
                 return Err("duplicate PALS CUDA session allocator limit".into());
             }
+        } else if let Some(value) = argument.strip_prefix("--pals-host-record-pages=") {
+            if native
+                .host_record_pages
+                .replace(value.parse::<bool>()?)
+                .is_some()
+            {
+                return Err("duplicate PALS host record page option".into());
+            }
         } else if let Some(value) = argument.strip_prefix("--pals-device-public-memory=") {
             if native
                 .device_public_memory
@@ -338,6 +346,7 @@ struct PalsNativeOptions {
     cuda_bundle_hash: Option<String>,
     cuda_device: Option<i32>,
     cuda_session_arena: Option<u64>,
+    host_record_pages: Option<bool>,
     device_public_memory: Option<bool>,
     cuda_control_mode: Option<String>,
     cuda_control_inventory: Option<String>,
@@ -430,6 +439,7 @@ impl PalsNativeOptions {
             || self.cuda_device.is_some()
             || self.cuda_session_arena.is_some()
             || self.device_public_memory.is_some()
+            || self.host_record_pages.is_some()
             || self.cuda_control_mode.is_some()
             || self.cuda_control_inventory.is_some()
             || self.cuda_control_inventory_hash.is_some()
@@ -509,6 +519,9 @@ fn run_native_pals(
     }
     if native.device_public_memory.unwrap_or(false) && !cfg!(feature = "experimental-io-binding") {
         return Err("PALS device public memory requires explicit experimental-io-binding; no binding fallback was started".into());
+    }
+    if native.host_record_pages.unwrap_or(false) && native.device_public_memory.unwrap_or(false) {
+        return Err("PALS host record pages and device public memory are mutually exclusive; no fallback was started".into());
     }
     let loading_profile = pals_cuda_loading_profile(
         native.cuda_loading_profile.as_deref(),
@@ -637,6 +650,16 @@ fn run_native_pals(
     };
     let mut settings = EngineSettings::default();
     settings.search.max_simulations = cpu_nodes;
+    let owner_options = rz_uci::pals_native::NativeOwnerOptions {
+        drain_limit: settings.shutdown_limit,
+        host_record_pages: native.host_record_pages.unwrap_or(false).then_some(
+            rz_uci::pals_native::NativeHostRecordPageLimits {
+                max_page_entries: 257,
+                max_page_bytes: 2 * 1024 * 1024,
+                max_transient_bytes: 2 * 1024 * 1024,
+            },
+        ),
+    };
     // Observe actual runtime/model factory cost independently of the probe
     // deadline. Earlier pin/cache preparation belongs to overall CLI cost.
     let model_loading_started = std::time::Instant::now();
@@ -645,32 +668,35 @@ fn run_native_pals(
             Some(loading) => {
                 let runtime =
                     rz_eval::onnx::OrtRuntime::load_with_cuda_loading_profile(&pin, loading)?;
-                rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_control_policy(
+                rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_control_policy_with_options(
                     &manifest,
                     &manifest_hash,
                     runtime,
                     backend_config,
                     policy,
                     &profile,
-                    settings.shutdown_limit,
+                    owner_options,
                 )?
             }
-            None => rz_uci::pals_native::NativeRoleModel::load_pinned_with_cuda_control_policy(
-                &manifest,
-                &manifest_hash,
-                &pin,
-                backend_config,
-                policy,
-                &profile,
-                settings.shutdown_limit,
-            )?,
+            None => {
+                let runtime = rz_eval::onnx::OrtRuntime::load(&pin)?;
+                rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_control_policy_with_options(
+                    &manifest,
+                    &manifest_hash,
+                    runtime,
+                    backend_config,
+                    policy,
+                    &profile,
+                    owner_options,
+                )?
+            }
         },
-        None => rz_uci::pals_native::NativeRoleModel::load_pinned(
+        None => rz_uci::pals_native::NativeRoleModel::load_pinned_with_options(
             &manifest,
             &manifest_hash,
             &pin,
             backend_config,
-            settings.shutdown_limit,
+            owner_options,
         )?,
     };
     let model_loading_elapsed = model_loading_started.elapsed();
@@ -773,12 +799,11 @@ fn run_native_pals(
         if let Err(primary) = startup {
             // Both owners are attempted independently. A failed helper start is
             // not a Native startup failure and does not invent a ready helper.
-            let checker_cleanup = driver
-                .finish_checker(std::time::Instant::now() + settings.shutdown_limit)
-                .err();
-            let cleanup = finish
-                .finish(std::time::Instant::now() + settings.shutdown_limit)
-                .err();
+            let (checker_cleanup, cleanup) = finish_pals_owners_within(
+                settings.shutdown_limit,
+                |until| driver.finish_checker(until).err(),
+                |until| finish.finish(until).err(),
+            );
             let observed_work = driver.work_receipt();
             let observed_checker =
                 rz_uci::pals_attestation::checker::PalsCheckerProcessReceipt::observe(
@@ -833,12 +858,11 @@ fn run_native_pals(
     let startup_checker = match startup_checker {
         Ok(evidence) => evidence,
         Err(checker_observation) => {
-            let checker_cleanup = driver
-                .finish_checker(std::time::Instant::now() + settings.shutdown_limit)
-                .err();
-            let cleanup = finish
-                .finish(std::time::Instant::now() + settings.shutdown_limit)
-                .err();
+            let (checker_cleanup, cleanup) = finish_pals_owners_within(
+                settings.shutdown_limit,
+                |until| driver.finish_checker(until).err(),
+                |until| finish.finish(until).err(),
+            );
             return Err(Box::new(PalsFinishError {
                 primary: None,
                 cleanup,
@@ -852,12 +876,11 @@ fn run_native_pals(
     let startup_work = match driver.work_receipt() {
         Ok(work) => work,
         Err(work_observation) => {
-            let checker_cleanup = driver
-                .finish_checker(std::time::Instant::now() + settings.shutdown_limit)
-                .err();
-            let cleanup = finish
-                .finish(std::time::Instant::now() + settings.shutdown_limit)
-                .err();
+            let (checker_cleanup, cleanup) = finish_pals_owners_within(
+                settings.shutdown_limit,
+                |until| driver.finish_checker(until).err(),
+                |until| finish.finish(until).err(),
+            );
             return Err(Box::new(PalsFinishError {
                 primary: None,
                 cleanup,
@@ -885,12 +908,11 @@ fn run_native_pals(
                 })() {
                     Ok(()) => Some(writer),
                     Err(publication) => {
-                        let checker_cleanup = driver
-                            .finish_checker(std::time::Instant::now() + settings.shutdown_limit)
-                            .err();
-                        let cleanup = finish
-                            .finish(std::time::Instant::now() + settings.shutdown_limit)
-                            .err();
+                        let (checker_cleanup, cleanup) = finish_pals_owners_within(
+                            settings.shutdown_limit,
+                            |until| driver.finish_checker(until).err(),
+                            |until| finish.finish(until).err(),
+                        );
                         return Err(Box::new(PalsFinishError {
                             primary: None,
                             cleanup,
@@ -902,12 +924,11 @@ fn run_native_pals(
                     }
                 },
                 Err(publication) => {
-                    let checker_cleanup = driver
-                        .finish_checker(std::time::Instant::now() + settings.shutdown_limit)
-                        .err();
-                    let cleanup = finish
-                        .finish(std::time::Instant::now() + settings.shutdown_limit)
-                        .err();
+                    let (checker_cleanup, cleanup) = finish_pals_owners_within(
+                        settings.shutdown_limit,
+                        |until| driver.finish_checker(until).err(),
+                        |until| finish.finish(until).err(),
+                    );
                     return Err(Box::new(PalsFinishError {
                         primary: None,
                         cleanup,
@@ -925,9 +946,11 @@ fn run_native_pals(
     let clock = ProcessClock::new(ProcessEpoch(1));
     let process = EngineProcess::with_search_driver(driver.clone(), owners, clock);
     let served = serve_process(process, settings);
-    let checker_finished =
-        driver.finish_checker(std::time::Instant::now() + settings.shutdown_limit);
-    let finished = finish.finish(std::time::Instant::now() + settings.shutdown_limit);
+    let (checker_finished, finished) = finish_pals_owners_within(
+        settings.shutdown_limit,
+        |until| driver.finish_checker(until),
+        |until| finish.finish(until),
+    );
     let observed_work = driver.work_receipt();
     let observed_checker = checker_profile
         .as_ref()
@@ -1005,6 +1028,21 @@ fn run_native_pals(
     }
 }
 
+/// Both owners are attempted independently against the same overall deadline.
+/// A slow helper must not grant the Native owner a fresh cleanup window.
+#[cfg(feature = "onnx-cpu")]
+fn finish_pals_owners_within<C, N>(
+    limit: Duration,
+    checker: impl FnOnce(std::time::Instant) -> C,
+    native: impl FnOnce(std::time::Instant) -> N,
+) -> (C, N) {
+    let now = std::time::Instant::now();
+    let until = now.checked_add(limit).unwrap_or(now);
+    let checker_result = checker(until);
+    let native_result = native(until);
+    (checker_result, native_result)
+}
+
 #[cfg(feature = "onnx-cpu")]
 fn pals_cuda_loading_profile(
     profile: Option<&str>,
@@ -1069,7 +1107,40 @@ fn pals_profile_root(
 
 #[cfg(all(test, feature = "onnx-cpu"))]
 mod pals_profile_tests {
-    use super::{pals_cuda_loading_profile, pals_profile_root};
+    use super::{finish_pals_owners_within, pals_cuda_loading_profile, pals_profile_root};
+
+    #[test]
+    fn both_owner_cleanup_attempts_share_one_deadline_even_after_helper_failure() {
+        use std::cell::RefCell;
+        use std::time::{Duration, Instant};
+        for limit in [Duration::from_secs(1), Duration::ZERO] {
+            let observed = RefCell::new(Vec::new());
+            let started = Instant::now();
+            let (checker, native) = finish_pals_owners_within(
+                limit,
+                |until| {
+                    observed.borrow_mut().push(("checker", until));
+                    Err::<(), _>("helper cleanup failed")
+                },
+                |until| {
+                    observed.borrow_mut().push(("native", until));
+                    Err::<(), _>("native cleanup failed")
+                },
+            );
+            assert_eq!(checker, Err("helper cleanup failed"));
+            assert_eq!(native, Err("native cleanup failed"));
+            let observed = observed.into_inner();
+            assert_eq!(observed.len(), 2);
+            assert_eq!(observed[0].0, "checker");
+            assert_eq!(observed[1].0, "native");
+            assert_eq!(observed[0].1, observed[1].1);
+            assert!(observed[0].1 >= started);
+            assert!(observed[0].1 <= Instant::now() + limit);
+            if limit.is_zero() {
+                assert!(observed[1].1 <= Instant::now());
+            }
+        }
+    }
 
     #[test]
     fn loading_profile_is_an_explicit_canonical_host_control_selection() {
