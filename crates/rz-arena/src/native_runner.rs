@@ -44,6 +44,18 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
     fn validate_runtime_admission(&self) -> Result<(), ArenaError> {
         Ok(())
     }
+    /// Consume provider-specific evidence from the owner-pinned preflight root
+    /// after both probes have closed, before admitting any game process. The
+    /// default preserves historical Own/V1/V2 behavior and creates no evidence.
+    #[cfg(target_os = "linux")]
+    fn validate_external_preflight(
+        &self,
+        _role: rz_experiments::NativeEngineRole,
+        _preflight: &crate::ExternalUciPreflight,
+        _runtime_directory: &cap_std::fs::Dir,
+    ) -> Result<(), ArenaError> {
+        Ok(())
+    }
     fn expected_provider_sessions(&self) -> usize {
         4
     }
@@ -1017,6 +1029,29 @@ pub(crate) mod linux {
                 &bytes,
                 64 * 1024,
             )?;
+            use cap_fs_ext::DirExt;
+            let index = if role == NativeEngineRole::Baseline {
+                0
+            } else {
+                1
+            };
+            let preflight_directory = match &owner.snapshot.preflight_runtime_roots[index] {
+                Some(root) => root.directory.try_clone(),
+                None => owner.snapshot.directory.open_dir_nofollow(if index == 0 {
+                    "baseline-runtime"
+                } else {
+                    "candidate-runtime"
+                }),
+            }
+            .map_err(|e| ArenaError::Io(e.to_string()))?;
+            // The selected capability is owner-held; compare its path/name pins
+            // immediately before and after provider consumption as well.
+            crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot)?;
+            owner
+                .spec
+                .validate_external_preflight(role, &receipt, &preflight_directory)?;
+            crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot)?;
+            preflight_runtime_totals(owner)?;
             receipts.push(receipt);
             bundle.process = None;
         }

@@ -74,6 +74,493 @@ pub struct PalsExternalCpuRProfileAuditV3 {
     pub physical_shutdown_observed: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PalsExternalCpuRSessionPurposeV3 {
+    Identification,
+    Readiness,
+    Game,
+}
+/// Validation of one actual producer pair, separate from execution admission.
+/// Original registration and byte hashes remain available; scoped resources
+/// and foreign work are never projected into Own CPU counters.
+#[derive(Clone, Debug, Serialize)]
+pub struct PalsExternalCpuRSessionAuditV3 {
+    pub purpose: PalsExternalCpuRSessionPurposeV3,
+    pub endpoint_id: String,
+    pub parent_process_id: u32,
+    pub startup_sha256: String,
+    pub termination_sha256: String,
+    pub registration: serde_json::Value,
+    pub receipt: rz_experiments::PalsExternalCpuRReceiptV3,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "pals-collection-onnx", feature = "native-cuda")
+))]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalCheckerWireV3 {
+    schema_version: u32,
+    domain: String,
+    profile_file_sha256: String,
+    profile_canonical_sha256: String,
+    registration_sha256: String,
+    registration: serde_json::Value,
+    startup_handshake_completed: bool,
+    observed_uci: Option<ExternalCheckerUciWireV3>,
+    startup_resource_observation: Option<rz_experiments::PalsCheckerReadyResourcesV3>,
+    startup_resource_unavailable: Option<String>,
+    requested_option_checks_completed: bool,
+    applied_option_values: String,
+    latest_attempt: Option<serde_json::Value>,
+    shutdown: Option<rz_experiments::PalsHelperShutdownV3>,
+    cleanup_complete: bool,
+    started_owner_exit_and_drains_confirmed: bool,
+}
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "pals-collection-onnx", feature = "native-cuda")
+))]
+#[derive(Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ExternalCheckerUciWireV3 {
+    name: String,
+    author: Option<String>,
+}
+
+/// Actual profile loading must precede this API. It creates only an unstarted
+/// checker to obtain immutable identity/conditions/capabilities; it starts no
+/// model or process and does not remove the launch/Core external guards.
+/// The caller must join `expected_parent_pid` to its supervisor/game evidence;
+/// this helper audit does not replace the four UCI exits, NN graph or PGN audit.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "pals-collection-onnx", feature = "native-cuda")
+))]
+pub fn validate_pals_external_cpu_r_session(
+    lock: &LockedPalsArenaLaunchV3,
+    role: NativeEngineRole,
+    loaded: &rz_uci::pals_checker_profile::LoadedPalsCheckerProfile,
+    startup: &[u8],
+    termination: &[u8],
+    expected_parent_pid: u32,
+    purpose: PalsExternalCpuRSessionPurposeV3,
+) -> Result<PalsExternalCpuRSessionAuditV3, ArenaError> {
+    use rz_experiments::{
+        PalsExternalCpuRReceiptV3, PalsExternalCpuRWorkV3, PalsModelValueIdentityV3, PalsObservedV3,
+    };
+    use rz_search::cpu_checker::CpuChecker;
+    lock.input.semantic_lock.verify()?;
+    require(
+        startup.len() <= 128 * 1024 && termination.len() <= 128 * 1024,
+        "external helper native envelope byte budget exceeded",
+    )?;
+    let s = unique_helper_json(startup)?;
+    let t = unique_helper_json(termination)?;
+    let PalsEngineV3::Pals(endpoint) = &lock.input.semantic_lock.manifest.engines[role_index(role)]
+    else {
+        return Err(invalid("external helper session requires native PALS"));
+    };
+    let Some((declaration, binding)) = lock.input.external_cpu_r_binding(role_index(role))? else {
+        return Err(invalid(
+            "own CPU_R cannot consume an external helper session",
+        ));
+    };
+    let native = lock.native(role)?;
+    let profile = loaded.profile();
+    require(
+        loaded.file_sha256() == declaration.profile.sha256
+            && loaded.canonical_sha256() == declaration.profile_canonical_sha256
+            && loaded.registration().file_bytes == declaration.profile.bytes
+            && profile.program == binding.registered_program
+            && profile.working_directory == binding.registered_working_directory
+            && profile.identity.binary_sha256 == declaration.binary.sha256
+            && profile.identity.declared_source == declaration.binary.source
+            && profile.identity.declared_license == declaration.binary.license,
+        "external helper actual loaded profile/pins/registered paths differ",
+    )?;
+    let p = &declaration.policy;
+    require(
+        profile.identity.options["Threads"]
+            .parse::<u32>()
+            .is_ok_and(|v| v <= p.threads_max)
+            && profile.identity.options["Hash"]
+                .parse::<u32>()
+                .is_ok_and(|v| v <= p.hash_mib_max)
+            && u32::from(profile.max_depth) <= p.max_depth
+            && profile.max_prefix_plies as u64 <= u64::from(p.max_prefix_plies)
+            && profile.handshake_timeout_ms <= p.handshake_max_ms
+            && profile.max_task_wall_time_ms <= p.task_wall_time_max_ms
+            && profile.stop_grace_ms <= p.stop_grace_max_ms
+            && profile.shutdown_grace_ms <= p.shutdown_grace_max_ms
+            && profile.max_output_bytes as u64 <= p.lifetime_output_bytes_max
+            && profile.max_line_bytes as u64 <= p.line_bytes_max,
+        "external helper loaded task/time/output profile exceeds declaration",
+    )?;
+    require(
+        declaration.resolver.version == rz_search::pals::value::MODEL_WDL_RESOLVER_VERSION
+            && declaration.resolver.semantics_sha256
+                == digest(rz_search::pals::value::MODEL_WDL_RESOLVER_SEMANTICS.as_bytes()),
+        "external helper model-WDL resolver differs from production semantics",
+    )?;
+    let checker = loaded
+        .create_checker()
+        .map_err(|e| invalid(format!("external helper unstarted checker: {e}")))?;
+    let caps = checker.capabilities();
+    let checkpoint = match &endpoint.model.weights {
+        PalsWeightIdentityV3::Untrained { artifact, .. }
+        | PalsWeightIdentityV3::Trained { artifact, .. } => artifact,
+        _ => return Err(invalid("external helper model-WDL checkpoint missing")),
+    };
+    let mut epoch = [0u8; 32];
+    for (i, byte) in epoch.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&checkpoint.sha256[i * 2..i * 2 + 2], 16)
+            .map_err(|_| invalid("external helper checkpoint digest malformed"))?;
+    }
+    let mut model = format!("pals-onnx-pc-fp32-{}", native.export.sha256);
+    if let Some(cuda) = lock.input.endpoints[role_index(role)].cuda_model() {
+        model.push_str(&format!(
+            "-cuda-device{}-arena{}",
+            cuda.device_id, cuda.session_arena_bytes
+        ));
+    }
+    let model_value = PalsModelValueIdentityV3 {
+        semantics: rz_search::pals::value::MODEL_WDL_VALUE_SEMANTICS.into(),
+        model: model.clone(),
+        encoding: native.encoding_semantic_sha256.clone(),
+        precision: "fp32".into(),
+        model_epoch: epoch,
+    };
+    let registration = serde_json::json!({
+        "identity": checker.identity(), "conditions": checker.conditions(),
+        "capabilities": {"max_depth":caps.max_depth,"max_prefix_plies":caps.max_prefix_plies,
+            "max_root_moves":caps.max_root_moves,"root_moves":caps.root_moves,"divergence":caps.divergence,
+            "resume":caps.resume,"selective_search":caps.selective_search},
+        "role_model": model, "model_value": model_value,
+        "resolver_version":rz_search::pals::value::MODEL_WDL_RESOLVER_VERSION,
+        "resolver_semantics":rz_search::pals::value::MODEL_WDL_RESOLVER_SEMANTICS,
+    });
+    let mut registered_hash = Sha256::new();
+    registered_hash.update(b"rz-pals-checker-registration/1\0");
+    registered_hash.update(serde_json::to_vec(&registration).map_err(|e| invalid(e.to_string()))?);
+    let registration_sha256 = format!("{:x}", registered_hash.finalize());
+    let (sw, tw): (ExternalCheckerWireV3, ExternalCheckerWireV3) = (
+        serde_json::from_value(s["cpu_checker"].clone())
+            .map_err(|e| invalid(format!("external startup checker wire: {e}")))?,
+        serde_json::from_value(t["cpu_checker"].clone())
+            .map_err(|e| invalid(format!("external termination checker wire: {e}")))?,
+    );
+    require(
+        sw.startup_resource_observation == tw.startup_resource_observation
+            && sw.startup_resource_unavailable.is_none()
+            && tw.startup_resource_unavailable.is_none()
+            && sw.observed_uci == tw.observed_uci,
+        "external helper historical ready resources/name changed or unavailable",
+    )?;
+    for (v, wire, ending) in [(&s, &sw, false), (&t, &tw, true)] {
+        require(
+            v["schema_version"] == 3
+                && v["domain"]
+                    == if ending {
+                        PALS_NATIVE_TERMINATION_V3_DOMAIN
+                    } else {
+                        PALS_NATIVE_STARTUP_V3_DOMAIN
+                    }
+                && v["endpoint_id"] == endpoint.id
+                && v["launch_sha256"] == lock.sha256
+                && v["process_id"] == expected_parent_pid
+                && expected_parent_pid > 0
+                && expected_parent_pid <= i32::MAX as u32
+                && v["binary_sha256"] == endpoint.binary.sha256
+                && v["runtime_sha256"] == native.runtime.sha256
+                && v["precision"] == "fp32"
+                && v["service_exit_success"] == ending
+                && v["provider"]
+                    == if lock.input.endpoints[role_index(role)]
+                        .cuda_model()
+                        .is_some()
+                    {
+                        "cuda"
+                    } else {
+                        "cpu"
+                    },
+            "external helper native envelope identity differs",
+        )?;
+        let n = &v["native"];
+        require(
+            array_hash(&n["model_epoch"])? == checkpoint.sha256
+                && array_hash(&n["export_manifest_sha256"])? == native.export.sha256
+                && array_hash(&n["encoding_semantic_sha256"])? == native.encoding_semantic_sha256
+                && array_hash(&n["adapter_source_sha256"])? == native.adapter_source_sha256
+                && n["trained"]
+                    == matches!(endpoint.model.weights, PalsWeightIdentityV3::Trained { .. })
+                && (n["frozen_epoch"].as_u64() == Some(endpoint.model.frozen_epoch)
+                    || (endpoint.model.frozen_epoch == 0 && n["frozen_epoch"].is_null()))
+                && count(n, "process_epoch")? > 0
+                && n["execution"]["host_record_pages"].is_null()
+                && n["host_record_page_observation"].is_null(),
+            "external helper native checkpoint/model/encoding/epoch or undeclared host mode differs",
+        )?;
+        let execution = &n["execution"];
+        require(
+            execution.is_object()
+                && array_hash(&execution["runtime_sha256"])? == native.runtime.sha256,
+            "external helper native execution/runtime observation missing",
+        )?;
+        match lock.input.endpoints[role_index(role)].cuda_model() {
+            Some(cuda) => require(
+                execution["provider"] == "cuda"
+                    && execution["device_id"] == cuda.device_id
+                    && execution["session_arena_bytes"] == cuda.session_arena_bytes
+                    && v["runtime_bundle_sha256"] == cuda.cuda_bundle.canonical_sha256
+                    && array_hash(&execution["runtime_bundle_sha256"])?
+                        == cuda.cuda_bundle.canonical_sha256,
+                "external helper native CUDA model execution differs",
+            )?,
+            None => require(
+                execution["provider"] == "cpu"
+                    && execution["device_id"].is_null()
+                    && execution["session_arena_bytes"].is_null()
+                    && execution["runtime_bundle_sha256"].is_null()
+                    && v["runtime_bundle_sha256"].is_null(),
+                "external helper native CPU execution differs",
+            )?,
+        }
+        require(
+            wire.schema_version == 1
+                && wire.domain == "rz-pals-checker-process/1"
+                && wire.profile_file_sha256 == loaded.file_sha256()
+                && wire.profile_canonical_sha256 == loaded.canonical_sha256()
+                && wire.registration == registration
+                && wire.registration_sha256 == registration_sha256
+                && wire.startup_handshake_completed
+                && wire.requested_option_checks_completed
+                && wire.applied_option_values == "unknown",
+            "external helper full registration/profile/resolver/option barrier differs",
+        )?;
+        let observed = wire
+            .observed_uci
+            .as_ref()
+            .ok_or_else(|| invalid("external helper UCI identity unobserved"))?;
+        require(
+            observed.name == profile.expected_uci_name
+                && observed.name.len() <= 1024
+                && !observed.name.chars().any(char::is_control)
+                && observed
+                    .author
+                    .as_ref()
+                    .is_none_or(|a| a.len() <= 1024 && !a.chars().any(char::is_control)),
+            "external helper observed UCI name/author differs or is unbounded",
+        )?;
+        require(
+            wire.latest_attempt
+                .as_ref()
+                .is_none_or(serde_json::Value::is_object),
+            "external helper latest diagnostic attempt malformed",
+        )?;
+        validate_pals_process_work_inner(&v["search_work"], "pals", !ending, true)?;
+        for field in [
+            "cpu_tasks_requested",
+            "cpu_tasks",
+            "completed_cpu_tasks",
+            "reused_completed_cpu_tasks_consumed",
+            "consumed_cpu_tasks",
+            "cpu_nodes",
+        ] {
+            require(
+                work_count(&v["search_work"]["pals"], field)? == 0,
+                "external helper contains own CPU work",
+            )?;
+        }
+    }
+    require(
+        s["native"]["process_epoch"] == t["native"]["process_epoch"]
+            && s["native"]["execution"] == t["native"]["execution"],
+        "external helper native process epoch/execution changed",
+    )?;
+    require(
+        !sw.cleanup_complete
+            && !sw.started_owner_exit_and_drains_confirmed
+            && sw.shutdown.is_none()
+            && tw.cleanup_complete
+            && tw.started_owner_exit_and_drains_confirmed,
+        "external helper startup/final owner closure boundary invalid",
+    )?;
+    let ready_resources = tw
+        .startup_resource_observation
+        .ok_or_else(|| invalid("external helper actual ready resource snapshot missing"))?;
+    let shutdown = tw
+        .shutdown
+        .ok_or_else(|| invalid("external helper final shutdown observation missing"))?;
+    let helper = shutdown
+        .process_identity
+        .as_ref()
+        .ok_or_else(|| invalid("external helper actual historical spawn identity missing"))?;
+    ready_resources.validate_against(
+        expected_parent_pid,
+        helper,
+        &lock.input.semantic_lock.manifest.resources[role_index(role)],
+        p,
+    )?;
+    require(
+        t["native"]["physical_shutdown_confirmed"] == true
+            && t["native"]["native_buffers_released"] == true
+            && t["native"]["quarantined"] == false
+            && count(&t["native"], "physical_runs_in_flight")? == 0,
+        "external helper closure cannot replace independent native physical shutdown",
+    )?;
+    if purpose == PalsExternalCpuRSessionPurposeV3::Game {
+        require(
+            count(&t["native"], "completed_new_game_resets")? >= 1
+                && count(&t["native"], "game_generation")?
+                    > count(&s["native"], "game_generation")?,
+            "external helper game session lacks native game reset boundary",
+        )?;
+    }
+    let totals = &t["search_work"]["pals"];
+    let work = PalsExternalCpuRWorkV3 {
+        tasks_dispatched: optional_foreign_count(totals, "external_checker_tasks")?,
+        reports_returned: optional_foreign_count(totals, "external_checker_reports")?,
+        node_budget_reserved: optional_foreign_count(
+            totals,
+            "external_checker_node_budget_reserved",
+        )?,
+        nodes_observed: optional_foreign_count(totals, "external_checker_nodes_observed")?,
+        consumed_completed_tasks: optional_foreign_count(
+            totals,
+            "consumed_external_checker_tasks",
+        )?,
+        work_incomplete: totals["external_checker_work_incomplete"].as_bool(),
+        completed_tasks: PalsObservedV3::Unknown,
+        reused_completed_task_consumptions: PalsObservedV3::Unknown,
+    };
+    let receipt = PalsExternalCpuRReceiptV3 {
+        profile_file_sha256: loaded.file_sha256().into(),
+        profile_canonical_sha256: loaded.canonical_sha256().into(),
+        registered_binary_sha256: declaration.binary.sha256.clone(),
+        registration_sha256,
+        resolver: declaration.resolver.clone(),
+        model_value,
+        ready_resources,
+        shutdown,
+        work,
+        applied_option_values: PalsObservedV3::Unknown,
+        model_loading: PalsObservedV3::Unknown,
+    };
+    receipt.validate_against(
+        endpoint,
+        &lock.input.semantic_lock.manifest.resources[role_index(role)],
+    )?;
+    Ok(PalsExternalCpuRSessionAuditV3 {
+        purpose,
+        endpoint_id: endpoint.id.clone(),
+        parent_process_id: expected_parent_pid,
+        startup_sha256: digest(startup),
+        termination_sha256: digest(termination),
+        registration,
+        receipt,
+    })
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "pals-collection-onnx", feature = "native-cuda")
+))]
+fn optional_foreign_count(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<Option<u64>, ArenaError> {
+    let v = value
+        .get(field)
+        .ok_or_else(|| invalid(format!("foreign work field missing: {field}")))?;
+    if v.is_null() {
+        Ok(None)
+    } else {
+        v.as_u64()
+            .map(Some)
+            .ok_or_else(|| invalid(format!("foreign work field type invalid: {field}")))
+    }
+}
+
+// serde's struct duplicate checks do not cover nested Value/BTreeMap fields.
+// Keep actual evidence bytes unambiguous before full registration comparison.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "pals-collection-onnx", feature = "native-cuda")
+))]
+fn unique_helper_json(bytes: &[u8]) -> Result<serde_json::Value, ArenaError> {
+    struct Unique(serde_json::Value);
+    impl<'de> Deserialize<'de> for Unique {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = Unique;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("JSON with unique object keys")
+                }
+                fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Unique, E> {
+                    Ok(Unique(v.into()))
+                }
+                fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Unique, E> {
+                    Ok(Unique(v.into()))
+                }
+                fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Unique, E> {
+                    Ok(Unique(v.into()))
+                }
+                fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Unique, E> {
+                    serde_json::Number::from_f64(v)
+                        .map(|v| Unique(v.into()))
+                        .ok_or_else(|| E::custom("nonfinite JSON"))
+                }
+                fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Unique, E> {
+                    Ok(Unique(v.into()))
+                }
+                fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Unique, E> {
+                    Ok(Unique(v.into()))
+                }
+                fn visit_unit<E: serde::de::Error>(self) -> Result<Unique, E> {
+                    Ok(Unique(serde_json::Value::Null))
+                }
+                fn visit_none<E: serde::de::Error>(self) -> Result<Unique, E> {
+                    self.visit_unit()
+                }
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut a: A,
+                ) -> Result<Unique, A::Error> {
+                    let mut v = Vec::new();
+                    while let Some(Unique(item)) = a.next_element()? {
+                        v.push(item);
+                    }
+                    Ok(Unique(v.into()))
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut a: A,
+                ) -> Result<Unique, A::Error> {
+                    let mut v = serde_json::Map::new();
+                    while let Some(key) = a.next_key::<String>()? {
+                        if v.contains_key(&key) {
+                            return Err(serde::de::Error::custom(
+                                "duplicate external helper JSON key",
+                            ));
+                        }
+                        let Unique(item) = a.next_value()?;
+                        v.insert(key, item);
+                    }
+                    Ok(Unique(v.into()))
+                }
+            }
+            d.deserialize_any(V)
+        }
+    }
+    serde_json::from_slice::<Unique>(bytes)
+        .map(|v| v.0)
+        .map_err(|e| invalid(format!("external helper JSON: {e}")))
+}
+
 /// Verify actual profile bytes/canonical identity against a prepared semantic
 /// lock and explicit registered Linux CAS program/cwd paths. This starts no
 /// checker or NN, reads no executable/model, and grants no arena launch/Core
@@ -2651,13 +3138,42 @@ pub fn validate_pals_process_work(
     kind: &str,
     startup: bool,
 ) -> Result<(), ArenaError> {
+    validate_pals_process_work_inner(work, kind, startup, false)
+}
+fn validate_pals_process_work_inner(
+    work: &serde_json::Value,
+    kind: &str,
+    startup: bool,
+    external: bool,
+) -> Result<(), ArenaError> {
     require(
         work["schema_version"] == 1 && work["search_kind"] == kind,
         "work schema/search kind differs",
     )?;
     // Historical v1 receipts omit this additive identity. Keep their absence
     // observable; an explicit identity must match the registered semantics.
-    if let Some(resolver) = work.get("pals_resolver") {
+    if external {
+        require(
+            kind == "pals"
+                && work["pals_resolver"]["version"]
+                    == rz_search::pals::value::MODEL_WDL_RESOLVER_VERSION
+                && work["pals_resolver"]["semantics_sha256"]
+                    == serde_json::json!(
+                        Sha256::digest(
+                            rz_search::pals::value::MODEL_WDL_RESOLVER_SEMANTICS.as_bytes()
+                        )
+                        .to_vec()
+                    ),
+            "external work model-WDL resolver missing or differs",
+        )?;
+        let values = &work["pals"];
+        require(
+            work_count(values, "completed_value_calls")? <= work_count(values, "value_calls")?
+                && work_count(values, "accepted_value_outputs")?
+                    <= work_count(values, "completed_value_calls")?,
+            "external model-WDL completion/acceptance counters inconsistent",
+        )?;
+    } else if let Some(resolver) = work.get("pals_resolver") {
         require(
             kind == "pals"
                 && resolver["version"] == rz_search::pals::engine::PALS_VALUE_RESOLVER_VERSION
@@ -2996,6 +3512,7 @@ fn endpoint_work_receipt(
     }
     let mut receipt = PalsEndpointReceiptV3 {
         endpoint_id: engine.id().into(),
+        external_cpu_r: None,
         uci_ready_observed: true,
         options,
         actual_affinity: PalsObservedV3::Unknown,
@@ -4253,6 +4770,227 @@ mod tests {
             pals_external_cpu_r_preflight_root(NativeEngineRole::Candidate, &game_root).is_err()
         );
         assert!(!game_root.exists() && !preflight_root.exists());
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "pals-collection-onnx", feature = "native-cuda")
+    ))]
+    fn helper_pair_fixture(
+        fixture: &ExternalProfileFixture,
+    ) -> (
+        LockedPalsArenaLaunchV3,
+        rz_uci::pals_checker_profile::LoadedPalsCheckerProfile,
+        serde_json::Value,
+        serde_json::Value,
+    ) {
+        use rz_search::cpu_checker::CpuChecker;
+        let input = fixture.native_launch();
+        let lock = LockedPalsArenaLaunchV3 {
+            sha256: crate::canonical_sha256(&input).unwrap(),
+            opening: input.opening(),
+            endpoint_views: [input.endpoint(0).unwrap(), input.endpoint(1).unwrap()],
+            input,
+        };
+        let (declaration, _) = lock.input.external_cpu_r_binding(0).unwrap().unwrap();
+        let loaded = rz_uci::pals_checker_profile::PalsCheckerProfile::load(
+            &fixture.root.join("profile.json"),
+            &declaration.profile.sha256,
+        )
+        .unwrap();
+        let checker = loaded.create_checker().unwrap();
+        let caps = checker.capabilities();
+        let n = lock.native(NativeEngineRole::Baseline).unwrap();
+        let PalsEngineV3::Pals(e) = &lock.input.semantic_lock.manifest.engines[0] else {
+            unreachable!()
+        };
+        let PalsWeightIdentityV3::Untrained { artifact, .. } = &e.model.weights else {
+            unreachable!()
+        };
+        let model_value = serde_json::json!({"semantics":rz_search::pals::value::MODEL_WDL_VALUE_SEMANTICS,
+            "model":format!("pals-onnx-pc-fp32-{}",n.export.sha256),"encoding":n.encoding_semantic_sha256,
+            "precision":"fp32","model_epoch":hash_array(&artifact.sha256)});
+        let registration = serde_json::json!({"identity":checker.identity(),"conditions":checker.conditions(),
+            "capabilities":{"max_depth":caps.max_depth,"max_prefix_plies":caps.max_prefix_plies,"max_root_moves":caps.max_root_moves,
+                "root_moves":caps.root_moves,"divergence":caps.divergence,"resume":caps.resume,"selective_search":caps.selective_search},
+            "role_model":model_value["model"],"model_value":model_value,
+            "resolver_version":rz_search::pals::value::MODEL_WDL_RESOLVER_VERSION,
+            "resolver_semantics":rz_search::pals::value::MODEL_WDL_RESOLVER_SEMANTICS});
+        let mut sha = Sha256::new();
+        sha.update(b"rz-pals-checker-registration/1\0");
+        sha.update(serde_json::to_vec(&registration).unwrap());
+        let limits = serde_json::json!({"mount_point":"/sys/fs/cgroup","mount_root":"/","resolved_directory":"/sys/fs/cgroup/test-only",
+            "memory_high":{"kind":"numeric","value":6u64<<30},"memory_max":{"kind":"numeric","value":12u64<<30},
+            "memory_swap_max":{"kind":"numeric","value":0},"pids_max":{"kind":"numeric","value":128}});
+        let process = |pid, parent, ticks| {
+            serde_json::json!({"pid":pid,"parent_pid":parent,"process_group":pid,
+            "proc_start_ticks_before":ticks,"proc_start_ticks_after":ticks,"cgroup_v2_membership":"/test-only",
+            "membership_path_view":"observer_procfs_and_cgroup2_mount_view","cgroup_namespace_inode":777,"cpu_allowed_list":"0,2",
+            "threads":[{"tid":pid,"proc_start_ticks_before":ticks,"proc_start_ticks_after":ticks,"cpu_allowed_list":"0,2"}],
+            "thread_observation_scope":"bounded_ready_boundary_thread_snapshot_not_lifetime_enforcement","cgroup_limits":limits})
+        };
+        let ready = serde_json::json!({"schema_version":1,"domain":"rz-pals-checker-ready-resources/1","scope":"linux_ready_boundary_snapshot",
+            "observed_unix_us":10,"observation_elapsed_us":1,"parent":process(100,99,500),"helper":process(101,100,600),
+            "cgroup_membership_equal":true,"cgroup_namespace_equal":true,"cpu_allowed_list_equal":true,
+            "additional_allocation":"none_declared_not_an_enforcement_proof",
+            "read_consistency":"identity_membership_affinity_bracketed_limits_sequential_not_atomic"});
+        let helper = serde_json::json!({"schema_version":1,"domain":"rz-pals-checker-process/1","profile_file_sha256":loaded.file_sha256(),
+            "profile_canonical_sha256":loaded.canonical_sha256(),"registration_sha256":format!("{:x}",sha.finalize()),"registration":registration,
+            "startup_handshake_completed":true,"observed_uci":{"name":loaded.profile().expected_uci_name,"author":null},
+            "startup_resource_observation":ready,"requested_option_checks_completed":true,"applied_option_values":"unknown",
+            "latest_attempt":null,"shutdown":null,"cleanup_complete":false,"started_owner_exit_and_drains_confirmed":false});
+        let mut totals = serde_json::json!({"external_checker_tasks":0,"external_checker_reports":0,"external_checker_nodes_observed":0,
+            "external_checker_node_budget_reserved":0,"consumed_external_checker_tasks":0,"external_checker_work_incomplete":false,
+            "value_calls":0,"completed_value_calls":0,"accepted_value_outputs":0});
+        for field in [
+            "completed_proposer_calls",
+            "completed_repair_calls",
+            "completed_critic_calls",
+            "cpu_tasks_requested",
+            "cpu_tasks",
+            "completed_cpu_tasks",
+            "reused_completed_cpu_tasks_consumed",
+            "consumed_cpu_tasks",
+            "cpu_nodes",
+            "consumed_role_outputs",
+        ] {
+            totals[field] = 0.into();
+        }
+        let work = serde_json::json!({"schema_version":1,"search_kind":"pals","go_invocations":0,"successful_returns":0,"failed_returns":0,
+            "active_invocations":0,"unobserved_work_invocations":0,"physical_unknown_returns":0,"canceled_returns":0,"deadline_returns":0,
+            "pals_resolver":{"version":rz_search::pals::value::MODEL_WDL_RESOLVER_VERSION,
+                "semantics_sha256":Sha256::digest(rz_search::pals::value::MODEL_WDL_RESOLVER_SEMANTICS.as_bytes()).to_vec()},"cpu":null,"pals":totals});
+        let native = serde_json::json!({"model_epoch":hash_array(&artifact.sha256),"export_manifest_sha256":hash_array(&n.export.sha256),
+            "encoding_semantic_sha256":hash_array(&n.encoding_semantic_sha256),"adapter_source_sha256":hash_array(&n.adapter_source_sha256),
+            "trained":false,"frozen_epoch":e.model.frozen_epoch,"process_epoch":77,
+            "execution":{"provider":"cpu","runtime_sha256":hash_array(&n.runtime.sha256),"device_id":null,"session_arena_bytes":null,"runtime_bundle_sha256":null},
+            "physical_shutdown_confirmed":false,"native_buffers_released":false,"quarantined":false,"physical_runs_in_flight":0,
+            "game_generation":0,"completed_new_game_resets":0});
+        let start = serde_json::json!({"schema_version":3,"domain":PALS_NATIVE_STARTUP_V3_DOMAIN,"endpoint_id":e.id,"launch_sha256":lock.sha256,
+            "process_id":100,"binary_sha256":e.binary.sha256,"runtime_sha256":n.runtime.sha256,"provider":"cpu","precision":"fp32",
+            "service_exit_success":false,"cpu_checker":helper,"native":native,"search_work":work});
+        let mut end = start.clone();
+        end["domain"] = PALS_NATIVE_TERMINATION_V3_DOMAIN.into();
+        end["service_exit_success"] = true.into();
+        end["native"]["physical_shutdown_confirmed"] = true.into();
+        end["native"]["native_buffers_released"] = true.into();
+        end["native"]["game_generation"] = 1.into();
+        end["native"]["completed_new_game_resets"] = 1.into();
+        let h = &mut end["cpu_checker"];
+        h["cleanup_complete"] = true.into();
+        h["started_owner_exit_and_drains_confirmed"] = true.into();
+        h["shutdown"] = serde_json::json!({"process_identity":{"pid":101,"process_group":101,"proc_start_ticks":600,"scope":"linux_spawn_observed_identity"},
+            "stop_sent":false,"quit_sent":true,"exit_observed":true,"stdout_drained":true,"stderr_drained":true,"exit_code":0,"exit_signal":null,
+            "cleanup_complete":true,"quarantined":false,"ownership_lost":false,"stdout_bytes":100,"stderr_bytes":0});
+        end["search_work"]["go_invocations"] = 1.into();
+        end["search_work"]["successful_returns"] = 1.into();
+        for (key, value) in [
+            ("external_checker_tasks", 1),
+            ("external_checker_reports", 1),
+            ("external_checker_nodes_observed", 20),
+            ("external_checker_node_budget_reserved", 256),
+            ("consumed_external_checker_tasks", 3),
+            ("value_calls", 3),
+            ("completed_value_calls", 3),
+            ("accepted_value_outputs", 3),
+        ] {
+            end["search_work"]["pals"][key] = value.into();
+        }
+        end["search_work"]["pals"]["external_checker_work_incomplete"] = true.into();
+        (lock, loaded, start, end)
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "pals-collection-onnx", feature = "native-cuda")
+    ))]
+    #[test]
+    fn external_helper_session_validates_registered_model_resources_and_unknown_work() {
+        let fixture = ExternalProfileFixture::new();
+        let (lock, loaded, start, end) = helper_pair_fixture(&fixture);
+        let audit = validate_pals_external_cpu_r_session(
+            &lock,
+            NativeEngineRole::Baseline,
+            &loaded,
+            &serde_json::to_vec(&start).unwrap(),
+            &serde_json::to_vec(&end).unwrap(),
+            100,
+            PalsExternalCpuRSessionPurposeV3::Game,
+        )
+        .unwrap();
+        assert_eq!(audit.receipt.work.reports_returned, Some(1));
+        assert_eq!(audit.receipt.work.consumed_completed_tasks, Some(3));
+        assert_eq!(audit.receipt.work.work_incomplete, Some(true));
+        assert!(matches!(
+            audit.receipt.work.completed_tasks,
+            PalsObservedV3::Unknown
+        ));
+        assert!(matches!(
+            audit.receipt.work.reused_completed_task_consumptions,
+            PalsObservedV3::Unknown
+        ));
+        assert!(matches!(
+            audit.receipt.applied_option_values,
+            PalsObservedV3::Unknown
+        ));
+        assert_eq!(
+            audit
+                .receipt
+                .shutdown
+                .process_identity
+                .as_ref()
+                .unwrap()
+                .pid,
+            101
+        );
+        assert!(lock.validate_execution().is_err());
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "pals-collection-onnx", feature = "native-cuda")
+    ))]
+    #[test]
+    fn external_helper_session_rejects_identity_resource_and_closure_fabrication() {
+        let fixture = ExternalProfileFixture::new();
+        let (lock, loaded, start, end) = helper_pair_fixture(&fixture);
+        let mutations: &[fn(&mut serde_json::Value)] = &[
+            |v| {
+                v["cpu_checker"]["registration"]["identity"]["identity"]["options"]["Threads"] =
+                    "1".into()
+            },
+            |v| v["cpu_checker"]["registration"]["model_value"]["model_epoch"][0] = 0.into(),
+            |v| v["native"]["model_epoch"][0] = 0.into(),
+            |v| v["search_work"]["pals_resolver"]["version"] = "own".into(),
+            |v| {
+                v["cpu_checker"]["startup_resource_observation"]["helper"]["cgroup_v2_membership"] =
+                    "/other".into()
+            },
+            |v| v["cpu_checker"]["shutdown"]["process_identity"]["proc_start_ticks"] = 601.into(),
+            |v| v["cpu_checker"]["shutdown"]["stderr_drained"] = false.into(),
+            |v| v["cpu_checker"]["shutdown"]["exit_code"] = 1.into(),
+            |v| v["cpu_checker"]["shutdown"]["ownership_lost"] = true.into(),
+            |v| v["native"]["physical_shutdown_confirmed"] = false.into(),
+            |v| v["search_work"]["pals"]["cpu_nodes"] = 20.into(),
+        ];
+        for (i, mutate) in mutations.iter().enumerate() {
+            let mut bad = end.clone();
+            mutate(&mut bad);
+            assert!(
+                validate_pals_external_cpu_r_session(
+                    &lock,
+                    NativeEngineRole::Baseline,
+                    &loaded,
+                    &serde_json::to_vec(&start).unwrap(),
+                    &serde_json::to_vec(&bad).unwrap(),
+                    100,
+                    PalsExternalCpuRSessionPurposeV3::Readiness
+                )
+                .is_err(),
+                "mutation {i}"
+            );
+        }
+        assert!(
+            unique_helper_json(br#"{"identity":{"options":{"Threads":"1","Threads":"2"}}}"#)
+                .is_err()
+        );
     }
     #[cfg(all(
         target_os = "linux",

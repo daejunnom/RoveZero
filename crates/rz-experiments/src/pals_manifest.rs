@@ -790,10 +790,402 @@ pub struct PalsOptionReceiptV3 {
     pub observed: PalsObservedV3<String>,
 }
 
+/// Historical Linux identity; it is neither a currently live PID nor one of
+/// Fastchess's four game UCI leaders.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsHelperProcessIdentityV3 {
+    pub pid: u32,
+    pub process_group: u32,
+    pub proc_start_ticks: u64,
+    pub scope: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PalsReadyLimitV3 {
+    Numeric { value: u64 },
+    Max,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsReadyCgroupLimitsV3 {
+    pub mount_point: String,
+    pub mount_root: String,
+    pub resolved_directory: String,
+    pub memory_high: PalsReadyLimitV3,
+    pub memory_max: PalsReadyLimitV3,
+    pub memory_swap_max: PalsReadyLimitV3,
+    pub pids_max: PalsReadyLimitV3,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsReadyThreadV3 {
+    pub tid: u32,
+    pub proc_start_ticks_before: u64,
+    pub proc_start_ticks_after: u64,
+    pub cpu_allowed_list: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsReadyProcessV3 {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub process_group: u32,
+    pub proc_start_ticks_before: u64,
+    pub proc_start_ticks_after: u64,
+    pub cgroup_v2_membership: String,
+    pub membership_path_view: String,
+    pub cgroup_namespace_inode: Option<u64>,
+    pub cpu_allowed_list: String,
+    pub threads: Vec<PalsReadyThreadV3>,
+    pub thread_observation_scope: String,
+    pub cgroup_limits: PalsReadyCgroupLimitsV3,
+}
+/// Direct cgroup-file/affinity observations at ready, never applied UCI option
+/// values, ancestor effective limits, memory peaks or lifetime enforcement.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsCheckerReadyResourcesV3 {
+    pub schema_version: u32,
+    pub domain: String,
+    pub scope: String,
+    pub observed_unix_us: u64,
+    pub observation_elapsed_us: u64,
+    pub parent: PalsReadyProcessV3,
+    pub helper: PalsReadyProcessV3,
+    pub cgroup_membership_equal: bool,
+    pub cgroup_namespace_equal: Option<bool>,
+    pub cpu_allowed_list_equal: bool,
+    pub additional_allocation: String,
+    pub read_consistency: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsHelperShutdownV3 {
+    pub process_identity: Option<PalsHelperProcessIdentityV3>,
+    pub stop_sent: bool,
+    pub quit_sent: bool,
+    pub exit_observed: bool,
+    pub stdout_drained: bool,
+    pub stderr_drained: bool,
+    pub exit_code: Option<i32>,
+    pub exit_signal: Option<i32>,
+    pub cleanup_complete: bool,
+    pub quarantined: bool,
+    pub ownership_lost: bool,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsModelValueIdentityV3 {
+    pub semantics: String,
+    pub model: String,
+    pub encoding: String,
+    pub precision: String,
+    /// Checkpoint digest, separate from numerical frozen/process epochs.
+    pub model_epoch: [u8; 32],
+}
+fn unknown_count() -> PalsObservedV3<u64> {
+    PalsObservedV3::Unknown
+}
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsExternalCpuRWorkV3 {
+    pub tasks_dispatched: Option<u64>,
+    pub reports_returned: Option<u64>,
+    pub node_budget_reserved: Option<u64>,
+    /// Foreign reported work; missing or incomplete is not zero/own nodes.
+    pub nodes_observed: Option<u64>,
+    pub consumed_completed_tasks: Option<u64>,
+    pub work_incomplete: Option<bool>,
+    /// The admitted producer has no totals for these two units. Defaults are
+    /// unknown; report counts or total consumption cannot substitute for them.
+    #[serde(default = "unknown_count")]
+    pub completed_tasks: PalsObservedV3<u64>,
+    #[serde(default = "unknown_count")]
+    pub reused_completed_task_consumptions: PalsObservedV3<u64>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsExternalCpuRReceiptV3 {
+    pub profile_file_sha256: String,
+    pub profile_canonical_sha256: String,
+    pub registered_binary_sha256: String,
+    pub registration_sha256: String,
+    pub resolver: PalsExternalCpuRResolverV3,
+    pub model_value: PalsModelValueIdentityV3,
+    pub ready_resources: PalsCheckerReadyResourcesV3,
+    pub shutdown: PalsHelperShutdownV3,
+    pub work: PalsExternalCpuRWorkV3,
+    pub applied_option_values: PalsObservedV3<BTreeMap<String, String>>,
+    pub model_loading: PalsObservedV3<bool>,
+}
+
+fn ready_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() <= 4096
+        && !path.chars().any(char::is_control)
+        && !path.split('/').any(|part| part == "." || part == "..")
+}
+fn ready_affinity(text: &str) -> Result<BTreeSet<u32>, ManifestError> {
+    require(
+        !text.is_empty() && text.len() <= 4096,
+        "ready affinity invalid",
+    )?;
+    let mut cpus = BTreeSet::new();
+    for item in text.split(',') {
+        let (low, high) = match item.split_once('-') {
+            Some((lo, hi)) => (lo.parse::<u32>(), hi.parse::<u32>()),
+            None => (item.parse::<u32>(), item.parse::<u32>()),
+        };
+        let (low, high) = (
+            low.map_err(|_| ManifestError::Integrity("ready affinity invalid".into()))?,
+            high.map_err(|_| ManifestError::Integrity("ready affinity invalid".into()))?,
+        );
+        require(
+            high >= low && high - low < 64,
+            "ready affinity range exceeds bound",
+        )?;
+        for cpu in low..=high {
+            require(
+                cpus.insert(cpu) && cpus.len() <= 64,
+                "ready affinity duplicate/oversized",
+            )?;
+        }
+    }
+    Ok(cpus)
+}
+impl PalsCheckerReadyResourcesV3 {
+    pub fn validate_against(
+        &self,
+        parent_pid: u32,
+        helper: &PalsHelperProcessIdentityV3,
+        r: &PalsResourcePolicyV3,
+        policy: &PalsExternalCpuRPolicyV3,
+    ) -> Result<(), ManifestError> {
+        require(
+            self.schema_version == 1
+                && self.domain == "rz-pals-checker-ready-resources/1"
+                && self.scope == "linux_ready_boundary_snapshot"
+                && self.additional_allocation == "none_declared_not_an_enforcement_proof"
+                && self.read_consistency
+                    == "identity_membership_affinity_bracketed_limits_sequential_not_atomic",
+            "external ready resource scope/domain differs",
+        )?;
+        require(
+            parent_pid > 0
+                && self.parent.pid == parent_pid
+                && self.helper.parent_pid == parent_pid
+                && helper.pid != parent_pid
+                && helper.pid > 0
+                && helper.pid <= i32::MAX as u32
+                && helper.process_group == helper.pid
+                && helper.proc_start_ticks > 0
+                && helper.scope == "linux_spawn_observed_identity"
+                && self.helper.pid == helper.pid
+                && self.helper.process_group == helper.process_group
+                && self.helper.process_group != self.parent.process_group
+                && self.helper.proc_start_ticks_before == helper.proc_start_ticks,
+            "external helper/parent historical identity differs",
+        )?;
+        let expected: BTreeSet<_> = r.cpu_affinity.iter().copied().collect();
+        for process in [&self.parent, &self.helper] {
+            require(
+                process.pid > 0
+                    && process.pid <= i32::MAX as u32
+                    && process.parent_pid > 0
+                    && process.process_group > 0
+                    && process.process_group <= i32::MAX as u32
+                    && process.proc_start_ticks_before > 0
+                    && process.proc_start_ticks_before == process.proc_start_ticks_after
+                    && process.membership_path_view == "observer_procfs_and_cgroup2_mount_view"
+                    && ready_path(&process.cgroup_v2_membership)
+                    && process
+                        .cgroup_namespace_inode
+                        .is_some_and(|inode| inode > 0)
+                    && ready_affinity(&process.cpu_allowed_list)? == expected
+                    && process.thread_observation_scope
+                        == "bounded_ready_boundary_thread_snapshot_not_lifetime_enforcement"
+                    && !process.threads.is_empty()
+                    && process.threads.len() <= 64,
+                "external ready process identity/affinity/scope invalid",
+            )?;
+            let mut tids = BTreeSet::new();
+            for thread in &process.threads {
+                require(
+                    thread.tid > 0
+                        && thread.tid <= i32::MAX as u32
+                        && tids.insert(thread.tid)
+                        && thread.proc_start_ticks_before > 0
+                        && thread.proc_start_ticks_before == thread.proc_start_ticks_after
+                        && ready_affinity(&thread.cpu_allowed_list)? == expected,
+                    "external ready thread identity/affinity invalid",
+                )?;
+                if thread.tid == process.pid {
+                    require(
+                        thread.proc_start_ticks_before == process.proc_start_ticks_before,
+                        "external ready leader thread identity differs",
+                    )?;
+                }
+            }
+            require(
+                tids.contains(&process.pid),
+                "external ready leader thread missing",
+            )?;
+            let limits = &process.cgroup_limits;
+            let relative = if limits.mount_root == "/" {
+                Some(process.cgroup_v2_membership.trim_start_matches('/'))
+            } else if process.cgroup_v2_membership == limits.mount_root {
+                Some("")
+            } else {
+                process
+                    .cgroup_v2_membership
+                    .strip_prefix(&format!("{}/", limits.mount_root.trim_end_matches('/')))
+            };
+            let resolved = relative.map(|relative| {
+                if relative.is_empty() {
+                    limits.mount_point.clone()
+                } else {
+                    format!("{}/{}", limits.mount_point.trim_end_matches('/'), relative)
+                }
+            });
+            require(
+                ready_path(&limits.mount_point)
+                    && ready_path(&limits.mount_root)
+                    && ready_path(&limits.resolved_directory)
+                    && resolved.as_ref() == Some(&limits.resolved_directory)
+                    && limits.memory_high
+                        == (PalsReadyLimitV3::Numeric {
+                            value: r.memory_high_bytes,
+                        })
+                    && limits.memory_max
+                        == (PalsReadyLimitV3::Numeric {
+                            value: r.memory_max_bytes,
+                        })
+                    && limits.memory_swap_max
+                        == (PalsReadyLimitV3::Numeric {
+                            value: r.swap_max_bytes,
+                        })
+                    && matches!(&limits.pids_max, PalsReadyLimitV3::Numeric { value } if *value > 0 && *value <= u64::from(policy.inherited_kernel_tasks_max)),
+                "external ready direct cgroup limits differ from registered finite policy",
+            )?;
+        }
+        require(
+            self.parent.cgroup_v2_membership == self.helper.cgroup_v2_membership
+                && self.parent.cgroup_namespace_inode == self.helper.cgroup_namespace_inode
+                && self.parent.cgroup_limits == self.helper.cgroup_limits
+                && ready_affinity(&self.parent.cpu_allowed_list)?
+                    == ready_affinity(&self.helper.cpu_allowed_list)?
+                && self.cgroup_membership_equal
+                && self.cgroup_namespace_equal == Some(true)
+                && self.cpu_allowed_list_equal,
+            "external ready inherited membership/namespace/affinity differs",
+        )
+    }
+}
+impl PalsExternalCpuRReceiptV3 {
+    pub fn validate_against(
+        &self,
+        e: &PalsEndpointV3,
+        r: &PalsResourcePolicyV3,
+    ) -> Result<(), ManifestError> {
+        let PalsCpuRSelectionV3::ExternalUci(declaration) = &e.cpu_r else {
+            return Err(ManifestError::Integrity(
+                "own CPU_R cannot claim external evidence".into(),
+            ));
+        };
+        require(
+            self.profile_file_sha256 == declaration.profile.sha256
+                && self.profile_canonical_sha256 == declaration.profile_canonical_sha256
+                && self.registered_binary_sha256 == declaration.binary.sha256
+                && sha(&self.registration_sha256, 64)
+                && self.resolver == declaration.resolver
+                && text(&self.model_value.model)
+                && self.model_value.model.len() <= 1024
+                && text(&self.model_value.semantics)
+                && self.model_value.semantics.len() <= 1024
+                && sha(&self.model_value.encoding, 64)
+                && self.model_value.precision == "fp32",
+            "external receipt profile/registration/resolver/model identity differs",
+        )?;
+        let checkpoint = match &e.model.weights {
+            PalsWeightIdentityV3::Untrained { artifact, .. }
+            | PalsWeightIdentityV3::Trained { artifact, .. } => artifact,
+            _ => {
+                return Err(ManifestError::Integrity(
+                    "external model-WDL needs actual native checkpoint".into(),
+                ));
+            }
+        };
+        require(
+            digest_hex(&self.model_value.model_epoch) == checkpoint.sha256,
+            "external model-WDL checkpoint epoch differs",
+        )?;
+        let helper =
+            self.shutdown.process_identity.as_ref().ok_or_else(|| {
+                ManifestError::Integrity("external shutdown identity unknown".into())
+            })?;
+        self.ready_resources.validate_against(
+            self.ready_resources.parent.pid,
+            helper,
+            r,
+            &declaration.policy,
+        )?;
+        require(
+            self.shutdown.exit_observed
+                && self.shutdown.stdout_drained
+                && self.shutdown.stderr_drained
+                && self.shutdown.exit_code == Some(0)
+                && self.shutdown.exit_signal.is_none()
+                && self.shutdown.cleanup_complete
+                && !self.shutdown.quarantined
+                && !self.shutdown.ownership_lost
+                && self
+                    .shutdown
+                    .stdout_bytes
+                    .checked_add(self.shutdown.stderr_bytes)
+                    .is_some_and(|bytes| bytes <= declaration.policy.lifetime_output_bytes_max),
+            "external helper exit/known PGID/pipe closure unconfirmed",
+        )?;
+        require(
+            matches!(self.applied_option_values, PalsObservedV3::Unknown)
+                && matches!(self.model_loading, PalsObservedV3::Unknown)
+                && matches!(self.work.completed_tasks, PalsObservedV3::Unknown)
+                && matches!(
+                    self.work.reused_completed_task_consumptions,
+                    PalsObservedV3::Unknown
+                ),
+            "external unobserved options/model/completed/reused work cannot be invented",
+        )?;
+        if let (Some(tasks), Some(reports)) =
+            (self.work.tasks_dispatched, self.work.reports_returned)
+        {
+            require(reports <= tasks, "external reports exceed dispatched tasks")?;
+        }
+        if let (Some(tasks), Some(reserved)) =
+            (self.work.tasks_dispatched, self.work.node_budget_reserved)
+        {
+            require(
+                u128::from(reserved)
+                    <= u128::from(tasks) * u128::from(declaration.policy.max_nodes_per_task),
+                "external reserved node budget exceeds declared task ceilings",
+            )?;
+        }
+        Ok(())
+    }
+}
+fn digest_hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PalsEndpointReceiptV3 {
     pub endpoint_id: String,
+    /// Omitted/default None preserves every historical Own V3 receipt byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_cpu_r: Option<PalsExternalCpuRReceiptV3>,
     pub uci_ready_observed: bool,
     pub options: BTreeMap<String, PalsOptionReceiptV3>,
     pub actual_affinity: PalsObservedV3<Vec<u32>>,
@@ -875,6 +1267,40 @@ fn receipt_endpoint(
     eligible: bool,
     failures: &BTreeSet<PalsRunFailureV3>,
 ) -> Result<(), ManifestError> {
+    match (e, &o.external_cpu_r) {
+        (PalsEngineV3::Pals(p), Some(external)) if !p.cpu_r.is_own() => {
+            external.validate_against(p, r)?;
+            if eligible {
+                require(
+                    external.work.tasks_dispatched.is_some()
+                        && external.work.reports_returned.is_some()
+                        && external.work.node_budget_reserved.is_some()
+                        && external.work.consumed_completed_tasks.is_some()
+                        && external.work.work_incomplete.is_some(),
+                    "eligible external CPU_R lacks observed request/report/reservation/consumption accounting",
+                )?;
+            }
+            require(
+                o.cpu_tasks_requested == 0
+                    && o.cpu_tasks_completed == 0
+                    && o.cpu_tasks_reused_consumed == 0
+                    && o.cpu_tasks_consumed == 0
+                    && o.cpu_nodes == 0,
+                "foreign CPU_R cannot be projected into own CPU counters",
+            )?;
+        }
+        (PalsEngineV3::Pals(p), None) if !p.cpu_r.is_own() => {
+            return Err(ManifestError::Integrity(
+                "external CPU_R receipt projection missing".into(),
+            ));
+        }
+        (_, None) => {}
+        _ => {
+            return Err(ManifestError::Integrity(
+                "own/non-PALS endpoint cannot claim external CPU_R".into(),
+            ));
+        }
+    }
     require(
         o.endpoint_id == e.id() && o.options.keys().eq(e.requested_options().keys()),
         "receipt endpoint/options differ from launch",
@@ -1276,6 +1702,7 @@ mod tests {
     fn endpoint_receipt(e: &PalsEngineV3) -> PalsEndpointReceiptV3 {
         PalsEndpointReceiptV3 {
             endpoint_id: e.id().into(),
+            external_cpu_r: None,
             uci_ready_observed: true,
             options: e
                 .requested_options()
@@ -1310,6 +1737,229 @@ mod tests {
             buffers_released: true,
             process_exited: true,
         }
+    }
+    fn external_receipt_fixture() -> (PalsEndpointV3, PalsExternalCpuRReceiptV3) {
+        let PalsEngineV3::Pals(mut endpoint) = pals("pals") else {
+            unreachable!()
+        };
+        endpoint.cpu_r = PalsCpuRSelectionV3::ExternalUci(Box::new(external_cpu_r_fixture()));
+        endpoint.model.backend = PalsModelBackendV3::OrtCpu;
+        let checkpoint = asset("checkpoint.pt");
+        let mut epoch = [0; 32];
+        for (i, byte) in epoch.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&checkpoint.sha256[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        endpoint.model.weights = PalsWeightIdentityV3::Untrained {
+            artifact: checkpoint,
+            initialization_seed: 1,
+        };
+        let limits = PalsReadyCgroupLimitsV3 {
+            mount_point: "/sys/fs/cgroup".into(),
+            mount_root: "/".into(),
+            resolved_directory: "/sys/fs/cgroup/test-only".into(),
+            memory_high: PalsReadyLimitV3::Numeric { value: 6 << 30 },
+            memory_max: PalsReadyLimitV3::Numeric { value: 12 << 30 },
+            memory_swap_max: PalsReadyLimitV3::Numeric { value: 0 },
+            pids_max: PalsReadyLimitV3::Numeric { value: 128 },
+        };
+        let process = |pid, parent_pid, ticks| PalsReadyProcessV3 {
+            pid,
+            parent_pid,
+            process_group: pid,
+            proc_start_ticks_before: ticks,
+            proc_start_ticks_after: ticks,
+            cgroup_v2_membership: "/test-only".into(),
+            membership_path_view: "observer_procfs_and_cgroup2_mount_view".into(),
+            cgroup_namespace_inode: Some(777),
+            cpu_allowed_list: "0,2".into(),
+            threads: vec![PalsReadyThreadV3 {
+                tid: pid,
+                proc_start_ticks_before: ticks,
+                proc_start_ticks_after: ticks,
+                cpu_allowed_list: "0,2".into(),
+            }],
+            thread_observation_scope:
+                "bounded_ready_boundary_thread_snapshot_not_lifetime_enforcement".into(),
+            cgroup_limits: limits.clone(),
+        };
+        let PalsCpuRSelectionV3::ExternalUci(declaration) = &endpoint.cpu_r else {
+            unreachable!()
+        };
+        let receipt = PalsExternalCpuRReceiptV3 {
+            profile_file_sha256: declaration.profile.sha256.clone(),
+            profile_canonical_sha256: declaration.profile_canonical_sha256.clone(),
+            registered_binary_sha256: declaration.binary.sha256.clone(),
+            registration_sha256: "f".repeat(64),
+            resolver: declaration.resolver.clone(),
+            model_value: PalsModelValueIdentityV3 {
+                semantics: "fixture-model-value".into(),
+                model: "fixture-native-model".into(),
+                encoding: "d".repeat(64),
+                precision: "fp32".into(),
+                model_epoch: epoch,
+            },
+            ready_resources: PalsCheckerReadyResourcesV3 {
+                schema_version: 1,
+                domain: "rz-pals-checker-ready-resources/1".into(),
+                scope: "linux_ready_boundary_snapshot".into(),
+                observed_unix_us: 10,
+                observation_elapsed_us: 1,
+                parent: process(100, 99, 500),
+                helper: process(101, 100, 600),
+                cgroup_membership_equal: true,
+                cgroup_namespace_equal: Some(true),
+                cpu_allowed_list_equal: true,
+                additional_allocation: "none_declared_not_an_enforcement_proof".into(),
+                read_consistency:
+                    "identity_membership_affinity_bracketed_limits_sequential_not_atomic".into(),
+            },
+            shutdown: PalsHelperShutdownV3 {
+                process_identity: Some(PalsHelperProcessIdentityV3 {
+                    pid: 101,
+                    process_group: 101,
+                    proc_start_ticks: 600,
+                    scope: "linux_spawn_observed_identity".into(),
+                }),
+                stop_sent: false,
+                quit_sent: true,
+                exit_observed: true,
+                stdout_drained: true,
+                stderr_drained: true,
+                exit_code: Some(0),
+                exit_signal: None,
+                cleanup_complete: true,
+                quarantined: false,
+                ownership_lost: false,
+                stdout_bytes: 100,
+                stderr_bytes: 0,
+            },
+            work: PalsExternalCpuRWorkV3 {
+                tasks_dispatched: Some(1),
+                reports_returned: Some(1),
+                node_budget_reserved: Some(256),
+                nodes_observed: Some(20),
+                consumed_completed_tasks: Some(3),
+                work_incomplete: Some(true),
+                completed_tasks: PalsObservedV3::Unknown,
+                reused_completed_task_consumptions: PalsObservedV3::Unknown,
+            },
+            applied_option_values: PalsObservedV3::Unknown,
+            model_loading: PalsObservedV3::Unknown,
+        };
+        (*endpoint, receipt)
+    }
+    #[test]
+    fn external_receipt_preserves_unknown_foreign_units_and_own_json_compatibility() {
+        let own = endpoint_receipt(&pals("pals"));
+        let bytes = serde_json::to_vec(&own).unwrap();
+        assert!(
+            !serde_json::from_slice::<serde_json::Value>(&bytes)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("external_cpu_r")
+        );
+        assert_eq!(
+            serde_json::from_slice::<PalsEndpointReceiptV3>(&bytes).unwrap(),
+            own
+        );
+        let (endpoint, receipt) = external_receipt_fixture();
+        receipt.validate_against(&endpoint, &resource()).unwrap();
+        // Consumption includes reuse and nodes remain foreign reported work.
+        let mut observed = receipt.clone();
+        observed.work.nodes_observed = Some(512);
+        observed.validate_against(&endpoint, &resource()).unwrap();
+        observed.work.nodes_observed = None;
+        observed.validate_against(&endpoint, &resource()).unwrap();
+        let mut wire = serde_json::to_value(&receipt.work).unwrap();
+        wire.as_object_mut().unwrap().remove("completed_tasks");
+        wire.as_object_mut()
+            .unwrap()
+            .remove("reused_completed_task_consumptions");
+        let decoded: PalsExternalCpuRWorkV3 = serde_json::from_value(wire).unwrap();
+        assert!(matches!(decoded.completed_tasks, PalsObservedV3::Unknown));
+        assert!(matches!(
+            decoded.reused_completed_task_consumptions,
+            PalsObservedV3::Unknown
+        ));
+        observed.work.completed_tasks = PalsObservedV3::Observed {
+            value: 1,
+            method: "reports".into(),
+        };
+        assert!(observed.validate_against(&endpoint, &resource()).is_err());
+    }
+    #[test]
+    fn external_ready_resources_and_independent_closure_fail_closed() {
+        let (endpoint, receipt) = external_receipt_fixture();
+        let mutations: &[fn(&mut PalsExternalCpuRReceiptV3)] = &[
+            |r| r.ready_resources.helper.proc_start_ticks_after += 1,
+            |r| r.ready_resources.helper.cgroup_namespace_inode = None,
+            |r| r.ready_resources.helper.cpu_allowed_list = "0".into(),
+            |r| r.ready_resources.helper.cgroup_limits.memory_swap_max = PalsReadyLimitV3::Max,
+            |r| r.ready_resources.helper.cgroup_limits.pids_max = PalsReadyLimitV3::Max,
+            |r| {
+                r.ready_resources.helper.cgroup_limits.resolved_directory =
+                    "/sys/fs/cgroup/other".into()
+            },
+            |r| r.ready_resources.cgroup_membership_equal = false,
+            |r| r.ready_resources.scope = "lifetime_enforcement".into(),
+            |r| r.shutdown.stderr_drained = false,
+            |r| r.shutdown.exit_code = Some(1),
+            |r| r.shutdown.exit_signal = Some(9),
+            |r| r.shutdown.ownership_lost = true,
+            |r| r.model_value.model_epoch[0] ^= 1,
+            |r| r.work.reports_returned = Some(2),
+        ];
+        for (index, mutate) in mutations.iter().enumerate() {
+            let mut bad = receipt.clone();
+            mutate(&mut bad);
+            assert!(
+                bad.validate_against(&endpoint, &resource()).is_err(),
+                "mutation {index}"
+            );
+        }
+        let mut four_threads = receipt;
+        for tid in 102..105 {
+            four_threads
+                .ready_resources
+                .helper
+                .threads
+                .push(PalsReadyThreadV3 {
+                    tid,
+                    proc_start_ticks_before: 600,
+                    proc_start_ticks_after: 600,
+                    cpu_allowed_list: "0,2".into(),
+                });
+        }
+        four_threads
+            .validate_against(&endpoint, &resource())
+            .unwrap();
+    }
+    #[test]
+    fn external_projection_selection_does_not_remove_existing_execution_guard() {
+        let (endpoint, external) = external_receipt_fixture();
+        let engine = PalsEngineV3::Pals(Box::new(endpoint));
+        let mut output = endpoint_receipt(&engine);
+        output.external_cpu_r = Some(external);
+        assert!(receipt_endpoint(&output, &engine, &resource(), false, &BTreeSet::new()).is_err());
+        output.cpu_tasks_requested = 0;
+        output.cpu_tasks_completed = 0;
+        output.cpu_tasks_consumed = 0;
+        output.cpu_nodes = 0;
+        receipt_endpoint(&output, &engine, &resource(), false, &BTreeSet::new()).unwrap();
+        assert!(
+            receipt_endpoint(&output, &pals("pals"), &resource(), false, &BTreeSet::new()).is_err()
+        );
+        let mut m = manifest();
+        m.engines[0] = engine;
+        let lock = m.lock().unwrap();
+        assert!(
+            receipt(&lock)
+                .validate_against(&lock)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported external CPU_R receipt")
+        );
     }
     fn receipt(l: &PalsInputLockV3) -> PalsRunReceiptV3 {
         let m = &l.manifest;
