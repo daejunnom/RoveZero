@@ -139,6 +139,12 @@ impl PalsCheckerProcessReceipt {
 
 fn process(state: CheckerShutdown) -> Value {
     json!({
+        "process_identity": state.process_identity.map(|identity| json!({
+            "pid": identity.pid,
+            "process_group": identity.process_group,
+            "proc_start_ticks": identity.proc_start_ticks,
+            "scope": "linux_spawn_observed_identity",
+        })),
         "stop_sent": state.stop_sent,
         "quit_sent": state.quit_sent,
         "exit_observed": state.exit_observed,
@@ -222,6 +228,32 @@ mod tests {
         assert_eq!(value["external"]["process"]["exit_observed"], false);
         assert_eq!(value["external"]["process"]["cleanup_complete"], false);
         assert_eq!(value["external"]["process"]["quarantined"], false);
+        assert!(value["external"]["process"]["process_identity"].is_null());
+    }
+
+    #[test]
+    fn historical_linux_spawn_identity_is_separate_from_exit_and_drain_evidence() {
+        let mut state = CheckerShutdown {
+            process_identity: Some(rz_search::cpu_checker::ExternalProcessIdentity {
+                pid: 123,
+                process_group: 123,
+                proc_start_ticks: 456,
+            }),
+            ..CheckerShutdown::default()
+        };
+        let active = process(state);
+        assert_eq!(active["process_identity"]["pid"], 123);
+        assert_eq!(active["process_identity"]["process_group"], 123);
+        assert_eq!(active["process_identity"]["proc_start_ticks"], 456);
+        assert_eq!(active["cleanup_complete"], false);
+        state.exit_observed = true;
+        state.stdout_drained = true;
+        state.stderr_drained = true;
+        state.cleanup_complete = true;
+        let ended = process(state);
+        assert_eq!(ended["process_identity"], active["process_identity"]);
+        assert_eq!(ended["cleanup_complete"], true);
+        assert!(process(CheckerShutdown::owned_no_process())["process_identity"].is_null());
     }
 
     #[test]

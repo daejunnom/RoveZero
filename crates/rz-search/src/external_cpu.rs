@@ -822,6 +822,7 @@ impl ExternalUciCpuChecker {
 
 fn empty_shutdown() -> CheckerShutdown {
     CheckerShutdown {
+        process_identity: None,
         stop_sent: false,
         quit_sent: false,
         exit_observed: false,
@@ -1247,6 +1248,13 @@ mod process {
                     return Err(error("spawn", "leader_group_mismatch"));
                 }
                 owner.start_time = identity.start;
+                owner.state.process_identity = Some(crate::cpu_checker::ExternalProcessIdentity {
+                    pid: u32::try_from(pid.as_raw())
+                        .map_err(|_| error("spawn", "leader_pid_range"))?,
+                    process_group: u32::try_from(identity.group)
+                        .map_err(|_| error("spawn", "leader_group_range"))?,
+                    proc_start_ticks: identity.start,
+                });
                 nonblocking(
                     owner
                         .stdin
@@ -1838,6 +1846,17 @@ mod tests {
         checker
             .start(Instant::now() + Duration::from_secs(10), &cancel)
             .unwrap();
+        let startup_identity = checker
+            .last_attempt()
+            .unwrap()
+            .external
+            .as_ref()
+            .unwrap()
+            .process
+            .process_identity
+            .unwrap();
+        assert_eq!(startup_identity.pid, startup_identity.process_group);
+        assert!(startup_identity.pid > 0);
         let limits = CpuLimits {
             max_depth: 8,
             max_nodes: 80,
@@ -1894,6 +1913,7 @@ mod tests {
                 && process.stderr_drained
         );
         assert!(!process.ownership_lost && !process.quarantined);
+        assert_eq!(process.process_identity, Some(startup_identity));
     }
 
     #[cfg(target_os = "linux")]
@@ -2002,6 +2022,7 @@ mod tests {
             .unwrap()
             .process;
         assert!(actual.cleanup_complete);
+        assert!(actual.process_identity.is_none());
         assert!(!actual.exit_observed && !actual.stdout_drained && !actual.stderr_drained);
         assert_eq!(
             checker

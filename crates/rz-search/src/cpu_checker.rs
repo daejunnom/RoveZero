@@ -284,7 +284,18 @@ pub struct ExternalAttemptEvidence {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExternalProcessIdentity {
+    pub pid: u32,
+    pub process_group: u32,
+    /// Observed Linux /proc start-time ticks; not wall-clock or a PID alone.
+    pub proc_start_ticks: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CheckerShutdown {
+    /// Historical spawn identity after actual PID/group/start-time checks.
+    /// None for own checkers, unsupported hosts and pre-spawn failures.
+    pub process_identity: Option<ExternalProcessIdentity>,
     pub stop_sent: bool,
     pub quit_sent: bool,
     pub exit_observed: bool,
