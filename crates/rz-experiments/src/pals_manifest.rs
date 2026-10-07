@@ -243,6 +243,10 @@ pub struct PalsPilotV3 {
     pub seed: u64,
     pub wall_time_max_ms: u64,
     pub cleanup_max_ms: u64,
+    /// External process readiness window, including cold runtime/model
+    /// construction and any separately declared post-load startup probe.
+    /// This is not a per-command probe limit or a whole-pair time extension;
+    /// the launch validator must fit an explicit probe within this window.
     pub handshake_max_ms: u64,
     pub concurrent_games: u32,
     pub restart_processes_each_game: bool,

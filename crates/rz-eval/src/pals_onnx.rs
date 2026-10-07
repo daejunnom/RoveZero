@@ -26,6 +26,9 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
+use std::time::Instant;
 mod cuda_control;
 pub use cuda_control::{
     PalsControlTransfer, PalsControlTransferKind, PalsCudaControlPolicy, PalsCudaPlacementWitness,
@@ -35,6 +38,299 @@ pub use cuda_control::{
 const MAX_MANIFEST_BYTES: usize = 128 * 1024;
 const MAX_GRAPH_BYTES: usize = 256 * 1024 * 1024;
 const MAX_MODEL_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_STARTUP_STAGE_EVENTS: usize = 64;
+const MAX_STARTUP_STAGE_REQUESTS: u8 = 2;
+
+/// Diagnostic stages only: a returned event is not an independent physical
+/// fence, native-input count, readiness proof or permission to release owners.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PalsStartupBackendStage {
+    RoleEvaluation,
+    InputPreparation,
+    PublicCacheHit,
+    PublicRun,
+    PublicOutputPreparation,
+    PrivateRun,
+    PrivateOutputValidation,
+    FirstRuntimeOriginAudit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PalsStartupStageBoundary {
+    Entered,
+    ReturnedOk,
+    ReturnedError,
+    Observed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct PalsStartupStageEvent {
+    /// Ordinal of the actual admitted startup Evaluate, not a NN input count.
+    pub request_ordinal: u8,
+    pub role: PalsRole,
+    pub stage: PalsStartupBackendStage,
+    pub boundary: PalsStartupStageBoundary,
+    pub elapsed_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PalsStartupSnapshotStatus {
+    Available,
+    Contended,
+    Poisoned,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PalsStartupStageSnapshot {
+    pub schema: &'static str,
+    /// Exactly the Instant supplied by the caller to start(), also suitable for
+    /// the UCI command timeline. No wall-clock or inferred loading timestamp.
+    pub clock_scope: &'static str,
+    pub snapshot_status: PalsStartupSnapshotStatus,
+    /// None means the diagnostic lock prevented observing the ledger origin.
+    pub capture_started: Option<bool>,
+    pub capture_closed: bool,
+    pub snapshot_elapsed_ns: Option<u64>,
+    pub captured_requests: u8,
+    pub max_requests: u8,
+    pub max_events: usize,
+    pub overflow: bool,
+    pub recording_contended: bool,
+    pub recording_poisoned: bool,
+    pub events: Vec<PalsStartupStageEvent>,
+}
+
+struct StartupStageLedger {
+    origin: Option<Instant>,
+    events: [Option<PalsStartupStageEvent>; MAX_STARTUP_STAGE_EVENTS],
+    len: usize,
+}
+
+struct StartupStageShared {
+    start_attempted: AtomicBool,
+    active: AtomicBool,
+    requests: AtomicU8,
+    overflow: AtomicBool,
+    recording_contended: AtomicBool,
+    recording_poisoned: AtomicBool,
+    ledger: Mutex<StartupStageLedger>,
+}
+
+/// An opt-in metadata-only handle, retained outside the physical worker. It
+/// owns no session, tensor, file descriptor or physical lease. Both recording
+/// and snapshots use try_lock, so missing diagnostic evidence cannot change a
+/// native result or turn a still-live invocation into physical completion.
+#[derive(Clone)]
+pub struct PalsStartupStageProbe {
+    shared: Arc<StartupStageShared>,
+}
+
+impl PalsStartupStageProbe {
+    fn new() -> Self {
+        Self {
+            shared: Arc::new(StartupStageShared {
+                start_attempted: AtomicBool::new(false),
+                active: AtomicBool::new(false),
+                requests: AtomicU8::new(0),
+                overflow: AtomicBool::new(false),
+                recording_contended: AtomicBool::new(false),
+                recording_poisoned: AtomicBool::new(false),
+                ledger: Mutex::new(StartupStageLedger {
+                    origin: None,
+                    events: [None; MAX_STARTUP_STAGE_EVENTS],
+                    len: 0,
+                }),
+            }),
+        }
+    }
+
+    /// Arm once immediately before the first startup Evaluate, using the same
+    /// monotonic origin as the caller's command observations. Never a retry.
+    pub fn start(&self, origin: Instant) -> bool {
+        if self
+            .shared
+            .start_attempted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        match self.shared.ledger.try_lock() {
+            Ok(mut ledger) => {
+                ledger.origin = Some(origin);
+                self.shared.active.store(true, Ordering::Release);
+                true
+            }
+            Err(TryLockError::WouldBlock) => {
+                self.shared
+                    .recording_contended
+                    .store(true, Ordering::Release);
+                false
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                self.shared
+                    .recording_poisoned
+                    .store(true, Ordering::Release);
+                false
+            }
+        }
+    }
+
+    fn closed(&self) -> bool {
+        self.shared.start_attempted.load(Ordering::Acquire)
+            && !self.shared.active.load(Ordering::Acquire)
+    }
+
+    fn begin_role(&self, role: PalsRole) -> Option<StartupRoleTrace> {
+        if !self.shared.active.load(Ordering::Acquire) {
+            return None;
+        }
+        let ordinal = self.shared.requests.fetch_add(1, Ordering::AcqRel) + 1;
+        if ordinal > MAX_STARTUP_STAGE_REQUESTS {
+            self.shared.active.store(false, Ordering::Release);
+            return None;
+        }
+        let trace = StartupRoleTrace {
+            probe: self.clone(),
+            ordinal,
+            role,
+        };
+        trace.record(
+            PalsStartupBackendStage::RoleEvaluation,
+            PalsStartupStageBoundary::Entered,
+        );
+        Some(trace)
+    }
+
+    /// Freeze a partial or successful startup observation without waiting for
+    /// the worker. The stop flag does not cancel native work or release pins.
+    pub fn snapshot_and_stop(&self) -> PalsStartupStageSnapshot {
+        // Closing a dormant diagnostic is final too; it must not arm a later
+        // capture after the caller has already published its frozen view.
+        self.shared.start_attempted.store(true, Ordering::Release);
+        self.shared.active.store(false, Ordering::Release);
+        let mut snapshot = PalsStartupStageSnapshot {
+            schema: "rovezero.pals-startup-backend-stages.v1",
+            clock_scope: "caller_supplied_monotonic_startup_origin",
+            snapshot_status: PalsStartupSnapshotStatus::Available,
+            capture_started: None,
+            capture_closed: true,
+            snapshot_elapsed_ns: None,
+            captured_requests: self
+                .shared
+                .requests
+                .load(Ordering::Acquire)
+                .min(MAX_STARTUP_STAGE_REQUESTS),
+            max_requests: MAX_STARTUP_STAGE_REQUESTS,
+            max_events: MAX_STARTUP_STAGE_EVENTS,
+            overflow: self.shared.overflow.load(Ordering::Acquire),
+            recording_contended: self.shared.recording_contended.load(Ordering::Acquire),
+            recording_poisoned: self.shared.recording_poisoned.load(Ordering::Acquire),
+            events: Vec::new(),
+        };
+        // Copy the fixed metadata array while locked; allocate the serialized
+        // view only after releasing it. No IO or native observation here.
+        let copied = match self.shared.ledger.try_lock() {
+            Ok(ledger) => Some((ledger.origin, ledger.events, ledger.len)),
+            Err(TryLockError::WouldBlock) => {
+                snapshot.snapshot_status = PalsStartupSnapshotStatus::Contended;
+                None
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                snapshot.snapshot_status = PalsStartupSnapshotStatus::Poisoned;
+                None
+            }
+        };
+        if let Some((origin, events, len)) = copied {
+            snapshot.capture_started = Some(origin.is_some());
+            snapshot.snapshot_elapsed_ns = origin.and_then(elapsed_ns);
+            snapshot.events = events.into_iter().take(len).flatten().collect();
+        }
+        snapshot
+    }
+}
+
+struct StartupRoleTrace {
+    probe: PalsStartupStageProbe,
+    ordinal: u8,
+    role: PalsRole,
+}
+
+impl StartupRoleTrace {
+    fn record(&self, stage: PalsStartupBackendStage, boundary: PalsStartupStageBoundary) {
+        if !self.probe.shared.active.load(Ordering::Acquire) {
+            return;
+        }
+        match self.probe.shared.ledger.try_lock() {
+            Ok(mut ledger) => {
+                if !self.probe.shared.active.load(Ordering::Acquire) {
+                    return;
+                }
+                if ledger.len == MAX_STARTUP_STAGE_EVENTS {
+                    self.probe.shared.overflow.store(true, Ordering::Release);
+                    return;
+                }
+                let Some(elapsed_ns) = ledger.origin.and_then(elapsed_ns) else {
+                    return;
+                };
+                let index = ledger.len;
+                ledger.events[index] = Some(PalsStartupStageEvent {
+                    request_ordinal: self.ordinal,
+                    role: self.role,
+                    stage,
+                    boundary,
+                    elapsed_ns,
+                });
+                ledger.len += 1;
+            }
+            Err(TryLockError::WouldBlock) => self
+                .probe
+                .shared
+                .recording_contended
+                .store(true, Ordering::Release),
+            Err(TryLockError::Poisoned(_)) => self
+                .probe
+                .shared
+                .recording_poisoned
+                .store(true, Ordering::Release),
+        }
+    }
+    fn returned(&self, stage: PalsStartupBackendStage, success: bool) {
+        self.record(
+            stage,
+            if success {
+                PalsStartupStageBoundary::ReturnedOk
+            } else {
+                PalsStartupStageBoundary::ReturnedError
+            },
+        );
+    }
+    fn finish(&self, success: bool) {
+        self.returned(PalsStartupBackendStage::RoleEvaluation, success);
+        if self.ordinal == MAX_STARTUP_STAGE_REQUESTS {
+            self.probe.shared.active.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn elapsed_ns(origin: Instant) -> Option<u64> {
+    u64::try_from(Instant::now().saturating_duration_since(origin).as_nanos()).ok()
+}
+
+fn startup_enter(trace: Option<&StartupRoleTrace>, stage: PalsStartupBackendStage) {
+    if let Some(trace) = trace {
+        trace.record(stage, PalsStartupStageBoundary::Entered);
+    }
+}
+
+fn startup_return(trace: Option<&StartupRoleTrace>, stage: PalsStartupBackendStage, success: bool) {
+    if let Some(trace) = trace {
+        trace.returned(stage, success);
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct PalsOnnxConfig {
@@ -1207,6 +1503,7 @@ pub struct PalsOnnxBackend {
     #[cfg(feature = "experimental-io-binding")]
     device_role: Option<device::DeviceRole>,
     quarantine: Option<BackendError>,
+    startup_stage_probe: Option<PalsStartupStageProbe>,
     pub public_encodes: u64,
     pub public_cache_hits: u64,
 }
@@ -1445,6 +1742,7 @@ impl PalsOnnxBackend {
             game_generation: 0,
             active: None,
             quarantine: None,
+            startup_stage_probe: None,
             public_encodes: 0,
             public_cache_hits: 0,
             #[cfg(feature = "experimental-io-binding")]
@@ -1786,6 +2084,15 @@ impl PalsOnnxBackend {
             }
         })
     }
+    /// Explicit startup diagnostics only. Obtain the handle before moving this
+    /// backend into the physical worker; the caller arms it with its startup
+    /// clock and freezes it on startup success/failure. Default runs allocate
+    /// no ledger and ordinary game invocations never capture stage events.
+    pub fn enable_startup_stage_probe(&mut self) -> PalsStartupStageProbe {
+        self.startup_stage_probe
+            .get_or_insert_with(PalsStartupStageProbe::new)
+            .clone()
+    }
     pub fn controlled_worker(
         mut self,
     ) -> Result<SingleWorker<PalsNativeCommand, Result<PalsNativeResult, BackendError>>, BackendError>
@@ -1818,6 +2125,31 @@ impl PalsOnnxBackend {
         })
     }
     pub fn run(&mut self, input: &PalsModelInput) -> Result<PalsRawOutput, BackendError> {
+        if self
+            .startup_stage_probe
+            .as_ref()
+            .is_some_and(PalsStartupStageProbe::closed)
+        {
+            self.startup_stage_probe = None;
+        }
+        let trace = self
+            .startup_stage_probe
+            .as_ref()
+            .and_then(|probe| probe.begin_role(input.role));
+        let result = self.run_inner(input, trace.as_ref());
+        if let Some(trace) = trace {
+            trace.finish(result.is_ok());
+            if trace.probe.closed() {
+                self.startup_stage_probe = None;
+            }
+        }
+        result
+    }
+    fn run_inner(
+        &mut self,
+        input: &PalsModelInput,
+        trace: Option<&StartupRoleTrace>,
+    ) -> Result<PalsRawOutput, BackendError> {
         if let Some(cause) = &self.quarantine {
             return Err(cause.clone());
         }
@@ -1844,21 +2176,30 @@ impl PalsOnnxBackend {
                 "validator inference is absent from P/C product export",
             ));
         }
+        startup_enter(trace, PalsStartupBackendStage::InputPreparation);
         let prepared = input
             .prepare_tensors(&self.model_config)
-            .map_err(model_input)?;
+            .map_err(model_input)
+            .inspect_err(|_| {
+                startup_return(trace, PalsStartupBackendStage::InputPreparation, false);
+            })?;
         let key = prepared.public_memory_key;
-        self.active = Some(ActiveInputs::new(prepared, input.role == PalsRole::Critic)?);
+        self.active = Some(
+            ActiveInputs::new(prepared, input.role == PalsRole::Critic).inspect_err(|_| {
+                startup_return(trace, PalsStartupBackendStage::InputPreparation, false);
+            })?,
+        );
+        startup_return(trace, PalsStartupBackendStage::InputPreparation, true);
         self.stats.admitted_role_requests = self.stats.admitted_role_requests.saturating_add(1);
         let result = {
             #[cfg(feature = "experimental-io-binding")]
             if self.config.device_public_memory {
-                self.run_device(input, key)
+                self.run_device(input, key, trace)
             } else {
-                self.run_active(input, key)
+                self.run_active(input, key, trace)
             }
             #[cfg(not(feature = "experimental-io-binding"))]
-            self.run_active(input, key)
+            self.run_active(input, key, trace)
         };
         if self.quarantine.is_none() {
             self.active = None;
@@ -1888,7 +2229,14 @@ impl PalsOnnxBackend {
             self.cuda_mapping_audit
                 .borrow_mut()
                 .after_run(result.is_ok(), || {
-                    self.runtime.verify_cuda_runtime_mappings()
+                    startup_enter(trace, PalsStartupBackendStage::FirstRuntimeOriginAudit);
+                    let verified = self.runtime.verify_cuda_runtime_mappings();
+                    startup_return(
+                        trace,
+                        PalsStartupBackendStage::FirstRuntimeOriginAudit,
+                        verified.is_ok(),
+                    );
+                    verified
                 })?;
         }
         if result.is_ok() {
@@ -1904,6 +2252,7 @@ impl PalsOnnxBackend {
         &mut self,
         input: &PalsModelInput,
         key: [u8; 32],
+        trace: Option<&StartupRoleTrace>,
     ) -> Result<PalsRawOutput, BackendError> {
         let device_id = match self.config.provider {
             Provider::Cuda { device_id, .. } => device_id,
@@ -1912,6 +2261,12 @@ impl PalsOnnxBackend {
         let cached = self.config.cache_public_memory
             && self.device_memory.as_ref().is_some_and(|m| m.key == key);
         if cached {
+            if let Some(trace) = trace {
+                trace.record(
+                    PalsStartupBackendStage::PublicCacheHit,
+                    PalsStartupStageBoundary::Observed,
+                );
+            }
             self.public_cache_hits = self.public_cache_hits.saturating_add(1);
             self.stats.public_cache_hits = self.stats.public_cache_hits.saturating_add(1);
         } else {
@@ -1937,6 +2292,7 @@ impl PalsOnnxBackend {
                     )
                 })?,
             );
+            startup_enter(trace, PalsStartupBackendStage::PublicRun);
             let result = self
                 .device_memory
                 .as_mut()
@@ -1946,6 +2302,7 @@ impl PalsOnnxBackend {
                     self.active.as_ref().expect("physical inputs pinned"),
                     &mut self.stats,
                 );
+            startup_return(trace, PalsStartupBackendStage::PublicRun, result.is_ok());
             if let Err(error) = result {
                 let failure = native(
                     CauseCode::OrtRun,
@@ -1955,6 +2312,7 @@ impl PalsOnnxBackend {
                 self.quarantine = Some(failure.clone());
                 return Err(failure);
             }
+            startup_enter(trace, PalsStartupBackendStage::PublicOutputPreparation);
             if let Err(error) = self
                 .device_memory
                 .as_ref()
@@ -1967,6 +2325,11 @@ impl PalsOnnxBackend {
                 return Err(error);
             }
             self.public_encodes = self.public_encodes.saturating_add(1);
+            startup_return(
+                trace,
+                PalsStartupBackendStage::PublicOutputPreparation,
+                true,
+            );
         }
         let critic = input.role == PalsRole::Critic;
         let shared = self.layout == Layout::SharedPcIf;
@@ -2000,6 +2363,7 @@ impl PalsOnnxBackend {
         } else {
             self.proposer.as_mut().expect("proposer session")
         };
+        startup_enter(trace, PalsStartupBackendStage::PrivateRun);
         let result = self
             .device_role
             .as_mut()
@@ -2010,6 +2374,7 @@ impl PalsOnnxBackend {
                 self.device_memory.as_ref().expect("public memory pinned"),
                 &mut self.stats,
             );
+        startup_return(trace, PalsStartupBackendStage::PrivateRun, result.is_ok());
         if let Err(error) = result {
             let failure = native(
                 CauseCode::OrtRun,
@@ -2019,6 +2384,7 @@ impl PalsOnnxBackend {
             self.quarantine = Some(failure.clone());
             return Err(failure);
         }
+        startup_enter(trace, PalsStartupBackendStage::PrivateOutputValidation);
         let output = self
             .device_role
             .as_ref()
@@ -2031,12 +2397,18 @@ impl PalsOnnxBackend {
         // No private role latent is fed into another invocation. After the
         // physical fence the private binding's aliases can be released.
         self.device_role = None;
+        startup_return(
+            trace,
+            PalsStartupBackendStage::PrivateOutputValidation,
+            true,
+        );
         Ok(output)
     }
     fn run_active(
         &mut self,
         input: &PalsModelInput,
         key: [u8; 32],
+        trace: Option<&StartupRoleTrace>,
     ) -> Result<PalsRawOutput, BackendError> {
         let page_key = self.public_page_key(key);
         self.active_memory = self
@@ -2051,6 +2423,12 @@ impl PalsOnnxBackend {
             .flatten();
         let cached = self.active_memory.is_some();
         if cached {
+            if let Some(trace) = trace {
+                trace.record(
+                    PalsStartupBackendStage::PublicCacheHit,
+                    PalsStartupStageBoundary::Observed,
+                );
+            }
             self.public_cache_hits = self.public_cache_hits.saturating_add(1);
             self.stats.public_cache_hits = self.stats.public_cache_hits.saturating_add(1);
         } else {
@@ -2058,7 +2436,9 @@ impl PalsOnnxBackend {
             let active = self.active.as_ref().expect("owned input installed");
             self.stats.public_nn_runs_attempted =
                 self.stats.public_nn_runs_attempted.saturating_add(1);
+            startup_enter(trace, PalsStartupBackendStage::PublicRun);
             let result = self.public.as_mut().expect("loaded public session").run(ort::inputs!["board" => &active.board, "metadata" => &active.metadata, "records" => &active.records, "record_mask" => &active.record_mask]);
+            startup_return(trace, PalsStartupBackendStage::PublicRun, result.is_ok());
             let outputs = match result {
                 Ok(outputs) => outputs,
                 Err(error) => {
@@ -2079,6 +2459,7 @@ impl PalsOnnxBackend {
             self.stats.public_nn_runs_completed =
                 self.stats.public_nn_runs_completed.saturating_add(1);
             self.stats.completed_nn_inputs = self.stats.completed_nn_inputs.saturating_add(1);
+            startup_enter(trace, PalsStartupBackendStage::PublicOutputPreparation);
             let tokens = self
                 .model_config
                 .public_memory_tokens(input.records.len())
@@ -2171,6 +2552,11 @@ impl PalsOnnxBackend {
             self.public_encodes = self.public_encodes.saturating_add(1);
             self.stats.validated_public_outputs =
                 self.stats.validated_public_outputs.saturating_add(1);
+            startup_return(
+                trace,
+                PalsStartupBackendStage::PublicOutputPreparation,
+                true,
+            );
         }
         let active = self.active.as_ref().expect("owned inputs remain installed");
         let memory = self
@@ -2186,6 +2572,7 @@ impl PalsOnnxBackend {
         let critic = input.role == PalsRole::Critic;
         let shared = self.layout == Layout::SharedPcIf;
         self.stats.role_nn_runs_attempted = self.stats.role_nn_runs_attempted.saturating_add(1);
+        startup_enter(trace, PalsStartupBackendStage::PrivateRun);
         let result = if shared {
             self.shared_pc.as_mut().expect("loaded shared P/C session").run(ort::inputs!["role_is_critic" => &active.role_is_critic, "memory_key" => &memory.memory_key, "memory_value" => &memory.memory_value, "memory_mask" => &memory.mask, "candidates" => &active.candidates, "candidate_mask" => &active.candidate_mask, "query" => &active.query, "divergence_features" => &active.divergences, "divergence_mask" => &active.divergence_mask])
         } else if critic {
@@ -2193,6 +2580,7 @@ impl PalsOnnxBackend {
         } else {
             self.proposer.as_mut().expect("loaded proposer session").run(ort::inputs!["memory_key" => &memory.memory_key, "memory_value" => &memory.memory_value, "memory_mask" => &memory.mask, "candidates" => &active.candidates, "candidate_mask" => &active.candidate_mask, "query" => &active.query])
         };
+        startup_return(trace, PalsStartupBackendStage::PrivateRun, result.is_ok());
         let outputs = match result {
             Ok(outputs) => outputs,
             Err(error) => {
@@ -2212,6 +2600,7 @@ impl PalsOnnxBackend {
         };
         self.stats.role_nn_runs_completed = self.stats.role_nn_runs_completed.saturating_add(1);
         self.stats.completed_nn_inputs = self.stats.completed_nn_inputs.saturating_add(1);
+        startup_enter(trace, PalsStartupBackendStage::PrivateOutputValidation);
         let extract = |name: &str, expected: &[i64]| -> Result<Vec<f32>, BackendError> {
             let (shape, values) = outputs[name].try_extract_tensor::<f32>().map_err(|e| {
                 native(
@@ -2284,6 +2673,11 @@ impl PalsOnnxBackend {
             .decode(input, &self.model_config)
             .map_err(model_input)?;
         self.stats.validated_role_outputs = self.stats.validated_role_outputs.saturating_add(1);
+        startup_return(
+            trace,
+            PalsStartupBackendStage::PrivateOutputValidation,
+            true,
+        );
         Ok(output)
     }
 }
@@ -2627,6 +3021,172 @@ mod device {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_stage_probe_preserves_partial_stage_and_shared_clock_without_retry() {
+        let dormant = PalsStartupStageProbe::new();
+        let closed = dormant.snapshot_and_stop();
+        assert_eq!(closed.capture_started, Some(false));
+        assert!(closed.capture_closed);
+        assert!(closed.events.is_empty());
+        assert!(!dormant.start(Instant::now()));
+        assert!(dormant.begin_role(PalsRole::Proposer).is_none());
+
+        let probe = PalsStartupStageProbe::new();
+        assert!(probe.begin_role(PalsRole::Proposer).is_none());
+        let origin = Instant::now();
+        assert!(probe.start(origin));
+        let trace = probe.begin_role(PalsRole::Proposer).unwrap();
+        startup_enter(Some(&trace), PalsStartupBackendStage::PublicRun);
+        let observed = probe.snapshot_and_stop();
+        assert_eq!(
+            observed.snapshot_status,
+            PalsStartupSnapshotStatus::Available
+        );
+        assert_eq!(observed.capture_started, Some(true));
+        assert!(observed.capture_closed);
+        assert_eq!(observed.captured_requests, 1);
+        assert_eq!(observed.events.len(), 2);
+        assert_eq!(observed.events[1].stage, PalsStartupBackendStage::PublicRun);
+        assert_eq!(
+            observed.events[1].boundary,
+            PalsStartupStageBoundary::Entered
+        );
+        assert_eq!(observed.events[1].role, PalsRole::Proposer);
+        assert_eq!(observed.events[1].request_ordinal, 1);
+        assert!(observed
+            .events
+            .windows(2)
+            .all(|pair| pair[0].elapsed_ns <= pair[1].elapsed_ns));
+        assert!(observed
+            .events
+            .iter()
+            .all(|event| event.elapsed_ns <= observed.snapshot_elapsed_ns.unwrap()));
+        // A late native return cannot mutate the already frozen startup view,
+        // arm a new capture, or be mistaken for an observed physical fence.
+        startup_return(Some(&trace), PalsStartupBackendStage::PublicRun, true);
+        trace.finish(true);
+        assert_eq!(probe.snapshot_and_stop().events, observed.events);
+        assert!(!probe.start(Instant::now()));
+        assert!(probe.begin_role(PalsRole::Critic).is_none());
+    }
+
+    #[test]
+    fn startup_stage_probe_bounds_storage_and_detaches_after_two_actual_roles() {
+        let probe = PalsStartupStageProbe::new();
+        assert!(probe.start(Instant::now()));
+        let proposer = probe.begin_role(PalsRole::Proposer).unwrap();
+        proposer.finish(true);
+        let critic = probe.begin_role(PalsRole::Critic).unwrap();
+        critic.finish(true);
+        assert!(probe.closed());
+        assert!(probe.begin_role(PalsRole::Validator).is_none());
+        let captured = probe.snapshot_and_stop();
+        assert_eq!(captured.captured_requests, 2);
+        assert_eq!(captured.events.len(), 4);
+        assert_eq!(captured.events[2].role, PalsRole::Critic);
+        assert_eq!(captured.events[2].request_ordinal, 2);
+        assert!(!captured.overflow);
+
+        let probe = PalsStartupStageProbe::new();
+        assert!(probe.start(Instant::now()));
+        let trace = probe.begin_role(PalsRole::Proposer).unwrap();
+        for _ in 0..MAX_STARTUP_STAGE_EVENTS + 10 {
+            trace.record(
+                PalsStartupBackendStage::PublicCacheHit,
+                PalsStartupStageBoundary::Observed,
+            );
+        }
+        let captured = probe.snapshot_and_stop();
+        assert_eq!(captured.events.len(), MAX_STARTUP_STAGE_EVENTS);
+        assert!(captured.overflow);
+        assert_eq!(
+            captured.events[0].stage,
+            PalsStartupBackendStage::RoleEvaluation
+        );
+        assert_eq!(
+            captured.events[0].boundary,
+            PalsStartupStageBoundary::Entered
+        );
+    }
+
+    #[test]
+    fn startup_stage_probe_contention_does_not_block_physical_worker_completion() {
+        use crate::worker::PhysicalPoll;
+        use std::time::Duration;
+
+        let probe = PalsStartupStageProbe::new();
+        assert!(probe.start(Instant::now()));
+        let held = probe.shared.ledger.lock().unwrap();
+        let worker_probe = probe.clone();
+        let mut worker = SingleWorker::spawn(move |input: &u8| {
+            let trace = worker_probe.begin_role(PalsRole::Proposer).unwrap();
+            startup_enter(Some(&trace), PalsStartupBackendStage::PublicRun);
+            trace.finish(true);
+            *input
+        })
+        .unwrap();
+        let mut lease = worker.submit(42).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            match lease.poll() {
+                PhysicalPoll::Ready(value) => {
+                    assert_eq!(value, 42);
+                    break;
+                }
+                PhysicalPoll::Pending if Instant::now() < until => std::thread::yield_now(),
+                _ => panic!("diagnostic contention changed the completed mock physical result"),
+            }
+        }
+        let missing = probe.snapshot_and_stop();
+        assert_eq!(
+            missing.snapshot_status,
+            PalsStartupSnapshotStatus::Contended
+        );
+        assert_eq!(missing.capture_started, None);
+        assert!(missing.recording_contended);
+        assert!(missing.events.is_empty());
+        drop(held);
+        loop {
+            match worker.try_shutdown() {
+                std::task::Poll::Ready(result) => {
+                    result.unwrap();
+                    break;
+                }
+                std::task::Poll::Pending if Instant::now() < until => std::thread::yield_now(),
+                _ => panic!("completed mock worker did not join within the finite fixture window"),
+            }
+        }
+        let observed = probe.snapshot_and_stop();
+        assert_eq!(
+            observed.snapshot_status,
+            PalsStartupSnapshotStatus::Available
+        );
+        assert!(observed.events.is_empty());
+        assert!(observed.recording_contended);
+    }
+
+    #[test]
+    fn startup_stage_probe_poison_is_explicit_and_does_not_rearm() {
+        let probe = PalsStartupStageProbe::new();
+        let other = probe.clone();
+        assert!(std::thread::spawn(move || {
+            let _held = other.shared.ledger.lock().unwrap();
+            panic!("poison metadata-only startup diagnostic fixture");
+        })
+        .join()
+        .is_err());
+        assert!(!probe.start(Instant::now()));
+        assert!(probe.begin_role(PalsRole::Proposer).is_none());
+        let snapshot = probe.snapshot_and_stop();
+        assert_eq!(
+            snapshot.snapshot_status,
+            PalsStartupSnapshotStatus::Poisoned
+        );
+        assert!(snapshot.recording_poisoned);
+        assert!(snapshot.events.is_empty());
+        assert!(!probe.start(Instant::now()));
+    }
 
     #[test]
     fn shim_product_admission_requires_explicit_host_cuda_control() {

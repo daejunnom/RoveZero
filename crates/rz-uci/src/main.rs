@@ -221,6 +221,16 @@ fn run_pals(
             {
                 return Err("duplicate PALS CUDA profile parent".into());
             }
+        } else if let Some(value) = argument.strip_prefix("--pals-startup-probe-timeout-ms=") {
+            let value = value
+                .parse::<u64>()
+                .map_err(|_| "invalid PALS startup probe timeout")?;
+            if !(1..=180_000).contains(&value) {
+                return Err("PALS startup probe timeout must be 1..180000 milliseconds".into());
+            }
+            if native.startup_probe_timeout_ms.replace(value).is_some() {
+                return Err("duplicate PALS startup probe timeout".into());
+            }
         } else if let Some(value) = argument.strip_prefix("--pals-cuda-loading-profile=") {
             if native
                 .cuda_loading_profile
@@ -314,6 +324,7 @@ struct PalsNativeOptions {
     cuda_profile_parent: Option<String>,
     cuda_loading_profile: Option<String>,
     cuda_loading_profile_hash: Option<String>,
+    startup_probe_timeout_ms: Option<u64>,
 }
 impl PalsNativeOptions {
     fn any(&self) -> bool {
@@ -338,6 +349,7 @@ impl PalsNativeOptions {
             || self.cuda_profile_parent.is_some()
             || self.cuda_loading_profile.is_some()
             || self.cuda_loading_profile_hash.is_some()
+            || self.startup_probe_timeout_ms.is_some()
     }
 }
 
@@ -392,7 +404,8 @@ fn run_native_pals(
             || native.cuda_profile_root.is_some()
             || native.cuda_profile_parent.is_some()
             || native.cuda_loading_profile.is_some()
-            || native.cuda_loading_profile_hash.is_some())
+            || native.cuda_loading_profile_hash.is_some()
+            || native.startup_probe_timeout_ms.is_some())
     {
         return Err("PALS CPU selection cannot accept CUDA bundle/device/allocator options".into());
     }
@@ -523,6 +536,9 @@ fn run_native_pals(
     };
     let mut settings = EngineSettings::default();
     settings.search.max_simulations = cpu_nodes;
+    // Observe actual runtime/model factory cost independently of the probe
+    // deadline. Earlier pin/cache preparation belongs to overall CLI cost.
+    let model_loading_started = std::time::Instant::now();
     let mut model = match cuda_control {
         Some((policy, profile)) => match loading_profile {
             Some(loading) => {
@@ -556,10 +572,14 @@ fn run_native_pals(
             settings.shutdown_limit,
         )?,
     };
+    let model_loading_elapsed = model_loading_started.elapsed();
     let finish = model.finish_handle();
-    if let Err(primary) =
-        model.prepare_startup(std::time::Instant::now() + std::time::Duration::from_secs(15))
-    {
+    let startup = (|| {
+        let budget = model.configure_startup_probe_timeout(native.startup_probe_timeout_ms)?;
+        model.observe_startup_loading(model_loading_elapsed)?;
+        model.prepare_startup(std::time::Instant::now() + budget)
+    })();
+    if let Err(primary) = startup {
         let mut publication = None;
         let mut failure_writer = match receipt_config.as_ref() {
             Some((root, launch, endpoint)) => {
@@ -569,7 +589,8 @@ fn run_native_pals(
                     launch,
                     &runtime_hash,
                 ) {
-                    Ok(mut writer) => match writer.startup(finish.receipt(), None) {
+                    Ok(mut writer) => match writer.failed_startup(finish.receipt(), &primary, None)
+                    {
                         Ok(()) => Some(writer),
                         Err(error) => {
                             publication = Some(error);

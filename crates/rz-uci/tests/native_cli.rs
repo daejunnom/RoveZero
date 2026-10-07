@@ -258,11 +258,69 @@ fn pals_loading_profile_duplicates_and_mock_mixing_are_rejected_before_protocol(
 }
 
 #[test]
+fn pals_startup_probe_timeout_rejects_invalid_duplicate_and_mock_use_before_loading() {
+    for (arguments, expected) in [
+        (
+            vec![
+                "--search=pals",
+                "--pals-model=onnx",
+                "--pals-startup-probe-timeout-ms=0",
+            ],
+            "PALS startup probe timeout must be 1..180000",
+        ),
+        (
+            vec![
+                "--search=pals",
+                "--pals-model=onnx",
+                "--pals-startup-probe-timeout-ms=180001",
+            ],
+            "PALS startup probe timeout must be 1..180000",
+        ),
+        (
+            vec![
+                "--search=pals",
+                "--pals-model=onnx",
+                "--pals-startup-probe-timeout-ms=private-timeout-marker",
+            ],
+            "invalid PALS startup probe timeout",
+        ),
+        (
+            vec![
+                "--search=pals",
+                "--pals-model=onnx",
+                "--pals-startup-probe-timeout-ms=120000",
+                "--pals-startup-probe-timeout-ms=120000",
+            ],
+            "duplicate PALS startup probe timeout",
+        ),
+        (
+            vec![
+                "--search=pals",
+                "--pals-model=legal-order-mock",
+                "--pals-startup-probe-timeout-ms=120000",
+            ],
+            "PALS mock selection cannot accept neural assets",
+        ),
+    ] {
+        let (status, protocol, diagnostic) = rejected(&arguments);
+        assert_eq!(status.code(), Some(2));
+        assert!(
+            protocol.is_empty(),
+            "rejected probe budget started a model or UCI"
+        );
+        assert!(diagnostic.contains(expected), "{diagnostic}");
+        assert!(!diagnostic.contains("private-timeout-marker"));
+        assert!(diagnostic.len() <= 512);
+    }
+}
+
+#[test]
 #[cfg(feature = "onnx-cpu")]
 fn pals_cpu_rejects_cuda_loading_profile_before_any_asset_or_runtime_lookup() {
     for profile_argument in [
         "--pals-cuda-loading-profile=private-profile-marker",
         "--pals-cuda-loading-profile-sha256=private-profile-marker",
+        "--pals-startup-probe-timeout-ms=120000",
     ] {
         let (status, protocol, diagnostic) = rejected(&[
             "--search=pals",

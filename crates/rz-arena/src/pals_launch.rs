@@ -43,6 +43,7 @@ pub const PALS_CLOCK_REAP_RUNNER_SHA256: &str =
 pub const PALS_CLOCK_REAP_RUNNER_BYTES: u64 = 2466608;
 const MAX_JSON_BYTES: usize = 256 * 1024;
 const MAX_CONTROL_INVENTORY_BYTES: u64 = 1024 * 1024;
+const MAX_STARTUP_PROBE_TIMEOUT_MS: u64 = 180_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,6 +140,12 @@ pub struct PalsOnnxCudaLaunchV3 {
     pub session_arena_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cuda_control: Option<Box<PalsCudaControlBindingV3>>,
+    /// One logical probe deadline after cold model construction, shared by all
+    /// P/C and NN-zero startup commands. None preserves the existing 15s
+    /// default/argv/canonical. This is separate from the whole external
+    /// readiness window and never extends physical drain or the pair wall cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_probe_timeout_ms: Option<u64>,
 }
 /// Explicit reviewed metadata inventory; it does not declare GPU success.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -662,6 +669,13 @@ impl PalsArenaLaunchV3 {
                 assets.extend(n.graphs.iter().map(|g| g.artifact.clone()));
                 if let Some(cuda) = cuda {
                     cuda.cuda_bundle.validate()?;
+                    if let Some(probe_ms) = cuda.startup_probe_timeout_ms {
+                        require(
+                            (1..=MAX_STARTUP_PROBE_TIMEOUT_MS).contains(&probe_ms)
+                                && probe_ms <= m.pilot.handshake_max_ms,
+                            "explicit CUDA startup probe requires 1..180000ms within the cold-model readiness window",
+                        )?;
+                    }
                     require(
                         cuda.device_id == 0
                             && cuda.session_arena_bytes == 2 * 1024 * 1024 * 1024
@@ -727,6 +741,9 @@ impl PalsArenaLaunchV3 {
                                 ),
                             ]);
                         }
+                    }
+                    if let Some(probe_ms) = cuda.startup_probe_timeout_ms {
+                        args.push(format!("--pals-startup-probe-timeout-ms={probe_ms}"));
                     }
                 }
                 (
@@ -1201,6 +1218,7 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
         limitations.push("CPU TT byte admission covers the compiled inline slot layout; retained identity heaps, allocator overhead and total peak are separately bounded by the verified inherited memory cgroup".into());
         limitations.push("CPU_T profile is preserved as declared identity only; this pilot executes CPU_R and P/C, with V absent and training_executed=false".into());
         limitations.push("PALS reserves a fixed 2MiB pair receipt before input copying/spawn within the declared output budget; insufficient admission and oversized final metadata remain errors. Legacy V1/V2 keep their original 64KiB reservation".into());
+        limitations.push("PALS handshake_max_ms bounds external process readiness, including cold runtime/model construction, the selected logical CUDA startup probe and protocol. The optional probe budget starts only after model construction and is shared across all startup commands; a probe not exceeding readiness is only a necessary condition, not guaranteed cold-start slack. Identification/readiness and each game restart may repeat this startup work. Preflight elapsed time, including separately bounded cleanup, is still deducted from the registered total pair window; no physical drain, quarantine or wall-time cap is extended".into());
         limitations.push(format!("PALS runner status patch: {:?}; legacy clock-only records remain readable, while new execution/Core requires the separately registered clock+reap-status runner", self.input.runner_status_patch()));
         if self
             .input
@@ -1331,6 +1349,10 @@ pub struct PalsNativeSessionAuditV3 {
     pub startup_nn_inputs_completed: u64,
     pub startup_nn_calls_completed: u64,
     pub startup_role_inputs_completed: u64,
+    /// Exact selected explicit budget from the execution receipt. Missing
+    /// historical/default metadata remains absent, not measured elapsed time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_probe_timeout_ms: Option<u64>,
     pub startup_probe: Option<serde_json::Value>,
     pub execution: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1479,6 +1501,29 @@ fn validate_native_loading_evidence(
         startup: validate_native_loading_mapping(cuda, loading, startup_mapping)?,
         final_mapping: validate_native_loading_mapping(cuda, loading, final_mapping)?,
     }))
+}
+fn validate_native_startup_budget(
+    cuda: &PalsOnnxCudaLaunchV3,
+    execution: &serde_json::Value,
+) -> Result<Option<u64>, ArenaError> {
+    let actual = &execution["startup_probe_timeout_ms"];
+    match cuda.startup_probe_timeout_ms {
+        None => {
+            require(
+                actual.is_null(),
+                "default CUDA startup cannot claim an unregistered explicit probe budget",
+            )?;
+            Ok(None)
+        }
+        Some(timeout_ms) => {
+            require(
+                (1..=MAX_STARTUP_PROBE_TIMEOUT_MS).contains(&timeout_ms)
+                    && actual.as_u64() == Some(timeout_ms),
+                "actual selected CUDA startup probe budget differs from the launch declaration",
+            )?;
+            Ok(Some(timeout_ms))
+        }
+    }
 }
 fn validate_cuda_placement_witness(
     cuda: &PalsOnnxCudaLaunchV3,
@@ -1885,6 +1930,7 @@ pub fn validate_pals_native_records(
     let mut startup_nn = (0, 0, 0);
     let mut cuda_placement = None;
     let mut cuda_loading = None;
+    let mut startup_probe_timeout_ms = None;
     if let Some(cuda) = cuda {
         require(
             s["runtime_bundle_sha256"] == cuda.cuda_bundle.canonical_sha256,
@@ -1895,6 +1941,7 @@ pub fn validate_pals_native_records(
             "CUDA execution/probe identity changed",
         )?;
         let execution = &sn["execution"];
+        startup_probe_timeout_ms = validate_native_startup_budget(cuda, execution)?;
         match &cuda.cuda_control {
             Some(control) => require(
                 array_hash(&execution["cuda_control_inventory_sha256"])?
@@ -1977,6 +2024,7 @@ pub fn validate_pals_native_records(
                     && sn["execution"]["runtime_bundle_sha256"].is_null()
                     && sn["execution"]["cuda_control_inventory_sha256"].is_null()
                     && sn["execution"]["cuda_loading_profile"].is_null()
+                    && sn["execution"]["startup_probe_timeout_ms"].is_null()
                     && count(&sn["execution"], "transient_request_device_bytes")? == 0
                     && count(&sn["execution"], "transient_execution_device_bytes")? == 0
                     && count(&sn["execution"], "pinned_request_bytes")? == 0
@@ -2136,6 +2184,7 @@ pub fn validate_pals_native_records(
             startup_nn_inputs_completed: startup_nn.0,
             startup_nn_calls_completed: startup_nn.1,
             startup_role_inputs_completed: startup_nn.2,
+            startup_probe_timeout_ms,
             startup_probe: sn["startup_probe"]
                 .as_object()
                 .map(|_| sn["startup_probe"].clone()),
@@ -3497,6 +3546,7 @@ mod tests {
             device_id: 0,
             session_arena_bytes: 2 << 30,
             cuda_control: None,
+            startup_probe_timeout_ms: None,
         });
         f.budget.max_runtime_bytes = 4 << 30;
         f.budget.max_artifact_bytes = 8 << 30;
@@ -3962,6 +4012,144 @@ mod tests {
         };
         c.cuda_control.as_mut().unwrap().inventory.bytes = MAX_CONTROL_INVENTORY_BYTES + 1;
         assert!(oversized.lock().is_err());
+    }
+    #[test]
+    fn pals_explicit_startup_probe_budget_preserves_default_canonical_and_fits_cold_readiness() {
+        let (legacy, _) = cuda_fixture();
+        let old = legacy.lock().unwrap();
+        let old_json = serde_json::to_string(&legacy).unwrap();
+        assert!(!old_json.contains("startup_probe_timeout_ms"));
+        let mut explicit_none = json(old_json.as_bytes()).unwrap();
+        explicit_none["endpoints"][0]["configuration"]["startup_probe_timeout_ms"] =
+            serde_json::Value::Null;
+        assert_eq!(
+            PalsArenaLaunchV3::from_json(&explicit_none.to_string())
+                .unwrap()
+                .lock()
+                .unwrap()
+                .sha256(),
+            old.sha256()
+        );
+        let mut explicit = legacy.clone();
+        let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut explicit.endpoints[0] else {
+            unreachable!()
+        };
+        cuda.startup_probe_timeout_ms = Some(120_000);
+        // Declaring a 120s post-load probe does not silently enlarge the
+        // existing 30s cold-model/process readiness window.
+        assert!(explicit.lock().is_err());
+        explicit.semantic_lock.manifest.pilot.handshake_max_ms = 180_000;
+        explicit.semantic_lock = explicit.semantic_lock.manifest.lock().unwrap();
+        let new = explicit.lock().unwrap();
+        assert_ne!(old.sha256(), new.sha256());
+        assert_eq!(new.declared_inputs(), old.declared_inputs());
+        assert_eq!(new.view().timeouts.startup_ms, 180_000);
+        assert_eq!(new.view().timeouts.handshake_ms, 180_000);
+        assert_eq!(
+            new.view().timeouts.runtime_ms,
+            old.view().timeouts.runtime_ms
+        );
+        assert_eq!(new.view().timeouts.drain_ms, old.view().timeouts.drain_ms);
+        let old_view = old.engine_view(NativeEngineRole::Baseline).unwrap();
+        let new_view = new.engine_view(NativeEngineRole::Baseline).unwrap();
+        assert_eq!(old_view.cuda_bundle, new_view.cuda_bundle);
+        let old_engine = old_view.external.unwrap();
+        let new_engine = new_view.external.unwrap();
+        assert_eq!(old_engine.assets, new_engine.assets);
+        assert_eq!(old_engine.environment, new_engine.environment);
+        assert_eq!(
+            new_engine.arguments[..old_engine.arguments.len()],
+            old_engine.arguments
+        );
+        assert_eq!(
+            &new_engine.arguments[old_engine.arguments.len()..],
+            &["--pals-startup-probe-timeout-ms=120000".to_owned()]
+        );
+        for timeout in [0, MAX_STARTUP_PROBE_TIMEOUT_MS + 1, u64::MAX] {
+            let mut bad = explicit.clone();
+            let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut bad.endpoints[0] else {
+                unreachable!()
+            };
+            cuda.startup_probe_timeout_ms = Some(timeout);
+            assert!(bad.lock().is_err());
+        }
+        for timeout in [1, MAX_STARTUP_PROBE_TIMEOUT_MS] {
+            let mut valid = explicit.clone();
+            let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut valid.endpoints[0] else {
+                unreachable!()
+            };
+            cuda.startup_probe_timeout_ms = Some(timeout);
+            assert!(valid.lock().is_ok());
+        }
+        let mut cpu_json =
+            json(serde_json::to_string(&native_fixture()).unwrap().as_bytes()).unwrap();
+        cpu_json["endpoints"][0]["configuration"]["startup_probe_timeout_ms"] = 120_000.into();
+        assert!(PalsArenaLaunchV3::from_json(&cpu_json.to_string()).is_err());
+    }
+    #[test]
+    fn pals_startup_probe_budget_requires_actual_selected_value_without_reinterpreting_nn_work() {
+        let (mut declared, _) = cuda_fixture();
+        declared.semantic_lock.manifest.pilot.handshake_max_ms = 180_000;
+        declared.semantic_lock = declared.semantic_lock.manifest.lock().unwrap();
+        let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut declared.endpoints[0] else {
+            unreachable!()
+        };
+        cuda.startup_probe_timeout_ms = Some(120_000);
+        let lock = declared.lock().unwrap();
+        let (mut start, mut end) = cuda_records_fixture(&lock);
+        for record in [&mut start, &mut end] {
+            record["native"]["execution"]["startup_probe_timeout_ms"] = 120_000.into();
+        }
+        let validate = |s: &serde_json::Value, t: &serde_json::Value| {
+            validate_pals_native_records(
+                &lock,
+                NativeEngineRole::Baseline,
+                &serde_json::to_vec(s).unwrap(),
+                &serde_json::to_vec(t).unwrap(),
+                "native-process-100",
+            )
+        };
+        let (observed, _) = validate(&start, &end).unwrap();
+        assert_eq!(observed.startup_probe_timeout_ms, Some(120_000));
+        assert_eq!(
+            (
+                observed.startup_nn_inputs_completed,
+                observed.completed_role_inputs,
+                observed.search_consumed_role_inputs,
+            ),
+            (3, 3, 1)
+        );
+        for wrong in [
+            serde_json::Value::Null,
+            119_999.into(),
+            0.into(),
+            u64::MAX.into(),
+            "120000".into(),
+        ] {
+            let mut a = start.clone();
+            let mut b = end.clone();
+            for record in [&mut a, &mut b] {
+                record["native"]["execution"]["startup_probe_timeout_ms"] = wrong.clone();
+            }
+            assert!(validate(&a, &b).is_err());
+        }
+        let mut changed = end.clone();
+        changed["native"]["execution"]["startup_probe_timeout_ms"] = 120_001.into();
+        assert!(validate(&start, &changed).is_err());
+        let (legacy, _) = cuda_fixture();
+        let old = legacy.lock().unwrap();
+        let old_cuda = legacy.endpoints[0].cuda_model().unwrap();
+        assert!(validate_native_startup_budget(old_cuda, &start["native"]["execution"]).is_err());
+        let (old_start, old_end) = cuda_records_fixture(&old);
+        let (audit, _) = validate_pals_native_records(
+            &old,
+            NativeEngineRole::Baseline,
+            &serde_json::to_vec(&old_start).unwrap(),
+            &serde_json::to_vec(&old_end).unwrap(),
+            "native-process-100",
+        )
+        .unwrap();
+        assert_eq!(audit.startup_probe_timeout_ms, None);
     }
     #[test]
     fn pals_experimental_loading_binding_preserves_legacy_canonical_and_all_binary_pins() {
@@ -4729,6 +4917,7 @@ mod tests {
             startup_nn_inputs_completed: 0,
             startup_nn_calls_completed: 0,
             startup_role_inputs_completed: 0,
+            startup_probe_timeout_ms: None,
             startup_probe: None,
             execution: None,
             cuda_placement: None,

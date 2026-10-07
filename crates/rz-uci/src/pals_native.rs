@@ -493,7 +493,7 @@ mod native {
     use rz_eval::pals_onnx::{
         PalsBackendStats, PalsCudaControlPolicy, PalsCudaPlacementWitness, PalsGraphOptimization,
         PalsNativeCommand, PalsNativeMappingWitness, PalsNativeResult, PalsOnnxBackend,
-        PalsSessionResidency,
+        PalsSessionResidency, PalsStartupStageProbe, PalsStartupStageSnapshot,
     };
     use rz_eval::worker::{PhysicalLease, PhysicalPoll, SingleWorker};
     use rz_position::contracts::ContractPosition;
@@ -555,6 +555,10 @@ mod native {
         final_stats: Mutex<Option<NativeBackendStatsReceipt>>,
         stats_lease: Mutex<Option<NativePhysicalLease>>,
         execution: NativeExecutionReceipt,
+        // Zero preserves the legacy absent/default wire; explicit selection
+        // is copied into immutable receipt snapshots, never worker inputs.
+        startup_probe_timeout_ms: AtomicU64,
+        startup_stage_probe: Option<PalsStartupStageProbe>,
         startup_probe: Mutex<Option<NativeStartupProbeReceipt>>,
         startup_ready: AtomicBool,
         final_mapping_confirmed: AtomicBool,
@@ -639,12 +643,77 @@ mod native {
         /// recorded here. Missing preserves historic eager/CPU wire formats.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub cuda_loading_profile: Option<NativeCudaLoadingIdentity>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub startup_probe_timeout_ms: Option<u64>,
         pub transient_request_device_bytes: u64,
         pub transient_execution_device_bytes: u64,
         pub pinned_request_bytes: u64,
         pub device_public_memory: bool,
     }
     /// Initialization work is never converted into search role consumption.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum NativeStartupErrorKind {
+        Unavailable,
+        InvalidOutput,
+        Canceled,
+        Deadline,
+        PhysicalCompletionUnknown,
+        Backend,
+    }
+    impl From<&RoleError> for NativeStartupErrorKind {
+        fn from(error: &RoleError) -> Self {
+            match error {
+                RoleError::Unavailable => Self::Unavailable,
+                RoleError::InvalidOutput => Self::InvalidOutput,
+                RoleError::Canceled => Self::Canceled,
+                RoleError::Deadline => Self::Deadline,
+                RoleError::PhysicalCompletionUnknown => Self::PhysicalCompletionUnknown,
+                RoleError::Backend(_) => Self::Backend,
+            }
+        }
+    }
+    #[derive(Clone, Debug, serde::Serialize)]
+    pub struct NativeStartupCommandObservation {
+        pub command: &'static str,
+        pub admitted: bool,
+        pub entered_elapsed_ns: Option<u64>,
+        pub returned_elapsed_ns: Option<u64>,
+        /// None means not observed, including an admitted, still pending job.
+        pub physical_completion_confirmed: Option<bool>,
+        pub return_error: Option<NativeStartupErrorKind>,
+        pub fence_observation: Option<&'static str>,
+    }
+    /// A bounded failure-only timeline. Successful legacy wire stays unchanged.
+    /// Loading time is observed at the actual CLI factory, not inferred from
+    /// whole-process duration; library errors remain in last_failure separately.
+    #[derive(Clone, Debug, serde::Serialize)]
+    pub struct NativeStartupFailureDiagnostic {
+        pub schema: &'static str,
+        pub model_loading_elapsed_ns: Option<u64>,
+        pub probe_budget_ns: Option<u64>,
+        pub probe_elapsed_ns: Option<u64>,
+        pub drain_limit_ns: Option<u64>,
+        pub current_stage: &'static str,
+        pub primary_error: Option<NativeStartupErrorKind>,
+        pub logical_deadline_expired: bool,
+        pub commands: Vec<NativeStartupCommandObservation>,
+        pub command_observation_overflow: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub backend_stages: Option<PalsStartupStageSnapshot>,
+    }
+    /// Observed successful cold-start phases under an explicit probe budget.
+    /// This is timing evidence, not failure evidence or resource/NN admission.
+    #[derive(Clone, Debug, serde::Serialize)]
+    pub struct NativeStartupTimingObservation {
+        pub schema: &'static str,
+        pub model_loading_elapsed_ns: Option<u64>,
+        pub probe_budget_ns: Option<u64>,
+        pub probe_elapsed_ns: Option<u64>,
+        pub drain_limit_ns: Option<u64>,
+        pub commands: Vec<NativeStartupCommandObservation>,
+        pub command_observation_overflow: bool,
+    }
     #[derive(Clone, Debug, serde::Serialize)]
     pub struct NativeStartupProbeReceipt {
         pub completed_proposer_calls: u64,
@@ -659,6 +728,14 @@ mod native {
         /// Actual cumulative snapshot after probe and reset; final statistics
         /// include this work and must not be reported as search-only inputs.
         pub backend_stats: Option<NativeBackendStatsReceipt>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub failure_diagnostic: Option<NativeStartupFailureDiagnostic>,
+        /// Explicit diagnostic startup only. These events do not authorize
+        /// readiness, GPU ownership, physical completion or NN consumption.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub backend_stages: Option<PalsStartupStageSnapshot>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub timing_observation: Option<NativeStartupTimingObservation>,
     }
     #[derive(Clone, Debug, serde::Serialize)]
     pub struct NativeRoleSourceIdentity {
@@ -752,6 +829,7 @@ mod native {
             runtime_bundle_sha256: backend.runtime_bundle_digest(),
             cuda_control_inventory_sha256: backend.cuda_control_inventory_digest(),
             cuda_loading_profile,
+            startup_probe_timeout_ms: None,
             transient_request_device_bytes: request,
             transient_execution_device_bytes: physical,
             // Rust owns pageable host tensors in this first host-K/V path.
@@ -928,6 +1006,12 @@ mod native {
         pub cause_truncated: Option<bool>,
     }
     impl WorkerOwner {
+        fn execution_receipt(&self) -> NativeExecutionReceipt {
+            let mut receipt = self.execution.clone();
+            let selected = self.startup_probe_timeout_ms.load(Ordering::Acquire);
+            receipt.startup_probe_timeout_ms = (selected != 0).then_some(selected);
+            receipt
+        }
         fn observe(
             &self,
             stage: &'static str,
@@ -1078,7 +1162,7 @@ mod native {
                     .clone(),
                 backend_stats,
                 backend_stats_observation,
-                execution: self.owner.execution.clone(),
+                execution: self.owner.execution_receipt(),
                 startup_probe: self
                     .owner
                     .startup_probe
@@ -1503,7 +1587,11 @@ mod native {
         pending_new_game: bool,
         control_lease: Option<NativePhysicalLease>,
         startup_attempted: bool,
+        startup_probe_configured: bool,
         delivered_request: Option<RequestId>,
+        startup_loading_elapsed_ns: Option<u64>,
+        startup_clock: Option<Instant>,
+        startup_diagnostic: Option<NativeStartupFailureDiagnostic>,
     }
     impl NativeRoleModel {
         pub fn load_pinned(
@@ -1567,7 +1655,7 @@ mod native {
         /// limit. There is no independent 30-second native tail hidden behind
         /// a shorter protocol fence.
         pub fn new_with_drain_limit(
-            backend: PalsOnnxBackend,
+            mut backend: PalsOnnxBackend,
             drain_limit: Duration,
         ) -> Result<Self, RoleError> {
             if drain_limit.is_zero() || Instant::now().checked_add(drain_limit).is_none() {
@@ -1577,6 +1665,9 @@ mod native {
             }
             let execution = execution_receipt(&backend)?;
             let is_cuda = execution.provider == "cuda";
+            // Dormant until prepare_startup establishes the shared clock.
+            // Successful default startup discards the optional diagnostics.
+            let startup_stage_probe = is_cuda.then(|| backend.enable_startup_stage_probe());
             if !is_cuda {
                 backend.verify_runtime().map_err(model_error)?;
             }
@@ -1656,6 +1747,8 @@ mod native {
                 final_stats: Mutex::new(None),
                 stats_lease: Mutex::new(None),
                 execution: execution.clone(),
+                startup_probe_timeout_ms: AtomicU64::new(0),
+                startup_stage_probe,
                 startup_probe: Mutex::new(is_cuda.then_some(NativeStartupProbeReceipt {
                     completed_proposer_calls: 0,
                     completed_critic_calls: 0,
@@ -1664,6 +1757,9 @@ mod native {
                     cuda_placement_witness: None,
                     reset_completed: false,
                     backend_stats: None,
+                    failure_diagnostic: None,
+                    backend_stages: None,
+                    timing_observation: None,
                 })),
                 startup_ready: AtomicBool::new(!is_cuda),
                 final_mapping_confirmed: AtomicBool::new(false),
@@ -1713,7 +1809,11 @@ mod native {
                 pending_new_game: false,
                 control_lease: None,
                 startup_attempted: false,
+                startup_probe_configured: false,
                 delivered_request: None,
+                startup_loading_elapsed_ns: None,
+                startup_clock: None,
+                startup_diagnostic: None,
             })
         }
         pub fn finish_handle(&self) -> NativeRoleFinishHandle {
@@ -1733,7 +1833,7 @@ mod native {
                 adapter_source_sha256: self.owner.adapter_source_digest,
                 model_configuration: PalsModelConfig::baseline(),
                 trained: self.owner.trained,
-                execution: self.owner.execution.clone(),
+                execution: self.owner.execution_receipt(),
             }
         }
         pub fn set_observer(
@@ -1769,6 +1869,36 @@ mod native {
         }
         /// CUDA readiness is obtained by the existing exclusive worker, not
         /// by an untracked temporary session or fabricated search consumption.
+        pub fn observe_startup_loading(&mut self, elapsed: Duration) -> Result<(), RoleError> {
+            if self.startup_attempted || self.startup_loading_elapsed_ns.is_some() {
+                return Err(RoleError::Unavailable);
+            }
+            self.startup_loading_elapsed_ns = u64::try_from(elapsed.as_nanos()).ok();
+            Ok(())
+        }
+        /// Explicit cold-start admission budget, independent of the arena's
+        /// protocol readiness and of the post-cancel physical drain limit.
+        /// Absent selection keeps the existing 15-second behavior and wire.
+        pub fn configure_startup_probe_timeout(
+            &mut self,
+            selected_ms: Option<u64>,
+        ) -> Result<Duration, RoleError> {
+            if self.startup_attempted || self.startup_probe_configured {
+                return Err(RoleError::Unavailable);
+            }
+            if selected_ms.is_some_and(|value| !(1..=180_000).contains(&value)) {
+                return Err(RoleError::InvalidOutput);
+            }
+            self.startup_probe_configured = true;
+            self.owner
+                .startup_probe_timeout_ms
+                .store(selected_ms.unwrap_or(0), Ordering::Release);
+            Ok(Duration::from_millis(selected_ms.unwrap_or(15_000)))
+        }
+        fn startup_elapsed_ns(&self) -> Option<u64> {
+            self.startup_clock
+                .and_then(|start| u64::try_from(start.elapsed().as_nanos()).ok())
+        }
         pub fn prepare_startup(&mut self, until: Instant) -> Result<(), RoleError> {
             if self.owner.startup_ready.load(Ordering::Acquire) {
                 return Ok(());
@@ -1777,11 +1907,37 @@ mod native {
                 return Err(RoleError::Unavailable);
             }
             self.startup_attempted = true;
+            let started = Instant::now();
+            self.startup_clock = Some(started);
+            if let Some(probe) = self.owner.startup_stage_probe.as_ref() {
+                let _ = probe.start(started);
+            }
+            self.startup_diagnostic = Some(NativeStartupFailureDiagnostic {
+                schema: "rz-pals-startup-failure-diagnostic/1",
+                model_loading_elapsed_ns: self.startup_loading_elapsed_ns,
+                probe_budget_ns: u64::try_from(until.saturating_duration_since(started).as_nanos())
+                    .ok(),
+                probe_elapsed_ns: None,
+                drain_limit_ns: u64::try_from(self.drain_limit.as_nanos()).ok(),
+                current_stage: "prepare_proposer_input",
+                primary_error: None,
+                logical_deadline_expired: false,
+                commands: Vec::with_capacity(7),
+                command_observation_overflow: false,
+                backend_stages: None,
+            });
             let outcome = (|| {
                 let position = Position::startpos();
                 let legal = position.legal_moves();
                 let cancel = AtomicBool::new(false);
                 for kind in [NativeQueryKind::Propose, NativeQueryKind::Reply] {
+                    if let Some(diagnostic) = self.startup_diagnostic.as_mut() {
+                        diagnostic.current_stage = if kind == NativeQueryKind::Reply {
+                            "prepare_critic_input"
+                        } else {
+                            "prepare_proposer_input"
+                        };
+                    }
                     let input = prepare_role_input(
                         &RoleQuery {
                             position: &position,
@@ -1894,12 +2050,110 @@ mod native {
                 self.owner.startup_ready.store(true, Ordering::Release);
                 Ok(())
             })();
-            if outcome.is_err() {
+            let backend_stages = self
+                .owner
+                .startup_stage_probe
+                .as_ref()
+                .map(PalsStartupStageProbe::snapshot_and_stop);
+            if let Err(error) = &outcome {
                 self.unusable = true;
+                let elapsed = self.startup_elapsed_ns();
+                if let Some(mut diagnostic) = self.startup_diagnostic.take() {
+                    diagnostic.probe_elapsed_ns = elapsed;
+                    diagnostic.primary_error = Some(NativeStartupErrorKind::from(error));
+                    diagnostic.logical_deadline_expired = Instant::now() >= until;
+                    diagnostic.backend_stages = backend_stages;
+                    if let Ok(mut probe) = self.owner.startup_probe.lock()
+                        && let Some(probe) = probe.as_mut()
+                    {
+                        probe.failure_diagnostic = Some(diagnostic);
+                    }
+                }
+            } else {
+                if self.owner.startup_probe_timeout_ms.load(Ordering::Acquire) != 0 {
+                    let elapsed = self.startup_elapsed_ns();
+                    let timing = self.startup_diagnostic.take().map(|diagnostic| {
+                        NativeStartupTimingObservation {
+                            schema: "rz-pals-startup-timing-observation/1",
+                            model_loading_elapsed_ns: diagnostic.model_loading_elapsed_ns,
+                            probe_budget_ns: diagnostic.probe_budget_ns,
+                            probe_elapsed_ns: elapsed,
+                            drain_limit_ns: diagnostic.drain_limit_ns,
+                            commands: diagnostic.commands,
+                            command_observation_overflow: diagnostic.command_observation_overflow,
+                        }
+                    });
+                    if let Ok(mut probe) = self.owner.startup_probe.lock()
+                        && let Some(probe) = probe.as_mut()
+                    {
+                        probe.backend_stages = backend_stages;
+                        probe.timing_observation = timing;
+                    }
+                }
+                self.startup_diagnostic = None;
             }
+            self.startup_clock = None;
             outcome
         }
         fn startup_command(
+            &mut self,
+            command: PalsNativeCommand,
+            until: Instant,
+        ) -> Result<PalsNativeResult, RoleError> {
+            let kind = match &command {
+                PalsNativeCommand::Evaluate(input) if input.role == PalsRole::Critic => {
+                    "critic_evaluation"
+                }
+                PalsNativeCommand::Evaluate(_) => "proposer_evaluation",
+                PalsNativeCommand::VerifyRuntime => "runtime_origin_audit",
+                PalsNativeCommand::ObserveRuntimeMappings => "runtime_loading_mapping",
+                PalsNativeCommand::VerifyCudaPlacement => "cuda_placement_audit",
+                PalsNativeCommand::NewGame => "new_game_reset",
+                PalsNativeCommand::SnapshotStats => "backend_stats",
+            };
+            let elapsed = self.startup_elapsed_ns();
+            // A diagnostic cap is not a command admission or completion rule.
+            // Suppress capture on overflow without mutating a prior event or
+            // replacing the actual command outcome.
+            if self
+                .startup_diagnostic
+                .as_ref()
+                .is_some_and(|d| d.commands.len() >= 7)
+            {
+                let mut diagnostic = self.startup_diagnostic.take();
+                if let Some(diagnostic) = diagnostic.as_mut() {
+                    diagnostic.command_observation_overflow = true;
+                    diagnostic.current_stage = kind;
+                }
+                let result = self.startup_command_inner(command, until);
+                self.startup_diagnostic = diagnostic;
+                return result;
+            }
+            if let Some(diagnostic) = self.startup_diagnostic.as_mut() {
+                diagnostic.current_stage = kind;
+                diagnostic.commands.push(NativeStartupCommandObservation {
+                    command: kind,
+                    admitted: false,
+                    entered_elapsed_ns: elapsed,
+                    returned_elapsed_ns: None,
+                    physical_completion_confirmed: None,
+                    return_error: None,
+                    fence_observation: None,
+                });
+            }
+            let result = self.startup_command_inner(command, until);
+            let elapsed = self.startup_elapsed_ns();
+            if let Some(observation) = self
+                .startup_diagnostic
+                .as_mut()
+                .and_then(|d| d.commands.last_mut())
+            {
+                observation.returned_elapsed_ns = elapsed;
+                observation.return_error = result.as_ref().err().map(NativeStartupErrorKind::from);
+            }
+            result
+        }
+        fn startup_command_inner(
             &mut self,
             command: PalsNativeCommand,
             until: Instant,
@@ -1908,6 +2162,13 @@ mod native {
                 return Err(RoleError::PhysicalCompletionUnknown);
             }
             if Instant::now() >= until {
+                if let Some(observation) = self
+                    .startup_diagnostic
+                    .as_mut()
+                    .and_then(|d| d.commands.last_mut())
+                {
+                    observation.fence_observation = Some("logical_deadline_before_admission");
+                }
                 return Err(RoleError::Deadline);
             }
             if self.runtime.state().executions != 0
@@ -1927,11 +2188,25 @@ mod native {
                     .map_err(model_error)?,
             );
             self.owner.in_flight.fetch_add(1, Ordering::AcqRel);
+            if let Some(observation) = self
+                .startup_diagnostic
+                .as_mut()
+                .and_then(|d| d.commands.last_mut())
+            {
+                observation.admitted = true;
+            }
             loop {
                 let lease = self.control_lease.as_mut().expect("admitted startup lease");
                 match lease.poll() {
                     PhysicalPoll::Ready(result) => {
                         self.owner.in_flight.fetch_sub(1, Ordering::AcqRel);
+                        if let Some(observation) = self
+                            .startup_diagnostic
+                            .as_mut()
+                            .and_then(|d| d.commands.last_mut())
+                        {
+                            observation.physical_completion_confirmed = Some(true);
+                        }
                         // The retained immutable job gives the exact input for
                         // output validation without recomputing/duplicating it.
                         let checked = match result {
@@ -1975,12 +2250,32 @@ mod native {
                             self.owner.remember_failure(&error);
                         }
                         self.owner.quarantined.store(true, Ordering::Release);
+                        if let Some(observation) = self
+                            .startup_diagnostic
+                            .as_mut()
+                            .and_then(|d| d.commands.last_mut())
+                        {
+                            observation.fence_observation = Some("physical_worker_quarantined");
+                        }
                         return Err(RoleError::PhysicalCompletionUnknown);
                     }
                     PhysicalPoll::Pending => {}
                 }
                 if Instant::now() >= physical_until {
                     self.owner.quarantined.store(true, Ordering::Release);
+                    if let Some(observation) = self
+                        .startup_diagnostic
+                        .as_mut()
+                        .and_then(|d| d.commands.last_mut())
+                    {
+                        observation.fence_observation =
+                            Some("pending_at_registered_physical_fence");
+                    }
+                    self.owner.remember_failure(&BackendError::new(
+                        rz_eval::error::FailureKind::BackendFailure,
+                        rz_eval::error::FailureStage::Backend,
+                        "PALS startup physical completion remains unconfirmed at its registered fence",
+                    ));
                     // Keep the lease and worker closure's session/input pins.
                     return Err(RoleError::PhysicalCompletionUnknown);
                 }
@@ -2487,6 +2782,7 @@ mod native {
                 runtime_bundle_sha256: Some([2; 32]),
                 cuda_control_inventory_sha256: Some([3; 32]),
                 cuda_loading_profile: None,
+                startup_probe_timeout_ms: None,
                 transient_request_device_bytes: 0,
                 transient_execution_device_bytes: 0,
                 pinned_request_bytes: 0,
@@ -2643,12 +2939,15 @@ mod native {
                     runtime_bundle_sha256: None,
                     cuda_control_inventory_sha256: None,
                     cuda_loading_profile: None,
+                    startup_probe_timeout_ms: None,
                     transient_request_device_bytes: 0,
                     transient_execution_device_bytes: 0,
                     pinned_request_bytes: 0,
                     device_public_memory: false,
                 }),
                 startup_probe: Mutex::new(None),
+                startup_probe_timeout_ms: AtomicU64::new(0),
+                startup_stage_probe: None,
                 startup_ready: AtomicBool::new(true),
                 final_mapping_confirmed: AtomicBool::new(false),
                 final_loading_mapping: Mutex::new(None),
@@ -2694,7 +2993,11 @@ mod native {
                 pending_new_game: false,
                 control_lease: None,
                 startup_attempted: false,
+                startup_probe_configured: false,
                 delivered_request: None,
+                startup_loading_elapsed_ns: None,
+                startup_clock: None,
+                startup_diagnostic: None,
             }
         }
         fn output(input: &PalsModelInput) -> PalsNativeResult {
@@ -2746,6 +3049,7 @@ mod native {
                     profile: profile.identifier(),
                     canonical_sha256: digest,
                 }),
+                startup_probe_timeout_ms: None,
                 transient_request_device_bytes: 0,
                 transient_execution_device_bytes: 0,
                 pinned_request_bytes: 0,
@@ -2778,6 +3082,272 @@ mod native {
                     .collect(),
             };
             (execution, witness)
+        }
+        fn require_probe(model: &NativeRoleModel) {
+            model.owner.startup_ready.store(false, Ordering::Release);
+            *model.owner.startup_probe.lock().unwrap() = Some(NativeStartupProbeReceipt {
+                completed_proposer_calls: 0,
+                completed_critic_calls: 0,
+                runtime_mapping_confirmed: false,
+                runtime_loading_mapping: None,
+                cuda_placement_witness: None,
+                reset_completed: false,
+                backend_stats: None,
+                failure_diagnostic: None,
+                backend_stages: None,
+                timing_observation: None,
+            });
+        }
+        #[test]
+        fn startup_probe_explicit_budget_preserves_default_wire_and_bounds() {
+            for selected in [None, Some(1), Some(15_000), Some(120_000), Some(180_000)] {
+                let mut model = fixture_model(|command| match command {
+                    PalsNativeCommand::SnapshotStats => PhysicalRun::Complete(Ok(
+                        PalsNativeResult::Stats(PalsBackendStats::default()),
+                    )),
+                    _ => unexpected_cuda_placement(),
+                });
+                let budget = model.configure_startup_probe_timeout(selected).unwrap();
+                assert_eq!(budget, Duration::from_millis(selected.unwrap_or(15_000)));
+                let execution = model.finish_handle().receipt().execution;
+                assert_eq!(execution.startup_probe_timeout_ms, selected);
+                let encoded = serde_json::to_value(execution).unwrap();
+                assert_eq!(
+                    encoded.get("startup_probe_timeout_ms").is_some(),
+                    selected.is_some()
+                );
+                assert!(model.configure_startup_probe_timeout(selected).is_err());
+                model
+                    .finish_handle()
+                    .finish(Instant::now() + Duration::from_secs(1))
+                    .unwrap();
+            }
+            for selected in [0, 180_001, u64::MAX] {
+                let mut model = fixture_model(|command| match command {
+                    PalsNativeCommand::SnapshotStats => PhysicalRun::Complete(Ok(
+                        PalsNativeResult::Stats(PalsBackendStats::default()),
+                    )),
+                    _ => unexpected_cuda_placement(),
+                });
+                assert!(matches!(
+                    model.configure_startup_probe_timeout(Some(selected)),
+                    Err(RoleError::InvalidOutput)
+                ));
+                assert_eq!(
+                    model
+                        .finish_handle()
+                        .receipt()
+                        .execution
+                        .startup_probe_timeout_ms,
+                    None
+                );
+                model
+                    .finish_handle()
+                    .finish(Instant::now() + Duration::from_secs(1))
+                    .unwrap();
+            }
+        }
+        #[test]
+        fn failed_startup_publishes_partial_mapping_evidence_without_masking_primary() {
+            use crate::pals_attestation::{PalsReceiptWriter, STARTUP_FILE, TERMINATION_FILE};
+            let (execution, witness) = loading_mapping_fixture();
+            let mut model = fixture_model_with_execution(
+                move |command| match command {
+                    PalsNativeCommand::Evaluate(_) => {
+                        PhysicalRun::Complete(Err(BackendError::new(
+                            FailureKind::BackendFailure,
+                            FailureStage::Backend,
+                            "bounded known startup fixture failure",
+                        )))
+                    }
+                    PalsNativeCommand::VerifyRuntime => {
+                        PhysicalRun::Complete(Ok(PalsNativeResult::RuntimeVerified))
+                    }
+                    PalsNativeCommand::ObserveRuntimeMappings => PhysicalRun::Complete(Ok(
+                        PalsNativeResult::RuntimeMappingsObserved(Box::new(witness.clone())),
+                    )),
+                    PalsNativeCommand::SnapshotStats => PhysicalRun::Complete(Ok(
+                        PalsNativeResult::Stats(PalsBackendStats::default()),
+                    )),
+                    _ => unexpected_cuda_placement(),
+                },
+                Some(execution),
+            );
+            require_probe(&model);
+            let budget = model
+                .configure_startup_probe_timeout(Some(120_000))
+                .unwrap();
+            model
+                .observe_startup_loading(Duration::from_millis(3))
+                .unwrap();
+            let primary = model.prepare_startup(Instant::now() + budget).unwrap_err();
+            assert!(matches!(primary, RoleError::Backend(_)));
+            let finish = model.finish_handle();
+            let partial = finish.receipt();
+            let diagnostic = partial
+                .startup_probe
+                .as_ref()
+                .unwrap()
+                .failure_diagnostic
+                .as_ref()
+                .unwrap();
+            assert_eq!(diagnostic.model_loading_elapsed_ns, Some(3_000_000));
+            assert_eq!(
+                diagnostic.primary_error,
+                Some(NativeStartupErrorKind::Backend)
+            );
+            assert_eq!(diagnostic.current_stage, "proposer_evaluation");
+            assert_eq!(diagnostic.commands.len(), 1);
+            assert!(diagnostic.commands[0].admitted);
+            assert_eq!(
+                diagnostic.commands[0].physical_completion_confirmed,
+                Some(true)
+            );
+            assert!(diagnostic.commands[0].returned_elapsed_ns.is_some());
+            assert!(
+                partial
+                    .startup_probe
+                    .as_ref()
+                    .unwrap()
+                    .runtime_loading_mapping
+                    .is_none()
+            );
+            assert_eq!(partial.physical_runs_in_flight, 0);
+            assert_eq!(partial.completed_role_inputs, 0);
+            assert_eq!(partial.search_consumed_role_inputs, 0);
+            let root = std::env::temp_dir().join(format!(
+                "rz-pals-failed-startup-{}-{}",
+                std::process::id(),
+                EPOCHS.fetch_add(1, Ordering::AcqRel)
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let runtime_hash = "01".repeat(32);
+            let mut writer =
+                PalsReceiptWriter::open(&root, "fixture", &"ab".repeat(32), &runtime_hash).unwrap();
+            assert!(writer.startup(partial.clone(), None).is_err());
+            writer.failed_startup(partial, &primary, None).unwrap();
+            let ended = finish
+                .finish(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            assert!(ended.physical_shutdown_confirmed && ended.native_buffers_released);
+            assert!(writer.termination(ended.clone(), true, None).is_err());
+            writer.termination(ended, false, None).unwrap();
+            drop(writer);
+            let slot = root.join(crate::process_receipts::process_run_id());
+            for file in [STARTUP_FILE, TERMINATION_FILE] {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(slot.join(file)).unwrap()).unwrap();
+                assert_eq!(value["startup_failure"], "backend");
+                assert_eq!(value["service_exit_success"], false);
+                assert_eq!(
+                    value["native"]["execution"]["startup_probe_timeout_ms"],
+                    120_000
+                );
+                assert_eq!(
+                    value["native"]["startup_probe"]["failure_diagnostic"]["primary_error"],
+                    "backend"
+                );
+                std::fs::remove_file(slot.join(file)).unwrap();
+            }
+            std::fs::remove_dir(slot).unwrap();
+            std::fs::remove_dir(root).unwrap();
+        }
+        #[test]
+        fn pending_startup_fence_keeps_lease_and_unknown_completion_in_partial_evidence() {
+            let mut model = fixture_model(|command| match command {
+                PalsNativeCommand::Evaluate(input) => {
+                    std::thread::sleep(Duration::from_millis(200));
+                    PhysicalRun::Complete(Ok(output(input)))
+                }
+                _ => unexpected_cuda_placement(),
+            });
+            require_probe(&model);
+            model.drain_limit = Duration::from_millis(5);
+            let result = model.prepare_startup(Instant::now() + Duration::from_millis(100));
+            assert!(matches!(result, Err(RoleError::PhysicalCompletionUnknown)));
+            let receipt = model.finish_handle().receipt();
+            let diagnostic = receipt.startup_probe.unwrap().failure_diagnostic.unwrap();
+            assert_eq!(
+                diagnostic.primary_error,
+                Some(NativeStartupErrorKind::PhysicalCompletionUnknown)
+            );
+            assert!(diagnostic.logical_deadline_expired);
+            assert_eq!(diagnostic.commands[0].physical_completion_confirmed, None);
+            assert_eq!(
+                diagnostic.commands[0].fence_observation,
+                Some("pending_at_registered_physical_fence")
+            );
+            assert!(diagnostic.commands[0].admitted);
+            assert!(
+                receipt.quarantined
+                    && !receipt.physical_shutdown_confirmed
+                    && !receipt.native_buffers_released
+            );
+            assert_eq!(receipt.physical_runs_in_flight, 1);
+            assert!(receipt.last_failure.is_some());
+            assert!(model.control_lease.is_some());
+            assert!(matches!(
+                model
+                    .finish_handle()
+                    .finish(Instant::now() + Duration::from_secs(1)),
+                Err(RoleError::PhysicalCompletionUnknown)
+            ));
+        }
+        #[test]
+        fn startup_command_diagnostic_overflow_does_not_change_command_or_prior_events() {
+            let mut model = fixture_model(|command| match command {
+                PalsNativeCommand::SnapshotStats => {
+                    PhysicalRun::Complete(Ok(PalsNativeResult::Stats(PalsBackendStats::default())))
+                }
+                _ => unexpected_cuda_placement(),
+            });
+            model.startup_diagnostic = Some(NativeStartupFailureDiagnostic {
+                schema: "rz-pals-startup-failure-diagnostic/1",
+                model_loading_elapsed_ns: None,
+                probe_budget_ns: None,
+                probe_elapsed_ns: None,
+                drain_limit_ns: None,
+                current_stage: "prior_command",
+                primary_error: None,
+                logical_deadline_expired: false,
+                command_observation_overflow: false,
+                backend_stages: None,
+                commands: vec![
+                    NativeStartupCommandObservation {
+                        command: "prior_command",
+                        admitted: true,
+                        entered_elapsed_ns: Some(3),
+                        returned_elapsed_ns: Some(7),
+                        physical_completion_confirmed: Some(true),
+                        return_error: None,
+                        fence_observation: None,
+                    };
+                    7
+                ],
+            });
+            assert!(matches!(
+                model.startup_command(
+                    PalsNativeCommand::SnapshotStats,
+                    Instant::now() + Duration::from_secs(1)
+                ),
+                Ok(PalsNativeResult::Stats(_))
+            ));
+            let diagnostic = model.startup_diagnostic.as_ref().unwrap();
+            assert!(diagnostic.command_observation_overflow);
+            assert_eq!(diagnostic.commands.len(), 7);
+            assert!(
+                diagnostic
+                    .commands
+                    .iter()
+                    .all(|event| event.command == "prior_command"
+                        && event.returned_elapsed_ns == Some(7))
+            );
+            let receipt = model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            assert!(receipt.physical_shutdown_confirmed && receipt.native_buffers_released);
+            assert_eq!(receipt.completed_role_inputs, 0);
         }
         #[test]
         fn loading_mapping_ack_requires_exact_pin_profile_partition_and_full_ort() {
@@ -2869,72 +3439,97 @@ mod native {
         }
         #[test]
         fn startup_worker_probe_does_not_create_search_consumption() {
-            let mut stats = PalsBackendStats::default();
-            let mut cached = false;
-            let mut model = fixture_model(move |command| {
-                PhysicalRun::Complete(Ok(match command {
-                    PalsNativeCommand::Evaluate(input) => {
-                        stats.admitted_role_requests += 1;
-                        if cached {
-                            stats.public_cache_hits += 1;
-                        } else {
-                            stats.public_cache_misses += 1;
-                            stats.public_nn_runs_attempted += 1;
-                            stats.public_nn_runs_completed += 1;
+            for selected in [None, Some(2_000)] {
+                let mut stats = PalsBackendStats::default();
+                let mut cached = false;
+                let mut model = fixture_model(move |command| {
+                    PhysicalRun::Complete(Ok(match command {
+                        PalsNativeCommand::Evaluate(input) => {
+                            stats.admitted_role_requests += 1;
+                            if cached {
+                                stats.public_cache_hits += 1;
+                            } else {
+                                stats.public_cache_misses += 1;
+                                stats.public_nn_runs_attempted += 1;
+                                stats.public_nn_runs_completed += 1;
+                                stats.completed_nn_inputs += 1;
+                                stats.validated_public_outputs += 1;
+                                cached = true;
+                            }
+                            stats.role_nn_runs_attempted += 1;
+                            stats.role_nn_runs_completed += 1;
                             stats.completed_nn_inputs += 1;
-                            stats.validated_public_outputs += 1;
-                            cached = true;
+                            stats.validated_role_outputs += 1;
+                            output(input)
                         }
-                        stats.role_nn_runs_attempted += 1;
-                        stats.role_nn_runs_completed += 1;
-                        stats.completed_nn_inputs += 1;
-                        stats.validated_role_outputs += 1;
-                        output(input)
-                    }
-                    PalsNativeCommand::NewGame => {
-                        cached = false;
-                        stats.new_game_resets += 1;
-                        PalsNativeResult::NewGame
-                    }
-                    PalsNativeCommand::VerifyCudaPlacement
-                    | PalsNativeCommand::ObserveRuntimeMappings => {
-                        return unexpected_cuda_placement();
-                    }
-                    PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
-                    PalsNativeCommand::SnapshotStats => PalsNativeResult::Stats(stats.clone()),
-                }))
-            });
-            // Only the control-flow is simulated by this CPU worker fixture;
-            // it is not provider/device/NN capability evidence.
-            model.owner.startup_ready.store(false, Ordering::Release);
-            *model.owner.startup_probe.lock().unwrap() = Some(NativeStartupProbeReceipt {
-                completed_proposer_calls: 0,
-                completed_critic_calls: 0,
-                runtime_mapping_confirmed: false,
-                runtime_loading_mapping: None,
-                cuda_placement_witness: None,
-                reset_completed: false,
-                backend_stats: None,
-            });
-            model
-                .prepare_startup(Instant::now() + Duration::from_secs(2))
-                .unwrap();
-            let receipt = model.finish_handle().receipt();
-            let startup = receipt.startup_probe.unwrap();
-            assert_eq!(startup.completed_proposer_calls, 1);
-            assert_eq!(startup.completed_critic_calls, 1);
-            assert!(startup.runtime_mapping_confirmed && startup.reset_completed);
-            assert_eq!(startup.backend_stats.unwrap().completed_nn_inputs, 3);
-            assert_eq!(receipt.completed_role_inputs, 0);
-            assert_eq!(receipt.delivered_role_inputs, 0);
-            assert_eq!(receipt.search_consumed_role_inputs, 0);
-            assert_eq!(receipt.completed_new_game_resets, 0);
-            assert_eq!(receipt.request_high_water, 0);
-            assert_eq!(receipt.physical_runs_in_flight, 0);
-            model
-                .finish_handle()
-                .finish(Instant::now() + Duration::from_secs(2))
-                .unwrap();
+                        PalsNativeCommand::NewGame => {
+                            cached = false;
+                            stats.new_game_resets += 1;
+                            PalsNativeResult::NewGame
+                        }
+                        PalsNativeCommand::VerifyCudaPlacement
+                        | PalsNativeCommand::ObserveRuntimeMappings => {
+                            return unexpected_cuda_placement();
+                        }
+                        PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
+                        PalsNativeCommand::SnapshotStats => PalsNativeResult::Stats(stats.clone()),
+                    }))
+                });
+                // Only the control-flow is simulated by this CPU worker fixture;
+                // it is not provider/device/NN capability evidence.
+                model.owner.startup_ready.store(false, Ordering::Release);
+                *model.owner.startup_probe.lock().unwrap() = Some(NativeStartupProbeReceipt {
+                    completed_proposer_calls: 0,
+                    completed_critic_calls: 0,
+                    runtime_mapping_confirmed: false,
+                    runtime_loading_mapping: None,
+                    cuda_placement_witness: None,
+                    reset_completed: false,
+                    backend_stats: None,
+                    failure_diagnostic: None,
+                    backend_stages: None,
+                    timing_observation: None,
+                });
+                let budget = model.configure_startup_probe_timeout(selected).unwrap();
+                model
+                    .observe_startup_loading(Duration::from_millis(3))
+                    .unwrap();
+                model.prepare_startup(Instant::now() + budget).unwrap();
+                let receipt = model.finish_handle().receipt();
+                let startup = receipt.startup_probe.unwrap();
+                let encoded = serde_json::to_value(&startup).unwrap();
+                assert!(encoded.get("failure_diagnostic").is_none());
+                assert!(encoded.get("backend_stages").is_none());
+                assert_eq!(
+                    encoded.get("timing_observation").is_some(),
+                    selected.is_some()
+                );
+                if let Some(timing) = startup.timing_observation.as_ref() {
+                    assert_eq!(timing.model_loading_elapsed_ns, Some(3_000_000));
+                    assert!(timing.probe_elapsed_ns.is_some());
+                    assert_eq!(timing.commands.len(), 5);
+                    assert!(
+                        timing
+                            .commands
+                            .iter()
+                            .all(|event| event.physical_completion_confirmed == Some(true))
+                    );
+                }
+                assert_eq!(startup.completed_proposer_calls, 1);
+                assert_eq!(startup.completed_critic_calls, 1);
+                assert!(startup.runtime_mapping_confirmed && startup.reset_completed);
+                assert_eq!(startup.backend_stats.unwrap().completed_nn_inputs, 3);
+                assert_eq!(receipt.completed_role_inputs, 0);
+                assert_eq!(receipt.delivered_role_inputs, 0);
+                assert_eq!(receipt.search_consumed_role_inputs, 0);
+                assert_eq!(receipt.completed_new_game_resets, 0);
+                assert_eq!(receipt.request_high_water, 0);
+                assert_eq!(receipt.physical_runs_in_flight, 0);
+                model
+                    .finish_handle()
+                    .finish(Instant::now() + Duration::from_secs(2))
+                    .unwrap();
+            }
         }
         struct InputObserver {
             input_keys: Arc<Mutex<Vec<[u8; 32]>>>,
@@ -3418,7 +4013,8 @@ pub use native::{
     NativeBackendStatsReceipt, NativeCudaLoadingIdentity, NativeExecutionReceipt,
     NativeFailureReceipt, NativePreparedContext, NativeRoleFinishHandle, NativeRoleModel,
     NativeRoleObserver, NativeRoleReceipt, NativeRoleRejection, NativeRoleSourceIdentity,
-    NativeStartupProbeReceipt,
+    NativeStartupCommandObservation, NativeStartupErrorKind, NativeStartupFailureDiagnostic,
+    NativeStartupProbeReceipt, NativeStartupTimingObservation,
 };
 
 #[cfg(test)]

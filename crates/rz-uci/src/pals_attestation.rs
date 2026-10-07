@@ -2,7 +2,7 @@
 //! All snapshots come from the native worker's actual counters and join fence.
 
 #[cfg(feature = "onnx-cpu")]
-use crate::pals_native::NativeRoleReceipt;
+use crate::pals_native::{NativeRoleReceipt, NativeStartupErrorKind};
 use crate::{
     process_receipts::{ExecutableIdentityV1, ProcessReceiptError, ProcessReceiptWriter},
     search_driver::ProcessSearchWorkReceipt,
@@ -30,6 +30,9 @@ pub struct PalsNativeReceiptV3 {
     pub provider: &'static str,
     pub precision: &'static str,
     pub service_exit_success: bool,
+    /// An unsuccessful startup is evidence, never a readiness attestation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_failure: Option<NativeStartupErrorKind>,
     pub native: NativeRoleReceipt,
     pub search_work: Option<ProcessSearchWorkReceipt>,
 }
@@ -43,6 +46,7 @@ pub struct PalsReceiptWriter {
     launch_sha256: String,
     binary_sha256: String,
     runtime_sha256: String,
+    startup_failure: Option<NativeStartupErrorKind>,
 }
 #[cfg(feature = "onnx-cpu")]
 impl PalsReceiptWriter {
@@ -80,6 +84,7 @@ impl PalsReceiptWriter {
             launch_sha256: launch_sha256.into(),
             binary_sha256: binary.sha256,
             runtime_sha256: runtime_sha256.into(),
+            startup_failure: None,
         })
     }
     fn envelope(
@@ -104,6 +109,7 @@ impl PalsReceiptWriter {
                 .map(|digest| digest.iter().map(|byte| format!("{byte:02x}")).collect()),
             precision: "fp32",
             service_exit_success,
+            startup_failure: self.startup_failure,
             native,
             search_work,
         }
@@ -115,6 +121,20 @@ impl PalsReceiptWriter {
     ) -> Result<(), ProcessReceiptError> {
         self.validate_execution(&native)?;
         self.validate_loading_mapping(&native, false)?;
+        let receipt = self.envelope(STARTUP_DOMAIN, native, false, search_work);
+        self.writer.publish_startup(&receipt)
+    }
+    /// The same identity and bounded, exclusive files preserve actual partial
+    /// counters, timing and an unconfirmed fence. Missing ACKs stay missing;
+    /// their absence must not replace the original preparation failure.
+    pub fn failed_startup(
+        &mut self,
+        native: NativeRoleReceipt,
+        primary: &rz_search::pals::engine::RoleError,
+        search_work: Option<ProcessSearchWorkReceipt>,
+    ) -> Result<(), ProcessReceiptError> {
+        self.validate_execution(&native)?;
+        self.startup_failure = Some(NativeStartupErrorKind::from(primary));
         let receipt = self.envelope(STARTUP_DOMAIN, native, false, search_work);
         self.writer.publish_startup(&receipt)
     }
@@ -130,6 +150,11 @@ impl PalsReceiptWriter {
         // An unsuccessful service may legitimately lack the final observation.
         // Preserve its original failure and partially completed evidence.
         if service_exit_success {
+            if self.startup_failure.is_some() {
+                return Err(ProcessReceiptError::boundary(
+                    "failed PALS startup cannot publish a successful service termination",
+                ));
+            }
             self.validate_loading_mapping(&native, true)?;
         }
         if service_exit_success
@@ -212,6 +237,23 @@ impl PalsReceiptWriter {
             return Err(ProcessReceiptError::boundary(
                 "PALS actual provider/runtime pin differs from receipt identity",
             ));
+        }
+        // Missing observations are allowed only by the failed-startup/failed
+        // termination paths. An observation that is actually present must
+        // always agree with the owner identity, even on those failure paths.
+        for mapping in native
+            .startup_probe
+            .as_ref()
+            .and_then(|probe| probe.runtime_loading_mapping.as_ref())
+            .into_iter()
+            .chain(native.final_runtime_loading_mapping.as_ref())
+        {
+            crate::pals_native::validate_runtime_loading_mapping(mapping, &native.execution)
+                .map_err(|_| {
+                    ProcessReceiptError::boundary(
+                        "PALS partial loading mapping differs from its pinned actual execution",
+                    )
+                })?;
         }
         if let Some(witness) = native
             .startup_probe
