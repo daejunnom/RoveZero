@@ -2,7 +2,9 @@
 //! 별도 타입으로 유지한다. 외부 cp/mate/depth/readyok는 Rules 증명이나 자체
 //! 평가 단위, 실제 옵션 적용의 증거로 승격하지 않는다.
 
-use crate::cpu::{CpuConfig, CpuError, CpuLimits, CpuReport, CpuResumeToken, CpuSearcher};
+use crate::cpu::{
+    CpuCapabilities, CpuConfig, CpuError, CpuLimits, CpuReport, CpuResumeToken, CpuSearcher,
+};
 use crate::cpu_value::{CpuTrainingState, CpuValueIdentity};
 use rz_position::{BoardMove, Color, Position};
 use serde::{Deserialize, Serialize};
@@ -238,7 +240,7 @@ pub enum ExternalCompletion {
     StoppedCanceled,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExternalCheckerReport {
     pub identity: ExternalCheckerIdentity,
     pub observed_uci: ExternalUciIdentity,
@@ -312,6 +314,12 @@ impl CheckerShutdown {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CheckerError {
     Owned(CpuError),
+    /// A physical own report was returned and then rejected by immutable
+    /// namespace validation. Its independent attempt work remains available;
+    /// this is distinct from an admission failure or an execution CpuError.
+    OwnedReportRejected {
+        reason: &'static str,
+    },
     Invalid(&'static str),
     Unsupported(&'static str),
     External {
@@ -323,6 +331,9 @@ impl std::fmt::Display for CheckerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Owned(error) => write!(f, "owned checker: {error}"),
+            Self::OwnedReportRejected { reason } => {
+                write!(f, "own returned report rejected: {reason}")
+            }
             Self::Invalid(detail) => write!(f, "checker admission: {detail}"),
             Self::Unsupported(detail) => write!(f, "checker unsupported: {detail}"),
             Self::External { stage, code } => write!(f, "external checker {stage}: {code}"),
@@ -337,6 +348,25 @@ pub trait CpuChecker: Send {
     fn identity(&self) -> &CheckerIdentity;
     fn conditions(&self) -> &str;
     fn capabilities(&self) -> CheckerCapabilities;
+    /// Admission-only immutable namespace check. This must not dispatch work,
+    /// reset an attempt ledger, transfer a resume token or count a cache visit.
+    fn validate_namespace(&self) -> Result<(), CheckerError> {
+        self.identity().validate()?;
+        if self.conditions().is_empty()
+            || self.conditions().len() > MAX_CONDITIONS_BYTES
+            || self.conditions().chars().any(char::is_control)
+        {
+            return Err(CheckerError::Invalid(
+                "checker conditions exceed finite bound",
+            ));
+        }
+        Ok(())
+    }
+    /// Only the own implementation can disclose its native configuration. A
+    /// foreign UCI declaration is never translated into an own search profile.
+    fn owned_descriptor(&self) -> Option<OwnedCheckerDescriptor> {
+        None
+    }
     fn last_attempt(&self) -> Option<&CheckerAttempt>;
     /// Start a new ledger scope even for unsupported/admission failures.
     /// Previous execution work is not this new attempt's actual work.
@@ -381,6 +411,14 @@ pub trait CpuChecker: Send {
     }
     fn new_game(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<(), CheckerError>;
     fn shutdown(&mut self, deadline: Instant) -> Result<CheckerShutdown, CheckerError>;
+}
+
+#[derive(Clone, Debug)]
+pub struct OwnedCheckerDescriptor {
+    pub config: CpuConfig,
+    pub search_identity: &'static str,
+    pub search_conditions: String,
+    pub capabilities: CpuCapabilities,
 }
 
 pub struct OwnedCpuChecker<C: CpuSearcher> {
@@ -455,6 +493,7 @@ impl<C: CpuSearcher> OwnedCpuChecker<C> {
             return Err(CheckerError::Invalid("owned identity changed type"));
         };
         let config = self.cpu.config();
+        let capabilities = self.cpu.capabilities();
         if self.cpu.value_identity() != identity
             || self.cpu.search_identity() != self.search_identity
             || self.cpu.search_conditions() != self.conditions
@@ -462,6 +501,13 @@ impl<C: CpuSearcher> OwnedCpuChecker<C> {
             || config.max_depth != self.config.max_depth
             || config.quiescence_ply != self.config.quiescence_ply
             || config.tt_entries != self.config.tt_entries
+            || capabilities.max_depth != self.capabilities.max_depth
+            || capabilities.max_prefix_plies != self.capabilities.max_prefix_plies
+            || capabilities.max_root_moves != self.capabilities.max_root_moves
+            || capabilities.root_moves != self.capabilities.root_moves
+            || capabilities.divergence != self.capabilities.divergence
+            || capabilities.completed_iteration_resume != self.capabilities.resume
+            || Some(capabilities.selective_reductions) != self.capabilities.selective_search
         {
             return Err(CheckerError::Invalid(
                 "frozen own value/search conditions changed",
@@ -488,7 +534,14 @@ impl<C: CpuSearcher> OwnedCpuChecker<C> {
             elapsed: started.elapsed(),
             external: None,
         });
-        self.validate_frozen()?;
+        if let Err(error) = self.validate_frozen() {
+            if result.is_ok() {
+                return Err(CheckerError::OwnedReportRejected {
+                    reason: "frozen own value/search conditions changed after returned report",
+                });
+            }
+            return Err(error);
+        }
         let report = result.map_err(CheckerError::Owned)?;
         let CheckerIdentity::Owned(identity) = &self.identity else {
             return Err(CheckerError::Invalid("owned identity changed type"));
@@ -497,9 +550,9 @@ impl<C: CpuSearcher> OwnedCpuChecker<C> {
             || report.search_version != self.search_identity
             || report.profile != self.config.profile
         {
-            return Err(CheckerError::Invalid(
-                "own report namespace differs from frozen checker",
-            ));
+            return Err(CheckerError::OwnedReportRejected {
+                reason: "own report namespace differs from frozen checker",
+            });
         }
         Ok(CheckerReport::Owned(report))
     }
@@ -514,6 +567,17 @@ impl<C: CpuSearcher> CpuChecker for OwnedCpuChecker<C> {
     }
     fn capabilities(&self) -> CheckerCapabilities {
         self.capabilities
+    }
+    fn validate_namespace(&self) -> Result<(), CheckerError> {
+        self.validate_frozen()
+    }
+    fn owned_descriptor(&self) -> Option<OwnedCheckerDescriptor> {
+        Some(OwnedCheckerDescriptor {
+            config: self.cpu.config().clone(),
+            search_identity: self.cpu.search_identity(),
+            search_conditions: self.cpu.search_conditions(),
+            capabilities: self.cpu.capabilities(),
+        })
     }
     fn last_attempt(&self) -> Option<&CheckerAttempt> {
         self.last_attempt.as_ref()
@@ -656,6 +720,14 @@ mod tests {
             })
             .unwrap(),
         );
+        let descriptor = checker.owned_descriptor().unwrap();
+        assert_eq!(descriptor.config.tt_entries, 0);
+        assert_eq!(descriptor.search_conditions, checker.conditions());
+        assert_eq!(
+            descriptor.capabilities.max_depth,
+            checker.capabilities().max_depth
+        );
+        assert_eq!(descriptor.search_identity, crate::cpu::CPU_SEARCH_VERSION);
         assert!(
             checker
                 .analyze(

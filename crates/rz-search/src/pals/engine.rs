@@ -5,12 +5,21 @@ use super::store::{
     PalsStores, RawScore, SituationId, StateId, StoreError, StoreLimits, TaskAdmission,
     TaskConsumer, TaskKey, TaskQuestion,
 };
+use super::value::MODEL_WDL_RESOLVER_VERSION;
+pub use super::value::{
+    MODEL_WDL_VALUE_SEMANTICS, ModelValueIdentity, ModelValueOutput, PalsResolvedValue,
+};
 use crate::cpu::{
     CPU_MATE_SCORE, CpuEngine, CpuError, CpuLimits, CpuReport, CpuResumeToken, CpuScoreScope,
     CpuSearcher,
 };
+use crate::cpu_checker::{
+    CheckerAttempt, CheckerError, CheckerIdentity, CheckerReport, CheckerShutdown, CpuChecker,
+    ExternalCheckerReport, ExternalCompletion, OwnedCheckerDescriptor, OwnedCpuChecker,
+};
 use crate::cpu_value::CpuValueIdentity;
 use rz_position::{BoardMove, Color, PlayStatus, Position, PositionError, TerminalReason};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -208,6 +217,17 @@ impl std::error::Error for RoleError {}
 /// logical cancellation alone never permits buffer/session reuse.
 pub trait RoleModel: Send {
     fn identity(&self) -> &str;
+    /// Separate frontier WDL namespace. Own CPU mode does not require this API.
+    /// The provider returns the key from its actual prepared input, rather than
+    /// a board-only/public-memory key or a digest reconstructed after inference.
+    fn value_identity(&self) -> Option<&ModelValueIdentity> {
+        None
+    }
+    /// Uses the Proposer forward's shared WDL; candidate policy is not consumed.
+    /// This estimate cannot calibrate foreign CP/mate or certify Rules facts.
+    fn evaluate_value(&mut self, _query: RoleQuery<'_>) -> Result<ModelValueOutput, RoleError> {
+        Err(RoleError::Unavailable)
+    }
     fn propose(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError>;
     fn reply(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError>;
     fn repair(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError>;
@@ -226,6 +246,12 @@ pub trait RoleModel: Send {
 impl<M: RoleModel + ?Sized> RoleModel for Box<M> {
     fn identity(&self) -> &str {
         (**self).identity()
+    }
+    fn value_identity(&self) -> Option<&ModelValueIdentity> {
+        (**self).value_identity()
+    }
+    fn evaluate_value(&mut self, query: RoleQuery<'_>) -> Result<ModelValueOutput, RoleError> {
+        (**self).evaluate_value(query)
     }
     fn propose(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
         (**self).propose(query)
@@ -265,6 +291,49 @@ impl LegalOrderRoleMock {
 impl RoleModel for LegalOrderRoleMock {
     fn identity(&self) -> &str {
         "explicit-legal-order-role-mock-v1"
+    }
+    fn value_identity(&self) -> Option<&ModelValueIdentity> {
+        static IDENTITY: std::sync::OnceLock<ModelValueIdentity> = std::sync::OnceLock::new();
+        Some(IDENTITY.get_or_init(|| ModelValueIdentity {
+            semantics: MODEL_WDL_VALUE_SEMANTICS.into(),
+            model: "explicit-legal-order-role-mock-v1".into(),
+            encoding: "explicit-mock-full-history-role-query-v1".into(),
+            precision: "fp32".into(),
+            model_epoch: [0; 32],
+        }))
+    }
+    fn evaluate_value(&mut self, query: RoleQuery<'_>) -> Result<ModelValueOutput, RoleError> {
+        query.check_control()?;
+        // This explicitly selected fixture defines its own prepared input. It
+        // is neither an LC0 tensor key nor a learned/native model evaluation.
+        let mut prepared = Sha256::new();
+        prepared.update(b"explicit-mock-full-history-role-query-v1\0");
+        for fen in query.position.snapshot().known_history_fens() {
+            prepared.update((fen.len() as u64).to_le_bytes());
+            prepared.update(fen.as_bytes());
+        }
+        prepared.update(
+            format!(
+                "{:?};{:?};{:?};{:?};{:?};{};{:?}",
+                query.legal,
+                query.prefix,
+                query.proposal,
+                query.counterexample,
+                query.records,
+                query.revision,
+                query.deadline
+            )
+            .as_bytes(),
+        );
+        let output = ModelValueOutput {
+            identity: self.value_identity().ok_or(RoleError::Unavailable)?.clone(),
+            input_sha256: prepared.finalize().into(),
+            state: query.position.position_identity(),
+            perspective: query.position.side_to_move(),
+            wdl: [0.25, 0.5, 0.25],
+        };
+        query.check_control()?;
+        Ok(output)
     }
     fn propose(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
         Self::evaluate(query)
@@ -310,6 +379,19 @@ pub struct PalsCounters {
     pub accepted_proposer_outputs: u64,
     pub accepted_critic_outputs: u64,
     pub accepted_repair_outputs: u64,
+    /// Shared Proposer WDL calls are separate from proposal policy calls.
+    pub value_calls: u64,
+    pub completed_value_calls: u64,
+    pub accepted_value_outputs: u64,
+    /// Foreign work is reported separately: None/omission never means zero.
+    pub external_checker_tasks: u64,
+    pub external_checker_reports: u64,
+    pub external_checker_nodes_observed: u64,
+    pub external_checker_work_incomplete: bool,
+    /// Finite admission budget charged once per external request, distinct from
+    /// observed nodes; nodes limits in UCI do not guarantee physical hard caps.
+    pub external_checker_node_budget_reserved: u64,
+    pub consumed_external_checker_tasks: u64,
     /// CPU API calls started, including calls which return CpuError.
     pub cpu_tasks_requested: u64,
     /// Physical CPU reports returned; not a requested-coverage completion count.
@@ -365,6 +447,7 @@ pub enum PalsValueScope {
 pub struct PalsRootValue {
     pub movement: BoardMove,
     pub score: Option<i32>,
+    pub resolved_value: PalsResolvedValue,
     pub scope: PalsValueScope,
     pub examined_replies: usize,
     /// None means the child was not materialized/examined, not zero replies.
@@ -374,6 +457,10 @@ pub struct PalsRootValue {
 pub struct PalsResult {
     pub best_move: Option<BoardMove>,
     pub score: Option<i32>,
+    /// Model WDL stays typed and never uses the own raw integer score field.
+    pub resolved_value: PalsResolvedValue,
+    pub model_value_identity: Option<ModelValueIdentity>,
+    pub checker_identity: CheckerIdentity,
     pub value_scope: PalsValueScope,
     pub terminal: Option<TerminalReason>,
     pub completion: PalsCompletion,
@@ -391,6 +478,7 @@ pub enum PalsError {
     InvalidLimits,
     Rules(PositionError),
     Cpu(CpuError),
+    Checker(CheckerError),
     Role(RoleError),
     Store(StoreError),
     Capacity,
@@ -410,6 +498,17 @@ impl From<PositionError> for PalsError {
 impl From<CpuError> for PalsError {
     fn from(e: CpuError) -> Self {
         Self::Cpu(e)
+    }
+}
+impl From<CheckerError> for PalsError {
+    fn from(error: CheckerError) -> Self {
+        match error {
+            CheckerError::Owned(error) => Self::Cpu(error),
+            CheckerError::OwnedReportRejected { reason } => {
+                Self::Store(StoreError::InvalidEvidence(reason))
+            }
+            error => Self::Checker(error),
+        }
     }
 }
 impl From<RoleError> for PalsError {
@@ -439,6 +538,7 @@ struct Node {
     terminal: Option<(TerminalReason, i32)>,
     edges: Vec<Edge>,
     evidence: Option<CpuEvidence>,
+    model_value: Option<ModelValueOutput>,
     resume: Option<CpuResumeToken>,
 }
 #[derive(Clone, Debug)]
@@ -468,9 +568,14 @@ enum Call {
 pub struct PalsEngine<M: RoleModel> {
     config: PalsConfig,
     model: M,
-    cpu: Box<dyn CpuSearcher>,
-    cpu_registered_value: CpuValueIdentity,
+    cpu: Box<dyn CpuChecker>,
+    checker_registered_identity: CheckerIdentity,
+    cpu_registered_value: Option<CpuValueIdentity>,
+    model_registered_value: Option<ModelValueIdentity>,
     cpu_registered_condition: String,
+    checker_new_game_pending: bool,
+    last_external_attempt: Option<u64>,
+    external_attempts: Vec<CheckerAttempt>,
     nodes: Vec<Node>,
     records: Vec<RoleRecord>,
     revision: u64,
@@ -495,8 +600,25 @@ impl<M: RoleModel> PalsEngine<M> {
         model: M,
         cpu: Box<dyn CpuSearcher>,
     ) -> Result<Self, PalsError> {
+        Self::new_with_boxed_checker(config, model, Box::new(OwnedCpuChecker::new(cpu)?))
+    }
+    /// Startup-selected helper, independent of the arena opponent. Foreign raw
+    /// scores remain observations; its checked PV expands the candidate graph
+    /// whose frontier is evaluated in the model's separately registered WDL.
+    pub fn new_with_checker<C: CpuChecker + 'static>(
+        config: PalsConfig,
+        model: M,
+        checker: C,
+    ) -> Result<Self, PalsError> {
+        Self::new_with_boxed_checker(config, model, Box::new(checker))
+    }
+    pub fn new_with_boxed_checker(
+        config: PalsConfig,
+        model: M,
+        cpu: Box<dyn CpuChecker>,
+    ) -> Result<Self, PalsError> {
         config.validate()?;
-        cpu.value_identity().validate().map_err(CpuError::Value)?;
+        cpu.identity().validate()?;
         let capabilities = cpu.capabilities();
         if !capabilities.divergence || !capabilities.root_moves {
             return Err(CpuError::Unsupported(
@@ -505,17 +627,56 @@ impl<M: RoleModel> PalsEngine<M> {
             .into());
         }
         if capabilities.max_depth == 0
-            || cpu.config().max_depth == 0
-            || cpu.config().max_depth > 64
-            || cpu.config().quiescence_ply > 32
-            || capabilities.max_depth < cpu.config().max_depth
+            || capabilities.max_depth > 64
             || capabilities.max_prefix_plies < config.line_plies.saturating_sub(1)
             || capabilities.max_root_moves < 256
-            || cpu.search_identity().is_empty()
+            || cpu.conditions().is_empty()
+            || cpu.conditions().len()
+                > if matches!(cpu.identity(), CheckerIdentity::ExternalUci(_)) {
+                    8192
+                } else {
+                    2048
+                }
+            || cpu.conditions().chars().any(char::is_control)
         {
             return Err(CpuError::Unsupported("PALS CPU bounded search capabilities").into());
         }
-        let cpu_registered_value = cpu.value_identity().clone();
+        let (cpu_registered_value, model_registered_value) = match cpu.identity() {
+            CheckerIdentity::Owned(identity) => {
+                let descriptor = cpu
+                    .owned_descriptor()
+                    .ok_or(CheckerError::Invalid("owned configuration missing"))?;
+                if descriptor.config.max_depth == 0
+                    || descriptor.config.max_depth > 64
+                    || descriptor.config.quiescence_ply > 32
+                    || capabilities.max_depth < descriptor.config.max_depth
+                    || descriptor.search_identity.is_empty()
+                {
+                    return Err(CpuError::Unsupported("PALS own CPU configuration").into());
+                }
+                (Some(identity.clone()), None)
+            }
+            CheckerIdentity::ExternalUci(_) => {
+                if cpu.owned_descriptor().is_some() || capabilities.resume {
+                    return Err(CheckerError::Invalid(
+                        "foreign helper cannot disclose own/resume semantics",
+                    )
+                    .into());
+                }
+                let identity = model
+                    .value_identity()
+                    .ok_or(RoleError::Unavailable)?
+                    .clone();
+                identity.validate()?;
+                if identity.model != model.identity()
+                    || identity.semantics != MODEL_WDL_VALUE_SEMANTICS
+                {
+                    return Err(RoleError::InvalidOutput.into());
+                }
+                (None, Some(identity))
+            }
+        };
+        let checker_registered_identity = cpu.identity().clone();
         let cpu_registered_condition = Self::cpu_condition_for(cpu.as_ref());
         let mut nodes = Vec::new();
         nodes
@@ -530,8 +691,13 @@ impl<M: RoleModel> PalsEngine<M> {
             config,
             model,
             cpu,
+            checker_registered_identity,
             cpu_registered_value,
+            model_registered_value,
             cpu_registered_condition,
+            checker_new_game_pending: false,
+            last_external_attempt: None,
+            external_attempts: Vec::new(),
             nodes,
             records,
             revision: 0,
@@ -544,12 +710,88 @@ impl<M: RoleModel> PalsEngine<M> {
     pub fn new_game(&mut self) {
         self.nodes.clear();
         self.records.clear();
-        self.cpu.clear();
+        // Preserve the old synchronous own clear. A foreign reset can fail and
+        // needs caller controls; defer it to search or explicit try_new_game.
+        if self.is_external() {
+            self.checker_new_game_pending = true;
+        } else {
+            let never_cancel = AtomicBool::new(false);
+            self.checker_new_game_pending = self
+                .cpu
+                .new_game(Instant::now() + Duration::from_secs(1), &never_cancel)
+                .is_err();
+        }
         self.model.new_game();
         self.revision = 0;
         self.stores = PalsStores::new(Self::store_limits(&self.config));
         self.consumer_id = 0;
         self.last_search_counters = None;
+        self.external_attempts.clear();
+        self.last_external_attempt = None;
+    }
+    pub fn try_new_game(
+        &mut self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), PalsError> {
+        self.new_game();
+        if self.checker_new_game_pending {
+            self.cpu.new_game(deadline, cancel)?;
+        }
+        self.checker_new_game_pending = false;
+        self.last_external_attempt = None;
+        Ok(())
+    }
+    pub fn shutdown_checker(&mut self, deadline: Instant) -> Result<CheckerShutdown, PalsError> {
+        Ok(self.cpu.shutdown(deadline)?)
+    }
+    pub fn checker_identity(&self) -> &CheckerIdentity {
+        &self.checker_registered_identity
+    }
+    /// Actual foreign attempt/process evidence, including failed/partial work.
+    /// Bounded per search; raw foreign scores do not enter the own resolver.
+    pub fn checker_attempts(&self) -> &[CheckerAttempt] {
+        &self.external_attempts
+    }
+    fn is_external(&self) -> bool {
+        matches!(
+            self.checker_registered_identity,
+            CheckerIdentity::ExternalUci(_)
+        )
+    }
+    fn owned_descriptor(&self) -> Result<OwnedCheckerDescriptor, PalsError> {
+        self.cpu
+            .owned_descriptor()
+            .ok_or(CheckerError::Invalid("own CPU-only operation on foreign helper").into())
+    }
+    fn owned_identity(&self) -> Result<&CpuValueIdentity, PalsError> {
+        match self.cpu.identity() {
+            CheckerIdentity::Owned(identity) => Ok(identity),
+            CheckerIdentity::ExternalUci(_) => {
+                Err(CheckerError::Invalid("foreign helper has no own score identity").into())
+            }
+        }
+    }
+    fn validate_checker_namespace(&self) -> Result<(), PalsError> {
+        self.cpu.validate_namespace().map_err(|error| match error {
+            CheckerError::Invalid(reason) => StoreError::InvalidConditions(reason).into(),
+            error => error.into(),
+        })
+    }
+    fn own_report(report: CheckerReport) -> Result<CpuReport, PalsError> {
+        match report {
+            CheckerReport::Owned(report) => Ok(report),
+            CheckerReport::ExternalUci(_) => {
+                Err(CheckerError::Invalid("foreign report delivered to own resolver").into())
+            }
+        }
+    }
+    fn resolver_version(&self) -> &'static str {
+        if self.is_external() {
+            MODEL_WDL_RESOLVER_VERSION
+        } else {
+            PALS_VALUE_RESOLVER_VERSION
+        }
     }
     pub fn retained_situations(&self) -> usize {
         self.nodes.len()
@@ -605,6 +847,12 @@ impl<M: RoleModel> PalsEngine<M> {
         progress: F,
     ) -> Result<PalsResult, PalsError> {
         let mut counters = PalsCounters::default();
+        self.external_attempts.clear();
+        // Actual prepared RoleQuery includes records, revision and deadline.
+        // Previous-search WDL is not an exact-input cache hit in this context.
+        for node in &mut self.nodes {
+            node.model_value = None;
+        }
         let result = self.search_inner(position, limits, cancel, progress, &mut counters);
         if let Ok(report) = &result {
             counters = report.counters;
@@ -633,8 +881,11 @@ impl<M: RoleModel> PalsEngine<M> {
         mut progress: F,
         counters: &mut PalsCounters,
     ) -> Result<PalsResult, PalsError> {
-        if self.cpu.value_identity() != &self.cpu_registered_value
+        self.validate_checker_namespace()?;
+        if self.cpu.identity() != &self.checker_registered_identity
             || self.cpu_condition() != self.cpu_registered_condition
+            || (self.is_external()
+                && self.model.value_identity() != self.model_registered_value.as_ref())
         {
             return Err(StoreError::InvalidConditions(
                 "startup-selected CPU search/value identity changed",
@@ -644,10 +895,14 @@ impl<M: RoleModel> PalsEngine<M> {
         if limits.max_rounds == 0
             || limits.max_cpu_nodes == 0
             || limits.cpu_depth == 0
-            || limits.cpu_depth > self.cpu.config().max_depth
             || limits.cpu_depth > self.cpu.capabilities().max_depth
         {
             return Err(PalsError::InvalidLimits);
+        }
+        if self.checker_new_game_pending {
+            self.cpu.new_game(limits.deadline, cancel)?;
+            self.checker_new_game_pending = false;
+            self.last_external_attempt = None;
         }
         let started = Instant::now();
         match self.stores.focus_actual_moves(position.snapshot()) {
@@ -667,7 +922,14 @@ impl<M: RoleModel> PalsEngine<M> {
             counters.root_scope_observation_complete = true;
             return Ok(PalsResult {
                 best_move: None,
-                score: Some(value),
+                score: if self.is_external() {
+                    None
+                } else {
+                    Some(value)
+                },
+                resolved_value: self.rules_value(root),
+                model_value_identity: self.model_registered_value.clone(),
+                checker_identity: self.checker_registered_identity.clone(),
                 value_scope: PalsValueScope::RulesTerminal,
                 terminal: Some(reason),
                 completion: PalsCompletion::Terminal,
@@ -675,7 +937,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 root_values: Vec::new(),
                 elapsed: started.elapsed(),
                 model_identity: self.model.identity().to_owned(),
-                resolver_version: PALS_VALUE_RESOLVER_VERSION,
+                resolver_version: self.resolver_version(),
             });
         }
         // Check every immediate legal child for actual Rules terminal evidence.
@@ -721,7 +983,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 completion = stop;
                 break;
             }
-            if counters.cpu_nodes >= limits.max_cpu_nodes {
+            if self.cpu_budget_used(counters) >= limits.max_cpu_nodes {
                 completion = PalsCompletion::CpuNodeLimit;
                 break;
             }
@@ -750,6 +1012,9 @@ impl<M: RoleModel> PalsEngine<M> {
                 }
                 Err(error) => return Err(error),
             }
+        }
+        if self.is_external() {
+            return self.model_result(root, &legal, completion, started, counters);
         }
         let mut root_values = Vec::with_capacity(legal.len());
         let mut best = legal.first().copied();
@@ -799,6 +1064,12 @@ impl<M: RoleModel> PalsEngine<M> {
             root_values.push(PalsRootValue {
                 movement,
                 score: value,
+                resolved_value: value.map_or(PalsResolvedValue::Unknown, |value| {
+                    PalsResolvedValue::OwnedRaw {
+                        value,
+                        perspective: position.side_to_move(),
+                    }
+                }),
                 scope: child_scope,
                 examined_replies: examined,
                 unexplored_replies: unexplored,
@@ -809,6 +1080,14 @@ impl<M: RoleModel> PalsEngine<M> {
         Ok(PalsResult {
             best_move: best,
             score,
+            resolved_value: score.map_or(PalsResolvedValue::Unknown, |value| {
+                PalsResolvedValue::OwnedRaw {
+                    value,
+                    perspective: position.side_to_move(),
+                }
+            }),
+            model_value_identity: self.model_registered_value.clone(),
+            checker_identity: self.checker_registered_identity.clone(),
             value_scope: scope,
             terminal: None,
             completion,
@@ -816,7 +1095,7 @@ impl<M: RoleModel> PalsEngine<M> {
             root_values,
             elapsed: started.elapsed(),
             model_identity: self.model.identity().to_owned(),
-            resolver_version: PALS_VALUE_RESOLVER_VERSION,
+            resolver_version: self.resolver_version(),
         })
     }
 
@@ -852,7 +1131,20 @@ impl<M: RoleModel> PalsEngine<M> {
             } else {
                 None
             },
-            score: terminal.map(|(_, score)| score),
+            score: if self.is_external() {
+                None
+            } else {
+                terminal.map(|(_, score)| score)
+            },
+            resolved_value: match classification.play_status {
+                PlayStatus::Terminal { winner, .. } => PalsResolvedValue::RulesTerminal {
+                    winner,
+                    perspective: position.side_to_move(),
+                },
+                PlayStatus::Ongoing => PalsResolvedValue::Unknown,
+            },
+            model_value_identity: self.model_registered_value.clone(),
+            checker_identity: self.checker_registered_identity.clone(),
             value_scope: if terminal.is_some() {
                 PalsValueScope::RulesTerminal
             } else {
@@ -883,6 +1175,7 @@ impl<M: RoleModel> PalsEngine<M> {
                     .map(|movement| PalsRootValue {
                         movement,
                         score: None,
+                        resolved_value: PalsResolvedValue::Unknown,
                         scope: PalsValueScope::Unknown,
                         examined_replies: 0,
                         unexplored_replies: None,
@@ -891,7 +1184,7 @@ impl<M: RoleModel> PalsEngine<M> {
             },
             elapsed: started.elapsed(),
             model_identity: self.model.identity().to_owned(),
-            resolver_version: PALS_VALUE_RESOLVER_VERSION,
+            resolver_version: self.resolver_version(),
         })
     }
     fn intern(&mut self, position: Position) -> Result<usize, PalsError> {
@@ -938,6 +1231,7 @@ impl<M: RoleModel> PalsEngine<M> {
             terminal,
             edges: Vec::new(),
             evidence: None,
+            model_value: None,
             resume: None,
         });
         Ok(self.nodes.len() - 1)
@@ -1080,10 +1374,27 @@ impl<M: RoleModel> PalsEngine<M> {
         if self.stopped(limits, cancel).is_some() {
             return Ok(());
         }
+        self.validate_checker_namespace()?;
+        if self.is_external() {
+            let root_state = self
+                .stores
+                .situations
+                .get(self.stores.root().ok_or(StoreError::StaleConsumer)?)?
+                .state;
+            let root = self
+                .nodes
+                .iter()
+                .position(|candidate| candidate.state == root_state)
+                .ok_or(StoreError::StaleConsumer)?;
+            // The foreign leaf analysis is retained as raw evidence. Its CP or
+            // mate report never supplies the frontier value consumed below.
+            self.external_request(root, node, line, None, true, limits, cancel, counters)?;
+            return self.evaluate_model_value(node, line, limits, cancel, counters);
+        }
         if self.nodes[node].evidence.as_ref().is_some_and(|e| {
             e.depth >= limits.cpu_depth
                 && e.scope == CpuScoreScope::CompletedIteration
-                && &e.value_identity == self.cpu.value_identity()
+                && Some(&e.value_identity) == self.cpu_registered_value.as_ref()
         }) {
             counters.evidence_cache_hits += 1;
             counters.consumed_cached_cpu_values += 1;
@@ -1094,13 +1405,13 @@ impl<M: RoleModel> PalsEngine<M> {
             return Ok(());
         }
         let task_nodes = remaining.min(self.config.cpu_nodes_per_task);
-        let profile = stable_id(self.cpu.config().profile.identity());
-        let value_identity = self.cpu.value_identity().clone();
+        let descriptor = self.owned_descriptor()?;
+        let profile = stable_id(descriptor.config.profile.identity());
+        let value_identity = self.owned_identity()?.clone();
         let cpu_condition = self.cpu_condition();
         let condition = stable_id(&format!(
             "{};q={}",
-            self.cpu.search_identity(),
-            self.cpu.config().quiescence_ply
+            descriptor.search_identity, descriptor.config.quiescence_ply
         ));
         self.consumer_id = self.consumer_id.checked_add(1).ok_or(PalsError::Capacity)?;
         let consumer_id = self.consumer_id;
@@ -1122,6 +1433,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 question: TaskQuestion::AnalyzePosition,
                 root_moves: Vec::new(),
                 value_identity: Some(value_identity.clone()),
+                checker_identity: None,
                 cpu_condition: Some(cpu_condition.clone()),
                 model: 0,
                 epoch: 0,
@@ -1167,7 +1479,7 @@ impl<M: RoleModel> PalsEngine<M> {
                             score: value,
                             depth,
                             scope: CpuScoreScope::CompletedIteration,
-                            value_identity: self.cpu.value_identity().clone(),
+                            value_identity: self.owned_identity()?.clone(),
                         });
                         counters.evidence_cache_hits += 1;
                         counters.consumed_cpu_tasks += 1;
@@ -1185,7 +1497,7 @@ impl<M: RoleModel> PalsEngine<M> {
             } => {
                 if checkpoint != node as u64
                     || self.nodes[node].resume.is_none()
-                    || !self.cpu.capabilities().completed_iteration_resume
+                    || !self.cpu.capabilities().resume
                 {
                     return Err(
                         StoreError::InvalidConditions("CPU checkpoint owner mismatch").into(),
@@ -1220,8 +1532,18 @@ impl<M: RoleModel> PalsEngine<M> {
             self.cpu
                 .analyze(&self.nodes[node].position, cpu_limits, cancel)
         } {
-            Ok(report) => report,
+            Ok(report) => match Self::own_report(report) {
+                Ok(report) => report,
+                Err(error) => {
+                    self.observe_cpu_failure(counters, task_nodes);
+                    self.stores.tasks.fail(execution)?;
+                    return Err(error);
+                }
+            },
             Err(error) => {
+                if matches!(error, CheckerError::OwnedReportRejected { .. }) {
+                    counters.cpu_tasks += 1;
+                }
                 self.observe_cpu_failure(counters, task_nodes);
                 self.stores.tasks.fail(execution)?;
                 return Err(error.into());
@@ -1266,6 +1588,11 @@ impl<M: RoleModel> PalsEngine<M> {
                 }
             },
             value_identity: Some(report.value_identity.clone()),
+            checker_identity: None,
+            checker_work: None,
+            external_report: None,
+            model_value_identity: None,
+            model_value_input: None,
             cpu_condition: Some(cpu_condition.clone()),
             cpu_pv: None,
             budget: report.nodes,
@@ -1347,20 +1674,575 @@ impl<M: RoleModel> PalsEngine<M> {
         Ok(())
     }
 
+    fn cpu_budget_used(&self, counters: &PalsCounters) -> u64 {
+        if self.is_external() {
+            counters.external_checker_node_budget_reserved
+        } else {
+            counters.cpu_nodes
+        }
+    }
+
+    fn evaluate_model_value(
+        &mut self,
+        node: usize,
+        line: &[BoardMove],
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        counters: &mut PalsCounters,
+    ) -> Result<(), PalsError> {
+        if self.nodes[node].terminal.is_some() || self.stopped(limits, cancel).is_some() {
+            return Ok(());
+        }
+        if counters.role_calls >= self.config.max_role_calls {
+            return Err(PalsError::RoleCallLimit);
+        }
+        let identity = self
+            .model_registered_value
+            .as_ref()
+            .ok_or(RoleError::Unavailable)?
+            .clone();
+        if self.model.value_identity() != Some(&identity) {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        let legal = self.nodes[node].position.legal_moves();
+        if legal.len() > 256 {
+            return Err(PalsError::Capacity);
+        }
+        let query = RoleQuery {
+            position: &self.nodes[node].position,
+            legal: &legal,
+            prefix: line,
+            proposal: line,
+            counterexample: None,
+            records: &self.records,
+            revision: self.revision,
+            deadline: limits.deadline,
+            cancel,
+        };
+        query.check_control()?;
+        counters.role_calls += 1;
+        counters.value_calls += 1;
+        let output = self.model.evaluate_value(query)?;
+        output.validate(&self.nodes[node].position, &identity)?;
+        counters.completed_value_calls += 1;
+        // Keep the full actual input identity; numeric scope IDs are metadata.
+        // No exact-input cache reuse is granted by a model namespace or board.
+        let observation = self.stores.append_observation(Observation {
+            state: self.nodes[node].state,
+            line: None,
+            source: stable_id(&identity.semantics),
+            epoch: 0,
+            value_identity: None,
+            checker_identity: None,
+            checker_work: None,
+            external_report: None,
+            model_value_identity: Some(identity.clone()),
+            model_value_input: Some(output.input_sha256),
+            cpu_condition: None,
+            cpu_pv: None,
+            scope: EvidenceScope::Model {
+                model: stable_id(&identity.model),
+                encoding: stable_id(&identity.encoding),
+                input: u64::from_le_bytes(
+                    output.input_sha256[..8]
+                        .try_into()
+                        .map_err(|_| RoleError::InvalidOutput)?,
+                ),
+            },
+            score: RawScore::Wdl {
+                win: output.wdl[0],
+                draw: output.wdl[1],
+                loss: output.wdl[2],
+                perspective: output.perspective,
+            },
+            budget: 1,
+            kind: ObservationKind::Proposal,
+            supersedes: None,
+            execution: None,
+        })?;
+        if cancel.load(Ordering::Acquire) {
+            return Err(RoleError::Canceled.into());
+        }
+        if Instant::now() >= limits.deadline {
+            return Err(RoleError::Deadline.into());
+        }
+        self.stores
+            .dependencies
+            .add(observation, self.nodes[node].situation)?;
+        if let Some(root) = self.stores.root() {
+            self.stores.dependencies.add(observation, root)?;
+        }
+        // Acknowledgement occurs only after successful publication/dependency
+        // admission and final controls; failed/late outputs are not consumed.
+        if cancel.load(Ordering::Acquire) {
+            return Err(RoleError::Canceled.into());
+        }
+        if Instant::now() >= limits.deadline {
+            return Err(RoleError::Deadline.into());
+        }
+        self.model.accepted_output();
+        counters.consumed_role_outputs += 1;
+        counters.accepted_value_outputs += 1;
+        self.nodes[node].model_value = Some(output);
+        Ok(())
+    }
+
+    fn validate_external_report(
+        &self,
+        position: &Position,
+        report: &ExternalCheckerReport,
+        alternatives: Option<&[BoardMove]>,
+        limits: CpuLimits,
+    ) -> Result<(), PalsError> {
+        report.identity.validate()?;
+        if self.cpu.identity() != &self.checker_registered_identity
+            || self.checker_registered_identity
+                != CheckerIdentity::ExternalUci(report.identity.clone())
+            || self.cpu.conditions() != self.cpu_registered_condition
+            || report.perspective != position.side_to_move()
+            || report.requested_depth != limits.max_depth
+            || report.root_restricted != alternatives.is_some()
+            || report.pv.len() > 256
+            || report.pv.capacity() > 256
+            || report
+                .work
+                .nodes
+                .is_some_and(|nodes| nodes > limits.max_nodes)
+            || (report.best_move.is_some() && report.best_move != report.pv.first().copied())
+            || (report.completion == ExternalCompletion::BestMove && report.best_move.is_none())
+            || alternatives.is_some_and(|moves| {
+                report
+                    .best_move
+                    .is_some_and(|movement| !moves.contains(&movement))
+            })
+            || report.wdl_per_mille.is_some_and(|wdl| {
+                wdl.into_iter().any(|value| value > 1000)
+                    || wdl.into_iter().map(u32::from).sum::<u32>() != 1000
+            })
+        {
+            return Err(StoreError::InvalidEvidence(
+                "foreign helper report differs from immutable request",
+            )
+            .into());
+        }
+        let mut checked = position.clone();
+        for movement in &report.pv {
+            let legal = checked.ordered_legal_moves();
+            if !matches!(checked.play_status_from_view(&legal)?, PlayStatus::Ongoing) {
+                return Err(StoreError::InvalidEvidence(
+                    "foreign PV continues after Rules terminal",
+                )
+                .into());
+            }
+            checked.make_from_view(&legal, *movement)?;
+        }
+        Ok(())
+    }
+
+    /// Capture one physical foreign request once. Budget reservations and actual
+    /// reported nodes are different quantities, including on node overshoot.
+    fn observe_external_attempt(&mut self, counters: &mut PalsCounters) -> Result<(), PalsError> {
+        let Some(attempt) = self.cpu.last_attempt() else {
+            counters.external_checker_work_incomplete = true;
+            return Ok(());
+        };
+        let Some(evidence) = &attempt.external else {
+            counters.external_checker_work_incomplete = true;
+            return Err(CheckerError::Invalid("foreign attempt has own ledger").into());
+        };
+        if self
+            .last_external_attempt
+            .is_some_and(|prior| evidence.request_id <= prior)
+        {
+            return Err(CheckerError::Invalid("foreign physical request ID was reused").into());
+        }
+        self.last_external_attempt = Some(evidence.request_id);
+        if let Some(nodes) = attempt.work.nodes {
+            counters.external_checker_nodes_observed = counters
+                .external_checker_nodes_observed
+                .checked_add(nodes)
+                .ok_or(PalsError::Capacity)?;
+        }
+        if attempt.work.nodes.is_none()
+            || attempt.work.qnodes.is_none()
+            || attempt.work.tt_hits.is_none()
+        {
+            counters.external_checker_work_incomplete = true;
+        }
+        // Bound an arbitrary injected checker before cloning retained payload.
+        if let Some(report) = &evidence.partial_report {
+            report.identity.validate()?;
+            if report.pv.len() > 256
+                || report.pv.capacity() > 256
+                || report.observed_uci.name.len() > 256
+                || report.observed_uci.name.capacity() > 256
+                || report
+                    .observed_uci
+                    .author
+                    .as_ref()
+                    .is_some_and(|author| author.len() > 256 || author.capacity() > 256)
+            {
+                return Err(CheckerError::Invalid("unbounded retained foreign attempt").into());
+            }
+        }
+        if self.external_attempts.len() >= self.config.max_records {
+            return Err(PalsError::Capacity);
+        }
+        self.external_attempts.push(attempt.clone());
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn external_candidate(
+        &mut self,
+        root: usize,
+        divergence: usize,
+        prefix: &[BoardMove],
+        alternatives: Option<&[BoardMove]>,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        counters: &mut PalsCounters,
+    ) -> Result<Option<CpuCandidate>, PalsError> {
+        self.external_request(
+            root,
+            divergence,
+            prefix,
+            alternatives,
+            false,
+            limits,
+            cancel,
+            counters,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn external_request(
+        &mut self,
+        root: usize,
+        divergence: usize,
+        prefix: &[BoardMove],
+        alternatives: Option<&[BoardMove]>,
+        verification: bool,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        counters: &mut PalsCounters,
+    ) -> Result<Option<CpuCandidate>, PalsError> {
+        if self.stopped(limits, cancel).is_some()
+            || self.nodes[divergence].terminal.is_some()
+            || alternatives.is_some_and(|moves| moves.is_empty())
+        {
+            return Ok(None);
+        }
+        self.validate_checker_namespace()?;
+        if self.external_attempts.len() >= self.config.max_records {
+            return Err(PalsError::Capacity);
+        }
+        let remaining = limits
+            .max_cpu_nodes
+            .saturating_sub(self.cpu_budget_used(counters));
+        if remaining == 0 {
+            return Ok(None);
+        }
+        let task_nodes = remaining.min(self.config.cpu_nodes_per_task);
+        let generation = self.stores.generation();
+        let active_root = self.stores.root().ok_or(StoreError::StaleConsumer)?;
+        let root_revision = self.stores.situations.get(active_root)?.revision;
+        let identity = self.checker_registered_identity.clone();
+        let question = if verification {
+            TaskQuestion::AnalyzePosition
+        } else if alternatives.is_some() {
+            TaskQuestion::AnalyzeRootMoves
+        } else {
+            TaskQuestion::FindAlternative {
+                divergence_ply: prefix.len() as u16,
+            }
+        };
+        let root_moves = alternatives
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            .map(Move16::pack)
+            .collect::<Result<Vec<_>, _>>()?;
+        let ordered_mask: String = root_moves
+            .iter()
+            .map(|movement| format!("{:04x}", movement.bits()))
+            .collect();
+        // Actual wall deadline is part of the request. A completed result from
+        // a different time allowance is not an exact-question cache hit.
+        let condition = format!(
+            "{};question={:?};ordered-root-mask={};prefix-plies={};deadline-tick={};nodes={};depth={}",
+            self.cpu_registered_condition,
+            question,
+            ordered_mask,
+            prefix.len(),
+            self.tick_at(limits.deadline),
+            task_nodes,
+            limits.cpu_depth
+        );
+        if condition.len() > 8192 {
+            return Err(
+                StoreError::InvalidConditions("foreign full condition exceeds bound").into(),
+            );
+        }
+        self.consumer_id = self.consumer_id.checked_add(1).ok_or(PalsError::Capacity)?;
+        let consumer_id = self.consumer_id;
+        let consumer = TaskConsumer {
+            id: consumer_id,
+            situation: self.nodes[divergence].situation,
+            revision: self
+                .stores
+                .situations
+                .get(self.nodes[divergence].situation)?
+                .revision,
+            generation,
+            deadline_tick: self.tick_at(limits.deadline),
+        };
+        let admission = match self.stores.request_task(
+            TaskKey {
+                state: self.nodes[divergence].state,
+                line: None,
+                question,
+                root_moves,
+                value_identity: None,
+                checker_identity: Some(identity.clone()),
+                cpu_condition: Some(condition.clone()),
+                model: 0,
+                epoch: 0,
+                profile: 0,
+                condition: stable_id(&condition),
+                input_revision: prefix.len() as u64,
+                requested_depth: limits.cpu_depth,
+                node_budget: task_nodes,
+            },
+            consumer,
+            self.tick_at(Instant::now()),
+        ) {
+            Ok(admission) => admission,
+            Err(StoreError::ExpiredConsumer) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let (execution, reused) = match admission {
+            TaskAdmission::Start(execution) => (execution, None),
+            TaskAdmission::Reuse {
+                execution,
+                observation,
+            } => (execution, Some(observation)),
+            TaskAdmission::Resume { .. } => {
+                return Err(CheckerError::Unsupported("foreign resume checkpoint").into());
+            }
+            TaskAdmission::Join(_) => {
+                return Err(StoreError::InvalidConditions(
+                    "single active foreign go cannot join unknown owner",
+                )
+                .into());
+            }
+        };
+        let observation = if let Some(observation) = reused {
+            observation
+        } else {
+            counters.external_checker_node_budget_reserved = counters
+                .external_checker_node_budget_reserved
+                .checked_add(task_nodes)
+                .ok_or(PalsError::Capacity)?;
+            counters.external_checker_tasks += 1;
+            let cpu_limits = CpuLimits {
+                max_depth: limits.cpu_depth,
+                max_nodes: task_nodes,
+                deadline: Some(limits.deadline),
+            };
+            self.cpu.reset_attempt();
+            let response = if verification {
+                self.cpu
+                    .analyze(&self.nodes[divergence].position, cpu_limits, cancel)
+            } else if let Some(moves) = alternatives {
+                self.cpu.analyze_root_moves(
+                    &self.nodes[divergence].position,
+                    moves,
+                    cpu_limits,
+                    cancel,
+                )
+            } else {
+                self.cpu
+                    .analyze_divergence(&self.nodes[root].position, prefix, cpu_limits, cancel)
+            };
+            let capture = self.observe_external_attempt(counters);
+            let report = match response {
+                Ok(CheckerReport::ExternalUci(report)) => {
+                    counters.external_checker_reports += 1;
+                    report
+                }
+                Ok(CheckerReport::Owned(_)) => {
+                    self.stores.tasks.fail(execution)?;
+                    return Err(CheckerError::Invalid("own report in foreign namespace").into());
+                }
+                Err(error) => {
+                    self.stores.tasks.fail(execution)?;
+                    capture?;
+                    return Err(error.into());
+                }
+            };
+            if let Err(error) = capture {
+                self.stores.tasks.fail(execution)?;
+                return Err(error);
+            }
+            if let Err(error) = self.validate_external_report(
+                &self.nodes[divergence].position,
+                &report,
+                alternatives,
+                cpu_limits,
+            ) {
+                self.stores.tasks.fail(execution)?;
+                return Err(error);
+            }
+            if self
+                .cpu
+                .last_attempt()
+                .and_then(|attempt| attempt.external.as_ref())
+                .is_none_or(|attempt| {
+                    attempt.request_id != report.request_id
+                        || attempt.partial_report.as_ref() != Some(&report)
+                })
+            {
+                self.stores.tasks.fail(execution)?;
+                return Err(CheckerError::Invalid(
+                    "foreign report has no matching physical attempt",
+                )
+                .into());
+            }
+            let publication = (|| -> Result<ObservationId, PalsError> {
+                let projection: Vec<_> = report
+                    .pv
+                    .iter()
+                    .copied()
+                    .take(self.config.line_plies)
+                    .collect();
+                let pv_line = if projection.is_empty() {
+                    None
+                } else {
+                    Some(
+                        self.stores
+                            .append_cpu_pv(&self.nodes[divergence].position, &projection)?,
+                    )
+                };
+                let observation = self.stores.append_observation(Observation {
+                    state: self.nodes[divergence].state,
+                    line: None,
+                    source: stable_id(&report.identity.adapter_semantics),
+                    epoch: 0,
+                    value_identity: None,
+                    checker_identity: Some(identity.clone()),
+                    checker_work: Some(report.work),
+                    external_report: Some(Box::new(report.clone())),
+                    model_value_identity: None,
+                    model_value_input: None,
+                    cpu_condition: Some(condition.clone()),
+                    cpu_pv: pv_line,
+                    scope: EvidenceScope::ExternalUci {
+                        requested_depth: report.requested_depth,
+                        reported_depth: report.reported_depth,
+                        seldepth: report.seldepth,
+                        bound: report.bound,
+                    },
+                    score: RawScore::ExternalUci {
+                        value: report.score,
+                        bound: report.bound,
+                        perspective: report.perspective,
+                        wdl_per_mille: report.wdl_per_mille,
+                    },
+                    budget: report.work.nodes.unwrap_or(0),
+                    kind: ObservationKind::ExternalCpuAnalysis,
+                    supersedes: None,
+                    execution: Some(execution),
+                })?;
+                Ok(observation)
+            })();
+            let observation = match publication {
+                Ok(observation) => observation,
+                Err(error) => {
+                    self.stores.tasks.fail(execution)?;
+                    return Err(error);
+                }
+            };
+            if report.completion == ExternalCompletion::BestMove && report.work.nodes.is_some() {
+                if let Err(error) = self.stores.complete_task(execution, observation) {
+                    self.stores.tasks.fail(execution)?;
+                    return Err(error.into());
+                }
+            } else {
+                self.stores.tasks.fail(execution)?;
+            }
+            observation
+        };
+        let evidence = self.stores.observations.get(observation)?;
+        let report = evidence
+            .external_report
+            .as_deref()
+            .ok_or(StoreError::InvalidEvidence("foreign task lost report"))?;
+        let valid_response =
+            report.completion == ExternalCompletion::BestMove && report.best_move.is_some();
+        let complete = valid_response && report.work.nodes.is_some();
+        let pv: Vec<_> = report
+            .pv
+            .iter()
+            .copied()
+            .take(self.config.line_plies.saturating_sub(prefix.len()))
+            .collect();
+        if self.stopped(limits, cancel).is_some()
+            || generation != self.stores.generation()
+            || !valid_response
+        {
+            return Ok(None);
+        }
+        if complete {
+            match self
+                .stores
+                .consume_task(execution, consumer_id, self.tick_at(Instant::now()))
+            {
+                Ok(_) => {}
+                Err(StoreError::ExpiredConsumer) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if self.stopped(limits, cancel).is_some() {
+            return Ok(None);
+        }
+        if complete {
+            counters.consumed_external_checker_tasks += 1;
+        }
+        self.stores
+            .dependencies
+            .add(observation, self.nodes[divergence].situation)?;
+        self.stores
+            .dependencies
+            .add(observation, self.nodes[root].situation)?;
+        Ok(Some(CpuCandidate {
+            pv,
+            observation,
+            generation,
+            root: active_root,
+            root_revision,
+            deadline: limits.deadline,
+        }))
+    }
+
     fn cpu_condition(&self) -> String {
         Self::cpu_condition_for(self.cpu.as_ref())
     }
-    fn cpu_condition_for(cpu: &dyn CpuSearcher) -> String {
-        format!(
-            "{};conditions={};profile={:?};q={};tt={};maxdepth={};capabilities={:?}",
-            cpu.search_identity(),
-            cpu.search_conditions(),
-            cpu.config().profile,
-            cpu.config().quiescence_ply,
-            cpu.config().tt_entries,
-            cpu.config().max_depth,
-            cpu.capabilities()
-        )
+    fn cpu_condition_for(cpu: &dyn CpuChecker) -> String {
+        if let Some(descriptor) = cpu.owned_descriptor() {
+            format!(
+                "{};conditions={};profile={:?};q={};tt={};maxdepth={};capabilities={:?}",
+                descriptor.search_identity,
+                descriptor.search_conditions,
+                descriptor.config.profile,
+                descriptor.config.quiescence_ply,
+                descriptor.config.tt_entries,
+                descriptor.config.max_depth,
+                descriptor.capabilities
+            )
+        } else {
+            cpu.conditions().to_owned()
+        }
     }
 
     fn validate_cpu_report(
@@ -1372,11 +2254,12 @@ impl<M: RoleModel> PalsEngine<M> {
         restricted: bool,
         limits: CpuLimits,
     ) -> Result<(), PalsError> {
+        let descriptor = self.owned_descriptor()?;
         if &report.value_identity != value_identity
-            || self.cpu.value_identity() != value_identity
+            || self.owned_identity()? != value_identity
             || self.cpu_condition() != cpu_condition
-            || report.search_version != self.cpu.search_identity()
-            || report.profile != self.cpu.config().profile
+            || report.search_version != descriptor.search_identity
+            || report.profile != descriptor.config.profile
             || report.root_restricted != restricted
             || report.completed_depth > limits.max_depth
             || report.reused_completed_depth > report.completed_depth
@@ -1392,8 +2275,8 @@ impl<M: RoleModel> PalsEngine<M> {
             || (report.score_scope == CpuScoreScope::FrontierOnly && report.completed_depth != 0)
             || report.pv.is_empty()
             || report.pv.len()
-                > limits.max_depth as usize + self.cpu.config().quiescence_ply as usize
-            || (report.resume.is_some() && !self.cpu.capabilities().completed_iteration_resume)
+                > limits.max_depth as usize + descriptor.config.quiescence_ply as usize
+            || (report.resume.is_some() && !self.cpu.capabilities().resume)
         {
             return Err(StoreError::InvalidEvidence(
                 "CPU report differs from admitted immutable search/value conditions",
@@ -1448,12 +2331,12 @@ impl<M: RoleModel> PalsEngine<M> {
     fn observe_cpu_failure(&self, counters: &mut PalsCounters, requested_nodes: u64) {
         if let Some(work) = self
             .cpu
-            .last_attempt_work()
-            .filter(|work| work.nodes <= requested_nodes && work.quiescence_nodes <= work.nodes)
+            .last_attempt().map(|attempt| attempt.work)
+            .filter(|work| matches!((work.nodes, work.qnodes), (Some(nodes), Some(qnodes)) if nodes <= requested_nodes && qnodes <= nodes) && work.tt_hits.is_some())
         {
-            counters.cpu_nodes += work.nodes;
-            counters.cpu_quiescence_nodes += work.quiescence_nodes;
-            counters.cpu_tt_hits += work.tt_hits;
+            counters.cpu_nodes += work.nodes.unwrap_or(0);
+            counters.cpu_quiescence_nodes += work.qnodes.unwrap_or(0);
+            counters.cpu_tt_hits += work.tt_hits.unwrap_or(0);
         } else {
             counters.cpu_work_observation_incomplete = true;
         }
@@ -1475,6 +2358,7 @@ impl<M: RoleModel> PalsEngine<M> {
         if self.stopped(limits, cancel).is_some() || self.nodes[divergence].terminal.is_some() {
             return Ok(None);
         }
+        self.validate_checker_namespace()?;
         let mut checked = self.nodes[root].position.clone();
         for &movement in prefix {
             checked.make_move(movement)?;
@@ -1489,6 +2373,17 @@ impl<M: RoleModel> PalsEngine<M> {
         {
             return Err(StoreError::StaleConsumer.into());
         }
+        if self.is_external() {
+            return self.external_candidate(
+                root,
+                divergence,
+                prefix,
+                alternatives,
+                limits,
+                cancel,
+                counters,
+            );
+        }
         let remaining = limits.max_cpu_nodes.saturating_sub(counters.cpu_nodes);
         if remaining == 0 || alternatives.is_some_and(|moves| moves.is_empty()) {
             return Ok(None);
@@ -1497,13 +2392,13 @@ impl<M: RoleModel> PalsEngine<M> {
         let active_root = self.stores.root().ok_or(StoreError::StaleConsumer)?;
         let root_revision = self.stores.situations.get(active_root)?.revision;
         let task_nodes = remaining.min(self.config.cpu_nodes_per_task);
-        let profile = stable_id(self.cpu.config().profile.identity());
+        let descriptor = self.owned_descriptor()?;
+        let profile = stable_id(descriptor.config.profile.identity());
         let condition = stable_id(&format!(
             "{};q={}",
-            self.cpu.search_identity(),
-            self.cpu.config().quiescence_ply
+            descriptor.search_identity, descriptor.config.quiescence_ply
         ));
-        let value_identity = self.cpu.value_identity().clone();
+        let value_identity = self.owned_identity()?.clone();
         let search_condition = self.cpu_condition();
         let question = if alternatives.is_some() {
             TaskQuestion::AnalyzeRootMoves
@@ -1549,6 +2444,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 question,
                 root_moves,
                 value_identity: Some(value_identity.clone()),
+                checker_identity: None,
                 cpu_condition: Some(cpu_condition.clone()),
                 model: 0,
                 epoch: 0,
@@ -1632,8 +2528,18 @@ impl<M: RoleModel> PalsEngine<M> {
             }
         };
         let report = match report {
-            Ok(report) => report,
+            Ok(report) => match Self::own_report(report) {
+                Ok(report) => report,
+                Err(error) => {
+                    self.observe_cpu_failure(counters, task_nodes);
+                    self.stores.tasks.fail(execution)?;
+                    return Err(error);
+                }
+            },
             Err(error) => {
+                if matches!(error, CheckerError::OwnedReportRejected { .. }) {
+                    counters.cpu_tasks += 1;
+                }
                 self.observe_cpu_failure(counters, task_nodes);
                 self.stores.tasks.fail(execution)?;
                 return Err(error.into());
@@ -1697,6 +2603,11 @@ impl<M: RoleModel> PalsEngine<M> {
                 condition,
             },
             value_identity: Some(report.value_identity.clone()),
+            checker_identity: None,
+            checker_work: None,
+            external_report: None,
+            model_value_identity: None,
+            model_value_input: None,
             cpu_condition: Some(cpu_condition.clone()),
             cpu_pv: Some(pv_line),
             score: if report.score_scope == CpuScoreScope::FrontierOnly {
@@ -1802,14 +2713,19 @@ impl<M: RoleModel> PalsEngine<M> {
             return Err(StoreError::Capacity("CPU candidate exceeds registered PALS line").into());
         }
         let evidence = self.stores.observations.get(candidate.observation)?;
-        if evidence.value_identity.as_ref() != Some(self.cpu.value_identity())
-            || evidence.cpu_pv.is_none_or(|line| {
-                self.stores
-                    .lines
-                    .moves(line)
-                    .map_or(true, |pv| pv != candidate.pv)
+        if (if self.is_external() {
+            evidence.checker_identity.as_ref() != Some(&self.checker_registered_identity)
+        } else {
+            evidence.value_identity.as_ref() != self.cpu_registered_value.as_ref()
+        }) || evidence.cpu_pv.is_none_or(|line| {
+            self.stores.lines.moves(line).map_or(true, |pv| {
+                if self.is_external() {
+                    !pv.starts_with(&candidate.pv)
+                } else {
+                    pv != candidate.pv
+                }
             })
-        {
+        }) {
             return Err(StoreError::InvalidEvidence(
                 "CPU candidate lost checked PV or value namespace",
             )
@@ -1944,6 +2860,11 @@ impl<M: RoleModel> PalsEngine<M> {
                 input: self.revision,
             },
             value_identity: None,
+            checker_identity: None,
+            checker_work: None,
+            external_report: None,
+            model_value_identity: None,
+            model_value_input: None,
             cpu_condition: None,
             cpu_pv: None,
             score: RawScore::Unknown,
@@ -1992,6 +2913,24 @@ impl<M: RoleModel> PalsEngine<M> {
         let root_color = self.nodes[root].position.side_to_move();
         let mut frontier: Vec<_> = root_rank.iter().take(width).copied().collect();
         frontier.sort_by(|a, b| {
+            if self.is_external() {
+                let value = |movement| {
+                    self.nodes[root]
+                        .edges
+                        .iter()
+                        .find(|edge| edge.movement == movement)
+                        .and_then(|edge| model_order_value(self.root_model_value(edge.child).0))
+                };
+                return value(*b)
+                    .partial_cmp(&value(*a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        root_rank
+                            .iter()
+                            .position(|movement| movement == a)
+                            .cmp(&root_rank.iter().position(|movement| movement == b))
+                    });
+            }
             let value = |movement| {
                 self.nodes[root]
                     .edges
@@ -2025,7 +2964,8 @@ impl<M: RoleModel> PalsEngine<M> {
             }
         }
         for movement in frontier {
-            if self.stopped(limits, cancel).is_some() || counters.cpu_nodes >= limits.max_cpu_nodes
+            if self.stopped(limits, cancel).is_some()
+                || self.cpu_budget_used(counters) >= limits.max_cpu_nodes
             {
                 break;
             }
@@ -2320,6 +3260,9 @@ impl<M: RoleModel> PalsEngine<M> {
         Ok(())
     }
     fn value(&self, node: usize, remaining: usize) -> Option<i32> {
+        if self.is_external() {
+            return None;
+        }
         let node = &self.nodes[node];
         if let Some((_, score)) = node.terminal {
             return Some(score);
@@ -2336,10 +3279,13 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         node.evidence
             .as_ref()
-            .filter(|e| e.value_identity == self.cpu_registered_value)
+            .filter(|e| Some(&e.value_identity) == self.cpu_registered_value.as_ref())
             .map(|e| e.score)
     }
     fn completed_line_value(&self, leaf: usize, plies: usize, required_depth: u16) -> Option<i32> {
+        if self.is_external() {
+            return None;
+        }
         let value = self.nodes[leaf]
             .terminal
             .map(|(_, value)| value)
@@ -2350,11 +3296,162 @@ impl<M: RoleModel> PalsEngine<M> {
                     .filter(|e| {
                         e.scope == CpuScoreScope::CompletedIteration
                             && e.depth >= required_depth
-                            && e.value_identity == self.cpu_registered_value
+                            && Some(&e.value_identity) == self.cpu_registered_value.as_ref()
                     })
                     .map(|e| e.score)
             })?;
         Some(if plies % 2 == 0 { value } else { -value })
+    }
+    fn rules_value(&self, node: usize) -> PalsResolvedValue {
+        let perspective = self.nodes[node].position.side_to_move();
+        match self.nodes[node].terminal {
+            Some((_, score)) => PalsResolvedValue::RulesTerminal {
+                winner: if score > 0 {
+                    Some(perspective)
+                } else if score < 0 {
+                    Some(perspective.opposite())
+                } else {
+                    None
+                },
+                perspective,
+            },
+            None => PalsResolvedValue::Unknown,
+        }
+    }
+    fn model_value(&self, index: usize, remaining: usize) -> PalsResolvedValue {
+        let node = &self.nodes[index];
+        if node.terminal.is_some() {
+            return self.rules_value(index);
+        }
+        if remaining > 0 {
+            let mut best = PalsResolvedValue::Unknown;
+            // Equal W-L distributions/conditional outcomes preserve Rules order.
+            for movement in node.position.legal_moves() {
+                if let Some(edge) = node.edges.iter().find(|edge| edge.movement == movement) {
+                    let value = flip_resolved_value(self.model_value(edge.child, remaining - 1));
+                    if better_model_choice(value, best, false, false) {
+                        best = value;
+                    }
+                }
+            }
+            if !matches!(best, PalsResolvedValue::Unknown) {
+                return best;
+            }
+        }
+        node.model_value
+            .as_ref()
+            .filter(|output| {
+                Some(&output.identity) == self.model_registered_value.as_ref()
+                    && output.state == node.position.position_identity()
+                    && output.perspective == node.position.side_to_move()
+            })
+            .map_or(PalsResolvedValue::Unknown, |output| {
+                PalsResolvedValue::ModelWdl {
+                    wdl: output.wdl,
+                    perspective: output.perspective,
+                }
+            })
+    }
+    fn root_model_value(&self, child: usize) -> (PalsResolvedValue, PalsValueScope) {
+        let terminal = self.nodes[child].terminal.is_some();
+        let value = self.model_value(child, self.config.line_plies.saturating_sub(1));
+        let mut flipped = flip_resolved_value(value);
+        if terminal {
+            // This is the directly selected child's current-state fact. Deeper
+            // terminal lines remain RestrictedRulesLine with estimate scope.
+            if let PalsResolvedValue::RestrictedRulesLine {
+                winner,
+                perspective,
+            } = flipped
+            {
+                flipped = PalsResolvedValue::RulesTerminal {
+                    winner,
+                    perspective,
+                };
+            }
+        }
+        let scope = if terminal {
+            PalsValueScope::RulesTerminal
+        } else if matches!(flipped, PalsResolvedValue::Unknown) {
+            PalsValueScope::Unknown
+        } else {
+            PalsValueScope::RestrictedEstimate
+        };
+        (flipped, scope)
+    }
+    fn model_result(
+        &self,
+        root: usize,
+        legal: &[BoardMove],
+        completion: PalsCompletion,
+        started: Instant,
+        counters: &mut PalsCounters,
+    ) -> Result<PalsResult, PalsError> {
+        let mut best_move = legal.first().copied();
+        let mut resolved_value = PalsResolvedValue::Unknown;
+        let mut scope = PalsValueScope::Unknown;
+        let mut root_values = Vec::with_capacity(legal.len());
+        for &movement in legal {
+            let edge = self.nodes[root]
+                .edges
+                .iter()
+                .find(|edge| edge.movement == movement);
+            let (value, child_scope, examined, unexplored) = if let Some(edge) = edge {
+                let child = &self.nodes[edge.child];
+                let (value, scope) = self.root_model_value(edge.child);
+                let legal_count = if child.terminal.is_some() {
+                    0
+                } else {
+                    child.position.legal_moves().len()
+                };
+                (
+                    value,
+                    scope,
+                    child.edges.len(),
+                    Some(legal_count.saturating_sub(child.edges.len())),
+                )
+            } else {
+                (PalsResolvedValue::Unknown, PalsValueScope::Unknown, 0, None)
+            };
+            if matches!(value, PalsResolvedValue::Unknown) {
+                counters.unknown_root_children += 1;
+            }
+            if better_model_choice(
+                value,
+                resolved_value,
+                child_scope == PalsValueScope::RulesTerminal,
+                scope == PalsValueScope::RulesTerminal,
+            ) {
+                best_move = Some(movement);
+                resolved_value = value;
+                scope = child_scope;
+            }
+            root_values.push(PalsRootValue {
+                movement,
+                score: None,
+                resolved_value: value,
+                scope: child_scope,
+                examined_replies: examined,
+                unexplored_replies: unexplored,
+            });
+        }
+        counters.retained_situations = self.nodes.len();
+        counters.root_scope_observation_complete = true;
+        Ok(PalsResult {
+            best_move,
+            score: None,
+            resolved_value,
+            model_value_identity: self.model_registered_value.clone(),
+            checker_identity: self.checker_registered_identity.clone(),
+            value_scope: scope,
+            terminal: None,
+            completion,
+            counters: *counters,
+            root_values,
+            elapsed: started.elapsed(),
+            model_identity: self.model.identity().to_owned(),
+            resolver_version: self.resolver_version(),
+        })
     }
     fn conclusion_observation(
         &mut self,
@@ -2377,6 +3474,11 @@ impl<M: RoleModel> PalsEngine<M> {
                 input: self.revision,
             },
             value_identity: None,
+            checker_identity: None,
+            checker_work: None,
+            external_report: None,
+            model_value_identity: None,
+            model_value_input: None,
             cpu_condition: None,
             cpu_pv: None,
             score: RawScore::Estimate {
@@ -2404,6 +3506,36 @@ impl<M: RoleModel> PalsEngine<M> {
             .into());
         }
         let mut best = None;
+        if self.is_external() {
+            let mut best_value = PalsResolvedValue::Unknown;
+            let mut best_terminal = false;
+            for movement in self.nodes[root].position.legal_moves() {
+                if let Some(edge) = self.nodes[root]
+                    .edges
+                    .iter()
+                    .find(|edge| edge.movement == movement)
+                {
+                    let (value, scope) = self.root_model_value(edge.child);
+                    let terminal = scope == PalsValueScope::RulesTerminal;
+                    if better_model_choice(value, best_value, terminal, best_terminal) {
+                        best = Some(movement);
+                        best_value = value;
+                        best_terminal = terminal;
+                    }
+                }
+            }
+            if let Some(movement) = best {
+                progress(movement);
+            }
+            if let Some(stop) = self.stopped(limits, cancel) {
+                return Err(match stop {
+                    PalsCompletion::Canceled => RoleError::Canceled,
+                    _ => RoleError::Deadline,
+                }
+                .into());
+            }
+            return Ok(());
+        }
         let mut best_score = None;
         let mut best_scope = PalsValueScope::Unknown;
         for edge in &self.nodes[root].edges {
@@ -2440,6 +3572,69 @@ impl<M: RoleModel> PalsEngine<M> {
     }
 }
 
+fn flip_resolved_value(value: PalsResolvedValue) -> PalsResolvedValue {
+    match value {
+        PalsResolvedValue::Unknown => PalsResolvedValue::Unknown,
+        // Raw own and model resolver namespaces never meet through this helper.
+        PalsResolvedValue::OwnedRaw { .. } => PalsResolvedValue::Unknown,
+        PalsResolvedValue::ModelWdl { wdl, perspective } => PalsResolvedValue::ModelWdl {
+            // These probabilities were validated before evidence admission.
+            wdl: [wdl[2], wdl[1], wdl[0]],
+            perspective: perspective.opposite(),
+        },
+        PalsResolvedValue::RulesTerminal {
+            winner,
+            perspective,
+        }
+        | PalsResolvedValue::RestrictedRulesLine {
+            winner,
+            perspective,
+        } => PalsResolvedValue::RestrictedRulesLine {
+            winner,
+            perspective: perspective.opposite(),
+        },
+    }
+}
+/// Ordering only: no foreign CP scaling, terminal-to-neural distribution or
+/// averaged P/C prediction is constructed. Unknown is not a zero expectation.
+fn model_order_value(value: PalsResolvedValue) -> Option<f32> {
+    match value {
+        PalsResolvedValue::ModelWdl { wdl, .. } => Some(wdl[0] - wdl[2]),
+        PalsResolvedValue::RulesTerminal {
+            winner,
+            perspective,
+        }
+        | PalsResolvedValue::RestrictedRulesLine {
+            winner,
+            perspective,
+        } => Some(match winner {
+            Some(color) if color == perspective => 1.0,
+            Some(_) => -1.0,
+            None => 0.0,
+        }),
+        PalsResolvedValue::Unknown | PalsResolvedValue::OwnedRaw { .. } => None,
+    }
+}
+fn better_model_choice(
+    candidate: PalsResolvedValue,
+    current: PalsResolvedValue,
+    terminal: bool,
+    current_terminal: bool,
+) -> bool {
+    let Some(value) = model_order_value(candidate) else {
+        return false;
+    };
+    let previous = model_order_value(current);
+    let proven_win = terminal && value > 0.0;
+    let previous_proven_win = current_terminal && previous.is_some_and(|value| value > 0.0);
+    if proven_win != previous_proven_win {
+        return proven_win;
+    }
+    previous.is_none_or(|previous| {
+        value > previous || (value == previous && terminal && !current_terminal)
+    })
+}
+
 fn better_root_choice(
     value: i32,
     scope: PalsValueScope,
@@ -2472,6 +3667,582 @@ fn stable_id(value: &str) -> u64 {
 mod tests {
     use super::*;
     use crate::cpu::CpuConfig;
+    use crate::cpu_checker::{
+        CheckerCapabilities, CheckerWork, ExternalAttemptEvidence, ExternalBound,
+        ExternalCheckerIdentity, ExternalModelMetadata, ExternalRawScore,
+        ExternalTrainingKnowledge, ExternalUciIdentity,
+    };
+
+    #[derive(Clone, Copy)]
+    enum ForeignFixtureMode {
+        Normal(i32),
+        UnknownWork,
+        Overshoot,
+        MixedIdentity,
+        Pending,
+    }
+    /// Typed in-process report fixture, not actual UCI/process evidence. The
+    /// native process owner's separate executable fixtures cover that boundary.
+    struct ForeignFixture {
+        identity: CheckerIdentity,
+        mode: ForeignFixtureMode,
+        request: u64,
+        attempt: Option<CheckerAttempt>,
+    }
+    impl ForeignFixture {
+        fn new(mode: ForeignFixtureMode) -> Self {
+            Self {
+                identity: CheckerIdentity::ExternalUci(ExternalCheckerIdentity {
+                    adapter_semantics: "explicit-foreign-report-fixture/v1".into(),
+                    binary_sha256: "1".repeat(64),
+                    launch_arguments_sha256: "2".repeat(64),
+                    declared_name: "in-process typed fixture".into(),
+                    declared_version: "1".into(),
+                    declared_source: "test-only".into(),
+                    declared_license: "MIT".into(),
+                    options: Default::default(),
+                    assets: Vec::new(),
+                    model_metadata: ExternalModelMetadata {
+                        weights_sha256: None,
+                        training: ExternalTrainingKnowledge::Unknown,
+                        declared_rights: None,
+                        precision: None,
+                    },
+                }),
+                mode,
+                request: 0,
+                attempt: None,
+            }
+        }
+        fn run(
+            &mut self,
+            position: &Position,
+            moves: Option<&[BoardMove]>,
+            limits: CpuLimits,
+        ) -> Result<CheckerReport, CheckerError> {
+            self.attempt = None;
+            self.request += 1;
+            let legal = position.legal_moves();
+            let best_move = moves.unwrap_or(&legal).first().copied();
+            let CheckerIdentity::ExternalUci(identity) = &self.identity else {
+                unreachable!()
+            };
+            let mut identity = identity.clone();
+            if matches!(self.mode, ForeignFixtureMode::MixedIdentity) {
+                identity.binary_sha256 = "9".repeat(64);
+            }
+            let report = ExternalCheckerReport {
+                identity,
+                observed_uci: ExternalUciIdentity {
+                    name: "typed fixture, process unobserved".into(),
+                    author: None,
+                },
+                request_id: self.request,
+                best_move: if matches!(self.mode, ForeignFixtureMode::Pending) {
+                    None
+                } else {
+                    best_move
+                },
+                pv: best_move.into_iter().collect(),
+                score: match self.mode {
+                    ForeignFixtureMode::Normal(value) => ExternalRawScore::MateMoves(value),
+                    _ => ExternalRawScore::Centipawns(900_000),
+                },
+                bound: ExternalBound::Lower,
+                wdl_per_mille: Some([999, 1, 0]),
+                perspective: position.side_to_move(),
+                requested_depth: limits.max_depth,
+                reported_depth: Some(0),
+                seldepth: None,
+                root_restricted: moves.is_some(),
+                completion: if matches!(self.mode, ForeignFixtureMode::Pending) {
+                    ExternalCompletion::Pending
+                } else {
+                    ExternalCompletion::BestMove
+                },
+                work: CheckerWork {
+                    nodes: if matches!(self.mode, ForeignFixtureMode::UnknownWork) {
+                        None
+                    } else if matches!(self.mode, ForeignFixtureMode::Overshoot) {
+                        Some(limits.max_nodes + 1)
+                    } else {
+                        Some(1)
+                    },
+                    qnodes: None,
+                    tt_hits: None,
+                },
+                elapsed: Duration::ZERO,
+            };
+            self.attempt = Some(CheckerAttempt {
+                work: report.work,
+                elapsed: report.elapsed,
+                external: Some(ExternalAttemptEvidence {
+                    request_id: report.request_id,
+                    partial_report: Some(report.clone()),
+                    process: CheckerShutdown::default(),
+                }),
+            });
+            if matches!(self.mode, ForeignFixtureMode::Overshoot) {
+                Err(CheckerError::External {
+                    stage: "fixture",
+                    code: "observed_node_overshoot",
+                })
+            } else {
+                Ok(CheckerReport::ExternalUci(report))
+            }
+        }
+    }
+    impl CpuChecker for ForeignFixture {
+        fn identity(&self) -> &CheckerIdentity {
+            &self.identity
+        }
+        fn conditions(&self) -> &str {
+            "test-foreign-helper/v1;process-evidence=unobserved"
+        }
+        fn capabilities(&self) -> CheckerCapabilities {
+            CheckerCapabilities {
+                max_depth: 64,
+                max_prefix_plies: 64,
+                max_root_moves: 256,
+                root_moves: true,
+                divergence: true,
+                resume: false,
+                selective_search: None,
+            }
+        }
+        fn last_attempt(&self) -> Option<&CheckerAttempt> {
+            self.attempt.as_ref()
+        }
+        fn reset_attempt(&mut self) {
+            self.attempt = None;
+        }
+        fn analyze(
+            &mut self,
+            position: &Position,
+            limits: CpuLimits,
+            _: &AtomicBool,
+        ) -> Result<CheckerReport, CheckerError> {
+            self.run(position, None, limits)
+        }
+        fn analyze_root_moves(
+            &mut self,
+            position: &Position,
+            moves: &[BoardMove],
+            limits: CpuLimits,
+            _: &AtomicBool,
+        ) -> Result<CheckerReport, CheckerError> {
+            self.run(position, Some(moves), limits)
+        }
+        fn analyze_divergence(
+            &mut self,
+            position: &Position,
+            prefix: &[BoardMove],
+            limits: CpuLimits,
+            _: &AtomicBool,
+        ) -> Result<CheckerReport, CheckerError> {
+            let mut target = position.clone();
+            for movement in prefix {
+                target
+                    .make_move(*movement)
+                    .map_err(|_| CheckerError::Invalid("fixture prefix"))?;
+            }
+            self.run(&target, None, limits)
+        }
+        fn new_game(&mut self, _: Instant, _: &AtomicBool) -> Result<(), CheckerError> {
+            self.attempt = None;
+            Ok(())
+        }
+        fn shutdown(&mut self, _: Instant) -> Result<CheckerShutdown, CheckerError> {
+            Ok(CheckerShutdown::default())
+        }
+    }
+    fn foreign_engine(mode: ForeignFixtureMode) -> PalsEngine<LegalOrderRoleMock> {
+        PalsEngine::new_with_checker(
+            PalsConfig {
+                beam_width: 1,
+                line_plies: 2,
+                cpu_nodes_per_task: 8,
+                ..PalsConfig::default()
+            },
+            LegalOrderRoleMock,
+            ForeignFixture::new(mode),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn externally_mutated_own_namespace_cannot_reuse_evidence_or_dispatch_new_work() {
+        struct MutableNamespaceCpu {
+            inner: CpuEngine,
+            changed: std::sync::Arc<AtomicBool>,
+            changed_value: CpuValueIdentity,
+            calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        }
+        impl CpuSearcher for MutableNamespaceCpu {
+            fn config(&self) -> &CpuConfig {
+                self.inner.config()
+            }
+            fn value_identity(&self) -> &CpuValueIdentity {
+                if self.changed.load(Ordering::Acquire) {
+                    &self.changed_value
+                } else {
+                    self.inner.value_identity()
+                }
+            }
+            fn search_identity(&self) -> &'static str {
+                self.inner.search_identity()
+            }
+            fn search_conditions(&self) -> String {
+                self.inner.search_conditions()
+            }
+            fn capabilities(&self) -> crate::cpu::CpuCapabilities {
+                self.inner.capabilities()
+            }
+            fn last_attempt_work(&self) -> Option<crate::cpu::CpuWork> {
+                self.inner.last_attempt_work()
+            }
+            fn clear(&mut self) {
+                self.inner.clear();
+            }
+            fn analyze(
+                &mut self,
+                position: &Position,
+                limits: CpuLimits,
+                cancel: &AtomicBool,
+            ) -> Result<CpuReport, CpuError> {
+                self.calls.fetch_add(1, Ordering::AcqRel);
+                self.inner.analyze(position, limits, cancel)
+            }
+        }
+        let changed = std::sync::Arc::new(AtomicBool::new(false));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let inner = CpuEngine::new(CpuConfig::default()).unwrap();
+        let mut changed_value = inner.value_identity().clone();
+        changed_value.semantics = "externally-mutated-own-value/v1".into();
+        let cpu = MutableNamespaceCpu {
+            inner,
+            changed: changed.clone(),
+            changed_value,
+            calls: calls.clone(),
+        };
+        let mut engine =
+            PalsEngine::new_with_cpu(PalsConfig::default(), LegalOrderRoleMock, cpu).unwrap();
+        let position = Position::startpos();
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine.intern(position.clone()).unwrap();
+        let mut counters = PalsCounters::default();
+        engine
+            .verify(root, &[], limits(), &AtomicBool::new(false), &mut counters)
+            .unwrap();
+        assert!(engine.nodes[root].evidence.is_some());
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        let before = counters;
+        let consumer_before = engine.consumer_id;
+        changed.store(true, Ordering::Release);
+        assert!(matches!(
+            engine.verify(root, &[], limits(), &AtomicBool::new(false), &mut counters),
+            Err(PalsError::Store(StoreError::InvalidConditions(
+                "frozen own value/search conditions changed"
+            )))
+        ));
+        assert_eq!(counters, before);
+        assert_eq!(engine.consumer_id, consumer_before);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            engine.search(&position, limits(), &AtomicBool::new(false)),
+            Err(PalsError::Store(StoreError::InvalidConditions(_)))
+        ));
+        let rejected = engine.last_search_counters().unwrap();
+        assert_eq!(rejected.cpu_tasks_requested, 0);
+        assert_eq!(rejected.consumed_cached_cpu_values, 0);
+        assert_eq!(rejected.cpu_nodes, 0);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+    #[test]
+    fn foreign_cp_mate_depth_and_wdl_stay_raw_while_model_drives_root_values() {
+        let position = Position::startpos();
+        let cancel = AtomicBool::new(false);
+        let mut positive = foreign_engine(ForeignFixtureMode::Normal(200));
+        let mut negative = foreign_engine(ForeignFixtureMode::Normal(-200));
+        let first = positive.search(&position, limits(), &cancel).unwrap();
+        let second = negative.search(&position, limits(), &cancel).unwrap();
+        assert_eq!(first.best_move, second.best_move);
+        assert_eq!(first.resolved_value, second.resolved_value);
+        assert_eq!(first.score, None);
+        assert_eq!(first.resolver_version, MODEL_WDL_RESOLVER_VERSION);
+        assert!(matches!(
+            first.resolved_value,
+            PalsResolvedValue::ModelWdl { .. }
+        ));
+        assert!(first.counters.external_checker_tasks > 0);
+        assert_eq!(first.counters.cpu_tasks_requested, 0);
+        assert_eq!(first.counters.cpu_nodes, 0);
+        assert!(first.counters.external_checker_work_incomplete);
+        assert!(first.counters.accepted_value_outputs > 0);
+        assert_eq!(
+            first.counters.role_calls,
+            first.counters.proposer_calls
+                + first.counters.critic_calls
+                + first.counters.repair_calls
+                + first.counters.value_calls
+        );
+        assert_eq!(
+            first.counters.consumed_role_outputs,
+            first.counters.accepted_proposer_outputs
+                + first.counters.accepted_critic_outputs
+                + first.counters.accepted_repair_outputs
+                + first.counters.accepted_value_outputs
+        );
+        for index in 0..positive.stores.observations.len() {
+            let observation = positive
+                .stores
+                .observations
+                .get(ObservationId(index))
+                .unwrap();
+            assert!(!matches!(observation.score, RawScore::Cpu { .. }));
+            if let Some(report) = &observation.external_report {
+                assert_eq!(report.score, ExternalRawScore::MateMoves(200));
+                assert_eq!(report.reported_depth, Some(0));
+                assert_eq!(report.bound, ExternalBound::Lower);
+                assert_eq!(report.work.qnodes, None);
+            }
+        }
+        assert!(
+            positive
+                .nodes
+                .iter()
+                .all(|node| node.evidence.is_none() && node.resume.is_none())
+        );
+    }
+    #[test]
+    fn foreign_unknown_pending_overshoot_and_namespace_failure_preserve_work_without_own_completion()
+     {
+        for mode in [
+            ForeignFixtureMode::UnknownWork,
+            ForeignFixtureMode::Pending,
+            ForeignFixtureMode::Overshoot,
+            ForeignFixtureMode::MixedIdentity,
+        ] {
+            let position = Position::startpos();
+            let mut engine = foreign_engine(mode);
+            engine
+                .stores
+                .focus_actual_moves(position.snapshot())
+                .unwrap();
+            let root = engine.intern(position).unwrap();
+            let mut counters = PalsCounters::default();
+            let result = engine.external_candidate(
+                root,
+                root,
+                &[],
+                None,
+                limits(),
+                &AtomicBool::new(false),
+                &mut counters,
+            );
+            assert_eq!(counters.external_checker_tasks, 1);
+            assert_eq!(counters.completed_cpu_tasks, 0);
+            assert_eq!(counters.consumed_cpu_tasks, 0);
+            assert_eq!(counters.consumed_external_checker_tasks, 0);
+            assert_eq!(engine.checker_attempts().len(), 1);
+            match mode {
+                ForeignFixtureMode::Overshoot => {
+                    assert!(result.is_err());
+                    assert_eq!(counters.external_checker_nodes_observed, 9);
+                    assert_eq!(counters.external_checker_node_budget_reserved, 8);
+                }
+                ForeignFixtureMode::MixedIdentity => {
+                    assert!(result.is_err());
+                    assert_eq!(counters.external_checker_nodes_observed, 1);
+                }
+                ForeignFixtureMode::UnknownWork => {
+                    assert!(result.unwrap().is_some());
+                    assert_eq!(engine.checker_attempts()[0].work.nodes, None);
+                    assert!(counters.external_checker_work_incomplete);
+                }
+                ForeignFixtureMode::Pending => {
+                    assert!(result.unwrap().is_none());
+                }
+                ForeignFixtureMode::Normal(_) => unreachable!(),
+            }
+            assert!(matches!(
+                engine
+                    .stores
+                    .tasks
+                    .get(super::super::store::ExecutionId(0))
+                    .unwrap()
+                    .status,
+                super::super::store::TaskStatus::Failed
+            ));
+            assert!(engine.nodes[root].evidence.is_none());
+        }
+    }
+    #[test]
+    fn foreign_evidence_capacity_failure_closes_task_but_keeps_physical_attempt() {
+        let position = Position::startpos();
+        let mut engine = foreign_engine(ForeignFixtureMode::Normal(999));
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine.intern(position).unwrap();
+        engine.stores.observations = super::super::store::ObservationStore::new(0);
+        let mut counters = PalsCounters::default();
+        assert!(matches!(
+            engine.external_candidate(
+                root,
+                root,
+                &[],
+                None,
+                limits(),
+                &AtomicBool::new(false),
+                &mut counters
+            ),
+            Err(PalsError::Capacity)
+        ));
+        assert_eq!(engine.checker_attempts().len(), 1);
+        assert_eq!(counters.external_checker_nodes_observed, 1);
+        assert_eq!(counters.consumed_external_checker_tasks, 0);
+        assert!(matches!(
+            engine
+                .stores
+                .tasks
+                .get(super::super::store::ExecutionId(0))
+                .unwrap()
+                .status,
+            super::super::store::TaskStatus::Failed
+        ));
+    }
+    #[test]
+    fn model_value_final_cancel_never_acknowledges_output_or_assigns_evidence() {
+        struct CancelValue;
+        impl RoleModel for CancelValue {
+            fn identity(&self) -> &str {
+                LegalOrderRoleMock.identity()
+            }
+            fn value_identity(&self) -> Option<&ModelValueIdentity> {
+                LegalOrderRoleMock.value_identity()
+            }
+            fn evaluate_value(
+                &mut self,
+                query: RoleQuery<'_>,
+            ) -> Result<ModelValueOutput, RoleError> {
+                let cancel = query.cancel;
+                let output = LegalOrderRoleMock.evaluate_value(query)?;
+                cancel.store(true, Ordering::Release);
+                Ok(output)
+            }
+            fn propose(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+                LegalOrderRoleMock.propose(query)
+            }
+            fn reply(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+                LegalOrderRoleMock.reply(query)
+            }
+            fn repair(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+                LegalOrderRoleMock.repair(query)
+            }
+            fn divergences(&mut self, query: DivergenceQuery<'_>) -> Result<Vec<f32>, RoleError> {
+                LegalOrderRoleMock.divergences(query)
+            }
+            fn accepted_output(&mut self) {
+                panic!("canceled model value must not be acknowledged");
+            }
+        }
+        let position = Position::startpos();
+        let mut engine = PalsEngine::new_with_checker(
+            PalsConfig::default(),
+            CancelValue,
+            ForeignFixture::new(ForeignFixtureMode::Normal(100)),
+        )
+        .unwrap();
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine.intern(position).unwrap();
+        let mut counters = PalsCounters::default();
+        assert!(matches!(
+            engine.evaluate_model_value(
+                root,
+                &[],
+                limits(),
+                &AtomicBool::new(false),
+                &mut counters
+            ),
+            Err(PalsError::Role(RoleError::Canceled))
+        ));
+        assert_eq!(counters.value_calls, 1);
+        assert_eq!(counters.completed_value_calls, 1);
+        assert_eq!(counters.accepted_value_outputs, 0);
+        assert!(engine.nodes[root].model_value.is_none());
+    }
+    #[test]
+    fn restricted_terminal_line_retains_actual_leaf_without_all_defenses_claim() {
+        let position = Position::from_fen("7k/5K2/6Q1/8/8/8/8/8 w - - 0 1").unwrap();
+        let mut engine = foreign_engine(ForeignFixtureMode::Normal(-999));
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine.intern(position.clone()).unwrap();
+        let mut counters = PalsCounters::default();
+        let (movement, child) = position
+            .legal_moves()
+            .into_iter()
+            .find_map(|movement| {
+                let mut child = position.clone();
+                child.make_move(movement).unwrap();
+                matches!(
+                    child.classify_position().unwrap().play_status,
+                    PlayStatus::Terminal {
+                        reason: TerminalReason::Checkmate,
+                        ..
+                    }
+                )
+                .then_some((movement, child))
+            })
+            .unwrap();
+        let leaf = engine
+            .connect(root, movement, child, &mut counters)
+            .unwrap();
+        assert!(matches!(
+            engine.rules_value(leaf),
+            PalsResolvedValue::RulesTerminal {
+                winner: Some(Color::White),
+                ..
+            }
+        ));
+        assert!(matches!(
+            engine.model_value(root, 1),
+            PalsResolvedValue::RestrictedRulesLine {
+                winner: Some(Color::White),
+                ..
+            }
+        ));
+        assert!(engine.nodes[root].terminal.is_none());
+        let result = engine
+            .model_result(
+                root,
+                &position.legal_moves(),
+                PalsCompletion::RoundLimit,
+                Instant::now(),
+                &mut counters,
+            )
+            .unwrap();
+        assert_eq!(result.best_move, Some(movement));
+        assert_eq!(result.score, None);
+        assert_eq!(result.terminal, None);
+        assert!(result.counters.unknown_root_children > 0);
+        assert!(matches!(
+            result.resolved_value,
+            PalsResolvedValue::RulesTerminal {
+                winner: Some(Color::White),
+                ..
+            }
+        ));
+    }
 
     fn engine() -> PalsEngine<LegalOrderRoleMock> {
         PalsEngine::new(
@@ -2662,7 +4433,7 @@ mod tests {
         assert_eq!(observation.kind, ObservationKind::CpuAnalysis);
         assert_eq!(
             observation.value_identity.as_ref(),
-            Some(engine.cpu.value_identity())
+            Some(engine.owned_identity().unwrap())
         );
         assert!(matches!(
             observation.scope,
@@ -2942,6 +4713,7 @@ mod tests {
         enum Mode {
             Unsupported,
             ChangedIdentity,
+            ChangedIdentityUnknownWork,
             Late,
             UnknownFailure,
             MaskLeak,
@@ -2977,6 +4749,16 @@ mod tests {
                     caps.divergence = false;
                 }
                 caps
+            }
+            fn last_attempt_work(&self) -> Option<crate::cpu::CpuWork> {
+                if matches!(
+                    self.mode,
+                    Mode::UnknownFailure | Mode::ChangedIdentityUnknownWork
+                ) {
+                    None
+                } else {
+                    self.inner.last_attempt_work()
+                }
             }
             fn clear(&mut self) {
                 self.inner.clear();
@@ -3020,7 +4802,10 @@ mod tests {
                     return Err(CpuError::Unsupported("injected unobserved CPU failure"));
                 }
                 let mut report = self.inner.analyze_divergence(p, prefix, l, c)?;
-                if matches!(self.mode, Mode::ChangedIdentity) {
+                if matches!(
+                    self.mode,
+                    Mode::ChangedIdentity | Mode::ChangedIdentityUnknownWork
+                ) {
                     self.changed = true;
                 }
                 if matches!(self.mode, Mode::Late) {
@@ -3054,6 +4839,7 @@ mod tests {
         let position = Position::from_fen("2r4k/8/8/8/2Q5/8/7P/K7 b - - 0 1").unwrap();
         for mode in [
             Mode::ChangedIdentity,
+            Mode::ChangedIdentityUnknownWork,
             Mode::Late,
             Mode::UnknownFailure,
             Mode::MaskLeak,
@@ -3121,6 +4907,25 @@ mod tests {
                         Err(PalsError::Store(StoreError::InvalidEvidence(_)))
                     ));
                     assert_eq!(counters.cpu_tasks, 1);
+                    if matches!(mode, Mode::ChangedIdentity) {
+                        // The wrapper rejected an actually returned report;
+                        // its independent work snapshot survives exactly once.
+                        assert!(counters.cpu_nodes > 0);
+                        assert!(counters.cpu_quiescence_nodes <= counters.cpu_nodes);
+                        assert!(!counters.cpu_work_observation_incomplete);
+                        assert_eq!(counters.completed_cpu_tasks, 0);
+                        assert_eq!(engine.stores.observations.len(), 0);
+                    }
+                    if matches!(mode, Mode::ChangedIdentityUnknownWork) {
+                        // Returned-report rejection is known, but independent
+                        // actual work is absent. Do not recover nodes from the
+                        // rejected report or present the bookkeeping zero as
+                        // a measured zero-work execution.
+                        assert!(counters.cpu_work_observation_incomplete);
+                        assert_eq!(counters.cpu_nodes, 0);
+                        assert_eq!(counters.completed_cpu_tasks, 0);
+                        assert_eq!(engine.stores.observations.len(), 0);
+                    }
                 }
             }
         }
@@ -3247,7 +5052,7 @@ mod tests {
             score: -25,
             depth: 1,
             scope: CpuScoreScope::CompletedIteration,
-            value_identity: engine.cpu.value_identity().clone(),
+            value_identity: engine.owned_identity().unwrap().clone(),
         });
         assert_eq!(engine.value(root, 4), Some(25));
     }
@@ -3417,7 +5222,7 @@ mod tests {
                 .key
                 .value_identity
                 .as_ref(),
-            Some(engine.cpu.value_identity())
+            Some(engine.owned_identity().unwrap())
         );
     }
     #[test]

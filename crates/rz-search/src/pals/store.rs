@@ -9,6 +9,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Weak};
 
+use crate::cpu_checker::{
+    CheckerIdentity, CheckerWork, ExternalBound, ExternalCheckerReport, ExternalCompletion,
+    ExternalRawScore,
+};
 use crate::cpu_value::CpuValueIdentity;
 use rz_position::{
     BoardMove, Color, PieceKind, PlayStatus, Position, PositionSnapshot, RepetitionIdentity, Square,
@@ -407,6 +411,14 @@ pub enum EvidenceScope {
         profile: u64,
         condition: u64,
     },
+    /// Foreign UCI output preserves its own depth and bound vocabulary. A
+    /// bestmove response is not an own completed iteration or a chess proof.
+    ExternalUci {
+        requested_depth: u16,
+        reported_depth: Option<u16>,
+        seldepth: Option<u16>,
+        bound: ExternalBound,
+    },
     Model {
         model: u64,
         encoding: u64,
@@ -426,6 +438,12 @@ pub enum RawScore {
         perspective: Color,
         bound: BoundKind,
     },
+    ExternalUci {
+        value: ExternalRawScore,
+        bound: ExternalBound,
+        perspective: Color,
+        wdl_per_mille: Option<[u16; 3]>,
+    },
     Wdl {
         win: f32,
         draw: f32,
@@ -443,6 +461,7 @@ pub enum ObservationKind {
     Refutation,
     Repair,
     CpuAnalysis,
+    ExternalCpuAnalysis,
     ExactTerminal,
 }
 
@@ -455,6 +474,14 @@ pub struct Observation {
     /// Exact immutable CPU evaluator namespace. It is independent of neural
     /// model/epoch handles and preserves real weight absence or checkpoint ID.
     pub value_identity: Option<CpuValueIdentity>,
+    pub checker_identity: Option<CheckerIdentity>,
+    /// Optional actual counters; unknown work stays None, never an invented 0.
+    pub checker_work: Option<CheckerWork>,
+    /// Full unprojected foreign report. `cpu_pv` retains only its bounded,
+    /// Rules-checked line projection, while this preserves raw units/metadata.
+    pub external_report: Option<Box<ExternalCheckerReport>>,
+    pub model_value_identity: Option<super::value::ModelValueIdentity>,
+    pub model_value_input: Option<[u8; 32]>,
     /// Exact canonical search implementation/configuration/capability and task
     /// conditions, including ordered restrictions. Numeric IDs are metadata.
     pub cpu_condition: Option<String>,
@@ -471,14 +498,65 @@ pub struct Observation {
 
 impl Observation {
     fn validate(&self) -> Result<(), StoreError> {
-        let cpu_scope = matches!(self.scope, EvidenceScope::DepthLimited { .. });
-        if cpu_scope != self.value_identity.is_some()
+        let owned_scope = matches!(self.scope, EvidenceScope::DepthLimited { .. });
+        let external_scope = matches!(self.scope, EvidenceScope::ExternalUci { .. });
+        let cpu_scope = owned_scope || external_scope;
+        if owned_scope != self.value_identity.is_some()
             || cpu_scope != self.cpu_condition.is_some()
             || (self.cpu_pv.is_some() && !cpu_scope)
+            || external_scope != self.external_report.is_some()
+            || (!cpu_scope && self.checker_work.is_some())
         {
             return Err(StoreError::InvalidEvidence(
                 "CPU scope requires its exact value namespace and PV scope",
             ));
+        }
+        match (&self.checker_identity, &self.value_identity) {
+            (Some(CheckerIdentity::Owned(actual)), Some(value))
+                if owned_scope && actual == value => {}
+            (None, Some(_)) if owned_scope => {} // Legacy own CPU namespace.
+            (Some(CheckerIdentity::ExternalUci(_)), None) if external_scope => {}
+            (None, None) if !cpu_scope => {}
+            _ => {
+                return Err(StoreError::InvalidEvidence(
+                    "checker and score namespaces differ",
+                ));
+            }
+        }
+        if let Some(identity) = &self.checker_identity {
+            identity.validate().map_err(|_| {
+                StoreError::InvalidEvidence("invalid or unbounded checker namespace")
+            })?;
+        }
+        if self.checker_work.is_some_and(|work| {
+            matches!((work.nodes, work.qnodes), (Some(nodes), Some(qnodes)) if qnodes > nodes)
+        }) {
+            return Err(StoreError::InvalidEvidence("checker work counters contradict"));
+        }
+        if external_scope {
+            self.validate_external_report()?;
+        } else if self.kind == ObservationKind::ExternalCpuAnalysis
+            || matches!(self.score, RawScore::ExternalUci { .. })
+        {
+            return Err(StoreError::InvalidEvidence(
+                "foreign result needs external scope",
+            ));
+        }
+        let model_wdl = matches!(self.score, RawScore::Wdl { .. });
+        if model_wdl && !matches!(self.scope, EvidenceScope::Model { .. }) {
+            return Err(StoreError::InvalidEvidence("model WDL needs model scope"));
+        }
+        if model_wdl != self.model_value_identity.is_some()
+            || model_wdl != self.model_value_input.is_some()
+        {
+            return Err(StoreError::InvalidEvidence(
+                "model WDL needs full value and input identity",
+            ));
+        }
+        if let Some(identity) = &self.model_value_identity {
+            identity.validate().map_err(|_| {
+                StoreError::InvalidEvidence("invalid or unbounded model value namespace")
+            })?;
         }
         if let Some(identity) = &self.value_identity {
             identity.validate().map_err(|_| {
@@ -488,7 +566,7 @@ impl Observation {
         if self
             .cpu_condition
             .as_ref()
-            .is_some_and(|value| value.capacity() > 2048 || !valid_cpu_condition(value))
+            .is_some_and(|value| !valid_cpu_condition(value, external_scope))
         {
             return Err(StoreError::InvalidEvidence(
                 "invalid or unbounded exact CPU conditions",
@@ -527,6 +605,73 @@ impl Observation {
         }
         Ok(())
     }
+
+    fn validate_external_report(&self) -> Result<(), StoreError> {
+        let Some(CheckerIdentity::ExternalUci(identity)) = &self.checker_identity else {
+            return Err(StoreError::InvalidEvidence(
+                "foreign report needs checker identity",
+            ));
+        };
+        let report = self
+            .external_report
+            .as_deref()
+            .ok_or(StoreError::InvalidEvidence("foreign report is absent"))?;
+        report.identity.validate().map_err(|_| {
+            StoreError::InvalidEvidence("invalid or unbounded retained foreign namespace")
+        })?;
+        if report.identity != *identity
+            || self.source != external_source_id(&identity.adapter_semantics)
+            || self.checker_work != Some(report.work)
+            || self.kind != ObservationKind::ExternalCpuAnalysis
+            || self.scope
+                != (EvidenceScope::ExternalUci {
+                    requested_depth: report.requested_depth,
+                    reported_depth: report.reported_depth,
+                    seldepth: report.seldepth,
+                    bound: report.bound,
+                })
+            || self.score
+                != (RawScore::ExternalUci {
+                    value: report.score,
+                    bound: report.bound,
+                    perspective: report.perspective,
+                    wdl_per_mille: report.wdl_per_mille,
+                })
+            || report.requested_depth == 0
+            || report.pv.len() > MAX_EXTERNAL_PV_PLIES
+            || report.pv.capacity() > MAX_EXTERNAL_PV_PLIES
+            || report.observed_uci.name.trim().is_empty()
+            || report.observed_uci.name.len() > 256
+            || report.observed_uci.name.capacity() > 256
+            || report.observed_uci.name.chars().any(char::is_control)
+            || report.observed_uci.author.as_ref().is_some_and(|author| {
+                author.len() > 256
+                    || author.capacity() > 256
+                    || author.chars().any(char::is_control)
+            })
+            || report.wdl_per_mille.is_some_and(|wdl| {
+                wdl.into_iter().any(|value| value > 1000)
+                    || wdl.into_iter().map(u32::from).sum::<u32>() != 1000
+            })
+            || report.work.nodes.is_some_and(|nodes| nodes != self.budget)
+            || (report.work.nodes.is_none() && self.budget != 0)
+        {
+            return Err(StoreError::InvalidEvidence(
+                "foreign report scope, counters or retained payload differ",
+            ));
+        }
+        // Zero `budget` with unknown nodes is an observation bookkeeping slot,
+        // not a zero-work claim; consumption still requires known bounded work.
+        Ok(())
+    }
+}
+
+const MAX_EXTERNAL_PV_PLIES: usize = 256;
+
+fn external_source_id(semantics: &str) -> u64 {
+    semantics.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
 }
 
 #[derive(Debug)]
@@ -840,6 +985,7 @@ pub struct TaskKey {
     /// CPU tasks use the complete immutable value namespace, never a truncated
     /// model hash or a fictitious neural epoch. Model tasks leave this absent.
     pub value_identity: Option<CpuValueIdentity>,
+    pub checker_identity: Option<CheckerIdentity>,
     /// Full canonical CPU implementation/configuration/capability, task kind,
     /// ordered root restrictions, profile and window. An immutable exact key;
     /// `condition` is only an auxiliary numeric identifier.
@@ -915,8 +1061,12 @@ pub struct TaskTable {
     root_move_limit: usize,
 }
 
-fn valid_cpu_condition(value: &str) -> bool {
-    !value.trim().is_empty() && value.len() <= 2048 && !value.chars().any(char::is_control)
+fn valid_cpu_condition(value: &String, external: bool) -> bool {
+    let maximum = if external { 8192 } else { 2048 };
+    !value.trim().is_empty()
+        && value.len() <= maximum
+        && value.capacity() <= maximum
+        && !value.chars().any(char::is_control)
 }
 
 impl TaskTable {
@@ -951,12 +1101,26 @@ impl TaskTable {
                 | TaskQuestion::AnalyzeRootMoves
                 | TaskQuestion::FindAlternative { .. }
         );
-        if cpu_question != key.value_identity.is_some()
+        let external = matches!(key.checker_identity, Some(CheckerIdentity::ExternalUci(_)));
+        if (cpu_question && !external) != key.value_identity.is_some()
             || cpu_question != key.cpu_condition.is_some()
+            || (!cpu_question && key.checker_identity.is_some())
         {
             return Err(StoreError::InvalidConditions(
                 "CPU task requires an exact evaluator namespace",
             ));
+        }
+        if let Some(identity) = &key.checker_identity {
+            identity.validate().map_err(|_| {
+                StoreError::InvalidConditions("invalid or unbounded checker namespace")
+            })?;
+            if let CheckerIdentity::Owned(actual) = identity {
+                if key.value_identity.as_ref() != Some(actual) {
+                    return Err(StoreError::InvalidConditions(
+                        "own checker and value namespace differ",
+                    ));
+                }
+            }
         }
         if let Some(identity) = &key.value_identity {
             identity.validate().map_err(|_| {
@@ -966,7 +1130,7 @@ impl TaskTable {
         if key
             .cpu_condition
             .as_ref()
-            .is_some_and(|value| value.capacity() > 2048 || !valid_cpu_condition(value))
+            .is_some_and(|value| !valid_cpu_condition(value, external))
         {
             return Err(StoreError::InvalidConditions(
                 "invalid or unbounded exact CPU conditions",
@@ -981,6 +1145,18 @@ impl TaskTable {
             return Err(StoreError::InvalidConditions(
                 "restricted CPU task requires ordered root moves",
             ));
+        }
+        if external && key.question == TaskQuestion::AnalyzePosition && !key.root_moves.is_empty() {
+            return Err(StoreError::InvalidConditions(
+                "unrestricted external task has root moves",
+            ));
+        }
+        let mut distinct_roots = BTreeSet::new();
+        for movement in &key.root_moves {
+            movement.unpack()?;
+            if !distinct_roots.insert(*movement) {
+                return Err(StoreError::InvalidConditions("duplicate task root move"));
+            }
         }
         if self.consumers.contains(&consumer.id) {
             return Err(StoreError::InvalidConditions("duplicate consumer ID"));
@@ -1096,6 +1272,14 @@ impl TaskTable {
             .tasks
             .get_mut(execution.0)
             .ok_or(StoreError::InvalidHandle("execution"))?;
+        if matches!(
+            task.key.checker_identity,
+            Some(CheckerIdentity::ExternalUci(_))
+        ) {
+            return Err(StoreError::InvalidConditions(
+                "external UCI has no owned resume checkpoint",
+            ));
+        }
         if !matches!(
             task.status,
             TaskStatus::InFlight | TaskStatus::CancellationRequested
@@ -1392,6 +1576,22 @@ impl PalsStores {
 
     fn validate_observation_handles(&self, observation: &Observation) -> Result<(), StoreError> {
         self.states.get(observation.state)?;
+        observation.validate()?;
+        if let Some(report) = observation.external_report.as_deref() {
+            if self.observations.observations.iter().any(|previous| {
+                previous.external_report.as_deref().is_some_and(|earlier| {
+                    earlier.identity == report.identity
+                        && earlier.request_id == report.request_id
+                        && (previous.execution != observation.execution
+                            || previous.state != observation.state)
+                })
+            }) {
+                return Err(StoreError::InvalidEvidence(
+                    "foreign physical request belongs to another task",
+                ));
+            }
+            self.validate_external_pv(observation, report)?;
+        }
         if let Some(previous) = observation.supersedes {
             if self.observations.get(previous)?.state != observation.state {
                 return Err(StoreError::InvalidEvidence(
@@ -1429,11 +1629,35 @@ impl PalsStores {
             if task.key.state != observation.state
                 || task.key.line != observation.line
                 || task.key.value_identity != observation.value_identity
+                || task.key.checker_identity != observation.checker_identity
                 || task.key.cpu_condition != observation.cpu_condition
             {
                 return Err(StoreError::InvalidEvidence(
                     "task and observation conditions differ",
                 ));
+            }
+            if let Some(report) = observation.external_report.as_deref() {
+                if task.key.epoch != observation.epoch
+                    || report.requested_depth != task.key.requested_depth
+                    || report.root_restricted == task.key.root_moves.is_empty()
+                    || report
+                        .work
+                        .nodes
+                        .is_some_and(|nodes| nodes > task.key.node_budget)
+                    || report
+                        .work
+                        .qnodes
+                        .is_some_and(|nodes| nodes > task.key.node_budget)
+                    || report.best_move.is_some_and(|movement| {
+                        !task.key.root_moves.is_empty()
+                            && Move16::pack(movement)
+                                .map_or(true, |packed| !task.key.root_moves.contains(&packed))
+                    })
+                {
+                    return Err(StoreError::InvalidEvidence(
+                        "foreign task budget or restriction differs",
+                    ));
+                }
             }
             if let Some(pv) = observation.cpu_pv {
                 if !task.key.root_moves.is_empty() {
@@ -1450,6 +1674,71 @@ impl PalsStores {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn position_for_state(&self, state: StateId) -> Result<Position, StoreError> {
+        let snapshot = self.states.get(state)?;
+        let trace = snapshot
+            .uci_replay(rz_position::MAX_UCI_REPLAY_PLIES)
+            .map_err(|_| {
+                StoreError::InvalidEvidence("exact external state history cannot be replayed")
+            })?;
+        let mut position = match trace.origin {
+            rz_position::HistoryOrigin::StartPosition => Position::startpos(),
+            rz_position::HistoryOrigin::Fen => Position::from_fen(&trace.start_fen)
+                .map_err(|_| StoreError::InvalidEvidence("external state origin is invalid"))?,
+        };
+        for movement in trace.moves {
+            position.make_move(movement).map_err(|_| {
+                StoreError::InvalidEvidence("external state history failed Rules replay")
+            })?;
+        }
+        if !position.snapshot().same_state(snapshot) {
+            return Err(StoreError::InvalidEvidence(
+                "external state history differs",
+            ));
+        }
+        Ok(position)
+    }
+
+    fn validate_external_pv(
+        &self,
+        observation: &Observation,
+        report: &ExternalCheckerReport,
+    ) -> Result<(), StoreError> {
+        let mut position = self.position_for_state(observation.state)?;
+        if report.perspective != position.side_to_move()
+            || (report.best_move.is_some() && report.best_move != report.pv.first().copied())
+            || (report.completion == ExternalCompletion::BestMove
+                && (report.best_move.is_none() || report.pv.is_empty()))
+        {
+            return Err(StoreError::InvalidEvidence(
+                "foreign bestmove or perspective differs",
+            ));
+        }
+        // Recheck the full retained raw PV, including any tail omitted from the
+        // line projection. Only Rules owns state transitions and terminal truth.
+        for movement in &report.pv {
+            let legal = position.ordered_legal_moves();
+            if !matches!(
+                position.play_status_from_view(&legal),
+                Ok(PlayStatus::Ongoing)
+            ) {
+                return Err(StoreError::InvalidEvidence(
+                    "foreign PV continues after Rules terminal",
+                ));
+            }
+            position
+                .make_from_view(&legal, *movement)
+                .map_err(|_| StoreError::InvalidEvidence("foreign PV failed Rules replay"))?;
+        }
+        let projected = &report.pv[..report.pv.len().min(self.limits.line_plies)];
+        match observation.cpu_pv {
+            Some(pv) if self.lines.moves(pv)? == projected => {}
+            None if projected.is_empty() => {}
+            _ => return Err(StoreError::InvalidEvidence("foreign PV projection differs")),
         }
         Ok(())
     }
@@ -1485,6 +1774,11 @@ impl PalsStores {
             source,
             epoch,
             value_identity: None,
+            checker_identity: None,
+            checker_work: None,
+            external_report: None,
+            model_value_identity: None,
+            model_value_input: None,
             cpu_condition: None,
             cpu_pv: None,
             scope: EvidenceScope::RulesTerminal,
@@ -1649,6 +1943,17 @@ impl PalsStores {
         now_tick: u64,
     ) -> Result<TaskAdmission, StoreError> {
         self.states.get(key.state)?;
+        if matches!(key.checker_identity, Some(CheckerIdentity::ExternalUci(_))) {
+            let position = self.position_for_state(key.state)?;
+            let legal = position.ordered_legal_moves();
+            for movement in &key.root_moves {
+                if !legal.moves().contains(&movement.unpack()?) {
+                    return Err(StoreError::InvalidConditions(
+                        "external task root is not legal",
+                    ));
+                }
+            }
+        }
         if let Some(line) = key.line {
             if self.lines.get(line)?.start_state != key.state {
                 return Err(StoreError::InvalidConditions("task line state"));
@@ -1661,11 +1966,27 @@ impl PalsStores {
         {
             return Err(StoreError::StaleConsumer);
         }
+        // Low-level tables are exposed for inspection. A caller must not turn
+        // retained partial evidence into reusable completion via raw mutation.
+        if let Some(execution) = self.tasks.latest.get(&key).copied()
+            && let TaskStatus::Completed(observation) = self.tasks.get(execution)?.status
+        {
+            self.validate_completed_task(execution, observation)?;
+        }
         self.tasks.request(key, consumer, now_tick)
     }
 
     pub fn complete_task(
         &mut self,
+        execution: ExecutionId,
+        observation: ObservationId,
+    ) -> Result<(), StoreError> {
+        self.validate_completed_task(execution, observation)?;
+        self.tasks.complete(execution, observation)
+    }
+
+    fn validate_completed_task(
+        &self,
         execution: ExecutionId,
         observation: ObservationId,
     ) -> Result<(), StoreError> {
@@ -1675,6 +1996,7 @@ impl PalsStores {
             || evidence.state != task.key.state
             || evidence.line != task.key.line
             || evidence.value_identity != task.key.value_identity
+            || evidence.checker_identity != task.key.checker_identity
             || evidence.cpu_condition != task.key.cpu_condition
         {
             return Err(StoreError::InvalidEvidence(
@@ -1694,13 +2016,34 @@ impl PalsStores {
                 | TaskQuestion::FindAlternative { .. }
         );
         if (cpu_question && matches!(evidence.scope, EvidenceScope::Model { .. }))
-            || (!cpu_question && matches!(evidence.scope, EvidenceScope::DepthLimited { .. }))
+            || (!cpu_question
+                && matches!(
+                    evidence.scope,
+                    EvidenceScope::DepthLimited { .. } | EvidenceScope::ExternalUci { .. }
+                ))
         {
             return Err(StoreError::InvalidEvidence(
                 "completed task backend scope mismatch",
             ));
         }
         match evidence.scope {
+            EvidenceScope::ExternalUci {
+                requested_depth, ..
+            } => {
+                let report = evidence
+                    .external_report
+                    .as_deref()
+                    .ok_or(StoreError::InvalidEvidence("foreign task lacks report"))?;
+                if requested_depth != task.key.requested_depth
+                    || report.completion != ExternalCompletion::BestMove
+                    || report.work.nodes.is_none()
+                    || report.best_move.is_none()
+                {
+                    return Err(StoreError::InvalidEvidence(
+                        "foreign task lacks a valid bounded bestmove completion",
+                    ));
+                }
+            }
             EvidenceScope::DepthLimited {
                 depth,
                 profile,
@@ -1722,7 +2065,7 @@ impl PalsStores {
             }
             _ => {}
         }
-        self.tasks.complete(execution, observation)
+        Ok(())
     }
 
     pub fn pause_task(
@@ -1732,12 +2075,21 @@ impl PalsStores {
         partial: Option<ObservationId>,
     ) -> Result<(), StoreError> {
         let task = self.tasks.get(execution)?;
+        if matches!(
+            task.key.checker_identity,
+            Some(CheckerIdentity::ExternalUci(_))
+        ) {
+            return Err(StoreError::InvalidConditions(
+                "external UCI has no owned resume checkpoint",
+            ));
+        }
         if let Some(id) = partial {
             let evidence = self.observations.get(id)?;
             if evidence.execution != Some(execution)
                 || evidence.state != task.key.state
                 || evidence.line != task.key.line
                 || evidence.value_identity != task.key.value_identity
+                || evidence.checker_identity != task.key.checker_identity
                 || evidence.cpu_condition != task.key.cpu_condition
             {
                 return Err(StoreError::InvalidEvidence("paused task record mismatch"));
@@ -1781,7 +2133,7 @@ impl PalsStores {
         now_tick: u64,
     ) -> Result<ObservationId, StoreError> {
         if let TaskStatus::Completed(observation) = self.tasks.get(execution)?.status {
-            self.validate_observation_handles(self.observations.get(observation)?)?;
+            self.validate_completed_task(execution, observation)?;
         }
         self.tasks.consume(
             execution,
@@ -1823,6 +2175,11 @@ mod tests {
             source: 1,
             epoch: 1,
             value_identity: Some(cpu_value_identity()),
+            checker_identity: None,
+            checker_work: None,
+            external_report: None,
+            model_value_identity: None,
+            model_value_input: None,
             cpu_condition: Some("fixture-cpu-search-conditions-v1".into()),
             cpu_pv: None,
             scope: EvidenceScope::DepthLimited {
@@ -1847,6 +2204,7 @@ mod tests {
             model: 1,
             epoch: 1,
             value_identity: Some(cpu_value_identity()),
+            checker_identity: None,
             cpu_condition: Some("fixture-cpu-search-conditions-v1".into()),
             profile: 1,
             condition: 1,
@@ -1862,6 +2220,292 @@ mod tests {
             weights_sha256: Some(weight_digit.to_string().repeat(64)),
             training: crate::cpu_value::CpuTrainingState::Untrained,
         }
+    }
+
+    fn external_identity() -> crate::cpu_checker::ExternalCheckerIdentity {
+        use crate::cpu_checker::{ExternalModelMetadata, ExternalTrainingKnowledge};
+        crate::cpu_checker::ExternalCheckerIdentity {
+            adapter_semantics: "fixture-external-uci-raw/1".into(),
+            binary_sha256: "a".repeat(64),
+            launch_arguments_sha256: "b".repeat(64),
+            declared_name: "fixture".into(),
+            declared_version: "1".into(),
+            declared_source: "test-source".into(),
+            declared_license: "MIT".into(),
+            options: BTreeMap::new(),
+            assets: Vec::new(),
+            model_metadata: ExternalModelMetadata {
+                weights_sha256: None,
+                training: ExternalTrainingKnowledge::Unknown,
+                declared_rights: None,
+                precision: None,
+            },
+        }
+    }
+
+    fn external_key(state: StateId) -> TaskKey {
+        let mut query = key(state);
+        query.value_identity = None;
+        query.checker_identity = Some(CheckerIdentity::ExternalUci(external_identity()));
+        query.cpu_condition = Some("fixture-external-full-conditions".into());
+        query
+    }
+
+    fn external_observation(state: StateId, execution: ExecutionId, pv: LineId) -> Observation {
+        use crate::cpu_checker::ExternalUciIdentity;
+        let report = ExternalCheckerReport {
+            identity: external_identity(),
+            observed_uci: ExternalUciIdentity {
+                name: "fixture".into(),
+                author: None,
+            },
+            request_id: 1,
+            best_move: Some(BoardMove::from_uci("e2e4").unwrap()),
+            pv: moves("e2e4 e7e5"),
+            score: ExternalRawScore::MateMoves(19),
+            bound: ExternalBound::Lower,
+            wdl_per_mille: Some([900, 50, 50]),
+            perspective: Color::White,
+            requested_depth: 4,
+            reported_depth: Some(1),
+            seldepth: Some(3),
+            root_restricted: false,
+            completion: ExternalCompletion::BestMove,
+            work: CheckerWork {
+                nodes: Some(20),
+                qnodes: None,
+                tt_hits: None,
+            },
+            elapsed: std::time::Duration::from_millis(1),
+        };
+        let mut record = observation(state, None, ObservationKind::ExternalCpuAnalysis);
+        record.source = external_source_id(&report.identity.adapter_semantics);
+        record.value_identity = None;
+        record.checker_identity = Some(CheckerIdentity::ExternalUci(report.identity.clone()));
+        record.checker_work = Some(report.work);
+        record.cpu_condition = Some("fixture-external-full-conditions".into());
+        record.cpu_pv = Some(pv);
+        record.scope = EvidenceScope::ExternalUci {
+            requested_depth: report.requested_depth,
+            reported_depth: report.reported_depth,
+            seldepth: report.seldepth,
+            bound: report.bound,
+        };
+        record.score = RawScore::ExternalUci {
+            value: report.score,
+            bound: report.bound,
+            perspective: report.perspective,
+            wdl_per_mille: report.wdl_per_mille,
+        };
+        record.budget = 20;
+        record.external_report = Some(Box::new(report));
+        record.execution = Some(execution);
+        record
+    }
+
+    #[test]
+    fn external_bestmove_preserves_foreign_scope_and_reuses_only_the_exact_question() {
+        let mut stores = PalsStores::new(StoreLimits {
+            line_plies: 1,
+            ..StoreLimits::default()
+        });
+        let position = Position::startpos();
+        let root = stores.focus_actual_moves(position.snapshot()).unwrap();
+        let state = stores.situations.get(root).unwrap().state;
+        let execution = match stores
+            .request_task(external_key(state), consumer(&stores, root, 1, 100), 0)
+            .unwrap()
+        {
+            TaskAdmission::Start(id) => id,
+            _ => panic!("start"),
+        };
+        let pv = stores.append_cpu_pv(&position, &moves("e2e4")).unwrap();
+        let record = external_observation(state, execution, pv);
+        let id = stores.append_observation(record.clone()).unwrap();
+        // reported depth 1 < requested 4 is deliberately not an own depth gate.
+        stores.complete_task(execution, id).unwrap();
+        assert!(
+            matches!(stores.request_task(external_key(state), consumer(&stores, root, 2, 100), 1).unwrap(), TaskAdmission::Reuse { observation, .. } if observation == id)
+        );
+        assert_eq!(stores.consume_task(execution, 2, 2).unwrap(), id);
+        assert_eq!(
+            stores
+                .observations
+                .get(id)
+                .unwrap()
+                .external_report
+                .as_ref()
+                .unwrap()
+                .pv
+                .len(),
+            2
+        );
+        let mut changed = external_key(state);
+        changed.node_budget += 1;
+        let other = match stores
+            .request_task(changed, consumer(&stores, root, 3, 100), 1)
+            .unwrap()
+        {
+            TaskAdmission::Start(id) => id,
+            _ => panic!("distinct budget must start"),
+        };
+        let mut duplicate = record.clone();
+        duplicate.execution = Some(other);
+        assert!(stores.append_observation(duplicate.clone()).is_err());
+        let mut wrong_identity = record.clone();
+        wrong_identity
+            .external_report
+            .as_mut()
+            .unwrap()
+            .identity
+            .binary_sha256 = "c".repeat(64);
+        assert!(stores.append_observation(wrong_identity).is_err());
+        let mut illegal_tail = record;
+        illegal_tail.external_report.as_mut().unwrap().pv[1] = BoardMove::from_uci("e7e4").unwrap();
+        assert!(stores.append_observation(illegal_tail).is_err());
+        let unchecked_duplicate = stores.observations.append(duplicate).unwrap();
+        assert!(stores.complete_task(other, unchecked_duplicate).is_err());
+    }
+
+    #[test]
+    fn unknown_or_stopped_foreign_work_is_preserved_without_consumption_or_resume() {
+        let mut stores = PalsStores::new(StoreLimits::default());
+        let position = Position::startpos();
+        let root = stores.focus_actual_moves(position.snapshot()).unwrap();
+        let state = stores.situations.get(root).unwrap().state;
+        let execution = match stores
+            .request_task(external_key(state), consumer(&stores, root, 1, 100), 0)
+            .unwrap()
+        {
+            TaskAdmission::Start(id) => id,
+            _ => panic!("start"),
+        };
+        let pv = stores
+            .append_cpu_pv(&position, &moves("e2e4 e7e5"))
+            .unwrap();
+        let mut record = external_observation(state, execution, pv);
+        record.checker_work = Some(CheckerWork::default());
+        record.budget = 0;
+        record.external_report.as_mut().unwrap().work = CheckerWork::default();
+        let unknown = stores.append_observation(record.clone()).unwrap();
+        assert!(stores.complete_task(execution, unknown).is_err());
+        assert!(stores.pause_task(execution, 7, Some(unknown)).is_err());
+        assert!(stores.tasks.pause(execution, 7, Some(unknown)).is_err());
+        record.checker_work = Some(CheckerWork {
+            nodes: Some(20),
+            ..CheckerWork::default()
+        });
+        record.budget = 20;
+        let report = record.external_report.as_mut().unwrap();
+        report.work = record.checker_work.unwrap();
+        report.completion = ExternalCompletion::StoppedDeadline;
+        let stopped = stores.append_observation(record).unwrap();
+        assert!(stores.complete_task(execution, stopped).is_err());
+        stores.tasks.fail(execution).unwrap();
+        assert_eq!(
+            stores.consume_task(execution, 1, 2),
+            Err(StoreError::NotCompleted)
+        );
+        assert_eq!(
+            stores
+                .observations
+                .get(unknown)
+                .unwrap()
+                .checker_work
+                .unwrap()
+                .nodes,
+            None
+        );
+        assert!(matches!(
+            stores
+                .request_task(external_key(state), consumer(&stores, root, 2, 100), 2)
+                .unwrap(),
+            TaskAdmission::Start(_)
+        ));
+    }
+
+    #[test]
+    fn raw_table_completion_cannot_authorize_foreign_partial_consumption_or_reuse() {
+        for (nodes, completion) in [
+            (None, ExternalCompletion::BestMove),
+            (Some(20), ExternalCompletion::StoppedDeadline),
+        ] {
+            let mut stores = PalsStores::new(StoreLimits::default());
+            let position = Position::startpos();
+            let root = stores.focus_actual_moves(position.snapshot()).unwrap();
+            let state = stores.situations.get(root).unwrap().state;
+            let execution = match stores
+                .request_task(external_key(state), consumer(&stores, root, 1, 100), 0)
+                .unwrap()
+            {
+                TaskAdmission::Start(id) => id,
+                _ => panic!("start"),
+            };
+            let pv = stores
+                .append_cpu_pv(&position, &moves("e2e4 e7e5"))
+                .unwrap();
+            let mut record = external_observation(state, execution, pv);
+            record.checker_work.as_mut().unwrap().nodes = nodes;
+            record.budget = nodes.unwrap_or(0);
+            let report = record.external_report.as_mut().unwrap();
+            report.work.nodes = nodes;
+            report.completion = completion;
+            let partial = stores.append_observation(record).unwrap();
+            assert!(stores.complete_task(execution, partial).is_err());
+            stores.tasks.complete(execution, partial).unwrap();
+            assert!(stores.consume_task(execution, 1, 2).is_err());
+            assert!(
+                stores
+                    .request_task(external_key(state), consumer(&stores, root, 2, 100), 2)
+                    .is_err()
+            );
+            assert_eq!(stores.tasks.consumer_count(), 1);
+        }
+    }
+
+    #[test]
+    fn model_wdl_requires_full_identity_and_actual_input_key() {
+        let mut record = observation(StateId(0), None, ObservationKind::Proposal);
+        record.score = RawScore::Wdl {
+            win: 0.5,
+            draw: 0.25,
+            loss: 0.25,
+            perspective: Color::White,
+        };
+        let mut store = ObservationStore::new(4);
+        assert!(store.append(record.clone()).is_err());
+        record.value_identity = None;
+        record.cpu_condition = None;
+        record.scope = EvidenceScope::Model {
+            model: 1,
+            encoding: 1,
+            input: 1,
+        };
+        record.score = RawScore::Wdl {
+            win: 0.5,
+            draw: 0.25,
+            loss: 0.25,
+            perspective: Color::White,
+        };
+        assert!(store.append(record.clone()).is_err());
+        record.model_value_identity = Some(super::super::value::ModelValueIdentity {
+            semantics: super::super::value::MODEL_WDL_VALUE_SEMANTICS.into(),
+            model: "fixture-model".into(),
+            encoding: "entity-fixture/1".into(),
+            precision: "f32".into(),
+            model_epoch: [1; 32],
+        });
+        assert!(store.append(record.clone()).is_err());
+        record.model_value_input = Some([2; 32]);
+        assert!(store.append(record.clone()).is_ok());
+        record.model_value_identity.as_mut().unwrap().encoding = String::with_capacity(257);
+        record
+            .model_value_identity
+            .as_mut()
+            .unwrap()
+            .encoding
+            .push_str("short");
+        assert!(store.append(record).is_err());
     }
 
     #[test]

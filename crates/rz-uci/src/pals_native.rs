@@ -503,7 +503,10 @@ mod native {
         RuntimeRoleRequest, SharedPalsScope, SharedRepresentationScope,
     };
     use rz_runtime::{Backend, BackendResult, Clock, Limits, Resources};
-    use rz_search::pals::engine::{RoleEvaluation, RoleModel, RoleSearchClosure};
+    use rz_search::pals::engine::{
+        MODEL_WDL_VALUE_SEMANTICS, ModelValueIdentity, ModelValueOutput, RoleEvaluation, RoleModel,
+        RoleSearchClosure,
+    };
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::Poll;
@@ -525,6 +528,19 @@ mod native {
         counter
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1))
             .map_err(|_| RoleError::Backend("PALS owner ID epoch exhausted".into()))
+    }
+    fn frontier_value_identity(
+        identity: &str,
+        model_epoch: [u8; 32],
+        encoding: Digest,
+    ) -> ModelValueIdentity {
+        ModelValueIdentity {
+            semantics: MODEL_WDL_VALUE_SEMANTICS.into(),
+            model: identity.into(),
+            encoding: encoding.0.iter().map(|b| format!("{b:02x}")).collect(),
+            precision: "fp32".into(),
+            model_epoch,
+        }
     }
     struct WorkerOwner {
         worker: Mutex<NativeWorker>,
@@ -1572,6 +1588,7 @@ mod native {
 
     pub struct NativeRoleModel {
         identity: String,
+        value_identity: ModelValueIdentity,
         epoch: ProcessEpoch,
         model_epoch: [u8; 32],
         model: Digest,
@@ -1702,6 +1719,10 @@ mod native {
                     execution.session_arena_bytes.unwrap_or(0)
                 ));
             }
+            // The selected graph/encoding/FP32 namespace is fixed at startup.
+            // Each delivered value still carries its actual prepared input key.
+            let value_identity = frontier_value_identity(&identity, model_epoch, encoding);
+            value_identity.validate()?;
             let epoch = ProcessEpoch(next(&EPOCHS)?);
             let clock = ContractSystemClock::new(epoch);
             let authority = SearchAuthority {
@@ -1794,6 +1815,7 @@ mod native {
             .map_err(model_error)?;
             Ok(Self {
                 identity,
+                value_identity,
                 epoch,
                 model_epoch,
                 model,
@@ -2688,6 +2710,40 @@ mod native {
         fn identity(&self) -> &str {
             &self.identity
         }
+        fn value_identity(&self) -> Option<&ModelValueIdentity> {
+            Some(&self.value_identity)
+        }
+        fn evaluate_value(&mut self, query: RoleQuery<'_>) -> Result<ModelValueOutput, RoleError> {
+            // Frontier evaluation uses the existing proposer forward/shared WDL
+            // head. Its candidate-policy output is unused. This is a contextual
+            // model estimate, not a candidate value or foreign-CP calibration.
+            let state = query.position.position_identity();
+            let perspective = query.position.side_to_move();
+            let input = prepare_role_input(&query, NativeQueryKind::Propose, self.model_epoch)?;
+            let output = self.run(
+                input,
+                query.position,
+                query.deadline,
+                query.cancel,
+                NativePreparedContext::Role {
+                    query: &query,
+                    kind: NativeQueryKind::Propose,
+                },
+            )?;
+            // This key was formed from the exact request before physical Run.
+            // Do not reconstruct it after Run: remaining-time features change.
+            let input_sha256 = output.key.input.0;
+            let RolePayload::Proposal { wdl, .. } = output.payload else {
+                return Err(RoleError::InvalidOutput);
+            };
+            Ok(ModelValueOutput {
+                identity: self.value_identity.clone(),
+                input_sha256,
+                state,
+                perspective,
+                wdl: wdl.probabilities(),
+            })
+        }
         fn propose(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
             self.evaluate(query, NativeQueryKind::Propose)
         }
@@ -2978,6 +3034,11 @@ mod native {
             .unwrap();
             NativeRoleModel {
                 identity: "pals-native-lifecycle-fixture".into(),
+                value_identity: frontier_value_identity(
+                    "pals-native-lifecycle-fixture",
+                    [3; 32],
+                    encoding,
+                ),
                 epoch,
                 model_epoch: [3; 32],
                 model,
@@ -3027,6 +3088,92 @@ mod native {
                 cancel,
             }
         }
+        #[test]
+        fn frontier_value_preserves_actual_prepared_key_and_single_consumption() {
+            let keys = Arc::new(Mutex::new(Vec::new()));
+            let observed = Arc::clone(&keys);
+            let mut model = fixture_model(move |command| match command {
+                PalsNativeCommand::Evaluate(input) => {
+                    observed.lock().unwrap().push(
+                        input
+                            .canonical_input_key(&PalsModelConfig::baseline())
+                            .unwrap(),
+                    );
+                    PhysicalRun::Complete(Ok(output(input)))
+                }
+                PalsNativeCommand::SnapshotStats => {
+                    PhysicalRun::Complete(Ok(PalsNativeResult::Stats(PalsBackendStats::default())))
+                }
+                _ => panic!("unexpected frontier fixture command"),
+            });
+            let position = Position::startpos();
+            let legal = position.legal_moves();
+            let cancel = AtomicBool::new(false);
+            let identity = model.value_identity().unwrap().clone();
+            assert_eq!(identity.model, model.identity());
+            assert_eq!(identity.model_epoch, [3; 32]);
+            assert_eq!(identity.precision, "fp32");
+            let mut delivered = Vec::new();
+            for revision in [0, 1] {
+                let mut request = query(&position, &legal, &cancel);
+                request.revision = revision;
+                let value = model.evaluate_value(request).unwrap();
+                value.validate(&position, &identity).unwrap();
+                assert_eq!(value.perspective, Color::White);
+                delivered.push(value.input_sha256);
+                assert_eq!(
+                    model.owner.consumed.load(Ordering::Acquire),
+                    revision,
+                    "delivery is not search consumption",
+                );
+                model.accepted_output();
+                model.accepted_output();
+                assert_eq!(model.owner.consumed.load(Ordering::Acquire), revision + 1);
+                assert_eq!(model.owner.in_flight.load(Ordering::Acquire), 0);
+            }
+            assert_eq!(*keys.lock().unwrap(), delivered);
+            assert_ne!(
+                delivered[0], delivered[1],
+                "revision is actual input identity"
+            );
+            assert_eq!(model.owner.completed.load(Ordering::Acquire), 2);
+            model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+        }
+
+        #[test]
+        fn canceled_or_expired_frontier_value_never_dispatches_or_consumes() {
+            let mut model = fixture_model(|command| match command {
+                PalsNativeCommand::SnapshotStats => {
+                    PhysicalRun::Complete(Ok(PalsNativeResult::Stats(PalsBackendStats::default())))
+                }
+                _ => panic!("canceled frontier dispatched physical work"),
+            });
+            let position = Position::startpos();
+            let legal = position.legal_moves();
+            let cancel = AtomicBool::new(true);
+            assert!(matches!(
+                model.evaluate_value(query(&position, &legal, &cancel)),
+                Err(RoleError::Canceled),
+            ));
+            cancel.store(false, Ordering::Release);
+            let mut request = query(&position, &legal, &cancel);
+            request.deadline = Instant::now();
+            assert!(matches!(
+                model.evaluate_value(request),
+                Err(RoleError::Deadline)
+            ));
+            assert_eq!(model.owner.completed.load(Ordering::Acquire), 0);
+            assert_eq!(model.owner.consumed.load(Ordering::Acquire), 0);
+            assert_eq!(model.owner.in_flight.load(Ordering::Acquire), 0);
+            model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+        }
+
         #[test]
         fn transient_cuda_reservations_follow_bounded_tensor_layout() {
             let (request, execution) = transient_device_layout().unwrap();

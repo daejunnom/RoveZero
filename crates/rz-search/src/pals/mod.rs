@@ -2,3 +2,4 @@
 //! from PUCT's visits and backup accounting.
 pub mod engine;
 pub mod store;
+pub mod value;
