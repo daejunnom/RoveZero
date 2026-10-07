@@ -6,6 +6,8 @@
 //! comparative preference rank, or proof of the game's outcome. Resume tokens
 //! stay opaque and inside this invocation; interrupted stacks are not restored.
 
+pub mod candidate;
+
 use crate::engine::{OwnerRegistry, RulesUciPort};
 use crate::pals_native::pals_history_digest;
 use crate::{Command, ParserLimits, PositionPort, parse};

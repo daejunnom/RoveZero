@@ -1,4 +1,8 @@
-//! One bounded JSON CPU_T request. No UCI engine/GPU/model/teacher is launched.
+//! One bounded JSON V task, or --candidate-only fresh single-candidate check.
+//! No child UCI engine/GPU/model/teacher is launched.
+use rz_uci::pals_cpu_task::candidate::{
+    self, CandidateRawReport, CandidateReceipt, CandidateTaskError,
+};
 use rz_uci::pals_cpu_task::{
     CpuTaskError, MAX_REQUEST_BYTES, MAX_SELF_BINARY_BYTES, MAX_WALL_TIME_MS, capabilities,
     dispatch_started, request_admission,
@@ -63,7 +67,8 @@ fn read_request(started: Instant) -> Result<Vec<u8>, CpuTaskError> {
 
 fn own_binary_sha(deadline: Instant) -> Result<String, CpuTaskError> {
     // On Linux the proc handle names the loaded executable inode even if a
-    // path is replaced after launch. Other hosts use current_exe's own image.
+    // path is replaced after launch. Other hosts hash current_exe's path: this
+    // does not provide Linux's loaded-inode guarantee, and callers pin the scope.
     #[cfg(target_os = "linux")]
     let path = std::path::PathBuf::from("/proc/self/exe");
     #[cfg(not(target_os = "linux"))]
@@ -120,6 +125,50 @@ struct CliContext {
     started: Instant,
     deadline: Instant,
     output_limit: usize,
+    candidate_only: bool,
+    // Retain actual work if final stdout delivery fails. Deadline exhaustion
+    // still grants no stderr grace; supervisors preserve partial pipe evidence.
+    candidate_report: Option<Box<CandidateRawReport>>,
+}
+
+enum CliError {
+    V(CpuTaskError),
+    Candidate(CandidateTaskError),
+}
+
+impl CliContext {
+    fn transport_error(&self, error: CpuTaskError) -> CliError {
+        if self.candidate_only {
+            let mut error = CandidateTaskError::new(error.stage, error.message);
+            if let Some(report) = &self.candidate_report {
+                error = error.with_report(report);
+            }
+            CliError::Candidate(error)
+        } else {
+            CliError::V(error)
+        }
+    }
+}
+
+fn cli_binary_scope() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "linux_loaded_executable_inode"
+    } else {
+        "current_exe_path_hash"
+    }
+}
+
+fn arguments(args: &[String]) -> Result<(bool, bool), CpuTaskError> {
+    match args {
+        [] => Ok((false, false)),
+        [a] if a == "--capabilities" => Ok((false, true)),
+        [a] if a == "--candidate-only" => Ok((true, false)),
+        [a, b] if a == "--candidate-only" && b == "--capabilities" => Ok((true, true)),
+        _ => Err(failure(
+            "arguments",
+            "supported modes: no arguments, --capabilities, --candidate-only, --candidate-only --capabilities",
+        )),
+    }
 }
 
 fn annotate(mut error: CpuTaskError, context: &CliContext) -> CpuTaskError {
@@ -135,33 +184,77 @@ fn annotate(mut error: CpuTaskError, context: &CliContext) -> CpuTaskError {
     error
 }
 
-fn run(context: &mut CliContext) -> Result<Vec<u8>, CpuTaskError> {
+fn run(context: &mut CliContext) -> Result<Vec<u8>, CliError> {
     let started = context.started;
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args == ["--capabilities"] {
+    context.candidate_only = args.first().is_some_and(|a| a == "--candidate-only");
+    let (candidate_only, show_capabilities) =
+        arguments(&args).map_err(|e| context.transport_error(e))?;
+    context.candidate_only = candidate_only;
+    if show_capabilities {
         let deadline = started
             .checked_add(Duration::from_millis(MAX_WALL_TIME_MS))
-            .ok_or_else(|| failure("admission", "capability deadline overflow"))?;
-        let binary = own_binary_sha(deadline)?;
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&capabilities()?).map_err(|e| failure("capabilities", e))?;
+            .ok_or_else(|| {
+                context.transport_error(failure("admission", "capability deadline overflow"))
+            })?;
+        let binary = own_binary_sha(deadline).map_err(|e| context.transport_error(e))?;
+        let capabilities = if candidate_only {
+            candidate::capabilities().map_err(CliError::Candidate)?
+        } else {
+            capabilities().map_err(CliError::V)?
+        };
+        let mut value: serde_json::Value = serde_json::from_slice(&capabilities)
+            .map_err(|e| context.transport_error(failure("capabilities", e)))?;
         value["cpu_binary_sha256"] = json!(binary);
-        let mut result = serde_json::to_vec(&value).map_err(|e| failure("capabilities", e))?;
+        if candidate_only {
+            value["binary_pin_scope"] = json!(cli_binary_scope());
+        }
+        let mut result = serde_json::to_vec(&value)
+            .map_err(|e| context.transport_error(failure("capabilities", e)))?;
         result.push(b'\n');
         return Ok(result);
     }
-    if !args.is_empty() {
-        return Err(failure(
-            "arguments",
-            "only no arguments or --capabilities are supported",
-        ));
-    }
-    let bytes = read_request(started)?;
-    let admission = request_admission(&bytes, started)?;
+    let bytes = read_request(started).map_err(|e| context.transport_error(e))?;
+    let admission = if candidate_only {
+        candidate::request_admission(&bytes, started).map_err(CliError::Candidate)?
+    } else {
+        request_admission(&bytes, started).map_err(CliError::V)?
+    };
     context.deadline = admission.deadline;
     context.output_limit = admission.output_limit;
-    let binary = own_binary_sha(context.deadline)?;
-    dispatch_started(&bytes, &binary, started)
+    let binary = own_binary_sha(context.deadline).map_err(|e| context.transport_error(e))?;
+    if !candidate_only {
+        return dispatch_started(&bytes, &binary, started).map_err(CliError::V);
+    }
+    let bytes =
+        candidate::dispatch_started(&bytes, &binary, started).map_err(CliError::Candidate)?;
+    let mut receipt: CandidateReceipt = serde_json::from_slice(&bytes)
+        .map_err(|e| context.transport_error(failure("candidate_receipt", e)))?;
+    context.candidate_report = Some(Box::new(receipt.report.clone()));
+    // This is an actual CLI observation, separate from a request's declared
+    // source registration. Linux loaded-inode and other-host path hashes differ.
+    receipt.binary_pin_scope = cli_binary_scope().into();
+    receipt.elapsed_ms = context
+        .started
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let mut bytes = serde_json::to_vec(&receipt)
+        .map_err(|e| context.transport_error(failure("candidate_receipt", e)))?;
+    bytes.push(b'\n');
+    if bytes.len() > context.output_limit {
+        return Err(context.transport_error(failure(
+            "output_bound",
+            "CLI candidate receipt exceeds admitted output bound",
+        )));
+    }
+    if Instant::now() >= context.deadline {
+        return Err(context.transport_error(failure(
+            "receipt_deadline",
+            "original absolute wall allowance expired after CLI image observation",
+        )));
+    }
+    Ok(bytes)
 }
 
 fn bounded_write<W: Write + Send + 'static>(
@@ -238,16 +331,27 @@ fn main() -> ExitCode {
         started,
         deadline,
         output_limit: 1024,
+        candidate_only: false,
+        candidate_report: None,
     };
     match run(&mut context) {
         Ok(bytes) => {
             match output_file(true).and_then(|file| bounded_write(file, bytes, context.deadline)) {
                 Ok(()) => ExitCode::SUCCESS,
+                Err(error) if context.candidate_only => {
+                    write_error(context.transport_error(error), &context)
+                }
                 Err(_) => ExitCode::from(1),
             }
         }
-        Err(error) => {
-            let error = annotate(error, &context);
+        Err(error) => write_error(error, &context),
+    }
+}
+
+fn write_error(error: CliError, context: &CliContext) -> ExitCode {
+    let mut bytes = match error {
+        CliError::V(error) => {
+            let error = annotate(error, context);
             // One bounded diagnostic on stderr; success emits no diagnostics.
             // If the richer receipt does not fit, retain honest known/unknown
             // work counters rather than replacing the error with a fake result.
@@ -261,14 +365,38 @@ fn main() -> ExitCode {
                     "full_error_omitted_for_output_bound":true}))
                     .unwrap_or_else(|_|b"{\"code\":\"cpu_task_failed\"}".to_vec());
             }
-            bytes.push(b'\n');
-            // When the original deadline is exhausted, do not invent an extra
-            // output grace. External supervisors retain partial pipe evidence.
-            let _ =
-                output_file(false).and_then(|file| bounded_write(file, bytes, context.deadline));
-            ExitCode::from(1)
+            bytes
         }
-    }
+        CliError::Candidate(mut error) => {
+            error.elapsed_ms = Some(
+                context
+                    .started
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
+            error.deadline_exceeded = Instant::now() >= context.deadline;
+            error.output_limit = context.output_limit;
+            let mut bytes = serde_json::to_vec(&error).unwrap_or_else(|_| {
+                b"{\"code\":\"cpu_candidate_error_serialization_failed\"}".to_vec()
+            });
+            if bytes.len() + 1 > error.output_limit {
+                bytes = serde_json::to_vec(
+                    &json!({"schema":error.schema,"code":error.code,"stage":error.stage,
+                    "known_nodes":error.known_nodes,"failed_check_work":error.failed_check_work,
+                    "report_present":error.report.is_some(),"cpu_calls":error.cpu_calls,
+                    "elapsed_ms":error.elapsed_ms,"deadline_exceeded":error.deadline_exceeded,
+                    "full_error_omitted_for_output_bound":true}),
+                )
+                .unwrap_or_else(|_| b"{\"code\":\"cpu_candidate_task_failed\"}".to_vec());
+            }
+            bytes
+        }
+    };
+    bytes.push(b'\n');
+    // No extra output grace after the original absolute wall allowance.
+    let _ = output_file(false).and_then(|file| bounded_write(file, bytes, context.deadline));
+    ExitCode::from(1)
 }
 
 #[cfg(test)]
@@ -304,11 +432,38 @@ mod tests {
             started,
             deadline: started + Duration::from_millis(1),
             output_limit: 4096,
+            candidate_only: false,
+            candidate_report: None,
         };
         let error = annotate(failure("self_binary", "deadline expired"), &context);
         assert!(error.deadline_exceeded);
         assert!(error.elapsed_ms.unwrap() >= 25);
         assert_eq!(error.output_limit, 4096);
         assert_eq!(error.known_nodes, None);
+    }
+
+    #[test]
+    fn candidate_mode_is_explicit_and_never_replaces_v_capabilities() {
+        assert_eq!(arguments(&[]).unwrap(), (false, false));
+        assert_eq!(
+            arguments(&["--capabilities".into()]).unwrap(),
+            (false, true)
+        );
+        assert_eq!(
+            arguments(&["--candidate-only".into()]).unwrap(),
+            (true, false)
+        );
+        assert_eq!(
+            arguments(&["--candidate-only".into(), "--capabilities".into()]).unwrap(),
+            (true, true)
+        );
+        assert!(arguments(&["--capabilities".into(), "--candidate-only".into()]).is_err());
+        let v: serde_json::Value = serde_json::from_slice(&capabilities().unwrap()).unwrap();
+        let candidate: serde_json::Value =
+            serde_json::from_slice(&candidate::capabilities().unwrap()).unwrap();
+        assert_eq!(v["schema"], "rz-pals-private-cpu-task/1");
+        assert_eq!(v["max_checks"], 2);
+        assert_eq!(candidate["schema"], candidate::CANDIDATE_SCHEMA);
+        assert_eq!(candidate["max_checks"], 1);
     }
 }
