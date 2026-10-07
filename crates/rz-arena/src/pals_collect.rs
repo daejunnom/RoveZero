@@ -35,6 +35,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "pals-collection-onnx")]
+mod native;
+#[cfg(feature = "pals-collection-onnx")]
+pub use native::{
+    OwnPalsOnnxCollectionDriver, PalsCollectionGraphPin, PalsNativeCollectionRegistry,
+};
+
 pub const PALS_COLLECT_VERSION: &str = "rz-pals-own-collector/1";
 const MAX_ROWS: usize = 65_536;
 const RECEIPT_RESERVE: u64 = 256 * 1024;
@@ -176,6 +183,11 @@ pub struct PalsCollectionSourceDescription {
     /// A real PALS provider must supply its actual registered epoch.
     pub model_epoch: [u8; 32],
     pub model_epoch_kind: String,
+    pub frozen_epoch: u64,
+    /// Actual native registration and execution configuration, absent for CPU/mock.
+    /// This is evidence metadata, not part of the model configuration digest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native: Option<serde_json::Value>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct PalsCollectedLine {
@@ -230,6 +242,59 @@ pub trait PalsCollectionDriver {
         limits: CpuLimits,
         cancel: &AtomicBool,
     ) -> Result<PalsCollectionDecision, ArenaError>;
+    /// Real role models seal their exact prepared inputs through the native
+    /// observer. The synthetic CPU/mock root encoder is never their producer.
+    fn records_actual_native_calls(&self) -> bool {
+        false
+    }
+    fn analyze_native(
+        &mut self,
+        _context: PalsNativeCaptureContext,
+        _limits: CpuLimits,
+        _cancel: &AtomicBool,
+    ) -> Result<PalsCollectionDecision, ArenaError> {
+        Err(invalid("driver has no actual native collection path"))
+    }
+    /// Drain even when analyze_native returned an error. Already sealed input
+    /// and physically returned raw evidence must survive logical rejection.
+    fn take_native_trace(&mut self) -> Result<PalsNativeTrace, ArenaError> {
+        Ok(PalsNativeTrace::default())
+    }
+    fn finish_collection(
+        &mut self,
+        _until: Instant,
+    ) -> Result<Option<serde_json::Value>, ArenaError> {
+        Ok(None)
+    }
+    fn receipt_preserved(&mut self) {}
+}
+
+pub struct PalsNativeCaptureContext {
+    pub position: Position,
+    pub opening: PalsCollectionOpening,
+    pub game: String,
+    pub actual_moves: Vec<BoardMove>,
+    pub sequence: u64,
+    pub max_bytes: u64,
+}
+#[derive(Default)]
+pub struct PalsNativeTrace {
+    pub sequence: u64,
+    /// Exclusive credit delegated from Output before dispatch; includes the
+    /// worst-case physically completed raw output and close-stage evidence.
+    pub reserved_bytes: u64,
+    pub cpu_nodes: u64,
+    pub cpu_jobs: u64,
+    pub cpu_work_observation_incomplete: bool,
+    pub rows: Vec<PalsNativeTraceRow>,
+    pub inputs: Vec<(PalsFrozenInput, bool)>,
+    pub failure: Option<String>,
+}
+pub struct PalsNativeTraceRow {
+    pub artifact: &'static str,
+    /// Exact bytes serialized and budget-admitted by the observer. Persisting
+    /// these does not regenerate a deadline feature or canonical float form.
+    pub json: Vec<u8>,
 }
 
 fn hex(value: [u8; 32]) -> String {
@@ -276,21 +341,27 @@ fn file_sha(path: &Path, max_bytes: u64) -> Result<String, ArenaError> {
 }
 
 fn source_description(
-    config: &CpuConfig,
+    engine: &CpuEngine,
     mode: &str,
     extra: serde_json::Value,
 ) -> Result<PalsCollectionSourceDescription, ArenaError> {
+    let config = engine.config();
+    engine
+        .value_identity()
+        .validate()
+        .map_err(|e| invalid(e.to_string()))?;
     let implementation = file_sha(&std::env::current_exe().map_err(io)?, 256 * 1024 * 1024)?;
     let configuration = serde_json::json!({"domain":"rz-own-cpu-configuration/1","mode":mode,
         "search":CPU_SEARCH_VERSION,"evaluator":BOOTSTRAP_SCORE_VERSION,"profile":config.profile.identity(),
-        "tt_entries":config.tt_entries,"max_depth":config.max_depth,"quiescence_ply":config.quiescence_ply,"extra":extra});
+        "tt_entries":config.tt_entries,"max_depth":config.max_depth,"quiescence_ply":config.quiescence_ply,
+        "value_identity":engine.value_identity(),"value_precision":if engine.value_identity().weights_sha256.is_some(){"fp32"}else{"integer_cp"},"extra":extra});
     let profile = canonical_sha256(&configuration)?;
     Ok(PalsCollectionSourceDescription {
         mode: mode.into(),
         source: PalsInputSource::OwnCpu {
             cpu_binary_sha256: implementation.clone(),
             evaluator_configuration_sha256: profile.clone(),
-            model_weights_sha256: None,
+            model_weights_sha256: engine.value_identity().weights_sha256.clone(),
         },
         cpu_profile_sha256: profile,
         implementation_sha256: implementation,
@@ -299,7 +370,63 @@ fn source_description(
         configuration,
         model_epoch: [0; 32],
         model_epoch_kind: "encoding_only_zero".into(),
+        frozen_epoch: 0,
+        native: None,
     })
+}
+
+/// Read-only registration facts from the actual executable and Rust encoder.
+/// This does not load/enroll a model or claim any NN execution or training.
+pub fn pals_collection_registration_description() -> Result<serde_json::Value, ArenaError> {
+    let cpu = CpuEngine::new(CpuConfig::default()).map_err(|e| invalid(e.to_string()))?;
+    let source = source_description(&cpu, "own-pals-native-cpu-tasks", serde_json::Value::Null)?;
+    let model = PalsModelConfig::baseline();
+    Ok(
+        serde_json::json!({"version":"rz-pals-collection-registration-description/1",
+        "collector_binary_sha256":source.implementation_sha256,"model_configuration":model,
+        "model_configuration_sha256":canonical_sha256(&model)?,"encoding_sha256":source.encoding_sha256,
+        "encoder_source_sha256":source.encoder_source_sha256,"cpu_configuration_sha256":source.cpu_profile_sha256,
+        "cpu_task_source":source,"native_model_loaded":false,"actual_training_executed":false}),
+    )
+}
+
+/// Reject unsafe output placement/name before expensive native initialization.
+/// Output::new repeats the authoritative checks when creating its fresh slot.
+pub fn validate_pals_collection_output(root: &Path, run_id: &str) -> Result<(), ArenaError> {
+    if !ident(run_id)
+        || !root.is_absolute()
+        || root
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(invalid(
+            "collection output requires absolute path and bounded fresh run ID",
+        ));
+    }
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| invalid("checkout location unavailable"))?
+        .canonicalize()
+        .map_err(io)?;
+    let mut ancestor = root;
+    while !ancestor.exists() {
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| invalid("output root has no existing ancestor"))?;
+    }
+    let resolved = ancestor.canonicalize().map_err(io)?;
+    if !resolved.is_dir() || resolved.starts_with(&checkout) || inside_git(&resolved) {
+        return Err(invalid(
+            "collection outputs must remain outside Git checkout",
+        ));
+    }
+    if root.exists() && root.canonicalize().map_err(io)?.join(run_id).exists() {
+        return Err(invalid(
+            "collection run already exists; overwrite forbidden",
+        ));
+    }
+    Ok(())
 }
 
 pub struct OwnCpuCollectionDriver {
@@ -308,9 +435,9 @@ pub struct OwnCpuCollectionDriver {
 }
 impl OwnCpuCollectionDriver {
     pub fn new(config: CpuConfig) -> Result<Self, ArenaError> {
-        let description =
-            source_description(&config, "own-cpu-bootstrap", serde_json::Value::Null)?;
         let engine = CpuEngine::new(config).map_err(|e| invalid(e.to_string()))?;
+        let description =
+            source_description(&engine, "own-cpu-bootstrap", serde_json::Value::Null)?;
         Ok(Self {
             engine,
             description,
@@ -321,7 +448,7 @@ fn cpu_raw(report: &CpuReport) -> serde_json::Value {
     serde_json::json!({"search_version":report.search_version,"profile":report.profile.identity(),
         "score_provenance":report.score_provenance,"raw_score":report.score,"score_scope":format!("{:?}",report.score_scope),
         "completed_depth":report.completed_depth,"nodes":report.nodes,"quiescence_nodes":report.quiescence_nodes,
-        "tt_hits":report.tt_hits,"completion":format!("{:?}",report.completion),"root_restricted":report.root_restricted,
+        "tt_hits":report.tt_hits,"completion":format!("{:?}",report.completion),"root_restricted":report.root_restricted,"value_identity":report.value_identity,"value_precision":if report.value_identity.weights_sha256.is_some(){"fp32"}else{"integer_cp"},
         "pv":report.pv.iter().map(ToString::to_string).collect::<Vec<_>>(),"elapsed_us":report.elapsed.as_micros().min(u64::MAX as u128) as u64})
 }
 impl PalsCollectionDriver for OwnCpuCollectionDriver {
@@ -372,13 +499,10 @@ impl OwnPalsMockCollectionDriver {
     pub fn new(cpu: CpuConfig, config: PalsConfig) -> Result<Self, ArenaError> {
         let extra = serde_json::json!({"beam":config.beam_width,"line_plies":config.line_plies,"max_nodes":config.max_nodes,
             "max_records":config.max_records,"max_role_calls":config.max_role_calls,"cpu_nodes_per_task":config.cpu_nodes_per_task});
+        let cpu = CpuEngine::new(cpu).map_err(|e| invalid(e.to_string()))?;
         let description = source_description(&cpu, "own-pals-legal-order-cpu-mock", extra)?;
-        let engine = PalsEngine::new(
-            config,
-            LegalOrderRoleMock,
-            CpuEngine::new(cpu).map_err(|e| invalid(e.to_string()))?,
-        )
-        .map_err(|e| invalid(e.to_string()))?;
+        let engine =
+            PalsEngine::new(config, LegalOrderRoleMock, cpu).map_err(|e| invalid(e.to_string()))?;
         Ok(Self {
             engine,
             description,
@@ -669,6 +793,91 @@ impl Output {
         self.write(name, &line, false)?;
         Ok(digest)
     }
+    fn native_credit(&self) -> u64 {
+        (self.max_bytes - RECEIPT_RESERVE).saturating_sub(self.bytes)
+    }
+    fn native_trace(&mut self, trace: &PalsNativeTrace) -> Result<(), ArenaError> {
+        if trace.reserved_bytes > self.native_credit()
+            || trace.rows.len() > MAX_ROWS * 8
+            || trace.inputs.len() > MAX_ROWS
+        {
+            return Err(ArenaError::Budget(
+                "native collection delegated output credit".into(),
+            ));
+        }
+        let written = trace.rows.iter().try_fold(0_u64, |sum, row| {
+            if !matches!(
+                row.artifact,
+                "inputs.jsonl"
+                    | "native-inputs.jsonl"
+                    | "input-lineage.jsonl"
+                    | "native-events.jsonl"
+                    | "native-raw-outputs.jsonl"
+                    | "public-record-sources.jsonl"
+                    | "native-divergence-inputs.jsonl"
+                    | "native-divergence-sidecars.jsonl"
+                    | "native-work-summary.jsonl"
+            ) || row.json.len() > MAX_JSON_RECORD_BYTES
+            {
+                return Err(invalid("native collector artifact/record limit"));
+            }
+            sum.checked_add(row.json.len() as u64 + 1)
+                .ok_or_else(|| invalid("native collector byte overflow"))
+        })?;
+        if written > trace.reserved_bytes {
+            return Err(invalid(
+                "native collector exceeded its dispatch reservation",
+            ));
+        }
+        // The producer had exclusive delegated credit during analysis. Charge
+        // that reservation exactly once, including unused/failure allowances.
+        self.bytes = self
+            .bytes
+            .checked_add(trace.reserved_bytes)
+            .ok_or_else(|| invalid("native collector reservation overflow"))?;
+        let mut first_failure = None;
+        for row in &trace.rows {
+            let name = row.artifact;
+            if self.failed_artifacts.contains(name) {
+                continue;
+            }
+            if !self.files.contains_key(name) {
+                let opened = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(self.directory.join(name));
+                match opened {
+                    Ok(file) => {
+                        self.files.insert(name, file);
+                    }
+                    Err(error) => {
+                        self.failed_artifacts.insert(name);
+                        if first_failure.is_none() {
+                            first_failure = Some(io(error));
+                        }
+                        continue;
+                    }
+                }
+            }
+            let file = self
+                .files
+                .get_mut(name)
+                .ok_or_else(|| invalid("native output file missing"))?;
+            if let Err(error) = file
+                .write_all(&row.json)
+                .and_then(|_| file.write_all(b"\n"))
+            {
+                self.failed_artifacts.insert(name);
+                if first_failure.is_none() {
+                    first_failure = Some(io(error));
+                }
+            }
+        }
+        match first_failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
     fn final_json<T: Serialize>(
         &mut self,
         name: &'static str,
@@ -723,6 +932,7 @@ pub struct PalsCollectionReceipt {
     pub games_finished: u32,
     pub cpu_nodes: u64,
     pub cpu_jobs: u64,
+    pub cpu_work_observation_incomplete: bool,
     pub wall_time_ms: u64,
     /// Payload written before this receipt; the receipt reserve is separately declared.
     pub data_output_bytes: u64,
@@ -737,12 +947,15 @@ pub struct PalsCollectionReceipt {
     pub artifacts: BTreeMap<String, PalsCollectionArtifact>,
     pub actual_training_executed: bool,
     pub external_teacher_used: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_finish: Option<serde_json::Value>,
 }
 
 struct Collection {
     sequence: u64,
     nodes: u64,
     jobs: u64,
+    work_incomplete: bool,
     rows: Vec<PalsLearningRecord>,
     inputs: Vec<CapturedInput>,
     assignments: BTreeMap<String, PalsSplit>,
@@ -770,6 +983,66 @@ impl Collection {
         row.validate()?;
         output.json("records.jsonl", &row)?;
         self.rows.push(row);
+        Ok(())
+    }
+    fn take_native(
+        &mut self,
+        output: &mut Output,
+        trace: PalsNativeTrace,
+        limits: CpuLimits,
+    ) -> Result<(), ArenaError> {
+        if self
+            .inputs
+            .len()
+            .checked_add(trace.inputs.len())
+            .is_none_or(|n| n > MAX_ROWS)
+            || trace.sequence < self.sequence
+        {
+            return Err(ArenaError::Budget("native input/sequence limit".into()));
+        }
+        for (input, _) in &trace.inputs {
+            input.verify()?;
+            if input.snapshot().capture_sequence <= self.sequence
+                || input.snapshot().capture_sequence > trace.sequence
+                || !matches!(input.snapshot().source, PalsInputSource::OwnPals { .. })
+            {
+                return Err(invalid(
+                    "native collector sealed input sequence/source mismatch",
+                ));
+            }
+        }
+        self.nodes = self
+            .nodes
+            .checked_add(trace.cpu_nodes)
+            .ok_or_else(|| invalid("native CPU node counter overflow"))?;
+        self.jobs = self
+            .jobs
+            .checked_add(trace.cpu_jobs)
+            .ok_or_else(|| invalid("native CPU task counter overflow"))?;
+        self.work_incomplete |= trace.cpu_work_observation_incomplete;
+        output.native_trace(&trace)?;
+        self.sequence = trace.sequence;
+        let exceeded_nodes = trace.cpu_nodes > limits.max_nodes;
+        self.inputs
+            .extend(
+                trace
+                    .inputs
+                    .into_iter()
+                    .map(|(input, outcome_eligible)| CapturedInput {
+                        input,
+                        outcome_eligible,
+                    }),
+            );
+        if exceeded_nodes {
+            return Err(invalid(
+                "native CPU work exceeded the actual requested node budget",
+            ));
+        }
+        if let Some(failure) = trace.failure {
+            return Err(invalid(format!(
+                "native collector observer failed: {failure}"
+            )));
+        }
         Ok(())
     }
     fn capture(
@@ -836,7 +1109,7 @@ impl Collection {
             transposition_sha256: transposition_sha(position),
             encoding_sha256: source.encoding_sha256.clone(),
             source: source.source.clone(),
-            frozen_epoch: 0,
+            frozen_epoch: source.frozen_epoch,
             input_revision: sequence,
             capture_sequence: sequence,
             white_to_move: position.side_to_move() == Color::White,
@@ -906,6 +1179,7 @@ impl Collection {
             value,
             completed_depth,
             score_scope: scope,
+            cpu_observation: None,
             perspective: position.side_to_move(),
             critical: false,
         };
@@ -1162,12 +1436,24 @@ fn checked_source(description: &PalsCollectionSourceDescription) -> Result<(), A
             evaluator_configuration_sha256,
             model_weights_sha256,
         } => {
+            let value_identity: rz_search::cpu_value::CpuValueIdentity = serde_json::from_value(
+                description
+                    .configuration
+                    .get("value_identity")
+                    .cloned()
+                    .ok_or_else(|| invalid("CPU source lacks exact evaluator value identity"))?,
+            )
+            .map_err(|e| invalid(e.to_string()))?;
+            value_identity
+                .validate()
+                .map_err(|e| invalid(e.to_string()))?;
             if cpu_binary_sha256 != &description.implementation_sha256
                 || evaluator_configuration_sha256 != &digest
                 || digest != description.cpu_profile_sha256
-                || model_weights_sha256.is_some()
+                || model_weights_sha256 != &value_identity.weights_sha256
                 || description.model_epoch != [0; 32]
                 || description.model_epoch_kind != "encoding_only_zero"
+                || description.frozen_epoch != 0
             {
                 return Err(invalid(
                     "weightless own-CPU source does not match actual configuration or encoding-only epoch",
@@ -1181,6 +1467,7 @@ fn checked_source(description: &PalsCollectionSourceDescription) -> Result<(), A
             if model_configuration_sha256 != &digest
                 || description.model_epoch_kind != "frozen_model_epoch"
                 || description.model_epoch == [0; 32]
+                || description.frozen_epoch == 0
             {
                 return Err(invalid(
                     "neural PALS source needs verified model configuration and actual frozen epoch",
@@ -1255,6 +1542,7 @@ pub fn collect_pals_own_data(
         sequence: 0,
         nodes: 0,
         jobs: 0,
+        work_incomplete: false,
         rows: Vec::new(),
         inputs: Vec::new(),
         assignments: BTreeMap::new(),
@@ -1267,7 +1555,7 @@ pub fn collect_pals_own_data(
     let mut conditional_cpu =
         CpuEngine::new(CpuConfig::default()).map_err(|e| invalid(e.to_string()))?;
     let conditional_description = source_description(
-        conditional_cpu.config(),
+        &conditional_cpu,
         "own-cpu-conditional-verification",
         serde_json::Value::Null,
     )?;
@@ -1347,22 +1635,27 @@ pub fn collect_pals_own_data(
                     end = Some((PalsOutcome::Unknown, PalsGameEnd::WallTimeLimit));
                     break;
                 }
-                let (input, prepared) = state.capture(
-                    &mut output,
-                    &position,
-                    opening,
-                    &game,
-                    position_command(opening, &moves),
-                    &moves,
-                    PalsDataRole::Proposer,
-                    &description,
-                    true,
-                    &[],
-                    &[],
-                    None,
-                    deadline,
-                    cancel,
-                )?;
+                let native_calls = driver.records_actual_native_calls();
+                let root_capture = if native_calls {
+                    None
+                } else {
+                    Some(state.capture(
+                        &mut output,
+                        &position,
+                        opening,
+                        &game,
+                        position_command(opening, &moves),
+                        &moves,
+                        PalsDataRole::Proposer,
+                        &description,
+                        true,
+                        &[],
+                        &[],
+                        None,
+                        deadline,
+                        cancel,
+                    )?)
+                };
                 if let Some(terminal) = termination(&position)? {
                     end = Some(terminal);
                     break;
@@ -1382,14 +1675,40 @@ pub fn collect_pals_own_data(
                 let job = job_limits(&config, &state, deadline)?;
                 let task_sha = canonical_sha256(&(
                     "rz-pals-own-task/1",
-                    input.sha256(),
+                    root_capture.as_ref().map(|(input, _)| input.sha256()),
+                    state_sha(&position)?,
                     description.cpu_profile_sha256.as_str(),
                     job.max_depth,
                     job.max_nodes,
                     "propose",
                 ))?;
-                let decision = driver.analyze(&position, &input, &prepared, job, cancel)?;
-                account(&mut state, job, decision.nodes)?;
+                let decision = if native_calls {
+                    let analyzed = driver.analyze_native(
+                        PalsNativeCaptureContext {
+                            position: position.clone(),
+                            opening: opening.clone(),
+                            game: game.clone(),
+                            actual_moves: moves.clone(),
+                            sequence: state.sequence,
+                            max_bytes: output.native_credit(),
+                        },
+                        job,
+                        cancel,
+                    );
+                    // Always preserve prepared/raw/rejected events before
+                    // propagating the native search error or attempting a move.
+                    let trace = driver.take_native_trace()?;
+                    state.take_native(&mut output, trace, job)?;
+                    analyzed?
+                } else {
+                    let (input, prepared) = root_capture
+                        .as_ref()
+                        .ok_or_else(|| invalid("CPU root capture missing"))?;
+                    driver.analyze(&position, input, prepared, job, cancel)?
+                };
+                if !native_calls {
+                    account(&mut state, job, decision.nodes)?;
+                }
                 let Some(movement) = decision.best_move else {
                     return Err(invalid(
                         "own source returned no move for an ongoing Rules state",
@@ -1397,10 +1716,14 @@ pub fn collect_pals_own_data(
                 };
                 let (_, legality) = replay_line(&position, &decision.pv)?;
                 let sequence = state.next()?;
-                let raw_sha=output.json("observations.jsonl",&serde_json::json!({"domain":"rz-own-analysis/1","sequence":sequence,"input_sha256":input.sha256(),"task_sha256":task_sha,"raw":decision.raw,"line_legality_sha256":legality,"genealogy":decision.genealogy}))?;
-                if decision.completed_estimate && decision.completed_depth > 0 {
+                let raw_sha=output.json("observations.jsonl",&serde_json::json!({"domain":"rz-own-analysis/1","sequence":sequence,"input_sha256":root_capture.as_ref().map(|(input,_)|input.sha256()),"task_sha256":task_sha,"raw":decision.raw,"line_legality_sha256":legality,"genealogy":decision.genealogy,"actual_native_call_inputs":native_calls}))?;
+                if !native_calls && decision.completed_estimate && decision.completed_depth > 0 {
+                    let input = &root_capture
+                        .as_ref()
+                        .ok_or_else(|| invalid("CPU label input missing"))?
+                        .0;
                     let row = owned_label(
-                        &input,
+                        input,
                         &description,
                         task_sha,
                         raw_sha.clone(),
@@ -1435,7 +1758,8 @@ pub fn collect_pals_own_data(
                     end = Some((PalsOutcome::Unknown, PalsGameEnd::WallTimeLimit));
                     break;
                 }
-                if config.collect_conditional_repair
+                if !native_calls
+                    && config.collect_conditional_repair
                     && decision.pv.len() >= 2
                     && config.max_total_nodes > state.nodes
                     && Instant::now() < deadline
@@ -1597,6 +1921,29 @@ pub fn collect_pals_own_data(
         }
         let _=output.final_json("failures.jsonl",&serde_json::json!({"sequence":state.sequence,"cause":failure,"nodes":state.nodes,"rows":state.rows.len(),"inputs":state.inputs.len(),"outcome_targets_for_unfinished_game":"masked"}));
     }
+    let cleanup_until = Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .ok_or_else(|| invalid("collector cleanup deadline overflow"))?;
+    let native_finish = match driver.finish_collection(cleanup_until) {
+        Ok(value) => {
+            if let Some(reason) = value
+                .as_ref()
+                .and_then(|v| v.get("_collection_failure"))
+                .and_then(|v| v.as_str())
+            {
+                failure = Some(failure_text(format!(
+                    "native finish failed: {reason}; prior={failure:?}"
+                )));
+            }
+            value
+        }
+        Err(error) => {
+            failure = Some(failure_text(format!(
+                "native finish failed: {error}; prior={failure:?}"
+            )));
+            None
+        }
+    };
     let audit = if failure.is_none() {
         Some(registry.audit(
             &state.rows,
@@ -1626,6 +1973,7 @@ pub fn collect_pals_own_data(
         games_finished: state.results.len() as u32,
         cpu_nodes: state.nodes,
         cpu_jobs: state.jobs,
+        cpu_work_observation_incomplete: state.work_incomplete,
         wall_time_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         data_output_bytes: artifacts.values().map(|a| a.bytes).sum(),
         reserved_output_bytes: output.bytes,
@@ -1635,8 +1983,10 @@ pub fn collect_pals_own_data(
         artifacts,
         actual_training_executed: false,
         external_teacher_used: false,
+        native_finish,
     };
     output.finish(&receipt)?;
+    driver.receipt_preserved();
     Ok(receipt)
 }
 
@@ -2209,6 +2559,7 @@ mod tests {
             sequence: 0,
             nodes: 0,
             jobs: 0,
+            work_incomplete: false,
             rows: Vec::new(),
             inputs: Vec::new(),
             assignments: BTreeMap::new(),
@@ -2231,7 +2582,7 @@ mod tests {
         })
         .unwrap();
         let cpu_source = source_description(
-            cpu.config(),
+            &cpu,
             "own-cpu-conditional-verification",
             serde_json::Value::Null,
         )
@@ -2501,7 +2852,11 @@ mod tests {
     fn admitted_compact_source_config_fits_compact_receipt_reserve() {
         let output = OwnedTemp::new();
         let mut description = driver().description().clone();
-        description.configuration = serde_json::json!(vec![0_u8; 32767]);
+        description
+            .configuration
+            .as_object_mut()
+            .unwrap()
+            .insert("padding".into(), serde_json::json!(vec![0_u8; 32000]));
         let digest = canonical_sha256(&description.configuration).unwrap();
         description.cpu_profile_sha256 = digest.clone();
         if let PalsInputSource::OwnCpu {
@@ -2524,6 +2879,7 @@ mod tests {
             games_finished: 0,
             cpu_nodes: 0,
             cpu_jobs: 0,
+            cpu_work_observation_incomplete: false,
             wall_time_ms: 0,
             data_output_bytes: 0,
             reserved_output_bytes: 0,
@@ -2533,6 +2889,7 @@ mod tests {
             artifacts: BTreeMap::new(),
             actual_training_executed: false,
             external_teacher_used: false,
+            native_finish: None,
         };
         disk.finish(&receipt).unwrap();
         let bytes = std::fs::read(disk.directory.join("receipt.json")).unwrap();
