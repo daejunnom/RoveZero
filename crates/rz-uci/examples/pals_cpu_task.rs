@@ -15,7 +15,7 @@ fn failure(stage: &'static str, message: impl std::fmt::Display) -> CpuTaskError
     CpuTaskError {
         code: "cpu_task_cli_failed",
         stage,
-        message: message.to_string().chars().take(512).collect(),
+        message: message.to_string().chars().take(512).collect::<String>().into_boxed_str(),
         known_nodes: None,
         failed_check_work: None,
         baseline: None,

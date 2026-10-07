@@ -248,6 +248,7 @@ impl ProcessReceiptWriter {
         self.startup_written = true;
         Ok(())
     }
+    #[cfg(feature = "onnx-cpu")]
     pub(crate) fn publish_auxiliary(
         &self,
         name: &'static str,

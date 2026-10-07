@@ -81,7 +81,7 @@ struct Request {
 pub struct CpuTaskError {
     pub code: &'static str,
     pub stage: &'static str,
-    pub message: String,
+    pub message: Box<str>,
     pub known_nodes: Option<u64>,
     pub failed_check_work: Option<Box<FailedCheckWork>>,
     pub baseline: Option<Box<RawReport>>,
@@ -104,7 +104,7 @@ impl CpuTaskError {
         Self {
             code: "cpu_task_failed",
             stage,
-            message: message.to_string().chars().take(512).collect(),
+            message: message.to_string().chars().take(512).collect::<String>().into_boxed_str(),
             known_nodes: None,
             failed_check_work: None,
             baseline: None,
