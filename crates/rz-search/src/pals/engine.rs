@@ -806,6 +806,15 @@ impl<M: RoleModel> PalsEngine<M> {
             error => error.into(),
         })
     }
+    fn checker_admission_error(error: CheckerError) -> PalsError {
+        match error {
+            CheckerError::External {
+                stage: "admission",
+                code: "insufficient_stop_reserve",
+            } => RoleError::Deadline.into(),
+            error => error.into(),
+        }
+    }
     fn own_report(report: CheckerReport) -> Result<CpuReport, PalsError> {
         match report {
             CheckerReport::Owned(report) => Ok(report),
@@ -1972,6 +1981,16 @@ impl<M: RoleModel> PalsEngine<M> {
             return Ok(None);
         }
         let task_nodes = remaining.min(self.config.cpu_nodes_per_task);
+        let cpu_limits = CpuLimits {
+            max_depth: limits.cpu_depth,
+            max_nodes: task_nodes,
+            deadline: Some(limits.deadline),
+        };
+        // A too-short foreign wall closes this search before allocating a task,
+        // reserving nodes or recording physical dispatch/unknown work.
+        self.cpu
+            .preflight_task(cpu_limits)
+            .map_err(Self::checker_admission_error)?;
         let generation = self.stores.generation();
         let active_root = self.stores.root().ok_or(StoreError::StaleConsumer)?;
         let root_revision = self.stores.situations.get(active_root)?.revision;
@@ -2073,11 +2092,6 @@ impl<M: RoleModel> PalsEngine<M> {
                 .checked_add(task_nodes)
                 .ok_or(PalsError::Capacity)?;
             counters.external_checker_tasks += 1;
-            let cpu_limits = CpuLimits {
-                max_depth: limits.cpu_depth,
-                max_nodes: task_nodes,
-                deadline: Some(limits.deadline),
-            };
             self.cpu.reset_attempt();
             let response = if verification {
                 self.cpu
@@ -2093,6 +2107,30 @@ impl<M: RoleModel> PalsEngine<M> {
                 self.cpu
                     .analyze_divergence(&self.nodes[root].position, prefix, cpu_limits, cancel)
             };
+            if matches!(
+                &response,
+                Err(CheckerError::External {
+                    stage: "admission",
+                    code: "insufficient_stop_reserve"
+                })
+            ) && self.cpu.last_attempt().is_none()
+            {
+                // The real adapter rechecks immediately before go. A race can
+                // refuse after caller reservation, but it started no physical
+                // work: close the task and release only this unused reservation.
+                self.stores.tasks.fail(execution)?;
+                counters.external_checker_node_budget_reserved = counters
+                    .external_checker_node_budget_reserved
+                    .checked_sub(task_nodes)
+                    .ok_or(StoreError::InvalidConditions(
+                        "foreign reservation underflow",
+                    ))?;
+                counters.external_checker_tasks =
+                    counters.external_checker_tasks.checked_sub(1).ok_or(
+                        StoreError::InvalidConditions("foreign dispatch count underflow"),
+                    )?;
+                return Err(RoleError::Deadline.into());
+            }
             let capture = self.observe_external_attempt(counters);
             let report = match response {
                 Ok(CheckerReport::ExternalUci(report)) => {
@@ -3708,6 +3746,9 @@ mod tests {
         Overshoot,
         MixedIdentity,
         Pending,
+        BudgetRefused,
+        BudgetRace,
+        AdmissionFailure(&'static str, &'static str),
     }
     /// Typed in-process report fixture, not actual UCI/process evidence. The
     /// native process owner's separate executable fixtures cover that boundary.
@@ -3749,6 +3790,12 @@ mod tests {
             limits: CpuLimits,
         ) -> Result<CheckerReport, CheckerError> {
             self.attempt = None;
+            if matches!(self.mode, ForeignFixtureMode::BudgetRace) {
+                return Err(CheckerError::External {
+                    stage: "admission",
+                    code: "insufficient_stop_reserve",
+                });
+            }
             self.request += 1;
             let legal = position.legal_moves();
             let best_move = moves.unwrap_or(&legal).first().copied();
@@ -3838,6 +3885,24 @@ mod tests {
                 selective_search: None,
             }
         }
+        fn preflight_task(&self, limits: CpuLimits) -> Result<(), CheckerError> {
+            match self.mode {
+                ForeignFixtureMode::BudgetRefused
+                    if limits.deadline.is_some_and(|until| {
+                        until.saturating_duration_since(Instant::now()) < Duration::from_secs(2)
+                    }) =>
+                {
+                    Err(CheckerError::External {
+                        stage: "admission",
+                        code: "insufficient_stop_reserve",
+                    })
+                }
+                ForeignFixtureMode::AdmissionFailure(stage, code) => {
+                    Err(CheckerError::External { stage, code })
+                }
+                _ => Ok(()),
+            }
+        }
         fn last_attempt(&self) -> Option<&CheckerAttempt> {
             self.attempt.as_ref()
         }
@@ -3896,6 +3961,121 @@ mod tests {
             ForeignFixture::new(mode),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn foreign_short_clock_preflight_keeps_last_valid_move_without_dispatch_or_reservation() {
+        let position = Position::startpos();
+        let cancel = AtomicBool::new(false);
+        let mut engine = foreign_engine(ForeignFixtureMode::BudgetRefused);
+        // Seed the consumer's legitimate Rules-validated fallback. The first
+        // nonterminal proposal reaches foreign admission before any estimate
+        // can replace it or manufacture an external/model work observation.
+        let prior_choice = position.legal_moves()[0];
+        let mut published = vec![prior_choice];
+        let report = engine
+            .search_with_progress(
+                &position,
+                PalsLimits {
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    ..limits()
+                },
+                &cancel,
+                |movement| published.push(movement),
+            )
+            .unwrap();
+        assert_eq!(report.completion, PalsCompletion::Deadline);
+        assert_eq!(report.best_move, Some(prior_choice));
+        assert_eq!(published, [prior_choice]);
+        assert_eq!(report.resolved_value, PalsResolvedValue::Unknown);
+        assert_eq!(report.value_scope, PalsValueScope::Unknown);
+        assert_eq!(report.counters.proposals, 1);
+        assert_eq!(report.counters.value_calls, 0);
+        assert_eq!(report.counters.accepted_value_outputs, 0);
+        assert_eq!(report.counters.external_checker_tasks, 0);
+        assert_eq!(report.counters.external_checker_reports, 0);
+        assert_eq!(report.counters.external_checker_node_budget_reserved, 0);
+        assert_eq!(report.counters.external_checker_nodes_observed, 0);
+        assert_eq!(report.counters.consumed_external_checker_tasks, 0);
+        assert!(!report.counters.external_checker_work_incomplete);
+        assert_eq!(report.counters.cpu_tasks_requested, 0);
+        assert_eq!(report.counters.cpu_nodes, 0);
+        assert!(engine.checker_attempts().is_empty());
+        assert!(engine.stores.tasks.is_empty());
+        assert_eq!(engine.consumer_id, 0);
+        assert!(!cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn foreign_pre_go_budget_race_releases_unused_reservation_without_unknown_work() {
+        let position = Position::startpos();
+        let mut engine = foreign_engine(ForeignFixtureMode::BudgetRace);
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine.intern(position).unwrap();
+        let mut counters = PalsCounters::default();
+        assert!(matches!(
+            engine.external_candidate(
+                root,
+                root,
+                &[],
+                None,
+                limits(),
+                &AtomicBool::new(false),
+                &mut counters,
+            ),
+            Err(PalsError::Role(RoleError::Deadline))
+        ));
+        assert_eq!(counters, PalsCounters::default());
+        assert!(engine.checker_attempts().is_empty());
+        assert!(engine.stores.observations.is_empty());
+        assert_eq!(engine.stores.tasks.len(), 1);
+        assert!(matches!(
+            engine
+                .stores
+                .tasks
+                .get(super::super::store::ExecutionId(0))
+                .unwrap()
+                .status,
+            super::super::store::TaskStatus::Failed
+        ));
+    }
+
+    #[test]
+    fn foreign_other_preflight_failures_keep_exact_error_without_dispatch() {
+        for (stage, code) in [
+            ("admission", "other_refusal"),
+            ("fixture", "insufficient_stop_reserve"),
+        ] {
+            let position = Position::startpos();
+            let mut engine = foreign_engine(ForeignFixtureMode::AdmissionFailure(stage, code));
+            engine
+                .stores
+                .focus_actual_moves(position.snapshot())
+                .unwrap();
+            let root = engine.intern(position).unwrap();
+            let mut counters = PalsCounters::default();
+            assert!(matches!(
+                engine.external_candidate(
+                    root,
+                    root,
+                    &[],
+                    None,
+                    limits(),
+                    &AtomicBool::new(false),
+                    &mut counters,
+                ),
+                Err(PalsError::Checker(CheckerError::External {
+                    stage: actual_stage,
+                    code: actual_code,
+                })) if (actual_stage, actual_code) == (stage, code)
+            ));
+            assert_eq!(counters, PalsCounters::default());
+            assert!(engine.stores.tasks.is_empty());
+            assert!(engine.checker_attempts().is_empty());
+        }
     }
     #[test]
     fn externally_mutated_own_namespace_cannot_reuse_evidence_or_dispatch_new_work() {
@@ -4093,7 +4273,10 @@ mod tests {
                 ForeignFixtureMode::Pending => {
                     assert!(result.unwrap().is_none());
                 }
-                ForeignFixtureMode::Normal(_) => unreachable!(),
+                ForeignFixtureMode::Normal(_)
+                | ForeignFixtureMode::BudgetRefused
+                | ForeignFixtureMode::BudgetRace
+                | ForeignFixtureMode::AdmissionFailure(_, _) => unreachable!(),
             }
             assert!(matches!(
                 engine

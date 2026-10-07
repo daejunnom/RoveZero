@@ -36,6 +36,7 @@ pub struct ExternalCpuConfig {
     pub max_prefix_plies: usize,
     pub handshake_timeout: Duration,
     pub max_task_wall_time: Duration,
+    /// Reserved inside every task for stop, bestmove drain and the ready barrier.
     pub stop_grace: Duration,
     pub shutdown_grace: Duration,
     /// Combined stdout/stderr bytes over this process's whole lifetime.
@@ -139,6 +140,49 @@ fn bounded_deadline(
         .checked_add(duration)
         .ok_or(CheckerError::Invalid("external deadline overflow"))?;
     Ok(supplied.map_or(local, |deadline| deadline.min(local)))
+}
+
+/// The caller's task wall includes readiness, analysis and physical stop/drain.
+/// A grace is a reserved portion of that wall, never a new window after expiry.
+#[derive(Clone, Copy, Debug)]
+struct ExternalTaskBudget {
+    analysis_deadline: Instant,
+    task_deadline: Instant,
+    stop_reserve: Duration,
+}
+
+impl ExternalTaskBudget {
+    fn new(
+        start: Instant,
+        task_deadline: Instant,
+        stop_reserve: Duration,
+    ) -> Result<Self, CheckerError> {
+        let analysis_deadline = task_deadline
+            .checked_sub(stop_reserve)
+            .ok_or_else(|| error("admission", "insufficient_stop_reserve"))?;
+        let budget = Self {
+            analysis_deadline,
+            task_deadline,
+            stop_reserve,
+        };
+        budget.analysis_millis(start)?;
+        Ok(budget)
+    }
+
+    fn analysis_millis(self, now: Instant) -> Result<u128, CheckerError> {
+        let remaining = self
+            .analysis_deadline
+            .saturating_duration_since(now)
+            .as_millis();
+        if remaining == 0 {
+            return Err(error("admission", "insufficient_stop_reserve"));
+        }
+        Ok(remaining)
+    }
+
+    fn drain_deadline(self, observed: Instant) -> Result<Instant, CheckerError> {
+        bounded_deadline(observed, self.stop_reserve, Some(self.task_deadline))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -377,7 +421,7 @@ impl ExternalUciCpuChecker {
     pub fn create(config: ExternalCpuConfig) -> Result<Self, CheckerError> {
         config.validate()?;
         let conditions = format!(
-            "{};score:{};depth-cap:{};prefix-cap:{};resume:unsupported;root:searchmoves;go:depth+reported-node-limit+finite-wall;single-active;game:ucinewgame+ready;output-cap:{};line-cap:{};task-ms:{};stop-ms:{};shutdown-ms:{}",
+            "{};score:{};depth-cap:{};prefix-cap:{};resume:unsupported;root:searchmoves;go:depth+reported-node-limit+finite-wall;task-wall:includes-stop-and-ready;single-active;game:ucinewgame+ready;output-cap:{};line-cap:{};task-ms:{};stop-ms:{};shutdown-ms:{}",
             EXTERNAL_UCI_CHECKER_VERSION,
             EXTERNAL_UCI_SCORE_SEMANTICS,
             config.max_depth,
@@ -437,9 +481,8 @@ impl ExternalUciCpuChecker {
         let result = self.handshake(deadline, cancel);
         if result.is_err() {
             self.failed = true;
-            let cleanup = Instant::now()
-                .checked_add(self.config.shutdown_grace)
-                .unwrap_or_else(Instant::now);
+            let cleanup =
+                bounded_deadline(Instant::now(), self.config.shutdown_grace, Some(deadline))?;
             let _ = self.shutdown(cleanup);
         }
         self.last_attempt = Some(CheckerAttempt {
@@ -569,6 +612,7 @@ impl ExternalUciCpuChecker {
         cancel: &AtomicBool,
     ) -> Result<CheckerReport, CheckerError> {
         self.last_attempt = None;
+        let start = Instant::now();
         if self.failed || self.active {
             return Err(error("analysis", "checker_not_available"));
         }
@@ -600,11 +644,11 @@ impl ExternalUciCpuChecker {
                 return Err(CheckerError::Invalid("external root mask"));
             }
         }
-        let start = Instant::now();
         let deadline = bounded_deadline(start, self.config.max_task_wall_time, limits.deadline)?;
         if cancel.load(Ordering::Acquire) || start >= deadline {
             return Err(error("analysis", "cancel_or_deadline_before_go"));
         }
+        let budget = ExternalTaskBudget::new(start, deadline, self.config.stop_grace)?;
         let replay = position
             .snapshot()
             .uci_replay(self.config.max_prefix_plies)
@@ -621,6 +665,7 @@ impl ExternalUciCpuChecker {
                 command.push_str(&mv.to_string());
             }
         }
+        budget.analysis_millis(Instant::now())?;
         self.request_id = self
             .request_id
             .checked_add(1)
@@ -654,17 +699,37 @@ impl ExternalUciCpuChecker {
             limits,
             cancel,
             start,
-            deadline,
+            budget,
             &command,
             &mut report,
         );
         report.elapsed = start.elapsed();
         self.capture(&report, start);
         if let Err(failure) = result {
+            if !self.active
+                && matches!(
+                    failure,
+                    CheckerError::External {
+                        stage: "admission",
+                        code: "insufficient_stop_reserve"
+                    }
+                )
+            {
+                // Readiness/position may have consumed the analysis window, but
+                // no go was sent. Preserve the idle owner and do not manufacture
+                // an analysis attempt or borrow a cleanup wall for this refusal.
+                self.last_attempt = None;
+                return Err(failure);
+            }
             self.failed = true;
-            let cleanup = Instant::now()
-                .checked_add(self.config.shutdown_grace)
-                .unwrap_or_else(Instant::now);
+            // Failed analysis may use only this task's remaining wall. If it is
+            // exhausted, shutdown records quarantine without a fresh wait; the
+            // retained owner can still be drained by explicit global shutdown.
+            let cleanup = bounded_deadline(
+                Instant::now(),
+                self.config.shutdown_grace,
+                Some(budget.task_deadline),
+            )?;
             let _ = self.shutdown(cleanup);
             self.capture(&report, start);
             return Err(failure);
@@ -680,18 +745,18 @@ impl ExternalUciCpuChecker {
         limits: CpuLimits,
         cancel: &AtomicBool,
         start: Instant,
-        deadline: Instant,
+        budget: ExternalTaskBudget,
         position_command: &str,
         report: &mut ExternalCheckerReport,
     ) -> Result<(), CheckerError> {
-        self.ready(deadline, cancel)?;
-        self.owner()?.send(position_command, deadline)?;
-        let remaining_ms = deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis();
-        if remaining_ms == 0 || cancel.load(Ordering::Acquire) {
+        budget.analysis_millis(Instant::now())?;
+        self.ready(budget.analysis_deadline, cancel)?;
+        self.owner()?
+            .send(position_command, budget.analysis_deadline)?;
+        if cancel.load(Ordering::Acquire) {
             return Err(error("analysis", "cancel_or_deadline_before_go"));
         }
+        let remaining_ms = budget.analysis_millis(Instant::now())?;
         let mut go = format!(
             "go depth {} nodes {} movetime {}",
             limits.max_depth, limits.max_nodes, remaining_ms
@@ -703,26 +768,26 @@ impl ExternalUciCpuChecker {
                 go.push_str(&mv.to_string());
             }
         }
-        self.owner()?.send(&go, deadline)?;
+        self.owner()?.send(&go, budget.analysis_deadline)?;
         self.active = true;
         let no_cancel = AtomicBool::new(false);
         let mut stopped_deadline = None;
         loop {
             let now = Instant::now();
-            if stopped_deadline.is_none() && (cancel.load(Ordering::Acquire) || now >= deadline) {
+            if stopped_deadline.is_none()
+                && (cancel.load(Ordering::Acquire) || now >= budget.analysis_deadline)
+            {
                 report.completion = if cancel.load(Ordering::Acquire) {
                     ExternalCompletion::StoppedCanceled
                 } else {
                     ExternalCompletion::StoppedDeadline
                 };
-                let stop_deadline = now
-                    .checked_add(self.config.stop_grace)
-                    .ok_or(CheckerError::Invalid("external stop overflow"))?;
+                let stop_deadline = budget.drain_deadline(now)?;
                 self.owner()?.send("stop", stop_deadline)?;
                 self.owner()?.mark_stop();
                 stopped_deadline = Some(stop_deadline);
             }
-            let wait_deadline = stopped_deadline.unwrap_or(deadline);
+            let wait_deadline = stopped_deadline.unwrap_or(budget.analysis_deadline);
             let token = if stopped_deadline.is_some() {
                 &no_cancel
             } else {
@@ -786,16 +851,21 @@ impl ExternalUciCpuChecker {
                     report.completion = ExternalCompletion::BestMove;
                 }
                 self.active = false;
-                self.ready(wait_deadline, &no_cancel)?;
+                let ready_deadline = match stopped_deadline {
+                    Some(deadline) => deadline,
+                    None => budget.drain_deadline(Instant::now())?,
+                };
+                let readiness = self.ready(ready_deadline, &no_cancel);
                 // Final cancellation/deadline remains a partial external
                 // observation even when bestmove races with the stop boundary.
                 if matches!(report.completion, ExternalCompletion::BestMove) {
                     if cancel.load(Ordering::Acquire) {
                         report.completion = ExternalCompletion::StoppedCanceled;
-                    } else if Instant::now() >= deadline {
+                    } else if Instant::now() >= budget.analysis_deadline {
                         report.completion = ExternalCompletion::StoppedDeadline;
                     }
                 }
+                readiness?;
                 return Ok(());
             } else if matches!(line.as_str(), "uciok" | "readyok") {
                 return Err(error("analysis", "unexpected_barrier_response"));
@@ -862,6 +932,23 @@ impl CpuChecker for ExternalUciCpuChecker {
             resume: false,
             selective_search: None,
         }
+    }
+    fn preflight_task(&self, limits: CpuLimits) -> Result<(), CheckerError> {
+        if self.failed || self.active {
+            return Err(error("analysis", "checker_not_available"));
+        }
+        if limits.max_depth == 0
+            || limits.max_depth > self.config.max_depth
+            || limits.max_nodes == 0
+        {
+            return Err(CheckerError::Invalid("external requested depth/nodes"));
+        }
+        let start = Instant::now();
+        let deadline = bounded_deadline(start, self.config.max_task_wall_time, limits.deadline)?;
+        if start >= deadline {
+            return Err(error("analysis", "cancel_or_deadline_before_go"));
+        }
+        ExternalTaskBudget::new(start, deadline, self.config.stop_grace).map(|_| ())
     }
     fn last_attempt(&self) -> Option<&CheckerAttempt> {
         self.last_attempt.as_ref()
@@ -1279,10 +1366,9 @@ mod process {
                 Ok::<(), CheckerError>(())
             })();
             if let Err(failure) = setup {
-                let deadline = Instant::now()
-                    .checked_add(owner.shutdown_grace)
-                    .unwrap_or_else(Instant::now);
-                let _ = owner.shutdown(deadline, false);
+                let cleanup =
+                    bounded_deadline(Instant::now(), owner.shutdown_grace, Some(deadline))?;
+                let _ = owner.shutdown(cleanup, false);
                 *failure_evidence = Some(SpawnFailure {
                     error: failure.clone(),
                     process: owner.evidence(),
@@ -1544,6 +1630,7 @@ mod process {
                         self.child.take();
                         self.authority = false;
                         self.state.cleanup_complete = true;
+                        self.state.quarantined = false;
                         PROCESS_SLOT.store(false, Ordering::Release);
                         return Ok(self.state);
                     }
@@ -1635,6 +1722,42 @@ mod process {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_budget_reserves_full_stop_and_ready_window_inside_parent_wall() {
+        let start = Instant::now();
+        let until = start + Duration::from_secs(2);
+        let reserve = Duration::from_secs(1);
+        let budget = ExternalTaskBudget::new(start, until, reserve).unwrap();
+        assert_eq!(budget.task_deadline, until);
+        assert_eq!(budget.analysis_deadline, start + Duration::from_secs(1));
+        assert_eq!(budget.analysis_millis(start).unwrap(), 1000);
+        assert_eq!(
+            budget.drain_deadline(budget.analysis_deadline).unwrap(),
+            until
+        );
+        assert_eq!(
+            budget
+                .drain_deadline(budget.analysis_deadline + Duration::from_millis(5))
+                .unwrap(),
+            until
+        );
+        assert!(matches!(
+            ExternalTaskBudget::new(start, start + reserve, reserve),
+            Err(CheckerError::External {
+                stage: "admission",
+                code: "insufficient_stop_reserve"
+            })
+        ));
+        assert!(matches!(
+            ExternalTaskBudget::new(start, start + reserve + Duration::from_micros(999), reserve),
+            Err(CheckerError::External {
+                code: "insufficient_stop_reserve",
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn external_scores_remain_native_units_bounds_and_unknown_work() {
         let cp = parse_info("info depth 8 seldepth 14 nodes 432 score cp -731 upperbound wdl 10 200 790 pv e2e4 e7e5", 16).unwrap();
@@ -1693,6 +1816,7 @@ mod tests {
         use std::io::{BufRead, Write};
         let mut position = Position::startpos();
         let mut readiness_count = 0usize;
+        let mut pending_best = None;
         for line in std::io::stdin().lock().lines() {
             let line = line.expect("fixture stdin");
             if line == "uci" {
@@ -1743,7 +1867,17 @@ mod tests {
                 } else {
                     println!("info depth {depth} seldepth 12 nodes {nodes} score cp 21 pv {best}");
                 }
-                println!("bestmove {best}");
+                if mode == 4 || mode == 5 {
+                    pending_best = Some(best);
+                } else {
+                    println!("bestmove {best}");
+                }
+            } else if line == "stop" {
+                if mode == 4
+                    && let Some(best) = pending_best.take()
+                {
+                    println!("bestmove {best}");
+                }
             } else if line == "quit" {
                 break;
             }
@@ -1780,6 +1914,22 @@ mod tests {
     fn fake_uci_pre_go_failure() {
         if fixture_mode("external_cpu::tests::fake_uci_pre_go_failure") {
             fixture_loop(3);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fake_uci_waits_for_stop() {
+        if fixture_mode("external_cpu::tests::fake_uci_waits_for_stop") {
+            fixture_loop(4);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fake_uci_ignores_stop() {
+        if fixture_mode("external_cpu::tests::fake_uci_ignores_stop") {
+            fixture_loop(5);
         }
     }
 
@@ -1955,6 +2105,165 @@ mod tests {
             .unwrap();
         assert_eq!(partial.completion, ExternalCompletion::Pending);
         assert_eq!(partial.best_move, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_deadline_stops_and_drains_inside_original_task_wall() {
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut config = fixture_config("fake_uci_waits_for_stop");
+        config.stop_grace = Duration::from_millis(500);
+        let mut checker = ExternalUciCpuChecker::create(config).unwrap();
+        checker
+            .start(Instant::now() + Duration::from_secs(10), &cancel)
+            .unwrap();
+        let until = Instant::now() + Duration::from_millis(1500);
+        let CheckerReport::ExternalUci(report) = checker
+            .analyze(
+                &Position::startpos(),
+                CpuLimits {
+                    max_depth: 8,
+                    max_nodes: 80,
+                    deadline: Some(until),
+                },
+                &cancel,
+            )
+            .unwrap()
+        else {
+            panic!("foreign converted to own");
+        };
+        assert_eq!(report.completion, ExternalCompletion::StoppedDeadline);
+        assert!(report.best_move.is_some());
+        assert_eq!(report.work.nodes, Some(10));
+        assert!(Instant::now() < until);
+        let attempt = checker.last_attempt().unwrap().external.as_ref().unwrap();
+        assert!(attempt.process.stop_sent);
+        assert!(!attempt.process.quarantined);
+        // An idle, drained checker remains reusable after a bounded stop.
+        checker
+            .new_game(Instant::now() + Duration::from_secs(1), &cancel)
+            .unwrap();
+        let cleanup = checker
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert!(cleanup.cleanup_complete && !cleanup.quarantined);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn insufficient_stop_reserve_rejects_before_go_without_poisoning_owner() {
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut checker = ExternalUciCpuChecker::create(fixture_config("fake_uci_normal")).unwrap();
+        checker
+            .start(Instant::now() + Duration::from_secs(10), &cancel)
+            .unwrap();
+        let startup_attempt = checker.last_attempt().unwrap().clone();
+        assert_eq!(startup_attempt.external.as_ref().unwrap().request_id, 0);
+        let limits = CpuLimits {
+            max_depth: 8,
+            max_nodes: 80,
+            deadline: Some(Instant::now() + Duration::from_millis(500)),
+        };
+        assert!(matches!(
+            checker.preflight_task(limits),
+            Err(CheckerError::External {
+                stage: "admission",
+                code: "insufficient_stop_reserve"
+            })
+        ));
+        assert!(matches!(
+            checker.preflight_task(CpuLimits {
+                max_nodes: 0,
+                ..limits
+            }),
+            Err(CheckerError::Invalid("external requested depth/nodes"))
+        ));
+        assert!(matches!(
+            checker.preflight_task(CpuLimits {
+                deadline: Some(Instant::now()),
+                ..limits
+            }),
+            Err(CheckerError::External {
+                stage: "analysis",
+                code: "cancel_or_deadline_before_go"
+            })
+        ));
+        // Immutable admission preserves historical startup evidence. Only an
+        // actual analyze call resets the ledger for its new analysis attempt.
+        let after_preflight = checker.last_attempt().unwrap();
+        assert_eq!(after_preflight.work, startup_attempt.work);
+        assert_eq!(after_preflight.elapsed, startup_attempt.elapsed);
+        let after_preflight = after_preflight.external.as_ref().unwrap();
+        let startup_external = startup_attempt.external.as_ref().unwrap();
+        assert_eq!(after_preflight.request_id, startup_external.request_id);
+        assert_eq!(
+            after_preflight.partial_report,
+            startup_external.partial_report
+        );
+        assert_eq!(after_preflight.process, startup_external.process);
+        let result = checker.analyze(&Position::startpos(), limits, &cancel);
+        assert!(matches!(
+            result,
+            Err(CheckerError::External {
+                stage: "admission",
+                code: "insufficient_stop_reserve"
+            })
+        ));
+        assert!(checker.last_attempt().is_none());
+        assert!(!checker.active && !checker.failed);
+        let transcript = std::str::from_utf8(checker.diagnostic_output().0).unwrap();
+        assert!(!transcript.contains("info depth") && !transcript.contains("bestmove "));
+        let cleanup = checker
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert!(cleanup.cleanup_complete && !cleanup.quarantined);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expired_task_quarantine_retains_owner_for_explicit_global_shutdown() {
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut config = fixture_config("fake_uci_ignores_stop");
+        config.stop_grace = Duration::from_millis(150);
+        let mut checker = ExternalUciCpuChecker::create(config).unwrap();
+        checker
+            .start(Instant::now() + Duration::from_secs(10), &cancel)
+            .unwrap();
+        let result = checker.analyze(
+            &Position::startpos(),
+            CpuLimits {
+                max_depth: 8,
+                max_nodes: 80,
+                deadline: Some(Instant::now() + Duration::from_millis(500)),
+            },
+            &cancel,
+        );
+        assert!(matches!(
+            result,
+            Err(CheckerError::External {
+                stage: "stop",
+                code: "bestmove_not_drained"
+            })
+        ));
+        let attempt = checker.last_attempt().unwrap().external.as_ref().unwrap();
+        let partial = attempt.partial_report.as_ref().unwrap();
+        assert_eq!(partial.completion, ExternalCompletion::StoppedDeadline);
+        assert_eq!(partial.best_move, None);
+        assert_eq!(partial.work.nodes, Some(10));
+        assert!(attempt.process.quarantined);
+        assert!(!attempt.process.cleanup_complete);
+        assert!(!attempt.process.ownership_lost);
+        assert!(checker.failed && checker.owner.is_some());
+        // This is a distinct, explicitly supplied global cleanup wall. The task
+        // failure did not borrow it or discard the still-owned process handle.
+        let cleanup = checker
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert!(cleanup.cleanup_complete && !cleanup.quarantined);
+        assert!(cleanup.exit_observed && cleanup.stdout_drained && cleanup.stderr_drained);
     }
 
     #[cfg(target_os = "linux")]

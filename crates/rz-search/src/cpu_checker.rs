@@ -388,6 +388,14 @@ pub trait CpuChecker: Send {
         }
         Ok(())
     }
+    /// Immutable task admission check before any caller reservation or dispatch.
+    /// This never clears an attempt ledger or produces a work/report observation.
+    /// It does not replace analyze's validation; synchronous own checkers retain
+    /// their existing behavior. A foreign insufficient_stop_reserve admission
+    /// refusal guarantees that no go or physical analysis attempt was started.
+    fn preflight_task(&self, _limits: CpuLimits) -> Result<(), CheckerError> {
+        Ok(())
+    }
     /// Only the own implementation can disclose its native configuration. A
     /// foreign UCI declaration is never translated into an own search profile.
     fn owned_descriptor(&self) -> Option<OwnedCheckerDescriptor> {
@@ -697,6 +705,40 @@ mod tests {
     use super::*;
     use crate::cpu::{CpuCapabilities, CpuEngine};
     use std::sync::{Arc, atomic::AtomicUsize};
+
+    #[test]
+    fn own_preflight_keeps_analysis_deadline_and_invalid_limit_behavior() {
+        let cpu = CpuEngine::new(CpuConfig {
+            tt_entries: 0,
+            ..CpuConfig::default()
+        })
+        .unwrap();
+        let mut checker = OwnedCpuChecker::new(cpu).unwrap();
+        let limits = CpuLimits {
+            max_depth: 1,
+            max_nodes: 1024,
+            deadline: Some(Instant::now()),
+        };
+        checker.preflight_task(limits).unwrap();
+        assert!(checker.last_attempt().is_none());
+        let CheckerReport::Owned(report) = checker
+            .analyze(&Position::startpos(), limits, &AtomicBool::new(false))
+            .unwrap()
+        else {
+            panic!("own checker changed namespace");
+        };
+        assert_eq!(report.completion, crate::cpu::CpuCompletion::Deadline);
+        assert_eq!(report.nodes, 0);
+        let invalid = CpuLimits {
+            max_nodes: 0,
+            ..limits
+        };
+        checker.preflight_task(invalid).unwrap();
+        assert!(matches!(
+            checker.analyze(&Position::startpos(), invalid, &AtomicBool::new(false)),
+            Err(CheckerError::Owned(CpuError::InvalidLimits(_)))
+        ));
+    }
 
     struct UnknownWork {
         cpu: CpuEngine,
