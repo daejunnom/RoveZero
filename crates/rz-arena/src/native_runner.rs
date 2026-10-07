@@ -28,6 +28,23 @@ pub struct NativeProviderSessionAudit {
     pub physical_drain: String,
 }
 
+/// Read-only view of an actual launch-owner input pin. The path names the
+/// private snapshot, not the source asset or the helper's registered program.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub struct NativeProviderInputView<'a> {
+    pub artifact: &'a rz_experiments::ArtifactRef,
+    pub path: &'a std::path::Path,
+    pub file: &'a std::fs::File,
+}
+
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub struct NativeProviderInputContext<'a> {
+    pub directory: &'a cap_std::fs::Dir,
+    pub pins: &'a [NativeProviderInputView<'a>],
+}
+
 /// Provider-specific wire acceptance is distinct from shared process/PGN gates.
 #[doc(hidden)]
 pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
@@ -53,8 +70,9 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
         _role: rz_experiments::NativeEngineRole,
         _preflight: &crate::ExternalUciPreflight,
         _runtime_directory: &cap_std::fs::Dir,
-    ) -> Result<(), ArenaError> {
-        Ok(())
+        _inputs: &NativeProviderInputContext<'_>,
+    ) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
+        Ok(Vec::new())
     }
     fn expected_provider_sessions(&self) -> usize {
         4
@@ -125,6 +143,32 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
         termination: &[u8],
         session: &str,
     ) -> Result<(Self::Audit, u32), ArenaError>;
+    /// Context-aware production entry. Historical providers keep their exact
+    /// validator; inputs and supervisor output never become wire declarations.
+    #[cfg(target_os = "linux")]
+    fn validate_records_with_context(
+        &self,
+        role: rz_experiments::NativeEngineRole,
+        startup: &[u8],
+        termination: &[u8],
+        session: &str,
+        _inputs: &NativeProviderInputContext<'_>,
+        _supervisor_stdout: &[u8],
+    ) -> Result<(Self::Audit, u32), ArenaError> {
+        self.validate_records(role, startup, termination, session)
+    }
+    #[cfg(target_os = "linux")]
+    fn validate_provider_session_set(
+        &self,
+        _sessions: &[Self::Audit],
+        _preflight: &[crate::ExternalUciPreflight],
+        _runtime_root: &cap_std::fs::Dir,
+        _inputs: &NativeProviderInputContext<'_>,
+        _supervisor_stdout: &[u8],
+        _artifacts: &[rz_experiments::ArtifactRef],
+    ) -> Result<(), ArenaError> {
+        Ok(())
+    }
     #[cfg(target_os = "linux")]
     fn verify_session_evidence(
         &self,
@@ -695,6 +739,77 @@ pub(crate) mod linux {
         }
         Ok(())
     }
+    // Callback boundaries compare the owner-held capabilities without rehashing
+    // a multi-gigabyte runtime per probe. Full byte verification remains at the
+    // existing prelaunch/post-run boundaries; the profile loader hashes its own
+    // bounded actual bytes inside the provider callback.
+    fn verify_provider_input_names<S: NativeLaunchDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+    ) -> Result<(), ArenaError> {
+        crate::native_launch::linux::verify_input_directories(
+            &owner.snapshot.directory,
+            &owner.snapshot.input_directory,
+            &owner.snapshot.input_subdirectories,
+        )?;
+        for item in &owner.snapshot.pins {
+            let relative = item
+                .path
+                .strip_prefix(&owner.snapshot.path)
+                .map_err(|_| invalid("provider input pin escaped owner root"))?;
+            let (directory, name) = crate::native_launch::linux::input_parent(
+                &owner.snapshot.input_directory,
+                &owner.snapshot.input_subdirectories,
+                relative,
+            )?;
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .follow(FollowSymlinks::No)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            let named = directory
+                .open_with(name, &options)
+                .map_err(|_| invalid("provider input name is unavailable"))?
+                .into_std()
+                .metadata()
+                .map_err(|_| invalid("provider named input metadata missing"))?;
+            let held = item
+                .file
+                .metadata()
+                .map_err(|_| invalid("provider input pin metadata missing"))?;
+            if !held.is_file()
+                || held.len() != item.artifact.bytes
+                || held.mode() & 0o222 != 0
+                || held.nlink() != 1
+                || (held.dev(), held.ino(), held.uid(), held.mode(), held.len())
+                    != (
+                        named.dev(),
+                        named.ino(),
+                        named.uid(),
+                        named.mode(),
+                        named.len(),
+                    )
+            {
+                return Err(invalid(
+                    "provider input name differs from read-only owner pin",
+                ));
+            }
+        }
+        Ok(())
+    }
+    fn provider_input_views<S: NativeLaunchDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+    ) -> Vec<NativeProviderInputView<'_>> {
+        owner
+            .snapshot
+            .pins
+            .iter()
+            .map(|pin| NativeProviderInputView {
+                artifact: &pin.artifact,
+                path: &pin.path,
+                file: &pin.file,
+            })
+            .collect()
+    }
     // Only the launch owner's synced, verified private snapshots are eligible.
     // This is a best-effort kernel cache hint, not deletion, memory reclamation
     // evidence or permission to touch the source/C runtime cache/GPU buffers.
@@ -805,11 +920,67 @@ pub(crate) mod linux {
             execution_order: [0, 1],
         })
     }
+    fn validate_preflight_provider_evidence(
+        evidence: &[(String, Vec<u8>)],
+    ) -> Result<(), ArenaError> {
+        if evidence.len() > 4 {
+            return Err(invalid("preflight provider evidence count exceeded"));
+        }
+        let mut names = BTreeSet::new();
+        for (relative, bytes) in evidence {
+            let components: Vec<_> = std::path::Path::new(relative).components().collect();
+            if relative.len() > 256
+                || components.len() != 2
+                || components
+                    .iter()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                || !names.insert(relative)
+                || bytes.is_empty()
+                || bytes.len() > 128 * 1024
+            {
+                return Err(invalid(
+                    "preflight provider evidence topology/byte bound invalid",
+                ));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    #[test]
+    fn preflight_provider_evidence_rejects_aliases_traversal_and_overflow() {
+        let rows = vec![
+            ("native-process-10/startup.json".into(), vec![1]),
+            ("native-process-10/termination.json".into(), vec![2]),
+        ];
+        assert!(validate_preflight_provider_evidence(&[]).is_ok()); // historical default
+        assert!(validate_preflight_provider_evidence(&rows).is_ok());
+        let mut duplicate = rows.clone();
+        duplicate.push(rows[0].clone());
+        assert!(validate_preflight_provider_evidence(&duplicate).is_err());
+        for name in [
+            "../startup.json",
+            "/root/startup.json",
+            "native/../startup.json",
+            "native/startup/nested.json",
+        ] {
+            assert!(validate_preflight_provider_evidence(&[(name.into(), vec![1])]).is_err());
+        }
+        assert!(validate_preflight_provider_evidence(&[(rows[0].0.clone(), vec![])]).is_err());
+        assert!(
+            validate_preflight_provider_evidence(&[(rows[0].0.clone(), vec![0; 128 * 1024 + 1])])
+                .is_err()
+        );
+        let excessive: Vec<_> = (0..5)
+            .map(|i| (format!("native-process-{i}/startup.json"), vec![1]))
+            .collect();
+        assert!(validate_preflight_provider_evidence(&excessive).is_err());
+    }
     fn preflight_endpoints<S: NativeProviderDeclaration>(
         bundle: &mut NativeRunBundle<S>,
         cancel: Option<&AtomicBool>,
-    ) -> Result<Vec<crate::ExternalUciPreflight>, ArenaError> {
+    ) -> Result<(Vec<crate::ExternalUciPreflight>, Vec<ArtifactRef>), ArenaError> {
         let mut receipts = Vec::new();
+        let mut provider_artifacts = Vec::new();
         for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
             let owner = bundle.owner.as_ref().expect("preflight owns snapshot");
             let Some(e) = owner.spec.engine_view(role)?.external.cloned() else {
@@ -1047,15 +1218,39 @@ pub(crate) mod linux {
             // The selected capability is owner-held; compare its path/name pins
             // immediately before and after provider consumption as well.
             crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot)?;
-            owner
-                .spec
-                .validate_external_preflight(role, &receipt, &preflight_directory)?;
+            verify_provider_input_names(owner)?;
+            let pins = provider_input_views(owner);
+            let inputs = NativeProviderInputContext {
+                directory: &owner.snapshot.input_directory,
+                pins: &pins,
+            };
+            let evidence = owner.spec.validate_external_preflight(
+                role,
+                &receipt,
+                &preflight_directory,
+                &inputs,
+            )?;
+            verify_provider_input_names(owner)?;
+            let prefix = owner.snapshot.preflight_runtime_roots[index]
+                .as_ref()
+                .map_or(
+                    if index == 0 {
+                        "baseline-runtime"
+                    } else {
+                        "candidate-runtime"
+                    },
+                    |root| root.name,
+                );
+            validate_preflight_provider_evidence(&evidence)?;
+            for (relative, bytes) in evidence {
+                provider_artifacts.push(artifact(owner, &format!("{prefix}/{relative}"), &bytes));
+            }
             crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot)?;
             preflight_runtime_totals(owner)?;
             receipts.push(receipt);
             bundle.process = None;
         }
-        Ok(receipts)
+        Ok((receipts, provider_artifacts))
     }
     pub(super) fn run<S: NativeProviderDeclaration>(
         bundle: &mut NativeRunBundle<S>,
@@ -1068,7 +1263,7 @@ pub(crate) mod linux {
             .expect("prepared native owner")
             .spec
             .validate_runtime_admission()?;
-        let external_preflight = preflight_endpoints(bundle, cancel)?;
+        let (external_preflight, preflight_artifacts) = preflight_endpoints(bundle, cancel)?;
         let owner = bundle.owner.as_mut().expect("prepared native owner");
         crate::emit_native_phase("prelaunch_verification_started");
         let mut rolling = SnapshotCacheHint::rolling(
@@ -1144,7 +1339,7 @@ pub(crate) mod linux {
             process: process.receipt.clone(),
             snapshots: owner.snapshot.receipts.clone(),
             snapshot_cache_hints: cache_hints,
-            artifacts: Vec::new(),
+            artifacts: preflight_artifacts,
             provider_sessions: Vec::new(),
             external_preflight,
             external_execution: Vec::new(),
@@ -1266,7 +1461,12 @@ pub(crate) mod linux {
                 }
                 Err(error) => receipt.pgn_audit_error = Some(error.to_string()),
             }
-            match audit_providers(owner, &process.stdout, &mut receipt.artifacts) {
+            match audit_providers(
+                owner,
+                &process.stdout,
+                &receipt.external_preflight,
+                &mut receipt.artifacts,
+            ) {
                 Ok((sessions, pids)) => {
                     receipt.provider_sessions = sessions;
                     for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
@@ -2145,6 +2345,7 @@ pub(crate) mod linux {
     fn audit_providers<S: NativeProviderDeclaration>(
         owner: &NativeLaunchOwner<S>,
         stdout: &[u8],
+        preflight: &[crate::ExternalUciPreflight],
         artifacts: &mut Vec<ArtifactRef>,
     ) -> Result<(Vec<S::Audit>, Vec<u32>), ArenaError> {
         let mut sessions = Vec::new();
@@ -2219,12 +2420,21 @@ pub(crate) mod linux {
                     &format!("{name}/{session}/{termination_filename}"),
                     &termination_bytes,
                 ));
-                let (audit, pid) = owner.spec.validate_records(
+                verify_provider_input_names(owner)?;
+                let pins = provider_input_views(owner);
+                let inputs = NativeProviderInputContext {
+                    directory: &owner.snapshot.input_directory,
+                    pins: &pins,
+                };
+                let (audit, pid) = owner.spec.validate_records_with_context(
                     role,
                     &startup_bytes,
                     &termination_bytes,
                     &session,
+                    &inputs,
+                    stdout,
                 )?;
+                verify_provider_input_names(owner)?;
                 if !ids.insert(pid) {
                     return Err(invalid("native pair reused a process identity"));
                 }
@@ -2261,6 +2471,21 @@ pub(crate) mod linux {
             .spec
             .validate_process_exit_trace(stdout, &expected_pids)?;
         let external = owner.spec.external_exit_ids(stdout, &expected_pids)?;
+        verify_provider_input_names(owner)?;
+        let pins = provider_input_views(owner);
+        let inputs = NativeProviderInputContext {
+            directory: &owner.snapshot.input_directory,
+            pins: &pins,
+        };
+        owner.spec.validate_provider_session_set(
+            &sessions,
+            preflight,
+            &owner.snapshot.directory,
+            &inputs,
+            stdout,
+            artifacts,
+        )?;
+        verify_provider_input_names(owner)?;
         Ok((sessions, external))
     }
 }

@@ -1442,12 +1442,6 @@ impl PalsRunReceiptV3 {
         lock.verify()?;
         let m = &lock.manifest;
         require(
-            m.engines
-                .iter()
-                .all(|engine| !matches!(engine, PalsEngineV3::Pals(p) if !p.cpu_r.is_own())),
-            "unsupported external CPU_R receipt: helper projection and owner closure are not implemented",
-        )?;
-        require(
             self.domain == PALS_RECEIPT_V3_DOMAIN
                 && self.run_id == m.run_id
                 && self.pair_id == m.pair_id
@@ -1474,6 +1468,10 @@ impl PalsRunReceiptV3 {
             )?;
         }
         let mut indices = BTreeSet::new();
+        let mut helper_pids = BTreeSet::new();
+        let mut helper_groups = BTreeSet::new();
+        let mut helper_tuples = BTreeSet::new();
+        let mut helper_parents = BTreeSet::new();
         for g in &self.games {
             require(
                 g.game_index < 2
@@ -1500,6 +1498,25 @@ impl PalsRunReceiptV3 {
                         ManifestError::Integrity("PALS V3: missing endpoint receipt".into())
                     })?;
                 receipt_endpoint(o, e, resources, self.pair_eligible, &self.failures)?;
+                if let Some(external) = &o.external_cpu_r {
+                    let identity =
+                        external.shutdown.process_identity.as_ref().ok_or_else(|| {
+                            ManifestError::Integrity(
+                                "external helper historical identity missing".into(),
+                            )
+                        })?;
+                    require(
+                        helper_pids.insert(identity.pid)
+                            && helper_groups.insert(identity.process_group)
+                            && helper_tuples.insert((
+                                identity.pid,
+                                identity.process_group,
+                                identity.proc_start_ticks,
+                            ))
+                            && helper_parents.insert(external.ready_resources.parent.pid),
+                        "external helper or restarted parent historical identity reused",
+                    )?;
+                }
             }
             let incomplete = matches!(
                 g.termination,
@@ -1546,6 +1563,10 @@ impl PalsRunReceiptV3 {
                 )?,
             }
         }
+        require(
+            helper_pids.is_disjoint(&helper_parents) && helper_groups.is_disjoint(&helper_parents),
+            "external helper historical identity collides with game parents",
+        )?;
         Ok(())
     }
 }
@@ -1936,11 +1957,11 @@ mod tests {
             .unwrap();
     }
     #[test]
-    fn external_projection_selection_does_not_remove_existing_execution_guard() {
+    fn external_projection_requires_scoped_closure_and_keeps_own_units_separate() {
         let (endpoint, external) = external_receipt_fixture();
         let engine = PalsEngineV3::Pals(Box::new(endpoint));
         let mut output = endpoint_receipt(&engine);
-        output.external_cpu_r = Some(external);
+        output.external_cpu_r = Some(external.clone());
         assert!(receipt_endpoint(&output, &engine, &resource(), false, &BTreeSet::new()).is_err());
         output.cpu_tasks_requested = 0;
         output.cpu_tasks_completed = 0;
@@ -1958,8 +1979,40 @@ mod tests {
                 .validate_against(&lock)
                 .unwrap_err()
                 .to_string()
-                .contains("unsupported external CPU_R receipt")
+                .contains("external CPU_R receipt projection missing")
         );
+        let mut projected = receipt(&lock);
+        for (index, game) in projected.games.iter_mut().enumerate() {
+            let mut endpoint = output.clone();
+            let observed = endpoint.external_cpu_r.as_mut().unwrap();
+            let parent = 100 + index as u32 * 2;
+            let helper = parent + 1;
+            observed.ready_resources.parent.pid = parent;
+            observed.ready_resources.parent.process_group = parent;
+            observed.ready_resources.parent.threads[0].tid = parent;
+            observed.ready_resources.helper.pid = helper;
+            observed.ready_resources.helper.process_group = helper;
+            observed.ready_resources.helper.parent_pid = parent;
+            observed.ready_resources.helper.threads[0].tid = helper;
+            let identity = observed.shutdown.process_identity.as_mut().unwrap();
+            identity.pid = helper;
+            identity.process_group = helper;
+            game.engines[0] = endpoint;
+        }
+        // This is typed consistency, not arena admission; Native provider,
+        // supervised game mapping, PGN/clock and cleanup gates live in arena.
+        projected.validate_against(&lock).unwrap();
+        let mut duplicated = projected.clone();
+        duplicated.games[1].engines[0] = duplicated.games[0].engines[0].clone();
+        assert!(duplicated.validate_against(&lock).is_err());
+        let mut unknown_closure = projected;
+        unknown_closure.games[0].engines[0]
+            .external_cpu_r
+            .as_mut()
+            .unwrap()
+            .shutdown
+            .stdout_drained = false;
+        assert!(unknown_closure.validate_against(&lock).is_err());
     }
     fn receipt(l: &PalsInputLockV3) -> PalsRunReceiptV3 {
         let m = &l.manifest;
@@ -2083,7 +2136,7 @@ mod tests {
             .validate_against(&lock)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("unsupported external CPU_R receipt"));
+        assert!(error.contains("external CPU_R receipt projection missing"));
         let mut failed = receipt(&lock);
         failed.pair_eligible = false;
         failed.failures.insert(PalsRunFailureV3::Infrastructure);

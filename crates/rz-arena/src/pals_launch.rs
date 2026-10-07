@@ -84,6 +84,9 @@ pub enum PalsExternalCpuRSessionPurposeV3 {
 /// Validation of one actual producer pair, separate from execution admission.
 /// Original registration and byte hashes remain available; scoped resources
 /// and foreign work are never projected into Own CPU counters.
+/// Parent start ticks/cgroup come from the helper producer's ready snapshot;
+/// the supervisor independently joins PID/role/session and owns its reap.
+/// Native resets do not observe a foreign ucinewgame/ready barrier history.
 #[derive(Clone, Debug, Serialize)]
 pub struct PalsExternalCpuRSessionAuditV3 {
     pub purpose: PalsExternalCpuRSessionPurposeV3,
@@ -132,7 +135,7 @@ struct ExternalCheckerUciWireV3 {
 
 /// Actual profile loading must precede this API. It creates only an unstarted
 /// checker to obtain immutable identity/conditions/capabilities; it starts no
-/// model or process and does not remove the launch/Core external guards.
+/// model or process and does not itself admit an arena run or Core projection.
 /// The caller must join `expected_parent_pid` to its supervisor/game evidence;
 /// this helper audit does not replace the four UCI exits, NN graph or PGN audit.
 #[cfg(all(
@@ -980,14 +983,21 @@ impl PalsArenaLaunchV3 {
     }
     pub fn validate(&self) -> Result<(), ArenaError> {
         self.semantic_lock.verify()?;
-        require(
-            self.semantic_lock
-                .manifest
-                .engines
-                .iter()
-                .all(|engine| !matches!(engine, PalsEngineV3::Pals(p) if !p.cpu_r.is_own())),
-            "unsupported external CPU_R launch: helper preflight, inherited cgroup and owner receipt integration are not implemented",
-        )?;
+        for index in 0..2 {
+            if self.external_cpu_r_binding(index)?.is_some() {
+                require(
+                    cfg!(all(
+                        target_os = "linux",
+                        any(feature = "pals-collection-onnx", feature = "native-cuda")
+                    )),
+                    "unsupported external CPU_R launch: Linux and pals-collection-onnx or native-cuda are required; no fallback",
+                )?;
+                require(
+                    self.endpoints[index].native_model().is_some(),
+                    "external CPU_R launch requires an explicitly registered native PALS endpoint",
+                )?;
+            }
+        }
         require(
             self.domain == PALS_ARENA_V3_DOMAIN,
             "wrong arena launch domain",
@@ -2191,6 +2201,8 @@ pub struct PalsNativeSessionAuditV3 {
     pub launch_sha256: String,
     pub startup_sha256: String,
     pub termination_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_cpu_r_session: Option<PalsExternalCpuRSessionAuditV3>,
     pub completed_role_inputs: u64,
     pub search_consumed_role_inputs: u64,
     pub completed_new_game_resets: u64,
@@ -2515,6 +2527,289 @@ fn validate_cuda_placement_witness(
         device_id: cuda.device_id,
     }))
 }
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "pals-collection-onnx", feature = "native-cuda")
+))]
+fn load_owner_helper_profile(
+    lock: &LockedPalsArenaLaunchV3,
+    role: NativeEngineRole,
+    inputs: &crate::native_runner::NativeProviderInputContext<'_>,
+) -> Result<rz_uci::pals_checker_profile::LoadedPalsCheckerProfile, ArenaError> {
+    use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+    use std::os::unix::fs::MetadataExt;
+    let (declaration, _) = lock
+        .input
+        .external_cpu_r_binding(role_index(role))?
+        .ok_or_else(|| invalid("own CPU_R has no external profile pin"))?;
+    let mut matches = inputs
+        .pins
+        .iter()
+        .filter(|pin| pin.artifact == &declaration.profile);
+    let pin = matches
+        .next()
+        .ok_or_else(|| invalid("owner profile snapshot pin missing"))?;
+    require(
+        matches.next().is_none(),
+        "owner profile snapshot pin duplicated",
+    )?;
+    let relative = lock
+        .snapshot_relative_path(&declaration.profile)
+        .ok_or_else(|| invalid("owner profile snapshot topology missing"))?;
+    let relative_path = Path::new(&relative);
+    let namespace = relative_path
+        .parent()
+        .and_then(Path::to_str)
+        .ok_or_else(|| invalid("profile snapshot namespace missing"))?;
+    let name = relative_path
+        .file_name()
+        .ok_or_else(|| invalid("profile snapshot filename missing"))?;
+    require(
+        relative_path.components().count() == 2
+            && relative_path
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+            && pin.path.ends_with(relative_path),
+        "owner profile pin topology differs",
+    )?;
+    let directory = inputs
+        .directory
+        .open_dir_nofollow(namespace)
+        .map_err(|_| invalid("owner profile namespace unavailable"))?;
+    let identity = |metadata: &std::fs::Metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.uid(),
+            metadata.mode(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    };
+    let named = || -> Result<std::fs::Metadata, ArenaError> {
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        directory
+            .open_with(name, &options)
+            .map_err(|_| invalid("owner profile name unavailable"))?
+            .into_std()
+            .metadata()
+            .map_err(|_| invalid("owner profile name metadata missing"))
+    };
+    let before = pin
+        .file
+        .metadata()
+        .map_err(|_| invalid("owner profile pin metadata missing"))?;
+    require(
+        before.is_file()
+            && before.len() == declaration.profile.bytes
+            && before.len() <= 64 * 1024
+            && before.mode() & 0o222 == 0
+            && before.nlink() == 1
+            && identity(&before) == identity(&named()?),
+        "owner profile snapshot is not its sealed read-only inode",
+    )?;
+    let loaded = rz_uci::pals_checker_profile::PalsCheckerProfile::load(
+        pin.path,
+        &declaration.profile.sha256,
+    )
+    .map_err(|e| invalid(format!("owner profile load failed: {e}")))?;
+    let after = pin
+        .file
+        .metadata()
+        .map_err(|_| invalid("owner profile pin recheck missing"))?;
+    require(
+        identity(&before) == identity(&after) && identity(&after) == identity(&named()?),
+        "owner profile snapshot changed during actual byte loading",
+    )?;
+    Ok(loaded)
+}
+
+#[cfg(target_os = "linux")]
+struct PalsPreflightHelperEvidence {
+    sessions: Vec<PalsNativeSessionAuditV3>,
+    artifacts: Vec<(String, Vec<u8>)>,
+}
+
+#[cfg(target_os = "linux")]
+fn audit_pals_helper_preflight(
+    lock: &LockedPalsArenaLaunchV3,
+    role: NativeEngineRole,
+    preflight: &crate::ExternalUciPreflight,
+    root: &cap_std::fs::Dir,
+    inputs: &crate::native_runner::NativeProviderInputContext<'_>,
+) -> Result<PalsPreflightHelperEvidence, ArenaError> {
+    if lock
+        .input
+        .external_cpu_r_binding(role_index(role))?
+        .is_none()
+    {
+        return Ok(PalsPreflightHelperEvidence {
+            sessions: vec![],
+            artifacts: vec![],
+        });
+    }
+    #[cfg(not(any(feature = "pals-collection-onnx", feature = "native-cuda")))]
+    {
+        let _ = (preflight, root, inputs);
+        Err(invalid(
+            "unsupported external CPU_R preflight: native PALS feature is required; no fallback",
+        ))
+    }
+    #[cfg(any(feature = "pals-collection-onnx", feature = "native-cuda"))]
+    {
+        use cap_fs_ext::DirExt;
+        let loaded = load_owner_helper_profile(lock, role, inputs)?;
+        require(
+            preflight.engine_id == lock.endpoint_views[role_index(role)].id,
+            "helper preflight endpoint differs",
+        )?;
+        let probes = [
+            (
+                &preflight.identification_process,
+                PalsExternalCpuRSessionPurposeV3::Identification,
+            ),
+            (
+                &preflight.readiness_process,
+                PalsExternalCpuRSessionPurposeV3::Readiness,
+            ),
+        ];
+        let mut expected = BTreeSet::new();
+        for (process, _) in probes {
+            require(
+                process.pid > 0
+                    && expected.insert(format!("native-process-{}", process.pid))
+                    && process.stop == crate::ProcessStop::Exited
+                    && process.exit_code == Some(0)
+                    && process.exit_signal.is_none()
+                    && process.group_cleanup == crate::CleanupStatus::Gone
+                    && process.errors.is_empty(),
+                "helper preflight requires two independently supervised normal exits",
+            )?;
+        }
+        let mut actual = BTreeSet::new();
+        for (index, entry) in root
+            .entries()
+            .map_err(|e| ArenaError::Io(e.to_string()))?
+            .enumerate()
+        {
+            require(
+                index < lock.input.budget.max_runtime_files as usize,
+                "helper preflight runtime entry cap exceeded",
+            )?;
+            let entry = entry.map_err(|e| ArenaError::Io(e.to_string()))?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| invalid("helper preflight name is not UTF-8"))?;
+            if name == "runtime-cache" {
+                continue;
+            }
+            require(
+                expected.contains(name) && actual.insert(name.to_owned()),
+                "unexpected or duplicate helper preflight session slot",
+            )?;
+        }
+        require(actual == expected, "helper preflight session slot missing")?;
+        let mut result = PalsPreflightHelperEvidence {
+            sessions: vec![],
+            artifacts: vec![],
+        };
+        for (process, purpose) in probes {
+            let name = format!("native-process-{}", process.pid);
+            let directory = root
+                .open_dir_nofollow(&name)
+                .map_err(|_| invalid("helper preflight session is not a real directory"))?;
+            let filenames = directory
+                .entries()
+                .map_err(|e| ArenaError::Io(e.to_string()))?
+                .take(3)
+                .map(|entry| {
+                    entry
+                        .map(|e| e.file_name())
+                        .map_err(|e| ArenaError::Io(e.to_string()))
+                })
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            require(
+                filenames
+                    == BTreeSet::from([
+                        OsString::from("pals-native-startup.v3.json"),
+                        OsString::from("pals-native-termination.v3.json"),
+                    ]),
+                "helper preflight session requires exactly its startup/termination evidence",
+            )?;
+            let start = read_work_file(&directory, "pals-native-startup.v3.json")?;
+            let end = read_work_file(&directory, "pals-native-termination.v3.json")?;
+            let helper = validate_pals_external_cpu_r_session(
+                lock,
+                role,
+                &loaded,
+                &start,
+                &end,
+                process.pid,
+                purpose,
+            )?;
+            let (audit, _) = validate_pals_native_records_inner(
+                lock,
+                role,
+                &start,
+                &end,
+                &name,
+                Some(helper),
+                false,
+            )?;
+            result.sessions.push(audit);
+            result
+                .artifacts
+                .push((format!("{name}/pals-native-startup.v3.json"), start));
+            result
+                .artifacts
+                .push((format!("{name}/pals-native-termination.v3.json"), end));
+        }
+        let leaders = probes.iter().map(|(process, _)| process.pid).collect();
+        validate_pals_helper_identity_set(&result.sessions, &leaders)?;
+        Ok(result)
+    }
+}
+
+// Historical identities are compared as observations, not as currently live
+// PIDs or a proof of an escaped descendant/security sandbox boundary.
+#[cfg(target_os = "linux")]
+fn validate_pals_helper_identity_set(
+    sessions: &[PalsNativeSessionAuditV3],
+    leaders: &BTreeSet<u32>,
+) -> Result<(), ArenaError> {
+    let (mut pids, mut groups, mut tuples) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    for session in sessions {
+        if let Some(helper) = &session.external_cpu_r_session {
+            let identity = helper
+                .receipt
+                .shutdown
+                .process_identity
+                .as_ref()
+                .ok_or_else(|| invalid("validated helper historical process identity missing"))?;
+            require(
+                helper.parent_process_id == session.process_id
+                    && leaders.contains(&session.process_id)
+                    && !leaders.contains(&identity.pid)
+                    && !leaders.contains(&identity.process_group)
+                    && pids.insert(identity.pid)
+                    && groups.insert(identity.process_group)
+                    && tuples.insert((
+                        identity.pid,
+                        identity.process_group,
+                        identity.proc_start_ticks,
+                    )),
+                "helper historical identity reused or collides with supervised UCI leaders",
+            )?;
+        }
+    }
+    Ok(())
+}
+
 impl NativeProviderDeclaration for LockedPalsArenaLaunchV3 {
     type Audit = PalsNativeSessionAuditV3;
     fn scope(&self) -> &'static str {
@@ -2534,6 +2829,170 @@ impl NativeProviderDeclaration for LockedPalsArenaLaunchV3 {
         self.input.require_reap_status_runner()?;
         self.input.require_actual_native_epoch()?;
         verify_pals_inherited_resources(self).map(|_| ())
+    }
+    #[cfg(target_os = "linux")]
+    fn validate_external_preflight(
+        &self,
+        role: NativeEngineRole,
+        preflight: &crate::ExternalUciPreflight,
+        runtime_directory: &cap_std::fs::Dir,
+        inputs: &crate::native_runner::NativeProviderInputContext<'_>,
+    ) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
+        Ok(
+            audit_pals_helper_preflight(self, role, preflight, runtime_directory, inputs)?
+                .artifacts,
+        )
+    }
+    #[cfg(target_os = "linux")]
+    fn validate_records_with_context(
+        &self,
+        role: NativeEngineRole,
+        startup: &[u8],
+        termination: &[u8],
+        session: &str,
+        inputs: &crate::native_runner::NativeProviderInputContext<'_>,
+        supervisor_stdout: &[u8],
+    ) -> Result<(Self::Audit, u32), ArenaError> {
+        if self
+            .input
+            .external_cpu_r_binding(role_index(role))?
+            .is_none()
+        {
+            return self.validate_records(role, startup, termination, session);
+        }
+        #[cfg(not(any(feature = "pals-collection-onnx", feature = "native-cuda")))]
+        {
+            let _ = (inputs, supervisor_stdout);
+            Err(invalid(
+                "unsupported external CPU_R game validation: native PALS feature is required; no fallback",
+            ))
+        }
+        #[cfg(any(feature = "pals-collection-onnx", feature = "native-cuda"))]
+        {
+            let loaded = load_owner_helper_profile(self, role, inputs)?;
+            // These role/game IDs originate in the pinned supervisor trace,
+            // before any native JSON supplies a purported PID.
+            let mapping = validate_pals_game_process_trace(
+                self,
+                supervisor_stdout,
+                &[BTreeSet::new(), BTreeSet::new()],
+            )?;
+            let expected = mapping[role_index(role)]
+                .iter()
+                .copied()
+                .find(|pid| session == format!("native-process-{pid}"))
+                .ok_or_else(|| {
+                    invalid("native session absent from supervised role/game PID mapping")
+                })?;
+            let helper = validate_pals_external_cpu_r_session(
+                self,
+                role,
+                &loaded,
+                startup,
+                termination,
+                expected,
+                PalsExternalCpuRSessionPurposeV3::Game,
+            )?;
+            validate_pals_native_records_inner(
+                self,
+                role,
+                startup,
+                termination,
+                session,
+                Some(helper),
+                true,
+            )
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn validate_provider_session_set(
+        &self,
+        sessions: &[Self::Audit],
+        preflight: &[crate::ExternalUciPreflight],
+        runtime_root: &cap_std::fs::Dir,
+        inputs: &crate::native_runner::NativeProviderInputContext<'_>,
+        supervisor_stdout: &[u8],
+        artifacts: &[ArtifactRef],
+    ) -> Result<(), ArenaError> {
+        let mut has_external = false;
+        for index in 0..2 {
+            has_external |= self.input.external_cpu_r_binding(index)?.is_some();
+        }
+        if !has_external {
+            return Ok(());
+        }
+        use cap_fs_ext::DirExt;
+        let mapping = validate_pals_game_process_trace(
+            self,
+            supervisor_stdout,
+            &[BTreeSet::new(), BTreeSet::new()],
+        )?;
+        let mut leaders: BTreeSet<_> = mapping.iter().flatten().copied().collect();
+        for receipt in preflight {
+            for process in [&receipt.identification_process, &receipt.readiness_process] {
+                require(
+                    leaders.insert(process.pid),
+                    "preflight/game supervisor PID reused",
+                )?;
+            }
+        }
+        let mut audited = sessions.to_vec();
+        for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+            let index = role_index(role);
+            if self.input.external_cpu_r_binding(index)?.is_none() {
+                continue;
+            }
+            let mut matching = preflight
+                .iter()
+                .filter(|p| p.engine_id == self.endpoint_views[index].id);
+            let receipt = matching
+                .next()
+                .ok_or_else(|| invalid("external helper preflight receipt absent"))?;
+            require(
+                matching.next().is_none(),
+                "external helper preflight receipt duplicated",
+            )?;
+            let name = if index == 0 {
+                "external-baseline-preflight-runtime"
+            } else {
+                "external-candidate-preflight-runtime"
+            };
+            let root = runtime_root
+                .open_dir_nofollow(name)
+                .map_err(|_| invalid("owner helper preflight root missing"))?;
+            let evidence = audit_pals_helper_preflight(self, role, receipt, &root, inputs)?;
+            for (relative, bytes) in &evidence.artifacts {
+                let suffix = format!("/{name}/{relative}");
+                require(
+                    artifacts
+                        .iter()
+                        .filter(|a| {
+                            a.path.ends_with(&suffix)
+                                && a.sha256 == digest(bytes)
+                                && a.bytes == bytes.len() as u64
+                        })
+                        .count()
+                        == 1,
+                    "helper preflight bytes differ from retained original evidence",
+                )?;
+            }
+            audited.extend(evidence.sessions);
+            let selected: Vec<_> = sessions
+                .iter()
+                .filter(|s| s.endpoint_id == self.endpoint_views[index].id)
+                .collect();
+            require(
+                selected.len() == 2
+                    && selected.iter().all(|s| {
+                        mapping[index].contains(&s.process_id)
+                            && s.external_cpu_r_session.as_ref().is_some_and(|h| {
+                                h.purpose == PalsExternalCpuRSessionPurposeV3::Game
+                            })
+                    }),
+                "two mapped external helper game sessions required",
+            )?;
+        }
+        validate_pals_helper_identity_set(&audited, &leaders)
     }
     fn expected_provider_sessions(&self) -> usize {
         2 * self
@@ -2567,7 +3026,11 @@ impl NativeProviderDeclaration for LockedPalsArenaLaunchV3 {
             } else {
                 NativeEngineRole::Baseline
             };
-            let other_records = collect_pals_process_work(self, other, root_output)?;
+            let other_records = if self.uses_provider_records(other)? {
+                vec![]
+            } else {
+                collect_pals_process_work(self, other, root_output)?
+            };
             // Native counterpart IDs have already been excluded by the generic
             // native auditor. A CPU/mock counterpart remains in external_ids.
             external_ids
@@ -2716,6 +3179,18 @@ pub fn validate_pals_native_records(
     termination: &[u8],
     session: &str,
 ) -> Result<(PalsNativeSessionAuditV3, u32), ArenaError> {
+    validate_pals_native_records_inner(lock, role, startup, termination, session, None, true)
+}
+
+fn validate_pals_native_records_inner(
+    lock: &LockedPalsArenaLaunchV3,
+    role: NativeEngineRole,
+    startup: &[u8],
+    termination: &[u8],
+    session: &str,
+    helper: Option<PalsExternalCpuRSessionAuditV3>,
+    game: bool,
+) -> Result<(PalsNativeSessionAuditV3, u32), ArenaError> {
     require(
         startup.len() <= 128 * 1024 && termination.len() <= 128 * 1024,
         "native receipt budget exceeded",
@@ -2775,10 +3250,27 @@ pub fn validate_pals_native_records(
             "unsupported undeclared host record-page execution/observation: the arena lock registers the whole-input public graph only",
         )?;
     }
-    require(
-        s["cpu_checker"].is_null() && t["cpu_checker"].is_null(),
-        "unsupported external CPU_R native receipt: independent helper resource and closure projection is not admitted",
-    )?;
+    if lock
+        .input
+        .external_cpu_r_binding(role_index(role))?
+        .is_some()
+    {
+        let audit = helper.as_ref().ok_or_else(|| invalid(
+            "unsupported external CPU_R native receipt: owner profile and independent supervisor context required"))?;
+        require(
+            audit.endpoint_id == engine.id
+                && u64::from(audit.parent_process_id) == pid
+                && audit.startup_sha256 == digest(startup)
+                && audit.termination_sha256 == digest(termination)
+                && (audit.purpose == PalsExternalCpuRSessionPurposeV3::Game) == game,
+            "helper/native audit pair or purpose differs",
+        )?;
+    } else {
+        require(
+            helper.is_none() && s["cpu_checker"].is_null() && t["cpu_checker"].is_null(),
+            "unsupported external CPU_R native receipt: own selection cannot inherit helper evidence",
+        )?;
+    }
     require(
         sn["final_runtime_loading_mapping"].is_null(),
         "startup cannot claim a later final loading observation",
@@ -2993,8 +3485,9 @@ pub fn validate_pals_native_records(
         "native physical execution high-water is below completed work",
     )?;
     require(
-        count(tn, "completed_new_game_resets")? >= 1
-            && count(tn, "game_generation")? > count(sn, "game_generation")?
+        (!game
+            || (count(tn, "completed_new_game_resets")? >= 1
+                && count(tn, "game_generation")? > count(sn, "game_generation")?))
             && count(tn, "physical_runs_in_flight")? == 0
             && tn["quarantined"] == false
             && tn["physical_shutdown_confirmed"] == true
@@ -3040,6 +3533,7 @@ pub fn validate_pals_native_records(
             launch_sha256: lock.sha256.clone(),
             startup_sha256: digest(startup),
             termination_sha256: digest(termination),
+            external_cpu_r_session: helper,
             completed_role_inputs: completed,
             search_consumed_role_inputs: consumed,
             completed_new_game_resets: count(tn, "completed_new_game_resets")?,
@@ -3291,12 +3785,27 @@ pub fn validate_pals_search_work_records(
     termination: &[u8],
     session: &str,
 ) -> Result<PalsProcessWorkAuditV3, ArenaError> {
+    validate_pals_search_work_records_inner(lock, role, startup, termination, session, None)
+}
+
+fn validate_pals_search_work_records_inner(
+    lock: &LockedPalsArenaLaunchV3,
+    role: NativeEngineRole,
+    startup: &[u8],
+    termination: &[u8],
+    session: &str,
+    audited_native: Option<&PalsNativeSessionAuditV3>,
+) -> Result<PalsProcessWorkAuditV3, ArenaError> {
     require(
         startup.len() <= MAX_JSON_BYTES && termination.len() <= MAX_JSON_BYTES,
         "work envelope byte budget exceeded",
     )?;
     let (s, t) = (json(startup)?, json(termination)?);
     let engine = &lock.endpoint_views[role_index(role)];
+    let external = lock
+        .input
+        .external_cpu_r_binding(role_index(role))?
+        .is_some();
     let native = matches!(
         &lock.input.endpoints[role_index(role)],
         PalsEndpointLaunchV3::OnnxCpu(_) | PalsEndpointLaunchV3::OnnxCuda(_)
@@ -3342,11 +3851,35 @@ pub fn validate_pals_search_work_records(
                 && value["service_exit_success"] == ending,
             "work envelope identity/start/end differs",
         )?;
-        validate_pals_process_work(&value["search_work"], kind, !ending)?;
+        validate_pals_process_work_inner(&value["search_work"], kind, !ending, external)?;
     }
     if native {
         // Native worker counters have their own accepted/delivered lifecycle.
-        validate_pals_native_records(lock, role, startup, termination, session)?;
+        if external {
+            let audit = audited_native.ok_or_else(|| {
+                invalid("external work requires production owner/supervisor native audit")
+            })?;
+            require(
+                audit.endpoint_id == engine.id
+                    && audit.process_id == pid
+                    && audit.launch_sha256 == lock.sha256
+                    && audit.startup_sha256 == digest(startup)
+                    && audit.termination_sha256 == digest(termination)
+                    && audit.raw_search_work == t["search_work"]
+                    && audit.raw_native == t["native"]
+                    && audit.physical_shutdown_confirmed
+                    && audit.native_buffers_released
+                    && audit.external_cpu_r_session.as_ref().is_some_and(|helper| {
+                        helper.purpose == PalsExternalCpuRSessionPurposeV3::Game
+                            && helper.parent_process_id == pid
+                            && helper.startup_sha256 == audit.startup_sha256
+                            && helper.termination_sha256 == audit.termination_sha256
+                    }),
+                "external work and validated native/helper session differ",
+            )?;
+        } else {
+            validate_pals_native_records(lock, role, startup, termination, session)?;
+        }
     }
     Ok(PalsProcessWorkAuditV3 {
         endpoint_id: engine.id.clone(),
@@ -3402,6 +3935,16 @@ pub fn collect_pals_process_work(
     lock: &LockedPalsArenaLaunchV3,
     role: NativeEngineRole,
     root: &cap_std::fs::Dir,
+) -> Result<Vec<PalsProcessWorkAuditV3>, ArenaError> {
+    collect_pals_process_work_with_audits(lock, role, root, &[])
+}
+
+#[cfg(target_os = "linux")]
+fn collect_pals_process_work_with_audits(
+    lock: &LockedPalsArenaLaunchV3,
+    role: NativeEngineRole,
+    root: &cap_std::fs::Dir,
+    native_audits: &[PalsNativeSessionAuditV3],
 ) -> Result<Vec<PalsProcessWorkAuditV3>, ArenaError> {
     use cap_fs_ext::DirExt;
     if matches!(
@@ -3460,8 +4003,14 @@ pub fn collect_pals_process_work(
             .map_err(|e| ArenaError::Io(e.to_string()))?;
         let start = read_work_file(&directory, start_name)?;
         let end = read_work_file(&directory, end_name)?;
-        records.push(validate_pals_search_work_records(
-            lock, role, &start, &end, name,
+        let mut matching = native_audits.iter().filter(|audit| {
+            audit.endpoint_id == lock.endpoint_views[role_index(role)].id
+                && name == format!("native-process-{}", audit.process_id)
+        });
+        let audit = matching.next();
+        require(matching.next().is_none(), "native work audit duplicated")?;
+        records.push(validate_pals_search_work_records_inner(
+            lock, role, &start, &end, name, audit,
         )?);
     }
     require(
@@ -3560,7 +4109,8 @@ fn endpoint_work_receipt(
             let w = &work
                 .ok_or_else(|| invalid("PALS search work unobserved"))?
                 .search_work;
-            validate_pals_process_work(w, "pals", false)?;
+            let external = !p.cpu_r.is_own();
+            validate_pals_process_work_inner(w, "pals", false, external)?;
             let t = &w["pals"];
             receipt.proposer_tasks_completed = work_count(t, "completed_proposer_calls")?
                 .checked_add(work_count(t, "completed_repair_calls")?)
@@ -3572,6 +4122,41 @@ fn endpoint_work_receipt(
                 work_count(t, "reused_completed_cpu_tasks_consumed")?;
             receipt.cpu_tasks_consumed = work_count(t, "consumed_cpu_tasks")?;
             receipt.cpu_nodes = work_count(t, "cpu_nodes")?;
+            if external {
+                let work = work.unwrap();
+                let n = native.ok_or_else(|| {
+                    invalid("external CPU_R lacks production native session audit")
+                })?;
+                let helper = n.external_cpu_r_session.as_ref().ok_or_else(|| {
+                    invalid("external CPU_R lacks validated independent helper projection")
+                })?;
+                require(
+                    helper.purpose == PalsExternalCpuRSessionPurposeV3::Game
+                        && helper.endpoint_id == receipt.endpoint_id
+                        && helper.parent_process_id == work.process_id
+                        && n.launch_sha256 == lock.sha256
+                        && n.startup_sha256 == work.startup_sha256
+                        && n.termination_sha256 == work.termination_sha256
+                        && n.raw_search_work == work.search_work
+                        && helper.startup_sha256 == work.startup_sha256
+                        && helper.termination_sha256 == work.termination_sha256
+                        && receipt.cpu_tasks_requested == 0
+                        && receipt.cpu_tasks_completed == 0
+                        && receipt.cpu_tasks_reused_consumed == 0
+                        && receipt.cpu_tasks_consumed == 0
+                        && receipt.cpu_nodes == 0,
+                    "external helper/game/work projection differs or claims Own work",
+                )?;
+                helper
+                    .receipt
+                    .validate_against(p, &lock.input.semantic_lock.manifest.resources[index])?;
+                receipt.external_cpu_r = Some(helper.receipt.clone());
+            } else {
+                require(
+                    native.is_none_or(|n| n.external_cpu_r_session.is_none()),
+                    "own CPU_R cannot inherit validated foreign projection",
+                )?;
+            }
             if p.model.backend == PalsModelBackendV3::DeterministicMock {
                 require(native.is_none(), "explicit mock cannot claim NN inputs")?;
             } else {
@@ -3883,10 +4468,11 @@ pub fn assemble_pals_core_receipt(
         lock.input.require_reap_status_runner()?;
         lock.input.require_actual_native_epoch()?;
         for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
-            assembly.work.extend(collect_pals_process_work(
+            assembly.work.extend(collect_pals_process_work_with_audits(
                 lock,
                 role,
                 &owner.snapshot.directory,
+                &native.receipt.provider_sessions,
             )?);
         }
         let cleanup = cleanup_time_ms.ok_or_else(|| {
@@ -4480,11 +5066,7 @@ mod tests {
             f.semantic_lock = f.semantic_lock.manifest.lock().unwrap();
             let error = f.validate().unwrap_err();
             assert!(matches!(&error, ArenaError::Integrity(_)));
-            assert!(
-                error
-                    .to_string()
-                    .contains("unsupported external CPU_R launch")
-            );
+            assert!(error.to_string().contains("external CPU_R"));
             assert!(f.lock().is_err());
         }
     }
@@ -4699,7 +5281,7 @@ mod tests {
                 .iter()
                 .any(|argument| argument.contains(fixture.program.to_str().unwrap()))
         );
-        assert!(input.lock().is_err());
+        assert!(input.lock().is_ok());
         let mut wrong = input.clone();
         let PalsEndpointLaunchV3::OnnxCpu(model) = &mut wrong.endpoints[0] else {
             unreachable!()
@@ -4727,15 +5309,15 @@ mod tests {
     fn external_preflight_evidence_is_separate_from_two_game_process_slots() {
         let fixture = ExternalProfileFixture::new();
         let input = fixture.native_launch();
-        // Construct only a prospective argv view. Public lock/admission remains
-        // unsupported, and this fixture does not prepare or execute a process.
+        // Construct only a prospective argv view. Actual admission still needs
+        // owner-pinned preflight evidence; this fixture starts no process.
         let view = LockedPalsArenaLaunchV3 {
             sha256: crate::canonical_sha256(&input).unwrap(),
             opening: input.opening(),
             endpoint_views: [input.endpoint(0).unwrap(), input.endpoint(1).unwrap()],
             input,
         };
-        assert!(view.validate_execution().is_err());
+        assert!(view.validate_execution().is_ok());
         let game_root = fixture.root.join("baseline-runtime");
         let preflight_root = fixture.root.join("external-baseline-preflight-runtime");
         assert!(
@@ -4864,7 +5446,21 @@ mod tests {
             "trained":false,"frozen_epoch":e.model.frozen_epoch,"process_epoch":77,
             "execution":{"provider":"cpu","runtime_sha256":hash_array(&n.runtime.sha256),"device_id":null,"session_arena_bytes":null,"runtime_bundle_sha256":null},
             "physical_shutdown_confirmed":false,"native_buffers_released":false,"quarantined":false,"physical_runs_in_flight":0,
-            "game_generation":0,"completed_new_game_resets":0});
+            "game_generation":0,"completed_new_game_resets":0,
+            "physically_completed_role_calls":0,"completed_role_inputs":0,"failed_physical_role_calls":0,"invalid_role_outputs":0,
+            "delivered_role_inputs":0,"search_consumed_role_inputs":0,"canceled_requests":0,"expired_requests":0,
+            "request_high_water":0,"execution_high_water":0,"last_failure":null,
+            "residency":{"native_sessions":n.graphs.len(),"role_reader_weights_shared":false,
+                "graphs":n.graphs.iter().map(|g|serde_json::json!({"role":g.role,"sha256":hash_array(&g.artifact.sha256),"serialized_bytes":g.artifact.bytes})).collect::<Vec<_>>()}});
+        let mut native = native;
+        for field in [
+            "transient_request_device_bytes",
+            "transient_execution_device_bytes",
+            "pinned_request_bytes",
+        ] {
+            native["execution"][field] = 0.into();
+        }
+        native["execution"]["device_public_memory"] = false.into();
         let start = serde_json::json!({"schema_version":3,"domain":PALS_NATIVE_STARTUP_V3_DOMAIN,"endpoint_id":e.id,"launch_sha256":lock.sha256,
             "process_id":100,"binary_sha256":e.binary.sha256,"runtime_sha256":n.runtime.sha256,"provider":"cpu","precision":"fp32",
             "service_exit_success":false,"cpu_checker":helper,"native":native,"search_work":work});
@@ -4875,6 +5471,19 @@ mod tests {
         end["native"]["native_buffers_released"] = true.into();
         end["native"]["game_generation"] = 1.into();
         end["native"]["completed_new_game_resets"] = 1.into();
+        for field in [
+            "physically_completed_role_calls",
+            "completed_role_inputs",
+            "delivered_role_inputs",
+            "search_consumed_role_inputs",
+            "request_high_water",
+            "execution_high_water",
+        ] {
+            end["native"][field] = 3.into();
+        }
+        end["native"]["observer_failures"] = 0.into();
+        end["native"]["backend_stats_observation"] = "exclusive_worker_before_shutdown".into();
+        end["native"]["backend_stats"] = stats_fixture(1, 3);
         let h = &mut end["cpu_checker"];
         h["cleanup_complete"] = true.into();
         h["started_owner_exit_and_drains_confirmed"] = true.into();
@@ -4892,11 +5501,450 @@ mod tests {
             ("value_calls", 3),
             ("completed_value_calls", 3),
             ("accepted_value_outputs", 3),
+            ("consumed_role_outputs", 3),
         ] {
             end["search_work"]["pals"][key] = value.into();
         }
         end["search_work"]["pals"]["external_checker_work_incomplete"] = true.into();
         (lock, loaded, start, end)
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "pals-collection-onnx", feature = "native-cuda")
+    ))]
+    #[test]
+    fn production_helper_context_joins_profile_supervisor_native_and_foreign_core() {
+        use crate::native_runner::{NativeProviderInputContext, NativeProviderInputView};
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = ExternalProfileFixture::new();
+        let (lock, _, start, end) = helper_pair_fixture(&fixture);
+        let (declaration, _) = lock.input.external_cpu_r_binding(0).unwrap().unwrap();
+        let input_path = fixture.root.join("private-inputs");
+        let relative = lock.snapshot_relative_path(&declaration.profile).unwrap();
+        let profile_path = input_path.join(&relative);
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        std::fs::copy(fixture.root.join("profile.json"), &profile_path).unwrap();
+        std::fs::set_permissions(&profile_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let file = std::fs::File::open(&profile_path).unwrap();
+        let input_directory =
+            cap_std::fs::Dir::open_ambient_dir(&input_path, cap_std::ambient_authority()).unwrap();
+        let pins = [NativeProviderInputView {
+            artifact: &declaration.profile,
+            path: &profile_path,
+            file: &file,
+        }];
+        let inputs = NativeProviderInputContext {
+            directory: &input_directory,
+            pins: &pins,
+        };
+        let trace = synthetic_helper_game_trace(&lock, [[100, 102], [200, 202]]);
+        let start_bytes = serde_json::to_vec(&start).unwrap();
+        let end_bytes = serde_json::to_vec(&end).unwrap();
+        assert!(
+            validate_pals_native_records(
+                &lock,
+                NativeEngineRole::Baseline,
+                &start_bytes,
+                &end_bytes,
+                "native-process-100"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_pals_search_work_records(
+                &lock,
+                NativeEngineRole::Baseline,
+                &start_bytes,
+                &end_bytes,
+                "native-process-100"
+            )
+            .is_err()
+        );
+        let (audit, pid) = lock
+            .validate_records_with_context(
+                NativeEngineRole::Baseline,
+                &start_bytes,
+                &end_bytes,
+                "native-process-100",
+                &inputs,
+                &trace,
+            )
+            .unwrap();
+        assert_eq!(pid, 100);
+        assert!(
+            lock.validate_records_with_context(
+                NativeEngineRole::Candidate,
+                &start_bytes,
+                &end_bytes,
+                "native-process-100",
+                &inputs,
+                &trace
+            )
+            .is_err()
+        );
+        let wrong_trace = synthetic_helper_game_trace(&lock, [[110, 112], [200, 202]]);
+        assert!(
+            lock.validate_records_with_context(
+                NativeEngineRole::Baseline,
+                &start_bytes,
+                &end_bytes,
+                "native-process-100",
+                &inputs,
+                &wrong_trace
+            )
+            .is_err()
+        );
+        let work = validate_pals_search_work_records_inner(
+            &lock,
+            NativeEngineRole::Baseline,
+            &start_bytes,
+            &end_bytes,
+            "native-process-100",
+            Some(&audit),
+        )
+        .unwrap();
+        assert!(
+            endpoint_work_receipt(
+                &lock,
+                NativeEngineRole::Baseline,
+                Some(&work),
+                None,
+                &preflight_fixture("pals")
+            )
+            .is_err()
+        );
+        let projected = endpoint_work_receipt(
+            &lock,
+            NativeEngineRole::Baseline,
+            Some(&work),
+            Some(&audit),
+            &preflight_fixture("pals"),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                projected.cpu_tasks_requested,
+                projected.cpu_tasks_completed,
+                projected.cpu_tasks_consumed,
+                projected.cpu_nodes
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(
+            (projected.nn_inputs_completed, projected.nn_inputs_consumed),
+            (4, 3)
+        );
+        let foreign = projected.external_cpu_r.unwrap();
+        assert_eq!(
+            (
+                foreign.work.reports_returned,
+                foreign.work.nodes_observed,
+                foreign.work.consumed_completed_tasks
+            ),
+            (Some(1), Some(20), Some(3))
+        );
+        assert!(matches!(
+            foreign.work.completed_tasks,
+            PalsObservedV3::Unknown
+        ));
+        let mut changed_work = work.clone();
+        changed_work.termination_sha256 = "f".repeat(64);
+        assert!(
+            endpoint_work_receipt(
+                &lock,
+                NativeEngineRole::Baseline,
+                Some(&changed_work),
+                Some(&audit),
+                &preflight_fixture("pals")
+            )
+            .is_err()
+        );
+        let mut broken = end.clone();
+        broken["native"]["residency"]["graphs"][0]["serialized_bytes"] = 999.into();
+        assert!(
+            lock.validate_records_with_context(
+                NativeEngineRole::Baseline,
+                &start_bytes,
+                &serde_json::to_vec(&broken).unwrap(),
+                "native-process-100",
+                &inputs,
+                &trace
+            )
+            .is_err()
+        ); // whole NN audit remains mandatory
+        let leaders = BTreeSet::from([100, 102, 200, 202]);
+        assert!(validate_pals_helper_identity_set(std::slice::from_ref(&audit), &leaders).is_ok());
+        assert!(
+            validate_pals_helper_identity_set(&[audit.clone(), audit.clone()], &leaders).is_err()
+        );
+        assert!(
+            validate_pals_helper_identity_set(
+                std::slice::from_ref(&audit),
+                &BTreeSet::from([100, 101, 200, 202])
+            )
+            .is_err()
+        );
+        // Byte-identical replacement is still a different inode from the owner.
+        std::fs::rename(&profile_path, profile_path.with_extension("old")).unwrap();
+        std::fs::copy(fixture.root.join("profile.json"), &profile_path).unwrap();
+        std::fs::set_permissions(&profile_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(load_owner_helper_profile(&lock, NativeEngineRole::Baseline, &inputs).is_err());
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "pals-collection-onnx", feature = "native-cuda")
+    ))]
+    fn synthetic_helper_game_trace(lock: &LockedPalsArenaLaunchV3, pids: [[u32; 2]; 2]) -> Vec<u8> {
+        let trace = |message: String| {
+            format!(
+                "[TRACE ] [12:34:56.123456] <{:>20}> fastchess --- {message}",
+                1
+            )
+        };
+        let mut rows = vec![];
+        for (game, (&baseline_pid, &candidate_pid)) in pids[0].iter().zip(&pids[1]).enumerate() {
+            let game_pids = [baseline_pid, candidate_pid];
+            let number = game + 1;
+            let white = &lock.input.semantic_lock.manifest.pilot.white_order[game];
+            let wr = lock
+                .input
+                .semantic_lock
+                .manifest
+                .engines
+                .iter()
+                .position(|e| e.id() == white)
+                .unwrap();
+            let black = lock.input.semantic_lock.manifest.engines[1 - wr].id();
+            rows.extend([
+                trace(format!(
+                    "Game {number} between {white} and {black} starting"
+                )),
+                format!("Started game {number} of 2 ({white} vs {black})"),
+                trace(format!(
+                    "Game {number} between {white} and {black} finished"
+                )),
+                trace(format!("Game {number} finished with result 1/2-1/2")),
+                format!("Finished game {number} ({white} vs {black}): 1/2-1/2 {{Draw}}"),
+                trace(format!(
+                    "Process with pid: {} terminated with status: 0",
+                    game_pids[wr]
+                )),
+                trace(format!(
+                    "Process with pid: {} terminated with status: 0",
+                    game_pids[1 - wr]
+                )),
+            ]);
+        }
+        format!("{}\n", rows.join("\n")).into_bytes()
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "pals-collection-onnx", feature = "native-cuda")
+    ))]
+    fn synthetic_helper_reidentify(
+        start: &mut serde_json::Value,
+        end: &mut serde_json::Value,
+        parent: u32,
+        helper: u32,
+    ) {
+        for value in [&mut *start, &mut *end] {
+            value["process_id"] = parent.into();
+            let ready = &mut value["cpu_checker"]["startup_resource_observation"];
+            ready["parent"]["pid"] = parent.into();
+            ready["parent"]["process_group"] = parent.into();
+            ready["parent"]["threads"][0]["tid"] = parent.into();
+            ready["helper"]["pid"] = helper.into();
+            ready["helper"]["process_group"] = helper.into();
+            ready["helper"]["parent_pid"] = parent.into();
+            ready["helper"]["threads"][0]["tid"] = helper.into();
+        }
+        end["cpu_checker"]["shutdown"]["process_identity"]["pid"] = helper.into();
+        end["cpu_checker"]["shutdown"]["process_identity"]["process_group"] = helper.into();
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "pals-collection-onnx", feature = "native-cuda")
+    ))]
+    #[test]
+    fn helper_preflight_consumes_exact_supervised_slots_and_keeps_game_root_separate() {
+        use crate::native_runner::{NativeProviderInputContext, NativeProviderInputView};
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = ExternalProfileFixture::new();
+        let (lock, _, start, end) = helper_pair_fixture(&fixture);
+        let (declaration, _) = lock.input.external_cpu_r_binding(0).unwrap().unwrap();
+        let input_path = fixture.root.join("private-inputs");
+        let profile_path =
+            input_path.join(lock.snapshot_relative_path(&declaration.profile).unwrap());
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        std::fs::copy(fixture.root.join("profile.json"), &profile_path).unwrap();
+        std::fs::set_permissions(&profile_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let file = std::fs::File::open(&profile_path).unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(&input_path, cap_std::ambient_authority()).unwrap();
+        let pins = [NativeProviderInputView {
+            artifact: &declaration.profile,
+            path: &profile_path,
+            file: &file,
+        }];
+        let inputs = NativeProviderInputContext {
+            directory: &directory,
+            pins: &pins,
+        };
+        let root_path = fixture.root.join("external-baseline-preflight-runtime");
+        std::fs::create_dir(&root_path).unwrap();
+        let root =
+            cap_std::fs::Dir::open_ambient_dir(&root_path, cap_std::ambient_authority()).unwrap();
+        let mut preflight = preflight_fixture("pals");
+        preflight.identification_process.pid = 10;
+        preflight.readiness_process.pid = 12;
+        for (parent, helper, identification) in [(10, 11, true), (12, 13, false)] {
+            let (mut s, mut t) = (start.clone(), end.clone());
+            for value in [&mut s, &mut t] {
+                value["process_id"] = parent.into();
+                let ready = &mut value["cpu_checker"]["startup_resource_observation"];
+                ready["parent"]["pid"] = parent.into();
+                ready["parent"]["process_group"] = parent.into();
+                ready["parent"]["threads"][0]["tid"] = parent.into();
+                ready["helper"]["pid"] = helper.into();
+                ready["helper"]["process_group"] = helper.into();
+                ready["helper"]["parent_pid"] = parent.into();
+                ready["helper"]["threads"][0]["tid"] = helper.into();
+            }
+            t["cpu_checker"]["shutdown"]["process_identity"]["pid"] = helper.into();
+            t["cpu_checker"]["shutdown"]["process_identity"]["process_group"] = helper.into();
+            if identification {
+                t["search_work"] = s["search_work"].clone();
+                for field in [
+                    "physically_completed_role_calls",
+                    "completed_role_inputs",
+                    "delivered_role_inputs",
+                    "search_consumed_role_inputs",
+                    "request_high_water",
+                    "execution_high_water",
+                    "completed_new_game_resets",
+                    "game_generation",
+                ] {
+                    t["native"][field] = 0.into();
+                }
+                t["native"]["backend_stats"] = stats_fixture(0, 0);
+            }
+            let path = root_path.join(format!("native-process-{parent}"));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(
+                path.join("pals-native-startup.v3.json"),
+                serde_json::to_vec(&s).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                path.join("pals-native-termination.v3.json"),
+                serde_json::to_vec(&t).unwrap(),
+            )
+            .unwrap();
+        }
+        let evidence = lock
+            .validate_external_preflight(NativeEngineRole::Baseline, &preflight, &root, &inputs)
+            .unwrap();
+        assert_eq!(evidence.len(), 4);
+        assert!(!fixture.root.join("baseline-runtime").exists());
+        let trace = synthetic_helper_game_trace(&lock, [[100, 102], [200, 202]]);
+        let mut games = Vec::new();
+        for (parent, helper) in [(100, 101), (102, 103)] {
+            let (mut s, mut t) = (start.clone(), end.clone());
+            synthetic_helper_reidentify(&mut s, &mut t, parent, helper);
+            games.push(
+                lock.validate_records_with_context(
+                    NativeEngineRole::Baseline,
+                    &serde_json::to_vec(&s).unwrap(),
+                    &serde_json::to_vec(&t).unwrap(),
+                    &format!("native-process-{parent}"),
+                    &inputs,
+                    &trace,
+                )
+                .unwrap()
+                .0,
+            );
+        }
+        let artifacts: Vec<ArtifactRef> = evidence
+            .iter()
+            .map(|(relative, bytes)| ArtifactRef {
+                path: format!("attempt/external-baseline-preflight-runtime/{relative}"),
+                sha256: digest(bytes),
+                bytes: bytes.len() as u64,
+                source: "synthetic retained producer evidence".into(),
+                license: "MIT".into(),
+            })
+            .collect();
+        let runtime_root =
+            cap_std::fs::Dir::open_ambient_dir(&fixture.root, cap_std::ambient_authority())
+                .unwrap();
+        lock.validate_provider_session_set(
+            &games,
+            std::slice::from_ref(&preflight),
+            &runtime_root,
+            &inputs,
+            &trace,
+            &artifacts,
+        )
+        .unwrap();
+        let mut changed_history = artifacts.clone();
+        changed_history[0].sha256 = "f".repeat(64);
+        assert!(
+            lock.validate_provider_session_set(
+                &games,
+                std::slice::from_ref(&preflight),
+                &runtime_root,
+                &inputs,
+                &trace,
+                &changed_history,
+            )
+            .is_err()
+        );
+        assert!(
+            lock.validate_provider_session_set(
+                &games[..1],
+                std::slice::from_ref(&preflight),
+                &runtime_root,
+                &inputs,
+                &trace,
+                &artifacts,
+            )
+            .is_err()
+        );
+        let mut wrong = preflight.clone();
+        wrong.readiness_process.pid = 14;
+        assert!(
+            lock.validate_external_preflight(NativeEngineRole::Baseline, &wrong, &root, &inputs)
+                .is_err()
+        );
+        let mut failed = preflight.clone();
+        failed.identification_process.exit_code = Some(1);
+        assert!(
+            lock.validate_external_preflight(NativeEngineRole::Baseline, &failed, &root, &inputs)
+                .is_err()
+        );
+        let absent = NativeProviderInputContext {
+            directory: &directory,
+            pins: &[],
+        };
+        assert!(
+            lock.validate_external_preflight(
+                NativeEngineRole::Baseline,
+                &preflight,
+                &root,
+                &absent
+            )
+            .is_err()
+        );
+        std::fs::create_dir(root_path.join("native-process-99")).unwrap();
+        assert!(
+            lock.validate_external_preflight(
+                NativeEngineRole::Baseline,
+                &preflight,
+                &root,
+                &inputs
+            )
+            .is_err()
+        );
     }
     #[cfg(all(
         target_os = "linux",
@@ -4941,7 +5989,7 @@ mod tests {
                 .pid,
             101
         );
-        assert!(lock.validate_execution().is_err());
+        assert!(lock.validate_execution().is_ok());
     }
     #[cfg(all(
         target_os = "linux",
@@ -6670,6 +7718,7 @@ mod tests {
             launch_sha256: lock.sha256().into(),
             startup_sha256: "a".repeat(64),
             termination_sha256: "b".repeat(64),
+            external_cpu_r_session: None,
             completed_role_inputs: 3,
             search_consumed_role_inputs: 1,
             completed_new_game_resets: 1,
