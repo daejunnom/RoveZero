@@ -167,6 +167,23 @@ loss를 계산하고 parameter digest와 gradient 부재를 재검사합니다. 
 학습 update·제품 V 연결은 없습니다. 합성 fixture와 실제 child 실행 인수는
 [PALS 구현·검증 기록](../../../docs/research/PALS-IMPLEMENTATION.md)에서 구분합니다.
 
+`native_divergence`는 ordinary current dataset에 등록되지 않은 실제 C 이탈 입력의
+별도 인수 접점입니다. `learning_input=false`인 producer journal, 원래 aux tensor·
+lineage·source·physical event/raw output와 독립 export/launch pin을 검증하며 ordinary
+parent는 같은 root의 Rules·이력·출처를 연결하는 anchor로만 사용합니다. parent의
+public features나 current label을 aux에 복사하지 않습니다. raw Rules 의미 digest와
+schema를 합성한 native encoding digest, export 당시 source와 실제 capture source는
+각 provenance에 맞춰 따로 대조합니다. `shared_pc_if`의 scalar 역할 분기와 별도
+P/C graph export를 명시적으로 지원하며 graph 이름만으로 역할을 추정하지 않습니다.
+
+새 before-dispatch descriptor와, 과거 수집 입력에 새 Rust prefix Rules receipt를
+연결한 `derived_from_legacy_prepared`는 다른 provenance입니다. 후자는 과거
+descriptor 존재나 ordinary current label을 증명하지 않습니다. CPU collator는
+batch 1~4·1MiB tensor 상한에서 captured divergence slot 순서를 유지하고 empty
+candidates에는 한 개의 false-mask padding만 둡니다. 정책·WDL·task·divergence의
+감독 mask는 모두 false입니다. 원래 native raw logits는 정답으로 사용하지 않습니다.
+이 접점의 실제 frozen CPU C 대조도 ranking·수선 성공·학습·기력 인수와 구분합니다.
+
 FLOPs 보고는 FMA=2 기준의 실제 선언 shape에 따른 matrix product 산술입니다.
 encoder와 role 반복 비용을 구분하고 cached memory를 호출마다 중복 계산하지 않습니다.
 softmax·RMSNorm·SwiGLU activation·lookup·이동·CPU 탐색과 backward는 제외 사실을

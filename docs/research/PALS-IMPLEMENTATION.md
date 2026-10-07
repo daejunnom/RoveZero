@@ -1017,3 +1017,98 @@ source `34dc701`의 [CI 37685960703](https://github.com/daejunnom/RoveZero/actio
 기록이 아니다.
 DG02의 실제 divergence/repair 인과 admission·목표 준비, 외부 helper의 완전한
 paired 인수와 전체 학습 준비의 통합은 남아 있다. GPU 검증은 계속 보류한다.
+
+### Native 이탈 지점 입력의 별도 인수와 예약 순서
+
+`ec32bb2`는 실제 native Divergence 입력과 별도의
+`rz-pals-native-divergence-context/1` descriptor를 물리 submit 전에 봉인한다.
+각 slot의 원래 순서·proposal·상대 차례의 prefix Rules state/history·원래 tensor
+sidecar·revision을 연결한다. 다시 준비하면서 샘플한 남은 시간을 원래 입력에
+덮어쓰지 않으며, descriptor에서 lineage와 false-learning journal로 이어지는
+연결에는 hash cycle이 없다. 과거 collection에 이 descriptor가 있었다고 소급하지 않는다.
+
+독립 소스 검토에서 producer journal 뒤에 output credit을 예약하는 순서 결함을
+발견했다. `638858f`는 정확한 출력 바이트와 raw/stage 예약을 producer capture
+이전으로 옮긴다. 예산 부족이면 journal·trace·sequence가 바뀌지 않고, 명시적으로
+credit을 늘린 뒤 같은 미제출 request를 다시 인수할 수 있다. producer 자체 quota
+거절은 이미 예약한 정확한 준비 행과 실패 journal을 보존한다. root50 native CPU
+observer 검사 10개, Arena all-target/all-feature Clippy `-D warnings`와 workspace
+format이 통과했고 managed scratch 정리도 verified였다. root49의 같은 10개 검사를
+더해 고유 검사 수로 표시하지 않는다.
+
+`5851659`의 `native_divergence.py`는 일반 strict dataset selector를 유지하면서
+별도 auxiliary input·sidecar·lineage·false journal·source·physical event/raw output을
+인수하는 접점이다. `NativeCollectionFacts`는 collection의 읽기 전용 사실이며 개별
+입력이나 label의 권한을 주지 않는다. 실제 aux 입력의 public records·role·revision은
+같은 root의 ordinary parent와 다를 수 있으므로 원래 captured tensor를 사용한다.
+empty candidates는 한 padding과 false input mask로 보존한다. 감독 policy·WDL·task·
+divergence mask는 모두 false이며 ranking·수선 성공·학습 정답을 만들지 않는다.
+root51의 합성 CPU fixture 19개가 통과했고 실제 모델·Rust child의 종단 성공과 구분한다.
+
+root52는 `638858f`의 정확한 tracked Rust/Cargo 입력을 빌드 전후 대조하고
+CPU semantic CLI를 별도 등록했다. compiler artifact는 `fresh=true`, 바이너리는
+38,259,808 bytes·SHA-256
+`bfccd4932f8d80613fe495a1c0e7c1ee3041386cf293e88c7de20560e79d83eb`로 이전 root44와
+같다. 같은 bytes라는 사실과 새 source 등록·빌드 실행을 각각 기록한다.
+
+실제 root53은 retained collection23의 false-learning Divergence 한 건에 대해
+새 Rust prefix Rules 영수증·loaded executable inode·stdin 이전 관측·reap·pipe EOF·
+owned group 소멸을 확인했다. C forward 전에 신규 Python graph route 검사에서
+거절됐다. 추적 결과 이 검사는 raw Rules semantic digest를 composite encoding
+digest와 직접 비교했고 export 당시 source와 capture 당시 source도 같은 artifact로
+비교했다. collector의 `load_pinned`는 기존 `verify_pals_rules_profile`을 이미 호출하므로
+이 실패를 collector의 의미 검사 우회로 해석하지 않는다. 원래 root53 실패·원시 자료와
+managed cleanup 성공을 보존하고 Python gate를 실제 계약에 맞게 수정한다.
+
+계약상 capture encoding은
+`SHA256(UTF-8("rovezero.pals-board-records.v1") || raw Rules semantic digest 32B)`다.
+export의 `rules_encoder_source_sha256`은 export 당시 선언 provenance이고, 실제
+capture encoder source는 registry·loaded source·sidecar의 별도 provenance다.
+각각 독립 pin을 검증하며 다른 source 시점 자체를 입력 의미 불일치로 판정하지 않는다.
+실제 다른 의미·미지원 profile·altered raw asset은 계속 거절해야 한다.
+
+root50·51·52·53의 논리 자료는 `runs/pals/continuation-cpu-check-03/`와
+`runs/pals/actual-native-divergence-cpu-53/`에 보존했다. root53은 CPU search·C forward·
+학습을 실행하지 않았으며 Rules-only child의 정상 종료가 auxiliary admission 성공을
+뜻하지 않는다. 정확한 Torch RSS/cgroup peak와 VRAM peak는 unknown으로 유지한다.
+`638858f`의 [CI 37689767011](https://github.com/daejunnom/RoveZero/actions/runs/37689767011)는
+Linux·Windows·CPU bindings·model CPU 네 job 모두 실제 성공했다. 후속 Python SHA와
+GPU·실제 학습의 인수에 자동 재사용하지 않는다.
+
+후속 `ab7bdb5`는 이 namespace 비교를 바로잡는다. root54의 CPU fixture 20개는
+서로 다른 raw/composite digest·export/capture source를 정상 인수하고, 실제 의미·
+loaded adapter·loaded encoding 불일치는 거절했다. root51의 19개와 겹치는 suite이므로
+합산하지 않는다. 같은 수정 freeze에 대한 독립 소스 재검토에서도 추가 must-fix가 없었다.
+
+실제 root55는 원래 collection23의 auxiliary
+`9e6c08d9467b9c330a0a41054be9da17a892281bc24acf4b2405f13cbcd6e22d`를 원래 current
+root parent와 연결했다. 새 Rust prefix Rules receipt 1개와 원래 false journal·tensor·
+source·export·physical native output의 독립 pin을 소비해 별도 admission을 통과했다.
+`derived_from_legacy_prepared`, `auxiliary_has_current_label=false`,
+`producer_journal_learning_input=false`를 유지한다. 원래 collector의 launch 사실은
+보존된 실제 실행 결과·당시 launcher source로 audit한 caller 관측이며 새로운
+collector launch나 과거 before-dispatch descriptor의 증거로 바꾸지 않았다.
+
+CPU FP32로 기존 full untrained checkpoint를 reload·동결하고 원래 captured public
+record·query·8-feature를 C 전방 계산에 사용했다. 원래 native FP32 raw 출력과의
+최대 절대 차이는 divergence logits `1.78814e-7`, WDL logits `1.90735e-6`, private
+latent `2.86102e-6`이었다. absolute `1e-4`·relative `1e-3` 대조를 통과했다. dummy
+candidate는 false input mask로 남았고 실제 policy 비교 후보나 정답이 아니다.
+policy·WDL·divergence·task 감독 mask는 모두 false이고 loss는 0이다. 미관측 자료를
+0점·무승부 또는 양의 ranking 목표로 바꾼 것이 아니다.
+
+full parameter SHA-256
+`eedfe35b2750147ff06c8381b5f6b1c4bd0a6ad7299d945cf02ff2b38bd5775e`는 전후 같다.
+새 CPU search는 0개이며 실제 모델·Rules 기능 검증 구간은 6,474ms였다. 설치·정리와
+다른 fixture를 포함한 service 전체 시간과 구분하고 성능 향상 수치로 사용하지 않는다.
+새 Rust child는 원래 deadline 안에서 pipe EOF·reap·group 소멸을 확인했고 managed
+scratch 정리도 verified였다. GPU·optimizer 생성·backward·학습 update는 없었다.
+Torch RSS/cgroup peak와 VRAM peak는 unknown이다. 논리 자료는
+`runs/pals/actual-native-divergence-cpu-55/`이며 `root-result.json` SHA-256은
+`2c1e03fe084eaf2c4080931f1ec697b09d2fd227c168bd57a69d1acf07f034bc`다.
+새 descriptor의 실제 fresh collection 소비·C 이탈 ranking·P 수선의 인과/비교 목표·
+완전한 external helper pair는 이 legacy-input 대조만으로 완료되지 않는다.
+
+소스 b7bdb5의 [CI 37692482991](https://github.com/daejunnom/RoveZero/actions/runs/37692482991)는
+Linux·Windows·CPU bindings·model CPU 네 job 모두 실제 성공했다. 마지막 Windows job은
+2026-10-07 21:59:30 UTC에 완료됐다. 다음 Repair 구현의 검사와 별개다.
