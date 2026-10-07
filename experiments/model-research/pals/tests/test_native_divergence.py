@@ -38,10 +38,20 @@ class NativeDivergenceFixture:
     selected public records. Neither synthetic source nor caller observation
     proves an actual Rust/native process; they exercise the declared trust seam.
     """
-    def __init__(self, directory, *, captured=True, critic=True, layout="separate_pc", role_batching="one_scalar_role_per_physical_batch"):
+    def __init__(self, directory, *, captured=True, critic=True, layout="separate_pc", role_batching="one_scalar_role_per_physical_batch",
+                 manifest_semantic=None, loaded_adapter_sha=None, loaded_encoding_sha=None):
         self.root, self.captured = Path(directory), captured
         original_bytes = fixtures.frozen_fixture_bytes
+        original_fixture = fixtures.fixture
         export = []
+        self.rules_semantic = fixtures.sha("synthetic exact Rules field semantics")
+
+        def native_row(*args, **kwargs):
+            row = original_fixture(*args, **kwargs)
+            row["input"]["snapshot"]["encoding_sha256"] = hashlib.sha256(
+                divergence.PALS_ENCODING_SCHEMA + bytes.fromhex(self.rules_semantic)).hexdigest()
+            row["input"]["sha256"] = training.seal_snapshot(row["input"]["snapshot"])
+            return row
 
         def with_critic(value):
             if critic and type(value) is list and len(value) == 2 and value[0] == training.CHECKED_SOURCE_DOMAIN:
@@ -58,11 +68,11 @@ class NativeDivergenceFixture:
                             "layout": layout, "config": description["configuration"],
                             "checkpoint_sha256": description["source"]["model_weights_sha256"], "trained": False, "training_steps": 0,
                             "roles": ["proposer", "critic"] if critic else ["proposer"], "validator_present": False,
+                            "rules_input_profile": "rz-pals-rules-fields-v1", "rules_input_semantic_sha256": manifest_semantic or self.rules_semantic,
+                            "rules_encoder_source_sha256": fixtures.sha("synthetic export-era encoder source; differs from actual collector"),
                             "graphs": [{"role": graph["role"], "sha256": graph["sha256"]} for graph in native["graphs"]]}
                 if layout == "shared_pc_if":
-                    manifest.update(model_semantics="rovezero.pals-model.v1", layout_revision=1, role_batching=role_batching,
-                                    rules_input_profile="rz-pals-rules-fields-v1", rules_input_semantic_sha256=description["encoding_sha256"],
-                                    rules_encoder_source_sha256=description["encoder_source_sha256"])
+                    manifest.update(model_semantics="rovezero.pals-model.v1", layout_revision=1, role_batching=role_batching)
                     manifest["graphs"][1].update(inputs=[{"name": "role_is_critic", "dtype": "BOOL", "shape": []},
                                                          {"name": "divergence_features", "dtype": "FLOAT", "shape": ["batch", "divergences", 8]}],
                                                  outputs=[{"name": "divergence_logits", "dtype": "FLOAT", "shape": ["batch", "divergences"]}])
@@ -71,9 +81,11 @@ class NativeDivergenceFixture:
                 manifest_sha = divergence.byte_pin(manifest_raw)["sha256"]
                 native["independent_registry"]["export_manifest_sha256"] = manifest_sha
                 native["loaded_source"]["export_manifest_sha256"] = list(bytes.fromhex(manifest_sha))
+                native["loaded_source"]["encoding_semantic_sha256"] = list(bytes.fromhex(loaded_encoding_sha or description["encoding_sha256"]))
+                native["loaded_source"]["adapter_source_sha256"] = list(bytes.fromhex(loaded_adapter_sha or description["encoder_source_sha256"]))
             return original_bytes(value)
 
-        with patch.object(fixtures, "frozen_fixture_bytes", side_effect=with_critic):
+        with patch.object(fixtures, "frozen_fixture_bytes", side_effect=with_critic), patch.object(fixtures, "fixture", side_effect=native_row):
             self.options = fixtures.write_frozen_fixture_collection(self.root, kinds=("native",))
         self.base = {path.name: path.read_bytes() for path in self.root.iterdir() if path.is_file()}
         self.source_raw = self.base["producer-source.json"]
@@ -318,10 +330,28 @@ class NativeDivergenceTests(unittest.TestCase):
             bank = NativeDivergenceFixture(root, layout="shared_pc_if")
             checked = bank.admit()
             self.assertEqual(checked.admission["registered_critic_graph_route"], "shared_pc_if")
+            self.assertNotEqual(checked.admission["rules_input_semantic_sha256"], checked.admission["encoding_sha256"])
+            self.assertNotEqual(checked.admission["export_declared_encoder_source_sha256"], checked.admission["actual_encoder_source_sha256"])
+            self.assertEqual(checked.admission["encoding_sha256"], hashlib.sha256(
+                divergence.PALS_ENCODING_SCHEMA + bytes.fromhex(checked.admission["rules_input_semantic_sha256"])).hexdigest())
             self.assertFalse(divergence.collate_native_divergences([checked]).divergence_mask.any())
         with tempfile.TemporaryDirectory() as root:
             bank = NativeDivergenceFixture(root, layout="shared_pc_if", role_batching="mixed_roles_per_batch")
             with self.assertRaisesRegex(ValueError, "explicit Critic graph route"):
+                bank.admit()
+
+    def test_real_rules_semantic_mismatch_and_actual_loaded_adapter_mismatch_are_refused(self):
+        with tempfile.TemporaryDirectory() as root:
+            bank = NativeDivergenceFixture(root, layout="shared_pc_if", manifest_semantic=fixtures.sha("another feature meaning"))
+            with self.assertRaisesRegex(ValueError, "encoding namespace"):
+                bank.admit()
+        with tempfile.TemporaryDirectory() as root:
+            bank = NativeDivergenceFixture(root, loaded_adapter_sha=fixtures.sha("different actual loaded adapter"))
+            with self.assertRaisesRegex(ValueError, "actual loaded adapter/encoding"):
+                bank.admit()
+        with tempfile.TemporaryDirectory() as root:
+            bank = NativeDivergenceFixture(root, loaded_encoding_sha=fixtures.sha("different actual loaded encoding"))
+            with self.assertRaisesRegex(ValueError, "actual loaded adapter/encoding"):
                 bank.admit()
 
     def test_self_resealed_sidecar_without_original_journal_and_receipt_is_refused(self):

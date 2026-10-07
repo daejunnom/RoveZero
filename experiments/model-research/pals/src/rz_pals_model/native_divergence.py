@@ -25,6 +25,10 @@ from .model import TensorInput
 from .semantic_verifier import CheckedSemanticInput, byte_pin, canonical, digest, _fields, _int, _parse, _sha
 
 CONTEXT_VERSION = "rz-pals-native-divergence-context/1"
+# rz-eval::pals_model::PALS_ENCODING_SCHEMA, used by both the native model
+# identity and rz-arena::pals_collect::native_encoding_sha. This namespace is
+# distinct from the raw Rules field-semantic digest declared by the export.
+PALS_ENCODING_SCHEMA = b"rovezero.pals-board-records.v1"
 CHALLENGED_DOMAIN = "rz-pals-challenged-line/1"
 ADMISSION_DOMAIN = "rz-pals-native-divergence-admission/1"
 LAUNCH_SCHEMA = "rz-pals-native-divergence-collection-launch/1"
@@ -238,6 +242,20 @@ def _critic_route(manifest_raw, source):
             or manifest.get("trained") is not False or type(manifest.get("training_steps")) is not int or manifest["training_steps"] != 0
             or manifest.get("validator_present") is not False or manifest.get("roles") != ["proposer", "critic"]):
         raise ValueError("registered export manifest/critic graph capability mismatch")
+    rules_semantic = _sha(manifest.get("rules_input_semantic_sha256"))
+    # These are distinct, independently pinned provenance axes. The declared
+    # export-era source records where its feature declaration came from; an
+    # actual collector source may differ after worker/lifecycle/comment edits.
+    # Their equality would incorrectly make code provenance a feature meaning.
+    _sha(manifest.get("rules_encoder_source_sha256"))
+    actual_source = _sha(source["encoder_source_sha256"])
+    loaded = native["loaded_source"]
+    if (training._epoch_hex(loaded.get("adapter_source_sha256")) != actual_source
+            or training._epoch_hex(loaded.get("encoding_semantic_sha256")) != source["encoding_sha256"]):
+        raise ValueError("actual loaded adapter/encoding differs from registered collector source")
+    composite = hashlib.sha256(PALS_ENCODING_SCHEMA + bytes.fromhex(rules_semantic)).hexdigest()
+    if manifest.get("rules_input_profile") != "rz-pals-rules-fields-v1" or composite != source["encoding_sha256"]:
+        raise ValueError("registered export Rules semantics do not match actual encoding namespace")
     graphs = manifest.get("graphs")
     if type(graphs) is not list or not 1 <= len(graphs) <= 4 or any(type(graph) is not dict for graph in graphs):
         raise ValueError("explicit registered export graph inventory required")
@@ -253,9 +271,7 @@ def _critic_route(manifest_raw, source):
     if (manifest.get("schema") != "rovezero.pals-model.v2" or manifest.get("layout") != "shared_pc_if"
             or manifest.get("model_semantics") != "rovezero.pals-model.v1" or type(manifest.get("layout_revision")) is not int
             or manifest["layout_revision"] != 1 or manifest.get("role_batching") != "one_scalar_role_per_physical_batch"
-            or roles != {"public", "shared_pc"} or manifest.get("rules_input_profile") != "rz-pals-rules-fields-v1"
-            or manifest.get("rules_input_semantic_sha256") != source["encoding_sha256"]
-            or manifest.get("rules_encoder_source_sha256") != source["encoder_source_sha256"]):
+            or roles != {"public", "shared_pc"}):
         raise ValueError("registered export has no supported explicit Critic graph route")
     shared = next(graph for graph in graphs if graph["role"] == "shared_pc")
     for name in ("inputs", "outputs"):
@@ -305,6 +321,10 @@ class NativeCollectionFacts:
     source_json: bytes
     registered_critic_graph_route: str
     collection_receipt_sha256: str
+    rules_input_semantic_sha256: str
+    encoding_sha256: str
+    export_declared_encoder_source_sha256: str
+    actual_encoder_source_sha256: str
     scope: str = "conditional_registered_collection_facts_only;no_individual_input_or_label_admission"
 
 
@@ -387,8 +407,10 @@ def verify_native_collection_authority(*, parent, parent_index, artifacts, regis
             or launch["spawned"] is not True or launch["reaped"] is not True or type(launch["exit_code"]) is not int
             or launch["exit_code"] != 0 or launch["timed_out"] is not False):
         raise ValueError("independent registered native collection launch observation required")
+    manifest = _parse(export_raw)
     return NativeCollectionFacts(parent["input"]["sha256"], canonical(producer), canonical(source), graph_route,
-                                 byte_pin(artifacts["receipt.json"])["sha256"])
+                                 byte_pin(artifacts["receipt.json"])["sha256"], manifest["rules_input_semantic_sha256"],
+                                 source["encoding_sha256"], manifest["rules_encoder_source_sha256"], source["encoder_source_sha256"])
 
 
 def _validate(parents, parent_index, artifacts, registration_raw, source_raw, export_raw, launch_raw, context_raw, mode, checks, pins):
@@ -528,6 +550,10 @@ def _validate(parents, parent_index, artifacts, registration_raw, source_raw, ex
                  "captured_revision": aux["input_revision"], "same_parent_public_records_required": False,
                  "caller_assurance": "independently_pinned_caller_collection_observation;registered_native_source;Rules_not_reimplemented",
                  "registered_critic_graph_route": graph_route,
+                 "rules_input_semantic_sha256": authority.rules_input_semantic_sha256,
+                 "encoding_sha256": authority.encoding_sha256,
+                 "export_declared_encoder_source_sha256": authority.export_declared_encoder_source_sha256,
+                 "actual_encoder_source_sha256": authority.actual_encoder_source_sha256,
                  "native_search_consumed": stages[-1] == "search_consumed", "all_target_masks_false": True}
     return frozen, context, encoding, admission
 
