@@ -713,14 +713,11 @@ pub(crate) mod linux {
         }
         spec.validate_execution()?;
         let input = spec.view();
-        let opening = crate::opening_pgn_for_spec(input.opening, input.max_plies)?;
-        if opening.len() as u64 != input.opening_artifact.bytes
-            || format!("{:x}", Sha256::digest(opening.as_bytes())) != input.opening_artifact.sha256
-        {
-            return Err(ArenaError::Integrity(
-                "opening artifact differs from complete A-validated trace serialization".into(),
-            ));
-        }
+        crate::validate_opening_artifact_for_spec(
+            input.opening,
+            input.max_plies,
+            input.opening_artifact,
+        )?;
         let total = spec.unique_bytes()?;
         if total > input.budget.max_input_bytes {
             return Err(ArenaError::Budget("native input aggregate exceeded".into()));

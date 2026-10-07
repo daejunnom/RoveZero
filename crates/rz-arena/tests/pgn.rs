@@ -1,10 +1,11 @@
 use rz_arena::{
     ArenaPlan, GameResult, PgnLimits, PgnOutcomePolicy, PlanLimits, audit_pair_pgn,
-    audit_pair_pgn_for_spec, opening_pgn, opening_pgn_for_spec,
+    audit_pair_pgn_for_spec, opening_pgn, opening_pgn_for_spec, validate_opening_artifact_for_spec,
 };
 use rz_experiments::{
-    ClaimPolicy, HistoryCompleteness, InitialPosition, OutcomePolicy, RunManifest,
+    ArtifactRef, ClaimPolicy, HistoryCompleteness, InitialPosition, OutcomePolicy, RunManifest,
 };
+use sha2::{Digest, Sha256};
 
 const FIXTURE: &str = include_str!("../../../experiments/baselines/fixtures/e01-input.json");
 const MATE_MOVES: &str = "1. e4 e5 2. Qh5 Nc6 3. Bc4 Nf6 4. Qxf7#";
@@ -56,6 +57,32 @@ fn policy(max_game_plies: u32) -> PgnOutcomePolicy {
         claim_policy: ClaimPolicy::ExplicitClaim,
         max_game_plies,
     }
+}
+
+#[test]
+fn opening_pin_rejects_same_position_with_manual_headers_or_changed_prefix() {
+    let mut opening = plan(input()).pairs()[0].opening.clone();
+    opening.moves.clear();
+    let text = opening_pgn_for_spec(&opening, 256).unwrap();
+    let mut artifact = ArtifactRef {
+        path: "opening.pgn".into(),
+        bytes: text.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
+        source: "https://github.com/daejunnom/RoveZero".into(),
+        license: "MIT".into(),
+    };
+    assert_eq!(
+        validate_opening_artifact_for_spec(&opening, 256, &artifact).unwrap(),
+        text
+    );
+    let manual = "[Event \"RoveZero Stockfish19 paired pilot\"]\n[Result \"*\"]\n\n*\n";
+    artifact.bytes = manual.len() as u64;
+    artifact.sha256 = format!("{:x}", Sha256::digest(manual.as_bytes()));
+    assert!(validate_opening_artifact_for_spec(&opening, 256, &artifact).is_err());
+    artifact.bytes = text.len() as u64;
+    artifact.sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+    opening.moves = vec!["e2e4".into(), "e7e5".into()];
+    assert!(validate_opening_artifact_for_spec(&opening, 256, &artifact).is_err());
 }
 
 #[test]

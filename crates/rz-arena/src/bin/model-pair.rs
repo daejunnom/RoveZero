@@ -2,12 +2,8 @@
 #[cfg(target_os = "linux")]
 use rz_experiments::LockedManifestV2;
 use rz_experiments::RunManifestV2;
-use std::{
-    error::Error,
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-};
+use sha2::{Digest, Sha256};
+use std::{error::Error, fs, io::Write, path::Path};
 fn read(path: &Path) -> Result<String, Box<dyn Error>> {
     if !path.is_absolute()
         || fs::symlink_metadata(path)?.file_type().is_symlink()
@@ -17,20 +13,42 @@ fn read(path: &Path) -> Result<String, Box<dyn Error>> {
     }
     Ok(fs::read_to_string(path)?)
 }
+fn write_new(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    if !path.is_absolute() {
+        return Err("absolute output outside Git required".into());
+    }
+    for parent in path.ancestors().skip(1) {
+        if parent.join(".git").exists() {
+            return Err("run artifacts stay outside Git".into());
+        }
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("lock") if args.len()==3=>{
-            let lock=RunManifestV2::from_json(&read(Path::new(&args[1]))?)?.lock()?;
-            let output=PathBuf::from(&args[2]);
-            if !output.is_absolute(){return Err("absolute lock output required".into());}
-            for parent in output.ancestors().skip(1) {if parent.join(".git").exists(){return Err("run locks stay outside Git".into());}}
-            let mut file=fs::OpenOptions::new().write(true).create_new(true).open(output)?;
-            file.write_all(lock.to_json()?.as_bytes())?;file.sync_all()?;
+            let input=RunManifestV2::from_json(&read(Path::new(&args[1]))?)?;
+            rz_arena::validate_opening_artifact_for_spec(&input.opening,input.max_plies,&input.opening_artifact)?;
+            let lock=input.lock()?;
+            write_new(Path::new(&args[2]),lock.to_json()?.as_bytes())?;
             println!("input_sha256={} execution_ready=false",lock.sha256());Ok(())
         },
+        Some("opening") if args.len()==3=>{
+            let input=RunManifestV2::from_json(&read(Path::new(&args[1]))?)?;
+            let text=rz_arena::opening_pgn_for_spec(&input.opening,input.max_plies)?;
+            write_new(Path::new(&args[2]),text.as_bytes())?;
+            println!("opening_bytes={} opening_sha256={:x} engines_started=false",text.len(),Sha256::digest(text.as_bytes()));
+            Ok(())
+        },
         Some("execute") if args.len()==5=>execute(&args[1..]),
-        _=>Err("usage: model-pair lock INPUT_JSON NEW_LOCK_JSON | execute LOCK_JSON ASSET_ROOT OUTPUT_ROOT UNIQUE_LABEL".into()),
+        _=>Err("usage: model-pair opening INPUT_JSON NEW_PGN | lock INPUT_JSON NEW_LOCK_JSON | execute LOCK_JSON ASSET_ROOT OUTPUT_ROOT UNIQUE_LABEL".into()),
     }
 }
 #[cfg(not(target_os = "linux"))]
