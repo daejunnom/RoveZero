@@ -146,7 +146,7 @@ class NativeDivergenceFixture:
         self.checks = ()
         self.rebuild()
 
-    def rebuild(self, *, reseal_context=True):
+    def rebuild(self, *, reseal_context=True, public_rows=None):
         """Re-pin synthetic collection bytes to reach deeper negative gates."""
         self.input["sha256"] = training.seal_snapshot(self.input["snapshot"])
         identity = self.input["sha256"]
@@ -176,7 +176,7 @@ class NativeDivergenceFixture:
         assets.update({"native-divergence-inputs.jsonl": lines([self.input]), "native-divergence-sidecars.jsonl": lines([self.sidecar]),
                        "input-lineage.jsonl": self.base["input-lineage.jsonl"] + lines([self.lineage]),
                        "producer-prepared.jsonl": self.base["producer-prepared.jsonl"] + lines([self.journal]),
-                       "public-record-sources.jsonl": lines([self.public]),
+                       "public-record-sources.jsonl": lines([self.public] if public_rows is None else public_rows),
                        "native-events.jsonl": self.base["native-events.jsonl"] + lines(self.events),
                        "native-raw-outputs.jsonl": lines([self.output])})
         if self.captured:
@@ -441,6 +441,28 @@ class NativeDivergenceTests(unittest.TestCase):
         bank.rebuild()
         with self.assertRaisesRegex(ValueError, "finite FP32"):
             bank.admit()
+
+    def test_repeated_identical_public_sources_are_one_exact_pinned_observation(self):
+        bank = self.fixture
+        bank.rebuild(public_rows=[bank.public, bank.public])
+        checked = bank.admit()
+        self.assertFalse(checked.admission["auxiliary_has_current_label"])
+        self.assertTrue(checked.admission["all_target_masks_false"])
+
+    def test_same_public_id_with_different_bytes_cannot_replace_the_pinned_source(self):
+        bank = self.fixture
+        changed = copy.deepcopy(bank.public)
+        changed["revision"] += 1
+        bank.rebuild(public_rows=[changed, changed])
+        with self.assertRaisesRegex(ValueError, "public record source"):
+            bank.admit()
+
+    def test_newer_public_source_does_not_erase_the_older_pinned_bytes(self):
+        bank = self.fixture
+        changed = copy.deepcopy(bank.public)
+        changed["revision"] += 1
+        bank.rebuild(public_rows=[changed, bank.public, changed, bank.public])
+        self.assertFalse(bank.admit().admission["auxiliary_has_current_label"])
 
     def test_public_advisory_id_does_not_supply_rules_authority(self):
         bank = self.fixture

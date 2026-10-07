@@ -62,6 +62,19 @@ def _one(rows, predicate, name):
     return matches[0]
 
 
+def _pinned_public_row(rows, expected_sha256):
+    """One exact observation, including repeated lexical rows per capture.
+
+    Retained collection artifacts can repeat identical selected source bytes.
+    Collapse only byte-identical selected rows; never choose by record ID/revision or weaken request/journal
+    uniqueness. The whole artifact and the observation hash stay independently
+    pinned, and differently serialized/value-bearing rows cannot substitute.
+    """
+    _sha(expected_sha256)
+    unique = {raw: value for raw, value in rows if byte_pin(raw)["sha256"] == expected_sha256}
+    return _one(list(unique.items()), lambda _: True, "public record source")
+
+
 def _pin_matches(raw, expected):
     _fields(expected, ("bytes", "sha256"))
     _int(expected["bytes"], 0, MAX_BYTES)
@@ -486,8 +499,7 @@ def _validate(parents, parent_index, artifacts, registration_raw, source_raw, ex
             raise ValueError("legacy descriptor lacks actual Rust prefix Rules proof")
     public_sources = _rows(artifacts["public-record-sources.jsonl"]) if artifacts["public-record-sources.jsonl"] else []
     for token, observation in zip(decoded[0]["records"], aux["public_records"]):
-        _, raw_source = _one([(raw, value) for raw, value in public_sources if byte_pin(raw)["sha256"] == observation["observation_sha256"]],
-                             lambda _: True, "public record source")
+        _, raw_source = _pinned_public_row(public_sources, observation["observation_sha256"])
         _fields(raw_source, ("domain", "game_id", "record_index", "revision", "origin_state_id", "origin_state_id_is_advisory",
                             "origin_rules_state_sha256", "origin_rules_identity_observation", "kind", "line", "value",
                             "completed_depth", "scope", "white_score_perspective", "critical", "source_cpu_profile_sha256"))

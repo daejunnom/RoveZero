@@ -199,6 +199,12 @@ all-masked 비교를 양의 준비 성공으로 바꾸지 않습니다. `frozen_
 조건부 ordinal 준비이며 전략적 수선 성공·counterexample 유효성·WDL·C divergence
 ranking이나 학습 update를 인수하지 않습니다.
 
+Public source JSONL은 다른 탐색에서 같은 observation을 다시 선택하면 동일한
+원본 행을 반복 포함할 수 있습니다. D·Repair 소비자는 독립 observation SHA와
+정확한 lexical bytes가 같은 행만 묶습니다. record ID·최신 revision으로 대체하지
+않으며 다른 bytes는 원래 pin을 대신하지 못합니다. 전체 artifact pin과 요청·
+journal·context·physical output의 유일성 검사는 유지합니다.
+
 FLOPs 보고는 FMA=2 기준의 실제 선언 shape에 따른 matrix product 산술입니다.
 encoder와 role 반복 비용을 구분하고 cached memory를 호출마다 중복 계산하지 않습니다.
 softmax·RMSNorm·SwiGLU activation·lookup·이동·CPU 탐색과 backward는 제외 사실을

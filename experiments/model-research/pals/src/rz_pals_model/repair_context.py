@@ -18,7 +18,7 @@ import time
 
 from . import comparative_training as candidate
 from . import training
-from .native_divergence import verify_native_collection_authority
+from .native_divergence import verify_native_collection_authority, _pinned_public_row
 from .semantic_verifier import CheckedSemanticInput, byte_pin, canonical, digest, _fields, _int, _parse, _sha
 
 CONTEXT_SCHEMA = "rz-pals-native-initial-repair-context/1"
@@ -195,8 +195,7 @@ def _ordinary(parents, index, artifacts, source, kind):
     _native_query(tensor, snapshot, lineage, kind)
     sources = _rows(artifacts["public-record-sources.jsonl"]) if artifacts["public-record-sources.jsonl"] else []
     for token, observation in zip(tensor["records"], snapshot["public_records"]):
-        _, public = _one(
-            [(raw, value) for raw, value in sources if byte_pin(raw)["sha256"] == observation["observation_sha256"]], lambda _: True, "public source")
+        _, public = _pinned_public_row(sources, observation["observation_sha256"])
         _fields(public, ("domain", "game_id", "record_index", "revision", "origin_state_id", "origin_state_id_is_advisory",
                          "origin_rules_state_sha256", "origin_rules_identity_observation", "kind", "line", "value",
                          "completed_depth", "scope", "white_score_perspective", "critical", "source_cpu_profile_sha256"))

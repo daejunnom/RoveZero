@@ -1152,3 +1152,46 @@ Rules·native 출력은 합성 자료다. 실제 fresh child/모델/수집의 �
 divergence ranking·학습·기력 인수와 구분한다. 원시 자료는 관리 루트의
 `runs/pals/continuation-cpu-check-03/repair-model-tests-56.log`와
 `repair-model-tests-57.log`에 보존하며 GPU 검증은 계속 보류한다.
+
+### 새 before-dispatch descriptor의 실제 CPU 소비
+
+root58은 `2840283`의 정확한 Rust/Cargo source를 빌드 전후 대조해 CPU native 수집기를
+별도 등록했다. debug·`pals-collection-onnx`·locked/offline 바이너리는 116,810,200 bytes·
+SHA-256 `2d9fc6edc61dcd4fc0b99ace5ff4ba8cb230b9c538a41865274fc4b283a52fc3`다.
+root59는 같은 registered untrained checkpoint·shared P/C export·CPU ORT에서 1게임·
+최대 2ply·line 2ply·rounds 2·role 상한 16·전체 30초로 새 수집을 실행했다.
+ordinary current P/C 12행과 before-dispatch 이탈 descriptor 4행을 회수했다.
+NN 입력 32개(public 16/role 16)·물리 role 완료 16개·탐색 소비 16개이며 물리 종료·
+buffer 해제·in-flight 0·process reap/pipe EOF/owned group 종료를 확인했다.
+ply-limit 결과는 unknown이며 대국 승패나 strategic 목표로 바꾸지 않았다.
+
+root60의 새 소비 검사는 첫 descriptor를 인수한 뒤 둘째에서 public source 행의
+중복을 모호한 출처로 거절했다. C forward는 시작하지 않았고 실패·정리 기록을
+그대로 보존했다. 실제 collector는 search마다 `raw_sources`를 초기화하고 같은
+global JSONL에 append하므로 동일 public observation의 정확한 행이 반복될 수 있다.
+`_pinned_public_row()`는 observation SHA가 일치하는 byte-identical 행만 묶는다.
+다른 bytes·revision·record ID로 원래 pin을 대체하지 않고 요청·journal·context·
+physical output의 유일성 검증도 유지한다. Repair 소비자는 같은 helper를 사용한다.
+
+root61은 D 23개·Repair 20개의 CPU fixture를 통과했다. 이전 suite와 겹치므로 고유
+표본으로 합산하지 않는다. 이어 root62는 실제 새 descriptor 4건을 각각 current root
+anchor·original tensor/lineage/false journal·물리 출력에 연결해 인수했다. provenance는
+`captured_before_dispatch`이며 과거 derived 입력이나 ordinary current label과 다르다.
+기존 full checkpoint를 reload·freeze한 CPU C batch 4의 native 출력 대조 최대 절대
+차이는 divergence `2.38419e-7`, WDL `2.86102e-6`, latent `3.81470e-6`으로 기존 absolute
+`1e-4`·relative `1e-3` 허용 오차를 만족했다. full parameter SHA는 전후 동일한
+`eedfe35b2750147ff06c8381b5f6b1c4bd0a6ad7299d945cf02ff2b38bd5775e`다. 감독 mask는
+모두 false이고 loss는 0이며 ranking·수선 유효성·학습의 증거로 사용하지 않는다.
+
+원시 자료는 `runs/pals/strict-native-divergence-capture-cpu-59/`, 실패한
+`actual-native-context-cpu-60/`, 후속 `actual-native-context-cpu-62/`와 continuation의
+root58~62 실행 파일·로그에 보존했다. root62 `root-result.json` SHA-256은
+`c94e0aa6f251402c0ebe70cf7e517785f29b2cfe3ebd7ee59adcae6c9ec1134b`다. CPU 자원은
+0/2·high 6GiB/max 12GiB·swap 0·pids 128로 실행 전에 확인했고 managed temporary
+환경 제거도 verified였다. CLI는 caller-pinned path와 소유 process group을 관측했으며
+loaded executable inode를 stdin 이전에 확인했다고 표현하지 않는다. 미관측 memory/VRAM
+peak는 unknown이다. GPU·backward·optimizer·학습은 실행하지 않았다.
+
+Repair source `d891af4`의 [CI 37694038457](https://github.com/daejunnom/RoveZero/actions/runs/37694038457)는
+Linux·Windows·CPU bindings·model CPU 네 job 모두 성공했다. 위 public source lookup
+수정과 다음 Rust continuation은 각 새 SHA의 검사로 별도 관리한다.
