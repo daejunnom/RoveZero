@@ -153,7 +153,7 @@ class WholeLineFixture:
                                   "scope": "caller_child_loaded_inode", "observed_before_stdin": True},
             "binary_before": ordinal.byte_pin(self.binary), "binary_after": ordinal.byte_pin(self.binary),
             "source_before": ordinal.byte_pin(self.raws["source"]), "source_after": ordinal.byte_pin(self.raws["source"]),
-            "binary_path_stable": True, "source_path_stable": True, "transport_failure": None, "overflow": False,
+            "binary_path_stable": True, "source_path_stable": True, "transport_failure": None, "cleanup_error": None, "overflow": False,
             "original_deadline_met": True, "elapsed_ms": 12}
         process.update(process_changes or {})
         execution["process_observation"] = ordinal.canonical(process)
@@ -476,6 +476,35 @@ class WholeLineOrdinalTests(unittest.TestCase):
         self.fixture.refresh_pins()
         with self.assertRaises(ValueError):
             self.fixture.admit()
+
+    def test_cleanup_error_only_is_failure_for_known_and_allmasked_pairs(self):
+        for masked in (False, True):
+            with self.subTest(masked=masked):
+                if masked:
+                    self.fixture.change_receipt("left", lambda receipt: receipt["report"].update(raw_score=20))
+                else:
+                    self.fixture.change_receipt("left", lambda receipt: receipt["report"].update(raw_score=90))
+                self.assertEqual(self.fixture.admit().outcome.mask, not masked)
+                # Matches helper67 selector-close failure: no transport failure,
+                # successful child exit/reap/EOF/group absence, cleanup only.
+                self.fixture.observe("left", process_changes={"cleanup_error": "selector.close failed"})
+                self.fixture.refresh_pins()
+                with self.assertRaisesRegex(ValueError, "actual child/EOF/group/original allowance failure"):
+                    self.fixture.admit()
+                self.fixture.observe("left")
+                self.fixture.refresh_pins()
+
+    def test_nonempty_actual_stderr_is_failure_for_known_and_allmasked_pairs(self):
+        for masked in (False, True):
+            with self.subTest(masked=masked):
+                self.fixture.executions["left"]["stderr"] = b""
+                self.fixture.change_receipt("left", lambda receipt: receipt["report"].update(raw_score=20 if masked else 90))
+                self.assertEqual(self.fixture.admit().outcome.mask, not masked)
+                self.fixture.executions["left"]["stderr"] = b'{"code":"cpu_line_continuation_failed","stage":"output"}\n'
+                self.fixture.observe("left")
+                self.fixture.refresh_pins()
+                with self.assertRaisesRegex(ValueError, "empty actual stderr"):
+                    self.fixture.admit()
 
     def test_full_completion_pv_node_and_fresh_namespace_are_strict(self):
         original = self.fixture.executions["left"]["receipt"]

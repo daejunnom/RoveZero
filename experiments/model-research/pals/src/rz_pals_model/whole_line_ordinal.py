@@ -269,6 +269,11 @@ def _request(raw, planned, anchor, criterion, registration, plan_pin):
 
 
 def _launch(buffers, request, registration, raws, pins):
+    # This first registered Rust CLI has a typed stdout-only success protocol.
+    # Preserve the caller's actual stderr bytes/pin, but diagnostic output is
+    # an execution failure even if a report or an all-masked pair also exists.
+    if buffers["stderr"] != b"":
+        raise ValueError("owned whole-line CLI must have empty actual stderr; cannot mask diagnostic failure")
     launch = _fields(_json(buffers["launch"]), ("schema", "task_id", "registration_sha256", "request", "receipt", "stderr",
         "process_observation", "criterion_artifact", "plan_artifact", "binary_artifact", "source_artifact",
         "anchor_durable_before_spawn", "criterion_fixed_before_spawn", "assurance_scope", "spawned", "reaped", "exit_code",
@@ -286,7 +291,7 @@ def _launch(buffers, request, registration, raws, pins):
     _int(launch["elapsed_ms"], 0, request["max_wall_time_ms"] - 1)
     process = _fields(_json(buffers["process_observation"]), ("schema", "task_id", "spawned", "reaped", "exit_code",
         "pipes_finished", "owned_group_absent", "process_supervision_scope", "loaded_executable", "binary_before", "binary_after",
-        "source_before", "source_after", "binary_path_stable", "source_path_stable", "transport_failure", "overflow",
+        "source_before", "source_after", "binary_path_stable", "source_path_stable", "transport_failure", "cleanup_error", "overflow",
         "original_deadline_met", "elapsed_ms"))
     _int(process["elapsed_ms"], 0, request["max_wall_time_ms"] - 1)
     if (process["schema"] != PROCESS_SCHEMA or process["task_id"] != request["task_id"]
@@ -294,7 +299,7 @@ def _launch(buffers, request, registration, raws, pins):
                                                        "source_path_stable", "original_deadline_met"))
             or type(process["exit_code"]) is not int or process["exit_code"] != 0
             or process["process_supervision_scope"] != "posix_owned_process_group"
-            or process["transport_failure"] is not None or process["overflow"] is not False
+            or process["transport_failure"] is not None or process["cleanup_error"] is not None or process["overflow"] is not False
             or process["elapsed_ms"] != launch["elapsed_ms"]):
         raise ValueError("actual child/EOF/group/original allowance failure; cannot classify as masked")
     for name in ("binary_before", "binary_after", "source_before", "source_after"):

@@ -1386,3 +1386,15 @@ fixture의 Rules/build/launch 사실은 합성이므로 실제 child·양의 nat
 연결하는 root74는 아직 미실행이며 root67 사실을 소급 인수하지 않는다.
 원시 로그는 continuation 관리 경로의 `whole-line-model-tests-73.log`,
 `whole-line-model-supervisor-73.log`에 보존한다.
+
+독립 검토는 별도 selector close 오류가 `transport_failure`와 달리 남을 수 있는데
+초안의 process 관측 schema에 그 축이 없던 점을 지적했다. 새 `cleanup_error` 필드를
+필수로 보존하고 known·allmasked 모두 None을 요구한다. 이번 owned Rust CLI는 정상
+typed stdout와 빈 stderr만 인수하며, 실제 nonempty stderr를 정상 receipt나 mask로
+숨기지 않는다. root75는 해당 두 경계의 known/allmasked 오류 주입을 포함한 25개
+CPU fixture를 통과했다. source/test 전후 pin 일치·managed temporary 및 tree 정리를
+확인했다. root73과 겹치는 suite이므로 23+25개 고유 검사로 합산하지 않는다.
+새 source SHA-256은 `82bdd8d550fbae1bb332ea0d6e27f61745f8e7e372b33ae25d4ffa61cb94bc01`,
+test는 `4652166797a046c6836bc38227917fe94835431e8ffe7fd05b643f21cb9f3327`이다.
+원시 로그는 같은 관리 경로의 `whole-line-model-tests-75.log`와 supervisor 기록에
+보존하며 실제 before-criterion root74 인수와 구분한다.
