@@ -28,9 +28,13 @@ use rz_uci::pals_native::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::{File, Metadata, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -320,6 +324,14 @@ fn file_sha(path: &Path, max_bytes: u64) -> Result<String, ArenaError> {
         return Err(invalid("source asset is not a bounded regular file"));
     }
     let mut file = File::open(path).map_err(io)?;
+    hash_open_file(&mut file, metadata.len(), max_bytes)
+}
+
+fn hash_open_file(
+    file: &mut File,
+    expected_bytes: u64,
+    max_bytes: u64,
+) -> Result<String, ArenaError> {
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     let mut total = 0_u64;
@@ -334,10 +346,99 @@ fn file_sha(path: &Path, max_bytes: u64) -> Result<String, ArenaError> {
             .ok_or_else(|| invalid("source asset grew beyond limit"))?;
         hash.update(&buffer[..read]);
     }
-    if total != metadata.len() {
+    if total != expected_bytes {
         return Err(invalid("source asset changed during verification"));
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+/// An independently hashed executable observation, owned through its open FD.
+/// Metadata checks detect observed changes; this is not a kernel file seal.
+struct VerifiedExecutableIdentity {
+    path: PathBuf,
+    file: File,
+    metadata: Metadata,
+    sha256: String,
+}
+impl VerifiedExecutableIdentity {
+    fn current() -> Result<Self, ArenaError> {
+        Self::open(&std::env::current_exe().map_err(io)?, 256 * 1024 * 1024)
+    }
+
+    fn open(path: &Path, max_bytes: u64) -> Result<Self, ArenaError> {
+        let named = std::fs::symlink_metadata(path).map_err(io)?;
+        if !named.is_file() || named.file_type().is_symlink() || named.len() > max_bytes {
+            return Err(invalid("executable is not a bounded regular file"));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        // A held Windows handle permits readers but denies write/delete opens.
+        // Unix retains the FD and compares inode/change metadata at reuse gates.
+        #[cfg(windows)]
+        options.share_mode(0x0000_0001);
+        let mut file = options.open(path).map_err(io)?;
+        let held = file.metadata().map_err(io)?;
+        if !Self::same_metadata(&named, &held)? {
+            return Err(invalid("executable path/FD changed before verification"));
+        }
+        let sha256 = hash_open_file(&mut file, held.len(), max_bytes)?;
+        let verified = Self {
+            path: path.to_owned(),
+            file,
+            metadata: held,
+            sha256,
+        };
+        verified.validate_stability()?;
+        Ok(verified)
+    }
+
+    fn same_metadata(before: &Metadata, after: &Metadata) -> Result<bool, ArenaError> {
+        if !before.is_file()
+            || !after.is_file()
+            || before.file_type().is_symlink()
+            || after.file_type().is_symlink()
+            || before.len() != after.len()
+            || before.modified().map_err(io)? != after.modified().map_err(io)?
+        {
+            return Ok(false);
+        }
+        #[cfg(unix)]
+        if (
+            before.dev(),
+            before.ino(),
+            before.mode(),
+            before.nlink(),
+            before.ctime(),
+            before.ctime_nsec(),
+        ) != (
+            after.dev(),
+            after.ino(),
+            after.mode(),
+            after.nlink(),
+            after.ctime(),
+            after.ctime_nsec(),
+        ) {
+            return Ok(false);
+        }
+        #[cfg(windows)]
+        if (before.creation_time(), before.file_attributes())
+            != (after.creation_time(), after.file_attributes())
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn validate_stability(&self) -> Result<(), ArenaError> {
+        let held = self.file.metadata().map_err(io)?;
+        let named = std::fs::symlink_metadata(&self.path).map_err(io)?;
+        if !Self::same_metadata(&self.metadata, &held)?
+            || !Self::same_metadata(&self.metadata, &named)?
+        {
+            return Err(invalid("verified executable path/FD metadata changed"));
+        }
+        Ok(())
+    }
 }
 
 fn source_description(
@@ -345,18 +446,33 @@ fn source_description(
     mode: &str,
     extra: serde_json::Value,
 ) -> Result<PalsCollectionSourceDescription, ArenaError> {
+    engine
+        .value_identity()
+        .validate()
+        .map_err(|e| invalid(e.to_string()))?;
+    let executable = VerifiedExecutableIdentity::current()?;
+    source_description_from_verified(engine, mode, extra, &executable)
+}
+
+fn source_description_from_verified(
+    engine: &CpuEngine,
+    mode: &str,
+    extra: serde_json::Value,
+    executable: &VerifiedExecutableIdentity,
+) -> Result<PalsCollectionSourceDescription, ArenaError> {
+    executable.validate_stability()?;
     let config = engine.config();
     engine
         .value_identity()
         .validate()
         .map_err(|e| invalid(e.to_string()))?;
-    let implementation = file_sha(&std::env::current_exe().map_err(io)?, 256 * 1024 * 1024)?;
+    let implementation = executable.sha256.clone();
     let configuration = serde_json::json!({"domain":"rz-own-cpu-configuration/1","mode":mode,
         "search":CPU_SEARCH_VERSION,"evaluator":BOOTSTRAP_SCORE_VERSION,"profile":config.profile.identity(),
         "tt_entries":config.tt_entries,"max_depth":config.max_depth,"quiescence_ply":config.quiescence_ply,
         "value_identity":engine.value_identity(),"value_precision":if engine.value_identity().weights_sha256.is_some(){"fp32"}else{"integer_cp"},"extra":extra});
     let profile = canonical_sha256(&configuration)?;
-    Ok(PalsCollectionSourceDescription {
+    let description = PalsCollectionSourceDescription {
         mode: mode.into(),
         source: PalsInputSource::OwnCpu {
             cpu_binary_sha256: implementation.clone(),
@@ -372,7 +488,9 @@ fn source_description(
         model_epoch_kind: "encoding_only_zero".into(),
         frozen_epoch: 0,
         native: None,
-    })
+    };
+    executable.validate_stability()?;
+    Ok(description)
 }
 
 /// Read-only registration facts from the actual executable and Rust encoder.
@@ -957,6 +1075,9 @@ struct Collection {
     jobs: u64,
     work_incomplete: bool,
     rows: Vec<PalsLearningRecord>,
+    /// Only successfully appended labels enter this bounded predecessor index.
+    /// Unlabeled raw rows never replace the latest whole label.
+    latest_labels: BTreeMap<String, (u64, String)>,
     inputs: Vec<CapturedInput>,
     assignments: BTreeMap<String, PalsSplit>,
     results: Vec<PalsGameResult>,
@@ -1016,12 +1137,55 @@ impl Collection {
             .ok_or_else(|| invalid("capture sequence exhausted"))?;
         Ok(self.sequence)
     }
-    fn add_row(&mut self, output: &mut Output, row: PalsLearningRecord) -> Result<(), ArenaError> {
+    fn add_row(
+        &mut self,
+        output: &mut Output,
+        mut row: PalsLearningRecord,
+    ) -> Result<(), ArenaError> {
         if self.rows.len() >= MAX_ROWS {
             return Err(ArenaError::Budget("collection row limit".into()));
         }
-        row.validate()?;
+        let input_sha = row.input.sha256().to_owned();
+        let next_sequence = if let Some(label) = &mut row.future_label {
+            match self.latest_labels.get(&input_sha) {
+                Some((sequence, digest)) => {
+                    if label.observed_sequence <= *sequence {
+                        return Err(invalid("collector label sequence must strictly increase"));
+                    }
+                    if label
+                        .supersedes_label_sha256
+                        .as_ref()
+                        .is_some_and(|prior| prior != digest)
+                    {
+                        return Err(invalid(
+                            "collector label predecessor differs from latest persisted label",
+                        ));
+                    }
+                    label.supersedes_label_sha256 = Some(digest.clone());
+                }
+                None => {
+                    if label.supersedes_label_sha256.is_some() {
+                        return Err(invalid(
+                            "collector label predecessor was not persisted for this input",
+                        ));
+                    }
+                    if self.latest_labels.len() >= MAX_ROWS {
+                        return Err(ArenaError::Budget("collection label index limit".into()));
+                    }
+                }
+            }
+            Some(label.observed_sequence)
+        } else {
+            None
+        };
+        // The public digest validates the complete row after the producer has
+        // explicitly linked its actual persisted predecessor. No old targets
+        // are merged into a newer whole label, including masked ActualGame rows.
+        let label_digest = row.label_digest()?;
         output.json("records.jsonl", &row)?;
+        if let (Some(sequence), Some(digest)) = (next_sequence, label_digest) {
+            self.latest_labels.insert(input_sha, (sequence, digest));
+        }
         self.rows.push(row);
         Ok(())
     }
@@ -1575,8 +1739,8 @@ pub fn collect_pals_own_data(
     {
         return Err(invalid("collector source is not independently registered"));
     }
-    let actual_binary = file_sha(&std::env::current_exe().map_err(io)?, 256 * 1024 * 1024)?;
-    if description.implementation_sha256 != actual_binary {
+    let actual_binary = VerifiedExecutableIdentity::current()?;
+    if description.implementation_sha256 != actual_binary.sha256 {
         return Err(invalid(
             "collector executable differs from registered CPU implementation",
         ));
@@ -1593,6 +1757,7 @@ pub fn collect_pals_own_data(
         jobs: 0,
         work_incomplete: false,
         rows: Vec::new(),
+        latest_labels: BTreeMap::new(),
         inputs: Vec::new(),
         assignments: BTreeMap::new(),
         results: Vec::new(),
@@ -1603,10 +1768,11 @@ pub fn collect_pals_own_data(
     let mut active: Option<ActiveGame> = None;
     let mut conditional_cpu =
         CpuEngine::new(CpuConfig::default()).map_err(|e| invalid(e.to_string()))?;
-    let conditional_description = source_description(
+    let conditional_description = source_description_from_verified(
         &conditional_cpu,
         "own-cpu-conditional-verification",
         serde_json::Value::Null,
+        &actual_binary,
     )?;
     output.json("conditional-source.jsonl", &conditional_description)?;
     let run_result = (|| -> Result<(), ArenaError> {
@@ -2005,6 +2171,11 @@ pub fn collect_pals_own_data(
             None
         }
     };
+    if let Err(error) = actual_binary.validate_stability() {
+        failure = Some(failure_text(format!(
+            "collector executable stability failed: {error}; prior={failure:?}"
+        )));
+    }
     let audit = if failure.is_none() {
         Some(registry.audit(
             &state.rows,
@@ -2403,6 +2574,406 @@ mod tests {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
     }
+    fn label_chain_fixture() -> (
+        OwnedTemp,
+        Output,
+        Collection,
+        PalsFrozenInput,
+        PalsCollectionSourceDescription,
+    ) {
+        let temp = OwnedTemp::new();
+        let executable_path = temp.0.join("synthetic-executable");
+        std::fs::write(&executable_path, b"bounded label-chain fixture").unwrap();
+        let executable = VerifiedExecutableIdentity::open(&executable_path, 1024).unwrap();
+        let cpu = CpuEngine::new(CpuConfig {
+            tt_entries: 64,
+            ..CpuConfig::default()
+        })
+        .unwrap();
+        let description = source_description_from_verified(
+            &cpu,
+            "own-cpu-bootstrap",
+            serde_json::Value::Null,
+            &executable,
+        )
+        .unwrap();
+        let mut output = Output::new(&temp.0, "label-chain", 1024 * 1024).unwrap();
+        let mut state = Collection {
+            sequence: 0,
+            nodes: 0,
+            jobs: 0,
+            work_incomplete: false,
+            rows: Vec::new(),
+            latest_labels: BTreeMap::new(),
+            inputs: Vec::new(),
+            assignments: BTreeMap::new(),
+            results: Vec::new(),
+            public: Vec::new(),
+            role_records: Vec::new(),
+        };
+        let (input, _) = state
+            .capture(
+                &mut output,
+                InputCapture {
+                    position: &Position::startpos(),
+                    opening: &PalsCollectionOpening::default(),
+                    game: "label-chain-game",
+                    position_command: position_command(&PalsCollectionOpening::default(), &[]),
+                    actual_moves: &[],
+                    role: PalsDataRole::Proposer,
+                    source: &description,
+                    outcome_eligible: true,
+                    prefix: &[],
+                    proposal: &[],
+                    counterexample: None,
+                    deadline: Instant::now() + Duration::from_secs(10),
+                    cancel: &AtomicBool::new(false),
+                },
+            )
+            .unwrap();
+        (temp, output, state, input, description)
+    }
+    fn fixture_cpu_label(
+        input: &PalsFrozenInput,
+        description: &PalsCollectionSourceDescription,
+        sequence: u64,
+    ) -> PalsLearningRecord {
+        owned_label(
+            input,
+            description,
+            CpuLabelEvidence {
+                task_sha: "a".repeat(64),
+                raw_sha: "b".repeat(64),
+                depth: 1,
+                nodes: 1,
+                sequence,
+                movement: BoardMove::from_uci("e2e4").unwrap(),
+                counterexample: None,
+            },
+        )
+        .unwrap()
+    }
+    fn fixture_unknown_game_label(input: &PalsFrozenInput, sequence: u64) -> PalsLearningRecord {
+        PalsLearningRecord {
+            input: input.clone(),
+            future_label: Some(PalsFutureLabel {
+                observed_sequence: sequence,
+                provenance: PalsTargetProvenance::ActualGame {
+                    result: PalsGameResult {
+                        game_id: input.snapshot().game_id.clone(),
+                        outcome: PalsOutcome::Unknown,
+                        ending: PalsGameEnd::PlyLimit,
+                        raw_evidence_sha256: "c".repeat(64),
+                    },
+                },
+                policy: None,
+                value_wdl: None,
+                white_to_move: input.snapshot().white_to_move,
+                counterexample: None,
+                verifier_tasks: None,
+                supersedes_label_sha256: None,
+            }),
+            verifier_private: None,
+        }
+    }
+    #[test]
+    fn persisted_cpu_policy_is_superseded_by_the_whole_unknown_game_label() {
+        let (_temp, mut output, mut state, input, description) = label_chain_fixture();
+        let sequence = state.next().unwrap();
+        let owned = fixture_cpu_label(&input, &description, sequence);
+        let owned_digest = owned.label_digest().unwrap().unwrap();
+        state.add_row(&mut output, owned.clone()).unwrap();
+        let prior_index = state.latest_labels.clone();
+        state
+            .add_row(
+                &mut output,
+                PalsLearningRecord {
+                    input: input.clone(),
+                    future_label: None,
+                    verifier_private: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(state.latest_labels, prior_index);
+        let sequence = state.next().unwrap();
+        state
+            .add_row(&mut output, fixture_unknown_game_label(&input, sequence))
+            .unwrap();
+        let persisted: Vec<PalsLearningRecord> = rows(&output.directory.join("records.jsonl"));
+        assert_eq!(persisted, state.rows);
+        assert_eq!(persisted[0], owned);
+        assert!(persisted[0].future_label.as_ref().unwrap().policy.is_some());
+        assert!(persisted[1].future_label.is_none());
+        let latest = persisted[2].future_label.as_ref().unwrap();
+        assert_eq!(latest.supersedes_label_sha256.as_ref(), Some(&owned_digest));
+        assert!(latest.policy.is_none());
+        assert!(latest.value_wdl.is_none());
+        assert_eq!(
+            state.latest_labels.get(input.sha256()),
+            Some(&(sequence, persisted[2].label_digest().unwrap().unwrap()))
+        );
+        assert!(state.latest_labels.len() <= state.rows.len());
+        let registry = PalsOwnedSources {
+            cpu_binary_sha256: BTreeSet::from([description.implementation_sha256]),
+            input_sources: BTreeSet::from([description.source]),
+        };
+        let split = PalsDatasetSplit {
+            games: BTreeMap::from([(input.snapshot().game_id.clone(), PalsSplit::Train)]),
+        };
+        let (audit, view) = registry
+            .audit_with_current_view(&persisted, &split)
+            .unwrap();
+        assert_eq!(audit.records, 3);
+        assert_eq!(audit.labeled_records, 2);
+        assert_eq!(view.indices(), &[2]);
+        assert!(
+            persisted[view.indices()[0]]
+                .future_label
+                .as_ref()
+                .unwrap()
+                .policy
+                .is_none()
+        );
+        let mut two_roots = persisted;
+        two_roots[2]
+            .future_label
+            .as_mut()
+            .unwrap()
+            .supersedes_label_sha256 = None;
+        assert!(registry.current_training_view(&two_roots, &split).is_err());
+    }
+    #[test]
+    fn collector_rejects_nonincreasing_or_unpersisted_label_predecessors() {
+        let (_temp, mut output, mut state, input, description) = label_chain_fixture();
+        let first_sequence = state.next().unwrap();
+        let first = fixture_cpu_label(&input, &description, first_sequence);
+        let first_digest = first.label_digest().unwrap().unwrap();
+        let path = output.directory.join("records.jsonl");
+        let mut unpersisted = first.clone();
+        unpersisted
+            .future_label
+            .as_mut()
+            .unwrap()
+            .supersedes_label_sha256 = Some("d".repeat(64));
+        assert!(state.add_row(&mut output, unpersisted).is_err());
+        assert!(state.rows.is_empty());
+        assert!(state.latest_labels.is_empty());
+        assert!(!path.exists());
+        state.add_row(&mut output, first.clone()).unwrap();
+        let persisted = std::fs::read(&path).unwrap();
+        let prior_index = state.latest_labels.clone();
+        for sequence in [first_sequence, first_sequence - 1] {
+            let mut invalid_sequence = first.clone();
+            invalid_sequence
+                .future_label
+                .as_mut()
+                .unwrap()
+                .observed_sequence = sequence;
+            assert!(state.add_row(&mut output, invalid_sequence).is_err());
+            assert_eq!(state.rows, vec![first.clone()]);
+            assert_eq!(state.latest_labels, prior_index);
+            assert_eq!(std::fs::read(&path).unwrap(), persisted);
+        }
+        let next_sequence = state.next().unwrap();
+        let mut successor = fixture_unknown_game_label(&input, next_sequence);
+        successor
+            .future_label
+            .as_mut()
+            .unwrap()
+            .supersedes_label_sha256 = Some("d".repeat(64));
+        assert!(state.add_row(&mut output, successor.clone()).is_err());
+        assert_eq!(state.rows, vec![first.clone()]);
+        assert_eq!(state.latest_labels, prior_index);
+        assert_eq!(std::fs::read(&path).unwrap(), persisted);
+        successor
+            .future_label
+            .as_mut()
+            .unwrap()
+            .supersedes_label_sha256 = Some(first_digest.clone());
+        state.add_row(&mut output, successor.clone()).unwrap();
+        assert_eq!(state.rows, vec![first, successor]);
+        let prior_index = state.latest_labels.clone();
+        let persisted = std::fs::read(&path).unwrap();
+        let mut stale = fixture_unknown_game_label(&input, state.next().unwrap());
+        stale.future_label.as_mut().unwrap().supersedes_label_sha256 = Some(first_digest);
+        assert!(state.add_row(&mut output, stale).is_err());
+        assert_eq!(state.rows.len(), 2);
+        assert_eq!(state.latest_labels, prior_index);
+        assert_eq!(std::fs::read(&path).unwrap(), persisted);
+    }
+    #[test]
+    fn partial_label_append_does_not_advance_rows_or_predecessor_index() {
+        for has_prior in [false, true] {
+            let (_temp, mut output, mut state, input, description) = label_chain_fixture();
+            let sequence = state.next().unwrap();
+            let first = fixture_cpu_label(&input, &description, sequence);
+            let path = output.directory.join("records.jsonl");
+            let next = if has_prior {
+                state.add_row(&mut output, first).unwrap();
+                fixture_unknown_game_label(&input, state.next().unwrap())
+            } else {
+                first
+            };
+            let prior_rows = state.rows.clone();
+            let prior_index = state.latest_labels.clone();
+            let prior_bytes = if path.exists() {
+                std::fs::read(&path).unwrap()
+            } else {
+                Vec::new()
+            };
+            let mut linked = next.clone();
+            if let Some((_, digest)) = prior_index.get(input.sha256()) {
+                linked
+                    .future_label
+                    .as_mut()
+                    .unwrap()
+                    .supersedes_label_sha256 = Some(digest.clone());
+            }
+            let attempted = serde_json::to_vec(&linked).unwrap();
+            FAIL_ARTIFACT.with(|flag| flag.set(Some(("records.jsonl", 13))));
+            assert!(state.add_row(&mut output, next).is_err());
+            assert_eq!(state.rows, prior_rows);
+            assert_eq!(state.latest_labels, prior_index);
+            assert!(output.failed_artifacts.contains("records.jsonl"));
+            let bytes = std::fs::read(path).unwrap();
+            assert_eq!(bytes.len(), prior_bytes.len() + 13);
+            assert_eq!(&bytes[..prior_bytes.len()], prior_bytes);
+            assert_eq!(&bytes[prior_bytes.len()..], &attempted[..13]);
+        }
+    }
+    #[test]
+    fn conditional_description_reuses_the_owned_verified_executable_identity() {
+        let output = OwnedTemp::new();
+        let path = output.0.join("synthetic-executable");
+        let bytes = b"bounded fixture executable bytes";
+        std::fs::write(&path, bytes).unwrap();
+        let executable = VerifiedExecutableIdentity::open(&path, 1024).unwrap();
+        let cpu = CpuEngine::new(CpuConfig {
+            tt_entries: 64,
+            ..CpuConfig::default()
+        })
+        .unwrap();
+        let original = source_description_from_verified(
+            &cpu,
+            "own-cpu-bootstrap",
+            serde_json::Value::Null,
+            &executable,
+        )
+        .unwrap();
+        let conditional = source_description_from_verified(
+            &cpu,
+            "own-cpu-conditional-verification",
+            serde_json::Value::Null,
+            &executable,
+        )
+        .unwrap();
+        let actual = format!("{:x}", Sha256::digest(bytes));
+        assert_eq!(original.implementation_sha256, actual);
+        assert_eq!(conditional.implementation_sha256, actual);
+        assert_ne!(original.cpu_profile_sha256, conditional.cpu_profile_sha256);
+        assert_eq!(executable.metadata.len(), bytes.len() as u64);
+        assert!(matches!(&conditional.source, PalsInputSource::OwnCpu {
+            cpu_binary_sha256, model_weights_sha256: None, ..
+        } if cpu_binary_sha256 == &actual));
+        executable.validate_stability().unwrap();
+        assert!(VerifiedExecutableIdentity::open(&path, bytes.len() as u64 - 1).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn verified_executable_identity_rejects_growth_and_same_size_writes() {
+        let output = OwnedTemp::new();
+        for (name, changed) in [
+            ("growing", b"longer".as_slice()),
+            ("same-size", b"edit".as_slice()),
+        ] {
+            let path = output.0.join(name);
+            std::fs::write(&path, b"base").unwrap();
+            let executable = VerifiedExecutableIdentity::open(&path, 1024).unwrap();
+            std::fs::write(&path, changed).unwrap();
+            let writer = OpenOptions::new().write(true).open(&path).unwrap();
+            writer
+                .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+                .unwrap();
+            writer.sync_all().unwrap();
+            assert!(executable.validate_stability().is_err());
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn verified_executable_identity_rejects_equal_length_path_replacement() {
+        let output = OwnedTemp::new();
+        let path = output.0.join("original");
+        let replacement = output.0.join("replacement");
+        std::fs::write(&path, b"base").unwrap();
+        let executable = VerifiedExecutableIdentity::open(&path, 1024).unwrap();
+        std::fs::write(&replacement, b"edit").unwrap();
+        let writer = OpenOptions::new().write(true).open(&replacement).unwrap();
+        writer
+            .set_modified(executable.metadata.modified().unwrap())
+            .unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        std::fs::rename(&replacement, &path).unwrap();
+        let named = std::fs::metadata(&path).unwrap();
+        assert_eq!(named.len(), executable.metadata.len());
+        assert_eq!(
+            named.modified().unwrap(),
+            executable.metadata.modified().unwrap()
+        );
+        assert_ne!(named.ino(), executable.metadata.ino());
+        assert!(executable.validate_stability().is_err());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn verified_executable_identity_denies_windows_write_handles() {
+        let output = OwnedTemp::new();
+        let path = output.0.join("protected");
+        std::fs::write(&path, b"base").unwrap();
+        let executable = VerifiedExecutableIdentity::open(&path, 1024).unwrap();
+        assert!(OpenOptions::new().write(true).open(&path).is_err());
+        executable.validate_stability().unwrap();
+    }
+    #[test]
+    fn collection_rejects_a_consistently_forged_driver_and_registry_binary_digest() {
+        let output = OwnedTemp::new();
+        let path = output.0.join("unregistered-fixture-executable");
+        std::fs::write(&path, b"not the actual collector executable").unwrap();
+        let executable = VerifiedExecutableIdentity::open(&path, 1024).unwrap();
+        let engine = CpuEngine::new(CpuConfig {
+            tt_entries: 64,
+            ..CpuConfig::default()
+        })
+        .unwrap();
+        let description = source_description_from_verified(
+            &engine,
+            "own-cpu-bootstrap",
+            serde_json::Value::Null,
+            &executable,
+        )
+        .unwrap();
+        let registry = PalsOwnedSources {
+            cpu_binary_sha256: BTreeSet::from([description.implementation_sha256.clone()]),
+            input_sources: BTreeSet::from([description.source.clone()]),
+        };
+        let mut cpu = OwnCpuCollectionDriver {
+            engine,
+            description,
+        };
+        let error = collect_pals_own_data(
+            small_config(),
+            &output.0,
+            &mut cpu,
+            &registry,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("collector executable differs from registered CPU implementation")
+        );
+        assert!(!output.0.join(small_config().run_id).exists());
+    }
     #[test]
     fn actual_cpu_collection_seals_native_inputs_and_masks_ply_limit() {
         let output = OwnedTemp::new();
@@ -2636,6 +3207,7 @@ mod tests {
             jobs: 0,
             work_incomplete: false,
             rows: Vec::new(),
+            latest_labels: BTreeMap::new(),
             inputs: Vec::new(),
             assignments: BTreeMap::new(),
             results: Vec::new(),
