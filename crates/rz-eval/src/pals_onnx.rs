@@ -9,7 +9,7 @@ use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S}
 use crate::onnx::{OrtRuntime, Provider};
 use crate::pals_model::{
     PalsModelConfig, PalsModelInput, PalsRawOutput, PalsRole, PreparedPalsTensors,
-    PALS_MODEL_SCHEMA, V_TASK_NAMES,
+    PALS_ENCODING_SCHEMA, PALS_MODEL_SCHEMA, V_TASK_NAMES,
 };
 use crate::worker::{PhysicalRun, SingleWorker};
 use ort::execution_providers::{
@@ -18,6 +18,10 @@ use ort::execution_providers::{
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::tensor::TensorElementType;
 use ort::value::{Tensor, ValueType};
+use rz_contracts::{Digest, PrecisionProfile};
+use rz_runtime::pals::{
+    MemoryBank, MemoryBankSnapshot, MemoryKey, MemoryPin, PublicPageKey, PublicPageKind,
+};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -882,11 +886,25 @@ impl ActiveInputs {
     }
 }
 struct PublicMemory {
-    key: [u8; 32],
     tokens: usize,
     memory_key: Tensor<f32>,
     memory_value: Tensor<f32>,
     mask: Tensor<bool>,
+}
+fn public_owner_bytes(key_capacity: usize, value_capacity: usize, mask_capacity: usize) -> u64 {
+    // Charge all three backing owners, never a short view of a larger K/V.
+    // Native OrtValue/allocator overhead is not an observed heap/VRAM peak.
+    ((key_capacity + value_capacity) * std::mem::size_of::<f32>()
+        + mask_capacity * std::mem::size_of::<bool>()
+        + std::mem::size_of::<PublicMemory>()) as u64
+}
+fn public_bank_error(error: impl std::fmt::Display) -> BackendError {
+    fail(
+        K::ResourceExhausted,
+        S::Backend,
+        "PALS bounded host public-memory reservation or pin release failed",
+    )
+    .with_external_cause(CauseCode::InputAllocation, &error)
 }
 /// A copied diagnostic witness after physical completion, never a product
 /// private latent or a second inference. Device-only K/V has no host witness.
@@ -1014,7 +1032,13 @@ pub struct PalsOnnxBackend {
     residency: PalsSessionResidency,
     stats: PalsBackendStats,
     cuda_mapping_audit: RefCell<CudaMappingAudit>,
-    memory: Option<PublicMemory>,
+    // The bank keeps one immutable whole-input owner. Only the current physical
+    // invocation holds an external pin; idle retained cache pages are unpinned.
+    // Option permits preserving the complete bank on unknown native completion.
+    memory: Option<MemoryBank<PublicMemory>>,
+    cached_memory_key: Option<MemoryKey>,
+    active_memory: Option<MemoryPin<PublicMemory>>,
+    game_generation: u64,
     active: Option<ActiveInputs>,
     #[cfg(feature = "experimental-io-binding")]
     device_memory: Option<device::DeviceMemory>,
@@ -1119,10 +1143,30 @@ impl PalsOnnxBackend {
                 sha256: graph_digest,
                 serialized_bytes: graph_bytes.len() as u64,
             });
-            let session = load_session(graph_bytes, config)?;
+            let session = load_session(graph_bytes, config).map_err(|mut failure| {
+                // Bounded role/phase context identifies partial-constructor
+                // failure without retaining graph bytes or retrying native init.
+                failure.detail = match graph.role.as_str() {
+                    "public" => "PALS public graph session creation failed",
+                    "shared_pc" => "PALS shared P/C graph session creation failed",
+                    "proposer" => "PALS proposer graph session creation failed",
+                    "critic" => "PALS critic graph session creation failed",
+                    _ => "PALS graph session creation failed",
+                };
+                failure
+            })?;
             validate_session(&session, graph, &manifest)?;
             sessions.insert(graph.role.clone(), session);
         }
+        let max_tokens = manifest
+            .config
+            .public_memory_tokens(manifest.config.max_records)
+            .map_err(model_input)?;
+        let memory = MemoryBank::new(
+            1,
+            public_owner_bytes(2 * max_tokens * 64, 2 * max_tokens * 64, max_tokens),
+        )
+        .map_err(public_bank_error)?;
         Ok(Self {
             public: sessions.remove("public"),
             proposer: sessions.remove("proposer"),
@@ -1157,7 +1201,10 @@ impl PalsOnnxBackend {
             },
             stats: PalsBackendStats::default(),
             cuda_mapping_audit: RefCell::default(),
-            memory: None,
+            memory: Some(memory),
+            cached_memory_key: None,
+            active_memory: None,
+            game_generation: 0,
             active: None,
             quarantine: None,
             public_encodes: 0,
@@ -1201,8 +1248,13 @@ impl PalsOnnxBackend {
         if self.config.device_public_memory {
             return Ok(None);
         }
-        self.memory
-            .as_ref()
+        self.cached_memory_key
+            .and_then(|key| {
+                self.memory
+                    .as_ref()
+                    .expect("public bank installed")
+                    .get(key)
+            })
             .map(|memory| {
                 let copy = |tensor: &Tensor<f32>| -> Result<Vec<f32>, BackendError> {
                     let (shape, values) = tensor.try_extract_tensor::<f32>().map_err(|e| {
@@ -1249,18 +1301,58 @@ impl PalsOnnxBackend {
     pub fn quarantine_cause(&self) -> Option<&BackendError> {
         self.quarantine.as_ref()
     }
+    /// Bounded host page ownership evidence. This is neither an ORT allocator
+    /// observation nor a VRAM peak. A quarantine may retain actual active pins.
+    pub fn host_public_page_snapshot(&self) -> MemoryBankSnapshot {
+        self.memory
+            .as_ref()
+            .expect("public bank installed")
+            .snapshot()
+    }
+    fn public_page_key(&self, content: [u8; 32]) -> MemoryKey {
+        MemoryKey::PublicPage(PublicPageKey {
+            kind: PublicPageKind::WholeInput,
+            content: Digest(content),
+            model: Digest(self.manifest_digest),
+            encoding: Digest(asset::sha256(PALS_ENCODING_SCHEMA.as_bytes())),
+            precision: PrecisionProfile::Fp32,
+            // No numeric mutable epoch is declared: the actual frozen 32-byte
+            // checkpoint epoch is already part of the exact content digest.
+            frozen_epoch: 0,
+            game_generation: self.game_generation,
+        })
+    }
     pub fn clear_public_memory(&mut self) -> Result<(), BackendError> {
         if let Some(cause) = &self.quarantine {
             return Err(cause.clone());
         }
-        // Exclusive &mut access and the synchronous Run boundary prove there
-        // is no concurrent physical invocation in this direct owner API.
-        self.memory = None;
+        if self.active.is_some() || self.active_memory.is_some() {
+            return Err(fail(
+                K::BackendFailure,
+                S::Backend,
+                "PALS NewGame requires the completed physical invocation boundary",
+            ));
+        }
+        let next_generation = self.game_generation.checked_add(1).ok_or_else(|| {
+            fail(
+                K::ResourceExhausted,
+                S::Backend,
+                "PALS game generation exhausted",
+            )
+        })?;
+        // Refused clear is all-or-nothing. No logical reset releases a pin.
+        self.memory
+            .as_mut()
+            .expect("public bank installed")
+            .clear()
+            .map_err(public_bank_error)?;
+        self.cached_memory_key = None;
         #[cfg(feature = "experimental-io-binding")]
         {
             self.device_role = None;
             self.device_memory = None;
         }
+        self.game_generation = next_generation;
         self.stats.new_game_resets = self.stats.new_game_resets.saturating_add(1);
         Ok(())
     }
@@ -1268,7 +1360,7 @@ impl PalsOnnxBackend {
         if let Some(cause) = &self.quarantine {
             return Err(cause.clone());
         }
-        if self.active.is_some() {
+        if self.active.is_some() || self.active_memory.is_some() {
             return Err(fail(
                 K::BackendFailure,
                 S::Backend,
@@ -1276,7 +1368,7 @@ impl PalsOnnxBackend {
             ));
         }
         let mut stats = self.stats.clone();
-        stats.live_public_cache_entries = u64::from(self.memory.is_some());
+        stats.live_public_cache_entries = self.host_public_page_snapshot().entries as u64;
         #[cfg(feature = "experimental-io-binding")]
         if self.device_memory.is_some() {
             stats.live_public_cache_entries += 1;
@@ -1370,6 +1462,22 @@ impl PalsOnnxBackend {
         };
         if self.quarantine.is_none() {
             self.active = None;
+            // Both native Runs are synchronously fenced, or the CPU failure is
+            // known complete. CUDA unknown retains this pin and its owner bank.
+            self.active_memory = None;
+            if !self.config.cache_public_memory {
+                self.memory
+                    .as_mut()
+                    .expect("public bank installed")
+                    .clear()
+                    .map_err(public_bank_error)?;
+                self.cached_memory_key = None;
+                #[cfg(feature = "experimental-io-binding")]
+                {
+                    self.device_role = None;
+                    self.device_memory = None;
+                }
+            }
         }
         if matches!(self.config.provider, Provider::Cuda { .. }) {
             // `run_active`'s synchronous Run or `run_device`'s output sync has
@@ -1524,8 +1632,18 @@ impl PalsOnnxBackend {
         input: &PalsModelInput,
         key: [u8; 32],
     ) -> Result<PalsRawOutput, BackendError> {
-        let cached =
-            self.config.cache_public_memory && self.memory.as_ref().is_some_and(|m| m.key == key);
+        let page_key = self.public_page_key(key);
+        self.active_memory = self
+            .config
+            .cache_public_memory
+            .then(|| {
+                self.memory
+                    .as_mut()
+                    .expect("public bank installed")
+                    .acquire(page_key)
+            })
+            .flatten();
+        let cached = self.active_memory.is_some();
         if cached {
             self.public_cache_hits = self.public_cache_hits.saturating_add(1);
             self.stats.public_cache_hits = self.stats.public_cache_hits.saturating_add(1);
@@ -1578,22 +1696,25 @@ impl PalsOnnxBackend {
                 }
                 Ok(values.to_vec())
             };
-            let memory_key = Tensor::from_array(([1, 2, tokens, 64], extract("memory_key")?))
-                .map_err(|e| {
-                    native(
-                        CauseCode::TensorCreate,
-                        "PALS public-memory ownership failed",
-                        e,
-                    )
-                })?;
-            let memory_value = Tensor::from_array(([1, 2, tokens, 64], extract("memory_value")?))
-                .map_err(|e| {
+            let key_values = extract("memory_key")?;
+            let key_capacity = key_values.capacity();
+            let memory_key = Tensor::from_array(([1, 2, tokens, 64], key_values)).map_err(|e| {
                 native(
                     CauseCode::TensorCreate,
                     "PALS public-memory ownership failed",
                     e,
                 )
             })?;
+            let value_values = extract("memory_value")?;
+            let value_capacity = value_values.capacity();
+            let memory_value =
+                Tensor::from_array(([1, 2, tokens, 64], value_values)).map_err(|e| {
+                    native(
+                        CauseCode::TensorCreate,
+                        "PALS public-memory ownership failed",
+                        e,
+                    )
+                })?;
             let (shape, values) = outputs["memory_mask"]
                 .try_extract_tensor::<bool>()
                 .map_err(|e| {
@@ -1613,7 +1734,9 @@ impl PalsOnnxBackend {
                     "PALS public-memory mask differs from admitted records",
                 ));
             }
-            let mask = Tensor::from_array(([1, tokens], values.to_vec())).map_err(|e| {
+            let mask_values = values.to_vec();
+            let mask_capacity = mask_values.capacity();
+            let mask = Tensor::from_array(([1, tokens], mask_values)).map_err(|e| {
                 native(
                     CauseCode::TensorCreate,
                     "PALS public-memory mask ownership failed",
@@ -1621,20 +1744,31 @@ impl PalsOnnxBackend {
                 )
             })?;
             drop(outputs);
-            self.memory = Some(PublicMemory {
-                key,
+            let memory = PublicMemory {
                 tokens,
                 memory_key,
                 memory_value,
                 mask,
-            });
+            };
+            self.active_memory = Some(
+                self.memory
+                    .as_mut()
+                    .expect("public bank installed")
+                    .insert(
+                        page_key,
+                        memory,
+                        public_owner_bytes(key_capacity, value_capacity, mask_capacity),
+                    )
+                    .map_err(public_bank_error)?,
+            );
+            self.cached_memory_key = Some(page_key);
             self.public_encodes = self.public_encodes.saturating_add(1);
             self.stats.validated_public_outputs =
                 self.stats.validated_public_outputs.saturating_add(1);
         }
         let active = self.active.as_ref().expect("owned inputs remain installed");
         let memory = self
-            .memory
+            .active_memory
             .as_ref()
             .expect("public memory installed after successful fence");
         debug_assert_eq!(
@@ -1771,6 +1905,9 @@ impl Drop for PalsOnnxBackend {
             if let Some(memory) = self.memory.take() {
                 std::mem::forget(memory);
             }
+            if let Some(pin) = self.active_memory.take() {
+                std::mem::forget(pin);
+            }
             #[cfg(feature = "experimental-io-binding")]
             {
                 if let Some(role) = self.device_role.take() {
@@ -1788,6 +1925,7 @@ impl Drop for PalsOnnxBackend {
                 self.device_role.take();
                 self.device_memory.take();
             }
+            self.active_memory.take();
             self.memory.take();
             self.active.take();
         }

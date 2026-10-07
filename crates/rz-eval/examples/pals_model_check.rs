@@ -309,6 +309,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err("finite numeric window exhausted before next physical Run".into());
         }
         let raw = backend.run(&case.input)?;
+        let pages = backend.host_public_page_snapshot();
+        if pages.max_entries != 1
+            || pages.pinned_entries != 0
+            || pages.pinned_bytes != 0
+            || pages.reserved_bytes > pages.max_bytes
+            || pages.entries != usize::from(!config.device_public_memory)
+        {
+            return Err(
+                "completed role retained an active host public-page pin or exceeded its bank"
+                    .into(),
+            );
+        }
         let mut report = verify(&raw, case)?;
         report["public_memory"] = verify_public(&backend, case)?;
         reports.push(report);
@@ -329,8 +341,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     backend.verify_runtime()?;
     let trained = backend.is_trained();
     let residency = backend.residency().clone();
+    let pages_before_reset = backend.host_public_page_snapshot();
     let encodes_before_new_game = backend.public_encodes;
     backend.clear_public_memory()?;
+    let pages_after_reset = backend.host_public_page_snapshot();
+    if pages_after_reset.entries != 0
+        || pages_after_reset.reserved_bytes != 0
+        || pages_after_reset.pinned_entries != 0
+        || pages_after_reset.pinned_bytes != 0
+    {
+        return Err("NewGame did not retire the completed host public-memory bank".into());
+    }
     if backend.public_encodes != encodes_before_new_game {
         return Err("new game cache reset executed a neural graph".into());
     }
@@ -346,6 +367,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     for (case, expected) in fixtures.cases.iter().zip(&raw_outputs) {
         if fresh.run(&case.input)? != *expected {
             return Err("public memory cache changed exact PALS output".into());
+        }
+        let pages = fresh.host_public_page_snapshot();
+        if pages.entries != 0 || pages.reserved_bytes != 0 || pages.pinned_entries != 0 {
+            return Err("disabled cache retained a completed host public page".into());
         }
     }
     fresh.verify_runtime()?;
@@ -491,6 +516,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         "stats_physical_ack":"confirmed","control_neural_runs":"zero","backend_stats":stats_json(&stats),
         "runtime_verify_physical_ack":"confirmed",
         "backend_stats_scope":"backend_lifetime_through_final_snapshot_ack",
+        "host_public_page_ownership":{"scope":"direct_owner_after_numeric_cases_before_worker",
+            "page_kind":"whole_input","frozen_numeric_epoch":0,
+            "weight_epoch_identity":"full_checkpoint_digest_in_exact_content_key",
+            "bank_max_entries":pages_before_reset.max_entries,"bank_max_bytes":pages_before_reset.max_bytes,
+            "before_new_game":{"entries":pages_before_reset.entries,"reserved_bytes":pages_before_reset.reserved_bytes,
+                "pinned_entries":pages_before_reset.pinned_entries,"pinned_bytes":pages_before_reset.pinned_bytes},
+            "after_new_game":{"entries":pages_after_reset.entries,"reserved_bytes":pages_after_reset.reserved_bytes,
+                "pinned_entries":pages_after_reset.pinned_entries,"pinned_bytes":pages_after_reset.pinned_bytes},
+            "cache_off_completed_page_retirement":"passed","runtime_allocator_peak":"unknown","vram_peak":"unknown"},
         "device_public_memory":config.device_public_memory,"session_residency":residency,"vram_peak":"unknown","cases":reports});
     let mut output = std::fs::OpenOptions::new()
         .create_new(true)
