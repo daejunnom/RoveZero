@@ -211,6 +211,7 @@ pub fn supervise(
             cancel,
             None,
             None,
+            None,
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -244,6 +245,7 @@ pub fn supervise_with_watch(
             limits,
             cancel,
             Some(linux::ArtifactObservation::Flat(watch)),
+            None,
             None,
         )
     }
@@ -291,6 +293,7 @@ pub fn supervise_in_directory(
             limits,
             cancel,
             watch.map(linux::ArtifactObservation::Flat),
+            None,
             None,
         )
     }
@@ -359,6 +362,7 @@ pub(crate) fn supervise_tree_observed(
             cancel,
             Some(linux::ArtifactObservation::Tree(watch)),
             stdout_observer,
+            None,
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -366,6 +370,58 @@ pub(crate) fn supervise_tree_observed(
         let _ = (program, args, directory, cancel, stdout_observer);
         Err(ArenaError::Invalid(
             "native process supervision currently requires Linux".into(),
+        ))
+    }
+}
+
+/// Finite UCI preflight input through the same pinned ELF/process-group owner.
+/// Commands are written nonblocking; the wall/output/tree bounds remain active.
+pub fn supervise_protocol_in_directory(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    commands: &[u8],
+) -> Result<ProcessOutput, ArenaError> {
+    limits.validate()?;
+    watch.validate()?;
+    if commands.is_empty() || commands.len() > 64 * 1024 || !commands.ends_with(b"\n") {
+        return Err(ArenaError::Budget(
+            "finite protocol input requires 1..64KiB and a final newline".into(),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if !directory
+            .metadata()
+            .map_err(|_| ArenaError::Io("process.cwd_metadata".into()))?
+            .is_dir()
+        {
+            return Err(ArenaError::Invalid(
+                "process working descriptor is not a directory".into(),
+            ));
+        }
+        let directory = directory
+            .try_clone()
+            .map_err(|_| ArenaError::Io("process.cwd_clone".into()))?;
+        linux::supervise(
+            program,
+            args,
+            directory,
+            limits,
+            cancel,
+            Some(linux::ArtifactObservation::Tree(watch)),
+            None,
+            Some(commands),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (program, args, directory, cancel, commands);
+        Err(ArenaError::Invalid(
+            "native UCI preflight requires Linux".into(),
         ))
     }
 }
@@ -380,7 +436,7 @@ mod linux {
     use nix::sys::stat::Mode;
     use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
     use nix::unistd::Pid;
-    use std::io::{self, Read};
+    use std::io::{self, Read, Write};
     use std::os::fd::{AsFd, AsRawFd};
     use std::os::unix::fs::{FileExt, MetadataExt};
     use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -424,6 +480,7 @@ mod linux {
         cancel: Option<&AtomicBool>,
         watch: Option<ArtifactObservation<'_>>,
         mut stdout_observer: Option<StdoutObserver<'_>>,
+        commands: Option<&[u8]>,
     ) -> Result<ProcessOutput, ArenaError> {
         native_elf(program)?;
         default_child_disposition()?;
@@ -452,7 +509,11 @@ mod linux {
             .envs(source_profile_environment(std::env::var_os(
                 "RZ_ARENA_SOURCE_PROFILE",
             )))
-            .stdin(Stdio::null())
+            .stdin(if commands.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0)
@@ -480,18 +541,25 @@ mod linux {
             artifact_limit_enforcement: watch.map(ArtifactObservation::enforcement),
             errors: Vec::new(),
         };
+        let mut stdin = child.stdin.take();
+        let mut input_offset = 0;
         let mut stdout = child.stdout.take();
         let mut stderr = child.stderr.take();
         let pipe_setup = stdout
             .as_ref()
             .ok_or(Errno::EBADF)
             .and_then(nonblocking)
-            .and_then(|()| stderr.as_ref().ok_or(Errno::EBADF).and_then(nonblocking));
+            .and_then(|()| stderr.as_ref().ok_or(Errno::EBADF).and_then(nonblocking))
+            .and_then(|()| match stdin.as_ref() {
+                Some(pipe) => nonblocking(pipe),
+                None => Ok(()),
+            });
         let mut stop = if pipe_setup.is_err() {
             evidence(&mut receipt, "process.pipe_nonblocking");
             // A blocking descriptor is never read by this loop.
             stdout = None;
             stderr = None;
+            stdin = None;
             Some(ProcessStop::IoFailure)
         } else {
             None
@@ -529,6 +597,32 @@ mod linux {
             }
             if let Some(ArtifactObservation::Tree(watch)) = watch {
                 observe_tree(&cwd_file, watch, &mut receipt, &mut stop);
+            }
+            if stop.is_none()
+                && let (Some(pipe), Some(commands)) = (stdin.as_mut(), commands)
+            {
+                let end = (input_offset + 4096).min(commands.len());
+                match pipe.write(&commands[input_offset..end]) {
+                    Ok(0) => {
+                        evidence(&mut receipt, "process.pipe_write_zero");
+                        stop = Some(ProcessStop::IoFailure);
+                    }
+                    Ok(n) => {
+                        input_offset += n;
+                        if input_offset == commands.len() {
+                            stdin = None;
+                        }
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => {
+                        evidence(&mut receipt, "process.pipe_write");
+                        stop = Some(ProcessStop::IoFailure);
+                    }
+                }
             }
             // Each pass drains a finite amount from each pipe, preserving time,
             // cancellation and process checks even under continuous output.

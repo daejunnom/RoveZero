@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "search_probe"
 required-features = ["onnx-cpu"]
 
+[[example]]
+name = "mock_adapter_check"
+required-features = ["onnx-cpu"]
+
 [features]
 experimental-batch = ["rz-search/experimental-batch", "rz-eval/experimental-batch"]
 experimental-io-buffers = ["rz-eval/experimental-io-buffers"]

@@ -1,13 +1,12 @@
 //! Fixed pilot cohort and pinned runner's whole-engine clock evidence.
 //! Clock logs are supervisor-owned evidence, never engine-reported UCI time.
 
-#[cfg(feature = "native-cuda")]
 use crate::{ArenaError, PairPgnAudit};
+use rz_experiments::NativeGameClockV3;
 use rz_experiments::OpeningSpec;
 #[cfg(feature = "native-cuda")]
-use rz_experiments::{CudaIntegrationPairSpec, CudaLaunchProfile, NativeGameClockV3};
+use rz_experiments::{CudaIntegrationPairSpec, CudaLaunchProfile};
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "native-cuda")]
 use sha2::{Digest, Sha256};
 #[cfg(feature = "native-cuda")]
 use std::collections::BTreeSet;
@@ -111,7 +110,6 @@ pub struct NativePilotStartupLoss {
 /// Decode only the pinned runner's FATAL startup renderer and its ordered game
 /// starts. Engine stderr can explain a cause but cannot manufacture a loss.
 /// Unsupported fatal messages remain errors, never silently excluded outcomes.
-#[cfg(feature = "native-cuda")]
 pub fn audit_pilot_startup_failure_trace(
     stdout: &[u8],
     pair: &crate::PairSpec,
@@ -133,7 +131,7 @@ pub fn audit_pilot_startup_failure_trace(
             return Err(invalid("startup failure trace line budget exceeded"));
         }
         if line.starts_with("[TRACE ] [") {
-            let Some(message) = crate::native_cuda::cuda_exit_trace_message(line) else {
+            let Some(message) = crate::native_exit::cuda_exit_trace_message(line) else {
                 continue;
             };
             if message.starts_with("Game ") && message.ends_with(" starting") {
@@ -171,7 +169,7 @@ pub fn audit_pilot_startup_failure_trace(
                 active = None;
             }
         } else if line.starts_with("[FATAL") {
-            let message = crate::native_cuda::native_runner_message(line, "[FATAL ] [", false)
+            let message = crate::native_exit::native_runner_message(line, "[FATAL ] [", false)
                 .ok_or_else(|| invalid("startup failure FATAL renderer is malformed"))?;
             let ordinal =
                 active.ok_or_else(|| invalid("startup failure has no matching active game"))?;
@@ -213,12 +211,10 @@ pub fn audit_pilot_startup_failure_trace(
         }))
     }
 }
-#[cfg(feature = "native-cuda")]
 fn invalid(message: &str) -> ArenaError {
     ArenaError::Integrity(message.into())
 }
 
-#[cfg(feature = "native-cuda")]
 #[derive(Debug)]
 struct ClockRecord<'a> {
     engine: &'a str,
@@ -228,7 +224,6 @@ struct ClockRecord<'a> {
     after: i64,
     valid: bool,
 }
-#[cfg(feature = "native-cuda")]
 fn record(message: &str) -> Result<ClockRecord<'_>, ArenaError> {
     let fields: Vec<_> = message.split(' ').collect();
     if fields.len() != 7 || fields[0] != "RZ_CLOCK_V1" {
@@ -275,7 +270,6 @@ fn record(message: &str) -> Result<ClockRecord<'_>, ArenaError> {
 /// the same two reset clocks. Quoted [Engine] payloads cannot forge this trace.
 /// Engine-loss PGNs are retained by the caller; an incomplete clock/provider
 /// gate stops the pilot and cannot turn an observed loss into an excluded win.
-#[cfg(feature = "native-cuda")]
 pub fn validate_pilot_clock_trace(
     stdout: &[u8],
     pgn: &PairPgnAudit,
@@ -300,7 +294,7 @@ pub fn validate_pilot_clock_trace(
         if !line.starts_with("[TRACE") || !line.contains("RZ_CLOCK_V1") {
             continue;
         }
-        let message = crate::native_cuda::cuda_exit_trace_message(line)
+        let message = crate::native_exit::cuda_exit_trace_message(line)
             .ok_or_else(|| invalid("pilot clock renderer differs from pinned runner"))?;
         records.push(record(message)?);
         trace.update(line.as_bytes());

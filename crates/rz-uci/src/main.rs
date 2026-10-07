@@ -38,10 +38,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_mock(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut explicit_mock = false;
+    let mut model_adapter = None;
     let mut delay = Duration::ZERO;
     for argument in arguments {
         if argument == "--cpu-mock" {
             explicit_mock = true;
+        } else if let Some(value) = argument.strip_prefix("--model-adapter=") {
+            if model_adapter.replace(value.to_owned()).is_some() {
+                return Err("duplicate model adapter".into());
+            }
         } else if let Some(value) = argument.strip_prefix("--mock-delay-ms=") {
             delay = Duration::from_millis(value.parse()?);
         } else {
@@ -56,9 +61,32 @@ fn run_mock(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     }
     let owners = Arc::new(OwnerRegistry::default());
     let clock = ProcessClock::new(ProcessEpoch(1)); // Issued once for this executable process.
-    let factory = Arc::new(CpuMockFactory::new(&owners, delay)?);
-    let process = EngineProcess::new(factory, owners, clock);
-    serve_process(process, EngineSettings::default())?;
+    match model_adapter.as_deref().unwrap_or("lc0") {
+        "lc0" => {
+            let factory = Arc::new(CpuMockFactory::new(&owners, delay)?);
+            serve_process(
+                EngineProcess::new(factory, owners, clock),
+                EngineSettings::default(),
+            )?;
+        }
+        "entity-candidate-mock" => {
+            if !delay.is_zero() {
+                return Err("entity mock does not support scripted delay".into());
+            }
+            let factory = Arc::new(rz_uci::bootstrap::EntityMockFactory::new(&owners)?);
+            let process = EngineProcess::new(factory.clone(), owners, clock).with_identity(
+                rz_uci::EngineIdentity {
+                    name: "RoveZero entity candidate CPU mock".into(),
+                    author: "RoveZero contributors".into(),
+                },
+            );
+            let served = serve_process(process, EngineSettings::default());
+            let finished = factory.finish(std::time::Instant::now() + Duration::from_secs(2));
+            served?;
+            finished?;
+        }
+        _ => return Err("unsupported model adapter".into()),
+    }
     Ok(())
 }
 

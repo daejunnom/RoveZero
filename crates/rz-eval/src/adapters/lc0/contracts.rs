@@ -6,6 +6,7 @@
 
 use crate::asset;
 use crate::error::{BackendError, FailureKind, FailureStage};
+pub use crate::model_adapter::{backend_error, PhysicalFailure};
 use crate::{output, RawOutput};
 use rz_contracts::*;
 use rz_encoding::classical::{self, EncodedInput, HistoryFill, Input, INPUT_VALUES};
@@ -444,39 +445,6 @@ impl<P> PreparedBatch<P> {
 pub type OnnxWorker<P> =
     crate::worker::SingleWorker<PreparedBatch<P>, Result<Vec<EvalOutput>, PhysicalFailure>>;
 
-/// Preserve bounded native cause beside the common error. D can retain this
-/// local evidence before publishing EvalFailure with its own completion context.
-#[derive(Clone, Debug)]
-pub struct PhysicalFailure {
-    pub contract: ContractError,
-    pub backend: Option<BackendError>,
-}
-
-impl From<ContractError> for PhysicalFailure {
-    fn from(contract: ContractError) -> Self {
-        Self {
-            contract,
-            backend: None,
-        }
-    }
-}
-
-impl From<BackendError> for PhysicalFailure {
-    fn from(backend: BackendError) -> Self {
-        Self {
-            contract: backend_error(&backend),
-            backend: Some(backend),
-        }
-    }
-}
-
-impl std::fmt::Display for PhysicalFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.contract.fmt(f)
-    }
-}
-impl std::error::Error for PhysicalFailure {}
-
 /// Owns one ORT session on one physical thread. Runtime maps the returned lease
 /// into its Backend interface; no reverse dependency from C to rz-runtime.
 #[cfg(feature = "onnx")]
@@ -633,25 +601,6 @@ pub fn ordered_policy_indices(
         result.push(index);
     }
     Ok(result)
-}
-
-pub fn backend_error(failure: &BackendError) -> ContractError {
-    let code = match failure.kind {
-        FailureKind::InvalidInput => ErrorCode::InvalidInput,
-        FailureKind::UnsupportedModel => ErrorCode::UnsupportedContract,
-        FailureKind::IdentityMismatch => ErrorCode::IdentityMismatch,
-        FailureKind::BackendUnavailable => ErrorCode::BackendUnavailable,
-        FailureKind::ResourceExhausted => ErrorCode::ResourceExhausted,
-        FailureKind::NumericalFailure => ErrorCode::NumericalFailure,
-        FailureKind::BackendFailure | FailureKind::Io => ErrorCode::BackendFailure,
-    };
-    let stage = match failure.stage {
-        FailureStage::Asset => Stage::Contract,
-        FailureStage::Admission => Stage::Admission,
-        FailureStage::Backend => Stage::Backend,
-        FailureStage::Output => Stage::Output,
-    };
-    error(code, stage, failure.detail)
 }
 
 fn error(code: ErrorCode, stage: Stage, detail: &'static str) -> ContractError {

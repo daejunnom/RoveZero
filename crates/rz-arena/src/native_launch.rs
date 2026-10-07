@@ -37,6 +37,15 @@ pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 
         role: rz_experiments::NativeEngineRole,
     ) -> Result<NativeEngineView<'_>, rz_experiments::ManifestError>;
     fn provider_name(&self) -> &'static str;
+    fn seed(&self) -> u64 {
+        1
+    }
+    fn rove_tree_max_edges(&self) -> Option<u32> {
+        None
+    }
+    fn validate_execution(&self) -> Result<(), ArenaError> {
+        Ok(())
+    }
     fn advise_drop_input_cache(&self) -> bool {
         false
     }
@@ -63,12 +72,32 @@ pub struct NativeEngineView<'a> {
     pub cuda_bundle: Option<&'a rz_experiments::CudaBundleBindingV1>,
     pub search: Option<rz_experiments::NativeCudaSearchV2>,
     pub batch_experiment: Option<usize>,
+    pub external: Option<&'a rz_experiments::ExternalUciEndpointV2>,
+    pub environment: Option<&'a rz_experiments::EngineEnvironmentV2>,
 }
 impl NativeEngineView<'_> {
+    #[cfg(target_os = "linux")]
+    fn executable_input(&self, artifact: &ArtifactRef) -> bool {
+        self.artifact(NativeArtifactRole::Binary)
+            .is_ok_and(|binary| binary == artifact)
+            || self
+                .environment
+                .is_some_and(|environment| &environment.launcher == artifact)
+    }
+
     pub fn artifact(
         &self,
         role: rz_experiments::NativeArtifactRole,
     ) -> Result<&ArtifactRef, ArenaError> {
+        if let Some(external) = self.external {
+            return if role == rz_experiments::NativeArtifactRole::Binary {
+                Ok(&external.binary)
+            } else {
+                Err(ArenaError::Invalid(
+                    "external UCI endpoint has no native NN role".into(),
+                ))
+            };
+        }
         let mut matching = self.artifacts.iter().filter(|b| b.role == role);
         let first = matching
             .next()
@@ -130,6 +159,8 @@ impl NativeLaunchDeclaration for LockedIntegrationPairSpecV1 {
             cuda_bundle: None,
             search: None,
             batch_experiment: None,
+            external: None,
+            environment: None,
         })
     }
     fn provider_name(&self) -> &'static str {
@@ -680,15 +711,13 @@ pub(crate) mod linux {
                 "native attempt requires a safe unique basename".into(),
             ));
         }
+        spec.validate_execution()?;
         let input = spec.view();
-        let opening = crate::opening_pgn_for_spec(input.opening, input.max_plies)?;
-        if opening.len() as u64 != input.opening_artifact.bytes
-            || format!("{:x}", Sha256::digest(opening.as_bytes())) != input.opening_artifact.sha256
-        {
-            return Err(ArenaError::Integrity(
-                "opening artifact differs from complete A-validated trace serialization".into(),
-            ));
-        }
+        crate::validate_opening_artifact_for_spec(
+            input.opening,
+            input.max_plies,
+            input.opening_artifact,
+        )?;
         let total = spec.unique_bytes()?;
         if total > input.budget.max_input_bytes {
             return Err(ArenaError::Budget("native input aggregate exceeded".into()));
@@ -747,7 +776,10 @@ pub(crate) mod linux {
             .set_permissions(Permissions::from_mode(0o700))
             .map_err(|_| io("cannot make native input directory private"))?;
         let path = root_path.join(label);
-        let cuda_bundle = spec.engine_view(NativeEngineRole::Baseline)?.cuda_bundle;
+        let cuda_bundle = spec
+            .engine_view(NativeEngineRole::Baseline)?
+            .cuda_bundle
+            .or(spec.engine_view(NativeEngineRole::Candidate)?.cuda_bundle);
         let bundle_directory = if cuda_bundle.is_some() {
             inputs
                 .create_dir("cuda-bundle")
@@ -792,10 +824,8 @@ pub(crate) mod linux {
                 || [NativeEngineRole::Baseline, NativeEngineRole::Candidate]
                     .into_iter()
                     .any(|role| {
-                        spec.engine_view(role).is_ok_and(|e| {
-                            e.artifact(NativeArtifactRole::Binary)
-                                .is_ok_and(|a| a == artifact)
-                        })
+                        spec.engine_view(role)
+                            .is_ok_and(|e| e.executable_input(artifact))
                     });
             let destination = if let Some(name) = bundle_name {
                 (
@@ -1011,6 +1041,51 @@ pub(crate) mod linux {
         for role in input.white_order {
             let engine = spec.engine_view(role)?;
             let binary = pin(pins, engine.artifact(NativeArtifactRole::Binary)?)?;
+            if let Some(external) = engine.external {
+                let tokens = external
+                    .arguments
+                    .iter()
+                    .map(|arg| {
+                        crate::external_uci::resolve_asset_tokens(arg, external, pins)
+                            .map(OsString::from)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let variables = external
+                    .environment
+                    .as_ref()
+                    .map(|environment| {
+                        environment
+                            .variables
+                            .iter()
+                            .map(|(name, value)| {
+                                crate::external_uci::resolve_asset_tokens(value, external, pins)
+                                    .map(|value| (name.clone(), value))
+                            })
+                            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
+                    })
+                    .transpose()?;
+                let launch = crate::engine_environment::prepare(
+                    binary,
+                    tokens,
+                    engine.environment,
+                    variables.as_ref(),
+                    pins,
+                )?;
+                args.extend([
+                    OsString::from("-engine"),
+                    key_path("cmd=", &launch.program.path)?,
+                    key_path("dir=", cwd)?,
+                    format!("name={}", engine.engine_id).into(),
+                ]);
+                if !launch.arguments.is_empty() {
+                    args.push(encode_fastchess_native_args(&launch.arguments)?);
+                }
+                for (name, value) in &external.requested_options {
+                    let value = crate::external_uci::resolve_asset_tokens(value, external, pins)?;
+                    args.push(format!("option.{name}={value}").into());
+                }
+                continue;
+            }
             let root = &roots[match role {
                 NativeEngineRole::Baseline => 0,
                 NativeEngineRole::Candidate => 1,
@@ -1065,12 +1140,17 @@ pub(crate) mod linux {
                 tokens.push(format!("--search-simulations={}", search.simulations).into());
                 tokens.push(format!("--final-selection={}", search.final_selection.cli()).into());
             }
+            if let Some(max_edges) = spec.rove_tree_max_edges() {
+                tokens.push(format!("--search-max-edges={max_edges}").into());
+            }
+            let launch =
+                crate::engine_environment::prepare(binary, tokens, engine.environment, None, pins)?;
             args.extend([
                 OsString::from("-engine"),
-                key_path("cmd=", &binary.path)?,
+                key_path("cmd=", &launch.program.path)?,
                 key_path("dir=", cwd)?,
                 format!("name={}", engine.engine_id).into(),
-                encode_fastchess_native_args(&tokens)?,
+                encode_fastchess_native_args(&launch.arguments)?,
             ]);
         }
         let opening = &pin(pins, input.opening_artifact)?.path;
@@ -1106,7 +1186,7 @@ pub(crate) mod linux {
             "-concurrency".into(),
             "1".into(),
             "-srand".into(),
-            "1".into(),
+            spec.seed().to_string().into(),
             "-maxmoves".into(),
             (remaining / 2).to_string().into(),
             "-pgnout".into(),
@@ -1162,7 +1242,9 @@ pub(crate) mod linux {
         if matches!(input.clock, rz_experiments::NativePairClock::Game(_)) {
             let baseline = spec.engine_view(NativeEngineRole::Baseline)?;
             let candidate = spec.engine_view(NativeEngineRole::Candidate)?;
-            limitations[0] = if candidate.batch_experiment.is_some() {
+            limitations[0] = if baseline.external.is_some() || candidate.external.is_some() {
+                "V2 external UCI paired pilot only; distinct engine resources/statistics; no Elo or model promotion"
+            } else if candidate.batch_experiment.is_some() {
                 "CUDA S batch pilot only; execution_ready=false; strength_eligible=false; same weights/precision/PUCT/final visits; batch width and scheduling differ"
             } else if baseline.search==candidate.search {
                 "CUDA B1 A/A whole-clock memory check; execution_ready=false; strength_eligible=false; same weights/runtime/binary/search"
@@ -1181,6 +1263,72 @@ pub(crate) mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn engine_and_environment_launcher_are_executable_readonly_private_snapshots() {
+            let base = std::env::temp_dir()
+                .join(format!("rovezero-environment-pin-{}", std::process::id()));
+            std::fs::create_dir(&base).expect("exclusive environment pin fixture");
+            let source = base.join("source");
+            let output = base.join("output");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::create_dir(&output).unwrap();
+            let make = |name: &str| {
+                let bytes = format!("synthetic {name}; not a native execution proof");
+                std::fs::write(source.join(name), &bytes).unwrap();
+                ArtifactRef {
+                    path: name.into(),
+                    sha256: format!("{:x}", Sha256::digest(bytes.as_bytes())),
+                    bytes: bytes.len() as u64,
+                    source: "https://example.org/environment-pin-fixture".into(),
+                    license: "Synthetic ownership fixture only".into(),
+                }
+            };
+            let binary = make("engine");
+            let launcher = make("launcher");
+            let asset = make("asset");
+            let mut external =
+                crate::stockfish19_endpoint(binary.clone(), NativeEngineRole::Candidate);
+            external.assets.push(asset.clone());
+            external.environment = Some(rz_experiments::EngineEnvironmentV2 {
+                launcher: launcher.clone(),
+                variables: std::collections::BTreeMap::new(),
+            });
+            let view = NativeEngineView {
+                engine_id: &external.id,
+                artifacts: &[],
+                cuda_bundle: None,
+                search: None,
+                batch_experiment: None,
+                external: Some(&external),
+                environment: external.environment.as_ref(),
+            };
+            let directory = Dir::open_ambient_dir(&output, cap_std::ambient_authority()).unwrap();
+            for (artifact, mode) in [(&binary, 0o500), (&launcher, 0o500), (&asset, 0o400)] {
+                let (pin, receipt) = readonly_copy(
+                    artifact,
+                    artifact.open_verified(&source, 4096).unwrap(),
+                    &directory,
+                    &artifact.path,
+                    output.join(&artifact.path),
+                    view.executable_input(artifact),
+                    4096,
+                )
+                .unwrap();
+                assert_eq!(
+                    pin.file.metadata().unwrap().permissions().mode() & 0o777,
+                    mode
+                );
+                assert!(receipt.distinct_source_inode && receipt.closed_writer_read_only);
+                assert_eq!(
+                    std::fs::read(&pin.path).unwrap(),
+                    std::fs::read(source.join(&artifact.path)).unwrap()
+                );
+            }
+            drop(directory);
+            // Only this exclusive synthetic tree; no processes or model buffers exist.
+            std::fs::remove_dir_all(base).unwrap();
+        }
 
         #[test]
         fn snapshot_stream_checks_tail_corruption_growth_and_truncation_across_chunks() {

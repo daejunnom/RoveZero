@@ -3,11 +3,15 @@
 #![forbid(unsafe_code)]
 
 mod contract;
+mod engine_environment;
+mod external_uci;
 mod fastchess;
 mod ledger;
+mod model_endpoints;
 #[cfg(feature = "native-cuda")]
 mod native_cuda;
 mod native_diagnostics;
+mod native_exit;
 mod native_launch;
 mod native_pilot;
 #[cfg(target_os = "linux")]
@@ -19,11 +23,16 @@ mod process;
 mod runner;
 
 pub use contract::*;
+pub use engine_environment::EngineEnvironmentObservation;
+pub use external_uci::*;
 pub use fastchess::*;
 pub use ledger::*;
+pub use model_endpoints::*;
 #[cfg(feature = "native-cuda")]
 pub use native_cuda::*;
 pub use native_diagnostics::emit_native_phase;
+#[cfg(not(feature = "native-cuda"))]
+pub use native_exit::validate_native_cuda_process_exit_trace;
 pub use native_launch::*;
 pub use native_pilot::*;
 pub use native_runner::*;

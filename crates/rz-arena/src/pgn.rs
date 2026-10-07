@@ -3,7 +3,7 @@
 //! from `rz-position`, never from a second chess rules implementation.
 use crate::{ArenaError, ArenaPlan, EngineFailureKind, GameResult, GameSpec, PairSpec};
 use rz_experiments::{
-    ClaimPolicy, HistoryCompleteness, InitialPosition, OpeningSpec, OutcomePolicy,
+    ArtifactRef, ClaimPolicy, HistoryCompleteness, InitialPosition, OpeningSpec, OutcomePolicy,
 };
 use rz_position::contracts::{ContractPosition, ContractState};
 use rz_position::{
@@ -11,6 +11,7 @@ use rz_position::{
     PositionLimits, TerminalReason,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -347,6 +348,24 @@ pub fn opening_pgn_for_spec(opening: &OpeningSpec, max_plies: u32) -> Result<Str
     if text.len() > MAX_PGN_BYTES {
         return Err(ArenaError::Budget(
             "serialized opening PGN exceeds 4 MiB".into(),
+        ));
+    }
+    Ok(text)
+}
+
+/// Check a declared book against the Rules-owned serialization before locking
+/// or preparing a launch. Matching the final board alone is insufficient.
+pub fn validate_opening_artifact_for_spec(
+    opening: &OpeningSpec,
+    max_plies: u32,
+    artifact: &ArtifactRef,
+) -> Result<String, ArenaError> {
+    let text = opening_pgn_for_spec(opening, max_plies)?;
+    if text.len() as u64 != artifact.bytes
+        || format!("{:x}", Sha256::digest(text.as_bytes())) != artifact.sha256
+    {
+        return Err(ArenaError::Integrity(
+            "opening artifact differs from complete A-validated trace serialization".into(),
         ));
     }
     Ok(text)

@@ -28,6 +28,120 @@ use std::{
 
 pub const MAX_EVALUATIONS: u64 = 129;
 
+/// One startup-selected non-LC0 model boundary, through the same D physical owner.
+pub struct EntityMockFactory {
+    owner: rz_eval::native_runtime_bridge::NativeWorkerOwner<
+        rz_eval::adapters::entity_mock::EntityCandidateMockAdapter,
+    >,
+    profile: EvaluatorProfile,
+}
+impl EntityMockFactory {
+    pub fn new(owners: &OwnerRegistry) -> Result<Self, ContractError> {
+        use rz_eval::{adapters::entity_mock as e, model_adapter::ModelAdapter};
+        let adapter = e::EntityCandidateMockAdapter::new(
+            ModelHandle {
+                owner: owners.allocate()?,
+                slot: 0,
+                generation: SlotGeneration(1),
+                manifest: e::model_manifest(),
+            },
+            EncodingHandle {
+                owner: owners.allocate()?,
+                slot: 0,
+                generation: SlotGeneration(1),
+                manifest: e::encoding_manifest(),
+            },
+        )?;
+        let profile = EvaluatorProfile {
+            model: Arc::clone(adapter.model()),
+            precision: PrecisionProfile::Fp32,
+            backend: adapter.backend(),
+            compute: ComputeBudget {
+                min_steps: 1,
+                max_steps: 1,
+                require_full: true,
+            },
+            bytes: ByteBudget {
+                host: e::HOST_BYTES_PER_ITEM,
+                device: 0,
+                pinned: 0,
+            },
+        };
+        let worker = adapter.worker().map_err(|e| e.contract)?;
+        let owner =
+            rz_eval::native_runtime_bridge::NativeWorkerOwner::from_worker(worker, adapter, 32)
+                .map_err(|e| e.contract)?;
+        Ok(Self { owner, profile })
+    }
+    pub fn finish(&self, until: Instant) -> Result<(), ContractError> {
+        loop {
+            match self.owner.try_shutdown() {
+                std::task::Poll::Ready(result) => return result.map_err(|e| e.contract),
+                _ if Instant::now() >= until => {
+                    return Err(error(
+                        ErrorCode::Expired,
+                        Stage::Backend,
+                        "entity mock physical shutdown unconfirmed",
+                    ));
+                }
+                _ => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+    }
+}
+impl EvaluatorFactory for EntityMockFactory {
+    fn profile(&self) -> EvaluatorProfile {
+        self.profile.clone()
+    }
+    fn input_key(&self, state: &RulesState, legal: &[Move]) -> Result<EvalInputKey, ContractError> {
+        use rz_eval::model_adapter::ModelAdapter;
+        self.owner.projection().input_key(state, legal)
+    }
+    fn create(
+        &self,
+        clock: ProcessClock,
+        authority: SearchAuthority,
+    ) -> Result<Box<dyn ManagedEvaluator>, ContractError> {
+        let high_water = clock.reserve_executions(MAX_EVALUATIONS)?;
+        let runtime_clock = RuntimeClock(clock.clone());
+        let scope = SharedScope::new(authority.current_scope()?);
+        let adapter = ContractsAdapter::with_execution_high_water(
+            scope.clone(),
+            runtime_clock.clone(),
+            1,
+            high_water,
+        )?;
+        let backend = rz_eval::native_runtime_bridge::NativeRuntimeBackend::new(
+            self.owner.clone(),
+            runtime_clock,
+        )?;
+        let limits = Limits {
+            max_requests: 1,
+            max_batch_items: 1,
+            max_executions: 1,
+            max_batch_wait: Duration::ZERO,
+            max_queue_age: Duration::from_secs(30),
+            deadline_reserve: Duration::ZERO,
+            memory: Resources {
+                host_bytes: 2
+                    * (self.profile.bytes.host
+                        + rz_eval::native_runtime_bridge::NATIVE_RUNTIME_OVERHEAD_BYTES),
+                device_bytes: 0,
+                pinned_bytes: 0,
+            },
+        };
+        let evaluator = ContractEvaluator::new(adapter, backend, limits, 256)?;
+        Ok(Box::new(CpuMockRuntime {
+            evaluator,
+            scope,
+            authority,
+            clock,
+            submissions: 0,
+            pending: None,
+        }))
+    }
+}
+
 fn error(code: ErrorCode, stage: Stage, detail: &'static str) -> ContractError {
     ContractError::new(code, stage, detail)
 }
@@ -218,21 +332,27 @@ impl EvaluatorFactory for CpuMockFactory {
         }))
     }
 }
-struct CpuMockRuntime {
-    evaluator: ContractEvaluator<RulesState, ScriptedRuntimeBackend<RuntimeClock>, RuntimeClock>,
+struct CpuMockRuntime<
+    B: rz_runtime::Backend<ContractsAdapter<RulesState, RuntimeClock>> = ScriptedRuntimeBackend<
+        RuntimeClock,
+    >,
+> {
+    evaluator: ContractEvaluator<RulesState, B, RuntimeClock>,
     scope: SharedScope,
     authority: SearchAuthority,
     clock: ProcessClock,
     submissions: u64,
     pending: Option<EvalContext>,
 }
-impl CpuMockRuntime {
+impl<B: rz_runtime::Backend<ContractsAdapter<RulesState, RuntimeClock>>> CpuMockRuntime<B> {
     fn refresh(&self) -> Result<(), ContractError> {
         self.scope.update(self.authority.current_scope()?);
         Ok(())
     }
 }
-impl Evaluator<RulesState> for CpuMockRuntime {
+impl<B: rz_runtime::Backend<ContractsAdapter<RulesState, RuntimeClock>>> Evaluator<RulesState>
+    for CpuMockRuntime<B>
+{
     fn submit(&mut self, request: Arc<EvalRequest<RulesState>>) -> Result<(), ContractError> {
         self.refresh()?;
         if self.submissions >= MAX_EVALUATIONS {
@@ -270,7 +390,11 @@ impl Evaluator<RulesState> for CpuMockRuntime {
         self.evaluator.cancel(request)
     }
 }
-impl ManagedEvaluator for CpuMockRuntime {
+impl<B> ManagedEvaluator for CpuMockRuntime<B>
+where
+    B: rz_runtime::Backend<ContractsAdapter<RulesState, RuntimeClock>> + Send,
+    B::Lease: Send,
+{
     fn shutdown(&mut self, until: Instant) -> Result<(), ContractError> {
         // Runtime admission/drain does not own UCI's root output permission.
         // A naturally completed worker can reach this before its queued

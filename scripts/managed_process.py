@@ -122,6 +122,8 @@ def _run_windows(argv, cwd, env, timeout, admission_check):
         "WaitForSingleObject": ([w.HANDLE, w.DWORD], w.DWORD),
         "GetExitCodeProcess": ([w.HANDLE, ctypes.POINTER(w.DWORD)], w.BOOL),
         "TerminateProcess": ([w.HANDLE, w.UINT], w.BOOL),
+        "OpenProcess": ([w.DWORD, w.BOOL, w.DWORD], w.HANDLE),
+        "IsProcessInJob": ([w.HANDLE, w.HANDLE, ctypes.POINTER(w.BOOL)], w.BOOL),
     }
     for name, (args, result) in signatures.items():
         fn = getattr(k, name)
@@ -138,6 +140,49 @@ def _run_windows(argv, cwd, env, timeout, admission_check):
     assigned = False
     failure = None
     requested_exit = None
+    descendants = {}
+
+    def pin_job_members():
+        # ActiveProcesses may reach zero while asynchronous termination is still
+        # releasing a descendant's cwd/I/O. Hold exact process objects and wait
+        # for their signaled state before claiming scratch is reclaimable.
+        capacity = 64
+        while capacity <= 4096:
+            class ProcessIds(ctypes.Structure):
+                _fields_ = [("assigned", w.DWORD), ("listed", w.DWORD),
+                            ("ids", ULONG_PTR * capacity)]
+            ids = ProcessIds()
+            ok = k.QueryInformationJobObject(job, 3, ctypes.byref(ids), ctypes.sizeof(ids), None)
+            if not ok and ctypes.get_last_error() != 234:  # ERROR_MORE_DATA
+                require(ok)
+            if ok and ids.listed == ids.assigned:
+                break
+            capacity *= 2
+        else:
+            raise RuntimeError("owned Windows job exceeds 4096 process observation bound")
+        for pid in ids.ids[:ids.listed]:
+            if pid == info.pid or pid in descendants:
+                continue
+            handle = k.OpenProcess(0x00100000 | 0x1000, False, pid)  # SYNCHRONIZE | QUERY_LIMITED_INFORMATION
+            if not handle and ctypes.get_last_error() == 87:  # Process already fully removed.
+                continue
+            require(handle)
+            member = w.BOOL()
+            try:
+                require(k.IsProcessInJob(handle, job, ctypes.byref(member)))
+                if not member.value:
+                    raise RuntimeError("process identity changed outside the owned Windows job")
+            except BaseException:
+                k.CloseHandle(handle)
+                raise
+            descendants[pid] = handle
+
+    def process_finished(handle):
+        status = k.WaitForSingleObject(handle, 0)
+        if status not in (0, 0x102):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return status == 0
+
     try:
         limits = Extended()
         limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -158,7 +203,12 @@ def _run_windows(argv, cwd, env, timeout, admission_check):
         started = time.monotonic()
         next_check = started
         try:
-            while k.WaitForSingleObject(info.process, 100) == 0x102:
+            while True:
+                status = k.WaitForSingleObject(info.process, 100)
+                if status == 0:
+                    break
+                if status != 0x102:
+                    raise ctypes.WinError(ctypes.get_last_error())
                 now = time.monotonic()
                 if now >= next_check:
                     admission_check()
@@ -173,13 +223,15 @@ def _run_windows(argv, cwd, env, timeout, admission_check):
         result = w.DWORD()
         if requested_exit is None:
             require(k.GetExitCodeProcess(info.process, ctypes.byref(result)))
+        pin_job_members()
         require(k.TerminateJobObject(job, requested_exit or result.value))
         gone = False
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
+            pin_job_members()
             accounting = Accounting()
             require(k.QueryInformationJobObject(job, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None))
-            if accounting.active == 0:
+            if accounting.active == 0 and all(process_finished(handle) for handle in [info.process, *descendants.values()]):
                 gone = True
                 break
             time.sleep(0.05)
@@ -188,6 +240,6 @@ def _run_windows(argv, cwd, env, timeout, admission_check):
         if created and not assigned:
             k.TerminateProcess(info.process, 125)  # Still suspended; never executed.
             k.WaitForSingleObject(info.process, 3000)
-        for handle in (info.thread, info.process, job):
+        for handle in (*descendants.values(), info.thread, info.process, job):
             if handle:
                 k.CloseHandle(handle)

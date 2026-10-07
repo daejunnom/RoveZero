@@ -53,137 +53,7 @@ pub struct BatchSessionAudit {
     pub completed_batch_distribution: [u64; 16],
 }
 
-/// Verify the fixed Linux Fastchess renderer, not an engine's self-report.
-/// The caller supplies four identities from validated startup records and the
-/// supervisor-owned, bounded stdout whose ArtifactRef is already retained.
-/// This pinned source logs raw wait status: only decimal `0` proves exit zero.
-/// Missing records (including earlier reaping), malformed records or renderer
-/// changes are unsupported evidence and fail closed, never inferred as success.
-pub fn validate_native_cuda_process_exit_trace(
-    stdout: &[u8],
-    expected_pids: &[u32],
-) -> Result<(), ArenaError> {
-    const MAX_BYTES: usize = 64 * 1024 * 1024;
-    const MAX_LINES: usize = 131_072;
-    const MAX_LINE_BYTES: usize = 4096;
-    let fail = |reason: &str| ArenaError::Integrity(reason.into());
-    if expected_pids.len() != 4
-        || expected_pids
-            .iter()
-            .any(|pid| *pid == 0 || *pid > i32::MAX as u32)
-        || expected_pids
-            .iter()
-            .enumerate()
-            .any(|(index, pid)| expected_pids[..index].contains(pid))
-    {
-        return Err(fail(
-            "CUDA exit trace requires exactly four distinct native PIDs",
-        ));
-    }
-    if stdout.is_empty() || stdout.len() > MAX_BYTES || !stdout.ends_with(b"\n") {
-        return Err(fail(
-            "CUDA exit trace is empty, over budget or unterminated",
-        ));
-    }
-    let text = std::str::from_utf8(stdout).map_err(|_| fail("CUDA runner stdout is not UTF-8"))?;
-    let mut seen = [false; 4];
-    for (index, line) in text.split_terminator('\n').enumerate() {
-        if index >= MAX_LINES || line.len() > MAX_LINE_BYTES {
-            return Err(fail("CUDA runner trace line budget exceeded"));
-        }
-        // Logger::readFromEngine adds its own anchored [Engine] prefix to each
-        // protocol line; a quoted TRACE-looking payload cannot supply evidence.
-        if !line.starts_with("[TRACE")
-            || !(line.contains("Process with pid")
-                || line.contains("Force terminating process with pid"))
-        {
-            continue;
-        }
-        if !line.is_ascii() {
-            return Err(fail("CUDA process exit renderer is not ASCII"));
-        }
-        let message = cuda_exit_trace_message(line)
-            .ok_or_else(|| fail("CUDA process exit renderer is malformed"))?;
-        if message.starts_with("Force terminating process with pid:") {
-            return Err(fail("CUDA native process required force termination"));
-        }
-        let (pid_text, status) = message
-            .strip_prefix("Process with pid: ")
-            .and_then(|value| value.split_once(" terminated with status: "))
-            .ok_or_else(|| fail("CUDA native process exit record is malformed"))?;
-        let pid = pid_text
-            .parse::<u32>()
-            .map_err(|_| fail("CUDA native process exit PID is malformed"))?;
-        if pid_text != pid.to_string() {
-            return Err(fail(
-                "CUDA native process exit PID is not canonical decimal",
-            ));
-        }
-        let slot = expected_pids
-            .iter()
-            .position(|expected| *expected == pid)
-            .ok_or_else(|| fail("CUDA runner trace contains a foreign native PID"))?;
-        if seen[slot] {
-            return Err(fail("CUDA native process exit evidence is duplicated"));
-        }
-        if status != "0" {
-            return Err(fail(
-                "CUDA native process exit status is nonzero or malformed",
-            ));
-        }
-        seen[slot] = true;
-    }
-    if seen.iter().any(|present| !present) {
-        return Err(fail("CUDA native process exit evidence is incomplete"));
-    }
-    Ok(())
-}
-
-pub(crate) fn cuda_exit_trace_message(line: &str) -> Option<&str> {
-    native_runner_message(line, "[TRACE ] [", true)
-}
-
-pub(crate) fn native_runner_message<'a>(
-    line: &'a str,
-    prefix: &str,
-    require_thread: bool,
-) -> Option<&'a str> {
-    // Pinned logger.hpp:157: [label left-width6] [time width15]
-    // <thread right-width20> fastchess --- message. TRACE_THREAD is nonempty.
-    let (time, tail) = line.strip_prefix(prefix)?.split_once("] <")?;
-    let time = time.as_bytes();
-    if time.len() != 15
-        || time[2] != b':'
-        || time[5] != b':'
-        || time[8] != b'.'
-        || time
-            .iter()
-            .enumerate()
-            .any(|(index, byte)| !matches!(index, 2 | 5 | 8) && !byte.is_ascii_digit())
-        || (time[0] - b'0') * 10 + time[1] - b'0' > 23
-        || (time[3] - b'0') * 10 + time[4] - b'0' > 59
-        || (time[6] - b'0') * 10 + time[7] - b'0' > 59
-    {
-        return None;
-    }
-    let (thread, message) = tail.split_once("> fastchess --- ")?;
-    let digits = thread.trim_start_matches(' ');
-    if thread.len() != 20 {
-        return None;
-    }
-    if digits.is_empty() {
-        if require_thread {
-            return None;
-        }
-    } else if digits.starts_with('0')
-        || !digits.bytes().all(|byte| byte.is_ascii_digit())
-        || digits.parse::<u64>().is_err()
-    {
-        return None;
-    }
-    Some(message)
-}
-
+pub use crate::native_exit::validate_native_cuda_process_exit_trace;
 impl<P: CudaLaunchProfile> crate::native_launch::sealed::Sealed
     for LockedCudaIntegrationPairSpec<P>
 {
@@ -235,6 +105,8 @@ impl<P: CudaLaunchProfile> NativeLaunchDeclaration for LockedCudaIntegrationPair
             cuda_bundle: Some(&engine.cuda_bundle),
             search: engine.profile.search_options(),
             batch_experiment: (P::VERSION == 4).then(|| engine.profile.max_batch()),
+            external: None,
+            environment: None,
         })
     }
     fn provider_name(&self) -> &'static str {
@@ -389,19 +261,66 @@ impl<P: CudaLaunchProfile> NativeProviderDeclaration for LockedCudaIntegrationPa
                 self.input().engine(role)?,
             );
         }
-        let mut evidence = linux::placement_evidence(pid, startup, runtime_directory)?;
-        if let Some(search) = self.input().engine(role)?.profile.search_options() {
-            let relative = format!(
-                "native-process-{pid}/{}",
-                rz_uci::native_cuda_attestation::SEARCH_FILE
-            );
-            let bytes =
-                crate::native_runner::linux::read_file(runtime_directory, &relative, 256 * 1024)?;
-            validate_native_cuda_search_record_fields(&bytes, startup, search)?;
-            evidence.push((relative, bytes));
-        }
-        Ok(evidence)
+        verify_cuda_endpoint_evidence(self.input().engine(role)?, pid, startup, runtime_directory)
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_cuda_endpoint_evidence<P: CudaLaunchProfile>(
+    engine: &CudaNativeLaunchSpec<P>,
+    pid: u32,
+    startup: &[u8],
+    runtime_directory: &cap_std::fs::Dir,
+) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
+    verify_cuda_endpoint_evidence_inner(
+        pid,
+        startup,
+        runtime_directory,
+        100_000,
+        engine.profile.search_options(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_cuda_endpoint_evidence_with_tree_limit<P: CudaLaunchProfile>(
+    engine: &CudaNativeLaunchSpec<P>,
+    pid: u32,
+    startup: &[u8],
+    runtime_directory: &cap_std::fs::Dir,
+    max_edges: u32,
+) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
+    let search = engine
+        .profile
+        .search_options()
+        .unwrap_or(rz_experiments::NativeCudaSearchV2 {
+            simulations: 128,
+            final_selection: rz_experiments::NativeFinalSelectionV2::Visits,
+            policy_temperature_milli: 1000,
+            raw_cache: false,
+        });
+    verify_cuda_endpoint_evidence_inner(pid, startup, runtime_directory, max_edges, Some(search))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_cuda_endpoint_evidence_inner(
+    pid: u32,
+    startup: &[u8],
+    runtime_directory: &cap_std::fs::Dir,
+    max_edges: u32,
+    search: Option<rz_experiments::NativeCudaSearchV2>,
+) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
+    let mut evidence = linux::placement_evidence(pid, startup, runtime_directory)?;
+    if let Some(search) = search {
+        let relative = format!(
+            "native-process-{pid}/{}",
+            rz_uci::native_cuda_attestation::SEARCH_FILE
+        );
+        let bytes =
+            crate::native_runner::linux::read_file(runtime_directory, &relative, 256 * 1024)?;
+        linux::validate_search_record(&bytes, startup, search, 1, u64::from(max_edges))?;
+        evidence.push((relative, bytes));
+    }
+    Ok(evidence)
 }
 
 /// Source bytes are verified and copied before any runner/native child starts.
@@ -497,7 +416,7 @@ pub use linux::{
 };
 
 #[cfg(target_os = "linux")]
-mod linux {
+pub(crate) mod linux {
     use super::*;
     use crate::native_runner::linux::{
         check_completion, equals, field, flag, hash, json, keys, n, none, number, registry, text,
@@ -736,6 +655,7 @@ mod linux {
                 .search_options()
                 .ok_or_else(|| invalid("batch search declaration"))?,
             width as u64,
+            100_000,
         )?;
         let summary = t.journal_summary.unwrap();
         if summary.max_pending != width
@@ -966,13 +886,14 @@ mod linux {
         startup: &[u8],
         expected: rz_experiments::NativeCudaSearchV2,
     ) -> Result<(), ArenaError> {
-        validate_search_record(bytes, startup, expected, 1)
+        validate_search_record(bytes, startup, expected, 1, 100_000)
     }
-    fn validate_search_record(
+    pub(super) fn validate_search_record(
         bytes: &[u8],
         startup: &[u8],
         expected: rz_experiments::NativeCudaSearchV2,
         width: u64,
+        max_edges: u64,
     ) -> Result<(), ArenaError> {
         if bytes.len() > 256 * 1024 || startup.len() > 256 * 1024 {
             return Err(ArenaError::Budget(
@@ -1011,7 +932,7 @@ mod linux {
             ("drain_margin_ms", 10),
             ("shutdown_ms", 2000),
             ("max_nodes", 20000),
-            ("max_edges", 100000),
+            ("max_edges", max_edges),
             ("max_depth", 128),
         ] {
             n(&receipt, key, value)?;
@@ -1251,7 +1172,7 @@ mod linux {
         }
         Ok(())
     }
-    pub(super) fn placement_evidence(
+    pub(crate) fn placement_evidence(
         pid: u32,
         startup: &[u8],
         runtime_directory: &cap_std::fs::Dir,

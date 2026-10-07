@@ -490,6 +490,16 @@ fn check_bytes(bytes: &[u8], len: usize, digest: &str) -> Result<(), BackendErro
     Ok(())
 }
 
+#[cfg(feature = "contracts")]
+impl AssetProfile {
+    pub fn admission_policy(self) -> super::NativeAdmissionPolicy {
+        match self {
+            Self::Maia1900 => super::NativeAdmissionPolicy::CudaOneGiB,
+            Self::Bt4It332 => super::NativeAdmissionPolicy::CudaThreeGiB,
+        }
+    }
+}
+
 #[cfg(test)]
 mod streaming_tests {
     use super::*;

@@ -68,7 +68,11 @@ class LifecycleTests(unittest.TestCase):
         paused, pause_receipt = self.run_training("paused", stop_after=3)
         self.assertEqual(pause_receipt["status"], "paused")
         resume_path = paused / "checkpoint-000003.json"
-        resumed, resume_receipt = self.run_training("resumed", resume_path=resume_path)
+        # A tiny fixture may fit within one Windows monotonic clock tick. Test
+        # elapsed-time accumulation with a deterministic clock, not CPU speed.
+        ticks = iter(range(0, 1_000_000_000, 1_000_000))
+        with patch("rz_training.trainer.time.monotonic_ns", side_effect=lambda: next(ticks)):
+            resumed, resume_receipt = self.run_training("resumed", resume_path=resume_path)
         left, right = self.read(continuous / "checkpoint-000008.json"), self.read(resumed / "checkpoint-000008.json")
         for field in ("provenance", "model", "optimizer", "sampler", "history", "best"):
             self.assertEqual(left[field], right[field], field)

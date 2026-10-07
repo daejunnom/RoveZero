@@ -56,6 +56,7 @@ const NATIVE_DIAGNOSTIC_CAPACITY: usize = 32;
 const FINAL_COLLECTION_LIMIT: Duration = Duration::from_secs(2);
 pub const CUDA_ARENA_BYTES: usize = 1024 * 1024 * 1024;
 pub const MAX_NATIVE_SIMULATIONS: u64 = 4096;
+pub const MAX_NATIVE_TREE_EDGES: usize = 4_194_304;
 const MAX_NATIVE_EVALUATIONS: u64 = MAX_NATIVE_SIMULATIONS + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +76,7 @@ pub struct NativeConfig {
     raw_cache: bool,
     parallelism: usize,
     search_simulations: u64,
+    search_max_edges: Option<usize>,
     final_move_policy: rz_search::tree::FinalMovePolicy,
     source_weights: PathBuf,
     onnx_model: PathBuf,
@@ -106,6 +108,7 @@ impl fmt::Debug for NativeConfig {
             )
             .field("batch", &self.parallelism)
             .field("search_simulations", &self.search_simulations)
+            .field("search_max_edges", &self.search_max_edges)
             .field("final", &self.final_move_policy)
             .field(
                 "bundle",
@@ -130,10 +133,28 @@ impl NativeConfig {
         arguments: impl IntoIterator<Item = String>,
         source_profile: bool,
     ) -> Result<Self, NativeBootstrapError> {
+        let mut selected_adapter = false;
+        let mut filtered = Vec::new();
+        for argument in arguments {
+            if let Some(adapter) = argument.strip_prefix("--model-adapter=") {
+                if selected_adapter || adapter != "lc0" {
+                    return Err(NativeBootstrapError::Contract(error(
+                        ErrorCode::UnsupportedContract,
+                        Stage::Admission,
+                        "unsupported or duplicate native model adapter",
+                    )));
+                }
+                selected_adapter = true;
+            } else {
+                filtered.push(argument);
+            }
+        }
+        let arguments = filtered;
         let mut execution_experiments = rz_eval::onnx::ExecutionExperiments::default();
         let mut raw_cache = false;
         let mut parallelism = None;
         let mut search_simulations = None;
+        let mut search_max_edges = None;
         let mut final_move_policy = None;
         let mut provider = None;
         let mut source_weights = None;
@@ -237,6 +258,20 @@ impl NativeConfig {
                         ));
                     }
                     search_simulations = Some(limit);
+                }
+                "--search-max-edges" => {
+                    if search_max_edges.is_some() {
+                        return Err(NativeBootstrapError::Config("duplicate search edge limit"));
+                    }
+                    let limit = value
+                        .parse::<usize>()
+                        .map_err(|_| NativeBootstrapError::Config("invalid search edge limit"))?;
+                    if !(1..=MAX_NATIVE_TREE_EDGES).contains(&limit) {
+                        return Err(NativeBootstrapError::Config(
+                            "native search edge limit must be 1..=4194304",
+                        ));
+                    }
+                    search_max_edges = Some(limit);
                 }
                 "--experimental-batch" => {
                     if parallelism.is_some() {
@@ -342,6 +377,7 @@ impl NativeConfig {
             raw_cache,
             parallelism,
             search_simulations: search_simulations.unwrap_or(128),
+            search_max_edges,
             final_move_policy: final_move_policy.unwrap_or_default(),
             source_weights: source_weights.ok_or_else(missing)?,
             onnx_model: onnx_model.ok_or_else(missing)?,
@@ -387,6 +423,9 @@ impl NativeConfig {
             ..crate::engine::EngineSettings::default()
         };
         settings.search.max_simulations = self.search_simulations;
+        if let Some(max_edges) = self.search_max_edges {
+            settings.tree.max_edges = max_edges;
+        }
         settings.final_move_policy = self.final_move_policy;
         settings
     }

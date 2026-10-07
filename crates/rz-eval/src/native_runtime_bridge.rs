@@ -4,10 +4,12 @@
 //! never initialize ORT inside `dispatch`. Logical cancellation belongs to D/B;
 //! only a physically completed worker result permits Ready and pin release.
 
+#[cfg(any(feature = "onnx", test))]
+use crate::rules_projection::ClassicalProjection;
 use crate::{
-    contracts::{backend_error, PhysicalFailure, PreparedBatch},
     error::{BackendError, CauseCode, FailureKind, FailureStage},
-    rules_projection::ClassicalProjection,
+    model_adapter::{backend_error, AdapterAdmission, ModelAdapter, PhysicalFailure},
+    rules_projection::Lc0ModelAdapter,
     worker::{PhysicalLease, PhysicalPoll, SingleWorker},
 };
 use rz_contracts::*;
@@ -20,12 +22,12 @@ use std::{
     time::Instant,
 };
 
-pub type NativePhysicalWorker =
-    SingleWorker<PreparedBatch<RulesState>, Result<Vec<EvalOutput>, PhysicalFailure>>;
-type NativePhysicalLease =
-    PhysicalLease<PreparedBatch<RulesState>, Result<Vec<EvalOutput>, PhysicalFailure>>;
+pub type NativePhysicalWorker<A = Lc0ModelAdapter> =
+    SingleWorker<<A as ModelAdapter>::PreparedBatch, Result<Vec<EvalOutput>, PhysicalFailure>>;
+type NativePhysicalLease<A> =
+    PhysicalLease<<A as ModelAdapter>::PreparedBatch, Result<Vec<EvalOutput>, PhysicalFailure>>;
 type NativeDelivery<C> = Vec<BackendResult<ContractsAdapter<RulesState, C>>>;
-type PreparedDispatch<C> = Result<(NativePhysicalLease, NativeDelivery<C>), PhysicalFailure>;
+type PreparedDispatch<C, A> = Result<(NativePhysicalLease<A>, NativeDelivery<C>), PhysicalFailure>;
 
 pub const NATIVE_RUNTIME_OVERHEAD_BYTES: u64 = 4096;
 /// Fixed first CUDA baseline declaration. This is neither measured VRAM nor a
@@ -40,43 +42,7 @@ pub enum NativeWorkerOrigin {
     CudaOnnx,
 }
 
-/// Admission declarations, not memory measurements or native allocation caps.
-/// D reserves `execution_resources` while a physical lease is outstanding.
-/// Bootstrap accounts for the separate session resident declaration; D must not
-/// subtract it when an individual execution completes. An injected worker may
-/// exercise this policy but cannot claim a verified CUDA origin.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NativeAdmissionPolicy {
-    Cpu,
-    CudaOneGiB,
-    CudaThreeGiB,
-}
-
-impl NativeAdmissionPolicy {
-    /// Additional D resources, beyond the EvalRequest's own ByteBudget. Adding
-    /// the same device declaration to ByteBudget would reserve it twice.
-    pub fn execution_resources(self) -> Resources {
-        Resources {
-            host_bytes: NATIVE_RUNTIME_OVERHEAD_BYTES,
-            device_bytes: match self {
-                Self::Cpu => 0,
-                Self::CudaOneGiB => NATIVE_CUDA_ADMISSION_BYTES,
-                Self::CudaThreeGiB => 3 * NATIVE_CUDA_ADMISSION_BYTES,
-            },
-            pinned_bytes: 0,
-        }
-    }
-
-    /// Separate bootstrap declaration. It is not an observed resident peak and
-    /// is not enforced by an execution's D reservation.
-    pub fn session_resident_admission(self) -> Resources {
-        Resources {
-            host_bytes: 0,
-            device_bytes: self.execution_resources().device_bytes,
-            pinned_bytes: 0,
-        }
-    }
-}
+pub use crate::adapters::lc0::NativeAdmissionPolicy;
 
 /// Metadata captured from the admitted, already loaded CUDA session. Paths and
 /// raw diagnostics stay outside this receipt; the runtime bundle digest binds
@@ -124,10 +90,10 @@ pub struct NativeOwnerStatus {
     pub reserved_diagnostics: usize,
 }
 
-struct OwnerState {
+struct OwnerState<A: ModelAdapter> {
     #[cfg(feature = "experimental-batch")]
     batch_journal: Option<crate::batch_journal::BatchJournal>,
-    worker: NativePhysicalWorker,
+    worker: NativePhysicalWorker<A>,
     epoch: Option<ProcessEpoch>,
     last_execution: Option<u64>,
     last_request: Option<u64>,
@@ -156,16 +122,16 @@ enum DiagnosticSlot {
     Occupied(NativeDiagnosticReceipt),
 }
 
-struct OwnerInner {
+struct OwnerInner<A: ModelAdapter> {
     max_batch: usize,
     #[cfg(feature = "experimental-notify")]
     signal: rz_runtime::CompletionSignal,
-    projection: ClassicalProjection,
+    projection: A,
     origin: NativeWorkerOrigin,
-    admission_policy: NativeAdmissionPolicy,
+    admission_policy: AdapterAdmission,
     cuda_metadata: Option<NativeCudaMetadata>,
     source_trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
-    state: Mutex<OwnerState>,
+    state: Mutex<OwnerState<A>>,
 }
 
 /// Process-owned session/worker and original diagnostic receipts. Keep this
@@ -174,9 +140,9 @@ struct OwnerInner {
 /// diagnostic capacity before launch; only actual failure/audit receipts occupy
 /// it afterward. A successful physical result releases its reserved slot.
 #[derive(Clone)]
-pub struct NativeWorkerOwner(Arc<OwnerInner>);
+pub struct NativeWorkerOwner<A: ModelAdapter = Lc0ModelAdapter>(Arc<OwnerInner<A>>);
 
-impl NativeWorkerOwner {
+impl<A: ModelAdapter> NativeWorkerOwner<A> {
     #[cfg(feature = "experimental-batch")]
     pub fn enable_batch_journal(&self) -> Result<(), ContractError> {
         let mut state = self.state();
@@ -242,8 +208,8 @@ impl NativeWorkerOwner {
     /// Injection exercises the same physical Lease bridge without claiming NN
     /// execution. The supplied closure must satisfy SingleWorker's Run contract.
     pub fn from_worker(
-        worker: NativePhysicalWorker,
-        projection: ClassicalProjection,
+        worker: NativePhysicalWorker<A>,
+        projection: A,
         diagnostic_capacity: usize,
     ) -> Result<Self, PhysicalFailure> {
         Self::from_worker_with_admission(
@@ -258,37 +224,42 @@ impl NativeWorkerOwner {
     /// The origin remains Injected for every policy; this API cannot attest NN
     /// execution, warm placement or a loaded CUDA provider.
     pub fn from_worker_with_admission(
-        worker: NativePhysicalWorker,
-        projection: ClassicalProjection,
+        worker: NativePhysicalWorker<A>,
+        projection: A,
         diagnostic_capacity: usize,
-        admission_policy: NativeAdmissionPolicy,
+        admission_policy: impl Into<AdapterAdmission>,
     ) -> Result<Self, PhysicalFailure> {
-        Self::from_worker_limit(worker, projection, diagnostic_capacity, admission_policy, 1)
+        Self::from_worker_limit(
+            worker,
+            projection,
+            diagnostic_capacity,
+            admission_policy.into(),
+            1,
+        )
     }
     #[cfg(feature = "experimental-batch")]
     pub fn from_worker_batched(
-        worker: NativePhysicalWorker,
-        projection: ClassicalProjection,
+        worker: NativePhysicalWorker<A>,
+        projection: A,
         diagnostic_capacity: usize,
-        admission_policy: NativeAdmissionPolicy,
+        admission_policy: impl Into<AdapterAdmission>,
         max_batch: usize,
     ) -> Result<Self, PhysicalFailure> {
         Self::from_worker_limit(
             worker,
             projection,
             diagnostic_capacity,
-            admission_policy,
+            admission_policy.into(),
             max_batch,
         )
     }
     fn from_worker_limit(
-        worker: NativePhysicalWorker,
-        projection: ClassicalProjection,
+        worker: NativePhysicalWorker<A>,
+        projection: A,
         diagnostic_capacity: usize,
-        admission_policy: NativeAdmissionPolicy,
+        admission_policy: AdapterAdmission,
         max_batch: usize,
     ) -> Result<Self, PhysicalFailure> {
-        let model = projection.model();
         if diagnostic_capacity == 0 || diagnostic_capacity > MAX_DIAGNOSTICS {
             return Err(failure(
                 ErrorCode::ResourceExhausted,
@@ -297,16 +268,14 @@ impl NativeWorkerOwner {
             )
             .into());
         }
-        if model.full_steps() != 1
-            || model.max_batch_items() != max_batch
-            || !(1..=16).contains(&max_batch)
+        projection.validate_runtime(max_batch)?;
+        if !(1..=16).contains(&max_batch)
             || (max_batch > 1 && !cfg!(feature = "experimental-batch"))
-            || !model.supports(PrecisionProfile::Fp32)
         {
             return Err(failure(
                 ErrorCode::UnsupportedContract,
                 Stage::Contract,
-                "native baseline requires fresh FP32 single-item inference",
+                "runtime batch capacity is unsupported",
             )
             .into());
         }
@@ -345,192 +314,11 @@ impl NativeWorkerOwner {
         })))
     }
 
-    /// Consumes an already loaded, verified CPU session. Native load/provider
-    /// initialization is a bootstrap operation, outside every search deadline.
-    #[cfg(feature = "onnx")]
-    pub fn from_onnx(
-        backend: crate::onnx::OnnxBackend,
-        projection: ClassicalProjection,
-        diagnostic_capacity: usize,
-    ) -> Result<Self, PhysicalFailure> {
-        Self::from_onnx_profiled(backend, projection, diagnostic_capacity, None)
-    }
-
-    #[cfg(feature = "onnx")]
-    pub fn from_onnx_profiled(
-        backend: crate::onnx::OnnxBackend,
-        projection: ClassicalProjection,
-        diagnostic_capacity: usize,
-        trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
-    ) -> Result<Self, PhysicalFailure> {
-        Self::from_onnx_limit(backend, projection, diagnostic_capacity, 1, trace)
-    }
-    #[cfg(all(feature = "onnx", feature = "experimental-batch"))]
-    pub fn from_onnx_batched(
-        backend: crate::onnx::OnnxBackend,
-        projection: ClassicalProjection,
-        diagnostic_capacity: usize,
-    ) -> Result<Self, PhysicalFailure> {
-        let max_batch = backend.config().max_batch;
-        Self::from_onnx_limit(backend, projection, diagnostic_capacity, max_batch, None)
-    }
-    #[cfg(feature = "onnx")]
-    fn from_onnx_limit(
-        backend: crate::onnx::OnnxBackend,
-        projection: ClassicalProjection,
-        diagnostic_capacity: usize,
-        max_batch: usize,
-        trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
-    ) -> Result<Self, PhysicalFailure> {
-        if !matches!(backend.config().provider, crate::onnx::Provider::Cpu)
-            || backend.config().max_batch != max_batch
-            || projection.backend().0 != backend.identity()
-            || projection.model().handle().manifest.0 != backend.asset_identity()
-        {
-            return Err(failure(
-                ErrorCode::IdentityMismatch,
-                Stage::Contract,
-                "native CPU owner differs from loaded provider/model/batch identity",
-            )
-            .into());
-        }
-        let worker = crate::contracts::spawn_onnx_worker_profiled(backend, trace.clone())?;
-        let mut owner = Self::from_worker_limit(
-            worker,
-            projection,
-            diagnostic_capacity,
-            NativeAdmissionPolicy::Cpu,
-            max_batch,
-        )?;
-        // No clone has escaped this constructor; the actual origin is immutable.
-        let inner = Arc::get_mut(&mut owner.0).expect("new native owner is exclusively owned");
-        inner.origin = NativeWorkerOrigin::CpuOnnx;
-        inner.source_trace = trace;
-        Ok(owner)
-    }
-
-    /// Consumes a verified CUDA B1/FP32 session after the actual warm placement
-    /// probe. Bootstrap, not a search deadline, owns initialization. The first
-    /// profile uses one intra-op thread and a one-GiB ORT arena declaration.
-    /// No unchecked caller value can issue CudaOnnx origin or placement metadata.
-    #[cfg(feature = "onnx")]
-    pub fn from_cuda_onnx(
-        backend: crate::onnx::OnnxBackend,
-        projection: ClassicalProjection,
-        diagnostic_capacity: usize,
-    ) -> Result<Self, PhysicalFailure> {
-        Self::from_cuda_onnx_profiled(backend, projection, diagnostic_capacity, None)
-    }
-
-    #[cfg(feature = "onnx")]
-    pub fn from_cuda_onnx_profiled(
-        backend: crate::onnx::OnnxBackend,
-        projection: ClassicalProjection,
-        diagnostic_capacity: usize,
-        trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
-    ) -> Result<Self, PhysicalFailure> {
-        Self::from_cuda_onnx_limit(backend, projection, diagnostic_capacity, 1, trace)
-    }
-    #[cfg(all(feature = "onnx", feature = "experimental-batch"))]
-    pub fn from_cuda_onnx_batched(
-        backend: crate::onnx::OnnxBackend,
-        projection: ClassicalProjection,
-        diagnostic_capacity: usize,
-    ) -> Result<Self, PhysicalFailure> {
-        let max_batch = backend.config().max_batch;
-        Self::from_cuda_onnx_limit(backend, projection, diagnostic_capacity, max_batch, None)
-    }
-    #[cfg(feature = "onnx")]
-    fn from_cuda_onnx_limit(
-        backend: crate::onnx::OnnxBackend,
-        projection: ClassicalProjection,
-        diagnostic_capacity: usize,
-        max_batch: usize,
-        trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
-    ) -> Result<Self, PhysicalFailure> {
-        // Preserve the actual native cause of an earlier uncertain Run before
-        // reporting a generic profile mismatch. Drop retains its session/input.
-        if let Some(cause) = backend.physical_quarantine_cause() {
-            return Err(cause.clone().into());
-        }
-        let crate::onnx::Provider::Cuda {
-            device_id,
-            arena_bytes,
-        } = backend.config().provider
-        else {
-            return Err(failure(
-                ErrorCode::IdentityMismatch,
-                Stage::Contract,
-                "native CUDA owner requires an explicitly loaded CUDA provider",
-            )
-            .into());
-        };
-        if device_id != 0
-            || arena_bytes != backend.asset_profile().cuda_arena_bytes()
-            || backend.config().max_batch != max_batch
-            || backend.config().intra_threads != 1
-            || projection.backend().0 != backend.identity()
-            || projection.model().handle().manifest.0 != backend.asset_identity()
-            || backend.has_unconfirmed_physical_completion()
-        {
-            return Err(failure(
-                ErrorCode::IdentityMismatch,
-                Stage::Contract,
-                "native CUDA owner differs from verified device0/B1/thread1/model/backend/arena profile",
-            )
-            .into());
-        }
-        let evidence = backend
-            .cuda_evidence()
-            .filter(|e| e.executed_cuda_nodes > 0)
-            .ok_or_else(|| {
-                failure(
-                    ErrorCode::IdentityMismatch,
-                    Stage::Contract,
-                    "native CUDA owner requires actual warm CUDA kernel placement",
-                )
-            })?;
-        let runtime_bundle_digest = backend.runtime_bundle_digest().ok_or_else(|| {
-            failure(
-                ErrorCode::IdentityMismatch,
-                Stage::Contract,
-                "native CUDA owner requires the complete pinned runtime bundle",
-            )
-        })?;
-        let metadata = NativeCudaMetadata {
-            device_id,
-            arena_bytes: arena_bytes as u64,
-            runtime_bundle_digest: Digest(runtime_bundle_digest),
-            placement_profile_digest: Digest(evidence.profile_sha256),
-            executed_cuda_nodes: evidence.executed_cuda_nodes,
-        };
-        // A successful historical probe alone does not authorize current maps.
-        // Loader failure stays typed and latched, with all native pins retained.
-        backend.verify_cuda_runtime_mappings()?;
-        let admission = match backend.asset_profile() {
-            crate::asset::AssetProfile::Maia1900 => NativeAdmissionPolicy::CudaOneGiB,
-            crate::asset::AssetProfile::Bt4It332 => NativeAdmissionPolicy::CudaThreeGiB,
-        };
-        let worker = crate::contracts::spawn_onnx_worker_profiled(backend, trace.clone())?;
-        let mut owner = Self::from_worker_limit(
-            worker,
-            projection,
-            diagnostic_capacity,
-            admission,
-            max_batch,
-        )?;
-        let inner = Arc::get_mut(&mut owner.0).expect("new native owner is exclusively owned");
-        inner.origin = NativeWorkerOrigin::CudaOnnx;
-        inner.cuda_metadata = Some(metadata);
-        inner.source_trace = trace;
-        Ok(owner)
-    }
-
     pub fn origin(&self) -> NativeWorkerOrigin {
         self.0.origin
     }
 
-    pub fn admission_policy(&self) -> NativeAdmissionPolicy {
+    pub fn admission_policy(&self) -> AdapterAdmission {
         self.0.admission_policy
     }
 
@@ -546,7 +334,7 @@ impl NativeWorkerOwner {
     pub fn max_batch(&self) -> usize {
         self.0.max_batch
     }
-    pub fn projection(&self) -> &ClassicalProjection {
+    pub fn projection(&self) -> &A {
         &self.0.projection
     }
 
@@ -674,7 +462,7 @@ impl NativeWorkerOwner {
     }
 
     fn take_from(
-        state: &mut OwnerState,
+        state: &mut OwnerState<A>,
         max_entries: usize,
     ) -> Result<NativeDiagnosticBatch, ContractError> {
         let count = state
@@ -711,7 +499,7 @@ impl NativeWorkerOwner {
         })
     }
 
-    fn state(&self) -> MutexGuard<'_, OwnerState> {
+    fn state(&self) -> MutexGuard<'_, OwnerState<A>> {
         match self.0.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
@@ -722,7 +510,7 @@ impl NativeWorkerOwner {
         }
     }
 
-    fn mark_poison(state: &mut OwnerState) {
+    fn mark_poison(state: &mut OwnerState<A>) {
         let error = owner_poison_error();
         state.closed.get_or_insert(error);
         if !state.poison_observed {
@@ -740,14 +528,14 @@ impl NativeWorkerOwner {
     }
 }
 
-pub struct NativeRuntimeBackend<C: ContractClock + Send> {
-    owner: NativeWorkerOwner,
+pub struct NativeRuntimeBackend<C: ContractClock + Send, A: ModelAdapter = Lc0ModelAdapter> {
+    owner: NativeWorkerOwner<A>,
     clock: C,
 }
 
-pub struct NativeRuntimeLease<C: ContractClock> {
-    physical: NativePhysicalLease,
-    owner: NativeWorkerOwner,
+pub struct NativeRuntimeLease<C: ContractClock, A: ModelAdapter = Lc0ModelAdapter> {
+    physical: NativePhysicalLease<A>,
+    owner: NativeWorkerOwner<A>,
     slot: usize,
     ticket: (ExecutionId, RequestId),
     context: CompletionContext,
@@ -757,8 +545,8 @@ pub struct NativeRuntimeLease<C: ContractClock> {
     quarantined: bool,
 }
 
-impl<C: ContractClock + Send> NativeRuntimeBackend<C> {
-    pub fn new(owner: NativeWorkerOwner, clock: C) -> Result<Self, ContractError> {
+impl<C: ContractClock + Send, A: ModelAdapter> NativeRuntimeBackend<C, A> {
+    pub fn new(owner: NativeWorkerOwner<A>, clock: C) -> Result<Self, ContractError> {
         {
             let state = owner.state();
             if let Some(error) = state.closed {
@@ -778,7 +566,7 @@ impl<C: ContractClock + Send> NativeRuntimeBackend<C> {
         Ok(Self { owner, clock })
     }
 
-    fn quarantine(&self, lease: &mut NativeRuntimeLease<C>, error: BackendError) {
+    fn quarantine(&self, lease: &mut NativeRuntimeLease<C, A>, error: BackendError) {
         let contract = backend_error(&error);
         self.owner.record(
             lease.slot,
@@ -794,8 +582,10 @@ impl<C: ContractClock + Send> NativeRuntimeBackend<C> {
     }
 }
 
-impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for NativeRuntimeBackend<C> {
-    type Lease = NativeRuntimeLease<C>;
+impl<C: ContractClock + Send, A: ModelAdapter> Backend<ContractsAdapter<RulesState, C>>
+    for NativeRuntimeBackend<C, A>
+{
+    type Lease = NativeRuntimeLease<C, A>;
 
     fn additional_resources(&self, requests: &[Arc<RuntimeRequest<RulesState>>]) -> Resources {
         let resources = self.owner.admission_policy().execution_resources();
@@ -945,7 +735,7 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
             state.diagnostics[slot] = DiagnosticSlot::Reserved;
             slot
         };
-        let prepared: PreparedDispatch<C> = (|| {
+        let prepared: PreparedDispatch<C, A> = (|| {
             let mut items = Vec::new();
             items
                 .try_reserve_exact(requests.len())
@@ -979,7 +769,7 @@ impl<C: ContractClock + Send> Backend<ContractsAdapter<RulesState, C>> for Nativ
                 }
                 items.push(prepared?);
             }
-            let batch = PreparedBatch::new(*execution, items)?;
+            let batch = self.owner.projection().batch(*execution, items)?;
             let mut results = Vec::new();
             results
                 .try_reserve_exact(requests.len())
@@ -1216,6 +1006,186 @@ fn process_shutdown_error() -> ContractError {
     )
 }
 
+impl NativeWorkerOwner<Lc0ModelAdapter> {
+    /// Consumes an already loaded, verified CPU session. Native load/provider
+    /// initialization is a bootstrap operation, outside every search deadline.
+    #[cfg(feature = "onnx")]
+    pub fn from_onnx(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+    ) -> Result<Self, PhysicalFailure> {
+        Self::from_onnx_profiled(backend, projection, diagnostic_capacity, None)
+    }
+
+    #[cfg(feature = "onnx")]
+    pub fn from_onnx_profiled(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+        trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
+    ) -> Result<Self, PhysicalFailure> {
+        Self::from_onnx_limit(backend, projection, diagnostic_capacity, 1, trace)
+    }
+    #[cfg(all(feature = "onnx", feature = "experimental-batch"))]
+    pub fn from_onnx_batched(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+    ) -> Result<Self, PhysicalFailure> {
+        let max_batch = backend.config().max_batch;
+        Self::from_onnx_limit(backend, projection, diagnostic_capacity, max_batch, None)
+    }
+    #[cfg(feature = "onnx")]
+    fn from_onnx_limit(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+        max_batch: usize,
+        trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
+    ) -> Result<Self, PhysicalFailure> {
+        if !matches!(backend.config().provider, crate::onnx::Provider::Cpu)
+            || backend.config().max_batch != max_batch
+            || projection.backend().0 != backend.identity()
+            || projection.model().handle().manifest.0 != backend.asset_identity()
+        {
+            return Err(failure(
+                ErrorCode::IdentityMismatch,
+                Stage::Contract,
+                "native CPU owner differs from loaded provider/model/batch identity",
+            )
+            .into());
+        }
+        let worker = crate::contracts::spawn_onnx_worker_profiled(backend, trace.clone())?;
+        let mut owner = Self::from_worker_limit(
+            worker,
+            projection,
+            diagnostic_capacity,
+            NativeAdmissionPolicy::Cpu.into(),
+            max_batch,
+        )?;
+        // No clone has escaped this constructor; the actual origin is immutable.
+        let inner = Arc::get_mut(&mut owner.0).expect("new native owner is exclusively owned");
+        inner.origin = NativeWorkerOrigin::CpuOnnx;
+        inner.source_trace = trace;
+        Ok(owner)
+    }
+
+    /// Consumes a verified CUDA B1/FP32 session after the actual warm placement
+    /// probe. Bootstrap, not a search deadline, owns initialization. The first
+    /// profile uses one intra-op thread and a one-GiB ORT arena declaration.
+    /// No unchecked caller value can issue CudaOnnx origin or placement metadata.
+    #[cfg(feature = "onnx")]
+    pub fn from_cuda_onnx(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+    ) -> Result<Self, PhysicalFailure> {
+        Self::from_cuda_onnx_profiled(backend, projection, diagnostic_capacity, None)
+    }
+
+    #[cfg(feature = "onnx")]
+    pub fn from_cuda_onnx_profiled(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+        trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
+    ) -> Result<Self, PhysicalFailure> {
+        Self::from_cuda_onnx_limit(backend, projection, diagnostic_capacity, 1, trace)
+    }
+    #[cfg(all(feature = "onnx", feature = "experimental-batch"))]
+    pub fn from_cuda_onnx_batched(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+    ) -> Result<Self, PhysicalFailure> {
+        let max_batch = backend.config().max_batch;
+        Self::from_cuda_onnx_limit(backend, projection, diagnostic_capacity, max_batch, None)
+    }
+    #[cfg(feature = "onnx")]
+    fn from_cuda_onnx_limit(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+        max_batch: usize,
+        trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
+    ) -> Result<Self, PhysicalFailure> {
+        // Preserve the actual native cause of an earlier uncertain Run before
+        // reporting a generic profile mismatch. Drop retains its session/input.
+        if let Some(cause) = backend.physical_quarantine_cause() {
+            return Err(cause.clone().into());
+        }
+        let crate::onnx::Provider::Cuda {
+            device_id,
+            arena_bytes,
+        } = backend.config().provider
+        else {
+            return Err(failure(
+                ErrorCode::IdentityMismatch,
+                Stage::Contract,
+                "native CUDA owner requires an explicitly loaded CUDA provider",
+            )
+            .into());
+        };
+        if device_id != 0
+            || arena_bytes != backend.asset_profile().cuda_arena_bytes()
+            || backend.config().max_batch != max_batch
+            || backend.config().intra_threads != 1
+            || projection.backend().0 != backend.identity()
+            || projection.model().handle().manifest.0 != backend.asset_identity()
+            || backend.has_unconfirmed_physical_completion()
+        {
+            return Err(failure(
+                ErrorCode::IdentityMismatch,
+                Stage::Contract,
+                "native CUDA owner differs from verified device0/B1/thread1/model/backend/arena profile",
+            )
+            .into());
+        }
+        let evidence = backend
+            .cuda_evidence()
+            .filter(|e| e.executed_cuda_nodes > 0)
+            .ok_or_else(|| {
+                failure(
+                    ErrorCode::IdentityMismatch,
+                    Stage::Contract,
+                    "native CUDA owner requires actual warm CUDA kernel placement",
+                )
+            })?;
+        let runtime_bundle_digest = backend.runtime_bundle_digest().ok_or_else(|| {
+            failure(
+                ErrorCode::IdentityMismatch,
+                Stage::Contract,
+                "native CUDA owner requires the complete pinned runtime bundle",
+            )
+        })?;
+        let metadata = NativeCudaMetadata {
+            device_id,
+            arena_bytes: arena_bytes as u64,
+            runtime_bundle_digest: Digest(runtime_bundle_digest),
+            placement_profile_digest: Digest(evidence.profile_sha256),
+            executed_cuda_nodes: evidence.executed_cuda_nodes,
+        };
+        // A successful historical probe alone does not authorize current maps.
+        // Loader failure stays typed and latched, with all native pins retained.
+        backend.verify_cuda_runtime_mappings()?;
+        let admission = backend.asset_profile().admission_policy();
+        let worker = crate::contracts::spawn_onnx_worker_profiled(backend, trace.clone())?;
+        let mut owner = Self::from_worker_limit(
+            worker,
+            projection,
+            diagnostic_capacity,
+            admission.into(),
+            max_batch,
+        )?;
+        let inner = Arc::get_mut(&mut owner.0).expect("new native owner is exclusively owned");
+        inner.origin = NativeWorkerOrigin::CudaOnnx;
+        inner.cuda_metadata = Some(metadata);
+        inner.source_trace = trace;
+        Ok(owner)
+    }
+}
+
 fn owner_poison_error() -> ContractError {
     failure(
         ErrorCode::BackendFailure,
@@ -1227,6 +1197,7 @@ fn owner_poison_error() -> ContractError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contracts::PreparedBatch;
     use crate::contracts::{encoding_manifest, MaiaBinding};
     use rz_encoding::classical::HistoryFill;
 
