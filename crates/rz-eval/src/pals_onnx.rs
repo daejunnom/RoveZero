@@ -31,11 +31,16 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 mod cuda_control;
 mod public_pages;
+mod warm;
 pub use cuda_control::{
     PalsControlTransfer, PalsControlTransferKind, PalsCudaControlPolicy, PalsCudaPlacementWitness,
     PalsGraphOptimization, PalsGraphPlacement, PalsKernelWitness,
 };
 pub use public_pages::{HostRecordPagePolicy, HostRecordPageSnapshot, HostRecordPageStats};
+pub use warm::{
+    PalsWarmCapability, PalsWarmInput, FROZEN_QUERY_SEMANTICS_V1, PRIVATE_WARM_GRAPH_SEMANTICS,
+    PRIVATE_WARM_SCHEMA,
+};
 
 /// Implementation provenance only. Changing this source digest does not
 /// change the public input, model epoch or encoding semantic namespace.
@@ -1397,9 +1402,14 @@ struct ActiveInputs {
     query: Tensor<f32>,
     divergences: Tensor<f32>,
     divergence_mask: Tensor<bool>,
+    private_warm: Option<warm::ActiveWarmInputs>,
 }
 impl ActiveInputs {
-    fn new(value: PreparedPalsTensors, critic: bool) -> Result<Self, BackendError> {
+    fn new(
+        value: PreparedPalsTensors,
+        critic: bool,
+        private: Option<&PalsWarmInput>,
+    ) -> Result<Self, BackendError> {
         let tensor_error = |e| native(CauseCode::TensorCreate, "cannot own PALS input tensor", e);
         let r = value.record_mask.len();
         let c = value.candidate_mask.len();
@@ -1415,6 +1425,16 @@ impl ActiveInputs {
             + value.candidate_mask.capacity()
             + value.divergence_mask.capacity()
             + 1) as u64;
+        let private_warm = private.map(PalsWarmInput::prepare).transpose()?;
+        let host_bytes = host_bytes
+            .checked_add(private_warm.as_ref().map_or(0, |v| v.host_bytes))
+            .ok_or_else(|| {
+                fail(
+                    K::ResourceExhausted,
+                    S::Admission,
+                    "PALS Warm input byte overflow",
+                )
+            })?;
         Ok(Self {
             host_bytes,
             role_is_critic: Tensor::from_array((Vec::<usize>::new(), vec![critic]))
@@ -1431,6 +1451,7 @@ impl ActiveInputs {
                 .map_err(tensor_error)?,
             divergence_mask: Tensor::from_array(([1, d], value.divergence_mask))
                 .map_err(tensor_error)?,
+            private_warm,
         })
     }
 }
@@ -1475,6 +1496,8 @@ pub struct PalsPublicMemoryWitness {
 #[allow(clippy::large_enum_variant)]
 pub enum PalsNativeCommand {
     Evaluate(PalsModelInput),
+    /// Separate CPU-only Warm graph domain; a Fresh mode payload is also explicit.
+    EvaluatePrivateWarm(PalsWarmInput),
     NewGame,
     SnapshotStats,
     VerifyRuntime,
@@ -1652,6 +1675,7 @@ pub struct PalsOnnxBackend {
     critic: Option<Session>,
     shared_pc: Option<Session>,
     layout: Layout,
+    private_warm: Option<PalsWarmCapability>,
     runtime: OrtRuntime,
     config: PalsOnnxConfig,
     model_config: PalsModelConfig,
@@ -1874,6 +1898,7 @@ impl PalsOnnxBackend {
             critic: sessions.remove("critic"),
             shared_pc: sessions.remove("shared_pc"),
             layout,
+            private_warm: None,
             runtime,
             config,
             model_config: manifest.config,
@@ -2313,7 +2338,9 @@ impl PalsOnnxBackend {
     {
         SingleWorker::spawn_with_outcome(move |command| {
             let boundary = match &command {
-                PalsNativeCommand::Evaluate(_) => HostRecordPageObservationBoundary::Evaluate,
+                PalsNativeCommand::Evaluate(_) | PalsNativeCommand::EvaluatePrivateWarm(_) => {
+                    HostRecordPageObservationBoundary::Evaluate
+                }
                 PalsNativeCommand::NewGame => HostRecordPageObservationBoundary::NewGame,
                 PalsNativeCommand::SnapshotStats => {
                     HostRecordPageObservationBoundary::SnapshotStats
@@ -2332,6 +2359,9 @@ impl PalsOnnxBackend {
                 PalsNativeCommand::Evaluate(input) => {
                     self.run(input).map(PalsNativeResult::Evaluation)
                 }
+                PalsNativeCommand::EvaluatePrivateWarm(input) => self
+                    .run_private_warm(input)
+                    .map(PalsNativeResult::Evaluation),
                 PalsNativeCommand::NewGame => self
                     .clear_public_memory()
                     .map(|()| PalsNativeResult::NewGame),
@@ -2376,7 +2406,7 @@ impl PalsOnnxBackend {
             .startup_stage_probe
             .as_ref()
             .and_then(|probe| probe.begin_role(input.role));
-        let result = self.run_inner(input, trace.as_ref());
+        let result = self.run_inner(input, trace.as_ref(), None);
         if let Some(trace) = trace {
             trace.finish(result.is_ok());
             if trace.probe.closed() {
@@ -2389,9 +2419,21 @@ impl PalsOnnxBackend {
         &mut self,
         input: &PalsModelInput,
         trace: Option<&StartupRoleTrace>,
+        private: Option<&PalsWarmInput>,
     ) -> Result<PalsRawOutput, BackendError> {
         if let Some(cause) = &self.quarantine {
             return Err(cause.clone());
+        }
+        match (&self.private_warm, private) {
+            (None, None) => {}
+            (Some(capability), Some(input)) => input.validate_for(capability)?,
+            _ => {
+                return Err(fail(
+                    K::UnsupportedModel,
+                    S::Admission,
+                    "PALS legacy and explicit private Warm graph invocation domains differ",
+                ))
+            }
         }
         self.cuda_mapping_audit.borrow().allow_run()?;
         if let Some(cause) = self
@@ -2425,9 +2467,11 @@ impl PalsOnnxBackend {
             })?;
         let key = prepared.public_memory_key;
         self.active = Some(
-            ActiveInputs::new(prepared, input.role == PalsRole::Critic).inspect_err(|_| {
-                startup_return(trace, PalsStartupBackendStage::InputPreparation, false);
-            })?,
+            ActiveInputs::new(prepared, input.role == PalsRole::Critic, private).inspect_err(
+                |_| {
+                    startup_return(trace, PalsStartupBackendStage::InputPreparation, false);
+                },
+            )?,
         );
         startup_return(trace, PalsStartupBackendStage::InputPreparation, true);
         self.stats.admitted_role_requests = self.stats.admitted_role_requests.saturating_add(1);
@@ -2827,7 +2871,9 @@ impl PalsOnnxBackend {
         let shared = self.layout == Layout::SharedPcIf;
         self.stats.role_nn_runs_attempted = self.stats.role_nn_runs_attempted.saturating_add(1);
         startup_enter(trace, PalsStartupBackendStage::PrivateRun);
-        let result = if shared {
+        let result = if let Some(private) = &active.private_warm {
+            self.shared_pc.as_mut().expect("loaded CPU private Warm session").run(ort::inputs!["role_is_critic" => &active.role_is_critic, "memory_key" => &memory.memory_key, "memory_value" => &memory.memory_value, "memory_mask" => &memory.mask, "candidates" => &active.candidates, "candidate_mask" => &active.candidate_mask, "query" => &active.query, "divergence_features" => &active.divergences, "divergence_mask" => &active.divergence_mask, "initial_latent" => &private.initial_latent, "warm_start" => &private.warm_start])
+        } else if shared {
             self.shared_pc.as_mut().expect("loaded shared P/C session").run(ort::inputs!["role_is_critic" => &active.role_is_critic, "memory_key" => &memory.memory_key, "memory_value" => &memory.memory_value, "memory_mask" => &memory.mask, "candidates" => &active.candidates, "candidate_mask" => &active.candidate_mask, "query" => &active.query, "divergence_features" => &active.divergences, "divergence_mask" => &active.divergence_mask])
         } else if critic {
             self.critic.as_mut().expect("loaded critic session").run(ort::inputs!["memory_key" => &memory.memory_key, "memory_value" => &memory.memory_value, "memory_mask" => &memory.mask, "candidates" => &active.candidates, "candidate_mask" => &active.candidate_mask, "query" => &active.query, "divergence_features" => &active.divergences, "divergence_mask" => &active.divergence_mask])

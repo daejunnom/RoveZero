@@ -240,6 +240,7 @@ pub struct PrivateSeedLimits {
     /// One or two accepted seeds per role; no unbounded history of latents.
     pub slots_per_role: usize,
     /// Module-owned accepted seed/slot reservation, excluding backend buffers.
+    /// Includes one outward lease handle, including its fixed admitted model.
     pub max_bank_bytes: u64,
     /// Overlapping output conversion/provisional ownership, not observed peak.
     pub max_transient_bytes: u64,
@@ -388,6 +389,7 @@ impl PrivateSeedBank {
         })?;
         let base_bytes = backing
             .checked_add(size_of::<State>() as u64)
+            .and_then(|n| n.checked_add(size_of::<PrivateSeedLease>() as u64))
             .and_then(|n| n.checked_add(OWNER_OVERHEAD))
             .ok_or(PrivateSeedError::Budget)?;
         if base_bytes > limits.max_bank_bytes {
@@ -485,6 +487,7 @@ impl PrivateSeedBank {
             }
             .ok_or(PrivateSeedError::GenerationExhausted)?;
             let invocation = invocation(&request, seed.as_deref());
+            let model = request.model;
             check_control(cancelled, deadline)?;
             state.next_id = id;
             match mode {
@@ -505,6 +508,7 @@ impl PrivateSeedBank {
                 inner: self.inner.clone(),
                 id,
                 invocation,
+                model,
                 seed,
                 finalized: false,
             })
@@ -679,6 +683,7 @@ pub struct PrivateSeedLease {
     inner: Arc<Mutex<State>>,
     id: u64,
     invocation: PrivateInvocation,
+    model: PrivateModelIdentity,
     seed: Option<Arc<Seed>>,
     finalized: bool,
 }
@@ -688,6 +693,11 @@ impl PrivateSeedLease {
     }
     pub fn invocation(&self) -> PrivateInvocation {
         self.invocation
+    }
+    /// The full identity admitted by `begin`, including Fresh leases with no
+    /// seed provenance. Fixed-size copying performs no allocation or locking.
+    pub fn model_identity(&self) -> PrivateModelIdentity {
+        self.model
     }
     pub fn seed_bits(&self) -> Option<&[u32]> {
         self.seed.as_ref().map(|s| s.bits.as_ref())
@@ -1210,6 +1220,22 @@ mod tests {
         (result, values)
     }
 
+    #[test]
+    fn base_reservation_accounts_for_the_full_outward_lease_identity() {
+        let bank = PrivateSeedBank::new(limits(), 1).unwrap();
+        let reserved = bank.snapshot().unwrap().reserved_bank_bytes;
+        let lease_and_owner =
+            size_of::<State>() as u64 + size_of::<PrivateSeedLease>() as u64 + OWNER_OVERHEAD;
+        assert!(reserved >= lease_and_owner);
+        let mut exact = limits();
+        exact.max_bank_bytes = reserved;
+        assert!(PrivateSeedBank::new(exact, 1).is_ok());
+        exact.max_bank_bytes -= 1;
+        assert!(matches!(
+            PrivateSeedBank::new(exact, 1),
+            Err(PrivateSeedError::Budget)
+        ));
+    }
     #[test]
     fn actual_seed_consumption_changes_output_and_preserves_fresh_keys() {
         let position = Position::startpos();
