@@ -298,6 +298,14 @@ impl OrtRuntime {
         self.pin.bundle_files()
     }
 
+    /// Audit the explicitly preloaded NVIDIA dependencies before constructing a
+    /// CUDA session. ORT provider images may load lazily during the first CUDA
+    /// Run; callers must use the full audit after that Run and its completion
+    /// fence succeed. This does not initialize a provider or prove completion.
+    pub fn verify_cuda_dependencies(&self) -> Result<(), BackendError> {
+        self.verify_cuda_mappings(false)
+    }
+
     /// Recheck all resident bundle images after later numerical/worker calls,
     /// before accepting their final GPU report. This is an origin audit, not a
     /// completion fence, VRAM measurement or device-drain operation.

@@ -270,7 +270,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         cache.library(Path::new(&args[2]), &args[3])?
     };
-    let runtime = OrtRuntime::load(&pin)?;
+    let runtime = OrtRuntime::load(&pin).map_err(|mut failure| {
+        if is_cuda {
+            failure.detail = "PALS CUDA runtime bootstrap failed before session creation";
+        }
+        failure
+    })?;
     let runtime_digest = runtime.binary_digest();
     let mut config = PalsOnnxConfig::cpu();
     if is_cuda {
@@ -359,6 +364,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             PhysicalPoll::Ready(Ok(PalsNativeResult::Stats(_))) => {
                 return Err("cache reset unexpectedly returned native statistics".into())
             }
+            PhysicalPoll::Ready(Ok(PalsNativeResult::RuntimeVerified)) => {
+                return Err("cache reset unexpectedly returned runtime verification".into())
+            }
             PhysicalPoll::Quarantined => {
                 return Err("new game cache reset remains quarantined".into())
             }
@@ -386,6 +394,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     PalsNativeResult::Stats(_) => {
                         return Err("evaluation unexpectedly returned native statistics".into())
                     }
+                    PalsNativeResult::RuntimeVerified => {
+                        return Err("evaluation unexpectedly returned runtime verification".into())
+                    }
                 }
                 break;
             }
@@ -399,6 +410,29 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err("physical lease still live at finite check deadline".into());
         }
         std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut verification = worker.submit(PalsNativeCommand::VerifyRuntime)?;
+    let verification_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match verification.poll() {
+            PhysicalPoll::Ready(Ok(PalsNativeResult::RuntimeVerified)) => break,
+            PhysicalPoll::Ready(Err(error)) => return Err(error.into()),
+            PhysicalPoll::Ready(Ok(_)) => {
+                return Err("runtime verification returned another command response".into())
+            }
+            PhysicalPoll::Quarantined => {
+                return Err(
+                    "runtime verification cannot confirm unknown physical completion".into(),
+                )
+            }
+            PhysicalPoll::Consumed => return Err("runtime verification completed twice".into()),
+            PhysicalPoll::Pending if Instant::now() < verification_deadline => {
+                std::thread::sleep(Duration::from_millis(1))
+            }
+            PhysicalPoll::Pending => {
+                return Err("runtime verification has no physical ACK before deadline".into())
+            }
+        }
     }
     let mut snapshot = worker.submit(PalsNativeCommand::SnapshotStats)?;
     let stats_deadline = Instant::now() + Duration::from_secs(30);
@@ -455,6 +489,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "public_counter_scope":"six_reference_cases_before_new_game_checks",
         "v_rejection":"passed","new_game_cache_reset":"passed","new_game_physical_ack":"confirmed",
         "stats_physical_ack":"confirmed","control_neural_runs":"zero","backend_stats":stats_json(&stats),
+        "runtime_verify_physical_ack":"confirmed",
         "backend_stats_scope":"backend_lifetime_through_final_snapshot_ack",
         "device_public_memory":config.device_public_memory,"session_residency":residency,"vram_peak":"unknown","cases":reports});
     let mut output = std::fs::OpenOptions::new()

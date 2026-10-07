@@ -19,6 +19,7 @@ use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::tensor::TensorElementType;
 use ort::value::{Tensor, ValueType};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
 
@@ -306,6 +307,64 @@ fn validate_role_tag(shape: &[i64], values: &[bool], critic: bool) -> Result<(),
     }
     Ok(())
 }
+#[derive(Default)]
+enum CudaMappingAudit {
+    #[default]
+    AwaitingFirstRun,
+    Confirmed,
+    Rejected(BackendError),
+}
+impl CudaMappingAudit {
+    fn allow_run(&self) -> Result<(), BackendError> {
+        match self {
+            Self::Rejected(cause) => Err(cause.clone()),
+            _ => Ok(()),
+        }
+    }
+    fn after_run(
+        &mut self,
+        completed: bool,
+        full_audit: impl FnOnce() -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        self.allow_run()?;
+        if !completed || matches!(self, Self::Confirmed) {
+            return Ok(());
+        }
+        match full_audit() {
+            Ok(()) => {
+                *self = Self::Confirmed;
+                Ok(())
+            }
+            Err(mut failure) => {
+                failure.detail = "PALS CUDA full mapping audit failed after completed native Run";
+                *self = Self::Rejected(failure.clone());
+                Err(failure)
+            }
+        }
+    }
+    fn final_audit(
+        &mut self,
+        full_audit: impl FnOnce() -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        self.allow_run()?;
+        if !matches!(self, Self::Confirmed) {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Backend,
+                "PALS full CUDA audit requires a completed native Run",
+            ));
+        }
+        match full_audit() {
+            Ok(()) => Ok(()),
+            Err(mut failure) => {
+                failure.detail =
+                    "PALS CUDA final full mapping audit failed after completed native Run";
+                *self = Self::Rejected(failure.clone());
+                Err(failure)
+            }
+        }
+    }
+}
 
 fn validate_declared_interface(
     values: &[TensorManifest],
@@ -537,7 +596,7 @@ fn validate_reader_bank(bank: &ReaderInitializerBank) -> Result<(), BackendError
             || entry.parameter.len() > 256
             || entry.initializer.len() > 256
             || entry.shape.len() > 8
-            || entry.shape.iter().any(|dim| *dim == 0)
+            || entry.shape.contains(&0)
             || elements.and_then(|n| n.checked_mul(4)) != Some(entry.bytes)
             || !parameters.insert(entry.parameter.as_str())
             || !initializers.insert(entry.initializer.as_str())
@@ -843,15 +902,21 @@ pub struct PalsPublicMemoryWitness {
 /// Cache reset is a physical-worker command so a completed NewGame response
 /// proves the old cache was retired after the preceding native execution.
 /// It neither reloads weights nor invokes a neural graph.
+// Exactly one exclusive physical worker owns at most one in-flight command.
+// Keep its bounded input inline rather than adding a Box allocation to every
+// role request merely to match the zero-payload control variants' size.
+#[allow(clippy::large_enum_variant)]
 pub enum PalsNativeCommand {
     Evaluate(PalsModelInput),
     NewGame,
     SnapshotStats,
+    VerifyRuntime,
 }
 pub enum PalsNativeResult {
     Evaluation(PalsRawOutput),
     NewGame,
     Stats(PalsBackendStats),
+    RuntimeVerified,
 }
 /// Native graph evidence, cumulative across games for one frozen backend.
 /// These are typed counters; a caller must choose its own receipt schema.
@@ -948,6 +1013,7 @@ pub struct PalsOnnxBackend {
     rules_input_semantic_sha256: Option<[u8; 32]>,
     residency: PalsSessionResidency,
     stats: PalsBackendStats,
+    cuda_mapping_audit: RefCell<CudaMappingAudit>,
     memory: Option<PublicMemory>,
     active: Option<ActiveInputs>,
     #[cfg(feature = "experimental-io-binding")]
@@ -1005,7 +1071,13 @@ impl PalsOnnxBackend {
                     "PALS provider and verified native runtime bundle differ",
                 ))
             }
-            (Provider::Cuda { .. }, Some(_)) => runtime.verify_cuda_runtime_mappings()?,
+            (Provider::Cuda { .. }, Some(_)) => {
+                runtime.verify_cuda_dependencies().map_err(|mut failure| {
+                    failure.detail =
+                        "PALS CUDA dependency mapping audit failed before session creation";
+                    failure
+                })?
+            }
             _ => {}
         }
         let parent = path.parent().ok_or_else(|| {
@@ -1084,6 +1156,7 @@ impl PalsOnnxBackend {
                 vram_peak_bytes: None,
             },
             stats: PalsBackendStats::default(),
+            cuda_mapping_audit: RefCell::default(),
             memory: None,
             active: None,
             quarantine: None,
@@ -1100,6 +1173,12 @@ impl PalsOnnxBackend {
     }
     pub fn manifest_digest(&self) -> [u8; 32] {
         self.manifest_digest
+    }
+    pub fn runtime_binary_digest(&self) -> [u8; 32] {
+        self.runtime.binary_digest()
+    }
+    pub fn runtime_bundle_digest(&self) -> Option<[u8; 32]> {
+        self.runtime.bundle_digest()
     }
     /// Export provenance declaration only. Loading a checkpoint cannot attest
     /// that the declared optimizer steps were actually executed.
@@ -1210,7 +1289,9 @@ impl PalsOnnxBackend {
     }
     pub fn verify_runtime(&self) -> Result<(), BackendError> {
         if matches!(self.config.provider, Provider::Cuda { .. }) {
-            self.runtime.verify_cuda_runtime_mappings()?;
+            self.cuda_mapping_audit
+                .borrow_mut()
+                .final_audit(|| self.runtime.verify_cuda_runtime_mappings())?;
         }
         Ok(())
     }
@@ -1241,6 +1322,9 @@ impl PalsOnnxBackend {
                 PalsNativeCommand::SnapshotStats => {
                     self.snapshot_stats().map(PalsNativeResult::Stats)
                 }
+                PalsNativeCommand::VerifyRuntime => self
+                    .verify_runtime()
+                    .map(|()| PalsNativeResult::RuntimeVerified),
             };
             match self.quarantine.as_ref() {
                 Some(cause) => PhysicalRun::Quarantined(cause.clone()),
@@ -1252,6 +1336,7 @@ impl PalsOnnxBackend {
         if let Some(cause) = &self.quarantine {
             return Err(cause.clone());
         }
+        self.cuda_mapping_audit.borrow().allow_run()?;
         input.validate(&self.model_config).map_err(model_input)?;
         if input.model_epoch != self.epoch {
             return Err(fail(
@@ -1285,6 +1370,18 @@ impl PalsOnnxBackend {
         };
         if self.quarantine.is_none() {
             self.active = None;
+        }
+        if matches!(self.config.provider, Provider::Cuda { .. }) {
+            // `run_active`'s synchronous Run or `run_device`'s output sync has
+            // physically completed. ORT provider images can now be required;
+            // this one-time audit must never preempt session creation, and is
+            // not a per-node mapping scan. A failed origin audit is latched but
+            // does not mislabel this already-fenced execution as unknown.
+            self.cuda_mapping_audit
+                .borrow_mut()
+                .after_run(result.is_ok(), || {
+                    self.runtime.verify_cuda_runtime_mappings()
+                })?;
         }
         result
     }
@@ -2227,5 +2324,86 @@ mod tests {
         stats.validated_role_outputs = 2;
         stats.live_public_cache_entries = 2;
         assert!(stats.validate().is_err());
+    }
+    #[test]
+    fn cuda_full_audit_waits_for_completed_run_and_latches_origin_failure() {
+        let mut phase = CudaMappingAudit::default();
+        phase.allow_run().unwrap();
+        phase
+            .after_run(false, || {
+                panic!("provider images cannot be required before a completed Run")
+            })
+            .unwrap();
+        assert!(matches!(phase, CudaMappingAudit::AwaitingFirstRun));
+        let calls = std::cell::Cell::new(0);
+        phase
+            .after_run(true, || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        phase
+            .after_run(true, || panic!("full origin audit is not a per-node scan"))
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(matches!(phase, CudaMappingAudit::Confirmed));
+        let mut rejected = CudaMappingAudit::default();
+        let failure = rejected
+            .after_run(true, || {
+                Err(fail(
+                    K::BackendUnavailable,
+                    S::Backend,
+                    "missing provider mapping",
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(
+            failure.detail,
+            "PALS CUDA full mapping audit failed after completed native Run"
+        );
+        assert_eq!(rejected.allow_run().unwrap_err(), failure);
+        assert_eq!(
+            rejected
+                .after_run(true, || panic!(
+                    "failed origin audit cannot be retried into success"
+                ))
+                .unwrap_err(),
+            failure
+        );
+        let mut final_rejected = CudaMappingAudit::default();
+        assert!(final_rejected
+            .final_audit(|| panic!(
+                "final audit cannot require lazy provider images before first Run"
+            ))
+            .is_err());
+        final_rejected.after_run(true, || Ok(())).unwrap();
+        let failure = final_rejected
+            .final_audit(|| {
+                Err(fail(
+                    K::BackendUnavailable,
+                    S::Backend,
+                    "late mapping origin changed",
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(
+            failure.detail,
+            "PALS CUDA final full mapping audit failed after completed native Run"
+        );
+        assert_eq!(final_rejected.allow_run().unwrap_err(), failure);
+        assert_eq!(
+            final_rejected
+                .after_run(true, || panic!(
+                    "no new Run may be admitted after final origin failure"
+                ))
+                .unwrap_err(),
+            failure
+        );
+        assert_eq!(
+            final_rejected
+                .final_audit(|| panic!("final origin failure cannot be retried into success"))
+                .unwrap_err(),
+            failure
+        );
     }
 }
