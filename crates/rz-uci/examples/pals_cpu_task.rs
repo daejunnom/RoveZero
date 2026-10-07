@@ -1,9 +1,11 @@
 //! One bounded JSON V task, --candidate-only fresh single-candidate check, or
-//! --prepare-semantic Rules-only branch preparation. Modes are exclusive.
+//! --prepare-semantic Rules-only preparation, or --line-continuation factual
+//! whole-line/endpoint check. Modes are exclusive.
 //! No child UCI engine/GPU/model/teacher is launched.
 use rz_uci::pals_cpu_task::candidate::{
     self, CandidateRawReport, CandidateReceipt, CandidateTaskError,
 };
+use rz_uci::pals_cpu_task::continuation::{self, ContinuationError, ContinuationReceipt};
 use rz_uci::pals_cpu_task::semantic::{self, SemanticError, SemanticReceipt};
 use rz_uci::pals_cpu_task::{
     CpuTaskError, MAX_REQUEST_BYTES, MAX_SELF_BINARY_BYTES, MAX_WALL_TIME_MS, capabilities,
@@ -128,6 +130,7 @@ enum CliMode {
     Verifier,
     Candidate,
     Semantic,
+    Continuation,
 }
 
 struct CliContext {
@@ -141,12 +144,14 @@ struct CliContext {
     // Only an actual completed preparation is retained. Its presence in a
     // transport error is diagnostic, never successful delivery or CPU work.
     semantic_receipt: Option<Box<SemanticReceipt>>,
+    continuation_receipt: Option<Box<ContinuationReceipt>>,
 }
 
 enum CliError {
     V(CpuTaskError),
     Candidate(CandidateTaskError),
     Semantic(SemanticError),
+    Continuation(ContinuationError),
 }
 
 impl CliContext {
@@ -163,6 +168,13 @@ impl CliContext {
                 let mut error = SemanticError::new(error.stage, error.message);
                 error.receipt = self.semantic_receipt.clone();
                 CliError::Semantic(error)
+            }
+            CliMode::Continuation => {
+                let mut error = ContinuationError::new(error.stage, error.message);
+                if let Some(receipt) = &self.continuation_receipt {
+                    error = error.with_receipt(receipt);
+                }
+                CliError::Continuation(error)
             }
             CliMode::Verifier => CliError::V(error),
         }
@@ -189,9 +201,13 @@ fn arguments(args: &[String]) -> Result<(CliMode, bool), CpuTaskError> {
         [a, b] if a == "--prepare-semantic" && b == "--capabilities" => {
             Ok((CliMode::Semantic, true))
         }
+        [a] if a == "--line-continuation" => Ok((CliMode::Continuation, false)),
+        [a, b] if a == "--line-continuation" && b == "--capabilities" => {
+            Ok((CliMode::Continuation, true))
+        }
         _ => Err(failure(
             "arguments",
-            "supported modes: no arguments, --capabilities, --candidate-only [--capabilities], --prepare-semantic [--capabilities]; modes are exclusive and ordered",
+            "supported modes: no arguments, --capabilities, --candidate-only [--capabilities], --prepare-semantic [--capabilities], --line-continuation [--capabilities]; modes are exclusive and ordered",
         )),
     }
 }
@@ -215,6 +231,7 @@ fn run(context: &mut CliContext) -> Result<Vec<u8>, CliError> {
     context.mode = match args.first().map(String::as_str) {
         Some("--candidate-only") => CliMode::Candidate,
         Some("--prepare-semantic") => CliMode::Semantic,
+        Some("--line-continuation") => CliMode::Continuation,
         _ => CliMode::Verifier,
     };
     let (mode, show_capabilities) = arguments(&args).map_err(|e| context.transport_error(e))?;
@@ -230,8 +247,11 @@ fn run(context: &mut CliContext) -> Result<Vec<u8>, CliError> {
             CliMode::Verifier => capabilities().map_err(CliError::V)?,
             CliMode::Candidate => candidate::capabilities().map_err(CliError::Candidate)?,
             CliMode::Semantic => semantic::capabilities().map_err(CliError::Semantic)?,
+            CliMode::Continuation => {
+                continuation::capabilities().map_err(CliError::Continuation)?
+            }
         };
-        if mode == CliMode::Semantic {
+        if matches!(mode, CliMode::Semantic | CliMode::Continuation) {
             context.output_limit = 8192;
         }
         let mut value: serde_json::Value = serde_json::from_slice(&capabilities)
@@ -247,10 +267,12 @@ fn run(context: &mut CliContext) -> Result<Vec<u8>, CliError> {
         let mut result = serde_json::to_vec(&value)
             .map_err(|e| context.transport_error(failure("capabilities", e)))?;
         result.push(b'\n');
-        if mode == CliMode::Semantic && result.len() > context.output_limit {
+        if matches!(mode, CliMode::Semantic | CliMode::Continuation)
+            && result.len() > context.output_limit
+        {
             return Err(context.transport_error(failure(
                 "capabilities",
-                "CLI semantic capabilities exceed the finite 8KiB output bound",
+                "CLI private-check capabilities exceed the finite 8KiB output bound",
             )));
         }
         return Ok(result);
@@ -270,6 +292,10 @@ fn run(context: &mut CliContext) -> Result<Vec<u8>, CliError> {
             let admission = admit_semantic(&bytes, context)?;
             (admission.deadline, admission.output_limit)
         }
+        CliMode::Continuation => {
+            let admission = admit_continuation(&bytes, context)?;
+            (admission.deadline, admission.output_limit)
+        }
     };
     context.deadline = deadline;
     context.output_limit = output_limit;
@@ -279,6 +305,9 @@ fn run(context: &mut CliContext) -> Result<Vec<u8>, CliError> {
     }
     if mode == CliMode::Semantic {
         return prepare_semantic(&bytes, &binary, context);
+    }
+    if mode == CliMode::Continuation {
+        return check_continuation(&bytes, &binary, context);
     }
     let bytes =
         candidate::dispatch_started(&bytes, &binary, started).map_err(CliError::Candidate)?;
@@ -390,6 +419,84 @@ fn prepare_semantic(
     Ok(output)
 }
 
+fn admit_continuation(
+    bytes: &[u8],
+    context: &mut CliContext,
+) -> Result<rz_uci::pals_cpu_task::CpuTaskAdmission, CliError> {
+    continuation::request_admission(bytes, context.started).map_err(|error| {
+        if error.deadline_exceeded {
+            // Expired admitted wall time never inherits the larger stdin clock
+            // as diagnostic output grace, even when admission returned no value.
+            context.deadline = context.deadline.min(context.started);
+        }
+        CliError::Continuation(error)
+    })
+}
+
+fn check_continuation(
+    bytes: &[u8],
+    verified_binary: &str,
+    context: &mut CliContext,
+) -> Result<Vec<u8>, CliError> {
+    let output = match continuation::dispatch_started(bytes, verified_binary, context.started) {
+        Ok(output) => output,
+        Err(mut error) => {
+            if let Some(receipt) = &mut error.receipt {
+                receipt.binary_pin_scope = cli_binary_scope().into();
+                context.continuation_receipt = Some(receipt.clone());
+            }
+            return Err(CliError::Continuation(error));
+        }
+    };
+    let mut receipt: ContinuationReceipt = serde_json::from_slice(&output)
+        .map_err(|error| context.transport_error(failure("continuation_receipt", error)))?;
+    receipt.binary_pin_scope = cli_binary_scope().into();
+    receipt.elapsed_ms = context
+        .started
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    context.continuation_receipt = Some(Box::new(receipt.clone()));
+    if receipt.schema != continuation::CONTINUATION_SCHEMA
+        || receipt.cpu_binary_sha256 != verified_binary
+        || receipt.cpu_calls > 1
+        || receipt.cpu_calls != u8::from(receipt.report.is_some())
+        || receipt.fresh_engine != receipt.report.is_some()
+        || receipt.conditions.resource_policy.max_checks != 1
+        || receipt.conditions.resource_policy.max_output_bytes != context.output_limit
+        || !receipt.line_rules_validated
+        || receipt.line.is_empty()
+        || receipt.line.len() > continuation::MAX_LINE_PLIES
+        || receipt.training_target_created
+        || receipt.product_verifier_enabled
+        || receipt.deadline_exceeded
+        || context.started.checked_add(Duration::from_millis(
+            receipt.conditions.resource_policy.max_wall_time_ms,
+        )) != Some(context.deadline)
+    {
+        return Err(context.transport_error(failure(
+            "continuation_receipt",
+            "actual continuation identity, one-check scope or original clock differs",
+        )));
+    }
+    let mut output = serde_json::to_vec(&receipt)
+        .map_err(|error| context.transport_error(failure("continuation_receipt", error)))?;
+    output.push(b'\n');
+    if output.len() > context.output_limit {
+        return Err(context.transport_error(failure(
+            "output_bound",
+            "CLI continuation receipt exceeds admitted output bound",
+        )));
+    }
+    if Instant::now() >= context.deadline {
+        return Err(context.transport_error(failure(
+            "receipt_deadline",
+            "original absolute wall allowance expired after CLI image observation",
+        )));
+    }
+    Ok(output)
+}
+
 fn bounded_write<W: Write + Send + 'static>(
     mut writer: W,
     bytes: Vec<u8>,
@@ -467,6 +574,7 @@ fn main() -> ExitCode {
         mode: CliMode::Verifier,
         candidate_report: None,
         semantic_receipt: None,
+        continuation_receipt: None,
     };
     match run(&mut context) {
         Ok(bytes) => {
@@ -558,6 +666,50 @@ fn write_error(error: CliError, context: &CliContext) -> ExitCode {
             }
             bytes
         }
+        CliError::Continuation(mut error) => {
+            error.elapsed_ms = Some(
+                context
+                    .started
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
+            error.deadline_exceeded |= Instant::now() >= context.deadline;
+            error.output_limit = context.output_limit;
+            if error.receipt.is_none() {
+                if let Some(receipt) = &context.continuation_receipt {
+                    error = error.with_receipt(receipt);
+                }
+            }
+            let mut bytes = serde_json::to_vec(&error).unwrap_or_else(|_| {
+                b"{\"code\":\"cpu_line_continuation_error_serialization_failed\"}".to_vec()
+            });
+            if bytes.len() + 1 > error.output_limit {
+                bytes = serde_json::to_vec(&json!({"schema":error.schema,"code":error.code,
+                    "stage":error.stage,"known_nodes":error.known_nodes,
+                    "failed_check_work":error.failed_check_work,"report_present":error.report.is_some(),
+                    "receipt_present":error.receipt.is_some(),"cpu_calls":error.cpu_calls,
+                    "context_sha256":error.receipt.as_ref().map(|receipt|&receipt.context_sha256),
+                    "line_sha256":error.receipt.as_ref().map(|receipt|&receipt.line_sha256),
+                    "cpu_binary_sha256":error.receipt.as_ref().map(|receipt|&receipt.cpu_binary_sha256),
+                    "binary_pin_scope":error.receipt.as_ref().map(|receipt|&receipt.binary_pin_scope),
+                    "elapsed_ms":error.elapsed_ms,"deadline_exceeded":error.deadline_exceeded,
+                    "full_error_omitted_for_output_bound":true}))
+                    .unwrap_or_else(|_|b"{\"code\":\"cpu_line_continuation_failed\"}".to_vec());
+            }
+            if bytes.len() + 1 > error.output_limit {
+                // Identity-rich diagnostics may need a smaller work-only
+                // diagnostic under the same original admitted output bound.
+                bytes = serde_json::to_vec(&json!({"schema":error.schema,"code":error.code,
+                    "stage":error.stage,"known_nodes":error.known_nodes,
+                    "failed_check_work":error.failed_check_work,"cpu_calls":error.cpu_calls,
+                    "report_present":error.report.is_some(),"receipt_present":error.receipt.is_some(),
+                    "elapsed_ms":error.elapsed_ms,"deadline_exceeded":error.deadline_exceeded,
+                    "full_error_omitted_for_output_bound":true}))
+                    .unwrap_or_else(|_|b"{\"code\":\"cpu_line_continuation_failed\"}".to_vec());
+            }
+            bytes
+        }
     };
     bytes.push(b'\n');
     // No extra output grace after the original absolute wall allowance.
@@ -601,6 +753,7 @@ mod tests {
             mode: CliMode::Verifier,
             candidate_report: None,
             semantic_receipt: None,
+            continuation_receipt: None,
         };
         let error = annotate(failure("self_binary", "deadline expired"), &context);
         assert!(error.deadline_exceeded);
@@ -724,6 +877,7 @@ mod tests {
             mode: CliMode::Semantic,
             candidate_report: None,
             semantic_receipt: None,
+            continuation_receipt: None,
         };
         let output = match prepare_semantic(&bytes, &binary, &mut context) {
             Ok(output) => output,
@@ -773,6 +927,7 @@ mod tests {
             mode: CliMode::Semantic,
             candidate_report: None,
             semantic_receipt: None,
+            continuation_receipt: None,
         };
         assert!(prepare_semantic(&bytes, &binary, &mut context).is_ok());
         // The direct writer expiry fixture checks typed final-delivery routing.
@@ -801,6 +956,7 @@ mod tests {
             mode: CliMode::Semantic,
             candidate_report: None,
             semantic_receipt: None,
+            continuation_receipt: None,
         };
         let error = match admit_semantic(&bytes, &mut context) {
             Err(CliError::Semantic(error)) => error,
@@ -818,5 +974,183 @@ mod tests {
         assert_eq!(output.unwrap_err().stage, "output_deadline");
         // The expired check dropped the writer without dispatching a worker.
         assert!(send.send(()).is_err());
+    }
+
+    #[test]
+    fn continuation_mode_is_exclusive_and_keeps_legacy_schemas_unchanged() {
+        assert_eq!(
+            arguments(&["--line-continuation".into()]).unwrap(),
+            (CliMode::Continuation, false)
+        );
+        assert_eq!(
+            arguments(&["--line-continuation".into(), "--capabilities".into()]).unwrap(),
+            (CliMode::Continuation, true)
+        );
+        for flags in [
+            vec!["--line-continuation", "--candidate-only"],
+            vec!["--candidate-only", "--line-continuation"],
+            vec!["--line-continuation", "--prepare-semantic"],
+            vec!["--prepare-semantic", "--line-continuation"],
+            vec!["--capabilities", "--line-continuation"],
+            vec!["--line-continuation", "--line-continuation"],
+        ] {
+            assert!(arguments(&flags.into_iter().map(str::to_owned).collect::<Vec<_>>()).is_err());
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&continuation::capabilities().unwrap()).unwrap();
+        assert_eq!(value["schema"], continuation::CONTINUATION_SCHEMA);
+        assert_eq!(value["max_checks"], 1);
+        assert_eq!(value["terminal_checks"], 0);
+        assert_eq!(value["max_line_plies"], 64);
+        assert_eq!(value["training_target_created"], false);
+        assert_eq!(value["ranking_created"], false);
+        let legacy: serde_json::Value = serde_json::from_slice(&capabilities().unwrap()).unwrap();
+        assert_eq!(legacy["schema"], "rz-pals-private-cpu-task/1");
+        assert_eq!(legacy["max_checks"], 2);
+    }
+
+    fn continuation_rules_request(binary: &str) -> continuation::LineContinuationRequest {
+        use rz_contracts::pals::Move16;
+        use rz_position::Position;
+        use rz_position::contracts::ContractPosition;
+        use rz_uci::engine::OwnerRegistry;
+        use rz_uci::pals_native::pals_history_digest;
+
+        let owners = OwnerRegistry::default();
+        let root_position = Position::startpos();
+        let root = ContractPosition::new(owners.allocate().unwrap(), root_position.clone());
+        let root_view = root.export().unwrap();
+        let movement = root_view
+            .legal_moves()
+            .moves()
+            .iter()
+            .copied()
+            .find(|movement| {
+                rz_position::BoardMove::try_from(*movement)
+                    .unwrap()
+                    .to_string()
+                    == "e2e4"
+            })
+            .unwrap();
+        let endpoint = root
+            .fork_from_view(owners.allocate().unwrap(), &root_view, movement)
+            .unwrap();
+        // No second application: export the child made by the actual Rules fork.
+        let endpoint_view = endpoint.export().unwrap();
+        let hex = |digest: &[u8; 32]| {
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let mut request = continuation::LineContinuationRequest {
+            schema: continuation::CONTINUATION_SCHEMA.into(),
+            task_id: "cli-line-fixture".into(),
+            captured_input_sha256: "1".repeat(64),
+            checker_namespace_sha256: "2".repeat(64),
+            before_result_anchor_sha256: "3".repeat(64),
+            frozen_epoch: 4,
+            input_revision: 5,
+            position_command: "position startpos".into(),
+            expected_root_board_fen: root_position.to_fen(),
+            root_rules_state_sha256: hex(&root_view.snapshot().identity().semantic.0),
+            root_rules_history_sha256: hex(&pals_history_digest(&root_position).unwrap()),
+            expected_root_legal_moves: root_view
+                .legal_moves()
+                .moves()
+                .iter()
+                .map(|movement| Move16::encode(*movement).bits())
+                .collect(),
+            root_side_to_move: semantic::SideToMove::White,
+            line: vec![Move16::encode(movement).bits()],
+            line_sha256: String::new(),
+            expected_endpoint_board_fen: endpoint.position().to_fen(),
+            endpoint_rules_state_sha256: hex(&endpoint_view.snapshot().identity().semantic.0),
+            endpoint_rules_history_sha256: hex(&pals_history_digest(endpoint.position()).unwrap()),
+            expected_endpoint_legal_moves: endpoint_view
+                .legal_moves()
+                .moves()
+                .iter()
+                .map(|movement| Move16::encode(*movement).bits())
+                .collect(),
+            endpoint_side_to_move: semantic::SideToMove::Black,
+            cpu_binary_sha256: binary.into(),
+            cpu_profile_sha256: String::new(),
+            horizon: 1,
+            node_budget: 100_000,
+            tt_entries: 64,
+            quiescence_ply: 8,
+            max_wall_time_ms: 10_000,
+            max_output_bytes: 1024 * 1024,
+            context_sha256: String::new(),
+        };
+        request.cpu_profile_sha256 = continuation::profile_sha256(&request).unwrap();
+        request.line_sha256 = continuation::line_sha256(&request).unwrap();
+        request.context_sha256 = continuation::request_context_sha256(&request).unwrap();
+        request
+    }
+
+    #[test]
+    fn continuation_delivery_failure_retains_actual_endpoint_work_and_image_scope() {
+        let binary = "a".repeat(64);
+        let bytes = serde_json::to_vec(&continuation_rules_request(&binary)).unwrap();
+        let started = Instant::now();
+        let admission = continuation::request_admission(&bytes, started).unwrap();
+        let mut context = CliContext {
+            started,
+            deadline: admission.deadline,
+            output_limit: admission.output_limit,
+            mode: CliMode::Continuation,
+            candidate_report: None,
+            semantic_receipt: None,
+            continuation_receipt: None,
+        };
+        let output = match check_continuation(&bytes, &binary, &mut context) {
+            Ok(output) => output,
+            Err(_) => panic!("whole-line CLI fixture failed"),
+        };
+        let receipt: ContinuationReceipt = serde_json::from_slice(&output).unwrap();
+        assert_eq!(receipt.binary_pin_scope, cli_binary_scope());
+        assert_eq!(receipt.cpu_calls, 1);
+        let CliError::Continuation(error) =
+            context.transport_error(failure("output", "delivery failed"))
+        else {
+            panic!("continuation delivery lost its typed diagnostic");
+        };
+        assert_eq!(error.cpu_calls, 1);
+        let retained = error.receipt.as_ref().unwrap();
+        assert_eq!(retained.context_sha256, receipt.context_sha256);
+        assert_eq!(retained.line_sha256, receipt.line_sha256);
+        assert_eq!(retained.binary_pin_scope, cli_binary_scope());
+        assert_eq!(
+            error.known_nodes.as_deref(),
+            Some(&receipt.report.unwrap().nodes)
+        );
+    }
+
+    #[test]
+    fn expired_continuation_admission_never_grants_outer_clock_diagnostic_grace() {
+        let mut request = continuation_rules_request(&"a".repeat(64));
+        request.max_wall_time_ms = 1;
+        request.context_sha256 = continuation::request_context_sha256(&request).unwrap();
+        let started = Instant::now() - Duration::from_millis(25);
+        let mut context = CliContext {
+            started,
+            deadline: started + Duration::from_millis(MAX_WALL_TIME_MS),
+            output_limit: 1024,
+            mode: CliMode::Continuation,
+            candidate_report: None,
+            semantic_receipt: None,
+            continuation_receipt: None,
+        };
+        let error = match admit_continuation(&serde_json::to_vec(&request).unwrap(), &mut context) {
+            Err(CliError::Continuation(error)) => error,
+            _ => panic!("expired continuation was admitted"),
+        };
+        assert_eq!(error.stage, "admission_deadline");
+        assert!(error.deadline_exceeded);
+        assert_eq!(error.cpu_calls, 0);
+        assert_eq!(context.deadline, started);
+        assert!(context.continuation_receipt.is_none());
     }
 }

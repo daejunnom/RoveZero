@@ -47,7 +47,7 @@ CPU가 중단됐을 때 남은 completed depth와 frontier estimate를 구분하
 | 제한된 작업·저장소·중요 기록 | 모델 입력은 record 128·후보 256·이탈 지점 128 상한이며 required critical record 누락을 거부한다. 상황·line·관측·작업·큐·실행의 별도 유한 한도를 지킨다. |
 | 실제 shared P/C reader 소유 | `public_memory`+`shared_pc_if` 두 session export와 native 소비 경로를 구현했다. 공유 reader·후보 임베딩 initializer는 outer scope 한 벌이며 private 초기 latent·4 FFN·head는 6개 ONNX `If`로 hard route한다. |
 | 공개 K/V 재사용과 GPU 상주 | 역할 중립 key와 cache-on/off 수치 대조 접점, bounded host page bank 및 device K/V/I/O binding 경로를 준비했다. 현재 확인한 host page는 전체 입력 단위이며 record별 증분 인코딩이 아니다. 실제 device 상주·prepack 복제·VRAM 공유는 별도 인수 대상이다. |
-| CPU/GPU 작업 겹치기와 private warm-start | 현재 native 역할 응답은 drain 후 반환하는 안전 경계다. CPU–GPU overlap 및 warm private latent의 의미·오차·효과는 미인수이며 현재 fresh 계산을 기준으로 남긴다. |
+| CPU/GPU 작업 겹치기와 private warm-start | 현재 native 역할 응답은 drain 후 반환하는 안전 경계다. CPU opt-in Warm의 기능·역할 namespace·취소·게임 reset·물리 수명은 아래 실제 Warm39에서 확인했다. GPU Warm·CPU–GPU overlap·속도·기력 효과는 미인수이며 기본은 Fresh다. |
 | 학습·resume·모델 교체 | own-source dataset·loss·recipe·zero-step AdamW·sampler/RNG/checkpoint·V-free export를 준비했다. 실제 CPU ORT P/C 수집과 별도 training-private V→CPU_T producer의 유한 실행을 확인했다. optimizer update 및 학습된 모델의 교체 일반화·강도는 미인수다. |
 
 현재 가중치는 seed로 만든 **무작위 초기 파라미터**다. 실제 neural forward와 결정적
@@ -1195,3 +1195,42 @@ peak는 unknown이다. GPU·backward·optimizer·학습은 실행하지 않았�
 Repair source `d891af4`의 [CI 37694038457](https://github.com/daejunnom/RoveZero/actions/runs/37694038457)는
 Linux·Windows·CPU bindings·model CPU 네 job 모두 성공했다. 위 public source lookup
 수정과 다음 Rust continuation은 각 새 SHA의 검사로 별도 관리한다.
+
+### 전체 ordered line의 Rules·CPU continuation 접점
+
+[`pals_cpu_task/continuation.rs`](../../crates/rz-uci/src/pals_cpu_task/continuation.rs)와
+배타적 `--line-continuation` CLI는 `rz-pals-owned-cpu-line-continuation/1`을 추가한다.
+기존 V task·candidate-only·semantic schema의 의미와 default mode를 유지한다.
+최대 64ply의 전체 ordered line을 Rules로 재생하며 합법적인 반복 move token을 보존한다.
+각 ply의 terminal·취소·원래 deadline을 확인하고 terminal 뒤 추가 move를 거절한다.
+root와 endpoint는 FEN·정확한 state·전체 known history·완전한 합법 수 순서·차례를
+각각 대조한다. line seal은 root state/history와 전체 순서를 포함한다.
+
+ongoing endpoint에서 fresh TT의 `Independent` bootstrap CPU를 한 번만 호출한다.
+실제 nodes·quiescence nodes·TT hits·completed depth·completion·score scope·PV를
+보존하고 endpoint에서 PV를 Rules로 재검증한다. raw score 관점은
+`endpoint_side_to_move`이며 root 부호나 line 간 전략적 rank로 자동 투영하지 않는다.
+terminal endpoint는 정확한 Rules descriptor와 CPU 0회·`report=null`을 반환한다.
+`training_target_created=false`, `product_verifier_enabled=false`를 유지한다.
+이 접점은 whole-line 합법성과 정확한 endpoint 검사의 사실이며 수선 성공·C 이탈
+ranking·WDL 목표·제품 V 활성화의 근거가 아니다.
+
+원래 CLI 시작 Instant의 deadline을 ingress·등록 실행 파일 확인·Rules 준비·CPU·
+report 검증·직렬화·bounded output에 이어 사용한다. search reserve는 원래 allowance에서
+차감한다. 실패는 실제 work/report/receipt를 가능한 범위에서 typed diagnostic으로
+보존하고 비관측 counter는 null이다. 이미 만료된 admission이나 delivery에 새 stderr
+grace를 주지 않는다. dispatcher 인수와 CLI self-image·외부 caller 등록/실행 증거는
+서로 다른 authority다.
+
+root65는 새 module 9개·CLI 전체 10개(신규 3개/기존 7개), `rz-uci` all-target/all-feature
+Clippy `-D warnings`, workspace format 검사를 통과했다. 독립 source freeze 재검토에서
+추가 must-fix는 없었다. managed scratch 종료·정리도 verified였다. CPU default build의
+기존 feature별 dead-code 경고는 all-feature Clippy 성공과 구분한다. 같은 검사를 고유
+표본으로 중복 합산하지 않는다. 원시 로그는 continuation 관리 경로의
+`continuation-lib-65.log`, `continuation-cli-65.log`, `continuation-clippy-65.log`와
+`continuation-format-65.log`다.
+
+현재 확인은 library·CLI correctness 범위이며, 새 source의 등록된 실제 continuation
+child·독립 durable caller anchor·후속 비교 소비는 아직 미실행이다. 실제 비학습
+Repair next-move 준비·C divergence ranking·외부 helper의 paired 종단 인수도 별도다.
+GPU 검증과 실제 학습은 이번 실행에서 계속 제외한다.

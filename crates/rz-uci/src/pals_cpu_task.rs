@@ -7,6 +7,7 @@
 //! stay opaque and inside this invocation; interrupted stacks are not restored.
 
 pub mod candidate;
+pub mod continuation;
 pub mod semantic;
 
 use crate::engine::{OwnerRegistry, RulesUciPort};

@@ -457,7 +457,7 @@ fn meanings(
     Ok(result)
 }
 
-fn describe(
+pub(super) fn describe(
     position: &Position,
     owners: &OwnerRegistry,
     legal_kind: MoveTokenKind,
