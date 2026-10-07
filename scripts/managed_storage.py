@@ -98,14 +98,70 @@ def remove_tree(path: Path, parent: Path) -> None:
     if not path.exists():
         return
 
-    def writable_remove(func, name, _error):
-        # Only owned, preflighted files; do not follow a changed link.
-        target = checked(Path(name))
-        if not target.is_relative_to(path):
-            raise StorageError("cleanup escaped owned tree")
-        os.chmod(target, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
-        func(name)
+    first_permission_error = None
+
+    def writable_remove(func, name, error):
+        nonlocal first_permission_error
+        original = error[1]
+        if not isinstance(original, PermissionError):
+            raise original.with_traceback(error[2])
+        if first_permission_error is None:
+            first_permission_error = original
+        try:
+            # Only owned, preflighted entries; do not follow a changed link.
+            target = checked(Path(name))
+            if not target.is_relative_to(path):
+                raise StorageError("cleanup escaped owned tree")
+            target_info = target.lstat()
+            if not (stat.S_ISDIR(target_info.st_mode) or stat.S_ISREG(target_info.st_mode)):
+                raise StorageError("unsupported cleanup permission target")
+
+            def writable_directory(directory):
+                directory = checked(directory)
+                if not directory.is_relative_to(path):
+                    raise StorageError("cleanup chmod escaped owned tree")
+                info = directory.lstat()
+                if not stat.S_ISDIR(info.st_mode):
+                    raise StorageError("cleanup permission parent is not a directory")
+                mode = stat.S_IMODE(info.st_mode) | stat.S_IRWXU
+                if os.name == "posix":
+                    # chmod the verified directory inode, never a link target.
+                    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                    descriptor = os.open(directory, flags)
+                    try:
+                        opened = os.fstat(descriptor)
+                        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                            raise StorageError("cleanup directory identity changed")
+                        os.fchmod(descriptor, mode)
+                    finally:
+                        os.close(descriptor)
+                else:
+                    os.chmod(directory, mode)
+
+            # POSIX unlink/rmdir require write + search on the parent, even
+            # when the file itself is writable. Never chmod the outside owner.
+            if target.parent.is_relative_to(path):
+                writable_directory(target.parent)
+            if stat.S_ISDIR(target_info.st_mode):
+                writable_directory(target)
+            elif os.name == "nt":
+                # Windows read-only files need their own attribute cleared.
+                # POSIX file mode does not govern unlink; leave shared inodes alone.
+                os.chmod(target, stat.S_IMODE(target_info.st_mode) | stat.S_IRUSR | stat.S_IWUSR)
+            checked(target)
+            retried_info = target.lstat()
+            if (retried_info.st_dev, retried_info.st_ino) != (target_info.st_dev, target_info.st_ino):
+                raise StorageError("cleanup target identity changed")
+            func(name)
+        except Exception as failure:
+            # Preserve the first failure when permission repair/retry fails.
+            raise failure from original
     shutil.rmtree(path, onerror=writable_remove)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    raise StorageError("cleanup did not remove the owned tree") from first_permission_error
 
 
 def write_record(path: Path, value: dict) -> None:
