@@ -23,6 +23,8 @@ struct HistoryNode {
     state: CoreState,
     repetition: RepetitionIdentity,
     previous: Option<Arc<HistoryNode>>,
+    // The actual checked transition from `previous`; the imported root has none.
+    incoming_move: Option<BoardMove>,
     len: usize,
     irreversible: bool,
 }
@@ -52,6 +54,8 @@ impl Drop for HistoryNode {
 pub const RULES_VERSION: &str = "rz-position/0.1.0";
 pub const RULES_VARIANT: &str = "standard_chess";
 pub const DEAD_POSITION_PROFILE: &str = "proven_material_subset_v1";
+/// Hard bound for an owned UCI replay, independent of caller/history limits.
+pub const MAX_UCI_REPLAY_PLIES: usize = 4096;
 const MAX_PERFT_STACK_DEPTH: u32 = 64;
 
 /// Exact, position-local rule identity. Equality verifies full known history;
@@ -76,7 +80,10 @@ impl PartialEq for PositionIdentity {
             if std::ptr::eq(x, y) {
                 return true;
             }
-            if x.state != y.state || x.irreversible != y.irreversible {
+            if x.state != y.state
+                || x.irreversible != y.irreversible
+                || x.incoming_move != y.incoming_move
+            {
                 return false;
             }
             a = x.previous.as_deref();
@@ -114,6 +121,17 @@ pub struct PositionSnapshot {
     identity: PositionIdentity,
     owner: Arc<()>,
     revision: u64,
+}
+
+/// The complete known rule trace for UCI's `position fen ... moves ...` input.
+/// `moves` are oldest-first actual moves, including every irreversible move.
+/// An imported FEN retains its unknown prefix even if it names the start board.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UciReplay {
+    pub origin: HistoryOrigin,
+    pub completeness: HistoryCompleteness,
+    pub start_fen: String,
+    pub moves: Vec<BoardMove>,
 }
 
 /// A borrowed exact historical frame. Padding and missing history are encoder
@@ -213,6 +231,105 @@ impl PositionSnapshot {
     }
     pub fn known_history_len(&self) -> usize {
         self.identity.history.len
+    }
+    /// Export all known history without inventing an imported FEN's prefix.
+    /// The output starts at the oldest known exact FEN, then lists every actual
+    /// checked move in chronological order. Reconstruct with `startpos` for a
+    /// `StartPosition` origin, or import `start_fen` for a `Fen` origin, to retain
+    /// the snapshot's complete rule identity rather than only its current board.
+    ///
+    /// At most `min(max_plies, MAX_UCI_REPLAY_PLIES)` moves may be exported; an
+    /// oversized trace fails and is never truncated. A zero bound admits an
+    /// initial snapshot. All output capacity is reserved fallibly before use.
+    pub fn uci_replay(&self, max_plies: usize) -> Result<UciReplay, PositionError> {
+        let move_count =
+            self.known_history_len()
+                .checked_sub(1)
+                .ok_or(PositionError::InvalidMove(
+                    "inconsistent UCI replay history",
+                ))?;
+        if move_count > max_plies.min(MAX_UCI_REPLAY_PLIES) {
+            return Err(PositionError::ResourceLimit("UCI replay plies"));
+        }
+        let mut moves = Vec::new();
+        moves
+            .try_reserve_exact(move_count)
+            .map_err(|_| PositionError::ResourceLimit("UCI replay allocation"))?;
+        let mut node = self.identity.history.as_ref();
+        while let Some(previous) = node.previous.as_deref() {
+            if moves.len() >= move_count || node.len.checked_sub(1) != Some(previous.len) {
+                return Err(PositionError::InvalidMove(
+                    "inconsistent UCI replay history",
+                ));
+            }
+            let mv = node.incoming_move.ok_or(PositionError::InvalidMove(
+                "inconsistent UCI replay history",
+            ))?;
+            let piece = previous
+                .state
+                .board
+                .get(mv.from)
+                .filter(|piece| piece.color == previous.state.side)
+                .ok_or(PositionError::InvalidMove(
+                    "inconsistent UCI replay history",
+                ))?;
+            // Nodes originate only from checked Rules moves. Reapply their
+            // recorded transitions without allocating another legal-move list,
+            // and verify every raw state/counter rather than only the endpoint.
+            let mut replayed = previous.state.clone();
+            let capture = movegen::apply(&mut replayed, mv);
+            if piece.kind != PieceKind::Pawn && !capture {
+                replayed.halfmove = previous
+                    .state
+                    .halfmove
+                    .checked_add(1)
+                    .ok_or(PositionError::CounterOverflow)?;
+            }
+            if previous.state.side == Color::Black {
+                replayed.fullmove = previous
+                    .state
+                    .fullmove
+                    .checked_add(1)
+                    .ok_or(PositionError::CounterOverflow)?;
+            }
+            let irreversible = piece.kind == PieceKind::Pawn
+                || capture
+                || replayed.castling != previous.state.castling;
+            if replayed != node.state || irreversible != node.irreversible {
+                return Err(PositionError::InvalidMove(
+                    "inconsistent UCI replay history",
+                ));
+            }
+            moves.push(mv);
+            node = previous;
+        }
+        if moves.len() != move_count || node.len != 1 || node.incoming_move.is_some() {
+            return Err(PositionError::InvalidMove(
+                "inconsistent UCI replay history",
+            ));
+        }
+        let mut start_fen = String::new();
+        start_fen
+            .try_reserve_exact(fen::MAX_CANONICAL_FEN_BYTES)
+            .map_err(|_| PositionError::ResourceLimit("UCI replay allocation"))?;
+        fen::format_into(&node.state, &mut start_fen);
+        match (self.identity.origin, self.identity.completeness) {
+            (HistoryOrigin::StartPosition, HistoryCompleteness::Complete)
+                if node.irreversible && start_fen == fen::START_FEN => {}
+            (HistoryOrigin::Fen, HistoryCompleteness::UnknownPrefix) if !node.irreversible => {}
+            _ => {
+                return Err(PositionError::InvalidMove(
+                    "inconsistent UCI replay history",
+                ))
+            }
+        }
+        moves.reverse();
+        Ok(UciReplay {
+            origin: self.identity.origin,
+            completeness: self.identity.completeness,
+            start_fen,
+            moves,
+        })
     }
     /// Conservative charge: count the entire prefix even when Arc nodes share.
     pub fn retained_history_bytes(&self) -> Option<usize> {
@@ -425,6 +542,7 @@ impl Position {
             repetition: RepetitionIdentity::of(&state),
             state: state.clone(),
             previous: None,
+            incoming_move: None,
             len: 1,
             irreversible: completeness == HistoryCompleteness::Complete,
         });
@@ -596,6 +714,7 @@ impl Position {
                 state: checked.state.clone(),
                 repetition: checked.repetition,
                 previous: Some(self.history.clone()),
+                incoming_move: Some(mv),
                 len: self.history.len + 1,
                 irreversible: checked.irreversible,
             });
@@ -840,6 +959,38 @@ fn count_nodes(state: &CoreState, depth: u32, budget: &mut u64) -> Result<u64, P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uci_replay_rejects_missing_or_inconsistent_internal_move_evidence() {
+        let mut position = Position::startpos();
+        Arc::get_mut(&mut position.history).unwrap().incoming_move =
+            Some(BoardMove::from_uci("e2e4").unwrap());
+        assert!(matches!(
+            position.snapshot().uci_replay(0),
+            Err(PositionError::InvalidMove(
+                "inconsistent UCI replay history"
+            ))
+        ));
+
+        let mut position = Position::startpos();
+        drop(position.make_uci("e2e4").unwrap());
+        let node = Arc::get_mut(&mut position.history).unwrap();
+        node.incoming_move = None;
+        assert!(matches!(
+            position.snapshot().uci_replay(1),
+            Err(PositionError::InvalidMove(
+                "inconsistent UCI replay history"
+            ))
+        ));
+        let node = Arc::get_mut(&mut position.history).unwrap();
+        node.incoming_move = Some(BoardMove::from_uci("d2d4").unwrap());
+        assert!(matches!(
+            position.snapshot().uci_replay(1),
+            Err(PositionError::InvalidMove(
+                "inconsistent UCI replay history"
+            ))
+        ));
+    }
 
     #[test]
     fn exhausted_revision_never_wraps_or_partially_changes_state() {
