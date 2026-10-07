@@ -144,6 +144,29 @@ WDL·전체 메이트 증명을 만들어 내지 않습니다. CPU threads는 2�
 완료 iteration token이 없으면 실제 baseline과 unavailable 이유를 그대로 남깁니다.
 이를 seven-way 효용 학습이나 기력 인수로 해석하지 않습니다.
 
+`semantic_verifier.admit_semantic_input`은 기존 strict frozen current P/C parent와
+별도 Rust `pals_cpu_task --prepare-semantic`의 원시 Rules 영수증을 연결하는 접점입니다.
+결과 전 common query·등록 source/binary·before anchor·독립 launch 관측의 정확한
+bytes와 pin을 함께 요구합니다. Rules가 준비한 board·이력 필드·합법 수·prefix·
+restriction·claim의 의미만 private V 입력으로 쓰며 hash는 식별용입니다.
+`FrozenSemanticVerifier`는 caller가 reload·동결한 기존 full V parameter를 보존하고,
+CPU FP32로 seven-task logits를 반환합니다. 활성 autocast는 tensor 실행 전에 거절합니다.
+11MiB의 추가 frontend 예약과 모델·checkpoint·전체 프로세스 메모리를 구분합니다.
+이 접점은 새 private 의미 입력이며 기존 export 호환·학습된 V 품질을 주장하지 않습니다.
+
+`verifier_utility.admit_fixed_obligation_utility`는 이 `CheckedSemanticInput` capability,
+strict parent의 실제 prepared/tensor/lineage bytes, 사전 criterion·plan·declared prior
+snapshot과 등록 checker의 실제 ResumeTask/Defer 원시 결과를 함께 소비합니다.
+고정 H/N/wall/profile에서 동일 호출의 completed-iteration resume가 전체 H를 완료한
+coverage와 정상 no-check Defer만 비교합니다. prior의 유효 completed iteration이
+이미 H를 충족하면 새 양의 목표를 거절하고 partial·실패·취소·terminal은 mask합니다.
+범위는 `declared_snapshot_relative_completed_iteration_coverage_only`이며 global
+novelty·최적 선택·일반 seven-way rank나 기력 목표로 바꾸지 않습니다.
+`frozen_verifier_utility_preparation`은 실제 semantic forward logits에서 별도 softplus
+loss를 계산하고 parameter digest와 gradient 부재를 재검사합니다. optimizer·backward·
+학습 update·제품 V 연결은 없습니다. 합성 fixture와 실제 child 실행 인수는
+[PALS 구현·검증 기록](../../../docs/research/PALS-IMPLEMENTATION.md)에서 구분합니다.
+
 FLOPs 보고는 FMA=2 기준의 실제 선언 shape에 따른 matrix product 산술입니다.
 encoder와 role 반복 비용을 구분하고 cached memory를 호출마다 중복 계산하지 않습니다.
 softmax·RMSNorm·SwiGLU activation·lookup·이동·CPU 탐색과 backward는 제외 사실을

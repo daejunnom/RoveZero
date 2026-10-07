@@ -945,3 +945,75 @@ GPU는 사용자 지시에 따라 보류 중이고 실제 training·backward·op
 supervisor의 원인별 인수, 충분히 완료된 paired
 실행을 각각 진행 단위로 추적한다. P/C target 준비·실제 Warm 역할 소비가 전체
 PALS Search·divergence/repair/V 학습·속도·기력의 완료를 뜻하지 않는다.
+
+### 정확한 분기 의미 입력과 고정 검사 의무 효용의 CPU 연결
+
+`4d98c7f`와 `ce93e4e`는 기존 private CPU task와 별도의
+`--prepare-semantic` CLI를 연결한다. Rules의 실제 상태·이력·합법 수 순서,
+prefix·restriction·claim-end를 준비하며 search·모델·target을 실행하지 않는다.
+빈 claim은 unknown으로 유지하고 합법한 수순을 메이트 또는 전술적 참으로
+승격하지 않는다. 원래 stdin·실행 이미지 hash·Rules 재생·출력의 deadline과
+출력 한도를 유지한다. module 인자 비교 scope와 실제 CLI의 Linux loaded
+executable inode scope를 구분한다. root41의 Rules 검사 11개와 root43의
+CLI 검사 7개, UCI all-target/all-feature Clippy 및 format을 통과했다.
+
+`87b7b4e`의 `CheckedSemanticInput`은 기존 strict frozen current parent를
+소비한다. 원시 request·receipt·source·registration·결과 전 선언·common query·
+독립 launch 관측을 각각 pin하며, Rules를 Python에서 재구현하거나 hash를
+신경망 의미 feature로 사용하지 않는다. 기존 public encoder·query16·동결된 V
+parameter를 유지하면서 실제 board·FEN 필드·known history·합법 수·prefix·
+restriction·claim 순서를 1,394개의 private 토큰으로 준비한다. 단일 owner의
+추가 예약 상한 11MiB는 기존 모델·checkpoint·전체 RSS 한도와 구별한다.
+CPU FP32 정밀도·finite 값·미변경 parameter·gradient 부재와 활성 autocast의
+조기 거절을 검사한다. 이 frontend는 새 private 입력 의미를 사용하며 기존 V
+export의 입력 호환이나 학습된 품질을 주장하지 않는다.
+
+`34dc701`의 효용 계약은 사전 지정된 동일 Rules 상태·이력·합법 수 순서·profile·
+H/N/wall/output 조건의 완료 iteration 의무만 비교한다. 실제 동일 호출의 owned
+resume와 요구 H 전체 완료에는 coverage 1, 정상 no-check Defer에는 0을 준다.
+partial·failure·취소·terminal·미관측은 mask한다. 이전 partial 요청에서도 이미
+완료된 iteration이 의무를 충족하면 새 양의 목표를 거절한다. 이 결과는 선언한
+prior snapshot에 대한 상대적 coverage이며 global novelty·최적 task·일반적인
+V 품질이 아니다. 기존 legacy rank·WDL 목표를 변경하지 않는다.
+
+root46의 CPU 검사 **35개(semantic 19·utility 16)**가 통과했다. 이 fixture의
+등록·Rust receipt·launch 관측은 합성이며 실제 child 실행 증거와 구분한다.
+실제 root47에서는 다음을 별도로 확인했다.
+
+- build44는 Rust 소스 `ce93e4e`, `default+search-work-receipts`의 debug 바이너리를
+  등록했다. 빌드 전후와 실행 전 source bytes를 대조했고 바이너리는 38,259,808
+  bytes·SHA-256 `bfccd4932f8d80613fe495a1c0e7c1ee3041386cf293e88c7de20560e79d83eb`다.
+- 실제 current P parent의 `position_command`와 state/history를 사용한 Rust
+  Rules-only receipt는 CPU 검사 0개이며 strict semantic admission을 통과했다.
+  stdin 전송 전 `/proc/PID/exe`를 읽어 실제 loaded image를 독립 대조했다.
+- 전체 V를 보존한 untrained checkpoint를 CPU FP32로 reload하고 parameter
+  observation을 forward 전에 고정했다. 1,394개 private 의미 토큰의 실제 V
+  logits도 CPU 결과가 나오기 전에 기록했다. 이후 같은 parent/profile에서
+  ResumeTask는 depth 1 baseline·depth 2 after를 완료했고 reused depth 1을
+  보고했다. Defer는 정상 no-check였다. 선언한 prior snapshot은 비어 있으며
+  앞선 candidate-only 실행을 whole-root prior로 사용하지 않았다.
+- strict utility factory와 실제 semantic V forward의 별도 softplus loss는
+  **0.5029387474**였다. full V parameter digest
+  `eedfe35b2750147ff06c8381b5f6b1c4bd0a6ad7299d945cf02ff2b38bd5775e`는 전후
+  동일하다. backward·optimizer·parameter update·GPU·제품 V는 실행하지 않았다.
+- 소유 child의 pipe EOF·reap·process group 소멸과 managed scratch 정리까지
+  exit 0이었다. CPU affinity 0/2·memory.high 6GiB/max 12GiB/swap 0의 실행 전
+  적용을 확인했다. 종료 후 service가 표시한 1.5MiB는 Torch 작업 peak의 근거로
+  사용하지 않으며 이번 실행의 정확한 RSS/cgroup peak·VRAM peak는 unknown이다.
+
+논리 근거는 `runs/pals/continuation-cpu-check-03/semantic-model-tests-46.log`,
+`runs/pals/actual-semantic-utility-cpu-47/`의 사전 선언·원시 영수증·독립 관측·
+핀·인수 결과에 보존했다. `root-result.json`의 SHA-256은
+`38b1f38e6303bfdd5788a297556d2578e7509f6ca4df4a0eeede9ab027cae698`,
+`frozen-semantic-utility-preparation.json`은
+`58c6a8b11c1d471777542be348b31aa0341ff826aaf3c2b4180b48798fa55313`다.
+root47의 Python 검증 구간 12,918ms와 설치·관리 정리를 포함한 service 구간은
+서로 다른 범위이며 성능 계측 또는 학습 성과로 사용하지 않는다.
+
+`ce93e4e`의 [CI 37683887244](https://github.com/daejunnom/RoveZero/actions/runs/37683887244)는
+Linux·Windows·CPU bindings·model CPU 네 job 모두 실제 성공했다. 새 Python
+source `34dc701`의 [CI 37685960703](https://github.com/daejunnom/RoveZero/actions/runs/37685960703)도
+같은 네 job의 실제 성공을 별도로 확인했다. 서로 다른 SHA의 성공을 재사용한
+기록이 아니다.
+DG02의 실제 divergence/repair 인과 admission·목표 준비, 외부 helper의 완전한
+paired 인수와 전체 학습 준비의 통합은 남아 있다. GPU 검증은 계속 보류한다.
