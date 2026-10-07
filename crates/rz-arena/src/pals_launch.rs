@@ -259,6 +259,14 @@ impl PalsArenaLaunchV3 {
     pub fn validate(&self) -> Result<(), ArenaError> {
         self.semantic_lock.verify()?;
         require(
+            self.semantic_lock
+                .manifest
+                .engines
+                .iter()
+                .all(|engine| !matches!(engine, PalsEngineV3::Pals(p) if !p.cpu_r.is_own())),
+            "unsupported external CPU_R launch: helper preflight, inherited cgroup and owner receipt integration are not implemented",
+        )?;
+        require(
             self.domain == PALS_ARENA_V3_DOMAIN,
             "wrong arena launch domain",
         )?;
@@ -3406,6 +3414,7 @@ mod tests {
                 exported_roles: BTreeSet::from([PalsRoleV3::Proposer, PalsRoleV3::Critic]),
             },
             cpu: cpu(),
+            cpu_r: PalsCpuRSelectionV3::Own,
             search: component("pals"),
             runtime: component("single-owner/1"),
             pools: PalsPoolLimitsV3 {
@@ -3511,6 +3520,57 @@ mod tests {
                 max_runtime_depth: 4,
                 address_space_per_process_bytes: 0,
             },
+        }
+    }
+    #[test]
+    fn declared_external_cpu_r_cannot_silently_launch_as_own() {
+        for mut f in [fixture(), native_fixture()] {
+            assert!(f.clone().lock().is_ok());
+            let mut binary = asset("helper/stockfish");
+            binary.source = "https://github.com/official-stockfish/Stockfish".into();
+            binary.license = "GPL-3.0-or-later".into();
+            let PalsEngineV3::Pals(e) = &mut f.semantic_lock.manifest.engines[0] else {
+                unreachable!()
+            };
+            e.cpu_r = PalsCpuRSelectionV3::ExternalUci(Box::new(PalsExternalCpuRV3 {
+                selection: PalsExternalCpuRSelectionV3::StockfishEmbeddedNnue,
+                profile: asset("helper/profile.json"),
+                profile_canonical_sha256: "a".repeat(64),
+                binary,
+                resolver: PalsExternalCpuRResolverV3 {
+                    version: "pals-model-wdl-restricted/0.1".into(),
+                    semantics_sha256: "a".repeat(64),
+                },
+                policy: PalsExternalCpuRPolicyV3 {
+                    resource_scope: PalsExternalCpuRResourceScopeV3::InheritedParentCgroup,
+                    max_owners: 1,
+                    max_active_tasks: 1,
+                    max_process_leaders: 1,
+                    inherited_kernel_tasks_max: 128,
+                    threads_max: 2,
+                    hash_mib_max: 16,
+                    max_depth: 8,
+                    max_prefix_plies: 64,
+                    max_nodes_per_task: 10_000,
+                    handshake_max_ms: 1000,
+                    task_wall_time_max_ms: 1000,
+                    stop_grace_max_ms: 100,
+                    shutdown_grace_max_ms: 100,
+                    lifetime_output_bytes_max: 4096,
+                    line_bytes_max: 1024,
+                },
+            }));
+            // Semantic preparation is permitted. No child/profile/model is
+            // started, copied or read by this declaration-only fixture.
+            f.semantic_lock = f.semantic_lock.manifest.lock().unwrap();
+            let error = f.validate().unwrap_err();
+            assert!(matches!(&error, ArenaError::Integrity(_)));
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported external CPU_R launch")
+            );
+            assert!(f.lock().is_err());
         }
     }
     fn native_fixture() -> PalsArenaLaunchV3 {

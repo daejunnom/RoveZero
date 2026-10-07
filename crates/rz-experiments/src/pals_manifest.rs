@@ -120,6 +120,8 @@ pub struct PalsComponentV3 {
 }
 
 /// Same Rust core, with separately declared T/R profile and evaluation semantics.
+/// This is a CPU_T/legacy own declaration. It authorizes CPU_R execution only
+/// when `PalsEndpointV3::cpu_r` selects Own; it never attests task execution.
 /// A CPU problem result is a scoped estimate/bound; this identity grants no proof.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -132,6 +134,91 @@ pub struct PalsOwnCpuV3 {
     pub max_depth: u32,
     pub max_task_ms: u64,
     pub max_tt_bytes: u64,
+}
+
+/// Runtime checker selection is independent of the preserved own CPU_T profile.
+/// Omitting Own preserves the exact historical V3 serializer and lock bytes.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(
+    tag = "kind",
+    content = "configuration",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum PalsCpuRSelectionV3 {
+    #[default]
+    Own,
+    ExternalUci(Box<PalsExternalCpuRV3>),
+}
+impl PalsCpuRSelectionV3 {
+    pub fn is_own(&self) -> bool {
+        matches!(self, Self::Own)
+    }
+}
+
+choices!(PalsExternalCpuRSelectionV3 {
+    StockfishEmbeddedNnue
+});
+choices!(PalsExternalCpuRResourceScopeV3 {
+    InheritedParentCgroup
+});
+
+/// Foreign CP/mate/bounds remain external estimates. This declared resolver
+/// identifies selected-model WDL resolution, never calibration of those scores.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsExternalCpuRResolverV3 {
+    pub version: String,
+    /// Declared semantic source digest; a runtime consumer must compare the
+    /// actual resolver identity independently before accepting execution.
+    pub semantics_sha256: String,
+}
+
+/// Finite ceilings to compare against the independently loaded checker profile.
+/// These are reservations/declarations, not observations of option application,
+/// OS thread count, memory peak, model loading, or successful process cleanup.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsExternalCpuRPolicyV3 {
+    /// The helper shares the parent's affinity and memory/swap cgroup limits.
+    /// There is no independent CPU, memory or GPU allocation for the helper.
+    pub resource_scope: PalsExternalCpuRResourceScopeV3,
+    pub max_owners: u32,
+    pub max_active_tasks: u32,
+    pub max_process_leaders: u32,
+    /// Whole inherited cgroup kernel-task ceiling, including Linux threads.
+    /// It is not interchangeable with the helper process-leader count.
+    pub inherited_kernel_tasks_max: u32,
+    pub threads_max: u32,
+    pub hash_mib_max: u32,
+    pub max_depth: u32,
+    pub max_prefix_plies: u32,
+    pub max_nodes_per_task: u64,
+    pub handshake_max_ms: u64,
+    pub task_wall_time_max_ms: u64,
+    /// This must be reserved inside the supplied search deadline at admission.
+    /// A finite value alone does not authorize extending that deadline.
+    pub stop_grace_max_ms: u64,
+    /// Helper and native NN owners require separate closure observations;
+    /// their combined shutdown must fit the parent's existing cleanup window.
+    pub shutdown_grace_max_ms: u64,
+    pub lifetime_output_bytes_max: u64,
+    pub line_bytes_max: u64,
+}
+
+/// First supported external CPU_R declaration: Stockfish with embedded NNUE,
+/// no engine argv or separately loaded assets. File and canonical profile pins
+/// are distinct. Public source/license declarations prove no model loading or
+/// training; those observations remain unknown in the external checker profile.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsExternalCpuRV3 {
+    pub selection: PalsExternalCpuRSelectionV3,
+    pub profile: ArtifactRef,
+    pub profile_canonical_sha256: String,
+    pub binary: ArtifactRef,
+    pub resolver: PalsExternalCpuRResolverV3,
+    pub policy: PalsExternalCpuRPolicyV3,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -156,7 +243,11 @@ pub struct PalsEndpointV3 {
     pub binary: ArtifactRef,
     pub source_commit: String,
     pub model: PalsModelIdentityV3,
+    /// Own CPU_T and historical own CPU_R declaration; see `cpu_r` for the
+    /// actual runtime selection. Keeping it does not mean it was executed.
     pub cpu: PalsOwnCpuV3,
+    #[serde(default, skip_serializing_if = "PalsCpuRSelectionV3::is_own")]
+    pub cpu_r: PalsCpuRSelectionV3,
     pub search: PalsComponentV3,
     pub runtime: PalsComponentV3,
     pub pools: PalsPoolLimitsV3,
@@ -316,6 +407,65 @@ fn cpu(c: &PalsOwnCpuV3) -> Result<(), ManifestError> {
         "CPU core must be own PVS with finite node/depth/time/TT limits",
     )
 }
+fn external_cpu_r(
+    c: &PalsExternalCpuRV3,
+    r: &PalsResourcePolicyV3,
+    pilot: &PalsPilotV3,
+) -> Result<(), ManifestError> {
+    c.profile.validate()?;
+    c.binary.validate()?;
+    require(
+        (1..=64 * 1024).contains(&c.profile.bytes)
+            && (1..=256 * 1024 * 1024).contains(&c.binary.bytes)
+            && sha(&c.profile_canonical_sha256, 64)
+            && (c.binary.source == "https://github.com/official-stockfish/Stockfish"
+                || c.binary
+                    .source
+                    .starts_with("https://github.com/official-stockfish/Stockfish/"))
+            && c.binary.license == "GPL-3.0-or-later",
+        "external CPU_R requires bounded pinned profile/binary and declared Stockfish source/license",
+    )?;
+    require(
+        c.resolver.version == "pals-model-wdl-restricted/0.1"
+            && sha(&c.resolver.semantics_sha256, 64),
+        "external CPU_R requires declared model-WDL resolver, not own raw/foreign CP calibration",
+    )?;
+    let p = &c.policy;
+    require(
+        p.max_owners == 1
+            && p.max_active_tasks == 1
+            && p.max_process_leaders == 1
+            && (1..=65_536).contains(&p.inherited_kernel_tasks_max)
+            && (1..=2).contains(&p.threads_max)
+            && p.threads_max <= r.cpu_threads
+            && p.inherited_kernel_tasks_max >= p.threads_max
+            && (1..=1024).contains(&p.hash_mib_max)
+            && u64::from(p.hash_mib_max) * 1024 * 1024 <= r.memory_high_bytes
+            && (1..=64).contains(&p.max_depth)
+            && p.max_prefix_plies <= 4096
+            && p.max_nodes_per_task > 0,
+        "external CPU_R requires one bounded owner/task and inherited finite CPU/memory/task caps",
+    )?;
+    require(
+        [
+            p.handshake_max_ms,
+            p.task_wall_time_max_ms,
+            p.stop_grace_max_ms,
+            p.shutdown_grace_max_ms,
+        ]
+        .iter()
+        .all(|time| (1..=180_000).contains(time))
+            && p.handshake_max_ms <= pilot.handshake_max_ms
+            && p.task_wall_time_max_ms <= pilot.wall_time_max_ms
+            && p.stop_grace_max_ms <= pilot.cleanup_max_ms
+            && p.shutdown_grace_max_ms <= pilot.cleanup_max_ms
+            && (1..=16 * 1024 * 1024).contains(&p.lifetime_output_bytes_max)
+            && p.lifetime_output_bytes_max <= r.memory_high_bytes
+            && (1..=65_536).contains(&p.line_bytes_max)
+            && p.line_bytes_max <= p.lifetime_output_bytes_max,
+        "external CPU_R time/output declarations exceed finite profile or inherited parent ceilings",
+    )
+}
 fn resources(r: &PalsResourcePolicyV3) -> Result<(), ManifestError> {
     let set: BTreeSet<_> = r.cpu_affinity.iter().collect();
     require(
@@ -371,7 +521,11 @@ fn model(m: &PalsModelIdentityV3) -> Result<(), ManifestError> {
         }
     }
 }
-fn endpoint(e: &PalsEngineV3, r: &PalsResourcePolicyV3) -> Result<(), ManifestError> {
+fn endpoint(
+    e: &PalsEngineV3,
+    r: &PalsResourcePolicyV3,
+    pilot: &PalsPilotV3,
+) -> Result<(), ManifestError> {
     require(
         text(e.id()) && options(e.requested_options()),
         "invalid engine identity/options",
@@ -418,6 +572,9 @@ fn endpoint(e: &PalsEngineV3, r: &PalsResourcePolicyV3) -> Result<(), ManifestEr
         PalsEngineV3::Pals(p) => {
             model(&p.model)?;
             cpu(&p.cpu)?;
+            if let PalsCpuRSelectionV3::ExternalUci(c) = &p.cpu_r {
+                external_cpu_r(c, r, pilot)?;
+            }
             component(&p.search)?;
             component(&p.runtime)?;
             let b = &p.pools;
@@ -476,7 +633,7 @@ fn changes(a: &PalsEngineV3, b: &PalsEngineV3) -> BTreeSet<PalsChangeAxisV3> {
         if a.model != b.model {
             result.insert(PalsChangeAxisV3::Model);
         }
-        if a.cpu != b.cpu {
+        if a.cpu != b.cpu || a.cpu_r != b.cpu_r {
             result.insert(PalsChangeAxisV3::CpuCore);
         }
         if a.search != b.search {
@@ -536,7 +693,7 @@ impl PalsRunManifestV3 {
         )?;
         for (e, r) in self.engines.iter().zip(&self.resources) {
             resources(r)?;
-            endpoint(e, r)?;
+            endpoint(e, r, &self.pilot)?;
         }
         let actual = changes(&self.engines[0], &self.engines[1]);
         require(
@@ -859,6 +1016,12 @@ impl PalsRunReceiptV3 {
         lock.verify()?;
         let m = &lock.manifest;
         require(
+            m.engines
+                .iter()
+                .all(|engine| !matches!(engine, PalsEngineV3::Pals(p) if !p.cpu_r.is_own())),
+            "unsupported external CPU_R receipt: helper projection and owner closure are not implemented",
+        )?;
+        require(
             self.domain == PALS_RECEIPT_V3_DOMAIN
                 && self.run_id == m.run_id
                 && self.pair_id == m.pair_id
@@ -964,6 +1127,36 @@ impl PalsRunReceiptV3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Golden bytes of the own-only V3 fixture before CPU_R selection existed.
+    const LEGACY_OWN_CANONICAL: &str = concat!(
+        r#"["rz-pals-execution-v3/1",{"schema_version":3,"run_id":"pals-pilot-1","pair_id":"pair-1","contract_revision":"pals/0.1","rules_profile":"standard-complete-histo"#,
+        r#"ry/1","comparison":"system","declared_changes":["endpoint"],"training_executed":false,"engines":[{"endpoint":"pals","configuration":{"id":"pals","binary":{"path"#,
+        r#"":"bin/rovezero","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bytes":1,"source":"https://example.org/source","license":"MIT"},"s"#,
+        r#"ource_commit":"cccccccccccccccccccccccccccccccccccccccc","model":{"architecture":"pals-width384-latent16-iterations2","input_schema":"entity-candidate-records/1"#,
+        r#"","policy_head":"candidate-policy/1","value_head":"stm-wdl/1","implementation_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","weight"#,
+        r#"s":{"kind":"deterministic_mock","seed":1},"frozen_epoch":1,"backend":"deterministic_mock","precision":"fp32","max_batch_width":1,"exported_roles":["proposer","c"#,
+        r#"ritic"]},"cpu":{"core":{"semantic_id":"rz-cpu-pvs/0.1","implementation_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","options":{}},"#,
+        r#""training_profile":{"semantic_id":"teacher-profile-1","implementation_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","options":{}},""#,
+        r#"runtime_profile":{"semantic_id":"runtime-profile-1","implementation_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","options":{}},"ev"#,
+        r#"aluation":{"semantic_id":"untrained-material-pst-1","implementation_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","options":{}},"ma"#,
+        r#"x_nodes_per_task":10000,"max_depth":8,"max_task_ms":100,"max_tt_bytes":1024},"search":{"semantic_id":"pals","implementation_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbb"#,
+        r#"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","options":{}},"runtime":{"semantic_id":"single-owner/1","implementation_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"#,
+        r#"bbbbbbbbbbbbbbbbbbbbbbbb","options":{}},"pools":{"states":64,"line_chunks":64,"situations":64,"observations":256,"tasks":16,"role_states":2,"memory_pages":64,"q"#,
+        r#"ueue_requests":16,"host_bytes":4096,"device_bytes":0},"requested_options":{"Ponder":"false"}}},{"endpoint":"own_cpu","configuration":{"id":"cpu","binary":{"path"#,
+        r#"":"bin/rovezero","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bytes":1,"source":"https://example.org/source","license":"MIT"},"s"#,
+        r#"ource_commit":"cccccccccccccccccccccccccccccccccccccccc","cpu":{"core":{"semantic_id":"rz-cpu-pvs/0.1","implementation_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"#,
+        r#"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","options":{}},"training_profile":{"semantic_id":"teacher-profile-1","implementation_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"#,
+        r#"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","options":{}},"runtime_profile":{"semantic_id":"runtime-profile-1","implementation_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"#,
+        r#"bbbbbbbbbbbbbbbbbbbbbbbbbbbbb","options":{}},"evaluation":{"semantic_id":"untrained-material-pst-1","implementation_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"#,
+        r#"bbbbbbbbbbbbbbbbbbbbbbbbbbbbb","options":{}},"max_nodes_per_task":10000,"max_depth":8,"max_task_ms":100,"max_tt_bytes":1024},"requested_options":{}}}],"resource"#,
+        r#"s":[{"cpu_threads":2,"cpu_affinity":[0,2],"memory_high_bytes":6442450944,"memory_max_bytes":12884901888,"swap_max_bytes":0,"requested_gpu":null,"device_allocati"#,
+        r#"on_max_bytes":0},{"cpu_threads":2,"cpu_affinity":[0,2],"memory_high_bytes":6442450944,"memory_max_bytes":12884901888,"swap_max_bytes":0,"requested_gpu":null,"de"#,
+        r#"vice_allocation_max_bytes":0}],"pilot":{"position_command":"position startpos","games":2,"white_order":["pals","cpu"],"base_ms":120000,"increment_ms":1000,"max_"#,
+        r#"plies":256,"seed":1,"wall_time_max_ms":900000,"cleanup_max_ms":30000,"handshake_max_ms":30000,"concurrent_games":1,"restart_processes_each_game":true,"ponder":f"#,
+        r#"alse,"score_adjudication":false,"elo_claim":false}}]"#,
+    );
+    const LEGACY_OWN_SHA256: &str =
+        "faf15aca4a8b3f28b4b569cd3d97dd50d57843b4a08c5e067eefe7bac5634219";
     fn asset(path: &str) -> ArtifactRef {
         ArtifactRef {
             path: path.into(),
@@ -1022,6 +1215,7 @@ mod tests {
                 exported_roles: BTreeSet::from([PalsRoleV3::Proposer, PalsRoleV3::Critic]),
             },
             cpu: own_cpu(),
+            cpu_r: PalsCpuRSelectionV3::Own,
             search: comp("pals"),
             runtime: comp("single-owner/1"),
             pools: PalsPoolLimitsV3 {
@@ -1149,6 +1343,181 @@ mod tests {
                 .collect(),
         }
     }
+
+    fn external_cpu_r_fixture() -> PalsExternalCpuRV3 {
+        let mut binary = asset("bin/stockfish");
+        binary.source = "https://github.com/official-stockfish/Stockfish".into();
+        binary.license = "GPL-3.0-or-later".into();
+        PalsExternalCpuRV3 {
+            selection: PalsExternalCpuRSelectionV3::StockfishEmbeddedNnue,
+            profile: asset("profiles/stockfish.json"),
+            profile_canonical_sha256: "d".repeat(64),
+            binary,
+            resolver: PalsExternalCpuRResolverV3 {
+                version: "pals-model-wdl-restricted/0.1".into(),
+                semantics_sha256: "e".repeat(64),
+            },
+            policy: PalsExternalCpuRPolicyV3 {
+                resource_scope: PalsExternalCpuRResourceScopeV3::InheritedParentCgroup,
+                max_owners: 1,
+                max_active_tasks: 1,
+                max_process_leaders: 1,
+                inherited_kernel_tasks_max: 128,
+                threads_max: 2,
+                hash_mib_max: 16,
+                max_depth: 8,
+                max_prefix_plies: 64,
+                max_nodes_per_task: 10_000,
+                handshake_max_ms: 1000,
+                task_wall_time_max_ms: 1000,
+                stop_grace_max_ms: 100,
+                shutdown_grace_max_ms: 100,
+                lifetime_output_bytes_max: 4096,
+                line_bytes_max: 1024,
+            },
+        }
+    }
+    fn select_external(m: &mut PalsRunManifestV3) {
+        let PalsEngineV3::Pals(p) = &mut m.engines[0] else {
+            unreachable!()
+        };
+        p.cpu_r = PalsCpuRSelectionV3::ExternalUci(Box::new(external_cpu_r_fixture()));
+    }
+    #[test]
+    fn own_cpu_r_omission_preserves_legacy_canonical_bytes_and_digest() {
+        let (domain, legacy): (String, PalsRunManifestV3) =
+            serde_json::from_str(LEGACY_OWN_CANONICAL).unwrap();
+        assert_eq!(domain, PALS_MANIFEST_V3_DOMAIN);
+        assert_eq!(legacy, manifest());
+        assert_eq!(
+            legacy.canonical_bytes().unwrap(),
+            LEGACY_OWN_CANONICAL.as_bytes()
+        );
+        assert_eq!(legacy.lock().unwrap().canonical_sha256, LEGACY_OWN_SHA256);
+        let mut value = serde_json::to_value(&legacy).unwrap();
+        assert!(value["engines"][0]["configuration"].get("cpu_r").is_none());
+        value["engines"][0]["configuration"]["cpu_r"] =
+            serde_json::to_value(PalsCpuRSelectionV3::Own).unwrap();
+        let explicit = PalsRunManifestV3::from_json(&value.to_string()).unwrap();
+        assert_eq!(
+            explicit.canonical_bytes().unwrap(),
+            LEGACY_OWN_CANONICAL.as_bytes()
+        );
+        assert_eq!(explicit.lock().unwrap().canonical_sha256, LEGACY_OWN_SHA256);
+    }
+    #[test]
+    fn external_cpu_r_is_an_explicit_preparation_lock_not_own_runtime_evidence() {
+        let mut m = manifest();
+        let original = m.lock().unwrap();
+        let PalsEngineV3::Pals(p) = &m.engines[0] else {
+            unreachable!()
+        };
+        let cpu_t_and_legacy = p.cpu.clone();
+        select_external(&mut m);
+        let lock = m.lock().unwrap();
+        assert_ne!(lock.canonical_sha256, original.canonical_sha256);
+        assert_eq!(
+            PalsInputLockV3::from_json(&serde_json::to_string(&lock).unwrap()).unwrap(),
+            lock,
+        );
+        let PalsEngineV3::Pals(p) = &lock.manifest.engines[0] else {
+            unreachable!()
+        };
+        assert_eq!(p.cpu, cpu_t_and_legacy);
+        let value = serde_json::to_value(&lock.manifest).unwrap();
+        assert_eq!(
+            value["engines"][0]["configuration"]["cpu_r"]["kind"],
+            "external_uci"
+        );
+        let error = receipt(&lock)
+            .validate_against(&lock)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported external CPU_R receipt"));
+        let mut failed = receipt(&lock);
+        failed.pair_eligible = false;
+        failed.failures.insert(PalsRunFailureV3::Infrastructure);
+        assert!(failed.validate_against(&lock).is_err());
+    }
+    #[test]
+    fn external_cpu_r_declarations_require_finite_inherited_stockfish_caps() {
+        let mutations: &[fn(&mut PalsExternalCpuRV3)] = &[
+            |c| c.profile.bytes = 0,
+            |c| c.profile.bytes = 64 * 1024 + 1,
+            |c| c.profile_canonical_sha256 = "not-a-digest".into(),
+            |c| c.binary.bytes = 256 * 1024 * 1024 + 1,
+            |c| c.binary.source = "https://example.org/other-engine".into(),
+            |c| c.binary.license = "MIT".into(),
+            |c| c.resolver.version = "pals-cpu-raw-restricted/0.1".into(),
+            |c| c.resolver.semantics_sha256 = "e".repeat(63),
+            |c| c.policy.max_owners = 2,
+            |c| c.policy.max_active_tasks = 2,
+            |c| c.policy.max_process_leaders = 2,
+            |c| c.policy.inherited_kernel_tasks_max = 0,
+            |c| c.policy.inherited_kernel_tasks_max = 65_537,
+            |c| c.policy.threads_max = 3,
+            |c| c.policy.hash_mib_max = 1025,
+            |c| c.policy.max_depth = 65,
+            |c| c.policy.max_prefix_plies = 4097,
+            |c| c.policy.max_nodes_per_task = 0,
+            |c| c.policy.handshake_max_ms = 30_001,
+            |c| c.policy.task_wall_time_max_ms = 180_001,
+            |c| c.policy.stop_grace_max_ms = 30_001,
+            |c| c.policy.shutdown_grace_max_ms = 30_001,
+            |c| c.policy.lifetime_output_bytes_max = 16 * 1024 * 1024 + 1,
+            |c| c.policy.line_bytes_max = 4097,
+        ];
+        assert!(external_cpu_r(&external_cpu_r_fixture(), &resource(), &manifest().pilot).is_ok());
+        for (index, mutate) in mutations.iter().enumerate() {
+            let mut c = external_cpu_r_fixture();
+            mutate(&mut c);
+            assert!(
+                external_cpu_r(&c, &resource(), &manifest().pilot).is_err(),
+                "accepted external mutation {index}",
+            );
+        }
+        let mut r = resource();
+        r.cpu_threads = 1;
+        assert!(external_cpu_r(&external_cpu_r_fixture(), &r, &manifest().pilot).is_err());
+        r.cpu_threads = 2;
+        r.memory_high_bytes = 1024;
+        assert!(external_cpu_r(&external_cpu_r_fixture(), &r, &manifest().pilot).is_err());
+    }
+    #[test]
+    fn external_cpu_r_rejects_unknown_selection_and_nested_policy_fields() {
+        let mut m = manifest();
+        select_external(&mut m);
+        let original = serde_json::to_value(&m).unwrap();
+        for (field, value) in [
+            ("selection", serde_json::json!("general_uci")),
+            ("unexpected", serde_json::json!(true)),
+        ] {
+            let mut wire = original.clone();
+            wire["engines"][0]["configuration"]["cpu_r"]["configuration"][field] = value;
+            assert!(PalsRunManifestV3::from_json(&wire.to_string()).is_err());
+        }
+        let mut wire = original.clone();
+        wire["engines"][0]["configuration"]["cpu_r"]["configuration"]["policy"]["resource_scope"] =
+            "independent_resources".into();
+        assert!(PalsRunManifestV3::from_json(&wire.to_string()).is_err());
+        let mut wire = original;
+        wire["engines"][0]["configuration"]["cpu_r"]["configuration"]["policy"]["extra_memory"] =
+            1.into();
+        assert!(PalsRunManifestV3::from_json(&wire.to_string()).is_err());
+    }
+    #[test]
+    fn runtime_checker_change_is_not_hidden_as_a_controlled_model_change() {
+        let mut m = manifest();
+        m.engines[1] = pals("candidate");
+        m.pilot.white_order[1] = "candidate".into();
+        select_external(&mut m);
+        m.declared_changes = BTreeSet::from([PalsChangeAxisV3::CpuCore]);
+        assert!(m.validate().is_ok());
+        m.comparison = PalsComparisonV3::InternalModel;
+        m.declared_changes = BTreeSet::from([PalsChangeAxisV3::Model]);
+        assert!(m.validate().is_err());
+    }
+
     #[test]
     fn legacy_domains_do_not_parse_or_lock_as_pals() {
         let mut m = manifest();
