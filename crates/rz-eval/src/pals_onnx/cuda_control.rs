@@ -988,8 +988,7 @@ impl std::io::Write for BoundedPlacementJson {
                 .capacity()
                 .saturating_mul(2)
                 .max(required)
-                .max(1024)
-                .min(MAX_PROFILE_BYTES);
+                .clamp(1024, MAX_PROFILE_BYTES);
             self.bytes
                 .try_reserve_exact(target - self.bytes.len())
                 .map_err(|_| std::io::Error::other("PALS placement JSON allocation failed"))?;
