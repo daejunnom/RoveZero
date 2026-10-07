@@ -504,6 +504,7 @@ dependencies = [
 name = "rz-search"
 version = "0.1.0"
 dependencies = [
+ "nix",
  "rz-contracts",
  "rz-position",
  "rz-telemetry",
