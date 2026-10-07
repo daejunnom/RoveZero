@@ -824,29 +824,182 @@ pub(super) fn owned_profile_root(path: &Path) -> Result<PathBuf, BackendError> {
 pub(super) fn record_initial_log(
     log: &Arc<Mutex<PlacementLog>>,
     path: &Path,
+    role: &str,
+    session_created: bool,
+    gate: Option<&Result<PalsGraphPlacement, BackendError>>,
 ) -> Result<(), BackendError> {
     use std::io::Write;
     let log = log
         .lock()
         .map_err(|_| policy_error("PALS placement collector was poisoned"))?;
-    let bytes = log.lines.join("\n");
-    if bytes.len() > MAX_PLACEMENT_BYTES {
-        return Err(policy_error("PALS placement log exceeds bounded output"));
+    if !matches!(role, "public" | "shared_pc") || !path.is_absolute() {
+        return Err(policy_error("PALS placement metadata owner is invalid"));
     }
+    let mut selected = None;
+    let mut headers = Vec::new();
+    let mut nodes = Vec::new();
+    let mut unparsed = Vec::new();
+    let mut began = false;
+    for (sequence, line) in log.lines.iter().enumerate() {
+        let line = line.trim();
+        if line == "Node placements" {
+            began = true;
+            continue;
+        }
+        let header = placement_header(line, "Node(s) placed on [")
+            .map(|(provider, count)| (provider, count, false))
+            .or_else(|| {
+                placement_header(line, "All nodes placed on [")
+                    .map(|(provider, count)| (provider, count, true))
+            });
+        if let Some((provider, count, all_nodes_summary)) = header {
+            if provider.len() <= 256 {
+                selected = Some(provider.clone());
+                headers.push(PlacementHeader {
+                    sequence,
+                    provider,
+                    declared_nodes: count,
+                    all_nodes_summary,
+                });
+                continue;
+            }
+        }
+        if began {
+            if let Some((op, name)) = line
+                .split_once(" (")
+                .and_then(|(op, rest)| rest.strip_suffix(')').map(|name| (op, name)))
+            {
+                if op.len() <= 256 && name.len() <= 256 {
+                    nodes.push(PlacementNode {
+                        sequence,
+                        provider: selected.clone(),
+                        name,
+                        op,
+                    });
+                    continue;
+                }
+            }
+        }
+        // Preserve incomplete-stream identity without copying arbitrary logger
+        // text or any values into the metadata-only file.
+        unparsed.push(PlacementUnparsed {
+            sequence,
+            line_sha256: asset::sha256(line.as_bytes()),
+        });
+    }
+    let evidence = PlacementFile {
+        schema: "rovezero.pals-initial-placement.v1",
+        source: "ort-1.22-finalize-recursive-verbose-node-metadata",
+        role,
+        session_created,
+        before_first_neural_run: true,
+        gate: match gate {
+            Some(Ok(_)) => "passed",
+            Some(Err(_)) => "rejected",
+            None => "not_reached",
+        },
+        gate_detail: gate
+            .and_then(|result| result.as_ref().err())
+            .map(|error| error.detail),
+        collected_bytes: log.bytes,
+        collector_overflow: log.overflow,
+        provider_headers: headers,
+        nodes,
+        unparsed,
+    };
+    let mut json = BoundedPlacementJson { bytes: Vec::new() };
+    serde_json::to_writer_pretty(&mut json, &evidence).map_err(|error| {
+        policy_error("cannot serialize bounded PALS placement metadata")
+            .with_external_cause(CauseCode::ProfilingFinish, &error)
+    })?;
+    json.write_all(b"\n").map_err(|error| {
+        policy_error("PALS placement metadata exceeds bounded output")
+            .with_external_cause(CauseCode::ProfilingFinish, &error)
+    })?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
         .map_err(|error| {
-            policy_error("cannot create exclusive PALS placement log")
+            policy_error("cannot create exclusive PALS placement metadata")
                 .with_external_cause(CauseCode::ProfilingStart, &error)
         })?;
-    file.write_all(bytes.as_bytes())
+    file.write_all(&json.bytes)
         .and_then(|()| file.sync_all())
         .map_err(|error| {
-            policy_error("cannot preserve bounded PALS placement log")
+            policy_error("cannot preserve bounded PALS placement metadata")
                 .with_external_cause(CauseCode::ProfilingFinish, &error)
         })
+}
+
+#[derive(Serialize)]
+struct PlacementHeader {
+    sequence: usize,
+    provider: String,
+    declared_nodes: usize,
+    all_nodes_summary: bool,
+}
+#[derive(Serialize)]
+struct PlacementNode<'a> {
+    sequence: usize,
+    provider: Option<String>,
+    name: &'a str,
+    op: &'a str,
+}
+#[derive(Serialize)]
+struct PlacementUnparsed {
+    sequence: usize,
+    line_sha256: [u8; 32],
+}
+#[derive(Serialize)]
+struct PlacementFile<'a> {
+    schema: &'static str,
+    source: &'static str,
+    role: &'a str,
+    session_created: bool,
+    before_first_neural_run: bool,
+    gate: &'static str,
+    gate_detail: Option<&'static str>,
+    collected_bytes: usize,
+    collector_overflow: bool,
+    provider_headers: Vec<PlacementHeader>,
+    nodes: Vec<PlacementNode<'a>>,
+    unparsed: Vec<PlacementUnparsed>,
+}
+struct BoundedPlacementJson {
+    bytes: Vec<u8>,
+}
+impl std::io::Write for BoundedPlacementJson {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let required = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .filter(|required| *required <= MAX_PROFILE_BYTES)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "PALS placement JSON exceeds 4MiB",
+                )
+            })?;
+        if required > self.bytes.capacity() {
+            let target = self
+                .bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(required)
+                .max(1024)
+                .min(MAX_PROFILE_BYTES);
+            self.bytes
+                .try_reserve_exact(target - self.bytes.len())
+                .map_err(|_| std::io::Error::other("PALS placement JSON allocation failed"))?;
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(super) fn finish_profile(session: &mut Session, root: &Path) -> Result<Vec<u8>, BackendError> {
@@ -889,6 +1042,30 @@ pub(super) fn finish_profile(session: &mut Session, root: &Path) -> Result<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct IoRoot(PathBuf);
+    impl Drop for IoRoot {
+        fn drop(&mut self) {
+            // Only the two exact files owned by this test; no recursive cleanup.
+            for name in [
+                "public-initial-placement.json",
+                "shared_pc-initial-placement.json",
+            ] {
+                let _ = std::fs::remove_file(self.0.join(name));
+            }
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+    fn io_root() -> IoRoot {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rz-pals-placement-io-{}-{nonce}",
+            std::process::id()
+        ));
+        IoRoot(owned_profile_root(&path).unwrap())
+    }
     fn graph() -> GraphPolicy {
         GraphPolicy {
             digest: [1; 32],
@@ -916,6 +1093,59 @@ mod tests {
             result.capture(line);
         }
         result
+    }
+    #[test]
+    fn rejected_pre_run_metadata_is_saved_exclusively_without_nn_values() {
+        let root = io_root();
+        let captured = Arc::new(Mutex::new(log(&[
+            "Node placements",
+            "Node(s) placed on [CPUExecutionProvider]. Number of nodes: 1",
+            "MatMul (p_nn)",
+            "Node(s) placed on [CUDAExecutionProvider]. Number of nodes: 1",
+            "MatMul (nn)",
+            "unrecognized callback record",
+        ])));
+        let gate = verify_placement("public", &graph(), &captured.lock().unwrap());
+        let detail = gate.as_ref().unwrap_err().detail;
+        let path = root.0.join("public-initial-placement.json");
+        record_initial_log(&captured, &path, "public", true, Some(&gate)).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let file: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(file["gate"], "rejected");
+        assert_eq!(file["gate_detail"], detail);
+        assert_eq!(file["before_first_neural_run"], true);
+        assert_eq!(file["nodes"][0]["provider"], CPU);
+        assert_eq!(file["nodes"][0]["name"], "p_nn");
+        assert_eq!(file["nodes"][0]["op"], "MatMul");
+        assert!(file.get("lines").is_none());
+        assert!(!std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("unrecognized callback record"));
+        assert!(record_initial_log(&captured, &path, "public", true, Some(&gate)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(record_initial_log(
+            &captured,
+            &root.0.join("absent").join("record.json"),
+            "public",
+            true,
+            Some(&gate)
+        )
+        .is_err());
+        assert_eq!(gate.as_ref().unwrap_err().detail, detail);
+        let failure_path = root.0.join("shared_pc-initial-placement.json");
+        record_initial_log(&captured, &failure_path, "shared_pc", false, None).unwrap();
+        let failure: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(failure_path).unwrap()).unwrap();
+        assert_eq!(failure["session_created"], false);
+        assert_eq!(failure["gate"], "not_reached");
+    }
+    #[test]
+    fn placement_json_byte_ceiling_rejects_before_extending_output() {
+        use std::io::Write;
+        let mut output = BoundedPlacementJson { bytes: Vec::new() };
+        output.write_all(&vec![0; MAX_PROFILE_BYTES]).unwrap();
+        assert!(output.write_all(b"x").is_err());
+        assert_eq!(output.bytes.len(), MAX_PROFILE_BYTES);
     }
     #[test]
     fn metadata_candidate_cannot_hide_model_data_or_unbounded_seed() {

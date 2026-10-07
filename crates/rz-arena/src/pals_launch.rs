@@ -3043,14 +3043,18 @@ mod tests {
                 .any(|a| a.contains("onnx") || a.contains("attestation") || a.contains("weights"))
         );
         assert_eq!(decoded.expected_provider_sessions(), 0);
+        let output_root = std::env::temp_dir().join("rovezero-pals-launch-mock-run");
         let arguments = decoded
-            .runtime_arguments(NativeEngineRole::Baseline, Path::new("/outside/run"))
+            .runtime_arguments(NativeEngineRole::Baseline, &output_root)
             .unwrap();
         assert_eq!(arguments.len(), 3);
-        assert!(arguments.contains(&OsString::from("--search-work-output-root=/outside/run")));
+        assert!(arguments.contains(&OsString::from(format!(
+            "--search-work-output-root={}",
+            output_root.display()
+        ))));
         assert!(
             decoded
-                .preflight_arguments(NativeEngineRole::Baseline, Path::new("/outside/run"))
+                .preflight_arguments(NativeEngineRole::Baseline, &output_root)
                 .unwrap()
                 .is_empty()
         );
@@ -3118,32 +3122,28 @@ mod tests {
         for a in &e.assets[2..] {
             assert!(lock.snapshot_relative_path(a).unwrap().starts_with("pals-"));
         }
+        let output_root = std::env::temp_dir().join("rovezero-pals-launch-native-runtime");
+        let other_output_root = std::env::temp_dir().join("rovezero-pals-launch-second-attempt");
         let arguments = lock
-            .runtime_arguments(NativeEngineRole::Baseline, Path::new("/outside/runtime"))
+            .runtime_arguments(NativeEngineRole::Baseline, &output_root)
             .unwrap();
         assert_eq!(arguments.len(), 4);
         let preflight = lock
-            .preflight_arguments(NativeEngineRole::Baseline, Path::new("/outside/runtime"))
+            .preflight_arguments(NativeEngineRole::Baseline, &output_root)
             .unwrap();
         assert_eq!(preflight, vec![pals_shared_runtime_argument().unwrap()]);
         let other_runtime = lock
-            .runtime_arguments(
-                NativeEngineRole::Baseline,
-                Path::new("/outside/second-attempt"),
-            )
+            .runtime_arguments(NativeEngineRole::Baseline, &other_output_root)
             .unwrap();
         let other_preflight = lock
-            .preflight_arguments(
-                NativeEngineRole::Baseline,
-                Path::new("/outside/second-attempt"),
-            )
+            .preflight_arguments(NativeEngineRole::Baseline, &other_output_root)
             .unwrap();
         assert_eq!(arguments.last(), other_runtime.last());
         assert_eq!(preflight, other_preflight);
         let cache_argument = arguments.last().unwrap().to_str().unwrap();
         assert!(cache_argument.starts_with("--pals-runtime-cache-root="));
         assert!(
-            !cache_argument.contains("/outside/runtime")
+            !cache_argument.contains(output_root.to_str().unwrap())
                 && !cache_argument.contains("second-attempt")
         );
     }

@@ -866,8 +866,21 @@ fn load_session(
     // Default native copying; no direct-reference initializer option is enabled.
     // Serialized owned bytes are freed immediately after successful/failed load.
     let loaded = builder.commit_from_memory(&bytes);
+    let placement = if let (Some((policy, _)), Some(log)) = (audit, &placement_log) {
+        loaded
+            .is_ok()
+            .then(|| policy.verify_initialization(role, log))
+    } else {
+        None
+    };
     let recorded = if let (Some((_, root)), Some(log)) = (audit, &placement_log) {
-        cuda_control::record_initial_log(log, &root.join(format!("{role}-initial-placement.log")))
+        cuda_control::record_initial_log(
+            log,
+            &root.join(format!("{role}-initial-placement.json")),
+            role,
+            loaded.is_ok(),
+            placement.as_ref(),
+        )
     } else {
         Ok(())
     };
@@ -875,12 +888,10 @@ fn load_session(
     // require both a saved bounded log and the independent pre-Run gate.
     let session =
         loaded.map_err(|e| native(CauseCode::ModelLoad, "PALS ONNX loading failed", e))?;
+    // Recording is attempted even for a rejected native/policy initialization.
+    // Preserve that primary error; a successful gate cannot bypass failed IO.
+    let placement = placement.transpose()?;
     recorded?;
-    let placement = if let (Some((policy, _)), Some(log)) = (audit, placement_log) {
-        Some(policy.verify_initialization(role, &log)?)
-    } else {
-        None
-    };
     Ok((session, placement))
 }
 
