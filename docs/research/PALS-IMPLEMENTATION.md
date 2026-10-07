@@ -491,3 +491,36 @@ raw resolver·자원·Core counter 조건은 외부 profile에 그대로 사용�
 외부-helper launch 등록, helper 자산 snapshot·합산 자원·종료 영수증, 실제 Stockfish
 실행과 수정 이후 paired 종단 인수는 여전히 후속 작업이다. DG06 metadata 구현도
 live producer·loader·resume 입장과 구분하여 별도 중앙 검사로 인수한다.
+
+### DG06 metadata와 실제 helper 식별의 추가 단위
+
+`44f65e4`는 Linux helper의 spawn 뒤 실제 `/proc` PID·process group·start tick 대조에
+성공한 경우에만 `ExternalProcessIdentity`를 보존한다. 종료 후 같은 역사 식별을 유지하며
+own checker·지원하지 않는 호스트·spawn 이전 실패에는 None을 남긴다. nested checker
+영수증에 이 식별을 추가했으며 exit·pipe drain·Native NN 완료와 독립적이다. 중앙 search
+164개·UCI 152개 library 검사와 두 패키지 all-target/all-feature Clippy가 통과했다.
+실제 arena의 inherited cgroup·helper PID join 인수는 이 타입 추가만으로 완료되지 않는다.
+
+`17fc6c5`는 DG06의 첫 metadata 계약이다. 별도 domain의 producer roster·unique input
+capture binding·envelope가 기존 raw dataset·split·current view와 독립 등록 pin을 묶는다.
+같은 게임의 두 producer는 다른 모델을 가질 수 있지만 각 producer의 source·epoch·
+등록 encoding은 모든 원시 이력에서 고정한다. 기존 input/raw/split/current seal과 label
+계보를 다시 검사하며 label provenance나 차례에서 input owner를 추정하지 않는다.
+
+NativeExact는 실제 선언된 encoding을 대조한다. PrivateCheckedDerivedQuery는 별도
+query schema·encoder·parent pin을 보존하고 항상 `requires_derived_adapter`에 남긴다.
+schema SHA의 형식 일치만으로 실제 private query·tensor 검사를 통과시키지 않는다.
+Python metadata 경계도 independently pinned raw receipt와 actual records/registry bytes,
+별도 fully validated current-view pin을 요구하며 기존 raw f64 seal을 새 표현으로 바꾸지 않는다.
+
+소스 pin을 고정한 중앙 Rust `pals_data` 33개(기존 25개+신규 8개), stdlib Python metadata
+12개, `rz-experiments`·`rz-arena` all-target/all-feature Clippy가 통과했다. Python의 이번
+검사는 모델·Torch·optimizer를 실행하지 않는다. 결과 scope는 항상 `metadata_only`이며
+실제 producer 사용·학습 입장·전체 목표 완료를 뜻하지 않는다.
+
+다음 연결은 독립 등록을 검증한 producer handle, 실제 capture evidence, 기존 출력
+budget 안의 roster/capture/envelope 영수증과 strict loader/resume이다. Native capture의
+현재 의미는 seal-before-submit·prepaid drain-after-search이며 durable disk write-before-submit
+증거로 보고하지 않는다. prepared journal 전체와 raw learning history의 unique input binding을
+구분해 divergence·거절·실패 입력을 보존한다. 기존 legacy loader/checkpoint에는 새 pin을
+자동 생성하여 strict 인수로 승격하지 않는다.
