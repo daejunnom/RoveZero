@@ -138,7 +138,7 @@ pub struct PalsOnnxCudaLaunchV3 {
     pub device_id: i32,
     pub session_arena_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cuda_control: Option<PalsCudaControlBindingV3>,
+    pub cuda_control: Option<Box<PalsCudaControlBindingV3>>,
 }
 /// Explicit reviewed metadata inventory; it does not declare GPU success.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -3298,7 +3298,7 @@ mod tests {
         let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut f.endpoints[0] else {
             unreachable!()
         };
-        cuda.cuda_control = Some(PalsCudaControlBindingV3 { inventory });
+        cuda.cuda_control = Some(Box::new(PalsCudaControlBindingV3 { inventory }));
         (f, bytes)
     }
     fn attach_control_witness(
