@@ -251,7 +251,13 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> SearchSessionDriver for Pa
             let outcome = engine.search_with_progress(
                 position,
                 rz_search::pals::engine::PalsLimits {
-                    deadline: context.control.admission_deadline,
+                    // End normal PALS work at the soft target. The existing
+                    // hard/output boundaries retain time for report validation,
+                    // physical completion, owner notification and UCI output.
+                    deadline: context
+                        .control
+                        .soft_deadline
+                        .min(context.control.admission_deadline),
                     max_rounds: self.max_rounds,
                     max_cpu_nodes: context.control.max_simulations,
                     cpu_depth: self.cpu_depth,
@@ -609,4 +615,112 @@ fn retain_work_failure(
         };
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rz_contracts::{GameGeneration, ProcessEpoch, RootGeneration, pals::SearchAuthority};
+    use rz_search::{
+        cpu::CpuConfig,
+        pals::engine::{
+            DivergenceQuery, PalsConfig, RoleError, RoleEvaluation, RoleModel, RoleQuery,
+        },
+        time::{TimeBudget, TimeBudgetConfig, TimeControl},
+    };
+
+    struct DeadlineObserver {
+        observed: Arc<Mutex<Vec<Instant>>>,
+    }
+    impl DeadlineObserver {
+        fn observe(&self, deadline: Instant) -> RoleError {
+            self.observed.lock().unwrap().push(deadline);
+            // Stop at the first actual role query, without sleeps or CPU work.
+            RoleError::Backend("test role deadline observed".into())
+        }
+    }
+    impl RoleModel for DeadlineObserver {
+        fn identity(&self) -> &str {
+            "test-only-pals-role-deadline-observer"
+        }
+        fn propose(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+            Err(self.observe(query.deadline))
+        }
+        fn reply(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+            Err(self.observe(query.deadline))
+        }
+        fn repair(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+            Err(self.observe(query.deadline))
+        }
+        fn divergences(&mut self, query: DivergenceQuery<'_>) -> Result<Vec<f32>, RoleError> {
+            Err(self.observe(query.deadline))
+        }
+    }
+
+    #[test]
+    fn pals_driver_role_query_uses_soft_target_without_extending_admission() {
+        for admission_is_earlier in [false, true] {
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let driver = PalsSessionDriver::new(
+                PalsConfig::default(),
+                DeadlineObserver {
+                    observed: Arc::clone(&observed),
+                },
+                CpuConfig {
+                    tt_entries: 0,
+                    ..CpuConfig::default()
+                },
+                1,
+                1,
+                1,
+                EngineIdentity {
+                    name: "PALS role deadline consumer test".into(),
+                    author: "RoveZero contributors".into(),
+                },
+            )
+            .unwrap();
+            // Reproduce the CPU06 low-clock allocation while keeping every
+            // timestamp in the future; the probe never waits for a deadline.
+            let start = Instant::now() + Duration::from_secs(60);
+            let budget = TimeBudget::new(
+                start,
+                TimeControl::Clock {
+                    remaining: Duration::from_millis(1010),
+                    increment: Duration::from_millis(1000),
+                    moves_to_go: None,
+                },
+                TimeBudgetConfig::default(),
+            )
+            .unwrap();
+            let mut control = SearchControl::from_budget(&budget, 1);
+            let expected = if admission_is_earlier {
+                // Shared contracts also permit admission to precede soft.
+                control.soft_deadline = control.deadline;
+                budget.admission_deadline
+            } else {
+                budget.soft_deadline
+            };
+            let authority = SearchAuthority {
+                epoch: ProcessEpoch(1),
+                game: GameGeneration(1),
+                root: RootGeneration(1),
+                implementation: driver.implementation(),
+            };
+            let context = SearchSessionContext {
+                authority,
+                control,
+                cancellation: CancelToken::new(),
+                shutdown_deadline: budget.output_deadline,
+                current: Arc::new(Mutex::new(SessionScope::Search(authority))),
+            };
+            let failure = driver
+                .run(&Position::startpos(), &context, &mut |_| {})
+                .unwrap_err();
+            assert_eq!(failure.code, "PalsSearch");
+            assert!(failure.detail.contains("test role deadline observed"));
+            assert_eq!(*observed.lock().unwrap(), [expected]);
+            assert_eq!(context.control.deadline, budget.hard_deadline);
+            assert!(!context.cancellation.is_canceled());
+        }
+    }
 }
