@@ -221,7 +221,16 @@ terminal·mate band·범위 밖·tie/margin 미달·partial·cancel·missing·un
 `CheckedWholeLinePair`는 immutable factory capability이고 원시 bytes 재로드 후 같은
 factory로 다시 인수합니다. ordinary policy·D current label·전략적 Repair validity·
 counterexample validity·WDL·minimax·전술 증명·학습 target 권한을 제공하지 않습니다.
-C slot·Repair 결정에 대한 projection과 frozen loss는 별도 후속 consumer가 필요합니다.
+`whole_line_projection.admit_repair_first_move_projection`은 최초 Repair의 실제
+current 상태에서 시작하는 두 suffix를 첫 합법 수의 조건부 비교로 연결합니다.
+같은 strict parent·Repair anchor와 결과 전 plan/criterion·실행 순서의 원시 pin을
+요구하며, 같은 첫 수에 다른 suffix만 붙인 경우는 두 후보로 만들지 않습니다.
+`frozen_repair_projection_preparation`은 기존 softplus loss의 학습 없는 준비만
+수행하고 CPU FP32·gradient 부재·parameter digest·원래 deadline을 전후 확인합니다.
+27개 CPU 검사는 합성 실행/Rules 증거와 작은 수치 fixture를 사용한 정확성 검사입니다.
+실제 Rust suffix 실행·checkpoint reload·학습·GPU 인수와 구분하며, 기존 ordinary
+Propose root의 whole-line 실행을 이 Repair 접점의 양의 실행 증거로 재사용하지 않습니다.
+C slot의 수선 witness와 ranking consumer는 별도 인수 항목입니다.
 기존 factual continuation을 새 사전 criterion이 있었던 자료로 소급 변환하지 않습니다.
 
 FLOPs 보고는 FMA=2 기준의 실제 선언 shape에 따른 matrix product 산술입니다.

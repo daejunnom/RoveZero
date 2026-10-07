@@ -1457,3 +1457,42 @@ standalone probe의 inherited affinity는 별도 관측하지 않았으므로 un
 `stockfish-helper-supervisor-76.json`에 보존했다. 기존 CPU02의 node256 실패와
 불완전 paired 결과를 이 성공으로 대체하지 않는다. 새 paired 실행은 제품 UCI와
 PALS example의 별도 등록, 새 조건·source·manifest digest 및 종단 인수를 요구한다.
+
+### 최초 Repair 결정의 whole-line projection
+
+[`whole_line_projection.py`](../../experiments/model-research/pals/src/rz_pals_model/whole_line_projection.py)는
+별도 `CheckedRepairWholeLineProjection` factory로 정확한 `CheckedRepairContext`와
+`CheckedWholeLinePair`를 연결한다. 같은 strict parent 객체·현재 Repair row·동일 causal
+anchor 객체와 `native_initial_repair`를 요구하며, continuation root의 전체 Rules
+descriptor와 이력을 반례 prefix의 실제 Rules target과 대조한다. 비교하는 line은
+현재 Repair 상태에서 시작하는 suffix다. root74의 ordinary Propose root 전체 수순
+비교는 이 projection의 실제 양성 증거가 아니다.
+
+결과 없는 별도 before 문서는 causal/current context, 원래 ordinal plan·criterion의
+byte pin과 ordered task/first move만 담는다. 결과 whole SHA·score·sign을 넣지 못하며,
+두 실제 launch의 pin과 durable-before-spawn 관측을 독립 caller bytes에 결합한다.
+`maximize_root_surrogate`에서 서로 다른 합법 첫 수만 별도
+`next_repair_move_whole_line_conditioned_surrogate` 목표로 소비한다. 같은 첫 수에 다른
+suffix는 `unsupported_same_first_move`로 보존하고 duplicate logit collation을 거절한다.
+일반 policy·WDL·전략적 Repair/반례 validity·C ranking·minimax·전술 증명은 부여하지 않는다.
+
+offline frozen helper는 독립 checkpoint reload observation과 현재 checkpoint/epoch,
+실제 config·유한 CPU FP32 parameter bytes를 확인한다. caller의 원래 absolute deadline과
+forward 전후 eval·requires_grad false·grad 없음·autocast 없음·parameter 및 parent 재검사를
+유지한다. all-masked 준비는 forward 전에 거절하며 backward·optimizer·update는 없다.
+제품 Rust 엔진과 기존 wire·workspace·공통 revision은 변경하지 않는다.
+
+root78은 CPU Torch 2.8.0/NumPy 2.2.6에서 집중 합성 fixture 27개를 통과했다.
+소스와 검사는 각각 `448e39f4733559955fd36a97eeffb19cfbebef9d63f52f1f74e9dca55f80432d`,
+`91d03a2ecd1c4f76e53bae76cb3d0ee2701dcc0edb8004be8c1509521caba82d`이며 실행 전후 일치했다.
+작은 numeric stand-in의 loss 배선 검사로서 실제 Rust Rules child·checkpoint reload·
+조건부 Repair projection의 실제 양성 인수·학습·기력 증거는 아니다. affinity 0/2,
+high 6GiB/max 12GiB·swap 0·pids 128과 managed temporary/tree 정리를 확인했다.
+service 115.255초에는 환경 설치가 포함되며 성능 비교가 아니다. 종료 후 service가
+표시한 peak로 실제 model/system peak를 판정하지 않으며 해당 peak는 unknown이다.
+원시 자료는 continuation 관리 경로의 `repair-projection-model-tests-78.log`와 resource,
+managed 기록에 보존한다. GPU 검증은 계속 보류한다.
+
+기존 `c483512`의 [CI 37702463443](https://github.com/daejunnom/RoveZero/actions/runs/37702463443)는
+네 CPU job 모두 성공했고 Windows job은 2026-10-07 23:35:16 UTC에 완료됐다.
+이 결과에 신규 projection 소스의 CI 인수를 포함시키지 않는다.
