@@ -51,6 +51,14 @@ pub struct ProcessReceipt {
     pub supervisor_version: u32,
     pub pid: u32,
     pub elapsed_ns: u64,
+    /// Observed group cleanup begins after terminal/stop detection and includes
+    /// the final group check and owned leader reap. It excludes engine play.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_elapsed_ns: Option<u64>,
+    /// Missing historical fields deserialize as unknown; a current run records
+    /// a stable reason whenever cleanup completion/timing could not be observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_timing_unavailable_reason: Option<String>,
     pub stop: ProcessStop,
     pub exit_code: Option<i32>,
     pub exit_signal: Option<i32>,
@@ -528,6 +536,8 @@ mod linux {
             supervisor_version: 1,
             pid,
             elapsed_ns: 0,
+            cleanup_elapsed_ns: None,
+            cleanup_timing_unavailable_reason: None,
             stop: ProcessStop::Exited,
             exit_code: None,
             exit_signal: None,
@@ -570,6 +580,7 @@ mod linux {
         let mut killed = false;
         let mut leader_done = false;
         let mut ownership_lost = false;
+        let mut cleanup_started = None;
         let preserve_unverified = matches!(watch, Some(ArtifactObservation::Tree(_)));
         loop {
             let now = Instant::now();
@@ -691,6 +702,9 @@ mod linux {
                     }
                 }
             }
+            if leader_done || stop.is_some() {
+                cleanup_started.get_or_insert_with(Instant::now);
+            }
             let last_group = match group_snapshot(pid, pid) {
                 Ok(snapshot) => {
                     if snapshot.members > limits.max_child_processes {
@@ -708,6 +722,11 @@ mod linux {
                     None
                 }
             };
+            // The group observation itself can trigger a child-limit or I/O
+            // stop. Begin timing before its subsequent termination/cleanup.
+            if stop.is_some() {
+                cleanup_started.get_or_insert_with(Instant::now);
+            }
             let no_others = last_group.is_some_and(|snapshot| snapshot.other_members == 0);
             if leader_done && no_others && stdout.is_none() && stderr.is_none() {
                 // The child may have created its final outputs between this
@@ -724,11 +743,13 @@ mod linux {
                 stop.get_or_insert(ProcessStop::Exited);
             }
             if stop.is_some() && shutdown.is_none() {
-                shutdown = Some(now);
+                // The observation/drain work above can take time. Grace begins
+                // at the actual termination request, not this pass's old clock.
+                shutdown = Some(Instant::now());
                 signal(group, Signal::SIGTERM, &mut receipt, "process.term");
             }
             if let Some(shutdown_at) = shutdown {
-                let age = now.duration_since(shutdown_at);
+                let age = shutdown_at.elapsed();
                 if age >= grace && !killed {
                     signal(group, Signal::SIGKILL, &mut receipt, "process.kill");
                     killed = true;
@@ -749,6 +770,14 @@ mod linux {
             ownership_lost,
             preserve_unverified,
         );
+        let cleanup_finished = Instant::now();
+        record_cleanup_timing(
+            &mut receipt,
+            cleanup_started,
+            cleanup_finished,
+            ownership_lost,
+            pending_child.is_some(),
+        );
         receipt.stop = stop.unwrap_or(ProcessStop::Exited);
         receipt.elapsed_ns = u64::try_from(started.elapsed().as_nanos())
             .map_err(|_| ArenaError::Budget("process elapsed duration overflow".into()))?;
@@ -760,6 +789,51 @@ mod linux {
             stderr: err,
             pending_child,
         })
+    }
+
+    fn record_cleanup_timing(
+        receipt: &mut ProcessReceipt,
+        started: Option<Instant>,
+        finished: Instant,
+        ownership_lost: bool,
+        pending_child: bool,
+    ) {
+        let unavailable = if ownership_lost
+            || receipt
+                .errors
+                .iter()
+                .any(|code| code == "process.ownership_lost")
+        {
+            Some("process_cleanup_ownership_lost_completion_unobserved")
+        } else if pending_child || receipt.group_cleanup != CleanupStatus::Gone {
+            Some("process_cleanup_completion_unverified")
+        } else if receipt.errors.iter().any(|code| code == "process.reap") {
+            Some("process_cleanup_reap_failed")
+        } else if started.is_none() {
+            Some("process_cleanup_interval_not_started")
+        } else {
+            None
+        };
+        if let Some(reason) = unavailable {
+            receipt.cleanup_elapsed_ns = None;
+            receipt.cleanup_timing_unavailable_reason = Some(reason.into());
+        } else {
+            match u64::try_from(
+                finished
+                    .duration_since(started.expect("observed cleanup start"))
+                    .as_nanos(),
+            ) {
+                Ok(elapsed) => {
+                    receipt.cleanup_elapsed_ns = Some(elapsed);
+                    receipt.cleanup_timing_unavailable_reason = None;
+                }
+                Err(_) => {
+                    receipt.cleanup_elapsed_ns = None;
+                    receipt.cleanup_timing_unavailable_reason =
+                        Some("process_cleanup_duration_overflow".into());
+                }
+            }
+        }
     }
 
     fn finish_child(
@@ -1335,6 +1409,8 @@ mod linux {
                 supervisor_version: 1,
                 pid,
                 elapsed_ns: 0,
+                cleanup_elapsed_ns: None,
+                cleanup_timing_unavailable_reason: None,
                 stop: ProcessStop::Exited,
                 exit_code: Some(0),
                 exit_signal: None,
@@ -1351,6 +1427,21 @@ mod linux {
         }
 
         #[test]
+        fn historical_process_receipts_keep_cleanup_timing_unknown() {
+            let receipt = receipt(123, CleanupStatus::Gone);
+            let historical = serde_json::to_value(receipt).unwrap();
+            assert!(historical.get("cleanup_elapsed_ns").is_none());
+            assert!(
+                historical
+                    .get("cleanup_timing_unavailable_reason")
+                    .is_none()
+            );
+            let decoded: ProcessReceipt = serde_json::from_value(historical).unwrap();
+            assert!(decoded.cleanup_elapsed_ns.is_none());
+            assert!(decoded.cleanup_timing_unavailable_reason.is_none());
+        }
+
+        #[test]
         fn tree_observation_ownership_loss_keeps_original_handle_without_reaping() {
             for tree in [false, true] {
                 let child = externally_reaped_child();
@@ -1362,6 +1453,12 @@ mod linux {
                 ];
                 let mut stop = Some(ProcessStop::IoFailure);
                 let pending = finish_child(child, &mut receipt, &mut stop, false, true, tree);
+                record_cleanup_timing(&mut receipt, None, Instant::now(), true, pending.is_some());
+                assert!(receipt.cleanup_elapsed_ns.is_none());
+                assert_eq!(
+                    receipt.cleanup_timing_unavailable_reason.as_deref(),
+                    Some("process_cleanup_ownership_lost_completion_unobserved")
+                );
                 assert_eq!(
                     pending.as_ref().map(std::process::Child::id),
                     tree.then_some(pid)
@@ -1388,6 +1485,22 @@ mod linux {
                 let mut receipt = receipt(pid, CleanupStatus::Gone);
                 let mut stop = Some(ProcessStop::Exited);
                 let pending = finish_child(child, &mut receipt, &mut stop, true, false, tree);
+                record_cleanup_timing(
+                    &mut receipt,
+                    Some(Instant::now()),
+                    Instant::now(),
+                    false,
+                    pending.is_some(),
+                );
+                assert!(receipt.cleanup_elapsed_ns.is_none());
+                assert_eq!(
+                    receipt.cleanup_timing_unavailable_reason.as_deref(),
+                    Some(if tree {
+                        "process_cleanup_ownership_lost_completion_unobserved"
+                    } else {
+                        "process_cleanup_reap_failed"
+                    })
+                );
                 assert_eq!(
                     pending.as_ref().map(std::process::Child::id),
                     tree.then_some(pid)

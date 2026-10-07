@@ -1,0 +1,2545 @@
+//! Finite own-data collection: checked Rules -> sealed input -> own analysis ->
+//! later labels. No external teacher, optimizer, GPU or cloud launch lives here.
+use crate::{ArenaError, canonical_sha256};
+#[cfg(feature = "pals-collection")]
+use rz_eval::pals_model::PALS_ENCODING_SCHEMA;
+use rz_eval::pals_model::{PalsModelConfig, PalsModelInput};
+use rz_experiments::{
+    PalsConditionalValidity, PalsCounterexampleTarget, PalsDataRole, PalsDatasetAudit,
+    PalsDatasetSplit, PalsFrozenInput, PalsFutureLabel, PalsGameEnd, PalsGameResult,
+    PalsInputSnapshot, PalsInputSource, PalsLearningRecord, PalsOutcome, PalsOwnedSources,
+    PalsPolicyTarget, PalsPublicRecord, PalsSplit, PalsTargetProvenance,
+};
+use rz_position::contracts::ContractPosition;
+use rz_position::{BoardMove, Color, PlayStatus, Position, PositionLimits, TerminalReason};
+use rz_search::cpu::{
+    BOOTSTRAP_SCORE_VERSION, CPU_SEARCH_VERSION, CpuConfig, CpuEngine, CpuLimits, CpuReport,
+    CpuScoreScope,
+};
+use rz_search::pals::engine::{
+    LegalOrderRoleMock, PalsConfig, PalsEngine, PalsLimits, RecordKind, RoleQuery, RoleRecord,
+};
+use rz_search::pals::store::{Move16, StateId};
+#[cfg(feature = "pals-collection")]
+use rz_uci::pals_native::{
+    NativeQueryKind, pals_native_source_digest, pals_rules_encoding_semantic_digest,
+    prepare_role_input,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
+use std::hash::{Hash, Hasher};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+pub const PALS_COLLECT_VERSION: &str = "rz-pals-own-collector/1";
+const MAX_ROWS: usize = 65_536;
+const RECEIPT_RESERVE: u64 = 256 * 1024;
+const MAX_JSON_RECORD_BYTES: usize = 256 * 1024;
+static NEXT_CAPTURE_OWNER: AtomicU64 = AtomicU64::new(1);
+
+fn invalid(message: impl Into<String>) -> ArenaError {
+    ArenaError::Invalid(message.into())
+}
+fn io(error: std::io::Error) -> ArenaError {
+    ArenaError::Io(error.to_string())
+}
+fn rules(error: rz_position::PositionError) -> ArenaError {
+    ArenaError::Contract(error.into())
+}
+fn ident(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 96
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PalsCollectionOpening {
+    pub id: String,
+    pub initial_fen: Option<String>,
+    pub moves: Vec<String>,
+    pub split: PalsSplit,
+}
+impl Default for PalsCollectionOpening {
+    fn default() -> Self {
+        Self {
+            id: "startpos".into(),
+            initial_fen: None,
+            moves: Vec::new(),
+            split: PalsSplit::Train,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PalsCollectionConfig {
+    pub run_id: String,
+    pub games: u32,
+    pub max_plies: u32,
+    pub cpu_depth: u16,
+    pub nodes_per_job: u64,
+    pub max_total_nodes: u64,
+    pub max_wall_time_ms: u64,
+    pub max_output_bytes: u64,
+    pub seed: u64,
+    /// Seeded legal plies before collection. These are actual opening moves,
+    /// never virtual counterexample moves or unseen teacher choices.
+    pub exploration_plies: u16,
+    pub collect_conditional_repair: bool,
+    pub openings: Vec<PalsCollectionOpening>,
+}
+impl Default for PalsCollectionConfig {
+    fn default() -> Self {
+        Self {
+            run_id: "own-cpu-pilot".into(),
+            games: 1,
+            max_plies: 32,
+            cpu_depth: 2,
+            nodes_per_job: 2048,
+            max_total_nodes: 196_608,
+            max_wall_time_ms: 60_000,
+            max_output_bytes: 8 * 1024 * 1024,
+            seed: 1,
+            exploration_plies: 2,
+            collect_conditional_repair: true,
+            openings: vec![PalsCollectionOpening::default()],
+        }
+    }
+}
+impl PalsCollectionConfig {
+    pub fn validate(&self) -> Result<(), ArenaError> {
+        if !ident(&self.run_id)
+            || self.games == 0
+            || self.games > 128
+            || self.max_plies == 0
+            || self.max_plies > 1024
+            || self.cpu_depth == 0
+            || self.cpu_depth > 16
+            || self.nodes_per_job == 0
+            || self.nodes_per_job > 10_000_000
+            || self.max_total_nodes == 0
+            || self.max_wall_time_ms == 0
+            || self.max_wall_time_ms > 3_600_000
+            || self.max_output_bytes <= RECEIPT_RESERVE * 2
+            || self.max_output_bytes > 1024 * 1024 * 1024
+            || self.openings.is_empty()
+            || self.openings.len() > 128
+            || self.exploration_plies > 32
+            || u64::from(self.games) * (u64::from(self.max_plies) + 1) * 8 > MAX_ROWS as u64
+        {
+            return Err(invalid(
+                "collector needs finite game/ply/depth/node/time/row/output limits",
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        for opening in &self.openings {
+            if !ident(&opening.id)
+                || !ids.insert(&opening.id)
+                || opening.moves.len() > 256
+                || opening
+                    .initial_fen
+                    .as_ref()
+                    .is_some_and(|f| f.len() > 512 || f.chars().any(char::is_control))
+                || opening.moves.iter().any(|m| m.len() > 5)
+            {
+                return Err(invalid("invalid or duplicate collector opening"));
+            }
+        }
+        if serde_json::to_vec(self)
+            .map_err(|e| invalid(e.to_string()))?
+            .len()
+            > 64 * 1024
+        {
+            return Err(invalid("collector configuration byte limit"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PalsCollectionSourceDescription {
+    pub mode: String,
+    pub source: PalsInputSource,
+    pub cpu_profile_sha256: String,
+    pub implementation_sha256: String,
+    pub encoding_sha256: String,
+    pub encoder_source_sha256: String,
+    pub configuration: serde_json::Value,
+    /// For weightless CPU data this is an opaque encoding-only zero epoch.
+    /// A real PALS provider must supply its actual registered epoch.
+    pub model_epoch: [u8; 32],
+    pub model_epoch_kind: String,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct PalsCollectedLine {
+    pub kind: String,
+    pub moves: Vec<u16>,
+    pub raw_value: Option<i32>,
+    pub completed_depth: u16,
+    pub raw_scope: String,
+    pub white_perspective: bool,
+}
+#[derive(Clone, Debug)]
+pub struct PalsCollectionDecision {
+    pub best_move: Option<BoardMove>,
+    pub pv: Vec<BoardMove>,
+    pub nodes: u64,
+    pub completed_depth: u16,
+    pub completed_estimate: bool,
+    pub raw: serde_json::Value,
+    pub genealogy: Vec<PalsCollectedLine>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PalsNativeInputSidecar {
+    pub version: String,
+    pub input_sha256: String,
+    pub encoding_sha256: String,
+    pub encoder_source_sha256: String,
+    pub model_epoch_kind: String,
+    pub canonical_tensor_sha256: String,
+    /// Preserve Rust serialization exactly; Python must not reserialize f32 to
+    /// guess its byte identity.
+    pub tensor_json: String,
+    pub tensor_sha256: String,
+    /// Exactly the selected tensor-record order, with immutable raw sources.
+    pub record_sources: Vec<PalsPublicRecord>,
+    pub sha256: String,
+}
+
+/// Model-backed PALS drivers may supply the same sealed-input boundary. Their
+/// exact configuration/weights must already be enrolled in the independent
+/// registry; a returned row cannot register itself. Only builtin CPU/mock
+/// drivers are exposed by the executable example.
+pub trait PalsCollectionDriver {
+    fn description(&self) -> &PalsCollectionSourceDescription;
+    fn new_game(&mut self);
+    fn analyze(
+        &mut self,
+        position: &Position,
+        input: &PalsFrozenInput,
+        prepared: &PalsModelInput,
+        limits: CpuLimits,
+        cancel: &AtomicBool,
+    ) -> Result<PalsCollectionDecision, ArenaError>;
+}
+
+fn hex(value: [u8; 32]) -> String {
+    value.iter().map(|b| format!("{b:02x}")).collect()
+}
+#[cfg(feature = "pals-collection")]
+fn native_encoding_sha() -> Result<String, ArenaError> {
+    let mut hash = Sha256::new();
+    hash.update(PALS_ENCODING_SCHEMA);
+    hash.update(pals_rules_encoding_semantic_digest());
+    Ok(format!("{:x}", hash.finalize()))
+}
+#[cfg(not(feature = "pals-collection"))]
+fn native_encoding_sha() -> Result<String, ArenaError> {
+    Err(invalid(
+        "actual own-data collection requires pals-collection feature and native Rust Rules encoder",
+    ))
+}
+
+fn file_sha(path: &Path, max_bytes: u64) -> Result<String, ArenaError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(io)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > max_bytes {
+        return Err(invalid("source asset is not a bounded regular file"));
+    }
+    let mut file = File::open(path).map_err(io)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file.read(&mut buffer).map_err(io)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .filter(|n| *n <= max_bytes)
+            .ok_or_else(|| invalid("source asset grew beyond limit"))?;
+        hash.update(&buffer[..read]);
+    }
+    if total != metadata.len() {
+        return Err(invalid("source asset changed during verification"));
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn source_description(
+    config: &CpuConfig,
+    mode: &str,
+    extra: serde_json::Value,
+) -> Result<PalsCollectionSourceDescription, ArenaError> {
+    let implementation = file_sha(&std::env::current_exe().map_err(io)?, 256 * 1024 * 1024)?;
+    let configuration = serde_json::json!({"domain":"rz-own-cpu-configuration/1","mode":mode,
+        "search":CPU_SEARCH_VERSION,"evaluator":BOOTSTRAP_SCORE_VERSION,"profile":config.profile.identity(),
+        "tt_entries":config.tt_entries,"max_depth":config.max_depth,"quiescence_ply":config.quiescence_ply,"extra":extra});
+    let profile = canonical_sha256(&configuration)?;
+    Ok(PalsCollectionSourceDescription {
+        mode: mode.into(),
+        source: PalsInputSource::OwnCpu {
+            cpu_binary_sha256: implementation.clone(),
+            evaluator_configuration_sha256: profile.clone(),
+            model_weights_sha256: None,
+        },
+        cpu_profile_sha256: profile,
+        implementation_sha256: implementation,
+        encoding_sha256: native_encoding_sha()?,
+        encoder_source_sha256: native_source_sha()?,
+        configuration,
+        model_epoch: [0; 32],
+        model_epoch_kind: "encoding_only_zero".into(),
+    })
+}
+
+pub struct OwnCpuCollectionDriver {
+    engine: CpuEngine,
+    description: PalsCollectionSourceDescription,
+}
+impl OwnCpuCollectionDriver {
+    pub fn new(config: CpuConfig) -> Result<Self, ArenaError> {
+        let description =
+            source_description(&config, "own-cpu-bootstrap", serde_json::Value::Null)?;
+        let engine = CpuEngine::new(config).map_err(|e| invalid(e.to_string()))?;
+        Ok(Self {
+            engine,
+            description,
+        })
+    }
+}
+fn cpu_raw(report: &CpuReport) -> serde_json::Value {
+    serde_json::json!({"search_version":report.search_version,"profile":report.profile.identity(),
+        "score_provenance":report.score_provenance,"raw_score":report.score,"score_scope":format!("{:?}",report.score_scope),
+        "completed_depth":report.completed_depth,"nodes":report.nodes,"quiescence_nodes":report.quiescence_nodes,
+        "tt_hits":report.tt_hits,"completion":format!("{:?}",report.completion),"root_restricted":report.root_restricted,
+        "pv":report.pv.iter().map(ToString::to_string).collect::<Vec<_>>(),"elapsed_us":report.elapsed.as_micros().min(u64::MAX as u128) as u64})
+}
+impl PalsCollectionDriver for OwnCpuCollectionDriver {
+    fn description(&self) -> &PalsCollectionSourceDescription {
+        &self.description
+    }
+    fn new_game(&mut self) {
+        self.engine.clear();
+    }
+    fn analyze(
+        &mut self,
+        position: &Position,
+        _input: &PalsFrozenInput,
+        _prepared: &PalsModelInput,
+        limits: CpuLimits,
+        cancel: &AtomicBool,
+    ) -> Result<PalsCollectionDecision, ArenaError> {
+        let r = self
+            .engine
+            .analyze(position, limits, cancel)
+            .map_err(|e| invalid(e.to_string()))?;
+        Ok(PalsCollectionDecision {
+            best_move: r.best_move,
+            pv: r.pv.clone(),
+            nodes: r.nodes,
+            completed_depth: r.completed_depth,
+            completed_estimate: r.score_scope == CpuScoreScope::CompletedIteration,
+            raw: cpu_raw(&r),
+            genealogy: vec![PalsCollectedLine {
+                kind: "cpu_proposal".into(),
+                moves: pack(&r.pv)?,
+                raw_value: Some(r.score),
+                completed_depth: r.completed_depth,
+                raw_scope: format!("{:?}", r.score_scope),
+                white_perspective: position.side_to_move() == Color::White,
+            }],
+        })
+    }
+}
+
+/// CPU-only PALS lineage collection. Legal-order role mocks have no learned
+/// parameters; this mode is explicitly not evidence of trained P/C strength.
+pub struct OwnPalsMockCollectionDriver {
+    engine: PalsEngine<LegalOrderRoleMock>,
+    description: PalsCollectionSourceDescription,
+}
+impl OwnPalsMockCollectionDriver {
+    pub fn new(cpu: CpuConfig, config: PalsConfig) -> Result<Self, ArenaError> {
+        let extra = serde_json::json!({"beam":config.beam_width,"line_plies":config.line_plies,"max_nodes":config.max_nodes,
+            "max_records":config.max_records,"max_role_calls":config.max_role_calls,"cpu_nodes_per_task":config.cpu_nodes_per_task});
+        let description = source_description(&cpu, "own-pals-legal-order-cpu-mock", extra)?;
+        let engine = PalsEngine::new(
+            config,
+            LegalOrderRoleMock,
+            CpuEngine::new(cpu).map_err(|e| invalid(e.to_string()))?,
+        )
+        .map_err(|e| invalid(e.to_string()))?;
+        Ok(Self {
+            engine,
+            description,
+        })
+    }
+}
+impl PalsCollectionDriver for OwnPalsMockCollectionDriver {
+    fn description(&self) -> &PalsCollectionSourceDescription {
+        &self.description
+    }
+    fn new_game(&mut self) {
+        self.engine.new_game();
+    }
+    fn analyze(
+        &mut self,
+        position: &Position,
+        _input: &PalsFrozenInput,
+        _prepared: &PalsModelInput,
+        limits: CpuLimits,
+        cancel: &AtomicBool,
+    ) -> Result<PalsCollectionDecision, ArenaError> {
+        let before = self
+            .engine
+            .records()
+            .iter()
+            .map(|r| r.revision)
+            .max()
+            .unwrap_or(0);
+        let r = self
+            .engine
+            .search(
+                position,
+                PalsLimits {
+                    deadline: limits
+                        .deadline
+                        .ok_or_else(|| invalid("PALS collection needs a deadline"))?,
+                    max_rounds: 2,
+                    max_cpu_nodes: limits.max_nodes,
+                    cpu_depth: limits.max_depth,
+                },
+                cancel,
+            )
+            .map_err(|e| invalid(e.to_string()))?;
+        let mut genealogy = Vec::new();
+        for record in self
+            .engine
+            .records()
+            .iter()
+            .filter(|record| record.revision > before)
+        {
+            if !self
+                .engine
+                .stores()
+                .states
+                .get(record.origin_state)
+                .map_err(|e| invalid(e.to_string()))?
+                .same_state(&position.snapshot())
+            {
+                continue;
+            }
+            genealogy.push(PalsCollectedLine {
+                kind: format!("{:?}", record.kind),
+                moves: pack(&record.line)?,
+                raw_value: record.value,
+                completed_depth: record.completed_depth,
+                raw_scope: format!("{:?}", record.score_scope),
+                white_perspective: record.perspective == Color::White,
+            });
+        }
+        Ok(PalsCollectionDecision {
+            best_move: r.best_move,
+            pv: r.best_move.into_iter().collect(),
+            nodes: r.counters.cpu_nodes,
+            // A mock PALS choice is a restricted-engine decision, not a single
+            // completed CPU task. Preserve its real task lineage without
+            // fabricating a completed-depth/policy label for the choice.
+            completed_depth: 0,
+            completed_estimate: false,
+            raw: serde_json::json!({"source":"pals_cpu_mock","completion":format!("{:?}",r.completion),"value_scope":format!("{:?}",r.value_scope),
+                "raw_score":r.score,"cpu_nodes":r.counters.cpu_nodes,"cpu_tasks":r.counters.cpu_tasks,"completed_cpu_tasks":r.counters.completed_cpu_tasks,
+                "role_calls":r.counters.role_calls,"model":r.model_identity,"elapsed_us":r.elapsed.as_micros().min(u64::MAX as u128) as u64}),
+            genealogy,
+        })
+    }
+}
+
+fn pack(moves: &[BoardMove]) -> Result<Vec<u16>, ArenaError> {
+    moves
+        .iter()
+        .map(|mv| {
+            Move16::pack(*mv)
+                .map(|m| m.bits())
+                .map_err(|e| invalid(e.to_string()))
+        })
+        .collect()
+}
+fn state_sha(position: &Position) -> Result<String, ArenaError> {
+    let owner = NEXT_CAPTURE_OWNER
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+        .map_err(|_| invalid("capture owner registry exhausted"))?;
+    let exported =
+        ContractPosition::new(rz_contracts::OwnerId(owner), position.clone()).export()?;
+    Ok(exported
+        .snapshot()
+        .identity()
+        .semantic
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+struct IdentityHasher(Sha256);
+impl Hasher for IdentityHasher {
+    fn finish(&self) -> u64 {
+        let bytes = self.0.clone().finalize();
+        u64::from_le_bytes(bytes[..8].try_into().expect("eight digest bytes"))
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+}
+fn transposition_sha(position: &Position) -> String {
+    let mut hasher = IdentityHasher(Sha256::new());
+    hasher.write(b"rz-rules-transposition-group/1");
+    position.snapshot().repetition_identity().hash(&mut hasher);
+    format!("{:x}", hasher.0.finalize())
+}
+
+struct Output {
+    directory: PathBuf,
+    files: BTreeMap<&'static str, File>,
+    max_bytes: u64,
+    bytes: u64,
+    failed_artifacts: BTreeSet<&'static str>,
+}
+fn inside_git(path: &Path) -> bool {
+    path.ancestors()
+        .any(|ancestor| ancestor.join(".git").exists())
+}
+struct BoundedJson {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+impl Write for BoundedJson {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(std::io::Error::other(
+                "collector serialized record byte limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn bounded_json<T: Serialize>(
+    value: &T,
+    limit: usize,
+    pretty: bool,
+) -> Result<Vec<u8>, ArenaError> {
+    let mut writer = BoundedJson {
+        bytes: Vec::new(),
+        limit,
+    };
+    if pretty {
+        serde_json::to_writer_pretty(&mut writer, value)
+    } else {
+        serde_json::to_writer(&mut writer, value)
+    }
+    .map_err(|e| {
+        if e.is_io() {
+            ArenaError::Budget(e.to_string())
+        } else {
+            invalid(e.to_string())
+        }
+    })?;
+    Ok(writer.bytes)
+}
+impl Output {
+    fn new(root: &Path, run_id: &str, max_bytes: u64) -> Result<Self, ArenaError> {
+        if !root.is_absolute()
+            || root
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(invalid(
+                "output root must be an absolute path without parent traversal",
+            ));
+        }
+        let checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| invalid("checkout location unavailable"))?
+            .canonicalize()
+            .map_err(io)?;
+        let mut existing = root;
+        while !existing.exists() {
+            existing = existing
+                .parent()
+                .ok_or_else(|| invalid("output root has no existing ancestor"))?;
+        }
+        let resolved_ancestor = existing.canonicalize().map_err(io)?;
+        if resolved_ancestor.starts_with(&checkout) || inside_git(&resolved_ancestor) {
+            return Err(invalid(
+                "collection outputs must remain outside Git checkout",
+            ));
+        }
+        std::fs::create_dir_all(root).map_err(io)?;
+        let resolved = root.canonicalize().map_err(io)?;
+        if resolved.starts_with(&checkout) || inside_git(&resolved) {
+            return Err(invalid("resolved output root is inside checkout"));
+        }
+        let directory = resolved.join(run_id);
+        std::fs::create_dir(&directory).map_err(io)?;
+        Ok(Self {
+            directory,
+            files: BTreeMap::new(),
+            max_bytes,
+            bytes: 0,
+            failed_artifacts: BTreeSet::new(),
+        })
+    }
+    fn write(
+        &mut self,
+        name: &'static str,
+        bytes: &[u8],
+        final_record: bool,
+    ) -> Result<(), ArenaError> {
+        let ceiling = if final_record {
+            self.max_bytes
+        } else {
+            self.max_bytes - RECEIPT_RESERVE
+        };
+        let new = self
+            .bytes
+            .checked_add(bytes.len() as u64)
+            .filter(|n| *n <= ceiling)
+            .ok_or_else(|| ArenaError::Budget("collector output byte limit".into()))?;
+        // Reserve before attempting an I/O operation: a failed write_all may
+        // already have written a prefix. Failed attempts never release quota.
+        self.bytes = new;
+        if !self.files.contains_key(name) {
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(self.directory.join(name))
+                .map_err(io)?;
+            self.files.insert(name, file);
+        }
+        #[cfg(all(test, feature = "pals-collection"))]
+        if let Some(prefix) = tests::FAIL_ARTIFACT.with(|flag| {
+            if flag.get().is_some_and(|(target, _)| target == name) {
+                let (_, prefix) = flag.get().expect("checked fault target");
+                flag.set(None);
+                Some(prefix)
+            } else {
+                None
+            }
+        }) {
+            self.files
+                .get_mut(name)
+                .ok_or_else(|| invalid("injected failure artifact not opened"))?
+                .write_all(&bytes[..prefix.min(bytes.len())])
+                .map_err(io)?;
+            self.failed_artifacts.insert(name);
+            return Err(ArenaError::Budget(
+                "injected partial artifact write failure".into(),
+            ));
+        }
+        let written = self
+            .files
+            .get_mut(name)
+            .expect("opened artifact")
+            .write_all(bytes);
+        if let Err(error) = written {
+            self.failed_artifacts.insert(name);
+            return Err(io(error));
+        }
+        Ok(())
+    }
+    fn json<T: Serialize>(&mut self, name: &'static str, value: &T) -> Result<String, ArenaError> {
+        let bytes = bounded_json(value, MAX_JSON_RECORD_BYTES, false)?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let mut line = bytes;
+        line.push(b'\n');
+        self.write(name, &line, false)?;
+        Ok(digest)
+    }
+    fn final_json<T: Serialize>(
+        &mut self,
+        name: &'static str,
+        value: &T,
+    ) -> Result<(), ArenaError> {
+        let mut bytes = bounded_json(value, MAX_JSON_RECORD_BYTES, false)?;
+        bytes.push(b'\n');
+        self.write(name, &bytes, true)
+    }
+    fn finish(&mut self, receipt: &PalsCollectionReceipt) -> Result<(), ArenaError> {
+        // Compact admitted source+run config and bounded result/failure text
+        // fit the receipt reserve; pretty indentation must not multiply them.
+        let mut bytes = bounded_json(receipt, RECEIPT_RESERVE as usize - 1, false)?;
+        bytes.push(b'\n');
+        self.write("receipt.json", &bytes, true)?;
+        for file in self.files.values() {
+            file.sync_all().map_err(io)?;
+        }
+        Ok(())
+    }
+    fn artifacts(&self) -> Result<BTreeMap<String, PalsCollectionArtifact>, ArenaError> {
+        let mut result = BTreeMap::new();
+        for name in self.files.keys() {
+            let path = self.directory.join(name);
+            let bytes = std::fs::metadata(&path).map_err(io)?.len();
+            result.insert(
+                (*name).into(),
+                PalsCollectionArtifact {
+                    bytes,
+                    sha256: file_sha(&path, self.max_bytes)?,
+                },
+            );
+        }
+        Ok(result)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PalsCollectionArtifact {
+    pub bytes: u64,
+    pub sha256: String,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct PalsCollectionReceipt {
+    pub version: String,
+    pub run_id: String,
+    pub source: PalsCollectionSourceDescription,
+    pub config: PalsCollectionConfig,
+    pub complete: bool,
+    pub failure: Option<String>,
+    pub games_finished: u32,
+    pub cpu_nodes: u64,
+    pub cpu_jobs: u64,
+    pub wall_time_ms: u64,
+    /// Payload written before this receipt; the receipt reserve is separately declared.
+    pub data_output_bytes: u64,
+    /// Includes full reservations for failed/partial writes, conservatively
+    /// ensuring the artifact bytes cannot exceed the declared output ceiling.
+    pub reserved_output_bytes: u64,
+    pub receipt_reserve_bytes: u64,
+    pub results: Vec<PalsGameResult>,
+    pub audit: Option<PalsDatasetAudit>,
+    /// Exact admitted artifact bytes before receipt creation. The receipt never
+    /// declares its own digest or reads files named by supplied dataset rows.
+    pub artifacts: BTreeMap<String, PalsCollectionArtifact>,
+    pub actual_training_executed: bool,
+    pub external_teacher_used: bool,
+}
+
+struct Collection {
+    sequence: u64,
+    nodes: u64,
+    jobs: u64,
+    rows: Vec<PalsLearningRecord>,
+    inputs: Vec<CapturedInput>,
+    assignments: BTreeMap<String, PalsSplit>,
+    results: Vec<PalsGameResult>,
+    public: Vec<PalsPublicRecord>,
+    role_records: Vec<RoleRecord>,
+}
+#[derive(Clone)]
+struct CapturedInput {
+    input: PalsFrozenInput,
+    outcome_eligible: bool,
+}
+impl Collection {
+    fn next(&mut self) -> Result<u64, ArenaError> {
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| invalid("capture sequence exhausted"))?;
+        Ok(self.sequence)
+    }
+    fn add_row(&mut self, output: &mut Output, row: PalsLearningRecord) -> Result<(), ArenaError> {
+        if self.rows.len() >= MAX_ROWS {
+            return Err(ArenaError::Budget("collection row limit".into()));
+        }
+        row.validate()?;
+        output.json("records.jsonl", &row)?;
+        self.rows.push(row);
+        Ok(())
+    }
+    fn capture(
+        &mut self,
+        output: &mut Output,
+        position: &Position,
+        opening: &PalsCollectionOpening,
+        game: &str,
+        position_command: String,
+        actual_moves: &[BoardMove],
+        role: PalsDataRole,
+        source: &PalsCollectionSourceDescription,
+        outcome_eligible: bool,
+        prefix: &[BoardMove],
+        proposal: &[BoardMove],
+        counterexample: Option<&[BoardMove]>,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(PalsFrozenInput, PalsModelInput), ArenaError> {
+        let sequence = self.next()?;
+        let legal = position.legal_moves();
+        let query = RoleQuery {
+            position,
+            legal: &legal,
+            prefix,
+            proposal,
+            counterexample,
+            records: &self.role_records,
+            revision: sequence,
+            deadline,
+            cancel,
+        };
+        let prepared = encode_native(&query, role, source)?;
+        let selected = prepared
+            .records
+            .iter()
+            .map(|record| {
+                let index = usize::try_from(
+                    record
+                        .record_id
+                        .checked_sub(1)
+                        .ok_or_else(|| invalid("native record ID zero"))?,
+                )
+                .map_err(|_| invalid("native record ID overflow"))?;
+                let raw = self
+                    .public
+                    .get(index)
+                    .ok_or_else(|| invalid("native record lacks immutable raw source"))?;
+                if raw.situation_revision != record.revision {
+                    return Err(invalid("native record/source revision mismatch"));
+                }
+                Ok(raw.clone())
+            })
+            .collect::<Result<Vec<_>, ArenaError>>()?;
+        let input = PalsInputSnapshot {
+            game_id: game.into(),
+            opening_id: opening.id.clone(),
+            line_genealogy_id: format!("{}-actual-and-conditional", game),
+            position_command,
+            board_fen: position.to_fen(),
+            actual_history: pack(actual_moves)?,
+            rules_state_sha256: state_sha(position)?,
+            rules_history_sha256: hex(prepared.history_digest),
+            transposition_sha256: transposition_sha(position),
+            encoding_sha256: source.encoding_sha256.clone(),
+            source: source.source.clone(),
+            frozen_epoch: 0,
+            input_revision: sequence,
+            capture_sequence: sequence,
+            white_to_move: position.side_to_move() == Color::White,
+            role,
+            legal_moves: pack(position.ordered_legal_moves().moves())?,
+            public_records: selected.clone(),
+        }
+        .seal()?;
+        output.json("inputs.jsonl", &input)?;
+        let tensor_json = serde_json::to_string(&prepared).map_err(|e| invalid(e.to_string()))?;
+        let tensor_sha256 = format!("{:x}", Sha256::digest(tensor_json.as_bytes()));
+        let mut sidecar = PalsNativeInputSidecar {
+            version: "rz-pals-native-input-sidecar/1".into(),
+            input_sha256: input.sha256().into(),
+            encoding_sha256: source.encoding_sha256.clone(),
+            encoder_source_sha256: native_source_sha()?,
+            model_epoch_kind: source.model_epoch_kind.clone(),
+            canonical_tensor_sha256: hex(prepared
+                .canonical_input_key(&PalsModelConfig::baseline())
+                .map_err(|e| invalid(e.to_string()))?),
+            tensor_json,
+            tensor_sha256,
+            record_sources: selected,
+            sha256: String::new(),
+        };
+        sidecar.sha256 = canonical_sha256(&(
+            sidecar.version.as_str(),
+            sidecar.input_sha256.as_str(),
+            sidecar.encoding_sha256.as_str(),
+            sidecar.encoder_source_sha256.as_str(),
+            sidecar.model_epoch_kind.as_str(),
+            sidecar.canonical_tensor_sha256.as_str(),
+            sidecar.tensor_json.as_str(),
+            sidecar.tensor_sha256.as_str(),
+            &sidecar.record_sources,
+        ))?;
+        output.json("native-inputs.jsonl", &sidecar)?;
+        output.json("input-lineage.jsonl",&serde_json::json!({"input_sha256":input.sha256(),"game_id":game,"actual_played_history":pack(actual_moves)?,"virtual_branch":!outcome_eligible,"actual_outcome_eligible":outcome_eligible}))?;
+        self.inputs.push(CapturedInput {
+            input: input.clone(),
+            outcome_eligible,
+        });
+        Ok((input, prepared))
+    }
+    fn publish(
+        &mut self,
+        output: &mut Output,
+        position: &Position,
+        hash: String,
+        kind: RecordKind,
+        line: &[BoardMove],
+        value: Option<i32>,
+        completed_depth: u16,
+        scope: Option<CpuScoreScope>,
+    ) -> Result<(), ArenaError> {
+        if self.role_records.len() >= 16_384 {
+            return Err(ArenaError::Budget("public source-record scan limit".into()));
+        }
+        let record = RoleRecord {
+            revision: self.sequence,
+            origin_state: StateId(
+                usize::try_from(self.sequence)
+                    .map_err(|_| invalid("advisory state ID exceeds target integer range"))?,
+            ),
+            kind,
+            line: line.to_vec(),
+            value,
+            completed_depth,
+            score_scope: scope,
+            perspective: position.side_to_move(),
+            critical: false,
+        };
+        // Every immutable record retains its actual Rules anchor. The numeric
+        // local StateId is advisory to the encoder, never exact state identity.
+        let source=output.json("public-record-sources.jsonl",&serde_json::json!({"record_index":self.role_records.len()+1,"origin_state_id":record.origin_state.0,"revision":self.sequence,
+            "origin_rules_state_sha256":state_sha(position)?,"kind":format!("{:?}",kind),"line":pack(line)?,"value":value,"completed_depth":completed_depth,
+            "scope":format!("{:?}",scope),"white_score_perspective":position.side_to_move()==Color::White,"observation_sha256":hash,"critical":false}))?;
+        self.public.push(PalsPublicRecord {
+            observation_sha256: source,
+            situation_revision: self.sequence,
+        });
+        self.role_records.push(record);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "pals-collection")]
+fn native_source_sha() -> Result<String, ArenaError> {
+    Ok(hex(pals_native_source_digest()))
+}
+#[cfg(not(feature = "pals-collection"))]
+fn native_source_sha() -> Result<String, ArenaError> {
+    Err(invalid("native input encoder feature is unavailable"))
+}
+#[cfg(feature = "pals-collection")]
+fn encode_native(
+    query: &RoleQuery<'_>,
+    role: PalsDataRole,
+    source: &PalsCollectionSourceDescription,
+) -> Result<PalsModelInput, ArenaError> {
+    let kind = if role == PalsDataRole::Critic {
+        NativeQueryKind::Reply
+    } else if query.counterexample.is_some() {
+        NativeQueryKind::Repair
+    } else {
+        NativeQueryKind::Propose
+    };
+    if role == PalsDataRole::Verifier {
+        return Err(invalid(
+            "verifier-private inputs require a distinct collection path",
+        ));
+    }
+    prepare_role_input(query, kind, source.model_epoch).map_err(|e| invalid(e.to_string()))
+}
+#[cfg(not(feature = "pals-collection"))]
+fn encode_native(
+    _: &RoleQuery<'_>,
+    _: PalsDataRole,
+    _: &PalsCollectionSourceDescription,
+) -> Result<PalsModelInput, ArenaError> {
+    Err(invalid("native input encoder feature is unavailable"))
+}
+
+fn position_command(opening: &PalsCollectionOpening, moves: &[BoardMove]) -> String {
+    let mut result = opening.initial_fen.as_ref().map_or_else(
+        || "position startpos".into(),
+        |fen| format!("position fen {fen}"),
+    );
+    if !moves.is_empty() {
+        result.push_str(" moves");
+        for mv in moves {
+            result.push(' ');
+            result.push_str(&mv.to_string());
+        }
+    }
+    result
+}
+fn replay_line(position: &Position, line: &[BoardMove]) -> Result<(Position, String), ArenaError> {
+    let mut next = position.clone();
+    let start = state_sha(position)?;
+    let mut transitions = Vec::new();
+    for mv in line {
+        if termination(&next)?.is_some() {
+            return Err(invalid(
+                "continuation contains a move after an exact Rules terminal",
+            ));
+        }
+        let before = state_sha(&next)?;
+        next.make_move(*mv).map_err(rules)?;
+        transitions.push((
+            before,
+            Move16::pack(*mv)
+                .map_err(|e| invalid(e.to_string()))?
+                .bits(),
+            state_sha(&next)?,
+        ));
+    }
+    let evidence = canonical_sha256(&("rz-rules-checked-line/1", start, transitions))?;
+    Ok((next, evidence))
+}
+fn job_limits(
+    config: &PalsCollectionConfig,
+    collection: &Collection,
+    deadline: Instant,
+) -> Result<CpuLimits, ArenaError> {
+    let remaining = config.max_total_nodes.saturating_sub(collection.nodes);
+    if remaining == 0 {
+        return Err(ArenaError::Budget("total CPU node limit".into()));
+    }
+    if Instant::now() >= deadline {
+        return Err(ArenaError::Budget("collector wall-time limit".into()));
+    }
+    Ok(CpuLimits {
+        max_depth: config.cpu_depth,
+        max_nodes: config.nodes_per_job.min(remaining),
+        deadline: Some(deadline),
+    })
+}
+fn account(collection: &mut Collection, limits: CpuLimits, nodes: u64) -> Result<(), ArenaError> {
+    if nodes > limits.max_nodes {
+        return Err(invalid("CPU source exceeded requested node budget"));
+    }
+    collection.nodes = collection
+        .nodes
+        .checked_add(nodes)
+        .ok_or_else(|| invalid("CPU node counter overflow"))?;
+    collection.jobs += 1;
+    Ok(())
+}
+fn policy(input: &PalsFrozenInput, movement: BoardMove) -> Result<PalsPolicyTarget, ArenaError> {
+    let packed = Move16::pack(movement)
+        .map_err(|e| invalid(e.to_string()))?
+        .bits();
+    let at = input
+        .snapshot()
+        .legal_moves
+        .iter()
+        .position(|mv| *mv == packed)
+        .ok_or_else(|| invalid("source bestmove is illegal at captured state"))?;
+    let mut probabilities = vec![0.0; input.snapshot().legal_moves.len()];
+    probabilities[at] = 1.0;
+    Ok(PalsPolicyTarget {
+        moves: input.snapshot().legal_moves.clone(),
+        probabilities,
+    })
+}
+fn owned_label(
+    input: &PalsFrozenInput,
+    description: &PalsCollectionSourceDescription,
+    task_sha: String,
+    raw_sha: String,
+    depth: u16,
+    nodes: u64,
+    sequence: u64,
+    movement: BoardMove,
+    counterexample: Option<PalsCounterexampleTarget>,
+) -> Result<PalsLearningRecord, ArenaError> {
+    Ok(PalsLearningRecord {
+        input: input.clone(),
+        future_label: Some(PalsFutureLabel {
+            observed_sequence: sequence,
+            provenance: PalsTargetProvenance::OwnedCpu {
+                engine_sha256: description.implementation_sha256.clone(),
+                profile_sha256: description.cpu_profile_sha256.clone(),
+                task_sha256: task_sha,
+                completed_depth: u32::from(depth),
+                nodes,
+                raw_evidence_sha256: raw_sha,
+            },
+            policy: Some(policy(input, movement)?),
+            value_wdl: None,
+            white_to_move: input.snapshot().white_to_move,
+            counterexample,
+            verifier_tasks: None,
+            supersedes_label_sha256: None,
+        }),
+        verifier_private: None,
+    })
+}
+fn termination(position: &Position) -> Result<Option<(PalsOutcome, PalsGameEnd)>, ArenaError> {
+    let status = position
+        .play_status_from_view(&position.ordered_legal_moves())
+        .map_err(rules)?;
+    Ok(match status {
+        PlayStatus::Ongoing => None,
+        PlayStatus::Terminal { reason, winner } => Some((
+            match winner {
+                Some(Color::White) => PalsOutcome::WhiteWin,
+                Some(Color::Black) => PalsOutcome::BlackWin,
+                None => PalsOutcome::Draw,
+            },
+            match reason {
+                TerminalReason::Checkmate => PalsGameEnd::Checkmate,
+                TerminalReason::Stalemate => PalsGameEnd::Stalemate,
+                TerminalReason::DeadPosition => PalsGameEnd::DeadPosition,
+                TerminalReason::FivefoldRepetition => PalsGameEnd::Repetition,
+                TerminalReason::SeventyFiveMove => PalsGameEnd::SeventyFiveMove,
+            },
+        )),
+    })
+}
+
+struct ActiveGame {
+    game: String,
+    opening: PalsCollectionOpening,
+    movetext: String,
+    position_sha: String,
+    moves: Vec<String>,
+    terminal: Option<(PalsOutcome, PalsGameEnd)>,
+    resolved: Option<PalsGameResult>,
+    result_written: bool,
+    pgn_written: bool,
+}
+impl ActiveGame {
+    fn new(
+        game: &str,
+        opening: &PalsCollectionOpening,
+        position: &Position,
+    ) -> Result<Self, ArenaError> {
+        Ok(Self {
+            game: game.into(),
+            opening: opening.clone(),
+            movetext: String::new(),
+            position_sha: state_sha(position)?,
+            moves: Vec::new(),
+            terminal: termination(position)?,
+            resolved: None,
+            result_written: false,
+            pgn_written: false,
+        })
+    }
+    fn advance(
+        &mut self,
+        position: &Position,
+        movetext: &str,
+        moves: &[BoardMove],
+    ) -> Result<(), ArenaError> {
+        self.movetext = movetext.into();
+        self.position_sha = state_sha(position)?;
+        self.moves = moves.iter().map(ToString::to_string).collect();
+        self.terminal = termination(position)?;
+        Ok(())
+    }
+}
+fn checked_source(description: &PalsCollectionSourceDescription) -> Result<(), ArenaError> {
+    description.source.validate()?;
+    let _ = bounded_json(&description.configuration, 64 * 1024, false)?;
+    if !ident(&description.mode)
+        || description.cpu_profile_sha256.len() != 64
+        || !description
+            .cpu_profile_sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || description.encoding_sha256 != native_encoding_sha()?
+        || description.encoder_source_sha256 != native_source_sha()?
+    {
+        return Err(invalid("collector source/actual encoder mismatch"));
+    }
+    let digest = canonical_sha256(&description.configuration)?;
+    match &description.source {
+        PalsInputSource::OwnCpu {
+            cpu_binary_sha256,
+            evaluator_configuration_sha256,
+            model_weights_sha256,
+        } => {
+            if cpu_binary_sha256 != &description.implementation_sha256
+                || evaluator_configuration_sha256 != &digest
+                || digest != description.cpu_profile_sha256
+                || model_weights_sha256.is_some()
+                || description.model_epoch != [0; 32]
+                || description.model_epoch_kind != "encoding_only_zero"
+            {
+                return Err(invalid(
+                    "weightless own-CPU source does not match actual configuration or encoding-only epoch",
+                ));
+            }
+        }
+        PalsInputSource::OwnPals {
+            model_configuration_sha256,
+            ..
+        } => {
+            if model_configuration_sha256 != &digest
+                || description.model_epoch_kind != "frozen_model_epoch"
+                || description.model_epoch == [0; 32]
+            {
+                return Err(invalid(
+                    "neural PALS source needs verified model configuration and actual frozen epoch",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+fn failure_text(error: impl std::fmt::Display) -> String {
+    let text = error.to_string();
+    if bounded_json(&text, 8192, false).is_ok() {
+        return text;
+    }
+    let suffix = format!(
+        " [message truncated; bytes={}; sha256={:x}]",
+        text.len(),
+        Sha256::digest(text.as_bytes())
+    );
+    let mut end = 8192.min(text.len());
+    loop {
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let candidate = format!("{}{suffix}", &text[..end]);
+        if bounded_json(&candidate, 8192, false).is_ok() {
+            return candidate;
+        }
+        if end == 0 {
+            return suffix;
+        }
+        end = end.saturating_sub((end / 8).max(1));
+    }
+}
+
+/// All output is append-only in a fresh directory outside the checkout. A
+/// failed collection returns a receipt with complete=false and preserves the
+/// admitted raw records. Split leakage is an explicit failed audit, never an
+/// automatic reassignment of a user-declared holdout game.
+pub fn collect_pals_own_data(
+    config: PalsCollectionConfig,
+    output_root: &Path,
+    driver: &mut dyn PalsCollectionDriver,
+    registry: &PalsOwnedSources,
+    cancel: &AtomicBool,
+) -> Result<PalsCollectionReceipt, ArenaError> {
+    let started = Instant::now();
+    config.validate()?;
+    registry.validate()?;
+    let description = driver.description().clone();
+    checked_source(&description)?;
+    if !registry.input_sources.contains(&description.source)
+        || !registry
+            .cpu_binary_sha256
+            .contains(&description.implementation_sha256)
+    {
+        return Err(invalid("collector source is not independently registered"));
+    }
+    let actual_binary = file_sha(&std::env::current_exe().map_err(io)?, 256 * 1024 * 1024)?;
+    if description.implementation_sha256 != actual_binary {
+        return Err(invalid(
+            "collector executable differs from registered CPU implementation",
+        ));
+    }
+    let mut output = Output::new(output_root, &config.run_id, config.max_output_bytes)?;
+    output.json("source-registry.jsonl", registry)?;
+    output.json("run-spec.jsonl", &config)?;
+    let deadline = started
+        .checked_add(Duration::from_millis(config.max_wall_time_ms))
+        .ok_or_else(|| invalid("collector deadline overflow"))?;
+    let mut state = Collection {
+        sequence: 0,
+        nodes: 0,
+        jobs: 0,
+        rows: Vec::new(),
+        inputs: Vec::new(),
+        assignments: BTreeMap::new(),
+        results: Vec::new(),
+        public: Vec::new(),
+        role_records: Vec::new(),
+    };
+    let mut failure = None;
+    let mut active: Option<ActiveGame> = None;
+    let mut conditional_cpu =
+        CpuEngine::new(CpuConfig::default()).map_err(|e| invalid(e.to_string()))?;
+    let conditional_description = source_description(
+        conditional_cpu.config(),
+        "own-cpu-conditional-verification",
+        serde_json::Value::Null,
+    )?;
+    output.json("conditional-source.jsonl", &conditional_description)?;
+    let run_result = (|| -> Result<(), ArenaError> {
+        for game_number in 0..config.games {
+            if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+                return Err(ArenaError::Budget(
+                    "collection cancelled or wall-time exhausted before next game".into(),
+                ));
+            }
+            let opening = &config.openings[game_number as usize % config.openings.len()];
+            let game = format!("{}-g{}", config.run_id, game_number + 1);
+            driver.new_game();
+            conditional_cpu.clear();
+            state.public.clear();
+            state.role_records.clear();
+            let input_start = state.inputs.len();
+            // This bounded Rules ceiling also covers hypothetical CPU depth,
+            // quiescence and PALS continuation plies. Restricting it to the
+            // actual game budget would reject valid deeper CPU queries.
+            // Actual openings+game are separately bounded below 1,313 plies.
+            let limits = PositionLimits::default();
+            let mut position = match &opening.initial_fen {
+                Some(fen) => Position::from_fen_with_limits(fen, limits).map_err(rules)?,
+                None => Position::startpos_with_limits(limits).map_err(rules)?,
+            };
+            let mut moves = Vec::new();
+            let mut movetext = String::new();
+            active = Some(ActiveGame::new(&game, opening, &position)?);
+            for text in &opening.moves {
+                if termination(&position)?.is_some() {
+                    return Err(invalid(
+                        "declared opening contains a move after an exact Rules terminal",
+                    ));
+                }
+                let mv = BoardMove::from_uci(text).map_err(rules)?;
+                let before = state_sha(&position)?;
+                append_san(&mut movetext, &position, mv)?;
+                position.make_move(mv).map_err(rules)?;
+                moves.push(mv);
+                active
+                    .as_mut()
+                    .ok_or_else(|| invalid("active game missing after opening move"))?
+                    .advance(&position, &movetext, &moves)?;
+                output.json("transitions.jsonl",&serde_json::json!({"game_id":game,"from":before,"move":Move16::pack(mv).map_err(|e|invalid(e.to_string()))?.bits(),"to":state_sha(&position)?,"actual":true,"declared_opening":true}))?;
+            }
+            let mut rng = config.seed ^ u64::from(game_number).wrapping_mul(0x9e3779b97f4a7c15);
+            for _ in 0..config.exploration_plies {
+                if termination(&position)?.is_some() {
+                    break;
+                }
+                let legal = position.legal_moves();
+                rng = rng.wrapping_add(0x9e3779b97f4a7c15);
+                let mut value = rng;
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+                value ^= value >> 31;
+                let movement = legal[value as usize % legal.len()];
+                let from = state_sha(&position)?;
+                append_san(&mut movetext, &position, movement)?;
+                position.make_move(movement).map_err(rules)?;
+                moves.push(movement);
+                active
+                    .as_mut()
+                    .ok_or_else(|| invalid("active game missing after exploration move"))?
+                    .advance(&position, &movetext, &moves)?;
+                output.json("transitions.jsonl",&serde_json::json!({"game_id":game,"from":from,"move":Move16::pack(movement).map_err(|e|invalid(e.to_string()))?.bits(),"to":state_sha(&position)?,"actual":true,"seeded_opening":true,"rng":"splitmix64-modulo-legal-order/1"}))?;
+            }
+            let mut end = None;
+            for ply in 0..=config.max_plies {
+                if cancel.load(Ordering::Acquire) {
+                    end = Some((PalsOutcome::Unknown, PalsGameEnd::UserStop));
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    end = Some((PalsOutcome::Unknown, PalsGameEnd::WallTimeLimit));
+                    break;
+                }
+                let (input, prepared) = state.capture(
+                    &mut output,
+                    &position,
+                    opening,
+                    &game,
+                    position_command(opening, &moves),
+                    &moves,
+                    PalsDataRole::Proposer,
+                    &description,
+                    true,
+                    &[],
+                    &[],
+                    None,
+                    deadline,
+                    cancel,
+                )?;
+                if let Some(terminal) = termination(&position)? {
+                    end = Some(terminal);
+                    break;
+                }
+                if ply == config.max_plies {
+                    end = Some((PalsOutcome::Unknown, PalsGameEnd::PlyLimit));
+                    break;
+                }
+                if cancel.load(Ordering::Acquire) {
+                    end = Some((PalsOutcome::Unknown, PalsGameEnd::UserStop));
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    end = Some((PalsOutcome::Unknown, PalsGameEnd::WallTimeLimit));
+                    break;
+                }
+                let job = job_limits(&config, &state, deadline)?;
+                let task_sha = canonical_sha256(&(
+                    "rz-pals-own-task/1",
+                    input.sha256(),
+                    description.cpu_profile_sha256.as_str(),
+                    job.max_depth,
+                    job.max_nodes,
+                    "propose",
+                ))?;
+                let decision = driver.analyze(&position, &input, &prepared, job, cancel)?;
+                account(&mut state, job, decision.nodes)?;
+                let Some(movement) = decision.best_move else {
+                    return Err(invalid(
+                        "own source returned no move for an ongoing Rules state",
+                    ));
+                };
+                let (_, legality) = replay_line(&position, &decision.pv)?;
+                let sequence = state.next()?;
+                let raw_sha=output.json("observations.jsonl",&serde_json::json!({"domain":"rz-own-analysis/1","sequence":sequence,"input_sha256":input.sha256(),"task_sha256":task_sha,"raw":decision.raw,"line_legality_sha256":legality,"genealogy":decision.genealogy}))?;
+                if decision.completed_estimate && decision.completed_depth > 0 {
+                    let row = owned_label(
+                        &input,
+                        &description,
+                        task_sha,
+                        raw_sha.clone(),
+                        decision.completed_depth,
+                        decision.nodes,
+                        sequence,
+                        movement,
+                        None,
+                    )?;
+                    state.add_row(&mut output, row)?;
+                }
+                let record = decision.genealogy.first();
+                state.publish(
+                    &mut output,
+                    &position,
+                    raw_sha,
+                    RecordKind::Proposal,
+                    &decision.pv,
+                    record
+                        .and_then(|r| r.raw_value)
+                        .filter(|_| decision.completed_estimate),
+                    decision.completed_depth,
+                    decision
+                        .completed_estimate
+                        .then_some(CpuScoreScope::CompletedIteration),
+                )?;
+                if cancel.load(Ordering::Acquire) {
+                    end = Some((PalsOutcome::Unknown, PalsGameEnd::UserStop));
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    end = Some((PalsOutcome::Unknown, PalsGameEnd::WallTimeLimit));
+                    break;
+                }
+                if config.collect_conditional_repair
+                    && decision.pv.len() >= 2
+                    && config.max_total_nodes > state.nodes
+                    && Instant::now() < deadline
+                    && !cancel.load(Ordering::Acquire)
+                {
+                    conditional(
+                        &config,
+                        &mut state,
+                        &mut output,
+                        &position,
+                        opening,
+                        &game,
+                        &moves,
+                        &decision.pv,
+                        &description,
+                        &conditional_description,
+                        &mut conditional_cpu,
+                        deadline,
+                        cancel,
+                    )?;
+                }
+                if cancel.load(Ordering::Acquire) {
+                    end = Some((PalsOutcome::Unknown, PalsGameEnd::UserStop));
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    end = Some((PalsOutcome::Unknown, PalsGameEnd::WallTimeLimit));
+                    break;
+                }
+                append_san(&mut movetext, &position, movement)?;
+                let before = state_sha(&position)?;
+                position.make_move(movement).map_err(rules)?;
+                moves.push(movement);
+                active
+                    .as_mut()
+                    .ok_or_else(|| invalid("active game missing after source move"))?
+                    .advance(&position, &movetext, &moves)?;
+                output.json("transitions.jsonl",&serde_json::json!({"game_id":game,"from":before,"move":Move16::pack(movement).map_err(|e|invalid(e.to_string()))?.bits(),"to":state_sha(&position)?,"actual":true}))?;
+            }
+            let (outcome, ending) = end
+                .ok_or_else(|| invalid("finite game ended without a termination classification"))?;
+            let result = PalsGameResult {
+                game_id: game.clone(),
+                outcome,
+                ending,
+                raw_evidence_sha256: canonical_sha256(&(
+                    "rz-own-game-end/1",
+                    game.as_str(),
+                    state_sha(&position)?,
+                    &moves.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    outcome,
+                    ending,
+                ))?,
+            };
+            result.validate()?;
+            active
+                .as_mut()
+                .ok_or_else(|| invalid("active game missing at actual end"))?
+                .resolved = Some(result.clone());
+            state.assignments.insert(game.clone(), opening.split);
+            state.results.push(result.clone());
+            output.json("game-results.jsonl", &result)?;
+            active
+                .as_mut()
+                .ok_or_else(|| invalid("active game missing after result write"))?
+                .result_written = true;
+            for captured in state.inputs[input_start..].to_vec() {
+                let input = captured.input;
+                let sequence = state.next()?;
+                let future_label = if captured.outcome_eligible {
+                    Some(PalsFutureLabel {
+                        observed_sequence: sequence,
+                        provenance: PalsTargetProvenance::ActualGame {
+                            result: result.clone(),
+                        },
+                        policy: None,
+                        value_wdl: outcome_wdl(outcome, input.snapshot().white_to_move),
+                        white_to_move: input.snapshot().white_to_move,
+                        counterexample: None,
+                        verifier_tasks: None,
+                        supersedes_label_sha256: None,
+                    })
+                } else {
+                    None
+                };
+                state.add_row(
+                    &mut output,
+                    PalsLearningRecord {
+                        input,
+                        future_label,
+                        verifier_private: None,
+                    },
+                )?;
+            }
+            let pgn = game_pgn(&game, opening, &description, &movetext, &result);
+            output.write("games.pgn", pgn.as_bytes(), false)?;
+            active
+                .as_mut()
+                .ok_or_else(|| invalid("active game missing after PGN write"))?
+                .pgn_written = true;
+            active = None;
+        }
+        let split = PalsDatasetSplit {
+            games: state.assignments.clone(),
+        };
+        let audit = registry.audit(&state.rows, &split)?;
+        output.json("split.jsonl", &split)?;
+        output.json("audit.jsonl", &audit)?;
+        Ok(())
+    })();
+    if let Err(error) = run_result {
+        failure = Some(failure_text(error));
+        if let Some(active) = active.take() {
+            let fallback = active
+                .terminal
+                .unwrap_or((PalsOutcome::Unknown, PalsGameEnd::InfrastructureFailure));
+            let result = if let Some(result) = active.resolved {
+                result
+            } else {
+                PalsGameResult {
+                    game_id: active.game.clone(),
+                    outcome: fallback.0,
+                    ending: fallback.1,
+                    raw_evidence_sha256: canonical_sha256(&(
+                        "rz-own-failed-game/1",
+                        active.game.as_str(),
+                        active.position_sha.as_str(),
+                        &active.moves,
+                        &failure,
+                    ))?,
+                }
+            };
+            let pgn = game_pgn(
+                &active.game,
+                &active.opening,
+                &description,
+                &active.movetext,
+                &result,
+            );
+            if !active.pgn_written {
+                let name = if output.failed_artifacts.contains("games.pgn") {
+                    "recovered-games.pgn"
+                } else {
+                    "games.pgn"
+                };
+                let _ = output.write(name, pgn.as_bytes(), true);
+            }
+            if !active.result_written {
+                let name = if output.failed_artifacts.contains("game-results.jsonl") {
+                    "recovered-game-results.jsonl"
+                } else {
+                    "game-results.jsonl"
+                };
+                let _ = output.final_json(name, &result);
+            }
+            if !state.results.iter().any(|r| r.game_id == result.game_id) {
+                state.results.push(result);
+            }
+        }
+        let _=output.final_json("failures.jsonl",&serde_json::json!({"sequence":state.sequence,"cause":failure,"nodes":state.nodes,"rows":state.rows.len(),"inputs":state.inputs.len(),"outcome_targets_for_unfinished_game":"masked"}));
+    }
+    let audit = if failure.is_none() {
+        Some(registry.audit(
+            &state.rows,
+            &PalsDatasetSplit {
+                games: state.assignments.clone(),
+            },
+        )?)
+    } else {
+        None
+    };
+    let artifacts = match output.artifacts() {
+        Ok(value) => value,
+        Err(error) => {
+            failure = Some(failure_text(format!(
+                "artifact preservation failed: {error}; prior={failure:?}"
+            )));
+            BTreeMap::new()
+        }
+    };
+    let receipt = PalsCollectionReceipt {
+        version: PALS_COLLECT_VERSION.into(),
+        run_id: config.run_id.clone(),
+        source: description,
+        config,
+        complete: failure.is_none(),
+        failure,
+        games_finished: state.results.len() as u32,
+        cpu_nodes: state.nodes,
+        cpu_jobs: state.jobs,
+        wall_time_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        data_output_bytes: artifacts.values().map(|a| a.bytes).sum(),
+        reserved_output_bytes: output.bytes,
+        receipt_reserve_bytes: RECEIPT_RESERVE,
+        results: state.results,
+        audit,
+        artifacts,
+        actual_training_executed: false,
+        external_teacher_used: false,
+    };
+    output.finish(&receipt)?;
+    Ok(receipt)
+}
+
+fn append_san(
+    text: &mut String,
+    position: &Position,
+    movement: BoardMove,
+) -> Result<(), ArenaError> {
+    if position.side_to_move() == Color::White {
+        text.push_str(&format!("{}. ", position.fullmove_number()));
+    } else if text.is_empty() {
+        text.push_str(&format!("{}... ", position.fullmove_number()));
+    }
+    text.push_str(&crate::pgn::san(position, movement)?);
+    text.push(' ');
+    Ok(())
+}
+fn game_pgn(
+    game: &str,
+    opening: &PalsCollectionOpening,
+    source: &PalsCollectionSourceDescription,
+    movetext: &str,
+    result: &PalsGameResult,
+) -> String {
+    let outcome = match result.outcome {
+        PalsOutcome::WhiteWin => "1-0",
+        PalsOutcome::BlackWin => "0-1",
+        PalsOutcome::Draw => "1/2-1/2",
+        PalsOutcome::Unknown => "*",
+    };
+    let engine = format!("{}-{}", source.mode, &source.implementation_sha256[..16]);
+    let mut pgn = format!(
+        "[Event \"RoveZero own-data collection\"]\n[Round \"{game}\"]\n[White \"{engine}\"]\n[Black \"{engine}\"]\n[Result \"{outcome}\"]\n[Termination \"{:?}\"]\n",
+        result.ending
+    );
+    if let Some(fen) = &opening.initial_fen {
+        pgn.push_str(&format!("[SetUp \"1\"]\n[FEN \"{fen}\"]\n"));
+    }
+    pgn.push_str(&format!("\n{movetext}{outcome}\n\n"));
+    pgn
+}
+fn outcome_wdl(outcome: PalsOutcome, white: bool) -> Option<[f64; 3]> {
+    match outcome {
+        PalsOutcome::Unknown => None,
+        PalsOutcome::Draw => Some([0.0, 1.0, 0.0]),
+        PalsOutcome::WhiteWin if white => Some([1.0, 0.0, 0.0]),
+        PalsOutcome::BlackWin if !white => Some([1.0, 0.0, 0.0]),
+        _ => Some([0.0, 0.0, 1.0]),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conditional(
+    config: &PalsCollectionConfig,
+    state: &mut Collection,
+    output: &mut Output,
+    root: &Position,
+    opening: &PalsCollectionOpening,
+    game: &str,
+    actual: &[BoardMove],
+    proposal: &[BoardMove],
+    source: &PalsCollectionSourceDescription,
+    cpu_source: &PalsCollectionSourceDescription,
+    cpu: &mut CpuEngine,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<(), ArenaError> {
+    let mut divergence = root.clone();
+    divergence.make_move(proposal[0]).map_err(rules)?;
+    if termination(&divergence)?.is_some() {
+        return Ok(());
+    }
+    let alternatives = divergence
+        .legal_moves()
+        .into_iter()
+        .filter(|mv| *mv != proposal[1])
+        .collect::<Vec<_>>();
+    if alternatives.is_empty() {
+        return Ok(());
+    }
+    let mut history = actual.to_vec();
+    history.push(proposal[0]);
+    let (input, _prepared) = state.capture(
+        output,
+        &divergence,
+        opening,
+        game,
+        position_command(opening, &history),
+        actual,
+        PalsDataRole::Critic,
+        source,
+        false,
+        &proposal[..1],
+        proposal,
+        None,
+        deadline,
+        cancel,
+    )?;
+    let job = job_limits(config, state, deadline)?;
+    let challenged = canonical_sha256(&(
+        "rz-pals-challenged-line/1",
+        state_sha(root)?,
+        pack(proposal)?,
+    ))?;
+    let task = canonical_sha256(&(
+        "rz-own-conditional-task/1",
+        input.sha256(),
+        &challenged,
+        pack(&alternatives)?,
+        job.max_depth,
+        job.max_nodes,
+        &cpu_source.cpu_profile_sha256,
+    ))?;
+    let report = cpu
+        .analyze_root_moves(&divergence, &alternatives, job, cancel)
+        .map_err(|e| invalid(e.to_string()))?;
+    account(state, job, report.nodes)?;
+    let Some(response) = report.best_move else {
+        return Ok(());
+    };
+    let response_line = if report.pv.is_empty() {
+        vec![response]
+    } else {
+        report.pv.clone()
+    };
+    let (_, legality) = replay_line(&divergence, &response_line)?;
+    let sequence = state.next()?;
+    let raw=output.json("observations.jsonl",&serde_json::json!({"kind":"cpu_conditional_counterexample","sequence":sequence,"input":input.sha256(),"challenged_line":challenged,"raw":cpu_raw(&report),"legality":legality,"validity":"not_examined","claim":"conditional continuation only"}))?;
+    let mut counter = PalsCounterexampleTarget {
+        challenged_line_sha256: challenged.clone(),
+        divergence_ply: 1,
+        response_line: pack(&response_line)?,
+        repair_line: None,
+        validity: PalsConditionalValidity::NotExamined,
+        input_revision: input.snapshot().input_revision,
+        legality_evidence_sha256: legality,
+    };
+    state.publish(
+        output,
+        &divergence,
+        raw.clone(),
+        RecordKind::Counterexample,
+        &response_line,
+        (report.score_scope == CpuScoreScope::CompletedIteration).then_some(report.score),
+        report.completed_depth,
+        Some(report.score_scope),
+    )?;
+    if report.score_scope == CpuScoreScope::CompletedIteration && report.completed_depth > 0 {
+        state.add_row(
+            output,
+            owned_label(
+                &input,
+                cpu_source,
+                task,
+                raw,
+                report.completed_depth,
+                report.nodes,
+                sequence,
+                response,
+                Some(counter.clone()),
+            )?,
+        )?;
+    }
+    if Instant::now() >= deadline
+        || cancel.load(Ordering::Acquire)
+        || state.nodes >= config.max_total_nodes
+    {
+        return Ok(());
+    }
+    let mut repair_position = divergence.clone();
+    repair_position.make_move(response).map_err(rules)?;
+    if termination(&repair_position)?.is_some() {
+        return Ok(());
+    }
+    history.push(response);
+    let prefix = [proposal[0], response];
+    let (repair_input, _prepared) = state.capture(
+        output,
+        &repair_position,
+        opening,
+        game,
+        position_command(opening, &history),
+        actual,
+        PalsDataRole::Proposer,
+        source,
+        false,
+        &prefix,
+        proposal,
+        Some(&response_line),
+        deadline,
+        cancel,
+    )?;
+    let job = job_limits(config, state, deadline)?;
+    let report = cpu
+        .analyze(&repair_position, job, cancel)
+        .map_err(|e| invalid(e.to_string()))?;
+    account(state, job, report.nodes)?;
+    let Some(repair_move) = report.best_move else {
+        return Ok(());
+    };
+    let repair_line = if report.pv.is_empty() {
+        vec![repair_move]
+    } else {
+        report.pv.clone()
+    };
+    let (_, repair_legality) = replay_line(&repair_position, &repair_line)?;
+    let sequence = state.next()?;
+    let task = canonical_sha256(&(
+        "rz-own-repair-task/1",
+        repair_input.sha256(),
+        &challenged,
+        job.max_depth,
+        job.max_nodes,
+        &cpu_source.cpu_profile_sha256,
+    ))?;
+    let raw=output.json("observations.jsonl",&serde_json::json!({"kind":"cpu_conditional_repair","sequence":sequence,"input":repair_input.sha256(),"challenged_line":challenged,"response":pack(&response_line)?,"repair":pack(&repair_line)?,"raw":cpu_raw(&report),"legality":repair_legality,"validity":"not_examined"}))?;
+    if report.score_scope == CpuScoreScope::CompletedIteration && report.completed_depth > 0 {
+        state.add_row(
+            output,
+            owned_label(
+                &repair_input,
+                cpu_source,
+                task,
+                raw.clone(),
+                report.completed_depth,
+                report.nodes,
+                sequence,
+                repair_move,
+                None,
+            )?,
+        )?;
+    }
+    state.publish(
+        output,
+        &repair_position,
+        raw,
+        RecordKind::Repair,
+        &repair_line,
+        (report.score_scope == CpuScoreScope::CompletedIteration).then_some(report.score),
+        report.completed_depth,
+        Some(report.score_scope),
+    )?;
+    // This is a lineage update, not a strategic success label. Finding a legal
+    // repair alone does not prove that it refuted the counterexample.
+    counter.repair_line = Some(pack(&repair_line)?);
+    output.json("genealogy.jsonl",&serde_json::json!({"input_sha256":input.sha256(),"observed_sequence":sequence,"conditional":counter}))?;
+    Ok(())
+}
+
+/// The source registry is constructed from verified loaded executable bytes,
+/// not from declarations in returned learning rows.
+pub fn own_collection_registry(
+    driver: &dyn PalsCollectionDriver,
+) -> Result<PalsOwnedSources, ArenaError> {
+    let description = driver.description();
+    checked_source(description)?;
+    if !matches!(
+        &description.source,
+        PalsInputSource::OwnCpu {
+            model_weights_sha256: None,
+            ..
+        }
+    ) {
+        return Err(invalid(
+            "automatic source enrollment is only available for verified weightless CPU; NN assets need an independent verified registry",
+        ));
+    }
+    let actual = file_sha(&std::env::current_exe().map_err(io)?, 256 * 1024 * 1024)?;
+    if actual != description.implementation_sha256 {
+        return Err(invalid("loaded source implementation hash mismatch"));
+    }
+    let registry = PalsOwnedSources {
+        cpu_binary_sha256: BTreeSet::from([actual]),
+        input_sources: BTreeSet::from([description.source.clone()]),
+    };
+    registry.validate()?;
+    Ok(registry)
+}
+
+#[cfg(all(test, feature = "pals-collection"))]
+mod tests {
+    use super::*;
+    std::thread_local! {pub(super) static FAIL_ARTIFACT:std::cell::Cell<Option<(&'static str,usize)>>=const {std::cell::Cell::new(None)};}
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
+    struct OwnedTemp(PathBuf);
+    impl OwnedTemp {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "rz-pals-collector-test-{}-{}",
+                std::process::id(),
+                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for OwnedTemp {
+        fn drop(&mut self) {
+            let Ok(resolved) = self.0.canonicalize() else {
+                return;
+            };
+            let Ok(temp) = std::env::temp_dir().canonicalize() else {
+                return;
+            };
+            if resolved.parent() == Some(temp.as_path())
+                && resolved
+                    .file_name()
+                    .is_some_and(|v| v.to_string_lossy().starts_with("rz-pals-collector-test-"))
+            {
+                let _ = std::fs::remove_dir_all(&resolved);
+            }
+        }
+    }
+    fn small_config() -> PalsCollectionConfig {
+        PalsCollectionConfig {
+            max_plies: 1,
+            cpu_depth: 1,
+            nodes_per_job: 256,
+            max_total_nodes: 1024,
+            max_wall_time_ms: 10_000,
+            max_output_bytes: 1024 * 1024,
+            exploration_plies: 0,
+            collect_conditional_repair: false,
+            ..PalsCollectionConfig::default()
+        }
+    }
+    fn driver() -> OwnCpuCollectionDriver {
+        OwnCpuCollectionDriver::new(CpuConfig {
+            tt_entries: 64,
+            quiescence_ply: 2,
+            ..CpuConfig::default()
+        })
+        .unwrap()
+    }
+    fn rows<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+    #[test]
+    fn actual_cpu_collection_seals_native_inputs_and_masks_ply_limit() {
+        let output = OwnedTemp::new();
+        let mut cpu = driver();
+        let registry = own_collection_registry(&cpu).unwrap();
+        let receipt = collect_pals_own_data(
+            small_config(),
+            &output.0,
+            &mut cpu,
+            &registry,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(receipt.complete, "{:?}", receipt.failure);
+        assert_eq!(receipt.results.len(), 1);
+        assert_eq!(receipt.results[0].outcome, PalsOutcome::Unknown);
+        assert_eq!(receipt.results[0].ending, PalsGameEnd::PlyLimit);
+        let run = output.0.join(&receipt.run_id);
+        let records: Vec<PalsLearningRecord> = rows(&run.join("records.jsonl"));
+        assert!(
+            records
+                .iter()
+                .any(|r| r.future_label.as_ref().is_some_and(|l| l.policy.is_some()))
+        );
+        for record in &records {
+            record.validate().unwrap();
+            assert!(
+                record
+                    .future_label
+                    .as_ref()
+                    .is_none_or(|l| l.value_wdl.is_none())
+            );
+        }
+        let inputs: Vec<PalsFrozenInput> = rows(&run.join("inputs.jsonl"));
+        let sidecars: Vec<PalsNativeInputSidecar> = rows(&run.join("native-inputs.jsonl"));
+        assert_eq!(inputs.len(), sidecars.len());
+        for (input, sidecar) in inputs.iter().zip(&sidecars) {
+            input.verify().unwrap();
+            assert_eq!(sidecar.input_sha256, input.sha256());
+            assert_eq!(
+                sidecar.tensor_sha256,
+                format!("{:x}", Sha256::digest(sidecar.tensor_json.as_bytes()))
+            );
+            let tensor: PalsModelInput = serde_json::from_str(&sidecar.tensor_json).unwrap();
+            tensor.validate(&PalsModelConfig::baseline()).unwrap();
+            assert_eq!(
+                hex(tensor.history_digest),
+                input.snapshot().rules_history_sha256
+            );
+            assert_eq!(tensor.model_epoch, [0; 32]);
+            assert_eq!(sidecar.model_epoch_kind, "encoding_only_zero");
+            assert_eq!(
+                tensor
+                    .candidates
+                    .iter()
+                    .map(|c| c.packed().unwrap())
+                    .collect::<Vec<_>>(),
+                input.snapshot().legal_moves
+            );
+            assert_eq!(sidecar.record_sources, input.snapshot().public_records);
+            assert!(matches!(
+                &input.snapshot().source,
+                PalsInputSource::OwnCpu {
+                    model_weights_sha256: None,
+                    ..
+                }
+            ));
+        }
+        let pgn = std::fs::read_to_string(run.join("games.pgn")).unwrap();
+        assert!(pgn.contains("[Termination \"PlyLimit\"]"));
+        assert!(pgn.contains("[Result \"*\"]"));
+    }
+    #[test]
+    fn exact_terminal_and_stalemate_are_rules_labels_without_cpu_jobs() {
+        for (fen, outcome) in [
+            ("7k/6Q1/5K2/8/8/8/8/8 b - - 0 1", PalsOutcome::WhiteWin),
+            ("8/8/8/8/8/5k2/6q1/7K w - - 0 1", PalsOutcome::BlackWin),
+            ("7k/5Q2/5K2/8/8/8/8/8 b - - 0 1", PalsOutcome::Draw),
+        ] {
+            let output = OwnedTemp::new();
+            let mut cpu = driver();
+            let registry = own_collection_registry(&cpu).unwrap();
+            let mut config = small_config();
+            config.openings[0].initial_fen = Some(fen.into());
+            let receipt = collect_pals_own_data(
+                config,
+                &output.0,
+                &mut cpu,
+                &registry,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert!(receipt.complete, "{:?}", receipt.failure);
+            assert_eq!(receipt.cpu_jobs, 0);
+            assert_eq!(receipt.results[0].outcome, outcome);
+            let records: Vec<PalsLearningRecord> =
+                rows(&output.0.join(receipt.run_id).join("records.jsonl"));
+            assert_eq!(records.len(), 1);
+            let label = records[0].future_label.as_ref().unwrap();
+            assert_eq!(
+                label.value_wdl,
+                outcome_wdl(outcome, records[0].input.snapshot().white_to_move)
+            );
+        }
+    }
+    struct BrokenDriver(OwnCpuCollectionDriver);
+    impl PalsCollectionDriver for BrokenDriver {
+        fn description(&self) -> &PalsCollectionSourceDescription {
+            self.0.description()
+        }
+        fn new_game(&mut self) {
+            self.0.new_game();
+        }
+        fn analyze(
+            &mut self,
+            _: &Position,
+            _: &PalsFrozenInput,
+            _: &PalsModelInput,
+            _: CpuLimits,
+            _: &AtomicBool,
+        ) -> Result<PalsCollectionDecision, ArenaError> {
+            Err(invalid("injected own-driver failure"))
+        }
+    }
+    #[test]
+    fn failure_preserves_seal_and_unknown_partial_pgn() {
+        let output = OwnedTemp::new();
+        let mut cpu = BrokenDriver(driver());
+        let registry = own_collection_registry(&cpu).unwrap();
+        let receipt = collect_pals_own_data(
+            small_config(),
+            &output.0,
+            &mut cpu,
+            &registry,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!receipt.complete);
+        assert!(receipt.failure.as_ref().unwrap().contains("injected"));
+        assert_eq!(receipt.results[0].outcome, PalsOutcome::Unknown);
+        let run = output.0.join(receipt.run_id);
+        assert!(run.join("inputs.jsonl").is_file());
+        assert!(run.join("native-inputs.jsonl").is_file());
+        let pgn = std::fs::read_to_string(run.join("games.pgn")).unwrap();
+        assert!(pgn.contains("InfrastructureFailure"));
+        assert!(pgn.contains("[Result \"*\"]"));
+        assert!(run.join("receipt.json").is_file());
+    }
+    #[test]
+    fn source_mismatch_and_existing_directory_are_rejected_without_overwrite() {
+        let output = OwnedTemp::new();
+        let mut cpu = driver();
+        let mut registry = own_collection_registry(&cpu).unwrap();
+        registry.input_sources.clear();
+        let replacement = PalsInputSource::OwnCpu {
+            cpu_binary_sha256: cpu.description().implementation_sha256.clone(),
+            evaluator_configuration_sha256: "a".repeat(64),
+            model_weights_sha256: None,
+        };
+        registry.input_sources.insert(replacement);
+        assert!(
+            collect_pals_own_data(
+                small_config(),
+                &output.0,
+                &mut cpu,
+                &registry,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
+        assert!(!output.0.join(small_config().run_id).exists());
+        let registry = own_collection_registry(&cpu).unwrap();
+        let receipt = collect_pals_own_data(
+            small_config(),
+            &output.0,
+            &mut cpu,
+            &registry,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(receipt.complete);
+        let receipt_path = output.0.join(receipt.run_id).join("receipt.json");
+        let before = std::fs::read(&receipt_path).unwrap();
+        assert!(
+            collect_pals_own_data(
+                small_config(),
+                &output.0,
+                &mut cpu,
+                &registry,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(receipt_path).unwrap(), before);
+    }
+    #[test]
+    fn overlapping_declared_splits_fail_audit_and_preserve_games() {
+        let output = OwnedTemp::new();
+        let mut cpu = driver();
+        let registry = own_collection_registry(&cpu).unwrap();
+        let mut config = small_config();
+        config.games = 2;
+        config.openings.push(PalsCollectionOpening {
+            id: "same-board-holdout".into(),
+            split: PalsSplit::Holdout,
+            ..PalsCollectionOpening::default()
+        });
+        let receipt = collect_pals_own_data(
+            config,
+            &output.0,
+            &mut cpu,
+            &registry,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!receipt.complete);
+        assert_eq!(receipt.results.len(), 2);
+        assert!(receipt.audit.is_none());
+        let pgn = std::fs::read_to_string(output.0.join(receipt.run_id).join("games.pgn")).unwrap();
+        assert_eq!(pgn.matches("[Event ").count(), 2);
+    }
+    #[test]
+    fn conditional_repair_inputs_keep_actual_history_separate_and_no_game_outcome() {
+        let output = OwnedTemp::new();
+        let source = driver().description().clone();
+        let config = small_config();
+        let mut disk = Output::new(&output.0, "conditional", config.max_output_bytes).unwrap();
+        let mut state = Collection {
+            sequence: 0,
+            nodes: 0,
+            jobs: 0,
+            rows: Vec::new(),
+            inputs: Vec::new(),
+            assignments: BTreeMap::new(),
+            results: Vec::new(),
+            public: Vec::new(),
+            role_records: Vec::new(),
+        };
+        let root = Position::startpos();
+        let opening = PalsCollectionOpening::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let cancel = AtomicBool::new(false);
+        let proposal = [
+            BoardMove::from_uci("e2e4").unwrap(),
+            BoardMove::from_uci("e7e5").unwrap(),
+        ];
+        let mut cpu = CpuEngine::new(CpuConfig {
+            tt_entries: 64,
+            quiescence_ply: 2,
+            ..CpuConfig::default()
+        })
+        .unwrap();
+        let cpu_source = source_description(
+            cpu.config(),
+            "own-cpu-conditional-verification",
+            serde_json::Value::Null,
+        )
+        .unwrap();
+        conditional(
+            &config,
+            &mut state,
+            &mut disk,
+            &root,
+            &opening,
+            "g1",
+            &[],
+            &proposal,
+            &source,
+            &cpu_source,
+            &mut cpu,
+            deadline,
+            &cancel,
+        )
+        .unwrap();
+        assert!(!state.inputs.is_empty());
+        assert_eq!(state.inputs[0].input.snapshot().role, PalsDataRole::Critic);
+        for captured in &state.inputs {
+            assert!(!captured.outcome_eligible);
+            assert!(captured.input.snapshot().actual_history.is_empty());
+            assert!(
+                captured
+                    .input
+                    .snapshot()
+                    .position_command
+                    .contains(" moves e2e4")
+            );
+        }
+        for row in &state.rows {
+            row.validate().unwrap();
+            let label = row.future_label.as_ref().unwrap();
+            assert!(label.value_wdl.is_none());
+            assert!(
+                label
+                    .counterexample
+                    .as_ref()
+                    .is_none_or(|c| c.validity == PalsConditionalValidity::NotExamined)
+            );
+        }
+    }
+    struct VirtualDepthProbe(OwnCpuCollectionDriver);
+    impl PalsCollectionDriver for VirtualDepthProbe {
+        fn description(&self) -> &PalsCollectionSourceDescription {
+            self.0.description()
+        }
+        fn new_game(&mut self) {
+            self.0.new_game();
+        }
+        fn analyze(
+            &mut self,
+            position: &Position,
+            input: &PalsFrozenInput,
+            prepared: &PalsModelInput,
+            limits: CpuLimits,
+            cancel: &AtomicBool,
+        ) -> Result<PalsCollectionDecision, ArenaError> {
+            let mut virtual_position = position.clone();
+            for text in ["e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "f8c5"] {
+                virtual_position
+                    .make_move(BoardMove::from_uci(text).map_err(rules)?)
+                    .map_err(rules)?;
+            }
+            self.0.analyze(position, input, prepared, limits, cancel)
+        }
+    }
+    #[test]
+    fn one_actual_ply_budget_keeps_capacity_for_deeper_virtual_cpu_lines() {
+        let output = OwnedTemp::new();
+        let mut cpu = VirtualDepthProbe(driver());
+        let registry = own_collection_registry(&cpu).unwrap();
+        let receipt = collect_pals_own_data(
+            small_config(),
+            &output.0,
+            &mut cpu,
+            &registry,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(receipt.complete, "{:?}", receipt.failure);
+        assert_eq!(receipt.results[0].ending, PalsGameEnd::PlyLimit);
+    }
+    #[test]
+    fn output_failure_after_rules_result_never_rewrites_outcome_to_unknown() {
+        let output = OwnedTemp::new();
+        let mut cpu = driver();
+        let registry = own_collection_registry(&cpu).unwrap();
+        let mut config = small_config();
+        config.openings[0].initial_fen = Some("7k/6Q1/5K2/8/8/8/8/8 b - - 0 1".into());
+        // A terminal collection's first records write occurs after its actual
+        // result is known. Simulate dataset serialization/storage failure there.
+        FAIL_ARTIFACT.with(|flag| flag.set(Some(("records.jsonl", 0))));
+        let receipt = collect_pals_own_data(
+            config,
+            &output.0,
+            &mut cpu,
+            &registry,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!receipt.complete);
+        assert_eq!(receipt.results.len(), 1);
+        assert_eq!(receipt.results[0].outcome, PalsOutcome::WhiteWin);
+        assert_eq!(receipt.results[0].ending, PalsGameEnd::Checkmate);
+        let run = output.0.join(receipt.run_id);
+        let results: Vec<PalsGameResult> = rows(&run.join("game-results.jsonl"));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], receipt.results[0]);
+        let pgn = std::fs::read_to_string(run.join("games.pgn")).unwrap();
+        assert!(pgn.contains("[Result \"1-0\"]"));
+        assert!(pgn.contains("Checkmate"));
+        assert!(receipt.data_output_bytes <= receipt.reserved_output_bytes);
+        assert!(receipt.reserved_output_bytes <= receipt.config.max_output_bytes);
+    }
+    #[test]
+    fn partial_opening_failure_keeps_every_successfully_played_move() {
+        let output = OwnedTemp::new();
+        let mut cpu = driver();
+        let registry = own_collection_registry(&cpu).unwrap();
+        let mut config = small_config();
+        config.openings[0].moves = vec!["e2e4".into(), "e2e5".into()];
+        let receipt = collect_pals_own_data(
+            config,
+            &output.0,
+            &mut cpu,
+            &registry,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!receipt.complete);
+        assert_eq!(receipt.results.len(), 1);
+        assert_eq!(receipt.results[0].outcome, PalsOutcome::Unknown);
+        let pgn = std::fs::read_to_string(output.0.join(receipt.run_id).join("games.pgn")).unwrap();
+        assert!(pgn.contains("1. e4 *"));
+    }
+    #[test]
+    fn foreign_git_checkout_and_terminal_continuations_are_rejected() {
+        let output = OwnedTemp::new();
+        let foreign = output.0.join("another-repository");
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(foreign.join(".git"), "gitdir: irrelevant\n").unwrap();
+        assert!(Output::new(&foreign.join("raw-data"), "outside-required", 1024 * 1024).is_err());
+        assert!(!foreign.join("raw-data").exists());
+        let drawn = Position::from_fen("4k3/8/8/8/8/8/4P3/4K3 w - - 150 1").unwrap();
+        let movement = BoardMove::from_uci("e2e4").unwrap();
+        assert!(replay_line(&drawn, &[movement]).is_err());
+        let mut cpu = driver();
+        let registry = own_collection_registry(&cpu).unwrap();
+        let mut config = small_config();
+        config.openings[0].initial_fen = Some(drawn.to_fen());
+        config.openings[0].moves = vec!["e2e4".into()];
+        let receipt = collect_pals_own_data(
+            config,
+            &output.0,
+            &mut cpu,
+            &registry,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!receipt.complete);
+        assert_eq!(receipt.cpu_jobs, 0);
+        assert_eq!(receipt.results[0].outcome, PalsOutcome::Draw);
+    }
+    struct CancelAfterAnalysis(OwnCpuCollectionDriver);
+    impl PalsCollectionDriver for CancelAfterAnalysis {
+        fn description(&self) -> &PalsCollectionSourceDescription {
+            self.0.description()
+        }
+        fn new_game(&mut self) {
+            self.0.new_game();
+        }
+        fn analyze(
+            &mut self,
+            position: &Position,
+            input: &PalsFrozenInput,
+            prepared: &PalsModelInput,
+            limits: CpuLimits,
+            cancel: &AtomicBool,
+        ) -> Result<PalsCollectionDecision, ArenaError> {
+            let result = self.0.analyze(position, input, prepared, limits, cancel)?;
+            cancel.store(true, Ordering::Release);
+            Ok(result)
+        }
+    }
+    #[test]
+    fn cancellation_before_actual_consumption_preserves_observation_without_moving() {
+        let output = OwnedTemp::new();
+        let mut cpu = CancelAfterAnalysis(driver());
+        let registry = own_collection_registry(&cpu).unwrap();
+        let receipt = collect_pals_own_data(
+            small_config(),
+            &output.0,
+            &mut cpu,
+            &registry,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(receipt.complete, "{:?}", receipt.failure);
+        assert_eq!(receipt.results[0].ending, PalsGameEnd::UserStop);
+        let pgn = std::fs::read_to_string(output.0.join(receipt.run_id).join("games.pgn")).unwrap();
+        assert!(pgn.contains("\n\n*\n"));
+        assert!(!pgn.contains("\n\n1."));
+    }
+    #[test]
+    fn serialization_and_failed_writes_keep_finite_reserved_byte_accounting() {
+        let output = OwnedTemp::new();
+        let mut disk = Output::new(&output.0, "bounded", 1024 * 1024).unwrap();
+        assert!(
+            disk.json("huge.jsonl", &"x".repeat(MAX_JSON_RECORD_BYTES + 1))
+                .is_err()
+        );
+        assert_eq!(disk.bytes, 0);
+        let existing = disk.directory.join("failed.jsonl");
+        std::fs::write(&existing, b"seed").unwrap();
+        disk.files
+            .insert("failed.jsonl", File::open(&existing).unwrap());
+        disk.bytes = 4;
+        assert!(
+            disk.write("failed.jsonl", b"reserved_attempt", false)
+                .is_err()
+        );
+        assert_eq!(disk.bytes, 4 + "reserved_attempt".len() as u64);
+        assert_eq!(std::fs::metadata(existing).unwrap().len(), 4);
+    }
+    #[test]
+    fn partial_result_and_pgn_writes_preserve_raw_prefix_and_valid_separate_recovery() {
+        for (artifact, recovery) in [
+            ("game-results.jsonl", "recovered-game-results.jsonl"),
+            ("games.pgn", "recovered-games.pgn"),
+        ] {
+            let output = OwnedTemp::new();
+            let mut cpu = driver();
+            let registry = own_collection_registry(&cpu).unwrap();
+            let mut config = small_config();
+            config.openings[0].initial_fen = Some("7k/6Q1/5K2/8/8/8/8/8 b - - 0 1".into());
+            FAIL_ARTIFACT.with(|flag| flag.set(Some((artifact, 13))));
+            let receipt = collect_pals_own_data(
+                config,
+                &output.0,
+                &mut cpu,
+                &registry,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert!(!receipt.complete);
+            assert_eq!(receipt.results[0].outcome, PalsOutcome::WhiteWin);
+            let run = output.0.join(receipt.run_id);
+            assert_eq!(std::fs::metadata(run.join(artifact)).unwrap().len(), 13);
+            if recovery.ends_with(".jsonl") {
+                let recovered: Vec<PalsGameResult> = rows(&run.join(recovery));
+                assert_eq!(recovered, receipt.results);
+            } else {
+                let pgn = std::fs::read_to_string(run.join(recovery)).unwrap();
+                assert!(pgn.contains("[Result \"1-0\"]"));
+                assert!(pgn.ends_with("1-0\n\n"));
+            }
+            assert!(receipt.artifacts.contains_key(artifact));
+            assert!(receipt.artifacts.contains_key(recovery));
+            assert!(receipt.data_output_bytes <= receipt.reserved_output_bytes);
+        }
+    }
+    #[test]
+    fn admitted_compact_source_config_fits_compact_receipt_reserve() {
+        let output = OwnedTemp::new();
+        let mut description = driver().description().clone();
+        description.configuration = serde_json::json!(vec![0_u8; 32767]);
+        let digest = canonical_sha256(&description.configuration).unwrap();
+        description.cpu_profile_sha256 = digest.clone();
+        if let PalsInputSource::OwnCpu {
+            evaluator_configuration_sha256,
+            ..
+        } = &mut description.source
+        {
+            *evaluator_configuration_sha256 = digest;
+        }
+        checked_source(&description).unwrap();
+        let config = small_config();
+        let mut disk = Output::new(&output.0, "large-descriptor", config.max_output_bytes).unwrap();
+        let receipt = PalsCollectionReceipt {
+            version: PALS_COLLECT_VERSION.into(),
+            run_id: config.run_id.clone(),
+            source: description,
+            config,
+            complete: false,
+            failure: Some(failure_text("x".repeat(64 * 1024))),
+            games_finished: 0,
+            cpu_nodes: 0,
+            cpu_jobs: 0,
+            wall_time_ms: 0,
+            data_output_bytes: 0,
+            reserved_output_bytes: 0,
+            receipt_reserve_bytes: RECEIPT_RESERVE,
+            results: Vec::new(),
+            audit: None,
+            artifacts: BTreeMap::new(),
+            actual_training_executed: false,
+            external_teacher_used: false,
+        };
+        disk.finish(&receipt).unwrap();
+        let bytes = std::fs::read(disk.directory.join("receipt.json")).unwrap();
+        assert!(bytes.len() < RECEIPT_RESERVE as usize);
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_ok());
+        let escaped = failure_text("\0".repeat(8192));
+        assert!(bounded_json(&escaped, 8192, false).is_ok());
+        assert!(escaped.contains("message truncated"));
+    }
+}

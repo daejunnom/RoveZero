@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const PALS_MANIFEST_V3_DOMAIN: &str = "rz-pals-execution-v3/1";
-pub const PALS_RECEIPT_V3_DOMAIN: &str = "rz-pals-receipt-v3/1";
+// Initial /1 was unpublished WIP. /2 separates CPU completed-task reuse from
+// NN cache consumption; historical V1/V2 codecs and execution locks are intact.
+pub const PALS_RECEIPT_V3_DOMAIN: &str = "rz-pals-receipt-v3/2";
 
 macro_rules! choices {
     ($name:ident { $($variant:ident),+ $(,)? }) => {
@@ -637,15 +639,24 @@ pub struct PalsEndpointReceiptV3 {
     pub memory_peak_bytes: PalsObservedV3<u64>,
     pub gpu_device: PalsObservedV3<String>,
     pub vram_peak_bytes: PalsObservedV3<u64>,
-    /// Completed native NN inputs/calls, not cache hits or MCTS visits.
+    /// All physically completed native graph inputs/calls, including shared
+    /// public-memory preparation and role reader graphs; not cache hits/visits.
     pub nn_inputs_completed: u64,
     pub nn_calls_completed: u64,
+    /// Native role inputs accepted by search. Public-memory reuse is retained
+    /// as a separate raw backend preparation/cache count.
     pub nn_inputs_consumed: u64,
+    /// Reused native NN evaluations only, never CPU evidence or a visit count.
     pub cached_evaluations_consumed: u64,
     pub proposer_tasks_completed: u64,
     pub critic_tasks_completed: u64,
+    /// RoveZero's own CPU_R task units. External UCI engine node/task statistics
+    /// remain in external evidence and are not converted to these counters.
     pub cpu_tasks_requested: u64,
     pub cpu_tasks_completed: u64,
+    /// Accepted consumers of previously completed TaskTable tasks. Reusing a
+    /// depth-sufficient node estimate alone is recorded in raw work evidence.
+    pub cpu_tasks_reused_consumed: u64,
     pub cpu_tasks_consumed: u64,
     pub cpu_nodes: u64,
     pub physical_state: PalsPhysicalStateV3,
@@ -766,7 +777,10 @@ fn receipt_endpoint(
         o.nn_inputs_consumed <= o.nn_inputs_completed
             && o.nn_calls_completed <= o.nn_inputs_completed
             && (o.nn_inputs_completed == 0) == (o.nn_calls_completed == 0)
-            && o.cpu_tasks_consumed <= o.cpu_tasks_completed
+            && o.cpu_tasks_completed
+                .checked_add(o.cpu_tasks_reused_consumed)
+                .is_some_and(|admitted| o.cpu_tasks_consumed <= admitted)
+            && o.cpu_tasks_reused_consumed <= o.cpu_tasks_consumed
             && o.cpu_tasks_completed <= o.cpu_tasks_requested,
         "NN/task completion and consumption counters inconsistent",
     )?;
@@ -782,6 +796,12 @@ fn receipt_endpoint(
         require(
             o.nn_inputs_completed == 0 && o.nn_inputs_consumed == 0 && o.nn_calls_completed == 0,
             "mock/CPU/external endpoint cannot invent native NN counters",
+        )?;
+    }
+    if !native {
+        require(
+            o.cached_evaluations_consumed == 0,
+            "mock/CPU/external process cannot claim native NN cache consumption",
         )?;
     }
     if matches!(e, PalsEngineV3::Pals(p) if p.model.backend == PalsModelBackendV3::OrtCuda)
@@ -1085,6 +1105,7 @@ mod tests {
             critic_tasks_completed: 0,
             cpu_tasks_requested: 1,
             cpu_tasks_completed: 1,
+            cpu_tasks_reused_consumed: 0,
             cpu_tasks_consumed: 1,
             cpu_nodes: 100,
             physical_state: PalsPhysicalStateV3::NotRequired,
@@ -1242,6 +1263,31 @@ mod tests {
         r.pair_eligible = true;
         r.failures.clear();
         assert!(r.validate_against(&l).is_err());
+    }
+    #[test]
+    fn pals_receipt_cpu_task_reuse_is_not_nn_cache_or_new_physical_work() {
+        let l = manifest().lock().unwrap();
+        let mut r = receipt(&l);
+        r.games[0].engines[0].cpu_tasks_requested = 1;
+        r.games[0].engines[0].cpu_tasks_completed = 1;
+        r.games[0].engines[0].cpu_tasks_reused_consumed = 2;
+        r.games[0].engines[0].cpu_tasks_consumed = 3;
+        assert!(r.validate_against(&l).is_ok());
+        r.games[0].engines[0].cpu_tasks_reused_consumed = 1;
+        assert!(r.validate_against(&l).is_err());
+        r.games[0].engines[0].cpu_tasks_reused_consumed = 2;
+        r.games[0].engines[0].cached_evaluations_consumed = 2;
+        assert!(r.validate_against(&l).is_err());
+        r.games[0].engines[0].cached_evaluations_consumed = 0;
+        r.domain = "rz-pals-receipt-v3/1".into();
+        assert!(r.validate_against(&l).is_err());
+        r.domain = PALS_RECEIPT_V3_DOMAIN.into();
+        let mut value = serde_json::to_value(&r).unwrap();
+        value["games"][0]["engines"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("cpu_tasks_reused_consumed");
+        assert!(PalsRunReceiptV3::from_json(&value.to_string(), &l).is_err());
     }
     #[test]
     fn engine_failure_is_a_loss_not_an_omitted_or_drawn_game() {

@@ -37,8 +37,48 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
     fn receipt_version(&self) -> u32 {
         1
     }
+    fn contract_revision(&self) -> &str {
+        "0.1"
+    }
+    #[cfg(target_os = "linux")]
+    fn validate_runtime_admission(&self) -> Result<(), ArenaError> {
+        Ok(())
+    }
     fn expected_provider_sessions(&self) -> usize {
         4
+    }
+    fn uses_provider_records(
+        &self,
+        role: rz_experiments::NativeEngineRole,
+    ) -> Result<bool, ArenaError> {
+        Ok(self.engine_view(role)?.external.is_none())
+    }
+    fn provider_export_artifact(
+        &self,
+        role: rz_experiments::NativeEngineRole,
+    ) -> Result<Option<&rz_experiments::ArtifactRef>, ArenaError> {
+        let engine = self.engine_view(role)?;
+        if engine.external.is_some() {
+            Ok(None)
+        } else {
+            Ok(Some(engine.artifact(
+                rz_experiments::NativeArtifactRole::ExportManifest,
+            )?))
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn validate_conversion_manifest(
+        &self,
+        _role: rz_experiments::NativeEngineRole,
+        startup: &[u8],
+        manifest: &[u8],
+        batch_experiment: bool,
+    ) -> Result<(), ArenaError> {
+        linux::verify_conversion_provenance(
+            &linux::json(startup)?,
+            &linux::json(manifest)?,
+            batch_experiment,
+        )
     }
     fn role_startup_filename(&self, _role: rz_experiments::NativeEngineRole) -> &'static str {
         self.startup_filename()
@@ -90,6 +130,15 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
         _native_pids: &[u32],
     ) -> Result<Vec<u32>, ArenaError> {
         Ok(Vec::new())
+    }
+    #[cfg(target_os = "linux")]
+    fn external_game_process_ids(
+        &self,
+        _role: rz_experiments::NativeEngineRole,
+        external_ids: &[u32],
+        _root_output: &cap_std::fs::Dir,
+    ) -> Result<Vec<u32>, ArenaError> {
+        Ok(external_ids.to_vec())
     }
     /// Additional provider-specific acceptance of the supervisor-owned stdout.
     /// CPU V1 keeps its existing gate; CUDA requires the pinned runner's exit
@@ -588,55 +637,27 @@ pub(crate) mod linux {
         owner: &mut NativeLaunchOwner<S>,
         mut cache_hint: Option<&mut SnapshotCacheHint>,
     ) -> Result<(), ArenaError> {
+        crate::native_launch::linux::verify_input_directories(
+            &owner.snapshot.directory,
+            &owner.snapshot.input_directory,
+            &owner.snapshot.input_subdirectories,
+        )?;
         for item in &mut owner.snapshot.pins {
             verify_copy(&mut item.file, &item.artifact)?;
             let relative = item
                 .path
                 .strip_prefix(&owner.snapshot.path)
                 .map_err(|_| invalid("native pin escaped owned directory"))?;
-            let name = relative
-                .file_name()
-                .ok_or_else(|| invalid("native input has no direct copy name"))?;
             let mut options = OpenOptions::new();
             options
                 .read(true)
                 .follow(FollowSymlinks::No)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-            let parent = relative
-                .parent()
-                .ok_or_else(|| invalid("native input has no parent"))?;
-            let directory = if parent == std::path::Path::new("inputs") {
-                &owner.snapshot.input_directory
-            } else if parent == std::path::Path::new("inputs/cuda-bundle") {
-                let held = owner
-                    .snapshot
-                    .bundle_directory
-                    .as_ref()
-                    .ok_or_else(|| invalid("CUDA input directory is not retained"))?;
-                let named = owner
-                    .snapshot
-                    .input_directory
-                    .open_dir_nofollow("cuda-bundle")
-                    .map_err(|_| invalid("CUDA input directory pathname changed"))?;
-                let held_meta = held
-                    .try_clone()
-                    .map_err(|_| invalid("cannot clone CUDA directory pin"))?
-                    .into_std_file()
-                    .metadata()
-                    .map_err(|_| invalid("CUDA input directory metadata unavailable"))?;
-                let named_meta = named
-                    .into_std_file()
-                    .metadata()
-                    .map_err(|_| invalid("CUDA named directory metadata unavailable"))?;
-                if (held_meta.dev(), held_meta.ino()) != (named_meta.dev(), named_meta.ino()) {
-                    return Err(invalid(
-                        "CUDA input directory no longer names its owned inode",
-                    ));
-                }
-                held
-            } else {
-                return Err(invalid("native input escaped closed snapshot topology"));
-            };
+            let (directory, name) = crate::native_launch::linux::input_parent(
+                &owner.snapshot.input_directory,
+                &owner.snapshot.input_subdirectories,
+                relative,
+            )?;
             let path_file = directory
                 .open_with(name, &options)
                 .map_err(|_| invalid("native input pathname changed"))?
@@ -782,14 +803,19 @@ pub(crate) mod linux {
                 continue;
             };
             let binary = pin(&owner.snapshot.pins, &e.binary)?;
-            let args = e
-                .arguments
-                .iter()
-                .map(|s| {
-                    crate::external_uci::resolve_asset_tokens(s, &e, &owner.snapshot.pins)
-                        .map(std::ffi::OsString::from)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            // Option identification/readiness probes must not create game-only
+            // provider records in the role runtime directory.
+            let runtime_root = owner.snapshot.path.join(match role {
+                NativeEngineRole::Baseline => "baseline-runtime",
+                NativeEngineRole::Candidate => "candidate-runtime",
+            });
+            let args = crate::native_launch::linux::external_arguments(
+                &owner.spec,
+                role,
+                &e,
+                &owner.snapshot.pins,
+                crate::native_launch::linux::ExternalArgumentMode::Preflight(&runtime_root),
+            )?;
             let requested = e
                 .requested_options
                 .iter()
@@ -993,6 +1019,12 @@ pub(crate) mod linux {
         cancel: Option<&AtomicBool>,
     ) -> Result<(NativePairReceipt<S::Audit>, ArtifactRef), ArenaError> {
         let run_started = std::time::Instant::now();
+        bundle
+            .owner
+            .as_ref()
+            .expect("prepared native owner")
+            .spec
+            .validate_runtime_admission()?;
         let external_preflight = preflight_endpoints(bundle, cancel)?;
         let owner = bundle.owner.as_mut().expect("prepared native owner");
         crate::emit_native_phase("prelaunch_verification_started");
@@ -1063,7 +1095,7 @@ pub(crate) mod linux {
             validation_scope: owner.spec.scope().into(),
             input_sha256: owner.spec.input_sha256().into(),
             pair_id: owner.spec.view().pair_id.into(),
-            contract_revision: "0.1".into(),
+            contract_revision: owner.spec.contract_revision().into(),
             runner_source_commit: owner.spec.view().runner.source_commit.clone(),
             runner_binary_sha256: owner.spec.view().runner.binary.sha256.clone(),
             process: process.receipt.clone(),
@@ -1195,6 +1227,9 @@ pub(crate) mod linux {
                 Ok((sessions, pids)) => {
                     receipt.provider_sessions = sessions;
                     for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+                        if owner.spec.uses_provider_records(role)? {
+                            continue;
+                        }
                         if let Some(e) = owner.spec.engine_view(role)?.external {
                             let options = e
                                 .requested_options
@@ -1208,12 +1243,17 @@ pub(crate) mod linux {
                                     .map(|v| (k.clone(), v))
                                 })
                                 .collect::<Result<BTreeMap<_, _>, _>>()?;
-                            match crate::external_uci::audit_external_game_protocol(
-                                &process.stdout,
-                                e,
-                                &options,
-                                &pids,
-                            ) {
+                            match owner
+                                .spec
+                                .external_game_process_ids(role, &pids, &owner.snapshot.directory)
+                                .and_then(|role_pids| {
+                                    crate::external_uci::audit_external_game_protocol(
+                                        &process.stdout,
+                                        e,
+                                        &options,
+                                        &role_pids,
+                                    )
+                                }) {
                                 Ok(a) => receipt.external_execution.push(a),
                                 Err(e) => receipt.external_audit_error = Some(e.to_string()),
                             }
@@ -1908,7 +1948,7 @@ pub(crate) mod linux {
         }
         Ok(())
     }
-    fn verify_conversion_provenance(
+    pub(super) fn verify_conversion_provenance(
         startup: &Value,
         manifest: &Value,
         batch_experiment: bool,
@@ -1972,7 +2012,7 @@ pub(crate) mod linux {
             (NativeEngineRole::Candidate, "candidate-runtime"),
         ] {
             let engine = owner.spec.engine_view(role)?;
-            if engine.external.is_some() {
+            if !owner.spec.uses_provider_records(role)? {
                 continue;
             }
             let directory = owner
@@ -2035,7 +2075,6 @@ pub(crate) mod linux {
                     &format!("{name}/{session}/{termination_filename}"),
                     &termination_bytes,
                 ));
-                let startup = json(&startup_bytes)?;
                 let (audit, pid) = owner.spec.validate_records(
                     role,
                     &startup_bytes,
@@ -2054,22 +2093,22 @@ pub(crate) mod linux {
                 }
                 // Compare conversion provenance with the exact copied export
                 // manifest bytes rather than trusting additional receipt strings.
-                let export = pin(
-                    &owner.snapshot.pins,
-                    engine.artifact(NativeArtifactRole::ExportManifest)?,
-                )?;
-                let manifest = json(&read_bytes(
-                    export
-                        .file
-                        .try_clone()
-                        .map_err(|_| invalid("cannot clone export pin"))?,
-                    64 * 1024,
-                )?)?;
-                verify_conversion_provenance(
-                    &startup,
-                    &manifest,
-                    engine.batch_experiment.is_some(),
-                )?;
+                if let Some(export) = owner.spec.provider_export_artifact(role)? {
+                    let export = pin(&owner.snapshot.pins, export)?;
+                    let manifest_bytes = read_bytes(
+                        export
+                            .file
+                            .try_clone()
+                            .map_err(|_| invalid("cannot clone export pin"))?,
+                        64 * 1024,
+                    )?;
+                    owner.spec.validate_conversion_manifest(
+                        role,
+                        &startup_bytes,
+                        &manifest_bytes,
+                        engine.batch_experiment.is_some(),
+                    )?;
+                }
                 sessions.push(audit);
             }
         }

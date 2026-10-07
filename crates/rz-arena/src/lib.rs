@@ -17,6 +17,8 @@ mod native_pilot;
 #[cfg(target_os = "linux")]
 mod native_retention;
 mod native_runner;
+pub mod pals_collect;
+pub mod pals_launch;
 mod pgn;
 mod plan;
 mod process;

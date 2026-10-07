@@ -10,6 +10,7 @@ description = "RoveZero paired opening plans and attempt/failure ledger"
 test-fixtures = []
 experimental-snapshot-io = []
 experimental-snapshot-reclaim = []
+pals-collection = ["dep:rz-uci"]
 native-cuda = ["dep:rz-uci", "rz-uci/onnx-cuda"]
 native-cuda-batch = ["native-cuda", "rz-uci/experimental-batch", "rz-eval/experimental-batch"]
 
@@ -26,10 +27,15 @@ required-features = ["native-cuda"]
 name = "native_batch_prepare"
 required-features = ["native-cuda-batch"]
 
+[[example]]
+name = "pals_collect"
+required-features = ["pals-collection"]
+
 [dependencies]
 rz-experiments.workspace = true
 rz-contracts.workspace = true
 rz-eval.workspace = true
+rz-search.workspace = true
 rz-position = { workspace = true, features = ["contracts"] }
 rz-uci = { workspace = true, optional = true }
 serde.workspace = true

@@ -1,11 +1,14 @@
 //! Retire only the launch owner's verified private copies after evidence is saved.
 //! Shared runtimes, source assets, executable pins and JSON evidence are retained.
-use crate::{ArenaError, NATIVE_PAIR_METADATA_CAP, native_launch::linux::Snapshot};
+use crate::{
+    ArenaError, NATIVE_PAIR_METADATA_CAP,
+    native_launch::linux::{Snapshot, input_parent, verify_input_directories},
+};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
 use serde_json::json;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, Permissions},
     io::Write,
     os::unix::fs::{MetadataExt, PermissionsExt},
@@ -137,7 +140,7 @@ pub(crate) fn retire(snapshot: &mut Snapshot) -> Result<(), ArenaError> {
     let removed = retire_pins(
         &snapshot.directory,
         &snapshot.input_directory,
-        snapshot.bundle_directory.as_ref(),
+        &snapshot.input_subdirectories,
         &snapshot.path,
         &snapshot.pins,
     )?;
@@ -154,10 +157,13 @@ pub(crate) fn retire(snapshot: &mut Snapshot) -> Result<(), ArenaError> {
 fn retire_pins(
     output: &Dir,
     inputs: &Dir,
-    bundle: Option<&Dir>,
+    subdirectories: &BTreeMap<std::path::PathBuf, Dir>,
     root: &Path,
     pins: &[crate::native_launch::linux::InputPin],
 ) -> Result<BTreeSet<std::path::PathBuf>, ArenaError> {
+    // All ancestors, including folders holding only preserved evidence, must
+    // still name the exact no-follow capabilities before any chmod or unlink.
+    verify_input_directories(output, inputs, subdirectories)?;
     let mut candidates = Vec::new();
     for pin in pins {
         let held = pin
@@ -176,19 +182,7 @@ fn retire_pins(
             .path
             .strip_prefix(root)
             .map_err(|_| invalid("retention pin escaped root"))?;
-        let parent = relative
-            .parent()
-            .ok_or_else(|| invalid("retention parent absent"))?;
-        let directory = if parent == Path::new("inputs") {
-            inputs
-        } else if parent == Path::new("inputs/cuda-bundle") {
-            bundle.ok_or_else(|| invalid("retention bundle pin absent"))?
-        } else {
-            return Err(invalid("retention pin outside input topology"));
-        };
-        let name = relative
-            .file_name()
-            .ok_or_else(|| invalid("retention name absent"))?;
+        let (directory, name) = input_parent(inputs, subdirectories, relative)?;
         let named = directory
             .symlink_metadata(name)
             .map_err(|_| invalid("retention named pin absent"))?;
@@ -207,26 +201,6 @@ fn retire_pins(
             ));
         }
         candidates.push((pin, directory, name.to_os_string(), relative.to_path_buf()));
-    }
-    // Verify named directories still identify the held capabilities.
-    for (parent, name, held) in [
-        (output, "inputs", Some(inputs)),
-        (inputs, "cuda-bundle", bundle),
-    ] {
-        if let Some(held) = held {
-            let named = parent
-                .open_dir_nofollow(name)
-                .map_err(|_| invalid("retention directory replaced"))?;
-            let a = readable_directory(held)?
-                .metadata()
-                .map_err(|_| invalid("retention directory metadata absent"))?;
-            let b = readable_directory(&named)?
-                .metadata()
-                .map_err(|_| invalid("retention named directory metadata absent"))?;
-            if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
-                return Err(invalid("retention directory identity changed"));
-            }
-        }
     }
     let mut options = OpenOptions::new();
     options
@@ -253,9 +227,8 @@ fn retire_pins(
     readable_directory(output)?
         .sync_all()
         .map_err(|_| ArenaError::Io("cannot sync retirement journal directory".into()))?;
-    let directories: Vec<_> = [Some(inputs), bundle]
-        .into_iter()
-        .flatten()
+    let directories: Vec<_> = std::iter::once(inputs)
+        .chain(subdirectories.values())
         .map(readable_directory)
         .collect::<Result<_, _>>()?;
     let result = (|| {
@@ -391,7 +364,7 @@ mod tests {
             input(&tree, "extra.JSON", false),
         ];
         fs::set_permissions(tree.0.join("inputs"), Permissions::from_mode(0o555)).unwrap();
-        let removed = retire_pins(&output, &inputs, None, &tree.0, &pins).unwrap();
+        let removed = retire_pins(&output, &inputs, &BTreeMap::new(), &tree.0, &pins).unwrap();
         assert_eq!(removed.len(), 2);
         assert!(!pins[0].path.exists());
         assert!(!pins[1].path.exists());
@@ -412,6 +385,54 @@ mod tests {
         );
     }
     #[test]
+    fn nested_export_retirement_preserves_descriptor_and_rejects_replaced_evidence_directory() {
+        for replace in [false, true] {
+            let tree = Tree::new();
+            let output = tree.dir();
+            output.create_dir("inputs").unwrap();
+            let inputs = output.open_dir_nofollow("inputs").unwrap();
+            inputs.create_dir("pals-export").unwrap();
+            inputs.create_dir("pals-descriptor").unwrap();
+            let subdirectories: BTreeMap<_, _> = ["pals-export", "pals-descriptor"]
+                .into_iter()
+                .map(|name| (PathBuf::from(name), inputs.open_dir_nofollow(name).unwrap()))
+                .collect();
+            let pins = vec![
+                input(&tree, "pals-export/public_memory.onnx", false),
+                input(&tree, "pals-export/export.json", false),
+                input(&tree, "pals-descriptor/evidence.json", false),
+                input(&tree, "runner", true),
+            ];
+            if replace {
+                // A directory containing only preserved JSON still participates
+                // in ownership validation before any model copy is unlinked.
+                fs::rename(
+                    tree.0.join("inputs/pals-descriptor"),
+                    tree.0.join("old-inputs"),
+                )
+                .unwrap();
+                fs::create_dir(tree.0.join("inputs/pals-descriptor")).unwrap();
+                assert!(retire_pins(&output, &inputs, &subdirectories, &tree.0, &pins).is_err());
+                assert!(pins[0].path.exists());
+                assert!(!tree.0.join(JOURNAL).exists());
+            } else {
+                let removed =
+                    retire_pins(&output, &inputs, &subdirectories, &tree.0, &pins).unwrap();
+                assert_eq!(removed.len(), 1);
+                assert!(!pins[0].path.exists());
+                assert!(pins[1].path.exists() && pins[2].path.exists() && pins[3].path.exists());
+            }
+            // Restore only this fixture's directory modes for its Drop cleanup.
+            for name in ["pals-export", "pals-descriptor"] {
+                fs::set_permissions(
+                    tree.0.join("inputs").join(name),
+                    Permissions::from_mode(0o700),
+                )
+                .unwrap();
+            }
+        }
+    }
+    #[test]
     fn replaced_pin_or_existing_journal_preserves_every_copy() {
         for replace in [true, false] {
             let tree = Tree::new();
@@ -428,7 +449,7 @@ mod tests {
             } else {
                 fs::write(tree.0.join(JOURNAL), b"prior evidence").unwrap();
             }
-            assert!(retire_pins(&output, &inputs, None, &tree.0, &pins).is_err());
+            assert!(retire_pins(&output, &inputs, &BTreeMap::new(), &tree.0, &pins).is_err());
             assert!(pins[0].path.exists() && pins[1].path.exists());
         }
     }

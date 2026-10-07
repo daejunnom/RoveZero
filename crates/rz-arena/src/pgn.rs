@@ -176,7 +176,7 @@ fn piece_letter(piece: PieceKind) -> char {
 
 /// Format one already legal move. Disambiguation and check suffix inspect A's
 /// board/legal array/checked preview; this code has no attack or move generator.
-fn san(position: &Position, mv: BoardMove) -> Result<String, ArenaError> {
+pub(crate) fn san(position: &Position, mv: BoardMove) -> Result<String, ArenaError> {
     let legal = position.legal_moves();
     if !legal.contains(&mv) {
         return Err(invalid("cannot serialize illegal opening move"));
