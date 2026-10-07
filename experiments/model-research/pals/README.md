@@ -205,6 +205,25 @@ Public source JSONL은 다른 탐색에서 같은 observation을 다시 선택�
 않으며 다른 bytes는 원래 pin을 대신하지 못합니다. 전체 artifact pin과 요청·
 journal·context·physical output의 유일성 검사는 유지합니다.
 
+`whole_line_ordinal.admit_whole_line_pair`는 기존 strict frozen current parent와
+별도로 등록한 Rust `--line-continuation`의 두 실제 실행을 연결합니다. 정확한
+current 입력 또는 이미 인수한 D/Repair capability의 자체 context·공개 증거를
+유지하고, binary·source·실제 build 관측·CLI capability·결과 전 criterion·before-plan과
+각 request/receipt/stderr/launch/process 관측의 원시 bytes 및 독립 pin을 요구합니다.
+loaded inode-before-stdin·exit 0·reap·EOF·group 부재와 source/binary 전후 안정성은
+known·masked 모두의 필수 조건이며, JSON 선언이나 self-seal만으로 실행을 증명하지 않습니다.
+
+비교는 동일 L/H/N/Q/TT/wall·profile·완전한 known history의 두 수순에 한정합니다.
+fresh CPU의 정확한 H 완료·Rules PV·raw endpoint 값을 보존하고, 사전 criterion만
+수순 parity와 명시한 선호 방향을 적용합니다. 범위는 `line_conditioned_surrogate`이며
+terminal·mate band·범위 밖·tie/margin 미달·partial·cancel·missing·unknown history는
+마스킹합니다. 식별·조건·실행 정리 실패는 mask로 숨기지 않고 거절합니다.
+`CheckedWholeLinePair`는 immutable factory capability이고 원시 bytes 재로드 후 같은
+factory로 다시 인수합니다. ordinary policy·D current label·전략적 Repair validity·
+counterexample validity·WDL·minimax·전술 증명·학습 target 권한을 제공하지 않습니다.
+C slot·Repair 결정에 대한 projection과 frozen loss는 별도 후속 consumer가 필요합니다.
+기존 factual continuation을 새 사전 criterion이 있었던 자료로 소급 변환하지 않습니다.
+
 FLOPs 보고는 FMA=2 기준의 실제 선언 shape에 따른 matrix product 산술입니다.
 encoder와 role 반복 비용을 구분하고 cached memory를 호출마다 중복 계산하지 않습니다.
 softmax·RMSNorm·SwiGLU activation·lookup·이동·CPU 탐색과 backward는 제외 사실을

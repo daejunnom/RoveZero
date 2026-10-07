@@ -1353,3 +1353,36 @@ in-flight 0과 managed temporary 정리를 확인했다. collector의 loaded ino
 문서 커밋 `866f5b2`의 [CI 37697648405](https://github.com/daejunnom/RoveZero/actions/runs/37697648405)는
 Linux·Windows·CPU bindings·model CPU 네 job 모두 실제 성공했다. root67/68/69의
 실제 실행 source·기능 인수와 CI 커밋은 각각 구분하며 GPU 검증은 계속 보류한다.
+
+### 전체 수순의 사전 criterion과 조건부 ordinal consumer
+
+[`whole_line_ordinal.py`](../../experiments/model-research/pals/src/rz_pals_model/whole_line_ordinal.py)는
+기존 strict current selector와 D/Repair capability를 재사용하고 새 의존성·공통 revision·
+제품 wire를 바꾸지 않는다. raw endpoint 값 자체는 그대로 두고 동일 L/H/N/Q/TT/wall·
+profile·전체 known history의 두 forced line을 결과 전 `line_conditioned_surrogate`
+criterion으로 비교한다. criterion의 명시 방향과 parity만 root surrogate에 적용하며
+unrestricted endpoint CPU 완료를 whole-line minimax 완료로 표시하지 않는다.
+
+factory는 7개 asset의 실제 bytes와 각 task의 request/receipt/stderr/launch/process
+bytes 및 독립 pin을 요구한다. historical build 재사용은 actual build exit·source 전후
+manifest·binary의 독립 caller 관측 범위로 명시하며 consumer가 다시 컴파일했다고
+표현하지 않는다. before-plan·criterion의 durable-before-spawn과 실제 loaded inode·
+exit·reap·EOF·group 부재·원래 allowance·source/binary 안정성을 known 및 masked
+모두에서 검사한다. 다른 public revision이나 auxiliary 입력을 현재 ordinary label로
+대체하지 않는다. fake callback·metadata-only parent·self-pinned bytes는 authority가 아니다.
+
+terminal·mate band·range·tie/margin·partial·canceled·missing·unknown full history는
+raw 관측과 별도 mask reason으로 남는다. identity·namespace·resource·cleanup 실패는
+ValueError로 거절한다. 반복 이력이 완전해졌어도 FEN 이전 전체 이력 불명을 known으로
+바꾸지 않는다. capability는 role projection이 필요한 조건부 비교이며 ordinary policy·
+C learning label·Repair validity·counterexample validity·WDL·minimax·전술 증명·학습
+target 생성 권한은 false다. C slot 및 Repair 첫 결정으로의 projection/loss는 후속 단계다.
+
+root73의 CPU synthetic contract fixture 23개는 통과했다. source/test pin은 실행 전후
+동일했고 CPU Torch 2.8.0+NumPy 2.2.6·affinity 0/2·high 6GiB/max 12GiB·swap 0·pids
+128을 확인했다. managed copied 환경의 tree cleanup·temporary 제거는 verified다.
+fixture의 Rules/build/launch 사실은 합성이므로 실제 child·양의 native 목표·모델 loss·
+학습·GPU의 성공으로 해석하지 않는다. 이 consumer를 실제 새 before-criterion child와
+연결하는 root74는 아직 미실행이며 root67 사실을 소급 인수하지 않는다.
+원시 로그는 continuation 관리 경로의 `whole-line-model-tests-73.log`,
+`whole-line-model-supervisor-73.log`에 보존한다.
