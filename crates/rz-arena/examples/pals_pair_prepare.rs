@@ -1,6 +1,6 @@
 //! V3 opening/lock/snapshot preparation and an explicit finite execute command.
 //! All arguments naming files/roots are absolute. No automatic retry or cloud use.
-use rz_arena::pals_launch::{LockedPalsArenaLaunchV3, PalsArenaLaunchV3};
+use rz_arena::pals_launch::PalsArenaLaunchV3;
 use std::{
     error::Error,
     fs,

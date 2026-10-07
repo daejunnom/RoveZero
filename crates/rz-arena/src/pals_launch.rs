@@ -29,7 +29,20 @@ pub const PALS_NATIVE_STARTUP_V3_DOMAIN: &str = "rz-pals-native-startup-v3/1";
 pub const PALS_NATIVE_TERMINATION_V3_DOMAIN: &str = "rz-pals-native-termination-v3/1";
 pub const PALS_SEARCH_WORK_STARTUP_V3_DOMAIN: &str = "rz-pals-search-work-startup-v3/1";
 pub const PALS_SEARCH_WORK_TERMINATION_V3_DOMAIN: &str = "rz-pals-search-work-termination-v3/1";
+pub const PALS_CLOCK_REAP_PATCH_SHA256: &str =
+    "23bc4abfa79fcde2b07bebcd70dba2adc112c6152ae3346188f693dc1b5e9ec5";
+pub const PALS_CLOCK_REAP_PATCH_BYTES: u64 = 9907;
+pub const PALS_CLOCK_REAP_RUNNER_SHA256: &str =
+    "29e89312bc4ec16a32ec185d8b53c60b0cdbad17eaac294f987491e36b8d29ff";
+pub const PALS_CLOCK_REAP_RUNNER_BYTES: u64 = 2466608;
 const MAX_JSON_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PalsRunnerStatusPatchV3 {
+    LegacyClockOnly,
+    ClockAndReapStatus,
+}
 
 fn invalid(reason: impl Into<String>) -> ArenaError {
     ArenaError::Integrity(format!("PALS arena V3: {}", reason.into()))
@@ -67,6 +80,17 @@ fn role_index(role: NativeEngineRole) -> usize {
         NativeEngineRole::Candidate => 1,
     }
 }
+/// Resolve the parent user's existing cache before the engine's cleared child
+/// environment. A cache open never supplies NN-ready or placement evidence.
+fn pals_shared_runtime_argument() -> Result<OsString, ArenaError> {
+    let cache = rz_eval::runtime_pin::RuntimeCache::for_user()
+        .map_err(|e| invalid(format!("shared runtime cache preparation:{:?}", e.kind)))?;
+    let path = cache
+        .root()
+        .to_str()
+        .ok_or_else(|| invalid("shared runtime root is not UTF-8"))?;
+    Ok(format!("--pals-runtime-cache-root={path}").into())
+}
 
 /// These are actual accepted CLI limits, separately pinned from declarations.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -97,6 +121,16 @@ pub struct PalsOnnxLaunchV3 {
     pub adapter_source_sha256: String,
     pub search: PalsSearchLaunchV3,
 }
+/// Explicit CUDA execution identity; the session arena is a declaration, never
+/// an observed device peak. Host K/V and physical B1 remain the first recipe.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsOnnxCudaLaunchV3 {
+    pub model: PalsOnnxLaunchV3,
+    pub cuda_bundle: rz_experiments::CudaBundleBindingV1,
+    pub device_id: i32,
+    pub session_arena_bytes: u64,
+}
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(
     tag = "recipe",
@@ -107,6 +141,7 @@ pub struct PalsOnnxLaunchV3 {
 pub enum PalsEndpointLaunchV3 {
     LegalOrderMock(PalsSearchLaunchV3),
     OnnxCpu(PalsOnnxLaunchV3),
+    OnnxCuda(PalsOnnxCudaLaunchV3),
     OwnCpu {
         max_depth: u16,
         max_nodes: u64,
@@ -117,6 +152,22 @@ pub enum PalsEndpointLaunchV3 {
         arguments: Vec<String>,
         environment: Option<EngineEnvironmentV2>,
     },
+}
+impl PalsEndpointLaunchV3 {
+    fn native_model(&self) -> Option<&PalsOnnxLaunchV3> {
+        match self {
+            Self::OnnxCpu(model) => Some(model),
+            Self::OnnxCuda(cuda) => Some(&cuda.model),
+            _ => None,
+        }
+    }
+    fn cuda_model(&self) -> Option<&PalsOnnxCudaLaunchV3> {
+        if let Self::OnnxCuda(cuda) = self {
+            Some(cuda)
+        } else {
+            None
+        }
+    }
 }
 
 /// A distinct arena envelope pins runner, opening, executable recipes and I/O
@@ -158,11 +209,8 @@ impl PalsArenaLaunchV3 {
                 && self.runner.source_commit == crate::FASTCHESS_SOURCE_COMMIT
                 && self.runner.version == crate::FASTCHESS_VERSION
                 && self.runner.dirty
-                && self.runner.dirty_patch.as_ref().is_some_and(|p| {
-                    p.sha256 == rz_experiments::FASTCHESS_CLOCK_PATCH_SHA256
-                        && p.bytes == rz_experiments::FASTCHESS_CLOCK_PATCH_BYTES
-                }),
-            "clock-audited pinned Fastchess and exact declared patch are required",
+                && self.runner_status_patch().is_ok(),
+            "clock-audited pinned Fastchess and an exact registered patch are required",
         )?;
         self.runner.binary.validate()?;
         self.runner
@@ -173,13 +221,32 @@ impl PalsArenaLaunchV3 {
         self.opening_artifact.validate()?;
         let b = self.budget;
         let unique = self.unique_input_bytes()?;
+        let cuda_count = self
+            .endpoints
+            .iter()
+            .filter(|e| e.cuda_model().is_some())
+            .count() as u64;
+        let cpu_native_count = self
+            .endpoints
+            .iter()
+            .filter(|e| matches!(e, PalsEndpointLaunchV3::OnnxCpu(_)))
+            .count() as u64;
+        // Historical PALS CUDA locks with a finite per-role cache reservation
+        // remain readable. New children share the bounded, content-addressed
+        // user runtime cache outside this attempt; no per-run bundle copy is
+        // included in the owned runtime tree.
+        let runtime_ceiling = if cuda_count == 0 {
+            2 * 1024 * 1024 * 1024
+        } else {
+            (4 * cuda_count + cpu_native_count) * 1024 * 1024 * 1024 + 64 * 1024 * 1024
+        };
         require(
             b.max_input_bytes > 0
                 && unique <= b.max_input_bytes
                 && b.max_output_bytes > 0
                 && b.max_output_bytes <= 64 * 1024 * 1024
                 && b.max_runtime_bytes > 0
-                && b.max_runtime_bytes <= 2 * 1024 * 1024 * 1024
+                && b.max_runtime_bytes <= runtime_ceiling
                 && b.max_child_processes >= 3
                 && b.max_child_processes <= 16
                 && b.max_runtime_files >= 16
@@ -207,14 +274,42 @@ impl PalsArenaLaunchV3 {
             self.endpoint(i)?;
             if let PalsEngineV3::Pals(e) = &self.semantic_lock.manifest.engines[i] {
                 require(
-                    e.pools.host_bytes == resources[i].memory_max_bytes
-                        && e.pools.device_bytes == 0
-                        && resources[i].requested_gpu.is_none()
-                        && resources[i].device_allocation_max_bytes == 0,
-                    "closed CPU/mock recipe uses the verified cgroup host ceiling and no GPU allocation",
+                    e.pools.host_bytes == resources[i].memory_max_bytes,
+                    "PALS pool host ceiling differs from verified memory cgroup",
                 )?;
+                if let Some(cuda) = self.endpoints[i].cuda_model() {
+                    let declared_arenas = cuda
+                        .session_arena_bytes
+                        .checked_mul(cuda.model.graphs.len() as u64)
+                        .ok_or_else(|| invalid("CUDA session declaration overflow"))?;
+                    require(
+                        resources[i].requested_gpu.is_some()
+                            && e.pools.device_bytes > 0
+                            && e.pools.device_bytes == resources[i].device_allocation_max_bytes
+                            && declared_arenas < e.pools.device_bytes
+                            && e.pools.device_bytes <= 6 * 1024 * 1024 * 1024,
+                        "CUDA explicit device budget must cover all declared session arenas; observed peak remains unknown",
+                    )?;
+                } else {
+                    require(
+                        e.pools.device_bytes == 0
+                            && resources[i].requested_gpu.is_none()
+                            && resources[i].device_allocation_max_bytes == 0,
+                        "closed CPU/mock recipe must not declare GPU allocation",
+                    )?;
+                }
             }
         }
+        let cuda_bundles: Vec<_> = self
+            .endpoints
+            .iter()
+            .filter_map(PalsEndpointLaunchV3::cuda_model)
+            .map(|c| &c.cuda_bundle)
+            .collect();
+        require(
+            cuda_bundles.windows(2).all(|pair| pair[0] == pair[1]),
+            "first CUDA executor requires one exact shared runtime bundle identity for both roles",
+        )?;
         let mut names = BTreeMap::new();
         let mut destinations = BTreeMap::new();
         for (artifact, target) in self.named_assets() {
@@ -239,6 +334,48 @@ impl PalsArenaLaunchV3 {
             endpoint_views: [self.endpoint(0)?, self.endpoint(1)?],
         })
     }
+    pub fn runner_status_patch(&self) -> Result<PalsRunnerStatusPatchV3, ArenaError> {
+        let patch = self
+            .runner
+            .dirty_patch
+            .as_ref()
+            .ok_or_else(|| invalid("runner patch absent"))?;
+        match (patch.sha256.as_str(), patch.bytes) {
+            (
+                rz_experiments::FASTCHESS_CLOCK_PATCH_SHA256,
+                rz_experiments::FASTCHESS_CLOCK_PATCH_BYTES,
+            ) => Ok(PalsRunnerStatusPatchV3::LegacyClockOnly),
+            (PALS_CLOCK_REAP_PATCH_SHA256, PALS_CLOCK_REAP_PATCH_BYTES) => {
+                Ok(PalsRunnerStatusPatchV3::ClockAndReapStatus)
+            }
+            _ => Err(invalid("runner patch hash/bytes not registered")),
+        }
+    }
+    fn require_reap_status_runner(&self) -> Result<(), ArenaError> {
+        require(
+            self.runner_status_patch()? == PalsRunnerStatusPatchV3::ClockAndReapStatus
+                && self.runner.binary.sha256 == PALS_CLOCK_REAP_RUNNER_SHA256
+                && self.runner.binary.bytes == PALS_CLOCK_REAP_RUNNER_BYTES,
+            "new PALS execution/Core requires the registered clock+reap-status patch and actual runner binary; legacy evidence is preserved without promotion",
+        )
+    }
+    fn require_actual_native_epoch(&self) -> Result<(), ArenaError> {
+        for (engine, recipe) in self
+            .semantic_lock
+            .manifest
+            .engines
+            .iter()
+            .zip(&self.endpoints)
+        {
+            if recipe.native_model().is_some() {
+                require(
+                    matches!(engine, PalsEngineV3::Pals(e) if e.model.frozen_epoch == 1),
+                    "new native PALS execution/Core requires deployment frozen epoch 1; historical epoch 0 locks remain unchanged",
+                )?;
+            }
+        }
+        Ok(())
+    }
     fn opening(&self) -> OpeningSpec {
         OpeningSpec {
             id: "pals-standard-start".into(),
@@ -252,7 +389,7 @@ impl PalsArenaLaunchV3 {
     fn named_assets(&self) -> Vec<(&ArtifactRef, String)> {
         let mut result = Vec::new();
         for recipe in &self.endpoints {
-            if let PalsEndpointLaunchV3::OnnxCpu(n) = recipe {
+            if let Some(n) = recipe.native_model() {
                 let namespace = format!("pals-{}", n.export.sha256);
                 result.push((&n.export, format!("{namespace}/{}", n.export_file)));
                 result.extend(
@@ -295,6 +432,12 @@ impl PalsArenaLaunchV3 {
                 PalsEndpointLaunchV3::OnnxCpu(n) => {
                     result.extend([&n.export, &n.runtime]);
                     result.extend(n.graphs.iter().map(|g| &g.artifact));
+                }
+                PalsEndpointLaunchV3::OnnxCuda(cuda) => {
+                    let n = &cuda.model;
+                    result.extend([&n.export, &n.runtime, &cuda.cuda_bundle.manifest]);
+                    result.extend(n.graphs.iter().map(|g| &g.artifact));
+                    result.extend(cuda.cuda_bundle.files.iter().map(|f| &f.artifact));
                 }
                 PalsEndpointLaunchV3::ReferenceUci {
                     environment: Some(e),
@@ -365,13 +508,23 @@ impl PalsArenaLaunchV3 {
                     None,
                 )
             }
-            (PalsEngineV3::Pals(e), PalsEndpointLaunchV3::OnnxCpu(n)) => {
+            (
+                PalsEngineV3::Pals(e),
+                recipe @ (PalsEndpointLaunchV3::OnnxCpu(_) | PalsEndpointLaunchV3::OnnxCuda(_)),
+            ) => {
+                let n = recipe.native_model().expect("native pattern selected");
+                let cuda = recipe.cuda_model();
                 require(
-                    e.model.backend == PalsModelBackendV3::OrtCpu
+                    e.model.backend
+                        == if cuda.is_some() {
+                            PalsModelBackendV3::OrtCuda
+                        } else {
+                            PalsModelBackendV3::OrtCpu
+                        }
                         && e.model.precision == PalsPrecisionV3::Fp32
                         && e.model.max_batch_width == 1
-                        && e.model.frozen_epoch == 0,
-                    "first native recipe supports frozen epoch 0, CPU FP32 B1 only",
+                        && matches!(e.model.frozen_epoch, 0 | 1),
+                    "native metadata requires explicit provider, historical/deployment frozen epoch 0/1 and FP32 B1",
                 )?;
                 require(
                     e.model.architecture == "pals-width384-latent16-iterations2"
@@ -423,7 +576,10 @@ impl PalsArenaLaunchV3 {
                 validate_pals_search(e, &n.search, m.pilot.wall_time_max_ms)?;
                 let mut args = pals_search_arguments(&n.search, "onnx");
                 args.extend([
-                    "--pals-provider=cpu".into(),
+                    format!(
+                        "--pals-provider={}",
+                        if cuda.is_some() { "cuda" } else { "cpu" }
+                    ),
                     "--pals-export-manifest={{asset:0}}".into(),
                     format!("--pals-export-sha256={}", n.export.sha256),
                     "--pals-runtime-path={{asset:1}}".into(),
@@ -431,11 +587,52 @@ impl PalsArenaLaunchV3 {
                 ]);
                 let mut assets = vec![n.export.clone(), n.runtime.clone()];
                 assets.extend(n.graphs.iter().map(|g| g.artifact.clone()));
+                if let Some(cuda) = cuda {
+                    cuda.cuda_bundle.validate()?;
+                    require(
+                        cuda.device_id == 0
+                            && cuda.session_arena_bytes == 2 * 1024 * 1024 * 1024
+                            && roles == BTreeSet::from(["public", "shared_pc"]),
+                        "first 6GiB CUDA recipe requires explicit device 0, per-session 2GiB and two shared-P/C graphs with room for tensor reservations",
+                    )?;
+                    require(
+                        cuda.cuda_bundle.file(
+                            rz_experiments::CudaBundleFileRoleV1::Core,
+                            "libonnxruntime.so.1.22.0",
+                        )? == &n.runtime,
+                        "CUDA bundle core identity differs from declared runtime",
+                    )?;
+                    let index = assets.len();
+                    assets.push(cuda.cuda_bundle.manifest.clone());
+                    assets.extend(
+                        cuda.cuda_bundle
+                            .files
+                            .iter()
+                            .filter(|f| f.artifact != n.runtime)
+                            .map(|f| f.artifact.clone()),
+                    );
+                    args.extend([
+                        format!("--pals-cuda-bundle={{{{asset:{index}}}}}"),
+                        format!(
+                            "--pals-cuda-bundle-sha256={}",
+                            cuda.cuda_bundle.manifest.sha256
+                        ),
+                        format!("--pals-cuda-device={}", cuda.device_id),
+                        format!(
+                            "--pals-cuda-session-arena-bytes={}",
+                            cuda.session_arena_bytes
+                        ),
+                        "--pals-device-public-memory=false".into(),
+                    ]);
+                }
                 (
                     &e.binary,
                     "rovezero-pals",
                     "pals/0.1",
-                    "RoveZero PALS P/C ONNX CPU + own CPU_R".to_string(),
+                    format!(
+                        "RoveZero PALS P/C ONNX {} + own CPU_R",
+                        if cuda.is_some() { "CUDA" } else { "CPU" }
+                    ),
                     Some(ExternalSourceV2 {
                         url: e.binary.source.clone(),
                         commit: e.source_commit.clone(),
@@ -671,10 +868,9 @@ impl LockedPalsArenaLaunchV3 {
         Ok(lock)
     }
     fn native(&self, role: NativeEngineRole) -> Result<&PalsOnnxLaunchV3, ArenaError> {
-        match &self.input.endpoints[role_index(role)] {
-            PalsEndpointLaunchV3::OnnxCpu(n) => Ok(n),
-            _ => Err(invalid("endpoint has no native P/C session")),
-        }
+        self.input.endpoints[role_index(role)]
+            .native_model()
+            .ok_or_else(|| invalid("endpoint has no native P/C session"))
     }
     fn validate_export(&self, role: NativeEngineRole, bytes: &[u8]) -> Result<(), ArenaError> {
         require(bytes.len() <= 128 * 1024, "P/C export JSON exceeds bound")?;
@@ -729,6 +925,31 @@ impl LockedPalsArenaLaunchV3 {
         }
         Ok(())
     }
+    fn validate_cuda_bundle(&self, role: NativeEngineRole, bytes: &[u8]) -> Result<(), ArenaError> {
+        let cuda = self.input.endpoints[role_index(role)]
+            .cuda_model()
+            .ok_or_else(|| invalid("endpoint has no CUDA bundle"))?;
+        require(
+            bytes.len() <= 64 * 1024 && digest(bytes) == cuda.cuda_bundle.manifest.sha256,
+            "CUDA descriptor byte/hash differs",
+        )?;
+        let parsed = rz_eval::runtime_pin::CudaRuntimeBundleSpec::from_json(
+            std::str::from_utf8(bytes).map_err(|_| invalid("CUDA descriptor not UTF-8"))?,
+        )
+        .map_err(|e| invalid(format!("CUDA descriptor rejected: {:?}", e.kind)))?;
+        let actual = parsed
+            .digest()
+            .map_err(|e| invalid(format!("CUDA descriptor digest rejected: {:?}", e.kind)))?;
+        require(
+            actual
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+                == cuda.cuda_bundle.canonical_sha256,
+            "CUDA descriptor canonical digest differs from pinned nineteen-file identity",
+        )?;
+        Ok(())
+    }
 }
 impl crate::native_launch::sealed::Sealed for LockedPalsArenaLaunchV3 {}
 impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
@@ -777,7 +998,9 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
         Ok(NativeEngineView {
             engine_id: &e.id,
             artifacts: &[],
-            cuda_bundle: None,
+            cuda_bundle: self.input.endpoints[role_index(role)]
+                .cuda_model()
+                .map(|cuda| &cuda.cuda_bundle),
             search: None,
             batch_experiment: None,
             external: Some(e),
@@ -792,10 +1015,19 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
             *scope="PALS V3 whole-system or explicitly controlled paired pilot; P/C native sessions and CPU/reference UCI processes are distinct; no Elo, training or model promotion".into();
         }
         if let Some(cache) = limitations.get_mut(8) {
-            *cache="PALS native runtime copies use the explicit per-attempt runtime-cache root inside the owned watched tree; bounded cache capacity and this attempt's output budget both apply; cache reuse is not NN inference evidence".into();
+            *cache="PALS native runtime uses the existing bounded content-addressed shared user cache outside the attempt; hits rehash and retain read-only native file pins through physical completion. Private input snapshots and per-attempt evidence remain owned and bounded separately; cache reuse is not NN inference evidence".into();
         }
         limitations.push("CPU TT byte admission covers the compiled inline slot layout; retained identity heaps, allocator overhead and total peak are separately bounded by the verified inherited memory cgroup".into());
         limitations.push("CPU_T profile is preserved as declared identity only; this pilot executes CPU_R and P/C, with V absent and training_executed=false".into());
+        limitations.push(format!("PALS runner status patch: {:?}; legacy clock-only records remain readable, while new execution/Core requires the separately registered clock+reap-status runner", self.input.runner_status_patch()));
+        if self
+            .input
+            .endpoints
+            .iter()
+            .any(|e| e.cuda_model().is_some())
+        {
+            limitations.push("PALS CUDA recipe fixes FP32/TF32 off, physical B1, host K/V, device 0 and per-session 2GiB arena declaration; CPU fallback/I/O binding/CUDA Graph are disabled; arena declarations and summed model device budget do not attest observed VRAM peak".into());
+        }
     }
     fn seed(&self) -> u64 {
         self.input.semantic_lock.manifest.pilot.seed
@@ -832,7 +1064,7 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
         )?;
         if !matches!(
             &self.input.endpoints[role_index(role)],
-            PalsEndpointLaunchV3::OnnxCpu(_)
+            PalsEndpointLaunchV3::OnnxCpu(_) | PalsEndpointLaunchV3::OnnxCuda(_)
         ) {
             return Ok(vec![
                 format!("--search-work-output-root={root}").into(),
@@ -852,7 +1084,7 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
                 self.endpoint_views[role_index(role)].id
             )
             .into(),
-            format!("--pals-runtime-cache-root={root}/runtime-cache").into(),
+            pals_shared_runtime_argument()?,
         ])
     }
     fn preflight_arguments(
@@ -862,7 +1094,7 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
     ) -> Result<Vec<OsString>, ArenaError> {
         if !matches!(
             &self.input.endpoints[role_index(role)],
-            PalsEndpointLaunchV3::OnnxCpu(_)
+            PalsEndpointLaunchV3::OnnxCpu(_) | PalsEndpointLaunchV3::OnnxCuda(_)
         ) {
             return Ok(vec![]);
         }
@@ -870,12 +1102,7 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV3 {
             runtime_root.is_absolute(),
             "preflight cache root must be absolute",
         )?;
-        let root = runtime_root
-            .to_str()
-            .ok_or_else(|| invalid("preflight cache root is not UTF-8"))?;
-        Ok(vec![
-            format!("--pals-runtime-cache-root={root}/runtime-cache").into(),
-        ])
+        Ok(vec![pals_shared_runtime_argument()?])
     }
 }
 
@@ -893,6 +1120,11 @@ pub struct PalsNativeSessionAuditV3 {
     pub completed_new_game_resets: u64,
     pub physical_shutdown_confirmed: bool,
     pub native_buffers_released: bool,
+    pub startup_nn_inputs_completed: u64,
+    pub startup_nn_calls_completed: u64,
+    pub startup_role_inputs_completed: u64,
+    pub startup_probe: Option<serde_json::Value>,
+    pub execution: Option<serde_json::Value>,
     pub raw_native: serde_json::Value,
     pub raw_search_work: serde_json::Value,
 }
@@ -912,6 +1144,8 @@ impl NativeProviderDeclaration for LockedPalsArenaLaunchV3 {
     }
     #[cfg(target_os = "linux")]
     fn validate_runtime_admission(&self) -> Result<(), ArenaError> {
+        self.input.require_reap_status_runner()?;
+        self.input.require_actual_native_epoch()?;
         verify_pals_inherited_resources(self).map(|_| ())
     }
     fn expected_provider_sessions(&self) -> usize {
@@ -919,13 +1153,13 @@ impl NativeProviderDeclaration for LockedPalsArenaLaunchV3 {
             .input
             .endpoints
             .iter()
-            .filter(|e| matches!(e, PalsEndpointLaunchV3::OnnxCpu(_)))
+            .filter(|e| e.native_model().is_some())
             .count()
     }
     fn uses_provider_records(&self, role: NativeEngineRole) -> Result<bool, ArenaError> {
         Ok(matches!(
             &self.input.endpoints[role_index(role)],
-            PalsEndpointLaunchV3::OnnxCpu(_)
+            PalsEndpointLaunchV3::OnnxCpu(_) | PalsEndpointLaunchV3::OnnxCuda(_)
         ))
     }
     #[cfg(target_os = "linux")]
@@ -1034,7 +1268,7 @@ impl NativeProviderDeclaration for LockedPalsArenaLaunchV3 {
     ) -> Result<(), ArenaError> {
         require(
             !batch,
-            "PALS CPU B1 recipe does not authorize experimental batch",
+            "PALS native B1 recipe does not authorize experimental batch",
         )?;
         self.validate_export(role, manifest)?;
         let s = json(startup)?;
@@ -1065,6 +1299,28 @@ fn count(v: &serde_json::Value, k: &str) -> Result<u64, ArenaError> {
     v[k].as_u64()
         .ok_or_else(|| invalid(format!("missing native counter {k}")))
 }
+/// All graph executions, including public memory, have explicit completion and
+/// validation counters. The caller keeps startup and search snapshots distinct.
+fn graph_stats(v: &serde_json::Value) -> Result<(u64, u64, u64), ArenaError> {
+    let public = count(v, "public_nn_runs_completed")?;
+    let role = count(v, "role_nn_runs_completed")?;
+    let inputs = count(v, "completed_nn_inputs")?;
+    let calls = public
+        .checked_add(role)
+        .ok_or_else(|| invalid("NN graph counters overflow"))?;
+    require(
+        inputs == calls
+            && count(v, "public_nn_runs_failed_known")? == 0
+            && count(v, "role_nn_runs_failed_known")? == 0
+            && public <= count(v, "public_nn_runs_attempted")?
+            && role <= count(v, "role_nn_runs_attempted")?
+            && count(v, "validated_public_outputs")? <= public
+            && count(v, "validated_role_outputs")? <= role
+            && count(v, "live_public_cache_entries")? <= 1,
+        "native graph completion/failure/validation counters inconsistent",
+    )?;
+    Ok((inputs, calls, role))
+}
 /// Pure wire validation. No self-reported field replaces process exit or PGN.
 pub fn validate_pals_native_records(
     lock: &LockedPalsArenaLaunchV3,
@@ -1080,6 +1336,7 @@ pub fn validate_pals_native_records(
     let s = json(startup)?;
     let t = json(termination)?;
     let native = lock.native(role)?;
+    let cuda = lock.input.endpoints[role_index(role)].cuda_model();
     let engine = &lock.endpoint_views[role_index(role)];
     require(
         s["schema_version"] == 3
@@ -1094,6 +1351,7 @@ pub fn validate_pals_native_records(
         "process_id",
         "binary_sha256",
         "runtime_sha256",
+        "runtime_bundle_sha256",
         "provider",
         "precision",
     ] {
@@ -1107,7 +1365,7 @@ pub fn validate_pals_native_records(
             && s["launch_sha256"] == lock.sha256
             && s["binary_sha256"] == engine.binary.sha256
             && s["runtime_sha256"] == native.runtime.sha256
-            && s["provider"] == "cpu"
+            && s["provider"] == if cuda.is_some() { "cuda" } else { "cpu" }
             && s["precision"] == "fp32"
             && s["service_exit_success"] == false
             && t["service_exit_success"] == true,
@@ -1120,6 +1378,87 @@ pub fn validate_pals_native_records(
     )?;
     let sn = &s["native"];
     let tn = &t["native"];
+    let mut startup_nn = (0, 0, 0);
+    if let Some(cuda) = cuda {
+        require(
+            s["runtime_bundle_sha256"] == cuda.cuda_bundle.canonical_sha256,
+            "CUDA envelope canonical runtime bundle differs",
+        )?;
+        require(
+            sn["execution"] == tn["execution"] && sn["startup_probe"] == tn["startup_probe"],
+            "CUDA execution/probe identity changed",
+        )?;
+        let execution = &sn["execution"];
+        require(
+            execution["provider"] == "cuda"
+                && execution["device_id"] == cuda.device_id
+                && execution["session_arena_bytes"] == cuda.session_arena_bytes
+                && execution["device_public_memory"] == false
+                && array_hash(&execution["runtime_sha256"])? == native.runtime.sha256
+                && array_hash(&execution["runtime_bundle_sha256"])?
+                    == cuda.cuda_bundle.canonical_sha256,
+            "CUDA provider/device/session/runtime bundle identity differs",
+        )?;
+        let transient = count(execution, "transient_request_device_bytes")?
+            .checked_add(count(execution, "transient_execution_device_bytes")?)
+            .ok_or_else(|| invalid("CUDA transient reservation overflow"))?;
+        let arenas = cuda
+            .session_arena_bytes
+            .checked_mul(native.graphs.len() as u64)
+            .ok_or_else(|| invalid("CUDA session reservation overflow"))?;
+        require(
+            transient > 0
+                && arenas.checked_add(transient).is_some_and(|n| {
+                    n <= lock.input.semantic_lock.manifest.resources[role_index(role)]
+                        .device_allocation_max_bytes
+                })
+                && count(execution, "pinned_request_bytes")? == 0,
+            "CUDA declared budget does not cover actual tensor reservations plus session declarations",
+        )?;
+        let probe = &sn["startup_probe"];
+        require(
+            count(probe, "completed_proposer_calls")? == 1
+                && count(probe, "completed_critic_calls")? == 1
+                && probe["runtime_mapping_confirmed"] == true
+                && probe["reset_completed"] == true,
+            "CUDA startup requires actual P/C callbacks, full runtime audit and reset",
+        )?;
+        startup_nn = graph_stats(&probe["backend_stats"])?;
+        require(
+            startup_nn.0 > 0
+                && startup_nn.2 == 2
+                && count(&probe["backend_stats"], "new_game_resets")? >= 1
+                && tn["final_runtime_mapping_confirmed"] == true,
+            "CUDA startup NN work/reset unavailable or inconsistent",
+        )?;
+    } else {
+        require(
+            sn["startup_probe"].is_null()
+                && tn["startup_probe"].is_null()
+                && s["runtime_bundle_sha256"].is_null(),
+            "CPU recipe cannot claim CUDA initialization work",
+        )?;
+        require(
+            (sn["execution"].is_null() && tn["execution"].is_null())
+                || (sn["execution"].is_object() && tn["execution"].is_object()),
+            "CPU execution identity is malformed or present in only one record",
+        )?;
+        if sn["execution"].is_object() {
+            require(
+                sn["execution"] == tn["execution"]
+                    && sn["execution"]["provider"] == "cpu"
+                    && sn["execution"]["device_id"].is_null()
+                    && sn["execution"]["session_arena_bytes"].is_null()
+                    && sn["execution"]["runtime_bundle_sha256"].is_null()
+                    && count(&sn["execution"], "transient_request_device_bytes")? == 0
+                    && count(&sn["execution"], "transient_execution_device_bytes")? == 0
+                    && count(&sn["execution"], "pinned_request_bytes")? == 0
+                    && sn["execution"]["device_public_memory"] == false
+                    && array_hash(&sn["execution"]["runtime_sha256"])? == native.runtime.sha256,
+                "CPU native execution metadata differs",
+            )?;
+        }
+    }
     let PalsEngineV3::Pals(e) = &lock.input.semantic_lock.manifest.engines[role_index(role)] else {
         return Err(invalid("missing native model identity"));
     };
@@ -1136,6 +1475,7 @@ pub fn validate_pals_native_records(
         "trained",
         "residency",
         "process_epoch",
+        "frozen_epoch",
     ] {
         require(
             sn[field] == tn[field],
@@ -1150,6 +1490,11 @@ pub fn validate_pals_native_records(
             && sn["trained"] == trained
             && count(sn, "process_epoch")? == 1,
         "native model/adapter/epoch identity differs",
+    )?;
+    require(
+        (e.model.frozen_epoch == 0 && sn["frozen_epoch"].is_null() && tn["frozen_epoch"].is_null())
+            || sn["frozen_epoch"].as_u64() == Some(e.model.frozen_epoch),
+        "native frozen deployment epoch differs from immutable semantic lock",
     )?;
     for field in [
         "physically_completed_role_calls",
@@ -1185,6 +1530,14 @@ pub fn validate_pals_native_records(
     let failed = count(tn, "failed_physical_role_calls")?;
     let delivered = count(tn, "delivered_role_inputs")?;
     let consumed = count(tn, "search_consumed_role_inputs")?;
+    // Historical CPU producer records may omit this additive observation;
+    // preserve their wire reader. New Core assembly requires the actual count.
+    if !tn["observer_failures"].is_null() {
+        require(
+            count(tn, "observer_failures")? == 0 && tn["last_observer_failure"].is_null(),
+            "native observer failed; physical counters are preserved without Core acceptance",
+        )?;
+    }
     require(
         physical
             == completed
@@ -1254,6 +1607,13 @@ pub fn validate_pals_native_records(
             completed_new_game_resets: count(tn, "completed_new_game_resets")?,
             physical_shutdown_confirmed: true,
             native_buffers_released: true,
+            startup_nn_inputs_completed: startup_nn.0,
+            startup_nn_calls_completed: startup_nn.1,
+            startup_role_inputs_completed: startup_nn.2,
+            startup_probe: sn["startup_probe"]
+                .as_object()
+                .map(|_| sn["startup_probe"].clone()),
+            execution: sn["execution"].as_object().map(|_| sn["execution"].clone()),
             raw_native: tn.clone(),
             raw_search_work: t["search_work"].clone(),
         },
@@ -1440,10 +1800,10 @@ pub fn validate_pals_search_work_records(
     let engine = &lock.endpoint_views[role_index(role)];
     let native = matches!(
         &lock.input.endpoints[role_index(role)],
-        PalsEndpointLaunchV3::OnnxCpu(_)
+        PalsEndpointLaunchV3::OnnxCpu(_) | PalsEndpointLaunchV3::OnnxCuda(_)
     );
     let (sdomain, tdomain, kind) = match &lock.input.endpoints[role_index(role)] {
-        PalsEndpointLaunchV3::OnnxCpu(_) => (
+        PalsEndpointLaunchV3::OnnxCpu(_) | PalsEndpointLaunchV3::OnnxCuda(_) => (
             PALS_NATIVE_STARTUP_V3_DOMAIN,
             PALS_NATIVE_TERMINATION_V3_DOMAIN,
             "pals",
@@ -1561,7 +1921,7 @@ pub fn collect_pals_process_work(
         .map_err(|e| ArenaError::Io(e.to_string()))?;
     let native = matches!(
         &lock.input.endpoints[role_index(role)],
-        PalsEndpointLaunchV3::OnnxCpu(_)
+        PalsEndpointLaunchV3::OnnxCpu(_) | PalsEndpointLaunchV3::OnnxCuda(_)
     );
     let (start_name, end_name) = if native {
         (
@@ -1724,17 +2084,30 @@ fn endpoint_work_receipt(
                     "native/work process or physical release differs",
                 )?;
                 require(
+                    p.model.frozen_epoch == 1 && count(&n.raw_native, "frozen_epoch")? == 1,
+                    "new Core requires actual deployment frozen epoch 1",
+                )?;
+                require(
                     n.raw_native["backend_stats_observation"] == "exclusive_worker_before_shutdown",
                     "native graph work observation missing",
                 )?;
+                require(
+                    count(&n.raw_native, "observer_failures")? == 0
+                        && n.raw_native["last_observer_failure"].is_null(),
+                    "Core requires actual successful observer completion",
+                )?;
                 let stats = &n.raw_native["backend_stats"];
-                receipt.nn_inputs_completed = work_count(stats, "completed_nn_inputs")?;
-                receipt.nn_calls_completed = work_count(stats, "public_nn_runs_completed")?
-                    .checked_add(work_count(stats, "role_nn_runs_completed")?)
-                    .ok_or_else(|| invalid("NN physical graph call overflow"))?;
+                let (all_inputs, all_calls, all_roles) = graph_stats(stats)?;
+                receipt.nn_inputs_completed = all_inputs
+                    .checked_sub(n.startup_nn_inputs_completed)
+                    .ok_or_else(|| invalid("NN cumulative inputs below startup snapshot"))?;
+                receipt.nn_calls_completed = all_calls
+                    .checked_sub(n.startup_nn_calls_completed)
+                    .ok_or_else(|| invalid("NN cumulative calls below startup snapshot"))?;
                 require(
                     receipt.nn_inputs_completed == receipt.nn_calls_completed
-                        && work_count(stats, "role_nn_runs_completed")? == n.completed_role_inputs,
+                        && all_roles.checked_sub(n.startup_role_inputs_completed)
+                            == Some(n.completed_role_inputs),
                     "physical B1 graph inputs/completion or role completion differs",
                 )?;
                 receipt.nn_inputs_consumed = n.search_consumed_role_inputs;
@@ -1747,6 +2120,9 @@ fn endpoint_work_receipt(
                     "native role completion/search consumption differs from observed search work",
                 )?;
                 receipt.physical_state = PalsPhysicalStateV3::Completed;
+                // Provider/device declarations and a mapped-runtime audit do
+                // not observe graph node placement. Preserve Unknown until a
+                // separate actual major-NN CUDA placement witness is supplied.
             }
         }
     }
@@ -1954,6 +2330,8 @@ pub fn assemble_pals_core_receipt(
         game_process_correspondence: "pinned Fastchess 1.8.2 source: one synchronous worker, restart=on, recover=false; TRACE/renderer game id and color plus finished-white-exit-black-exit windows; separate native/owned-group completion gates required".into(),
         work: vec![], core: None, assembly_error: None, training_executed: false };
     let result: Result<PalsRunReceiptV3, ArenaError> = (|| {
+        lock.input.require_reap_status_runner()?;
+        lock.input.require_actual_native_epoch()?;
         for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
             assembly.work.extend(collect_pals_process_work(
                 lock,
@@ -2207,6 +2585,16 @@ pub fn verify_pals_launch_exports(
             file.read_to_end(&mut bytes)
                 .map_err(|e| ArenaError::Io(e.to_string()))?;
             spec.validate_export(role, &bytes)?;
+        }
+        if let Some(cuda) = spec.input.endpoints[role_index(role)].cuda_model() {
+            let mut file = cuda
+                .cuda_bundle
+                .manifest
+                .open_verified(source_root, 64 * 1024)?;
+            let mut bytes = Vec::with_capacity(cuda.cuda_bundle.manifest.bytes as usize);
+            file.read_to_end(&mut bytes)
+                .map_err(|e| ArenaError::Io(e.to_string()))?;
+            spec.validate_cuda_bundle(role, &bytes)?;
         }
     }
     Ok(())
@@ -2466,6 +2854,7 @@ mod tests {
         };
         e.model.architecture = "pals-width384-latent16-iterations2".into();
         e.model.backend = PalsModelBackendV3::OrtCpu;
+        e.model.frozen_epoch = 1;
         e.model.weights = PalsWeightIdentityV3::Untrained {
             artifact: asset("model/checkpoint.pt"),
             initialization_seed: 1,
@@ -2493,6 +2882,117 @@ mod tests {
             },
         });
         f
+    }
+    fn cuda_fixture() -> (PalsArenaLaunchV3, Vec<u8>) {
+        let mut f = native_fixture();
+        let PalsEndpointLaunchV3::OnnxCpu(mut model) = f.endpoints[0].clone() else {
+            unreachable!()
+        };
+        model.graphs.retain(|g| g.role == "public");
+        model.graphs.push(PalsGraphAssetV3 {
+            file: "shared_pc_if.onnx".into(),
+            role: "shared_pc".into(),
+            artifact: asset("model/shared_pc_if.onnx"),
+        });
+        model.runtime = asset("runtime/libonnxruntime.so.1.22.0");
+        let files: Vec<_> = CUDA_BUNDLE_FILENAMES
+            .iter()
+            .map(|(filename, role)| CudaBundleFileBindingV1 {
+                filename: (*filename).into(),
+                role: *role,
+                artifact: asset(&format!("runtime/{filename}")),
+            })
+            .collect();
+        let descriptor = serde_json::to_vec(&serde_json::json!({"schema_version":1,
+            "files":files.iter().map(|f|serde_json::json!({"role":f.role,"filename":f.filename,
+                "bytes":f.artifact.bytes,"sha256":f.artifact.sha256})).collect::<Vec<_>>()}))
+        .unwrap();
+        let mut bundle = CudaBundleBindingV1 {
+            manifest: asset("runtime/bundle.json"),
+            canonical_sha256: "0".repeat(64),
+            files,
+        };
+        bundle.manifest.sha256 = digest(&descriptor);
+        bundle.manifest.bytes = descriptor.len() as u64;
+        bundle.canonical_sha256 = bundle.canonical_digest().unwrap();
+        let PalsEngineV3::Pals(e) = &mut f.semantic_lock.manifest.engines[0] else {
+            unreachable!()
+        };
+        e.model.backend = PalsModelBackendV3::OrtCuda;
+        e.pools.device_bytes = 6 << 30;
+        f.semantic_lock.manifest.resources[0].requested_gpu = Some("RTX 4050 6GB".into());
+        f.semantic_lock.manifest.resources[0].device_allocation_max_bytes = 6 << 30;
+        f.semantic_lock = f.semantic_lock.manifest.lock().unwrap();
+        f.endpoints[0] = PalsEndpointLaunchV3::OnnxCuda(PalsOnnxCudaLaunchV3 {
+            model,
+            cuda_bundle: bundle,
+            device_id: 0,
+            session_arena_bytes: 2 << 30,
+        });
+        f.budget.max_runtime_bytes = 4 << 30;
+        f.budget.max_artifact_bytes = 8 << 30;
+        (f, descriptor)
+    }
+    fn stats_fixture(public: u64, role: u64) -> serde_json::Value {
+        serde_json::json!({"public_nn_runs_completed":public,"role_nn_runs_completed":role,
+            "completed_nn_inputs":public+role,"public_nn_runs_attempted":public,"role_nn_runs_attempted":role,
+            "public_nn_runs_failed_known":0,"role_nn_runs_failed_known":0,"validated_public_outputs":public,
+            "validated_role_outputs":role,"live_public_cache_entries":0,"new_game_resets":1})
+    }
+    fn hash_array(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+    fn cuda_records_fixture(
+        lock: &LockedPalsArenaLaunchV3,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let cuda = lock.input.endpoints[0].cuda_model().unwrap();
+        let model = &cuda.model;
+        let native = serde_json::json!({"physically_completed_role_calls":0,"completed_role_inputs":0,
+            "failed_physical_role_calls":0,"invalid_role_outputs":0,"delivered_role_inputs":0,"search_consumed_role_inputs":0,
+            "canceled_requests":0,"expired_requests":0,"completed_new_game_resets":0,"process_epoch":1,"game_generation":0,
+            "request_high_water":0,"execution_high_water":0,"physical_runs_in_flight":0,"quarantined":false,
+            "physical_shutdown_confirmed":false,"native_buffers_released":false,"last_failure":null,
+            "model_epoch":hash_array(&"a".repeat(64)),"export_manifest_sha256":hash_array(&model.export.sha256),
+            "encoding_semantic_sha256":hash_array(&model.encoding_semantic_sha256),"adapter_source_sha256":hash_array(&model.adapter_source_sha256),
+            "trained":false,"frozen_epoch":1,"residency":{"native_sessions":model.graphs.len(),"layout":"shared_pc_if",
+                "role_reader_weights_shared":null,"native_resident_parameter_bytes":null,"vram_peak_bytes":null,
+                "graphs":model.graphs.iter().map(|g|serde_json::json!({"role":g.role,"sha256":hash_array(&g.artifact.sha256),
+                    "serialized_bytes":g.artifact.bytes})).collect::<Vec<_>>()},
+            "execution":{"provider":"cuda","device_id":0,"session_arena_bytes":2u64<<30,
+                "runtime_sha256":hash_array(&model.runtime.sha256),"runtime_bundle_sha256":hash_array(&cuda.cuda_bundle.canonical_sha256),
+                "transient_request_device_bytes":8192,"transient_execution_device_bytes":8192,"pinned_request_bytes":0,"device_public_memory":false},
+            "startup_probe":{"completed_proposer_calls":1,"completed_critic_calls":1,"runtime_mapping_confirmed":true,
+                "reset_completed":true,"backend_stats":stats_fixture(1,2)}});
+        let start = serde_json::json!({"schema_version":3,"domain":PALS_NATIVE_STARTUP_V3_DOMAIN,
+            "endpoint_id":"pals","launch_sha256":lock.sha256(),"process_id":100,"binary_sha256":"a".repeat(64),
+            "runtime_sha256":model.runtime.sha256,"runtime_bundle_sha256":cuda.cuda_bundle.canonical_sha256,
+            "provider":"cuda","precision":"fp32","service_exit_success":false,"native":native});
+        let mut end = start.clone();
+        end["domain"] = PALS_NATIVE_TERMINATION_V3_DOMAIN.into();
+        end["service_exit_success"] = true.into();
+        for (key, value) in [
+            ("physically_completed_role_calls", 3u64),
+            ("completed_role_inputs", 3),
+            ("delivered_role_inputs", 2),
+            ("search_consumed_role_inputs", 1),
+            ("completed_new_game_resets", 1),
+            ("game_generation", 1),
+            ("request_high_water", 5),
+            ("execution_high_water", 3),
+        ] {
+            end["native"][key] = value.into();
+        }
+        end["native"]["physical_shutdown_confirmed"] = true.into();
+        end["native"]["native_buffers_released"] = true.into();
+        end["native"]["final_runtime_mapping_confirmed"] = true.into();
+        end["native"]["observer_failures"] = 0.into();
+        end["native"]["last_observer_failure"] = serde_json::Value::Null;
+        end["native"]["backend_stats_observation"] = "exclusive_worker_before_shutdown".into();
+        end["native"]["backend_stats"] = stats_fixture(2, 5);
+        (start, end)
     }
     #[test]
     fn pals_v3_launch_lock_has_own_identity_and_actual_endpoint_cli() {
@@ -2545,6 +3045,42 @@ mod tests {
         assert!(LockedPalsArenaLaunchV3::from_json(&value.to_string()).is_err());
     }
     #[test]
+    fn pals_runner_registers_new_patch_and_binary_without_rewriting_legacy_locks() {
+        let legacy = fixture();
+        let old = legacy.lock().unwrap();
+        assert_eq!(
+            legacy.runner_status_patch().unwrap(),
+            PalsRunnerStatusPatchV3::LegacyClockOnly
+        );
+        assert!(legacy.require_reap_status_runner().is_err());
+        let mut current = legacy.clone();
+        let patch = current.runner.dirty_patch.as_mut().unwrap();
+        patch.sha256 = PALS_CLOCK_REAP_PATCH_SHA256.into();
+        patch.bytes = PALS_CLOCK_REAP_PATCH_BYTES;
+        current.runner.binary.sha256 = PALS_CLOCK_REAP_RUNNER_SHA256.into();
+        current.runner.binary.bytes = PALS_CLOCK_REAP_RUNNER_BYTES;
+        let new = current.lock().unwrap();
+        assert!(current.require_reap_status_runner().is_ok());
+        assert_ne!(old.sha256(), new.sha256());
+        assert_eq!(
+            LockedPalsArenaLaunchV3::from_json(&old.to_json().unwrap())
+                .unwrap()
+                .sha256(),
+            old.sha256()
+        );
+        assert_eq!(
+            current.semantic_lock.canonical_sha256,
+            legacy.semantic_lock.canonical_sha256
+        );
+        let mut invalid_patch = current.clone();
+        invalid_patch.runner.dirty_patch.as_mut().unwrap().bytes -= 1;
+        assert!(invalid_patch.lock().is_err());
+        let mut unregistered_binary = current;
+        unregistered_binary.runner.binary.sha256 = "f".repeat(64);
+        assert!(unregistered_binary.lock().is_ok()); // metadata-only declaration remains explicit.
+        assert!(unregistered_binary.require_reap_status_runner().is_err());
+    }
+    #[test]
     fn pals_native_recipe_assets_and_dynamic_arguments_do_not_leak_lc0_flags() {
         let lock = native_fixture().lock().unwrap();
         assert_eq!(lock.expected_provider_sessions(), 2);
@@ -2568,12 +3104,195 @@ mod tests {
         let preflight = lock
             .preflight_arguments(NativeEngineRole::Baseline, Path::new("/outside/runtime"))
             .unwrap();
-        assert_eq!(
-            preflight,
-            vec![OsString::from(
-                "--pals-runtime-cache-root=/outside/runtime/runtime-cache"
-            )]
+        assert_eq!(preflight, vec![pals_shared_runtime_argument().unwrap()]);
+        let other_runtime = lock
+            .runtime_arguments(
+                NativeEngineRole::Baseline,
+                Path::new("/outside/second-attempt"),
+            )
+            .unwrap();
+        let other_preflight = lock
+            .preflight_arguments(
+                NativeEngineRole::Baseline,
+                Path::new("/outside/second-attempt"),
+            )
+            .unwrap();
+        assert_eq!(arguments.last(), other_runtime.last());
+        assert_eq!(preflight, other_preflight);
+        let cache_argument = arguments.last().unwrap().to_str().unwrap();
+        assert!(cache_argument.starts_with("--pals-runtime-cache-root="));
+        assert!(
+            !cache_argument.contains("/outside/runtime")
+                && !cache_argument.contains("second-attempt")
         );
+    }
+    #[test]
+    fn pals_cuda_recipe_pins_nineteen_libraries_without_cpu_or_lc0_fallback() {
+        let (f, descriptor) = cuda_fixture();
+        let lock = f.lock().unwrap();
+        assert_eq!(lock.expected_provider_sessions(), 2);
+        lock.validate_cuda_bundle(NativeEngineRole::Baseline, &descriptor)
+            .unwrap();
+        let view = lock.engine_view(NativeEngineRole::Baseline).unwrap();
+        assert_eq!(view.cuda_bundle.unwrap().files.len(), 19);
+        let endpoint = view.external.unwrap();
+        assert_eq!(endpoint.assets.len(), 23); // export, core, two graphs, descriptor, eighteen sibling libs.
+        assert!(endpoint.arguments.contains(&"--pals-provider=cuda".into()));
+        assert!(
+            endpoint
+                .arguments
+                .contains(&"--pals-cuda-bundle={{asset:4}}".into())
+        );
+        assert!(
+            endpoint
+                .arguments
+                .contains(&"--pals-device-public-memory=false".into())
+        );
+        assert!(
+            !endpoint
+                .arguments
+                .iter()
+                .any(|arg| arg == "--pals-provider=cpu"
+                    || arg.starts_with("--onnx-")
+                    || arg.starts_with("--source-weights"))
+        );
+        let serialized = lock.to_json().unwrap();
+        assert_eq!(
+            LockedPalsArenaLaunchV3::from_json(&serialized)
+                .unwrap()
+                .sha256(),
+            lock.sha256()
+        );
+        let mut bad = f.clone();
+        let PalsEndpointLaunchV3::OnnxCuda(n) = &mut bad.endpoints[0] else {
+            unreachable!()
+        };
+        n.cuda_bundle.files.pop();
+        assert!(bad.lock().is_err());
+        let mut bad = f.clone();
+        let PalsEndpointLaunchV3::OnnxCuda(n) = &mut bad.endpoints[0] else {
+            unreachable!()
+        };
+        n.model.runtime.sha256 = "f".repeat(64);
+        assert!(bad.lock().is_err());
+        let mut bad = f.clone();
+        let PalsEndpointLaunchV3::OnnxCuda(n) = &mut bad.endpoints[0] else {
+            unreachable!()
+        };
+        n.device_id = 1;
+        assert!(bad.lock().is_err());
+        let mut bad = f.clone();
+        let PalsEndpointLaunchV3::OnnxCuda(n) = &mut bad.endpoints[0] else {
+            unreachable!()
+        };
+        n.model.graphs = native_fixture().endpoints[0]
+            .native_model()
+            .unwrap()
+            .graphs
+            .clone();
+        assert!(bad.lock().is_err());
+        let mut bad = f;
+        let PalsEngineV3::Pals(e) = &mut bad.semantic_lock.manifest.engines[0] else {
+            unreachable!()
+        };
+        e.model.backend = PalsModelBackendV3::OrtCpu;
+        bad.semantic_lock = bad.semantic_lock.manifest.lock().unwrap();
+        assert!(bad.lock().is_err());
+        let mut wrong = descriptor;
+        wrong[0] = b'[';
+        assert!(
+            lock.validate_cuda_bundle(NativeEngineRole::Baseline, &wrong)
+                .is_err()
+        );
+    }
+    #[test]
+    fn pals_cuda_startup_work_is_not_search_work_or_cuda_placement_evidence() {
+        let (f, _) = cuda_fixture();
+        let lock = f.lock().unwrap();
+        let (start, end) = cuda_records_fixture(&lock);
+        let validate = |s: &serde_json::Value, t: &serde_json::Value| {
+            validate_pals_native_records(
+                &lock,
+                NativeEngineRole::Baseline,
+                &serde_json::to_vec(s).unwrap(),
+                &serde_json::to_vec(t).unwrap(),
+                "native-process-100",
+            )
+        };
+        let (audit, pid) = validate(&start, &end).unwrap();
+        assert_eq!(pid, 100);
+        assert_eq!(
+            (
+                audit.startup_nn_inputs_completed,
+                audit.startup_nn_calls_completed,
+                audit.startup_role_inputs_completed
+            ),
+            (3, 3, 2)
+        );
+        assert_eq!(
+            (
+                audit.completed_role_inputs,
+                audit.search_consumed_role_inputs
+            ),
+            (3, 1)
+        );
+        let mut work = work_fixture("pals");
+        work["pals"]["consumed_role_outputs"] = 1.into();
+        work["pals"]["completed_proposer_calls"] = 1.into();
+        let search_work = PalsProcessWorkAuditV3 {
+            endpoint_id: "pals".into(),
+            process_id: 100,
+            startup_sha256: "a".repeat(64),
+            termination_sha256: "b".repeat(64),
+            startup_bytes: 100,
+            termination_bytes: 200,
+            search_work: work,
+        };
+        let receipt = endpoint_work_receipt(
+            &lock,
+            NativeEngineRole::Baseline,
+            Some(&search_work),
+            Some(&audit),
+            &preflight_fixture("pals"),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                receipt.nn_inputs_completed,
+                receipt.nn_calls_completed,
+                receipt.nn_inputs_consumed
+            ),
+            (4, 4, 1)
+        );
+        assert_eq!(receipt.gpu_device, PalsObservedV3::Unknown);
+        let mut incomplete_snapshot = audit.clone();
+        incomplete_snapshot.raw_native["backend_stats"] = stats_fixture(0, 1);
+        assert!(
+            endpoint_work_receipt(
+                &lock,
+                NativeEngineRole::Baseline,
+                Some(&search_work),
+                Some(&incomplete_snapshot),
+                &preflight_fixture("pals")
+            )
+            .is_err()
+        );
+        let mut failed_observer = end.clone();
+        failed_observer["native"]["observer_failures"] = 1.into();
+        assert!(validate(&start, &failed_observer).is_err());
+        let mut bad = end.clone();
+        bad["runtime_bundle_sha256"] = "f".repeat(64).into();
+        assert!(validate(&start, &bad).is_err());
+        let mut bad_start = start.clone();
+        let mut bad_end = end.clone();
+        bad_start["native"]["startup_probe"]["runtime_mapping_confirmed"] = false.into();
+        bad_end["native"]["startup_probe"] = bad_start["native"]["startup_probe"].clone();
+        assert!(validate(&bad_start, &bad_end).is_err());
+        let mut bad_start = start.clone();
+        let mut bad_end = end;
+        bad_start["native"]["execution"]["transient_execution_device_bytes"] = (3u64 << 30).into();
+        bad_end["native"]["execution"] = bad_start["native"]["execution"].clone();
+        assert!(validate(&bad_start, &bad_end).is_err());
     }
     #[test]
     fn pals_launch_rejects_unsupported_options_small_tt_and_secret_inputs() {
@@ -2641,7 +3360,7 @@ mod tests {
         let adapter_hash = [187u8; 32];
         let zero = serde_json::json!({"physically_completed_role_calls":0,"completed_role_inputs":0,"failed_physical_role_calls":0,"invalid_role_outputs":0,"delivered_role_inputs":0,"search_consumed_role_inputs":0,"canceled_requests":0,"expired_requests":0,"completed_new_game_resets":0,"process_epoch":1,"game_generation":0,"request_high_water":0,"execution_high_water":0,"physical_runs_in_flight":0,"quarantined":false,"physical_shutdown_confirmed":false,"native_buffers_released":false,"last_failure":null,
             "model_epoch":graph_hash,"export_manifest_sha256":graph_hash,"encoding_semantic_sha256":encoding_hash,"adapter_source_sha256":adapter_hash,"trained":false,
-            "residency":{"native_sessions":3,"role_reader_weights_shared":false,"native_resident_parameter_bytes":null,"vram_peak_bytes":null,"graphs":[{"role":"public","sha256":graph_hash,"serialized_bytes":1000},{"role":"proposer","sha256":graph_hash,"serialized_bytes":1000},{"role":"critic","sha256":graph_hash,"serialized_bytes":1000}]}});
+            "frozen_epoch":1,"residency":{"native_sessions":3,"role_reader_weights_shared":false,"native_resident_parameter_bytes":null,"vram_peak_bytes":null,"graphs":[{"role":"public","sha256":graph_hash,"serialized_bytes":1000},{"role":"proposer","sha256":graph_hash,"serialized_bytes":1000},{"role":"critic","sha256":graph_hash,"serialized_bytes":1000}]}});
         let start = serde_json::json!({"schema_version":3,"domain":PALS_NATIVE_STARTUP_V3_DOMAIN,"endpoint_id":"pals","launch_sha256":lock.sha256(),"process_id":100,"binary_sha256":"a".repeat(64),"runtime_sha256":"a".repeat(64),"provider":"cpu","precision":"fp32","service_exit_success":false,"native":zero});
         let mut end = start.clone();
         end["domain"] = PALS_NATIVE_TERMINATION_V3_DOMAIN.into();
@@ -2673,6 +3392,63 @@ mod tests {
         assert_eq!(pid, 100);
         assert_eq!(audit.completed_role_inputs, 3);
         assert_eq!(audit.search_consumed_role_inputs, 1);
+        assert!(lock.input.require_actual_native_epoch().is_ok());
+        let mut historical = native_fixture();
+        let PalsEngineV3::Pals(e) = &mut historical.semantic_lock.manifest.engines[0] else {
+            unreachable!()
+        };
+        e.model.frozen_epoch = 0;
+        historical.semantic_lock = historical.semantic_lock.manifest.lock().unwrap();
+        let old = historical.lock().unwrap();
+        assert!(old.input.require_actual_native_epoch().is_err());
+        let mut old_start = start.clone();
+        let mut old_end = end.clone();
+        old_start["launch_sha256"] = old.sha256().into();
+        old_end["launch_sha256"] = old.sha256().into();
+        old_start["native"]
+            .as_object_mut()
+            .unwrap()
+            .remove("frozen_epoch");
+        old_end["native"]
+            .as_object_mut()
+            .unwrap()
+            .remove("frozen_epoch");
+        assert!(
+            validate_pals_native_records(
+                &old,
+                NativeEngineRole::Baseline,
+                &serde_json::to_vec(&old_start).unwrap(),
+                &serde_json::to_vec(&old_end).unwrap(),
+                "native-process-100"
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            LockedPalsArenaLaunchV3::from_json(&old.to_json().unwrap())
+                .unwrap()
+                .sha256(),
+            old.sha256()
+        );
+        let mut missing_start = start.clone();
+        let mut missing_end = end.clone();
+        missing_start["native"]
+            .as_object_mut()
+            .unwrap()
+            .remove("frozen_epoch");
+        missing_end["native"]
+            .as_object_mut()
+            .unwrap()
+            .remove("frozen_epoch");
+        assert!(
+            validate_pals_native_records(
+                &lock,
+                NativeEngineRole::Baseline,
+                &serde_json::to_vec(&missing_start).unwrap(),
+                &serde_json::to_vec(&missing_end).unwrap(),
+                "native-process-100"
+            )
+            .is_err()
+        );
         let mut bad = end.clone();
         bad["native"]["search_consumed_role_inputs"] = 4.into();
         assert!(validate(&bad).is_err());
@@ -2687,6 +3463,12 @@ mod tests {
         assert!(validate(&bad).is_err());
         let mut bad = end.clone();
         bad["runtime_sha256"] = "f".repeat(64).into();
+        assert!(validate(&bad).is_err());
+        let mut bad = end.clone();
+        bad["native"]["execution"] = serde_json::json!({"provider":"cuda"});
+        assert!(validate(&bad).is_err());
+        let mut bad = end;
+        bad["native"]["execution"] = "not an object".into();
         assert!(validate(&bad).is_err());
     }
     fn work_fixture(kind: &str) -> serde_json::Value {
@@ -2882,8 +3664,15 @@ mod tests {
             completed_new_game_resets: 1,
             physical_shutdown_confirmed: true,
             native_buffers_released: true,
-            raw_native: serde_json::json!({"backend_stats_observation":"exclusive_worker_before_shutdown",
-                "backend_stats":{"public_nn_runs_completed":1,"role_nn_runs_completed":3,"completed_nn_inputs":4,"public_cache_hits":2}}),
+            startup_nn_inputs_completed: 0,
+            startup_nn_calls_completed: 0,
+            startup_role_inputs_completed: 0,
+            startup_probe: None,
+            execution: None,
+            raw_native: serde_json::json!({"backend_stats_observation":"exclusive_worker_before_shutdown","observer_failures":0,"last_observer_failure":null,"frozen_epoch":1,
+                "backend_stats":{"public_nn_runs_completed":1,"role_nn_runs_completed":3,"completed_nn_inputs":4,"public_cache_hits":2,
+                    "public_nn_runs_failed_known":0,"role_nn_runs_failed_known":0,"public_nn_runs_attempted":1,"role_nn_runs_attempted":3,
+                    "validated_public_outputs":1,"validated_role_outputs":3,"live_public_cache_entries":1}}),
             raw_search_work: audit.search_work.clone(),
         };
         let receipt = endpoint_work_receipt(
@@ -2903,6 +3692,22 @@ mod tests {
             (4, 4, 1)
         );
         assert_eq!(receipt.cached_evaluations_consumed, 0);
+        let mut missing_observer = native.clone();
+        missing_observer
+            .raw_native
+            .as_object_mut()
+            .unwrap()
+            .remove("observer_failures");
+        assert!(
+            endpoint_work_receipt(
+                &lock,
+                NativeEngineRole::Baseline,
+                Some(&audit),
+                Some(&missing_observer),
+                &preflight_fixture("pals")
+            )
+            .is_err()
+        );
         let mut unknown = native;
         unknown.raw_native["backend_stats"] = serde_json::Value::Null;
         assert!(
