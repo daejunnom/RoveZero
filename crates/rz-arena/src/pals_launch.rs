@@ -203,7 +203,10 @@ impl PalsArenaLaunchV3 {
             "wrong arena launch domain",
         )?;
         let pilot = &self.semantic_lock.manifest.pilot;
-        require(pilot.max_plies % 2 == 0, "Fastchess max-plies must be even")?;
+        require(
+            pilot.max_plies.is_multiple_of(2),
+            "Fastchess max-plies must be even",
+        )?;
         require(
             self.runner.source_url == crate::FASTCHESS_SOURCE_URL
                 && self.runner.source_commit == crate::FASTCHESS_SOURCE_COMMIT
@@ -270,11 +273,11 @@ impl PalsArenaLaunchV3 {
                 && resources[0].swap_max_bytes == resources[1].swap_max_bytes,
             "this executor supports one identical inherited CPU/memory policy for the two sequential engines",
         )?;
-        for i in 0..2 {
+        for (i, resource) in resources.iter().enumerate() {
             self.endpoint(i)?;
             if let PalsEngineV3::Pals(e) = &self.semantic_lock.manifest.engines[i] {
                 require(
-                    e.pools.host_bytes == resources[i].memory_max_bytes,
+                    e.pools.host_bytes == resource.memory_max_bytes,
                     "PALS pool host ceiling differs from verified memory cgroup",
                 )?;
                 if let Some(cuda) = self.endpoints[i].cuda_model() {
@@ -283,9 +286,9 @@ impl PalsArenaLaunchV3 {
                         .checked_mul(cuda.model.graphs.len() as u64)
                         .ok_or_else(|| invalid("CUDA session declaration overflow"))?;
                     require(
-                        resources[i].requested_gpu.is_some()
+                        resource.requested_gpu.is_some()
                             && e.pools.device_bytes > 0
-                            && e.pools.device_bytes == resources[i].device_allocation_max_bytes
+                            && e.pools.device_bytes == resource.device_allocation_max_bytes
                             && declared_arenas < e.pools.device_bytes
                             && e.pools.device_bytes <= 6 * 1024 * 1024 * 1024,
                         "CUDA explicit device budget must cover all declared session arenas; observed peak remains unknown",
@@ -293,8 +296,8 @@ impl PalsArenaLaunchV3 {
                 } else {
                     require(
                         e.pools.device_bytes == 0
-                            && resources[i].requested_gpu.is_none()
-                            && resources[i].device_allocation_max_bytes == 0,
+                            && resource.requested_gpu.is_none()
+                            && resource.device_allocation_max_bytes == 0,
                         "closed CPU/mock recipe must not declare GPU allocation",
                     )?;
                 }
@@ -661,9 +664,11 @@ impl PalsArenaLaunchV3 {
                     "own CPU executable limits exceed declaration",
                 )?;
                 validate_cpu_profile(&e.cpu, m.pilot.wall_time_max_ms)?;
-                let mut config = rz_search::cpu::CpuConfig::default();
-                config.max_depth = *max_depth;
-                config.tt_entries = *tt_entries as usize;
+                let config = rz_search::cpu::CpuConfig {
+                    max_depth: *max_depth,
+                    tt_entries: *tt_entries as usize,
+                    ..Default::default()
+                };
                 require(
                     config
                         .tt_allocation_bytes()
@@ -1701,6 +1706,22 @@ pub fn validate_pals_process_work(
         work["schema_version"] == 1 && work["search_kind"] == kind,
         "work schema/search kind differs",
     )?;
+    // Historical v1 receipts omit this additive identity. Keep their absence
+    // observable; an explicit identity must match the registered semantics.
+    if let Some(resolver) = work.get("pals_resolver") {
+        require(
+            kind == "pals"
+                && resolver["version"] == rz_search::pals::engine::PALS_VALUE_RESOLVER_VERSION
+                && resolver["semantics_sha256"]
+                    == serde_json::json!(
+                        Sha256::digest(
+                            rz_search::pals::engine::PALS_VALUE_RESOLVER_SEMANTICS.as_bytes()
+                        )
+                        .to_vec()
+                    ),
+            "work resolver identity belongs to a different policy/search path",
+        )?;
+    }
     let go = work_count(work, "go_invocations")?;
     let success = work_count(work, "successful_returns")?;
     let failed = work_count(work, "failed_returns")?;
@@ -2433,19 +2454,19 @@ pub fn assemble_pals_core_receipt(
                     .work
                     .iter()
                     .find(|w| w.endpoint_id == id && w.process_id == pid);
-                if game.classification != "engine_loss" {
-                    if let Some(work) = work {
-                        let plies = game.uci_moves.len() as u64;
-                        let expected_go = if game.white_engine == id {
-                            plies / 2 + plies % 2
-                        } else {
-                            plies / 2
-                        };
-                        require(
-                            work_count(&work.search_work, "go_invocations")? == expected_go,
-                            "per-game work invocation count differs from audited moves",
-                        )?;
-                    }
+                if game.classification != "engine_loss"
+                    && let Some(work) = work
+                {
+                    let plies = game.uci_moves.len() as u64;
+                    let expected_go = if game.white_engine == id {
+                        plies / 2 + plies % 2
+                    } else {
+                        plies / 2
+                    };
+                    require(
+                        work_count(&work.search_work, "go_invocations")? == expected_go,
+                        "per-game work invocation count differs from audited moves",
+                    )?;
                 }
                 let nn = receipts
                     .provider_sessions
@@ -3545,6 +3566,25 @@ mod tests {
         let mut bad = end;
         bad["search_work"]["successful_returns"] = 2.into();
         assert!(verify(&bad).is_err());
+    }
+
+    #[test]
+    fn additive_resolver_identity_checks_semantics_without_rewriting_legacy_work() {
+        let mut work = work_fixture("pals");
+        assert!(validate_pals_process_work(&work, "pals", true).is_ok());
+        assert!(work.get("pals_resolver").is_none());
+        work["pals_resolver"] = serde_json::json!({
+            "version": rz_search::pals::engine::PALS_VALUE_RESOLVER_VERSION,
+            "semantics_sha256": Sha256::digest(
+                rz_search::pals::engine::PALS_VALUE_RESOLVER_SEMANTICS.as_bytes()
+            ).to_vec()
+        });
+        assert!(validate_pals_process_work(&work, "pals", true).is_ok());
+        let mut cpu = work_fixture("cpu");
+        cpu["pals_resolver"] = work["pals_resolver"].clone();
+        assert!(validate_pals_process_work(&cpu, "cpu", true).is_err());
+        work["pals_resolver"]["semantics_sha256"][0] = 256.into();
+        assert!(validate_pals_process_work(&work, "pals", true).is_err());
     }
     #[test]
     fn pals_core_projection_separates_cpu_evidence_reuse_from_nn_and_actual_consumption() {

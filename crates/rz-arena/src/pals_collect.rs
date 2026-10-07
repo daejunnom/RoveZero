@@ -581,7 +581,7 @@ impl PalsCollectionDriver for OwnPalsMockCollectionDriver {
             // fabricating a completed-depth/policy label for the choice.
             completed_depth: 0,
             completed_estimate: false,
-            raw: serde_json::json!({"source":"pals_cpu_mock","completion":format!("{:?}",r.completion),"value_scope":format!("{:?}",r.value_scope),
+            raw: serde_json::json!({"source":"pals_cpu_mock","resolver_version":r.resolver_version,"completion":format!("{:?}",r.completion),"value_scope":format!("{:?}",r.value_scope),
                 "raw_score":r.score,"cpu_nodes":r.counters.cpu_nodes,"cpu_tasks":r.counters.cpu_tasks,"completed_cpu_tasks":r.counters.completed_cpu_tasks,
                 "role_calls":r.counters.role_calls,"model":r.model_identity,"elapsed_us":r.elapsed.as_micros().min(u64::MAX as u128) as u64}),
             genealogy,
@@ -968,6 +968,46 @@ struct CapturedInput {
     input: PalsFrozenInput,
     outcome_eligible: bool,
 }
+
+/// Borrowed state and role context available before an input is sealed.
+struct InputCapture<'a> {
+    position: &'a Position,
+    opening: &'a PalsCollectionOpening,
+    game: &'a str,
+    position_command: String,
+    actual_moves: &'a [BoardMove],
+    role: PalsDataRole,
+    source: &'a PalsCollectionSourceDescription,
+    outcome_eligible: bool,
+    prefix: &'a [BoardMove],
+    proposal: &'a [BoardMove],
+    counterexample: Option<&'a [BoardMove]>,
+    deadline: Instant,
+    cancel: &'a AtomicBool,
+}
+
+/// One immutable public observation and its exact Rules anchor.
+struct PublicObservation<'a> {
+    position: &'a Position,
+    hash: String,
+    kind: RecordKind,
+    line: &'a [BoardMove],
+    value: Option<i32>,
+    completed_depth: u16,
+    scope: Option<CpuScoreScope>,
+}
+
+/// Completed CPU evidence, kept separate from the previously sealed input.
+struct CpuLabelEvidence {
+    task_sha: String,
+    raw_sha: String,
+    depth: u16,
+    nodes: u64,
+    sequence: u64,
+    movement: BoardMove,
+    counterexample: Option<PalsCounterexampleTarget>,
+}
+
 impl Collection {
     fn next(&mut self) -> Result<u64, ArenaError> {
         self.sequence = self
@@ -1048,20 +1088,23 @@ impl Collection {
     fn capture(
         &mut self,
         output: &mut Output,
-        position: &Position,
-        opening: &PalsCollectionOpening,
-        game: &str,
-        position_command: String,
-        actual_moves: &[BoardMove],
-        role: PalsDataRole,
-        source: &PalsCollectionSourceDescription,
-        outcome_eligible: bool,
-        prefix: &[BoardMove],
-        proposal: &[BoardMove],
-        counterexample: Option<&[BoardMove]>,
-        deadline: Instant,
-        cancel: &AtomicBool,
+        context: InputCapture<'_>,
     ) -> Result<(PalsFrozenInput, PalsModelInput), ArenaError> {
+        let InputCapture {
+            position,
+            opening,
+            game,
+            position_command,
+            actual_moves,
+            role,
+            source,
+            outcome_eligible,
+            prefix,
+            proposal,
+            counterexample,
+            deadline,
+            cancel,
+        } = context;
         let sequence = self.next()?;
         let legal = position.legal_moves();
         let query = RoleQuery {
@@ -1157,14 +1200,17 @@ impl Collection {
     fn publish(
         &mut self,
         output: &mut Output,
-        position: &Position,
-        hash: String,
-        kind: RecordKind,
-        line: &[BoardMove],
-        value: Option<i32>,
-        completed_depth: u16,
-        scope: Option<CpuScoreScope>,
+        observation: PublicObservation<'_>,
     ) -> Result<(), ArenaError> {
+        let PublicObservation {
+            position,
+            hash,
+            kind,
+            line,
+            value,
+            completed_depth,
+            scope,
+        } = observation;
         if self.role_records.len() >= 16_384 {
             return Err(ArenaError::Budget("public source-record scan limit".into()));
         }
@@ -1320,14 +1366,17 @@ fn policy(input: &PalsFrozenInput, movement: BoardMove) -> Result<PalsPolicyTarg
 fn owned_label(
     input: &PalsFrozenInput,
     description: &PalsCollectionSourceDescription,
-    task_sha: String,
-    raw_sha: String,
-    depth: u16,
-    nodes: u64,
-    sequence: u64,
-    movement: BoardMove,
-    counterexample: Option<PalsCounterexampleTarget>,
+    evidence: CpuLabelEvidence,
 ) -> Result<PalsLearningRecord, ArenaError> {
+    let CpuLabelEvidence {
+        task_sha,
+        raw_sha,
+        depth,
+        nodes,
+        sequence,
+        movement,
+        counterexample,
+    } = evidence;
     Ok(PalsLearningRecord {
         input: input.clone(),
         future_label: Some(PalsFutureLabel {
@@ -1641,19 +1690,21 @@ pub fn collect_pals_own_data(
                 } else {
                     Some(state.capture(
                         &mut output,
-                        &position,
-                        opening,
-                        &game,
-                        position_command(opening, &moves),
-                        &moves,
-                        PalsDataRole::Proposer,
-                        &description,
-                        true,
-                        &[],
-                        &[],
-                        None,
-                        deadline,
-                        cancel,
+                        InputCapture {
+                            position: &position,
+                            opening,
+                            game: &game,
+                            position_command: position_command(opening, &moves),
+                            actual_moves: &moves,
+                            role: PalsDataRole::Proposer,
+                            source: &description,
+                            outcome_eligible: true,
+                            prefix: &[],
+                            proposal: &[],
+                            counterexample: None,
+                            deadline,
+                            cancel,
+                        },
                     )?)
                 };
                 if let Some(terminal) = termination(&position)? {
@@ -1725,30 +1776,34 @@ pub fn collect_pals_own_data(
                     let row = owned_label(
                         input,
                         &description,
-                        task_sha,
-                        raw_sha.clone(),
-                        decision.completed_depth,
-                        decision.nodes,
-                        sequence,
-                        movement,
-                        None,
+                        CpuLabelEvidence {
+                            task_sha,
+                            raw_sha: raw_sha.clone(),
+                            depth: decision.completed_depth,
+                            nodes: decision.nodes,
+                            sequence,
+                            movement,
+                            counterexample: None,
+                        },
                     )?;
                     state.add_row(&mut output, row)?;
                 }
                 let record = decision.genealogy.first();
                 state.publish(
                     &mut output,
-                    &position,
-                    raw_sha,
-                    RecordKind::Proposal,
-                    &decision.pv,
-                    record
-                        .and_then(|r| r.raw_value)
-                        .filter(|_| decision.completed_estimate),
-                    decision.completed_depth,
-                    decision
-                        .completed_estimate
-                        .then_some(CpuScoreScope::CompletedIteration),
+                    PublicObservation {
+                        position: &position,
+                        hash: raw_sha,
+                        kind: RecordKind::Proposal,
+                        line: &decision.pv,
+                        value: record
+                            .and_then(|r| r.raw_value)
+                            .filter(|_| decision.completed_estimate),
+                        completed_depth: decision.completed_depth,
+                        scope: decision
+                            .completed_estimate
+                            .then_some(CpuScoreScope::CompletedIteration),
+                    },
                 )?;
                 if cancel.load(Ordering::Acquire) {
                     end = Some((PalsOutcome::Unknown, PalsGameEnd::UserStop));
@@ -1826,7 +1881,13 @@ pub fn collect_pals_own_data(
                 .as_mut()
                 .ok_or_else(|| invalid("active game missing after result write"))?
                 .result_written = true;
-            for captured in state.inputs[input_start..].to_vec() {
+            // Each iteration releases the input borrow before mutating the
+            // sequence/rows; no second Vec of every sealed input is allocated.
+            let input_end = state.inputs.len();
+            let mut input_index = input_start;
+            while input_index < input_end {
+                let captured = state.inputs[input_index].clone();
+                input_index += 1;
                 let input = captured.input;
                 let sequence = state.next()?;
                 let future_label = if captured.outcome_eligible {
@@ -2071,19 +2132,21 @@ fn conditional(
     history.push(proposal[0]);
     let (input, _prepared) = state.capture(
         output,
-        &divergence,
-        opening,
-        game,
-        position_command(opening, &history),
-        actual,
-        PalsDataRole::Critic,
-        source,
-        false,
-        &proposal[..1],
-        proposal,
-        None,
-        deadline,
-        cancel,
+        InputCapture {
+            position: &divergence,
+            opening,
+            game,
+            position_command: position_command(opening, &history),
+            actual_moves: actual,
+            role: PalsDataRole::Critic,
+            source,
+            outcome_eligible: false,
+            prefix: &proposal[..1],
+            proposal,
+            counterexample: None,
+            deadline,
+            cancel,
+        },
     )?;
     let job = job_limits(config, state, deadline)?;
     let challenged = canonical_sha256(&(
@@ -2126,13 +2189,16 @@ fn conditional(
     };
     state.publish(
         output,
-        &divergence,
-        raw.clone(),
-        RecordKind::Counterexample,
-        &response_line,
-        (report.score_scope == CpuScoreScope::CompletedIteration).then_some(report.score),
-        report.completed_depth,
-        Some(report.score_scope),
+        PublicObservation {
+            position: &divergence,
+            hash: raw.clone(),
+            kind: RecordKind::Counterexample,
+            line: &response_line,
+            value: (report.score_scope == CpuScoreScope::CompletedIteration)
+                .then_some(report.score),
+            completed_depth: report.completed_depth,
+            scope: Some(report.score_scope),
+        },
     )?;
     if report.score_scope == CpuScoreScope::CompletedIteration && report.completed_depth > 0 {
         state.add_row(
@@ -2140,13 +2206,15 @@ fn conditional(
             owned_label(
                 &input,
                 cpu_source,
-                task,
-                raw,
-                report.completed_depth,
-                report.nodes,
-                sequence,
-                response,
-                Some(counter.clone()),
+                CpuLabelEvidence {
+                    task_sha: task,
+                    raw_sha: raw,
+                    depth: report.completed_depth,
+                    nodes: report.nodes,
+                    sequence,
+                    movement: response,
+                    counterexample: Some(counter.clone()),
+                },
             )?,
         )?;
     }
@@ -2165,19 +2233,21 @@ fn conditional(
     let prefix = [proposal[0], response];
     let (repair_input, _prepared) = state.capture(
         output,
-        &repair_position,
-        opening,
-        game,
-        position_command(opening, &history),
-        actual,
-        PalsDataRole::Proposer,
-        source,
-        false,
-        &prefix,
-        proposal,
-        Some(&response_line),
-        deadline,
-        cancel,
+        InputCapture {
+            position: &repair_position,
+            opening,
+            game,
+            position_command: position_command(opening, &history),
+            actual_moves: actual,
+            role: PalsDataRole::Proposer,
+            source,
+            outcome_eligible: false,
+            prefix: &prefix,
+            proposal,
+            counterexample: Some(&response_line),
+            deadline,
+            cancel,
+        },
     )?;
     let job = job_limits(config, state, deadline)?;
     let report = cpu
@@ -2209,25 +2279,30 @@ fn conditional(
             owned_label(
                 &repair_input,
                 cpu_source,
-                task,
-                raw.clone(),
-                report.completed_depth,
-                report.nodes,
-                sequence,
-                repair_move,
-                None,
+                CpuLabelEvidence {
+                    task_sha: task,
+                    raw_sha: raw.clone(),
+                    depth: report.completed_depth,
+                    nodes: report.nodes,
+                    sequence,
+                    movement: repair_move,
+                    counterexample: None,
+                },
             )?,
         )?;
     }
     state.publish(
         output,
-        &repair_position,
-        raw,
-        RecordKind::Repair,
-        &repair_line,
-        (report.score_scope == CpuScoreScope::CompletedIteration).then_some(report.score),
-        report.completed_depth,
-        Some(report.score_scope),
+        PublicObservation {
+            position: &repair_position,
+            hash: raw,
+            kind: RecordKind::Repair,
+            line: &repair_line,
+            value: (report.score_scope == CpuScoreScope::CompletedIteration)
+                .then_some(report.score),
+            completed_depth: report.completed_depth,
+            scope: Some(report.score_scope),
+        },
     )?;
     // This is a lineage update, not a strategic success label. Finding a legal
     // repair alone does not prove that it refuted the counterexample.

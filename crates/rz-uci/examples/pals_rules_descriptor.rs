@@ -38,7 +38,7 @@ fn hex(bytes: [u8; 32]) -> String {
     bytes.into_iter().map(|b| format!("{b:02x}")).collect()
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::args_os().skip(1).next().is_some() {
+    if std::env::args_os().nth(1).is_some() {
         return Err(
             "pals_rules_descriptor takes no arguments and emits one fixed declaration".into(),
         );

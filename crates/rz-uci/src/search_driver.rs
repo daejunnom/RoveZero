@@ -18,7 +18,7 @@ use std::{
 };
 mod work;
 use work::{AttemptObservation, ProcessWorkJournal};
-pub use work::{CpuWorkTotals, PalsWorkTotals, ProcessSearchWorkReceipt};
+pub use work::{CpuWorkTotals, PalsResolverIdentity, PalsWorkTotals, ProcessSearchWorkReceipt};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "search-work-receipts", derive(serde::Serialize))]
@@ -77,6 +77,7 @@ pub struct PalsSessionDriver<M: rz_search::pals::engine::RoleModel + 'static> {
     engine: Mutex<rz_search::pals::engine::PalsEngine<M>>,
     reset_pending: AtomicBool,
     implementation: Digest,
+    resolver_version: &'static str,
     identity: EngineIdentity,
     max_rounds: u64,
     max_cpu_nodes: u64,
@@ -108,6 +109,10 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
         let mut hash = Sha256::new();
         hash.update(b"rz-uci-pals-session/1\0");
         hash.update(rz_search::pals::engine::PALS_SEARCH_VERSION.as_bytes());
+        hash.update(b"\0value-resolver\0");
+        hash.update(rz_search::pals::engine::PALS_VALUE_RESOLVER_VERSION.as_bytes());
+        hash.update([0]);
+        hash.update(rz_search::pals::engine::PALS_VALUE_RESOLVER_SEMANTICS.as_bytes());
         hash.update(rz_search::cpu::CPU_SEARCH_VERSION.as_bytes());
         hash.update(rz_search::cpu::BOOTSTRAP_SCORE_VERSION.as_bytes());
         hash.update(model.identity().as_bytes());
@@ -136,6 +141,7 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
             engine: Mutex::new(engine),
             reset_pending: AtomicBool::new(false),
             implementation: Digest(hash.finalize().into()),
+            resolver_version: rz_search::pals::engine::PALS_VALUE_RESOLVER_VERSION,
             identity,
             max_rounds,
             max_cpu_nodes,
@@ -271,6 +277,14 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> SearchSessionDriver for Pa
                     SearchSessionFailure::debug("PalsSearch", &error)
                 }
             })?;
+            if report.resolver_version != self.resolver_version {
+                return Err(SearchSessionFailure {
+                    physical_completion: DriverPhysicalCompletion::Confirmed,
+                    code: "PalsResolverIdentity",
+                    detail: "returned PALS resolver version differs from its startup registration"
+                        .into(),
+                });
+            }
             if context.accepts().map_err(|error| SearchSessionFailure {
                 physical_completion: DriverPhysicalCompletion::Confirmed,
                 code: "PalsAuthority",

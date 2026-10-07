@@ -17,6 +17,24 @@ use std::time::{Duration, Instant};
 
 pub const PALS_SEARCH_VERSION: &str = "pals-restricted-refinement/0.1";
 
+/// Identity of the current value resolver, independent of model, CPU value
+/// namespace and search implementation identities. Changing this policy needs
+/// a new version; recording it does not calibrate CPU scores or change search.
+///
+/// Rules terminals are exact current-state facts. Other leaves use accepted
+/// side-to-move CPU raw scores from the registered value namespace, including
+/// frontier-only and partially completed iterations; their original scope and
+/// work counters remain recorded. Examined children propagate max/negation.
+/// Missing values stay None and are omitted from that restricted max, never
+/// replaced by zero. No P/C WDL averaging or CP/WDL calibration is performed.
+///
+/// At the root, a Rules-certified win takes priority; equal values prefer a
+/// Rules terminal, then existing Rules order resolves ties. A restricted
+/// estimate, including a finite-depth mate score, is not a whole-game bound or
+/// an independently verified all-defenses proof.
+pub const PALS_VALUE_RESOLVER_VERSION: &str = "pals-cpu-raw-restricted/0.1";
+pub const PALS_VALUE_RESOLVER_SEMANTICS: &str = "leaf:accepted-registered-cpu-raw-side-to-move-including-frontier-and-partial;propagation:examined-children-max-negation;unknown:None-not-zero;calibration:none;pc-score-average:none;root:rules-certified-win-first,equal-value-terminal-first,Rules-order-ties;nonterminal-scope:restricted-estimate-not-game-bound";
+
 #[derive(Clone, Debug)]
 pub struct PalsConfig {
     pub beam_width: usize,
@@ -363,6 +381,9 @@ pub struct PalsResult {
     pub root_values: Vec<PalsRootValue>,
     pub elapsed: Duration,
     pub model_identity: String,
+    /// Policy identity only; the underlying CPU value namespace remains
+    /// independent and is preserved in task/observation provenance.
+    pub resolver_version: &'static str,
 }
 #[derive(Debug)]
 pub enum PalsError {
@@ -654,6 +675,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 root_values: Vec::new(),
                 elapsed: started.elapsed(),
                 model_identity: self.model.identity().to_owned(),
+                resolver_version: PALS_VALUE_RESOLVER_VERSION,
             });
         }
         // Check every immediate legal child for actual Rules terminal evidence.
@@ -794,6 +816,7 @@ impl<M: RoleModel> PalsEngine<M> {
             root_values,
             elapsed: started.elapsed(),
             model_identity: self.model.identity().to_owned(),
+            resolver_version: PALS_VALUE_RESOLVER_VERSION,
         })
     }
 
@@ -868,6 +891,7 @@ impl<M: RoleModel> PalsEngine<M> {
             },
             elapsed: started.elapsed(),
             model_identity: self.model.identity().to_owned(),
+            resolver_version: PALS_VALUE_RESOLVER_VERSION,
         })
     }
     fn intern(&mut self, position: Position) -> Result<usize, PalsError> {
@@ -3111,6 +3135,7 @@ mod tests {
             let result = engine()
                 .search(&position, limits(), &AtomicBool::new(false))
                 .unwrap();
+            assert_eq!(result.resolver_version, PALS_VALUE_RESOLVER_VERSION);
             let mut child = position.clone();
             child.make_move(result.best_move.unwrap()).unwrap();
             assert!(matches!(
@@ -3129,12 +3154,14 @@ mod tests {
         let result = engine()
             .search(&position, limits(), &AtomicBool::new(false))
             .unwrap();
+        assert_eq!(result.resolver_version, PALS_VALUE_RESOLVER_VERSION);
         assert_eq!(result.terminal, Some(TerminalReason::Stalemate));
         assert_eq!(result.best_move, None);
         let position = Position::startpos();
         let result = engine()
             .search(&position, limits(), &AtomicBool::new(true))
             .unwrap();
+        assert_eq!(result.resolver_version, PALS_VALUE_RESOLVER_VERSION);
         assert_eq!(result.completion, PalsCompletion::Canceled);
         assert!(position.legal_moves().contains(&result.best_move.unwrap()));
         assert_eq!(result.score, None);
@@ -3440,6 +3467,7 @@ mod tests {
             .search(&position, limits(), &AtomicBool::new(false))
             .unwrap();
         assert_eq!(result.completion, PalsCompletion::Capacity);
+        assert_eq!(result.resolver_version, PALS_VALUE_RESOLVER_VERSION);
         assert!(position.legal_moves().contains(&result.best_move.unwrap()));
         assert_eq!(result.value_scope, PalsValueScope::Unknown);
         assert_eq!(engine.retained_situations(), 257);
@@ -3451,6 +3479,7 @@ mod tests {
             .search(&terminal, limits(), &AtomicBool::new(false))
             .unwrap();
         assert_eq!(result.completion, PalsCompletion::Terminal);
+        assert_eq!(result.resolver_version, PALS_VALUE_RESOLVER_VERSION);
         assert!(result.terminal.is_some());
         assert!(result.root_values.is_empty());
         assert_eq!(result.counters.unknown_root_children, 0);

@@ -21,6 +21,26 @@ PUCT simulation·visit 수로 표시하지 않는다.
 CPU 문제 결과는 남는다. 취소·세대 변경 이후 늦은 결과는 현재 루트에 적용하지 않는다.
 물리 완료가 불명확하거나 격리된 실행은 입력·출력·workspace를 보존하며 재사용하지 않는다.
 
+### 첫 value resolver와 교체 범위
+
+첫 정책은 `pals-cpu-raw-restricted/0.1`이다. 등록된 CPU value namespace의 수용된
+raw scalar와 실제 Rules terminal을 사용하고, 조사한 자식의 차례 관점 값을 부호 전환해
+max를 계산한다. 수용된 frontier·부분 완료 값도 해당 범위와 함께 사용할 수 있으므로
+요청 깊이 완료와 같은 뜻으로 기록하지 않는다. 미관측 값은 `None`이며 0·무승부로 채우지
+않는다. CP/WDL 보정이나 P/C 값과의 평균은 하지 않는다. 실제 Rules 승리 착수를 우선하고,
+같은 값에서는 terminal, 나머지 동점에서는 Rules 순서를 유지한다. 제한 후보의 추정값은
+전체 게임의 bound 또는 완결 증명이 아니다.
+
+`PalsResult`와 collector 원시 결과에 버전을 기록하고, UCI process 작업 영수증에는 버전과
+의미 정의의 SHA-256을 추가한다. 시작 identity와 반환 결과의 정책이 다르면 거부한다.
+과거 영수증의 필드 부재는 그대로 읽으며 해당 정책을 관측한 것으로 자동 채우지 않는다.
+이 식별 추가는 현재 착수·점수 정책을 바꾸지 않는다. 후속 resolver 변경은 S 실험이다.
+
+외부 UCI 상대 연결과 PALS 내부의 외부 `CPU_R` checker는 별도 접점이다. 첫 제품은 자체
+`CpuSearcher`를 사용하며, 외부 checker의 capability·관점·raw mate/bound·단일 활성 go·
+미지원 resume은 별도 인수한다. 현재 host whole-input K/V page의 실제 backing 소유권은
+GPU resident page·record별 증분 재사용 또는 private latent warm-start의 인수를 대신하지 않는다.
+
 ## PALS V3 명세·lock·receipt
 
 `rz-experiments::PalsRunManifestV3`는 `rz-pals-execution-v3/1` 도메인에서 JSON을

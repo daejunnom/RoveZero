@@ -104,7 +104,12 @@ impl CpuTaskError {
         Self {
             code: "cpu_task_failed",
             stage,
-            message: message.to_string().chars().take(512).collect::<String>().into_boxed_str(),
+            message: message
+                .to_string()
+                .chars()
+                .take(512)
+                .collect::<String>()
+                .into_boxed_str(),
             known_nodes: None,
             failed_check_work: None,
             baseline: None,

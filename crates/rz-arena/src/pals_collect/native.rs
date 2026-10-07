@@ -871,7 +871,7 @@ impl PalsCollectionDriver for OwnPalsOnnxCollectionDriver {
             completed_depth: 0,
             completed_estimate: false,
             genealogy,
-            raw: serde_json::json!({"source":"actual_frozen_pals_onnx_cpu","training_state":"Untrained",
+            raw: serde_json::json!({"source":"actual_frozen_pals_onnx_cpu","resolver_version":r.resolver_version,"training_state":"Untrained",
                 "completion":format!("{:?}",r.completion),"value_scope":format!("{:?}",r.value_scope),"raw_score":r.score,
                 "cpu_nodes":r.counters.cpu_nodes,"cpu_tasks":r.counters.cpu_tasks,"cpu_task_configuration_sha256":self.description.cpu_profile_sha256,
                 "role_calls":r.counters.role_calls,"search_consumed_role_outputs":r.counters.consumed_role_outputs,

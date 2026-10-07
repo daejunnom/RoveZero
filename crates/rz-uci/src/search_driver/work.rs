@@ -7,7 +7,26 @@ use rz_search::{
     cpu::{CpuReport, CpuScoreScope, CpuWork},
     pals::engine::PalsCounters,
 };
+use sha2::{Digest as _, Sha256};
 use std::sync::Mutex;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "search-work-receipts", derive(serde::Serialize))]
+pub struct PalsResolverIdentity {
+    pub version: String,
+    pub semantics_sha256: [u8; 32],
+}
+impl PalsResolverIdentity {
+    fn registered() -> Self {
+        Self {
+            version: rz_search::pals::engine::PALS_VALUE_RESOLVER_VERSION.into(),
+            semantics_sha256: Sha256::digest(
+                rz_search::pals::engine::PALS_VALUE_RESOLVER_SEMANTICS.as_bytes(),
+            )
+            .into(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "search-work-receipts", derive(serde::Serialize))]
@@ -24,6 +43,13 @@ pub struct ProcessSearchWorkReceipt {
     pub unobserved_work_invocations: u64,
     pub cpu: Option<CpuWorkTotals>,
     pub pals: Option<PalsWorkTotals>,
+    /// Startup-selected identity remains available even for a failed go. The
+    /// driver rejects a returned result with a different resolver version.
+    #[cfg_attr(
+        feature = "search-work-receipts",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub pals_resolver: Option<PalsResolverIdentity>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -224,6 +250,7 @@ impl ProcessWorkJournal {
                 unobserved_work_invocations: 0,
                 cpu: (kind == SearchKind::Cpu).then(CpuWorkTotals::zero),
                 pals: (kind == SearchKind::Pals).then(PalsWorkTotals::zero),
+                pals_resolver: (kind == SearchKind::Pals).then(PalsResolverIdentity::registered),
             }),
             pending_cpu: Mutex::new(Vec::with_capacity(16)),
         }
@@ -493,6 +520,10 @@ mod tests {
             (0, 1, 1)
         );
         assert_eq!(receipt.unobserved_work_invocations, 0);
+        assert_eq!(
+            receipt.pals_resolver.as_ref(),
+            Some(&PalsResolverIdentity::registered())
+        );
         let totals = receipt.pals.unwrap();
         assert_eq!(totals.cpu_nodes, Some(4));
         assert_eq!(totals.partial_cpu_iterations, Some(1));
@@ -516,6 +547,14 @@ mod tests {
             .unwrap();
         let receipt = journal.snapshot().unwrap();
         assert_eq!(receipt.unobserved_work_invocations, 1);
+        assert!(receipt.pals_resolver.is_none());
+        #[cfg(feature = "search-work-receipts")]
+        assert!(
+            serde_json::to_value(&receipt)
+                .unwrap()
+                .get("pals_resolver")
+                .is_none()
+        );
         let totals = receipt.cpu.unwrap();
         assert_eq!(totals.tasks_requested, Some(1));
         assert_eq!(totals.reports_returned, Some(0));
