@@ -11,6 +11,9 @@ pub use adapters::lc0::{asset, output};
 pub mod batch_journal;
 pub mod error;
 pub mod mock;
+pub mod pals_model;
+#[cfg(all(feature = "onnx", feature = "contracts"))]
+pub mod pals_onnx;
 pub mod runtime_pin;
 pub mod worker;
 
