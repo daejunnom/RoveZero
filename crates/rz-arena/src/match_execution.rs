@@ -165,13 +165,25 @@ pub fn audit_ponder_protocol(
         hits: 0,
         stopped: 0,
     };
-    for line in text.lines() {
-        if line.contains("RZ_PONDER_FAILURE_V1") {
-            return Err(ArenaError::Invalid("ponder cleanup failed".into()));
+    for (index, line) in text.lines().enumerate() {
+        if index >= 131_072 || line.len() > 4096 {
+            return Err(ArenaError::Budget(
+                "ponder trace line budget exceeded".into(),
+            ));
         }
-        let Some((_, record)) = line.split_once("RZ_PONDER_") else {
+        // Only the pinned runner renderer is evidence. Engine stdout/stderr
+        // payloads cannot manufacture policy or drain witnesses.
+        if !line.starts_with("[TRACE ] [") || !line.contains("RZ_PONDER_") {
+            continue;
+        }
+        let message = crate::native_exit::cuda_exit_trace_message(line)
+            .ok_or_else(|| ArenaError::Invalid("ponder trace renderer differs".into()))?;
+        let Some(record) = message.strip_prefix("RZ_PONDER_") else {
             continue;
         };
+        if record.starts_with("FAILURE_V1 ") {
+            return Err(ArenaError::Invalid("ponder cleanup failed".into()));
+        }
         let fields: BTreeMap<_, _> = record
             .split_whitespace()
             .skip(1)
@@ -185,13 +197,20 @@ pub fn audit_ponder_protocol(
             .position(|e| e == name)
             .ok_or_else(|| ArenaError::Invalid("foreign ponder engine".into()))?;
         if record.starts_with("POLICY_V1 ") {
-            if fields.get("enabled") != Some(&"true") {
+            if fields.len() != 2
+                || record.split_whitespace().count() != 3
+                || fields.get("enabled") != Some(&"true")
+            {
                 return Err(ArenaError::Invalid("ponder policy differs".into()));
             }
             policies[index] += 1;
             continue;
         }
-        if !record.starts_with("V1 ") || fields.get("valid") != Some(&"true") {
+        if !record.starts_with("V1 ")
+            || fields.len() != 3
+            || record.split_whitespace().count() != 4
+            || fields.get("valid") != Some(&"true")
+        {
             return Err(ArenaError::Invalid("ponder transition failed".into()));
         }
         match fields.get("event").copied() {

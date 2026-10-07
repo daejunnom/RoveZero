@@ -526,7 +526,10 @@ impl RunManifestV2 {
                     "resource policy owns CUDA visibility; remove conflicting public environment variables",
                 )?;
                 if let EngineEndpointV2::RoveZero(e) = self.engine(allocation.role)? {
-                    let cpu = matches!(e.launch, Some(RoveLaunchV2::Lc0Cpu(_)));
+                    let Some(launch) = e.launch.as_ref() else {
+                        continue;
+                    };
+                    let cpu = matches!(launch, RoveLaunchV2::Lc0Cpu(_));
                     require_v2(
                         cpu == (allocation.kind == EngineComputeKind::Cpu),
                         "native provider differs from compute kind",
@@ -929,6 +932,13 @@ impl LockedManifestV2 {
             v.lock_version == 2 && v.domain == MANIFEST_V2_DOMAIN && !v.execution_ready,
             "wrong V2 lock domain/authority",
         )?;
+        require_v2(
+            v.input
+                .match_execution
+                .as_ref()
+                .is_none_or(|e| e.resolved_resources.is_some()),
+            "locked match is missing its resolved placement",
+        )?;
         let locked = v.input.lock()?;
         require_v2(locked.sha256 == v.input_sha256, "V2 digest mismatch")?;
         Ok(locked)
@@ -961,6 +971,60 @@ mod tests {
         let reread = LockedManifestV2::from_json(&legacy.to_string()).unwrap();
         assert_eq!(reread.sha256(), lock.sha256());
         assert_eq!(reread.to_json().unwrap(), json);
+    }
+    #[test]
+    fn v2_lock_freezes_automatic_placement_and_rejects_missing_or_modified_plan() {
+        use crate::{EngineResourceRequest, MatchHardware, ResourceSharing};
+        let mut input = manifest(ComparisonV2::Fixture);
+        input.resources.cpu_threads = 3;
+        input.resources.affinity = vec![0, 1, 2];
+        input.match_execution = Some(MatchExecutionV1 {
+            ponder: false,
+            sharing: ResourceSharing::Isolated,
+            hardware: MatchHardware {
+                cpu_cores: vec![vec![0], vec![1], vec![2]],
+                gpus: vec![],
+            },
+            engines: [NativeEngineRole::Baseline, NativeEngineRole::Candidate].map(|role| {
+                EngineResourceRequest {
+                    role,
+                    kind: EngineComputeKind::Cpu,
+                    cpu_ids: None,
+                    threads: None,
+                    gpu_ids: None,
+                    gpu_memory_bytes: None,
+                    cpu_weight: None,
+                    gpu_weight: None,
+                }
+            }),
+            executor: input.runner.binary.clone(),
+            resolved_resources: None,
+        });
+        let expected = input.match_execution.as_ref().unwrap().plan().unwrap();
+        let lock = input.lock().unwrap();
+        assert_eq!(
+            lock.input()
+                .match_execution
+                .as_ref()
+                .unwrap()
+                .resolved_resources,
+            Some(expected)
+        );
+        let json = lock.to_json().unwrap();
+        assert_eq!(
+            LockedManifestV2::from_json(&json).unwrap().sha256(),
+            lock.sha256()
+        );
+        let mut changed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        changed["input"]["match_execution"]["resolved_resources"]["engines"][0]["cpu_ids"] =
+            serde_json::json!([2]);
+        assert!(LockedManifestV2::from_json(&changed.to_string()).is_err());
+        let mut removed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        removed["input"]["match_execution"]
+            .as_object_mut()
+            .unwrap()
+            .remove("resolved_resources");
+        assert!(LockedManifestV2::from_json(&removed.to_string()).is_err());
     }
     #[test]
     fn public_environment_budgets_and_native_semantics_are_checked() {

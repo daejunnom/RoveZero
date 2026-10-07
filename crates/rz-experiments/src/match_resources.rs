@@ -79,6 +79,7 @@ pub struct MatchExecutionV1 {
     pub resolved_resources: Option<MatchResourcePlan>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct EngineResourceAllocation {
     pub role: NativeEngineRole,
     pub kind: EngineComputeKind,
@@ -88,6 +89,7 @@ pub struct EngineResourceAllocation {
     pub gpu_memory_bytes: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct MatchResourcePlan {
     pub policy_version: u32,
     pub sharing: ResourceSharing,

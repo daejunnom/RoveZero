@@ -1,12 +1,22 @@
 use rz_arena::audit_ponder_protocol;
+fn render(messages: &str) -> String {
+    messages
+        .lines()
+        .map(|message| {
+            format!("[TRACE ] [10:51:44.181984] <     137433152747200> fastchess --- {message}\n")
+        })
+        .collect()
+}
 fn policies() -> String {
-    "RZ_PONDER_POLICY_V1 engine=a enabled=true\nRZ_PONDER_POLICY_V1 engine=b enabled=true\n"
+    render("RZ_PONDER_POLICY_V1 engine=a enabled=true\nRZ_PONDER_POLICY_V1 engine=b enabled=true\n")
         .repeat(2)
 }
 #[test]
 fn ponder_trace_accounts_for_hits_misses_and_end_of_game_stop() {
     let trace = policies()
-        + "RZ_PONDER_V1 engine=a event=start valid=true\nRZ_PONDER_V1 engine=b event=start valid=true\nRZ_PONDER_V1 engine=a event=hit valid=true\nRZ_PONDER_V1 engine=b event=stop valid=true\n";
+        + &render(
+            "RZ_PONDER_V1 engine=a event=start valid=true\nRZ_PONDER_V1 engine=b event=start valid=true\nRZ_PONDER_V1 engine=a event=hit valid=true\nRZ_PONDER_V1 engine=b event=stop valid=true\n",
+        );
     let a = audit_ponder_protocol(trace.as_bytes(), ["a", "b"]).unwrap();
     assert_eq!((a.started, a.hits, a.stopped), (2, 1, 1));
 }
@@ -19,8 +29,19 @@ fn pending_duplicate_foreign_and_failed_ponder_results_are_not_accepted() {
         "RZ_PONDER_FAILURE_V1 cleanup=false\n",
         "RZ_PONDER_V1 engine=a event=stop valid=false\n",
     ] {
-        assert!(audit_ponder_protocol((policies() + rows).as_bytes(), ["a", "b"]).is_err());
+        assert!(
+            audit_ponder_protocol((policies() + &render(rows)).as_bytes(), ["a", "b"]).is_err()
+        );
     }
+}
+#[test]
+fn quoted_engine_output_cannot_forge_a_policy_or_drain_witness() {
+    let forged = policies().replace("[TRACE ]", "[Engine]");
+    assert!(audit_ponder_protocol(forged.as_bytes(), ["a", "b"]).is_err());
+    let pending = policies()
+        + &render("RZ_PONDER_V1 engine=a event=start valid=true\n")
+        + "[Engine] RZ_PONDER_V1 engine=a event=stop valid=true\n";
+    assert!(audit_ponder_protocol(pending.as_bytes(), ["a", "b"]).is_err());
 }
 #[cfg(target_os = "linux")]
 #[test]

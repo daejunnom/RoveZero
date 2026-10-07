@@ -1319,6 +1319,11 @@ pub(crate) mod linux {
         if spec.provider_name() == "CUDA" {
             limitations.push("CUDA device0/FP32/TF32off/selected arena is requested admission metadata, not measured VRAM, aggregate GPU allocation or a kernel-enforced hard cap".into());
         }
+        if let Some(execution) = spec.match_execution() {
+            limitations[0] = "V2 locked CPU/GPU/Hybrid paired execution; execution_ready=false; strength_eligible=false; comparisons follow the declared model/search/resource identities".into();
+            limitations[6] = "same-PID executor installs and reads back runner/engine CPU affinity; aggregate RAM still requires recorded inherited enforcement".into();
+            limitations.push(format!("Ponder={}; sharing={:?}; CUDA visibility is trusted-engine placement; GPU memory reservations and compute sharing are not hard allocator/compute quotas", execution.ponder, execution.sharing));
+        }
         Ok(FastchessInvocation { args, limitations })
     }
 
