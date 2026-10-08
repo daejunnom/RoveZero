@@ -45,6 +45,7 @@ mod producer;
 #[cfg(feature = "pals-collection-onnx")]
 pub use native::{
     OwnPalsOnnxCollectionDriver, PalsCollectionGraphPin, PalsNativeCollectionRegistry,
+    PalsNativeRefinementRegistration,
 };
 pub use producer::{
     CheckedProducerOwner, PalsProducerCollectionConfig, RegisteredProducerHandle,

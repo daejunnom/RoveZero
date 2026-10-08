@@ -6,7 +6,8 @@ use rz_eval::error::BackendError;
 use rz_eval::pals_model::PalsRawOutput;
 use rz_eval::pals_onnx::PalsOnnxConfig;
 use rz_eval::runtime_pin::RuntimeLibraryPin;
-use rz_search::pals::engine::{PALS_SEARCH_VERSION, RoleError};
+use rz_experiments::PalsSearchPolicyIdentityV3;
+use rz_search::pals::engine::{PALS_SEARCH_VERSION, PostRepairRecheckPolicy, RoleError};
 use rz_uci::pals_native::{
     NativePreparedContext, NativeQueryKind, NativeRoleFinishHandle, NativeRoleModel,
     NativeRoleObserver, NativeRoleRejection,
@@ -17,6 +18,8 @@ use std::sync::{Arc, Mutex};
 mod divergence;
 
 const REGISTRY_VERSION: &str = "rz-pals-native-collection-registry/1";
+const REFINEMENT_REGISTRATION_VERSION: &str = "rz-pals-native-refinement-registration/1";
+const MAX_REFINEMENT_REGISTRATION_BYTES: usize = 32 * 1024;
 const RAW_RESERVE: u64 = 128 * 1024;
 const STAGE_RESERVE: u64 = 32 * 1024;
 
@@ -142,6 +145,152 @@ impl PalsNativeCollectionRegistry {
         };
         sources.validate()?;
         Ok(sources)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RefinementRegistrationWire {
+    version: String,
+    base_registry_canonical_sha256: String,
+    collector_binary_sha256: String,
+    search_policy: PalsSearchPolicyIdentityV3,
+}
+
+/// Immutable independent registration, admitted from the exact same bounded
+/// bytes that were hashed and decoded. No public mutable fields or Deserialize
+/// implementation can attach a retained pin to caller-constructed contents.
+/// This is policy/source registration only, never a Reply execution witness.
+#[derive(Clone, Debug)]
+pub struct PalsNativeRefinementRegistration {
+    wire: RefinementRegistrationWire,
+    raw_sha256: String,
+}
+impl Serialize for PalsNativeRefinementRegistration {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.wire.serialize(serializer)
+    }
+}
+impl PalsNativeRefinementRegistration {
+    pub fn from_registration_bytes(
+        bytes: &[u8],
+        expected_sha256: &str,
+    ) -> Result<Self, ArenaError> {
+        if bytes.is_empty()
+            || bytes.len() > MAX_REFINEMENT_REGISTRATION_BYTES
+            || !valid_sha(expected_sha256)
+            || format!("{:x}", Sha256::digest(bytes)) != expected_sha256
+        {
+            return Err(invalid(
+                "refinement registration bounded bytes differ from the independent raw pin",
+            ));
+        }
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| invalid("refinement registration is not UTF-8"))?;
+        let wire: RefinementRegistrationWire = crate::decode_json(text)?;
+        if wire.version != REFINEMENT_REGISTRATION_VERSION
+            || !valid_sha(&wire.base_registry_canonical_sha256)
+            || !valid_sha(&wire.collector_binary_sha256)
+        {
+            return Err(invalid("invalid closed native refinement registration"));
+        }
+        wire.search_policy
+            .validate()
+            .map_err(|e| invalid(e.to_string()))?;
+        Ok(Self {
+            wire,
+            raw_sha256: expected_sha256.into(),
+        })
+    }
+    pub fn read_pinned(path: &Path, expected_sha256: &str) -> Result<Self, ArenaError> {
+        let private_path = path.components().any(|part| {
+            let name = part.as_os_str().to_string_lossy().to_ascii_lowercase();
+            name == ".env"
+                || name.starts_with(".env.")
+                || name.contains("credential")
+                || name.contains("service-account")
+                || name.contains("service_account")
+                || name.starts_with("id_ed25519")
+                || name.starts_with("id_rsa")
+                || name.ends_with(".key")
+                || name.ends_with(".pem")
+        });
+        if !path.is_absolute() || private_path || !valid_sha(expected_sha256) {
+            return Err(invalid(
+                "refinement registration requires an absolute public data path and independent SHA256",
+            ));
+        }
+        let file = File::open(path).map_err(io)?;
+        let metadata = file.metadata().map_err(io)?;
+        if !metadata.is_file()
+            || metadata.len() == 0
+            || metadata.len() > MAX_REFINEMENT_REGISTRATION_BYTES as u64
+        {
+            return Err(invalid(
+                "refinement registration handle is not a bounded nonempty regular file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_REFINEMENT_REGISTRATION_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(io)?;
+        Self::from_registration_bytes(&bytes, expected_sha256)
+    }
+    pub fn validate_against(&self, base: &PalsNativeCollectionRegistry) -> Result<(), ArenaError> {
+        base.validate()?;
+        self.wire
+            .search_policy
+            .validate()
+            .map_err(|e| invalid(e.to_string()))?;
+        if self.wire.version != REFINEMENT_REGISTRATION_VERSION
+            || !valid_sha(&self.raw_sha256)
+            || self.wire.base_registry_canonical_sha256 != canonical_sha256(base)?
+            || self.wire.collector_binary_sha256 != base.collector_binary_sha256
+        {
+            return Err(invalid(
+                "refinement registration base registry or collector binary binding differs",
+            ));
+        }
+        Ok(())
+    }
+    pub fn raw_sha256(&self) -> &str {
+        &self.raw_sha256
+    }
+}
+
+fn observed_refinement_selection(
+    registration: Option<&PalsNativeRefinementRegistration>,
+    actual_policy: PostRepairRecheckPolicy,
+    actual_search_identity: &str,
+    actual_conditions: Option<&str>,
+) -> Result<Option<PalsSearchPolicyIdentityV3>, ArenaError> {
+    match (registration, actual_policy) {
+        (None, PostRepairRecheckPolicy::Disabled)
+            if actual_search_identity == PALS_SEARCH_VERSION && actual_conditions.is_none() =>
+        {
+            Ok(None)
+        }
+        (Some(registration), PostRepairRecheckPolicy::SameRepairedLineOnceV1) => {
+            let conditions = actual_conditions.ok_or_else(|| {
+                invalid("actual selected engine refinement conditions are absent")
+            })?;
+            let observed = PalsSearchPolicyIdentityV3 {
+                version: rz_experiments::PALS_POST_REPAIR_RECHECK_V3_VERSION.into(),
+                policy: rz_experiments::PALS_POST_REPAIR_RECHECK_V3_POLICY.into(),
+                search_identity: actual_search_identity.into(),
+                conditions_sha256: Sha256::digest(conditions.as_bytes()).into(),
+            };
+            observed.validate().map_err(|e| invalid(e.to_string()))?;
+            if observed != registration.wire.search_policy {
+                return Err(invalid(
+                    "actual engine refinement getters differ from independently registered policy",
+                ));
+            }
+            Ok(Some(observed))
+        }
+        _ => Err(invalid(
+            "actual engine refinement selection differs from explicit independent registration",
+        )),
     }
 }
 
@@ -719,7 +868,49 @@ impl OwnPalsOnnxCollectionDriver {
         pals: PalsConfig,
         max_rounds: u64,
     ) -> Result<Self, ArenaError> {
+        Self::load_cpu_selected(
+            export, checkpoint, pin, registry, cpu, pals, max_rounds, None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_cpu_with_refinement_policy(
+        export: &Path,
+        checkpoint: &Path,
+        pin: &RuntimeLibraryPin,
+        registry: &PalsNativeCollectionRegistry,
+        cpu: CpuConfig,
+        pals: PalsConfig,
+        max_rounds: u64,
+        registration: &PalsNativeRefinementRegistration,
+    ) -> Result<Self, ArenaError> {
+        Self::load_cpu_selected(
+            export,
+            checkpoint,
+            pin,
+            registry,
+            cpu,
+            pals,
+            max_rounds,
+            Some(registration),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn load_cpu_selected(
+        export: &Path,
+        checkpoint: &Path,
+        pin: &RuntimeLibraryPin,
+        registry: &PalsNativeCollectionRegistry,
+        cpu: CpuConfig,
+        pals: PalsConfig,
+        max_rounds: u64,
+        registration: Option<&PalsNativeRefinementRegistration>,
+    ) -> Result<Self, ArenaError> {
         registry.validate()?;
+        // Validate the independent policy/base/binary registration before CPU
+        // owner construction or runtime/model loading; no implicit fallback.
+        if let Some(registration) = registration {
+            registration.validate_against(registry)?;
+        }
         pals.validate().map_err(|e| invalid(e.to_string()))?;
         if !(1..=16).contains(&max_rounds) {
             return Err(invalid("native collection max rounds must be 1..=16"));
@@ -791,7 +982,7 @@ impl OwnPalsOnnxCollectionDriver {
         }
         let configuration = serde_json::to_value(&identity.model_configuration)
             .map_err(|e| invalid(e.to_string()))?;
-        let description = PalsCollectionSourceDescription {
+        let mut description = PalsCollectionSourceDescription {
             mode: "own-pals-onnx-untrained-cpu".into(),
             source: PalsInputSource::OwnPals {
                 model_configuration_sha256: registry.model_configuration_sha256.clone(),
@@ -828,7 +1019,49 @@ impl OwnPalsOnnxCollectionDriver {
         model
             .set_observer(Box::new(Observer(Arc::clone(&sink))))
             .map_err(|e| invalid(e.to_string()))?;
-        let engine = PalsEngine::new(pals, model, cpu).map_err(|e| invalid(e.to_string()))?;
+        let engine = match registration {
+            None => PalsEngine::new(pals, model, cpu),
+            Some(_) => PalsEngine::new_with_cpu_and_refinement_policy(
+                pals,
+                model,
+                cpu,
+                PostRepairRecheckPolicy::SameRepairedLineOnceV1,
+            ),
+        }
+        .map_err(|e| invalid(e.to_string()))?;
+        let observed = observed_refinement_selection(
+            registration,
+            engine.post_repair_recheck_policy(),
+            engine.search_identity(),
+            engine.refinement_conditions(),
+        )?;
+        if let (Some(registration), Some(observed)) = (registration, observed) {
+            let facts = description
+                .native
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| invalid("loaded native source description is absent"))?;
+            facts.insert(
+                "refinement_registration".into(),
+                serde_json::to_value(registration).map_err(|e| invalid(e.to_string()))?,
+            );
+            facts.insert(
+                "refinement_registration_sha256".into(),
+                serde_json::json!(registration.raw_sha256()),
+            );
+            facts.insert(
+                "pals_search_policy".into(),
+                serde_json::to_value(observed).map_err(|e| invalid(e.to_string()))?,
+            );
+            facts.insert(
+                "search_version".into(),
+                serde_json::json!(engine.search_identity()),
+            );
+            checked_source(&description)?;
+            sink.lock()
+                .map_err(|_| invalid("native collector sink poisoned during source binding"))?
+                .source = description.clone();
+        }
         Ok(Self {
             engine,
             finish,
@@ -899,6 +1132,13 @@ impl PalsCollectionDriver for OwnPalsOnnxCollectionDriver {
                 .map_err(|_| invalid("native collector sink poisoned"))?;
             if s.context.is_some() || !s.trace.rows.is_empty() {
                 return Err(invalid("prior native trace was not drained"));
+            }
+            if self.engine.post_repair_recheck_policy() != PostRepairRecheckPolicy::Disabled
+                && s.producer.is_none()
+            {
+                return Err(invalid(
+                    "explicit recheck cannot dispatch without a source-bound strict producer handle",
+                ));
             }
             s.trace.sequence = context.sequence;
             s.context = Some(context);
@@ -1030,6 +1270,224 @@ mod tests {
     use rz_contracts::ProcessEpoch;
     use rz_search::pals::engine::{DivergenceQuery, RoleQuery};
     use rz_uci::pals_native::{prepare_divergence_input, prepare_role_input};
+
+    fn refinement_base() -> PalsNativeCollectionRegistry {
+        let model_configuration = PalsModelConfig::baseline();
+        PalsNativeCollectionRegistry {
+            version: REGISTRY_VERSION.into(),
+            collector_binary_sha256: "01".repeat(32),
+            model_configuration_sha256: canonical_sha256(&model_configuration).unwrap(),
+            model_configuration,
+            checkpoint_sha256: "02".repeat(32),
+            export_manifest_sha256: "03".repeat(32),
+            graphs: vec![PalsCollectionGraphPin {
+                role: "public".into(),
+                sha256: "04".repeat(32),
+                serialized_bytes: 1024,
+            }],
+            runtime_sha256: "05".repeat(32),
+            encoding_sha256: "06".repeat(32),
+            encoder_source_sha256: "07".repeat(32),
+            cpu_configuration_sha256: "08".repeat(32),
+            frozen_epoch: 1,
+            training_state: "untrained".into(),
+            provider: "cpu".into(),
+            intra_threads: 1,
+            cache_public_memory: false,
+        }
+    }
+    fn refinement_bytes(base: &PalsNativeCollectionRegistry) -> Vec<u8> {
+        serde_json::to_vec(&RefinementRegistrationWire {
+            version: REFINEMENT_REGISTRATION_VERSION.into(),
+            base_registry_canonical_sha256: canonical_sha256(base).unwrap(),
+            collector_binary_sha256: base.collector_binary_sha256.clone(),
+            search_policy: PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1(),
+        })
+        .unwrap()
+    }
+    fn admitted_refinement(bytes: &[u8]) -> Result<PalsNativeRefinementRegistration, ArenaError> {
+        PalsNativeRefinementRegistration::from_registration_bytes(
+            bytes,
+            &format!("{:x}", Sha256::digest(bytes)),
+        )
+    }
+
+    #[test]
+    fn refinement_registration_retains_actual_raw_pin_and_preserves_base_registry_wire() {
+        let base = refinement_base();
+        let before = serde_json::to_vec(&base).unwrap();
+        let canonical_before = canonical_sha256(&base).unwrap();
+        let bytes = refinement_bytes(&base);
+        let registration = admitted_refinement(&bytes).unwrap();
+        registration.validate_against(&base).unwrap();
+        assert_eq!(
+            registration.raw_sha256(),
+            format!("{:x}", Sha256::digest(&bytes))
+        );
+        assert_eq!(serde_json::to_vec(&registration).unwrap(), bytes);
+        assert_eq!(serde_json::to_vec(&base).unwrap(), before);
+        assert_eq!(canonical_sha256(&base).unwrap(), canonical_before);
+        assert!(
+            !serde_json::to_value(&base)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("pals_search_policy")
+        );
+    }
+
+    #[test]
+    fn refinement_registration_rejects_raw_pin_size_duplicate_unknown_null_and_policy_forgery() {
+        let base = refinement_base();
+        let bytes = refinement_bytes(&base);
+        assert!(
+            PalsNativeRefinementRegistration::from_registration_bytes(&bytes, &"09".repeat(32))
+                .is_err()
+        );
+        assert!(admitted_refinement(&[]).is_err());
+        assert!(admitted_refinement(&vec![b' '; MAX_REFINEMENT_REGISTRATION_BYTES + 1]).is_err());
+        let original: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for changed in [
+            {
+                let mut v = original.clone();
+                v["extra"] = serde_json::json!(true);
+                v
+            },
+            {
+                let mut v = original.clone();
+                v["search_policy"] = serde_json::Value::Null;
+                v
+            },
+            {
+                let mut v = original.clone();
+                v["search_policy"]["policy"] = serde_json::json!("disabled");
+                v
+            },
+            {
+                let mut v = original.clone();
+                v["search_policy"]["conditions_sha256"] = serde_json::json!([0]);
+                v
+            },
+            {
+                let mut v = original.clone();
+                v["collector_binary_sha256"] = serde_json::json!("AA".repeat(32));
+                v
+            },
+        ] {
+            assert!(admitted_refinement(&serde_json::to_vec(&changed).unwrap()).is_err());
+        }
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let duplicate = text.replacen(
+            "\"version\":",
+            "\"version\":\"rz-pals-native-refinement-registration/1\",\"version\":",
+            1,
+        );
+        assert!(admitted_refinement(duplicate.as_bytes()).is_err());
+        let duplicate_nested = text.replacen(
+            "\"policy\":",
+            "\"policy\":\"same_repaired_line_once_v1\",\"policy\":",
+            1,
+        );
+        assert!(admitted_refinement(duplicate_nested.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn refinement_registration_binds_registry_canonical_identity_and_binary_separately() {
+        let base = refinement_base();
+        let registration = admitted_refinement(&refinement_bytes(&base)).unwrap();
+        let mut changed = base.clone();
+        changed.cache_public_memory = true;
+        assert!(registration.validate_against(&changed).is_err());
+        let mut wire: RefinementRegistrationWire =
+            serde_json::from_slice(&refinement_bytes(&base)).unwrap();
+        wire.collector_binary_sha256 = "09".repeat(32);
+        let independent = admitted_refinement(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        assert!(independent.validate_against(&base).is_err());
+    }
+
+    #[test]
+    fn refinement_selection_checks_actual_engine_identity_conditions_and_legacy_disabled() {
+        use rz_search::pals::engine::{
+            POST_REPAIR_RECHECK_CONDITIONS, POST_REPAIR_RECHECK_SEARCH_VERSION,
+        };
+        let base = refinement_base();
+        let registration = admitted_refinement(&refinement_bytes(&base)).unwrap();
+        assert_eq!(
+            observed_refinement_selection(
+                None,
+                PostRepairRecheckPolicy::Disabled,
+                PALS_SEARCH_VERSION,
+                None
+            )
+            .unwrap(),
+            None
+        );
+        let observed = observed_refinement_selection(
+            Some(&registration),
+            PostRepairRecheckPolicy::SameRepairedLineOnceV1,
+            POST_REPAIR_RECHECK_SEARCH_VERSION,
+            Some(POST_REPAIR_RECHECK_CONDITIONS),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            observed,
+            PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1()
+        );
+        assert!(
+            observed_refinement_selection(
+                None,
+                PostRepairRecheckPolicy::SameRepairedLineOnceV1,
+                POST_REPAIR_RECHECK_SEARCH_VERSION,
+                Some(POST_REPAIR_RECHECK_CONDITIONS)
+            )
+            .is_err()
+        );
+        assert!(
+            observed_refinement_selection(
+                Some(&registration),
+                PostRepairRecheckPolicy::Disabled,
+                PALS_SEARCH_VERSION,
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            observed_refinement_selection(
+                Some(&registration),
+                PostRepairRecheckPolicy::SameRepairedLineOnceV1,
+                PALS_SEARCH_VERSION,
+                Some(POST_REPAIR_RECHECK_CONDITIONS)
+            )
+            .is_err()
+        );
+        assert!(
+            observed_refinement_selection(
+                Some(&registration),
+                PostRepairRecheckPolicy::SameRepairedLineOnceV1,
+                POST_REPAIR_RECHECK_SEARCH_VERSION,
+                Some("changed conditions")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn producer_checked_source_pin_covers_optional_refinement_registration_facts() {
+        let shared = sink(&Position::startpos(), 1024 * 1024);
+        let handle = fixture_producer(&shared, 32 * 1024);
+        let mut source = shared.lock().unwrap().source.clone();
+        handle.verify_source(&source).unwrap();
+        let base = refinement_base();
+        let registration = admitted_refinement(&refinement_bytes(&base)).unwrap();
+        source.native = Some(serde_json::json!({
+            "refinement_registration":registration,
+            "refinement_registration_sha256":registration.raw_sha256(),
+            "pals_search_policy":PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1(),
+            "search_version":rz_search::pals::engine::POST_REPAIR_RECHECK_SEARCH_VERSION,
+        }));
+        assert!(handle.verify_source(&source).is_err());
+    }
 
     static NEXT_NATIVE_OUTPUT: AtomicU64 = AtomicU64::new(1);
     struct NativeTestOutput(PathBuf);

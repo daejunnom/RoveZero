@@ -6,7 +6,9 @@ use rz_arena::pals_collect::{
     pals_producer_registration_description, validate_pals_collection_output,
 };
 #[cfg(feature = "pals-collection-onnx")]
-use rz_arena::pals_collect::{OwnPalsOnnxCollectionDriver, PalsNativeCollectionRegistry};
+use rz_arena::pals_collect::{
+    OwnPalsOnnxCollectionDriver, PalsNativeCollectionRegistry, PalsNativeRefinementRegistration,
+};
 #[cfg(feature = "pals-collection-onnx")]
 use rz_eval::runtime_pin::RuntimeCache;
 use rz_experiments::PalsSplit;
@@ -29,6 +31,8 @@ fn usage() {
         [--beam-width N] [--line-plies N] [--max-role-calls N] [--pals-rounds N]\n\
         [--producer-registration ABSOLUTE --producer-registration-sha256 SHA256]\n\
         [--producer-journal-bytes N --producer-capture-bytes N]\n\
+        [--post-repair-recheck same-repaired-line-once-v1\n\
+         --refinement-registration ABSOLUTE --refinement-registration-sha256 SHA256]\n\
         CPU/mock sources have no neural weights. Limits are mandatory finite defaults.\n\
         Actual ONNX mode accepts independently registered Untrained P/C on explicit CPU only.\n\
         --describe-registration prints read-only executable/CPU/encoder/model-config facts and exits.\n\
@@ -37,6 +41,43 @@ fn usage() {
         Output preserves seals, actual native tensors, physical raw/delivery/consumption, masks, PGN and failure receipt."
     );
 }
+
+// Selection admission precedes every owner/runtime/model dispatch. The only
+// non-strict exception is read-only producer-registration bootstrap metadata.
+fn validate_refinement_cli(
+    mode: &str,
+    provider: Option<&str>,
+    policy: Option<&str>,
+    registration: Option<&PathBuf>,
+    registration_sha256: Option<&str>,
+    strict_producer: bool,
+    describe_producer: bool,
+) -> Result<bool, String> {
+    match (policy, registration, registration_sha256) {
+        (None, None, None) => Ok(false),
+        (Some("same-repaired-line-once-v1"), Some(path), Some(sha)) => {
+            if mode != "pals-onnx" || provider != Some("cpu") || !path.is_absolute()
+                || sha.len() != 64
+                || !sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+                return Err("explicit recheck requires CPU pals-onnx, an absolute registration and exact lowercase SHA256".into());
+            }
+            if !strict_producer && !describe_producer {
+                return Err("explicit recheck collection requires independent strict producer registration".into());
+            }
+            Ok(true)
+        }
+        _ => Err("post-Repair selection requires the exact policy, registration path and independent SHA256 together".into()),
+    }
+}
+
+fn set_refinement_arg<T>(slot: &mut Option<T>, value: T, flag: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(format!("duplicate {flag}"));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
 fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let mut config = PalsCollectionConfig::default();
     let mut output = None;
@@ -48,6 +89,9 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let mut runtime_cache = None;
     let mut source_registry = None;
     let mut source_registry_sha256 = None;
+    let mut post_repair_recheck = None;
+    let mut refinement_registration = None;
+    let mut refinement_registration_sha256 = None;
     let mut producer_registration = None;
     let mut producer_registration_sha256 = None;
     let mut producer_journal_bytes = None;
@@ -85,6 +129,15 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             "--runtime-cache" => runtime_cache = Some(PathBuf::from(value)),
             "--source-registry" => source_registry = Some(PathBuf::from(value)),
             "--source-registry-sha256" => source_registry_sha256 = Some(value),
+            "--post-repair-recheck" => {
+                set_refinement_arg(&mut post_repair_recheck, value, &flag)?;
+            }
+            "--refinement-registration" => {
+                set_refinement_arg(&mut refinement_registration, PathBuf::from(value), &flag)?;
+            }
+            "--refinement-registration-sha256" => {
+                set_refinement_arg(&mut refinement_registration_sha256, value, &flag)?;
+            }
             "--producer-registration" => producer_registration = Some(PathBuf::from(value)),
             "--producer-registration-sha256" => producer_registration_sha256 = Some(value),
             "--producer-journal-bytes" => producer_journal_bytes = Some(value.parse::<u64>()?),
@@ -125,6 +178,15 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             _ => return Err(format!("unknown argument {flag}").into()),
         }
     }
+    let recheck_selected = validate_refinement_cli(
+        &mode,
+        provider.as_deref(),
+        post_repair_recheck.as_deref(),
+        refinement_registration.as_ref(),
+        refinement_registration_sha256.as_deref(),
+        producer_registration.is_some() && producer_registration_sha256.is_some(),
+        describe_producer.is_some(),
+    )?;
     if describe_producer.is_some()
         && (producer_registration.is_some()
             || producer_registration_sha256.is_some()
@@ -168,7 +230,8 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         || runtime.is_some()
         || runtime_cache.is_some()
         || source_registry.is_some()
-        || source_registry_sha256.is_some();
+        || source_registry_sha256.is_some()
+        || recheck_selected;
     if mode != "pals-onnx" && native_flags {
         return Err(
             "native assets/provider flags require pals-onnx; no weights source downcast".into(),
@@ -202,6 +265,20 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                         .as_deref()
                         .ok_or("--source-registry-sha256 is required")?,
                 )?;
+                let refinement = if recheck_selected {
+                    let registration = PalsNativeRefinementRegistration::read_pinned(
+                        refinement_registration
+                            .as_deref()
+                            .ok_or("--refinement-registration is required")?,
+                        refinement_registration_sha256
+                            .as_deref()
+                            .ok_or("--refinement-registration-sha256 is required")?,
+                    )?;
+                    registration.validate_against(&expected)?;
+                    Some(registration)
+                } else {
+                    None
+                };
                 let cache = match runtime_cache {
                     Some(path) => RuntimeCache::open(&path)?,
                     None => RuntimeCache::for_user()?,
@@ -211,15 +288,31 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                     return Err("--runtime must be absolute".into());
                 }
                 let pin = cache.library(&runtime, &expected.runtime_sha256)?;
-                let driver = Box::new(OwnPalsOnnxCollectionDriver::load_cpu(
-                    export.as_deref().ok_or("--export is required")?,
-                    checkpoint.as_deref().ok_or("--checkpoint is required")?,
-                    &pin,
-                    &expected,
-                    CpuConfig::default(),
-                    pals,
-                    pals_rounds,
-                )?);
+                let export = export.as_deref().ok_or("--export is required")?;
+                let checkpoint = checkpoint.as_deref().ok_or("--checkpoint is required")?;
+                let driver = Box::new(match refinement.as_ref() {
+                    None => OwnPalsOnnxCollectionDriver::load_cpu(
+                        export,
+                        checkpoint,
+                        &pin,
+                        &expected,
+                        CpuConfig::default(),
+                        pals,
+                        pals_rounds,
+                    )?,
+                    Some(registration) => {
+                        OwnPalsOnnxCollectionDriver::load_cpu_with_refinement_policy(
+                            export,
+                            checkpoint,
+                            &pin,
+                            &expected,
+                            CpuConfig::default(),
+                            pals,
+                            pals_rounds,
+                            registration,
+                        )?
+                    }
+                });
                 (driver, expected.owned_sources()?)
             }
             #[cfg(not(feature = "pals-collection-onnx"))]
@@ -271,5 +364,186 @@ fn main() {
             eprintln!("pals_collect: {error}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn public_registration() -> PathBuf {
+        std::env::temp_dir().join("public-refinement-registration.json")
+    }
+
+    #[test]
+    fn refinement_cli_preserves_absent_legacy_selection() {
+        for mode in ["cpu", "pals-mock", "pals-onnx"] {
+            assert!(!validate_refinement_cli(mode, None, None, None, None, false, false).unwrap());
+        }
+    }
+
+    #[test]
+    fn refinement_cli_admits_strict_collection_and_metadata_bootstrap_only() {
+        let path = public_registration();
+        let sha = "07".repeat(32);
+        for (strict, bootstrap) in [(true, false), (false, true)] {
+            assert!(
+                validate_refinement_cli(
+                    "pals-onnx",
+                    Some("cpu"),
+                    Some("same-repaired-line-once-v1"),
+                    Some(&path),
+                    Some(&sha),
+                    strict,
+                    bootstrap
+                )
+                .unwrap()
+            );
+        }
+        assert!(
+            validate_refinement_cli(
+                "pals-onnx",
+                Some("cpu"),
+                Some("same-repaired-line-once-v1"),
+                Some(&path),
+                Some(&sha),
+                false,
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn refinement_cli_rejects_partial_alias_provider_and_pin_drift() {
+        let path = public_registration();
+        let sha = "07".repeat(32);
+        let selected = Some("same-repaired-line-once-v1");
+        for policy in [
+            None,
+            Some("disabled"),
+            Some("same_repaired_line_once_v1"),
+            Some("unknown"),
+        ] {
+            assert!(
+                validate_refinement_cli(
+                    "pals-onnx",
+                    Some("cpu"),
+                    policy,
+                    Some(&path),
+                    Some(&sha),
+                    true,
+                    false
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_refinement_cli(
+                "pals-onnx",
+                Some("cpu"),
+                selected,
+                None,
+                Some(&sha),
+                true,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_refinement_cli(
+                "pals-onnx",
+                Some("cpu"),
+                selected,
+                Some(&path),
+                None,
+                true,
+                false
+            )
+            .is_err()
+        );
+        for (mode, provider) in [
+            ("cpu", Some("cpu")),
+            ("pals-mock", Some("cpu")),
+            ("pals-onnx", Some("cuda")),
+            ("pals-onnx", None),
+        ] {
+            assert!(
+                validate_refinement_cli(
+                    mode,
+                    provider,
+                    selected,
+                    Some(&path),
+                    Some(&sha),
+                    true,
+                    false
+                )
+                .is_err()
+            );
+        }
+        let relative = PathBuf::from("relative.json");
+        assert!(
+            validate_refinement_cli(
+                "pals-onnx",
+                Some("cpu"),
+                selected,
+                Some(&relative),
+                Some(&sha),
+                true,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_refinement_cli(
+                "pals-onnx",
+                Some("cpu"),
+                selected,
+                Some(&path),
+                Some("00"),
+                true,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_refinement_cli(
+                "pals-onnx",
+                Some("cpu"),
+                selected,
+                Some(&path),
+                Some(&"AA".repeat(32)),
+                true,
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn refinement_flags_reject_duplicate_without_overwriting_first_value() {
+        let mut policy = None;
+        set_refinement_arg(&mut policy, "first".to_owned(), "--post-repair-recheck").unwrap();
+        assert!(
+            set_refinement_arg(&mut policy, "second".to_owned(), "--post-repair-recheck").is_err()
+        );
+        assert_eq!(policy.as_deref(), Some("first"));
+        let mut path = Some(public_registration());
+        assert!(
+            set_refinement_arg(
+                &mut path,
+                PathBuf::from("other.json"),
+                "--refinement-registration"
+            )
+            .is_err()
+        );
+        let mut sha = Some("07".repeat(32));
+        assert!(
+            set_refinement_arg(
+                &mut sha,
+                "08".repeat(32),
+                "--refinement-registration-sha256"
+            )
+            .is_err()
+        );
     }
 }
