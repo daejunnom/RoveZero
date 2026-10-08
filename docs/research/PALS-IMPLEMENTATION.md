@@ -1888,3 +1888,44 @@ focused fixture는 바로 이 최종 경계에 늦은 취소와 만료를 넣는
 실행 인수로 해석하지 않는다. CLI/driver·manifest/arena·collector의 선택과 receipt
 연결은 별도 소비자 단위이며, 이 engine 단위만으로 제품에서 선택 가능하다고
 보고하지 않는다. 특히 early/unknown PalsResult에는 정책 식별 필드가 없다.
+
+이 engine source `2367174552e3553d9bc11168e410b2b5cf96bf74`의
+CI `37723109129`에서는 Linux·Windows Rust 및 CPU bindings 성공과 Linux의
+post-repair 집중 검사 7개 실제 `ok`를 확인했다. Windows는 2026-10-08 03:38:28 UTC에
+완료됐다. PALS Python suite는 359개 중 native slot Repair 소비자에서
+16개 실패·1개 오류로 끝났다. 기존 닫힌 source-pair 등록이 이전 engine byte pin만
+허용하여 새 source를 `unreviewed_collector_transition_source_pair`로 거절한 것이다.
+이를 일반 NN/대국 성공이나 새 정책 소비자 연결 실패와 혼동하지 않는다. 새 engine의
+기본 Disabled 경로와 변경되지 않은 collector의 실제 constructor를 대조한 후에만
+새 exact source pair를 등록하며, 미검토 source 거절과 과거 pair 읽기를 유지한다.
+
+### Device record planner와 전체 backing 소유 예약의 첫 Rust 단위
+
+`rz-eval`의 `device_pages_plan`은 sealed backing·certified slice·순서 있는 fixed
+ports·전체 owner bank·유한 예약을 분리한다. 현재 유일한 구현은 immutable CPU
+fixture backing이다. CUDA namespace는 선언이며 CUDA owner factory, packing Run,
+private P/C native consumer, device fence·물리 완료·quarantine 연결은 아직 없다.
+기존 두 graph manifest guard와 CLI·native 통계를 변경하지 않는다.
+
+projection reference는 비소유 key·generation·offset이며 실제 plan만 고유 whole
+owner pin을 획득한다. 중복 record의 입력 순서와 port는 유지하고, 전체 backing
+capacity를 한 번 청구한다. 인증한 slice만 게시하며 0-record view는 실제 zero-feature
+projection과 false mask를 요구한다. cache hit에서도 pending public block·join·내부
+node·control·private output overlap·세 session의 예약은 줄이지 않는다. session 및
+추가 metadata의 unknown/0 선언은 성공적인 0-byte 값으로 대체하지 않는다.
+
+독립 검토에서 같은 namespace의 다른 registry가 외부 plan을 인수하면 그 plan이
+보유한 backing 비용을 누락하는 문제를 발견했다. private checked instance seal을
+registry·plan·Copy offset에 함께 묶고, actual origin을 lookup·pin·예약 전에 검사해
+수정했다. 의미 projection/cache namespace에는 seal을 넣지 않는다. UID overflow는
+typed 거절이며 clear 또는 이후 할당 실패에서 ID를 재사용하지 않는다.
+
+focused Rust fixture는 기존 10개와 cross-registry·재구성 backing·UID 소진 3개를
+합쳐 13개다. 수정본의 독립 delta 검토와 파일별 Rust 2021 fmt는 통과했으며 실제
+fixture 실행은 후속 CI에서 인수한다. packing node 최대 payload 산술 합 1,142,291 B,
+그중 별도 joined/final owner를 뺀 내부 합 943,634 B는 정적 예약 근거다. allocator,
+workspace, 실제 peak 또는 VRAM 측정값으로 해석하지 않는다.
+
+기존 CPU04 frozen preparation과 historical binary는 이번 engine·UCI·backend source
+변경 후 현재 source 등록으로 재사용하지 않는다. 실제 준비를 재개할 때 source 전후
+pin과 새 binary 등록을 다시 확인하며, 이전 명세와 실패·중단 자료는 보존한다.

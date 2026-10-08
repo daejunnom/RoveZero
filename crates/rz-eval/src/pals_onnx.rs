@@ -30,11 +30,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 mod cuda_control;
+mod device_pages_plan;
 mod public_pages;
 mod warm;
 pub use cuda_control::{
     PalsControlTransfer, PalsControlTransferKind, PalsCudaControlPolicy, PalsCudaPlacementWitness,
     PalsGraphOptimization, PalsGraphPlacement, PalsKernelWitness,
+};
+pub use device_pages_plan::{
+    device_packing_maximum_node_payload_sum, CpuOwnedPublicBacking, DevicePageDomain,
+    DevicePageError, DevicePageInvocationDeclaration, DevicePageNamespace, DevicePagePayload,
+    DevicePagePlan, DevicePageReservation, DevicePagesLimits, DevicePagesRegistry,
+    DeviceProjectionOffset, DevicePublicBacking, DevicePublicBlock, DevicePublicBlockDescriptor,
+    DEVICE_PAGE_RECORD_CAPACITY,
 };
 pub use public_pages::{HostRecordPagePolicy, HostRecordPageSnapshot, HostRecordPageStats};
 pub use warm::{
