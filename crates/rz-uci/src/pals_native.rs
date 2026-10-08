@@ -1,5 +1,10 @@
 //! Exact Rules-to-PALS model composition and a single native physical owner.
 //! P/C heads cross the typed PALS scheduler; Python is never a product callback.
+pub use rz_eval::pals_device_resources::{
+    NativeCudaPackingArtifactResourcesInput, NativeCudaPackingGraphInspectionInput,
+    NativeCudaRecordPagePayloadDeclaration, NativeCudaRecordPagesInvocationInput,
+    NativeCudaRecordPagesLimitsInput, NativeCudaRecordPagesResourceInput,
+};
 use rz_eval::pals_model::{
     PalsCandidateToken, PalsModelConfig, PalsModelInput, PalsRecordToken, PalsRole,
 };
@@ -597,6 +602,8 @@ mod native {
         last_failure: Mutex<Option<NativeFailureReceipt>>,
         final_stats: Mutex<Option<NativeBackendStatsReceipt>>,
         stats_lease: Mutex<Option<NativePhysicalLease>>,
+        cuda_record_page_snapshot: Mutex<Option<NativeCudaRecordPageSnapshotReceipt>>,
+        cuda_record_page_snapshot_error: Mutex<Option<NativeStartupErrorKind>>,
         execution: NativeExecutionReceipt,
         additional_host_bytes: u64,
         host_record_page_observer: Option<HostRecordPageObservationHandle>,
@@ -698,6 +705,17 @@ mod native {
         ) -> Result<(), RoleError> {
             Ok(())
         }
+        /// Actual selection from this owner accompanies the original physical
+        /// return. The immutable marker grants no additional Run/fence or current
+        /// resident-bank observation. Legacy observers keep their old callback.
+        fn physically_completed_with_execution(
+            &mut self,
+            id: RequestId,
+            result: Result<&rz_eval::pals_model::PalsRawOutput, &BackendError>,
+            _execution: &NativeExecutionReceipt,
+        ) -> Result<(), RoleError> {
+            self.physically_completed(id, result)
+        }
         fn delivered(&mut self, _id: RequestId) -> Result<(), RoleError> {
             Ok(())
         }
@@ -730,6 +748,415 @@ mod native {
     pub struct NativeOwnerOptions {
         pub drain_limit: Duration,
         pub host_record_pages: Option<NativeHostRecordPageLimits>,
+    }
+    /// Owned opt-in input. Execution identity, namespace, Session and placement
+    /// are obtained from the loaded backend and this owner, never the caller.
+    pub struct NativeCudaRecordPagesRegistration {
+        pub checked_graph: rz_eval::pals_onnx::CheckedFixedPackingGraph,
+        pub limits: rz_eval::pals_onnx::DevicePagesLimits,
+        pub invocation: rz_eval::pals_onnx::DevicePageInvocationDeclaration,
+        pub profile_root: std::path::PathBuf,
+        pub frozen_epoch: u64,
+    }
+    impl NativeCudaRecordPagesRegistration {
+        pub fn for_deployment(
+            checked_graph: rz_eval::pals_onnx::CheckedFixedPackingGraph,
+            limits: rz_eval::pals_onnx::DevicePagesLimits,
+            invocation: rz_eval::pals_onnx::DevicePageInvocationDeclaration,
+            profile_root: std::path::PathBuf,
+        ) -> Self {
+            Self {
+                checked_graph,
+                limits,
+                invocation,
+                profile_root,
+                frozen_epoch: DEPLOYMENT_FROZEN_EPOCH,
+            }
+        }
+    }
+    /// Limits and backing reservations supplied at admission. These do not
+    /// measure native allocator/session/VRAM peaks or prove completed work.
+    #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+    pub struct NativeCudaRecordPagesResourceDeclaration {
+        pub max_blocks: usize,
+        pub max_bank_whole_payload_bytes: u64,
+        pub max_registry_entries: usize,
+        pub max_container_host_bytes: u64,
+        pub max_invocation_host_bytes: u64,
+        pub max_invocation_device_bytes: u64,
+        pub public_session_bytes: u64,
+        pub packing_session_bytes: u64,
+        pub private_session_bytes: u64,
+        pub private_output_payload: NativeCudaRecordPagePayloadDeclaration,
+        pub original_input_and_transfer_payload: NativeCudaRecordPagePayloadDeclaration,
+        pub additional_owner_metadata_payload: NativeCudaRecordPagePayloadDeclaration,
+    }
+    impl NativeCudaRecordPagesResourceDeclaration {
+        fn from_registration(
+            registration: &NativeCudaRecordPagesRegistration,
+        ) -> Result<Self, RoleError> {
+            let limits = registration.limits;
+            let invocation = registration.invocation;
+            let nonzero = |value: Option<u64>| {
+                value
+                    .filter(|value| *value > 0)
+                    .ok_or(RoleError::InvalidOutput)
+            };
+            if limits.max_blocks == 0
+                || limits.max_registry_entries == 0
+                || limits.max_bank_whole_payload_bytes == 0
+                || limits.max_container_host_bytes == 0
+                || limits.max_invocation_host_bytes == 0
+                || limits.max_invocation_device_bytes == 0
+            {
+                return Err(RoleError::InvalidOutput);
+            }
+            let private_output_payload = invocation
+                .private_output_payload
+                .ok_or(RoleError::InvalidOutput)?;
+            let original_input_and_transfer_payload = invocation
+                .original_input_and_transfer_payload
+                .ok_or(RoleError::InvalidOutput)?;
+            let additional_owner_metadata_payload = invocation
+                .additional_owner_metadata_payload
+                .ok_or(RoleError::InvalidOutput)?;
+            let public_session_bytes = nonzero(invocation.public_session_bytes)?;
+            let packing_session_bytes = nonzero(invocation.packing_session_bytes)?;
+            let private_session_bytes = nonzero(invocation.private_session_bytes)?;
+            let sessions = public_session_bytes
+                .checked_add(packing_session_bytes)
+                .and_then(|n| n.checked_add(private_session_bytes))
+                .ok_or(RoleError::InvalidOutput)?;
+            let mut host = 0u64;
+            let mut device = sessions;
+            for payload in [
+                private_output_payload,
+                original_input_and_transfer_payload,
+                additional_owner_metadata_payload,
+            ] {
+                if payload.total().map_err(|_| RoleError::InvalidOutput)? == 0 {
+                    return Err(RoleError::InvalidOutput);
+                }
+                host = host
+                    .checked_add(payload.host)
+                    .ok_or(RoleError::InvalidOutput)?;
+                device = device
+                    .checked_add(payload.device)
+                    .ok_or(RoleError::InvalidOutput)?;
+            }
+            let artifact = registration
+                .checked_graph
+                .registered_artifacts()
+                .resources();
+            if host > limits.max_invocation_host_bytes
+                || device > limits.max_invocation_device_bytes
+                || invocation.packing_session_bytes != Some(artifact.declared_packing_session_bytes)
+                || additional_owner_metadata_payload.host
+                    < registration
+                        .checked_graph
+                        .known_retained_host_bytes()
+                        .map_err(|_| RoleError::InvalidOutput)?
+            {
+                return Err(RoleError::InvalidOutput);
+            }
+            Ok(Self {
+                max_blocks: limits.max_blocks,
+                max_bank_whole_payload_bytes: limits.max_bank_whole_payload_bytes,
+                max_registry_entries: limits.max_registry_entries,
+                max_container_host_bytes: limits.max_container_host_bytes,
+                max_invocation_host_bytes: limits.max_invocation_host_bytes,
+                max_invocation_device_bytes: limits.max_invocation_device_bytes,
+                public_session_bytes,
+                packing_session_bytes,
+                private_session_bytes,
+                private_output_payload: NativeCudaRecordPagePayloadDeclaration {
+                    host: private_output_payload.host,
+                    device: private_output_payload.device,
+                },
+                original_input_and_transfer_payload: NativeCudaRecordPagePayloadDeclaration {
+                    host: original_input_and_transfer_payload.host,
+                    device: original_input_and_transfer_payload.device,
+                },
+                additional_owner_metadata_payload: NativeCudaRecordPagePayloadDeclaration {
+                    host: additional_owner_metadata_payload.host,
+                    device: additional_owner_metadata_payload.device,
+                },
+            })
+        }
+    }
+    /// Immutable selection from the actual installed owner. Initial live-bank
+    /// counters are deliberately absent; later observation is a separate ACK.
+    #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+    pub struct NativeCudaRecordPagesDeclaration {
+        pub schema: &'static str,
+        pub mode: &'static str,
+        pub process_epoch: u64,
+        pub installation_game_generation: u64,
+        pub frozen_epoch: u64,
+        pub model_manifest_sha256: [u8; 32],
+        pub model_epoch: [u8; 32],
+        pub public_graph_sha256: [u8; 32],
+        pub encoding_sha256: [u8; 32],
+        pub runtime_sha256: [u8; 32],
+        pub runtime_identity_scope: &'static str,
+        pub device_id: u32,
+        pub packing_graph_sha256: [u8; 32],
+        pub packing_graph_bytes: u64,
+        pub packing_manifest_sha256: [u8; 32],
+        pub packing_manifest_bytes: u64,
+        pub known_retained_artifact_host_bytes: u64,
+        /// Tracked implementation provenance, independent of frozen model/input
+        /// semantics and obtained from the actual backend implementation getter.
+        pub implementation_sha256: [u8; 32],
+        pub initialized_scope: &'static str,
+        pub initialized_provider_count: usize,
+        pub initialized_log_sha256: [u8; 32],
+        pub initialized_log_digest_domain: &'static str,
+        pub model_native_sessions: usize,
+        pub packing_native_sessions: usize,
+        /// The invocation upper bounds already include public/packing/private
+        /// session declarations, bank/join/input/backing owners and metadata.
+        /// They replace legacy transient/session aggregation for this selection.
+        pub resource_accounting_scope: &'static str,
+        pub declared_resources: NativeCudaRecordPagesResourceDeclaration,
+    }
+    #[derive(Clone, Debug, serde::Serialize)]
+    pub struct NativeCudaRecordPageStatsReceipt {
+        pub admitted_views: u64,
+        pub public_subset_runs_attempted: u64,
+        pub public_subset_runs_completed: u64,
+        pub packing_runs_attempted: u64,
+        pub packing_runs_completed: u64,
+        pub private_joined_runs_attempted: u64,
+        pub private_joined_runs_completed: u64,
+        pub certified_board_slices: u64,
+        pub certified_record_slices: u64,
+        pub published_blocks: u64,
+        pub last_unique_whole_pins: usize,
+        pub last_reserved_host_bytes: u64,
+        pub last_reserved_device_bytes: u64,
+    }
+    /// Actual worker observation, not an owned CUDA capability or a new fence.
+    #[derive(Clone, Debug, serde::Serialize)]
+    pub struct NativeCudaRecordPageSnapshotReceipt {
+        pub schema: &'static str,
+        pub initialized_scope: &'static str,
+        pub initialized_provider_count: usize,
+        pub packing_native_sessions: usize,
+        pub initialized_log_sha256: [u8; 32],
+        pub initialized_log_digest_domain: &'static str,
+        pub packing_graph_sha256: [u8; 32],
+        pub process_epoch: u64,
+        pub game_generation: u64,
+        pub model_manifest_sha256: [u8; 32],
+        pub model_epoch: [u8; 32],
+        pub public_graph_sha256: [u8; 32],
+        pub encoding_sha256: [u8; 32],
+        pub runtime_sha256: [u8; 32],
+        pub runtime_identity_scope: &'static str,
+        pub device_id: u32,
+        pub live_blocks: usize,
+        pub certified_projections: usize,
+        pub whole_owner_host_bytes: u64,
+        pub whole_owner_device_bytes: u64,
+        pub active_invocation: bool,
+        pub physical_completion_unknown: bool,
+        pub quarantined: bool,
+        pub stats: NativeCudaRecordPageStatsReceipt,
+    }
+    #[cfg(feature = "experimental-io-binding")]
+    impl From<rz_eval::pals_onnx::CudaRecordPageSnapshot> for NativeCudaRecordPageSnapshotReceipt {
+        fn from(value: rz_eval::pals_onnx::CudaRecordPageSnapshot) -> Self {
+            let stats = value.stats;
+            Self {
+                schema: value.schema,
+                initialized_scope: value.initialized_scope,
+                initialized_provider_count: value.initialized_provider_count,
+                packing_native_sessions: value.packing_native_sessions,
+                initialized_log_sha256: value.initialized_log_sha256,
+                initialized_log_digest_domain: value.initialized_log_digest_domain,
+                packing_graph_sha256: value.packing_graph_sha256,
+                process_epoch: value.process_epoch,
+                game_generation: value.game_generation,
+                model_manifest_sha256: value.model_manifest_sha256,
+                model_epoch: value.model_epoch,
+                public_graph_sha256: value.public_graph_sha256,
+                encoding_sha256: value.encoding_sha256,
+                runtime_sha256: value.runtime_sha256,
+                runtime_identity_scope: value.runtime_identity_scope,
+                device_id: value.device_id,
+                live_blocks: value.live_blocks,
+                certified_projections: value.certified_projections,
+                whole_owner_host_bytes: value.whole_owner_host_bytes,
+                whole_owner_device_bytes: value.whole_owner_device_bytes,
+                active_invocation: value.active_invocation,
+                physical_completion_unknown: value.physical_completion_unknown,
+                quarantined: value.quarantined,
+                stats: NativeCudaRecordPageStatsReceipt {
+                    admitted_views: stats.admitted_views,
+                    public_subset_runs_attempted: stats.public_subset_runs_attempted,
+                    public_subset_runs_completed: stats.public_subset_runs_completed,
+                    packing_runs_attempted: stats.packing_runs_attempted,
+                    packing_runs_completed: stats.packing_runs_completed,
+                    private_joined_runs_attempted: stats.private_joined_runs_attempted,
+                    private_joined_runs_completed: stats.private_joined_runs_completed,
+                    certified_board_slices: stats.certified_board_slices,
+                    certified_record_slices: stats.certified_record_slices,
+                    published_blocks: stats.published_blocks,
+                    last_unique_whole_pins: stats.last_unique_whole_pins,
+                    last_reserved_host_bytes: stats.last_reserved_host_bytes,
+                    last_reserved_device_bytes: stats.last_reserved_device_bytes,
+                },
+            }
+        }
+    }
+    fn validate_cuda_record_pages_selection(
+        config: &rz_eval::pals_onnx::PalsOnnxConfig,
+        options: NativeOwnerOptions,
+        frozen_epoch: u64,
+        warm: bool,
+    ) -> Result<(), RoleError> {
+        if !cfg!(all(
+            feature = "experimental-io-binding",
+            feature = "onnx-cuda",
+            target_os = "linux"
+        )) || !matches!(config.provider, rz_eval::onnx::Provider::Cuda { device_id, .. } if device_id >= 0)
+            || config.device_public_memory
+            || !config.cache_public_memory
+            || options.host_record_pages.is_some()
+            || warm
+            || frozen_epoch != DEPLOYMENT_FROZEN_EPOCH
+        {
+            return Err(RoleError::Backend("Registered CUDA pages require the explicit Linux CUDA OwnCPU/Fresh path; incompatible selection or epoch".into()));
+        }
+        Ok(())
+    }
+    fn validate_cuda_record_page_session_declarations(
+        config: &rz_eval::pals_onnx::PalsOnnxConfig,
+        declaration: &NativeCudaRecordPagesResourceDeclaration,
+    ) -> Result<(), RoleError> {
+        let rz_eval::onnx::Provider::Cuda { arena_bytes, .. } = config.provider else {
+            return Err(RoleError::InvalidOutput);
+        };
+        let arena = u64::try_from(arena_bytes).map_err(|_| RoleError::InvalidOutput)?;
+        if declaration.public_session_bytes != arena || declaration.private_session_bytes != arena {
+            return Err(RoleError::InvalidOutput);
+        }
+        Ok(())
+    }
+    #[cfg(feature = "experimental-io-binding")]
+    fn installed_cuda_record_pages_declaration(
+        backend: &PalsOnnxBackend,
+        epoch: ProcessEpoch,
+        frozen_epoch: u64,
+        artifact: rz_eval::pals_onnx::PackingArtifactRegistration,
+        retained: u64,
+        declared_resources: NativeCudaRecordPagesResourceDeclaration,
+    ) -> Result<NativeCudaRecordPagesDeclaration, RoleError> {
+        let snapshot = backend
+            .cuda_record_page_snapshot()
+            .map_err(model_error)?
+            .ok_or(RoleError::InvalidOutput)?;
+        let public = backend
+            .residency()
+            .graphs
+            .iter()
+            .find(|graph| graph.role == "public")
+            .ok_or(RoleError::InvalidOutput)?;
+        let mut encoding = Sha256::new();
+        encoding.update(PALS_ENCODING_SCHEMA);
+        encoding.update(pals_rules_encoding_semantic_digest());
+        let encoding: [u8; 32] = encoding.finalize().into();
+        let device_id = match backend.config().provider {
+            rz_eval::onnx::Provider::Cuda { device_id, .. } => {
+                u32::try_from(device_id).map_err(|_| RoleError::InvalidOutput)?
+            }
+            _ => return Err(RoleError::InvalidOutput),
+        };
+        if snapshot.schema != "rz-pals-resident-cuda-record-pages-observation/1"
+            || snapshot.process_epoch != epoch.0
+            || snapshot.model_epoch != backend.model_epoch()
+            || snapshot.model_manifest_sha256 != backend.manifest_digest()
+            || snapshot.public_graph_sha256 != public.sha256
+            || snapshot.encoding_sha256 != encoding
+            || Some(snapshot.runtime_sha256) != backend.runtime_bundle_digest()
+            || snapshot.device_id != device_id
+            || snapshot.packing_graph_sha256 != artifact.graph.sha256
+            || snapshot.initialized_scope != "initialized_provider_count"
+            || snapshot.runtime_identity_scope != "closed_cuda_library_bundle"
+            || snapshot.initialized_log_digest_domain
+                != "rz-pals-fixed-packing-initialized-provider-count/1"
+            || snapshot.initialized_provider_count != 275
+            || snapshot.packing_native_sessions != 1
+            || backend.residency().native_sessions != 2
+            || snapshot.active_invocation
+            || snapshot.physical_completion_unknown
+            || snapshot.quarantined
+            || frozen_epoch != DEPLOYMENT_FROZEN_EPOCH
+        {
+            return Err(RoleError::InvalidOutput);
+        }
+        Ok(NativeCudaRecordPagesDeclaration {
+            schema: "rz-pals-native-cuda-record-pages-selection/1",
+            mode: "registered-packing-v1",
+            process_epoch: snapshot.process_epoch,
+            installation_game_generation: snapshot.game_generation,
+            frozen_epoch,
+            model_manifest_sha256: snapshot.model_manifest_sha256,
+            model_epoch: snapshot.model_epoch,
+            public_graph_sha256: snapshot.public_graph_sha256,
+            encoding_sha256: snapshot.encoding_sha256,
+            runtime_sha256: snapshot.runtime_sha256,
+            runtime_identity_scope: snapshot.runtime_identity_scope,
+            device_id: snapshot.device_id,
+            packing_graph_sha256: snapshot.packing_graph_sha256,
+            packing_graph_bytes: artifact.graph.bytes,
+            packing_manifest_sha256: artifact.manifest.sha256,
+            packing_manifest_bytes: artifact.manifest.bytes,
+            known_retained_artifact_host_bytes: retained,
+            implementation_sha256: rz_eval::pals_onnx::cuda_record_pages_implementation_digest(),
+            initialized_scope: snapshot.initialized_scope,
+            initialized_provider_count: snapshot.initialized_provider_count,
+            initialized_log_sha256: snapshot.initialized_log_sha256,
+            initialized_log_digest_domain: snapshot.initialized_log_digest_domain,
+            model_native_sessions: backend.residency().native_sessions,
+            packing_native_sessions: snapshot.packing_native_sessions,
+            resource_accounting_scope: "combined_resident_owner_invocation_including_sessions_and_backing",
+            declared_resources,
+        })
+    }
+    #[cfg(feature = "experimental-io-binding")]
+    fn checked_cuda_record_page_observation(
+        snapshot: NativeCudaRecordPageSnapshotReceipt,
+        selection: &NativeCudaRecordPagesDeclaration,
+    ) -> Result<NativeCudaRecordPageSnapshotReceipt, RoleError> {
+        if snapshot.schema != "rz-pals-resident-cuda-record-pages-observation/1"
+            || snapshot.process_epoch != selection.process_epoch
+            || snapshot.game_generation < selection.installation_game_generation
+            || snapshot.model_manifest_sha256 != selection.model_manifest_sha256
+            || snapshot.model_epoch != selection.model_epoch
+            || snapshot.public_graph_sha256 != selection.public_graph_sha256
+            || snapshot.encoding_sha256 != selection.encoding_sha256
+            || snapshot.runtime_sha256 != selection.runtime_sha256
+            || snapshot.runtime_identity_scope != selection.runtime_identity_scope
+            || snapshot.device_id != selection.device_id
+            || snapshot.packing_graph_sha256 != selection.packing_graph_sha256
+            || snapshot.initialized_scope != selection.initialized_scope
+            || snapshot.initialized_provider_count != selection.initialized_provider_count
+            || snapshot.initialized_log_sha256 != selection.initialized_log_sha256
+            || snapshot.initialized_log_digest_domain != selection.initialized_log_digest_domain
+            || snapshot.packing_native_sessions != selection.packing_native_sessions
+            || snapshot.active_invocation
+            || snapshot.physical_completion_unknown
+            || snapshot.quarantined
+            || snapshot.stats.last_reserved_host_bytes
+                > selection.declared_resources.max_invocation_host_bytes
+            || snapshot.stats.last_reserved_device_bytes
+                > selection.declared_resources.max_invocation_device_bytes
+        {
+            return Err(RoleError::InvalidOutput);
+        }
+        Ok(snapshot)
     }
     impl NativeOwnerOptions {
         fn validate(self, config: &rz_eval::pals_onnx::PalsOnnxConfig) -> Result<(), RoleError> {
@@ -1044,6 +1471,32 @@ mod native {
         pub host_record_pages: Option<NativeHostRecordPageDeclaration>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub private_warm: Option<NativePrivateWarmDeclaration>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cuda_record_pages: Option<NativeCudaRecordPagesDeclaration>,
+    }
+    impl NativeExecutionReceipt {
+        fn request_device_reservation(&self) -> u64 {
+            // The selected whole-owner reservation already includes the original
+            // input and transfers. Retain the legacy numbers as declarations in
+            // the receipt, without charging their device backing a second time.
+            if self.cuda_record_pages.is_some() {
+                0
+            } else {
+                self.transient_request_device_bytes
+            }
+        }
+        fn execution_device_reservation(&self) -> u64 {
+            self.cuda_record_pages
+                .as_ref()
+                .map_or(self.transient_execution_device_bytes, |selection| {
+                    selection.declared_resources.max_invocation_device_bytes
+                })
+        }
+        fn runtime_device_reservation(&self) -> Result<u64, RoleError> {
+            self.request_device_reservation()
+                .checked_add(self.execution_device_reservation())
+                .ok_or(RoleError::InvalidOutput)
+        }
     }
     #[derive(Clone, Debug, serde::Serialize)]
     pub struct NativePrivateWarmDeclaration {
@@ -1150,6 +1603,12 @@ mod native {
         pub backend_stages: Option<PalsStartupStageSnapshot>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub timing_observation: Option<NativeStartupTimingObservation>,
+        /// Same-worker metadata ACK after the real startup probes and reset.
+        /// Its absence is never filled with the initial installation snapshot.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cuda_record_page_observation: Option<NativeCudaRecordPageSnapshotReceipt>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cuda_record_page_observation_error: Option<NativeStartupErrorKind>,
     }
     #[derive(Clone, Debug, serde::Serialize)]
     pub struct NativeRoleSourceIdentity {
@@ -1273,6 +1732,7 @@ mod native {
                     native_cpu_loaded_capability: true,
                 }
             }),
+            cuda_record_pages: None,
         })
     }
     pub(crate) fn validate_runtime_loading_mapping(
@@ -1547,7 +2007,13 @@ mod native {
         pub private_warm_observation: Option<NativePrivateWarmObservation>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub private_warm_observation_unavailable: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cuda_record_page_observation: Option<NativeCudaRecordPageSnapshotReceipt>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cuda_record_page_observation_error: Option<NativeStartupErrorKind>,
         pub execution: NativeExecutionReceipt,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cuda_record_page_observation_scope: Option<&'static str>,
         pub startup_probe: Option<NativeStartupProbeReceipt>,
         /// None means not observed/applicable, not a failed or successful audit.
         pub final_runtime_mapping_confirmed: Option<bool>,
@@ -1656,6 +2122,15 @@ mod native {
                 .private_warm
                 .as_ref()
                 .map(|warm| warm.state.snapshot());
+            let cuda_record_page_observation = self
+                .owner
+                .cuda_record_page_snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let cuda_record_page_observation_scope = cuda_record_page_observation
+                .as_ref()
+                .map(|_| "exclusive_worker_before_shutdown");
             NativeRoleReceipt {
                 physically_completed_role_calls: self
                     .owner
@@ -1712,7 +2187,14 @@ mod native {
                     .as_ref()
                     .and_then(|r| r.as_ref().err())
                     .map(|_| true),
+                cuda_record_page_observation,
+                cuda_record_page_observation_error: *self
+                    .owner
+                    .cuda_record_page_snapshot_error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
                 execution: self.owner.execution_receipt(),
+                cuda_record_page_observation_scope,
                 startup_probe: self
                     .owner
                     .startup_probe
@@ -1757,6 +2239,13 @@ mod native {
                             .lock()
                             .map_err(|_| RoleError::PhysicalCompletionUnknown)?
                             .is_some())
+                    && (self.owner.execution.cuda_record_pages.is_none()
+                        || self
+                            .owner
+                            .cuda_record_page_snapshot
+                            .lock()
+                            .map_err(|_| RoleError::PhysicalCompletionUnknown)?
+                            .is_some())
                 {
                     return Ok(());
                 }
@@ -1794,7 +2283,25 @@ mod native {
                             {
                                 PalsNativeCommand::ObserveRuntimeMappings
                             } else {
-                                PalsNativeCommand::SnapshotStats
+                                #[cfg(feature = "experimental-io-binding")]
+                                {
+                                    if self.owner.execution.cuda_record_pages.is_some()
+                                        && self
+                                            .owner
+                                            .cuda_record_page_snapshot
+                                            .lock()
+                                            .map_err(|_| RoleError::PhysicalCompletionUnknown)?
+                                            .is_none()
+                                    {
+                                        PalsNativeCommand::SnapshotCudaRecordPages
+                                    } else {
+                                        PalsNativeCommand::SnapshotStats
+                                    }
+                                }
+                                #[cfg(not(feature = "experimental-io-binding"))]
+                                {
+                                    PalsNativeCommand::SnapshotStats
+                                }
                             },
                         )
                         .map_err(|error| {
@@ -1809,6 +2316,9 @@ mod native {
                     let expected_mapping =
                         matches!(lease.input(), PalsNativeCommand::ObserveRuntimeMappings);
                     let expected_stats = matches!(lease.input(), PalsNativeCommand::SnapshotStats);
+                    #[cfg(feature = "experimental-io-binding")]
+                    let expected_pages =
+                        matches!(lease.input(), PalsNativeCommand::SnapshotCudaRecordPages);
                     match lease.poll() {
                         PhysicalPoll::Ready(result) => {
                             self.owner.in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -1850,7 +2360,39 @@ mod native {
                                         .final_stats
                                         .lock()
                                         .unwrap_or_else(|e| e.into_inner()) = Some(stats.into());
-                                    return Ok(());
+                                    if self.owner.execution.cuda_record_pages.is_none() {
+                                        return Ok(());
+                                    }
+                                }
+                                #[cfg(feature = "experimental-io-binding")]
+                                Ok(PalsNativeResult::CudaRecordPagesObserved(snapshot))
+                                    if expected_pages =>
+                                {
+                                    let selection = self
+                                        .owner
+                                        .execution
+                                        .cuda_record_pages
+                                        .as_ref()
+                                        .ok_or(RoleError::InvalidOutput)?;
+                                    let snapshot = checked_cuda_record_page_observation(
+                                        (*snapshot).into(),
+                                        selection,
+                                    )?;
+                                    if snapshot.game_generation
+                                        != self.owner.game_generation.load(Ordering::Acquire)
+                                    {
+                                        return Err(RoleError::InvalidOutput);
+                                    }
+                                    *self
+                                        .owner
+                                        .cuda_record_page_snapshot
+                                        .lock()
+                                        .map_err(|_| RoleError::Unavailable)? = Some(snapshot);
+                                    *self
+                                        .owner
+                                        .cuda_record_page_snapshot_error
+                                        .lock()
+                                        .map_err(|_| RoleError::Unavailable)? = None;
                                 }
                                 Ok(_) => {
                                     return Err(RoleError::Backend(
@@ -1900,6 +2442,21 @@ mod native {
                 self.owner.quarantined.store(true, Ordering::Release);
             }
             if self.owner.quarantined.load(Ordering::Acquire) {
+                if self.owner.execution.cuda_record_pages.is_some()
+                    && self
+                        .owner
+                        .cuda_record_page_snapshot
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_none()
+                {
+                    *self
+                        .owner
+                        .cuda_record_page_snapshot_error
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) =
+                        Some(NativeStartupErrorKind::PhysicalCompletionUnknown);
+                }
                 return Err(RoleError::PhysicalCompletionUnknown);
             }
             if self.owner.shutdown.load(Ordering::Acquire) {
@@ -1915,13 +2472,38 @@ mod native {
             let stats_failure = match self.collect_final_stats(until) {
                 Ok(()) => None,
                 Err(RoleError::PhysicalCompletionUnknown) => {
+                    if self.owner.execution.cuda_record_pages.is_some() {
+                        *self
+                            .owner
+                            .cuda_record_page_snapshot_error
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) =
+                            Some(NativeStartupErrorKind::PhysicalCompletionUnknown);
+                    }
                     self.owner.quarantined.store(true, Ordering::Release);
                     return Err(RoleError::PhysicalCompletionUnknown);
                 }
                 // A failed but physically completed Stats control does not
                 // authorize metrics. Still join/drop the idle native owner in
                 // the same cleanup window and preserve the original failure.
-                Err(error) => Some(error),
+                Err(error) => {
+                    if self.owner.execution.cuda_record_pages.is_some()
+                        && self
+                            .owner
+                            .cuda_record_page_snapshot
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_none()
+                    {
+                        *self
+                            .owner
+                            .cuda_record_page_snapshot_error
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) =
+                            Some(NativeStartupErrorKind::from(&error));
+                    }
+                    Some(error)
+                }
             };
             loop {
                 if self.owner.quarantined.load(Ordering::Acquire) {
@@ -1970,7 +2552,7 @@ mod native {
         fn additional_resources(&self, _: &[Arc<RuntimeRoleRequest<PalsModelInput>>]) -> Resources {
             Resources {
                 host_bytes: self.owner.additional_host_bytes,
-                device_bytes: self.owner.execution.transient_execution_device_bytes,
+                device_bytes: self.owner.execution.execution_device_reservation(),
                 pinned_bytes: 0,
             }
         }
@@ -2077,13 +2659,21 @@ mod native {
                 Ok(PalsNativeResult::Evaluation(raw)) => self
                     .owner
                     .observe("physical_return", |observer| {
-                        observer.physically_completed(lease.request.role().id, Ok(raw))
+                        observer.physically_completed_with_execution(
+                            lease.request.role().id,
+                            Ok(raw),
+                            &self.owner.execution_receipt(),
+                        )
                     })
                     .is_err(),
                 Err(error) => self
                     .owner
                     .observe("physical_return", |observer| {
-                        observer.physically_completed(lease.request.role().id, Err(error))
+                        observer.physically_completed_with_execution(
+                            lease.request.role().id,
+                            Err(error),
+                            &self.owner.execution_receipt(),
+                        )
                     })
                     .is_err(),
                 _ => false,
@@ -2093,13 +2683,7 @@ mod native {
                     self.owner.completed.fetch_add(1, Ordering::AcqRel);
                     Ok(raw)
                 }
-                Ok(
-                    PalsNativeResult::NewGame
-                    | PalsNativeResult::Stats(_)
-                    | PalsNativeResult::RuntimeVerified
-                    | PalsNativeResult::CudaPlacementVerified(_)
-                    | PalsNativeResult::RuntimeMappingsObserved(_),
-                ) => {
+                Ok(_) => {
                     self.owner.validation_failed.fetch_add(1, Ordering::AcqRel);
                     Err(fault(
                         ErrorCode::UnsupportedContract,
@@ -2365,12 +2949,94 @@ mod native {
         /// before the first chess P/C admission. Already-selected backend
         /// policies remain explicit selections and are attested as such.
         pub fn new_with_options(
+            backend: PalsOnnxBackend,
+            options: NativeOwnerOptions,
+        ) -> Result<Self, RoleError> {
+            Self::new_with_optional_cuda_record_pages(backend, options, None)
+        }
+        /// Explicit resident factory for the OwnCPU product path. External CPU
+        /// helpers are unsupported by this selection and must be refused before
+        /// model loading by the caller. No caller namespace or epoch is accepted.
+        pub fn new_with_registered_cuda_record_pages(
+            backend: PalsOnnxBackend,
+            options: NativeOwnerOptions,
+            registration: NativeCudaRecordPagesRegistration,
+        ) -> Result<Self, RoleError> {
+            Self::new_with_optional_cuda_record_pages(backend, options, Some(registration))
+        }
+        /// Reuse the existing pinned runtime/control loader, then install the
+        /// owned checked body before this backend enters a worker. The pair keeps
+        /// finite protocol drain options separate from resident graph ownership.
+        pub fn load_with_runtime_and_registered_cuda_record_pages(
+            export: &std::path::Path,
+            expected_export_sha256: &str,
+            runtime: rz_eval::onnx::OrtRuntime,
+            config: rz_eval::pals_onnx::PalsOnnxConfig,
+            policy: PalsCudaControlPolicy,
+            model_profile_root: &std::path::Path,
+            owner: (NativeOwnerOptions, NativeCudaRecordPagesRegistration),
+        ) -> Result<Self, RoleError> {
+            let (options, registration) = owner;
+            options.validate(&config)?;
+            validate_cuda_record_pages_selection(
+                &config,
+                options,
+                registration.frozen_epoch,
+                false,
+            )?;
+            let resources =
+                NativeCudaRecordPagesResourceDeclaration::from_registration(&registration)?;
+            validate_cuda_record_page_session_declarations(&config, &resources)?;
+            let backend = PalsOnnxBackend::load_with_cuda_control_policy(
+                export,
+                expected_export_sha256,
+                runtime,
+                config,
+                policy,
+                model_profile_root,
+            )
+            .map_err(model_error)?;
+            Self::new_with_registered_cuda_record_pages(backend, options, registration)
+        }
+        fn new_with_optional_cuda_record_pages(
             mut backend: PalsOnnxBackend,
             options: NativeOwnerOptions,
+            registration: Option<NativeCudaRecordPagesRegistration>,
         ) -> Result<Self, RoleError> {
             options.validate(&backend.config())?;
             let drain_limit = options.drain_limit;
             let warm_capability = backend.private_warm_capability().copied();
+            let resident_resources = registration
+                .as_ref()
+                .map(|registration| {
+                    validate_cuda_record_pages_selection(
+                        &backend.config(),
+                        options,
+                        registration.frozen_epoch,
+                        warm_capability.is_some(),
+                    )?;
+                    let resources =
+                        NativeCudaRecordPagesResourceDeclaration::from_registration(registration)?;
+                    validate_cuda_record_page_session_declarations(&backend.config(), &resources)?;
+                    if backend.residency().native_sessions != 2
+                        || backend.residency().layout != "shared_pc_if"
+                    {
+                        return Err(RoleError::InvalidOutput);
+                    }
+                    Ok(resources)
+                })
+                .transpose()?;
+            #[cfg(feature = "experimental-io-binding")]
+            if registration.is_none()
+                && backend
+                    .cuda_record_page_snapshot()
+                    .map_err(model_error)?
+                    .is_some()
+            {
+                return Err(RoleError::Backend(
+                    "Resident CUDA backend requires the explicit owned factory".into(),
+                ));
+            }
             if warm_capability.is_some()
                 && (backend.config().provider != rz_eval::onnx::Provider::Cpu
                     || backend.config().device_public_memory)
@@ -2409,6 +3075,13 @@ mod native {
                         0
                     })
                 })
+                .and_then(|b| {
+                    b.checked_add(
+                        resident_resources
+                            .as_ref()
+                            .map_or(0, |r| r.max_invocation_host_bytes),
+                    )
+                })
                 .ok_or(RoleError::InvalidOutput)?;
             let runtime_host_bytes = (4 * REQUEST_BYTES)
                 .checked_add(page_reservation)
@@ -2418,6 +3091,13 @@ mod native {
                     } else {
                         0
                     })
+                })
+                .and_then(|b| {
+                    b.checked_add(
+                        resident_resources
+                            .as_ref()
+                            .map_or(0, |r| r.max_invocation_host_bytes),
+                    )
                 })
                 .ok_or(RoleError::InvalidOutput)?;
             let is_cuda = execution.provider == "cuda";
@@ -2478,6 +3158,52 @@ mod native {
             let value_identity = frontier_value_identity(&identity, model_epoch, encoding);
             value_identity.validate()?;
             let epoch = ProcessEpoch(next(&EPOCHS)?);
+            let cuda_record_pages = if let Some(registration) = registration {
+                #[cfg(feature = "experimental-io-binding")]
+                {
+                    let artifact = registration.checked_graph.registration();
+                    let retained = registration
+                        .checked_graph
+                        .known_retained_host_bytes()
+                        .map_err(|_| RoleError::InvalidOutput)?;
+                    let frozen_epoch = registration.frozen_epoch;
+                    let declared_resources = resident_resources.ok_or(RoleError::InvalidOutput)?;
+                    backend
+                        .install_registered_cuda_record_pages(
+                            rz_eval::pals_onnx::PalsCudaRecordPageRegistration {
+                                checked_graph: registration.checked_graph,
+                                process_epoch: epoch,
+                                frozen_epoch,
+                                limits: registration.limits,
+                                invocation: registration.invocation,
+                                profile_root: registration.profile_root,
+                            },
+                        )
+                        .map_err(model_error)?;
+                    Some(installed_cuda_record_pages_declaration(
+                        &backend,
+                        epoch,
+                        frozen_epoch,
+                        artifact,
+                        retained,
+                        declared_resources,
+                    )?)
+                }
+                #[cfg(not(feature = "experimental-io-binding"))]
+                {
+                    let _ = registration;
+                    return Err(RoleError::Backend(
+                        "Resident CUDA pages require experimental-io-binding; fallback forbidden"
+                            .into(),
+                    ));
+                }
+            } else {
+                None
+            };
+            let execution = NativeExecutionReceipt {
+                cuda_record_pages,
+                ..execution
+            };
             let game = if warm_capability.is_some() { 0 } else { 1 };
             let private_warm = warm_capability
                 .map(|capability| {
@@ -2536,6 +3262,8 @@ mod native {
                 last_failure: Mutex::new(None),
                 final_stats: Mutex::new(None),
                 stats_lease: Mutex::new(None),
+                cuda_record_page_snapshot: Mutex::new(None),
+                cuda_record_page_snapshot_error: Mutex::new(None),
                 execution: execution.clone(),
                 additional_host_bytes,
                 host_record_page_observer,
@@ -2552,6 +3280,8 @@ mod native {
                     failure_diagnostic: None,
                     backend_stages: None,
                     timing_observation: None,
+                    cuda_record_page_observation: None,
+                    cuda_record_page_observation_error: None,
                 })),
                 startup_ready: AtomicBool::new(!is_cuda),
                 final_mapping_confirmed: AtomicBool::new(false),
@@ -2576,10 +3306,7 @@ mod native {
                     deadline_reserve: Duration::ZERO,
                     memory: Resources {
                         host_bytes: runtime_host_bytes,
-                        device_bytes: execution
-                            .transient_request_device_bytes
-                            .checked_add(execution.transient_execution_device_bytes)
-                            .ok_or(RoleError::InvalidOutput)?,
+                        device_bytes: execution.runtime_device_reservation()?,
                         pinned_bytes: execution.pinned_request_bytes,
                     },
                 },
@@ -2829,6 +3556,47 @@ mod native {
                     .as_mut()
                     .ok_or(RoleError::Unavailable)?
                     .reset_completed = true;
+                #[cfg(feature = "experimental-io-binding")]
+                if self.owner.execution.cuda_record_pages.is_some() {
+                    let observed = (|| {
+                        let snapshot = match self
+                            .startup_command(PalsNativeCommand::SnapshotCudaRecordPages, until)?
+                        {
+                            PalsNativeResult::CudaRecordPagesObserved(snapshot) => *snapshot,
+                            _ => return Err(RoleError::InvalidOutput),
+                        };
+                        let selection = self
+                            .owner
+                            .execution
+                            .cuda_record_pages
+                            .as_ref()
+                            .ok_or(RoleError::InvalidOutput)?;
+                        let snapshot =
+                            checked_cuda_record_page_observation(snapshot.into(), selection)?;
+                        if snapshot.game_generation
+                            != self.owner.game_generation.load(Ordering::Acquire)
+                            || snapshot.live_blocks != 0
+                            || snapshot.certified_projections != 0
+                        {
+                            return Err(RoleError::InvalidOutput);
+                        }
+                        Ok(snapshot)
+                    })();
+                    let mut probe = self
+                        .owner
+                        .startup_probe
+                        .lock()
+                        .map_err(|_| RoleError::Unavailable)?;
+                    let probe = probe.as_mut().ok_or(RoleError::Unavailable)?;
+                    match observed {
+                        Ok(snapshot) => probe.cuda_record_page_observation = Some(snapshot),
+                        Err(error) => {
+                            probe.cuda_record_page_observation_error =
+                                Some(NativeStartupErrorKind::from(&error));
+                            return Err(error);
+                        }
+                    }
+                }
                 let stats = match self.startup_command(PalsNativeCommand::SnapshotStats, until)? {
                     PalsNativeResult::Stats(stats) => stats,
                     _ => return Err(RoleError::InvalidOutput),
@@ -2858,6 +3626,15 @@ mod native {
                 .map(PalsStartupStageProbe::snapshot_and_stop);
             if let Err(error) = &outcome {
                 self.unusable = true;
+                if self.owner.execution.cuda_record_pages.is_some()
+                    && let Ok(mut probe) = self.owner.startup_probe.lock()
+                    && let Some(probe) = probe.as_mut()
+                    && probe.cuda_record_page_observation.is_none()
+                {
+                    probe
+                        .cuda_record_page_observation_error
+                        .get_or_insert(NativeStartupErrorKind::from(error));
+                }
                 let elapsed = self.startup_elapsed_ns();
                 if let Some(mut diagnostic) = self.startup_diagnostic.take() {
                     diagnostic.probe_elapsed_ns = elapsed;
@@ -2912,16 +3689,21 @@ mod native {
                 PalsNativeCommand::VerifyCudaPlacement => "cuda_placement_audit",
                 PalsNativeCommand::NewGame => "new_game_reset",
                 PalsNativeCommand::SnapshotStats => "backend_stats",
+                #[cfg(feature = "experimental-io-binding")]
+                PalsNativeCommand::SnapshotCudaRecordPages => "cuda_record_pages_observation",
             };
             let elapsed = self.startup_elapsed_ns();
             // A diagnostic cap is not a command admission or completion rule.
             // Suppress capture on overflow without mutating a prior event or
             // replacing the actual command outcome.
-            if self
-                .startup_diagnostic
-                .as_ref()
-                .is_some_and(|d| d.commands.len() >= 7)
-            {
+            if self.startup_diagnostic.as_ref().is_some_and(|d| {
+                d.commands.len()
+                    >= if self.owner.execution.cuda_record_pages.is_some() {
+                        8
+                    } else {
+                        7
+                    }
+            }) {
                 let mut diagnostic = self.startup_diagnostic.take();
                 if let Some(diagnostic) = diagnostic.as_mut() {
                     diagnostic.command_observation_overflow = true;
@@ -3151,13 +3933,7 @@ mod native {
                                 self.owner.new_game_resets.fetch_add(1, Ordering::AcqRel);
                                 return terminal.map_or(Ok(()), Err);
                             }
-                            Ok(
-                                PalsNativeResult::Evaluation(_)
-                                | PalsNativeResult::Stats(_)
-                                | PalsNativeResult::RuntimeVerified
-                                | PalsNativeResult::CudaPlacementVerified(_)
-                                | PalsNativeResult::RuntimeMappingsObserved(_),
-                            ) => {
+                            Ok(_) => {
                                 self.unusable = true;
                                 return Err(RoleError::Backend(
                                     "PALS reset lease received a different response".into(),
@@ -3424,7 +4200,7 @@ mod native {
                 cancel: cancel.clone(),
                 resources: ByteBudget {
                     host: REQUEST_BYTES,
-                    device: self.owner.execution.transient_request_device_bytes,
+                    device: self.owner.execution.request_device_reservation(),
                     pinned: self.owner.execution.pinned_request_bytes,
                 },
             });
@@ -3887,6 +4663,464 @@ mod native {
             )))
         }
 
+        // Pure synthetic metadata and the in-process worker seam only. This
+        // fixture does not mint a checked body, loaded Session, CUDA placement,
+        // device backing, physical GPU fence or measured allocator peak.
+        #[cfg(feature = "experimental-io-binding")]
+        fn resident_boundary_fixture() -> (
+            NativeExecutionReceipt,
+            rz_eval::pals_onnx::CudaRecordPageSnapshot,
+        ) {
+            let selection = NativeCudaRecordPagesDeclaration {
+                schema: "rz-pals-native-cuda-record-pages-selection/1",
+                mode: "registered-packing-v1",
+                process_epoch: 7,
+                installation_game_generation: 0,
+                frozen_epoch: DEPLOYMENT_FROZEN_EPOCH,
+                model_manifest_sha256: [3; 32],
+                model_epoch: [4; 32],
+                public_graph_sha256: [5; 32],
+                encoding_sha256: [6; 32],
+                runtime_sha256: [2; 32],
+                runtime_identity_scope: "closed_cuda_library_bundle",
+                device_id: 0,
+                packing_graph_sha256: [8; 32],
+                packing_graph_bytes: 256,
+                packing_manifest_sha256: [9; 32],
+                packing_manifest_bytes: 128,
+                known_retained_artifact_host_bytes: 1024,
+                implementation_sha256: [10; 32],
+                initialized_scope: "initialized_provider_count",
+                initialized_provider_count: 275,
+                initialized_log_sha256: [11; 32],
+                initialized_log_digest_domain: "rz-pals-fixed-packing-initialized-provider-count/1",
+                model_native_sessions: 2,
+                packing_native_sessions: 1,
+                resource_accounting_scope: "combined_resident_owner_invocation_including_sessions_and_backing",
+                declared_resources: NativeCudaRecordPagesResourceDeclaration {
+                    max_blocks: 2,
+                    max_bank_whole_payload_bytes: 8192,
+                    max_registry_entries: 4,
+                    max_container_host_bytes: 4096,
+                    max_invocation_host_bytes: 16384,
+                    max_invocation_device_bytes: 65536,
+                    public_session_bytes: 4096,
+                    packing_session_bytes: 4096,
+                    private_session_bytes: 4096,
+                    private_output_payload: NativeCudaRecordPagePayloadDeclaration {
+                        host: 0,
+                        device: 1024,
+                    },
+                    original_input_and_transfer_payload: NativeCudaRecordPagePayloadDeclaration {
+                        host: 1024,
+                        device: 1024,
+                    },
+                    additional_owner_metadata_payload: NativeCudaRecordPagePayloadDeclaration {
+                        host: 4096,
+                        device: 0,
+                    },
+                },
+            };
+            let snapshot = rz_eval::pals_onnx::CudaRecordPageSnapshot {
+                schema: "rz-pals-resident-cuda-record-pages-observation/1",
+                initialized_scope: selection.initialized_scope,
+                initialized_provider_count: selection.initialized_provider_count,
+                packing_native_sessions: selection.packing_native_sessions,
+                initialized_log_sha256: selection.initialized_log_sha256,
+                initialized_log_digest_domain: selection.initialized_log_digest_domain,
+                packing_graph_sha256: selection.packing_graph_sha256,
+                process_epoch: selection.process_epoch,
+                game_generation: 1,
+                model_manifest_sha256: selection.model_manifest_sha256,
+                model_epoch: selection.model_epoch,
+                public_graph_sha256: selection.public_graph_sha256,
+                encoding_sha256: selection.encoding_sha256,
+                runtime_sha256: selection.runtime_sha256,
+                runtime_identity_scope: selection.runtime_identity_scope,
+                device_id: selection.device_id,
+                live_blocks: 0,
+                certified_projections: 0,
+                whole_owner_host_bytes: 256,
+                whole_owner_device_bytes: 512,
+                active_invocation: false,
+                physical_completion_unknown: false,
+                quarantined: false,
+                stats: rz_eval::pals_onnx::CudaRecordPageStats::default(),
+            };
+            let execution = NativeExecutionReceipt {
+                provider: "cuda",
+                device_id: Some(0),
+                session_arena_bytes: Some(4096),
+                runtime_sha256: [1; 32],
+                runtime_bundle_sha256: Some([2; 32]),
+                cuda_control_inventory_sha256: Some([12; 32]),
+                cuda_loading_profile: None,
+                startup_probe_timeout_ms: None,
+                transient_request_device_bytes: 11,
+                transient_execution_device_bytes: 22,
+                pinned_request_bytes: 19,
+                device_public_memory: false,
+                host_record_pages: None,
+                private_warm: None,
+                cuda_record_pages: Some(selection),
+            };
+            (execution, snapshot)
+        }
+
+        #[test]
+        fn resident_none_preserves_legacy_receipt_omission_and_copy_options() {
+            fn requires_copy<T: Copy>() {}
+            requires_copy::<NativeOwnerOptions>();
+            let model = fixture_model(|command| match command {
+                PalsNativeCommand::SnapshotStats => {
+                    PhysicalRun::Complete(Ok(PalsNativeResult::Stats(PalsBackendStats::default())))
+                }
+                _ => unexpected_cuda_placement(),
+            });
+            require_probe(&model);
+            let before = serde_json::to_value(model.finish_handle().receipt()).unwrap();
+            assert!(before["execution"].get("cuda_record_pages").is_none());
+            assert!(before.get("cuda_record_page_observation").is_none());
+            assert!(before.get("cuda_record_page_observation_error").is_none());
+            assert!(before.get("cuda_record_page_observation_scope").is_none());
+            assert!(
+                before["startup_probe"]
+                    .get("cuda_record_page_observation")
+                    .is_none()
+            );
+            assert!(
+                before["startup_probe"]
+                    .get("cuda_record_page_observation_error")
+                    .is_none()
+            );
+            let ended = model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            let after = serde_json::to_string(&ended).unwrap();
+            assert!(!after.contains("cuda_record_page"));
+            assert!(ended.physical_shutdown_confirmed && ended.native_buffers_released);
+        }
+
+        #[test]
+        fn resident_selection_refuses_incompatible_modes_before_model_loading() {
+            let options = NativeOwnerOptions {
+                drain_limit: Duration::from_secs(1),
+                host_record_pages: None,
+            };
+            let mut config = rz_eval::pals_onnx::PalsOnnxConfig::cpu();
+            assert!(
+                validate_cuda_record_pages_selection(
+                    &config,
+                    options,
+                    DEPLOYMENT_FROZEN_EPOCH,
+                    false
+                )
+                .is_err()
+            );
+            config.provider = rz_eval::onnx::Provider::Cuda {
+                device_id: 0,
+                arena_bytes: 4096,
+            };
+            assert_eq!(
+                validate_cuda_record_pages_selection(
+                    &config,
+                    options,
+                    DEPLOYMENT_FROZEN_EPOCH,
+                    false
+                )
+                .is_ok(),
+                cfg!(all(
+                    feature = "experimental-io-binding",
+                    feature = "onnx-cuda",
+                    target_os = "linux"
+                ))
+            );
+            for mutation in 0..6 {
+                let mut c = config;
+                let mut o = options;
+                let mut epoch = DEPLOYMENT_FROZEN_EPOCH;
+                let mut warm = false;
+                match mutation {
+                    0 => c.device_public_memory = true,
+                    1 => c.cache_public_memory = false,
+                    2 => {
+                        o.host_record_pages = Some(NativeHostRecordPageLimits {
+                            max_page_entries: 2,
+                            max_page_bytes: 1024,
+                            max_transient_bytes: 1024,
+                        })
+                    }
+                    3 => epoch += 1,
+                    4 => warm = true,
+                    _ => {
+                        c.provider = rz_eval::onnx::Provider::Cuda {
+                            device_id: -1,
+                            arena_bytes: 4096,
+                        }
+                    }
+                }
+                assert!(validate_cuda_record_pages_selection(&c, o, epoch, warm).is_err());
+            }
+        }
+
+        #[cfg(feature = "experimental-io-binding")]
+        #[test]
+        fn resident_owner_device_reservation_replaces_legacy_transients_once() {
+            let (mut execution, _) = resident_boundary_fixture();
+            let selected = execution.cuda_record_pages.take().unwrap();
+            assert_eq!(execution.request_device_reservation(), 11);
+            assert_eq!(execution.execution_device_reservation(), 22);
+            assert_eq!(execution.runtime_device_reservation().unwrap(), 33);
+            execution.cuda_record_pages = Some(selected);
+            assert_eq!(execution.request_device_reservation(), 0);
+            assert_eq!(execution.execution_device_reservation(), 65536);
+            assert_eq!(execution.runtime_device_reservation().unwrap(), 65536);
+            assert_eq!(execution.pinned_request_bytes, 19);
+            // Legacy transient declarations remain visible but do not create
+            // an additional charge in the selected combined-owner scope.
+            let wire = serde_json::to_value(&execution).unwrap();
+            assert_eq!(wire["transient_request_device_bytes"], 11);
+            assert_eq!(wire["transient_execution_device_bytes"], 22);
+            execution.cuda_record_pages = None;
+            execution.transient_execution_device_bytes = u64::MAX;
+            assert!(execution.runtime_device_reservation().is_err());
+        }
+
+        #[cfg(feature = "experimental-io-binding")]
+        #[test]
+        fn resident_session_declarations_match_the_actual_model_arena() {
+            let (execution, _) = resident_boundary_fixture();
+            let mut declaration = execution.cuda_record_pages.unwrap().declared_resources;
+            let mut config = rz_eval::pals_onnx::PalsOnnxConfig::cpu();
+            assert!(validate_cuda_record_page_session_declarations(&config, &declaration).is_err());
+            config.provider = rz_eval::onnx::Provider::Cuda {
+                device_id: 0,
+                arena_bytes: 4096,
+            };
+            assert!(validate_cuda_record_page_session_declarations(&config, &declaration).is_ok());
+            declaration.private_session_bytes += 1;
+            assert!(validate_cuda_record_page_session_declarations(&config, &declaration).is_err());
+            declaration.private_session_bytes -= 1;
+            declaration.public_session_bytes -= 1;
+            assert!(validate_cuda_record_page_session_declarations(&config, &declaration).is_err());
+        }
+
+        #[cfg(feature = "experimental-io-binding")]
+        #[test]
+        fn resident_snapshot_requires_exact_owner_pins_idle_state_and_bounded_reservations() {
+            let (execution, actual) = resident_boundary_fixture();
+            let mut selection = execution.cuda_record_pages.unwrap();
+            let snapshot: NativeCudaRecordPageSnapshotReceipt = actual.into();
+            assert!(checked_cuda_record_page_observation(snapshot.clone(), &selection).is_ok());
+            for mutation in 0..11 {
+                let mut wrong = snapshot.clone();
+                match mutation {
+                    0 => wrong.process_epoch += 1,
+                    1 => wrong.model_epoch = [0; 32],
+                    2 => wrong.packing_graph_sha256 = [0; 32],
+                    3 => wrong.runtime_sha256 = [0; 32],
+                    4 => wrong.initialized_provider_count -= 1,
+                    5 => wrong.initialized_log_sha256 = [0; 32],
+                    6 => wrong.active_invocation = true,
+                    7 => wrong.physical_completion_unknown = true,
+                    8 => wrong.quarantined = true,
+                    9 => {
+                        wrong.stats.last_reserved_host_bytes =
+                            selection.declared_resources.max_invocation_host_bytes + 1
+                    }
+                    _ => {
+                        wrong.stats.last_reserved_device_bytes =
+                            selection.declared_resources.max_invocation_device_bytes + 1
+                    }
+                }
+                assert!(checked_cuda_record_page_observation(wrong, &selection).is_err());
+            }
+            selection.installation_game_generation = 2;
+            assert!(checked_cuda_record_page_observation(snapshot, &selection).is_err());
+        }
+
+        #[cfg(feature = "experimental-io-binding")]
+        #[test]
+        fn resident_final_snapshot_is_an_actual_control_ack_not_the_initial_marker() {
+            let (execution, mut snapshot) = resident_boundary_fixture();
+            snapshot.live_blocks = 1;
+            snapshot.certified_projections = 2;
+            snapshot.stats.packing_runs_completed = 3;
+            let pages = Arc::new(AtomicU64::new(0));
+            let called = Arc::clone(&pages);
+            let model = fixture_model_with_execution(
+                move |command| {
+                    PhysicalRun::Complete(Ok(match command {
+                        PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
+                        PalsNativeCommand::SnapshotCudaRecordPages => {
+                            called.fetch_add(1, Ordering::AcqRel);
+                            PalsNativeResult::CudaRecordPagesObserved(Box::new(snapshot.clone()))
+                        }
+                        PalsNativeCommand::SnapshotStats => {
+                            PalsNativeResult::Stats(PalsBackendStats::default())
+                        }
+                        _ => PalsNativeResult::NewGame,
+                    }))
+                },
+                Some(execution),
+            );
+            let finish = model.finish_handle();
+            assert!(finish.receipt().execution.cuda_record_pages.is_some());
+            assert!(finish.receipt().cuda_record_page_observation.is_none());
+            let receipt = finish
+                .finish(Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            let observed = receipt.cuda_record_page_observation.as_ref().unwrap();
+            assert_eq!(pages.load(Ordering::Acquire), 1);
+            assert_eq!(observed.live_blocks, 1);
+            assert_eq!(observed.certified_projections, 2);
+            assert_eq!(observed.stats.packing_runs_completed, 3);
+            assert_eq!(
+                receipt.cuda_record_page_observation_scope,
+                Some("exclusive_worker_before_shutdown")
+            );
+            assert!(receipt.cuda_record_page_observation_error.is_none());
+            assert!(receipt.physical_shutdown_confirmed && receipt.native_buffers_released);
+            assert_eq!(receipt.physically_completed_role_calls, 0);
+            assert_eq!(receipt.search_consumed_role_inputs, 0);
+        }
+
+        #[cfg(feature = "experimental-io-binding")]
+        #[test]
+        fn resident_wrong_metadata_response_preserves_failure_and_missing_observation() {
+            let (execution, _) = resident_boundary_fixture();
+            let model = fixture_model_with_execution(
+                |command| {
+                    PhysicalRun::Complete(Ok(match command {
+                        PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
+                        // Deliberately wrong NN-zero metadata response; never a page ACK.
+                        _ => PalsNativeResult::Stats(PalsBackendStats::default()),
+                    }))
+                },
+                Some(execution),
+            );
+            let finish = model.finish_handle();
+            assert!(matches!(
+                finish.finish(Instant::now() + Duration::from_secs(1)),
+                Err(RoleError::Backend(_))
+            ));
+            let receipt = finish.receipt();
+            assert!(receipt.cuda_record_page_observation.is_none());
+            assert!(receipt.cuda_record_page_observation_scope.is_none());
+            assert_eq!(
+                receipt.cuda_record_page_observation_error,
+                Some(NativeStartupErrorKind::Backend)
+            );
+            assert!(receipt.backend_stats.is_none());
+            assert!(receipt.physical_shutdown_confirmed && receipt.native_buffers_released);
+            assert_eq!(receipt.physically_completed_role_calls, 0);
+        }
+
+        #[cfg(feature = "experimental-io-binding")]
+        #[test]
+        fn resident_expired_finish_never_dispatches_or_fabricates_a_snapshot() {
+            let (execution, _) = resident_boundary_fixture();
+            let calls = Arc::new(AtomicU64::new(0));
+            let called = Arc::clone(&calls);
+            let model = fixture_model_with_execution(
+                move |command| {
+                    called.fetch_add(1, Ordering::AcqRel);
+                    match command {
+                        PalsNativeCommand::VerifyRuntime => {
+                            PhysicalRun::Complete(Ok(PalsNativeResult::RuntimeVerified))
+                        }
+                        _ => unexpected_cuda_placement(),
+                    }
+                },
+                Some(execution),
+            );
+            // An already admitted control is physically joined within the
+            // fixture's explicit bound. Consuming that ACK after expiry must
+            // not admit the subsequent resident observation command.
+            complete_admitted_deadline_control(&model, PalsNativeCommand::VerifyRuntime);
+            let finish = model.finish_handle();
+            assert!(matches!(
+                finish.finish(Instant::now()),
+                Err(RoleError::Deadline)
+            ));
+            let receipt = finish.receipt();
+            assert_eq!(calls.load(Ordering::Acquire), 1);
+            assert!(receipt.cuda_record_page_observation.is_none());
+            assert_eq!(
+                receipt.cuda_record_page_observation_error,
+                Some(NativeStartupErrorKind::Deadline)
+            );
+            assert!(receipt.cuda_record_page_observation_scope.is_none());
+            assert_eq!(receipt.physical_runs_in_flight, 0);
+            assert!(receipt.physical_shutdown_confirmed && receipt.native_buffers_released);
+        }
+
+        #[cfg(feature = "experimental-io-binding")]
+        #[test]
+        fn resident_failed_startup_keeps_original_error_and_separate_final_ack() {
+            let (execution, snapshot) = resident_boundary_fixture();
+            let mut model = fixture_model_with_execution(
+                move |command| match command {
+                    PalsNativeCommand::Evaluate(_) => {
+                        PhysicalRun::Complete(Err(BackendError::new(
+                            FailureKind::BackendFailure,
+                            FailureStage::Backend,
+                            "synthetic startup primary failure",
+                        )))
+                    }
+                    PalsNativeCommand::VerifyRuntime => {
+                        PhysicalRun::Complete(Ok(PalsNativeResult::RuntimeVerified))
+                    }
+                    PalsNativeCommand::SnapshotCudaRecordPages => PhysicalRun::Complete(Ok(
+                        PalsNativeResult::CudaRecordPagesObserved(Box::new(snapshot.clone())),
+                    )),
+                    PalsNativeCommand::SnapshotStats => PhysicalRun::Complete(Ok(
+                        PalsNativeResult::Stats(PalsBackendStats::default()),
+                    )),
+                    _ => unexpected_cuda_placement(),
+                },
+                Some(execution),
+            );
+            require_probe(&model);
+            assert!(matches!(
+                model.prepare_startup(Instant::now() + Duration::from_secs(1)),
+                Err(RoleError::Backend(_))
+            ));
+            let finish = model.finish_handle();
+            let failed = finish.receipt();
+            let probe = failed.startup_probe.as_ref().unwrap();
+            assert!(probe.cuda_record_page_observation.is_none());
+            assert_eq!(
+                probe.cuda_record_page_observation_error,
+                Some(NativeStartupErrorKind::Backend)
+            );
+            assert!(failed.cuda_record_page_observation.is_none());
+            assert!(!model.owner.startup_ready.load(Ordering::Acquire));
+            let ended = finish
+                .finish(Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            assert!(ended.cuda_record_page_observation.is_some());
+            assert!(
+                ended
+                    .startup_probe
+                    .as_ref()
+                    .unwrap()
+                    .cuda_record_page_observation
+                    .is_none()
+            );
+            assert_eq!(
+                ended
+                    .startup_probe
+                    .as_ref()
+                    .unwrap()
+                    .cuda_record_page_observation_error,
+                Some(NativeStartupErrorKind::Backend)
+            );
+            assert!(ended.last_failure.is_some());
+            assert!(!model.owner.startup_ready.load(Ordering::Acquire));
+        }
+
         #[test]
         fn startup_cuda_witness_requires_owner_pins_and_both_private_branches() {
             use rz_eval::pals_onnx::{PalsGraphPlacement, PalsKernelWitness};
@@ -3907,6 +5141,7 @@ mod native {
                 device_public_memory: false,
                 host_record_pages: None,
                 private_warm: None,
+                cuda_record_pages: None,
             };
             let graphs: Vec<_> = ["public", "shared_pc"]
                 .into_iter()
@@ -4310,6 +5545,8 @@ mod native {
                 final_stats: Mutex::new(None),
                 stats_lease: Mutex::new(None),
                 additional_host_bytes: REQUEST_BYTES,
+                cuda_record_page_snapshot: Mutex::new(None),
+                cuda_record_page_snapshot_error: Mutex::new(None),
                 host_record_page_observer: None,
                 residency: PalsSessionResidency {
                     graphs: vec![],
@@ -4335,6 +5572,7 @@ mod native {
                     device_public_memory: false,
                     host_record_pages: None,
                     private_warm: None,
+                    cuda_record_pages: None,
                 }),
                 startup_probe: Mutex::new(None),
                 startup_probe_timeout_ms: AtomicU64::new(0),
@@ -4622,6 +5860,7 @@ mod native {
                 device_public_memory: false,
                 host_record_pages: None,
                 private_warm: None,
+                cuda_record_pages: None,
             };
             let roots: Vec<_> = profile
                 .eager_indices()
@@ -4664,6 +5903,8 @@ mod native {
                 failure_diagnostic: None,
                 backend_stages: None,
                 timing_observation: None,
+                cuda_record_page_observation: None,
+                cuda_record_page_observation_error: None,
             });
         }
         #[test]
@@ -5040,6 +6281,10 @@ mod native {
                         | PalsNativeCommand::ObserveRuntimeMappings => {
                             return unexpected_cuda_placement();
                         }
+                        #[cfg(feature = "experimental-io-binding")]
+                        PalsNativeCommand::SnapshotCudaRecordPages => {
+                            return unexpected_cuda_placement();
+                        }
                         PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
                         PalsNativeCommand::SnapshotStats => PalsNativeResult::Stats(stats.clone()),
                     }))
@@ -5058,6 +6303,8 @@ mod native {
                     failure_diagnostic: None,
                     backend_stages: None,
                     timing_observation: None,
+                    cuda_record_page_observation: None,
+                    cuda_record_page_observation_error: None,
                 });
                 let budget = model.configure_startup_probe_timeout(selected).unwrap();
                 model
@@ -5167,6 +6414,10 @@ mod native {
                     | PalsNativeCommand::ObserveRuntimeMappings => {
                         return unexpected_cuda_placement();
                     }
+                    #[cfg(feature = "experimental-io-binding")]
+                    PalsNativeCommand::SnapshotCudaRecordPages => {
+                        return unexpected_cuda_placement();
+                    }
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
                     PalsNativeCommand::SnapshotStats => {
                         PalsNativeResult::Stats(PalsBackendStats::default())
@@ -5216,6 +6467,10 @@ mod native {
                     PalsNativeCommand::EvaluatePrivateWarm(_)
                     | PalsNativeCommand::VerifyCudaPlacement
                     | PalsNativeCommand::ObserveRuntimeMappings => {
+                        return unexpected_cuda_placement();
+                    }
+                    #[cfg(feature = "experimental-io-binding")]
+                    PalsNativeCommand::SnapshotCudaRecordPages => {
                         return unexpected_cuda_placement();
                     }
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
@@ -5281,6 +6536,10 @@ mod native {
                     | PalsNativeCommand::ObserveRuntimeMappings => {
                         return unexpected_cuda_placement();
                     }
+                    #[cfg(feature = "experimental-io-binding")]
+                    PalsNativeCommand::SnapshotCudaRecordPages => {
+                        return unexpected_cuda_placement();
+                    }
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
                     PalsNativeCommand::SnapshotStats => {
                         PalsNativeResult::Stats(PalsBackendStats::default())
@@ -5341,6 +6600,10 @@ mod native {
                     | PalsNativeCommand::ObserveRuntimeMappings => {
                         return unexpected_cuda_placement();
                     }
+                    #[cfg(feature = "experimental-io-binding")]
+                    PalsNativeCommand::SnapshotCudaRecordPages => {
+                        return unexpected_cuda_placement();
+                    }
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
                 }))
             });
@@ -5397,6 +6660,8 @@ mod native {
                 PalsNativeCommand::EvaluatePrivateWarm(_)
                 | PalsNativeCommand::VerifyCudaPlacement
                 | PalsNativeCommand::ObserveRuntimeMappings => unexpected_cuda_placement(),
+                #[cfg(feature = "experimental-io-binding")]
+                PalsNativeCommand::SnapshotCudaRecordPages => unexpected_cuda_placement(),
                 PalsNativeCommand::VerifyRuntime => {
                     PhysicalRun::Complete(Ok(PalsNativeResult::RuntimeVerified))
                 }
@@ -5432,6 +6697,8 @@ mod native {
                     PalsNativeCommand::EvaluatePrivateWarm(_)
                     | PalsNativeCommand::VerifyCudaPlacement
                     | PalsNativeCommand::ObserveRuntimeMappings => unexpected_cuda_placement(),
+                    #[cfg(feature = "experimental-io-binding")]
+                    PalsNativeCommand::SnapshotCudaRecordPages => unexpected_cuda_placement(),
                     PalsNativeCommand::VerifyRuntime => {
                         PhysicalRun::Complete(Ok(PalsNativeResult::RuntimeVerified))
                     }
@@ -5520,6 +6787,8 @@ mod native {
                 PalsNativeCommand::EvaluatePrivateWarm(_)
                 | PalsNativeCommand::VerifyCudaPlacement
                 | PalsNativeCommand::ObserveRuntimeMappings => unexpected_cuda_placement(),
+                #[cfg(feature = "experimental-io-binding")]
+                PalsNativeCommand::SnapshotCudaRecordPages => unexpected_cuda_placement(),
                 PalsNativeCommand::VerifyRuntime => {
                     PhysicalRun::Complete(Ok(PalsNativeResult::RuntimeVerified))
                 }
@@ -5551,6 +6820,10 @@ mod native {
                     PalsNativeCommand::EvaluatePrivateWarm(_)
                     | PalsNativeCommand::VerifyCudaPlacement
                     | PalsNativeCommand::ObserveRuntimeMappings => {
+                        return unexpected_cuda_placement();
+                    }
+                    #[cfg(feature = "experimental-io-binding")]
+                    PalsNativeCommand::SnapshotCudaRecordPages => {
                         return unexpected_cuda_placement();
                     }
                     PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
@@ -5591,13 +6864,15 @@ pub(crate) use native::validate_private_warm_evidence;
 pub(crate) use native::validate_runtime_loading_mapping;
 #[cfg(feature = "onnx-cpu")]
 pub use native::{
-    NativeBackendStatsReceipt, NativeCudaLoadingIdentity, NativeExecutionReceipt,
-    NativeFailureReceipt, NativeHostRecordPageBankReceipt, NativeHostRecordPageCommandReceipt,
-    NativeHostRecordPageDeclaration, NativeHostRecordPageLimits,
-    NativeHostRecordPageObservationReceipt, NativeHostRecordPageSnapshotReceipt,
-    NativeHostRecordPageStatsReceipt, NativeOwnerOptions, NativePreparedContext,
-    NativePrivateWarmDeclaration, NativeRoleFinishHandle, NativeRoleModel, NativeRoleObserver,
-    NativeRoleReceipt, NativeRoleRejection, NativeRoleSourceIdentity,
+    NativeBackendStatsReceipt, NativeCudaLoadingIdentity, NativeCudaRecordPageSnapshotReceipt,
+    NativeCudaRecordPageStatsReceipt, NativeCudaRecordPagesDeclaration,
+    NativeCudaRecordPagesRegistration, NativeCudaRecordPagesResourceDeclaration,
+    NativeExecutionReceipt, NativeFailureReceipt, NativeHostRecordPageBankReceipt,
+    NativeHostRecordPageCommandReceipt, NativeHostRecordPageDeclaration,
+    NativeHostRecordPageLimits, NativeHostRecordPageObservationReceipt,
+    NativeHostRecordPageSnapshotReceipt, NativeHostRecordPageStatsReceipt, NativeOwnerOptions,
+    NativePreparedContext, NativePrivateWarmDeclaration, NativeRoleFinishHandle, NativeRoleModel,
+    NativeRoleObserver, NativeRoleReceipt, NativeRoleRejection, NativeRoleSourceIdentity,
     NativeStartupCommandObservation, NativeStartupErrorKind, NativeStartupFailureDiagnostic,
     NativeStartupProbeReceipt, NativeStartupTimingObservation,
 };

@@ -2226,3 +2226,42 @@ parameter·Warm·제품 V는 바꾸지 않는다.
 경계 fixture는 numeric stub을 명시해 사용한다. 이번 소스의 실제 실행 인수는 다음
 CPU CI에 남는다. 같은 conditional witness의 실제 whole-action 완료·인과·비용과
 별도 masked utility target은 아직 후속 필수 단위다.
+
+### 명시적인 resident 선택의 CLI·소유자·arena 연결
+
+새 lane은 `--pals-cuda-record-pages=registered-packing-v1`과 packing manifest·graph의
+두 경로·두 SHA 및 inline resource JSON을 함께 받는다. 모든 옵션을 생략한 기존
+경로는 그대로 유지한다. 부분 선택·중복·unknown·CPU/mock·외부 helper·미지원 feature는
+모델 로딩 전에 거부한다. 기존 arena의 `--pals-device-public-memory=false`는 허용하되
+`true`, host pages 또는 Warm 선언과의 혼용은 거부한다. 이 선택은 현재 Linux CUDA
+OwnCPU/Fresh·Shared P/C·FP32·단일 물리 worker 범위이며 새 기본값이 아니다.
+
+자원 선언 DTO는 기본 CPU 빌드에서도 읽을 수 있게 `rz-eval`에 분리한다. 누락·null·
+unknown·중복·float·overflow와 서로 다른 packing session 선언을 거부하고, 실제 native
+타입 변환은 기존 feature 아래에서만 제공한다. 모델의 두 Session과 보조 packing
+Session 하나를 따로 센다. 선택 owner의 전체 invocation 상한에는 session·bank·join·
+input·metadata가 포함되므로 기존 native device 요청/session 예약을 다시 더하지 않는다.
+별도 UCI 직렬화 요청·runtime bookkeeping의 host 예약은 유지한다. 이 값들은
+알려진 예약 선언이며 실제 RSS·cgroup·VRAM peak의 관측이 아니다.
+
+독립 검토에서 보조 packing Session이 모델 Session의 arena 설정을 상속하여 별도
+packing 선언과 달라지는 결함을 발견했다. packing 선언의 nonzero·정수 범위·등록
+artifact 일치를 확인하고 그 값을 실제 packing provider의 `with_memory_limit`에
+전달하도록 수정한다. 모델 public/private 선언은 모델 provider의 원래 arena와
+정확히 대조하며 직접 backend 설치도 같은 검사를 거친다. 설정을 자동 축소하거나
+선언을 관측 peak로 해석하지 않는다. 별도 모델 2GiB/packing 128MiB와 잘못된 선언을
+대조하는 순수 CPU fixture를 추가했으며 실행 인수는 최종 CI에서 확인한다.
+
+guarded artifact loader는 정적 CLI와 제품 경로가 함께 사용한다. caller의 자원 선언과
+inspection budget으로 검증한 owned graph만 배포 생성자로 이동한다. 실제 process
+epoch·모델·Rules encoding·전체 CUDA runtime bundle·device namespace는 loaded backend와
+owner에서 얻는다. 별도 implementation SHA는 추적 소스의 출처이며 모델 의미·Run·
+finite·fence 권한을 대신하지 않는다. arena는 기대 implementation 핀을 실제 marker와
+대조하고, startup와 종료의 관측은 각각 worker의 실제 metadata ACK로 받는다. 초기
+snapshot을 종료 결과로 복사하지 않는다. 관측 실패·unknown completion·격리 상태는
+성공으로 채우지 않으며 packing 작업 수를 모델 NN 입력 수나 탐색 소비 수와 섞지 않는다.
+
+독립 CLI·loader 소스 리뷰와 중앙 소스 검토를 수행했지만 이 연결 단위의 최종 Rust
+compile·fixture·정적 interoperability 인수는 다음 정확한 SHA의 CPU CI 대상이다.
+사용자의 이번 GPU 검증 보류를 유지한다. CUDA 장치·수치·물리 완료·메모리·성능·대국은
+미실행이며 실제 training·backward·optimizer와 새 cloud 실행도 수행하지 않는다.

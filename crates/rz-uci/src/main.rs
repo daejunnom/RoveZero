@@ -102,6 +102,9 @@ fn run_pals(
     let mut post_repair_recheck = None;
     let mut native = PalsNativeOptions::default();
     for argument in arguments {
+        if native.cuda_record_pages.take(&argument)? {
+            continue;
+        }
         if let Some(value) = argument.strip_prefix("--pals-model=") {
             if model.replace(value.to_owned()).is_some() {
                 return Err("duplicate PALS model".into());
@@ -298,6 +301,10 @@ fn run_pals(
     };
     config.validate()?;
     let external_checker = native.checker.is_external()?;
+    let cuda_record_pages =
+        native
+            .cuda_record_pages
+            .validate(model.as_deref(), &native, external_checker)?;
     // Close unsupported combinations before feature dispatch, native asset
     // admission, model loading or a foreign checker lifecycle can begin.
     let refinement_policy =
@@ -321,6 +328,7 @@ fn run_pals(
         }
         return run_native_pals(
             native,
+            cuda_record_pages,
             config,
             rounds,
             max_cpu_nodes,
@@ -400,6 +408,589 @@ struct PalsNativeOptions {
     cuda_loading_profile: Option<String>,
     cuda_loading_profile_hash: Option<String>,
     startup_probe_timeout_ms: Option<u64>,
+    cuda_record_pages: PalsCudaRecordPagesOptions,
+}
+
+const PALS_CUDA_RECORD_PAGES_RESOURCE_JSON_LIMIT: usize = 8192;
+
+#[derive(Default)]
+struct PalsCudaRecordPagesOptions {
+    mode: Option<String>,
+    manifest: Option<String>,
+    manifest_hash: Option<String>,
+    graph: Option<String>,
+    graph_hash: Option<String>,
+    resources: Option<String>,
+}
+
+#[cfg(all(feature = "onnx-cpu", feature = "experimental-io-binding"))]
+#[derive(Debug)]
+struct PalsCudaRecordPagesSelection {
+    manifest: std::path::PathBuf,
+    manifest_hash: [u8; 32],
+    graph: std::path::PathBuf,
+    graph_hash: [u8; 32],
+    resources: rz_eval::pals_device_resources::NativeCudaRecordPagesResourceInput,
+}
+#[cfg(not(all(feature = "onnx-cpu", feature = "experimental-io-binding")))]
+type PalsCudaRecordPagesSelection = ();
+
+impl PalsCudaRecordPagesOptions {
+    fn any(&self) -> bool {
+        self.mode.is_some()
+            || self.manifest.is_some()
+            || self.manifest_hash.is_some()
+            || self.graph.is_some()
+            || self.graph_hash.is_some()
+            || self.resources.is_some()
+    }
+
+    fn take(&mut self, argument: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let (slot, value, name) = if let Some(value) =
+            argument.strip_prefix("--pals-cuda-record-pages=")
+        {
+            (&mut self.mode, value, "mode")
+        } else if let Some(value) = argument.strip_prefix("--pals-packing-manifest=") {
+            (&mut self.manifest, value, "manifest")
+        } else if let Some(value) = argument.strip_prefix("--pals-packing-manifest-sha256=") {
+            (&mut self.manifest_hash, value, "manifest SHA-256")
+        } else if let Some(value) = argument.strip_prefix("--pals-packing-graph=") {
+            (&mut self.graph, value, "graph")
+        } else if let Some(value) = argument.strip_prefix("--pals-packing-graph-sha256=") {
+            (&mut self.graph_hash, value, "graph SHA-256")
+        } else if let Some(value) = argument.strip_prefix("--pals-cuda-record-pages-resources=") {
+            (&mut self.resources, value, "resources")
+        } else {
+            return Ok(false);
+        };
+        if slot.is_some() {
+            return Err(format!("duplicate PALS CUDA record pages {name}").into());
+        }
+        if name == "resources" && value.len() > PALS_CUDA_RECORD_PAGES_RESOURCE_JSON_LIMIT {
+            return Err("PALS CUDA record pages inline resource JSON exceeds 8192 UTF-8 bytes; no asset or native loading was started".into());
+        }
+        *slot = Some(value.to_owned());
+        Ok(true)
+    }
+
+    /// Pure admission selection: no checker, file, cache, runtime or model is opened.
+    fn validate(
+        &self,
+        model: Option<&str>,
+        native: &PalsNativeOptions,
+        external_checker: bool,
+    ) -> Result<Option<PalsCudaRecordPagesSelection>, Box<dyn std::error::Error>> {
+        if !self.any() {
+            return Ok(None);
+        }
+        let (mode, manifest, manifest_hash, graph, graph_hash, resources) = match (
+            self.mode.as_deref(), self.manifest.as_deref(), self.manifest_hash.as_deref(),
+            self.graph.as_deref(), self.graph_hash.as_deref(), self.resources.as_deref(),
+        ) {
+            (Some(mode), Some(manifest), Some(manifest_hash), Some(graph), Some(graph_hash), Some(resources)) =>
+                (mode, manifest, manifest_hash, graph, graph_hash, resources),
+            _ => return Err("PALS CUDA record pages requires all six explicit mode/packing-manifest/pin/packing-graph/pin/inline-resources flags together; no loading was started".into()),
+        };
+        if mode != "registered-packing-v1" {
+            return Err("unsupported PALS CUDA record pages mode; expected registered-packing-v1; no loading was started".into());
+        }
+        if model != Some("onnx") || native.provider.as_deref() != Some("cuda") {
+            return Err("PALS CUDA record pages requires explicit ONNX/CUDA selection; no CPU or model fallback was started".into());
+        }
+        // Warm/host declarations remain separate opt-ins. Arena's explicit
+        // legacy device=false preserves host control and does not select a lane.
+        if native.private_warm.is_some()
+            || native.host_record_pages.is_some()
+            || native.device_public_memory.unwrap_or(false)
+        {
+            return Err("PALS CUDA record pages cannot mix private warm, host record pages or legacy device public memory flags; no loading was started".into());
+        }
+        if external_checker {
+            return Err("PALS CUDA record pages supports own CPU only; external checker/helper selection was refused before profile or model loading".into());
+        }
+        let manifest = pals_packing_absolute_path(manifest)?;
+        let graph = pals_packing_absolute_path(graph)?;
+        let manifest_hash = pals_packing_sha256(manifest_hash)?;
+        let graph_hash = pals_packing_sha256(graph_hash)?;
+        if resources.len() > PALS_CUDA_RECORD_PAGES_RESOURCE_JSON_LIMIT {
+            return Err("PALS CUDA record pages inline resource JSON exceeds 8192 UTF-8 bytes; no loading was started".into());
+        }
+        if native.cuda_control_mode.as_deref() != Some("inventory-v2")
+            || native.cuda_control_inventory.is_none()
+            || native.cuda_control_inventory_hash.is_none()
+            || native.cuda_profile_root.is_some() == native.cuda_profile_parent.is_some()
+        {
+            return Err("PALS CUDA record pages requires complete inventory-v2 control and exactly one absolute profile root/parent; no loading was started".into());
+        }
+        pals_packing_absolute_path(
+            native
+                .cuda_control_inventory
+                .as_deref()
+                .ok_or("missing PALS CUDA control inventory")?,
+        )?;
+        pals_packing_sha256(
+            native
+                .cuda_control_inventory_hash
+                .as_deref()
+                .ok_or("missing PALS CUDA control inventory SHA-256")?,
+        )?;
+        let profile = pals_packing_absolute_path(
+            native
+                .cuda_profile_root
+                .as_deref()
+                .or(native.cuda_profile_parent.as_deref())
+                .ok_or("missing PALS CUDA profile root/parent")?,
+        )?;
+        if native.cuda_profile_root.is_some() && profile.file_name().is_none() {
+            return Err("PALS CUDA record pages requires a named exclusive profile root; no loading was started".into());
+        }
+        if !cfg!(all(
+            feature = "onnx-cpu",
+            feature = "onnx-cuda",
+            feature = "experimental-io-binding",
+            target_os = "linux"
+        )) {
+            return Err("PALS CUDA record pages requires onnx-cpu, onnx-cuda and experimental-io-binding on Linux; no provider or model fallback was started".into());
+        }
+        #[cfg(all(feature = "onnx-cpu", feature = "experimental-io-binding"))]
+        {
+            Ok(Some(PalsCudaRecordPagesSelection {
+                manifest,
+                manifest_hash,
+                graph,
+                graph_hash,
+                resources: pals_cuda_record_pages_resources(resources)?,
+            }))
+        }
+        #[cfg(not(all(feature = "onnx-cpu", feature = "experimental-io-binding")))]
+        {
+            let _ = (manifest, manifest_hash, graph, graph_hash);
+            Err("PALS CUDA record pages support is not compiled; no loading was started".into())
+        }
+    }
+}
+
+fn pals_packing_absolute_path(
+    value: &str,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let path = std::path::PathBuf::from(value);
+    if !path.is_absolute()
+        || path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err("PALS packing paths must be absolute without parent/current-directory components; no loading was started".into());
+    }
+    Ok(path)
+}
+
+fn pals_packing_sha256(value: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err("PALS packing SHA-256 pins must be exactly 64 lowercase hexadecimal bytes; no loading was started".into());
+    }
+    let nibble = |b: u8| {
+        if b.is_ascii_digit() {
+            b - b'0'
+        } else {
+            b - b'a' + 10
+        }
+    };
+    let mut digest = [0; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        digest[index] = (nibble(pair[0]) << 4) | nibble(pair[1]);
+    }
+    Ok(digest)
+}
+
+#[cfg(all(feature = "onnx-cpu", feature = "experimental-io-binding"))]
+fn pals_cuda_record_pages_resources(
+    value: &str,
+) -> Result<
+    rz_eval::pals_device_resources::NativeCudaRecordPagesResourceInput,
+    Box<dyn std::error::Error>,
+> {
+    if value.len() > PALS_CUDA_RECORD_PAGES_RESOURCE_JSON_LIMIT {
+        return Err("PALS CUDA record pages inline resource JSON exceeds 8192 UTF-8 bytes; no loading was started".into());
+    }
+    // The owner DTO rejects unknown, duplicate, absent and inconsistent fields.
+    // This parser grants neither a namespace nor any native/device capability.
+    serde_json::from_str(value).map_err(|error| {
+        format!(
+            "invalid PALS CUDA record pages resource declaration: {error}; no loading was started"
+        )
+        .into()
+    })
+}
+
+#[cfg(all(feature = "onnx-cpu", feature = "experimental-io-binding"))]
+fn pals_cuda_record_pages_profile_root(
+    control: &std::path::Path,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let mut name = control
+        .file_name()
+        .ok_or("PALS CUDA record pages requires a named control profile root")?
+        .to_os_string();
+    name.push("-registered-packing-v1");
+    Ok(control
+        .parent()
+        .ok_or("PALS CUDA control profile parent is absent")?
+        .join(name))
+}
+
+#[cfg(test)]
+mod pals_cuda_record_page_option_tests {
+    use super::{
+        PalsCudaRecordPagesOptions, PalsNativeOptions, pals_packing_absolute_path,
+        pals_packing_sha256, run_pals,
+    };
+
+    fn flags() -> Vec<String> {
+        let parent = std::env::temp_dir();
+        vec![
+            "--pals-cuda-record-pages=registered-packing-v1".into(),
+            format!(
+                "--pals-packing-manifest={}",
+                parent.join("unopened-packing-manifest.json").display()
+            ),
+            format!("--pals-packing-manifest-sha256={}", "0".repeat(64)),
+            format!(
+                "--pals-packing-graph={}",
+                parent.join("unopened-packing-graph.onnx").display()
+            ),
+            format!("--pals-packing-graph-sha256={}", "1".repeat(64)),
+            "--pals-cuda-record-pages-resources={}".into(),
+        ]
+    }
+
+    #[test]
+    fn omission_preserves_legacy_selection_and_native_any() {
+        let mut native = PalsNativeOptions::default();
+        assert!(!native.any());
+        for (model, provider) in [
+            (None, None),
+            (Some("legal-order-mock"), None),
+            (Some("onnx"), Some("cpu")),
+            (Some("onnx"), Some("cuda")),
+        ] {
+            native.provider = provider.map(str::to_owned);
+            assert!(
+                native
+                    .cuda_record_pages
+                    .validate(model, &native, false)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn every_new_flag_is_native_and_duplicates_fail_before_dispatch() {
+        for flag in flags() {
+            let mut native = PalsNativeOptions::default();
+            assert!(native.cuda_record_pages.take(&flag).unwrap());
+            assert!(native.any());
+            assert!(
+                native
+                    .cuda_record_pages
+                    .take(&flag)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("duplicate PALS CUDA record pages")
+            );
+            let error = run_pals(vec![flag.clone(), flag], None).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("duplicate PALS CUDA record pages")
+            );
+        }
+        for flag in [
+            "--pals-cuda-record-pages",
+            "--pals-packing-graph",
+            "--pals-cuda-record-pages-unknown=value",
+        ] {
+            assert!(!PalsCudaRecordPagesOptions::default().take(flag).unwrap());
+            assert!(run_pals(vec![flag.into()], None).is_err());
+        }
+    }
+
+    #[test]
+    fn partial_and_unknown_selections_refuse_unopened_assets() {
+        for omitted in 0..6 {
+            let mut args = flags();
+            args.remove(omitted);
+            args.extend(["--pals-model=onnx".into(), "--pals-provider=cuda".into()]);
+            assert!(
+                run_pals(args, None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("all six explicit")
+            );
+        }
+        for mode in [
+            "",
+            "true",
+            "false",
+            "registered-packing-v2",
+            "REGISTERED-PACKING-V1",
+        ] {
+            let mut args = flags();
+            args[0] = format!("--pals-cuda-record-pages={mode}");
+            args.extend(["--pals-model=onnx".into(), "--pals-provider=cuda".into()]);
+            assert!(
+                run_pals(args, None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsupported PALS CUDA record pages mode")
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_mock_old_lanes_and_external_helper_refuse_before_loading() {
+        for (model, provider) in [("onnx", "cpu"), ("legal-order-mock", "cuda")] {
+            let mut args = flags();
+            args.extend([
+                format!("--pals-model={model}"),
+                format!("--pals-provider={provider}"),
+            ]);
+            assert!(
+                run_pals(args, None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("explicit ONNX/CUDA selection")
+            );
+        }
+        for option in ["private-warm", "host-record-pages"] {
+            for value in ["true", "false"] {
+                let mut args = flags();
+                args.extend([
+                    "--pals-model=onnx".into(),
+                    "--pals-provider=cuda".into(),
+                    format!("--pals-{option}={value}"),
+                ]);
+                assert!(
+                    run_pals(args, None)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("cannot mix")
+                );
+            }
+        }
+        for (value, expected) in [
+            ("true", "cannot mix"),
+            ("false", "complete inventory-v2 control"),
+        ] {
+            let mut args = flags();
+            args.extend([
+                "--pals-model=onnx".into(),
+                "--pals-provider=cuda".into(),
+                format!("--pals-device-public-memory={value}"),
+            ]);
+            // False reaches the next pure gate; true refuses before any gate
+            // could open the intentionally unavailable packing assets.
+            assert!(
+                run_pals(args, None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
+        }
+        let mut args = flags();
+        args.extend([
+            "--pals-model=onnx".into(),
+            "--pals-provider=cuda".into(),
+            "--pals-cpu-checker=external-uci".into(),
+            "--pals-cpu-profile=/intentionally-unopened-helper-profile.json".into(),
+            "--pals-cpu-profile-sha256=unread-fixture-pin".into(),
+        ]);
+        assert!(
+            run_pals(args, None)
+                .unwrap_err()
+                .to_string()
+                .contains("supports own CPU only")
+        );
+    }
+
+    #[test]
+    fn incomplete_control_selection_is_refused_before_inventory_loading() {
+        let parent = std::env::temp_dir();
+        let inventory = format!(
+            "--pals-cuda-control-inventory={}",
+            parent.join("unopened-inventory.json").display()
+        );
+        let pin = format!("--pals-cuda-control-inventory-sha256={}", "0".repeat(64));
+        let profile = format!(
+            "--pals-cuda-profile-root={}",
+            parent.join("unopened-profile-owner").display()
+        );
+        for control in [
+            vec![],
+            vec![
+                "--pals-cuda-control-mode=inventory-v2".into(),
+                inventory.clone(),
+                profile.clone(),
+            ],
+            vec![
+                "--pals-cuda-control-mode=inventory-v2".into(),
+                pin.clone(),
+                profile.clone(),
+            ],
+            vec![
+                "--pals-cuda-control-mode=inventory-v2".into(),
+                inventory.clone(),
+                pin.clone(),
+            ],
+            vec![
+                "--pals-cuda-control-mode=unknown".into(),
+                inventory.clone(),
+                pin.clone(),
+                profile.clone(),
+            ],
+            vec![
+                "--pals-cuda-control-mode=inventory-v2".into(),
+                inventory,
+                pin,
+                profile,
+                format!("--pals-cuda-profile-parent={}", parent.display()),
+            ],
+        ] {
+            let mut args = flags();
+            args.extend(["--pals-model=onnx".into(), "--pals-provider=cuda".into()]);
+            args.extend(control);
+            assert!(
+                run_pals(args, None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("complete inventory-v2 control")
+            );
+        }
+    }
+
+    #[cfg(not(all(
+        feature = "onnx-cpu",
+        feature = "onnx-cuda",
+        feature = "experimental-io-binding",
+        target_os = "linux"
+    )))]
+    #[test]
+    fn unsupported_build_refuses_complete_selection_before_any_asset_load() {
+        let parent = std::env::temp_dir();
+        let mut args = flags();
+        args.extend([
+            "--pals-model=onnx".into(),
+            "--pals-provider=cuda".into(),
+            "--pals-cuda-control-mode=inventory-v2".into(),
+            format!(
+                "--pals-cuda-control-inventory={}",
+                parent.join("unopened-inventory.json").display()
+            ),
+            format!("--pals-cuda-control-inventory-sha256={}", "0".repeat(64)),
+            format!(
+                "--pals-cuda-profile-root={}",
+                parent.join("unopened-profile-owner").display()
+            ),
+        ]);
+        assert!(
+            run_pals(args, None)
+                .unwrap_err()
+                .to_string()
+                .contains("experimental-io-binding on Linux")
+        );
+    }
+
+    #[test]
+    fn paths_pins_and_inline_json_byte_limit_are_pure_checks() {
+        assert!(pals_packing_absolute_path("").is_err());
+        assert!(pals_packing_absolute_path("relative/graph.onnx").is_err());
+        assert!(
+            pals_packing_absolute_path(
+                &std::env::temp_dir().join("../graph.onnx").to_string_lossy()
+            )
+            .is_err()
+        );
+        assert!(pals_packing_sha256(&"01".repeat(32)).is_ok());
+        for pin in [
+            "0".repeat(63),
+            "0".repeat(65),
+            "A".repeat(64),
+            "g".repeat(64),
+            format!(" {}", "0".repeat(64)),
+        ] {
+            assert!(pals_packing_sha256(&pin).is_err());
+        }
+        let oversized = format!("--pals-cuda-record-pages-resources={}", " ".repeat(8193));
+        assert!(
+            PalsCudaRecordPagesOptions::default()
+                .take(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("8192 UTF-8 bytes")
+        );
+        let non_ascii = format!("--pals-cuda-record-pages-resources={}", "가".repeat(2731));
+        assert!(
+            PalsCudaRecordPagesOptions::default()
+                .take(&non_ascii)
+                .is_err()
+        );
+    }
+
+    #[cfg(all(feature = "onnx-cpu", feature = "experimental-io-binding"))]
+    #[test]
+    fn closed_resource_dto_rejects_missing_unknown_duplicate_zero_and_overflow() {
+        use super::pals_cuda_record_pages_resources;
+        let value = concat!(
+            "{\"limits\":{\"max_blocks\":1,\"max_bank_whole_payload_bytes\":16384,\"max_registry_entries\":128,",
+            "\"max_container_host_bytes\":65536,\"max_invocation_host_bytes\":8388608,\"max_invocation_device_bytes\":16777216},",
+            "\"invocation\":{\"public_session_bytes\":128,\"packing_session_bytes\":128,\"private_session_bytes\":128,",
+            "\"private_output_payload\":{\"host\":64,\"device\":64},\"original_input_and_transfer_payload\":{\"host\":64,\"device\":64},",
+            "\"additional_owner_metadata_payload\":{\"host\":65536,\"device\":0}},",
+            "\"packing_artifact\":{\"packing_session_bytes\":128,\"additional_owner_metadata_host_bytes\":65536,",
+            "\"max_owned_artifact_host_bytes\":1048576,\"max_declared_host_bytes\":4194304,\"max_declared_device_bytes\":4194304},",
+            "\"graph_inspection\":{\"max_inspection_host_bytes\":1024,\"max_wire_fields\":1024}}"
+        );
+        assert!(pals_cuda_record_pages_resources(value).is_ok());
+        assert!(
+            pals_cuda_record_pages_resources(&format!("{value}{}", " ".repeat(8192 - value.len())))
+                .is_ok()
+        );
+        for invalid in [
+            value.replacen('{', "{\"unknown\":0,", 1),
+            value.replace("\"max_blocks\":1", "\"max_blocks\":1,\"max_blocks\":1"),
+            value.replace("\"public_session_bytes\":128,", ""),
+            value.replace(
+                "\"packing_session_bytes\":128",
+                "\"packing_session_bytes\":0",
+            ),
+            value.replace(
+                "\"public_session_bytes\":128",
+                "\"public_session_bytes\":18446744073709551615",
+            ),
+            format!("{value}{}", " ".repeat(8193 - value.len())),
+        ] {
+            assert!(pals_cuda_record_pages_resources(&invalid).is_err());
+        }
+    }
+
+    #[cfg(all(feature = "onnx-cpu", feature = "experimental-io-binding"))]
+    #[test]
+    fn resident_profile_is_a_separate_named_sibling_without_creation() {
+        let control = std::env::temp_dir().join("uncreated-control-owner");
+        let resident = super::pals_cuda_record_pages_profile_root(&control).unwrap();
+        assert_eq!(resident.parent(), control.parent());
+        assert_ne!(resident, control);
+        assert_eq!(
+            resident.file_name().unwrap(),
+            "uncreated-control-owner-registered-packing-v1"
+        );
+    }
 }
 #[derive(Default)]
 struct PalsCheckerOptions {
@@ -551,12 +1142,14 @@ impl PalsNativeOptions {
             || self.cuda_loading_profile.is_some()
             || self.cuda_loading_profile_hash.is_some()
             || self.startup_probe_timeout_ms.is_some()
+            || self.cuda_record_pages.any()
     }
 }
 
 #[cfg(not(feature = "onnx-cpu"))]
 fn run_native_pals(
     _native: PalsNativeOptions,
+    _cuda_record_pages: Option<PalsCudaRecordPagesSelection>,
     _config: rz_search::pals::engine::PalsConfig,
     _rounds: u64,
     _cpu_nodes: u64,
@@ -572,6 +1165,7 @@ fn run_native_pals(
 #[cfg(feature = "onnx-cpu")]
 fn run_native_pals(
     native: PalsNativeOptions,
+    cuda_record_pages: Option<PalsCudaRecordPagesSelection>,
     config: rz_search::pals::engine::PalsConfig,
     rounds: u64,
     cpu_nodes: u64,
@@ -770,37 +1364,70 @@ fn run_native_pals(
             },
         ),
     };
+    #[cfg(feature = "experimental-io-binding")]
+    let resident_registration = match cuda_record_pages {
+        Some(selection) => {
+            let (_, control_profile) = cuda_control
+                .as_ref()
+                .ok_or("PALS CUDA record pages requires the selected inventory control owner")?;
+            let profile = pals_cuda_record_pages_profile_root(control_profile)?;
+            let (limits, invocation, declaration, inspection_budget) = selection.resources.validated_parts()
+                .map_err(|error| format!("invalid PALS CUDA record pages resource declaration: {error}; no native loading was started"))?;
+            // One guarded reader/validator owns the pinned bytes. No ORT model
+            // path reread, static CLI process or duplicate graph parser is used.
+            let checked_graph = rz_eval::pals_onnx::load_checked_fixed_packing_graph(
+                &selection.manifest,
+                &selection.graph,
+                selection.manifest_hash,
+                selection.graph_hash,
+                declaration,
+                inspection_budget,
+            )?;
+            Some(
+                rz_uci::pals_native::NativeCudaRecordPagesRegistration::for_deployment(
+                    checked_graph,
+                    limits,
+                    invocation,
+                    profile,
+                ),
+            )
+        }
+        None => None,
+    };
+    #[cfg(not(feature = "experimental-io-binding"))]
+    let _ = cuda_record_pages;
     // Observe actual runtime/model factory cost independently of the probe
     // deadline. Earlier pin/cache preparation belongs to overall CLI cost.
     let model_loading_started = std::time::Instant::now();
     let mut model = match cuda_control {
-        Some((policy, profile)) => match loading_profile {
-            Some(loading) => {
-                let runtime =
-                    rz_eval::onnx::OrtRuntime::load_with_cuda_loading_profile(&pin, loading)?;
+        Some((policy, profile)) => {
+            let runtime = match loading_profile {
+                Some(loading) => {
+                    rz_eval::onnx::OrtRuntime::load_with_cuda_loading_profile(&pin, loading)?
+                }
+                None => rz_eval::onnx::OrtRuntime::load(&pin)?,
+            };
+            #[cfg(feature = "experimental-io-binding")]
+            {
+                match resident_registration {
+                    Some(registration) => rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_registered_cuda_record_pages(
+                        &manifest, &manifest_hash, runtime, backend_config, policy,
+                        &profile, (owner_options, registration),
+                    )?,
+                    None => rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_control_policy_with_options(
+                        &manifest, &manifest_hash, runtime, backend_config, policy,
+                        &profile, owner_options,
+                    )?,
+                }
+            }
+            #[cfg(not(feature = "experimental-io-binding"))]
+            {
                 rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_control_policy_with_options(
-                    &manifest,
-                    &manifest_hash,
-                    runtime,
-                    backend_config,
-                    policy,
-                    &profile,
-                    owner_options,
+                    &manifest, &manifest_hash, runtime, backend_config, policy,
+                    &profile, owner_options,
                 )?
             }
-            None => {
-                let runtime = rz_eval::onnx::OrtRuntime::load(&pin)?;
-                rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_control_policy_with_options(
-                    &manifest,
-                    &manifest_hash,
-                    runtime,
-                    backend_config,
-                    policy,
-                    &profile,
-                    owner_options,
-                )?
-            }
-        },
+        }
         None if native.private_warm.unwrap_or(false) => {
             rz_uci::pals_native::NativeRoleModel::load_pinned_cpu_private_warm_with_options(
                 &manifest,

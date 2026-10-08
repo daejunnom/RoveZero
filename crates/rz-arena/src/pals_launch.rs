@@ -7,6 +7,7 @@ use crate::{
     ArenaError, NativeEngineView, NativeLaunchDeclaration, NativeLaunchOwner, NativePairView,
     NativeProviderDeclaration,
 };
+use rz_eval::pals_device_resources::NativeCudaRecordPagesResourceInput;
 use rz_experiments::{
     ArtifactRef, EngineEnvironmentV2, ExternalSourceV2, ExternalUciEndpointV2, HistoryCompleteness,
     InitialPosition, ManifestError, NativeEngineRole, NativeGameClockV3, NativePairClock,
@@ -45,6 +46,7 @@ pub const PALS_CLOCK_REAP_RUNNER_BYTES: u64 = 2466608;
 const MAX_JSON_BYTES: usize = 256 * 1024;
 const MAX_CONTROL_INVENTORY_BYTES: u64 = 1024 * 1024;
 const MAX_STARTUP_PROBE_TIMEOUT_MS: u64 = 180_000;
+const MAX_CUDA_RECORD_PAGES_RESOURCES_BYTES: usize = 8192;
 
 /// An actual bounded profile-file observation, separate from process startup.
 /// Registered paths are compared exactly; the hashed profile is never rewritten
@@ -307,6 +309,7 @@ pub fn validate_pals_external_cpu_r_session(
             "external helper native checkpoint/model/encoding/epoch or undeclared host mode differs",
         )?;
         require_no_undeclared_private_warm(n)?;
+        require_no_cuda_record_pages(n)?;
         let execution = &n["execution"];
         require(
             execution.is_object()
@@ -852,6 +855,90 @@ pub struct PalsOnnxCudaLaunchV3 {
     /// readiness window and never extends physical drain or the pair wall cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_probe_timeout_ms: Option<u64>,
+    /// Explicit auxiliary packing registration; omission preserves the legacy
+    /// two-model-graph recipe. Declaration is never a device Run/fence witness.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_cuda_record_pages"
+    )]
+    pub cuda_record_pages: Option<PalsCudaRecordPagesBindingV1>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum PalsCudaRecordPagesModeV1 {
+    #[serde(rename = "registered-packing-v1")]
+    RegisteredPackingV1,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsCudaRecordPagesBindingV1 {
+    pub mode: PalsCudaRecordPagesModeV1,
+    /// Independently registered implementation provenance, distinct from the
+    /// model adapter/encoding and from observed Run/physical completion.
+    pub implementation_sha256: String,
+    pub manifest: ArtifactRef,
+    pub graph: ArtifactRef,
+    pub resources: NativeCudaRecordPagesResourceInput,
+}
+fn deserialize_present_cuda_record_pages<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PalsCudaRecordPagesBindingV1>, D::Error> {
+    PalsCudaRecordPagesBindingV1::deserialize(deserializer).map(Some)
+}
+impl PalsCudaRecordPagesBindingV1 {
+    fn resources_json(&self) -> Result<String, ArenaError> {
+        self.resources
+            .validate()
+            .map_err(|error| invalid(error.to_string()))?;
+        let text =
+            serde_json::to_string(&self.resources).map_err(|error| invalid(error.to_string()))?;
+        require(
+            text.len() <= MAX_CUDA_RECORD_PAGES_RESOURCES_BYTES,
+            "resident CUDA resources require bounded inline JSON",
+        )?;
+        Ok(text)
+    }
+    fn validate(&self, cuda: &PalsOnnxCudaLaunchV3) -> Result<(), ArenaError> {
+        self.manifest.validate()?;
+        self.graph.validate()?;
+        require_public_artifact(&self.manifest)?;
+        require_public_artifact(&self.graph)?;
+        self.resources_json()?;
+        let r = &self.resources;
+        let retained = self
+            .manifest
+            .bytes
+            .checked_add(self.graph.bytes)
+            .ok_or_else(|| invalid("resident packing artifact byte overflow"))?;
+        require(
+            hash(&self.implementation_sha256)
+                && self.implementation_sha256 != "0".repeat(64)
+                && hash(&self.manifest.sha256)
+                && hash(&self.graph.sha256)
+                && (1..=512 * 1024).contains(&self.manifest.bytes)
+                && (1..=2 * 1024 * 1024).contains(&self.graph.bytes)
+                && self.manifest.path != self.graph.path
+                && retained <= r.packing_artifact.max_owned_artifact_host_bytes
+                && retained
+                    .checked_add(r.packing_artifact.additional_owner_metadata_host_bytes)
+                    .is_some_and(|n| n <= r.packing_artifact.max_declared_host_bytes)
+                && cuda.cuda_control.is_some()
+                && r.invocation.public_session_bytes == cuda.session_arena_bytes
+                && r.invocation.private_session_bytes == cuda.session_arena_bytes,
+            "resident packing pins/resources require separate registered artifacts, model control gate and exact model arenas",
+        )
+    }
+    fn declared_resources(&self) -> serde_json::Value {
+        let l = &self.resources.limits;
+        let i = &self.resources.invocation;
+        serde_json::json!({"max_blocks":l.max_blocks,"max_bank_whole_payload_bytes":l.max_bank_whole_payload_bytes,
+            "max_registry_entries":l.max_registry_entries,"max_container_host_bytes":l.max_container_host_bytes,
+            "max_invocation_host_bytes":l.max_invocation_host_bytes,"max_invocation_device_bytes":l.max_invocation_device_bytes,
+            "public_session_bytes":i.public_session_bytes,"packing_session_bytes":i.packing_session_bytes,
+            "private_session_bytes":i.private_session_bytes,"private_output_payload":i.private_output_payload,
+            "original_input_and_transfer_payload":i.original_input_and_transfer_payload,
+            "additional_owner_metadata_payload":i.additional_owner_metadata_payload})
+    }
 }
 /// Explicit reviewed metadata inventory; it does not declare GPU success.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -999,6 +1086,17 @@ impl PalsArenaLaunchV3 {
         self.semantic_lock.verify()?;
         for index in 0..2 {
             validate_launch_search_policy(self, index)?;
+            if let Some(cuda) = self.endpoints[index].cuda_model()
+                && let Some(pages) = &cuda.cuda_record_pages
+            {
+                pages.validate(cuda)?;
+                require(
+                    matches!(&self.semantic_lock.manifest.engines[index],
+                    PalsEngineV3::Pals(e) if matches!(&e.cpu_r, PalsCpuRSelectionV3::Own)
+                        && e.model.frozen_epoch == 1),
+                    "resident CUDA registration requires deployment epoch 1 and own CPU_R; external helper is unsupported",
+                )?;
+            }
             if self.external_cpu_r_binding(index)?.is_some() {
                 require(
                     cfg!(all(
@@ -1108,6 +1206,14 @@ impl PalsArenaLaunchV3 {
                             && e.pools.device_bytes <= 6 * 1024 * 1024 * 1024,
                         "CUDA explicit device budget must cover all declared session arenas; observed peak remains unknown",
                     )?;
+                    if let Some(pages) = &cuda.cuda_record_pages {
+                        require(
+                            pages.resources.limits.max_invocation_host_bytes <= e.pools.host_bytes
+                                && pages.resources.limits.max_invocation_device_bytes
+                                    <= e.pools.device_bytes,
+                            "resident combined owner invocation bounds exceed admitted host/device pools",
+                        )?;
+                    }
                 } else {
                     require(
                         e.pools.device_bytes == 0
@@ -1244,6 +1350,14 @@ impl PalsArenaLaunchV3 {
                     ),
                 ));
             }
+            if let Some(pages) = recipe
+                .cuda_model()
+                .and_then(|cuda| cuda.cuda_record_pages.as_ref())
+            {
+                let namespace = format!("pals-packing-{}", pages.manifest.sha256);
+                result.push((&pages.manifest, format!("{namespace}/device-packing.json")));
+                result.push((&pages.graph, format!("{namespace}/device_public_pack.onnx")));
+            }
         }
         result
     }
@@ -1289,6 +1403,9 @@ impl PalsArenaLaunchV3 {
                     result.extend(cuda.cuda_bundle.files.iter().map(|f| &f.artifact));
                     if let Some(control) = &cuda.cuda_control {
                         result.push(&control.inventory);
+                    }
+                    if let Some(pages) = &cuda.cuda_record_pages {
+                        result.extend([&pages.manifest, &pages.graph]);
                     }
                 }
                 PalsEndpointLaunchV3::ReferenceUci {
@@ -1518,6 +1635,26 @@ impl PalsArenaLaunchV3 {
                     }
                     if let Some(probe_ms) = cuda.startup_probe_timeout_ms {
                         args.push(format!("--pals-startup-probe-timeout-ms={probe_ms}"));
+                    }
+                    if let Some(pages) = &cuda.cuda_record_pages {
+                        pages.validate(cuda)?;
+                        require(
+                            helper.is_none(),
+                            "resident CUDA cannot launch an external helper",
+                        )?;
+                        let manifest_index = assets.len();
+                        assets.extend([pages.manifest.clone(), pages.graph.clone()]);
+                        args.extend([
+                            "--pals-cuda-record-pages=registered-packing-v1".into(),
+                            format!("--pals-packing-manifest={{{{asset:{manifest_index}}}}}"),
+                            format!("--pals-packing-manifest-sha256={}", pages.manifest.sha256),
+                            format!("--pals-packing-graph={{{{asset:{}}}}}", manifest_index + 1),
+                            format!("--pals-packing-graph-sha256={}", pages.graph.sha256),
+                            format!(
+                                "--pals-cuda-record-pages-resources={}",
+                                pages.resources_json()?
+                            ),
+                        ]);
                     }
                 }
                 if let Some((helper, _)) = helper {
@@ -2288,8 +2425,19 @@ pub struct PalsNativeSessionAuditV3 {
     pub cuda_placement: Option<PalsCudaPlacementAuditV3>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cuda_loading: Option<PalsCudaLoadingAuditV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cuda_record_pages: Option<PalsCudaRecordPagesAuditV1>,
     pub raw_native: serde_json::Value,
     pub raw_search_work: serde_json::Value,
+}
+/// Exact raw producer observations validated against an explicit launch
+/// registration. These DTOs grant no CUDA owner, completion fence or peak.
+#[derive(Clone, Debug, Serialize)]
+pub struct PalsCudaRecordPagesAuditV1 {
+    pub selection: serde_json::Value,
+    pub startup_observation: serde_json::Value,
+    pub termination_observation: serde_json::Value,
+    pub termination_observation_scope: &'static str,
 }
 /// Compact validated linkage; the original typed producer witness remains in
 /// startup_probe. Device index is the exercised producer's configured index,
@@ -3249,6 +3397,314 @@ fn require_no_undeclared_private_warm(record: &serde_json::Value) -> Result<(), 
         "unsupported undeclared private warm execution/observation: the arena lock registers Fresh whole-input execution only",
     )
 }
+fn require_no_cuda_record_pages(record: &serde_json::Value) -> Result<(), ArenaError> {
+    let present =
+        |v: &serde_json::Value, key: &str| v.as_object().is_some_and(|o| o.contains_key(key));
+    require(
+        !present(&record["execution"], "cuda_record_pages")
+            && ![
+                "cuda_record_page_observation",
+                "cuda_record_page_observation_error",
+                "cuda_record_page_observation_scope",
+            ]
+            .iter()
+            .any(|key| present(record, key))
+            && ![
+                "cuda_record_page_observation",
+                "cuda_record_page_observation_error",
+            ]
+            .iter()
+            .any(|key| present(&record["startup_probe"], key)),
+        "unregistered resident CUDA declaration/observation/marker is forbidden",
+    )
+}
+fn exact_cuda_record_page_fields(v: &serde_json::Value, fields: &[&str]) -> Result<(), ArenaError> {
+    let object = v
+        .as_object()
+        .ok_or_else(|| invalid("resident CUDA evidence must be an object"))?;
+    require(
+        object.len() == fields.len() && fields.iter().all(|key| object.contains_key(*key)),
+        "resident CUDA evidence has missing/unknown fields",
+    )
+}
+fn resident_encoding_sha256(native: &serde_json::Value) -> Result<String, ArenaError> {
+    let semantics: [u8; 32] = serde_json::from_value(native["encoding_semantic_sha256"].clone())
+        .map_err(|_| invalid("resident encoding semantic digest is not exact bytes"))?;
+    let mut hash = Sha256::new();
+    hash.update(rz_eval::pals_model::PALS_ENCODING_SCHEMA);
+    hash.update(semantics);
+    Ok(format!("{:x}", hash.finalize()))
+}
+fn validate_cuda_record_page_observation(
+    v: &serde_json::Value,
+    selection: &serde_json::Value,
+    pages: &PalsCudaRecordPagesBindingV1,
+    backend_stats: &serde_json::Value,
+) -> Result<(), ArenaError> {
+    exact_cuda_record_page_fields(
+        v,
+        &[
+            "schema",
+            "initialized_scope",
+            "initialized_provider_count",
+            "packing_native_sessions",
+            "initialized_log_sha256",
+            "initialized_log_digest_domain",
+            "packing_graph_sha256",
+            "process_epoch",
+            "game_generation",
+            "model_manifest_sha256",
+            "model_epoch",
+            "public_graph_sha256",
+            "encoding_sha256",
+            "runtime_sha256",
+            "runtime_identity_scope",
+            "device_id",
+            "live_blocks",
+            "certified_projections",
+            "whole_owner_host_bytes",
+            "whole_owner_device_bytes",
+            "active_invocation",
+            "physical_completion_unknown",
+            "quarantined",
+            "stats",
+        ],
+    )?;
+    require(
+        v["schema"] == "rz-pals-resident-cuda-record-pages-observation/1"
+            && count(v, "game_generation")? >= count(selection, "installation_game_generation")?
+            && v["active_invocation"] == false
+            && v["physical_completion_unknown"] == false
+            && v["quarantined"] == false,
+        "resident CUDA observation is stale/active/unknown/quarantined",
+    )?;
+    for field in [
+        "initialized_scope",
+        "initialized_provider_count",
+        "packing_native_sessions",
+        "initialized_log_sha256",
+        "initialized_log_digest_domain",
+        "packing_graph_sha256",
+        "process_epoch",
+        "model_manifest_sha256",
+        "model_epoch",
+        "public_graph_sha256",
+        "encoding_sha256",
+        "runtime_sha256",
+        "runtime_identity_scope",
+        "device_id",
+    ] {
+        require(
+            v[field] == selection[field],
+            "resident CUDA observed identity changed",
+        )?;
+    }
+    let r = &pages.resources;
+    let whole = count(v, "whole_owner_host_bytes")?
+        .checked_add(count(v, "whole_owner_device_bytes")?)
+        .ok_or_else(|| invalid("resident whole-owner byte overflow"))?;
+    require(
+        count(v, "live_blocks")? <= r.limits.max_blocks as u64
+            && count(v, "certified_projections")? <= r.limits.max_registry_entries as u64
+            && whole <= r.limits.max_bank_whole_payload_bytes,
+        "resident actual whole owners/index exceed their registered bounds",
+    )?;
+    let stats = &v["stats"];
+    exact_cuda_record_page_fields(
+        stats,
+        &[
+            "admitted_views",
+            "public_subset_runs_attempted",
+            "public_subset_runs_completed",
+            "packing_runs_attempted",
+            "packing_runs_completed",
+            "private_joined_runs_attempted",
+            "private_joined_runs_completed",
+            "certified_board_slices",
+            "certified_record_slices",
+            "published_blocks",
+            "last_unique_whole_pins",
+            "last_reserved_host_bytes",
+            "last_reserved_device_bytes",
+        ],
+    )?;
+    let public = count(stats, "public_subset_runs_completed")?;
+    let packing = count(stats, "packing_runs_completed")?;
+    let private = count(stats, "private_joined_runs_completed")?;
+    require(
+        public == count(stats, "public_subset_runs_attempted")?
+            && packing == count(stats, "packing_runs_attempted")?
+            && private == count(stats, "private_joined_runs_attempted")?
+            && packing == private
+            && private == count(stats, "admitted_views")?
+            && public == count(backend_stats, "public_nn_runs_completed")?
+            && private == count(backend_stats, "role_nn_runs_completed")?
+            && count(stats, "certified_board_slices")? <= public
+            && count(stats, "published_blocks")? <= public
+            && count(stats, "certified_record_slices")?
+                <= public
+                    .checked_mul(128)
+                    .ok_or_else(|| invalid("resident slice counter overflow"))?
+            && count(stats, "last_unique_whole_pins")? <= r.limits.max_blocks as u64
+            && count(stats, "last_reserved_host_bytes")? <= r.limits.max_invocation_host_bytes
+            && count(stats, "last_reserved_device_bytes")? <= r.limits.max_invocation_device_bytes,
+        "resident subset/packing/private/owner counters or combined reservations differ",
+    )
+}
+fn validate_cuda_record_pages_pair(
+    cuda: Option<&PalsOnnxCudaLaunchV3>,
+    startup: &serde_json::Value,
+    termination: &serde_json::Value,
+) -> Result<Option<PalsCudaRecordPagesAuditV1>, ArenaError> {
+    let Some((cuda, pages)) =
+        cuda.and_then(|cuda| cuda.cuda_record_pages.as_ref().map(|p| (cuda, p)))
+    else {
+        require_no_cuda_record_pages(startup)?;
+        require_no_cuda_record_pages(termination)?;
+        return Ok(None);
+    };
+    pages.validate(cuda)?;
+    let selection = &startup["execution"]["cuda_record_pages"];
+    exact_cuda_record_page_fields(
+        selection,
+        &[
+            "schema",
+            "mode",
+            "process_epoch",
+            "installation_game_generation",
+            "frozen_epoch",
+            "model_manifest_sha256",
+            "model_epoch",
+            "public_graph_sha256",
+            "encoding_sha256",
+            "runtime_sha256",
+            "runtime_identity_scope",
+            "device_id",
+            "packing_graph_sha256",
+            "packing_graph_bytes",
+            "packing_manifest_sha256",
+            "packing_manifest_bytes",
+            "known_retained_artifact_host_bytes",
+            "implementation_sha256",
+            "initialized_scope",
+            "initialized_provider_count",
+            "initialized_log_sha256",
+            "initialized_log_digest_domain",
+            "model_native_sessions",
+            "packing_native_sessions",
+            "resource_accounting_scope",
+            "declared_resources",
+        ],
+    )?;
+    let public = cuda
+        .model
+        .graphs
+        .iter()
+        .find(|g| g.role == "public")
+        .ok_or_else(|| invalid("resident public graph missing"))?;
+    let retained = count(selection, "known_retained_artifact_host_bytes")?;
+    let raw = pages
+        .manifest
+        .bytes
+        .checked_add(pages.graph.bytes)
+        .ok_or_else(|| invalid("resident artifact byte overflow"))?;
+    require(
+        selection == &termination["execution"]["cuda_record_pages"]
+            && selection["schema"] == "rz-pals-native-cuda-record-pages-selection/1"
+            && selection["mode"] == "registered-packing-v1"
+            && array_hash(&selection["implementation_sha256"])? == pages.implementation_sha256
+            && count(selection, "process_epoch")? == count(startup, "process_epoch")?
+            && count(selection, "process_epoch")? == count(termination, "process_epoch")?
+            && selection["frozen_epoch"] == 1
+            && startup["frozen_epoch"] == 1
+            && termination["frozen_epoch"] == 1
+            && selection["model_manifest_sha256"] == startup["export_manifest_sha256"]
+            && selection["model_epoch"] == startup["model_epoch"]
+            && array_hash(&selection["public_graph_sha256"])? == public.artifact.sha256
+            && array_hash(&selection["encoding_sha256"])? == resident_encoding_sha256(startup)?
+            && array_hash(&selection["runtime_sha256"])? == cuda.cuda_bundle.canonical_sha256
+            && selection["runtime_identity_scope"] == "closed_cuda_library_bundle"
+            && selection["device_id"] == cuda.device_id
+            && array_hash(&selection["packing_graph_sha256"])? == pages.graph.sha256
+            && selection["packing_graph_bytes"] == pages.graph.bytes
+            && array_hash(&selection["packing_manifest_sha256"])? == pages.manifest.sha256
+            && selection["packing_manifest_bytes"] == pages.manifest.bytes
+            && retained >= raw
+            && retained
+                <= pages
+                    .resources
+                    .invocation
+                    .additional_owner_metadata_payload
+                    .host
+            && selection["initialized_scope"] == "initialized_provider_count"
+            && selection["initialized_provider_count"] == 275
+            && array_hash(&selection["initialized_log_sha256"])? != "0".repeat(64)
+            && selection["initialized_log_digest_domain"]
+                == "rz-pals-fixed-packing-initialized-provider-count/1"
+            && selection["model_native_sessions"] == 2
+            && selection["packing_native_sessions"] == 1
+            && startup["residency"]["native_sessions"] == 2
+            && selection["resource_accounting_scope"]
+                == "combined_resident_owner_invocation_including_sessions_and_backing"
+            && selection["declared_resources"] == pages.declared_resources(),
+        "resident CUDA registered selection/actual installed identity or resources differ",
+    )?;
+    // Only the startup probe owns the post-probe/reset ACK. The final ACK is
+    // separate; an initial installed DTO is never accepted in its place.
+    let absent =
+        |v: &serde_json::Value, key: &str| !v.as_object().is_some_and(|o| o.contains_key(key));
+    require(
+        absent(startup, "cuda_record_page_observation")
+            && absent(startup, "cuda_record_page_observation_error")
+            && absent(startup, "cuda_record_page_observation_scope")
+            && absent(
+                &startup["startup_probe"],
+                "cuda_record_page_observation_error",
+            )
+            && absent(termination, "cuda_record_page_observation_error")
+            && termination["cuda_record_page_observation_scope"]
+                == "exclusive_worker_before_shutdown",
+        "resident snapshot ACK provenance is missing/failed/duplicated",
+    )?;
+    let first = &startup["startup_probe"]["cuda_record_page_observation"];
+    let last = &termination["cuda_record_page_observation"];
+    validate_cuda_record_page_observation(
+        first,
+        selection,
+        pages,
+        &startup["startup_probe"]["backend_stats"],
+    )?;
+    validate_cuda_record_page_observation(last, selection, pages, &termination["backend_stats"])?;
+    require(
+        count(first, "game_generation")? == count(startup, "game_generation")?
+            && count(last, "game_generation")? == count(termination, "game_generation")?
+            && count(last, "game_generation")? >= count(first, "game_generation")?,
+        "resident final snapshot generation differs from the actual native owner",
+    )?;
+    for key in [
+        "admitted_views",
+        "public_subset_runs_attempted",
+        "public_subset_runs_completed",
+        "packing_runs_attempted",
+        "packing_runs_completed",
+        "private_joined_runs_attempted",
+        "private_joined_runs_completed",
+        "certified_board_slices",
+        "certified_record_slices",
+        "published_blocks",
+    ] {
+        require(
+            count(&last["stats"], key)? >= count(&first["stats"], key)?,
+            "resident cumulative counter regressed",
+        )?;
+    }
+    Ok(Some(PalsCudaRecordPagesAuditV1 {
+        selection: selection.clone(),
+        startup_observation: first.clone(),
+        termination_observation: last.clone(),
+        termination_observation_scope: "exclusive_worker_before_shutdown",
+    }))
+}
 
 /// Pure wire validation. No self-reported field replaces process exit or PGN.
 pub fn validate_pals_native_records(
@@ -3320,9 +3776,8 @@ fn validate_pals_native_records_inner(
     )?;
     let sn = &s["native"];
     let tn = &t["native"];
-    // This launch revision registers only the whole-input public graph path.
-    // Optional product observations cannot silently select a different cache,
-    // layout or host-memory policy that is absent from the semantic lock.
+    // Host pages and private Warm remain unregistered. The separately explicit
+    // resident CUDA binding cannot authorize either unrelated optional mode.
     for record in [sn, tn] {
         require(
             record["execution"]["host_record_pages"].is_null()
@@ -3331,6 +3786,7 @@ fn validate_pals_native_records_inner(
         )?;
         require_no_undeclared_private_warm(record)?;
     }
+    let cuda_record_pages = validate_cuda_record_pages_pair(cuda, sn, tn)?;
     if lock
         .input
         .external_cpu_r_binding(role_index(role))?
@@ -3400,22 +3856,38 @@ fn validate_pals_native_records_inner(
                     == cuda.cuda_bundle.canonical_sha256,
             "CUDA provider/device/session/runtime bundle identity differs",
         )?;
-        let transient = count(execution, "transient_request_device_bytes")?
-            .checked_add(count(execution, "transient_execution_device_bytes")?)
-            .ok_or_else(|| invalid("CUDA transient reservation overflow"))?;
-        let arenas = cuda
-            .session_arena_bytes
-            .checked_mul(native.graphs.len() as u64)
-            .ok_or_else(|| invalid("CUDA session reservation overflow"))?;
-        require(
-            transient > 0
-                && arenas.checked_add(transient).is_some_and(|n| {
-                    n <= lock.input.semantic_lock.manifest.resources[role_index(role)]
+        if let Some(pages) = &cuda.cuda_record_pages {
+            // This authoritative invocation bound already contains all three
+            // sessions, backing/join/intermediate/input/metadata reservations.
+            // Legacy transient+model arena arithmetic would count them twice.
+            require(
+                pages.resources.limits.max_invocation_device_bytes
+                    <= lock.input.semantic_lock.manifest.resources[role_index(role)]
                         .device_allocation_max_bytes
-                })
-                && count(execution, "pinned_request_bytes")? == 0,
-            "CUDA declared budget does not cover actual tensor reservations plus session declarations",
-        )?;
+                    && pages.resources.limits.max_invocation_host_bytes
+                        <= lock.input.semantic_lock.manifest.resources[role_index(role)]
+                            .memory_max_bytes
+                    && count(execution, "pinned_request_bytes")? == 0,
+                "resident combined owner reservation exceeds actual admitted pools",
+            )?;
+        } else {
+            let transient = count(execution, "transient_request_device_bytes")?
+                .checked_add(count(execution, "transient_execution_device_bytes")?)
+                .ok_or_else(|| invalid("CUDA transient reservation overflow"))?;
+            let arenas = cuda
+                .session_arena_bytes
+                .checked_mul(native.graphs.len() as u64)
+                .ok_or_else(|| invalid("CUDA session reservation overflow"))?;
+            require(
+                transient > 0
+                    && arenas.checked_add(transient).is_some_and(|n| {
+                        n <= lock.input.semantic_lock.manifest.resources[role_index(role)]
+                            .device_allocation_max_bytes
+                    })
+                    && count(execution, "pinned_request_bytes")? == 0,
+                "CUDA declared budget does not cover actual tensor reservations plus session declarations",
+            )?;
+        }
         let probe = &sn["startup_probe"];
         cuda_loading = validate_native_loading_evidence(
             cuda,
@@ -3630,6 +4102,7 @@ fn validate_pals_native_records_inner(
             execution: sn["execution"].as_object().map(|_| sn["execution"].clone()),
             cuda_placement,
             cuda_loading,
+            cuda_record_pages,
             raw_native: tn.clone(),
             raw_search_work: t["search_work"].clone(),
         },
@@ -6455,6 +6928,7 @@ mod tests {
             session_arena_bytes: 2 << 30,
             cuda_control: None,
             startup_probe_timeout_ms: None,
+            cuda_record_pages: None,
         });
         f.budget.max_runtime_bytes = 4 << 30;
         f.budget.max_artifact_bytes = 8 << 30;
@@ -6599,6 +7073,531 @@ mod tests {
         end["native"]["backend_stats_observation"] = "exclusive_worker_before_shutdown".into();
         end["native"]["backend_stats"] = stats_fixture(2, 5);
         (start, end)
+    }
+    // These are CPU wire fixtures. Synthetic receipts exercise the acceptance
+    // boundary; they do not attest an actual CUDA owner, Run, fence or peak.
+    fn cuda_record_pages_fixture() -> PalsArenaLaunchV3 {
+        let (mut input, _) = cuda_control_fixture();
+        let resources = serde_json::from_value(serde_json::json!({
+            "limits":{"max_blocks":4,"max_bank_whole_payload_bytes":4u64<<20,
+                "max_registry_entries":512,"max_container_host_bytes":1u64<<20,
+                "max_invocation_host_bytes":32u64<<20,"max_invocation_device_bytes":5u64<<30},
+            "invocation":{"public_session_bytes":2u64<<30,"packing_session_bytes":64u64<<20,
+                "private_session_bytes":2u64<<30,"private_output_payload":{"host":0,"device":1u64<<20},
+                "original_input_and_transfer_payload":{"host":4u64<<20,"device":4u64<<20},
+                "additional_owner_metadata_payload":{"host":8u64<<20,"device":0}},
+            "packing_artifact":{"packing_session_bytes":64u64<<20,"additional_owner_metadata_host_bytes":2u64<<20,
+                "max_owned_artifact_host_bytes":4u64<<20,"max_declared_host_bytes":8u64<<20,"max_declared_device_bytes":128u64<<20},
+            "graph_inspection":{"max_inspection_host_bytes":1u64<<20,"max_wire_fields":65536}
+        })).unwrap();
+        let mut manifest = asset("packing/device-packing.json");
+        manifest.sha256 = "c".repeat(64);
+        let mut graph = asset("packing/device_public_pack.onnx");
+        graph.sha256 = "d".repeat(64);
+        let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut input.endpoints[0] else {
+            unreachable!()
+        };
+        cuda.cuda_record_pages = Some(PalsCudaRecordPagesBindingV1 {
+            mode: PalsCudaRecordPagesModeV1::RegisteredPackingV1,
+            implementation_sha256: "e".repeat(64),
+            manifest,
+            graph,
+            resources,
+        });
+        input
+    }
+    fn cuda_record_page_wire_fixture(
+        lock: &LockedPalsArenaLaunchV3,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let (mut start, mut end) = cuda_records_fixture(lock);
+        let cuda = lock.input.endpoints[0].cuda_model().unwrap();
+        let pages = cuda.cuda_record_pages.as_ref().unwrap();
+        let native = &start["native"];
+        let public = cuda
+            .model
+            .graphs
+            .iter()
+            .find(|g| g.role == "public")
+            .unwrap();
+        let selection = serde_json::json!({
+            "schema":"rz-pals-native-cuda-record-pages-selection/1","mode":"registered-packing-v1",
+            "process_epoch":1,"installation_game_generation":0,"frozen_epoch":1,
+            "model_manifest_sha256":native["export_manifest_sha256"],"model_epoch":native["model_epoch"],
+            "public_graph_sha256":hash_array(&public.artifact.sha256),
+            "encoding_sha256":hash_array(&resident_encoding_sha256(native).unwrap()),
+            "runtime_sha256":hash_array(&cuda.cuda_bundle.canonical_sha256),"runtime_identity_scope":"closed_cuda_library_bundle",
+            "device_id":0,"packing_graph_sha256":hash_array(&pages.graph.sha256),"packing_graph_bytes":pages.graph.bytes,
+            "packing_manifest_sha256":hash_array(&pages.manifest.sha256),"packing_manifest_bytes":pages.manifest.bytes,
+            "known_retained_artifact_host_bytes":4096,"implementation_sha256":hash_array(&pages.implementation_sha256),
+            "initialized_scope":"initialized_provider_count","initialized_provider_count":275,
+            "initialized_log_sha256":hash_array(&"f".repeat(64)),"initialized_log_digest_domain":"rz-pals-fixed-packing-initialized-provider-count/1",
+            "model_native_sessions":2,"packing_native_sessions":1,
+            "resource_accounting_scope":"combined_resident_owner_invocation_including_sessions_and_backing",
+            "declared_resources":pages.declared_resources()
+        });
+        let snapshot = |generation: u64, public: u64, private: u64, live: u64| {
+            let mut fields = serde_json::Map::new();
+            for key in [
+                "initialized_scope",
+                "initialized_provider_count",
+                "packing_native_sessions",
+                "initialized_log_sha256",
+                "initialized_log_digest_domain",
+                "packing_graph_sha256",
+                "process_epoch",
+                "model_manifest_sha256",
+                "model_epoch",
+                "public_graph_sha256",
+                "encoding_sha256",
+                "runtime_sha256",
+                "runtime_identity_scope",
+                "device_id",
+            ] {
+                fields.insert(key.into(), selection[key].clone());
+            }
+            let mut value = serde_json::Value::Object(fields);
+            value["schema"] = "rz-pals-resident-cuda-record-pages-observation/1".into();
+            value["game_generation"] = generation.into();
+            value["live_blocks"] = live.into();
+            value["certified_projections"] = live.into();
+            value["whole_owner_host_bytes"] = (live * 128).into();
+            value["whole_owner_device_bytes"] = (live * 512).into();
+            value["active_invocation"] = false.into();
+            value["physical_completion_unknown"] = false.into();
+            value["quarantined"] = false.into();
+            value["stats"] = serde_json::json!({"admitted_views":private,
+                "public_subset_runs_attempted":public,"public_subset_runs_completed":public,
+                "packing_runs_attempted":private,"packing_runs_completed":private,
+                "private_joined_runs_attempted":private,"private_joined_runs_completed":private,
+                "certified_board_slices":public,"certified_record_slices":public,"published_blocks":public,
+                "last_unique_whole_pins":1,"last_reserved_host_bytes":16u64<<20,"last_reserved_device_bytes":5u64<<30});
+            value
+        };
+        let first = snapshot(1, 1, 2, 0);
+        let last = snapshot(2, 2, 5, 2);
+        // Fresh UCI owner generation is 1; the installed backend was generation
+        // 0 before the actual startup NewGame reset ACK recorded below.
+        start["native"]["game_generation"] = 1.into();
+        // The game adds its own ucinewgame after the startup reset.
+        end["native"]["game_generation"] = 2.into();
+        for record in [&mut start, &mut end] {
+            record["native"]["execution"]["cuda_record_pages"] = selection.clone();
+            record["native"]["startup_probe"]["cuda_record_page_observation"] = first.clone();
+        }
+        end["native"]["cuda_record_page_observation"] = last;
+        end["native"]["cuda_record_page_observation_scope"] =
+            "exclusive_worker_before_shutdown".into();
+        attach_control_witness(lock, &mut start, &mut end);
+        (start, end)
+    }
+    fn audit_cuda_record_page_wire(
+        lock: &LockedPalsArenaLaunchV3,
+        start: &serde_json::Value,
+        end: &serde_json::Value,
+    ) -> Result<(PalsNativeSessionAuditV3, u32), ArenaError> {
+        validate_pals_native_records(
+            lock,
+            NativeEngineRole::Baseline,
+            &serde_json::to_vec(start).unwrap(),
+            &serde_json::to_vec(end).unwrap(),
+            "native-process-100",
+        )
+    }
+    #[test]
+    fn resident_cuda_omission_preserves_legacy_lock_arguments_and_audit_projection() {
+        for old in [cuda_fixture().0, cuda_control_fixture().0] {
+            let text = serde_json::to_string(&old).unwrap();
+            assert!(!text.contains("cuda_record_pages"));
+            let decoded = PalsArenaLaunchV3::from_json(&text).unwrap();
+            assert_eq!(
+                crate::canonical_sha256(&decoded).unwrap(),
+                crate::canonical_sha256(&old).unwrap()
+            );
+            let old_lock = old.lock().unwrap();
+            let decoded_lock = decoded.lock().unwrap();
+            assert_eq!(old_lock.sha256(), decoded_lock.sha256());
+            for index in 0..2 {
+                assert_eq!(
+                    old_lock.endpoint_views[index].arguments,
+                    decoded_lock.endpoint_views[index].arguments
+                );
+                assert_eq!(
+                    old_lock.endpoint_views[index].assets,
+                    decoded_lock.endpoint_views[index].assets
+                );
+            }
+            let (mut start, mut end) = cuda_records_fixture(&old_lock);
+            if old_lock.input.endpoints[0]
+                .cuda_model()
+                .unwrap()
+                .cuda_control
+                .is_some()
+            {
+                attach_control_witness(&old_lock, &mut start, &mut end);
+            }
+            let audit = audit_cuda_record_page_wire(&old_lock, &start, &end)
+                .unwrap()
+                .0;
+            assert!(
+                serde_json::to_value(audit)
+                    .unwrap()
+                    .get("cuda_record_pages")
+                    .is_none()
+            );
+            let mut invalid = serde_json::to_value(&old_lock.input).unwrap();
+            invalid["endpoints"][0]["configuration"]["cuda_record_pages"] = serde_json::Value::Null;
+            assert!(
+                PalsArenaLaunchV3::from_json(&serde_json::to_string(&invalid).unwrap()).is_err()
+            );
+        }
+    }
+    #[test]
+    fn resident_cuda_separate_assets_and_six_flags_fit_maximum_registered_own_recipe() {
+        let mut input = cuda_record_pages_fixture();
+        let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut input.endpoints[0] else {
+            unreachable!()
+        };
+        cuda.cuda_control.as_mut().unwrap().loading_profile = Some(loading_binding_fixture());
+        cuda.startup_probe_timeout_ms = Some(30_000);
+        let input = select_post_repair_recheck(input);
+        let mut legacy = input.clone();
+        let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut legacy.endpoints[0] else {
+            unreachable!()
+        };
+        cuda.cuda_record_pages = None;
+        let legacy = legacy.lock().unwrap();
+        let lock = input.lock().unwrap();
+        let args = &lock.endpoint_views[0].arguments;
+        assert_eq!(legacy.endpoint_views[0].arguments.len(), 23);
+        assert_eq!(args.len(), 29);
+        assert!(args.len() <= 32 && args.iter().all(|arg| arg.len() <= 4096));
+        let prefixes = [
+            "--pals-cuda-record-pages=",
+            "--pals-packing-manifest=",
+            "--pals-packing-manifest-sha256=",
+            "--pals-packing-graph=",
+            "--pals-packing-graph-sha256=",
+            "--pals-cuda-record-pages-resources=",
+        ];
+        for prefix in prefixes {
+            assert_eq!(args.iter().filter(|arg| arg.starts_with(prefix)).count(), 1);
+        }
+        let without_selected: Vec<_> = args
+            .iter()
+            .filter(|arg| !prefixes.iter().any(|p| arg.starts_with(p)))
+            .cloned()
+            .collect();
+        assert_eq!(without_selected, legacy.endpoint_views[0].arguments);
+        let resource_text = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--pals-cuda-record-pages-resources="))
+            .unwrap();
+        assert!(resource_text.starts_with('{') && resource_text.len() <= 8192);
+        let cuda = lock.input.endpoints[0].cuda_model().unwrap();
+        let pages = cuda.cuda_record_pages.as_ref().unwrap();
+        assert_eq!(
+            crate::decode_json::<NativeCudaRecordPagesResourceInput>(resource_text).unwrap(),
+            pages.resources
+        );
+        assert_eq!(cuda.model.graphs.len(), 2);
+        assert!(cuda.model.graphs.iter().all(|g| g.role != "packing"));
+        assert_eq!(
+            lock.endpoint_views[0].assets.len(),
+            legacy.endpoint_views[0].assets.len() + 2
+        );
+        assert_eq!(
+            lock.input.declared_artifacts().len(),
+            legacy.input.declared_artifacts().len() + 2
+        );
+        assert_eq!(
+            lock.snapshot_relative_path(&pages.manifest).unwrap(),
+            format!("pals-packing-{}/device-packing.json", pages.manifest.sha256)
+        );
+        assert_eq!(
+            lock.snapshot_relative_path(&pages.graph).unwrap(),
+            format!(
+                "pals-packing-{}/device_public_pack.onnx",
+                pages.manifest.sha256
+            )
+        );
+    }
+    #[test]
+    fn resident_cuda_registration_rejects_partial_null_unknown_and_incompatible_declarations() {
+        let input = cuda_record_pages_fixture();
+        input.clone().lock().unwrap();
+        let raw = serde_json::to_value(&input).unwrap();
+        for mutation in 0..9 {
+            let mut bad = raw.clone();
+            let pages = &mut bad["endpoints"][0]["configuration"]["cuda_record_pages"];
+            match mutation {
+                0 => *pages = serde_json::Value::Null,
+                1 => {
+                    pages.as_object_mut().unwrap().remove("graph");
+                }
+                2 => pages["mode"] = "registered-packing-v2".into(),
+                3 => pages["extra"] = true.into(),
+                4 => pages["implementation_sha256"] = "E".repeat(64).into(),
+                5 => pages["resources"]["limits"]["max_blocks"] = serde_json::json!(4.0),
+                6 => {
+                    pages["resources"]["invocation"]["packing_session_bytes"] =
+                        serde_json::json!(u64::MAX)
+                }
+                7 => pages["graph"]["bytes"] = serde_json::json!(2u64 * 1024 * 1024 + 1),
+                _ => {
+                    pages["resources"]["limits"]["max_invocation_device_bytes"] =
+                        serde_json::json!(7u64 << 30)
+                }
+            }
+            assert!(
+                PalsArenaLaunchV3::from_json(&serde_json::to_string(&bad).unwrap()).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        let duplicate = serde_json::to_string(&raw).unwrap().replacen(
+            "\"mode\":\"registered-packing-v1\"",
+            "\"mode\":\"registered-packing-v1\",\"mode\":\"registered-packing-v1\"",
+            1,
+        );
+        assert!(PalsArenaLaunchV3::from_json(&duplicate).is_err());
+        // Fields cannot cross to CPU/reference/OwnCpu endpoint schemas.
+        let declaration = raw["endpoints"][0]["configuration"]["cuda_record_pages"].clone();
+        for other in [
+            serde_json::to_value(native_fixture()).unwrap(),
+            serde_json::to_value(fixture()).unwrap(),
+        ] {
+            for index in 0..2 {
+                let mut bad = other.clone();
+                bad["endpoints"][index]["configuration"]["cuda_record_pages"] = declaration.clone();
+                assert!(
+                    PalsArenaLaunchV3::from_json(&serde_json::to_string(&bad).unwrap()).is_err()
+                );
+            }
+        }
+        let mut reference = serde_json::to_value(PalsEndpointLaunchV3::ReferenceUci {
+            expected_uci_name: "reference".into(),
+            arguments: vec![],
+            environment: None,
+        })
+        .unwrap();
+        reference["configuration"]["cuda_record_pages"] = declaration;
+        assert!(
+            crate::decode_json::<PalsEndpointLaunchV3>(&serde_json::to_string(&reference).unwrap())
+                .is_err()
+        );
+        let mut no_control = input.clone();
+        let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut no_control.endpoints[0] else {
+            unreachable!()
+        };
+        cuda.cuda_control = None;
+        assert!(no_control.lock().is_err());
+        let mut declared_helper = input.clone();
+        let PalsEngineV3::Pals(engine) = &mut declared_helper.semantic_lock.manifest.engines[0]
+        else {
+            unreachable!()
+        };
+        let mut binary = asset("helper/stockfish");
+        binary.source = "https://github.com/official-stockfish/Stockfish".into();
+        binary.license = "GPL-3.0-or-later".into();
+        engine.cpu_r = PalsCpuRSelectionV3::ExternalUci(Box::new(PalsExternalCpuRV3 {
+            selection: PalsExternalCpuRSelectionV3::StockfishEmbeddedNnue,
+            profile: asset("helper/profile.json"),
+            profile_canonical_sha256: "a".repeat(64),
+            binary,
+            resolver: PalsExternalCpuRResolverV3 {
+                version: rz_search::pals::value::MODEL_WDL_RESOLVER_VERSION.into(),
+                semantics_sha256: digest(
+                    rz_search::pals::value::MODEL_WDL_RESOLVER_SEMANTICS.as_bytes(),
+                ),
+            },
+            policy: PalsExternalCpuRPolicyV3 {
+                resource_scope: PalsExternalCpuRResourceScopeV3::InheritedParentCgroup,
+                max_owners: 1,
+                max_active_tasks: 1,
+                max_process_leaders: 1,
+                inherited_kernel_tasks_max: 128,
+                threads_max: 2,
+                hash_mib_max: 16,
+                max_depth: 8,
+                max_prefix_plies: 64,
+                max_nodes_per_task: 10_000,
+                handshake_max_ms: 1000,
+                task_wall_time_max_ms: 1000,
+                stop_grace_max_ms: 100,
+                shutdown_grace_max_ms: 100,
+                lifetime_output_bytes_max: 4096,
+                line_bytes_max: 1024,
+            },
+        }));
+        declared_helper.semantic_lock = declared_helper.semantic_lock.manifest.lock().unwrap();
+        let error = declared_helper.validate().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("resident CUDA registration requires")
+        );
+        let mut helper = input;
+        let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut helper.endpoints[0] else {
+            unreachable!()
+        };
+        cuda.model.external_cpu_r = Some(PalsExternalCpuRLaunchV3 {
+            registered_program: "/registered-cas/stockfish".into(),
+            registered_working_directory: "/registered-cas".into(),
+        });
+        assert!(helper.lock().is_err());
+    }
+    #[test]
+    fn resident_cuda_audit_preserves_distinct_actual_selection_dynamic_ack_and_model_counts() {
+        let lock = cuda_record_pages_fixture().lock().unwrap();
+        let (start, end) = cuda_record_page_wire_fixture(&lock);
+        let (audit, pid) = audit_cuda_record_page_wire(&lock, &start, &end).unwrap();
+        assert_eq!(pid, 100);
+        let resident = audit.cuda_record_pages.unwrap();
+        assert_eq!(
+            resident.selection,
+            start["native"]["execution"]["cuda_record_pages"]
+        );
+        assert_eq!(
+            resident.startup_observation,
+            start["native"]["startup_probe"]["cuda_record_page_observation"]
+        );
+        assert_eq!(
+            resident.termination_observation,
+            end["native"]["cuda_record_page_observation"]
+        );
+        assert_ne!(
+            resident.startup_observation,
+            resident.termination_observation
+        );
+        assert_eq!(
+            array_hash(&resident.selection["implementation_sha256"]).unwrap(),
+            "e".repeat(64)
+        );
+        assert_ne!(
+            resident.selection["implementation_sha256"],
+            start["native"]["adapter_source_sha256"]
+        );
+        assert_eq!(audit.startup_nn_calls_completed, 3);
+        assert_eq!(end["native"]["backend_stats"]["completed_nn_inputs"], 7);
+        assert_eq!(
+            resident.termination_observation["stats"]["packing_runs_completed"],
+            5
+        );
+        // Retained CheckedFixedPackingGraph wrapper bytes may exceed the raw
+        // artifact sub-budget, but must fit additional owner metadata.
+        let mut wrapper_start = start.clone();
+        let mut wrapper_end = end.clone();
+        for r in [&mut wrapper_start, &mut wrapper_end] {
+            r["native"]["execution"]["cuda_record_pages"]["known_retained_artifact_host_bytes"] =
+                serde_json::json!(5u64 << 20);
+        }
+        assert!(audit_cuda_record_page_wire(&lock, &wrapper_start, &wrapper_end).is_ok());
+    }
+    #[test]
+    fn resident_cuda_audit_rejects_borrowed_ack_drift_unknown_and_missing_physical_close() {
+        let lock = cuda_record_pages_fixture().lock().unwrap();
+        let (start, end) = cuda_record_page_wire_fixture(&lock);
+        for mutation in 0..15 {
+            let mut s = start.clone();
+            let mut t = end.clone();
+            match mutation {
+                0 => {
+                    for r in [&mut s, &mut t] {
+                        r["native"]["execution"]["cuda_record_pages"]["implementation_sha256"] =
+                            hash_array(&"b".repeat(64)).into();
+                    }
+                }
+                1 => {
+                    t["native"]["cuda_record_page_observation"] =
+                        s["native"]["startup_probe"]["cuda_record_page_observation"].clone()
+                }
+                2 => t["native"]["cuda_record_page_observation"]["game_generation"] = 0.into(),
+                3 => {
+                    t["native"]["cuda_record_page_observation"]["physical_completion_unknown"] =
+                        true.into()
+                }
+                4 => t["native"]["cuda_record_page_observation"]["quarantined"] = true.into(),
+                5 => {
+                    t["native"]["cuda_record_page_observation"]["stats"]["packing_runs_completed"] =
+                        4.into()
+                }
+                6 => {
+                    t["native"]["cuda_record_page_observation"]["stats"]["certified_board_slices"] =
+                        0.into()
+                }
+                7 => {
+                    t["native"]["cuda_record_page_observation_scope"] = "installed_snapshot".into()
+                }
+                8 => t["native"]["cuda_record_page_observation_error"] = serde_json::Value::Null,
+                9 => {
+                    s["native"]["cuda_record_page_observation"] =
+                        end["native"]["cuda_record_page_observation"].clone()
+                }
+                10 => t["native"]["cuda_record_page_observation"]["extra"] = true.into(),
+                11 => t["native"]["physical_shutdown_confirmed"] = false.into(),
+                12 => {
+                    t["native"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("cuda_record_page_observation");
+                }
+                13 => {
+                    t["native"]["cuda_record_page_observation"]["stats"]["last_reserved_device_bytes"] =
+                        serde_json::json!(6u64 << 30)
+                }
+                _ => {
+                    for r in [&mut s, &mut t] {
+                        r["native"]["startup_probe"]["cuda_record_page_observation"]["game_generation"] =
+                            0.into();
+                    }
+                }
+            }
+            assert!(
+                audit_cuda_record_page_wire(&lock, &s, &t).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        let bytes = serde_json::to_string(&end).unwrap().replacen(
+            "\"packing_runs_completed\":5",
+            "\"packing_runs_completed\":5,\"packing_runs_completed\":5",
+            1,
+        );
+        assert!(
+            validate_pals_native_records(
+                &lock,
+                NativeEngineRole::Baseline,
+                &serde_json::to_vec(&start).unwrap(),
+                bytes.as_bytes(),
+                "native-process-100"
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn resident_cuda_unregistered_markers_are_rejected_even_when_null_or_declaration_only() {
+        let lock = cuda_fixture().0.lock().unwrap();
+        let (start, end) = cuda_records_fixture(&lock);
+        for key in [
+            "cuda_record_page_observation",
+            "cuda_record_page_observation_error",
+            "cuda_record_page_observation_scope",
+        ] {
+            let mut bad = end.clone();
+            bad["native"][key] = serde_json::Value::Null;
+            assert!(audit_cuda_record_page_wire(&lock, &start, &bad).is_err());
+        }
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!({"mode":"registered-packing-v1"}),
+        ] {
+            let mut bad = end.clone();
+            bad["native"]["execution"]["cuda_record_pages"] = value;
+            assert!(audit_cuda_record_page_wire(&lock, &start, &bad).is_err());
+            assert!(validate_cuda_record_pages_pair(None, &bad["native"], &bad["native"]).is_err());
+            assert!(require_no_cuda_record_pages(&bad["native"]).is_err());
+        }
+        let selected = cuda_record_pages_fixture().lock().unwrap();
+        let (s, t) = cuda_records_fixture(&selected);
+        assert!(audit_cuda_record_page_wire(&selected, &s, &t).is_err());
     }
     #[test]
     fn undeclared_host_record_pages_cannot_be_accepted_as_whole_input_native_execution() {
@@ -8433,6 +9432,7 @@ mod tests {
             execution: None,
             cuda_placement: None,
             cuda_loading: None,
+            cuda_record_pages: None,
             raw_native: serde_json::json!({"backend_stats_observation":"exclusive_worker_before_shutdown","observer_failures":0,"last_observer_failure":null,"frozen_epoch":1,
                 "backend_stats":{"public_nn_runs_completed":1,"role_nn_runs_completed":3,"completed_nn_inputs":4,"public_cache_hits":2,
                     "public_nn_runs_failed_known":0,"role_nn_runs_failed_known":0,"public_nn_runs_attempted":1,"role_nn_runs_attempted":3,
