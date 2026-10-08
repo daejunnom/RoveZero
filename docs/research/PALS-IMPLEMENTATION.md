@@ -1608,3 +1608,31 @@ Pair example은 `fresh=false`이며 113,055,936B/
 이는 실제 역사 소스 `0027464`의 Linux 바이너리이며 이후 Windows import 수정이나
 문서 커밋에서 새로 빌드한 것으로 표시하지 않는다. 새 자체 CPU_R pilot이 이 등록을
 사용할 때 모델·시계·자원·source proof와 최종 PR 검사를 각각 기록한다.
+
+### 최종 CPU CI와 추가 실행 보류
+
+Windows import 조건 수정 `f533b97`의
+[CI 37710950947](https://github.com/daejunnom/RoveZero/actions/runs/37710950947)는
+Linux·Windows·CPU bindings·PALS model CPU 네 job 모두 실제 성공했다.
+최종 Windows 완료는 2026-10-08 01:09:52 UTC다. 기존 `0027464`의 Windows
+컴파일 실패를 보존하며, 새 CI를 역사적 build89 바이너리의 새 빌드나 실제 대국
+성공으로 표시하지 않는다.
+
+별도 actual81 Repair suffix의 실제 CPU 검사를 위한 환경 준비 제어 호출은
+exit 1로 종료됐다. 실제 도달 단계는 미확인이며, 두 준비 로그는 0B였고 driver 결과·최종 managed
+정리 영수증은 얻지 못했다. 이후 Ubuntu가 중지 상태임을 확인했으나 원인을
+OOM으로 확정하지 않는다. unit 부재만으로 소유 lease·scratch의 정리 완료를
+인수하지 않으며, 원본 시도와 로그를 보존한 상태에서 같은 namespace를 다시
+실행하지 않는다. 모델 실행·frozen loss·checkpoint 인수는 미확인이다.
+
+현재 GPU 검증은 사용자 지시로 계속 보류한다. 추가 CPU 신경망·paired 실행은
+호스트 메모리 여유 확인과 중단된 소유 작업의 복구 확인 뒤에만 진행한다.
+그동안 별도 CPU04 자체 Rust CPU_R pilot의 소스 준비를 수행한다. 독립 검토에서
+검증된 Python 원문과 bytecode cache의 실행 경로 차이, 최종 준비 실패 뒤 성공
+영수증을 재사용할 수 있는 경계를 발견했다. 확인된 원문 bytes의 직접 실행과
+최종 성공·실제 exit 0의 별도 인수를 연결하기 전에는 대국을 시작하지 않는다.
+
+최소 P6의 자체 CPU 상대 pilot과 외부 Stockfish helper의 양성 인수를 구분한다.
+CPU04가 성공하더라도 CPU03의 외부 helper 실패 여섯 건을 대체하지 않는다.
+조건부 C slot·Repair 수순 비교의 합성 정확성, 실제 모델 소비, 전략적 품질,
+전체 엔진 대국도 각각 별도 인수다. PR은 Draft이며 전체 목표는 아직 미완료다.
