@@ -972,6 +972,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             PhysicalPoll::Ready(Ok(PalsNativeResult::Stats(_))) => {
                 return Err("cache reset unexpectedly returned native statistics".into())
             }
+            #[cfg(feature = "experimental-io-binding")]
+            PhysicalPoll::Ready(Ok(PalsNativeResult::CudaRecordPagesObserved(_))) => {
+                return Err("cache reset unexpectedly returned resident CUDA metadata".into())
+            }
             PhysicalPoll::Ready(Ok(PalsNativeResult::RuntimeVerified)) => {
                 return Err("cache reset unexpectedly returned runtime verification".into())
             }
@@ -1007,6 +1011,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     PalsNativeResult::Stats(_) => {
                         return Err("evaluation unexpectedly returned native statistics".into())
+                    }
+                    #[cfg(feature = "experimental-io-binding")]
+                    PalsNativeResult::CudaRecordPagesObserved(_) => {
+                        return Err("evaluation unexpectedly returned resident CUDA metadata".into())
                     }
                     PalsNativeResult::RuntimeVerified => {
                         return Err("evaluation unexpectedly returned runtime verification".into())

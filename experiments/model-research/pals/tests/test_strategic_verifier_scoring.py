@@ -23,7 +23,7 @@ from rz_pals_model import strategic_verifier_scoring as scoring
 from rz_pals_model import verifier_producer as legacy
 from rz_pals_model.config import ModelConfig
 from rz_pals_model.model import initialize
-from rz_pals_model.training import _parameter_digest
+from rz_pals_model.preparation_check import _parameter_digest
 from test_strategic_verifier_query import QueryFixture
 
 
