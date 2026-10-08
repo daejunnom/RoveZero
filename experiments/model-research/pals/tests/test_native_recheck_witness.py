@@ -323,6 +323,12 @@ class NativeRecheckBoundaryTests(unittest.TestCase):
         fixture.rows = []
         self.assertEqual(fixture.read(), [])
 
+    def test_empty_optional_journal_does_not_relax_nonempty_exact_jsonl(self):
+        self.assertEqual(witness._optional_jsonl_rows(b""), [])
+        for raw in (b'{"stage":"prepared"}', b"\n"):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                witness._optional_jsonl_rows(raw)
+
     def test_trace_payload_or_descriptor_mutation_cannot_be_resealed_as_observation(self):
         fixture = SyntheticTrace()
         fixture.rows[-1]["data"]["synthetic_endpoint_missing"] = False

@@ -244,6 +244,17 @@ def _recheck_identity(value):
     return copy.deepcopy(value)
 
 
+def _optional_jsonl_rows(raw):
+    """An empty optional journal has no observations, never completion authority.
+
+    Nonempty journals keep the existing exact newline/JSONL parser. Required
+    prepared input and producer journals do not use this optional boundary.
+    """
+    if type(raw) is bytes and raw == b"":
+        return []
+    return native._rows(raw)
+
+
 def _sealed_trace_rows(raw, *, expected_pin, identity, descriptor_sha256):
     """Whole raw file seals and one exact attempt's order, not its validity.
 
@@ -255,7 +266,7 @@ def _sealed_trace_rows(raw, *, expected_pin, identity, descriptor_sha256):
     selected_identity = _recheck_identity(identity)
     _sha(descriptor_sha256)
     selected, groups = [], {}
-    for _, row in native._rows(raw):
+    for _, row in _optional_jsonl_rows(raw):
         _fields(row, ("domain", "stage", "game_id", "identity", "descriptor_sha256", "payload_sha256", "observer_elapsed_us", "data"))
         if row["domain"] != TRACE_DOMAIN or row["stage"] not in ("prepared", "reply_bound", "finished"):
             raise ValueError("native recheck trace domain/stage")
@@ -381,7 +392,7 @@ def _prepared_input_rows(initial_repair, *, input_sha256, native_request, kind, 
             or sidecar["canonical_tensor_sha256"] != anchors["canonical_tensor_sha256"]):
         raise ValueError("native recheck actual sealed tensor or encoding differs from the prepared call")
     tensor = _parse(sidecar["tensor_json"].encode(), MAX_BYTES)
-    sources = native._rows(artifacts["public-record-sources.jsonl"])
+    sources = _optional_jsonl_rows(artifacts["public-record-sources.jsonl"])
     source = _parse(initial_repair._raws[1])[1]
     if len(tensor["records"]) != len(snapshot["public_records"]):
         raise ValueError("native recheck public token/source roster mismatch")
@@ -440,7 +451,7 @@ def _raw_reply_events(*, events_bytes, output_bytes, game_id, input_sha256, nati
     if type(game_id) is not str or not game_id or len(game_id.encode()) > 256:
         raise ValueError("native recheck bounded game identity required")
     events, outputs = [], []
-    for _, event in native._rows(events_bytes):
+    for _, event in _optional_jsonl_rows(events_bytes):
         _fields(event, ("domain", "game_id", "process_epoch", "request_sequence", "input_sha256", "stage", "observer_elapsed_us", "detail"))
         native._request([event["process_epoch"], event["request_sequence"]])
         _sha(event["input_sha256"])
@@ -454,7 +465,7 @@ def _raw_reply_events(*, events_bytes, output_bytes, game_id, input_sha256, nati
             events.append(event)
         elif event["input_sha256"] == input_sha256:
             raise ValueError("native recheck Reply input attributed to a different request")
-    for _, output in native._rows(output_bytes):
+    for _, output in _optional_jsonl_rows(output_bytes):
         _fields(output, ("domain", "process_epoch", "request_sequence", "input_sha256", "physical_completion_confirmed", "success", "raw"))
         native._request([output["process_epoch"], output["request_sequence"]])
         _sha(output["input_sha256"])
