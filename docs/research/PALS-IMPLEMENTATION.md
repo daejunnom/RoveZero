@@ -1636,3 +1636,44 @@ OOM으로 확정하지 않는다. unit 부재만으로 소유 lease·scratch의 
 CPU04가 성공하더라도 CPU03의 외부 helper 실패 여섯 건을 대체하지 않는다.
 조건부 C slot·Repair 수순 비교의 합성 정확성, 실제 모델 소비, 전략적 품질,
 전체 엔진 대국도 각각 별도 인수다. PR은 Draft이며 전체 목표는 아직 미완료다.
+
+## 재개 시 범위 대조와 CPU04 준비 감독기 소스
+
+사용자는 이번 GPU 검증을 보류했다. 실제 학습 제외 조건도 유지한다. GPU 실행을
+하지 않았으며, 메모리 여유와 actual81 소유권 회수가 확인되기 전에는 WSL 모델 실행·
+CPU 신경망 대국을 재개하지 않는다. 경량 Windows stdlib 메타데이터 검사와 소스 작업은
+별도 범위다. 원래 실패 자료·lease·보존 산출물을 성공 상태로 고쳐 다음 실행을 열지 않는다.
+
+CPU04 준비의 자기 보고와 실제 종료를 구별하는 총괄 감독기 초안을 보존 루트에 작성했다.
+freeze revision 3의 정확한 원문 bytes를 로드하고, nonce-bound oneshot 서비스에서 준비를
+실행하도록 연결했다. 독립 main PID·start ticks·실행 이미지·Invocation·cgroup·자원 관측,
+actual wait client exit·stdout/stderr EOF·소유 cgroup 부재와 source 전후 일치가 모두 필요하다.
+로그 저장 실패는 서비스 정리를 막지 않으며 양성 admission은 거부한다. 원래 300초 작업과
+30초 정리의 전체 창은 갱신하지 않는다. 최종 출력 후에도 deadline·취소를 다시 확인한다.
+시간 필드는 게시 전 범위이며, 호출한 총괄의 실제 supervisor exit·EOF·전체 시간·게시 pin
+인수가 끝나야 대국 runner를 시작할 수 있다. 이 실제 Linux 연결 인수는 아직 미실행이다.
+
+수정된 감독기 소스 `a08e10407d80b59a07393bc59ec9cdea9a0301f961207358947c6c08166939ad`
+21,685 bytes를 대상으로 Windows Python 3.10 stdlib의 syntax/module 및 순수 finality
+메타데이터 37개 검사를 실제 실행해 모두 통과했다. 기존 CPU04 revision 3의 raw loader·
+publication 31개 검사와 별도 결과다. 이 검사는 실제 서비스·O_NOFOLLOW·권한 전환·
+모델·GPU·물리 정리·admission 발행을 관측하지 않았으며 준비나 대국 인수로 승격하지 않는다.
+
+전체 원문의 구현 목록을 다시 대조하여, 최소 CPU pilot과 전체 계획 완료를 구분한다.
+
+| 항목 | 현재 범위와 남은 작업 |
+|---|---|
+| CPU04 최종 인수 | 준비 감독기와 typed Core·실신경망·시계·PGN·수명·저장 인수는 미실행. 실패한 `go`의 알려진 정수 계수 0을 요구하며 CPU03 자료로 대체하지 않는다. |
+| CPU 캡처 정렬 | 기존 MVV/LVA는 원문 기본 SEE와 다르다. legacy identity를 보존한 명시적 `LegalSeeV1` 구현과 consumer 연결·인수를 별도로 진행한다. 제한 교환 점수는 전게임 bound가 아니다. |
+| 학습 준비용 V 환류 | 기존 부모당 한 번의 cold V→CPU→label은 새 CPU 결과→새 immutable 과제 입력→V 판단 갱신→다음 작업의 반복을 대신하지 않는다. 별도 bounded coverage feedback 경로를 준비한다. 기존 seal·reader와 제품 V-free 경로는 보존한다. |
+| CUDA record별 공개 K/V bank | host record pages와 CUDA whole-input cache는 존재하지만 resident record pool과 실제 device join은 아직 구현되지 않았다. GPU 검증 보류와 구현 누락은 별개다. |
+| CUDA private Warm | 현재 CPU P/C-only이며 CUDA는 명시적 미지원이다. 원문의 별도 근사 모델 실험으로 추적하며 Fresh CPU04의 선행 조건으로 추가하지 않는다. |
+| Repair 후 C 재검토 | 수선·CPU 검증·의존 결론 갱신은 존재한다. 수선한 수순을 대상으로 한 C 재공격과 원문 재검토 트리거의 연결 여부를 추가 확인한다. 확인 전에는 구조적 누락이나 전략 효과를 단정하지 않는다. |
+
+set-associative TT·paused node-stack resume·host KV tier·압축·overlap·세 CPU 프로필 전체는
+원문의 제안·선택·미결정과 구분한다. 현재 completed-iteration resume를 paused stack
+resume라고 부르지 않는다. 실제 학습을 제외한 전체 목표는 여전히 미완료다.
+
+이번 재개에서 원격 PR 23 HEAD `ea7d567cdb26a2ae387eacc29224612a4fcb0b75`의
+Linux·Windows·CPU bindings·PALS model 네 CI 성공을 다시 확인했다. 이 성공은 해당
+소스의 CPU 검사이며 위 감독기와 이후 SEE·V 환류 소스의 성공 결과가 아니다.
