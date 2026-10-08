@@ -3084,3 +3084,41 @@ spawn/loaded image/EOF/reap/process group·원래 시작 시각, 다음 before/p
 group은 0, utility/target/training 및 전체 causal bridge 권한은 false로 유지한다.
 실제 등록된 ONNX 4N 실행과 그 결과의 strict Query 환류·전체 비용·utility 인수는
 후속 단계다. CPU source 검사를 실제 모델·GPU 실행으로 보고하지 않는다.
+
+## 2026-10-09 — 관측 결과 선택을 실제 frozen replay CLI에 연결
+
+`prepare_observed_replay_launch_bundle`는 등록된 `RepairOpponent4n`에 한해서 새
+`rz-pals-frozen-replay-cli-expected/3`를 게시한다. `native_result=query_prior_v1`은
+명시적 결과 선택이며 입력·출력에서 추론하지 않는다. 새 transport는 완전한 기존 `/2`
+기대 명세를 `expectations`에 소유권 이동해 담고, 원래 wall·cleanup·output을 바깥에도
+기록한다. CLI는 안팎의 값이 모두 일치하고 내부 schema가 `/2`인 경우만 인수한다.
+중복·누락·미지원 값·추가 필드는 거부한다. 기존 예상 bytes의 재직렬화를 새로운
+독립 기대 pin이나 strict Query 의미 검증으로 대신하지 않는다.
+
+기존 `prepare_replay_launch_bundle`은 기존 `/2` 기대 bytes와 준비 manifest `/1`을
+유지한다. 새 API만 준비 manifest `/2`의 `requested_native_result`를 게시하고, 그
+schema를 별도 context digest 도메인으로 쓴다. 동일한 원본·입력·asset 경로·S/E/W를
+사용하며 기존 직렬화·게시·readback credit과 native output 상한을 늘리지 않는다.
+이미 실행한 모델 결과를 준비 manifest에 미리 채우지 않는다. 준비가 관측하는 것은
+파일 게시이며 `spawn_observed`·`native_result_observed`와 모든 권한은 false다.
+
+실제 `pals_frozen_replay` CLI는 기대 `/3`의 선택과 인수한 4N mode를 대조한 뒤,
+asset/cache 로딩 전 `ObservedPrior` dispatch 경로를 고정한다. 이 경로는 기존 같은
+시계·같은 assets로 `dispatch_started_observed_with_semantic_scope`를 직접 호출하고,
+완료 결과 bytes를 기존 bounded delivery 경로에 넘긴다. 이미 직렬화한 결과를 읽기
+전용으로 넘기며 동적 PV나 native 관측을 추가로 복제하지 않는다. `/1`·`/2`는 기존
+byte dispatch를 계속 사용한다. 기본 feature의 native 거부·기존 argv·입력과 registration
+schema·공통 계약은 바꾸지 않는다.
+
+선택한 결과 종류는 CLI 준비 header와 오류 진단에 남긴다. 미선택 경로에서는 새 필드를
+생략한다. 이 metadata는 stdout 전달 완료·프로세스 종료·loaded provider·물리 종료의
+자기 증명을 만들지 않는다. 반환 관측의 `pending_caller_chronology`와 utility group 0을
+유지한다. 다음 caller는 원래 예산 아래의 외부 bounded capture·EOF·reap·group 정리와
+loaded-image 관측, 독립 등록 자료 및 next before/prior chronology를 직접 연결해야 한다.
+원래 process-local Instant를 다른 프로세스로 전송한 것처럼 표시하지 않는다.
+
+검사에는 실제 durable 4N 게시의 원본·기대 bytes·readback·시계 보존과 2N/3N의 게시 전
+거부를 포함한다. CLI의 명시 선택·기존 경로·안팎 clock·version·lane·duplicate/extra 필드
+검사도 추가한다. 이 소스 단위의 CPU CI 결과는 정확한 HEAD에서 별도로 기록하며, 실제
+등록된 ONNX 4N 실행·외부 supervisor·strict Query 환류·전체 비용·utility 인수는 남아 있다.
+GPU 검증 보류와 실제 학습 제외를 유지한다.
