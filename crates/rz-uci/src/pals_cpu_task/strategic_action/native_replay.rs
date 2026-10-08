@@ -2066,6 +2066,7 @@ mod tests {
     use crate::pals_native::{NativeLoadStage, NativeRoleCompletionUnknown};
     use replay_inputs::{ReplayBindingPins, ReplayParentPins};
     use rz_contracts::{ExecutionId, ProcessEpoch};
+    use rz_search::pals::engine::replay::repair_replay_requirements;
 
     // Admission/observation fixtures never load ORT or launch a child. The
     // explicit dispatch/capture test uses a deterministic RoleModel plus the

@@ -1661,9 +1661,9 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap();
-        let request: super::replay_inputs::ReplayInputRequest =
+        let request: super::super::replay_inputs::ReplayInputRequest =
             serde_json::from_slice(payload(&bundle, "replay-input.json").as_bytes()).unwrap();
-        assert_eq!(request.schema, super::replay_inputs::OPPONENT_SCHEMA);
+        assert_eq!(request.schema, super::super::replay_inputs::OPPONENT_SCHEMA);
         assert_eq!(request.mode, ReplayInputMode::RepairOpponent4n);
         assert_eq!(request.registration_raw.as_bytes(), f.registration);
         assert_eq!(request.prepared_action_raw.as_bytes(), f.action);
@@ -1707,7 +1707,8 @@ mod tests {
     #[test]
     fn opponent_launch_output_shortage_refuses_before_any_publication() {
         let mut f = opponent_fixture();
-        let required = super::replay_inputs::replay_mode_requirements(f.mode, 4, 1, 64).unwrap();
+        let required =
+            super::super::replay_inputs::replay_mode_requirements(f.mode, 4, 1, 64).unwrap();
         let output = replay_output_requirements(
             required.actual_role_calls() as usize,
             required.cpu_checks(),
