@@ -2904,3 +2904,55 @@ E/W 안에서 확인한다. 뒤따르는 validator의 typed/Value/Rules heap은 
 남긴다. 모델/provider/dispatch, durable caller 등록, whole cost·물리 종료·full Repair
 recheck·utility·학습 target의 권한은 발급하지 않는다. 실제 CLI expected/launch 파일의
 결과 전 등록과 CPU 모델 실행·종료 자료 회수는 이 순수 준비 단위 이후의 별도 인수다.
+
+### Rust의 결과 전 frozen replay 파일 준비
+
+`replay_launch_preparation::prepare_replay_launch_bundle`은 기존 ReplyOnly2n 및
+RepairEndpoint3n 요청을 파일로 준비한다. 새 replay registration·prepared action·whole
+semantic receipt·CPU Fresh profile의 독립 원문과 expected 선언을 받고, 기존 생성자와
+scoped Rules/resource checker를 사용한다. native wrapper의 동일한 role/check 수와
+공개 output 예약 산식으로 원래 출력 한도를 확인한다. profile도 기존 closed decoder를
+공유한다. 이 순수 접점은 실제 runtime·export 파일을 읽거나 모델/provider를 만들지 않는다.
+
+CLI의 `ExpectedPinsWire`, expected `/2`, launch assets DTO는 이 모듈과 공유한다. 기존
+V1 outer와 V1/V2 parser·실행 순서는 유지한다. 현재 실제 CLI는 binary domain 선언을
+먼저 검사하고 stdin·Rules/resource·독립 assets/profile을 확인한 뒤 실행 image를
+관측한다. 입력 전 domain 선언 검사를 실제 loaded image 관측으로 표현하지 않는다.
+기존 private flat wire의 field/type/closed serde와 context revision은 바꾸지 않는다.
+
+네 원문 파일과 새 replay input·launch assets·expected의 일곱 payload를 caller가
+소유한 새 디렉터리에 저장하고, manifest를 마지막에 게시한다. caller root는 기존의
+절대 UTF-8 경로이며 한 component의 새 child만 만든다. payload는 `create_new`,
+확인된 write return 수, file sync 및 동일 handle의 고정 4KiB chunk readback으로
+검사한다. pending manifest의 확인이 끝난 뒤 정상 이름으로 옮기고 directory sync를
+시도한다. 실패는 원래 typed 원인과 실제 작성/readback 범위, 준비된 요청·payload·부분
+직렬화 bytes를 소유해 반환한다. 기존 디렉터리·파일을 덮어쓰거나 자동 삭제하지 않는다.
+
+최종 게시 후 실패하면 원래 W 안에서 정상 manifest의 격리를 시도한다. 격리 실패와
+정상 이름의 부재 미확인을 secondary로 보존하며 성공으로 바꾸지 않는다. 파일 존재만으로
+실행 권한을 주지 않는다. 성공 객체도 다른 프로세스의 source/build/binary/factory 등록,
+실제 모델 실행·종료·전체 비용·utility를 인수하지 않는다. 후속 launch는 독립 등록·pin과
+같은 원래 caller 마감을 다시 확인해야 한다.
+
+추가 publication IO 및 backing 예산은 각각 최대 16MiB다. bounded metadata bootstrap
+128KiB를 먼저 확인한 뒤 assets와 expected를 backing 없는 count/hash writer로 측정하고
+합계를 입장시킨다. IO 정책은 `2 × (네 원문 + 생성 요청 + assets + expected + manifest
+최대 64KiB) + 8bytes`이며 마지막 EOF 확인을 포함한다. backing 정책은 네 원문 복사,
+assets·expected·manifest backing과 metadata allowance를 포함한다. 기존 생성 요청의
+소유권은 이동하며 construction credit과 별도로 표시한다. policy credit은 기존 typed
+validator·canonical JSON·allocator의 전체 peak나 RSS 측정값이 아니다.
+
+모든 시간 검사는 같은 process-local S/E/W와 cancel을 사용하는 cooperative checkpoint다.
+동기 OS I/O의 강제 timeout, hostile concurrent parent 교체 방어, Instant의 프로세스 간
+전송을 증명하지 않는다. file sync/readback과 close 결과·crash persistence는 구분한다.
+Windows directory metadata persistence는 unknown으로 남기고 Unix directory sync 관측도
+별도 getter로 제공한다. 준비 manifest에는 spawn·native result·physical·whole cost·utility·
+training 권한을 부여하지 않는다.
+
+신규 CPU fixture의 소스는 13개이며 Unix link fixture 하나는 Windows에서 미실행이다.
+실제 Rules 준비를 사용한 두 mode의 원문/manifest 정합, 원래 자원 부족·마감·cancel·
+profile 원인, publication credit, 기존 디렉터리 충돌, 경로·링크 거절, bounded readback과
+격리 실패, escaping/부분 직렬화, 공유 codec와 독립 scope 불일치를 다룬다. controlled
+tempfs 및 순수 준비 검사이며 actual CPU task·모델/provider·child process를 실행하지 않는다.
+이 소스 단위의 CPU CI와 등록된 실제 replay·external supervisor·strict Query 환류·별도
+4N full opponent recheck·whole cost·물리 종료·utility 인수는 각각 구분한다.

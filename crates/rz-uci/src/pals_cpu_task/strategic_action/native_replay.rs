@@ -924,6 +924,70 @@ impl ReplayObserver {
     }
 }
 
+/// Immutable serialized-output bound computed from this wrapper's retained
+/// observation layout. This is neither an allocator/RSS measurement nor a
+/// supported-mode, CPU-budget, provider or execution admission capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplayOutputRequirements {
+    trace_bytes: usize,
+    text_bytes: usize,
+    required_output_bytes: usize,
+}
+impl ReplayOutputRequirements {
+    pub const fn trace_bytes(self) -> usize {
+        self.trace_bytes
+    }
+    pub const fn text_bytes(self) -> usize {
+        self.text_bytes
+    }
+    pub const fn required_output_bytes(self) -> usize {
+        self.required_output_bytes
+    }
+    /// Checks a declaration without allocating or extending its allowance.
+    pub fn check_output_limit(self, limit: usize) -> Result<(), AdmissionFault> {
+        if self.required_output_bytes > limit {
+            return Err(fault(
+                "output_reserve",
+                "declared output cannot retain worst-case observations",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Pure checked arithmetic shared by result-free caller preparation and the
+/// actual pre-load reservation. Counts do not attest to any work performed.
+/// Supported mode/counts and the original output cap remain caller-checker
+/// responsibilities; no new count cap or default is introduced here.
+pub fn replay_output_requirements(
+    roles: usize,
+    checks: usize,
+) -> Result<ReplayOutputRequirements, AdmissionFault> {
+    let trace = roles
+        .checked_mul(ROLE_TRACE_BYTES)
+        .ok_or(fault("output_reserve", "trace overflow"))?;
+    // Committed compact JSONL contains no unescaped controls except its
+    // single newline separators. Wrapping that valid UTF-8 as a JSON string
+    // costs at most two bytes per existing byte (quotes/backslashes/newline).
+    // Free-text Debug snapshots use the separate six-byte worst-case bound.
+    let stage_bytes = checks
+        .checked_mul(STAGE_TEXT_BYTES + 2 * SNAPSHOT_BYTES)
+        .ok_or(fault("output_reserve", "stage snapshot overflow"))?;
+    let text_bytes = stage_bytes
+        .checked_add(STATE_TEXT_BYTES + OUTCOME_TEXT_BYTES)
+        .ok_or(fault("output_reserve", "retained snapshot overflow"))?;
+    let need = trace
+        .checked_mul(2)
+        .and_then(|n| text_bytes.checked_mul(6).and_then(|t| n.checked_add(t)))
+        .and_then(|n| n.checked_add(HEADER_RESERVE))
+        .ok_or(fault("output_reserve", "serialized upper bound overflow"))?;
+    Ok(ReplayOutputRequirements {
+        trace_bytes: trace,
+        text_bytes,
+        required_output_bytes: need,
+    })
+}
+
 struct Reserved {
     collector: Arc<Mutex<Collector>>,
     output: Vec<u8>,
@@ -933,30 +997,7 @@ struct Reserved {
 }
 impl Reserved {
     fn new(roles: usize, checks: usize, clock: Clock) -> Result<Self, AdmissionFault> {
-        let trace = roles
-            .checked_mul(ROLE_TRACE_BYTES)
-            .ok_or(fault("output_reserve", "trace overflow"))?;
-        // Committed compact JSONL contains no unescaped controls except its
-        // single newline separators. Wrapping that valid UTF-8 as a JSON string
-        // costs at most two bytes per existing byte (quotes/backslashes/newline).
-        // Free-text Debug snapshots use the separate six-byte worst-case bound.
-        let stage_bytes = checks
-            .checked_mul(STAGE_TEXT_BYTES + 2 * SNAPSHOT_BYTES)
-            .ok_or(fault("output_reserve", "stage snapshot overflow"))?;
-        let text_bytes = stage_bytes
-            .checked_add(STATE_TEXT_BYTES + OUTCOME_TEXT_BYTES)
-            .ok_or(fault("output_reserve", "retained snapshot overflow"))?;
-        let need = trace
-            .checked_mul(2)
-            .and_then(|n| text_bytes.checked_mul(6).and_then(|t| n.checked_add(t)))
-            .and_then(|n| n.checked_add(HEADER_RESERVE))
-            .ok_or(fault("output_reserve", "serialized upper bound overflow"))?;
-        if need > clock.output {
-            return Err(fault(
-                "output_reserve",
-                "declared output cannot retain worst-case observations",
-            ));
-        }
+        replay_output_requirements(roles, checks)?.check_output_limit(clock.output)?;
         let mut slots = Vec::new();
         reserve_vec(&mut slots, checks)?;
         for _ in 0..checks {
@@ -1517,7 +1558,7 @@ fn admit_assets(
         .into());
     }
     validate_sources(sources)?;
-    let profile = decode_profile(
+    let profile = check_cpu_fresh_asset_profile(
         assets.profile_raw,
         assets.expected_profile_artifact,
         assets.expected_profile,
@@ -1535,6 +1576,18 @@ fn admit_assets(
         .check(cancel)
         .map_err(|_| fault("assets_clock", "original execution deadline/cancel"))?;
     Ok(profile)
+}
+/// Checks original bounded profile bytes and all independently expected facts.
+/// The returned value is an owned declaration, not native admission authority.
+/// This performs no file IO, source/binary registration, runtime-pin admission,
+/// provider/session load or model execution. The actual configuration and
+/// source/runtime/export checks remain in the existing `admit_assets` path.
+pub fn check_cpu_fresh_asset_profile(
+    raw: &[u8],
+    expected_pin: &ArtifactPin,
+    expected: &CpuFreshAssetProfile,
+) -> Result<CpuFreshAssetProfile, CpuFreshAssetError> {
+    decode_profile(raw, expected_pin, expected)
 }
 fn decode_profile(
     raw: &[u8],
@@ -2715,5 +2768,158 @@ mod tests {
         let mut refused = reserved_bytes(64).unwrap();
         refused.extend_from_slice(b"{}");
         assert!(append_prepared_tick(&mut refused, expired, 9).is_err());
+    }
+
+    #[test]
+    fn public_output_exact_cap_and_shortage_match_pre_load_reservation() {
+        let requirement = replay_output_requirements(3, 2).unwrap();
+        assert_eq!(requirement.trace_bytes(), 432 * 1024);
+        assert_eq!(requirement.text_bytes(), 112 * 1024);
+        assert_eq!(requirement.required_output_bytes(), 2 * 1024 * 1024);
+        let copied = requirement;
+        let cap = requirement.required_output_bytes();
+        assert!(requirement.check_output_limit(cap).is_ok());
+        assert!(Reserved::new(3, 2, clock(cap)).is_ok());
+        let refused = copied.check_output_limit(cap - 1).unwrap_err();
+        assert_eq!(refused.stage, "output_reserve");
+        assert_eq!(
+            refused.reason,
+            "declared output cannot retain worst-case observations"
+        );
+        assert!(matches!(
+            Reserved::new(3, 2, clock(cap - 1)),
+            Err(AdmissionFault {
+                stage: "output_reserve",
+                reason: "declared output cannot retain worst-case observations"
+            })
+        ));
+        assert_eq!(copied, requirement);
+    }
+
+    #[test]
+    fn public_output_overflow_faults_preserve_each_arithmetic_stage() {
+        let cases = [
+            (usize::MAX, 2, "trace overflow"),
+            (0, usize::MAX, "stage snapshot overflow"),
+            (
+                0,
+                usize::MAX / (STAGE_TEXT_BYTES + 2 * SNAPSHOT_BYTES),
+                "retained snapshot overflow",
+            ),
+            (
+                usize::MAX / ROLE_TRACE_BYTES,
+                0,
+                "serialized upper bound overflow",
+            ),
+        ];
+        for (roles, checks, reason) in cases {
+            let refused = replay_output_requirements(roles, checks).unwrap_err();
+            assert_eq!(refused.stage, "output_reserve");
+            assert_eq!(refused.reason, reason);
+            assert!(
+                matches!(Reserved::new(roles, checks, clock(usize::MAX)), Err(error) if error.stage == refused.stage && error.reason == refused.reason)
+            );
+        }
+        // Zero counts retain the old fixed header/state bound. They do not
+        // acquire a supported replay mode or an execution capability.
+        let empty = replay_output_requirements(0, 0).unwrap();
+        assert_eq!(empty.trace_bytes(), 0);
+        assert_eq!(empty.text_bytes(), 48 * 1024);
+        assert_eq!(empty.required_output_bytes(), 800 * 1024);
+    }
+
+    #[test]
+    fn public_profile_checker_keeps_originals_and_expected_declaration_immutable() {
+        let expected = profile(false);
+        let original = serde_json::to_vec(&expected).unwrap();
+        let expected_pin = pin(&original);
+        let original_copy = original.clone();
+        let expected_copy = serde_json::to_vec(&expected).unwrap();
+        let pin_copy = expected_pin.clone();
+        let mut checked =
+            check_cpu_fresh_asset_profile(&original, &expected_pin, &expected).unwrap();
+        assert!(same_profile(&checked, &expected));
+        checked.cache_public_memory = true;
+        checked.context_sha256 = asset_profile_context(&checked).unwrap();
+        let changed = serde_json::to_vec(&checked).unwrap();
+        let refused =
+            check_cpu_fresh_asset_profile(&changed, &pin(&changed), &expected).unwrap_err();
+        assert_eq!(refused.fault.stage, "asset_profile");
+        assert_eq!(original, original_copy);
+        assert_eq!(serde_json::to_vec(&expected).unwrap(), expected_copy);
+        assert!(same_pin(&expected_pin, &pin_copy));
+        assert!(!expected.cache_public_memory);
+    }
+
+    #[test]
+    fn public_profile_checker_rejects_pin_extent_scope_and_context_substitution() {
+        let expected = profile(false);
+        let original = serde_json::to_vec(&expected).unwrap();
+        let expected_pin = pin(&original);
+        let mut changed_raw = original.clone();
+        changed_raw.push(b' ');
+        assert_eq!(
+            check_cpu_fresh_asset_profile(&changed_raw, &expected_pin, &expected)
+                .unwrap_err()
+                .fault
+                .stage,
+            "asset_profile_pin"
+        );
+        let oversized = vec![b' '; MAX_PROFILE_BYTES + 1];
+        assert_eq!(
+            check_cpu_fresh_asset_profile(&oversized, &pin(&oversized), &expected)
+                .unwrap_err()
+                .fault
+                .stage,
+            "asset_profile_pin"
+        );
+        for field in ["schema", "domain", "provider", "encoding"] {
+            let mut changed = expected.clone();
+            match field {
+                "schema" => changed.schema = "rz-pals-cpu-fresh-replay-assets/2".into(),
+                "domain" => changed.domain = "private_warm".into(),
+                "provider" => changed.provider = "cuda".into(),
+                _ => {
+                    changed.encoding_semantic_sha256 =
+                        lower_hex(pals_native::pals_rules_encoding_semantic_digest())
+                }
+            }
+            changed.context_sha256 = asset_profile_context(&changed).unwrap();
+            let raw = serde_json::to_vec(&changed).unwrap();
+            let refused = check_cpu_fresh_asset_profile(&raw, &pin(&raw), &changed).unwrap_err();
+            assert_eq!(refused.fault.stage, "asset_profile");
+        }
+        let mut changed = expected.clone();
+        changed.context_sha256 = lower_hex([9; 32]);
+        let raw = serde_json::to_vec(&changed).unwrap();
+        assert_eq!(
+            check_cpu_fresh_asset_profile(&raw, &pin(&raw), &changed)
+                .unwrap_err()
+                .fault
+                .stage,
+            "asset_profile_context"
+        );
+    }
+
+    #[test]
+    fn public_profile_checker_rejects_key_alias_and_duplicate_with_original_json_cause() {
+        let expected = profile(false);
+        let original = serde_json::to_string(&expected).unwrap();
+        let invalid = [
+            original.replace("\"domain\":", "\"Domain\":"),
+            original.replace("\"context_sha256\":", "\"contextSha256\":"),
+            original.replacen('{', "{\"schema\":\"rz-pals-cpu-fresh-replay-assets/1\",", 1),
+        ];
+        for raw in invalid {
+            let refused =
+                check_cpu_fresh_asset_profile(raw.as_bytes(), &pin(raw.as_bytes()), &expected)
+                    .unwrap_err();
+            assert_eq!(refused.fault.stage, "asset_profile_json");
+            assert_eq!(refused.fault.reason, "closed profile JSON refused");
+            assert!(matches!(
+                refused.source.as_deref(),
+                Some(CpuFreshAssetSourceError::Json(_))
+            ));
+        }
     }
 }

@@ -1546,42 +1546,14 @@ mod cpu_cli {
         use rz_uci::pals_cpu_task::strategic_action::native_replay::{
             self, CpuFreshAssetProfile, CpuFreshReplayAssets,
         };
+        use rz_uci::pals_cpu_task::strategic_action::replay_inputs;
         pub(super) use rz_uci::pals_cpu_task::strategic_action::replay_inputs::CheckedReplayInputs;
         pub(super) use rz_uci::pals_cpu_task::strategic_action::replay_inputs::ReplayInputError;
-        use rz_uci::pals_cpu_task::strategic_action::replay_inputs::{
-            self, ReplayBindingPins, ReplayExpectedPins, ReplayParentPins,
-            ReplayRegisteredArtifacts,
+        use rz_uci::pals_cpu_task::strategic_action::replay_launch_preparation::{
+            ExpectedPinsWire, ExpectedTransportV2, LaunchAssets,
         };
         use serde::Deserialize;
 
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct ExpectedPinsWire {
-            registration_artifact: ArtifactPin,
-            prepared_action_artifact: ArtifactPin,
-            semantic_receipt_artifact: ArtifactPin,
-            parent: ReplayParentPins,
-            binding: ReplayBindingPins,
-            registered_artifacts: ReplayRegisteredArtifacts,
-            legacy_cpu_profile_sha256: String,
-            provider_factory_id: String,
-            semantic_binary_sha256: String,
-        }
-        impl ExpectedPinsWire {
-            fn into_expected(self) -> ReplayExpectedPins {
-                ReplayExpectedPins {
-                    registration_artifact: self.registration_artifact,
-                    prepared_action_artifact: self.prepared_action_artifact,
-                    semantic_receipt_artifact: self.semantic_receipt_artifact,
-                    parent: self.parent,
-                    binding: self.binding,
-                    registered_artifacts: self.registered_artifacts,
-                    legacy_cpu_profile_sha256: self.legacy_cpu_profile_sha256,
-                    provider_factory_id: self.provider_factory_id,
-                    semantic_binary_sha256: self.semantic_binary_sha256,
-                }
-            }
-        }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct ExpectedTransport {
@@ -1595,21 +1567,6 @@ mod cpu_cli {
             cleanup_reserve_ms: u64,
             output_bytes: usize,
             replay_binary_pin_scope: String,
-        }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct ExpectedTransportV2 {
-            schema: String,
-            request_artifact: ArtifactPin,
-            replay_expected: ExpectedPinsWire,
-            launch_asset_artifact: ArtifactPin,
-            cpu_fresh_profile_artifact: ArtifactPin,
-            cpu_fresh_profile: CpuFreshAssetProfile,
-            whole_wall_ms: u64,
-            cleanup_reserve_ms: u64,
-            output_bytes: usize,
-            replay_binary_pin_scope: String,
-            expected_semantic_receipt_producer_scope: SemanticReceiptProducerScope,
         }
         struct ParsedExpectedTransport {
             transport: ExpectedTransport,
@@ -1712,15 +1669,6 @@ mod cpu_cli {
                 None => SemanticScopeRoute::LibraryOnlyV1,
                 Some(scope) => SemanticScopeRoute::Explicit(scope),
             }
-        }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct LaunchAssets {
-            schema: String,
-            export_manifest_path: String,
-            runtime_library_path: String,
-            runtime_cache_root: String,
-            cpu_fresh_profile_raw: String,
         }
         fn validate_runtime_observation(
             bundle: Option<[u8; 32]>,

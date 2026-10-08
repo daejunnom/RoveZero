@@ -8,6 +8,8 @@
 #[cfg(feature = "onnx-cpu")]
 pub mod native_replay;
 pub mod replay_inputs;
+#[cfg(feature = "onnx-cpu")]
+pub mod replay_launch_preparation;
 
 use super::{CpuProfile, CpuTaskAdmission, CpuTaskError, TaskKind};
 use serde::{Deserialize, Serialize};
