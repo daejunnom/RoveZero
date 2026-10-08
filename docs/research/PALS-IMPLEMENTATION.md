@@ -2963,7 +2963,8 @@ tempfs 및 순수 준비 검사이며 actual CPU task·모델/provider·child pr
 단계를 search-local 접점으로 제공한다. 두 기존 mode는 이 경로를 자동 선택하지 않는다.
 별도 scope는 `rz-pals-frozen-parent-repair-opponent-continuation-replay/1`이다. 추가
 타입은 `replay/opponent_recheck.rs`에 두며, 같은 Rules·역할 출력 인수·CPU task·원래
-마감과 단일 finish hook을 사용한다. 기존 CLI·등록·launch 명세는 계속 2N/3N 전용이다.
+마감과 단일 finish hook을 사용한다. 이 소스 단위 당시 CLI·등록·launch 명세는
+2N/3N 전용이었다. 다음 절은 별도로 추가한 명시적 4N 연결을 설명한다.
 
 실제 완료한 세 번째 unrestricted Repair 관측과 게시된 Repair line/revision을 먼저
 확인한다. 원래 공격 이후 달라진 자기 수 다음의 첫 상대 차례를 찾고, C가 그 상태에서
@@ -2995,3 +2996,50 @@ GPU 검증은 사용자 지시에 따라 보류한다.
 합성 fixture는 생성자에서 quiescence 16을 명시하고 네 단계에 동일하게 적용한다.
 제품·등록 실행·기존 2N/3N fixture의 설정이나 완료 기준을 변경하거나 부분 완료 후
 자동으로 한도·마감·자원을 바꾸지 않는다. 이전 CI의 실패 원문도 별도로 보존한다.
+
+## 2026-10-09 — 4N 입력 등록·native dispatch·durable launch 연결
+
+`repair_opponent_4n`은 입력 `rz-pals-frozen-replay-inputs/2`, 등록
+`rz-pals-frozen-replay-consumer-registration/2`를 명시적으로 사용한다. 기존
+`reply_only_2n`·`repair_endpoint_3n`은 각각 기존 `/1` schema, context domain과
+직렬화 형식을 유지한다. 새 `opponent_recheck_source` pin은 `/2`에서 필수이고
+독립 기대값·원문 registration context·컴파일된 실제 소스 바이트와 각각 대조한다.
+`/1`에는 이 필드를 넣지 않는다. 필드 부재는 기존 바이트를 유지하지만 명시적
+`null`, 중복, 미지원 필드·schema 교차·크기·digest 불일치는 거부한다. 이 source
+비교와 과거 binary 등록, 현재 OS 실행 이미지 관측은 별도 근거다.
+
+`replay_mode_requirements`가 입력 인수·launch 준비·native 실행의 공통 자원 산식을
+제공한다. 2N의 기존 보수적인 Repair role/store 예약은 유지하며 실제 observer 호출
+상한 L+1과 CPU stage 2개를 구분한다. 3N과 4N은 각각 실제 role 상한·stage 3/4개를
+사용한다. 새 4N 입력은 원래 prepared action의 remaining nodes/wall/output에 들어가야
+한다. 원래 N·H1·CPU profile·시계·정리 reserve는 바꾸지 않는다. constructor나
+publication 함수가 부족한 이전 allowance를 늘리지 않는다.
+
+native dispatcher는 동일 `FreshReplayOwner`의 실제 `run_with_opponent_recheck`를
+호출한다. 기존 역할 observer가 준비·물리 완료·논리 출력 인수를 계속 기록한다.
+관측 출력 `/2`에는 새 `opponent_state`를 별도로 두어 실제 anchor, 생성된 수순,
+수별 logical context·accepted·selected와 endpoint를 보존한다. 네 번째 stage의
+실제 CPU task/report/attempt/observation은 기존 세 번째 Repair stage와 분리한다.
+2N/3N 출력 `/1`에는 새 필드를 직렬화하지 않는다. 실패에도 이미 생긴 stage·수순·
+scalar work를 포착하고 기존 typed 원인·cleanup·observer 실패를 보존한다. CPU ID와
+native RequestId를 같은 것으로 취급하지 않으며 완료 관측을 utility 권한으로 승격하지 않는다.
+
+출력 상한 4MiB는 그대로다. 4N은 별도의 관측 layout으로 큰 prepared/terminal 행을
+각각 32KiB, accepted context를 8KiB, 작은 행을 1KiB, 역할당 최대 12행으로 제한한다.
+역할별 backing은 82KiB, 새 상대 상태 snapshot은 32KiB이며 JSON escaping·전체
+header·stage·outcome 예약을 모델 로딩 전에 검사한다. L=5/P=1의 최대 14 role
+호출은 기존 상한에 들어간다. 더 긴 입력이나 관측 행이 예약을 넘으면 명확히 거부·
+실패하고 기존 결과를 보존한다. 출력 상한 확장·원시값 생략 후 성공 처리·자동 재시도는
+하지 않는다. 이 한도는 직렬화 예약이며 RSS·allocator peak가 아니다.
+
+durable launch 준비는 새 입력과 등록 원문을 그대로 보관하고 동일 공통 산식으로
+native 출력 한도를 검사한다. 기존 expected transport `/2`는 공통 artifacts DTO를
+통해 새 pin을 운반한다. transport schema와 입력/registration schema는 다른 domain이다.
+manifest 준비만으로 모델 로딩·child spawn·기존 Query/2 재검증·물리 종료가 성립하지 않는다.
+
+이 단위는 입력 검사 6개, native source/예약/실패/실제 CPU dispatch 포착 검사 4개,
+durable launch 검사 2개를 추가한다. 실제 CPU 포착 fixture는 합성 RoleModel·고정
+quiescence 16과 실제 네 단계 checker를 사용한다. ORT/GPU/provider/외부 child는 실행하지
+않는다. 기존 CLI 소비 검사와 2N/3N 검사도 정확한 SHA의 CI에서 별도로 확인한다.
+실제 등록된 신경망의 4N 실행·external supervisor·strict Query 결과 환류·전체 비용·
+utility/target 인수는 아직 미실행이다. 실제 학습은 제외하고 GPU 검증은 계속 보류한다.
