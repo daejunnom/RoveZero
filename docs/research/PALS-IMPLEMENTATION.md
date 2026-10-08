@@ -2023,3 +2023,33 @@ trace는 후속 단위다. 일반 Reply의 물리 완료·delivery·consumption�
 Repair 재검토를 증명하지 않는다. 같은 repaired line·revision·상대 anchor·CPU
 namespace 및 실제 비교 evidence를 결합해야 하며, 기존 Disabled collector와 label
 인수 범위를 완화하지 않는다. 전체 전략적 V와 CUDA record bank도 계속 미완료다.
+
+### 재검사 observer와 native journal 연결 상태
+
+`5933f65`의 engine은 prepared/finished 기본 noop과 Box 전달을 제공한다. 실제
+accepted Repair record와 수순·Rules snapshot, 저장된 CPU Observation/Execution ID와
+TaskRecord, 다음 Reply 결과 및 조건부 publication을 빌려 전달한다. provenance 없음은
+`Unobserved`, 실제 handle 모순은 `InvalidProvenance`이며 수동 값을 완료 작업으로
+만들지 않는다. Reply 호출 시도는 물리 NN 제출이나 완료와 별도다.
+
+종료 callback 뒤 두 경로가 성공했을 때 원래 deadline/cancel을 다시 확인한다.
+원래 오류와 첫 observer 보조 오류의 우선순위는 유지하며 이미 적법하게 게시한
+조건부 기록은 철회하지 않는다. [CI 37732758483](https://github.com/daejunnom/RoveZero/actions/runs/37732758483)의
+Linux·Windows·CPU bindings는 성공했고 observer 집중 검사 11개가 두 OS에서 각각
+실제 통과했다. model CPU job은 닫힌 source-pair 미등록과 이전 source literal에서
+실패했으므로 이 commit을 전체 CI 성공으로 기록하지 않는다.
+
+후속 native journal은 마지막 Repair 한 호출 대신 repaired suffix의 각 실제 accepted
+요청·입력·sidecar·lineage·원시 policy 순위를 결합한다. 별도 정책 원문 등록을 실제
+engine 선택과 대조하고 `prepared → reply_bound → finished`의 출력 공간을 Reply 전에
+예약한다. 기존 lineage domain은 유지하며 새 descriptor 연결은
+`native-recheck-traces.jsonl`에 보존한다. 최종 consumer는 원래 receipt inventory와
+실제 producer journal 및 두 Rules 재생 endpoint를 함께 확인해야 한다. marker나
+일반 Reply 완료만으로 실제 재검사·Repair 성공·WDL·학습 target을 인정하지 않는다.
+
+CUDA packing의 첫 연결부는 `RegisteredPackingArtifactBytes`의 실제 바이트 pin과
+고정 선언 검사다. 기존 Python 고정 wire와 독립 대조했으며 Native graph body,
+weight-free 내용, session/provider·수치·fence는 `NotPerformed`다. 이는 resident
+record bank·native join·P/C read 구현이나 GPU 성공의 대체물이 아니다. 두 후속 단위의
+실행 검사는 최종 통합 commit의 CPU CI에서 별도 인수한다. 이번 GPU 보류, 로컬
+heavy CPU 자원 답변 대기, 실제 학습 제외 및 Draft 경계는 유지한다.

@@ -49,12 +49,20 @@ _REVIEWED_DISABLED_RECHECK_SOURCES = (
     {"bytes": 297307, "sha256": "9c0de95911cf54365abec3818f089c20287d80160ea05eee8acbd326f7b49d2c"},
     {"bytes": 73365, "sha256": "564d2b29d873df1c7b0424bfcee0b52a8f314cbfd88fa68ef35f4fda99a600d5"},
 )
+# Source-only review of the observer-enabled successor's DEFAULT branch.
+# The opt-in registration, marker and aliases remain rejected below; this entry
+# does not enroll selected recheck collections or claim a caller actually ran.
+_REVIEWED_DISABLED_OBSERVER_SOURCES = (
+    {"bytes": 343988, "sha256": "0302e49b6a9784641ca90aba17490d404b793098f38836b7b3cf42a12ee131d1"},
+    {"bytes": 153861, "sha256": "098005ae44fe5c5a9b0a2181d8cde32a40c3eeaaf0e733e2d92ec6859fd424e5"},
+)
 _SOURCE_REVIEW_PROFILES = (
     ("legacy_prepared_lineage_4469f9d", _REVIEWED_SOURCES),
     ("legacy_disabled_recheck_9c0de959", _REVIEWED_DISABLED_RECHECK_SOURCES),
+    ("legacy_disabled_observer_0302e49b", _REVIEWED_DISABLED_OBSERVER_SOURCES),
 )
 _DISABLED_SEARCH_VERSION = "pals-restricted-refinement/0.1"
-_OPT_IN_LANE_FIELDS = ("pals_search_policy", "post_repair_recheck", "post_repair_recheck_policy", "post_repair_recheck_conditions",
+_OPT_IN_LANE_FIELDS = ("pals_search_policy", "refinement_registration", "refinement_registration_sha256", "post_repair_recheck", "post_repair_recheck_policy", "post_repair_recheck_conditions",
     "post_repair_recheck_search_version", "refinement_policy", "refinement_conditions", "refinement_search_version")
 _RAW_NAMES = ("work_summary", "build_registration", "source_manifest", "engine_source", "native_source")
 _PIN_NAMES = (*_RAW_NAMES, "divergence_sha256", "slot", "initial_repair_sha256", "reply_rules_sha256", "line_rules_sha256")

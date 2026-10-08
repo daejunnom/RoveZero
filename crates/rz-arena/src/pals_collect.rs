@@ -1037,6 +1037,7 @@ impl Output {
                     | "native-divergence-sidecars.jsonl"
                     | "native-divergence-contexts.jsonl"
                     | "native-work-summary.jsonl"
+                    | "native-recheck-traces.jsonl"
             ) || row.json.len() > MAX_JSON_RECORD_BYTES
             {
                 return Err(invalid("native collector artifact/record limit"));
@@ -1296,6 +1297,7 @@ impl Collection {
         output: &mut Output,
         trace: PalsNativeTrace,
         limits: CpuLimits,
+        secondary: &mut NativeRetentionFailures,
     ) -> Result<(), ArenaError> {
         if self
             .inputs
@@ -1326,12 +1328,41 @@ impl Collection {
             .checked_add(trace.cpu_jobs)
             .ok_or_else(|| invalid("native CPU task counter overflow"))?;
         self.work_incomplete |= trace.cpu_work_observation_incomplete;
-        output.native_trace(&trace)?;
-        if let Some(producer) = output.producer.clone() {
-            producer.flush_journal(output)?;
+        // Both bounded persistence attempts remain possible even when the
+        // first fails. Neither can erase the already observed native failure.
+        let persisted = output.native_trace(&trace);
+        let journal = if let Some(producer) = output.producer.clone() {
+            producer.flush_journal(output)
+        } else {
+            Ok(())
+        };
+        let exceeded_nodes = trace.cpu_nodes > limits.max_nodes;
+        let observed = if exceeded_nodes {
+            Err(invalid(
+                "native CPU work exceeded the actual requested node budget",
+            ))
+        } else if let Some(failure) = &trace.failure {
+            Err(invalid(format!(
+                "native collector observer failed: {failure}"
+            )))
+        } else {
+            Ok(())
+        };
+        // Inputs/sequence are admitted only after persistence succeeds, as in
+        // the original path. A failed persistence never becomes admission.
+        let persistence_ok = persisted.is_ok() && journal.is_ok();
+        let retained = native_after_retention(
+            observed,
+            persisted,
+            NativeRetentionStage::Persistence,
+            secondary,
+        );
+        let retained =
+            native_after_retention(retained, journal, NativeRetentionStage::Journal, secondary);
+        if !persistence_ok {
+            return retained;
         }
         self.sequence = trace.sequence;
-        let exceeded_nodes = trace.cpu_nodes > limits.max_nodes;
         self.inputs
             .extend(
                 trace
@@ -1342,17 +1373,7 @@ impl Collection {
                         outcome_eligible,
                     }),
             );
-        if exceeded_nodes {
-            return Err(invalid(
-                "native CPU work exceeded the actual requested node budget",
-            ));
-        }
-        if let Some(failure) = trace.failure {
-            return Err(invalid(format!(
-                "native collector observer failed: {failure}"
-            )));
-        }
-        Ok(())
+        retained
     }
     fn capture(
         &mut self,
@@ -1815,8 +1836,11 @@ fn checked_source(description: &PalsCollectionSourceDescription) -> Result<(), A
     Ok(())
 }
 fn failure_text(error: impl std::fmt::Display) -> String {
+    bounded_failure_text(error, 8192)
+}
+fn bounded_failure_text(error: impl std::fmt::Display, max_bytes: usize) -> String {
     let text = error.to_string();
-    if bounded_json(&text, 8192, false).is_ok() {
+    if bounded_json(&text, max_bytes, false).is_ok() {
         return text;
     }
     let suffix = format!(
@@ -1824,19 +1848,86 @@ fn failure_text(error: impl std::fmt::Display) -> String {
         text.len(),
         Sha256::digest(text.as_bytes())
     );
-    let mut end = 8192.min(text.len());
+    let mut end = max_bytes.min(text.len());
     loop {
         while !text.is_char_boundary(end) {
             end -= 1;
         }
         let candidate = format!("{}{suffix}", &text[..end]);
-        if bounded_json(&candidate, 8192, false).is_ok() {
+        if bounded_json(&candidate, max_bytes, false).is_ok() {
             return candidate;
         }
         if end == 0 {
             return suffix;
         }
         end = end.saturating_sub((end / 8).max(1));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NativeRetentionStage {
+    Recovery,
+    Persistence,
+    Journal,
+}
+impl NativeRetentionStage {
+    fn index(self) -> usize {
+        match self {
+            Self::Recovery => 0,
+            Self::Persistence => 1,
+            Self::Journal => 2,
+        }
+    }
+}
+#[derive(Default)]
+struct NativeRetentionFailures {
+    // One stopped analysis has at most these three retention boundaries. Each
+    // note has a 1 KiB JSON bound; no unbounded per-call failure list is kept.
+    notes: [Option<String>; 3],
+}
+impl NativeRetentionFailures {
+    fn record(&mut self, stage: NativeRetentionStage, error: &ArenaError) {
+        self.notes[stage.index()] = Some(bounded_failure_text(error, 1024));
+    }
+    fn failure_text(&self, primary: impl std::fmt::Display) -> String {
+        if self.notes.iter().all(Option::is_none) {
+            return failure_text(primary);
+        }
+        // Reserve room for every bounded secondary in the existing 8 KiB
+        // failure field. The primary stays first, with its truncation SHA when
+        // necessary; receipt/failures.jsonl schemas and quotas do not change.
+        let mut text = bounded_failure_text(primary, 4096);
+        for (stage, note) in ["trace-recovery", "trace-persistence", "producer-journal"]
+            .into_iter()
+            .zip(&self.notes)
+        {
+            if let Some(note) = note {
+                text.push_str("; native-retention-secondary[");
+                text.push_str(stage);
+                text.push_str("]=");
+                text.push_str(note);
+            }
+        }
+        failure_text(text)
+    }
+}
+fn native_after_retention<T>(
+    primary: Result<T, ArenaError>,
+    retention: Result<(), ArenaError>,
+    stage: NativeRetentionStage,
+    secondary: &mut NativeRetentionFailures,
+) -> Result<T, ArenaError> {
+    match primary {
+        Err(error) => {
+            if let Err(retention_error) = retention {
+                secondary.record(stage, &retention_error);
+            }
+            Err(error)
+        }
+        Ok(value) => {
+            retention?;
+            Ok(value)
+        }
     }
 }
 
@@ -1927,6 +2018,7 @@ pub fn collect_pals_own_data_with_producer(
         role_records: Vec::new(),
     };
     let mut failure = None;
+    let mut native_secondary = NativeRetentionFailures::default();
     let mut active: Option<ActiveGame> = None;
     let mut conditional_cpu =
         CpuEngine::new(CpuConfig::default()).map_err(|e| invalid(e.to_string()))?;
@@ -2076,9 +2168,15 @@ pub fn collect_pals_own_data_with_producer(
                     );
                     // Always preserve prepared/raw/rejected events before
                     // propagating the native search error or attempting a move.
-                    let trace = driver.take_native_trace()?;
-                    state.take_native(&mut output, trace, job)?;
-                    analyzed?
+                    let retained = driver.take_native_trace().and_then(|trace| {
+                        state.take_native(&mut output, trace, job, &mut native_secondary)
+                    });
+                    native_after_retention(
+                        analyzed,
+                        retained,
+                        NativeRetentionStage::Recovery,
+                        &mut native_secondary,
+                    )?
                 } else {
                     let (input, prepared) = root_capture
                         .as_ref()
@@ -2260,7 +2358,7 @@ pub fn collect_pals_own_data_with_producer(
         Ok(())
     })();
     if let Err(error) = run_result {
-        failure = Some(failure_text(error));
+        failure = Some(native_secondary.failure_text(error));
         if let Some(active) = active.take() {
             let fallback = active
                 .terminal
@@ -2821,6 +2919,171 @@ mod tests {
             )
             .unwrap();
         (temp, output, state, input, description)
+    }
+    #[test]
+    fn native_analysis_primary_survives_actual_trace_credit_rejection() {
+        let (_temp, mut output, mut state, _, _) = label_chain_fixture();
+        let sequence = state.sequence;
+        let inputs = state.inputs.len();
+        let bytes = output.bytes;
+        let mut secondary = NativeRetentionFailures::default();
+        let trace = PalsNativeTrace {
+            sequence: sequence + 1,
+            reserved_bytes: output.native_credit() + 1,
+            ..PalsNativeTrace::default()
+        };
+        let limits = job_limits(
+            &small_config(),
+            &state,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        let retained = state.take_native(&mut output, trace, limits, &mut secondary);
+        assert!(matches!(&retained, Err(ArenaError::Budget(_))));
+        let primary = invalid("PhysicalCompletionUnknown: original native analysis");
+        let expected = primary.to_string();
+        let error = native_after_retention::<()>(
+            Err(primary),
+            retained,
+            NativeRetentionStage::Recovery,
+            &mut secondary,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        let cause = secondary.failure_text(error);
+        assert!(cause.starts_with(&expected));
+        assert!(cause.contains("native-retention-secondary[trace-recovery]"));
+        assert!(cause.contains("delegated output credit"));
+        output
+            .final_json("failures.jsonl", &serde_json::json!({"cause":cause}))
+            .unwrap();
+        let persisted: Vec<serde_json::Value> = rows(&output.directory.join("failures.jsonl"));
+        assert_eq!(persisted[0]["cause"], cause);
+        assert_eq!(state.sequence, sequence);
+        assert_eq!(state.inputs.len(), inputs);
+        // The rejected delegated credit was never charged or silently raised.
+        assert_eq!(
+            output.bytes - bytes,
+            std::fs::metadata(output.directory.join("failures.jsonl"))
+                .unwrap()
+                .len()
+        );
+    }
+    #[test]
+    fn native_observer_primary_survives_io_failure_with_raw_sibling_attempted() {
+        let (_temp, mut output, mut state, _, _) = label_chain_fixture();
+        let sequence = state.sequence;
+        let inputs = state.inputs.len();
+        let bytes = output.bytes;
+        // An exact owned-directory collision fails the first open. The second
+        // row must still be written by the production native_trace path.
+        std::fs::create_dir(output.directory.join("native-events.jsonl")).unwrap();
+        let raw = br#"{"raw":"retained-sibling"}"#.to_vec();
+        let rejected = br#"{"event":"physically-completion-unknown"}"#.to_vec();
+        let reserved = (raw.len() + rejected.len() + 2) as u64;
+        let trace = PalsNativeTrace {
+            sequence: sequence + 1,
+            reserved_bytes: reserved,
+            cpu_nodes: 2,
+            cpu_jobs: 1,
+            cpu_work_observation_incomplete: true,
+            rows: vec![
+                PalsNativeTraceRow {
+                    artifact: "native-events.jsonl",
+                    json: rejected,
+                },
+                PalsNativeTraceRow {
+                    artifact: "native-raw-outputs.jsonl",
+                    json: raw.clone(),
+                },
+            ],
+            failure: Some("PhysicalCompletionUnknown: observer retained original".into()),
+            ..PalsNativeTrace::default()
+        };
+        let limits = job_limits(
+            &small_config(),
+            &state,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        let mut secondary = NativeRetentionFailures::default();
+        let error = state
+            .take_native(&mut output, trace, limits, &mut secondary)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("PhysicalCompletionUnknown: observer retained original")
+        );
+        let cause = secondary.failure_text(error);
+        assert!(cause.contains("native-retention-secondary[trace-persistence]"));
+        assert!(output.failed_artifacts.contains("native-events.jsonl"));
+        let mut expected = raw;
+        expected.push(b'\n');
+        assert_eq!(
+            std::fs::read(output.directory.join("native-raw-outputs.jsonl")).unwrap(),
+            expected
+        );
+        assert_eq!(output.bytes, bytes + reserved);
+        assert_eq!(
+            (state.nodes, state.jobs, state.work_incomplete),
+            (2, 1, true)
+        );
+        assert_eq!(state.sequence, sequence);
+        assert_eq!(state.inputs.len(), inputs);
+    }
+    #[test]
+    fn native_retention_failure_bounds_and_success_gate_keep_all_three_stages() {
+        let mut secondary = NativeRetentionFailures::default();
+        let error = native_after_retention::<()>(
+            Err(ArenaError::Budget("original-primary-variant".into())),
+            Err(invalid("journal-failed")),
+            NativeRetentionStage::Journal,
+            &mut secondary,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ArenaError::Budget(ref cause) if cause == "original-primary-variant")
+        );
+        let error = native_after_retention(
+            Ok(7_u8),
+            Err(ArenaError::Budget("trace-recovery-failed".into())),
+            NativeRetentionStage::Recovery,
+            &mut secondary,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ArenaError::Budget(ref cause) if cause == "trace-recovery-failed"));
+        assert_eq!(
+            native_after_retention(
+                Ok(7_u8),
+                Ok(()),
+                NativeRetentionStage::Recovery,
+                &mut secondary
+            )
+            .unwrap(),
+            7
+        );
+        for stage in [
+            NativeRetentionStage::Recovery,
+            NativeRetentionStage::Persistence,
+            NativeRetentionStage::Journal,
+        ] {
+            secondary.record(stage, &invalid("한글\\\"\n".repeat(10_000)));
+        }
+        assert!(
+            secondary
+                .notes
+                .iter()
+                .all(|note| bounded_json(note.as_ref().unwrap(), 1024, false).is_ok())
+        );
+        let cause =
+            secondary.failure_text(format!("original-primary: {}", "큰\\\"\n".repeat(10_000)));
+        assert!(bounded_json(&cause, 8192, false).is_ok());
+        assert!(cause.starts_with("original-primary:"));
+        for stage in ["trace-recovery", "trace-persistence", "producer-journal"] {
+            assert!(cause.contains(&format!("native-retention-secondary[{stage}]")));
+        }
+        assert_eq!(cause.matches("message truncated; bytes=").count(), 4);
     }
     fn fixture_cpu_label(
         input: &PalsFrozenInput,

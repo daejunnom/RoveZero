@@ -515,8 +515,9 @@ mod native {
     };
     use rz_runtime::{Backend, BackendResult, Clock, Limits, Resources};
     use rz_search::pals::engine::{
-        MODEL_WDL_VALUE_SEMANTICS, ModelValueIdentity, ModelValueOutput, RoleAcceptance,
-        RoleEvaluation, RoleLogicalContext, RoleModel, RoleQueryPurpose, RoleSearchClosure,
+        MODEL_WDL_VALUE_SEMANTICS, ModelValueIdentity, ModelValueOutput, RecheckFinished,
+        RecheckPrepared, RoleAcceptance, RoleEvaluation, RoleLogicalContext, RoleModel,
+        RoleQueryPurpose, RoleSearchClosure,
     };
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -666,6 +667,30 @@ mod native {
             input: &PalsModelInput,
             context: NativePreparedContext<'_>,
         ) -> Result<(), RoleError>;
+        /// Optional actual logical provenance; the legacy observer keeps its
+        /// existing prepared callback and serialized input/lineage unchanged.
+        fn prepared_with_logical_context(
+            &mut self,
+            id: RequestId,
+            input: &PalsModelInput,
+            context: NativePreparedContext<'_>,
+            _logical: Option<&RoleLogicalContext>,
+        ) -> Result<(), RoleError> {
+            self.prepared(id, input, context)
+        }
+        fn accepted_context(
+            &mut self,
+            _id: RequestId,
+            _acceptance: &RoleAcceptance<'_>,
+        ) -> Result<(), RoleError> {
+            Ok(())
+        }
+        fn recheck_prepared(&mut self, _event: RecheckPrepared<'_>) -> Result<(), RoleError> {
+            Ok(())
+        }
+        fn recheck_finished(&mut self, _event: RecheckFinished<'_>) -> Result<(), RoleError> {
+            Ok(())
+        }
         fn physically_completed(
             &mut self,
             _id: RequestId,
@@ -3409,7 +3434,12 @@ mod native {
                 key,
             });
             self.owner.observe("prepared", |observer| {
-                observer.prepared(id, request.state.as_ref(), prepared_context)
+                observer.prepared_with_logical_context(
+                    id,
+                    request.state.as_ref(),
+                    prepared_context,
+                    logical,
+                )
             })?;
             if let Some(admission) = warm_admission {
                 let mut slot = self
@@ -3639,6 +3669,18 @@ mod native {
         fn repair(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
             self.evaluate(query, NativeQueryKind::Repair, None)
         }
+        fn recheck_prepared(&mut self, event: RecheckPrepared<'_>) -> Result<(), RoleError> {
+            self.owner.observe("recheck_prepared", |observer| {
+                observer.recheck_prepared(event)
+            })
+        }
+        fn recheck_finished(&mut self, event: RecheckFinished<'_>) -> Result<(), RoleError> {
+            // This is a prepaid logical close callback. Deadline/cancel must not
+            // suppress it, and it never submits or infers a physical native Run.
+            self.owner.observe("recheck_finished", |observer| {
+                observer.recheck_finished(event)
+            })
+        }
         fn divergences(&mut self, query: DivergenceQuery<'_>) -> Result<Vec<f32>, RoleError> {
             let input = prepare_divergence_input(&query, self.model_epoch)?;
             let output = self.run(
@@ -3776,7 +3818,13 @@ mod native {
         ) -> Result<(), RoleError> {
             acceptance.check_control()?;
             let Some(warm) = &self.owner.private_warm else {
+                let id = self.delivered_request;
                 self.accepted_output();
+                if let Some(id) = id {
+                    self.owner.observe("accepted_context", |observer| {
+                        observer.accepted_context(id, &acceptance)
+                    })?;
+                }
                 return Ok(());
             };
             let id = self.delivered_request.ok_or_else(|| {

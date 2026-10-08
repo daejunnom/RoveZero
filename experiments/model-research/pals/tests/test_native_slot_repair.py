@@ -430,10 +430,16 @@ class NativeSlotRepairTests(unittest.TestCase):
         copied = slot_witness._reviewed_source_pair(old)
         copied[slot_witness._SOURCE_PATHS[0]]["sha256"] = "0" * 64
         self.assertEqual(slot_witness._reviewed_source_pair(old), old)
+        earlier_disabled = dict(zip(slot_witness._SOURCE_PATHS, (
+            {"bytes": 297307, "sha256": "9c0de95911cf54365abec3818f089c20287d80160ea05eee8acbd326f7b49d2c"},
+            {"bytes": 73365, "sha256": "564d2b29d873df1c7b0424bfcee0b52a8f314cbfd88fa68ef35f4fda99a600d5"})))
+        self.assertEqual(slot_witness._reviewed_source_pair(earlier_disabled), earlier_disabled)
         current = {path: semantic.byte_pin(value) for path, value in zip(slot_witness._SOURCE_PATHS,
             (self.fixture.engine_raw, self.fixture.native_raw))}
         self.assertEqual(current[slot_witness._SOURCE_PATHS[0]],
-            {"bytes": 297307, "sha256": "9c0de95911cf54365abec3818f089c20287d80160ea05eee8acbd326f7b49d2c"})
+            {"bytes": 343988, "sha256": "0302e49b6a9784641ca90aba17490d404b793098f38836b7b3cf42a12ee131d1"})
+        self.assertEqual(current[slot_witness._SOURCE_PATHS[1]],
+            {"bytes": 153861, "sha256": "098005ae44fe5c5a9b0a2181d8cde32a40c3eeaaf0e733e2d92ec6859fd424e5"})
         self.assertEqual(slot_witness._reviewed_source_pair(current), current)
         self.assertNotEqual(current, old)
 
@@ -485,6 +491,30 @@ class NativeSlotRepairTests(unittest.TestCase):
                         target[marker] = policy
                         with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_refinement_policy"):
                             slot_witness._source_review(values, source)
+
+    def test_policy_registration_without_marker_is_still_not_a_disabled_profile(self):
+        values = source_review_raws(self.fixture)
+        registration = {
+            "version": "rz-pals-native-refinement-registration/1",
+            "base_registry_canonical_sha256": fixtures.sha("registered base"),
+            "collector_binary_sha256": self.fixture.source["implementation_sha256"],
+            "search_policy": {
+                "version": "pals-post-repair-recheck/1",
+                "policy": "same_repaired_line_once_v1",
+                "search_identity": "pals-restricted-refinement-post-repair-recheck/1",
+                "conditions_sha256": list(bytes.fromhex(
+                    "bea44b7e9ab59f32dcffb1b4c597fd36a4b75037803aeeacd6c18785ce838166")),
+            },
+        }
+        for owner in ("source", "native", "search_configuration", "independent_registry"):
+            for marker, declaration in (("refinement_registration", registration),
+                                        ("refinement_registration_sha256", semantic.byte_pin(raw(registration))["sha256"])):
+                with self.subTest(owner=owner, marker=marker):
+                    source = copy.deepcopy(self.fixture.source)
+                    target = source if owner == "source" else source["native"] if owner == "native" else source["native"].setdefault(owner, {})
+                    target[marker] = copy.deepcopy(declaration)
+                    with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_refinement_policy"):
+                        slot_witness._source_review(values, source)
 
     def test_all_policy_owners_preserve_omission_and_legacy_but_refuse_other_search_versions(self):
         values = source_review_raws(self.fixture)
