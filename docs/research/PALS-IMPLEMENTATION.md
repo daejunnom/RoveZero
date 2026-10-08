@@ -1767,3 +1767,19 @@ legacy를 유지한다. report와 completed-iteration resume는 실제 선택한
 root는 두 Rust 파일을 해당 crate edition 2024로 서식 정리했다.
 로컬 Cargo·Python import·fixture·모델·WSL·GPU 실행은 하지 않았다.
 이 consumer와 새 V feedback의 정확한 integration SHA를 기존 CPU CI에서 검사한다.
+
+### Private SEE 소비자의 첫 CI 실패와 기본 호출 호환성 수정
+
+`7fbb389`의 CPU CI run `37719631256`은 Linux workspace, Windows workspace,
+CPU bindings 세 job에서 성공했지만 `pals-model-cpu-correctness`는 실패했다.
+PALS Python suite는 339개 검사를 실행했고 기존 `test_current_consumers`의
+다섯 사례에서 `ordering_policy` 키워드를 받지 않는 legacy bridge fixture와
+producer 호출이 충돌했다. 이 실패를 모델 수치 성공이나 전체 CI 성공으로
+집계하지 않는다. 원래 job log와 exact-SHA 결과는 저장소 밖 인수 자료로 보존했다.
+
+후속 수정은 기본 legacy producer의 기존 bridge 호출 형태를 유지하고,
+명시적으로 선택한 SEE lane에만 새 ordering 키워드를 전달한다. 기존 consumer
+검사를 완화하거나 fixture에 임의 키워드를 받아들이게 하지 않는다. request와
+report의 ordering domain, 실제 CPU conditions 및 raw evidence 검증은 그대로다.
+이 수정의 소스·후속 CI 결과는 `7fbb389`의 실패 기록과 별도로 인수한다.
+로컬에서는 Python import·모델 실행·Cargo 검사·GPU 검사를 시작하지 않았다.

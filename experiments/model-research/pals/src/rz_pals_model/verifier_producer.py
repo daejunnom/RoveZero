@@ -1130,8 +1130,12 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
                 counts["cpu_dispatches"] += 1
                 cpu_capture = {}
                 cpu_stage = "cpu_bridge"
+                # Preserve the legacy bridge call boundary. Only the explicitly
+                # selected SEE lane supplies its new ordering keyword.
+                bridge_options = {} if selected_ordering == LEGACY_ORDERING else {
+                    "ordering_policy": selected_ordering}
                 response = run_cpu_bridge(binary, request, limits, capture=cpu_capture,
-                                          pipe_reservation=pipe_reservation, ordering_policy=selected_ordering)
+                                          pipe_reservation=pipe_reservation, **bridge_options)
                 cpu_stage = "response_validation"
                 try:
                     gain = observed_gain_with_ordering(request, response, ordering_policy=selected_ordering)
