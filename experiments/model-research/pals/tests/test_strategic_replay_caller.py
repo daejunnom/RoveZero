@@ -108,9 +108,10 @@ class StrategicReplayCallerTests(unittest.TestCase):
         self.assertEqual(values["semantic_receipt_producer_scope_variant"], "LinuxLoadedExecutableInode")
         self.assertIs(values["complete_replay_expected_pins"], False)
         self.assertIn("replay_consumer_registration_original_bytes_and_independent_pin", values["required_external"])
+        audit = checked.audit()
         for key in caller._DENIED:
-            self.assertIs(checked.audit()[key], False)
-        self.assertEqual(checked.audit()["actual_utility_groups"], 0)
+            self.assertIs(audit[key], False)
+        self.assertEqual(audit["actual_utility_groups"], 0)
         self.assertFalse(hasattr(checked, "dispatch"))
 
     def test_original_deadline_and_exact_resource_declarations_are_not_converted(self):
@@ -118,10 +119,13 @@ class StrategicReplayCallerTests(unittest.TestCase):
         original = self.f.prepared.envelope()
         checked = caller.prepare_replay_caller_bindings(**arguments)
         self.assertEqual(checked.audit()["original_absolute_deadline"], arguments["deadline"])
-        self.assertEqual(action._parse(checked.raw_assets()["prepared_action"])["remaining"], original["remaining"])
-        self.assertEqual(action._parse(checked.raw_assets()["prepared_action"])["action"], original["action"])
+        assets = checked.raw_assets()
+        prepared = action._parse(assets["prepared_action"])
+        self.assertEqual(prepared["remaining"], original["remaining"])
+        self.assertEqual(prepared["action"], original["action"])
+        values = checked.constructor_inputs()
         for name in ("mode", "config", "resources", "outer_wire", "cli_expected"):
-            self.assertNotIn(name, checked.constructor_inputs())
+            self.assertNotIn(name, values)
 
     def test_factory_only_immutable_checked_object(self):
         with self.assertRaises(caller.ReplayCallerRefusal):
@@ -256,8 +260,9 @@ class StrategicReplayCallerTests(unittest.TestCase):
         raw = json.dumps(dict(reversed(list(self.f.request(0).items()))), ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
         prepared = self.f.prepare_action(0, raw=raw)
         checked = self.f.admit(prepared_action=prepared)
-        self.assertEqual(checked.raw_assets()["cpu_request"], raw)
-        self.assertEqual(checked.raw_assets()["expected_cpu_request_pin"], query.byte_pin(raw))
+        assets = checked.raw_assets()
+        self.assertEqual(assets["cpu_request"], raw)
+        self.assertEqual(assets["expected_cpu_request_pin"], query.byte_pin(raw))
         self.assertEqual(checked.constructor_inputs()["originals_available"]["prepared_action"], prepared.envelope_bytes())
 
     def test_rerendered_rules_dict_cannot_replace_independently_pinned_original(self):
@@ -373,8 +378,9 @@ class StrategicReplayCallerTests(unittest.TestCase):
 
     def test_handoff_identity_is_byte_binding_without_complete_replay_authority(self):
         checked = self.f.admit()
-        self.assertEqual(len(checked.sha256), 64)
-        self.assertEqual(hashlib.sha256(checked._views()[2]).hexdigest(), checked.sha256)
+        identity = checked.sha256
+        self.assertEqual(len(identity), 64)
+        self.assertEqual(hashlib.sha256(checked._views()[2]).hexdigest(), identity)
         self.assertEqual(checked.audit()["ledger"]["scope"], "own_handoff_ledger_only_not_resident_or_rss_cap")
         self.assertFalse(hasattr(checked, "outer_request"))
 
