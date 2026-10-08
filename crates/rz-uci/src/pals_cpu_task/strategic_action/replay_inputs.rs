@@ -10,7 +10,9 @@
 //!
 //! ReplyOnly2n reserves conservative Repair role/store requirements, explicitly
 //! reported as overreservation; its physical CPU allowance remains exactly 2N.
-//! RepairEndpoint3n separately reserves 3N. Neither mode extends old remaining
+//! RepairEndpoint3n separately reserves 3N. RepairOpponent4n explicitly uses /2
+//! source registration and reserves 4N plus an actual new C continuation.
+//! No mode extends old remaining
 //! declarations or changes the legacy request. Cleanup is an explicit partition
 //! inside the original whole wall, not a fresh clock or whole-cost observation.
 
@@ -20,7 +22,8 @@ use crate::engine::OwnerRegistry;
 use rz_position::{BoardMove, HistoryCompleteness, HistoryOrigin, Position};
 use rz_search::cpu::{CpuConfig, CpuProfile};
 use rz_search::pals::engine::replay::{
-    DefendResponseReplayPlan, ReplayHistoricalPins, repair_replay_requirements,
+    DefendResponseReplayPlan, ReplayError, ReplayHistoricalPins,
+    repair_opponent_replay_requirements, repair_replay_requirements,
 };
 use rz_search::pals::engine::{PalsConfig, PalsLimits};
 use semantic::{MoveMeaning, MoveTokenKind, SemanticReceipt, SemanticRequest};
@@ -34,6 +37,8 @@ use std::time::{Duration, Instant};
 
 pub const SCHEMA: &str = "rz-pals-frozen-replay-inputs/1";
 pub const REGISTRATION_SCHEMA: &str = "rz-pals-frozen-replay-consumer-registration/1";
+pub const OPPONENT_SCHEMA: &str = "rz-pals-frozen-replay-inputs/2";
+pub const OPPONENT_REGISTRATION_SCHEMA: &str = "rz-pals-frozen-replay-consumer-registration/2";
 pub const SCOPE: &str = "caller_registered_original_bytes_to_rules_checked_owner_arguments";
 pub const BINARY_DECLARATION_SCOPE: &str =
     "external_caller_registered_digest_not_loaded_image_observation";
@@ -301,14 +306,127 @@ pub enum ReplayInputMode {
     ReplyOnly2n,
     #[serde(rename = "repair_endpoint_3n")]
     RepairEndpoint3n,
+    #[serde(rename = "repair_opponent_4n")]
+    RepairOpponent4n,
 }
 impl ReplayInputMode {
     fn checks(self) -> u64 {
         match self {
             Self::ReplyOnly2n => 2,
             Self::RepairEndpoint3n => 3,
+            Self::RepairOpponent4n => 4,
         }
     }
+    pub const fn input_schema(self) -> &'static str {
+        match self {
+            Self::RepairOpponent4n => OPPONENT_SCHEMA,
+            Self::ReplyOnly2n | Self::RepairEndpoint3n => SCHEMA,
+        }
+    }
+    pub const fn registration_schema(self) -> &'static str {
+        match self {
+            Self::RepairOpponent4n => OPPONENT_REGISTRATION_SCHEMA,
+            Self::ReplyOnly2n | Self::RepairEndpoint3n => REGISTRATION_SCHEMA,
+        }
+    }
+}
+
+/// Source-owned finite reservations shared by admission, launch preparation and
+/// native observation. The old 2N lane retains its conservative 3N role/store
+/// reservation; actual observer roles and CPU stages are declared separately.
+/// These counts establish neither allocation nor work/physical completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplayModeRequirements {
+    cpu_nodes: u64,
+    role_calls: u64,
+    actual_role_calls: u64,
+    nodes: usize,
+    records: usize,
+    observations: usize,
+    line_chunks: usize,
+    stages: usize,
+    cpu_checks: usize,
+}
+impl ReplayModeRequirements {
+    pub const fn cpu_nodes(self) -> u64 {
+        self.cpu_nodes
+    }
+    pub const fn role_calls(self) -> u64 {
+        self.role_calls
+    }
+    pub const fn nodes(self) -> usize {
+        self.nodes
+    }
+    pub const fn records(self) -> usize {
+        self.records
+    }
+    pub const fn observations(self) -> usize {
+        self.observations
+    }
+    pub const fn line_chunks(self) -> usize {
+        self.line_chunks
+    }
+    pub const fn stages(self) -> usize {
+        self.stages
+    }
+    pub const fn actual_role_calls(self) -> u64 {
+        self.actual_role_calls
+    }
+    pub const fn cpu_checks(self) -> usize {
+        self.cpu_checks
+    }
+}
+pub fn replay_mode_requirements(
+    mode: ReplayInputMode,
+    line_plies: usize,
+    prefix_plies: usize,
+    nodes_per_check: u64,
+) -> Result<ReplayModeRequirements, ReplayError> {
+    let (role_calls, nodes, records, observations, line_chunks, stages) =
+        if mode == ReplayInputMode::RepairOpponent4n {
+            let required =
+                repair_opponent_replay_requirements(line_plies, prefix_plies, nodes_per_check)?;
+            (
+                required.role_calls(),
+                required.nodes(),
+                required.records(),
+                required.observations(),
+                required.line_chunks(),
+                required.stages(),
+            )
+        } else {
+            let required = repair_replay_requirements(line_plies, prefix_plies, nodes_per_check)?;
+            (
+                required.role_calls(),
+                required.nodes(),
+                required.records(),
+                required.observations(),
+                required.line_chunks(),
+                required.stages(),
+            )
+        };
+    let actual_role_calls = if mode == ReplayInputMode::ReplyOnly2n {
+        u64::try_from(line_plies)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or(ReplayError::InvalidPlan("reply role bound overflow"))?
+    } else {
+        role_calls
+    };
+    let cpu_nodes = nodes_per_check
+        .checked_mul(mode.checks())
+        .ok_or(ReplayError::InvalidPlan("mode CPU reservation overflow"))?;
+    Ok(ReplayModeRequirements {
+        cpu_nodes,
+        role_calls,
+        actual_role_calls,
+        nodes,
+        records,
+        observations,
+        line_chunks,
+        stages,
+        cpu_checks: mode.checks() as usize,
+    })
 }
 
 /// Four Query/2 parent identities. Encoding stays here because the existing
@@ -347,6 +465,20 @@ pub struct ReplayRegisteredArtifacts {
     pub wrapper_source: ArtifactPin,
     pub replay_source: ArtifactPin,
     pub provider_factory_source: ArtifactPin,
+    // Absent in the old wire and required only by the explicit /2 registration.
+    // An explicit null is refused rather than becoming an absent legacy field.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_artifact"
+    )]
+    pub opponent_recheck_source: Option<ArtifactPin>,
+}
+
+fn present_artifact<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ArtifactPin>, D::Error> {
+    ArtifactPin::deserialize(deserializer).map(Some)
 }
 
 /// Explicit negative authority fields are part of both closed wire schemas.
@@ -691,7 +823,7 @@ impl CheckedReplayInputs {
     }
     pub fn audit(&self) -> ReplayInputAudit {
         ReplayInputAudit {
-            schema: SCHEMA,
+            schema: self.request.mode.input_schema(),
             scope: SCOPE,
             expected_semantic_receipt_producer_scope: self.expected_semantic_receipt_producer_scope,
             mode: self.request.mode,
@@ -799,10 +931,13 @@ fn same_serialized<T: Serialize>(
 fn check_registration(
     raw: &str,
     expected: &ReplayExpectedPins,
+    mode: ReplayInputMode,
 ) -> Result<ReplayConsumerRegistration, ReplayInputError> {
     let registration: ReplayConsumerRegistration =
         serde_json::from_str(raw).map_err(|e| ReplayInputError::new("registration_json", e))?;
-    if registration.schema != REGISTRATION_SCHEMA
+    if registration.schema != mode.registration_schema()
+        || registration.artifacts.opponent_recheck_source.is_some()
+            != (mode == ReplayInputMode::RepairOpponent4n)
         || registration.binary_pin_scope != BINARY_DECLARATION_SCOPE
         || registration.legacy_cpu_max_checks != 2
         || registration.authorities != ReplayAuthorities::default()
@@ -837,9 +972,12 @@ fn check_registration(
     ] {
         bounded_pin(source, MAX_SOURCE_BYTES)?;
     }
+    if let Some(source) = &registration.artifacts.opponent_recheck_source {
+        bounded_pin(source, MAX_SOURCE_BYTES)?;
+    }
     digest_bytes(&registration.legacy_cpu_profile_sha256)?;
     digest_bytes(&registration.context_sha256)?;
-    if closed_context(REGISTRATION_SCHEMA, &registration)? != registration.context_sha256 {
+    if closed_context(mode.registration_schema(), &registration)? != registration.context_sha256 {
         return Err(ReplayInputError::new(
             "registration_context",
             "closed registration context differs",
@@ -1255,7 +1393,9 @@ fn validate(
     input_artifact: ArtifactPin,
     expected_scope: Option<SemanticReceiptProducerScope>,
 ) -> Result<CheckedReplayInputs, ReplayInputError> {
-    if request.schema != SCHEMA || request.authorities != ReplayAuthorities::default() {
+    if request.schema != request.mode.input_schema()
+        || request.authorities != ReplayAuthorities::default()
+    {
         return Err(ReplayInputError::new(
             "domain_authority",
             "closed replay domain and negative authority declarations required",
@@ -1311,14 +1451,14 @@ fn validate(
         &expected.semantic_receipt_artifact,
         MAX_SEMANTIC_RECEIPT_BYTES,
     )?;
-    if closed_context(SCHEMA, &request)? != request.context_sha256 {
+    if closed_context(request.mode.input_schema(), &request)? != request.context_sha256 {
         return Err(ReplayInputError::new(
             "context_identity",
             "new replay mode/resources/original raw context differs",
         ));
     }
     check_clock(clock)?;
-    let registration = check_registration(&request.registration_raw, expected)?;
+    let registration = check_registration(&request.registration_raw, expected, request.mode)?;
     let (prepared, _) = super::decode(request.prepared_action_raw.as_bytes(), started)
         .map_err(|e| ReplayInputError::strategic("prepared_action", e))?;
     let binding = &request.binding;
@@ -1361,9 +1501,13 @@ fn validate(
             "config does not retain exact original N",
         ));
     }
-    let required =
-        repair_replay_requirements(config.line_plies, cpu.prefix.len(), cpu.max_nodes_per_check)
-            .map_err(|e| ReplayInputError::new("resource_arithmetic", e))?;
+    let required = replay_mode_requirements(
+        request.mode,
+        config.line_plies,
+        cpu.prefix.len(),
+        cpu.max_nodes_per_check,
+    )
+    .map_err(|e| ReplayInputError::new("resource_arithmetic", e))?;
     let exact_cpu = cpu
         .max_nodes_per_check
         .checked_mul(request.mode.checks())
@@ -1381,21 +1525,20 @@ fn validate(
         })?;
     let resources = &request.resources;
     if resources.cpu_nodes != exact_cpu
-        || (request.mode == ReplayInputMode::RepairEndpoint3n
-            && resources.cpu_nodes != required.cpu_nodes())
+        || resources.cpu_nodes != required.cpu_nodes
         || resources.cpu_nodes > prepared.remaining.nodes
         || resources.whole_wall_ms > prepared.remaining.wall_ms
         || resources.output_bytes as u64 > prepared.remaining.output_bytes
         || resources.output_bytes < minimum_output
         || resources.role_calls != config.max_role_calls
-        || resources.role_calls < required.role_calls()
+        || resources.role_calls < required.role_calls
         || resources.store_nodes != config.max_nodes
-        || resources.store_nodes < required.nodes()
+        || resources.store_nodes < required.nodes
         || resources.store_records != config.max_records
-        || resources.store_records < required.records()
-        || resources.required_observations != required.observations()
-        || resources.required_line_chunks != required.line_chunks()
-        || resources.required_stages != required.stages()
+        || resources.store_records < required.records
+        || resources.required_observations != required.observations
+        || resources.required_line_chunks != required.line_chunks
+        || resources.required_stages != required.stages
         || !(1..=65_536).contains(&resources.max_rounds)
     {
         return Err(ReplayInputError::new(
@@ -1803,6 +1946,9 @@ fn preparation_expected_shape(expected: &ReplayExpectedPins) -> Result<(), Repla
         // checked_pin checks SHA shape before constructing an error projection.
         bounded_pin(pin, maximum)?;
     }
+    if let Some(pin) = &expected.registered_artifacts.opponent_recheck_source {
+        bounded_pin(pin, MAX_SOURCE_BYTES)?;
+    }
     Ok(())
 }
 fn preparation_original<'a>(
@@ -1914,7 +2060,7 @@ pub fn prepare_replay_request(
                     limit: None,
                 })?;
             let mut view = ReplayPreparationView {
-                schema: SCHEMA,
+                schema: declaration.mode.input_schema(),
                 mode: declaration.mode,
                 registration_raw,
                 registration_artifact: &expected.registration_artifact,
@@ -1933,7 +2079,7 @@ pub fn prepare_replay_request(
             // Context has the existing compact [SCHEMA, body] canonical meaning.
             // Sorting changes key order, not compact byte length or string escaping.
             let context_json_bytes = count_preparation(
-                &(SCHEMA, &view),
+                &(declaration.mode.input_schema(), &view),
                 MAX_REQUEST_BYTES,
                 clock,
                 started,
@@ -1984,7 +2130,7 @@ pub fn prepare_replay_request(
             }
             stage = "context";
             preparation_clock(started, clock, expected_scope)?;
-            let context = closed_context(SCHEMA, &view)
+            let context = closed_context(declaration.mode.input_schema(), &view)
                 .map_err(|error| preparation_input_cause(error, started, clock, expected_scope))?;
             preparation_clock(started, clock, expected_scope)?;
             view.context_sha256 = Some(&context);
@@ -2284,6 +2430,7 @@ mod tests {
             wrapper_source: artifact(&"4".repeat(64), 12345),
             replay_source: artifact(&"5".repeat(64), 115515),
             provider_factory_source: artifact(&"6".repeat(64), 23456),
+            opponent_recheck_source: None,
         };
         let mut registration = ReplayConsumerRegistration {
             schema: REGISTRATION_SCHEMA.into(),
@@ -2362,6 +2509,252 @@ mod tests {
             &fixture.expected,
             started,
         )
+    }
+
+    fn opponent_fixture() -> Fixture {
+        // A newly constructed original fixture declares 4N; production never
+        // upgrades an existing action's remaining allowance.
+        let mut value = fixture(ReplayInputMode::RepairEndpoint3n, true, "position startpos");
+        let mode = ReplayInputMode::RepairOpponent4n;
+        value.request.mode = mode;
+        value.request.schema = mode.input_schema().into();
+        let mut action: super::super::Request =
+            serde_json::from_str(&value.request.prepared_action_raw).unwrap();
+        action.remaining.nodes = 256;
+        action.context_sha256 = seal(super::super::SCHEMA, &action);
+        value.request.prepared_action_raw = serde_json::to_string(&action).unwrap() + "\n";
+        value.request.prepared_action_artifact =
+            super::super::pin(value.request.prepared_action_raw.as_bytes());
+        value.expected.prepared_action_artifact = value.request.prepared_action_artifact.clone();
+        let mut registration: ReplayConsumerRegistration =
+            serde_json::from_str(&value.request.registration_raw).unwrap();
+        registration.schema = mode.registration_schema().into();
+        registration.artifacts.opponent_recheck_source = Some(artifact(&"a".repeat(64), 4096));
+        value.expected.registered_artifacts = registration.artifacts.clone();
+        replace_opponent_registration(&mut value, registration);
+        let required = replay_mode_requirements(mode, 4, 1, 64).unwrap();
+        value.request.config.max_records = required.records;
+        value.request.config.max_role_calls = required.role_calls;
+        value.request.resources.cpu_nodes = required.cpu_nodes;
+        value.request.resources.role_calls = required.role_calls;
+        value.request.resources.store_records = required.records;
+        value.request.resources.required_observations = required.observations;
+        value.request.resources.required_line_chunks = required.line_chunks;
+        value.request.resources.required_stages = required.stages;
+        value.request.resources.output_bytes = MAX_OUTPUT_BYTES;
+        value.request.context_sha256 = seal(mode.input_schema(), &value.request);
+        value
+    }
+    fn replace_opponent_registration(
+        value: &mut Fixture,
+        mut registration: ReplayConsumerRegistration,
+    ) {
+        registration.context_sha256 = seal(&registration.schema, &registration);
+        value.request.registration_raw = serde_json::to_string(&registration).unwrap() + "\n";
+        value.request.registration_artifact =
+            super::super::pin(value.request.registration_raw.as_bytes());
+        value.expected.registration_artifact = value.request.registration_artifact.clone();
+        value.request.context_sha256 = seal(value.request.mode.input_schema(), &value.request);
+    }
+
+    #[test]
+    fn opponent_input_v2_admits_exact_four_n_declarations_without_execution() {
+        let fixture = opponent_fixture();
+        let checked = admitted(&fixture, Instant::now()).unwrap();
+        let audit = checked.audit();
+        assert_eq!(audit.schema, OPPONENT_SCHEMA);
+        assert_eq!(audit.mode, ReplayInputMode::RepairOpponent4n);
+        assert_eq!(audit.cpu_allowance, 256);
+        assert!(!audit.conservative_repair_role_store_overreservation);
+        assert!(!audit.cpu_engine_created && !audit.model_created && !audit.provider_created);
+        assert_eq!(audit.authorities, ReplayAuthorities::default());
+        assert!(audit.registered_artifacts.opponent_recheck_source.is_some());
+        let (_, _, _, limits) = checked.into_owner_args();
+        assert_eq!(limits.max_cpu_nodes, 256);
+    }
+
+    #[test]
+    fn opponent_registration_must_be_independent_present_bounded_and_v2() {
+        for fault in 0..5 {
+            let mut fixture = opponent_fixture();
+            let mut registration: ReplayConsumerRegistration =
+                serde_json::from_str(&fixture.request.registration_raw).unwrap();
+            match fault {
+                0 => registration.schema = REGISTRATION_SCHEMA.into(),
+                1 => registration.artifacts.opponent_recheck_source = None,
+                2 => {
+                    registration
+                        .artifacts
+                        .opponent_recheck_source
+                        .as_mut()
+                        .unwrap()
+                        .sha256 = "b".repeat(64)
+                }
+                3 => {
+                    registration
+                        .artifacts
+                        .opponent_recheck_source
+                        .as_mut()
+                        .unwrap()
+                        .bytes = MAX_SOURCE_BYTES + 1;
+                    fixture.expected.registered_artifacts = registration.artifacts.clone();
+                }
+                _ => {
+                    registration
+                        .artifacts
+                        .opponent_recheck_source
+                        .as_mut()
+                        .unwrap()
+                        .bytes = 0
+                }
+            }
+            replace_opponent_registration(&mut fixture, registration);
+            assert!(admitted(&fixture, Instant::now()).is_err());
+        }
+    }
+
+    #[test]
+    fn opponent_mode_schema_and_legacy_source_namespace_do_not_cross() {
+        let mut new = opponent_fixture();
+        new.request.schema = SCHEMA.into();
+        new.request.context_sha256 = seal(SCHEMA, &new.request);
+        assert!(admitted(&new, Instant::now()).is_err());
+        for mode in [
+            ReplayInputMode::ReplyOnly2n,
+            ReplayInputMode::RepairEndpoint3n,
+        ] {
+            let mut old = fixture(mode, false, "position startpos");
+            let mut registration: ReplayConsumerRegistration =
+                serde_json::from_str(&old.request.registration_raw).unwrap();
+            registration.artifacts.opponent_recheck_source = Some(artifact(&"a".repeat(64), 4096));
+            old.expected.registered_artifacts = registration.artifacts.clone();
+            replace_opponent_registration(&mut old, registration);
+            assert!(admitted(&old, Instant::now()).is_err());
+        }
+    }
+
+    #[test]
+    fn absent_opponent_pin_preserves_legacy_bytes_and_explicit_null_is_refused() {
+        let fixture = fixture(ReplayInputMode::ReplyOnly2n, false, "position startpos");
+        let artifacts = &fixture.expected.registered_artifacts;
+        #[derive(Serialize)]
+        struct Legacy<'a> {
+            legacy_cpu_binary: &'a ArtifactPin,
+            replay_binary: &'a ArtifactPin,
+            engine_source: &'a ArtifactPin,
+            wrapper_source: &'a ArtifactPin,
+            replay_source: &'a ArtifactPin,
+            provider_factory_source: &'a ArtifactPin,
+        }
+        let legacy = Legacy {
+            legacy_cpu_binary: &artifacts.legacy_cpu_binary,
+            replay_binary: &artifacts.replay_binary,
+            engine_source: &artifacts.engine_source,
+            wrapper_source: &artifacts.wrapper_source,
+            replay_source: &artifacts.replay_source,
+            provider_factory_source: &artifacts.provider_factory_source,
+        };
+        assert_eq!(
+            serde_json::to_vec(artifacts).unwrap(),
+            serde_json::to_vec(&legacy).unwrap()
+        );
+        let raw = serde_json::to_string(artifacts).unwrap();
+        assert!(!raw.contains("opponent_recheck_source"));
+        for added in [
+            "\"opponent_recheck_source\":null,",
+            "\"unknown_opponent_source\":{},",
+        ] {
+            let bad = raw.replacen('{', &format!("{{{added}"), 1);
+            assert!(serde_json::from_str::<ReplayRegisteredArtifacts>(&bad).is_err());
+        }
+        let mut full = artifacts.clone();
+        full.opponent_recheck_source = Some(artifact(&"a".repeat(64), 4096));
+        let raw = serde_json::to_string(&full).unwrap();
+        let duplicate = raw.replacen('{', "{\"opponent_recheck_source\":{\"bytes\":4096,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},", 1);
+        assert!(serde_json::from_str::<ReplayRegisteredArtifacts>(&duplicate).is_err());
+    }
+
+    #[test]
+    fn opponent_reservations_and_original_remaining_refuse_before_owner_creation() {
+        for fault in 0..7 {
+            let mut fixture = opponent_fixture();
+            match fault {
+                0 => fixture.request.resources.cpu_nodes = 192,
+                1 => {
+                    fixture.request.resources.role_calls -= 1;
+                    fixture.request.config.max_role_calls -= 1;
+                }
+                2 => {
+                    fixture.request.resources.store_records = 4;
+                    fixture.request.config.max_records = 4;
+                }
+                3 => fixture.request.resources.required_stages = 3,
+                4 => fixture.request.resources.required_observations -= 1,
+                5 => fixture.request.resources.required_line_chunks -= 1,
+                _ => {
+                    let mut action: super::super::Request =
+                        serde_json::from_str(&fixture.request.prepared_action_raw).unwrap();
+                    action.remaining.nodes = 192;
+                    action.context_sha256 = seal(super::super::SCHEMA, &action);
+                    fixture.request.prepared_action_raw = serde_json::to_string(&action).unwrap();
+                    fixture.request.prepared_action_artifact =
+                        super::super::pin(fixture.request.prepared_action_raw.as_bytes());
+                    fixture.expected.prepared_action_artifact =
+                        fixture.request.prepared_action_artifact.clone();
+                }
+            }
+            fixture.request.context_sha256 = seal(OPPONENT_SCHEMA, &fixture.request);
+            let error = admitted(&fixture, Instant::now()).err().unwrap();
+            assert_eq!(error.stage, "resource_reservation");
+        }
+    }
+
+    #[test]
+    fn mode_requirements_keep_legacy_overreservation_and_new_finite_counts() {
+        let reply = replay_mode_requirements(ReplayInputMode::ReplyOnly2n, 5, 1, 100_000).unwrap();
+        let repair =
+            replay_mode_requirements(ReplayInputMode::RepairEndpoint3n, 5, 1, 100_000).unwrap();
+        let opponent =
+            replay_mode_requirements(ReplayInputMode::RepairOpponent4n, 5, 1, 100_000).unwrap();
+        assert_eq!(
+            (
+                reply.cpu_nodes,
+                reply.actual_role_calls(),
+                reply.cpu_checks()
+            ),
+            (200_000, 6, 2)
+        );
+        assert_eq!(
+            (reply.role_calls, reply.nodes, reply.records, reply.stages),
+            (
+                repair.role_calls,
+                repair.nodes,
+                repair.records,
+                repair.stages
+            )
+        );
+        assert_eq!(
+            (
+                repair.cpu_nodes,
+                repair.actual_role_calls(),
+                repair.cpu_checks()
+            ),
+            (300_000, 12, 3)
+        );
+        assert_eq!(
+            (
+                opponent.cpu_nodes,
+                opponent.actual_role_calls(),
+                opponent.cpu_checks(),
+                opponent.records,
+                opponent.stages
+            ),
+            (400_000, 14, 4, 5, 4)
+        );
+        assert!(replay_mode_requirements(ReplayInputMode::RepairOpponent4n, 3, 1, 1).is_err());
+        assert!(
+            replay_mode_requirements(ReplayInputMode::RepairOpponent4n, 5, 1, u64::MAX).is_err()
+        );
     }
     fn reseal(fixture: &mut Fixture) {
         fixture.request.context_sha256 = seal(SCHEMA, &fixture.request);

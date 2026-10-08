@@ -2380,6 +2380,7 @@ mod cpu_cli {
                     wrapper_source: pin.clone(),
                     replay_source: pin.clone(),
                     provider_factory_source: pin,
+                    opponent_recheck_source: None,
                 },
                 legacy_cpu_profile_sha256: h(),
                 provider_factory_id: "rz-uci-native-cpu-fresh-invocation-v1".into(),

@@ -15,7 +15,9 @@ use super::replay_inputs::{
     ReplayPreparationDeclaration, ReplayPreparationError, ReplayRegisteredArtifacts,
     SemanticReceiptProducerScope, check_replay_inputs_with_semantic_scope, prepare_replay_request,
 };
-use rz_search::pals::engine::replay::{ReplayError, repair_replay_requirements};
+use rz_search::pals::engine::replay::ReplayError;
+#[cfg(test)]
+use rz_search::pals::engine::replay::repair_replay_requirements;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::TryReserveError;
@@ -960,28 +962,16 @@ pub fn prepare_replay_launch_bundle(
             )
             .map_err(|error| ReplayLaunchCause::Input(Box::new(error)))?;
             let (config, root, plan, limits) = checked.into_owner_args();
-            let (roles, checks) = match declaration.replay.mode {
-                ReplayInputMode::ReplyOnly2n => (
-                    config
-                        .line_plies
-                        .checked_add(1)
-                        .ok_or(ReplayLaunchCause::Refusal("role extent overflow"))?,
-                    2,
-                ),
-                ReplayInputMode::RepairEndpoint3n => {
-                    let required = repair_replay_requirements(
-                        config.line_plies,
-                        plan.prefix.len(),
-                        plan.nodes_per_check,
-                    )
-                    .map_err(|error| ReplayLaunchCause::Replay(Box::new(error)))?;
-                    (
-                        usize::try_from(required.role_calls())
-                            .map_err(ReplayLaunchCause::Integer)?,
-                        3,
-                    )
-                }
-            };
+            let required = super::replay_inputs::replay_mode_requirements(
+                declaration.replay.mode,
+                config.line_plies,
+                plan.prefix.len(),
+                plan.nodes_per_check,
+            )
+            .map_err(|error| ReplayLaunchCause::Replay(Box::new(error)))?;
+            let roles = usize::try_from(required.actual_role_calls())
+                .map_err(ReplayLaunchCause::Integer)?;
+            let checks = required.cpu_checks();
             drop((config, root, plan, limits));
             let output_required = replay_output_requirements(roles, checks)
                 .map_err(|error| ReplayLaunchCause::Output(Box::new(error)))?;
@@ -1524,6 +1514,7 @@ mod tests {
             wrapper_source: artifact(&"4".repeat(64), 12345),
             replay_source: artifact(&"5".repeat(64), 115515),
             provider_factory_source: artifact(&"6".repeat(64), 23456),
+            opponent_recheck_source: None,
         };
         let mut registration = ReplayConsumerRegistration {
             schema: REGISTRATION_SCHEMA.into(),
@@ -1566,6 +1557,7 @@ mod tests {
             cpu_nodes: match mode {
                 ReplayInputMode::ReplyOnly2n => 128,
                 ReplayInputMode::RepairEndpoint3n => 192,
+                ReplayInputMode::RepairOpponent4n => 256,
             },
             role_calls: required.role_calls(),
             store_nodes: 257,
@@ -1622,6 +1614,119 @@ mod tests {
             max_publication_bytes: MAX_PUBLICATION_BYTES,
             max_publication_backing_bytes: MAX_PUBLICATION_BACKING_BYTES,
         }
+    }
+
+    fn opponent_fixture() -> Fixture {
+        let mut f = fixture(ReplayInputMode::RepairEndpoint3n);
+        f.mode = ReplayInputMode::RepairOpponent4n;
+        let mut registration: ReplayConsumerRegistration =
+            serde_json::from_slice(&f.registration).unwrap();
+        registration.schema = f.mode.registration_schema().into();
+        registration.artifacts.opponent_recheck_source = Some(artifact(&"a".repeat(64), 4096));
+        registration.context_sha256 = seal(&registration.schema, &registration);
+        f.registration = (serde_json::to_string(&registration).unwrap() + "\n").into_bytes();
+        f.expected.registration_artifact = super::super::pin(&f.registration);
+        f.expected.registered_artifacts = registration.artifacts;
+        let mut action: super::super::Request = serde_json::from_slice(&f.action).unwrap();
+        // The fresh controlled original declares 4N. No production allowance
+        // is extended in request construction or durable launch preparation.
+        action.remaining.nodes = 256;
+        action.context_sha256 = seal(super::super::SCHEMA, &action);
+        f.action = (serde_json::to_string(&action).unwrap() + "\r\n").into_bytes();
+        f.expected.prepared_action_artifact = super::super::pin(&f.action);
+        let required =
+            rz_search::pals::engine::replay::repair_opponent_replay_requirements(4, 1, 64).unwrap();
+        f.config.max_records = required.records();
+        f.config.max_role_calls = required.role_calls();
+        f.resources.cpu_nodes = required.cpu_nodes();
+        f.resources.role_calls = required.role_calls();
+        f.resources.store_records = required.records();
+        f.resources.required_observations = required.observations();
+        f.resources.required_line_chunks = required.line_chunks();
+        f.resources.required_stages = required.stages();
+        f
+    }
+
+    #[test]
+    fn durable_opponent_v2_preserves_originals_and_independent_source_pin() {
+        let f = opponent_fixture();
+        let root = TempRoot::new();
+        let started = Instant::now();
+        let bundle = prepare(
+            &f,
+            &root.path,
+            "four-n",
+            budget(),
+            started,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let request: super::replay_inputs::ReplayInputRequest =
+            serde_json::from_slice(payload(&bundle, "replay-input.json").as_bytes()).unwrap();
+        assert_eq!(request.schema, super::replay_inputs::OPPONENT_SCHEMA);
+        assert_eq!(request.mode, ReplayInputMode::RepairOpponent4n);
+        assert_eq!(request.registration_raw.as_bytes(), f.registration);
+        assert_eq!(request.prepared_action_raw.as_bytes(), f.action);
+        assert_eq!(request.semantic_receipt_raw.as_bytes(), f.semantic);
+        assert_eq!(request.resources.cpu_nodes, 256);
+        assert_eq!(request.resources.required_stages, 4);
+        let transport: ExpectedTransportV2 =
+            serde_json::from_slice(payload(&bundle, "replay-expected.json").as_bytes()).unwrap();
+        assert_eq!(transport.schema, EXPECTED_TRANSPORT_V2_SCHEMA);
+        assert_eq!(
+            transport
+                .replay_expected
+                .into_expected()
+                .registered_artifacts,
+            f.expected.registered_artifacts
+        );
+        assert_eq!(bundle.original_started(), started);
+        assert_eq!(bundle.deadline(), started + Duration::from_millis(WALL));
+        assert_eq!(
+            bundle.execution_deadline(),
+            started + Duration::from_millis(WALL - CLEANUP)
+        );
+        let checked = check_replay_inputs_with_semantic_scope(
+            payload(&bundle, "replay-input.json").as_bytes(),
+            &f.expected,
+            SemanticReceiptProducerScope::LibraryDispatcherArgument,
+            started,
+        )
+        .unwrap();
+        assert_eq!(checked.audit().authorities, ReplayAuthorities::default());
+        assert_eq!(checked.audit().actual_utility_groups, 0);
+        assert!(
+            checked
+                .audit()
+                .registered_artifacts
+                .opponent_recheck_source
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn opponent_launch_output_shortage_refuses_before_any_publication() {
+        let mut f = opponent_fixture();
+        let required = super::replay_inputs::replay_mode_requirements(f.mode, 4, 1, 64).unwrap();
+        let output = replay_output_requirements(
+            required.actual_role_calls() as usize,
+            required.cpu_checks(),
+        )
+        .unwrap();
+        f.resources.output_bytes = output.required_output_bytes() - 1;
+        let root = TempRoot::new();
+        let error = prepare(
+            &f,
+            &root.path,
+            "shortage",
+            budget(),
+            Instant::now(),
+            &AtomicBool::new(false),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.stage, "native_output_reservation");
+        assert!(!root.path.join("shortage").exists());
     }
     fn prepare(
         f: &Fixture,
