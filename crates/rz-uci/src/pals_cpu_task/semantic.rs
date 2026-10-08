@@ -552,7 +552,7 @@ pub(super) fn describe(
     Ok(descriptor)
 }
 
-fn prepare_root(
+pub(super) fn prepare_root(
     request: &SemanticRequest,
     owners: &Arc<OwnerRegistry>,
     deadline: Instant,

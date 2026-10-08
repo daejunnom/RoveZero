@@ -2570,3 +2570,71 @@ private `StoreLimits` 계산과 실제 예약은 탐색 소유 경계에 둔다.
 원본 prepared action과 전체 SemanticReceipt 원문·독립 pin·등록·네 parent pin을
 비교하고 기존 Rules 생성기를 재사용하는 방향이며 아직 구현·실행 인수 전이다.
 기존 Query/2·CPU action/1의 원문과 2N·binary 의미를 자동 확장하지 않는다.
+
+이 공유 자원 계산의 HEAD `c7245e1a056f13ca5f490a8fb312f4db415eb2bf`에서
+[CPU CI 37781627761](https://github.com/daejunnom/RoveZero/actions/runs/37781627761)은
+Linux·Windows·모델 CPU·bindings 네 job 모두 성공했다. 원문 로그에서 각 OS의
+기존 Reply-only 13개·Repair endpoint 12개와 새 순수 계산/preflight 네 개의 통과를
+확인했다. 모델 suite 548개 중 Python 전략 경계 28개, Rust 전략 경계 11개/OS,
+native fixture 29개/OS와 output persistence 2개/OS도 확인했다. 원문 로그와
+정확한 HEAD·job 종료·byte 수·SHA는 저장소 밖에 보존한다. 이는 새 rz-uci 입력
+경계·실제 등록 자료 수집·strict Query/native recheck·whole cost·물리 종료·utility·
+GPU·학습 인수와 구분한다.
+
+### 원본 자료를 유지하는 Rust replay 입력 경계
+
+`rz-uci`의 `strategic_action::replay_inputs`는 별도
+`rz-pals-frozen-replay-inputs/1` 요청과
+`rz-pals-frozen-replay-consumer-registration/1` 등록을 받고
+`check_replay_inputs(bytes, independent_expected_pins, original_started)`로
+검사한다. 원본 prepared action·전체 SemanticReceipt·등록 UTF-8 bytes의 길이·SHA와
+네 parent pin, Query·catalogue·before·prior·semantic pin을 독립 caller 값과 비교한다.
+semantic capability identity·receipt context·branch meaning·before anchor·원문 SHA는
+각 도메인으로 유지한다. 과거 CPU binary와 새 replay binary·engine·wrapper·replay
+child·provider factory 소스 선언은 별도로 봉인한다. 등록 digest는 loaded image를
+실제 관측한 증거가 아니다.
+
+기존 action/CPU decoder·pin 검증과 Rules `prepare_root`·`describe`·수순 재생을
+재사용한다. 실제 root와 prefix target, claim 끝 상태의 전체 descriptor·이력·차례·
+합법 수 순서·restriction·승격 token을 원본 receipt와 대조한 뒤 private
+`CheckedReplayInputs`를 만든다. target-relative claim에는 prefix를 정확히 한 번
+붙인다. 이 첫 경계는 완전 startpos 이력의 known positions 최대 4096개를 지원하고
+FEN unknown history나 한도 초과를 거절한다. nullable 필드가 원문에서 빠져 serde가
+None을 채운 경우도 typed receipt와 raw JSON의 shape 대조로 거절한다.
+
+`reply_only_2n`과 `repair_endpoint_3n`은 별도 모드다. 정확한 2N/3N allowance와
+출력·역할·store 선언은 원래 remaining에 들어맞아야 한다. source-owned 순수 자원
+계산을 재사용하며 Reply-only의 보수적 Repair role/store 예약은 overreservation으로
+기록한다. 전체 deadline은 원래 시작+whole wall이며 owner work deadline은 같은
+시작에서 명시 cleanup reserve를 뺀 값이다. invalid output·pin·등록·control 오류에도
+유효한 원래 whole wall과 elapsed·진단 cap·상위/하위 원인을 보존한다. 생성자와 Rules
+준비 비용을 제외한 search elapsed를 전체 invocation 비용으로 쓰지 않는다.
+
+checked 객체는 원문·등록·자원·두 deadline의 읽기 전용 accessor와 기존 typed owner
+입력으로의 consuming conversion만 제공한다. CPU engine·모델·provider·owner를
+생성하거나 dispatch하지 않는다. Query/semantic capability·과거 source/launch 인수는
+caller 책임이며 Rust 재인수·native 인과·full Repair recheck·전체 비용·물리 종료·
+utility·target·training·제품 V 권한은 모두 false다. 기존 native engine/producer의
+closed source pair와 Python 등록 literal을 새 child의 증거로 자동 확장하지 않는다.
+
+후속 caller는 기존 strict parent와 선택 index에서 최초 semantic admission의 원본
+request·receipt·source·registration·before·launch·common query bytes와 독립 pins를
+보존하고 기존 factory로 재대조해야 한다. `rules_receipt()`의 deep-copy dict를
+재직렬화한 bytes는 원본 receipt의 대체물이 아니다. prepared action과 같은 선택
+capability를 대조한 뒤 원본 전체 receipt와 새 replay 등록을 전달한다. 과거 CPU/
+semantic 등록·binary와 새 wrapper build·binary·launch 관측을 각각 보존한다.
+
+독립 소스 검토에서 decoded prefix의 Vec retained capacity가 작은 L보다 커질 수
+있는데 실제 owner는 이를 거부한다는 연결 공백을 발견했다. 새 child는 prefix와
+claim에 L, root/target legal order와 restriction에 256의 retained capacity 상한을
+보장한다. ordered 길이를 checked 합산하고 fallible exact reservation 뒤 실제
+capacity를 확인하며 초과는 명시적으로 거부한다. L=2/P=1/no-claim의 두 모드에 대해
+반환 owner 인자·원래 원문·자원·no-engine audit을 검사하는 회귀를 추가한다.
+
+두 모드·claim 결합·raw self-repin·encoding/domain 혼동·binary/source 교환·Rules
+descriptor 변조·history/길이·3N remaining 부족·자원/cleanup·닫힌 wire·원래 만료
+clock·오류/권한·retained capacity 검사의 fixture 13개를 추가했다. 기존 두 조상 파일에는 module 선언과
+`prepare_root` visibility만 변경했고 parent engine·native producer·replay는 불변이다.
+formatter·소스 대조·독립 리뷰는 실제 새 HEAD CPU CI 실행 결과와 구분한다. 이 단계는
+아직 실행 인수 전이며 utility groups 0/masked·제품 V 미활성·이번 GPU 검증 보류와
+actual training/backward/optimizer 제외를 유지한다.
