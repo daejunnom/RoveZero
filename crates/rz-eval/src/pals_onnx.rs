@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 mod cuda_control;
 mod device_packing_admission;
+mod device_packing_graph;
 mod device_pages_plan;
 mod public_pages;
 mod warm;
@@ -45,6 +46,13 @@ pub use device_packing_admission::{
     DEVICE_PACKING_DOMAIN, DEVICE_PACKING_GRAPH_FILE, DEVICE_PACKING_MANIFEST_FILE,
     DEVICE_PACKING_MAX_GRAPH_BYTES, DEVICE_PACKING_MAX_MANIFEST_BYTES,
     DEVICE_PACKING_MAX_NODE_PAYLOAD_SUM, DEVICE_PACKING_SCHEMA,
+};
+pub use device_packing_graph::{
+    CheckedFixedPackingGraph, PackingGraphBodyError, PackingGraphBodyInspection,
+    PackingGraphBodyVerification, PackingGraphDataType, PackingGraphDimension,
+    PackingGraphInspectionBudget, PackingGraphName, PackingGraphNodeDescriptor, PackingGraphShape,
+    PackingGraphTensorDescriptor, PACKING_GRAPH_BODY_INSPECTOR_VERSION,
+    PACKING_GRAPH_MAX_INSPECTION_HOST_BYTES, PACKING_GRAPH_MAX_WIRE_FIELDS,
 };
 pub use device_pages_plan::{
     device_packing_maximum_node_payload_sum, CpuOwnedPublicBacking, DevicePageDomain,

@@ -2080,3 +2080,27 @@ unresolved로 보존하고, source·raw·요청·관점·게시 모순은 거부
 model CPU job의 366개 검사 중 한 역사 profile fixture가 현재 source pin을 이전
 observer pin과 혼동해 실패했다. 후속 수정은 이전 literal pair 검사를 별도로 보존하고
 현재 pair를 정확히 지정한다. 이 수정이나 새 whole 검사를 이전 CI 성공으로 소급하지 않는다.
+
+후속 [CI 37738287013](https://github.com/daejunnom/RoveZero/actions/runs/37738287013)의
+`9c1d57cd13b04b2e993c046c58863b5af102e9ef`는 Linux·Windows·CPU bindings가
+성공했고 공개 whole 11개도 실제 통과했다. 전체 model suite 425개 중 선택적 빈
+JSONL 파일을 기존 required-row parser로 읽은 세 경계가 error여서 run은 실패다.
+후속 수정은 trace·public source·raw event·raw output의 exact empty bytes만 빈
+관측으로 처리한다. required prepared/producer 파일과 nonempty JSONL의 완전 줄바꿈
+검사는 유지하며, empty가 완료·소비·target 권한을 만들지 않는다. 별도 nonempty
+malformed 회귀를 더해 source methods는 60개다. 후속 CI 성공은 아직 미인수다.
+
+### Rust의 고정 packing graphbody 검사
+
+`CheckedFixedPackingGraph`는 admitted immutable pair를 이동 소유하고 실제 ONNX
+body를 닫힌 recipe와 대조한다. 다섯 INT64 controls, 387 inputs·3 outputs·272
+value_info·275 ordered nodes의 dtype·shape·이름·edge·attribute와 finite gate 연결을
+검사한다. wire field/packed element·depth·fallible allocation의 유한 검사를 적용하고
+retained backing과 inspection scratch 예약을 나누며 관측 peak로 보고하지 않는다.
+
+두 독립 정적 검토와 file-specific rustfmt를 마쳤다. 12개 synthetic wire fixture는
+repinned foreign body·연결·finite gate·control·type·shape·unknown/stateful field·중복
+및 malformed/resource 경계를 다룬다. 실제 Python artifact interop은 별도 인수다.
+Rust는 의미가 같은 packed/unpacked/zero 생략 wire를 허용하므로 Python deterministic
+export의 byte equality와 구분한다. `native_verification=NotPerformed`는 유지하며
+session interface·provider·실제 finite 출력·Run/fence·resident bank를 인수하지 않는다.
