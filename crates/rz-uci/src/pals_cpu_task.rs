@@ -9,6 +9,7 @@
 pub mod candidate;
 pub mod continuation;
 pub mod semantic;
+pub mod strategic_action;
 
 use crate::engine::{OwnerRegistry, RulesUciPort};
 use crate::pals_native::pals_history_digest;

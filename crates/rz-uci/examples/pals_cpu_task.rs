@@ -1,6 +1,7 @@
 //! One bounded JSON V task, --candidate-only fresh single-candidate check, or
 //! --prepare-semantic Rules-only preparation, or --line-continuation factual
-//! whole-line/endpoint check. Modes are exclusive.
+//! whole-line/endpoint check, or --strategic-action caller-bound CPU dispatch.
+//! Modes are exclusive. The latter does not execute a native P/C action.
 //! Private V tasks alone can explicitly select --cpu-ordering=legal-see-v1.
 //! Native PALS/CPU_R and other private modes keep their historical selection.
 //! No child UCI engine/GPU/model/teacher is launched.
@@ -10,6 +11,7 @@ use rz_uci::pals_cpu_task::candidate::{
 };
 use rz_uci::pals_cpu_task::continuation::{self, ContinuationError, ContinuationReceipt};
 use rz_uci::pals_cpu_task::semantic::{self, SemanticError, SemanticReceipt};
+use rz_uci::pals_cpu_task::strategic_action::{self, StrategicError, StrategicReceipt};
 use rz_uci::pals_cpu_task::{
     CpuTaskError, MAX_REQUEST_BYTES, MAX_SELF_BINARY_BYTES, MAX_WALL_TIME_MS, capabilities,
     capabilities_with_ordering, dispatch_started, dispatch_started_with_ordering,
@@ -135,6 +137,7 @@ enum CliMode {
     Candidate,
     Semantic,
     Continuation,
+    StrategicAction,
 }
 
 struct CliContext {
@@ -149,6 +152,7 @@ struct CliContext {
     // transport error is diagnostic, never successful delivery or CPU work.
     semantic_receipt: Option<Box<SemanticReceipt>>,
     continuation_receipt: Option<Box<ContinuationReceipt>>,
+    strategic_receipt: Option<Box<StrategicReceipt>>,
 }
 
 enum CliError {
@@ -156,6 +160,7 @@ enum CliError {
     Candidate(CandidateTaskError),
     Semantic(SemanticError),
     Continuation(ContinuationError),
+    StrategicAction(StrategicError),
 }
 
 impl CliContext {
@@ -179,6 +184,11 @@ impl CliContext {
                     error = error.with_receipt(receipt);
                 }
                 CliError::Continuation(error)
+            }
+            CliMode::StrategicAction => {
+                let mut error = StrategicError::new(error.stage, error.message);
+                error.receipt = self.strategic_receipt.clone();
+                CliError::StrategicAction(error)
             }
             CliMode::Verifier => CliError::V(error),
         }
@@ -209,9 +219,13 @@ fn arguments(args: &[String]) -> Result<(CliMode, bool), CpuTaskError> {
         [a, b] if a == "--line-continuation" && b == "--capabilities" => {
             Ok((CliMode::Continuation, true))
         }
+        [a] if a == "--strategic-action" => Ok((CliMode::StrategicAction, false)),
+        [a, b] if a == "--strategic-action" && b == "--capabilities" => {
+            Ok((CliMode::StrategicAction, true))
+        }
         _ => Err(failure(
             "arguments",
-            "supported modes: no arguments, --capabilities, --candidate-only [--capabilities], --prepare-semantic [--capabilities], --line-continuation [--capabilities]; modes are exclusive and ordered",
+            "supported modes: no arguments, --capabilities, --candidate-only [--capabilities], --prepare-semantic [--capabilities], --line-continuation [--capabilities], --strategic-action [--capabilities]; modes are exclusive and ordered",
         )),
     }
 }
@@ -253,6 +267,7 @@ fn run(context: &mut CliContext) -> Result<Vec<u8>, CliError> {
         Some("--candidate-only") => CliMode::Candidate,
         Some("--prepare-semantic") => CliMode::Semantic,
         Some("--line-continuation") => CliMode::Continuation,
+        Some("--strategic-action") => CliMode::StrategicAction,
         _ => CliMode::Verifier,
     };
     let (mode, show_capabilities, ordering) =
@@ -278,8 +293,14 @@ fn run(context: &mut CliContext) -> Result<Vec<u8>, CliError> {
             CliMode::Continuation => {
                 continuation::capabilities().map_err(CliError::Continuation)?
             }
+            CliMode::StrategicAction => {
+                strategic_action::capabilities().map_err(CliError::StrategicAction)?
+            }
         };
-        if matches!(mode, CliMode::Semantic | CliMode::Continuation) {
+        if matches!(
+            mode,
+            CliMode::Semantic | CliMode::Continuation | CliMode::StrategicAction
+        ) {
             context.output_limit = 8192;
         }
         let mut value: serde_json::Value = serde_json::from_slice(&capabilities)
@@ -295,8 +316,10 @@ fn run(context: &mut CliContext) -> Result<Vec<u8>, CliError> {
         let mut result = serde_json::to_vec(&value)
             .map_err(|e| context.transport_error(failure("capabilities", e)))?;
         result.push(b'\n');
-        if matches!(mode, CliMode::Semantic | CliMode::Continuation)
-            && result.len() > context.output_limit
+        if matches!(
+            mode,
+            CliMode::Semantic | CliMode::Continuation | CliMode::StrategicAction
+        ) && result.len() > context.output_limit
         {
             return Err(context.transport_error(failure(
                 "capabilities",
@@ -328,6 +351,16 @@ fn run(context: &mut CliContext) -> Result<Vec<u8>, CliError> {
             let admission = admit_continuation(&bytes, context)?;
             (admission.deadline, admission.output_limit)
         }
+        CliMode::StrategicAction => {
+            let admission =
+                strategic_action::request_admission(&bytes, started).map_err(|error| {
+                    if error.deadline_exceeded {
+                        context.deadline = context.deadline.min(context.started);
+                    }
+                    CliError::StrategicAction(error)
+                })?;
+            (admission.deadline, admission.output_limit)
+        }
     };
     context.deadline = deadline;
     context.output_limit = output_limit;
@@ -344,6 +377,9 @@ fn run(context: &mut CliContext) -> Result<Vec<u8>, CliError> {
     }
     if mode == CliMode::Continuation {
         return check_continuation(&bytes, &binary, context);
+    }
+    if mode == CliMode::StrategicAction {
+        return dispatch_strategic(&bytes, &binary, context);
     }
     let bytes =
         candidate::dispatch_started(&bytes, &binary, started).map_err(CliError::Candidate)?;
@@ -533,6 +569,72 @@ fn check_continuation(
     Ok(output)
 }
 
+fn dispatch_strategic(
+    bytes: &[u8],
+    verified_binary: &str,
+    context: &mut CliContext,
+) -> Result<Vec<u8>, CliError> {
+    let output = match strategic_action::dispatch_started(bytes, verified_binary, context.started) {
+        Ok(output) => output,
+        Err(mut error) => {
+            if let Some(receipt) = &mut error.receipt {
+                receipt.binary_pin_scope = cli_binary_scope().into();
+                context.strategic_receipt = Some(receipt.clone());
+            }
+            return Err(CliError::StrategicAction(error));
+        }
+    };
+    let mut receipt: StrategicReceipt = serde_json::from_slice(&output)
+        .map_err(|error| context.transport_error(failure("strategic_receipt", error)))?;
+    receipt.binary_pin_scope = cli_binary_scope().into();
+    receipt.elapsed_ms = context
+        .started
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    context.strategic_receipt = Some(Box::new(receipt.clone()));
+    if receipt.schema != strategic_action::SCHEMA
+        || receipt.scope != "caller_registered_query_to_actual_own_cpu_dispatch"
+        || receipt.deadline_exceeded
+        || receipt.query_revalidated_by_rust
+        || receipt.native_action_causal_bridge_observed
+        || receipt.conditional_witness_validated
+        || receipt.whole_action_cost_observed
+        || receipt.final_search_closure_observed
+        || receipt.action_completion_admitted
+        || receipt.utility_authority
+        || receipt.target_authority
+        || receipt.training_authority
+        || receipt.product_verifier_enabled
+        || receipt.actual_training_executed
+        || receipt.backward_executed
+        || receipt.optimizer_created
+        || receipt.gpu_used
+        || receipt.external_teacher_used
+    {
+        return Err(context.transport_error(failure(
+            "strategic_receipt",
+            "actual CPU dispatch scope differs or grants unsupported action authority",
+        )));
+    }
+    let mut output = serde_json::to_vec(&receipt)
+        .map_err(|error| context.transport_error(failure("strategic_receipt", error)))?;
+    output.push(b'\n');
+    if output.len() > context.output_limit {
+        return Err(context.transport_error(failure(
+            "output_bound",
+            "CLI strategic receipt exceeds original admitted output bound",
+        )));
+    }
+    if Instant::now() >= context.deadline {
+        return Err(context.transport_error(failure(
+            "receipt_deadline",
+            "original absolute wall allowance expired after CPU dispatch",
+        )));
+    }
+    Ok(output)
+}
+
 fn bounded_write<W: Write + Send + 'static>(
     mut writer: W,
     bytes: Vec<u8>,
@@ -611,6 +713,7 @@ fn main() -> ExitCode {
         candidate_report: None,
         semantic_receipt: None,
         continuation_receipt: None,
+        strategic_receipt: None,
     };
     match run(&mut context) {
         Ok(bytes) => {
@@ -746,6 +849,41 @@ fn write_error(error: CliError, context: &CliContext) -> ExitCode {
             }
             bytes
         }
+        CliError::StrategicAction(mut error) => {
+            error.elapsed_ms = Some(
+                context
+                    .started
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
+            error.deadline_exceeded |= Instant::now() >= context.deadline;
+            error.output_limit = context.output_limit;
+            if error.receipt.is_none() {
+                error.receipt = context.strategic_receipt.clone();
+            }
+            let mut bytes = serde_json::to_vec(&error).unwrap_or_else(|_| {
+                b"{\"code\":\"strategic_action_error_serialization_failed\"}".to_vec()
+            });
+            if bytes.len() + 1 > error.output_limit {
+                bytes = serde_json::to_vec(&json!({
+                    "code": error.code, "stage": error.stage,
+                    "elapsed_ms": error.elapsed_ms, "deadline_exceeded": error.deadline_exceeded,
+                    "cpu_error_present": error.cpu_error.is_some(),
+                    "known_nodes": error.cpu_error.as_ref().and_then(|e| e.known_nodes)
+                        .or_else(|| error.receipt.as_ref().and_then(|r| r.actual_cpu_nodes)),
+                    "failed_check_work": error.cpu_error.as_ref().and_then(|e| e.failed_check_work.as_ref()),
+                    "baseline_present": error.cpu_error.as_ref().is_some_and(|e| e.baseline.is_some())
+                        || error.receipt.as_ref().is_some_and(|r| r.baseline_present),
+                    "after_present": error.cpu_error.as_ref().is_some_and(|e| e.after.is_some())
+                        || error.receipt.as_ref().is_some_and(|r| r.after_present),
+                    "receipt_present": error.receipt.is_some(),
+                    "cpu_response_present": error.receipt.as_ref().is_some_and(|r| r.cpu_response_raw.is_some()),
+                    "full_error_omitted_for_output_bound": true
+                })).unwrap_or_else(|_| b"{\"code\":\"strategic_action_failed\"}".to_vec());
+            }
+            bytes
+        }
     };
     bytes.push(b'\n');
     // No extra output grace after the original absolute wall allowance.
@@ -771,6 +909,42 @@ mod tests {
     }
 
     #[test]
+    fn strategic_action_mode_requires_explicit_selection_without_see_or_other_modes() {
+        assert_eq!(arguments(&[]).unwrap(), (CliMode::Verifier, false));
+        assert_eq!(
+            arguments_with_ordering(&["--strategic-action".into()]).unwrap(),
+            (
+                CliMode::StrategicAction,
+                false,
+                CpuOrderingPolicy::LegacyMvvLvaV1
+            )
+        );
+        assert_eq!(
+            arguments(&["--strategic-action".into(), "--capabilities".into()]).unwrap(),
+            (CliMode::StrategicAction, true)
+        );
+        for args in [
+            vec!["--capabilities", "--strategic-action"],
+            vec!["--strategic-action", "--candidate-only"],
+            vec!["--strategic-action", "--prepare-semantic"],
+            vec!["--strategic-action", "--line-continuation"],
+            vec!["--strategic-action", "--cpu-ordering=legal-see-v1"],
+            vec!["--cpu-ordering=legal-see-v1", "--strategic-action"],
+        ] {
+            assert!(
+                arguments_with_ordering(&args.into_iter().map(str::to_owned).collect::<Vec<_>>())
+                    .is_err()
+            );
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&strategic_action::capabilities().unwrap()).unwrap();
+        assert_eq!(value["schema"], strategic_action::SCHEMA);
+        assert_eq!(value["query_revalidated_by_rust"], false);
+        assert_eq!(value["native_action_causal_bridge_observed"], false);
+        assert_eq!(value["utility_authority"], false);
+    }
+
+    #[test]
     fn unread_output_cannot_block_beyond_the_absolute_deadline() {
         let (send, receive) = mpsc::sync_channel(1);
         let deadline = Instant::now() + Duration::from_millis(20);
@@ -790,6 +964,7 @@ mod tests {
             candidate_report: None,
             semantic_receipt: None,
             continuation_receipt: None,
+            strategic_receipt: None,
         };
         let error = annotate(failure("self_binary", "deadline expired"), &context);
         assert!(error.deadline_exceeded);
@@ -955,6 +1130,7 @@ mod tests {
             candidate_report: None,
             semantic_receipt: None,
             continuation_receipt: None,
+            strategic_receipt: None,
         };
         let output = match prepare_semantic(&bytes, &binary, &mut context) {
             Ok(output) => output,
@@ -1005,6 +1181,7 @@ mod tests {
             candidate_report: None,
             semantic_receipt: None,
             continuation_receipt: None,
+            strategic_receipt: None,
         };
         assert!(prepare_semantic(&bytes, &binary, &mut context).is_ok());
         // The direct writer expiry fixture checks typed final-delivery routing.
@@ -1034,6 +1211,7 @@ mod tests {
             candidate_report: None,
             semantic_receipt: None,
             continuation_receipt: None,
+            strategic_receipt: None,
         };
         let error = match admit_semantic(&bytes, &mut context) {
             Err(CliError::Semantic(error)) => error,
@@ -1181,6 +1359,7 @@ mod tests {
             candidate_report: None,
             semantic_receipt: None,
             continuation_receipt: None,
+            strategic_receipt: None,
         };
         let output = match check_continuation(&bytes, &binary, &mut context) {
             Ok(output) => output,
@@ -1219,6 +1398,7 @@ mod tests {
             candidate_report: None,
             semantic_receipt: None,
             continuation_receipt: None,
+            strategic_receipt: None,
         };
         let error = match admit_continuation(&serde_json::to_vec(&request).unwrap(), &mut context) {
             Err(CliError::Continuation(error)) => error,
