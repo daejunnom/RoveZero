@@ -1559,3 +1559,37 @@ handler 직접 호출을 외부 OS signal 전달 성공으로 보고하지 않�
 WSL app alias의 binary 읽기 단계에서 35ms에 실패했고 engines/NN은 시작하지 않았다.
 이 실패를 보존하고 system WSL 실행 파일을 명시한 별도 CLI 관측을 준비한다. 실제 paired
 대국 인수는 아직 없으며 GPU·학습·새 cloud 실행은 없다.
+
+### CPU03 실제 대국과 Core 탐색 실패 보존
+
+중앙 root86은 system WSL 실행 파일을 사용해 실제 CPU03 한 쌍을 실행했다.
+Windows CLI exit 0과 전체 75.919초, 바깥 transport 68.428초, nonce service의
+정상 제어 호출 종료·기존 cgroup 부재를 관측했다. 원시 자료 48파일 387,832,084B를
+Windows 관리 루트로 회수해 크기·SHA256를 전부 대조했으며 Linux 원본도 보존했다.
+
+두 게임은 58/33 ply 체크메이트로 끝났고 PALS는 흑백 모두 졌다. 120초+1초 시계의
+91개 실제 차감 기록과 흑백 교환, Rules 종료·PGN, native/helper 정상 종료는 일치했다.
+그러나 PALS go 45건 중 실패 6건이 있어 전체 기능 인수는 실패다. 외부 checker가
+task당 4096을 넘는 4844/6443 노드를 보고한 두 건과, 종료된 checker의 후속 호출
+거절 네 건을 원시 work에 보존했다. 마지막 합법 착수로 게임이 계속된 사실은 실패를
+없애지 않는다. GPU·학습·기력 향상·전체 메모리 peak는 이 실행의 인수 범위가 아니다.
+
+기존 Core 조립기는 실제 `failed_returns`를 읽고도 `pair_eligible=true`를 생성했다.
+원래 Core와 PGN을 재작성하지 않고, 새 코드에서 endpoint의
+`search_failed_go_count: Option<u64>`와 typed `SearchFailure`를 연결했다.
+과거 V3의 필드 부재는 역직렬화·재직렬화 시 unknown으로 유지한다. 새 OwnCPU/PALS
+양성 인수에는 관측된 0이 필요하며, 양수이면 실패 목록과 부적격 상태를 모두 요구한다.
+Reference UCI에 RoveZero 내부 계수를 만들지 않는다. V1/V2·공통 revision·모델·탐색·
+요청 노드 예산과 PGN의 실제 결과·종료 이유는 변경하지 않는다.
+
+root87의 format 검사 실패를 보존하고 formatter 적용 뒤 root88에서 format,
+`rz-experiments` library 81개·`rz-arena`의 `pals-collection-onnx` library 110개를
+통과했다. 실제 affinity 0/2·high 6GiB/max 12GiB·swap 0·pids 128을 확인했고,
+managed 임시 tree 정리도 완료했다. arena 검사 69.95초와 설치 없는 service 104.014초는
+정확성 실행 시간이며 성능 비교가 아니다. 종료 후 표시된 작은 service peak는 전체
+메모리 peak의 근거로 쓰지 않는다. 새 자체 Rust checker pilot은 별도 명세·등록 바이너리로
+진행하며 CPU03의 외부 checker 실패를 재시도나 성공으로 바꾸지 않는다.
+
+`c7c1d90`의 [CI 37708314220](https://github.com/daejunnom/RoveZero/actions/runs/37708314220)는
+네 CPU job 모두 실제 성공했다(Windows 최종 2026-10-08 00:39:30 UTC).
+이 결과에 후속 Core 수정의 CI·실제 대국 인수를 포함시키지 않는다.

@@ -4077,6 +4077,7 @@ fn endpoint_work_receipt(
         endpoint_id: engine.id().into(),
         external_cpu_r: None,
         uci_ready_observed: true,
+        search_failed_go_count: None,
         options,
         actual_affinity: PalsObservedV3::Unknown,
         memory_peak_bytes: PalsObservedV3::Unknown,
@@ -4107,6 +4108,7 @@ fn endpoint_work_receipt(
                 .ok_or_else(|| invalid("own CPU work unobserved"))?
                 .search_work;
             validate_pals_process_work(w, "cpu", false)?;
+            receipt.search_failed_go_count = Some(work_count(w, "failed_returns")?);
             let cpu = &w["cpu"];
             receipt.cpu_tasks_requested = work_count(cpu, "tasks_requested")?;
             receipt.cpu_tasks_completed = work_count(cpu, "requested_depth_completed")?
@@ -4125,6 +4127,7 @@ fn endpoint_work_receipt(
                 .search_work;
             let external = !p.cpu_r.is_own();
             validate_pals_process_work_inner(w, "pals", false, external)?;
+            receipt.search_failed_go_count = Some(work_count(w, "failed_returns")?);
             let t = &w["pals"];
             receipt.proposer_tasks_completed = work_count(t, "completed_proposer_calls")?
                 .checked_add(work_count(t, "completed_repair_calls")?)
@@ -4240,6 +4243,19 @@ fn endpoint_work_receipt(
         }
     }
     Ok(receipt)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn record_endpoint_search_failure(
+    endpoint: &PalsEndpointReceiptV3,
+    failures: &mut BTreeSet<PalsRunFailureV3>,
+) {
+    if endpoint
+        .search_failed_go_count
+        .is_some_and(|failed| failed > 0)
+    {
+        failures.insert(PalsRunFailureV3::SearchFailure);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -4607,7 +4623,9 @@ pub fn assemble_pals_core_receipt(
                     .iter()
                     .find(|p| p.engine_id == id)
                     .ok_or_else(|| invalid("pinned UCI preflight absent"))?;
-                engines.push(endpoint_work_receipt(lock, role, work, nn, preflight)?);
+                let endpoint = endpoint_work_receipt(lock, role, work, nn, preflight)?;
+                record_endpoint_search_failure(&endpoint, &mut failures);
+                engines.push(endpoint);
             }
             let (result, termination, failed_endpoint) = core_game_outcome(game)?;
             if result == PalsResultV3::Incomplete {
@@ -7771,6 +7789,57 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn pals_core_search_failed_go_count_preserves_failure_and_rejects_unknown_work() {
+        let lock = fixture().lock().unwrap();
+        for (role, kind, id) in [
+            (NativeEngineRole::Baseline, "pals", "pals"),
+            (NativeEngineRole::Candidate, "cpu", "cpu"),
+        ] {
+            let mut audit = PalsProcessWorkAuditV3 {
+                endpoint_id: id.into(),
+                process_id: 1,
+                startup_sha256: "a".repeat(64),
+                termination_sha256: "b".repeat(64),
+                startup_bytes: 100,
+                termination_bytes: 200,
+                search_work: work_fixture(kind),
+            };
+            let preflight = preflight_fixture(id);
+            let zero = endpoint_work_receipt(&lock, role, Some(&audit), None, &preflight).unwrap();
+            assert_eq!(zero.search_failed_go_count, Some(0));
+            let mut failures = BTreeSet::new();
+            record_endpoint_search_failure(&zero, &mut failures);
+            assert!(failures.is_empty());
+
+            audit.search_work["go_invocations"] = 6.into();
+            audit.search_work["failed_returns"] = 6.into();
+            let failed =
+                endpoint_work_receipt(&lock, role, Some(&audit), None, &preflight).unwrap();
+            assert_eq!(failed.search_failed_go_count, Some(6));
+            assert_eq!(failed.cpu_tasks_completed, zero.cpu_tasks_completed);
+            assert_eq!(failed.cpu_nodes, zero.cpu_nodes);
+            record_endpoint_search_failure(&failed, &mut failures);
+            assert_eq!(failures, BTreeSet::from([PalsRunFailureV3::SearchFailure]));
+            assert!(!failures.is_empty()); // The assembler derives pair eligibility here.
+
+            for invalid in [serde_json::Value::Null, true.into(), "6".into()] {
+                let mut unknown = audit.clone();
+                unknown.search_work["failed_returns"] = invalid;
+                assert!(
+                    endpoint_work_receipt(&lock, role, Some(&unknown), None, &preflight).is_err()
+                );
+            }
+            audit
+                .search_work
+                .as_object_mut()
+                .unwrap()
+                .remove("failed_returns");
+            assert!(endpoint_work_receipt(&lock, role, Some(&audit), None, &preflight).is_err());
+            assert!(endpoint_work_receipt(&lock, role, None, None, &preflight).is_err());
+        }
+    }
+
     #[test]
     fn pals_core_nn_completion_includes_public_graph_without_counting_cache_reuse() {
         let lock = native_fixture().lock().unwrap();

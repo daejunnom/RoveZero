@@ -73,7 +73,8 @@ choices!(PalsRunFailureV3 {
     ResourceAdmission,
     Infrastructure,
     EngineLaunch,
-    IncompleteGame
+    IncompleteGame,
+    SearchFailure
 });
 
 /// Initial parameters and trained parameters cannot share a fictitious weights ID.
@@ -1187,6 +1188,11 @@ pub struct PalsEndpointReceiptV3 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_cpu_r: Option<PalsExternalCpuRReceiptV3>,
     pub uci_ready_observed: bool,
+    /// Independently retained per-process search-work failed go returns.
+    /// Historical absence is unknown, never an observed zero; foreign UCI
+    /// endpoints have no RoveZero search-work projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_failed_go_count: Option<u64>,
     pub options: BTreeMap<String, PalsOptionReceiptV3>,
     pub actual_affinity: PalsObservedV3<Vec<u32>>,
     pub memory_peak_bytes: PalsObservedV3<u64>,
@@ -1305,6 +1311,24 @@ fn receipt_endpoint(
         o.endpoint_id == e.id() && o.options.keys().eq(e.requested_options().keys()),
         "receipt endpoint/options differ from launch",
     )?;
+    if o.search_failed_go_count.is_some_and(|failed| failed > 0) {
+        require(
+            !eligible && failures.contains(&PalsRunFailureV3::SearchFailure),
+            "observed search failed go requires an ineligible run and preserved search failure",
+        )?;
+    }
+    if eligible && !matches!(e, PalsEngineV3::ReferenceUci(_)) {
+        require(
+            o.search_failed_go_count == Some(0),
+            "eligible RoveZero endpoint lacks observed zero search failed go count",
+        )?;
+    }
+    if matches!(e, PalsEngineV3::ReferenceUci(_)) {
+        require(
+            o.search_failed_go_count.is_none(),
+            "reference UCI endpoint cannot inherit RoveZero search failed go count",
+        )?;
+    }
     for (name, option) in &o.options {
         require(
             e.requested_options().get(name) == Some(&option.requested),
@@ -1725,6 +1749,11 @@ mod tests {
             endpoint_id: e.id().into(),
             external_cpu_r: None,
             uci_ready_observed: true,
+            search_failed_go_count: if matches!(e, PalsEngineV3::ReferenceUci(_)) {
+                None
+            } else {
+                Some(0)
+            },
             options: e
                 .requested_options()
                 .iter()
@@ -2045,6 +2074,67 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn historical_search_failure_count_stays_unknown_and_rejects_positive_admission() {
+        let engine = pals("pals");
+        let mut legacy = serde_json::to_value(endpoint_receipt(&engine)).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("search_failed_go_count");
+        let decoded: PalsEndpointReceiptV3 = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(decoded.search_failed_go_count, None);
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
+        receipt_endpoint(&decoded, &engine, &resource(), false, &BTreeSet::new()).unwrap();
+        assert!(receipt_endpoint(&decoded, &engine, &resource(), true, &BTreeSet::new()).is_err());
+
+        let mut null = legacy.clone();
+        null["search_failed_go_count"] = serde_json::Value::Null;
+        let decoded: PalsEndpointReceiptV3 = serde_json::from_value(null).unwrap();
+        assert_eq!(decoded.search_failed_go_count, None);
+        for invalid in [true.into(), (-1).into(), "0".into()] {
+            let mut bad = legacy.clone();
+            bad["search_failed_go_count"] = invalid;
+            assert!(serde_json::from_value::<PalsEndpointReceiptV3>(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn observed_failed_go_cannot_become_an_eligible_completed_pair() {
+        let lock = manifest().lock().unwrap();
+        let mut run = receipt(&lock);
+        run.validate_against(&lock).unwrap();
+        let original_games = run.games.clone();
+        run.games[0].engines[0].search_failed_go_count = Some(6);
+        assert!(run.validate_against(&lock).is_err());
+        run.pair_eligible = false;
+        run.failures.insert(PalsRunFailureV3::Infrastructure);
+        assert!(run.validate_against(&lock).is_err());
+        run.failures.insert(PalsRunFailureV3::SearchFailure);
+        run.validate_against(&lock).unwrap();
+        assert_eq!(run.games[0].pgn, original_games[0].pgn);
+        assert_eq!(run.games[0].result, original_games[0].result);
+        assert_eq!(run.games[0].termination, original_games[0].termination);
+        assert_eq!(run.games[0].engines[0].search_failed_go_count, Some(6));
+        let wire = serde_json::to_string(&run).unwrap();
+        assert_eq!(PalsRunReceiptV3::from_json(&wire, &lock).unwrap(), run);
+        assert!(wire.contains("search_failure"));
+        run.pair_eligible = true;
+        assert!(run.validate_against(&lock).is_err());
+    }
+
+    #[test]
+    fn unknown_rove_search_count_is_not_a_zero_observation() {
+        let lock = manifest().lock().unwrap();
+        let mut run = receipt(&lock);
+        run.games[1].engines[1].search_failed_go_count = None;
+        assert!(run.validate_against(&lock).is_err());
+        run.pair_eligible = false;
+        run.failures.insert(PalsRunFailureV3::Infrastructure);
+        run.validate_against(&lock).unwrap();
+        assert_eq!(run.games[1].engines[1].search_failed_go_count, None);
     }
 
     fn external_cpu_r_fixture() -> PalsExternalCpuRV3 {
