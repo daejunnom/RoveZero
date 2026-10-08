@@ -161,16 +161,9 @@ class FeedbackBudget:
 
     def reserve(self, game, *, nodes, flops, output_bytes, semantic_bytes):
         self.check()
-        if game not in self.games and len(self.games) >= self.limits["max_games"]:
-            return None
         additions = {"steps": 1, "nodes": nodes, "forward_flops": flops, "output_bytes": output_bytes, "semantic_bytes": semantic_bytes}
-        for name, value in additions.items():
-            _int(value, 0, (1 << 63) - 1)
-            if self.used[name] + value > self.limits["max_" + name]:
-                return None
-        for name, value in additions.items():
-            self.used[name] += value
-        self.games.add(game)
+        if not _reserve_usage(self.limits, self.used, self.games, game, additions):
+            return None
         return _Credit(self, output_bytes)
 
     def can_dispatch(self, wall_ms, calls=1):
@@ -192,6 +185,44 @@ class _Credit:
     def release(self):
         self.budget.used["output_bytes"] -= self.remaining
         self.remaining = 0
+
+
+def _reserve_usage(limits, used, games, game, additions):
+    """Pure quota transaction shared by live execution and historical replay."""
+    _fields(additions, ("steps", "nodes", "forward_flops", "output_bytes", "semantic_bytes"))
+    if game not in games and len(games) >= limits["max_games"]:
+        return False
+    for name, value in additions.items():
+        _int(value, 0, (1 << 63) - 1)
+        if used[name] + value > limits["max_" + name]:
+            return False
+    for name, value in additions.items():
+        used[name] += value
+    games.add(game)
+    return True
+
+
+def _round_cost(stage, limits, config, encoding, snapshot):
+    return {"steps": 1, "nodes": 2 * stage["max_nodes_per_check"],
+        "forward_flops": forward_flops_upper(config, len(encoding.public_records), len(snapshot["legal_moves"])),
+        "output_bytes": 6 * limits["max_child_output_bytes"] + (2 << 20),
+        "semantic_bytes": semantic.reservation_bytes(1, 66 + max(1, len(encoding.public_records)), limits["max_semantic_bytes"])}
+
+
+def _stage_capabilities(plan, capabilities):
+    """The same registered pre-dispatch gate applies at execution AND reload."""
+    for stage in plan["stages"]:
+        for key, capability in (("requested_depth", "max_depth"), ("max_nodes_per_check", "max_nodes_per_check"), ("max_wall_time_ms", "max_wall_time_ms")):
+            maximum = {"max_depth": 64, "max_nodes_per_check": (1 << 32) - 1, "max_wall_time_ms": 300000}[capability]
+            if stage[key] > _int(capabilities[capability], 1, maximum):
+                raise ValueError("fixed feedback schedule exceeds independently registered actual capability")
+    if plan["limits"]["max_child_output_bytes"] > _int(capabilities["max_response_bytes"], 1, 1 << 20):
+        raise ValueError("feedback child output admission exceeds actual capability")
+
+
+def _episode_action(task, number, round_count):
+    if task == "defer" and number != round_count - 1:
+        raise ValueError("explicit defer terminates its feedback episode; later round forbidden")
 
 
 def forward_flops_upper(config, records, candidates):
@@ -557,6 +588,7 @@ def _cpu_observation(request_raw, receipt_raw, process_raw, legal_order):
 
 
 def _assets(paths, expected, stage, deadline, remaining_input):
+    semantic._deadline(deadline)  # Exact int/float, finite, not bool; before any I/O.
     names = ("registration", "source", "capabilities", "semantic_registration", "semantic_source")
     _fields(paths, (*names, "binary"))
     _fields(expected, (*names, "binary"))
@@ -565,13 +597,13 @@ def _assets(paths, expected, stage, deadline, remaining_input):
         raise ValueError("aggregate registered input allowance denied BEFORE reads/allocation")
     values, actual_paths = {}, {}
     for name in (*names, "binary"):
+        semantic._deadline(deadline)
         maximum = MAX_BYTES if name == "binary" else 4 << 20
         _fields(expected[name], ("bytes", "sha256"))
         _int(expected[name]["bytes"], 1, maximum)
         actual_paths[name], values[name] = legacy._file(paths[name], expected[name]["sha256"], expected[name]["bytes"])
         _actual(values[name], expected[name], maximum)
-        if time.monotonic() >= deadline:
-            raise TimeoutError("registration reads spent the original caller budget")
+        semantic._deadline(deadline)
     profile = legacy.cpu_profile(stage["tt_entries"], stage["requested_depth"], stage["quiescence_ply"])
     registration, capabilities = utility._registered(values["registration"], values["source"], values["binary"], values["capabilities"],
         {name: expected[name] for name in ("registration", "source", "binary", "capabilities")},
@@ -586,6 +618,7 @@ def _assets(paths, expected, stage, deadline, remaining_input):
             or semantic_registration["assurance_scope"] != "independently_registered_caller_source"
             or semantic_registration["accepted_binary_pin_scope"] != "linux_loaded_executable_inode"):
         raise ValueError("same independently registered Linux CPU and Rules worker required")
+    semantic._deadline(deadline)
     return values, actual_paths, registration, capabilities
 
 
@@ -653,12 +686,7 @@ unknown. Partial/canceled/terminal observations never become positive targets.
         raise ValueError("aggregate caller input bytes exceed fixed feedback allowance")
     remaining_input = plan["limits"]["max_input_bytes"] - len(plan_bytes) - len(parameter_observation_bytes)
     assets, paths, registration, capabilities = _assets(registered_paths, expected_registered_pins, plan["stages"][0], budget.work_deadline, remaining_input)
-    for stage in plan["stages"]:
-        for key, capability in (("requested_depth", "max_depth"), ("max_nodes_per_check", "max_nodes_per_check"), ("max_wall_time_ms", "max_wall_time_ms")):
-            if stage[key] > capabilities[capability]:
-                raise ValueError("fixed feedback schedule exceeds independently registered actual capability")
-    if plan["limits"]["max_child_output_bytes"] > capabilities["max_response_bytes"]:
-        raise ValueError("feedback child output admission exceeds actual capability")
+    _stage_capabilities(plan, capabilities)
     # Parent loaders/checkpoint loads are already caller-owned. Read allocations
     # here are independently bounded by the supplied small asset pins plus one
     # <=64MiB binary. Their combined byte count is declared explicitly.
@@ -698,10 +726,9 @@ unknown. Partial/canceled/terminal observations never become positive targets.
                     break
                 snapshot = parents.records[index]["input"]["snapshot"]
                 encoded = parents.encodings[identity]
-                semantic_size = semantic.reservation_bytes(1, 66 + max(1, len(encoded.public_records)), plan["limits"]["max_semantic_bytes"])
-                flops = forward_flops_upper(model.config, len(encoded.public_records), len(snapshot["legal_moves"]))
-                credit = budget.reserve(snapshot["game_id"], nodes=2 * stage["max_nodes_per_check"], flops=flops,
-                    output_bytes=6 * plan["limits"]["max_child_output_bytes"] + (2 << 20), semantic_bytes=semantic_size)
+                cost = _round_cost(stage, plan["limits"], model.config, encoded, snapshot)
+                credit = budget.reserve(snapshot["game_id"], nodes=cost["nodes"], flops=cost["forward_flops"],
+                    output_bytes=cost["output_bytes"], semantic_bytes=cost["semantic_bytes"])
                 if credit is None:
                     episode["stop"] = stop = "pre_dispatch_resource_limit_unresolved"
                     break
@@ -863,6 +890,7 @@ def _replay(parents, raws, receipt_pin, registered_pins, parameter_pin, source_s
     for name, pin in report["artifacts"].items():
         _actual(raws[name], pin, MAX_BYTES, empty=True)
     plan = _plan(raws["plan.json"], parents, report["plan"])
+    _stage_capabilities(plan, legacy._parse(raws["capabilities.json"]))
     _fields(report["resources"], ("limits", "used"))
     if report["resources"]["limits"] != plan["limits"]:
         raise ValueError("feedback fixed resource policy mismatch")
@@ -885,6 +913,12 @@ def _replay(parents, raws, receipt_pin, registered_pins, parameter_pin, source_s
     semantic_bytes = 0
     flops = 0
     games = set()
+    setup_names = ("plan.json", "parameter-observation.json", "registration.json", "source.json", "capabilities.json", "semantic_registration.json", "semantic_source.json")
+    reserved_usage = {"steps": 0, "nodes": 0, "forward_flops": 0, "semantic_bytes": 0,
+        "output_bytes": FINAL_BYTES + INDEX_BYTES + sum(len(raws[name]) for name in setup_names)}
+    if reserved_usage["output_bytes"] > plan["limits"]["max_output_bytes"]:
+        raise ValueError("historical feedback setup reservation denied before any round")
+    reserved_games = set()
     inventory = {"receipt.json", "plan.json", "parameter-observation.json", "registration.json", "source.json", "capabilities.json",
         "semantic_registration.json", "semantic_source.json", "episodes.json"}
     current = {parents.records[i]["input"]["sha256"]: i for i in parents.current_view.current_indices}
@@ -904,7 +938,11 @@ def _replay(parents, raws, receipt_pin, registered_pins, parameter_pin, source_s
             stem = "parent-" + str(parent_index) + "-round-" + str(number)
             if round_info["stem"] != stem or type(round_info["CPU_dispatched"]) is not bool:
                 raise ValueError("feedback round ordinal/type mismatch")
-            remaining = plan["limits"]["max_steps"] - steps
+            remaining = plan["limits"]["max_steps"] - reserved_usage["steps"]
+            encoding = parents.encodings[identity]
+            cost = _round_cost(stage, plan["limits"], ModelConfig(), encoding, snapshot)
+            if not _reserve_usage(plan["limits"], reserved_usage, reserved_games, snapshot["game_id"], cost):
+                raise ValueError("historical feedback reservation denied BEFORE round dispatch")
             common = next_common_query(parents, parent_index, stage, ledger, round_index=number, maximum_rounds=len(plan["stages"]),
                                       remaining_global_steps=remaining, binary_sha256=registered_pins["binary"]["sha256"])
             if common is None or _raw(common) != raws[stem + "-common_query.json"]:
@@ -950,6 +988,7 @@ def _replay(parents, raws, receipt_pin, registered_pins, parameter_pin, source_s
             eligible = checked.common_query()["eligible_tasks"]
             chosen = max((i for i, flag in enumerate(eligible) if flag), key=lambda i: (logits[i], -i))
             task = TASKS[chosen]
+            _episode_action(task, number, len(episode["rounds"]))
             request = _request(snapshot, identity, stage, task, registered_pins["binary"]["sha256"])
             request["max_output_bytes"] = plan["limits"]["max_child_output_bytes"]
             request["context_sha256"] = legacy._hash(legacy.CPU_SCHEMA, request)
@@ -964,10 +1003,9 @@ def _replay(parents, raws, receipt_pin, registered_pins, parameter_pin, source_s
                 raise ValueError("producer forward observation is not pinned frozen semantic scope")
             steps += 1
             transitions += int(number > 0)
-            encoding = parents.encodings[identity]
             games.add(snapshot["game_id"])
-            semantic_bytes += semantic.reservation_bytes(1, 66 + max(1, len(encoding.public_records)), plan["limits"]["max_semantic_bytes"])
-            flops += forward_flops_upper(ModelConfig(), len(encoding.public_records), len(snapshot["legal_moves"]))
+            semantic_bytes += cost["semantic_bytes"]
+            flops += cost["forward_flops"]
             if round_info["CPU_dispatched"]:
                 inventory.update(stem + suffix for suffix in ("-CPU-request.json", "-CPU-stdout.bin", "-CPU-stderr.bin", "-CPU-process.bin",
                     "-feedback-evidence.json", "-masked-label.json"))
@@ -985,6 +1023,7 @@ def _replay(parents, raws, receipt_pin, registered_pins, parameter_pin, source_s
                     raise ValueError("persisted CPU feedback evidence/raw chain changed")
                 response = legacy._parse(out)
                 nodes += response["nodes"]
+                reserved_usage["nodes"] -= cost["nodes"] - response["nodes"]
                 expected_label = {"future_label": legacy.future_label(checked.derived_input()["input"]["snapshot"],
                     legacy.TaskContext(**checked.common_query()["context"]), task, request, response, _pin(evidence)["sha256"]),
                     "task_rank_masked": True, "ordinary_admission": False, "positive_training_target": False}
@@ -1002,6 +1041,9 @@ def _replay(parents, raws, receipt_pin, registered_pins, parameter_pin, source_s
                     raise ValueError("missing unresolved-stop evidence")
             if round_info["ledger_after_sha256"] != ledger.sha256:
                 raise ValueError("retained feedback ledger identity changed")
+            actual_round_bytes = sum(len(raw) for name, raw in raws.items() if name.startswith(stem + "-"))
+            _int(actual_round_bytes, 0, cost["output_bytes"])
+            reserved_usage["output_bytes"] -= cost["output_bytes"] - actual_round_bytes
     expected_counts = {"selections": steps, "semantic_preparations": steps, "verifier_cold_forwards": steps,
         "CPU_dispatches": CPU_dispatches, "CPU_checks": CPU_checks, "feedback_transitions": transitions, "ranked_targets": 0}
     if set(raws) != inventory:
@@ -1012,7 +1054,7 @@ def _replay(parents, raws, receipt_pin, registered_pins, parameter_pin, source_s
     expected_used = {"steps": steps, "nodes": nodes, "semantic_bytes": semantic_bytes, "forward_flops": flops,
         "output_bytes": FINAL_BYTES + INDEX_BYTES + sum(len(raw) for name, raw in raws.items() if name not in ("receipt.json", "episodes.json"))}
     _fields(report["resources"]["used"], expected_used)
-    if report["resources"]["used"] != expected_used:
+    if report["resources"]["used"] != expected_used or reserved_usage != expected_used:
         raise ValueError("feedback prepaid/observed resource accounting differs")
     if len(games) > plan["limits"]["max_games"]:
         raise ValueError("feedback admitted games exceed pre-result allowance")
@@ -1031,6 +1073,7 @@ An external owner must independently accept actual producer exit/cleanup/time
 and provide the receipt pin. No fabricated observation object/factory callback
 opens this reader. It never returns an ordinary training ValidatedDataset.
 """
+    semantic._deadline(deadline)  # Reject invalid/expired caller clocks BEFORE paths/reads.
     _int(max_input_bytes, 1, 128 << 20)
     root = legacy._path(directory)
     if any((p / ".git").exists() for p in (root, *root.parents)):
@@ -1043,8 +1086,7 @@ opens this reader. It never returns an ordinary training ValidatedDataset.
         _fields(expected, ("bytes", "sha256"))
         size = _int(expected["bytes"], 0 if empty else 1, min(remaining, FINAL_BYTES if name == "receipt.json" else MAX_BYTES))
         remaining -= size  # Deduct BEFORE allocation/read.
-        if time.monotonic() >= deadline:
-            raise TimeoutError("original replay caller deadline exhausted")
+        semantic._deadline(deadline)
         path = legacy._path(root / name)
         if size == 0:
             before = path.lstat()
@@ -1053,6 +1095,7 @@ opens this reader. It never returns an ordinary training ValidatedDataset.
             raw = b""
         else:
             _, raw = legacy._file(path, expected["sha256"], size)
+        semantic._deadline(deadline)
         return _actual(raw, expected, MAX_BYTES, empty=empty)
     raws = {"receipt.json": read("receipt.json", expected_receipt_pin)}
     report = legacy._parse(raws["receipt.json"])
@@ -1062,13 +1105,15 @@ opens this reader. It never returns an ordinary training ValidatedDataset.
     for name, pin in artifacts.items():
         raws[name] = read(name, pin, empty=True)
     plan = _plan(raws["plan.json"], parents, report["plan"])
-    assets, _, _, _ = _assets(registered_paths, expected_registered_pins, plan["stages"][0], deadline, remaining)
+    assets, _, _, capabilities = _assets(registered_paths, expected_registered_pins, plan["stages"][0], deadline, remaining)
+    semantic._deadline(deadline)
+    _stage_capabilities(plan, capabilities)
     for name, raw in assets.items():
         if name != "binary" and raw != raws[name + ".json"]:
             raise ValueError("actual independent registration paths differ from accepted bank")
     result = CheckedFeedbackHistory(parents, tuple(sorted(raws.items())), _raw(expected_receipt_pin),
         _raw(expected_registered_pins), _raw(expected_parameter_observation_pin), semantic._sha(expected_producer_source_sha256))
+    semantic._deadline(deadline)
     result.verify()
-    if time.monotonic() >= deadline:
-        raise TimeoutError("original replay caller deadline exhausted")
+    semantic._deadline(deadline)
     return result

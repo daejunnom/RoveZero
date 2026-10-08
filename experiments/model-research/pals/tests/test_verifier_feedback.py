@@ -7,6 +7,7 @@ child, Rules replay, trained utility, strategic feedback or product V is
 proved. No optimizer/backward/GPU/checkpoint export is used.
 """
 import copy
+from contextlib import ExitStack
 import tempfile
 import time
 from pathlib import Path
@@ -137,6 +138,39 @@ class FeedbackFixture:
         else:
             result = raw(self.response(request)) + b"\n"
         return result, b"", raw(synthetic_process(assets["binary_pin"], assets["source_pin"]))
+
+
+def repin_plan_limits(bank, **updates):
+    """Synthetic consistent raw-byte re-pinning to reach historical quota gates.
+
+No changed bank is an actual producer/launch observation. These fixtures show
+that small final actual usage cannot erase an impossible pre-dispatch reserve.
+"""
+    raws = dict(bank._raws)
+    report = legacy._parse(raws["receipt.json"])
+    plan = legacy._parse(raws["plan.json"])
+    plan["limits"].update(updates)
+    raws["plan.json"] = raw(plan)
+    plan_pin = semantic.byte_pin(raws["plan.json"])
+    for name in tuple(raws):
+        if name.endswith("-feedback-before.json"):
+            before = legacy._parse(raws[name])
+            before["plan"] = plan_pin
+            raws[name] = raw(before)
+            stem = name[:-len("-feedback-before.json")]
+            before_pin = semantic.byte_pin(raws[name])
+            for suffix in ("-Rules-dispatch.json", "-decision.json"):
+                value = legacy._parse(raws[stem + suffix])
+                value["feedback_before"] = before_pin
+                raws[stem + suffix] = raw(value)
+    report["plan"] = plan_pin
+    report["resources"]["limits"] = copy.deepcopy(plan["limits"])
+    report["resources"]["used"]["output_bytes"] = feedback.FINAL_BYTES + feedback.INDEX_BYTES + sum(
+        len(value) for name, value in raws.items() if name not in ("receipt.json", "episodes.json"))
+    report["artifacts"] = {name: semantic.byte_pin(value) for name, value in raws.items() if name != "receipt.json"}
+    raws["receipt.json"] = raw(report)
+    return feedback.CheckedFeedbackHistory(bank._parent, tuple(sorted(raws.items())), raw(semantic.byte_pin(raws["receipt.json"])),
+        bank._registered_pins, bank._parameter_pin, bank._source_sha256)
 
 
 class CoverageFeedbackTests(unittest.TestCase):
@@ -344,6 +378,99 @@ class CoverageFeedbackTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 feedback._assets(f.paths, f.pins, f.stage, time.monotonic() + 1, 1)
 
+    def test_assets_invalid_or_expired_deadline_refused_before_read_nn_or_child(self):
+        f = self.fixture
+        for deadline in (float("nan"), float("inf"), -float("inf"), True, False, None, "200", 100, 99):
+            with self.subTest(deadline=repr(deadline)), ExitStack() as stack:
+                stack.enter_context(patch.object(feedback.time, "monotonic", return_value=100))
+                read = stack.enter_context(patch.object(legacy, "_file", side_effect=AssertionError("no read")))
+                forward = stack.enter_context(patch.object(semantic.FrozenSemanticVerifier, "forward", side_effect=AssertionError("no NN")))
+                child = stack.enter_context(patch.object(feedback.subprocess, "Popen", side_effect=AssertionError("no child")))
+                with self.assertRaises(TimeoutError):
+                    feedback._assets(f.paths, f.pins, f.stage, deadline, 128 << 20)
+                read.assert_not_called()
+                forward.assert_not_called()
+                child.assert_not_called()
+
+    def test_loader_invalid_or_expired_deadline_refused_before_assets_paths_or_read(self):
+        f = self.fixture
+        for deadline in (float("nan"), float("inf"), -float("inf"), True, False, None, "200", 100, 99):
+            with self.subTest(deadline=repr(deadline)), ExitStack() as stack:
+                stack.enter_context(patch.object(feedback.time, "monotonic", return_value=100))
+                path = stack.enter_context(patch.object(legacy, "_path", side_effect=AssertionError("no path I/O")))
+                read = stack.enter_context(patch.object(legacy, "_file", side_effect=AssertionError("no read")))
+                assets = stack.enter_context(patch.object(feedback, "_assets", side_effect=AssertionError("no assets")))
+                forward = stack.enter_context(patch.object(semantic.FrozenSemanticVerifier, "forward", side_effect=AssertionError("no NN")))
+                child = stack.enter_context(patch.object(feedback.subprocess, "Popen", side_effect=AssertionError("no child")))
+                with self.assertRaises(TimeoutError):
+                    feedback.load_verifier_feedback_bank(f.root / "bank", parents=f.parents, expected_receipt_pin={},
+                        expected_registered_pins=f.pins, expected_parameter_observation_pin={}, expected_producer_source_sha256="1" * 64,
+                        registered_paths=f.paths, deadline=deadline)
+                for guard in (path, read, assets, forward, child):
+                    guard.assert_not_called()
+
+    def test_assets_recheck_expiry_after_read_before_any_next_asset(self):
+        f = self.fixture
+        with patch.object(feedback.time, "monotonic", side_effect=[100, 100, 200]), patch.object(legacy, "_file",
+                return_value=(f.paths["registration"], f.assets["registration"])) as read:
+            with self.assertRaises(TimeoutError):
+                feedback._assets(f.paths, f.pins, f.stage, 200, 128 << 20)
+            read.assert_called_once()
+
+    def test_loader_rechecks_expiry_at_replay_boundary(self):
+        f = self.fixture
+        clock = {"now": 100}
+        plan_raw = raw(f.plan)
+        receipt_raw = raw({"plan": semantic.byte_pin(plan_raw), "artifacts": {"plan.json": semantic.byte_pin(plan_raw)}})
+        def read(path, expected, maximum):
+            return path, receipt_raw if Path(path).name == "receipt.json" else plan_raw
+        def assets(*args):
+            clock["now"] = 200
+            return {}, None, None, {}
+        with patch.object(feedback.time, "monotonic", side_effect=lambda: clock["now"]), patch.object(legacy, "_file", side_effect=read), \
+                patch.object(feedback, "_assets", side_effect=assets), patch.object(feedback, "_plan", return_value=f.plan), \
+                patch.object(feedback, "_replay", side_effect=AssertionError("expired replay must not begin")) as replay:
+            with self.assertRaises(TimeoutError):
+                feedback.load_verifier_feedback_bank(f.root / "bank", parents=f.parents, expected_receipt_pin=semantic.byte_pin(receipt_raw),
+                    expected_registered_pins=f.pins, expected_parameter_observation_pin={}, expected_producer_source_sha256="1" * 64,
+                    registered_paths=f.paths, deadline=200)
+            replay.assert_not_called()
+
+    def test_stage_capabilities_apply_to_later_rounds_and_child_output(self):
+        f = self.fixture
+        caps = {"max_depth": 4, "max_nodes_per_check": 100000, "max_wall_time_ms": 10000, "max_response_bytes": 65536}
+        feedback._stage_capabilities(f.plan, caps)
+        for name, value in (("max_depth", 3), ("max_nodes_per_check", 99999), ("max_wall_time_ms", 9999),
+                            ("max_response_bytes", 65535), ("max_depth", True)):
+            with self.subTest(capability=name, value=value), self.assertRaises(ValueError):
+                feedback._stage_capabilities(f.plan, dict(caps, **{name: value}))
+        changed = copy.deepcopy(f.plan)
+        changed["stages"][1]["max_wall_time_ms"] = 10001
+        with self.assertRaises(ValueError):
+            feedback._stage_capabilities(changed, caps)
+
+    def test_actual_refund_does_not_erase_next_round_node_reservation(self):
+        f = self.fixture
+        limits = dict(f.limits, max_nodes=200000)
+        used = {"steps": 0, "nodes": 0, "forward_flops": 0, "semantic_bytes": 0,
+                "output_bytes": feedback.FINAL_BYTES + feedback.INDEX_BYTES}
+        games = set()
+        encoding = f.parents.encodings[f.identity]
+        cost = feedback._round_cost(f.stage, limits, ModelConfig(), encoding, f.snapshot)
+        self.assertTrue(feedback._reserve_usage(limits, used, games, f.snapshot["game_id"], cost))
+        used["nodes"] -= cost["nodes"] - 100
+        used["output_bytes"] -= cost["output_bytes"] - 100
+        before = dict(used)
+        self.assertFalse(feedback._reserve_usage(limits, used, games, f.snapshot["game_id"], cost))
+        self.assertEqual(used, before)
+        self.assertLess(200, limits["max_nodes"])  # Two small actual tallies would fit; the next reserve does not.
+
+    def test_explicit_defer_terminates_episode_even_with_future_masked_round(self):
+        feedback._episode_action("defer", 0, 1)
+        feedback._episode_action("resume_task", 0, 2)
+        with self.assertRaisesRegex(ValueError, "defer terminates"):
+            feedback._episode_action("defer", 0, 2)
+
     def test_semantic_matrix_flops_bound_includes_extra_private_tokens(self):
         config = ModelConfig()
         base = matmul_flops(config, "validator", 0, 2)["cold_forward_matmul_flops"]
@@ -386,6 +513,27 @@ class CoverageFeedbackTests(unittest.TestCase):
         summary = bank.summary()
         self.assertEqual(summary["counts"]["feedback_transitions"], 1)
         self.assertFalse(summary["ordinary_admission"])
+        # Consistently re-pin the synthetic bank so failures reach the quota
+        # chronology itself, rather than an unrelated byte/plan mismatch.
+        for updates in ({"max_nodes": 100000}, {"max_output_bytes": result["resources"]["used"]["output_bytes"]}):
+            with self.subTest(quota=updates):
+                impossible = repin_plan_limits(bank, **updates)
+                with self.assertRaisesRegex(ValueError, "reservation denied BEFORE round"):
+                    impossible.verify()
+        # A consistently re-pinned synthetic decision cannot keep another
+        # round after choosing Defer, even when every supervision rank masks.
+        raws = dict(bank._raws)
+        name = sorted(name for name in raws if name.endswith("-decision.json"))[0]
+        decision = legacy._parse(raws[name])
+        decision["task_logits"] = [1.0 if task == "defer" else 0.0 for task in TASKS]
+        raws[name] = raw(decision)
+        report = legacy._parse(raws["receipt.json"])
+        report["artifacts"][name] = semantic.byte_pin(raws[name])
+        raws["receipt.json"] = raw(report)
+        early_defer = feedback.CheckedFeedbackHistory(bank._parent, tuple(sorted(raws.items())), raw(semantic.byte_pin(raws["receipt.json"])),
+            bank._registered_pins, bank._parameter_pin, bank._source_sha256)
+        with self.assertRaisesRegex(ValueError, "defer terminates"):
+            early_defer.verify()
         # Exact raw history remains authority; a bank mutation cannot be hidden
         # by changing the query declaration to a larger coverage number.
         raws = dict(bank._raws)

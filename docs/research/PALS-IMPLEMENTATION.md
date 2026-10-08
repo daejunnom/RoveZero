@@ -1821,3 +1821,41 @@ test source는 17,038B SHA
 실제 CPU 수치는 후속 exact-SHA CI에서 인수한다. learned public projection의
 수치 대조, Rust native consumer, CUDA resident owner·lease·fence·quarantine은
 이 단위에서 미구현/미인수다. GPU 검증은 계속 사용자 보류다.
+
+### V coverage feedback reload의 세 검토 누락 수정
+
+초도 `7fbb389` 이후 독립 원문 검토에서 발견한 세 누락을 후속 소스로 수정했다.
+loader와 registered asset의 첫 I/O 전·각 read 전후·replay 전후에 기존 유한
+deadline 검사를 재사용하여 bool·NaN·무한대·만료를 거절한다. live producer와
+reload는 같은 round cost와 원자적 예약 함수를 사용한다. 각 round에서 `2N`,
+FLOPs·semantic bytes·`6 × childcap + 2MiB` 출력 비용을 먼저 예약하고, 검증된
+실제 nodes와 저장 bytes의 차이만 환급한 뒤 다음 round를 인수한다. 작은 최종
+실제 합계로 발주 전 불가능했던 예약을 숨기지 못한다. 전체 stage의 H/N/wall과
+child output cap도 같은 actual-capability gate로 검사하고 Defer 이후 round를
+거절한다.
+
+후속 읽기 전용 독립 검토는 세 제품 누락이 소스상 닫혔음을 확인했고 추가
+must-fix는 발견하지 않았다. 동결 feedback source는 74,836B SHA
+`c06f0d31ef61874f95f7205f4fa0ce29427a65b189ff821d8c25f7088d63dd8c`,
+test source는 33,316B SHA
+`d9a9b3b7692d62327550d94b2e632b2f349312be02cb0ee65730e4ab094c177d`다.
+source9는 실제 dependency bytes를 전후 검사하므로 SEE consumer의 후속 수정도
+실제 producer source pin으로 대조하며 상수 pin을 자동 재해석하지 않는다.
+
+검사 소스는 기존 20개와 추가 7개로 총 27개다. 노드·출력 예약 음성 사례는
+plan·before·dispatch·decision·receipt bytes를 다시 봉인하여 해당 예약 gate를
+검사한다. Defer 사례는 decision과 pin을 재봉인해 episode 종료 gate 도달을
+검사하지만 나머지 CPU request/evidence는 기존 Resume 상태다. 따라서 이것을
+전체 필드가 일관된 Defer→후속 round 역사의 end-to-end 검사로 표현하지 않는다.
+root105는 동결 pin 전후 일치와 Windows stdlib AST를 실제 exit 0으로 확인했다.
+제품 module import·fixture·Torch·실제 Rust child·WSL·GPU 실행은 하지 않았다.
+수정 전 source/CI는 보존하며 실제 27개 검사·전체 producer 종료와 cleanup은
+별도 exact-SHA 인수 대상으로 남긴다. ordinary/positive target·실제 학습·전체
+전략적 V 환류로 scope를 확대하지 않는다.
+
+packing source `9fbcdcd145c26e488fad44641ad794174859fa00`의 CI run
+`37721184850`은 네 CPU job 모두 SUCCESS를 확인했다. Windows 최종 완료는
+2026-10-08 03:13:43 UTC다. PALS suite 352개가 통과했고 packing의 13개 method도
+skip 없이 실제 `ok`를 확인했다. CPU ORT의 합성 K/V 수치·artifact·입력 거절
+검사는 이 source에 한정하며, 위 feedback reload 수정은 후속 SHA에서 검사한다.
+학습·GPU·Rust CUDA resident consumer·CPU04 pair 인수로 확대하지 않는다.
