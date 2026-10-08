@@ -5,6 +5,8 @@
 //! parent, semantic receipt, or prior chronology. Its receipt is neither a native
 //! action/witness bridge nor whole-action closure, cost, utility, or a target.
 
+#[cfg(feature = "onnx-cpu")]
+pub mod native_replay;
 pub mod replay_inputs;
 
 use super::{CpuProfile, CpuTaskAdmission, CpuTaskError, TaskKind};

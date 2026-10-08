@@ -104,6 +104,16 @@ pub fn pals_rules_encoding_semantic_digest() -> [u8; 32] {
     }
     h.finalize().into()
 }
+/// Fresh model/input namespace, distinct from the Rules-only manifest profile.
+/// Preserve the existing schema bytes followed by the exact Rules digest. This
+/// pure identity getter grants no loaded-model or native execution authority;
+/// PrivateWarm continues to use its separate capability-owned encoding.
+pub fn pals_fresh_encoding_semantic_digest() -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(rz_eval::pals_model::PALS_ENCODING_SCHEMA);
+    h.update(pals_rules_encoding_semantic_digest());
+    h.finalize().into()
+}
 pub fn pals_native_source_digest() -> [u8; 32] {
     Sha256::digest(include_bytes!("pals_native.rs")).into()
 }
@@ -501,7 +511,6 @@ mod native {
         RootGeneration, Stage, Wdl,
     };
     use rz_eval::error::BackendError;
-    use rz_eval::pals_model::PALS_ENCODING_SCHEMA;
     use rz_eval::pals_onnx::{
         HostRecordPageObservationBoundary, HostRecordPageObservationHandle,
         HostRecordPageObservationOutcome, HostRecordPageObservationSnapshot,
@@ -1319,10 +1328,7 @@ mod native {
             .iter()
             .find(|graph| graph.role == "public")
             .ok_or(RoleError::InvalidOutput)?;
-        let mut encoding = Sha256::new();
-        encoding.update(PALS_ENCODING_SCHEMA);
-        encoding.update(pals_rules_encoding_semantic_digest());
-        let encoding: [u8; 32] = encoding.finalize().into();
+        let encoding = pals_fresh_encoding_semantic_digest();
         let device_id = match backend.config().provider {
             rz_eval::onnx::Provider::Cuda { device_id, .. } => {
                 u32::try_from(device_id).map_err(|_| RoleError::InvalidOutput)?
@@ -3600,13 +3606,11 @@ mod native {
             )?;
             let model_epoch = backend.model_epoch();
             let model = Digest(backend.manifest_digest());
-            let mut encoding_hasher = Sha256::new();
-            encoding_hasher.update(PALS_ENCODING_SCHEMA);
-            encoding_hasher.update(pals_rules_encoding_semantic_digest());
-            let encoding = Digest(warm_capability.map_or_else(
-                || encoding_hasher.finalize().into(),
-                |cap| cap.private_model_identity().encoding,
-            ));
+            let encoding = Digest(
+                warm_capability.map_or_else(pals_fresh_encoding_semantic_digest, |cap| {
+                    cap.private_model_identity().encoding
+                }),
+            );
             let adapter_source_digest = if let Some(cap) = warm_capability {
                 let mut hash = Sha256::new();
                 hash.update(b"rz-pals-native-private-warm-adapter/1");
@@ -6295,7 +6299,7 @@ mod native {
         {
             let epoch = ProcessEpoch(next(&EPOCHS).unwrap());
             let model = Digest([3; 32]);
-            let encoding = Digest(pals_rules_encoding_semantic_digest());
+            let encoding = Digest(pals_fresh_encoding_semantic_digest());
             let clock = ContractSystemClock::new(epoch);
             let scope = SharedPalsScope::new(PalsScope {
                 authority: SearchAuthority {
@@ -6465,6 +6469,13 @@ mod native {
             });
             let receipt = model.finish_handle().receipt();
             validate_private_warm_evidence(&receipt, false).unwrap();
+            // Controlled owner/receipt propagation uses the same authoritative
+            // Fresh namespace as production; no second hash algorithm is copied.
+            assert_eq!(
+                receipt.encoding_semantic_sha256,
+                pals_fresh_encoding_semantic_digest()
+            );
+            assert_eq!(model.encoding.0, receipt.encoding_semantic_sha256);
             let wire = serde_json::to_value(&receipt).unwrap();
             assert!(wire.get("private_warm_observation").is_none());
             assert!(wire.get("private_warm_observation_unavailable").is_none());

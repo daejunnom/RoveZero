@@ -2717,3 +2717,56 @@ runtime pin과 실제 worker/session join·buffer release는 별도로 기록한
 pure/controlled fixture, 실제 wrapper compile, 실제 모델 replay와 원래 전체 시계
 인수는 각각 구분하며 기존 Query/2·CPU action/1·replay input 등록 wire를 바꾸거나
 실행·whole-cost·physical·utility 권한을 자동으로 부여하지 않는다.
+
+### 실제 CPU Fresh 모델을 연결하는 frozen replay wrapper
+
+`strategic_action::native_replay`는 `onnx-cpu`의 명시적 연결부다. 기존
+`check_replay_inputs`로 원래 시작·실행 마감·전체 마감과 독립 등록을 검사한 뒤,
+독립 asset profile과 원본 profile bytes·export manifest·runtime library를 대조한다.
+기존 CPU action CLI와 semantic binary의 등록은 그대로 보존한다. 새 wrapper의
+factory·source·replay binary 등록은 그 기존 실행 증거를 대신하지 않는다.
+
+프로필의 `encoding_semantic_sha256`은 실제 Fresh 모델 입력의 기존 식별값이다.
+이는 `SHA256(PALS_ENCODING_SCHEMA bytes || Rules digest)`이며, manifest의
+Rules 전용 식별값과 구분한다. 공개 `pals_fresh_encoding_semantic_digest()`를
+Fresh constructor·CUDA record 선언·wrapper가 공유한다. PrivateWarm capability의
+인코딩과 Rules manifest 검사 의미는 유지한다. Rules digest만으로 profile context를
+다시 봉인해도 입장을 거절하며, 로딩 후 실제 모델의 식별값도 정확히 대조한다.
+
+선택한 경로는 invocation loader → 실제 `NativeRoleModel` →
+`FreshReplayOwner`다. ReplyOnly는 기존 `run`의 2N 경로를, RepairEndpoint는
+`run_with_repair`의 3N 경로를 사용한다. 원래 cancel·limits·generation을 전달하며
+mock 결과를 native 결과로 대체하지 않는다. owner 구성 전 실제 finish handle을
+보존하고, run 실패에서도 남은 store·attempt·report와 실제 관측 row를 수집한다.
+runtime/owner Drop 뒤의 같은 W finish는 새 retry 창이나 runtime pump를 만들지
+않는다. 완료 미관측 lease와 cleanup 실패는 계속 미관측·실패로 남긴다.
+
+public-memory cache 선택은 독립 profile과 정확히 같아야 한다. CUDA bundle,
+device public memory, private Warm 및 다른 provider는 native load 전에 거절한다.
+CPU config나 pin 검증 성공만으로 실제 provider 실행을 인증하지 않는다.
+
+입력·관측·출력의 예약은 실제 실행 전에 유한한 상한으로 검사한다. 기본 L4/P1의
+ReplyOnly·RepairEndpoint는 기존 4MiB 출력 한도 안에서 각각 입장 가능하고, 더 큰
+구성은 예약 부족으로 명확히 거절할 수 있다. 제한을 자동 축소하거나 mode를 바꾸지
+않는다. compact JSONL의 외부 string escaping과 자유 Debug snapshot의 escaping을
+구분하여 예약하며, row 실패 전에 이미 소유한 row는 보존한다.
+
+오류는 원래 primary와 cleanup·observer·output secondary를 별도로 소유한다.
+`NativeReplayError::serialized()`도 같은 원래 W를 적용한다. 입력 오류에 유효한
+whole wall이 이미 입장됐으면 최초 시작에서 그 W를 복원하고, whole clock이 없는
+malformed 입력은 미관측으로 구분한다. 직렬화 실패나 마감 초과가 원래 원인,
+nonzero CPU work·unknown counter·앞선 row를 지우지 않는다. 원래 structured
+backend error를 소유하는 것과 JSON의 bounded 진단 투영은 별도 범위다.
+
+관측 출력은 실제 TaskRecord·attempt·report·Reply/Repair 및 native binding을
+구분한다. formatter의 `complete`는 그 bounded snapshot의 완전성을 뜻하며 전체
+typed/raw archive를 인증하지 않는다. raw float는 IEEE bits로 보존하고, publication,
+Ready, 정상 소비·accepted context는 각각 기록한다. bytes 준비 시각은 caller의
+delivery·flush·exit 시각을 포함하지 않는다.
+
+이번 연결부에는 profile/source 입장, 두 mode의 예약, 원래 시계, 오류·관측 보존을
+다루는 pure/controlled fixture 14개를 추가했다. 소스 검토와 실제 fixture 실행은
+구분하고 새 HEAD CPU CI 결과로 실행 여부를 확인한다. 이 fixture는 실제 ORT 모델
+로딩이나 registered native replay 성공을 대체하지 않는다. 별도 CLI 연결, 실제 CPU
+모델 실행, strict Query/full recheck·whole cost·physical closure·utility 인수는
+후속 검사로 남는다. GPU 검증은 사용자 지시에 따라 보류하며 실제 학습은 범위 밖이다.
