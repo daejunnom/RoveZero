@@ -1,7 +1,10 @@
 //! One bounded JSON V task, --candidate-only fresh single-candidate check, or
 //! --prepare-semantic Rules-only preparation, or --line-continuation factual
 //! whole-line/endpoint check. Modes are exclusive.
+//! Private V tasks alone can explicitly select --cpu-ordering=legal-see-v1.
+//! Native PALS/CPU_R and other private modes keep their historical selection.
 //! No child UCI engine/GPU/model/teacher is launched.
+use rz_search::cpu::CpuOrderingPolicy;
 use rz_uci::pals_cpu_task::candidate::{
     self, CandidateRawReport, CandidateReceipt, CandidateTaskError,
 };
@@ -9,7 +12,8 @@ use rz_uci::pals_cpu_task::continuation::{self, ContinuationError, ContinuationR
 use rz_uci::pals_cpu_task::semantic::{self, SemanticError, SemanticReceipt};
 use rz_uci::pals_cpu_task::{
     CpuTaskError, MAX_REQUEST_BYTES, MAX_SELF_BINARY_BYTES, MAX_WALL_TIME_MS, capabilities,
-    dispatch_started, request_admission,
+    capabilities_with_ordering, dispatch_started, dispatch_started_with_ordering,
+    request_admission, request_admission_with_ordering,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -212,6 +216,23 @@ fn arguments(args: &[String]) -> Result<(CliMode, bool), CpuTaskError> {
     }
 }
 
+fn arguments_with_ordering(
+    args: &[String],
+) -> Result<(CliMode, bool, CpuOrderingPolicy), CpuTaskError> {
+    match args {
+        [flag] if flag == "--cpu-ordering=legal-see-v1" => {
+            Ok((CliMode::Verifier, false, CpuOrderingPolicy::LegalSeeV1))
+        }
+        [flag, capability]
+            if flag == "--cpu-ordering=legal-see-v1" && capability == "--capabilities" =>
+        {
+            Ok((CliMode::Verifier, true, CpuOrderingPolicy::LegalSeeV1))
+        }
+        _ => arguments(args)
+            .map(|(mode, capabilities)| (mode, capabilities, CpuOrderingPolicy::LegacyMvvLvaV1)),
+    }
+}
+
 fn annotate(mut error: CpuTaskError, context: &CliContext) -> CpuTaskError {
     error.elapsed_ms = Some(
         context
@@ -234,7 +255,8 @@ fn run(context: &mut CliContext) -> Result<Vec<u8>, CliError> {
         Some("--line-continuation") => CliMode::Continuation,
         _ => CliMode::Verifier,
     };
-    let (mode, show_capabilities) = arguments(&args).map_err(|e| context.transport_error(e))?;
+    let (mode, show_capabilities, ordering) =
+        arguments_with_ordering(&args).map_err(|e| context.transport_error(e))?;
     context.mode = mode;
     if show_capabilities {
         let deadline = started
@@ -244,7 +266,13 @@ fn run(context: &mut CliContext) -> Result<Vec<u8>, CliError> {
             })?;
         let binary = own_binary_sha(deadline).map_err(|e| context.transport_error(e))?;
         let capabilities = match mode {
-            CliMode::Verifier => capabilities().map_err(CliError::V)?,
+            CliMode::Verifier => {
+                if ordering == CpuOrderingPolicy::LegacyMvvLvaV1 {
+                    capabilities().map_err(CliError::V)?
+                } else {
+                    capabilities_with_ordering(ordering).map_err(CliError::V)?
+                }
+            }
             CliMode::Candidate => candidate::capabilities().map_err(CliError::Candidate)?,
             CliMode::Semantic => semantic::capabilities().map_err(CliError::Semantic)?,
             CliMode::Continuation => {
@@ -280,7 +308,11 @@ fn run(context: &mut CliContext) -> Result<Vec<u8>, CliError> {
     let bytes = read_request(started).map_err(|e| context.transport_error(e))?;
     let (deadline, output_limit) = match mode {
         CliMode::Verifier => {
-            let admission = request_admission(&bytes, started).map_err(CliError::V)?;
+            let admission = if ordering == CpuOrderingPolicy::LegacyMvvLvaV1 {
+                request_admission(&bytes, started).map_err(CliError::V)?
+            } else {
+                request_admission_with_ordering(&bytes, started, ordering).map_err(CliError::V)?
+            };
             (admission.deadline, admission.output_limit)
         }
         CliMode::Candidate => {
@@ -301,7 +333,11 @@ fn run(context: &mut CliContext) -> Result<Vec<u8>, CliError> {
     context.output_limit = output_limit;
     let binary = own_binary_sha(context.deadline).map_err(|e| context.transport_error(e))?;
     if mode == CliMode::Verifier {
-        return dispatch_started(&bytes, &binary, started).map_err(CliError::V);
+        return if ordering == CpuOrderingPolicy::LegacyMvvLvaV1 {
+            dispatch_started(&bytes, &binary, started).map_err(CliError::V)
+        } else {
+            dispatch_started_with_ordering(&bytes, &binary, started, ordering).map_err(CliError::V)
+        };
     }
     if mode == CliMode::Semantic {
         return prepare_semantic(&bytes, &binary, context);
@@ -785,6 +821,47 @@ mod tests {
         assert_eq!(v["max_checks"], 2);
         assert_eq!(candidate["schema"], candidate::CANDIDATE_SCHEMA);
         assert_eq!(candidate["max_checks"], 1);
+    }
+
+    #[test]
+    fn private_see_flag_is_exclusive_and_does_not_change_legacy_modes() {
+        assert_eq!(
+            arguments_with_ordering(&[]).unwrap(),
+            (CliMode::Verifier, false, CpuOrderingPolicy::LegacyMvvLvaV1)
+        );
+        assert_eq!(
+            arguments_with_ordering(&["--capabilities".into()]).unwrap(),
+            (CliMode::Verifier, true, CpuOrderingPolicy::LegacyMvvLvaV1)
+        );
+        assert_eq!(
+            arguments_with_ordering(&["--cpu-ordering=legal-see-v1".into()]).unwrap(),
+            (CliMode::Verifier, false, CpuOrderingPolicy::LegalSeeV1)
+        );
+        assert_eq!(
+            arguments_with_ordering(&[
+                "--cpu-ordering=legal-see-v1".into(),
+                "--capabilities".into()
+            ])
+            .unwrap(),
+            (CliMode::Verifier, true, CpuOrderingPolicy::LegalSeeV1)
+        );
+        for arguments in [
+            vec!["--cpu-ordering=unknown"],
+            vec!["--cpu-ordering=legacy-mvv-lva-v1"],
+            vec!["--capabilities", "--cpu-ordering=legal-see-v1"],
+            vec!["--candidate-only", "--cpu-ordering=legal-see-v1"],
+            vec!["--cpu-ordering=legal-see-v1", "--candidate-only"],
+            vec!["--prepare-semantic", "--cpu-ordering=legal-see-v1"],
+            vec!["--line-continuation", "--cpu-ordering=legal-see-v1"],
+            vec!["--cpu-ordering=legal-see-v1", "--cpu-ordering=legal-see-v1"],
+        ] {
+            assert!(
+                arguments_with_ordering(
+                    &arguments.into_iter().map(String::from).collect::<Vec<_>>()
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

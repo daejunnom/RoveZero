@@ -1708,3 +1708,62 @@ SEE는 기존 Rules의 합법 recapture·네 승격·앙파상·핀·왕 안전�
 아니다. 준비 감독기는 추가 cleanup 관측 보완 후 22,121 bytes,
 `dd49cbf64606265c3fef2e4d4b4f45a542eb531a0ea24e668f23fe9454dd43f6`로 원문을 별도
 보존했고, 같은 순수 메타데이터 37개가 모두 PASS였다. 물리 완료·대국 검사는 미실행이다.
+
+### SEE source 후속 CPU CI 관측
+
+`6c166dc54a68cbdc739aaebf1147d2318e811b53`의 기존 workflow
+run `37717186953`은 Linux·Windows·CPU bindings·PALS model CPU 네 job 모두
+SUCCESS로 종료됐다. Windows의 최종 완료는 2026-10-08 02:24:47 UTC다.
+이는 실제 crate edition 2024로 수정한 SEE source와 CPU 검사 결과다.
+이전 `55fcc76`의 서식 실패는 보존한다. 로컬 WSL·모델·GPU·대국을 새로
+실행한 결과가 아니며, CPU_T CLI/producer의 명시적 SEE 선택 연결과
+실제 CPU04 pair·전체 V 환류·CUDA record bank·Repair 후 C 재검토는 별도 잔여다.
+
+### Private V coverage feedback 첫 소스 단위
+
+`verifier_feedback.py`는 별도
+`rz-pals-private-v-feedback-plan/1` 도메인의 고정 stage를 받는다. 이전 실제 CPU
+request·response·process·raw ledger를 보존하고, 같은 parent·Rules·순서·branch·
+binary·profile·H/N/Q/TT/wall 조건에서 완료된 iteration 깊이만 다음 새 checked
+semantic header에 넣는다. 새 input/before/query seal 이후 기존 frozen V를 cold
+forward해 다음 작업을 선택한다. raw hash를 모델 특징으로 넣지 않는다.
+
+Global/per-parent stage·node·wall·output·semantic owner bytes·FLOPs를 발주 전에
+예약한다. 원래 task wall을 확보하지 못하면 unresolved로 종료하며 예산을 조용히
+낮춰 같은 coverage로 재해석하지 않는다. 초기 stage는 legacy
+`resume_task`/`cross_profile_recheck`/`defer`에 한정하고 SEE를 자동 소비하지 않는다.
+재로드는 원시 ledger와 새 입력의 연결·등록 pin·imported source·관측 범위를 다시
+대조하는 `CheckedFeedbackHistory`를 반환한다. ordinary dataset·positive training
+capability가 아니며 실제 producer 종료와 전체 시간·cleanup의 외부 인수가 필요하다.
+
+동결 첫 source는 72,395 bytes,
+`311eb5a61e8488194d53b4093d2338de4d3d39348dd7cb37f895d3d5dee026c0`이고
+20개 집중 fixture source는 23,702 bytes,
+`3413ed5d05509a27df6d166c855f75963831d6efe95e8f1f1c564187be10994d`다.
+root100의 CPython 3.10 AST 검사는 실제 exit 0과 source 전후 동일을 확인했다.
+module import·fixture·Torch·Rust child·GPU 실행은 하지 않았다. CPU CI와 독립
+source review를 후속 인수한다. fixture의 synthetic child/Rules 자료 아래 두 cold
+V forward 검사는 실제 등록 Rust 실행이나 Rules 재생 증거로 확대하지 않는다.
+
+이 단위는 declared-snapshot-relative completed-iteration coverage feedback이며
+전체 전략적 V 우선순위·budget head·private Warm·CPU stack 복원·학습 완료가 아니다.
+task rank·WDL·ordinary/positive target은 계속 masked/false다. P/C 제품은 V-free다.
+
+### CPU_T private SEE 소비자 연결
+
+Private `pals_cpu_task` example은 명시적 `--cpu-ordering=legal-see-v1`과
+봉인된 `ordering_policy: legal_see_v1` 요청을 함께 요구한다. task domain은
+`rz-pals-private-cpu-task-legal-see/1`, conditions domain은
+`rz-pals-private-cpu-conditions-legal-see/1`이며 search identity는
+`rz-cpu-pvs-legal-see/0.1`이다. marker 생략·무인수·기존 capabilities는 legacy를
+유지하고 null·unknown·다른 namespace·다른 mode의 혼합은 검색 전에 거절한다.
+
+Producer의 `ordering_policy` 선택과 explicit bank reload를 함께 연결했다.
+기본 helper·value·후보/semantic/continuation·native PALS·CPU_R·V coverage loop는
+legacy를 유지한다. report와 completed-iteration resume는 실제 선택한 engine의
+전체 조건을 대조한다. raw score를 새로운 reward나 WDL로 바꾸지 않는다.
+
+새 집중 fixture source는 Rust bridge 7개·CLI parser 1개·Python 7개다.
+root는 두 Rust 파일을 해당 crate edition 2024로 서식 정리했다.
+로컬 Cargo·Python import·fixture·모델·WSL·GPU 실행은 하지 않았다.
+이 consumer와 새 V feedback의 정확한 integration SHA를 기존 CPU CI에서 검사한다.

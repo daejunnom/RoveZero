@@ -17,8 +17,9 @@ use rz_contracts::pals::Move16;
 use rz_position::contracts::ContractPosition;
 use rz_position::{BoardMove, Color, PlayStatus, Position, PositionLimits};
 use rz_search::cpu::{
-    BOOTSTRAP_SCORE_VERSION, CPU_MATE_SCORE, CPU_SEARCH_VERSION, CpuCompletion, CpuConfig,
-    CpuEngine, CpuLimits, CpuProfile, CpuReport, CpuScoreScope, CpuSearcher,
+    BOOTSTRAP_SCORE_VERSION, CPU_MATE_SCORE, CPU_SEARCH_VERSION, CPU_SEE_SEARCH_VERSION,
+    CpuCompletion, CpuConfig, CpuEngine, CpuLimits, CpuOrderingPolicy, CpuProfile, CpuReport,
+    CpuScoreScope, CpuSearcher,
 };
 use rz_search::cpu_value::{CpuTrainingState, CpuValueIdentity};
 use serde::{Deserialize, Serialize};
@@ -31,12 +32,15 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 pub const CPU_TASK_SCHEMA: &str = "rz-pals-private-cpu-task/1";
+/// Explicit opt-in bridge. The frozen legacy task/conditions domains stay intact.
+pub const CPU_SEE_TASK_SCHEMA: &str = "rz-pals-private-cpu-task-legal-see/1";
 pub const MAX_REQUEST_BYTES: usize = 512 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const MAX_WALL_TIME_MS: u64 = 300_000;
 /// Only the executable itself is streamed by the example; no model is loaded.
 pub const MAX_SELF_BINARY_BYTES: u64 = 1024 * 1024 * 1024;
 const CONDITIONS_SCHEMA: &str = "rz-pals-private-cpu-conditions/1";
+const SEE_CONDITIONS_SCHEMA: &str = "rz-pals-private-cpu-conditions-legal-see/1";
 const BRANCH_DOMAIN: &str = "rz-pals-private-cpu-branch/1";
 const ROOT_ORDER_DOMAIN: &str = "rz-pals-private-cpu-root-order/1";
 
@@ -52,10 +56,30 @@ enum TaskKind {
     Defer,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum ExplicitOrdering {
+    #[serde(rename = "legal_see_v1")]
+    LegalSeeV1,
+}
+
+fn deserialize_ordering<'de, D>(deserializer: D) -> Result<Option<ExplicitOrdering>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Missing means legacy; explicit null/unknown policy is not an omission.
+    ExplicitOrdering::deserialize(deserializer).map(Some)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
     schema: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_ordering"
+    )]
+    ordering_policy: Option<ExplicitOrdering>,
     task: TaskKind,
     parent_input_sha256: String,
     position_command: String,
@@ -76,6 +100,43 @@ struct Request {
     cpu_profile_sha256: String,
     recheck_profile_sha256: String,
     context_sha256: String,
+}
+
+impl Request {
+    fn ordering(&self) -> CpuOrderingPolicy {
+        if self.ordering_policy.is_some() {
+            CpuOrderingPolicy::LegalSeeV1
+        } else {
+            CpuOrderingPolicy::LegacyMvvLvaV1
+        }
+    }
+    fn domain(&self) -> &'static str {
+        task_domain(self.ordering())
+    }
+}
+
+fn task_domain(ordering: CpuOrderingPolicy) -> &'static str {
+    match ordering {
+        CpuOrderingPolicy::LegacyMvvLvaV1 => CPU_TASK_SCHEMA,
+        CpuOrderingPolicy::LegalSeeV1 => CPU_SEE_TASK_SCHEMA,
+    }
+}
+
+fn search_version(ordering: CpuOrderingPolicy) -> &'static str {
+    match ordering {
+        CpuOrderingPolicy::LegacyMvvLvaV1 => CPU_SEARCH_VERSION,
+        CpuOrderingPolicy::LegalSeeV1 => CPU_SEE_SEARCH_VERSION,
+    }
+}
+
+fn require_ordering(request: &Request, selected: CpuOrderingPolicy) -> Result<(), CpuTaskError> {
+    if request.ordering() != selected || request.schema != task_domain(selected) {
+        return Err(CpuTaskError::new(
+            "ordering_admission",
+            "CLI selection, sealed ordering marker and task domain differ",
+        ));
+    }
+    Ok(())
 }
 
 /// Explicit failure; a CPU call which failed before a report has unknown work.
@@ -251,7 +312,7 @@ fn decode_request(bytes: &[u8]) -> Result<Request, CpuTaskError> {
     // numbers are unsigned integers, never bool/fractional/nonfinite substitutes.
     let request: Request =
         serde_json::from_slice(bytes).map_err(|e| CpuTaskError::new("json_admission", e))?;
-    if request.schema != CPU_TASK_SCHEMA
+    if request.schema != request.domain()
         || !(1..=63).contains(&request.baseline_depth)
         || request.requested_depth <= request.baseline_depth
         || request.requested_depth > 64
@@ -333,7 +394,18 @@ pub struct CpuTaskAdmission {
 }
 
 pub fn request_admission(bytes: &[u8], started: Instant) -> Result<CpuTaskAdmission, CpuTaskError> {
+    request_admission_with_ordering(bytes, started, CpuOrderingPolicy::LegacyMvvLvaV1)
+}
+
+/// Selected private CLI admission. The argument is a declaration; independent
+/// caller/source/loaded-image observations remain separate execution evidence.
+pub fn request_admission_with_ordering(
+    bytes: &[u8],
+    started: Instant,
+    selected: CpuOrderingPolicy,
+) -> Result<CpuTaskAdmission, CpuTaskError> {
     let request = decode_request(bytes)?;
+    require_ordering(&request, selected)?;
     let deadline = started
         .checked_add(Duration::from_millis(request.max_wall_time_ms))
         .ok_or_else(|| CpuTaskError::new("admission", "absolute deadline overflow"))?;
@@ -344,10 +416,14 @@ pub fn request_admission(bytes: &[u8], started: Instant) -> Result<CpuTaskAdmiss
 }
 
 fn profile(request: &Request, profile: CpuProfile) -> Value {
-    json!({"domain":CPU_TASK_SCHEMA,"search":CPU_SEARCH_VERSION,
+    let mut value = json!({"domain":request.domain(),"search":search_version(request.ordering()),
         "evaluator":BOOTSTRAP_SCORE_VERSION,"profile":profile.identity(),
         "tt_entries":request.tt_entries,"max_depth":request.requested_depth,
-        "quiescence_ply":request.quiescence_ply,"selective_reductions":false})
+        "quiescence_ply":request.quiescence_ply,"selective_reductions":false});
+    if request.ordering() == CpuOrderingPolicy::LegalSeeV1 {
+        value["ordering_policy"] = json!(CpuOrderingPolicy::LegalSeeV1.identity());
+    }
+    value
 }
 
 fn validate_pins(request: &Request, binary: &str) -> Result<(), CpuTaskError> {
@@ -370,7 +446,7 @@ fn validate_pins(request: &Request, binary: &str) -> Result<(), CpuTaskError> {
     raw.as_object_mut()
         .expect("Request is object")
         .remove("context_sha256");
-    if json_digest(&json!([CPU_TASK_SCHEMA, raw]))? != request.context_sha256 {
+    if json_digest(&json!([request.domain(), raw]))? != request.context_sha256 {
         return Err(CpuTaskError::new(
             "context_identity",
             "complete request context digest mismatch",
@@ -465,12 +541,15 @@ fn replay_checked(
 }
 
 fn configured(request: &Request, profile: CpuProfile) -> Result<CpuEngine, CpuTaskError> {
-    CpuEngine::new(CpuConfig {
-        profile,
-        tt_entries: request.tt_entries,
-        max_depth: request.requested_depth,
-        quiescence_ply: request.quiescence_ply,
-    })
+    CpuEngine::with_ordering(
+        CpuConfig {
+            profile,
+            tt_entries: request.tt_entries,
+            max_depth: request.requested_depth,
+            quiescence_ply: request.quiescence_ply,
+        },
+        request.ordering(),
+    )
     .map_err(|e| CpuTaskError::new("cpu_prepare", e))
 }
 
@@ -532,13 +611,17 @@ fn conditions(
     }
     let root_order = pack_moves(&root_order)?;
     Ok(Conditions {
-        schema: CONDITIONS_SCHEMA,
+        schema: if request.ordering() == CpuOrderingPolicy::LegalSeeV1 {
+            SEE_CONDITIONS_SCHEMA
+        } else {
+            CONDITIONS_SCHEMA
+        },
         rules_state_sha256: state_sha(position, owners)?,
         rules_history_sha256: history_sha(position)?,
         board_fen: position.to_fen(),
         profile_sha256: json_digest(&profile_value(request, cpu.config().profile))?,
         value_identity: cpu.value_identity().clone(),
-        search_version: CPU_SEARCH_VERSION,
+        search_version: cpu.search_identity(),
         search_conditions: cpu.search_conditions(),
         quiescence_ply: request.quiescence_ply,
         resource_policy: ResourcePolicy {
@@ -583,7 +666,8 @@ fn raw_report(
     } else {
         return Err(CpuTaskError::new("cpu_report", "unknown actual profile"));
     };
-    if report.search_version != CPU_SEARCH_VERSION
+    if report.search_version != search_version(request.ordering())
+        || conditions.search_version != report.search_version
         || report.profile != expected_profile
         || report.value_identity != conditions.value_identity
         || report.value_identity.semantics != BOOTSTRAP_SCORE_VERSION
@@ -726,7 +810,24 @@ pub fn dispatch_started(
     verified_own_binary_sha256: &str,
     started: Instant,
 ) -> Result<Vec<u8>, CpuTaskError> {
+    dispatch_started_with_ordering(
+        bytes,
+        verified_own_binary_sha256,
+        started,
+        CpuOrderingPolicy::LegacyMvvLvaV1,
+    )
+}
+
+/// Both the explicit caller choice and sealed domain/marker must agree. The
+/// original start instant covers stdin, binary hashing, CPU work and output.
+pub fn dispatch_started_with_ordering(
+    bytes: &[u8],
+    verified_own_binary_sha256: &str,
+    started: Instant,
+    selected: CpuOrderingPolicy,
+) -> Result<Vec<u8>, CpuTaskError> {
     let request = decode_request(bytes)?;
+    require_ordering(&request, selected)?;
     let cap = request.max_output_bytes;
     let result = execute(&request, verified_own_binary_sha256, started);
     result.map_err(|mut error| {
@@ -783,7 +884,7 @@ fn execute(
         ));
     }
     let mut response = Response {
-        schema: CPU_TASK_SCHEMA,
+        schema: request.domain(),
         task: request.task,
         context_sha256: request.context_sha256.clone(),
         cpu_binary_sha256: verified_binary.to_owned(),
@@ -1001,15 +1102,24 @@ fn finish(
 /// Capabilities describe actual implementation limits, with conditional tasks
 /// stated separately; they are not claims that a request completed a CPU check.
 pub fn capabilities() -> Result<Vec<u8>, CpuTaskError> {
-    let cpu = CpuEngine::new(CpuConfig {
-        profile: CpuProfile::PlanAssisted,
-        tt_entries: 0,
-        max_depth: 64,
-        quiescence_ply: 32,
-    })
+    capabilities_with_ordering(CpuOrderingPolicy::LegacyMvvLvaV1)
+}
+
+/// Selected CPU_T implementation metadata, not a completed check or support
+/// declaration for native PALS/CPU_R launch, candidate or continuation modes.
+pub fn capabilities_with_ordering(ordering: CpuOrderingPolicy) -> Result<Vec<u8>, CpuTaskError> {
+    let cpu = CpuEngine::with_ordering(
+        CpuConfig {
+            profile: CpuProfile::PlanAssisted,
+            tt_entries: 0,
+            max_depth: 64,
+            quiescence_ply: 32,
+        },
+        ordering,
+    )
     .map_err(|e| CpuTaskError::new("capabilities", e))?;
     let cap = cpu.capabilities();
-    let value = json!({"schema":CPU_TASK_SCHEMA,"training_private_only":true,"product_verifier_enabled":false,
+    let mut value = json!({"schema":task_domain(ordering),"training_private_only":true,"product_verifier_enabled":false,
         "actual_training_executed":false,"backward_executed":false,"optimizer_created":false,
         "external_teacher_used":false,"gpu_used":false,"cpu_search":cpu.search_identity(),
         "value_identity":cpu.value_identity(),"profile":cpu.config().profile.identity(),
@@ -1022,6 +1132,9 @@ pub fn capabilities() -> Result<Vec<u8>, CpuTaskError> {
             "lower_selectivity":"unavailable_reductions_already_disabled",
             "resume_task":"conditional_owned_completed_iteration_token",
             "cross_profile_recheck":"fresh_own_independent_profile","defer":"no_cpu_check"}});
+    if ordering == CpuOrderingPolicy::LegalSeeV1 {
+        value["ordering_policy"] = json!("legal_see_v1");
+    }
     let mut bytes = canonical(&value)?;
     bytes.push(b'\n');
     Ok(bytes)
@@ -1037,6 +1150,7 @@ mod tests {
         let owners = OwnerRegistry::default();
         let mut r = Request {
             schema: CPU_TASK_SCHEMA.into(),
+            ordering_policy: None,
             task,
             parent_input_sha256: "b".repeat(64),
             position_command: "position startpos".into(),
@@ -1071,10 +1185,220 @@ mod tests {
         .unwrap();
         let mut v = serde_json::to_value(&*r).unwrap();
         v.as_object_mut().unwrap().remove("context_sha256");
-        r.context_sha256 = json_digest(&json!([CPU_TASK_SCHEMA, v])).unwrap();
+        r.context_sha256 = json_digest(&json!([r.domain(), v])).unwrap();
     }
     fn run(r: &Request) -> Value {
         serde_json::from_slice(&dispatch(&serde_json::to_vec(r).unwrap(), BINARY).unwrap()).unwrap()
+    }
+
+    fn see_request(task: TaskKind) -> Request {
+        let mut request = request(task);
+        request.schema = CPU_SEE_TASK_SCHEMA.into();
+        request.ordering_policy = Some(ExplicitOrdering::LegalSeeV1);
+        seal(&mut request);
+        request
+    }
+
+    #[test]
+    fn ordering_marker_omission_preserves_legacy_wire_and_profile() {
+        let request = request(TaskKind::Defer);
+        let wire = serde_json::to_value(&request).unwrap();
+        assert!(wire.get("ordering_policy").is_none());
+        assert_eq!(
+            profile(&request, CpuProfile::PlanAssisted),
+            json!({
+                "domain":CPU_TASK_SCHEMA,"search":CPU_SEARCH_VERSION,
+                "evaluator":BOOTSTRAP_SCORE_VERSION,"profile":"cpu-plan-assisted-conservative-v1",
+                "tt_entries":64,"max_depth":2,"quiescence_ply":8,"selective_reductions":false
+            })
+        );
+        let cap: Value = serde_json::from_slice(&capabilities().unwrap()).unwrap();
+        assert_eq!(cap["schema"], CPU_TASK_SCHEMA);
+        assert_eq!(cap["cpu_search"], CPU_SEARCH_VERSION);
+        assert!(cap.get("ordering_policy").is_none());
+        let answer = run(&request);
+        assert_eq!(answer["schema"], CPU_TASK_SCHEMA);
+        assert_eq!(answer["nodes"], 0);
+    }
+
+    #[test]
+    fn explicit_see_selection_requires_matching_domain_marker_and_cli() {
+        let request = see_request(TaskKind::Defer);
+        let wire = serde_json::to_vec(&request).unwrap();
+        assert!(request_admission(&wire, Instant::now()).is_err());
+        assert!(dispatch(&wire, BINARY).is_err());
+        let answer: Value = serde_json::from_slice(
+            &dispatch_started_with_ordering(
+                &wire,
+                BINARY,
+                Instant::now(),
+                CpuOrderingPolicy::LegalSeeV1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(answer["schema"], CPU_SEE_TASK_SCHEMA);
+        assert_eq!(answer["status"], "deferred");
+        assert_eq!(answer["nodes"], 0);
+        assert!(answer["baseline"].is_null());
+        assert!(answer["after"].is_null());
+        let legacy = serde_json::to_vec(&self::request(TaskKind::Defer)).unwrap();
+        assert!(
+            request_admission_with_ordering(&legacy, Instant::now(), CpuOrderingPolicy::LegalSeeV1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ordering_null_unknown_and_cross_domain_markers_fail_before_search() {
+        let legacy = serde_json::to_value(request(TaskKind::Defer)).unwrap();
+        for marker in [
+            Value::Null,
+            json!("unknown"),
+            json!(false),
+            json!("legal_see_v1"),
+        ] {
+            let mut changed = legacy.clone();
+            changed["ordering_policy"] = marker;
+            assert!(decode_request(&serde_json::to_vec(&changed).unwrap()).is_err());
+        }
+        let mut missing = serde_json::to_value(see_request(TaskKind::Defer)).unwrap();
+        missing.as_object_mut().unwrap().remove("ordering_policy");
+        assert!(decode_request(&serde_json::to_vec(&missing).unwrap()).is_err());
+    }
+
+    #[test]
+    fn see_profile_conditions_and_reports_use_actual_selected_engine() {
+        let request = see_request(TaskKind::ResumeTask);
+        let description = profile(&request, CpuProfile::PlanAssisted);
+        assert_eq!(description["domain"], CPU_SEE_TASK_SCHEMA);
+        assert_eq!(description["search"], CPU_SEE_SEARCH_VERSION);
+        assert_eq!(
+            description["ordering_policy"],
+            CpuOrderingPolicy::LegalSeeV1.identity()
+        );
+        assert_eq!(description["evaluator"], BOOTSTRAP_SCORE_VERSION);
+        let selected = configured(&request, CpuProfile::PlanAssisted).unwrap();
+        assert_eq!(selected.ordering_policy(), CpuOrderingPolicy::LegalSeeV1);
+        assert_eq!(
+            selected.value_identity().training,
+            CpuTrainingState::Bootstrap
+        );
+        let answer: Value = serde_json::from_slice(
+            &dispatch_started_with_ordering(
+                &serde_json::to_vec(&request).unwrap(),
+                BINARY,
+                Instant::now(),
+                CpuOrderingPolicy::LegalSeeV1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let baseline = &answer["baseline"];
+        assert_eq!(baseline["conditions"]["schema"], SEE_CONDITIONS_SCHEMA);
+        assert_eq!(
+            baseline["conditions"]["search_version"],
+            CPU_SEE_SEARCH_VERSION
+        );
+        assert_eq!(
+            baseline["conditions"]["search_conditions"],
+            selected.search_conditions()
+        );
+        assert_eq!(baseline["score_provenance"], BOOTSTRAP_SCORE_VERSION);
+        if !answer["after"].is_null() {
+            assert_eq!(
+                answer["after"]["conditions_sha256"],
+                baseline["conditions_sha256"]
+            );
+            assert_eq!(answer["resume_kind"], "completed_iteration");
+        }
+        assert_eq!(answer["product_verifier_enabled"], false);
+    }
+
+    #[test]
+    fn see_pins_cannot_use_legacy_context_or_profile_and_capabilities_are_separate() {
+        let mut request = see_request(TaskKind::Defer);
+        let original = request.context_sha256.clone();
+        let mut raw = serde_json::to_value(&request).unwrap();
+        raw.as_object_mut().unwrap().remove("context_sha256");
+        request.context_sha256 = json_digest(&json!([CPU_TASK_SCHEMA, raw])).unwrap();
+        assert_eq!(
+            validate_pins(&request, BINARY).unwrap_err().stage,
+            "context_identity"
+        );
+        request.context_sha256 = original;
+        request.cpu_profile_sha256 = self::request(TaskKind::Defer).cpu_profile_sha256;
+        let mut raw = serde_json::to_value(&request).unwrap();
+        raw.as_object_mut().unwrap().remove("context_sha256");
+        request.context_sha256 = json_digest(&json!([CPU_SEE_TASK_SCHEMA, raw])).unwrap();
+        assert_eq!(
+            validate_pins(&request, BINARY).unwrap_err().stage,
+            "profile_identity"
+        );
+        let cap: Value = serde_json::from_slice(
+            &capabilities_with_ordering(CpuOrderingPolicy::LegalSeeV1).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cap["schema"], CPU_SEE_TASK_SCHEMA);
+        assert_eq!(cap["cpu_search"], CPU_SEE_SEARCH_VERSION);
+        assert_eq!(cap["ordering_policy"], "legal_see_v1");
+        assert_eq!(cap["value_identity"]["semantics"], BOOTSTRAP_SCORE_VERSION);
+    }
+
+    #[test]
+    fn selected_see_admission_keeps_original_absolute_deadline() {
+        let mut request = see_request(TaskKind::Defer);
+        request.max_wall_time_ms = 1;
+        seal(&mut request);
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let started = Instant::now() - Duration::from_secs(1);
+        let admission =
+            request_admission_with_ordering(&bytes, started, CpuOrderingPolicy::LegalSeeV1)
+                .unwrap();
+        assert_eq!(admission.deadline, started + Duration::from_millis(1));
+        let error =
+            dispatch_started_with_ordering(&bytes, BINARY, started, CpuOrderingPolicy::LegalSeeV1)
+                .unwrap_err();
+        assert_eq!(error.stage, "receipt_deadline");
+        assert!(error.deadline_exceeded);
+        assert_eq!(error.known_nodes, Some(0));
+    }
+
+    #[test]
+    fn see_cross_profile_keeps_ordering_but_uses_fresh_independent_namespace() {
+        let request = see_request(TaskKind::CrossProfileRecheck);
+        let answer: Value = serde_json::from_slice(
+            &dispatch_started_with_ordering(
+                &serde_json::to_vec(&request).unwrap(),
+                BINARY,
+                Instant::now(),
+                CpuOrderingPolicy::LegalSeeV1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(answer["status"], "observed");
+        assert!(answer["resume_kind"].is_null());
+        for key in ["baseline", "after"] {
+            assert_eq!(
+                answer[key]["conditions"]["search_version"],
+                CPU_SEE_SEARCH_VERSION
+            );
+            assert_eq!(answer[key]["reused_completed_depth"], 0);
+            assert_eq!(answer[key]["score_provenance"], BOOTSTRAP_SCORE_VERSION);
+        }
+        assert_eq!(
+            answer["baseline"]["profile_sha256"],
+            request.cpu_profile_sha256
+        );
+        assert_eq!(
+            answer["after"]["profile_sha256"],
+            request.recheck_profile_sha256
+        );
+        assert_ne!(
+            answer["baseline"]["conditions_sha256"],
+            answer["after"]["conditions_sha256"]
+        );
     }
 
     #[test]

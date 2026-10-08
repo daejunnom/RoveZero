@@ -133,3 +133,21 @@ lock 경합·poison·overflow는 진단 부재로 표시하며 실행 결과나 
 Colab의 학습 실행과 비용 등록은 별도 후속 실행이다. 원시 데이터·모델·PGN·로그·
 보고서는 기존 저장소 관리 규약에 따라 저장소 밖에 두고, 이번 변경에는 소스와
 검토 가능한 작은 독립 검사만 포함한다.
+
+### 전체 원문과 최소 pilot의 구분
+
+P6의 양성 자체 CPU pair만으로 두 원문의 전체 구현 완료를 선언하지 않는다.
+현재 선택된 실행 흐름의 잔여와 원문의 선택적 후보를 다음처럼 구별한다.
+
+| 항목 | 구현·인수 경계 |
+|---|---|
+| CPU_T SEE 정렬 | Rules-legal material exchange를 ordering에만 쓰는 `LegalSeeV1` Rust API와 CPU CI를 제공한다. legacy 기본값과 식별은 유지하며, private CPU_T 소비자의 명시적 선택 연결은 별도 인수한다. |
+| V 결과 환류 | 실제 CPU 결과의 같은 범위 완료 정보를 다음 immutable private 입력에 전달하는 bounded coverage loop를 준비한다. coverage 증가는 전략적 유용성이나 학습 target의 증거가 아니다. branch/profile/budget의 선택·유용성 비교 범위도 별도로 기록한다. |
+| GPU record 공유 메모리 | host record page와 CUDA whole-input bank를 record별 GPU 증분 공유로 표시하지 않는다. missing subset 인코딩·실제 device join·불변 read view·물리 pin·한도·격리 접점이 구현돼야 한다. GPU 검증 보류와 소스 미구현은 다른 상태다. |
+| Repair 이후 C 재검토 | 원래 첫 수와 수정 line/revision을 유지한 targeted C 재공격의 직접 호출·소비를 확인한다. 다음 round의 새 root Propose만으로 이 연결을 인수하지 않는다. 전략적 강도 향상은 별도 관측 사항이다. |
+| 실제 CPU pair | 해당 integration source/binary와 시계·NN 소비·typed failed-go 0·Rules·PGN·process·저장·cleanup을 모두 인수한다. preparation 자기 보고나 CPU CI로 대체하지 않는다. |
+| 선택적 후속 기능 | CUDA private Warm, paused search stack, set-associative TT, fast pruning과 대체 optimizer는 원문의 후보·미결정 범위를 보존한다. 기본 Fresh 구현의 필수 통과 조건으로 임의 확대하지 않는다. |
+
+실제 학습은 이번 목표에서 제외한다. 사용자 지시로 GPU 검증도 현재 보류한다.
+보류된 실행을 성공 또는 skip 인수로 채우지 않으며, 전체 구현·CPU CI·실신경망·
+실제 대국·GPU 인수와 미지원 옵션을 각각 기록한다.

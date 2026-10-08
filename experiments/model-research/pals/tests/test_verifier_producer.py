@@ -69,6 +69,31 @@ def response(req):
             "product_verifier_enabled": False, "deadline_exceeded": False}
 
 
+def see_request(task="resume_task"):
+    value = request(task)
+    value.update(schema=producer.SEE_CPU_SCHEMA, ordering_policy=producer.SEE_ORDERING)
+    for key, profile in (("cpu_profile_sha256", producer.PROFILE), ("recheck_profile_sha256", producer.RECHECK_PROFILE)):
+        value[key] = producer.profile_sha256(producer.cpu_profile_with_ordering(
+            16, 2, 8, profile, ordering_policy=producer.SEE_ORDERING))
+    value["branch_sha256"] = producer._hash("rz-pals-private-cpu-branch/1",
+        {"parent_input_sha256": value["parent_input_sha256"], "prefix": [], "root_moves": []})
+    value.pop("context_sha256")
+    value["context_sha256"] = producer._hash(producer.SEE_CPU_SCHEMA, value)
+    return value
+
+
+def see_response(req):
+    value = response(req)
+    for key in ("baseline", "after"):
+        conditions = value[key]["conditions"]
+        profile = producer.RECHECK_PROFILE if key == "after" and req["task"] == "cross_profile_recheck" else producer.PROFILE
+        conditions.update(schema=producer.SEE_CONDITIONS_SCHEMA, search_version=producer.SEE_CPU_SEARCH,
+                          search_conditions=producer.cpu_conditions_with_ordering(16, 2, 8, profile,
+                                                   ordering_policy=producer.SEE_ORDERING))
+        value[key]["conditions_sha256"] = hashlib.sha256(producer._json(conditions)).hexdigest()
+    return value
+
+
 def parent():
     snapshot = {"game_id": "numeric-fixture-game", "opening_id": "numeric-fixture-opening",
                 "line_genealogy_id": "numeric-fixture-line", "position_command": "position fen " + FEN,
@@ -112,6 +137,102 @@ class VerifierProducerTests(unittest.TestCase):
         self.step_guard = patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer updates forbidden"))
         self.step_guard.start()
         self.addCleanup(self.step_guard.stop)
+
+    def test_see_helpers_preserve_legacy_profile_bytes_and_value_semantics(self):
+        legacy = producer.cpu_profile(16, 2, 8)
+        self.assertEqual(producer._json(legacy), producer._json(producer.cpu_profile_with_ordering(16, 2, 8)))
+        self.assertEqual(legacy, {"domain": producer.CPU_SCHEMA, "search": producer.CPU_SEARCH,
+            "evaluator": producer.CPU_VALUE, "profile": producer.PROFILE, "tt_entries": 16,
+            "max_depth": 2, "quiescence_ply": 8, "selective_reductions": False})
+        selected = producer.cpu_profile_with_ordering(16, 2, 8, ordering_policy=producer.SEE_ORDERING)
+        self.assertNotEqual(producer.profile_sha256(legacy), producer.profile_sha256(selected))
+        self.assertEqual(selected["domain"], producer.SEE_CPU_SCHEMA)
+        self.assertEqual(selected["ordering_policy"], producer.SEE_ORDERING_IDENTITY)
+        self.assertEqual(selected["evaluator"], legacy["evaluator"])
+        self.assertNotIn("ordering_policy", request())
+        self.assertEqual(producer.cpu_bridge_arguments("/owned/cpu", request()), ["/owned/cpu"])
+
+    def test_see_bridge_literal_argv_requires_sealed_matching_request_before_spawn(self):
+        selected = see_request()
+        self.assertEqual(producer.cpu_bridge_arguments("/owned/cpu", selected, ordering_policy=producer.SEE_ORDERING),
+                         ["/owned/cpu", "--cpu-ordering=legal-see-v1"])
+        limits = producer.Limits(max_games=1, max_steps=1, max_nodes=1000, max_wall_time_ms=10000,
+                                 max_output_bytes=65536, max_forward_flops=1000)
+        with patch.object(producer.subprocess, "Popen", side_effect=AssertionError("must not spawn")) as popen:
+            with self.assertRaises(producer.CpuBridgeFailure):
+                producer.run_cpu_bridge("/owned/cpu", selected, limits)
+            with self.assertRaises(producer.CpuBridgeFailure):
+                producer.run_cpu_bridge("/owned/cpu", request(), limits, ordering_policy=producer.SEE_ORDERING)
+            popen.assert_not_called()
+        for key, changed in (("ordering_policy", None), ("ordering_policy", "unknown"),
+                             ("context_sha256", SHA), ("cpu_profile_sha256", request()["cpu_profile_sha256"]),
+                             ("schema", producer.CPU_SCHEMA)):
+            bad = dict(selected, **{key: changed})
+            with self.assertRaises(ValueError):
+                producer.cpu_bridge_arguments("/owned/cpu", bad, ordering_policy=producer.SEE_ORDERING)
+
+    def test_see_progress_keeps_raw_evidence_and_masks_comparative_targets(self):
+        req, actual = see_request(), see_response(see_request())
+        producer.report_with_ordering(actual["baseline"], req, req["cpu_profile_sha256"], ordering_policy=producer.SEE_ORDERING)
+        gain = producer.observed_gain_with_ordering(req, actual, ordering_policy=producer.SEE_ORDERING)
+        self.assertEqual(gain["new_completed_depth"], 1)
+        self.assertFalse(gain["comparative_preference_available"])
+        self.assertIsNone(gain["preference_rank"])
+        self.assertFalse(gain["wdl_inferred"])
+        self.assertEqual(actual["baseline"]["raw_score"], 30000)
+        with self.assertRaises(ValueError):
+            producer._report(actual["baseline"], req, req["cpu_profile_sha256"])
+        with self.assertRaises(ValueError):
+            producer.observed_gain(req, actual)
+        snapshot = parent()[0]["input"]["snapshot"]
+        context = TaskContext(req["branch_sha256"], req["cpu_profile_sha256"], 0)
+        label = producer.future_label(snapshot, context, req["task"], req, actual, SHA)
+        self.assertIsNone(label["policy"])
+        self.assertIsNone(label["value_wdl"])
+        self.assertTrue(all(t["preference_rank"] is None for t in label["verifier_tasks"]))
+
+    def test_see_full_conditions_resealed_mismatch_is_rejected(self):
+        req, actual = see_request(), see_response(see_request())
+        changes = (("schema", "rz-pals-private-cpu-conditions/1"),
+                   ("search_version", producer.CPU_SEARCH),
+                   ("search_conditions", actual["baseline"]["conditions"]["search_conditions"].replace("search+qsearch+exchange", "search+qsearch")),
+                   ("value_identity", {"semantics": "other", "weights_sha256": None, "training": {"kind": "bootstrap"}}))
+        for field, value in changes:
+            bad = copy.deepcopy(actual["baseline"])
+            bad["conditions"][field] = value
+            bad["conditions_sha256"] = hashlib.sha256(producer._json(bad["conditions"])).hexdigest()
+            with self.assertRaises(ValueError):
+                producer.report_with_ordering(bad, req, req["cpu_profile_sha256"], ordering_policy=producer.SEE_ORDERING)
+        bad = copy.deepcopy(actual["baseline"])
+        bad["nodes"] = 101
+        with self.assertRaises(ValueError):
+            producer.report_with_ordering(bad, req, req["cpu_profile_sha256"], ordering_policy=producer.SEE_ORDERING)
+
+    def test_see_partial_and_canceled_reports_do_not_invent_completion_or_rank(self):
+        req, actual = see_request(), see_response(see_request())
+        for completion in ("node_limit", "deadline", "canceled", "quiescence_limit"):
+            partial = copy.deepcopy(actual)
+            partial["after"].update(completion=completion, completed_depth=1)
+            gain = producer.observed_gain_with_ordering(req, partial, ordering_policy=producer.SEE_ORDERING)
+            self.assertFalse(gain["actual_question_complete"])
+            self.assertEqual(gain["new_completed_depth"], 0)
+            self.assertIsNone(gain["preference_rank"])
+        deferred_req = see_request("defer")
+        deferred = dict(see_response(deferred_req), status="deferred", baseline=None, after=None, nodes=0, resume_kind=None)
+        gain = producer.observed_gain_with_ordering(deferred_req, deferred, ordering_policy=producer.SEE_ORDERING)
+        self.assertEqual(gain["status"], "deferred")
+        self.assertFalse(gain["baseline_observed"])
+
+    def test_see_cross_profile_is_fresh_observation_with_same_ordering(self):
+        req = see_request("cross_profile_recheck")
+        actual = see_response(req)
+        gain = producer.observed_gain_with_ordering(req, actual, ordering_policy=producer.SEE_ORDERING)
+        self.assertTrue(gain["new_completed_profile_observation"])
+        self.assertFalse(gain["same_conditions"])
+        self.assertEqual(gain["new_completed_depth"], 0)
+        self.assertIsNone(gain["preference_rank"])
+        self.assertEqual(actual["after"]["reused_completed_depth"], 0)
+        self.assertEqual(actual["after"]["conditions"]["search_version"], producer.SEE_CPU_SEARCH)
 
     def test_declared_query_uses_pre_result_controls_only(self):
         row, _ = parent()
@@ -396,6 +517,72 @@ class VerifierProducerTests(unittest.TestCase):
                     self.assertEqual(primary.producer_failure["counts"], {"cpu_dispatches": 1})
                     self.assertFalse(primary.producer_failure["complete"])
                     self.assertEqual((bank.root / "failed-cpu-stdout.bin").read_bytes(), raw)
+
+    def test_see_bank_reload_requires_independent_selected_policy_and_preserves_mask(self):
+        original, native = parent()
+        parents = ValidatedDataset([original], {"games": {"numeric-fixture-game": "train"}},
+                                   {"cpu_binary_sha256": [SHA], "input_sources": [original["input"]["snapshot"]["source"]]},
+                                   {native.input_sha256: native})
+        req = see_request()
+        req["parent_input_sha256"] = native.input_sha256
+        req["branch_sha256"] = producer._hash("rz-pals-private-cpu-branch/1",
+                                {"parent_input_sha256": native.input_sha256, "prefix": [], "root_moves": []})
+        req.pop("context_sha256")
+        req["context_sha256"] = producer._hash(producer.SEE_CPU_SCHEMA, req)
+        context = TaskContext(req["branch_sha256"], req["cpu_profile_sha256"], 0)
+        source = {"kind": "own_pals", "model_configuration_sha256": "b" * 64, "model_weights_sha256": "c" * 64}
+        declaration = {"schema": producer.QUERY_SCHEMA, "model_configuration_sha256": "b" * 64,
+                       "private_encoder_source_sha256": "d" * 64, "cpu_ordering_policy": producer.SEE_ORDERING_IDENTITY}
+        schema_sha = producer._hash(producer.QUERY_SCHEMA, declaration)
+        mask, _ = producer.eligible_tasks(("resume_task",), {"prefix": [], "root_moves": []}, MOVES)
+        query = producer.private_query(mask, original["input"]["snapshot"], baseline_depth=1, requested_depth=2,
+                                       max_nodes_per_check=100, max_wall_time_ms=1000, budget_bucket=0)
+        derivation = {"encoding_schema_sha256": schema_sha, "parent_input_sha256": native.input_sha256,
+                      "context": producer.asdict(context), "prefix": [], "root_moves": [],
+                      "allowed_tasks": ["resume_task"], "eligible_tasks": mask, "query": list(query),
+                      "baseline_depth": 1, "requested_depth": 2, "max_nodes_per_check": 100,
+                      "max_task_wall_time_ms": 1000}
+        row, encoding = producer.verifier_input(original, native, source, context, query,
+                                                producer._hash(producer.QUERY_SCHEMA, derivation), 1)
+        actual = see_response(req)
+        evidence = {"input_sha256": row["input"]["sha256"], "context": producer.asdict(context), "request": req,
+                    "response": actual, "observed_information": producer.observed_gain_with_ordering(req, actual, ordering_policy=producer.SEE_ORDERING)}
+        evidence_sha = producer._hash(producer.GAIN_SCHEMA, evidence)
+        row["future_label"] = producer.future_label(row["input"]["snapshot"], context, "resume_task", req, actual, evidence_sha)
+        row["verifier_private"] = {"task_kind": "resume_task", "control_sha256": req["context_sha256"], "private_latent": [0.25]}
+        with tempfile.TemporaryDirectory() as temporary:
+            limits = producer.Limits(max_games=1, max_steps=1, max_nodes=1000, max_wall_time_ms=10000,
+                                     max_output_bytes=65536, max_forward_flops=1000)
+            bank = producer.PrivateBank(Path(temporary) / "see-reload", limits)
+            bank.append("inputs.jsonl", {"parent_input_sha256": native.input_sha256, "input": row["input"],
+                                          "context": producer.asdict(context), "split": "train"})
+            bank.append("encodings.jsonl", producer._encoded_json(encoding, native.input_sha256, context, derivation))
+            bank.append("decisions.jsonl", {"input_sha256": row["input"]["sha256"], "request": req,
+                                            "task": "resume_task", "verifier_private": row["verifier_private"]})
+            bank.append("cpu-evidence.jsonl", {"evidence_sha256": evidence_sha, **evidence})
+            bank.append("future-labels.jsonl", {"input_sha256": row["input"]["sha256"], "future_label": row["future_label"],
+                                               "observed_information_evidence_sha256": evidence_sha})
+            bank.append("private-records.jsonl", {"record": row, "evidence_sha256": evidence_sha})
+            receipt = bank.finish({"complete": True, "failure": None, "status": "checks_passed_before_receipt_write",
+                                   "counts": {"selections": 1}, "native_verifier_encoded": False, "trained": False,
+                                   "cpu_ordering_policy": producer.SEE_ORDERING, "checkpoint_sha256": "c" * 64,
+                                   "no_comparative_training_target": True, "query_encoding": declaration,
+                                   "encoding_schema_sha256": schema_sha,
+                                   "source_registry": {"cpu_binary_sha256": [SHA], "input_sources": [source]}})
+            args = {"expected_receipt_sha256": receipt["receipt_sha256"], "parents": parents,
+                    "expected_checkpoint_sha256": "c" * 64, "expected_cpu_binary_sha256": SHA,
+                    "expected_private_encoder_source_sha256": "d" * 64}
+            with self.assertRaises(ValueError):
+                producer.load_private_verifier_bank(bank.root, **args)
+            loaded = producer.load_private_verifier_bank(bank.root, **args, ordering_policy=producer.SEE_ORDERING)
+            self.assertEqual(len(loaded.records), 1)
+            self.assertFalse(loaded.collate([0], "verifier", task_contexts=[context]).task_mask.any())
+            self.assertIsNone(loaded.records[0]["future_label"]["policy"])
+            self.assertIsNone(loaded.records[0]["future_label"]["value_wdl"])
+            with (bank.root / "cpu-evidence.jsonl").open("ab") as stream:
+                stream.write(b"\n")
+            with self.assertRaises(ValueError):
+                producer.load_private_verifier_bank(bank.root, **args, ordering_policy=producer.SEE_ORDERING)
 
     def test_private_bank_reload_checks_query_context_native_parent_and_future_label(self):
         original, native = parent()

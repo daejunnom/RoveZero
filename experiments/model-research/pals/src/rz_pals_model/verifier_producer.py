@@ -42,6 +42,17 @@ PROFILE = "cpu-plan-assisted-conservative-v1"
 RECHECK_PROFILE = "cpu-independent-conservative-v1"
 CPU_SEARCH = "rz-cpu-pvs/0.1"
 CPU_VALUE = "bootstrap-material-pst-v1"
+LEGACY_ORDERING = "legacy_mvv_lva_v1"
+SEE_ORDERING = "legal_see_v1"
+SEE_ORDERING_IDENTITY = "cpu-ordering-rules-legal-target-exchange-v1"
+SEE_CPU_SCHEMA = "rz-pals-private-cpu-task-legal-see/1"
+SEE_CONDITIONS_SCHEMA = "rz-pals-private-cpu-conditions-legal-see/1"
+SEE_CPU_SEARCH = "rz-cpu-pvs-legal-see/0.1"
+SEE_CLI_ARGUMENT = "--cpu-ordering=legal-see-v1"
+SEE_CONDITIONS_SUFFIX = (";ordering=" + SEE_ORDERING_IDENTITY +
+    ";exchange:all-Rules-legal-recaptures-on-target,optional-stop-zero,material-only,P100-N320-B330-R500-Q900-K0,no-pruning,max-plies32,max-positions-per-order4096,typed-fail-on-exhaustion"
+    ";ordering-priority:TT,nonnegative-exchange,quiet-history,negative-exchange"
+    ";node-work:search+qsearch+exchange;exchange-cancel-deadline:original")
 # Current generated gain scalars, seven-task/provenance label, and masked loss
 # fields have separate finite allowances; append rechecks every sealed bound.
 CPU_GAIN_OUTPUT_RESERVE = 4096
@@ -129,6 +140,56 @@ def cpu_profile(tt_entries, requested_depth, quiescence_ply, profile=PROFILE):
 
 def profile_sha256(configuration):
     return hashlib.sha256(_json(configuration)).hexdigest()
+
+
+def _ordering_policy(value):
+    if type(value) is not str or value not in (LEGACY_ORDERING, SEE_ORDERING):
+        raise ValueError("unsupported explicit CPU ordering policy")
+    return value
+
+
+def cpu_profile_with_ordering(tt_entries, requested_depth, quiescence_ply, profile=PROFILE,
+                              *, ordering_policy=LEGACY_ORDERING):
+    """Opt-in S namespace; unchanged value semantics and legacy declaration."""
+    selected = _ordering_policy(ordering_policy)
+    value = cpu_profile(tt_entries, requested_depth, quiescence_ply, profile)
+    if selected == SEE_ORDERING:
+        value.update(domain=SEE_CPU_SCHEMA, search=SEE_CPU_SEARCH,
+                     ordering_policy=SEE_ORDERING_IDENTITY)
+    return value
+
+
+def cpu_conditions_with_ordering(tt_entries, requested_depth, quiescence_ply, profile=PROFILE,
+                                 *, ordering_policy=LEGACY_ORDERING):
+    selected = _ordering_policy(ordering_policy)
+    legacy = CPU_CONDITIONS + f";profile={profile};max_depth={requested_depth};q_plies={quiescence_ply};tt_entries={tt_entries}"
+    return legacy + SEE_CONDITIONS_SUFFIX if selected == SEE_ORDERING else legacy
+
+
+def _cpu_request_domain(request, ordering_policy):
+    selected = _ordering_policy(ordering_policy)
+    if selected == LEGACY_ORDERING:
+        if request.get("schema") != CPU_SCHEMA or "ordering_policy" in request:
+            raise ValueError("legacy CPU task requires original domain and omitted ordering marker")
+        return CPU_SCHEMA
+    if request.get("schema") != SEE_CPU_SCHEMA or request.get("ordering_policy") != SEE_ORDERING:
+        raise ValueError("selected CPU CLI policy, task domain and sealed ordering marker differ")
+    for key, profile in (("cpu_profile_sha256", PROFILE), ("recheck_profile_sha256", RECHECK_PROFILE)):
+        expected = cpu_profile_with_ordering(request["tt_entries"], request["requested_depth"],
+                    request["quiescence_ply"], profile, ordering_policy=selected)
+        if request[key] != profile_sha256(expected):
+            raise ValueError("selected CPU profile digest differs from fixed SEE declaration")
+    raw = dict(request)
+    context = raw.pop("context_sha256")
+    if context != _hash(SEE_CPU_SCHEMA, raw):
+        raise ValueError("selected CPU request context is not sealed in SEE domain")
+    return SEE_CPU_SCHEMA
+
+
+def cpu_bridge_arguments(binary, request, *, ordering_policy=LEGACY_ORDERING):
+    """Literal argv policy agrees with the sealed request; no auto-detection."""
+    _cpu_request_domain(request, ordering_policy)
+    return [str(binary), SEE_CLI_ARGUMENT] if ordering_policy == SEE_ORDERING else [str(binary)]
 
 
 def eligible_tasks(allowed, control, legal_moves=None, *, require_available=True):
@@ -365,16 +426,18 @@ class CpuBridgeFailure(RuntimeError):
                         "stderr_sha256": hashlib.sha256(self.capture["stderr"]).hexdigest()}
 
 
-def run_cpu_bridge(binary, request, limits, *, capture=None, pipe_reservation=None):
+def run_cpu_bridge(binary, request, limits, *, capture=None, pipe_reservation=None,
+                   ordering_policy=LEGACY_ORDERING):
     capture = {} if capture is None else capture
     try:
-        return _run_cpu_bridge(binary, request, limits, capture, pipe_reservation)
+        return _run_cpu_bridge(binary, request, limits, capture, pipe_reservation, ordering_policy=ordering_policy)
     except BaseException as error:
         raise CpuBridgeFailure(error, capture) from error
 
 
-def _run_cpu_bridge(binary, request, limits, capture, pipe_reservation=None):
+def _run_cpu_bridge(binary, request, limits, capture, pipe_reservation=None, *, ordering_policy=LEGACY_ORDERING):
     """One own no-child Rust worker; capped pipes, timeout/cancel kill and reap."""
+    arguments = cpu_bridge_arguments(binary, request, ordering_policy=ordering_policy)
     raw = _json(request) + b"\n"
     if len(raw) > 512 * 1024:
         raise ValueError("CPU_T request exceeds finite stdin admission")
@@ -392,7 +455,7 @@ def _run_cpu_bridge(binary, request, limits, capture, pipe_reservation=None):
         raise ValueError("CPU_T pipe reservation differs from registered bound")
     started = time.monotonic()
     try:
-        proc = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, shell=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except BaseException:
         pipe_reservation.release()  # A rejected spawn produced no pipe bytes.
@@ -531,6 +594,29 @@ def _record_producer_failure(bank, error, *, counts, checkpoint_sha256, cpu_bina
 
 
 def _report(value, request, profile, *, after=False):
+    """Historical legacy validation, preserved for feedback/utility consumers."""
+    expected = cpu_conditions_with_ordering(request["tt_entries"], request["requested_depth"],
+               request["quiescence_ply"], PROFILE if profile == request["cpu_profile_sha256"] else RECHECK_PROFILE)
+    return _report_impl(value, request, profile, after=after,
+                        conditions_schema="rz-pals-private-cpu-conditions/1",
+                        search_version=CPU_SEARCH, expected_search=expected)
+
+
+def report_with_ordering(value, request, profile, *, after=False, ordering_policy=LEGACY_ORDERING):
+    _cpu_request_domain(request, ordering_policy)
+    if ordering_policy == LEGACY_ORDERING:
+        return _report(value, request, profile, after=after)
+    if profile not in (request["cpu_profile_sha256"], request["recheck_profile_sha256"]):
+        raise ValueError("unknown selected CPU profile")
+    expected = cpu_conditions_with_ordering(request["tt_entries"], request["requested_depth"],
+               request["quiescence_ply"], PROFILE if profile == request["cpu_profile_sha256"] else RECHECK_PROFILE,
+               ordering_policy=ordering_policy)
+    return _report_impl(value, request, profile, after=after,
+                        conditions_schema=SEE_CONDITIONS_SCHEMA,
+                        search_version=SEE_CPU_SEARCH, expected_search=expected)
+
+
+def _report_impl(value, request, profile, *, after, conditions_schema, search_version, expected_search):
     required = {"profile_sha256", "conditions_sha256", "score_scope", "completed_depth", "requested_depth",
                 "nodes", "quiescence_nodes", "completion", "root_restricted", "raw_score", "pv",
                 "white_to_move", "elapsed_ms", "reused_completed_depth", "score_provenance",
@@ -543,15 +629,12 @@ def _report(value, request, profile, *, after=False):
     fields = {"schema", "rules_state_sha256", "rules_history_sha256", "board_fen", "profile_sha256",
               "value_identity", "search_version", "quiescence_ply", "root_moves", "white_to_move",
               "legal_moves", "root_order", "root_order_sha256", "search_conditions", "root_selection", "resource_policy"}
-    if not isinstance(conditions, dict) or set(conditions) != fields or conditions["schema"] != "rz-pals-private-cpu-conditions/1":
+    if not isinstance(conditions, dict) or set(conditions) != fields or conditions["schema"] != conditions_schema:
         raise ValueError("CPU actual conditions descriptor missing")
     if hashlib.sha256(_json(conditions)).hexdigest() != _sha(value["conditions_sha256"]):
         raise ValueError("CPU actual conditions descriptor SHA mismatch")
-    if conditions["profile_sha256"] != profile or conditions["search_version"] != CPU_SEARCH or conditions["quiescence_ply"] != request["quiescence_ply"] or conditions["value_identity"] != {"semantics": CPU_VALUE, "weights_sha256": None, "training": {"kind": "bootstrap"}}:
+    if conditions["profile_sha256"] != profile or conditions["search_version"] != search_version or conditions["quiescence_ply"] != request["quiescence_ply"] or conditions["value_identity"] != {"semantics": CPU_VALUE, "weights_sha256": None, "training": {"kind": "bootstrap"}}:
         raise ValueError("CPU search/evaluator/configuration conditions mismatch")
-    profile_name = PROFILE if profile == request["cpu_profile_sha256"] else RECHECK_PROFILE
-    expected_search = (CPU_CONDITIONS + f";profile={profile_name};max_depth={request['requested_depth']}"
-                       f";q_plies={request['quiescence_ply']};tt_entries={request['tt_entries']}")
     if conditions["search_conditions"] != expected_search:
         raise ValueError("CPU actual PVS namespace differs from registered source semantics")
     if conditions["resource_policy"] != {"max_wall_time_ms": request["max_wall_time_ms"],
@@ -618,6 +701,20 @@ def _report(value, request, profile, *, after=False):
 
 def observed_gain(request, response):
     """Only new conditional completed scope/depth; no score/mate/nodes reward."""
+    return _observed_gain_impl(request, response, _report)
+
+
+def observed_gain_with_ordering(request, response, *, ordering_policy=LEGACY_ORDERING):
+    """Fixed-ordering conditional scope progress; never an ordering A/B reward."""
+    _cpu_request_domain(request, ordering_policy)
+    if ordering_policy == LEGACY_ORDERING:
+        return observed_gain(request, response)
+    def validate(value, req, profile, *, after=False):
+        return report_with_ordering(value, req, profile, after=after, ordering_policy=ordering_policy)
+    return _observed_gain_impl(request, response, validate)
+
+
+def _observed_gain_impl(request, response, report_validator):
     required = {"schema", "task", "context_sha256", "cpu_binary_sha256", "rules_state_sha256",
                 "rules_history_sha256", "board_fen", "branch_sha256", "status", "reason",
                 "baseline", "after", "nodes", "elapsed_ms", "resume_kind", "product_verifier_enabled", "deadline_exceeded"}
@@ -650,7 +747,7 @@ def observed_gain(request, response):
         if before is not None:
             if response["status"] != "unavailable":
                 raise ValueError("only unavailability may preserve a baseline")
-            _report(before, request, request["cpu_profile_sha256"])
+            report_validator(before, request, request["cpu_profile_sha256"])
             if before["requested_depth"] != request["baseline_depth"] or response["nodes"] != before["nodes"]:
                 raise ValueError("unavailable resume baseline accounting mismatch")
         elif response["nodes"] != 0:
@@ -663,8 +760,8 @@ def observed_gain(request, response):
                 "comparative_preference_available": False, "preference_rank": None}
     base_profile = request["cpu_profile_sha256"]
     next_profile = (request["recheck_profile_sha256"] if request["task"] == "cross_profile_recheck" else base_profile)
-    _report(before, request, base_profile)
-    _report(after, request, next_profile, after=True)
+    report_validator(before, request, base_profile)
+    report_validator(after, request, next_profile, after=True)
     if before["reused_completed_depth"] != 0:
         raise ValueError("fresh baseline cannot claim existing resume state")
     if before["requested_depth"] != request["baseline_depth"] or after["requested_depth"] != request["requested_depth"]:
@@ -726,14 +823,17 @@ def _encoded_json(encoding, parent_sha256, context, derivation):
 def load_private_verifier_bank(directory, *, expected_receipt_sha256, parents,
                                expected_checkpoint_sha256, expected_cpu_binary_sha256,
                                expected_private_encoder_source_sha256,
-                               max_input_bytes=64 * 1024 * 1024):
+                               max_input_bytes=64 * 1024 * 1024,
+                               ordering_policy=LEGACY_ORDERING):
     """Reload an independently accepted zero-step bank into ValidatedDataset.
 
     The owner confirms the CLI's final passed status/exit 0 before supplying
     the receipt SHA. A receipt records checks before final write; it alone is
     not evidence that launch, final I/O and cleanup met the execution budget.
     Parent native data is independently admitted and never silently recreated.
+    SEE is never inferred from a receipt: the caller must select its namespace.
     """
+    selected_ordering = _ordering_policy(ordering_policy)
     if not isinstance(parents, ValidatedDataset):
         raise ValueError("independently admitted native public parent dataset required")
     root = _path(directory)
@@ -743,6 +843,9 @@ def load_private_verifier_bank(directory, *, expected_receipt_sha256, parents,
         raise ValueError("private bank exceeds aggregate input admission")
     _, raw = _file(paths[0], expected_receipt_sha256, paths[0].stat().st_size)
     receipt = _parse(raw)
+    if ((selected_ordering == LEGACY_ORDERING and "cpu_ordering_policy" in receipt)
+            or (selected_ordering == SEE_ORDERING and receipt.get("cpu_ordering_policy") != SEE_ORDERING)):
+        raise ValueError("private bank ordering differs from independently selected namespace")
     if receipt.get("schema") != SCHEMA or receipt.get("complete") is not True or receipt.get("failure") is not None or receipt.get("status") != "checks_passed_before_receipt_write":
         raise ValueError("failed or incomplete private bank cannot enter preparation")
     for name in ("actual_training_executed", "backward_executed", "optimizer_created", "product_verifier_enabled", "external_teacher_used", "native_verifier_encoded", "trained"):
@@ -751,6 +854,9 @@ def load_private_verifier_bank(directory, *, expected_receipt_sha256, parents,
     if type(receipt.get("optimizer_steps")) is not int or receipt["optimizer_steps"] != 0 or receipt.get("private_bank_only") is not True or receipt.get("no_comparative_training_target") is not True:
         raise ValueError("private bank learning provenance mismatch")
     declaration = receipt["query_encoding"]
+    if ((selected_ordering == LEGACY_ORDERING and "cpu_ordering_policy" in declaration)
+            or (selected_ordering == SEE_ORDERING and declaration.get("cpu_ordering_policy") != SEE_ORDERING_IDENTITY)):
+        raise ValueError("private query declaration differs from selected CPU ordering")
     if declaration["private_encoder_source_sha256"] != _sha(expected_private_encoder_source_sha256) or receipt["checkpoint_sha256"] != _sha(expected_checkpoint_sha256):
         raise ValueError("private encoder/own frozen weight authority mismatch")
     if _hash(QUERY_SCHEMA, declaration) != receipt["encoding_schema_sha256"]:
@@ -806,9 +912,10 @@ def load_private_verifier_bank(directory, *, expected_receipt_sha256, parents,
         if frozen != prepared["input"] or _json(encoded) != _json(_encoded_json(encoding, parent_id, context, derivation)["encoding"]):
             raise ValueError("fresh V input/public features differ from admitted native parent")
         request, response = evidence["request"], evidence["response"]
+        request_domain = _cpu_request_domain(request, selected_ordering)
         pre_request = dict(request)
         request_seal = pre_request.pop("context_sha256")
-        if request_seal != _hash(CPU_SCHEMA, pre_request) or request["branch_sha256"] != context.branch_sha256 or request["cpu_profile_sha256"] != context.cpu_profile_sha256 or request["parent_input_sha256"] != parent_id or request["cpu_binary_sha256"] != expected_cpu_binary_sha256:
+        if request_seal != _hash(request_domain, pre_request) or request["branch_sha256"] != context.branch_sha256 or request["cpu_profile_sha256"] != context.cpu_profile_sha256 or request["parent_input_sha256"] != parent_id or request["cpu_binary_sha256"] != expected_cpu_binary_sha256:
             raise ValueError("CPU future evidence not bound to selected private context")
         if request["branch_sha256"] != _hash("rz-pals-private-cpu-branch/1", {"parent_input_sha256": parent_id, **controls}):
             raise ValueError("CPU branch controls changed after V selection")
@@ -816,7 +923,7 @@ def load_private_verifier_bank(directory, *, expected_receipt_sha256, parents,
             raise ValueError("CPU future evidence attached to another V decision")
         if decision["task"] != request["task"] or not mask[TASKS.index(decision["task"])] or decision["verifier_private"]["task_kind"] != decision["task"] or decision["verifier_private"]["control_sha256"] != request_seal:
             raise ValueError("private task/latent controls changed after selection")
-        actual_gain = observed_gain(request, response)
+        actual_gain = observed_gain_with_ordering(request, response, ordering_policy=selected_ordering)
         expected_evidence = dict(evidence)
         evidence_sha = expected_evidence.pop("evidence_sha256")
         if evidence["observed_information"] != actual_gain or _hash(GAIN_SCHEMA, expected_evidence) != evidence_sha:
@@ -845,8 +952,11 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
                           budget_bucket=0, tt_entries=8192, quiescence_ply=8,
                           frozen_epoch=1, max_input_bytes=256 * 1024 * 1024,
                           allowed_tasks=("widen_responses", "resume_task", "cross_profile_recheck", "defer"),
-                          controls=None, controls_sha256=None, cancel_file=None):
+                          controls=None, controls_sha256=None, cancel_file=None,
+                          ordering_policy=LEGACY_ORDERING):
     """Finite collection steps are selections/dispatches; optimizer steps stay 0."""
+    selected_ordering = _ordering_policy(ordering_policy)
+    cpu_domain = SEE_CPU_SCHEMA if selected_ordering == SEE_ORDERING else CPU_SCHEMA
     limits = Limits(max_games=max_games, max_steps=max_steps, max_nodes=max_nodes,
                     max_wall_time_ms=max_wall_time_ms, max_output_bytes=max_output_bytes,
                     max_forward_flops=max_forward_flops, cancel_file=cancel_file)
@@ -921,14 +1031,17 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
         before = _parameter_digest(model)
         source = {"kind": "own_pals", "model_configuration_sha256": _hash("rz-pals-private-model-configuration/1", model.config.to_dict()),
                   "model_weights_sha256": checkpoint_sha256}
-        profile = cpu_profile(tt_entries, requested_depth, quiescence_ply)
+        profile = cpu_profile_with_ordering(tt_entries, requested_depth, quiescence_ply, ordering_policy=selected_ordering)
         profile_sha = profile_sha256(profile)
-        recheck_sha = profile_sha256(cpu_profile(tt_entries, requested_depth, quiescence_ply, RECHECK_PROFILE))
+        recheck_sha = profile_sha256(cpu_profile_with_ordering(tt_entries, requested_depth, quiescence_ply, RECHECK_PROFILE,
+                                                              ordering_policy=selected_ordering))
         producer_source_sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         query_encoding = {"schema": QUERY_SCHEMA, "native_encoding_sha256": data.records[0]["input"]["snapshot"]["encoding_sha256"],
                           "encoder_source_sha256": encoder_source_sha256, "query_fields": list(QUERY_FIELDS),
                           "private_encoder_source_sha256": producer_source_sha,
                           "model_configuration_sha256": source["model_configuration_sha256"], "private_only": True}
+        if selected_ordering == SEE_ORDERING:
+            query_encoding["cpu_ordering_policy"] = SEE_ORDERING_IDENTITY
         if any(row["input"]["snapshot"]["encoding_sha256"] != query_encoding["native_encoding_sha256"] for row in data.records):
             raise ValueError("one private bank cannot mix native encoding revisions")
         encoding_sha = _hash(QUERY_SCHEMA, query_encoding)
@@ -984,7 +1097,7 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
                 task = select_task(actual[3], mask)
                 counts["selections"] += 1
                 wall_budget = min(max_task_wall_time_ms, limits.remaining_ms())
-                request = {"schema": CPU_SCHEMA, "task": task,
+                request = {"schema": cpu_domain, "task": task,
                            "parent_input_sha256": parent["input"]["sha256"],
                            "position_command": snapshot["position_command"], "expected_board_fen": snapshot["board_fen"],
                            "rules_state_sha256": snapshot["rules_state_sha256"], "rules_history_sha256": snapshot["rules_history_sha256"],
@@ -995,7 +1108,9 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
                            "max_output_bytes": max_cpu_output_bytes,
                            "tt_entries": tt_entries, "quiescence_ply": quiescence_ply,
                            "cpu_profile_sha256": profile_sha, "recheck_profile_sha256": recheck_sha}
-                request["context_sha256"] = _hash(CPU_SCHEMA, request)
+                if selected_ordering == SEE_ORDERING:
+                    request["ordering_policy"] = SEE_ORDERING
+                request["context_sha256"] = _hash(cpu_domain, request)
                 private = {"task_kind": task, "control_sha256": request["context_sha256"],
                            "private_latent": actual[2][0].reshape(-1).tolist()}
                 decision = {"input_sha256": row["input"]["sha256"], "parent_input_sha256": parent["input"]["sha256"],
@@ -1016,10 +1131,10 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
                 cpu_capture = {}
                 cpu_stage = "cpu_bridge"
                 response = run_cpu_bridge(binary, request, limits, capture=cpu_capture,
-                                          pipe_reservation=pipe_reservation)
+                                          pipe_reservation=pipe_reservation, ordering_policy=selected_ordering)
                 cpu_stage = "response_validation"
                 try:
-                    gain = observed_gain(request, response)
+                    gain = observed_gain_with_ordering(request, response, ordering_policy=selected_ordering)
                 except BaseException as protocol_error:
                     raise CpuBridgeFailure(protocol_error, cpu_capture) from protocol_error
                 # On failure retain the upper reservation: actual child usage
@@ -1076,6 +1191,7 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
             raise ValueError("private encoder source changed during production")
         elapsed = limits.check()
         result = bank.finish({"complete": True, "status": "checks_passed_before_receipt_write", "failure": None, "counts": counts,
+                              **({"cpu_ordering_policy": SEE_ORDERING} if selected_ordering == SEE_ORDERING else {}),
                               "source_registry": authority, "query_encoding": query_encoding,
                               "encoding_schema_sha256": encoding_sha, "checkpoint_sha256": checkpoint_sha256,
                               "collection_receipt_sha256": receipt_sha256, "controls_sha256": controls_sha256,
@@ -1101,7 +1217,7 @@ def run_verifier_producer(*, collection, receipt_sha256, encoder_source_sha256, 
                                               parents=data, expected_checkpoint_sha256=checkpoint_sha256,
                                               expected_cpu_binary_sha256=cpu_binary_sha256,
                                               expected_private_encoder_source_sha256=producer_source_sha,
-                                              max_input_bytes=max_output_bytes)
+                                              max_input_bytes=max_output_bytes, ordering_policy=selected_ordering)
         if len(reloaded.records) != counts["selections"]:
             raise ValueError("private bank reload lost admitted V selections")
         for reloaded_row in reloaded.records:
@@ -1137,6 +1253,7 @@ def main(argv=None):
     parser.add_argument("--controls")
     parser.add_argument("--controls-sha256")
     parser.add_argument("--cancel-file")
+    parser.add_argument("--ordering-policy", choices=(LEGACY_ORDERING, SEE_ORDERING), default=LEGACY_ORDERING)
     arguments = vars(parser.parse_args(argv))
     if arguments["allowed_tasks"] is None:
         del arguments["allowed_tasks"]
