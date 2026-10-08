@@ -7,6 +7,7 @@ use super::ArtifactPin;
 use super::replay_inputs::{
     self, ReplayAuthorities, ReplayExpectedPins, ReplayInputAudit, ReplayInputError,
     ReplayInputMode, ReplayRegisteredArtifacts, SemanticReceiptProducerScope,
+    replay_mode_requirements,
 };
 use crate::pals_native::{
     self, NativeInvocationBudget, NativeLoadFailure, NativeOwnerOptions, NativePreparedContext,
@@ -19,9 +20,11 @@ use rz_eval::pals_model::{PalsModelInput, PalsRawOutput};
 use rz_eval::pals_onnx::{PalsNativeResult, PalsOnnxConfig};
 use rz_eval::runtime_pin::RuntimeLibraryPin;
 use rz_search::pals::engine::replay::{
-    FreshReplayOwner, ReplayError, ReplayOutcome, ReplayRepairOutcome, repair_replay_requirements,
+    FreshReplayOwner, ReplayError, ReplayOpponentOutcome, ReplayOutcome, ReplayRepairOutcome,
 };
-use rz_search::pals::engine::{RoleAcceptance, RoleError, RoleLogicalContext};
+use rz_search::pals::engine::{
+    PalsLimits, RoleAcceptance, RoleError, RoleLogicalContext, RoleModel,
+};
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::fmt::{self, Write as _};
@@ -33,6 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const SCHEMA: &str = "rz-pals-cpu-fresh-native-replay-observation/1";
+pub const OPPONENT_SCHEMA: &str = "rz-pals-cpu-fresh-native-replay-observation/2";
 pub const ASSET_PROFILE_SCHEMA: &str = "rz-pals-cpu-fresh-replay-assets/1";
 pub const SCOPE: &str = "caller_registered_inputs_to_actual_own_cpu_fresh_replay_observations";
 // Existing replay registration permits ASCII identifiers without '/'.
@@ -44,13 +48,26 @@ const HEADER_RESERVE: usize = 512 * 1024;
 const ROLE_TRACE_BYTES: usize = 144 * 1024;
 const ROWS_PER_ROLE: usize = 12;
 const PREPARED_BYTES: usize = 64 * 1024;
-const TERMINAL_BYTES: usize = 64 * 1024;
 const CONTEXT_BYTES: usize = 8 * 1024;
 const SMALL_ROW_BYTES: usize = 1024;
 const SNAPSHOT_BYTES: usize = 8 * 1024;
 const STAGE_TEXT_BYTES: usize = 16 * 1024;
 const STATE_TEXT_BYTES: usize = 32 * 1024;
 const OUTCOME_TEXT_BYTES: usize = 16 * 1024;
+const OPPONENT_STATE_TEXT_BYTES: usize = 32 * 1024;
+// Explicit /2 observation profile: two 32KiB large rows, one 8KiB
+// accepted-context row, at most nine 1KiB small rows and twelve separators.
+// Overflow is an observer failure, never a truncated successful evaluation.
+const OPPONENT_LARGE_ROW_BYTES: usize = 32 * 1024;
+const OPPONENT_ROLE_TRACE_BYTES: usize = 82 * 1024;
+
+fn role_trace_bytes(checks: usize) -> usize {
+    if checks == 4 {
+        OPPONENT_ROLE_TRACE_BYTES
+    } else {
+        ROLE_TRACE_BYTES
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -489,6 +506,8 @@ pub struct NativeReplayObservation {
     pub stages: Vec<CpuStageObservation>,
     /// Actual Rust snapshots; not a legacy raw JSON response or imported record.
     pub replay_state: SnapshotText,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opponent_state: Option<SnapshotText>,
     pub outcome: SnapshotText,
     pub trace_jsonl: String,
     pub trace_rows: usize,
@@ -548,11 +567,25 @@ struct Collector {
     /// One separately reserved synchronous formatter arena, never a callback
     /// borrow retained after return or format!(large) followed by truncation.
     terminal_scratch: SnapshotText,
+    large_row_bytes: usize,
 }
 impl Collector {
+    #[cfg(test)]
     fn reserved(roles: usize, whole: Instant) -> Result<Self, AdmissionFault> {
+        Self::reserved_for_checks(roles, 2, whole)
+    }
+    fn reserved_for_checks(
+        roles: usize,
+        checks: usize,
+        whole: Instant,
+    ) -> Result<Self, AdmissionFault> {
+        let large_row_bytes = if checks == 4 {
+            OPPONENT_LARGE_ROW_BYTES
+        } else {
+            PREPARED_BYTES
+        };
         let limit = roles
-            .checked_mul(ROLE_TRACE_BYTES)
+            .checked_mul(role_trace_bytes(checks))
             .ok_or(fault("observer_reserve", "byte overflow"))?;
         let row_limit = roles
             .checked_mul(ROWS_PER_ROLE)
@@ -568,7 +601,8 @@ impl Collector {
             role_limit: roles,
             whole,
             failure: None,
-            terminal_scratch: SnapshotText::reserved(TERMINAL_BYTES)?,
+            terminal_scratch: SnapshotText::reserved(large_row_bytes)?,
+            large_row_bytes,
         })
     }
     fn fail(&mut self, why: &'static str) -> RoleError {
@@ -690,7 +724,7 @@ impl Collector {
                             full_native_diagnostic_archive: false,
                         },
                     },
-                    TERMINAL_BYTES,
+                    self.large_row_bytes,
                 );
                 self.terminal_scratch = scratch;
                 row?;
@@ -837,7 +871,7 @@ impl NativeRoleObserver for ReplayObserver {
                     input,
                     logical: logical.map(DebugRef),
                 },
-                PREPARED_BYTES,
+                c.large_row_bytes,
             )
         })
     }
@@ -964,7 +998,7 @@ pub fn replay_output_requirements(
     checks: usize,
 ) -> Result<ReplayOutputRequirements, AdmissionFault> {
     let trace = roles
-        .checked_mul(ROLE_TRACE_BYTES)
+        .checked_mul(role_trace_bytes(checks))
         .ok_or(fault("output_reserve", "trace overflow"))?;
     // Committed compact JSONL contains no unescaped controls except its
     // single newline separators. Wrapping that valid UTF-8 as a JSON string
@@ -975,6 +1009,13 @@ pub fn replay_output_requirements(
         .ok_or(fault("output_reserve", "stage snapshot overflow"))?;
     let text_bytes = stage_bytes
         .checked_add(STATE_TEXT_BYTES + OUTCOME_TEXT_BYTES)
+        .and_then(|n| {
+            if checks == 4 {
+                n.checked_add(OPPONENT_STATE_TEXT_BYTES)
+            } else {
+                Some(n)
+            }
+        })
         .ok_or(fault("output_reserve", "retained snapshot overflow"))?;
     let need = trace
         .checked_mul(2)
@@ -993,6 +1034,7 @@ struct Reserved {
     output: Vec<u8>,
     slots: Vec<CpuStageObservation>,
     state: SnapshotText,
+    opponent_state: Option<SnapshotText>,
     outcome: SnapshotText,
 }
 impl Reserved {
@@ -1004,10 +1046,19 @@ impl Reserved {
             slots.push(CpuStageObservation::reserved()?);
         }
         Ok(Self {
-            collector: Arc::new(Mutex::new(Collector::reserved(roles, clock.whole)?)),
+            collector: Arc::new(Mutex::new(Collector::reserved_for_checks(
+                roles,
+                checks,
+                clock.whole,
+            )?)),
             output: reserved_bytes(clock.output)?,
             slots,
             state: SnapshotText::reserved(STATE_TEXT_BYTES)?,
+            opponent_state: if checks == 4 {
+                Some(SnapshotText::reserved(OPPONENT_STATE_TEXT_BYTES)?)
+            } else {
+                None
+            },
             outcome: SnapshotText::reserved(OUTCOME_TEXT_BYTES)?,
         })
     }
@@ -1017,6 +1068,24 @@ impl Reserved {
 enum Outcome {
     Reply(ReplayOutcome),
     Repair(ReplayRepairOutcome),
+    Opponent(ReplayOpponentOutcome),
+}
+
+fn run_owner<M: RoleModel>(
+    owner: &mut FreshReplayOwner<M>,
+    mode: ReplayInputMode,
+    limits: PalsLimits,
+    cancel: &AtomicBool,
+) -> Result<Outcome, ReplayError> {
+    match mode {
+        ReplayInputMode::ReplyOnly2n => owner.run(limits, cancel).map(Outcome::Reply),
+        ReplayInputMode::RepairEndpoint3n => {
+            owner.run_with_repair(limits, cancel).map(Outcome::Repair)
+        }
+        ReplayInputMode::RepairOpponent4n => owner
+            .run_with_opponent_recheck(limits, cancel)
+            .map(Outcome::Opponent),
+    }
 }
 
 pub fn dispatch_started(
@@ -1091,28 +1160,34 @@ fn dispatch_started_inner(
         )
         .map_err(|e| bare_error(NativeReplayPrimary::Asset(Box::new(e)), clock, cancel))?;
         let (config, root, plan, limits) = checked.into_owner_args();
-        let requirements =
-            repair_replay_requirements(config.line_plies, plan.prefix.len(), plan.nodes_per_check)
-                .map_err(|e| bare_error(NativeReplayPrimary::Owner(e), clock, cancel))?;
-        let roles = match mode {
-            ReplayInputMode::ReplyOnly2n => config.line_plies.checked_add(1),
-            ReplayInputMode::RepairEndpoint3n => usize::try_from(requirements.role_calls()).ok(),
-        }
-        .ok_or_else(|| {
-            bare_error(
-                NativeReplayPrimary::Admission(fault("observer_reserve", "role bound overflow")),
-                clock,
-                cancel,
-            )
-        })?;
-        let checks = match mode {
-            ReplayInputMode::ReplyOnly2n => 2,
-            ReplayInputMode::RepairEndpoint3n => 3,
-        };
+        let requirements = replay_mode_requirements(
+            mode,
+            config.line_plies,
+            plan.prefix.len(),
+            plan.nodes_per_check,
+        )
+        .map_err(|e| bare_error(NativeReplayPrimary::Owner(e), clock, cancel))?;
+        let roles = usize::try_from(requirements.actual_role_calls())
+            .ok()
+            .ok_or_else(|| {
+                bare_error(
+                    NativeReplayPrimary::Admission(fault(
+                        "observer_reserve",
+                        "role bound overflow",
+                    )),
+                    clock,
+                    cancel,
+                )
+            })?;
+        let checks = requirements.cpu_checks();
         let mut reserved = Reserved::new(roles, checks, clock)
             .map_err(|e| bare_error(NativeReplayPrimary::Admission(e), clock, cancel))?;
         let mut receipt = NativeReplayObservation {
-            schema: SCHEMA,
+            schema: if mode == ReplayInputMode::RepairOpponent4n {
+                OPPONENT_SCHEMA
+            } else {
+                SCHEMA
+            },
             scope: SCOPE,
             status: "admitted_before_load",
             mode,
@@ -1140,6 +1215,7 @@ fn dispatch_started_inner(
             cpu_work_observation_incomplete: None,
             stages: Vec::new(),
             replay_state: reserved.state,
+            opponent_state: reserved.opponent_state,
             outcome: reserved.outcome,
             trace_jsonl: String::new(),
             trace_rows: 0,
@@ -1212,14 +1288,7 @@ fn dispatch_started_inner(
                                 }
                                 Ok(()) => {
                                     receipt.replay_attempted = true;
-                                    Some(match mode {
-                                        ReplayInputMode::ReplyOnly2n => {
-                                            owner.run(limits, cancel).map(Outcome::Reply)
-                                        }
-                                        ReplayInputMode::RepairEndpoint3n => owner
-                                            .run_with_repair(limits, cancel)
-                                            .map(Outcome::Repair),
-                                    })
+                                    Some(run_owner(&mut owner, mode, limits, cancel))
                                 }
                             };
                             receipt.replay_returned_ok = result.as_ref().is_some_and(Result::is_ok);
@@ -1234,6 +1303,7 @@ fn dispatch_started_inner(
                                     let complete = match outcome {
                                         Outcome::Reply(o) => receipt.outcome.capture(&o),
                                         Outcome::Repair(o) => receipt.outcome.capture(&o),
+                                        Outcome::Opponent(o) => receipt.outcome.capture(&o),
                                     };
                                     if !complete {
                                         output_error = Some(fault(
@@ -1355,8 +1425,8 @@ fn dispatch_started_inner(
     })
 }
 
-fn capture_owner(
-    owner: &FreshReplayOwner<NativeRoleModel>,
+fn capture_owner<M: RoleModel>(
+    owner: &FreshReplayOwner<M>,
     slots: &mut Vec<CpuStageObservation>,
     receipt: &mut NativeReplayObservation,
 ) -> bool {
@@ -1446,6 +1516,25 @@ fn capture_owner(
             ),
         ),
     ));
+    // This separate /2 snapshot does not relabel the third endpoint or join
+    // search-local role contexts/CPU IDs with physical native request IDs.
+    if let Some(state) = &mut receipt.opponent_state {
+        complete &= state.capture(&(
+            "repair_opponent_continuation",
+            owner.opponent_anchor_ply(),
+            owner.opponent_counterline(),
+            owner.opponent_role_steps(),
+            owner.opponent_endpoint().map(|endpoint| {
+                (
+                    endpoint.state,
+                    endpoint.situation,
+                    endpoint.snapshot,
+                    endpoint.terminal,
+                    endpoint.stage,
+                )
+            }),
+        ));
+    }
     complete
 }
 
@@ -1646,6 +1735,12 @@ fn validate_sources(p: &ReplayRegisteredArtifacts) -> Result<(), AdmissionFault>
     ];
     let actual_factory_digest: [u8; 32] = Sha256::digest(actual[1].1).into();
     if actual.iter().any(|(pin, bytes)| !pin_matches(pin, bytes))
+        || p.opponent_recheck_source.as_ref().is_some_and(|pin| {
+            !pin_matches(
+                pin,
+                include_bytes!("../../../../rz-search/src/pals/engine/replay/opponent_recheck.rs"),
+            )
+        })
         || actual_factory_digest != pals_native::pals_native_source_digest()
         || p.legacy_cpu_binary.sha256 == p.replay_binary.sha256
     {
@@ -1972,8 +2067,9 @@ mod tests {
     use replay_inputs::{ReplayBindingPins, ReplayParentPins};
     use rz_contracts::{ExecutionId, ProcessEpoch};
 
-    // All tests below are pure controlled admission/observation fixtures. They
-    // never load an ORT runtime, construct a model/CPU engine, or launch a child.
+    // Admission/observation fixtures never load ORT or launch a child. The
+    // explicit dispatch/capture test uses a deterministic RoleModel plus the
+    // real bounded CPU checker; it proves no physical native execution.
     fn pin(bytes: &[u8]) -> ArtifactPin {
         ArtifactPin {
             bytes: bytes.len() as u64,
@@ -1990,7 +2086,230 @@ mod tests {
                 "../../../../rz-search/src/pals/engine/replay.rs"
             )),
             provider_factory_source: pin(include_bytes!("../../pals_native.rs")),
+            opponent_recheck_source: None,
         }
+    }
+
+    #[test]
+    fn opponent_source_is_separately_compared_with_compiled_source_bytes() {
+        let mut registered = sources();
+        assert!(validate_sources(&registered).is_ok());
+        registered.opponent_recheck_source = Some(pin(include_bytes!(
+            "../../../../rz-search/src/pals/engine/replay/opponent_recheck.rs"
+        )));
+        assert!(validate_sources(&registered).is_ok());
+        registered.opponent_recheck_source.as_mut().unwrap().sha256 = "0".repeat(64);
+        assert!(validate_sources(&registered).is_err());
+    }
+
+    #[test]
+    fn opponent_output_profile_fits_five_ply_without_expanding_original_cap() {
+        let req =
+            replay_mode_requirements(ReplayInputMode::RepairOpponent4n, 5, 1, 100_000).unwrap();
+        let roles = usize::try_from(req.actual_role_calls()).unwrap();
+        let declared = replay_output_requirements(roles, req.cpu_checks()).unwrap();
+        assert!(declared.required_output_bytes() <= replay_inputs::MAX_OUTPUT_BYTES);
+        assert!(
+            declared
+                .check_output_limit(declared.required_output_bytes() - 1)
+                .is_err()
+        );
+        assert!(Reserved::new(roles, 4, clock(declared.required_output_bytes() - 1)).is_err());
+        let reserved = Reserved::new(roles, 4, clock(replay_inputs::MAX_OUTPUT_BYTES)).unwrap();
+        assert_eq!(reserved.slots.len(), 4);
+        assert!(reserved.opponent_state.is_some());
+        let collector = reserved.collector.lock().unwrap();
+        assert_eq!(collector.limit, roles * OPPONENT_ROLE_TRACE_BYTES);
+        assert_eq!(collector.large_row_bytes, OPPONENT_LARGE_ROW_BYTES);
+        assert_eq!(collector.row_limit, roles * ROWS_PER_ROLE);
+        assert!(
+            2 * OPPONENT_LARGE_ROW_BYTES + CONTEXT_BYTES + 9 * SMALL_ROW_BYTES + ROWS_PER_ROLE
+                <= OPPONENT_ROLE_TRACE_BYTES
+        );
+        for checks in [2, 3] {
+            let old = replay_output_requirements(5, checks).unwrap();
+            assert_eq!(
+                old.required_output_bytes(),
+                5 * ROLE_TRACE_BYTES * 2
+                    + (checks * (STAGE_TEXT_BYTES + 2 * SNAPSHOT_BYTES)
+                        + STATE_TEXT_BYTES
+                        + OUTCOME_TEXT_BYTES)
+                        * 6
+                    + HEADER_RESERVE
+            );
+            assert!(
+                Reserved::new(5, checks, clock(replay_inputs::MAX_OUTPUT_BYTES))
+                    .unwrap()
+                    .opponent_state
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn opponent_observer_overflow_preserves_failure_without_retry_or_success() {
+        let mut collector = Collector::reserved_for_checks(1, 4, clock(1024).whole).unwrap();
+        let cap = collector.large_row_bytes;
+        assert!(collector.row(&"x".repeat(cap + 1), cap).is_err());
+        assert!(collector.failure.is_some());
+        assert!(collector.bytes.is_empty());
+        assert!(collector.row(&"small", SMALL_ROW_BYTES).is_err());
+        assert_eq!(collector.rows, 0);
+    }
+
+    #[test]
+    fn actual_mode_dispatch_and_capture_keep_fourth_cpu_separate_from_native_ids() {
+        use rz_position::{BoardMove, Position};
+        use rz_search::cpu::{CpuConfig, CpuProfile};
+        use rz_search::pals::engine::replay::{DefendResponseReplayPlan, ReplayHistoricalPins};
+        use rz_search::pals::engine::{
+            DivergenceQuery, PalsConfig, RecordKind, RoleEvaluation, RoleQuery,
+        };
+        fn line(text: &[&str]) -> Vec<BoardMove> {
+            text.iter()
+                .map(|text| BoardMove::from_uci(text).unwrap())
+                .collect()
+        }
+        struct Roles;
+        impl Roles {
+            fn evaluate(query: RoleQuery<'_>, text: &[&str]) -> Result<RoleEvaluation, RoleError> {
+                let movement = BoardMove::from_uci(text[query.prefix.len()]).unwrap();
+                let at = query
+                    .legal
+                    .iter()
+                    .position(|m| *m == movement)
+                    .ok_or(RoleError::InvalidOutput)?;
+                let mut logits = vec![0.0; query.legal.len()];
+                logits[at] = 1.0;
+                Ok(RoleEvaluation {
+                    logits,
+                    wdl: [0.25, 0.5, 0.25],
+                })
+            }
+        }
+        impl RoleModel for Roles {
+            fn identity(&self) -> &str {
+                "wrapper-controlled-opponent-role/1"
+            }
+            fn propose(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+                Self::evaluate(query, &["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"])
+            }
+            fn reply(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+                let after_repair = query
+                    .records
+                    .iter()
+                    .any(|record| record.kind == RecordKind::Repair);
+                Self::evaluate(
+                    query,
+                    if after_repair {
+                        &["e2e4", "e7e6", "d2d3", "c7c5", "b1c3"]
+                    } else {
+                        &["e2e4", "e7e6", "d2d4", "d7d5", "e4e5"]
+                    },
+                )
+            }
+            fn repair(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+                Self::evaluate(query, &["e2e4", "e7e6", "d2d3", "d7d5", "g1f3"])
+            }
+            fn divergences(&mut self, _: DivergenceQuery<'_>) -> Result<Vec<f32>, RoleError> {
+                Err(RoleError::Unavailable)
+            }
+        }
+        let root = Position::startpos();
+        let prefix = line(&["e2e4"]);
+        let mut target = root.clone();
+        target.make_move(prefix[0]).unwrap();
+        let mut owner = FreshReplayOwner::new(
+            PalsConfig {
+                line_plies: 5,
+                max_records: 5,
+                cpu_nodes_per_task: 100_000,
+                ..PalsConfig::default()
+            },
+            Roles,
+            root.clone(),
+            DefendResponseReplayPlan {
+                historical: ReplayHistoricalPins {
+                    parent_input_sha256: [1; 32],
+                    current_view_sha256: [2; 32],
+                    frozen_admission_sha256: [3; 32],
+                    query_sha256: [4; 32],
+                    catalogue_sha256: [5; 32],
+                    before_result_sha256: [6; 32],
+                    semantic_input_sha256: [7; 32],
+                    cpu_request_sha256: [8; 32],
+                },
+                expected_root: root.snapshot(),
+                expected_target: target.snapshot(),
+                root_legal_order: root.legal_moves(),
+                target_legal_order: target.legal_moves(),
+                prefix,
+                response_restriction: line(&["c7c5"]),
+                claimed_line: line(&["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"]),
+                baseline_depth: 1,
+                requested_depth: 2,
+                nodes_per_check: 100_000,
+                cpu: CpuConfig {
+                    profile: CpuProfile::PlanAssisted,
+                    tt_entries: 16,
+                    max_depth: 2,
+                    quiescence_ply: 16,
+                },
+            },
+        )
+        .unwrap();
+        let c = clock(replay_inputs::MAX_OUTPUT_BYTES);
+        let mode = ReplayInputMode::RepairOpponent4n;
+        let outcome = run_owner(
+            &mut owner,
+            mode,
+            PalsLimits {
+                deadline: c.execution,
+                max_rounds: 1,
+                max_cpu_nodes: 400_000,
+                cpu_depth: 2,
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            Outcome::Opponent(ReplayOpponentOutcome::CompletedOpponentEndpoint { .. })
+        ));
+        let mut observation = receipt(c);
+        observation.schema = OPPONENT_SCHEMA;
+        observation.mode = mode;
+        let mut reserved = Reserved::new(14, 4, c).unwrap();
+        observation.opponent_state = reserved.opponent_state;
+        assert!(capture_owner(&owner, &mut reserved.slots, &mut observation));
+        assert_eq!(observation.stages.len(), 4);
+        assert_eq!(observation.stages[2].phase, "repair_endpoint");
+        assert_eq!(observation.stages[3].phase, "repair_opponent_endpoint");
+        assert!(
+            observation.stages[3]
+                .raw_task
+                .text
+                .contains("rz-pals-frozen-parent-repair-opponent-continuation-replay/1")
+        );
+        assert_ne!(
+            observation.stages[2].cpu_execution,
+            observation.stages[3].cpu_execution
+        );
+        assert_eq!(observation.cpu_tasks_requested, Some(4));
+        assert_eq!(
+            owner.opponent_counterline(),
+            line(&["e2e4", "e7e6", "d2d3", "c7c5", "b1c3"])
+        );
+        assert!(observation.opponent_state.as_ref().unwrap().complete);
+        assert!(
+            observation
+                .replay_state
+                .text
+                .contains("repair_endpoint_only")
+        );
+        assert_eq!(observation.native_bindings_observed, 0);
+        assert!(observation.native_receipt.is_none() && observation.native_cleanup_missing);
+        assert_eq!(observation.authorities, ReplayAuthorities::default());
     }
     fn profile(cache: bool) -> CpuFreshAssetProfile {
         let mut p = CpuFreshAssetProfile {
@@ -2104,6 +2423,7 @@ mod tests {
             cpu_work_observation_incomplete: None,
             stages: Vec::new(),
             replay_state: SnapshotText::reserved(STATE_TEXT_BYTES).unwrap(),
+            opponent_state: None,
             outcome: SnapshotText::reserved(OUTCOME_TEXT_BYTES).unwrap(),
             trace_jsonl: String::new(),
             trace_rows: 0,
