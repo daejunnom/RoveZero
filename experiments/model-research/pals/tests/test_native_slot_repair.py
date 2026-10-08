@@ -343,8 +343,12 @@ class NativeSlotRepairTests(unittest.TestCase):
         self.assertEqual(body["initial_repair_native_request"], [1, 4])
         self.assertEqual(body["publication_native_request"], [1, 5])
         self.assertEqual(body["captured_input_revision"], 2)
-        self.assertEqual(body["transition_profile"]["reviewed_transition_sources"], dict(zip(
-            slot_witness._SOURCE_PATHS, slot_witness._REVIEWED_DISABLED_RECHECK_SOURCES)))
+        self.assertEqual(body["transition_profile"]["reviewed_transition_sources"], {
+            "crates/rz-search/src/pals/engine.rs": {
+                "bytes": 343988, "sha256": "0302e49b6a9784641ca90aba17490d404b793098f38836b7b3cf42a12ee131d1"},
+            "crates/rz-arena/src/pals_collect/native.rs": {
+                "bytes": 153791, "sha256": "0b056c4f2aada6380b1345a067e4d2c139118a8636ad7dc6f1a67a0dc0c55144"},
+        })
         self.assertEqual(admission["scope"], "conditional_unique_prepared_lineage")
         self.assertFalse(body["direct_causal_ids_present"])
         self.assertFalse(body["before_dispatch_witness_claimed"])

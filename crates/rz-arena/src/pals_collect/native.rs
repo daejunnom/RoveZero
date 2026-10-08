@@ -1114,12 +1114,12 @@ impl Sink {
                 "selected recheck native input has no actual logical context",
             ));
         }
-        if let Some(logical) = logical {
-            if logical.public_revision != revision || logical.prefix.as_slice() != prefix {
-                return Err(role_error(
-                    "actual native logical context differs from query revision/prefix",
-                ));
-            }
+        if let Some(logical) = logical
+            && (logical.public_revision != revision || logical.prefix.as_slice() != prefix)
+        {
+            return Err(role_error(
+                "actual native logical context differs from query revision/prefix",
+            ));
         }
         let eligible = kind == NativeQueryKind::Propose
             && prefix.is_empty()
@@ -1581,15 +1581,14 @@ impl NativeRoleObserver for Observer {
             let c=s.calls.get_mut(&id).ok_or_else(||role_error("physical result lacks prepared call"))?;
             if c.physical || c.physical_unknown {return Err(role_error("duplicate or unknown physical completion"));}
             c.physical=true;
-            if let (Some(meta),Ok(raw))=(&mut c.logical,result) {
-                if matches!(meta.kind,NativeQueryKind::Repair|NativeQueryKind::Reply) {
+            if let (Some(meta),Ok(raw))=(&mut c.logical,result)
+                && matches!(meta.kind,NativeQueryKind::Repair|NativeQueryKind::Reply) {
                     if raw.candidate_logits.len()!=meta.legal.len() || raw.candidate_logits.iter().any(|v|!v.is_finite()) {
                         return Err(role_error("actual Repair/Reply raw policy shape/finite values differ from Rules legal order"));
                     }
                     let mut indices:Vec<_>=(0..meta.legal.len()).collect();
                     indices.sort_by(|&a,&b|raw.candidate_logits[b].total_cmp(&raw.candidate_logits[a]).then(a.cmp(&b)));
                     meta.chosen_first=indices.first().map(|&i|meta.legal[i]);
-                }
             }
             let input_sha256=c.input_sha256.clone();
             let raw=match result {Ok(raw)=>raw_bits(raw),Err(error)=>serde_json::json!({"failure":failure_text(error),"kind":format!("{:?}",error)})};
@@ -2025,15 +2024,15 @@ impl PalsCollectionDriver for OwnPalsOnnxCollectionDriver {
                 .map_err(|e| invalid(e.to_string()))?;
             Ok(())
         })();
-        if let Err(error) = &summary_result {
-            if let Ok(mut s) = self.sink.lock() {
-                let previous = s.trace.failure.take();
-                s.trace.failure = Some(format!(
-                    "{}; summary secondary: {}",
-                    previous.as_deref().unwrap_or("search succeeded"),
-                    failure_text(error)
-                ));
-            }
+        if let Err(error) = &summary_result
+            && let Ok(mut s) = self.sink.lock()
+        {
+            let previous = s.trace.failure.take();
+            s.trace.failure = Some(format!(
+                "{}; summary secondary: {}",
+                previous.as_deref().unwrap_or("search succeeded"),
+                failure_text(error)
+            ));
         }
         let r = search_after_summary(result, summary_result)?;
         let mut genealogy = Vec::new();

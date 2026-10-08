@@ -56,10 +56,17 @@ _REVIEWED_DISABLED_OBSERVER_SOURCES = (
     {"bytes": 343988, "sha256": "0302e49b6a9784641ca90aba17490d404b793098f38836b7b3cf42a12ee131d1"},
     {"bytes": 153861, "sha256": "098005ae44fe5c5a9b0a2181d8cde32a40c3eeaaf0e733e2d92ec6859fd424e5"},
 )
+# Independently re-reviewed let-chain-only successor of that DEFAULT path.
+# Older bytes remain readable; selected recheck collections remain excluded.
+_REVIEWED_DISABLED_OBSERVER_LINT_SOURCES = (
+    {"bytes": 343988, "sha256": "0302e49b6a9784641ca90aba17490d404b793098f38836b7b3cf42a12ee131d1"},
+    {"bytes": 153791, "sha256": "0b056c4f2aada6380b1345a067e4d2c139118a8636ad7dc6f1a67a0dc0c55144"},
+)
 _SOURCE_REVIEW_PROFILES = (
     ("legacy_prepared_lineage_4469f9d", _REVIEWED_SOURCES),
     ("legacy_disabled_recheck_9c0de959", _REVIEWED_DISABLED_RECHECK_SOURCES),
     ("legacy_disabled_observer_0302e49b", _REVIEWED_DISABLED_OBSERVER_SOURCES),
+    ("legacy_disabled_observer_lint_0b056c4f", _REVIEWED_DISABLED_OBSERVER_LINT_SOURCES),
 )
 _DISABLED_SEARCH_VERSION = "pals-restricted-refinement/0.1"
 _OPT_IN_LANE_FIELDS = ("pals_search_policy", "refinement_registration", "refinement_registration_sha256", "post_repair_recheck", "post_repair_recheck_policy", "post_repair_recheck_conditions",
