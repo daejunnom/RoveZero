@@ -28,6 +28,34 @@ use std::time::{Duration, Instant};
 
 pub const PALS_SEARCH_VERSION: &str = "pals-restricted-refinement/0.1";
 
+/// Opt-in search semantics; this does not change a model or the value resolver.
+pub const POST_REPAIR_RECHECK_SEARCH_VERSION: &str =
+    "pals-restricted-refinement-post-repair-recheck/1";
+pub const POST_REPAIR_RECHECK_CONDITIONS: &str = "accepted-repair-and-completed-own-evidence;unchanged-first-move;first-opponent-anchor-after-changed-own-response;one-Reply-call-per-repair;prefer-unexamined-different-legal-response;remaining-repaired-suffix-Rules-replay;equal-line-length;equal-completed-CPU-depth-and-namespace-or-both-Rules-terminals;mixed-scope-unresolved;conditional-refutation-only;shared-global-role-cpu-store-deadline-cancel-limits;no-recursive-repair";
+
+/// Selected only at construction. Driver/CLI/manifest registration is a separate
+/// integration step; exposing this API does not advertise product CLI support.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PostRepairRecheckPolicy {
+    #[default]
+    Disabled,
+    SameRepairedLineOnceV1,
+}
+impl PostRepairRecheckPolicy {
+    pub fn search_identity(self) -> &'static str {
+        match self {
+            Self::Disabled => PALS_SEARCH_VERSION,
+            Self::SameRepairedLineOnceV1 => POST_REPAIR_RECHECK_SEARCH_VERSION,
+        }
+    }
+    pub fn conditions(self) -> Option<&'static str> {
+        match self {
+            Self::Disabled => None,
+            Self::SameRepairedLineOnceV1 => Some(POST_REPAIR_RECHECK_CONDITIONS),
+        }
+    }
+}
+
 /// Identity of the current value resolver, independent of model, CPU value
 /// namespace and search implementation identities. Changing this policy needs
 /// a new version; recording it does not calibrate CPU scores or change search.
@@ -725,10 +753,25 @@ struct RoleQuestion<'a> {
     divergences: &'a [usize],
 }
 
+/// One already accepted Repair. All slices remain owned by the current refine;
+/// this is neither a persistent queue nor a grant to reopen another root.
+struct CompletedRepairRecheck<'a> {
+    root: usize,
+    original_first: BoardMove,
+    attack_ply: usize,
+    repaired_line: LineId,
+    repair_record_revision: u64,
+    repaired_leaf: usize,
+    repaired: &'a [BoardMove],
+    refutation: &'a [BoardMove],
+    completed_value: i32,
+}
+
 /// Persistent exact situations and public evidence survive a normal root change.
 /// `new_game` is the only automatic game-wide invalidation boundary.
 pub struct PalsEngine<M: RoleModel> {
     config: PalsConfig,
+    post_repair_recheck: PostRepairRecheckPolicy,
     model: M,
     cpu: Box<dyn CpuChecker>,
     checker_registered_identity: CheckerIdentity,
@@ -760,6 +803,21 @@ impl<M: RoleModel> PalsEngine<M> {
     ) -> Result<Self, PalsError> {
         Self::new_with_boxed_cpu(config, model, Box::new(cpu))
     }
+    /// Immutable opt-in lane. Existing constructors keep Disabled semantics.
+    pub fn new_with_cpu_and_refinement_policy<C: CpuSearcher + 'static>(
+        config: PalsConfig,
+        model: M,
+        cpu: C,
+        policy: PostRepairRecheckPolicy,
+    ) -> Result<Self, PalsError> {
+        let cpu: Box<dyn CpuSearcher> = Box::new(cpu);
+        Self::new_with_boxed_checker_and_refinement_policy(
+            config,
+            model,
+            Box::new(OwnedCpuChecker::new(cpu)?),
+            policy,
+        )
+    }
     pub fn new_with_boxed_cpu(
         config: PalsConfig,
         model: M,
@@ -777,13 +835,42 @@ impl<M: RoleModel> PalsEngine<M> {
     ) -> Result<Self, PalsError> {
         Self::new_with_boxed_checker(config, model, Box::new(checker))
     }
+    pub fn new_with_checker_and_refinement_policy<C: CpuChecker + 'static>(
+        config: PalsConfig,
+        model: M,
+        checker: C,
+        policy: PostRepairRecheckPolicy,
+    ) -> Result<Self, PalsError> {
+        Self::new_with_boxed_checker_and_refinement_policy(config, model, Box::new(checker), policy)
+    }
     pub fn new_with_boxed_checker(
         config: PalsConfig,
         model: M,
         cpu: Box<dyn CpuChecker>,
     ) -> Result<Self, PalsError> {
+        Self::new_with_boxed_checker_and_refinement_policy(
+            config,
+            model,
+            cpu,
+            PostRepairRecheckPolicy::Disabled,
+        )
+    }
+    pub fn new_with_boxed_checker_and_refinement_policy(
+        config: PalsConfig,
+        model: M,
+        cpu: Box<dyn CpuChecker>,
+        policy: PostRepairRecheckPolicy,
+    ) -> Result<Self, PalsError> {
         config.validate()?;
         cpu.identity().validate()?;
+        if policy == PostRepairRecheckPolicy::SameRepairedLineOnceV1
+            && matches!(cpu.identity(), CheckerIdentity::ExternalUci(_))
+        {
+            return Err(CpuError::Unsupported(
+                "post-Repair recheck v1 requires completed own CPU evidence",
+            )
+            .into());
+        }
         let capabilities = cpu.capabilities();
         if !capabilities.divergence || !capabilities.root_moves {
             return Err(CpuError::Unsupported(
@@ -854,6 +941,7 @@ impl<M: RoleModel> PalsEngine<M> {
         let stores = PalsStores::new(Self::store_limits(&config));
         Ok(Self {
             config,
+            post_repair_recheck: policy,
             model,
             cpu,
             checker_registered_identity,
@@ -1007,6 +1095,16 @@ impl<M: RoleModel> PalsEngine<M> {
     }
     pub fn model_identity(&self) -> &str {
         self.model.identity()
+    }
+    pub fn post_repair_recheck_policy(&self) -> PostRepairRecheckPolicy {
+        self.post_repair_recheck
+    }
+    /// Consumers must bind this effective identity, not only the legacy constant.
+    pub fn search_identity(&self) -> &'static str {
+        self.post_repair_recheck.search_identity()
+    }
+    pub fn refinement_conditions(&self) -> Option<&'static str> {
+        self.post_repair_recheck.conditions()
     }
     /// Snapshot of the most recent entered search, including errors. Read after
     /// that search returns; the caller owns cumulative per-process accounting.
@@ -3559,6 +3657,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 // frontier; this conditional counterexample never blacklists it.
                 let mut repair = prefix.to_vec();
                 repair.push(response);
+                let accepted_repairs_before = counters.accepted_repair_outputs;
                 let repair_leaf = self.follow(
                     response_node,
                     &mut repair,
@@ -3572,17 +3671,17 @@ impl<M: RoleModel> PalsEngine<M> {
                 counters.repairs += 1;
                 let repair_record =
                     self.record(RecordKind::Repair, &repair, None, 0, None, None)?;
+                let repair_record_revision = self.revision;
                 self.verify(repair_leaf, &repair, limits, cancel, counters)?;
                 self.publish_choice(root, limits, cancel, progress)?;
+                let completed_repair_value =
+                    self.completed_line_value(repair_leaf, repair.len(), limits.cpu_depth);
                 if let (
                     Some((old_line, old_evidence, old_value)),
                     Some((new_line, _)),
                     Some(new_value),
-                ) = (
-                    supported_refutation,
-                    repair_record,
-                    self.completed_line_value(repair_leaf, repair.len(), limits.cpu_depth),
-                ) {
+                ) = (supported_refutation, repair_record, completed_repair_value)
+                {
                     if new_line != old_line
                         && new_value > old_value
                         && self.stopped(limits, cancel).is_none()
@@ -3603,9 +3702,283 @@ impl<M: RoleModel> PalsEngine<M> {
                         counters.supported_repairs += 1;
                     }
                 }
+                if let (true, Some((repaired_line, _)), Some(completed_value)) = (
+                    counters.accepted_repair_outputs > accepted_repairs_before,
+                    repair_record,
+                    completed_repair_value,
+                ) {
+                    self.recheck_repaired_line(
+                        CompletedRepairRecheck {
+                            root,
+                            original_first: movement,
+                            attack_ply: ply,
+                            repaired_line,
+                            repair_record_revision,
+                            repaired_leaf: repair_leaf,
+                            repaired: &repair,
+                            refutation: &refutation,
+                            completed_value,
+                        },
+                        limits,
+                        cancel,
+                        counters,
+                        progress,
+                    )?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// One C policy call against an accepted, completed Repair. The remaining
+    /// repaired suffix is only Rules replay, never another C call or Repair.
+    /// A shortened/illegal suffix stays a provisional counterexample; only a
+    /// full equal-length line with comparable completed evidence may refute.
+    fn recheck_repaired_line(
+        &mut self,
+        repair: CompletedRepairRecheck<'_>,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        counters: &mut PalsCounters,
+        progress: &mut dyn FnMut(BoardMove),
+    ) -> Result<(), PalsError> {
+        if self.post_repair_recheck == PostRepairRecheckPolicy::Disabled || self.is_external() {
+            return Ok(());
+        }
+        if let Some(stop) = self.stopped(limits, cancel) {
+            return Err(match stop {
+                PalsCompletion::Canceled => RoleError::Canceled,
+                _ => RoleError::Deadline,
+            }
+            .into());
+        }
+        if self.cpu_budget_used(counters) >= limits.max_cpu_nodes {
+            return Ok(());
+        }
+        self.validate_checker_namespace()?;
+        let root = self
+            .nodes
+            .get(repair.root)
+            .ok_or(StoreError::InvalidHandle("repair recheck root"))?;
+        let root_situation = root.situation;
+        let root_state = root.state;
+        let root_color = root.position.side_to_move();
+        if self.stores.root() != Some(root_situation) {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        let current = self.stores.situations.get(root_situation)?;
+        if current.state != root_state
+            || !self
+                .stores
+                .states
+                .get(root_state)?
+                .same_state(&root.position.snapshot())
+        {
+            return Err(StoreError::InvalidEvidence("repair recheck root state mismatch").into());
+        }
+        let root_revision = current.revision;
+        let generation = self.stores.generation();
+        let previous_evidence = current
+            .conclusions
+            .get(repair.repaired_line)
+            .and_then(|conclusion| conclusion.evidence);
+        if repair.repaired.len() > self.config.line_plies
+            || repair.attack_ply >= repair.repaired.len()
+            || repair.attack_ply >= repair.refutation.len()
+            || repair.repaired.first().copied() != Some(repair.original_first)
+            || repair.repaired[..=repair.attack_ply] != repair.refutation[..=repair.attack_ply]
+            || self.stores.lines.get(repair.repaired_line)?.start_state != root_state
+            || self.stores.lines.moves(repair.repaired_line)?.as_slice() != repair.repaired
+            || !self.records.iter().any(|record| {
+                record.origin_state == root_state
+                    && record.kind == RecordKind::Repair
+                    && record.revision == repair.repair_record_revision
+                    && record.line.as_slice() == repair.repaired
+            })
+        {
+            return Err(
+                StoreError::InvalidEvidence("repair recheck line/revision mismatch").into(),
+            );
+        }
+        if self.completed_line_value(
+            repair.repaired_leaf,
+            repair.repaired.len(),
+            limits.cpu_depth,
+        ) != Some(repair.completed_value)
+        {
+            return Ok(()); // Partial/foreign value namespaces cannot grant this work.
+        }
+        let mut path = Vec::new();
+        path.try_reserve_exact(repair.repaired.len() + 1)
+            .map_err(|_| PalsError::Capacity)?;
+        path.push(repair.root);
+        let mut node = repair.root;
+        for movement in repair.repaired {
+            node = self.nodes[node]
+                .edges
+                .iter()
+                .find(|edge| edge.movement == *movement)
+                .ok_or(StoreError::InvalidHandle("repair recheck path"))?
+                .child;
+            path.push(node);
+        }
+        if node != repair.repaired_leaf {
+            return Err(StoreError::InvalidEvidence("repair recheck leaf mismatch").into());
+        }
+        let changed_own = (repair.attack_ply + 1..repair.repaired.len()).find(|&ply| {
+            self.nodes[path[ply]].position.side_to_move() == root_color
+                && repair.refutation.get(ply) != Some(&repair.repaired[ply])
+        });
+        let Some(anchor_ply) = changed_own.and_then(|changed| {
+            (changed + 1..repair.repaired.len()).find(|&ply| {
+                self.nodes[path[ply]].position.side_to_move() != root_color
+                    && self.nodes[path[ply]].terminal.is_none()
+            })
+        }) else {
+            return Ok(()); // No eligible opponent anchor is not a proof of defense.
+        };
+        let anchor = path[anchor_ply];
+        let replies = self.ranked(
+            anchor,
+            Call::Reply,
+            &repair.repaired[..anchor_ply],
+            repair.repaired,
+            Some(repair.refutation),
+            limits,
+            cancel,
+            counters,
+        )?;
+        let original_response = repair.repaired[anchor_ply];
+        let response = replies
+            .iter()
+            .copied()
+            .find(|movement| {
+                *movement != original_response
+                    && !self.nodes[anchor]
+                        .edges
+                        .iter()
+                        .any(|edge| edge.movement == *movement)
+            })
+            .or_else(|| {
+                replies
+                    .iter()
+                    .copied()
+                    .find(|movement| *movement != original_response)
+            });
+        let Some(response) = response else {
+            return Ok(()); // No alternative response is not an all-defenses result.
+        };
+        let mut counter = Vec::new();
+        counter
+            .try_reserve_exact(repair.repaired.len())
+            .map_err(|_| PalsError::Capacity)?;
+        counter.extend_from_slice(&repair.repaired[..anchor_ply]);
+        let mut state = self.nodes[anchor].position.clone();
+        state.make_move(response)?;
+        let mut counter_leaf = self.connect(anchor, response, state, counters)?;
+        counter.push(response);
+        let mut full_suffix = true;
+        for movement in &repair.repaired[anchor_ply + 1..] {
+            if self.stopped(limits, cancel).is_some()
+                || self.nodes[counter_leaf].terminal.is_some()
+                || !self.nodes[counter_leaf]
+                    .position
+                    .legal_moves()
+                    .contains(movement)
+            {
+                full_suffix = false;
+                break;
+            }
+            let mut state = self.nodes[counter_leaf].position.clone();
+            state.make_move(*movement)?;
+            counter_leaf = self.connect(counter_leaf, *movement, state, counters)?;
+            counter.push(*movement);
+        }
+        counters.refutations += 1;
+        self.record(RecordKind::Counterexample, &counter, None, 0, None, None)?;
+        self.verify(counter_leaf, &counter, limits, cancel, counters)?;
+        self.publish_choice(repair.root, limits, cancel, progress)?;
+        if self.stores.root() != Some(root_situation)
+            || self.stores.generation() != generation
+            || self.stores.situations.get(root_situation)?.revision != root_revision
+        {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        self.validate_checker_namespace()?;
+        if !full_suffix || counter.len() != repair.repaired.len() {
+            return Ok(());
+        }
+        if !self.comparable_recheck_evidence(repair.repaired_leaf, counter_leaf, limits.cpu_depth) {
+            return Ok(());
+        }
+        let Some(counter_value) =
+            self.completed_line_value(counter_leaf, counter.len(), limits.cpu_depth)
+        else {
+            return Ok(());
+        };
+        if counter_value >= repair.completed_value {
+            return Ok(());
+        }
+        self.publish_recheck_refutation(
+            &repair,
+            counter_value,
+            previous_evidence,
+            limits,
+            cancel,
+            counters,
+        )
+    }
+    fn publish_recheck_refutation(
+        &mut self,
+        repair: &CompletedRepairRecheck<'_>,
+        counter_value: i32,
+        previous_evidence: Option<ObservationId>,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        counters: &mut PalsCounters,
+    ) -> Result<(), PalsError> {
+        // The earlier publish_choice guard precedes comparison work. Check again
+        // at this final mutation boundary before creating conclusion evidence.
+        if let Some(stop) = self.stopped(limits, cancel) {
+            return Err(match stop {
+                PalsCompletion::Canceled => RoleError::Canceled,
+                _ => RoleError::Deadline,
+            }
+            .into());
+        }
+        let evidence = self.conclusion_observation(
+            repair.root,
+            repair.repaired_line,
+            ObservationKind::Refutation,
+            counter_value,
+            previous_evidence,
+        )?;
+        self.stores.refute_continuation(
+            self.nodes[repair.root].situation,
+            repair.repaired_line,
+            evidence,
+        )?;
+        counters.supported_refutations += 1;
+        Ok(())
+    }
+    fn comparable_recheck_evidence(&self, repaired: usize, counter: usize, required: u16) -> bool {
+        let repaired = &self.nodes[repaired];
+        let counter = &self.nodes[counter];
+        match (repaired.terminal, counter.terminal) {
+            (Some(_), Some(_)) => true,
+            (None, None) => match (&repaired.evidence, &counter.evidence) {
+                (Some(repaired), Some(counter)) => {
+                    repaired.scope == CpuScoreScope::CompletedIteration
+                        && counter.scope == CpuScoreScope::CompletedIteration
+                        && repaired.depth >= required
+                        && repaired.depth == counter.depth
+                        && repaired.value_identity == counter.value_identity
+                        && self.cpu_registered_value.as_ref() == Some(&repaired.value_identity)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     }
     fn value(&self, node: usize, remaining: usize) -> Option<i32> {
         if self.is_external() {
@@ -3814,7 +4187,7 @@ impl<M: RoleModel> PalsEngine<M> {
         Ok(self.stores.append_observation(Observation {
             state: self.nodes[root].state,
             line: Some(line),
-            source: stable_id(PALS_SEARCH_VERSION),
+            source: stable_id(self.search_identity()),
             epoch: 0,
             scope: EvidenceScope::Model {
                 model: stable_id(self.model.identity()),
@@ -4795,6 +5168,554 @@ mod tests {
             max_rounds: 1,
             max_cpu_nodes: 2000,
             cpu_depth: 1,
+        }
+    }
+
+    #[derive(Default)]
+    struct RecheckRoleFixture {
+        replies: Vec<RoleLogicalContext>,
+        cancel_after_reply: bool,
+    }
+    impl RoleModel for RecheckRoleFixture {
+        fn identity(&self) -> &str {
+            "post-repair-recheck-context-fixture/1"
+        }
+        fn propose(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+            LegalOrderRoleMock.propose(query)
+        }
+        fn reply(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+            let preferred = BoardMove::from_uci("g8f6").unwrap();
+            let preferred_index = query
+                .legal
+                .iter()
+                .position(|movement| *movement == preferred);
+            let mut result = LegalOrderRoleMock.reply(query)?;
+            if let Some(index) = preferred_index {
+                result.logits[index] = 100.0;
+            }
+            Ok(result)
+        }
+        fn repair(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+            let preferred = BoardMove::from_uci("f1c4").unwrap();
+            let preferred_index = query
+                .legal
+                .iter()
+                .position(|movement| *movement == preferred);
+            let mut result = LegalOrderRoleMock.repair(query)?;
+            if let Some(index) = preferred_index {
+                result.logits[index] = 100.0;
+            }
+            Ok(result)
+        }
+        fn divergences(&mut self, query: DivergenceQuery<'_>) -> Result<Vec<f32>, RoleError> {
+            LegalOrderRoleMock.divergences(query)
+        }
+        fn reply_with_context(
+            &mut self,
+            query: RoleQuery<'_>,
+            context: &RoleLogicalContext,
+        ) -> Result<RoleEvaluation, RoleError> {
+            self.replies.push(context.clone());
+            let cancel = query.cancel;
+            let result = self.reply(query)?;
+            if self.cancel_after_reply {
+                cancel.store(true, Ordering::Release);
+            }
+            Ok(result)
+        }
+    }
+
+    /// White-box evidence fixture, not an actual CPU/NN/process acceptance run.
+    /// Completed cache values isolate conclusion scope from chess strength;
+    /// the one-node case below exercises the real bounded CPU incomplete path.
+    struct RecheckFixture {
+        engine: PalsEngine<RecheckRoleFixture>,
+        root: usize,
+        leaf: usize,
+        old_line: LineId,
+        repaired_line: LineId,
+        repair_record_revision: u64,
+        repair_evidence: ObservationId,
+        repaired: Vec<BoardMove>,
+        refutation: Vec<BoardMove>,
+        counters: PalsCounters,
+    }
+    impl RecheckFixture {
+        fn run(&mut self, limits: PalsLimits, cancel: &AtomicBool) -> Result<(), PalsError> {
+            self.engine.recheck_repaired_line(
+                CompletedRepairRecheck {
+                    root: self.root,
+                    original_first: self.repaired[0],
+                    attack_ply: 1,
+                    repaired_line: self.repaired_line,
+                    repair_record_revision: self.repair_record_revision,
+                    repaired_leaf: self.leaf,
+                    repaired: &self.repaired,
+                    refutation: &self.refutation,
+                    completed_value: 100,
+                },
+                limits,
+                cancel,
+                &mut self.counters,
+                &mut |_| {},
+            )
+        }
+    }
+    fn recheck_fixture(
+        policy: PostRepairRecheckPolicy,
+        counter_complete: bool,
+        incompatible_suffix: bool,
+    ) -> RecheckFixture {
+        fn moves(text: &[&str]) -> Vec<BoardMove> {
+            text.iter()
+                .map(|movement| BoardMove::from_uci(movement).unwrap())
+                .collect()
+        }
+        let proposal = moves(&["e2e4", "c7c5", "g1f3", "d7d6", "d2d3", "b8c6"]);
+        let (repaired, refutation, counter) = if incompatible_suffix {
+            (
+                moves(&["e2e4", "e7e5", "f1c4", "d7d5", "e4d5", "g8f6"]),
+                moves(&["e2e4", "e7e5", "g1f3", "d7d5", "e4d5", "g8f6"]),
+                moves(&["e2e4", "e7e5", "f1c4", "g8f6"]),
+            )
+        } else {
+            (
+                moves(&["e2e4", "e7e5", "f1c4", "b8c6", "d2d3", "d7d6"]),
+                moves(&["e2e4", "e7e5", "g1f3", "b8c6", "d2d3", "d7d6"]),
+                moves(&["e2e4", "e7e5", "f1c4", "g8f6", "d2d3", "d7d6"]),
+            )
+        };
+        let mut engine = PalsEngine::new_with_cpu_and_refinement_policy(
+            PalsConfig {
+                line_plies: 6,
+                ..PalsConfig::default()
+            },
+            RecheckRoleFixture::default(),
+            CpuEngine::new(CpuConfig {
+                max_depth: 4,
+                tt_entries: 128,
+                ..CpuConfig::default()
+            })
+            .unwrap(),
+            policy,
+        )
+        .unwrap();
+        let position = Position::startpos();
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine.intern(position.clone()).unwrap();
+        let mut counters = PalsCounters::default();
+        let mut path = vec![root];
+        let mut node = root;
+        for movement in &repaired {
+            let mut child = engine.nodes[node].position.clone();
+            child.make_move(*movement).unwrap();
+            node = engine
+                .connect(node, *movement, child, &mut counters)
+                .unwrap();
+            path.push(node);
+        }
+        let leaf = node;
+        let identity = engine.owned_identity().unwrap().clone();
+        engine.nodes[leaf].evidence = Some(CpuEvidence {
+            score: 100,
+            depth: 1,
+            scope: CpuScoreScope::CompletedIteration,
+            value_identity: identity.clone(),
+        });
+        if counter_complete {
+            let mut counter_position = position;
+            for movement in &counter {
+                counter_position.make_move(*movement).unwrap();
+            }
+            // Intern the leaf without connecting its anchor edge, so C's
+            // preferred alternative remains the first unexamined response.
+            let counter_leaf = engine.intern(counter_position).unwrap();
+            engine.nodes[counter_leaf].evidence = Some(CpuEvidence {
+                score: -100,
+                depth: 1,
+                scope: CpuScoreScope::CompletedIteration,
+                value_identity: identity,
+            });
+        }
+        let (old_line, _) = engine
+            .record(RecordKind::Proposal, &proposal, None, 0, None, None)
+            .unwrap()
+            .unwrap();
+        let old_evidence = engine
+            .conclusion_observation(root, old_line, ObservationKind::Refutation, 50, None)
+            .unwrap();
+        engine
+            .stores
+            .refute_continuation(engine.nodes[root].situation, old_line, old_evidence)
+            .unwrap();
+        let ranked = engine
+            .ranked(
+                path[2],
+                Call::Repair,
+                &repaired[..2],
+                &proposal,
+                Some(&refutation),
+                limits(),
+                &AtomicBool::new(false),
+                &mut counters,
+            )
+            .unwrap();
+        assert_eq!(ranked[0], repaired[2]);
+        let (repaired_line, _) = engine
+            .record(RecordKind::Repair, &repaired, None, 0, None, None)
+            .unwrap()
+            .unwrap();
+        let repair_record_revision = engine.revision;
+        let repair_evidence = engine
+            .conclusion_observation(
+                root,
+                repaired_line,
+                ObservationKind::Repair,
+                100,
+                Some(old_evidence),
+            )
+            .unwrap();
+        engine
+            .stores
+            .repair(
+                engine.nodes[root].situation,
+                old_line,
+                repaired_line,
+                repair_evidence,
+            )
+            .unwrap();
+        RecheckFixture {
+            engine,
+            root,
+            leaf,
+            old_line,
+            repaired_line,
+            repair_record_revision,
+            repair_evidence,
+            repaired,
+            refutation,
+            counters,
+        }
+    }
+
+    #[test]
+    fn post_repair_policy_is_constructor_selected_and_legacy_disabled() {
+        assert_eq!(
+            engine().post_repair_recheck_policy(),
+            PostRepairRecheckPolicy::Disabled
+        );
+        assert_eq!(engine().search_identity(), PALS_SEARCH_VERSION);
+        assert_eq!(engine().refinement_conditions(), None);
+        let mut fixture = recheck_fixture(PostRepairRecheckPolicy::Disabled, true, false);
+        fixture.run(limits(), &AtomicBool::new(false)).unwrap();
+        assert!(fixture.engine.model.replies.is_empty());
+        assert_eq!(fixture.counters.critic_calls, 0);
+        assert_eq!(fixture.counters.supported_refutations, 0);
+        let mut selected =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        assert_eq!(
+            selected.engine.search_identity(),
+            POST_REPAIR_RECHECK_SEARCH_VERSION
+        );
+        assert_eq!(
+            selected.engine.refinement_conditions(),
+            Some(POST_REPAIR_RECHECK_CONDITIONS)
+        );
+        selected.engine.new_game();
+        assert_eq!(
+            selected.engine.post_repair_recheck_policy(),
+            PostRepairRecheckPolicy::SameRepairedLineOnceV1
+        );
+    }
+
+    #[test]
+    fn post_repair_one_reply_uses_revised_context_and_refutes_only_that_line() {
+        use super::super::store::ContinuationStatus;
+        let mut fixture =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        fixture.run(limits(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(fixture.engine.model.replies.len(), 1);
+        let context = &fixture.engine.model.replies[0];
+        assert_eq!(context.purpose, RoleQueryPurpose::ReplyPolicy);
+        assert_eq!(context.prefix, fixture.repaired[..3]);
+        assert_eq!(
+            context.proposal_sha256,
+            role_line_sha256(b"proposal", &fixture.repaired).unwrap()
+        );
+        assert_eq!(
+            context.refutation_sha256,
+            Some(role_line_sha256(b"refutation", &fixture.refutation).unwrap())
+        );
+        assert!(context.public_revision >= fixture.repair_record_revision);
+        assert_eq!(fixture.counters.critic_calls, 1);
+        assert_eq!(fixture.counters.accepted_critic_outputs, 1);
+        assert_eq!(fixture.counters.accepted_repair_outputs, 1);
+        assert_eq!(fixture.counters.supported_refutations, 1);
+        assert_eq!(fixture.counters.consumed_cached_cpu_values, 1);
+        let situation = fixture
+            .engine
+            .stores
+            .situations
+            .get(fixture.engine.nodes[fixture.root].situation)
+            .unwrap();
+        assert!(situation.dirty);
+        assert_eq!(
+            situation.conclusions.get(fixture.old_line).unwrap().status,
+            ContinuationStatus::RepairedBy(fixture.repaired_line)
+        );
+        let conclusion = situation.conclusions.get(fixture.repaired_line).unwrap();
+        assert_eq!(conclusion.status, ContinuationStatus::Refuted);
+        let evidence = fixture
+            .engine
+            .stores
+            .observations
+            .get(conclusion.evidence.unwrap())
+            .unwrap();
+        assert_eq!(evidence.supersedes, Some(fixture.repair_evidence));
+        assert_eq!(
+            evidence.source,
+            stable_id(POST_REPAIR_RECHECK_SEARCH_VERSION)
+        );
+        assert!(matches!(evidence.scope, EvidenceScope::Model { .. }));
+        assert!(
+            fixture.engine.nodes[fixture.root]
+                .edges
+                .iter()
+                .any(|edge| edge.movement == fixture.repaired[0])
+        );
+    }
+
+    #[test]
+    fn post_repair_illegal_suffix_preserves_provisional_counter_without_refutation() {
+        use super::super::store::ContinuationStatus;
+        let mut fixture =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, true);
+        fixture.run(limits(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(fixture.engine.model.replies.len(), 1);
+        assert_eq!(fixture.counters.supported_refutations, 0);
+        assert_eq!(fixture.counters.consumed_cached_cpu_values, 1);
+        let record = fixture
+            .engine
+            .records
+            .iter()
+            .rev()
+            .find(|record| record.kind == RecordKind::Counterexample)
+            .unwrap();
+        assert_eq!(record.line.len(), 4);
+        assert_eq!(record.line[0], fixture.repaired[0]);
+        assert_eq!(record.value, None);
+        assert_eq!(
+            fixture
+                .engine
+                .stores
+                .situations
+                .get(fixture.engine.nodes[fixture.root].situation)
+                .unwrap()
+                .conclusions
+                .get(fixture.repaired_line)
+                .unwrap()
+                .status,
+            ContinuationStatus::Supported
+        );
+    }
+
+    #[test]
+    fn post_repair_incomplete_cpu_and_exhausted_or_canceled_controls_do_not_refute() {
+        use super::super::store::ContinuationStatus;
+        let mut fixture = recheck_fixture(
+            PostRepairRecheckPolicy::SameRepairedLineOnceV1,
+            false,
+            false,
+        );
+        fixture
+            .run(
+                PalsLimits {
+                    max_cpu_nodes: 1,
+                    ..limits()
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(fixture.engine.model.replies.len(), 1);
+        assert!(fixture.counters.cpu_nodes <= 1);
+        assert_eq!(fixture.counters.supported_refutations, 0);
+        assert_eq!(
+            fixture
+                .engine
+                .stores
+                .situations
+                .get(fixture.engine.nodes[fixture.root].situation)
+                .unwrap()
+                .conclusions
+                .get(fixture.repaired_line)
+                .unwrap()
+                .status,
+            ContinuationStatus::Supported
+        );
+        let mut exhausted =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        exhausted.engine.config.max_role_calls = exhausted.counters.role_calls;
+        assert!(matches!(
+            exhausted.run(limits(), &AtomicBool::new(false)),
+            Err(PalsError::RoleCallLimit)
+        ));
+        assert!(exhausted.engine.model.replies.is_empty());
+        let mut cpu_exhausted =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        cpu_exhausted.counters.cpu_nodes = limits().max_cpu_nodes;
+        cpu_exhausted
+            .run(limits(), &AtomicBool::new(false))
+            .unwrap();
+        assert!(cpu_exhausted.engine.model.replies.is_empty());
+        assert_eq!(cpu_exhausted.counters.supported_refutations, 0);
+        let mut canceled =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        assert!(matches!(
+            canceled.run(limits(), &AtomicBool::new(true)),
+            Err(PalsError::Role(RoleError::Canceled))
+        ));
+        assert!(canceled.engine.model.replies.is_empty());
+    }
+
+    #[test]
+    fn post_repair_different_completed_depth_is_unresolved_and_foreign_lane_is_unsupported() {
+        use super::super::store::ContinuationStatus;
+        let mut fixture =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        for node in &mut fixture.engine.nodes {
+            if let Some(evidence) = node
+                .evidence
+                .as_mut()
+                .filter(|evidence| evidence.score == -100)
+            {
+                evidence.depth = 2;
+            }
+        }
+        fixture.run(limits(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(fixture.counters.consumed_cached_cpu_values, 1);
+        assert_eq!(fixture.counters.supported_refutations, 0);
+        assert_eq!(
+            fixture
+                .engine
+                .stores
+                .situations
+                .get(fixture.engine.nodes[fixture.root].situation)
+                .unwrap()
+                .conclusions
+                .get(fixture.repaired_line)
+                .unwrap()
+                .status,
+            ContinuationStatus::Supported,
+        );
+        assert!(matches!(
+            PalsEngine::new_with_checker_and_refinement_policy(
+                PalsConfig::default(),
+                RecheckRoleFixture::default(),
+                ForeignFixture::new(ForeignFixtureMode::Normal(1)),
+                PostRepairRecheckPolicy::SameRepairedLineOnceV1,
+            ),
+            Err(PalsError::Cpu(CpuError::Unsupported(_)))
+        ));
+        let mut stale =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        stale.repair_record_revision += 1;
+        assert!(matches!(
+            stale.run(limits(), &AtomicBool::new(false)),
+            Err(PalsError::Store(StoreError::InvalidEvidence(_)))
+        ));
+        assert!(stale.engine.model.replies.is_empty());
+    }
+
+    #[test]
+    fn post_repair_late_reply_is_completed_but_not_accepted_or_consumed() {
+        let mut fixture =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        fixture.engine.model.cancel_after_reply = true;
+        let consumed_before = fixture.counters.consumed_role_outputs;
+        assert!(matches!(
+            fixture.run(limits(), &AtomicBool::new(false)),
+            Err(PalsError::Role(RoleError::Canceled))
+        ));
+        assert_eq!(fixture.counters.critic_calls, 1);
+        assert_eq!(fixture.counters.completed_critic_calls, 1);
+        assert_eq!(fixture.counters.accepted_critic_outputs, 0);
+        assert_eq!(fixture.counters.consumed_role_outputs, consumed_before);
+        assert_eq!(fixture.counters.supported_refutations, 0);
+        assert!(
+            !fixture
+                .engine
+                .records
+                .iter()
+                .any(|record| record.kind == RecordKind::Counterexample)
+        );
+    }
+
+    #[test]
+    fn post_repair_final_refutation_boundary_rejects_late_cancel_and_deadline() {
+        use super::super::store::ContinuationStatus;
+        for canceled in [true, false] {
+            let mut fixture =
+                recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+            let root_situation = fixture.engine.nodes[fixture.root].situation;
+            let before = fixture
+                .engine
+                .stores
+                .situations
+                .get(root_situation)
+                .unwrap();
+            let revision_before = before.revision;
+            let dirty_before = before.dirty;
+            let observations_before = fixture.engine.stores.observations.len();
+            let records_before = fixture.engine.records.len();
+            let mut final_limits = limits();
+            if !canceled {
+                final_limits.deadline = Instant::now();
+            }
+            // Model a stop arriving after the earlier publish_choice and evidence
+            // comparisons: invoke the actual final publication boundary directly.
+            let result = fixture.engine.publish_recheck_refutation(
+                &CompletedRepairRecheck {
+                    root: fixture.root,
+                    original_first: fixture.repaired[0],
+                    attack_ply: 1,
+                    repaired_line: fixture.repaired_line,
+                    repair_record_revision: fixture.repair_record_revision,
+                    repaired_leaf: fixture.leaf,
+                    repaired: &fixture.repaired,
+                    refutation: &fixture.refutation,
+                    completed_value: 100,
+                },
+                -100,
+                Some(fixture.repair_evidence),
+                final_limits,
+                &AtomicBool::new(canceled),
+                &mut fixture.counters,
+            );
+            assert!(matches!(
+                (canceled, result),
+                (true, Err(PalsError::Role(RoleError::Canceled)))
+                    | (false, Err(PalsError::Role(RoleError::Deadline)))
+            ));
+            let after = fixture
+                .engine
+                .stores
+                .situations
+                .get(root_situation)
+                .unwrap();
+            let conclusion = after.conclusions.get(fixture.repaired_line).unwrap();
+            assert_eq!(after.revision, revision_before);
+            assert_eq!(after.dirty, dirty_before);
+            assert_eq!(conclusion.status, ContinuationStatus::Supported);
+            assert_eq!(conclusion.evidence, Some(fixture.repair_evidence));
+            assert_eq!(
+                fixture.engine.stores.observations.len(),
+                observations_before
+            );
+            assert_eq!(fixture.engine.records.len(), records_before);
+            assert_eq!(fixture.counters.supported_refutations, 0);
         }
     }
 

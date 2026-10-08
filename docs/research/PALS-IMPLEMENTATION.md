@@ -1859,3 +1859,32 @@ packing source `9fbcdcd145c26e488fad44641ad794174859fa00`의 CI run
 skip 없이 실제 `ok`를 확인했다. CPU ORT의 합성 K/V 수치·artifact·입력 거절
 검사는 이 source에 한정하며, 위 feedback reload 수정은 후속 SHA에서 검사한다.
 학습·GPU·Rust CUDA resident consumer·CPU04 pair 인수로 확대하지 않는다.
+
+feedback reload 수정 source `cb0752fc95ad70f3ad76d9fd6c9cf308429c0f61`의
+CI run `37721828446`도 네 CPU job 모두 SUCCESS를 확인했다. 마지막 Linux job은
+2026-10-08 03:19:48 UTC에 완료됐다. PALS suite 359개와 feedback 27개 모두
+실제 `ok`를 확인했으며 skip으로 대체하지 않았다. 두 cold V forward·raw replay
+fixture는 합성 child 관측과 frozen CPU 모델을 사용한다. 실제 등록 Rust child,
+외부 owner의 producer 종료·cleanup 및 CPU04 대국의 인수는 계속 별도다.
+
+### Repair 뒤 같은 line을 한 번 재검토하는 opt-in 경계
+
+`PostRepairRecheckPolicy::SameRepairedLineOnceV1`은 실제 Repair 출력이 수용되고
+완료 evidence를 가진 해당 repaired line에만 적용한다. 기본 constructor는
+`Disabled`이며 기존 search identity를 보존한다. 활성 정책은 별도 search identity와
+immutable getter를 가지며 첫 지원 범위는 자체 CPU/Rules evidence다. ExternalUci
+checker와 이 정책의 조합은 생성 단계에서 거절한다.
+
+현재 root·history·line·record revision·checker namespace를 대조하고, 이번 Repair를
+유발한 refutation과 다른 우리 응수 뒤의 상대 anchor에서 Reply를 최대 한 번 요청한다.
+이후 suffix는 Rules로 재생하며 추가 Reply follow나 재귀 Repair를 만들지 않는다.
+같은 길이의 완전 수순에서 양쪽 Rules terminal 또는 같은 namespace·같은 완료 CPU
+depth를 만족할 때만 해당 repaired LineId의 조건부 refutation을 게시한다. 미완료·단축·
+불법 suffix·깊이 불일치·대안 부재는 새로운 반박이나 전체 방어 증명이 아니다.
+
+최종 publication은 observation 추가·line refutation·지원 counter 증가 전에 다시
+deadline/cancel을 확인한다. 독립 검토에서 발견한 이 guard 누락은 수정했으며,
+focused fixture는 바로 이 최종 경계에 늦은 취소와 만료를 넣는 형태다. 실제 CPU·NN
+실행 인수로 해석하지 않는다. CLI/driver·manifest/arena·collector의 선택과 receipt
+연결은 별도 소비자 단위이며, 이 engine 단위만으로 제품에서 선택 가능하다고
+보고하지 않는다. 특히 early/unknown PalsResult에는 정책 식별 필드가 없다.
