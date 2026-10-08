@@ -2981,10 +2981,17 @@ state·논리 context·출력 인수 여부·선택한 수를 보존하고, 부�
 관측을 보존하고 세 번째 Repair endpoint의 근거를 덮어쓰지 않는다. Rules terminal은
 별도 종료 결과이며 네 번째 CPU 관측을 만들어 넣지 않는다.
 
-신규 소스 검사 12개는 C의 응답과 다음 수가 모두 Repair와 달라지는 예, fresh 네 번째
+신규 소스 검사 13개는 C의 응답과 다음 수가 모두 Repair와 달라지는 예, fresh 네 번째
 실행·정확한 history/context·기존 3N 선택 보존, anchor 부재, 자원 부족, 부분 CPU,
 마감·취소·모델 오류·잘못된 출력·물리 완료 불명을 다룬다. 이 문단은 검사 범위의
 설명이며 실행 성공은 정확한 SHA의 CPU CI 자료로 별도 확인한다. native RequestId·
 모델/provider 실행·strict Query 환류·external supervisor·전체 비용·물리 종료·utility·
 학습 target 인수는 이 소스 경로만으로 성립하지 않는다. 실제 학습은 범위 밖이며
 GPU 검증은 사용자 지시에 따라 보류한다.
+
+새 L=5 합성 fixture의 초기 quiescence 한도 4에서는 세 번째 Repair 관측이 부분
+완료여서 C 단계에 진입하지 않았다. 해당 입력·조건을 음성 검사로 보존하고
+`QuiescenceLimit`·task failure·새 C 및 네 번째 실행 부재를 확인한다. 양성 경로의
+합성 fixture는 생성자에서 quiescence 16을 명시하고 네 단계에 동일하게 적용한다.
+제품·등록 실행·기존 2N/3N fixture의 설정이나 완료 기준을 변경하거나 부분 완료 후
+자동으로 한도·마감·자원을 바꾸지 않는다. 이전 CI의 실패 원문도 별도로 보존한다.

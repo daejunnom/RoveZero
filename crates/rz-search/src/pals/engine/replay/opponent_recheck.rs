@@ -162,6 +162,11 @@ mod tests {
         moves.iter().map(|text| mv(text)).collect()
     }
     fn fixture() -> FreshReplayOwner<Roles> {
+        fixture_with_quiescence(16)
+    }
+    // Constructor-selected finite synthetic test condition, identical across
+    // all four stages. No partial result triggers an automatic setting change.
+    fn fixture_with_quiescence(quiescence_ply: u16) -> FreshReplayOwner<Roles> {
         let root = Position::startpos();
         let mut target = root.clone();
         target.make_move(mv("e2e4")).unwrap();
@@ -212,7 +217,7 @@ mod tests {
                     profile: CpuProfile::PlanAssisted,
                     tt_entries: 16,
                     max_depth: 2,
-                    quiescence_ply: 4,
+                    quiescence_ply,
                 },
             },
         )
@@ -440,6 +445,36 @@ mod tests {
         );
         assert_eq!(owner.stages.len(), 1);
         assert!(owner.opponent_role_steps().is_empty());
+    }
+
+    #[test]
+    fn original_short_quiescence_repair_stays_partial_and_never_enters_new_c() {
+        let mut owner = fixture_with_quiescence(4);
+        let outcome = owner
+            .run_with_opponent_recheck(limits(), &AtomicBool::new(false))
+            .unwrap();
+        let ReplayOpponentOutcome::RepairNotReady(ReplayRepairOutcome::PartialRepairEndpoint {
+            execution,
+            observation,
+        }) = outcome
+        else {
+            panic!("{outcome:?}; stages={:?}", owner.stages);
+        };
+        assert_eq!(owner.stages.len(), 3);
+        let third = &owner.stages[2];
+        assert_eq!(third.execution, execution);
+        assert_eq!(third.observation, observation);
+        assert_eq!(
+            third.report.as_ref().unwrap().completion,
+            CpuCompletion::QuiescenceLimit
+        );
+        assert!(!third.exact_completed);
+        assert_eq!(owner.task(execution).unwrap().status, TaskStatus::Failed);
+        assert_eq!(owner.counters.cpu_tasks_requested, 3);
+        assert!(owner.opponent_role_steps().is_empty() && owner.engine.model.contexts.is_empty());
+        assert!(owner.opponent_endpoint().is_none());
+        assert_eq!(owner.plan.cpu.quiescence_ply, 4);
+        assert_eq!(owner.engine.model.finish_calls, 1);
     }
 
     #[test]
