@@ -134,6 +134,7 @@ pub struct PriorStage {
     report_qnodes: Option<u64>,
     report_tt_hits: Option<u64>,
     report_elapsed_ms: Option<u64>,
+    attempt_present: bool,
     attempt_nodes: Option<u64>,
     observation_present: bool,
     /// Metadata only; separate from the numeric/move feature view.
@@ -146,6 +147,7 @@ impl PriorStage {
         self.exact_completed
             && self.report_present
             && self.observation_present
+            && self.attempt_present
             && self.completion == Some(PriorCompletion::DepthLimit)
             && self.completed_iteration
             && self.completed_depth == Some(self.requested_depth)
@@ -260,7 +262,8 @@ impl ReplayQueryPrior {
             out.registered_condition_sha256 =
                 Sha256::digest(stage.registered_condition().as_bytes()).into();
             out.task_condition_sha256 = Sha256::digest(stage.task_condition().as_bytes()).into();
-            out.attempt_nodes = stage.attempt().map(|attempt| attempt.work.nodes);
+            out.attempt_present = stage.attempt().is_some();
+            out.attempt_nodes = stage.attempt().and_then(|attempt| attempt.work.nodes);
             if let Some(report) = stage.report() {
                 out.report_present = true;
                 out.completed_depth = Some(report.completed_depth);
@@ -515,6 +518,8 @@ fn classify(
                 }
             || !raw.report_present
             || raw.observation_id.is_none()
+            || !raw.attempt_present
+            || raw.attempt_nodes != stage.attempt_nodes
             || !raw.raw_stage.complete
             || !raw.raw_task.complete
             || !raw.raw_observation.as_ref().is_some_and(|s| s.complete)
@@ -663,6 +668,8 @@ pub(super) mod tests {
             stage.report_qnodes = Some(0);
             stage.report_tt_hits = Some(0);
             stage.observation_present = true;
+            stage.attempt_present = true;
+            stage.attempt_nodes = Some(10);
             let mut raw = CpuStageObservation::reserved().unwrap();
             raw.phase = raw_phases[at];
             raw.cpu_execution = at;
@@ -674,6 +681,8 @@ pub(super) mod tests {
             raw.report_qnodes = Some(0);
             raw.report_tt_hits = Some(0);
             raw.observation_id = Some(at);
+            raw.attempt_present = true;
+            raw.attempt_nodes = Some(10);
             raw.raw_stage.complete = true;
             raw.raw_task.complete = true;
             raw.raw_observation.as_mut().unwrap().complete = true;
