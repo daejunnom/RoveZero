@@ -2155,3 +2155,34 @@ commit의 CPU CI에서 별도 인수한다. Query/2는 scoring·utility·target�
 제품 권한이 모두 false인 첫 입력 단위다. 실제 frozen action scorer, 같은 conditional
 witness의 전체 action 완료·인과·비용 인수, 별도 masked target consumer는 후속 필수
 단위다. depth 증가·점수 일치·counterexample 부재를 utility로 간주하지 않는다.
+
+### Query/2 fixture 실패 보존과 resident CUDA owner 연결 초안
+
+[CI 37741985878](https://github.com/daejunnom/RoveZero/actions/runs/37741985878)는
+`0faf70c3e28436f3ecb36ec3484f074a5248c7b1`에서 Linux·Windows·CPU bindings가
+성공하고 model suite 469개 중 1개가 error로 종료했다. Defer 중복 검사의 두 번째
+fixture가 원래 관측 receipt보다 짧은 1ms deadline을 선언하여, 중복 검사를 하기
+전에 strict receipt 검증에서 거부됐다. 원래 실패 자료를 보존하고 fixture의 두 번째
+예산을 99999 nodes/9999ms로 수정했다. 첫 action의 100000 nodes/10000ms와는
+계속 다른 controls이며, 제품 Query/2와 완료 receipt의 검사 조건은 바꾸지 않았다.
+수정된 fixture의 실제 통과 여부는 후속 exact commit의 CPU CI로 별도 확인한다.
+
+명시적인 CUDA resident owner 초안은 기존 `device_public_memory`·host pages·Warm과
+분리한다. 실제 model/manifest/public graph/Rules-composite encoding·전체 runtime
+bundle·device·game namespace를 대조하고, 고정 packing graph의 실제 Session·loaded
+interface·all-CUDA 초기 배치를 별도로 확인한다. 초기 registry를 만든 뒤 실제 예약
+capacity도 같은 aggregate limit에 합산하여 packing Session 시작 전에 거부할 수 있다.
+이 계산은 알려진 예약 선언이며 실제 RAM·VRAM peak가 아니다.
+
+실행 수명은 public subset Run/sync → packing Run/sync → finite scalar·mask·device
+검사 → private completion capability → 선택 slice publication → 기존 private role
+순서다. 논리 취소와 물리 완료를 구분하며 unknown completion·unwind에서는 최초
+원인과 session·backing·binding·allocator·pin을 함께 보존한다. 기존 model residency는
+loaded model의 session만 센다. 별도 snapshot의 `packing_native_sessions`는 실제
+보유한 보조 Session 수이며, 후속 receipt·총 자원 예산에서는 두 관측을 합산해야 한다.
+snapshot이나 정적 graphbody 성공만으로 Run·finite·fence 권한을 만들지 않는다.
+
+이 단위는 두 독립 소스 리뷰와 중앙 Rust 서식을 거친 구현 초안이다. 실제 Rust
+compile·CPU fixture 인수는 새 CI에 남아 있고, UCI factory·CLI 선택·arena receipt
+연결도 후속 단위다. 이번 세션의 GPU 검증 보류를 유지하며 실제 장치·수치·Run·
+완료·메모리·대국·학습 검사는 수행하지 않는다.

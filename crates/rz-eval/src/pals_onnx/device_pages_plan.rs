@@ -23,6 +23,9 @@ use std::fmt;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(feature = "experimental-io-binding")]
+pub(super) mod native;
+
 pub const DEVICE_PAGE_RECORD_CAPACITY: usize = 128;
 const BOARD: usize = 66;
 const HEADS: usize = 2;

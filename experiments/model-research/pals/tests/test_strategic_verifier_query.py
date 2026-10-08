@@ -593,7 +593,9 @@ class StrategicQueryTests(unittest.TestCase):
     def test_defer_cpu_options_cannot_create_fake_alternatives(self):
         f = self.f
         f.profiles.append(f.profile(horizon=5, tt=32, q=5))
-        f.actions = [f.action("defer"), f.action("defer", 1, nodes=1, wall=1)]
+        # Both strict semantic fixtures must be valid before the duplicate guard;
+        # use distinct limits that still cover their original observed receipts.
+        f.actions = [f.action("defer"), f.action("defer", 1, nodes=99999, wall=9999)]
         f.refresh()
         with self.assertRaisesRegex(ValueError, "effective duplicate"):
             f.admit()

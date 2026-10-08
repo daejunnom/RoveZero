@@ -54,6 +54,10 @@ pub use device_packing_graph::{
     PackingGraphTensorDescriptor, PACKING_GRAPH_BODY_INSPECTOR_VERSION,
     PACKING_GRAPH_MAX_INSPECTION_HOST_BYTES, PACKING_GRAPH_MAX_WIRE_FIELDS,
 };
+#[cfg(feature = "experimental-io-binding")]
+pub use device_pages_plan::native::{
+    resident_cuda_minimum_metadata_host_bytes, CudaRecordPageSnapshot, CudaRecordPageStats,
+};
 pub use device_pages_plan::{
     device_packing_maximum_node_payload_sum, CpuOwnedPublicBacking, DevicePageDomain,
     DevicePageError, DevicePageInvocationDeclaration, DevicePageNamespace, DevicePagePayload,
@@ -95,6 +99,8 @@ pub enum HostRecordPageObservationBoundary {
     Evaluate,
     NewGame,
     SnapshotStats,
+    #[cfg(feature = "experimental-io-binding")]
+    SnapshotCudaRecordPages,
     VerifyRuntime,
     VerifyCudaPlacement,
     ObserveRuntimeMappings,
@@ -1525,6 +1531,10 @@ pub enum PalsNativeCommand {
     EvaluatePrivateWarm(PalsWarmInput),
     NewGame,
     SnapshotStats,
+    /// Metadata from this exclusive worker's actual resident owner. This command
+    /// neither creates a native Run nor converts unknown completion to a fence.
+    #[cfg(feature = "experimental-io-binding")]
+    SnapshotCudaRecordPages,
     VerifyRuntime,
     VerifyCudaPlacement,
     ObserveRuntimeMappings,
@@ -1533,6 +1543,8 @@ pub enum PalsNativeResult {
     Evaluation(PalsRawOutput),
     NewGame,
     Stats(PalsBackendStats),
+    #[cfg(feature = "experimental-io-binding")]
+    CudaRecordPagesObserved(Box<CudaRecordPageSnapshot>),
     RuntimeVerified,
     CudaPlacementVerified(Box<PalsCudaPlacementWitness>),
     RuntimeMappingsObserved(Box<PalsNativeMappingWitness>),
@@ -1681,7 +1693,11 @@ pub struct PalsGraphIdentity {
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PalsSessionResidency {
+    /// Loaded model graphs only. Weight-free auxiliary graphs are reported in
+    /// their separate owner snapshot, never folded into model weight identity.
     pub graphs: Vec<PalsGraphIdentity>,
+    /// Loaded model sessions. A selected resident owner separately reports its
+    /// actual packing Session; callers must include it in total-session budgets.
     pub native_sessions: usize,
     pub layout: String,
     pub reader_initializer_bank: Option<ReaderInitializerBank>,
@@ -1691,6 +1707,18 @@ pub struct PalsSessionResidency {
     pub role_reader_weights_shared: Option<bool>,
     pub native_resident_parameter_bytes: Option<u64>,
     pub vram_peak_bytes: Option<u64>,
+}
+/// Explicit resident-page registration, before the backend enters its worker.
+/// Model, graph, encoding, runtime and game identities are derived from this
+/// backend; neither a caller Session nor a placement declaration is accepted.
+#[cfg(feature = "experimental-io-binding")]
+pub struct PalsCudaRecordPageRegistration {
+    pub checked_graph: CheckedFixedPackingGraph,
+    pub process_epoch: rz_contracts::ProcessEpoch,
+    pub frozen_epoch: u64,
+    pub limits: DevicePagesLimits,
+    pub invocation: DevicePageInvocationDeclaration,
+    pub profile_root: std::path::PathBuf,
 }
 /// A session's execution weight epoch never changes. It has exactly one cache
 /// slot, one active input slot and one exclusive caller/physical worker.
@@ -1726,6 +1754,8 @@ pub struct PalsOnnxBackend {
     device_memory: Option<device::DeviceMemory>,
     #[cfg(feature = "experimental-io-binding")]
     device_role: Option<device::DeviceRole>,
+    #[cfg(feature = "experimental-io-binding")]
+    cuda_record_pages: Option<device_pages_plan::native::CudaRecordPages>,
     quarantine: Option<BackendError>,
     startup_stage_probe: Option<PalsStartupStageProbe>,
     pub public_encodes: u64,
@@ -1975,7 +2005,102 @@ impl PalsOnnxBackend {
             device_memory: None,
             #[cfg(feature = "experimental-io-binding")]
             device_role: None,
+            #[cfg(feature = "experimental-io-binding")]
+            cuda_record_pages: None,
         })
+    }
+    #[cfg(feature = "experimental-io-binding")]
+    pub fn install_registered_cuda_record_pages(
+        &mut self,
+        registration: PalsCudaRecordPageRegistration,
+    ) -> Result<(), BackendError> {
+        let device_id = match self.config.provider {
+            Provider::Cuda { device_id, .. } if device_id >= 0 => device_id as u32,
+            _ => {
+                return Err(fail(
+                    K::BackendUnavailable,
+                    S::Admission,
+                    "resident PALS pages require an explicit CUDA device",
+                ));
+            }
+        };
+        let public_graph = self
+            .residency
+            .graphs
+            .iter()
+            .find(|graph| graph.role == "public")
+            .ok_or_else(|| {
+                fail(
+                    K::IdentityMismatch,
+                    S::Admission,
+                    "resident PALS pages have no loaded public graph identity",
+                )
+            })?
+            .sha256;
+        let rules_semantic = self.rules_input_semantic_sha256.ok_or_else(|| {
+            fail(
+                K::IdentityMismatch,
+                S::Admission,
+                "resident PALS pages require the loaded Rules semantic input identity",
+            )
+        })?;
+        let encoding = {
+            use sha2::Digest as _;
+            let mut digest = sha2::Sha256::new();
+            digest.update(PALS_ENCODING_SCHEMA);
+            digest.update(rules_semantic);
+            digest.finalize().into()
+        };
+        let namespace = DevicePageNamespace {
+            process_epoch: registration.process_epoch,
+            model_manifest: self.manifest_digest,
+            model_epoch: self.epoch,
+            public_graph,
+            encoding,
+            frozen_epoch: registration.frozen_epoch,
+            game_generation: self.game_generation,
+            domain: DevicePageDomain::Cuda {
+                device_id,
+                runtime_sha256: self.runtime.bundle_digest().ok_or_else(|| {
+                    fail(
+                        K::IdentityMismatch,
+                        S::Admission,
+                        "resident PALS pages require the actual CUDA runtime bundle identity",
+                    )
+                })?,
+            },
+        };
+        self.install_cuda_record_pages(
+            registration.checked_graph,
+            namespace,
+            registration.limits,
+            registration.invocation,
+            registration.profile_root,
+        )
+    }
+    /// Observation of this owner only, never host K/V or a new fence.
+    #[cfg(feature = "experimental-io-binding")]
+    pub fn cuda_record_page_snapshot(
+        &self,
+    ) -> Result<Option<CudaRecordPageSnapshot>, BackendError> {
+        self.cuda_record_pages
+            .as_ref()
+            .map(device_pages_plan::native::CudaRecordPages::snapshot)
+            .transpose()
+    }
+    fn has_active_physical_invocation(&self) -> bool {
+        if self.active.is_some() || self.active_memory.is_some() {
+            return true;
+        }
+        #[cfg(feature = "experimental-io-binding")]
+        if self
+            .cuda_record_pages
+            .as_ref()
+            .is_some_and(device_pages_plan::native::CudaRecordPages::has_active_invocation)
+        {
+            return true;
+        }
+        false
     }
     pub fn model_epoch(&self) -> [u8; 32] {
         self.epoch
@@ -2014,6 +2139,10 @@ impl PalsOnnxBackend {
             return Err(cause.clone());
         }
         if self.config.device_public_memory {
+            return Ok(None);
+        }
+        #[cfg(feature = "experimental-io-binding")]
+        if self.cuda_record_pages.is_some() {
             return Ok(None);
         }
         self.record_pages
@@ -2071,7 +2200,18 @@ impl PalsOnnxBackend {
             .transpose()
     }
     pub fn quarantine_cause(&self) -> Option<&BackendError> {
-        self.quarantine.as_ref()
+        if let Some(cause) = &self.quarantine {
+            return Some(cause);
+        }
+        #[cfg(feature = "experimental-io-binding")]
+        if let Some(cause) = self
+            .cuda_record_pages
+            .as_ref()
+            .and_then(device_pages_plan::native::CudaRecordPages::quarantine_cause)
+        {
+            return Some(cause);
+        }
+        None
     }
     /// Bounded host page ownership evidence. This is neither an ORT allocator
     /// observation nor a VRAM peak. A quarantine may retain actual active pins.
@@ -2101,7 +2241,7 @@ impl PalsOnnxBackend {
         if let Some(cause) = &self.quarantine {
             return Err(cause.clone());
         }
-        if self.active.is_some() || self.active_memory.is_some() {
+        if self.has_active_physical_invocation() {
             return Err(fail(
                 K::BackendFailure,
                 S::Backend,
@@ -2115,6 +2255,12 @@ impl PalsOnnxBackend {
                 "PALS game generation exhausted",
             )
         })?;
+        #[cfg(feature = "experimental-io-binding")]
+        if let Some(pages) = &mut self.cuda_record_pages {
+            // The resident owner checks its actual invocation/fence state before
+            // the logical generation or any independent host bank is reset.
+            pages.clear_for_new_game(next_generation)?;
+        }
         // Refused clear is all-or-nothing. No logical reset releases a pin.
         self.memory
             .as_mut()
@@ -2138,7 +2284,7 @@ impl PalsOnnxBackend {
         if let Some(cause) = &self.quarantine {
             return Err(cause.clone());
         }
-        if self.active.is_some() || self.active_memory.is_some() {
+        if self.has_active_physical_invocation() {
             return Err(fail(
                 K::BackendFailure,
                 S::Backend,
@@ -2179,7 +2325,7 @@ impl PalsOnnxBackend {
         if let Some(cause) = &self.quarantine {
             return Err(cause.clone());
         }
-        if self.active.is_some() || self.active_memory.is_some() {
+        if self.has_active_physical_invocation() {
             return Err(fail(
                 K::BackendFailure,
                 S::Backend,
@@ -2244,7 +2390,7 @@ impl PalsOnnxBackend {
         if let Some(cause) = &self.quarantine {
             return Err(cause.clone());
         }
-        if self.active.is_some() || self.active_memory.is_some() {
+        if self.has_active_physical_invocation() {
             return Err(fail(
                 K::BackendFailure,
                 S::Backend,
@@ -2370,6 +2516,10 @@ impl PalsOnnxBackend {
                 PalsNativeCommand::SnapshotStats => {
                     HostRecordPageObservationBoundary::SnapshotStats
                 }
+                #[cfg(feature = "experimental-io-binding")]
+                PalsNativeCommand::SnapshotCudaRecordPages => {
+                    HostRecordPageObservationBoundary::SnapshotCudaRecordPages
+                }
                 PalsNativeCommand::VerifyRuntime => {
                     HostRecordPageObservationBoundary::VerifyRuntime
                 }
@@ -2393,6 +2543,19 @@ impl PalsOnnxBackend {
                 PalsNativeCommand::SnapshotStats => {
                     self.snapshot_stats().map(PalsNativeResult::Stats)
                 }
+                #[cfg(feature = "experimental-io-binding")]
+                PalsNativeCommand::SnapshotCudaRecordPages => self
+                    .cuda_record_page_snapshot()
+                    .and_then(|snapshot| {
+                        snapshot.ok_or_else(|| {
+                            fail(
+                                K::InvalidInput,
+                                S::Admission,
+                                "CUDA resident observation requires an installed owner",
+                            )
+                        })
+                    })
+                    .map(|snapshot| PalsNativeResult::CudaRecordPagesObserved(Box::new(snapshot))),
                 PalsNativeCommand::VerifyRuntime => self
                     .verify_runtime()
                     .map(|()| PalsNativeResult::RuntimeVerified),
@@ -2483,6 +2646,11 @@ impl PalsOnnxBackend {
                 "validator inference is absent from P/C product export",
             ));
         }
+        #[cfg(feature = "experimental-io-binding")]
+        if self.cuda_record_pages.is_some() {
+            let result = self.run_cuda_record_pages(input, trace);
+            return self.finish_role_run(input, trace, result);
+        }
         startup_enter(trace, PalsStartupBackendStage::InputPreparation);
         let prepared = input
             .prepare_tensors(&self.model_config)
@@ -2532,6 +2700,16 @@ impl PalsOnnxBackend {
                 }
             }
         }
+        self.finish_role_run(input, trace, result)
+    }
+    /// The resident and legacy paths share the same post-fence origin audit and
+    /// actual successful role observations. This helper creates no new fence.
+    fn finish_role_run(
+        &mut self,
+        input: &PalsModelInput,
+        trace: Option<&StartupRoleTrace>,
+        result: Result<PalsRawOutput, BackendError>,
+    ) -> Result<PalsRawOutput, BackendError> {
         if matches!(self.config.provider, Provider::Cuda { .. }) {
             // `run_active`'s synchronous Run or `run_device`'s output sync has
             // physically completed. ORT provider images can now be required;
@@ -3009,7 +3187,13 @@ impl PalsOnnxBackend {
 
 impl Drop for PalsOnnxBackend {
     fn drop(&mut self) {
-        if self.quarantine.is_some() {
+        let completion_unknown = self.quarantine.is_some();
+        #[cfg(feature = "experimental-io-binding")]
+        let completion_unknown = completion_unknown
+            || self.cuda_record_pages.as_ref().is_some_and(
+                device_pages_plan::native::CudaRecordPages::physical_completion_unknown,
+            );
+        if completion_unknown {
             // The worker normally retains the entire closure on quarantine. A
             // direct caller may drop its owner: retain the same resources rather
             // than using Drop as an unproven CUDA completion acknowledgement.
@@ -3040,6 +3224,11 @@ impl Drop for PalsOnnxBackend {
             }
             #[cfg(feature = "experimental-io-binding")]
             {
+                if let Some(pages) = self.cuda_record_pages.take() {
+                    // Includes packing session, pinned public blocks, pending
+                    // transfers, joined outputs and all dependent allocators.
+                    std::mem::forget(pages);
+                }
                 if let Some(role) = self.device_role.take() {
                     std::mem::forget(role);
                 }
@@ -3053,6 +3242,7 @@ impl Drop for PalsOnnxBackend {
             #[cfg(feature = "experimental-io-binding")]
             {
                 self.device_role.take();
+                self.cuda_record_pages.take();
                 self.device_memory.take();
             }
             self.active_memory.take();
@@ -3240,16 +3430,35 @@ mod device {
             memory: &DeviceMemory,
             stats: &mut PalsBackendStats,
         ) -> ort::Result<()> {
+            self.run_joined(
+                session,
+                active,
+                &memory.memory_key,
+                &memory.memory_value,
+                &memory.mask,
+                stats,
+            )
+        }
+        /// Borrow physically completed joined K/V inside the exclusive owner.
+        /// This method does not certify, cache or manufacture a completion fence.
+        pub fn run_joined(
+            &mut self,
+            session: &mut Session,
+            active: &ActiveInputs,
+            memory_key: &Tensor<f32>,
+            memory_value: &Tensor<f32>,
+            mask: &Tensor<bool>,
+            stats: &mut PalsBackendStats,
+        ) -> ort::Result<()> {
             if self.is_critic.is_some() {
                 // CUDA If's condition has OrtMemTypeCPUInput. This is an
                 // owned CPU bool scalar, never an uploaded device condition.
                 self.binding
                     .bind_input("role_is_critic", &active.role_is_critic)?;
             }
-            self.binding.bind_input("memory_key", &memory.memory_key)?;
-            self.binding
-                .bind_input("memory_value", &memory.memory_value)?;
-            self.binding.bind_input("memory_mask", &memory.mask)?;
+            self.binding.bind_input("memory_key", memory_key)?;
+            self.binding.bind_input("memory_value", memory_value)?;
+            self.binding.bind_input("memory_mask", mask)?;
             self.binding.bind_input("candidates", &active.candidates)?;
             self.binding
                 .bind_input("candidate_mask", &active.candidate_mask)?;

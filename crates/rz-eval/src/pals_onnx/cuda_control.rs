@@ -645,15 +645,33 @@ pub(super) struct PlacementLog {
     overflow: bool,
 }
 impl PlacementLog {
-    fn capture(&mut self, message: &str) {
+    pub(super) fn capture(&mut self, message: &str) {
         if self.reserve_message(message) {
             self.lines.push(message.to_owned());
         }
     }
-    fn capture_transfer(&mut self, message: &str) {
+    pub(super) fn capture_transfer(&mut self, message: &str) {
         if self.reserve_message(message) {
             self.transfer_lines.push(message.to_owned());
         }
+    }
+    /// Observation bytes only. This does not admit any graph or native Session.
+    pub(super) fn bounded_lines(&self) -> Result<&[String], BackendError> {
+        if self.overflow {
+            return Err(policy_error("PALS placement collector overflowed"));
+        }
+        Ok(&self.lines)
+    }
+    pub(super) fn has_transfer_lines(&self) -> bool {
+        !self.transfer_lines.is_empty()
+    }
+    /// Bounded diagnostic prefix; callers must retain the overflow flag.
+    /// These bytes alone never authorize initialized placement.
+    pub(super) fn diagnostic_lines(&self) -> &[String] {
+        &self.lines
+    }
+    pub(super) fn overflowed(&self) -> bool {
+        self.overflow
     }
     fn reserve_message(&mut self, message: &str) -> bool {
         if self.overflow {
@@ -741,7 +759,7 @@ pub struct PalsCudaPlacementWitness {
     pub shared_pc: PalsKernelWitness,
     pub category_provenance: String,
 }
-fn placement_header(line: &str, prefix: &str) -> Option<(String, usize)> {
+pub(super) fn placement_header(line: &str, prefix: &str) -> Option<(String, usize)> {
     let rest = line.strip_prefix(prefix)?;
     let (provider, count) = rest.split_once("]. Number of nodes: ")?;
     let count = count.parse::<usize>().ok()?;
