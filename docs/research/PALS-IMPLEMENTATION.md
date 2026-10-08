@@ -1948,3 +1948,11 @@ main 3개·driver 5개·work 3개 총 11개 focused fixture 소스를 준비했�
 검토·파일별 서식과 후속 CI를 구분한다. arena/manifest의 새 lane 인수와 collector의
 독립 constructor·producer 등록은 아직 연결되지 않았다. 일반 V3 paired 인수나
 학습 자료 소비까지 연결했다고 보고하지 않는다.
+
+통합 source `ebde32c5b4dbb1ef9528a47f0b106753b1f41edd`의 CI
+`37724974142`는 CPU bindings만 SUCCESS였고 Linux·Windows Rust와 PALS model은
+FAILURE였다. Rust는 UCI focused fixture의 `OwnedCpuChecker` 반환 타입에 실제
+`CpuEngine` type argument가 빠져 E0107로 중단됐다. 해당 fixture 서명만 수정하며,
+13개 registry 또는 11개 UCI 검사를 이 실패 run에서 실행한 것처럼 표시하지 않는다.
+PALS model은 별도의 이전 closed source-pair 거절 16개 실패·1개 오류였다. 원래 run의
+실패·로그·종료 결과를 보존하고, 후속 통합 SHA에서 다시 인수한다.

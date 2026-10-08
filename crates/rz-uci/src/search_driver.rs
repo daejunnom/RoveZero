@@ -1953,7 +1953,7 @@ mod tests {
         )
         .unwrap()
     }
-    fn refinement_checker() -> OwnedCpuChecker {
+    fn refinement_checker() -> OwnedCpuChecker<rz_search::cpu::CpuEngine> {
         OwnedCpuChecker::new(rz_search::cpu::CpuEngine::new(refinement_cpu_config()).unwrap())
             .unwrap()
     }
