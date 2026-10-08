@@ -176,11 +176,12 @@ class WholeLineProjectionTests(unittest.TestCase):
     def test_exact_current_repair_suffix_scope_without_ordinary_or_truth_authority(self):
         checked = self.fixture.admit()
         self.assertIs(checked.verify(), checked)
-        self.assertTrue(checked.target.mask)
-        self.assertEqual(checked.target.sign, 1)
-        self.assertEqual(checked.target.row_index, self.fixture.index)
-        self.assertEqual(checked.target.input_sha256, self.fixture.repair.rows[1]["input"]["sha256"])
-        self.assertEqual(checked.target.scope, "next_repair_move_whole_line_conditioned_surrogate")
+        target = checked.target
+        self.assertTrue(target.mask)
+        self.assertEqual(target.sign, 1)
+        self.assertEqual(target.row_index, self.fixture.index)
+        self.assertEqual(target.input_sha256, self.fixture.repair.rows[1]["input"]["sha256"])
+        self.assertEqual(target.scope, "next_repair_move_whole_line_conditioned_surrogate")
         self.assertEqual(self.fixture.whole.outcome.raw_endpoint_scores, (90, 20))
         # This detached view is unchanged throughout these field assertions.
         # Mutation/revalidation tests below still obtain their own fresh views.
@@ -310,9 +311,10 @@ class WholeLineProjectionTests(unittest.TestCase):
         self.assertNotEqual(*[line["line"] for line in self.fixture.lines.plan["lines"]])
         self.assertTrue(self.fixture.whole.outcome.mask)
         checked = self.fixture.admit()
-        self.assertFalse(checked.target.mask)
-        self.assertEqual(checked.target.sign, 0)
-        self.assertEqual(checked.target.reason, "unsupported_same_first_move")
+        target = checked.target
+        self.assertFalse(target.mask)
+        self.assertEqual(target.sign, 0)
+        self.assertEqual(target.reason, "unsupported_same_first_move")
         with self.assertRaisesRegex(ValueError, "separate suffix scorer"):
             checked.collate()
         model = FrozenNumericFixture(on_forward=lambda: self.fail("all-masked forward executed")).eval().requires_grad_(False)
@@ -346,16 +348,18 @@ class WholeLineProjectionTests(unittest.TestCase):
     def test_terminal_endpoint_is_masked_without_fabricating_cpu_work(self):
         self.fixture.terminal()
         checked = self.fixture.admit()
-        self.assertEqual(checked.target.reason, "terminal")
-        self.assertFalse(checked.target.mask)
+        target = checked.target
+        self.assertEqual(target.reason, "terminal")
+        self.assertFalse(target.mask)
         self.assertIsNone(self.fixture.whole.outcome.raw_endpoint_scores[0])
 
     def test_consistent_unknown_prefix_is_masked_not_global_history_authority(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = ProjectionFixture(directory, complete_history=False)
             checked = fixture.admit()
-            self.assertEqual(checked.target.reason, "unknown_history_prefix")
-            self.assertFalse(checked.target.mask)
+            target = checked.target
+            self.assertEqual(target.reason, "unknown_history_prefix")
+            self.assertFalse(target.mask)
             model = FrozenNumericFixture(on_forward=lambda: self.fail("unknown-history forward executed")).eval().requires_grad_(False)
             with self.assertRaisesRegex(ValueError, "all-masked"):
                 fixture.prepare(model, checked=checked)
