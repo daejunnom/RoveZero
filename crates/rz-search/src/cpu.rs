@@ -6,6 +6,10 @@
 //! `PositionIdentity`, profile, 남은 깊이와 bound를 함께 검사한다.
 //! 중단된 노드는 저장하지 않으며, 체크에서 quiescence 한도에 도달하면 static
 //! stand-pat을 반환하는 대신 현재 iteration을 명시적으로 중단한다.
+//! LegalSeeV1은 명시적으로 선택하는 ordering 변경이다. 제한된 동일 칸의
+//! material 교환 minimax만 계산하며 게임 값·전술 증명·pruning bound가 아니다.
+
+mod see;
 
 use crate::cpu_value::{
     BootstrapCpuValue, CpuAccumulator, CpuValueError, CpuValueEvaluator, CpuValueIdentity,
@@ -16,11 +20,12 @@ use rz_position::{
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const CPU_SEARCH_VERSION: &str = "rz-cpu-pvs/0.1";
+pub const CPU_SEE_SEARCH_VERSION: &str = "rz-cpu-pvs-legal-see/0.1";
 pub const CPU_SEARCH_CONDITIONS: &str = "iterative-deepening:1..requested;root-window:full-first,aspiration40-following,full-when-mate-or-fail-inclusive;pvs:first-full,following-zero-window,strict-interior-research;qsearch:tactical-capture-ep-promotion,all-check-evasions,no-check-standpat;q-limit:checked-abort;tt:direct-mapped,full-history-value-profile,equal-remaining-depth,completed-nodes-only;selectivity:no-reductions-no-nullmove;ties:Rules-order;score:side-to-move-raw";
 pub const BOOTSTRAP_SCORE_VERSION: &str = "bootstrap-material-pst-v1";
 pub const CPU_MATE_SCORE: i32 = 30_000;
@@ -34,6 +39,24 @@ const MAX_TT_ENTRIES: usize = 1_048_576;
 const MAX_ROOT_MOVES: usize = 256;
 const MAX_KNOWN_HISTORY: usize = 4096;
 const ASPIRATION_WINDOW: i32 = 40;
+const MAX_SEE_POSITIONS_PER_ORDER: u32 = 4096;
+
+/// Ordering is immutable for the lifetime of one engine and its private TT.
+/// Existing constructors retain the historical MVV/LVA policy and namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum CpuOrderingPolicy {
+    LegacyMvvLvaV1,
+    LegalSeeV1,
+}
+
+impl CpuOrderingPolicy {
+    pub fn identity(self) -> &'static str {
+        match self {
+            Self::LegacyMvvLvaV1 => "cpu-ordering-mvv-lva-v1",
+            Self::LegalSeeV1 => "cpu-ordering-rules-legal-target-exchange-v1",
+        }
+    }
+}
 
 /// First implementation has no selective reductions in any profile. Distinct
 /// identities prevent independent verification work from sharing TT evidence.
@@ -101,7 +124,9 @@ fn checked_inline_slot_bytes(entries: usize, slot_bytes: usize) -> Result<u64, C
 #[derive(Clone, Copy, Debug)]
 pub struct CpuLimits {
     pub max_depth: u16,
-    /// Counts both full-search and quiescence positions, including TT probes.
+    /// Counts full-search and quiescence positions, including TT probes.
+    /// LegalSeeV1 additionally charges all entered exchange positions to this
+    /// same budget; exchange work never receives a fresh deadline or budget.
     pub max_nodes: u64,
     pub deadline: Option<Instant>,
 }
@@ -176,6 +201,7 @@ pub struct CpuIterationProgress {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CpuWork {
     /// Actual positions visited by this invocation only, including qsearch.
+    /// Explicit LegalSeeV1 also includes entered material-exchange positions.
     /// Reused completed depth does not re-charge the previous invocation.
     pub nodes: u64,
     pub quiescence_nodes: u64,
@@ -252,6 +278,7 @@ struct TtEntry {
 
 pub struct CpuEngine {
     config: CpuConfig,
+    ordering: CpuOrderingPolicy,
     tt: Vec<Option<TtEntry>>,
     /// Saturating side/from/to quiet history; fixed 32 KiB.
     history: Box<[[[i32; 64]; 64]; 2]>,
@@ -391,7 +418,7 @@ impl CpuSearcher for CpuEngine {
         CpuEngine::value_identity(self)
     }
     fn search_identity(&self) -> &'static str {
-        CPU_SEARCH_VERSION
+        CpuEngine::search_identity(self)
     }
     fn search_conditions(&self) -> String {
         CpuEngine::search_conditions(self)
@@ -487,9 +514,22 @@ impl CpuEngine {
         Self::with_evaluator(config, Arc::new(BootstrapCpuValue::default()))
     }
 
+    /// Explicit ordering-policy opt-in; existing `new` remains legacy.
+    pub fn with_ordering(config: CpuConfig, ordering: CpuOrderingPolicy) -> Result<Self, CpuError> {
+        Self::with_evaluator_and_ordering(config, Arc::new(BootstrapCpuValue::default()), ordering)
+    }
+
     pub fn with_evaluator(
         config: CpuConfig,
         evaluator: Arc<dyn CpuValueEvaluator>,
+    ) -> Result<Self, CpuError> {
+        Self::with_evaluator_and_ordering(config, evaluator, CpuOrderingPolicy::LegacyMvvLvaV1)
+    }
+
+    pub fn with_evaluator_and_ordering(
+        config: CpuConfig,
+        evaluator: Arc<dyn CpuValueEvaluator>,
+        ordering: CpuOrderingPolicy,
     ) -> Result<Self, CpuError> {
         config.tt_allocation_bytes()?;
         evaluator.identity().validate().map_err(CpuError::Value)?;
@@ -505,6 +545,7 @@ impl CpuEngine {
         tt.resize_with(config.tt_entries, || None);
         Ok(Self {
             config,
+            ordering,
             tt,
             history: Box::new([[[0; 64]; 64]; 2]),
             value_identity: Arc::new(evaluator.identity().clone()),
@@ -517,19 +558,37 @@ impl CpuEngine {
         &self.config
     }
 
+    pub fn ordering_policy(&self) -> CpuOrderingPolicy {
+        self.ordering
+    }
+
+    pub fn search_identity(&self) -> &'static str {
+        match self.ordering {
+            CpuOrderingPolicy::LegacyMvvLvaV1 => CPU_SEARCH_VERSION,
+            CpuOrderingPolicy::LegalSeeV1 => CPU_SEE_SEARCH_VERSION,
+        }
+    }
+
     /// Full immutable value namespace used by this engine's TT and resume.
     pub fn value_identity(&self) -> &CpuValueIdentity {
         &self.value_identity
     }
 
     pub fn search_conditions(&self) -> String {
-        format!(
+        let legacy = format!(
             "{CPU_SEARCH_CONDITIONS};profile={};max_depth={};q_plies={};tt_entries={}",
             self.config.profile.identity(),
             self.config.max_depth,
             self.config.quiescence_ply,
             self.config.tt_entries
-        )
+        );
+        match self.ordering {
+            CpuOrderingPolicy::LegacyMvvLvaV1 => legacy,
+            CpuOrderingPolicy::LegalSeeV1 => format!(
+                "{legacy};ordering={};exchange:all-Rules-legal-recaptures-on-target,optional-stop-zero,material-only,P100-N320-B330-R500-Q900-K0,no-pruning,max-plies32,max-positions-per-order{MAX_SEE_POSITIONS_PER_ORDER},typed-fail-on-exhaustion;ordering-priority:TT,nonnegative-exchange,quiet-history,negative-exchange;node-work:search+qsearch+exchange;exchange-cancel-deadline:original",
+                self.ordering.identity()
+            ),
+        }
     }
 
     /// Actual counters for the last normally returned attempt, including
@@ -688,7 +747,7 @@ impl CpuEngine {
                 profile: self.config.profile,
                 score_provenance: "rz-position/rules-terminal",
                 value_identity: (*self.value_identity).clone(),
-                search_version: CPU_SEARCH_VERSION,
+                search_version: self.search_identity(),
                 root_restricted: root_moves.is_some(),
                 elapsed: started.elapsed(),
                 reused_completed_depth: 0,
@@ -815,7 +874,7 @@ impl CpuEngine {
             profile: self.config.profile,
             score_provenance: self.evaluator.provenance(),
             value_identity: (*self.value_identity).clone(),
-            search_version: CPU_SEARCH_VERSION,
+            search_version: self.search_identity(),
             root_restricted: root_moves.is_some(),
             elapsed: started.elapsed(),
             reused_completed_depth: resume.map_or(0, |token| token.completed_depth),
@@ -866,7 +925,7 @@ impl CpuEngine {
     ) -> Result<NodeValue, Abort> {
         control.visit(false)?;
         let mut moves = legal.to_vec();
-        self.order_moves(position, &mut moves, previous_best);
+        self.order_moves(position, &mut moves, previous_best, control)?;
         let mut best = NodeValue {
             score: -INFINITY,
             pv: Vec::new(),
@@ -977,7 +1036,8 @@ impl CpuEngine {
             position,
             &mut moves,
             tt.as_ref().and_then(|entry| entry.best_move),
-        );
+            control,
+        )?;
         let mut best = NodeValue {
             score: -INFINITY,
             pv: Vec::new(),
@@ -1086,7 +1146,7 @@ impl CpuEngine {
         if !in_check {
             moves.retain(|mv| is_tactical(position, *mv));
         }
-        self.order_moves(position, &mut moves, None);
+        self.order_moves(position, &mut moves, None, control)?;
         for mv in moves {
             let undo = position.make_move(mv)?;
             let value_undo = match self.evaluator.apply_delta(&mut control.value, undo.delta()) {
@@ -1117,9 +1177,71 @@ impl CpuEngine {
         Ok(best)
     }
 
-    fn order_moves(&self, position: &Position, moves: &mut [BoardMove], best: Option<BoardMove>) {
-        // Stable sorting preserves Rules order when all priorities tie.
-        moves.sort_by_key(|mv| std::cmp::Reverse(self.order_score(position, *mv, best)));
+    fn order_moves(
+        &self,
+        position: &Position,
+        moves: &mut [BoardMove],
+        best: Option<BoardMove>,
+        control: &mut Control<'_>,
+    ) -> Result<(), Abort> {
+        self.order_moves_with_see_budget(
+            position,
+            moves,
+            best,
+            control,
+            MAX_SEE_POSITIONS_PER_ORDER,
+        )
+    }
+
+    fn order_moves_with_see_budget(
+        &self,
+        position: &Position,
+        moves: &mut [BoardMove],
+        best: Option<BoardMove>,
+        control: &mut Control<'_>,
+        maximum_exchange_positions: u32,
+    ) -> Result<(), Abort> {
+        if self.ordering == CpuOrderingPolicy::LegacyMvvLvaV1 {
+            // Preserve historical stable sorting and MVV/LVA/history keys.
+            moves.sort_by_key(|mv| std::cmp::Reverse(self.order_score(position, *mv, best)));
+            return Ok(());
+        }
+        let mut scored = Vec::new();
+        scored
+            .try_reserve_exact(moves.len())
+            .map_err(|_| Abort::Error(CpuError::Allocation))?;
+        let mut exchange_positions = 0;
+        let mut visit_exchange = || {
+            control.check_stop()?;
+            if exchange_positions >= maximum_exchange_positions {
+                return Err(Abort::Error(CpuError::Unsupported(
+                    "legal SEE ordering exchange position budget exhausted",
+                )));
+            }
+            control.visit(false)?;
+            exchange_positions += 1;
+            Ok(())
+        };
+        for &mv in moves.iter() {
+            let key = if best == Some(mv) {
+                (3u8, 0)
+            } else if is_tactical(position, mv) {
+                let exchange = see::score(position, mv, &mut visit_exchange)?;
+                (if exchange >= 0 { 2 } else { 0 }, exchange)
+            } else {
+                (1, self.order_score(position, mv, None))
+            };
+            scored.push((mv, key));
+        }
+        // Evaluate once per move; equal keys retain the original Rules order.
+        // An interrupted computation leaves caller order intact and never
+        // replaces an unobserved exchange value with zero or MVV/LVA.
+        scored.sort_by_key(|(_, key)| std::cmp::Reverse(*key));
+        control.check_stop()?;
+        for (target, (mv, _)) in moves.iter_mut().zip(scored) {
+            *target = mv;
+        }
+        Ok(())
     }
 
     fn order_score(&self, position: &Position, mv: BoardMove, best: Option<BoardMove>) -> i32 {
@@ -1323,6 +1445,218 @@ mod tests {
         .unwrap()
     }
 
+    fn see_engine() -> CpuEngine {
+        CpuEngine::with_ordering(
+            CpuConfig {
+                tt_entries: 16,
+                max_depth: 4,
+                quiescence_ply: 4,
+                ..CpuConfig::default()
+            },
+            CpuOrderingPolicy::LegalSeeV1,
+        )
+        .unwrap()
+    }
+
+    fn ordering_control<'a>(
+        cpu: &CpuEngine,
+        position: &Position,
+        cancel: &'a AtomicBool,
+        limits: CpuLimits,
+    ) -> Control<'a> {
+        Control {
+            limits,
+            cancellation: cancel,
+            nodes: 0,
+            quiescence_nodes: 0,
+            tt_hits: 0,
+            value: cpu.evaluator.initialize(position).unwrap(),
+        }
+    }
+
+    #[test]
+    fn legal_see_is_explicit_and_preserves_legacy_identity_and_resume_boundary() {
+        let config = CpuConfig::default();
+        let mut legacy = CpuEngine::new(config.clone()).unwrap();
+        let mut see =
+            CpuEngine::with_ordering(config.clone(), CpuOrderingPolicy::LegalSeeV1).unwrap();
+        let expected = format!(
+            "{CPU_SEARCH_CONDITIONS};profile={};max_depth={};q_plies={};tt_entries={}",
+            config.profile.identity(),
+            config.max_depth,
+            config.quiescence_ply,
+            config.tt_entries
+        );
+        assert_eq!(legacy.ordering_policy(), CpuOrderingPolicy::LegacyMvvLvaV1);
+        assert_eq!(legacy.search_identity(), CPU_SEARCH_VERSION);
+        assert_eq!(legacy.search_conditions(), expected);
+        assert_eq!(CpuSearcher::search_identity(&see), CPU_SEE_SEARCH_VERSION);
+        assert!(see
+            .search_conditions()
+            .contains(CpuOrderingPolicy::LegalSeeV1.identity()));
+        assert!(see
+            .search_conditions()
+            .contains("node-work:search+qsearch+exchange"));
+        assert_eq!(legacy.value_identity(), see.value_identity());
+        assert_eq!(
+            legacy.config().tt_allocation_bytes().unwrap(),
+            see.config().tt_allocation_bytes().unwrap()
+        );
+
+        let position = Position::startpos();
+        let cancel = AtomicBool::new(false);
+        let report = legacy.analyze(&position, limits(1), &cancel).unwrap();
+        assert_eq!(report.search_version, CPU_SEARCH_VERSION);
+        let token = report.resume.unwrap();
+        assert!(matches!(
+            see.resume(&position, &token, limits(2), &cancel),
+            Err(CpuError::ResumeMismatch(_))
+        ));
+        let report = see.analyze(&position, limits(1), &cancel).unwrap();
+        assert_eq!(report.search_version, CPU_SEE_SEARCH_VERSION);
+        assert_eq!(report.profile, config.profile);
+        assert!(matches!(
+            legacy.resume(&position, &report.resume.unwrap(), limits(2), &cancel),
+            Err(CpuError::ResumeMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn legal_see_places_losing_capture_after_quiet_but_keeps_tt_priority() {
+        let position = Position::from_fen("7k/8/2p5/3p4/8/8/8/K2Q4 w - - 0 1").unwrap();
+        let losing = "d1d5".parse().unwrap();
+        let quiet = "a1b1".parse().unwrap();
+        let cancel = AtomicBool::new(false);
+        let legacy = engine();
+        let see = see_engine();
+        let mut old_moves = [quiet, losing];
+        let mut control = ordering_control(&legacy, &position, &cancel, limits(1));
+        legacy
+            .order_moves(&position, &mut old_moves, None, &mut control)
+            .unwrap();
+        assert_eq!(old_moves, [losing, quiet]);
+        assert_eq!(control.nodes, 0);
+        let mut moves = old_moves;
+        let mut control = ordering_control(&see, &position, &cancel, limits(1));
+        see.order_moves(&position, &mut moves, None, &mut control)
+            .unwrap();
+        assert_eq!(moves, [quiet, losing]);
+        assert!(control.nodes > 0);
+        assert_eq!(control.quiescence_nodes, 0);
+        let mut control = ordering_control(&see, &position, &cancel, limits(1));
+        see.order_moves(&position, &mut moves, Some(losing), &mut control)
+            .unwrap();
+        assert_eq!(moves, [losing, quiet]);
+        assert_eq!(control.nodes, 0);
+    }
+
+    #[test]
+    fn legal_see_equal_keys_keep_rules_order_without_creating_tt_work() {
+        let position = Position::startpos();
+        let mut moves = position.ordered_legal_moves().moves().to_vec();
+        let original = moves.clone();
+        let cpu = see_engine();
+        let cancel = AtomicBool::new(false);
+        let mut control = ordering_control(&cpu, &position, &cancel, limits(1));
+        cpu.order_moves(&position, &mut moves, None, &mut control)
+            .unwrap();
+        assert_eq!(moves, original);
+        assert_eq!(control.nodes, 0);
+        assert_eq!(control.tt_hits, 0);
+    }
+
+    #[test]
+    fn legal_see_work_limit_is_typed_and_leaves_move_order_and_input_unchanged() {
+        let position = Position::from_fen("7k/8/2p5/3p4/8/8/8/K2Q4 w - - 0 1").unwrap();
+        let before = position.snapshot();
+        let original = ["d1d5".parse().unwrap(), "a1b1".parse().unwrap()];
+        let cpu = see_engine();
+        let cancel = AtomicBool::new(false);
+        let mut moves = original;
+        let mut control = ordering_control(&cpu, &position, &cancel, limits(1));
+        assert!(matches!(
+            cpu.order_moves_with_see_budget(&position, &mut moves, None, &mut control, 1),
+            Err(Abort::Error(CpuError::Unsupported(
+                "legal SEE ordering exchange position budget exhausted"
+            )))
+        ));
+        assert_eq!(control.nodes, 1);
+        assert_eq!(moves, original);
+        assert!(position.matches_snapshot(&before));
+        let mut control = ordering_control(
+            &cpu,
+            &position,
+            &cancel,
+            CpuLimits {
+                max_nodes: 1,
+                ..limits(1)
+            },
+        );
+        assert!(matches!(
+            cpu.order_moves(&position, &mut moves, None, &mut control),
+            Err(Abort::Stop(CpuCompletion::NodeLimit))
+        ));
+        assert_eq!(control.nodes, 1);
+        assert_eq!(moves, original);
+        assert!(position.matches_snapshot(&before));
+    }
+
+    #[test]
+    fn legal_see_cancel_and_original_deadline_never_become_an_exchange_score() {
+        let position = Position::from_fen("7k/8/2p5/3p4/8/8/8/K2Q4 w - - 0 1").unwrap();
+        let original = ["d1d5".parse().unwrap(), "a1b1".parse().unwrap()];
+        let cpu = see_engine();
+        let canceled = AtomicBool::new(true);
+        let mut moves = original;
+        let mut control = ordering_control(&cpu, &position, &canceled, limits(1));
+        assert!(matches!(
+            cpu.order_moves(&position, &mut moves, None, &mut control),
+            Err(Abort::Stop(CpuCompletion::Canceled))
+        ));
+        assert_eq!(control.nodes, 0);
+        let cancel = AtomicBool::new(false);
+        let mut control = ordering_control(
+            &cpu,
+            &position,
+            &cancel,
+            CpuLimits {
+                deadline: Some(Instant::now()),
+                ..limits(1)
+            },
+        );
+        assert!(matches!(
+            cpu.order_moves(&position, &mut moves, None, &mut control),
+            Err(Abort::Stop(CpuCompletion::Deadline))
+        ));
+        assert_eq!(control.nodes, 0);
+        assert_eq!(moves, original);
+    }
+
+    #[test]
+    fn legal_see_entered_positions_are_in_actual_partial_search_work() {
+        let position = Position::from_fen("7k/8/2p5/3p4/4P3/8/4Q3/K7 w - - 0 1").unwrap();
+        let before = position.snapshot();
+        let mut cpu = see_engine();
+        let report = cpu
+            .analyze(
+                &position,
+                CpuLimits {
+                    max_nodes: 2,
+                    ..limits(1)
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(report.search_version, CPU_SEE_SEARCH_VERSION);
+        assert_eq!(report.completion, CpuCompletion::NodeLimit);
+        assert_eq!(report.completed_depth, 0);
+        assert_eq!(report.score_scope, CpuScoreScope::FrontierOnly);
+        assert_eq!(report.nodes, 2);
+        assert_eq!(cpu.last_attempt_work().unwrap().nodes, 2);
+        assert!(position.legal_moves().contains(&report.best_move.unwrap()));
+        assert!(position.matches_snapshot(&before));
+    }
+
     fn limits(depth: u16) -> CpuLimits {
         CpuLimits {
             max_depth: depth,
@@ -1415,11 +1749,9 @@ mod tests {
             .unwrap();
         assert_eq!(canceled.completion, CpuCompletion::Canceled);
         assert_eq!(canceled.completed_depth, 0);
-        assert!(
-            position
-                .legal_moves()
-                .contains(&canceled.best_move.unwrap())
-        );
+        assert!(position
+            .legal_moves()
+            .contains(&canceled.best_move.unwrap()));
         assert_eq!(canceled.score_scope, CpuScoreScope::FrontierOnly);
         let expired = engine
             .analyze(
@@ -1830,8 +2162,8 @@ mod tests {
         assert!(actual.nodes > 0 && actual.nodes <= limits(1).max_nodes);
         assert!(actual.quiescence_nodes > 0 && actual.quiescence_nodes <= actual.nodes);
         assert!(before.same_state(&position.snapshot()));
-        assert!(
-            cpu.analyze(
+        assert!(cpu
+            .analyze(
                 &position,
                 CpuLimits {
                     max_nodes: 0,
@@ -1839,8 +2171,7 @@ mod tests {
                 },
                 &AtomicBool::new(false)
             )
-            .is_err()
-        );
+            .is_err());
         assert_eq!(cpu.last_attempt_work(), Some(CpuWork::default()));
         cpu.clear();
         assert_eq!(cpu.last_attempt_work(), None);
@@ -1944,17 +2275,15 @@ mod tests {
 
     #[test]
     fn invalid_budgets_and_root_moves_are_not_silent_fallbacks() {
-        assert!(
-            CpuEngine::new(CpuConfig {
-                tt_entries: MAX_TT_ENTRIES + 1,
-                ..CpuConfig::default()
-            })
-            .is_err()
-        );
+        assert!(CpuEngine::new(CpuConfig {
+            tt_entries: MAX_TT_ENTRIES + 1,
+            ..CpuConfig::default()
+        })
+        .is_err());
         let position = Position::startpos();
         let mut cpu = engine();
-        assert!(
-            cpu.analyze(
+        assert!(cpu
+            .analyze(
                 &position,
                 CpuLimits {
                     max_nodes: 0,
@@ -1962,21 +2291,17 @@ mod tests {
                 },
                 &AtomicBool::new(false)
             )
-            .is_err()
-        );
-        assert!(
-            cpu.analyze_root_moves(&position, &[], limits(1), &AtomicBool::new(false))
-                .is_err()
-        );
+            .is_err());
+        assert!(cpu
+            .analyze_root_moves(&position, &[], limits(1), &AtomicBool::new(false))
+            .is_err());
         let mv = BoardMove::from_uci("e2e4").unwrap();
-        assert!(
-            cpu.analyze_root_moves(&position, &[mv, mv], limits(1), &AtomicBool::new(false))
-                .is_err()
-        );
+        assert!(cpu
+            .analyze_root_moves(&position, &[mv, mv], limits(1), &AtomicBool::new(false))
+            .is_err());
         let illegal = BoardMove::from_uci("e2e5").unwrap();
-        assert!(
-            cpu.analyze_root_moves(&position, &[illegal], limits(1), &AtomicBool::new(false))
-                .is_err()
-        );
+        assert!(cpu
+            .analyze_root_moves(&position, &[illegal], limits(1), &AtomicBool::new(false))
+            .is_err());
     }
 }

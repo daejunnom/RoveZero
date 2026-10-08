@@ -1677,3 +1677,31 @@ resume라고 부르지 않는다. 실제 학습을 제외한 전체 목표는 �
 이번 재개에서 원격 PR 23 HEAD `ea7d567cdb26a2ae387eacc29224612a4fcb0b75`의
 Linux·Windows·CPU bindings·PALS model 네 CI 성공을 다시 확인했다. 이 성공은 해당
 소스의 CPU 검사이며 위 감독기와 이후 SEE·V 환류 소스의 성공 결과가 아니다.
+
+### 명시적 LegalSeeV1 소스 연결
+
+`CpuOrderingPolicy::LegalSeeV1`과 별도 constructor를 작성했다. 기존 constructor·
+세 CPU profile·CpuConfig·CPU value namespace·legacy search conditions는 유지한다.
+새 정책은 `rz-cpu-pvs-legal-see/0.1`과 ordering·물질값·32 ply·정렬당 4,096개
+교환 상태·원래 deadline/cancel·실제 node 비용을 별도 conditions로 기록한다.
+resume는 전체 conditions가 다르면 거부하며 TT는 정책이 불변인 해당 engine이 소유한다.
+
+SEE는 기존 Rules의 합법 recapture·네 승격·앙파상·핀·왕 안전성과 실제 move delta를
+사용한 같은 target의 제한 물질 교환 minimax다. abstract decline의 0은 교환 게임의
+선택일 뿐 미관측 CPU 값을 0으로 채우는 동작이 아니다. mate·전게임 bound·pruning
+권한으로 사용하지 않는다. 각 entered 교환 상태를 기존 전체 node 한도에 청구하고,
+취소·마감·상한 실패는 typed 미완료/오류로 남긴다. score 계산은 한 수당 한 번이며
+모든 score가 확인된 뒤에만 move 배열을 바꾼다. 중단된 score를 MVV/LVA로 대체하지 않는다.
+
+교환 정확성 10개와 namespace·resume·정렬·수명·상한·부분 비용 연결 6개의 Rust 검사
+소스를 추가했다. 총괄의 직접 검토와 저장소 edition 2021의 해당 source rustfmt 및
+diff check는 통과했다. 최초 formatter 호출의 edition 2024는 2021로 다시 적용했다.
+메모리 조건 때문에 로컬 Cargo·모델·WSL 검사는 실행하지 않았으며 새 source의 CPU CI를
+별도로 인수한다. CPU_T CLI/producer의 실제 선택과 비교 명세 연결은 아직 미완료다.
+이 opt-in을 기존 CPU04의 legacy binary/config에 소급 적용하거나 기력 개선으로 보고하지 않는다.
+
+문서 커밋 `1c9ef4024bc73623dfb501eca51ba656872b0cf8`의 네 CPU CI도 실제 SUCCESS를
+확인했다(Windows 최종 2026-10-08 02:10:59 UTC). 이는 이후 LegalSeeV1 소스의 검사 결과가
+아니다. 준비 감독기는 추가 cleanup 관측 보완 후 22,121 bytes,
+`dd49cbf64606265c3fef2e4d4b4f45a542eb531a0ea24e668f23fe9454dd43f6`로 원문을 별도
+보존했고, 같은 순수 메타데이터 37개가 모두 PASS였다. 물리 완료·대국 검사는 미실행이다.
