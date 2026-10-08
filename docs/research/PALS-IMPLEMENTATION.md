@@ -2536,3 +2536,13 @@ native post-Repair recheck·전체 caller 비용·물리 종료·utility는 아�
 저장·출력·단일 전체 wall·cleanup 한도를 함께 봉인하고 원래 remaining이 부족하면
 거절해야 한다. 기존 utility groups 0/masked·제품 V 미활성·이번 GPU 검증 보류와
 actual training/backward/optimizer 제외를 유지한다.
+
+Repair endpoint 초안 HEAD `bbc673b8713914666bd8da1706b367ebe0aa1557`의
+[CPU CI 37776614455](https://github.com/daejunnom/RoveZero/actions/runs/37776614455)는
+모델 CPU·bindings 성공, Linux·Windows 실패로 종료됐다. 각 OS에서 기존 Reply-only
+13개와 새 Repair endpoint 11개는 통과했으나 terminal fixture 한 개가
+`Search(Role(InvalidOutput))`로 실패했다. root `f2f3` 뒤 초안의
+`g7g5 g2g4 d8h4`는 e7 폰이 퀸의 경로를 막는다. 후속 수정은 fixture prefix와
+기대 수순만 `e7e5 g2g4 d8h4`로 바꾸며 제품 Rules·평가 출력 검사는 유지한다.
+이 수순은 기존 부모의 Rules terminal fixture와 일치한다. 원시 실패·job별 종료·
+이후 skip된 검사를 보존하고 수정 HEAD의 별도 CI 성공 전까지 전체 suite를 인수하지 않는다.

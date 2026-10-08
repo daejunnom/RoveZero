@@ -2365,7 +2365,7 @@ mod repair_tests {
     ) -> FreshReplayOwner<RepairRoles> {
         let (proposal, restriction, response, counter_suffix, repair_suffix) = if terminal_repair {
             (
-                vec![mv("g7g5"), mv("e2e4"), mv("b8c6")],
+                vec![mv("e7e5"), mv("e2e4"), mv("b8c6")],
                 mv("g2g4"),
                 mv("g2g4"),
                 mv("a7a6"),
@@ -2759,7 +2759,7 @@ mod repair_tests {
             result,
             ReplayRepairOutcome::RulesTerminalRepairEndpoint { .. }
         ));
-        assert_eq!(owner.repaired_line(), &[mv("g7g5"), mv("g2g4"), mv("d8h4")]);
+        assert_eq!(owner.repaired_line(), &[mv("e7e5"), mv("g2g4"), mv("d8h4")]);
         assert_eq!(owner.stages.len(), 2);
         assert_eq!(owner.counters.cpu_tasks_requested, 2);
         assert!(matches!(
