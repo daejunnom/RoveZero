@@ -2635,6 +2635,51 @@ capacity를 확인하며 초과는 명시적으로 거부한다. L=2/P=1/no-clai
 descriptor 변조·history/길이·3N remaining 부족·자원/cleanup·닫힌 wire·원래 만료
 clock·오류/권한·retained capacity 검사의 fixture 13개를 추가했다. 기존 두 조상 파일에는 module 선언과
 `prepare_root` visibility만 변경했고 parent engine·native producer·replay는 불변이다.
-formatter·소스 대조·독립 리뷰는 실제 새 HEAD CPU CI 실행 결과와 구분한다. 이 단계는
-아직 실행 인수 전이며 utility groups 0/masked·제품 V 미활성·이번 GPU 검증 보류와
+formatter·소스 대조·독립 리뷰는 실제 새 HEAD CPU CI 실행 결과와 구분한다. 초기
+작성 시 실행 인수 전 기록은 아래 정확한 HEAD의 후속 관측으로 보완하며,
+utility groups 0/masked·제품 V 미활성·이번 GPU 검증 보류와
 actual training/backward/optimizer 제외를 유지한다.
+
+입력 경계 HEAD `f36cc5b5d6cf145fa228eea40200502e752429fc`의
+[CPU CI 37796629924](https://github.com/daejunnom/RoveZero/actions/runs/37796629924)는
+Linux·Windows·모델 CPU·bindings 네 job 모두 성공했다. 원문에서 각 OS의 새 입력
+fixture 13개를 확인했으며 L2/P1 retained capacity 회귀도 포함한다. 기존 Reply-only
+13개·Repair endpoint 12개·순수 requirements/preflight 네 개, native fixture 29개와
+persistence 두 개의 결과도 별도로 확인했다. 이 결과는 원본 caller 선언과 실제
+Rules를 대조하는 경계의 CPU 인수이며 새 native factory/실제 replay dispatch·요청별
+물리 lease·strict Query/full recheck·whole cost·physical closure·utility 인수는 아니다.
+새 native 관측 변경은 별도 HEAD와 검사로 관리한다. 원문 job 로그·byte 수·SHA와
+job별 완료 시각은 저장소 밖에 보존한다.
+
+### 요청별 actual Runtime ExecutionId 관측 접점
+
+`pals_native.rs`의 선택적 `NativeRoleObserver`에 기본 noop인 `dispatched`와
+`terminal` 접점을 추가한다. 실제 `worker.submit` 성공 뒤 확보한 Lease의
+`RequestId`·`ExecutionId`를 `NativeRoleExecutionBinding`으로 전달한다. receipt의
+aggregate high-water를 요청별 실행 ID로 환산하지 않으며 기존 receipt schema와
+prepared/physical return/consumption 접점은 유지한다.
+
+제출 뒤 observer 오류·panic·mutex poison이 생겨도 물리 Lease를 `Ok(Lease)`로
+runtime에 넘겨 같은 물리 작업을 계속 회수한다. backend 원래 실패는 callback
+전에 봉인하고 observer 오류는 별도 secondary로 남긴다. 실제 Ready만 inflight와
+물리 완료 계수를 회수하며 observer 실패 결과는 정상 delivery/consumption으로
+전달하지 않는다. callback 성공은 물리 fence나 서비스 성공 증거가 아니다.
+
+`NativeRoleTerminal::CompletionUnknown`은 quarantine·consumed·drain 만료를
+같은 binding에서 한 번 관측하는 상태이며 물리 완료가 아니다. 별도로 실제 늦은
+Ready를 관측해도 quarantine과 닫힌 정상 소비 권한을 복구하지 않는다. pending은
+Ready 행을 만들지 않는다. 단일 bounded binding slot은 기존 runtime의 실제
+max_requests/max_batch_items/max_executions 각각 1과 맞추고, 기존 Ready 미관측
+binding이 있으면 새 worker submit을 거절한다.
+
+실제 ID/high-water/new-game 분리, 제출 후 오류·panic의 Lease 보존,
+backend/observer 동시 실패, unknown 중복 방지, drain 뒤 late Ready,
+observer mutex poison, 잘못된 control 응답의 완료/성공 분리를 다루는 controlled
+fixture 소스 일곱 개를 추가했다. native의 test header는 기존 41개에서 48개가 됐다.
+formatter와 기존 입력·replay·runtime·worker·규약·workflow 보존 대조는 완료했고
+동결 소스의 독립 리뷰에서 추가 필수 수정은 발견되지 않았다. 새 HEAD CPU CI의
+실행 인수는 별도로 확인한다. late Ready fixture는 기존 runtime을 직접 다시 pump하며
+공개 finish handle에 새 자동 회수 경로를 추가한 증거가 아니다. 이 fixture는 실제
+ONNX/ORT 모델 로딩·GPU fence·새 native replay wrapper 실행 증거가 아니다.
+factory/source/binary/provider 등록, 원래 전체 시계와 명시적 finish 결과, strict
+Query/full recheck·whole cost·physical closure·utility 인수는 계속 남는다.

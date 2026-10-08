@@ -618,6 +618,8 @@ mod native {
         observer: Mutex<Option<Box<dyn NativeRoleObserver>>>,
         observer_failures: AtomicU64,
         last_observer_failure: Mutex<Option<NativeFailureReceipt>>,
+        // One actual submitted role lease, never a high-water reconstruction.
+        role_execution: Mutex<Option<ObservedRoleExecution>>,
         private_warm: Option<NativeWarmOwner>,
         warm_admission: Mutex<Option<WarmAdmission>>,
     }
@@ -665,6 +667,35 @@ mod native {
         SearchFailedUnconsumed,
         GameReset,
     }
+    /// Actual request/Runtime execution association supplied by a submitted Lease.
+    /// This copyable observation is not a factory/source/binary or whole-cost proof.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct NativeRoleExecutionBinding {
+        pub request: RequestId,
+        pub execution: ExecutionId,
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum NativeRoleCompletionUnknown {
+        Quarantined,
+        Consumed,
+        DrainExpired,
+    }
+    /// Raw physical observation, distinct from head validation, delivery and
+    /// search consumption. CompletionUnknown is not physical terminal completion.
+    /// An unknown observation can precede a separately observed actual late Ready;
+    /// that fact never clears quarantine or authorizes normal delivery/recovery.
+    #[derive(Clone, Copy)]
+    pub enum NativeRoleTerminal<'a> {
+        Ready(Result<&'a PalsNativeResult, &'a BackendError>),
+        CompletionUnknown(NativeRoleCompletionUnknown),
+    }
+    struct ObservedRoleExecution {
+        binding: NativeRoleExecutionBinding,
+        unknown_observed: bool,
+        ready_observed: bool,
+        // The first secondary observer failure survives pending/unknown work.
+        observer_error: Option<RoleError>,
+    }
     /// Optional bounded collector. All callbacks run on the calling/search
     /// thread and use its clock; startup probe inputs never enter this stream.
     pub trait NativeRoleObserver: Send {
@@ -684,6 +715,20 @@ mod native {
             _logical: Option<&RoleLogicalContext>,
         ) -> Result<(), RoleError> {
             self.prepared(id, input, context)
+        }
+        /// Called only after the actual worker submit and Lease ownership exist.
+        /// Failure cannot undo physical admission; the runtime retains/drains it.
+        fn dispatched(&mut self, _binding: NativeRoleExecutionBinding) -> Result<(), RoleError> {
+            Ok(())
+        }
+        /// Reports the same actual binding as dispatched. Pending has no Ready
+        /// event, and unknown is emitted at most once before any actual late Ready.
+        fn terminal(
+            &mut self,
+            _binding: NativeRoleExecutionBinding,
+            _event: NativeRoleTerminal<'_>,
+        ) -> Result<(), RoleError> {
+            Ok(())
         }
         fn accepted_context(
             &mut self,
@@ -1914,15 +1959,21 @@ mod native {
             stage: &'static str,
             callback: impl FnOnce(&mut dyn NativeRoleObserver) -> Result<(), RoleError>,
         ) -> Result<(), RoleError> {
-            let result = {
-                let mut observer = self
-                    .observer
-                    .lock()
-                    .map_err(|_| RoleError::Backend("PALS observer owner poisoned".into()))?;
-                match observer.as_mut() {
-                    Some(observer) => callback(observer.as_mut()),
+            let result = match self.observer.lock() {
+                Ok(mut slot) => match slot.as_mut() {
+                    Some(observer) => {
+                        // Observer code must not unwind out of a post-submit
+                        // handoff and drop a still unconfirmed physical Lease.
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            callback(observer.as_mut())
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(RoleError::Backend("PALS observer callback panicked".into()))
+                        })
+                    }
                     None => Ok(()),
-                }
+                },
+                Err(_) => Err(RoleError::Backend("PALS observer owner poisoned".into())),
             };
             if result.is_err() {
                 self.observer_failures.fetch_add(1, Ordering::AcqRel);
@@ -1945,6 +1996,73 @@ mod native {
                 ));
             }
             Ok(())
+        }
+        fn remember_role_observer_error(
+            &self,
+            binding: NativeRoleExecutionBinding,
+            error: RoleError,
+        ) {
+            let mut slot = self
+                .role_execution
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(observed) = slot.as_mut()
+                && observed.binding == binding
+                && observed.observer_error.is_none()
+            {
+                observed.observer_error = Some(error);
+            }
+        }
+        fn observe_role_terminal(
+            &self,
+            binding: NativeRoleExecutionBinding,
+            event: NativeRoleTerminal<'_>,
+        ) -> Result<(), RoleError> {
+            // Pure bounded state is released before invoking observer code. The
+            // Ready and unknown flags are separate: a real late Ready is retained
+            // without converting the preceding unknown into success.
+            {
+                let mut slot = self
+                    .role_execution
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let Some(observed) = slot.as_mut().filter(|o| o.binding == binding) else {
+                    return Err(RoleError::Backend(
+                        "PALS role Lease observation binding mismatch".into(),
+                    ));
+                };
+                let notified = match event {
+                    NativeRoleTerminal::Ready(_) => &mut observed.ready_observed,
+                    NativeRoleTerminal::CompletionUnknown(_) => {
+                        if observed.ready_observed {
+                            return Ok(());
+                        }
+                        &mut observed.unknown_observed
+                    }
+                };
+                if *notified {
+                    return Ok(());
+                }
+                *notified = true;
+            }
+            self.observe("bound_physical_terminal", |observer| {
+                observer.terminal(binding, event)
+            })
+        }
+        fn observe_role_unknown(&self, request: RequestId, reason: NativeRoleCompletionUnknown) {
+            let binding = self
+                .role_execution
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .filter(|o| o.binding.request == request && !o.ready_observed)
+                .map(|o| o.binding);
+            if let Some(binding) = binding
+                && let Err(error) = self
+                    .observe_role_terminal(binding, NativeRoleTerminal::CompletionUnknown(reason))
+            {
+                self.remember_role_observer_error(binding, error);
+            }
         }
         fn remember_failure(&self, error: &BackendError) {
             let receipt = NativeFailureReceipt {
@@ -2546,6 +2664,9 @@ mod native {
         request: Arc<RuntimeRoleRequest<PalsModelInput>>,
         execution: ExecutionId,
         warm: Option<WarmAdmission>,
+        // A post-submit observer error cannot return dispatch Err and strand
+        // this Lease. Runtime polling must retain it through actual completion.
+        observer_failed: bool,
     }
     impl Backend<PalsAdapter<PalsModelInput, ContractSystemClock>> for WorkerBackend {
         type Lease = Lease;
@@ -2565,6 +2686,13 @@ mod native {
                 || self.owner.quarantined.load(Ordering::Acquire)
                 || self.owner.finishing.load(Ordering::Acquire)
                 || self.owner.shutdown.load(Ordering::Acquire)
+                || self
+                    .owner
+                    .role_execution
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .is_some_and(|o| !o.ready_observed)
             {
                 return Err(fault(
                     ErrorCode::BackendUnavailable,
@@ -2625,24 +2753,66 @@ mod native {
             self.owner
                 .execution_high_water
                 .store(execution.sequence, Ordering::Release);
-            Ok(Lease {
+            let mut lease = Lease {
                 physical,
                 request,
                 execution: *execution,
                 warm,
-            })
+                observer_failed: false,
+            };
+            let binding = NativeRoleExecutionBinding {
+                request: lease.request.role().id,
+                execution: lease.execution,
+            };
+            *self
+                .owner
+                .role_execution
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(ObservedRoleExecution {
+                binding,
+                unknown_observed: false,
+                ready_observed: false,
+                observer_error: None,
+            });
+            if let Err(error) = self
+                .owner
+                .observe("role_dispatched", |observer| observer.dispatched(binding))
+            {
+                lease.observer_failed = true;
+                self.owner.remember_role_observer_error(binding, error);
+            }
+            // Even callback poison/panic/failure leaves the actual physical
+            // Lease in runtime ownership. No observer-only quarantine is made.
+            Ok(lease)
         }
         fn poll(
             &mut self,
             lease: &mut Lease,
         ) -> Poll<Vec<BackendResult<PalsAdapter<PalsModelInput, ContractSystemClock>>>> {
+            let binding = NativeRoleExecutionBinding {
+                request: lease.request.role().id,
+                execution: lease.execution,
+            };
             let result = match lease.physical.poll() {
                 PhysicalPoll::Pending => return Poll::Pending,
-                PhysicalPoll::Quarantined | PhysicalPoll::Consumed => {
+                unknown @ (PhysicalPoll::Quarantined | PhysicalPoll::Consumed) => {
                     if let Ok(Some(error)) = lease.physical.quarantine_cause() {
+                        // Preserve the backend's original cause before observers.
                         self.owner.remember_failure(&error);
                     }
                     self.owner.quarantined.store(true, Ordering::Release);
+                    let reason = if matches!(unknown, PhysicalPoll::Quarantined) {
+                        NativeRoleCompletionUnknown::Quarantined
+                    } else {
+                        NativeRoleCompletionUnknown::Consumed
+                    };
+                    if let Err(error) = self.owner.observe_role_terminal(
+                        binding,
+                        NativeRoleTerminal::CompletionUnknown(reason),
+                    ) {
+                        lease.observer_failed = true;
+                        self.owner.remember_role_observer_error(binding, error);
+                    }
                     if let Some(mut warm) = lease.warm.take() {
                         if let Some(physical) = warm.physical.take() {
                             warm.state
@@ -2655,29 +2825,39 @@ mod native {
             };
             self.owner.in_flight.fetch_sub(1, Ordering::AcqRel);
             self.owner.physical_completed.fetch_add(1, Ordering::AcqRel);
-            let observer_failed = match &result {
-                Ok(PalsNativeResult::Evaluation(raw)) => self
-                    .owner
-                    .observe("physical_return", |observer| {
+            if let Err(error) = &result {
+                self.owner.remember_failure(error);
+            }
+            if let Err(error) = self
+                .owner
+                .observe_role_terminal(binding, NativeRoleTerminal::Ready(result.as_ref()))
+            {
+                lease.observer_failed = true;
+                self.owner.remember_role_observer_error(binding, error);
+            }
+            let legacy_observation = match &result {
+                Ok(PalsNativeResult::Evaluation(raw)) => {
+                    self.owner.observe("physical_return", |observer| {
                         observer.physically_completed_with_execution(
                             lease.request.role().id,
                             Ok(raw),
                             &self.owner.execution_receipt(),
                         )
                     })
-                    .is_err(),
-                Err(error) => self
-                    .owner
-                    .observe("physical_return", |observer| {
-                        observer.physically_completed_with_execution(
-                            lease.request.role().id,
-                            Err(error),
-                            &self.owner.execution_receipt(),
-                        )
-                    })
-                    .is_err(),
-                _ => false,
+                }
+                Err(error) => self.owner.observe("physical_return", |observer| {
+                    observer.physically_completed_with_execution(
+                        lease.request.role().id,
+                        Err(error),
+                        &self.owner.execution_receipt(),
+                    )
+                }),
+                _ => Ok(()),
             };
+            if let Err(error) = legacy_observation {
+                lease.observer_failed = true;
+                self.owner.remember_role_observer_error(binding, error);
+            }
             let raw = match result {
                 Ok(PalsNativeResult::Evaluation(raw)) => {
                     self.owner.completed.fetch_add(1, Ordering::AcqRel);
@@ -2690,8 +2870,7 @@ mod native {
                         "PALS role lease received a control response",
                     ))
                 }
-                Err(error) => {
-                    self.owner.remember_failure(&error);
+                Err(_) => {
                     self.owner.physical_failed.fetch_add(1, Ordering::AcqRel);
                     Err(fault(
                         ErrorCode::BackendFailure,
@@ -2747,6 +2926,14 @@ mod native {
             if raw_was_successful && output.is_err() {
                 self.owner.validation_failed.fetch_add(1, Ordering::AcqRel);
             }
+            let observer_failed = lease.observer_failed
+                || self
+                    .owner
+                    .role_execution
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .is_some_and(|o| o.binding == binding && o.observer_error.is_some());
             let mut output = if observer_failed && output.is_ok() {
                 Err(fault(
                     ErrorCode::BackendFailure,
@@ -3289,6 +3476,7 @@ mod native {
                 observer: Mutex::new(None),
                 observer_failures: AtomicU64::new(0),
                 last_observer_failure: Mutex::new(None),
+                role_execution: Mutex::new(None),
                 private_warm,
                 warm_admission: Mutex::new(None),
             });
@@ -4281,6 +4469,8 @@ mod native {
                 if self.owner.quarantined.load(Ordering::Acquire) {
                     self.unusable = true;
                     cancel.cancel();
+                    self.owner
+                        .observe_role_unknown(id, NativeRoleCompletionUnknown::Quarantined);
                     let _ = self.runtime.cancel(id);
                     self.runtime.pump();
                     let _ = self.owner.observe("physical_unknown", |observer| {
@@ -4349,6 +4539,8 @@ mod native {
                 if drain_until.is_some_and(|deadline| Instant::now() >= deadline) {
                     self.unusable = true;
                     self.owner.quarantined.store(true, Ordering::Release);
+                    self.owner
+                        .observe_role_unknown(id, NativeRoleCompletionUnknown::DrainExpired);
                     let now = self.clock.now();
                     let _ = self.runtime.begin_shutdown(Deadline {
                         clock: self.clock.domain(),
@@ -5583,6 +5775,7 @@ mod native {
                 observer: Mutex::new(None),
                 observer_failures: AtomicU64::new(0),
                 last_observer_failure: Mutex::new(None),
+                role_execution: Mutex::new(None),
                 private_warm: None,
                 warm_admission: Mutex::new(None),
             });
@@ -6347,6 +6540,492 @@ mod native {
                     .unwrap();
             }
         }
+        // Controlled worker/observer fixtures only. No ORT/model/provider/source,
+        // registered binary, whole-cost, CUDA or training authority is produced.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum BindingTerminalFact {
+            Evaluation,
+            BackendFailure,
+            Control,
+            Unknown(NativeRoleCompletionUnknown),
+        }
+        #[derive(Default)]
+        struct BindingFacts {
+            prepared: Vec<RequestId>,
+            dispatched: Vec<NativeRoleExecutionBinding>,
+            terminal: Vec<(NativeRoleExecutionBinding, BindingTerminalFact)>,
+            delivered: Vec<RequestId>,
+            accepted: Vec<RequestId>,
+            inflight_at_dispatch: Vec<u64>,
+            backend_details: Vec<&'static str>,
+        }
+        struct BindingObserver {
+            facts: Arc<Mutex<BindingFacts>>,
+            owner: std::sync::Weak<WorkerOwner>,
+            fail_dispatch: bool,
+            panic_dispatch: bool,
+            fail_terminal: bool,
+            overwrite_high_water: bool,
+            release: Option<std::sync::mpsc::Sender<()>>,
+        }
+        fn binding_observer(
+            facts: &Arc<Mutex<BindingFacts>>,
+            owner: &Arc<WorkerOwner>,
+        ) -> BindingObserver {
+            BindingObserver {
+                facts: Arc::clone(facts),
+                owner: Arc::downgrade(owner),
+                fail_dispatch: false,
+                panic_dispatch: false,
+                fail_terminal: false,
+                overwrite_high_water: false,
+                release: None,
+            }
+        }
+        impl NativeRoleObserver for BindingObserver {
+            fn prepared(
+                &mut self,
+                id: RequestId,
+                _: &PalsModelInput,
+                _: NativePreparedContext<'_>,
+            ) -> Result<(), RoleError> {
+                self.facts.lock().unwrap().prepared.push(id);
+                Ok(())
+            }
+            fn dispatched(&mut self, binding: NativeRoleExecutionBinding) -> Result<(), RoleError> {
+                let owner = self.owner.upgrade().unwrap();
+                {
+                    let mut facts = self.facts.lock().unwrap();
+                    facts.dispatched.push(binding);
+                    facts
+                        .inflight_at_dispatch
+                        .push(owner.in_flight.load(Ordering::Acquire));
+                }
+                if self.overwrite_high_water {
+                    // Deliberately unrelated metadata, proving callbacks use
+                    // the actual Lease rather than reading this mutable counter.
+                    owner.execution_high_water.store(999, Ordering::Release);
+                }
+                if let Some(release) = self.release.take() {
+                    release.send(()).unwrap();
+                }
+                if self.panic_dispatch {
+                    panic!("controlled dispatch observer panic");
+                }
+                if self.fail_dispatch {
+                    return Err(RoleError::Backend(
+                        "controlled dispatch observer failure".into(),
+                    ));
+                }
+                Ok(())
+            }
+            fn terminal(
+                &mut self,
+                binding: NativeRoleExecutionBinding,
+                event: NativeRoleTerminal<'_>,
+            ) -> Result<(), RoleError> {
+                let mut facts = self.facts.lock().unwrap();
+                let fact = match event {
+                    NativeRoleTerminal::Ready(Ok(PalsNativeResult::Evaluation(_))) => {
+                        BindingTerminalFact::Evaluation
+                    }
+                    NativeRoleTerminal::Ready(Ok(_)) => BindingTerminalFact::Control,
+                    NativeRoleTerminal::Ready(Err(error)) => {
+                        facts.backend_details.push(error.detail);
+                        BindingTerminalFact::BackendFailure
+                    }
+                    NativeRoleTerminal::CompletionUnknown(reason) => {
+                        BindingTerminalFact::Unknown(reason)
+                    }
+                };
+                facts.terminal.push((binding, fact));
+                drop(facts);
+                if self.fail_terminal {
+                    return Err(RoleError::Backend(
+                        "controlled terminal observer failure".into(),
+                    ));
+                }
+                Ok(())
+            }
+            fn delivered(&mut self, id: RequestId) -> Result<(), RoleError> {
+                self.facts.lock().unwrap().delivered.push(id);
+                Ok(())
+            }
+            fn accepted(&mut self, id: RequestId) -> Result<(), RoleError> {
+                self.facts.lock().unwrap().accepted.push(id);
+                Ok(())
+            }
+        }
+        fn binding_fixture_command(
+            command: &PalsNativeCommand,
+        ) -> PhysicalRun<Result<PalsNativeResult, BackendError>> {
+            match command {
+                PalsNativeCommand::Evaluate(input) => PhysicalRun::Complete(Ok(output(input))),
+                PalsNativeCommand::NewGame => PhysicalRun::Complete(Ok(PalsNativeResult::NewGame)),
+                PalsNativeCommand::SnapshotStats => {
+                    PhysicalRun::Complete(Ok(PalsNativeResult::Stats(PalsBackendStats::default())))
+                }
+                _ => unexpected_cuda_placement(),
+            }
+        }
+        fn binding_backend_error() -> BackendError {
+            BackendError::new(
+                FailureKind::BackendFailure,
+                FailureStage::Backend,
+                "binding fixture original backend cause",
+            )
+        }
+        #[test]
+        fn role_binding_uses_actual_dispatch_and_ready_ids_across_new_game() {
+            let mut model = fixture_model(binding_fixture_command);
+            let facts = Arc::new(Mutex::new(BindingFacts::default()));
+            let mut observer = binding_observer(&facts, &model.owner);
+            observer.overwrite_high_water = true;
+            model.set_observer(Box::new(observer)).unwrap();
+            let position = Position::startpos();
+            let legal = position.legal_moves();
+            let cancel = AtomicBool::new(false);
+            for reset in [false, true] {
+                if reset {
+                    model.new_game();
+                }
+                model.propose(query(&position, &legal, &cancel)).unwrap();
+                model.accepted_output();
+            }
+            {
+                let facts = facts.lock().unwrap();
+                assert_eq!(facts.prepared.len(), 2);
+                assert_eq!(facts.dispatched.len(), 2);
+                assert_eq!(facts.terminal.len(), 2);
+                assert_eq!(facts.inflight_at_dispatch, [1, 1]);
+                for index in 0..2 {
+                    let binding = facts.dispatched[index];
+                    assert_eq!(binding.request, facts.prepared[index]);
+                    assert_eq!(binding.request.epoch, model.epoch);
+                    assert_ne!(binding.execution.sequence, 999);
+                    assert_eq!(
+                        facts.terminal[index],
+                        (binding, BindingTerminalFact::Evaluation)
+                    );
+                    assert_eq!(facts.delivered[index], binding.request);
+                    assert_eq!(facts.accepted[index], binding.request);
+                }
+                assert_ne!(facts.dispatched[0].execution, facts.dispatched[1].execution);
+            }
+            let receipt = model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(receipt.execution_high_water, 999);
+            assert_eq!(receipt.physically_completed_role_calls, 2);
+            assert_eq!(receipt.search_consumed_role_inputs, 2);
+            assert_eq!(receipt.observer_failures, 0);
+            assert!(receipt.physical_shutdown_confirmed && receipt.native_buffers_released);
+        }
+        #[test]
+        fn post_submit_observer_error_and_panic_keep_lease_until_actual_ready() {
+            for panic_dispatch in [false, true] {
+                let (release, waiting) = std::sync::mpsc::channel();
+                let mut model = fixture_model(move |command| match command {
+                    PalsNativeCommand::Evaluate(input) => {
+                        waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+                        PhysicalRun::Complete(Ok(output(input)))
+                    }
+                    _ => binding_fixture_command(command),
+                });
+                let facts = Arc::new(Mutex::new(BindingFacts::default()));
+                let mut observer = binding_observer(&facts, &model.owner);
+                observer.fail_dispatch = !panic_dispatch;
+                observer.panic_dispatch = panic_dispatch;
+                observer.release = Some(release);
+                model.set_observer(Box::new(observer)).unwrap();
+                let position = Position::startpos();
+                let legal = position.legal_moves();
+                let cancel = AtomicBool::new(false);
+                assert!(matches!(
+                    model.propose(query(&position, &legal, &cancel)),
+                    Err(RoleError::Backend(_))
+                ));
+                model.accepted_output();
+                {
+                    let facts = facts.lock().unwrap();
+                    assert_eq!(facts.inflight_at_dispatch, [1]);
+                    assert_eq!(
+                        facts.terminal,
+                        [(facts.dispatched[0], BindingTerminalFact::Evaluation)]
+                    );
+                    assert!(facts.delivered.is_empty() && facts.accepted.is_empty());
+                }
+                let observed = model.owner.role_execution.lock().unwrap();
+                assert!(observed.as_ref().unwrap().ready_observed);
+                assert!(observed.as_ref().unwrap().observer_error.is_some());
+                drop(observed);
+                let handle = model.finish_handle();
+                let before = handle.receipt();
+                assert_eq!(before.physically_completed_role_calls, 1);
+                assert_eq!(before.physical_runs_in_flight, 0);
+                assert_eq!(before.observer_failures, 1);
+                assert_eq!(
+                    before.last_observer_failure.as_ref().unwrap().stage,
+                    "role_dispatched"
+                );
+                assert!(!before.quarantined);
+                let done = handle
+                    .finish(Instant::now() + Duration::from_secs(2))
+                    .unwrap();
+                assert!(done.physical_shutdown_confirmed && done.native_buffers_released);
+                assert_eq!(done.search_consumed_role_inputs, 0);
+            }
+        }
+        #[test]
+        fn backend_failure_stays_primary_when_dispatch_and_terminal_observers_fail() {
+            let mut model = fixture_model(|command| match command {
+                PalsNativeCommand::Evaluate(_) => {
+                    PhysicalRun::Complete(Err(binding_backend_error()))
+                }
+                _ => binding_fixture_command(command),
+            });
+            let facts = Arc::new(Mutex::new(BindingFacts::default()));
+            let mut observer = binding_observer(&facts, &model.owner);
+            observer.fail_dispatch = true;
+            observer.fail_terminal = true;
+            model.set_observer(Box::new(observer)).unwrap();
+            let position = Position::startpos();
+            let legal = position.legal_moves();
+            let cancel = AtomicBool::new(false);
+            assert!(matches!(
+                model.propose(query(&position, &legal, &cancel)),
+                Err(RoleError::Backend(_))
+            ));
+            {
+                let facts = facts.lock().unwrap();
+                assert_eq!(
+                    facts.terminal,
+                    [(facts.dispatched[0], BindingTerminalFact::BackendFailure)]
+                );
+                assert_eq!(
+                    facts.backend_details,
+                    ["binding fixture original backend cause"]
+                );
+                assert!(facts.delivered.is_empty() && facts.accepted.is_empty());
+            }
+            let receipt = model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(
+                receipt.last_failure.as_ref().unwrap().detail,
+                "binding fixture original backend cause"
+            );
+            assert_eq!(receipt.failed_physical_role_calls, 1);
+            assert_eq!(receipt.physically_completed_role_calls, 1);
+            assert_eq!(receipt.observer_failures, 2);
+            assert_eq!(receipt.search_consumed_role_inputs, 0);
+            assert!(!receipt.quarantined);
+            assert!(receipt.physical_shutdown_confirmed && receipt.native_buffers_released);
+        }
+        #[test]
+        fn unknown_binding_is_once_only_and_never_a_fake_ready_after_observer_error() {
+            let mut model = fixture_model(|_| PhysicalRun::Quarantined(binding_backend_error()));
+            let facts = Arc::new(Mutex::new(BindingFacts::default()));
+            let mut observer = binding_observer(&facts, &model.owner);
+            observer.fail_terminal = true;
+            model.set_observer(Box::new(observer)).unwrap();
+            let position = Position::startpos();
+            let legal = position.legal_moves();
+            let cancel = AtomicBool::new(false);
+            assert!(matches!(
+                model.propose(query(&position, &legal, &cancel)),
+                Err(RoleError::PhysicalCompletionUnknown)
+            ));
+            for _ in 0..3 {
+                model.runtime.pump();
+            }
+            {
+                let facts = facts.lock().unwrap();
+                assert_eq!(
+                    facts.terminal,
+                    [(
+                        facts.dispatched[0],
+                        BindingTerminalFact::Unknown(NativeRoleCompletionUnknown::Quarantined)
+                    )]
+                );
+                assert!(facts.delivered.is_empty() && facts.accepted.is_empty());
+            }
+            let handle = model.finish_handle();
+            assert!(matches!(
+                handle.finish(Instant::now() + Duration::from_secs(1)),
+                Err(RoleError::PhysicalCompletionUnknown)
+            ));
+            let receipt = handle.receipt();
+            assert_eq!(receipt.physically_completed_role_calls, 0);
+            assert_eq!(receipt.physical_runs_in_flight, 1);
+            assert_eq!(receipt.observer_failures, 1);
+            assert_eq!(
+                receipt.last_failure.as_ref().unwrap().detail,
+                "binding fixture original backend cause"
+            );
+            assert!(
+                receipt.quarantined
+                    && !receipt.physical_shutdown_confirmed
+                    && !receipt.native_buffers_released
+            );
+        }
+        #[test]
+        fn actual_late_ready_after_drain_unknown_never_reopens_consumption() {
+            let (release, waiting) = std::sync::mpsc::channel();
+            let mut model = fixture_model(move |command| match command {
+                PalsNativeCommand::Evaluate(input) => {
+                    waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+                    PhysicalRun::Complete(Ok(output(input)))
+                }
+                _ => binding_fixture_command(command),
+            });
+            model.drain_limit = Duration::from_millis(10);
+            let facts = Arc::new(Mutex::new(BindingFacts::default()));
+            model
+                .set_observer(Box::new(binding_observer(&facts, &model.owner)))
+                .unwrap();
+            let position = Position::startpos();
+            let legal = position.legal_moves();
+            let cancel = AtomicBool::new(false);
+            let mut request = query(&position, &legal, &cancel);
+            // Waiting is controlled independently of the logical deadline. No
+            // fake Ready or shortened node/model computation stands in for it.
+            request.deadline = Instant::now() + Duration::from_millis(500);
+            assert!(matches!(
+                model.propose(request),
+                Err(RoleError::PhysicalCompletionUnknown)
+            ));
+            {
+                let facts = facts.lock().unwrap();
+                assert_eq!(facts.dispatched.len(), 1);
+                assert_eq!(
+                    facts.terminal,
+                    [(
+                        facts.dispatched[0],
+                        BindingTerminalFact::Unknown(NativeRoleCompletionUnknown::DrainExpired)
+                    )]
+                );
+            }
+            assert_eq!(model.owner.in_flight.load(Ordering::Acquire), 1);
+            release.send(()).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            // Existing PalsRuntime allows pumping a timed-out retained owner;
+            // only its actual backend Ready decrements the physical counter.
+            while model.owner.in_flight.load(Ordering::Acquire) != 0 && Instant::now() < until {
+                model.runtime.pump();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            {
+                let facts = facts.lock().unwrap();
+                let binding = facts.dispatched[0];
+                assert_eq!(
+                    facts.terminal,
+                    [
+                        (
+                            binding,
+                            BindingTerminalFact::Unknown(NativeRoleCompletionUnknown::DrainExpired)
+                        ),
+                        (binding, BindingTerminalFact::Evaluation),
+                    ]
+                );
+                assert!(facts.delivered.is_empty() && facts.accepted.is_empty());
+            }
+            model.accepted_output();
+            assert!(matches!(
+                model.propose(query(&position, &legal, &cancel)),
+                Err(RoleError::PhysicalCompletionUnknown)
+            ));
+            let handle = model.finish_handle();
+            assert!(matches!(
+                handle.finish(until),
+                Err(RoleError::PhysicalCompletionUnknown)
+            ));
+            let receipt = handle.receipt();
+            assert_eq!(receipt.physically_completed_role_calls, 1);
+            assert_eq!(receipt.physical_runs_in_flight, 0);
+            assert_eq!(receipt.search_consumed_role_inputs, 0);
+            assert!(receipt.quarantined && !receipt.native_buffers_released);
+        }
+        #[test]
+        fn poisoned_observer_keeps_actual_ready_and_original_backend_cause() {
+            let target = Arc::new(Mutex::new(std::sync::Weak::<WorkerOwner>::new()));
+            let actual_target = Arc::clone(&target);
+            let mut model = fixture_model(move |command| match command {
+                PalsNativeCommand::Evaluate(_) => {
+                    let owner = actual_target.lock().unwrap().upgrade().unwrap();
+                    // Poison after physical submit; never skip the real Ready.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _guard = owner.observer.lock().unwrap();
+                        panic!("controlled observer mutex poison");
+                    }));
+                    PhysicalRun::Complete(Err(binding_backend_error()))
+                }
+                _ => binding_fixture_command(command),
+            });
+            *target.lock().unwrap() = Arc::downgrade(&model.owner);
+            let facts = Arc::new(Mutex::new(BindingFacts::default()));
+            model
+                .set_observer(Box::new(binding_observer(&facts, &model.owner)))
+                .unwrap();
+            let position = Position::startpos();
+            let legal = position.legal_moves();
+            let cancel = AtomicBool::new(false);
+            assert!(matches!(
+                model.propose(query(&position, &legal, &cancel)),
+                Err(RoleError::Backend(_))
+            ));
+            let receipt = model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(
+                receipt.last_failure.as_ref().unwrap().detail,
+                "binding fixture original backend cause"
+            );
+            assert_eq!(receipt.failed_physical_role_calls, 1);
+            assert_eq!(receipt.physically_completed_role_calls, 1);
+            assert_eq!(receipt.physical_runs_in_flight, 0);
+            assert!(receipt.observer_failures >= 2);
+            assert_eq!(receipt.search_consumed_role_inputs, 0);
+            assert!(!receipt.quarantined);
+            assert!(receipt.physical_shutdown_confirmed && receipt.native_buffers_released);
+        }
+        #[test]
+        fn bound_ready_control_is_known_physical_work_but_not_a_role_output() {
+            let mut model = fixture_model(|command| match command {
+                PalsNativeCommand::Evaluate(_) => {
+                    PhysicalRun::Complete(Ok(PalsNativeResult::NewGame))
+                }
+                _ => binding_fixture_command(command),
+            });
+            let facts = Arc::new(Mutex::new(BindingFacts::default()));
+            model
+                .set_observer(Box::new(binding_observer(&facts, &model.owner)))
+                .unwrap();
+            let position = Position::startpos();
+            let legal = position.legal_moves();
+            let cancel = AtomicBool::new(false);
+            assert!(model.propose(query(&position, &legal, &cancel)).is_err());
+            {
+                let facts = facts.lock().unwrap();
+                assert_eq!(
+                    facts.terminal,
+                    [(facts.dispatched[0], BindingTerminalFact::Control)]
+                );
+                assert!(facts.delivered.is_empty() && facts.accepted.is_empty());
+            }
+            let receipt = model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(receipt.physically_completed_role_calls, 1);
+            assert_eq!(receipt.completed_role_inputs, 0);
+            assert_eq!(receipt.invalid_role_outputs, 1);
+            assert_eq!(receipt.search_consumed_role_inputs, 0);
+            assert_eq!(receipt.observer_failures, 0);
+        }
         struct InputObserver {
             input_keys: Arc<Mutex<Vec<[u8; 32]>>>,
             stages: Arc<Mutex<Vec<(u64, &'static str)>>>,
@@ -6871,8 +7550,9 @@ pub use native::{
     NativeHostRecordPageCommandReceipt, NativeHostRecordPageDeclaration,
     NativeHostRecordPageLimits, NativeHostRecordPageObservationReceipt,
     NativeHostRecordPageSnapshotReceipt, NativeHostRecordPageStatsReceipt, NativeOwnerOptions,
-    NativePreparedContext, NativePrivateWarmDeclaration, NativeRoleFinishHandle, NativeRoleModel,
-    NativeRoleObserver, NativeRoleReceipt, NativeRoleRejection, NativeRoleSourceIdentity,
+    NativePreparedContext, NativePrivateWarmDeclaration, NativeRoleCompletionUnknown,
+    NativeRoleExecutionBinding, NativeRoleFinishHandle, NativeRoleModel, NativeRoleObserver,
+    NativeRoleReceipt, NativeRoleRejection, NativeRoleSourceIdentity, NativeRoleTerminal,
     NativeStartupCommandObservation, NativeStartupErrorKind, NativeStartupFailureDiagnostic,
     NativeStartupProbeReceipt, NativeStartupTimingObservation,
 };
