@@ -15,12 +15,11 @@ use rz_experiments::{
     PalsWeightIdentityV3, ToolIdentity,
 };
 #[cfg(target_os = "linux")]
-use rz_experiments::{
-    PALS_RECEIPT_V3_DOMAIN, PalsGameReceiptV3, PalsResultV3, PalsRunFailureV3, PalsTerminationV3,
-};
+use rz_experiments::{PALS_RECEIPT_V3_DOMAIN, PalsGameReceiptV3, PalsResultV3, PalsTerminationV3};
 #[cfg(any(target_os = "linux", test))]
 use rz_experiments::{
     PalsEndpointReceiptV3, PalsObservedV3, PalsOptionReceiptV3, PalsPhysicalStateV3,
+    PalsRunFailureV3,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

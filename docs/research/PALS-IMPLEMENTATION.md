@@ -1593,3 +1593,18 @@ managed 임시 tree 정리도 완료했다. arena 검사 69.95초와 설치 없�
 `c7c1d90`의 [CI 37708314220](https://github.com/daejunnom/RoveZero/actions/runs/37708314220)는
 네 CPU job 모두 실제 성공했다(Windows 최종 2026-10-08 00:39:30 UTC).
 이 결과에 후속 Core 수정의 CI·실제 대국 인수를 포함시키지 않는다.
+
+Core 수정 `0027464`의 Windows job은 새 테스트 helper와 enum import의 cfg 범위가
+달라 컴파일 단계에서 실패했다. Linux/test 조건을 동일하게 맞추는 import 수정으로
+연결했으며, Linux의 유효 바인딩과 실행 로직은 동일하다. 원래 Windows 실패 로그와
+후속 CI는 별도로 보존한다. 역사적 V3 decode를 새 양성 인수와 혼동하지 않는다.
+
+중앙 build89는 `0027464`의 Rust/Cargo 230개를 빌드 전후 대조하고 CPU UCI와
+PALS pair example을 등록했다. Cargo exit 0·managed 임시 정리 완료·service 13.100초를
+관측했다. UCI는 `fresh=true`이고 기존 72의 동일한 78,293,936B/
+`7097c6182172f1ed4313a35242f0ccf949fef05ce743ab56ecc55513db8af84b`다.
+Pair example은 `fresh=false`이며 113,055,936B/
+`3ef8a76fbe30fb636c94bbdd6816208fca163844e9c714ca7b1684c5fbd0c50c`로 별도 등록했다.
+이는 실제 역사 소스 `0027464`의 Linux 바이너리이며 이후 Windows import 수정이나
+문서 커밋에서 새로 빌드한 것으로 표시하지 않는다. 새 자체 CPU_R pilot이 이 등록을
+사용할 때 모델·시계·자원·source proof와 최종 PR 검사를 각각 기록한다.
