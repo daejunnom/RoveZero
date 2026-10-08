@@ -41,6 +41,21 @@ _REVIEWED_SOURCES = (
     {"bytes": 260542, "sha256": "4469f9d8721264c2053380fd8900ef00b23602d42220adb99b8199cef8b62afb"},
     {"bytes": 73365, "sha256": "564d2b29d873df1c7b0424bfcee0b52a8f314cbfd88fa68ef35f4fda99a600d5"},
 )
+# Independently reviewed default-only successor. The unchanged collector calls
+# PalsEngine::new -> Disabled; the new opt-in constructor is NOT admitted.
+# Literal pairs only: neither a current file read nor one reviewed component
+# can register an otherwise unknown engine/collector combination.
+_REVIEWED_DISABLED_RECHECK_SOURCES = (
+    {"bytes": 297307, "sha256": "9c0de95911cf54365abec3818f089c20287d80160ea05eee8acbd326f7b49d2c"},
+    {"bytes": 73365, "sha256": "564d2b29d873df1c7b0424bfcee0b52a8f314cbfd88fa68ef35f4fda99a600d5"},
+)
+_SOURCE_REVIEW_PROFILES = (
+    ("legacy_prepared_lineage_4469f9d", _REVIEWED_SOURCES),
+    ("legacy_disabled_recheck_9c0de959", _REVIEWED_DISABLED_RECHECK_SOURCES),
+)
+_DISABLED_SEARCH_VERSION = "pals-restricted-refinement/0.1"
+_OPT_IN_LANE_FIELDS = ("pals_search_policy", "post_repair_recheck", "post_repair_recheck_policy", "post_repair_recheck_conditions",
+    "post_repair_recheck_search_version", "refinement_policy", "refinement_conditions", "refinement_search_version")
 _RAW_NAMES = ("work_summary", "build_registration", "source_manifest", "engine_source", "native_source")
 _PIN_NAMES = (*_RAW_NAMES, "divergence_sha256", "slot", "initial_repair_sha256", "reply_rules_sha256", "line_rules_sha256")
 _ROOT_FIELDS = ("game_id", "opening_id", "line_genealogy_id", "actual_history", "source", "frozen_epoch", "encoding_sha256")
@@ -70,7 +85,18 @@ def _pin(raw, expected):
         raise ValueError("native slot immutable byte pin mismatch")
 
 
-def _source_profile(raws, source):
+def _reviewed_source_pair(actual):
+    """Closed pair lookup AFTER raw manifest/build checks; returns no aliases."""
+    _fields(actual, _SOURCE_PATHS)
+    for _, pair in _SOURCE_REVIEW_PROFILES:
+        reviewed = dict(zip(_SOURCE_PATHS, pair))
+        if actual == reviewed:
+            return copy.deepcopy(reviewed)
+    raise _Unsupported("unreviewed_collector_transition_source_pair")
+
+
+def _source_review(raws, source):
+    """Verify actual caller build/binary/manifest bytes before static matching."""
     build, manifest = _parse(raws["build_registration"]), _parse(raws["source_manifest"])
     if build.get("schema") != BUILD_SCHEMA:
         raise _Unsupported("unreviewed_collector_build_schema")
@@ -105,16 +131,38 @@ def _source_profile(raws, source):
         _int(entry["bytes"], 0, 64 * 1024 * 1024)
         _sha(entry["sha256"])
         by_path[path] = {key: entry[key] for key in ("bytes", "sha256")}
-    for path, name, reviewed in zip(_SOURCE_PATHS, ("engine_source", "native_source"), _REVIEWED_SOURCES):
+    actual_pair = {}
+    for path, name in zip(_SOURCE_PATHS, ("engine_source", "native_source")):
         actual = byte_pin(raws[name])
         if by_path.get(path) != actual:
             raise ValueError("actual transition source bytes absent from original registered build manifest")
-        if actual != reviewed:
-            raise _Unsupported("unreviewed_collector_transition_source_pair")
+        actual_pair[path] = actual
+    reviewed_pair = _reviewed_source_pair(actual_pair)
+    native_source = source.get("native")
+    if type(native_source) is not dict:
+        raise ValueError("actual native collector source description required")
+    policy_owners = (source, native_source, native_source.get("search_configuration", {}), native_source.get("independent_registry", {}))
+    for owner in policy_owners:
+        if type(owner) is not dict:
+            raise ValueError("native collector policy description must be an object")
+        if any(key in owner for key in _OPT_IN_LANE_FIELDS):
+            raise _Unsupported("unreviewed_collector_refinement_policy")
+    # Historical minimal descriptions omit this declaration. The reviewed
+    # constructor/source pair still establishes only the Disabled lane; a
+    # present declaration in ANY policy owner must agree. The CPU task source
+    # is a separate namespace, outside these four collector policy owners.
+    if any(owner.get("search_version", _DISABLED_SEARCH_VERSION) != _DISABLED_SEARCH_VERSION
+           for owner in policy_owners):
+        raise _Unsupported("unreviewed_collector_refinement_policy")
     return {"source_commit": commit, "collector_binary_sha256": binary["sha256"],
             "build_registration": byte_pin(raws["build_registration"]), "source_manifest": byte_pin(raws["source_manifest"]),
-            "reviewed_transition_sources": {path: pin for path, pin in zip(_SOURCE_PATHS, _REVIEWED_SOURCES)},
+            "reviewed_transition_sources": reviewed_pair,
             "assurance": "independently_pinned_caller_build_observation;static_source_pair_review;not_self_reported_execution_certification"}
+
+
+def _source_profile(raws, source):
+    """Historical private seam; the actual reviewed pair remains authoritative."""
+    return _source_review(raws, source)
 
 
 def _finite_bits(values, count):
@@ -608,7 +656,7 @@ def _validate(divergence, slot, initial, reply_check, line_check, raws, pins):
             "extra_assets": {name: byte_pin(value) for name, value in raws.items()}}
     source = _parse(divergence._raws[1])[1]
     try:
-        profile = _source_profile(raws, source)
+        profile = _source_review(raws, source)
         body["transition_profile"] = profile
         if work_pin is None:
             raise _Unsupported("missing_original_work_summary_receipt_pin")

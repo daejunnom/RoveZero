@@ -1956,3 +1956,23 @@ FAILURE였다. Rust는 UCI focused fixture의 `OwnedCpuChecker` 반환 타입에
 13개 registry 또는 11개 UCI 검사를 이 실패 run에서 실행한 것처럼 표시하지 않는다.
 PALS model은 별도의 이전 closed source-pair 거절 16개 실패·1개 오류였다. 원래 run의
 실패·로그·종료 결과를 보존하고, 후속 통합 SHA에서 다시 인수한다.
+
+### 기본 collector의 닫힌 native Repair source-pair 등록
+
+기존 engine `4469f9d…`·native `564d2b29…` profile은 유지하고, 실제 읽은 새 engine
+`9c0de959…`와 변경되지 않은 native의 exact pair를 별도 profile로 추가한다. native의
+실제 constructor는 여전히 Disabled를 선택하며 새 recheck의 첫 분기에서 즉시
+반환한다. 실제 build manifest·source bytes·commit·등록 binary 결합을 먼저 검사한
+뒤 closed pair를 선택하고 returned pin은 detached copy로 반환한다.
+
+독립 검토에서 실제 `pals_search_policy` 키 누락과 nested `search_version` 검사 누락을
+발견해 수정했다. source·native·search_configuration·independent_registry의 같은
+typed owner 목록으로 marker와 version을 대조한다. 현재 collector가 만들지 않는
+marker는 Disabled 선언이어도 거절한다. present 새/unknown/null version은 거절하며
+기존 version과 생략은 유지한다. 자체 CPU namespace는 별도 cpu_task_source이므로
+이 검사를 그 CPU version으로 대체하지 않는다. 새 opt-in collector는 미지원이다.
+
+focused Python fixture는 36개이며 실제 marker 16개 및 nested version 12개 음성
+subcase를 포함한다. historical pair selector의 합성 seam을 실제 과거 producer·빌드
+재검증으로 해석하지 않는다. root109는 최종 byte pin과 stdlib AST만 PASS다. 실제
+import·fixture·consumer 인수는 후속 CPU CI에서 확인하며 local NN·WSL·GPU는 미실행이다.

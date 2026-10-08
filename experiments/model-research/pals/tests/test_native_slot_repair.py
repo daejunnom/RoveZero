@@ -36,6 +36,14 @@ def lines(values):
     return b"".join(raw(value) + b"\n" for value in values)
 
 
+def source_review_raws(fixture, **replacements):
+    """Synthetic caller build assets, not evidence of a compiler/process run."""
+    values = dict(zip(slot_witness._RAW_NAMES, (fixture.assets["native-work-summary.jsonl"], fixture.build_raw,
+        fixture.manifest_raw, fixture.engine_raw, fixture.native_raw)))
+    values.update(replacements)
+    return values
+
+
 class SlotFixture(RepairFixture):
     """One root, one D, one selected Reply slot, one Repair, later observation.
 
@@ -335,6 +343,8 @@ class NativeSlotRepairTests(unittest.TestCase):
         self.assertEqual(body["initial_repair_native_request"], [1, 4])
         self.assertEqual(body["publication_native_request"], [1, 5])
         self.assertEqual(body["captured_input_revision"], 2)
+        self.assertEqual(body["transition_profile"]["reviewed_transition_sources"], dict(zip(
+            slot_witness._SOURCE_PATHS, slot_witness._REVIEWED_DISABLED_RECHECK_SOURCES)))
         self.assertEqual(admission["scope"], "conditional_unique_prepared_lineage")
         self.assertFalse(body["direct_causal_ids_present"])
         self.assertFalse(body["before_dispatch_witness_claimed"])
@@ -408,6 +418,98 @@ class NativeSlotRepairTests(unittest.TestCase):
         checked = self.fixture.admit_slot()
         self.assertEqual(checked.status, "unsupported")
         self.assertEqual(checked.context()["reason"], "unreviewed_collector_transition_source_pair")
+
+    def test_historical_pair_remains_a_separate_closed_profile(self):
+        # The historical source bytes are not fabricated or loaded from Git.
+        # This is the closed-table preservation seam, not a historical build
+        # observation. Actual byte/binary binding is tested separately below.
+        old = dict(zip(slot_witness._SOURCE_PATHS, (
+            {"bytes": 260542, "sha256": "4469f9d8721264c2053380fd8900ef00b23602d42220adb99b8199cef8b62afb"},
+            {"bytes": 73365, "sha256": "564d2b29d873df1c7b0424bfcee0b52a8f314cbfd88fa68ef35f4fda99a600d5"})))
+        self.assertEqual(slot_witness._reviewed_source_pair(old), old)
+        copied = slot_witness._reviewed_source_pair(old)
+        copied[slot_witness._SOURCE_PATHS[0]]["sha256"] = "0" * 64
+        self.assertEqual(slot_witness._reviewed_source_pair(old), old)
+        current = {path: semantic.byte_pin(value) for path, value in zip(slot_witness._SOURCE_PATHS,
+            (self.fixture.engine_raw, self.fixture.native_raw))}
+        self.assertEqual(current[slot_witness._SOURCE_PATHS[0]],
+            {"bytes": 297307, "sha256": "9c0de95911cf54365abec3818f089c20287d80160ea05eee8acbd326f7b49d2c"})
+        self.assertEqual(slot_witness._reviewed_source_pair(current), current)
+        self.assertNotEqual(current, old)
+
+    def test_unknown_engine_or_native_source_pair_remains_unsupported(self):
+        for name, index in (("engine_source", 0), ("native_source", 1)):
+            with self.subTest(component=name):
+                values = source_review_raws(self.fixture)
+                values[name] += b"\n"
+                manifest = copy.deepcopy(self.fixture.manifest)
+                manifest["files"][index].update(semantic.byte_pin(values[name]))
+                values["source_manifest"] = raw(manifest)
+                build = copy.deepcopy(self.fixture.build)
+                build["source_manifest"] = semantic.byte_pin(values["source_manifest"])
+                values["build_registration"] = raw(build)
+                with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_transition_source_pair"):
+                    slot_witness._source_review(values, self.fixture.source)
+
+    def test_actual_manifest_and_binary_bindings_precede_unknown_pair_mask(self):
+        values = source_review_raws(self.fixture)
+        values["engine_source"] += b"\n"  # Unknown but correctly manifest-bound engine.
+        values["native_source"] += b"\n"  # Deliberately absent from the original manifest.
+        manifest = copy.deepcopy(self.fixture.manifest)
+        manifest["files"][0].update(semantic.byte_pin(values["engine_source"]))
+        values["source_manifest"] = raw(manifest)
+        build = copy.deepcopy(self.fixture.build)
+        build["source_manifest"] = semantic.byte_pin(values["source_manifest"])
+        values["build_registration"] = raw(build)
+        with self.assertRaisesRegex(ValueError, "actual transition source bytes absent"):
+            slot_witness._source_review(values, self.fixture.source)
+        build["binary"]["sha256"] = fixtures.sha("unregistered binary despite unknown source")
+        values["build_registration"] = raw(build)
+        with self.assertRaisesRegex(ValueError, "build binary"):
+            slot_witness._source_review(values, self.fixture.source)
+
+    def test_active_refinement_declaration_is_not_a_disabled_collector_profile(self):
+        values = source_review_raws(self.fixture)
+        declared = copy.deepcopy(self.fixture.source)
+        declared["native"]["search_version"] = "pals-restricted-refinement/0.1"
+        slot_witness._source_review(values, declared)
+        declared["native"]["search_version"] = "pals-restricted-refinement-post-repair-recheck/1"
+        with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_refinement_policy"):
+            slot_witness._source_review(values, declared)
+        for owner in ("source", "native", "search_configuration", "independent_registry"):
+            for marker in ("post_repair_recheck_policy", "pals_search_policy"):
+                for policy in ("SameRepairedLineOnceV1", "Disabled"):
+                    with self.subTest(owner=owner, marker=marker, policy=policy):
+                        source = copy.deepcopy(self.fixture.source)
+                        target = source if owner == "source" else source["native"] if owner == "native" else source["native"].setdefault(owner, {})
+                        target[marker] = policy
+                        with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_refinement_policy"):
+                            slot_witness._source_review(values, source)
+
+    def test_all_policy_owners_preserve_omission_and_legacy_but_refuse_other_search_versions(self):
+        values = source_review_raws(self.fixture)
+        for owner in ("source", "native", "search_configuration", "independent_registry"):
+            for version in (None, "pals-restricted-refinement-post-repair-recheck/1", "unknown-search-version/1"):
+                with self.subTest(owner=owner, version=version):
+                    source = copy.deepcopy(self.fixture.source)
+                    target = source if owner == "source" else source["native"] if owner == "native" else source["native"].setdefault(owner, {})
+                    target["search_version"] = version
+                    with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_refinement_policy"):
+                        slot_witness._source_review(values, source)
+                    target["search_version"] = "pals-restricted-refinement/0.1"
+                    slot_witness._source_review(values, source)
+                    del target["search_version"]
+                    slot_witness._source_review(values, source)
+
+    def test_returned_source_review_pins_cannot_mutate_closed_allowlist(self):
+        values = source_review_raws(self.fixture)
+        original = slot_witness._source_review(values, self.fixture.source)
+        changed = slot_witness._source_review(values, self.fixture.source)
+        changed["reviewed_transition_sources"][slot_witness._SOURCE_PATHS[0]]["bytes"] = 1
+        changed["reviewed_transition_sources"][slot_witness._SOURCE_PATHS[1]]["sha256"] = "0" * 64
+        changed["source_manifest"]["sha256"] = "1" * 64
+        self.assertEqual(slot_witness._source_review(values, self.fixture.source), original)
+        self.assertEqual(slot_witness._source_profile(values, self.fixture.source), original)
 
     def test_retain_original_work_summary_pin_no_partial_subtrace_can_be_added(self):
         args = self.fixture.slot_arguments()
