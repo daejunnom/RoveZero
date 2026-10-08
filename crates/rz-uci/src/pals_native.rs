@@ -794,6 +794,217 @@ mod native {
         pub drain_limit: Duration,
         pub host_record_pages: Option<NativeHostRecordPageLimits>,
     }
+    /// One caller-owned absolute invocation clock. Synchronous native loading is
+    /// checked before/after each stage; this value does not interrupt that call.
+    /// Cleanup always retains the original whole deadline, never `now + reserve`.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct NativeInvocationBudget {
+        started: Instant,
+        execution_until: Instant,
+        whole_until: Instant,
+        cleanup_reserve: Duration,
+    }
+    impl NativeInvocationBudget {
+        pub fn new(
+            started: Instant,
+            execution_until: Instant,
+            whole_until: Instant,
+            cleanup_reserve: Duration,
+        ) -> Result<Self, RoleError> {
+            Self::new_at(
+                started,
+                execution_until,
+                whole_until,
+                cleanup_reserve,
+                Instant::now(),
+            )
+        }
+        fn new_at(
+            started: Instant,
+            execution_until: Instant,
+            whole_until: Instant,
+            cleanup_reserve: Duration,
+            now: Instant,
+        ) -> Result<Self, RoleError> {
+            if started > now
+                || started >= execution_until
+                || execution_until >= whole_until
+                || cleanup_reserve.is_zero()
+                || execution_until.checked_add(cleanup_reserve) != Some(whole_until)
+                || now.checked_add(cleanup_reserve).is_none()
+            {
+                return Err(RoleError::Backend(
+                    "Native invocation requires past S < E < W, E + positive finite D = W".into(),
+                ));
+            }
+            Ok(Self {
+                started,
+                execution_until,
+                whole_until,
+                cleanup_reserve,
+            })
+        }
+        pub const fn started(self) -> Instant {
+            self.started
+        }
+        pub const fn execution_until(self) -> Instant {
+            self.execution_until
+        }
+        pub const fn whole_until(self) -> Instant {
+            self.whole_until
+        }
+        pub const fn cleanup_reserve(self) -> Duration {
+            self.cleanup_reserve
+        }
+        fn check_at(self, now: Instant, cancel: &AtomicBool) -> Result<(), RoleError> {
+            if cancel.load(Ordering::Acquire) {
+                return Err(RoleError::Canceled);
+            }
+            if now >= self.execution_until {
+                return Err(RoleError::Deadline);
+            }
+            Ok(())
+        }
+        fn failure(
+            self,
+            stage: NativeLoadStage,
+            cause: RoleError,
+            cancel: &AtomicBool,
+            finish: Option<NativeRoleFinishHandle>,
+        ) -> NativeLoadFailure {
+            self.failure_at(stage, cause, Instant::now(), cancel, finish)
+        }
+        fn failure_at(
+            self,
+            stage: NativeLoadStage,
+            cause: RoleError,
+            now: Instant,
+            cancel: &AtomicBool,
+            finish: Option<NativeRoleFinishHandle>,
+        ) -> NativeLoadFailure {
+            NativeLoadFailure {
+                stage,
+                cause,
+                elapsed: now.saturating_duration_since(self.started),
+                execution_expired: now >= self.execution_until,
+                whole_expired: now >= self.whole_until,
+                canceled: cancel.load(Ordering::Acquire),
+                finish,
+                backend_error: None,
+            }
+        }
+        fn check_stage(
+            self,
+            stage: NativeLoadStage,
+            cancel: &AtomicBool,
+        ) -> Result<(), NativeLoadFailure> {
+            self.check_at(Instant::now(), cancel)
+                .map_err(|cause| self.failure(stage, cause, cancel, None))
+        }
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum NativeLoadStage {
+        Admission,
+        RuntimeLoad,
+        BackendLoad,
+        OwnerConstruction,
+        PostConstruction,
+    }
+    /// Actual synchronous load failure and current clock/cancel facts. `finish`
+    /// is an owned cleanup opportunity, not a physical shutdown/release receipt.
+    /// None means cleanup is unobserved, including failures before owner capture;
+    /// it never means zero workers, zero native work, or successful release.
+    pub struct NativeLoadFailure {
+        pub stage: NativeLoadStage,
+        pub cause: RoleError,
+        pub elapsed: Duration,
+        pub execution_expired: bool,
+        pub whole_expired: bool,
+        pub canceled: bool,
+        pub finish: Option<NativeRoleFinishHandle>,
+        /// Owned original error from the direct runtime/backend loading call.
+        /// RoleError-only owner construction and clock/admission paths leave
+        /// this None (unobserved), not a complete C diagnostic journal.
+        pub backend_error: Option<Box<BackendError>>,
+    }
+    impl NativeLoadFailure {
+        fn with_backend_error(mut self, error: BackendError) -> Self {
+            // Move the bounded original, including its owned local diagnostic;
+            // do not reconstruct it from Display or clone native text.
+            self.backend_error = Some(Box::new(error));
+            self
+        }
+    }
+    impl std::fmt::Debug for NativeLoadFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("NativeLoadFailure")
+                .field("stage", &self.stage)
+                .field("cause", &self.cause)
+                .field("elapsed", &self.elapsed)
+                .field("execution_expired", &self.execution_expired)
+                .field("whole_expired", &self.whole_expired)
+                .field("canceled", &self.canceled)
+                .field("finish_handle_available", &self.finish.is_some())
+                .field("backend_error", &self.backend_error)
+                .finish()
+        }
+    }
+    impl std::fmt::Display for NativeLoadFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "Native invocation load failed at {:?}: {:?}",
+                self.stage, self.cause
+            )
+        }
+    }
+    impl std::error::Error for NativeLoadFailure {}
+    fn validate_cpu_fresh_invocation(
+        config: &rz_eval::pals_onnx::PalsOnnxConfig,
+        options: NativeOwnerOptions,
+        budget: NativeInvocationBudget,
+        cancel: &AtomicBool,
+    ) -> Result<(), NativeLoadFailure> {
+        budget.check_stage(NativeLoadStage::Admission, cancel)?;
+        let validation = (|| {
+            options.validate(config)?;
+            if config.provider != rz_eval::onnx::Provider::Cpu
+                || config.device_public_memory
+                || options.host_record_pages.is_some()
+                || options.drain_limit != budget.cleanup_reserve()
+                || !(1..=2).contains(&config.intra_threads)
+            {
+                return Err(RoleError::Backend(
+                    "Native invocation loader requires CPU Fresh, 1..=2 threads, no record pages and exact cleanup reserve".into(),
+                ));
+            }
+            Ok(())
+        })();
+        validation
+            .map_err(|cause| budget.failure(NativeLoadStage::Admission, cause, cancel, None))?;
+        budget.check_stage(NativeLoadStage::Admission, cancel)
+    }
+    fn validate_cpu_invocation_bundle(bundle: Option<[u8; 32]>) -> Result<(), RoleError> {
+        // This is only a decision over the actual pin getter in the factory.
+        // None does not certify a CPU build, provider execution or source pin.
+        if bundle.is_some() {
+            return Err(RoleError::Backend(
+                "CPU Fresh invocation refuses a CUDA native runtime bundle".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn accept_invocation_owner(
+        model: NativeRoleModel,
+        budget: NativeInvocationBudget,
+        cancel: &AtomicBool,
+    ) -> Result<NativeRoleModel, NativeLoadFailure> {
+        if let Err(cause) = budget.check_at(Instant::now(), cancel) {
+            let finish = Some(model.finish_handle());
+            return Err(budget.failure(NativeLoadStage::PostConstruction, cause, cancel, finish));
+        }
+        Ok(model)
+    }
     /// Owned opt-in input. Execution identity, namespace, Session and placement
     /// are obtained from the loaded backend and this owner, never the caller.
     pub struct NativeCudaRecordPagesRegistration {
@@ -3024,6 +3235,79 @@ mod native {
                 .map_err(model_error)?;
             Self::new_with_options(backend, options)
         }
+        /// Additive CPU Fresh loader using the caller's original absolute clock.
+        /// No synchronous ORT/session call is forcibly timed out. A late return
+        /// is rejected with its original failure/elapsed facts and any actually
+        /// captured owner handle; the caller must finish using budget.whole_until().
+        /// ORT's process-lifetime pinned bootstrap/latch remains separate from
+        /// native worker/session join; a finish handle does not unload that latch.
+        /// This factory neither admits Query/2 nor proves registered binary,
+        /// provider execution, physical closure or measured whole invocation cost.
+        pub fn load_pinned_cpu_fresh_for_invocation(
+            export: &std::path::Path,
+            expected_export_sha256: &str,
+            pin: &rz_eval::runtime_pin::RuntimeLibraryPin,
+            config: rz_eval::pals_onnx::PalsOnnxConfig,
+            options: NativeOwnerOptions,
+            budget: NativeInvocationBudget,
+            cancel: &AtomicBool,
+        ) -> Result<Self, NativeLoadFailure> {
+            validate_cpu_fresh_invocation(&config, options, budget, cancel)?;
+            validate_cpu_invocation_bundle(pin.bundle_digest())
+                .map_err(|cause| budget.failure(NativeLoadStage::Admission, cause, cancel, None))?;
+            budget.check_stage(NativeLoadStage::RuntimeLoad, cancel)?;
+            let runtime = rz_eval::onnx::OrtRuntime::load(pin).map_err(|cause| {
+                budget
+                    .failure(
+                        NativeLoadStage::RuntimeLoad,
+                        model_error(&cause),
+                        cancel,
+                        None,
+                    )
+                    .with_backend_error(cause)
+            })?;
+            budget.check_stage(NativeLoadStage::RuntimeLoad, cancel)?;
+            budget.check_stage(NativeLoadStage::BackendLoad, cancel)?;
+            // The existing Fresh loader supplies no warm/resident/host-page
+            // registration. Its own manifest/runtime validation is unchanged.
+            let backend = PalsOnnxBackend::load(export, expected_export_sha256, runtime, config)
+                .map_err(|cause| {
+                    budget
+                        .failure(
+                            NativeLoadStage::BackendLoad,
+                            model_error(&cause),
+                            cancel,
+                            None,
+                        )
+                        .with_backend_error(cause)
+                })?;
+            budget.check_stage(NativeLoadStage::BackendLoad, cancel)?;
+            if backend.private_warm_capability().is_some() {
+                return Err(budget.failure(
+                    NativeLoadStage::BackendLoad,
+                    RoleError::Backend(
+                        "Native invocation loader refuses a private warm backend".into(),
+                    ),
+                    cancel,
+                    None,
+                ));
+            }
+            budget.check_stage(NativeLoadStage::OwnerConstruction, cancel)?;
+            let mut finish = None;
+            let model = Self::new_with_optional_cuda_record_pages_and_capture(
+                backend,
+                options,
+                None,
+                Some(&mut finish),
+            )
+            .map_err(|cause| {
+                budget.failure(NativeLoadStage::OwnerConstruction, cause, cancel, finish)
+            })?;
+            // The returned model owns exactly the Arc captured before runtime
+            // initialization. Post-check uses that owner, with no cleanup call
+            // or new relative deadline hidden inside the failure path.
+            accept_invocation_owner(model, budget, cancel)
+        }
         /// Explicit CPU-only approximate artifact domain. A legacy Fresh
         /// manifest never silently gains a seed input or frozen query policy.
         pub fn load_pinned_cpu_private_warm_with_options(
@@ -3186,9 +3470,22 @@ mod native {
             Self::new_with_registered_cuda_record_pages(backend, options, registration)
         }
         fn new_with_optional_cuda_record_pages(
+            backend: PalsOnnxBackend,
+            options: NativeOwnerOptions,
+            registration: Option<NativeCudaRecordPagesRegistration>,
+        ) -> Result<Self, RoleError> {
+            Self::new_with_optional_cuda_record_pages_and_capture(
+                backend,
+                options,
+                registration,
+                None,
+            )
+        }
+        fn new_with_optional_cuda_record_pages_and_capture(
             mut backend: PalsOnnxBackend,
             options: NativeOwnerOptions,
             registration: Option<NativeCudaRecordPagesRegistration>,
+            finish_capture: Option<&mut Option<NativeRoleFinishHandle>>,
         ) -> Result<Self, RoleError> {
             options.validate(&backend.config())?;
             let drain_limit = options.drain_limit;
@@ -3480,6 +3777,14 @@ mod native {
                 private_warm,
                 warm_admission: Mutex::new(None),
             });
+            if let Some(slot) = finish_capture {
+                // Actual worker/owner exists here, before all fallible adapter,
+                // resource and Runtime construction. Default factories do not
+                // request a capture and retain their existing error semantics.
+                *slot = Some(NativeRoleFinishHandle {
+                    owner: Arc::clone(&owner),
+                });
+            }
             let runtime = PalsRuntime::new(
                 PalsAdapter::new(scope.clone(), clock.clone()).map_err(model_error)?,
                 WorkerBackend {
@@ -4959,6 +5264,302 @@ mod native {
             (execution, snapshot)
         }
 
+        // Pure clock/admission checks and controlled SingleWorker owner checks.
+        // These fixtures do not load ORT/model files or prove provider, binary,
+        // source-registration, native inference or whole-cost execution.
+        #[test]
+        fn invocation_budget_preserves_original_absolute_clock_and_is_copy() {
+            fn requires_copy<T: Copy>() {}
+            requires_copy::<NativeInvocationBudget>();
+            let started = Instant::now();
+            let execution = started + Duration::from_secs(2);
+            let reserve = Duration::from_secs(1);
+            let whole = execution + reserve;
+            let budget =
+                NativeInvocationBudget::new_at(started, execution, whole, reserve, started)
+                    .unwrap();
+            assert_eq!(budget.started(), started);
+            assert_eq!(budget.execution_until(), execution);
+            assert_eq!(budget.whole_until(), whole);
+            assert_eq!(budget.cleanup_reserve(), reserve);
+            let cancel = AtomicBool::new(false);
+            assert!(
+                budget
+                    .check_at(execution - Duration::from_nanos(1), &cancel)
+                    .is_ok()
+            );
+            assert!(matches!(
+                budget.check_at(execution, &cancel),
+                Err(RoleError::Deadline)
+            ));
+            assert_eq!(budget.whole_until(), whole);
+        }
+        #[test]
+        fn invocation_budget_rejects_future_zero_order_mismatch_and_overflow() {
+            let now = Instant::now();
+            let one = Duration::from_secs(1);
+            let execution = now + one;
+            let whole = execution + one;
+            for (started, end, all, reserve) in [
+                (now + one, now + one + one, now + one + one + one, one),
+                (now, now, whole, one),
+                (now, execution, execution, one),
+                (now, execution, whole, Duration::ZERO),
+                (now, execution, whole + one, one),
+                (now, execution, whole, Duration::MAX),
+            ] {
+                assert!(matches!(
+                    NativeInvocationBudget::new_at(started, end, all, reserve, now),
+                    Err(RoleError::Backend(_))
+                ));
+            }
+            // The public constructor applies the same future-start rejection.
+            assert!(
+                NativeInvocationBudget::new(
+                    now + Duration::from_secs(60),
+                    now + Duration::from_secs(61),
+                    now + Duration::from_secs(62),
+                    one
+                )
+                .is_err()
+            );
+        }
+        #[test]
+        fn invocation_admission_rejects_cancel_and_expiry_before_native_loading() {
+            let now = Instant::now();
+            let reserve = Duration::from_secs(2);
+            let options = NativeOwnerOptions {
+                drain_limit: reserve,
+                host_record_pages: None,
+            };
+            let config = rz_eval::pals_onnx::PalsOnnxConfig::cpu();
+            let execution = now + Duration::from_secs(60);
+            let live =
+                NativeInvocationBudget::new(now, execution, execution + reserve, reserve).unwrap();
+            let cancel = AtomicBool::new(true);
+            let canceled =
+                validate_cpu_fresh_invocation(&config, options, live, &cancel).unwrap_err();
+            assert_eq!(canceled.stage, NativeLoadStage::Admission);
+            assert!(matches!(canceled.cause, RoleError::Canceled));
+            assert!(canceled.canceled && !canceled.execution_expired && !canceled.whole_expired);
+            assert!(canceled.finish.is_none());
+
+            let old_start = now - Duration::from_secs(3);
+            let expired_end = now - Duration::from_millis(1);
+            let expired_reserve = Duration::from_secs(60);
+            let expired = NativeInvocationBudget::new(
+                old_start,
+                expired_end,
+                expired_end + expired_reserve,
+                expired_reserve,
+            )
+            .unwrap();
+            let expired_options = NativeOwnerOptions {
+                drain_limit: expired_reserve,
+                ..options
+            };
+            cancel.store(false, Ordering::Release);
+            let failure = validate_cpu_fresh_invocation(&config, expired_options, expired, &cancel)
+                .unwrap_err();
+            assert_eq!(failure.stage, NativeLoadStage::Admission);
+            assert!(matches!(failure.cause, RoleError::Deadline));
+            assert!(failure.execution_expired && !failure.whole_expired && !failure.canceled);
+            assert!(failure.elapsed >= Duration::from_secs(3));
+            assert!(failure.finish.is_none()); // unobserved cleanup, not worker=0 proof
+        }
+        #[test]
+        fn invocation_admission_rejects_cpu_config_pages_and_drain_mismatch() {
+            let now = Instant::now();
+            let reserve = Duration::from_secs(2);
+            let execution = now + Duration::from_secs(60);
+            let budget =
+                NativeInvocationBudget::new(now, execution, execution + reserve, reserve).unwrap();
+            let config = rz_eval::pals_onnx::PalsOnnxConfig::cpu();
+            let options = NativeOwnerOptions {
+                drain_limit: reserve,
+                host_record_pages: None,
+            };
+            let cancel = AtomicBool::new(false);
+            assert!(validate_cpu_fresh_invocation(&config, options, budget, &cancel).is_ok());
+            let mut cuda = config;
+            cuda.provider = rz_eval::onnx::Provider::Cuda {
+                device_id: 0,
+                arena_bytes: 1024,
+            };
+            let mut device = config;
+            device.device_public_memory = true;
+            let mut threads = config;
+            threads.intra_threads = 0;
+            let pages = NativeOwnerOptions {
+                host_record_pages: Some(NativeHostRecordPageLimits {
+                    max_page_entries: 2,
+                    max_page_bytes: 1024,
+                    max_transient_bytes: 1024,
+                }),
+                ..options
+            };
+            let other_drain = NativeOwnerOptions {
+                drain_limit: Duration::from_secs(1),
+                ..options
+            };
+            for (configuration, owner) in [
+                (cuda, options),
+                (device, options),
+                (threads, options),
+                (config, pages),
+                (config, other_drain),
+            ] {
+                let failure = validate_cpu_fresh_invocation(&configuration, owner, budget, &cancel)
+                    .unwrap_err();
+                assert_eq!(failure.stage, NativeLoadStage::Admission);
+                assert!(matches!(failure.cause, RoleError::Backend(_)));
+                assert!(failure.finish.is_none());
+                assert!(!failure.canceled && !failure.execution_expired && !failure.whole_expired);
+            }
+        }
+        #[test]
+        fn invocation_failure_preserves_primary_cause_and_separate_clock_facts() {
+            let started = Instant::now();
+            let execution = started + Duration::from_secs(1);
+            let reserve = Duration::from_secs(1);
+            let whole = execution + reserve;
+            let budget =
+                NativeInvocationBudget::new_at(started, execution, whole, reserve, started)
+                    .unwrap();
+            let cancel = AtomicBool::new(true);
+            let failure = budget.failure_at(
+                NativeLoadStage::RuntimeLoad,
+                RoleError::Backend("original runtime cause".into()),
+                whole,
+                &cancel,
+                None,
+            );
+            assert_eq!(failure.stage, NativeLoadStage::RuntimeLoad);
+            assert!(
+                matches!(&failure.cause, RoleError::Backend(detail) if detail == "original runtime cause")
+            );
+            assert_eq!(failure.elapsed, Duration::from_secs(2));
+            assert!(failure.execution_expired && failure.whole_expired && failure.canceled);
+            assert!(failure.finish.is_none());
+            assert!(failure.backend_error.is_none());
+        }
+        #[test]
+        fn invocation_direct_backend_error_preserves_typed_original_and_clock_facts() {
+            // Injected bounded errors only: no library/runtime/model is loaded.
+            // The same builder is used by the two direct native load boundaries.
+            let started = Instant::now();
+            let execution = started + Duration::from_secs(1);
+            let reserve = Duration::from_secs(1);
+            let whole = execution + reserve;
+            let budget =
+                NativeInvocationBudget::new_at(started, execution, whole, reserve, started)
+                    .unwrap();
+            let cancel = AtomicBool::new(true);
+            let text = "x".repeat(rz_eval::error::CAUSE_PREFIX_BYTES + 7);
+            for stage in [NativeLoadStage::RuntimeLoad, NativeLoadStage::BackendLoad] {
+                let backend = BackendError::new(
+                    FailureKind::BackendUnavailable,
+                    FailureStage::Backend,
+                    "injected original native load cause",
+                )
+                .with_external_cause(rz_eval::error::CauseCode::RuntimeInitialize, &text)
+                .with_diagnostic("injected-bounded-native", &text);
+                let expected_cause = backend.cause;
+                let expected_projection = backend.to_string();
+                // Preserve the original diagnostic allocation by ownership move.
+                let diagnostic_address = std::ptr::from_ref(backend.native.as_deref().unwrap());
+                let failure = budget
+                    .failure_at(stage, model_error(&backend), whole, &cancel, None)
+                    .with_backend_error(backend);
+                assert_eq!(failure.stage, stage);
+                assert!(
+                    matches!(&failure.cause, RoleError::Backend(value) if value == &expected_projection)
+                );
+                assert_eq!(failure.elapsed, Duration::from_secs(2));
+                assert!(failure.execution_expired && failure.whole_expired && failure.canceled);
+                assert!(failure.finish.is_none());
+                let original = failure.backend_error.as_deref().unwrap();
+                assert_eq!(original.kind, FailureKind::BackendUnavailable);
+                assert_eq!(original.stage, FailureStage::Backend);
+                assert_eq!(original.detail, "injected original native load cause");
+                assert_eq!(original.cause, expected_cause);
+                let cause = original.cause.unwrap();
+                assert_eq!(cause.code, rz_eval::error::CauseCode::RuntimeInitialize);
+                assert_eq!(
+                    usize::from(cause.hashed_bytes),
+                    rz_eval::error::CAUSE_PREFIX_BYTES
+                );
+                assert!(cause.truncated && !cause.formatting_failed);
+                let diagnostic = original.native.as_deref().unwrap();
+                assert_eq!(std::ptr::from_ref(diagnostic), diagnostic_address);
+                assert_eq!(diagnostic.message.len(), rz_eval::error::CAUSE_PREFIX_BYTES);
+                assert!(diagnostic.truncated);
+            }
+        }
+        #[test]
+        fn invocation_cpu_runtime_admission_refuses_cuda_bundle_before_bootstrap() {
+            assert!(validate_cpu_invocation_bundle(None).is_ok());
+            assert!(matches!(
+                validate_cpu_invocation_bundle(Some([0; 32])),
+                Err(RoleError::Backend(_))
+            ));
+            assert!(matches!(
+                validate_cpu_invocation_bundle(Some([255; 32])),
+                Err(RoleError::Backend(_))
+            ));
+        }
+        #[test]
+        fn invocation_postconstruction_cancel_retains_same_actual_finish_owner() {
+            let model = fixture_model(binding_fixture_command);
+            let actual_owner = Arc::clone(&model.owner);
+            let now = Instant::now();
+            let reserve = Duration::from_secs(2);
+            let execution = now + Duration::from_secs(60);
+            let budget =
+                NativeInvocationBudget::new(now, execution, execution + reserve, reserve).unwrap();
+            let cancel = AtomicBool::new(true);
+            let failure = accept_invocation_owner(model, budget, &cancel)
+                .err()
+                .unwrap();
+            assert_eq!(failure.stage, NativeLoadStage::PostConstruction);
+            assert!(matches!(failure.cause, RoleError::Canceled));
+            assert!(failure.canceled && !failure.execution_expired && !failure.whole_expired);
+            assert!(failure.backend_error.is_none());
+            let handle = failure.finish.unwrap();
+            assert!(Arc::ptr_eq(&handle.owner, &actual_owner));
+            assert!(!handle.receipt().physical_shutdown_confirmed);
+            // The one absolute W is used; no fresh now+D cleanup window exists.
+            let receipt = handle.finish(budget.whole_until()).unwrap();
+            assert!(receipt.physical_shutdown_confirmed && receipt.native_buffers_released);
+            assert_eq!(receipt.physically_completed_role_calls, 0);
+            assert_eq!(receipt.search_consumed_role_inputs, 0);
+        }
+        #[test]
+        fn invocation_postconstruction_expiry_keeps_owner_and_expired_whole_clock() {
+            let model = fixture_model(binding_fixture_command);
+            let actual_owner = Arc::clone(&model.owner);
+            let now = Instant::now();
+            let started = now - Duration::from_secs(4);
+            let execution = now - Duration::from_secs(2);
+            let reserve = Duration::from_secs(1);
+            let whole = execution + reserve;
+            let budget = NativeInvocationBudget::new(started, execution, whole, reserve).unwrap();
+            let cancel = AtomicBool::new(false);
+            let failure = accept_invocation_owner(model, budget, &cancel)
+                .err()
+                .unwrap();
+            assert_eq!(failure.stage, NativeLoadStage::PostConstruction);
+            assert!(matches!(failure.cause, RoleError::Deadline));
+            assert!(failure.execution_expired && failure.whole_expired && !failure.canceled);
+            let handle = failure.finish.unwrap();
+            assert!(Arc::ptr_eq(&handle.owner, &actual_owner));
+            // No cleanup is attempted or successful release claimed after W.
+            // The caller still owns this same handle and the original past W.
+            assert!(budget.whole_until() < Instant::now());
+            let receipt = handle.receipt();
+            assert!(!receipt.physical_shutdown_confirmed && !receipt.native_buffers_released);
+            assert_eq!(receipt.physically_completed_role_calls, 0);
+        }
         #[test]
         fn resident_none_preserves_legacy_receipt_omission_and_copy_options() {
             fn requires_copy<T: Copy>() {}
@@ -7549,10 +8150,11 @@ pub use native::{
     NativeExecutionReceipt, NativeFailureReceipt, NativeHostRecordPageBankReceipt,
     NativeHostRecordPageCommandReceipt, NativeHostRecordPageDeclaration,
     NativeHostRecordPageLimits, NativeHostRecordPageObservationReceipt,
-    NativeHostRecordPageSnapshotReceipt, NativeHostRecordPageStatsReceipt, NativeOwnerOptions,
-    NativePreparedContext, NativePrivateWarmDeclaration, NativeRoleCompletionUnknown,
-    NativeRoleExecutionBinding, NativeRoleFinishHandle, NativeRoleModel, NativeRoleObserver,
-    NativeRoleReceipt, NativeRoleRejection, NativeRoleSourceIdentity, NativeRoleTerminal,
+    NativeHostRecordPageSnapshotReceipt, NativeHostRecordPageStatsReceipt, NativeInvocationBudget,
+    NativeLoadFailure, NativeLoadStage, NativeOwnerOptions, NativePreparedContext,
+    NativePrivateWarmDeclaration, NativeRoleCompletionUnknown, NativeRoleExecutionBinding,
+    NativeRoleFinishHandle, NativeRoleModel, NativeRoleObserver, NativeRoleReceipt,
+    NativeRoleRejection, NativeRoleSourceIdentity, NativeRoleTerminal,
     NativeStartupCommandObservation, NativeStartupErrorKind, NativeStartupFailureDiagnostic,
     NativeStartupProbeReceipt, NativeStartupTimingObservation,
 };

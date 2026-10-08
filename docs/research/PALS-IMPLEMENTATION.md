@@ -2683,3 +2683,37 @@ formatter와 기존 입력·replay·runtime·worker·규약·workflow 보존 대
 ONNX/ORT 모델 로딩·GPU fence·새 native replay wrapper 실행 증거가 아니다.
 factory/source/binary/provider 등록, 원래 전체 시계와 명시적 finish 결과, strict
 Query/full recheck·whole cost·physical closure·utility 인수는 계속 남는다.
+
+### 원래 전체 시계를 보존하는 CPU Fresh loader
+
+`NativeInvocationBudget`은 caller의 원래 시작 S, 실행 마감 E, 전체 마감 W,
+cleanup reserve D를 private checked fields로 보존한다. S<E<W, D>0,
+E+D=W와 기존 유한 drain 조건을 검증하며 미래 시작 시각을 거절한다.
+`load_pinned_cpu_fresh_for_invocation`은 기존 loader와 별도로 명시 선택하는
+CPU Fresh 접점이다. options의 drain이 D와 같고 CPU provider·host 입력·1~2 intra
+threads·record pages 없음·단일 CPU runtime pin인 경우만 실제 로딩을 진행한다.
+정확한 public-memory cache 옵션은 독립 asset profile의 선언과 함께 고정하며
+private Warm·resident/device 메모리와 혼동하지 않는다.
+
+runtime load·backend load·owner construction의 각 동기 단계 전후에 원래 E와
+cancel을 확인한다. 원래 오류, 실패 단계, S 기준 elapsed, E/W 초과와 cancel을
+`NativeLoadFailure`에 보존한다. 직접 runtime/backend 실패에는 원래 구조화된
+`BackendError`도 별도 소유하여 문자열 투영으로 원인·단계·bounded diagnostic을
+잃지 않게 한다. 기존 owner constructor의 `RoleError`만 반환되는 경로에서는
+해당 구조 진단 미관측을 그대로 남기며 전체 오류 journal로 표현하지 않는다.
+실제 `WorkerOwner` 생성 직후 finish handle을
+보존하여 이후 fallible adapter/runtime 구성 실패에서도 caller가 같은 W로
+명시적 종료를 관측할 수 있게 한다. owner 생성 전 `finish=None`은 cleanup
+미관측이며 실행 0이나 native resource release 성공을 뜻하지 않는다.
+
+동기 ORT/session 호출은 이 API가 선점하지 않는다. 단계 전후 검사와 늦은 반환
+거절은 hard timeout 증거가 아니며 외부 caller의 원래 시계·process supervision이
+필요하다. cleanup에 새 now+D 창을 만들지 않는다. CPU config만으로 CUDA bundle
+preload를 막을 수 없으므로 runtime load 전 실제 pin의 bundle 부재를 확인한다.
+그 부재는 CPU provider 실행 성공을 인증하지 않는다. ORT의 process-lifetime
+runtime pin과 실제 worker/session join·buffer release는 별도로 기록한다.
+
+이 접점과 CPU Fresh replay wrapper는 별도 소스·검사 단위로 통합한다. loader의
+pure/controlled fixture, 실제 wrapper compile, 실제 모델 replay와 원래 전체 시계
+인수는 각각 구분하며 기존 Query/2·CPU action/1·replay input 등록 wire를 바꾸거나
+실행·whole-cost·physical·utility 권한을 자동으로 부여하지 않는다.
