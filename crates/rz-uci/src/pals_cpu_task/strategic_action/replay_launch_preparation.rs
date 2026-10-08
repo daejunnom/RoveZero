@@ -2095,7 +2095,20 @@ mod tests {
     fn descriptor_and_single_child_rules_reject_traversal_and_oversized_or_reserved_names() {
         assert!(descriptor(Path::new("relative-model.json")).is_err());
         let root = TempRoot::new();
-        assert!(descriptor(&root.path.join("..").join("other")).is_err());
+        // Preserve the raw parent component: PathBuf::push normalizes it when
+        // the Windows canonical root has a verbatim prefix.
+        let mut lexical = root.path.as_os_str().to_owned();
+        lexical.push(std::path::MAIN_SEPARATOR_STR);
+        lexical.push("..");
+        lexical.push(std::path::MAIN_SEPARATOR_STR);
+        lexical.push("other");
+        let traversing = PathBuf::from(lexical);
+        assert!(
+            traversing
+                .components()
+                .any(|part| matches!(part, Component::ParentDir))
+        );
+        assert!(descriptor(&traversing).is_err());
         assert!(descriptor(&root.path.join("x".repeat(MAX_PATH_BYTES))).is_err());
         for name in ["", "../other", "child/file", "CON", "lpt9", "a.b"] {
             assert!(safe_directory_name(name).is_err());
