@@ -26,6 +26,107 @@ pub const FRESH_REPLAY_REPAIR_SCOPE: &str = "rz-pals-frozen-parent-repair-endpoi
 const MAX_REPLAY_HISTORY_PLIES: usize = 4096;
 const MAX_REPLAY_CONDITION_BYTES: usize = 4096;
 
+/// Pure finite upper-bound declarations for the optional Repair endpoint lane.
+/// These are not observed allocation peaks, StoreLimits, execution support,
+/// Query admission or native/physical authority. Product configuration/plan
+/// bounds are validated separately by the existing owner constructor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RepairReplayRequirements {
+    cpu_nodes: u64,
+    role_calls: u64,
+    nodes: usize,
+    observations: usize,
+    line_chunks: usize,
+    records: usize,
+    stages: usize,
+}
+impl RepairReplayRequirements {
+    pub const fn cpu_nodes(&self) -> u64 {
+        self.cpu_nodes
+    }
+    pub const fn role_calls(&self) -> u64 {
+        self.role_calls
+    }
+    pub const fn nodes(&self) -> usize {
+        self.nodes
+    }
+    pub const fn observations(&self) -> usize {
+        self.observations
+    }
+    pub const fn line_chunks(&self) -> usize {
+        self.line_chunks
+    }
+    pub const fn records(&self) -> usize {
+        self.records
+    }
+    pub const fn stages(&self) -> usize {
+        self.stages
+    }
+}
+
+/// Computes 3N and the source-owned worst-case Repair reservations without I/O,
+/// allocation, model/CPU calls or any private StoreLimits copy. Invalid scalar
+/// extents and every intermediate arithmetic/conversion overflow are rejected;
+/// even error construction uses only static InvalidPlan details (no Box).
+pub fn repair_replay_requirements(
+    line_plies: usize,
+    prefix_plies: usize,
+    nodes_per_check: u64,
+) -> Result<RepairReplayRequirements, ReplayError> {
+    if line_plies == 0 || prefix_plies >= line_plies || nodes_per_check == 0 {
+        return Err(ReplayError::InvalidPlan("invalid Repair L/P/N"));
+    }
+    let cpu_nodes = nodes_per_check
+        .checked_mul(3)
+        .ok_or(ReplayError::InvalidPlan("3N overflow"))?;
+    let tail = line_plies
+        .checked_sub(prefix_plies)
+        .and_then(|remaining| remaining.checked_sub(1))
+        .ok_or(ReplayError::InvalidPlan("Repair response extent"))?;
+    // L Proposal calls, one initial Reply, then at most L-P-1 calls per tail.
+    let role_calls = line_plies
+        .checked_add(1)
+        .and_then(|calls| {
+            tail.checked_mul(2)
+                .and_then(|extra| calls.checked_add(extra))
+        })
+        .and_then(|calls| u64::try_from(calls).ok())
+        .ok_or(ReplayError::InvalidPlan("Repair role bound overflow"))?;
+    // Root+Proposal, bounded CPU candidate, selected response and two tails.
+    let nodes = line_plies
+        .checked_mul(4)
+        .and_then(|count| {
+            prefix_plies
+                .checked_mul(3)
+                .and_then(|shared| count.checked_sub(shared))
+        })
+        .ok_or(ReplayError::InvalidPlan("Repair node bound overflow"))?;
+    let observations = nodes.checked_add(6).ok_or(ReplayError::InvalidPlan(
+        "Repair observation bound overflow",
+    ))?;
+    let line_chunks = nodes
+        .checked_mul(
+            line_plies
+                .checked_add(1)
+                .ok_or(ReplayError::InvalidPlan("Repair line extent overflow"))?,
+        )
+        .and_then(|count| {
+            line_plies
+                .checked_mul(5)
+                .and_then(|extra| count.checked_add(extra))
+        })
+        .ok_or(ReplayError::InvalidPlan("Repair line chunk bound overflow"))?;
+    Ok(RepairReplayRequirements {
+        cpu_nodes,
+        role_calls,
+        nodes,
+        observations,
+        line_chunks,
+        records: 4,
+        stages: 3,
+    })
+}
+
 /// Binding declarations only. The independently registered frozen parent,
 /// Query/2 bytes, catalogue and before-result ordering are checked by the caller.
 /// No historical RequestId, ExecutionId, record or model epoch is imported.
@@ -803,60 +904,23 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         limits: PalsLimits,
         cancel: &AtomicBool,
     ) -> Result<(), ReplayError> {
-        let total = self
-            .plan
-            .nodes_per_check
-            .checked_mul(3)
-            .ok_or(ReplayError::InvalidPlan("3N overflow"))?;
         let extent = self.engine.config.line_plies;
-        let tail = extent
-            .checked_sub(self.plan.prefix.len())
-            .and_then(|remaining| remaining.checked_sub(1))
-            .ok_or(ReplayError::InvalidPlan("Repair response extent"))?;
-        // Proposal has at most L calls, initial Reply one, and the two tails
-        // each at most L-P-1. Terminal/short paths consume fewer, never more.
-        let role_calls = extent
-            .checked_add(1)
-            .and_then(|calls| {
-                tail.checked_mul(2)
-                    .and_then(|extra| calls.checked_add(extra))
-            })
-            .and_then(|calls| u64::try_from(calls).ok())
-            .ok_or(ReplayError::InvalidPlan("Repair role bound overflow"))?;
-        // Root+Proposal, bounded CPU candidate, selected response and two tails.
-        // Existing store reservations are constructor-owned; these are finite
-        // upper-bound declarations, not observations of actual allocation peak.
-        let nodes = extent
-            .checked_mul(4)
-            .and_then(|count| {
-                self.plan
-                    .prefix
-                    .len()
-                    .checked_mul(3)
-                    .and_then(|shared| count.checked_sub(shared))
-            })
-            .ok_or(ReplayError::InvalidPlan("Repair node bound overflow"))?;
-        let observations = nodes.checked_add(6).ok_or(PalsError::Capacity)?;
-        let line_chunks = nodes
-            .checked_mul(extent.checked_add(1).ok_or(PalsError::Capacity)?)
-            .and_then(|count| {
-                extent
-                    .checked_mul(5)
-                    .and_then(|extra| count.checked_add(extra))
-            })
-            .ok_or(PalsError::Capacity)?;
+        let required =
+            repair_replay_requirements(extent, self.plan.prefix.len(), self.plan.nodes_per_check)?;
+        // Store limits remain constructor-owned and are not exported in the
+        // pure declaration. Comparisons use the same calculated requirements.
         let reserved = PalsEngine::<M>::store_limits(&self.engine.config);
         if limits.max_rounds == 0
             || limits.cpu_depth != self.plan.requested_depth
-            || limits.max_cpu_nodes < total
+            || limits.max_cpu_nodes < required.cpu_nodes()
             || self.engine.config.cpu_nodes_per_task != self.plan.nodes_per_check
-            || self.engine.config.max_role_calls < role_calls
-            || self.engine.config.max_records < 4
-            || self.engine.config.max_nodes < nodes
-            || reserved.observations < observations
-            || reserved.line_chunks < line_chunks
-            || reserved.executions < 3
-            || reserved.consumers < 3
+            || self.engine.config.max_role_calls < required.role_calls()
+            || self.engine.config.max_records < required.records()
+            || self.engine.config.max_nodes < required.nodes()
+            || reserved.observations < required.observations()
+            || reserved.line_chunks < required.line_chunks()
+            || reserved.executions < required.stages()
+            || reserved.consumers < required.stages()
             || !self.stages.is_empty()
         {
             return Err(ReplayError::InvalidPlan(
@@ -865,7 +929,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         }
         self.check_control(limits, cancel)?;
         self.stages
-            .try_reserve_exact(3)
+            .try_reserve_exact(required.stages())
             .map_err(|_| PalsError::Capacity)?;
         self.model_counterline = bounded_moves(&[], extent)?;
         self.repaired_line = bounded_moves(&[], extent)?;
@@ -2846,5 +2910,104 @@ mod repair_tests {
             owner.task(retained_stage.execution).unwrap().status,
             TaskStatus::Completed(retained_stage.observation.unwrap())
         );
+    }
+
+    #[test]
+    fn repair_requirements_exact_formulas_and_short_tail_boundaries() {
+        let declared = repair_replay_requirements(3, 1, 100_000).unwrap();
+        assert_eq!(declared.cpu_nodes(), 300_000);
+        assert_eq!(declared.role_calls(), 6);
+        assert_eq!(declared.nodes(), 9);
+        assert_eq!(declared.observations(), 15);
+        assert_eq!(declared.line_chunks(), 51);
+        assert_eq!(declared.records(), 4);
+        assert_eq!(declared.stages(), 3);
+        let shortest = repair_replay_requirements(1, 0, 1).unwrap();
+        assert_eq!(shortest.cpu_nodes(), 3);
+        assert_eq!(shortest.role_calls(), 2);
+        assert_eq!(shortest.nodes(), 4);
+        assert_eq!(shortest.observations(), 10);
+        assert_eq!(shortest.line_chunks(), 13);
+        let no_tail = repair_replay_requirements(16, 15, 1).unwrap();
+        assert_eq!(no_tail.role_calls(), 17);
+        assert_eq!(no_tail.nodes(), 19);
+        assert_eq!(no_tail.observations(), 25);
+        assert_eq!(no_tail.line_chunks(), 403);
+        // Pure declaration only: product's configured N ceiling is a separate
+        // constructor gate. This is the exact non-overflowing u64 3N boundary.
+        assert_eq!(
+            repair_replay_requirements(1, 0, u64::MAX / 3)
+                .unwrap()
+                .cpu_nodes(),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn repair_requirements_invalid_scalars_are_static_errors() {
+        for (line, prefix, nodes) in [(0, 0, 1), (3, 3, 1), (3, 4, 1), (3, 1, 0)] {
+            assert!(matches!(
+                repair_replay_requirements(line, prefix, nodes),
+                Err(ReplayError::InvalidPlan("invalid Repair L/P/N"))
+            ));
+        }
+    }
+
+    #[test]
+    fn repair_requirements_checked_overflow_does_not_return_wrapped_or_allocating_error() {
+        assert!(matches!(
+            repair_replay_requirements(3, 1, u64::MAX / 3 + 1),
+            Err(ReplayError::InvalidPlan("3N overflow"))
+        ));
+        assert!(matches!(
+            repair_replay_requirements(usize::MAX, 0, 1),
+            Err(ReplayError::InvalidPlan("Repair role bound overflow"))
+        ));
+        assert!(matches!(
+            repair_replay_requirements(usize::MAX / 4 + 1, 0, 1),
+            Err(ReplayError::InvalidPlan("Repair node bound overflow"))
+        ));
+        assert!(matches!(
+            repair_replay_requirements(usize::MAX / 4, 0, 1),
+            Err(ReplayError::InvalidPlan(
+                "Repair observation bound overflow"
+            ))
+        ));
+        assert!(matches!(
+            repair_replay_requirements(usize::MAX / 8 + 1, 0, 1),
+            Err(ReplayError::InvalidPlan("Repair line chunk bound overflow"))
+        ));
+    }
+
+    #[test]
+    fn actual_repair_preflight_uses_public_requirement_thresholds_and_stage_reservation() {
+        let required = repair_replay_requirements(3, 1, 100_000).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut owner = fixture(100_000);
+        let mut bound = limits(100_000);
+        bound.max_cpu_nodes = required.cpu_nodes();
+        owner.engine.config.max_role_calls = required.role_calls();
+        owner.prepare_repair(bound, &cancel).unwrap();
+        assert!(owner.stages.capacity() >= required.stages());
+        assert!(owner.stages.is_empty());
+        assert_eq!(owner.counters.role_calls, 0);
+        assert_eq!(owner.counters.cpu_tasks_requested, 0);
+        let mut owner = fixture(100_000);
+        bound.max_cpu_nodes = required.cpu_nodes() - 1;
+        assert!(matches!(
+            owner.prepare_repair(bound, &cancel),
+            Err(ReplayError::InvalidPlan(_))
+        ));
+        assert!(owner.stages.is_empty());
+        let mut owner = fixture(100_000);
+        bound.max_cpu_nodes = required.cpu_nodes();
+        owner.engine.config.max_role_calls = required.role_calls() - 1;
+        assert!(matches!(
+            owner.prepare_repair(bound, &cancel),
+            Err(ReplayError::InvalidPlan(_))
+        ));
+        assert!(owner.stages.is_empty());
+        assert_eq!(owner.counters.role_calls, 0);
+        assert_eq!(owner.counters.cpu_tasks_requested, 0);
     }
 }

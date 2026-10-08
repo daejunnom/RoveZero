@@ -2546,3 +2546,27 @@ Repair endpoint 초안 HEAD `bbc673b8713914666bd8da1706b367ebe0aa1557`의
 기대 수순만 `e7e5 g2g4 d8h4`로 바꾸며 제품 Rules·평가 출력 검사는 유지한다.
 이 수순은 기존 부모의 Rules terminal fixture와 일치한다. 원시 실패·job별 종료·
 이후 skip된 검사를 보존하고 수정 HEAD의 별도 CI 성공 전까지 전체 suite를 인수하지 않는다.
+
+수정 HEAD `af2b24e5bd2440fc15f613e278e794921909c33b`의
+[CPU CI 37778289887](https://github.com/daejunnom/RoveZero/actions/runs/37778289887)는
+Linux·Windows·모델 CPU·bindings 네 job 모두 성공했다. 원시 로그에서 기존
+Reply-only 13개/OS와 Repair endpoint 12개/OS의 통과를 확인했고 이전 실패와 skip
+기록은 보존한다. 작은 실제 own CPU와 scripted RoleModel의 연결 인수이며 native
+모델·전체 Repair recheck·Query 승인·whole cost·물리 종료·utility·GPU 인수는 아니다.
+
+### 소비자와 실행이 공유하는 순수 Repair 자원 계산
+
+`repair_replay_requirements(L, P, N)`과 읽기 전용 `RepairReplayRequirements`를
+공개하여 기존 3N·역할 호출·node·observation·line chunk·record·stage 계산을 한
+소유 경계에서 재사용한다. 실제 `prepare_repair`도 이 함수의 반환값으로 비교하며,
+private `StoreLimits` 계산과 실제 예약은 탐색 소유 경계에 둔다. 함수는 I/O·할당·
+모델·CPU 호출 없이 checked 산술로 잘못된 scalar와 중간 overflow를 거부한다.
+이 반환값은 요구량 선언이며 할당 peak·provider 지원·실제 실행 인수는 아니다.
+제품 L/N/config 상한·Rules·수명 검사는 기존 constructor와 실행 경로가 담당한다.
+
+기존 25개 replay fixture와 run·Repair·endpoint·CPU stage 본문은 유지한다. 새
+순수 공식·유효/잘못된 경계·overflow·실제 preflight 기준 연결 검사 네 개의 결과는
+새 정확한 HEAD의 CPU CI로 별도 인수한다. 첫 새 입력 경계는 rz-uci 소비자 쪽에서
+원본 prepared action과 전체 SemanticReceipt 원문·독립 pin·등록·네 parent pin을
+비교하고 기존 Rules 생성기를 재사용하는 방향이며 아직 구현·실행 인수 전이다.
+기존 Query/2·CPU action/1의 원문과 2N·binary 의미를 자동 확장하지 않는다.
