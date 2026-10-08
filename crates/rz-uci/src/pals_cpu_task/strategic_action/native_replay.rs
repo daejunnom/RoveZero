@@ -1535,7 +1535,7 @@ fn validate_sources(p: &ReplayRegisteredArtifacts) -> Result<(), AdmissionFault>
     let actual_factory_digest: [u8; 32] = Sha256::digest(actual[1].1).into();
     if actual.iter().any(|(pin, bytes)| !pin_matches(pin, bytes))
         || actual_factory_digest != pals_native::pals_native_source_digest()
-        || same_pin(&p.legacy_cpu_binary, &p.replay_binary)
+        || p.legacy_cpu_binary.sha256 == p.replay_binary.sha256
     {
         return Err(fault(
             "source_registration",
@@ -2095,6 +2095,14 @@ mod tests {
             }
             assert!(validate_sources(&changed).is_err());
         }
+        let mut same_sha = p.clone();
+        same_sha.replay_binary.sha256 = same_sha.legacy_cpu_binary.sha256.clone();
+        same_sha.replay_binary.bytes = same_sha.legacy_cpu_binary.bytes.checked_add(1).unwrap();
+        assert_ne!(
+            same_sha.replay_binary.bytes,
+            same_sha.legacy_cpu_binary.bytes
+        );
+        assert!(validate_sources(&same_sha).is_err());
         assert!(
             FACTORY_ID
                 .bytes()

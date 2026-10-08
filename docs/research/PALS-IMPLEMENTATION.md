@@ -2770,3 +2770,58 @@ delivery·flush·exit 시각을 포함하지 않는다.
 로딩이나 registered native replay 성공을 대체하지 않는다. 별도 CLI 연결, 실제 CPU
 모델 실행, strict Query/full recheck·whole cost·physical closure·utility 인수는
 후속 검사로 남는다. GPU 검증은 사용자 지시에 따라 보류하며 실제 학습은 범위 밖이다.
+
+### 별도 CPU frozen replay CLI의 등록·출력·오류 수명
+
+`pals_frozen_replay`는 기존 `pals_cpu_task` CLI와 구분한 opt-in 예제다.
+native 구현은 `onnx-cpu` feature 안에 두고, feature 없는 실행은 std-only 경로에서
+명시적으로 거절한다. 기본 빌드에 선택 serde/ORT 의존성을 자동 활성화하지 않는다.
+기존 CPU action CLI의 wire와 실행 증거는 그대로 보존한다.
+
+인자는 `--expected-pins ABS`, `--expected-sha256 HEX`, `--expected-bytes POS`,
+`--asset-profile ABS` 네 쌍으로 한정한다. frozen request는 2MiB 이하 원문 stdin이다.
+expected 원문은 인자로 받은 독립 bytes/SHA에 대조하고, closed expected·launch
+schema로 request·launch·profile·모델·CPU runtime 등록을 연결한다. model·provider
+선택의 기본 경로·환경 변수 fallback이나 stdin에서 expected를 유도하는 경로는 없다.
+RuntimeCache의 실제 CPU library bytes/SHA와 bundle 부재를 독립 profile에 대조하며,
+cache 검증을 실제 ORT provider 로딩 성공으로 해석하지 않는다.
+
+새 실행 image는 독립 replay binary pin에 대조한다. Linux는 열린 `/proc/self/exe`
+inode, 다른 OS는 `current_exe` 경로 해시 범위로 구분한다. replay SHA는 역사 CPU
+및 semantic binary SHA와 각각 달라야 한다. legacy bytes만 다르게 선언해 같은 SHA를
+등록하는 경우도 wrapper에서 거절한다. 이 분리 검사는 과거 CPU·semantic 실행이나
+provider loaded image의 provenance를 새로 관측했다는 권한을 주지 않는다.
+
+최초 S는 인자·stdin·독립 파일·image hash·runtime cache·dispatch·출력까지 포함한다.
+성공 입력의 W/E/D/output 선언은 독립 transport와 정확히 같아야 한다. 입력 오류가
+더 짧은 유효 request W/E나 더 작은 output을 이미 알고 있으면 오류 처리에도 기존
+한도와의 최소값을 적용하고 두 선언·불일치를 별도로 보존한다. 원래 typed input
+cause는 유지하며, 오류 직렬화에도 유효 마감·출력 한도를 적용한다. malformed clock은
+미관측으로 구분하고 새 상대 시간창을 만들지 않는다.
+
+정상 `CheckedReplayInputs`를 받은 뒤 transport와 W/E/D/output이 달라 거절하는
+경로도 같은 원칙을 따른다. 실제 checked getter에서 얻은 마감·출력과 원래 resource
+선언을 먼저 보존하고 양쪽 한도의 최소값을 적용한 뒤 불일치를 거절한다. transport와
+request의 원래 cleanup 선언을 혼합해 새 cleanup 값을 추정하지 않는다. `admitted_input_clock`
+관측은 입력 admission의 한도 대조이며 Query·provider·실행·물리 완료 권한이 아니다.
+
+native 성공·실패 JSON bytes는 재봉인하거나 다시 직렬화하지 않고 outer envelope에
+그대로 넣는다. CLI header·newline까지 원래 출력 상한에 포함하고, 부족하면 원래
+body와 오류를 소유한 채 전달을 거절한다. 준비 시각·확인된 write prefix·flush·exit·
+물리 종료를 서로 구분한다. header는 출력 소비·process exit·physical closure 성공을
+미리 선언하지 않는다.
+
+stdout/stderr는 전체 가능한 frame bytes를 공유 credit에 선예약한다. timeout이
+writer 종료나 zero-byte 성공을 뜻하지 않으며, 실제 OS writer가 종료하기 전에는
+미완료 예약을 반환하지 않는다. 확정된 미사용량만 돌려준다. 원문과 typed native/input
+error evidence를 같은 owned bundle로 pending writer에 보존하고, 원래 write/flush
+결과·io cause는 알림 채널과 별개의 유한 terminal record에 남긴다. 늦은 오류·부분
+출력·진단 출력의 secondary 실패를 원래 search/backend 오류와 합치지 않는다.
+
+기존 CPU matrix에는 feature 없는 예제의 compile/test 한 단계만 추가한다. 새 CLI의
+순수·제어된 I/O fixture와 실제 실행은 별도 인수이며, default compile 성공은 production
+CLI 실행 성공을 뜻하지 않는다. 동기 파일/ORT/pipe의 강제 중단, native 진단을 포함한
+전체 process output 상한, 같은 W의 external launch/reap·loaded provider·physical
+증거는 외부 supervisor가 따로 수거해야 한다. pending Arc 보존은 외부 내구성 저장의
+증거가 아니다. 독립 등록과 원문을 준비하는 caller 연결, 실제 CPU 모델 replay 및
+strict Query/full recheck·whole cost·physical·utility는 계속 후속 인수로 남긴다.
