@@ -608,7 +608,7 @@ pub(super) mod tests {
         o.input_admission.schema = o.mode.input_schema();
         o.input_admission
             .registered_artifacts
-            .opponent_recheck_source = Some(super::super::pin(b"controlled_source"));
+            .opponent_recheck_source = Some(super::super::super::pin(b"controlled_source"));
         o.input_admission.cpu_allowance = 100;
         o.status = "observations_returned";
         o.model_returned = true;
@@ -766,7 +766,7 @@ pub(super) mod tests {
             consume_native_replay_prior(
                 &o,
                 &controlled_expected(&o),
-                &super::super::pin(b"other_asset_profile"),
+                &super::super::super::pin(b"other_asset_profile"),
                 &super::super::tests::profile(false)
             )
             .is_err()
