@@ -2291,3 +2291,18 @@ CPU response 수치나 caller before 선언을 whole-action 인과·실행 비�
 기존 coverage utility와 별개이며 scorer·Pareto·loss·학습 소비자에 아직 연결하지 않는다.
 24개 focused test source와 독립 리뷰·AST parse를 준비했다. 실제 CPU CI 실행 및 실제
 native action causal bridge·whole-action cost·utility target 구현은 별도로 남아 있다.
+
+`dc64d63c4a8fe6ba282c6a4c25b4ab8f2f4e2ecb` / run `37750409269`에서는 model CPU의
+520개 tests와 bindings가 실제 통과했다. scorer 27개와 utility 24개는 이 run의 실제
+성공이며 합성 action/witness 범위와 실제 학습·utility group 부재는 그대로 유지한다.
+Linux·Windows의 workspace all-targets/all-features, native CLI, 독립 Rules release와
+CPU Python 검사도 통과했으나 두 OS job의 최종 상태는 Clippy 한 건으로 FAILURE다.
+
+Clippy는 resident의 `Source::Hit(DeviceProjectionOffset)`와 `Pending(u16)`의 크기 차이를
+지적했다. 이 값은 board 1개·record 최대 128개의 inline Copy port로 제한되며
+`ActiveCudaPageInvocation` 전체 크기를 실제 metadata 예약에 더한다. 해당 enum에만
+설명과 `large_enum_variant` 예외를 두어 요청별 heap·새 fallible 소유 경계를 추가하지
+않는다. 의미·메모리 효율·GPU 성공의 개선으로 보고하지 않는다. Linux all-features에서는
+미지원 빌드 fixture가 cfg로 제외되므로 기존 단일 CI의 두 OS job에 default-feature CLI
+unit 검사를 추가하여 provider·artifact 로딩 이전 거부를 별도로 실행한다. 후속 SHA의
+Clippy와 이 기본 feature 검사는 다시 인수한다.

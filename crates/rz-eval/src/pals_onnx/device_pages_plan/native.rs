@@ -185,6 +185,11 @@ impl Phase {
         )
     }
 }
+// At most one board plus DEVICE_PAGE_RECORD_CAPACITY record ports live inline
+// in ActiveCudaPageInvocation, whose full size is charged by the metadata
+// reservation. Keep certified offsets Copy without a per-port heap allocation
+// or a new fallible ownership boundary during selection and binding.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Source {
     Hit(DeviceProjectionOffset),
