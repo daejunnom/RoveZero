@@ -2423,3 +2423,13 @@ summary 경로는 유지한다. 추가한 일곱 focused fixture는 합성 owner
 생산하지 않는다. 소스 구현·정확한 파일 formatter·독립 검토·해당 HEAD의 CPU CI와
 등록된 실제 collector 실행을 각각 구분한다. Query-selected replay action API와 전체
 비용 ledger는 이 반환 생산자 구현만으로 완료되지 않는다.
+
+첫 생산자 공유 HEAD `ec0fba3b02a9c9b845e7a8647a2dc749978dec89`의
+[CPU CI run 37764947833](https://github.com/daejunnom/RoveZero/actions/runs/37764947833)은
+실패했다. Linux·Windows는 44-field 단일 JSON 매크로의 재귀 한도에서 컴파일을
+중단했고, 모델 CPU suite는 변경한 Rust source에 대한 strict 등록·독립 fixture pin이
+갱신되지 않아 52 failure·3 error를 보존했다. bindings job만 성공했다. 후속 수정은
+카운터 44개를 그대로 개별 scalar JSON 객체로 조립하며 crate 재귀 한도는 변경하지
+않는다. source 등록은 독립 검토한 정확한 collector/engine pair를 명시 literal로 추가하고
+이전 pair와 실패 자료를 보존한다. 실행 시 current hash를 자동 허용하거나 unknown
+source를 인수하지 않는다. 수정 HEAD의 CI 결과는 이전 성공·실패와 별도로 확인한다.

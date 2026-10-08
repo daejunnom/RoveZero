@@ -347,7 +347,7 @@ class NativeSlotRepairTests(unittest.TestCase):
             "crates/rz-search/src/pals/engine.rs": {
                 "bytes": 343988, "sha256": "0302e49b6a9784641ca90aba17490d404b793098f38836b7b3cf42a12ee131d1"},
             "crates/rz-arena/src/pals_collect/native.rs": {
-                "bytes": 153791, "sha256": "0b056c4f2aada6380b1345a067e4d2c139118a8636ad7dc6f1a67a0dc0c55144"},
+                "bytes": 193797, "sha256": "9653ed5ef33eced92b400aef40a7ad018a2668505d6a14568ae9d80e69dc65df"},
         })
         self.assertEqual(admission["scope"], "conditional_unique_prepared_lineage")
         self.assertFalse(body["direct_causal_ids_present"])
@@ -447,7 +447,7 @@ class NativeSlotRepairTests(unittest.TestCase):
         self.assertEqual(current[slot_witness._SOURCE_PATHS[0]],
             {"bytes": 343988, "sha256": "0302e49b6a9784641ca90aba17490d404b793098f38836b7b3cf42a12ee131d1"})
         self.assertEqual(current[slot_witness._SOURCE_PATHS[1]],
-            {"bytes": 153791, "sha256": "0b056c4f2aada6380b1345a067e4d2c139118a8636ad7dc6f1a67a0dc0c55144"})
+            {"bytes": 193797, "sha256": "9653ed5ef33eced92b400aef40a7ad018a2668505d6a14568ae9d80e69dc65df"})
         self.assertEqual(slot_witness._reviewed_source_pair(current), current)
         self.assertNotEqual(current, old)
 
