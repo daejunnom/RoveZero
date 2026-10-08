@@ -1929,3 +1929,22 @@ workspace, 실제 peak 또는 VRAM 측정값으로 해석하지 않는다.
 기존 CPU04 frozen preparation과 historical binary는 이번 engine·UCI·backend source
 변경 후 현재 source 등록으로 재사용하지 않는다. 실제 준비를 재개할 때 source 전후
 pin과 새 binary 등록을 다시 확인하며, 이전 명세와 실패·중단 자료는 보존한다.
+
+### 재검토 정책의 UCI 선택과 실행 영수증
+
+UCI는 `--pals-post-repair-recheck=same-repaired-line-once-v1`의 명시적 선택만
+새 정책 constructor로 전달한다. 생략 또는 API의 Disabled는 기존 v1/v2 session
+hash 경로와 receipt 생략 형식을 보존한다. 중복·unknown 값과 external checker
+조합은 profile·모델 로딩 전에 거절한다. driver는 실제 engine의 immutable 정책·
+search identity·조건 getter를 캡처하고 role 실행 입장에서도 등록값과 대조한다.
+
+새 session domain은 전체 checker namespace와 선택 identity를 함께 결합한다.
+optional `pals_search_policy`는 version·policy·search_identity·conditions_sha256을
+담고, legacy `None`은 직렬화하지 않는다. marker는 zero-work·early·실패에서도
+startup 선택만 나타낸다. 실제 재검토 실행·수선 성공·조건부 refutation 수를 만들거나
+기존 resolver·모델·완료 counter를 그 증거로 바꾸지 않는다.
+
+main 3개·driver 5개·work 3개 총 11개 focused fixture 소스를 준비했다. 독립 소스
+검토·파일별 서식과 후속 CI를 구분한다. arena/manifest의 새 lane 인수와 collector의
+독립 constructor·producer 등록은 아직 연결되지 않았다. 일반 V3 paired 인수나
+학습 자료 소비까지 연결했다고 보고하지 않는다.

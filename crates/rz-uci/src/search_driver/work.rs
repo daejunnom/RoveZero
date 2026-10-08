@@ -31,6 +31,62 @@ impl PalsResolverIdentity {
     }
 }
 
+/// Immutable startup selection, not proof that a post-Repair Reply ran or won.
+/// The value resolver, model identity and completion counters stay independent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "search-work-receipts", derive(serde::Serialize))]
+pub struct PalsSearchPolicyIdentity {
+    pub version: String,
+    pub policy: String,
+    pub search_identity: String,
+    pub conditions_sha256: [u8; 32],
+}
+impl PalsSearchPolicyIdentity {
+    pub const VERSION: &'static str = "pals-post-repair-recheck/1";
+    pub const POLICY: &'static str = "same_repaired_line_once_v1";
+
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let expected_conditions: [u8; 32] =
+            Sha256::digest(rz_search::pals::engine::POST_REPAIR_RECHECK_CONDITIONS.as_bytes())
+                .into();
+        if self.version != Self::VERSION
+            || self.policy != Self::POLICY
+            || self.search_identity != rz_search::pals::engine::POST_REPAIR_RECHECK_SEARCH_VERSION
+            || self.conditions_sha256 != expected_conditions
+        {
+            return Err(ContractError::new(
+                ErrorCode::IdentityMismatch,
+                Stage::Admission,
+                "PALS selected search policy identity differs from its closed lane",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "search-work-receipts")]
+impl<'de> serde::Deserialize<'de> for PalsSearchPolicyIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            version: String,
+            policy: String,
+            search_identity: String,
+            conditions_sha256: [u8; 32],
+        }
+        let wire = <Wire as serde::Deserialize<'de>>::deserialize(deserializer)?;
+        let identity = Self {
+            version: wire.version,
+            policy: wire.policy,
+            search_identity: wire.search_identity,
+            conditions_sha256: wire.conditions_sha256,
+        };
+        identity.validate().map_err(serde::de::Error::custom)?;
+        Ok(identity)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "search-work-receipts", derive(serde::Serialize))]
 pub struct ProcessSearchWorkReceipt {
@@ -53,6 +109,13 @@ pub struct ProcessSearchWorkReceipt {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub pals_resolver: Option<PalsResolverIdentity>,
+    /// Absent in every legacy/default receipt. A present marker identifies only
+    /// the actual startup-selected immutable lane, including failed/early go.
+    #[cfg_attr(
+        feature = "search-work-receipts",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub pals_search_policy: Option<PalsSearchPolicyIdentity>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -259,7 +322,32 @@ impl ProcessWorkJournal {
     pub fn new_pals(resolver: PalsResolverIdentity) -> Self {
         Self::with_resolver(SearchKind::Pals, Some(resolver))
     }
+    pub fn new_pals_with_search_policy(
+        resolver: PalsResolverIdentity,
+        policy: PalsSearchPolicyIdentity,
+    ) -> Result<Self, ContractError> {
+        policy.validate()?;
+        if resolver != PalsResolverIdentity::registered() {
+            return Err(ContractError::new(
+                ErrorCode::UnsupportedContract,
+                Stage::Admission,
+                "post-Repair recheck v1 requires the own CPU value resolver",
+            ));
+        }
+        Ok(Self::with_registration(
+            SearchKind::Pals,
+            Some(resolver),
+            Some(policy),
+        ))
+    }
     fn with_resolver(kind: SearchKind, resolver: Option<PalsResolverIdentity>) -> Self {
+        Self::with_registration(kind, resolver, None)
+    }
+    fn with_registration(
+        kind: SearchKind,
+        resolver: Option<PalsResolverIdentity>,
+        policy: Option<PalsSearchPolicyIdentity>,
+    ) -> Self {
         Self {
             receipt: Mutex::new(ProcessSearchWorkReceipt {
                 schema_version: 1,
@@ -275,6 +363,7 @@ impl ProcessWorkJournal {
                 cpu: (kind == SearchKind::Cpu).then(CpuWorkTotals::zero),
                 pals: (kind == SearchKind::Pals).then(PalsWorkTotals::zero),
                 pals_resolver: resolver,
+                pals_search_policy: policy,
             }),
             pending_cpu: Mutex::new(Vec::with_capacity(16)),
         }
@@ -479,6 +568,151 @@ mod tests {
             current: Arc::new(Mutex::new(SessionScope::Search(authority))),
         }
     }
+    fn policy_fixture() -> PalsSearchPolicyIdentity {
+        PalsSearchPolicyIdentity {
+            version: PalsSearchPolicyIdentity::VERSION.into(),
+            policy: PalsSearchPolicyIdentity::POLICY.into(),
+            search_identity: rz_search::pals::engine::POST_REPAIR_RECHECK_SEARCH_VERSION.into(),
+            conditions_sha256: Sha256::digest(
+                rz_search::pals::engine::POST_REPAIR_RECHECK_CONDITIONS.as_bytes(),
+            )
+            .into(),
+        }
+    }
+
+    #[test]
+    fn selected_policy_survives_early_and_unknown_failure_without_invented_work() {
+        let policy = policy_fixture();
+        let journal = ProcessWorkJournal::new_pals_with_search_policy(
+            PalsResolverIdentity::registered(),
+            policy.clone(),
+        )
+        .unwrap();
+        let before = journal.snapshot().unwrap();
+        assert_eq!(before.pals_search_policy.as_ref(), Some(&policy));
+        assert_eq!(before.go_invocations, 0);
+        assert_eq!(before.pals.unwrap().role_calls, Some(0));
+        let context = context();
+        context.cancellation.cancel();
+        journal.begin().unwrap();
+        journal
+            .finish(
+                &context,
+                &Ok(SearchSessionReport {
+                    best_move: None,
+                    work: DriverWork::Pals {
+                        rounds: 0,
+                        cpu_nodes: 0,
+                        completed_tasks: 0,
+                        consumed_role_outputs: 0,
+                        retained_situations: 0,
+                    },
+                }),
+                AttemptObservation::NoWork,
+            )
+            .unwrap();
+        let early = journal.snapshot().unwrap();
+        assert_eq!(early.pals_search_policy.as_ref(), Some(&policy));
+        assert_eq!((early.successful_returns, early.canceled_returns), (1, 1));
+        assert_eq!(early.pals.unwrap().completed_cpu_tasks, Some(0));
+        journal.begin().unwrap();
+        journal
+            .finish(
+                &context,
+                &Err(SearchSessionFailure::physical_completion_unknown()),
+                AttemptObservation::PalsStarted,
+            )
+            .unwrap();
+        let failed = journal.snapshot().unwrap();
+        assert_eq!(failed.pals_search_policy.as_ref(), Some(&policy));
+        assert_eq!(
+            (failed.failed_returns, failed.physical_unknown_returns),
+            (1, 1)
+        );
+        assert_eq!(failed.unobserved_work_invocations, 1);
+        let totals = failed.pals.unwrap();
+        assert_eq!(totals.completed_cpu_tasks, None);
+        assert_eq!(totals.role_calls, None);
+        assert_eq!(totals.cpu_nodes, None);
+    }
+
+    #[test]
+    fn wrong_policy_or_foreign_resolver_cannot_register_the_owned_lane() {
+        for field in ["version", "policy", "search", "conditions"] {
+            let mut wrong = policy_fixture();
+            match field {
+                "version" => wrong.version = "pals".into(),
+                "policy" => wrong.policy = "disabled".into(),
+                "search" => {
+                    wrong.search_identity = rz_search::pals::engine::PALS_SEARCH_VERSION.into()
+                }
+                "conditions" => wrong.conditions_sha256[0] ^= 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                ProcessWorkJournal::new_pals_with_search_policy(
+                    PalsResolverIdentity::registered(),
+                    wrong,
+                )
+                .is_err()
+            );
+        }
+        let foreign = PalsResolverIdentity::from_semantics(
+            rz_search::pals::value::MODEL_WDL_RESOLVER_VERSION,
+            rz_search::pals::value::MODEL_WDL_RESOLVER_SEMANTICS,
+        );
+        assert!(
+            ProcessWorkJournal::new_pals_with_search_policy(foreign, policy_fixture()).is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "search-work-receipts")]
+    fn legacy_marker_is_omitted_and_selected_wire_is_closed_and_validated() {
+        let legacy = ProcessWorkJournal::new(SearchKind::Pals)
+            .snapshot()
+            .unwrap();
+        let explicit = ProcessWorkJournal::new_pals(PalsResolverIdentity::registered())
+            .snapshot()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&legacy).unwrap(),
+            serde_json::to_vec(&explicit).unwrap()
+        );
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("pals_search_policy")
+                .is_none()
+        );
+        let policy = policy_fixture();
+        let encoded = serde_json::to_value(&policy).unwrap();
+        assert_eq!(
+            serde_json::from_value::<PalsSearchPolicyIdentity>(encoded.clone()).unwrap(),
+            policy
+        );
+        for field in [
+            "extra",
+            "version",
+            "policy",
+            "search_identity",
+            "conditions_sha256",
+        ] {
+            let mut wrong = encoded.clone();
+            wrong[field] = serde_json::Value::Null;
+            assert!(
+                serde_json::from_value::<PalsSearchPolicyIdentity>(wrong).is_err(),
+                "{field}"
+            );
+        }
+        let mut wrong_lane = encoded.clone();
+        wrong_lane["version"] = "pals".into();
+        assert!(serde_json::from_value::<PalsSearchPolicyIdentity>(wrong_lane).is_err());
+        let raw = serde_json::to_string(&policy).unwrap();
+        let duplicate = format!("{{\"version\":\"{}\",{}", policy.version, &raw[1..]);
+        assert!(serde_json::from_str::<PalsSearchPolicyIdentity>(&duplicate).is_err());
+    }
+
     #[test]
     fn foreign_work_and_model_values_keep_the_selected_resolver_and_unknown_scope() {
         let resolver = PalsResolverIdentity::from_semantics(

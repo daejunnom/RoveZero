@@ -99,6 +99,7 @@ fn run_pals(
     let mut cpu_nodes = None;
     let mut cpu_depth = None;
     let mut situations = None;
+    let mut post_repair_recheck = None;
     let mut native = PalsNativeOptions::default();
     for argument in arguments {
         if let Some(value) = argument.strip_prefix("--pals-model=") {
@@ -116,6 +117,10 @@ fn run_pals(
         } else if let Some(value) = argument.strip_prefix("--pals-cpu-depth=") {
             if cpu_depth.replace(value.parse::<u16>()?).is_some() {
                 return Err("duplicate PALS CPU depth".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-post-repair-recheck=") {
+            if post_repair_recheck.replace(value.to_owned()).is_some() {
+                return Err("duplicate PALS post-Repair recheck policy".into());
             }
         } else if let Some(value) = argument.strip_prefix("--pals-cpu-checker=") {
             if native.checker.selection.replace(value.to_owned()).is_some() {
@@ -293,6 +298,10 @@ fn run_pals(
     };
     config.validate()?;
     let external_checker = native.checker.is_external()?;
+    // Close unsupported combinations before feature dispatch, native asset
+    // admission, model loading or a foreign checker lifecycle can begin.
+    let refinement_policy =
+        pals_refinement_policy(post_repair_recheck.as_deref(), external_checker)?;
     if external_checker && model.as_deref() != Some("onnx") {
         return Err("external PALS CPU checker requires the explicit contextual-WDL ONNX model; the legal-order mock has no model-value endpoint".into());
     }
@@ -310,7 +319,14 @@ fn run_pals(
         if work_receipts.is_some() {
             return Err("native PALS uses pals-output-root/launch-sha256/endpoint-id for one combined native/search receipt".into());
         }
-        return run_native_pals(native, config, rounds, max_cpu_nodes, cpu_depth);
+        return run_native_pals(
+            native,
+            config,
+            rounds,
+            max_cpu_nodes,
+            cpu_depth,
+            refinement_policy,
+        );
     }
     if model.as_deref() != Some("legal-order-mock") {
         return Err("PALS requires explicit --pals-model=legal-order-mock or onnx; no model fallback was started".into());
@@ -320,22 +336,41 @@ fn run_pals(
             "PALS mock selection cannot accept neural assets or a provider declaration".into(),
         );
     }
-    let driver = Arc::new(rz_uci::search_driver::PalsSessionDriver::new(
-        config,
-        rz_search::pals::engine::LegalOrderRoleMock,
-        rz_search::cpu::CpuConfig::default(),
-        rounds,
-        max_cpu_nodes,
-        cpu_depth,
-        rz_uci::EngineIdentity {
-            name: "RoveZero PALS explicit legal-order CPU mock + own CPU_R".into(),
-            author: "RoveZero contributors".into(),
-        },
-    )?);
+    let driver = Arc::new(
+        rz_uci::search_driver::PalsSessionDriver::new_with_refinement_policy(
+            config,
+            rz_search::pals::engine::LegalOrderRoleMock,
+            rz_search::cpu::CpuConfig::default(),
+            rounds,
+            max_cpu_nodes,
+            cpu_depth,
+            rz_uci::EngineIdentity {
+                name: "RoveZero PALS explicit legal-order CPU mock + own CPU_R".into(),
+                author: "RoveZero contributors".into(),
+            },
+            refinement_policy,
+        )?,
+    );
     let mut settings = EngineSettings::default();
     settings.search.max_simulations = max_cpu_nodes;
     serve_search_process(driver, settings, work_receipts)?;
     Ok(())
+}
+
+fn pals_refinement_policy(
+    selected: Option<&str>,
+    external_checker: bool,
+) -> Result<rz_search::pals::engine::PostRepairRecheckPolicy, Box<dyn std::error::Error>> {
+    use rz_search::pals::engine::PostRepairRecheckPolicy;
+    let policy = match selected {
+        None => PostRepairRecheckPolicy::Disabled,
+        Some("same-repaired-line-once-v1") => PostRepairRecheckPolicy::SameRepairedLineOnceV1,
+        Some(_) => return Err("PALS post-Repair recheck requires the exact explicit same-repaired-line-once-v1 lane; omission retains legacy".into()),
+    };
+    if external_checker && policy != PostRepairRecheckPolicy::Disabled {
+        return Err("PALS post-Repair recheck v1 supports own CPU/Rules evidence only; no external checker or model was started".into());
+    }
+    Ok(policy)
 }
 
 #[derive(Default)]
@@ -406,7 +441,65 @@ impl PalsCheckerOptions {
 }
 #[cfg(test)]
 mod pals_checker_option_tests {
-    use super::PalsCheckerOptions;
+    use super::{PalsCheckerOptions, pals_refinement_policy, run_pals};
+
+    #[test]
+    fn post_repair_policy_is_an_exact_opt_in_with_legacy_omission() {
+        use rz_search::pals::engine::PostRepairRecheckPolicy;
+        assert_eq!(
+            pals_refinement_policy(None, false).unwrap(),
+            PostRepairRecheckPolicy::Disabled
+        );
+        assert_eq!(
+            pals_refinement_policy(None, true).unwrap(),
+            PostRepairRecheckPolicy::Disabled
+        );
+        assert_eq!(
+            pals_refinement_policy(Some("same-repaired-line-once-v1"), false).unwrap(),
+            PostRepairRecheckPolicy::SameRepairedLineOnceV1,
+        );
+        for value in [
+            "",
+            "disabled",
+            "same_repaired_line_once_v1",
+            "same-repaired-line-once-v2",
+            "SAME-REPAIRED-LINE-ONCE-V1",
+        ] {
+            assert!(
+                pals_refinement_policy(Some(value), false).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_or_malformed_post_repair_flags_never_reach_a_factory() {
+        let flag = "--pals-post-repair-recheck=same-repaired-line-once-v1";
+        let duplicate = run_pals(vec![flag.into(), flag.into()], None).unwrap_err();
+        assert!(duplicate.to_string().contains("duplicate PALS post-Repair"));
+        for flag in [
+            "--pals-post-repair-recheck",
+            "--pals-post-repair-recheck=unknown",
+        ] {
+            assert!(run_pals(vec![flag.into()], None).is_err());
+        }
+    }
+
+    #[test]
+    fn post_repair_external_checker_is_rejected_before_profile_or_model_loading() {
+        let failure = run_pals(
+            vec![
+                "--pals-model=onnx".into(),
+                "--pals-cpu-checker=external-uci".into(),
+                "--pals-cpu-profile=/intentionally-unavailable-profile.json".into(),
+                "--pals-cpu-profile-sha256=unread-fixture-pin".into(),
+                "--pals-post-repair-recheck=same-repaired-line-once-v1".into(),
+            ],
+            None,
+        )
+        .unwrap_err();
+        assert!(failure.to_string().contains("own CPU/Rules evidence only"));
+    }
 
     #[test]
     fn helper_selection_requires_an_explicit_complete_profile_without_fallback() {
@@ -468,6 +561,7 @@ fn run_native_pals(
     _rounds: u64,
     _cpu_nodes: u64,
     _cpu_depth: u16,
+    _refinement_policy: rz_search::pals::engine::PostRepairRecheckPolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "PALS ONNX startup requires feature onnx-cpu; no provider or model fallback was started"
@@ -482,6 +576,7 @@ fn run_native_pals(
     rounds: u64,
     cpu_nodes: u64,
     cpu_depth: u16,
+    refinement_policy: rz_search::pals::engine::PostRepairRecheckPolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // PALS owns a distinct manifest and tensors. LC0 NativeConfig and its
     // attestation cannot authorize or describe this model.
@@ -786,10 +881,19 @@ fn run_native_pals(
     // The helper is unstarted through every fallible constructor. No foreign
     // process can disappear into a constructor Drop without a shutdown receipt.
     let driver = match match checker {
-        Some(checker) => rz_uci::search_driver::PalsSessionDriver::new_with_checker(
-            config, model, checker, rounds, cpu_nodes, cpu_depth, identity,
-        ),
-        None => rz_uci::search_driver::PalsSessionDriver::new(
+        Some(checker) => {
+            rz_uci::search_driver::PalsSessionDriver::new_with_checker_and_refinement_policy(
+                config,
+                model,
+                checker,
+                rounds,
+                cpu_nodes,
+                cpu_depth,
+                identity,
+                refinement_policy,
+            )
+        }
+        None => rz_uci::search_driver::PalsSessionDriver::new_with_refinement_policy(
             config,
             model,
             rz_search::cpu::CpuConfig::default(),
@@ -797,6 +901,7 @@ fn run_native_pals(
             cpu_nodes,
             cpu_depth,
             identity,
+            refinement_policy,
         ),
     } {
         Ok(driver) => Arc::new(driver),

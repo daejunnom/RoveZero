@@ -10,7 +10,7 @@ use rz_search::cpu_checker::{
     ExternalUciIdentity, OwnedCheckerDescriptor, OwnedCpuChecker,
 };
 use rz_search::driver::SearchControl;
-use rz_search::pals::engine::ModelValueIdentity;
+use rz_search::pals::engine::{ModelValueIdentity, PostRepairRecheckPolicy};
 use sha2::{Digest as _, Sha256};
 use std::{
     fmt,
@@ -23,7 +23,10 @@ use std::{
 };
 mod work;
 use work::{AttemptObservation, ProcessWorkJournal};
-pub use work::{CpuWorkTotals, PalsResolverIdentity, PalsWorkTotals, ProcessSearchWorkReceipt};
+pub use work::{
+    CpuWorkTotals, PalsResolverIdentity, PalsSearchPolicyIdentity, PalsWorkTotals,
+    ProcessSearchWorkReceipt,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "search-work-receipts", derive(serde::Serialize))]
@@ -172,6 +175,7 @@ pub struct PalsSessionDriver<M: rz_search::pals::engine::RoleModel + 'static> {
     cpu_depth: u16,
     work: ProcessWorkJournal,
     registration: PalsCheckerRegistration,
+    search_policy: Option<PalsSearchPolicyIdentity>,
     checker_closed: AtomicBool,
     checker_started: AtomicBool,
     checker_lifecycle: Mutex<PalsCheckerLifecycle>,
@@ -244,10 +248,63 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
             cpu_depth,
             work: ProcessWorkJournal::new(SearchKind::Pals),
             registration,
+            search_policy: None,
             checker_closed: AtomicBool::new(false),
             checker_started: AtomicBool::new(true),
             checker_lifecycle: Mutex::new(PalsCheckerLifecycle::default()),
         })
+    }
+
+    /// The omitted/Disabled selection delegates to the historical own v1
+    /// constructor. Only the explicit lane uses the full checker namespace.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_refinement_policy(
+        config: rz_search::pals::engine::PalsConfig,
+        model: M,
+        cpu_config: rz_search::cpu::CpuConfig,
+        max_rounds: u64,
+        max_cpu_nodes: u64,
+        cpu_depth: u16,
+        identity: EngineIdentity,
+        policy: PostRepairRecheckPolicy,
+    ) -> Result<Self, SearchSessionFailure> {
+        if policy == PostRepairRecheckPolicy::Disabled {
+            return Self::new(
+                config,
+                model,
+                cpu_config,
+                max_rounds,
+                max_cpu_nodes,
+                cpu_depth,
+                identity,
+            );
+        }
+        if max_rounds == 0
+            || max_rounds > 1_000_000
+            || max_cpu_nodes == 0
+            || cpu_depth == 0
+            || cpu_depth > cpu_config.max_depth
+        {
+            return Err(SearchSessionFailure {
+                physical_completion: DriverPhysicalCompletion::Confirmed,
+                code: "PalsConfiguration",
+                detail: "finite PALS round/CPU limits are required".into(),
+            });
+        }
+        let cpu = rz_search::cpu::CpuEngine::new(cpu_config)
+            .map_err(|error| SearchSessionFailure::debug("PalsCpuConstructor", &error))?;
+        let checker = OwnedCpuChecker::new(cpu)
+            .map_err(|error| SearchSessionFailure::debug("PalsCheckerConstructor", &error))?;
+        Self::new_with_checker_and_refinement_policy(
+            config,
+            model,
+            checker,
+            max_rounds,
+            max_cpu_nodes,
+            cpu_depth,
+            identity,
+            policy,
+        )
     }
 
     /// Explicit checker-selected path with a separate v2 source namespace.
@@ -274,6 +331,29 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn new_with_checker_and_refinement_policy<C: CpuChecker + 'static>(
+        config: rz_search::pals::engine::PalsConfig,
+        model: M,
+        checker: C,
+        max_rounds: u64,
+        max_cpu_nodes: u64,
+        cpu_depth: u16,
+        identity: EngineIdentity,
+        policy: PostRepairRecheckPolicy,
+    ) -> Result<Self, SearchSessionFailure> {
+        Self::new_with_boxed_checker_and_refinement_policy(
+            config,
+            model,
+            Box::new(checker),
+            max_rounds,
+            max_cpu_nodes,
+            cpu_depth,
+            identity,
+            policy,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_boxed_checker(
         config: rz_search::pals::engine::PalsConfig,
         model: M,
@@ -283,7 +363,39 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
         cpu_depth: u16,
         identity: EngineIdentity,
     ) -> Result<Self, SearchSessionFailure> {
+        Self::new_with_boxed_checker_and_refinement_policy(
+            config,
+            model,
+            checker,
+            max_rounds,
+            max_cpu_nodes,
+            cpu_depth,
+            identity,
+            PostRepairRecheckPolicy::Disabled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_boxed_checker_and_refinement_policy(
+        config: rz_search::pals::engine::PalsConfig,
+        model: M,
+        checker: Box<dyn CpuChecker>,
+        max_rounds: u64,
+        max_cpu_nodes: u64,
+        cpu_depth: u16,
+        identity: EngineIdentity,
+        policy: PostRepairRecheckPolicy,
+    ) -> Result<Self, SearchSessionFailure> {
         let registration = PalsCheckerRegistration::capture(checker.as_ref(), &model)?;
+        if policy != PostRepairRecheckPolicy::Disabled
+            && matches!(registration.identity, CheckerIdentity::ExternalUci(_))
+        {
+            return Err(SearchSessionFailure {
+                physical_completion: DriverPhysicalCompletion::Confirmed,
+                code: "PalsRefinementUnsupported",
+                detail: "post-Repair recheck v1 requires own CPU/Rules evidence; no foreign helper was started".into(),
+            });
+        }
         if max_rounds == 0
             || max_rounds > 1_000_000
             || max_cpu_nodes == 0
@@ -299,15 +411,32 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
                 detail: "finite PALS limits and bounded model identity are required".into(),
             });
         }
-        let implementation =
+        let legacy_implementation =
             checker_implementation(&registration, &config, max_rounds, max_cpu_nodes, cpu_depth);
         let engine =
-            rz_search::pals::engine::PalsEngine::new_with_boxed_checker(config, model, checker)
-                .map_err(|error| SearchSessionFailure::debug("PalsConstructor", &error))?;
-        let work = ProcessWorkJournal::new_pals(PalsResolverIdentity::from_semantics(
+            rz_search::pals::engine::PalsEngine::new_with_boxed_checker_and_refinement_policy(
+                config, model, checker, policy,
+            )
+            .map_err(|error| SearchSessionFailure::debug("PalsConstructor", &error))?;
+        let search_policy = selected_search_policy(&engine, policy)?;
+        let implementation = search_policy
+            .as_ref()
+            .map_or(legacy_implementation, |selected| {
+                refinement_implementation(legacy_implementation, selected)
+            });
+        let resolver = PalsResolverIdentity::from_semantics(
             registration.resolver_version,
             registration.resolver_semantics,
-        ));
+        );
+        let work = match &search_policy {
+            Some(selected) => {
+                ProcessWorkJournal::new_pals_with_search_policy(resolver, selected.clone())
+                    .map_err(|error| {
+                        SearchSessionFailure::debug("PalsSearchPolicyRegistration", &error)
+                    })?
+            }
+            None => ProcessWorkJournal::new_pals(resolver),
+        };
         Ok(Self {
             engine: Mutex::new(engine),
             reset_requested: AtomicU64::new(0),
@@ -324,6 +453,7 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
                 CheckerIdentity::Owned(_)
             )),
             registration,
+            search_policy,
             checker_closed: AtomicBool::new(false),
             checker_lifecycle: Mutex::new(PalsCheckerLifecycle::default()),
         })
@@ -331,6 +461,11 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
 
     pub fn checker_registration(&self) -> &PalsCheckerRegistration {
         &self.registration
+    }
+    /// Available before any go, including when a later result is early/unknown.
+    /// This does not attest that a recheck branch ran or refuted a repaired line.
+    pub fn search_policy_registration(&self) -> Option<&PalsSearchPolicyIdentity> {
+        self.search_policy.as_ref()
     }
     /// Startup success is independent of registration and UCI option claims.
     pub fn checker_started(&self) -> bool {
@@ -764,6 +899,19 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> SearchSessionDriver for Pa
                     },
                 });
             }
+            let selected_policy = if self.search_policy.is_some() {
+                PostRepairRecheckPolicy::SameRepairedLineOnceV1
+            } else {
+                PostRepairRecheckPolicy::Disabled
+            };
+            if selected_search_policy(&engine, selected_policy)? != self.search_policy {
+                return Err(SearchSessionFailure {
+                    physical_completion: DriverPhysicalCompletion::Confirmed,
+                    code: "PalsSearchPolicyIdentity",
+                    detail: "effective PALS lane differs from its immutable startup registration"
+                        .into(),
+                });
+            }
             let _active = self.activate_checker(Arc::clone(&context.control.cancellation))?;
             let reset_requested = self.reset_requested.load(Ordering::Acquire);
             if reset_requested != self.reset_applied.load(Ordering::Acquire) {
@@ -871,6 +1019,53 @@ fn pals_failure<M: rz_search::pals::engine::RoleModel>(
         failure.physical_completion = DriverPhysicalCompletion::Unknown;
     }
     failure
+}
+
+/// Capture only actual immutable engine getters. A result's resolver/score does
+/// not identify this lane and cannot establish that its recheck branch executed.
+fn selected_search_policy<M: rz_search::pals::engine::RoleModel>(
+    engine: &rz_search::pals::engine::PalsEngine<M>,
+    requested: PostRepairRecheckPolicy,
+) -> Result<Option<PalsSearchPolicyIdentity>, SearchSessionFailure> {
+    let mismatch = || SearchSessionFailure {
+        physical_completion: DriverPhysicalCompletion::Confirmed,
+        code: "PalsSearchPolicyIdentity",
+        detail: "actual PALS search/refinement getters differ from selected startup policy".into(),
+    };
+    if engine.post_repair_recheck_policy() != requested {
+        return Err(mismatch());
+    }
+    if requested == PostRepairRecheckPolicy::Disabled {
+        if engine.search_identity() != rz_search::pals::engine::PALS_SEARCH_VERSION
+            || engine.refinement_conditions().is_some()
+        {
+            return Err(mismatch());
+        }
+        return Ok(None);
+    }
+    let conditions = engine.refinement_conditions().ok_or_else(mismatch)?;
+    let identity = PalsSearchPolicyIdentity {
+        version: PalsSearchPolicyIdentity::VERSION.into(),
+        policy: PalsSearchPolicyIdentity::POLICY.into(),
+        search_identity: engine.search_identity().into(),
+        conditions_sha256: Sha256::digest(conditions.as_bytes()).into(),
+    };
+    identity
+        .validate()
+        .map_err(|error| SearchSessionFailure::debug("PalsSearchPolicyIdentity", &error))?;
+    Ok(Some(identity))
+}
+
+fn refinement_implementation(base: Digest, policy: &PalsSearchPolicyIdentity) -> Digest {
+    let mut hash = Sha256::new();
+    hash.update(b"rz-uci-pals-post-repair-recheck-session/1\0");
+    hash.update(base.0);
+    for value in [&policy.version, &policy.policy, &policy.search_identity] {
+        hash.update((value.len() as u64).to_le_bytes());
+        hash.update(value.as_bytes());
+    }
+    hash.update(policy.conditions_sha256);
+    Digest(hash.finalize().into())
 }
 
 /// Canonical length-prefixed declaration hash. It binds every admitted checker
@@ -1724,6 +1919,250 @@ mod tests {
             current: Arc::new(Mutex::new(SessionScope::Search(authority))),
         }
     }
+
+    fn refinement_config() -> PalsConfig {
+        PalsConfig {
+            beam_width: 1,
+            line_plies: 2,
+            cpu_nodes_per_task: 8,
+            ..PalsConfig::default()
+        }
+    }
+    fn refinement_cpu_config() -> CpuConfig {
+        CpuConfig {
+            tt_entries: 0,
+            ..CpuConfig::default()
+        }
+    }
+    fn refinement_name() -> EngineIdentity {
+        EngineIdentity {
+            name: "PALS immutable recheck lane fixture".into(),
+            author: "RoveZero contributors".into(),
+        }
+    }
+    fn refinement_driver<M: RoleModel + 'static>(model: M) -> PalsSessionDriver<M> {
+        PalsSessionDriver::new_with_refinement_policy(
+            refinement_config(),
+            model,
+            refinement_cpu_config(),
+            1,
+            8,
+            1,
+            refinement_name(),
+            PostRepairRecheckPolicy::SameRepairedLineOnceV1,
+        )
+        .unwrap()
+    }
+    fn refinement_checker() -> OwnedCpuChecker {
+        OwnedCpuChecker::new(rz_search::cpu::CpuEngine::new(refinement_cpu_config()).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn disabled_policy_keeps_v1_v2_hashes_and_opt_in_has_a_separate_actual_namespace() {
+        use rz_search::pals::engine::LegalOrderRoleMock;
+        let legacy = PalsSessionDriver::new(
+            refinement_config(),
+            LegalOrderRoleMock,
+            refinement_cpu_config(),
+            1,
+            8,
+            1,
+            refinement_name(),
+        )
+        .unwrap();
+        let disabled = PalsSessionDriver::new_with_refinement_policy(
+            refinement_config(),
+            LegalOrderRoleMock,
+            refinement_cpu_config(),
+            1,
+            8,
+            1,
+            refinement_name(),
+            PostRepairRecheckPolicy::Disabled,
+        )
+        .unwrap();
+        assert_eq!(legacy.implementation(), disabled.implementation());
+        assert_eq!(
+            legacy.work_receipt().unwrap(),
+            disabled.work_receipt().unwrap()
+        );
+        assert!(legacy.search_policy_registration().is_none());
+        let explicit = PalsSessionDriver::new_with_checker(
+            refinement_config(),
+            LegalOrderRoleMock,
+            refinement_checker(),
+            1,
+            8,
+            1,
+            refinement_name(),
+        )
+        .unwrap();
+        let explicit_disabled = PalsSessionDriver::new_with_checker_and_refinement_policy(
+            refinement_config(),
+            LegalOrderRoleMock,
+            refinement_checker(),
+            1,
+            8,
+            1,
+            refinement_name(),
+            PostRepairRecheckPolicy::Disabled,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.implementation(),
+            explicit_disabled.implementation()
+        );
+        assert_eq!(
+            explicit.work_receipt().unwrap(),
+            explicit_disabled.work_receipt().unwrap()
+        );
+        let selected = refinement_driver(LegalOrderRoleMock);
+        assert_ne!(selected.implementation(), legacy.implementation());
+        assert_ne!(selected.implementation(), explicit.implementation());
+        let policy = selected.search_policy_registration().unwrap();
+        policy.validate().unwrap();
+        let engine = selected.engine.lock().unwrap();
+        assert_eq!(policy.search_identity, engine.search_identity());
+        assert_eq!(
+            policy.conditions_sha256,
+            <[u8; 32]>::from(Sha256::digest(
+                engine.refinement_conditions().unwrap().as_bytes(),
+            ))
+        );
+        assert_eq!(
+            selected
+                .work_receipt()
+                .unwrap()
+                .unwrap()
+                .pals_search_policy
+                .as_ref(),
+            Some(policy)
+        );
+        #[cfg(feature = "search-work-receipts")]
+        assert_eq!(
+            serde_json::to_vec(&legacy.work_receipt().unwrap()).unwrap(),
+            serde_json::to_vec(&disabled.work_receipt().unwrap()).unwrap(),
+        );
+        let changed_budget = PalsSessionDriver::new_with_refinement_policy(
+            refinement_config(),
+            LegalOrderRoleMock,
+            refinement_cpu_config(),
+            1,
+            9,
+            1,
+            refinement_name(),
+            PostRepairRecheckPolicy::SameRepairedLineOnceV1,
+        )
+        .unwrap();
+        assert_ne!(selected.implementation(), changed_budget.implementation());
+    }
+
+    #[test]
+    fn opted_in_driver_early_cancel_preserves_selection_with_no_recheck_claim() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let driver = refinement_driver(DeadlineObserver {
+            observed: Arc::clone(&observed),
+        });
+        let before = driver.work_receipt().unwrap().unwrap();
+        let context = checker_context(&driver);
+        context.cancellation.cancel();
+        let report = driver
+            .run(&Position::startpos(), &context, &mut |_| {})
+            .unwrap();
+        assert!(report.best_move.is_none());
+        assert!(observed.lock().unwrap().is_empty());
+        let after = driver.work_receipt().unwrap().unwrap();
+        assert_eq!(after.pals_search_policy, before.pals_search_policy);
+        assert_eq!(
+            (
+                after.go_invocations,
+                after.successful_returns,
+                after.canceled_returns
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(after.unobserved_work_invocations, 0);
+        let totals = after.pals.unwrap();
+        assert_eq!(totals.role_calls, Some(0));
+        assert_eq!(totals.completed_cpu_tasks, Some(0));
+        assert_eq!(totals.consumed_role_outputs, Some(0));
+    }
+
+    #[test]
+    fn opted_in_driver_preserves_backend_failure_marker_and_original_deadline() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let driver = refinement_driver(DeadlineObserver {
+            observed: Arc::clone(&observed),
+        });
+        let context = checker_context(&driver);
+        let hard = context.control.deadline;
+        let soft = context
+            .control
+            .soft_deadline
+            .min(context.control.admission_deadline);
+        let failure = driver
+            .run(&Position::startpos(), &context, &mut |_| {})
+            .unwrap_err();
+        assert_eq!(failure.code, "PalsSearch");
+        assert!(failure.detail.contains("test role deadline observed"));
+        assert_eq!(*observed.lock().unwrap(), [soft]);
+        assert_eq!(context.control.deadline, hard);
+        let work = driver.work_receipt().unwrap().unwrap();
+        assert_eq!(
+            work.pals_search_policy.as_ref(),
+            driver.search_policy_registration()
+        );
+        assert_eq!((work.successful_returns, work.failed_returns), (0, 1));
+        assert_eq!(work.active_invocations, 0);
+        assert_eq!(work.pals.unwrap().accepted_proposer_outputs, Some(0));
+    }
+
+    #[test]
+    fn selected_external_checker_is_rejected_without_start_or_analysis() {
+        let state = Arc::new(CheckerProbeState::default());
+        let result = PalsSessionDriver::new_with_checker_and_refinement_policy(
+            refinement_config(),
+            rz_search::pals::engine::LegalOrderRoleMock,
+            CheckerProbe::new(Arc::clone(&state)),
+            1,
+            8,
+            1,
+            refinement_name(),
+            PostRepairRecheckPolicy::SameRepairedLineOnceV1,
+        );
+        let Err(failure) = result else {
+            panic!("unsupported foreign lane admitted")
+        };
+        assert_eq!(failure.code, "PalsRefinementUnsupported");
+        assert_eq!(state.starts.load(Ordering::Acquire), 0);
+        assert_eq!(state.analyses.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn registration_drift_fails_before_any_role_work() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut driver = refinement_driver(DeadlineObserver {
+            observed: Arc::clone(&observed),
+        });
+        driver.search_policy.as_mut().unwrap().conditions_sha256[0] ^= 1;
+        let context = checker_context(&driver);
+        let failure = driver
+            .run(&Position::startpos(), &context, &mut |_| {})
+            .unwrap_err();
+        assert_eq!(failure.code, "PalsSearchPolicyIdentity");
+        assert!(observed.lock().unwrap().is_empty());
+        let receipt = driver.work_receipt().unwrap().unwrap();
+        receipt
+            .pals_search_policy
+            .as_ref()
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert_eq!(receipt.failed_returns, 1);
+        assert_eq!(receipt.pals.unwrap().role_calls, Some(0));
+    }
+
     fn start_probe(driver: &PalsSessionDriver<rz_search::pals::engine::LegalOrderRoleMock>) {
         driver
             .start_checker(
