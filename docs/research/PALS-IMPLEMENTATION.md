@@ -3043,3 +3043,44 @@ quiescence 16과 실제 네 단계 checker를 사용한다. ORT/GPU/provider/외
 않는다. 기존 CLI 소비 검사와 2N/3N 검사도 정확한 SHA의 CI에서 별도로 확인한다.
 실제 등록된 신경망의 4N 실행·external supervisor·strict Query 결과 환류·전체 비용·
 utility/target 인수는 아직 미실행이다. 실제 학습은 제외하고 GPU 검증은 계속 보류한다.
+
+## 2026-10-09 — 등록된 4N 결과의 Rust 관측 소비 경계
+
+`native_replay::query_prior`의 구현은 같은 디렉터리의 `replay_prior.rs`에 둔다. native
+로딩·실행·관찰자와 분리되는 책임은 결과를 다음 private V 입력으로 보존할 수 있는지
+판정하는 것이다. Rules·CPU checker·native lease를 다시 구현하지 않는다.
+
+명시적 `dispatch_started_observed_with_semantic_scope`는 같은 원래 S/E/W 안에서 실제
+dispatch와 최종 출력 검사를 수행하고, 하나의 결과 객체로 반환 bytes와 읽기 전용 typed
+관측을 함께 넘긴다. 4N은 새 native 관측 `/3`에 `rz-pals-frozen-replay-query-prior/1`
+projection을 추가한다. 기존 byte 진입점·CLI·durable launch는 2N/3N의 `/1`과 4N의
+`/2`를 유지한다. 입력·registration `/1`·`/2`, 기존 Python Query/2의 wire·digest와
+공통 계약 revision은 바꾸지 않는다. 기존 CLI에 새 결과를 자동 활성화하지 않는다.
+
+projection은 네 CPU 단계의 정확한 완료·요청/완료 깊이·완료 이유·PV move16·실제
+nodes/qnodes/TT hits, 원래 H1 조건의 metadata hash, Repair와 실제 새 상대 수순을
+포착한다. 단계 4개·PV 96수·수순 16수의 고정 inline 저장소를 사용하며 동적 PV 복제나
+Debug 재해석은 없다. 실제 terminal은 세 CPU 단계만 직렬화한다. 범위를 넘으면
+실패로 보존하며 잘라낸 성공이나 추가 예산을 만들지 않는다. projection JSON의 상한
+16KiB는 기존 512KiB header 예약 안에 두고 동일한 전체 출력 상한을 유지한다.
+
+`consume_native_replay_prior`는 등록·원래 action/semantic receipt·parent/current/frozen/
+encoding·Query/catalogue/before/prior·factory/source의 독립 expected 값과 입력 audit를
+대조한다. 같은 실제 stage의 scalar와 projection도 비교한다. 미완료·frontier·재사용
+깊이·누락 비용·취소·오류·native 완료 불명·버퍼 미해제는 완료 입력으로 승격하지 않는다.
+CPU 점수·실행 ID·식별 hash는 신경망 feature로 사용하지 않는다. compiled projection
+source hash는 metadata로 기록하며 이를 독립 expected source나 전체 build 인수로
+대체하지 않는다.
+
+E 검사는 실제 `run_owner` 반환 시각에서, W 검사는 정리·관측·출력 뒤에서 수행한다.
+기존 `execution_deadline_exceeded`가 정리 종료 시점까지 포함한다는 사실을 보존하며,
+정리가 E를 지나 W 안에서 끝난 경우를 작업 지연으로 재라벨하지 않는다. 반환 뒤
+취소·최종 출력 실패는 prior readiness도 실패 상태로 철회하고 이미 관측한 작업은 남긴다.
+
+완료 CPU 범위와 native 종료를 모두 확인해도 상태는 `pending_caller_chronology`다.
+새 소비자는 strict dataset/current selector·frozen producer 재입장, 외부 child의
+spawn/loaded image/EOF/reap/process group·원래 시작 시각, 다음 before/prior ledger를
+검증하지 않는다. 새 결과를 기존 Query/2 completed prior로 전달하지 않으며 utility
+group은 0, utility/target/training 및 전체 causal bridge 권한은 false로 유지한다.
+실제 등록된 ONNX 4N 실행과 그 결과의 strict Query 환류·전체 비용·utility 인수는
+후속 단계다. CPU source 검사를 실제 모델·GPU 실행으로 보고하지 않는다.
