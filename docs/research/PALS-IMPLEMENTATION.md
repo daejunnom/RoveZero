@@ -1783,3 +1783,41 @@ producer 호출이 충돌했다. 이 실패를 모델 수치 성공이나 전체
 report의 ordering domain, 실제 CPU conditions 및 raw evidence 검증은 그대로다.
 이 수정의 소스·후속 CI 결과는 `7fbb389`의 실패 기록과 별도로 인수한다.
 로컬에서는 Python import·모델 실행·Cargo 검사·GPU 검사를 시작하지 않았다.
+
+후속 source `2766a42e6fd9153cdb9d5ccb4175ed29ad64f70f`의 CI run
+`37720496417`은 네 CPU job 모두 SUCCESS를 확인했다. Windows의 마지막 완료는
+2026-10-08 03:05:25 UTC다. PALS Python suite 339개와 CPU forward/export/no-step
+준비는 해당 source의 검사이며, 독립 검토에서 드러난 feedback reload 누락의
+후속 수정이나 새 packing artifact 검사를 이 성공으로 소급 인증하지 않는다.
+
+### Record device packing artifact의 소스와 CPU 수치 검사 준비
+
+별도 `device_packing_artifacts.py`는 학습 가중치가 없는 deterministic ONNX
+IR10/opset17 결합 그래프와 strict manifest를 제공한다. 기존 learned public/role
+export와 CLI·native manifest를 바꾸지 않는다. B1 FP32, K/V 2 heads × 64,
+board 66 tokens, record 최대 128개를 명시하며 입력 387개·노드 275개·INT64
+initializer 5개/40B를 사용한다. ordered record occurrence·중복·source offset을
+보존하고 0-record에서는 실제 zero-feature projection token과 false mask를 요구한다.
+K/V를 임의의 0으로 합성하지 않는다.
+
+CPU 입력 witness는 전체 readonly owning backing·feed alias·각 고유 payload와
+제어 배열·mask를 함께 검사한다. 노드 dtype/shape의 최대 payload 합계를 산술로
+계산하되 allocator·session·workspace 또는 peak 관측값으로 보고하지 않는다.
+출력은 저장소 밖 새 절대 경로에만 생성하며 기존 경로를 덮어쓰지 않는다.
+
+초도 독립 검토에서 재검사의 model/graph/projection identity가 caller 객체의
+custom equality에 의존할 수 있는 타입 누락을 발견했다. 두 block identity와
+모든 expected projection key를 exact lowercase SHA-256 문자열로 검사하도록
+보강했으며 prepare·직접 구성·replace 경로의 거절 fixture를 추가했다. 후속 독립
+읽기 전용 검토는 해당 우회가 소스상 닫혔음을 확인했다. 동결 source는 25,949B
+SHA `c95c9768f8072db7da3165169bc37923f51cde9bc8b2e0b59ca70564864d54f5`,
+test source는 17,038B SHA
+`36e2defb197c973f90a88ac3530fc6f37e4e70165c413c2085b674b1eacc9faa`다.
+
+13개 검사 method 소스는 exact graph/manifest, 합성 K/V의 bitwise routing,
+0/mixed/128 record·중복·signed zero·visible finite, 타입·owner·예산 거절을
+포함한다. root104는 동결 pin 전후 일치와 Windows stdlib AST를 실제 exit 0으로
+확인했으며 import·검사 실행·graph 생성·모델·WSL·GPU 실행은 하지 않았다.
+실제 CPU 수치는 후속 exact-SHA CI에서 인수한다. learned public projection의
+수치 대조, Rust native consumer, CUDA resident owner·lease·fence·quarantine은
+이 단위에서 미구현/미인수다. GPU 검증은 계속 사용자 보류다.
