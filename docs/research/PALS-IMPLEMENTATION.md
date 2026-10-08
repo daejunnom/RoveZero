@@ -2197,3 +2197,32 @@ CPU bindings와 model suite 469개가 성공했다. 따라서 앞선 Query fixtu
 조건을 유지하고, invalid descriptor 문자열은 오류 또는 shape 불일치로 거부한다.
 Warm CPU 경로에는 resident owner `None`만 추가한다. 원래 양 OS compile 실패
 자료를 보존하며, 수정 후 실제 Rust 통과는 후속 exact-SHA CI에서 별도 확인한다.
+
+후속 `714859c8b4bdeda5f611fe751625ee862b70d807`의
+[CI 37745167614](https://github.com/daejunnom/RoveZero/actions/runs/37745167614)도
+model suite 469개와 CPU bindings가 성공했다. 양 OS Rust는 `rz-uci`의 기존 exhaustive
+match 세 곳에서 새 metadata command/result를 아직 처리하지 않아 실패했다.
+Evaluate·NewGame 응답의 관측 marker를 NN 성공으로 받아들이지 않고 typed 오류로
+거부하며, 실제 snapshot ACK는 선택된 유한 관측 경로에서만 소비하도록 연결한다.
+이 실패와 뒤의 selected factory 구현을 구분하고, 전체 Rust 성공을 소급하지 않는다.
+
+### 학습 없이 호출하는 frozen action scorer
+
+`FrozenStrategicVerifierScorer`는 exact Query/2를 기존 frozen CPU FP32 validator에
+연결하는 별도 offline seam이다. sealed legacy query16과 원문은 그대로 보존하고
+새 호출의 NN query seed만 0으로 둔다. 실제 action controls와 순서가 검증된 prior의
+known/unknown·비용·PV를 4483개의 고정 private token으로 표현한다. hash·profile 이름·
+catalogue slot·budget bucket·raw CPU 점수는 numeric feature로 사용하지 않는다.
+
+1~8개 전체 catalogue의 실제 batch padding·입력·K/V·GQA 반복·attention/FFN scratch·
+검증 workspace·분석적 matmul FLOPs를 첫 tensor collation 전에 예약한다. 반환까지
+원래 absolute deadline·actual parameter digest·CPU FP32·eval·gradient flags·module
+config·checked parent를 다시 검사한다. 동시 kernel의 선점, process RSS나 BLAS allocator
+hard cap, 학습된 utility 또는 기력 개선은 주장하지 않는다. 기존 P/C·checkpoint·export·
+parameter·Warm·제품 V는 바꾸지 않는다.
+
+독립 리뷰와 총괄 원문·AST 검사를 마쳤으며 source tests 27개를 준비했다. 실제 model을
+호출하는 fixture는 합성 QueryFixture의 두 action이고, 전체 8개 catalogue 및 실패
+경계 fixture는 numeric stub을 명시해 사용한다. 이번 소스의 실제 실행 인수는 다음
+CPU CI에 남는다. 같은 conditional witness의 실제 whole-action 완료·인과·비용과
+별도 masked utility target은 아직 후속 필수 단위다.
