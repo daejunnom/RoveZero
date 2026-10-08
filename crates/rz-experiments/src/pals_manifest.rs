@@ -11,6 +11,87 @@ pub const PALS_MANIFEST_V3_DOMAIN: &str = "rz-pals-execution-v3/1";
 // NN cache consumption; historical V1/V2 codecs and execution locks are intact.
 pub const PALS_RECEIPT_V3_DOMAIN: &str = "rz-pals-receipt-v3/2";
 
+/// Closed opt-in search lane. These are declaration/observation wire identities,
+/// not execution proof, a new model, or a change to the value resolver.
+pub const PALS_POST_REPAIR_RECHECK_V3_VERSION: &str = "pals-post-repair-recheck/1";
+pub const PALS_POST_REPAIR_RECHECK_V3_OPTION_KEY: &str = "post_repair_recheck";
+pub const PALS_POST_REPAIR_RECHECK_V3_OPTION_VALUE: &str = "same-repaired-line-once-v1";
+pub const PALS_POST_REPAIR_RECHECK_V3_POLICY: &str = "same_repaired_line_once_v1";
+pub const PALS_POST_REPAIR_RECHECK_V3_SEARCH_IDENTITY: &str =
+    "pals-restricted-refinement-post-repair-recheck/1";
+/// SHA-256 of the exact engine's 425-byte UTF-8 refinement conditions. Arena
+/// must independently compare this closed contract pin with its engine constants;
+/// experiments never depends on search or UCI to validate persisted identities.
+pub const PALS_POST_REPAIR_RECHECK_V3_CONDITIONS_SHA256: [u8; 32] = [
+    0xbe, 0xa4, 0x4b, 0x7e, 0x9a, 0xb5, 0x9f, 0x32, 0xdc, 0xff, 0xb1, 0xb4, 0xc5, 0x97, 0xfd, 0x36,
+    0xa4, 0xb7, 0x50, 0x37, 0x80, 0x3a, 0xee, 0xac, 0xd6, 0xc1, 0x87, 0x85, 0xce, 0x83, 0x81, 0x66,
+];
+
+/// Omission selects the historical lane; there is no serialized Disabled alias.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub enum PalsPostRepairRecheckPolicyV3 {
+    #[serde(rename = "same-repaired-line-once-v1")]
+    SameRepairedLineOnceV1,
+}
+
+/// Four-field identity captured from immutable startup-selected engine getters.
+/// A matching identity does not prove a post-Repair Reply ran, completed or won.
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct PalsSearchPolicyIdentityV3 {
+    pub version: String,
+    pub policy: String,
+    pub search_identity: String,
+    pub conditions_sha256: [u8; 32],
+}
+impl PalsSearchPolicyIdentityV3 {
+    pub fn expected_same_repaired_line_once_v1() -> Self {
+        Self {
+            version: PALS_POST_REPAIR_RECHECK_V3_VERSION.into(),
+            policy: PALS_POST_REPAIR_RECHECK_V3_POLICY.into(),
+            search_identity: PALS_POST_REPAIR_RECHECK_V3_SEARCH_IDENTITY.into(),
+            conditions_sha256: PALS_POST_REPAIR_RECHECK_V3_CONDITIONS_SHA256,
+        }
+    }
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        require(
+            self.version == PALS_POST_REPAIR_RECHECK_V3_VERSION
+                && self.policy == PALS_POST_REPAIR_RECHECK_V3_POLICY
+                && self.search_identity == PALS_POST_REPAIR_RECHECK_V3_SEARCH_IDENTITY
+                && self.conditions_sha256 == PALS_POST_REPAIR_RECHECK_V3_CONDITIONS_SHA256,
+            "selected search policy identity differs from the closed post-Repair lane",
+        )
+    }
+}
+impl<'de> Deserialize<'de> for PalsSearchPolicyIdentityV3 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            version: String,
+            policy: String,
+            search_identity: String,
+            conditions_sha256: [u8; 32],
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let identity = Self {
+            version: wire.version,
+            policy: wire.policy,
+            search_identity: wire.search_identity,
+            conditions_sha256: wire.conditions_sha256,
+        };
+        identity.validate().map_err(serde::de::Error::custom)?;
+        Ok(identity)
+    }
+}
+
+/// Used only for the new optional Core observation: absent is unknown, while
+/// a present JSON null is invalid. Existing optional fields keep their codecs.
+pub fn deserialize_present_pals_search_policy<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PalsSearchPolicyIdentityV3>, D::Error> {
+    PalsSearchPolicyIdentityV3::deserialize(deserializer).map(Some)
+}
+
 macro_rules! choices {
     ($name:ident { $($variant:ident),+ $(,)? }) => {
         #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq, Ord, PartialOrd)]
@@ -392,6 +473,23 @@ fn component(c: &PalsComponentV3) -> Result<(), ManifestError> {
         "invalid component identity/options",
     )
 }
+fn pals_search_lane(p: &PalsEndpointV3) -> Result<(), ManifestError> {
+    match p.search.semantic_id.as_str() {
+        // Keep the historical component/options declaration semantics intact.
+        // The executable arena recipe applies its existing stricter closure.
+        "pals" => Ok(()),
+        PALS_POST_REPAIR_RECHECK_V3_VERSION => require(
+            p.cpu_r.is_own()
+                && p.search.options.len() == 1
+                && p.search
+                    .options
+                    .get(PALS_POST_REPAIR_RECHECK_V3_OPTION_KEY)
+                    .is_some_and(|value| value == PALS_POST_REPAIR_RECHECK_V3_OPTION_VALUE),
+            "post-Repair search lane requires its exact single option and Own CPU_R",
+        ),
+        _ => require(false, "unsupported PALS search semantic lane"),
+    }
+}
 fn cpu(c: &PalsOwnCpuV3) -> Result<(), ManifestError> {
     component(&c.core)?;
     component(&c.training_profile)?;
@@ -578,21 +676,21 @@ fn endpoint(
             }
             component(&p.search)?;
             component(&p.runtime)?;
+            pals_search_lane(p)?;
             let b = &p.pools;
             require(
-                p.search.semantic_id == "pals"
-                    && [
-                        b.states,
-                        b.line_chunks,
-                        b.situations,
-                        b.observations,
-                        b.tasks,
-                        b.role_states,
-                        b.memory_pages,
-                        b.queue_requests,
-                    ]
-                    .iter()
-                    .all(|n| *n > 0)
+                [
+                    b.states,
+                    b.line_chunks,
+                    b.situations,
+                    b.observations,
+                    b.tasks,
+                    b.role_states,
+                    b.memory_pages,
+                    b.queue_requests,
+                ]
+                .iter()
+                .all(|n| *n > 0)
                     && b.host_bytes > 0
                     && b.host_bytes <= r.memory_max_bytes
                     && b.device_bytes <= r.device_allocation_max_bytes
@@ -1193,6 +1291,16 @@ pub struct PalsEndpointReceiptV3 {
     /// endpoints have no RoveZero search-work projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_failed_go_count: Option<u64>,
+    /// Actual selected identity only after both raw startup and termination
+    /// markers were checked against the manifest/CLI. Absence in old receipts
+    /// stays unknown and serializes to the same legacy bytes. This grants no
+    /// recheck execution, completion, refutation or repaired-line authority.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_pals_search_policy"
+    )]
+    pub pals_search_policy: Option<PalsSearchPolicyIdentityV3>,
     pub options: BTreeMap<String, PalsOptionReceiptV3>,
     pub actual_affinity: PalsObservedV3<Vec<u32>>,
     pub memory_peak_bytes: PalsObservedV3<u64>,
@@ -1273,6 +1381,23 @@ fn receipt_endpoint(
     eligible: bool,
     failures: &BTreeSet<PalsRunFailureV3>,
 ) -> Result<(), ManifestError> {
+    match e {
+        PalsEngineV3::Pals(p) if p.search.semantic_id == PALS_POST_REPAIR_RECHECK_V3_VERSION => {
+            pals_search_lane(p)?;
+            o.pals_search_policy
+                .as_ref()
+                .ok_or_else(|| {
+                    ManifestError::Integrity(
+                        "PALS V3: selected post-Repair lane observation missing".into(),
+                    )
+                })?
+                .validate()?;
+        }
+        _ => require(
+            o.pals_search_policy.is_none(),
+            "legacy/non-PALS/external endpoint cannot claim post-Repair lane observation",
+        )?,
+    }
     match (e, &o.external_cpu_r) {
         (PalsEngineV3::Pals(p), Some(external)) if !p.cpu_r.is_own() => {
             external.validate_against(p, r)?;
@@ -1754,6 +1879,7 @@ mod tests {
             } else {
                 Some(0)
             },
+            pals_search_policy: None,
             options: e
                 .requested_options()
                 .iter()
@@ -2074,6 +2200,345 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn select_post_repair(m: &mut PalsRunManifestV3, index: usize) {
+        let PalsEngineV3::Pals(p) = &mut m.engines[index] else {
+            unreachable!()
+        };
+        p.search.semantic_id = PALS_POST_REPAIR_RECHECK_V3_VERSION.into();
+        p.search.options = BTreeMap::from([(
+            PALS_POST_REPAIR_RECHECK_V3_OPTION_KEY.into(),
+            PALS_POST_REPAIR_RECHECK_V3_OPTION_VALUE.into(),
+        )]);
+    }
+    fn policy_receipt(l: &PalsInputLockV3) -> PalsRunReceiptV3 {
+        let mut r = receipt(l);
+        for game in &mut r.games {
+            for output in &mut game.engines {
+                if l.manifest.engines.iter().any(|e| {
+                    e.id() == output.endpoint_id
+                        && matches!(e, PalsEngineV3::Pals(p)
+                            if p.search.semantic_id == PALS_POST_REPAIR_RECHECK_V3_VERSION)
+                }) {
+                    // Synthetic typed fixture only: actual raw-pair observation
+                    // and source/CLI admission belong to the arena consumer.
+                    output.pals_search_policy =
+                        Some(PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1());
+                }
+            }
+        }
+        r
+    }
+
+    #[test]
+    fn post_repair_policy_enum_has_only_the_exact_explicit_selection() {
+        let policy = PalsPostRepairRecheckPolicyV3::SameRepairedLineOnceV1;
+        let raw = serde_json::to_string(&policy).unwrap();
+        assert_eq!(raw, "\"same-repaired-line-once-v1\"");
+        assert_eq!(
+            decode_json::<PalsPostRepairRecheckPolicyV3>(&raw).unwrap(),
+            policy
+        );
+        for invalid in [
+            "null",
+            "false",
+            "1",
+            "\"disabled\"",
+            "\"same_repaired_line_once_v1\"",
+            "\"same-repaired-line-once-v2\"",
+            "\"SAME-REPAIRED-LINE-ONCE-V1\"",
+        ] {
+            assert!(
+                decode_json::<PalsPostRepairRecheckPolicyV3>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn post_repair_four_field_identity_is_closed_and_checks_the_fixed_digest() {
+        let expected = PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1();
+        expected.validate().unwrap();
+        let raw = serde_json::to_string(&expected).unwrap();
+        assert_eq!(
+            decode_json::<PalsSearchPolicyIdentityV3>(&raw).unwrap(),
+            expected
+        );
+        let wire = serde_json::to_value(&expected).unwrap();
+        assert_eq!(wire.as_object().unwrap().len(), 4);
+        for field in ["version", "policy", "search_identity", "conditions_sha256"] {
+            let mut absent = wire.clone();
+            absent.as_object_mut().unwrap().remove(field);
+            assert!(decode_json::<PalsSearchPolicyIdentityV3>(&absent.to_string()).is_err());
+            let mut null = wire.clone();
+            null[field] = serde_json::Value::Null;
+            assert!(decode_json::<PalsSearchPolicyIdentityV3>(&null.to_string()).is_err());
+        }
+        for field in ["version", "policy", "search_identity", "conditions"] {
+            let mut wrong = expected.clone();
+            match field {
+                "version" => wrong.version = "pals".into(),
+                "policy" => wrong.policy = PALS_POST_REPAIR_RECHECK_V3_OPTION_VALUE.into(),
+                "search_identity" => {
+                    wrong.search_identity = "pals-restricted-refinement/0.1".into()
+                }
+                "conditions" => wrong.conditions_sha256[31] ^= 1,
+                _ => unreachable!(),
+            }
+            assert!(wrong.validate().is_err());
+            assert!(
+                decode_json::<PalsSearchPolicyIdentityV3>(&serde_json::to_string(&wrong).unwrap(),)
+                    .is_err()
+            );
+        }
+        let mut extra = wire.clone();
+        extra["executed"] = false.into();
+        assert!(decode_json::<PalsSearchPolicyIdentityV3>(&extra.to_string()).is_err());
+        for invalid in [true.into(), 256.into(), (-1).into(), "190".into()] {
+            let mut bad_byte = wire.clone();
+            bad_byte["conditions_sha256"][0] = invalid;
+            assert!(decode_json::<PalsSearchPolicyIdentityV3>(&bad_byte.to_string()).is_err());
+        }
+        let mut short = wire;
+        short["conditions_sha256"].as_array_mut().unwrap().pop();
+        assert!(decode_json::<PalsSearchPolicyIdentityV3>(&short.to_string()).is_err());
+    }
+
+    #[test]
+    fn post_repair_identity_and_option_duplicate_bytes_are_rejected() {
+        let raw = serde_json::to_string(
+            &PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1(),
+        )
+        .unwrap();
+        let duplicate = format!(
+            "{{\"version\":\"{}\",{}",
+            PALS_POST_REPAIR_RECHECK_V3_VERSION,
+            &raw[1..],
+        );
+        assert!(decode_json::<PalsSearchPolicyIdentityV3>(&duplicate).is_err());
+        assert!(serde_json::from_str::<PalsSearchPolicyIdentityV3>(&duplicate).is_err());
+        let mut m = manifest();
+        select_post_repair(&mut m, 0);
+        let raw = serde_json::to_string(&m).unwrap();
+        let one = "\"post_repair_recheck\":\"same-repaired-line-once-v1\"";
+        let duplicate = raw.replacen(one, &format!("{one},{one}"), 1);
+        assert_ne!(duplicate, raw);
+        assert!(PalsRunManifestV3::from_json(&duplicate).is_err());
+    }
+
+    #[test]
+    fn post_repair_manifest_requires_exact_option_and_own_cpu_r() {
+        let original = manifest().lock().unwrap();
+        let mut m = manifest();
+        select_post_repair(&mut m, 0);
+        let selected = m.lock().unwrap();
+        assert_ne!(selected.canonical_sha256, original.canonical_sha256);
+        assert_eq!(
+            PalsInputLockV3::from_json(&serde_json::to_string(&selected).unwrap()).unwrap(),
+            selected,
+        );
+        for invalid in [
+            BTreeMap::new(),
+            BTreeMap::from([("post_repair_recheck".into(), "disabled".into())]),
+            BTreeMap::from([(
+                "post_repair_recheck".into(),
+                "same_repaired_line_once_v1".into(),
+            )]),
+            BTreeMap::from([(
+                "Post_Repair_Recheck".into(),
+                "same-repaired-line-once-v1".into(),
+            )]),
+            BTreeMap::from([
+                (
+                    "post_repair_recheck".into(),
+                    "same-repaired-line-once-v1".into(),
+                ),
+                ("beam".into(), "1".into()),
+            ]),
+        ] {
+            let mut bad = m.clone();
+            let PalsEngineV3::Pals(p) = &mut bad.engines[0] else {
+                unreachable!()
+            };
+            p.search.options = invalid;
+            assert!(bad.validate().is_err());
+        }
+        let mut external = m.clone();
+        select_external(&mut external);
+        assert!(external.validate().is_err());
+        let mut unknown = m;
+        let PalsEngineV3::Pals(p) = &mut unknown.engines[0] else {
+            unreachable!()
+        };
+        p.search.semantic_id = "pals-post-repair-recheck/2".into();
+        assert!(unknown.validate().is_err());
+        // Legacy declared search options retain their original generic meaning;
+        // this does not make them supported by the closed executable recipe.
+        let mut legacy = manifest();
+        let PalsEngineV3::Pals(p) = &mut legacy.engines[0] else {
+            unreachable!()
+        };
+        p.search
+            .options
+            .insert("legacy_declared_experiment".into(), "1".into());
+        legacy.validate().unwrap();
+    }
+
+    #[test]
+    fn post_repair_controlled_comparison_changes_only_search() {
+        let mut m = manifest();
+        m.engines[1] = pals("new");
+        m.pilot.white_order = ["pals".into(), "new".into()];
+        m.comparison = PalsComparisonV3::InternalSearch;
+        m.declared_changes = BTreeSet::from([PalsChangeAxisV3::Search]);
+        select_post_repair(&mut m, 1);
+        let lock = m.lock().unwrap();
+        assert_eq!(changes(&m.engines[0], &m.engines[1]), m.declared_changes);
+        assert_eq!(lock.manifest.resources[0], lock.manifest.resources[1]);
+        let (PalsEngineV3::Pals(old), PalsEngineV3::Pals(new)) = (&m.engines[0], &m.engines[1])
+        else {
+            unreachable!()
+        };
+        assert_eq!(old.model, new.model);
+        assert_eq!(old.cpu, new.cpu);
+        assert_eq!(old.runtime, new.runtime);
+        assert_eq!(old.pools, new.pools);
+        let run = policy_receipt(&lock);
+        run.validate_against(&lock).unwrap();
+        assert!(run.games[0].engines[0].pals_search_policy.is_none());
+        assert!(run.games[0].engines[1].pals_search_policy.is_some());
+    }
+
+    #[test]
+    fn selected_core_policy_is_required_even_for_failed_or_unknown_work() {
+        let mut m = manifest();
+        select_post_repair(&mut m, 0);
+        let lock = m.lock().unwrap();
+        assert!(receipt(&lock).validate_against(&lock).is_err());
+        let mut run = policy_receipt(&lock);
+        run.validate_against(&lock).unwrap();
+        run.pair_eligible = false;
+        run.failures.insert(PalsRunFailureV3::Infrastructure);
+        run.games[0].engines[0].search_failed_go_count = None;
+        run.validate_against(&lock).unwrap();
+        run.games[0].engines[0].pals_search_policy = None;
+        assert!(run.validate_against(&lock).is_err());
+        run.games[0].engines[0].pals_search_policy =
+            Some(PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1());
+        run.games[0].engines[0].search_failed_go_count = Some(1);
+        assert!(run.validate_against(&lock).is_err());
+        run.failures.insert(PalsRunFailureV3::SearchFailure);
+        run.validate_against(&lock).unwrap();
+    }
+
+    #[test]
+    fn core_policy_cannot_be_projected_into_legacy_cpu_reference_or_external() {
+        let mut engines = vec![pals("legacy"), manifest().engines[1].clone()];
+        engines.push(PalsEngineV3::ReferenceUci(Box::new(
+            PalsReferenceEndpointV3 {
+                id: "reference".into(),
+                family: "fixture-reference".into(),
+                version: "1".into(),
+                binary: asset("bin/reference"),
+                source_url: "https://example.org/fixture".into(),
+                source_commit: "c".repeat(40),
+                assets: vec![],
+                requested_options: BTreeMap::new(),
+            },
+        )));
+        for engine in engines {
+            let mut output = endpoint_receipt(&engine);
+            receipt_endpoint(&output, &engine, &resource(), false, &BTreeSet::new()).unwrap();
+            output.pals_search_policy =
+                Some(PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1());
+            assert!(
+                receipt_endpoint(&output, &engine, &resource(), false, &BTreeSet::new()).is_err()
+            );
+        }
+        let (external, helper) = external_receipt_fixture();
+        let engine = PalsEngineV3::Pals(Box::new(external));
+        let mut output = endpoint_receipt(&engine);
+        output.external_cpu_r = Some(helper);
+        output.pals_search_policy =
+            Some(PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1());
+        assert!(receipt_endpoint(&output, &engine, &resource(), false, &BTreeSet::new()).is_err());
+    }
+
+    #[test]
+    fn core_policy_wire_rejects_present_null_duplicate_and_bad_identity() {
+        let mut m = manifest();
+        select_post_repair(&mut m, 0);
+        let run = policy_receipt(&m.lock().unwrap());
+        let output = &run.games[0].engines[0];
+        let raw = serde_json::to_string(output).unwrap();
+        assert_eq!(decode_json::<PalsEndpointReceiptV3>(&raw).unwrap(), *output);
+        let mut null = serde_json::to_value(output).unwrap();
+        null["pals_search_policy"] = serde_json::Value::Null;
+        assert!(decode_json::<PalsEndpointReceiptV3>(&null.to_string()).is_err());
+        let identity = serde_json::to_string(output.pals_search_policy.as_ref().unwrap()).unwrap();
+        let duplicate = raw.replacen(
+            "\"pals_search_policy\":",
+            &format!("\"pals_search_policy\":{identity},\"pals_search_policy\":"),
+            1,
+        );
+        assert_ne!(duplicate, raw);
+        assert!(decode_json::<PalsEndpointReceiptV3>(&duplicate).is_err());
+        let mut bad = output.clone();
+        bad.pals_search_policy.as_mut().unwrap().conditions_sha256[0] ^= 1;
+        assert!(
+            decode_json::<PalsEndpointReceiptV3>(&serde_json::to_string(&bad).unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_core_omission_preserves_bytes_and_existing_null_unknowns() {
+        let engine = pals("pals");
+        let output = endpoint_receipt(&engine);
+        let bytes = serde_json::to_vec(&output).unwrap();
+        let wire: serde_json::Value = decode_json(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        assert!(wire.get("pals_search_policy").is_none());
+        let decoded: PalsEndpointReceiptV3 =
+            decode_json(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
+        let mut historical_nulls = wire;
+        historical_nulls["external_cpu_r"] = serde_json::Value::Null;
+        historical_nulls["search_failed_go_count"] = serde_json::Value::Null;
+        let unknown: PalsEndpointReceiptV3 = decode_json(&historical_nulls.to_string()).unwrap();
+        assert!(unknown.external_cpu_r.is_none());
+        assert!(unknown.search_failed_go_count.is_none());
+        assert!(unknown.pals_search_policy.is_none());
+        receipt_endpoint(&unknown, &engine, &resource(), false, &BTreeSet::new()).unwrap();
+        assert!(receipt_endpoint(&unknown, &engine, &resource(), true, &BTreeSet::new()).is_err());
+        historical_nulls["pals_search_policy"] = serde_json::Value::Null;
+        assert!(decode_json::<PalsEndpointReceiptV3>(&historical_nulls.to_string()).is_err());
+    }
+
+    #[test]
+    fn selected_policy_does_not_promote_failed_go_or_rewrite_game_facts() {
+        let mut m = manifest();
+        select_post_repair(&mut m, 0);
+        let lock = m.lock().unwrap();
+        let mut run = policy_receipt(&lock);
+        let original_games = run.games.clone();
+        run.games[0].engines[0].search_failed_go_count = Some(6);
+        assert!(run.validate_against(&lock).is_err());
+        run.pair_eligible = false;
+        run.failures.insert(PalsRunFailureV3::Infrastructure);
+        assert!(run.validate_against(&lock).is_err());
+        run.failures.insert(PalsRunFailureV3::SearchFailure);
+        run.validate_against(&lock).unwrap();
+        for (actual, original) in run.games.iter().zip(original_games) {
+            assert_eq!(actual.pgn, original.pgn);
+            assert_eq!(actual.result, original.result);
+            assert_eq!(actual.termination, original.termination);
+            assert_eq!(
+                actual.engines[0].pals_search_policy,
+                original.engines[0].pals_search_policy
+            );
+        }
+        let bytes = serde_json::to_string(&run).unwrap();
+        assert_eq!(PalsRunReceiptV3::from_json(&bytes, &lock).unwrap(), run);
     }
 
     #[test]
