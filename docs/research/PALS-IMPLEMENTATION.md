@@ -2306,3 +2306,16 @@ Clippy는 resident의 `Source::Hit(DeviceProjectionOffset)`와 `Pending(u16)`의
 미지원 빌드 fixture가 cfg로 제외되므로 기존 단일 CI의 두 OS job에 default-feature CLI
 unit 검사를 추가하여 provider·artifact 로딩 이전 거부를 별도로 실행한다. 후속 SHA의
 Clippy와 이 기본 feature 검사는 다시 인수한다.
+
+`b1715a23eb78a17eda3be0f813d24961a7b63ecf` / run `37751846236`의 model 520 tests와
+bindings는 통과했다. 양 OS의 workspace tests·새 default-feature binary CLI 검사·
+native CLI·Rules release·보조 CPU 검사는 성공했으나 최종 Clippy에서 arena의
+`PalsEndpointLaunchV3` 크기 차이가 추가로 드러나 두 job은 FAILURE다. 앞선 native
+타입 예외는 해당 crate의 Clippy를 통과했고 이 결과를 arena 전체 성공으로 확대하지 않는다.
+
+arena의 새 optional `cuda_record_pages` 설정만 `Option<Box<...>>`로 보관하여 선택하지
+않은 endpoint가 큰 resource DTO를 inline으로 갖지 않도록 한다. native 요청 port와
+다르게 이 값은 시작 때 선택한 설정 하나이며 요청별 allocator·물리 수명을 바꾸지 않는다.
+Box는 JSON에 투명하고 기존 present-value deserializer의 명시적 null 거부·unknown
+거부·None 생략·canonical digest는 유지한다. 기존 wire·launch·audit fixture로 다시
+검사하며 실제 process peak·성능 효과의 계측 증거는 아니다. 원래 실패 로그를 보존한다.

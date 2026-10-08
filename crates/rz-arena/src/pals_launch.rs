@@ -857,12 +857,14 @@ pub struct PalsOnnxCudaLaunchV3 {
     pub startup_probe_timeout_ms: Option<u64>,
     /// Explicit auxiliary packing registration; omission preserves the legacy
     /// two-model-graph recipe. Declaration is never a device Run/fence witness.
+    /// The selected configuration is owned once at launch; unselected endpoints
+    /// do not carry its full resource DTO inline. Box is transparent on the wire.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_present_cuda_record_pages"
     )]
-    pub cuda_record_pages: Option<PalsCudaRecordPagesBindingV1>,
+    pub cuda_record_pages: Option<Box<PalsCudaRecordPagesBindingV1>>,
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum PalsCudaRecordPagesModeV1 {
@@ -882,8 +884,8 @@ pub struct PalsCudaRecordPagesBindingV1 {
 }
 fn deserialize_present_cuda_record_pages<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
-) -> Result<Option<PalsCudaRecordPagesBindingV1>, D::Error> {
-    PalsCudaRecordPagesBindingV1::deserialize(deserializer).map(Some)
+) -> Result<Option<Box<PalsCudaRecordPagesBindingV1>>, D::Error> {
+    Box::<PalsCudaRecordPagesBindingV1>::deserialize(deserializer).map(Some)
 }
 impl PalsCudaRecordPagesBindingV1 {
     fn resources_json(&self) -> Result<String, ArenaError> {
@@ -7097,13 +7099,13 @@ mod tests {
         let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut input.endpoints[0] else {
             unreachable!()
         };
-        cuda.cuda_record_pages = Some(PalsCudaRecordPagesBindingV1 {
+        cuda.cuda_record_pages = Some(Box::new(PalsCudaRecordPagesBindingV1 {
             mode: PalsCudaRecordPagesModeV1::RegisteredPackingV1,
             implementation_sha256: "e".repeat(64),
             manifest,
             graph,
             resources,
-        });
+        }));
         input
     }
     fn cuda_record_page_wire_fixture(
