@@ -59,6 +59,10 @@ name = "pals_model_check"
 required-features = ["onnx", "contracts"]
 
 [[example]]
+name = "device_packing_graph_check"
+required-features = ["onnx", "contracts"]
+
+[[example]]
 name = "ort_export"
 required-features = ["experimental-ort-model"]
 

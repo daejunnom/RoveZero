@@ -2104,3 +2104,27 @@ repinned foreign body·연결·finite gate·control·type·shape·unknown/statef
 Rust는 의미가 같은 packed/unpacked/zero 생략 wire를 허용하므로 Python deterministic
 export의 byte equality와 구분한다. `native_verification=NotPerformed`는 유지하며
 session interface·provider·실제 finite 출력·Run/fence·resident bank를 인수하지 않는다.
+
+후속 [CI 37739736920](https://github.com/daejunnom/RoveZero/actions/runs/37739736920)는
+`f6da7970e71edce41efebb7b43a354cb8ad6a14a`의 Linux·Windows·CPU bindings·model CPU
+네 job이 모두 성공했다. model suite 426개에는 선택적 empty 관측 수정과 공개 whole
+11개가 포함되며, 고정 graphbody의 synthetic Rust 검사 12개도 두 OS에서 통과했다.
+이 결과를 아직 연결하지 않은 resident CUDA owner나 실제 Python artifact의 Rust
+interop 성공으로 소급하지 않는다. 이번 사용자가 GPU 검증을 보류했으므로 실제
+장치 수치·Run·물리 완료·메모리·대국 검사는 미실행으로 유지한다.
+
+### Python packing 산출물과 Rust 검사기의 정적 연결
+
+`device_packing_graph_check` 예제는 `onnx,contracts` feature에서만 빌드한다.
+절대 manifest/graph 경로와 독립 SHA-256 두 개를 받아 512 KiB/2 MiB의 고정
+입수 상한, regular file·link/reparse·전후 metadata·실제 byte hash를 검사한다.
+immutable admission 뒤 원래 읽기 Vec 두 개를 해제하고 고정 body 검사기에 소유권을
+넘긴다. report의 session/metadata 각 1-byte 값은 정적 선언 sentinel이며 실제 native
+할당·provider·수치·Run·fence·VRAM·등록 출처 인증을 만들지 않는다. path 검사는
+일반적인 hostile filesystem의 inode 인증이나 전체 구간의 원자적 path 인증이 아니다.
+
+기존 bounded CPU validation은 독립 Python producer가 만든 실제 artifact를 이 Rust
+예제에 전달한다. 모델 수치 검사와 구분한 stage·source/asset pin·exit status를 남기고
+기존 managed output·time/cleanup 정책을 유지한다. 두 독립 소스 리뷰와 Rust 파일
+서식을 마쳤으며, 실제 interoperability·CLI fixture·양 OS compile은 새 commit의
+CPU CI로 별도 인수한다. 이 연결은 ORT Session을 만들거나 GPU를 실행하지 않는다.

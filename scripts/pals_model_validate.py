@@ -109,7 +109,12 @@ def main():
             ["git", "diff", "--quiet", "--no-ext-diff"], cwd=source, check=False).returncode != 0
         receipt["source_commit_method"] = "local_git"
     package = source / "experiments/model-research/pals"
-    source_files = [Path(__file__).resolve(), source / "crates/rz-eval/src/pals_model.rs"]
+    source_files = [Path(__file__).resolve(), source / "crates/rz-eval/src/pals_model.rs",
+                    source / "crates/rz-eval/Cargo.toml",
+                    source / "crates/rz-eval/examples/device_packing_graph_check.rs",
+                    source / "crates/rz-eval/src/pals_onnx/device_packing_admission.rs",
+                    source / "crates/rz-eval/src/pals_onnx/device_packing_graph.rs",
+                    source / "crates/rz-eval/src/pals_onnx.rs"]
     source_files.extend(sorted((package / "src/rz_pals_model").glob("*.py")))
     source_files.extend(sorted((package / "tests").glob("*.py")))
     receipt["source_files"] = {str(p.relative_to(source)).replace("\\", "/"):
@@ -138,6 +143,41 @@ def main():
             stages["model_tests_seconds"] = run([
                 str(python), "-m", "unittest", "discover", "-s", str(package / "tests"), "-v"],
                 cwd=source, environment=environment)
+            # This separate static gate consumes the actual deterministic Python
+            # artifact in Rust. It creates no ORT Session, provider or Run.
+            packing = output / "device-packing"
+            stages["device_packing_export_seconds"] = run([
+                str(python), "-c",
+                "from rz_pals_model.device_packing_artifacts import export_device_packing_artifact\n"
+                "import sys\nexport_device_packing_artifact(sys.argv[1])\n",
+                str(packing)], cwd=source, environment=environment)
+            packing_files = {
+                name: packing / name
+                for name in ("device-packing.json", "device_public_pack.onnx")}
+            packing_pins = {}
+            for name, asset_path in packing_files.items():
+                # Producer already applies its fixed file bounds; this consumer
+                # independently checks the actual files before hashing them.
+                cap = 512 * 1024 if name.endswith(".json") else 2 * 1024 * 1024
+                size = asset_path.stat().st_size
+                if asset_path.is_symlink() or not asset_path.is_file() or not 1 <= size <= cap:
+                    raise OSError("generated packing artifact violates static file bounds")
+                with asset_path.open("rb") as handle:
+                    sha = hashlib.file_digest(handle, "sha256").hexdigest()
+                packing_pins[name] = {"bytes": size, "sha256": sha}
+            stages["device_packing_rust_body_seconds"] = run([
+                "cargo", "run", "--locked", "-p", "rz-eval", "--features", "onnx,contracts",
+                "--example", "device_packing_graph_check", "--quiet", "--",
+                str(packing_files["device-packing.json"]),
+                str(packing_files["device_public_pack.onnx"]),
+                packing_pins["device-packing.json"]["sha256"],
+                packing_pins["device_public_pack.onnx"]["sha256"]],
+                cwd=source, environment=environment, seconds=300)
+            receipt["device_packing_static_interop"] = {
+                "assets": packing_pins, "scope": "python_artifact_rust_fixed_body_check_only",
+                "rust_body_exit_status": 0, "native_validation": "not_performed",
+                "provider_run_fence_authority": False,
+                "registration_authenticity_authority": False}
             cli = [str(python), "-m", "rz_pals_model.cli"]
             initialization = output / "initialization"
             export = output / "export-pc"
