@@ -11,7 +11,10 @@
 //! freshness. Constructor allocation and Rules reconstruction precede `run`;
 //! its elapsed time therefore is not whole invocation cost. This module grants
 //! no native causality/physical closure, strategic refutation, utility, target,
-//! training, Repair, or whole-line authority.
+//! training, successful strategic Repair, or whole-line authority. The optional
+//! Repair tail records an actual accepted model continuation and a separate fresh
+//! unrestricted endpoint check; it issues no supported-repair conclusion and
+//! does not enter the native post-Repair recheck phase.
 
 use super::*;
 use crate::cpu::{CpuCompletion, CpuConfig, CpuOrderingPolicy, CpuProfile};
@@ -19,6 +22,7 @@ use rz_position::{HistoryCompleteness, HistoryOrigin};
 use std::fmt::Write;
 
 pub const FRESH_REPLAY_SCOPE: &str = "rz-pals-frozen-parent-defend-response-replay/1";
+pub const FRESH_REPLAY_REPAIR_SCOPE: &str = "rz-pals-frozen-parent-repair-endpoint-replay/1";
 const MAX_REPLAY_HISTORY_PLIES: usize = 4096;
 const MAX_REPLAY_CONDITION_BYTES: usize = 4096;
 
@@ -63,12 +67,14 @@ pub struct DefendResponseReplayPlan {
 pub enum ReplayCpuPhase {
     Baseline,
     After,
+    RepairEndpoint,
 }
 impl ReplayCpuPhase {
     fn label(self) -> &'static str {
         match self {
             Self::Baseline => "baseline",
             Self::After => "after",
+            Self::RepairEndpoint => "repair-endpoint",
         }
     }
 }
@@ -143,6 +149,36 @@ pub enum ReplayOutcome {
     },
 }
 
+/// Search-local factual outcomes only. A completed endpoint is an unrestricted
+/// side-to-move CPU observation, not a repaired-line/root value, successful
+/// strategic repair, conditional refutation or native/utility authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplayRepairOutcome {
+    ReplyNotApplied(ReplayOutcome),
+    /// No actual Repair output was accepted (for example, a terminal response
+    /// or an already full prefix). No Repair record or endpoint claim is made.
+    NoAcceptedRepair,
+    PartialRepairEndpoint {
+        execution: ExecutionId,
+        observation: Option<ObservationId>,
+    },
+    CompletedRepairEndpoint {
+        repaired_line: LineId,
+        repair_record_revision: u64,
+        endpoint_state: StateId,
+        endpoint_situation: SituationId,
+        execution: ExecutionId,
+        observation: ObservationId,
+    },
+    RulesTerminalRepairEndpoint {
+        repaired_line: LineId,
+        repair_record_revision: u64,
+        endpoint_state: StateId,
+        endpoint_situation: SituationId,
+        reason: TerminalReason,
+    },
+}
+
 #[derive(Debug)]
 pub enum ReplayError {
     InvalidPlan(&'static str),
@@ -204,6 +240,12 @@ pub struct FreshReplayOwner<M: RoleModel> {
     reply_prepared_context: Option<RoleLogicalContext>,
     reply_accepted_context: Option<RoleLogicalContext>,
     publication_revision: Option<u64>,
+    model_counterline: Vec<BoardMove>,
+    repaired_line: Vec<BoardMove>,
+    repair_record_revision: Option<u64>,
+    repair_line_id: Option<LineId>,
+    repair_endpoint_node: Option<usize>,
+    repair_endpoint_snapshot: Option<PositionSnapshot>,
 }
 
 struct StageRequest<'a> {
@@ -362,6 +404,13 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             reply_prepared_context: None,
             reply_accepted_context: None,
             publication_revision: None,
+            // The legacy Reply-only lane has no additional heap reservation.
+            model_counterline: Vec::new(),
+            repaired_line: Vec::new(),
+            repair_record_revision: None,
+            repair_line_id: None,
+            repair_endpoint_node: None,
+            repair_endpoint_snapshot: None,
         })
     }
 
@@ -416,6 +465,33 @@ impl<M: RoleModel> FreshReplayOwner<M> {
     pub fn publication_revision(&self) -> Option<u64> {
         self.publication_revision
     }
+    /// Actual model-generated continuation from the selected Reply response.
+    /// It does not claim that the restricted CPU discovered this full line.
+    pub fn model_counterline(&self) -> &[BoardMove] {
+        &self.model_counterline
+    }
+    /// Actual accepted/partial model Repair prefix, including retained failure
+    /// work. Presence alone is not a Repair acceptance or endpoint completion.
+    pub fn repaired_line(&self) -> &[BoardMove] {
+        &self.repaired_line
+    }
+    pub fn repair_record_revision(&self) -> Option<u64> {
+        self.repair_record_revision
+    }
+    pub fn repair_line_id(&self) -> Option<LineId> {
+        self.repair_line_id
+    }
+    /// Reuses the parent's actual store provenance validator. An unobserved or
+    /// invalid endpoint stays explicit; this getter cannot mint completion.
+    pub fn repair_endpoint(&self) -> Option<RecheckEndpoint<'_>> {
+        let node = self.engine.nodes.get(self.repair_endpoint_node?)?;
+        let snapshot = self.repair_endpoint_snapshot.as_ref()?;
+        Some(PalsEngine::<M>::recheck_endpoint(
+            node,
+            &self.engine.stores,
+            snapshot,
+        ))
+    }
     pub fn task(&self, execution: ExecutionId) -> Result<&TaskRecord, StoreError> {
         self.engine.stores.tasks.get(execution)
     }
@@ -446,13 +522,39 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         limits: PalsLimits,
         cancel: &AtomicBool,
     ) -> Result<ReplayOutcome, ReplayError> {
+        self.run_once(limits, cancel, |owner, counters| {
+            owner.run_inner(limits, cancel, counters)
+        })
+    }
+
+    /// Opt-in 3N lane. The old two-check Reply result is not reinterpreted: only
+    /// an accepted Reply can enter a new model continuation/Repair tail. No
+    /// recheck callbacks, supported-repair publication or value propagation run.
+    pub fn run_with_repair(
+        &mut self,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+    ) -> Result<ReplayRepairOutcome, ReplayError> {
+        self.run_once(limits, cancel, |owner, counters| {
+            owner.prepare_repair(limits, cancel)?;
+            let reply = owner.run_inner(limits, cancel, counters)?;
+            owner.repair_tail(reply, limits, cancel, counters)
+        })
+    }
+
+    fn run_once<T>(
+        &mut self,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        operation: impl FnOnce(&mut Self, &mut PalsCounters) -> Result<T, ReplayError>,
+    ) -> Result<T, ReplayError> {
         if self.used {
             return Err(ReplayError::AlreadyUsed);
         }
         self.used = true;
         let started = Instant::now();
         let mut counters = PalsCounters::default();
-        let mut result = self.run_inner(limits, cancel, &mut counters);
+        let mut result = operation(self, &mut counters);
         counters.retained_situations = self.engine.nodes.len();
         self.counters = counters;
         self.engine.last_search_counters = Some(counters);
@@ -694,6 +796,619 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             after_observation: candidate.observation,
             publication_revision: self.engine.revision,
         })
+    }
+
+    fn prepare_repair(
+        &mut self,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+    ) -> Result<(), ReplayError> {
+        let total = self
+            .plan
+            .nodes_per_check
+            .checked_mul(3)
+            .ok_or(ReplayError::InvalidPlan("3N overflow"))?;
+        let extent = self.engine.config.line_plies;
+        let tail = extent
+            .checked_sub(self.plan.prefix.len())
+            .and_then(|remaining| remaining.checked_sub(1))
+            .ok_or(ReplayError::InvalidPlan("Repair response extent"))?;
+        // Proposal has at most L calls, initial Reply one, and the two tails
+        // each at most L-P-1. Terminal/short paths consume fewer, never more.
+        let role_calls = extent
+            .checked_add(1)
+            .and_then(|calls| {
+                tail.checked_mul(2)
+                    .and_then(|extra| calls.checked_add(extra))
+            })
+            .and_then(|calls| u64::try_from(calls).ok())
+            .ok_or(ReplayError::InvalidPlan("Repair role bound overflow"))?;
+        // Root+Proposal, bounded CPU candidate, selected response and two tails.
+        // Existing store reservations are constructor-owned; these are finite
+        // upper-bound declarations, not observations of actual allocation peak.
+        let nodes = extent
+            .checked_mul(4)
+            .and_then(|count| {
+                self.plan
+                    .prefix
+                    .len()
+                    .checked_mul(3)
+                    .and_then(|shared| count.checked_sub(shared))
+            })
+            .ok_or(ReplayError::InvalidPlan("Repair node bound overflow"))?;
+        let observations = nodes.checked_add(6).ok_or(PalsError::Capacity)?;
+        let line_chunks = nodes
+            .checked_mul(extent.checked_add(1).ok_or(PalsError::Capacity)?)
+            .and_then(|count| {
+                extent
+                    .checked_mul(5)
+                    .and_then(|extra| count.checked_add(extra))
+            })
+            .ok_or(PalsError::Capacity)?;
+        let reserved = PalsEngine::<M>::store_limits(&self.engine.config);
+        if limits.max_rounds == 0
+            || limits.cpu_depth != self.plan.requested_depth
+            || limits.max_cpu_nodes < total
+            || self.engine.config.cpu_nodes_per_task != self.plan.nodes_per_check
+            || self.engine.config.max_role_calls < role_calls
+            || self.engine.config.max_records < 4
+            || self.engine.config.max_nodes < nodes
+            || reserved.observations < observations
+            || reserved.line_chunks < line_chunks
+            || reserved.executions < 3
+            || reserved.consumers < 3
+            || !self.stages.is_empty()
+        {
+            return Err(ReplayError::InvalidPlan(
+                "limits do not support fixed H1/3N and Repair reservations",
+            ));
+        }
+        self.check_control(limits, cancel)?;
+        self.stages
+            .try_reserve_exact(3)
+            .map_err(|_| PalsError::Capacity)?;
+        self.model_counterline = bounded_moves(&[], extent)?;
+        self.repaired_line = bounded_moves(&[], extent)?;
+        self.check_control(limits, cancel)
+    }
+
+    fn repair_tail(
+        &mut self,
+        reply: ReplayOutcome,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        counters: &mut PalsCounters,
+    ) -> Result<ReplayRepairOutcome, ReplayError> {
+        let ReplayOutcome::ReplyAccepted {
+            selected_response, ..
+        } = reply
+        else {
+            return Ok(ReplayRepairOutcome::ReplyNotApplied(reply));
+        };
+        self.check_control(limits, cancel)?;
+        let context = self
+            .reply_accepted_context
+            .as_ref()
+            .ok_or(StoreError::InvalidEvidence(
+                "Repair lacks actual accepted Reply context",
+            ))?;
+        let root_situation = self.engine.stores.root().ok_or(StoreError::StaleConsumer)?;
+        let root = self
+            .engine
+            .nodes
+            .iter()
+            .position(|node| node.situation == root_situation)
+            .ok_or(StoreError::StaleConsumer)?;
+        let target = self
+            .engine
+            .nodes
+            .iter()
+            .position(|node| node.situation == context.situation)
+            .ok_or(StoreError::StaleConsumer)?;
+        if context.purpose != RoleQueryPurpose::ReplyPolicy
+            || context.search_generation != self.engine.stores.generation()
+            || Some(context.game_generation) != self.engine.game_generation
+            || context.public_revision != self.engine.revision
+            || !self.engine.nodes[root]
+                .position
+                .snapshot()
+                .same_state(&self.root.snapshot())
+            || !self.engine.nodes[target]
+                .position
+                .snapshot()
+                .same_state(&self.target)
+        {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        let response = self.engine.nodes[target]
+            .edges
+            .iter()
+            .find(|edge| edge.movement == selected_response)
+            .ok_or(StoreError::InvalidEvidence(
+                "Repair lacks actual selected Reply edge",
+            ))?
+            .child;
+        let mut counterline = std::mem::take(&mut self.model_counterline);
+        counterline.extend_from_slice(&self.reply_line);
+        // Always generate from the actual response's Rules state. In particular,
+        // an H1 PV whose first move differs is never spliced into this branch.
+        let followed = self.engine.follow(
+            response,
+            &mut counterline,
+            &self.proposal,
+            Some(&self.candidate_line),
+            Call::Reply,
+            limits,
+            cancel,
+            counters,
+        );
+        self.model_counterline = counterline;
+        followed?;
+        self.check_control(limits, cancel)?;
+        counters.refutations += 1;
+        // This full line is model-generated. The initial H1 observation remains
+        // on its own initial Counterexample and accepted Reply context only.
+        self.engine.record(
+            RecordKind::Counterexample,
+            &self.model_counterline,
+            None,
+            0,
+            None,
+            None,
+        )?;
+        self.check_control(limits, cancel)?;
+        let accepted_before = counters.accepted_repair_outputs;
+        let mut repaired = std::mem::take(&mut self.repaired_line);
+        repaired.extend_from_slice(&self.reply_line);
+        let followed = self.engine.follow(
+            response,
+            &mut repaired,
+            &self.proposal,
+            Some(&self.model_counterline),
+            Call::Repair,
+            limits,
+            cancel,
+            counters,
+        );
+        self.repaired_line = repaired;
+        let endpoint = followed?;
+        self.check_control(limits, cancel)?;
+        if counters.accepted_repair_outputs == accepted_before {
+            return Ok(ReplayRepairOutcome::NoAcceptedRepair);
+        }
+        // Re-run the actual complete ordered line with Rules, independently of
+        // the path's node index. No history is manufactured from FEN or digests.
+        let mut checked = self.root.clone();
+        for &movement in &self.repaired_line {
+            self.check_control(limits, cancel)?;
+            if !matches!(
+                checked.classify_position()?.play_status,
+                PlayStatus::Ongoing
+            ) {
+                return Err(
+                    StoreError::InvalidEvidence("Repair continues after Rules terminal").into(),
+                );
+            }
+            checked.make_move(movement)?;
+        }
+        let snapshot = checked.snapshot();
+        if !self.engine.nodes[endpoint]
+            .position
+            .snapshot()
+            .same_state(&snapshot)
+            || self.engine.nodes[endpoint].position.legal_moves() != checked.legal_moves()
+            || !self
+                .engine
+                .stores
+                .states
+                .get(self.engine.nodes[endpoint].state)?
+                .same_state(&snapshot)
+        {
+            return Err(
+                StoreError::InvalidEvidence("Repair endpoint full Rules history/order").into(),
+            );
+        }
+        self.check_control(limits, cancel)?;
+        let (line_id, _) = self
+            .engine
+            .record(RecordKind::Repair, &self.repaired_line, None, 0, None, None)?
+            .ok_or(StoreError::InvalidEvidence(
+                "accepted Repair model publication absent",
+            ))?;
+        counters.repairs += 1;
+        self.repair_line_id = Some(line_id);
+        self.repair_record_revision = Some(self.engine.revision);
+        self.repair_endpoint_node = Some(endpoint);
+        self.repair_endpoint_snapshot = Some(snapshot);
+        self.check_control(limits, cancel)?;
+        let state = self.engine.nodes[endpoint].state;
+        let situation = self.engine.nodes[endpoint].situation;
+        if let Some((reason, _)) = self.engine.nodes[endpoint].terminal {
+            let facts = self.repair_endpoint().ok_or(StoreError::InvalidEvidence(
+                "Repair terminal snapshot absent",
+            ))?;
+            if !matches!(facts.evidence, RecheckEndpointEvidence::RulesTerminal { reason: actual, .. } if actual == reason)
+            {
+                return Err(StoreError::InvalidEvidence("Repair terminal Rules provenance").into());
+            }
+            self.check_control(limits, cancel)?;
+            return Ok(ReplayRepairOutcome::RulesTerminalRepairEndpoint {
+                repaired_line: line_id,
+                repair_record_revision: self.engine.revision,
+                endpoint_state: state,
+                endpoint_situation: situation,
+                reason,
+            });
+        }
+        // Independent third TT/checker with exactly the same registered H1
+        // capability. No prior report/token/cache is passed to its constructor.
+        let fresh = OwnedCpuChecker::new(CpuEngine::new(self.plan.cpu.clone())?)?;
+        self.engine.cpu = Box::new(fresh);
+        self.engine.start_checker(limits.deadline, cancel)?;
+        self.check_control(limits, cancel)?;
+        let completed = self.repair_endpoint_stage(
+            StageRequest {
+                root,
+                target: endpoint,
+                phase: ReplayCpuPhase::RepairEndpoint,
+                depth: self.plan.requested_depth,
+                limits,
+                cancel,
+            },
+            counters,
+        )?;
+        self.check_control(limits, cancel)?;
+        let stage = self.stages.last().ok_or(PalsError::Capacity)?;
+        let Some(observation) = completed else {
+            return Ok(ReplayRepairOutcome::PartialRepairEndpoint {
+                execution: stage.execution,
+                observation: stage.observation,
+            });
+        };
+        let execution = stage.execution;
+        let facts = self.repair_endpoint().ok_or(StoreError::InvalidEvidence(
+            "Repair endpoint snapshot absent",
+        ))?;
+        match facts.evidence {
+            RecheckEndpointEvidence::OwnCpu {
+                observation_id,
+                execution_id,
+                task,
+                admitted_scope,
+                ..
+            } if observation_id == observation
+                && execution_id == execution
+                && task.status == TaskStatus::Completed(observation)
+                && admitted_scope == CpuScoreScope::CompletedIteration
+                && stage.exact_completed => {}
+            RecheckEndpointEvidence::InvalidProvenance { error } => return Err(error.into()),
+            _ => {
+                return Err(StoreError::InvalidEvidence(
+                    "Repair completed endpoint provenance absent",
+                )
+                .into());
+            }
+        }
+        self.check_control(limits, cancel)?;
+        Ok(ReplayRepairOutcome::CompletedRepairEndpoint {
+            repaired_line: line_id,
+            repair_record_revision: self.engine.revision,
+            endpoint_state: state,
+            endpoint_situation: situation,
+            execution,
+            observation,
+        })
+    }
+
+    /// A separate unrestricted endpoint namespace. The two legacy restricted
+    /// stage helpers below are deliberately unchanged and cannot mint this fact.
+    fn repair_endpoint_stage(
+        &mut self,
+        request: StageRequest<'_>,
+        counters: &mut PalsCounters,
+    ) -> Result<Option<ObservationId>, ReplayError> {
+        let StageRequest {
+            root,
+            target,
+            phase,
+            depth,
+            limits,
+            cancel,
+        } = request;
+        self.check_control(limits, cancel)?;
+        self.engine.validate_checker_namespace()?;
+        if phase != ReplayCpuPhase::RepairEndpoint
+            || depth != self.plan.requested_depth
+            || self.engine.nodes[target].terminal.is_some()
+            || self.engine.nodes[target].evidence.is_some()
+            || self.engine.cpu.last_attempt().is_some()
+            || self.engine.cpu_condition() != self.engine.cpu_registered_condition
+            || self.engine.cpu.identity() != &self.engine.checker_registered_identity
+            || self.stages.len() != 2
+            || self.stages.capacity() < 3
+        {
+            return Err(ReplayError::InvalidPlan(
+                "endpoint is not a fresh unrestricted third stage",
+            ));
+        }
+        let descriptor = self.engine.owned_descriptor()?;
+        let value_identity = self.engine.owned_identity()?.clone();
+        let registered_condition = self.engine.cpu_condition();
+        let mut task_condition = String::new();
+        task_condition
+            .try_reserve_exact(MAX_REPLAY_CONDITION_BYTES)
+            .map_err(|_| PalsError::Capacity)?;
+        write!(&mut task_condition,
+            "{};replay={};phase=repair-endpoint;question=AnalyzePosition;input-revision=0;root-moves=empty",
+            registered_condition, FRESH_REPLAY_REPAIR_SCOPE,
+        ).map_err(|_| PalsError::Capacity)?;
+        if task_condition.len() > MAX_REPLAY_CONDITION_BYTES {
+            return Err(PalsError::Capacity.into());
+        }
+        let profile = stable_id(descriptor.config.profile.identity());
+        let condition = stable_id(&task_condition);
+        let generation = self.engine.stores.generation();
+        let active_root = self.engine.stores.root().ok_or(StoreError::StaleConsumer)?;
+        let root_revision = self.engine.stores.situations.get(active_root)?.revision;
+        self.engine.consumer_id = self
+            .engine
+            .consumer_id
+            .checked_add(1)
+            .ok_or(PalsError::Capacity)?;
+        let consumer = TaskConsumer {
+            id: self.engine.consumer_id,
+            situation: self.engine.nodes[target].situation,
+            revision: self
+                .engine
+                .stores
+                .situations
+                .get(self.engine.nodes[target].situation)?
+                .revision,
+            generation,
+            deadline_tick: self.engine.tick_at(limits.deadline),
+        };
+        let admission = self.engine.stores.request_task(
+            TaskKey {
+                state: self.engine.nodes[target].state,
+                line: None,
+                question: TaskQuestion::AnalyzePosition,
+                root_moves: Vec::new(),
+                model: 0,
+                epoch: 0,
+                value_identity: Some(value_identity),
+                checker_identity: None,
+                cpu_condition: Some(task_condition.clone()),
+                profile,
+                condition,
+                input_revision: 0,
+                requested_depth: depth,
+                node_budget: self.plan.nodes_per_check,
+            },
+            consumer,
+            self.engine.tick_at(Instant::now()),
+        )?;
+        let TaskAdmission::Start(execution) = admission else {
+            return Err(StoreError::InvalidConditions(
+                "fresh endpoint requires Start, never reuse/join/resume",
+            )
+            .into());
+        };
+        let index = self.stages.len();
+        self.stages.push(ReplayStageReport {
+            phase,
+            requested_depth: depth,
+            node_budget: self.plan.nodes_per_check,
+            execution,
+            task_condition,
+            registered_condition,
+            report: None,
+            attempt: None,
+            observation: None,
+            exact_completed: false,
+            cleanup_error: None,
+        });
+        let result = self.repair_endpoint_started(
+            StartedStage {
+                index,
+                root,
+                target,
+                consumer,
+                active_root,
+                root_revision,
+                limits,
+                cancel,
+            },
+            counters,
+        );
+        if result.is_err()
+            && let Err(error) = self.engine.stores.tasks.fail(execution)
+        {
+            self.stages[index].cleanup_error = Some(Box::new(error));
+        }
+        result
+    }
+
+    fn repair_endpoint_started(
+        &mut self,
+        context: StartedStage<'_>,
+        counters: &mut PalsCounters,
+    ) -> Result<Option<ObservationId>, ReplayError> {
+        let StartedStage {
+            index,
+            root,
+            target,
+            consumer,
+            active_root,
+            root_revision,
+            limits,
+            cancel,
+        } = context;
+        self.check_control(limits, cancel)?;
+        let cpu_limits = CpuLimits {
+            max_depth: self.plan.requested_depth,
+            max_nodes: self.plan.nodes_per_check,
+            deadline: Some(limits.deadline),
+        };
+        self.engine.cpu.preflight_task(cpu_limits)?;
+        self.check_control(limits, cancel)?;
+        counters.cpu_tasks_requested += 1;
+        let result =
+            self.engine
+                .cpu
+                .analyze(&self.engine.nodes[target].position, cpu_limits, cancel);
+        self.stages[index].attempt = self.engine.cpu.last_attempt().cloned();
+        let report = match result {
+            Ok(report) => match PalsEngine::<M>::own_report(report) {
+                Ok(report) => report,
+                Err(error) => {
+                    self.engine
+                        .observe_cpu_failure(counters, cpu_limits.max_nodes);
+                    return Err(error.into());
+                }
+            },
+            Err(error) => {
+                if matches!(error, CheckerError::OwnedReportRejected { .. }) {
+                    counters.cpu_tasks += 1;
+                }
+                self.engine
+                    .observe_cpu_failure(counters, cpu_limits.max_nodes);
+                return Err(error.into());
+            }
+        };
+        self.stages[index].report = Some(report);
+        let stage = &self.stages[index];
+        let report = stage.report.as_ref().ok_or(PalsError::Capacity)?;
+        let validation = self.engine.validate_cpu_report(
+            &self.engine.nodes[target].position,
+            report,
+            self.engine.owned_identity()?,
+            &stage.registered_condition,
+            false,
+            cpu_limits,
+        );
+        if validation.is_ok() {
+            counters
+                .cpu_nodes
+                .checked_add(report.nodes)
+                .ok_or(PalsError::Capacity)?;
+            counters
+                .cpu_quiescence_nodes
+                .checked_add(report.quiescence_nodes)
+                .ok_or(PalsError::Capacity)?;
+            counters
+                .cpu_tt_hits
+                .checked_add(report.tt_hits)
+                .ok_or(PalsError::Capacity)?;
+        }
+        let exact = validation.is_ok() && exact_coverage(report, cpu_limits.max_depth);
+        PalsEngine::<M>::observe_cpu_report(
+            counters,
+            report,
+            cpu_limits.max_depth,
+            validation.is_ok(),
+        );
+        if validation.is_ok()
+            && !exact
+            && report.score_scope == CpuScoreScope::CompletedIteration
+            && report.completed_depth >= cpu_limits.max_depth
+        {
+            counters.completed_cpu_tasks -= 1;
+        }
+        validation?;
+        let observation = self.engine.stores.append_observation(Observation {
+            state: self.engine.nodes[target].state,
+            line: None,
+            source: stable_id(report.score_provenance),
+            epoch: 0,
+            scope: EvidenceScope::DepthLimited {
+                depth: report.completed_depth,
+                profile: stable_id(self.plan.cpu.profile.identity()),
+                condition: stable_id(&stage.task_condition),
+            },
+            value_identity: Some(report.value_identity.clone()),
+            checker_identity: None,
+            checker_work: None,
+            external_report: None,
+            model_value_identity: None,
+            model_value_input: None,
+            cpu_condition: Some(stage.task_condition.clone()),
+            cpu_pv: None,
+            score: if report.score_scope == CpuScoreScope::FrontierOnly {
+                RawScore::Estimate {
+                    value: report.score as f32,
+                    perspective: self.engine.nodes[target].position.side_to_move(),
+                }
+            } else {
+                RawScore::Cpu {
+                    value: report.score,
+                    perspective: self.engine.nodes[target].position.side_to_move(),
+                    bound: BoundKind::ExactWithinSearch,
+                }
+            },
+            budget: report.nodes,
+            kind: ObservationKind::CpuAnalysis,
+            supersedes: None,
+            execution: Some(stage.execution),
+        })?;
+        self.stages[index].observation = Some(observation);
+        self.stages[index].exact_completed = exact;
+        if !exact {
+            self.engine
+                .stores
+                .tasks
+                .fail(self.stages[index].execution)?;
+            self.check_control(limits, cancel)?;
+            return Ok(None);
+        }
+        self.engine
+            .stores
+            .complete_task(self.stages[index].execution, observation)?;
+        self.check_control(limits, cancel)?;
+        self.engine.stores.consume_task(
+            self.stages[index].execution,
+            consumer.id,
+            self.engine.tick_at(Instant::now()),
+        )?;
+        self.check_control(limits, cancel)?;
+        counters.consumed_cpu_tasks += 1;
+        self.engine
+            .stores
+            .dependencies
+            .add(observation, self.engine.nodes[target].situation)?;
+        self.engine
+            .stores
+            .dependencies
+            .add(observation, self.engine.nodes[root].situation)?;
+        if self.engine.stores.generation() != consumer.generation
+            || self.engine.stores.root() != Some(active_root)
+            || self.engine.stores.situations.get(active_root)?.revision != root_revision
+            || self
+                .repair_endpoint_snapshot
+                .as_ref()
+                .is_none_or(|snapshot| {
+                    !self.engine.nodes[target]
+                        .position
+                        .snapshot()
+                        .same_state(snapshot)
+                })
+        {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        self.check_control(limits, cancel)?;
+        let report = self.stages[index]
+            .report
+            .as_ref()
+            .ok_or(PalsError::Capacity)?;
+        // Only this completed unrestricted actual observation enters endpoint
+        // evidence. Both restricted root observations remain sources only.
+        self.engine.nodes[target].evidence = Some(CpuEvidence {
+            score: report.score,
+            depth: report.completed_depth,
+            scope: report.score_scope,
+            value_identity: report.value_identity.clone(),
+            provenance: Some((observation, self.stages[index].execution)),
+        });
+        Ok(Some(observation))
     }
 
     fn stage(
@@ -1498,5 +2213,638 @@ mod tests {
         );
         assert_eq!(counters.cpu_tasks_requested, before);
         assert_eq!(owner.stages.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+    use crate::pals::store::TaskStatus;
+
+    /// Synthetic RoleModel source fixture only. It does not attest native NN
+    /// submission, Query admission, physical cleanup or whole invocation cost.
+    struct RepairRoles {
+        proposal: Vec<BoardMove>,
+        response: BoardMove,
+        counter_suffix: BoardMove,
+        repair_suffix: BoardMove,
+        accepted: usize,
+        cancel_on_accept: Option<usize>,
+        reject_repair_acceptance: bool,
+        fail_repair: bool,
+        repair_physical_unknown: bool,
+        initial_cpu_source: Option<ObservationId>,
+        saw_model_counterline: bool,
+        finish_calls: usize,
+        closure: Option<RoleSearchClosure>,
+    }
+    impl RepairRoles {
+        fn evaluate(
+            query: &RoleQuery<'_>,
+            selected: BoardMove,
+        ) -> Result<RoleEvaluation, RoleError> {
+            let index = query
+                .legal
+                .iter()
+                .position(|movement| *movement == selected)
+                .ok_or(RoleError::InvalidOutput)?;
+            let mut logits = vec![0.0; query.legal.len()];
+            logits[index] = 1.0;
+            Ok(RoleEvaluation {
+                logits,
+                wdl: [0.25, 0.5, 0.25],
+            })
+        }
+    }
+    impl RoleModel for RepairRoles {
+        fn identity(&self) -> &str {
+            "synthetic-replay-repair-model/1"
+        }
+        fn propose(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+            let movement = *self
+                .proposal
+                .get(query.prefix.len())
+                .ok_or(RoleError::InvalidOutput)?;
+            Self::evaluate(&query, movement)
+        }
+        fn reply(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+            let initial = query
+                .records
+                .iter()
+                .rev()
+                .find(|record| record.kind == RecordKind::Counterexample)
+                .ok_or(RoleError::InvalidOutput)?;
+            if initial.value.is_some()
+                || initial.completed_depth != 0
+                || initial.score_scope.is_some()
+            {
+                return Err(RoleError::InvalidOutput);
+            }
+            self.initial_cpu_source = initial.cpu_observation;
+            Self::evaluate(
+                &query,
+                if query.prefix.len() == 1 {
+                    self.response
+                } else {
+                    self.counter_suffix
+                },
+            )
+        }
+        fn repair(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+            let record = query
+                .records
+                .iter()
+                .rev()
+                .find(|record| record.kind == RecordKind::Counterexample)
+                .ok_or(RoleError::InvalidOutput)?;
+            if record.cpu_observation.is_some()
+                || record.value.is_some()
+                || record.completed_depth != 0
+                || record.score_scope.is_some()
+                || query.counterexample != Some(record.line.as_slice())
+                || record.line.get(1) != Some(&self.response)
+                || record.line.get(2) != Some(&self.counter_suffix)
+            {
+                return Err(RoleError::InvalidOutput);
+            }
+            self.saw_model_counterline = true;
+            if self.repair_physical_unknown {
+                return Err(RoleError::PhysicalCompletionUnknown);
+            }
+            if self.fail_repair {
+                return Err(RoleError::Backend(
+                    "synthetic primary Repair failure".into(),
+                ));
+            }
+            Self::evaluate(&query, self.repair_suffix)
+        }
+        fn divergences(&mut self, _: DivergenceQuery<'_>) -> Result<Vec<f32>, RoleError> {
+            Err(RoleError::Unavailable)
+        }
+        fn accepted_output_checked(
+            &mut self,
+            acceptance: RoleAcceptance<'_>,
+        ) -> Result<(), RoleError> {
+            acceptance.check_control()?;
+            if self.reject_repair_acceptance
+                && acceptance.context.purpose == RoleQueryPurpose::RepairPolicy
+            {
+                return Err(RoleError::Backend(
+                    "synthetic Repair acceptance rejected".into(),
+                ));
+            }
+            self.accepted += 1;
+            if self.cancel_on_accept == Some(self.accepted) {
+                acceptance.cancel.store(true, Ordering::Release);
+            }
+            Ok(())
+        }
+        fn finish_search(&mut self, reason: RoleSearchClosure) {
+            self.finish_calls += 1;
+            self.closure = Some(reason);
+        }
+    }
+    fn mv(text: &str) -> BoardMove {
+        BoardMove::from_uci(text).unwrap()
+    }
+    fn fixture(nodes: u64) -> FreshReplayOwner<RepairRoles> {
+        from_root(Position::startpos(), nodes, false)
+    }
+    fn from_root(
+        root: Position,
+        nodes: u64,
+        terminal_repair: bool,
+    ) -> FreshReplayOwner<RepairRoles> {
+        from_root_with_extent(root, nodes, terminal_repair, 3)
+    }
+    fn from_root_with_extent(
+        root: Position,
+        nodes: u64,
+        terminal_repair: bool,
+        extent: usize,
+    ) -> FreshReplayOwner<RepairRoles> {
+        let (proposal, restriction, response, counter_suffix, repair_suffix) = if terminal_repair {
+            (
+                vec![mv("g7g5"), mv("e2e4"), mv("b8c6")],
+                mv("g2g4"),
+                mv("g2g4"),
+                mv("a7a6"),
+                mv("d8h4"),
+            )
+        } else {
+            (
+                vec![mv("e2e4"), mv("e7e5"), mv("g1f3")],
+                mv("c7c5"),
+                mv("e7e6"),
+                mv("d2d4"),
+                mv("d2d3"),
+            )
+        };
+        let proposal = bounded_moves(&proposal[..extent], extent).unwrap();
+        let prefix = vec![proposal[0]];
+        let mut target = root.clone();
+        target.make_move(prefix[0]).unwrap();
+        let roles = RepairRoles {
+            proposal: proposal.clone(),
+            response,
+            counter_suffix,
+            repair_suffix,
+            accepted: 0,
+            cancel_on_accept: None,
+            reject_repair_acceptance: false,
+            fail_repair: false,
+            repair_physical_unknown: false,
+            initial_cpu_source: None,
+            saw_model_counterline: false,
+            finish_calls: 0,
+            closure: None,
+        };
+        let plan = DefendResponseReplayPlan {
+            historical: ReplayHistoricalPins {
+                parent_input_sha256: [1; 32],
+                current_view_sha256: [2; 32],
+                frozen_admission_sha256: [3; 32],
+                query_sha256: [4; 32],
+                catalogue_sha256: [5; 32],
+                before_result_sha256: [6; 32],
+                semantic_input_sha256: [7; 32],
+                cpu_request_sha256: [8; 32],
+            },
+            expected_root: root.snapshot(),
+            expected_target: target.snapshot(),
+            root_legal_order: root.legal_moves(),
+            target_legal_order: target.legal_moves(),
+            prefix,
+            response_restriction: vec![restriction],
+            claimed_line: proposal,
+            baseline_depth: 1,
+            requested_depth: 2,
+            nodes_per_check: nodes,
+            cpu: CpuConfig {
+                profile: CpuProfile::PlanAssisted,
+                tt_entries: 16,
+                max_depth: 2,
+                quiescence_ply: 4,
+            },
+        };
+        FreshReplayOwner::new(
+            PalsConfig {
+                line_plies: extent,
+                max_records: 4,
+                cpu_nodes_per_task: nodes,
+                ..PalsConfig::default()
+            },
+            roles,
+            root,
+            plan,
+        )
+        .unwrap()
+    }
+    fn limits(nodes: u64) -> PalsLimits {
+        PalsLimits {
+            deadline: Instant::now() + Duration::from_secs(10),
+            max_rounds: 1,
+            max_cpu_nodes: nodes * 3,
+            cpu_depth: 2,
+        }
+    }
+
+    #[test]
+    fn actual_repair_endpoint_is_third_fresh_unrestricted_completed_task() {
+        let mut owner = fixture(100_000);
+        let result = owner
+            .run_with_repair(limits(100_000), &AtomicBool::new(false))
+            .unwrap();
+        let ReplayRepairOutcome::CompletedRepairEndpoint {
+            repaired_line,
+            repair_record_revision,
+            endpoint_state,
+            execution,
+            observation,
+            ..
+        } = result
+        else {
+            panic!("{result:?}");
+        };
+        assert_eq!(owner.repair_line_id(), Some(repaired_line));
+        assert_eq!(owner.repair_record_revision(), Some(repair_record_revision));
+        assert_eq!(owner.stages.len(), 3);
+        let endpoint = &owner.stages[2];
+        assert_eq!(endpoint.phase, ReplayCpuPhase::RepairEndpoint);
+        assert!(endpoint.exact_completed && endpoint.attempt.is_some());
+        assert_eq!(endpoint.execution, execution);
+        assert_eq!(endpoint.observation, Some(observation));
+        assert_eq!(endpoint.report.as_ref().unwrap().reused_completed_depth, 0);
+        assert_ne!(execution, owner.stages[0].execution);
+        assert_ne!(execution, owner.stages[1].execution);
+        assert_eq!(
+            endpoint.registered_condition,
+            owner.stages[1].registered_condition
+        );
+        assert!(endpoint.task_condition.contains(FRESH_REPLAY_REPAIR_SCOPE));
+        let task = owner.task(execution).unwrap();
+        assert_eq!(task.key.question, TaskQuestion::AnalyzePosition);
+        assert!(task.key.root_moves.is_empty());
+        assert_eq!(task.key.input_revision, 0);
+        assert_eq!(task.key.state, endpoint_state);
+        assert_eq!(task.status, TaskStatus::Completed(observation));
+        assert_eq!(task.resumed_from, None);
+        let facts = owner.repair_endpoint().unwrap();
+        assert_eq!(facts.snapshot.side_to_move(), Color::Black);
+        assert!(matches!(facts.evidence, RecheckEndpointEvidence::OwnCpu {
+            observation_id, execution_id, ..
+        } if observation_id == observation && execution_id == execution));
+        let raw = owner.observation(observation).unwrap();
+        assert_eq!(
+            raw.score,
+            RawScore::Cpu {
+                value: endpoint.report.as_ref().unwrap().score,
+                perspective: Color::Black,
+                bound: BoundKind::ExactWithinSearch,
+            }
+        );
+        assert_eq!(owner.counters.cpu_tasks_requested, 3);
+        assert_eq!(owner.counters.supported_repairs, 0);
+        assert_eq!(owner.counters.supported_refutations, 0);
+        assert!(owner.engine.nodes.iter().all(|node| {
+            owner
+                .engine
+                .stores
+                .situations
+                .get(node.situation)
+                .unwrap()
+                .conclusions
+                .iter()
+                .next()
+                .is_none()
+        }));
+        assert_eq!(owner.engine.model.finish_calls, 1);
+        assert!(!owner.strict_query_admission_verified() && !owner.native_freshness_verified());
+        assert!(!owner.whole_cost_verified() && !owner.physical_closure_verified());
+        assert!(!owner.utility_authority() && !owner.training_target_created());
+    }
+
+    #[test]
+    fn selected_reply_differs_from_cpu_pv_and_model_line_has_no_cpu_source_or_score() {
+        let mut owner = fixture(100_000);
+        owner
+            .run_with_repair(limits(100_000), &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(owner.stages[1].report.as_ref().unwrap().pv[0], mv("c7c5"));
+        assert_eq!(owner.reply_line(), &[mv("e2e4"), mv("e7e6")]);
+        assert_eq!(
+            owner.model_counterline(),
+            &[mv("e2e4"), mv("e7e6"), mv("d2d4")]
+        );
+        assert_eq!(owner.repaired_line(), &[mv("e2e4"), mv("e7e6"), mv("d2d3")]);
+        assert!(owner.engine.model.saw_model_counterline);
+        assert_eq!(
+            owner.engine.model.initial_cpu_source,
+            owner.stages[1].observation
+        );
+        assert_eq!(owner.records().len(), 4);
+        let model_counter = owner
+            .records()
+            .iter()
+            .rev()
+            .find(|record| record.kind == RecordKind::Counterexample)
+            .unwrap();
+        assert_eq!(model_counter.line, owner.model_counterline());
+        let repair = owner
+            .records()
+            .iter()
+            .find(|record| record.kind == RecordKind::Repair)
+            .unwrap();
+        for record in [model_counter, repair] {
+            assert_eq!(record.cpu_observation, None);
+            assert_eq!(record.value, None);
+            assert_eq!(record.completed_depth, 0);
+            assert_eq!(record.score_scope, None);
+        }
+        let target = owner
+            .engine
+            .nodes
+            .iter()
+            .find(|node| node.position.snapshot().same_state(&owner.target))
+            .unwrap();
+        assert!(target.evidence.is_none());
+    }
+
+    #[test]
+    fn fixed_three_n_and_role_reservations_refuse_before_dispatch() {
+        let mut owner = fixture(100_000);
+        let mut bound = limits(100_000);
+        bound.max_cpu_nodes -= 1;
+        assert!(matches!(
+            owner.run_with_repair(bound, &AtomicBool::new(false)),
+            Err(ReplayError::InvalidPlan(_))
+        ));
+        assert_eq!(owner.counters.role_calls, 0);
+        assert!(owner.stages.is_empty());
+        assert_eq!(owner.engine.model.finish_calls, 1);
+        let mut owner = fixture(100_000);
+        owner.engine.config.max_role_calls = 5; // L+1+2*(L-P-1) is six.
+        assert!(matches!(
+            owner.run_with_repair(limits(100_000), &AtomicBool::new(false)),
+            Err(ReplayError::InvalidPlan(_))
+        ));
+        assert_eq!(owner.counters.role_calls, 0);
+        assert!(owner.stages.is_empty());
+    }
+
+    #[test]
+    fn reply_only_stays_two_checks_and_duplicate_other_mode_has_no_finish_hook() {
+        let mut owner = fixture(100_000);
+        let cancel = AtomicBool::new(false);
+        assert!(matches!(
+            owner.run(limits(100_000), &cancel).unwrap(),
+            ReplayOutcome::ReplyAccepted { .. }
+        ));
+        assert_eq!(owner.stages.len(), 2);
+        assert_eq!(owner.counters.repair_calls, 0);
+        assert!(owner.repaired_line().is_empty() && owner.model_counterline().is_empty());
+        assert!(matches!(
+            owner.run_with_repair(limits(100_000), &cancel),
+            Err(ReplayError::AlreadyUsed)
+        ));
+        assert_eq!(owner.engine.model.finish_calls, 1);
+        let mut owner = fixture(100_000);
+        owner.run_with_repair(limits(100_000), &cancel).unwrap();
+        assert!(matches!(
+            owner.run(limits(100_000), &cancel),
+            Err(ReplayError::AlreadyUsed)
+        ));
+        assert_eq!(owner.engine.model.finish_calls, 1);
+    }
+
+    #[test]
+    fn failed_or_rejected_repair_keeps_h0_h1_and_never_dispatches_endpoint() {
+        for reject_acceptance in [false, true] {
+            let mut owner = fixture(100_000);
+            owner.engine.model.fail_repair = !reject_acceptance;
+            owner.engine.model.reject_repair_acceptance = reject_acceptance;
+            let error = owner.run_with_repair(limits(100_000), &AtomicBool::new(false));
+            assert!(
+                matches!(error, Err(ReplayError::Search(error)) if matches!(*error, PalsError::Role(RoleError::Backend(_))))
+            );
+            assert_eq!(owner.stages.len(), 2);
+            assert!(owner.stages.iter().all(|stage| stage.report.is_some()
+                && stage.attempt.is_some()
+                && stage.exact_completed));
+            assert_eq!(owner.counters.accepted_repair_outputs, 0);
+            assert!(
+                !owner
+                    .records()
+                    .iter()
+                    .any(|record| record.kind == RecordKind::Repair)
+            );
+            assert_eq!(owner.repair_record_revision(), None);
+            assert_eq!(owner.engine.model.finish_calls, 1);
+            assert_eq!(owner.engine.model.closure, Some(RoleSearchClosure::Failed));
+        }
+    }
+
+    #[test]
+    fn late_repair_acceptance_cancel_preserves_partial_line_but_no_record_or_endpoint() {
+        let mut owner = fixture(100_000);
+        owner.engine.model.cancel_on_accept = Some(6);
+        let error = owner.run_with_repair(limits(100_000), &AtomicBool::new(false));
+        assert!(
+            matches!(error, Err(ReplayError::Search(error)) if matches!(*error, PalsError::Role(RoleError::Canceled)))
+        );
+        assert_eq!(owner.counters.accepted_repair_outputs, 1);
+        assert_eq!(owner.repaired_line().len(), 3);
+        assert_eq!(owner.stages.len(), 2);
+        assert_eq!(owner.repair_record_revision(), None);
+        assert_eq!(owner.engine.model.finish_calls, 1);
+        assert_eq!(
+            owner.engine.model.closure,
+            Some(RoleSearchClosure::Canceled)
+        );
+    }
+
+    #[test]
+    fn fresh_endpoint_partial_retains_raw_work_without_completed_node_evidence() {
+        // Quiet e4/c5 has one restricted Black root for H0/H1; the repaired
+        // e4/e6/d3 endpoint must examine the full Black root order at H1. The
+        // finite budgets locate that difference with real work under identical
+        // TT16/q4/H1 configuration, not an injected report or budget downgrade.
+        let mut observed_partial = false;
+        for nodes in [32, 64, 128, 256] {
+            let mut owner = fixture(nodes);
+            let result = owner
+                .run_with_repair(limits(nodes), &AtomicBool::new(false))
+                .unwrap();
+            if let ReplayRepairOutcome::PartialRepairEndpoint {
+                execution,
+                observation,
+            } = result
+            {
+                observed_partial = true;
+                let stage = &owner.stages[2];
+                assert!(stage.report.is_some() && stage.attempt.is_some());
+                assert!(!stage.exact_completed);
+                assert_eq!(stage.node_budget, nodes);
+                assert_eq!(stage.observation, observation);
+                assert_eq!(owner.task(execution).unwrap().status, TaskStatus::Failed);
+                assert!(owner.stages[..2].iter().all(|stage| stage.exact_completed));
+                assert!(
+                    owner.stages[..2].iter().all(|stage| stage
+                        .report
+                        .as_ref()
+                        .unwrap()
+                        .root_restricted)
+                );
+                assert!(!stage.report.as_ref().unwrap().root_restricted);
+                assert!(matches!(
+                    owner.repair_endpoint().unwrap().evidence,
+                    RecheckEndpointEvidence::Unobserved
+                ));
+                assert!(
+                    owner.engine.nodes[owner.repair_endpoint_node.unwrap()]
+                        .evidence
+                        .is_none()
+                );
+                assert_eq!(owner.engine.model.finish_calls, 1);
+                break;
+            }
+        }
+        assert!(
+            observed_partial,
+            "no actual endpoint-partial boundary in finite fixture budgets"
+        );
+    }
+
+    #[test]
+    fn restricted_root_observation_cannot_be_promoted_to_endpoint_provenance() {
+        let mut owner = fixture(100_000);
+        owner.run(limits(100_000), &AtomicBool::new(false)).unwrap();
+        let target = owner
+            .engine
+            .nodes
+            .iter()
+            .position(|node| node.position.snapshot().same_state(&owner.target))
+            .unwrap();
+        let stage = &owner.stages[1];
+        let report = stage.report.as_ref().unwrap();
+        // Internal adversarial fixture only: a matching actual raw score/state
+        // still has AnalyzeRootMoves/restricted namespace and must be refused.
+        owner.engine.nodes[target].evidence = Some(CpuEvidence {
+            score: report.score,
+            depth: report.completed_depth,
+            scope: report.score_scope,
+            value_identity: report.value_identity.clone(),
+            provenance: Some((stage.observation.unwrap(), stage.execution)),
+        });
+        let facts = PalsEngine::<RepairRoles>::recheck_endpoint(
+            &owner.engine.nodes[target],
+            &owner.engine.stores,
+            &owner.target,
+        );
+        assert!(matches!(
+            facts.evidence,
+            RecheckEndpointEvidence::InvalidProvenance { .. }
+        ));
+    }
+
+    #[test]
+    fn terminal_repair_endpoint_is_rules_only_and_has_two_cpu_checks() {
+        let mut root = Position::startpos();
+        root.make_move(mv("f2f3")).unwrap();
+        let mut owner = from_root(root, 100_000, true);
+        let result = owner
+            .run_with_repair(limits(100_000), &AtomicBool::new(false))
+            .unwrap();
+        assert!(matches!(
+            result,
+            ReplayRepairOutcome::RulesTerminalRepairEndpoint { .. }
+        ));
+        assert_eq!(owner.repaired_line(), &[mv("g7g5"), mv("g2g4"), mv("d8h4")]);
+        assert_eq!(owner.stages.len(), 2);
+        assert_eq!(owner.counters.cpu_tasks_requested, 2);
+        assert!(matches!(
+            owner.repair_endpoint().unwrap().evidence,
+            RecheckEndpointEvidence::RulesTerminal { .. }
+        ));
+        assert_eq!(owner.counters.supported_repairs, 0);
+        assert_eq!(owner.engine.model.finish_calls, 1);
+    }
+
+    #[test]
+    fn full_reply_prefix_without_any_repair_acceptance_is_not_completed_repair() {
+        let mut owner = from_root_with_extent(Position::startpos(), 100_000, false, 2);
+        let result = owner
+            .run_with_repair(limits(100_000), &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(result, ReplayRepairOutcome::NoAcceptedRepair);
+        assert_eq!(owner.counters.accepted_repair_outputs, 0);
+        assert_eq!(owner.repair_record_revision(), None);
+        assert_eq!(owner.stages.len(), 2);
+        assert_eq!(owner.engine.model.finish_calls, 1);
+    }
+
+    #[test]
+    fn repair_physical_unknown_keeps_primary_reason_and_stops_before_endpoint() {
+        let mut owner = fixture(100_000);
+        owner.engine.model.repair_physical_unknown = true;
+        let result = owner.run_with_repair(limits(100_000), &AtomicBool::new(false));
+        assert!(
+            matches!(result, Err(ReplayError::Search(error)) if matches!(*error, PalsError::Role(RoleError::PhysicalCompletionUnknown)))
+        );
+        assert_eq!(owner.stages.len(), 2);
+        assert_eq!(owner.counters.accepted_repair_outputs, 0);
+        assert_eq!(owner.counters.repair_calls, 1);
+        assert_eq!(owner.counters.cpu_tasks_requested, 2);
+        assert_eq!(owner.repair_record_revision(), None);
+        assert_eq!(owner.engine.model.finish_calls, 1);
+        assert_eq!(
+            owner.engine.model.closure,
+            Some(RoleSearchClosure::PhysicalCompletionUnknown)
+        );
+    }
+
+    #[test]
+    fn fresh_endpoint_tt_cannot_reuse_the_completed_endpoint_task() {
+        let mut owner = fixture(100_000);
+        let cancel = AtomicBool::new(false);
+        let bound = limits(100_000);
+        owner.run_with_repair(bound, &cancel).unwrap();
+        // Internal guard fixture keeps the immutable completed task while
+        // temporarily detaching only the public stage ledger/Node projection.
+        let retained_stage = owner.stages.pop().unwrap();
+        let endpoint = owner.repair_endpoint_node.unwrap();
+        let root_situation = owner.engine.stores.root().unwrap();
+        let root = owner
+            .engine
+            .nodes
+            .iter()
+            .position(|node| node.situation == root_situation)
+            .unwrap();
+        owner.engine.nodes[endpoint].evidence = None;
+        owner.engine.cpu = Box::new(
+            OwnedCpuChecker::new(CpuEngine::new(owner.plan.cpu.clone()).unwrap()).unwrap(),
+        );
+        let mut counters = owner.counters;
+        let before = counters.cpu_tasks_requested;
+        let result = owner.repair_endpoint_stage(
+            StageRequest {
+                root,
+                target: endpoint,
+                phase: ReplayCpuPhase::RepairEndpoint,
+                depth: 2,
+                limits: bound,
+                cancel: &cancel,
+            },
+            &mut counters,
+        );
+        assert!(
+            matches!(result, Err(ReplayError::Search(error)) if matches!(*error, PalsError::Store(StoreError::InvalidConditions(_))))
+        );
+        assert_eq!(counters.cpu_tasks_requested, before);
+        assert_eq!(owner.stages.len(), 2);
+        assert_eq!(
+            owner.task(retained_stage.execution).unwrap().status,
+            TaskStatus::Completed(retained_stage.observation.unwrap())
+        );
     }
 }

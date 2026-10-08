@@ -2489,3 +2489,50 @@ Query 선택의 native 인과, whole cost, utility를 인증하지 않는다. �
 recheck·caller 종료/정리 ledger 연결은 후속 구현·인수 범위다. 독립 두 action의 동일
 조건부 fact/전체 비용 비교는 아직 미인수이며 utility groups 0/masked를 유지한다.
 이번 GPU 검증 보류와 actual training/backward/optimizer 제외를 유지한다.
+
+이 첫 replay 접점의 HEAD `2f4e4ffbe9ac7dd3602f599307dd0530b085c83e`에서
+[CPU CI run 37772249341](https://github.com/daejunnom/RoveZero/actions/runs/37772249341)은
+Linux·Windows·모델 CPU·bindings 네 job 모두 성공했다. 총괄은 원문에서 새 replay
+fixture 13개/OS, 모델 suite 548개·Python 전략 경계 28개·Rust 전략 경계 11개/OS,
+native fixture 29개/OS·output persistence 2개/OS의 실제 통과를 확인했다. 정확한
+HEAD·job 종료 시각·원문 byte 수·SHA는 저장소 밖 인수 자료로 보존한다. 이 결과는
+작은 자체 CPU와 scripted RoleModel의 연결 검사이며 실제 Query/2 인수·native
+request/NN 인과·Repair/recheck·whole cost·GPU·기력·학습 인수로 확대하지 않는다.
+
+### 명시적인 Repair endpoint replay
+
+별도 `run_with_repair`는 기존 `run`의 Reply-only 2N 의미를 보존하면서 실제 Reply
+수락 뒤의 모델 continuation·Repair와 독립 endpoint 검사를 연결한다. 시작 전에
+고정 3N, 최대 역할 호출 `L + 1 + 2 × (L − P − 1)`, 네 public record와 세 stage,
+유한 node·observation·line 저장 한도를 확인한다. `L`은 최대 line 길이, `P`는
+고정 prefix 길이다. 남은 예산에 맞추어 N·깊이·수순 길이를 조용히 낮추지 않는다.
+
+새 C 수순은 실제 선택 Reply response의 Rules 상태에서 생성한다. 그 응수가 H1
+CPU PV와 다르면 CPU의 suffix를 이어 붙이지 않는다. 모델이 생성한 full
+Counterexample과 Repair record는 CPU 출처 None·값 None·depth 0·scope None으로
+게시한다. 원래 H1 observation은 초기 CPU Counterexample과 최초 Reply context의
+출처로 남으며 새 모델 수순 전체를 검증한 근거가 아니다. 실제 Repair 수락 수 증가와
+전체 Rules 수순·끝 상태·합법 수 순서의 재대조 없이 완료 endpoint를 주장하지 않는다.
+
+세 번째 CPU/TT는 새 owner이며 질문은 `AnalyzePosition`, root moves는 빈 목록,
+input revision은 0이다. 별도 `rz-pals-frozen-parent-repair-endpoint-replay/1` scope의
+Start-only H1/N Task와 원문 report·attempt를 보존한다. 정확한 완료 관측·Task 소비가
+끝난 뒤에만 endpoint의 own CPU evidence를 설치하고 기존 `recheck_endpoint`의
+state·execution·question·scope provenance 검사를 통과해야 한다. Partial은 관측을
+남기지만 완료 Node evidence를 만들지 않는다. Rules terminal은 세 번째 CPU 실행
+없이 Rules 근거의 별도 결과로 반환하며 CPU mate 점수를 종료 판정으로 승격하지 않는다.
+
+추가한 12개 fixture source는 작은 실제 own CPU와 scripted Repair 모델을 사용한다.
+기존 13개 fixture 및 Reply-only `run_inner`·CPU stage 본문은 유지하고, one-shot 사용·
+원래 deadline/cancel·primary/secondary 실패·finish 한 번은 공통 wrapper에서 보존한다.
+소스 대조·formatter·독립 리뷰와 새 정확한 HEAD의 CPU CI 결과는 별도로 인수한다.
+앞선 2f4e4ff의 13개 통과를 새 12개 검사 성공으로 재사용하지 않는다.
+
+이 경계는 accepted Repair의 끝 상태 관측까지다. Supported Repair·조건부 refutation·
+native post-Repair recheck·전체 caller 비용·물리 종료·utility는 아직 인수하지 않는다.
+후속 wire는 별도 request/observation 및 source·provider factory·실제 실행 binary 등록이
+필요하다. 역사 CPU binary pin을 새 replay binary pin으로 대체하거나 새 결과를 기존
+2N action receipt·Query/2 completed prior로 재라벨하지 않는다. 3N mode는 추가 역할·
+저장·출력·단일 전체 wall·cleanup 한도를 함께 봉인하고 원래 remaining이 부족하면
+거절해야 한다. 기존 utility groups 0/masked·제품 V 미활성·이번 GPU 검증 보류와
+actual training/backward/optimizer 제외를 유지한다.
