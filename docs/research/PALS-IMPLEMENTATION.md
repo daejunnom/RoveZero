@@ -2186,3 +2186,14 @@ snapshot이나 정적 graphbody 성공만으로 Run·finite·fence 권한을 만
 compile·CPU fixture 인수는 새 CI에 남아 있고, UCI factory·CLI 선택·arena receipt
 연결도 후속 단위다. 이번 세션의 GPU 검증 보류를 유지하며 실제 장치·수치·Run·
 완료·메모리·대국·학습 검사는 수행하지 않는다.
+
+resident 초안 `184222c25227d66cc2404573c3b7bfa7b6092914`의
+[CI 37744387094](https://github.com/daejunnom/RoveZero/actions/runs/37744387094)는
+CPU bindings와 model suite 469개가 성공했다. 따라서 앞선 Query fixture 수정은
+실제 CPU 검사에서 인수했다. Linux·Windows Rust job은 새 native 파일의 API 연결
+오류 10개로 compile 단계에서 실패했다. ORT 전용 오류 함수에 I/O·JSON 오류를
+전달한 곳, fallible graph descriptor 문자열을 바로 사용한 곳, 별도 Warm constructor의
+새 optional 필드 초기화 누락을 수정한다. 각 오류의 원래 stage·cause와 fail-closed
+조건을 유지하고, invalid descriptor 문자열은 오류 또는 shape 불일치로 거부한다.
+Warm CPU 경로에는 resident owner `None`만 추가한다. 원래 양 OS compile 실패
+자료를 보존하며, 수정 후 실제 Rust 통과는 후속 exact-SHA CI에서 별도 확인한다.

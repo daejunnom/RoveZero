@@ -525,28 +525,31 @@ impl CudaRecordPages {
         let file =
             std::fs::File::create_new(self.profile_root.join("packing-initial-placement.json"))
                 .map_err(|error| {
-                    native(
-                        CauseCode::ProfilingStart,
+                    fail(
+                        K::BackendFailure,
+                        S::Backend,
                         "cannot preserve packing initialization",
-                        error,
                     )
+                    .with_external_cause(CauseCode::ProfilingStart, &error)
                 })?;
         // Stream escaping into the owned output. A rejected prefix is retained
         // without allocating an unbounded serialized JSON buffer.
         let mut output = BoundedInitializationRecord { file, written: 0 };
         serde_json::to_writer(&mut output, &record).map_err(|error| {
-            native(
-                CauseCode::ProfilingStart,
+            fail(
+                K::BackendFailure,
+                S::Backend,
                 "cannot preserve bounded packing initialization",
-                error,
             )
+            .with_external_cause(CauseCode::ProfilingStart, &error)
         })?;
         std::io::Write::flush(&mut output).map_err(|error| {
-            native(
-                CauseCode::ProfilingStart,
+            fail(
+                K::BackendFailure,
+                S::Backend,
                 "cannot flush packing initialization",
-                error,
             )
+            .with_external_cause(CauseCode::ProfilingStart, &error)
         })
     }
 }
@@ -584,7 +587,9 @@ fn validate_packing_session(
     }
     for (index, input) in session.inputs.iter().enumerate() {
         let expected = graph.input_descriptor(index).map_err(body_error)?;
-        if input.name != expected.name.as_str() || !interface_matches(&input.input_type, expected) {
+        if input.name != expected.name.as_str().map_err(body_error)?
+            || !interface_matches(&input.input_type, expected)
+        {
             return Err(refused(
                 "packing loaded input order/type/shape/symbol differs",
             ));
@@ -592,7 +597,7 @@ fn validate_packing_session(
     }
     for (index, output) in session.outputs.iter().enumerate() {
         let expected = graph.output_descriptor(index).map_err(body_error)?;
-        if output.name != expected.name.as_str()
+        if output.name != expected.name.as_str().map_err(body_error)?
             || !interface_matches(&output.output_type, expected)
         {
             return Err(refused(
@@ -629,7 +634,7 @@ fn interface_matches(value: &ValueType, expected: PackingGraphTensorDescriptor) 
                         && symbol.is_empty()
                 }
                 PackingGraphDimension::Symbol(expected) => {
-                    *size == -1 && symbol == expected.as_str()
+                    *size == -1 && expected.as_str().is_ok_and(|expected| symbol == expected)
                 }
             })
 }
@@ -1161,11 +1166,12 @@ fn unwind_cause(payload: &(dyn std::any::Any + Send)) -> BackendError {
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("non-string native panic");
     let bounded: String = text.chars().take(256).collect();
-    native(
-        CauseCode::OrtRun,
+    fail(
+        K::BackendFailure,
+        S::Backend,
         "resident native unwind; physical completion not released",
-        std::io::Error::other(bounded),
     )
+    .with_external_cause(CauseCode::OrtRun, &std::io::Error::other(bounded))
 }
 
 impl CudaRecordPages {
@@ -1803,7 +1809,7 @@ impl CudaRecordPages {
                         .input_descriptor(2 + index * 3 + offset)
                         .map_err(body_error)?;
                     binding
-                        .bind_input(expected.name.as_str(), tensor)
+                        .bind_input(expected.name.as_str().map_err(body_error)?, tensor)
                         .map_err(|error| {
                             native(CauseCode::OrtRun, "packing record data input failed", error)
                         })?;
@@ -1813,7 +1819,10 @@ impl CudaRecordPages {
                     .input_descriptor(2 + index * 3 + 2)
                     .map_err(body_error)?;
                 binding
-                    .bind_input(expected.name.as_str(), &packing.offsets[index])
+                    .bind_input(
+                        expected.name.as_str().map_err(body_error)?,
+                        &packing.offsets[index],
+                    )
                     .map_err(|error| {
                         native(
                             CauseCode::OrtRun,

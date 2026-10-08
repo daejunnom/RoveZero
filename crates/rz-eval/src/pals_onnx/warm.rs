@@ -683,6 +683,8 @@ impl PalsOnnxBackend {
             device_memory: None,
             #[cfg(feature = "experimental-io-binding")]
             device_role: None,
+            #[cfg(feature = "experimental-io-binding")]
+            cuda_record_pages: None,
         })
     }
     pub fn private_warm_capability(&self) -> Option<&PalsWarmCapability> {
