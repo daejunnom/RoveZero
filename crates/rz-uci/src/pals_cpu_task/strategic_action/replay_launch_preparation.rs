@@ -1864,7 +1864,7 @@ mod tests {
         body.as_object_mut().unwrap().remove("context_sha256");
         assert_eq!(
             observed.manifest().context_sha256,
-            super::super::json_digest(&serde_json::json!([
+            crate::pals_cpu_task::json_digest(&serde_json::json!([
                 OBSERVED_PREPARATION_MANIFEST_SCHEMA,
                 body
             ]))
