@@ -1,0 +1,865 @@
+//! Structured, bounded observations for a subsequent private V query.
+//!
+//! This consumer compares independent historical bindings and separates complete
+//! CPU scope from native closure. It does not validate a dataset/current selector,
+//! caller process chronology, loaded executable, whole-action cost or utility.
+//! No Debug text, CPU score, native numeric ID or identity hash is a V feature.
+
+use super::super::replay_inputs::{ReplayAuthorities, ReplayExpectedPins, ReplayInputMode};
+use super::{AdmissionFault, CpuFreshAssetProfile, NativeReplayObservation};
+use rz_contracts::pals::Move16;
+use rz_position::BoardMove;
+use rz_search::cpu::{CpuCompletion, CpuScoreScope};
+use rz_search::pals::engine::RoleModel;
+use rz_search::pals::engine::replay::{FreshReplayOwner, ReplayCpuPhase, ReplayOpponentOutcome};
+use serde::{Serialize, Serializer};
+use sha2::{Digest, Sha256};
+
+pub const SCHEMA: &str = "rz-pals-frozen-replay-query-prior/1";
+pub const SCOPE: &str = "registered_native_replay_projection_pending_caller_chronology";
+pub const MAX_PV_MOVES: usize = 96; // registered depth <=64 plus qsearch <=32
+pub const MAX_LINE_MOVES: usize = 16;
+pub const MAX_STAGES: usize = 4;
+/// Fixed scalar/move projection fits inside the existing /2 header reservation.
+pub const MAX_PROJECTED_JSON_BYTES: usize = 16 * 1024;
+
+/// Compiled literal metadata only. An independent caller must still register
+/// this consumer source/build/binary; this is never a fallback expected pin.
+pub fn projection_source_digest() -> [u8; 32] {
+    Sha256::digest(include_bytes!("replay_prior.rs")).into()
+}
+
+#[derive(Debug)]
+pub struct PackedMoves {
+    moves: [u16; MAX_PV_MOVES],
+    len: usize,
+}
+impl Default for PackedMoves {
+    fn default() -> Self {
+        Self {
+            moves: [0; MAX_PV_MOVES],
+            len: 0,
+        }
+    }
+}
+impl PackedMoves {
+    fn capture(&mut self, moves: &[BoardMove], maximum: usize) -> Result<(), AdmissionFault> {
+        self.len = 0;
+        if moves.len() > maximum || maximum > MAX_PV_MOVES {
+            return Err(fault("exact move extent exceeds registered projection"));
+        }
+        for movement in moves {
+            let movement = rz_contracts::Move::try_from(*movement)
+                .map_err(|_| fault("actual move16 conversion failed"))?;
+            self.moves[self.len] = Move16::encode(movement).bits();
+            self.len += 1;
+        }
+        Ok(())
+    }
+    pub fn as_slice(&self) -> &[u16] {
+        &self.moves[..self.len]
+    }
+}
+impl Serialize for PackedMoves {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.as_slice().serialize(s)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorPhase {
+    Baseline,
+    After,
+    RepairEndpoint,
+    RepairOpponentEndpoint,
+}
+impl From<ReplayCpuPhase> for PriorPhase {
+    fn from(value: ReplayCpuPhase) -> Self {
+        match value {
+            ReplayCpuPhase::Baseline => Self::Baseline,
+            ReplayCpuPhase::After => Self::After,
+            ReplayCpuPhase::RepairEndpoint => Self::RepairEndpoint,
+            ReplayCpuPhase::RepairOpponentEndpoint => Self::RepairOpponentEndpoint,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorCompletion {
+    DepthLimit,
+    NodeLimit,
+    Deadline,
+    Canceled,
+    QuiescenceLimit,
+    RulesTerminal,
+}
+impl From<CpuCompletion> for PriorCompletion {
+    fn from(value: CpuCompletion) -> Self {
+        match value {
+            CpuCompletion::DepthLimit => Self::DepthLimit,
+            CpuCompletion::NodeLimit => Self::NodeLimit,
+            CpuCompletion::Deadline => Self::Deadline,
+            CpuCompletion::Canceled => Self::Canceled,
+            CpuCompletion::QuiescenceLimit => Self::QuiescenceLimit,
+            CpuCompletion::Terminal(_) => Self::RulesTerminal,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorOutcome {
+    Unobserved,
+    RepairNotReady,
+    NoEligibleOpponentAnchor,
+    NoAlternativeResponse,
+    PartialOpponentEndpoint,
+    CompletedOpponentEndpoint,
+    RulesTerminalOpponentEndpoint,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct PriorStage {
+    phase: Option<PriorPhase>,
+    requested_depth: u16,
+    node_budget: u64,
+    exact_completed: bool,
+    report_present: bool,
+    completed_depth: Option<u16>,
+    completion: Option<PriorCompletion>,
+    completed_iteration: bool,
+    root_restricted: Option<bool>,
+    reused_completed_depth: Option<u16>,
+    report_nodes: Option<u64>,
+    report_qnodes: Option<u64>,
+    report_tt_hits: Option<u64>,
+    report_elapsed_ms: Option<u64>,
+    attempt_nodes: Option<u64>,
+    observation_present: bool,
+    /// Metadata only; separate from the numeric/move feature view.
+    registered_condition_sha256: [u8; 32],
+    task_condition_sha256: [u8; 32],
+    pv: PackedMoves,
+}
+impl PriorStage {
+    fn complete(&self) -> bool {
+        self.exact_completed
+            && self.report_present
+            && self.observation_present
+            && self.completion == Some(PriorCompletion::DepthLimit)
+            && self.completed_iteration
+            && self.completed_depth == Some(self.requested_depth)
+            && self.reused_completed_depth == Some(0)
+            && self.report_nodes.is_some_and(|n| n <= self.node_budget)
+    }
+    pub fn pv(&self) -> &[u16] {
+        self.pv.as_slice()
+    }
+    pub fn phase(&self) -> Option<PriorPhase> {
+        self.phase
+    }
+    pub fn completed_depth(&self) -> Option<u16> {
+        self.completed_depth
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorReadiness {
+    Unobserved,
+    IncompleteCpuScope,
+    NativeClosureUnobserved,
+    OriginalWindowFailed,
+    CapturedResultFailed,
+    CompleteCpuScopePendingCallerChronology,
+    RulesTerminalPendingCallerChronology,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReplayQueryPrior {
+    schema: &'static str,
+    assurance_scope: &'static str,
+    projection_source_sha256: [u8; 32],
+    outcome: PriorOutcome,
+    readiness: PriorReadiness,
+    work_returned_elapsed_ms: Option<u64>,
+    work_returned_within_execution_window: Option<bool>,
+    /// Retained scalar facts do not fabricate a missing report or cost as zero.
+    stage_count: usize,
+    #[serde(serialize_with = "serialize_stages")]
+    stages: [PriorStage; MAX_STAGES],
+    opponent_anchor_ply: Option<usize>,
+    repaired_line: PackedMoves,
+    opponent_counterline: PackedMoves,
+    opponent_role_steps: usize,
+    accepted_opponent_steps: usize,
+    endpoint_observed: bool,
+    endpoint_rules_terminal: bool,
+    actual_utility_groups: u8,
+    authorities: ReplayAuthorities,
+}
+fn serialize_stages<S: Serializer>(
+    stages: &[PriorStage; MAX_STAGES],
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    let count = stages
+        .iter()
+        .take_while(|stage| stage.phase.is_some())
+        .count();
+    stages[..count].serialize(s)
+}
+impl Default for ReplayQueryPrior {
+    fn default() -> Self {
+        Self {
+            schema: SCHEMA,
+            assurance_scope: SCOPE,
+            projection_source_sha256: projection_source_digest(),
+            outcome: PriorOutcome::Unobserved,
+            readiness: PriorReadiness::Unobserved,
+            stage_count: 0,
+            work_returned_elapsed_ms: None,
+            work_returned_within_execution_window: None,
+            stages: std::array::from_fn(|_| PriorStage::default()),
+            opponent_anchor_ply: None,
+            repaired_line: PackedMoves::default(),
+            opponent_counterline: PackedMoves::default(),
+            opponent_role_steps: 0,
+            accepted_opponent_steps: 0,
+            endpoint_observed: false,
+            endpoint_rules_terminal: false,
+            actual_utility_groups: 0,
+            authorities: ReplayAuthorities::default(),
+        }
+    }
+}
+impl ReplayQueryPrior {
+    pub(super) fn observe_work_return(
+        &mut self,
+        started: std::time::Instant,
+        execution: std::time::Instant,
+    ) {
+        let now = std::time::Instant::now();
+        self.work_returned_elapsed_ms =
+            u64::try_from(now.saturating_duration_since(started).as_millis()).ok();
+        self.work_returned_within_execution_window = Some(now < execution);
+    }
+    pub(super) fn capture<M: RoleModel>(
+        &mut self,
+        owner: &FreshReplayOwner<M>,
+    ) -> Result<(), AdmissionFault> {
+        if owner.stages().len() > MAX_STAGES {
+            return Err(fault("CPU stage extent"));
+        }
+        self.stage_count = owner.stages().len();
+        for (out, stage) in self.stages.iter_mut().zip(owner.stages()) {
+            out.phase = Some(stage.phase().into());
+            out.requested_depth = stage.requested_depth();
+            out.node_budget = stage.node_budget();
+            out.exact_completed = stage.exact_completed();
+            out.observation_present = stage.observation().is_some();
+            out.registered_condition_sha256 =
+                Sha256::digest(stage.registered_condition().as_bytes()).into();
+            out.task_condition_sha256 = Sha256::digest(stage.task_condition().as_bytes()).into();
+            out.attempt_nodes = stage.attempt().map(|attempt| attempt.work.nodes);
+            if let Some(report) = stage.report() {
+                out.report_present = true;
+                out.completed_depth = Some(report.completed_depth);
+                out.completion = Some(report.completion.into());
+                out.completed_iteration = report.score_scope == CpuScoreScope::CompletedIteration;
+                out.root_restricted = Some(report.root_restricted);
+                out.reused_completed_depth = Some(report.reused_completed_depth);
+                out.report_nodes = Some(report.nodes);
+                out.report_qnodes = Some(report.quiescence_nodes);
+                out.report_tt_hits = Some(report.tt_hits);
+                out.report_elapsed_ms = Some(
+                    u64::try_from(report.elapsed.as_millis())
+                        .map_err(|_| fault("elapsed extent"))?,
+                );
+                out.pv.capture(&report.pv, MAX_PV_MOVES)?;
+            }
+        }
+        self.opponent_anchor_ply = owner.opponent_anchor_ply();
+        self.repaired_line
+            .capture(owner.repaired_line(), MAX_LINE_MOVES)?;
+        self.opponent_counterline
+            .capture(owner.opponent_counterline(), MAX_LINE_MOVES)?;
+        self.opponent_role_steps = owner.opponent_role_steps().len();
+        self.accepted_opponent_steps = owner
+            .opponent_role_steps()
+            .iter()
+            .filter(|step| step.accepted() && step.selected().is_some())
+            .count();
+        self.endpoint_observed = owner.opponent_endpoint().is_some();
+        self.endpoint_rules_terminal = owner
+            .opponent_endpoint()
+            .is_some_and(|endpoint| endpoint.terminal.is_some());
+        Ok(())
+    }
+    pub(super) fn capture_outcome(&mut self, outcome: &ReplayOpponentOutcome) {
+        self.outcome = match outcome {
+            ReplayOpponentOutcome::RepairNotReady(_) => PriorOutcome::RepairNotReady,
+            ReplayOpponentOutcome::NoEligibleOpponentAnchor => {
+                PriorOutcome::NoEligibleOpponentAnchor
+            }
+            ReplayOpponentOutcome::NoAlternativeResponse => PriorOutcome::NoAlternativeResponse,
+            ReplayOpponentOutcome::PartialOpponentEndpoint { .. } => {
+                PriorOutcome::PartialOpponentEndpoint
+            }
+            ReplayOpponentOutcome::CompletedOpponentEndpoint { .. } => {
+                PriorOutcome::CompletedOpponentEndpoint
+            }
+            ReplayOpponentOutcome::RulesTerminalOpponentEndpoint { .. } => {
+                PriorOutcome::RulesTerminalOpponentEndpoint
+            }
+        };
+    }
+    pub fn readiness(&self) -> PriorReadiness {
+        self.readiness
+    }
+    pub fn outcome(&self) -> PriorOutcome {
+        self.outcome
+    }
+    pub fn stages(&self) -> &[PriorStage] {
+        &self.stages[..self.stage_count]
+    }
+    pub fn opponent_counterline(&self) -> &[u16] {
+        self.opponent_counterline.as_slice()
+    }
+    pub fn repaired_line(&self) -> &[u16] {
+        self.repaired_line.as_slice()
+    }
+    pub(super) fn set_readiness(&mut self, value: PriorReadiness) {
+        self.readiness = value;
+    }
+}
+
+fn fault(reason: &'static str) -> AdmissionFault {
+    AdmissionFault {
+        stage: "query_prior",
+        reason,
+    }
+}
+
+/// Borrowed checked projection. No deserializer or mutable feature accessor is
+/// supplied. Actual native replay calls this consumer before returning /2 bytes.
+pub struct CheckedNativeReplayPrior<'a> {
+    observation: &'a NativeReplayObservation,
+    readiness: PriorReadiness,
+}
+impl<'a> CheckedNativeReplayPrior<'a> {
+    pub fn projection(&self) -> &'a ReplayQueryPrior {
+        self.observation
+            .query_prior
+            .as_ref()
+            .expect("checked /2 projection")
+    }
+    pub fn readiness(&self) -> PriorReadiness {
+        self.readiness
+    }
+}
+
+pub fn consume_native_replay_prior<'a>(
+    observation: &'a NativeReplayObservation,
+    expected: &ReplayExpectedPins,
+    expected_asset_profile_artifact: &super::super::ArtifactPin,
+    expected_asset_profile: &CpuFreshAssetProfile,
+) -> Result<CheckedNativeReplayPrior<'a>, AdmissionFault> {
+    let audit = &observation.input_admission;
+    let projection = observation
+        .query_prior
+        .as_ref()
+        .ok_or_else(|| fault("explicit /2 projection required"))?;
+    if observation.mode != ReplayInputMode::RepairOpponent4n
+        || observation.schema != super::QUERY_PRIOR_OBSERVATION_SCHEMA
+        || observation.scope != super::SCOPE
+        || audit.mode != observation.mode
+        || audit.schema != observation.mode.input_schema()
+        || audit.scope != super::super::replay_inputs::SCOPE
+        || expected
+            .registered_artifacts
+            .opponent_recheck_source
+            .is_none()
+        || observation.binary_pin_scope != super::super::replay_inputs::BINARY_DECLARATION_SCOPE
+        || audit.binary_pin_scope != observation.binary_pin_scope
+        || audit.parent != expected.parent
+        || audit.binding != expected.binding
+        || audit.registration_artifact != expected.registration_artifact
+        || audit.prepared_action_artifact != expected.prepared_action_artifact
+        || audit.semantic_receipt_artifact != expected.semantic_receipt_artifact
+        || audit.registered_artifacts != expected.registered_artifacts
+        || audit.provider_factory_id != expected.provider_factory_id
+        || audit.legacy_cpu_profile_sha256 != expected.legacy_cpu_profile_sha256
+        || observation.authorities != ReplayAuthorities::default()
+        || audit.authorities != ReplayAuthorities::default()
+        || projection.authorities != ReplayAuthorities::default()
+        || audit.actual_utility_groups != 0
+        || projection.actual_utility_groups != 0
+        || projection.schema != SCHEMA
+        || projection.assurance_scope != SCOPE
+        || projection.projection_source_sha256 != projection_source_digest()
+        || observation.asset_profile_artifact != *expected_asset_profile_artifact
+        || expected_asset_profile.schema != super::ASSET_PROFILE_SCHEMA
+        || expected_asset_profile.domain != "cpu_fresh"
+        || expected_asset_profile.provider != "cpu"
+    {
+        return Err(fault(
+            "independent registration/parent/current/frozen/query binding or authority differs",
+        ));
+    }
+    if let Some(native) = &observation.native_receipt {
+        if super::digest_string(&expected_asset_profile.model_epoch) != Some(native.model_epoch)
+            || super::digest_string(&expected_asset_profile.export_manifest.sha256)
+                != Some(native.export_manifest_sha256)
+            || super::digest_string(&expected_asset_profile.encoding_semantic_sha256)
+                != Some(native.encoding_semantic_sha256)
+            || super::digest_string(&expected.registered_artifacts.provider_factory_source.sha256)
+                != Some(native.adapter_source_sha256)
+        {
+            return Err(fault(
+                "independent model/export/encoding/adapter binding differs",
+            ));
+        }
+    }
+    let readiness = classify(observation, projection);
+    Ok(CheckedNativeReplayPrior {
+        observation,
+        readiness,
+    })
+}
+
+fn classify(
+    observation: &NativeReplayObservation,
+    projection: &ReplayQueryPrior,
+) -> PriorReadiness {
+    // The old execution_deadline_exceeded tick includes cleanup. Cleanup may
+    // legitimately cross E while remaining within W; use the actual work-return
+    // tick for E and preserve the old diagnostic unchanged.
+    if observation.canceled
+        || observation.deadline_exceeded
+        || observation.original_whole_wall_ms != observation.input_admission.whole_wall_ms
+        || observation.cleanup_reserve_ms != observation.input_admission.cleanup_reserve_ms
+        || observation.cleanup_reserve_ms >= observation.original_whole_wall_ms
+        || observation.elapsed_ms > observation.original_whole_wall_ms
+    {
+        return PriorReadiness::OriginalWindowFailed;
+    }
+    if observation.status != "observations_returned"
+        || !observation.replay_returned_ok
+        || !observation.owner_created
+        || !observation.model_returned
+        || !observation.replay_attempted
+        || !observation.assets_source_admitted
+        || !observation.replay_state.complete
+        || !observation
+            .opponent_state
+            .as_ref()
+            .is_some_and(|state| state.complete)
+        || !observation.outcome.complete
+        || !observation.trace_complete
+    {
+        return PriorReadiness::CapturedResultFailed;
+    }
+    if projection.work_returned_within_execution_window != Some(true)
+        || !projection.work_returned_elapsed_ms.is_some_and(|elapsed| {
+            elapsed < observation.original_whole_wall_ms - observation.cleanup_reserve_ms
+        })
+    {
+        return PriorReadiness::OriginalWindowFailed;
+    }
+    let phases = [
+        PriorPhase::Baseline,
+        PriorPhase::After,
+        PriorPhase::RepairEndpoint,
+        PriorPhase::RepairOpponentEndpoint,
+    ];
+    let terminal = projection.outcome == PriorOutcome::RulesTerminalOpponentEndpoint;
+    let required = if terminal { 3 } else { 4 };
+    if (!terminal && projection.outcome != PriorOutcome::CompletedOpponentEndpoint)
+        || projection.stage_count != required
+        || observation.stages.len() != required
+        || projection.stages[required..]
+            .iter()
+            .any(|stage| stage.phase.is_some())
+        || observation.cpu_tasks_requested != Some(required as u64)
+        || observation.cpu_tasks_accounted != Some(required as u64)
+        || observation.cpu_reports_returned != Some(required as u64)
+        || observation.cpu_work_observation_incomplete != Some(false)
+        || !projection.endpoint_observed
+        || projection.endpoint_rules_terminal != terminal
+        || projection.opponent_anchor_ply.is_none()
+        || projection.opponent_role_steps == 0
+        || projection.opponent_role_steps > MAX_LINE_MOVES
+        || projection.accepted_opponent_steps != projection.opponent_role_steps
+        || projection.repaired_line.as_slice().is_empty()
+        || projection.opponent_counterline.as_slice().is_empty()
+        || projection.repaired_line.as_slice() == projection.opponent_counterline.as_slice()
+    {
+        return PriorReadiness::IncompleteCpuScope;
+    }
+    let mut nodes = 0u64;
+    for (at, (stage, raw)) in projection
+        .stages()
+        .iter()
+        .zip(&observation.stages)
+        .enumerate()
+    {
+        if stage.phase != Some(phases[at])
+            || !stage.complete()
+            || !raw.exact_completed
+            || raw.phase
+                != match phases[at] {
+                    PriorPhase::Baseline => "baseline",
+                    PriorPhase::After => "after",
+                    PriorPhase::RepairEndpoint => "repair_endpoint",
+                    PriorPhase::RepairOpponentEndpoint => "repair_opponent_endpoint",
+                }
+            || !raw.report_present
+            || raw.observation_id.is_none()
+            || !raw.raw_stage.complete
+            || !raw.raw_task.complete
+            || !raw.raw_observation.as_ref().is_some_and(|s| s.complete)
+            || raw.report_nodes != stage.report_nodes
+            || raw.requested_depth != stage.requested_depth
+            || raw.report_qnodes != stage.report_qnodes
+            || raw.report_tt_hits != stage.report_tt_hits
+            || raw.node_budget != stage.node_budget
+        {
+            return PriorReadiness::IncompleteCpuScope;
+        }
+        let Some(total) = nodes.checked_add(stage.report_nodes.unwrap_or(0)) else {
+            return PriorReadiness::IncompleteCpuScope;
+        };
+        nodes = total;
+    }
+    if observation.cpu_nodes_lower_bound != Some(nodes)
+        || nodes > observation.input_admission.cpu_allowance
+    {
+        return PriorReadiness::IncompleteCpuScope;
+    }
+    if !observation.cleanup_attempted
+        || !observation.cleanup_returned_ok
+        || observation.native_cleanup_missing
+        || observation.native_bindings_observed == 0
+        || observation.native_ready_observed != observation.native_bindings_observed
+        || observation.native_terminal_missing != 0
+        || observation.native_completion_unknown_observed != 0
+    {
+        return PriorReadiness::NativeClosureUnobserved;
+    }
+    let Some(native) = &observation.native_receipt else {
+        return PriorReadiness::NativeClosureUnobserved;
+    };
+    if !native.physical_shutdown_confirmed
+        || !native.native_buffers_released
+        || native.quarantined
+        || native.physical_runs_in_flight != 0
+        || native.observer_failures != 0
+        || native.last_observer_failure.is_some()
+        || native.last_failure.is_some()
+        || native.failed_physical_role_calls != 0
+        || native.invalid_role_outputs != 0
+        || native.canceled_requests != 0
+        || native.expired_requests != 0
+        || native.completed_role_inputs != native.search_consumed_role_inputs
+        || native.delivered_role_inputs != native.completed_role_inputs
+        || native.physically_completed_role_calls != native.completed_role_inputs
+        || native.completed_role_inputs != observation.native_ready_observed as u64
+    {
+        return PriorReadiness::NativeClosureUnobserved;
+    }
+    if terminal {
+        PriorReadiness::RulesTerminalPendingCallerChronology
+    } else {
+        PriorReadiness::CompleteCpuScopePendingCallerChronology
+    }
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::super::CpuStageObservation;
+    use super::*;
+
+    /// Controlled declarations only. This helper is never a production self-pin
+    /// fallback or evidence of running ONNX/processes/strict parent admission.
+    pub(in super::super) fn controlled_expected(o: &NativeReplayObservation) -> ReplayExpectedPins {
+        let a = &o.input_admission;
+        ReplayExpectedPins {
+            registration_artifact: a.registration_artifact.clone(),
+            prepared_action_artifact: a.prepared_action_artifact.clone(),
+            semantic_receipt_artifact: a.semantic_receipt_artifact.clone(),
+            parent: a.parent.clone(),
+            binding: a.binding.clone(),
+            registered_artifacts: a.registered_artifacts.clone(),
+            legacy_cpu_profile_sha256: a.legacy_cpu_profile_sha256.clone(),
+            provider_factory_id: a.provider_factory_id.clone(),
+            semantic_binary_sha256: "a".repeat(64),
+        }
+    }
+    fn fixture() -> NativeReplayObservation {
+        let mut o = super::super::tests::receipt(super::super::tests::clock(4 * 1024 * 1024));
+        o.mode = ReplayInputMode::RepairOpponent4n;
+        o.schema = super::super::QUERY_PRIOR_OBSERVATION_SCHEMA;
+        o.input_admission.mode = o.mode;
+        o.input_admission.schema = o.mode.input_schema();
+        o.input_admission
+            .registered_artifacts
+            .opponent_recheck_source = Some(super::super::pin(b"controlled_source"));
+        o.input_admission.cpu_allowance = 100;
+        o.status = "observations_returned";
+        o.model_returned = true;
+        o.owner_created = true;
+        o.replay_attempted = true;
+        o.replay_returned_ok = true;
+        o.assets_source_admitted = true;
+        o.replay_state.complete = true;
+        o.outcome.complete = true;
+        o.opponent_state = Some(super::super::SnapshotText {
+            text: String::new(),
+            complete: true,
+        });
+        o.cpu_tasks_requested = Some(4);
+        o.cpu_tasks_accounted = Some(4);
+        o.cpu_reports_returned = Some(4);
+        o.cpu_nodes_lower_bound = Some(40);
+        o.cpu_work_observation_incomplete = Some(false);
+        let mut p = ReplayQueryPrior::default();
+        p.outcome = PriorOutcome::CompletedOpponentEndpoint;
+        p.work_returned_elapsed_ms = Some(1);
+        p.work_returned_within_execution_window = Some(true);
+        p.stage_count = 4;
+        p.endpoint_observed = true;
+        p.opponent_anchor_ply = Some(3);
+        p.opponent_role_steps = 2;
+        p.accepted_opponent_steps = 2;
+        p.repaired_line
+            .capture(&[BoardMove::from_uci("e2e4").unwrap()], MAX_LINE_MOVES)
+            .unwrap();
+        p.opponent_counterline
+            .capture(&[BoardMove::from_uci("d2d4").unwrap()], MAX_LINE_MOVES)
+            .unwrap();
+        let phases = [
+            PriorPhase::Baseline,
+            PriorPhase::After,
+            PriorPhase::RepairEndpoint,
+            PriorPhase::RepairOpponentEndpoint,
+        ];
+        let raw_phases = [
+            "baseline",
+            "after",
+            "repair_endpoint",
+            "repair_opponent_endpoint",
+        ];
+        for (at, stage) in p.stages.iter_mut().enumerate() {
+            stage.phase = Some(phases[at]);
+            stage.requested_depth = 2;
+            stage.node_budget = 25;
+            stage.exact_completed = true;
+            stage.report_present = true;
+            stage.completed_depth = Some(2);
+            stage.completion = Some(PriorCompletion::DepthLimit);
+            stage.completed_iteration = true;
+            stage.reused_completed_depth = Some(0);
+            stage.report_nodes = Some(10);
+            stage.report_qnodes = Some(0);
+            stage.report_tt_hits = Some(0);
+            stage.observation_present = true;
+            let mut raw = CpuStageObservation::reserved().unwrap();
+            raw.phase = raw_phases[at];
+            raw.cpu_execution = at;
+            raw.requested_depth = 2;
+            raw.node_budget = 25;
+            raw.exact_completed = true;
+            raw.report_present = true;
+            raw.report_nodes = Some(10);
+            raw.report_qnodes = Some(0);
+            raw.report_tt_hits = Some(0);
+            raw.observation_id = Some(at);
+            raw.raw_stage.complete = true;
+            raw.raw_task.complete = true;
+            raw.raw_observation.as_mut().unwrap().complete = true;
+            o.stages.push(raw);
+        }
+        o.query_prior = Some(p);
+        o
+    }
+    fn ready(o: &NativeReplayObservation) -> PriorReadiness {
+        consume_native_replay_prior(
+            o,
+            &controlled_expected(o),
+            &o.asset_profile_artifact,
+            &super::super::tests::profile(false),
+        )
+        .unwrap()
+        .readiness()
+    }
+    #[test]
+    fn four_exact_cpu_stages_without_native_evidence_remain_unadmitted() {
+        let o = fixture();
+        assert_eq!(ready(&o), PriorReadiness::NativeClosureUnobserved);
+        let p = o.query_prior.as_ref().unwrap();
+        assert_eq!(p.authorities, ReplayAuthorities::default());
+        assert_eq!(p.actual_utility_groups, 0);
+        let value = serde_json::to_value(p).unwrap();
+        assert!(!value.to_string().contains("cpu_execution"));
+        assert!(!value.to_string().contains("raw_stage"));
+        assert!(!value.to_string().contains("score\":"));
+    }
+    #[test]
+    fn independent_parent_current_frozen_query_and_source_bindings_do_not_cross() {
+        let o = fixture();
+        for at in 0..9 {
+            let mut e = controlled_expected(&o);
+            match at {
+                0 => e.parent.parent_input_sha256 = "b".repeat(64),
+                1 => e.parent.current_view_sha256 = "b".repeat(64),
+                2 => e.parent.frozen_admission_sha256 = "b".repeat(64),
+                3 => e.parent.encoding_sha256 = "b".repeat(64),
+                4 => e.binding.query_sha256 = "b".repeat(64),
+                5 => e.binding.prior_ledger_sha256 = "b".repeat(64),
+                6 => e.registration_artifact.sha256 = "b".repeat(64),
+                7 => e.registered_artifacts.opponent_recheck_source = None,
+                _ => e.provider_factory_id = "other".into(),
+            }
+            assert!(
+                consume_native_replay_prior(
+                    &o,
+                    &e,
+                    &o.asset_profile_artifact,
+                    &super::super::tests::profile(false)
+                )
+                .is_err()
+            );
+        }
+        let mut o = fixture();
+        o.authorities.utility_authority = true;
+        assert!(
+            consume_native_replay_prior(
+                &o,
+                &controlled_expected(&o),
+                &o.asset_profile_artifact,
+                &super::super::tests::profile(false)
+            )
+            .is_err()
+        );
+        let mut o = fixture();
+        o.mode = ReplayInputMode::RepairEndpoint3n;
+        assert!(
+            consume_native_replay_prior(
+                &o,
+                &controlled_expected(&o),
+                &o.asset_profile_artifact,
+                &super::super::tests::profile(false)
+            )
+            .is_err()
+        );
+        let o = fixture();
+        assert!(
+            consume_native_replay_prior(
+                &o,
+                &controlled_expected(&o),
+                &super::super::pin(b"other_asset_profile"),
+                &super::super::tests::profile(false)
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn partial_reordered_frontier_reused_and_missing_work_never_become_complete_scope() {
+        for at in 0..8 {
+            let mut o = fixture();
+            let p = o.query_prior.as_mut().unwrap();
+            match at {
+                0 => p.outcome = PriorOutcome::PartialOpponentEndpoint,
+                1 => p.stages[3].exact_completed = false,
+                2 => p.stages.swap(2, 3),
+                3 => p.stages[3].completed_iteration = false,
+                4 => p.stages[3].reused_completed_depth = Some(1),
+                5 => o.cpu_nodes_lower_bound = None,
+                6 => p.stages[3].report_nodes = Some(26),
+                _ => p.accepted_opponent_steps = 1,
+            }
+            assert_eq!(ready(&o), PriorReadiness::IncompleteCpuScope);
+        }
+    }
+    #[test]
+    fn cleanup_crossing_execution_partition_does_not_relabel_timely_work_as_late() {
+        let mut o = fixture();
+        o.execution_deadline_exceeded = true;
+        o.elapsed_ms = 40_000; // work at 1ms, E=30s, cleanup still within W=60s
+        assert_eq!(ready(&o), PriorReadiness::NativeClosureUnobserved);
+        o.query_prior
+            .as_mut()
+            .unwrap()
+            .work_returned_within_execution_window = Some(false);
+        assert_eq!(ready(&o), PriorReadiness::OriginalWindowFailed);
+        o.query_prior
+            .as_mut()
+            .unwrap()
+            .work_returned_within_execution_window = Some(true);
+        o.canceled = true;
+        assert_eq!(ready(&o), PriorReadiness::OriginalWindowFailed);
+    }
+    #[test]
+    fn terminal_after_three_checks_has_no_fabricated_fourth_cpu_and_still_needs_native_closure() {
+        let mut o = fixture();
+        let p = o.query_prior.as_mut().unwrap();
+        p.outcome = PriorOutcome::RulesTerminalOpponentEndpoint;
+        p.endpoint_rules_terminal = true;
+        p.stage_count = 3;
+        p.stages[3] = PriorStage::default();
+        o.stages.truncate(3);
+        o.cpu_tasks_requested = Some(3);
+        o.cpu_tasks_accounted = Some(3);
+        o.cpu_reports_returned = Some(3);
+        o.cpu_nodes_lower_bound = Some(30);
+        assert_eq!(ready(&o), PriorReadiness::NativeClosureUnobserved);
+        assert_eq!(
+            serde_json::to_value(o.query_prior.as_ref().unwrap()).unwrap()["stages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        o.query_prior.as_mut().unwrap().stage_count = 4;
+        assert_eq!(ready(&o), PriorReadiness::IncompleteCpuScope);
+    }
+    #[test]
+    fn fixed_projection_extent_and_move16_match_existing_export_without_truncation() {
+        let mut p = ReplayQueryPrior::default();
+        let movement = BoardMove::from_uci("a7a8n").unwrap();
+        let moves = [movement; MAX_PV_MOVES];
+        for s in &mut p.stages {
+            s.phase = Some(PriorPhase::Baseline);
+            s.pv.capture(&moves, MAX_PV_MOVES).unwrap();
+            s.report_nodes = Some(u64::MAX);
+            s.report_qnodes = Some(u64::MAX);
+            s.report_tt_hits = Some(u64::MAX);
+            s.report_elapsed_ms = Some(u64::MAX);
+            s.attempt_nodes = Some(u64::MAX);
+            s.node_budget = u64::MAX;
+            s.registered_condition_sha256 = [255; 32];
+            s.task_condition_sha256 = [255; 32];
+        }
+        p.repaired_line
+            .capture(&moves[..MAX_LINE_MOVES], MAX_LINE_MOVES)
+            .unwrap();
+        p.opponent_counterline
+            .capture(&moves[..MAX_LINE_MOVES], MAX_LINE_MOVES)
+            .unwrap();
+        let raw = serde_json::to_vec(&p).unwrap();
+        assert!(raw.len() <= MAX_PROJECTED_JSON_BYTES);
+        assert_eq!(
+            p.stages[0].pv.as_slice(),
+            crate::pals_cpu_task::pack_moves(&moves).unwrap()
+        );
+        assert!(
+            p.repaired_line
+                .capture(&moves[..MAX_LINE_MOVES + 1], MAX_LINE_MOVES)
+                .is_err()
+        );
+        assert!(p.repaired_line.as_slice().is_empty());
+        const {
+            assert!(MAX_PROJECTED_JSON_BYTES < super::super::HEADER_RESERVE);
+        }
+    }
+}
