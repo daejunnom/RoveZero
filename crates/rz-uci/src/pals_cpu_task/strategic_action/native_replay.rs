@@ -2123,10 +2123,12 @@ mod tests {
         assert_eq!(collector.limit, roles * OPPONENT_ROLE_TRACE_BYTES);
         assert_eq!(collector.large_row_bytes, OPPONENT_LARGE_ROW_BYTES);
         assert_eq!(collector.row_limit, roles * ROWS_PER_ROLE);
-        assert!(
-            2 * OPPONENT_LARGE_ROW_BYTES + CONTEXT_BYTES + 9 * SMALL_ROW_BYTES + ROWS_PER_ROLE
-                <= OPPONENT_ROLE_TRACE_BYTES
-        );
+        const {
+            assert!(
+                2 * OPPONENT_LARGE_ROW_BYTES + CONTEXT_BYTES + 9 * SMALL_ROW_BYTES + ROWS_PER_ROLE
+                    <= OPPONENT_ROLE_TRACE_BYTES
+            );
+        }
         for checks in [2, 3] {
             let old = replay_output_requirements(5, checks).unwrap();
             assert_eq!(
