@@ -26,7 +26,9 @@ use rz_search::pals::engine::{PalsConfig, PalsLimits};
 use semantic::{MoveMeaning, MoveTokenKind, SemanticReceipt, SemanticRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::TryReserveError;
 use std::fmt;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -42,6 +44,206 @@ pub const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
 const MAX_KNOWN_HISTORY_POSITIONS: usize = 4096;
 const DIAGNOSTIC_OUTPUT_BYTES: usize = 1024;
+pub const MAX_CONSTRUCTION_CREDIT_BYTES: usize = 16 * 1024 * 1024;
+const CONSTRUCTION_TOPOLOGY_BYTES: usize = 64 * 1024;
+const CONSTRUCTION_RAW_PAYLOAD_COPIES: usize = 3;
+
+/// registration is the new ReplayConsumerRegistration wire, not the historical
+/// semantic producer's registration. All three byte slices remain original.
+#[derive(Clone, Copy)]
+pub struct ReplayOriginals<'a> {
+    pub registration: &'a [u8],
+    pub prepared_action: &'a [u8],
+    pub semantic_receipt: &'a [u8],
+}
+impl fmt::Debug for ReplayOriginals<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReplayOriginals")
+            .field("registration_bytes", &self.registration.len())
+            .field("prepared_action_bytes", &self.prepared_action.len())
+            .field("semantic_receipt_bytes", &self.semantic_receipt.len())
+            .finish()
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct ReplayPreparationDeclaration<'a> {
+    pub mode: ReplayInputMode,
+    pub config: &'a ReplayConfigInput,
+    pub resources: &'a ReplayResourceDeclaration,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct ReplayConstructionBudget {
+    pub max_outer_bytes: usize,
+    pub max_construction_credit_bytes: usize,
+}
+
+/// Policy prepayment for known owned construction backing only. Neither these
+/// numbers nor retained Vec capacity measure allocator, validator or RSS peak.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct ReplayConstructionCredit {
+    pub raw_utf8_bytes: usize,
+    /// Source-owned copy allowance, not an observed allocator or RSS peak.
+    pub raw_payload_copies: usize,
+    pub context_json_bytes: usize,
+    pub outer_json_bytes: usize,
+    pub fixed_topology_bytes: usize,
+    pub policy_bytes: usize,
+    pub final_retained_capacity_bytes: usize,
+    pub allocator_peak_observed: bool,
+    pub validator_peak_observed: bool,
+    pub rss_peak_observed: bool,
+}
+#[derive(Debug, Serialize)]
+pub struct ReplayPreparationAudit {
+    pub scope: &'static str,
+    pub construction: ReplayConstructionCredit,
+    pub input_admission: ReplayInputAudit,
+    pub elapsed_ms: u64,
+}
+
+/// Immutable owned outer wire, checked by the existing scoped input boundary.
+/// It is not a Query capability, caller registration or native execution token.
+pub struct PreparedReplayRequest {
+    bytes: Vec<u8>,
+    artifact: ArtifactPin,
+    audit: ReplayPreparationAudit,
+    whole_deadline: Instant,
+    execution_deadline: Instant,
+}
+impl fmt::Debug for PreparedReplayRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedReplayRequest")
+            .field("artifact", &self.artifact)
+            .field("construction", &self.audit.construction)
+            .finish_non_exhaustive()
+    }
+}
+impl PreparedReplayRequest {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn artifact(&self) -> &ArtifactPin {
+        &self.artifact
+    }
+    pub fn audit(&self) -> &ReplayPreparationAudit {
+        &self.audit
+    }
+    pub fn deadline(&self) -> Instant {
+        self.whole_deadline
+    }
+    pub fn execution_deadline(&self) -> Instant {
+        self.execution_deadline
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplayOriginalKind {
+    Registration,
+    PreparedAction,
+    SemanticReceipt,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplayConstructionWriterFailure {
+    Deadline,
+    ByteLimit,
+    LengthOverflow,
+    RetainedCapacity,
+}
+#[derive(Debug)]
+pub enum ReplayPreparationCause {
+    Input(Box<ReplayInputError>),
+    Utf8 {
+        original: ReplayOriginalKind,
+        source: std::str::Utf8Error,
+    },
+    Reserve(TryReserveError),
+    Serialization {
+        source: serde_json::Error,
+        writer: Option<ReplayConstructionWriterFailure>,
+    },
+    Refusal {
+        reason: &'static str,
+        actual: Option<usize>,
+        limit: Option<usize>,
+    },
+}
+
+/// Failed bytes are owned evidence, never a successful prepared input. A partial
+/// serialization has no complete artifact pin and is explicitly distinguished.
+pub struct RejectedReplayBytes {
+    bytes: Vec<u8>,
+    artifact: Option<ArtifactPin>,
+    serialization_complete: bool,
+}
+impl fmt::Debug for RejectedReplayBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RejectedReplayBytes")
+            .field("bytes", &self.bytes.len())
+            .field("artifact", &self.artifact)
+            .field("serialization_complete", &self.serialization_complete)
+            .finish()
+    }
+}
+impl RejectedReplayBytes {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn artifact(&self) -> Option<&ArtifactPin> {
+        self.artifact.as_ref()
+    }
+    pub fn serialization_complete(&self) -> bool {
+        self.serialization_complete
+    }
+}
+#[derive(Debug, Serialize)]
+pub struct ReplayPreparationDiagnostics {
+    pub expected_semantic_receipt_producer_scope: SemanticReceiptProducerScope,
+    pub elapsed_ms: u64,
+    pub deadline_exceeded: bool,
+    pub execution_deadline_exceeded: bool,
+    pub original_whole_deadline_retained: bool,
+    pub whole_wall_ms: Option<u64>,
+    pub cleanup_reserve_ms: Option<u64>,
+    pub output_limit: usize,
+    #[serde(skip)]
+    original_started: Instant,
+    #[serde(skip)]
+    clock: Option<Clock>,
+}
+impl ReplayPreparationDiagnostics {
+    pub fn original_started(&self) -> Instant {
+        self.original_started
+    }
+    pub fn deadline(&self) -> Option<Instant> {
+        self.clock.map(|c| c.whole_deadline)
+    }
+    pub fn execution_deadline(&self) -> Option<Instant> {
+        self.clock.map(|c| c.execution_deadline)
+    }
+}
+#[derive(Debug)]
+pub struct ReplayPreparationError {
+    pub stage: &'static str,
+    pub cause: Box<ReplayPreparationCause>,
+    pub diagnostics: Box<ReplayPreparationDiagnostics>,
+    pub rejected_outer: Option<Box<RejectedReplayBytes>>,
+}
+impl fmt::Display for ReplayPreparationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "replay preparation failed at {}", self.stage)
+    }
+}
+impl std::error::Error for ReplayPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self.cause.as_ref() {
+            ReplayPreparationCause::Input(error) => Some(error.as_ref()),
+            ReplayPreparationCause::Utf8 { source, .. } => Some(source),
+            ReplayPreparationCause::Reserve(source) => Some(source),
+            ReplayPreparationCause::Serialization { source, .. } => Some(source),
+            ReplayPreparationCause::Refusal { .. } => None,
+        }
+    }
+}
 
 /// Independently registered scope of the historical SemanticReceipt producer.
 /// Exact comparison observes a caller declaration, never the current replay
@@ -1281,7 +1483,33 @@ fn check_replay_inputs_inner(
     let request: ReplayInputRequest = serde_json::from_slice(bytes).map_err(|e| {
         ReplayInputError::new("input_json", e).stamped(started, None, expected_scope)
     })?;
-    let resources = &request.resources;
+    let mut admitted_clock = None;
+    let clock = admit_resource_clock(
+        &request.resources,
+        started,
+        expected_scope,
+        &mut admitted_clock,
+    )?;
+    validate(
+        request,
+        expected,
+        started,
+        clock,
+        super::pin(bytes),
+        expected_scope,
+    )
+    .map_err(|e| e.stamped(started, Some(clock), expected_scope))
+}
+
+/// Keeps the actual partial clock at admission failures without reconstructing
+/// it from error strings. Legacy JSON parsing still happens before this helper.
+fn admit_resource_clock(
+    resources: &ReplayResourceDeclaration,
+    started: Instant,
+    expected_scope: Option<SemanticReceiptProducerScope>,
+    admitted: &mut Option<Clock>,
+) -> Result<Clock, ReplayInputError> {
+    *admitted = None;
     if !(1..=cpu_task::MAX_WALL_TIME_MS).contains(&resources.whole_wall_ms) {
         return Err(
             ReplayInputError::new("whole_wall", "finite original whole wall required").stamped(
@@ -1312,6 +1540,7 @@ fn check_replay_inputs_inner(
             DIAGNOSTIC_OUTPUT_BYTES
         },
     };
+    *admitted = Some(clock);
     if !output_valid {
         return Err(ReplayInputError::new(
             "output_bound",
@@ -1338,6 +1567,7 @@ fn check_replay_inputs_inner(
                 expected_scope,
             )
         })?;
+    *admitted = Some(clock);
     if started > Instant::now() {
         return Err(ReplayInputError::new(
             "original_clock",
@@ -1345,15 +1575,554 @@ fn check_replay_inputs_inner(
         )
         .stamped(started, Some(clock), expected_scope));
     }
-    validate(
-        request,
-        expected,
-        started,
+    Ok(clock)
+}
+
+/// Borrowed shape of the existing closed outer wire. Opaque raw strings are
+/// serialized verbatim as JSON string values, never parsed and re-rendered here.
+#[derive(Serialize)]
+struct ReplayPreparationView<'a> {
+    schema: &'static str,
+    mode: ReplayInputMode,
+    registration_raw: &'a str,
+    registration_artifact: &'a ArtifactPin,
+    prepared_action_raw: &'a str,
+    prepared_action_artifact: &'a ArtifactPin,
+    semantic_receipt_raw: &'a str,
+    semantic_receipt_artifact: &'a ArtifactPin,
+    parent: &'a ReplayParentPins,
+    binding: &'a ReplayBindingPins,
+    config: &'a ReplayConfigInput,
+    resources: &'a ReplayResourceDeclaration,
+    authorities: ReplayAuthorities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_sha256: Option<&'a str>,
+}
+
+struct ConstructionWriter<'a> {
+    backing: Option<&'a mut Vec<u8>>,
+    bytes: usize,
+    limit: usize,
+    clock: Clock,
+    failure: Option<ReplayConstructionWriterFailure>,
+}
+impl ConstructionWriter<'_> {
+    fn reject(&mut self, reason: ReplayConstructionWriterFailure) -> io::Error {
+        self.failure = Some(reason);
+        io::Error::other("bounded replay construction writer refused write")
+    }
+}
+impl Write for ConstructionWriter<'_> {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if Instant::now() >= self.clock.execution_deadline {
+            return Err(self.reject(ReplayConstructionWriterFailure::Deadline));
+        }
+        let Some(next) = self.bytes.checked_add(input.len()) else {
+            return Err(self.reject(ReplayConstructionWriterFailure::LengthOverflow));
+        };
+        if next > self.limit {
+            return Err(self.reject(ReplayConstructionWriterFailure::ByteLimit));
+        }
+        if self
+            .backing
+            .as_ref()
+            .is_some_and(|bytes| next > bytes.capacity())
+        {
+            return Err(self.reject(ReplayConstructionWriterFailure::RetainedCapacity));
+        }
+        if let Some(bytes) = self.backing.as_mut() {
+            // Capacity was reserved and inspected before serialization. This
+            // extend cannot request a new backing allocation.
+            bytes.extend_from_slice(input);
+        }
+        self.bytes = next;
+        Ok(input.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        if Instant::now() >= self.clock.execution_deadline {
+            Err(self.reject(ReplayConstructionWriterFailure::Deadline))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn preparation_input_cause(
+    error: ReplayInputError,
+    started: Instant,
+    clock: Clock,
+    scope: SemanticReceiptProducerScope,
+) -> ReplayPreparationCause {
+    ReplayPreparationCause::Input(Box::new(error.stamped(started, Some(clock), Some(scope))))
+}
+fn preparation_clock(
+    started: Instant,
+    clock: Clock,
+    scope: SemanticReceiptProducerScope,
+) -> Result<(), ReplayPreparationCause> {
+    check_clock(clock).map_err(|error| preparation_input_cause(error, started, clock, scope))
+}
+fn preparation_error(
+    stage: &'static str,
+    cause: ReplayPreparationCause,
+    started: Instant,
+    clock: Option<Clock>,
+    scope: SemanticReceiptProducerScope,
+    rejected_outer: Option<RejectedReplayBytes>,
+) -> ReplayPreparationError {
+    let mut error = ReplayPreparationError {
+        stage,
+        cause: Box::new(cause),
+        diagnostics: Box::new(ReplayPreparationDiagnostics {
+            expected_semantic_receipt_producer_scope: scope,
+            elapsed_ms: 0,
+            deadline_exceeded: false,
+            execution_deadline_exceeded: false,
+            original_whole_deadline_retained: clock.is_some(),
+            whole_wall_ms: clock.map(|c| c.whole_wall_ms),
+            cleanup_reserve_ms: clock.map(|c| c.cleanup_reserve_ms),
+            output_limit: clock.map_or(DIAGNOSTIC_OUTPUT_BYTES, |c| c.output_limit),
+            original_started: started,
+            clock,
+        }),
+        rejected_outer: rejected_outer.map(Box::new),
+    };
+    let now = Instant::now();
+    error.diagnostics.elapsed_ms = cpu_task::milliseconds(now.saturating_duration_since(started));
+    error.diagnostics.deadline_exceeded = clock.is_some_and(|c| now >= c.whole_deadline);
+    error.diagnostics.execution_deadline_exceeded =
+        clock.is_some_and(|c| now >= c.execution_deadline);
+    error
+}
+fn count_preparation<T: Serialize>(
+    value: &T,
+    limit: usize,
+    clock: Clock,
+    started: Instant,
+    scope: SemanticReceiptProducerScope,
+) -> Result<usize, ReplayPreparationCause> {
+    preparation_clock(started, clock, scope)?;
+    let mut writer = ConstructionWriter {
+        backing: None,
+        bytes: 0,
+        limit,
         clock,
-        super::pin(bytes),
-        expected_scope,
+        failure: None,
+    };
+    serde_json::to_writer(&mut writer, value).map_err(|source| {
+        ReplayPreparationCause::Serialization {
+            source,
+            writer: writer.failure,
+        }
+    })?;
+    preparation_clock(started, clock, scope)?;
+    Ok(writer.bytes)
+}
+
+fn preparation_expected_shape(expected: &ReplayExpectedPins) -> Result<(), ReplayInputError> {
+    // No cloning or context Value construction until every variable-size
+    // expected field is bounded. Numeric declarations have fixed wire topology.
+    for sha in [
+        &expected.parent.parent_input_sha256,
+        &expected.parent.current_view_sha256,
+        &expected.parent.frozen_admission_sha256,
+        &expected.parent.encoding_sha256,
+        &expected.binding.query_sha256,
+        &expected.binding.prior_ledger_sha256,
+        &expected.binding.semantic_input_sha256,
+        &expected.binding.semantic_context_sha256,
+        &expected.binding.semantic_branch_meaning_sha256,
+        &expected.binding.semantic_before_result_anchor_sha256,
+        &expected.legacy_cpu_profile_sha256,
+        &expected.semantic_binary_sha256,
+    ] {
+        digest_bytes(sha)?;
+    }
+    if expected.provider_factory_id.is_empty()
+        || expected.provider_factory_id.len() > 128
+        || !expected
+            .provider_factory_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(ReplayInputError::new(
+            "registration_identity",
+            "bounded closed factory ID required",
+        ));
+    }
+    for (pin, maximum) in [
+        (
+            &expected.registration_artifact,
+            MAX_REGISTRATION_BYTES as u64,
+        ),
+        (
+            &expected.prepared_action_artifact,
+            super::MAX_REQUEST_BYTES as u64,
+        ),
+        (
+            &expected.semantic_receipt_artifact,
+            MAX_SEMANTIC_RECEIPT_BYTES as u64,
+        ),
+        (
+            &expected.binding.catalogue_artifact,
+            MAX_OUTPUT_BYTES as u64,
+        ),
+        (
+            &expected.binding.before_result_artifact,
+            MAX_OUTPUT_BYTES as u64,
+        ),
+        (
+            &expected.binding.cpu_request_artifact,
+            cpu_task::MAX_REQUEST_BYTES as u64,
+        ),
+        (
+            &expected.registered_artifacts.legacy_cpu_binary,
+            cpu_task::MAX_SELF_BINARY_BYTES,
+        ),
+        (
+            &expected.registered_artifacts.replay_binary,
+            cpu_task::MAX_SELF_BINARY_BYTES,
+        ),
+        (
+            &expected.registered_artifacts.engine_source,
+            MAX_SOURCE_BYTES,
+        ),
+        (
+            &expected.registered_artifacts.wrapper_source,
+            MAX_SOURCE_BYTES,
+        ),
+        (
+            &expected.registered_artifacts.replay_source,
+            MAX_SOURCE_BYTES,
+        ),
+        (
+            &expected.registered_artifacts.provider_factory_source,
+            MAX_SOURCE_BYTES,
+        ),
+    ] {
+        // checked_pin checks SHA shape before constructing an error projection.
+        bounded_pin(pin, maximum)?;
+    }
+    Ok(())
+}
+fn preparation_original<'a>(
+    raw: &'a [u8],
+    expected: &ArtifactPin,
+    maximum: usize,
+    original: ReplayOriginalKind,
+) -> Result<&'a str, ReplayPreparationCause> {
+    if raw.is_empty() || raw.len() > maximum || expected.bytes != raw.len() as u64 {
+        return Err(ReplayPreparationCause::Refusal {
+            reason: "original UTF-8 byte extent differs from independent pin or bound",
+            actual: Some(raw.len()),
+            limit: Some(maximum),
+        });
+    }
+    let text = std::str::from_utf8(raw)
+        .map_err(|source| ReplayPreparationCause::Utf8 { original, source })?;
+    if super::pin(raw) != *expected {
+        return Err(ReplayPreparationCause::Refusal {
+            reason: "original bytes differ from independently supplied SHA256",
+            actual: None,
+            limit: None,
+        });
+    }
+    Ok(text)
+}
+
+/// Constructs only the existing outer input wire and its closed context. The
+/// three originals stay borrowed and byte-exact; a successful result has passed
+/// the existing scoped checker, which is then dropped. No engines are created.
+///
+/// The prepaid policy is 3*Sraw + 2*C + Q + 64KiB. Unchanged closed_context keeps
+/// its original body Value while json!'s array expression converts &body into a
+/// second Value with owned raw strings; the existing canonical helper then
+/// recursively clones a third, sorted Value. These three raw payload copies can
+/// coexist. The remaining allowance covers conservative canonical Vec growth,
+/// exact final Vec and fixed metadata topology. It is not an allocator/validator/
+/// RSS peak guarantee. The final checker is a separate allocation boundary. No
+/// caller certification bool, larger wall or expanded remaining is accepted.
+pub fn prepare_replay_request(
+    originals: ReplayOriginals<'_>,
+    declaration: ReplayPreparationDeclaration<'_>,
+    expected: &ReplayExpectedPins,
+    expected_scope: SemanticReceiptProducerScope,
+    budget: ReplayConstructionBudget,
+    started: Instant,
+) -> Result<PreparedReplayRequest, ReplayPreparationError> {
+    let mut observed_clock = None;
+    let clock = admit_resource_clock(
+        declaration.resources,
+        started,
+        Some(expected_scope),
+        &mut observed_clock,
     )
-    .map_err(|e| e.stamped(started, Some(clock), expected_scope))
+    .map_err(|error| {
+        preparation_error(
+            "resource_clock",
+            ReplayPreparationCause::Input(Box::new(error)),
+            started,
+            observed_clock,
+            expected_scope,
+            None,
+        )
+    })?;
+    let mut stage = "preflight";
+    let mut bytes = Vec::new();
+    let mut artifact = None;
+    let mut serialization_complete = false;
+    let prepared =
+        (|| -> Result<(ReplayPreparationAudit, Instant, Instant), ReplayPreparationCause> {
+            if !(1..=MAX_REQUEST_BYTES).contains(&budget.max_outer_bytes)
+                || !(1..=MAX_CONSTRUCTION_CREDIT_BYTES)
+                    .contains(&budget.max_construction_credit_bytes)
+            {
+                return Err(ReplayPreparationCause::Refusal {
+                    reason: "construction outer/credit bounds are outside supported finite limits",
+                    actual: None,
+                    limit: None,
+                });
+            }
+            preparation_expected_shape(expected)
+                .map_err(|error| preparation_input_cause(error, started, clock, expected_scope))?;
+            let registration_raw = preparation_original(
+                originals.registration,
+                &expected.registration_artifact,
+                MAX_REGISTRATION_BYTES,
+                ReplayOriginalKind::Registration,
+            )?;
+            let prepared_action_raw = preparation_original(
+                originals.prepared_action,
+                &expected.prepared_action_artifact,
+                super::MAX_REQUEST_BYTES,
+                ReplayOriginalKind::PreparedAction,
+            )?;
+            let semantic_receipt_raw = preparation_original(
+                originals.semantic_receipt,
+                &expected.semantic_receipt_artifact,
+                MAX_SEMANTIC_RECEIPT_BYTES,
+                ReplayOriginalKind::SemanticReceipt,
+            )?;
+            let raw_utf8_bytes = originals
+                .registration
+                .len()
+                .checked_add(originals.prepared_action.len())
+                .and_then(|sum| sum.checked_add(originals.semantic_receipt.len()))
+                .ok_or(ReplayPreparationCause::Refusal {
+                    reason: "original byte sum overflow",
+                    actual: None,
+                    limit: None,
+                })?;
+            let mut view = ReplayPreparationView {
+                schema: SCHEMA,
+                mode: declaration.mode,
+                registration_raw,
+                registration_artifact: &expected.registration_artifact,
+                prepared_action_raw,
+                prepared_action_artifact: &expected.prepared_action_artifact,
+                semantic_receipt_raw,
+                semantic_receipt_artifact: &expected.semantic_receipt_artifact,
+                parent: &expected.parent,
+                binding: &expected.binding,
+                config: declaration.config,
+                resources: declaration.resources,
+                authorities: ReplayAuthorities::default(),
+                context_sha256: None,
+            };
+            stage = "count";
+            // Context has the existing compact [SCHEMA, body] canonical meaning.
+            // Sorting changes key order, not compact byte length or string escaping.
+            let context_json_bytes = count_preparation(
+                &(SCHEMA, &view),
+                MAX_REQUEST_BYTES,
+                clock,
+                started,
+                expected_scope,
+            )?;
+            const PLACEHOLDER: &str =
+                "0000000000000000000000000000000000000000000000000000000000000000";
+            view.context_sha256 = Some(PLACEHOLDER);
+            let outer_json_bytes = count_preparation(
+                &view,
+                budget.max_outer_bytes,
+                clock,
+                started,
+                expected_scope,
+            )?;
+            let policy_bytes = raw_utf8_bytes
+                .checked_mul(CONSTRUCTION_RAW_PAYLOAD_COPIES)
+                .and_then(|amount| {
+                    context_json_bytes
+                        .checked_mul(2)
+                        .and_then(|context| amount.checked_add(context))
+                })
+                .and_then(|amount| amount.checked_add(outer_json_bytes))
+                .and_then(|amount| amount.checked_add(CONSTRUCTION_TOPOLOGY_BYTES))
+                .ok_or(ReplayPreparationCause::Refusal {
+                    reason: "construction credit arithmetic overflow",
+                    actual: None,
+                    limit: None,
+                })?;
+            if policy_bytes > budget.max_construction_credit_bytes {
+                return Err(ReplayPreparationCause::Refusal {
+                    reason: "known construction backing policy exceeds declared credit",
+                    actual: Some(policy_bytes),
+                    limit: Some(budget.max_construction_credit_bytes),
+                });
+            }
+            stage = "final_backing";
+            preparation_clock(started, clock, expected_scope)?;
+            bytes
+                .try_reserve_exact(outer_json_bytes)
+                .map_err(ReplayPreparationCause::Reserve)?;
+            if bytes.capacity() != outer_json_bytes {
+                return Err(ReplayPreparationCause::Refusal {
+                    reason: "allocator retained capacity differs from prepaid exact final backing",
+                    actual: Some(bytes.capacity()),
+                    limit: Some(outer_json_bytes),
+                });
+            }
+            stage = "context";
+            preparation_clock(started, clock, expected_scope)?;
+            let context = closed_context(SCHEMA, &view)
+                .map_err(|error| preparation_input_cause(error, started, clock, expected_scope))?;
+            preparation_clock(started, clock, expected_scope)?;
+            view.context_sha256 = Some(&context);
+            stage = "serialize";
+            let written = {
+                let mut writer = ConstructionWriter {
+                    backing: Some(&mut bytes),
+                    bytes: 0,
+                    limit: outer_json_bytes,
+                    clock,
+                    failure: None,
+                };
+                serde_json::to_writer(&mut writer, &view).map_err(|source| {
+                    ReplayPreparationCause::Serialization {
+                        source,
+                        writer: writer.failure,
+                    }
+                })?;
+                writer.bytes
+            };
+            serialization_complete = true;
+            if written != outer_json_bytes {
+                return Err(ReplayPreparationCause::Refusal {
+                    reason: "actual compact outer differs from prepaid byte count",
+                    actual: Some(written),
+                    limit: Some(outer_json_bytes),
+                });
+            }
+            preparation_clock(started, clock, expected_scope)?;
+            artifact = Some(super::pin(&bytes));
+            preparation_clock(started, clock, expected_scope)?;
+            stage = "scoped_input_check";
+            // Move the actual typed checker cause unchanged on error. Its source,
+            // expected scope and original clock are not reconstructed or replaced.
+            let checked =
+                check_replay_inputs_with_semantic_scope(&bytes, expected, expected_scope, started)
+                    .map_err(|error| ReplayPreparationCause::Input(Box::new(error)))?;
+            if checked.original_registration() != originals.registration
+                || checked.original_prepared_action() != originals.prepared_action
+                || checked.original_semantic_receipt() != originals.semantic_receipt
+                || checked.deadline() != clock.whole_deadline
+                || checked.execution_deadline() != clock.execution_deadline
+            {
+                return Err(ReplayPreparationCause::Refusal {
+                    reason: "scoped checker did not retain original bytes and clock",
+                    actual: None,
+                    limit: None,
+                });
+            }
+            let input_admission = checked.audit();
+            let whole_deadline = checked.deadline();
+            let execution_deadline = checked.execution_deadline();
+            drop(checked);
+            stage = "prepared_publication";
+            preparation_clock(started, clock, expected_scope)?;
+            Ok((
+                ReplayPreparationAudit {
+                    scope: "borrowed_original_bytes_to_existing_scoped_input_check_only",
+                    construction: ReplayConstructionCredit {
+                        raw_utf8_bytes,
+                        raw_payload_copies: CONSTRUCTION_RAW_PAYLOAD_COPIES,
+                        context_json_bytes,
+                        outer_json_bytes,
+                        fixed_topology_bytes: CONSTRUCTION_TOPOLOGY_BYTES,
+                        policy_bytes,
+                        final_retained_capacity_bytes: bytes.capacity(),
+                        allocator_peak_observed: false,
+                        validator_peak_observed: false,
+                        rss_peak_observed: false,
+                    },
+                    input_admission,
+                    elapsed_ms: cpu_task::milliseconds(started.elapsed()),
+                },
+                whole_deadline,
+                execution_deadline,
+            ))
+        })();
+    match prepared {
+        Ok((mut audit, whole_deadline, execution_deadline)) => {
+            // The checker observed the same artifact. Move that small pin; no
+            // rehash, raw clone or fresh deadline is needed during publication.
+            let Some(pin) = artifact else {
+                return Err(preparation_error(
+                    "prepared_publication",
+                    ReplayPreparationCause::Refusal {
+                        reason: "completed scoped input lacks its observed outer artifact",
+                        actual: None,
+                        limit: None,
+                    },
+                    started,
+                    Some(clock),
+                    expected_scope,
+                    Some(RejectedReplayBytes {
+                        bytes,
+                        artifact: None,
+                        serialization_complete,
+                    }),
+                ));
+            };
+            if let Err(cause) = preparation_clock(started, clock, expected_scope) {
+                return Err(preparation_error(
+                    "prepared_publication",
+                    cause,
+                    started,
+                    Some(clock),
+                    expected_scope,
+                    Some(RejectedReplayBytes {
+                        bytes,
+                        artifact: Some(pin),
+                        serialization_complete,
+                    }),
+                ));
+            }
+            audit.elapsed_ms = cpu_task::milliseconds(started.elapsed());
+            Ok(PreparedReplayRequest {
+                bytes,
+                artifact: pin,
+                audit,
+                whole_deadline,
+                execution_deadline,
+            })
+        }
+        Err(cause) => {
+            let rejected = (bytes.capacity() != 0).then_some(RejectedReplayBytes {
+                bytes,
+                artifact,
+                serialization_complete,
+            });
+            Err(preparation_error(
+                stage,
+                cause,
+                started,
+                Some(clock),
+                expected_scope,
+                rejected,
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1607,6 +2376,747 @@ mod tests {
         fixture.expected.semantic_receipt_artifact =
             fixture.request.semantic_receipt_artifact.clone();
         reseal(fixture);
+    }
+
+    fn construction_budget() -> ReplayConstructionBudget {
+        ReplayConstructionBudget {
+            max_outer_bytes: MAX_REQUEST_BYTES,
+            max_construction_credit_bytes: MAX_CONSTRUCTION_CREDIT_BYTES,
+        }
+    }
+    fn constructed(
+        fixture: &Fixture,
+        scope: SemanticReceiptProducerScope,
+        budget: ReplayConstructionBudget,
+        started: Instant,
+    ) -> Result<PreparedReplayRequest, ReplayPreparationError> {
+        prepare_replay_request(
+            ReplayOriginals {
+                registration: fixture.request.registration_raw.as_bytes(),
+                prepared_action: fixture.request.prepared_action_raw.as_bytes(),
+                semantic_receipt: fixture.request.semantic_receipt_raw.as_bytes(),
+            },
+            ReplayPreparationDeclaration {
+                mode: fixture.request.mode,
+                config: &fixture.request.config,
+                resources: &fixture.request.resources,
+            },
+            &fixture.expected,
+            scope,
+            budget,
+            started,
+        )
+    }
+
+    #[test]
+    fn construction_preserves_all_original_whitespace_and_exact_independent_pins_without_engines() {
+        for mode in [
+            ReplayInputMode::ReplyOnly2n,
+            ReplayInputMode::RepairEndpoint3n,
+        ] {
+            let mut value = fixture(mode, false, "position startpos");
+            value.request.registration_raw =
+                format!("\r\n\t{} \r\n", value.request.registration_raw);
+            value.request.prepared_action_raw =
+                format!("\t{}\r\n ", value.request.prepared_action_raw);
+            value.request.semantic_receipt_raw =
+                format!("\n{}\t\r\n", value.request.semantic_receipt_raw);
+            // Independent fixture registration records the original bytes. The
+            // production constructor cannot choose or replace these expected pins.
+            value.expected.registration_artifact =
+                super::super::pin(value.request.registration_raw.as_bytes());
+            value.expected.prepared_action_artifact =
+                super::super::pin(value.request.prepared_action_raw.as_bytes());
+            value.expected.semantic_receipt_artifact =
+                super::super::pin(value.request.semantic_receipt_raw.as_bytes());
+            let started = Instant::now();
+            let prepared =
+                constructed(&value, PRODUCER_SCOPES[0], construction_budget(), started).unwrap();
+            let wire: ReplayInputRequest = serde_json::from_slice(prepared.as_bytes()).unwrap();
+            assert_eq!(
+                wire.registration_raw.as_bytes(),
+                value.request.registration_raw.as_bytes()
+            );
+            assert_eq!(
+                wire.prepared_action_raw.as_bytes(),
+                value.request.prepared_action_raw.as_bytes()
+            );
+            assert_eq!(
+                wire.semantic_receipt_raw.as_bytes(),
+                value.request.semantic_receipt_raw.as_bytes()
+            );
+            assert_eq!(prepared.artifact(), &super::super::pin(prepared.as_bytes()));
+            assert_eq!(wire.context_sha256, seal(SCHEMA, &wire));
+            assert_eq!(prepared.deadline(), started + Duration::from_millis(5000));
+            assert_eq!(
+                prepared.execution_deadline(),
+                started + Duration::from_millis(4990)
+            );
+            let audit = prepared.audit();
+            assert_eq!(audit.input_admission.mode, mode);
+            assert_eq!(
+                audit.input_admission.registration_artifact,
+                value.expected.registration_artifact
+            );
+            assert_eq!(
+                audit.input_admission.prepared_action_artifact,
+                value.expected.prepared_action_artifact
+            );
+            assert_eq!(
+                audit.input_admission.semantic_receipt_artifact,
+                value.expected.semantic_receipt_artifact
+            );
+            assert_eq!(
+                audit.input_admission.authorities,
+                ReplayAuthorities::default()
+            );
+            assert_eq!(audit.input_admission.cpu_checks, 0);
+            assert_eq!(audit.input_admission.actual_utility_groups, 0);
+            assert!(
+                !audit.input_admission.cpu_engine_created
+                    && !audit.input_admission.model_created
+                    && !audit.input_admission.provider_created
+            );
+            assert!(
+                !audit.construction.allocator_peak_observed
+                    && !audit.construction.validator_peak_observed
+                    && !audit.construction.rss_peak_observed
+            );
+            assert_eq!(
+                audit.construction.final_retained_capacity_bytes,
+                prepared.as_bytes().len()
+            );
+        }
+    }
+    #[test]
+    fn construction_counts_escaped_wire_and_rejects_exact_outer_or_credit_shortage_before_backing()
+    {
+        let value = fixture(ReplayInputMode::ReplyOnly2n, false, "position startpos");
+        let prepared = constructed(
+            &value,
+            PRODUCER_SCOPES[0],
+            construction_budget(),
+            Instant::now(),
+        )
+        .unwrap();
+        let credit = prepared.audit().construction;
+        let wire: ReplayInputRequest = serde_json::from_slice(prepared.as_bytes()).unwrap();
+        assert_eq!(
+            credit.outer_json_bytes,
+            serde_json::to_vec(&wire).unwrap().len()
+        );
+        let mut body = serde_json::to_value(&wire).unwrap();
+        body.as_object_mut().unwrap().remove("context_sha256");
+        assert_eq!(
+            credit.context_json_bytes,
+            serde_json::to_vec(&json!([SCHEMA, body])).unwrap().len()
+        );
+        assert_eq!(
+            credit.policy_bytes,
+            CONSTRUCTION_RAW_PAYLOAD_COPIES * credit.raw_utf8_bytes
+                + 2 * credit.context_json_bytes
+                + credit.outer_json_bytes
+                + 65536
+        );
+        // Each original contains quotes, backslashes and line endings; exact
+        // JSON escaping is counted rather than a blanket multiplier allowance.
+        assert!(credit.outer_json_bytes > credit.raw_utf8_bytes);
+        let outer_error = constructed(
+            &value,
+            PRODUCER_SCOPES[0],
+            ReplayConstructionBudget {
+                max_outer_bytes: credit.outer_json_bytes - 1,
+                max_construction_credit_bytes: credit.policy_bytes,
+            },
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(outer_error.stage, "count");
+        assert!(matches!(
+            outer_error.cause.as_ref(),
+            ReplayPreparationCause::Serialization {
+                writer: Some(ReplayConstructionWriterFailure::ByteLimit),
+                ..
+            }
+        ));
+        assert!(outer_error.rejected_outer.is_none());
+        let credit_error = constructed(
+            &value,
+            PRODUCER_SCOPES[0],
+            ReplayConstructionBudget {
+                max_outer_bytes: credit.outer_json_bytes,
+                max_construction_credit_bytes: credit.policy_bytes - 1,
+            },
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(credit_error.stage, "count");
+        assert!(
+            matches!(credit_error.cause.as_ref(), ReplayPreparationCause::Refusal {
+            actual: Some(actual), limit: Some(limit), ..
+        } if *actual == credit.policy_bytes && *limit + 1 == *actual)
+        );
+        assert!(credit_error.rejected_outer.is_none());
+        let exact = constructed(
+            &value,
+            PRODUCER_SCOPES[0],
+            ReplayConstructionBudget {
+                max_outer_bytes: credit.outer_json_bytes,
+                max_construction_credit_bytes: credit.policy_bytes,
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(exact.as_bytes(), prepared.as_bytes());
+    }
+    #[test]
+    fn construction_three_raw_copy_credit_is_exact_and_prior_two_copy_credit_refuses_before_backing()
+     {
+        let value = fixture(ReplayInputMode::ReplyOnly2n, false, "position startpos");
+        let prepared = constructed(
+            &value,
+            PRODUCER_SCOPES[0],
+            construction_budget(),
+            Instant::now(),
+        )
+        .unwrap();
+        let credit = prepared.audit().construction;
+        assert_eq!(credit.raw_payload_copies, 3);
+        let prior_two_copy_credit = 2 * credit.raw_utf8_bytes
+            + 2 * credit.context_json_bytes
+            + credit.outer_json_bytes
+            + 65536;
+        let corrected_three_copy_credit = 3 * credit.raw_utf8_bytes
+            + 2 * credit.context_json_bytes
+            + credit.outer_json_bytes
+            + 65536;
+        assert_eq!(credit.policy_bytes, corrected_three_copy_credit);
+        assert_eq!(
+            corrected_three_copy_credit - prior_two_copy_credit,
+            credit.raw_utf8_bytes
+        );
+        assert!(credit.raw_utf8_bytes > 0);
+        let exact_start = Instant::now();
+        let exact = constructed(
+            &value,
+            PRODUCER_SCOPES[0],
+            ReplayConstructionBudget {
+                max_outer_bytes: credit.outer_json_bytes,
+                max_construction_credit_bytes: corrected_three_copy_credit,
+            },
+            exact_start,
+        )
+        .unwrap();
+        // Credit policy changes no wire, original artifact identity or lifecycle
+        // authority. These assertions do not measure the allocator's peak.
+        assert_eq!(exact.as_bytes(), prepared.as_bytes());
+        assert_eq!(exact.artifact(), prepared.artifact());
+        assert_eq!(exact.artifact(), &super::super::pin(exact.as_bytes()));
+        assert_eq!(exact.audit().construction.raw_payload_copies, 3);
+        assert_eq!(
+            exact.audit().construction.policy_bytes,
+            corrected_three_copy_credit
+        );
+        assert_eq!(
+            exact.audit().input_admission.authorities,
+            ReplayAuthorities::default()
+        );
+        assert!(!exact.audit().construction.allocator_peak_observed);
+        assert!(!exact.audit().construction.validator_peak_observed);
+        assert!(!exact.audit().construction.rss_peak_observed);
+        assert_eq!(exact.deadline(), exact_start + Duration::from_millis(5000));
+        assert_eq!(
+            exact.execution_deadline(),
+            exact_start + Duration::from_millis(4990)
+        );
+        let refused_start = Instant::now();
+        let error = constructed(
+            &value,
+            PRODUCER_SCOPES[0],
+            ReplayConstructionBudget {
+                max_outer_bytes: credit.outer_json_bytes,
+                max_construction_credit_bytes: prior_two_copy_credit,
+            },
+            refused_start,
+        )
+        .unwrap_err();
+        assert_eq!(error.stage, "count");
+        assert!(
+            matches!(error.cause.as_ref(), ReplayPreparationCause::Refusal {
+            actual: Some(actual), limit: Some(limit), ..
+        } if *actual == corrected_three_copy_credit && *limit == prior_two_copy_credit)
+        );
+        // The policy gate precedes final backing, context Value construction,
+        // serialization and checker admission, so no candidate bytes are held.
+        assert!(error.rejected_outer.is_none());
+        assert_eq!(
+            error.diagnostics.expected_semantic_receipt_producer_scope,
+            PRODUCER_SCOPES[0]
+        );
+        assert_eq!(
+            error.diagnostics.deadline(),
+            Some(refused_start + Duration::from_millis(5000))
+        );
+        assert_eq!(
+            error.diagnostics.execution_deadline(),
+            Some(refused_start + Duration::from_millis(4990))
+        );
+        assert_eq!(
+            error.diagnostics.output_limit,
+            value.request.resources.output_bytes
+        );
+    }
+    #[test]
+    fn construction_keeps_scoped_checker_error_and_rejected_outer_as_owned_evidence() {
+        let mut value = fixture(ReplayInputMode::ReplyOnly2n, false, "position startpos");
+        changed_receipt(&mut value, |receipt| {
+            receipt.binary_pin_scope = PRODUCER_SCOPES[1].as_str().into();
+        });
+        let started = Instant::now();
+        let error =
+            constructed(&value, PRODUCER_SCOPES[2], construction_budget(), started).unwrap_err();
+        assert_eq!(error.stage, "scoped_input_check");
+        let ReplayPreparationCause::Input(original_error) = error.cause.as_ref() else {
+            panic!("typed original checker error");
+        };
+        assert_eq!(original_error.stage, "semantic_binding");
+        assert_eq!(
+            original_error.expected_semantic_receipt_producer_scope,
+            Some(PRODUCER_SCOPES[2])
+        );
+        assert!(original_error.original_whole_deadline_retained);
+        assert_eq!(error.diagnostics.original_started(), started);
+        let rejected = error.rejected_outer.as_ref().unwrap();
+        assert!(rejected.serialization_complete());
+        assert_eq!(
+            rejected.artifact(),
+            Some(&super::super::pin(rejected.as_bytes()))
+        );
+        let wire: ReplayInputRequest = serde_json::from_slice(rejected.as_bytes()).unwrap();
+        assert_eq!(
+            wire.semantic_receipt_raw.as_bytes(),
+            value.request.semantic_receipt_raw.as_bytes()
+        );
+        assert_eq!(wire.authorities, ReplayAuthorities::default());
+        let matching = constructed(
+            &value,
+            PRODUCER_SCOPES[1],
+            construction_budget(),
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            matching
+                .audit()
+                .input_admission
+                .expected_semantic_receipt_producer_scope,
+            Some(PRODUCER_SCOPES[1])
+        );
+    }
+    #[test]
+    fn construction_preflight_retains_real_utf8_and_rejects_pin_or_oversized_expected_before_count()
+    {
+        let mut value = fixture(ReplayInputMode::ReplyOnly2n, false, "position startpos");
+        let mut invalid = value.request.semantic_receipt_raw.as_bytes().to_vec();
+        invalid.push(0xff);
+        value.expected.semantic_receipt_artifact = super::super::pin(&invalid);
+        let error = prepare_replay_request(
+            ReplayOriginals {
+                registration: value.request.registration_raw.as_bytes(),
+                prepared_action: value.request.prepared_action_raw.as_bytes(),
+                semantic_receipt: &invalid,
+            },
+            ReplayPreparationDeclaration {
+                mode: value.request.mode,
+                config: &value.request.config,
+                resources: &value.request.resources,
+            },
+            &value.expected,
+            PRODUCER_SCOPES[0],
+            construction_budget(),
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error.stage, "preflight");
+        assert!(
+            matches!(error.cause.as_ref(), ReplayPreparationCause::Utf8 { original: ReplayOriginalKind::SemanticReceipt, source } if source.valid_up_to() == invalid.len() - 1)
+        );
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(error.rejected_outer.is_none());
+        let expired_start = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+        let expired_utf8 = prepare_replay_request(
+            ReplayOriginals {
+                registration: value.request.registration_raw.as_bytes(),
+                prepared_action: value.request.prepared_action_raw.as_bytes(),
+                semantic_receipt: &invalid,
+            },
+            ReplayPreparationDeclaration {
+                mode: value.request.mode,
+                config: &value.request.config,
+                resources: &value.request.resources,
+            },
+            &value.expected,
+            PRODUCER_SCOPES[2],
+            construction_budget(),
+            expired_start,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            expired_utf8.cause.as_ref(),
+            ReplayPreparationCause::Utf8 { .. }
+        ));
+        assert_eq!(
+            expired_utf8
+                .diagnostics
+                .expected_semantic_receipt_producer_scope,
+            PRODUCER_SCOPES[2]
+        );
+        assert_eq!(
+            expired_utf8.diagnostics.deadline(),
+            Some(expired_start + Duration::from_millis(5000))
+        );
+        assert_eq!(
+            expired_utf8.diagnostics.execution_deadline(),
+            Some(expired_start + Duration::from_millis(4990))
+        );
+        assert!(
+            expired_utf8.diagnostics.deadline_exceeded
+                && expired_utf8.diagnostics.execution_deadline_exceeded
+        );
+        assert_eq!(
+            expired_utf8.diagnostics.output_limit,
+            value.request.resources.output_bytes
+        );
+        let mut value = fixture(ReplayInputMode::ReplyOnly2n, false, "position startpos");
+        value.request.semantic_receipt_raw.push(' ');
+        let pin_error = constructed(
+            &value,
+            PRODUCER_SCOPES[0],
+            construction_budget(),
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(pin_error.stage, "preflight");
+        assert!(matches!(
+            pin_error.cause.as_ref(),
+            ReplayPreparationCause::Refusal { .. }
+        ));
+        assert!(pin_error.rejected_outer.is_none());
+        for invalid_field in 0..4 {
+            let mut value = fixture(ReplayInputMode::ReplyOnly2n, false, "position startpos");
+            match invalid_field {
+                0 => value.expected.parent.encoding_sha256 = "a".repeat(65),
+                1 => value.expected.registered_artifacts.wrapper_source.sha256 = "a".repeat(65),
+                2 => value.expected.provider_factory_id = "a".repeat(129),
+                _ => value.expected.registration_artifact.bytes = MAX_REGISTRATION_BYTES as u64 + 1,
+            }
+            let error = constructed(
+                &value,
+                PRODUCER_SCOPES[0],
+                construction_budget(),
+                Instant::now(),
+            )
+            .unwrap_err();
+            assert_eq!(error.stage, "preflight");
+            assert!(matches!(
+                error.cause.as_ref(),
+                ReplayPreparationCause::Input(_)
+            ));
+            assert!(error.rejected_outer.is_none());
+        }
+        for budget in [
+            ReplayConstructionBudget {
+                max_outer_bytes: MAX_REQUEST_BYTES + 1,
+                max_construction_credit_bytes: MAX_CONSTRUCTION_CREDIT_BYTES,
+            },
+            ReplayConstructionBudget {
+                max_outer_bytes: MAX_REQUEST_BYTES,
+                max_construction_credit_bytes: MAX_CONSTRUCTION_CREDIT_BYTES + 1,
+            },
+        ] {
+            let value = fixture(ReplayInputMode::ReplyOnly2n, false, "position startpos");
+            let error =
+                constructed(&value, PRODUCER_SCOPES[0], budget, Instant::now()).unwrap_err();
+            assert_eq!(error.stage, "preflight");
+            assert!(matches!(
+                error.cause.as_ref(),
+                ReplayPreparationCause::Refusal { .. }
+            ));
+            assert!(error.rejected_outer.is_none());
+        }
+    }
+    #[test]
+    fn construction_never_expands_declared_cpu_role_store_or_output_resources() {
+        for missing in 0..5 {
+            let mut value = fixture(
+                ReplayInputMode::RepairEndpoint3n,
+                false,
+                "position startpos",
+            );
+            match missing {
+                0 => value.request.resources.cpu_nodes = 128,
+                1 => value.request.resources.role_calls -= 1,
+                2 => value.request.resources.store_nodes -= 1,
+                3 => value.request.resources.required_stages -= 1,
+                _ => value.request.resources.output_bytes = 2 * 65536,
+            }
+            let error = constructed(
+                &value,
+                PRODUCER_SCOPES[0],
+                construction_budget(),
+                Instant::now(),
+            )
+            .unwrap_err();
+            let ReplayPreparationCause::Input(checker) = error.cause.as_ref() else {
+                panic!("existing resource checker");
+            };
+            assert_eq!(checker.stage, "resource_reservation");
+            let rejected = error.rejected_outer.as_ref().unwrap();
+            let wire: ReplayInputRequest = serde_json::from_slice(rejected.as_bytes()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&wire.resources).unwrap(),
+                serde_json::to_value(&value.request.resources).unwrap()
+            );
+            assert_eq!(wire.mode, ReplayInputMode::RepairEndpoint3n);
+            assert_eq!(
+                wire.prepared_action_raw.as_bytes(),
+                value.request.prepared_action_raw.as_bytes()
+            );
+        }
+    }
+    #[test]
+    fn construction_preserves_old_two_n_remaining_and_requires_explicit_new_mode_resources() {
+        let mut value = fixture(
+            ReplayInputMode::RepairEndpoint3n,
+            false,
+            "position startpos",
+        );
+        let mut action: super::super::Request =
+            serde_json::from_str(&value.request.prepared_action_raw).unwrap();
+        action.remaining.nodes = 128;
+        action.context_sha256 = seal(super::super::SCHEMA, &action);
+        value.request.prepared_action_raw = serde_json::to_string(&action).unwrap() + "\r\n";
+        value.expected.prepared_action_artifact =
+            super::super::pin(value.request.prepared_action_raw.as_bytes());
+        let error = constructed(
+            &value,
+            PRODUCER_SCOPES[0],
+            construction_budget(),
+            Instant::now(),
+        )
+        .unwrap_err();
+        let ReplayPreparationCause::Input(checker) = error.cause.as_ref() else {
+            panic!("original resource checker");
+        };
+        assert_eq!(checker.stage, "resource_reservation");
+        let rejected = error.rejected_outer.as_ref().unwrap();
+        let wire: ReplayInputRequest = serde_json::from_slice(rejected.as_bytes()).unwrap();
+        assert_eq!(wire.mode, ReplayInputMode::RepairEndpoint3n);
+        assert_eq!(wire.resources.cpu_nodes, 192);
+        assert_eq!(
+            wire.prepared_action_raw.as_bytes(),
+            value.request.prepared_action_raw.as_bytes()
+        );
+        let retained_action: super::super::Request =
+            serde_json::from_str(&wire.prepared_action_raw).unwrap();
+        assert_eq!(retained_action.remaining.nodes, 128);
+        assert_eq!(
+            retained_action.cpu_request_raw.as_bytes(),
+            action.cpu_request_raw.as_bytes()
+        );
+        // The caller supplies a separate explicit 2N declaration. The function
+        // does not clip 3N or silently mutate the historical action remaining.
+        value.request.mode = ReplayInputMode::ReplyOnly2n;
+        value.request.resources.cpu_nodes = 128;
+        let prepared = constructed(
+            &value,
+            PRODUCER_SCOPES[0],
+            construction_budget(),
+            Instant::now(),
+        )
+        .unwrap();
+        let wire: ReplayInputRequest = serde_json::from_slice(prepared.as_bytes()).unwrap();
+        assert_eq!(wire.mode, ReplayInputMode::ReplyOnly2n);
+        assert_eq!(wire.resources.cpu_nodes, 128);
+        assert_eq!(
+            wire.prepared_action_raw.as_bytes(),
+            value.request.prepared_action_raw.as_bytes()
+        );
+        assert_eq!(prepared.audit().input_admission.cpu_allowance, 128);
+        assert!(
+            prepared
+                .audit()
+                .input_admission
+                .conservative_repair_role_store_overreservation
+        );
+    }
+    #[test]
+    fn construction_preserves_known_clock_scope_for_early_refusal_and_keeps_malformed_legacy_unknown()
+     {
+        let scope = PRODUCER_SCOPES[1];
+        let mut value = fixture(ReplayInputMode::ReplyOnly2n, false, "position startpos");
+        let started = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+        let error = constructed(
+            &value,
+            scope,
+            ReplayConstructionBudget {
+                max_outer_bytes: 0,
+                max_construction_credit_bytes: 1,
+            },
+            started,
+        )
+        .unwrap_err();
+        assert_eq!(error.stage, "preflight");
+        assert_eq!(
+            error.diagnostics.expected_semantic_receipt_producer_scope,
+            scope
+        );
+        assert_eq!(
+            error.diagnostics.deadline(),
+            Some(started + Duration::from_millis(5000))
+        );
+        assert_eq!(
+            error.diagnostics.execution_deadline(),
+            Some(started + Duration::from_millis(4990))
+        );
+        assert!(
+            error.diagnostics.deadline_exceeded && error.diagnostics.execution_deadline_exceeded
+        );
+        assert_eq!(
+            error.diagnostics.output_limit,
+            value.request.resources.output_bytes
+        );
+        let expired = constructed(&value, scope, construction_budget(), started).unwrap_err();
+        assert_eq!(expired.stage, "count");
+        assert!(expired.diagnostics.deadline_exceeded);
+        assert!(expired.rejected_outer.is_none());
+        value.request.resources.output_bytes = 0;
+        let output = constructed(&value, scope, construction_budget(), started).unwrap_err();
+        assert_eq!(output.stage, "resource_clock");
+        assert_eq!(output.diagnostics.output_limit, DIAGNOSTIC_OUTPUT_BYTES);
+        assert_eq!(
+            output.diagnostics.deadline(),
+            Some(started + Duration::from_millis(5000))
+        );
+        assert!(output.diagnostics.deadline_exceeded);
+        let ReplayPreparationCause::Input(original) = output.cause.as_ref() else {
+            panic!("original invalid-output cause");
+        };
+        assert_eq!(original.stage, "output_bound");
+        assert!(original.deadline_exceeded);
+        let legacy = check_replay_inputs(b"{", &value.expected, started).unwrap_err();
+        assert_eq!(legacy.stage, "input_json");
+        assert!(!legacy.original_whole_deadline_retained);
+        assert!(legacy.elapsed_ms.is_some());
+        assert!(
+            legacy.whole_wall_ms.is_none()
+                && legacy.expected_semantic_receipt_producer_scope.is_none()
+        );
+        assert!(
+            !serde_json::to_value(&legacy)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("expected_semantic_receipt_producer_scope")
+        );
+    }
+    #[test]
+    fn construction_future_start_and_malformed_original_keep_typed_causes_and_same_partitions() {
+        let mut value = fixture(ReplayInputMode::ReplyOnly2n, false, "position startpos");
+        let future = Instant::now() + Duration::from_secs(60);
+        let error =
+            constructed(&value, PRODUCER_SCOPES[0], construction_budget(), future).unwrap_err();
+        let ReplayPreparationCause::Input(original) = error.cause.as_ref() else {
+            panic!("future start clock cause");
+        };
+        assert_eq!(original.stage, "original_clock");
+        assert_eq!(
+            error.diagnostics.deadline(),
+            Some(future + Duration::from_millis(5000))
+        );
+        assert_eq!(
+            error.diagnostics.execution_deadline(),
+            Some(future + Duration::from_millis(4990))
+        );
+        assert_eq!(error.diagnostics.elapsed_ms, 0);
+        assert!(error.rejected_outer.is_none());
+        value.request.semantic_receipt_raw = "{\n".into();
+        value.expected.semantic_receipt_artifact =
+            super::super::pin(value.request.semantic_receipt_raw.as_bytes());
+        let started = Instant::now();
+        let error =
+            constructed(&value, PRODUCER_SCOPES[0], construction_budget(), started).unwrap_err();
+        let ReplayPreparationCause::Input(original) = error.cause.as_ref() else {
+            panic!("original malformed receipt cause");
+        };
+        assert_eq!(original.stage, "semantic_receipt_json");
+        assert!(original.original_whole_deadline_retained);
+        assert_eq!(
+            original.expected_semantic_receipt_producer_scope,
+            Some(PRODUCER_SCOPES[0])
+        );
+        assert_eq!(
+            error.diagnostics.deadline(),
+            Some(started + Duration::from_millis(5000))
+        );
+        let rejected = error.rejected_outer.as_ref().unwrap();
+        assert!(rejected.serialization_complete());
+        let wire: ReplayInputRequest = serde_json::from_slice(rejected.as_bytes()).unwrap();
+        assert_eq!(wire.semantic_receipt_raw, "{\n");
+    }
+    #[test]
+    fn construction_writer_preserves_partial_bytes_and_real_serde_failure_without_growth() {
+        let started = Instant::now();
+        let clock = Clock {
+            whole_deadline: started + Duration::from_secs(10),
+            execution_deadline: started + Duration::from_secs(9),
+            whole_wall_ms: 10000,
+            cleanup_reserve_ms: 1000,
+            output_limit: 1024,
+        };
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(4).unwrap();
+        let retained = bytes.capacity();
+        let (cause, written) = {
+            let mut writer = ConstructionWriter {
+                backing: Some(&mut bytes),
+                bytes: 0,
+                limit: 4,
+                clock,
+                failure: None,
+            };
+            let source = serde_json::to_writer(&mut writer, &"abc\n").unwrap_err();
+            assert_eq!(
+                writer.failure,
+                Some(ReplayConstructionWriterFailure::ByteLimit)
+            );
+            (
+                ReplayPreparationCause::Serialization {
+                    source,
+                    writer: writer.failure,
+                },
+                writer.bytes,
+            )
+        };
+        assert_eq!(bytes.capacity(), retained);
+        assert_eq!(bytes.len(), written);
+        assert!(!bytes.is_empty());
+        let error = preparation_error(
+            "serialize",
+            cause,
+            started,
+            Some(clock),
+            PRODUCER_SCOPES[0],
+            Some(RejectedReplayBytes {
+                bytes,
+                artifact: None,
+                serialization_complete: false,
+            }),
+        );
+        assert!(std::error::Error::source(&error).is_some());
+        let rejected = error.rejected_outer.as_ref().unwrap();
+        assert!(!rejected.serialization_complete());
+        assert!(rejected.artifact().is_none());
     }
 
     #[test]

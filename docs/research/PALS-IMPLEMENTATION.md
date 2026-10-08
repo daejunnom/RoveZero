@@ -2854,3 +2854,53 @@ version·scope를 검사한다. `/2`의 missing·null·unknown·duplicate·잘�
 원문 pin·context 변조, 범위 불일치, legacy 생략, 실패의 typed 원인·원래 한도와
 negative authority는 CPU fixture의 별도 검사 대상이다. 이 연결의 소스·fixture 검사는
 등록된 실제 CPU 모델 replay·외부 supervisor 종료·utility 수집의 실행 인수를 대체하지 않는다.
+
+### Strict caller 원문과 Rust replay wire의 준비 접점
+
+`strategic_replay_caller`는 기존 Query/2와 `PreparedStrategicCpuAction`을 재검증하고,
+caller가 보존한 semantic request·whole receipt·source·registration·before result·launch
+observation·common query의 일곱 원본 bytes를 기존 semantic factory에 다시 입장시킨다.
+선택된 action과 semantic slot, parent/current/frozen 및 실제 encoding이 같은지 확인한다.
+원문을 잃었으면 거절하며, receipt dictionary를 재직렬화해 과거 pin을 복구하지 않는다.
+생산 범위는 독립 등록 원문과 외부 기대값을 대조한다. receipt 결과나 현재 OS를 보고
+기대 범위를 선택하지 않는다. 현재 strict semantic factory가 지원하는 두 image 범위를
+넘겨 허용하지 않으며, 이 준비 결과가 실제 과거 image를 다시 관측했다는 뜻은 아니다.
+
+새 Python 접점의 원문 합계 12MiB·pin metadata 64KiB·추가 준비 scratch 8MiB는
+해당 접점의 유한 정책 credit이다. 기존 Query/action의 원문 한도는 계속 적용한다.
+이미 존재하는 capability의 resident 메모리나 Python/Rust allocator의 물리 peak를
+측정하거나 완전히 제한한 수치가 아니다. 각 재검증은 같은 유한 caller deadline을
+사용하며 새 시간창을 만들지 않는다. Python은 Rust의 2N/3N·role/store 요구량을
+재계산하거나 예산을 자동 확장하지 않는다.
+
+Rust의 `prepare_replay_request`는 세 원문을 borrowed bytes로 받아 UTF-8·독립 pin을
+대조하고, 기존 replay 입력의 mode/config/resources와 expected 선언을 사용한다.
+이 세 원문은 새 독립 `ReplayConsumerRegistration`, prepared action/1, whole semantic
+receipt다. Python 접점의 과거 semantic registration은 별도 역사 근거이며 새 replay
+consumer registration 자리를 대신하지 않는다. Python handoff는 action과 receipt 및
+역사·선택 identity의 부분 연결만 제공한다. 새 consumer registration·replay binary·
+source·factory·assets와 완전한 `ReplayExpectedPins`는 독립 caller가 별도로 공급한다.
+새 바깥 JSON만 직렬화하며 세 embedded 원문의 공백·줄바꿈·키 순서와 bytes는 보존한다.
+`ReplayInputRequest`·`ReplayExpectedPins`·기존 CLI expected `/1`과 `/2`의 wire 및
+context 의미는 유지한다. 완성한 wire는 같은 S·scope·expected로 기존 scoped checker에
+통과시켜 실제 Rules와 원래 remaining, ReplyOnly2n/RepairEndpoint3n의 요구량을 검사한다.
+
+준비 예산은 outer wire 최대 2MiB, construction credit 최대 16MiB다. escaping을 포함한
+길이를 할당 전에 count하고 `3 × Sraw + 2 × C + Q + 64KiB`를 checked arithmetic으로
+입장시킨다. Sraw는 세 원문 길이 합계, C는 기존 closed context의 직렬화 길이,
+Q는 64hex context가 포함된 최종 wire 길이다. credit은 context 계산의 원문 문자열
+복사 세 벌·canonical backing·최종 wire 및 고정 topology allowance에 대한 보수적 정책이며
+실제 allocator peak의 측정값이 아니다. 최종 wire의 backing과 쓰기는 cap 및 원래
+E/W 안에서 확인한다. 뒤따르는 validator의 typed/Value/Rules heap은 이 credit의
+완전한 메모리 상한으로 주장하지 않으며 외부 memory supervision과 별도로 인수한다.
+기존 context 함수는 body Value, `json!` array Value, canonical sorted Value를 만든다.
+현재 사용 중인 [serde_json 1.0.145의 macro](https://github.com/serde-rs/json/blob/v1.0.145/src/macros.rs)
+및 [Value serializer](https://github.com/serde-rs/json/blob/v1.0.145/src/value/ser.rs)의
+소유 문자열 복사를 대조하여 이 세 payload를 예약한다. hash 함수와 의미는 유지한다.
+
+성공 타입은 private immutable wire·실제 artifact pin·준비 audit와 원래 마감만 제공한다.
+거절된 최종 후보와 typed 원인은 오류의 소유로 보존하며 성공 타입으로 반환하지 않는다.
+입장 가능한 원래 자원 선언은 이른 UTF-8·pin·준비 budget 거절에도 S/W/E와 진단 cap을
+남긴다. 모델/provider/dispatch, durable caller 등록, whole cost·물리 종료·full Repair
+recheck·utility·학습 target의 권한은 발급하지 않는다. 실제 CLI expected/launch 파일의
+결과 전 등록과 CPU 모델 실행·종료 자료 회수는 이 순수 준비 단위 이후의 별도 인수다.
