@@ -265,6 +265,42 @@ pub(in crate::pals_onnx) struct CudaRecordPages {
     packing_session: Option<Session>,
 }
 
+/// Bind declarations to the limits actually supplied to each provider. Packing
+/// has its own explicit arena; it never inherits or silently lowers model arenas.
+/// This is configuration admission only, not an allocator/VRAM observation.
+fn packing_session_settings(
+    model_provider: Provider,
+    declaration: DevicePageInvocationDeclaration,
+    registered_packing_bytes: u64,
+) -> NativeResult<(i32, usize)> {
+    let Provider::Cuda {
+        device_id,
+        arena_bytes,
+    } = model_provider
+    else {
+        return Err(refused("packing requires explicit CUDA"));
+    };
+    let model_bytes = u64::try_from(arena_bytes)
+        .map_err(|_| arithmetic("model CUDA arena is not representable"))?;
+    let packing_bytes = declaration
+        .packing_session_bytes
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| arithmetic("packing CUDA arena declaration is absent or zero"))?;
+    if device_id < 0
+        || model_bytes == 0
+        || declaration.public_session_bytes != Some(model_bytes)
+        || declaration.private_session_bytes != Some(model_bytes)
+        || packing_bytes != registered_packing_bytes
+    {
+        return Err(arithmetic(
+            "resident session declarations differ from provider limits or packing registration",
+        ));
+    }
+    let packing_arena = usize::try_from(packing_bytes)
+        .map_err(|_| arithmetic("packing CUDA arena is not representable"))?;
+    Ok((device_id, packing_arena))
+}
+
 impl CudaRecordPages {
     pub(in crate::pals_onnx) fn has_active_invocation(&self) -> bool {
         self.active.is_some()
@@ -348,13 +384,14 @@ impl CudaRecordPages {
         })
     }
     fn initialize(&mut self, config: PalsOnnxConfig) -> NativeResult<()> {
-        let Provider::Cuda {
-            device_id,
-            arena_bytes,
-        } = config.provider
-        else {
-            return Err(refused("packing requires explicit CUDA"));
-        };
+        let (device_id, arena_bytes) = packing_session_settings(
+            config.provider,
+            self.declaration,
+            self.graph
+                .registered_artifacts()
+                .resources()
+                .declared_packing_session_bytes,
+        )?;
         let configure = |error| {
             native(
                 CauseCode::SessionConfiguration,
@@ -808,6 +845,16 @@ impl PalsOnnxBackend {
                 "resident namespace differs from this validated producer/runtime",
             ));
         }
+        // Revalidate direct backend callers as well as the UCI factory before
+        // constructing a registry or the auxiliary native Session.
+        packing_session_settings(
+            self.config.provider,
+            declaration,
+            graph
+                .registered_artifacts()
+                .resources()
+                .declared_packing_session_bytes,
+        )?;
         let metadata = declaration
             .additional_owner_metadata_payload
             .ok_or_else(|| refused("resident native metadata declaration missing"))?;
@@ -2075,6 +2122,52 @@ fn resolve_pair<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packing_arena_uses_its_own_registered_limit_and_exact_model_arenas() {
+        let model_arena = 2 * 1024 * 1024 * 1024;
+        let packing_arena = 128 * 1024 * 1024;
+        let provider = Provider::Cuda {
+            device_id: 0,
+            arena_bytes: model_arena,
+        };
+        let declaration = DevicePageInvocationDeclaration {
+            public_session_bytes: Some(model_arena as u64),
+            packing_session_bytes: Some(packing_arena as u64),
+            private_session_bytes: Some(model_arena as u64),
+            private_output_payload: None,
+            original_input_and_transfer_payload: None,
+            additional_owner_metadata_payload: None,
+        };
+        assert_eq!(
+            packing_session_settings(provider, declaration, packing_arena as u64).unwrap(),
+            (0, packing_arena)
+        );
+        for mutation in 0..5 {
+            let mut invalid = declaration;
+            match mutation {
+                0 => invalid.public_session_bytes = Some(1),
+                1 => invalid.private_session_bytes = Some(1),
+                2 => invalid.packing_session_bytes = Some(0),
+                3 => invalid.packing_session_bytes = None,
+                _ => invalid.packing_session_bytes = Some(packing_arena as u64 + 1),
+            }
+            assert!(packing_session_settings(provider, invalid, packing_arena as u64).is_err());
+        }
+        assert!(
+            packing_session_settings(Provider::Cpu, declaration, packing_arena as u64).is_err()
+        );
+        assert!(packing_session_settings(
+            Provider::Cuda {
+                device_id: -1,
+                arena_bytes: model_arena
+            },
+            declaration,
+            packing_arena as u64
+        )
+        .is_err());
+        assert!(packing_session_settings(provider, declaration, model_arena as u64).is_err());
+    }
 
     // These are pure observation/parser/bit-identity fixtures. They construct no
     // CUDA Tensor/Session, initialized capability, finite proof or certified bank.

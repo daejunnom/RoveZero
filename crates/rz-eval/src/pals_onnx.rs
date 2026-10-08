@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 mod cuda_control;
 mod device_packing_admission;
+mod device_packing_assets;
 mod device_packing_graph;
 mod device_pages_plan;
 mod public_pages;
@@ -47,6 +48,7 @@ pub use device_packing_admission::{
     DEVICE_PACKING_MAX_GRAPH_BYTES, DEVICE_PACKING_MAX_MANIFEST_BYTES,
     DEVICE_PACKING_MAX_NODE_PAYLOAD_SUM, DEVICE_PACKING_SCHEMA,
 };
+pub use device_packing_assets::{load_checked_fixed_packing_graph, DevicePackingAssetError};
 pub use device_packing_graph::{
     CheckedFixedPackingGraph, PackingGraphBodyError, PackingGraphBodyInspection,
     PackingGraphBodyVerification, PackingGraphDataType, PackingGraphDimension,
@@ -84,6 +86,35 @@ pub fn host_record_page_implementation_digest() -> [u8; 32] {
             include_bytes!("pals_model.rs").as_slice(),
             include_bytes!("pals_onnx.rs").as_slice(),
             include_bytes!("../../rz-runtime/src/pals.rs").as_slice(),
+        ] {
+            digest.update((source.len() as u64).to_le_bytes());
+            digest.update(source);
+        }
+        digest.finalize().into()
+    })
+}
+
+/// Explicit resident implementation provenance, separate from model/input
+/// semantics and from native Run, placement or physical-completion evidence.
+#[cfg(feature = "experimental-io-binding")]
+pub fn cuda_record_pages_implementation_digest() -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    static DIGEST: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    *DIGEST.get_or_init(|| {
+        let mut digest = Sha256::new();
+        digest.update(b"rz-pals-cuda-record-pages-implementation/1");
+        for source in [
+            include_bytes!("pals_onnx/device_pages_plan/native.rs").as_slice(),
+            include_bytes!("pals_onnx/device_pages_plan.rs").as_slice(),
+            include_bytes!("pals_onnx/device_packing_admission.rs").as_slice(),
+            include_bytes!("pals_onnx/device_packing_graph.rs").as_slice(),
+            include_bytes!("pals_onnx/device_packing_assets.rs").as_slice(),
+            include_bytes!("pals_onnx/cuda_control.rs").as_slice(),
+            include_bytes!("pals_device_resources.rs").as_slice(),
+            include_bytes!("pals_model.rs").as_slice(),
+            include_bytes!("pals_onnx.rs").as_slice(),
+            include_bytes!("../../rz-runtime/src/pals.rs").as_slice(),
+            include_bytes!("../../rz-native-loader/src/ort_binding.rs").as_slice(),
         ] {
             digest.update((source.len() as u64).to_le_bytes());
             digest.update(source);

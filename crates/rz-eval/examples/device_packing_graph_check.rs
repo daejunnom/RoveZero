@@ -8,21 +8,16 @@
 //!
 //! Usage: device_packing_graph_check ABS_MANIFEST ABS_GRAPH MANIFEST_SHA GRAPH_SHA
 use rz_eval::pals_onnx::{
-    CheckedFixedPackingGraph, DevicePackingAdmissionError, DevicePackingResourceDeclaration,
-    PackingArtifactRegistration, PackingGraphBodyError, PackingGraphInspectionBudget,
-    PackingNativeVerification, RegisteredPackingArtifactBytes, RegisteredPackingBytePin,
+    load_checked_fixed_packing_graph, DevicePackingAssetError, DevicePackingResourceDeclaration,
+    PackingGraphBodyError, PackingGraphInspectionBudget, PackingNativeVerification,
     DEVICE_PACKING_MAX_GRAPH_BYTES, DEVICE_PACKING_MAX_MANIFEST_BYTES,
     DEVICE_PACKING_MAX_NODE_PAYLOAD_SUM, PACKING_GRAPH_BODY_INSPECTOR_VERSION,
     PACKING_GRAPH_MAX_INSPECTION_HOST_BYTES, PACKING_GRAPH_MAX_WIRE_FIELDS,
 };
 use serde_json::{json, Value};
-use sha2::{Digest as _, Sha256};
 use std::ffi::OsString;
-#[cfg(any(target_os = "linux", windows))]
-use std::fs::OpenOptions;
-use std::fs::{self, File, Metadata};
-use std::io::{self, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::io::{self, Write};
+use std::path::{Component, PathBuf};
 use std::process::ExitCode;
 
 const REPORT_SCHEMA: &str = "rz-pals-device-packing-graph-check/1";
@@ -37,11 +32,7 @@ const MAX_DECLARED_DEVICE_BYTES: u64 = DEVICE_PACKING_MAX_NODE_PAYLOAD_SUM + SES
 #[derive(Debug)]
 enum CheckError {
     Arguments(&'static str),
-    Filesystem(&'static str, io::Error),
-    FileRejected(&'static str),
-    Allocation,
-    HashMismatch(&'static str),
-    ByteAdmission(DevicePackingAdmissionError),
+    Assets(DevicePackingAssetError),
     GraphBody(PackingGraphBodyError),
     UnexpectedNativeScope,
     Json(serde_json::Error),
@@ -52,10 +43,7 @@ impl CheckError {
     fn stage(&self) -> &'static str {
         match self {
             Self::Arguments(_) => "arguments",
-            Self::Filesystem(stage, _) => stage,
-            Self::FileRejected(_) | Self::Allocation => "file_admission",
-            Self::HashMismatch(_) => "byte_pin",
-            Self::ByteAdmission(_) => "registered_byte_admission",
+            Self::Assets(error) => error.stage(),
             Self::GraphBody(_) => "fixed_graph_body",
             Self::UnexpectedNativeScope => "scope",
             Self::Json(_) | Self::Output(_) => "report_delivery",
@@ -64,12 +52,9 @@ impl CheckError {
 
     fn detail(&self) -> String {
         let text = match self {
-            Self::Arguments(reason) | Self::FileRejected(reason) | Self::HashMismatch(reason) => {
-                (*reason).to_owned()
-            }
-            Self::Filesystem(_, error) | Self::Output(error) => error.to_string(),
-            Self::Allocation => "fallible artifact buffer reservation failed".to_owned(),
-            Self::ByteAdmission(error) => error.to_string(),
+            Self::Arguments(reason) => (*reason).to_owned(),
+            Self::Assets(error) => error.detail(),
+            Self::Output(error) => error.to_string(),
             Self::GraphBody(error) => error.to_string(),
             Self::UnexpectedNativeScope => {
                 "static inspector unexpectedly returned native scope".to_owned()
@@ -154,176 +139,6 @@ fn parse_arguments(values: impl IntoIterator<Item = OsString>) -> Result<Argumen
     })
 }
 
-fn is_link_or_reparse(metadata: &Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        // Reject junctions and all other reparse points, not only symlinks.
-        metadata.file_attributes() & 0x400 != 0
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-
-fn path_metadata(path: &Path, maximum: usize) -> Result<Metadata> {
-    let mut selected = None;
-    for ancestor in path.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor)
-            .map_err(|error| CheckError::Filesystem("path_metadata", error))?;
-        if is_link_or_reparse(&metadata) {
-            return Err(CheckError::FileRejected(
-                "symlink or reparse artifact path component",
-            ));
-        }
-        if ancestor == path {
-            if !metadata.is_file() || metadata.len() == 0 || metadata.len() > maximum as u64 {
-                return Err(CheckError::FileRejected(
-                    "artifact must be a nonempty regular file within its fixed byte cap",
-                ));
-            }
-            selected = Some(metadata);
-        } else if !metadata.is_dir() {
-            return Err(CheckError::FileRejected(
-                "artifact ancestor must be a regular directory",
-            ));
-        }
-    }
-    selected.ok_or(CheckError::FileRejected("artifact metadata missing"))
-}
-
-fn open_regular_candidate(path: &Path) -> Result<File> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // Linux O_NOFOLLOW | O_NONBLOCK: refuse a final symlink, and do not block
-        // on a FIFO substituted after metadata inspection. No libc dependency.
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(0x20000 | 0x800)
-            .open(path)
-            .map_err(|error| CheckError::Filesystem("open", error))
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // OPEN_REPARSE_POINT opens the reparse point itself so handle metadata
-        // can reject it. FILE_SHARE_READ disallows writer/delete sharing.
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(0x00200000)
-            .share_mode(0x00000001)
-            .open(path)
-            .map_err(|error| CheckError::Filesystem("open", error))
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        let _ = path;
-        Err(CheckError::FileRejected(
-            "guarded regular-file reader supports Linux and Windows only",
-        ))
-    }
-}
-
-fn matching_metadata(before: &Metadata, after: &Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        before.dev() == after.dev()
-            && before.ino() == after.ino()
-            && before.len() == after.len()
-            && before.mtime() == after.mtime()
-            && before.mtime_nsec() == after.mtime_nsec()
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        // Windows metadata equality is not a globally unique file-ID proof.
-        // The independently supplied content digest is still required below.
-        before.file_attributes() == after.file_attributes()
-            && before.file_size() == after.file_size()
-            && before.creation_time() == after.creation_time()
-            && before.last_write_time() == after.last_write_time()
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (before, after);
-        false
-    }
-}
-
-fn read_registered_file(
-    path: &Path,
-    maximum: usize,
-    expected_sha256: [u8; 32],
-    part: &'static str,
-) -> Result<Vec<u8>> {
-    let before = path_metadata(path, maximum)?;
-    let mut file = open_regular_candidate(path)?;
-    let opened = file
-        .metadata()
-        .map_err(|error| CheckError::Filesystem("opened_metadata", error))?;
-    if !opened.is_file() || is_link_or_reparse(&opened) || !matching_metadata(&before, &opened) {
-        return Err(CheckError::FileRejected(
-            "opened artifact is not the prechecked regular file",
-        ));
-    }
-    let initial = usize::try_from(opened.len())
-        .map_err(|_| CheckError::FileRejected("artifact length conversion overflow"))?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(initial)
-        .map_err(|_| CheckError::Allocation)?;
-    let mut scratch = [0u8; 8192];
-    loop {
-        // One bounded probe byte catches growth without retaining an oversized
-        // graph. Even an Interrupted error is preserved; no unbounded retries.
-        let remaining = maximum
-            .checked_sub(bytes.len())
-            .ok_or(CheckError::FileRejected("artifact byte cap exceeded"))?;
-        let probe = remaining
-            .checked_add(1)
-            .ok_or(CheckError::FileRejected("artifact probe bound overflow"))?;
-        let wanted = scratch.len().min(probe);
-        let count = file
-            .read(&mut scratch[..wanted])
-            .map_err(|error| CheckError::Filesystem("read", error))?;
-        if count == 0 {
-            break;
-        }
-        if count > remaining {
-            return Err(CheckError::FileRejected(
-                "artifact grew beyond its fixed byte cap",
-            ));
-        }
-        bytes
-            .try_reserve_exact(count)
-            .map_err(|_| CheckError::Allocation)?;
-        bytes.extend_from_slice(&scratch[..count]);
-    }
-    let closed_read = file
-        .metadata()
-        .map_err(|error| CheckError::Filesystem("read_metadata", error))?;
-    let named_after = path_metadata(path, maximum)?;
-    if bytes.is_empty()
-        || bytes.len() != initial
-        || !matching_metadata(&opened, &closed_read)
-        || !matching_metadata(&closed_read, &named_after)
-    {
-        return Err(CheckError::FileRejected(
-            "artifact metadata or length changed during read",
-        ));
-    }
-    if <[u8; 32]>::from(Sha256::digest(&bytes)) != expected_sha256 {
-        return Err(CheckError::HashMismatch(part));
-    }
-    Ok(bytes)
-}
-
 fn hex(digest: [u8; 32]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut value = String::with_capacity(64);
@@ -335,28 +150,6 @@ fn hex(digest: [u8; 32]) -> String {
 }
 
 fn check(arguments: Arguments) -> Result<Value> {
-    let manifest = read_registered_file(
-        &arguments.manifest,
-        DEVICE_PACKING_MAX_MANIFEST_BYTES,
-        arguments.manifest_sha256,
-        "manifest SHA-256 mismatch",
-    )?;
-    let graph = read_registered_file(
-        &arguments.graph,
-        DEVICE_PACKING_MAX_GRAPH_BYTES,
-        arguments.graph_sha256,
-        "graph SHA-256 mismatch",
-    )?;
-    let registration = PackingArtifactRegistration {
-        manifest: RegisteredPackingBytePin {
-            bytes: manifest.len() as u64,
-            sha256: arguments.manifest_sha256,
-        },
-        graph: RegisteredPackingBytePin {
-            bytes: graph.len() as u64,
-            sha256: arguments.graph_sha256,
-        },
-    };
     let declaration = DevicePackingResourceDeclaration {
         packing_session_bytes: Some(SESSION_SENTINEL_BYTES),
         additional_owner_metadata_host_bytes: Some(METADATA_SENTINEL_BYTES),
@@ -364,22 +157,22 @@ fn check(arguments: Arguments) -> Result<Value> {
         max_declared_host_bytes: MAX_DECLARED_HOST_BYTES,
         max_declared_device_bytes: MAX_DECLARED_DEVICE_BYTES,
     };
-    let registered =
-        RegisteredPackingArtifactBytes::admit(&manifest, &graph, registration, declaration)
-            .map_err(CheckError::ByteAdmission)?;
-    // Admission owns its fallibly copied artifact bytes. Release both read Vecs
-    // BEFORE graph inspection; no extra graph copy survives into that stage.
-    drop(manifest);
-    drop(graph);
-    let byte_scope = format!("{:?}", registered.verification_scope());
-    let checked = CheckedFixedPackingGraph::verify(
-        registered,
+    // Only this static CLI supplies sentinel declarations. Product callers must
+    // supply their own resources to the same guarded loader, never this policy.
+    let checked = load_checked_fixed_packing_graph(
+        &arguments.manifest,
+        &arguments.graph,
+        arguments.manifest_sha256,
+        arguments.graph_sha256,
+        declaration,
         PackingGraphInspectionBudget {
             max_inspection_host_bytes: PACKING_GRAPH_MAX_INSPECTION_HOST_BYTES,
             max_wire_fields: PACKING_GRAPH_MAX_WIRE_FIELDS,
         },
     )
-    .map_err(CheckError::GraphBody)?;
+    .map_err(CheckError::Assets)?;
+    let registration = checked.registration();
+    let byte_scope = format!("{:?}", checked.registered_artifacts().verification_scope());
     if checked.native_verification() != PackingNativeVerification::NotPerformed
         || checked.registered_artifacts().native_verification()
             != PackingNativeVerification::NotPerformed
@@ -457,37 +250,8 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
     const ABC_SHA: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-
-    struct OwnedFixtureDirectory(PathBuf);
-    impl OwnedFixtureDirectory {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "rz-packing-cli-{}-{}",
-                std::process::id(),
-                SEQUENCE.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).unwrap();
-            Self(path)
-        }
-        fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
-            let path = self.0.join(name);
-            fs::write(&path, bytes).unwrap();
-            path
-        }
-    }
-    impl Drop for OwnedFixtureDirectory {
-        fn drop(&mut self) {
-            // Only exact files owned by this finite fixture; no recursive cleanup.
-            for name in ["abc", "empty", "large", "link"] {
-                let _ = fs::remove_file(self.0.join(name));
-            }
-            let _ = fs::remove_dir(&self.0);
-        }
-    }
 
     fn positional_arguments() -> Vec<OsString> {
         let root = std::env::temp_dir();
@@ -535,49 +299,6 @@ mod tests {
                 Err(CheckError::Arguments(_))
             ));
         }
-    }
-
-    #[test]
-    fn regular_file_reader_checks_exact_cap_nonempty_and_independent_hash() {
-        let owner = OwnedFixtureDirectory::new();
-        let path = owner.file("abc", b"abc");
-        let pin = lowercase_sha256(ABC_SHA.into()).unwrap();
-        assert_eq!(
-            read_registered_file(&path, 3, pin, "fixture hash")
-                .unwrap()
-                .as_slice(),
-            b"abc"
-        );
-        assert!(matches!(
-            read_registered_file(&path, 3, [0; 32], "fixture hash"),
-            Err(CheckError::HashMismatch(_))
-        ));
-        let empty = owner.file("empty", b"");
-        let large = owner.file("large", b"abcd");
-        for selected in [&empty, &large, &owner.0] {
-            assert!(matches!(
-                read_registered_file(selected, 3, pin, "fixture hash"),
-                Err(CheckError::FileRejected(_))
-            ));
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn regular_file_reader_refuses_symbolic_link_even_when_target_hash_matches() {
-        let owner = OwnedFixtureDirectory::new();
-        let source = owner.file("abc", b"abc");
-        let link = owner.0.join("link");
-        std::os::unix::fs::symlink(source, &link).unwrap();
-        assert!(matches!(
-            read_registered_file(
-                &link,
-                3,
-                lowercase_sha256(ABC_SHA.into()).unwrap(),
-                "fixture hash"
-            ),
-            Err(CheckError::FileRejected(_))
-        ));
     }
 
     #[test]
