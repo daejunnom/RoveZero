@@ -1385,6 +1385,9 @@ fn capture_owner(
             rz_search::pals::engine::replay::ReplayCpuPhase::Baseline => "baseline",
             rz_search::pals::engine::replay::ReplayCpuPhase::After => "after",
             rz_search::pals::engine::replay::ReplayCpuPhase::RepairEndpoint => "repair_endpoint",
+            rz_search::pals::engine::replay::ReplayCpuPhase::RepairOpponentEndpoint => {
+                "repair_opponent_endpoint"
+            }
         };
         out.cpu_execution = stage.execution().0;
         out.requested_depth = stage.requested_depth();

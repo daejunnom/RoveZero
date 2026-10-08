@@ -2956,3 +2956,35 @@ profile 원인, publication credit, 기존 디렉터리 충돌, 경로·링크 �
 tempfs 및 순수 준비 검사이며 actual CPU task·모델/provider·child process를 실행하지 않는다.
 이 소스 단위의 CPU CI와 등록된 실제 replay·external supervisor·strict Query 환류·별도
 4N full opponent recheck·whole cost·물리 종료·utility 인수는 각각 구분한다.
+
+## 2026-10-09 — 명시적으로 선택하는 4N 실제 C 수순 재검사
+
+`FreshReplayOwner::run_with_opponent_recheck`는 기존 2N Reply와 3N Repair의 다음
+단계를 search-local 접점으로 제공한다. 두 기존 mode는 이 경로를 자동 선택하지 않는다.
+별도 scope는 `rz-pals-frozen-parent-repair-opponent-continuation-replay/1`이다. 추가
+타입은 `replay/opponent_recheck.rs`에 두며, 같은 Rules·역할 출력 인수·CPU task·원래
+마감과 단일 finish hook을 사용한다. 기존 CLI·등록·launch 명세는 계속 2N/3N 전용이다.
+
+실제 완료한 세 번째 unrestricted Repair 관측과 게시된 Repair line/revision을 먼저
+확인한다. 원래 공격 이후 달라진 자기 수 다음의 첫 상대 차례를 찾고, C가 그 상태에서
+기존 응답과 다른 합법 응답을 선택하게 한다. 이후 horizon까지의 수들도 실제 C policy
+호출로 생성한다. Repair suffix를 복사해 이어 붙이지 않는다. 각 호출의 확인된 Rules
+state·논리 context·출력 인수 여부·선택한 수를 보존하고, 부분 실패에도 앞선 관측과
+생성된 수순을 남긴다. 모델 정책이 제시한 대안은 검증 대상이며 최선 방어의 증명이 아니다.
+
+`repair_opponent_replay_requirements(L,P,N)`는 `L-P >= 3`, 고정 CPU 상한 4N,
+기존 3N 역할 상한에 `L-P-2`회의 C 호출, record 5개와 stage 4개를 요구한다.
+노드·관측·line chunk의 추가 예약도 checked 산식으로 선언한다. 생성자 소유 저장소
+한도와 원래 자원·마감이 부족하면 실행 전에 거부한다. 이 선언은 peak 측정값이 아니다.
+새 CPU 검사는 같은 H1·profile/config를 가진 새 checker/TT에서 unrestricted
+`AnalyzePosition`, 빈 root moves, input revision 0, Start로 수행한다. 새 stage/task의
+관측을 보존하고 세 번째 Repair endpoint의 근거를 덮어쓰지 않는다. Rules terminal은
+별도 종료 결과이며 네 번째 CPU 관측을 만들어 넣지 않는다.
+
+신규 소스 검사 12개는 C의 응답과 다음 수가 모두 Repair와 달라지는 예, fresh 네 번째
+실행·정확한 history/context·기존 3N 선택 보존, anchor 부재, 자원 부족, 부분 CPU,
+마감·취소·모델 오류·잘못된 출력·물리 완료 불명을 다룬다. 이 문단은 검사 범위의
+설명이며 실행 성공은 정확한 SHA의 CPU CI 자료로 별도 확인한다. native RequestId·
+모델/provider 실행·strict Query 환류·external supervisor·전체 비용·물리 종료·utility·
+학습 target 인수는 이 소스 경로만으로 성립하지 않는다. 실제 학습은 범위 밖이며
+GPU 검증은 사용자 지시에 따라 보류한다.

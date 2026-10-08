@@ -21,6 +21,13 @@ use crate::cpu::{CpuCompletion, CpuConfig, CpuOrderingPolicy, CpuProfile};
 use rz_position::{HistoryCompleteness, HistoryOrigin};
 use std::fmt::Write;
 
+mod opponent_recheck;
+use opponent_recheck::OpponentRecheckState;
+pub use opponent_recheck::{
+    FRESH_REPLAY_OPPONENT_SCOPE, RepairOpponentReplayRequirements, ReplayOpponentEndpoint,
+    ReplayOpponentOutcome, ReplayOpponentRoleStep, repair_opponent_replay_requirements,
+};
+
 pub const FRESH_REPLAY_SCOPE: &str = "rz-pals-frozen-parent-defend-response-replay/1";
 pub const FRESH_REPLAY_REPAIR_SCOPE: &str = "rz-pals-frozen-parent-repair-endpoint-replay/1";
 const MAX_REPLAY_HISTORY_PLIES: usize = 4096;
@@ -169,6 +176,7 @@ pub enum ReplayCpuPhase {
     Baseline,
     After,
     RepairEndpoint,
+    RepairOpponentEndpoint,
 }
 impl ReplayCpuPhase {
     fn label(self) -> &'static str {
@@ -176,6 +184,7 @@ impl ReplayCpuPhase {
             Self::Baseline => "baseline",
             Self::After => "after",
             Self::RepairEndpoint => "repair-endpoint",
+            Self::RepairOpponentEndpoint => "repair-opponent-endpoint",
         }
     }
 }
@@ -347,6 +356,33 @@ pub struct FreshReplayOwner<M: RoleModel> {
     repair_line_id: Option<LineId>,
     repair_endpoint_node: Option<usize>,
     repair_endpoint_snapshot: Option<PositionSnapshot>,
+    opponent_recheck: Option<Box<OpponentRecheckState>>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum EndpointKind {
+    Repair,
+    Opponent,
+}
+impl EndpointKind {
+    fn phase(self) -> ReplayCpuPhase {
+        match self {
+            Self::Repair => ReplayCpuPhase::RepairEndpoint,
+            Self::Opponent => ReplayCpuPhase::RepairOpponentEndpoint,
+        }
+    }
+    fn prior_stages(self) -> usize {
+        match self {
+            Self::Repair => 2,
+            Self::Opponent => 3,
+        }
+    }
+    fn scope(self) -> &'static str {
+        match self {
+            Self::Repair => FRESH_REPLAY_REPAIR_SCOPE,
+            Self::Opponent => FRESH_REPLAY_OPPONENT_SCOPE,
+        }
+    }
 }
 
 struct StageRequest<'a> {
@@ -512,6 +548,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             repair_line_id: None,
             repair_endpoint_node: None,
             repair_endpoint_snapshot: None,
+            opponent_recheck: None,
         })
     }
 
@@ -1171,6 +1208,15 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         request: StageRequest<'_>,
         counters: &mut PalsCounters,
     ) -> Result<Option<ObservationId>, ReplayError> {
+        self.unrestricted_endpoint_stage(request, counters, EndpointKind::Repair)
+    }
+
+    fn unrestricted_endpoint_stage(
+        &mut self,
+        request: StageRequest<'_>,
+        counters: &mut PalsCounters,
+        kind: EndpointKind,
+    ) -> Result<Option<ObservationId>, ReplayError> {
         let StageRequest {
             root,
             target,
@@ -1181,19 +1227,20 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         } = request;
         self.check_control(limits, cancel)?;
         self.engine.validate_checker_namespace()?;
-        if phase != ReplayCpuPhase::RepairEndpoint
+        if phase != kind.phase()
             || depth != self.plan.requested_depth
             || self.engine.nodes[target].terminal.is_some()
-            || self.engine.nodes[target].evidence.is_some()
+            || (kind == EndpointKind::Repair && self.engine.nodes[target].evidence.is_some())
             || self.engine.cpu.last_attempt().is_some()
             || self.engine.cpu_condition() != self.engine.cpu_registered_condition
             || self.engine.cpu.identity() != &self.engine.checker_registered_identity
-            || self.stages.len() != 2
-            || self.stages.capacity() < 3
+            || self.stages.len() != kind.prior_stages()
+            || self.stages.capacity() < kind.prior_stages() + 1
         {
-            return Err(ReplayError::InvalidPlan(
-                "endpoint is not a fresh unrestricted third stage",
-            ));
+            return Err(ReplayError::InvalidPlan(match kind {
+                EndpointKind::Repair => "endpoint is not a fresh unrestricted third stage",
+                EndpointKind::Opponent => "endpoint is not a fresh unrestricted fourth stage",
+            }));
         }
         let descriptor = self.engine.owned_descriptor()?;
         let value_identity = self.engine.owned_identity()?.clone();
@@ -1202,10 +1249,14 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         task_condition
             .try_reserve_exact(MAX_REPLAY_CONDITION_BYTES)
             .map_err(|_| PalsError::Capacity)?;
-        write!(&mut task_condition,
-            "{};replay={};phase=repair-endpoint;question=AnalyzePosition;input-revision=0;root-moves=empty",
-            registered_condition, FRESH_REPLAY_REPAIR_SCOPE,
-        ).map_err(|_| PalsError::Capacity)?;
+        write!(
+            &mut task_condition,
+            "{};replay={};phase={};question=AnalyzePosition;input-revision=0;root-moves=empty",
+            registered_condition,
+            kind.scope(),
+            kind.phase().label(),
+        )
+        .map_err(|_| PalsError::Capacity)?;
         if task_condition.len() > MAX_REPLAY_CONDITION_BYTES {
             return Err(PalsError::Capacity.into());
         }
@@ -1283,6 +1334,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
                 cancel,
             },
             counters,
+            kind,
         );
         if result.is_err()
             && let Err(error) = self.engine.stores.tasks.fail(execution)
@@ -1296,6 +1348,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         &mut self,
         context: StartedStage<'_>,
         counters: &mut PalsCounters,
+        kind: EndpointKind,
     ) -> Result<Option<ObservationId>, ReplayError> {
         let StartedStage {
             index,
@@ -1446,15 +1499,12 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         if self.engine.stores.generation() != consumer.generation
             || self.engine.stores.root() != Some(active_root)
             || self.engine.stores.situations.get(active_root)?.revision != root_revision
-            || self
-                .repair_endpoint_snapshot
-                .as_ref()
-                .is_none_or(|snapshot| {
-                    !self.engine.nodes[target]
-                        .position
-                        .snapshot()
-                        .same_state(snapshot)
-                })
+            || self.endpoint_snapshot(kind).is_none_or(|snapshot| {
+                !self.engine.nodes[target]
+                    .position
+                    .snapshot()
+                    .same_state(snapshot)
+            })
         {
             return Err(StoreError::StaleConsumer.into());
         }
@@ -1465,13 +1515,18 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             .ok_or(PalsError::Capacity)?;
         // Only this completed unrestricted actual observation enters endpoint
         // evidence. Both restricted root observations remain sources only.
-        self.engine.nodes[target].evidence = Some(CpuEvidence {
-            score: report.score,
-            depth: report.completed_depth,
-            scope: report.score_scope,
-            value_identity: report.value_identity.clone(),
-            provenance: Some((observation, self.stages[index].execution)),
-        });
+        if kind == EndpointKind::Repair {
+            self.engine.nodes[target].evidence = Some(CpuEvidence {
+                score: report.score,
+                depth: report.completed_depth,
+                scope: report.score_scope,
+                value_identity: report.value_identity.clone(),
+                provenance: Some((observation, self.stages[index].execution)),
+            });
+        }
+        // A fourth observation remains in its own stage/task ledger. In
+        // particular, a transposition cannot overwrite the third-stage evidence
+        // exposed by repair_endpoint(), or masquerade as an old cached value.
         Ok(Some(observation))
     }
 
