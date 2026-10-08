@@ -1975,4 +1975,51 @@ marker는 Disabled 선언이어도 거절한다. present 새/unknown/null versio
 focused Python fixture는 36개이며 실제 marker 16개 및 nested version 12개 음성
 subcase를 포함한다. historical pair selector의 합성 seam을 실제 과거 producer·빌드
 재검증으로 해석하지 않는다. root109는 최종 byte pin과 stdlib AST만 PASS다. 실제
-import·fixture·consumer 인수는 후속 CPU CI에서 확인하며 local NN·WSL·GPU는 미실행이다.
+import·fixture·consumer 인수는 아래 후속 CPU CI에서 확인하며 local NN·WSL·GPU는 미실행이다.
+
+### `9fa1505`의 통합 CPU CI 인수
+
+[CI 37725468882](https://github.com/daejunnom/RoveZero/actions/runs/37725468882)는
+source `9fa1505481bc3acf7e1a1c4b3af4b8c036048b25`에서 Linux·Windows workspace,
+CPU bindings, PALS model CPU 네 job 모두 SUCCESS다. 최종 Windows job은
+2026-10-08 04:07:55 UTC에 완료됐다. Linux·Windows의 all-targets/all-features 검사,
+native CLI, Rules release 대조, Python 도구 검사와 clippy `-D warnings`를 포함한다.
+Linux 로그에서 record planner/registry의 집중 검사 13개와 post-repair engine 검사
+7개, 새 UCI 선택·journal 검사의 actual `ok`를 확인했다. PALS model suite 365개와
+native Repair 소비자 집중 검사 36개도 실제 실행돼 통과했다. 이전 `2367174`와
+`ebde32c`의 실패 기록을 소급 성공으로 바꾸지 않는다.
+
+이 인수는 현재 구현 소스의 CPU 검사다. CUDA backing·물리 device join·활성 collector,
+전체 전략적 V, 실제 GPU 수치·메모리·대국을 완료했다고 표시하지 않는다. 후속
+arena/manifest 연결은 별도 source 단위로 검증한다. 기존 CPU04 preparation/binary의
+source 등록은 현재 HEAD로 재사용하지 않으며 GPU 보류·로컬 heavy CPU 자원 질문의
+답변 대기·실제 학습 제외·전체 목표 미완료·Draft 경계를 유지한다.
+
+### Repair 재검토 정책의 V3 명세와 arena 소비 연결
+
+명시적 `pals-post-repair-recheck/1` 검색 명세는 단일 옵션
+`post_repair_recheck=same-repaired-line-once-v1`과 자체 CPU_R만 허용한다. 실행 recipe의
+동일 선택을 대조한 뒤 UCI flag 하나를 마지막에 추가한다. 미선택 recipe의 argv 순서와
+생략된 optional 필드, V3 canonical bytes 및 과거 V1/V2 읽기 경로를 보존한다.
+새 optional의 present-null과 미지원 선택은 거절하며, 기존 optional의 null 의미는
+바꾸지 않는다. `rz-experiments`는 engine/UCI에 역의존하지 않는 얇은 wire 타입을
+소유한다. arena의 집중 검사 소스는 현재 engine의 조건 literal SHA와 계약 pin을 대조한다.
+
+work 기록 감사와 공개 native 단독 감사는 startup·termination의 실제
+`search_work.pals_search_policy` 네 필드를 모두 대조한다. 새 lane에서는 두 marker가
+필수이고 legacy·자체 CPU·외부 UCI·외부 CPU_R 경로에 주입된 marker는 거절한다.
+Core에는 명세의 기대값을 복사하지 않고 실제 work 관측에서 검증한 marker를 옮긴다.
+marker가 맞더라도 실패한 go·불명 작업·물리 완료·buffer 해제·NN 소비·시계·PGN의
+기존 인수 조건은 유지한다. 선택을 Reply 실행·재검토 성공·전체 방어 증명으로 집계하지 않는다.
+
+검사 소스는 manifest 신규 10개와 arena 신규 6개, 기존 external 선언 fixture 보강
+1개다. 최대 옵션의 CUDA recipe는 metadata 대조 대상으로 legacy 22개 argv에서
+선택 후 23개가 되며 기존 32개 상한을 유지한다. 실제 CUDA 실행 자료는 아니다.
+원문 동결·독립 검토·서식·CPU CI의 증거를 각각 구분하고, 이번 단위 이전 `9fa1505`의
+성공을 새 arena source의 실제 실행으로 재사용하지 않는다.
+
+native collector의 활성 정책 constructor·독립 출처 등록과 실제 Repair→Reply 인과
+trace는 후속 단위다. 일반 Reply의 물리 완료·delivery·consumption만으로 특정
+Repair 재검토를 증명하지 않는다. 같은 repaired line·revision·상대 anchor·CPU
+namespace 및 실제 비교 evidence를 결합해야 하며, 기존 Disabled collector와 label
+인수 범위를 완화하지 않는다. 전체 전략적 V와 CUDA record bank도 계속 미완료다.
