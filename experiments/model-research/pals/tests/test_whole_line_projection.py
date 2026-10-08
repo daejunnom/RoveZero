@@ -182,9 +182,12 @@ class WholeLineProjectionTests(unittest.TestCase):
         self.assertEqual(checked.target.input_sha256, self.fixture.repair.rows[1]["input"]["sha256"])
         self.assertEqual(checked.target.scope, "next_repair_move_whole_line_conditioned_surrogate")
         self.assertEqual(self.fixture.whole.outcome.raw_endpoint_scores, (90, 20))
+        # This detached view is unchanged throughout these field assertions.
+        # Mutation/revalidation tests below still obtain their own fresh views.
+        admission = checked.admission
         for field in ("ordinary_policy_admitted", "strategic_repair_validity_admitted", "counterexample_validity_admitted",
                       "wdl_admitted", "divergence_ranking_admitted", "minimax_admitted", "tactical_proof_admitted", "actual_training_executed"):
-            self.assertIs(checked.admission[field], False)
+            self.assertIs(admission[field], False)
 
     def test_actual74_like_propose_root_full_line_cannot_become_repair_positive(self):
         old = self.fixture.make_whole_fixture(self.fixture.repair.root_index).admit()
@@ -324,14 +327,16 @@ class WholeLineProjectionTests(unittest.TestCase):
             self.fixture.lines.change_receipt("left", lambda receipt: (receipt.update(status=status),
                 receipt["report"].update(completion=completion, completed_depth=1)))
             self.fixture.refresh()
-            self.assertFalse(self.fixture.admit().target.mask)
-            self.assertEqual(self.fixture.admit().target.reason, reason)
+            target = self.fixture.admit().target
+            self.assertFalse(target.mask)
+            self.assertEqual(target.reason, reason)
         for score, reason in ((29000, "mate_band"), (20001, "out_of_range"), (20, "tie_or_below_margin")):
             self.fixture.lines.executions["left"]["receipt"] = original
             self.fixture.lines.change_receipt("left", lambda receipt: receipt["report"].update(raw_score=score))
             self.fixture.refresh()
-            self.assertEqual(self.fixture.admit().target.reason, reason)
-            self.assertEqual(self.fixture.admit().target.sign, 0)
+            target = self.fixture.admit().target
+            self.assertEqual(target.reason, reason)
+            self.assertEqual(target.sign, 0)
         self.fixture.lines.executions["left"]["receipt"] = None
         self.fixture.lines.observe("left")
         self.fixture.lines.refresh_pins()
