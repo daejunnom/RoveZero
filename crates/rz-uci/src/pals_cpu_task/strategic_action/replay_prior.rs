@@ -409,19 +409,18 @@ pub fn consume_native_replay_prior<'a>(
             "independent registration/parent/current/frozen/query binding or authority differs",
         ));
     }
-    if let Some(native) = &observation.native_receipt {
-        if super::digest_string(&expected_asset_profile.model_epoch) != Some(native.model_epoch)
+    if let Some(native) = &observation.native_receipt
+        && (super::digest_string(&expected_asset_profile.model_epoch) != Some(native.model_epoch)
             || super::digest_string(&expected_asset_profile.export_manifest.sha256)
                 != Some(native.export_manifest_sha256)
             || super::digest_string(&expected_asset_profile.encoding_semantic_sha256)
                 != Some(native.encoding_semantic_sha256)
             || super::digest_string(&expected.registered_artifacts.provider_factory_source.sha256)
-                != Some(native.adapter_source_sha256)
-        {
-            return Err(fault(
-                "independent model/export/encoding/adapter binding differs",
-            ));
-        }
+                != Some(native.adapter_source_sha256))
+    {
+        return Err(fault(
+            "independent model/export/encoding/adapter binding differs",
+        ));
     }
     let readiness = classify(observation, projection);
     Ok(CheckedNativeReplayPrior {
@@ -627,15 +626,17 @@ pub(super) mod tests {
         o.cpu_reports_returned = Some(4);
         o.cpu_nodes_lower_bound = Some(40);
         o.cpu_work_observation_incomplete = Some(false);
-        let mut p = ReplayQueryPrior::default();
-        p.outcome = PriorOutcome::CompletedOpponentEndpoint;
-        p.work_returned_elapsed_ms = Some(1);
-        p.work_returned_within_execution_window = Some(true);
-        p.stage_count = 4;
-        p.endpoint_observed = true;
-        p.opponent_anchor_ply = Some(3);
-        p.opponent_role_steps = 2;
-        p.accepted_opponent_steps = 2;
+        let mut p = ReplayQueryPrior {
+            outcome: PriorOutcome::CompletedOpponentEndpoint,
+            work_returned_elapsed_ms: Some(1),
+            work_returned_within_execution_window: Some(true),
+            stage_count: 4,
+            endpoint_observed: true,
+            opponent_anchor_ply: Some(3),
+            opponent_role_steps: 2,
+            accepted_opponent_steps: 2,
+            ..ReplayQueryPrior::default()
+        };
         p.repaired_line
             .capture(&[BoardMove::from_uci("e2e4").unwrap()], MAX_LINE_MOVES)
             .unwrap();
