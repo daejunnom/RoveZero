@@ -2442,3 +2442,50 @@ Linux는 해당 native focused 검사들을 통과한 뒤 `collapsible_if`의 wa
 중단했다. 후속 변경은 fixture 차이를 1ms로 만들고, Err → sink lock → selected 여부의
 평가 순서를 유지한 let-chain으로 조건문을 정리한다. production deadline이나 lint
 엄격도는 바꾸지 않는다. 최종 source pair를 명시 등록하고 같은 HEAD의 재검사를 요구한다.
+
+최종 생산자 수정 HEAD `b738ad719c877d0fe2b195d5755ddb44f22c6a43`의
+[CPU CI run 37767689597](https://github.com/daejunnom/RoveZero/actions/runs/37767689597)은
+Linux·Windows·bindings·모델 CPU 네 job 모두 성공했다. 원문 로그에서 모델 suite 548개,
+Python 전략 경계 28개, Rust 전략 경계 11개/OS와 native fixture 29개/OS를 확인했다.
+일곱 새 반환 fixture는 합성 owner 자료를 사용하는 범위이며 실제 collector 실행,
+Query 선택의 native 인과, whole cost, utility를 인증하지 않는다. 이전 실패 자료도 보존한다.
+
+### Frozen parent의 별도 Rust replay 접점
+
+[engine/replay.rs](../../crates/rz-search/src/pals/engine/replay.rs)의
+`FreshReplayOwner::new`와 일회성 `run`은 별도의 caller-declared offline 경계다.
+첫 범위는 Complete startpos 전체 이력의 Rules 재구성 → 실제 새 P Proposal →
+선택 `defend_response`의 두 CPU 검사 → after 관측의 공개 Counterexample →
+같은 replay의 실제 Reply 수락까지다. 기존 `engine.rs`에는 모듈 선언만 추가하며
+기존 product search·CPU dispatcher·native collector 함수 본문은 유지한다.
+
+- 역사적 parent·Query·catalogue·before-result·semantic·CPU request digest는 선언된
+  provenance다. strict Python admission과 원문 byte binding은 호출자의 인수 책임이며
+  과거 record·TaskKey·ExecutionId·ObservationId를 새 stores로 가져오지 않는다.
+- 새 P 출력이 선언 prefix와 맞지 않으면 `SeedNotApplied`로 끝난다. 법적 historical
+  claimed line도 가설로 보존하며 CPU가 그 전체 수순을 검증했다고 표시하지 않는다.
+- baseline H0와 after H1은 동일 H1 capability의 새 PlanAssisted CPU/TT로 각각 수행한다.
+  같은 effective Rules root order와 고정 N, 동일 original deadline/cancel을 사용하고
+  2N 지원이 부족하면 실행 전에 거절한다. 원래 restriction 순서는 별도로 보존한다.
+- phase별 TaskKey에서 Start만 허용한다. 원문 report·attempt·known/unknown work를
+  CPU 교체 전에 소유하고 primary와 secondary task cleanup 실패를 구분한다.
+  정확한 DepthLimit·요청 깊이·CompletedIteration·reuse 0을 충족한 after만 게시한다.
+- 공개 Counterexample의 값은 None·depth 0이며 실제 after observation을 참조한다.
+  그 이후 새 Reply context를 준비·수락하고 늦은 취소·만료를 다시 검사한다.
+  같은 Proposal 응수는 `SameProposalResponse`, 미완료 검사는 `Partial`로 보존한다.
+- entered invocation마다 논리 `finish_search` hook를 한 번 호출한다. 이 hook와
+  Reply 수락은 worker join·buffer 해제·Repair·recheck 완료의 증거와 구분한다.
+  모델의 native worker/epoch freshness도 이 owner의 Rust 생성만으로 인증하지 않는다.
+
+13개 focused CPU fixture는 실제 own CPU 실행과 scripted RoleModel을 연결하여 phase
+독립성·Start-only·H0 완료 후 H1 partial의 work 보존·Reply 입력·late cancel·finish를
+검사한다. 소스/formatter/독립 검토와 해당 HEAD의 CI 성공을 구분하며, 아래 후속
+검사 결과를 확인하기 전에는 새 fixture가 통과했다고 표시하지 않는다.
+기존 source pair의 successor 등록은 unchanged default/recheck 경로에만 적용되며
+새 replay를 기존 witness 권한으로 자동 인수하지 않는다.
+
+생성자와 Rules 재구성 비용은 `run` elapsed 이전이므로 전체 invocation 시간은 아직
+미관측이다. 실제 Query/2 소비자·native RequestId/NN 실행·같은 invocation의 Repair와
+recheck·caller 종료/정리 ledger 연결은 후속 구현·인수 범위다. 독립 두 action의 동일
+조건부 fact/전체 비용 비교는 아직 미인수이며 utility groups 0/masked를 유지한다.
+이번 GPU 검증 보류와 actual training/backward/optimizer 제외를 유지한다.

@@ -56,6 +56,14 @@ _REVIEWED_OPT_IN_SOURCE_PROFILES = (
         "crates/rz-arena/src/pals_collect/native.rs": {
             "bytes": 193840, "sha256": "2c2bfb1c8717a68429d315fa576268ba95b9b6106caed57400b885f656d04ae7"},
     }),
+    # Module/comment-only engine successor; native does not call standalone
+    # replay, so this profile admits no replay causal, witness or utility scope.
+    ("opt_in_replay_module_0a0a4800_native_2c2bfb1c", {
+        "crates/rz-search/src/pals/engine.rs": {
+            "bytes": 344097, "sha256": "0a0a4800e940700721ec856ab86c8d8dbb581f6291fd78976ce1f918ea5a40c3"},
+        "crates/rz-arena/src/pals_collect/native.rs": {
+            "bytes": 193840, "sha256": "2c2bfb1c8717a68429d315fa576268ba95b9b6106caed57400b885f656d04ae7"},
+    }),
 )
 _POLICY = {
     "version": "pals-post-repair-recheck/1",

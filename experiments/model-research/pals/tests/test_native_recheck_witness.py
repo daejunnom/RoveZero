@@ -642,8 +642,8 @@ class NativeRecheckWholeGateTests(unittest.TestCase):
 # A source successor requires an explicit new review and deliberate fixture edit.
 REVIEWED_WHOLE_SOURCE_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
-        "bytes": 343988,
-        "sha256": "0302e49b6a9784641ca90aba17490d404b793098f38836b7b3cf42a12ee131d1",
+        "bytes": 344097,
+        "sha256": "0a0a4800e940700721ec856ab86c8d8dbb581f6291fd78976ce1f918ea5a40c3",
     },
     "crates/rz-arena/src/pals_collect/native.rs": {
         "bytes": 193840,

@@ -1,5 +1,9 @@
 //! Restricted-game PALS refinement. These edges are examined continuations,
 //! not PUCT visits. Only Rules can certify a terminal position.
+
+/// Separate caller-declared offline replay; not a product V or native closure capability.
+pub mod replay;
+
 use super::store::{
     BoundKind, ContinuationConclusion, EvidenceScope, ExecutionId, LineId, Move16, Observation,
     ObservationId, ObservationKind, PalsStores, RawScore, SituationId, StateId, StoreError,

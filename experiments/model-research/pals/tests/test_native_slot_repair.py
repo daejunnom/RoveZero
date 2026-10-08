@@ -345,7 +345,7 @@ class NativeSlotRepairTests(unittest.TestCase):
         self.assertEqual(body["captured_input_revision"], 2)
         self.assertEqual(body["transition_profile"]["reviewed_transition_sources"], {
             "crates/rz-search/src/pals/engine.rs": {
-                "bytes": 343988, "sha256": "0302e49b6a9784641ca90aba17490d404b793098f38836b7b3cf42a12ee131d1"},
+                "bytes": 344097, "sha256": "0a0a4800e940700721ec856ab86c8d8dbb581f6291fd78976ce1f918ea5a40c3"},
             "crates/rz-arena/src/pals_collect/native.rs": {
                 "bytes": 193840, "sha256": "2c2bfb1c8717a68429d315fa576268ba95b9b6106caed57400b885f656d04ae7"},
         })
@@ -445,7 +445,7 @@ class NativeSlotRepairTests(unittest.TestCase):
         current = {path: semantic.byte_pin(value) for path, value in zip(slot_witness._SOURCE_PATHS,
             (self.fixture.engine_raw, self.fixture.native_raw))}
         self.assertEqual(current[slot_witness._SOURCE_PATHS[0]],
-            {"bytes": 343988, "sha256": "0302e49b6a9784641ca90aba17490d404b793098f38836b7b3cf42a12ee131d1"})
+            {"bytes": 344097, "sha256": "0a0a4800e940700721ec856ab86c8d8dbb581f6291fd78976ce1f918ea5a40c3"})
         self.assertEqual(current[slot_witness._SOURCE_PATHS[1]],
             {"bytes": 193840, "sha256": "2c2bfb1c8717a68429d315fa576268ba95b9b6106caed57400b885f656d04ae7"})
         self.assertEqual(slot_witness._reviewed_source_pair(current), current)

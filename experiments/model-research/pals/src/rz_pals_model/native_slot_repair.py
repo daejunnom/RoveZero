@@ -75,6 +75,13 @@ _REVIEWED_DISABLED_SEARCH_RETURN_CLOCK_LINT_SOURCES = (
     {"bytes": 343988, "sha256": "0302e49b6a9784641ca90aba17490d404b793098f38836b7b3cf42a12ee131d1"},
     {"bytes": 193840, "sha256": "2c2bfb1c8717a68429d315fa576268ba95b9b6106caed57400b885f656d04ae7"},
 )
+# Reviewed engine module/comment-only successor; its original body is preserved.
+# The native collector does not call standalone replay. This profile grants no
+# replay causal, witness or utility authority.
+_REVIEWED_DISABLED_REPLAY_MODULE_SOURCES = (
+    {"bytes": 344097, "sha256": "0a0a4800e940700721ec856ab86c8d8dbb581f6291fd78976ce1f918ea5a40c3"},
+    {"bytes": 193840, "sha256": "2c2bfb1c8717a68429d315fa576268ba95b9b6106caed57400b885f656d04ae7"},
+)
 _SOURCE_REVIEW_PROFILES = (
     ("legacy_prepared_lineage_4469f9d", _REVIEWED_SOURCES),
     ("legacy_disabled_recheck_9c0de959", _REVIEWED_DISABLED_RECHECK_SOURCES),
@@ -82,6 +89,7 @@ _SOURCE_REVIEW_PROFILES = (
     ("legacy_disabled_observer_lint_0b056c4f", _REVIEWED_DISABLED_OBSERVER_LINT_SOURCES),
     ("legacy_disabled_search_return_9653ed5e", _REVIEWED_DISABLED_SEARCH_RETURN_SOURCES),
     ("legacy_disabled_search_return_clock_lint_2c2bfb1c", _REVIEWED_DISABLED_SEARCH_RETURN_CLOCK_LINT_SOURCES),
+    ("legacy_disabled_replay_module_0a0a4800_native_2c2bfb1c", _REVIEWED_DISABLED_REPLAY_MODULE_SOURCES),
 )
 _DISABLED_SEARCH_VERSION = "pals-restricted-refinement/0.1"
 _OPT_IN_LANE_FIELDS = ("pals_search_policy", "refinement_registration", "refinement_registration_sha256", "post_repair_recheck", "post_repair_recheck_policy", "post_repair_recheck_conditions",
