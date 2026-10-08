@@ -230,7 +230,14 @@ current 상태에서 시작하는 두 suffix를 첫 합법 수의 조건부 비�
 27개 CPU 검사는 합성 실행/Rules 증거와 작은 수치 fixture를 사용한 정확성 검사입니다.
 실제 Rust suffix 실행·checkpoint reload·학습·GPU 인수와 구분하며, 기존 ordinary
 Propose root의 whole-line 실행을 이 Repair 접점의 양의 실행 증거로 재사용하지 않습니다.
-C slot의 수선 witness와 ranking consumer는 별도 인수 항목입니다.
+`native_slot_repair.admit_native_slot_repair`는 exact D slot의 Reply·초기 Repair·
+selected public full line을 전체 immutable trace·work summary·native finish와
+등록된 Rules/source/build 근거에 연결하는 별도 조건부 witness입니다. 직접 causal ID가
+없는 기존 wire에서 유일한 prepared lineage만 허용하며 known/not_examined/unsupported를
+구분합니다. 같은 원시 public 행만 합치고 input revision 역행과 bool request ID를
+거절합니다. record_index/critical만 바뀐 projection은 미지원으로 보존합니다.
+중앙 CPU fixture 30개는 합성 관측의 정확성 검사이며 실제 C witness·ranking·target·
+loss·전략적 수선·제품 권한의 실행 증거가 아닙니다. 제품 P/C/Repair 구현과 별도로 인수합니다.
 기존 factual continuation을 새 사전 criterion이 있었던 자료로 소급 변환하지 않습니다.
 
 FLOPs 보고는 FMA=2 기준의 실제 선언 shape에 따른 matrix product 산술입니다.

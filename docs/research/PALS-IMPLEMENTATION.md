@@ -1496,3 +1496,66 @@ managed 기록에 보존한다. GPU 검증은 계속 보류한다.
 기존 `c483512`의 [CI 37702463443](https://github.com/daejunnom/RoveZero/actions/runs/37702463443)는
 네 CPU job 모두 성공했고 Windows job은 2026-10-07 23:35:16 UTC에 완료됐다.
 이 결과에 신규 projection 소스의 CI 인수를 포함시키지 않는다.
+
+후속 `8dde262`의 [CI 37705295820](https://github.com/daejunnom/RoveZero/actions/runs/37705295820)은
+Linux·Windows·CPU bindings·PALS model CPU 네 job 모두 실제 성공했다. Linux 최종 완료는
+2026-10-08 00:05:24 UTC다. 해당 SHA의 CPU 검사이며 새 C witness와 소스 밖 supervisor,
+GPU·실제 학습·최종 paired 인수를 포함하지 않는다.
+
+### 조건부 C slot의 실제 관측 연결
+
+[`native_slot_repair.py`](../../experiments/model-research/pals/src/rz_pals_model/native_slot_repair.py)의
+`CheckedNativeSlotRepair`는 하나의 exact D 입력·ordered slot과 원래 root, Reply, 최초 Repair,
+후속으로 실제 선택된 public repaired line을 전체 관측 창에서 도출한다. caller가 matching
+index나 callback을 제공할 수 없으며, root·Reply·초기 Repair·publication은 기존 strict current
+view에 있어야 한다. 나머지 historical 호출은 등록된 immutable raw 관측으로만 남긴다.
+prepared/input/sidecar/lineage/event/raw-output 전체 roster와 per-search work summary·native
+finish를 먼저 대조하므로 빠진 호출을 완전한 미검사 창으로 표현하지 않는다. 원래 collector
+build manifest와 binary, 검토한 Rust transition 두 소스 및 실제 Rules capability의 완전한
+이력을 각각 요구한다.
+
+기존 wire에는 직접 D→Reply→Repair causal ID가 없으므로 범위는
+`conditional_unique_prepared_lineage`다. 일반 flow의 publication은 다음 D에서 처음 관측될
+수 있어 이전 window의 `not_examined`를 채우지 못한다. 좁은 ordinary-observer 경로의
+synthetic known은 실제 collector의 branch/role-limit 경로를 실행한 증거가 아니다.
+Reply 소비를 Reply policy가 CPU 응답을 선택했다는 주장으로 바꾸지 않는다. 전략적 수선,
+counterexample validity, C ranking, whole-line ordinal·target·loss·학습·제품 권한은 모두 false다.
+
+독립 검토에서 exact public raw 반복 거절, 같은 root input revision 역행, physical output의
+bool request ID가 정수와 같게 비교되는 경계를 수정했다. 동일 observation SHA와 실제 lexical
+bytes가 모두 같은 반복만 합친다. 같은 game/revision에서 record_index·critical만 달라진
+selected projection은 `unsupported_public_projection_change`로 보존하며 뒤의 immutable
+충돌을 끝까지 검사한다. 빈 raw와 빈 selected는 부재이고 selected에 필요한 raw가 없으면
+거절한다.
+
+중앙 root82는 30개 모두 공통 semantic fixture 준비에서 ERROR였다. 빈 prefix/root_moves에
+부적격 task를 지정한 fixture를 기존 eligibility 조건에 맞추고 제품 validator는 유지했다.
+새 root84에서 CPU Torch 2.8.0/NumPy 2.2.6의 합성 fixture 30개가 10.299초에 통과했다.
+소스 `84b474a1809cb2a9dc63793ad06c715023e1bb0d2e78ada0ba3073b41902ce32`와
+검사 `1cc5273d740eea2f97976fabdea26b17b0ac934da778eb94f7aaa103c34fc2be`의 전후 pin,
+affinity 0/2·high 6GiB/max 12GiB·swap 0·pids 128과 managed temporary/tree 정리를 확인했다.
+설치 포함 service 60.113초는 성능 비교가 아니며 실제 메모리 peak는 unknown이다.
+root82의 원래 30 ERROR와 cleanup 증거는 보존하고 검사 수를 합산하지 않는다.
+actual69·actual74를 새 witness나 C 감독으로 승격하지 않았다.
+
+### 최종 CPU helper 대국의 준비와 감독
+
+새 CPU03의 실제 준비 root79는 lock/opening/private snapshot 세 command의 loaded image,
+exit 0 및 transport 정리를 확인했다. driver exit·pipe·정리 22.379초, managed temporary/tree
+정리 완료이며 engines/NN/paired 인수는 false다. 모델·binary·기존 조건과 새 source freeze
+revision 2를 고정했다. PALS(+Stockfish 19 CPU_R) 대 자체 CPU의 120초+1초·흑백 교환 두 판,
+동시 대국 1개·최대 256 ply·전체 900초+정리 30초를 실제 실행해야 최종 인수가 가능하다.
+
+소스 밖 supervisor 독립 검토에서 취소가 cleanup을 끊는 경계와 stdout 저장 오류가 stderr
+보존을 생략하는 경계를 수정했다. 새 helper는 작업 구간의 cooperative 취소만 검사하며
+handler는 flag만 설정한다. 각 stdout/stderr와 nested marker/result의 원시 보존을 따로
+시도하고 첫 오류를 유지한다. 바깥 PGID 종료는 별도 nonce systemd service 종료가 아니다.
+최종 PGN·clock·typed Core·NN·helper·물리 수명 인수는 transport와 구분한다.
+
+root83은 중앙 실행 사용자 설정이 fixture의 root 전제와 달라 child 없이 실패했다. 원래 자료를
+보존하고 evidence namespace만 바꾼 root85를 root로 실행해 stdlib 오류 주입 6항목을
+0.432초에 통과했다. 실제 tiny child의 종료·reap·group과 로그 보존을 검사했지만 cleanup
+handler 직접 호출을 외부 OS signal 전달 성공으로 보고하지 않는다. root80의 Windows CLI는
+WSL app alias의 binary 읽기 단계에서 35ms에 실패했고 engines/NN은 시작하지 않았다.
+이 실패를 보존하고 system WSL 실행 파일을 명시한 별도 CLI 관측을 준비한다. 실제 paired
+대국 인수는 아직 없으며 GPU·학습·새 cloud 실행은 없다.
