@@ -444,24 +444,151 @@ fn search_return_deadline(
     )
 }
 fn search_return_counters(c: &PalsCounters) -> serde_json::Value {
-    serde_json::json!({"rounds":c.rounds,"proposals":c.proposals,"refutations":c.refutations,"repairs":c.repairs,
-        "supported_refutations":c.supported_refutations,"supported_repairs":c.supported_repairs,
-        "role_calls":c.role_calls,"proposer_calls":c.proposer_calls,"critic_calls":c.critic_calls,"repair_calls":c.repair_calls,
-        "completed_proposer_calls":c.completed_proposer_calls,"completed_critic_calls":c.completed_critic_calls,"completed_repair_calls":c.completed_repair_calls,
-        "consumed_role_outputs":c.consumed_role_outputs,"accepted_proposer_outputs":c.accepted_proposer_outputs,
-        "accepted_critic_outputs":c.accepted_critic_outputs,"accepted_repair_outputs":c.accepted_repair_outputs,
-        "value_calls":c.value_calls,"completed_value_calls":c.completed_value_calls,"accepted_value_outputs":c.accepted_value_outputs,
-        "external_checker_tasks":c.external_checker_tasks,"external_checker_reports":c.external_checker_reports,
-        "external_checker_nodes_observed":c.external_checker_nodes_observed,"external_checker_work_incomplete":c.external_checker_work_incomplete,
-        "external_checker_node_budget_reserved":c.external_checker_node_budget_reserved,"consumed_external_checker_tasks":c.consumed_external_checker_tasks,
-        "cpu_tasks_requested":c.cpu_tasks_requested,"cpu_tasks":c.cpu_tasks,"cpu_work_observation_incomplete":c.cpu_work_observation_incomplete,
-        "cpu_nodes":c.cpu_nodes,"cpu_quiescence_nodes":c.cpu_quiescence_nodes,"cpu_tt_hits":c.cpu_tt_hits,
-        "completed_cpu_tasks":c.completed_cpu_tasks,"partial_cpu_iterations":c.partial_cpu_iterations,"consumed_cpu_tasks":c.consumed_cpu_tasks,
-        "reused_completed_cpu_tasks_consumed":c.reused_completed_cpu_tasks_consumed,"consumed_partial_cpu_values":c.consumed_partial_cpu_values,
-        "consumed_frontier_cpu_values":c.consumed_frontier_cpu_values,"consumed_cached_cpu_values":c.consumed_cached_cpu_values,
-        "evidence_cache_hits":c.evidence_cache_hits,"examined_edges":c.examined_edges,"retained_situations":c.retained_situations,
-        "root_scope_observation_complete":c.root_scope_observation_complete,"unknown_root_children":c.unknown_root_children})
+    // Each scalar has its own macro expansion; keep every original counter key.
+    let fields = [
+        ("rounds", serde_json::json!(c.rounds)),
+        ("proposals", serde_json::json!(c.proposals)),
+        ("refutations", serde_json::json!(c.refutations)),
+        ("repairs", serde_json::json!(c.repairs)),
+        (
+            "supported_refutations",
+            serde_json::json!(c.supported_refutations),
+        ),
+        ("supported_repairs", serde_json::json!(c.supported_repairs)),
+        ("role_calls", serde_json::json!(c.role_calls)),
+        ("proposer_calls", serde_json::json!(c.proposer_calls)),
+        ("critic_calls", serde_json::json!(c.critic_calls)),
+        ("repair_calls", serde_json::json!(c.repair_calls)),
+        (
+            "completed_proposer_calls",
+            serde_json::json!(c.completed_proposer_calls),
+        ),
+        (
+            "completed_critic_calls",
+            serde_json::json!(c.completed_critic_calls),
+        ),
+        (
+            "completed_repair_calls",
+            serde_json::json!(c.completed_repair_calls),
+        ),
+        (
+            "consumed_role_outputs",
+            serde_json::json!(c.consumed_role_outputs),
+        ),
+        (
+            "accepted_proposer_outputs",
+            serde_json::json!(c.accepted_proposer_outputs),
+        ),
+        (
+            "accepted_critic_outputs",
+            serde_json::json!(c.accepted_critic_outputs),
+        ),
+        (
+            "accepted_repair_outputs",
+            serde_json::json!(c.accepted_repair_outputs),
+        ),
+        ("value_calls", serde_json::json!(c.value_calls)),
+        (
+            "completed_value_calls",
+            serde_json::json!(c.completed_value_calls),
+        ),
+        (
+            "accepted_value_outputs",
+            serde_json::json!(c.accepted_value_outputs),
+        ),
+        (
+            "external_checker_tasks",
+            serde_json::json!(c.external_checker_tasks),
+        ),
+        (
+            "external_checker_reports",
+            serde_json::json!(c.external_checker_reports),
+        ),
+        (
+            "external_checker_nodes_observed",
+            serde_json::json!(c.external_checker_nodes_observed),
+        ),
+        (
+            "external_checker_work_incomplete",
+            serde_json::json!(c.external_checker_work_incomplete),
+        ),
+        (
+            "external_checker_node_budget_reserved",
+            serde_json::json!(c.external_checker_node_budget_reserved),
+        ),
+        (
+            "consumed_external_checker_tasks",
+            serde_json::json!(c.consumed_external_checker_tasks),
+        ),
+        (
+            "cpu_tasks_requested",
+            serde_json::json!(c.cpu_tasks_requested),
+        ),
+        ("cpu_tasks", serde_json::json!(c.cpu_tasks)),
+        (
+            "cpu_work_observation_incomplete",
+            serde_json::json!(c.cpu_work_observation_incomplete),
+        ),
+        ("cpu_nodes", serde_json::json!(c.cpu_nodes)),
+        (
+            "cpu_quiescence_nodes",
+            serde_json::json!(c.cpu_quiescence_nodes),
+        ),
+        ("cpu_tt_hits", serde_json::json!(c.cpu_tt_hits)),
+        (
+            "completed_cpu_tasks",
+            serde_json::json!(c.completed_cpu_tasks),
+        ),
+        (
+            "partial_cpu_iterations",
+            serde_json::json!(c.partial_cpu_iterations),
+        ),
+        (
+            "consumed_cpu_tasks",
+            serde_json::json!(c.consumed_cpu_tasks),
+        ),
+        (
+            "reused_completed_cpu_tasks_consumed",
+            serde_json::json!(c.reused_completed_cpu_tasks_consumed),
+        ),
+        (
+            "consumed_partial_cpu_values",
+            serde_json::json!(c.consumed_partial_cpu_values),
+        ),
+        (
+            "consumed_frontier_cpu_values",
+            serde_json::json!(c.consumed_frontier_cpu_values),
+        ),
+        (
+            "consumed_cached_cpu_values",
+            serde_json::json!(c.consumed_cached_cpu_values),
+        ),
+        (
+            "evidence_cache_hits",
+            serde_json::json!(c.evidence_cache_hits),
+        ),
+        ("examined_edges", serde_json::json!(c.examined_edges)),
+        (
+            "retained_situations",
+            serde_json::json!(c.retained_situations),
+        ),
+        (
+            "root_scope_observation_complete",
+            serde_json::json!(c.root_scope_observation_complete),
+        ),
+        (
+            "unknown_root_children",
+            serde_json::json!(c.unknown_root_children),
+        ),
+    ];
+    serde_json::Value::Object(
+        fields
+            .into_iter()
+            .map(|(name, value)| (name.into(), value))
+            .collect(),
+    )
 }
+
 fn search_return_result(
     result: &Result<PalsResult, PalsError>,
 ) -> Result<serde_json::Value, RoleError> {
