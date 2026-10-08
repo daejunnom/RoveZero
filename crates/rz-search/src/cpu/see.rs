@@ -9,7 +9,7 @@
 //! Rules admit at most 32 board pieces. All four promotions, EP removals,
 //! discovered attacks, pins and king safety come from Rules views/deltas.
 
-use super::{is_tactical, material, Abort, CpuError};
+use super::{Abort, CpuError, is_tactical, material};
 use rz_position::{BoardMove, Color, Position, RuleMoveDelta, Square};
 
 const MAX_EXCHANGE_PLIES: u16 = 32;

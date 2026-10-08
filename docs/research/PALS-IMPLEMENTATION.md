@@ -1694,8 +1694,11 @@ SEE는 기존 Rules의 합법 recapture·네 승격·앙파상·핀·왕 안전�
 모든 score가 확인된 뒤에만 move 배열을 바꾼다. 중단된 score를 MVV/LVA로 대체하지 않는다.
 
 교환 정확성 10개와 namespace·resume·정렬·수명·상한·부분 비용 연결 6개의 Rust 검사
-소스를 추가했다. 총괄의 직접 검토와 저장소 edition 2021의 해당 source rustfmt 및
-diff check는 통과했다. 최초 formatter 호출의 edition 2024는 2021로 다시 적용했다.
+소스를 추가했다. 총괄의 직접 검토와 diff check를 수행했다. 루트의 edition 2021과
+`rz-search`의 명시적 edition 2024를 혼동해 최종 2021 formatter를 적용한 결과,
+`55fcc7657dbcb397a2e0f9bdcd9e9f0a4f967dfb` CI의 bindings·Linux·Windows는
+서식 검사에서 실패했다. 원래 실패 로그를 보존했고, 실제 crate edition 2024로
+다시 정렬한 해당 source rustfmt check는 통과했다. 새 SHA의 CI 인수는 별도다.
 메모리 조건 때문에 로컬 Cargo·모델·WSL 검사는 실행하지 않았으며 새 source의 CPU CI를
 별도로 인수한다. CPU_T CLI/producer의 실제 선택과 비교 명세 연결은 아직 미완료다.
 이 opt-in을 기존 CPU04의 legacy binary/config에 소급 적용하거나 기력 개선으로 보고하지 않는다.

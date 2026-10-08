@@ -20,8 +20,8 @@ use rz_position::{
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub const CPU_SEARCH_VERSION: &str = "rz-cpu-pvs/0.1";
@@ -1491,12 +1491,14 @@ mod tests {
         assert_eq!(legacy.search_identity(), CPU_SEARCH_VERSION);
         assert_eq!(legacy.search_conditions(), expected);
         assert_eq!(CpuSearcher::search_identity(&see), CPU_SEE_SEARCH_VERSION);
-        assert!(see
-            .search_conditions()
-            .contains(CpuOrderingPolicy::LegalSeeV1.identity()));
-        assert!(see
-            .search_conditions()
-            .contains("node-work:search+qsearch+exchange"));
+        assert!(
+            see.search_conditions()
+                .contains(CpuOrderingPolicy::LegalSeeV1.identity())
+        );
+        assert!(
+            see.search_conditions()
+                .contains("node-work:search+qsearch+exchange")
+        );
         assert_eq!(legacy.value_identity(), see.value_identity());
         assert_eq!(
             legacy.config().tt_allocation_bytes().unwrap(),
@@ -1749,9 +1751,11 @@ mod tests {
             .unwrap();
         assert_eq!(canceled.completion, CpuCompletion::Canceled);
         assert_eq!(canceled.completed_depth, 0);
-        assert!(position
-            .legal_moves()
-            .contains(&canceled.best_move.unwrap()));
+        assert!(
+            position
+                .legal_moves()
+                .contains(&canceled.best_move.unwrap())
+        );
         assert_eq!(canceled.score_scope, CpuScoreScope::FrontierOnly);
         let expired = engine
             .analyze(
@@ -2162,8 +2166,8 @@ mod tests {
         assert!(actual.nodes > 0 && actual.nodes <= limits(1).max_nodes);
         assert!(actual.quiescence_nodes > 0 && actual.quiescence_nodes <= actual.nodes);
         assert!(before.same_state(&position.snapshot()));
-        assert!(cpu
-            .analyze(
+        assert!(
+            cpu.analyze(
                 &position,
                 CpuLimits {
                     max_nodes: 0,
@@ -2171,7 +2175,8 @@ mod tests {
                 },
                 &AtomicBool::new(false)
             )
-            .is_err());
+            .is_err()
+        );
         assert_eq!(cpu.last_attempt_work(), Some(CpuWork::default()));
         cpu.clear();
         assert_eq!(cpu.last_attempt_work(), None);
@@ -2275,15 +2280,17 @@ mod tests {
 
     #[test]
     fn invalid_budgets_and_root_moves_are_not_silent_fallbacks() {
-        assert!(CpuEngine::new(CpuConfig {
-            tt_entries: MAX_TT_ENTRIES + 1,
-            ..CpuConfig::default()
-        })
-        .is_err());
+        assert!(
+            CpuEngine::new(CpuConfig {
+                tt_entries: MAX_TT_ENTRIES + 1,
+                ..CpuConfig::default()
+            })
+            .is_err()
+        );
         let position = Position::startpos();
         let mut cpu = engine();
-        assert!(cpu
-            .analyze(
+        assert!(
+            cpu.analyze(
                 &position,
                 CpuLimits {
                     max_nodes: 0,
@@ -2291,17 +2298,21 @@ mod tests {
                 },
                 &AtomicBool::new(false)
             )
-            .is_err());
-        assert!(cpu
-            .analyze_root_moves(&position, &[], limits(1), &AtomicBool::new(false))
-            .is_err());
+            .is_err()
+        );
+        assert!(
+            cpu.analyze_root_moves(&position, &[], limits(1), &AtomicBool::new(false))
+                .is_err()
+        );
         let mv = BoardMove::from_uci("e2e4").unwrap();
-        assert!(cpu
-            .analyze_root_moves(&position, &[mv, mv], limits(1), &AtomicBool::new(false))
-            .is_err());
+        assert!(
+            cpu.analyze_root_moves(&position, &[mv, mv], limits(1), &AtomicBool::new(false))
+                .is_err()
+        );
         let illegal = BoardMove::from_uci("e2e5").unwrap();
-        assert!(cpu
-            .analyze_root_moves(&position, &[illegal], limits(1), &AtomicBool::new(false))
-            .is_err());
+        assert!(
+            cpu.analyze_root_moves(&position, &[illegal], limits(1), &AtomicBool::new(false))
+                .is_err()
+        );
     }
 }
