@@ -2128,3 +2128,30 @@ immutable admission 뒤 원래 읽기 Vec 두 개를 해제하고 고정 body �
 기존 managed output·time/cleanup 정책을 유지한다. 두 독립 소스 리뷰와 Rust 파일
 서식을 마쳤으며, 실제 interoperability·CLI fixture·양 OS compile은 새 commit의
 CPU CI로 별도 인수한다. 이 연결은 ORT Session을 만들거나 GPU를 실행하지 않는다.
+
+해당 연결의 [CI 37741108960](https://github.com/daejunnom/RoveZero/actions/runs/37741108960)는
+`80e5256294d13f65997d1531632ba2cbdb842418`의 네 CPU job이 모두 성공했다.
+실제 Python producer 산출물을 Rust 예제가 입수한 stage와 반환 scope는 원래
+model job 로그로 인수하며, 장치·ORT Session·Run·fence 미실행 범위를 유지한다.
+
+### 전략 V의 실제 action 입력 경계
+
+별도 `strategic_verifier_query.py`는 strict current/frozen dataset과 checked Rules
+semantic 입력에서 immutable Query/2를 만든다. 한 query의 실제 branch/task/profile·
+자원 controls와 순서 있는 prior를 결합하고, hash·profile 이름·request ID·catalogue
+slot·budget bucket을 수치 feature로 바꾸지 않는다. Defer에는 CPU node 예약과
+controls를 0으로 두고 profile 차이로 가짜 대안을 만들지 않는다. 원래 등록 자료는
+보존한다. canceled/partial/failed CPU deadline receipt는 unknown 관측으로 유지하며
+완료 gain validator의 성공 조건을 완화하지 않는다.
+
+메타데이터 canonical JSON의 UTF-8·escape·구두점·반복 참조 크기는 직렬화 전에
+남은 byte credit으로 검사한다. prior의 원래 launch bytes/pin 중복과 검증된 JSON
+내용의 canonical digest 중복을 모두 거부해 request/launch whitespace·key-order
+별칭으로 같은 실행을 중복 관측하지 않는다. digest는 재표기 판별용이며 독립적인
+process 실행 증거를 발급하지 않는다. declared byte credit은 전체 Python heap peak가 아니다.
+
+두 독립 source 리뷰와 AST 검사를 마쳤으며 집중 source test methods 43개는 새
+commit의 CPU CI에서 별도 인수한다. Query/2는 scoring·utility·target·dispatch·학습·
+제품 권한이 모두 false인 첫 입력 단위다. 실제 frozen action scorer, 같은 conditional
+witness의 전체 action 완료·인과·비용 인수, 별도 masked target consumer는 후속 필수
+단위다. depth 증가·점수 일치·counterexample 부재를 utility로 간주하지 않는다.
