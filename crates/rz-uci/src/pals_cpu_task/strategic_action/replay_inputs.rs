@@ -43,6 +43,55 @@ const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
 const MAX_KNOWN_HISTORY_POSITIONS: usize = 4096;
 const DIAGNOSTIC_OUTPUT_BYTES: usize = 1024;
 
+/// Independently registered scope of the historical SemanticReceipt producer.
+/// Exact comparison observes a caller declaration, never the current replay
+/// image, Query capability or the original producer's loaded-image proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum SemanticReceiptProducerScope {
+    #[serde(rename = "dispatcher_compared_verified_argument")]
+    LibraryDispatcherArgument,
+    #[serde(rename = "linux_loaded_executable_inode")]
+    LinuxLoadedExecutableInode,
+    #[serde(rename = "current_exe_path_hash")]
+    CurrentExePathHash,
+}
+impl SemanticReceiptProducerScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LibraryDispatcherArgument => "dispatcher_compared_verified_argument",
+            Self::LinuxLoadedExecutableInode => "linux_loaded_executable_inode",
+            Self::CurrentExePathHash => "current_exe_path_hash",
+        }
+    }
+}
+impl<'de> Deserialize<'de> for SemanticReceiptProducerScope {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_str(SemanticScopeVisitor)
+    }
+}
+struct SemanticScopeVisitor;
+impl<'de> serde::de::Visitor<'de> for SemanticScopeVisitor {
+    type Value = SemanticReceiptProducerScope;
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("one exact registered SemanticReceipt producer scope string")
+    }
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        match value {
+            "dispatcher_compared_verified_argument" => Ok(Self::Value::LibraryDispatcherArgument),
+            "linux_loaded_executable_inode" => Ok(Self::Value::LinuxLoadedExecutableInode),
+            "current_exe_path_hash" => Ok(Self::Value::CurrentExePathHash),
+            _ => Err(E::unknown_variant(
+                value,
+                &[
+                    "dispatcher_compared_verified_argument",
+                    "linux_loaded_executable_inode",
+                    "current_exe_path_hash",
+                ],
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplayInputMode {
@@ -225,10 +274,14 @@ pub enum ReplayInputSourceError {
     Cpu(Box<CpuTaskError>),
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ReplayInputError {
     pub code: &'static str,
     pub stage: &'static str,
+    /// Expected declaration only; presence does not mean receipt comparison or
+    /// historical loaded-image admission completed successfully.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_semantic_receipt_producer_scope: Option<SemanticReceiptProducerScope>,
     pub message: Box<str>,
     pub elapsed_ms: Option<u64>,
     pub deadline_exceeded: bool,
@@ -240,11 +293,39 @@ pub struct ReplayInputError {
     pub output_limit: usize,
     pub source_error: Option<Box<ReplayInputSourceError>>,
 }
+impl fmt::Debug for ReplayInputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // NativeReplayPrimary archives this Debug view in its JSON diagnostic.
+        // Legacy None must retain the old field order and omit the new field.
+        let mut view = formatter.debug_struct("ReplayInputError");
+        view.field("code", &self.code).field("stage", &self.stage);
+        if let Some(scope) = self.expected_semantic_receipt_producer_scope {
+            view.field("expected_semantic_receipt_producer_scope", &Some(scope));
+        }
+        view.field("message", &self.message)
+            .field("elapsed_ms", &self.elapsed_ms)
+            .field("deadline_exceeded", &self.deadline_exceeded)
+            .field(
+                "execution_deadline_exceeded",
+                &self.execution_deadline_exceeded,
+            )
+            .field(
+                "original_whole_deadline_retained",
+                &self.original_whole_deadline_retained,
+            )
+            .field("whole_wall_ms", &self.whole_wall_ms)
+            .field("cleanup_reserve_ms", &self.cleanup_reserve_ms)
+            .field("output_limit", &self.output_limit)
+            .field("source_error", &self.source_error)
+            .finish()
+    }
+}
 impl ReplayInputError {
     pub fn new(stage: &'static str, message: impl fmt::Display) -> Self {
         Self {
             code: "frozen_replay_input_failed",
             stage,
+            expected_semantic_receipt_producer_scope: None,
             message: message
                 .to_string()
                 .chars()
@@ -276,7 +357,13 @@ impl ReplayInputError {
         result.source_error = Some(Box::new(ReplayInputSourceError::Cpu(Box::new(error))));
         result
     }
-    fn stamped(mut self, started: Instant, clock: Option<Clock>) -> Self {
+    fn stamped(
+        mut self,
+        started: Instant,
+        clock: Option<Clock>,
+        expected_scope: Option<SemanticReceiptProducerScope>,
+    ) -> Self {
+        self.expected_semantic_receipt_producer_scope = expected_scope;
         self.elapsed_ms = Some(cpu_task::milliseconds(started.elapsed()));
         if let Some(clock) = clock {
             self.output_limit = clock.output_limit;
@@ -300,6 +387,8 @@ impl std::error::Error for ReplayInputError {}
 pub struct ReplayInputAudit {
     pub schema: &'static str,
     pub scope: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_semantic_receipt_producer_scope: Option<SemanticReceiptProducerScope>,
     pub mode: ReplayInputMode,
     pub input_artifact: ArtifactPin,
     pub registration_artifact: ArtifactPin,
@@ -324,12 +413,14 @@ pub struct ReplayInputAudit {
     pub authorities: ReplayAuthorities,
 }
 
-/// Private checked fields can only be produced by check_replay_inputs. The
+/// Private checked fields can only be produced by the replay input check entry
+/// points. The
 /// consuming conversion supplies existing typed owner inputs, never a provider
 /// or a callable dispatch. Readonly raw access preserves original byte evidence.
 pub struct CheckedReplayInputs {
     request: ReplayInputRequest,
     registration: ReplayConsumerRegistration,
+    expected_semantic_receipt_producer_scope: Option<SemanticReceiptProducerScope>,
     cpu_request_raw: String,
     input_artifact: ArtifactPin,
     config: PalsConfig,
@@ -350,6 +441,11 @@ impl fmt::Debug for CheckedReplayInputs {
     }
 }
 impl CheckedReplayInputs {
+    /// Explicit expected declaration already compared with the original receipt.
+    /// None preserves the legacy library-only entry point and its omitted wire.
+    pub fn expected_semantic_receipt_producer_scope(&self) -> Option<SemanticReceiptProducerScope> {
+        self.expected_semantic_receipt_producer_scope
+    }
     pub fn mode(&self) -> ReplayInputMode {
         self.request.mode
     }
@@ -395,6 +491,7 @@ impl CheckedReplayInputs {
         ReplayInputAudit {
             schema: SCHEMA,
             scope: SCOPE,
+            expected_semantic_receipt_producer_scope: self.expected_semantic_receipt_producer_scope,
             mode: self.request.mode,
             input_artifact: self.input_artifact.clone(),
             registration_artifact: self.request.registration_artifact.clone(),
@@ -652,10 +749,14 @@ fn prepare_rules(
     receipt: &SemanticReceipt,
     clock: Clock,
     expected: &ReplayExpectedPins,
+    expected_scope: Option<SemanticReceiptProducerScope>,
 ) -> Result<(Position, DefendResponseReplayPlan), ReplayInputError> {
     if receipt.schema != semantic::SEMANTIC_SCHEMA
         || receipt.implementation != semantic::SEMANTIC_VERSION
-        || receipt.binary_pin_scope != semantic::BINARY_PIN_SCOPE
+        || receipt.binary_pin_scope
+            != expected_scope
+                .unwrap_or(SemanticReceiptProducerScope::LibraryDispatcherArgument)
+                .as_str()
         || receipt.caller_declaration_scope != semantic::DECLARATION_SCOPE
         || receipt.meaning_scope != semantic::MEANING_SCOPE
         || receipt.question != semantic::SemanticQuestion::RestrictedResponse
@@ -950,6 +1051,7 @@ fn validate(
     started: Instant,
     clock: Clock,
     input_artifact: ArtifactPin,
+    expected_scope: Option<SemanticReceiptProducerScope>,
 ) -> Result<CheckedReplayInputs, ReplayInputError> {
     if request.schema != SCHEMA || request.authorities != ReplayAuthorities::default() {
         return Err(ReplayInputError::new(
@@ -1115,7 +1217,7 @@ fn validate(
             "complete original receipt fields required, including explicit nullable fields",
         ));
     }
-    let (root, plan) = prepare_rules(&request, &cpu, &receipt, clock, expected)?;
+    let (root, plan) = prepare_rules(&request, &cpu, &receipt, clock, expected, expected_scope)?;
     check_clock(clock)?;
     let limits = PalsLimits {
         deadline: clock.execution_deadline,
@@ -1126,6 +1228,7 @@ fn validate(
     Ok(CheckedReplayInputs {
         request,
         registration,
+        expected_semantic_receipt_producer_scope: expected_scope,
         cpu_request_raw: prepared.cpu_request_raw,
         input_artifact,
         config,
@@ -1145,26 +1248,57 @@ pub fn check_replay_inputs(
     expected: &ReplayExpectedPins,
     started: Instant,
 ) -> Result<CheckedReplayInputs, ReplayInputError> {
+    check_replay_inputs_inner(bytes, expected, None, started)
+}
+
+/// Explicit caller registration is required; the scope is not selected from the
+/// receipt, host OS or the current replay executable. All raw bindings and Rules
+/// checks remain the same as the legacy library-only entry point.
+pub fn check_replay_inputs_with_semantic_scope(
+    bytes: &[u8],
+    expected: &ReplayExpectedPins,
+    expected_scope: SemanticReceiptProducerScope,
+    started: Instant,
+) -> Result<CheckedReplayInputs, ReplayInputError> {
+    check_replay_inputs_inner(bytes, expected, Some(expected_scope), started)
+}
+
+fn check_replay_inputs_inner(
+    bytes: &[u8],
+    expected: &ReplayExpectedPins,
+    expected_scope: Option<SemanticReceiptProducerScope>,
+    started: Instant,
+) -> Result<CheckedReplayInputs, ReplayInputError> {
     if bytes.is_empty() || bytes.len() > MAX_REQUEST_BYTES {
         return Err(
-            ReplayInputError::new("input_extent", "new replay wire must contain 1..=2MiB")
-                .stamped(started, None),
+            ReplayInputError::new("input_extent", "new replay wire must contain 1..=2MiB").stamped(
+                started,
+                None,
+                expected_scope,
+            ),
         );
     }
-    let request: ReplayInputRequest = serde_json::from_slice(bytes)
-        .map_err(|e| ReplayInputError::new("input_json", e).stamped(started, None))?;
+    let request: ReplayInputRequest = serde_json::from_slice(bytes).map_err(|e| {
+        ReplayInputError::new("input_json", e).stamped(started, None, expected_scope)
+    })?;
     let resources = &request.resources;
     if !(1..=cpu_task::MAX_WALL_TIME_MS).contains(&resources.whole_wall_ms) {
         return Err(
-            ReplayInputError::new("whole_wall", "finite original whole wall required")
-                .stamped(started, None),
+            ReplayInputError::new("whole_wall", "finite original whole wall required").stamped(
+                started,
+                None,
+                expected_scope,
+            ),
         );
     }
     let whole_deadline = started
         .checked_add(Duration::from_millis(resources.whole_wall_ms))
         .ok_or_else(|| {
-            ReplayInputError::new("whole_wall", "original whole deadline overflow")
-                .stamped(started, None)
+            ReplayInputError::new("whole_wall", "original whole deadline overflow").stamped(
+                started,
+                None,
+                expected_scope,
+            )
         })?;
     let output_valid = (1024..=MAX_OUTPUT_BYTES).contains(&resources.output_bytes);
     let mut clock = Clock {
@@ -1183,7 +1317,7 @@ pub fn check_replay_inputs(
             "output_bound",
             "invalid output; original whole wall retained with diagnostic cap",
         )
-        .stamped(started, Some(clock)));
+        .stamped(started, Some(clock), expected_scope));
     }
     if resources.cleanup_reserve_ms == 0 || resources.cleanup_reserve_ms >= resources.whole_wall_ms
     {
@@ -1191,25 +1325,35 @@ pub fn check_replay_inputs(
             "cleanup_reserve",
             "finite positive cleanup reserve must be inside original whole wall",
         )
-        .stamped(started, Some(clock)));
+        .stamped(started, Some(clock), expected_scope));
     }
     clock.execution_deadline = started
         .checked_add(Duration::from_millis(
             resources.whole_wall_ms - resources.cleanup_reserve_ms,
         ))
         .ok_or_else(|| {
-            ReplayInputError::new("cleanup_reserve", "original work deadline overflow")
-                .stamped(started, Some(clock))
+            ReplayInputError::new("cleanup_reserve", "original work deadline overflow").stamped(
+                started,
+                Some(clock),
+                expected_scope,
+            )
         })?;
     if started > Instant::now() {
         return Err(ReplayInputError::new(
             "original_clock",
             "caller start cannot be in the future",
         )
-        .stamped(started, Some(clock)));
+        .stamped(started, Some(clock), expected_scope));
     }
-    validate(request, expected, started, clock, super::pin(bytes))
-        .map_err(|e| e.stamped(started, Some(clock)))
+    validate(
+        request,
+        expected,
+        started,
+        clock,
+        super::pin(bytes),
+        expected_scope,
+    )
+    .map_err(|e| e.stamped(started, Some(clock), expected_scope))
 }
 
 #[cfg(test)]
@@ -1223,6 +1367,11 @@ mod tests {
     const NEW_BINARY: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const SEMANTIC_BINARY: &str =
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const PRODUCER_SCOPES: [SemanticReceiptProducerScope; 3] = [
+        SemanticReceiptProducerScope::LibraryDispatcherArgument,
+        SemanticReceiptProducerScope::LinuxLoadedExecutableInode,
+        SemanticReceiptProducerScope::CurrentExePathHash,
+    ];
 
     struct Fixture {
         request: ReplayInputRequest,
@@ -1458,6 +1607,205 @@ mod tests {
         fixture.expected.semantic_receipt_artifact =
             fixture.request.semantic_receipt_artifact.clone();
         reseal(fixture);
+    }
+
+    #[test]
+    fn explicit_semantic_scopes_are_exact_and_legacy_remains_library_only() {
+        for actual_scope in PRODUCER_SCOPES {
+            let mut value = fixture(ReplayInputMode::ReplyOnly2n, false, "position startpos");
+            changed_receipt(&mut value, |receipt| {
+                receipt.binary_pin_scope = actual_scope.as_str().into();
+            });
+            let raw = serde_json::to_vec(&value.request).unwrap();
+            for expected_scope in PRODUCER_SCOPES {
+                let result = check_replay_inputs_with_semantic_scope(
+                    &raw,
+                    &value.expected,
+                    expected_scope,
+                    Instant::now(),
+                );
+                if actual_scope == expected_scope {
+                    let checked = result.unwrap();
+                    assert_eq!(
+                        checked.expected_semantic_receipt_producer_scope(),
+                        Some(expected_scope)
+                    );
+                    let audit = checked.audit();
+                    assert_eq!(
+                        audit.expected_semantic_receipt_producer_scope,
+                        Some(expected_scope)
+                    );
+                    assert_eq!(audit.binary_pin_scope, BINARY_DECLARATION_SCOPE);
+                    assert_eq!(audit.authorities, ReplayAuthorities::default());
+                    assert_eq!(audit.cpu_checks, 0);
+                    assert!(
+                        !audit.cpu_engine_created
+                            && !audit.model_created
+                            && !audit.provider_created
+                    );
+                    assert_eq!(audit.actual_utility_groups, 0);
+                    assert_eq!(
+                        serde_json::to_value(&audit).unwrap()["expected_semantic_receipt_producer_scope"],
+                        expected_scope.as_str(),
+                    );
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.stage, "semantic_binding");
+                    assert_eq!(
+                        error.expected_semantic_receipt_producer_scope,
+                        Some(expected_scope)
+                    );
+                }
+            }
+            let legacy = check_replay_inputs(&raw, &value.expected, Instant::now());
+            if actual_scope == SemanticReceiptProducerScope::LibraryDispatcherArgument {
+                let checked = legacy.unwrap();
+                assert!(checked.expected_semantic_receipt_producer_scope().is_none());
+                assert!(
+                    !serde_json::to_value(checked.audit())
+                        .unwrap()
+                        .as_object()
+                        .unwrap()
+                        .contains_key("expected_semantic_receipt_producer_scope")
+                );
+            } else {
+                let error = legacy.unwrap_err();
+                assert_eq!(error.stage, "semantic_binding");
+                assert!(error.expected_semantic_receipt_producer_scope.is_none());
+                assert!(
+                    !serde_json::to_value(&error)
+                        .unwrap()
+                        .as_object()
+                        .unwrap()
+                        .contains_key("expected_semantic_receipt_producer_scope")
+                );
+            }
+        }
+    }
+    #[test]
+    fn explicit_scope_cannot_repin_reseal_or_enable_original_authorities() {
+        let scope = SemanticReceiptProducerScope::LinuxLoadedExecutableInode;
+        for field in 0..3 {
+            let mut value = fixture(ReplayInputMode::ReplyOnly2n, false, "position startpos");
+            changed_receipt(&mut value, |receipt| {
+                receipt.binary_pin_scope = scope.as_str().into();
+            });
+            match field {
+                0 => {
+                    value.request.semantic_receipt_raw.push(' ');
+                    value.request.semantic_receipt_artifact =
+                        super::super::pin(value.request.semantic_receipt_raw.as_bytes());
+                    // The raw pin from independent registration remains original.
+                    reseal(&mut value);
+                }
+                1 => value.request.context_sha256 = "0".repeat(64),
+                _ => {
+                    value.request.authorities.loaded_image_observed = true;
+                    reseal(&mut value);
+                }
+            }
+            let error = check_replay_inputs_with_semantic_scope(
+                &serde_json::to_vec(&value.request).unwrap(),
+                &value.expected,
+                scope,
+                Instant::now(),
+            )
+            .unwrap_err();
+            assert_eq!(error.expected_semantic_receipt_producer_scope, Some(scope));
+            assert_eq!(
+                error.stage,
+                match field {
+                    0 => "original_artifact_identity",
+                    1 => "context_identity",
+                    _ => "domain_authority",
+                }
+            );
+        }
+    }
+    #[test]
+    fn semantic_scope_wire_accepts_only_the_three_exact_string_literals() {
+        assert_eq!(
+            SemanticReceiptProducerScope::LibraryDispatcherArgument.as_str(),
+            semantic::BINARY_PIN_SCOPE
+        );
+        for scope in PRODUCER_SCOPES {
+            let raw = serde_json::to_vec(&scope).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<SemanticReceiptProducerScope>(&raw).unwrap(),
+                scope
+            );
+            assert_eq!(
+                serde_json::from_value::<SemanticReceiptProducerScope>(json!(scope.as_str()))
+                    .unwrap(),
+                scope
+            );
+            assert_eq!(
+                serde_json::from_slice::<String>(&raw).unwrap(),
+                scope.as_str()
+            );
+        }
+        for raw in [
+            "null",
+            "true",
+            "0",
+            "-1",
+            "0.5",
+            "[]",
+            "{}",
+            r#""LibraryDispatcherArgument""#,
+            r#""library_dispatcher_argument""#,
+            r#"{"dispatcher_compared_verified_argument":null}"#,
+            r#"{"linux_loaded_executable_inode":null,"linux_loaded_executable_inode":null}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<SemanticReceiptProducerScope>(raw).is_err(),
+                "{raw}"
+            );
+        }
+    }
+    #[test]
+    fn explicit_scope_errors_keep_known_original_clock_and_unknown_clock_distinct() {
+        let scope = SemanticReceiptProducerScope::CurrentExePathHash;
+        let started = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+        let mut value = fixture(
+            ReplayInputMode::RepairEndpoint3n,
+            false,
+            "position startpos",
+        );
+        value.request.resources.output_bytes = 0;
+        reseal(&mut value);
+        let error = check_replay_inputs_with_semantic_scope(
+            &serde_json::to_vec(&value.request).unwrap(),
+            &value.expected,
+            scope,
+            started,
+        )
+        .unwrap_err();
+        assert_eq!(error.stage, "output_bound");
+        assert_eq!(error.expected_semantic_receipt_producer_scope, Some(scope));
+        assert!(error.original_whole_deadline_retained && error.deadline_exceeded);
+        assert_eq!(error.whole_wall_ms, Some(5000));
+        assert_eq!(error.output_limit, DIAGNOSTIC_OUTPUT_BYTES);
+        assert!(error.elapsed_ms.unwrap() >= 10000);
+        let unknown =
+            check_replay_inputs_with_semantic_scope(b"{", &value.expected, scope, started)
+                .unwrap_err();
+        assert_eq!(unknown.stage, "input_json");
+        assert_eq!(
+            unknown.expected_semantic_receipt_producer_scope,
+            Some(scope)
+        );
+        assert!(!unknown.original_whole_deadline_retained);
+        assert!(unknown.whole_wall_ms.is_none());
+        let legacy = check_replay_inputs(b"{", &value.expected, started).unwrap_err();
+        assert!(legacy.expected_semantic_receipt_producer_scope.is_none());
+        assert!(
+            !serde_json::to_value(&legacy)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("expected_semantic_receipt_producer_scope")
+        );
     }
 
     #[test]

@@ -96,6 +96,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "onnx-cpu")]
 mod cpu_cli {
     use rz_uci::pals_cpu_task::strategic_action::ArtifactPin;
+    use rz_uci::pals_cpu_task::strategic_action::replay_inputs::SemanticReceiptProducerScope;
     use serde::Serialize;
     use sha2::{Digest, Sha256};
     #[cfg(any(feature = "onnx-cpu", test))]
@@ -117,6 +118,8 @@ mod cpu_cli {
 
     #[cfg(feature = "onnx-cpu")]
     const EXPECTED_SCHEMA: &str = "rz-pals-frozen-replay-cli-expected/1";
+    #[cfg(feature = "onnx-cpu")]
+    const EXPECTED_SCHEMA_V2: &str = "rz-pals-frozen-replay-cli-expected/2";
     #[cfg(feature = "onnx-cpu")]
     const LAUNCH_SCHEMA: &str = "rz-pals-frozen-replay-cli-assets/1";
     const CLI_SCHEMA: &str = "rz-pals-frozen-replay-cli-delivery/1";
@@ -1008,6 +1011,8 @@ mod cpu_cli {
         whole_wall_ms: Option<u64>,
         cleanup_reserve_ms: Option<u64>,
         expected_transport: Option<ArtifactPin>,
+        // An independently registered expectation, not a historical image witness.
+        expected_semantic_receipt_producer_scope: Option<SemanticReceiptProducerScope>,
         launch_artifact: Option<ArtifactPin>,
         request_artifact: Option<ArtifactPin>,
         replay_binary: Option<ArtifactPin>,
@@ -1037,6 +1042,7 @@ mod cpu_cli {
                 whole_wall_ms: None,
                 cleanup_reserve_ms: None,
                 expected_transport: None,
+                expected_semantic_receipt_producer_scope: None,
                 launch_artifact: None,
                 request_artifact: None,
                 replay_binary: None,
@@ -1341,6 +1347,8 @@ mod cpu_cli {
         schema: &'static str,
         scope: &'static str,
         expected_transport: &'a Option<ArtifactPin>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expected_semantic_receipt_producer_scope: Option<SemanticReceiptProducerScope>,
         launch_artifact: &'a Option<ArtifactPin>,
         request_artifact: &'a Option<ArtifactPin>,
         replay_binary: &'a Option<ArtifactPin>,
@@ -1374,6 +1382,8 @@ mod cpu_cli {
             schema: CLI_SCHEMA,
             scope: "cli_pins_and_bytes_prepared_before_delivery",
             expected_transport: &context.expected_transport,
+            expected_semantic_receipt_producer_scope: context
+                .expected_semantic_receipt_producer_scope,
             launch_artifact: &context.launch_artifact,
             request_artifact: &context.request_artifact,
             replay_binary: &context.replay_binary,
@@ -1489,6 +1499,9 @@ mod cpu_cli {
         "serialization_error_retained":context.serialization_error_retained(),
         "secondary_delivery_error_retained":errors.secondary.is_some(),
         "original_native_body_omitted":context.raw_body.is_some(),"physical_closure_observed_by_cli":false});
+        if let Some(scope) = context.expected_semantic_receipt_producer_scope {
+            value["expected_semantic_receipt_producer_scope"] = serde_json::json!(scope);
+        }
         let prepared = bounded_json(&value, context.deadline, maximum.saturating_sub(1));
         let mut bytes = match prepared {
             Ok(bytes) => bytes,
@@ -1500,6 +1513,9 @@ mod cpu_cli {
             "elapsed_ms":context.elapsed_ms(),"native_dispatch_entered":context.native_dispatch_entered,
             "body_artifact":body,"original_native_body_omitted":context.raw_body.is_some(),
             "bytes_charged":budget.charged.load(Ordering::Acquire),"work":"unknown_not_zero"});
+                if let Some(scope) = context.expected_semantic_receipt_producer_scope {
+                    value["expected_semantic_receipt_producer_scope"] = serde_json::json!(scope);
+                }
                 let Ok(smaller) = bounded_json(&value, context.deadline, maximum.saturating_sub(1))
                 else {
                     return;
@@ -1582,6 +1598,123 @@ mod cpu_cli {
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
+        struct ExpectedTransportV2 {
+            schema: String,
+            request_artifact: ArtifactPin,
+            replay_expected: ExpectedPinsWire,
+            launch_asset_artifact: ArtifactPin,
+            cpu_fresh_profile_artifact: ArtifactPin,
+            cpu_fresh_profile: CpuFreshAssetProfile,
+            whole_wall_ms: u64,
+            cleanup_reserve_ms: u64,
+            output_bytes: usize,
+            replay_binary_pin_scope: String,
+            expected_semantic_receipt_producer_scope: SemanticReceiptProducerScope,
+        }
+        struct ParsedExpectedTransport {
+            transport: ExpectedTransport,
+            expected_scope: Option<SemanticReceiptProducerScope>,
+        }
+        // Only these bounded original-clock fields are projected before version
+        // admission. Ignored fields grant no scope/identity/native authority; the
+        // final version-specific DTO remains closed and rejects duplicate fields.
+        #[derive(Deserialize)]
+        struct ExpectedClockProjection {
+            whole_wall_ms: u64,
+            cleanup_reserve_ms: u64,
+            output_bytes: usize,
+        }
+        #[derive(Deserialize)]
+        struct ExpectedSchemaProjection {
+            schema: String,
+        }
+        fn parse_expected_transport(
+            raw: &[u8],
+            context: &mut Context,
+        ) -> CliResult<ParsedExpectedTransport> {
+            let clock: ExpectedClockProjection = serde_json::from_slice(raw)
+                .map_err(|error| TransportError::new("expected_clock_json", error))?;
+            context.install_clock(
+                clock.whole_wall_ms,
+                clock.cleanup_reserve_ms,
+                clock.output_bytes,
+            )?;
+            // A schema/scope refusal keeps the known original S/W/E/cap. No
+            // partially parsed or malformed JSON is used to invent a new clock.
+            let schema: ExpectedSchemaProjection = serde_json::from_slice(raw)
+                .map_err(|error| TransportError::new("expected_schema_json", error))?;
+            let parsed = match schema.schema.as_str() {
+                EXPECTED_SCHEMA => ParsedExpectedTransport {
+                    transport: serde_json::from_slice(raw)
+                        .map_err(|error| TransportError::new("expected_json", error))?,
+                    expected_scope: None,
+                },
+                EXPECTED_SCHEMA_V2 => {
+                    let version: ExpectedTransportV2 = serde_json::from_slice(raw)
+                        .map_err(|error| TransportError::new("expected_json", error))?;
+                    ParsedExpectedTransport {
+                        expected_scope: Some(version.expected_semantic_receipt_producer_scope),
+                        transport: ExpectedTransport {
+                            schema: version.schema,
+                            request_artifact: version.request_artifact,
+                            replay_expected: version.replay_expected,
+                            launch_asset_artifact: version.launch_asset_artifact,
+                            cpu_fresh_profile_artifact: version.cpu_fresh_profile_artifact,
+                            cpu_fresh_profile: version.cpu_fresh_profile,
+                            whole_wall_ms: version.whole_wall_ms,
+                            cleanup_reserve_ms: version.cleanup_reserve_ms,
+                            output_bytes: version.output_bytes,
+                            replay_binary_pin_scope: version.replay_binary_pin_scope,
+                        },
+                    }
+                }
+                _ => {
+                    return Err(TransportError::new(
+                        "expected_schema",
+                        "closed expected transport V1 or V2 required",
+                    ));
+                }
+            };
+            finish_expected_transport_admission(parsed, &clock, context)
+        }
+        fn finish_expected_transport_admission(
+            parsed: ParsedExpectedTransport,
+            clock: &ExpectedClockProjection,
+            context: &mut Context,
+        ) -> CliResult<ParsedExpectedTransport> {
+            // Closed decoding established this expectation declaration only. Keep
+            // it even when the later original-E guard refuses admission; this is
+            // not a scope comparison or historical loaded-image success witness.
+            context.expected_semantic_receipt_producer_scope = parsed.expected_scope;
+            if parsed.transport.whole_wall_ms != clock.whole_wall_ms
+                || parsed.transport.cleanup_reserve_ms != clock.cleanup_reserve_ms
+                || parsed.transport.output_bytes != clock.output_bytes
+            {
+                return Err(TransportError::new(
+                    "expected_clock_projection",
+                    "closed transport differs from its original budget-only projection",
+                ));
+            }
+            check_time(context.execution_deadline, "expected_admission_deadline")?;
+            Ok(parsed)
+        }
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum SemanticScopeRoute {
+            LibraryOnlyV1,
+            Explicit(SemanticReceiptProducerScope),
+        }
+        fn semantic_scope_route(
+            expected: Option<SemanticReceiptProducerScope>,
+        ) -> SemanticScopeRoute {
+            // Routing an expectation creates neither a checked replay nor an
+            // observation of the receipt producer's historical loaded image.
+            match expected {
+                None => SemanticScopeRoute::LibraryOnlyV1,
+                Some(scope) => SemanticScopeRoute::Explicit(scope),
+            }
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct LaunchAssets {
             schema: String,
             export_manifest_path: String,
@@ -1630,15 +1763,13 @@ mod cpu_cli {
                 &cancel,
             )?;
             context.expected_transport = Some(artifact(&expected_raw));
-            let transport: ExpectedTransport = serde_json::from_slice(&expected_raw)
-                .map_err(|e| TransportError::new("expected_json", e))?;
-            context.install_clock(
-                transport.whole_wall_ms,
-                transport.cleanup_reserve_ms,
-                transport.output_bytes,
-            )?;
-            if transport.schema != EXPECTED_SCHEMA
-                || transport.replay_binary_pin_scope != binary_scope()
+            let parsed = parse_expected_transport(&expected_raw, context)?;
+            let scope_route = semantic_scope_route(parsed.expected_scope);
+            let transport = parsed.transport;
+            if !matches!(
+                transport.schema.as_str(),
+                EXPECTED_SCHEMA | EXPECTED_SCHEMA_V2
+            ) || transport.replay_binary_pin_scope != binary_scope()
                 || transport.replay_expected.provider_factory_id
                     != "rz-uci-native-cpu-fresh-invocation-v1"
             {
@@ -1673,16 +1804,28 @@ mod cpu_cli {
                 "request_admission_deadline",
             )?;
             context.request_artifact = Some(artifact(&request));
-            let checked =
-                match replay_inputs::check_replay_inputs(&request, &expected, context.started) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        // Keep original typed cause/source diagnostics. No native work
-                        // count is invented for an input-admission refusal.
-                        context.retain_input_error(error)?;
-                        return Ok(false);
-                    }
-                };
+            let input_result = match scope_route {
+                SemanticScopeRoute::LibraryOnlyV1 => {
+                    replay_inputs::check_replay_inputs(&request, &expected, context.started)
+                }
+                SemanticScopeRoute::Explicit(scope) => {
+                    replay_inputs::check_replay_inputs_with_semantic_scope(
+                        &request,
+                        &expected,
+                        scope,
+                        context.started,
+                    )
+                }
+            };
+            let checked = match input_result {
+                Ok(value) => value,
+                Err(error) => {
+                    // Keep original typed cause/source diagnostics. No native work
+                    // count is invented for an input-admission refusal.
+                    context.retain_input_error(error)?;
+                    return Ok(false);
+                }
+            };
             context.apply_admitted_request_clock(&checked)?;
             drop(checked); // No model/provider/completion authority is retained here.
             let launch_raw = read_verified(
@@ -1777,20 +1920,34 @@ mod cpu_cli {
                 "native_dispatch_deadline",
             )?;
             context.native_dispatch_entered = true;
-            match native_replay::dispatch_started(
-                &request,
-                &expected,
-                CpuFreshReplayAssets {
-                    export: &export,
-                    runtime_pin: &runtime,
-                    config,
-                    profile_raw: launch.cpu_fresh_profile_raw.as_bytes(),
-                    expected_profile_artifact: &transport.cpu_fresh_profile_artifact,
-                    expected_profile: profile,
-                },
-                context.started,
-                &cancel,
-            ) {
+            let assets = CpuFreshReplayAssets {
+                export: &export,
+                runtime_pin: &runtime,
+                config,
+                profile_raw: launch.cpu_fresh_profile_raw.as_bytes(),
+                expected_profile_artifact: &transport.cpu_fresh_profile_artifact,
+                expected_profile: profile,
+            };
+            let dispatched = match scope_route {
+                SemanticScopeRoute::LibraryOnlyV1 => native_replay::dispatch_started(
+                    &request,
+                    &expected,
+                    assets,
+                    context.started,
+                    &cancel,
+                ),
+                SemanticScopeRoute::Explicit(scope) => {
+                    native_replay::dispatch_started_with_semantic_scope(
+                        &request,
+                        &expected,
+                        scope,
+                        assets,
+                        context.started,
+                        &cancel,
+                    )
+                }
+            };
+            match dispatched {
                 Ok(bytes) => {
                     context.store_body(bytes, "native_returned_ok");
                     Ok(true)
@@ -1821,6 +1978,361 @@ mod cpu_cli {
         #[cfg(test)]
         mod tests {
             use super::*;
+            fn expected_wire(schema: &str, scope_members: &str) -> Vec<u8> {
+                // A codec-only declaration fixture, not independently registered
+                // history, a checked request, a runtime or a callable provider.
+                let h = "c".repeat(64);
+                let pin = format!(r#"{{"bytes":17,"sha256":"{h}"}}"#);
+                let image_scope = binary_scope();
+                format!(r#"{{
+                    "schema":"{schema}",
+                    "request_artifact":{pin},
+                    "replay_expected":{{
+                        "registration_artifact":{pin},
+                        "prepared_action_artifact":{pin},
+                        "semantic_receipt_artifact":{pin},
+                        "parent":{{"parent_input_sha256":"{h}","current_view_sha256":"{h}","frozen_admission_sha256":"{h}","encoding_sha256":"{h}"}},
+                        "binding":{{
+                            "query_sha256":"{h}","catalogue_artifact":{pin},"before_result_artifact":{pin},
+                            "prior_ledger_sha256":"{h}","semantic_input_sha256":"{h}","semantic_context_sha256":"{h}",
+                            "semantic_branch_meaning_sha256":"{h}","semantic_before_result_anchor_sha256":"{h}","cpu_request_artifact":{pin}
+                        }},
+                        "registered_artifacts":{{"legacy_cpu_binary":{pin},"replay_binary":{pin},"engine_source":{pin},"wrapper_source":{pin},"replay_source":{pin},"provider_factory_source":{pin}}},
+                        "legacy_cpu_profile_sha256":"{h}",
+                        "provider_factory_id":"rz-uci-native-cpu-fresh-invocation-v1",
+                        "semantic_binary_sha256":"{h}"
+                    }},
+                    "launch_asset_artifact":{pin},
+                    "cpu_fresh_profile_artifact":{pin},
+                    "cpu_fresh_profile":{{
+                        "schema":"rz-pals-cpu-fresh-replay-assets/1","domain":"cpu_fresh","provider":"cpu",
+                        "export_manifest":{pin},"runtime_library":{pin},"model_epoch":"codec-only",
+                        "encoding_semantic_sha256":"{h}","intra_threads":1,"cache_public_memory":false,
+                        "device_public_memory":false,"context_sha256":"{h}"
+                    }},
+                    "whole_wall_ms":1000,"cleanup_reserve_ms":100,"output_bytes":1024,
+                    "replay_binary_pin_scope":"{image_scope}"{scope_members}
+                }}"#).into_bytes()
+            }
+            fn scope_member(literal: &str) -> String {
+                format!(r#", "expected_semantic_receipt_producer_scope":"{literal}""#)
+            }
+            #[test]
+            fn expected_v1_codec_retains_wire_and_rejects_any_scope_field() {
+                let mut context = Context::new(Instant::now()).unwrap();
+                let parsed =
+                    parse_expected_transport(&expected_wire(EXPECTED_SCHEMA, ""), &mut context)
+                        .unwrap();
+                assert_eq!(parsed.transport.schema, EXPECTED_SCHEMA);
+                assert_eq!(parsed.expected_scope, None);
+                for literal in [
+                    "dispatcher_compared_verified_argument",
+                    "linux_loaded_executable_inode",
+                    "current_exe_path_hash",
+                ] {
+                    let mut context = Context::new(Instant::now()).unwrap();
+                    assert!(
+                        parse_expected_transport(
+                            &expected_wire(EXPECTED_SCHEMA, &scope_member(literal)),
+                            &mut context
+                        )
+                        .is_err()
+                    );
+                }
+                for member in [
+                    r#", "expected_semantic_receipt_producer_scope":null"#,
+                    r#", "expected_semantic_receipt_producer_scope":false"#,
+                ] {
+                    let mut context = Context::new(Instant::now()).unwrap();
+                    assert!(
+                        parse_expected_transport(
+                            &expected_wire(EXPECTED_SCHEMA, member),
+                            &mut context
+                        )
+                        .is_err()
+                    );
+                }
+            }
+            #[test]
+            fn expected_v2_codec_requires_one_closed_semantic_scope() {
+                for (literal, scope) in [
+                    (
+                        "dispatcher_compared_verified_argument",
+                        SemanticReceiptProducerScope::LibraryDispatcherArgument,
+                    ),
+                    (
+                        "linux_loaded_executable_inode",
+                        SemanticReceiptProducerScope::LinuxLoadedExecutableInode,
+                    ),
+                    (
+                        "current_exe_path_hash",
+                        SemanticReceiptProducerScope::CurrentExePathHash,
+                    ),
+                ] {
+                    let mut context = Context::new(Instant::now()).unwrap();
+                    let parsed = parse_expected_transport(
+                        &expected_wire(EXPECTED_SCHEMA_V2, &scope_member(literal)),
+                        &mut context,
+                    )
+                    .unwrap();
+                    assert_eq!(parsed.transport.schema, EXPECTED_SCHEMA_V2);
+                    assert_eq!(parsed.expected_scope, Some(scope));
+                    assert!(!context.native_dispatch_entered);
+                }
+                for member in [
+                    "",
+                    r#", "expected_semantic_receipt_producer_scope":null"#,
+                    r#", "expected_semantic_receipt_producer_scope":true"#,
+                    r#", "expected_semantic_receipt_producer_scope":{"linux_loaded_executable_inode":null}"#,
+                    r#", "expected_semantic_receipt_producer_scope":"unknown""#,
+                    r#", "expected_semantic_receipt_producer_scope":"linux_loaded_executable_inode", "expected_semantic_receipt_producer_scope":"linux_loaded_executable_inode""#,
+                    r#", "expected_semantic_receipt_producer_scope":"current_exe_path_hash", "past_image_observed":true"#,
+                ] {
+                    let mut context = Context::new(Instant::now()).unwrap();
+                    assert!(
+                        parse_expected_transport(
+                            &expected_wire(EXPECTED_SCHEMA_V2, member),
+                            &mut context
+                        )
+                        .is_err()
+                    );
+                    assert!(context.expected_semantic_receipt_producer_scope.is_none());
+                }
+            }
+            #[test]
+            fn closed_v2_scope_survives_final_execution_deadline_with_original_whole_window() {
+                let raw = String::from_utf8(expected_wire(
+                    EXPECTED_SCHEMA_V2,
+                    &scope_member("linux_loaded_executable_inode"),
+                ))
+                .unwrap()
+                .replacen(r#""whole_wall_ms":1000"#, r#""whole_wall_ms":5000"#, 1)
+                .replacen(
+                    r#""cleanup_reserve_ms":100"#,
+                    r#""cleanup_reserve_ms":4000"#,
+                    1,
+                )
+                .replacen(r#""output_bytes":1024"#, r#""output_bytes":8192"#, 1)
+                .into_bytes();
+                let mut codec_context = Context::new(Instant::now()).unwrap();
+                let parsed = parse_expected_transport(&raw, &mut codec_context).unwrap();
+                let clock: ExpectedClockProjection = serde_json::from_slice(&raw).unwrap();
+                // Reproduce work consuming the declared E before the actual final
+                // guard, while W still has three seconds. Only private clock facts
+                // are seeded; there is no checked replay, native owner or NN call.
+                let started = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
+                let mut context = Context::new(started).unwrap();
+                context.deadline = started + Duration::from_millis(clock.whole_wall_ms);
+                context.execution_deadline =
+                    started + Duration::from_millis(clock.whole_wall_ms - clock.cleanup_reserve_ms);
+                context.whole_wall_ms = Some(clock.whole_wall_ms);
+                context.cleanup_reserve_ms = Some(clock.cleanup_reserve_ms);
+                context.output_limit = clock.output_bytes;
+                let original = (
+                    context.started,
+                    context.deadline,
+                    context.execution_deadline,
+                    context.output_limit,
+                );
+                assert!(context.expected_semantic_receipt_producer_scope.is_none());
+                assert!(Instant::now() >= context.execution_deadline);
+                check_time(context.deadline, "fixture_original_whole_window").unwrap();
+                let error = match finish_expected_transport_admission(parsed, &clock, &mut context)
+                {
+                    Err(error) => error,
+                    Ok(_) => panic!("elapsed final admission unexpectedly succeeded"),
+                };
+                assert_eq!(error.stage, "expected_admission_deadline");
+                assert_eq!(
+                    context.expected_semantic_receipt_producer_scope,
+                    Some(SemanticReceiptProducerScope::LinuxLoadedExecutableInode)
+                );
+                assert_eq!(
+                    (
+                        context.started,
+                        context.deadline,
+                        context.execution_deadline,
+                        context.output_limit
+                    ),
+                    original
+                );
+                assert_eq!(context.whole_wall_ms, Some(5000));
+                assert_eq!(context.cleanup_reserve_ms, Some(4000));
+                assert!(!context.native_dispatch_entered);
+                assert!(context.native_error.is_none());
+                assert!(context.input_error.is_none());
+                assert!(context.replay_binary.is_none());
+                assert!(context.runtime_library.is_none());
+                // This token tests the existing byte-preparation header only, not
+                // a native receipt or actual diagnostic delivery/physical closure.
+                context.store_body(
+                    b"{\"codec_fixture\":true}".to_vec(),
+                    "codec_declaration_only",
+                );
+                let prepared = envelope(&context).unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&prepared).unwrap();
+                assert_eq!(
+                    value["cli"]["expected_semantic_receipt_producer_scope"],
+                    "linux_loaded_executable_inode"
+                );
+                assert_eq!(
+                    value["cli"]["execution_deadline_exceeded_at_preparation"],
+                    true
+                );
+                assert_eq!(value["cli"]["loaded_provider_image_observed_by_cli"], false);
+                assert_eq!(value["cli"]["physical_closure_observed_by_cli"], false);
+                assert_eq!(value["cli"]["process_exit_observed"], false);
+                assert!(value["cli"]["stdout_delivered"].is_null());
+            }
+            #[test]
+            fn schema_and_scope_refusals_keep_original_projected_clock_and_cap() {
+                let duplicate_schema = String::from_utf8(expected_wire(EXPECTED_SCHEMA_V2, "")).unwrap()
+                    .replacen(r#""schema":"rz-pals-frozen-replay-cli-expected/2""#,
+                        r#""schema":"rz-pals-frozen-replay-cli-expected/2","schema":"rz-pals-frozen-replay-cli-expected/2""#, 1).into_bytes();
+                let boolean_schema = String::from_utf8(expected_wire(EXPECTED_SCHEMA, ""))
+                    .unwrap()
+                    .replacen(
+                        r#""schema":"rz-pals-frozen-replay-cli-expected/1""#,
+                        r#""schema":true"#,
+                        1,
+                    )
+                    .into_bytes();
+                for raw in [
+                    expected_wire(EXPECTED_SCHEMA, &scope_member("current_exe_path_hash")),
+                    expected_wire(EXPECTED_SCHEMA_V2, ""),
+                    expected_wire(
+                        EXPECTED_SCHEMA_V2,
+                        r#", "expected_semantic_receipt_producer_scope":null"#,
+                    ),
+                    expected_wire(
+                        EXPECTED_SCHEMA_V2,
+                        r#", "expected_semantic_receipt_producer_scope":false"#,
+                    ),
+                    expected_wire(
+                        EXPECTED_SCHEMA_V2,
+                        r#", "expected_semantic_receipt_producer_scope":{"linux_loaded_executable_inode":null}"#,
+                    ),
+                    expected_wire(
+                        EXPECTED_SCHEMA_V2,
+                        r#", "expected_semantic_receipt_producer_scope":"current_exe_path_hash", "expected_semantic_receipt_producer_scope":"current_exe_path_hash""#,
+                    ),
+                    expected_wire(EXPECTED_SCHEMA_V2, &scope_member("unknown")),
+                    expected_wire("unknown-schema", ""),
+                    duplicate_schema,
+                    boolean_schema,
+                ] {
+                    let started = Instant::now();
+                    let mut context = Context::new(started).unwrap();
+                    let error = match parse_expected_transport(&raw, &mut context) {
+                        Err(error) => error,
+                        Ok(_) => panic!("closed codec refusal fixture unexpectedly accepted"),
+                    };
+                    assert!(matches!(
+                        error.stage,
+                        "expected_json" | "expected_schema" | "expected_schema_json"
+                    ));
+                    assert_eq!(context.deadline, started + Duration::from_millis(1000));
+                    assert_eq!(
+                        context.execution_deadline,
+                        started + Duration::from_millis(900)
+                    );
+                    assert_eq!(context.whole_wall_ms, Some(1000));
+                    assert_eq!(context.cleanup_reserve_ms, Some(100));
+                    assert_eq!(context.output_limit, 1024);
+                    assert!(!context.native_dispatch_entered);
+                    assert!(context.native_error.is_none());
+                    assert!(context.input_error.is_none());
+                }
+                // Keep the established valid-W/invalid-output refusal behavior.
+                let invalid_output = String::from_utf8(expected_wire(EXPECTED_SCHEMA_V2, ""))
+                    .unwrap()
+                    .replacen(r#""output_bytes":1024"#, r#""output_bytes":0"#, 1)
+                    .into_bytes();
+                let started = Instant::now();
+                let mut context = Context::new(started).unwrap();
+                assert!(parse_expected_transport(&invalid_output, &mut context).is_err());
+                assert_eq!(context.deadline, started + Duration::from_millis(1000));
+                assert_eq!(context.whole_wall_ms, Some(1000));
+                assert_eq!(context.output_limit, DIAGNOSTIC_BYTES);
+            }
+            #[test]
+            fn malformed_expected_json_cannot_invent_projected_clock() {
+                let started = Instant::now();
+                let mut context = Context::new(started).unwrap();
+                let before = (
+                    context.deadline,
+                    context.execution_deadline,
+                    context.output_limit,
+                );
+                let raw = br#"{"whole_wall_ms":1000,"cleanup_reserve_ms":100,"output_bytes":1024,"schema":"#;
+                assert!(parse_expected_transport(raw, &mut context).is_err());
+                assert_eq!(
+                    (
+                        context.deadline,
+                        context.execution_deadline,
+                        context.output_limit
+                    ),
+                    before
+                );
+                assert!(context.whole_wall_ms.is_none());
+                assert!(context.cleanup_reserve_ms.is_none());
+            }
+            #[test]
+            fn semantic_scope_route_reuses_one_explicit_choice_and_v1_stays_library_only() {
+                for selection in [
+                    None,
+                    Some(SemanticReceiptProducerScope::LibraryDispatcherArgument),
+                    Some(SemanticReceiptProducerScope::LinuxLoadedExecutableInode),
+                    Some(SemanticReceiptProducerScope::CurrentExePathHash),
+                ] {
+                    // The same production helper/selection feeds both call sites;
+                    // this pure route test does not invoke a dispatcher or provider.
+                    let initial_check_route = semantic_scope_route(selection);
+                    let dispatch_route = semantic_scope_route(selection);
+                    assert_eq!(initial_check_route, dispatch_route);
+                    match selection {
+                        None => assert_eq!(initial_check_route, SemanticScopeRoute::LibraryOnlyV1),
+                        Some(scope) => {
+                            assert_eq!(initial_check_route, SemanticScopeRoute::Explicit(scope))
+                        }
+                    }
+                }
+            }
+            #[test]
+            fn expected_semantic_scope_header_is_optional_declaration_not_image_witness() {
+                for selection in [
+                    None,
+                    Some(SemanticReceiptProducerScope::LibraryDispatcherArgument),
+                    Some(SemanticReceiptProducerScope::LinuxLoadedExecutableInode),
+                    Some(SemanticReceiptProducerScope::CurrentExePathHash),
+                ] {
+                    let mut context = Context::new(Instant::now()).unwrap();
+                    context.install_clock(5000, 500, 16 * 1024).unwrap();
+                    context.expected_semantic_receipt_producer_scope = selection;
+                    context.store_body(
+                        b"{\"codec_fixture\":true}".to_vec(),
+                        "codec_declaration_only",
+                    );
+                    let raw = envelope(&context).unwrap();
+                    let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+                    match selection {
+                        None => assert!(
+                            value["cli"]
+                                .get("expected_semantic_receipt_producer_scope")
+                                .is_none()
+                        ),
+                        Some(scope) => assert_eq!(
+                            value["cli"]["expected_semantic_receipt_producer_scope"],
+                            serde_json::to_value(scope).unwrap()
+                        ),
+                    }
+                    assert_eq!(value["cli"]["loaded_provider_image_observed_by_cli"], false);
+                    assert_eq!(value["cli"]["physical_closure_observed_by_cli"], false);
+                    assert_eq!(value["cli"]["process_exit_observed"], false);
+                    assert!(value["cli"]["stdout_delivered"].is_null());
+                    assert!(!context.native_dispatch_entered);
+                }
+            }
             #[test]
             fn binary_domains_reject_same_sha_even_when_legacy_bytes_differ() {
                 let replay = artifact(b"replay fixture");

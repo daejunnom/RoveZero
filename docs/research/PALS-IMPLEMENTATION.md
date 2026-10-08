@@ -2825,3 +2825,32 @@ CLI 실행 성공을 뜻하지 않는다. 동기 파일/ORT/pipe의 강제 중�
 증거는 외부 supervisor가 따로 수거해야 한다. pending Arc 보존은 외부 내구성 저장의
 증거가 아니다. 독립 등록과 원문을 준비하는 caller 연결, 실제 CPU 모델 replay 및
 strict Query/full recheck·whole cost·physical·utility는 계속 후속 인수로 남긴다.
+
+### Semantic receipt 생산 범위의 독립 등록
+
+기존 semantic library는 `dispatcher_compared_verified_argument` 범위의 flat receipt를
+만든다. 기존 `pals_cpu_task --prepare-semantic` CLI의 성공 출력은 같은 flat receipt에
+Linux의 `linux_loaded_executable_inode` 또는 다른 OS의 `current_exe_path_hash` 범위를
+기록해 직렬화한다. 이 CLI 출력 안에 원래 library receipt가 따로 중첩되지는 않는다.
+frozen replay 연결을 위해 receipt의 scope를 다시 쓰거나 원문을 재직렬화하지 않는다.
+
+기존 `check_replay_inputs`·`dispatch_started`와 CLI expected `/1`은 library 범위만
+받는 의미를 유지한다. explicit semantic-scope API와 별도 CLI expected `/2`는 독립
+등록한 `expected_semantic_receipt_producer_scope`를 필수 closed enum으로 받아, pin과
+context를 검증한 원문 receipt의 범위와 정확히 비교한다. 원문·현재 OS·현재 replay
+image에서 기대 범위를 선택하거나 세 범위를 무조건 허용하는 방식으로 바꾸지 않는다.
+`ReplayInputRequest`·`ReplayExpectedPins`의 기존 wire와 context는 유지한다.
+
+explicit 선택은 성공의 input audit와 실패 기록에 기대 선언으로 보존한다. 기존 경로의
+`None`은 JSON에서 생략하며, 기존 `binary_pin_scope`는 replay image의 독립 caller
+선언 범위를 계속 뜻한다. 기대값을 전달했다는 기록이 과거 producer image의 재관측,
+scope 일치 성공, strict Query/2 전체 검증이나 물리 종료 권한을 만들지는 않는다.
+
+CLI는 독립 expected 원문에서 알려진 원래 W·cleanup·output cap을 먼저 적용한 뒤
+version·scope를 검사한다. `/2`의 missing·null·unknown·duplicate·잘못된 타입과 `/1`의
+새 scope 필드는 거절한다. 이 거절에 새 시간창이나 더 큰 출력 cap을 주지 않는다.
+유효 closed `/2`를 읽은 뒤 E가 만료되는 경로에서도 기대 선언을 먼저 보존하고
+마감을 거절한다. 파싱에 실패한 scope를 관측값으로 채우지는 않는다.
+원문 pin·context 변조, 범위 불일치, legacy 생략, 실패의 typed 원인·원래 한도와
+negative authority는 CPU fixture의 별도 검사 대상이다. 이 연결의 소스·fixture 검사는
+등록된 실제 CPU 모델 replay·외부 supervisor 종료·utility 수집의 실행 인수를 대체하지 않는다.

@@ -6,7 +6,7 @@
 use super::ArtifactPin;
 use super::replay_inputs::{
     self, ReplayAuthorities, ReplayExpectedPins, ReplayInputAudit, ReplayInputError,
-    ReplayInputMode, ReplayRegisteredArtifacts,
+    ReplayInputMode, ReplayRegisteredArtifacts, SemanticReceiptProducerScope,
 };
 use crate::pals_native::{
     self, NativeInvocationBudget, NativeLoadFailure, NativeOwnerOptions, NativePreparedContext,
@@ -294,6 +294,10 @@ impl Serialize for NativeReplayPrimary {
 #[derive(Debug, Serialize)]
 pub struct NativeReplayError {
     pub code: &'static str,
+    /// Independent expected declaration, including failures before comparison.
+    /// It grants no historical producer or current loaded-image authority.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_semantic_receipt_producer_scope: Option<SemanticReceiptProducerScope>,
     pub primary: Box<NativeReplayPrimary>,
     pub cleanup_error: Option<Box<RoleErrorView>>,
     pub observer_error: Option<Box<AdmissionFault>>,
@@ -355,6 +359,7 @@ fn input_error(
     };
     NativeReplayError {
         code: "native_replay_failed",
+        expected_semantic_receipt_producer_scope: error.expected_semantic_receipt_producer_scope,
         cleanup_error: None,
         observer_error: None,
         output_error: None,
@@ -980,286 +985,333 @@ pub fn dispatch_started(
     started: Instant,
     cancel: &AtomicBool,
 ) -> Result<Vec<u8>, NativeReplayError> {
-    let checked = match replay_inputs::check_replay_inputs(bytes, expected, started) {
-        Ok(c) => c,
-        Err(e) => return Err(input_error(e, started, cancel)),
-    };
-    let clock = Clock {
+    dispatch_started_inner(bytes, expected, None, assets, started, cancel)
+}
+
+/// The historical producer scope is independently selected by the caller. It
+/// does not change replay binary declaration scope or observe a loaded image.
+pub fn dispatch_started_with_semantic_scope(
+    bytes: &[u8],
+    expected: &ReplayExpectedPins,
+    expected_scope: SemanticReceiptProducerScope,
+    assets: CpuFreshReplayAssets<'_>,
+    started: Instant,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, NativeReplayError> {
+    dispatch_started_inner(
+        bytes,
+        expected,
+        Some(expected_scope),
+        assets,
         started,
-        execution: checked.execution_deadline(),
-        whole: checked.deadline(),
-        output: checked.output_limit(),
-    };
-    let mode = checked.mode();
-    let audit = checked.audit();
-    let reserve = Duration::from_millis(checked.resources().cleanup_reserve_ms);
-    let budget = NativeInvocationBudget::new(started, clock.execution, clock.whole, reserve)
-        .map_err(|e| bare_error(NativeReplayPrimary::Control(e), clock, cancel))?;
-    clock
-        .check(cancel)
-        .map_err(|e| bare_error(NativeReplayPrimary::Control(e), clock, cancel))?;
-    let profile = admit_assets(
-        &assets,
-        checked.registration().provider_factory_id.as_str(),
-        &checked.registration().artifacts,
-        clock,
         cancel,
     )
-    .map_err(|e| bare_error(NativeReplayPrimary::Asset(Box::new(e)), clock, cancel))?;
-    let (config, root, plan, limits) = checked.into_owner_args();
-    let requirements =
-        repair_replay_requirements(config.line_plies, plan.prefix.len(), plan.nodes_per_check)
-            .map_err(|e| bare_error(NativeReplayPrimary::Owner(e), clock, cancel))?;
-    let roles = match mode {
-        ReplayInputMode::ReplyOnly2n => config.line_plies.checked_add(1),
-        ReplayInputMode::RepairEndpoint3n => usize::try_from(requirements.role_calls()).ok(),
-    }
-    .ok_or_else(|| {
-        bare_error(
-            NativeReplayPrimary::Admission(fault("observer_reserve", "role bound overflow")),
+}
+
+fn dispatch_started_inner(
+    bytes: &[u8],
+    expected: &ReplayExpectedPins,
+    expected_scope: Option<SemanticReceiptProducerScope>,
+    assets: CpuFreshReplayAssets<'_>,
+    started: Instant,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, NativeReplayError> {
+    let result = (|| {
+        let admission = match expected_scope {
+            Some(scope) => replay_inputs::check_replay_inputs_with_semantic_scope(
+                bytes, expected, scope, started,
+            ),
+            None => replay_inputs::check_replay_inputs(bytes, expected, started),
+        };
+        let checked = match admission {
+            Ok(c) => c,
+            Err(e) => return Err(input_error(e, started, cancel)),
+        };
+        let clock = Clock {
+            started,
+            execution: checked.execution_deadline(),
+            whole: checked.deadline(),
+            output: checked.output_limit(),
+        };
+        let mode = checked.mode();
+        let audit = checked.audit();
+        let reserve = Duration::from_millis(checked.resources().cleanup_reserve_ms);
+        let budget = NativeInvocationBudget::new(started, clock.execution, clock.whole, reserve)
+            .map_err(|e| bare_error(NativeReplayPrimary::Control(e), clock, cancel))?;
+        clock
+            .check(cancel)
+            .map_err(|e| bare_error(NativeReplayPrimary::Control(e), clock, cancel))?;
+        let profile = admit_assets(
+            &assets,
+            checked.registration().provider_factory_id.as_str(),
+            &checked.registration().artifacts,
             clock,
             cancel,
         )
-    })?;
-    let checks = match mode {
-        ReplayInputMode::ReplyOnly2n => 2,
-        ReplayInputMode::RepairEndpoint3n => 3,
-    };
-    let mut reserved = Reserved::new(roles, checks, clock)
-        .map_err(|e| bare_error(NativeReplayPrimary::Admission(e), clock, cancel))?;
-    let mut receipt = NativeReplayObservation {
-        schema: SCHEMA,
-        scope: SCOPE,
-        status: "admitted_before_load",
-        mode,
-        input_admission: audit,
-        assets_source_admitted: true,
-        asset_profile_artifact: assets.expected_profile_artifact.clone(),
-        binary_pin_scope: replay_inputs::BINARY_DECLARATION_SCOPE,
-        model_returned: false,
-        owner_created: false,
-        replay_attempted: false,
-        replay_returned_ok: false,
-        elapsed_ms: 0,
-        original_whole_wall_ms: 0,
-        cleanup_reserve_ms: milliseconds(reserve),
-        elapsed_scope: "original_start_through_cleanup_and_observation_capture",
-        bytes_prepared_elapsed_ms: None,
-        bytes_prepared_scope: "original_start_through_main_encoding_before_final_timing_member_and_caller_delivery",
-        execution_deadline_exceeded: false,
-        deadline_exceeded: false,
-        canceled: false,
-        cpu_tasks_requested: None,
-        cpu_tasks_accounted: None,
-        cpu_reports_returned: None,
-        cpu_nodes_lower_bound: None,
-        cpu_work_observation_incomplete: None,
-        stages: Vec::new(),
-        replay_state: reserved.state,
-        outcome: reserved.outcome,
-        trace_jsonl: String::new(),
-        trace_rows: 0,
-        trace_complete: true,
-        native_receipt: None,
-        native_bindings_observed: 0,
-        native_completion_unknown_observed: 0,
-        native_ready_observed: 0,
-        native_terminal_missing: 0,
-        cleanup_attempted: false,
-        cleanup_returned_ok: false,
-        native_cleanup_missing: true,
-        authorities: ReplayAuthorities::default(),
-    };
-    receipt.original_whole_wall_ms = receipt.input_admission.whole_wall_ms;
-    let mut primary = None;
-    let mut cleanup_error = None;
-    let mut output_error = None;
-    let options = NativeOwnerOptions {
-        drain_limit: reserve,
-        host_record_pages: None,
-    };
-    let model_result = NativeRoleModel::load_pinned_cpu_fresh_for_invocation(
-        assets.export,
-        &profile.export_manifest.sha256,
-        assets.runtime_pin,
-        assets.config,
-        options,
-        budget,
-        cancel,
-    );
-    match model_result {
-        Err(failure) => {
-            if let Some(handle) = failure.finish.as_ref() {
-                cleanup_error = finish(handle, clock.whole, &mut receipt);
-            }
-            primary = Some(NativeReplayPrimary::Load(Box::new(failure)));
+        .map_err(|e| bare_error(NativeReplayPrimary::Asset(Box::new(e)), clock, cancel))?;
+        let (config, root, plan, limits) = checked.into_owner_args();
+        let requirements =
+            repair_replay_requirements(config.line_plies, plan.prefix.len(), plan.nodes_per_check)
+                .map_err(|e| bare_error(NativeReplayPrimary::Owner(e), clock, cancel))?;
+        let roles = match mode {
+            ReplayInputMode::ReplyOnly2n => config.line_plies.checked_add(1),
+            ReplayInputMode::RepairEndpoint3n => usize::try_from(requirements.role_calls()).ok(),
         }
-        Ok(mut model) => {
-            receipt.model_returned = true;
-            let handle = model.finish_handle();
-            let identity = model.source_identity();
-            if digest_string(&profile.model_epoch) != Some(identity.checkpoint_sha256)
-                || digest_string(&profile.export_manifest.sha256)
-                    != Some(identity.export_manifest_sha256)
-                || digest_string(&profile.encoding_semantic_sha256)
-                    != Some(identity.encoding_semantic_sha256)
-                || identity.adapter_source_sha256 != pals_native::pals_native_source_digest()
-                || identity.execution.provider != "cpu"
-            {
-                primary = Some(NativeReplayPrimary::Admission(fault(
-                    "loaded_identity",
-                    "actual model/encoding/provider differs",
-                )));
-            } else if let Err(e) = clock.check(cancel) {
-                primary = Some(NativeReplayPrimary::Control(e));
-            } else if let Err(e) =
-                model.set_observer(Box::new(ReplayObserver(Arc::clone(&reserved.collector))))
-            {
-                primary = Some(NativeReplayPrimary::ObserverInstallation(e));
-            } else {
-                match FreshReplayOwner::new(config, model, root, plan) {
-                    Err(e) => primary = Some(NativeReplayPrimary::Owner(e)),
-                    Ok(mut owner) => {
-                        receipt.owner_created = true;
-                        let result = match clock.check(cancel) {
-                            Err(e) => {
-                                primary = Some(NativeReplayPrimary::Control(e));
-                                None
-                            }
-                            Ok(()) => {
-                                receipt.replay_attempted = true;
-                                Some(match mode {
-                                    ReplayInputMode::ReplyOnly2n => {
-                                        owner.run(limits, cancel).map(Outcome::Reply)
-                                    }
-                                    ReplayInputMode::RepairEndpoint3n => {
-                                        owner.run_with_repair(limits, cancel).map(Outcome::Repair)
-                                    }
-                                })
-                            }
-                        };
-                        receipt.replay_returned_ok = result.as_ref().is_some_and(Result::is_ok);
-                        if !capture_owner(&owner, &mut reserved.slots, &mut receipt) {
-                            output_error = Some(fault(
-                                "observation_capture",
-                                "partial bounded snapshot; actual scalar work retained",
-                            ));
-                        }
-                        match result {
-                            Some(Ok(outcome)) => {
-                                let complete = match outcome {
-                                    Outcome::Reply(o) => receipt.outcome.capture(&o),
-                                    Outcome::Repair(o) => receipt.outcome.capture(&o),
-                                };
-                                if !complete {
-                                    output_error =
-                                        Some(fault("outcome_capture", "outcome snapshot bound"));
+        .ok_or_else(|| {
+            bare_error(
+                NativeReplayPrimary::Admission(fault("observer_reserve", "role bound overflow")),
+                clock,
+                cancel,
+            )
+        })?;
+        let checks = match mode {
+            ReplayInputMode::ReplyOnly2n => 2,
+            ReplayInputMode::RepairEndpoint3n => 3,
+        };
+        let mut reserved = Reserved::new(roles, checks, clock)
+            .map_err(|e| bare_error(NativeReplayPrimary::Admission(e), clock, cancel))?;
+        let mut receipt = NativeReplayObservation {
+            schema: SCHEMA,
+            scope: SCOPE,
+            status: "admitted_before_load",
+            mode,
+            input_admission: audit,
+            assets_source_admitted: true,
+            asset_profile_artifact: assets.expected_profile_artifact.clone(),
+            binary_pin_scope: replay_inputs::BINARY_DECLARATION_SCOPE,
+            model_returned: false,
+            owner_created: false,
+            replay_attempted: false,
+            replay_returned_ok: false,
+            elapsed_ms: 0,
+            original_whole_wall_ms: 0,
+            cleanup_reserve_ms: milliseconds(reserve),
+            elapsed_scope: "original_start_through_cleanup_and_observation_capture",
+            bytes_prepared_elapsed_ms: None,
+            bytes_prepared_scope: "original_start_through_main_encoding_before_final_timing_member_and_caller_delivery",
+            execution_deadline_exceeded: false,
+            deadline_exceeded: false,
+            canceled: false,
+            cpu_tasks_requested: None,
+            cpu_tasks_accounted: None,
+            cpu_reports_returned: None,
+            cpu_nodes_lower_bound: None,
+            cpu_work_observation_incomplete: None,
+            stages: Vec::new(),
+            replay_state: reserved.state,
+            outcome: reserved.outcome,
+            trace_jsonl: String::new(),
+            trace_rows: 0,
+            trace_complete: true,
+            native_receipt: None,
+            native_bindings_observed: 0,
+            native_completion_unknown_observed: 0,
+            native_ready_observed: 0,
+            native_terminal_missing: 0,
+            cleanup_attempted: false,
+            cleanup_returned_ok: false,
+            native_cleanup_missing: true,
+            authorities: ReplayAuthorities::default(),
+        };
+        receipt.original_whole_wall_ms = receipt.input_admission.whole_wall_ms;
+        let mut primary = None;
+        let mut cleanup_error = None;
+        let mut output_error = None;
+        let options = NativeOwnerOptions {
+            drain_limit: reserve,
+            host_record_pages: None,
+        };
+        let model_result = NativeRoleModel::load_pinned_cpu_fresh_for_invocation(
+            assets.export,
+            &profile.export_manifest.sha256,
+            assets.runtime_pin,
+            assets.config,
+            options,
+            budget,
+            cancel,
+        );
+        match model_result {
+            Err(failure) => {
+                if let Some(handle) = failure.finish.as_ref() {
+                    cleanup_error = finish(handle, clock.whole, &mut receipt);
+                }
+                primary = Some(NativeReplayPrimary::Load(Box::new(failure)));
+            }
+            Ok(mut model) => {
+                receipt.model_returned = true;
+                let handle = model.finish_handle();
+                let identity = model.source_identity();
+                if digest_string(&profile.model_epoch) != Some(identity.checkpoint_sha256)
+                    || digest_string(&profile.export_manifest.sha256)
+                        != Some(identity.export_manifest_sha256)
+                    || digest_string(&profile.encoding_semantic_sha256)
+                        != Some(identity.encoding_semantic_sha256)
+                    || identity.adapter_source_sha256 != pals_native::pals_native_source_digest()
+                    || identity.execution.provider != "cpu"
+                {
+                    primary = Some(NativeReplayPrimary::Admission(fault(
+                        "loaded_identity",
+                        "actual model/encoding/provider differs",
+                    )));
+                } else if let Err(e) = clock.check(cancel) {
+                    primary = Some(NativeReplayPrimary::Control(e));
+                } else if let Err(e) =
+                    model.set_observer(Box::new(ReplayObserver(Arc::clone(&reserved.collector))))
+                {
+                    primary = Some(NativeReplayPrimary::ObserverInstallation(e));
+                } else {
+                    match FreshReplayOwner::new(config, model, root, plan) {
+                        Err(e) => primary = Some(NativeReplayPrimary::Owner(e)),
+                        Ok(mut owner) => {
+                            receipt.owner_created = true;
+                            let result = match clock.check(cancel) {
+                                Err(e) => {
+                                    primary = Some(NativeReplayPrimary::Control(e));
+                                    None
                                 }
+                                Ok(()) => {
+                                    receipt.replay_attempted = true;
+                                    Some(match mode {
+                                        ReplayInputMode::ReplyOnly2n => {
+                                            owner.run(limits, cancel).map(Outcome::Reply)
+                                        }
+                                        ReplayInputMode::RepairEndpoint3n => owner
+                                            .run_with_repair(limits, cancel)
+                                            .map(Outcome::Repair),
+                                    })
+                                }
+                            };
+                            receipt.replay_returned_ok = result.as_ref().is_some_and(Result::is_ok);
+                            if !capture_owner(&owner, &mut reserved.slots, &mut receipt) {
+                                output_error = Some(fault(
+                                    "observation_capture",
+                                    "partial bounded snapshot; actual scalar work retained",
+                                ));
                             }
-                            Some(Err(e)) => primary = Some(NativeReplayPrimary::Run(e)),
-                            None => {}
+                            match result {
+                                Some(Ok(outcome)) => {
+                                    let complete = match outcome {
+                                        Outcome::Reply(o) => receipt.outcome.capture(&o),
+                                        Outcome::Repair(o) => receipt.outcome.capture(&o),
+                                    };
+                                    if !complete {
+                                        output_error = Some(fault(
+                                            "outcome_capture",
+                                            "outcome snapshot bound",
+                                        ));
+                                    }
+                                }
+                                Some(Err(e)) => primary = Some(NativeReplayPrimary::Run(e)),
+                                None => {}
+                            }
                         }
                     }
                 }
+                // Owner/model Drop and this explicit same-W finish do not pump a
+                // runtime, retry a failed operation, or grant a recovery window.
+                cleanup_error = finish(&handle, clock.whole, &mut receipt);
             }
-            // Owner/model Drop and this explicit same-W finish do not pump a
-            // runtime, retry a failed operation, or grant a recovery window.
-            cleanup_error = finish(&handle, clock.whole, &mut receipt);
         }
-    }
-    let observer_error = drain_collector(&reserved.collector, &mut receipt);
-    clock.stamp(&mut receipt, cancel);
-    if primary.is_none() && (receipt.deadline_exceeded || receipt.canceled) {
-        primary = Some(NativeReplayPrimary::Control(if receipt.canceled {
-            RoleError::Canceled
-        } else {
-            RoleError::Deadline
-        }));
-    }
-    if primary.is_none() && cleanup_error.is_some() {
-        primary = Some(NativeReplayPrimary::Observation(fault(
-            "native_cleanup",
-            "native cleanup did not return success",
-        )));
-    }
-    if primary.is_none()
-        && let Some(e) = observer_error
-    {
-        primary = Some(NativeReplayPrimary::Observation(e));
-    }
-    if primary.is_none()
-        && let Some(e) = output_error
-    {
-        primary = Some(NativeReplayPrimary::Output(e));
-    }
-    receipt.status = if primary.is_some() {
-        "failed_with_retained_observations"
-    } else {
-        "observations_returned"
-    };
-    if let Some(p) = primary {
-        return Err(with_receipt(
-            p,
-            cleanup_error,
-            observer_error,
-            output_error,
-            receipt,
-            clock,
-            cancel,
-        ));
-    }
-    if let Err(e) = serialize_into(
-        &mut reserved.output,
-        clock.output,
-        Some(clock.whole),
-        &receipt,
-    ) {
-        return Err(with_receipt(
-            NativeReplayPrimary::Output(e),
-            cleanup_error,
-            observer_error,
-            Some(e),
-            receipt,
-            clock,
-            cancel,
-        ));
-    }
-    receipt.bytes_prepared_elapsed_ms = Some(milliseconds(started.elapsed()));
-    if let Err(e) = append_prepared_tick(
-        &mut reserved.output,
-        clock,
-        receipt.bytes_prepared_elapsed_ms.unwrap_or(u64::MAX),
-    ) {
-        return Err(with_receipt(
-            NativeReplayPrimary::Output(e),
-            cleanup_error,
-            observer_error,
-            Some(e),
-            receipt,
-            clock,
-            cancel,
-        ));
-    }
-    // This actual post-encoding guard covers the terminal timing member as well.
-    // receipt.elapsed_ms retains its explicit cleanup/capture scope on success.
-    let whole_expired = Instant::now() >= clock.whole;
-    let canceled = cancel.load(Ordering::Acquire);
-    if whole_expired || canceled {
-        return Err(with_receipt(
-            NativeReplayPrimary::Control(if canceled {
+        let observer_error = drain_collector(&reserved.collector, &mut receipt);
+        clock.stamp(&mut receipt, cancel);
+        if primary.is_none() && (receipt.deadline_exceeded || receipt.canceled) {
+            primary = Some(NativeReplayPrimary::Control(if receipt.canceled {
                 RoleError::Canceled
             } else {
                 RoleError::Deadline
-            }),
-            cleanup_error,
-            observer_error,
-            output_error,
-            receipt,
+            }));
+        }
+        if primary.is_none() && cleanup_error.is_some() {
+            primary = Some(NativeReplayPrimary::Observation(fault(
+                "native_cleanup",
+                "native cleanup did not return success",
+            )));
+        }
+        if primary.is_none()
+            && let Some(e) = observer_error
+        {
+            primary = Some(NativeReplayPrimary::Observation(e));
+        }
+        if primary.is_none()
+            && let Some(e) = output_error
+        {
+            primary = Some(NativeReplayPrimary::Output(e));
+        }
+        receipt.status = if primary.is_some() {
+            "failed_with_retained_observations"
+        } else {
+            "observations_returned"
+        };
+        if let Some(p) = primary {
+            return Err(with_receipt(
+                p,
+                cleanup_error,
+                observer_error,
+                output_error,
+                receipt,
+                clock,
+                cancel,
+            ));
+        }
+        if let Err(e) = serialize_into(
+            &mut reserved.output,
+            clock.output,
+            Some(clock.whole),
+            &receipt,
+        ) {
+            return Err(with_receipt(
+                NativeReplayPrimary::Output(e),
+                cleanup_error,
+                observer_error,
+                Some(e),
+                receipt,
+                clock,
+                cancel,
+            ));
+        }
+        receipt.bytes_prepared_elapsed_ms = Some(milliseconds(started.elapsed()));
+        if let Err(e) = append_prepared_tick(
+            &mut reserved.output,
             clock,
-            cancel,
-        ));
-    }
-    Ok(reserved.output)
+            receipt.bytes_prepared_elapsed_ms.unwrap_or(u64::MAX),
+        ) {
+            return Err(with_receipt(
+                NativeReplayPrimary::Output(e),
+                cleanup_error,
+                observer_error,
+                Some(e),
+                receipt,
+                clock,
+                cancel,
+            ));
+        }
+        // This actual post-encoding guard covers the terminal timing member as well.
+        // receipt.elapsed_ms retains its explicit cleanup/capture scope on success.
+        let whole_expired = Instant::now() >= clock.whole;
+        let canceled = cancel.load(Ordering::Acquire);
+        if whole_expired || canceled {
+            return Err(with_receipt(
+                NativeReplayPrimary::Control(if canceled {
+                    RoleError::Canceled
+                } else {
+                    RoleError::Deadline
+                }),
+                cleanup_error,
+                observer_error,
+                output_error,
+                receipt,
+                clock,
+                cancel,
+            ));
+        }
+        Ok(reserved.output)
+    })();
+    // Every explicit failure keeps the expectation even if no input/audit/owner
+    // was admitted. This is metadata, never a successful scope comparison.
+    result.map_err(|mut error: NativeReplayError| {
+        error.expected_semantic_receipt_producer_scope = expected_scope;
+        error
+    })
 }
 
 fn capture_owner(
@@ -1410,6 +1462,7 @@ fn bare_error(
 ) -> NativeReplayError {
     NativeReplayError {
         code: "native_replay_failed",
+        expected_semantic_receipt_producer_scope: None,
         primary: Box::new(primary),
         cleanup_error: None,
         observer_error: None,
@@ -1436,6 +1489,9 @@ fn with_receipt(
     clock.stamp(&mut receipt, cancel);
     receipt.status = "failed_with_retained_observations";
     let mut e = bare_error(primary, clock, cancel);
+    e.expected_semantic_receipt_producer_scope = receipt
+        .input_admission
+        .expected_semantic_receipt_producer_scope;
     e.cleanup_error = cleanup_error.map(Box::new);
     e.observer_error = observer_error.map(Box::new);
     e.output_error = output_error.map(Box::new);
@@ -1939,6 +1995,7 @@ mod tests {
         let audit = ReplayInputAudit {
             schema: replay_inputs::SCHEMA,
             scope: replay_inputs::SCOPE,
+            expected_semantic_receipt_producer_scope: None,
             mode: ReplayInputMode::ReplyOnly2n,
             input_artifact: empty.clone(),
             registration_artifact: empty.clone(),
@@ -2367,6 +2424,145 @@ mod tests {
         // Keep the Result's error payload small without changing the transparent
         // JSON wire or cloning the owned cause/receipt into a summary error.
         assert!(std::mem::size_of::<NativeReplayError>() < 128);
+    }
+    #[test]
+    fn scoped_initial_input_failures_preserve_expected_declaration_without_loading() {
+        let audit = receipt(clock(8192)).input_admission;
+        let expected = ReplayExpectedPins {
+            registration_artifact: audit.registration_artifact,
+            prepared_action_artifact: audit.prepared_action_artifact,
+            semantic_receipt_artifact: audit.semantic_receipt_artifact,
+            parent: audit.parent,
+            binding: audit.binding,
+            registered_artifacts: audit.registered_artifacts,
+            legacy_cpu_profile_sha256: audit.legacy_cpu_profile_sha256,
+            provider_factory_id: audit.provider_factory_id,
+            semantic_binary_sha256: "a".repeat(64),
+        };
+        let started = Instant::now();
+        let scope = SemanticReceiptProducerScope::LinuxLoadedExecutableInode;
+        // Exercise the actual scoped input checker and production error adapter
+        // before any RuntimeLibraryPin, asset loader, CPU engine or model exists.
+        let source =
+            replay_inputs::check_replay_inputs_with_semantic_scope(b"{", &expected, scope, started)
+                .unwrap_err();
+        let error = input_error(source, started, &AtomicBool::new(false));
+        assert_eq!(error.expected_semantic_receipt_producer_scope, Some(scope));
+        assert!(error.receipt.is_none());
+        assert!(!error.original_whole_deadline_retained);
+        assert!(error.serialization_deadline.is_none());
+        let NativeReplayPrimary::Input(original) = error.primary.as_ref() else {
+            panic!("original scoped input cause lost")
+        };
+        assert_eq!(original.stage, "input_json");
+        assert_eq!(
+            original.expected_semantic_receipt_producer_scope,
+            Some(scope)
+        );
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            wire["expected_semantic_receipt_producer_scope"],
+            scope.as_str()
+        );
+        assert_eq!(
+            wire["primary"]["input"]["expected_semantic_receipt_producer_scope"],
+            scope.as_str()
+        );
+        let legacy_source =
+            replay_inputs::check_replay_inputs(b"{", &expected, started).unwrap_err();
+        let legacy = input_error(legacy_source, started, &AtomicBool::new(false));
+        assert!(legacy.expected_semantic_receipt_producer_scope.is_none());
+        assert!(
+            !serde_json::to_string(&legacy)
+                .unwrap()
+                .contains("expected_semantic_receipt_producer_scope")
+        );
+        let wire = serde_json::to_value(&legacy).unwrap();
+        assert!(
+            !wire
+                .as_object()
+                .unwrap()
+                .contains_key("expected_semantic_receipt_producer_scope")
+        );
+        assert!(
+            !wire["primary"]["input"]
+                .as_object()
+                .unwrap()
+                .contains_key("expected_semantic_receipt_producer_scope")
+        );
+    }
+    #[test]
+    fn scoped_retained_output_failure_keeps_expectation_and_false_authorities() {
+        let c = clock(512);
+        let scope = SemanticReceiptProducerScope::CurrentExePathHash;
+        let mut observed = receipt(c);
+        observed
+            .input_admission
+            .expected_semantic_receipt_producer_scope = Some(scope);
+        observed.trace_jsonl = "{\"controlled_retained_scope_row\":true}\n".into();
+        observed.trace_rows = 1;
+        let error = with_receipt(
+            NativeReplayPrimary::Output(fault("serialization", "controlled finite output failure")),
+            None,
+            None,
+            Some(fault("serialization", "controlled finite output failure")),
+            observed,
+            c,
+            &AtomicBool::new(false),
+        );
+        assert!(error.serialized().is_err());
+        assert_eq!(error.expected_semantic_receipt_producer_scope, Some(scope));
+        let retained = error.receipt.as_ref().unwrap();
+        assert_eq!(
+            retained
+                .input_admission
+                .expected_semantic_receipt_producer_scope,
+            Some(scope)
+        );
+        assert_eq!(
+            retained.input_admission.binary_pin_scope,
+            replay_inputs::BINARY_DECLARATION_SCOPE
+        );
+        assert_eq!(
+            retained.binary_pin_scope,
+            replay_inputs::BINARY_DECLARATION_SCOPE
+        );
+        assert_eq!(retained.trace_rows, 1);
+        assert!(
+            retained
+                .trace_jsonl
+                .contains("controlled_retained_scope_row")
+        );
+        assert_eq!(retained.authorities, ReplayAuthorities::default());
+        assert_eq!(
+            retained.input_admission.authorities,
+            ReplayAuthorities::default()
+        );
+        assert!(!retained.model_returned && !retained.owner_created && !retained.replay_attempted);
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            wire["expected_semantic_receipt_producer_scope"],
+            scope.as_str()
+        );
+        assert_eq!(
+            wire["receipt"]["input_admission"]["expected_semantic_receipt_producer_scope"],
+            scope.as_str()
+        );
+        let legacy = bare_error(
+            NativeReplayPrimary::Admission(fault(
+                "source_registration",
+                "controlled legacy failure",
+            )),
+            c,
+            &AtomicBool::new(false),
+        );
+        assert!(
+            !serde_json::to_value(&legacy)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("expected_semantic_receipt_producer_scope")
+        );
     }
     #[test]
     fn output_failure_keeps_nonzero_work_rows_unknowns_and_negative_authorities() {
