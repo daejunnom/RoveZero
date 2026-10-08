@@ -29,8 +29,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub const EXPECTED_TRANSPORT_V2_SCHEMA: &str = "rz-pals-frozen-replay-cli-expected/2";
+pub const EXPECTED_TRANSPORT_V3_SCHEMA: &str = "rz-pals-frozen-replay-cli-expected/3";
 pub const LAUNCH_ASSETS_SCHEMA: &str = "rz-pals-frozen-replay-cli-assets/1";
 pub const PREPARATION_MANIFEST_SCHEMA: &str = "rz-pals-frozen-replay-launch-preparation/1";
+pub const OBSERVED_PREPARATION_MANIFEST_SCHEMA: &str = "rz-pals-frozen-replay-launch-preparation/2";
 pub const MAX_EXPECTED_BYTES: usize = 64 * 1024;
 pub const MAX_LAUNCH_ASSETS_BYTES: usize = 128 * 1024;
 pub const MAX_PATH_BYTES: usize = 4096;
@@ -104,6 +106,51 @@ pub struct ExpectedTransportV2 {
     pub output_bytes: usize,
     pub replay_binary_pin_scope: String,
     pub expected_semantic_receipt_producer_scope: SemanticReceiptProducerScope,
+}
+
+/// An independently selected result lane, never inferred from input or output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeResultLane {
+    QueryPriorV1,
+}
+
+/// New closed /3 transport. The complete old /2 expectations remain nested and
+/// independently pinned; the repeated clock is checked before native admission.
+/// Old /1 and /2 parsers do not acquire permission to accept this result lane.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedTransportV3 {
+    pub schema: String,
+    pub native_result: NativeResultLane,
+    pub whole_wall_ms: u64,
+    pub cleanup_reserve_ms: u64,
+    pub output_bytes: usize,
+    pub expectations: ExpectedTransportV2,
+}
+impl ExpectedTransportV3 {
+    pub fn new(expectations: ExpectedTransportV2, native_result: NativeResultLane) -> Self {
+        Self {
+            schema: EXPECTED_TRANSPORT_V3_SCHEMA.into(),
+            native_result,
+            whole_wall_ms: expectations.whole_wall_ms,
+            cleanup_reserve_ms: expectations.cleanup_reserve_ms,
+            output_bytes: expectations.output_bytes,
+            expectations,
+        }
+    }
+    pub fn same_original_clock(&self) -> bool {
+        self.whole_wall_ms == self.expectations.whole_wall_ms
+            && self.cleanup_reserve_ms == self.expectations.cleanup_reserve_ms
+            && self.output_bytes == self.expectations.output_bytes
+    }
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum PublishedExpectedTransport {
+    Legacy(ExpectedTransportV2),
+    Observed(ExpectedTransportV3),
 }
 
 /// Existing asset transport contains descriptor paths and the exact original
@@ -403,6 +450,8 @@ pub struct ReplayLaunchManifest {
     pub files: Vec<ReplayPublishedFile>,
     pub mode: ReplayInputMode,
     pub expected_semantic_receipt_producer_scope: SemanticReceiptProducerScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_native_result: Option<NativeResultLane>,
     pub whole_wall_ms: u64,
     pub cleanup_reserve_ms: u64,
     pub elapsed_before_manifest_ms: u64,
@@ -881,6 +930,47 @@ pub fn prepare_replay_launch_bundle(
     started: Instant,
     cancel: &AtomicBool,
 ) -> Result<PreparedReplayLaunchBundle, ReplayLaunchPreparationError> {
+    prepare_replay_launch_bundle_inner(
+        originals,
+        declaration,
+        expected,
+        budget,
+        started,
+        cancel,
+        None,
+    )
+}
+
+/// Explicit observed 4N lane. Preparation still makes no execution or closure
+/// claim; it pins the new result request into the same durable publication.
+pub fn prepare_observed_replay_launch_bundle(
+    originals: ReplayLaunchOriginals<'_>,
+    declaration: ReplayLaunchDeclaration<'_>,
+    expected: ReplayLaunchExpected<'_>,
+    budget: ReplayLaunchBudget,
+    started: Instant,
+    cancel: &AtomicBool,
+) -> Result<PreparedReplayLaunchBundle, ReplayLaunchPreparationError> {
+    prepare_replay_launch_bundle_inner(
+        originals,
+        declaration,
+        expected,
+        budget,
+        started,
+        cancel,
+        Some(NativeResultLane::QueryPriorV1),
+    )
+}
+
+fn prepare_replay_launch_bundle_inner(
+    originals: ReplayLaunchOriginals<'_>,
+    declaration: ReplayLaunchDeclaration<'_>,
+    expected: ReplayLaunchExpected<'_>,
+    budget: ReplayLaunchBudget,
+    started: Instant,
+    cancel: &AtomicBool,
+    requested_native_result: Option<NativeResultLane>,
+) -> Result<PreparedReplayLaunchBundle, ReplayLaunchPreparationError> {
     let mut clock = LaunchClock::declared(started, declaration.replay);
     let mut stage = "declaration";
     let mut payloads = Vec::new();
@@ -922,6 +1012,13 @@ pub fn prepare_replay_launch_bundle(
                 "original finite wall is unknown",
             ))?;
             declared_clock.check(cancel)?;
+            if requested_native_result.is_some()
+                && declaration.replay.mode != ReplayInputMode::RepairOpponent4n
+            {
+                return Err(ReplayLaunchCause::Refusal(
+                    "query prior result requires explicitly registered 4N mode",
+                ));
+            }
             stage = "profile";
             let profile = check_cpu_fresh_asset_profile(
                 originals.cpu_fresh_profile,
@@ -1005,6 +1102,12 @@ pub fn prepare_replay_launch_bundle(
                 replay_binary_pin_scope: scope.into(),
                 expected_semantic_receipt_producer_scope: declaration
                     .expected_semantic_receipt_producer_scope,
+            };
+            let transport = match requested_native_result {
+                None => PublishedExpectedTransport::Legacy(transport),
+                Some(lane) => {
+                    PublishedExpectedTransport::Observed(ExpectedTransportV3::new(transport, lane))
+                }
             };
             let expected_pin = count_wire(&transport, MAX_EXPECTED_BYTES, admitted_clock, cancel)?;
             let expected_len =
@@ -1151,12 +1254,18 @@ pub fn prepare_replay_launch_bundle(
             let _ = directory_sync(&bundle_root)?;
             admitted_clock.check(cancel)?;
             let mut manifest = ReplayLaunchManifest {
-                schema: PREPARATION_MANIFEST_SCHEMA.into(),
+                schema: if requested_native_result.is_some() {
+                    OBSERVED_PREPARATION_MANIFEST_SCHEMA
+                } else {
+                    PREPARATION_MANIFEST_SCHEMA
+                }
+                .into(),
                 scope: "original_bytes_to_result_free_durable_launch_bundle_only".into(),
                 files: files.clone(),
                 mode: declaration.replay.mode,
                 expected_semantic_receipt_producer_scope: declaration
                     .expected_semantic_receipt_producer_scope,
+                requested_native_result,
                 whole_wall_ms: admitted_clock.whole_wall_ms,
                 cleanup_reserve_ms: admitted_clock.cleanup_reserve_ms,
                 elapsed_before_manifest_ms: super::super::milliseconds(started.elapsed()),
@@ -1180,7 +1289,7 @@ pub fn prepare_replay_launch_bundle(
                 .ok_or(ReplayLaunchCause::Refusal("manifest body is not object"))?
                 .remove("context_sha256");
             manifest.context_sha256 =
-                super::super::json_digest(&serde_json::json!([PREPARATION_MANIFEST_SCHEMA, body]))
+                super::super::json_digest(&serde_json::json!([manifest.schema, body]))
                     .map_err(|error| ReplayLaunchCause::Cpu(Box::new(error)))?;
             wire_into(
                 &manifest,
@@ -1645,6 +1754,145 @@ mod tests {
         f.resources.required_line_chunks = required.line_chunks();
         f.resources.required_stages = required.stages();
         f
+    }
+
+    fn prepare_observed(
+        f: &Fixture,
+        root: &Path,
+        name: &str,
+        started: Instant,
+    ) -> Result<PreparedReplayLaunchBundle, ReplayLaunchPreparationError> {
+        let export = root.join("unopened-export.json");
+        let runtime = root.join("unopened-runtime-library");
+        let cache = root.join("unopened-runtime-cache");
+        prepare_observed_replay_launch_bundle(
+            ReplayLaunchOriginals {
+                replay: ReplayOriginals {
+                    registration: &f.registration,
+                    prepared_action: &f.action,
+                    semantic_receipt: &f.semantic,
+                },
+                cpu_fresh_profile: &f.profile_raw,
+            },
+            ReplayLaunchDeclaration {
+                replay: ReplayPreparationDeclaration {
+                    mode: f.mode,
+                    config: &f.config,
+                    resources: &f.resources,
+                },
+                expected_semantic_receipt_producer_scope:
+                    SemanticReceiptProducerScope::LibraryDispatcherArgument,
+                assets: ReplayLaunchAssetPaths {
+                    export_manifest: &export,
+                    runtime_library: &runtime,
+                    runtime_cache_root: &cache,
+                },
+                output_root: root,
+                bundle_directory_name: name,
+                replay_binary_pin_scope: "current_exe_path_hash",
+            },
+            ReplayLaunchExpected {
+                replay: &f.expected,
+                cpu_fresh_profile_artifact: &f.profile_pin,
+                cpu_fresh_profile: &f.profile,
+            },
+            budget(),
+            started,
+            &AtomicBool::new(false),
+        )
+    }
+
+    #[test]
+    fn observed_four_n_publication_pins_lane_without_rewriting_old_transport_or_clock() {
+        let f = opponent_fixture();
+        let root = TempRoot::new();
+        let started = Instant::now();
+        let old = prepare(
+            &f,
+            &root.path,
+            "legacy",
+            budget(),
+            started,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let observed = prepare_observed(&f, &root.path, "observed", started).unwrap();
+        let raw = payload(&observed, "replay-expected.json").as_bytes();
+        let v3: ExpectedTransportV3 = serde_json::from_slice(raw).unwrap();
+        assert_eq!(v3.schema, EXPECTED_TRANSPORT_V3_SCHEMA);
+        assert_eq!(v3.native_result, NativeResultLane::QueryPriorV1);
+        assert!(v3.same_original_clock());
+        assert_eq!(
+            serde_json::to_vec(&v3.expectations).unwrap(),
+            payload(&old, "replay-expected.json").as_bytes()
+        );
+        assert!(serde_json::from_slice::<ExpectedTransportV2>(raw).is_err());
+        for name in [
+            "replay-input.json",
+            "replay-registration.json",
+            "prepared-action.json",
+            "semantic-receipt.json",
+            "cpu-fresh-profile.json",
+            "launch-assets.json",
+        ] {
+            assert_eq!(
+                payload(&observed, name).as_bytes(),
+                payload(&old, name).as_bytes()
+            );
+        }
+        assert_eq!(observed.original_started(), old.original_started());
+        assert_eq!(observed.execution_deadline(), old.execution_deadline());
+        assert_eq!(observed.deadline(), old.deadline());
+        assert_eq!(
+            observed.manifest().schema,
+            OBSERVED_PREPARATION_MANIFEST_SCHEMA
+        );
+        assert_eq!(
+            observed.manifest().requested_native_result,
+            Some(NativeResultLane::QueryPriorV1)
+        );
+        assert_eq!(old.manifest().schema, PREPARATION_MANIFEST_SCHEMA);
+        assert_eq!(old.manifest().requested_native_result, None);
+        let old_wire = serde_json::to_value(old.manifest()).unwrap();
+        assert!(old_wire.get("requested_native_result").is_none());
+        assert_eq!(
+            observed.manifest().authorities,
+            ReplayAuthorities::default()
+        );
+        assert!(!observed.manifest().native_result_observed && !observed.manifest().spawn_observed);
+        let mut body = serde_json::to_value(observed.manifest()).unwrap();
+        body.as_object_mut().unwrap().remove("context_sha256");
+        assert_eq!(
+            observed.manifest().context_sha256,
+            super::super::json_digest(&serde_json::json!([
+                OBSERVED_PREPARATION_MANIFEST_SCHEMA,
+                body
+            ]))
+            .unwrap()
+        );
+        for row in observed.publication() {
+            assert!(row.readback_verified && row.sync_completed);
+            assert_eq!(
+                super::super::pin(&fs::read(observed.directory().join(&row.name)).unwrap()),
+                row.artifact
+            );
+        }
+    }
+
+    #[test]
+    fn observed_lane_refuses_two_or_three_n_before_creating_any_bundle() {
+        for mode in [
+            ReplayInputMode::ReplyOnly2n,
+            ReplayInputMode::RepairEndpoint3n,
+        ] {
+            let f = fixture(mode);
+            let root = TempRoot::new();
+            let error = prepare_observed(&f, &root.path, "refused", Instant::now()).unwrap_err();
+            assert_eq!(error.stage, "declaration");
+            assert!(!root.path.join("refused").exists());
+            assert!(error.evidence.retained_payloads().is_empty());
+            assert!(error.evidence.publication().is_empty());
+        }
     }
 
     #[test]

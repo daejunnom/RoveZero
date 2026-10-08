@@ -97,6 +97,7 @@ fn main() -> std::process::ExitCode {
 mod cpu_cli {
     use rz_uci::pals_cpu_task::strategic_action::ArtifactPin;
     use rz_uci::pals_cpu_task::strategic_action::replay_inputs::SemanticReceiptProducerScope;
+    use rz_uci::pals_cpu_task::strategic_action::replay_launch_preparation::NativeResultLane;
     use serde::Serialize;
     use sha2::{Digest, Sha256};
     #[cfg(any(feature = "onnx-cpu", test))]
@@ -120,6 +121,7 @@ mod cpu_cli {
     const EXPECTED_SCHEMA: &str = "rz-pals-frozen-replay-cli-expected/1";
     #[cfg(feature = "onnx-cpu")]
     const EXPECTED_SCHEMA_V2: &str = "rz-pals-frozen-replay-cli-expected/2";
+    const EXPECTED_SCHEMA_V3: &str = "rz-pals-frozen-replay-cli-expected/3";
     #[cfg(feature = "onnx-cpu")]
     const LAUNCH_SCHEMA: &str = "rz-pals-frozen-replay-cli-assets/1";
     const CLI_SCHEMA: &str = "rz-pals-frozen-replay-cli-delivery/1";
@@ -1013,6 +1015,7 @@ mod cpu_cli {
         expected_transport: Option<ArtifactPin>,
         // An independently registered expectation, not a historical image witness.
         expected_semantic_receipt_producer_scope: Option<SemanticReceiptProducerScope>,
+        requested_native_result: Option<NativeResultLane>,
         launch_artifact: Option<ArtifactPin>,
         request_artifact: Option<ArtifactPin>,
         replay_binary: Option<ArtifactPin>,
@@ -1043,6 +1046,7 @@ mod cpu_cli {
                 cleanup_reserve_ms: None,
                 expected_transport: None,
                 expected_semantic_receipt_producer_scope: None,
+                requested_native_result: None,
                 launch_artifact: None,
                 request_artifact: None,
                 replay_binary: None,
@@ -1349,6 +1353,8 @@ mod cpu_cli {
         expected_transport: &'a Option<ArtifactPin>,
         #[serde(skip_serializing_if = "Option::is_none")]
         expected_semantic_receipt_producer_scope: Option<SemanticReceiptProducerScope>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        requested_native_result: Option<NativeResultLane>,
         launch_artifact: &'a Option<ArtifactPin>,
         request_artifact: &'a Option<ArtifactPin>,
         replay_binary: &'a Option<ArtifactPin>,
@@ -1384,6 +1390,7 @@ mod cpu_cli {
             expected_transport: &context.expected_transport,
             expected_semantic_receipt_producer_scope: context
                 .expected_semantic_receipt_producer_scope,
+            requested_native_result: context.requested_native_result,
             launch_artifact: &context.launch_artifact,
             request_artifact: &context.request_artifact,
             replay_binary: &context.replay_binary,
@@ -1502,6 +1509,9 @@ mod cpu_cli {
         if let Some(scope) = context.expected_semantic_receipt_producer_scope {
             value["expected_semantic_receipt_producer_scope"] = serde_json::json!(scope);
         }
+        if let Some(lane) = context.requested_native_result {
+            value["requested_native_result"] = serde_json::json!(lane);
+        }
         let prepared = bounded_json(&value, context.deadline, maximum.saturating_sub(1));
         let mut bytes = match prepared {
             Ok(bytes) => bytes,
@@ -1515,6 +1525,9 @@ mod cpu_cli {
             "bytes_charged":budget.charged.load(Ordering::Acquire),"work":"unknown_not_zero"});
                 if let Some(scope) = context.expected_semantic_receipt_producer_scope {
                     value["expected_semantic_receipt_producer_scope"] = serde_json::json!(scope);
+                }
+                if let Some(lane) = context.requested_native_result {
+                    value["requested_native_result"] = serde_json::json!(lane);
                 }
                 let Ok(smaller) = bounded_json(&value, context.deadline, maximum.saturating_sub(1))
                 else {
@@ -1550,7 +1563,7 @@ mod cpu_cli {
         pub(super) use rz_uci::pals_cpu_task::strategic_action::replay_inputs::CheckedReplayInputs;
         pub(super) use rz_uci::pals_cpu_task::strategic_action::replay_inputs::ReplayInputError;
         use rz_uci::pals_cpu_task::strategic_action::replay_launch_preparation::{
-            ExpectedPinsWire, ExpectedTransportV2, LaunchAssets,
+            ExpectedPinsWire, ExpectedTransportV2, ExpectedTransportV3, LaunchAssets,
         };
         use serde::Deserialize;
 
@@ -1571,6 +1584,30 @@ mod cpu_cli {
         struct ParsedExpectedTransport {
             transport: ExpectedTransport,
             expected_scope: Option<SemanticReceiptProducerScope>,
+            native_result: Option<NativeResultLane>,
+        }
+        impl ParsedExpectedTransport {
+            fn from_v2(
+                version: ExpectedTransportV2,
+                native_result: Option<NativeResultLane>,
+            ) -> Self {
+                Self {
+                    expected_scope: Some(version.expected_semantic_receipt_producer_scope),
+                    native_result,
+                    transport: ExpectedTransport {
+                        schema: version.schema,
+                        request_artifact: version.request_artifact,
+                        replay_expected: version.replay_expected,
+                        launch_asset_artifact: version.launch_asset_artifact,
+                        cpu_fresh_profile_artifact: version.cpu_fresh_profile_artifact,
+                        cpu_fresh_profile: version.cpu_fresh_profile,
+                        whole_wall_ms: version.whole_wall_ms,
+                        cleanup_reserve_ms: version.cleanup_reserve_ms,
+                        output_bytes: version.output_bytes,
+                        replay_binary_pin_scope: version.replay_binary_pin_scope,
+                    },
+                }
+            }
         }
         // Only these bounded original-clock fields are projected before version
         // admission. Ignored fields grant no scope/identity/native authority; the
@@ -1605,30 +1642,33 @@ mod cpu_cli {
                     transport: serde_json::from_slice(raw)
                         .map_err(|error| TransportError::new("expected_json", error))?,
                     expected_scope: None,
+                    native_result: None,
                 },
                 EXPECTED_SCHEMA_V2 => {
                     let version: ExpectedTransportV2 = serde_json::from_slice(raw)
                         .map_err(|error| TransportError::new("expected_json", error))?;
-                    ParsedExpectedTransport {
-                        expected_scope: Some(version.expected_semantic_receipt_producer_scope),
-                        transport: ExpectedTransport {
-                            schema: version.schema,
-                            request_artifact: version.request_artifact,
-                            replay_expected: version.replay_expected,
-                            launch_asset_artifact: version.launch_asset_artifact,
-                            cpu_fresh_profile_artifact: version.cpu_fresh_profile_artifact,
-                            cpu_fresh_profile: version.cpu_fresh_profile,
-                            whole_wall_ms: version.whole_wall_ms,
-                            cleanup_reserve_ms: version.cleanup_reserve_ms,
-                            output_bytes: version.output_bytes,
-                            replay_binary_pin_scope: version.replay_binary_pin_scope,
-                        },
+                    ParsedExpectedTransport::from_v2(version, None)
+                }
+                EXPECTED_SCHEMA_V3 => {
+                    let version: ExpectedTransportV3 = serde_json::from_slice(raw)
+                        .map_err(|error| TransportError::new("expected_json", error))?;
+                    if !version.same_original_clock()
+                        || version.expectations.schema != EXPECTED_SCHEMA_V2
+                    {
+                        return Err(TransportError::new(
+                            "expected_result_lane",
+                            "observed /3 requires nested /2 expectations and the same original clock",
+                        ));
                     }
+                    ParsedExpectedTransport::from_v2(
+                        version.expectations,
+                        Some(version.native_result),
+                    )
                 }
                 _ => {
                     return Err(TransportError::new(
                         "expected_schema",
-                        "closed expected transport V1 or V2 required",
+                        "closed expected transport V1, V2 or explicit V3 required",
                     ));
                 }
             };
@@ -1643,6 +1683,7 @@ mod cpu_cli {
             // it even when the later original-E guard refuses admission; this is
             // not a scope comparison or historical loaded-image success witness.
             context.expected_semantic_receipt_producer_scope = parsed.expected_scope;
+            context.requested_native_result = parsed.native_result;
             if parsed.transport.whole_wall_ms != clock.whole_wall_ms
                 || parsed.transport.cleanup_reserve_ms != clock.cleanup_reserve_ms
                 || parsed.transport.output_bytes != clock.output_bytes
@@ -1668,6 +1709,33 @@ mod cpu_cli {
             match expected {
                 None => SemanticScopeRoute::LibraryOnlyV1,
                 Some(scope) => SemanticScopeRoute::Explicit(scope),
+            }
+        }
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum NativeDispatchRoute {
+            LegacyLibrary,
+            LegacyScoped(SemanticReceiptProducerScope),
+            ObservedPrior(SemanticReceiptProducerScope),
+        }
+        fn native_dispatch_route(
+            scope: SemanticScopeRoute,
+            result: Option<NativeResultLane>,
+            mode: replay_inputs::ReplayInputMode,
+        ) -> CliResult<NativeDispatchRoute> {
+            match (scope, result) {
+                (SemanticScopeRoute::LibraryOnlyV1, None) => Ok(NativeDispatchRoute::LegacyLibrary),
+                (SemanticScopeRoute::Explicit(scope), None) => {
+                    Ok(NativeDispatchRoute::LegacyScoped(scope))
+                }
+                (SemanticScopeRoute::Explicit(scope), Some(NativeResultLane::QueryPriorV1))
+                    if mode == replay_inputs::ReplayInputMode::RepairOpponent4n =>
+                {
+                    Ok(NativeDispatchRoute::ObservedPrior(scope))
+                }
+                _ => Err(TransportError::new(
+                    "native_result_mode",
+                    "query prior requires explicit /3 expectations and registered 4N input",
+                )),
             }
         }
         fn validate_runtime_observation(
@@ -1713,6 +1781,7 @@ mod cpu_cli {
             context.expected_transport = Some(artifact(&expected_raw));
             let parsed = parse_expected_transport(&expected_raw, context)?;
             let scope_route = semantic_scope_route(parsed.expected_scope);
+            let native_result = parsed.native_result;
             let transport = parsed.transport;
             if !matches!(
                 transport.schema.as_str(),
@@ -1775,6 +1844,9 @@ mod cpu_cli {
                 }
             };
             context.apply_admitted_request_clock(&checked)?;
+            // The selected output lane is checked against the independently
+            // admitted input before any asset/cache/native work can begin.
+            let dispatch_route = native_dispatch_route(scope_route, native_result, checked.mode())?;
             drop(checked); // No model/provider/completion authority is retained here.
             let launch_raw = read_verified(
                 &args.launch_path,
@@ -1876,15 +1948,15 @@ mod cpu_cli {
                 expected_profile_artifact: &transport.cpu_fresh_profile_artifact,
                 expected_profile: profile,
             };
-            let dispatched = match scope_route {
-                SemanticScopeRoute::LibraryOnlyV1 => native_replay::dispatch_started(
+            let dispatched = match dispatch_route {
+                NativeDispatchRoute::LegacyLibrary => native_replay::dispatch_started(
                     &request,
                     &expected,
                     assets,
                     context.started,
                     &cancel,
                 ),
-                SemanticScopeRoute::Explicit(scope) => {
+                NativeDispatchRoute::LegacyScoped(scope) => {
                     native_replay::dispatch_started_with_semantic_scope(
                         &request,
                         &expected,
@@ -1893,6 +1965,17 @@ mod cpu_cli {
                         context.started,
                         &cancel,
                     )
+                }
+                NativeDispatchRoute::ObservedPrior(scope) => {
+                    native_replay::dispatch_started_observed_with_semantic_scope(
+                        &request,
+                        &expected,
+                        scope,
+                        assets,
+                        context.started,
+                        &cancel,
+                    )
+                    .map(native_replay::NativeReplayResult::into_bytes)
                 }
             };
             match dispatched {
@@ -1964,6 +2047,159 @@ mod cpu_cli {
             }
             fn scope_member(literal: &str) -> String {
                 format!(r#", "expected_semantic_receipt_producer_scope":"{literal}""#)
+            }
+            fn observed_expected() -> ExpectedTransportV3 {
+                let mut v2: ExpectedTransportV2 = serde_json::from_slice(&expected_wire(
+                    EXPECTED_SCHEMA_V2,
+                    &scope_member("dispatcher_compared_verified_argument"),
+                ))
+                .unwrap();
+                // This controlled declaration explicitly reserves header space;
+                // no production cap is increased after a serialization failure.
+                v2.output_bytes = 8192;
+                ExpectedTransportV3::new(v2, NativeResultLane::QueryPriorV1)
+            }
+            #[test]
+            fn explicit_v3_selects_prior_dispatch_and_preserves_original_clock_declaration_only() {
+                let raw = serde_json::to_vec(&observed_expected()).unwrap();
+                let started = Instant::now();
+                let mut context = Context::new(started).unwrap();
+                let parsed = parse_expected_transport(&raw, &mut context).unwrap();
+                assert_eq!(parsed.transport.schema, EXPECTED_SCHEMA_V2);
+                assert_eq!(parsed.native_result, Some(NativeResultLane::QueryPriorV1));
+                assert_eq!(context.started, started);
+                assert_eq!(context.deadline, started + Duration::from_millis(1000));
+                assert_eq!(
+                    context.execution_deadline,
+                    started + Duration::from_millis(900)
+                );
+                assert_eq!(context.output_limit, 8192);
+                assert_eq!(
+                    native_dispatch_route(
+                        semantic_scope_route(parsed.expected_scope),
+                        parsed.native_result,
+                        replay_inputs::ReplayInputMode::RepairOpponent4n
+                    )
+                    .unwrap(),
+                    NativeDispatchRoute::ObservedPrior(
+                        SemanticReceiptProducerScope::LibraryDispatcherArgument
+                    )
+                );
+                context.store_body(b"{\"codec_fixture\":true}".to_vec(), "declaration_only");
+                let envelope: serde_json::Value =
+                    serde_json::from_slice(&envelope(&context).unwrap()).unwrap();
+                assert_eq!(envelope["cli"]["requested_native_result"], "query_prior_v1");
+                assert_eq!(envelope["cli"]["process_exit_observed"], false);
+                assert_eq!(envelope["cli"]["physical_closure_observed_by_cli"], false);
+                assert!(!context.native_dispatch_entered);
+                assert!(context.runtime_library.is_none() && context.replay_binary.is_none());
+            }
+            #[test]
+            fn observed_result_lane_rejects_mode_or_scope_substitution_before_native_loading() {
+                let scope = SemanticReceiptProducerScope::LibraryDispatcherArgument;
+                for mode in [
+                    replay_inputs::ReplayInputMode::ReplyOnly2n,
+                    replay_inputs::ReplayInputMode::RepairEndpoint3n,
+                    replay_inputs::ReplayInputMode::RepairOpponent4n,
+                ] {
+                    assert_eq!(
+                        native_dispatch_route(SemanticScopeRoute::LibraryOnlyV1, None, mode)
+                            .unwrap(),
+                        NativeDispatchRoute::LegacyLibrary
+                    );
+                    assert_eq!(
+                        native_dispatch_route(SemanticScopeRoute::Explicit(scope), None, mode)
+                            .unwrap(),
+                        NativeDispatchRoute::LegacyScoped(scope)
+                    );
+                    assert!(
+                        native_dispatch_route(
+                            SemanticScopeRoute::LibraryOnlyV1,
+                            Some(NativeResultLane::QueryPriorV1),
+                            mode
+                        )
+                        .is_err()
+                    );
+                    if mode != replay_inputs::ReplayInputMode::RepairOpponent4n {
+                        assert!(
+                            native_dispatch_route(
+                                SemanticScopeRoute::Explicit(scope),
+                                Some(NativeResultLane::QueryPriorV1),
+                                mode
+                            )
+                            .is_err()
+                        );
+                    }
+                }
+                for (schema, member) in [
+                    (EXPECTED_SCHEMA, "".to_string()),
+                    (
+                        EXPECTED_SCHEMA_V2,
+                        scope_member("dispatcher_compared_verified_argument"),
+                    ),
+                ] {
+                    let member = member + r#", "native_result":"query_prior_v1""#;
+                    let started = Instant::now();
+                    let mut context = Context::new(started).unwrap();
+                    assert!(
+                        parse_expected_transport(&expected_wire(schema, &member), &mut context)
+                            .is_err()
+                    );
+                    assert!(context.requested_native_result.is_none());
+                    assert!(!context.native_dispatch_entered);
+                }
+            }
+            #[test]
+            fn v3_closed_codec_rejects_clock_version_lane_and_extra_field_mutations() {
+                let original = serde_json::to_value(observed_expected()).unwrap();
+                let mut variants = Vec::new();
+                for field in ["whole_wall_ms", "cleanup_reserve_ms", "output_bytes"] {
+                    let mut v = original.clone();
+                    v["expectations"][field] =
+                        serde_json::json!(v["expectations"][field].as_u64().unwrap() + 1);
+                    variants.push(serde_json::to_vec(&v).unwrap());
+                }
+                for (field, replacement) in [
+                    ("schema", serde_json::json!(EXPECTED_SCHEMA)),
+                    ("native_result", serde_json::json!("unknown")),
+                    ("unregistered_authority", serde_json::json!(true)),
+                ] {
+                    let mut v = original.clone();
+                    v[field] = replacement;
+                    variants.push(serde_json::to_vec(&v).unwrap());
+                }
+                let mut missing = original.clone();
+                missing.as_object_mut().unwrap().remove("native_result");
+                variants.push(serde_json::to_vec(&missing).unwrap());
+                let mut nested = original.clone();
+                nested["expectations"]["schema"] = serde_json::json!(EXPECTED_SCHEMA);
+                variants.push(serde_json::to_vec(&nested).unwrap());
+                let mut nested_extra = original.clone();
+                nested_extra["expectations"]["native_result"] = serde_json::json!("query_prior_v1");
+                variants.push(serde_json::to_vec(&nested_extra).unwrap());
+                let raw = serde_json::to_string(&original).unwrap();
+                variants.push(
+                    raw.replacen(
+                        r#""native_result":"query_prior_v1""#,
+                        r#""native_result":"query_prior_v1","native_result":"query_prior_v1""#,
+                        1,
+                    )
+                    .into_bytes(),
+                );
+                for raw in variants {
+                    let started = Instant::now();
+                    let mut context = Context::new(started).unwrap();
+                    assert!(parse_expected_transport(&raw, &mut context).is_err());
+                    assert_eq!(context.started, started);
+                    assert_eq!(context.deadline, started + Duration::from_millis(1000));
+                    assert_eq!(
+                        context.execution_deadline,
+                        started + Duration::from_millis(900)
+                    );
+                    assert_eq!(context.output_limit, 8192);
+                    assert!(!context.native_dispatch_entered);
+                    assert!(context.runtime_library.is_none() && context.replay_binary.is_none());
+                }
             }
             #[test]
             fn expected_v1_codec_retains_wire_and_rejects_any_scope_field() {
