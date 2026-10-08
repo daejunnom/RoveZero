@@ -2053,3 +2053,30 @@ weight-free 내용, session/provider·수치·fence는 `NotPerformed`다. 이는
 record bank·native join·P/C read 구현이나 GPU 성공의 대체물이 아니다. 두 후속 단위의
 실행 검사는 최종 통합 commit의 CPU CI에서 별도 인수한다. 이번 GPU 보류, 로컬
 heavy CPU 자원 답변 대기, 실제 학습 제외 및 Draft 경계는 유지한다.
+
+### 원래 receipt에 결합한 native recheck 전체 관측 검증
+
+`native_recheck_witness.py`는 닫힌 opt-in engine/native source pair를 독립 literal로
+등록한다. 원래 build·source·binary 등록과 최초 receipt 전체 inventory를 대조하고,
+Repair suffix의 모든 실제 요청, 다음 Reply binding·raw policy·물리 완료·소비,
+두 전체 Rules 수순, 저장된 OwnCpu TaskRecord/Observation과 조건부 Model/Estimate
+publication을 공개 factory에서 함께 검사한다. 기존 receipt에 trace를 사후 추가하지
+않는다. marker·소스 hash·Reply 완료 하나만으로 재검사 관측을 인수하지 않는다.
+
+반환 범위는 `conditional_same_repaired_line_observation_only`다. WDL·Rules 증명,
+전략 repair·counterexample·policy/D ranking·학습·제품 권한과 최종 search envelope
+완료 권한은 모두 false다. 취소·마감·원래 서비스 오류·미완료·Rules capability 부재는
+unresolved로 보존하고, source·raw·요청·관점·게시 모순은 거부한다. observer 이후의
+최종 search 상태를 관측했다고 주장하지 않는다.
+
+59개 source test methods 중 공개 whole 경로 11개는 별도 최초 receipt fixture와
+실제 strict loader·공개 anchor/whole factory를 사용한다. build·process·Rules·OwnCpu
+실행 기록은 합성이며, 실제 읽은 Rust source bytes와 구분한다. 공개 양의 whole
+사례는 짝수 ply이고 홀수 관점·duplicate/sign 검사는 기존 helper 범위다. 두 독립
+정적 검토와 AST 검사는 실행 성공을 대신하지 않는다. 실제 통과는 후속 CI에서 인수한다.
+
+직전 [CI 37736002427](https://github.com/daejunnom/RoveZero/actions/runs/37736002427)는
+`31cd1ca44bc2b735f9923047f586069162921adf`의 Linux·Windows·CPU bindings가 성공했다.
+model CPU job의 366개 검사 중 한 역사 profile fixture가 현재 source pin을 이전
+observer pin과 혼동해 실패했다. 후속 수정은 이전 literal pair 검사를 별도로 보존하고
+현재 pair를 정확히 지정한다. 이 수정이나 새 whole 검사를 이전 CI 성공으로 소급하지 않는다.
