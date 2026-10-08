@@ -2614,15 +2614,14 @@ impl PalsCollectionDriver for OwnPalsOnnxCollectionDriver {
         })();
         if let Err(error) = &summary_result
             && let Ok(mut s) = self.sink.lock()
+            && !selected_return
         {
-            if !selected_return {
-                let previous = s.trace.failure.take();
-                s.trace.failure = Some(format!(
-                    "{}; summary secondary: {}",
-                    previous.as_deref().unwrap_or("search succeeded"),
-                    failure_text(error)
-                ));
-            }
+            let previous = s.trace.failure.take();
+            s.trace.failure = Some(format!(
+                "{}; summary secondary: {}",
+                previous.as_deref().unwrap_or("search succeeded"),
+                failure_text(error)
+            ));
         }
         let r = search_after_summary(result, summary_result)?;
         let mut genealogy = Vec::new();
@@ -3254,7 +3253,8 @@ mod tests {
     fn observed_return_uses_original_clock_and_records_cancel_expiry_without_join_claim() {
         let (shared, mut limits) = return_fixture(1024 * 1024);
         let mut s = shared.lock().unwrap();
-        limits.deadline = s.started.checked_sub(Duration::from_nanos(1)).unwrap();
+        // A one-nanosecond subtraction can round to the same Instant on Windows.
+        limits.deadline = s.started.checked_sub(Duration::from_millis(1)).unwrap();
         let cancel = AtomicBool::new(true);
         s.prepare_search_return(limits, &cancel, fixture_owner_snapshot())
             .unwrap();

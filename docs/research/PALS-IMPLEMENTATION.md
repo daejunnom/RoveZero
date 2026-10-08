@@ -2433,3 +2433,12 @@ summary 경로는 유지한다. 추가한 일곱 focused fixture는 합성 owner
 않는다. source 등록은 독립 검토한 정확한 collector/engine pair를 명시 literal로 추가하고
 이전 pair와 실패 자료를 보존한다. 실행 시 current hash를 자동 허용하거나 unknown
 source를 인수하지 않는다. 수정 HEAD의 CI 결과는 이전 성공·실패와 별도로 확인한다.
+
+`c9ed3a6933ab37bb3f0ed5770d3482dfc34962e4`의
+[CPU CI run 37766471341](https://github.com/daejunnom/RoveZero/actions/runs/37766471341)은
+모델 CPU와 bindings job이 성공했지만 전체 run은 실패했다. Windows는 clock fixture의
+1ns subtraction이 동일 `Instant`로 관측되어 before-origin assertion에서 실패했고,
+Linux는 해당 native focused 검사들을 통과한 뒤 `collapsible_if`의 warnings-as-errors에서
+중단했다. 후속 변경은 fixture 차이를 1ms로 만들고, Err → sink lock → selected 여부의
+평가 순서를 유지한 let-chain으로 조건문을 정리한다. production deadline이나 lint
+엄격도는 바꾸지 않는다. 최종 source pair를 명시 등록하고 같은 HEAD의 재검사를 요구한다.

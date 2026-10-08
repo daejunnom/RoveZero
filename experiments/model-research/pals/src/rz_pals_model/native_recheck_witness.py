@@ -50,6 +50,12 @@ _REVIEWED_OPT_IN_SOURCE_PROFILES = (
         "crates/rz-arena/src/pals_collect/native.rs": {
             "bytes": 193797, "sha256": "9653ed5ef33eced92b400aef40a7ad018a2668505d6a14568ae9d80e69dc65df"},
     }),
+    ("opt_in_search_return_clock_lint_2c2bfb1c", {
+        "crates/rz-search/src/pals/engine.rs": {
+            "bytes": 343988, "sha256": "0302e49b6a9784641ca90aba17490d404b793098f38836b7b3cf42a12ee131d1"},
+        "crates/rz-arena/src/pals_collect/native.rs": {
+            "bytes": 193840, "sha256": "2c2bfb1c8717a68429d315fa576268ba95b9b6106caed57400b885f656d04ae7"},
+    }),
 )
 _POLICY = {
     "version": "pals-post-repair-recheck/1",
