@@ -2319,3 +2319,42 @@ arena의 새 optional `cuda_record_pages` 설정만 `Option<Box<...>>`로 보관
 Box는 JSON에 투명하고 기존 present-value deserializer의 명시적 null 거부·unknown
 거부·None 생략·canonical digest는 유지한다. 기존 wire·launch·audit fixture로 다시
 검사하며 실제 process peak·성능 효과의 계측 증거는 아니다. 원래 실패 로그를 보존한다.
+
+### Query/2와 실제 CPU_T 요청의 사전 결합
+
+`strategic_cpu_action`은 기존 `CheckedStrategicQuery`를 재검증한 뒤 catalogue의 선택
+행, exact semantic input, 등록 프로필, 부모 Rules 상태·이력, CPU 원문 요청과 독립 핀을
+결합한다. 결과를 보기 전에 envelope를 고정하며 기존 private CPU 요청을 임의로 수정하거나
+남은 시간에 맞춰 `max_wall_time_ms`를 줄이지 않는다. 요청·envelope·출력은 별도 schema와
+원문 핀으로 구분한다. Python factory는 파일을 읽거나 프로세스·모델·학습을 실행하지 않는다.
+
+Rust의 `pals_cpu_task::strategic_action`과 예제의 명시적 `--strategic-action` 선택은
+`rz-pals-private-strategic-action/1` envelope를 strict typed serde로 읽는다. 실행 전에
+선택 action과 실제 CPU 요청의 task·깊이·노드·wall·출력·등록 프로필을 대조하고, 남은
+steps·nodes·wall·출력 예약이 충분한지 확인한다. CPU 검사 action은 최대 두 번의 node
+예약을, Defer는 node 0을 사용하며 출력 예약은 action의 두 배다. 기존 원래 start instant와
+CPU_T dispatcher를 재사용하고 기존 legacy 요청·조건·CLI의 의미는 바꾸지 않는다.
+
+이 Rust 경계는 **caller가 검증·등록한 Query/2 선언을 실제 own CPU dispatch에 결합**한다.
+전체 Query/2의 current parent·frozen admission·semantic capability·prior chronology를
+Rust가 다시 검증했다고 주장하지 않는다. `query_revalidated_by_rust=false`를 보존하고
+그 검증은 원문·독립 핀을 보유한 strict Python consumer가 담당한다. profile·binary의 선언은
+actual loaded image·source·process의 독립 관측을 대신하지 않는다. CLI는 자신의 loaded
+image 또는 current-exe-path 확인 범위를 별도로 표시하며 다른 host의 보장으로 바꾸지 않는다.
+
+Rust 응답에는 실제 CPU 결과 원문과 byte 핀을 남긴다. 실패하면 원래 `CpuTaskError`의
+baseline·after·known/unknown work를 보존한다. 응답 직렬화·deadline·출력 전달 실패도
+진단 자료이며 성공한 action이나 무비용 결과가 아니다. CPU의 새 조건부 질문 완료는
+Rules 판정·native Reply/Repair/recheck·publication·전체 search closure와 별도 증거다.
+
+이번 단계로 native action 인과, 같은 conditional witness의 독립 두 action 비교, whole-action
+비용 및 학습 utility가 완성되지 않는다. `native_action_causal_bridge_observed`,
+`conditional_witness_validated`, `whole_action_cost_observed`, `final_search_closure_observed`,
+`action_completion_admitted`와 utility·target·training authority는 false다. 기존
+`strategic_verifier_utility`의 항상 masked 반환과 `actual_utility_groups=0`도 유지한다.
+제품 V-free 경로, actual training·backward·optimizer 제외 및 이번 GPU 검증 보류는 그대로다.
+
+새 source의 CPU 검사와 기존 소비자 호환성은 후속 정확한 commit SHA의 동일 CPU CI에서
+별도로 인수한다. source 검사·합성 caller fixture를 실제 CUDA·native action·대국의 성공으로
+기록하지 않는다. 후속 native producer는 task 선택 전부터 actual native request ID·task
+execution·최종 return/cleanup·단일 clock의 비용을 결합해야 하며 사후 digest 첨부로 대체하지 않는다.
