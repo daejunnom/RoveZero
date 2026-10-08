@@ -8,9 +8,10 @@ use rz_eval::pals_onnx::PalsOnnxConfig;
 use rz_eval::runtime_pin::RuntimeLibraryPin;
 use rz_experiments::PalsSearchPolicyIdentityV3;
 use rz_search::pals::engine::{
-    PALS_SEARCH_VERSION, POST_REPAIR_RECHECK_OBSERVER_VERSION, PostRepairRecheckPolicy,
-    RecheckEndpoint, RecheckEndpointEvidence, RecheckFinished, RecheckIdentity, RecheckPrepared,
-    RoleAcceptance, RoleError, RoleLogicalContext, RoleQueryPurpose,
+    PALS_SEARCH_VERSION, POST_REPAIR_RECHECK_OBSERVER_VERSION, PalsCounters, PalsError, PalsResult,
+    PostRepairRecheckPolicy, RecheckEndpoint, RecheckEndpointEvidence, RecheckFinished,
+    RecheckIdentity, RecheckPrepared, RoleAcceptance, RoleError, RoleLogicalContext,
+    RoleQueryPurpose,
 };
 use rz_search::pals::store::{EvidenceScope, Observation, RawScore, TaskStatus};
 use rz_uci::pals_native::{
@@ -32,6 +33,14 @@ const RECHECK_ARTIFACT: &str = "native-recheck-traces.jsonl";
 const RECHECK_ROWS: usize = 3;
 const MAX_RECHECK_ATTEMPTS: usize = 128;
 const MAX_RECHECK_ROW_BYTES: usize = MAX_JSON_RECORD_BYTES;
+const SEARCH_RETURN_DOMAIN: &str = "rz-pals-native-observed-search-return/1";
+const SEARCH_RETURN_ARTIFACT: &str = "native-search-returns.jsonl";
+const SEARCH_RETURN_ROW_BYTES: usize = 64 * 1024;
+const SEARCH_SUMMARY_ROW_BYTES: usize = 8 * 1024;
+const SEARCH_RETURN_RESERVED_BYTES: u64 =
+    (SEARCH_RETURN_ROW_BYTES * 2 + SEARCH_SUMMARY_ROW_BYTES) as u64;
+const SEARCH_RETURN_HELD_ROWS: usize = 3;
+const SEARCH_RETURN_MAX_HISTORY_PLIES: usize = 4096;
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -349,6 +358,22 @@ struct PendingRecheck {
     reply: Option<RequestId>,
     bound_payload_sha256: Option<String>,
 }
+// Exclusive descriptor/return/legacy-summary credit. Native callbacks retain
+// their separate Call.prepaid_rows and cannot consume any of these three slots.
+struct PendingSearchReturn {
+    descriptor_sha256: String,
+    capture_sequence: u64,
+    limits: PalsLimits,
+    descriptor_pending: bool,
+    return_pending: bool,
+    summary_pending: bool,
+}
+#[derive(Clone, Copy)]
+enum SearchReturnSlot {
+    Descriptor,
+    Returned,
+    Summary,
+}
 struct Sink {
     context: Option<PalsNativeCaptureContext>,
     source: PalsCollectionSourceDescription,
@@ -363,6 +388,7 @@ struct Sink {
     closed_rechecks: Vec<RecheckIdentity>,
     prepaid_recheck_rows: usize,
     prepaid_native_rows: usize,
+    pending_search_return: Option<PendingSearchReturn>,
 }
 fn role_error(error: impl std::fmt::Display) -> RoleError {
     RoleError::Backend(failure_text(error))
@@ -376,6 +402,104 @@ fn search_after_summary<T>(
         Ok(value) => {
             summary?;
             Ok(value)
+        }
+    }
+}
+fn native_trace_secondary(trace: &mut PalsNativeTrace, stage: &str, error: impl std::fmt::Display) {
+    let secondary = failure_text(error);
+    let previous = trace.failure.take();
+    trace.failure = Some(match previous {
+        Some(primary) => format!("{primary}; {stage} secondary: {secondary}"),
+        None => format!("{stage} secondary: {secondary}"),
+    });
+}
+fn native_trace_failure(trace: &mut PalsNativeTrace, stage: &str, error: impl std::fmt::Display) {
+    if trace.failure.is_some() {
+        native_trace_secondary(trace, stage, error);
+    } else {
+        // Retain the original diagnostic verbatim when there is no earlier primary.
+        trace.failure = Some(failure_text(error));
+    }
+}
+fn search_return_tick(started: Instant, at: Instant) -> Result<u64, RoleError> {
+    let elapsed = at
+        .checked_duration_since(started)
+        .ok_or_else(|| role_error("search return clock precedes native capture origin"))?;
+    u64::try_from(elapsed.as_nanos()).map_err(|_| role_error("search return clock tick overflow"))
+}
+fn search_return_deadline(
+    started: Instant,
+    deadline: Instant,
+) -> Result<serde_json::Value, RoleError> {
+    let (relation, distance) = if let Some(distance) = deadline.checked_duration_since(started) {
+        ("at_or_after_origin", distance)
+    } else {
+        ("before_origin", started.duration_since(deadline))
+    };
+    let distance = u64::try_from(distance.as_nanos())
+        .map_err(|_| role_error("original search deadline tick overflow"))?;
+    Ok(
+        serde_json::json!({"origin":"native_capture_start","unit":"nanoseconds",
+        "relation":relation,"distance":distance,"deadline_replaced":false}),
+    )
+}
+fn search_return_counters(c: &PalsCounters) -> serde_json::Value {
+    serde_json::json!({"rounds":c.rounds,"proposals":c.proposals,"refutations":c.refutations,"repairs":c.repairs,
+        "supported_refutations":c.supported_refutations,"supported_repairs":c.supported_repairs,
+        "role_calls":c.role_calls,"proposer_calls":c.proposer_calls,"critic_calls":c.critic_calls,"repair_calls":c.repair_calls,
+        "completed_proposer_calls":c.completed_proposer_calls,"completed_critic_calls":c.completed_critic_calls,"completed_repair_calls":c.completed_repair_calls,
+        "consumed_role_outputs":c.consumed_role_outputs,"accepted_proposer_outputs":c.accepted_proposer_outputs,
+        "accepted_critic_outputs":c.accepted_critic_outputs,"accepted_repair_outputs":c.accepted_repair_outputs,
+        "value_calls":c.value_calls,"completed_value_calls":c.completed_value_calls,"accepted_value_outputs":c.accepted_value_outputs,
+        "external_checker_tasks":c.external_checker_tasks,"external_checker_reports":c.external_checker_reports,
+        "external_checker_nodes_observed":c.external_checker_nodes_observed,"external_checker_work_incomplete":c.external_checker_work_incomplete,
+        "external_checker_node_budget_reserved":c.external_checker_node_budget_reserved,"consumed_external_checker_tasks":c.consumed_external_checker_tasks,
+        "cpu_tasks_requested":c.cpu_tasks_requested,"cpu_tasks":c.cpu_tasks,"cpu_work_observation_incomplete":c.cpu_work_observation_incomplete,
+        "cpu_nodes":c.cpu_nodes,"cpu_quiescence_nodes":c.cpu_quiescence_nodes,"cpu_tt_hits":c.cpu_tt_hits,
+        "completed_cpu_tasks":c.completed_cpu_tasks,"partial_cpu_iterations":c.partial_cpu_iterations,"consumed_cpu_tasks":c.consumed_cpu_tasks,
+        "reused_completed_cpu_tasks_consumed":c.reused_completed_cpu_tasks_consumed,"consumed_partial_cpu_values":c.consumed_partial_cpu_values,
+        "consumed_frontier_cpu_values":c.consumed_frontier_cpu_values,"consumed_cached_cpu_values":c.consumed_cached_cpu_values,
+        "evidence_cache_hits":c.evidence_cache_hits,"examined_edges":c.examined_edges,"retained_situations":c.retained_situations,
+        "root_scope_observation_complete":c.root_scope_observation_complete,"unknown_root_children":c.unknown_root_children})
+}
+fn search_return_result(
+    result: &Result<PalsResult, PalsError>,
+) -> Result<serde_json::Value, RoleError> {
+    match result {
+        Err(error) => {
+            let variant = match error {
+                PalsError::InvalidConfig => "InvalidConfig",
+                PalsError::InvalidLimits => "InvalidLimits",
+                PalsError::Rules(_) => "Rules",
+                PalsError::Cpu(_) => "Cpu",
+                PalsError::Checker(_) => "Checker",
+                PalsError::Role(_) => "Role",
+                PalsError::Store(_) => "Store",
+                PalsError::Capacity => "Capacity",
+                PalsError::RoleCallLimit => "RoleCallLimit",
+            };
+            Ok(
+                serde_json::json!({"kind":"Err","pals_error_variant":variant,"primary_display":failure_text(error),
+                "primary_display_scope":"original-PalsError-bounded-failure-text;not-unbounded-Debug-copy"}),
+            )
+        }
+        Ok(result) => {
+            let best_move = result
+                .best_move
+                .map(|m| Move16::pack(m).map(|m| m.bits()))
+                .transpose()
+                .map_err(role_error)?;
+            let elapsed_ns = u64::try_from(result.elapsed.as_nanos())
+                .map_err(|_| role_error("engine search elapsed tick overflow"))?;
+            Ok(
+                serde_json::json!({"kind":"Ok","best_move":best_move,"score":result.score,
+                "checker_identity":result.checker_identity,"value_scope":format!("{:?}",result.value_scope),
+                "terminal":result.terminal.map(|t|format!("{:?}",t)),"completion":format!("{:?}",result.completion),
+                "counters":search_return_counters(&result.counters),"root_value_count":result.root_values.len(),
+                "elapsed_ns":elapsed_ns,"elapsed_scope":"engine-reported-search-duration;not-whole-action-cost",
+                "model_identity":result.model_identity,"resolver_version":result.resolver_version,
+                "projection_scope":"explicit-return-fields;resolved-value-and-root-value-bodies-not-serialized;no-utility-or-label-authority"}),
+            )
         }
     }
 }
@@ -520,6 +644,257 @@ fn recheck_endpoint_json(
     )
 }
 impl Sink {
+    fn prepare_search_return(
+        &mut self,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        native_before: serde_json::Value,
+    ) -> Result<(), RoleError> {
+        if !self.selected_recheck() || self.pending_search_return.is_some() {
+            return Err(role_error(
+                "unselected or duplicate observed search return preparation",
+            ));
+        }
+        self.producer
+            .as_ref()
+            .ok_or_else(|| role_error("observed search return requires strict producer"))?
+            .verify_source(&self.source)
+            .map_err(role_error)?;
+        let capture = self.context()?;
+        if capture.actual_moves.len() > SEARCH_RETURN_MAX_HISTORY_PLIES {
+            return Err(role_error(
+                "observed search return actual history exceeds 4096 plies",
+            ));
+        }
+        let snapshot = capture.position.snapshot();
+        let replay = snapshot
+            .uci_replay(SEARCH_RETURN_MAX_HISTORY_PLIES)
+            .map_err(role_error)?;
+        let at = Instant::now();
+        let descriptor = serde_json::json!({"domain":SEARCH_RETURN_DOMAIN,"stage":"before_search",
+            "game_id":capture.game,"capture_sequence":capture.sequence,"opening_id":capture.opening.id,
+            "root":{"rules_version":snapshot.rules_version(),"variant":snapshot.variant(),
+                "board_fen":snapshot.to_fen(),"rules_state_sha256":state_sha(&capture.position).map_err(role_error)?,
+                "history_origin":format!("{:?}",replay.origin),"history_completeness":format!("{:?}",replay.completeness),
+                "known_history_max_plies":SEARCH_RETURN_MAX_HISTORY_PLIES,"known_history_start_fen":replay.start_fen,
+                "known_history_moves":pack(&replay.moves).map_err(role_error)?,
+                "capture_declared_actual_moves":pack(&capture.actual_moves).map_err(role_error)?,
+                "unknown_prefix_invented":false},
+            "checked_source_sha256":canonical_sha256(&("rz-pals-collector-checked-source/1",&self.source)).map_err(role_error)?,
+            "refinement_registration_sha256":self.source.native.as_ref().and_then(|n|n.get("refinement_registration_sha256")),
+            "pals_search_policy":self.source.native.as_ref().and_then(|n|n.get("pals_search_policy")),
+            "limits":{"max_rounds":limits.max_rounds,"max_cpu_nodes":limits.max_cpu_nodes,"cpu_depth":limits.cpu_depth,
+                "original_deadline":search_return_deadline(self.started,limits.deadline)?},
+            "observer_tick":search_return_tick(self.started,at)?,"observer_tick_origin":"native_capture_start","observer_tick_unit":"nanoseconds",
+            "cancelled_at_descriptor":cancel.load(Ordering::Acquire),"deadline_expired_at_descriptor":at>=limits.deadline,
+            "native_owner_before":native_before,"native_owner_scope":"sequential-mutex-and-atomic-owner-snapshot;not-atomic-ledger-or-worker-Stats-ACK",
+            "search_not_yet_called":true,"descriptor_persistence":"sealed-before-search;buffered-trace-not-durable-disk-commit",
+            "reserved_output_bytes":SEARCH_RETURN_RESERVED_BYTES,"reserved_rows":SEARCH_RETURN_HELD_ROWS,
+            "per_descriptor_or_return_row_bytes_including_newline":SEARCH_RETURN_ROW_BYTES,"summary_row_bytes_including_newline":SEARCH_SUMMARY_ROW_BYTES,
+            "physical_nn_rows":null,"physical_nn_rows_observation":"unknown;role-callback-counts-are-not-graph-run-counts",
+            "query_action_causal_authority":false,"whole_action_cost_authority":false,"utility_authority":false,"training_target_authority":false});
+        // Both exact descriptor validation and all accounting checks precede the
+        // atomic reservation. Failure cannot start search or leave partial credit.
+        let json =
+            bounded_json(&descriptor, SEARCH_RETURN_ROW_BYTES - 1, false).map_err(role_error)?;
+        let descriptor_sha256 = format!("{:x}", Sha256::digest(&json));
+        let capture_sequence = capture.sequence;
+        let next_bytes = self
+            .trace
+            .reserved_bytes
+            .checked_add(SEARCH_RETURN_RESERVED_BYTES)
+            .filter(|n| *n <= capture.max_bytes)
+            .ok_or_else(|| {
+                role_error("observed search return byte credit exhausted before search")
+            })?;
+        let next_held = self
+            .prepaid_native_rows
+            .checked_add(SEARCH_RETURN_HELD_ROWS)
+            .ok_or_else(|| role_error("observed search return row credit overflow"))?;
+        if self
+            .trace
+            .rows
+            .len()
+            .checked_add(self.prepaid_recheck_rows)
+            .and_then(|n| n.checked_add(next_held))
+            .is_none_or(|n| n > MAX_ROWS * 8)
+        {
+            return Err(role_error(
+                "observed search return row credit exhausted before search",
+            ));
+        }
+        self.trace
+            .rows
+            .try_reserve(SEARCH_RETURN_HELD_ROWS)
+            .map_err(|_| role_error("observed search return row allocation failed"))?;
+        self.trace.reserved_bytes = next_bytes;
+        self.prepaid_native_rows = next_held;
+        self.pending_search_return = Some(PendingSearchReturn {
+            descriptor_sha256,
+            capture_sequence,
+            limits,
+            descriptor_pending: true,
+            return_pending: true,
+            summary_pending: true,
+        });
+        self.search_return_row(SearchReturnSlot::Descriptor, json)
+    }
+    fn search_return_row(
+        &mut self,
+        slot: SearchReturnSlot,
+        json: Vec<u8>,
+    ) -> Result<(), RoleError> {
+        let pending = self
+            .pending_search_return
+            .as_ref()
+            .ok_or_else(|| role_error("observed search row has no exclusive reservation"))?;
+        if pending.capture_sequence != self.context()?.sequence {
+            return Err(role_error("observed search row capture sequence changed"));
+        }
+        let (allowed, maximum, artifact) = match slot {
+            SearchReturnSlot::Descriptor => (
+                pending.descriptor_pending,
+                SEARCH_RETURN_ROW_BYTES,
+                SEARCH_RETURN_ARTIFACT,
+            ),
+            SearchReturnSlot::Returned => (
+                !pending.descriptor_pending && pending.return_pending,
+                SEARCH_RETURN_ROW_BYTES,
+                SEARCH_RETURN_ARTIFACT,
+            ),
+            SearchReturnSlot::Summary => (
+                !pending.descriptor_pending && pending.summary_pending,
+                SEARCH_SUMMARY_ROW_BYTES,
+                "native-work-summary.jsonl",
+            ),
+        };
+        if !allowed || json.is_empty() || json.len() >= maximum {
+            return Err(role_error(
+                "observed search row exceeded or reused its own reserved slot",
+            ));
+        }
+        let remaining = self
+            .prepaid_native_rows
+            .checked_sub(1)
+            .ok_or_else(|| role_error("observed search held row accounting underflow"))?;
+        let pending = self
+            .pending_search_return
+            .as_mut()
+            .ok_or_else(|| role_error("observed search reservation disappeared"))?;
+        match slot {
+            SearchReturnSlot::Descriptor => pending.descriptor_pending = false,
+            SearchReturnSlot::Returned => pending.return_pending = false,
+            SearchReturnSlot::Summary => pending.summary_pending = false,
+        }
+        self.prepaid_native_rows = remaining;
+        self.trace.rows.push(PalsNativeTraceRow { artifact, json });
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn observed_search_return(
+        &mut self,
+        result: &Result<PalsResult, PalsError>,
+        counters: Option<&PalsCounters>,
+        observer_error: Option<&str>,
+        returned_at: Instant,
+        cancelled_at_search_return: bool,
+        owner_snapshot_started: Instant,
+        owner_snapshot_observed: Instant,
+        native_after: serde_json::Value,
+        cancel: &AtomicBool,
+    ) -> Result<(), RoleError> {
+        let pending = self
+            .pending_search_return
+            .as_ref()
+            .ok_or_else(|| role_error("search returned without its before descriptor"))?;
+        let mut prefix = Sha256::new();
+        prefix.update(b"rz-pals-native-observed-search-trace-prefix/1");
+        for row in &self.trace.rows {
+            prefix.update((row.artifact.len() as u64).to_be_bytes());
+            prefix.update(row.artifact.as_bytes());
+            prefix.update((row.json.len() as u64).to_be_bytes());
+            prefix.update(&row.json);
+        }
+        let construction_started = Instant::now();
+        let mut value = serde_json::json!({"domain":SEARCH_RETURN_DOMAIN,"stage":"search_returned",
+            "game_id":self.context()?.game,"capture_sequence":pending.capture_sequence,
+            "before_search_row_sha256":pending.descriptor_sha256,"search_called_and_returned":true,
+            "actual_result":search_return_result(result)?,"last_search_counters":counters.map(search_return_counters),
+            "last_search_counters_observation":if counters.is_some(){"actual-engine-last-search-counters"}else{"None;unobserved-not-zero"},
+            "recheck_observer_error":observer_error,"native_trace_failure":self.trace.failure,
+            "trace_prefix_rows":self.trace.rows.len(),"trace_capture_sequence_at_return":self.trace.sequence,
+            "trace_prefix_sha256":format!("{:x}",prefix.finalize()),
+            "trace_prefix_scope":"ordered-artifact-names-and-exact-raw-JSON-bytes-before-this-row;not-durable-disk-commit",
+            "clock":{"origin":"native_capture_start","unit":"nanoseconds",
+                "search_returned_tick":search_return_tick(self.started,returned_at)?,
+                "owner_snapshot_started_tick":search_return_tick(self.started,owner_snapshot_started)?,
+                "owner_snapshot_observed_tick":search_return_tick(self.started,owner_snapshot_observed)?,
+                "json_construction_started_tick":search_return_tick(self.started,construction_started)?,
+                "serialization_started_tick":null,
+                "serialization_completed_tick":null,"serialization_completed_observation":"not-self-attested-in-this-row"},
+            "original_deadline":search_return_deadline(self.started,pending.limits.deadline)?,
+            "deadline_expired_at_search_return":returned_at>=pending.limits.deadline,
+            "deadline_expired_at_owner_snapshot":owner_snapshot_observed>=pending.limits.deadline,
+            "deadline_expired_at_serialization_start":null,
+            "cancelled_at_search_return_observation":cancelled_at_search_return,
+            "cancelled_at_return_observer":cancel.load(Ordering::Acquire),
+            "native_owner_after":native_after,"native_owner_scope":"sequential-mutex-and-atomic-owner-snapshot;not-atomic-ledger-or-worker-Stats-ACK",
+            "search_return_is_worker_join":false,"search_return_is_process_shutdown":false,
+            "physical_nn_rows":null,"physical_nn_rows_observation":"unknown;owner-role-callback-counts-and-search-role-counters-kept-separate",
+            "query_action_causal_authority":false,"whole_action_cost_authority":false,"utility_authority":false,"training_target_authority":false});
+        // Capture the byte-serialization boundary once, before serialization.
+        // No fixed-point attempt invents a completed time inside its own row.
+        let serialization_started = Instant::now();
+        value["clock"]["serialization_started_tick"] =
+            serde_json::json!(search_return_tick(self.started, serialization_started)?);
+        value["deadline_expired_at_serialization_start"] =
+            serde_json::json!(serialization_started >= pending.limits.deadline);
+        let json = bounded_json(&value, SEARCH_RETURN_ROW_BYTES - 1, false).map_err(role_error)?;
+        self.search_return_row(SearchReturnSlot::Returned, json)
+    }
+    fn search_summary_row(&mut self, summary: &serde_json::Value) -> Result<(), RoleError> {
+        let json =
+            bounded_json(summary, SEARCH_SUMMARY_ROW_BYTES - 1, false).map_err(role_error)?;
+        self.search_return_row(SearchReturnSlot::Summary, json)
+    }
+    fn preserve_incomplete_return_failure(&mut self) {
+        let missing = self
+            .calls
+            .iter()
+            .find(|(_, c)| !c.physical && !c.rejected)
+            .map(|(id, _)| {
+                format!(
+                    "native request {}:{} returned without physical/rejection evidence",
+                    id.epoch.0, id.sequence
+                )
+            });
+        if let Some(missing) = missing {
+            if self.trace.failure.is_some() {
+                native_trace_secondary(&mut self.trace, "missing physical/rejection", missing);
+            } else {
+                // Preserve the legacy no-primary diagnostic verbatim.
+                self.trace.failure = Some(missing);
+            }
+        }
+        if self.pending_recheck.is_some() || self.rejected_recheck.is_some() {
+            native_trace_failure(
+                &mut self.trace,
+                "missing recheck finish",
+                "native recheck returned without its prepaid finish or rejected-preparation close",
+            );
+        }
+        if self
+            .pending_search_return
+            .as_ref()
+            .is_some_and(|p| p.descriptor_pending || p.return_pending || p.summary_pending)
+        {
+            native_trace_secondary(
+                &mut self.trace,
+                "observed search return",
+                "reserved return or summary row is missing",
+            );
+        }
+    }
     fn context(&self) -> Result<&PalsNativeCaptureContext, RoleError> {
         self.context
             .as_ref()
@@ -1833,6 +2208,7 @@ impl OwnPalsOnnxCollectionDriver {
             closed_rechecks: Vec::new(),
             prepaid_recheck_rows: 0,
             prepaid_native_rows: 0,
+            pending_search_return: None,
         }));
         model
             .set_observer(Box::new(Observer(Arc::clone(&sink))))
@@ -1943,6 +2319,8 @@ impl PalsCollectionDriver for OwnPalsOnnxCollectionDriver {
         cancel: &AtomicBool,
     ) -> Result<PalsCollectionDecision, ArenaError> {
         let position = context.position.clone();
+        let selected_return =
+            self.engine.post_repair_recheck_policy() != PostRepairRecheckPolicy::Disabled;
         {
             let mut s = self
                 .sink
@@ -1951,12 +2329,45 @@ impl PalsCollectionDriver for OwnPalsOnnxCollectionDriver {
             if s.context.is_some() || !s.trace.rows.is_empty() {
                 return Err(invalid("prior native trace was not drained"));
             }
-            if self.engine.post_repair_recheck_policy() != PostRepairRecheckPolicy::Disabled
-                && s.producer.is_none()
-            {
+            if selected_return && s.producer.is_none() {
                 return Err(invalid(
                     "explicit recheck cannot dispatch without a source-bound strict producer handle",
                 ));
+            }
+            if selected_return != s.selected_recheck() {
+                return Err(invalid(
+                    "observed search return selection differs from registered source lane",
+                ));
+            }
+            if selected_return {
+                let conditions = self
+                    .engine
+                    .refinement_conditions()
+                    .ok_or_else(|| invalid("selected search return conditions absent"))?;
+                let actual = PalsSearchPolicyIdentityV3 {
+                    version: rz_experiments::PALS_POST_REPAIR_RECHECK_V3_VERSION.into(),
+                    policy: rz_experiments::PALS_POST_REPAIR_RECHECK_V3_POLICY.into(),
+                    search_identity: self.engine.search_identity().into(),
+                    conditions_sha256: Sha256::digest(conditions.as_bytes()).into(),
+                };
+                actual.validate().map_err(|e| invalid(e.to_string()))?;
+                let actual = serde_json::to_value(actual).map_err(|e| invalid(e.to_string()))?;
+                if s.source
+                    .native
+                    .as_ref()
+                    .and_then(|n| n.get("pals_search_policy"))
+                    != Some(&actual)
+                    || self
+                        .description
+                        .native
+                        .as_ref()
+                        .and_then(|n| n.get("pals_search_policy"))
+                        != Some(&actual)
+                {
+                    return Err(invalid(
+                        "actual search getters differ from registered observed-return lane",
+                    ));
+                }
             }
             s.trace.sequence = context.sequence;
             s.context = Some(context);
@@ -1967,6 +2378,7 @@ impl PalsCollectionDriver for OwnPalsOnnxCollectionDriver {
             s.rejected_recheck = None;
             s.prepaid_recheck_rows = 0;
             s.prepaid_native_rows = 0;
+            s.pending_search_return = None;
         }
         let before = self
             .engine
@@ -1975,20 +2387,34 @@ impl PalsCollectionDriver for OwnPalsOnnxCollectionDriver {
             .map(|r| r.revision)
             .max()
             .unwrap_or(0);
-        let result = self.engine.search(
-            &position,
-            PalsLimits {
-                deadline: limits
-                    .deadline
-                    .ok_or_else(|| invalid("native collection deadline missing"))?,
-                max_rounds: self.max_rounds,
-                max_cpu_nodes: limits.max_nodes,
-                cpu_depth: limits.max_depth,
-            },
-            cancel,
-        );
+        let pals_limits = PalsLimits {
+            deadline: limits
+                .deadline
+                .ok_or_else(|| invalid("native collection deadline missing"))?,
+            max_rounds: self.max_rounds,
+            max_cpu_nodes: limits.max_nodes,
+            cpu_depth: limits.max_depth,
+        };
+        if selected_return {
+            let native_before = lifecycle_receipt(&self.finish.receipt())?;
+            self.sink
+                .lock()
+                .map_err(|_| invalid("native collector sink poisoned"))?
+                .prepare_search_return(pals_limits, cancel, native_before)
+                .map_err(|e| invalid(e.to_string()))?;
+        }
+        let result = self.engine.search(&position, pals_limits, cancel);
+        // Freeze this before locks, counters, owner receipt cloning or JSON work.
+        let search_returned_at = Instant::now();
+        let cancelled_at_search_return = cancel.load(Ordering::Acquire);
         let counters = self.engine.last_search_counters();
         let recheck_observer_error = self.engine.last_recheck_observer_error().map(failure_text);
+        let native_after = selected_return.then(|| {
+            let snapshot_started = Instant::now();
+            let snapshot = lifecycle_receipt(&self.finish.receipt());
+            let snapshot_observed = Instant::now();
+            (snapshot_started, snapshot_observed, snapshot)
+        });
         let summary_result = (|| -> Result<(), ArenaError> {
             let mut s = self
                 .sink
@@ -2008,9 +2434,35 @@ impl PalsCollectionDriver for OwnPalsOnnxCollectionDriver {
                 ));
             }
             if let Some(error) = &recheck_observer_error {
-                s.trace.failure.get_or_insert_with(|| error.clone());
+                native_trace_failure(&mut s.trace, "recheck observer", error);
             }
-            s.reserve(8192).map_err(|e| invalid(e.to_string()))?;
+            let envelope_result =
+                if let Some((snapshot_started, snapshot_observed, snapshot)) = native_after {
+                    match snapshot {
+                        Ok(snapshot) => s
+                            .observed_search_return(
+                                &result,
+                                counters.as_ref(),
+                                recheck_observer_error.as_deref(),
+                                search_returned_at,
+                                cancelled_at_search_return,
+                                snapshot_started,
+                                snapshot_observed,
+                                snapshot,
+                                cancel,
+                            )
+                            .map_err(|e| invalid(e.to_string())),
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    Ok(())
+                };
+            if let Err(error) = &envelope_result {
+                native_trace_secondary(&mut s.trace, "observed search return", error);
+            }
+            if !selected_return {
+                s.reserve(8192).map_err(|e| invalid(e.to_string()))?;
+            }
             let mut summary = serde_json::json!({"domain":"rz-pals-native-search-work/1",
                 "cpu_nodes":c.cpu_nodes,"cpu_tasks_requested":c.cpu_tasks_requested,"cpu_reports_returned":c.cpu_tasks,
                 "cpu_work_observation_incomplete":s.trace.cpu_work_observation_incomplete,
@@ -2020,19 +2472,30 @@ impl PalsCollectionDriver for OwnPalsOnnxCollectionDriver {
             if self.engine.post_repair_recheck_policy() != PostRepairRecheckPolicy::Disabled {
                 summary["recheck_observer_error"] = serde_json::json!(recheck_observer_error);
             }
-            s.row("native-work-summary.jsonl", &summary)
-                .map_err(|e| invalid(e.to_string()))?;
+            let summary_result = if selected_return {
+                s.search_summary_row(&summary)
+            } else {
+                s.row("native-work-summary.jsonl", &summary)
+            }
+            .map_err(|e| invalid(e.to_string()));
+            if selected_return && let Err(error) = &summary_result {
+                native_trace_secondary(&mut s.trace, "summary", error);
+            }
+            envelope_result?;
+            summary_result?;
             Ok(())
         })();
         if let Err(error) = &summary_result
             && let Ok(mut s) = self.sink.lock()
         {
-            let previous = s.trace.failure.take();
-            s.trace.failure = Some(format!(
-                "{}; summary secondary: {}",
-                previous.as_deref().unwrap_or("search succeeded"),
-                failure_text(error)
-            ));
+            if !selected_return {
+                let previous = s.trace.failure.take();
+                s.trace.failure = Some(format!(
+                    "{}; summary secondary: {}",
+                    previous.as_deref().unwrap_or("search succeeded"),
+                    failure_text(error)
+                ));
+            }
         }
         let r = search_after_summary(result, summary_result)?;
         let mut genealogy = Vec::new();
@@ -2065,22 +2528,7 @@ impl PalsCollectionDriver for OwnPalsOnnxCollectionDriver {
             .sink
             .lock()
             .map_err(|_| invalid("native collector sink poisoned"))?;
-        let missing = s
-            .calls
-            .iter()
-            .find(|(_, c)| !c.physical && !c.rejected)
-            .map(|(id, _)| {
-                format!(
-                    "native request {}:{} returned without physical/rejection evidence",
-                    id.epoch.0, id.sequence
-                )
-            });
-        if let Some(missing) = missing {
-            s.trace.failure = Some(missing);
-        }
-        if s.pending_recheck.is_some() || s.rejected_recheck.is_some() {
-            s.trace.failure.get_or_insert_with(||"native recheck returned without its prepaid finish or rejected-preparation close".into());
-        }
+        s.preserve_incomplete_return_failure();
         let consumed: BTreeSet<_> = s
             .calls
             .values()
@@ -2096,6 +2544,7 @@ impl PalsCollectionDriver for OwnPalsOnnxCollectionDriver {
         s.closed_rechecks.clear();
         s.prepaid_recheck_rows = 0;
         s.prepaid_native_rows = 0;
+        s.pending_search_return = None;
         Ok(std::mem::take(&mut s.trace))
     }
     fn finish_collection(
@@ -2418,6 +2867,7 @@ mod tests {
             closed_rechecks: Vec::new(),
             prepaid_recheck_rows: 0,
             prepaid_native_rows: 0,
+            pending_search_return: None,
         }))
     }
     fn raw(count: usize) -> PalsRawOutput {
@@ -2459,6 +2909,313 @@ mod tests {
         .unwrap();
         shared.lock().unwrap().producer = Some(handle.clone());
         handle
+    }
+    // These exercise actual collector seal/accounting functions with synthetic
+    // owner JSON and an Err return supplied by the fixture. No engine.search,
+    // model/CPU/NN execution, worker join or process success is claimed.
+    fn return_fixture(credit: u64) -> (Arc<Mutex<Sink>>, PalsLimits) {
+        let fixture = RecheckFixture::new();
+        (fixture.admitted_sink(credit), fixture.limits)
+    }
+    fn fixture_owner_snapshot() -> serde_json::Value {
+        serde_json::json!({"fixture_scope":"synthetic-owner-snapshot-not-actual-native-execution",
+            "physical_shutdown_confirmed":false,"native_buffers_released":false,
+            "physical_runs_in_flight":0,"backend_stats":null})
+    }
+    #[test]
+    fn observed_return_reservation_checks_bytes_rows_and_descriptor_before_mutation() {
+        for axis in ["bytes", "rows", "descriptor"] {
+            let (shared, limits) = return_fixture(if axis == "bytes" {
+                SEARCH_RETURN_RESERVED_BYTES - 1
+            } else {
+                1024 * 1024
+            });
+            let mut s = shared.lock().unwrap();
+            if axis == "rows" {
+                s.prepaid_recheck_rows = MAX_ROWS * 8 - 2;
+            }
+            let before = (
+                s.trace.reserved_bytes,
+                s.prepaid_native_rows,
+                s.prepaid_recheck_rows,
+                s.trace.rows.len(),
+            );
+            let owner = if axis == "descriptor" {
+                serde_json::json!({"oversize":"x".repeat(SEARCH_RETURN_ROW_BYTES)})
+            } else {
+                fixture_owner_snapshot()
+            };
+            assert!(
+                s.prepare_search_return(limits, &AtomicBool::new(false), owner)
+                    .is_err(),
+                "{axis}"
+            );
+            assert_eq!(
+                (
+                    s.trace.reserved_bytes,
+                    s.prepaid_native_rows,
+                    s.prepaid_recheck_rows,
+                    s.trace.rows.len()
+                ),
+                before,
+                "{axis}"
+            );
+            assert!(s.pending_search_return.is_none());
+        }
+    }
+    #[test]
+    fn observed_return_disabled_sink_keeps_legacy_summary_bytes_and_no_new_rows() {
+        let shared = sink(&Position::startpos(), 1024 * 1024);
+        let mut s = shared.lock().unwrap();
+        let limits = RecheckFixture::new().limits;
+        assert!(
+            s.prepare_search_return(limits, &AtomicBool::new(false), fixture_owner_snapshot())
+                .is_err()
+        );
+        assert!(s.pending_search_return.is_none());
+        assert_eq!(s.prepaid_native_rows, 0);
+        assert!(s.trace.rows.is_empty());
+        let summary = serde_json::json!({"domain":"rz-pals-native-search-work/1","cpu_nodes":0,
+            "cpu_tasks_requested":0,"cpu_reports_returned":0,"cpu_work_observation_incomplete":false,
+            "cpu_task_configuration_sha256":s.source.cpu_profile_sha256,"search_result":null,
+            "role_calls":0,"search_consumed_role_outputs":0});
+        s.reserve(8192).unwrap();
+        s.row("native-work-summary.jsonl", &summary).unwrap();
+        assert_eq!(s.trace.rows.len(), 1);
+        assert_eq!(s.trace.rows[0].artifact, "native-work-summary.jsonl");
+        assert_eq!(s.trace.rows[0].json, serde_json::to_vec(&summary).unwrap());
+        assert_eq!(s.trace.reserved_bytes, 8192);
+    }
+    #[test]
+    fn observed_return_slots_are_exclusive_and_counters_none_stays_unknown() {
+        let (shared, limits) = return_fixture(1024 * 1024);
+        let mut s = shared.lock().unwrap();
+        let cancel = AtomicBool::new(false);
+        s.prepare_search_return(limits, &cancel, fixture_owner_snapshot())
+            .unwrap();
+        assert_eq!(s.trace.reserved_bytes, 139264);
+        assert_eq!(s.prepaid_native_rows, 2);
+        assert!(
+            s.search_return_row(SearchReturnSlot::Returned, Vec::new())
+                .is_err()
+        );
+        assert_eq!(s.prepaid_native_rows, 2);
+        s.prepaid_recheck_rows = MAX_ROWS * 8 - 3;
+        assert!(
+            s.row(
+                "native-events.jsonl",
+                &serde_json::json!({"unrelated":true})
+            )
+            .is_err()
+        );
+        assert_eq!(s.prepaid_native_rows, 2);
+        s.prepaid_recheck_rows = 0;
+        let returned = Instant::now();
+        let result = Err(PalsError::InvalidLimits);
+        s.observed_search_return(
+            &result,
+            None,
+            None,
+            returned,
+            false,
+            returned,
+            returned,
+            fixture_owner_snapshot(),
+            &cancel,
+        )
+        .unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&s.trace.rows[1].json).unwrap();
+        assert_eq!(raw["actual_result"]["kind"], "Err");
+        assert_eq!(raw["actual_result"]["pals_error_variant"], "InvalidLimits");
+        assert!(raw["last_search_counters"].is_null());
+        assert!(raw["physical_nn_rows"].is_null());
+        assert_eq!(
+            raw["native_owner_after"]["physical_shutdown_confirmed"],
+            false
+        );
+        assert_eq!(raw["whole_action_cost_authority"], false);
+        assert_eq!(raw["search_return_is_worker_join"], false);
+        assert_eq!(
+            raw["before_search_row_sha256"],
+            format!("{:x}", Sha256::digest(&s.trace.rows[0].json))
+        );
+        assert!(
+            s.observed_search_return(
+                &result,
+                None,
+                None,
+                returned,
+                false,
+                returned,
+                returned,
+                fixture_owner_snapshot(),
+                &cancel
+            )
+            .is_err()
+        );
+        let summary = serde_json::json!({"domain":"rz-pals-native-search-work/1","cpu_nodes":0});
+        s.search_summary_row(&summary).unwrap();
+        assert!(s.search_summary_row(&summary).is_err());
+        assert_eq!(s.prepaid_native_rows, 0);
+        assert_eq!(s.trace.rows.len(), 3);
+        assert_eq!(s.trace.rows[2].json, serde_json::to_vec(&summary).unwrap());
+        s.preserve_incomplete_return_failure();
+        assert!(s.trace.failure.is_none());
+    }
+    #[test]
+    fn observed_return_failure_keeps_summary_credit_and_is_unresolved_on_drain() {
+        let (shared, limits) = return_fixture(1024 * 1024);
+        let mut s = shared.lock().unwrap();
+        let cancel = AtomicBool::new(false);
+        s.prepare_search_return(limits, &cancel, fixture_owner_snapshot())
+            .unwrap();
+        let at = Instant::now();
+        assert!(
+            s.observed_search_return(
+                &Err(PalsError::Capacity),
+                None,
+                None,
+                at,
+                false,
+                at,
+                at,
+                serde_json::json!({"oversize":"x".repeat(SEARCH_RETURN_ROW_BYTES)}),
+                &cancel
+            )
+            .is_err()
+        );
+        assert_eq!(s.prepaid_native_rows, 2);
+        s.search_summary_row(&serde_json::json!({"domain":"rz-pals-native-search-work/1"}))
+            .unwrap();
+        assert_eq!(s.prepaid_native_rows, 1);
+        s.preserve_incomplete_return_failure();
+        assert!(
+            s.trace
+                .failure
+                .as_ref()
+                .unwrap()
+                .contains("reserved return or summary row is missing")
+        );
+        assert_eq!(s.trace.rows.len(), 2);
+    }
+    #[test]
+    fn observed_return_root_preserves_unknown_prefix_and_rejects_oversized_actual_extent() {
+        let (shared, limits) = return_fixture(1024 * 1024);
+        let mut s = shared.lock().unwrap();
+        let start_fen = Position::startpos().to_fen();
+        s.context.as_mut().unwrap().position = Position::from_fen(&start_fen).unwrap();
+        s.prepare_search_return(limits, &AtomicBool::new(false), fixture_owner_snapshot())
+            .unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&s.trace.rows[0].json).unwrap();
+        assert_eq!(raw["root"]["board_fen"], start_fen);
+        assert_eq!(raw["root"]["history_origin"], "Fen");
+        assert_eq!(raw["root"]["history_completeness"], "UnknownPrefix");
+        assert_eq!(raw["root"]["known_history_moves"], serde_json::json!([]));
+        drop(s);
+        let (shared, limits) = return_fixture(1024 * 1024);
+        let mut s = shared.lock().unwrap();
+        s.context.as_mut().unwrap().actual_moves =
+            vec![BoardMove::from_uci("e2e4").unwrap(); SEARCH_RETURN_MAX_HISTORY_PLIES + 1];
+        assert!(
+            s.prepare_search_return(limits, &AtomicBool::new(false), fixture_owner_snapshot())
+                .is_err()
+        );
+        assert_eq!(s.trace.reserved_bytes, 0);
+        assert!(s.trace.rows.is_empty());
+    }
+    #[test]
+    fn observed_return_uses_original_clock_and_records_cancel_expiry_without_join_claim() {
+        let (shared, mut limits) = return_fixture(1024 * 1024);
+        let mut s = shared.lock().unwrap();
+        limits.deadline = s.started.checked_sub(Duration::from_nanos(1)).unwrap();
+        let cancel = AtomicBool::new(true);
+        s.prepare_search_return(limits, &cancel, fixture_owner_snapshot())
+            .unwrap();
+        let at = Instant::now();
+        s.observed_search_return(
+            &Err(PalsError::InvalidLimits),
+            None,
+            Some("synthetic observer failure"),
+            at,
+            true,
+            at,
+            at,
+            fixture_owner_snapshot(),
+            &cancel,
+        )
+        .unwrap();
+        let before: serde_json::Value = serde_json::from_slice(&s.trace.rows[0].json).unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&s.trace.rows[1].json).unwrap();
+        assert_eq!(
+            before["limits"]["original_deadline"],
+            after["original_deadline"]
+        );
+        assert_eq!(after["original_deadline"]["relation"], "before_origin");
+        assert_eq!(after["deadline_expired_at_search_return"], true);
+        assert_eq!(after["cancelled_at_return_observer"], true);
+        assert_eq!(after["query_action_causal_authority"], false);
+        assert_eq!(after["utility_authority"], false);
+        assert_eq!(after["training_target_authority"], false);
+        assert!(after["clock"]["serialization_completed_tick"].is_null());
+        assert!(
+            after["clock"]["serialization_started_tick"]
+                .as_u64()
+                .unwrap()
+                >= after["clock"]["search_returned_tick"].as_u64().unwrap()
+        );
+    }
+    #[test]
+    fn missing_physical_secondary_preserves_search_primary_and_original_error_return() {
+        let shared = sink(&Position::startpos(), 1024 * 1024);
+        let mut s = shared.lock().unwrap();
+        s.trace.failure = Some("search primary: PALS: InvalidConfig; native trace: none".into());
+        native_trace_failure(
+            &mut s.trace,
+            "recheck observer",
+            "synthetic observer failure",
+        );
+        s.rejected_recheck = Some(RecheckFixture::new().identity());
+        native_trace_secondary(
+            &mut s.trace,
+            "observed search return",
+            "synthetic envelope failure",
+        );
+        native_trace_secondary(&mut s.trace, "summary", "synthetic summary failure");
+        s.calls.insert(
+            id(7),
+            Call {
+                input_sha256: "07".repeat(32),
+                physical: false,
+                delivered: false,
+                accepted: false,
+                rejected: false,
+                physical_unknown: false,
+                logical: None,
+                prepaid_rows: 0,
+            },
+        );
+        s.preserve_incomplete_return_failure();
+        let failure = s.trace.failure.as_ref().unwrap();
+        assert!(failure.starts_with("search primary: PALS: InvalidConfig; native trace: none"));
+        assert!(failure.contains("recheck observer secondary: synthetic observer failure"));
+        assert!(failure.contains("missing recheck finish secondary: native recheck returned without its prepaid finish or rejected-preparation close"));
+        assert!(failure.contains("observed search return secondary: synthetic envelope failure"));
+        assert!(failure.contains("summary secondary: synthetic summary failure"));
+        assert!(failure.contains("missing physical/rejection secondary: native request 17:7"));
+        let returned = search_after_summary::<()>(
+            Err(PalsError::InvalidConfig),
+            Err(invalid("synthetic envelope failure")),
+        )
+        .unwrap_err();
+        assert!(returned.to_string().contains("InvalidConfig"));
+        assert!(!returned.to_string().contains("envelope failure"));
+        s.trace.failure = None;
+        s.rejected_recheck = None;
+        s.preserve_incomplete_return_failure();
+        assert_eq!(
+            s.trace.failure.as_deref(),
+            Some("native request 17:7 returned without physical/rejection evidence")
+        );
     }
     // Observer-only fixture: Rules replay and real seal/credit functions run,
     // but store handles/policy logits are explicitly synthetic. No NN or CPU

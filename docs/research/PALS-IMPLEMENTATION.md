@@ -2374,11 +2374,17 @@ native action·whole cost·CUDA·기력·학습의 인수로 확대하지 않는
 
 후속 native 관측은 실제 collector의 `engine.search` 호출 전과 반환 후를 소유한
 [`native.rs`](../../crates/rz-arena/src/pals_collect/native.rs)에 둔다. 역사적 Query/2의 CPU
-결과를 별도 full search에 붙이는 방식은 인과 연결로 인정하지 않는다. live action은 엔진이
-발급하는 실제 Proposal·C divergence site에 사전 선택을 연결하고, 해당 CPU 검사 결과를
-같은 invocation의 TaskKey·ExecutionId·ObservationId로 게시하여 Reply·Repair·recheck로
-이어야 한다. 이 실제 action API와 독립적인 두 action의 동일 조건부 fact·전체 비용 비교는
-여전히 별도 구현·인수 대상이다. 기존 utility의 masked 상태와 group 0은 유지한다.
+결과를 별도 full search에 붙이는 방식은 인과 연결로 인정하지 않는다. Query/2의 strict
+parent는 완료된 collection의 독립 receipt·raw audit·current view·frozen admission을
+요구하므로 진행 중인 C/Repair row를 같은 invocation의 Query/2 parent로 받을 수 없다.
+첫 action 구현은 완료된 frozen parent를 기존 strict loader로 인수하고, 새 Rust owner가
+Rules 상태·전체 이력·prefix·restriction을 재구성하는 명시적 offline replay 범위로 둔다.
+과거 parent의 RequestId·epoch·Proposal·Repair는 provenance이며 새 수락·publication
+권한으로 복사하지 않는다. 선택 CPU 검사와 새 실제 Proposal·Reply·Repair·recheck는
+같은 fresh invocation의 TaskKey·ExecutionId·ObservationId로 이어야 한다. live parent
+continuation에는 별도 불변 capability와 pending·reset·종료 계약이 필요하며 기존 frozen
+조건을 느슨하게 만들지 않는다. 실제 replay action API와 독립적인 두 action의 동일
+조건부 fact·전체 비용 비교는 아직 구현·인수 대상이다. utility의 masked 상태와 group 0을 유지한다.
 
 별도 `rz-pals-native-observed-search-return/1` 자료는 등록된 explicit recheck lane에서만
 검색 전 descriptor와 실제 검색 반환을 관측하는 경계다. 기존 default·V1·recheck witness의
@@ -2396,6 +2402,24 @@ role call 수로 환산하지 않는다. Query action 인과·whole-action cost�
 false이고 search return은 worker join·session/buffer 해제와 별도다. 종료 행·요약·회수
 실패는 원래 search primary 뒤에 secondary로 보존하며 관측 work를 지우지 않는다.
 이 후속 변경의 compile·fixture·실제 collector 인수는 원래 f78b194의 성공과 구분한다.
-첫 WIP 단위는 output artifact 허용과 합성 persistence·sibling failure 검사이며, 실제
-검색 전 예약·반환 생산자는 별도 소스 구현·검토 중이다. 이 WIP를 생산자 완성으로 표시하지 않는다.
+첫 WIP 단위는 output artifact 허용과 합성 persistence·sibling failure 검사였다. 아래
+89eea8c의 성공과 후속 실제 호출 경계의 생산자 구현·검사 결과를 별도로 기록한다.
 사용자의 이번 GPU 검증 보류와 actual training·backward·optimizer 제외는 계속 적용한다.
+
+output persistence WIP `89eea8c6f4d3987882ddaa5925c183dbb1e794c1`의
+[CPU CI run 37762510301](https://github.com/daejunnom/RoveZero/actions/runs/37762510301)은
+네 job이 모두 성공했다. 양 OS 원시 로그에서 새 persistence 합성 fixture 두 개, 모델
+suite 548개·Python 전략 경계 28개·Rust 전략 경계 11개/OS의 통과를 확인했다. 이 HEAD에는
+실제 검색 전 예약·반환 생산자가 없으며, 자료 보존 fixture 성공을 native action 인과나
+whole cost 인수로 바꾸지 않는다. 정확한 HEAD·job·원문 pin은 소스 밖 인수 기록에 보존한다.
+
+후속 Rust 생산자는 explicit recheck의 실제 engine getter와 등록된 typed policy/source를
+dispatch 전에 대조하고, descriptor·return·summary의 전용 credit을 함께 예약한다.
+실제 `engine.search` 바로 뒤에 반환 시각·cancel을 고정한 뒤 counters의 `Option`,
+순차 owner snapshot, 직렬화 시작을 기록한다. 오류 뒤에도 summary 저장을 시도하고
+trace 회수의 missing physical 진단은 원래 search primary 뒤에 보존한다. 기존 Disabled
+summary 경로는 유지한다. 추가한 일곱 focused fixture는 합성 owner JSON·제공된 오류로
+예약·슬롯·이력 상한·unknown·시계·오류 보존을 검사하며 실제 engine/CPU/NN 인과 자료를
+생산하지 않는다. 소스 구현·정확한 파일 formatter·독립 검토·해당 HEAD의 CPU CI와
+등록된 실제 collector 실행을 각각 구분한다. Query-selected replay action API와 전체
+비용 ledger는 이 반환 생산자 구현만으로 완료되지 않는다.
