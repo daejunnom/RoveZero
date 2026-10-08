@@ -2265,3 +2265,29 @@ snapshot을 종료 결과로 복사하지 않는다. 관측 실패·unknown comp
 compile·fixture·정적 interoperability 인수는 다음 정확한 SHA의 CPU CI 대상이다.
 사용자의 이번 GPU 검증 보류를 유지한다. CUDA 장치·수치·물리 완료·메모리·성능·대국은
 미실행이며 실제 training·backward·optimizer와 새 cloud 실행도 수행하지 않는다.
+
+### 선택 연결의 CPU CI 실패 보존과 utility 준비 경계
+
+통합 SHA `5a85621a7b5d805da2f6ac53d78722f3e165399b`의 run `37749160614`는 완료 실패다.
+CPU bindings job만 성공했고 Linux·Windows Rust job은 `pals_model_check` 예제의 두
+exhaustive match에서 새 metadata 응답을 빠뜨려 compile 단계에서 실패했다. 예제도
+해당 응답을 평가·새 게임 성공으로 처리하지 않고 명시적인 오류로 거부하도록 수정한다.
+모델 job은 470 tests 중 scorer module import 한 건이 실패했다. parameter digest의
+실제 정의인 `preparation_check`로 테스트 import를 수정한다. 이 실패에서 scorer의
+27개 test가 실행·통과했다고 기록하지 않는다. 세 실패 job 원문과 SHA를 외부 보고서
+루트에 보존하며 이후 정확한 통합 SHA의 전체 CPU CI로 다시 확인한다.
+
+`strategic_verifier_utility`는 Query/2·criterion·before pair·각 action의 CPU 원문과
+핀·whole witness의 재검증 접점을 준비한다. immutable raw와 expected-pin metadata의
+합계는 parse·canonicalization 전에 4MiB credit으로 제한한다. 이는 해당 원문의 상한이며
+전체 Python heap·기존 자산·JSON workspace의 process peak 한도가 아니다. 독립 리뷰에서
+caller bundle의 unknown-key set 복제가 byte guard보다 먼저 발생하는 문제를 발견하여
+exact dict·길이 선행·고정 이름 membership 순서로 거부하도록 수정했다.
+
+현재 반환은 항상 `masked_unresolved`·`native_action_causal_bridge_unobserved`이며
+`known=false`·`mask=false`·`actual_utility_groups=0`이다. preference·sign·whole action cost는
+만들지 않고 utility·target·training·action completion·final closure 권한은 false다.
+CPU response 수치나 caller before 선언을 whole-action 인과·실행 비용으로 승격하지 않는다.
+기존 coverage utility와 별개이며 scorer·Pareto·loss·학습 소비자에 아직 연결하지 않는다.
+24개 focused test source와 독립 리뷰·AST parse를 준비했다. 실제 CPU CI 실행 및 실제
+native action causal bridge·whole-action cost·utility target 구현은 별도로 남아 있다.
