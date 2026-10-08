@@ -1,9 +1,9 @@
 //! Restricted-game PALS refinement. These edges are examined continuations,
 //! not PUCT visits. Only Rules can certify a terminal position.
 use super::store::{
-    BoundKind, EvidenceScope, LineId, Move16, Observation, ObservationId, ObservationKind,
-    PalsStores, RawScore, SituationId, StateId, StoreError, StoreLimits, TaskAdmission,
-    TaskConsumer, TaskKey, TaskQuestion,
+    BoundKind, ContinuationConclusion, EvidenceScope, ExecutionId, LineId, Move16, Observation,
+    ObservationId, ObservationKind, PalsStores, RawScore, SituationId, StateId, StoreError,
+    StoreLimits, TaskAdmission, TaskConsumer, TaskKey, TaskQuestion, TaskRecord, TaskStatus,
 };
 use super::value::MODEL_WDL_RESOLVER_VERSION;
 pub use super::value::{
@@ -32,6 +32,8 @@ pub const PALS_SEARCH_VERSION: &str = "pals-restricted-refinement/0.1";
 pub const POST_REPAIR_RECHECK_SEARCH_VERSION: &str =
     "pals-restricted-refinement-post-repair-recheck/1";
 pub const POST_REPAIR_RECHECK_CONDITIONS: &str = "accepted-repair-and-completed-own-evidence;unchanged-first-move;first-opponent-anchor-after-changed-own-response;one-Reply-call-per-repair;prefer-unexamined-different-legal-response;remaining-repaired-suffix-Rules-replay;equal-line-length;equal-completed-CPU-depth-and-namespace-or-both-Rules-terminals;mixed-scope-unresolved;conditional-refutation-only;shared-global-role-cpu-store-deadline-cancel-limits;no-recursive-repair";
+/// Observer provenance domain, independent of the policy-selection marker.
+pub const POST_REPAIR_RECHECK_OBSERVER_VERSION: &str = "pals-post-repair-recheck-observer/1";
 
 /// Selected only at construction. Driver/CLI/manifest registration is a separate
 /// integration step; exposing this API does not advertise product CLI support.
@@ -234,6 +236,121 @@ pub struct RoleAcceptance<'a> {
     pub deadline: Instant,
     pub cancel: &'a AtomicBool,
 }
+
+/// Search-local identity, not a native runtime RequestId or a physical dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecheckIdentity {
+    pub game_generation: u64,
+    pub search_generation: u64,
+    pub root: SituationId,
+    pub root_revision: u64,
+    pub repair_record_revision: u64,
+    pub repaired_line: LineId,
+}
+
+/// Borrowed immutable store facts. Missing provenance stays unknown even when a
+/// manually constructed test value happens to satisfy the search comparison.
+#[derive(Debug)]
+pub enum RecheckEndpointEvidence<'a> {
+    Unobserved,
+    InvalidProvenance {
+        error: StoreError,
+    },
+    OwnCpu {
+        observation_id: ObservationId,
+        execution_id: ExecutionId,
+        observation: &'a Observation,
+        task: &'a TaskRecord,
+        admitted_scope: CpuScoreScope,
+    },
+    RulesTerminal {
+        reason: TerminalReason,
+        value: i32,
+        perspective: Color,
+    },
+}
+
+#[derive(Debug)]
+pub struct RecheckEndpoint<'a> {
+    pub state: StateId,
+    pub situation: SituationId,
+    pub snapshot: &'a PositionSnapshot,
+    pub evidence: RecheckEndpointEvidence<'a>,
+}
+
+/// Prepared after eligibility checks, before the one Reply call. The observer
+/// reserves its own bounded output before returning Ok. It must not retain the
+/// borrowed state, controls, records or task data beyond this synchronous call.
+#[derive(Debug)]
+pub struct RecheckPrepared<'a> {
+    pub identity: RecheckIdentity,
+    pub root_state: StateId,
+    pub root_snapshot: &'a PositionSnapshot,
+    pub anchor_state: StateId,
+    pub anchor_situation: SituationId,
+    pub anchor_snapshot: &'a PositionSnapshot,
+    pub anchor_ply: usize,
+    pub reply_context: &'a RoleLogicalContext,
+    pub repair_record: &'a RoleRecord,
+    pub repaired: &'a [BoardMove],
+    pub refutation: &'a [BoardMove],
+    pub repaired_endpoint: RecheckEndpoint<'a>,
+    pub limits: PalsLimits,
+    /// Engine-local nanoseconds since its clock_origin; not a native capture
+    /// timestamp. Do not compare directly with another observer's elapsed clock.
+    pub deadline_tick: u64,
+    pub cancel: &'a AtomicBool,
+    pub config: &'a PalsConfig,
+    pub checker_identity: &'a CheckerIdentity,
+    pub cpu_condition: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecheckDisposition {
+    PreparedRejected,
+    Interrupted,
+    NoAlternativeResponse,
+    IncompleteCounterline,
+    IncomparableEvidence,
+    MissingCompletedCounterValue,
+    CounterNotLower,
+    ConditionalRefutationPublished,
+}
+
+#[derive(Debug)]
+pub struct RecheckPublication<'a> {
+    pub observation_id: ObservationId,
+    pub observation: &'a Observation,
+    pub conclusion: ContinuationConclusion,
+}
+
+/// One finish callback follows every attempted preparation, including a rejected
+/// reservation with no pending native request. This is conditional search
+/// evidence, never an all-defenses, training-target or repair-success authority.
+#[derive(Debug)]
+pub struct RecheckFinished<'a> {
+    pub identity: RecheckIdentity,
+    pub prepared_accepted: bool,
+    /// Only the engine's RoleModel call attempt. Native events separately prove
+    /// neural submission, physical completion and accepted output RequestId.
+    pub reply_call_attempted: bool,
+    pub reply_accepted: bool,
+    pub reply_context: &'a RoleLogicalContext,
+    pub selected_response: Option<BoardMove>,
+    pub counterline: &'a [BoardMove],
+    pub full_suffix_replayed: bool,
+    pub repaired_endpoint: RecheckEndpoint<'a>,
+    pub counter_endpoint: Option<RecheckEndpoint<'a>>,
+    /// The unchanged engine comparison predicate, not proof of raw provenance.
+    pub comparable: bool,
+    pub publication: Option<RecheckPublication<'a>>,
+    pub disposition: RecheckDisposition,
+    pub original_error: Option<&'a PalsError>,
+    pub limits: PalsLimits,
+    /// Same engine-local clock domain as prepared.deadline_tick.
+    pub deadline_tick: u64,
+    pub cancel: &'a AtomicBool,
+}
 impl RoleAcceptance<'_> {
     pub fn check_control(&self) -> Result<(), RoleError> {
         check_role_control(self.deadline, self.cancel)
@@ -373,6 +490,17 @@ pub trait RoleModel: Send {
         self.accepted_output();
         Ok(())
     }
+    /// Reserve and seal bounded observer output before Reply is attempted.
+    /// Err prevents Reply; finished is still called with prepared_accepted=false.
+    fn recheck_prepared(&mut self, _prepared: RecheckPrepared<'_>) -> Result<(), RoleError> {
+        Ok(())
+    }
+    /// Close the attempt using reserved output, including cancellation/deadline.
+    /// A rejected preparation has no reservation or native request to consume.
+    /// This callback must not dispatch work, change controls or initiate search.
+    fn recheck_finished(&mut self, _finished: RecheckFinished<'_>) -> Result<(), RoleError> {
+        Ok(())
+    }
     /// Close only delivered-output accounting at this logical search boundary.
     /// Physical leases, drain, and quarantine remain the backend owner's job.
     fn finish_search(&mut self, _reason: RoleSearchClosure) {}
@@ -446,6 +574,12 @@ impl<M: RoleModel + ?Sized> RoleModel for Box<M> {
     }
     fn accepted_output_checked(&mut self, acceptance: RoleAcceptance<'_>) -> Result<(), RoleError> {
         (**self).accepted_output_checked(acceptance)
+    }
+    fn recheck_prepared(&mut self, prepared: RecheckPrepared<'_>) -> Result<(), RoleError> {
+        (**self).recheck_prepared(prepared)
+    }
+    fn recheck_finished(&mut self, finished: RecheckFinished<'_>) -> Result<(), RoleError> {
+        (**self).recheck_finished(finished)
     }
     fn finish_search(&mut self, reason: RoleSearchClosure) {
         (**self).finish_search(reason);
@@ -729,6 +863,9 @@ struct CpuEvidence {
     depth: u16,
     scope: CpuScoreScope,
     value_identity: CpuValueIdentity,
+    /// Actual accepted store handles, not recovered from ambiguous dependencies.
+    /// None is reserved for evidence without an observed store provenance.
+    provenance: Option<(ObservationId, ExecutionId)>,
 }
 struct CpuCandidate {
     pv: Vec<BoardMove>,
@@ -767,6 +904,35 @@ struct CompletedRepairRecheck<'a> {
     completed_value: i32,
 }
 
+struct RecheckProgress {
+    prepared_accepted: bool,
+    reply_call_attempted: bool,
+    reply_accepted: bool,
+    selected_response: Option<BoardMove>,
+    counterline: Vec<BoardMove>,
+    counter_leaf: Option<usize>,
+    full_suffix_replayed: bool,
+    comparable: bool,
+    publication: Option<ObservationId>,
+    disposition: RecheckDisposition,
+}
+impl Default for RecheckProgress {
+    fn default() -> Self {
+        Self {
+            prepared_accepted: false,
+            reply_call_attempted: false,
+            reply_accepted: false,
+            selected_response: None,
+            counterline: Vec::new(),
+            counter_leaf: None,
+            full_suffix_replayed: false,
+            comparable: false,
+            publication: None,
+            disposition: RecheckDisposition::Interrupted,
+        }
+    }
+}
+
 /// Persistent exact situations and public evidence survive a normal root change.
 /// `new_game` is the only automatic game-wide invalidation boundary.
 pub struct PalsEngine<M: RoleModel> {
@@ -791,6 +957,7 @@ pub struct PalsEngine<M: RoleModel> {
     clock_origin: Instant,
     consumer_id: u64,
     last_search_counters: Option<PalsCounters>,
+    last_recheck_observer_error: Option<RoleError>,
 }
 impl<M: RoleModel> PalsEngine<M> {
     pub fn new(config: PalsConfig, model: M, cpu: CpuEngine) -> Result<Self, PalsError> {
@@ -959,6 +1126,7 @@ impl<M: RoleModel> PalsEngine<M> {
             clock_origin: Instant::now(),
             consumer_id: 0,
             last_search_counters: None,
+            last_recheck_observer_error: None,
         })
     }
     pub fn new_game(&mut self) {
@@ -983,6 +1151,7 @@ impl<M: RoleModel> PalsEngine<M> {
         self.stores = PalsStores::new(Self::store_limits(&self.config));
         self.consumer_id = 0;
         self.last_search_counters = None;
+        self.last_recheck_observer_error = None;
         self.external_attempts.clear();
         self.last_external_attempt = None;
     }
@@ -1111,6 +1280,11 @@ impl<M: RoleModel> PalsEngine<M> {
     pub fn last_search_counters(&self) -> Option<PalsCounters> {
         self.last_search_counters
     }
+    /// First secondary finish-callback error in the latest entered search. The
+    /// original operation error takes precedence. Reset on search and new_game.
+    pub fn last_recheck_observer_error(&self) -> Option<&RoleError> {
+        self.last_recheck_observer_error.as_ref()
+    }
     pub fn stores(&self) -> &PalsStores {
         &self.stores
     }
@@ -1150,6 +1324,7 @@ impl<M: RoleModel> PalsEngine<M> {
         cancel: &AtomicBool,
         progress: F,
     ) -> Result<PalsResult, PalsError> {
+        self.last_recheck_observer_error = None;
         if self.game_generation.is_none() {
             return Err(PalsError::Capacity);
         }
@@ -1878,6 +2053,7 @@ impl<M: RoleModel> PalsEngine<M> {
                             depth,
                             scope: CpuScoreScope::CompletedIteration,
                             value_identity: self.owned_identity()?.clone(),
+                            provenance: Some((observation, execution)),
                         });
                         counters.evidence_cache_hits += 1;
                         counters.consumed_cpu_tasks += 1;
@@ -2044,6 +2220,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 depth: report.completed_depth,
                 scope: report.score_scope,
                 value_identity: report.value_identity.clone(),
+                provenance: Some((observation, execution)),
             });
             if requested_coverage_complete {
                 counters.consumed_cpu_tasks += 1;
@@ -3838,6 +4015,215 @@ impl<M: RoleModel> PalsEngine<M> {
             return Ok(()); // No eligible opponent anchor is not a proof of defense.
         };
         let anchor = path[anchor_ply];
+        let reply_context = self.role_context(
+            anchor,
+            RoleQuestion {
+                purpose: RoleQueryPurpose::ReplyPolicy,
+                prefix: &repair.repaired[..anchor_ply],
+                proposal: repair.repaired,
+                refutation: Some(repair.refutation),
+                divergences: &[],
+            },
+        )?;
+        let identity = RecheckIdentity {
+            game_generation: self.game_generation.ok_or(PalsError::Capacity)?,
+            search_generation: generation,
+            root: root_situation,
+            root_revision,
+            repair_record_revision: repair.repair_record_revision,
+            repaired_line: repair.repaired_line,
+        };
+        // Only the bounded facts needed by the observer are retained here. No
+        // node, store, or graph is copied. Snapshots preserve actual Rules history.
+        let root_snapshot = self.nodes[repair.root].position.snapshot();
+        let anchor_snapshot = self.nodes[anchor].position.snapshot();
+        let repaired_snapshot = self.nodes[repair.repaired_leaf].position.snapshot();
+        let deadline_tick = self.tick_at(limits.deadline);
+        let mut trace = RecheckProgress::default();
+        let prepared = {
+            let repaired_endpoint = Self::recheck_endpoint(
+                &self.nodes[repair.repaired_leaf],
+                &self.stores,
+                &repaired_snapshot,
+            );
+            let invalid = match &repaired_endpoint.evidence {
+                RecheckEndpointEvidence::InvalidProvenance { error } => Some(error.clone()),
+                _ => None,
+            };
+            if let Some(error) = invalid {
+                Err(PalsError::Store(error))
+            } else {
+                let record = self
+                    .records
+                    .iter()
+                    .find(|record| {
+                        record.origin_state == root_state
+                            && record.kind == RecordKind::Repair
+                            && record.revision == repair.repair_record_revision
+                            && record.line.as_slice() == repair.repaired
+                    })
+                    .ok_or(StoreError::InvalidEvidence(
+                        "accepted Repair record disappeared",
+                    ))?;
+                self.model
+                    .recheck_prepared(RecheckPrepared {
+                        identity,
+                        root_state,
+                        root_snapshot: &root_snapshot,
+                        anchor_state: self.nodes[anchor].state,
+                        anchor_situation: self.nodes[anchor].situation,
+                        anchor_snapshot: &anchor_snapshot,
+                        anchor_ply,
+                        reply_context: &reply_context,
+                        repair_record: record,
+                        repaired: repair.repaired,
+                        refutation: repair.refutation,
+                        repaired_endpoint,
+                        limits,
+                        deadline_tick,
+                        cancel,
+                        config: &self.config,
+                        checker_identity: &self.checker_registered_identity,
+                        cpu_condition: &self.cpu_registered_condition,
+                    })
+                    .map_err(PalsError::Role)
+            }
+        };
+        let mut result = match prepared {
+            Ok(()) => {
+                trace.prepared_accepted = true;
+                self.recheck_after_prepared(
+                    &repair,
+                    anchor,
+                    anchor_ply,
+                    root_situation,
+                    root_revision,
+                    generation,
+                    previous_evidence,
+                    limits,
+                    cancel,
+                    counters,
+                    progress,
+                    &mut trace,
+                )
+            }
+            Err(error) => {
+                trace.disposition = RecheckDisposition::PreparedRejected;
+                Err(error)
+            }
+        };
+        let counter_snapshot = trace
+            .counter_leaf
+            .map(|node| self.nodes[node].position.snapshot());
+        let counter_endpoint =
+            trace
+                .counter_leaf
+                .zip(counter_snapshot.as_ref())
+                .map(|(node, snapshot)| {
+                    Self::recheck_endpoint(&self.nodes[node], &self.stores, snapshot)
+                });
+        let repaired_endpoint = Self::recheck_endpoint(
+            &self.nodes[repair.repaired_leaf],
+            &self.stores,
+            &repaired_snapshot,
+        );
+        let publication = match trace
+            .publication
+            .map(|observation_id| {
+                let observation = self.stores.observations.get(observation_id)?;
+                let conclusion = self
+                    .stores
+                    .situations
+                    .get(root_situation)?
+                    .conclusions
+                    .get(repair.repaired_line)
+                    .copied()
+                    .ok_or(StoreError::InvalidEvidence(
+                        "recheck publication conclusion missing",
+                    ))?;
+                if conclusion.evidence != Some(observation_id) {
+                    return Err(StoreError::InvalidEvidence(
+                        "recheck publication evidence changed",
+                    ));
+                }
+                Ok::<_, StoreError>(RecheckPublication {
+                    observation_id,
+                    observation,
+                    conclusion,
+                })
+            })
+            .transpose()
+        {
+            Ok(publication) => publication,
+            Err(error) => {
+                if result.is_ok() {
+                    result = Err(error.into());
+                }
+                None
+            }
+        };
+        // Closing already prepared output must not be skipped merely because the
+        // original deadline/cancel fired. The callback receives those controls.
+        let finished = self.model.recheck_finished(RecheckFinished {
+            identity,
+            prepared_accepted: trace.prepared_accepted,
+            reply_call_attempted: trace.reply_call_attempted,
+            reply_accepted: trace.reply_accepted,
+            reply_context: &reply_context,
+            selected_response: trace.selected_response,
+            counterline: &trace.counterline,
+            full_suffix_replayed: trace.full_suffix_replayed,
+            repaired_endpoint,
+            counter_endpoint,
+            comparable: trace.comparable,
+            publication,
+            disposition: trace.disposition,
+            original_error: result.as_ref().err(),
+            limits,
+            deadline_tick,
+            cancel,
+        });
+        if let Err(error) = finished {
+            if self.last_recheck_observer_error.is_none() {
+                self.last_recheck_observer_error = Some(error.clone());
+            }
+            if result.is_ok() {
+                return Err(error.into());
+            }
+        }
+        // Observer work belongs to the same original allowance. Only two
+        // successful operations reach this guard; never replace a primary error
+        // or the first secondary observer failure with a later control state.
+        if result.is_ok() {
+            if let Some(stop) = self.stopped(limits, cancel) {
+                return Err(match stop {
+                    PalsCompletion::Canceled => RoleError::Canceled,
+                    _ => RoleError::Deadline,
+                }
+                .into());
+            }
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recheck_after_prepared(
+        &mut self,
+        repair: &CompletedRepairRecheck<'_>,
+        anchor: usize,
+        anchor_ply: usize,
+        root_situation: SituationId,
+        root_revision: u64,
+        generation: u64,
+        previous_evidence: Option<ObservationId>,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        counters: &mut PalsCounters,
+        progress: &mut dyn FnMut(BoardMove),
+        trace: &mut RecheckProgress,
+    ) -> Result<(), PalsError> {
+        let calls_before = counters.critic_calls;
+        let accepted_before = counters.accepted_critic_outputs;
         let replies = self.ranked(
             anchor,
             Call::Reply,
@@ -3847,7 +4233,10 @@ impl<M: RoleModel> PalsEngine<M> {
             limits,
             cancel,
             counters,
-        )?;
+        );
+        trace.reply_call_attempted = counters.critic_calls != calls_before;
+        trace.reply_accepted = counters.accepted_critic_outputs != accepted_before;
+        let replies = replies?;
         let original_response = repair.repaired[anchor_ply];
         let response = replies
             .iter()
@@ -3866,16 +4255,20 @@ impl<M: RoleModel> PalsEngine<M> {
                     .find(|movement| *movement != original_response)
             });
         let Some(response) = response else {
+            trace.disposition = RecheckDisposition::NoAlternativeResponse;
             return Ok(()); // No alternative response is not an all-defenses result.
         };
-        let mut counter = Vec::new();
-        counter
+        trace.selected_response = Some(response);
+        trace
+            .counterline
             .try_reserve_exact(repair.repaired.len())
             .map_err(|_| PalsError::Capacity)?;
+        let counter = &mut trace.counterline;
         counter.extend_from_slice(&repair.repaired[..anchor_ply]);
         let mut state = self.nodes[anchor].position.clone();
         state.make_move(response)?;
         let mut counter_leaf = self.connect(anchor, response, state, counters)?;
+        trace.counter_leaf = Some(counter_leaf);
         counter.push(response);
         let mut full_suffix = true;
         for movement in &repair.repaired[anchor_ply + 1..] {
@@ -3892,11 +4285,20 @@ impl<M: RoleModel> PalsEngine<M> {
             let mut state = self.nodes[counter_leaf].position.clone();
             state.make_move(*movement)?;
             counter_leaf = self.connect(counter_leaf, *movement, state, counters)?;
+            trace.counter_leaf = Some(counter_leaf);
             counter.push(*movement);
         }
+        trace.full_suffix_replayed = full_suffix;
         counters.refutations += 1;
-        self.record(RecordKind::Counterexample, &counter, None, 0, None, None)?;
-        self.verify(counter_leaf, &counter, limits, cancel, counters)?;
+        self.record(
+            RecordKind::Counterexample,
+            counter.as_slice(),
+            None,
+            0,
+            None,
+            None,
+        )?;
+        self.verify(counter_leaf, counter.as_slice(), limits, cancel, counters)?;
         self.publish_choice(repair.root, limits, cancel, progress)?;
         if self.stores.root() != Some(root_situation)
             || self.stores.generation() != generation
@@ -3906,27 +4308,36 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         self.validate_checker_namespace()?;
         if !full_suffix || counter.len() != repair.repaired.len() {
+            trace.disposition = RecheckDisposition::IncompleteCounterline;
             return Ok(());
         }
-        if !self.comparable_recheck_evidence(repair.repaired_leaf, counter_leaf, limits.cpu_depth) {
+        trace.comparable =
+            self.comparable_recheck_evidence(repair.repaired_leaf, counter_leaf, limits.cpu_depth);
+        if !trace.comparable {
+            trace.disposition = RecheckDisposition::IncomparableEvidence;
             return Ok(());
         }
         let Some(counter_value) =
             self.completed_line_value(counter_leaf, counter.len(), limits.cpu_depth)
         else {
+            trace.disposition = RecheckDisposition::MissingCompletedCounterValue;
             return Ok(());
         };
         if counter_value >= repair.completed_value {
+            trace.disposition = RecheckDisposition::CounterNotLower;
             return Ok(());
         }
-        self.publish_recheck_refutation(
-            &repair,
+        let publication = self.publish_recheck_refutation(
+            repair,
             counter_value,
             previous_evidence,
             limits,
             cancel,
             counters,
-        )
+        )?;
+        trace.publication = Some(publication);
+        trace.disposition = RecheckDisposition::ConditionalRefutationPublished;
+        Ok(())
     }
     fn publish_recheck_refutation(
         &mut self,
@@ -3936,7 +4347,7 @@ impl<M: RoleModel> PalsEngine<M> {
         limits: PalsLimits,
         cancel: &AtomicBool,
         counters: &mut PalsCounters,
-    ) -> Result<(), PalsError> {
+    ) -> Result<ObservationId, PalsError> {
         // The earlier publish_choice guard precedes comparison work. Check again
         // at this final mutation boundary before creating conclusion evidence.
         if let Some(stop) = self.stopped(limits, cancel) {
@@ -3959,8 +4370,86 @@ impl<M: RoleModel> PalsEngine<M> {
             evidence,
         )?;
         counters.supported_refutations += 1;
-        Ok(())
+        Ok(evidence)
     }
+    fn recheck_endpoint<'a>(
+        node: &'a Node,
+        stores: &'a PalsStores,
+        snapshot: &'a PositionSnapshot,
+    ) -> RecheckEndpoint<'a> {
+        let evidence = (|| -> Result<RecheckEndpointEvidence<'a>, StoreError> {
+            if !stores.states.get(node.state)?.same_state(snapshot)
+                || stores.situations.get(node.situation)?.state != node.state
+            {
+                return Err(StoreError::InvalidEvidence("recheck endpoint Rules state mismatch"));
+            }
+            if let Some((reason, value)) = node.terminal {
+                return Ok(RecheckEndpointEvidence::RulesTerminal {
+                    reason, value, perspective: node.position.side_to_move(),
+                });
+            }
+            let Some(admitted) = &node.evidence else {
+                return Ok(RecheckEndpointEvidence::Unobserved);
+            };
+            let Some((observation_id, execution_id)) = admitted.provenance else {
+                return Ok(RecheckEndpointEvidence::Unobserved);
+            };
+            let observation = stores.observations.get(observation_id)?;
+            let task = stores.tasks.get(execution_id)?;
+            let scope_matches = matches!(observation.scope,
+                EvidenceScope::DepthLimited { depth, profile, condition }
+                if depth == admitted.depth && profile == task.key.profile && condition == task.key.condition
+            );
+            let score_matches = match (admitted.scope, observation.score) {
+                (CpuScoreScope::CompletedIteration, RawScore::Cpu { value, perspective, bound }) => {
+                    value == admitted.score && perspective == node.position.side_to_move()
+                        && bound == BoundKind::ExactWithinSearch
+                }
+                (CpuScoreScope::FrontierOnly, RawScore::Estimate { value, perspective }) => {
+                    value == admitted.score as f32 && perspective == node.position.side_to_move()
+                }
+                _ => false,
+            };
+            let status_matches = match task.status {
+                TaskStatus::Completed(actual) => actual == observation_id
+                    && admitted.scope == CpuScoreScope::CompletedIteration
+                    && admitted.depth >= task.key.requested_depth,
+                TaskStatus::Paused { evidence, .. } => evidence == Some(observation_id),
+                TaskStatus::Failed => true, // Retained incomplete/frontier work, not completed authority.
+                _ => false,
+            };
+            if observation.state != node.state
+                || observation.line.is_some()
+                || observation.execution != Some(execution_id)
+                || observation.kind != ObservationKind::CpuAnalysis
+                || observation.value_identity.as_ref() != Some(&admitted.value_identity)
+                || observation.checker_identity.is_some()
+                || observation.cpu_condition.is_none()
+                || observation.cpu_condition != task.key.cpu_condition
+                || task.key.state != node.state
+                || task.key.line.is_some()
+                || task.key.question != TaskQuestion::AnalyzePosition
+                || !task.key.root_moves.is_empty()
+                || task.key.value_identity.as_ref() != Some(&admitted.value_identity)
+                || task.key.checker_identity.is_some()
+                || task.key.input_revision != 0
+                || observation.budget > task.key.node_budget
+                || !scope_matches || !score_matches || !status_matches
+            {
+                return Err(StoreError::InvalidEvidence("recheck endpoint accepted provenance mismatch"));
+            }
+            Ok(RecheckEndpointEvidence::OwnCpu {
+                observation_id, execution_id, observation, task, admitted_scope: admitted.scope,
+            })
+        })().unwrap_or_else(|error| RecheckEndpointEvidence::InvalidProvenance { error });
+        RecheckEndpoint {
+            state: node.state,
+            situation: node.situation,
+            snapshot,
+            evidence,
+        }
+    }
+
     fn comparable_recheck_evidence(&self, repaired: usize, counter: usize, required: u16) -> bool {
         let repaired = &self.nodes[repaired];
         let counter = &self.nodes[counter];
@@ -5175,6 +5664,32 @@ mod tests {
     struct RecheckRoleFixture {
         replies: Vec<RoleLogicalContext>,
         cancel_after_reply: bool,
+        cancel_after_prepare: bool,
+        cancel_after_finish: bool,
+        finish_cross_deadline: bool,
+        prepare_error: Option<RoleError>,
+        reply_error: Option<RoleError>,
+        finish_error: Option<RoleError>,
+        prepared: Vec<(RecheckIdentity, RoleLogicalContext, Instant)>,
+        finished: Vec<RecheckFinishFixture>,
+    }
+    struct RecheckFinishFixture {
+        identity: RecheckIdentity,
+        prepared_accepted: bool,
+        attempted: bool,
+        accepted: bool,
+        selected: Option<BoardMove>,
+        counterline: Vec<BoardMove>,
+        full_suffix: bool,
+        comparable: bool,
+        repaired_observed: bool,
+        repaired_invalid: bool,
+        counter_observed: Option<bool>,
+        publication: Option<(ObservationId, ContinuationConclusion)>,
+        disposition: RecheckDisposition,
+        original_role_error: Option<RoleError>,
+        original_failed: bool,
+        deadline: Instant,
     }
     impl RoleModel for RecheckRoleFixture {
         fn identity(&self) -> &str {
@@ -5216,12 +5731,110 @@ mod tests {
             context: &RoleLogicalContext,
         ) -> Result<RoleEvaluation, RoleError> {
             self.replies.push(context.clone());
+            if let Some(error) = &self.reply_error {
+                return Err(error.clone());
+            }
             let cancel = query.cancel;
             let result = self.reply(query)?;
             if self.cancel_after_reply {
                 cancel.store(true, Ordering::Release);
             }
             Ok(result)
+        }
+        fn recheck_prepared(&mut self, prepared: RecheckPrepared<'_>) -> Result<(), RoleError> {
+            assert_eq!(prepared.repair_record.kind, RecordKind::Repair);
+            assert_eq!(
+                prepared.repair_record.revision,
+                prepared.identity.repair_record_revision
+            );
+            assert_eq!(prepared.repair_record.line.as_slice(), prepared.repaired);
+            assert_eq!(
+                prepared.reply_context.prefix,
+                prepared.repaired[..prepared.anchor_ply]
+            );
+            assert_eq!(prepared.reply_context.state, prepared.anchor_state);
+            assert_eq!(prepared.reply_context.situation, prepared.anchor_situation);
+            assert_eq!(
+                prepared.reply_context.search_generation,
+                prepared.identity.search_generation
+            );
+            let mut checked = Position::startpos();
+            assert!(prepared.root_snapshot.same_state(&checked.snapshot()));
+            for movement in &prepared.reply_context.prefix {
+                checked.make_move(*movement).unwrap();
+            }
+            assert!(prepared.anchor_snapshot.same_state(&checked.snapshot()));
+            self.prepared.push((
+                prepared.identity,
+                prepared.reply_context.clone(),
+                prepared.limits.deadline,
+            ));
+            if self.cancel_after_prepare {
+                prepared.cancel.store(true, Ordering::Release);
+            }
+            match &self.prepare_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
+        }
+        fn recheck_finished(&mut self, finished: RecheckFinished<'_>) -> Result<(), RoleError> {
+            if let Some(publication) = &finished.publication {
+                assert_eq!(
+                    publication.conclusion.evidence,
+                    Some(publication.observation_id)
+                );
+                assert_eq!(
+                    publication.observation.line,
+                    Some(finished.identity.repaired_line)
+                );
+                assert_eq!(publication.observation.kind, ObservationKind::Refutation);
+            }
+            self.finished.push(RecheckFinishFixture {
+                identity: finished.identity,
+                prepared_accepted: finished.prepared_accepted,
+                attempted: finished.reply_call_attempted,
+                accepted: finished.reply_accepted,
+                selected: finished.selected_response,
+                counterline: finished.counterline.to_vec(),
+                full_suffix: finished.full_suffix_replayed,
+                comparable: finished.comparable,
+                repaired_observed: matches!(
+                    finished.repaired_endpoint.evidence,
+                    RecheckEndpointEvidence::OwnCpu { .. }
+                ),
+                repaired_invalid: matches!(
+                    finished.repaired_endpoint.evidence,
+                    RecheckEndpointEvidence::InvalidProvenance { .. }
+                ),
+                counter_observed: finished.counter_endpoint.as_ref().map(|endpoint| {
+                    matches!(endpoint.evidence, RecheckEndpointEvidence::OwnCpu { .. })
+                }),
+                publication: finished
+                    .publication
+                    .map(|publication| (publication.observation_id, publication.conclusion)),
+                disposition: finished.disposition,
+                original_role_error: match finished.original_error {
+                    Some(PalsError::Role(error)) => Some(error.clone()),
+                    _ => None,
+                },
+                original_failed: finished.original_error.is_some(),
+                deadline: finished.limits.deadline,
+            });
+            if self.finish_cross_deadline {
+                // Finite fixture callback work, charged to the original wall.
+                let remaining = finished
+                    .limits
+                    .deadline
+                    .saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining.saturating_add(Duration::from_millis(1)));
+            }
+            if self.cancel_after_finish {
+                finished.cancel.store(true, Ordering::Release);
+            }
+            match &self.finish_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
         }
     }
 
@@ -5324,6 +5937,7 @@ mod tests {
             depth: 1,
             scope: CpuScoreScope::CompletedIteration,
             value_identity: identity.clone(),
+            provenance: None,
         });
         if counter_complete {
             let mut counter_position = position;
@@ -5338,6 +5952,7 @@ mod tests {
                 depth: 1,
                 scope: CpuScoreScope::CompletedIteration,
                 value_identity: identity,
+                provenance: None,
             });
         }
         let (old_line, _) = engine
@@ -5402,6 +6017,477 @@ mod tests {
     }
 
     #[test]
+    fn recheck_observer_keeps_manual_values_unobserved_and_links_actual_publication() {
+        let mut fixture =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        let requested = limits();
+        fixture.run(requested, &AtomicBool::new(false)).unwrap();
+        assert_eq!(fixture.engine.model.prepared.len(), 1);
+        assert_eq!(fixture.engine.model.finished.len(), 1);
+        let finished = &fixture.engine.model.finished[0];
+        assert_eq!(finished.identity, fixture.engine.model.prepared[0].0);
+        assert_eq!(finished.deadline, requested.deadline);
+        assert!(finished.prepared_accepted && finished.attempted && finished.accepted);
+        assert_eq!(
+            finished.selected,
+            Some(BoardMove::from_uci("g8f6").unwrap())
+        );
+        assert_eq!(finished.counterline.len(), fixture.repaired.len());
+        assert!(finished.full_suffix && finished.comparable);
+        assert!(!finished.repaired_observed && !finished.repaired_invalid);
+        assert_eq!(finished.counter_observed, Some(false));
+        assert!(!finished.original_failed);
+        assert_eq!(
+            finished.disposition,
+            RecheckDisposition::ConditionalRefutationPublished
+        );
+        let (observation, conclusion) = finished.publication.unwrap();
+        assert_eq!(conclusion.evidence, Some(observation));
+        assert_eq!(
+            fixture
+                .engine
+                .stores
+                .situations
+                .get(finished.identity.root)
+                .unwrap()
+                .conclusions
+                .get(finished.identity.repaired_line)
+                .copied(),
+            Some(conclusion)
+        );
+        assert_eq!(fixture.engine.last_recheck_observer_error(), None);
+    }
+
+    #[test]
+    fn recheck_preparation_rejection_finishes_without_reply_and_preserves_secondary_error() {
+        let mut fixture =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        let primary = RoleError::Backend("observer reservation refused".into());
+        let secondary = RoleError::Backend("observer close failed".into());
+        fixture.engine.model.prepare_error = Some(primary.clone());
+        fixture.engine.model.finish_error = Some(secondary.clone());
+        assert!(
+            matches!(fixture.run(limits(), &AtomicBool::new(false)), Err(PalsError::Role(error)) if error == primary)
+        );
+        assert_eq!(fixture.engine.model.prepared.len(), 1);
+        assert_eq!(fixture.engine.model.finished.len(), 1);
+        assert!(fixture.engine.model.replies.is_empty());
+        let finished = &fixture.engine.model.finished[0];
+        assert!(!finished.prepared_accepted && !finished.attempted && !finished.accepted);
+        assert!(finished.counterline.is_empty());
+        assert_eq!(finished.disposition, RecheckDisposition::PreparedRejected);
+        assert_eq!(finished.original_role_error.as_ref(), Some(&primary));
+        assert_eq!(
+            fixture.engine.last_recheck_observer_error(),
+            Some(&secondary)
+        );
+        assert_eq!(fixture.counters.critic_calls, 0);
+        assert_eq!(fixture.counters.supported_refutations, 0);
+    }
+
+    #[test]
+    fn recheck_reply_failure_and_observer_failure_keep_original_error_and_no_publication() {
+        let mut fixture =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        let primary = RoleError::PhysicalCompletionUnknown;
+        let secondary = RoleError::Backend("observer close failed".into());
+        fixture.engine.model.reply_error = Some(primary.clone());
+        fixture.engine.model.finish_error = Some(secondary.clone());
+        fixture.engine.model.cancel_after_finish = true;
+        assert!(
+            matches!(fixture.run(limits(), &AtomicBool::new(false)), Err(PalsError::Role(error)) if error == primary)
+        );
+        assert_eq!(fixture.engine.model.finished.len(), 1);
+        let finished = &fixture.engine.model.finished[0];
+        assert!(finished.prepared_accepted && finished.attempted && !finished.accepted);
+        assert!(
+            finished.selected.is_none()
+                && finished.counterline.is_empty()
+                && finished.publication.is_none()
+        );
+        assert_eq!(finished.original_role_error, Some(primary));
+        assert_eq!(
+            fixture.engine.last_recheck_observer_error(),
+            Some(&secondary)
+        );
+        assert_eq!(fixture.counters.completed_critic_calls, 0);
+    }
+
+    #[test]
+    fn recheck_cancel_after_preparation_or_reply_still_finishes_original_controls_once() {
+        for after_reply in [false, true] {
+            let mut fixture =
+                recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+            fixture.engine.model.cancel_after_prepare = !after_reply;
+            fixture.engine.model.cancel_after_reply = after_reply;
+            let requested = limits();
+            let cancel = AtomicBool::new(false);
+            assert!(matches!(
+                fixture.run(requested, &cancel),
+                Err(PalsError::Role(RoleError::Canceled))
+            ));
+            assert_eq!(fixture.engine.model.prepared.len(), 1);
+            assert_eq!(fixture.engine.model.finished.len(), 1);
+            let finished = &fixture.engine.model.finished[0];
+            assert!(finished.prepared_accepted);
+            assert_eq!(finished.attempted, after_reply);
+            assert!(!finished.accepted);
+            assert_eq!(finished.deadline, requested.deadline);
+            assert_eq!(finished.original_role_error, Some(RoleError::Canceled));
+            assert!(finished.publication.is_none());
+        }
+    }
+
+    #[test]
+    fn recheck_successful_finish_rechecks_external_cancel_at_return_boundary() {
+        let mut fixture =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        fixture.engine.model.cancel_after_finish = true;
+        let requested = limits();
+        let cancel = AtomicBool::new(false);
+        assert!(matches!(
+            fixture.run(requested, &cancel),
+            Err(PalsError::Role(RoleError::Canceled))
+        ));
+        assert!(cancel.load(Ordering::Acquire));
+        assert_eq!(fixture.engine.model.finished.len(), 1);
+        assert!(!fixture.engine.model.finished[0].original_failed);
+        assert!(fixture.engine.model.finished[0].publication.is_some());
+        assert_eq!(
+            fixture.engine.model.finished[0].deadline,
+            requested.deadline
+        );
+        assert_eq!(fixture.engine.last_recheck_observer_error(), None);
+    }
+
+    #[test]
+    fn recheck_successful_finish_time_is_charged_to_original_deadline() {
+        let mut fixture =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        fixture.engine.model.finish_cross_deadline = true;
+        let requested = PalsLimits {
+            deadline: Instant::now() + Duration::from_millis(100),
+            ..limits()
+        };
+        assert!(matches!(
+            fixture.run(requested, &AtomicBool::new(false)),
+            Err(PalsError::Role(RoleError::Deadline))
+        ));
+        assert_eq!(fixture.engine.model.finished.len(), 1);
+        assert!(!fixture.engine.model.finished[0].original_failed);
+        assert!(fixture.engine.model.finished[0].publication.is_some());
+        assert_eq!(
+            fixture.engine.model.finished[0].deadline,
+            requested.deadline
+        );
+        assert!(Instant::now() >= requested.deadline);
+        assert_eq!(fixture.engine.last_recheck_observer_error(), None);
+    }
+
+    #[test]
+    fn recheck_finish_error_is_typed_and_reset_on_new_game_and_search() {
+        let mut fixture =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        let secondary = RoleError::Backend("observer close failed".into());
+        fixture.engine.model.finish_error = Some(secondary.clone());
+        assert!(
+            matches!(fixture.run(limits(), &AtomicBool::new(false)), Err(PalsError::Role(error)) if error == secondary)
+        );
+        assert!(!fixture.engine.model.finished[0].original_failed);
+        assert_eq!(
+            fixture.engine.last_recheck_observer_error(),
+            Some(&secondary)
+        );
+        fixture.engine.new_game();
+        assert_eq!(fixture.engine.last_recheck_observer_error(), None);
+        fixture.engine.last_recheck_observer_error = Some(secondary);
+        assert!(matches!(
+            fixture.engine.search(
+                &Position::startpos(),
+                PalsLimits {
+                    max_rounds: 0,
+                    ..limits()
+                },
+                &AtomicBool::new(false)
+            ),
+            Err(PalsError::InvalidLimits)
+        ));
+        assert_eq!(fixture.engine.last_recheck_observer_error(), None);
+    }
+
+    #[test]
+    fn recheck_actual_append_and_reuse_preserve_exact_observation_execution_and_task() {
+        let mut fixture =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        fixture.engine.nodes[fixture.leaf].evidence = None;
+        let requested = limits();
+        let cancel = AtomicBool::new(false);
+        let mut first = PalsCounters::default();
+        fixture
+            .engine
+            .verify(
+                fixture.leaf,
+                &fixture.repaired,
+                requested,
+                &cancel,
+                &mut first,
+            )
+            .unwrap();
+        let ids = fixture.engine.nodes[fixture.leaf]
+            .evidence
+            .as_ref()
+            .unwrap()
+            .provenance
+            .unwrap();
+        let snapshot = fixture.engine.nodes[fixture.leaf].position.snapshot();
+        let endpoint = PalsEngine::<RecheckRoleFixture>::recheck_endpoint(
+            &fixture.engine.nodes[fixture.leaf],
+            &fixture.engine.stores,
+            &snapshot,
+        );
+        match endpoint.evidence {
+            RecheckEndpointEvidence::OwnCpu {
+                observation_id,
+                execution_id,
+                observation,
+                task,
+                admitted_scope,
+            } => {
+                assert_eq!((observation_id, execution_id), ids);
+                assert_eq!(observation.execution, Some(execution_id));
+                assert_eq!(task.status, TaskStatus::Completed(observation_id));
+                assert_eq!(task.key.cpu_condition, observation.cpu_condition);
+                assert_eq!(task.key.state, endpoint.state);
+                assert_eq!(admitted_scope, CpuScoreScope::CompletedIteration);
+            }
+            other => panic!("actual completed store evidence missing: {other:?}"),
+        }
+        fixture.engine.nodes[fixture.leaf].evidence = None;
+        let mut reused = PalsCounters::default();
+        fixture
+            .engine
+            .verify(
+                fixture.leaf,
+                &fixture.repaired,
+                requested,
+                &cancel,
+                &mut reused,
+            )
+            .unwrap();
+        assert_eq!(
+            fixture.engine.nodes[fixture.leaf]
+                .evidence
+                .as_ref()
+                .unwrap()
+                .provenance,
+            Some(ids)
+        );
+        assert_eq!(reused.cpu_tasks_requested, 0);
+        assert_eq!(reused.reused_completed_cpu_tasks_consumed, 1);
+        fixture.engine.nodes[fixture.leaf]
+            .evidence
+            .as_mut()
+            .unwrap()
+            .depth += 1;
+        assert!(matches!(
+            PalsEngine::<RecheckRoleFixture>::recheck_endpoint(
+                &fixture.engine.nodes[fixture.leaf],
+                &fixture.engine.stores,
+                &snapshot
+            )
+            .evidence,
+            RecheckEndpointEvidence::InvalidProvenance { .. }
+        ));
+    }
+
+    #[test]
+    fn recheck_invalid_provenance_is_distinct_from_absence_and_closes_without_reply() {
+        let mut fixture =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        fixture.engine.nodes[fixture.leaf]
+            .evidence
+            .as_mut()
+            .unwrap()
+            .provenance = Some((ObservationId(usize::MAX), ExecutionId(usize::MAX)));
+        assert!(matches!(
+            fixture.run(limits(), &AtomicBool::new(false)),
+            Err(PalsError::Store(StoreError::InvalidHandle(_)))
+        ));
+        assert!(
+            fixture.engine.model.prepared.is_empty() && fixture.engine.model.replies.is_empty()
+        );
+        assert_eq!(fixture.engine.model.finished.len(), 1);
+        let finished = &fixture.engine.model.finished[0];
+        assert!(finished.repaired_invalid && !finished.repaired_observed);
+        assert!(!finished.prepared_accepted && !finished.attempted && finished.original_failed);
+        assert_eq!(finished.disposition, RecheckDisposition::PreparedRejected);
+    }
+
+    #[test]
+    fn recheck_endpoint_distinguishes_rules_terminal_and_actual_incomplete_task() {
+        let mut fixture =
+            recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        let mut terminal = Position::startpos();
+        for text in ["f2f3", "e7e5", "g2g4", "d8h4"] {
+            terminal
+                .make_move(BoardMove::from_uci(text).unwrap())
+                .unwrap();
+        }
+        let snapshot = terminal.snapshot();
+        let node = fixture.engine.intern(terminal).unwrap();
+        assert!(matches!(
+            PalsEngine::<RecheckRoleFixture>::recheck_endpoint(
+                &fixture.engine.nodes[node],
+                &fixture.engine.stores,
+                &snapshot
+            )
+            .evidence,
+            RecheckEndpointEvidence::RulesTerminal {
+                perspective: Color::White,
+                ..
+            }
+        ));
+        fixture.engine.nodes[fixture.leaf].evidence = None;
+        let mut work = PalsCounters::default();
+        fixture
+            .engine
+            .verify(
+                fixture.leaf,
+                &fixture.repaired,
+                PalsLimits {
+                    max_cpu_nodes: 1,
+                    ..limits()
+                },
+                &AtomicBool::new(false),
+                &mut work,
+            )
+            .unwrap();
+        let snapshot = fixture.engine.nodes[fixture.leaf].position.snapshot();
+        match PalsEngine::<RecheckRoleFixture>::recheck_endpoint(
+            &fixture.engine.nodes[fixture.leaf],
+            &fixture.engine.stores,
+            &snapshot,
+        )
+        .evidence
+        {
+            RecheckEndpointEvidence::OwnCpu { task, .. } => {
+                assert!(!matches!(task.status, TaskStatus::Completed(_)))
+            }
+            other => panic!("incomplete actual work lost its raw identity: {other:?}"),
+        }
+        assert_eq!(work.completed_cpu_tasks, 0);
+    }
+
+    #[test]
+    fn boxed_recheck_hooks_forward_and_default_mock_hooks_remain_noop() {
+        // Direct callback forwarding fixture, not a native/CPU execution witness.
+        let fixture = recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
+        let mut position = Position::startpos();
+        for movement in &fixture.repaired[..3] {
+            position.make_move(*movement).unwrap();
+        }
+        let anchor = fixture
+            .engine
+            .nodes
+            .iter()
+            .position(|node| node.position.position_identity() == position.position_identity())
+            .unwrap();
+        let context = fixture
+            .engine
+            .role_context(
+                anchor,
+                RoleQuestion {
+                    purpose: RoleQueryPurpose::ReplyPolicy,
+                    prefix: &fixture.repaired[..3],
+                    proposal: &fixture.repaired,
+                    refutation: Some(&fixture.refutation),
+                    divergences: &[],
+                },
+            )
+            .unwrap();
+        let root_snapshot = fixture.engine.nodes[fixture.root].position.snapshot();
+        let anchor_snapshot = fixture.engine.nodes[anchor].position.snapshot();
+        let repaired_snapshot = fixture.engine.nodes[fixture.leaf].position.snapshot();
+        let requested = limits();
+        let cancel = AtomicBool::new(false);
+        let identity = RecheckIdentity {
+            game_generation: context.game_generation,
+            search_generation: context.search_generation,
+            root: fixture.engine.nodes[fixture.root].situation,
+            root_revision: fixture
+                .engine
+                .stores
+                .situations
+                .get(fixture.engine.nodes[fixture.root].situation)
+                .unwrap()
+                .revision,
+            repair_record_revision: fixture.repair_record_revision,
+            repaired_line: fixture.repaired_line,
+        };
+        let prepared = || RecheckPrepared {
+            identity,
+            root_state: fixture.engine.nodes[fixture.root].state,
+            root_snapshot: &root_snapshot,
+            anchor_state: fixture.engine.nodes[anchor].state,
+            anchor_situation: fixture.engine.nodes[anchor].situation,
+            anchor_snapshot: &anchor_snapshot,
+            anchor_ply: 3,
+            reply_context: &context,
+            repair_record: fixture
+                .engine
+                .records
+                .iter()
+                .find(|record| record.kind == RecordKind::Repair)
+                .unwrap(),
+            repaired: &fixture.repaired,
+            refutation: &fixture.refutation,
+            repaired_endpoint: PalsEngine::<RecheckRoleFixture>::recheck_endpoint(
+                &fixture.engine.nodes[fixture.leaf],
+                &fixture.engine.stores,
+                &repaired_snapshot,
+            ),
+            limits: requested,
+            deadline_tick: fixture.engine.tick_at(requested.deadline),
+            cancel: &cancel,
+            config: &fixture.engine.config,
+            checker_identity: &fixture.engine.checker_registered_identity,
+            cpu_condition: &fixture.engine.cpu_registered_condition,
+        };
+        let finished = || RecheckFinished {
+            identity,
+            prepared_accepted: true,
+            reply_call_attempted: false,
+            reply_accepted: false,
+            reply_context: &context,
+            selected_response: None,
+            counterline: &[],
+            full_suffix_replayed: false,
+            repaired_endpoint: PalsEngine::<RecheckRoleFixture>::recheck_endpoint(
+                &fixture.engine.nodes[fixture.leaf],
+                &fixture.engine.stores,
+                &repaired_snapshot,
+            ),
+            counter_endpoint: None,
+            comparable: false,
+            publication: None,
+            disposition: RecheckDisposition::NoAlternativeResponse,
+            original_error: None,
+            limits: requested,
+            deadline_tick: fixture.engine.tick_at(requested.deadline),
+            cancel: &cancel,
+        };
+        let mut default = LegalOrderRoleMock;
+        RoleModel::recheck_prepared(&mut default, prepared()).unwrap();
+        RoleModel::recheck_finished(&mut default, finished()).unwrap();
+        let mut boxed = Box::new(RecheckRoleFixture::default());
+        RoleModel::recheck_prepared(&mut boxed, prepared()).unwrap();
+        RoleModel::recheck_finished(&mut boxed, finished()).unwrap();
+        assert_eq!(boxed.prepared.len(), 1);
+        assert_eq!(boxed.finished.len(), 1);
+        assert_eq!(boxed.prepared[0].0, boxed.finished[0].identity);
+    }
+
+    #[test]
     fn post_repair_policy_is_constructor_selected_and_legacy_disabled() {
         assert_eq!(
             engine().post_repair_recheck_policy(),
@@ -5412,6 +6498,9 @@ mod tests {
         let mut fixture = recheck_fixture(PostRepairRecheckPolicy::Disabled, true, false);
         fixture.run(limits(), &AtomicBool::new(false)).unwrap();
         assert!(fixture.engine.model.replies.is_empty());
+        assert!(
+            fixture.engine.model.prepared.is_empty() && fixture.engine.model.finished.is_empty()
+        );
         assert_eq!(fixture.counters.critic_calls, 0);
         assert_eq!(fixture.counters.supported_refutations, 0);
         let mut selected =
@@ -5497,6 +6586,13 @@ mod tests {
         assert_eq!(fixture.engine.model.replies.len(), 1);
         assert_eq!(fixture.counters.supported_refutations, 0);
         assert_eq!(fixture.counters.consumed_cached_cpu_values, 1);
+        assert_eq!(fixture.engine.model.finished.len(), 1);
+        assert_eq!(
+            fixture.engine.model.finished[0].disposition,
+            RecheckDisposition::IncompleteCounterline
+        );
+        assert!(!fixture.engine.model.finished[0].full_suffix);
+        assert!(fixture.engine.model.finished[0].publication.is_none());
         let record = fixture
             .engine
             .records
@@ -5563,6 +6659,9 @@ mod tests {
             Err(PalsError::RoleCallLimit)
         ));
         assert!(exhausted.engine.model.replies.is_empty());
+        assert_eq!(exhausted.engine.model.finished.len(), 1);
+        assert!(!exhausted.engine.model.finished[0].attempted);
+        assert!(exhausted.engine.model.finished[0].original_failed);
         let mut cpu_exhausted =
             recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
         cpu_exhausted.counters.cpu_nodes = limits().max_cpu_nodes;
@@ -5597,6 +6696,12 @@ mod tests {
         fixture.run(limits(), &AtomicBool::new(false)).unwrap();
         assert_eq!(fixture.counters.consumed_cached_cpu_values, 1);
         assert_eq!(fixture.counters.supported_refutations, 0);
+        assert_eq!(fixture.engine.model.finished.len(), 1);
+        assert_eq!(
+            fixture.engine.model.finished[0].disposition,
+            RecheckDisposition::IncomparableEvidence
+        );
+        assert!(!fixture.engine.model.finished[0].comparable);
         assert_eq!(
             fixture
                 .engine
@@ -6905,6 +8010,7 @@ mod tests {
             depth: 1,
             scope: CpuScoreScope::CompletedIteration,
             value_identity: engine.owned_identity().unwrap().clone(),
+            provenance: None,
         });
         assert_eq!(engine.value(root, 4), Some(25));
     }
