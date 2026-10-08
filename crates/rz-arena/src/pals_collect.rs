@@ -1038,6 +1038,7 @@ impl Output {
                     | "native-divergence-contexts.jsonl"
                     | "native-work-summary.jsonl"
                     | "native-recheck-traces.jsonl"
+                    | "native-search-returns.jsonl"
             ) || row.json.len() > MAX_JSON_RECORD_BYTES
             {
                 return Err(invalid("native collector artifact/record limit"));
@@ -3031,6 +3032,80 @@ mod tests {
         );
         assert_eq!(state.sequence, sequence);
         assert_eq!(state.inputs.len(), inputs);
+    }
+
+    #[test]
+    fn native_search_return_artifact_preserves_raw_bytes_and_unused_dispatch_credit() {
+        // The production output boundary, with synthetic rows only. This does
+        // not manufacture a native search result or a causal action witness.
+        let temp = OwnedTemp::new();
+        let mut output = Output::new(&temp.0, "native-search-return", 1024 * 1024).unwrap();
+        let before = output.bytes;
+        let raw =
+            br#"{"domain":"output-path-fixture","native_action_causal_bridge_observed":false}"#
+                .to_vec();
+        let reserved = raw.len() as u64 + 1 + 4096;
+        let trace = PalsNativeTrace {
+            reserved_bytes: reserved,
+            rows: vec![PalsNativeTraceRow {
+                artifact: "native-search-returns.jsonl",
+                json: raw.clone(),
+            }],
+            ..PalsNativeTrace::default()
+        };
+        output.native_trace(&trace).unwrap();
+        let mut expected = raw;
+        expected.push(b'\n');
+        assert_eq!(
+            std::fs::read(output.directory.join("native-search-returns.jsonl")).unwrap(),
+            expected
+        );
+        assert_eq!(output.bytes, before + reserved);
+        assert!(output.files.contains_key("native-search-returns.jsonl"));
+        assert!(output.failed_artifacts.is_empty());
+    }
+
+    #[test]
+    fn native_search_return_open_failure_keeps_raw_sibling_and_charged_credit() {
+        let temp = OwnedTemp::new();
+        let mut output = Output::new(&temp.0, "native-search-return-failed", 1024 * 1024).unwrap();
+        std::fs::create_dir(output.directory.join("native-search-returns.jsonl")).unwrap();
+        let before = output.bytes;
+        let raw = br#"{"scope":"synthetic-raw-sibling"}"#.to_vec();
+        let closure = br#"{"scope":"synthetic-return-output-failure"}"#.to_vec();
+        let reserved = (raw.len() + closure.len() + 2) as u64 + 4096;
+        let trace = PalsNativeTrace {
+            reserved_bytes: reserved,
+            rows: vec![
+                PalsNativeTraceRow {
+                    artifact: "native-search-returns.jsonl",
+                    json: closure,
+                },
+                PalsNativeTraceRow {
+                    artifact: "native-raw-outputs.jsonl",
+                    json: raw.clone(),
+                },
+            ],
+            failure: Some("original search primary retained".into()),
+            ..PalsNativeTrace::default()
+        };
+        assert!(output.native_trace(&trace).is_err());
+        let mut expected = raw;
+        expected.push(b'\n');
+        assert_eq!(
+            std::fs::read(output.directory.join("native-raw-outputs.jsonl")).unwrap(),
+            expected
+        );
+        assert_eq!(output.bytes, before + reserved);
+        assert!(
+            output
+                .failed_artifacts
+                .contains("native-search-returns.jsonl")
+        );
+        assert_eq!(
+            trace.failure.as_deref(),
+            Some("original search primary retained")
+        );
     }
     #[test]
     fn native_retention_failure_bounds_and_success_gate_keep_all_three_stages() {

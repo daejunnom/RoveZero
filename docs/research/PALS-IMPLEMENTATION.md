@@ -2358,3 +2358,44 @@ Rules 판정·native Reply/Repair/recheck·publication·전체 search closure와
 별도로 인수한다. source 검사·합성 caller fixture를 실제 CUDA·native action·대국의 성공으로
 기록하지 않는다. 후속 native producer는 task 선택 전부터 actual native request ID·task
 execution·최종 return/cleanup·단일 clock의 비용을 결합해야 하며 사후 digest 첨부로 대체하지 않는다.
+
+### CPU action 경계의 정확한 CI 인수와 native 반환 관측
+
+`1613c75ed64b0511ad1eb113722d43367e4959dd`의
+[CPU CI run 37758023927](https://github.com/daejunnom/RoveZero/actions/runs/37758023927)은
+Linux·Windows·모델 CPU·bindings 네 job이 모두 성공했다. 후속 Python 준비·소비를 포함한
+`f78b194220cc6bb0358bd95c16e3510f572d9317`의
+[CPU CI run 37758783207](https://github.com/daejunnom/RoveZero/actions/runs/37758783207)도
+동일한 네 job이 모두 성공했다. 총괄은 최신 run의 원문에서 모델 연구 suite 548개와
+새 Python focused 28개, 양 OS 각각 Rust 전략 경계 11개의 실제 통과를 확인했다.
+Python receipt는 합성 fixture이며 Rust의 작은 자체 CPU primitives는 CI에서 실행된다.
+네 job의 원문·byte 수·SHA와 정확한 실행 HEAD를 소스 밖에 보존한다. 이 결과를 실제
+native action·whole cost·CUDA·기력·학습의 인수로 확대하지 않는다.
+
+후속 native 관측은 실제 collector의 `engine.search` 호출 전과 반환 후를 소유한
+[`native.rs`](../../crates/rz-arena/src/pals_collect/native.rs)에 둔다. 역사적 Query/2의 CPU
+결과를 별도 full search에 붙이는 방식은 인과 연결로 인정하지 않는다. live action은 엔진이
+발급하는 실제 Proposal·C divergence site에 사전 선택을 연결하고, 해당 CPU 검사 결과를
+같은 invocation의 TaskKey·ExecutionId·ObservationId로 게시하여 Reply·Repair·recheck로
+이어야 한다. 이 실제 action API와 독립적인 두 action의 동일 조건부 fact·전체 비용 비교는
+여전히 별도 구현·인수 대상이다. 기존 utility의 masked 상태와 group 0은 유지한다.
+
+별도 `rz-pals-native-observed-search-return/1` 자료는 등록된 explicit recheck lane에서만
+검색 전 descriptor와 실제 검색 반환을 관측하는 경계다. 기존 default·V1·recheck witness의
+wire와 의미는 유지한다. 완전 Rules replay의 origin·completeness·모든 알려진 이동을
+`PositionSnapshot::uci_replay(4096)`으로 보존하며 FEN의 unknown prefix를 완전 이력으로
+승격하지 않는다. 두 행은 각각 newline 포함 64KiB, 기존 요약은 8KiB로 제한하여 총
+139,264 bytes와 세 행을 검색 전에 함께 예약한다. 남은 output에 맞추어 의미 필드·이력·
+deadline을 조용히 축소하지 않는다. 메모리 seal은 디스크 write/fsync 완료 증거가 아니다.
+
+실제 Result·counters의 존재 여부·원래 오류·마지막 cancel/deadline 상태를 보존한다.
+검색 반환 직후의 시각과 이후 owner snapshot·직렬화 시각은 동일 sink clock 안에서
+구분하며 caller 전체 wall clock을 대신하지 않는다. owner receipt의 순차 lock/Acquire
+관측은 원자적 ledger나 새 worker Stats ACK가 아니다. physical NN rows는 unknown이며
+role call 수로 환산하지 않는다. Query action 인과·whole-action cost·utility·학습 권한은
+false이고 search return은 worker join·session/buffer 해제와 별도다. 종료 행·요약·회수
+실패는 원래 search primary 뒤에 secondary로 보존하며 관측 work를 지우지 않는다.
+이 후속 변경의 compile·fixture·실제 collector 인수는 원래 f78b194의 성공과 구분한다.
+첫 WIP 단위는 output artifact 허용과 합성 persistence·sibling failure 검사이며, 실제
+검색 전 예약·반환 생산자는 별도 소스 구현·검토 중이다. 이 WIP를 생산자 완성으로 표시하지 않는다.
+사용자의 이번 GPU 검증 보류와 actual training·backward·optimizer 제외는 계속 적용한다.
