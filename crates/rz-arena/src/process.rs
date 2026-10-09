@@ -96,6 +96,32 @@ pub struct OriginalProcessObservation {
     loaded_image: Option<LoadedImageObservation>,
     #[serde(skip)]
     first_input_written_ns: Option<u64>,
+    #[serde(skip)]
+    loaded_image_progress: LoadedImageProgress,
+}
+#[derive(Debug, Default)]
+struct LoadedImageProgress {
+    attempts: u64,
+    pending: u64,
+    first_pending_code: Option<&'static str>,
+    last_pending_code: Option<&'static str>,
+}
+impl LoadedImageProgress {
+    #[cfg(target_os = "linux")]
+    fn begin_attempt(&mut self) -> Result<(), &'static str> {
+        self.attempts = self
+            .attempts
+            .checked_add(1)
+            .ok_or("process.loaded_image_attempt_overflow")?;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn record_pending(&mut self, code: &'static str) {
+        // At most one pending observation per counted attempt.
+        self.pending += 1;
+        self.first_pending_code.get_or_insert(code);
+        self.last_pending_code = Some(code);
+    }
 }
 #[derive(Debug)]
 struct LoadedImageObservation {
@@ -124,6 +150,7 @@ impl OriginalProcessObservation {
             ownership_lost: false,
             loaded_image: None,
             first_input_written_ns: None,
+            loaded_image_progress: LoadedImageProgress::default(),
         }
     }
     pub fn written_bytes(&self) -> Option<usize> {
@@ -143,6 +170,18 @@ impl OriginalProcessObservation {
     }
     pub fn original_exit_observed_ns(&self) -> Option<u64> {
         self.original_exit_observed_ns
+    }
+    pub fn loaded_image_attempts(&self) -> u64 {
+        self.loaded_image_progress.attempts
+    }
+    pub fn loaded_image_pending_observations(&self) -> u64 {
+        self.loaded_image_progress.pending
+    }
+    pub fn loaded_image_first_pending_code(&self) -> Option<&'static str> {
+        self.loaded_image_progress.first_pending_code
+    }
+    pub fn loaded_image_last_pending_code(&self) -> Option<&'static str> {
+        self.loaded_image_progress.last_pending_code
     }
 }
 
@@ -210,6 +249,9 @@ impl OriginalLoadedImage<'_> {
     }
     pub fn first_input_written_ns(&self) -> u64 {
         self.first_input_written_ns
+    }
+    pub fn observation(&self) -> &OriginalProcessObservation {
+        self.output.observation()
     }
     pub fn assurance_scope(&self) -> &'static str {
         "actual_parent_same_inode_before_original_stdin_pending_content_and_native_admission"
@@ -1028,6 +1070,7 @@ mod linux {
         let mut cleanup_started = None;
         let preserve_unverified = matches!(watch, Some(ArtifactObservation::Tree(_)));
         let mut loaded_image_checked = false;
+        let mut loaded_image_progress = LoadedImageProgress::default();
         loop {
             let now = Instant::now();
             if stop.is_none() {
@@ -1062,10 +1105,14 @@ mod linux {
                 && !loaded_image_checked
                 && let Some(window) = original
             {
-                // Child owns the unreaped PID and stdin has not received a byte.
-                // An absent, inaccessible or different loaded file refuses input;
-                // normal group drain/cleanup still owns the failed child.
-                match observe_loaded_image(program, pid, window) {
+                // Keep the same owned, unreaped child and original E while its
+                // executable observation is pending. Never write before the
+                // matching image and optional content verification both finish.
+                // No content-verification refusal is retried.
+                match loaded_image_progress
+                    .begin_attempt()
+                    .and_then(|()| observe_loaded_image(program, pid, window))
+                {
                     Ok((loaded, image)) => {
                         if let Some(o) = observation.as_deref_mut() {
                             o.loaded_image = Some(image);
@@ -1078,6 +1125,9 @@ mod linux {
                         } else {
                             loaded_image_checked = true;
                         }
+                    }
+                    Err(code) if loaded_image_observation_pending(code) => {
+                        loaded_image_progress.record_pending(code);
                     }
                     Err(code) => {
                         evidence(&mut receipt, code);
@@ -1097,6 +1147,7 @@ mod linux {
                 }
             }
             if stop.is_none()
+                && (original.is_none() || loaded_image_checked)
                 && let (Some(pipe), Some(commands)) = (stdin.as_mut(), commands)
             {
                 let end = (input_offset + 4096).min(commands.len());
@@ -1287,6 +1338,18 @@ mod linux {
             }
             std::thread::sleep(POLL);
         }
+        if original.is_some() && !loaded_image_checked {
+            evidence(
+                &mut receipt,
+                "process.loaded_image_not_confirmed_before_input",
+            );
+            if let Some(code) = loaded_image_progress.last_pending_code {
+                evidence(&mut receipt, code);
+            }
+            if stop.is_none() || stop == Some(ProcessStop::Exited) {
+                stop = Some(ProcessStop::IoFailure);
+            }
+        }
         let pending_child = finish_child(
             child,
             &mut receipt,
@@ -1315,6 +1378,7 @@ mod linux {
             o.stdout_eof = stdout_eof;
             o.stderr_eof = stderr_eof;
             o.ownership_lost = ownership_lost;
+            o.loaded_image_progress = loaded_image_progress;
         }
         Ok(ProcessOutput {
             receipt,
@@ -1413,6 +1477,13 @@ mod linux {
         retain_child.then_some(child)
     }
 
+    fn loaded_image_observation_pending(code: &str) -> bool {
+        matches!(
+            code,
+            "process.loaded_image_open" | "process.loaded_image_differs_from_pinned_file"
+        )
+    }
+
     fn observe_loaded_image(
         program: &File,
         pid: u32,
@@ -1428,11 +1499,13 @@ mod linux {
         let actual = loaded
             .metadata()
             .map_err(|_| "process.loaded_image_metadata")?;
-        if !expected.is_file()
-            || !actual.is_file()
-            || expected.dev() != actual.dev()
-            || expected.ino() != actual.ino()
-        {
+        if !expected.is_file() {
+            return Err("process.pinned_image_not_regular");
+        }
+        if !actual.is_file() {
+            return Err("process.loaded_image_not_regular");
+        }
+        if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
             return Err("process.loaded_image_differs_from_pinned_file");
         }
         let observed_ns = window
@@ -2007,6 +2080,12 @@ mod linux {
             assert_eq!(serialized["schema"], "rz-original-process-transport/1");
             assert!(serialized.get("loaded_image").is_none());
             assert!(serialized.get("first_input_written_ns").is_none());
+            assert!(serialized.get("loaded_image_progress").is_none());
+            assert!(image.observation().loaded_image_attempts() > 0);
+            assert!(
+                image.observation().loaded_image_pending_observations()
+                    < image.observation().loaded_image_attempts()
+            );
             let original_write = output.observation.first_input_written_ns.take();
             assert!(output.checked_loaded_image().is_err());
             output.observation.first_input_written_ns = original_write;
@@ -2094,6 +2173,50 @@ mod linux {
             assert_eq!(
                 observe_loaded_image(&other, std::process::id(), window).unwrap_err(),
                 "process.loaded_image_differs_from_pinned_file"
+            );
+        }
+
+        #[test]
+        fn loaded_image_pending_does_not_retry_content_or_metadata_failures() {
+            assert!(loaded_image_observation_pending(
+                "process.loaded_image_open"
+            ));
+            assert!(loaded_image_observation_pending(
+                "process.loaded_image_differs_from_pinned_file"
+            ));
+            for code in [
+                "process.loaded_image_verification_refused",
+                "process.pinned_image_metadata",
+                "process.loaded_image_metadata",
+                "process.pinned_image_not_regular",
+                "process.loaded_image_not_regular",
+                "process.loaded_image_clock_unavailable",
+                "process.loaded_image_attempt_overflow",
+            ] {
+                assert!(!loaded_image_observation_pending(code));
+            }
+            let mut progress = LoadedImageProgress::default();
+            for code in [
+                "process.loaded_image_open",
+                "process.loaded_image_differs_from_pinned_file",
+            ] {
+                progress.begin_attempt().unwrap();
+                progress.record_pending(code);
+            }
+            progress.begin_attempt().unwrap();
+            assert_eq!((progress.attempts, progress.pending), (3, 2));
+            assert_eq!(
+                progress.first_pending_code,
+                Some("process.loaded_image_open")
+            );
+            assert_eq!(
+                progress.last_pending_code,
+                Some("process.loaded_image_differs_from_pinned_file")
+            );
+            progress.attempts = u64::MAX;
+            assert_eq!(
+                progress.begin_attempt(),
+                Err("process.loaded_image_attempt_overflow")
             );
         }
 

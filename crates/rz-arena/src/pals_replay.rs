@@ -723,6 +723,11 @@ mod linux {
                     .unwrap()
                 };
                 assert_eq!(program.stream_position().unwrap(), 7);
+                assert!(output.observation().loaded_image_attempts() > 0);
+                assert!(
+                    output.observation().loaded_image_pending_observations()
+                        < output.observation().loaded_image_attempts()
+                );
                 assert_eq!(
                     credit.remaining, 0,
                     "{output:?}; observed={observed:?}; refusal={refusal:?}"
