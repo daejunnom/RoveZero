@@ -23,6 +23,8 @@
 //! 수락된 GPU Repair/C tail, live token의 실제 scheduler resume가 연결되지
 //! 않으면 두 profile 모두 인수 실패다. pause를 만들려고 NN/CPU 출력을 바꾸지 않는다.
 
+#![recursion_limit = "256"]
+
 #[cfg(not(all(feature = "onnx-cuda", feature = "experimental-io-binding")))]
 fn main() -> std::process::ExitCode {
     eprintln!("pals_cuda_warm_check requires onnx-cuda and experimental-io-binding");
@@ -1289,6 +1291,17 @@ mod check {
             if capture.rechecks.len() >= MAX_RECHECK_EVENTS {
                 return Err(RoleError::Unavailable);
             }
+            let identity = format!("{:?}", event.identity);
+            let reply_context = logical(event.reply_context);
+            let prepared_lines = capture.rechecks.iter().rev().find_map(|prepared| {
+                (prepared["event"] == "prepared"
+                    && prepared["identity"] == identity
+                    && prepared["reply_context"] == reply_context
+                    && prepared["original_deadline_tick"] == event.deadline_tick)
+                    .then(|| (prepared["repaired"].clone(), prepared["refutation"].clone()))
+            });
+            let prepared_observation_matched = prepared_lines.is_some();
+            let (repaired, refutation) = prepared_lines.unwrap_or((Value::Null, Value::Null));
             let tail_requests: Vec<_> = capture
                 .calls
                 .iter()
@@ -1309,7 +1322,8 @@ mod check {
                 event.policy,
                 PostRepairRecheckPolicy::ActualOpponentContinuationV1
                     | PostRepairRecheckPolicy::IterativeFrozenModelWdlV2
-            ) && event.prepared_accepted
+            ) && prepared_observation_matched
+                && event.prepared_accepted
                 && event.reply_call_attempted
                 && event.reply_accepted
                 && event.counterline_completed
@@ -1318,14 +1332,14 @@ mod check {
                 && !tail_requests.is_empty();
             capture.recheck_completed |= completed;
             capture.rechecks.push(json!({"event": "finished", "policy": format!("{:?}", event.policy),
-                "identity": format!("{:?}", event.identity), "prepared_accepted": event.prepared_accepted,
+                "identity": identity, "prepared_accepted": event.prepared_accepted,
                 "reply_call_attempted": event.reply_call_attempted, "reply_accepted": event.reply_accepted,
                 "selected_response": event.selected_response.map(|v| v.to_string()), "counterline": moves(event.counterline),
                 "counterline_completed": event.counterline_completed, "full_suffix_replayed": event.full_suffix_replayed,
                 "comparable": event.comparable, "publication_observed": event.publication.is_some(),
                 "disposition": format!("{:?}", event.disposition), "original_error": event.original_error.map(|v| format!("{v:?}")),
-                "reply_context": logical(event.reply_context), "original_deadline_tick": event.deadline_tick,
-                "repaired": moves(event.repaired), "refutation": moves(event.refutation),
+                "reply_context": reply_context, "original_deadline_tick": event.deadline_tick,
+                "repaired": repaired, "refutation": refutation, "prepared_observation_matched": prepared_observation_matched,
                 "actual_new_prefix_c_tail_request_ids": tail_requests,
                 "actual_search_continuation_completed": completed}));
             Ok(())
@@ -1920,12 +1934,12 @@ mod check {
                 },
                 cancel,
             );
-            observe_scheduler_resume_links(
-                &mut capture
+            {
+                let mut trace = capture
                     .lock()
-                    .map_err(|_| fail("cpu_trace", "capture_unavailable"))?,
-                engine.stores(),
-            )?;
+                    .map_err(|_| fail("cpu_trace", "capture_unavailable"))?;
+                observe_scheduler_resume_links(&mut trace, engine.stores())?;
+            }
             let counters = engine
                 .last_search_counters()
                 .ok_or(fail("search", "actual_counters_missing"))?;
@@ -1951,10 +1965,11 @@ mod check {
             // Do not forge a Repair or select an alternative by modifying NN
             // logits. Its absence is an explicit unmet exercise gate.
             let resume = if continuation && counters.accepted_repair_outputs > 0 {
+                let mut owner = native
+                    .lock()
+                    .map_err(|_| fail("resume", "owner_unavailable"))?;
                 replay(
-                    &mut native
-                        .lock()
-                        .map_err(|_| fail("resume", "owner_unavailable"))?,
+                    &mut owner,
                     &handle,
                     capture,
                     &forwards,
