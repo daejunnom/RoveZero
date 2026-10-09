@@ -62,7 +62,7 @@ impl OriginalProcessWindow {
     }
     #[cfg(target_os = "linux")]
     fn elapsed_ns(self, at: Instant) -> Option<u64> {
-        u64::try_from(at.saturating_duration_since(self.started).as_nanos()).ok()
+        u64::try_from(at.checked_duration_since(self.started)?.as_nanos()).ok()
     }
 }
 
@@ -135,6 +135,39 @@ impl OriginalProcessObservation {
 pub struct OriginalProcessOutput {
     process: ProcessOutput,
     observation: OriginalProcessObservation,
+    window: OriginalProcessWindow,
+}
+
+/// Actual supervisor timestamps borrowed from its private output owner. These
+/// describe transport, not model execution, loaded-image admission or Query order.
+/// The launch timestamp precedes Command::spawn; it is not a child-ready event.
+#[derive(Debug)]
+pub struct OriginalProcessTiming<'a> {
+    output: &'a OriginalProcessOutput,
+    stamps: [u64; 4],
+}
+impl OriginalProcessTiming<'_> {
+    pub fn original_started(&self) -> Instant {
+        self.output.window.started
+    }
+    pub fn execution_deadline(&self) -> Instant {
+        self.output.window.execution
+    }
+    pub fn whole_deadline(&self) -> Instant {
+        self.output.window.whole
+    }
+    pub fn supervisor_entry_ns(&self) -> u64 {
+        self.stamps[0]
+    }
+    pub fn launch_started_ns(&self) -> u64 {
+        self.stamps[1]
+    }
+    pub fn exit_observed_ns(&self) -> u64 {
+        self.stamps[2]
+    }
+    pub fn supervisor_finished_ns(&self) -> u64 {
+        self.stamps[3]
+    }
 }
 impl OriginalProcessOutput {
     pub fn process(&self) -> &ProcessOutput {
@@ -142,6 +175,49 @@ impl OriginalProcessOutput {
     }
     pub fn observation(&self) -> &OriginalProcessObservation {
         &self.observation
+    }
+    /// Requires real pipe/group/reap closure and ordered timestamps on the exact
+    /// original process clock. A JSON observation cannot construct this borrow.
+    pub fn checked_timing(&self) -> Result<OriginalProcessTiming<'_>, ArenaError> {
+        if !self.transport_complete() {
+            return Err(ArenaError::Invalid(
+                "original process closure/timing unavailable".into(),
+            ));
+        }
+        let stamps = self
+            .ordered_stamps()
+            .ok_or_else(|| ArenaError::Invalid("original process timing order".into()))?;
+        Ok(OriginalProcessTiming {
+            output: self,
+            stamps,
+        })
+    }
+    fn ordered_stamps(&self) -> Option<[u64; 4]> {
+        let o = &self.observation;
+        let stamps = [
+            o.original_supervisor_entry_ns?,
+            o.original_spawn_ns?,
+            o.original_exit_observed_ns?,
+            o.original_finished_ns?,
+        ];
+        let execution = u64::try_from(
+            self.window
+                .execution
+                .checked_duration_since(self.window.started)?
+                .as_nanos(),
+        )
+        .ok()?;
+        let whole = u64::try_from(
+            self.window
+                .whole
+                .checked_duration_since(self.window.started)?
+                .as_nanos(),
+        )
+        .ok()?;
+        (stamps.windows(2).all(|pair| pair[0] <= pair[1])
+            && stamps[2] < execution
+            && stamps[3] < whole)
+            .then_some(stamps)
     }
     pub fn transport_complete(&self) -> bool {
         let o = &self.observation;
@@ -156,6 +232,7 @@ impl OriginalProcessOutput {
             && o.original_spawn_ns.is_some()
             && o.original_exit_observed_ns.is_some()
             && o.original_finished_ns.is_some()
+            && self.ordered_stamps().is_some()
             && !o.cancelled_at_return
             && !o.ownership_lost
             && r.stop == ProcessStop::Exited
@@ -649,6 +726,7 @@ pub fn supervise_input_in_original_window(
         Ok(OriginalProcessOutput {
             process,
             observation,
+            window: input.window,
         })
     }
     #[cfg(not(target_os = "linux"))]
@@ -1712,6 +1790,24 @@ mod linux {
             assert!(output.transport_complete(), "{output:?}");
             assert!(output.observation().exit_observed_before_execution());
             assert!(output.observation().original_exit_observed_ns().is_some());
+            let timing = output.checked_timing().unwrap();
+            assert_eq!(timing.original_started(), started);
+            assert_eq!(timing.execution_deadline(), window.execution);
+            assert_eq!(timing.whole_deadline(), window.whole);
+            assert!(timing.supervisor_entry_ns() <= timing.launch_started_ns());
+            assert!(timing.launch_started_ns() <= timing.exit_observed_ns());
+            assert!(timing.exit_observed_ns() <= timing.supervisor_finished_ns());
+            let old_spawn = output.observation.original_spawn_ns;
+            output.observation.original_spawn_ns =
+                Some(output.observation.original_exit_observed_ns.unwrap() + 1);
+            assert!(!output.transport_complete());
+            assert!(output.checked_timing().is_err());
+            output.observation.original_spawn_ns = old_spawn;
+            let old_finish = output.observation.original_finished_ns;
+            output.observation.original_finished_ns = Some(5_500_000_000);
+            assert!(!output.transport_complete());
+            assert!(output.checked_timing().is_err());
+            output.observation.original_finished_ns = old_finish;
             output.observation.exit_observed_before_execution = false;
             assert!(!output.transport_complete());
             output.observation.exit_observed_before_execution = true;

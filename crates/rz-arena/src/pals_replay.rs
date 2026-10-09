@@ -13,10 +13,11 @@ use rz_uci::pals_cpu_task::strategic_action::replay_launch_preparation::{
 };
 use std::fs::File;
 use std::sync::atomic::AtomicBool;
-#[cfg(target_os = "linux")]
 use std::time::Instant;
 
+mod chronology;
 mod delivery;
+pub use chronology::{CheckedRepairReplayObservation, ReplayCallerTiming};
 pub use delivery::{
     BoundRepairReplayDelivery, BoundReplayDelivery, RepairReplayDeliveryRegistration,
     ReplayDeliveryRegistration,
@@ -65,6 +66,7 @@ pub struct OwnedReplayCapture {
     bundle: PreparedReplayLaunchBundle,
     process: OriginalProcessOutput,
     postflight_error: Option<ArenaError>,
+    caller_finished: Instant,
     finished_before_original_whole: bool,
     cancelled_at_return: bool,
 }
@@ -162,12 +164,14 @@ pub fn supervise_prepared_observed_replay(
     {
         match linux::capture(&bundle, program, directory, policy, cancel) {
             Ok((process, postflight_error)) => {
-                let finished_before_original_whole = Instant::now() < bundle.deadline();
+                let caller_finished = Instant::now();
+                let finished_before_original_whole = caller_finished < bundle.deadline();
                 let cancelled_at_return = cancel.load(std::sync::atomic::Ordering::Acquire);
                 Ok(OwnedReplayCapture {
                     bundle,
                     process,
                     postflight_error,
+                    caller_finished,
                     finished_before_original_whole,
                     cancelled_at_return,
                 })
