@@ -2,7 +2,10 @@
 //! report does not become an admitted native witness, Query or utility target.
 
 use super::chronology::elapsed;
-use super::{CheckedRepairReplayObservation, OwnedReplayCapture, RepairReplayDeliveryRegistration};
+use super::{
+    CheckedRepairReplayObservation, CheckedReplayLoadedBinary, OwnedReplayCapture,
+    RepairReplayDeliveryRegistration,
+};
 use crate::ArenaError;
 use crate::process::OriginalLoadedImage;
 use rz_uci::pals_cpu_task::strategic_action::replay_inputs::{
@@ -19,7 +22,7 @@ pub struct ReportedRepairPriorMaterial<'capture> {
     observation: CheckedRepairReplayObservation<'capture>,
     original: &'capture PreparedReplayRequest,
     raw_native: &'capture [u8],
-    loaded_image: OriginalLoadedImage<'capture>,
+    loaded_binary: CheckedReplayLoadedBinary<'capture>,
     caller_started_ns: u64,
     before_next_query_at: Instant,
     elapsed_before_next_query_ns: u64,
@@ -43,7 +46,12 @@ impl ReportedRepairPriorMaterial<'_> {
     /// Same-inode parent observation before stdin, not content/source or native
     /// witness admission. Its owner is the same actual process capture.
     pub fn loaded_image(&self) -> &OriginalLoadedImage<'_> {
-        &self.loaded_image
+        self.loaded_binary.loaded_image()
+    }
+    /// Actual loaded FD content matched to the same capture's registered binary
+    /// artifact. Native work, dependencies and next-Query admission remain separate.
+    pub fn loaded_binary(&self) -> &CheckedReplayLoadedBinary<'_> {
+        &self.loaded_binary
     }
     pub fn caller_started_ns(&self) -> u64 {
         self.caller_started_ns
@@ -66,7 +74,7 @@ impl ReportedRepairPriorMaterial<'_> {
 }
 
 impl OwnedReplayCapture {
-    /// Source registration, actual loaded-file identity, raw binding, original
+    /// Source registration, actual loaded-binary content, raw binding, original
     /// Rules and process timing checks happen before the single issue. Refusal
     /// leaves input/raw bytes and process custody intact. Issued material is never
     /// replenished by drop, changed registration or resetting cancellation.
@@ -78,7 +86,7 @@ impl OwnedReplayCapture {
         let reservation = self
             .prior_material_issue
             .reserve(self.bundle().deadline(), cancel)?;
-        let loaded_image = self.process().checked_loaded_image()?;
+        let loaded_binary = self.checked_loaded_binary()?;
         let delivery = self.bind_repair_delivery(registration, cancel)?;
         let observation = delivery.check_reported_rules_with_timing(cancel)?;
         let mut originals = self
@@ -119,7 +127,7 @@ impl OwnedReplayCapture {
             observation,
             original,
             raw_native: delivery.raw_native_bytes(),
-            loaded_image,
+            loaded_binary,
             caller_started_ns,
             before_next_query_at,
             elapsed_before_next_query_ns,

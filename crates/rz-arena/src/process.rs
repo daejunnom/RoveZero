@@ -17,6 +17,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 type StdoutObserver<'a> = &'a mut dyn FnMut(&[u8]);
+type LoadedImageVerifier<'a> = &'a mut dyn FnMut(&File) -> Result<(), ()>;
 
 pub const MAX_ORIGINAL_INPUT_BYTES: usize = 2 * 1024 * 1024;
 
@@ -754,6 +755,47 @@ pub fn supervise_input_in_original_window(
     watch: &OwnedArtifactTreeWatch,
     input: OriginalProcessInput<'_>,
 ) -> Result<OriginalProcessOutput, ArenaError> {
+    supervise_original_input(program, args, directory, limits, cancel, watch, input, None)
+}
+
+/// Only internal callers may add content checks on the actual proc executable.
+/// Failure is captured after spawn and follows the existing child custody path.
+/// A callback returning Ok is not exposed as a generic content-admission token.
+#[cfg(all(target_os = "linux", any(feature = "pals-collection-onnx", test)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_verified_input_in_original_window(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    input: OriginalProcessInput<'_>,
+    verify_loaded: LoadedImageVerifier<'_>,
+) -> Result<OriginalProcessOutput, ArenaError> {
+    supervise_original_input(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        watch,
+        input,
+        Some(verify_loaded),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn supervise_original_input(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    input: OriginalProcessInput<'_>,
+    verify_loaded: Option<LoadedImageVerifier<'_>>,
+) -> Result<OriginalProcessOutput, ArenaError> {
     input.window.check_before_spawn(limits)?;
     watch.validate()?;
     if input.bytes.is_empty() || input.bytes.len() > MAX_ORIGINAL_INPUT_BYTES {
@@ -789,6 +831,7 @@ pub fn supervise_input_in_original_window(
                 commands: Some(input.bytes),
                 original: Some(input.window),
                 observation: Some(&mut observation),
+                verify_loaded,
             },
         )?;
         let returned = Instant::now();
@@ -804,7 +847,7 @@ pub fn supervise_input_in_original_window(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (program, args, directory, cancel);
+        let _ = (program, args, directory, cancel, verify_loaded);
         Err(ArenaError::Invalid(
             "original input supervision currently requires Linux".into(),
         ))
@@ -832,10 +875,11 @@ mod linux {
     const POLL: Duration = Duration::from_millis(5);
 
     #[derive(Default)]
-    pub(super) struct InvocationIo<'a, 'b> {
+    pub(super) struct InvocationIo<'a, 'b, 'v> {
         pub commands: Option<&'a [u8]>,
         pub original: Option<OriginalProcessWindow>,
         pub observation: Option<&'b mut OriginalProcessObservation>,
+        pub verify_loaded: Option<LoadedImageVerifier<'v>>,
     }
 
     #[derive(Clone, Copy)]
@@ -872,12 +916,13 @@ mod linux {
         cancel: Option<&AtomicBool>,
         watch: Option<ArtifactObservation<'_>>,
         mut stdout_observer: Option<StdoutObserver<'_>>,
-        io: InvocationIo<'_, '_>,
+        io: InvocationIo<'_, '_, '_>,
     ) -> Result<ProcessOutput, ArenaError> {
         let InvocationIo {
             commands,
             original,
             mut observation,
+            mut verify_loaded,
         } = io;
         if let Some(window) = original {
             window.check_before_spawn(limits)?;
@@ -1021,10 +1066,17 @@ mod linux {
                 // An absent, inaccessible or different loaded file refuses input;
                 // normal group drain/cleanup still owns the failed child.
                 match observe_loaded_image(program, pid, window) {
-                    Ok(image) => {
-                        loaded_image_checked = true;
+                    Ok((loaded, image)) => {
                         if let Some(o) = observation.as_deref_mut() {
                             o.loaded_image = Some(image);
+                        }
+                        if let Some(verifier) = verify_loaded.as_mut()
+                            && verifier(&loaded).is_err()
+                        {
+                            evidence(&mut receipt, "process.loaded_image_verification_refused");
+                            stop = Some(ProcessStop::IoFailure);
+                        } else {
+                            loaded_image_checked = true;
                         }
                     }
                     Err(code) => {
@@ -1365,7 +1417,7 @@ mod linux {
         program: &File,
         pid: u32,
         window: OriginalProcessWindow,
-    ) -> Result<LoadedImageObservation, &'static str> {
+    ) -> Result<(File, LoadedImageObservation), &'static str> {
         let expected = program
             .metadata()
             .map_err(|_| "process.pinned_image_metadata")?;
@@ -1386,12 +1438,15 @@ mod linux {
         let observed_ns = window
             .elapsed_ns(Instant::now())
             .ok_or("process.loaded_image_clock_unavailable")?;
-        Ok(LoadedImageObservation {
-            pid,
-            device: actual.dev(),
-            inode: actual.ino(),
-            observed_ns,
-        })
+        Ok((
+            loaded,
+            LoadedImageObservation {
+                pid,
+                device: actual.dev(),
+                inode: actual.ino(),
+                observed_ns,
+            },
+        ))
     }
 
     fn native_elf(program: &File) -> Result<(), ArenaError> {
@@ -2033,7 +2088,7 @@ mod linux {
             // A real proc executable is compared, without a caller-supplied
             // path, forged serialized report or a fabricated success owner.
             let actual = File::open("/proc/self/exe").unwrap();
-            let image = observe_loaded_image(&actual, std::process::id(), window).unwrap();
+            let (_, image) = observe_loaded_image(&actual, std::process::id(), window).unwrap();
             assert_eq!(image.inode, actual.metadata().unwrap().ino());
             let other = File::open("/bin/cat").unwrap();
             assert_eq!(
@@ -2076,6 +2131,72 @@ mod linux {
             assert!(output.observation.written_bytes.unwrap() < input.len());
             assert!(!output.transport_complete());
             assert!(output.process().pending_child.is_none(), "{output:?}");
+        }
+
+        #[test]
+        fn original_loaded_image_verifier_rechecks_cancel_and_execution_before_input() {
+            let directory = OriginalTestDirectory::new();
+            let program = File::open("/bin/cat").unwrap();
+            for cancel_in_verifier in [true, false] {
+                let cancel = AtomicBool::new(false);
+                let started = Instant::now();
+                let execution = started + Duration::from_secs(1);
+                let window = OriginalProcessWindow::new(
+                    started,
+                    execution,
+                    started + Duration::from_millis(1500),
+                )
+                .unwrap();
+                let mut calls = 0;
+                let output = {
+                    let mut verifier = |_: &File| {
+                        calls += 1;
+                        if cancel_in_verifier {
+                            cancel.store(true, Ordering::Release);
+                        } else {
+                            // A real successful callback can finish after original
+                            // E. It cannot renew E or authorize sending any input.
+                            std::thread::sleep(
+                                execution.saturating_duration_since(Instant::now())
+                                    + Duration::from_millis(10),
+                            );
+                        }
+                        Ok(())
+                    };
+                    supervise_verified_input_in_original_window(
+                        &program,
+                        &[],
+                        &directory.file(),
+                        ProcessLimits {
+                            wall_ms: 1000,
+                            ..original_limits()
+                        },
+                        Some(&cancel),
+                        &original_watch(),
+                        OriginalProcessInput {
+                            bytes: b"must-not-be-sent",
+                            window,
+                        },
+                        &mut verifier,
+                    )
+                    .unwrap()
+                };
+                assert_eq!(calls, 1);
+                assert_eq!(output.observation().written_bytes(), Some(0));
+                assert!(output.process().stdout.is_empty());
+                assert!(!output.transport_complete());
+                assert!(output.checked_loaded_image().is_err());
+                assert_eq!(
+                    output.process().receipt.stop,
+                    if cancel_in_verifier {
+                        ProcessStop::Cancelled
+                    } else {
+                        ProcessStop::WallLimit
+                    }
+                );
+                assert_eq!(output.process().receipt.group_cleanup, CleanupStatus::Gone);
+                assert!(output.process().pending_child.is_none(), "{output:?}");
+            }
         }
 
         #[test]

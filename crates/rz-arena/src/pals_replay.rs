@@ -1,4 +1,4 @@
-//! Caller-owned observed frozen replay launch. Transport closure never admits a
+//! Caller-owned observed frozen replay launch. Transport closure alone never admits a
 //! native result, checked Query, utility group or original model/source fact.
 //! The prepared byte owner and pending child are retained for caller recovery.
 
@@ -15,9 +15,11 @@ use std::fs::File;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+mod binary;
 mod chronology;
 mod delivery;
 mod query_material;
+pub use binary::CheckedReplayLoadedBinary;
 pub use chronology::{CheckedRepairReplayObservation, ReplayCallerTiming};
 pub use delivery::{
     BoundRepairReplayDelivery, BoundReplayDelivery, RepairReplayDeliveryRegistration,
@@ -68,6 +70,8 @@ pub struct OwnedReplayCapture {
     bundle: PreparedReplayLaunchBundle,
     process: OriginalProcessOutput,
     postflight_error: Option<ArenaError>,
+    loaded_binary: Option<binary::LoadedReplayBinaryObservation>,
+    loaded_binary_error: Option<ArenaError>,
     caller_started: Instant,
     caller_finished: Instant,
     prior_material_issue: query_material::MaterialIssueGate,
@@ -83,6 +87,10 @@ impl OwnedReplayCapture {
     }
     pub fn postflight_error(&self) -> Option<&ArenaError> {
         self.postflight_error.as_ref()
+    }
+    /// Original content-check refusal after spawn, separate from JSON postflight.
+    pub fn loaded_binary_error(&self) -> Option<&ArenaError> {
+        self.loaded_binary_error.as_ref()
     }
     pub fn transport_complete(&self) -> bool {
         self.process.transport_complete()
@@ -152,6 +160,27 @@ fn check_resource_policy(
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn check_verification_credit(
+    binary_bytes: u64,
+    publication_bytes: u64,
+    declared_reads: u64,
+) -> Result<(), ArenaError> {
+    // Binary preflight + actual loaded executable; publication pre/postflight.
+    // No quiet read-credit increase or a new budget after the child is started.
+    let required = binary_bytes
+        .checked_add(publication_bytes)
+        .and_then(|bytes| bytes.checked_mul(2))
+        .ok_or_else(|| ArenaError::Budget("replay verification extent overflow".into()))?;
+    if declared_reads < required {
+        Err(ArenaError::Budget(
+            "replay declared read credit cannot cover binary/load and publication passes".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// The already-open ELF and cwd are caller-owned independent handles. This
 /// rechecks prepared /3 bytes, descriptor pins and original deadlines, then uses
 /// the existing Linux group/pipe/reap owner. It never substitutes an engine or
@@ -168,14 +197,16 @@ pub fn supervise_prepared_observed_replay(
     {
         let caller_started = Instant::now();
         match linux::capture(&bundle, program, directory, policy, cancel) {
-            Ok((process, postflight_error)) => {
+            Ok(captured) => {
                 let caller_finished = Instant::now();
                 let finished_before_original_whole = caller_finished < bundle.deadline();
                 let cancelled_at_return = cancel.load(std::sync::atomic::Ordering::Acquire);
                 Ok(OwnedReplayCapture {
                     bundle,
-                    process,
-                    postflight_error,
+                    process: captured.process,
+                    postflight_error: captured.postflight_error,
+                    loaded_binary: captured.loaded_binary,
+                    loaded_binary_error: captured.loaded_binary_error,
                     caller_started,
                     caller_finished,
                     prior_material_issue: query_material::MaterialIssueGate::default(),
@@ -199,10 +230,8 @@ pub fn supervise_prepared_observed_replay(
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use crate::{
-        OriginalProcessInput, OriginalProcessWindow, OwnedArtifactTreeWatch,
-        supervise_input_in_original_window,
-    };
+    use crate::process::supervise_verified_input_in_original_window;
+    use crate::{OriginalProcessInput, OriginalProcessWindow, OwnedArtifactTreeWatch};
     use nix::fcntl::{OFlag, open, openat};
     use nix::sys::stat::Mode;
     use rz_uci::pals_cpu_task::strategic_action::ArtifactPin;
@@ -321,6 +350,30 @@ mod linux {
         Ok(())
     }
 
+    fn verify_loaded_binary<F: FnMut() -> Result<(), ArenaError>>(
+        loaded: &File,
+        pin: &ArtifactPin,
+        maximum: u64,
+        credit: &mut ReadCredit,
+        original_started: Instant,
+        mut check: F,
+    ) -> Result<binary::LoadedReplayBinaryObservation, ArenaError> {
+        let started_ns = chronology::elapsed(original_started, Instant::now())?;
+        verify_file(loaded, pin, maximum, credit, &mut check)?;
+        let metadata = loaded
+            .metadata()
+            .map_err(|_| ArenaError::Io("replay loaded binary metadata".into()))?;
+        let finished_ns = chronology::elapsed(original_started, Instant::now())?;
+        check()?;
+        Ok(binary::LoadedReplayBinaryObservation {
+            artifact: pin.clone(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            started_ns,
+            finished_ns,
+        })
+    }
+
     fn verify_publication(
         bundle: &PreparedReplayLaunchBundle,
         directory: &File,
@@ -374,13 +427,20 @@ mod linux {
         )
     }
 
+    pub(super) struct CapturedProcess {
+        pub process: OriginalProcessOutput,
+        pub postflight_error: Option<ArenaError>,
+        pub loaded_binary: Option<binary::LoadedReplayBinaryObservation>,
+        pub loaded_binary_error: Option<ArenaError>,
+    }
+
     pub(super) fn capture(
         bundle: &PreparedReplayLaunchBundle,
         program: &File,
         directory: &File,
         policy: ReplayCallerPolicy,
         cancel: &AtomicBool,
-    ) -> Result<(OriginalProcessOutput, Option<ArenaError>), ArenaError> {
+    ) -> Result<CapturedProcess, ArenaError> {
         check_clock(bundle, cancel, false)?;
         let manifest = bundle.manifest();
         if manifest.schema != OBSERVED_PREPARATION_MANIFEST_SCHEMA
@@ -446,13 +506,27 @@ mod linux {
         let mut credit = ReadCredit {
             remaining: policy.verification_read_bytes,
         };
+        let binary_pin = &expected
+            .expectations
+            .replay_expected
+            .registered_artifacts
+            .replay_binary;
+        let publication_bytes = bundle.payloads().iter().try_fold(
+            bundle.manifest_artifact().bytes,
+            |total, payload| {
+                total
+                    .checked_add(payload.artifact().bytes)
+                    .ok_or_else(|| ArenaError::Budget("replay publication extent overflow".into()))
+            },
+        )?;
+        check_verification_credit(
+            binary_pin.bytes,
+            publication_bytes,
+            policy.verification_read_bytes,
+        )?;
         verify_file(
             program,
-            &expected
-                .expectations
-                .replay_expected
-                .registered_artifacts
-                .replay_binary,
+            binary_pin,
             policy.maximum_binary_bytes,
             &mut credit,
             || check_clock(bundle, cancel, false),
@@ -480,29 +554,211 @@ mod linux {
             max_files: 8,
             max_depth: 0,
         };
-        let process = supervise_input_in_original_window(
-            program,
-            &args,
-            directory,
-            policy.process,
-            Some(cancel),
-            &watch,
-            OriginalProcessInput {
-                bytes: request.as_bytes(),
-                window,
-            },
-        )?;
+        let mut loaded_binary = None;
+        let mut loaded_binary_error = None;
+        let process = {
+            let mut verify_loaded = |loaded: &File| {
+                let verified = verify_loaded_binary(
+                    loaded,
+                    binary_pin,
+                    policy.maximum_binary_bytes,
+                    &mut credit,
+                    bundle.original_started(),
+                    || check_clock(bundle, cancel, false),
+                );
+                match verified {
+                    Ok(observation) => {
+                        loaded_binary = Some(observation);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        loaded_binary_error = Some(error);
+                        Err(())
+                    }
+                }
+            };
+            supervise_verified_input_in_original_window(
+                program,
+                &args,
+                directory,
+                policy.process,
+                Some(cancel),
+                &watch,
+                OriginalProcessInput {
+                    bytes: request.as_bytes(),
+                    window,
+                },
+                &mut verify_loaded,
+            )?
+        };
         // This finite readback also belongs to W. Never return a new Err after
         // spawn that would discard pending-child custody or captured output.
         let postflight_error =
             verify_publication(bundle, directory, &mut credit, cancel, true).err();
-        Ok((process, postflight_error))
+        Ok(CapturedProcess {
+            process,
+            postflight_error,
+            loaded_binary,
+            loaded_binary_error,
+        })
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::io::{Seek, SeekFrom, Write};
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        struct LoadedBinaryTestDirectory(std::path::PathBuf);
+        impl LoadedBinaryTestDirectory {
+            fn new() -> Self {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let path = std::env::temp_dir().join(format!(
+                    "rz-loaded-binary-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                std::fs::create_dir(&path).unwrap();
+                Self(path)
+            }
+        }
+        impl Drop for LoadedBinaryTestDirectory {
+            fn drop(&mut self) {
+                // This test's cat creates no files. Never recurse on cleanup.
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+
+        #[test]
+        fn replay_loaded_binary_gate_checks_actual_child_bytes_and_retains_refusal() {
+            let directory = LoadedBinaryTestDirectory::new();
+            let directory_file = File::open(&directory.0).unwrap();
+            let mut program = File::open("/bin/cat").unwrap();
+            let mut reference = Vec::new();
+            File::open("/bin/cat")
+                .unwrap()
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut reference)
+                .unwrap();
+            assert!(reference.len() <= 1024 * 1024);
+            let pin = ArtifactPin {
+                bytes: reference.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(&reference)),
+            };
+            drop(reference);
+            program.seek(SeekFrom::Start(7)).unwrap();
+            for refuse in [false, true] {
+                let expected = ArtifactPin {
+                    sha256: if refuse {
+                        "0".repeat(64)
+                    } else {
+                        pin.sha256.clone()
+                    },
+                    bytes: pin.bytes,
+                };
+                let started = Instant::now();
+                let execution = started + std::time::Duration::from_secs(5);
+                let window = OriginalProcessWindow::new(
+                    started,
+                    execution,
+                    started + std::time::Duration::from_millis(5500),
+                )
+                .unwrap();
+                let mut credit = ReadCredit {
+                    remaining: pin.bytes,
+                };
+                let mut observed = None;
+                let mut refusal = None;
+                let output = {
+                    let mut verifier = |mut loaded: &File| {
+                        assert_eq!(loaded.stream_position().unwrap(), 0);
+                        let result = verify_loaded_binary(
+                            loaded,
+                            &expected,
+                            pin.bytes,
+                            &mut credit,
+                            started,
+                            || {
+                                if Instant::now() >= execution {
+                                    Err(ArenaError::Budget("test original E".into()))
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        );
+                        assert_eq!(loaded.stream_position().unwrap(), 0);
+                        match result {
+                            Ok(value) => {
+                                observed = Some(value);
+                                Ok(())
+                            }
+                            Err(error) => {
+                                refusal = Some(error);
+                                Err(())
+                            }
+                        }
+                    };
+                    supervise_verified_input_in_original_window(
+                        &program,
+                        &[],
+                        &directory_file,
+                        ProcessLimits {
+                            wall_ms: 5000,
+                            shutdown_grace_ms: 250,
+                            max_output_bytes: 4096,
+                            max_child_processes: 1,
+                        },
+                        None,
+                        &OwnedArtifactTreeWatch {
+                            max_total_bytes: 4096,
+                            max_file_bytes: 4096,
+                            max_files: 1,
+                            max_depth: 0,
+                        },
+                        OriginalProcessInput {
+                            bytes: b"original-input",
+                            window,
+                        },
+                        &mut verifier,
+                    )
+                    .unwrap()
+                };
+                assert_eq!(program.stream_position().unwrap(), 7);
+                assert_eq!(credit.remaining, 0);
+                assert!(output.process().pending_child.is_none(), "{output:?}");
+                assert_eq!(
+                    output.process().receipt.group_cleanup,
+                    crate::CleanupStatus::Gone
+                );
+                if refuse {
+                    assert!(observed.is_none());
+                    assert!(matches!(refusal, Some(ArenaError::Integrity(_))));
+                    assert_eq!(output.observation().written_bytes(), Some(0));
+                    assert!(output.process().stdout.is_empty());
+                    assert_eq!(output.process().receipt.stop, crate::ProcessStop::IoFailure);
+                    assert!(
+                        output
+                            .process()
+                            .receipt
+                            .errors
+                            .iter()
+                            .any(|code| code == "process.loaded_image_verification_refused")
+                    );
+                    assert!(!output.transport_complete());
+                } else {
+                    assert!(refusal.is_none());
+                    let content = observed.unwrap();
+                    let image = output.checked_loaded_image().unwrap();
+                    assert_eq!(content.artifact, pin);
+                    assert_eq!(content.device, image.file_device());
+                    assert_eq!(content.inode, image.file_inode());
+                    assert!(image.observed_ns() <= content.started_ns);
+                    assert!(content.started_ns <= content.finished_ns);
+                    assert!(content.finished_ns <= image.first_input_written_ns());
+                    assert_eq!(output.process().stdout, b"original-input");
+                    assert!(output.transport_complete());
+                }
+            }
+        }
 
         #[test]
         fn replay_caller_descriptor_hash_preserves_offset_and_honors_read_credit_and_original_guard()
@@ -577,6 +833,14 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_caller_loaded_binary_credit_accounts_for_both_passes_without_extension() {
+        assert!(check_verification_credit(10, 3, 26).is_ok());
+        assert!(check_verification_credit(10, 3, 25).is_err());
+        assert!(check_verification_credit(u64::MAX, 1, u64::MAX).is_err());
+        assert!(check_verification_credit(u64::MAX / 2 + 1, 0, u64::MAX).is_err());
+    }
 
     fn policy() -> ReplayCallerPolicy {
         ReplayCallerPolicy {
