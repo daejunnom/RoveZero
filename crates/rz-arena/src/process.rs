@@ -90,6 +90,18 @@ pub struct OriginalProcessObservation {
     finished_before_whole: bool,
     cancelled_at_return: bool,
     ownership_lost: bool,
+    // Process-local observations are not added to the legacy transport/1 JSON.
+    #[serde(skip)]
+    loaded_image: Option<LoadedImageObservation>,
+    #[serde(skip)]
+    first_input_written_ns: Option<u64>,
+}
+#[derive(Debug)]
+struct LoadedImageObservation {
+    pid: u32,
+    device: u64,
+    inode: u64,
+    observed_ns: u64,
 }
 impl OriginalProcessObservation {
     #[cfg(target_os = "linux")]
@@ -109,6 +121,8 @@ impl OriginalProcessObservation {
             finished_before_whole: false,
             cancelled_at_return: false,
             ownership_lost: false,
+            loaded_image: None,
+            first_input_written_ns: None,
         }
     }
     pub fn written_bytes(&self) -> Option<usize> {
@@ -169,6 +183,37 @@ impl OriginalProcessTiming<'_> {
         self.stamps[3]
     }
 }
+
+/// Parent observation of the actual child's executable before original stdin.
+/// This checks file identity, not executable content, dependencies, native NN
+/// completion, cgroup enforcement or next-Query admission. No serialized report
+/// can construct this borrow from a PID or an alleged loaded-image timestamp.
+#[derive(Debug)]
+pub struct OriginalLoadedImage<'a> {
+    output: &'a OriginalProcessOutput,
+    image: &'a LoadedImageObservation,
+    first_input_written_ns: u64,
+}
+impl OriginalLoadedImage<'_> {
+    pub fn process_id(&self) -> u32 {
+        self.output.process.receipt.pid
+    }
+    pub fn file_device(&self) -> u64 {
+        self.image.device
+    }
+    pub fn file_inode(&self) -> u64 {
+        self.image.inode
+    }
+    pub fn observed_ns(&self) -> u64 {
+        self.image.observed_ns
+    }
+    pub fn first_input_written_ns(&self) -> u64 {
+        self.first_input_written_ns
+    }
+    pub fn assurance_scope(&self) -> &'static str {
+        "actual_parent_same_inode_before_original_stdin_pending_content_and_native_admission"
+    }
+}
 impl OriginalProcessOutput {
     pub fn process(&self) -> &ProcessOutput {
         &self.process
@@ -190,6 +235,34 @@ impl OriginalProcessOutput {
         Ok(OriginalProcessTiming {
             output: self,
             stamps,
+        })
+    }
+    /// Adds a real parent-loaded-image observation to complete transport. It is
+    /// deliberately separate from the existing transport/1 closure contract.
+    pub fn checked_loaded_image(&self) -> Result<OriginalLoadedImage<'_>, ArenaError> {
+        let timing = self.checked_timing()?;
+        let image = self
+            .observation
+            .loaded_image
+            .as_ref()
+            .ok_or_else(|| ArenaError::Invalid("original loaded image unobserved".into()))?;
+        let first_input_written_ns = self
+            .observation
+            .first_input_written_ns
+            .ok_or_else(|| ArenaError::Invalid("original first input write unobserved".into()))?;
+        if image.pid != self.process.receipt.pid
+            || image.observed_ns < timing.launch_started_ns()
+            || image.observed_ns > first_input_written_ns
+            || first_input_written_ns > timing.exit_observed_ns()
+        {
+            return Err(ArenaError::Invalid(
+                "original loaded image owner/time order".into(),
+            ));
+        }
+        Ok(OriginalLoadedImage {
+            output: self,
+            image,
+            first_input_written_ns,
         })
     }
     fn ordered_stamps(&self) -> Option<[u64; 4]> {
@@ -909,6 +982,7 @@ mod linux {
         let mut stderr_eof = false;
         let mut cleanup_started = None;
         let preserve_unverified = matches!(watch, Some(ArtifactObservation::Tree(_)));
+        let mut loaded_image_checked = false;
         loop {
             let now = Instant::now();
             if stop.is_none() {
@@ -940,6 +1014,37 @@ mod linux {
                 observe_tree(&cwd_file, watch, &mut receipt, &mut stop);
             }
             if stop.is_none()
+                && !loaded_image_checked
+                && let Some(window) = original
+            {
+                // Child owns the unreaped PID and stdin has not received a byte.
+                // An absent, inaccessible or different loaded file refuses input;
+                // normal group drain/cleanup still owns the failed child.
+                match observe_loaded_image(program, pid, window) {
+                    Ok(image) => {
+                        loaded_image_checked = true;
+                        if let Some(o) = observation.as_deref_mut() {
+                            o.loaded_image = Some(image);
+                        }
+                    }
+                    Err(code) => {
+                        evidence(&mut receipt, code);
+                        stop = Some(ProcessStop::IoFailure);
+                    }
+                }
+            }
+            if stop.is_none()
+                && let Some(window) = original
+            {
+                // Every write rechecks control after artifact/image observation.
+                // OS calls can finish late; they do not renew the original clock.
+                if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                    stop = Some(ProcessStop::Cancelled);
+                } else if Instant::now() >= window.execution {
+                    stop = Some(ProcessStop::WallLimit);
+                }
+            }
+            if stop.is_none()
                 && let (Some(pipe), Some(commands)) = (stdin.as_mut(), commands)
             {
                 let end = (input_offset + 4096).min(commands.len());
@@ -949,6 +1054,11 @@ mod linux {
                         stop = Some(ProcessStop::IoFailure);
                     }
                     Ok(n) => {
+                        if input_offset == 0
+                            && let (Some(window), Some(o)) = (original, observation.as_deref_mut())
+                        {
+                            o.first_input_written_ns = window.elapsed_ns(Instant::now());
+                        }
                         input_offset += n;
                         if input_offset == commands.len() {
                             stdin = None;
@@ -1249,6 +1359,39 @@ mod linux {
             evidence(receipt, "process.leader_unreaped");
         }
         retain_child.then_some(child)
+    }
+
+    fn observe_loaded_image(
+        program: &File,
+        pid: u32,
+        window: OriginalProcessWindow,
+    ) -> Result<LoadedImageObservation, &'static str> {
+        let expected = program
+            .metadata()
+            .map_err(|_| "process.pinned_image_metadata")?;
+        // Resolve the actual unreaped child's proc link, not an argv/path report.
+        // The File pins this observation while metadata is read, then closes.
+        let loaded =
+            File::open(format!("/proc/{pid}/exe")).map_err(|_| "process.loaded_image_open")?;
+        let actual = loaded
+            .metadata()
+            .map_err(|_| "process.loaded_image_metadata")?;
+        if !expected.is_file()
+            || !actual.is_file()
+            || expected.dev() != actual.dev()
+            || expected.ino() != actual.ino()
+        {
+            return Err("process.loaded_image_differs_from_pinned_file");
+        }
+        let observed_ns = window
+            .elapsed_ns(Instant::now())
+            .ok_or("process.loaded_image_clock_unavailable")?;
+        Ok(LoadedImageObservation {
+            pid,
+            device: actual.dev(),
+            inode: actual.ino(),
+            observed_ns,
+        })
     }
 
     fn native_elf(program: &File) -> Result<(), ArenaError> {
@@ -1797,6 +1940,50 @@ mod linux {
             assert!(timing.supervisor_entry_ns() <= timing.launch_started_ns());
             assert!(timing.launch_started_ns() <= timing.exit_observed_ns());
             assert!(timing.exit_observed_ns() <= timing.supervisor_finished_ns());
+            let image = output.checked_loaded_image().unwrap();
+            let metadata = program.metadata().unwrap();
+            assert_eq!(image.process_id(), output.process().receipt.pid);
+            assert_eq!(image.file_device(), metadata.dev());
+            assert_eq!(image.file_inode(), metadata.ino());
+            assert!(timing.launch_started_ns() <= image.observed_ns());
+            assert!(image.observed_ns() <= image.first_input_written_ns());
+            assert!(image.first_input_written_ns() <= timing.exit_observed_ns());
+            let serialized = serde_json::to_value(output.observation()).unwrap();
+            assert_eq!(serialized["schema"], "rz-original-process-transport/1");
+            assert!(serialized.get("loaded_image").is_none());
+            assert!(serialized.get("first_input_written_ns").is_none());
+            let original_write = output.observation.first_input_written_ns.take();
+            assert!(output.checked_loaded_image().is_err());
+            output.observation.first_input_written_ns = original_write;
+            let original_image = output.observation.loaded_image.take();
+            // Complete transport alone never constructs a loaded-image borrow.
+            assert!(output.transport_complete());
+            assert!(output.checked_loaded_image().is_err());
+            output.observation.loaded_image = original_image;
+            let old_image_time = output
+                .observation
+                .loaded_image
+                .as_ref()
+                .unwrap()
+                .observed_ns;
+            output
+                .observation
+                .loaded_image
+                .as_mut()
+                .unwrap()
+                .observed_ns = output.observation.first_input_written_ns.unwrap() + 1;
+            assert!(output.checked_loaded_image().is_err());
+            output
+                .observation
+                .loaded_image
+                .as_mut()
+                .unwrap()
+                .observed_ns = old_image_time;
+            let old_image_pid = output.observation.loaded_image.as_ref().unwrap().pid;
+            output.observation.loaded_image.as_mut().unwrap().pid = old_image_pid + 1;
+            assert!(output.checked_loaded_image().is_err());
+            output.observation.loaded_image.as_mut().unwrap().pid = old_image_pid;
+            assert!(output.checked_loaded_image().is_ok());
             let old_spawn = output.observation.original_spawn_ns;
             output.observation.original_spawn_ns =
                 Some(output.observation.original_exit_observed_ns.unwrap() + 1);
@@ -1831,6 +2018,27 @@ mod linux {
                     &input,
                 )
                 .is_err()
+            );
+        }
+
+        #[test]
+        fn loaded_image_observation_rejects_a_different_actual_executable() {
+            let started = Instant::now();
+            let window = OriginalProcessWindow::new(
+                started,
+                started + Duration::from_secs(5),
+                started + Duration::from_millis(5500),
+            )
+            .unwrap();
+            // A real proc executable is compared, without a caller-supplied
+            // path, forged serialized report or a fabricated success owner.
+            let actual = File::open("/proc/self/exe").unwrap();
+            let image = observe_loaded_image(&actual, std::process::id(), window).unwrap();
+            assert_eq!(image.inode, actual.metadata().unwrap().ino());
+            let other = File::open("/bin/cat").unwrap();
+            assert_eq!(
+                observe_loaded_image(&other, std::process::id(), window).unwrap_err(),
+                "process.loaded_image_differs_from_pinned_file"
             );
         }
 
