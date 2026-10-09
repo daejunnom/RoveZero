@@ -196,7 +196,11 @@ impl Sink {
             || event.reply_context.situation != event.anchor_situation
             || event.repair_record.kind != RecordKind::Repair
             || event.repair_record.revision != event.identity.repair_record_revision
-            || event.reply_context.public_revision != event.repair_record.revision
+            // Repair is historical. This reviewed engine's verification can
+            // append one public record before Reply; it cannot advance further.
+            || !(event.reply_context.public_revision == event.repair_record.revision
+                || event.repair_record.revision.checked_add(1)
+                    == Some(event.reply_context.public_revision))
             || event.repair_record.origin_state != event.root_state
             || event.repair_record.line.as_slice() != event.repaired
             || !matches!(

@@ -669,8 +669,8 @@ REVIEWED_WHOLE_SOURCE_PINS = {
         "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c",
     },
     "crates/rz-arena/src/pals_collect/native.rs": {
-        "bytes": 221690,
-        "sha256": "8886c0e01d0c753fa0a1b5256e36f2230d41f5e561fca8ac7ae8f895b9e0813c",
+        "bytes": 224380,
+        "sha256": "a286a2403317be7f5f058b65488e7c9722d2b7f4b9bf683ea95e5c9f51a7aaf8",
     },
 }
 

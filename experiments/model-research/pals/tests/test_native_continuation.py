@@ -28,7 +28,7 @@ def context(prefix, purpose, revision):
 
 class CollectionFixture:
     """Matches the original wire without pretending fixture hashes are Rules proof."""
-    def __init__(self):
+    def __init__(self, *, reply_revision=8, later_reply_revision=None):
         self.repaired = [move(12, 28), move(52, 36), move(6, 21), move(57, 42), move(5, 33), move(48, 40)]
         self.refutation = self.repaired[:2] + [move(1, 18), move(62, 45), move(2, 29), move(51, 35)]
         self.counter = self.repaired[:3] + [move(62, 45), move(5, 26), move(51, 35)]
@@ -56,7 +56,7 @@ class CollectionFixture:
                     "checked_source_sha256": consumer._pin(consumer._canonical(["rz-pals-collector-checked-source/1", self.source]))["sha256"],
                     "refinement_registration_sha256": consumer._pin(self.policy_raw)["sha256"], "policy": copy.deepcopy(consumer.POLICY),
                     "root_rules_state_sha256": sha("root"), "anchor_rules_state_sha256": sha("state-5"), "anchor_ply": 3,
-                    "initial_reply_context": context(self.repaired[:3], "ReplyPolicy", 8),
+                    "initial_reply_context": context(self.repaired[:3], "ReplyPolicy", reply_revision),
                     "parent_repair_chain": {"initial_prefix": self.repaired[:2], "initial_prefix_len": 2,
                                             "full_repaired_line": self.repaired, "calls": parent_calls,
                                             "journal_observation": "independent-exact-producer-journal-entry-required; raw-entry-SHA-not-returned-by-producer-API"},
@@ -70,7 +70,8 @@ class CollectionFixture:
         summaries = []
         for ordinal, ply in enumerate(range(3, 6)):
             sequence = 5 + ordinal
-            call = self.add_call(sequence, self.counter[:ply], "Reply", self.counter[ply], self.repaired, self.refutation, 8)
+            revision = reply_revision if ordinal == 0 or later_reply_revision is None else later_reply_revision
+            call = self.add_call(sequence, self.counter[:ply], "Reply", self.counter[ply], self.repaired, self.refutation, revision)
             call.update(prepared_payload_sha256=self.trace[0]["payload_sha256"], ordinal=ordinal,
                         previous_bound_payload_sha256=self.trace[-1]["payload_sha256"] if ordinal else None,
                         bound_before_submit=True, physical_completion_observed=False, delivery_observed=False,
@@ -177,6 +178,38 @@ class NativeContinuationTests(unittest.TestCase):
         self.assertTrue(all(call["search_consumed"] for call in result["attempts"][0]["reply_calls"]))
         self.assertIsNone(result["physical_nn_rows"])
         self.assertTrue(all(result[name] is False for name in consumer.DENIED_AUTHORITIES))
+
+    def test_current_reply_revision_matches_repair_or_its_single_verification(self):
+        for current_revision in (8, 9):
+            with self.subTest(current_revision=current_revision):
+                fixture = CollectionFixture(reply_revision=current_revision)
+                result = consumer.audit_native_continuation_collection(**fixture.arguments())
+                prepared = fixture.trace[0]["data"]
+                self.assertEqual(fixture.identity["repair_record_revision"], 8)
+                self.assertEqual(prepared["initial_reply_context"]["public_revision"], current_revision)
+                self.assertTrue(all(call["logical_context"]["public_revision"] == 7
+                                    for call in prepared["parent_repair_chain"]["calls"]))
+                self.assertEqual([row["snapshot"]["input_revision"] for row in fixture.files["inputs.jsonl"]],
+                                 [7] * 4 + [current_revision] * 3)
+                attempt = result["attempts"][0]
+                self.assertEqual(len(attempt["parent_repair_calls"]), 4)
+                self.assertEqual(len(attempt["reply_calls"]), 3)
+                self.assertTrue(all(call["search_consumed"] for call in attempt["reply_calls"]))
+                self.assertTrue(attempt["finished_observed"])
+                self.assertTrue(attempt["counterline_completed_observed"])
+                self.assertIsNone(result["physical_nn_rows"])
+                self.assertTrue(all(result[name] is False for name in consumer.DENIED_AUTHORITIES))
+
+    def test_reply_revision_cannot_skip_verification_or_drift_from_current_public_view(self):
+        for current_revision, later_revision, error in (
+                (7, None, "post-Repair anchor/revision"),
+                (10, None, "post-Repair anchor/revision"),
+                (9, 8, "stale Reply context"),
+                (9, 10, "stale Reply context")):
+            with self.subTest(current_revision=current_revision, later_revision=later_revision):
+                fixture = CollectionFixture(reply_revision=current_revision, later_reply_revision=later_revision)
+                with self.assertRaisesRegex(ValueError, error):
+                    consumer.audit_native_continuation_collection(**fixture.arguments())
 
     def test_duplicate_and_reordered_reply_rows_are_rejected(self):
         for duplicate in (True, False):

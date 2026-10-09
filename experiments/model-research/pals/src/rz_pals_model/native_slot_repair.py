@@ -109,6 +109,13 @@ _REVIEWED_DISABLED_SELECTED_IDENTITY_SOURCES = (
     {"bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"},
     {"bytes": 221690, "sha256": "8886c0e01d0c753fa0a1b5256e36f2230d41f5e561fca8ac7ae8f895b9e0813c"},
 )
+# Independently reviewed DEFAULT-only successor. Native's new tests cover the
+# separate continuation revision guard; its Disabled production path and the
+# engine bytes are unchanged. This pair enrolls no selected continuation lane.
+_REVIEWED_DISABLED_CONTINUATION_REVISION_FIXTURE_SOURCES = (
+    {"bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"},
+    {"bytes": 224380, "sha256": "a286a2403317be7f5f058b65488e7c9722d2b7f4b9bf683ea95e5c9f51a7aaf8"},
+)
 _SOURCE_REVIEW_PROFILES = (
     ("legacy_prepared_lineage_4469f9d", _REVIEWED_SOURCES),
     ("legacy_disabled_recheck_9c0de959", _REVIEWED_DISABLED_RECHECK_SOURCES),
@@ -121,6 +128,7 @@ _SOURCE_REVIEW_PROFILES = (
     ("legacy_disabled_multi_reply_observer_b813828e", _REVIEWED_DISABLED_NATIVE_CONTINUATION_OBSERVER_SOURCES),
     ("legacy_disabled_continuation_selection_v2_eea0654a", _REVIEWED_DISABLED_CONTINUATION_SELECTION_V2_SOURCES),
     ("legacy_disabled_selected_identity_8886c0e0", _REVIEWED_DISABLED_SELECTED_IDENTITY_SOURCES),
+    ("legacy_disabled_continuation_revision_fixture_a286a240", _REVIEWED_DISABLED_CONTINUATION_REVISION_FIXTURE_SOURCES),
 )
 _DISABLED_SEARCH_VERSION = "pals-restricted-refinement/0.1"
 _OPT_IN_LANE_FIELDS = ("pals_search_policy", "refinement_registration", "refinement_registration_sha256", "post_repair_recheck", "post_repair_recheck_policy", "post_repair_recheck_conditions",

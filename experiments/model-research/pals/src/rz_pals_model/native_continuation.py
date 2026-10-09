@@ -444,7 +444,13 @@ def _attempt(group, *, source_sha, policy_sha, source, indices, journals, split,
     repaired, refutation = _moves(prepared["repaired"], 3), _moves(prepared["refutation"], 3)
     anchor = _uint(prepared["anchor_ply"], len(repaired) - 1)
     initial = _context(prepared["initial_reply_context"], identity, "ReplyPolicy", repaired[:anchor])
-    if (anchor == 0 or initial["public_revision"] != identity["repair_record_revision"]
+    # Repair identifies a historical record; its single verification can
+    # advance the current public view once before Reply without changing R.
+    repair_revision = identity["repair_record_revision"]
+    allowed_public_revisions = (repair_revision,)
+    if repair_revision < U64_MAX:
+        allowed_public_revisions += (repair_revision + 1,)
+    if (anchor == 0 or initial["public_revision"] not in allowed_public_revisions
             or prepared["policy"] != POLICY or prepared["engine_observer_version"] != "pals-post-repair-continuation-observer/2"
             or prepared["checked_source_sha256"] != source_sha or prepared["refinement_registration_sha256"] != policy_sha
             or prepared["prepared_before_reply_submit"] is not True

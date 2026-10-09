@@ -3985,7 +3985,10 @@ mod tests {
     }
     #[test]
     fn native_continuation_seals_three_actual_prefixes_and_persists_a_distinct_trace() {
-        let f = continuation_fixture();
+        let mut f = continuation_fixture();
+        // Fresh CPU verification follows Repair and advances the public view;
+        // the accepted Repair record and its parent chain remain historical.
+        f.reply_context.public_revision = f.record.revision + 1;
         let shared = continuation_sink(&f);
         let counter = ["e2e4", "e7e5", "g1f3", "g8f6", "f1c4", "d7d5"]
             .map(|m| BoardMove::from_uci(m).unwrap());
@@ -3997,7 +4000,11 @@ mod tests {
             let context = if ply == 3 {
                 f.reply_context.clone()
             } else {
-                RecheckFixture::logical(&counter[..ply], NativeQueryKind::Reply, 8)
+                RecheckFixture::logical(
+                    &counter[..ply],
+                    NativeQueryKind::Reply,
+                    f.reply_context.public_revision,
+                )
             };
             f.observe_prefix(
                 &shared,
@@ -4053,6 +4060,11 @@ mod tests {
             "rz-pals-native-post-repair-continuation/2"
         );
         assert_eq!(rows[0]["data"]["examined_responses"], serde_json::json!([]));
+        assert_eq!(rows[0]["identity"]["repair_record_revision"], 8);
+        assert_eq!(
+            rows[0]["data"]["initial_reply_context"]["public_revision"],
+            9
+        );
         assert_eq!(rows[4]["data"]["initial_selection_checked"], true);
         assert_eq!(
             rows[4]["data"]["expected_initial_response"],
@@ -4076,6 +4088,64 @@ mod tests {
             .flat_map(|r| r.json.iter().copied().chain(std::iter::once(b'\n')))
             .collect::<Vec<_>>();
         assert_eq!(stored, expected);
+    }
+    #[test]
+    fn native_continuation_rejects_stale_initial_or_changed_reply_revision() {
+        for invalid_revision in [7, 10] {
+            let mut invalid = continuation_fixture();
+            invalid.reply_context.public_revision = invalid_revision;
+            let shared = continuation_sink(&invalid);
+            let mut observer = Observer(Arc::clone(&shared));
+            assert!(
+                observer
+                    .recheck_prepared(continuation_prepared(&invalid))
+                    .is_err()
+            );
+            let s = shared.lock().unwrap();
+            assert!(s.pending_continuation.is_none());
+            assert!(!s.calls.contains_key(&id(5)));
+            assert!(
+                !s.trace
+                    .rows
+                    .iter()
+                    .any(|r| r.artifact == "native-continuation-traces.jsonl")
+            );
+        }
+
+        for changed_revision in [8, 10] {
+            let mut f = continuation_fixture();
+            f.reply_context.public_revision = f.record.revision + 1;
+            let shared = continuation_sink(&f);
+            let counter = ["e2e4", "e7e5", "g1f3", "g8f6", "f1c4", "d7d5"]
+                .map(|m| BoardMove::from_uci(m).unwrap());
+            let mut observer = Observer(Arc::clone(&shared));
+            observer
+                .recheck_prepared(continuation_prepared(&f))
+                .unwrap();
+            f.observe_prefix(
+                &shared,
+                5,
+                NativeQueryKind::Reply,
+                &counter[..3],
+                counter[3],
+                &f.reply_context,
+            )
+            .unwrap();
+            let context =
+                RecheckFixture::logical(&counter[..4], NativeQueryKind::Reply, changed_revision);
+            assert!(
+                f.observe_prefix(
+                    &shared,
+                    6,
+                    NativeQueryKind::Reply,
+                    &counter[..4],
+                    counter[4],
+                    &context,
+                )
+                .is_err()
+            );
+            assert!(!shared.lock().unwrap().calls.contains_key(&id(6)));
+        }
     }
     #[test]
     fn native_continuation_rejects_unaccepted_previous_output_or_a_spliced_prefix() {
