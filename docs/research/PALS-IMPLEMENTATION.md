@@ -3305,3 +3305,37 @@ raw 변조·중복 key·추가 출력, 독립 pin·clock 대체, CLI 완료/권�
 만들지 않는다. 현재 수정 HEAD의 컴파일·CI는 push 후 별도로 인수한다.
 실제 등록 frozen 4N 실행과 native 의미 결과 소비·다음 Query 연결 및 유용성·paired 인수는
 계속 남는다. GPU 검증 보류·실제 학습 제외·로컬 heavy CPU 미실행과 Draft를 유지한다.
+
+### 캡처된 prior의 보고 상태와 공통 readiness 판정
+
+직전 `7629e87`의 CPU CI 네 job과 Linux/Windows의 delivery 검사 다섯 개는 성공했다.
+이번 변경은 `BoundReplayDelivery::check_reported_consistency`를 추가한다. 원래 W와 취소를
+확인하고 이미 원문과 연결한 native JSON을 닫힌 필드·자료형으로 읽으며, 준비된 expected
+소유권을 이동해 독립 model/export/encoding/adapter 식별과 입력 binding을 대조한다.
+원문 bytes와 process custody는 기존 capture에 남는다. JSON의 중복 key 거부는 기존
+delivery decoder에서 수행하고, report 소비자도 스트리밍 byte counter·4개 CPU 단계·
+16KiB projection·96개 PV와 16개 line 한도를 검사한다. raw Debug 문자열은 feature로 해석하지 않는다.
+
+기존 in-process readiness의 판정문을 읽기 전용 fact view에 대한 공통 함수로 옮겼다.
+실제 native 경로는 원래 typed 관측을 빌려 사용하며 JSON 직렬화·역직렬화나 body 복사를
+추가하지 않는다. caller 경로는 private wire를 통해 같은 판정문을 사용한다. window·
+CPU phase/depth/report·노드 합계·endpoint·반환/소비/물리 종료 계수를 다시 대조하고,
+보고된 readiness가 계산 결과와 다르면 거부한다. scope가 미완료거나 종료 관측이 없으면
+기존 실패/미완료 readiness를 그대로 유지한다. 정리가 E를 넘는 경우와 작업이 E를 넘는
+경우도 기존처럼 구분한다. policy·평가 계약·기본 feature·실제 역할 선택은 바꾸지 않는다.
+
+`ReportedPriorConsistency`는 별도 readonly 타입이며 보증 범위는
+`reported_consistency_pending_native_witness_and_caller_chronology`다.
+**계수가 모두 맞는 합성 보고서도 실제 native witness나 다음 Query prior가 되지 않는다.**
+공개 NativeRoleReceipt/ReplayQueryPrior/CheckedNativeReplayPrior에 Deserialize나
+소유 projection 반환 접점을 추가하지 않는다. 작은 data enum만 역직렬화를 지원한다.
+receipt 중 기존 readiness/identity에 필요한 부분만 보고 자료로 읽으며 나머지 native
+상세 수명·실행 증거는 원문에 보존하고 인수하지 않는다. 별도 witness·Rules·current/frozen
+재입장·caller chronology·whole-action cost·utility 검사는 여전히 필요하다.
+
+CPU 검사 세 개를 추가했다. 기존 native 소비자와 caller의 window/부분/terminal/정리 사례
+7개를 대조하고, 과장된 readiness·잘못된 자료형·미지원 필드·authority/source 대체를 거부한다.
+synthetic closure의 일관성이 맞아도 reported scope와 모든 권한 false를 유지하고,
+반환 계수·진행 중 실행·격리·모델 식별·실패 필드 부재가 바뀌면 거부한다.
+현재 수정 HEAD의 컴파일·CI는 push 후 별도로 인수한다. 실제 등록 frozen 4N child/NN 실행,
+독립 native witness·다음 Query·효용·paired 인수는 남으며 GPU 보류·실제 학습 제외·Draft를 유지한다.
