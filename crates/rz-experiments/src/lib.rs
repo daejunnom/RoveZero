@@ -10,6 +10,7 @@ mod native_cuda_v2;
 mod native_launch;
 mod pals_data;
 mod pals_manifest;
+mod pals_manifest_v4;
 mod validation;
 
 pub use manifest::*;
@@ -21,6 +22,7 @@ pub use native_cuda_v2::*;
 pub use native_launch::*;
 pub use pals_data::*;
 pub use pals_manifest::*;
+pub use pals_manifest_v4::*;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};

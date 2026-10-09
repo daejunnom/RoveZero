@@ -502,14 +502,14 @@ fn sha(s: &str, len: usize) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn options(m: &BTreeMap<String, String>) -> bool {
+pub(crate) fn options(m: &BTreeMap<String, String>) -> bool {
     let casefold: BTreeSet<_> = m.keys().map(|key| key.to_ascii_lowercase()).collect();
     m.len() <= 64
         && casefold.len() == m.len()
         && m.iter()
             .all(|(k, v)| text(k) && v.len() <= 1024 && !v.chars().any(char::is_control))
 }
-fn component(c: &PalsComponentV3) -> Result<(), ManifestError> {
+pub(crate) fn component(c: &PalsComponentV3) -> Result<(), ManifestError> {
     require(
         text(&c.semantic_id) && sha(&c.implementation_sha256, 64) && options(&c.options),
         "invalid component identity/options",
@@ -541,7 +541,7 @@ fn pals_search_lane(p: &PalsEndpointV3) -> Result<(), ManifestError> {
         _ => require(false, "unsupported PALS search semantic lane"),
     }
 }
-fn cpu(c: &PalsOwnCpuV3) -> Result<(), ManifestError> {
+pub(crate) fn cpu(c: &PalsOwnCpuV3) -> Result<(), ManifestError> {
     component(&c.core)?;
     component(&c.training_profile)?;
     component(&c.runtime_profile)?;
@@ -557,7 +557,7 @@ fn cpu(c: &PalsOwnCpuV3) -> Result<(), ManifestError> {
         "CPU core must be own PVS with finite node/depth/time/TT limits",
     )
 }
-fn external_cpu_r(
+pub(crate) fn external_cpu_r(
     c: &PalsExternalCpuRV3,
     r: &PalsResourcePolicyV3,
     pilot: &PalsPilotV3,
@@ -616,7 +616,7 @@ fn external_cpu_r(
         "external CPU_R time/output declarations exceed finite profile or inherited parent ceilings",
     )
 }
-fn resources(r: &PalsResourcePolicyV3) -> Result<(), ManifestError> {
+pub(crate) fn resources(r: &PalsResourcePolicyV3) -> Result<(), ManifestError> {
     let set: BTreeSet<_> = r.cpu_affinity.iter().collect();
     require(
         (1..=64).contains(&r.cpu_threads)
@@ -632,7 +632,7 @@ fn resources(r: &PalsResourcePolicyV3) -> Result<(), ManifestError> {
         "invalid resource policy",
     )
 }
-fn model(m: &PalsModelIdentityV3) -> Result<(), ManifestError> {
+pub(crate) fn model(m: &PalsModelIdentityV3) -> Result<(), ManifestError> {
     require(
         [
             &m.architecture,
@@ -671,7 +671,7 @@ fn model(m: &PalsModelIdentityV3) -> Result<(), ManifestError> {
         }
     }
 }
-fn endpoint(
+pub(crate) fn endpoint(
     e: &PalsEngineV3,
     r: &PalsResourcePolicyV3,
     pilot: &PalsPilotV3,
@@ -777,7 +777,7 @@ fn endpoint(
     binary.validate()?;
     require(sha(commit, 40), "source commit must be a full Git SHA")
 }
-fn changes(a: &PalsEngineV3, b: &PalsEngineV3) -> BTreeSet<PalsChangeAxisV3> {
+pub(crate) fn changes(a: &PalsEngineV3, b: &PalsEngineV3) -> BTreeSet<PalsChangeAxisV3> {
     let mut result = BTreeSet::new();
     if let (PalsEngineV3::Pals(a), PalsEngineV3::Pals(b)) = (a, b) {
         if a.model != b.model {
@@ -1416,7 +1416,7 @@ pub struct PalsRunReceiptV3 {
     pub games: Vec<PalsGameReceiptV3>,
 }
 
-fn observation<T>(o: &PalsObservedV3<T>) -> Result<(), ManifestError> {
+pub(crate) fn observation<T>(o: &PalsObservedV3<T>) -> Result<(), ManifestError> {
     match o {
         PalsObservedV3::Unknown => Ok(()),
         PalsObservedV3::Observed { method, .. } => require(
@@ -1495,6 +1495,18 @@ fn receipt_endpoint(
             ));
         }
     }
+    receipt_endpoint_physical(o, e, r, eligible, failures)
+}
+
+/// Shared physical/options/resource checks only. Legacy lane and checker proof
+/// validation stays in `receipt_endpoint`; new domains validate their own lanes.
+pub(crate) fn receipt_endpoint_physical(
+    o: &PalsEndpointReceiptV3,
+    e: &PalsEngineV3,
+    r: &PalsResourcePolicyV3,
+    eligible: bool,
+    failures: &BTreeSet<PalsRunFailureV3>,
+) -> Result<(), ManifestError> {
     require(
         o.endpoint_id == e.id() && o.options.keys().eq(e.requested_options().keys()),
         "receipt endpoint/options differ from launch",
