@@ -11,8 +11,8 @@ pub const REPAIR_EVIDENCE_SCOPE: &str =
 pub fn repair_evidence_source_digest() -> [u8; 32] {
     Sha256::digest(include_bytes!("replay_repair_evidence.rs")).into()
 }
-pub fn repair_evidence_source_bytes() -> usize {
-    include_bytes!("replay_repair_evidence.rs").len()
+pub fn repair_evidence_source_bytes() -> u64 {
+    include_bytes!("replay_repair_evidence.rs").len() as u64
 }
 
 /// Constructed only by the actual producer. Wire parsing is separately labelled
@@ -22,7 +22,7 @@ pub struct RepairAnchorEvidence {
     pub(super) schema: &'static str,
     pub(super) assurance_scope: &'static str,
     pub(super) source_sha256: [u8; 32],
-    pub(super) source_bytes: usize,
+    pub(super) source_bytes: u64,
     pub(super) model_counterline: PackedMoves,
     pub(super) repaired_line: PackedMoves,
     pub(super) repair_record_observed: bool,

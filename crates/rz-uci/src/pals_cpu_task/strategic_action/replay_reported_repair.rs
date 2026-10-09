@@ -14,7 +14,7 @@ struct RepairWire {
     schema: String,
     assurance_scope: String,
     source_sha256: [u8; 32],
-    source_bytes: usize,
+    source_bytes: u64,
     model_counterline: Vec<u16>,
     repaired_line: Vec<u16>,
     repair_record_observed: bool,
