@@ -3230,3 +3230,40 @@ DEFAULT/single-Reply 소비자는 literal source review profile만 추가하고 
 현재 수정 HEAD의 CPU CI는 아직 미관측이다. 실제 frozen 다중 NN 실행과 strict 결과 인수,
 Query prior·whole-action cost·utility·paired 대국은 계속 남아 있다. GPU 보류·실제 학습 제외,
 로컬 heavy CPU 미실행, Draft 유지.
+
+
+### 다중 Reply 최초 응답의 독립 순위 대조 — 관측 버전 2
+
+직전 `59e57be`의 관측 접점은 CPU CI 네 job에서 인수했다. 위 최초 응답의
+합법성·차이 검사에 더해, 이번 변경은 **탐색의 기존 선택 알고리즘을 바꾸지 않고**
+실제 선택 근거를 native 수집기에서 독립 대조한다. 첫 C Reply 제출 전에
+`RecheckPrepared.examined_responses`로 anchor의 실제 edge 목록을 전달한다.
+Disabled와 기존 single-Reply의 목록은 비어 있으며 해당 관측 wire는 유지한다.
+복사 범위는 현재 anchor의 합법 수로 제한하고 node/store/graph 전체는 복제하지 않는다.
+
+수집기는 정확한 Rules replay로 목록의 합법성·중복을 확인하고 첫 raw 순위 저장 공간을
+제출 전에 예약한다. 기존 physical completion callback의 유한 raw logits에서 내림차순,
+동률 시 요청의 합법 수 index 순으로 순위를 만든다. 첫 호출의 결과만 pending descriptor에
+보존하며 이후 tail의 전체 순위는 추가 저장하지 않는다. 논리 수락·context·producer가
+완료된 호출에서 원래 응답을 제외하고 미탐색 응답 중 첫 수를 찾으며, 미탐색 응답이
+없으면 다른 응답 중 첫 수를 찾는다. engine의 selected-response 값을 이 계산의 입력으로
+쓰지 않는다. 실제 다음 prefix와 최종 selected response는 이 예상 수와 같아야 한다.
+합법적이지만 순위가 틀린 응답은 다음 제출 전에 거부하고 종료 trace에도 성공으로
+기록하지 않는다. 다른 응답이 있는데 `NoAlternativeResponse`로 표시하는 경우도 거부한다.
+
+새 trace domain은 `rz-pals-native-post-repair-continuation/2`, observer version은
+`pals-post-repair-continuation-observer/2`다. prepared에 examined 목록과 선택 규칙,
+finished에 독립 예상 응답과 대조 상태를 추가한다. 이전 `/1` 원시 기록을 덮어쓰거나
+새 검사에 통과한 자료로 자동 승격하지 않는다. registration `/1`과 정책 의미는 유지하며,
+등록 자체는 여전히 실행 증거가 아니다. 기존 Python DEFAULT/single-Reply 소비자의
+허용 source profile만 추가하고 이전 profile·policy·나머지 실행/수락 AST를 보존한다.
+새 `/2` JSON의 표지만으로 strict witness나 학습 목표를 만들지 않는다.
+
+CPU observer 검사 세 개를 추가했다. 정상 선택 네 경우는 원래 응답 제외, 미탐색 우선,
+전부 탐색한 경우의 fallback, logits 동률을 다룬다. 별도 거부 검사는 합법적인 다른
+순위의 수를 다음 prefix/최종 반환에 넣거나 대안이 없다고 주장하는 경우, 중복/불법
+examined 목록을 다룬다. 기존 실제 engine mock callback도 준비 목록의 원래 edge·합법성·
+중복을 검사한다. fixture는 합성 logits이므로 실제 NN 실행 증거가 아니다.
+현재 수정 HEAD의 CI는 push 후 별도로 인수한다. frozen 실제 다중 Reply 실행·strict 결과
+소비·CPU endpoint provenance·Query prior·whole-action cost·utility·paired 인수는 계속 남는다.
+GPU 검증 보류·실제 학습 제외·로컬 heavy CPU 미실행·Draft 및 전체 목표 active를 유지한다.
