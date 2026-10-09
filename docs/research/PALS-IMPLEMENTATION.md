@@ -3414,3 +3414,16 @@ CPU 검사 세 개로 실제 deterministic RoleModel+자체 CPU replay의 기록
 명시적 새 result lane·독립 source pin·caller Rules 대조와 다음 Query/실행 인수는 아직
 후속 연결이다. 현재 HEAD의 CPU CI는 push 후 별도로 확인한다. 전체 목표 active·Draft,
 GPU 검증 보류·실제 학습 제외·로컬 heavy CPU 미실행을 유지한다.
+
+
+### 명시적 Repair origin 결과와 호출자 첫 anchor 재검산
+
+직전 생성자 접점 `3258c823e7dc667383f3a8a84febc52b8e272863`는 CI 37882349630 attempt 1의 네 CPU job에서 인수했다. Linux·Windows 원시 로그에 새 owner 검사 3개와 이전 Rules/reported/delivery 15개의 실제 성공이 있다. 다음 코드 `8ec443dc3e66250643e78869aad46aea81732aa8`는 source split과 원래 계약을 유지하며 아래 경로를 연결한다. 이 새 source의 CI는 게시 후 별도로 확인한다.
+
+- `prepare_repair_observed_replay_launch_bundle`과 `repair_anchor_v1`을 명시적으로 선택할 때만 native observation `/4`를 만든다. 기존 library/scoped bytes와 Query prior `/3`는 원래 경로·의미를 유지한다. 기존 `/3` 소비자는 새 evidence를 거부한다.
+- 실제 `FreshReplayOwner`의 accepted Repair record를 original W에서 다시 확인하고, Repair 이전 모델 반격선·Repair 수순·local record revision·첫 anchor를 고정 크기 move projection으로 전달한다. 최대 16수이며 모델/session 생성 이전에 작은 저장 공간을 준비한다. 새로운 CPU/model/role 실행·시계 연장·graph 복제는 없다. 실패한 replay의 원래 typed cause·관측·물리 drain은 유지하며 성공한 work의 origin 검사 실패도 typed Run 오류로 남긴다.
+- CLI의 source·원문 hash·요청 lane·원래 시계와 호출자의 실제 transport closure를 대조한다. Repair evidence source는 호출자에서 독립 등록한다. 수신 digest나 현재 compiled source를 production expected pin으로 대신하지 않는다. caller capture/raw stdout을 빌리므로 native body를 복제·재직렬화하지 않는다.
+- 닫힌 보고 parser는 source·shape·move extent·record 존재와 revision·정책 권한을 검사한다. 기존 private 준비 원문을 빌려 Rules root/history를 한 번 재구성하고, 기존 수순 legality/terminal 검사와 첫 own 변경 다음의 **첫 ongoing opponent turn**을 같은 W에서 재계산한다. original C 응답·prefix·partial model line·후속 anchor 선택을 거부한다. parent/current/frozen/input/action/semantic/artifact/factory/scope 결합도 실제 준비와 대조한다. 임시 Rules graph는 반환 전 해제한다.
+- 돌아오는 것은 `ReportedRepairRulesConsistency`라는 보고 일관성이다. local record revision은 출처 메타데이터이며 V feature·portable ID가 아니다. reported native completion을 실제 native witness로 만들거나 다음 Query/utility 권한을 발급하지 않는다.
+
+새 CPU 검사는 첫 anchor/수순·원래 W와 취소·private 준비 binding·새/기존 lane 구분·source/shape/revision/authority 변조·raw body 보존과 CLI 4N routing을 다룬다. 형식 검사·diff check 및 common readiness predicate 원문 대조는 통과했고, 이 source의 CPU CI·실제 registered frozen child/NN·독립 native witness·current/frozen/next Query chronology·whole cost/utility·실제 multi-Reply 수집·같은 integration SHA paired 및 전체 P0–P6 최종 인수는 구분한다. GPU 보류·학습 제외·로컬 heavy CPU 미실행·PR Draft·목표 active를 유지한다.
