@@ -3386,3 +3386,9 @@ E/W 구분을 확인하며 backing 변조·취소·W 만료를 거부한다. 합
 검사한다. 실제 메이트/스테일메이트는 Rules로 판정하며 native closure 미관측은 그대로
 유지한다. 이번 HEAD의 CPU CI는 push 후 별도 인수한다. 실제 frozen 4N child/NN 실행,
 독립 witness·다음 Query·효용·paired 인수는 남는다. GPU 보류·실제 학습 제외·Draft를 유지한다.
+
+첫 `1eaf26a`의 CI는 test-only prepared fixture helper의 가시성이 좁아 Linux에서
+`E0603`으로 실패했다. bindings job은 성공했지만 남은 model/Windows job은 이 실패를
+확인한 뒤 총괄이 종료 요청해 cancelled로 보존한다. 전체 성공으로 기록하지 않는다.
+helper의 `cfg(test)` 접근 범위만 strategic_action 내부로 수정하며 제품 경계·wire·동작은
+바꾸지 않는다. 수정 HEAD의 새 CPU CI는 별도로 인수한다.

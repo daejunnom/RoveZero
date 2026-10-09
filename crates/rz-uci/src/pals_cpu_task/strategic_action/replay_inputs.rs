@@ -2902,7 +2902,7 @@ pub(super) mod tests {
     }
 
     /// CPU Rules fixture only. No native/role work, witness or caller admission.
-    pub(super) fn controlled_prepared_result_rules() -> PreparedReplayRequest {
+    pub(in super::super) fn controlled_prepared_result_rules() -> PreparedReplayRequest {
         constructed(
             &opponent_fixture(),
             PRODUCER_SCOPES[0],
