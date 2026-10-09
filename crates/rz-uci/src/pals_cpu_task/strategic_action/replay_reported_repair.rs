@@ -289,6 +289,72 @@ mod tests {
         assert_eq!(evidence.authorities, ReplayAuthorities::default());
     }
     #[test]
+    fn reported_repair_black_own_turn_uses_original_rules_side_and_history() {
+        let (mut root, mut prior, mut evidence) = fixture();
+        let view = root.root.ordered_legal_moves();
+        root.root
+            .make_from_view(&view, BoardMove::from_uci("e2e4").unwrap())
+            .unwrap();
+        root.prefix = moves("e7e5");
+        let before = root.root.snapshot();
+        assert_eq!(root.root.side_to_move(), rz_position::Color::Black);
+        assert_eq!(root.root.known_history_len(), 2);
+        let repair = moves("e7e5 g1f3 g8f6 f1b5 b8c6 b5a4");
+        prior
+            .repaired_line
+            .capture(&repair, MAX_LINE_MOVES)
+            .unwrap();
+        evidence
+            .repaired_line
+            .capture(&repair, MAX_LINE_MOVES)
+            .unwrap();
+        evidence
+            .model_counterline
+            .capture(&moves("e7e5 g1f3 b8c6 f1b5 a7a6 b5a4"), MAX_LINE_MOVES)
+            .unwrap();
+        prior
+            .opponent_counterline
+            .capture(&moves("e7e5 g1f3 g8f6 f1c4 b8c6 d2d3"), MAX_LINE_MOVES)
+            .unwrap();
+        assert_eq!(
+            check_anchor(&root, &prior, &evidence, &AtomicBool::new(false)).unwrap(),
+            3
+        );
+        assert!(before.same_state(&root.root.snapshot()));
+        assert_eq!(root.root.known_history_len(), 2);
+    }
+    #[test]
+    fn reported_repair_short_original_model_mate_is_rules_terminal_not_partial() {
+        let (mut root, mut prior, mut evidence) = fixture();
+        root.prefix = moves("f2f3");
+        let repair = moves("f2f3 e7e5 g2g3 d8f6 e2e3 f6g6");
+        prior
+            .repaired_line
+            .capture(&repair, MAX_LINE_MOVES)
+            .unwrap();
+        evidence
+            .repaired_line
+            .capture(&repair, MAX_LINE_MOVES)
+            .unwrap();
+        prior
+            .opponent_counterline
+            .capture(&moves("f2f3 e7e5 g2g3 d8h4 e2e3 h4g5"), MAX_LINE_MOVES)
+            .unwrap();
+        evidence
+            .model_counterline
+            .capture(&moves("f2f3 e7e5 g2g4 d8h4"), MAX_LINE_MOVES)
+            .unwrap();
+        assert_eq!(
+            check_anchor(&root, &prior, &evidence, &AtomicBool::new(false)).unwrap(),
+            3
+        );
+        evidence
+            .model_counterline
+            .capture(&moves("f2f3 e7e5 g2g4 d8h4 a2a3"), MAX_LINE_MOVES)
+            .unwrap();
+        assert!(check_anchor(&root, &prior, &evidence, &AtomicBool::new(false)).is_err());
+    }
+    #[test]
     fn reported_repair_refuses_later_anchor_original_c_illegal_or_partial_model_line() {
         for case in 0..6 {
             let (root, mut prior, mut evidence) = fixture();
