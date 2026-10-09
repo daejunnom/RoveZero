@@ -4,12 +4,14 @@
 //! `bootstrap-material-pst-v1`의 차례 관점 raw 단위이며 학습 값이나 보정된 CP가 아니다.
 //! TT의 짧은 hash는 slot 선택만 담당한다. 재사용은 전체 알려진 Rules 이력의
 //! `PositionIdentity`, profile, 남은 깊이와 bound를 함께 검사한다.
-//! 중단된 노드는 저장하지 않으며, 체크에서 quiescence 한도에 도달하면 static
+//! 기본 재귀 정책은 중단된 노드를 저장하지 않는다. opt-in PausedStack은 실제
+//! 미완료 프레임과 Rules/accumulator 소유자를 보존한다. 체크에서 quiescence 한도에 도달하면 static
 //! stand-pat을 반환하는 대신 현재 iteration을 명시적으로 중단한다.
 //! LegalSeeV1은 명시적으로 선택하는 ordering 변경이다. 제한된 동일 칸의
 //! material 교환 minimax만 계산하며 게임 값·전술 증명·pruning bound가 아니다.
 
 mod see;
+mod stack;
 
 use crate::cpu_value::{
     BootstrapCpuValue, CpuAccumulator, CpuValueError, CpuValueEvaluator, CpuValueIdentity,
@@ -26,6 +28,9 @@ use std::time::{Duration, Instant};
 
 pub const CPU_SEARCH_VERSION: &str = "rz-cpu-pvs/0.1";
 pub const CPU_SEE_SEARCH_VERSION: &str = "rz-cpu-pvs-legal-see/0.1";
+pub const CPU_PAUSED_STACK_SEARCH_VERSION: &str = "rz-cpu-pvs-paused-stack/0.1";
+pub const CPU_PAUSED_STACK_SEE_SEARCH_VERSION: &str = "rz-cpu-pvs-legal-see-paused-stack/0.1";
+pub const CPU_PAUSED_STACK_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const CPU_SEARCH_CONDITIONS: &str = "iterative-deepening:1..requested;root-window:full-first,aspiration40-following,full-when-mate-or-fail-inclusive;pvs:first-full,following-zero-window,strict-interior-research;qsearch:tactical-capture-ep-promotion,all-check-evasions,no-check-standpat;q-limit:checked-abort;tt:direct-mapped,full-history-value-profile,equal-remaining-depth,completed-nodes-only;selectivity:no-reductions-no-nullmove;ties:Rules-order;score:side-to-move-raw";
 pub const BOOTSTRAP_SCORE_VERSION: &str = "bootstrap-material-pst-v1";
 pub const CPU_MATE_SCORE: i32 = 30_000;
@@ -54,6 +59,24 @@ impl CpuOrderingPolicy {
         match self {
             Self::LegacyMvvLvaV1 => "cpu-ordering-mvv-lva-v1",
             Self::LegalSeeV1 => "cpu-ordering-rules-legal-target-exchange-v1",
+        }
+    }
+}
+
+/// Explicit startup choice. Historical constructors keep recursive search and
+/// completed-iteration resume. PausedStack retains one actual owned traversal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum CpuResumePolicy {
+    #[default]
+    CompletedIteration,
+    PausedStack,
+}
+
+impl CpuResumePolicy {
+    pub fn identity(self) -> &'static str {
+        match self {
+            Self::CompletedIteration => "cpu-resume-completed-iteration-v1",
+            Self::PausedStack => "cpu-resume-paused-stack-v1",
         }
     }
 }
@@ -185,8 +208,8 @@ pub struct CpuReport {
     pub root_restricted: bool,
     pub elapsed: Duration,
     pub reused_completed_depth: u16,
-    /// Resume only after the last completed iteration. Interrupted node stacks
-    /// are discarded; a new finite budget continues at completed_depth + 1.
+    /// Historical policy resumes after a completed iteration. The explicit
+    /// PausedStack policy may instead return a one-use engine-owned stack token.
     pub resume: Option<CpuResumeToken>,
 }
 
@@ -219,6 +242,31 @@ pub struct CpuResumeToken {
     completed_depth: u16,
     score: i32,
     pv: Vec<BoardMove>,
+    paused_stack: Option<PausedStackToken>,
+}
+
+#[derive(Clone, Debug)]
+struct PausedStackToken {
+    owner: Arc<()>,
+    serial: u64,
+    cumulative: CpuWork,
+    retained_bytes: usize,
+}
+
+impl CpuResumeToken {
+    pub fn is_paused_stack(&self) -> bool {
+        self.paused_stack.is_some()
+    }
+
+    /// Previously consumed work is diagnostic only; report counters always
+    /// cover newly consumed work from the current invocation.
+    pub fn cumulative_work(&self) -> Option<CpuWork> {
+        self.paused_stack.as_ref().map(|token| token.cumulative)
+    }
+
+    pub fn paused_stack_bytes(&self) -> Option<usize> {
+        self.paused_stack.as_ref().map(|token| token.retained_bytes)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -227,6 +275,10 @@ pub enum CpuError {
     InvalidLimits(&'static str),
     InvalidRootMoves(&'static str),
     ResumeMismatch(&'static str),
+    PausedStackMemoryLimit {
+        retained_bytes: usize,
+        maximum_bytes: usize,
+    },
     Unsupported(&'static str),
     Allocation,
     Rules(PositionError),
@@ -240,6 +292,13 @@ impl std::fmt::Display for CpuError {
             Self::InvalidLimits(message) => write!(f, "CPU limits: {message}"),
             Self::InvalidRootMoves(message) => write!(f, "CPU root moves: {message}"),
             Self::ResumeMismatch(message) => write!(f, "CPU resume: {message}"),
+            Self::PausedStackMemoryLimit {
+                retained_bytes,
+                maximum_bytes,
+            } => write!(
+                f,
+                "CPU paused stack retains {retained_bytes} bytes, above {maximum_bytes} bytes"
+            ),
             Self::Unsupported(message) => write!(f, "CPU capability unavailable: {message}"),
             Self::Allocation => f.write_str("CPU TT allocation refused"),
             Self::Rules(error) => write!(f, "CPU rules failure: {error}"),
@@ -285,6 +344,10 @@ pub struct CpuEngine {
     evaluator: Arc<dyn CpuValueEvaluator>,
     value_identity: Arc<CpuValueIdentity>,
     last_attempt_work: Option<CpuWork>,
+    resume_policy: CpuResumePolicy,
+    paused: Option<stack::PausedTask>,
+    stack_owner: Arc<()>,
+    stack_serial: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -310,6 +373,20 @@ pub trait CpuSearcher: Send {
     /// checkers must declare their own conditions rather than inheriting PVS.
     fn search_conditions(&self) -> String;
     fn capabilities(&self) -> CpuCapabilities;
+    fn resume_policy(&self) -> CpuResumePolicy {
+        CpuResumePolicy::CompletedIteration
+    }
+    /// Retained traversal bytes, excluding the already configured TT/history
+    /// owner. None means there is no live paused traversal.
+    fn paused_stack_bytes(&self) -> Option<usize> {
+        None
+    }
+    /// Read-only ownership query, without executing or charging work. For a
+    /// PausedStack token this must prove that its actual frame owner is live.
+    /// Unknown custom ownership is not reported as current.
+    fn token_is_current(&self, _token: &CpuResumeToken) -> bool {
+        false
+    }
     /// None means work was not observed. Never substitute invented zero work.
     /// The default preserves unknown accounting for custom implementations.
     fn last_attempt_work(&self) -> Option<CpuWork> {
@@ -366,6 +443,15 @@ impl<C: CpuSearcher + ?Sized> CpuSearcher for Box<C> {
     }
     fn capabilities(&self) -> CpuCapabilities {
         (**self).capabilities()
+    }
+    fn resume_policy(&self) -> CpuResumePolicy {
+        (**self).resume_policy()
+    }
+    fn paused_stack_bytes(&self) -> Option<usize> {
+        (**self).paused_stack_bytes()
+    }
+    fn token_is_current(&self, token: &CpuResumeToken) -> bool {
+        (**self).token_is_current(token)
     }
     fn last_attempt_work(&self) -> Option<CpuWork> {
         (**self).last_attempt_work()
@@ -433,6 +519,15 @@ impl CpuSearcher for CpuEngine {
             completed_iteration_resume: true,
             selective_reductions: false,
         }
+    }
+    fn resume_policy(&self) -> CpuResumePolicy {
+        CpuEngine::resume_policy(self)
+    }
+    fn paused_stack_bytes(&self) -> Option<usize> {
+        CpuEngine::paused_stack_bytes(self)
+    }
+    fn token_is_current(&self, token: &CpuResumeToken) -> bool {
+        CpuEngine::token_is_current(self, token)
     }
     fn last_attempt_work(&self) -> Option<CpuWork> {
         CpuEngine::last_attempt_work(self)
@@ -531,6 +626,32 @@ impl CpuEngine {
         evaluator: Arc<dyn CpuValueEvaluator>,
         ordering: CpuOrderingPolicy,
     ) -> Result<Self, CpuError> {
+        Self::with_evaluator_ordering_and_resume_policy(
+            config,
+            evaluator,
+            ordering,
+            CpuResumePolicy::CompletedIteration,
+        )
+    }
+
+    pub fn with_resume_policy(
+        config: CpuConfig,
+        resume_policy: CpuResumePolicy,
+    ) -> Result<Self, CpuError> {
+        Self::with_evaluator_ordering_and_resume_policy(
+            config,
+            Arc::new(BootstrapCpuValue::default()),
+            CpuOrderingPolicy::LegacyMvvLvaV1,
+            resume_policy,
+        )
+    }
+
+    pub fn with_evaluator_ordering_and_resume_policy(
+        config: CpuConfig,
+        evaluator: Arc<dyn CpuValueEvaluator>,
+        ordering: CpuOrderingPolicy,
+        resume_policy: CpuResumePolicy,
+    ) -> Result<Self, CpuError> {
         config.tt_allocation_bytes()?;
         evaluator.identity().validate().map_err(CpuError::Value)?;
         if config.max_depth == 0 || config.max_depth > MAX_DEPTH {
@@ -551,6 +672,10 @@ impl CpuEngine {
             value_identity: Arc::new(evaluator.identity().clone()),
             evaluator,
             last_attempt_work: None,
+            resume_policy,
+            paused: None,
+            stack_owner: Arc::new(()),
+            stack_serial: 0,
         })
     }
 
@@ -563,10 +688,43 @@ impl CpuEngine {
     }
 
     pub fn search_identity(&self) -> &'static str {
-        match self.ordering {
-            CpuOrderingPolicy::LegacyMvvLvaV1 => CPU_SEARCH_VERSION,
-            CpuOrderingPolicy::LegalSeeV1 => CPU_SEE_SEARCH_VERSION,
+        match (self.ordering, self.resume_policy) {
+            (CpuOrderingPolicy::LegacyMvvLvaV1, CpuResumePolicy::CompletedIteration) => {
+                CPU_SEARCH_VERSION
+            }
+            (CpuOrderingPolicy::LegalSeeV1, CpuResumePolicy::CompletedIteration) => {
+                CPU_SEE_SEARCH_VERSION
+            }
+            (CpuOrderingPolicy::LegacyMvvLvaV1, CpuResumePolicy::PausedStack) => {
+                CPU_PAUSED_STACK_SEARCH_VERSION
+            }
+            (CpuOrderingPolicy::LegalSeeV1, CpuResumePolicy::PausedStack) => {
+                CPU_PAUSED_STACK_SEE_SEARCH_VERSION
+            }
         }
+    }
+
+    pub fn resume_policy(&self) -> CpuResumePolicy {
+        self.resume_policy
+    }
+
+    pub fn paused_stack_bytes(&self) -> Option<usize> {
+        self.paused.as_ref().map(|task| task.retained_bytes())
+    }
+
+    /// Paused tokens require the one live engine-owned traversal. Historical
+    /// completed tokens have no frame owner and report namespace compatibility.
+    pub fn token_is_current(&self, token: &CpuResumeToken) -> bool {
+        if token.is_paused_stack() {
+            return stack::token_is_current(self, token);
+        }
+        token.completed_depth > 0
+            && token.completed_depth <= self.config.max_depth
+            && token.profile == self.config.profile
+            && token.quiescence_ply == self.config.quiescence_ply
+            && token.value_identity == *self.value_identity
+            && self.evaluator.identity() == self.value_identity.as_ref()
+            && token.search_conditions == self.search_conditions()
     }
 
     /// Full immutable value namespace used by this engine's TT and resume.
@@ -582,11 +740,18 @@ impl CpuEngine {
             self.config.quiescence_ply,
             self.config.tt_entries
         );
-        match self.ordering {
+        let conditions = match self.ordering {
             CpuOrderingPolicy::LegacyMvvLvaV1 => legacy,
             CpuOrderingPolicy::LegalSeeV1 => format!(
                 "{legacy};ordering={};exchange:all-Rules-legal-recaptures-on-target,optional-stop-zero,material-only,P100-N320-B330-R500-Q900-K0,no-pruning,max-plies32,max-positions-per-order{MAX_SEE_POSITIONS_PER_ORDER},typed-fail-on-exhaustion;ordering-priority:TT,nonnegative-exchange,quiet-history,negative-exchange;node-work:search+qsearch+exchange;exchange-cancel-deadline:original",
                 self.ordering.identity()
+            ),
+        };
+        match self.resume_policy {
+            CpuResumePolicy::CompletedIteration => conditions,
+            CpuResumePolicy::PausedStack => format!(
+                "{conditions};resume={};paused-owner:single-use-root-full-history-restriction-profile-value-conditions-target-depth;paused-memory:max-1-task-8388608-bytes;consumed-work:no-replay-no-recharge;cancel-newgame-fresh-analysis:invalidate",
+                self.resume_policy.identity()
             ),
         }
     }
@@ -600,9 +765,18 @@ impl CpuEngine {
 
     /// New game ownership boundary; no TT/history evidence crosses this call.
     pub fn clear(&mut self) {
+        self.invalidate_paused_stack();
         self.tt.iter_mut().for_each(|entry| *entry = None);
         *self.history = [[[0; 64]; 64]; 2];
         self.last_attempt_work = None;
+    }
+
+    fn invalidate_paused_stack(&mut self) {
+        self.paused = None;
+        // Tokens retain their old Arc; a fresh allocation cannot share its
+        // identity while an old token remains alive.
+        self.stack_owner = Arc::new(());
+        self.stack_serial = 0;
     }
 
     pub fn analyze(
@@ -653,6 +827,7 @@ impl CpuEngine {
         cancellation: &AtomicBool,
     ) -> Result<CpuReport, CpuError> {
         self.last_attempt_work = Some(CpuWork::default());
+        self.invalidate_paused_stack();
         if prefix.len() > MAX_DEPTH as usize {
             return Err(CpuError::InvalidLimits("divergence prefix exceeds 64 ply"));
         }
@@ -671,6 +846,22 @@ impl CpuEngine {
         cancellation: &AtomicBool,
     ) -> Result<CpuReport, CpuError> {
         self.last_attempt_work = Some(CpuWork::default());
+        if self.resume_policy == CpuResumePolicy::PausedStack {
+            return stack::run(
+                self,
+                position,
+                token.root_moves.as_deref(),
+                limits,
+                cancellation,
+                Some(token),
+                &mut |_| {},
+            );
+        }
+        if token.paused_stack.is_some() {
+            return Err(CpuError::ResumeMismatch(
+                "paused stack belongs to another policy",
+            ));
+        }
         if token.root != position.position_identity() {
             return Err(CpuError::ResumeMismatch(
                 "Rules state or full known history changed",
@@ -709,6 +900,17 @@ impl CpuEngine {
         resume: Option<&CpuResumeToken>,
         observer: &mut dyn FnMut(CpuIterationProgress),
     ) -> Result<CpuReport, CpuError> {
+        if self.resume_policy == CpuResumePolicy::PausedStack {
+            return stack::run(
+                self,
+                position,
+                root_moves,
+                limits,
+                cancellation,
+                resume,
+                observer,
+            );
+        }
         self.last_attempt_work = Some(CpuWork::default());
         self.validate_limits(position, limits)?;
         let started = Instant::now();
@@ -856,6 +1058,7 @@ impl CpuEngine {
             completed_depth,
             score,
             pv: best.clone(),
+            paused_stack: None,
         });
         Ok(CpuReport {
             best_move: best.first().copied(),
