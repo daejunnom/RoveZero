@@ -160,11 +160,17 @@ class NativeRecheckBoundaryTests(unittest.TestCase):
                 witness._policy_identity(value)
 
     def test_policy_rejects_unknown_disabled_and_extra_field(self):
-        for policy in ("Disabled", "same-repaired-line-once-v1", None):
+        for policy in ("Disabled", "same-repaired-line-once-v1", "actual_opponent_continuation_v1", "actual-opponent-continuation-v1", None):
             value = copy.deepcopy(witness._POLICY)
             value["policy"] = policy
             with self.assertRaises(witness.UnsupportedNativeRecheck):
                 witness._policy_identity(value)
+        actual_continuation = {"version": "pals-post-repair-continuation/1",
+            "policy": "actual_opponent_continuation_v1",
+            "search_identity": "pals-restricted-refinement-post-repair-continuation/1",
+            "conditions_sha256": list(bytes.fromhex("876c7104c28183131243101df86c386865bf903f26545edde01d48de4403d4d1"))}
+        with self.assertRaises(witness.UnsupportedNativeRecheck):
+            witness._policy_identity(actual_continuation)
         value = copy.deepcopy(witness._POLICY)
         value["completed"] = True
         with self.assertRaises(ValueError):
@@ -642,12 +648,12 @@ class NativeRecheckWholeGateTests(unittest.TestCase):
 # A source successor requires an explicit new review and deliberate fixture edit.
 REVIEWED_WHOLE_SOURCE_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
-        "bytes": 344097,
-        "sha256": "0a0a4800e940700721ec856ab86c8d8dbb581f6291fd78976ce1f918ea5a40c3",
+        "bytes": 354492,
+        "sha256": "fab843bc71b7e4b3584a437b7b4d89515be8b7ae12a2ba36ade83086c74c6618",
     },
     "crates/rz-arena/src/pals_collect/native.rs": {
-        "bytes": 193840,
-        "sha256": "2c2bfb1c8717a68429d315fa576268ba95b9b6106caed57400b885f656d04ae7",
+        "bytes": 195372,
+        "sha256": "e25fc205f895825607a15292a5c23ed6ccfe425f4c6134201a52fe68ca13df1c",
     },
 }
 

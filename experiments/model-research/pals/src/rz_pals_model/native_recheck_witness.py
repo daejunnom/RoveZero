@@ -64,6 +64,15 @@ _REVIEWED_OPT_IN_SOURCE_PROFILES = (
         "crates/rz-arena/src/pals_collect/native.rs": {
             "bytes": 193840, "sha256": "2c2bfb1c8717a68429d315fa576268ba95b9b6106caed57400b885f656d04ae7"},
     }),
+    # Reviewed old single-Reply branch only. The collector now explicitly
+    # refuses actual C continuation at registration and observer boundaries.
+    # This profile does not admit that new lane or its multiple Reply calls.
+    ("opt_in_single_reply_guarded_fab843bc_native_e25fc205", {
+        "crates/rz-search/src/pals/engine.rs": {
+            "bytes": 354492, "sha256": "fab843bc71b7e4b3584a437b7b4d89515be8b7ae12a2ba36ade83086c74c6618"},
+        "crates/rz-arena/src/pals_collect/native.rs": {
+            "bytes": 195372, "sha256": "e25fc205f895825607a15292a5c23ed6ccfe425f4c6134201a52fe68ca13df1c"},
+    }),
 )
 _POLICY = {
     "version": "pals-post-repair-recheck/1",

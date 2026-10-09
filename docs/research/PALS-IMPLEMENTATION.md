@@ -3182,3 +3182,13 @@ driver identity, manifest/receipt의 old/new tuple 치환, mock/CPU/CUDA 선언�
 로컬 heavy CPU·GPU·실제 학습은 실행하지 않았다. 소스의 CI 인수는 정확한 새 HEAD에서
 별도로 확인한다. 실제 native 다중 Reply 인수, 등록된 observed 4N 실행·strict Query
 prior·whole-action cost·utility 및 paired 대국 인수는 계속 남는다.
+
+
+현재 C continuation 통합의 첫 CI `aaa37fd`에서 Linux·Windows·bindings는 성공했으나,
+model CPU 576개 중 기존 source review pin과 현재 Rust bytes가 달라 52 failure/3 error가
+발생했다. 이 실패 run과 네 원시 job log는 보존한다. 최종 고정 Rust engine/collector
+pair를 수동 대조하고 Disabled 및 기존 single-Reply branch만 literal review profile에
+추가한다. 모든 이전 pair와 policy 검사를 유지한다. Python 제품 변경은 이 두 정적
+allowlist의 pin 등록에 한정하며 실행·수락 알고리즘과 `_POLICY`는 동일 AST다.
+독립 fixture의 literal pin과 새 lane 거부 subcase를 갱신한다. 새 다중 C policy,
+별도 binary의 실행 또는 NN 물리 완료를 이 pin 갱신으로 인수하지 않는다.

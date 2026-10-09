@@ -82,6 +82,13 @@ _REVIEWED_DISABLED_REPLAY_MODULE_SOURCES = (
     {"bytes": 344097, "sha256": "0a0a4800e940700721ec856ab86c8d8dbb581f6291fd78976ce1f918ea5a40c3"},
     {"bytes": 193840, "sha256": "2c2bfb1c8717a68429d315fa576268ba95b9b6106caed57400b885f656d04ae7"},
 )
+# Reviewed DEFAULT-only successor. The new C continuation is opt-in; the
+# collector retains Disabled, and the policy checks below still exclude every
+# selected lane. Literal source-pair review does not certify a native execution.
+_REVIEWED_DISABLED_C_CONTINUATION_OWNER_SOURCES = (
+    {"bytes": 354492, "sha256": "fab843bc71b7e4b3584a437b7b4d89515be8b7ae12a2ba36ade83086c74c6618"},
+    {"bytes": 195372, "sha256": "e25fc205f895825607a15292a5c23ed6ccfe425f4c6134201a52fe68ca13df1c"},
+)
 _SOURCE_REVIEW_PROFILES = (
     ("legacy_prepared_lineage_4469f9d", _REVIEWED_SOURCES),
     ("legacy_disabled_recheck_9c0de959", _REVIEWED_DISABLED_RECHECK_SOURCES),
@@ -90,6 +97,7 @@ _SOURCE_REVIEW_PROFILES = (
     ("legacy_disabled_search_return_9653ed5e", _REVIEWED_DISABLED_SEARCH_RETURN_SOURCES),
     ("legacy_disabled_search_return_clock_lint_2c2bfb1c", _REVIEWED_DISABLED_SEARCH_RETURN_CLOCK_LINT_SOURCES),
     ("legacy_disabled_replay_module_0a0a4800_native_2c2bfb1c", _REVIEWED_DISABLED_REPLAY_MODULE_SOURCES),
+    ("legacy_disabled_c_continuation_owner_fab843bc_native_e25fc205", _REVIEWED_DISABLED_C_CONTINUATION_OWNER_SOURCES),
 )
 _DISABLED_SEARCH_VERSION = "pals-restricted-refinement/0.1"
 _OPT_IN_LANE_FIELDS = ("pals_search_policy", "refinement_registration", "refinement_registration_sha256", "post_repair_recheck", "post_repair_recheck_policy", "post_repair_recheck_conditions",

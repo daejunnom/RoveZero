@@ -345,9 +345,9 @@ class NativeSlotRepairTests(unittest.TestCase):
         self.assertEqual(body["captured_input_revision"], 2)
         self.assertEqual(body["transition_profile"]["reviewed_transition_sources"], {
             "crates/rz-search/src/pals/engine.rs": {
-                "bytes": 344097, "sha256": "0a0a4800e940700721ec856ab86c8d8dbb581f6291fd78976ce1f918ea5a40c3"},
+                "bytes": 354492, "sha256": "fab843bc71b7e4b3584a437b7b4d89515be8b7ae12a2ba36ade83086c74c6618"},
             "crates/rz-arena/src/pals_collect/native.rs": {
-                "bytes": 193840, "sha256": "2c2bfb1c8717a68429d315fa576268ba95b9b6106caed57400b885f656d04ae7"},
+                "bytes": 195372, "sha256": "e25fc205f895825607a15292a5c23ed6ccfe425f4c6134201a52fe68ca13df1c"},
         })
         self.assertEqual(admission["scope"], "conditional_unique_prepared_lineage")
         self.assertFalse(body["direct_causal_ids_present"])
@@ -442,12 +442,16 @@ class NativeSlotRepairTests(unittest.TestCase):
             {"bytes": 343988, "sha256": "0302e49b6a9784641ca90aba17490d404b793098f38836b7b3cf42a12ee131d1"},
             {"bytes": 153861, "sha256": "098005ae44fe5c5a9b0a2181d8cde32a40c3eeaaf0e733e2d92ec6859fd424e5"})))
         self.assertEqual(slot_witness._reviewed_source_pair(earlier_observer), earlier_observer)
+        earlier_replay = dict(zip(slot_witness._SOURCE_PATHS, (
+            {"bytes": 344097, "sha256": "0a0a4800e940700721ec856ab86c8d8dbb581f6291fd78976ce1f918ea5a40c3"},
+            {"bytes": 193840, "sha256": "2c2bfb1c8717a68429d315fa576268ba95b9b6106caed57400b885f656d04ae7"})))
+        self.assertEqual(slot_witness._reviewed_source_pair(earlier_replay), earlier_replay)
         current = {path: semantic.byte_pin(value) for path, value in zip(slot_witness._SOURCE_PATHS,
             (self.fixture.engine_raw, self.fixture.native_raw))}
         self.assertEqual(current[slot_witness._SOURCE_PATHS[0]],
-            {"bytes": 344097, "sha256": "0a0a4800e940700721ec856ab86c8d8dbb581f6291fd78976ce1f918ea5a40c3"})
+            {"bytes": 354492, "sha256": "fab843bc71b7e4b3584a437b7b4d89515be8b7ae12a2ba36ade83086c74c6618"})
         self.assertEqual(current[slot_witness._SOURCE_PATHS[1]],
-            {"bytes": 193840, "sha256": "2c2bfb1c8717a68429d315fa576268ba95b9b6106caed57400b885f656d04ae7"})
+            {"bytes": 195372, "sha256": "e25fc205f895825607a15292a5c23ed6ccfe425f4c6134201a52fe68ca13df1c"})
         self.assertEqual(slot_witness._reviewed_source_pair(current), current)
         self.assertNotEqual(current, old)
 
@@ -527,7 +531,7 @@ class NativeSlotRepairTests(unittest.TestCase):
     def test_all_policy_owners_preserve_omission_and_legacy_but_refuse_other_search_versions(self):
         values = source_review_raws(self.fixture)
         for owner in ("source", "native", "search_configuration", "independent_registry"):
-            for version in (None, "pals-restricted-refinement-post-repair-recheck/1", "unknown-search-version/1"):
+            for version in (None, "pals-restricted-refinement-post-repair-recheck/1", "pals-restricted-refinement-post-repair-continuation/1", "unknown-search-version/1"):
                 with self.subTest(owner=owner, version=version):
                     source = copy.deepcopy(self.fixture.source)
                     target = source if owner == "source" else source["native"] if owner == "native" else source["native"].setdefault(owner, {})
