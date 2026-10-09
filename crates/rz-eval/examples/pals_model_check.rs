@@ -21,6 +21,10 @@ use std::path::Path;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "experimental-io-binding")]
+#[path = "pals_model_check/resident_cuda.rs"]
+mod resident_cuda;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Fixtures {
@@ -733,6 +737,15 @@ fn mapping_json(phase: &str, observed: &NativeMappingObservation) -> serde_json:
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args: Vec<_> = std::env::args().skip(1).collect();
+    #[cfg(feature = "experimental-io-binding")]
+    let resident_check = resident_cuda::Selection::take(&mut args)?;
+    #[cfg(not(feature = "experimental-io-binding"))]
+    if args.iter().any(|arg| arg == "--check-cuda-record-pages") {
+        return Err(
+            "resident CUDA correctness requires the explicit experimental-io-binding build feature"
+                .into(),
+        );
+    }
     let check_record_pages = args.last().is_some_and(|arg| arg == HOST_PAGE_CHECK_FLAG);
     if check_record_pages {
         args.pop();
@@ -748,7 +761,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     if !matches!(args.len(), 8 | 9 | 11) {
-        return Err("usage: pals_model_check EXPORT.json EXPORT_SHA256 ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu|cuda|cuda-device|cuda-control|cuda-control-shim CACHE_ROOT [CUDA_BUNDLE.json] [INVENTORY_V2.json INVENTORY_SHA256]; CPU-only optional trailing --check-host-record-pages".into());
+        return Err("usage: pals_model_check EXPORT.json EXPORT_SHA256 ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu|cuda|cuda-device|cuda-control|cuda-control-shim CACHE_ROOT [CUDA_BUNDLE.json] [INVENTORY_V2.json INVENTORY_SHA256]; CPU-only optional trailing --check-host-record-pages; Linux cuda-control-shim optional trailing --check-cuda-record-pages MANIFEST SHA256 GRAPH SHA256 RESOURCES.json".into());
     }
     let is_cuda = match (args[6].as_str(), args.len()) {
         ("cpu", 8) => false,
@@ -1201,6 +1214,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         fields.insert(
             "host_record_page_correctness".into(),
             check_host_record_pages(&fixtures, runtime.clone(), Path::new(&args[0]), &args[1])?,
+        );
+    }
+    #[cfg(feature = "experimental-io-binding")]
+    if let Some(selection) = resident_check {
+        fields.insert(
+            "resident_cuda_record_correctness".into(),
+            selection.check(resident_cuda::Context {
+                fixtures: &fixtures,
+                runtime: runtime.clone(),
+                export: Path::new(&args[0]),
+                export_sha: &args[1],
+                policy: control_policy
+                    .as_ref()
+                    .ok_or("resident correctness has no explicit CUDA policy")?,
+                config,
+                report,
+            })?,
         );
     }
     let mut output = std::fs::OpenOptions::new()

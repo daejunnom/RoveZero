@@ -786,7 +786,7 @@ def _checked_producer_source(raw, registration, pin):
 
 
 def load_frozen_collected_dataset(directory, *, expected_receipt_sha256, producer_registrations,
-                                  max_input_bytes=64 * 1024 * 1024):
+                                  max_input_bytes=64 * 1024 * 1024, continuation_registration=None):
     """Strict CPU preparation admission; a missing/failed artifact never retries legacy.
 
     Each independent entry supplies ``pin`` (the complete game/producer roster
@@ -796,6 +796,8 @@ def load_frozen_collected_dataset(directory, *, expected_receipt_sha256, produce
     pin must come from the completed collector/audit, not this loader's output.
     Native callbacks and raw row bytes are checked in addition to metadata.
     Private derived encodings require a separate adapter and are refused here.
+    Multi-Reply continuation/2 requires its independent policy registration and
+    original journals. Its extra audit is observation only, never target authority.
     """
     from . import frozen_producer as metadata
 
@@ -1013,15 +1015,37 @@ def load_frozen_collected_dataset(directory, *, expected_receipt_sha256, produce
         admitted_inputs.append({"binding": binding, "producer": pin, "prepared_evidence_sha256": binding["capture_evidence_sha256"]})
     if set(encodings) != set(frozen):
         raise ValueError("strict frozen collection lacks per-input producer encoding")
+    continuation = None
+    if "native-continuation-traces.jsonl" in artifacts:
+        from . import native_continuation as continuation_consumer
+        declaration = _fields(continuation_registration, ("registration_path", "sha256"),
+                              "independent continuation registration")
+        policy_path = Path(declaration["registration_path"])
+        if not policy_path.is_absolute() or any(
+                part.lower() == ".env" or part.lower().startswith((".env.", "id_rsa", "id_ed25519"))
+                or part.lower().endswith((".key", ".pem")) or "credential" in part.lower()
+                or "service-account" in part.lower() or "service_account" in part.lower() for part in policy_path.parts):
+            raise ValueError("continuation registration requires an absolute public data path")
+        policy_bytes = read(policy_path, maximum=32 * 1024)
+        continuation_files = {name: read(directory / name, artifacts.get(name))
+                              for name in continuation_consumer.REQUIRED_ARTIFACTS if name in artifacts}
+        continuation = continuation_consumer.audit_native_continuation_collection(
+            receipt_bytes=receipt_bytes, artifact_bytes=continuation_files,
+            expected_receipt_sha256=expected_receipt_sha256, policy_registration_bytes=policy_bytes,
+            expected_policy_registration_sha256=_sha(declaration["sha256"]), max_input_bytes=max_input_bytes)
+    elif continuation_registration is not None:
+        raise ValueError("continuation registration supplied without original continuation trace")
     result._attach_encodings(encodings)
     result.collection_receipt = copy.deepcopy(receipt)
+    result.native_continuation_observation = copy.deepcopy(continuation)
     result._attach_frozen_admission({"version": FROZEN_ADMISSION_DOMAIN, "receipt": _byte_pin(receipt_bytes),
                                      "artifacts": {name: _byte_pin(raw) for name, raw in raw_files.items()},
                                      "producer_registrations": registration_assets, "inputs": admitted_inputs,
                                      "metadata_audit": audit, "owned_sources": registry,
                                      "raw_dataset_sha256": envelope["envelope"]["raw_dataset_sha256"],
                                      "split_sha256": envelope["envelope"]["split_sha256"],
-                                     "current_view_sha256": result.current_view.sha256})
+                                     "current_view_sha256": result.current_view.sha256,
+                                     **({"native_continuation_observation": continuation} if continuation is not None else {})})
     return result
 
 
@@ -1120,6 +1144,9 @@ class ValidatedDataset:
             raise ValueError("checked frozen current label view changed")
         if _canonical("rz-pals-frozen-receipt-view/1", self.collection_receipt) != self._frozen_receipt_identity:
             raise ValueError("checked frozen receipt provenance changed")
+        if (getattr(self, "native_continuation_observation", None)
+                != self.frozen_admission.get("native_continuation_observation")):
+            raise ValueError("checked continuation observation changed")
         if (_sorted_canonical("rz-pals-checked-native-encodings/1", self._encoding_identities)
                 != self.frozen_admission["encoding_identities_sha256"]):
             raise ValueError("checked frozen encoding admission changed")
