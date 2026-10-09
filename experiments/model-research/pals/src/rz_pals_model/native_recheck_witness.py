@@ -73,6 +73,12 @@ _REVIEWED_OPT_IN_SOURCE_PROFILES = (
         "crates/rz-arena/src/pals_collect/native.rs": {
             "bytes": 195372, "sha256": "e25fc205f895825607a15292a5c23ed6ccfe425f4c6134201a52fe68ca13df1c"},
     }),
+    # Reviewed legacy single-Reply branch only; the new observer has a
+    # separate policy, registration and artifact, rejected by this consumer.
+    ("opt_in_legacy_single_reply_with_multi_observer_b813828e", {
+        "crates/rz-search/src/pals/engine.rs": {'bytes': 354492, 'sha256': 'fab843bc71b7e4b3584a437b7b4d89515be8b7ae12a2ba36ade83086c74c6618'},
+        "crates/rz-arena/src/pals_collect/native.rs": {'bytes': 212711, 'sha256': 'b813828e9e469feb0769a35bb721f8fbfdf4c7dace9da92907372a757b822ba6'},
+    }),
 )
 _POLICY = {
     "version": "pals-post-repair-recheck/1",
