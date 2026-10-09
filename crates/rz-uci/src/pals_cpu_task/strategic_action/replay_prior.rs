@@ -6,14 +6,21 @@
 //! No Debug text, CPU score, native numeric ID or identity hash is a V feature.
 
 use super::super::replay_inputs::{ReplayAuthorities, ReplayExpectedPins, ReplayInputMode};
-use super::{AdmissionFault, CpuFreshAssetProfile, NativeReplayObservation};
+use super::{
+    AdmissionFault, CpuFreshAssetProfile, CpuStageObservation, NativeReplayObservation,
+    SnapshotText,
+};
 use rz_contracts::pals::Move16;
 use rz_position::BoardMove;
 use rz_search::cpu::{CpuCompletion, CpuScoreScope};
 use rz_search::pals::engine::RoleModel;
 use rz_search::pals::engine::replay::{FreshReplayOwner, ReplayCpuPhase, ReplayOpponentOutcome};
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
+
+#[path = "replay_reported.rs"]
+mod reported;
+pub use reported::{ReportedPriorConsistency, check_reported_prior_consistency};
 
 pub const SCHEMA: &str = "rz-pals-frozen-replay-query-prior/1";
 pub const SCOPE: &str = "registered_native_replay_projection_pending_caller_chronology";
@@ -66,7 +73,7 @@ impl Serialize for PackedMoves {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PriorPhase {
     Baseline,
@@ -84,7 +91,7 @@ impl From<ReplayCpuPhase> for PriorPhase {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PriorCompletion {
     DepthLimit,
@@ -106,7 +113,7 @@ impl From<CpuCompletion> for PriorCompletion {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PriorOutcome {
     Unobserved,
@@ -165,7 +172,7 @@ impl PriorStage {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PriorReadiness {
     Unobserved,
@@ -433,6 +440,143 @@ fn classify(
     observation: &NativeReplayObservation,
     projection: &ReplayQueryPrior,
 ) -> PriorReadiness {
+    classify_readiness(&ReadinessObservation::from(observation), projection)
+}
+
+/// Common fact view for live native observations and separately labelled caller
+/// reports. Constructing this view does not manufacture a native witness.
+struct ReadinessObservation<'a> {
+    canceled: bool,
+    deadline_exceeded: bool,
+    original_whole_wall_ms: u64,
+    cleanup_reserve_ms: u64,
+    elapsed_ms: u64,
+    input_admission: ReadinessInput,
+    status: &'a str,
+    replay_returned_ok: bool,
+    owner_created: bool,
+    model_returned: bool,
+    replay_attempted: bool,
+    assets_source_admitted: bool,
+    replay_state: &'a SnapshotText,
+    opponent_state: Option<&'a SnapshotText>,
+    outcome: &'a SnapshotText,
+    trace_complete: bool,
+    stages: &'a [CpuStageObservation],
+    cpu_tasks_requested: Option<u64>,
+    cpu_tasks_accounted: Option<u64>,
+    cpu_reports_returned: Option<u64>,
+    cpu_work_observation_incomplete: Option<bool>,
+    cpu_nodes_lower_bound: Option<u64>,
+    cleanup_attempted: bool,
+    cleanup_returned_ok: bool,
+    native_cleanup_missing: bool,
+    native_bindings_observed: usize,
+    native_ready_observed: usize,
+    native_terminal_missing: usize,
+    native_completion_unknown_observed: usize,
+    native_receipt: Option<ClosureReceipt>,
+}
+struct ReadinessInput {
+    whole_wall_ms: u64,
+    cleanup_reserve_ms: u64,
+    cpu_allowance: u64,
+}
+#[derive(Deserialize)]
+struct ClosureReceipt {
+    physical_shutdown_confirmed: bool,
+    native_buffers_released: bool,
+    quarantined: bool,
+    physical_runs_in_flight: u64,
+    observer_failures: u64,
+    #[serde(deserialize_with = "required_option")]
+    last_observer_failure: Option<serde_json::Value>,
+    #[serde(deserialize_with = "required_option")]
+    last_failure: Option<serde_json::Value>,
+    failed_physical_role_calls: u64,
+    invalid_role_outputs: u64,
+    canceled_requests: u64,
+    expired_requests: u64,
+    completed_role_inputs: u64,
+    search_consumed_role_inputs: u64,
+    delivered_role_inputs: u64,
+    physically_completed_role_calls: u64,
+}
+fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+impl From<&crate::pals_native::NativeRoleReceipt> for ClosureReceipt {
+    fn from(n: &crate::pals_native::NativeRoleReceipt) -> Self {
+        Self {
+            physical_shutdown_confirmed: n.physical_shutdown_confirmed,
+            native_buffers_released: n.native_buffers_released,
+            quarantined: n.quarantined,
+            physical_runs_in_flight: n.physical_runs_in_flight,
+            observer_failures: n.observer_failures,
+            last_observer_failure: n
+                .last_observer_failure
+                .as_ref()
+                .map(|_| serde_json::Value::Null),
+            last_failure: n.last_failure.as_ref().map(|_| serde_json::Value::Null),
+            failed_physical_role_calls: n.failed_physical_role_calls,
+            invalid_role_outputs: n.invalid_role_outputs,
+            canceled_requests: n.canceled_requests,
+            expired_requests: n.expired_requests,
+            completed_role_inputs: n.completed_role_inputs,
+            search_consumed_role_inputs: n.search_consumed_role_inputs,
+            delivered_role_inputs: n.delivered_role_inputs,
+            physically_completed_role_calls: n.physically_completed_role_calls,
+        }
+    }
+}
+impl<'a> From<&'a NativeReplayObservation> for ReadinessObservation<'a> {
+    fn from(o: &'a NativeReplayObservation) -> Self {
+        Self {
+            canceled: o.canceled,
+            deadline_exceeded: o.deadline_exceeded,
+            original_whole_wall_ms: o.original_whole_wall_ms,
+            cleanup_reserve_ms: o.cleanup_reserve_ms,
+            elapsed_ms: o.elapsed_ms,
+            input_admission: ReadinessInput {
+                whole_wall_ms: o.input_admission.whole_wall_ms,
+                cleanup_reserve_ms: o.input_admission.cleanup_reserve_ms,
+                cpu_allowance: o.input_admission.cpu_allowance,
+            },
+            status: o.status,
+            replay_returned_ok: o.replay_returned_ok,
+            owner_created: o.owner_created,
+            model_returned: o.model_returned,
+            replay_attempted: o.replay_attempted,
+            assets_source_admitted: o.assets_source_admitted,
+            replay_state: &o.replay_state,
+            opponent_state: o.opponent_state.as_ref(),
+            outcome: &o.outcome,
+            trace_complete: o.trace_complete,
+            stages: &o.stages,
+            cpu_tasks_requested: o.cpu_tasks_requested,
+            cpu_tasks_accounted: o.cpu_tasks_accounted,
+            cpu_reports_returned: o.cpu_reports_returned,
+            cpu_work_observation_incomplete: o.cpu_work_observation_incomplete,
+            cpu_nodes_lower_bound: o.cpu_nodes_lower_bound,
+            cleanup_attempted: o.cleanup_attempted,
+            cleanup_returned_ok: o.cleanup_returned_ok,
+            native_cleanup_missing: o.native_cleanup_missing,
+            native_bindings_observed: o.native_bindings_observed,
+            native_ready_observed: o.native_ready_observed,
+            native_terminal_missing: o.native_terminal_missing,
+            native_completion_unknown_observed: o.native_completion_unknown_observed,
+            native_receipt: o.native_receipt.as_ref().map(ClosureReceipt::from),
+        }
+    }
+}
+fn classify_readiness(
+    observation: &ReadinessObservation<'_>,
+    projection: &ReplayQueryPrior,
+) -> PriorReadiness {
     // The old execution_deadline_exceeded tick includes cleanup. Cleanup may
     // legitimately cross E while remaining within W; use the actual work-return
     // tick for E and preserve the old diagnostic unchanged.
@@ -502,7 +646,7 @@ fn classify(
     for (at, (stage, raw)) in projection
         .stages()
         .iter()
-        .zip(&observation.stages)
+        .zip(observation.stages)
         .enumerate()
     {
         if stage.phase != Some(phases[at])
@@ -606,6 +750,8 @@ pub(super) mod tests {
         o.input_admission.mode = o.mode;
         o.input_admission.schema = o.mode.input_schema();
         o.input_admission
+            .conservative_repair_role_store_overreservation = false;
+        o.input_admission
             .registered_artifacts
             .opponent_recheck_source = Some(super::super::super::pin(b"controlled_source"));
         o.input_admission.cpu_allowance = 100;
@@ -701,6 +847,154 @@ pub(super) mod tests {
         )
         .unwrap()
         .readiness()
+    }
+    fn controlled_projection_source() -> super::super::super::ArtifactPin {
+        // Independent test fixture choice only, never a production source fallback.
+        super::super::super::pin(include_bytes!("replay_prior.rs"))
+    }
+    fn reported(
+        body: serde_json::Value,
+        o: &NativeReplayObservation,
+    ) -> Result<ReportedPriorConsistency, AdmissionFault> {
+        check_reported_prior_consistency(
+            body,
+            &controlled_expected(o),
+            &o.asset_profile_artifact,
+            &super::super::tests::profile(false),
+            &controlled_projection_source(),
+        )
+    }
+    #[test]
+    fn reported_readiness_recomputes_the_same_cpu_window_and_partial_scope_cases() {
+        for case in 0..7 {
+            let mut o = fixture();
+            match case {
+                0 => {}
+                1 => o.canceled = true,
+                2 => o.query_prior.as_mut().unwrap().stages[3].reused_completed_depth = Some(1),
+                3 => o.stages[2].report_nodes = Some(20),
+                4 => o.cpu_nodes_lower_bound = None,
+                5 => {
+                    let p = o.query_prior.as_mut().unwrap();
+                    p.outcome = PriorOutcome::RulesTerminalOpponentEndpoint;
+                    p.endpoint_rules_terminal = true;
+                    p.stage_count = 3;
+                    p.stages[3] = PriorStage::default();
+                    o.stages.truncate(3);
+                    o.cpu_tasks_requested = Some(3);
+                    o.cpu_tasks_accounted = Some(3);
+                    o.cpu_reports_returned = Some(3);
+                    o.cpu_nodes_lower_bound = Some(30);
+                }
+                _ => {
+                    o.execution_deadline_exceeded = true;
+                    o.elapsed_ms = 40_000;
+                }
+            }
+            let expected = ready(&o);
+            o.query_prior.as_mut().unwrap().readiness = expected;
+            let checked = reported(serde_json::to_value(&o).unwrap(), &o).unwrap();
+            assert_eq!(
+                checked.recomputed_reported_readiness(),
+                expected,
+                "case {case}"
+            );
+            assert_eq!(
+                checked.reported_projection().authorities,
+                ReplayAuthorities::default()
+            );
+            assert_eq!(checked.reported_projection().actual_utility_groups, 0);
+        }
+    }
+    #[test]
+    fn reported_readiness_overclaims_wrong_types_and_unknown_projection_are_refused() {
+        let mut o = fixture();
+        let computed = ready(&o);
+        o.query_prior.as_mut().unwrap().readiness = computed;
+        let body = serde_json::to_value(&o).unwrap();
+        for case in 0..6 {
+            let mut changed = body.clone();
+            match case {
+                0 => {
+                    changed["query_prior"]["readiness"] =
+                        serde_json::json!("complete_cpu_scope_pending_caller_chronology")
+                }
+                1 => changed["cpu_nodes_lower_bound"] = serde_json::json!(true),
+                2 => changed["query_prior"]["unknown_authority"] = serde_json::json!(true),
+                3 => {
+                    changed["stages"][3]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("report_present");
+                }
+                4 => {
+                    changed["query_prior"]["projection_source_sha256"] =
+                        serde_json::json!(vec![0u8; 32])
+                }
+                _ => {
+                    changed["input_admission"]["authorities"]["utility_authority"] =
+                        serde_json::json!(true)
+                }
+            }
+            assert!(reported(changed, &o).is_err(), "case {case}");
+        }
+    }
+    #[test]
+    fn reported_complete_closure_is_only_a_report_and_retains_no_native_witness_authority() {
+        let mut o = fixture();
+        o.query_prior.as_mut().unwrap().readiness =
+            PriorReadiness::CompleteCpuScopePendingCallerChronology;
+        let mut body = serde_json::to_value(&o).unwrap();
+        body["cleanup_attempted"] = serde_json::json!(true);
+        body["cleanup_returned_ok"] = serde_json::json!(true);
+        body["native_cleanup_missing"] = serde_json::json!(false);
+        body["native_bindings_observed"] = serde_json::json!(1);
+        body["native_ready_observed"] = serde_json::json!(1);
+        body["native_terminal_missing"] = serde_json::json!(0);
+        body["native_completion_unknown_observed"] = serde_json::json!(0);
+        let profile = super::super::tests::profile(false);
+        let expected = controlled_expected(&o);
+        // Synthetic reported closure, deliberately NOT a NativeRoleReceipt.
+        body["native_receipt"] = serde_json::json!({
+            "model_epoch":super::super::digest_string(&profile.model_epoch).unwrap(),
+            "export_manifest_sha256":super::super::digest_string(&profile.export_manifest.sha256).unwrap(),
+            "encoding_semantic_sha256":super::super::digest_string(&profile.encoding_semantic_sha256).unwrap(),
+            "adapter_source_sha256":super::super::digest_string(&expected.registered_artifacts.provider_factory_source.sha256).unwrap(),
+            "physical_shutdown_confirmed":true,"native_buffers_released":true,"quarantined":false,
+            "physical_runs_in_flight":0,"observer_failures":0,"last_observer_failure":null,"last_failure":null,
+            "failed_physical_role_calls":0,"invalid_role_outputs":0,"canceled_requests":0,"expired_requests":0,
+            "completed_role_inputs":1,"search_consumed_role_inputs":1,"delivered_role_inputs":1,"physically_completed_role_calls":1,
+        });
+        let checked = reported(body.clone(), &o).unwrap();
+        assert_eq!(
+            checked.recomputed_reported_readiness(),
+            PriorReadiness::CompleteCpuScopePendingCallerChronology
+        );
+        assert_eq!(
+            checked.assurance_scope(),
+            "reported_consistency_pending_native_witness_and_caller_chronology"
+        );
+        assert_eq!(
+            checked.reported_projection().authorities,
+            ReplayAuthorities::default()
+        );
+        assert_eq!(ready(&o), PriorReadiness::NativeClosureUnobserved);
+        for case in 0..5 {
+            let mut changed = body.clone();
+            match case {
+                0 => changed["native_receipt"]["delivered_role_inputs"] = serde_json::json!(2),
+                1 => changed["native_receipt"]["physical_runs_in_flight"] = serde_json::json!(1),
+                2 => changed["native_receipt"]["model_epoch"] = serde_json::json!(vec![0u8; 32]),
+                3 => {
+                    changed["native_receipt"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("last_failure");
+                }
+                _ => changed["native_receipt"]["quarantined"] = serde_json::json!(true),
+            }
+            assert!(reported(changed, &o).is_err(), "case {case}");
+        }
     }
     #[test]
     fn four_exact_cpu_stages_without_native_evidence_remain_unadmitted() {

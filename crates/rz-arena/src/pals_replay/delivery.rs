@@ -38,6 +38,7 @@ pub struct BoundReplayDelivery<'a> {
     raw_native: &'a [u8],
     body_artifact: ArtifactPin,
     projection: Value,
+    projection_source: ArtifactPin,
 }
 impl<'a> BoundReplayDelivery<'a> {
     pub fn capture(&self) -> &'a OwnedReplayCapture {
@@ -53,6 +54,45 @@ impl<'a> BoundReplayDelivery<'a> {
     /// The next consumer must validate native work and caller chronology itself.
     pub fn unadmitted_projection(&self) -> &Value {
         &self.projection
+    }
+    /// Recomputes the producer's reported readiness against the same classifier
+    /// used by live native replay. Still pending independent native witness and
+    /// next-Query chronology; it never manufactures CheckedNativeReplayPrior.
+    pub fn check_reported_consistency(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<query_prior::ReportedPriorConsistency, ArenaError> {
+        let check_clock = || {
+            if cancel.load(Ordering::Acquire) || Instant::now() >= self.capture.bundle().deadline()
+            {
+                Err(ArenaError::Budget(
+                    "replay consistency original window/cancellation".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        check_clock()?;
+        let payload = self
+            .capture
+            .bundle()
+            .payloads()
+            .iter()
+            .find(|payload| payload.name() == "replay-expected.json")
+            .ok_or_else(|| invalid("consistency expected payload missing"))?;
+        let expected: ExpectedTransportV3 = decode(payload.as_bytes())?;
+        let body: Value = decode(self.raw_native)?;
+        let pins = expected.expectations.replay_expected.into_expected();
+        let report = query_prior::check_reported_prior_consistency(
+            body,
+            &pins,
+            &expected.expectations.cpu_fresh_profile_artifact,
+            &expected.expectations.cpu_fresh_profile,
+            &self.projection_source,
+        )
+        .map_err(|error| invalid(&format!("reported native consistency: {error:?}")))?;
+        check_clock()?;
+        Ok(report)
     }
 }
 
@@ -101,6 +141,7 @@ impl OwnedReplayCapture {
             raw_native,
             body_artifact,
             projection,
+            projection_source: registration.query_prior_source.clone(),
         })
     }
 }
