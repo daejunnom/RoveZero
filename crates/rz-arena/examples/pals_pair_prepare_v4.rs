@@ -64,6 +64,11 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("semantic-lock") if args.len()==3=>{
+            let manifest=rz_experiments::PalsRunManifestV4::from_json(&read(Path::new(&args[1]))?)?;
+            let lock=manifest.lock()?;write_new(Path::new(&args[2]),lock.to_json()?.as_bytes())?;
+            println!("pals_semantic_sha256={} metadata_locked=true engines_started=false nn_ready=false training_executed=false",lock.canonical_sha256);Ok(())
+        },
         Some("lock") if args.len()==3=>{
             let input=PalsArenaLaunchV4::from_json(&read(Path::new(&args[1]))?)?;
             let lock=input.lock()?;write_new(Path::new(&args[2]),lock.to_json()?.as_bytes())?;
@@ -77,7 +82,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("opening_written=true engines_started=false");Ok(())
         },
         Some("prepare"|"execute") if args.len()==5=>prepare_or_execute(&args[1..],args[0]=="execute"),
-        _=>Err("usage: pals_pair_prepare_v4 opening LAUNCH_JSON NEW_PGN | lock LAUNCH_JSON NEW_LOCK | prepare LOCK_JSON ASSET_ROOT OUTPUT_ROOT UNIQUE_LABEL | execute LOCK_JSON ASSET_ROOT OUTPUT_ROOT UNIQUE_LABEL".into()),
+        _=>Err("usage: pals_pair_prepare_v4 semantic-lock MANIFEST_JSON NEW_SEMANTIC_LOCK_JSON | opening LAUNCH_JSON NEW_PGN | lock LAUNCH_JSON NEW_LOCK | prepare LOCK_JSON ASSET_ROOT OUTPUT_ROOT UNIQUE_LABEL | execute LOCK_JSON ASSET_ROOT OUTPUT_ROOT UNIQUE_LABEL".into()),
     }
 }
 #[cfg(not(target_os = "linux"))]
