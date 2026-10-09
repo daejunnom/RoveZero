@@ -3392,3 +3392,25 @@ E/W 구분을 확인하며 backing 변조·취소·W 만료를 거부한다. 합
 확인한 뒤 총괄이 종료 요청해 cancelled로 보존한다. 전체 성공으로 기록하지 않는다.
 helper의 `cfg(test)` 접근 범위만 strategic_action 내부로 수정하며 제품 경계·wire·동작은
 바꾸지 않는다. 수정 HEAD의 새 CPU CI는 별도로 인수한다.
+
+### 실제 Repair record와 anchor의 읽기 전용 생성자 근거
+
+직전 `2dec62f`의 CPU CI 네 job과 Linux/Windows의 Rules/reported/delivery 검사 15개는
+성공했다. 다음 변경은 `FreshReplayOwner::opponent_repair_origin`이다. 현재 owner의
+accepted Repair LinePool 경로·record kind/revision·root state·원래 model counterline과
+repaired line을 기존 anchor 판정으로 다시 대조한다. 저장한 anchor와 같은 “자기 수가
+변경된 뒤 첫 ongoing 상대 차례”를 계산해야 실제 origin view를 반환한다.
+
+`ReplayOpponentRepairOrigin`은 owner를 빌리는 읽기 전용 타입이다. 모델 counterline과
+Repair line, 실제 record revision, anchor를 관측한다. Deserialize/Clone/소유 생성자는
+없으며 local revision을 portable record ID·V feature·전략적 값으로 쓰지 않는다. 기존
+실행은 원래 E의 control을 같은 판정문에 전달하고, 결과 검증은 전달받은 원래 W를
+사용한다. 새 CPU 작업·model call·role 수·record·예약을 만들거나 E를 연장하지 않는다.
+확인 전 anchor가 없으면 미관측으로 남기고, record/revision/line/anchor 대체는 거부한다.
+
+CPU 검사 세 개로 실제 deterministic RoleModel+자체 CPU replay의 기록을 빌려 확인하고
+추가 작업 계수가 없음을 대조하며, record 누락·revision/anchor/model line 대체 및
+취소·마감 만료를 거부한다. 이것은 native NN witness가 아니다. 이 근거를 구조화하는
+명시적 새 result lane·독립 source pin·caller Rules 대조와 다음 Query/실행 인수는 아직
+후속 연결이다. 현재 HEAD의 CPU CI는 push 후 별도로 확인한다. 전체 목표 active·Draft,
+GPU 검증 보류·실제 학습 제외·로컬 heavy CPU 미실행을 유지한다.
