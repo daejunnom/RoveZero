@@ -8,6 +8,8 @@ or device allocation sharing; those require native execution evidence.
 """
 import hashlib
 
+from .config import INTERACTION_WIDTH, LINE_WIDTH, MAX_LINE_PLIES
+
 ARTIFACT_SCHEMA = "rovezero.pals-model.v2"
 SHARED_LAYOUT = "shared_pc_if"
 SHARED_LAYOUT_REVISION = 1
@@ -73,6 +75,12 @@ class _Graph:
     def linear(self, value, parameter):
         return self.op("MatMul", value, self.bank.weight(parameter, transpose=True))
 
+    def biased_linear(self, value, prefix):
+        return self.op("Add", self.linear(value, prefix + ".weight"), self.bank.weight(prefix + ".bias"))
+
+    def silu(self, value):
+        return self.op("Mul", value, self.op("Sigmoid", value))
+
     def norm(self, value, parameter):
         mean = self.op("ReduceMean", self.op("Mul", value, value), axes=[-1], keepdims=1)
         inverse = self.op("Reciprocal", self.op("Sqrt", self.op("Add", mean, self.floats(1e-6))))
@@ -125,8 +133,67 @@ class _Graph:
     def private_initial(self, role):
         prefix = f"experts.{role}"
         latent = self.unsqueeze(self.bank.weight(prefix + ".initial_latent"), [0])
-        query = self.unsqueeze(self.linear("query", prefix + ".query_projection.weight"), [1])
+        query = self.linear("query", prefix + ".query_projection.weight")
+        if self.config.full_line:
+            query = self.op("Add", query, self.linear("query_line_features", prefix + ".query_line_projection.weight"))
+            related = self.linear(self.silu(self.biased_linear("relation_features", prefix + ".relation_hidden")), prefix + ".relation_output.weight")
+            related = self.op("Mul", related, self.unsqueeze("relation_active_float", [-1]))
+            summed = self.op("ReduceSum", related, self.ints([1]), keepdims=0)
+            count = self.op("ReduceSum", "relation_active_float", self.ints([1]), keepdims=1)
+            query = self.op("Add", query, self.op("Div", summed, self.op("Max", count, self.floats(1))))
+        query = self.unsqueeze(query, [1])
         return self.op("Add", latent, query)
+
+    def line_encoder(self, tokens, mask):
+        from onnx import TensorProto
+        prefix = "public_encoder.line_encoder"
+        batch, groups = self.dimension(tokens, 0), self.dimension(tokens, 1)
+        moves = self.op("Reshape", tokens, self.ints([-1, MAX_LINE_PLIES, 3]))
+        active = self.op("Reshape", mask, self.ints([-1, MAX_LINE_PLIES]))
+        safe = self.op("Where", self.unsqueeze(active, [-1]), moves, self.ints(0))
+        fields = []
+        for index, name in enumerate(("from_square", "to_square", "promotion")):
+            fields.append(self.op("Gather", self.bank.weight(prefix + ".moves." + name + ".weight"),
+                                  self.op("Gather", safe, self.ints(index), axis=2), axis=0))
+        value = self.linear(self.op("Concat", *fields, axis=-1), prefix + ".moves.projection.weight")
+        value = self.op("Add", value, self.unsqueeze(self.bank.weight(prefix + ".ply_embedding.weight"), [0]))
+        active_float = self.op("Cast", active, to=TensorProto.FLOAT)
+        expanded_mask = self.unsqueeze(active_float, [-1])
+        value = self.op("Mul", value, expanded_mask)
+        for index, dilation in enumerate((1, 2)):
+            temporal = self.op("Conv", self.op("Transpose", value, perm=[0, 2, 1]),
+                               self.bank.weight(prefix + f".temporal_blocks.{index}.weight"),
+                               kernel_shape=[3], dilations=[dilation], pads=[dilation, dilation], strides=[1])
+            temporal = self.op("Transpose", temporal, perm=[0, 2, 1])
+            value = self.op("Mul", self.op("Add", value, self.silu(temporal)), expanded_mask)
+        scores = self.op("Squeeze", self.linear(value, prefix + ".pool_attention.weight"), self.ints([-1]))
+        weights = self.op("Mul", self.op("Softmax", self.op("Where", active, scores, self.floats(-1e9)), axis=-1), active_float)
+        pooled = self.op("ReduceSum", self.op("Mul", value, self.unsqueeze(weights, [-1])), self.ints([1]), keepdims=0)
+        return self.op("Reshape", pooled, self.shape(batch, groups, self.ints([LINE_WIDTH])))
+
+    def full_line_inputs(self):
+        from onnx import TensorProto, helper
+        lines = self.line_encoder("query_line_tokens", "query_line_mask")
+        lines = self.op("Reshape", lines, self.shape(self.dimension(lines, 0), self.ints([3 * LINE_WIDTH])))
+        self.nodes.append(helper.make_node("Identity", [lines], ["query_line_features"]))
+        keys = self.op("Slice", "memory_key", self.ints([66]), self.ints([2**63 - 1]), self.ints([2]))
+        values = self.op("Slice", "memory_value", self.ints([66]), self.ints([2**63 - 1]), self.ints([2]))
+        own = self.op("Transpose", self.op("Concat", keys, values, axis=1), perm=[0, 2, 1, 3])
+        own = self.op("Reshape", own, self.shape(self.dimension(own, 0), self.dimension(own, 1),
+                       self.ints([2 * self.config.kv_heads * self.config.head_dimension])))
+        related, active_refs = [], []
+        for axis in range(2):
+            refs = self.op("Gather", "record_relations", self.ints(axis), axis=2)
+            active = self.op("GreaterOrEqual", refs, self.ints(0))
+            active_refs.append(active)
+            expanded = self.op("Expand", self.unsqueeze(self.op("Max", refs, self.ints(0)), [-1]), self.op("Shape", own))
+            selected = self.op("GatherElements", own, expanded, axis=1)
+            related.append(self.op("Mul", selected, self.unsqueeze(self.op("Cast", active, to=TensorProto.FLOAT), [-1])))
+        features = self.op("Concat", own, *related, axis=-1)
+        record_mask = self.op("Slice", "memory_mask", self.ints([66]), self.ints([2**63 - 1]), self.ints([1]))
+        active = self.op("Cast", self.op("And", record_mask, self.op("Or", *active_refs)), to=TensorProto.FLOAT)
+        self.nodes.append(helper.make_node("Identity", [features], ["relation_features"]))
+        self.nodes.append(helper.make_node("Identity", [active], ["relation_active_float"]))
 
     def private_ffn(self, latent, role, index):
         prefix = f"experts.{role}"
@@ -147,7 +214,14 @@ class _Graph:
         prefix = f"experts.{role}"
         context = self.op("ReduceMean", latent, axes=[1], keepdims=0)
         expanded = self.unsqueeze(context, [1])
-        logits = self.op("Squeeze", self.linear(self.op("Mul", embedded, expanded), prefix + ".policy_head.weight"), self.ints([-1]))
+        if self.config.interaction_head:
+            expanded_context = self.op("Expand", expanded, self.op("Shape", embedded))
+            joined = self.op("Concat", embedded, expanded_context, axis=-1)
+            hidden = self.silu(self.biased_linear(joined, prefix + ".interaction_policy_head.hidden"))
+            logits = self.linear(hidden, prefix + ".interaction_policy_head.output.weight")
+        else:
+            logits = self.linear(self.op("Mul", embedded, expanded), prefix + ".policy_head.weight")
+        logits = self.op("Squeeze", logits, self.ints([-1]))
         logits = self.op("Where", "candidate_mask", logits, self.floats(-1e9))
         wdl = self.linear(context, prefix + ".wdl_head.weight")
         if role == "critic":
@@ -189,6 +263,8 @@ def build_shared_pc_graph(model):
     bank = _Bank(model)
     graph = _Graph(bank, config, SHARED_LAYOUT)
     latent_shape = ["batch", config.latent_slots, config.width]
+    if config.full_line:
+        graph.full_line_inputs()
     latent = graph.routed("private_initial", [latent_shape])
     for _ in range(config.iterations):
         for index in range(config.recurrent_blocks):
@@ -207,6 +283,10 @@ def build_shared_pc_graph(model):
                    ("divergence_features", TensorProto.FLOAT, ["batch", "divergences", 8]),
                    ("divergence_mask", TensorProto.BOOL, ["batch", "divergences"]),
                    ("query", TensorProto.FLOAT, ["batch", 16])]
+    if config.full_line:
+        descriptors += [("query_line_tokens", TensorProto.INT64, ["batch", 3, MAX_LINE_PLIES, 3]),
+                        ("query_line_mask", TensorProto.BOOL, ["batch", 3, MAX_LINE_PLIES]),
+                        ("record_relations", TensorProto.INT64, ["batch", "records", 2])]
     outputs = [("candidate_logits", TensorProto.FLOAT, ["batch", "candidates"]),
                ("wdl_logits", TensorProto.FLOAT, ["batch", 3]), ("private_latent", TensorProto.FLOAT, latent_shape),
                ("divergence_logits", TensorProto.FLOAT, ["batch", "divergences"]), ("is_critic", TensorProto.BOOL, [])]
@@ -221,7 +301,7 @@ def build_shared_pc_graph(model):
 
 def audit_shared_pc_graph(document, weights):
     """Fail closed on accidental shared copies or eager private computation."""
-    shared = [value for value in weights if value["parameter"].startswith(("reader_blocks.", "move_embedding."))]
+    shared = [value for value in weights if value["parameter"].startswith(("reader_blocks.", "move_embedding.", "public_encoder.line_encoder."))]
     names = [value["initializer"] for value in shared]
     outer_names = [value.name for value in document.graph.initializer]
     if len(names) != len(set(names)) or any(outer_names.count(name) != 1 for name in names):

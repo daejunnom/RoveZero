@@ -13,11 +13,14 @@ from pathlib import Path
 import stat
 
 from .artifacts import (annotate_public_memory_shapes, atomic_json, digest_file,
-                        load_checkpoint, output_directory, read_rules_profile)
-from .config import ModelConfig, SCHEMA, TASKS
+                        load_checkpoint, output_directory, read_rules_profile, validate_rules_declaration)
+from .config import MAX_LINE_PLIES, ModelConfig, SCHEMA, TASKS, public_tensor_names, role_tensor_names
 from .onnx_warm import (PRIVATE_SEED_POLICY, WARM_ARTIFACT_SCHEMA,
                         WARM_GRAPH_SEMANTICS, WARM_LAYOUT, WARM_LAYOUT_REVISION,
-                        audit_warm_pc_graph, build_warm_pc_graph)
+                        PRIVATE_SEED_POLICY_V2, WARM_ARTIFACT_SCHEMA_V2, WARM_GRAPH_SEMANTICS_V2,
+                        WARM_LAYOUT_V2, PRIVATE_CUDA_WARM_SCHEMA, CUDA_WARM_LAYOUT,
+                        CUDA_WARM_GRAPH_SEMANTICS, CUDA_PRIVATE_SEED_POLICY, CUDA_QUERY_SEMANTICS,
+                        CUDA_EXECUTION_DOMAIN, audit_warm_pc_graph, build_warm_pc_graph)
 
 WARM_GRAPH_FILE = WARM_LAYOUT + ".onnx"
 WARM_MANIFEST_FILE = "warm_export.json"
@@ -29,6 +32,28 @@ PRIVATE_INPUT_NAMES = ["role_is_critic", "memory_key", "memory_value", "memory_m
                        "divergence_mask", "query", "initial_latent", "warm_start"]
 PRIVATE_OUTPUT_NAMES = ["candidate_logits", "wdl_logits", "private_latent",
                         "divergence_logits", "is_critic"]
+
+
+def warm_export_domain(config, cuda=False):
+    """Registration only: CUDA execution capability requires native witnesses."""
+    config.validate()
+    if cuda:
+        if not config.full_line:
+            raise ValueError("CUDA Warm V2 requires a registered full-line profile")
+        return {"schema": PRIVATE_CUDA_WARM_SCHEMA, "layout": CUDA_WARM_LAYOUT, "layout_revision": 2,
+                "graph_file": CUDA_WARM_LAYOUT + ".onnx", "manifest_file": "cuda_warm_export.json",
+                "private_role": "shared_pc", "warm_graph_semantics": CUDA_WARM_GRAPH_SEMANTICS,
+                "private_seed_policy": CUDA_PRIVATE_SEED_POLICY, "query_semantics": CUDA_QUERY_SEMANTICS,
+                "execution_domain": CUDA_EXECUTION_DOMAIN}
+    if config.profile != "legacy_summary_v1":
+        return {"schema": WARM_ARTIFACT_SCHEMA_V2, "layout": WARM_LAYOUT_V2, "layout_revision": 2,
+                "graph_file": WARM_LAYOUT_V2 + ".onnx", "manifest_file": WARM_MANIFEST_FILE,
+                "private_role": "shared_pc_warm", "warm_graph_semantics": WARM_GRAPH_SEMANTICS_V2,
+                "private_seed_policy": PRIVATE_SEED_POLICY_V2}
+    return {"schema": WARM_ARTIFACT_SCHEMA, "layout": WARM_LAYOUT, "layout_revision": 1,
+            "graph_file": WARM_GRAPH_FILE, "manifest_file": WARM_MANIFEST_FILE,
+            "private_role": "shared_pc_warm", "warm_graph_semantics": WARM_GRAPH_SEMANTICS,
+            "private_seed_policy": PRIVATE_SEED_POLICY}
 
 
 def _sha(value):
@@ -148,8 +173,8 @@ def _descriptors(values):
             for value in values]
 
 
-def _expected_private_inputs():
-    return [
+def _expected_private_inputs(config=ModelConfig()):
+    result = [
         {"name": "role_is_critic", "dtype": "BOOL", "shape": []},
         {"name": "memory_key", "dtype": "FLOAT", "shape": ["batch", 2, "memory_tokens", 64]},
         {"name": "memory_value", "dtype": "FLOAT", "shape": ["batch", 2, "memory_tokens", 64]},
@@ -159,6 +184,14 @@ def _expected_private_inputs():
         {"name": "divergence_features", "dtype": "FLOAT", "shape": ["batch", "divergences", 8]},
         {"name": "divergence_mask", "dtype": "BOOL", "shape": ["batch", "divergences"]},
         {"name": "query", "dtype": "FLOAT", "shape": ["batch", 16]},
+    ]
+    if config.full_line:
+        result += [
+            {"name": "query_line_tokens", "dtype": "INT64", "shape": ["batch", 3, MAX_LINE_PLIES, 3]},
+            {"name": "query_line_mask", "dtype": "BOOL", "shape": ["batch", 3, MAX_LINE_PLIES]},
+            {"name": "record_relations", "dtype": "INT64", "shape": ["batch", "records", 2]},
+        ]
+    return result + [
         {"name": "initial_latent", "dtype": "FLOAT", "shape": ["batch", 16, 384]},
         {"name": "warm_start", "dtype": "BOOL", "shape": []},
     ]
@@ -176,6 +209,8 @@ def _expected_private_outputs():
 
 def validate_warm_export_manifest(manifest, metadata):
     """Reject old domains, unregistered seed semantics, V, or missing graphs."""
+    if manifest.get("schema") in (WARM_ARTIFACT_SCHEMA_V2, PRIVATE_CUDA_WARM_SCHEMA):
+        return _validate_v2_warm_export_manifest(manifest, metadata)
     if (manifest.get("schema") != WARM_ARTIFACT_SCHEMA or manifest.get("model_semantics") != SCHEMA
             or manifest.get("layout") != WARM_LAYOUT or manifest.get("layout_revision") != WARM_LAYOUT_REVISION
             or manifest.get("config") != ModelConfig().to_dict()
@@ -261,54 +296,122 @@ def validate_warm_export_manifest(manifest, metadata):
     return ["proposer", "critic"]
 
 
-def export_warm_checkpoint(checkpoint, directory, rules_profile_json):
+def _expected_public_inputs(config):
+    result = [{"name": "board", "dtype": "INT64", "shape": ["batch", 64]},
+              {"name": "metadata", "dtype": "FLOAT", "shape": ["batch", 16]},
+              {"name": "records", "dtype": "FLOAT", "shape": ["batch", "records", 16]},
+              {"name": "record_mask", "dtype": "BOOL", "shape": ["batch", "records"]}]
+    if config.full_line:
+        result += [{"name": "record_line_tokens", "dtype": "INT64", "shape": ["batch", "records", MAX_LINE_PLIES, 3]},
+                   {"name": "record_line_mask", "dtype": "BOOL", "shape": ["batch", "records", MAX_LINE_PLIES]}]
+    return result
+
+
+def _validate_v2_warm_export_manifest(manifest, metadata):
+    config = ModelConfig(**manifest.get("config", {}))
+    config.validate()
+    cuda = manifest.get("schema") == PRIVATE_CUDA_WARM_SCHEMA
+    domain = warm_export_domain(config, cuda)
+    if config.profile == "legacy_summary_v1" or any(manifest.get(key) != domain[key] for key in (
+            "schema", "layout", "layout_revision", "warm_graph_semantics", "private_seed_policy")):
+        raise ValueError("warm V2 registered schema/profile/layout mismatch")
+    if (manifest.get("config") != metadata.get("config") or manifest.get("checkpoint_sha256") != metadata.get("checkpoint_sha256")
+            or not _sha(manifest.get("checkpoint_sha256")) or manifest.get("model_semantics") != config.model_semantics
+            or manifest.get("encoding_schema") != config.encoding or manifest.get("model_profile") != config.profile):
+        raise ValueError("warm V2 model/encoding/checkpoint identity mismatch")
+    if cuda and any(manifest.get(key) != domain[key] for key in ("execution_domain", "query_semantics")):
+        raise ValueError("CUDA Warm requires explicit device I/O and exact query semantics")
+    if (manifest.get("approximate") is not True or manifest.get("precision") != "fp32" or manifest.get("tf32") is not False
+            or manifest.get("native_seed_owner_support") != "not_registered_by_python_export"
+            or manifest.get("batch_mode") != "one_scalar_role_and_one_scalar_mode_per_physical_batch"
+            or manifest.get("validator_present") is not False or manifest.get("roles") != ["proposer", "critic"]
+            or manifest.get("task_names") != list(TASKS)):
+        raise ValueError("warm V2 requires explicit approximate V-free P/C semantics")
+    steps = manifest.get("training_steps")
+    if type(steps) is not int or steps < 0 or manifest.get("trained") is not (steps > 0) or steps != metadata.get("training_steps") or manifest.get("trained") is not metadata.get("trained"):
+        raise ValueError("warm V2 training provenance mismatch")
+    declaration = manifest.get("rules_input_declaration")
+    if not isinstance(declaration, dict): raise ValueError("warm V2 requires actual Rules declaration")
+    digest = validate_rules_declaration(declaration, config)
+    canonical = json.dumps(declaration, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    if (len(canonical) > 65536 or manifest.get("rules_input_semantic_sha256") != digest
+            or manifest.get("rules_input_profile") != declaration["rules_input_profile"]
+            or manifest.get("learned_input_compatibility") != "unverified_declaration_only"
+            or manifest.get("rules_encoder_source_sha256") != declaration["rules_encoder_source_sha256"]
+            or manifest.get("rules_profile_canonical_sha256") != hashlib.sha256(canonical).hexdigest()
+            or not _sha(manifest.get("rules_profile_descriptor_sha256"))):
+        raise ValueError("warm V2 Rules source/canonical identity mismatch")
+    graphs = manifest.get("graphs")
+    if not isinstance(graphs, list) or len(graphs) != 2 or [graph.get("role") for graph in graphs] != ["public", domain["private_role"]]:
+        raise ValueError("warm V2 requires public and registered private graphs")
+    for graph, filename in zip(graphs, ("public_memory.onnx", domain["graph_file"])):
+        if graph.get("file") != filename or not _sha(graph.get("sha256")) or graph.get("opset") != 17:
+            raise ValueError("warm V2 graph filename/digest/opset mismatch")
+    if graphs[1].get("inputs") != _expected_private_inputs(config) or graphs[1].get("outputs") != _expected_private_outputs():
+        raise ValueError("warm V2 private tensor shape/dtype mismatch")
+    if graphs[0].get("inputs") != _expected_public_inputs(config) or graphs[0].get("outputs") != [
+            {"name": "memory_key", "dtype": "FLOAT", "shape": ["batch", 2, "memory_tokens", 64]},
+            {"name": "memory_value", "dtype": "FLOAT", "shape": ["batch", 2, "memory_tokens", 64]},
+            {"name": "memory_mask", "dtype": "BOOL", "shape": ["batch", "memory_tokens"]}]:
+        raise ValueError("warm V2 public tensor shape/dtype mismatch")
+    return ["proposer", "critic"]
+
+
+def export_warm_checkpoint(checkpoint, directory, rules_profile_json, *, cuda=False):
     """Explicit new artifact domain; existing checkpoint state_dict stays intact."""
     import onnx
     import torch
     from .model import fixture_input
     model, metadata = load_checkpoint(checkpoint)
+    domain = warm_export_domain(model.config, cuda)
     if rules_profile_json is None:
         raise ValueError("warm export requires the native Rules profile declaration")
     rules_profile = read_rules_profile(rules_profile_json, model.config)
     output = output_directory(directory)
-    for filename in ("public_memory.onnx", WARM_GRAPH_FILE, WARM_MANIFEST_FILE):
+    for filename in ("public_memory.onnx", domain["graph_file"], domain["manifest_file"]):
         destination = output / filename
         if destination.exists() or destination.with_suffix(destination.suffix + ".partial").exists():
             raise FileExistsError(f"warm artifact already exists: {filename}")
     free = model.without_validator()
-    data = fixture_input()
+    data = fixture_input(profile=free.config.profile)
     data.validate(free.config)
     public_file = output / "public_memory.onnx"
     public_temporary = public_file.with_suffix(".onnx.partial")
-    public_names = ["board", "metadata", "records", "record_mask"]
+    public_names = public_tensor_names(free.config)
     axes = {name: {0: "batch"} for name in public_names}
     axes["records"][1] = axes["record_mask"][1] = "records"
+    if free.config.full_line:
+        axes["record_line_tokens"][1] = axes["record_line_mask"][1] = "records"
     axes.update({"memory_key": {0: "batch", 2: "memory_tokens"},
                  "memory_value": {0: "batch", 2: "memory_tokens"},
                  "memory_mask": {0: "batch", 1: "memory_tokens"}})
     with torch.no_grad():
-        torch.onnx.export(free.public_encoder, data.public_args(), str(public_temporary),
+        torch.onnx.export(free.public_encoder, data.public_args(free.config), str(public_temporary),
                           input_names=public_names, output_names=["memory_key", "memory_value", "memory_mask"],
                           dynamic_axes=axes, opset_version=17, dynamo=False,
                           export_params=True, do_constant_folding=True)
     public = onnx.load(str(public_temporary), load_external_data=False)
     annotate_public_memory_shapes(public, free.config)
-    private, ownership = build_warm_pc_graph(free)
+    private, ownership = build_warm_pc_graph(free, domain["layout"], domain["layout_revision"])
     graphs = []
     for document, filename, role in ((public, "public_memory.onnx", "public"),
-                                     (private, WARM_GRAPH_FILE, "shared_pc_warm")):
+                                     (private, domain["graph_file"], domain["private_role"])):
         destination = output / filename
         temporary = destination.with_suffix(".onnx.partial")
         onnx.checker.check_model(document, full_check=True)
         properties = {
-            "schema": WARM_ARTIFACT_SCHEMA, "model_semantics": SCHEMA,
-            "layout": WARM_LAYOUT, "layout_revision": str(WARM_LAYOUT_REVISION), "role": role,
+            "schema": domain["schema"], "model_semantics": free.config.model_semantics,
+            "layout": domain["layout"], "layout_revision": str(domain["layout_revision"]), "role": role,
             "checkpoint_sha256": metadata["checkpoint_sha256"], "precision": "fp32",
             "trained": str(metadata["trained"]).lower(), "training_steps": str(metadata["training_steps"]),
             "expected_ort": "1.22.0", "approximate": "true",
-            "warm_graph_semantics": WARM_GRAPH_SEMANTICS, "private_seed_policy": PRIVATE_SEED_POLICY,
+            "warm_graph_semantics": domain["warm_graph_semantics"], "private_seed_policy": domain["private_seed_policy"],
             "public_kv": "shared_role_neutral",
         }
+        if free.config.profile != "legacy_summary_v1":
+            properties.update({"model_profile": free.config.profile, "encoding_schema": free.config.encoding})
+        if cuda:
+            properties.update({key: domain[key] for key in ("execution_domain", "query_semantics")})
         properties.update({key: rules_profile[key] for key in (
             "rules_input_profile", "rules_input_semantic_sha256", "rules_encoder_source_sha256")})
         onnx.helper.set_model_props(document, properties)
@@ -318,28 +421,36 @@ def export_warm_checkpoint(checkpoint, directory, rules_profile_json):
                        "opset": 17, "inputs": _descriptors(document.graph.input),
                        "outputs": _descriptors(document.graph.output)})
     manifest = {
-        "schema": WARM_ARTIFACT_SCHEMA, "model_semantics": SCHEMA,
-        "layout": WARM_LAYOUT, "layout_revision": WARM_LAYOUT_REVISION,
+        "schema": domain["schema"], "model_semantics": free.config.model_semantics,
+        "layout": domain["layout"], "layout_revision": domain["layout_revision"],
         "checkpoint_sha256": metadata["checkpoint_sha256"], "config": free.config.to_dict(),
         "trained": metadata["trained"], "training_steps": metadata["training_steps"],
         "precision": "fp32", "tf32": False, "approximate": True,
         "roles": ["proposer", "critic"], "validator_present": False, "task_names": list(TASKS),
-        "warm_graph_semantics": WARM_GRAPH_SEMANTICS, "private_seed_policy": PRIVATE_SEED_POLICY,
+        "warm_graph_semantics": domain["warm_graph_semantics"], "private_seed_policy": domain["private_seed_policy"],
         "batch_mode": "one_scalar_role_and_one_scalar_mode_per_physical_batch",
         "native_seed_owner_support": "not_registered_by_python_export",
         "graphs": graphs, "ownership": ownership, "numeric_status": "not_run", "cuda": "not_run",
         "torch_version": torch.__version__, "expected_ort": "1.22.0",
         "rust_ort_crate": "2.0.0-rc.10", **rules_profile,
     }
+    if free.config.profile != "legacy_summary_v1":
+        manifest.update({"model_profile": free.config.profile, "encoding_schema": free.config.encoding})
+    if cuda:
+        manifest.update({key: domain[key] for key in ("execution_domain", "query_semantics")})
     validate_warm_export_manifest(manifest, metadata)
-    atomic_json(output / WARM_MANIFEST_FILE, manifest)
+    atomic_json(output / domain["manifest_file"], manifest)
     return manifest
 
 
-def validate_warm_feed(feed, max_batch=16):
+def validate_warm_feed(feed, max_batch=16, config=None):
     """Boundary validation used before ORT; ONNX alone is not a finite checker."""
     import numpy as np
-    if set(feed) != set(PRIVATE_INPUT_NAMES) or not isinstance(max_batch, int) or isinstance(max_batch, bool) or not 1 <= max_batch <= 16:
+    if config is None:
+        config = ModelConfig.for_profile("full_line_interaction_v2") if "query_line_tokens" in feed else ModelConfig()
+    config.validate()
+    names = [value["name"] for value in _expected_private_inputs(config)]
+    if set(feed) != set(names) or not isinstance(max_batch, int) or isinstance(max_batch, bool) or not 1 <= max_batch <= 16:
         raise ValueError("warm feed names/batch admission limit mismatch")
     if any(not isinstance(value, np.ndarray) for value in feed.values()):
         raise ValueError("warm feed requires explicit typed numpy tensors")
@@ -372,6 +483,37 @@ def validate_warm_feed(feed, max_batch=16):
             raise ValueError("warm feed requires finite FP32")
     if not np.all(mask[:, :66]):
         raise ValueError("warm public board/metadata prefix must remain active")
+    if config.full_line:
+        if np.any(feed["query"][:, 6:8] != 0):
+            raise ValueError("warm full-line query forbids revision/deadline semantic features")
+        tokens, active = feed["query_line_tokens"], feed["query_line_mask"]
+        if tokens.dtype != np.int64 or tokens.shape != (b, 3, MAX_LINE_PLIES, 3) or active.dtype != np.bool_ or active.shape != (b, 3, MAX_LINE_PLIES):
+            raise ValueError("warm full-line query shape/dtype mismatch")
+        if np.any(active[..., 1:] & ~active[..., :-1]):
+            raise ValueError("warm full-line mask must be contiguous prefix")
+        moves = tokens[active]
+        if np.any((moves[:, :2] < 0) | (moves[:, :2] > 63)) or np.any((moves[:, 2] < 0) | (moves[:, 2] > 4)) or np.any(moves[:, 0] == moves[:, 1]):
+            raise ValueError("warm full-line query move code mismatch")
+        refs = feed["record_relations"]
+        r = s - 66
+        if refs.dtype != np.int64 or refs.shape != (b, r, 2) or np.any((refs < -1) | (refs >= r)):
+            raise ValueError("warm full-line local relationship shape/index")
+        if np.any((refs >= 0) & ~mask[:, 66:, None]):
+            raise ValueError("warm masked record carries relationship")
+        for row in range(b):
+            visiting, complete = set(), set()
+            def visit(index):
+                if index in visiting: raise ValueError("warm relationship cycle/self reference")
+                if index in complete: return
+                visiting.add(index)
+                for ref in refs[row, index]:
+                    if ref >= 0:
+                        if not mask[row, 66 + ref]: raise ValueError("warm relationship references masked record")
+                        visit(int(ref))
+                visiting.remove(index)
+                complete.add(index)
+            for index in range(r):
+                if mask[row, 66 + index]: visit(index)
 
 
 def _cpu_session(source, profile_prefix=None):
@@ -397,18 +539,22 @@ def _numpy(values):
     return [value.detach().cpu().numpy() for value in values]
 
 
-def _feed(data, memory, seed, role, mode):
+def _feed(data, memory, seed, role, mode, config=None):
     import numpy as np
     if role not in ("proposer", "critic") or not isinstance(mode, (bool, np.bool_)):
         raise ValueError("warm feed requires explicit P/C role and bool mode")
-    names = PRIVATE_INPUT_NAMES[1:9]
-    values = [*memory, *_numpy((data.candidates, data.candidate_mask,
-                               data.divergence_features, data.divergence_mask, data.query))]
+    if config is None:
+        config = ModelConfig.for_profile("full_line_interaction_v2") if data.query_line_tokens is not None else ModelConfig()
+    names = role_tensor_names(config)
+    fields = (data.candidates, data.candidate_mask, data.divergence_features, data.divergence_mask, data.query)
+    if config.full_line:
+        fields += (data.query_line_tokens, data.query_line_mask, data.record_relations)
+    values = [*memory, *_numpy(fields)]
     feed = dict(zip(names, values))
     feed.update({"role_is_critic": np.asarray(role == "critic", dtype=np.bool_),
                  "initial_latent": np.asarray(seed),
                  "warm_start": np.asarray(mode, dtype=np.bool_)})
-    validate_warm_feed(feed)
+    validate_warm_feed(feed, config=config)
     return feed
 
 
@@ -453,7 +599,7 @@ def _reference(model, data, memory, role, seed, mode):
     import torch
     with torch.no_grad():
         result = model.warm_role_graph(role)(
-            *data.role_args(memory), torch.from_numpy(seed), torch.tensor(mode, dtype=torch.bool))
+            *data.role_args(memory, model.config), torch.from_numpy(seed), torch.tensor(mode, dtype=torch.bool))
     outputs = _numpy(result)
     if role == "proposer":
         outputs.append(np.zeros(data.divergence_mask.shape, dtype=np.float32))
@@ -524,7 +670,7 @@ def verify_warm_cpu_routes(graph_bytes, feed):
             "production_optimized_routing": "requires_native_check"}
 
 
-def numeric_check_warm(checkpoint, directory):
+def numeric_check_warm(checkpoint, directory, *, cuda=False):
     """Independent Torch/legacy-ONNX/new-ONNX correctness; never a benchmark."""
     import numpy as np
     import torch
@@ -532,8 +678,9 @@ def numeric_check_warm(checkpoint, directory):
     from .onnx_shared import build_shared_pc_graph
     model, metadata = load_checkpoint(checkpoint)
     model = model.without_validator()
+    domain = warm_export_domain(model.config, cuda)
     output = output_directory(directory)
-    manifest, manifest_provenance = _read_warm_manifest(output / WARM_MANIFEST_FILE)
+    manifest, manifest_provenance = _read_warm_manifest(output / domain["manifest_file"])
     validate_warm_export_manifest(manifest, metadata)
     # Revalidate the Rules descriptor itself, not only digest-shaped strings.
     import tempfile
@@ -556,23 +703,29 @@ def numeric_check_warm(checkpoint, directory):
     # none reopen the mutable registered graph paths for execution.
     _document_from_immutable_bytes(graph_sources["public"])
     legacy_document, legacy_ownership = build_shared_pc_graph(model)
-    registered_private = _document_from_immutable_bytes(graph_sources["shared_pc_warm"])
-    audit_warm_pc_graph(registered_private, legacy_document, legacy_ownership)
+    registered_private = _document_from_immutable_bytes(graph_sources[domain["private_role"]])
+    audit_warm_pc_graph(registered_private, legacy_document, legacy_ownership, domain["layout"], domain["layout_revision"])
     legacy = _cpu_session(legacy_document.SerializeToString())
     public = _cpu_session(graph_sources["public"])
-    warm = _cpu_session(graph_sources["shared_pc_warm"])
+    warm = _cpu_session(graph_sources[domain["private_role"]])
     reports, maxima = [], {}
     # Fixed finite matrix, including explicit empty padding and dynamic batch.
     for records, candidates, divergences, batch in ((1, 1, 1, 1), (3, 4, 2, 1), (2, 7, 3, 2)):
-        data = fixture_input(records, candidates, divergences, batch)
+        data = fixture_input(records, candidates, divergences, batch, profile=model.config.profile)
         if records == candidates == divergences == 1:
             data.record_mask.zero_()
             data.candidate_mask.zero_()
             data.divergence_mask.zero_()
+            if model.config.full_line:
+                data.record_line_tokens.zero_()
+                data.record_line_mask.zero_()
+                data.record_relations.fill_(-1)
+                data.query_line_tokens.zero_()
+                data.query_line_mask.zero_()
         data.validate(model.config)
         with torch.no_grad():
-            reference_memory = model.public_encoder(*data.public_args())
-        actual_memory = public.run(None, dict(zip(("board", "metadata", "records", "record_mask"), _numpy(data.public_args()))))
+            reference_memory = model.public_encoder(*data.public_args(model.config))
+        actual_memory = public.run(None, dict(zip(public_tensor_names(model.config), _numpy(data.public_args(model.config)))))
         for a, b in zip(_numpy(reference_memory), actual_memory):
             if a.dtype == np.bool_:
                 if not np.array_equal(a, b):
@@ -613,8 +766,8 @@ def numeric_check_warm(checkpoint, directory):
                             "warm_new_and_torch": "passed", "fresh_seed_independent": True,
                             "warm_seed_coordinates_tested": perturbations,
                             "seed_provenance": "numerical_fixture_only_not_native_accepted"})
-    route_evidence = verify_warm_cpu_routes(graph_sources["shared_pc_warm"], feed)
-    report = {"schema": "rovezero.pals-private-warm-cpu-check.v1", "status": "passed",
+    route_evidence = verify_warm_cpu_routes(graph_sources[domain["private_role"]], feed)
+    report = {"schema": "rovezero.pals-private-warm-cpu-check.v1" if model.config.profile == "legacy_summary_v1" else "rovezero.pals-private-warm-cpu-check.v2", "status": "passed",
               "scope": "fp32_tensor_math_only", "checkpoint_sha256": metadata["checkpoint_sha256"],
               "graphs": graph_provenance, "manifest": manifest_provenance,
               "admission_limits": {"manifest_bytes": MAX_WARM_MANIFEST_BYTES,
@@ -626,7 +779,10 @@ def numeric_check_warm(checkpoint, directory):
               "optimizer_steps": 0, "cuda": "not_run", "native_warm_acceptance": "not_run",
               "rules_seed_eligibility": "not_proven_by_numerical_fixture",
               "cpu_routing_witness": route_evidence}
-    atomic_json(output / "numeric_warm_cpu.json", report)
+    if cuda:
+        report.update({"schema": "rovezero.pals-private-cuda-warm-cpu-reference.v2", "execution_domain": CUDA_EXECUTION_DOMAIN,
+                       "io_binding": "not_run", "cuda_capability": "not_registered_by_cpu_reference"})
+    atomic_json(output / ("numeric_cuda_warm_cpu_reference.json" if cuda else "numeric_warm_cpu.json"), report)
     return report
 
 

@@ -27,7 +27,13 @@ def verify_cpu_hard_routes(graph_path, feed):
             options.enable_profiling = True
             options.profile_file_prefix = str(Path(directory) / role)
             session = ort.InferenceSession(str(graph_path), sess_options=options, providers=["CPUExecutionProvider"])
-            result = session.run(None, {**feed, "role_is_critic": np.asarray(role == "critic", dtype=np.bool_)})
+            current = {**feed, "role_is_critic": np.asarray(role == "critic", dtype=np.bool_)}
+            if {value.name for value in session.get_inputs()} != set(current):
+                raise ValueError("hard-route witness input/profile tensor names mismatch")
+            # V2 adds explicit bounded line/mask/local-ref tensors; route
+            # profiling consumes those same tensors and never synthesizes an
+            # old summary input for a registered full-line graph.
+            result = session.run(None, current)
             profile = Path(session.end_profiling())
             encoded = profile.read_bytes()
             events = json.loads(encoded)

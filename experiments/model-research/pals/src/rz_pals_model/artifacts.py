@@ -4,7 +4,49 @@ import json
 import os
 from pathlib import Path
 
-from .config import ModelConfig, SCHEMA, TASKS
+from .config import (DEFAULT_INIT_PROFILE, MAX_LINE_PLIES, MODEL_SEMANTICS_V2, ModelConfig,
+                     SCHEMA, TASKS, public_tensor_names, role_tensor_names)
+
+FULL_LINE_RULES_FEATURES = ["full_line.record_tokens", "full_line.record_lengths", "full_line.record_mask",
+                            "full_line.query_tokens", "full_line.query_lengths", "full_line.query_mask",
+                            "full_line.record_kind", "full_line.parent_local_index", "full_line.supersedes_local_index"]
+FULL_LINE_RULES_BOUNDS = {"max_records": 128, "max_line_plies": 256, "max_candidates": 256}
+
+
+def validate_rules_declaration(declaration, config):
+    """V2 has a separate semantic extension; the V1 58-field digest stays fixed."""
+    config.validate()
+    schema = "rovezero.pals-rules-descriptor.v2" if config.full_line else "rovezero.pals-rules-descriptor.v1"
+    profile = "rz-pals-rules-full-line-v2" if config.full_line else "rz-pals-rules-fields-v1"
+    if declaration.get("schema") != schema or declaration.get("rules_input_profile") != profile or declaration.get("config") != config.to_dict():
+        raise ValueError("Rules profile schema/config mismatch")
+    for key in ("rules_input_semantic_sha256", "rules_encoder_source_sha256"):
+        if not _sha256_text(declaration.get(key)): raise ValueError("Rules declaration digest missing")
+    if declaration.get("learned_input_compatibility") != "unverified_declaration_only":
+        raise ValueError("source declaration cannot assert learned compatibility")
+    features = []
+    for key, count in (("metadata_features", 16), ("record_features", 16), ("query_features", 16), ("divergence_features", 8)):
+        values = declaration.get(key)
+        if not isinstance(values, list) or len(values) != count or any(not isinstance(value, str) or not value for value in values):
+            raise ValueError("Rules feature vocabulary mismatch")
+        features += values
+    if config.full_line:
+        if declaration.get("full_line_features") != FULL_LINE_RULES_FEATURES or declaration.get("bounds") != FULL_LINE_RULES_BOUNDS:
+            raise ValueError("Rules full-line vocabulary/bounds mismatch")
+        features += FULL_LINE_RULES_FEATURES
+    elif "full_line_features" in declaration or "bounds" in declaration:
+        raise ValueError("legacy Rules descriptor rejects full-line extension")
+    fields = declaration.get("semantic_fields")
+    if declaration.get("semantic_digest_algorithm") != "sha256_u64le_length_prefixed_utf8_fields" or not isinstance(fields, list) or len(fields) != (67 if config.full_line else 58) or fields[0] != profile or not isinstance(fields[1], str) or not fields[1] or fields[1] != declaration.get("rules_base_semantics") or fields[2:] != features:
+        raise ValueError("Rules semantic fields/canonicalization mismatch")
+    semantic = hashlib.sha256()
+    for field in fields:
+        value = field.encode("utf-8")
+        semantic.update(len(value).to_bytes(8, "little"))
+        semantic.update(value)
+    if semantic.hexdigest() != declaration["rules_input_semantic_sha256"]:
+        raise ValueError("Rules semantic digest disagrees with declared fields")
+    return semantic.hexdigest()
 
 
 def digest_file(path):
@@ -31,6 +73,14 @@ def read_rules_profile(path, config):
             result[key] = value
         return result
     declaration = json.loads(encoded, object_pairs_hook=unique_pairs)
+    if config.profile != "legacy_summary_v1":
+        semantic_digest = validate_rules_declaration(declaration, config)
+        canonical = json.dumps(declaration, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        return {"rules_input_profile": declaration["rules_input_profile"], "rules_input_semantic_sha256": semantic_digest,
+                "rules_encoder_source_sha256": declaration["rules_encoder_source_sha256"],
+                "rules_profile_descriptor_sha256": hashlib.sha256(encoded).hexdigest(),
+                "rules_profile_canonical_sha256": hashlib.sha256(canonical).hexdigest(),
+                "rules_input_declaration": declaration, "learned_input_compatibility": "unverified_declaration_only"}
     if declaration.get("schema") != "rovezero.pals-rules-descriptor.v1" or declaration.get("rules_input_profile") != "rz-pals-rules-fields-v1" or declaration.get("config") != config.to_dict():
         raise ValueError("Rules profile schema/config mismatch")
     for key in ("rules_input_semantic_sha256", "rules_encoder_source_sha256"):
@@ -95,20 +145,20 @@ def atomic_json(path, value):
     temporary.replace(path)
 
 
-def initialize_checkpoint(directory, seed):
+def initialize_checkpoint(directory, seed, profile=DEFAULT_INIT_PROFILE):
     import torch
     from .model import initialize
     output = output_directory(directory)
     checkpoint = output / "untrained.pt"
     if checkpoint.exists() or checkpoint.with_suffix(".pt.partial").exists():
         raise FileExistsError("checkpoint already exists")
-    model = initialize(seed)
+    model = initialize(seed, ModelConfig.for_profile(profile))
     temporary = checkpoint.with_suffix(".pt.partial")
     # Only tensors and JSON-like primitives; loading uses weights_only=True.
     torch.save({"state_dict": model.state_dict(), "config": model.config.to_dict(), "seed": seed,
-                "schema": SCHEMA, "training_steps": 0, "trained": False}, temporary)
+                "schema": model.config.model_semantics, "training_steps": 0, "trained": False}, temporary)
     temporary.replace(checkpoint)
-    metadata = {"schema": SCHEMA, "checkpoint": checkpoint.name, "checkpoint_sha256": digest_file(checkpoint),
+    metadata = {"schema": model.config.model_semantics, "checkpoint": checkpoint.name, "checkpoint_sha256": digest_file(checkpoint),
                 "config": model.config.to_dict(), "seed": seed, "trained": False, "training_steps": 0,
                 "external_weights": False, "external_teacher": False, "precision": "fp32", "tf32": False,
                 "torch_version": torch.__version__, "parameter_count": sum(p.numel() for p in model.parameters()),
@@ -123,13 +173,13 @@ def load_checkpoint(path):
     path = Path(path).resolve()
     metadata_path = path.with_name("checkpoint.json")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if metadata.get("schema") != SCHEMA or metadata.get("checkpoint_sha256") != digest_file(path):
+    if metadata.get("schema") not in (SCHEMA, MODEL_SEMANTICS_V2) or metadata.get("checkpoint_sha256") != digest_file(path):
         raise ValueError("checkpoint identity mismatch")
     if metadata.get("external_weights") is not False or metadata.get("external_teacher") is not False:
         raise ValueError("first PALS profile requires explicit own-weight/no-external-teacher provenance")
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     steps = checkpoint.get("training_steps")
-    if checkpoint.get("schema") != SCHEMA or not isinstance(steps, int) or isinstance(steps, bool) or steps < 0 or checkpoint.get("trained") is not (steps > 0):
+    if checkpoint.get("schema") != metadata["schema"] or not isinstance(steps, int) or isinstance(steps, bool) or steps < 0 or checkpoint.get("trained") is not (steps > 0):
         raise ValueError("checkpoint must declare consistent training provenance")
     if metadata.get("training_steps") != steps or metadata.get("trained") is not checkpoint["trained"]:
         raise ValueError("checkpoint/receipt training provenance mismatch")
@@ -137,6 +187,8 @@ def load_checkpoint(path):
         raise ValueError("checkpoint configuration mismatch")
     config = ModelConfig(**checkpoint["config"])
     config.validate()
+    if metadata["schema"] != config.model_semantics:
+        raise ValueError("checkpoint schema/profile semantics mismatch")
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(checkpoint["seed"])
         model = PalsModel(config)
@@ -150,9 +202,13 @@ def validate_export_manifest(manifest, metadata):
     shared = manifest.get("schema") == ARTIFACT_SCHEMA
     if manifest.get("schema") not in (SCHEMA, ARTIFACT_SCHEMA) or manifest.get("config") != metadata.get("config") or manifest.get("checkpoint_sha256") != metadata.get("checkpoint_sha256"):
         raise ValueError("export schema/config/checkpoint mismatch")
-    if shared and (manifest.get("model_semantics") != SCHEMA or manifest.get("layout") != SHARED_LAYOUT or manifest.get("layout_revision") != SHARED_LAYOUT_REVISION):
+    config = ModelConfig(**manifest["config"])
+    config.validate()
+    if config.profile != "legacy_summary_v1" and (manifest.get("model_semantics") != config.model_semantics or manifest.get("encoding_schema") != config.encoding or manifest.get("model_profile") != config.profile):
+        raise ValueError("export model profile/semantic/encoding mismatch")
+    if shared and (manifest.get("model_semantics") != config.model_semantics or manifest.get("layout") != SHARED_LAYOUT or manifest.get("layout_revision") != SHARED_LAYOUT_REVISION):
         raise ValueError("export shared layout/semantic revision mismatch")
-    if shared and (manifest.get("rules_input_profile") != "rz-pals-rules-fields-v1" or not _sha256_text(manifest.get("rules_input_semantic_sha256")) or not _sha256_text(manifest.get("rules_encoder_source_sha256"))):
+    if shared and (manifest.get("rules_input_profile") != ("rz-pals-rules-full-line-v2" if config.full_line else "rz-pals-rules-fields-v1") or not _sha256_text(manifest.get("rules_input_semantic_sha256")) or not _sha256_text(manifest.get("rules_encoder_source_sha256"))):
         raise ValueError("shared production layout requires Rules semantic profile")
     if manifest.get("trained") is not metadata.get("trained") or manifest.get("training_steps") != metadata.get("training_steps"):
         raise ValueError("export training provenance mismatch")
@@ -179,12 +235,14 @@ def validate_export_manifest(manifest, metadata):
         if graph.get("file") != expected_file or not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest) or graph.get("opset") != 17:
             raise ValueError("export graph file/digest/opset mismatch")
         if role == "public":
-            expected_inputs = ["board", "metadata", "records", "record_mask"]
+            expected_inputs = public_tensor_names(config)
             expected_outputs = ["memory_key", "memory_value", "memory_mask"]
         else:
             expected_inputs = (["role_is_critic"] if role == "shared_pc" else []) + ["memory_key", "memory_value", "memory_mask", "candidates", "candidate_mask"]
             if role in ("critic", "shared_pc"): expected_inputs += ["divergence_features", "divergence_mask"]
             expected_inputs += ["query"]
+            if config.full_line:
+                expected_inputs += ["query_line_tokens", "query_line_mask", "record_relations"]
             expected_outputs = ["candidate_logits", "wdl_logits", "private_latent"]
             if role in ("critic", "shared_pc"): expected_outputs += ["divergence_logits"]
             if role == "shared_pc": expected_outputs += ["is_critic"]
@@ -193,6 +251,16 @@ def validate_export_manifest(manifest, metadata):
             descriptors = graph.get(key)
             if not isinstance(descriptors, list) or [value.get("name") for value in descriptors] != expected:
                 raise ValueError("export graph required tensor names mismatch")
+        line_shapes = {"record_line_tokens": ("INT64", ["batch", "records", MAX_LINE_PLIES, 3]),
+                       "record_line_mask": ("BOOL", ["batch", "records", MAX_LINE_PLIES]),
+                       "query_line_tokens": ("INT64", ["batch", 3, MAX_LINE_PLIES, 3]),
+                       "query_line_mask": ("BOOL", ["batch", 3, MAX_LINE_PLIES]),
+                       "record_relations": ("INT64", ["batch", "records", 2])}
+        for descriptor in graph["inputs"]:
+            if descriptor["name"] in line_shapes:
+                dtype, shape = line_shapes[descriptor["name"]]
+                if descriptor.get("dtype") != dtype or descriptor.get("shape") != shape:
+                    raise ValueError("export full-line tensor shape/dtype mismatch")
     return roles
 
 
@@ -232,10 +300,10 @@ def export_checkpoint(checkpoint, directory, include_validator=False, layout="se
     output = output_directory(directory)
     if not include_validator:
         model = model.without_validator()
-    data = fixture_input()
+    data = fixture_input(profile=model.config.profile)
     data.validate(model.config)
     graphs = []
-    public_args = data.public_args()
+    public_args = data.public_args(model.config)
     # CPU export does not execute TF32. Never change caller autograd/backend
     # globals; a future preparation consumer may export then build its losses.
     with torch.no_grad():
@@ -247,10 +315,12 @@ def export_checkpoint(checkpoint, directory, include_validator=False, layout="se
     artifact_schema = ARTIFACT_SCHEMA if layout == SHARED_LAYOUT else SCHEMA
     def save_document(document, temporary, destination, filename, role):
         onnx.checker.check_model(document, full_check=True)
-        properties = {"schema": artifact_schema, "model_semantics": SCHEMA,
+        properties = {"schema": artifact_schema, "model_semantics": model.config.model_semantics,
             "layout": layout, "layout_revision": str(SHARED_LAYOUT_REVISION if layout == SHARED_LAYOUT else 1), "role": role,
             "checkpoint_sha256": metadata["checkpoint_sha256"], "training_steps": str(metadata["training_steps"]), "trained": str(metadata["trained"]).lower(),
             "precision": "fp32", "expected_ort": "1.22.0", "public_kv": "shared_role_neutral"}
+        if model.config.profile != "legacy_summary_v1":
+            properties.update({"encoding_schema": model.config.encoding, "model_profile": model.config.profile})
         if rules_profile is not None:
             properties.update({key: rules_profile[key] for key in ("rules_input_profile", "rules_input_semantic_sha256", "rules_encoder_source_sha256")})
         onnx.helper.set_model_props(document, properties)
@@ -277,13 +347,15 @@ def export_checkpoint(checkpoint, directory, include_validator=False, layout="se
             annotate_public_memory_shapes(document, model.config)
         save_document(document, temporary, destination, filename, role)
 
-    public_names = ["board", "metadata", "records", "record_mask"]
+    public_names = public_tensor_names(model.config)
     axes = {name: {0: "batch"} for name in public_names}
     axes["records"][1] = axes["record_mask"][1] = "records"
+    if model.config.full_line:
+        axes["record_line_tokens"][1] = axes["record_line_mask"][1] = "records"
     axes.update({"memory_key": {0: "batch", 2: "memory_tokens"}, "memory_value": {0: "batch", 2: "memory_tokens"}, "memory_mask": {0: "batch", 1: "memory_tokens"}})
     export(model.public_encoder, public_args, "public_memory.onnx", public_names,
            ["memory_key", "memory_value", "memory_mask"], axes, "public")
-    names = ["memory_key", "memory_value", "memory_mask", "candidates", "candidate_mask", "divergence_features", "divergence_mask", "query"]
+    names = role_tensor_names(model.config)
     for role in (model.experts if layout == "separate_pc" else ()):
         outputs = ["candidate_logits", "wdl_logits", "private_latent"]
         if role == "critic": outputs.append("divergence_logits")
@@ -294,7 +366,9 @@ def export_checkpoint(checkpoint, directory, include_validator=False, layout="se
         axes["candidates"][1] = axes["candidate_mask"][1] = axes["candidate_logits"][1] = "candidates"
         axes["divergence_features"][1] = axes["divergence_mask"][1] = "divergences"
         if role == "critic": axes["divergence_logits"][1] = "divergences"
-        export(model.role_graph(role), data.role_args(memory), f"role_{role}.onnx", names, outputs, axes, role)
+        if model.config.full_line:
+            axes["record_relations"][1] = "records"
+        export(model.role_graph(role), data.role_args(memory, model.config), f"role_{role}.onnx", names, outputs, axes, role)
     reader_bank = None
     if layout == SHARED_LAYOUT:
         filename = "shared_pc_if.onnx"
@@ -310,8 +384,11 @@ def export_checkpoint(checkpoint, directory, include_validator=False, layout="se
                 "candidate_promotion": {"0": "none", "1": "queen", "2": "rook", "3": "bishop", "4": "knight"},
                 "wdl_perspective": "input_side_to_move", "task_names": list(TASKS), "numeric_status": "not_run", "cuda_status": "not_run"}
     if layout == SHARED_LAYOUT:
-        manifest.update({"model_semantics": SCHEMA, "layout": layout, "layout_revision": SHARED_LAYOUT_REVISION,
+        manifest.update({"model_semantics": model.config.model_semantics, "layout": layout, "layout_revision": SHARED_LAYOUT_REVISION,
                          "reader_initializer_bank": reader_bank, "role_batching": "one_scalar_role_per_physical_batch"})
+    if model.config.profile != "legacy_summary_v1":
+        manifest.update({"model_semantics": model.config.model_semantics, "encoding_schema": model.config.encoding,
+                         "model_profile": model.config.profile})
     if rules_profile is not None:
         manifest.update(rules_profile)
     atomic_json(output / "export.json", manifest)
@@ -342,11 +419,11 @@ def numeric_check(checkpoint, directory):
     reports = []
     with torch.no_grad():
         for records, candidates, divergences, batch in ((1, 1, 1, 1), (3, 7, 4, 1), (5, 9, 3, 2)):
-            data = fixture_input(records, candidates, divergences, batch)
-            data.validate()
-            public_feed = dict(zip(("board", "metadata", "records", "record_mask"), [x.numpy() for x in data.public_args()]))
+            data = fixture_input(records, candidates, divergences, batch, profile=model.config.profile)
+            data.validate(model.config)
+            public_feed = dict(zip(public_tensor_names(model.config), [x.numpy() for x in data.public_args(model.config)]))
             public = sessions["public"].run(None, public_feed)
-            reference_memory = model.public_encoder(*data.public_args())
+            reference_memory = model.public_encoder(*data.public_args(model.config))
             for name, expected, actual in zip(("memory_key", "memory_value", "memory_mask"), reference_memory, public):
                 expected = expected.numpy()
                 if expected.shape != actual.shape:
@@ -356,9 +433,9 @@ def numeric_check(checkpoint, directory):
                 elif not np.allclose(expected, actual, atol=1e-4, rtol=1e-3):
                     raise ValueError(f"public numeric mismatch: {name}")
             for role in manifest["roles"]:
-                expected = model.role_graph(role)(*data.role_args(reference_memory))
-                tensors = data.role_args(tuple(torch.from_numpy(v) for v in public))
-                all_feed = dict(zip(("memory_key", "memory_value", "memory_mask", "candidates", "candidate_mask", "divergence_features", "divergence_mask", "query"), [x.numpy() for x in tensors]))
+                expected = model.role_graph(role)(*data.role_args(reference_memory, model.config))
+                tensors = data.role_args(tuple(torch.from_numpy(v) for v in public), model.config)
+                all_feed = dict(zip(role_tensor_names(model.config), [x.numpy() for x in tensors]))
                 session = sessions.get(role)
                 if manifest.get("layout") == "shared_pc_if":
                     session = sessions["shared_pc"]
@@ -392,14 +469,14 @@ def numeric_check(checkpoint, directory):
                                 "batch": batch, "max_absolute_differences": maxima})
     if len(reports) != 3 * len(manifest["roles"]):
         raise ValueError("numeric role acceptance case count mismatch")
-    result = {"schema": SCHEMA, "artifact_schema": manifest["schema"], "layout": manifest.get("layout", "separate_pc"),
+    result = {"schema": model.config.model_semantics, "artifact_schema": manifest["schema"], "layout": manifest.get("layout", "separate_pc"),
               "checkpoint_sha256": metadata["checkpoint_sha256"], "trained": metadata["trained"],
               "runtime": ort.__version__, "provider": "CPUExecutionProvider", "rust_ort": "not_run", "cuda": "not_run", "cases": reports, "status": "passed"}
     if manifest.get("layout") == "shared_pc_if":
         from .numeric import verify_cpu_hard_routes
-        data = fixture_input(3, 7, 4, 1)
-        with torch.no_grad(): memory = model.public_encoder(*data.public_args())
-        feed = dict(zip(("memory_key", "memory_value", "memory_mask", "candidates", "candidate_mask", "divergence_features", "divergence_mask", "query"), [value.numpy() for value in data.role_args(memory)]))
+        data = fixture_input(3, 7, 4, 1, profile=model.config.profile)
+        with torch.no_grad(): memory = model.public_encoder(*data.public_args(model.config))
+        feed = dict(zip(role_tensor_names(model.config), [value.numpy() for value in data.role_args(memory, model.config)]))
         result["hard_route_cpu_profile"] = verify_cpu_hard_routes(directory / "shared_pc_if.onnx", feed)
     return result
 
@@ -429,11 +506,16 @@ def rust_fixtures(checkpoint, export_directory, destination):
               ("proposer_order_reversed", "proposer", 3, 7, 0, True, 1),
               ("same_board_other_history", "proposer", 3, 7, 0, False, 2),
               ("all_promotions", "critic", 1, 4, 1, False, 3))
+    if model.config.full_line:
+        shapes += (("full_middle_record_changed", "critic", 3, 7, 4, False, 1),
+                   ("full_middle_query_changed", "proposer", 3, 7, 0, False, 1),
+                   ("record_relations_changed", "critic", 3, 7, 4, False, 1),
+                   ("empty_line_padding", "proposer", 1, 1, 0, False, 1))
     with torch.no_grad():
         for name, role, records, candidates, divergences, reverse, history in shapes:
             if role not in manifest["roles"]:
                 raise ValueError("fixture role absent from exported model")
-            data = fixture_input(max(records, 1), max(candidates, 1), max(divergences, 1))
+            data = fixture_input(max(records, 1), max(candidates, 1), max(divergences, 1), profile=model.config.profile)
             data = dataclasses.replace(data, record_mask=torch.ones((1, max(records, 1)), dtype=torch.bool) if records else torch.zeros((1, 1), dtype=torch.bool),
                                        candidate_mask=torch.ones((1, max(candidates, 1)), dtype=torch.bool) if candidates else torch.zeros((1, 1), dtype=torch.bool),
                                        divergence_mask=torch.ones((1, max(divergences, 1)), dtype=torch.bool) if divergences else torch.zeros((1, 1), dtype=torch.bool))
@@ -444,9 +526,20 @@ def rust_fixtures(checkpoint, export_directory, destination):
                 data = dataclasses.replace(data, candidates=torch.flip(data.candidates, (1,)))
             if name == "all_promotions":
                 data = dataclasses.replace(data, candidates=torch.tensor([[[48, 56, promotion] for promotion in (1, 2, 3, 4)]], dtype=torch.int64))
-            data.validate()
-            memory = model.public_encoder(*data.public_args())
-            raw = model.role_graph(role)(*data.role_args(memory))
+            if model.config.full_line:
+                if not records or name == "empty_line_padding":
+                    data.record_line_tokens.zero_(); data.record_line_mask.zero_(); data.record_relations.fill_(-1)
+                if name == "empty_line_padding":
+                    data.query_line_tokens.zero_(); data.query_line_mask.zero_()
+                if name == "full_middle_record_changed":
+                    data.record_line_tokens[0, 0, 1, 0] = 31
+                if name == "full_middle_query_changed":
+                    data.query_line_tokens[0, 1, 1, 0] = 31
+                if name == "record_relations_changed":
+                    data.record_relations[0, 2] = torch.tensor([-1, 0])
+            data.validate(model.config)
+            memory = model.public_encoder(*data.public_args(model.config))
+            raw = model.role_graph(role)(*data.role_args(memory, model.config))
             input_value = {"role": role, "board": data.board[0].tolist(), "metadata": data.metadata[0].tolist(),
                 "records": [{"record_id": index+1, "revision": 1, "critical": index == 0,
                              "features": data.records[0,index].tolist()} for index in range(records)],
@@ -455,6 +548,16 @@ def rust_fixtures(checkpoint, export_directory, destination):
                 "divergence_features": data.divergence_features[0,:divergences].tolist(), "query": data.query[0].tolist(),
                 "situation_revision": 1, "history_digest": [history]*32,
                 "model_epoch": list(bytes.fromhex(metadata["checkpoint_sha256"]))}
+            if model.config.full_line:
+                def line(values, active):
+                    return [{"from": token[0], "to": token[1], "promotion": token[2]} for token in values[active].tolist()]
+                input_value["full_line"] = {"records": [
+                    {"moves": line(data.record_line_tokens[0, index], data.record_line_mask[0, index]),
+                     "parent": None if data.record_relations[0, index, 0] < 0 else int(data.record_relations[0, index, 0]),
+                     "supersedes": None if data.record_relations[0, index, 1] < 0 else int(data.record_relations[0, index, 1])}
+                    for index in range(records)],
+                    **{name: line(data.query_line_tokens[0, index], data.query_line_mask[0, index])
+                       for index, name in enumerate(("query_prefix", "query_proposal", "query_counter"))}}
             expected = {"candidate_logits": raw[0][0,:candidates].tolist(), "wdl_logits": raw[1][0].tolist(),
                         "private_latent": raw[2][0].flatten().tolist(),
                         "divergence_logits": raw[3][0,:divergences].tolist() if role == "critic" else None,
@@ -462,7 +565,10 @@ def rust_fixtures(checkpoint, export_directory, destination):
             public_memory = {"tokens": int(memory[0].shape[2]), "memory_key": memory[0].flatten().tolist(),
                              "memory_value": memory[1].flatten().tolist(), "memory_mask": memory[2].flatten().tolist()}
             cases.append({"name": name, "input": input_value, "expected": expected, "public_memory": public_memory})
-    result = {"schema": SCHEMA, "checkpoint_sha256": metadata["checkpoint_sha256"], "trained": metadata["trained"],
+    result = {"schema": model.config.model_semantics, "checkpoint_sha256": metadata["checkpoint_sha256"], "trained": metadata["trained"],
               "rules_certified": False, "reference": "pytorch_fp32_tf32_off", "cases": cases}
+    if model.config.profile != "legacy_summary_v1":
+        result.update({"config": model.config.to_dict(), "model_profile": model.config.profile,
+                       "encoding_schema": model.config.encoding})
     atomic_json(output, result)
-    return {"schema": SCHEMA, "file": output.name, "sha256": digest_file(output), "cases": len(cases), "trained": metadata["trained"]}
+    return {"schema": model.config.model_semantics, "file": output.name, "sha256": digest_file(output), "cases": len(cases), "trained": metadata["trained"]}

@@ -7,11 +7,12 @@ public-memory K/V may be retained. All first-profile arithmetic is FP32.
 """
 import copy
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 from torch import nn
 
-from .config import ModelConfig, ROLES, TASKS
+from .config import INTERACTION_WIDTH, LINE_WIDTH, MAX_LINE_PLIES, ModelConfig, ROLES, TASKS
 
 
 class RMSNorm(nn.Module):
@@ -97,15 +98,20 @@ class PublicEncoder(nn.Module):
         self.memory_key = nn.Linear(config.width, config.kv_heads * config.head_dimension, bias=False)
         self.memory_value = nn.Linear(config.width, config.kv_heads * config.head_dimension, bias=False)
 
-    def encode_records(self, records):
+    def encode_records(self, records, record_line_tokens=None, record_line_mask=None):
         b, r, _ = records.shape
         fields = self.record_projection(records.reshape(b * r, 4, 4)) + self.record_field_embedding
         mask = torch.ones((b * r, 4), dtype=torch.bool, device=records.device)
         for block in self.record_blocks:
             fields = block(fields, mask)
-        return fields.mean(dim=1).reshape(b, r, self.config.width)
+        result = fields.mean(dim=1).reshape(b, r, self.config.width)
+        if self.config.full_line:
+            if record_line_tokens is None or record_line_mask is None:
+                raise ValueError("full-line record tensors are required")
+            result = result + self.record_line_projection(self.line_encoder(record_line_tokens, record_line_mask))
+        return result
 
-    def forward(self, board, metadata, records, record_mask):
+    def forward(self, board, metadata, records, record_mask, record_line_tokens=None, record_line_mask=None):
         b = board.shape[0]
         square = self.piece_embedding(board) + self.square_embedding
         meta = self.metadata_projection(metadata).reshape(b, 2, self.config.width)
@@ -113,7 +119,7 @@ class PublicEncoder(nn.Module):
         board_mask = torch.ones((b, 66), dtype=torch.bool, device=board.device)
         for block in self.board_blocks:
             board_tokens = block(board_tokens, board_mask)
-        record_tokens = self.encode_records(records)
+        record_tokens = self.encode_records(records, record_line_tokens, record_line_mask)
         memory = torch.cat((board_tokens, record_tokens), dim=1)
         mask = torch.cat((board_mask, record_mask), dim=1)
         key = self.memory_key(memory).reshape(b, -1, self.config.kv_heads, self.config.head_dimension).transpose(1, 2)
@@ -154,6 +160,61 @@ class MoveEmbedding(nn.Module):
                                          self.promotion(candidates[:, :, 2])), dim=-1))
 
 
+class FullLineEncoder(nn.Module):
+    """Independent ordered move/ply encoder shared by record and query lines.
+
+    Mask before every lookup/convolution and after each residual keeps padded
+    move values from affecting a live neighbor. Empty lines pool to exact zero.
+    Relationships, global IDs, revisions and hashes are never inputs here.
+    """
+    def __init__(self):
+        super().__init__()
+        self.moves = MoveEmbedding(SimpleNamespace(width=LINE_WIDTH))
+        self.ply_embedding = nn.Embedding(MAX_LINE_PLIES, LINE_WIDTH)
+        self.temporal_blocks = nn.ModuleList(nn.Conv1d(LINE_WIDTH, LINE_WIDTH, 3, padding=dilation,
+                                                      dilation=dilation, bias=False) for dilation in (1, 2))
+        self.pool_attention = nn.Linear(LINE_WIDTH, 1, bias=False)
+
+    def forward(self, tokens, mask):
+        groups = tokens.shape[:-2]
+        moves = tokens.reshape(-1, MAX_LINE_PLIES, 3)
+        active = mask.reshape(-1, MAX_LINE_PLIES)
+        safe_moves = moves.masked_fill(~active[:, :, None], 0)
+        value = self.moves(safe_moves) + self.ply_embedding(torch.arange(MAX_LINE_PLIES, device=tokens.device))[None, :, :]
+        value = value * active[:, :, None]
+        for temporal in self.temporal_blocks:
+            value = (value + torch.nn.functional.silu(temporal(value.transpose(1, 2)).transpose(1, 2))) * active[:, :, None]
+        scores = self.pool_attention(value).squeeze(-1).masked_fill(~active, -1e9)
+        weights = torch.softmax(scores, dim=-1) * active
+        return (value * weights[:, :, None]).sum(dim=1).reshape(*groups, LINE_WIDTH)
+
+
+class CandidateInteractionHead(nn.Module):
+    """Nonlinear candidate/context joint score permits from-dependent ranking."""
+    def __init__(self, width):
+        super().__init__()
+        self.hidden = nn.Linear(2 * width, INTERACTION_WIDTH)
+        self.output = nn.Linear(INTERACTION_WIDTH, 1, bias=False)
+
+    def forward(self, candidates, context):
+        context = context[:, None, :].expand(-1, candidates.shape[1], -1)
+        return self.output(torch.nn.functional.silu(self.hidden(torch.cat((candidates, context), dim=-1))))
+
+
+def relation_features(key, value, memory_mask, relations):
+    """Gather local record relationships from independent public K/V only."""
+    own = torch.cat((key[:, :, 66:, :], value[:, :, 66:, :]), dim=1).transpose(1, 2).flatten(2)
+    batch, records, width = own.shape
+    active_records = memory_mask[:, 66:]
+    related = []
+    for axis in range(2):
+        index = relations[:, :, axis]
+        selected = torch.gather(own, 1, index.clamp_min(0)[:, :, None].expand(batch, records, width))
+        related.append(selected * (index >= 0)[:, :, None])
+    active = active_records & (relations >= 0).any(dim=-1)
+    return torch.cat((own, *related), dim=-1), active
+
+
 class RoleExpert(nn.Module):
     def __init__(self, role, config):
         super().__init__()
@@ -170,15 +231,33 @@ class RoleExpert(nn.Module):
         if role == "validator":
             self.task_head = nn.Linear(config.width, len(TASKS), bias=False)
 
+    def initial(self, query, query_line_features=None, graph_relations=None, graph_relation_mask=None):
+        conditioning = self.query_projection(query)
+        if self.config.full_line:
+            if query_line_features is None or graph_relations is None or graph_relation_mask is None:
+                raise ValueError("full-line private query/relationship tensors are required")
+            conditioning = conditioning + self.query_line_projection(query_line_features.flatten(1))
+            relations = self.relation_output(torch.nn.functional.silu(self.relation_hidden(graph_relations)))
+            relations = (relations * graph_relation_mask[:, :, None]).sum(dim=1) / graph_relation_mask.sum(dim=1, keepdim=True).clamp_min(1)
+            conditioning = conditioning + relations
+        return self.initial_latent[None, :, :] + conditioning[:, None, :]
+
+    def candidate_logits(self, move_embedding, candidates, context):
+        embedded = move_embedding(candidates)
+        if self.config.interaction_head:
+            return self.interaction_policy_head(embedded, context).squeeze(-1)
+        return self.policy_head(embedded * context[:, None, :]).squeeze(-1)
+
     def forward(self, reader_blocks, move_embedding, key, value, mask, candidates, candidate_mask,
-                divergence_features, divergence_mask, query):
-        latent = self.initial_latent[None, :, :] + self.query_projection(query)[:, None, :]
+                divergence_features, divergence_mask, query, query_line_features=None,
+                graph_relations=None, graph_relation_mask=None):
+        latent = self.initial(query, query_line_features, graph_relations, graph_relation_mask)
         for _ in range(self.config.iterations):
             for index, reader in enumerate(reader_blocks):
                 latent = reader(latent, key, value, mask)
                 latent = latent + self.ffns[index](self.ffn_norms[index](latent))
         context = latent.mean(dim=1)
-        candidate_logits = self.policy_head(move_embedding(candidates) * context[:, None, :]).squeeze(-1)
+        candidate_logits = self.candidate_logits(move_embedding, candidates, context)
         candidate_logits = candidate_logits.masked_fill(~candidate_mask, -1e9)
         outputs = (candidate_logits, self.wdl_head(context), latent)
         if self.role == "critic":
@@ -205,7 +284,7 @@ class RoleExpert(nn.Module):
                 latent = reader(latent, key, value, mask)
                 latent = latent + self.ffns[index](self.ffn_norms[index](latent))
         context = latent.mean(dim=1)
-        candidate_logits = self.policy_head(move_embedding(candidates) * context[:, None, :]).squeeze(-1)
+        candidate_logits = self.candidate_logits(move_embedding, candidates, context)
         candidate_logits = candidate_logits.masked_fill(~candidate_mask, -1e9)
         outputs = (candidate_logits, self.wdl_head(context), latent)
         if self.role == "critic":
@@ -218,13 +297,21 @@ class RoleExpert(nn.Module):
 
 class RoleGraph(nn.Module):
     """An exported graph contains exactly one private expert, never a router."""
-    def __init__(self, reader_blocks, move_embedding, expert):
+    def __init__(self, reader_blocks, move_embedding, expert, line_encoder=None):
         super().__init__()
         self.reader_blocks, self.move_embedding, self.expert = reader_blocks, move_embedding, expert
+        self.line_encoder = line_encoder
 
-    def forward(self, key, value, mask, candidates, candidate_mask, divergence_features, divergence_mask, query):
+    def forward(self, key, value, mask, candidates, candidate_mask, divergence_features, divergence_mask, query,
+                query_line_tokens=None, query_line_mask=None, record_relations=None):
+        extra = ()
+        if self.expert.config.full_line:
+            if query_line_tokens is None or query_line_mask is None or record_relations is None:
+                raise ValueError("full-line private graph inputs are required")
+            features, active = relation_features(key, value, mask, record_relations)
+            extra = (self.line_encoder(query_line_tokens, query_line_mask), features, active)
         return self.expert(self.reader_blocks, self.move_embedding, key, value, mask, candidates,
-                           candidate_mask, divergence_features, divergence_mask, query)
+                           candidate_mask, divergence_features, divergence_mask, query, *extra)
 
 
 class WarmRoleGraph(RoleGraph):
@@ -236,16 +323,20 @@ class WarmRoleGraph(RoleGraph):
     Caller seed acceptance/Rules context is certified by the Rust owner, not
     by this numerical wrapper. There is no implicit seed-zero => Fresh rule.
     """
-    def __init__(self, reader_blocks, move_embedding, expert):
+    def __init__(self, reader_blocks, move_embedding, expert, line_encoder=None):
         if expert.role not in ("proposer", "critic"):
             raise ValueError("private warm graph is P/C-only; validator is unsupported")
-        super().__init__(reader_blocks, move_embedding, expert)
+        super().__init__(reader_blocks, move_embedding, expert, line_encoder)
 
     def forward(self, key, value, mask, candidates, candidate_mask,
-                divergence_features, divergence_mask, query, initial_latent,
-                warm_start):
+                divergence_features, divergence_mask, query, *arguments):
         config = self.expert.config
         config.validate()
+        expected = 5 if config.full_line else 2
+        if len(arguments) != expected:
+            raise ValueError("private warm profile input count mismatch")
+        initial_latent, warm_start = arguments[-2:]
+        line_arguments = arguments[:-2]
         batch = key.shape[0] if key.ndim == 4 else 0
         if not isinstance(initial_latent, torch.Tensor) or batch < 1 or initial_latent.shape != (batch, config.latent_slots, config.width):
             raise ValueError("private warm initial latent shape must be [batch,16,384]")
@@ -257,7 +348,7 @@ class WarmRoleGraph(RoleGraph):
             raise ValueError("private warm seed/mode is on a different device")
         if not bool(warm_start.item()):
             return super().forward(key, value, mask, candidates, candidate_mask,
-                                   divergence_features, divergence_mask, query)
+                                   divergence_features, divergence_mask, query, *line_arguments)
         return self.expert.forward_from_initial(
             self.reader_blocks, self.move_embedding, key, value, mask, candidates,
             candidate_mask, divergence_features, divergence_mask, initial_latent)
@@ -274,16 +365,39 @@ class PalsModel(nn.Module):
         self.reader_blocks = nn.ModuleList(ReaderBlock(config) for _ in range(config.recurrent_blocks))
         self.move_embedding = MoveEmbedding(config)
         self.experts = nn.ModuleDict((role, RoleExpert(role, config)) for role in roles)
+        if config.profile != "legacy_summary_v1":
+            # Build the unchanged legacy bank first, then draw all new V2 banks
+            # in one fixed order. Selecting an ablation changes registered
+            # components, never the seeded common/input/head parameter values.
+            line_encoder = FullLineEncoder()
+            record_projection = nn.Linear(LINE_WIDTH, config.width, bias=False)
+            if config.full_line:
+                self.public_encoder.line_encoder = line_encoder
+                self.public_encoder.record_line_projection = record_projection
+            for expert in self.experts.values():
+                interaction = CandidateInteractionHead(config.width)
+                query_projection = nn.Linear(3 * LINE_WIDTH, config.width, bias=False)
+                relation_hidden = nn.Linear(3 * 2 * config.kv_heads * config.head_dimension, INTERACTION_WIDTH)
+                relation_output = nn.Linear(INTERACTION_WIDTH, config.width, bias=False)
+                if config.interaction_head:
+                    expert.interaction_policy_head = interaction
+                    del expert.policy_head
+                if config.full_line:
+                    expert.query_line_projection = query_projection
+                    expert.relation_hidden = relation_hidden
+                    expert.relation_output = relation_output
 
     def role_graph(self, role):
         if role not in self.experts:
             raise ValueError("role absent from frozen model")
-        return RoleGraph(self.reader_blocks, self.move_embedding, self.experts[role])
+        return RoleGraph(self.reader_blocks, self.move_embedding, self.experts[role],
+                         self.public_encoder.line_encoder if self.config.full_line else None)
 
     def warm_role_graph(self, role):
         if role not in self.experts:
             raise ValueError("role absent from frozen model")
-        return WarmRoleGraph(self.reader_blocks, self.move_embedding, self.experts[role])
+        return WarmRoleGraph(self.reader_blocks, self.move_embedding, self.experts[role],
+                             self.public_encoder.line_encoder if self.config.full_line else None)
 
     def without_validator(self):
         result = copy.deepcopy(self)
@@ -314,6 +428,11 @@ class TensorInput:
     divergence_features: torch.Tensor
     divergence_mask: torch.Tensor
     query: torch.Tensor
+    record_line_tokens: torch.Tensor = None
+    record_line_mask: torch.Tensor = None
+    query_line_tokens: torch.Tensor = None
+    query_line_mask: torch.Tensor = None
+    record_relations: torch.Tensor = None
 
     def validate(self, config=ModelConfig()):
         config.validate()
@@ -341,26 +460,102 @@ class TensorInput:
         for mask in (self.record_mask, self.candidate_mask, self.divergence_mask):
             if mask.dtype != torch.bool:
                 raise ValueError("mask dtype must be bool")
-        devices = {value.device for value in self.__dict__.values()}
+        full = (self.record_line_tokens, self.record_line_mask, self.query_line_tokens,
+                self.query_line_mask, self.record_relations)
+        if any(value is not None for value in full) and not all(isinstance(value, torch.Tensor) for value in full):
+            raise ValueError("partial full-line payload")
+        if not config.full_line and any(value is not None for value in full):
+            raise ValueError("profile rejects unexpected full-line payload")
+        if config.full_line and any(value is None for value in full):
+            raise ValueError("full-line profile requires explicit complete line payload")
+        if config.full_line and (torch.any(self.records[:, :, 6] != 0) or torch.any(self.query[:, 6:8] != 0)):
+            raise ValueError("full-line profile forbids identifier/revision/deadline semantic features")
+        if all(value is not None for value in full):
+            self._validate_lines(self.record_line_tokens, self.record_line_mask, (b, r), "record")
+            self._validate_lines(self.query_line_tokens, self.query_line_mask, (b, 3), "query")
+            if torch.any(self.record_line_mask & ~self.record_mask[:, :, None]):
+                raise ValueError("inactive record carries live line tokens")
+            relations = self.record_relations
+            if relations.dtype != torch.int64 or relations.shape != (b, r, 2) or torch.any((relations < -1) | (relations >= r)):
+                raise ValueError("record local relationship shape/index")
+            if torch.any((relations >= 0) & ~self.record_mask[:, :, None]):
+                raise ValueError("inactive record carries relationships")
+            # Admission runs outside exported arithmetic; inspect each bounded
+            # DAG in Python so cycles cannot leak into the private role graph.
+            for row in range(b):
+                refs = relations[row].tolist()
+                active = self.record_mask[row].tolist()
+                visiting, complete = set(), set()
+                def visit(index):
+                    if index in visiting: raise ValueError("record relationship cycle/self reference")
+                    if index in complete: return
+                    visiting.add(index)
+                    for parent in refs[index]:
+                        if parent >= 0:
+                            if not active[parent]: raise ValueError("relationship references masked record")
+                            visit(parent)
+                    visiting.remove(index)
+                    complete.add(index)
+                for index in range(r):
+                    if active[index]: visit(index)
+        devices = {value.device for value in self.__dict__.values() if value is not None}
         if len(devices) != 1:
             raise ValueError("input tensors are split across devices")
 
-    def public_args(self):
-        return self.board, self.metadata, self.records, self.record_mask
+    @staticmethod
+    def _validate_lines(tokens, mask, groups, label):
+        if tokens.dtype != torch.int64 or tokens.shape != (*groups, MAX_LINE_PLIES, 3) or mask.dtype != torch.bool or mask.shape != (*groups, MAX_LINE_PLIES):
+            raise ValueError(label + " line shape/dtype")
+        if torch.any(mask[..., 1:] & ~mask[..., :-1]):
+            raise ValueError(label + " line mask must be a contiguous prefix")
+        active = tokens[mask]
+        if torch.any((active[:, :2] < 0) | (active[:, :2] > 63)) or torch.any((active[:, 2] < 0) | (active[:, 2] > 4)) or torch.any(active[:, 0] == active[:, 1]):
+            raise ValueError(label + " line move code")
 
-    def role_args(self, memory):
-        return (*memory, self.candidates, self.candidate_mask, self.divergence_features, self.divergence_mask, self.query)
+    def public_args(self, config=None):
+        args = self.board, self.metadata, self.records, self.record_mask
+        if (config.full_line if config is not None else self.record_line_tokens is not None):
+            return (*args, self.record_line_tokens, self.record_line_mask)
+        return args
+
+    def role_args(self, memory, config=None):
+        args = (*memory, self.candidates, self.candidate_mask, self.divergence_features, self.divergence_mask, self.query)
+        if (config.full_line if config is not None else self.query_line_tokens is not None):
+            return (*args, self.query_line_tokens, self.query_line_mask, self.record_relations)
+        return args
 
 
-def fixture_input(records=3, candidates=4, divergences=2, batch=1):
+def fixture_input(records=3, candidates=4, divergences=2, batch=1, profile="legacy_summary_v1"):
     """Numeric fixture only, not Rules-certified chess or training data."""
     if not 1 <= records <= 128 or not 1 <= candidates <= 256 or not 1 <= divergences <= 128 or batch < 1:
         raise ValueError("fixture shape exceeds bounded profile")
     board = (torch.arange(64, dtype=torch.int64) % 13)[None, :].repeat(batch, 1)
     moves = torch.tensor([(i % 64, (i + 8) % 64, i % 5) for i in range(candidates)], dtype=torch.int64)[None, :, :].repeat(batch, 1, 1)
-    return TensorInput(board, torch.arange(16, dtype=torch.float32)[None, :].repeat(batch, 1) / 16,
+    config = ModelConfig.for_profile(profile)
+    result = TensorInput(board, torch.arange(16, dtype=torch.float32)[None, :].repeat(batch, 1) / 16,
                        torch.arange(batch * records * 16, dtype=torch.float32).reshape(batch, records, 16) / 127,
                        torch.ones((batch, records), dtype=torch.bool), moves,
                        torch.ones((batch, candidates), dtype=torch.bool),
                        torch.arange(batch * divergences * 8, dtype=torch.float32).reshape(batch, divergences, 8) / 31,
                        torch.ones((batch, divergences), dtype=torch.bool), torch.zeros((batch, 16), dtype=torch.float32))
+    if config.full_line:
+        result.records[:, :, 6] = 0
+        result.query[:, 6:8] = 0
+        lines = torch.zeros((batch, records, MAX_LINE_PLIES, 3), dtype=torch.int64)
+        masks = torch.zeros((batch, records, MAX_LINE_PLIES), dtype=torch.bool)
+        query_lines = torch.zeros((batch, 3, MAX_LINE_PLIES, 3), dtype=torch.int64)
+        query_masks = torch.zeros((batch, 3, MAX_LINE_PLIES), dtype=torch.bool)
+        for index in range(records):
+            for ply in range(4 + index % 3):
+                lines[:, index, ply] = torch.tensor([(index + ply * 7) % 64, (index + ply * 7 + 8) % 64, ply % 5])
+                masks[:, index, ply] = True
+        for index in range(3):
+            for ply in range(index + 2):
+                query_lines[:, index, ply] = torch.tensor([(index + ply * 9) % 64, (index + ply * 9 + 16) % 64, ply % 5])
+                query_masks[:, index, ply] = True
+        relations = torch.full((batch, records, 2), -1, dtype=torch.int64)
+        if records > 1: relations[:, 1:, 0] = torch.arange(records - 1)
+        result = TensorInput(**{**result.__dict__, "record_line_tokens": lines, "record_line_mask": masks,
+                               "query_line_tokens": query_lines, "query_line_mask": query_masks,
+                               "record_relations": relations})
+    return result

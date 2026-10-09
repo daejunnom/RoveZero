@@ -1,6 +1,7 @@
 """PALS training *preparation*: audited tensors, losses, optimizer and resume.
 
-There is deliberately no optimizer-update or training-loop entry point. Rules
+This preparation module deliberately has no optimizer-update entry point. The
+separate nonzero_training domain owns bounded actual updates and checkpoints. Rules
 and the Rust collector own legality and feature encoding. A /2 historical row
 cannot reconstruct public observation features from their hashes, so collation
 requires a separately supplied, input-bound encoded snapshot. Targets never
@@ -27,7 +28,7 @@ import torch
 from torch.nn import functional as F
 
 from .artifacts import digest_file, output_directory
-from .config import ModelConfig, TASKS
+from .config import ModelConfig, TASKS, MAX_LINE_PLIES
 from .model import TensorInput
 
 DATA_DOMAIN = "rz-pals-data/2"
@@ -419,6 +420,68 @@ class EncodedSnapshot:
     query: tuple
     divergences: tuple = ()  # (DivergenceContext, 8 features)
     task_queries: tuple = ()  # (TaskContext, 16 features)
+    model_profile: str = "legacy_summary_v1"
+    full_line: dict = None  # exact admitted /2 payload; never reconstructed from hashes
+
+
+def _encoding_value(value):
+    encoded = asdict(value)
+    if value.model_profile == "legacy_summary_v1" and value.full_line is None:
+        # Preserve the /1 derived encoding identity, not just the input seal.
+        del encoded["model_profile"]
+        del encoded["full_line"]
+    return encoded
+
+
+def _encoding_identity(value):
+    return _canonical("rz-pals-python-immutable-encoding/1", _encoding_value(value))
+
+
+def _validate_full_line(value, records):
+    value = _fields(value, ("records", "query_prefix", "query_proposal", "query_counter"), "full-line input")
+    if not isinstance(value["records"], list) or len(value["records"]) != records:
+        raise ValueError("full-line record order/extent differs from captured summary records")
+    def moves(line):
+        if not isinstance(line, list) or len(line) > MAX_LINE_PLIES:
+            raise ValueError("full-line ply allocation bound")
+        for token in line:
+            token = _fields(token, ("from", "to", "promotion"), "full-line move token")
+            source, destination = _uint(token["from"], 63), _uint(token["to"], 63)
+            _uint(token["promotion"], 4)
+            if source == destination:
+                raise ValueError("full-line move has identical from/to")
+    relations = []
+    for index, record in enumerate(value["records"]):
+        if (not isinstance(record, dict) or not {"moves", "parent", "supersedes"} <= set(record)
+                or set(record) - {"moves", "parent", "supersedes", "parent_required", "supersedes_required"}):
+            raise ValueError("full-line record fields")
+        moves(record["moves"])
+        pair = []
+        for name in ("parent", "supersedes"):
+            required = record.get(name + "_required", False)
+            if type(required) is not bool or (required and record[name] is None):
+                raise ValueError("full-line required local relationship is missing")
+            reference = record[name]
+            if reference is not None and (_uint(reference, records - 1) == index):
+                raise ValueError("full-line self relationship")
+            pair.append(reference)
+        relations.append(pair)
+    complete, visiting = set(), set()
+    def visit(index):
+        if index in visiting:
+            raise ValueError("full-line relationship cycle")
+        if index in complete:
+            return
+        visiting.add(index)
+        for reference in relations[index]:
+            if reference is not None:
+                visit(reference)
+        visiting.remove(index)
+        complete.add(index)
+    for index in range(records):
+        visit(index)
+    for name in ("query_prefix", "query_proposal", "query_counter"):
+        moves(value[name])
 
 
 def _validate_encoding(e):
@@ -427,6 +490,12 @@ def _validate_encoding(e):
     _vector(e.board, 64, integers=True)
     _vector(e.metadata, 16)
     _vector(e.query, 16)
+    config = ModelConfig.for_profile(e.model_profile)
+    if config.full_line:
+        if e.full_line is None:
+            raise ValueError("full-line encoded snapshot requires explicit complete /2 payload")
+    elif e.full_line is not None:
+        raise ValueError("encoded snapshot profile rejects unexpected full-line payload")
     if not isinstance(e.public_records, (list, tuple)) or len(e.public_records) > 128 or not isinstance(e.divergences, (list, tuple)) or len(e.divergences) > 128 or not isinstance(e.task_queries, (list, tuple)) or len(e.task_queries) > 64:
         raise ValueError("encoded item allocation bound")
     for entry in e.public_records:
@@ -435,6 +504,10 @@ def _validate_encoding(e):
         _sha(entry[0])
         _uint(entry[1])
         _vector(entry[2], 16)
+    if config.full_line:
+        _validate_full_line(e.full_line, len(e.public_records))
+        if e.query[6] != 0 or e.query[7] != 0 or any(record[2][6] != 0 for record in e.public_records):
+            raise ValueError("full-line captured encoding carries forbidden origin/revision/deadline semantic features")
     for entry in e.divergences:
         if not isinstance(entry, (list, tuple)) or len(entry) != 2:
             raise ValueError("encoded divergence descriptor")
@@ -489,13 +562,20 @@ def encoded_from_sidecar(sidecar, record, *, expected_encoder_source_sha256, exp
     context descriptors; those conditional targets require explicit descriptors
     before they can be admitted by the collator.
     """
+    version = sidecar.get("version") if isinstance(sidecar, dict) else None
     names = ("version", "input_sha256", "encoding_sha256", "encoder_source_sha256", "model_epoch_kind",
-             "canonical_tensor_sha256", "tensor_json", "tensor_sha256", "record_sources", "sha256")
+             "canonical_tensor_sha256", "tensor_json", "tensor_sha256", "record_sources")
+    if version == "rz-pals-native-input-sidecar/2":
+        names += ("model_profile", "encoding_profile")
+    names += ("sha256",)
     value = _fields(sidecar, names, "native tensor sidecar")
     s = record["input"]["snapshot"]
     _sha(expected_encoder_source_sha256)
-    if value["version"] != "rz-pals-native-input-sidecar/1" or value["input_sha256"] != record["input"]["sha256"] or value["encoding_sha256"] != s["encoding_sha256"] or value["encoder_source_sha256"] != expected_encoder_source_sha256:
+    if value["version"] not in ("rz-pals-native-input-sidecar/1", "rz-pals-native-input-sidecar/2") or value["input_sha256"] != record["input"]["sha256"] or value["encoding_sha256"] != s["encoding_sha256"] or value["encoder_source_sha256"] != expected_encoder_source_sha256:
         raise ValueError("native sidecar input/encoder identity mismatch")
+    config = ModelConfig.for_profile(value["model_profile"]) if version == "rz-pals-native-input-sidecar/2" else ModelConfig.baseline()
+    if version == "rz-pals-native-input-sidecar/2" and (config.profile == "legacy_summary_v1" or value["encoding_profile"] != config.encoding):
+        raise ValueError("native /2 sidecar requires exact registered V2 model/encoding profile")
     for name in ("canonical_tensor_sha256", "tensor_sha256", "sha256"):
         _sha(value[name])
     if not isinstance(value["tensor_json"], str) or len(value["tensor_json"].encode()) > 2 * 1024 * 1024 or hashlib.sha256(value["tensor_json"].encode()).hexdigest() != value["tensor_sha256"]:
@@ -506,6 +586,8 @@ def encoded_from_sidecar(sidecar, record, *, expected_encoder_source_sha256, exp
     if outer_sha != value["sha256"] or sources != s["public_records"]:
         raise ValueError("native sidecar seal or captured record order mismatch")
     tensor_names = ("role", "board", "metadata", "records", "required_critical_records", "candidates", "divergence_features", "query", "situation_revision", "history_digest", "model_epoch")
+    if config.full_line:
+        tensor_names += ("full_line",)
     tensor = _fields(_unique_json(value["tensor_json"]), tensor_names, "native input")
     if tensor["role"] != ROLE_NAMES[s["role"]] or _uint(tensor["situation_revision"]) != s["input_revision"] or tuple(tensor["board"]) != _fen_board(s["board_fen"]):
         raise ValueError("native input role/revision/board mismatch")
@@ -551,7 +633,8 @@ def encoded_from_sidecar(sidecar, record, *, expected_encoder_source_sha256, exp
         raise ValueError("native input missing required critical records")
     if tensor["divergence_features"]:
         raise ValueError("native divergence features require explicit challenged-line/ply descriptors")
-    result = EncodedSnapshot(value["input_sha256"], value["encoding_sha256"], tuple(tensor["board"]), tuple(tensor["metadata"]), tuple(public), tuple(tensor["query"]))
+    result = EncodedSnapshot(value["input_sha256"], value["encoding_sha256"], tuple(tensor["board"]), tuple(tensor["metadata"]), tuple(public), tuple(tensor["query"]),
+                             model_profile=config.profile, full_line=copy.deepcopy(tensor.get("full_line")))
     _validate_encoding(result)
     return result
 
@@ -948,7 +1031,7 @@ def load_frozen_collected_dataset(directory, *, expected_receipt_sha256, produce
     actual_sidecars = exact_rows("native-inputs.jsonl", "input_sha256")
     actual_lineage = exact_rows("input-lineage.jsonl", "input_sha256")
     native_events = None
-    encodings, admitted_inputs = {}, []
+    encodings, admitted_inputs, full_line_parents = {}, [], {}
     for identity, binding in bindings.items():
         row = frozen[identity]
         pin = pins[(binding["game_id"], binding["producer_id"])]
@@ -1011,10 +1094,35 @@ def load_frozen_collected_dataset(directory, *, expected_receipt_sha256, produce
         if sidecar.get("model_epoch_kind") != policy["native_model_epoch"]["kind"]:
             raise ValueError("sidecar epoch kind differs from input's actual producer")
         encoding = encoded_from_sidecar(sidecar, row, expected_encoder_source_sha256=policy["encoder_source_sha256"], expected_model_epoch=expected_epoch)
+        checked_source = sources[(binding["game_id"], binding["producer_id"])]
+        if pin["source"]["kind"] == "own_pals":
+            registered_profile = checked_source["configuration"].get("profile", "legacy_summary_v1")
+            if registered_profile != encoding.model_profile:
+                raise ValueError("actual sidecar model profile differs from independent loaded producer")
+            if encoding.model_profile != "legacy_summary_v1":
+                checked_config = ModelConfig(**checked_source["configuration"])
+                checked_config.validate()
         encodings[identity] = encoding
+        if encoding.full_line is not None:
+            full_line_parents[identity] = {"sidecar": sidecar, "source": checked_source, "request": request}
         admitted_inputs.append({"binding": binding, "producer": pin, "prepared_evidence_sha256": binding["capture_evidence_sha256"]})
     if set(encodings) != set(frozen):
         raise ValueError("strict frozen collection lacks per-input producer encoding")
+    full_line_observation, coverage_observation = None, None
+    from . import target_coverage as coverage_consumer
+    if full_line_parents and coverage_consumer.FULL_LINE_ARTIFACT not in artifacts:
+        raise ValueError("strict V2 collection lacks exact full-line context artifact")
+    if coverage_consumer.FULL_LINE_ARTIFACT in artifacts:
+        name = coverage_consumer.FULL_LINE_ARTIFACT
+        raw_files[name] = read(directory / name, artifacts[name])
+        full_line_observation = coverage_consumer.inspect_full_line_contexts(
+            raw_files[name], encoded=encodings, exact_parents=full_line_parents)
+    if coverage_consumer.COVERAGE_ARTIFACT in artifacts:
+        name = coverage_consumer.COVERAGE_ARTIFACT
+        raw_files[name] = read(directory / name, artifacts[name])
+        coverage_observation = coverage_consumer.inspect_collector_target_coverage(raw_files[name], dataset=result)
+    elif full_line_parents:
+        raise ValueError("strict V2 collection lacks actual target coverage artifact")
     continuation = None
     if "native-continuation-traces.jsonl" in artifacts:
         from . import native_continuation as continuation_consumer
@@ -1038,6 +1146,8 @@ def load_frozen_collected_dataset(directory, *, expected_receipt_sha256, produce
     result._attach_encodings(encodings)
     result.collection_receipt = copy.deepcopy(receipt)
     result.native_continuation_observation = copy.deepcopy(continuation)
+    result.full_line_context_observation = copy.deepcopy(full_line_observation)
+    result.target_coverage_observation = copy.deepcopy(coverage_observation)
     result._attach_frozen_admission({"version": FROZEN_ADMISSION_DOMAIN, "receipt": _byte_pin(receipt_bytes),
                                      "artifacts": {name: _byte_pin(raw) for name, raw in raw_files.items()},
                                      "producer_registrations": registration_assets, "inputs": admitted_inputs,
@@ -1045,6 +1155,8 @@ def load_frozen_collected_dataset(directory, *, expected_receipt_sha256, produce
                                      "raw_dataset_sha256": envelope["envelope"]["raw_dataset_sha256"],
                                      "split_sha256": envelope["envelope"]["split_sha256"],
                                      "current_view_sha256": result.current_view.sha256,
+                                     **({"full_line_context_observation": full_line_observation} if full_line_observation is not None else {}),
+                                     **({"target_coverage_observation": coverage_observation} if coverage_observation is not None else {}),
                                      **({"native_continuation_observation": continuation} if continuation is not None else {})})
     return result
 
@@ -1062,6 +1174,7 @@ class TrainingBatch:
     divergence_mask: torch.Tensor
     task: torch.Tensor
     task_mask: torch.Tensor
+    model_profile: str = "legacy_summary_v1"
 
 
 class ValidatedDataset:
@@ -1147,12 +1260,15 @@ class ValidatedDataset:
         if (getattr(self, "native_continuation_observation", None)
                 != self.frozen_admission.get("native_continuation_observation")):
             raise ValueError("checked continuation observation changed")
+        if (getattr(self, "full_line_context_observation", None) != self.frozen_admission.get("full_line_context_observation")
+                or getattr(self, "target_coverage_observation", None) != self.frozen_admission.get("target_coverage_observation")):
+            raise ValueError("checked V2 full-line/coverage observation changed")
         if (_sorted_canonical("rz-pals-checked-native-encodings/1", self._encoding_identities)
                 != self.frozen_admission["encoding_identities_sha256"]):
             raise ValueError("checked frozen encoding admission changed")
         if set(self.encodings) != set(self._encoding_identities) or any(
                 not isinstance(value, EncodedSnapshot)
-                or _canonical("rz-pals-python-immutable-encoding/1", asdict(value)) != self._encoding_identities.get(key)
+                or _encoding_identity(value) != self._encoding_identities.get(key)
                 for key, value in self.encodings.items()):
             raise ValueError("checked frozen per-input encoding changed")
 
@@ -1167,7 +1283,7 @@ class ValidatedDataset:
             _validate_encoding(value)
             if key != value.input_sha256:
                 raise ValueError("encoded snapshot key mismatch")
-            self._encoding_identities[key] = _canonical("rz-pals-python-immutable-encoding/1", asdict(value))
+            self._encoding_identities[key] = _encoding_identity(value)
 
     def indices(self, role, split="train"):
         if role not in ROLE_NAMES or split not in ("train", "validation", "holdout"):
@@ -1204,7 +1320,7 @@ class ValidatedDataset:
             if not isinstance(e, EncodedSnapshot) or e.input_sha256 != row["input"]["sha256"] or e.encoding_sha256 != s["encoding_sha256"]:
                 raise ValueError("missing or mismatched collector encoded snapshot")
             _validate_encoding(e)
-            if _canonical("rz-pals-python-immutable-encoding/1", asdict(e)) != self._encoding_identities.get(e.input_sha256):
+            if _encoding_identity(e) != self._encoding_identities.get(e.input_sha256):
                 raise ValueError("encoded input changed after admission")
             expected_records = [(v["observation_sha256"], v["situation_revision"]) for v in s["public_records"]]
             if [(v[0], v[1]) for v in e.public_records] != expected_records:
@@ -1217,6 +1333,9 @@ class ValidatedDataset:
                 raise ValueError("V controls leaked into P/C encoded input")
             rows.append(row)
             encoded.append(e)
+        if len({e.model_profile for e in encoded}) != 1:
+            raise ValueError("training batch cannot mix legacy and V2 model/encoding profiles")
+        config = ModelConfig.for_profile(encoded[0].model_profile)
         b = len(rows)
         r = max(1, max(len(e.public_records) for e in encoded))
         c = max(1, max(len(v["input"]["snapshot"]["legal_moves"]) for v in rows))
@@ -1290,9 +1409,30 @@ class ValidatedDataset:
                         task[i, j], task_mask[i, j] = weight, True
         inputs = TensorInput(board, metadata, records, record_mask, candidates, candidate_mask,
                              divergence_features, divergence_candidates, query)
-        inputs.validate()
+        if config.full_line:
+            record_lines = torch.zeros((b, r, MAX_LINE_PLIES, 3), dtype=torch.int64, device=device)
+            record_line_mask = torch.zeros((b, r, MAX_LINE_PLIES), dtype=torch.bool, device=device)
+            query_lines = torch.zeros((b, 3, MAX_LINE_PLIES, 3), dtype=torch.int64, device=device)
+            query_line_mask = torch.zeros((b, 3, MAX_LINE_PLIES), dtype=torch.bool, device=device)
+            relations = torch.full((b, r, 2), -1, dtype=torch.int64, device=device)
+            for i, e in enumerate(encoded):
+                for j, record in enumerate(e.full_line["records"]):
+                    for ply, token in enumerate(record["moves"]):
+                        record_lines[i, j, ply] = torch.tensor([token["from"], token["to"], token["promotion"]], device=device)
+                        record_line_mask[i, j, ply] = True
+                    for relation, name in enumerate(("parent", "supersedes")):
+                        if record[name] is not None:
+                            relations[i, j, relation] = record[name]
+                for j, name in enumerate(("query_prefix", "query_proposal", "query_counter")):
+                    for ply, token in enumerate(e.full_line[name]):
+                        query_lines[i, j, ply] = torch.tensor([token["from"], token["to"], token["promotion"]], device=device)
+                        query_line_mask[i, j, ply] = True
+            inputs = TensorInput(**{**inputs.__dict__, "record_line_tokens": record_lines,
+                                    "record_line_mask": record_line_mask, "query_line_tokens": query_lines,
+                                    "query_line_mask": query_line_mask, "record_relations": relations})
+        inputs.validate(config)
         return TrainingBatch(ROLE_NAMES[role], inputs, tuple(v["input"]["sha256"] for v in rows), policy,
-                             policy_mask, wdl, wdl_mask, divergence, divergence_mask, task, task_mask)
+                             policy_mask, wdl, wdl_mask, divergence, divergence_mask, task, task_mask, config.profile)
 
 
 def _masked_distribution_loss(logits, target, active, rows):
@@ -1324,7 +1464,7 @@ def masked_losses(outputs, batch, weights=None):
         raise ValueError("invalid registered loss weights")
     if batch.role not in ("proposer", "critic", "validator") or len(outputs) != (3 if batch.role == "proposer" else 4):
         raise ValueError("hard-routed output role mismatch")
-    batch.inputs.validate()
+    batch.inputs.validate(ModelConfig.for_profile(batch.model_profile))
     b, c, d = batch.inputs.board.shape[0], batch.inputs.candidates.shape[1], batch.inputs.divergence_features.shape[1]
     required_targets = ((batch.policy, (b, c), torch.float32), (batch.policy_mask, (b,), torch.bool),
                         (batch.wdl, (b, 3), torch.float32), (batch.wdl_mask, (b,), torch.bool),
@@ -1335,7 +1475,7 @@ def masked_losses(outputs, batch, weights=None):
     expected_shapes = ((b, c), (b, 3), (b, 16, 384))
     if any(not isinstance(value, torch.Tensor) or value.dtype != torch.float32 or not torch.all(torch.isfinite(value)) for value in outputs) or any(value.shape != shape for value, shape in zip(outputs[:3], expected_shapes)):
         raise ValueError("role output must be finite even on masked rows")
-    all_values = (*outputs, *batch.inputs.__dict__.values(), batch.policy, batch.policy_mask, batch.wdl, batch.wdl_mask,
+    all_values = (*outputs, *(value for value in batch.inputs.__dict__.values() if value is not None), batch.policy, batch.policy_mask, batch.wdl, batch.wdl_mask,
                   batch.divergence, batch.divergence_mask, batch.task, batch.task_mask)
     if len({v.device for v in all_values}) != 1:
         raise ValueError("loss tensors must share one explicit device")
@@ -1432,6 +1572,24 @@ def prepare_adamw(model, recipe, role):
     model.config.validate()
     if role not in recipe["role_order"] or ROLE_NAMES[role] not in model.experts:
         raise ValueError("role absent from preparation phase/model")
+    return _owned_adamw(model, role, recipe["phase"], recipe)
+
+
+def prepare_nonzero_adamw(model, role):
+    """The locked follow-up optimizer; creating it does not perform an update.
+
+    Every selected tensor has weight decay 0.01 in this explicit smoke domain.
+    The preparation recipe's historical matrix/vector decay split is unchanged.
+    """
+    return _owned_adamw(model, role, "bounded_nonzero_smoke", {
+        "learning_rate": 1e-4, "betas": [0.9, 0.999], "epsilon": 1e-8,
+        "weight_decay": 0.01}, decay_vectors=True)
+
+
+def _owned_adamw(model, role, phase, settings, *, decay_vectors=False):
+    model.config.validate()
+    if role not in ROLE_NAMES or ROLE_NAMES[role] not in model.experts:
+        raise ValueError("role absent from optimizer model")
     prefixes = ("public_encoder.", "reader_blocks.", "move_embedding.")
     mapped = {}
     for name, parameter in model.named_parameters(remove_duplicate=False):
@@ -1463,12 +1621,12 @@ def prepare_adamw(model, recipe, role):
         raise ValueError("V may update private V tensors only")
     decay = [p for name, p in selected if p.ndim >= 2]
     no_decay = [p for name, p in selected if p.ndim < 2]
-    groups = [{"params": values, "weight_decay": recipe["weight_decay"] if label == "matrix" else 0.0, "group_name": label}
+    groups = [{"params": values, "weight_decay": settings["weight_decay"] if label == "matrix" or decay_vectors else 0.0, "group_name": label}
               for label, values in (("matrix", decay), ("vector", no_decay)) if values]
-    optimizer = torch.optim.AdamW(groups, lr=recipe["learning_rate"], betas=tuple(recipe["betas"]), eps=recipe["epsilon"], foreach=False)
+    optimizer = torch.optim.AdamW(groups, lr=settings["learning_rate"], betas=tuple(settings["betas"]), eps=settings["epsilon"], foreach=False)
     if len({id(p) for g in optimizer.param_groups for p in g["params"]}) != len(selected):
         raise ValueError("optimizer parameter membership duplication")
-    return OptimizerPreparation(optimizer, recipe["phase"], role, tuple(name for name, _ in selected), observed)
+    return OptimizerPreparation(optimizer, phase, role, tuple(name for name, _ in selected), observed)
 
 
 class BudgetLedger:

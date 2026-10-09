@@ -15,6 +15,32 @@ from .onnx_shared import build_shared_pc_graph
 WARM_ARTIFACT_SCHEMA = "rovezero.pals-private-warm.v1"
 WARM_LAYOUT = "shared_pc_if_approx_warm_v1"
 WARM_LAYOUT_REVISION = 1
+WARM_ARTIFACT_SCHEMA_V2 = "rovezero.pals-private-warm.v2"
+WARM_LAYOUT_V2 = "shared_pc_if_approx_warm_v2"
+WARM_GRAPH_SEMANTICS_V2 = (
+    "rz-pals-private-native-warm/2;accepted-final-latent;no-query-double-add;"
+    "fixed-2-iterations;private-self-kv-recomputed;fp32;pc-only;registered-model-profile"
+)
+PRIVATE_SEED_POLICY_V2 = (
+    "rz-pals-private-approx-warm/2;fp32-bits;same-exact-rules-context;"
+    "role-isolated;accepted-seed-only;no-exact-cache;full-line-profile-fenced"
+)
+PRIVATE_CUDA_WARM_SCHEMA = "rovezero.pals-private-cuda-warm.v2"
+CUDA_WARM_LAYOUT = "shared_pc_if_approx_cuda_warm_v2"
+CUDA_WARM_GRAPH_SEMANTICS = (
+    "rz-pals-private-native-cuda-warm/2;accepted-final-latent;no-query-double-add;"
+    "fixed-2-iterations;private-self-kv-recomputed;fp32;pc-only;device-public-kv;io-binding-required"
+)
+CUDA_PRIVATE_SEED_POLICY = (
+    "rz-pals-private-approx-cuda-warm/2;fp32-bits;same-exact-rules-context;"
+    "role-isolated;accepted-seed-only;no-exact-cache;device-public-kv;physical-output-fence"
+)
+CUDA_QUERY_SEMANTICS = (
+    "rz-pals-private-cuda-query/2;same-actual-nonrecord-fp32-and-full-lines;"
+    "logical-game-search-situation-prefix-focus-role-isolated;records-revision-current;"
+    "original-deadline-cancel-fixed;value-fresh"
+)
+CUDA_EXECUTION_DOMAIN = "cuda_device_io_binding_v2"
 WARM_GRAPH_SEMANTICS = (
     "rz-pals-private-native-warm/1;accepted-final-latent;no-query-double-add;"
     "fixed-2-iterations;private-self-kv-recomputed;fp32;pc-only"
@@ -50,7 +76,7 @@ def _initial_route(document):
     return routes[0]
 
 
-def build_warm_pc_graph(model):
+def build_warm_pc_graph(model, layout=None, layout_revision=None):
     """Return a new opt-in graph; never mutate legacy graph/model/checkpoint."""
     from onnx import TensorProto, checker, helper
     legacy, legacy_evidence = build_shared_pc_graph(model)
@@ -76,12 +102,16 @@ def build_warm_pc_graph(model):
         helper.make_tensor_value_info("initial_latent", TensorProto.FLOAT, shape),
         helper.make_tensor_value_info("warm_start", TensorProto.BOOL, []),
     ])
-    document.graph.name = WARM_LAYOUT
+    if layout is None:
+        layout = WARM_LAYOUT if model.config.profile == "legacy_summary_v1" else WARM_LAYOUT_V2
+    if layout_revision is None:
+        layout_revision = 1 if model.config.profile == "legacy_summary_v1" else 2
+    document.graph.name = layout
     checker.check_model(document, full_check=True)
-    return document, audit_warm_pc_graph(document, legacy, legacy_evidence)
+    return document, audit_warm_pc_graph(document, legacy, legacy_evidence, layout, layout_revision)
 
 
-def audit_warm_pc_graph(document, legacy, legacy_evidence):
+def audit_warm_pc_graph(document, legacy, legacy_evidence, layout=None, layout_revision=None):
     """Strict template equivalence plus recursive role/seed routing audit.
 
     Comparing complete initializer and node protobufs prevents approximate
@@ -93,7 +123,13 @@ def audit_warm_pc_graph(document, legacy, legacy_evidence):
     index, initial = _initial_route(legacy)
     if legacy_evidence.get("if_routes") != 6 or legacy_evidence.get("branch_local_initializers") != 0:
         raise ValueError("warm template lacks the checked legacy route evidence")
-    if document.graph.name != WARM_LAYOUT or len(document.graph.node) != len(legacy.graph.node):
+    if layout is None:
+        layout = WARM_LAYOUT if document.graph.name == WARM_LAYOUT else WARM_LAYOUT_V2
+    if layout_revision is None:
+        layout_revision = 1 if layout == WARM_LAYOUT else 2
+    if layout not in (WARM_LAYOUT, WARM_LAYOUT_V2, "shared_pc_if_approx_cuda_warm_v2") or layout_revision != (1 if layout == WARM_LAYOUT else 2):
+        raise ValueError("unregistered warm layout/revision")
+    if document.graph.name != layout or len(document.graph.node) != len(legacy.graph.node):
         raise ValueError("warm graph layout/node count mismatch")
     for field in ("functions", "opset_import", "training_info"):
         if [value.SerializeToString() for value in getattr(document, field)] != [value.SerializeToString() for value in getattr(legacy, field)]:
@@ -152,12 +188,12 @@ def audit_warm_pc_graph(document, legacy, legacy_evidence):
             raise ValueError("warm branch-local initializer copies are forbidden")
     return {
         "scope": "onnx_serialized_initializers_only",
-        "layout_revision": WARM_LAYOUT_REVISION,
+        "layout_revision": layout_revision,
         "legacy_graph_sha256": hashlib.sha256(legacy.SerializeToString()).hexdigest(),
         "legacy_ownership": copy.deepcopy(legacy_evidence),
         "recursive_role_if_routes": 6, "warm_mode_if_routes": 1,
         "branch_local_initializers": 0, "seed_values_per_batch_row": 6144,
-        "fresh_initialization": "unchanged_legacy_role_if",
+        "fresh_initialization": "unchanged_legacy_role_if" if layout_revision == 1 else "registered_profile_role_if",
         "warm_initialization": "complete_final_latent_identity_no_query_addition",
         "private_self_kv": "recomputed_by_unchanged_readers",
         "accepted_seed_and_rules_context": "requires_native_owner_validation",

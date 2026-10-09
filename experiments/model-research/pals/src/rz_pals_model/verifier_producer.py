@@ -812,7 +812,10 @@ def future_label(snapshot, context, task, request, response, evidence_sha256):
 
 
 def _encoded_json(encoding, parent_sha256, context, derivation):
-    value = asdict(encoding)
+    from .training import _encoding_value
+    if encoding.model_profile != "legacy_summary_v1" or encoding.full_line is not None:
+        raise ValueError("legacy private V bank requires an explicit V2 encoding adapter")
+    value = _encoding_value(encoding)
     value["task_queries"] = [{"context": asdict(context), "query": list(encoding.query)}]
     payload = {"schema": QUERY_SCHEMA, "parent_input_sha256": parent_sha256,
                "encoding": value, "derivation": derivation, "query_feature_names": list(QUERY_FIELDS),
