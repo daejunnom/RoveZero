@@ -39,9 +39,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+mod full_line;
 #[cfg(feature = "pals-collection-onnx")]
 mod native;
 mod producer;
+pub use full_line::{
+    PalsCheckerValueNamespaceV2, PalsFullLineContextV2, PalsObservedCountV2,
+    PalsTargetCoverageReceiptV2,
+};
 #[cfg(feature = "pals-collection-onnx")]
 pub use native::{
     OwnPalsOnnxCollectionDriver, PalsCollectionGraphPin, PalsNativeCollectionRegistry,
@@ -234,7 +239,49 @@ pub struct PalsNativeInputSidecar {
     pub tensor_sha256: String,
     /// Exactly the selected tensor-record order, with immutable raw sources.
     pub record_sources: Vec<PalsPublicRecord>,
+    /// Present only in sidecar/2; historical sidecar/1 bytes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding_profile: Option<String>,
     pub sha256: String,
+}
+impl PalsNativeInputSidecar {
+    fn digest(&self) -> Result<String, ArenaError> {
+        match (
+            &self.model_profile,
+            &self.encoding_profile,
+            self.version.as_str(),
+        ) {
+            (None, None, "rz-pals-native-input-sidecar/1") => canonical_sha256(&(
+                &self.version,
+                &self.input_sha256,
+                &self.encoding_sha256,
+                &self.encoder_source_sha256,
+                &self.model_epoch_kind,
+                &self.canonical_tensor_sha256,
+                &self.tensor_json,
+                &self.tensor_sha256,
+                &self.record_sources,
+            )),
+            (Some(profile), Some(encoding), "rz-pals-native-input-sidecar/2") => {
+                canonical_sha256(&(
+                    &self.version,
+                    &self.input_sha256,
+                    &self.encoding_sha256,
+                    &self.encoder_source_sha256,
+                    &self.model_epoch_kind,
+                    &self.canonical_tensor_sha256,
+                    &self.tensor_json,
+                    &self.tensor_sha256,
+                    &self.record_sources,
+                    profile,
+                    encoding,
+                ))
+            }
+            _ => Err(invalid("sidecar version/profile fields differ")),
+        }
+    }
 }
 
 /// Model-backed PALS drivers may supply the same sealed-input boundary. Their
@@ -332,6 +379,17 @@ fn native_encoding_sha() -> Result<String, ArenaError> {
     hash.update(PALS_ENCODING_SCHEMA);
     hash.update(pals_rules_encoding_semantic_digest());
     Ok(format!("{:x}", hash.finalize()))
+}
+#[cfg(feature = "pals-collection")]
+fn source_encoding_sha(source: &PalsCollectionSourceDescription) -> Result<String, ArenaError> {
+    let config = full_line::model_config(source)?;
+    Ok(hex(
+        rz_uci::pals_native::pals_fresh_encoding_semantic_digest_for_config(&config),
+    ))
+}
+#[cfg(not(feature = "pals-collection"))]
+fn source_encoding_sha(_: &PalsCollectionSourceDescription) -> Result<String, ArenaError> {
+    native_encoding_sha()
 }
 #[cfg(not(feature = "pals-collection"))]
 fn native_encoding_sha() -> Result<String, ArenaError> {
@@ -528,6 +586,49 @@ pub fn pals_collection_registration_description() -> Result<serde_json::Value, A
         "encoder_source_sha256":source.encoder_source_sha256,"cpu_configuration_sha256":source.cpu_profile_sha256,
         "cpu_task_source":source,"native_model_loaded":false,"actual_training_executed":false}),
     )
+}
+/// Explicit V4 registration facts. It preserves the V1 description and performs
+/// no model load, graph forward, enrollment or label generation.
+#[cfg(feature = "pals-collection")]
+pub fn pals_collection_registration_description_v4(
+    profile: rz_eval::pals_model::PalsModelProfile,
+) -> Result<serde_json::Value, ArenaError> {
+    let mut facts = pals_collection_registration_description()?;
+    let model = PalsModelConfig::for_profile(profile);
+    model.validate().map_err(|e| invalid(e.to_string()))?;
+    facts["version"] = serde_json::json!("rz-pals-collection-registration-description/2");
+    facts["model_configuration"] =
+        serde_json::to_value(&model).map_err(|e| invalid(e.to_string()))?;
+    facts["model_configuration_sha256"] = serde_json::json!(canonical_sha256(&model)?);
+    facts["encoding_sha256"] = serde_json::json!(hex(
+        rz_uci::pals_native::pals_fresh_encoding_semantic_digest_for_config(&model)
+    ));
+    facts["model_profile"] = serde_json::json!(profile.as_str());
+    facts["model_semantics"] = serde_json::json!(profile.model_semantics());
+    facts["model_semantics_sha256"] = serde_json::json!(hex(profile.registered_semantics_sha256()));
+    facts["model_implementation_sha256"] =
+        serde_json::json!(hex(rz_eval::pals_model::compiled_model_boundary_sha256()));
+    facts["search_implementation_sha256"] = serde_json::json!(hex(
+        rz_search::pals::engine::compiled_search_implementation_sha256()
+    ));
+    facts["resolver_implementation_sha256"] = serde_json::json!(hex(
+        rz_search::pals::engine::compiled_resolver_implementation_sha256()
+    ));
+    facts["own_raw_resolver_semantics_sha256"] = serde_json::json!(hex(
+        rz_search::pals::engine::ResolverPolicy::OwnRawRestricted.semantics_sha256()
+    ));
+    facts["model_wdl_resolver_semantics_sha256"] = serde_json::json!(hex(
+        rz_search::pals::engine::ResolverPolicy::ModelWdlRestricted.semantics_sha256()
+    ));
+    facts["implementation_pin_contract"] = serde_json::json!({
+        "model_implementation_sha256": {"manifest_field":"base.model.implementation_sha256", "domain":rz_eval::pals_model::PALS_COMPILED_MODEL_BOUNDARY_DOMAIN,
+            "scope":"compiled Rust/Python model boundary sources; weights, adapter, provider and successful NN execution are separate"},
+        "encoder_source_sha256": {"manifest_field":"native recipe.adapter_source_sha256", "scope":"compiled native adapter source; independent of model boundary SHA"},
+        "model_semantics_sha256": {"manifest_field":"model_v2.model_semantics_sha256", "domain":rz_eval::pals_model::PALS_REGISTERED_SEMANTICS_DOMAIN,
+            "scope":"registered profile/configuration/math; source provenance and binary pin are separate"}
+    });
+    facts["encoding_profile"] = serde_json::json!(profile.encoding_schema());
+    Ok(facts)
 }
 
 /// Reject unsafe output placement/name before expensive native initialization.
@@ -1029,6 +1130,7 @@ impl Output {
                 row.artifact,
                 "inputs.jsonl"
                     | "native-inputs.jsonl"
+                    | "native-full-line-contexts.v2.jsonl"
                     | "input-lineage.jsonl"
                     | "native-events.jsonl"
                     | "native-raw-outputs.jsonl"
@@ -1469,6 +1571,8 @@ impl Collection {
             tensor_json,
             tensor_sha256,
             record_sources: selected,
+            model_profile: None,
+            encoding_profile: None,
             sha256: String::new(),
         };
         sidecar.sha256 = canonical_sha256(&(
@@ -1537,6 +1641,8 @@ impl Collection {
             completed_depth,
             score_scope: scope,
             cpu_observation: None,
+            parent_revision: None,
+            supersedes_revision: None,
             perspective: position.side_to_move(),
             critical: false,
         };
@@ -1784,7 +1890,7 @@ fn checked_source(description: &PalsCollectionSourceDescription) -> Result<(), A
             .cpu_profile_sha256
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        || description.encoding_sha256 != native_encoding_sha()?
+        || description.encoding_sha256 != source_encoding_sha(description)?
         || description.encoder_source_sha256 != native_source_sha()?
     {
         return Err(invalid("collector source/actual encoder mismatch"));
@@ -2475,6 +2581,20 @@ pub fn collect_pals_own_data_with_producer(
     } else {
         None
     };
+    if let Ok(model) = full_line::model_config(&description)
+        && !model.profile.is_legacy()
+    {
+        match full_line::coverage(&state.rows, model.profile)
+            .and_then(|coverage| output.final_json("target-coverage.v2.jsonl", &coverage))
+        {
+            Ok(()) => {}
+            Err(error) => {
+                failure = Some(failure_text(format!(
+                    "target coverage preservation failed: {error}; prior={failure:?}"
+                )))
+            }
+        }
+    }
     let artifacts = match output.artifacts() {
         Ok(value) => value,
         Err(error) => {

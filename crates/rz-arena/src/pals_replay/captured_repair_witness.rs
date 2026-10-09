@@ -874,6 +874,7 @@ mod tests {
             situation_revision: 9,
             history_digest: [3; 32],
             model_epoch: [4; 32],
+            full_line: None,
         }
     }
     fn trace() -> Value {

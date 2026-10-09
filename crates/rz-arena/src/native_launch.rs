@@ -48,6 +48,11 @@ pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 
         role: rz_experiments::NativeEngineRole,
     ) -> Result<NativeEngineView<'_>, rz_experiments::ManifestError>;
     fn provider_name(&self) -> &'static str;
+    /// V4 has independently typed model/resolver/recheck/stack selections.
+    /// Historical declarations retain their original 32-token codec limit.
+    fn argument_limit(&self) -> usize {
+        32
+    }
     /// Fixed receipt reservation selected before input copying or child spawn.
     /// Legacy declarations keep their original 64 KiB receipt and stream split.
     fn pair_metadata_cap(&self) -> u64 {
@@ -341,10 +346,16 @@ impl<S: NativeLaunchDeclaration> NativeLaunchOwner<S> {
 /// `argv_split` parser. This is a single `args=` outer argv element, not shell
 /// quoting. Quotes and backslashes are rejected rather than ambiguously escaped.
 pub fn encode_fastchess_native_args(tokens: &[OsString]) -> Result<OsString, ArenaError> {
-    if tokens.is_empty() || tokens.len() > 32 {
-        return Err(ArenaError::Invalid(
-            "native engine arguments require 1..32 tokens".into(),
-        ));
+    encode_fastchess_native_args_with_limit(tokens, 32)
+}
+pub fn encode_fastchess_native_args_with_limit(
+    tokens: &[OsString],
+    limit: usize,
+) -> Result<OsString, ArenaError> {
+    if !matches!(limit, 32 | 48) || tokens.is_empty() || tokens.len() > limit {
+        return Err(ArenaError::Invalid(format!(
+            "native engine arguments require 1..{limit} tokens and a registered 32/48-token limit"
+        )));
     }
     let mut encoded = String::from("args=");
     for (index, token) in tokens.iter().enumerate() {
@@ -1469,7 +1480,10 @@ pub(crate) mod linux {
                     format!("name={}", engine.engine_id).into(),
                 ]);
                 if !launch.arguments.is_empty() {
-                    args.push(encode_fastchess_native_args(&launch.arguments)?);
+                    args.push(encode_fastchess_native_args_with_limit(
+                        &launch.arguments,
+                        spec.argument_limit(),
+                    )?);
                 }
                 for (name, value) in &external.requested_options {
                     let value = crate::external_uci::resolve_asset_tokens(value, external, pins)?;
@@ -1541,7 +1555,7 @@ pub(crate) mod linux {
                 key_path("cmd=", &launch.program.path)?,
                 key_path("dir=", cwd)?,
                 format!("name={}", engine.engine_id).into(),
-                encode_fastchess_native_args(&launch.arguments)?,
+                encode_fastchess_native_args_with_limit(&launch.arguments, spec.argument_limit())?,
             ]);
         }
         let opening = &pin(pins, input.opening_artifact)?.path;
@@ -1655,6 +1669,18 @@ pub(crate) mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn v4_argument_ceiling_is_explicit_and_preserves_legacy_32() {
+            let args = vec![OsString::from("--bounded-fixture=value"); 48];
+            assert!(encode_fastchess_native_args(&args[..32]).is_ok());
+            assert!(encode_fastchess_native_args(&args[..33]).is_err());
+            assert!(encode_fastchess_native_args_with_limit(&args, 48).is_ok());
+            assert!(encode_fastchess_native_args_with_limit(&args, 47).is_err());
+            let mut excessive = args;
+            excessive.push("--extra=value".into());
+            assert!(encode_fastchess_native_args_with_limit(&excessive, 48).is_err());
+        }
 
         #[derive(Clone, Debug)]
         struct RuntimeArgumentsFixture;

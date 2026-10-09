@@ -30,6 +30,7 @@ fn usage() {
         --checkpoint ABSOLUTE --runtime ABSOLUTE --source-registry ABSOLUTE\n\
         --source-registry-sha256 SHA256 [--runtime-cache ABSOLUTE]\n\
         [--beam-width N] [--line-plies N] [--max-role-calls N] [--pals-rounds N]\n\
+        [--pals-followup-lane v4 --pals-resolver-policy own-raw-restricted|model-wdl-restricted]\n\
         [--producer-registration ABSOLUTE --producer-registration-sha256 SHA256]\n\
         [--producer-journal-bytes N --producer-capture-bytes N]\n\
         [--post-repair-recheck same-repaired-line-once-v1|actual-opponent-continuation-v1\n\
@@ -124,6 +125,8 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let mut source_registry = None;
     let mut source_registry_sha256 = None;
     let mut post_repair_recheck = None;
+    let mut followup_lane = None;
+    let mut resolver_selection = None;
     let mut refinement_registration = None;
     let mut refinement_registration_sha256 = None;
     let mut producer_registration = None;
@@ -140,6 +143,20 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             println!(
                 "{}",
                 serde_json::to_string(&pals_collection_registration_description()?)?
+            );
+            return Ok(true);
+        }
+        if flag == "--describe-registration-v4" {
+            let profile = args
+                .next()
+                .ok_or("--describe-registration-v4 requires explicit model profile")?;
+            let profile: rz_eval::pals_model::PalsModelProfile =
+                serde_json::from_str(&serde_json::to_string(&profile)?)?;
+            println!(
+                "{}",
+                serde_json::to_string(
+                    &rz_arena::pals_collect::pals_collection_registration_description_v4(profile)?
+                )?
             );
             return Ok(true);
         }
@@ -163,6 +180,8 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             "--runtime" => runtime = Some(PathBuf::from(value)),
             "--runtime-cache" => runtime_cache = Some(PathBuf::from(value)),
             "--source-registry" => source_registry = Some(PathBuf::from(value)),
+            "--pals-followup-lane" => set_refinement_arg(&mut followup_lane, value, &flag)?,
+            "--pals-resolver-policy" => set_refinement_arg(&mut resolver_selection, value, &flag)?,
             "--source-registry-sha256" => source_registry_sha256 = Some(value),
             "--post-repair-recheck" => {
                 set_refinement_arg(&mut post_repair_recheck, value, &flag)?;
@@ -233,6 +252,16 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         producer_registration.is_some() && producer_registration_sha256.is_some(),
         describe_owner,
     )?;
+    if followup_lane.as_deref().is_some_and(|lane| lane != "v4")
+        || (followup_lane.is_some()
+            && (mode != "pals-onnx" || provider.as_deref() != Some("cpu") || recheck_selected))
+        || (resolver_selection.is_some() && followup_lane.is_none())
+        || resolver_selection.as_deref().is_some_and(|resolver| {
+            !matches!(resolver, "own-raw-restricted" | "model-wdl-restricted")
+        })
+    {
+        return Err("V4 collection requires explicit CPU pals-onnx and own-raw-restricted/model-wdl-restricted; legacy refinement registrations cannot be mixed".into());
+    }
     let producer_config = match (producer_registration, producer_registration_sha256) {
         (None, None) => {
             if producer_journal_bytes.is_some() || producer_capture_bytes.is_some() {
@@ -345,6 +374,26 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                 let export = export.as_deref().ok_or("--export is required")?;
                 let checkpoint = checkpoint.as_deref().ok_or("--checkpoint is required")?;
                 let driver = Box::new(match (refinement.as_ref(), continuation.as_ref()) {
+                    (None, None) if followup_lane.is_some() => {
+                        OwnPalsOnnxCollectionDriver::load_cpu_v4(
+                            export,
+                            checkpoint,
+                            &pin,
+                            &expected,
+                            CpuConfig::default(),
+                            pals,
+                            pals_rounds,
+                            match resolver_selection
+                                .as_deref()
+                                .unwrap_or("own-raw-restricted")
+                            {
+                                "model-wdl-restricted" => {
+                                    rz_search::pals::engine::ResolverPolicy::ModelWdlRestricted
+                                }
+                                _ => rz_search::pals::engine::ResolverPolicy::OwnRawRestricted,
+                            },
+                        )?
+                    }
                     (None, None) => OwnPalsOnnxCollectionDriver::load_cpu(
                         export,
                         checkpoint,

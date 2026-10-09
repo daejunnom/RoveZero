@@ -10,8 +10,8 @@ use rz_experiments::PalsSearchPolicyIdentityV3;
 use rz_search::pals::engine::{
     PALS_SEARCH_VERSION, POST_REPAIR_RECHECK_OBSERVER_VERSION, PalsCounters, PalsError, PalsResult,
     PostRepairRecheckPolicy, RecheckEndpoint, RecheckEndpointEvidence, RecheckFinished,
-    RecheckIdentity, RecheckPrepared, RoleAcceptance, RoleError, RoleLogicalContext,
-    RoleQueryPurpose,
+    RecheckIdentity, RecheckPrepared, ResolverPolicy, RoleAcceptance, RoleError,
+    RoleLogicalContext, RoleQueryPurpose,
 };
 use rz_search::pals::store::{EvidenceScope, Observation, RawScore, TaskStatus};
 use rz_uci::pals_native::{
@@ -323,6 +323,12 @@ fn observed_refinement_identity(
         }
         PostRepairRecheckPolicy::Disabled => {
             return Err(invalid("disabled search has no refinement policy identity"));
+        }
+        PostRepairRecheckPolicy::FrozenModelWdlV2
+        | PostRepairRecheckPolicy::IterativeFrozenModelWdlV2 => {
+            return Err(invalid(
+                "V4 frozen WDL policy cannot use a legacy refinement registration",
+            ));
         }
     };
     let conditions = actual_conditions
@@ -747,6 +753,33 @@ fn recheck_observation_json(observation: &Observation) -> serde_json::Value {
         } => {
             serde_json::json!({"kind":"Wdl","value_f32_bits":[win.to_bits(),draw.to_bits(),loss.to_bits()],"white_perspective":perspective==Color::White})
         }
+        RawScore::ContextWdl {
+            win,
+            draw,
+            loss,
+            perspective,
+            context_revision,
+        } => {
+            serde_json::json!({"kind":"ContextWdl","value_f32_bits":[win.to_bits(),draw.to_bits(),loss.to_bits()],"white_perspective":perspective==Color::White,"context_revision":context_revision})
+        }
+        RawScore::ConditionalWdl {
+            expectation,
+            perspective,
+            repaired,
+            counter,
+            context_revision,
+        } => {
+            serde_json::json!({"kind":"ConditionalWdl","expectation_f32_bits":expectation.to_bits(),"white_perspective":perspective==Color::White,"repaired":repaired.0,"counter":counter.0,"context_revision":context_revision})
+        }
+        RawScore::ConditionalRepairWdl {
+            expectation,
+            perspective,
+            before,
+            after,
+            context_revision,
+        } => {
+            serde_json::json!({"kind":"ConditionalRepairWdl","expectation_f32_bits":expectation.to_bits(),"white_perspective":perspective==Color::White,"before":before.0,"after":after.0,"context_revision":context_revision})
+        }
         RawScore::Terminal { winner } => {
             serde_json::json!({"kind":"Terminal","white_winner":winner.map(|c|c==Color::White)})
         }
@@ -779,6 +812,19 @@ fn recheck_endpoint_json(
     }
     let evidence = match &endpoint.evidence {
         RecheckEndpointEvidence::Unobserved => serde_json::json!({"kind":"Unobserved"}),
+        RecheckEndpointEvidence::ModelWdl {
+            observation_id,
+            observation,
+            output,
+            context_revision,
+        } => {
+            output.validate(actual, &output.identity)?;
+            serde_json::json!({"kind":"ModelWdl","observation_id":observation_id.0,"observation":recheck_observation_json(observation),
+                "context_revision":context_revision,"model_identity":{"semantics":output.identity.semantics,"model":output.identity.model,
+                    "encoding":output.identity.encoding,"precision":output.identity.precision,"model_epoch":hex(output.identity.model_epoch)},
+                "input_sha256":hex(output.input_sha256),"wdl":output.wdl,"white_perspective":output.perspective==Color::White,
+                "value_authority":"fresh-frozen-model-WDL;not-owned-raw;not-Rules-proof"})
+        }
         RecheckEndpointEvidence::InvalidProvenance { error } => {
             serde_json::json!({"kind":"InvalidProvenance","error":failure_text(error)})
         }
@@ -806,6 +852,12 @@ fn recheck_endpoint_json(
                     evidence,
                 } => {
                     serde_json::json!({"kind":"Paused","checkpoint":checkpoint,"evidence":evidence.map(|id|id.0)})
+                }
+                TaskStatus::RetiredPaused {
+                    checkpoint,
+                    evidence,
+                } => {
+                    serde_json::json!({"kind":"RetiredPaused","checkpoint":checkpoint,"evidence":evidence.map(|id|id.0)})
                 }
                 TaskStatus::Completed(id) => {
                     serde_json::json!({"kind":"Completed","observation_id":id.0})
@@ -1642,8 +1694,9 @@ impl Sink {
         if self.calls.contains_key(&id) || self.total_rows >= MAX_ROWS {
             return Err(role_error("duplicate native request or input row limit"));
         }
+        let model_configuration = full_line::model_config(&self.source).map_err(role_error)?;
         prepared
-            .validate(&PalsModelConfig::baseline())
+            .validate(&model_configuration)
             .map_err(role_error)?;
         if prepared.model_epoch != self.source.model_epoch {
             return Err(role_error(
@@ -1803,31 +1856,48 @@ impl Sink {
         }
         let tensor_json = serde_json::to_string(prepared).map_err(role_error)?;
         let mut sidecar = PalsNativeInputSidecar {
-            version: "rz-pals-native-input-sidecar/1".into(),
+            version: if model_configuration.profile.is_legacy() {
+                "rz-pals-native-input-sidecar/1"
+            } else {
+                "rz-pals-native-input-sidecar/2"
+            }
+            .into(),
             input_sha256: input.sha256().into(),
             encoding_sha256: self.source.encoding_sha256.clone(),
             encoder_source_sha256: self.source.encoder_source_sha256.clone(),
             model_epoch_kind: "frozen_model_epoch".into(),
             canonical_tensor_sha256: hex(prepared
-                .canonical_input_key(&PalsModelConfig::baseline())
+                .canonical_input_key(&model_configuration)
                 .map_err(role_error)?),
             tensor_sha256: format!("{:x}", Sha256::digest(tensor_json.as_bytes())),
             tensor_json,
             record_sources: selected,
+            model_profile: (!model_configuration.profile.is_legacy())
+                .then(|| model_configuration.profile.as_str().into()),
+            encoding_profile: (!model_configuration.profile.is_legacy())
+                .then(|| model_configuration.profile.encoding_schema().into()),
             sha256: String::new(),
         };
-        sidecar.sha256 = canonical_sha256(&(
-            sidecar.version.as_str(),
-            sidecar.input_sha256.as_str(),
-            sidecar.encoding_sha256.as_str(),
-            sidecar.encoder_source_sha256.as_str(),
-            sidecar.model_epoch_kind.as_str(),
-            sidecar.canonical_tensor_sha256.as_str(),
-            sidecar.tensor_json.as_str(),
-            sidecar.tensor_sha256.as_str(),
-            &sidecar.record_sources,
-        ))
-        .map_err(role_error)?;
+        sidecar.sha256 = sidecar.digest().map_err(role_error)?;
+        let full_line_row = full_line::prepare_context(
+            &input,
+            &sidecar,
+            prepared,
+            records,
+            &self.source,
+            id.epoch.0,
+            id.sequence,
+        )
+        .map_err(role_error)?
+        .map(|context| {
+            bounded_json(&context, MAX_JSON_RECORD_BYTES, false)
+                .map(|json| PalsNativeTraceRow {
+                    artifact: full_line::CONTEXT_ARTIFACT,
+                    json,
+                })
+                .map_err(role_error)
+        })
+        .transpose()?;
         let divergence = kind == NativeQueryKind::Divergence;
         let divergence_context = match context {
             NativePreparedContext::Divergence { query } => Some(divergence::prepare_context(
@@ -1904,6 +1974,7 @@ impl Sink {
         let exact_bytes = rows
             .iter()
             .chain(divergence_row.iter())
+            .chain(full_line_row.iter())
             .chain(raw_rows.iter().map(|(_, r)| r))
             .try_fold(0_u64, |n, r| {
                 n.checked_add(r.json.len() as u64 + 1)
@@ -1913,6 +1984,7 @@ impl Sink {
             .len()
             .checked_add(raw_rows.len())
             .and_then(|n| n.checked_add(usize::from(divergence_row.is_some())))
+            .and_then(|n| n.checked_add(usize::from(full_line_row.is_some())))
             .and_then(|n| n.checked_add(1)) // the prepaid prepared event
             .ok_or_else(|| role_error("native prepared row count overflow"))?;
         if self
@@ -1964,6 +2036,7 @@ impl Sink {
         }
         self.trace.rows.extend(rows);
         self.trace.rows.extend(divergence_row);
+        self.trace.rows.extend(full_line_row);
         if !divergence {
             self.trace.inputs.push((input.clone(), eligible));
         }
@@ -2291,6 +2364,7 @@ impl OwnPalsOnnxCollectionDriver {
             pals,
             max_rounds,
             Some(&registration.inner),
+            None,
         )
     }
     pub fn load_cpu(
@@ -2303,7 +2377,32 @@ impl OwnPalsOnnxCollectionDriver {
         max_rounds: u64,
     ) -> Result<Self, ArenaError> {
         Self::load_cpu_selected(
-            export, checkpoint, pin, registry, cpu, pals, max_rounds, None,
+            export, checkpoint, pin, registry, cpu, pals, max_rounds, None, None,
+        )
+    }
+    /// Explicit followup constructor. The independent registry selects the
+    /// actual model profile; old load_cpu keeps its historical constructor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_cpu_v4(
+        export: &Path,
+        checkpoint: &Path,
+        pin: &RuntimeLibraryPin,
+        registry: &PalsNativeCollectionRegistry,
+        cpu: CpuConfig,
+        pals: PalsConfig,
+        max_rounds: u64,
+        resolver: ResolverPolicy,
+    ) -> Result<Self, ArenaError> {
+        Self::load_cpu_selected(
+            export,
+            checkpoint,
+            pin,
+            registry,
+            cpu,
+            pals,
+            max_rounds,
+            None,
+            Some(resolver),
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -2326,6 +2425,7 @@ impl OwnPalsOnnxCollectionDriver {
             pals,
             max_rounds,
             Some(registration),
+            None,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -2338,6 +2438,7 @@ impl OwnPalsOnnxCollectionDriver {
         pals: PalsConfig,
         max_rounds: u64,
         registration: Option<&PalsNativeRefinementRegistration>,
+        followup_resolver: Option<ResolverPolicy>,
     ) -> Result<Self, ArenaError> {
         registry.validate()?;
         // Validate the independent policy/base/binary registration before CPU
@@ -2354,7 +2455,11 @@ impl OwnPalsOnnxCollectionDriver {
             || file_sha(checkpoint, 256 * 1024 * 1024)? != registry.checkpoint_sha256
             || actual_binary != registry.collector_binary_sha256
             || hex(pin.binary_digest()) != registry.runtime_sha256
-            || native_encoding_sha()? != registry.encoding_sha256
+            || hex(
+                rz_uci::pals_native::pals_fresh_encoding_semantic_digest_for_config(
+                    &registry.model_configuration,
+                ),
+            ) != registry.encoding_sha256
             || native_source_sha()? != registry.encoder_source_sha256
         {
             return Err(invalid(
@@ -2460,22 +2565,124 @@ impl OwnPalsOnnxCollectionDriver {
         model
             .set_observer(Box::new(Observer(Arc::clone(&sink))))
             .map_err(|e| invalid(e.to_string()))?;
-        let engine = match registration {
-            None => PalsEngine::new(pals, model, cpu),
-            Some(registration) => PalsEngine::new_with_cpu_and_refinement_policy(
+        let engine = match (registration, followup_resolver) {
+            (None, Some(resolver)) => {
+                let checker = rz_search::cpu_checker::OwnedCpuChecker::new(cpu)
+                    .map_err(|e| invalid(e.to_string()))?;
+                PalsEngine::new_with_boxed_checker_and_policies(
+                    pals,
+                    model,
+                    Box::new(checker),
+                    resolver,
+                    PostRepairRecheckPolicy::Disabled,
+                )
+            }
+            (None, None) => PalsEngine::new(pals, model, cpu),
+            (Some(registration), None) => PalsEngine::new_with_cpu_and_refinement_policy(
                 pals,
                 model,
                 cpu,
                 registered_refinement_policy(&registration.wire)?,
             ),
+            (Some(_), Some(_)) => {
+                return Err(invalid(
+                    "V4 collection cannot reinterpret a legacy refinement registration",
+                ));
+            }
         }
         .map_err(|e| invalid(e.to_string()))?;
-        let observed = observed_refinement_selection(
-            registration,
-            engine.post_repair_recheck_policy(),
-            engine.search_identity(),
-            engine.refinement_conditions(),
-        )?;
+        if (followup_resolver.is_some() || !identity.model_configuration.profile.is_legacy())
+            && let Some(facts) = description
+                .native
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            facts.insert(
+                "search_version".into(),
+                serde_json::json!(engine.search_identity()),
+            );
+            facts.insert(
+                "policy_conditions_sha256".into(),
+                serde_json::json!(
+                    engine
+                        .refinement_conditions()
+                        .map(|s| format!("{:x}", Sha256::digest(s.as_bytes())))
+                ),
+            );
+            facts.insert(
+                "followup_lane_explicit".into(),
+                serde_json::json!(followup_resolver.is_some()),
+            );
+            facts.insert(
+                "resolver_policy".into(),
+                serde_json::json!(engine.resolver_policy().version()),
+            );
+            facts.insert(
+                "checker_kind".into(),
+                serde_json::json!(match engine.checker_identity() {
+                    rz_search::cpu_checker::CheckerIdentity::Owned(_) => "own",
+                    rz_search::cpu_checker::CheckerIdentity::ExternalUci(_) => "external_uci",
+                }),
+            );
+            facts.insert(
+                "checker_identity".into(),
+                serde_json::to_value(engine.checker_identity())
+                    .map_err(|e| invalid(e.to_string()))?,
+            );
+            facts.insert(
+                "actual_model_identity".into(),
+                serde_json::json!(engine.model_identity()),
+            );
+            facts.insert(
+                "model_semantics_sha256".into(),
+                serde_json::json!(hex(identity
+                    .model_configuration
+                    .profile
+                    .registered_semantics_sha256())),
+            );
+            facts.insert(
+                "model_implementation_sha256".into(),
+                serde_json::json!(hex(rz_eval::pals_model::compiled_model_boundary_sha256())),
+            );
+            facts.insert(
+                "search_implementation_sha256".into(),
+                serde_json::json!(hex(
+                    rz_search::pals::engine::compiled_search_implementation_sha256()
+                )),
+            );
+            facts.insert(
+                "resolver_implementation_sha256".into(),
+                serde_json::json!(hex(
+                    rz_search::pals::engine::compiled_resolver_implementation_sha256()
+                )),
+            );
+            facts.insert(
+                "resolver_semantics_sha256".into(),
+                serde_json::json!(hex(engine.resolver_policy().semantics_sha256())),
+            );
+        }
+        sink.lock()
+            .map_err(|_| invalid("native collector sink poisoned during namespace binding"))?
+            .source = description.clone();
+        let observed = if followup_resolver.is_some() {
+            if engine.post_repair_recheck_policy() != PostRepairRecheckPolicy::Disabled
+                || engine.search_identity() != rz_search::pals::engine::PALS_FOLLOWUP_SEARCH_VERSION
+                || engine.refinement_conditions()
+                    != Some(rz_search::pals::engine::PALS_FOLLOWUP_CONDITIONS)
+            {
+                return Err(invalid(
+                    "V4 actual collection policy/conditions differ from explicit baseline lane",
+                ));
+            }
+            None
+        } else {
+            observed_refinement_selection(
+                registration,
+                engine.post_repair_recheck_policy(),
+                engine.search_identity(),
+                engine.refinement_conditions(),
+            )?
+        };
         if let (Some(registration), Some(observed)) = (registration, observed) {
             let facts = description
                 .native
@@ -3565,6 +3772,8 @@ mod tests {
                     completed_depth: 0,
                     score_scope: None,
                     cpu_observation: None,
+                    parent_revision: None,
+                    supersedes_revision: None,
                     perspective: Color::White,
                     critical: true,
                 },
