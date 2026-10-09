@@ -142,7 +142,7 @@ def main():
             environment["PYTHONPATH"] = str(package / "src")
             stages["model_tests_seconds"] = run([
                 str(python), "-m", "unittest", "discover", "-s", str(package / "tests"), "-v"],
-                cwd=source, environment=environment)
+                cwd=source, environment=environment, seconds=600)
             # This separate static gate consumes the actual deterministic Python
             # artifact in Rust. It creates no ORT Session, provider or Run.
             packing = output / "device-packing"
