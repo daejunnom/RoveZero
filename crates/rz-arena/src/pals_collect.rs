@@ -45,7 +45,7 @@ mod producer;
 #[cfg(feature = "pals-collection-onnx")]
 pub use native::{
     OwnPalsOnnxCollectionDriver, PalsCollectionGraphPin, PalsNativeCollectionRegistry,
-    PalsNativeRefinementRegistration,
+    PalsNativeContinuationRegistration, PalsNativeRefinementRegistration,
 };
 pub use producer::{
     CheckedProducerOwner, PalsProducerCollectionConfig, RegisteredProducerHandle,
@@ -1038,6 +1038,7 @@ impl Output {
                     | "native-divergence-contexts.jsonl"
                     | "native-work-summary.jsonl"
                     | "native-recheck-traces.jsonl"
+                    | "native-continuation-traces.jsonl"
                     | "native-search-returns.jsonl"
             ) || row.json.len() > MAX_JSON_RECORD_BYTES
             {

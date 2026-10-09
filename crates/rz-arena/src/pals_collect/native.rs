@@ -20,8 +20,11 @@ use rz_uci::pals_native::{
 };
 use std::sync::{Arc, Mutex};
 
+#[path = "continuation.rs"]
+mod continuation;
 #[path = "divergence.rs"]
 mod divergence;
+pub use continuation::PalsNativeContinuationRegistration;
 
 const REGISTRY_VERSION: &str = "rz-pals-native-collection-registry/1";
 const REFINEMENT_REGISTRATION_VERSION: &str = "rz-pals-native-refinement-registration/1";
@@ -176,6 +179,27 @@ struct RefinementRegistrationWire {
     search_policy: PalsSearchPolicyIdentityV3,
 }
 
+// Keep both closed tuples in this source owner: legacy source review must not
+// acquire an unpinned policy-selection implementation in the new module.
+fn registered_refinement_policy(
+    wire: &RefinementRegistrationWire,
+) -> Result<PostRepairRecheckPolicy, ArenaError> {
+    if wire.version == REFINEMENT_REGISTRATION_VERSION
+        && wire.search_policy == PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1()
+    {
+        Ok(PostRepairRecheckPolicy::SameRepairedLineOnceV1)
+    } else if wire.version == "rz-pals-native-continuation-registration/1"
+        && wire.search_policy
+            == PalsSearchPolicyIdentityV3::expected_actual_opponent_continuation_v1()
+    {
+        Ok(PostRepairRecheckPolicy::ActualOpponentContinuationV1)
+    } else {
+        Err(invalid(
+            "native registration version and selected policy differ",
+        ))
+    }
+}
+
 /// Immutable independent registration, admitted from the exact same bounded
 /// bytes that were hashed and decoded. No public mutable fields or Deserialize
 /// implementation can attach a retained pin to caller-constructed contents.
@@ -224,6 +248,10 @@ impl PalsNativeRefinementRegistration {
         })
     }
     pub fn read_pinned(path: &Path, expected_sha256: &str) -> Result<Self, ArenaError> {
+        let bytes = Self::read_registration_file(path, expected_sha256)?;
+        Self::from_registration_bytes(&bytes, expected_sha256)
+    }
+    fn read_registration_file(path: &Path, expected_sha256: &str) -> Result<Vec<u8>, ArenaError> {
         let private_path = path.components().any(|part| {
             let name = part.as_os_str().to_string_lossy().to_ascii_lowercase();
             name == ".env"
@@ -255,7 +283,7 @@ impl PalsNativeRefinementRegistration {
         file.take(MAX_REFINEMENT_REGISTRATION_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(io)?;
-        Self::from_registration_bytes(&bytes, expected_sha256)
+        Ok(bytes)
     }
     pub fn validate_against(&self, base: &PalsNativeCollectionRegistry) -> Result<(), ArenaError> {
         base.validate()?;
@@ -263,9 +291,7 @@ impl PalsNativeRefinementRegistration {
             .search_policy
             .validate()
             .map_err(|e| invalid(e.to_string()))?;
-        if self.wire.version != REFINEMENT_REGISTRATION_VERSION
-            || self.wire.search_policy
-                != PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1()
+        if registered_refinement_policy(&self.wire).is_err()
             || !valid_sha(&self.raw_sha256)
             || self.wire.base_registry_canonical_sha256 != canonical_sha256(base)?
             || self.wire.collector_binary_sha256 != base.collector_binary_sha256
@@ -293,13 +319,27 @@ fn observed_refinement_selection(
         {
             Ok(None)
         }
-        (Some(registration), PostRepairRecheckPolicy::SameRepairedLineOnceV1) => {
+        (Some(registration), policy) if policy != PostRepairRecheckPolicy::Disabled => {
+            if registered_refinement_policy(&registration.wire)? != policy {
+                return Err(invalid(
+                    "actual selected policy differs from its registration lane",
+                ));
+            }
             let conditions = actual_conditions.ok_or_else(|| {
                 invalid("actual selected engine refinement conditions are absent")
             })?;
+            let expected = match policy {
+                PostRepairRecheckPolicy::SameRepairedLineOnceV1 => {
+                    PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1()
+                }
+                PostRepairRecheckPolicy::ActualOpponentContinuationV1 => {
+                    PalsSearchPolicyIdentityV3::expected_actual_opponent_continuation_v1()
+                }
+                PostRepairRecheckPolicy::Disabled => unreachable!(),
+            };
             let observed = PalsSearchPolicyIdentityV3 {
-                version: rz_experiments::PALS_POST_REPAIR_RECHECK_V3_VERSION.into(),
-                policy: rz_experiments::PALS_POST_REPAIR_RECHECK_V3_POLICY.into(),
+                version: expected.version,
+                policy: expected.policy,
                 search_identity: actual_search_identity.into(),
                 conditions_sha256: Sha256::digest(conditions.as_bytes()).into(),
             };
@@ -388,6 +428,7 @@ struct Sink {
     total_rows: usize,
     producer: Option<RegisteredProducerHandle>,
     pending_recheck: Option<PendingRecheck>,
+    pending_continuation: Option<continuation::PendingContinuation>,
     rejected_recheck: Option<RecheckIdentity>,
     closed_rechecks: Vec<RecheckIdentity>,
     prepaid_recheck_rows: usize,
@@ -1007,7 +1048,10 @@ impl Sink {
                 self.trace.failure = Some(missing);
             }
         }
-        if self.pending_recheck.is_some() || self.rejected_recheck.is_some() {
+        if self.pending_recheck.is_some()
+            || self.pending_continuation.is_some()
+            || self.rejected_recheck.is_some()
+        {
             native_trace_failure(
                 &mut self.trace,
                 "missing recheck finish",
@@ -1231,7 +1275,10 @@ impl Sink {
         ))
     }
     fn prepare_recheck(&mut self, event: RecheckPrepared<'_>) -> Result<(), RoleError> {
-        if self.pending_recheck.is_some() || self.rejected_recheck.is_some() {
+        if self.pending_recheck.is_some()
+            || self.pending_continuation.is_some()
+            || self.rejected_recheck.is_some()
+        {
             return Err(role_error(
                 "recheck attempted while a prior descriptor is unclosed",
             ));
@@ -1379,6 +1426,18 @@ impl Sink {
         logical: Option<&RoleLogicalContext>,
         until: Instant,
     ) -> Result<(), RoleError> {
+        if self.pending_continuation.is_some() {
+            return self.check_continuation_reply(
+                id,
+                kind,
+                position,
+                prefix,
+                proposal,
+                counterexample,
+                logical,
+                until,
+            );
+        }
         let Some(pending) = &self.pending_recheck else {
             return Ok(());
         };
@@ -1400,6 +1459,9 @@ impl Sink {
         Ok(())
     }
     fn bind_recheck_reply(&mut self, id: RequestId) -> Result<(), RoleError> {
+        if self.pending_continuation.is_some() {
+            return self.bind_continuation_reply(id);
+        }
         let Some(pending) = self.pending_recheck.as_ref() else {
             return Ok(());
         };
@@ -2043,10 +2105,16 @@ impl NativeRoleObserver for Observer {
         self.with(|s| s.capture_logical(id, input, context, logical))
     }
     fn recheck_prepared(&mut self, event: RecheckPrepared<'_>) -> Result<(), RoleError> {
-        self.with(|s| s.prepare_recheck(event))
+        self.with(|s| match event.policy {
+            PostRepairRecheckPolicy::ActualOpponentContinuationV1 => s.prepare_continuation(event),
+            _ => s.prepare_recheck(event),
+        })
     }
     fn recheck_finished(&mut self, event: RecheckFinished<'_>) -> Result<(), RoleError> {
-        self.with(|s| s.finish_recheck(event))
+        self.with(|s| match event.policy {
+            PostRepairRecheckPolicy::ActualOpponentContinuationV1 => s.finish_continuation(event),
+            _ => s.finish_recheck(event),
+        })
     }
     fn accepted_context(
         &mut self,
@@ -2184,6 +2252,31 @@ pub struct OwnPalsOnnxCollectionDriver {
     max_rounds: u64,
 }
 impl OwnPalsOnnxCollectionDriver {
+    /// A separate explicit registration selects the actual multi-Reply lane.
+    /// The ordinary/default and legacy refinement entry points keep their wire.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_cpu_with_continuation_policy(
+        export: &Path,
+        checkpoint: &Path,
+        pin: &RuntimeLibraryPin,
+        registry: &PalsNativeCollectionRegistry,
+        cpu: CpuConfig,
+        pals: PalsConfig,
+        max_rounds: u64,
+        registration: &PalsNativeContinuationRegistration,
+    ) -> Result<Self, ArenaError> {
+        registration.validate_against(registry)?;
+        Self::load_cpu_selected(
+            export,
+            checkpoint,
+            pin,
+            registry,
+            cpu,
+            pals,
+            max_rounds,
+            Some(&registration.inner),
+        )
+    }
     pub fn load_cpu(
         export: &Path,
         checkpoint: &Path,
@@ -2341,6 +2434,7 @@ impl OwnPalsOnnxCollectionDriver {
             total_rows: 0,
             producer: None,
             pending_recheck: None,
+            pending_continuation: None,
             rejected_recheck: None,
             closed_rechecks: Vec::new(),
             prepaid_recheck_rows: 0,
@@ -2352,11 +2446,11 @@ impl OwnPalsOnnxCollectionDriver {
             .map_err(|e| invalid(e.to_string()))?;
         let engine = match registration {
             None => PalsEngine::new(pals, model, cpu),
-            Some(_) => PalsEngine::new_with_cpu_and_refinement_policy(
+            Some(registration) => PalsEngine::new_with_cpu_and_refinement_policy(
                 pals,
                 model,
                 cpu,
-                PostRepairRecheckPolicy::SameRepairedLineOnceV1,
+                registered_refinement_policy(&registration.wire)?,
             ),
         }
         .map_err(|e| invalid(e.to_string()))?;
@@ -2676,6 +2770,7 @@ impl PalsCollectionDriver for OwnPalsOnnxCollectionDriver {
         }
         s.context = None;
         s.pending_recheck = None;
+        s.pending_continuation = None;
         s.rejected_recheck = None;
         s.closed_rechecks.clear();
         s.prepaid_recheck_rows = 0;
@@ -3019,6 +3114,7 @@ mod tests {
             total_rows: 0,
             producer: None,
             pending_recheck: None,
+            pending_continuation: None,
             rejected_recheck: None,
             closed_rechecks: Vec::new(),
             prepaid_recheck_rows: 0,
@@ -3563,7 +3659,25 @@ mod tests {
             ply: usize,
             context: &RoleLogicalContext,
         ) -> Result<(), RoleError> {
-            let (position, _) = replay_line(&self.root, &self.repaired[..ply]).unwrap();
+            self.observe_prefix(
+                shared,
+                sequence,
+                kind,
+                &self.repaired[..ply],
+                self.repaired[ply],
+                context,
+            )
+        }
+        fn observe_prefix(
+            &self,
+            shared: &Arc<Mutex<Sink>>,
+            sequence: u64,
+            kind: NativeQueryKind,
+            prefix: &[BoardMove],
+            chosen: BoardMove,
+            context: &RoleLogicalContext,
+        ) -> Result<(), RoleError> {
+            let (position, _) = replay_line(&self.root, prefix).unwrap();
             let legal = position.ordered_legal_moves().moves().to_vec();
             let records = if kind == NativeQueryKind::Reply {
                 vec![self.record.clone()]
@@ -3573,7 +3687,7 @@ mod tests {
             let query = RoleQuery {
                 position: &position,
                 legal: &legal,
-                prefix: &self.repaired[..ply],
+                prefix,
                 proposal: &self.repaired,
                 counterexample: Some(&self.refutation),
                 records: &records,
@@ -3594,8 +3708,7 @@ mod tests {
             )?;
             let mut output = raw(legal.len());
             output.candidate_logits.fill(-1.);
-            output.candidate_logits[legal.iter().position(|m| *m == self.repaired[ply]).unwrap()] =
-                1.;
+            output.candidate_logits[legal.iter().position(|m| *m == chosen).unwrap()] = 1.;
             observer.physically_completed(id(sequence), Ok(&output))?;
             observer.delivered(id(sequence))?;
             observer.accepted(id(sequence))?;
@@ -3706,6 +3819,334 @@ mod tests {
                 .flat_map(|r| r.json.iter().copied().chain(std::iter::once(b'\n')))
                 .collect::<Vec<_>>();
             assert_eq!(stored, expected);
+        }
+    }
+
+    fn continuation_fixture() -> RecheckFixture {
+        let mut f = RecheckFixture::new();
+        f.repaired = ["e2e4", "e7e5", "g1f3", "b8c6", "d2d3", "d7d6"]
+            .map(|m| BoardMove::from_uci(m).unwrap())
+            .to_vec();
+        f.refutation = ["e2e4", "e7e5", "f1c4", "b8c6", "d2d3", "d7d6"]
+            .map(|m| BoardMove::from_uci(m).unwrap())
+            .to_vec();
+        f.repaired_snapshot = replay_line(&f.root, &f.repaired).unwrap().0.snapshot();
+        f.record.line = f.repaired.clone();
+        f.config.line_plies = 6;
+        f
+    }
+    fn continuation_sink(f: &RecheckFixture) -> Arc<Mutex<Sink>> {
+        let shared = sink(&f.root, 8 * 1024 * 1024);
+        shared.lock().unwrap().source.native = Some(serde_json::json!({
+            "pals_search_policy":PalsSearchPolicyIdentityV3::expected_actual_opponent_continuation_v1(),
+            "refinement_registration_sha256":"09".repeat(32)}));
+        fixture_producer(&shared, 1024 * 1024);
+        for ply in 2..f.repaired.len() {
+            f.observe_call(
+                &shared,
+                (ply - 1) as u64,
+                NativeQueryKind::Repair,
+                ply,
+                &RecheckFixture::logical(&f.repaired[..ply], NativeQueryKind::Repair, 7),
+            )
+            .unwrap();
+        }
+        shared
+    }
+    fn continuation_prepared(f: &RecheckFixture) -> RecheckPrepared<'_> {
+        let mut event = f.prepared();
+        event.policy = PostRepairRecheckPolicy::ActualOpponentContinuationV1;
+        event
+    }
+    #[test]
+    fn native_continuation_registration_is_separate_and_checks_observed_engine_selection() {
+        let base = refinement_base();
+        let legacy = refinement_bytes(&base);
+        let mut wire: serde_json::Value = serde_json::from_slice(&legacy).unwrap();
+        wire["version"] = serde_json::json!("rz-pals-native-continuation-registration/1");
+        wire["search_policy"] = serde_json::to_value(
+            PalsSearchPolicyIdentityV3::expected_actual_opponent_continuation_v1(),
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let pin = format!("{:x}", Sha256::digest(&bytes));
+        assert!(PalsNativeRefinementRegistration::from_registration_bytes(&bytes, &pin).is_err());
+        assert!(
+            PalsNativeContinuationRegistration::from_registration_bytes(
+                &legacy,
+                &format!("{:x}", Sha256::digest(&legacy))
+            )
+            .is_err()
+        );
+        assert!(
+            PalsNativeContinuationRegistration::from_registration_bytes(&bytes, &"00".repeat(32))
+                .is_err()
+        );
+        let registration =
+            PalsNativeContinuationRegistration::from_registration_bytes(&bytes, &pin).unwrap();
+        registration.validate_against(&base).unwrap();
+        let policy = PostRepairRecheckPolicy::ActualOpponentContinuationV1;
+        assert_eq!(
+            observed_refinement_selection(
+                Some(&registration.inner),
+                policy,
+                policy.search_identity(),
+                policy.conditions()
+            )
+            .unwrap(),
+            Some(PalsSearchPolicyIdentityV3::expected_actual_opponent_continuation_v1())
+        );
+        assert!(
+            observed_refinement_selection(
+                Some(&registration.inner),
+                PostRepairRecheckPolicy::SameRepairedLineOnceV1,
+                policy.search_identity(),
+                policy.conditions()
+            )
+            .is_err()
+        );
+        assert!(
+            observed_refinement_selection(
+                Some(&registration.inner),
+                policy,
+                policy.search_identity(),
+                Some("changed")
+            )
+            .is_err()
+        );
+        let mut changed = base.clone();
+        changed.collector_binary_sha256 = "10".repeat(32);
+        assert!(registration.validate_against(&changed).is_err());
+    }
+    #[test]
+    fn native_continuation_seals_three_actual_prefixes_and_persists_a_distinct_trace() {
+        let f = continuation_fixture();
+        let shared = continuation_sink(&f);
+        let counter = ["e2e4", "e7e5", "g1f3", "g8f6", "f1c4", "d7d5"]
+            .map(|m| BoardMove::from_uci(m).unwrap());
+        let mut observer = Observer(Arc::clone(&shared));
+        observer
+            .recheck_prepared(continuation_prepared(&f))
+            .unwrap();
+        for ply in 3..6 {
+            let context = if ply == 3 {
+                f.reply_context.clone()
+            } else {
+                RecheckFixture::logical(&counter[..ply], NativeQueryKind::Reply, 8)
+            };
+            f.observe_prefix(
+                &shared,
+                ply as u64 + 2,
+                NativeQueryKind::Reply,
+                &counter[..ply],
+                counter[ply],
+                &context,
+            )
+            .unwrap();
+        }
+        let mut finish = f.finished(true, true, true);
+        finish.policy = PostRepairRecheckPolicy::ActualOpponentContinuationV1;
+        finish.selected_response = Some(counter[3]);
+        finish.counterline = &counter;
+        finish.counterline_completed = true;
+        observer.recheck_finished(finish).unwrap();
+        let s = shared.lock().unwrap();
+        assert!(s.pending_continuation.is_none());
+        assert_eq!(s.prepaid_recheck_rows, 0);
+        assert!(!s.trace.rows.iter().any(|r| r.artifact == RECHECK_ARTIFACT));
+        let rows: Vec<serde_json::Value> = s
+            .trace
+            .rows
+            .iter()
+            .filter(|r| r.artifact == "native-continuation-traces.jsonl")
+            .map(|r| serde_json::from_slice(&r.json).unwrap())
+            .collect();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r["stage"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "prepared",
+                "reply_bound",
+                "reply_bound",
+                "reply_bound",
+                "finished"
+            ]
+        );
+        let calls = rows[4]["data"]["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 3);
+        for (i, call) in calls.iter().enumerate() {
+            assert_eq!(call["request_sequence"], serde_json::json!(i + 5));
+            assert_eq!(call["bound_payload_sha256"], rows[i + 1]["payload_sha256"]);
+            assert_eq!(call["search_consumed"], true);
+            assert_eq!(call["accepted_context_checked"], true);
+        }
+        assert_eq!(rows[4]["data"]["counterline_completed"], true);
+        assert_eq!(rows[4]["data"]["full_suffix_replayed"], false);
+        assert!(rows[4]["data"]["publication"].is_null()); // No CPU comparison or actual NN fixture claim.
+        let temp = NativeTestOutput::new();
+        let mut output = Output::new(&temp.0, "continuation-storage", 16 * 1024 * 1024).unwrap();
+        output.native_trace(&s.trace).unwrap();
+        let stored = std::fs::read(
+            temp.0
+                .join("continuation-storage/native-continuation-traces.jsonl"),
+        )
+        .unwrap();
+        let expected = s
+            .trace
+            .rows
+            .iter()
+            .filter(|r| r.artifact == "native-continuation-traces.jsonl")
+            .flat_map(|r| r.json.iter().copied().chain(std::iter::once(b'\n')))
+            .collect::<Vec<_>>();
+        assert_eq!(stored, expected);
+    }
+    #[test]
+    fn native_continuation_rejects_unaccepted_previous_output_or_a_spliced_prefix() {
+        let f = continuation_fixture();
+        let counter = ["e2e4", "e7e5", "g1f3", "g8f6", "f1c4", "d7d5"]
+            .map(|m| BoardMove::from_uci(m).unwrap());
+        for mutation in 0..5 {
+            let shared = continuation_sink(&f);
+            let mut observer = Observer(Arc::clone(&shared));
+            observer
+                .recheck_prepared(continuation_prepared(&f))
+                .unwrap();
+            f.observe_prefix(
+                &shared,
+                5,
+                NativeQueryKind::Reply,
+                &counter[..3],
+                counter[3],
+                &f.reply_context,
+            )
+            .unwrap();
+            let mut prefix = counter[..4].to_vec();
+            if mutation == 4 {
+                prefix[3] = f.repaired[3];
+            } else {
+                let mut s = shared.lock().unwrap();
+                let c = s.calls.get_mut(&id(5)).unwrap();
+                match mutation {
+                    0 => c.physical = false,
+                    1 => c.delivered = false,
+                    2 => c.accepted = false,
+                    _ => c.physical_unknown = true,
+                }
+            }
+            let context = RecheckFixture::logical(&prefix, NativeQueryKind::Reply, 8);
+            assert!(
+                f.observe_prefix(
+                    &shared,
+                    6,
+                    NativeQueryKind::Reply,
+                    &prefix,
+                    counter[4],
+                    &context
+                )
+                .is_err()
+            );
+            assert!(!shared.lock().unwrap().calls.contains_key(&id(6)));
+        }
+    }
+    #[test]
+    fn native_continuation_partial_tail_and_failed_completion_never_claim_full_coverage() {
+        let f = continuation_fixture();
+        let shared = continuation_sink(&f);
+        let counter = ["e2e4", "e7e5", "g1f3", "g8f6", "f1c4", "d7d5"]
+            .map(|m| BoardMove::from_uci(m).unwrap());
+        let mut observer = Observer(Arc::clone(&shared));
+        observer
+            .recheck_prepared(continuation_prepared(&f))
+            .unwrap();
+        f.observe_prefix(
+            &shared,
+            5,
+            NativeQueryKind::Reply,
+            &counter[..3],
+            counter[3],
+            &f.reply_context,
+        )
+        .unwrap();
+        let context = RecheckFixture::logical(&counter[..4], NativeQueryKind::Reply, 8);
+        f.observe_prefix(
+            &shared,
+            6,
+            NativeQueryKind::Reply,
+            &counter[..4],
+            counter[4],
+            &context,
+        )
+        .unwrap();
+        let mut forged = f.finished(true, true, true);
+        forged.policy = PostRepairRecheckPolicy::ActualOpponentContinuationV1;
+        forged.selected_response = Some(counter[3]);
+        forged.counterline = &counter;
+        forged.counterline_completed = true;
+        assert!(observer.recheck_finished(forged).is_err());
+        let mut finish = f.finished(true, true, true);
+        finish.policy = PostRepairRecheckPolicy::ActualOpponentContinuationV1;
+        finish.selected_response = Some(counter[3]);
+        finish.counterline = &counter[..5];
+        finish.disposition = rz_search::pals::engine::RecheckDisposition::Interrupted;
+        observer.recheck_finished(finish).unwrap();
+        let s = shared.lock().unwrap();
+        assert!(s.trace.failure.is_some()); // Earlier false completion remains primary evidence.
+        let end: serde_json::Value =
+            serde_json::from_slice(&s.trace.rows.last().unwrap().json).unwrap();
+        assert_eq!(end["data"]["counterline_completed"], false);
+        assert!(end["data"]["publication"].is_null());
+        assert_eq!(end["data"]["calls"].as_array().unwrap().len(), 2);
+        assert_eq!(s.prepaid_recheck_rows, 1); // Unused bound slot remains charged through drain.
+    }
+    #[test]
+    fn native_continuation_reserves_before_dispatch_and_keeps_original_control_context() {
+        for cancel in [false, true] {
+            let f = continuation_fixture();
+            let shared = continuation_sink(&f);
+            if cancel {
+                f.cancel.store(true, Ordering::Release);
+            } else {
+                let mut s = shared.lock().unwrap();
+                let reserved = s.trace.reserved_bytes;
+                s.context.as_mut().unwrap().max_bytes = reserved;
+            }
+            let mut observer = Observer(Arc::clone(&shared));
+            assert!(
+                observer
+                    .recheck_prepared(continuation_prepared(&f))
+                    .is_err()
+            );
+            let s = shared.lock().unwrap();
+            assert!(s.pending_continuation.is_none());
+            assert!(!s.calls.contains_key(&id(5)));
+        }
+        for changed in 0..4 {
+            let f = continuation_fixture();
+            let shared = continuation_sink(&f);
+            let mut observer = Observer(Arc::clone(&shared));
+            observer
+                .recheck_prepared(continuation_prepared(&f))
+                .unwrap();
+            let mut context = f.reply_context.clone();
+            match changed {
+                0 => context.game_generation += 1,
+                1 => context.search_generation += 1,
+                2 => context.public_revision += 1,
+                _ => context.situation_revision += 1,
+            }
+            assert!(
+                f.observe_prefix(
+                    &shared,
+                    5,
+                    NativeQueryKind::Reply,
+                    &f.repaired[..3],
+                    BoardMove::from_uci("g8f6").unwrap(),
+                    &context
+                )
+                .is_err()
+            );
+            assert!(!shared.lock().unwrap().calls.contains_key(&id(5)));
         }
     }
     #[test]

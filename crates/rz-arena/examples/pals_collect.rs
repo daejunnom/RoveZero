@@ -7,7 +7,8 @@ use rz_arena::pals_collect::{
 };
 #[cfg(feature = "pals-collection-onnx")]
 use rz_arena::pals_collect::{
-    OwnPalsOnnxCollectionDriver, PalsNativeCollectionRegistry, PalsNativeRefinementRegistration,
+    OwnPalsOnnxCollectionDriver, PalsNativeCollectionRegistry, PalsNativeContinuationRegistration,
+    PalsNativeRefinementRegistration,
 };
 #[cfg(feature = "pals-collection-onnx")]
 use rz_eval::runtime_pin::RuntimeCache;
@@ -31,7 +32,7 @@ fn usage() {
         [--beam-width N] [--line-plies N] [--max-role-calls N] [--pals-rounds N]\n\
         [--producer-registration ABSOLUTE --producer-registration-sha256 SHA256]\n\
         [--producer-journal-bytes N --producer-capture-bytes N]\n\
-        [--post-repair-recheck same-repaired-line-once-v1\n\
+        [--post-repair-recheck same-repaired-line-once-v1|actual-opponent-continuation-v1\n\
          --refinement-registration ABSOLUTE --refinement-registration-sha256 SHA256]\n\
         CPU/mock sources have no neural weights. Limits are mandatory finite defaults.\n\
         Actual ONNX mode accepts independently registered Untrained P/C on explicit CPU only.\n\
@@ -55,7 +56,7 @@ fn validate_refinement_cli(
 ) -> Result<bool, String> {
     match (policy, registration, registration_sha256) {
         (None, None, None) => Ok(false),
-        (Some("same-repaired-line-once-v1"), Some(path), Some(sha)) => {
+        (Some("same-repaired-line-once-v1" | "actual-opponent-continuation-v1"), Some(path), Some(sha)) => {
             if mode != "pals-onnx" || provider != Some("cpu") || !path.is_absolute()
                 || sha.len() != 64
                 || !sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
@@ -265,8 +266,24 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                         .as_deref()
                         .ok_or("--source-registry-sha256 is required")?,
                 )?;
-                let refinement = if recheck_selected {
+                let continuation_selected =
+                    post_repair_recheck.as_deref() == Some("actual-opponent-continuation-v1");
+                let refinement = if recheck_selected && !continuation_selected {
                     let registration = PalsNativeRefinementRegistration::read_pinned(
+                        refinement_registration
+                            .as_deref()
+                            .ok_or("--refinement-registration is required")?,
+                        refinement_registration_sha256
+                            .as_deref()
+                            .ok_or("--refinement-registration-sha256 is required")?,
+                    )?;
+                    registration.validate_against(&expected)?;
+                    Some(registration)
+                } else {
+                    None
+                };
+                let continuation = if continuation_selected {
+                    let registration = PalsNativeContinuationRegistration::read_pinned(
                         refinement_registration
                             .as_deref()
                             .ok_or("--refinement-registration is required")?,
@@ -290,8 +307,8 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                 let pin = cache.library(&runtime, &expected.runtime_sha256)?;
                 let export = export.as_deref().ok_or("--export is required")?;
                 let checkpoint = checkpoint.as_deref().ok_or("--checkpoint is required")?;
-                let driver = Box::new(match refinement.as_ref() {
-                    None => OwnPalsOnnxCollectionDriver::load_cpu(
+                let driver = Box::new(match (refinement.as_ref(), continuation.as_ref()) {
+                    (None, None) => OwnPalsOnnxCollectionDriver::load_cpu(
                         export,
                         checkpoint,
                         &pin,
@@ -300,7 +317,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                         pals,
                         pals_rounds,
                     )?,
-                    Some(registration) => {
+                    (Some(registration), None) => {
                         OwnPalsOnnxCollectionDriver::load_cpu_with_refinement_policy(
                             export,
                             checkpoint,
@@ -311,6 +328,21 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                             pals_rounds,
                             registration,
                         )?
+                    }
+                    (None, Some(registration)) => {
+                        OwnPalsOnnxCollectionDriver::load_cpu_with_continuation_policy(
+                            export,
+                            checkpoint,
+                            &pin,
+                            &expected,
+                            CpuConfig::default(),
+                            pals,
+                            pals_rounds,
+                            registration,
+                        )?
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err("mixed continuation/refinement registrations".into());
                     }
                 });
                 (driver, expected.owned_sources()?)
@@ -379,6 +411,71 @@ mod tests {
         for mode in ["cpu", "pals-mock", "pals-onnx"] {
             assert!(!validate_refinement_cli(mode, None, None, None, None, false, false).unwrap());
         }
+    }
+    #[test]
+    fn actual_continuation_cli_requires_exact_explicit_cpu_strict_selection() {
+        let path = public_registration();
+        let sha = "07".repeat(32);
+        assert!(
+            validate_refinement_cli(
+                "pals-onnx",
+                Some("cpu"),
+                Some("actual-opponent-continuation-v1"),
+                Some(&path),
+                Some(&sha),
+                true,
+                false
+            )
+            .unwrap()
+        );
+        assert!(
+            validate_refinement_cli(
+                "pals-onnx",
+                Some("cpu"),
+                Some("actual-opponent-continuation-v1"),
+                Some(&path),
+                Some(&sha),
+                false,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_refinement_cli(
+                "pals-onnx",
+                Some("cuda"),
+                Some("actual-opponent-continuation-v1"),
+                Some(&path),
+                Some(&sha),
+                true,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_refinement_cli(
+                "pals-mock",
+                Some("cpu"),
+                Some("actual-opponent-continuation-v1"),
+                Some(&path),
+                Some(&sha),
+                true,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_refinement_cli(
+                "pals-onnx",
+                Some("cpu"),
+                Some("actual_opponent_continuation_v1"),
+                Some(&path),
+                Some(&sha),
+                true,
+                false
+            )
+            .is_err()
+        );
     }
 
     #[test]
