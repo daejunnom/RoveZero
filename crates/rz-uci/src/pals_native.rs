@@ -4715,21 +4715,7 @@ mod native {
             command: PalsNativeCommand,
             until: Instant,
         ) -> Result<PalsNativeResult, RoleError> {
-            let kind = match &command {
-                PalsNativeCommand::Evaluate(input) if input.role == PalsRole::Critic => {
-                    "critic_evaluation"
-                }
-                PalsNativeCommand::Evaluate(_) => "proposer_evaluation",
-                PalsNativeCommand::EvaluatePrivateWarm(_) => "private_warm_evaluation",
-                PalsNativeCommand::VerifyRuntime => "runtime_origin_audit",
-                PalsNativeCommand::ObserveRuntimeMappings => "runtime_loading_mapping",
-                PalsNativeCommand::VerifyCudaPlacement => "cuda_placement_audit",
-                PalsNativeCommand::NewGame => "new_game_reset",
-                PalsNativeCommand::ResetTo(_) => "explicit_game_reset",
-                PalsNativeCommand::SnapshotStats => "backend_stats",
-                #[cfg(feature = "experimental-io-binding")]
-                PalsNativeCommand::SnapshotCudaRecordPages => "cuda_record_pages_observation",
-            };
+            let kind = command.diagnostic_kind();
             let elapsed = self.startup_elapsed_ns();
             // A diagnostic cap is not a command admission or completion rule.
             // Suppress capture on overflow without mutating a prior event or

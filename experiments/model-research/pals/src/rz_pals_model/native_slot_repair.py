@@ -101,6 +101,14 @@ _REVIEWED_DISABLED_CONTINUATION_SELECTION_V2_SOURCES = (
     {'bytes': 355881, 'sha256': '32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c'},
     {'bytes': 220199, 'sha256': 'eea0654a5c11d6e0d69b5c5df71363a8e2d8f4fb7ad02cf5d766fb4b06ec456f'},
 )
+# Reviewed DEFAULT-only successor: the collector now derives a selected return
+# tuple from the live policy, while Disabled still skips that selected block.
+# The legacy prepared-lineage transition is unchanged. This literal pair grants
+# no opt-in continuation, execution, cost, utility or training authority.
+_REVIEWED_DISABLED_SELECTED_IDENTITY_SOURCES = (
+    {"bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"},
+    {"bytes": 221690, "sha256": "8886c0e01d0c753fa0a1b5256e36f2230d41f5e561fca8ac7ae8f895b9e0813c"},
+)
 _SOURCE_REVIEW_PROFILES = (
     ("legacy_prepared_lineage_4469f9d", _REVIEWED_SOURCES),
     ("legacy_disabled_recheck_9c0de959", _REVIEWED_DISABLED_RECHECK_SOURCES),
@@ -112,6 +120,7 @@ _SOURCE_REVIEW_PROFILES = (
     ("legacy_disabled_c_continuation_owner_fab843bc_native_e25fc205", _REVIEWED_DISABLED_C_CONTINUATION_OWNER_SOURCES),
     ("legacy_disabled_multi_reply_observer_b813828e", _REVIEWED_DISABLED_NATIVE_CONTINUATION_OBSERVER_SOURCES),
     ("legacy_disabled_continuation_selection_v2_eea0654a", _REVIEWED_DISABLED_CONTINUATION_SELECTION_V2_SOURCES),
+    ("legacy_disabled_selected_identity_8886c0e0", _REVIEWED_DISABLED_SELECTED_IDENTITY_SOURCES),
 )
 _DISABLED_SEARCH_VERSION = "pals-restricted-refinement/0.1"
 _OPT_IN_LANE_FIELDS = ("pals_search_policy", "refinement_registration", "refinement_registration_sha256", "post_repair_recheck", "post_repair_recheck_policy", "post_repair_recheck_conditions",

@@ -38,7 +38,7 @@ fn usage() {
         Actual ONNX mode accepts independently registered Untrained P/C on explicit CPU only.\n\
         --describe-registration prints read-only executable/CPU/encoder/model-config facts and exits.\n\
         --describe-producer ID constructs the checked CPU/native owner, prints registration facts and exits.\n\
-        --describe-checked-source ID constructs the same checked owner and prints its full source description.\n\
+        --describe-checked-source ID prints the checked owner's canonical source-domain artifact, without a newline.\n\
         Strict producer mode requires independent prior registration bytes; failure has no legacy fallback.\n\
         Output preserves seals, actual native tensors, physical raw/delivery/consumption, masks, PGN and failure receipt."
     );
@@ -97,6 +97,19 @@ fn validate_describe_cli(
         );
     }
     Ok(producer || checked_source)
+}
+
+fn checked_source_description(
+    driver: &mut dyn PalsCollectionDriver,
+    producer_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // The strict loader compares the original compact domain tuple to the
+    // checked_source_sha256 from this same checked producer owner.
+    pals_producer_registration_description(driver, producer_id)?;
+    let mut value =
+        serde_json::to_value(("rz-pals-collector-checked-source/1", driver.description()))?;
+    value.sort_all_objects();
+    Ok(serde_json::to_string(&value)?)
 }
 
 fn run() -> Result<bool, Box<dyn std::error::Error>> {
@@ -399,8 +412,10 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         // Validate the ID through the same checked producer owner used by
         // --describe-producer. Emit the actual owner's borrowed description,
         // rather than reconstructing it from assets or registration metadata.
-        pals_producer_registration_description(driver.as_mut(), &producer_id)?;
-        println!("{}", serde_json::to_string(driver.description())?);
+        print!(
+            "{}",
+            checked_source_description(driver.as_mut(), &producer_id)?
+        );
         return Ok(true);
     }
     let output = output.ok_or("--output-root is required")?;
@@ -448,6 +463,27 @@ mod tests {
         for (producer, source) in [(true, false), (false, true), (true, true)] {
             assert!(validate_describe_cli(producer, source, true).is_err());
         }
+    }
+
+    #[test]
+    fn checked_source_output_matches_same_owner_registration_digest() {
+        use sha2::{Digest, Sha256};
+        let mut driver = OwnCpuCollectionDriver::new(CpuConfig::default()).unwrap();
+        let registration =
+            pals_producer_registration_description(&mut driver, "source-bootstrap").unwrap();
+        let output = checked_source_description(&mut driver, "source-bootstrap").unwrap();
+        assert!(!output.ends_with('\n'));
+        assert_eq!(
+            format!("{:x}", Sha256::digest(output.as_bytes())),
+            registration["checked_source_sha256"].as_str().unwrap()
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed[0], "rz-pals-collector-checked-source/1");
+        assert_eq!(
+            parsed[1],
+            serde_json::to_value(driver.description()).unwrap()
+        );
+        assert!(checked_source_description(&mut driver, "invalid producer id").is_err());
     }
 
     #[test]

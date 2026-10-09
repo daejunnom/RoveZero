@@ -840,17 +840,7 @@ impl Collector {
 }
 
 fn native_result_kind(result: &PalsNativeResult) -> &'static str {
-    match result {
-        PalsNativeResult::Evaluation(_) => "evaluation",
-        PalsNativeResult::NewGame => "new_game",
-        PalsNativeResult::ResetTo { .. } => "reset_to_game",
-        PalsNativeResult::Stats(_) => "stats",
-        PalsNativeResult::RuntimeVerified => "runtime_verified",
-        PalsNativeResult::CudaPlacementVerified(_) => "cuda_placement_verified",
-        PalsNativeResult::RuntimeMappingsObserved(_) => "runtime_mappings_observed",
-        #[cfg(feature = "experimental-io-binding")]
-        PalsNativeResult::CudaRecordPagesObserved(_) => "cuda_record_pages_observed",
-    }
+    result.diagnostic_kind()
 }
 struct FloatBits<'a>(&'a [f32]);
 impl fmt::Debug for FloatBits<'_> {

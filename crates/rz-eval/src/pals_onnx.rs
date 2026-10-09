@@ -1586,6 +1586,41 @@ pub enum PalsNativeResult {
     CudaPlacementVerified(Box<PalsCudaPlacementWitness>),
     RuntimeMappingsObserved(Box<PalsNativeMappingWitness>),
 }
+impl PalsNativeCommand {
+    /// Stable diagnostic label matched in the enum's defining feature domain.
+    /// Downstream feature unification must not hide an enabled control variant.
+    pub fn diagnostic_kind(&self) -> &'static str {
+        match self {
+            Self::Evaluate(input) if input.role == PalsRole::Critic => "critic_evaluation",
+            Self::Evaluate(_) => "proposer_evaluation",
+            Self::EvaluatePrivateWarm(_) => "private_warm_evaluation",
+            Self::VerifyRuntime => "runtime_origin_audit",
+            Self::ObserveRuntimeMappings => "runtime_loading_mapping",
+            Self::VerifyCudaPlacement => "cuda_placement_audit",
+            Self::NewGame => "new_game_reset",
+            Self::ResetTo(_) => "explicit_game_reset",
+            Self::SnapshotStats => "backend_stats",
+            #[cfg(feature = "experimental-io-binding")]
+            Self::SnapshotCudaRecordPages => "cuda_record_pages_observation",
+        }
+    }
+}
+impl PalsNativeResult {
+    /// Stable result diagnostic; a label is not a physical-completion witness.
+    pub fn diagnostic_kind(&self) -> &'static str {
+        match self {
+            Self::Evaluation(_) => "evaluation",
+            Self::NewGame => "new_game",
+            Self::ResetTo { .. } => "reset_to_game",
+            Self::Stats(_) => "stats",
+            Self::RuntimeVerified => "runtime_verified",
+            Self::CudaPlacementVerified(_) => "cuda_placement_verified",
+            Self::RuntimeMappingsObserved(_) => "runtime_mappings_observed",
+            #[cfg(feature = "experimental-io-binding")]
+            Self::CudaRecordPagesObserved(_) => "cuda_record_pages_observed",
+        }
+    }
+}
 
 /// NN-zero metadata observation from the exclusive physical worker. A full
 /// origin audit requires an already completed CUDA Run; it is not a kernel,

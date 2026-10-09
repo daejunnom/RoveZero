@@ -978,6 +978,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     loop {
         match reset.poll() {
             PhysicalPoll::Ready(Ok(PalsNativeResult::NewGame)) => break,
+            PhysicalPoll::Ready(Ok(PalsNativeResult::ResetTo { .. })) => {
+                return Err("legacy new game reset unexpectedly returned a target reset ACK".into())
+            }
             PhysicalPoll::Ready(Err(error)) => return Err(error.into()),
             PhysicalPoll::Ready(Ok(PalsNativeResult::Evaluation(_))) => {
                 return Err("cache reset unexpectedly returned a neural evaluation".into());
@@ -1021,6 +1024,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     PalsNativeResult::NewGame => {
                         return Err("evaluation unexpectedly returned a cache reset".into())
+                    }
+                    PalsNativeResult::ResetTo { .. } => {
+                        return Err("evaluation unexpectedly returned a target reset ACK".into())
                     }
                     PalsNativeResult::Stats(_) => {
                         return Err("evaluation unexpectedly returned native statistics".into())

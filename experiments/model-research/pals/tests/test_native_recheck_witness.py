@@ -282,6 +282,23 @@ class NativeRecheckBoundaryTests(unittest.TestCase):
         with self.assertRaises(witness.UnsupportedNativeRecheck):
             witness._reviewed_source_pair(pair)
 
+    def test_selected_identity_successor_preserves_prior_single_reply_review_and_rejects_drift(self):
+        old = {
+            witness._SOURCE_PATHS[0]: {
+                "bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"},
+            witness._SOURCE_PATHS[1]: {
+                "bytes": 220199, "sha256": "eea0654a5c11d6e0d69b5c5df71363a8e2d8f4fb7ad02cf5d766fb4b06ec456f"},
+        }
+        _, retained = witness._reviewed_source_pair(old)
+        self.assertEqual(retained, old)
+        _, successor = witness._reviewed_source_pair(REVIEWED_WHOLE_SOURCE_PINS)
+        self.assertEqual(successor, REVIEWED_WHOLE_SOURCE_PINS)
+        for path in witness._SOURCE_PATHS:
+            changed = copy.deepcopy(REVIEWED_WHOLE_SOURCE_PINS)
+            changed[path]["bytes"] += 1
+            with self.assertRaises(witness.UnsupportedNativeRecheck):
+                witness._reviewed_source_pair(changed)
+
     def test_unchecked_repair_anchor_cannot_be_constructed(self):
         with self.assertRaises(ValueError):
             witness.CheckedNativeRecheckRepairAnchor()
@@ -652,8 +669,8 @@ REVIEWED_WHOLE_SOURCE_PINS = {
         "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c",
     },
     "crates/rz-arena/src/pals_collect/native.rs": {
-        "bytes": 220199,
-        "sha256": "eea0654a5c11d6e0d69b5c5df71363a8e2d8f4fb7ad02cf5d766fb4b06ec456f",
+        "bytes": 221690,
+        "sha256": "8886c0e01d0c753fa0a1b5256e36f2230d41f5e561fca8ac7ae8f895b9e0813c",
     },
 }
 

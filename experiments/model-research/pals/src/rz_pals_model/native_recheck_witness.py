@@ -84,6 +84,15 @@ _REVIEWED_OPT_IN_SOURCE_PROFILES = (
         "crates/rz-search/src/pals/engine.rs": {'bytes': 355881, 'sha256': '32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c'},
         "crates/rz-arena/src/pals_collect/native.rs": {'bytes': 220199, 'sha256': 'eea0654a5c11d6e0d69b5c5df71363a8e2d8f4fb7ad02cf5d766fb4b06ec456f'},
     }),
+    # Reviewed same-line single-Reply successor only. The actual selected
+    # getters now derive their own closed tuple; the legacy tuple is identical.
+    # Continuation remains a separate registration/artifact rejected below.
+    ("opt_in_single_reply_selected_identity_8886c0e0", {
+        "crates/rz-search/src/pals/engine.rs": {
+            "bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"},
+        "crates/rz-arena/src/pals_collect/native.rs": {
+            "bytes": 221690, "sha256": "8886c0e01d0c753fa0a1b5256e36f2230d41f5e561fca8ac7ae8f895b9e0813c"},
+    }),
 )
 _POLICY = {
     "version": "pals-post-repair-recheck/1",

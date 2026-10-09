@@ -347,7 +347,7 @@ class NativeSlotRepairTests(unittest.TestCase):
             "crates/rz-search/src/pals/engine.rs": {
                 "bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"},
             "crates/rz-arena/src/pals_collect/native.rs": {
-                "bytes": 220199, "sha256": "eea0654a5c11d6e0d69b5c5df71363a8e2d8f4fb7ad02cf5d766fb4b06ec456f"},
+                "bytes": 221690, "sha256": "8886c0e01d0c753fa0a1b5256e36f2230d41f5e561fca8ac7ae8f895b9e0813c"},
         })
         self.assertEqual(admission["scope"], "conditional_unique_prepared_lineage")
         self.assertFalse(body["direct_causal_ids_present"])
@@ -446,12 +446,16 @@ class NativeSlotRepairTests(unittest.TestCase):
             {"bytes": 344097, "sha256": "0a0a4800e940700721ec856ab86c8d8dbb581f6291fd78976ce1f918ea5a40c3"},
             {"bytes": 193840, "sha256": "2c2bfb1c8717a68429d315fa576268ba95b9b6106caed57400b885f656d04ae7"})))
         self.assertEqual(slot_witness._reviewed_source_pair(earlier_replay), earlier_replay)
+        earlier_selection = dict(zip(slot_witness._SOURCE_PATHS, (
+            {"bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"},
+            {"bytes": 220199, "sha256": "eea0654a5c11d6e0d69b5c5df71363a8e2d8f4fb7ad02cf5d766fb4b06ec456f"})))
+        self.assertEqual(slot_witness._reviewed_source_pair(earlier_selection), earlier_selection)
         current = {path: semantic.byte_pin(value) for path, value in zip(slot_witness._SOURCE_PATHS,
             (self.fixture.engine_raw, self.fixture.native_raw))}
         self.assertEqual(current[slot_witness._SOURCE_PATHS[0]],
             {"bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"})
         self.assertEqual(current[slot_witness._SOURCE_PATHS[1]],
-            {"bytes": 220199, "sha256": "eea0654a5c11d6e0d69b5c5df71363a8e2d8f4fb7ad02cf5d766fb4b06ec456f"})
+            {"bytes": 221690, "sha256": "8886c0e01d0c753fa0a1b5256e36f2230d41f5e561fca8ac7ae8f895b9e0813c"})
         self.assertEqual(slot_witness._reviewed_source_pair(current), current)
         self.assertNotEqual(current, old)
 
