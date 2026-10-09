@@ -455,6 +455,23 @@ pub struct OwnedCheckerDescriptor {
     pub capabilities: CpuCapabilities,
 }
 
+impl OwnedCheckerDescriptor {
+    /// Full owned replay condition namespace. This is metadata, not result authority.
+    /// Keep byte-for-byte parity with the existing PALS producer condition format.
+    pub fn registered_replay_condition(&self) -> String {
+        format!(
+            "{};conditions={};profile={:?};q={};tt={};maxdepth={};capabilities={:?}",
+            self.search_identity,
+            self.search_conditions,
+            self.config.profile,
+            self.config.quiescence_ply,
+            self.config.tt_entries,
+            self.config.max_depth,
+            self.capabilities
+        )
+    }
+}
+
 pub struct OwnedCpuChecker<C: CpuSearcher> {
     cpu: C,
     identity: CheckerIdentity,

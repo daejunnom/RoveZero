@@ -12,8 +12,9 @@ use crate::pals_cpu_task::strategic_action::replay_inputs::{
 use rz_position::{BoardMove, PlayStatus, Position, PositionSnapshot};
 use rz_search::cpu::{
     CPU_MATE_THRESHOLD, CpuCompletion, CpuEngine, CpuError, CpuLimits, CpuReport, CpuScoreScope,
-    CpuWork,
+    CpuSearcher, CpuWork,
 };
+use rz_search::cpu_checker::OwnedCheckerDescriptor;
 use rz_search::pals::engine::replay::{
     FRESH_REPLAY_OPPONENT_SCOPE, FRESH_REPLAY_REPAIR_SCOPE, FRESH_REPLAY_SCOPE,
 };
@@ -276,6 +277,30 @@ fn stage_audit(stage: &IndependentRepairCpuStage) -> serde_json::Value {
         "pv":packed(&stage.report.pv).ok(),"value_identity":stage.report.value_identity})
 }
 
+fn owned_replay_condition(cpu: &CpuEngine) -> String {
+    OwnedCheckerDescriptor {
+        config: cpu.config().clone(),
+        search_identity: cpu.search_identity(),
+        search_conditions: cpu.search_conditions(),
+        capabilities: CpuSearcher::capabilities(cpu),
+    }
+    .registered_replay_condition()
+}
+
+fn declared_stage_conditions_match(
+    source: &super::PriorStage,
+    depth: u16,
+    node_budget: u64,
+    condition_sha: &[u8; 32],
+    task_sha: &[u8; 32],
+) -> bool {
+    source.complete()
+        && source.requested_depth == depth
+        && source.node_budget == node_budget
+        && source.registered_condition_sha256 == *condition_sha
+        && source.task_condition_sha256 == *task_sha
+}
+
 /// Revalidates the immutable original against independent pins and its original
 /// S/E/W, then runs each already reported CPU condition with a new empty engine.
 /// The source child score remains unknown; actual CPU facts have a separate scope.
@@ -424,7 +449,7 @@ pub fn observe_independent_repair_cpu_witness(
                 });
             }
         };
-        let condition = cpu.search_conditions();
+        let condition = owned_replay_condition(&cpu);
         let task_condition = if restricted {
             let encoded = match packed(&effective) {
                 Ok(encoded) => encoded,
@@ -448,12 +473,13 @@ pub fn observe_independent_repair_cpu_witness(
         };
         let condition_sha: [u8; 32] = Sha256::digest(condition.as_bytes()).into();
         let task_sha: [u8; 32] = Sha256::digest(task_condition.as_bytes()).into();
-        if !source.complete()
-            || source.requested_depth != depth
-            || source.node_budget != plan.nodes_per_check
-            || source.registered_condition_sha256 != condition_sha
-            || source.task_condition_sha256 != task_sha
-        {
+        if !declared_stage_conditions_match(
+            source,
+            depth,
+            plan.nodes_per_check,
+            &condition_sha,
+            &task_sha,
+        ) {
             let mut error = failure("condition", "reported phase/depth/node/condition differs");
             error.completed_stages = stages;
             return Err(error);
@@ -585,6 +611,95 @@ pub fn observe_independent_repair_cpu_witness(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rz_search::cpu::CpuConfig;
+
+    fn observed_baseline_stage(
+        condition_sha: [u8; 32],
+        task_sha: [u8; 32],
+    ) -> super::super::PriorStage {
+        super::super::PriorStage {
+            phase: Some(PriorPhase::Baseline),
+            requested_depth: 1,
+            node_budget: 4096,
+            exact_completed: true,
+            report_present: true,
+            completed_depth: Some(1),
+            completion: Some(super::super::PriorCompletion::DepthLimit),
+            completed_iteration: true,
+            reused_completed_depth: Some(0),
+            report_nodes: Some(2),
+            attempt_present: true,
+            observation_present: true,
+            registered_condition_sha256: condition_sha,
+            task_condition_sha256: task_sha,
+            ..Default::default()
+        }
+    }
+
+    fn observed_baseline_conditions() -> ([u8; 32], [u8; 32]) {
+        let cpu = CpuEngine::new(CpuConfig {
+            max_depth: 2,
+            quiescence_ply: 4,
+            tt_entries: 4096,
+            ..Default::default()
+        })
+        .unwrap();
+        let condition = owned_replay_condition(&cpu);
+        let task = format!(
+            "{condition};replay={FRESH_REPLAY_SCOPE};phase=baseline;question=AnalyzeRootMoves;prefix-plies=1;ordered-root-mask=0a39"
+        );
+        // Producer digests observed in the complete four-stage native report.
+        assert_eq!(
+            format!("{:x}", Sha256::digest(condition.as_bytes())),
+            "47becceb7400e1c81aa5681c21b977651b9f5331f05cf6159f4d6d20a36166b3"
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(task.as_bytes())),
+            "8022c0d6c871ad8231ff1045b3bf6c52a353080d7e04927613d29f98480d7467"
+        );
+        assert_ne!(
+            Sha256::digest(condition.as_bytes()),
+            Sha256::digest(cpu.search_conditions().as_bytes())
+        );
+        (
+            Sha256::digest(condition.as_bytes()).into(),
+            Sha256::digest(task.as_bytes()).into(),
+        )
+    }
+
+    #[test]
+    fn complete_owned_stage_uses_full_producer_condition_namespace() {
+        let (condition_sha, task_sha) = observed_baseline_conditions();
+        let stage = observed_baseline_stage(condition_sha, task_sha);
+        assert!(declared_stage_conditions_match(
+            &stage,
+            1,
+            4096,
+            &condition_sha,
+            &task_sha
+        ));
+    }
+
+    #[test]
+    fn owned_stage_still_refuses_depth_node_digest_and_completion_tampering() {
+        let (condition_sha, task_sha) = observed_baseline_conditions();
+        for axis in 0..6 {
+            let mut stage = observed_baseline_stage(condition_sha, task_sha);
+            match axis {
+                0 => stage.requested_depth = 2,
+                1 => stage.node_budget = 4097,
+                2 => stage.registered_condition_sha256[0] ^= 1,
+                3 => stage.task_condition_sha256[0] ^= 1,
+                4 => stage.exact_completed = false,
+                5 => stage.completed_depth = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                !declared_stage_conditions_match(&stage, 1, 4096, &condition_sha, &task_sha),
+                "tamper axis {axis}"
+            );
+        }
+    }
     #[test]
     fn cpu_witness_reservation_is_permanent_even_after_downstream_refusal() {
         let spent = AtomicBool::new(false);
