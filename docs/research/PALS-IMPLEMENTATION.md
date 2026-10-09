@@ -3454,7 +3454,7 @@ GPU 검증 보류·실제 학습 제외·로컬 heavy CPU 미실행을 유지한
 
 ### 원본 입력 전달 전 실제 loaded executable 관측
 
-원본 입력을 받는 Linux supervisor는 첫 stdin byte를 보내기 전에 자신이 소유하고 아직 reap하지 않은 실제 child PID의 `/proc/<pid>/exe`를 연다. 이 파일의 device/inode를 실행에 사용한 pinned executable FD와 비교한다. 경로·argv·자식 JSON의 자기 보고나 별도로 입력한 PID로 이를 대신하지 않는다. 열기·metadata·동일성 확인이 실패하면 원본 입력을 보내지 않고 기존 process-group drain·종료·pending custody 경로로 실패를 보존한다.
+원본 입력을 받는 Linux supervisor는 첫 stdin byte를 보내기 전에 자신이 소유하고 아직 reap하지 않은 실제 child PID의 `/proc/<pid>/exe`를 연다. 이 파일의 device/inode를 실행에 사용한 pinned executable FD와 비교한다. 경로·argv·자식 JSON의 자기 보고나 별도로 입력한 PID로 이를 대신하지 않는다. 열기·동일성의 미확정 관측은 아래 시작 단계의 원래 E 안에서 보류하며 확인 전 입력을 보내지 않는다. metadata 오류·내용 검증 거부나 끝내 확인되지 않은 동일성은 기존 process-group drain·종료·pending custody 경로로 실패를 보존한다.
 
 - 성공 관측 시각과 첫 실제 pipe write 후의 부모 관측 시각은 원래 S 기준으로만 저장한다. 첫 관측과 이후 매 write 직전에는 cancellation과 원래 E를 검사하며, OS 관측 시간이 길어졌다고 timer를 다시 시작하지 않는다. OS call을 preempt하는 hard-timeout 증거로 해석하지 않는다.
 - `OriginalLoadedImage`는 실제 `OriginalProcessOutput`을 빌리는 readonly 자료다. 성공 transport·동일 PID·launch→loaded-file 관측→첫 write→exit 관측 순서가 있어야 제공한다. 공개 생성자·Clone·serde가 없으며, legacy `rz-original-process-transport/1` JSON에는 새 private 관측을 추가하지 않는다. complete transport나 serialized timestamp만으로 이 borrow를 만들지 않는다.
@@ -3473,3 +3473,13 @@ GPU 검증 보류·실제 학습 제외·로컬 heavy CPU 미실행을 유지한
 - 단일 `ReportedRepairPriorMaterial`은 같은 capture의 내용 검증을 요구하고 이 작은 관측을 빌린다. 원래 raw body·입력·부모 시각·예약·실패 반환 조건을 유지한다. 바이너리 전체 buffer·모델/session·Rules graph를 추가 복제하지 않으며 기존 transport/1 및 native /3,/4 형식을 바꾸지 않는다.
 
 독립 인수는 구분한다. 작은 Linux actual-process 검사는 실제 cat executable의 올바른/틀린 SHA-256, cursor 보존, 읽기 credit 차감, 원래 입력 전 거부·0 byte 전송·완전 종료를 확인한다. 추가 supervisor 검사는 성공 callback 직후의 취소와 E 경과도 입력을 허용하지 않는지 확인한다. CPU 경계 검사는 read-credit overflow/부족과 검증 시각의 역순을 다룬다. 이 검사는 actual registered frozen 4N 모델/NN, runtime dependency, 지속적인 executable 동일성, hostile write·fork 격리, next Query episode/ledger·whole utility 또는 paired 대국의 증거가 아니다. 해당 native 인수와 실행 연결은 남기며 GPU 보류·학습 제외·로컬 heavy CPU 보류·Draft·goal active를 유지한다. 새 exact-head CPU CI는 게시 후 실제 로그로 별도 인수한다.
+
+### 동일성을 확인하기 전의 유한 시작 단계
+
+`5e0ebc7`의 CI [37893898805](https://github.com/daejunnom/RoveZero/actions/runs/37893898805)는 Linux 세 검사 실패와 나머지 세 job 성공으로 보존한다. 진단 메시지만 추가한 `b44ea69`의 CI [37895010893](https://github.com/daejunnom/RoveZero/actions/runs/37895010893)는 Linux 한 검사 실패와 나머지 세 job 성공이다. 두 번째 실패에서는 actual child의 `process.loaded_image_differs_from_pinned_file`, 0 byte 입력, 내용 verifier 미호출·read credit 미차감, group Gone·pending child 없음이 관측됐다. `spawn` 직후의 최초 불일치는 확인했지만 정확한 커널 원인이나 일시성은 이 로그만으로 확정하지 않는다.
+
+- 시작 관측은 같은 unreaped child의 기존 supervisor loop에 둔다. proc executable 열기 실패·파일 동일성 불일치 두 종류만 원래 E와 취소 안에서 보류한다. child를 다시 spawn하거나 새로운 대기 시계·예산을 만들지 않는다. pipe drain·출력·child 수·전체 W·종료 책임도 계속 검사한다.
+- **동일성 확인과 선택적 내용 검증이 모두 끝나기 전에는 write가 불가능하다.** 원래 E 만료·취소·조기 exit·지속 불일치는 입력 없이 종료하고 `process.loaded_image_not_confirmed_before_input` 및 마지막 보류 사유를 보존한다. metadata·비정규 파일·시계·관측 횟수 overflow는 즉시 실패한다. 내용 hash·크기·read-credit 검증 거부는 재시도하지 않는다.
+- 관측 횟수·보류 횟수·첫/마지막 보류 코드는 실제 process owner의 작은 private scalar로 보존하고 readonly getter로 제공한다. 성공 후 이전 보류 관측을 지우거나 성공 receipt의 오류로 바꾸지 않는다. legacy transport/1 JSON은 그대로 유지한다. 관측 횟수는 syscall의 hard-timeout·자식의 ready·NN 완료 증거가 아니다.
+
+실제 cat 입력 검사에 관측 횟수와 원래 입력 전 완료 조건을 연결하고, 직접 다른 executable을 확인하는 기존 거부 검사를 유지한다. 보류 대상이 metadata·내용 검증 오류로 넓어지지 않게 CPU 경계 검사도 추가한다. 이 source 수정의 정확한 CI는 게시 후 별도로 확인하며, 실제 frozen NN·next Query·utility·paired 인수는 계속 남긴다.
