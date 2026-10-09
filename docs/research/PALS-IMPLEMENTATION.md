@@ -11,6 +11,124 @@ Rust 제품의 실제 startup·역할 소비·취소·게임 수명·최종 증�
 export·frozen forward·dataset preparation을 구분한다. Python 준비 성공을 Rust 제품의
 실행 인수·학습·강도 결과로 승격하지 않는다.
 
+## 2026-10-10 현재 소스 인수 상태
+
+실제 optimizer 학습을 제외한 선택 구현·실행 인수는 완료됐다. 선택16행의 범위는
+[PALS 구현과 인수 기록](../PALS-IMPLEMENTATION.md#2026-10-10-현재-소스-인수-상태)을 따른다.
+이 절 뒤의 각 실패·보류·미완료 기록은 당시 source와 실행의 이력이다. 새 정상 실행으로
+과거 원문을 고치지 않으며, 미관측 범위를 성공으로 채우지 않는다.
+
+**소스·CI·등록 이미지.** 기존 제품 실행 source는
+`935519d8e2cf3ddb3fe25d52da8497700d7cf1a5`, 최종 consumer source는
+`cbaea3b8e92669adcdb4acefd1c6a71fe4d83524`다.
+[소스 CI 37973912091](https://github.com/daejunnom/RoveZero/actions/runs/37973912091)의
+Linux·Windows·CPU bindings·PALS model 네 job은 실제 성공했다. build536은 fmt,
+captured CPU witness4, pair example7, workspace all-targets/all-features Clippy 및 release
+build를 통과했고 등록 source265개를 빌드 전후와 실제 실행 감사에서 대조했다. 실행된
+consumer는7,949,896bytes/SHA-256
+`00884ce715e4353ee6c29f03fd0f2750ff887ae18cf403c1b29cb2c9c3933117`이다.
+최종 문서 tip의 별도 CI·검토와 실행 결과 재사용 확인은 외부 영수증/PR에 남긴다.
+
+**기존 source935의 실제 수집503·GPU508·대국514.** R5는 같은 continuation 안에서
+3Reply를 실제 소비한 두 사례를 인수했다. 전체94개 role 완료·전달·소비, backend NN188개
+(public94+private94), CPU8192nodes/32jobs를 각각 기록했다. strict frozen loader와
+current-view·분할/누출 소비를 확인했고89개 record는 holdout/value masked다. 두 게임은
+ply_limit으로 결과 unknown이며 관측되지 않은 WDL·ranking·utility target을 만들지 않았다.
+기능 인수는 `reports/pals/r5-current-source-503-final-acceptance.json`에 연결한다.
+
+GPU508은 source935/build492 제품의 beam4·정상 refine1이다. P13/C8, role21개의 물리
+완료·전달·탐색 소비, search NN42개(public21+private21)와 startup3개를 구분했다.
+CPU16task/521nodes, 준비13.306622초/go0.289842초, cgroup peak3,582,324,736bytes와
+OOM0을 관측했다. Repair stage8은 Repair NN 실행과 다르며 accepted Repair NN과
+supported Repair는0이다. reset ACK2회/generation3·최종 빈 bank·in-flight0·shutdown/
+buffer 해제·EOF/reap/group/unit 종료를 인수했다. 독립 보고는
+`runs/pals/gpu-product-full-refine-20261010-02/independent-observed-summary.json`,
+6,810bytes/SHA-256 `49d8b91f21ad9c0b0b70ed979ca5409bd90158e8e218eeeec0409ba45a581e05`다.
+과거 source2ad의4control/0round smoke는 영향 소스181개·이미지·빌드 조건 동일성으로
+source935에 재사용 확인했다. 이는508의 실제 정상1round와 다른 실행이다.
+
+R6 source935의 `pals-current-own-cpu-r-935-03`은 자체 CPU_R 상대의 흑백 교환2판/99ply,
+120초+1초, 표준 시작, process restart의 기능 pilot이다. 백 PALS76ply0-1과 흑 PALS23ply1-0은
+모두 Rules checkmate였으며 scored2/incomplete0·네 endpoint의 typed failed-go0을 확인했다.
+실제99개 raw clock의 before 연속성·ceil 벽시계 차감·적시 착수의1000ms increment와
+position/history/go/bestmove↔PGN 수순을 대조했고 오류0이었다. PGN의 반올림된 시간 주석만으로
+시계를 인수하지 않았다.
+
+NN4,620개(public2,310+private2,310)와 role 결과 소비2,310개는 다른 단위다. PALS 자체
+CPU_R 요청1,282/새 완료1,215/재사용 완료 소비2/완료 소비1,217, nodes633,189를 기록했다.
+partial iteration55/frontier 소비12/cache 값 소비279를 요청 깊이 완료나 새 작업에 더하지
+않았다. 두 PALS process 각각의 public/shared_pc ORT session2개와 양쪽 물리 shutdown,
+buffer 해제·in-flight0·quarantine false를 확인했다. root54.265초·exit0·reap·EOF·unit 종료,
+원래900초+정리30초를 인수했다. 전역 affinity0/2·memory.high6GiB/max12GiB/swap0는 관측했고,
+전체 memory peak·개별 endpoint peak·VRAM은 unknown이다. PGN은
+`runs/pals/pals-current-own-cpu-r-935-03/paired-recovered/paired-attempt-01/match.pgn`,
+5,647bytes/SHA-256 `b86d36a9cf248e51482c5df6bfc422679a9db26de2502d2488dcf491c8ca9826`이다.
+최종 기능 인수 `reports/pals/r6-final-acceptance-514-KO.json`은8,080bytes/SHA-256
+`1a57739c6d7e8643be036a19f1796d6e684c1cab45b57c2579e88d8817148b63`다. 미학습 PALS0/2를
+기력·Elo 판정으로 승격하지 않는다.
+
+**R2/R3 실제 Repair·독립 witness·다음 Query537.** ONE Query의 두 action 준비531은
+실제 Query factory1회·prepared2회·caller binding2회를 기록했다. 사전 Query는
+`7bccb44d065167c3df91ae2d47beb1d7d338afe53869aad5c6c4f68ca33c270a`다. 후속537은 이 입력과
+등록 모델10/CPU FP32/Fresh, N4096·4N source·8N 전체 예산을 사용했다. frozen source4-stage는
+4 CPU task/278nodes·NN28을 보고했고 독립 CPU4-stage/278nodes·캡처14입력 NN28의 실제
+완료를 확인했다. source child의 물리 작업 attestation은 false이고 source scalar 점수 일치는
+unknown/null이다. reported/source와 fresh independent scope를 합친 비용임을 명시한다.
+
+next Query는 `75ac23d290f0b7a978f2837a97ce06a019443b7584d0c0f2b8c040b30f777735`, prior ledger는
+`5c19de62204aa35da52001bd53e0da62329b7feb9945e44b90e311820109caa6`에서
+`bf118682e1525f2d1a6f6b15b4f0d0ec9640256fa38636ae9c546cc3e02d40dc`로 전이했다. 새 Query는
+source-bound evidence를 실제 소유하며 JSON capability 복원·Query2 action 의미의 재검증·
+product verifier 권한을 주장하지 않는다. 다음 coverage 선택은 Defer, 추가 V/NN/CPU0이다.
+원래 S→다음 선택 완료의 전체 비용1.539106541초/CPU556nodes/NN56, root2.047초/exit0·reap·
+EOF·unit 종료, 독립 physical in-flight0·shutdown/buffer 해제를 인수했다. 회수16파일/2,550,025bytes는
+모두 inventory hash와 일치했다. 원시 근거는 `reports/pals/r2-basic4n-537-recovered/`와
+`r2-basic4n-537-outer.json`이다.
+
+**R4 동일 process의 두 action538.** 같은 사전 Query/prior의 N4096/N2048을 nested typed
+owner로 묶되 각 original S/W와 독립 model owner를 보존했다. 각 W300초/정리 reserve30초,
+pair670초=2W+준비30초+비교10초+정리30초, root727초를 고정했다. 두 lane의 독립 witness는
+서로 다른 epoch/lease를 사용했고 각각14개 캡처 입력/NN28 완료와 in-flight0·shutdown/buffer
+해제를 확인했다. 양쪽 child exit0/group gone, root3.641초/exit0·reap·EOF·unit 종료/정리 오류0이다.
+
+왼쪽 전체 비용1.605115383초, 오른쪽1.325331493초이며 각 CPU556nodes/NN56이다.
+합CPU1112≤49152·NN112=한도112를 지켰다. 서로 다른 예산 상한이 실제 작업량 감소를 만든
+것으로 해석하지 않는다. 원래 백 관점에서 repair0/counter+16이라 조건부 counter-lower가
+성립하지 않았다. production의 `mask=preference.is_some()`에 따라 preference null/mask false,
+actual utility groups0·utility/target/training 권한 false를 보존했다. 시간 차이로 이 조건 실패를
+덮지 않았으며 positive Pareto·paper reward·learned V·기력·속도 향상은 주장하지 않는다.
+이는 실제 음성 비교·unknown 처리 인수다. source child scalar 일치와 physical attestation의
+한계도 그대로다.
+
+회수36파일/5,107,001bytes의 inventory와 source265개를 독립 대조했고 blocker0이었다.
+`reports/pals/final-audit-538.json`은18,897bytes/SHA-256
+`4dfee8b9de37df15ff1c7c2076654a620b5e450cfd229621ea4d259fa629d957`, 상태는
+`PASS_MASKED_OBSERVATION`이다. 원시 pair acceptance/conditional cost와 양쪽 witness/closure는
+`reports/pals/r4-pair-538-recovered/`에 보존했다.
+
+**수정·재사용·보존.** 532의 full4-stage 부분 성공 뒤 independent witness가 거부된 원인은
+producer의 full OWNED descriptor와 consumer의 bare search_conditions 대조 오류였다.
+consumer에 실제 descriptor 전체 조건을 연결하고 positive 및6축 tamper 검사로 보완했다.
+조건·완료·깊이·예산 검사를 약화하지 않았다. 935→cbaea3b의 변경은 pair example, 추가 CPU
+descriptor 메서드, 독립 witness의 세 파일이다. producer engine/sourceExpected7·모델·Rules·
+runtime·제품 UCI 경로·Cargo·workflow는 유지됐다. source935의 수집/GPU/대국을 cbaea3b의
+새 물리 실행으로 표시하지 않는다. selected-source 재사용 근거
+`reports/pals/final-selected-reuse-539.json`은4,843bytes/SHA-256
+`ec930882c0b548912d092119f1ecfe39d545dd0902465df5b8c5c86ff6b33b5b`다.
+
+524~527의 cwd/profile/store/runtime-root pre-NN 거부, 528의 prefix 불일치·Repair not ready,
+532의 consumer 거부와534/535의 검사 실패는 원문 그대로다. 534의 잘못된 test filter0개를
+witness4개 PASS로 세지 않았다. 진단 뒤 고른 b2b4/b8a6 사례530/531은 기존 result-free
+등록517/522와 구분하며 넓은 성능·기력 일반화의 근거로 쓰지 않는다. cleanup529는 Linux와
+Windows의 비활성 private 사본을 각각6개/122,609,586bytes, 합245,219,172bytes 논리 반환하고
+원본 공유 자산·CAS·PGN·로그·negative 보고서를 보존했다. VHD 물리 축소 주장은 없다.
+
+선택된 비학습 구현·정상 실행·음성 비교는 인수했으며 실제 optimizer 학습은0이다.
+GPU508의 Repair NN0, 미실행 full native quarantine fault·개별 GPU late-completion trace,
+unknown VRAM peak·물리 parameter sharing·source scalar 일치를 보존한다. CUDA private
+Warm·추가 pruning·대체 optimizer·실제 학습과 대규모 강도 평가는 후속 범위다. 미학습 모델의
+준비·기능 인수를 학습 완료·경쟁력·성능 개선으로 바꾸지 않는다.
+
 ## 2026-10-09 병렬 재개 감사 기준
 
 이 절의 기준 소스는 `b6de5325d47a417461823f4a92329287c0e5af09`다. 사용자는 학습

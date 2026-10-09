@@ -5,6 +5,72 @@
 실제 실행 승인으로 확대하지 않는다. 이번 목표는 **실제 학습을 제외한 구현**이며,
 기반 언어는 Rust다. 기존 Rules·PUCT·LC0 모델 경로와 과거 V1/V2 기록은 보존한다.
 
+## 2026-10-10 현재 소스 인수 상태
+
+실제 optimizer 학습을 제외한 선택 구현과 실행 인수를 마쳤다. 기존 제품 실행의 소스는
+`935519d8e2cf3ddb3fe25d52da8497700d7cf1a5`, 마지막 consumer 수정 소스는
+`cbaea3b8e92669adcdb4acefd1c6a71fe4d83524`다. 두 소스의 실행을 구분하며, 이후 문서
+커밋을 새 모델 실행으로 표시하지 않는다. 아래 날짜 이후의 상태가 이 문서 뒤에 보존한
+과거 미완료·보류 기록을 보완한다. 실패 원문이나 당시 인수 범위는 수정하지 않는다.
+
+[소스 CI 37973912091](https://github.com/daejunnom/RoveZero/actions/runs/37973912091)의
+Linux·Windows·CPU bindings·PALS model 네 job이 모두 성공했다. 로컬 build536은 fmt,
+독립 witness 4개, pair example 7개, workspace 전체 feature/target Clippy, release build를
+통과했다. 등록 consumer `00884ce715e4353ee6c29f03fd0f2750ff887ae18cf403c1b29cb2c9c3933117`로
+Repair 이후 Query 전이537과 동일 process의 두 action538을 각각 실제 실행했다.
+최종 문서 tip의 검사·CI와 source 재사용 확인은 PR과 외부 인수 영수증에 별도로 기록한다.
+상세 계수와 한계는 [현재 실행 인수 기록](research/PALS-IMPLEMENTATION.md#2026-10-10-현재-소스-인수-상태)에 둔다.
+
+선택16행은 두 원문을 대조한 구현 범위이며 원문의 번호 목록을 대체하지 않는다.
+학습 제외는 데이터 계약·strict replay·분할/누출 검사·zero-step checkpoint/resume와
+V-free export 준비를 제외한다는 뜻이 아니다.
+
+| ID | 선택된 원문 요구 | 완료한 구현·인수 범위 |
+|---|---|---|
+| P0-01 | Rules·typed authority·제품 탐색 교체 | CPU CI, Rules/제품 경계, R6 UCI 기능 인수 |
+| P0-02 | V3 manifest/lock/receipt·V1/V2 보존 | 등록 build492, locked pair/Core·기존 codec 보존 |
+| P1-01 | 자체 PVS·qsearch·TT·취소·조건부 resume | CPU CI, 자체 CPU_R 대국, R2 네 stage의 독립 재실행 |
+| P1-02 | SEE ordering·profile/value/resume namespace | 명시적 선택·기본값 보존 및 조건/namespace 검사; 기력 효과 미주장 |
+| P2-01 | 제한 후보 best-first·합법 prefix·quiet 응수·Repair | R5 수집503, GPU 정상 round508, R2 완료 Repair537/538 |
+| P2-02 | 불변 관측·판정 revision·착수 초점·표현/사실 수명 | current-view, reset/drain, 과거 controls의 영향 소스 재사용 및 R6 종료 |
+| P2-03 | Repair 뒤 동일 첫 수·actual C continuation | R5 동일 continuation의 3Reply 두 사례와 독립 R2 endpoint 재실행 |
+| P3-01 | 384/GQA6:2/latent16/reader2×2·private expert·V-free | 모델 CPU CI, 독립 수치 기록, 실제 CPU NN와 GPU P/C 정상 실행 |
+| P3-02 | missing subset/device join·pin/evict·예약·물리 수명 | numeric/resident 인수, GPU508 정상 종료·과거 controls 재사용; fault 미실행 범위 유지 |
+| P4-01 | 당시 입력/후속 label·causal current-view·split/leak | strict frozen loader 인수, 89개 holdout/value masked, 미관측 WDL target 미부여 |
+| P4-02 | 후보 비교·divergence/whole-line 감독·unknown mask | 소스·CPU 검사와 masked 데이터 소비; 관측 없는 정답 미부여 |
+| P4-03 | finite zero-step recipe·RNG/sampler·checkpoint/resume·export | 모델 준비·재현 검사; 실제 optimizer 학습 0 |
+| P5-01 | V-private Query·CPU action·환류·episode/prior ledger | ONE Query/two-action 준비531, 실제 next Query·ledger537/538, 다음 선택 Defer |
+| P5-02 | 원래 전체 causal 비용·동일 문제/witness utility·private/public | 실제 whole-cost537/538, 조건부 비교의 음성 결과와 null/masked 보존 |
+| P6-01 | 같은 시작·흑백 교환·동일 clock/resource·process restart | R6 두 판/99ply·120+1·흑백 교환·Rules/시계/PGN 기능 인수 |
+| P6-02 | 실패·NN 완료/소비 구분·Core/final bytes·EOF/reap/cleanup | R6 네 failed-go 0, NN4620/role소비2310, 두 PALS drain·group/unit 종료와 회수 |
+
+537의 비용 범위는 원래 S부터 다음 선택 완료까지 1.539106541초다. CPU556 nodes·NN56은
+source 보고278/28과 독립 재실행278/28을 합친 명시적 범위다. source child의 물리 작업
+attestation은 false, source scalar 일치는 unknown이다. 독립 캡처14개/NN28의 완료와
+shutdown은 확인했다. 다음 Query·prior ledger는 실제 새 소유자를 통해 발급했으며 JSON을
+live capability로 복원하지 않았다. 다음 선택 Defer를 neural V 선택이나 전략적 증명으로
+보고하지 않는다.
+
+538은 같은 사전 Query의 N4096/N2048 action을 독립 소유자와 원래 시계로 실행했다.
+각 CPU556/NN56, 전체 비용1.605115383초/1.325331493초를 기록했다. 루트 백 관점에서
+repair0/counter+16이므로 필요한 조건부 counter-lower가 성립하지 않았다. 시간 차이로
+이를 덮지 않고 preference null, known-label mask false, utility/target/training 권한 false를
+유지했다. 이는 실제 음성 결과 처리 인수이며 positive utility나 속도 개선의 증거가 아니다.
+
+Frozen 자산은 미학습 모델이다. 실제 학습·강도·Elo·성능 개선을 주장하지 않는다. R6의
+PALS0/2는 기능 pilot 결과다. GPU508에서 Repair NN은0이며, 개별 GPU late-completion
+trace·full native quarantine fault는 미실행, VRAM peak·native parameter storage의 물리
+공유와 source child scalar 일치는 unknown이다. 선택적 CUDA Warm·추가 pruning·대체
+optimizer와 실제 학습은 후속 범위다. 5% 의미 보존 회귀 문턱을 PALS 도입 조건으로 쓰지 않는다.
+
+과거 실패487/496/499/504/509 및 R2 516/524~528/532, 검사534/535의 원문을 보존했다.
+진단 후 선택한 새 b2b4/b8a6 사례는 기존 result-free 등록517/522와 구분한다. 532에서 발견한
+full OWNED CPU 조건과 bare search_conditions 대조 오류는 consumer만 수정했다. producer
+engine/sourceExpected7·모델·원래 Query·예산은 유지했다. 935→cbaea3b의 변경은 pair example,
+추가 descriptor 메서드, 독립 witness 세 파일이며 기존 제품 실행 경로의 결과를 새 GPU
+실행으로 표시하지 않는다. cleanup529는 비활성 private 사본을 Linux/Windows에서 합
+245,219,172bytes 논리 반환하고 공유 자산·PGN·로그·실패 자료를 보존했다. VHD 물리 축소량은 아니다.
+
 ## 실행 경계
 
 UCI 아래에서 PUCT, PALS, 자체 CPU 탐색을 선택한다. PALS는 P의 수순 제안,
