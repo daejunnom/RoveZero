@@ -401,6 +401,26 @@ pub trait CpuChecker: Send {
     fn owned_descriptor(&self) -> Option<OwnedCheckerDescriptor> {
         None
     }
+    /// Actual immutable owned resume selection; external declarations expose
+    /// no native stack policy or native token ownership.
+    fn owned_resume_policy(&self) -> Option<crate::cpu::CpuResumePolicy> {
+        None
+    }
+    /// Read-only liveness check. This cannot resume, consume, recharge or pin a
+    /// foreign/native token merely because its metadata has a similar shape.
+    fn token_is_current(&self, _token: &CpuResumeToken) -> bool {
+        false
+    }
+    /// Explicit native-owner capability. External implementations keep false:
+    /// disposing an own CPU checkpoint never drains or cancels foreign work.
+    fn supports_paused_stack_discard(&self) -> bool {
+        false
+    }
+    /// Dispose only the native owner's paused frames, without resetting its
+    /// attempt ledger, TT, ordering history, or any physical backend lease.
+    fn discard_paused_stack(&mut self) -> bool {
+        false
+    }
     fn last_attempt(&self) -> Option<&CheckerAttempt>;
     /// Start a new ledger scope even for unsupported/admission failures.
     /// Previous execution work is not this new attempt's actual work.
@@ -629,6 +649,18 @@ impl<C: CpuSearcher> CpuChecker for OwnedCpuChecker<C> {
             search_conditions: self.cpu.search_conditions(),
             capabilities: self.cpu.capabilities(),
         })
+    }
+    fn owned_resume_policy(&self) -> Option<crate::cpu::CpuResumePolicy> {
+        Some(self.cpu.resume_policy())
+    }
+    fn token_is_current(&self, token: &CpuResumeToken) -> bool {
+        self.cpu.token_is_current(token)
+    }
+    fn supports_paused_stack_discard(&self) -> bool {
+        self.cpu.supports_paused_stack_discard()
+    }
+    fn discard_paused_stack(&mut self) -> bool {
+        self.cpu.discard_paused_stack()
     }
     fn last_attempt(&self) -> Option<&CheckerAttempt> {
         self.last_attempt.as_ref()

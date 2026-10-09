@@ -692,9 +692,11 @@ impl Frame {
                 Ok(Action::Push(child))
             }
             Stage::Await(active) => {
-                let child = returned.take().ok_or_else(|| {
-                    Abort::Error(CpuError::ResumeMismatch("missing completed child frame"))
-                })?;
+                let child = returned
+                    .take()
+                    .ok_or(Abort::Error(CpuError::ResumeMismatch(
+                        "missing completed child frame",
+                    )))?;
                 let score = -child.score;
                 if active.phase == ChildPhase::Scout && score > self.alpha && score < self.beta {
                     active.phase = ChildPhase::Full;
@@ -1182,6 +1184,54 @@ mod tests {
                 _ => panic!("TT completion changed across pause intervals"),
             }
         }
+    }
+
+    #[test]
+    fn disposing_a_paused_owner_preserves_tt_history_and_observed_work() {
+        let position = Position::from_fen("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1").unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut engine = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 64);
+        let completed = engine.analyze(&position, limits(100_000), &cancel).unwrap();
+        assert_eq!(completed.completion, CpuCompletion::DepthLimit);
+        assert!(engine.tt.iter().any(Option::is_some));
+        assert!(
+            engine
+                .history
+                .iter()
+                .flatten()
+                .flatten()
+                .any(|value| *value != 0)
+        );
+        let partial = engine
+            .analyze(
+                &position,
+                CpuLimits {
+                    max_depth: 3,
+                    ..limits(1)
+                },
+                &cancel,
+            )
+            .unwrap();
+        let token = partial.resume.unwrap();
+        let work = engine.last_attempt_work();
+        let mut unchanged = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 64);
+        unchanged.tt = engine.tt.clone();
+        unchanged.history = engine.history.clone();
+        assert!(engine.token_is_current(&token));
+        assert!(engine.supports_paused_stack_discard());
+        assert!(engine.discard_paused_stack());
+        assert!(!engine.token_is_current(&token));
+        assert!(engine.paused_stack_bytes().is_none());
+        assert_eq!(engine.last_attempt_work(), work);
+        compare_tt_and_history(&engine, &unchanged);
+        assert!(!engine.discard_paused_stack());
+        assert_eq!(engine.last_attempt_work(), work);
+        compare_tt_and_history(&engine, &unchanged);
+        assert!(matches!(
+            engine.resume(&position, &token, limits(1), &cancel),
+            Err(CpuError::ResumeMismatch(_))
+        ));
+        assert_eq!(engine.last_attempt_work().unwrap().nodes, 0);
     }
 
     #[test]

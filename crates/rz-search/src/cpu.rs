@@ -387,6 +387,18 @@ pub trait CpuSearcher: Send {
     fn token_is_current(&self, _token: &CpuResumeToken) -> bool {
         false
     }
+    /// Explicit support for disposing only this owner's paused traversal.
+    /// Custom PausedStack owners must opt in; default false is not proof that
+    /// they have no retained frames.
+    fn supports_paused_stack_discard(&self) -> bool {
+        false
+    }
+    /// Invalidate the live paused traversal, preserving TT, ordering history,
+    /// and the last observed work. Returns true only when frames were dropped.
+    /// This is not a new search attempt or a new-game reset.
+    fn discard_paused_stack(&mut self) -> bool {
+        false
+    }
     /// None means work was not observed. Never substitute invented zero work.
     /// The default preserves unknown accounting for custom implementations.
     fn last_attempt_work(&self) -> Option<CpuWork> {
@@ -452,6 +464,12 @@ impl<C: CpuSearcher + ?Sized> CpuSearcher for Box<C> {
     }
     fn token_is_current(&self, token: &CpuResumeToken) -> bool {
         (**self).token_is_current(token)
+    }
+    fn supports_paused_stack_discard(&self) -> bool {
+        (**self).supports_paused_stack_discard()
+    }
+    fn discard_paused_stack(&mut self) -> bool {
+        (**self).discard_paused_stack()
     }
     fn last_attempt_work(&self) -> Option<CpuWork> {
         (**self).last_attempt_work()
@@ -528,6 +546,12 @@ impl CpuSearcher for CpuEngine {
     }
     fn token_is_current(&self, token: &CpuResumeToken) -> bool {
         CpuEngine::token_is_current(self, token)
+    }
+    fn supports_paused_stack_discard(&self) -> bool {
+        CpuEngine::supports_paused_stack_discard(self)
+    }
+    fn discard_paused_stack(&mut self) -> bool {
+        CpuEngine::discard_paused_stack(self)
     }
     fn last_attempt_work(&self) -> Option<CpuWork> {
         CpuEngine::last_attempt_work(self)
@@ -725,6 +749,18 @@ impl CpuEngine {
             && token.value_identity == *self.value_identity
             && self.evaluator.identity() == self.value_identity.as_ref()
             && token.search_conditions == self.search_conditions()
+    }
+
+    pub fn supports_paused_stack_discard(&self) -> bool {
+        true
+    }
+
+    /// Drop only the actual paused traversal and its one-use token owner. TT,
+    /// ordering history, and the measured last attempt remain available.
+    pub fn discard_paused_stack(&mut self) -> bool {
+        let retained = self.paused.is_some();
+        self.invalidate_paused_stack();
+        retained
     }
 
     /// Full immutable value namespace used by this engine's TT and resume.

@@ -5,9 +5,10 @@
 pub mod replay;
 
 use super::store::{
-    BoundKind, ContinuationConclusion, EvidenceScope, ExecutionId, LineId, Move16, Observation,
-    ObservationId, ObservationKind, PalsStores, RawScore, SituationId, StateId, StoreError,
-    StoreLimits, TaskAdmission, TaskConsumer, TaskKey, TaskQuestion, TaskRecord, TaskStatus,
+    BoundKind, ContinuationConclusion, ContinuationStatus, EvidenceScope, ExecutionId, LineId,
+    Move16, Observation, ObservationId, ObservationKind, PalsStores, RawScore, SituationId,
+    StateId, StoreError, StoreLimits, TaskAdmission, TaskConsumer, TaskKey, TaskQuestion,
+    TaskRecord, TaskStatus,
 };
 use super::value::MODEL_WDL_RESOLVER_VERSION;
 pub use super::value::{
@@ -30,7 +31,13 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+mod archive_lifecycle;
+mod cpu_lifecycle;
+mod frozen_recheck;
+
 pub const PALS_SEARCH_VERSION: &str = "pals-restricted-refinement/0.1";
+pub const PALS_FOLLOWUP_SEARCH_VERSION: &str = "rovezero.pals-full-line-v2/0.2";
+pub const PALS_FOLLOWUP_CONDITIONS: &str = "explicit-independent-checker-resolver;restricted-candidate-refinement;Rules-own-legality-terminal;typed-model-profile-encoding;shared-role-cpu-store-deadline-cancel-limits;optional-repair-queue-paused-stack-CUDA-Warm-disabled-unless-declared;no-global-five-percent-gate";
 
 /// Opt-in search semantics; this does not change a model or the value resolver.
 pub const POST_REPAIR_RECHECK_SEARCH_VERSION: &str =
@@ -43,6 +50,87 @@ pub const POST_REPAIR_CONTINUATION_SEARCH_VERSION: &str =
 pub const POST_REPAIR_CONTINUATION_CONDITIONS: &str = "accepted-repair-and-completed-own-evidence;unchanged-first-move;first-opponent-anchor-after-changed-own-response;prefer-unexamined-different-legal-response;C-Reply-at-each-actual-counter-prefix;no-repaired-suffix-splice;counterline-bounded-by-repaired-line-length;equal-line-length;equal-completed-CPU-depth-and-namespace-or-both-Rules-terminals;mixed-scope-unresolved;conditional-refutation-only;shared-global-role-cpu-store-deadline-cancel-limits;no-recursive-repair";
 /// Observer provenance domain, independent of the policy-selection marker.
 pub const POST_REPAIR_RECHECK_OBSERVER_VERSION: &str = "pals-post-repair-recheck-observer/1";
+pub const POST_REPAIR_FROZEN_WDL_SEARCH_VERSION: &str = "post-repair-frozen-wdl-v2";
+pub const POST_REPAIR_FROZEN_WDL_QUEUE_SEARCH_VERSION: &str = "post-repair-frozen-wdl-queue-v2";
+pub const POST_REPAIR_FROZEN_WDL_CONDITIONS: &str = "accepted-repair;unchanged-first-move;C-at-each-actual-counter-prefix;equal-line-length;Fresh-same-frozen-model-precision-context-revision-WDL-or-both-Rules-terminal;immutable-raw-context-revision-pair;mixed-scope-unresolved;strict-value-decrease;conditional-refutation-only;shared-role-cpu-store-deadline-cancel-limits";
+pub const POST_REPAIR_FROZEN_WDL_QUEUE_CONDITIONS: &str = "accepted-repair;unchanged-first-move;C-at-each-actual-counter-prefix;equal-line-length;Fresh-same-frozen-model-precision-context-revision-WDL-or-both-Rules-terminal;immutable-raw-context-revision-pair;mixed-scope-unresolved;strict-value-decrease;conditional-refutation-only;shared-role-cpu-store-deadline-cancel-limits;pending-at-most-64;Repair-at-most-3-per-first-move;deduplicate-question-revision;stop-without-new-evidence;fresh-counter-to-new-Repair-strict-improvement;supersede-active-refutation-with-paired-evidence";
+
+/// Checker selection controls CPU discovery only. Value resolution is an
+/// independent startup policy; foreign CP/mate reports never become own raw.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolverPolicy {
+    OwnRawRestricted,
+    ModelWdlRestricted,
+}
+impl ResolverPolicy {
+    pub fn version(self) -> &'static str {
+        match self {
+            Self::OwnRawRestricted => PALS_VALUE_RESOLVER_VERSION,
+            Self::ModelWdlRestricted => MODEL_WDL_RESOLVER_VERSION,
+        }
+    }
+    /// The actual registered numeric contract, separate from source provenance.
+    pub fn semantics_sha256(self) -> [u8; 32] {
+        Sha256::digest(match self {
+            Self::OwnRawRestricted => PALS_VALUE_RESOLVER_SEMANTICS.as_bytes(),
+            Self::ModelWdlRestricted => super::value::MODEL_WDL_RESOLVER_SEMANTICS.as_bytes(),
+        })
+        .into()
+    }
+}
+
+/// Compiled source provenance. The domain, logical path and byte length frame
+/// each source; these pins never replace a binary/feature or semantic identity.
+pub fn compiled_search_implementation_sha256() -> [u8; 32] {
+    compiled_component_digest(
+        b"rz-pals-search-implementation-sources/1",
+        &[
+            ("pals/engine.rs", include_str!("engine.rs")),
+            (
+                "pals/engine/frozen_recheck.rs",
+                include_str!("engine/frozen_recheck.rs"),
+            ),
+            (
+                "pals/engine/archive_lifecycle.rs",
+                include_str!("engine/archive_lifecycle.rs"),
+            ),
+            (
+                "pals/engine/cpu_lifecycle.rs",
+                include_str!("engine/cpu_lifecycle.rs"),
+            ),
+            ("pals/store.rs", include_str!("store.rs")),
+            ("pals/store/hot.rs", include_str!("store/hot.rs")),
+            ("pals/store/archive.rs", include_str!("store/archive.rs")),
+            (
+                "pals/store/archive/codec.rs",
+                include_str!("store/archive/codec.rs"),
+            ),
+        ],
+    )
+}
+
+pub fn compiled_resolver_implementation_sha256() -> [u8; 32] {
+    compiled_component_digest(
+        b"rz-pals-resolver-implementation-sources/1",
+        &[
+            ("pals/engine.rs", include_str!("engine.rs")),
+            ("pals/value.rs", include_str!("value.rs")),
+        ],
+    )
+}
+
+fn compiled_component_digest(domain: &[u8], sources: &[(&str, &str)]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    for bytes in std::iter::once(domain).chain(
+        sources
+            .iter()
+            .flat_map(|(name, source)| [name.as_bytes(), source.as_bytes()]),
+    ) {
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+    hash.finalize().into()
+}
 
 /// Immutable startup selection. Omission retains the historical search lane.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -51,6 +139,8 @@ pub enum PostRepairRecheckPolicy {
     Disabled,
     SameRepairedLineOnceV1,
     ActualOpponentContinuationV1,
+    FrozenModelWdlV2,
+    IterativeFrozenModelWdlV2,
 }
 impl PostRepairRecheckPolicy {
     pub fn search_identity(self) -> &'static str {
@@ -58,6 +148,8 @@ impl PostRepairRecheckPolicy {
             Self::Disabled => PALS_SEARCH_VERSION,
             Self::SameRepairedLineOnceV1 => POST_REPAIR_RECHECK_SEARCH_VERSION,
             Self::ActualOpponentContinuationV1 => POST_REPAIR_CONTINUATION_SEARCH_VERSION,
+            Self::FrozenModelWdlV2 => POST_REPAIR_FROZEN_WDL_SEARCH_VERSION,
+            Self::IterativeFrozenModelWdlV2 => POST_REPAIR_FROZEN_WDL_QUEUE_SEARCH_VERSION,
         }
     }
     pub fn conditions(self) -> Option<&'static str> {
@@ -65,6 +157,8 @@ impl PostRepairRecheckPolicy {
             Self::Disabled => None,
             Self::SameRepairedLineOnceV1 => Some(POST_REPAIR_RECHECK_CONDITIONS),
             Self::ActualOpponentContinuationV1 => Some(POST_REPAIR_CONTINUATION_CONDITIONS),
+            Self::FrozenModelWdlV2 => Some(POST_REPAIR_FROZEN_WDL_CONDITIONS),
+            Self::IterativeFrozenModelWdlV2 => Some(POST_REPAIR_FROZEN_WDL_QUEUE_CONDITIONS),
         }
     }
     pub fn registration_version(self) -> Option<&'static str> {
@@ -72,6 +166,8 @@ impl PostRepairRecheckPolicy {
             Self::Disabled => None,
             Self::SameRepairedLineOnceV1 => Some("pals-post-repair-recheck/1"),
             Self::ActualOpponentContinuationV1 => Some("pals-post-repair-continuation/1"),
+            Self::FrozenModelWdlV2 => Some("post-repair-frozen-wdl-v2"),
+            Self::IterativeFrozenModelWdlV2 => Some("post-repair-frozen-wdl-queue-v2"),
         }
     }
     pub fn registration_policy(self) -> Option<&'static str> {
@@ -79,7 +175,15 @@ impl PostRepairRecheckPolicy {
             Self::Disabled => None,
             Self::SameRepairedLineOnceV1 => Some("same_repaired_line_once_v1"),
             Self::ActualOpponentContinuationV1 => Some("actual_opponent_continuation_v1"),
+            Self::FrozenModelWdlV2 => Some("frozen_model_wdl_v2"),
+            Self::IterativeFrozenModelWdlV2 => Some("iterative_frozen_model_wdl_v2"),
         }
+    }
+    pub fn uses_frozen_model_wdl(self) -> bool {
+        matches!(
+            self,
+            Self::FrozenModelWdlV2 | Self::IterativeFrozenModelWdlV2
+        )
     }
 }
 
@@ -195,6 +299,10 @@ pub enum RecordKind {
 #[derive(Clone, Debug)]
 pub struct RoleRecord {
     pub revision: u64,
+    /// Actual public-record relationships, projected to local references by V2.
+    /// Revisions are metadata only and are never numerical model features.
+    pub parent_revision: Option<u64>,
+    pub supersedes_revision: Option<u64>,
     /// Anchor of this relative continuation; old-root facts retain provenance.
     pub origin_state: StateId,
     pub kind: RecordKind,
@@ -287,6 +395,12 @@ pub enum RecheckEndpointEvidence<'a> {
         observation: &'a Observation,
         task: &'a TaskRecord,
         admitted_scope: CpuScoreScope,
+    },
+    ModelWdl {
+        observation_id: ObservationId,
+        observation: &'a Observation,
+        output: &'a ModelValueOutput,
+        context_revision: u64,
     },
     RulesTerminal {
         reason: TerminalReason,
@@ -775,6 +889,12 @@ pub struct PalsCounters {
     /// This is observation coverage, never a claim that every branch is solved.
     pub root_scope_observation_complete: bool,
     pub unknown_root_children: usize,
+    pub repair_queue_enqueued: u64,
+    pub repair_queue_deduplicated: u64,
+    pub repair_queue_without_new_evidence: u64,
+    pub repair_queue_peak: usize,
+    pub frozen_wdl_comparisons: u64,
+    pub frozen_wdl_unresolved: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PalsCompletion {
@@ -888,6 +1008,8 @@ struct Node {
     edges: Vec<Edge>,
     evidence: Option<CpuEvidence>,
     model_value: Option<ModelValueOutput>,
+    model_observation: Option<ObservationId>,
+    model_value_revision: Option<u64>,
     resume: Option<CpuResumeToken>,
 }
 #[derive(Clone, Debug)]
@@ -972,6 +1094,8 @@ impl Default for RecheckProgress {
 /// `new_game` is the only automatic game-wide invalidation boundary.
 pub struct PalsEngine<M: RoleModel> {
     config: PalsConfig,
+    resolver: ResolverPolicy,
+    followup_lane: bool,
     post_repair_recheck: PostRepairRecheckPolicy,
     model: M,
     cpu: Box<dyn CpuChecker>,
@@ -993,6 +1117,11 @@ pub struct PalsEngine<M: RoleModel> {
     consumer_id: u64,
     last_search_counters: Option<PalsCounters>,
     last_recheck_observer_error: Option<RoleError>,
+    last_cpu_checkpoint_cleanup_error: Option<PalsError>,
+    repair_queue: std::collections::VecDeque<frozen_recheck::RepairWork>,
+    repair_questions: HashSet<(BoardMove, u64, Vec<BoardMove>)>,
+    repair_counts: std::collections::HashMap<BoardMove, u8>,
+    archive_state: archive_lifecycle::EngineArchiveLifecycle,
 }
 impl<M: RoleModel> PalsEngine<M> {
     pub fn new(config: PalsConfig, model: M, cpu: CpuEngine) -> Result<Self, PalsError> {
@@ -1063,9 +1192,32 @@ impl<M: RoleModel> PalsEngine<M> {
         cpu: Box<dyn CpuChecker>,
         policy: PostRepairRecheckPolicy,
     ) -> Result<Self, PalsError> {
+        let resolver = if matches!(cpu.identity(), CheckerIdentity::ExternalUci(_)) {
+            ResolverPolicy::ModelWdlRestricted
+        } else {
+            ResolverPolicy::OwnRawRestricted
+        };
+        let mut engine =
+            Self::new_with_boxed_checker_and_policies(config, model, cpu, resolver, policy)?;
+        engine.followup_lane = false;
+        Ok(engine)
+    }
+    pub fn new_with_boxed_checker_and_policies(
+        config: PalsConfig,
+        model: M,
+        cpu: Box<dyn CpuChecker>,
+        resolver: ResolverPolicy,
+        policy: PostRepairRecheckPolicy,
+    ) -> Result<Self, PalsError> {
         config.validate()?;
         cpu.identity().validate()?;
+        if resolver == ResolverPolicy::OwnRawRestricted
+            && matches!(cpu.identity(), CheckerIdentity::ExternalUci(_))
+        {
+            return Err(CpuError::Unsupported("foreign checker with own raw resolver").into());
+        }
         if policy != PostRepairRecheckPolicy::Disabled
+            && !policy.uses_frozen_model_wdl()
             && matches!(cpu.identity(), CheckerIdentity::ExternalUci(_))
         {
             return Err(CpuError::Unsupported(
@@ -1130,6 +1282,22 @@ impl<M: RoleModel> PalsEngine<M> {
                 (None, Some(identity))
             }
         };
+        let model_registered_value = if resolver == ResolverPolicy::ModelWdlRestricted
+            || policy.uses_frozen_model_wdl()
+        {
+            let identity = model
+                .value_identity()
+                .ok_or(RoleError::Unavailable)?
+                .clone();
+            identity.validate()?;
+            if identity.model != model.identity() || identity.semantics != MODEL_WDL_VALUE_SEMANTICS
+            {
+                return Err(RoleError::InvalidOutput.into());
+            }
+            Some(identity)
+        } else {
+            model_registered_value
+        };
         let checker_registered_identity = cpu.identity().clone();
         let cpu_registered_condition = Self::cpu_condition_for(cpu.as_ref());
         let mut nodes = Vec::new();
@@ -1143,6 +1311,8 @@ impl<M: RoleModel> PalsEngine<M> {
         let stores = PalsStores::new(Self::store_limits(&config));
         Ok(Self {
             config,
+            resolver,
+            followup_lane: true,
             post_repair_recheck: policy,
             model,
             cpu,
@@ -1162,6 +1332,11 @@ impl<M: RoleModel> PalsEngine<M> {
             consumer_id: 0,
             last_search_counters: None,
             last_recheck_observer_error: None,
+            last_cpu_checkpoint_cleanup_error: None,
+            repair_queue: std::collections::VecDeque::new(),
+            repair_questions: HashSet::new(),
+            repair_counts: std::collections::HashMap::new(),
+            archive_state: archive_lifecycle::EngineArchiveLifecycle::default(),
         })
     }
     pub fn new_game(&mut self) {
@@ -1184,11 +1359,16 @@ impl<M: RoleModel> PalsEngine<M> {
         self.model.new_game_with_generation(self.game_generation);
         self.revision = 0;
         self.stores = PalsStores::new(Self::store_limits(&self.config));
+        self.reset_archive_new_game();
         self.consumer_id = 0;
         self.last_search_counters = None;
         self.last_recheck_observer_error = None;
+        self.last_cpu_checkpoint_cleanup_error = None;
         self.external_attempts.clear();
         self.last_external_attempt = None;
+        self.repair_queue.clear();
+        self.repair_questions.clear();
+        self.repair_counts.clear();
     }
     pub fn try_new_game(
         &mut self,
@@ -1285,11 +1465,13 @@ impl<M: RoleModel> PalsEngine<M> {
         }
     }
     fn resolver_version(&self) -> &'static str {
-        if self.is_external() {
-            MODEL_WDL_RESOLVER_VERSION
-        } else {
-            PALS_VALUE_RESOLVER_VERSION
-        }
+        self.resolver.version()
+    }
+    pub fn resolver_policy(&self) -> ResolverPolicy {
+        self.resolver
+    }
+    fn uses_model_resolver(&self) -> bool {
+        self.resolver == ResolverPolicy::ModelWdlRestricted
     }
     pub fn retained_situations(&self) -> usize {
         self.nodes.len()
@@ -1305,10 +1487,18 @@ impl<M: RoleModel> PalsEngine<M> {
     }
     /// Consumers must bind this effective identity, not only the legacy constant.
     pub fn search_identity(&self) -> &'static str {
-        self.post_repair_recheck.search_identity()
+        if self.followup_lane && self.post_repair_recheck == PostRepairRecheckPolicy::Disabled {
+            PALS_FOLLOWUP_SEARCH_VERSION
+        } else {
+            self.post_repair_recheck.search_identity()
+        }
     }
     pub fn refinement_conditions(&self) -> Option<&'static str> {
-        self.post_repair_recheck.conditions()
+        if self.followup_lane && self.post_repair_recheck == PostRepairRecheckPolicy::Disabled {
+            Some(PALS_FOLLOWUP_CONDITIONS)
+        } else {
+            self.post_repair_recheck.conditions()
+        }
     }
     /// Snapshot of the most recent entered search, including errors. Read after
     /// that search returns; the caller owns cumulative per-process accounting.
@@ -1319,6 +1509,11 @@ impl<M: RoleModel> PalsEngine<M> {
     /// original operation error takes precedence. Reset on search and new_game.
     pub fn last_recheck_observer_error(&self) -> Option<&RoleError> {
         self.last_recheck_observer_error.as_ref()
+    }
+    /// Independent checkpoint cleanup failure when the original search already
+    /// failed. The caller can preserve both errors without replacing either.
+    pub fn last_cpu_checkpoint_cleanup_error(&self) -> Option<&PalsError> {
+        self.last_cpu_checkpoint_cleanup_error.as_ref()
     }
     pub fn stores(&self) -> &PalsStores {
         &self.stores
@@ -1360,31 +1555,47 @@ impl<M: RoleModel> PalsEngine<M> {
         progress: F,
     ) -> Result<PalsResult, PalsError> {
         self.last_recheck_observer_error = None;
+        self.last_cpu_checkpoint_cleanup_error = None;
+        self.repair_queue.clear();
+        self.repair_questions.clear();
+        self.repair_counts.clear();
         if self.game_generation.is_none() {
             return Err(PalsError::Capacity);
         }
         let mut counters = PalsCounters::default();
         self.external_attempts.clear();
-        // Actual prepared RoleQuery includes records, revision and deadline.
-        // Previous-search WDL is not an exact-input cache hit in this context.
-        for node in &mut self.nodes {
-            node.model_value = None;
+        let mut result = self.search_inner(position, limits, cancel, progress, &mut counters);
+        let canceled = cancel.load(Ordering::Acquire)
+            || matches!(&result, Ok(report) if report.completion == PalsCompletion::Canceled)
+            || matches!(&result, Err(PalsError::Role(RoleError::Canceled)));
+        if canceled {
+            // This discards only the owned CPU continuation. GPU buffers remain
+            // subject to their physical owner/drain even after logical cancel.
+            if let Err(error) = self.discard_canceled_cpu_checkpoints() {
+                if result.is_ok() {
+                    result = Err(error);
+                } else {
+                    // Preserve the original search error and its independent
+                    // cleanup failure. Neither is turned into completion.
+                    self.last_cpu_checkpoint_cleanup_error = Some(error);
+                }
+            }
         }
-        let result = self.search_inner(position, limits, cancel, progress, &mut counters);
         if let Ok(report) = &result {
             counters = report.counters;
         }
         counters.retained_situations = self.nodes.len();
         self.last_search_counters = Some(counters);
         let closure = match &result {
+            Err(PalsError::Role(RoleError::PhysicalCompletionUnknown)) => {
+                RoleSearchClosure::PhysicalCompletionUnknown
+            }
+            _ if canceled => RoleSearchClosure::Canceled,
             Ok(report) => match report.completion {
                 PalsCompletion::Canceled => RoleSearchClosure::Canceled,
                 PalsCompletion::Deadline => RoleSearchClosure::Deadline,
                 _ => RoleSearchClosure::Completed,
             },
-            Err(PalsError::Role(RoleError::PhysicalCompletionUnknown)) => {
-                RoleSearchClosure::PhysicalCompletionUnknown
-            }
             Err(_) => RoleSearchClosure::Failed,
         };
         self.model.finish_search(closure);
@@ -1401,7 +1612,7 @@ impl<M: RoleModel> PalsEngine<M> {
         self.validate_checker_namespace()?;
         if self.cpu.identity() != &self.checker_registered_identity
             || self.cpu_condition() != self.cpu_registered_condition
-            || (self.is_external()
+            || (self.model_registered_value.is_some()
                 && self.model.value_identity() != self.model_registered_value.as_ref())
         {
             return Err(StoreError::InvalidConditions(
@@ -1422,16 +1633,36 @@ impl<M: RoleModel> PalsEngine<M> {
             self.last_external_attempt = None;
         }
         let started = Instant::now();
-        match self.stores.focus_actual_moves(position.snapshot()) {
-            Ok(_) => {}
-            Err(StoreError::Capacity(_)) => return self.capacity_result(position, started),
-            Err(error) => return Err(error.into()),
-        }
-        let root = match self.intern(position.clone()) {
-            Ok(root) => root,
-            Err(PalsError::Capacity) => return self.capacity_result(position, started),
-            Err(error) => return Err(error),
+        self.prepare_archive_root(position, limits.deadline, cancel)?;
+        let root = loop {
+            let attempt = match self.stores.focus_actual_moves(position.snapshot()) {
+                Ok(_) => self.intern(position.clone()),
+                Err(StoreError::Capacity(_)) => Err(PalsError::Capacity),
+                Err(error) => Err(error.into()),
+            };
+            match attempt {
+                Ok(root) => break root,
+                Err(PalsError::Capacity | PalsError::Store(StoreError::Capacity(_)))
+                    if self.archive_enabled() =>
+                {
+                    // The lifecycle permits exactly one allocation retry. A
+                    // second failure is PinSaturated, never a hidden restart.
+                    self.retry_archive_root_allocation(position, limits.deadline, cancel)?;
+                }
+                Err(PalsError::Capacity | PalsError::Store(StoreError::Capacity(_))) => {
+                    return self.capacity_result(position, started);
+                }
+                Err(error) => return Err(error),
+            }
         };
+        let root = self.finish_archive_root(root, limits.deadline, cancel)?;
+        // Archive old input/evidence ownership before invalidating the live
+        // projection. Previous-search WDL is not a current-context cache hit.
+        for node in &mut self.nodes {
+            node.model_value = None;
+            node.model_observation = None;
+            node.model_value_revision = None;
+        }
         self.refresh_projection(self.nodes[root].state);
         let legal = position.legal_moves();
         if let Some((reason, value)) = self.nodes[root].terminal {
@@ -1439,7 +1670,7 @@ impl<M: RoleModel> PalsEngine<M> {
             counters.root_scope_observation_complete = true;
             return Ok(PalsResult {
                 best_move: None,
-                score: if self.is_external() {
+                score: if self.uses_model_resolver() {
                     None
                 } else {
                     Some(value)
@@ -1530,7 +1761,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 Err(error) => return Err(error),
             }
         }
-        if self.is_external() {
+        if self.uses_model_resolver() {
             return self.model_result(root, &legal, completion, started, counters);
         }
         let mut root_values = Vec::with_capacity(legal.len());
@@ -1648,7 +1879,7 @@ impl<M: RoleModel> PalsEngine<M> {
             } else {
                 None
             },
-            score: if self.is_external() {
+            score: if self.uses_model_resolver() {
                 None
             } else {
                 terminal.map(|(_, score)| score)
@@ -1749,6 +1980,8 @@ impl<M: RoleModel> PalsEngine<M> {
             edges: Vec::new(),
             evidence: None,
             model_value: None,
+            model_observation: None,
+            model_value_revision: None,
             resume: None,
         });
         Ok(self.nodes.len() - 1)
@@ -1976,6 +2209,20 @@ impl<M: RoleModel> PalsEngine<M> {
         cancel: &AtomicBool,
         counters: &mut PalsCounters,
     ) -> Result<(), PalsError> {
+        self.verify_checked_cpu(node, line, limits, cancel, counters)?;
+        if !self.is_external() && self.uses_model_resolver() {
+            self.evaluate_model_value(node, line, limits, cancel, counters)?;
+        }
+        Ok(())
+    }
+    fn verify_checked_cpu(
+        &mut self,
+        node: usize,
+        line: &[BoardMove],
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        counters: &mut PalsCounters,
+    ) -> Result<(), PalsError> {
         if self.nodes[node].terminal.is_some() {
             return Ok(());
         }
@@ -2013,6 +2260,7 @@ impl<M: RoleModel> PalsEngine<M> {
             return Ok(());
         }
         let task_nodes = remaining.min(self.config.cpu_nodes_per_task);
+        self.synchronize_cpu_checkpoints()?;
         let descriptor = self.owned_descriptor()?;
         let profile = stable_id(descriptor.config.profile.identity());
         let value_identity = self.owned_identity()?.clone();
@@ -2174,7 +2422,7 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         // A stopped task retains completed depth evidence, but never pretends to
         // have examined the requested remaining depth or to prove a mate.
-        let observation = match self.stores.append_observation(Observation {
+        let observation = match self.append_engine_observation(Observation {
             state: self.nodes[node].state,
             line: None,
             source: stable_id(report.score_provenance),
@@ -2345,7 +2593,7 @@ impl<M: RoleModel> PalsEngine<M> {
         counters.completed_value_calls += 1;
         // Keep the full actual input identity; numeric scope IDs are metadata.
         // No exact-input cache reuse is granted by a model namespace or board.
-        let observation = self.stores.append_observation(Observation {
+        let observation = self.append_engine_observation(Observation {
             state: self.nodes[node].state,
             line: None,
             source: stable_id(&identity.semantics),
@@ -2367,11 +2615,21 @@ impl<M: RoleModel> PalsEngine<M> {
                         .map_err(|_| RoleError::InvalidOutput)?,
                 ),
             },
-            score: RawScore::Wdl {
-                win: output.wdl[0],
-                draw: output.wdl[1],
-                loss: output.wdl[2],
-                perspective: output.perspective,
+            score: if self.followup_lane || self.post_repair_recheck.uses_frozen_model_wdl() {
+                RawScore::ContextWdl {
+                    win: output.wdl[0],
+                    draw: output.wdl[1],
+                    loss: output.wdl[2],
+                    perspective: output.perspective,
+                    context_revision: self.revision,
+                }
+            } else {
+                RawScore::Wdl {
+                    win: output.wdl[0],
+                    draw: output.wdl[1],
+                    loss: output.wdl[2],
+                    perspective: output.perspective,
+                }
             },
             budget: 1,
             kind: ObservationKind::Proposal,
@@ -2402,6 +2660,8 @@ impl<M: RoleModel> PalsEngine<M> {
         counters.consumed_role_outputs += 1;
         counters.accepted_value_outputs += 1;
         self.nodes[node].model_value = Some(output);
+        self.nodes[node].model_observation = Some(observation);
+        self.nodes[node].model_value_revision = Some(self.revision);
         Ok(())
     }
 
@@ -2771,7 +3031,7 @@ impl<M: RoleModel> PalsEngine<M> {
                             .append_cpu_pv(&self.nodes[divergence].position, &projection)?,
                     )
                 };
-                let observation = self.stores.append_observation(Observation {
+                let observation = self.append_engine_observation(Observation {
                     state: self.nodes[divergence].state,
                     line: None,
                     source: stable_id(&report.identity.adapter_semantics),
@@ -3035,6 +3295,7 @@ impl<M: RoleModel> PalsEngine<M> {
         if remaining == 0 || alternatives.is_some_and(|moves| moves.is_empty()) {
             return Ok(None);
         }
+        self.synchronize_cpu_checkpoints()?;
         let generation = self.stores.generation();
         let active_root = self.stores.root().ok_or(StoreError::StaleConsumer)?;
         let root_revision = self.stores.situations.get(active_root)?.revision;
@@ -3239,7 +3500,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 return Err(error.into());
             }
         };
-        let observation = match self.stores.append_observation(Observation {
+        let observation = match self.append_engine_observation(Observation {
             state: self.nodes[divergence].state,
             line: None,
             source: stable_id(report.score_provenance),
@@ -3457,6 +3718,33 @@ impl<M: RoleModel> PalsEngine<M> {
         let root = self.stores.root().ok_or(PalsError::Capacity)?;
         let root_state = self.stores.situations.get(root)?.state;
         let perspective = perspective.unwrap_or(self.stores.states.get(root_state)?.side_to_move());
+        let supersedes_revision = self
+            .records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.origin_state == root_state
+                    && record.kind == kind
+                    && record.line.first() == line.first()
+            })
+            .map(|record| record.revision);
+        let parent_revision = self
+            .records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.origin_state == root_state
+                    && record.line.first() == line.first()
+                    && match kind {
+                        RecordKind::Repair => record.kind == RecordKind::Counterexample,
+                        RecordKind::Counterexample => {
+                            matches!(record.kind, RecordKind::Proposal | RecordKind::Repair)
+                        }
+                        RecordKind::CpuVerification => record.line == line,
+                        RecordKind::Proposal => false,
+                    }
+            })
+            .map(|record| record.revision);
         // This small vector is only the current public input projection. Raw
         // observations remain immutable in the independently bounded store.
         // Pin the newest proposal/counterexample/repair/CPU estimate for every
@@ -3474,12 +3762,24 @@ impl<M: RoleModel> PalsEngine<M> {
             let obsolete = self
                 .records
                 .iter()
-                .position(|record| !record.critical)
+                .position(|record| {
+                    !record.critical
+                        && Some(record.revision) != parent_revision
+                        && Some(record.revision) != supersedes_revision
+                        && !self.records.iter().any(|active| {
+                            active.critical
+                                && (active.parent_revision == Some(record.revision)
+                                    || active.supersedes_revision == Some(record.revision))
+                        })
+                })
                 .ok_or(PalsError::Capacity)?;
+            self.archive_public_record_before_remove(obsolete)?;
             self.records.remove(obsolete);
         }
         self.records.push(RoleRecord {
             revision: self.revision,
+            parent_revision,
+            supersedes_revision,
             kind,
             line: line.to_vec(),
             origin_state: root_state,
@@ -3496,7 +3796,7 @@ impl<M: RoleModel> PalsEngine<M> {
         let line_id = self
             .stores
             .append_line(self.stores.situations.get(root)?.focus, line)?;
-        let observation = self.stores.append_observation(Observation {
+        let observation = self.append_engine_observation(Observation {
             state: root_state,
             line: Some(line_id),
             source: stable_id(self.model.identity()),
@@ -3560,7 +3860,7 @@ impl<M: RoleModel> PalsEngine<M> {
         let root_color = self.nodes[root].position.side_to_move();
         let mut frontier: Vec<_> = root_rank.iter().take(width).copied().collect();
         frontier.sort_by(|a, b| {
-            if self.is_external() {
+            if self.uses_model_resolver() {
                 let value = |movement| {
                     self.nodes[root]
                         .edges
@@ -3867,6 +4167,9 @@ impl<M: RoleModel> PalsEngine<M> {
                 };
                 // Repair resumes AFTER the response. The first move remains in the
                 // frontier; this conditional counterexample never blacklists it.
+                if !self.admit_iterative_repair(movement) {
+                    continue;
+                }
                 let mut repair = prefix.to_vec();
                 repair.push(response);
                 let accepted_repairs_before = counters.accepted_repair_outputs;
@@ -3914,31 +4217,50 @@ impl<M: RoleModel> PalsEngine<M> {
                         counters.supported_repairs += 1;
                     }
                 }
-                if let (true, Some((repaired_line, _)), Some(completed_value)) = (
+                if let (true, Some((repaired_line, _))) = (
                     counters.accepted_repair_outputs > accepted_repairs_before,
                     repair_record,
-                    completed_repair_value,
                 ) {
-                    self.recheck_repaired_line(
-                        CompletedRepairRecheck {
-                            root,
-                            original_first: movement,
-                            attack_ply: ply,
-                            repaired_line,
-                            repair_record_revision,
-                            repaired_leaf: repair_leaf,
-                            repaired: &repair,
-                            refutation: &refutation,
-                            completed_value,
-                        },
-                        limits,
-                        cancel,
-                        counters,
-                        progress,
-                    )?;
+                    if self.post_repair_recheck.uses_frozen_model_wdl() {
+                        self.queue_or_recheck_frozen(
+                            frozen_recheck::RepairWork {
+                                root,
+                                original_first: movement,
+                                attack_ply: ply,
+                                repaired_line,
+                                repair_record_revision,
+                                repaired_leaf: repair_leaf,
+                                repaired: repair.clone(),
+                                refutation: refutation.clone(),
+                            },
+                            limits,
+                            cancel,
+                            counters,
+                            progress,
+                        )?;
+                    } else if let Some(completed_value) = completed_repair_value {
+                        self.recheck_repaired_line(
+                            CompletedRepairRecheck {
+                                root,
+                                original_first: movement,
+                                attack_ply: ply,
+                                repaired_line,
+                                repair_record_revision,
+                                repaired_leaf: repair_leaf,
+                                repaired: &repair,
+                                refutation: &refutation,
+                                completed_value,
+                            },
+                            limits,
+                            cancel,
+                            counters,
+                            progress,
+                        )?;
+                    }
                 }
             }
         }
+        self.drain_repair_queue(limits, cancel, counters, progress)?;
         Ok(())
     }
 
@@ -4491,7 +4813,8 @@ impl<M: RoleModel> PalsEngine<M> {
                 TaskStatus::Completed(actual) => actual == observation_id
                     && admitted.scope == CpuScoreScope::CompletedIteration
                     && admitted.depth >= task.key.requested_depth,
-                TaskStatus::Paused { evidence, .. } => evidence == Some(observation_id),
+                TaskStatus::Paused { evidence, .. }
+                | TaskStatus::RetiredPaused { evidence, .. } => evidence == Some(observation_id),
                 TaskStatus::Failed => true, // Retained incomplete/frontier work, not completed authority.
                 _ => false,
             };
@@ -4547,7 +4870,7 @@ impl<M: RoleModel> PalsEngine<M> {
         }
     }
     fn value(&self, node: usize, remaining: usize) -> Option<i32> {
-        if self.is_external() {
+        if self.uses_model_resolver() {
             return None;
         }
         let node = &self.nodes[node];
@@ -4570,7 +4893,7 @@ impl<M: RoleModel> PalsEngine<M> {
             .map(|e| e.score)
     }
     fn completed_line_value(&self, leaf: usize, plies: usize, required_depth: u16) -> Option<i32> {
-        if self.is_external() {
+        if self.uses_model_resolver() {
             return None;
         }
         let value = self.nodes[leaf]
@@ -4750,7 +5073,7 @@ impl<M: RoleModel> PalsEngine<M> {
     ) -> Result<ObservationId, PalsError> {
         // Restricted-search summaries deliberately retain estimate scope. Even
         // a finite CPU mate score cannot mint RulesTerminal through this route.
-        Ok(self.stores.append_observation(Observation {
+        Ok(self.append_engine_observation(Observation {
             state: self.nodes[root].state,
             line: Some(line),
             source: stable_id(self.search_identity()),
@@ -4793,7 +5116,7 @@ impl<M: RoleModel> PalsEngine<M> {
             .into());
         }
         let mut best = None;
-        if self.is_external() {
+        if self.uses_model_resolver() {
             let mut best_value = PalsResolvedValue::Unknown;
             let mut best_terminal = false;
             for movement in self.nodes[root].position.legal_moves() {
@@ -5482,6 +5805,90 @@ mod tests {
                 .iter()
                 .all(|node| node.evidence.is_none() && node.resume.is_none())
         );
+    }
+
+    #[test]
+    fn foreign_checker_accepts_explicit_fresh_wdl_recheck_and_rejects_own_raw() {
+        let previous = foreign_engine(ForeignFixtureMode::Normal(200));
+        let rejected = PalsEngine::new_with_boxed_checker_and_policies(
+            previous.config,
+            previous.model,
+            previous.cpu,
+            ResolverPolicy::OwnRawRestricted,
+            PostRepairRecheckPolicy::FrozenModelWdlV2,
+        );
+        assert!(matches!(
+            rejected,
+            Err(PalsError::Cpu(CpuError::Unsupported(
+                "foreign checker with own raw resolver"
+            )))
+        ));
+        let previous = foreign_engine(ForeignFixtureMode::Normal(-200));
+        let mut engine = PalsEngine::new_with_boxed_checker_and_policies(
+            PalsConfig {
+                line_plies: 6,
+                ..previous.config
+            },
+            previous.model,
+            previous.cpu,
+            ResolverPolicy::ModelWdlRestricted,
+            PostRepairRecheckPolicy::FrozenModelWdlV2,
+        )
+        .unwrap();
+        let position = Position::startpos();
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine.intern(position).unwrap();
+        let mut counters = PalsCounters::default();
+        let moves = |text: &[&str]| {
+            text.iter()
+                .map(|m| BoardMove::from_uci(m).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let repaired = moves(&["e2e4", "e7e5", "f1c4", "b8c6", "d2d3", "d7d6"]);
+        let refutation = moves(&["e2e4", "e7e5", "g1f3", "b8c6", "d2d3", "d7d6"]);
+        engine
+            .record(RecordKind::Counterexample, &refutation, None, 0, None, None)
+            .unwrap();
+        let mut leaf = root;
+        for movement in &repaired {
+            let mut child = engine.nodes[leaf].position.clone();
+            child.make_move(*movement).unwrap();
+            leaf = engine
+                .connect(leaf, *movement, child, &mut counters)
+                .unwrap();
+        }
+        let (repaired_line, _) = engine
+            .record(RecordKind::Repair, &repaired, None, 0, None, None)
+            .unwrap()
+            .unwrap();
+        engine
+            .queue_or_recheck_frozen(
+                frozen_recheck::RepairWork {
+                    root,
+                    original_first: repaired[0],
+                    attack_ply: 1,
+                    repaired_line,
+                    repair_record_revision: engine.revision,
+                    repaired_leaf: leaf,
+                    repaired,
+                    refutation,
+                },
+                PalsLimits {
+                    deadline: Instant::now() + Duration::from_secs(10),
+                    ..limits()
+                },
+                &AtomicBool::new(false),
+                &mut counters,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(counters.external_checker_reports > 0);
+        assert!(counters.accepted_value_outputs >= 3);
+        assert_eq!(counters.frozen_wdl_comparisons, 1);
+        assert_eq!(counters.supported_refutations, 0); // Equal WDL is not a strict decrease.
     }
     #[test]
     fn foreign_unknown_pending_overshoot_and_namespace_failure_preserve_work_without_own_completion()

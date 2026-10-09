@@ -1171,8 +1171,7 @@ impl PalsRuntimeChecksV4 {
                 .map(|a| (&a.path, a))
                 .collect();
             require(
-                artifacts.len() == expected.len()
-                    && artifacts.keys().eq(expected.keys().map(|path| *path)),
+                artifacts.len() == expected.len() && artifacts.keys().eq(expected.keys().copied()),
                 "artifact check set differs from locked endpoint inputs",
             )?;
             for (path, a) in expected {

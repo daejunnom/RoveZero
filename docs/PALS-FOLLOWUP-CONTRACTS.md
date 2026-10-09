@@ -44,6 +44,10 @@ SHA에서 확인한다. CPU/mock, 실제 NN, GPU 수명, 학습 smoke, 대국 �
 - 새 재검토는 frozen 모델의 Fresh WDL을 양 끝점의 동일 관점에서 비교한다. 두 Rules
   terminal은 Rules로 비교하고, mixed/unknown은 unresolved다. 외부 CP/mate를 own raw나
   Rules 사실로 바꾸지 않는다. 추가 NN 비용은 원래 전역 예산에 포함한다.
+- 새 raw WDL에는 실제 공개 문맥 revision을 `ContextWdl`로 보존한다. 조건부 반박은
+  같은 모델·정밀도·revision의 두 raw 관측을 참조한다. 반복 Repair는 실제 C endpoint와
+  새 P endpoint를 다시 Fresh로 대조하고, 엄격한 개선이 있을 때만 현재 반박을
+  `ConditionalRepairWdl`로 supersede하여 `RepairedBy`로 연결한다. Legacy WDL wire는 유지한다.
 - 반복 queue는 별도 S 정책, first move별 Repair 3회·pending 64개다. 같은 질문/revision
   중복을 막고 새로운 증거가 없으면 종료한다. 원래 first move·근거·supersedes를 보존한다.
 - hot 한도 80% 또는 allocation 실패에서 비활성 자료를 cold로 이동하고 1회 재시도한다.
@@ -55,6 +59,9 @@ SHA에서 확인한다. CPU/mock, 실제 NN, GPU 수명, 학습 smoke, 대국 �
 - `PausedStack`은 opaque token, 1개·8MiB다. 미완료 PVS/qsearch/SEE frame과 정확한
   Rules/accumulator·ordering·TT 소유권을 보존한다. consumed work를 다시 세지 않는다.
   다른 history/profile/root/namespace, 취소·새 게임에는 재사용하지 않는다.
+  CPU admission마다 실제 owner와 token을 대조한다. stale paused 기록은 역사 증거로
+  보존하고 새 작업으로 다시 시작한다. CPU 호출 밖의 논리 취소도 실제 stack을 폐기하며
+  GPU lease의 물리 완료 규칙은 별도로 유지한다.
 - CUDA ApproxWarm은 host Warm과 별도 capability다. accepted seed만 같은 role·모델·
   Rules/query 문맥에서 사용한다. 공개 record revision만 변경 가능하다. value/V는 Fresh다.
   논리 취소가 물리 완료를 대신하지 않는다. 완료 불명 owner/buffer는 격리·보존한다.
@@ -67,7 +74,15 @@ P/C는 공유+해당 private, V는 private V만 update한다. Repair는 P 검사
 
 CPU FP32, batch/accumulation 1, lr 1e-4, betas 0.9/0.999, eps 1e-8, decay 0.01,
 clip norm 1, constant schedule을 사용한다. 역할별 continuous 4와 2+resume+2를 비교한다.
-총 update 24회·CPU 2·15분+정리30초·출력2GiB를 넘지 않는다. 진단 자산은 arena 승격 불가다.
+각 온전한 비교는 실제 update 24회이며 CPU 2·15분+정리30초·출력2GiB를 유지한다.
+2026-10-10 사용자 승인으로 실패와 재시도를 합친 누적 update 한도는 제거했다.
+실제 dispatch/completion의 누적 수와 실패·checkpoint는 계속 보존하며, 이 승인을
+본격 학습이나 유료 자원 사용으로 확대하지 않는다. 진단 자산은 arena 승격 불가다.
+
+작은 nonzero 진단의 세 번째 실행에서 P/C/V 각각 8회, 총 24회 update의 모델·AdamW·
+scheduler·RNG·sampler 연속/재개 일치와 의도한 parameter membership·동결·유한값을
+확인했다. 앞선 실패 1회와 8회를 포함한 누적 소비는 33회다. 실제 학습 target을 사용한
+update는 0회이며, 실제 target coverage와 learned V 인수는 이 진단 결과와 구분한다.
 
 GPU는 RTX 4050/WSL, Windows commit 여유 6GiB 이상, memory.high 6GiB/max 12GiB다.
 실제 Repair→C→재개와 seeded Warm reference를 검사하고 별도 60분 비용 창을 사용한다.
