@@ -3439,3 +3439,15 @@ GPU 검증 보류·실제 학습 제외·로컬 heavy CPU 미실행을 유지한
 - 반환 객체는 실제 capture와 raw hash를 빌리고 작은 Rules 사실·시각만 보존한다. 공개 생성자·Clone·serde와 native/Query capability는 없다. 기존 `/3`·`/4` 원문 schema·digest·독립 source 등록·readiness·규칙·탐색 정책·resource 한도는 유지한다. 취소나 원래 W 만료 시 거부하고 pending child·raw bytes를 소비하지 않는다.
 
 기존 실제 `/bin/cat` Linux 감독 검사에 원래 시계와 관측 순서·변조 거부를 추가했고, CPU 경계 검사는 postflight/check 역전·W 경계·시간 차감의 비포화와 준비 비용 유지 여부를 다룬다. 이들은 측정값이나 native 실행의 증거가 아닌 코드 정확성 검사다. 새 source의 exact-head CI는 별도로 인수한다. 실제 registered frozen 4N child/NN와 독립 native witness, current/frozen/next Query의 episode 순서, whole-action utility, 실제 multi-Reply 최종 인수와 같은 source의 paired 실행은 여전히 남는다. GPU 보류·학습 제외·로컬 heavy CPU 보류·Draft를 유지한다.
+
+
+### 실제 capture의 다음 Query 자료 발급 경계
+
+직전 `6abf6afde178a04a314283025982bcdc2cfc19da`의 CI 37887299857 attempt 1 네 CPU job, Linux·Windows 관련 검사 31개씩 및 실제 Linux process 시계 검사를 인수했다. `9c26685af7146a94550c1a998a7c134eef776df8`는 호출자 관측 비용에 원래 입력 소유자와 단일 자료 발급을 연결한다. `rz-arena/src/pals_replay/query_material.rs`는 다음 private Query에 넘길 자료의 발급·예약을 담당하며, 실제 Query 검산·native witness·utility와 구분한다.
+
+- 실제 감독 진입 전 부모 시각을 `OwnedReplayCapture`에 보존한다. source 독립 등록, 원문 body/CLI binding, 기존 원래 Rules 검사와 실제 process 시계 검사를 재사용한다. caller 진입→supervisor 진입→report 검사→자료 반환 전 관측 순서를 같은 원래 S/E/W에서 확인한다. 시각이나 순번은 수신 JSON에서 공급하지 않는다.
+- `prepare_reported_repair_prior_material`은 private 원래 `PreparedReplayRequest`와 raw stdout body를 빌려 `ReportedRepairPriorMaterial`을 만든다. parent/current/frozen/encoding 및 이전 query/catalogue/before/prior ledger/semantic 결합은 실제 원래 입력의 audit를 읽는다. body 재직렬화·원문 Vec 복제·Rules graph 보존·새 model/session·공개 생성자/Clone/serde가 없다.
+- capture별 원자적 **available→checking→issued** 예약으로 동시에 두 Rules 이력을 재구성하지 않는다. 발급 전 source/parser/binding/Rules/취소 검사 실패는 예약을 해제하고 원래 W 안에서만 수정할 수 있다. 발급 뒤에는 자료를 버리거나 취소를 다시 해제해도 재발급하지 않는다. 발급 후 만료·취소로 반환이 실패한 경우에도 issued 상태를 유지한다. raw bytes·원래 준비·pending child custody를 소비하거나 정리됐다고 표시하지 않는다.
+- 원래 S부터 자료 반환 전 관측까지의 비용과 report 검사 이후 추가 구간을 함께 제공한다. 잔여 budget을 새 timer로 만들지 않는다. 반환 자료의 여러 readonly 참조를 한 episode에 중복 삽입하지 않도록 **실제 next Query 소비자**의 물리 실행/원문·의미 ledger 검사가 여전히 필요하다. 이번 단일 발급은 전역 sequence나 서로 다른 capture/episode의 순서를 증명하지 않는다.
+
+이 자료는 reported Repair/Rules와 실제 부모 transport/cost의 연결이다. `CheckedNativeReplayPrior`·admitted Query·reward/target은 발급하지 않으며, 실제 registered frozen 4N child/NN·독립 native witness·다음 Query admission/episode chronology·whole-action utility·최종 multi-Reply·same-source paired 인수는 남는다. 네 CPU 검사는 단일 발급, 동시 alias, failed-check 예약 반환, 취소/만료와 재발급 금지를 다룬다. 이들은 actual frozen NN/Query 실행의 증거가 아니다. 기존 native `/3`·`/4` schema·canonicalization·readiness·탐색·평가 의미·resource 한도를 유지한다. 새 exact-head CI는 게시 후 별도 인수하며 GPU 보류·학습 제외·로컬 heavy CPU 보류·Draft·goal active를 유지한다.
