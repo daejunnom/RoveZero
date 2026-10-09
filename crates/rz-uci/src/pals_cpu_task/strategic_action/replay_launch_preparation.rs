@@ -113,6 +113,7 @@ pub struct ExpectedTransportV2 {
 #[serde(rename_all = "snake_case")]
 pub enum NativeResultLane {
     QueryPriorV1,
+    RepairAnchorV1,
 }
 
 /// New closed /3 transport. The complete old /2 expectations remain nested and
@@ -967,6 +968,26 @@ pub fn prepare_observed_replay_launch_bundle(
         started,
         cancel,
         Some(NativeResultLane::QueryPriorV1),
+    )
+}
+
+/// Opt-in actual Repair origin projection; keeps the old preparation entries.
+pub fn prepare_repair_observed_replay_launch_bundle(
+    originals: ReplayLaunchOriginals<'_>,
+    declaration: ReplayLaunchDeclaration<'_>,
+    expected: ReplayLaunchExpected<'_>,
+    budget: ReplayLaunchBudget,
+    started: Instant,
+    cancel: &AtomicBool,
+) -> Result<PreparedReplayLaunchBundle, ReplayLaunchPreparationError> {
+    prepare_replay_launch_bundle_inner(
+        originals,
+        declaration,
+        expected,
+        budget,
+        started,
+        cancel,
+        Some(NativeResultLane::RepairAnchorV1),
     )
 }
 

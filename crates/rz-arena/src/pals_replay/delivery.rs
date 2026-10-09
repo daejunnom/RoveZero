@@ -123,12 +123,133 @@ impl<'a> BoundReplayDelivery<'a> {
     }
 }
 
+/// Separate independent registration, never inferred from received source hashes.
+#[derive(Clone, Debug)]
+pub struct RepairReplayDeliveryRegistration {
+    pub prior: ReplayDeliveryRegistration,
+    pub repair_evidence_source: ArtifactPin,
+}
+#[derive(Debug)]
+pub struct BoundRepairReplayDelivery<'a> {
+    inner: BoundReplayDelivery<'a>,
+    repair_source: ArtifactPin,
+}
+impl<'a> BoundRepairReplayDelivery<'a> {
+    pub fn capture(&self) -> &'a OwnedReplayCapture {
+        self.inner.capture()
+    }
+    pub fn raw_native_bytes(&self) -> &'a [u8] {
+        self.inner.raw_native_bytes()
+    }
+    pub fn body_artifact(&self) -> &ArtifactPin {
+        self.inner.body_artifact()
+    }
+    pub fn check_reported_consistency(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<query_prior::ReportedRepairConsistency, ArenaError> {
+        let clock = || {
+            if cancel.load(Ordering::Acquire)
+                || Instant::now() >= self.capture().bundle().deadline()
+            {
+                Err(invalid("Repair report original W/cancellation"))
+            } else {
+                Ok(())
+            }
+        };
+        clock()?;
+        let payload = self
+            .capture()
+            .bundle()
+            .payloads()
+            .iter()
+            .find(|p| p.name() == "replay-expected.json")
+            .ok_or_else(|| invalid("Repair expected payload missing"))?;
+        let expected: ExpectedTransportV3 = decode(payload.as_bytes())?;
+        if expected.native_result != NativeResultLane::RepairAnchorV1 {
+            return Err(invalid("Repair report lane differs"));
+        }
+        let pins = expected.expectations.replay_expected.into_expected();
+        let report = query_prior::check_reported_repair_consistency(
+            decode(self.raw_native_bytes())?,
+            &pins,
+            &expected.expectations.cpu_fresh_profile_artifact,
+            &expected.expectations.cpu_fresh_profile,
+            &self.inner.projection_source,
+            &self.repair_source,
+        )
+        .map_err(|e| invalid(&format!("reported Repair consistency: {e:?}")))?;
+        clock()?;
+        Ok(report)
+    }
+    pub fn check_reported_rules_consistency(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<query_prior::ReportedRepairRulesConsistency, ArenaError> {
+        let report = self.check_reported_consistency(cancel)?;
+        let mut originals = self
+            .capture()
+            .bundle()
+            .payloads()
+            .iter()
+            .filter_map(|p| p.prepared_request());
+        let prepared = originals
+            .next()
+            .ok_or_else(|| invalid("actual Repair prepared owner missing"))?;
+        if originals.next().is_some() || prepared.deadline() != self.capture().bundle().deadline() {
+            return Err(invalid(
+                "Repair prepared owner uniqueness/original W differs",
+            ));
+        }
+        report
+            .check_original_rules(prepared, cancel)
+            .map_err(|e| invalid(&format!("reported Repair original Rules: {e:?}")))
+    }
+}
+enum DeliveryRegistration<'a> {
+    Prior(&'a ReplayDeliveryRegistration),
+    Repair(&'a RepairReplayDeliveryRegistration),
+}
+impl DeliveryRegistration<'_> {
+    fn prior(&self) -> &ReplayDeliveryRegistration {
+        match self {
+            Self::Prior(p) => p,
+            Self::Repair(r) => &r.prior,
+        }
+    }
+    fn lane(&self) -> NativeResultLane {
+        match self {
+            Self::Prior(_) => NativeResultLane::QueryPriorV1,
+            Self::Repair(_) => NativeResultLane::RepairAnchorV1,
+        }
+    }
+}
+
 impl OwnedReplayCapture {
     /// Refusal leaves this capture and any child custody intact. Both parser work
     /// and postflight checks must fit the SAME original whole-action deadline.
     pub fn bind_delivery(
         &self,
         registration: &ReplayDeliveryRegistration,
+        cancel: &AtomicBool,
+    ) -> Result<BoundReplayDelivery<'_>, ArenaError> {
+        self.bind_delivery_registered(DeliveryRegistration::Prior(registration), cancel)
+    }
+    pub fn bind_repair_delivery(
+        &self,
+        registration: &RepairReplayDeliveryRegistration,
+        cancel: &AtomicBool,
+    ) -> Result<BoundRepairReplayDelivery<'_>, ArenaError> {
+        let inner =
+            self.bind_delivery_registered(DeliveryRegistration::Repair(registration), cancel)?;
+        Ok(BoundRepairReplayDelivery {
+            inner,
+            repair_source: registration.repair_evidence_source.clone(),
+        })
+    }
+    fn bind_delivery_registered(
+        &self,
+        registration: DeliveryRegistration<'_>,
         cancel: &AtomicBool,
     ) -> Result<BoundReplayDelivery<'_>, ArenaError> {
         let check_clock = || {
@@ -156,11 +277,11 @@ impl OwnedReplayCapture {
             return Err(invalid("expected payload extent/uniqueness"));
         }
         let expected: ExpectedTransportV3 = decode(payload.as_bytes())?;
-        let (raw_native, body_artifact, projection) = bind_bytes(
+        let (raw_native, body_artifact, projection) = bind_bytes_registered(
             &self.process().process().stdout,
             &expected,
             payload.artifact(),
-            registration,
+            &registration,
         )?;
         check_clock()?;
         Ok(BoundReplayDelivery {
@@ -168,7 +289,7 @@ impl OwnedReplayCapture {
             raw_native,
             body_artifact,
             projection,
-            projection_source: registration.query_prior_source.clone(),
+            projection_source: registration.prior().query_prior_source.clone(),
         })
     }
 }
@@ -298,22 +419,36 @@ struct AdmittedClock {
     declarations_differ: bool,
 }
 
+#[cfg(test)]
 fn bind_bytes<'a>(
     stdout: &'a [u8],
     expected: &ExpectedTransportV3,
     expected_artifact: &ArtifactPin,
     registration: &ReplayDeliveryRegistration,
 ) -> Result<(&'a [u8], ArtifactPin, Value), ArenaError> {
+    bind_bytes_registered(
+        stdout,
+        expected,
+        expected_artifact,
+        &DeliveryRegistration::Prior(registration),
+    )
+}
+fn bind_bytes_registered<'a>(
+    stdout: &'a [u8],
+    expected: &ExpectedTransportV3,
+    expected_artifact: &ArtifactPin,
+    registration: &DeliveryRegistration<'_>,
+) -> Result<(&'a [u8], ArtifactPin, Value), ArenaError> {
     if expected.schema != EXPECTED_TRANSPORT_V3_SCHEMA
         || expected.expectations.schema != EXPECTED_TRANSPORT_V2_SCHEMA
-        || expected.native_result != NativeResultLane::QueryPriorV1
+        || expected.native_result != registration.lane()
         || !expected.same_original_clock()
         || expected.cleanup_reserve_ms == 0
         || expected.cleanup_reserve_ms >= expected.whole_wall_ms
         || expected.output_bytes > replay_inputs::MAX_OUTPUT_BYTES
         || stdout.len() > expected.output_bytes
-        || registration.query_prior_source.bytes == 0
-        || registration.query_prior_source.bytes > 512 * 1024
+        || registration.prior().query_prior_source.bytes == 0
+        || registration.prior().query_prior_source.bytes > 512 * 1024
     {
         return Err(invalid("explicit /3 registration, clock or byte bound"));
     }
@@ -369,11 +504,25 @@ fn bind_bytes<'a>(
     let _ = header.execution_deadline_exceeded_at_preparation;
     let mut native: Value = decode(raw_native)?;
     bind_native(&native, expected, &semantic_scope)?;
+    match registration {
+        DeliveryRegistration::Prior(_) if native.get("repair_anchor_evidence").is_some() => {
+            return Err(invalid("legacy /3 binding refuses Repair evidence"));
+        }
+        DeliveryRegistration::Repair(r) => {
+            bind_repair_projection(
+                native
+                    .get("repair_anchor_evidence")
+                    .ok_or_else(|| invalid("Repair evidence required"))?,
+                &r.repair_evidence_source,
+            )?;
+        }
+        DeliveryRegistration::Prior(_) => {}
+    }
     let projection = native
         .as_object_mut()
         .and_then(|object| object.remove("query_prior"))
         .ok_or_else(|| invalid("structured prior required"))?;
-    bind_projection(&projection, registration)?;
+    bind_projection(&projection, registration.prior())?;
     Ok((raw_native, header.body_artifact, projection))
 }
 
@@ -406,7 +555,10 @@ fn bind_native(
     same(
         native,
         "schema",
-        native_replay::QUERY_PRIOR_OBSERVATION_SCHEMA,
+        match expected.native_result {
+            NativeResultLane::QueryPriorV1 => native_replay::QUERY_PRIOR_OBSERVATION_SCHEMA,
+            NativeResultLane::RepairAnchorV1 => native_replay::REPAIR_ANCHOR_OBSERVATION_SCHEMA,
+        },
     )?;
     same(native, "scope", native_replay::SCOPE)?;
     same(native, "mode", mode)?;
@@ -474,6 +626,61 @@ fn bind_native(
     }
     same(audit, "cpu_checks", 0u8)?;
     no_authority(audit)
+}
+
+fn bind_repair_projection(value: &Value, source: &ArtifactPin) -> Result<(), ArenaError> {
+    closed_keys(
+        value,
+        &[
+            "schema",
+            "assurance_scope",
+            "source_sha256",
+            "source_bytes",
+            "model_counterline",
+            "repaired_line",
+            "repair_record_observed",
+            "repair_record_revision",
+            "opponent_anchor_ply",
+            "actual_utility_groups",
+            "authorities",
+        ],
+    )?;
+    same(value, "schema", query_prior::REPAIR_EVIDENCE_SCHEMA)?;
+    same(value, "assurance_scope", query_prior::REPAIR_EVIDENCE_SCOPE)?;
+    same(value, "source_bytes", source.bytes)?;
+    if source.bytes == 0 || source.bytes > 512 * 1024 {
+        return Err(invalid("independent Repair source extent"));
+    }
+    let digest: [u8; 32] = serde_json::from_value(value["source_sha256"].clone())
+        .map_err(|_| invalid("Repair source digest shape"))?;
+    if digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+        != source.sha256
+    {
+        return Err(invalid("independent Repair source digest"));
+    }
+    same(value, "actual_utility_groups", 0u8)?;
+    no_authority(value)?;
+    for key in ["model_counterline", "repaired_line"] {
+        let moves = value[key]
+            .as_array()
+            .ok_or_else(|| invalid("Repair move array"))?;
+        if moves.len() > query_prior::MAX_LINE_MOVES {
+            return Err(invalid("Repair move extent"));
+        }
+        for movement in moves {
+            let bits = movement
+                .as_u64()
+                .and_then(|b| u16::try_from(b).ok())
+                .ok_or_else(|| invalid("Repair packed move type"))?;
+            rz_contracts::pals::Move16::try_from_bits(bits)
+                .and_then(rz_contracts::pals::Move16::decode)
+                .map_err(|_| invalid("Repair packed move codec"))?;
+        }
+    }
+    Ok(())
 }
 
 fn bind_projection(
@@ -719,6 +926,94 @@ mod tests {
         bytes.extend_from_slice(raw);
         bytes.extend_from_slice(b"}\n");
         bytes
+    }
+    fn repair_fixture() -> (
+        ExpectedTransportV3,
+        ArtifactPin,
+        RepairReplayDeliveryRegistration,
+        Value,
+        Value,
+    ) {
+        let (mut expected, _, prior, mut header, mut native) = fixture();
+        expected.native_result = NativeResultLane::RepairAnchorV1;
+        let pin = artifact(&serde_json::to_vec(&expected).unwrap());
+        header["requested_native_result"] = json!("repair_anchor_v1");
+        header["expected_transport"] = serde_json::to_value(&pin).unwrap();
+        native["schema"] = json!(native_replay::REPAIR_ANCHOR_OBSERVATION_SCHEMA);
+        // Independently selected test fixture, not a production source fallback.
+        let source = ArtifactPin {
+            bytes: query_prior::repair_evidence_source_bytes(),
+            sha256: query_prior::repair_evidence_source_digest()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        };
+        native["repair_anchor_evidence"] =
+            serde_json::to_value(query_prior::RepairAnchorEvidence::default()).unwrap();
+        (
+            expected,
+            pin,
+            RepairReplayDeliveryRegistration {
+                prior,
+                repair_evidence_source: source,
+            },
+            header,
+            native,
+        )
+    }
+    #[test]
+    fn captured_repair_delivery_keeps_original_bytes_and_explicit_independent_lane() {
+        let (expected, pin, registration, header, native) = repair_fixture();
+        let raw = serde_json::to_vec_pretty(&native).unwrap();
+        let bytes = output(&header, &raw);
+        let (borrowed, body_pin, _) = bind_bytes_registered(
+            &bytes,
+            &expected,
+            &pin,
+            &DeliveryRegistration::Repair(&registration),
+        )
+        .unwrap();
+        assert_eq!(borrowed, raw);
+        assert_eq!(body_pin, artifact(&raw));
+        assert!(borrowed.as_ptr() >= bytes.as_ptr());
+        assert!(borrowed.as_ptr_range().end <= bytes.as_ptr_range().end);
+        assert!(bind_bytes(&bytes, &expected, &pin, &registration.prior).is_err());
+    }
+    #[test]
+    fn captured_repair_delivery_refuses_source_shape_move_extent_and_lane_substitution() {
+        let (expected, pin, mut registration, header, native) = repair_fixture();
+        for case in 0..5 {
+            let mut changed = native.clone();
+            match case {
+                0 => changed["repair_anchor_evidence"]["source_bytes"] = json!(0),
+                1 => changed["repair_anchor_evidence"]["extra_authority"] = json!(true),
+                2 => changed["repair_anchor_evidence"]["actual_utility_groups"] = json!(1),
+                3 => changed["repair_anchor_evidence"]["model_counterline"] = json!(vec![0; 17]),
+                _ => changed["schema"] = json!(native_replay::QUERY_PRIOR_OBSERVATION_SCHEMA),
+            }
+            let raw = serde_json::to_vec(&changed).unwrap();
+            assert!(
+                bind_bytes_registered(
+                    &output(&header, &raw),
+                    &expected,
+                    &pin,
+                    &DeliveryRegistration::Repair(&registration)
+                )
+                .is_err(),
+                "case {case}"
+            );
+        }
+        registration.repair_evidence_source.sha256 = "0".repeat(64);
+        let raw = serde_json::to_vec(&native).unwrap();
+        assert!(
+            bind_bytes_registered(
+                &output(&header, &raw),
+                &expected,
+                &pin,
+                &DeliveryRegistration::Repair(&registration)
+            )
+            .is_err()
+        );
     }
     #[test]
     fn captured_delivery_binds_original_body_without_reserializing_or_promoting_prior() {

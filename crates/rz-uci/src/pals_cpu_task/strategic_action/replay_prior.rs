@@ -21,8 +21,17 @@ use sha2::{Digest, Sha256};
 #[path = "replay_reported.rs"]
 mod reported;
 pub use reported::{
-    ReportedPriorConsistency, ReportedRulesConsistency, ReportedRulesError,
-    check_reported_prior_consistency,
+    ReportedPriorConsistency, ReportedRepairConsistency, ReportedRepairRulesConsistency,
+    ReportedRulesConsistency, ReportedRulesError, check_reported_prior_consistency,
+    check_reported_repair_consistency,
+};
+
+#[path = "replay_repair_evidence.rs"]
+mod repair_evidence;
+pub use repair_evidence::{
+    REPAIR_EVIDENCE_SCHEMA, REPAIR_EVIDENCE_SCOPE, RepairAnchorEvidence,
+    consume_native_repair_replay_prior, repair_evidence_source_bytes,
+    repair_evidence_source_digest,
 };
 
 pub const SCHEMA: &str = "rz-pals-frozen-replay-query-prior/1";
@@ -377,13 +386,32 @@ pub fn consume_native_replay_prior<'a>(
     expected_asset_profile_artifact: &super::super::ArtifactPin,
     expected_asset_profile: &CpuFreshAssetProfile,
 ) -> Result<CheckedNativeReplayPrior<'a>, AdmissionFault> {
+    if observation.repair_anchor_evidence.is_some() {
+        return Err(fault("legacy /3 prior rejects Repair evidence lane"));
+    }
+    consume_native_replay_prior_schema(
+        observation,
+        expected,
+        expected_asset_profile_artifact,
+        expected_asset_profile,
+        super::QUERY_PRIOR_OBSERVATION_SCHEMA,
+    )
+}
+
+fn consume_native_replay_prior_schema<'a>(
+    observation: &'a NativeReplayObservation,
+    expected: &ReplayExpectedPins,
+    expected_asset_profile_artifact: &super::super::ArtifactPin,
+    expected_asset_profile: &CpuFreshAssetProfile,
+    schema: &str,
+) -> Result<CheckedNativeReplayPrior<'a>, AdmissionFault> {
     let audit = &observation.input_admission;
     let projection = observation
         .query_prior
         .as_ref()
         .ok_or_else(|| fault("explicit /2 projection required"))?;
     if observation.mode != ReplayInputMode::RepairOpponent4n
-        || observation.schema != super::QUERY_PRIOR_OBSERVATION_SCHEMA
+        || observation.schema != schema
         || observation.scope != super::SCOPE
         || audit.mode != observation.mode
         || audit.schema != observation.mode.input_schema()
@@ -746,7 +774,7 @@ pub(super) mod tests {
             semantic_binary_sha256: "a".repeat(64),
         }
     }
-    fn fixture() -> NativeReplayObservation {
+    pub(super) fn fixture() -> NativeReplayObservation {
         let mut o = super::super::tests::receipt(super::super::tests::clock(4 * 1024 * 1024));
         o.mode = ReplayInputMode::RepairOpponent4n;
         o.schema = super::super::QUERY_PRIOR_OBSERVATION_SCHEMA;

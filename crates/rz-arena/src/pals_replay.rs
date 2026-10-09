@@ -17,7 +17,10 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 mod delivery;
-pub use delivery::{BoundReplayDelivery, ReplayDeliveryRegistration};
+pub use delivery::{
+    BoundRepairReplayDelivery, BoundReplayDelivery, RepairReplayDeliveryRegistration,
+    ReplayDeliveryRegistration,
+};
 
 pub const MAX_REPLAY_CALLER_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_REPLAY_CALLER_READ_BYTES: u64 = MAX_REPLAY_CALLER_BINARY_BYTES + 32 * 1024 * 1024;
@@ -101,7 +104,10 @@ fn check_lane_and_policy(
     )?;
     if expected.schema != EXPECTED_TRANSPORT_V3_SCHEMA
         || expected.expectations.schema != EXPECTED_TRANSPORT_V2_SCHEMA
-        || expected.native_result != NativeResultLane::QueryPriorV1
+        || !matches!(
+            expected.native_result,
+            NativeResultLane::QueryPriorV1 | NativeResultLane::RepairAnchorV1
+        )
         || !expected.same_original_clock()
     {
         return Err(ArenaError::Invalid(
@@ -367,7 +373,10 @@ mod linux {
         check_clock(bundle, cancel, false)?;
         let manifest = bundle.manifest();
         if manifest.schema != OBSERVED_PREPARATION_MANIFEST_SCHEMA
-            || manifest.requested_native_result != Some(NativeResultLane::QueryPriorV1)
+            || !matches!(
+                manifest.requested_native_result,
+                Some(NativeResultLane::QueryPriorV1 | NativeResultLane::RepairAnchorV1)
+            )
             || manifest.mode != ReplayInputMode::RepairOpponent4n
         {
             return Err(ArenaError::Invalid(

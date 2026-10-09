@@ -61,9 +61,21 @@ impl ReportedPriorConsistency {
         prepared: &PreparedReplayRequest,
         cancel: &AtomicBool,
     ) -> Result<ReportedRulesConsistency, ReportedRulesError> {
+        self.check_original_rules_with(prepared, cancel, |_, _| Ok(()))
+            .map(|(report, ())| report)
+    }
+    // The extra checker sees the one reconstructed Rules graph only within this
+    // scope. Returned facts are small; the graph never becomes a report field.
+    pub(in super::super) fn check_original_rules_with<T>(
+        self,
+        prepared: &PreparedReplayRequest,
+        cancel: &AtomicBool,
+        extra: impl FnOnce(&ReplayResultRoot, &ReplayQueryPrior) -> Result<T, AdmissionFault>,
+    ) -> Result<(ReportedRulesConsistency, T), ReportedRulesError> {
         control(prepared.deadline(), cancel)?;
         let audit = &prepared.audit().input_admission;
         if self.input_artifact != *prepared.artifact()
+            || !self.original_binding.matches(audit)
             || audit.input_artifact != *prepared.artifact()
             || audit.mode != ReplayInputMode::RepairOpponent4n
             || self.whole_wall_ms != audit.whole_wall_ms
@@ -75,15 +87,19 @@ impl ReportedPriorConsistency {
             .reconstruct_result_root(cancel)
             .map_err(|e| ReportedRulesError::Original(Box::new(e)))?;
         let facts = check_lines(&root, &self.projection, cancel)?;
+        let extra_facts = extra(&root, &self.projection)?;
         // No graph is stored in the returned report. S/W/E remain unmodified.
         drop(root);
         control(prepared.deadline(), cancel)?;
-        Ok(ReportedRulesConsistency {
-            report: self,
-            repaired_endpoint: facts.repaired_endpoint,
-            opponent_endpoint: facts.opponent_endpoint,
-            anchor_ply: facts.anchor_ply,
-        })
+        Ok((
+            ReportedRulesConsistency {
+                report: self,
+                repaired_endpoint: facts.repaired_endpoint,
+                opponent_endpoint: facts.opponent_endpoint,
+                anchor_ply: facts.anchor_ply,
+            },
+            extra_facts,
+        ))
     }
 }
 struct RulesFacts {
@@ -380,6 +396,9 @@ mod tests {
                 input_artifact: prepared.artifact().clone(),
                 whole_wall_ms: prepared.audit().input_admission.whole_wall_ms,
                 cleanup_reserve_ms: prepared.audit().input_admission.cleanup_reserve_ms,
+                original_binding: ReportedOriginalBinding::from_audit(
+                    &prepared.audit().input_admission,
+                ),
             }
         };
         let result = make_report()

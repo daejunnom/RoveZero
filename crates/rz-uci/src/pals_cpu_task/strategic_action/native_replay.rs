@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 pub const SCHEMA: &str = "rz-pals-cpu-fresh-native-replay-observation/1";
 pub const OPPONENT_SCHEMA: &str = "rz-pals-cpu-fresh-native-replay-observation/2";
 pub const QUERY_PRIOR_OBSERVATION_SCHEMA: &str = "rz-pals-cpu-fresh-native-replay-observation/3";
+pub const REPAIR_ANCHOR_OBSERVATION_SCHEMA: &str = "rz-pals-cpu-fresh-native-replay-observation/4";
 pub const ASSET_PROFILE_SCHEMA: &str = "rz-pals-cpu-fresh-replay-assets/1";
 pub const SCOPE: &str = "caller_registered_inputs_to_actual_own_cpu_fresh_replay_observations";
 // Existing replay registration permits ASCII identifiers without '/'.
@@ -516,6 +517,9 @@ pub struct NativeReplayObservation {
     /// This is not a Query/2 known prior or utility/target admission.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_prior: Option<query_prior::ReplayQueryPrior>,
+    /// Explicit /4, fixed small owner-origin evidence, never a portable record ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair_anchor_evidence: Option<query_prior::RepairAnchorEvidence>,
     pub outcome: SnapshotText,
     pub trace_jsonl: String,
     pub trace_rows: usize,
@@ -1122,8 +1126,16 @@ pub fn dispatch_started(
     started: Instant,
     cancel: &AtomicBool,
 ) -> Result<Vec<u8>, NativeReplayError> {
-    dispatch_started_inner(bytes, expected, None, assets, started, cancel, false)
-        .map(NativeReplayResult::into_bytes)
+    dispatch_started_inner(
+        bytes,
+        expected,
+        None,
+        assets,
+        started,
+        cancel,
+        CaptureLane::Legacy,
+    )
+    .map(NativeReplayResult::into_bytes)
 }
 
 /// The historical producer scope is independently selected by the caller. It
@@ -1143,7 +1155,7 @@ pub fn dispatch_started_with_semantic_scope(
         assets,
         started,
         cancel,
-        false,
+        CaptureLane::Legacy,
     )
     .map(NativeReplayResult::into_bytes)
 }
@@ -1165,8 +1177,34 @@ pub fn dispatch_started_observed_with_semantic_scope(
         assets,
         started,
         cancel,
-        true,
+        CaptureLane::Prior,
     )
+}
+
+/// Explicit /4 actual-owner origin result. Never selected by old entry points.
+pub fn dispatch_started_repair_observed_with_semantic_scope(
+    bytes: &[u8],
+    expected: &ReplayExpectedPins,
+    expected_scope: SemanticReceiptProducerScope,
+    assets: CpuFreshReplayAssets<'_>,
+    started: Instant,
+    cancel: &AtomicBool,
+) -> Result<NativeReplayResult, NativeReplayError> {
+    dispatch_started_inner(
+        bytes,
+        expected,
+        Some(expected_scope),
+        assets,
+        started,
+        cancel,
+        CaptureLane::Repair,
+    )
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CaptureLane {
+    Legacy,
+    Prior,
+    Repair,
 }
 
 fn dispatch_started_inner(
@@ -1176,7 +1214,7 @@ fn dispatch_started_inner(
     assets: CpuFreshReplayAssets<'_>,
     started: Instant,
     cancel: &AtomicBool,
-    capture_query_prior: bool,
+    capture_lane: CaptureLane,
 ) -> Result<NativeReplayResult, NativeReplayError> {
     let result = (|| {
         let admission = match expected_scope {
@@ -1196,6 +1234,16 @@ fn dispatch_started_inner(
             output: checked.output_limit(),
         };
         let mode = checked.mode();
+        if capture_lane == CaptureLane::Repair && mode != ReplayInputMode::RepairOpponent4n {
+            return Err(bare_error(
+                NativeReplayPrimary::Admission(fault(
+                    "repair_result_mode",
+                    "explicit Repair origin requires registered 4N input",
+                )),
+                clock,
+                cancel,
+            ));
+        }
         let audit = checked.audit();
         let reserve = Duration::from_millis(checked.resources().cleanup_reserve_ms);
         let budget = NativeInvocationBudget::new(started, clock.execution, clock.whole, reserve)
@@ -1235,7 +1283,13 @@ fn dispatch_started_inner(
         let mut reserved = Reserved::new(roles, checks, clock)
             .map_err(|e| bare_error(NativeReplayPrimary::Admission(e), clock, cancel))?;
         let mut receipt = NativeReplayObservation {
-            schema: if mode == ReplayInputMode::RepairOpponent4n && capture_query_prior {
+            schema: if mode == ReplayInputMode::RepairOpponent4n
+                && capture_lane == CaptureLane::Repair
+            {
+                REPAIR_ANCHOR_OBSERVATION_SCHEMA
+            } else if mode == ReplayInputMode::RepairOpponent4n
+                && capture_lane == CaptureLane::Prior
+            {
                 QUERY_PRIOR_OBSERVATION_SCHEMA
             } else if mode == ReplayInputMode::RepairOpponent4n {
                 OPPONENT_SCHEMA
@@ -1270,8 +1324,12 @@ fn dispatch_started_inner(
             stages: Vec::new(),
             replay_state: reserved.state,
             opponent_state: reserved.opponent_state,
-            query_prior: (mode == ReplayInputMode::RepairOpponent4n && capture_query_prior)
+            query_prior: (mode == ReplayInputMode::RepairOpponent4n
+                && capture_lane != CaptureLane::Legacy)
                 .then(query_prior::ReplayQueryPrior::default),
+            repair_anchor_evidence: (mode == ReplayInputMode::RepairOpponent4n
+                && capture_lane == CaptureLane::Repair)
+                .then(query_prior::RepairAnchorEvidence::default),
             outcome: reserved.outcome,
             trace_jsonl: String::new(),
             trace_rows: 0,
@@ -1359,6 +1417,18 @@ fn dispatch_started_inner(
                                     "partial bounded snapshot; actual scalar work retained",
                                 ));
                             }
+                            // Result verification uses original W; any failure is
+                            // retained alongside actual work and subsequent drain.
+                            let origin_error = if receipt.replay_returned_ok {
+                                receipt
+                                    .repair_anchor_evidence
+                                    .as_mut()
+                                    .and_then(|evidence| {
+                                        evidence.capture_owner(&owner, clock.whole, cancel).err()
+                                    })
+                            } else {
+                                None
+                            }; // Failed work retains its typed primary; no origin admission.
                             match result {
                                 Some(Ok(outcome)) => {
                                     let complete = match outcome {
@@ -1380,6 +1450,9 @@ fn dispatch_started_inner(
                                 }
                                 Some(Err(e)) => primary = Some(NativeReplayPrimary::Run(e)),
                                 None => {}
+                            }
+                            if let Some(error) = origin_error {
+                                primary = Some(NativeReplayPrimary::Run(error));
                             }
                         }
                     }
@@ -1420,12 +1493,22 @@ fn dispatch_started_inner(
             "observations_returned"
         };
         if receipt.query_prior.is_some() {
-            match query_prior::consume_native_replay_prior(
-                &receipt,
-                expected,
-                assets.expected_profile_artifact,
-                assets.expected_profile,
-            ) {
+            let checked = if capture_lane == CaptureLane::Repair {
+                query_prior::consume_native_repair_replay_prior(
+                    &receipt,
+                    expected,
+                    assets.expected_profile_artifact,
+                    assets.expected_profile,
+                )
+            } else {
+                query_prior::consume_native_replay_prior(
+                    &receipt,
+                    expected,
+                    assets.expected_profile_artifact,
+                    assets.expected_profile,
+                )
+            };
+            match checked {
                 Ok(checked) => {
                     let readiness = checked.readiness();
                     if let Some(prior) = &mut receipt.query_prior {
@@ -2617,6 +2700,7 @@ mod tests {
             replay_state: SnapshotText::reserved(STATE_TEXT_BYTES).unwrap(),
             opponent_state: None,
             query_prior: None,
+            repair_anchor_evidence: None,
             outcome: SnapshotText::reserved(OUTCOME_TEXT_BYTES).unwrap(),
             trace_jsonl: String::new(),
             trace_rows: 0,

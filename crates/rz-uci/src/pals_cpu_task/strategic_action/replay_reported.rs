@@ -10,6 +10,12 @@ use serde_json::Value;
 mod rules;
 pub use rules::{ReportedRulesConsistency, ReportedRulesError};
 
+#[path = "replay_reported_repair.rs"]
+mod repair;
+pub use repair::{
+    ReportedRepairConsistency, ReportedRepairRulesConsistency, check_reported_repair_consistency,
+};
+
 /// A closed, recomputed REPORT, still pending independent native witness and
 /// caller chronology. No Serialize/Deserialize/Clone/into-projection constructor.
 pub struct ReportedPriorConsistency {
@@ -18,6 +24,47 @@ pub struct ReportedPriorConsistency {
     input_artifact: ArtifactPin,
     whole_wall_ms: u64,
     cleanup_reserve_ms: u64,
+    original_binding: ReportedOriginalBinding,
+}
+// Pin metadata only; prevents a standalone report checker from being attached to
+// a different prepared original merely by copying its input hash and clock.
+struct ReportedOriginalBinding {
+    registration: ArtifactPin,
+    action: ArtifactPin,
+    semantic: ArtifactPin,
+    parent: ReplayParentPins,
+    binding: ReplayBindingPins,
+    artifacts: ReplayRegisteredArtifacts,
+    factory: String,
+    cpu_profile: String,
+    semantic_scope: Option<SemanticReceiptProducerScope>,
+}
+impl ReportedOriginalBinding {
+    fn matches(&self, a: &super::super::super::replay_inputs::ReplayInputAudit) -> bool {
+        self.registration == a.registration_artifact
+            && self.action == a.prepared_action_artifact
+            && self.semantic == a.semantic_receipt_artifact
+            && self.parent == a.parent
+            && self.binding == a.binding
+            && self.artifacts == a.registered_artifacts
+            && self.factory == a.provider_factory_id
+            && self.cpu_profile == a.legacy_cpu_profile_sha256
+            && self.semantic_scope == a.expected_semantic_receipt_producer_scope
+    }
+    #[cfg(test)]
+    fn from_audit(a: &super::super::super::replay_inputs::ReplayInputAudit) -> Self {
+        Self {
+            registration: a.registration_artifact.clone(),
+            action: a.prepared_action_artifact.clone(),
+            semantic: a.semantic_receipt_artifact.clone(),
+            parent: a.parent.clone(),
+            binding: a.binding.clone(),
+            artifacts: a.registered_artifacts.clone(),
+            factory: a.provider_factory_id.clone(),
+            cpu_profile: a.legacy_cpu_profile_sha256.clone(),
+            semantic_scope: a.expected_semantic_receipt_producer_scope,
+        }
+    }
 }
 impl ReportedPriorConsistency {
     pub fn reported_projection(&self) -> &ReplayQueryPrior {
@@ -326,6 +373,23 @@ pub fn check_reported_prior_consistency(
     profile: &CpuFreshAssetProfile,
     projection_source: &ArtifactPin,
 ) -> Result<ReportedPriorConsistency, AdmissionFault> {
+    check_reported_prior_schema(
+        body,
+        expected,
+        profile_pin,
+        profile,
+        projection_source,
+        super::super::QUERY_PRIOR_OBSERVATION_SCHEMA,
+    )
+}
+fn check_reported_prior_schema(
+    body: Value,
+    expected: &ReplayExpectedPins,
+    profile_pin: &ArtifactPin,
+    profile: &CpuFreshAssetProfile,
+    projection_source: &ArtifactPin,
+    schema: &str,
+) -> Result<ReportedPriorConsistency, AdmissionFault> {
     bounded_json_extent(&body, super::super::super::replay_inputs::MAX_OUTPUT_BYTES)?;
     if body
         .get("stages")
@@ -347,7 +411,7 @@ pub fn check_reported_prior_consistency(
     let o: NativeWire = serde_json::from_value(body)
         .map_err(|_| fault("reported native closed field/type shape"))?;
     let a = &o.input_admission;
-    if o.schema != super::super::QUERY_PRIOR_OBSERVATION_SCHEMA
+    if o.schema != schema
         || o.scope != super::super::SCOPE
         || o.mode != ReplayInputMode::RepairOpponent4n
         || a.mode != o.mode
@@ -468,6 +532,17 @@ pub fn check_reported_prior_consistency(
         input_artifact: a.input_artifact.clone(),
         whole_wall_ms: a.whole_wall_ms,
         cleanup_reserve_ms: a.cleanup_reserve_ms,
+        original_binding: ReportedOriginalBinding {
+            registration: a.registration_artifact.clone(),
+            action: a.prepared_action_artifact.clone(),
+            semantic: a.semantic_receipt_artifact.clone(),
+            parent: a.parent.clone(),
+            binding: a.binding.clone(),
+            artifacts: a.registered_artifacts.clone(),
+            factory: a.provider_factory_id.clone(),
+            cpu_profile: a.legacy_cpu_profile_sha256.clone(),
+            semantic_scope: a.expected_semantic_receipt_producer_scope,
+        },
     })
 }
 fn bounded_json_extent(value: &Value, limit: usize) -> Result<(), AdmissionFault> {

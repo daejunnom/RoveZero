@@ -1716,6 +1716,7 @@ mod cpu_cli {
             LegacyLibrary,
             LegacyScoped(SemanticReceiptProducerScope),
             ObservedPrior(SemanticReceiptProducerScope),
+            ObservedRepair(SemanticReceiptProducerScope),
         }
         fn native_dispatch_route(
             scope: SemanticScopeRoute,
@@ -1731,6 +1732,11 @@ mod cpu_cli {
                     if mode == replay_inputs::ReplayInputMode::RepairOpponent4n =>
                 {
                     Ok(NativeDispatchRoute::ObservedPrior(scope))
+                }
+                (SemanticScopeRoute::Explicit(scope), Some(NativeResultLane::RepairAnchorV1))
+                    if mode == replay_inputs::ReplayInputMode::RepairOpponent4n =>
+                {
+                    Ok(NativeDispatchRoute::ObservedRepair(scope))
                 }
                 _ => Err(TransportError::new(
                     "native_result_mode",
@@ -1977,6 +1983,17 @@ mod cpu_cli {
                     )
                     .map(native_replay::NativeReplayResult::into_bytes)
                 }
+                NativeDispatchRoute::ObservedRepair(scope) => {
+                    native_replay::dispatch_started_repair_observed_with_semantic_scope(
+                        &request,
+                        &expected,
+                        scope,
+                        assets,
+                        context.started,
+                        &cancel,
+                    )
+                    .map(native_replay::NativeReplayResult::into_bytes)
+                }
             };
             match dispatched {
                 Ok(bytes) => {
@@ -2148,6 +2165,38 @@ mod cpu_cli {
                     assert!(context.requested_native_result.is_none());
                     assert!(!context.native_dispatch_entered);
                 }
+            }
+            #[test]
+            fn repair_origin_result_requires_explicit_scope_and_registered_four_stage_mode() {
+                let scope = SemanticReceiptProducerScope::LibraryDispatcherArgument;
+                for mode in [
+                    replay_inputs::ReplayInputMode::ReplyOnly2n,
+                    replay_inputs::ReplayInputMode::RepairEndpoint3n,
+                    replay_inputs::ReplayInputMode::RepairOpponent4n,
+                ] {
+                    assert!(
+                        native_dispatch_route(
+                            SemanticScopeRoute::LibraryOnlyV1,
+                            Some(NativeResultLane::RepairAnchorV1),
+                            mode
+                        )
+                        .is_err()
+                    );
+                    let result = native_dispatch_route(
+                        SemanticScopeRoute::Explicit(scope),
+                        Some(NativeResultLane::RepairAnchorV1),
+                        mode,
+                    );
+                    if mode == replay_inputs::ReplayInputMode::RepairOpponent4n {
+                        assert_eq!(result.unwrap(), NativeDispatchRoute::ObservedRepair(scope));
+                    } else {
+                        assert!(result.is_err());
+                    }
+                }
+                assert_eq!(
+                    serde_json::to_string(&NativeResultLane::RepairAnchorV1).unwrap(),
+                    "\"repair_anchor_v1\""
+                );
             }
             #[test]
             fn v3_closed_codec_rejects_clock_version_lane_and_extra_field_mutations() {
