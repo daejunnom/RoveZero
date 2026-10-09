@@ -3462,3 +3462,14 @@ GPU 검증 보류·실제 학습 제외·로컬 heavy CPU 미실행을 유지한
 - 관측 범위는 해당 순간의 executable **파일 동일성**이다. 바이너리 내용·동적 library·계속 같은 executable로 실행됐음·fork 탈출·NN 완료·cgroup enforcement·native witness·전역 Query 순서의 증거는 아니다. 기존 독립 source pin과 pre/postflight를 대체하지 않는다. child가 입력 전에 exit하거나 proc 접근을 허용하지 않는 환경은 unobserved failure로 남긴다.
 
 실제 Linux `/bin/cat` 입력 전달 검사는 device/inode·입력 전 관측 순서·완전 종료·legacy JSON 보존과 결손/순서/PID 거부를 검사한다. 별도 Linux 검사는 실제 proc executable과 다른 pinned file의 불일치를 거부한다. CPU CI가 실제 frozen 모델 실행·Query admission이나 GPU 인수를 대신하지 않는다. GPU 보류·학습 제외·로컬 heavy CPU 보류·Draft·goal active는 유지한다.
+
+### 실제 loaded executable 내용과 원래 실행 예산의 연결
+
+동일 파일 관측만으로 내용 hash가 검증됐다고 표시하지 않는다. PALS의 실제 caller는 기존 바이너리 preflight에 더해, 부모 감독자가 열어 유지하는 실제 child의 proc executable FD를 원본 stdin 전에 검증한다. 기존 `read_at` 기반 16KiB 스트리밍 hash·크기·metadata 전후 대조·각 block의 원래 E/취소 검사를 재사용한다. 고정 바이너리 FD의 이름이나 자식의 자기 보고를 해시 대상 대신 쓰지 않는다. 일반 original-input API는 기존 파일 동일성 경로를 유지하고 이 추가 검증 접점은 crate 내부에 둔다.
+
+- 시작 전에는 **바이너리 두 pass와 publication 두 pass**의 실제 bytes 합계를 checked arithmetic으로 계산해 선언된 verification read credit에 들어가는지 확인한다. 전체 read credit·최대 바이너리 크기·S/E/W·worker·output 한도를 자동 확대하지 않는다. 기존 정책이 큰 바이너리의 추가 pass를 수용하지 못하면 시작 전에 예산 부족을 거부한다.
+- 내용 검증 후 원래 E를 넘었거나 취소됐으면 stdin을 보내지 않는다. 검증 거부는 이미 시작한 child를 버리는 새 `Err` 경로로 전환하지 않는다. 기존 bounded drain·group 종료·reap·pending custody와 `process.loaded_image_verification_refused`를 남기고, `OwnedReplayCapture::loaded_binary_error`에 원래 hash/크기/read-credit/clock 오류를 JSON postflight 오류와 별도로 보존한다.
+- `CheckedReplayLoadedBinary`는 실제 capture의 private 내용 관측과 같은 PID의 complete process 관측을 빌린다. 등록한 binary artifact, 실제 file device/inode, loaded-file 관측→검증 시작→검증 종료→첫 write 순서가 일치해야 한다. 공개 생성자·Clone·serde나 generic callback 성공만으로 이 자료를 만들 수 없다. `binary.rs`는 이 caller-side 내용 관측의 readonly 접점이며 모델·native 결과·Query를 검산하지 않는다.
+- 단일 `ReportedRepairPriorMaterial`은 같은 capture의 내용 검증을 요구하고 이 작은 관측을 빌린다. 원래 raw body·입력·부모 시각·예약·실패 반환 조건을 유지한다. 바이너리 전체 buffer·모델/session·Rules graph를 추가 복제하지 않으며 기존 transport/1 및 native /3,/4 형식을 바꾸지 않는다.
+
+독립 인수는 구분한다. 작은 Linux actual-process 검사는 실제 cat executable의 올바른/틀린 SHA-256, cursor 보존, 읽기 credit 차감, 원래 입력 전 거부·0 byte 전송·완전 종료를 확인한다. 추가 supervisor 검사는 성공 callback 직후의 취소와 E 경과도 입력을 허용하지 않는지 확인한다. CPU 경계 검사는 read-credit overflow/부족과 검증 시각의 역순을 다룬다. 이 검사는 actual registered frozen 4N 모델/NN, runtime dependency, 지속적인 executable 동일성, hostile write·fork 격리, next Query episode/ledger·whole utility 또는 paired 대국의 증거가 아니다. 해당 native 인수와 실행 연결은 남기며 GPU 보류·학습 제외·로컬 heavy CPU 보류·Draft·goal active를 유지한다. 새 exact-head CPU CI는 게시 후 실제 로그로 별도 인수한다.
