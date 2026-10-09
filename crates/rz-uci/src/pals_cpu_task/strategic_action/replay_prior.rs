@@ -369,6 +369,11 @@ pub struct CheckedNativeReplayPrior<'a> {
     readiness: PriorReadiness,
 }
 impl<'a> CheckedNativeReplayPrior<'a> {
+    /// The original native observation borrowed by this checked capability.
+    /// This does not deserialize, copy or admit a reported child observation.
+    pub fn observation(&self) -> &'a NativeReplayObservation {
+        self.observation
+    }
     pub fn projection(&self) -> &'a ReplayQueryPrior {
         self.observation
             .query_prior

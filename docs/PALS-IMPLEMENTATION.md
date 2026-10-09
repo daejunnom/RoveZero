@@ -141,13 +141,38 @@ P6의 양성 자체 CPU pair만으로 두 원문의 전체 구현 완료를 선�
 
 | 항목 | 구현·인수 경계 |
 |---|---|
-| CPU_T SEE 정렬 | Rules-legal material exchange를 ordering에만 쓰는 `LegalSeeV1` Rust API와 CPU CI를 제공한다. legacy 기본값과 식별은 유지하며, private CPU_T 소비자의 명시적 선택 연결은 별도 인수한다. |
-| V 결과 환류 | 실제 CPU 결과의 같은 범위 완료 정보를 다음 immutable private 입력에 전달하는 bounded coverage loop를 준비한다. coverage 증가는 전략적 유용성이나 학습 target의 증거가 아니다. branch/profile/budget의 선택·유용성 비교 범위도 별도로 기록한다. |
-| GPU record 공유 메모리 | host record page와 CUDA whole-input bank를 record별 GPU 증분 공유로 표시하지 않는다. missing subset 인코딩·실제 device join·불변 read view·물리 pin·한도·격리 접점이 구현돼야 한다. GPU 검증 보류와 소스 미구현은 다른 상태다. |
-| Repair 이후 C 재검토 | 원래 첫 수와 수정 line/revision을 유지한 targeted C 재공격의 직접 호출·소비를 확인한다. 다음 round의 새 root Propose만으로 이 연결을 인수하지 않는다. 전략적 강도 향상은 별도 관측 사항이다. |
+| CPU_T SEE 정렬 | `LegalSeeV1` Rust ordering과 private CPU_T의 명시적 `--cpu-ordering=legal-see-v1`·봉인된 `ordering_policy: legal_see_v1`, producer의 `--ordering-policy legal_see_v1`까지 연결돼 있다. legacy 기본값·식별은 유지하며 SEE는 전략적 증명이나 영구 pruning이 아니다. 등록 기준 `b6de532`의 Linux·Windows CI에서 실제 선택 engine·조건·report·독립 resume namespace를 검사했다. 새 실제 producer 실행과 기력 효과는 별도 인수한다. |
+| V 결과 환류 | bounded coverage loop와 native Repair 보고의 단일 prior 자료 발급 접점이 있다. capture의 loaded binary·원래 S/E/W·Rules·raw body·부모 transport 비용을 검사하지만, 자료 발급만으로 actual native witness·다음 Query admission·episode ledger·whole-action utility를 발급하지 않는다. coverage 증가는 전략적 유용성이나 학습 target의 증거가 아니다. |
+| GPU record 공유 메모리 | host whole-input page와 record별 CUDA resident packing을 구분한다. 명시적 `registered-packing-v1` lane의 missing subset 인코딩·device join·불변 read view·물리 pin·예약·격리·CLI/arena 연결 소스가 있다. source/CPU 검사와 실제 target GPU의 수치·물리 완료·eviction·메모리 관측 인수는 분리한다. 전체 입력 cache 성공을 record별 GPU 공유의 증거로 쓰지 않는다. |
+| Repair 이후 C 재검토 | 같은 line을 한 번 재검토하는 기존 lane과 실제 새 C continuation의 별도 S lane·다중 Reply 관측 접점이 있다. 원래 첫 수·Repair line/revision·첫 ongoing 상대 anchor·실제 dispatch/소비를 대조한다. 새 source의 실제 다중 Reply 수집 인수와 전략적 강도 효과는 별도로 남기며 다음 round의 root Propose로 대신하지 않는다. |
 | 실제 CPU pair | 해당 integration source/binary와 시계·NN 소비·typed failed-go 0·Rules·PGN·process·저장·cleanup을 모두 인수한다. preparation 자기 보고나 CPU CI로 대체하지 않는다. |
 | 선택적 후속 기능 | CUDA private Warm, paused search stack, set-associative TT, fast pruning과 대체 optimizer는 원문의 후보·미결정 범위를 보존한다. 기본 Fresh 구현의 필수 통과 조건으로 임의 확대하지 않는다. |
 
-실제 학습은 이번 목표에서 제외한다. 사용자 지시로 GPU 검증도 현재 보류한다.
-보류된 실행을 성공 또는 skip 인수로 채우지 않으며, 전체 구현·CPU CI·실신경망·
-실제 대국·GPU 인수와 미지원 옵션을 각각 기록한다.
+실제 학습은 이번 목표에서 제외한다. 2026-10-09 재개에서는 총괄과 서브에이전트가
+소유 경계를 나눠 구현하며, GPU를 포함한 최종 실행은 총괄이 등록된 소스·바이너리·
+자산·환경과 유한 예산을 확인한 뒤 인수한다. 과거 GPU 보류·실패 자료는 그대로 보존한다.
+구현·CPU CI·실신경망·실제 대국·GPU 인수와 미지원 옵션을 각각 기록하며 미실행을
+성공 또는 skip 인수로 채우지 않는다.
+
+### 현재 소스의 최종 인수 순서
+
+재개 감사 기준은 `b6de5325d47a417461823f4a92329287c0e5af09`이며 그 SHA의 CPU CI
+성공을 후속 수정이나 실제 frozen NN 실행의 성공으로 소급하지 않는다. 아래 목록은
+학습 제외 목표의 잔여 인수이며 구현 담당의 개별 완료와 최종 통합 인수를 구분한다.
+
+1. 중단된 CPU 실행의 실제 owner·lease·scratch 상태를 확인하고 원래 실패 자료를
+   보존한다. 최종 source·feature·바이너리와 자산을 새 실행에 등록한다.
+2. 실제 registered frozen 4N CPU caller와 독립 native witness를 인수한다. 원래
+   S/E/W, 입력 전 loaded binary 확인, raw·Rules·물리 완료·정리를 각각 확인한다.
+3. 실제 결과를 다음 immutable Query에 소비하는 episode·prior ledger와 전체 action
+   비용·utility 경계를 연결한다. 중복·순서 역전·늦은 결과·취소를 거부하고 unknown은
+   masked로 보존한다. legacy receipt를 만들어 native 관측을 대신하지 않는다.
+4. 같은 통합 소스에서 actual 다중 Reply의 tensor·dispatch·소비·Repair anchor/revision,
+   분할·누출·영수증·저장을 인수한다. GPU 수치·공유 page·물리 수명 검사는 별도로 남긴다.
+5. 같은 최종 source/binary의 자체 CPU 상대 한 쌍을 기존 120초+1초·최대 256 ply·
+   전체 15분+정리 30초로 실행한다. 두 판의 백/흑·시계·NN 소비·typed failed-go·Rules·
+   PGN·EOF/reap/group 종료·필수 최종 저장을 확인한다. 과거 source에 고정된 준비
+   명세·binary를 새 source의 인수로 사용하지 않는다.
+6. 원문의 선택된 필수 요구사항을 source·CPU 검사·실제 CPU·GPU·paired 자료에
+   대조하고 정확한 최종 SHA의 CI와 PR 인수 기록을 갱신한다. 미지원 선택적 연구,
+   실제 학습 제외와 관측되지 않은 값은 완료 범위와 함께 명시한다.

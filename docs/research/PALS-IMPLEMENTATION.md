@@ -11,6 +11,28 @@ Rust 제품의 실제 startup·역할 소비·취소·게임 수명·최종 증�
 export·frozen forward·dataset preparation을 구분한다. Python 준비 성공을 Rust 제품의
 실행 인수·학습·강도 결과로 승격하지 않는다.
 
+## 2026-10-09 병렬 재개 감사 기준
+
+이 절의 기준 소스는 `b6de5325d47a417461823f4a92329287c0e5af09`다. 사용자는 학습
+제외 목표의 병렬 구현을 재개했다. GPU 보류와 CPU 실행 보류를 서술하는 뒤의 기록은
+그 당시 상태이며 현재 재개를 취소하지 않는다. 총괄이 최종 소스·자산·환경·예산을
+확인한 실행과 개별 담당의 source 작업을 구분한다. 기존 실패·unknown·미인수 원문과
+실행 자료를 변경하거나 새 성공으로 재작성하지 않는다.
+
+기준 SHA의 [CPU CI 37897124887](https://github.com/daejunnom/RoveZero/actions/runs/37897124887)는
+Linux·Windows·CPU bindings·PALS model 네 job이 모두 성공했다. 이것은 후속 통합 소스의
+CI, 실제 registered frozen 4N 실행·next Query·whole-action utility·최종 다중 Reply 수집,
+GPU 또는 paired 인수의 성공을 뜻하지 않는다. 원문의 전체 요구사항 대조와 최종 실행
+순서는 [PALS 구현과 인수 기록](../PALS-IMPLEMENTATION.md)을 따른다.
+
+| 재개 시 경계 | 확인된 소스·기존 증거 | 최종 통합에서 필요한 증거 |
+|---|---|---|
+| CPU_T SEE | private Rust CPU task와 producer의 명시적 SEE 선택까지 구현돼 있다. 기준 SHA의 Linux·Windows CI는 `legal_see_is_explicit_and_preserves_legacy_identity_and_resume_boundary`, `see_profile_conditions_and_reports_use_actual_selected_engine`, `see_cross_profile_keeps_ordering_but_uses_fresh_independent_namespace`를 통과했다. | 실제 선택한 producer 실행은 source·binary·ordering 조건으로 별도 등록한다. 기본값 변경·기력 개선을 이 검사로 주장하지 않는다. |
+| 실제 frozen caller와 Query 환류 | loaded binary·원래 실행 창·보고 Rules·caller 비용·단일 prior 자료 발급의 소스와 CPU 검사가 있다. | 실제 registered child/NN·독립 native witness와 다음 Query admission·episode ledger·중복/늦은 결과 거부를 연결한다. 발급 자료를 legacy receipt 또는 native capability로 바꾸어 쓰지 않는다. |
+| V 비용·utility | 조건부 witness와 엄격한 unknown/masked 준비 경계가 있다. | 같은 사전 질문·prior의 독립 action 전체 비용과 실제 결과가 있어야 알려진 utility를 발급한다. 부분 관측이나 선언값을 양의 target으로 승격하지 않는다. |
+| GPU record page와 물리 수명 | 명시적 resident packing의 loader·planner·owner·CLI·arena 소스가 있다. 과거 독립 numeric와 제품 오류 자료는 각 실행 source로 남아 있다. | 최종 source의 target CUDA 수치·subset/device join·pin/eviction·취소/늦은 완료·정상 종료와 관측 자원을 인수한다. host page·CPU fixture로 대신하지 않는다. |
+| 다중 Reply와 최종 CPU pair | actual C continuation·anchor·native journal과 typed failed-go·Rules/시계·최종 저장 경로가 있다. 기존 CPU03 및 더 이전 pair의 실패 자료를 보존한다. | 같은 최종 source/binary의 실제 collection 및 자체 CPU_R paired 한 쌍에서 모든 계수·영수증·PGN·EOF/reap/group 종료·정리를 확인한다. 과거 build89 준비는 현재 source의 실행 증거가 아니다. |
+
 ## 처리 흐름과 소유 경계
 
 제품 경로는 기존 UCI에서 탐색을 선택한 뒤 Rules의 정확한 상태·이력·합법 수를 사용한다.
