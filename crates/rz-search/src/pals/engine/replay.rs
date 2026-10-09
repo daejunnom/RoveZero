@@ -25,7 +25,8 @@ mod opponent_recheck;
 use opponent_recheck::OpponentRecheckState;
 pub use opponent_recheck::{
     FRESH_REPLAY_OPPONENT_SCOPE, RepairOpponentReplayRequirements, ReplayOpponentEndpoint,
-    ReplayOpponentOutcome, ReplayOpponentRoleStep, repair_opponent_replay_requirements,
+    ReplayOpponentOutcome, ReplayOpponentRepairOrigin, ReplayOpponentRoleStep,
+    repair_opponent_replay_requirements,
 };
 
 pub const FRESH_REPLAY_SCOPE: &str = "rz-pals-frozen-parent-defend-response-replay/1";

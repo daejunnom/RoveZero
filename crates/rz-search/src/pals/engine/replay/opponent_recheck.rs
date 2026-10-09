@@ -239,6 +239,88 @@ mod tests {
     }
 
     #[test]
+    fn repair_origin_borrows_actual_record_and_recomputes_anchor_without_new_work() {
+        let mut owner = fixture();
+        let limits = limits();
+        assert!(
+            owner
+                .opponent_repair_origin(limits.deadline, &AtomicBool::new(false))
+                .unwrap()
+                .is_none()
+        );
+        owner
+            .run_with_opponent_recheck(limits, &AtomicBool::new(false))
+            .unwrap();
+        let work = (
+            owner.counters().cpu_nodes,
+            owner.counters().cpu_tasks_requested,
+            owner.engine.model.contexts.len(),
+            owner.engine.model.finish_calls,
+        );
+        let origin = owner
+            .opponent_repair_origin(limits.deadline, &AtomicBool::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(origin.anchor_ply(), 3);
+        assert_eq!(origin.model_counterline(), owner.model_counterline());
+        assert_eq!(origin.repaired_line(), owner.repaired_line());
+        assert_eq!(
+            Some(origin.repair_record_revision()),
+            owner.repair_record_revision
+        );
+        assert_eq!(
+            work,
+            (
+                owner.counters().cpu_nodes,
+                owner.counters().cpu_tasks_requested,
+                owner.engine.model.contexts.len(),
+                owner.engine.model.finish_calls
+            )
+        );
+    }
+
+    #[test]
+    fn repair_origin_refuses_record_revision_anchor_or_original_line_substitution() {
+        for case in 0..4 {
+            let mut owner = fixture();
+            let limits = limits();
+            owner
+                .run_with_opponent_recheck(limits, &AtomicBool::new(false))
+                .unwrap();
+            match case {
+                0 => owner
+                    .engine
+                    .records
+                    .retain(|record| record.kind != RecordKind::Repair),
+                1 => owner.repair_record_revision = owner.repair_record_revision.map(|r| r + 1),
+                2 => owner.opponent_recheck.as_mut().unwrap().anchor_ply = Some(4),
+                _ => owner.model_counterline[2] = owner.repaired_line[2],
+            }
+            assert!(
+                owner
+                    .opponent_repair_origin(limits.deadline, &AtomicBool::new(false))
+                    .is_err(),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn repair_origin_result_verification_obeys_cancellation_and_its_original_window() {
+        let owner = fixture();
+        assert!(
+            owner
+                .opponent_repair_origin(limits().deadline, &AtomicBool::new(true))
+                .is_err()
+        );
+        assert!(
+            owner
+                .opponent_repair_origin(Instant::now(), &AtomicBool::new(false))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn actual_c_generates_response_and_remaining_tail_not_repair_suffix() {
         let mut owner = fixture();
         let outcome = owner
@@ -792,7 +874,72 @@ pub struct ReplayOpponentEndpoint<'a> {
     pub stage: Option<&'a ReplayStageReport>,
 }
 
+/// Borrowed actual accepted Repair record/path and recomputed anchor. Local
+/// revision is provenance, never a portable record handle or strategic feature.
+/// Only the live owner can construct it; no Clone/Deserialize/owned constructor.
+pub struct ReplayOpponentRepairOrigin<'a> {
+    model_counterline: &'a [BoardMove],
+    repaired_line: &'a [BoardMove],
+    repair_record_revision: u64,
+    anchor_ply: usize,
+}
+impl ReplayOpponentRepairOrigin<'_> {
+    pub fn model_counterline(&self) -> &[BoardMove] {
+        self.model_counterline
+    }
+    pub fn repaired_line(&self) -> &[BoardMove] {
+        self.repaired_line
+    }
+    pub fn repair_record_revision(&self) -> u64 {
+        self.repair_record_revision
+    }
+    pub fn anchor_ply(&self) -> usize {
+        self.anchor_ply
+    }
+}
+
 impl<M: RoleModel> FreshReplayOwner<M> {
+    /// Readonly result verification under the supplied original W. It reuses the
+    /// actual work's anchor predicate and store checks, without CPU/model work,
+    /// role counters, reservations, new records or an extension of work's E.
+    pub fn opponent_repair_origin(
+        &self,
+        verification_deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<Option<ReplayOpponentRepairOrigin<'_>>, ReplayError> {
+        let control = || {
+            check_role_control(verification_deadline, cancel)
+                .map_err(|error| PalsError::from(error).into())
+        };
+        control()?;
+        let Some(anchor) = self.opponent_anchor_ply() else {
+            return Ok(None);
+        };
+        let (Some(line), Some(revision)) = (self.repair_line_id, self.repair_record_revision)
+        else {
+            return Err(
+                StoreError::InvalidEvidence("opponent anchor lacks actual Repair record").into(),
+            );
+        };
+        let recomputed = self
+            .opponent_anchor_with_control(line, revision, &control)?
+            .ok_or(StoreError::InvalidEvidence(
+                "record has no eligible opponent anchor",
+            ))?;
+        if recomputed.2 != anchor {
+            return Err(StoreError::InvalidEvidence(
+                "stored opponent anchor differs from actual Repair path",
+            )
+            .into());
+        }
+        control()?;
+        Ok(Some(ReplayOpponentRepairOrigin {
+            model_counterline: &self.model_counterline,
+            repaired_line: &self.repaired_line,
+            repair_record_revision: revision,
+            anchor_ply: anchor,
+        }))
+    }
     pub fn opponent_counterline(&self) -> &[BoardMove] {
         self.opponent_recheck
             .as_ref()
@@ -905,6 +1052,17 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         limits: PalsLimits,
         cancel: &AtomicBool,
     ) -> Result<Option<(usize, usize, usize)>, ReplayError> {
+        self.opponent_anchor_with_control(repaired_line, record_revision, &|| {
+            self.check_control(limits, cancel)
+        })
+    }
+
+    fn opponent_anchor_with_control(
+        &self,
+        repaired_line: LineId,
+        record_revision: u64,
+        control: &dyn Fn() -> Result<(), ReplayError>,
+    ) -> Result<Option<(usize, usize, usize)>, ReplayError> {
         let active_root = self.engine.stores.root().ok_or(StoreError::StaleConsumer)?;
         let root = self
             .engine
@@ -941,7 +1099,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         let mut node = root;
         let mut changed_own = false;
         for (ply, movement) in self.repaired_line.iter().enumerate() {
-            self.check_control(limits, cancel)?;
+            control()?;
             self.check_node_state(node)?;
             if changed_own
                 && self.engine.nodes[node].position.side_to_move() != color
