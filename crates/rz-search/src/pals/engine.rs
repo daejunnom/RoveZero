@@ -2461,7 +2461,7 @@ impl<M: RoleModel> PalsEngine<M> {
             Err(error) => {
                 self.nodes[node].resume = None;
                 self.stores.tasks.fail(execution)?;
-                return Err(error.into());
+                return Err(error);
             }
         };
         if requested_coverage_complete {
@@ -3538,7 +3538,7 @@ impl<M: RoleModel> PalsEngine<M> {
             Ok(observation) => observation,
             Err(error) => {
                 self.stores.tasks.fail(execution)?;
-                return Err(error.into());
+                return Err(error);
             }
         };
         if complete {
@@ -5073,7 +5073,7 @@ impl<M: RoleModel> PalsEngine<M> {
     ) -> Result<ObservationId, PalsError> {
         // Restricted-search summaries deliberately retain estimate scope. Even
         // a finite CPU mate score cannot mint RulesTerminal through this route.
-        Ok(self.append_engine_observation(Observation {
+        self.append_engine_observation(Observation {
             state: self.nodes[root].state,
             line: Some(line),
             source: stable_id(self.search_identity()),
@@ -5099,7 +5099,7 @@ impl<M: RoleModel> PalsEngine<M> {
             kind,
             supersedes,
             execution: None,
-        })?)
+        })
     }
     fn publish_choice(
         &self,

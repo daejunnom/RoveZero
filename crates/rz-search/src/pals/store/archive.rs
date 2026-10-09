@@ -1620,8 +1620,10 @@ impl PalsStores {
             bundle
                 .engine_records
                 .retain(|record| reachable.contains(&record.origin_state()));
-            let mut pins = StorePins::default();
-            pins.states = reachable;
+            let mut pins = StorePins {
+                states: reachable,
+                ..StorePins::default()
+            };
             for node in &bundle.engine_nodes {
                 pins.situations.insert(node.situation);
             }

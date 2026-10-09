@@ -1179,7 +1179,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 context_revision: self.revision,
             }
         };
-        Ok(self.append_engine_observation(Observation {
+        self.append_engine_observation(Observation {
             state: self.nodes[work.root].state,
             line: Some(work.repaired_line),
             source: stable_id(self.search_identity()),
@@ -1202,6 +1202,6 @@ impl<M: RoleModel> PalsEngine<M> {
             kind: ObservationKind::Refutation,
             supersedes,
             execution: None,
-        })?)
+        })
     }
 }
