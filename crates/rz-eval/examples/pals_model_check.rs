@@ -3,8 +3,7 @@
 use rz_eval::asset;
 use rz_eval::onnx::{OrtRuntime, Provider};
 use rz_eval::pals_model::{
-    PalsModelConfig, PalsModelInput, PalsRawOutput, PalsRole, PALS_ENCODING_SCHEMA,
-    PALS_MODEL_SCHEMA,
+    PalsModelConfig, PalsModelInput, PalsModelProfile, PalsRawOutput, PalsRecordLine, PalsRole,
 };
 use rz_eval::pals_onnx::{
     HostRecordPagePolicy, HostRecordPageSnapshot, PalsBackendStats, PalsCudaControlPolicy,
@@ -29,6 +28,12 @@ mod resident_cuda;
 #[serde(deny_unknown_fields)]
 struct Fixtures {
     schema: String,
+    #[serde(default)]
+    config: PalsModelConfig,
+    #[serde(default)]
+    model_profile: Option<PalsModelProfile>,
+    #[serde(default)]
+    encoding_schema: Option<String>,
     checkpoint_sha256: String,
     rules_certified: bool,
     trained: bool,
@@ -45,7 +50,24 @@ struct Case {
 }
 
 fn validate_fixture_coverage(fixtures: &Fixtures) -> Result<(), Box<dyn Error>> {
-    let required = [
+    fixtures.config.validate()?;
+    let profile = fixtures.config.profile;
+    if !profile.is_legacy()
+        && (fixtures.model_profile != Some(profile)
+            || fixtures.encoding_schema.as_deref() != Some(profile.encoding_schema()))
+    {
+        return Err("V2 reference profile/encoding declaration differs".into());
+    }
+    if profile.is_legacy()
+        && (fixtures.model_profile.is_some_and(|p| !p.is_legacy())
+            || fixtures
+                .encoding_schema
+                .as_deref()
+                .is_some_and(|s| s != profile.encoding_schema()))
+    {
+        return Err("legacy reference cannot declare V2 tensor semantics".into());
+    }
+    let mut required = vec![
         ("empty_context", PalsRole::Proposer, 0, 0, 0),
         ("critic_divergence", PalsRole::Critic, 3, 7, 4),
         ("proposer_order", PalsRole::Proposer, 3, 7, 0),
@@ -53,7 +75,15 @@ fn validate_fixture_coverage(fixtures: &Fixtures) -> Result<(), Box<dyn Error>> 
         ("same_board_other_history", PalsRole::Proposer, 3, 7, 0),
         ("all_promotions", PalsRole::Critic, 1, 4, 1),
     ];
-    if fixtures.schema != PALS_MODEL_SCHEMA
+    if profile.uses_full_line() {
+        required.extend([
+            ("full_middle_record_changed", PalsRole::Critic, 3, 7, 4),
+            ("full_middle_query_changed", PalsRole::Proposer, 3, 7, 0),
+            ("record_relations_changed", PalsRole::Critic, 3, 7, 4),
+            ("empty_line_padding", PalsRole::Proposer, 1, 1, 0),
+        ]);
+    }
+    if fixtures.schema != profile.model_semantics()
         || fixtures.rules_certified
         || fixtures.reference != "pytorch_fp32_tf32_off"
         || fixtures.cases.len() != required.len()
@@ -70,7 +100,7 @@ fn validate_fixture_coverage(fixtures: &Fixtures) -> Result<(), Box<dyn Error>> 
             return Err("P/C numeric reference case is missing or duplicated".into());
         }
         let input = &matching[0].input;
-        input.validate(&PalsModelConfig::baseline())?;
+        input.validate(&fixtures.config)?;
         if input.role != role
             || input.records.len() != records
             || input.candidates.len() != candidates
@@ -79,7 +109,7 @@ fn validate_fixture_coverage(fixtures: &Fixtures) -> Result<(), Box<dyn Error>> 
             return Err("P/C numeric reference case does not cover its declared role/shape".into());
         }
         let witness = &matching[0].public_memory;
-        let tokens = PalsModelConfig::baseline().public_memory_tokens(records)?;
+        let tokens = fixtures.config.public_memory_tokens(records)?;
         if witness.tokens != tokens
             || witness.memory_key.len() != 2 * tokens * 64
             || witness.memory_value.len() != 2 * tokens * 64
@@ -124,6 +154,110 @@ fn validate_fixture_coverage(fixtures: &Fixtures) -> Result<(), Box<dyn Error>> 
     }) {
         return Err("promotion reference does not cover queen/rook/bishop/knight order".into());
     }
+    if profile.uses_full_line() {
+        let middle_changed =
+            |before: &[rz_eval::pals_model::PalsCandidateToken],
+             after: &[rz_eval::pals_model::PalsCandidateToken]| {
+                before.len() >= 3
+                    && before.len() == after.len()
+                    && before.first() == after.first()
+                    && before.last() == after.last()
+                    && before[1..before.len() - 1] != after[1..after.len() - 1]
+            };
+        let record = &case("full_middle_record_changed").input;
+        let base = &case("critic_divergence").input;
+        let mut restored = record.clone();
+        restored
+            .full_line
+            .as_mut()
+            .ok_or("record mutation full_line missing")?
+            .records = base
+            .full_line
+            .as_ref()
+            .ok_or("base full_line missing")?
+            .records
+            .clone();
+        if restored != *base
+            || !record
+                .full_line
+                .as_ref()
+                .unwrap()
+                .records
+                .iter()
+                .zip(&base.full_line.as_ref().unwrap().records)
+                .any(|(after, before)| middle_changed(&before.moves, &after.moves))
+        {
+            return Err(
+                "record-middle comparison does not isolate equal-endpoint full sequence changes"
+                    .into(),
+            );
+        }
+        let query = &case("full_middle_query_changed").input;
+        let base = &case("proposer_order").input;
+        let after = query
+            .full_line
+            .as_ref()
+            .ok_or("query mutation full_line missing")?;
+        let before = base
+            .full_line
+            .as_ref()
+            .ok_or("query base full_line missing")?;
+        let mut restored = query.clone();
+        let lines = restored.full_line.as_mut().unwrap();
+        lines.query_prefix = before.query_prefix.clone();
+        lines.query_proposal = before.query_proposal.clone();
+        lines.query_counter = before.query_counter.clone();
+        if restored != *base
+            || ![
+                (&before.query_prefix, &after.query_prefix),
+                (&before.query_proposal, &after.query_proposal),
+                (&before.query_counter, &after.query_counter),
+            ]
+            .into_iter()
+            .any(|(before, after)| middle_changed(before, after))
+            || case("full_middle_query_changed").public_memory
+                != case("proposer_order").public_memory
+        {
+            return Err(
+                "query-middle comparison changed public memory or another model input".into(),
+            );
+        }
+        let relation = &case("record_relations_changed").input;
+        let base = &case("critic_divergence").input;
+        let mut restored = relation.clone();
+        let changed_lines = restored
+            .full_line
+            .as_mut()
+            .ok_or("relation mutation full_line missing")?;
+        let base_lines = base.full_line.as_ref().unwrap();
+        for (changed, before) in changed_lines.records.iter_mut().zip(&base_lines.records) {
+            changed.parent = before.parent;
+            changed.supersedes = before.supersedes;
+            changed.parent_required = before.parent_required;
+            changed.supersedes_required = before.supersedes_required;
+        }
+        if relation == base
+            || restored != *base
+            || case("record_relations_changed").public_memory
+                != case("critic_divergence").public_memory
+        {
+            return Err(
+                "private relationship mutation changed independent public encoder inputs".into(),
+            );
+        }
+        let empty = case("empty_line_padding")
+            .input
+            .full_line
+            .as_ref()
+            .ok_or("padding full_line missing")?;
+        if empty.records.iter().any(|r| !r.moves.is_empty())
+            || !empty.query_prefix.is_empty()
+            || !empty.query_proposal.is_empty()
+            || !empty.query_counter.is_empty()
+        {
+            return Err("empty-line case does not exercise fully masked temporal padding".into());
+        }
+    }
     Ok(())
 }
 
@@ -143,10 +277,13 @@ fn compare(actual: &[f32], expected: &[f32], atol: f64, rtol: f64) -> Result<f64
     }
     Ok(maximum)
 }
-fn verify(raw: &PalsRawOutput, case: &Case) -> Result<serde_json::Value, Box<dyn Error>> {
-    let config = PalsModelConfig::baseline();
-    let actual = raw.decode(&case.input, &config)?;
-    let expected = case.expected.decode(&case.input, &config)?;
+fn verify(
+    raw: &PalsRawOutput,
+    case: &Case,
+    config: &PalsModelConfig,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let actual = raw.decode(&case.input, config)?;
+    let expected = case.expected.decode(&case.input, config)?;
     let candidate = compare(
         &raw.candidate_logits,
         &case.expected.candidate_logits,
@@ -315,7 +452,10 @@ fn numeric_window(start: Instant) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn reseal_numeric_input(input: &mut PalsModelInput) -> Result<(), Box<dyn Error>> {
+fn reseal_numeric_input(
+    input: &mut PalsModelInput,
+    config: &PalsModelConfig,
+) -> Result<(), Box<dyn Error>> {
     // Derived inputs are model-tensor cases, not fabricated Rules positions,
     // CPU observations or training targets. Retain the reference history/epoch.
     input.required_critical_records = input
@@ -324,11 +464,25 @@ fn reseal_numeric_input(input: &mut PalsModelInput) -> Result<(), Box<dyn Error>
         .filter(|record| record.critical)
         .map(|record| record.record_id)
         .collect();
-    let config = PalsModelConfig::baseline();
-    input.validate(&config)?;
-    let prepared = input.prepare_tensors(&config)?;
-    if prepared.input_key != input.canonical_input_key(&config)?
-        || prepared.public_memory_key != input.public_memory_key(&config)?
+    // These controlled page derivations isolate public feature reuse. Full-line
+    // reference mutations above exercise actual nonempty complete sequences.
+    if let Some(lines) = &mut input.full_line {
+        lines.records = input
+            .records
+            .iter()
+            .map(|_| PalsRecordLine {
+                moves: vec![],
+                parent: None,
+                supersedes: None,
+                parent_required: false,
+                supersedes_required: false,
+            })
+            .collect();
+    }
+    input.validate(config)?;
+    let prepared = input.prepare_tensors(config)?;
+    if prepared.input_key != input.canonical_input_key(config)?
+        || prepared.public_memory_key != input.public_memory_key(config)?
     {
         return Err("derived full canonical/encoding identity did not reseal".into());
     }
@@ -430,7 +584,7 @@ fn derived_record_cases(
         ("derived_role_order_p_to_c_again", critic_view),
     ];
     for (_, input) in &mut cases {
-        reseal_numeric_input(input)?;
+        reseal_numeric_input(input, &fixtures.config)?;
     }
     if cases.len() > 20 {
         return Err("derived correctness case cap exceeded".into());
@@ -519,7 +673,8 @@ fn check_host_record_pages(
         .find(|graph| graph.role == "public")
         .ok_or("registered public graph identity missing")?
         .sha256;
-    let policy = HostRecordPagePolicy::for_registered_graph(graph_sha);
+    let policy =
+        HostRecordPagePolicy::for_profile_registered_graph(fixtures.config.profile, graph_sha);
     pages.enable_host_record_pages(policy)?;
     let checkpoint = asset::parse_sha256(&fixtures.checkpoint_sha256)?;
     if !matches!(whole.config().provider, Provider::Cpu)
@@ -537,7 +692,7 @@ fn check_host_record_pages(
     for case in &fixtures.cases {
         numeric_window(start)?;
         let raw = pages.run(&case.input)?;
-        let mut row = verify(&raw, case)?;
+        let mut row = verify(&raw, case, &fixtures.config)?;
         row["public_memory"] = verify_public(&pages, case)?;
         row["page_ownership"] = page_snapshot_json(&completed_page_snapshot(&pages, true)?);
         anchors.push(row);
@@ -572,14 +727,10 @@ fn check_host_record_pages(
         let actual = pages.run(input)?;
         let native_after = pages.snapshot_stats()?;
         let page_after = completed_page_snapshot(&pages, true)?;
-        let mut row = verify(&actual, &case)?;
+        let mut row = verify(&actual, &case, &fixtures.config)?;
         row["public_memory"] = verify_public(&pages, &case)?;
-        row["input_key"] = json!(hex_digest(
-            &input.canonical_input_key(&PalsModelConfig::baseline())?
-        ));
-        row["full_public_key"] = json!(hex_digest(
-            &input.public_memory_key(&PalsModelConfig::baseline())?
-        ));
+        row["input_key"] = json!(hex_digest(&input.canonical_input_key(&fixtures.config)?));
+        row["full_public_key"] = json!(hex_digest(&input.public_memory_key(&fixtures.config)?));
         row["records"] = json!(input.records.len());
         row["role"] = json!(input.role);
         row["first_run_accounting"] =
@@ -629,7 +780,7 @@ fn check_host_record_pages(
         let repeated = pages.run(input)?;
         let repeat_native = pages.snapshot_stats()?;
         let repeat_pages = completed_page_snapshot(&pages, true)?;
-        verify(&repeated, &case)?;
+        verify(&repeated, &case, &fixtures.config)?;
         let repeat_counts =
             verify_page_run_accounting(&native_after, &repeat_native, &page_after, &repeat_pages)?;
         if repeat_native.public_nn_runs_completed != native_after.public_nn_runs_completed
@@ -647,7 +798,7 @@ fn check_host_record_pages(
             return Err("fresh whole comparator did not physically execute both graphs".into());
         }
         numeric_window(start)?;
-        verify(&whole.run(input)?, &case)?;
+        verify(&whole.run(input)?, &case, &fixtures.config)?;
         let whole_repeat = whole.snapshot_stats()?;
         let whole_ownership = whole.host_public_page_snapshot();
         if whole_repeat.public_nn_runs_completed != whole_after.public_nn_runs_completed
@@ -682,7 +833,7 @@ fn check_host_record_pages(
     let fresh_after_clear = pages.run(&first.input)?;
     let after_fresh_native = pages.snapshot_stats()?;
     let after_fresh_pages = completed_page_snapshot(&pages, true)?;
-    verify(&fresh_after_clear, &first)?;
+    verify(&fresh_after_clear, &first, &fixtures.config)?;
     verify_public(&pages, &first)?;
     let fresh_counts = verify_page_run_accounting(
         &native_after_clear,
@@ -705,7 +856,7 @@ fn check_host_record_pages(
         "scope":"model_tensor_numeric_only_no_rules_or_training_certification_no_performance_claim",
         "provider":"CPUExecutionProvider","precision":"fp32","tf32":false,
         "max_window_seconds":HOST_PAGE_CHECK_SECONDS,"native_deadline_scope":"before_each_synchronous_Run_not_forced_cancellation",
-        "encoding_schema":PALS_ENCODING_SCHEMA,"manifest_sha256":export_sha,"checkpoint_sha256":fixtures.checkpoint_sha256,
+        "encoding_schema":fixtures.config.profile.encoding_schema(),"manifest_sha256":export_sha,"checkpoint_sha256":fixtures.checkpoint_sha256,
         "independent_reference_anchor":{"source":"original_registered_six_case_pytorch_fp32_tf32_off",
             "whole_results":"top_level_cases_unchanged","page_cases":anchors},
         "derived_whole_page_equivalence":{"source":"fresh_whole_input_ORT_same_pinned_export_and_runtime",
@@ -860,6 +1011,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let epoch = backend.model_epoch();
     if epoch != asset::parse_sha256(&fixtures.checkpoint_sha256)?
         || backend.is_trained() != fixtures.trained
+        || backend.model_config() != &fixtures.config
     {
         return Err("reference weight epoch differs".into());
     }
@@ -867,7 +1019,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         if case.name.is_empty() || case.name.len() > 128 || case.input.model_epoch != epoch {
             return Err("fixture identity differs".into());
         }
-        case.input.validate(&PalsModelConfig::baseline())?;
+        case.input.validate(&fixtures.config)?;
     }
     // CUDA tests are bounded by the shell/process owner in addition to these
     // logical deadlines. This check never claims a deadline stopped native Run.
@@ -894,7 +1046,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .into(),
             );
         }
-        let mut report = verify(&raw, case)?;
+        let mut report = verify(&raw, case, &fixtures.config)?;
         report["public_memory"] = verify_public(&backend, case)?;
         reports.push(report);
         let repeated = backend.run(&case.input)?;
@@ -1020,7 +1172,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             PhysicalPoll::Ready(result) => {
                 match result? {
                     PalsNativeResult::Evaluation(raw) => {
-                        verify(&raw, &fixtures.cases[0])?;
+                        verify(&raw, &fixtures.cases[0], &fixtures.config)?;
                     }
                     PalsNativeResult::NewGame => {
                         return Err("evaluation unexpectedly returned a cache reset".into())
@@ -1181,7 +1333,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cuda_evidence = json!({"cuda_mode":args[6],"graph_optimization":graph_optimization,
         "cuda_control_inventory_sha256":control_policy.as_ref().map(|_| args[10].as_str()),
         "cuda_placement_witness":placement_witness,"fresh_cuda_placement_witness":fresh_placement_witness});
-    let mut receipt = json!({"schema": PALS_MODEL_SCHEMA,"status":"passed","trained":trained,"rules_certified":false,
+    let mut receipt = json!({"schema": fixtures.config.profile.model_semantics(),"status":"passed","trained":trained,"rules_certified":false,
         "model_epoch":hex_digest(&epoch),"manifest_sha256":args[1],"fixture_sha256":hex_digest(&fixture_digest),
         "runtime_sha256":hex_digest(&runtime_digest),"runtime":"1.22.0","rust_ort":"2.0.0-rc.10",
         "provider":if is_cuda {"CUDAExecutionProvider"} else {"CPUExecutionProvider"},"precision":"fp32","tf32":false,
@@ -1196,6 +1348,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let fields = receipt
         .as_object_mut()
         .ok_or("acceptance receipt is not an object")?;
+    if !fixtures.config.profile.is_legacy() {
+        fields.insert("model_profile".into(), json!(fixtures.config.profile));
+        fields.insert(
+            "encoding_schema".into(),
+            json!(fixtures.config.profile.encoding_schema()),
+        );
+        fields.insert(
+            "public_counter_scope".into(),
+            json!("registered_profile_reference_cases_before_new_game_checks"),
+        );
+    }
     fields.insert("host_public_page_ownership".into(), host_page_evidence);
     fields.insert(
         "native_loading".into(),

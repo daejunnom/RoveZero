@@ -29,6 +29,10 @@ use std::time::Instant;
 
 pub const PRIVATE_WARM_SEMANTICS: &str =
     "rz-pals-private-approx-warm/1;fp32-bits;same-exact-rules-context;role-isolated;accepted-seed-only;no-exact-cache";
+/// Distinct CUDA invocation namespace. A bank lease alone does not attest a
+/// loaded CUDA graph, I/O binding, device residency or physical completion.
+pub const PRIVATE_CUDA_WARM_SEMANTICS: &str =
+    "rz-pals-private-approx-cuda-warm/2;fp32-bits;same-exact-rules-context;role-isolated;accepted-seed-only;no-exact-cache;device-public-kv;physical-output-fence";
 pub const CURRENT_NATIVE_PRIVATE_WARM_SUPPORTED: bool = false;
 const MAX_LATENT_ELEMENTS: usize = 16 * 384;
 // Conservative per-allocation ownership overhead. This is a module reservation,
@@ -123,6 +127,30 @@ impl PrivateRulesContext {
         for value in input.divergence_features.iter().flatten() {
             context.update(value.to_bits().to_le_bytes());
         }
+        if !config.profile.is_legacy() {
+            context.update(b"rz-pals-private-non-record-v2/2");
+            context.update(config.profile.as_str().as_bytes());
+            context.update(config.profile.encoding_schema().as_bytes());
+            // Ordered query lines are part of the question, not public record
+            // revision. Record lines and their local relationships may change.
+            if let Some(lines) = &input.full_line {
+                for line in [
+                    &lines.query_prefix,
+                    &lines.query_proposal,
+                    &lines.query_counter,
+                ] {
+                    context.update((line.len() as u64).to_le_bytes());
+                    for candidate in line {
+                        context.update(
+                            candidate
+                                .packed()
+                                .map_err(|_| PrivateSeedError::InvalidModelInput)?
+                                .to_le_bytes(),
+                        );
+                    }
+                }
+            }
+        }
         Ok(Self {
             rules: snapshot.weak_position_identity(),
             rules_revision: snapshot.revision(),
@@ -201,12 +229,19 @@ pub enum PrivateInvocation {
         seed_seal: [u8; 32],
         invocation_key: [u8; 32],
     },
+    /// CUDA Warm is explicitly admitted and never relabels a V1 invocation.
+    ApproxCudaWarmV2 {
+        input_key: [u8; 32],
+        seed_seal: [u8; 32],
+        invocation_key: [u8; 32],
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrivateInvocationMode {
     Fresh,
     ApproxWarmV1,
+    ApproxCudaWarmV2,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -552,10 +587,11 @@ impl PrivateSeedBank {
             {
                 return Err(PrivateSeedError::InvalidModelInput);
             }
-            if mode == PrivateInvocationMode::ApproxWarmV1 && request.role == PalsRole::Validator {
+            let warm = mode != PrivateInvocationMode::Fresh;
+            if warm && request.role == PalsRole::Validator {
                 return Err(PrivateSeedError::UnsupportedRole);
             }
-            let seed = if mode == PrivateInvocationMode::ApproxWarmV1 {
+            let seed = if warm {
                 state.slots[role_index(request.role)]
                     .iter()
                     .rev()
@@ -579,16 +615,20 @@ impl PrivateSeedBank {
                 .ok_or(PrivateSeedError::GenerationExhausted)?;
             let count = match mode {
                 PrivateInvocationMode::Fresh => state.counts.fresh_admissions.checked_add(1),
-                PrivateInvocationMode::ApproxWarmV1 => state.counts.warm_admissions.checked_add(1),
+                PrivateInvocationMode::ApproxWarmV1 | PrivateInvocationMode::ApproxCudaWarmV2 => {
+                    state.counts.warm_admissions.checked_add(1)
+                }
             }
             .ok_or(PrivateSeedError::GenerationExhausted)?;
-            let invocation = invocation(&request, seed.as_deref());
+            let invocation = invocation(&request, seed.as_deref(), mode);
             let model = request.model;
             check_control(cancelled, deadline)?;
             state.next_id = id;
             match mode {
                 PrivateInvocationMode::Fresh => state.counts.fresh_admissions = count,
-                PrivateInvocationMode::ApproxWarmV1 => state.counts.warm_admissions = count,
+                PrivateInvocationMode::ApproxWarmV1 | PrivateInvocationMode::ApproxCudaWarmV2 => {
+                    state.counts.warm_admissions = count
+                }
             }
             state.active = Some(Active {
                 id,
@@ -1151,19 +1191,36 @@ fn hash_request(hash: &mut Sha256, request: &PrivateSeedRequest) {
     hash.update(request.context.situation.prefix);
     hash.update(request.context.situation.focus);
 }
-fn invocation(request: &PrivateSeedRequest, seed: Option<&Seed>) -> PrivateInvocation {
+fn invocation(
+    request: &PrivateSeedRequest,
+    seed: Option<&Seed>,
+    mode: PrivateInvocationMode,
+) -> PrivateInvocation {
     let input_key = request.context.prepared_input;
     match seed {
         None => PrivateInvocation::Fresh { input_key },
         Some(seed) => {
             let mut hash = Sha256::new();
-            hash.update(PRIVATE_WARM_SEMANTICS.as_bytes());
+            hash.update(if mode == PrivateInvocationMode::ApproxCudaWarmV2 {
+                PRIVATE_CUDA_WARM_SEMANTICS.as_bytes()
+            } else {
+                PRIVATE_WARM_SEMANTICS.as_bytes()
+            });
             hash_request(&mut hash, request);
             hash.update(seed.provenance.seal);
-            PrivateInvocation::ApproxWarmV1 {
-                input_key,
-                seed_seal: seed.provenance.seal,
-                invocation_key: hash.finalize().into(),
+            let invocation_key = hash.finalize().into();
+            if mode == PrivateInvocationMode::ApproxCudaWarmV2 {
+                PrivateInvocation::ApproxCudaWarmV2 {
+                    input_key,
+                    seed_seal: seed.provenance.seal,
+                    invocation_key,
+                }
+            } else {
+                PrivateInvocation::ApproxWarmV1 {
+                    input_key,
+                    seed_seal: seed.provenance.seal,
+                    invocation_key,
+                }
             }
         }
     }
@@ -1196,6 +1253,16 @@ fn provenance(
             ..
         } => {
             seal.update([1]);
+            seal.update(invocation_key);
+            seal.update(seed_seal);
+        }
+        PrivateInvocation::ApproxCudaWarmV2 {
+            invocation_key,
+            seed_seal,
+            ..
+        } => {
+            seal.update([2]);
+            seal.update(PRIVATE_CUDA_WARM_SEMANTICS.as_bytes());
             seal.update(invocation_key);
             seal.update(seed_seal);
         }
@@ -1257,6 +1324,7 @@ mod tests {
             situation_revision: 0,
             history_digest: [4; 32],
             model_epoch: [5; 32],
+            full_line: None,
         }
     }
     fn request(position: &PositionSnapshot, input: &PalsModelInput) -> PrivateSeedRequest {
@@ -1332,6 +1400,98 @@ mod tests {
         assert!(matches!(
             PrivateSeedBank::new(exact, 1),
             Err(PrivateSeedError::Budget)
+        ));
+    }
+    #[test]
+    fn cuda_invocation_has_a_distinct_key_and_keeps_unknown_seed_pinned() {
+        let position = Position::startpos();
+        let snapshot = position.snapshot();
+        let input = input(PalsRole::Proposer);
+        let req = request(&snapshot, &input);
+        let bank = PrivateSeedBank::new(limits(), 1).unwrap();
+        let (accepted, _) = accepted(&bank, &req, &snapshot, PrivateInvocationMode::Fresh);
+        let cancel = CancelToken::new();
+        let v1 = bank
+            .begin(
+                req.clone(),
+                &snapshot,
+                PrivateInvocationMode::ApproxWarmV1,
+                &cancel,
+                deadline(),
+            )
+            .unwrap();
+        let PrivateInvocation::ApproxWarmV1 {
+            invocation_key: v1_key,
+            seed_seal,
+            ..
+        } = v1.invocation()
+        else {
+            panic!("expected v1");
+        };
+        assert_eq!(seed_seal, accepted.seal);
+        drop(v1.complete_known(PhysicalSeedCompletion::Failed).unwrap());
+        let cuda = bank
+            .begin(
+                req,
+                &snapshot,
+                PrivateInvocationMode::ApproxCudaWarmV2,
+                &cancel,
+                deadline(),
+            )
+            .unwrap();
+        let PrivateInvocation::ApproxCudaWarmV2 {
+            invocation_key: cuda_key,
+            seed_seal,
+            ..
+        } = cuda.invocation()
+        else {
+            panic!("expected CUDA v2");
+        };
+        assert_eq!(seed_seal, accepted.seal);
+        assert_ne!(cuda_key, v1_key);
+        let id = cuda.id();
+        drop(cuda); // Unknown is not a successful completion or seed publication.
+        let state = bank.snapshot().unwrap();
+        assert!(state.quarantined && state.admission_closed);
+        assert_eq!(state.active_lease, Some(id));
+        assert_eq!(state.pinned_entries, 1);
+        assert_eq!(state.counts.accepted_seeds, 1);
+        assert!(matches!(
+            bank.reset_game(2),
+            Err(PrivateSeedError::ActivePhysicalLease)
+        ));
+    }
+    #[test]
+    fn cuda_full_line_query_change_cannot_reuse_same_rules_seed() {
+        use crate::pals_model::{PalsFullLineInput, PalsModelProfile};
+        let snapshot = Position::startpos().snapshot();
+        let config = PalsModelConfig::for_profile(PalsModelProfile::FullLineV2);
+        let mut input = input(PalsRole::Proposer);
+        input.full_line = Some(PalsFullLineInput {
+            records: vec![],
+            query_prefix: input.candidates.clone(),
+            query_proposal: input.candidates.clone(),
+            query_counter: vec![],
+        });
+        let mut req = request(&snapshot, &super::tests::input(PalsRole::Proposer));
+        let situation = req.context.situation;
+        req.context = PrivateRulesContext::seal(&snapshot, &input, &config, situation).unwrap();
+        let bank = PrivateSeedBank::new(limits(), 1).unwrap();
+        accepted(&bank, &req, &snapshot, PrivateInvocationMode::Fresh);
+        input.situation_revision = 1;
+        let current = PrivateRulesContext::seal(&snapshot, &input, &config, situation).unwrap();
+        assert!(req.context.warm_eligible(&current, &snapshot));
+        input.full_line.as_mut().unwrap().query_proposal[0].to = 20;
+        req.context = PrivateRulesContext::seal(&snapshot, &input, &config, situation).unwrap();
+        assert!(matches!(
+            bank.begin(
+                req,
+                &snapshot,
+                PrivateInvocationMode::ApproxCudaWarmV2,
+                &CancelToken::new(),
+                deadline()
+            ),
+            Err(PrivateSeedError::MissingSeed)
         ));
     }
     #[test]

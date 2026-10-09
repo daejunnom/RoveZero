@@ -2268,6 +2268,7 @@ mod tests {
             situation_revision: 1,
             history_digest: [5; 32],
             model_epoch: [2; 32],
+            full_line: None,
         };
         let mut prepared = input
             .prepare_tensors(&PalsModelConfig::default())

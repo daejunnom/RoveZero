@@ -34,6 +34,22 @@ impl HostRecordPagePolicy {
             max_transient_bytes: 2 * 1024 * 1024,
         }
     }
+    pub const fn for_profile_registered_graph(
+        profile: PalsModelProfile,
+        public_graph_sha256: [u8; 32],
+    ) -> Self {
+        Self {
+            projection_semantics: profile.independent_projection_semantics(),
+            // Full-line input and its missing-record subset overlap until the
+            // native fence. Charge both, rather than shrinking the sequence.
+            max_transient_bytes: if profile.uses_full_line() {
+                8 * 1024 * 1024
+            } else {
+                2 * 1024 * 1024
+            },
+            ..Self::for_registered_graph(public_graph_sha256)
+        }
+    }
     fn entry_budget(self) -> u64 {
         2 * self.max_page_entries as u64 * MemoryBank::<HostPage>::entry_slot_bytes()
     }
@@ -99,6 +115,11 @@ struct PublicSubset {
     mask: Tensor<bool>,
     bytes: u64,
     slots: usize,
+    lines: Option<PublicSubsetLines>,
+}
+struct PublicSubsetLines {
+    tokens: Tensor<i64>,
+    mask: Tensor<bool>,
 }
 struct JoinBuffers {
     key: Vec<f32>,
@@ -201,7 +222,8 @@ impl PalsOnnxBackend {
                 )
             })?;
         if graph.sha256 != policy.public_graph_sha256
-            || policy.projection_semantics != INDEPENDENT_RECORD_PROJECTION_SEMANTICS
+            || policy.projection_semantics
+                != self.model_config.profile.independent_projection_semantics()
         {
             return Err(fail(
                 K::IdentityMismatch,
@@ -263,13 +285,14 @@ impl PalsOnnxBackend {
         content: [u8; 32],
         policy: HostRecordPagePolicy,
     ) -> MemoryKey {
-        projected_page_key(
+        projected_page_key_for(
             kind,
             content,
             policy,
             self.epoch,
             self.manifest_digest,
             self.game_generation,
+            self.model_config.profile,
         )
     }
 
@@ -395,7 +418,14 @@ impl PalsOnnxBackend {
             + if missing.is_empty() {
                 0
             } else {
-                (subset_slots * 16 * 4 + subset_slots + std::mem::size_of::<PublicSubset>()) as u64
+                (subset_slots * 16 * 4
+                    + subset_slots
+                    + std::mem::size_of::<PublicSubset>()
+                    + if plan.record_lines.is_some() {
+                        subset_slots * MAX_LINE_PLY * (3 * 8 + 1)
+                    } else {
+                        0
+                    }) as u64
             };
         if predicted > pages.policy.max_transient_bytes {
             return Err(fail(
@@ -415,18 +445,51 @@ impl PalsOnnxBackend {
             let slots = miss_records.len().max(1);
             let mut features = vec![0.; slots * 16];
             let mut mask = vec![false; slots];
+            let mut line_arrays = plan.record_lines.as_ref().map(|_| {
+                (
+                    vec![0; slots * MAX_LINE_PLY * 3],
+                    vec![false; slots * MAX_LINE_PLY],
+                )
+            });
             for (slot, index) in miss_records.iter().enumerate() {
                 features[slot * 16..(slot + 1) * 16].copy_from_slice(&plan.features[*index]);
                 mask[slot] = plan.record_mask[*index];
+                if let (Some(source), Some((tokens, line_mask))) =
+                    (&plan.record_lines, &mut line_arrays)
+                {
+                    for (ply, movement) in source[*index].iter().enumerate() {
+                        let offset = (slot * MAX_LINE_PLY + ply) * 3;
+                        tokens[offset..offset + 3].copy_from_slice(&[
+                            movement.from as i64,
+                            movement.to as i64,
+                            movement.promotion as i64,
+                        ]);
+                        line_mask[slot * MAX_LINE_PLY + ply] = true;
+                    }
+                }
             }
             let bytes = (features.capacity() * 4
                 + mask.capacity()
-                + std::mem::size_of::<PublicSubset>()) as u64;
+                + std::mem::size_of::<PublicSubset>()
+                + line_arrays.as_ref().map_or(0, |(tokens, line_mask)| {
+                    tokens.capacity() * 8 + line_mask.capacity()
+                })) as u64;
+            let lines = line_arrays
+                .map(|(tokens, mask)| {
+                    Ok::<_, BackendError>(PublicSubsetLines {
+                        tokens: Tensor::from_array(([1, slots, MAX_LINE_PLY, 3], tokens))
+                            .map_err(tensor_create)?,
+                        mask: Tensor::from_array(([1, slots, MAX_LINE_PLY], mask))
+                            .map_err(tensor_create)?,
+                    })
+                })
+                .transpose()?;
             pages.subset = Some(PublicSubset {
                 records: Tensor::from_array(([1, slots, 16], features)).map_err(tensor_create)?,
                 mask: Tensor::from_array(([1, slots], mask)).map_err(tensor_create)?,
                 bytes,
                 slots,
+                lines,
             });
         }
         // Reserve every known overlapping owner before Run: original prepared
@@ -522,13 +585,16 @@ impl PalsOnnxBackend {
             .submitted_record_tokens
             .saturating_add(slots as u64);
         startup_enter(trace, PalsStartupBackendStage::PublicRun);
+        let mut values = ort::inputs!["board" => &active.board, "metadata" => &active.metadata,
+            "records" => &subset.records, "record_mask" => &subset.mask];
+        if let Some(lines) = &subset.lines {
+            values.extend(ort::inputs!["record_line_tokens" => &lines.tokens, "record_line_mask" => &lines.mask]);
+        }
         let result = self
             .public
             .as_mut()
             .expect("public session installed")
-            .run(ort::inputs![
-            "board" => &active.board, "metadata" => &active.metadata,
-            "records" => &subset.records, "record_mask" => &subset.mask]);
+            .run(values);
         startup_return(trace, PalsStartupBackendStage::PublicRun, result.is_ok());
         let outputs = match result {
             Ok(outputs) => outputs,
@@ -654,6 +720,7 @@ fn tensor_create(error: ort::Error) -> BackendError {
         error,
     )
 }
+#[cfg(test)]
 fn projected_page_key(
     kind: PublicPageKind,
     content: [u8; 32],
@@ -662,6 +729,25 @@ fn projected_page_key(
     manifest: [u8; 32],
     game_generation: u64,
 ) -> MemoryKey {
+    projected_page_key_for(
+        kind,
+        content,
+        policy,
+        epoch,
+        manifest,
+        game_generation,
+        PalsModelProfile::LegacySummaryV1,
+    )
+}
+fn projected_page_key_for(
+    kind: PublicPageKind,
+    content: [u8; 32],
+    policy: HostRecordPagePolicy,
+    epoch: [u8; 32],
+    manifest: [u8; 32],
+    game_generation: u64,
+    profile: PalsModelProfile,
+) -> MemoryKey {
     // Bind the content to both the full checkpoint epoch and actual public
     // graph. The old full canonical input/public key is never rewritten.
     let mut hash = sha2::Sha256::new();
@@ -669,12 +755,15 @@ fn projected_page_key(
     hash.update(content);
     hash.update(epoch);
     hash.update(policy.public_graph_sha256);
-    hash.update(INDEPENDENT_RECORD_PROJECTION_SEMANTICS.as_bytes());
+    hash.update(profile.independent_projection_semantics().as_bytes());
+    if !profile.is_legacy() {
+        hash.update(profile.as_str().as_bytes());
+    }
     MemoryKey::PublicPage(PublicPageKey {
         kind,
         content: Digest(hash.finalize().into()),
         model: Digest(manifest),
-        encoding: Digest(asset::sha256(PALS_ENCODING_SCHEMA.as_bytes())),
+        encoding: Digest(asset::sha256(profile.encoding_schema().as_bytes())),
         precision: PrecisionProfile::Fp32,
         frozen_epoch: 0,
         game_generation,
@@ -685,6 +774,16 @@ fn plan_capacity_bytes(plan: &IndependentPublicPlan) -> u64 {
         + plan.record_contents.capacity() * 32
         + plan.features.capacity() * 16 * 4
         + plan.record_mask.capacity()) as u64
+        + plan.record_lines.as_ref().map_or(0, |lines| {
+            (lines.capacity() * std::mem::size_of::<Vec<crate::pals_model::PalsCandidateToken>>()
+                + lines
+                    .iter()
+                    .map(|line| {
+                        line.capacity()
+                            * std::mem::size_of::<crate::pals_model::PalsCandidateToken>()
+                    })
+                    .sum::<usize>()) as u64
+        })
 }
 fn role_output_bytes(input: &PalsModelInput) -> u64 {
     let floats = input.candidates.len().max(1)
@@ -759,6 +858,45 @@ fn copy_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn v2_page_policy_and_keys_bind_complete_encoder_profile() {
+        let profile = PalsModelProfile::FullLineInteractionV2;
+        let policy = HostRecordPagePolicy::for_profile_registered_graph(profile, [1; 32]);
+        assert_eq!(
+            policy.projection_semantics,
+            profile.independent_projection_semantics()
+        );
+        assert!(
+            policy.max_transient_bytes
+                > HostRecordPagePolicy::for_registered_graph([1; 32]).max_transient_bytes
+        );
+        let key = projected_page_key_for(
+            PublicPageKind::IndependentRecordProjection,
+            [2; 32],
+            policy,
+            [3; 32],
+            [4; 32],
+            1,
+            profile,
+        );
+        let other = projected_page_key_for(
+            PublicPageKind::IndependentRecordProjection,
+            [2; 32],
+            policy,
+            [3; 32],
+            [4; 32],
+            1,
+            PalsModelProfile::FullLineV2,
+        );
+        assert_ne!(key, other);
+        let MemoryKey::PublicPage(page) = key else {
+            panic!("public page expected")
+        };
+        assert_eq!(
+            page.encoding,
+            Digest(asset::sha256(profile.encoding_schema().as_bytes()))
+        );
+    }
     #[test]
     fn projection_pages_fence_graph_checkpoint_encoding_precision_and_game() {
         let policy = HostRecordPagePolicy::for_registered_graph([1; 32]);

@@ -10,6 +10,10 @@ use sha2::{Digest as _, Sha256};
 use std::fs::{Metadata, OpenOptions};
 use std::io::Read;
 
+#[cfg(feature = "experimental-io-binding")]
+#[path = "warm/cuda.rs"]
+pub(super) mod cuda;
+
 pub const PRIVATE_WARM_SCHEMA: &str = "rovezero.pals-private-warm.v1";
 const WARM_LAYOUT: &str = "shared_pc_if_approx_warm_v1";
 pub const PRIVATE_WARM_GRAPH_SEMANTICS: &str =
@@ -151,6 +155,13 @@ impl PreparedWarmIdentity {
         let expected = match invocation {
             PrivateInvocation::Fresh { input_key }
             | PrivateInvocation::ApproxWarmV1 { input_key, .. } => input_key,
+            PrivateInvocation::ApproxCudaWarmV2 { .. } => {
+                return Err(BackendError::new(
+                    K::IdentityMismatch,
+                    S::Admission,
+                    "CPU PALS Warm v1 cannot bind a CUDA Warm v2 invocation",
+                ));
+            }
         };
         if self.input_key != expected {
             return Err(BackendError::new(
@@ -283,6 +294,11 @@ impl PalsWarmInput {
     pub fn input(&self) -> &PalsModelInput {
         &self.input
     }
+    /// Exact owned FP32 seed payload that will be bound to the graph. Reading it
+    /// does not allocate, consume a bank lease or certify physical completion.
+    pub fn initial_latent_bits(&self) -> &[u32] {
+        &self.initial_bits
+    }
     pub fn invocation(&self) -> PrivateInvocation {
         self.invocation
     }
@@ -313,6 +329,13 @@ impl PalsWarmInput {
         let input_key = match self.invocation {
             PrivateInvocation::Fresh { input_key }
             | PrivateInvocation::ApproxWarmV1 { input_key, .. } => input_key,
+            PrivateInvocation::ApproxCudaWarmV2 { .. } => {
+                return Err(fail(
+                    K::IdentityMismatch,
+                    S::Admission,
+                    "CPU PALS Warm v1 cannot execute a CUDA Warm v2 invocation",
+                ));
+            }
         };
         if input_key != canonical
             || self.prepared.input_key != canonical
@@ -447,6 +470,14 @@ fn validate_input(
 #[serde(deny_unknown_fields)]
 struct WarmManifest {
     schema: String,
+    #[serde(default)]
+    execution_domain: Option<String>,
+    #[serde(default)]
+    query_semantics: Option<String>,
+    #[serde(default)]
+    encoding_schema: Option<String>,
+    #[serde(default)]
+    model_profile: Option<String>,
     model_semantics: String,
     layout: String,
     layout_revision: u32,
@@ -515,6 +546,17 @@ struct RulesDeclaration {
     query_features: Vec<String>,
     divergence_features: Vec<String>,
     config: PalsModelConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    full_line_features: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bounds: Option<RulesBounds>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RulesBounds {
+    max_records: usize,
+    max_line_plies: usize,
+    max_candidates: usize,
 }
 
 fn warm_inputs() -> Vec<Interface> {
@@ -684,6 +726,10 @@ impl PalsOnnxBackend {
             #[cfg(feature = "experimental-io-binding")]
             device_role: None,
             #[cfg(feature = "experimental-io-binding")]
+            private_cuda_warm: None,
+            #[cfg(feature = "experimental-io-binding")]
+            device_warm_role: None,
+            #[cfg(feature = "experimental-io-binding")]
             cuda_record_pages: None,
         })
     }
@@ -738,6 +784,11 @@ fn validate_cpu(config: PalsOnnxConfig, bundle: Option<[u8; 32]>) -> Result<(), 
 fn validate_manifest(m: &WarmManifest) -> Result<(), BackendError> {
     m.config.validate().map_err(model_input)?;
     if m.schema != PRIVATE_WARM_SCHEMA
+        || m.execution_domain.is_some()
+        || m.query_semantics.is_some()
+        || m.encoding_schema.is_some()
+        || m.model_profile.is_some()
+        || !m.config.profile.is_legacy()
         || m.model_semantics != PALS_MODEL_SCHEMA
         || m.layout != WARM_LAYOUT
         || m.layout_revision != 1
@@ -867,6 +918,8 @@ fn validate_rules(m: &WarmManifest) -> Result<(), BackendError> {
         || d.record_features.len() != 16
         || d.query_features.len() != 16
         || d.divergence_features.len() != 8
+        || d.full_line_features.is_some()
+        || d.bounds.is_some()
     {
         return Err(fail(
             K::IdentityMismatch,
@@ -1170,7 +1223,7 @@ mod tests {
 
     // Authored declarations/capabilities below are available only to this child
     // unit. They never load an ORT session or claim Native numerical acceptance.
-    fn declaration() -> RulesDeclaration {
+    pub(super) fn declaration() -> RulesDeclaration {
         let features = |n| {
             (0..n)
                 .map(|i| format!("authored_field_{i}"))
@@ -1191,6 +1244,8 @@ mod tests {
             query_features: features(16),
             divergence_features: features(8),
             config: PalsModelConfig::baseline(),
+            full_line_features: None,
+            bounds: None,
         };
         d.semantic_fields = std::iter::once(d.rules_input_profile.clone())
             .chain(std::iter::once(d.rules_base_semantics.clone()))
@@ -1211,7 +1266,7 @@ mod tests {
         d.rules_input_semantic_sha256 = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
         d
     }
-    fn descriptors(values: Vec<Interface>) -> Vec<TensorManifest> {
+    pub(super) fn descriptors(values: Vec<Interface>) -> Vec<TensorManifest> {
         values
             .into_iter()
             .map(|v| TensorManifest {
@@ -1237,12 +1292,16 @@ mod tests {
             })
             .collect()
     }
-    fn manifest() -> WarmManifest {
+    pub(super) fn manifest() -> WarmManifest {
         let d = declaration();
         let canonical =
             serde_json::to_vec(&canonical_value(serde_json::to_value(&d).unwrap())).unwrap();
         WarmManifest {
             schema: PRIVATE_WARM_SCHEMA.into(),
+            execution_domain: None,
+            query_semantics: None,
+            encoding_schema: None,
+            model_profile: None,
             model_semantics: PALS_MODEL_SCHEMA.into(),
             layout: WARM_LAYOUT.into(),
             layout_revision: 1,
@@ -1367,6 +1426,7 @@ mod tests {
             situation_revision: 0,
             history_digest: [8; 32],
             model_epoch: [3; 32],
+            full_line: None,
         }
     }
     #[test]

@@ -147,7 +147,7 @@ impl Selection {
             let before = idle_snapshot(&pages)?;
             let raw = pages.run(&case.input)?;
             let after = idle_snapshot(&pages)?;
-            let mut row = verify(&raw, case)?;
+            let mut row = verify(&raw, case, &context.fixtures.config)?;
             row["resident_accounting"] = accounting(&before, &after)?;
             anchors.push(row);
         }
@@ -171,7 +171,7 @@ impl Selection {
             window(start)?;
             let raw = pages.run(&input)?;
             let after = idle_snapshot(&pages)?;
-            let mut row = verify(&raw, &case)?;
+            let mut row = verify(&raw, &case, &context.fixtures.config)?;
             row["input_key"] = json!(hex_digest(
                 &input.canonical_input_key(&PalsModelConfig::baseline())?
             ));
@@ -210,7 +210,7 @@ impl Selection {
                 _ => {}
             }
             window(start)?;
-            verify(&pages.run(&input)?, &case)?;
+            verify(&pages.run(&input)?, &case, &context.fixtures.config)?;
             let repeated = idle_snapshot(&pages)?;
             row["repeat_accounting"] = accounting(&after, &repeated)?;
             if repeated.stats.public_subset_runs_completed
@@ -245,7 +245,7 @@ impl Selection {
             start,
         )? {
             PalsNativeResult::Evaluation(raw) => {
-                verify(&raw, &context.fixtures.cases[0])?;
+                verify(&raw, &context.fixtures.cases[0], &context.fixtures.config)?;
             }
             _ => return Err("resident Evaluate returned another command".into()),
         }

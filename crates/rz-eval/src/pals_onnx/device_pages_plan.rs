@@ -1192,6 +1192,7 @@ mod tests {
             situation_revision: 1,
             history_digest: [5; 32],
             model_epoch: namespace().model_epoch,
+            full_line: None,
         }
     }
     fn limits(blocks: usize) -> DevicePagesLimits {

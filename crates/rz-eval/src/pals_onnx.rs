@@ -8,8 +8,9 @@ use crate::asset::{self, parse_sha256};
 use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
 use crate::onnx::{NativeLoadingProfile, NativeMappingObservation, OrtRuntime, Provider};
 use crate::pals_model::{
-    PalsModelConfig, PalsModelInput, PalsRawOutput, PalsRole, PreparedPalsTensors,
-    PALS_ENCODING_SCHEMA, PALS_MODEL_SCHEMA, V_TASK_NAMES,
+    PalsModelConfig, PalsModelInput, PalsModelProfile, PalsRawOutput, PalsRole,
+    PreparedPalsFullLineTensors, PreparedPalsTensors, MAX_LINE_PLY, PALS_ENCODING_SCHEMA,
+    PALS_MODEL_SCHEMA, QUERY_LINE_COUNT, V_TASK_NAMES,
 };
 use crate::worker::{PhysicalRun, SingleWorker};
 use ort::execution_providers::{
@@ -68,6 +69,12 @@ pub use device_pages_plan::{
     DEVICE_PAGE_RECORD_CAPACITY,
 };
 pub use public_pages::{HostRecordPagePolicy, HostRecordPageSnapshot, HostRecordPageStats};
+#[cfg(feature = "experimental-io-binding")]
+pub use warm::cuda::{
+    PalsCudaWarmCapability, PalsCudaWarmInput, PRIVATE_CUDA_QUERY_SEMANTICS,
+    PRIVATE_CUDA_WARM_EXECUTION_DOMAIN, PRIVATE_CUDA_WARM_GRAPH_SEMANTICS,
+    PRIVATE_CUDA_WARM_SCHEMA,
+};
 pub use warm::{
     PalsWarmCapability, PalsWarmInput, FROZEN_QUERY_SEMANTICS_V1, PRIVATE_WARM_GRAPH_SEMANTICS,
     PRIVATE_WARM_SCHEMA,
@@ -84,6 +91,7 @@ pub fn host_record_page_implementation_digest() -> [u8; 32] {
         for source in [
             include_bytes!("pals_onnx/public_pages.rs").as_slice(),
             include_bytes!("pals_model.rs").as_slice(),
+            include_bytes!("pals_model/full_line.rs").as_slice(),
             include_bytes!("pals_onnx.rs").as_slice(),
             include_bytes!("../../rz-runtime/src/pals.rs").as_slice(),
         ] {
@@ -112,6 +120,7 @@ pub fn cuda_record_pages_implementation_digest() -> [u8; 32] {
             include_bytes!("pals_onnx/cuda_control.rs").as_slice(),
             include_bytes!("pals_device_resources.rs").as_slice(),
             include_bytes!("pals_model.rs").as_slice(),
+            include_bytes!("pals_model/full_line.rs").as_slice(),
             include_bytes!("pals_onnx.rs").as_slice(),
             include_bytes!("../../rz-runtime/src/pals.rs").as_slice(),
             include_bytes!("../../rz-native-loader/src/ort_binding.rs").as_slice(),
@@ -639,6 +648,10 @@ struct ExportManifest {
     #[serde(default)]
     model_semantics: Option<String>,
     #[serde(default)]
+    model_profile: Option<PalsModelProfile>,
+    #[serde(default)]
+    encoding_schema: Option<String>,
+    #[serde(default)]
     layout: Option<String>,
     #[serde(default)]
     layout_revision: Option<u32>,
@@ -715,18 +728,46 @@ enum Layout {
 }
 impl ExportManifest {
     fn resolved_layout(&self) -> Result<Layout, BackendError> {
+        let profile = self.config.profile;
+        if !profile.is_legacy()
+            && (self.model_semantics.as_deref() != Some(profile.model_semantics())
+                || self.model_profile != Some(profile)
+                || self.encoding_schema.as_deref() != Some(profile.encoding_schema()))
+        {
+            return Err(fail(
+                K::IdentityMismatch,
+                S::Asset,
+                "PALS V2 model/profile/encoding declaration differs",
+            ));
+        }
+        if profile.is_legacy()
+            && (self.model_profile.is_some_and(|p| !p.is_legacy())
+                || self
+                    .encoding_schema
+                    .as_deref()
+                    .is_some_and(|s| s != PALS_ENCODING_SCHEMA))
+        {
+            return Err(fail(
+                K::IdentityMismatch,
+                S::Asset,
+                "legacy PALS export cannot declare V2 input semantics",
+            ));
+        }
         match (
             self.schema.as_str(),
             self.layout.as_deref(),
             self.model_semantics.as_deref(),
         ) {
-            (PALS_MODEL_SCHEMA, None | Some("separate_pc"), None | Some(PALS_MODEL_SCHEMA))
-                if self.reader_initializer_bank.is_none() =>
+            (PALS_MODEL_SCHEMA, None | Some("separate_pc"), semantics)
+                if (semantics == Some(profile.model_semantics())
+                    || (semantics.is_none() && profile.is_legacy()))
+                    && self.reader_initializer_bank.is_none() =>
             {
                 Ok(Layout::SeparatePc)
             }
-            ("rovezero.pals-model.v2", Some("shared_pc_if"), Some(PALS_MODEL_SCHEMA))
-                if self.layout_revision == Some(1)
+            ("rovezero.pals-model.v2", Some("shared_pc_if"), Some(semantics))
+                if semantics == profile.model_semantics()
+                    && self.layout_revision == Some(1)
                     && self.role_batching.as_deref()
                         == Some("one_scalar_role_per_physical_batch") =>
             {
@@ -779,6 +820,20 @@ fn public_inputs() -> Vec<Interface> {
         spec("record_mask", TensorElementType::Bool, &[-1, -1]),
     ]
 }
+fn public_inputs_for(profile: PalsModelProfile) -> Vec<Interface> {
+    let mut inputs = public_inputs();
+    if profile.uses_full_line() {
+        inputs.extend([
+            spec(
+                "record_line_tokens",
+                TensorElementType::Int64,
+                &[-1, -1, 256, 3],
+            ),
+            spec("record_line_mask", TensorElementType::Bool, &[-1, -1, 256]),
+        ]);
+    }
+    inputs
+}
 fn memory_outputs() -> Vec<Interface> {
     vec![
         spec("memory_key", TensorElementType::Float32, &[-1, 2, -1, 64]),
@@ -805,6 +860,21 @@ fn role_inputs(critic: bool) -> Vec<Interface> {
     }
     result
 }
+fn role_inputs_for(critic: bool, profile: PalsModelProfile) -> Vec<Interface> {
+    let mut inputs = role_inputs(critic);
+    if profile.uses_full_line() {
+        inputs.extend([
+            spec(
+                "query_line_tokens",
+                TensorElementType::Int64,
+                &[-1, 3, 256, 3],
+            ),
+            spec("query_line_mask", TensorElementType::Bool, &[-1, 3, 256]),
+            spec("record_relations", TensorElementType::Int64, &[-1, -1, 2]),
+        ]);
+    }
+    inputs
+}
 fn role_outputs(critic: bool) -> Vec<Interface> {
     let mut result = vec![
         spec("candidate_logits", TensorElementType::Float32, &[-1, -1]),
@@ -824,6 +894,11 @@ fn shared_inputs() -> Vec<Interface> {
     let mut result = vec![spec("role_is_critic", TensorElementType::Bool, &[])];
     result.extend(role_inputs(true));
     result
+}
+fn shared_inputs_for(profile: PalsModelProfile) -> Vec<Interface> {
+    let mut inputs = vec![spec("role_is_critic", TensorElementType::Bool, &[])];
+    inputs.extend(role_inputs_for(true, profile));
+    inputs
 }
 fn shared_outputs() -> Vec<Interface> {
     let mut result = role_outputs(true);
@@ -976,7 +1051,14 @@ fn validate_manifest(manifest: &ExportManifest) -> Result<[u8; 32], BackendError
         &manifest.rules_input_semantic_sha256,
     ) {
         (None, None) if layout == Layout::SeparatePc => {}
-        (Some(profile), Some(digest)) if profile == "rz-pals-rules-fields-v1" => {
+        (Some(profile), Some(digest))
+            if profile
+                == if manifest.config.profile.uses_full_line() {
+                    "rz-pals-rules-full-line-v2"
+                } else {
+                    "rz-pals-rules-fields-v1"
+                } =>
+        {
             parse_sha256(digest)?;
         }
         _ => {
@@ -1112,11 +1194,11 @@ fn validate_manifest(manifest: &ExportManifest) -> Result<[u8; 32], BackendError
         validate_declared_interface(
             &graph.inputs,
             &if role == "public" {
-                public_inputs()
+                public_inputs_for(manifest.config.profile)
             } else if role == "shared_pc" {
-                shared_inputs()
+                shared_inputs_for(manifest.config.profile)
             } else {
-                role_inputs(critic)
+                role_inputs_for(critic, manifest.config.profile)
             },
         )?;
         validate_declared_interface(
@@ -1213,11 +1295,11 @@ fn validate_session(
     manifest: &ExportManifest,
 ) -> Result<(), BackendError> {
     let inputs = if graph.role == "public" {
-        public_inputs()
+        public_inputs_for(manifest.config.profile)
     } else if graph.role == "shared_pc" {
-        shared_inputs()
+        shared_inputs_for(manifest.config.profile)
     } else {
-        role_inputs(graph.role == "critic")
+        role_inputs_for(graph.role == "critic", manifest.config.profile)
     };
     let outputs = if graph.role == "public" {
         memory_outputs()
@@ -1276,6 +1358,31 @@ fn validate_session(
         }
     }
     let shared = manifest.resolved_layout()? == Layout::SharedPcIf;
+    if !manifest.config.profile.is_legacy() {
+        for (key, expected) in [
+            ("model_profile", manifest.config.profile.as_str()),
+            ("encoding_schema", manifest.config.profile.encoding_schema()),
+        ] {
+            if metadata
+                .custom(key)
+                .map_err(|e| {
+                    native(
+                        CauseCode::ModelLoad,
+                        "cannot read PALS V2 profile metadata",
+                        e,
+                    )
+                })?
+                .as_deref()
+                != Some(expected)
+            {
+                return Err(fail(
+                    K::IdentityMismatch,
+                    S::Asset,
+                    "PALS graph V2 profile metadata differs",
+                ));
+            }
+        }
+    }
     for (key, expected) in [
         ("model_semantics", manifest.model_semantics.as_deref()),
         ("layout", manifest.layout.as_deref()),
@@ -1465,6 +1572,49 @@ struct ActiveInputs {
     divergences: Tensor<f32>,
     divergence_mask: Tensor<bool>,
     private_warm: Option<warm::ActiveWarmInputs>,
+    full_line: Option<ActiveFullLineInputs>,
+}
+struct ActiveFullLineInputs {
+    record_line_tokens: Tensor<i64>,
+    record_line_mask: Tensor<bool>,
+    query_line_tokens: Tensor<i64>,
+    query_line_mask: Tensor<bool>,
+    record_relations: Tensor<i64>,
+}
+impl ActiveFullLineInputs {
+    fn new(value: PreparedPalsFullLineTensors, records: usize) -> Result<Self, BackendError> {
+        let error = |e| {
+            native(
+                CauseCode::TensorCreate,
+                "cannot own full-line PALS input tensor",
+                e,
+            )
+        };
+        Ok(Self {
+            record_line_tokens: Tensor::from_array((
+                [1, records, MAX_LINE_PLY, 3],
+                value.record_line_tokens,
+            ))
+            .map_err(error)?,
+            record_line_mask: Tensor::from_array((
+                [1, records, MAX_LINE_PLY],
+                value.record_line_mask,
+            ))
+            .map_err(error)?,
+            query_line_tokens: Tensor::from_array((
+                [1, QUERY_LINE_COUNT, MAX_LINE_PLY, 3],
+                value.query_line_tokens,
+            ))
+            .map_err(error)?,
+            query_line_mask: Tensor::from_array((
+                [1, QUERY_LINE_COUNT, MAX_LINE_PLY],
+                value.query_line_mask,
+            ))
+            .map_err(error)?,
+            record_relations: Tensor::from_array(([1, records, 2], value.record_relations))
+                .map_err(error)?,
+        })
+    }
 }
 impl ActiveInputs {
     fn new(
@@ -1486,7 +1636,12 @@ impl ActiveInputs {
             + value.record_mask.capacity()
             + value.candidate_mask.capacity()
             + value.divergence_mask.capacity()
-            + 1) as u64;
+            + 1
+            + value
+                .full_line
+                .as_ref()
+                .map_or(0, PreparedPalsFullLineTensors::owned_bytes))
+            as u64;
         let private_warm = private.map(PalsWarmInput::prepare).transpose()?;
         let host_bytes = host_bytes
             .checked_add(private_warm.as_ref().map_or(0, |v| v.host_bytes))
@@ -1514,6 +1669,10 @@ impl ActiveInputs {
             divergence_mask: Tensor::from_array(([1, d], value.divergence_mask))
                 .map_err(tensor_error)?,
             private_warm,
+            full_line: value
+                .full_line
+                .map(|lines| ActiveFullLineInputs::new(lines, r))
+                .transpose()?,
         })
     }
 }
@@ -1560,6 +1719,9 @@ pub enum PalsNativeCommand {
     Evaluate(PalsModelInput),
     /// Separate CPU-only Warm graph domain; a Fresh mode payload is also explicit.
     EvaluatePrivateWarm(PalsWarmInput),
+    /// CUDA Warm has its own capability and physical owner domain.
+    #[cfg(feature = "experimental-io-binding")]
+    EvaluateCudaWarm(PalsCudaWarmInput),
     NewGame,
     /// NN-zero reset to an explicit logical target. Repeated logical new games
     /// may skip generations; the exclusive backend accepts only increasing ones.
@@ -1594,6 +1756,8 @@ impl PalsNativeCommand {
             Self::Evaluate(input) if input.role == PalsRole::Critic => "critic_evaluation",
             Self::Evaluate(_) => "proposer_evaluation",
             Self::EvaluatePrivateWarm(_) => "private_warm_evaluation",
+            #[cfg(feature = "experimental-io-binding")]
+            Self::EvaluateCudaWarm(_) => "cuda_warm_evaluation",
             Self::VerifyRuntime => "runtime_origin_audit",
             Self::ObserveRuntimeMappings => "runtime_loading_mapping",
             Self::VerifyCudaPlacement => "cuda_placement_audit",
@@ -1801,6 +1965,8 @@ pub struct PalsOnnxBackend {
     shared_pc: Option<Session>,
     layout: Layout,
     private_warm: Option<PalsWarmCapability>,
+    #[cfg(feature = "experimental-io-binding")]
+    private_cuda_warm: Option<PalsCudaWarmCapability>,
     runtime: OrtRuntime,
     config: PalsOnnxConfig,
     model_config: PalsModelConfig,
@@ -1826,6 +1992,8 @@ pub struct PalsOnnxBackend {
     device_memory: Option<device::DeviceMemory>,
     #[cfg(feature = "experimental-io-binding")]
     device_role: Option<device::DeviceRole>,
+    #[cfg(feature = "experimental-io-binding")]
+    device_warm_role: Option<warm::cuda::DeviceWarmRole>,
     #[cfg(feature = "experimental-io-binding")]
     cuda_record_pages: Option<device_pages_plan::native::CudaRecordPages>,
     quarantine: Option<BackendError>,
@@ -2026,6 +2194,8 @@ impl PalsOnnxBackend {
             shared_pc: sessions.remove("shared_pc"),
             layout,
             private_warm: None,
+            #[cfg(feature = "experimental-io-binding")]
+            private_cuda_warm: None,
             runtime,
             config,
             model_config: manifest.config,
@@ -2078,6 +2248,8 @@ impl PalsOnnxBackend {
             #[cfg(feature = "experimental-io-binding")]
             device_role: None,
             #[cfg(feature = "experimental-io-binding")]
+            device_warm_role: None,
+            #[cfg(feature = "experimental-io-binding")]
             cuda_record_pages: None,
         })
     }
@@ -2086,6 +2258,13 @@ impl PalsOnnxBackend {
         &mut self,
         registration: PalsCudaRecordPageRegistration,
     ) -> Result<(), BackendError> {
+        if !self.model_config.profile.is_legacy() {
+            return Err(fail(
+                K::UnsupportedModel,
+                S::Admission,
+                "registered CUDA packing pages require their legacy graph input ABI",
+            ));
+        }
         let device_id = match self.config.provider {
             Provider::Cuda { device_id, .. } if device_id >= 0 => device_id as u32,
             _ => {
@@ -2165,6 +2344,10 @@ impl PalsOnnxBackend {
             return true;
         }
         #[cfg(feature = "experimental-io-binding")]
+        if self.device_warm_role.is_some() {
+            return true;
+        }
+        #[cfg(feature = "experimental-io-binding")]
         if self
             .cuda_record_pages
             .as_ref()
@@ -2176,6 +2359,9 @@ impl PalsOnnxBackend {
     }
     pub fn model_epoch(&self) -> [u8; 32] {
         self.epoch
+    }
+    pub fn model_config(&self) -> &PalsModelConfig {
+        &self.model_config
     }
     pub fn manifest_digest(&self) -> [u8; 32] {
         self.manifest_digest
@@ -2301,7 +2487,9 @@ impl PalsOnnxBackend {
             kind: PublicPageKind::WholeInput,
             content: Digest(content),
             model: Digest(self.manifest_digest),
-            encoding: Digest(asset::sha256(PALS_ENCODING_SCHEMA.as_bytes())),
+            encoding: Digest(asset::sha256(
+                self.model_config.profile.encoding_schema().as_bytes(),
+            )),
             precision: PrecisionProfile::Fp32,
             // No numeric mutable epoch is declared: the actual frozen 32-byte
             // checkpoint epoch is already part of the exact content digest.
@@ -2599,6 +2787,10 @@ impl PalsOnnxBackend {
                 PalsNativeCommand::Evaluate(_) | PalsNativeCommand::EvaluatePrivateWarm(_) => {
                     HostRecordPageObservationBoundary::Evaluate
                 }
+                #[cfg(feature = "experimental-io-binding")]
+                PalsNativeCommand::EvaluateCudaWarm(_) => {
+                    HostRecordPageObservationBoundary::Evaluate
+                }
                 PalsNativeCommand::NewGame | PalsNativeCommand::ResetTo(_) => {
                     HostRecordPageObservationBoundary::NewGame
                 }
@@ -2625,6 +2817,10 @@ impl PalsOnnxBackend {
                 }
                 PalsNativeCommand::EvaluatePrivateWarm(input) => self
                     .run_private_warm(input)
+                    .map(PalsNativeResult::Evaluation),
+                #[cfg(feature = "experimental-io-binding")]
+                PalsNativeCommand::EvaluateCudaWarm(input) => self
+                    .run_cuda_private_warm(input)
                     .map(PalsNativeResult::Evaluation),
                 PalsNativeCommand::NewGame => self
                     .clear_public_memory()
@@ -2706,6 +2902,14 @@ impl PalsOnnxBackend {
     ) -> Result<PalsRawOutput, BackendError> {
         if let Some(cause) = &self.quarantine {
             return Err(cause.clone());
+        }
+        #[cfg(feature = "experimental-io-binding")]
+        if self.private_cuda_warm.is_some() {
+            return Err(fail(
+                K::UnsupportedModel,
+                S::Admission,
+                "explicit CUDA Warm graph requires its registered capability payload",
+            ));
         }
         match (&self.private_warm, private) {
             (None, None) => {}
@@ -3025,7 +3229,15 @@ impl PalsOnnxBackend {
                 self.stats.public_nn_runs_attempted =
                     self.stats.public_nn_runs_attempted.saturating_add(1);
                 startup_enter(trace, PalsStartupBackendStage::PublicRun);
-                let result = self.public.as_mut().expect("loaded public session").run(ort::inputs!["board" => &active.board, "metadata" => &active.metadata, "records" => &active.records, "record_mask" => &active.record_mask]);
+                let mut values = ort::inputs!["board" => &active.board, "metadata" => &active.metadata, "records" => &active.records, "record_mask" => &active.record_mask];
+                if let Some(lines) = &active.full_line {
+                    values.extend(ort::inputs!["record_line_tokens" => &lines.record_line_tokens, "record_line_mask" => &lines.record_line_mask]);
+                }
+                let result = self
+                    .public
+                    .as_mut()
+                    .expect("loaded public session")
+                    .run(values);
                 startup_return(trace, PalsStartupBackendStage::PublicRun, result.is_ok());
                 let outputs = match result {
                     Ok(outputs) => outputs,
@@ -3169,15 +3381,27 @@ impl PalsOnnxBackend {
         let shared = self.layout == Layout::SharedPcIf;
         self.stats.role_nn_runs_attempted = self.stats.role_nn_runs_attempted.saturating_add(1);
         startup_enter(trace, PalsStartupBackendStage::PrivateRun);
-        let result = if let Some(private) = &active.private_warm {
-            self.shared_pc.as_mut().expect("loaded CPU private Warm session").run(ort::inputs!["role_is_critic" => &active.role_is_critic, "memory_key" => &memory.memory_key, "memory_value" => &memory.memory_value, "memory_mask" => &memory.mask, "candidates" => &active.candidates, "candidate_mask" => &active.candidate_mask, "query" => &active.query, "divergence_features" => &active.divergences, "divergence_mask" => &active.divergence_mask, "initial_latent" => &private.initial_latent, "warm_start" => &private.warm_start])
-        } else if shared {
-            self.shared_pc.as_mut().expect("loaded shared P/C session").run(ort::inputs!["role_is_critic" => &active.role_is_critic, "memory_key" => &memory.memory_key, "memory_value" => &memory.memory_value, "memory_mask" => &memory.mask, "candidates" => &active.candidates, "candidate_mask" => &active.candidate_mask, "query" => &active.query, "divergence_features" => &active.divergences, "divergence_mask" => &active.divergence_mask])
+        let mut values = ort::inputs!["memory_key" => &memory.memory_key, "memory_value" => &memory.memory_value, "memory_mask" => &memory.mask, "candidates" => &active.candidates, "candidate_mask" => &active.candidate_mask, "query" => &active.query];
+        if critic || shared {
+            values.extend(ort::inputs!["divergence_features" => &active.divergences, "divergence_mask" => &active.divergence_mask]);
+        }
+        if shared {
+            values.extend(ort::inputs!["role_is_critic" => &active.role_is_critic]);
+        }
+        if let Some(lines) = &active.full_line {
+            values.extend(ort::inputs!["query_line_tokens" => &lines.query_line_tokens, "query_line_mask" => &lines.query_line_mask, "record_relations" => &lines.record_relations]);
+        }
+        if let Some(private) = &active.private_warm {
+            values.extend(ort::inputs!["initial_latent" => &private.initial_latent, "warm_start" => &private.warm_start]);
+        }
+        let session = if shared {
+            self.shared_pc.as_mut().expect("loaded shared P/C session")
         } else if critic {
-            self.critic.as_mut().expect("loaded critic session").run(ort::inputs!["memory_key" => &memory.memory_key, "memory_value" => &memory.memory_value, "memory_mask" => &memory.mask, "candidates" => &active.candidates, "candidate_mask" => &active.candidate_mask, "query" => &active.query, "divergence_features" => &active.divergences, "divergence_mask" => &active.divergence_mask])
+            self.critic.as_mut().expect("loaded critic session")
         } else {
-            self.proposer.as_mut().expect("loaded proposer session").run(ort::inputs!["memory_key" => &memory.memory_key, "memory_value" => &memory.memory_value, "memory_mask" => &memory.mask, "candidates" => &active.candidates, "candidate_mask" => &active.candidate_mask, "query" => &active.query])
+            self.proposer.as_mut().expect("loaded proposer session")
         };
+        let result = session.run(values);
         startup_return(trace, PalsStartupBackendStage::PrivateRun, result.is_ok());
         let outputs = match result {
             Ok(outputs) => outputs,
@@ -3327,6 +3551,9 @@ impl Drop for PalsOnnxBackend {
                 if let Some(role) = self.device_role.take() {
                     std::mem::forget(role);
                 }
+                if let Some(role) = self.device_warm_role.take() {
+                    std::mem::forget(role);
+                }
                 if let Some(memory) = self.device_memory.take() {
                     std::mem::forget(memory);
                 }
@@ -3368,9 +3595,9 @@ mod device {
         binding: IoBinding,
         pub key: [u8; 32],
         tokens: usize,
-        memory_key: Tensor<f32>,
-        memory_value: Tensor<f32>,
-        mask: Tensor<bool>,
+        pub(super) memory_key: Tensor<f32>,
+        pub(super) memory_value: Tensor<f32>,
+        pub(super) mask: Tensor<bool>,
         // rc.10 allocated tensors retain callbacks rather than this Allocator;
         // keep it last, after all bindings and dependent tensors.
         _allocator: Allocator,
@@ -3437,6 +3664,12 @@ mod device {
             self.binding.bind_input("records", &active.records)?;
             self.binding
                 .bind_input("record_mask", &active.record_mask)?;
+            if let Some(lines) = &active.full_line {
+                self.binding
+                    .bind_input("record_line_tokens", &lines.record_line_tokens)?;
+                self.binding
+                    .bind_input("record_line_mask", &lines.record_line_mask)?;
+            }
             self.binding.synchronize_inputs()?;
             stats.public_nn_runs_attempted = stats.public_nn_runs_attempted.saturating_add(1);
             run_fixed_binding(session, &self.binding)?;
@@ -3474,7 +3707,7 @@ mod device {
         allocator: Allocator,
     }
     pub(super) struct DeviceRole {
-        binding: IoBinding,
+        pub(super) binding: IoBinding,
         candidate: Tensor<f32>,
         wdl: Tensor<f32>,
         latent: Tensor<f32>,
@@ -3558,6 +3791,14 @@ mod device {
             self.binding
                 .bind_input("candidate_mask", &active.candidate_mask)?;
             self.binding.bind_input("query", &active.query)?;
+            if let Some(lines) = &active.full_line {
+                self.binding
+                    .bind_input("query_line_tokens", &lines.query_line_tokens)?;
+                self.binding
+                    .bind_input("query_line_mask", &lines.query_line_mask)?;
+                self.binding
+                    .bind_input("record_relations", &lines.record_relations)?;
+            }
             if self.divergence.is_some() {
                 self.binding
                     .bind_input("divergence_features", &active.divergences)?;
@@ -4057,7 +4298,62 @@ mod tests {
             situation_revision: 3,
             model_epoch: [4; 32],
             history_digest: [5; 32],
+            full_line: None,
         }
+    }
+    #[test]
+    fn v2_manifest_requires_complete_profile_identity_and_exact_tensor_abi() {
+        use crate::pals_model::PALS_MODEL_SEMANTICS_V2;
+        let mut m = manifest();
+        m.config = PalsModelConfig::full_line_interaction_v2();
+        assert!(validate_manifest(&m).is_err());
+        m.model_profile = Some(m.config.profile);
+        m.model_semantics = Some(PALS_MODEL_SEMANTICS_V2.to_owned());
+        m.encoding_schema = Some(m.config.profile.encoding_schema().to_owned());
+        assert!(validate_manifest(&m).is_err()); // Legacy tensor ABI is insufficient.
+        for graph in &mut m.graphs {
+            let inputs = if graph.role == "public" {
+                public_inputs_for(m.config.profile)
+            } else {
+                role_inputs_for(graph.role == "critic", m.config.profile)
+            };
+            graph.inputs = inputs
+                .into_iter()
+                .map(|v| TensorManifest {
+                    name: v.name.to_owned(),
+                    dtype: match v.dtype {
+                        TensorElementType::Float32 => "FLOAT",
+                        TensorElementType::Int64 => "INT64",
+                        TensorElementType::Bool => "BOOL",
+                        _ => unreachable!(),
+                    }
+                    .to_owned(),
+                    shape: v
+                        .shape
+                        .iter()
+                        .enumerate()
+                        .map(|(axis, &dim)| {
+                            if dim == -1 {
+                                serde_json::json!(format!("dynamic_{axis}"))
+                            } else {
+                                serde_json::json!(dim)
+                            }
+                        })
+                        .collect(),
+                })
+                .collect();
+        }
+        validate_manifest(&m).unwrap();
+        m.model_profile = Some(PalsModelProfile::FullLineV2);
+        assert!(validate_manifest(&m).is_err());
+        m.model_profile = Some(m.config.profile);
+        m.graphs[0]
+            .inputs
+            .iter_mut()
+            .find(|v| v.name == "record_line_tokens")
+            .unwrap()
+            .shape[2] = 255.into();
+        assert!(validate_manifest(&m).is_err());
     }
     #[test]
     fn public_cache_role_neutral_private_query_and_candidates_are_not_memory() {
