@@ -3339,3 +3339,50 @@ synthetic closure의 일관성이 맞아도 reported scope와 모든 권한 fals
 반환 계수·진행 중 실행·격리·모델 식별·실패 필드 부재가 바뀌면 거부한다.
 현재 수정 HEAD의 컴파일·CI는 push 후 별도로 인수한다. 실제 등록 frozen 4N child/NN 실행,
 독립 native witness·다음 Query·효용·paired 인수는 남으며 GPU 보류·실제 학습 제외·Draft를 유지한다.
+
+### 캡처된 Repair·상대 counterline의 원래 Rules 재생
+
+직전 `341e036`의 CPU CI 네 job과 Linux/Windows의 reported 검사 세 개·delivery 검사 다섯 개는
+성공했다. 이번 변경은 `BoundReplayDelivery::check_reported_rules_consistency`를 추가한다.
+이미 닫힌 보고 상태를 대조한 뒤, **이 capture가 보유한 private PreparedReplayRequest**를 빌려
+원래 input artifact와 전체/정리 시간 선언을 대조한다. 임의 JSON bytes로 prepared owner를
+만들지 않으며 다른 원문·다른 시간 선언의 report를 같은 Rules 결과로 받아들이지 않는다.
+
+준비 시 확인한 root graph는 이전과 같이 준비 종료에 해제한다. 결과 검증에서는 immutable
+원문을 다시 hash 확인하고 그 안의 original action/CPU `position_command`를 기존 semantic
+root builder로 재생한다. 완전한 startpos 이력, 이력 상한, 원래 semantic root descriptor의
+상태·이력 식별과 합법 수 순서, CPU root FEN과 ongoing 조건을 다시 확인한다. FEN만으로
+과거 이력을 만들거나 native Debug 문자열에서 Position을 복원하지 않는다. 입력 준비에
+사용한 original-root SemanticRequest 구성은 공통 함수로 추출하며 내용은 유지한다.
+
+**이 재생은 결과 검증을 위한 원래 W 내 작업이다.** 원래 S를 W와 원래 whole_wall_ms에서
+복구하고 original action decoder에도 그 S를 준다. E가 끝났어도 W 내 검증은 가능하지만
+E를 연장하거나 새 CPU search·role/provider·model work를 생성하지 않는다. 재생 단계는
+W를 확인하고, phase와 각 line ply에서는 취소를 검사한다. 임시 root/branch graph는
+검증 반환 전에 해제하며 결과에는 report와 작은 Rules facts만 남긴다. source-owned
+backing credit를 실제 validator/RSS peak로 승격하지 않으며 메모리 개선을 주장하지 않는다.
+
+완료/Rules-terminal opponent endpoint 보고에 한해 다음을 Rules로 검사한다. Repair와
+counterline은 원래 prefix를 유지하고, anchor 앞의 모든 수가 같으며 첫 상대 응답은 달라야
+한다. anchor는 ongoing인 상대 차례여야 한다. 모든 수가 합법이고 중간 Rules terminal
+뒤에 수가 이어지지 않아야 한다. 실제 counterline suffix 길이와 role/accepted 계수를
+대조하며 ongoing endpoint는 선언한 line horizon까지 도달해야 한다. 종료 outcome/flag는
+Rules가 재생한 실제 endpoint와 같아야 한다. 메이트 winner와 스테일메이트 draw는 Rules가
+제공한 PlayStatus로 보존한다. 부분 보고는 완료 결과로 채우지 않고 원래 report/raw에 남긴다.
+
+반환 타입 `ReportedRulesConsistency`의 범위는
+`reported_lines_rules_checked_pending_repair_anchor_selection_native_witness_and_caller_chronology`다.
+현재 projection에는 **Repair 이전 모델 counterline과 실제 Repair record revision이 없다.**
+따라서 구조적으로 유효한 anchor라고 해도 생성자의 “자기 수 변경 뒤 첫 상대 차례” 선택을
+독립 인증한 것은 아니다. 이 증거, 모든 CPU PV 의미, 독립 native witness, current/frozen
+재입장·다음 Query chronology·whole-action cost·utility는 여전히 별도 인수 대상이다.
+public native/projection capability에 Deserialize/Clone/소유 반환을 추가하지 않는다.
+원래 Rules 복원 오류는 stage·cause를 별도 오류 variant에 보존하며, 실패 시 capture의
+원문과 child custody를 취소·해제하지 않는다.
+
+CPU 검사 일곱 개를 준비했다. 실제 private 준비 원문에서 root를 복원하고 다른 이력과
+E/W 구분을 확인하며 backing 변조·취소·W 만료를 거부한다. 합법 대조선, 불법 수·prefix·
+자기 차례 anchor·같은 첫 응답·잘못된 role 수·거짓 terminal·짧은 horizon·메이트 후 추가 수를
+검사한다. 실제 메이트/스테일메이트는 Rules로 판정하며 native closure 미관측은 그대로
+유지한다. 이번 HEAD의 CPU CI는 push 후 별도 인수한다. 실제 frozen 4N child/NN 실행,
+독립 witness·다음 Query·효용·paired 인수는 남는다. GPU 보류·실제 학습 제외·Draft를 유지한다.
