@@ -3192,3 +3192,41 @@ pair를 수동 대조하고 Disabled 및 기존 single-Reply branch만 literal r
 allowlist의 pin 등록에 한정하며 실행·수락 알고리즘과 `_POLICY`는 동일 AST다.
 독립 fixture의 literal pin과 새 lane 거부 subcase를 갱신한다. 새 다중 C policy,
 별도 binary의 실행 또는 NN 물리 완료를 이 pin 갱신으로 인수하지 않는다.
+
+
+### 실제 C 후속 수순의 다중 Reply native 관측 접점
+
+새 `ActualOpponentContinuationV1`을 frozen CPU native collector까지 연결한다.
+`PalsNativeContinuationRegistration`은 별도 immutable 등록 타입이며
+`rz-pals-native-continuation-registration/1`과 실제 continuation policy tuple을
+독립 raw hash·기준 registry·collector binary에 묶는다. 기존 refinement 등록 parser는
+새 등록을 거부하고, 새 parser도 기존 등록을 거부한다. 실제 engine getter·조건 hash를
+다시 대조한 뒤 선택한다. 기본 Disabled와 기존 single-Reply trace는 유지한다.
+
+`load_cpu_with_continuation_policy`와 `pals_collect`의 명시 옵션
+`--post-repair-recheck actual-opponent-continuation-v1`이 같은 경로를 사용한다.
+CPU provider·strict producer·독립 등록은 실행 전에 요구한다. 기존 `--refinement-registration`
+경로/해시 인수는 선택한 policy의 별도 등록 타입으로 읽는다. 새 의존성·feature·workflow·
+계약 revision·탐색 의미는 추가하지 않는다.
+
+새 책임은 `crates/rz-arena/src/pals_collect/continuation.rs`에 둔다. 기존 native owner의
+prepared tensor·raw 출력·물리 완료·delivery·accepted context·producer journal을 재사용한다.
+다중 Reply 각각의 actual prefix·RequestId·epoch·순서·세대·revision·원래 마감과
+직전 수락 출력을 대조한다. 최초 대체 응수는 기존 선택 규칙에 따라 원래 응수와 다른
+합법 수인지 확인하고, 이후 tail은 직전 actual C policy의 첫 수와 일치해야 한다.
+선택 ranking의 전체 독립 재실행과 CPU endpoint의 원시 provenance 인수는 별도다.
+
+등록·준비·각 Reply bind·종료는 `native-continuation-traces.jsonl`의 별도 domain으로
+연결한다. 시작 시 repaired 길이에 따른 유한 row/byte credit을 예약하고, 취소·부분 완료의
+미사용 credit도 drain까지 청구한다. 완료가 누락된 호출을 다음 prefix에 연결하거나,
+이전 repaired suffix를 끼워 넣거나, 부족한 call coverage를 완전 수순으로 표시하지 않는다.
+논리 취소·실제 물리 완료·출력 소비는 각각 기록한다. trace persistence와 종료 실패의
+보존은 기존 Output·finish guard 경로를 사용한다.
+
+CPU observer fixture 5개와 CLI 검사 1개를 추가했다. fixture의 물리 완료 callback은
+합성 입력·출력으로 수집기 상태를 검사하며 실제 NN 실행 증거가 아니다. 기존 Python
+DEFAULT/single-Reply 소비자는 literal source review profile만 추가하고 실행/수락 AST,
+이전 pair, policy를 유지한다. 새 domain·등록·policy를 이 소비자의 witness로 승인하지 않는다.
+현재 수정 HEAD의 CPU CI는 아직 미관측이다. 실제 frozen 다중 NN 실행과 strict 결과 인수,
+Query prior·whole-action cost·utility·paired 대국은 계속 남아 있다. GPU 보류·실제 학습 제외,
+로컬 heavy CPU 미실행, Draft 유지.
