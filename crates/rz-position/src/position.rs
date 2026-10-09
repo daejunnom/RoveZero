@@ -1,6 +1,8 @@
 use crate::{fen, movegen, types::*};
 use std::sync::{Arc, Weak};
 
+mod snapshot_codec;
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct RepetitionIdentity {
     pieces: [u64; 12],

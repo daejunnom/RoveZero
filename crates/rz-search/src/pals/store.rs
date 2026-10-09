@@ -18,9 +18,28 @@ use rz_position::{
     BoardMove, Color, PieceKind, PlayStatus, Position, PositionSnapshot, RepetitionIdentity, Square,
 };
 
+mod archive;
+mod hot;
+pub use archive::{
+    ArchiveConfig, ArchiveIoBudget, ArchiveLoadPin, ArchiveReceipt, ArchiveRecordKind,
+    ArchiveStats, ColdHandle, EngineArchiveNode, EngineArchiveReceipt, LoadedArchive, StorePins,
+};
+use hot::HotRecords;
+
 macro_rules! index_id {
     ($name:ident) => {
-        #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            Eq,
+            PartialEq,
+            Ord,
+            PartialOrd,
+            Hash,
+            serde::Serialize,
+            serde::Deserialize,
+        )]
         pub struct $name(pub usize);
     };
 }
@@ -30,7 +49,9 @@ index_id!(ObservationId);
 index_id!(ExecutionId);
 
 /// Reusing a slot issues another generation, so stale IDs cannot name new work.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct SituationId {
     pub slot: usize,
     pub generation: u64,
@@ -49,6 +70,18 @@ pub enum StoreError {
     AlreadyConsumed,
     NotCompleted,
     RevisionExhausted,
+    ArchiveDisabled,
+    ArchiveBudgetRequired,
+    ArchiveQuota(&'static str),
+    ArchiveIo {
+        stage: &'static str,
+        kind: std::io::ErrorKind,
+    },
+    ArchiveIntegrity(&'static str),
+    ArchiveDeadline,
+    ArchiveByteBudget,
+    PinSaturated(&'static str),
+    ColdRecord(&'static str),
 }
 
 impl std::fmt::Display for StoreError {
@@ -98,7 +131,9 @@ impl Default for StoreLimits {
 }
 
 /// Coordinate move packing only; Rules still owns legality, castling and EP.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Move16(u16);
 
 impl Move16 {
@@ -147,7 +182,7 @@ impl Move16 {
 #[derive(Debug)]
 pub struct StateStore {
     identity: Arc<()>,
-    snapshots: Vec<PositionSnapshot>,
+    snapshots: HotRecords<PositionSnapshot>,
     index: HashMap<RepetitionIdentity, Vec<StateId>>,
     limit: usize,
     history_limit: usize,
@@ -158,7 +193,7 @@ impl StateStore {
     pub fn new(limit: usize, retained_history_bytes: usize) -> Self {
         Self {
             identity: Arc::new(()),
-            snapshots: Vec::new(),
+            snapshots: HotRecords::new(),
             index: HashMap::new(),
             limit,
             history_limit: retained_history_bytes,
@@ -192,17 +227,30 @@ impl StateStore {
             .filter(|bytes| *bytes <= self.history_limit)
             .ok_or(StoreError::Capacity("state history bytes"))?;
         let key = snapshot.repetition_identity();
-        let id = StateId(self.snapshots.len());
-        self.snapshots.push(snapshot);
+        self.index
+            .try_reserve(1)
+            .map_err(|_| StoreError::Capacity("state index allocation"))?;
+        self.snapshots.reserve(1)?;
+        self.index
+            .entry(key.clone())
+            .or_default()
+            .try_reserve(1)
+            .map_err(|_| StoreError::Capacity("state bucket allocation"))?;
+        let id = StateId(self.snapshots.next_id());
+        self.snapshots.push(snapshot)?;
         self.index.entry(key).or_default().push(id);
         self.history_bytes = new_bytes;
         Ok(id)
     }
 
     pub fn get(&self, id: StateId) -> Result<&PositionSnapshot, StoreError> {
-        self.snapshots
-            .get(id.0)
-            .ok_or(StoreError::InvalidHandle("state"))
+        self.snapshots.get(id.0).ok_or_else(|| {
+            if id.0 < self.snapshots.next_id() {
+                StoreError::ColdRecord("state")
+            } else {
+                StoreError::InvalidHandle("state")
+            }
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -220,7 +268,7 @@ impl StateStore {
 
 pub const MOVES_PER_CHUNK: usize = 16;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LineChunk {
     pub parent: Option<LineId>,
     pub start_state: StateId,
@@ -244,7 +292,7 @@ pub struct LinePool {
     /// A weak attestation retains this allocation, so replacing a public pool
     /// cannot reissue its checked numeric handles under a new owner.
     identity: Arc<()>,
-    chunks: Vec<LineChunk>,
+    chunks: HotRecords<LineChunk>,
     roots: BTreeMap<StateId, LineId>,
     index: BTreeMap<(LineId, Vec<Move16>), LineId>,
     limit: usize,
@@ -255,7 +303,7 @@ impl LinePool {
     pub fn new(limit: usize, ply_limit: usize) -> Self {
         Self {
             identity: Arc::new(()),
-            chunks: Vec::new(),
+            chunks: HotRecords::new(),
             roots: BTreeMap::new(),
             index: BTreeMap::new(),
             limit,
@@ -270,14 +318,14 @@ impl LinePool {
         if self.chunks.len() >= self.limit {
             return Err(StoreError::Capacity("line chunks"));
         }
-        let id = LineId(self.chunks.len());
+        let id = LineId(self.chunks.next_id());
         self.chunks.push(LineChunk {
             parent: None,
             start_state,
             moves: [Move16(0); MOVES_PER_CHUNK],
             len: 0,
             plies: 0,
-        });
+        })?;
         self.roots.insert(start_state, id);
         Ok(id)
     }
@@ -319,6 +367,7 @@ impl LinePool {
         if self.chunks.len().saturating_add(missing) > self.limit {
             return Err(StoreError::Capacity("line chunks"));
         }
+        self.chunks.reserve(missing)?;
         let mut parent = prefix;
         let start_state = self.get(prefix)?.start_state;
         let mut accumulated = self.get(prefix)?.plies;
@@ -332,14 +381,14 @@ impl LinePool {
             let mut payload = [Move16(0); MOVES_PER_CHUNK];
             payload[..chunk.len()].copy_from_slice(chunk);
             accumulated += chunk.len();
-            let id = LineId(self.chunks.len());
+            let id = LineId(self.chunks.next_id());
             self.chunks.push(LineChunk {
                 parent: Some(parent),
                 start_state,
                 moves: payload,
                 len: chunk.len(),
                 plies: accumulated,
-            });
+            })?;
             self.index.insert(key, id);
             parent = id;
         }
@@ -348,9 +397,13 @@ impl LinePool {
     }
 
     pub fn get(&self, id: LineId) -> Result<&LineChunk, StoreError> {
-        self.chunks
-            .get(id.0)
-            .ok_or(StoreError::InvalidHandle("line"))
+        self.chunks.get(id.0).ok_or_else(|| {
+            if id.0 < self.chunks.next_id() {
+                StoreError::ColdRecord("line")
+            } else {
+                StoreError::InvalidHandle("line")
+            }
+        })
     }
 
     pub fn moves(&self, id: LineId) -> Result<Vec<BoardMove>, StoreError> {
@@ -394,7 +447,7 @@ impl LinePool {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum BoundKind {
     ExactWithinSearch,
     LowerWithinSearch,
@@ -450,12 +503,53 @@ pub enum RawScore {
         loss: f32,
         perspective: Color,
     },
+    /// Actual prepared model output under one immutable public PALS context.
+    /// Legacy Wdl retains its original unversioned raw-output contract.
+    ContextWdl {
+        win: f32,
+        draw: f32,
+        loss: f32,
+        perspective: Color,
+        context_revision: u64,
+    },
+    /// Restricted continuation expectation derived from two immutable raw model
+    /// observations. This does not claim a new prepared model input or WDL.
+    ConditionalWdl {
+        expectation: f32,
+        perspective: Color,
+        repaired: ObservationId,
+        counter: ObservationId,
+        context_revision: u64,
+    },
+    /// Strict improvement over the re-evaluated counter under the same public
+    /// context. Supersedes links the separate active refutation observation.
+    ConditionalRepairWdl {
+        expectation: f32,
+        perspective: Color,
+        before: ObservationId,
+        after: ObservationId,
+        context_revision: u64,
+    },
     Terminal {
         winner: Option<Color>,
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+impl RawScore {
+    fn model_dependencies(self) -> Option<[ObservationId; 2]> {
+        match self {
+            Self::ConditionalWdl {
+                repaired: before,
+                counter: after,
+                ..
+            }
+            | Self::ConditionalRepairWdl { before, after, .. } => Some([before, after]),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ObservationKind {
     Proposal,
     Refutation,
@@ -542,7 +636,10 @@ impl Observation {
                 "foreign result needs external scope",
             ));
         }
-        let model_wdl = matches!(self.score, RawScore::Wdl { .. });
+        let model_wdl = matches!(
+            self.score,
+            RawScore::Wdl { .. } | RawScore::ContextWdl { .. }
+        );
         if model_wdl && !matches!(self.scope, EvidenceScope::Model { .. }) {
             return Err(StoreError::InvalidEvidence("model WDL needs model scope"));
         }
@@ -552,6 +649,31 @@ impl Observation {
             return Err(StoreError::InvalidEvidence(
                 "model WDL needs full value and input identity",
             ));
+        }
+        if let RawScore::ConditionalWdl { expectation, .. } = self.score {
+            if !expectation.is_finite()
+                || !(-1.0..=1.0).contains(&expectation)
+                || !matches!(self.scope, EvidenceScope::Model { .. })
+                || self.kind != ObservationKind::Refutation
+                || self.line.is_none()
+            {
+                return Err(StoreError::InvalidEvidence(
+                    "conditional model expectation needs a finite refutation line",
+                ));
+            }
+        }
+        if let RawScore::ConditionalRepairWdl { expectation, .. } = self.score {
+            if !expectation.is_finite()
+                || !(-1.0..=1.0).contains(&expectation)
+                || !matches!(self.scope, EvidenceScope::Model { .. })
+                || self.kind != ObservationKind::Repair
+                || self.line.is_none()
+                || self.supersedes.is_none()
+            {
+                return Err(StoreError::InvalidEvidence(
+                    "conditional model repair needs a finite line and refutation link",
+                ));
+            }
         }
         if let Some(identity) = &self.model_value_identity {
             identity.validate().map_err(|_| {
@@ -577,6 +699,9 @@ impl Observation {
                 return Err(StoreError::InvalidEvidence("non-finite estimate"));
             }
             RawScore::Wdl {
+                win, draw, loss, ..
+            }
+            | RawScore::ContextWdl {
                 win, draw, loss, ..
             } if ![win, draw, loss]
                 .into_iter()
@@ -666,6 +791,130 @@ impl Observation {
     }
 }
 
+/// Validate the immutable raw evidence used by a derived model refutation. The
+/// engine owns the live root/context revision check; this verifies only the
+/// retained evidence namespace, perspective conversion and strict decrease.
+fn validate_conditional_wdl(
+    observation: &Observation,
+    repaired: &Observation,
+    counter: &Observation,
+) -> Result<(), StoreError> {
+    let RawScore::ConditionalWdl {
+        expectation,
+        perspective,
+        context_revision,
+        ..
+    } = observation.score
+    else {
+        return Ok(());
+    };
+    observation.validate()?;
+    let (repaired_expectation, counter_expectation) =
+        validate_context_model_pair(repaired, counter, perspective, context_revision)?;
+    if counter_expectation >= repaired_expectation || expectation != counter_expectation {
+        return Err(StoreError::InvalidEvidence(
+            "conditional model expectation is not its strict counter decrease",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_context_model_pair(
+    before: &Observation,
+    after: &Observation,
+    perspective: Color,
+    context_revision: u64,
+) -> Result<(f32, f32), StoreError> {
+    before.validate()?;
+    after.validate()?;
+    if before.model_value_identity.is_none()
+        || before.model_value_identity != after.model_value_identity
+        || before.model_value_input.is_none()
+        || after.model_value_input.is_none()
+    {
+        return Err(StoreError::InvalidEvidence(
+            "conditional model evidence namespaces differ",
+        ));
+    }
+    let root_expectation = |raw: &Observation| {
+        if let RawScore::ContextWdl {
+            win,
+            loss,
+            perspective: raw_perspective,
+            context_revision: raw_revision,
+            ..
+        } = raw.score
+            && raw_revision == context_revision
+        {
+            Ok(if raw_perspective == perspective {
+                win - loss
+            } else {
+                loss - win
+            })
+        } else {
+            Err(StoreError::InvalidEvidence(
+                "conditional evidence needs actual raw WDL under its context revision",
+            ))
+        }
+    };
+    Ok((root_expectation(before)?, root_expectation(after)?))
+}
+
+fn validate_conditional_repair_wdl(
+    observation: &Observation,
+    before: &Observation,
+    after: &Observation,
+    refutation: &Observation,
+) -> Result<(), StoreError> {
+    let RawScore::ConditionalRepairWdl {
+        expectation,
+        perspective,
+        context_revision,
+        ..
+    } = observation.score
+    else {
+        return Ok(());
+    };
+    observation.validate()?;
+    refutation.validate()?;
+    if refutation.kind != ObservationKind::Refutation || refutation.state != observation.state {
+        return Err(StoreError::InvalidEvidence(
+            "conditional model repair supersedes another refutation scope",
+        ));
+    }
+    let (before_expectation, after_expectation) =
+        validate_context_model_pair(before, after, perspective, context_revision)?;
+    if after_expectation <= before_expectation || expectation != after_expectation {
+        return Err(StoreError::InvalidEvidence(
+            "conditional model repair is not its strict improvement",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_model_derivation<'a>(
+    observation: &Observation,
+    get: impl Fn(ObservationId) -> Result<&'a Observation, StoreError>,
+) -> Result<(), StoreError> {
+    match observation.score {
+        RawScore::ConditionalWdl {
+            repaired, counter, ..
+        } => validate_conditional_wdl(observation, get(repaired)?, get(counter)?),
+        RawScore::ConditionalRepairWdl { before, after, .. } => {
+            let refutation = observation.supersedes.ok_or(StoreError::InvalidEvidence(
+                "conditional model repair lacks superseded refutation",
+            ))?;
+            validate_conditional_repair_wdl(
+                observation,
+                get(before)?,
+                get(after)?,
+                get(refutation)?,
+            )
+        }
+        _ => Ok(()),
+    }
+}
+
 const MAX_EXTERNAL_PV_PLIES: usize = 256;
 
 fn external_source_id(semantics: &str) -> u64 {
@@ -676,35 +925,40 @@ fn external_source_id(semantics: &str) -> u64 {
 
 #[derive(Debug)]
 pub struct ObservationStore {
-    observations: Vec<Observation>,
+    observations: HotRecords<Observation>,
     limit: usize,
 }
 
 impl ObservationStore {
     pub fn new(limit: usize) -> Self {
         Self {
-            observations: Vec::new(),
+            observations: HotRecords::new(),
             limit,
         }
     }
 
     pub fn append(&mut self, observation: Observation) -> Result<ObservationId, StoreError> {
         observation.validate()?;
+        validate_model_derivation(&observation, |id| self.get(id))?;
         if let Some(previous) = observation.supersedes {
             self.get(previous)?;
         }
         if self.observations.len() >= self.limit {
             return Err(StoreError::Capacity("observations"));
         }
-        let id = ObservationId(self.observations.len());
-        self.observations.push(observation);
+        let id = ObservationId(self.observations.next_id());
+        self.observations.push(observation)?;
         Ok(id)
     }
 
     pub fn get(&self, id: ObservationId) -> Result<&Observation, StoreError> {
-        self.observations
-            .get(id.0)
-            .ok_or(StoreError::InvalidHandle("observation"))
+        self.observations.get(id.0).ok_or_else(|| {
+            if id.0 < self.observations.next_id() {
+                StoreError::ColdRecord("observation")
+            } else {
+                StoreError::InvalidHandle("observation")
+            }
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -715,7 +969,7 @@ impl ObservationStore {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ContinuationStatus {
     Unresolved,
     Supported,
@@ -723,7 +977,7 @@ pub enum ContinuationStatus {
     RepairedBy(LineId),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ContinuationConclusion {
     pub status: ContinuationStatus,
     pub evidence: Option<ObservationId>,
@@ -731,7 +985,7 @@ pub struct ContinuationConclusion {
 }
 
 /// Mutable interpretation; immutable raw observations remain independently readable.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ConclusionView {
     continuations: BTreeMap<LineId, ContinuationConclusion>,
 }
@@ -760,7 +1014,7 @@ impl ConclusionView {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Situation {
     pub state: StateId,
     pub focus: LineId,
@@ -962,7 +1216,9 @@ impl DependencyIndex {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub enum TaskQuestion {
     AnalyzePosition,
     AnalyzeRootMoves,
@@ -974,7 +1230,7 @@ pub enum TaskQuestion {
 
 /// Exact task reuse namespace. A different requested depth, input revision,
 /// profile, history StateId, candidate order, or model epoch is another question.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct TaskKey {
     pub state: StateId,
     pub line: Option<LineId>,
@@ -999,7 +1255,7 @@ pub struct TaskKey {
     pub node_budget: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TaskConsumer {
     pub id: u64,
     pub situation: SituationId,
@@ -1009,7 +1265,7 @@ pub struct TaskConsumer {
     pub deadline_tick: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TaskStatus {
     InFlight,
     CancellationRequested,
@@ -1017,18 +1273,23 @@ pub enum TaskStatus {
         checkpoint: u64,
         evidence: Option<ObservationId>,
     },
+    /// A concrete CPU owner rejected reuse; partial evidence stays historical.
+    RetiredPaused {
+        checkpoint: u64,
+        evidence: Option<ObservationId>,
+    },
     Completed(ObservationId),
     Failed,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct ConsumerRecord {
     consumer: TaskConsumer,
     cancelled: bool,
     consumed: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TaskRecord {
     pub key: TaskKey,
     pub status: TaskStatus,
@@ -1053,7 +1314,7 @@ pub enum TaskAdmission {
 
 #[derive(Debug)]
 pub struct TaskTable {
-    tasks: Vec<TaskRecord>,
+    tasks: HotRecords<TaskRecord>,
     latest: BTreeMap<TaskKey, ExecutionId>,
     consumers: BTreeSet<u64>,
     execution_limit: usize,
@@ -1072,7 +1333,7 @@ fn valid_cpu_condition(value: &String, external: bool) -> bool {
 impl TaskTable {
     pub fn new(executions: usize, consumers: usize, root_moves_per_task: usize) -> Self {
         Self {
-            tasks: Vec::new(),
+            tasks: HotRecords::new(),
             latest: BTreeMap::new(),
             consumers: BTreeSet::new(),
             execution_limit: executions,
@@ -1183,7 +1444,7 @@ impl TaskTable {
             if self.tasks.len() >= self.execution_limit {
                 return Err(StoreError::Capacity("task executions"));
             }
-            let id = ExecutionId(self.tasks.len());
+            let id = ExecutionId(self.tasks.next_id());
             let paused =
                 self.latest
                     .get(&key)
@@ -1196,7 +1457,7 @@ impl TaskTable {
                 status: TaskStatus::InFlight,
                 resumed_from: paused.map(|(previous, _)| previous),
                 consumers: Vec::new(),
-            });
+            })?;
             self.latest.insert(key, id);
             let admission = match paused {
                 Some((previous, checkpoint)) => TaskAdmission::Resume {
@@ -1218,9 +1479,13 @@ impl TaskTable {
     }
 
     pub fn get(&self, id: ExecutionId) -> Result<&TaskRecord, StoreError> {
-        self.tasks
-            .get(id.0)
-            .ok_or(StoreError::InvalidHandle("execution"))
+        self.tasks.get(id.0).ok_or_else(|| {
+            if id.0 < self.tasks.next_id() {
+                StoreError::ColdRecord("execution")
+            } else {
+                StoreError::InvalidHandle("execution")
+            }
+        })
     }
 
     /// Publication retains the completed observation even if every consumer has
@@ -1366,6 +1631,166 @@ impl TaskTable {
     pub fn consumer_count(&self) -> usize {
         self.consumers.len()
     }
+    pub fn paused_executions_for_state(
+        &self,
+        state: StateId,
+    ) -> Result<Vec<ExecutionId>, StoreError> {
+        let count = self
+            .tasks
+            .entries()
+            .filter(|(_, t)| {
+                t.key.state == state
+                    && matches!(t.status, TaskStatus::Paused { .. })
+                    && t.key.value_identity.is_some()
+                    && !matches!(
+                        t.key.checker_identity,
+                        Some(CheckerIdentity::ExternalUci(_))
+                    )
+            })
+            .count();
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(count)
+            .map_err(|_| StoreError::Capacity("paused execution index"))?;
+        result.extend(
+            self.tasks
+                .entries()
+                .filter(|(_, t)| {
+                    t.key.state == state
+                        && matches!(t.status, TaskStatus::Paused { .. })
+                        && t.key.value_identity.is_some()
+                        && !matches!(
+                            t.key.checker_identity,
+                            Some(CheckerIdentity::ExternalUci(_))
+                        )
+                })
+                .map(|(id, _)| ExecutionId(id)),
+        );
+        Ok(result)
+    }
+    /// The concrete CPU owner must first establish which tokens remain current.
+    /// This table certifies no backend stack ownership or physical completion.
+    pub fn retire_paused_except(
+        &mut self,
+        current: &BTreeSet<ExecutionId>,
+    ) -> Result<usize, StoreError> {
+        for id in current {
+            self.get(*id)?;
+        }
+        let count = self
+            .tasks
+            .entries()
+            .filter(|(id, t)| {
+                !current.contains(&ExecutionId(*id))
+                    && matches!(t.status, TaskStatus::Paused { .. })
+                    && t.key.value_identity.is_some()
+                    && !matches!(
+                        t.key.checker_identity,
+                        Some(CheckerIdentity::ExternalUci(_))
+                    )
+            })
+            .count();
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(count)
+            .map_err(|_| StoreError::Capacity("retired pause index"))?;
+        ids.extend(
+            self.tasks
+                .entries()
+                .filter(|(id, t)| {
+                    !current.contains(&ExecutionId(*id))
+                        && matches!(t.status, TaskStatus::Paused { .. })
+                        && t.key.value_identity.is_some()
+                        && !matches!(
+                            t.key.checker_identity,
+                            Some(CheckerIdentity::ExternalUci(_))
+                        )
+                })
+                .map(|(id, _)| id),
+        );
+        for id in &ids {
+            let task = self.tasks.get_mut(*id).expect("checked pause execution");
+            let TaskStatus::Paused {
+                checkpoint,
+                evidence,
+            } = task.status
+            else {
+                unreachable!("filtered pause")
+            };
+            task.status = TaskStatus::RetiredPaused {
+                checkpoint,
+                evidence,
+            };
+            for c in &mut task.consumers {
+                c.cancelled = true;
+            }
+        }
+        Ok(ids.len())
+    }
+    pub fn active_states(&self) -> impl Iterator<Item = StateId> + '_ {
+        self.tasks
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    TaskStatus::InFlight
+                        | TaskStatus::CancellationRequested
+                        | TaskStatus::Paused { .. }
+                )
+            })
+            .map(|t| t.key.state)
+    }
+    /// Engine compaction supplies current node indices only after committing
+    /// the old topology. Retired checkpoint metadata is never rewritten.
+    pub fn remap_paused_checkpoints(
+        &mut self,
+        nodes: &BTreeMap<StateId, u64>,
+    ) -> Result<usize, StoreError> {
+        let count = self
+            .tasks
+            .entries()
+            .filter(|(_, task)| {
+                matches!(task.status, TaskStatus::Paused { .. })
+                    && task.key.value_identity.is_some()
+                    && !matches!(
+                        task.key.checker_identity,
+                        Some(CheckerIdentity::ExternalUci(_))
+                    )
+            })
+            .count();
+        let mut remaps = Vec::new();
+        remaps
+            .try_reserve_exact(count)
+            .map_err(|_| StoreError::Capacity("pause checkpoint remap"))?;
+        for (id, task) in self.tasks.entries() {
+            if matches!(task.status, TaskStatus::Paused { .. })
+                && task.key.value_identity.is_some()
+                && !matches!(
+                    task.key.checker_identity,
+                    Some(CheckerIdentity::ExternalUci(_))
+                )
+            {
+                let checkpoint =
+                    nodes
+                        .get(&task.key.state)
+                        .copied()
+                        .ok_or(StoreError::InvalidHandle(
+                            "active pause state missing from remap",
+                        ))?;
+                remaps.push((id, checkpoint));
+            }
+        }
+        for (id, checkpoint) in &remaps {
+            let task = self.tasks.get_mut(*id).expect("checked remap execution");
+            let TaskStatus::Paused { evidence, .. } = task.status else {
+                unreachable!("checked pause remap")
+            };
+            task.status = TaskStatus::Paused {
+                checkpoint: *checkpoint,
+                evidence,
+            };
+        }
+        Ok(remaps.len())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1451,6 +1876,7 @@ pub struct PalsStores {
     root: Option<SituationId>,
     generation: u64,
     checked_cpu_pvs: BTreeMap<LineId, CheckedCpuPv>,
+    archive: Option<archive::ArchiveManager>,
 }
 
 impl PalsStores {
@@ -1471,6 +1897,7 @@ impl PalsStores {
             root: None,
             generation: 0,
             checked_cpu_pvs: BTreeMap::new(),
+            archive: None,
         }
     }
 
@@ -1482,6 +1909,25 @@ impl PalsStores {
     }
 
     pub fn insert_situation(
+        &mut self,
+        snapshot: PositionSnapshot,
+    ) -> Result<SituationId, StoreError> {
+        if !self.automatic_archive_enabled() {
+            return self.insert_situation_once(snapshot);
+        }
+        let mut pins = StorePins::default();
+        if let Some(id) = self.states.find(&snapshot) {
+            pins.states.insert(id);
+        }
+        self.automatic_reclaim(pins.clone(), false)?;
+        let result = self.insert_situation_once(snapshot.clone());
+        if matches!(result, Err(StoreError::Capacity(_))) && self.automatic_reclaim(pins, true)? {
+            self.insert_situation_once(snapshot)
+        } else {
+            result
+        }
+    }
+    fn insert_situation_once(
         &mut self,
         snapshot: PositionSnapshot,
     ) -> Result<SituationId, StoreError> {
@@ -1506,13 +1952,38 @@ impl PalsStores {
         checked_moves: &[BoardMove],
     ) -> Result<LineId, StoreError> {
         self.states.get(self.lines.get(prefix)?.start_state)?;
-        self.lines.append(prefix, checked_moves)
+        let mut pins = StorePins::default();
+        pins.lines.insert(prefix);
+        self.automatic_reclaim(pins.clone(), false)?;
+        let result = self.lines.append(prefix, checked_moves);
+        if matches!(result, Err(StoreError::Capacity(_))) && self.automatic_reclaim(pins, true)? {
+            self.lines.append(prefix, checked_moves)
+        } else {
+            result
+        }
     }
 
     /// Mint a CPU PV handle only after replay through the Rules owner from the
     /// complete registered state. The checked-handle set is bounded by the
     /// existing immutable line-chunk limit and does not store duplicate moves.
     pub fn append_cpu_pv(
+        &mut self,
+        position: &Position,
+        moves: &[BoardMove],
+    ) -> Result<LineId, StoreError> {
+        let mut pins = StorePins::default();
+        if let Some(state) = self.states.find(&position.snapshot()) {
+            pins.states.insert(state);
+        }
+        self.automatic_reclaim(pins.clone(), false)?;
+        let result = self.append_cpu_pv_once(position, moves);
+        if matches!(result, Err(StoreError::Capacity(_))) && self.automatic_reclaim(pins, true)? {
+            self.append_cpu_pv_once(position, moves)
+        } else {
+            result
+        }
+    }
+    fn append_cpu_pv_once(
         &mut self,
         position: &Position,
         moves: &[BoardMove],
@@ -1565,6 +2036,33 @@ impl PalsStores {
         &mut self,
         observation: Observation,
     ) -> Result<ObservationId, StoreError> {
+        // The legacy/no-automatic-archive path never clones large raw payloads.
+        if self.archive_enabled() && observation.external_report.is_some() {
+            return Err(StoreError::ArchiveBudgetRequired);
+        }
+        if !self.automatic_archive_enabled() {
+            return self.append_observation_once(observation);
+        }
+        let mut pins = StorePins::default();
+        pins.states.insert(observation.state);
+        pins.lines.extend(observation.line);
+        pins.lines.extend(observation.cpu_pv);
+        pins.observations.extend(observation.supersedes);
+        pins.observations
+            .extend(observation.score.model_dependencies().into_iter().flatten());
+        pins.executions.extend(observation.execution);
+        self.automatic_reclaim(pins.clone(), false)?;
+        let result = self.append_observation_once(observation.clone());
+        if matches!(result, Err(StoreError::Capacity(_))) && self.automatic_reclaim(pins, true)? {
+            self.append_observation_once(observation)
+        } else {
+            result
+        }
+    }
+    fn append_observation_once(
+        &mut self,
+        observation: Observation,
+    ) -> Result<ObservationId, StoreError> {
         if matches!(observation.score, RawScore::Terminal { .. }) {
             return Err(StoreError::InvalidEvidence(
                 "Rules terminal must be minted from a checked Position",
@@ -1575,8 +2073,18 @@ impl PalsStores {
     }
 
     fn validate_observation_handles(&self, observation: &Observation) -> Result<(), StoreError> {
-        self.states.get(observation.state)?;
+        let snapshot = self.states.get(observation.state)?;
         observation.validate()?;
+        if let RawScore::ConditionalWdl { perspective, .. }
+        | RawScore::ConditionalRepairWdl { perspective, .. } = observation.score
+        {
+            if perspective != snapshot.side_to_move() {
+                return Err(StoreError::InvalidEvidence(
+                    "conditional model expectation has another root perspective",
+                ));
+            }
+            validate_model_derivation(observation, |id| self.observations.get(id))?;
+        }
         if let Some(report) = observation.external_report.as_deref() {
             if self.observations.observations.iter().any(|previous| {
                 previous.external_report.as_deref().is_some_and(|earlier| {
@@ -1747,6 +2255,24 @@ impl PalsStores {
     /// terminal evidence through the product facade. Model/CPU reported mate and
     /// claimable draws cannot select this path by setting an enum field.
     pub fn append_rules_terminal(
+        &mut self,
+        position: &Position,
+        source: u64,
+        epoch: u64,
+    ) -> Result<ObservationId, StoreError> {
+        let mut pins = StorePins::default();
+        if let Some(state) = self.states.find(&position.snapshot()) {
+            pins.states.insert(state);
+        }
+        self.automatic_reclaim(pins.clone(), false)?;
+        let result = self.append_rules_terminal_once(position, source, epoch);
+        if matches!(result, Err(StoreError::Capacity(_))) && self.automatic_reclaim(pins, true)? {
+            self.append_rules_terminal_once(position, source, epoch)
+        } else {
+            result
+        }
+    }
+    fn append_rules_terminal_once(
         &mut self,
         position: &Position,
         source: u64,
@@ -1937,6 +2463,27 @@ impl PalsStores {
     }
 
     pub fn request_task(
+        &mut self,
+        key: TaskKey,
+        consumer: TaskConsumer,
+        now_tick: u64,
+    ) -> Result<TaskAdmission, StoreError> {
+        if !self.automatic_archive_enabled() {
+            return self.request_task_once(key, consumer, now_tick);
+        }
+        let mut pins = StorePins::default();
+        pins.states.insert(key.state);
+        pins.lines.extend(key.line);
+        pins.situations.insert(consumer.situation);
+        self.automatic_reclaim(pins.clone(), false)?;
+        let result = self.request_task_once(key.clone(), consumer, now_tick);
+        if matches!(result, Err(StoreError::Capacity(_))) && self.automatic_reclaim(pins, true)? {
+            self.request_task_once(key, consumer, now_tick)
+        } else {
+            result
+        }
+    }
+    fn request_task_once(
         &mut self,
         key: TaskKey,
         consumer: TaskConsumer,
