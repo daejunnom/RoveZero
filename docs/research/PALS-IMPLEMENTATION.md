@@ -3143,3 +3143,42 @@ GPU 검증 보류와 실제 학습 제외를 유지한다.
 `f5e857a`의 CI `37864492893`은 네 job의 종료를 모두 확인했다. model CPU와 bindings는 성공했으나 Linux/Windows workspace는 `u64` process 출력 상한과 `usize` transport 선언의 E0308/E0277 비교 오류로 실패했다. 새 transport 검사 성공으로 기록하지 않으며 원시 로그를 별도 보고서 루트에 보존한다. 수정은 checked 정수 변환으로 선언값을 유지하며 변환 실패를 거부한다.
 
 추가 검토로 원래 E 이전의 leader exit 관측을 W 이내 정리 완료와 분리했다. 첫 waitid 종료 관측의 S 이후 offset과 E 이전 여부를 기록하며, 해당 관측 없이 전달 완료를 발급하지 않는다. OS가 종료를 늦게 보여 주는 경우도 소급하여 통과시키지 않는다. 기존 실제 cat 검사에 E 관측 누락의 거부를 추가했다. 기존 receipt·protocol·준비/CLI wire·공통 계약은 유지하며, 수정 HEAD의 정확한 CPU CI 인수는 PR 설명과 외부 SHA·로그 영수증으로 별도 확인한다.
+
+
+## 일반 UCI 탐색의 실제 C 후속 수순 — 별도 S lane
+
+원래 계획의 Repair 이후 재공격을 제품 탐색에 연결한다. 기존
+`same-repaired-line-once-v1`은 C의 새 응답 한 수 뒤에 기존 Repair의 나머지 수순을
+Rules로 재생한다. 이 의미와 기존 생략/default lane·V1/V2 기록은 유지한다.
+새 명시 옵션 `--pals-post-repair-recheck=actual-opponent-continuation-v1`은
+원래 첫 착수를 보존하고, 대체 응답 이후 매 실제 counter-prefix에서 C Reply를 호출한다.
+C는 상대와 자기 차례를 포함한 제한된 후보 수순을 생성하며, 기존 Repair suffix를
+끼워 넣지 않는다. 새 수순의 길이는 수락된 Repair 길이를 넘지 않는다.
+
+- 기존 `ranked`의 정확한 Rules 합법 수·context·출력 수락을 사용한다. 모델과 CPU
+  namespace·value resolver는 바꾸지 않으며 새 역할 호출도 기존 전역 예산에 청구한다.
+  같은 deadline/cancel/store 한도와 native 역할 평가기의 물리 수명을 재사용한다.
+- 완전 길이의 counterline과 같은 완료 CPU depth/namespace 또는 두 Rules 종료
+  근거가 있을 때만 해당 Repair line을 조건부로 반박한다. 부분/잘못된/늦은 출력,
+  역할 한도 소진, 비교 불가능한 CPU 근거는 확정 반박이나 모든 방어의 증명이 아니다.
+  짧아진 terminal line도 기존 equal-length 비교를 자동 우회하지 않는다.
+- observer는 선택 policy와 `counterline_completed`를 별도로 전달한다.
+  실제 C 생성은 `full_suffix_replayed=true`로 표시하지 않는다. 초기 대체 Reply의
+  attempt/acceptance와 전체 C 호출·완료·소비 계수의 의미도 구분한다.
+- 새 검색 identity는 `pals-restricted-refinement-post-repair-continuation/1`, 명세
+  version은 `pals-post-repair-continuation/1`, policy는
+  `actual_opponent_continuation_v1`이다. 468-byte conditions의 SHA-256은
+  `876c7104c28183131243101df86c386865bf903f26545edde01d48de4403d4d1`이다.
+  UCI driver getter·immutable startup registration·영수증·V3 lock·arena argv와
+  양쪽 process snapshot을 직접 대조한다. 기존 lane의 hash/tuple은 변경하지 않는다.
+- 한 번의 Reply만 소비하도록 설계된 native refinement collector 등록과 observer는
+  새 lane을 명시적으로 거부한다. 일반 native UCI 역할 평가기 연결을 그 collector의
+  strict witness, Query target, utility label 또는 실제 NN 실행 성공으로 승격하지 않는다.
+
+CPU fixture는 새 뒷수순/실제 prefix/원래 첫 수/조건부 conclusion namespace,
+취소·잘못된 shape·역할 예산 초과와 불완전 CPU 근거, CLI 중복·외부 checker 거부,
+driver identity, manifest/receipt의 old/new tuple 치환, mock/CPU/CUDA 선언의 argv와
+시작·종료 관측 치환을 검사한다. CUDA fixture는 선언/검증 코드이며 실제 GPU 실행이 아니다.
+로컬 heavy CPU·GPU·실제 학습은 실행하지 않았다. 소스의 CI 인수는 정확한 새 HEAD에서
+별도로 확인한다. 실제 native 다중 Reply 인수, 등록된 observed 4N 실행·strict Query
+prior·whole-action cost·utility 및 paired 대국 인수는 계속 남는다.
