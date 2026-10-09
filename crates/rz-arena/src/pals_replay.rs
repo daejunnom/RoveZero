@@ -16,6 +16,9 @@ use std::sync::atomic::AtomicBool;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 
+mod delivery;
+pub use delivery::{BoundReplayDelivery, ReplayDeliveryRegistration};
+
 pub const MAX_REPLAY_CALLER_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_REPLAY_CALLER_READ_BYTES: u64 = MAX_REPLAY_CALLER_BINARY_BYTES + 32 * 1024 * 1024;
 
