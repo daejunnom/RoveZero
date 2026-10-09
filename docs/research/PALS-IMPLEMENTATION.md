@@ -3267,3 +3267,41 @@ examined 목록을 다룬다. 기존 실제 engine mock callback도 준비 목�
 현재 수정 HEAD의 CI는 push 후 별도로 인수한다. frozen 실제 다중 Reply 실행·strict 결과
 소비·CPU endpoint provenance·Query prior·whole-action cost·utility·paired 인수는 계속 남는다.
 GPU 검증 보류·실제 학습 제외·로컬 heavy CPU 미실행·Draft 및 전체 목표 active를 유지한다.
+
+### 외부 frozen replay의 캡처와 출력 연결
+
+직전 `50c12dd`는 Linux·Windows workspace, bindings, model CPU CI 네 job 모두 성공했다.
+이번 변경은 게임 안 다중 Reply 관측과 별개인 `rz-arena::pals_replay`의 외부 frozen 4N
+경로를 다룬다. 실제 `OwnedReplayCapture`에 `bind_delivery`를 추가하고,
+준비 소유자의 원래 W가 끝나기 전 취소·transport closure·postflight 상태를 검사한다.
+실패는 capture를 소비하지 않으며 pending child와 입력 소유권은 기존 owner에 남는다.
+
+CLI의 고정 `{cli,native}` 봉투에서 원본 native 바이트를 빌려 해시를 대조한다.
+JSON을 다시 직렬화해서 본문 pin을 만들지 않는다. 전체 출력·header·expected 파일의
+기존 한도를 유지하고 중복 key·추가 출력·알 수 없는 header와 clock 필드를 거부한다.
+준비된 `/3` expected, 요청·binary·runtime·asset pin, semantic producer scope,
+원래 W/E/output 선언, native 입력 audit의 parent/current/frozen/query binding을 대조한다.
+CLI에 있는 `stdout_delivered=null`, process/loaded-provider/physical-closure false 표시는
+그대로 요구하고 실제 pipe/exit/group 종료 증거는 capture owner에서 확인한다.
+정리·직렬화가 E를 넘을 수 있다는 기존 진단은 새 실행 창이나 작업 완료 증거로 바꾸지 않는다.
+
+작은 구조화 prior는 닫힌 필드와 단계·move 배열·크기 한도를 검사하며,
+별도 `ReplayDeliveryRegistration.query_prior_source`의 독립 source digest와 대조한다.
+기존 prepared `/3`에는 이 source pin이 없으므로 수신 JSON이나 현재 빌드의 digest를
+기대값으로 자동 채우지 않는다. source 선언을 연결한 사실과 해당 source/NN 실행을
+인수한 사실도 구분한다. production API는 실제 capture 없이는 `BoundReplayDelivery`를
+생성할 수 없고 raw body 복제나 child custody 복제를 제공하지 않는다.
+
+**`BoundReplayDelivery`는 native 의미 인수나 다음 Query prior가 아니다.**
+`unadmitted_projection()`은 읽기 전용 JSON이다. native 단계 완료·Rules 수순·raw report·
+역할 receipt·물리 수명 검증, strict current selector/frozen 재입장, caller chronology,
+whole-action cost·utility를 이 연결 검사로 대신하지 않는다. `Unobserved` prior의 원문
+연결도 가능하지만 readiness는 그대로 남으며 utility/target/training 권한은 모두 false다.
+권한 타입에 Deserialize·Clone 생성자를 추가하거나 기존 Query/2 소비자를 완화하지 않는다.
+
+이번 CPU parser 검사 다섯 개는 원문과 재직렬화의 해시 차이, borrow 범위,
+raw 변조·중복 key·추가 출력, 독립 pin·clock 대체, CLI 완료/권한 주장의 거부,
+에러 lane, prior/source/배열 한도를 다룬다. 합성 wire 검사는 실제 child나 ONNX 실행을
+만들지 않는다. 현재 수정 HEAD의 컴파일·CI는 push 후 별도로 인수한다.
+실제 등록 frozen 4N 실행과 native 의미 결과 소비·다음 Query 연결 및 유용성·paired 인수는
+계속 남는다. GPU 검증 보류·실제 학습 제외·로컬 heavy CPU 미실행과 Draft를 유지한다.
