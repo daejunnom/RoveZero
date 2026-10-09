@@ -6,11 +6,18 @@ use super::super::super::replay_inputs::{
 use super::*;
 use serde_json::Value;
 
+#[path = "replay_reported_rules.rs"]
+mod rules;
+pub use rules::{ReportedRulesConsistency, ReportedRulesError};
+
 /// A closed, recomputed REPORT, still pending independent native witness and
 /// caller chronology. No Serialize/Deserialize/Clone/into-projection constructor.
 pub struct ReportedPriorConsistency {
     projection: ReplayQueryPrior,
     readiness: PriorReadiness,
+    input_artifact: ArtifactPin,
+    whole_wall_ms: u64,
+    cleanup_reserve_ms: u64,
 }
 impl ReportedPriorConsistency {
     pub fn reported_projection(&self) -> &ReplayQueryPrior {
@@ -458,6 +465,9 @@ pub fn check_reported_prior_consistency(
     Ok(ReportedPriorConsistency {
         projection,
         readiness,
+        input_artifact: a.input_artifact.clone(),
+        whole_wall_ms: a.whole_wall_ms,
+        cleanup_reserve_ms: a.cleanup_reserve_ms,
     })
 }
 fn bounded_json_extent(value: &Value, limit: usize) -> Result<(), AdmissionFault> {

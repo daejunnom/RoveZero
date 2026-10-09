@@ -20,7 +20,10 @@ use sha2::{Digest, Sha256};
 
 #[path = "replay_reported.rs"]
 mod reported;
-pub use reported::{ReportedPriorConsistency, check_reported_prior_consistency};
+pub use reported::{
+    ReportedPriorConsistency, ReportedRulesConsistency, ReportedRulesError,
+    check_reported_prior_consistency,
+};
 
 pub const SCHEMA: &str = "rz-pals-frozen-replay-query-prior/1";
 pub const SCOPE: &str = "registered_native_replay_projection_pending_caller_chronology";

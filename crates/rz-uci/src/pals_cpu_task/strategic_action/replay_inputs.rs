@@ -33,6 +33,7 @@ use std::collections::TryReserveError;
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub const SCHEMA: &str = "rz-pals-frozen-replay-inputs/1";
@@ -139,6 +140,101 @@ impl PreparedReplayRequest {
     pub fn execution_deadline(&self) -> Instant {
         self.execution_deadline
     }
+
+    /// Result verification only, under the original W. This never reopens E or
+    /// creates CPU/model/provider work. The reconstructed history is temporary;
+    /// no Rules graph is retained throughout native execution or in its report.
+    pub(super) fn reconstruct_result_root(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<ReplayResultRoot, ReplayInputError> {
+        let control = || {
+            if cancel.load(Ordering::Acquire) || Instant::now() >= self.whole_deadline {
+                Err(ReplayInputError::new(
+                    "result_rules_control",
+                    "original whole window expired or result verification canceled",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        control()?;
+        if self.bytes.len() > MAX_REQUEST_BYTES || super::pin(&self.bytes) != self.artifact {
+            return Err(ReplayInputError::new(
+                "result_rules_input",
+                "prepared backing differs",
+            ));
+        }
+        let request: ReplayInputRequest = serde_json::from_slice(&self.bytes)
+            .map_err(|e| ReplayInputError::new("result_rules_input", e))?;
+        let started = self
+            .whole_deadline
+            .checked_sub(Duration::from_millis(
+                self.audit.input_admission.whole_wall_ms,
+            ))
+            .ok_or_else(|| {
+                ReplayInputError::new("result_rules_clock", "original start unavailable")
+            })?;
+        // Decode the immutable, previously admitted original action with its
+        // original S, not a fresh admission clock or an execution extension.
+        let (prepared, _) = super::decode(request.prepared_action_raw.as_bytes(), started)
+            .map_err(|e| ReplayInputError::strategic("result_rules_action", e))?;
+        let cpu = cpu_task::decode_request(prepared.cpu_request_raw.as_bytes())
+            .map_err(|e| ReplayInputError::cpu("result_rules_cpu_input", e))?;
+        let receipt: SemanticReceipt = serde_json::from_str(&request.semantic_receipt_raw)
+            .map_err(|e| ReplayInputError::new("result_rules_semantic", e))?;
+        let semantic_request = original_root_request(&cpu, &receipt);
+        control()?;
+        let owners = Arc::new(OwnerRegistry::default());
+        let root = semantic::prepare_root(&semantic_request, &owners, self.whole_deadline)
+            .map_err(|e| ReplayInputError::semantic("result_rules_root", e))?;
+        if root.history_completeness() != HistoryCompleteness::Complete
+            || root.history_origin() != HistoryOrigin::StartPosition
+            || root.known_history_len() == 0
+            || root.known_history_len() > MAX_KNOWN_HISTORY_POSITIONS
+        {
+            return Err(ReplayInputError::new(
+                "result_rules_history",
+                "complete startpos history required",
+            ));
+        }
+        let actual = semantic::describe(
+            &root,
+            &owners,
+            MoveTokenKind::RootLegal,
+            self.whole_deadline,
+        )
+        .map_err(|e| ReplayInputError::semantic("result_rules_descriptor", e))?;
+        same_serialized(&actual, &receipt.root, "result_rules_descriptor")?;
+        if actual.rules_state_sha256 != cpu.rules_state_sha256
+            || actual.rules_history_sha256 != cpu.rules_history_sha256
+            || actual.board_fen != cpu.expected_board_fen
+            || actual.play_status != "ongoing"
+        {
+            return Err(ReplayInputError::new(
+                "result_rules_identity",
+                "original complete Rules root differs",
+            ));
+        }
+        let prefix = cpu_task::decode_moves(&cpu.prefix)
+            .map_err(|e| ReplayInputError::cpu("result_rules_prefix", e))?;
+        control()?;
+        Ok(ReplayResultRoot {
+            root,
+            prefix,
+            line_plies: request.config.line_plies,
+            whole_deadline: self.whole_deadline,
+        })
+    }
+}
+
+/// Private temporary input to the report's Rules check, never an execution or
+/// historical owner capability. Construction remains with PreparedReplayRequest.
+pub(super) struct ReplayResultRoot {
+    pub(super) root: Position,
+    pub(super) prefix: Vec<BoardMove>,
+    pub(super) line_plies: usize,
+    pub(super) whole_deadline: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1083,6 +1179,31 @@ fn retained_moves(
     Ok(result)
 }
 
+fn original_root_request(cpu: &cpu_task::Request, receipt: &SemanticReceipt) -> SemanticRequest {
+    SemanticRequest {
+        schema: semantic::SEMANTIC_SCHEMA.into(),
+        question: receipt.question,
+        parent_input_sha256: cpu.parent_input_sha256.clone(),
+        before_result_anchor_sha256: receipt.before_result_anchor_sha256.clone(),
+        position_command: cpu.position_command.clone(),
+        expected_board_fen: cpu.expected_board_fen.clone(),
+        rules_state_sha256: cpu.rules_state_sha256.clone(),
+        rules_history_sha256: cpu.rules_history_sha256.clone(),
+        prefix: cpu.prefix.clone(),
+        root_moves: cpu.root_moves.clone(),
+        claimed_line: receipt
+            .claimed_line
+            .movements
+            .iter()
+            .map(|token| token.move16)
+            .collect(),
+        current_binary_sha256: receipt.current_binary_sha256.clone(),
+        max_wall_time_ms: receipt.resource_policy.max_wall_time_ms,
+        max_output_bytes: receipt.resource_policy.max_output_bytes,
+        context_sha256: receipt.context_sha256.clone(),
+    }
+}
+
 fn prepare_rules(
     request: &ReplayInputRequest,
     cpu: &cpu_task::Request,
@@ -1128,28 +1249,7 @@ fn prepare_rules(
     // Root preparation uses the actual original CPU position command. Receipt
     // context and its original tool launch remain independently caller-checked;
     // this adapter does not recreate a semantic request/context to certify them.
-    let semantic_request = SemanticRequest {
-        schema: semantic::SEMANTIC_SCHEMA.into(),
-        question: receipt.question,
-        parent_input_sha256: cpu.parent_input_sha256.clone(),
-        before_result_anchor_sha256: receipt.before_result_anchor_sha256.clone(),
-        position_command: cpu.position_command.clone(),
-        expected_board_fen: cpu.expected_board_fen.clone(),
-        rules_state_sha256: cpu.rules_state_sha256.clone(),
-        rules_history_sha256: cpu.rules_history_sha256.clone(),
-        prefix: cpu.prefix.clone(),
-        root_moves: cpu.root_moves.clone(),
-        claimed_line: receipt
-            .claimed_line
-            .movements
-            .iter()
-            .map(|token| token.move16)
-            .collect(),
-        current_binary_sha256: receipt.current_binary_sha256.clone(),
-        max_wall_time_ms: receipt.resource_policy.max_wall_time_ms,
-        max_output_bytes: receipt.resource_policy.max_output_bytes,
-        context_sha256: receipt.context_sha256.clone(),
-    };
+    let semantic_request = original_root_request(cpu, receipt);
     if semantic_request.claimed_line.len() > semantic::MAX_CLAIM_PLIES {
         return Err(ReplayInputError::new(
             "claim_extent",
@@ -2272,7 +2372,7 @@ pub fn prepare_replay_request(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::engine::RulesUciPort;
     use crate::{Command, ParserLimits, PositionPort, parse};
@@ -2799,6 +2899,93 @@ mod tests {
             budget,
             started,
         )
+    }
+
+    /// CPU Rules fixture only. No native/role work, witness or caller admission.
+    pub(super) fn controlled_prepared_result_rules() -> PreparedReplayRequest {
+        constructed(
+            &opponent_fixture(),
+            PRODUCER_SCOPES[0],
+            construction_budget(),
+            Instant::now(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn result_rules_reconstruction_preserves_full_history_and_original_whole_window() {
+        let fixture = fixture(
+            ReplayInputMode::RepairEndpoint3n,
+            true,
+            "position startpos moves g1f3 g8f6 f3g1 f6g8",
+        );
+        let mut prepared = constructed(
+            &fixture,
+            PRODUCER_SCOPES[0],
+            construction_budget(),
+            Instant::now(),
+        )
+        .unwrap();
+        let original_whole = prepared.deadline();
+        // Pure result validation is allowed after E, but never changes it.
+        prepared.execution_deadline = Instant::now();
+        let original_execution = prepared.execution_deadline();
+        let reconstructed = prepared
+            .reconstruct_result_root(&AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(
+            reconstructed.root.history_completeness(),
+            HistoryCompleteness::Complete
+        );
+        assert_eq!(
+            reconstructed.root.history_origin(),
+            HistoryOrigin::StartPosition
+        );
+        assert_eq!(reconstructed.root.known_history_len(), 5);
+        assert_ne!(
+            cpu_task::history_sha(&reconstructed.root).unwrap(),
+            cpu_task::history_sha(&Position::startpos()).unwrap()
+        );
+        assert_eq!(
+            reconstructed.prefix,
+            vec![BoardMove::from_uci("e2e4").unwrap()]
+        );
+        assert_eq!(prepared.deadline(), original_whole);
+        assert_eq!(prepared.execution_deadline(), original_execution);
+        assert_eq!(prepared.audit().input_admission.cpu_checks, 0);
+        assert!(!prepared.audit().input_admission.cpu_engine_created);
+    }
+
+    #[test]
+    fn result_rules_reconstruction_refuses_cancellation_expiry_and_backing_changes() {
+        let mut prepared = controlled_prepared_result_rules();
+        assert_eq!(
+            prepared
+                .reconstruct_result_root(&AtomicBool::new(true))
+                .err()
+                .unwrap()
+                .stage,
+            "result_rules_control"
+        );
+        prepared.bytes.push(b' ');
+        assert_eq!(
+            prepared
+                .reconstruct_result_root(&AtomicBool::new(false))
+                .err()
+                .unwrap()
+                .stage,
+            "result_rules_input"
+        );
+        let mut prepared = controlled_prepared_result_rules();
+        prepared.whole_deadline = Instant::now();
+        assert_eq!(
+            prepared
+                .reconstruct_result_root(&AtomicBool::new(false))
+                .err()
+                .unwrap()
+                .stage,
+            "result_rules_control"
+        );
     }
 
     #[test]

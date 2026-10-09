@@ -94,6 +94,33 @@ impl<'a> BoundReplayDelivery<'a> {
         check_clock()?;
         Ok(report)
     }
+
+    /// Checks reported line legality against this capture's original prepared
+    /// Rules input. Still no native witness, Repair record/anchor selection proof,
+    /// or subsequent Query capability. Refusal retains raw bytes/child custody.
+    pub fn check_reported_rules_consistency(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<query_prior::ReportedRulesConsistency, ArenaError> {
+        let report = self.check_reported_consistency(cancel)?;
+        let mut originals = self
+            .capture
+            .bundle()
+            .payloads()
+            .iter()
+            .filter_map(|payload| payload.prepared_request());
+        let prepared = originals
+            .next()
+            .ok_or_else(|| invalid("actual prepared input owner missing"))?;
+        if originals.next().is_some() || prepared.deadline() != self.capture.bundle().deadline() {
+            return Err(invalid(
+                "prepared input owner uniqueness/original clock differs",
+            ));
+        }
+        report
+            .check_original_rules(prepared, cancel)
+            .map_err(|error| invalid(&format!("reported original Rules consistency: {error:?}")))
+    }
 }
 
 impl OwnedReplayCapture {

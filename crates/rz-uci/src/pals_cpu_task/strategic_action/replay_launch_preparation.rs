@@ -334,6 +334,14 @@ impl ReplayLaunchPayload {
             PayloadBacking::Request(request) => request.as_bytes(),
         }
     }
+    /// Borrows the private, previously admitted request owner. Arbitrary byte
+    /// payloads cannot fabricate this owner or a result Rules root.
+    pub fn prepared_request(&self) -> Option<&PreparedReplayRequest> {
+        match &self.backing {
+            PayloadBacking::Bytes(_) => None,
+            PayloadBacking::Request(request) => Some(request),
+        }
+    }
 }
 impl fmt::Debug for ReplayLaunchPayload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
