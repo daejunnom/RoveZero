@@ -32,8 +32,8 @@ consumer는7,949,896bytes/SHA-256
 **기존 source935의 실제 수집503·GPU508·대국514.** R5는 같은 continuation 안에서
 3Reply를 실제 소비한 두 사례를 인수했다. 전체94개 role 완료·전달·소비, backend NN188개
 (public94+private94), CPU8192nodes/32jobs를 각각 기록했다. strict frozen loader와
-current-view·분할/누출 소비를 확인했고89개 record는 holdout/value masked다. 두 게임은
-ply_limit으로 결과 unknown이며 관측되지 않은 WDL·ranking·utility target을 만들지 않았다.
+current-view·분할/누출 소비를 확인했고89개 record는 holdout/value masked다. 대국 결과는
+ply_limit으로 unknown이며 관측되지 않은 WDL·ranking·utility target을 만들지 않았다.
 기능 인수는 `reports/pals/r5-current-source-503-final-acceptance.json`에 연결한다.
 
 GPU508은 source935/build492 제품의 beam4·정상 refine1이다. P13/C8, role21개의 물리
