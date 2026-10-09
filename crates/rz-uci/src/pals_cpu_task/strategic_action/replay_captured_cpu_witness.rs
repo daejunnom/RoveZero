@@ -184,7 +184,7 @@ pub struct IndependentRepairCpuFailure {
     pub last_attempt: Option<CpuWork>,
     /// Normally returned CPU output retained if its attempt counters were
     /// unavailable. It is neither a completed stage nor a checked endpoint fact.
-    pub returned_report_without_attempt: Option<CpuReport>,
+    pub returned_report_without_attempt: Option<Box<CpuReport>>,
 }
 impl std::fmt::Display for IndependentRepairCpuFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -484,7 +484,7 @@ pub fn observe_independent_repair_cpu_witness(
         let Some(attempt) = attempt else {
             let mut error = failure("cpu_work", "actual attempt counters missing");
             error.completed_stages = stages;
-            error.returned_report_without_attempt = Some(report);
+            error.returned_report_without_attempt = Some(Box::new(report));
             return Err(error);
         };
         let observation = IndependentRepairCpuStage {

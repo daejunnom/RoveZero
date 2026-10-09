@@ -53,6 +53,12 @@ struct WitnessProgress {
 /// Partial actual work remains owned here on refusal, including a returned raw
 /// cap that did not match the child. No constructor, Clone or deserializer.
 pub struct CapturedRepairWitnessFailure {
+    retained: Box<CapturedRepairFailureData>,
+}
+// Keep the returned error small without dropping or cloning the actual partial
+// work. The heap allocation belongs only to this failure and every audit borrows
+// its original typed cause, capabilities, receipts and absolute clocks.
+struct CapturedRepairFailureData {
     cause: CapturedRepairWitnessCause,
     source_input: rz_uci::pals_cpu_task::strategic_action::ArtifactPin,
     source_output: rz_uci::pals_cpu_task::strategic_action::ArtifactPin,
@@ -65,15 +71,18 @@ pub struct CapturedRepairWitnessFailure {
 impl std::fmt::Debug for CapturedRepairWitnessFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CapturedRepairWitnessFailure")
-            .field("cause", &self.cause)
-            .field("source_input", &self.source_input)
-            .field("completed_native_inputs", &self.progress.native.len())
+            .field("cause", &self.retained.cause)
+            .field("source_input", &self.retained.source_input)
+            .field(
+                "completed_native_inputs",
+                &self.retained.progress.native.len(),
+            )
             .finish()
     }
 }
 impl std::fmt::Display for CapturedRepairWitnessFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.cause {
+        match &self.retained.cause {
             CapturedRepairWitnessCause::Refusal(_) => {
                 write!(f, "captured Repair refused; owned diagnostic available")
             }
@@ -87,23 +96,23 @@ impl std::fmt::Display for CapturedRepairWitnessFailure {
 impl std::error::Error for CapturedRepairWitnessFailure {}
 impl CapturedRepairWitnessFailure {
     pub fn primary_cause(&self) -> &CapturedRepairWitnessCause {
-        &self.cause
+        &self.retained.cause
     }
     pub fn completed_native_inputs(&self) -> &[NativeRecordedInputWitness] {
-        &self.progress.native
+        &self.retained.progress.native
     }
     pub fn pristine_ack(&self) -> Option<&NativeRecordedCpuPristineAck> {
-        self.progress.pristine.as_ref()
+        self.retained.progress.pristine.as_ref()
     }
     pub fn final_native_receipt(&self) -> Option<&NativeRoleReceipt> {
-        self.progress.final_receipt.as_ref()
+        self.retained.progress.final_receipt.as_ref()
     }
     /// Read-only snapshot on failure; physical closure is never implied by it.
     pub fn native_failure_snapshot(&self) -> &NativeRoleReceipt {
-        &self.native_snapshot
+        &self.retained.native_snapshot
     }
     pub fn invocation_budget(&self) -> NativeInvocationBudget {
-        self.budget
+        self.retained.budget
     }
     /// Caller output credit is independently enforced by W. The deadline is for
     /// failure preservation only and may not exceed original W + two seconds.
@@ -112,7 +121,8 @@ impl CapturedRepairWitnessFailure {
         writer: &mut W,
         deadline: Instant,
     ) -> Result<(), ArenaError> {
-        let maximum_deadline = self
+        let retained = &self.retained;
+        let maximum_deadline = retained
             .source_whole
             .checked_add(std::time::Duration::from_secs(2))
             .ok_or_else(|| invalid("captured failure postmortem extent"))?;
@@ -121,29 +131,29 @@ impl CapturedRepairWitnessFailure {
         }
         let audit = CapturedFailureAudit {
             schema: "rz-pals-captured-repair-witness-failure/1",
-            cause: DebugDiagnostic(&self.cause),
-            source_input: &self.source_input,
-            source_output: &self.source_output,
-            completed_native_inputs: &self.progress.native,
-            pristine_ack: self.progress.pristine.as_ref(),
-            final_native_receipt: self.progress.final_receipt.as_ref(),
-            native_failure_snapshot: &self.native_snapshot,
-            original_execution_ns: self
+            cause: DebugDiagnostic(&retained.cause),
+            source_input: &retained.source_input,
+            source_output: &retained.source_output,
+            completed_native_inputs: &retained.progress.native,
+            pristine_ack: retained.progress.pristine.as_ref(),
+            final_native_receipt: retained.progress.final_receipt.as_ref(),
+            native_failure_snapshot: &retained.native_snapshot,
+            original_execution_ns: retained
                 .budget
                 .execution_until()
-                .saturating_duration_since(self.budget.started())
+                .saturating_duration_since(retained.budget.started())
                 .as_nanos(),
-            original_whole_ns: self
+            original_whole_ns: retained
                 .budget
                 .whole_until()
-                .saturating_duration_since(self.budget.started())
+                .saturating_duration_since(retained.budget.started())
                 .as_nanos(),
             diagnostic_deadline_ns: deadline
-                .saturating_duration_since(self.budget.started())
+                .saturating_duration_since(retained.budget.started())
                 .as_nanos(),
-            source_original_whole_ns: self
+            source_original_whole_ns: retained
                 .source_whole
-                .saturating_duration_since(self.source_started)
+                .saturating_duration_since(retained.source_started)
                 .as_nanos(),
             postmortem_only: true,
             query_admitted: false,
@@ -672,19 +682,21 @@ pub fn witness_captured_repair_inputs<'a>(
     match result {
         Ok(witness) => Ok(witness),
         Err(cause) => Err(CapturedRepairWitnessFailure {
-            cause,
-            source_input: material.original_input().artifact().clone(),
-            source_output: material.checked_report().body_artifact().clone(),
-            budget,
-            source_started: material
-                .checked_report()
-                .caller_timing()
-                .capture()
-                .bundle()
-                .original_started(),
-            source_whole: material.original_input().deadline(),
-            progress,
-            native_snapshot: model.finish_handle().receipt(),
+            retained: Box::new(CapturedRepairFailureData {
+                cause,
+                source_input: material.original_input().artifact().clone(),
+                source_output: material.checked_report().body_artifact().clone(),
+                budget,
+                source_started: material
+                    .checked_report()
+                    .caller_timing()
+                    .capture()
+                    .bundle()
+                    .original_started(),
+                source_whole: material.original_input().deadline(),
+                progress,
+                native_snapshot: model.finish_handle().receipt(),
+            }),
         }),
     }
 }

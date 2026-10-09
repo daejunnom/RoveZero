@@ -1085,7 +1085,11 @@ mod tests {
     fn clock_refuses_reversal_expiry_and_cancel_without_new_window() {
         let now = Instant::now();
         let cancel = AtomicBool::new(false);
-        assert!(nanos(now, now - std::time::Duration::from_nanos(1)).is_err());
+        let past = now
+            .checked_sub(std::time::Duration::from_millis(1))
+            .expect("clock fixture subtraction must be representable");
+        assert!(past < now, "clock fixture must be strictly earlier");
+        assert!(nanos(now, past).is_err());
         assert!(control(now, &cancel).is_err());
         cancel.store(true, Ordering::Release);
         assert!(control(now + std::time::Duration::from_secs(1), &cancel).is_err());
