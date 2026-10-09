@@ -1,0 +1,298 @@
+"""Pure capture admission and bounded worker lifecycle; no NN forward/import."""
+import argparse
+import copy
+import hashlib
+import json
+from pathlib import Path
+import struct
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from rz_pals_model.config import ModelConfig
+from rz_pals_model.cuda_warm_actual_reference import (
+    ATOL, LATENT_ELEMENTS, MAX_CAPTURE_CALLS, CAPTURE_SCHEMA, REFERENCE_SCHEMA, DEFAULT_ROLE_FORWARDS,
+    _bind_native_source_identity, _compare_raw, _external_path, _json_bytes, _reference_call, _write_reference,
+    canonical_captured_input_key, latent_bytes, run_actual_reference_cli,
+    validate_actual_capture, validate_captured_input)
+
+
+MANIFEST_SHA = "11" * 32
+
+
+def _input(role="proposer"):
+    move = {"from": 8, "to": 16, "promotion": 0}
+    line = [move, {"from": 48, "to": 40, "promotion": 0}, {"from": 16, "to": 24, "promotion": 0}]
+    return {"role": role, "board": [index % 13 for index in range(64)],
+            "metadata": [0.0] * 16, "query": [0.0] * 16,
+            "records": [{"record_id": 10, "revision": 2, "critical": True, "features": [0.0] * 16},
+                        {"record_id": 20, "revision": 3, "critical": False, "features": [0.0] * 16}],
+            "required_critical_records": [10], "candidates": [move],
+            "divergence_features": [[0.0] * 8] if role == "critic" else [],
+            "situation_revision": 5, "history_digest": [7] * 32, "model_epoch": [23] * 32,
+            "full_line": {"records": [{"moves": line, "parent": None, "supersedes": None},
+                                     {"moves": [], "parent": 0, "supersedes": None}],
+                          "query_prefix": [], "query_proposal": copy.deepcopy(line), "query_counter": []}}
+
+
+def _bits(value):
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+def _call(sequence=1, role="proposer", warm=False, source=None):
+    config = ModelConfig.for_profile("full_line_interaction_v2")
+    value = _input(role)
+    key = canonical_captured_input_key(value, config)
+    raw = {"candidate_logits": [0.125], "wdl_logits": [0.25, -0.0, -0.25],
+           "divergence_logits": [0.375] if role == "critic" else None,
+           "task_logits": None, "private_latent": [0.5] * LATENT_ELEMENTS}
+    bits = {name: [_bits(number) for number in numbers] if numbers is not None else None for name, numbers in raw.items()}
+    seed = source["raw_output_bits"]["private_latent"] if warm else [_bits(-0.0)] * LATENT_ELEMENTS
+    digest = hashlib.sha256(latent_bytes(seed)).hexdigest()
+    invocation = {"mode": "approx_cuda_warm_v2" if warm else "fresh", "input_key_hex": key,
+                  "invocation_key_hex": "33" * 32 if warm else key}
+    provenance = None
+    if warm:
+        invocation["seed_seal_hex"] = "44" * 32
+        provenance = {"seal_hex": "44" * 32, "role": role, "latent_bits_digest_hex": digest,
+                      "model_manifest_sha256_hex": MANIFEST_SHA, "model_epoch_hex": bytes(value["model_epoch"]).hex(),
+                      "source_input_hex": source["input_key_hex"]}
+    encoded_input = json.dumps(value, separators=(",", ":"), allow_nan=False)
+    input_bits = {"metadata": [_bits(number) for number in value["metadata"]],
+                  "query": [_bits(number) for number in value["query"]],
+                  "records": [[_bits(number) for number in record["features"]] for record in value["records"]],
+                  "divergence_features": [[_bits(number) for number in features] for features in value["divergence_features"]]}
+    return {"request_id": {"epoch": 1, "sequence": sequence}, "execution_id": {"epoch": 2, "sequence": sequence},
+            "input": value, "input_key_hex": key, "input_json_utf8": encoded_input, "input_f32_bits": input_bits,
+            "input_json_sha256_hex": hashlib.sha256(encoded_input.encode("utf-8")).hexdigest(),
+            "initial_latent_bits": seed, "initial_latent_sha256_hex": digest,
+            "warm_start": warm, "invocation": invocation, "seed_provenance": provenance,
+            "physical": {"dispatched": True, "ready": True, "completion_unknown": False, "completed_ok": True},
+            "accepted": True, "delivered": True, "raw_output": raw, "raw_output_bits": bits,
+            "final_latent_sha256_hex": hashlib.sha256(latent_bytes(bits["private_latent"])).hexdigest()}
+
+
+def _capture():
+    fresh_p, fresh_c = _call(), _call(2, "critic")
+    return {"schema": CAPTURE_SCHEMA, "phase": "capture", "execution_checks_passed": True,
+            "export_manifest_sha256_hex": MANIFEST_SHA,
+            "max_actual_role_forwards_including_startup": DEFAULT_ROLE_FORWARDS,
+            "actual_role_forwards_including_startup": 5, "actual_completed_role_forwards_including_startup": 5,
+            "actual_known_completed_startup_role_forwards": 2, "role_forward_accounting_checked": True,
+            "model_configuration": ModelConfig.for_profile("full_line_interaction_v2").to_dict(),
+            "calls": [fresh_p, fresh_c, _call(3, warm=True, source=fresh_p)]}
+
+
+class CapturedReferenceAdmissionTests(unittest.TestCase):
+    def test_full_seed_signed_zero_and_prior_same_role_are_preserved(self):
+        capture = _capture()
+        self.assertEqual(validate_actual_capture(capture, MANIFEST_SHA).profile, "full_line_interaction_v2")
+        self.assertEqual(latent_bytes(capture["calls"][0]["initial_latent_bits"])[:4], b"\x00\x00\x00\x80")
+        self.assertEqual(capture["calls"][2]["initial_latent_bits"], capture["calls"][0]["raw_output_bits"]["private_latent"])
+
+    def test_canonical_key_binds_full_middle_query_relations_history_and_signed_zero(self):
+        value = _input()
+        config = ModelConfig.for_profile("full_line_interaction_v2")
+        original = canonical_captured_input_key(value, config)
+        for label in ("middle_record", "middle_query", "relation", "history", "record_id", "revision", "signed_zero", "required_flag"):
+            changed = copy.deepcopy(value)
+            if label == "middle_record": changed["full_line"]["records"][0]["moves"][1]["to"] = 39
+            elif label == "middle_query": changed["full_line"]["query_proposal"][1]["to"] = 39
+            elif label == "relation": changed["full_line"]["records"][1].update(parent=None, supersedes=0)
+            elif label == "history": changed["history_digest"][31] = 8
+            elif label == "record_id": changed["records"][1]["record_id"] = 21
+            elif label == "revision": changed["situation_revision"] = 6
+            elif label == "signed_zero": changed["query"][0] = -0.0
+            else: changed["full_line"]["records"][1]["parent_required"] = True
+            with self.subTest(label=label):
+                self.assertNotEqual(canonical_captured_input_key(changed, config), original)
+
+    def test_malformed_typed_inputs_fail_before_tensor_allocation(self):
+        config = ModelConfig.for_profile("full_line_interaction_v2")
+        for label in ("bool_id", "missing_critical", "unknown_feature", "cycle", "missing_required", "record_id_feature", "query_revision", "query_deadline", "line_capacity", "bad_move", "duplicate_move", "head_profile", "nonfinite"):
+            changed, selected = _input(), config
+            if label == "bool_id": changed["records"][0]["record_id"] = True
+            elif label == "missing_critical": changed["records"][0]["critical"] = False
+            elif label == "unknown_feature": changed["full_line"]["record_id_hash"] = 1
+            elif label == "cycle": changed["full_line"]["records"][0]["supersedes"] = 1
+            elif label == "missing_required": changed["full_line"]["records"][0]["parent_required"] = True
+            elif label == "record_id_feature": changed["records"][0]["features"][6] = 1.0
+            elif label == "query_revision": changed["query"][6] = 1.0
+            elif label == "query_deadline": changed["query"][7] = 1.0
+            elif label == "line_capacity": changed["full_line"]["query_counter"] = changed["candidates"] * 257
+            elif label == "bad_move": changed["candidates"][0]["promotion"] = 5
+            elif label == "duplicate_move": changed["candidates"] *= 2
+            elif label == "head_profile": selected = ModelConfig.for_profile("interaction_head_v2")
+            else: changed["metadata"][0] = float("nan")
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                validate_captured_input(changed, selected)
+
+    def test_call_provenance_modes_completion_and_bit_tampering_are_refused(self):
+        for label in ("execution_gate", "full_input", "input_utf8", "input_digest", "input_f32_bits", "serde_signed_zero", "seed_bit", "seed_digest", "seed_nan", "warm_mode", "fresh_seal", "wrong_role_seed", "prior_seed_missing", "provenance_seal", "output_bit", "output_length", "final_latent_digest", "request_duplicate", "execution_duplicate", "unknown_completion", "not_delivered", "call_count", "profile", "manifest"):
+            changed = copy.deepcopy(_capture())
+            first, warm = changed["calls"][0], changed["calls"][2]
+            digest = MANIFEST_SHA
+            if label == "execution_gate": changed["execution_checks_passed"] = False
+            elif label == "full_input": first["input"]["full_line"]["query_proposal"][1]["to"] = 39
+            elif label == "input_utf8": first["input_json_utf8"] += " "
+            elif label == "input_digest": first["input_json_sha256_hex"] = "66" * 32
+            elif label == "input_f32_bits": first["input_f32_bits"]["query"][0] = _bits(-0.0)
+            elif label == "serde_signed_zero":
+                parsed = copy.deepcopy(first["input"])
+                parsed["query"][0] = -0.0
+                first["input_json_utf8"] = json.dumps(parsed, separators=(",", ":"))
+                first["input_json_sha256_hex"] = hashlib.sha256(first["input_json_utf8"].encode("utf-8")).hexdigest()
+            elif label == "seed_bit": first["initial_latent_bits"][6143] = 0
+            elif label == "seed_digest": first["initial_latent_sha256_hex"] = "66" * 32
+            elif label == "seed_nan": first["initial_latent_bits"][0] = 0x7fc00000
+            elif label == "warm_mode": warm["invocation"]["mode"] = "approx_warm_v1_refused"
+            elif label == "fresh_seal": first["invocation"]["seed_seal_hex"] = "66" * 32
+            elif label == "wrong_role_seed": warm["seed_provenance"]["role"] = "critic"
+            elif label == "prior_seed_missing":
+                changed["calls"] = [warm]
+                changed["actual_role_forwards_including_startup"] = changed["actual_completed_role_forwards_including_startup"] = 3
+            elif label == "provenance_seal": warm["seed_provenance"]["seal_hex"] = "66" * 32
+            elif label == "output_bit": first["raw_output_bits"]["wdl_logits"][1] = 0
+            elif label == "output_length": first["raw_output"]["private_latent"].pop()
+            elif label == "final_latent_digest": first["final_latent_sha256_hex"] = "66" * 32
+            elif label == "request_duplicate": warm["request_id"] = first["request_id"]
+            elif label == "execution_duplicate": warm["execution_id"] = first["execution_id"]
+            elif label == "unknown_completion": first["physical"]["completion_unknown"] = True
+            elif label == "not_delivered": first["delivered"] = False
+            elif label == "call_count": changed["calls"] = changed["calls"] * (MAX_CAPTURE_CALLS + 1)
+            elif label == "profile": changed["model_configuration"]["iterations"] = True
+            else: digest = "66" * 32
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                validate_actual_capture(changed, digest)
+
+    def test_empty_semantic_slots_stay_explicit(self):
+        value = _input("critic")
+        value.update(records=[], required_critical_records=[], candidates=[], divergence_features=[])
+        value["full_line"] = {"records": [], "query_prefix": [], "query_proposal": [], "query_counter": []}
+        validate_captured_input(value, ModelConfig.for_profile("full_line_interaction_v2"))
+
+    def test_explicit_scenario_role_budget_and_actual_accounting_are_required(self):
+        for selected in (16, DEFAULT_ROLE_FORWARDS, 128):
+            capture = _capture()
+            capture["max_actual_role_forwards_including_startup"] = selected
+            validate_actual_capture(capture, MANIFEST_SHA)
+        for name, number in (("max_actual_role_forwards_including_startup", 15),
+                             ("max_actual_role_forwards_including_startup", 129),
+                             ("max_actual_role_forwards_including_startup", True),
+                             ("actual_role_forwards_including_startup", 6),
+                             ("actual_completed_role_forwards_including_startup", 4),
+                             ("actual_known_completed_startup_role_forwards", 1),
+                             ("role_forward_accounting_checked", False)):
+            capture = _capture()
+            capture[name] = number
+            with self.subTest(name=name, value=number), self.assertRaises(ValueError):
+                validate_actual_capture(capture, MANIFEST_SHA)
+        capture = _capture()
+        del capture["max_actual_role_forwards_including_startup"]
+        with self.assertRaises(ValueError):
+            validate_actual_capture(capture, MANIFEST_SHA)
+
+    def test_selected_role_budget_fences_calls_before_replay(self):
+        capture = _capture()
+        capture["max_actual_role_forwards_including_startup"] = 16
+        capture["calls"] = [_call(sequence) for sequence in range(1, 16)]
+        capture["actual_role_forwards_including_startup"] = capture["actual_completed_role_forwards_including_startup"] = 17
+        with self.assertRaisesRegex(ValueError, "explicit registered role-forward budget"):
+            validate_actual_capture(capture, MANIFEST_SHA)
+
+    def test_reference_tolerance_checks_last_latent_coordinate_and_role_heads(self):
+        original = _call()["raw_output"]
+        for label in ("latent_last", "wdl", "head", "nonfinite"):
+            changed = copy.deepcopy(original)
+            if label == "latent_last": changed["private_latent"][6143] += 0.1
+            elif label == "wdl": changed["wdl_logits"][1] += ATOL * 2
+            elif label == "head": changed["task_logits"] = [0.0] * 7
+            else: changed["candidate_logits"][0] = float("inf")
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                _compare_raw(changed, original)
+        self.assertEqual(_compare_raw(original, original)["private_latent"], 0.0)
+
+    def test_duplicate_or_nonfinite_json_is_refused(self):
+        for contents in (b'{"calls": [], "calls": []}', b'{"x": NaN}', b'{"x": Infinity}', b'[]'):
+            with self.assertRaises(ValueError):
+                _json_bytes(contents)
+
+    def test_normalized_policy_and_wdl_gate_is_separate_from_raw_gate(self):
+        for head in ("candidate_logits", "wdl_logits"):
+            original = _call()["raw_output"]
+            original[head] = [10.0] * (2 if head == "candidate_logits" else 3)
+            changed = copy.deepcopy(original)
+            changed[head][0] += 0.001
+            with self.subTest(head=head), self.assertRaisesRegex(ValueError, "normalized probability"):
+                _compare_raw(changed, original)
+
+    def test_reference_packet_keeps_exact_id_input_bits_lines_and_invocation(self):
+        call = _capture()["calls"][2]
+        packet = _reference_call(call, copy.deepcopy(call["raw_output"]), copy.deepcopy(call["raw_output"]))
+        for name in ("request_id", "execution_id", "input_key_hex", "input_json_sha256_hex", "input_f32_bits", "invocation",
+                     "initial_latent_sha256_hex", "warm_start"):
+            self.assertEqual(packet[name], call[name])
+        self.assertEqual(packet["full_line"], call["input"]["full_line"])
+        self.assertEqual(len(packet["torch_raw_output"]["private_latent"]), LATENT_ELEMENTS)
+
+    def test_capability_namespace_is_distinct_from_rules_only_digest(self):
+        capture = _capture()
+        config = ModelConfig.for_profile("full_line_interaction_v2")
+        source = {"checkpoint_sha256": [23] * 32, "export_manifest_sha256": list(bytes.fromhex(MANIFEST_SHA)),
+                  "encoding_semantic_sha256": [0x81] * 32, "adapter_source_sha256": [0x82] * 32,
+                  "model_configuration": config.to_dict(), "trained": False, "frozen_epoch": 1}
+        capture["source_identity"] = source
+        capture["calls"][2]["seed_provenance"].update(encoding_semantic_sha256_hex="81" * 32, frozen_epoch=1)
+        manifest = {"checkpoint_sha256": "17" * 32, "rules_input_semantic_sha256": "aa" * 32,
+                    "rules_encoder_source_sha256": "bb" * 32}
+        self.assertIs(_bind_native_source_identity(capture, manifest, {"trained": False}, config), source)
+        capture["calls"][2]["seed_provenance"]["encoding_semantic_sha256_hex"] = "aa" * 32
+        with self.assertRaises(ValueError):
+            _bind_native_source_identity(capture, manifest, {"trained": False}, config)
+
+    def test_atomic_exclusive_report_keeps_previous_artifact(self):
+        with tempfile.TemporaryDirectory(prefix="rz-pals-actual-reference-") as directory:
+            path = Path(directory) / "reference.json"
+            report = {"schema": REFERENCE_SCHEMA, "calls": []}
+            summary = _write_reference(path, report)
+            self.assertEqual(summary["reference_sha256_hex"], hashlib.sha256(path.read_bytes()).hexdigest())
+            self.assertEqual(json.loads(path.read_bytes()), report)
+            self.assertFalse(path.with_name(path.name + ".partial").exists())
+            with self.assertRaises(FileExistsError):
+                _write_reference(path, report)
+            self.assertEqual(json.loads(path.read_bytes()), report)
+
+    def test_secret_and_relative_paths_are_refused_before_read(self):
+        with tempfile.TemporaryDirectory(prefix="rz-pals-actual-reference-") as directory:
+            for path in (Path(directory) / ".env", Path(directory) / "credential.json", Path("relative.json")):
+                with self.assertRaises(ValueError):
+                    _external_path(path)
+
+    def test_cli_timeout_terminates_then_kills_one_worker_without_retry(self):
+        class Receiver:
+            def poll(self, seconds): return False
+            def close(self): pass
+        class Sender:
+            def close(self): pass
+        class Worker:
+            def __init__(self): self.alive, self.started, self.terminated, self.killed = True, 0, 0, 0
+            def start(self): self.started += 1
+            def is_alive(self): return self.alive
+            def terminate(self): self.terminated += 1
+            def kill(self): self.killed += 1; self.alive = False
+            def join(self, seconds): pass
+            def close(self): pass
+        worker = Worker()
+        class Context:
+            def Pipe(self, duplex): return Receiver(), Sender()
+            def Process(self, **kwargs): return worker
+        arguments = argparse.Namespace(checkpoint="checkpoint", export_manifest="manifest", export_manifest_sha256=MANIFEST_SHA,
+                                       capture_json="capture", capture_sha256="00" * 32, output_json="output", max_seconds=1)
+        with patch("rz_pals_model.cuda_warm_actual_reference.multiprocessing.get_context", return_value=Context()):
+            with self.assertRaises(TimeoutError):
+                run_actual_reference_cli(arguments)
+        self.assertEqual((worker.started, worker.terminated, worker.killed), (1, 1, 1))
+
+
+if __name__ == "__main__":
+    unittest.main()

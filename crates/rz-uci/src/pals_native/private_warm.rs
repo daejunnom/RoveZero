@@ -1129,8 +1129,8 @@ mod tests {
         assert_eq!(snapshot.known_seed_completions, 1);
         assert_eq!(snapshot.pinned_entries, 1);
         assert!(core.reset_after_known_fence(1).is_err());
-        assert!(core
-            .prepare(
+        assert!(
+            core.prepare(
                 RequestId::new(ProcessEpoch(1), 3),
                 prepared(&state(), &position, &context, 3, &cancel, until)
                     .input
@@ -1142,7 +1142,8 @@ mod tests {
                 CancelToken::new(),
                 &cancel
             )
-            .is_err());
+            .is_err()
+        );
         drop(core);
         assert!(owner.upgrade().is_some());
         assert!(input.upgrade().is_some());
@@ -1179,8 +1180,8 @@ mod tests {
             [3; 32],
         )
         .unwrap();
-        assert!(core
-            .prepare(
+        assert!(
+            core.prepare(
                 RequestId::new(ProcessEpoch(1), 3),
                 input,
                 position.snapshot(),
@@ -1189,7 +1190,8 @@ mod tests {
                 CancelToken::new(),
                 &cancel
             )
-            .is_err());
+            .is_err()
+        );
         assert_eq!(core.snapshot().unwrap().frozen_contexts_per_role, [2, 0]);
         assert!(held.frozen.is_some());
     }

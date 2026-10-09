@@ -32,6 +32,13 @@ def numeric_check_cuda_warm_cpu_reference(checkpoint, directory):
     return numeric_check_warm(checkpoint, directory, cuda=True)
 
 
+def numeric_check_cuda_warm_actual_reference(checkpoint, export_manifest, export_manifest_sha256,
+                                             capture_json, capture_sha256, output_json, *, max_seconds=300):
+    from .cuda_warm_actual_reference import numeric_check_cuda_warm_actual_reference as replay
+    return replay(checkpoint, export_manifest, export_manifest_sha256, capture_json, capture_sha256,
+                  output_json, max_seconds=max_seconds)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -42,11 +49,16 @@ def main(argv=None):
     numeric = commands.add_parser("cpu-reference")
     numeric.add_argument("--checkpoint", required=True)
     numeric.add_argument("--output", required=True)
+    from .cuda_warm_actual_reference import add_actual_reference_parser
+    add_actual_reference_parser(commands)
     arguments = parser.parse_args(argv)
     if arguments.command == "export":
         result = export_cuda_warm_checkpoint(arguments.checkpoint, arguments.output, arguments.rules_profile_json)
-    else:
+    elif arguments.command == "cpu-reference":
         result = numeric_check_cuda_warm_cpu_reference(arguments.checkpoint, arguments.output)
+    else:
+        from .cuda_warm_actual_reference import run_actual_reference_cli
+        result = run_actual_reference_cli(arguments)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False))
     return 0
 
