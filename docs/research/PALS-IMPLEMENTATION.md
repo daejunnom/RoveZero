@@ -3427,3 +3427,15 @@ GPU 검증 보류·실제 학습 제외·로컬 heavy CPU 미실행을 유지한
 - 돌아오는 것은 `ReportedRepairRulesConsistency`라는 보고 일관성이다. local record revision은 출처 메타데이터이며 V feature·portable ID가 아니다. reported native completion을 실제 native witness로 만들거나 다음 Query/utility 권한을 발급하지 않는다.
 
 새 CPU 검사는 첫 anchor/수순·원래 W와 취소·private 준비 binding·새/기존 lane 구분·source/shape/revision/authority 변조·raw body 보존과 CLI 4N routing을 다룬다. 형식 검사·diff check 및 common readiness predicate 원문 대조는 통과했고, 이 source의 CPU CI·실제 registered frozen child/NN·독립 native witness·current/frozen/next Query chronology·whole cost/utility·실제 multi-Reply 수집·같은 integration SHA paired 및 전체 P0–P6 최종 인수는 구분한다. GPU 보류·학습 제외·로컬 heavy CPU 미실행·PR Draft·목표 active를 유지한다.
+
+
+### 호출자 관측 시계와 결과 검산까지의 비용
+
+직전 `4c0ee9cedcbbc86bf163ce6f49f61fb5c9660574`의 네 CPU job 및 관련 검사 29개 인수 후 `4d7855925a2ca4bc2e5b115425889d90b1f3a806`에서 부모 호출자가 실제 관측한 시각을 Repair 보고의 Rules 검산 결과와 연결했다. `rz-arena/src/pals_replay/chronology.rs`는 process 감독과 native 보고 parser의 책임을 바꾸지 않고, 두 소유자의 시계를 대조하고 비용을 묶는 호출자 책임을 갖는다.
+
+- `OriginalProcessOutput`이 실제 감독에 사용한 private process-local S/E/W를 보존한다. `checked_timing`은 stdin 전달·stdout/stderr EOF·exit·group cleanup·reap custody·오류 없는 종료와 관측 시각의 순서를 모두 요구한다. 경계 밖 시각·누락·순서 역전은 transport 완료로 인정하지 않는다. launch 시각은 `Command::spawn` 직전으로, child ready나 모델 시작 시각이 아니다.
+- `OwnedReplayCapture`은 사후 파일 확인을 마친 부모 반환 시각을 보존한다. `BoundRepairReplayDelivery::check_reported_rules_with_timing`은 실제 원문 capture를 빌리고 원래 private 준비의 Rules 검사와 같은 S/E/W인지 대조한다. 검사 시작·완료는 부모 함수가 직접 찍으며 native JSON이나 외부 호출자가 시간을 공급하지 않는다.
+- 준비와 사전 확인, 감독 준비, spawn부터 exit 관측까지, drain과 감독 반환, 호출자 사후 확인, capture 후 검사 전 공백, report/Rules 검산을 분리한다. 합계는 원래 S부터 이번 report 검사 완료까지이며 준비나 지연 시간을 새 시계로 제외하지 않는다. 후속 Query 선택·직렬화 및 이번 timing 확인 이후 비용은 episode 소유자가 추가로 청구해야 한다. `remaining_original_whole_ns`는 **검사 완료 시점**의 잔여량이지 사용 시점의 가용 예산이 아니다.
+- 반환 객체는 실제 capture와 raw hash를 빌리고 작은 Rules 사실·시각만 보존한다. 공개 생성자·Clone·serde와 native/Query capability는 없다. 기존 `/3`·`/4` 원문 schema·digest·독립 source 등록·readiness·규칙·탐색 정책·resource 한도는 유지한다. 취소나 원래 W 만료 시 거부하고 pending child·raw bytes를 소비하지 않는다.
+
+기존 실제 `/bin/cat` Linux 감독 검사에 원래 시계와 관측 순서·변조 거부를 추가했고, CPU 경계 검사는 postflight/check 역전·W 경계·시간 차감의 비포화와 준비 비용 유지 여부를 다룬다. 이들은 측정값이나 native 실행의 증거가 아닌 코드 정확성 검사다. 새 source의 exact-head CI는 별도로 인수한다. 실제 registered frozen 4N child/NN와 독립 native witness, current/frozen/next Query의 episode 순서, whole-action utility, 실제 multi-Reply 최종 인수와 같은 source의 paired 실행은 여전히 남는다. GPU 보류·학습 제외·로컬 heavy CPU 보류·Draft를 유지한다.
