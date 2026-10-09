@@ -3,9 +3,9 @@
 use super::*;
 
 const REGISTRATION_VERSION: &str = "rz-pals-native-continuation-registration/1";
-const DOMAIN: &str = "rz-pals-native-post-repair-continuation/1";
+const DOMAIN: &str = "rz-pals-native-post-repair-continuation/2";
 const ARTIFACT: &str = "native-continuation-traces.jsonl";
-const OBSERVER_VERSION: &str = "pals-post-repair-continuation-observer/1";
+const OBSERVER_VERSION: &str = "pals-post-repair-continuation-observer/2";
 
 /// An independently pinned, immutable registration for the separate C lane.
 /// Registration permits observation; it never certifies execution or utility.
@@ -68,6 +68,10 @@ pub(super) struct PendingContinuation {
     descriptor: String,
     prepared_payload: String,
     initial_context: RoleLogicalContext,
+    examined_responses: Vec<BoardMove>,
+    // Capacity is reserved before submission. Filled only by the first actual
+    // physical raw result, never by the search's selected-response callback.
+    initial_ranking: Vec<BoardMove>,
     repaired: Vec<BoardMove>,
     refutation: Vec<BoardMove>,
     limits: PalsLimits,
@@ -75,6 +79,44 @@ pub(super) struct PendingContinuation {
     parent_epoch: u64,
     parent_sequence: u64,
     calls: Vec<(RequestId, String)>,
+}
+
+impl PendingContinuation {
+    pub(super) fn record_initial_ranking(
+        &mut self,
+        id: RequestId,
+        legal: &[BoardMove],
+        indices: &[usize],
+    ) -> Result<(), RoleError> {
+        if self.calls.first().map(|(first, _)| *first) != Some(id) {
+            return Ok(());
+        }
+        if !self.initial_ranking.is_empty()
+            || indices.len() != legal.len()
+            || self.initial_ranking.capacity() < legal.len()
+        {
+            return Err(role_error(
+                "initial continuation ranking lacks unique reserved raw completion",
+            ));
+        }
+        self.initial_ranking
+            .extend(indices.iter().map(|&i| legal[i]));
+        Ok(())
+    }
+
+    fn expected_response(&self) -> Option<BoardMove> {
+        let original = self.repaired[self.initial_context.prefix.len()];
+        self.initial_ranking
+            .iter()
+            .copied()
+            .find(|movement| *movement != original && !self.examined_responses.contains(movement))
+            .or_else(|| {
+                self.initial_ranking
+                    .iter()
+                    .copied()
+                    .find(|movement| *movement != original)
+            })
+    }
 }
 
 impl Sink {
@@ -178,6 +220,24 @@ impl Sink {
                 "continuation anchor differs from exact Rules replay",
             ));
         }
+        let legal = anchor.legal_moves();
+        if event.examined_responses.len() > legal.len()
+            || event
+                .examined_responses
+                .iter()
+                .enumerate()
+                .any(|(i, movement)| {
+                    !legal.contains(movement) || event.examined_responses[..i].contains(movement)
+                })
+        {
+            return Err(role_error(
+                "continuation examined responses are not unique legal anchor edges",
+            ));
+        }
+        let mut initial_ranking = Vec::new();
+        initial_ranking
+            .try_reserve_exact(legal.len())
+            .map_err(role_error)?;
         let (repaired, _) = replay_line(root, event.repaired).map_err(role_error)?;
         let (parents, epoch, sequence) = self.parent_repair_chain(&event, &root_sha)?;
         let context = logical_json(event.reply_context)?;
@@ -187,6 +247,8 @@ impl Sink {
             "policy":PalsSearchPolicyIdentityV3::expected_actual_opponent_continuation_v1(),
             "root_rules_state_sha256":root_sha,"anchor_rules_state_sha256":state_sha(&anchor).map_err(role_error)?,
             "anchor_ply":event.anchor_ply,"initial_reply_context":context,"parent_repair_chain":parents,
+            "examined_responses":pack(event.examined_responses).map_err(role_error)?,
+            "initial_selection_rule":"ranked_unexamined_different_else_ranked_different/1",
             "repaired":pack(event.repaired).map_err(role_error)?,"refutation":pack(event.refutation).map_err(role_error)?,
             "repaired_endpoint":recheck_endpoint_json(&event.repaired_endpoint,&repaired)?,
             "checker_identity":event.checker_identity,"cpu_condition":event.cpu_condition,
@@ -231,6 +293,8 @@ impl Sink {
             descriptor,
             prepared_payload,
             initial_context: event.reply_context.clone(),
+            examined_responses: event.examined_responses.to_vec(),
+            initial_ranking,
             repaired: event.repaired.to_vec(),
             refutation: event.refutation.to_vec(),
             limits: event.limits,
@@ -312,18 +376,11 @@ impl Sink {
                     "continuation prefix does not extend the preceding accepted C output",
                 ));
             }
-            // The initial alternative can skip the original/ranked examined
-            // responses. It must still be an actual legal, different response.
             if pending.calls.len() == 1
-                && (prefix.last() == pending.repaired.get(start)
-                    || !previous_meta.legal.contains(
-                        prefix
-                            .last()
-                            .ok_or_else(|| role_error("continuation move absent"))?,
-                    ))
+                && prefix.last().copied() != self.expected_initial_continuation_response()?
             {
                 return Err(role_error(
-                    "initial continuation alternative is not a different legal response",
+                    "initial continuation alternative differs from actual raw ranking and examined anchor edges",
                 ));
             }
             previous.sequence
@@ -345,6 +402,33 @@ impl Sink {
             ));
         }
         Ok(())
+    }
+    fn expected_initial_continuation_response(&self) -> Result<Option<BoardMove>, RoleError> {
+        let pending = self
+            .pending_continuation
+            .as_ref()
+            .ok_or_else(|| role_error("initial continuation pending missing"))?;
+        let id = pending
+            .calls
+            .first()
+            .ok_or_else(|| role_error("initial continuation has no bound raw call"))?
+            .0;
+        let meta = self.accepted_continuation_call(id)?;
+        if pending.initial_ranking.len() != meta.legal.len()
+            || pending
+                .initial_ranking
+                .iter()
+                .enumerate()
+                .any(|(i, movement)| {
+                    !meta.legal.contains(movement)
+                        || pending.initial_ranking[..i].contains(movement)
+                })
+        {
+            return Err(role_error(
+                "initial continuation lacks a complete unique actual raw ranking",
+            ));
+        }
+        Ok(pending.expected_response())
     }
     pub(super) fn bind_continuation_reply(&mut self, id: RequestId) -> Result<(), RoleError> {
         let pending = self
@@ -425,12 +509,18 @@ impl Sink {
             ));
         }
         let start = pending.initial_context.prefix.len();
+        let expected_response = if event.reply_accepted {
+            self.expected_initial_continuation_response()?
+        } else {
+            None
+        };
         if let Some(movement) = event.selected_response {
             if event.counterline.len() <= start
                 || event.counterline[..start] != pending.repaired[..start]
                 || event.counterline[start] != movement
                 || movement == pending.repaired[start]
                 || !event.reply_accepted
+                || expected_response != Some(movement)
             {
                 return Err(role_error(
                     "continuation returned another initial response or prefix",
@@ -443,6 +533,13 @@ impl Sink {
         {
             return Err(role_error(
                 "continuation claims a line without a selected alternative",
+            ));
+        }
+        if event.disposition == rz_search::pals::engine::RecheckDisposition::NoAlternativeResponse
+            && (!event.reply_accepted || expected_response.is_some())
+        {
+            return Err(role_error(
+                "continuation claims no alternative despite the accepted raw ranking",
             ));
         }
         let mut calls = Vec::with_capacity(pending.calls.len());
@@ -513,6 +610,9 @@ impl Sink {
         let data = serde_json::json!({"prepared_payload_sha256":pending.prepared_payload,"calls":calls,
             "prepared_accepted":event.prepared_accepted,"initial_reply_attempted":event.reply_call_attempted,"initial_reply_accepted":event.reply_accepted,
             "selected_response":event.selected_response.map(|m|Move16::pack(m).map(|m|m.bits())).transpose().map_err(role_error)?,
+            "expected_initial_response":expected_response.map(|m|Move16::pack(m).map(|m|m.bits())).transpose().map_err(role_error)?,
+            "initial_selection_checked":event.reply_accepted && (event.selected_response.is_some()
+                || event.disposition == rz_search::pals::engine::RecheckDisposition::NoAlternativeResponse),
             "counterline":pack(event.counterline).map_err(role_error)?,"counterline_completed":event.counterline_completed,
             "full_suffix_replayed":false,"repaired_endpoint":recheck_endpoint_json(&event.repaired_endpoint,&repaired)?,"counter_endpoint":counter,
             "comparable":event.comparable,"publication":publication,"disposition":format!("{:?}",event.disposition),

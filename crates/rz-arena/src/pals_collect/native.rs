@@ -2169,6 +2169,9 @@ impl NativeRoleObserver for Observer {
                     let mut indices:Vec<_>=(0..meta.legal.len()).collect();
                     indices.sort_by(|&a,&b|raw.candidate_logits[b].total_cmp(&raw.candidate_logits[a]).then(a.cmp(&b)));
                     meta.chosen_first=indices.first().map(|&i|meta.legal[i]);
+                    if let Some(pending) = s.pending_continuation.as_mut() {
+                        pending.record_initial_ranking(id, &meta.legal, &indices)?;
+                    }
             }
             let input_sha256=c.input_sha256.clone();
             let raw=match result {Ok(raw)=>raw_bits(raw),Err(error)=>serde_json::json!({"failure":failure_text(error),"kind":format!("{:?}",error)})};
@@ -3598,6 +3601,7 @@ mod tests {
                 anchor_situation: self.reply_context.situation,
                 anchor_snapshot: &self.anchor_snapshot,
                 anchor_ply: 3,
+                examined_responses: &[],
                 reply_context: &self.reply_context,
                 repair_record: &self.record,
                 repaired: &self.repaired,
@@ -3677,6 +3681,17 @@ mod tests {
             chosen: BoardMove,
             context: &RoleLogicalContext,
         ) -> Result<(), RoleError> {
+            self.observe_ranked_prefix(shared, sequence, kind, prefix, &[(chosen, 1.)], context)
+        }
+        fn observe_ranked_prefix(
+            &self,
+            shared: &Arc<Mutex<Sink>>,
+            sequence: u64,
+            kind: NativeQueryKind,
+            prefix: &[BoardMove],
+            logits: &[(BoardMove, f32)],
+            context: &RoleLogicalContext,
+        ) -> Result<(), RoleError> {
             let (position, _) = replay_line(&self.root, prefix).unwrap();
             let legal = position.ordered_legal_moves().moves().to_vec();
             let records = if kind == NativeQueryKind::Reply {
@@ -3708,7 +3723,9 @@ mod tests {
             )?;
             let mut output = raw(legal.len());
             output.candidate_logits.fill(-1.);
-            output.candidate_logits[legal.iter().position(|m| *m == chosen).unwrap()] = 1.;
+            for (movement, logit) in logits {
+                output.candidate_logits[legal.iter().position(|m| m == movement).unwrap()] = *logit;
+            }
             observer.physically_completed(id(sequence), Ok(&output))?;
             observer.delivered(id(sequence))?;
             observer.accepted(id(sequence))?;
@@ -3949,6 +3966,7 @@ mod tests {
         finish.selected_response = Some(counter[3]);
         finish.counterline = &counter;
         finish.counterline_completed = true;
+        finish.disposition = rz_search::pals::engine::RecheckDisposition::IncomparableEvidence;
         observer.recheck_finished(finish).unwrap();
         let s = shared.lock().unwrap();
         assert!(s.pending_continuation.is_none());
@@ -3982,6 +4000,16 @@ mod tests {
             assert_eq!(call["accepted_context_checked"], true);
         }
         assert_eq!(rows[4]["data"]["counterline_completed"], true);
+        assert_eq!(
+            rows[0]["domain"],
+            "rz-pals-native-post-repair-continuation/2"
+        );
+        assert_eq!(rows[0]["data"]["examined_responses"], serde_json::json!([]));
+        assert_eq!(rows[4]["data"]["initial_selection_checked"], true);
+        assert_eq!(
+            rows[4]["data"]["expected_initial_response"],
+            serde_json::json!(Move16::pack(counter[3]).unwrap().bits())
+        );
         assert_eq!(rows[4]["data"]["full_suffix_replayed"], false);
         assert!(rows[4]["data"]["publication"].is_null()); // No CPU comparison or actual NN fixture claim.
         let temp = NativeTestOutput::new();
@@ -4083,6 +4111,7 @@ mod tests {
         forged.selected_response = Some(counter[3]);
         forged.counterline = &counter;
         forged.counterline_completed = true;
+        forged.disposition = rz_search::pals::engine::RecheckDisposition::IncomparableEvidence;
         assert!(observer.recheck_finished(forged).is_err());
         let mut finish = f.finished(true, true, true);
         finish.policy = PostRepairRecheckPolicy::ActualOpponentContinuationV1;
@@ -4099,6 +4128,155 @@ mod tests {
         assert_eq!(end["data"]["calls"].as_array().unwrap().len(), 2);
         assert_eq!(s.prepaid_recheck_rows, 1); // Unused bound slot remains charged through drain.
     }
+    #[test]
+    fn native_continuation_initial_response_replays_raw_ranking_examined_edges_and_ties() {
+        let f = continuation_fixture();
+        let (anchor, _) = replay_line(&f.root, &f.repaired[..3]).unwrap();
+        let legal = anchor.ordered_legal_moves().moves().to_vec();
+        let original = f.repaired[3];
+        let first = BoardMove::from_uci("g8f6").unwrap();
+        let second = BoardMove::from_uci("d7d6").unwrap();
+        let tied = if legal.iter().position(|m| *m == first).unwrap()
+            < legal.iter().position(|m| *m == second).unwrap()
+        {
+            first
+        } else {
+            second
+        };
+        let cases = [
+            (Vec::new(), 9., 8., first),
+            (vec![first], 9., 8., second),
+            (legal.clone(), 9., 8., first),
+            (Vec::new(), 9., 9., tied),
+        ];
+        for (examined, first_logit, second_logit, expected) in cases {
+            let shared = continuation_sink(&f);
+            let mut observer = Observer(Arc::clone(&shared));
+            let mut prepared = continuation_prepared(&f);
+            prepared.examined_responses = &examined;
+            observer.recheck_prepared(prepared).unwrap();
+            f.observe_ranked_prefix(
+                &shared,
+                5,
+                NativeQueryKind::Reply,
+                &f.repaired[..3],
+                &[
+                    (original, 100.),
+                    (first, first_logit),
+                    (second, second_logit),
+                ],
+                &f.reply_context,
+            )
+            .unwrap();
+            let mut counter = f.repaired[..3].to_vec();
+            counter.push(expected);
+            let mut finish = f.finished(true, true, true);
+            finish.policy = PostRepairRecheckPolicy::ActualOpponentContinuationV1;
+            finish.selected_response = Some(expected);
+            finish.counterline = &counter;
+            finish.disposition = rz_search::pals::engine::RecheckDisposition::IncompleteCounterline;
+            observer.recheck_finished(finish).unwrap();
+            let s = shared.lock().unwrap();
+            let prepared: serde_json::Value = serde_json::from_slice(
+                &s.trace
+                    .rows
+                    .iter()
+                    .find(|r| r.artifact == "native-continuation-traces.jsonl")
+                    .unwrap()
+                    .json,
+            )
+            .unwrap();
+            let finished: serde_json::Value =
+                serde_json::from_slice(&s.trace.rows.last().unwrap().json).unwrap();
+            assert_eq!(
+                prepared["data"]["examined_responses"],
+                serde_json::json!(pack(&examined).unwrap())
+            );
+            assert_eq!(
+                finished["data"]["expected_initial_response"],
+                serde_json::json!(Move16::pack(expected).unwrap().bits())
+            );
+            assert_eq!(finished["data"]["initial_selection_checked"], true);
+            assert!(finished["data"]["publication"].is_null());
+        }
+    }
+
+    #[test]
+    fn native_continuation_rejects_a_legal_but_wrong_initial_choice_before_tail_dispatch_and_finish()
+     {
+        let f = continuation_fixture();
+        let first = BoardMove::from_uci("g8f6").unwrap();
+        let wrong = BoardMove::from_uci("d7d6").unwrap();
+        let shared = continuation_sink(&f);
+        let mut observer = Observer(Arc::clone(&shared));
+        observer
+            .recheck_prepared(continuation_prepared(&f))
+            .unwrap();
+        f.observe_ranked_prefix(
+            &shared,
+            5,
+            NativeQueryKind::Reply,
+            &f.repaired[..3],
+            &[(first, 9.), (wrong, 8.)],
+            &f.reply_context,
+        )
+        .unwrap();
+        let mut counter = f.repaired[..3].to_vec();
+        counter.push(wrong);
+        let context = RecheckFixture::logical(&counter, NativeQueryKind::Reply, 8);
+        assert!(
+            f.observe_prefix(
+                &shared,
+                6,
+                NativeQueryKind::Reply,
+                &counter,
+                BoardMove::from_uci("f1c4").unwrap(),
+                &context
+            )
+            .is_err()
+        );
+        assert!(!shared.lock().unwrap().calls.contains_key(&id(6)));
+        let mut finish = f.finished(true, true, true);
+        finish.policy = PostRepairRecheckPolicy::ActualOpponentContinuationV1;
+        finish.selected_response = Some(wrong);
+        finish.counterline = &counter;
+        finish.disposition = rz_search::pals::engine::RecheckDisposition::IncompleteCounterline;
+        assert!(observer.recheck_finished(finish).is_err());
+        let mut no_alternative = f.finished(true, true, true);
+        no_alternative.policy = PostRepairRecheckPolicy::ActualOpponentContinuationV1;
+        assert!(observer.recheck_finished(no_alternative).is_err());
+        assert!(!shared.lock().unwrap().trace.rows.iter().any(|r| {
+            r.artifact == "native-continuation-traces.jsonl"
+                && serde_json::from_slice::<serde_json::Value>(&r.json).unwrap()["stage"]
+                    == "finished"
+        }));
+    }
+
+    #[test]
+    fn native_continuation_rejects_duplicate_or_illegal_examined_responses_before_submission() {
+        let f = continuation_fixture();
+        let movement = BoardMove::from_uci("g8f6").unwrap();
+        for examined in [
+            vec![movement, movement],
+            vec![BoardMove::from_uci("e2e4").unwrap()],
+        ] {
+            let shared = continuation_sink(&f);
+            let mut observer = Observer(Arc::clone(&shared));
+            let mut prepared = continuation_prepared(&f);
+            prepared.examined_responses = &examined;
+            assert!(observer.recheck_prepared(prepared).is_err());
+            let s = shared.lock().unwrap();
+            assert!(s.pending_continuation.is_none());
+            assert!(!s.calls.contains_key(&id(5)));
+            assert!(
+                !s.trace
+                    .rows
+                    .iter()
+                    .any(|r| r.artifact == "native-continuation-traces.jsonl")
+            );
+        }
+    }
+
     #[test]
     fn native_continuation_reserves_before_dispatch_and_keeps_original_control_context() {
         for cancel in [false, true] {

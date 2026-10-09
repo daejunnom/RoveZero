@@ -316,6 +316,9 @@ pub struct RecheckPrepared<'a> {
     pub anchor_situation: SituationId,
     pub anchor_snapshot: &'a PositionSnapshot,
     pub anchor_ply: usize,
+    /// Exact anchor edges before the first C Reply. Only the actual continuation
+    /// observer uses this bounded snapshot; it does not alter response selection.
+    pub examined_responses: &'a [BoardMove],
     pub reply_context: &'a RoleLogicalContext,
     pub repair_record: &'a RoleRecord,
     pub repaired: &'a [BoardMove],
@@ -4071,6 +4074,13 @@ impl<M: RoleModel> PalsEngine<M> {
         let anchor_snapshot = self.nodes[anchor].position.snapshot();
         let repaired_snapshot = self.nodes[repair.repaired_leaf].position.snapshot();
         let deadline_tick = self.tick_at(limits.deadline);
+        let mut examined_responses = Vec::new();
+        if self.post_repair_recheck == PostRepairRecheckPolicy::ActualOpponentContinuationV1 {
+            examined_responses
+                .try_reserve_exact(self.nodes[anchor].edges.len())
+                .map_err(|_| PalsError::Capacity)?;
+            examined_responses.extend(self.nodes[anchor].edges.iter().map(|edge| edge.movement));
+        }
         let mut trace = RecheckProgress::default();
         let prepared = {
             let repaired_endpoint = Self::recheck_endpoint(
@@ -4107,6 +4117,7 @@ impl<M: RoleModel> PalsEngine<M> {
                         anchor_situation: self.nodes[anchor].situation,
                         anchor_snapshot: &anchor_snapshot,
                         anchor_ply,
+                        examined_responses: &examined_responses,
                         reply_context: &reply_context,
                         repair_record: record,
                         repaired: repair.repaired,
@@ -5844,6 +5855,20 @@ mod tests {
                 checked.make_move(*movement).unwrap();
             }
             assert!(prepared.anchor_snapshot.same_state(&checked.snapshot()));
+            if prepared.policy == PostRepairRecheckPolicy::ActualOpponentContinuationV1 {
+                assert!(
+                    prepared
+                        .examined_responses
+                        .contains(&prepared.repaired[prepared.anchor_ply])
+                );
+                let legal = checked.legal_moves();
+                for (i, movement) in prepared.examined_responses.iter().enumerate() {
+                    assert!(legal.contains(movement));
+                    assert!(!prepared.examined_responses[..i].contains(movement));
+                }
+            } else {
+                assert!(prepared.examined_responses.is_empty());
+            }
             self.prepared.push((
                 prepared.identity,
                 prepared.reply_context.clone(),
@@ -6522,6 +6547,7 @@ mod tests {
             anchor_situation: fixture.engine.nodes[anchor].situation,
             anchor_snapshot: &anchor_snapshot,
             anchor_ply: 3,
+            examined_responses: &[],
             reply_context: &context,
             repair_record: fixture
                 .engine
