@@ -95,6 +95,12 @@ _REVIEWED_DISABLED_NATIVE_CONTINUATION_OBSERVER_SOURCES = (
     {'bytes': 354492, 'sha256': 'fab843bc71b7e4b3584a437b7b4d89515be8b7ae12a2ba36ade83086c74c6618'},
     {'bytes': 212711, 'sha256': 'b813828e9e469feb0769a35bb721f8fbfdf4c7dace9da92907372a757b822ba6'},
 )
+# Reviewed DEFAULT branch only; v2 selection observations do not grant
+# multi-Reply execution, endpoint, utility or training authority.
+_REVIEWED_DISABLED_CONTINUATION_SELECTION_V2_SOURCES = (
+    {'bytes': 355881, 'sha256': '32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c'},
+    {'bytes': 220199, 'sha256': 'eea0654a5c11d6e0d69b5c5df71363a8e2d8f4fb7ad02cf5d766fb4b06ec456f'},
+)
 _SOURCE_REVIEW_PROFILES = (
     ("legacy_prepared_lineage_4469f9d", _REVIEWED_SOURCES),
     ("legacy_disabled_recheck_9c0de959", _REVIEWED_DISABLED_RECHECK_SOURCES),
@@ -105,6 +111,7 @@ _SOURCE_REVIEW_PROFILES = (
     ("legacy_disabled_replay_module_0a0a4800_native_2c2bfb1c", _REVIEWED_DISABLED_REPLAY_MODULE_SOURCES),
     ("legacy_disabled_c_continuation_owner_fab843bc_native_e25fc205", _REVIEWED_DISABLED_C_CONTINUATION_OWNER_SOURCES),
     ("legacy_disabled_multi_reply_observer_b813828e", _REVIEWED_DISABLED_NATIVE_CONTINUATION_OBSERVER_SOURCES),
+    ("legacy_disabled_continuation_selection_v2_eea0654a", _REVIEWED_DISABLED_CONTINUATION_SELECTION_V2_SOURCES),
 )
 _DISABLED_SEARCH_VERSION = "pals-restricted-refinement/0.1"
 _OPT_IN_LANE_FIELDS = ("pals_search_policy", "refinement_registration", "refinement_registration_sha256", "post_repair_recheck", "post_repair_recheck_policy", "post_repair_recheck_conditions",
