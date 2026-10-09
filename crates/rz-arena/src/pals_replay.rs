@@ -723,7 +723,10 @@ mod linux {
                     .unwrap()
                 };
                 assert_eq!(program.stream_position().unwrap(), 7);
-                assert_eq!(credit.remaining, 0);
+                assert_eq!(
+                    credit.remaining, 0,
+                    "{output:?}; observed={observed:?}; refusal={refusal:?}"
+                );
                 assert!(output.process().pending_child.is_none(), "{output:?}");
                 assert_eq!(
                     output.process().receipt.group_cleanup,

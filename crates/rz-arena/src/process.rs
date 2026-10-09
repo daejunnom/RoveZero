@@ -2126,7 +2126,11 @@ mod linux {
                 },
             )
             .unwrap();
-            assert_eq!(output.process().receipt.stop, ProcessStop::WallLimit);
+            assert_eq!(
+                output.process().receipt.stop,
+                ProcessStop::WallLimit,
+                "{output:?}"
+            );
             assert!(output.observation.original_spawn_ns.unwrap() >= 200_000_000);
             assert!(output.observation.written_bytes.unwrap() < input.len());
             assert!(!output.transport_complete());
@@ -2181,7 +2185,7 @@ mod linux {
                     )
                     .unwrap()
                 };
-                assert_eq!(calls, 1);
+                assert_eq!(calls, 1, "{output:?}");
                 assert_eq!(output.observation().written_bytes(), Some(0));
                 assert!(output.process().stdout.is_empty());
                 assert!(!output.transport_complete());
