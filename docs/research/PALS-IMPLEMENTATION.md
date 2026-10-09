@@ -3451,3 +3451,14 @@ GPU 검증 보류·실제 학습 제외·로컬 heavy CPU 미실행을 유지한
 - 원래 S부터 자료 반환 전 관측까지의 비용과 report 검사 이후 추가 구간을 함께 제공한다. 잔여 budget을 새 timer로 만들지 않는다. 반환 자료의 여러 readonly 참조를 한 episode에 중복 삽입하지 않도록 **실제 next Query 소비자**의 물리 실행/원문·의미 ledger 검사가 여전히 필요하다. 이번 단일 발급은 전역 sequence나 서로 다른 capture/episode의 순서를 증명하지 않는다.
 
 이 자료는 reported Repair/Rules와 실제 부모 transport/cost의 연결이다. `CheckedNativeReplayPrior`·admitted Query·reward/target은 발급하지 않으며, 실제 registered frozen 4N child/NN·독립 native witness·다음 Query admission/episode chronology·whole-action utility·최종 multi-Reply·same-source paired 인수는 남는다. 네 CPU 검사는 단일 발급, 동시 alias, failed-check 예약 반환, 취소/만료와 재발급 금지를 다룬다. 이들은 actual frozen NN/Query 실행의 증거가 아니다. 기존 native `/3`·`/4` schema·canonicalization·readiness·탐색·평가 의미·resource 한도를 유지한다. 새 exact-head CI는 게시 후 별도 인수하며 GPU 보류·학습 제외·로컬 heavy CPU 보류·Draft·goal active를 유지한다.
+
+### 원본 입력 전달 전 실제 loaded executable 관측
+
+원본 입력을 받는 Linux supervisor는 첫 stdin byte를 보내기 전에 자신이 소유하고 아직 reap하지 않은 실제 child PID의 `/proc/<pid>/exe`를 연다. 이 파일의 device/inode를 실행에 사용한 pinned executable FD와 비교한다. 경로·argv·자식 JSON의 자기 보고나 별도로 입력한 PID로 이를 대신하지 않는다. 열기·metadata·동일성 확인이 실패하면 원본 입력을 보내지 않고 기존 process-group drain·종료·pending custody 경로로 실패를 보존한다.
+
+- 성공 관측 시각과 첫 실제 pipe write 후의 부모 관측 시각은 원래 S 기준으로만 저장한다. 첫 관측과 이후 매 write 직전에는 cancellation과 원래 E를 검사하며, OS 관측 시간이 길어졌다고 timer를 다시 시작하지 않는다. OS call을 preempt하는 hard-timeout 증거로 해석하지 않는다.
+- `OriginalLoadedImage`는 실제 `OriginalProcessOutput`을 빌리는 readonly 자료다. 성공 transport·동일 PID·launch→loaded-file 관측→첫 write→exit 관측 순서가 있어야 제공한다. 공개 생성자·Clone·serde가 없으며, legacy `rz-original-process-transport/1` JSON에는 새 private 관측을 추가하지 않는다. complete transport나 serialized timestamp만으로 이 borrow를 만들지 않는다.
+- 단일 `ReportedRepairPriorMaterial` 발급은 같은 capture의 loaded-file 관측도 요구하고 빌린다. 실패는 발급 전 예약을 반환하고 raw/input/pending custody를 유지한다. 이 관측은 모델·직렬화 버퍼·raw output 복제를 추가하지 않는다.
+- 관측 범위는 해당 순간의 executable **파일 동일성**이다. 바이너리 내용·동적 library·계속 같은 executable로 실행됐음·fork 탈출·NN 완료·cgroup enforcement·native witness·전역 Query 순서의 증거는 아니다. 기존 독립 source pin과 pre/postflight를 대체하지 않는다. child가 입력 전에 exit하거나 proc 접근을 허용하지 않는 환경은 unobserved failure로 남긴다.
+
+실제 Linux `/bin/cat` 입력 전달 검사는 device/inode·입력 전 관측 순서·완전 종료·legacy JSON 보존과 결손/순서/PID 거부를 검사한다. 별도 Linux 검사는 실제 proc executable과 다른 pinned file의 불일치를 거부한다. CPU CI가 실제 frozen 모델 실행·Query admission이나 GPU 인수를 대신하지 않는다. GPU 보류·학습 제외·로컬 heavy CPU 보류·Draft·goal active는 유지한다.
