@@ -50,7 +50,6 @@ const MAX_PROFILE_BYTES: usize = 8192;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_RUNTIME_BYTES: u64 = 512 * 1024 * 1024;
 const HEADER_RESERVE: usize = 512 * 1024;
-const ROLE_TRACE_BYTES: usize = 144 * 1024;
 const ROWS_PER_ROLE: usize = 12;
 const PREPARED_BYTES: usize = 64 * 1024;
 const CONTEXT_BYTES: usize = 8 * 1024;
@@ -60,17 +59,49 @@ const STAGE_TEXT_BYTES: usize = 16 * 1024;
 const STATE_TEXT_BYTES: usize = 32 * 1024;
 const OUTCOME_TEXT_BYTES: usize = 16 * 1024;
 const OPPONENT_STATE_TEXT_BYTES: usize = 32 * 1024;
-// Explicit /2 observation profile: two 32KiB large rows, one 8KiB
-// accepted-context row, at most nine 1KiB small rows and twelve separators.
-// Overflow is an observer failure, never a truncated successful evaluation.
-const OPPONENT_LARGE_ROW_BYTES: usize = 32 * 1024;
-const OPPONENT_ROLE_TRACE_BYTES: usize = 82 * 1024;
+// The frozen baseline has 16 * 384 private latent scalars. With 256 candidate,
+// 128 divergence, seven task and three WDL scalars, its hex payload alone is
+// 52,304 bytes. A 32KiB physical-ready row cannot represent that observation.
+// Raw text has a separate 64KiB arena. /4 retains the original 32KiB prepared
+// input cap and gives the physical-ready JSON row 64KiB. The full raw projection
+// is sealed hex/syntax, so only its bounded metadata is charged for escaping.
+// An oversized prepared input or terminal row is refused, never clipped.
+const RAW_OUTPUT_BIT_PROJECTION_BYTES: usize = 64 * 1024;
+const RAW_SCALAR_HEX_BYTES: usize = (16 * 384 + 256 + 128 + 7 + 3) * 8;
+const RAW_FIXED_SYNTAX_BYTES: usize = 1024;
+const RAW_UNESCAPED_TEXT_BYTES: usize = RAW_SCALAR_HEX_BYTES + RAW_FIXED_SYNTAX_BYTES;
+const OPPONENT_PREPARED_ROW_BYTES: usize = 32 * 1024;
+const OPPONENT_READY_ROW_BYTES: usize = 64 * 1024;
+const READY_METADATA_BYTES: usize = 2 * 1024;
+const OPPONENT_READY_OUTER_BYTES: usize = RAW_UNESCAPED_TEXT_BYTES + 2 * READY_METADATA_BYTES;
+// Exactly two distinct large rows, one context row, at most nine small rows and twelve
+// newline separators per role. Overflow remains refusal, never truncation.
+const ROLE_TRACE_BYTES: usize =
+    2 * PREPARED_BYTES + CONTEXT_BYTES + 9 * SMALL_ROW_BYTES + ROWS_PER_ROLE;
+const OPPONENT_ROLE_TRACE_BYTES: usize = OPPONENT_PREPARED_ROW_BYTES
+    + OPPONENT_READY_ROW_BYTES
+    + CONTEXT_BYTES
+    + 9 * SMALL_ROW_BYTES
+    + ROWS_PER_ROLE;
+const OPPONENT_ESCAPED_ROLE_TRACE_BYTES: usize = 2 * OPPONENT_PREPARED_ROW_BYTES
+    + OPPONENT_READY_OUTER_BYTES
+    + 2 * CONTEXT_BYTES
+    + 18 * SMALL_ROW_BYTES
+    + 2 * ROWS_PER_ROLE;
 
 fn role_trace_bytes(checks: usize) -> usize {
     if checks == 4 {
         OPPONENT_ROLE_TRACE_BYTES
     } else {
         ROLE_TRACE_BYTES
+    }
+}
+
+fn escaped_role_trace_bytes(checks: usize) -> usize {
+    if checks == 4 {
+        OPPONENT_ESCAPED_ROLE_TRACE_BYTES
+    } else {
+        2 * ROLE_TRACE_BYTES
     }
 }
 
@@ -579,7 +610,11 @@ struct Collector {
     /// One separately reserved synchronous formatter arena, never a callback
     /// borrow retained after return or format!(large) followed by truncation.
     terminal_scratch: SnapshotText,
-    large_row_bytes: usize,
+    prepared_row_bytes: usize,
+    ready_row_bytes: usize,
+    ready_outer_bytes: usize,
+    escaped_limit: usize,
+    escaped_bytes: usize,
 }
 impl Collector {
     #[cfg(test)]
@@ -591,10 +626,20 @@ impl Collector {
         checks: usize,
         whole: Instant,
     ) -> Result<Self, AdmissionFault> {
-        let large_row_bytes = if checks == 4 {
-            OPPONENT_LARGE_ROW_BYTES
+        let prepared_row_bytes = if checks == 4 {
+            OPPONENT_PREPARED_ROW_BYTES
         } else {
             PREPARED_BYTES
+        };
+        let ready_row_bytes = if checks == 4 {
+            OPPONENT_READY_ROW_BYTES
+        } else {
+            PREPARED_BYTES
+        };
+        let ready_outer_bytes = if checks == 4 {
+            OPPONENT_READY_OUTER_BYTES
+        } else {
+            2 * PREPARED_BYTES
         };
         let limit = roles
             .checked_mul(role_trace_bytes(checks))
@@ -602,6 +647,9 @@ impl Collector {
         let row_limit = roles
             .checked_mul(ROWS_PER_ROLE)
             .ok_or(fault("observer_reserve", "row overflow"))?;
+        let escaped_limit = roles
+            .checked_mul(escaped_role_trace_bytes(checks))
+            .ok_or(fault("observer_reserve", "escaped byte overflow"))?;
         let mut bindings = Vec::new();
         reserve_vec(&mut bindings, roles)?;
         Ok(Self {
@@ -613,8 +661,12 @@ impl Collector {
             role_limit: roles,
             whole,
             failure: None,
-            terminal_scratch: SnapshotText::reserved(large_row_bytes)?,
-            large_row_bytes,
+            terminal_scratch: SnapshotText::reserved(RAW_OUTPUT_BIT_PROJECTION_BYTES)?,
+            prepared_row_bytes,
+            ready_row_bytes,
+            ready_outer_bytes,
+            escaped_limit,
+            escaped_bytes: 0,
         })
     }
     fn fail(&mut self, why: &'static str) -> RoleError {
@@ -622,6 +674,17 @@ impl Collector {
         RoleError::Backend("CPU Fresh replay bounded observer failed; actual work retained".into())
     }
     fn row<T: Serialize>(&mut self, event: &T, cap: usize) -> Result<(), RoleError> {
+        let outer_cap = cap
+            .checked_mul(2)
+            .ok_or_else(|| self.fail("row escape overflow"))?;
+        self.row_with_outer_cap(event, cap, outer_cap)
+    }
+    fn row_with_outer_cap<T: Serialize>(
+        &mut self,
+        event: &T,
+        cap: usize,
+        outer_cap: usize,
+    ) -> Result<(), RoleError> {
         if self.failure.is_some() {
             return Err(self.fail("prior observer failure"));
         }
@@ -629,18 +692,36 @@ impl Collector {
             return Err(self.fail("row reservation exhausted"));
         }
         let old = self.bytes.len();
-        let end = old
-            .checked_add(cap)
-            .and_then(|n| n.checked_add(1))
-            .unwrap_or(self.limit)
-            .min(self.limit);
+        let end = old.checked_add(cap).unwrap_or(self.limit).min(self.limit);
         if serialize_into(&mut self.bytes, end, Some(self.whole), event).is_err()
             || self.bytes.len() >= self.limit
         {
             self.bytes.truncate(old);
             return Err(self.fail("row serialization/clock/byte bound"));
         }
+        // serde_json's compact row contains no literal controls. The outer
+        // trace JSON string adds one byte for each quote/backslash and two for
+        // its newline. Count that actual encoding before committing the row;
+        // the smaller /4 Ready bound is therefore enforced, not presumed.
+        let row = &self.bytes[old..];
+        let controls = row.iter().any(|byte| *byte < 0x20);
+        let escaped_body = row.len().checked_add(
+            row.iter()
+                .filter(|byte| matches!(**byte, b'"' | b'\\'))
+                .count(),
+        );
+        let next_escaped = escaped_body
+            .and_then(|n| n.checked_add(2))
+            .and_then(|n| self.escaped_bytes.checked_add(n));
+        if controls
+            || escaped_body.is_none_or(|n| n > outer_cap)
+            || next_escaped.is_none_or(|n| n > self.escaped_limit)
+        {
+            self.bytes.truncate(old);
+            return Err(self.fail("row outer-JSON/registered escape bound"));
+        }
         self.bytes.push(b'\n');
+        self.escaped_bytes = next_escaped.expect("checked above");
         self.rows += 1;
         Ok(())
     }
@@ -697,11 +778,18 @@ impl Collector {
                 // PalsNativeResult has no blanket Debug/Serialize. Record its
                 // actual variant, format raw evaluation bits directly into the
                 // reserved arena, and leave unsupported control payload missing.
+                self.terminal_scratch.text.clear();
+                self.terminal_scratch.complete = false;
                 let (kind, complete) = match result {
-                    Ok(PalsNativeResult::Evaluation(raw)) => (
-                        "evaluation",
-                        self.terminal_scratch.capture(&RawOutputBits(raw)),
-                    ),
+                    Ok(PalsNativeResult::Evaluation(raw)) => {
+                        let complete = raw_shape_within_frozen_bound(raw)
+                            && self.terminal_scratch.capture(&RawOutputBits(raw))
+                            && sealed_raw_projection(&self.terminal_scratch.text);
+                        if !complete {
+                            self.terminal_scratch.complete = false;
+                        }
+                        ("evaluation", complete)
+                    }
                     Err(error) => ("backend_error", self.terminal_scratch.capture(error)),
                     Ok(other) => {
                         self.terminal_scratch.text.clear();
@@ -725,7 +813,7 @@ impl Collector {
                         complete: false,
                     },
                 );
-                let row = self.row(
+                let row = self.row_with_outer_cap(
                     &BoundEvent {
                         event: "physical_ready",
                         binding: BindingView::from(binding),
@@ -736,7 +824,8 @@ impl Collector {
                             full_native_diagnostic_archive: false,
                         },
                     },
-                    self.large_row_bytes,
+                    self.ready_row_bytes,
+                    self.ready_outer_bytes,
                 );
                 self.terminal_scratch = scratch;
                 row?;
@@ -754,6 +843,7 @@ fn native_result_kind(result: &PalsNativeResult) -> &'static str {
     match result {
         PalsNativeResult::Evaluation(_) => "evaluation",
         PalsNativeResult::NewGame => "new_game",
+        PalsNativeResult::ResetTo { .. } => "reset_to_game",
         PalsNativeResult::Stats(_) => "stats",
         PalsNativeResult::RuntimeVerified => "runtime_verified",
         PalsNativeResult::CudaPlacementVerified(_) => "cuda_placement_verified",
@@ -789,6 +879,42 @@ impl fmt::Debug for RawOutputBits<'_> {
             .field("private_latent", &FloatBits(&self.0.private_latent))
             .finish()
     }
+}
+
+/// Shared, bounded bit projection for an actual recorded-input witness. This
+/// preserves the existing physical-ready field order and IEEE-754 encoding.
+/// It neither imports a JSON capability nor omits the private latent output.
+pub fn native_raw_output_bit_projection(raw: &PalsRawOutput) -> Result<String, AdmissionFault> {
+    if !raw_shape_within_frozen_bound(raw) {
+        return Err(fault(
+            "raw_bit_projection",
+            "frozen raw shape exceeds registered bound",
+        ));
+    }
+    let mut projection = SnapshotText::reserved(RAW_OUTPUT_BIT_PROJECTION_BYTES)?;
+    if !projection.capture(&RawOutputBits(raw)) || !sealed_raw_projection(&projection.text) {
+        return Err(fault(
+            "raw_bit_projection",
+            "complete raw bit projection does not fit",
+        ));
+    }
+    Ok(projection.text)
+}
+
+fn raw_shape_within_frozen_bound(raw: &PalsRawOutput) -> bool {
+    let config = rz_eval::pals_model::PalsModelConfig::baseline();
+    raw.candidate_logits.len() <= config.max_candidates
+        && raw
+            .divergence_logits
+            .as_ref()
+            .is_none_or(|v| v.len() <= config.max_divergences)
+        && raw.private_latent.len() == config.latent_elements()
+}
+fn sealed_raw_projection(text: &str) -> bool {
+    text.len() <= RAW_UNESCAPED_TEXT_BYTES
+        && text
+            .bytes()
+            .all(|byte| byte >= 0x20 && byte != b'"' && byte != b'\\')
 }
 
 #[derive(Serialize)]
@@ -883,7 +1009,7 @@ impl NativeRoleObserver for ReplayObserver {
                     input,
                     logical: logical.map(DebugRef),
                 },
-                c.large_row_bytes,
+                c.prepared_row_bytes,
             )
         })
     }
@@ -976,6 +1102,7 @@ impl ReplayObserver {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplayOutputRequirements {
     trace_bytes: usize,
+    escaped_trace_bytes: usize,
     text_bytes: usize,
     required_output_bytes: usize,
 }
@@ -985,6 +1112,9 @@ impl ReplayOutputRequirements {
     }
     pub const fn text_bytes(self) -> usize {
         self.text_bytes
+    }
+    pub const fn escaped_trace_bytes(self) -> usize {
+        self.escaped_trace_bytes
     }
     pub const fn required_output_bytes(self) -> usize {
         self.required_output_bytes
@@ -1012,9 +1142,13 @@ pub fn replay_output_requirements(
     let trace = roles
         .checked_mul(role_trace_bytes(checks))
         .ok_or(fault("output_reserve", "trace overflow"))?;
-    // Committed compact JSONL contains no unescaped controls except its
-    // single newline separators. Wrapping that valid UTF-8 as a JSON string
-    // costs at most two bytes per existing byte (quotes/backslashes/newline).
+    // /4 separates prepared and Ready event encoding. The actual collector
+    // seals full fixed-hex raw text and checks every row's outer JSON expansion.
+    // Legacy lanes retain their general two-byte escaping bound. These exact
+    // new registration minima never alter already recorded JSON schemas/bytes.
+    let escaped_trace = roles
+        .checked_mul(escaped_role_trace_bytes(checks))
+        .ok_or(fault("output_reserve", "escaped trace overflow"))?;
     // Free-text Debug snapshots use the separate six-byte worst-case bound.
     let stage_bytes = checks
         .checked_mul(STAGE_TEXT_BYTES + 2 * SNAPSHOT_BYTES)
@@ -1029,13 +1163,14 @@ pub fn replay_output_requirements(
             }
         })
         .ok_or(fault("output_reserve", "retained snapshot overflow"))?;
-    let need = trace
-        .checked_mul(2)
-        .and_then(|n| text_bytes.checked_mul(6).and_then(|t| n.checked_add(t)))
+    let need = text_bytes
+        .checked_mul(6)
+        .and_then(|t| escaped_trace.checked_add(t))
         .and_then(|n| n.checked_add(HEADER_RESERVE))
         .ok_or(fault("output_reserve", "serialized upper bound overflow"))?;
     Ok(ReplayOutputRequirements {
         trace_bytes: trace,
+        escaped_trace_bytes: escaped_trace,
         text_bytes,
         required_output_bytes: need,
     })
@@ -1216,6 +1351,7 @@ fn dispatch_started_inner(
     cancel: &AtomicBool,
     capture_lane: CaptureLane,
 ) -> Result<NativeReplayResult, NativeReplayError> {
+    let actual_native_entry = Instant::now();
     let result = (|| {
         let admission = match expected_scope {
             Some(scope) => replay_inputs::check_replay_inputs_with_semantic_scope(
@@ -1345,6 +1481,9 @@ fn dispatch_started_inner(
             authorities: ReplayAuthorities::default(),
         };
         receipt.original_whole_wall_ms = receipt.input_admission.whole_wall_ms;
+        if let Some(prior) = &mut receipt.query_prior {
+            prior.observe_native_entry(actual_native_entry);
+        }
         let mut primary = None;
         let mut cleanup_error = None;
         let mut output_error = None;
@@ -2291,7 +2430,9 @@ mod tests {
         let req =
             replay_mode_requirements(ReplayInputMode::RepairOpponent4n, 5, 1, 100_000).unwrap();
         let roles = usize::try_from(req.actual_role_calls()).unwrap();
+        assert_eq!(roles, 14);
         let declared = replay_output_requirements(roles, req.cpu_checks()).unwrap();
+        assert_eq!(declared.required_output_bytes(), 4_011_440);
         assert!(declared.required_output_bytes() <= replay_inputs::MAX_OUTPUT_BYTES);
         assert!(
             declared
@@ -2304,11 +2445,21 @@ mod tests {
         assert!(reserved.opponent_state.is_some());
         let collector = reserved.collector.lock().unwrap();
         assert_eq!(collector.limit, roles * OPPONENT_ROLE_TRACE_BYTES);
-        assert_eq!(collector.large_row_bytes, OPPONENT_LARGE_ROW_BYTES);
+        assert_eq!(collector.prepared_row_bytes, OPPONENT_PREPARED_ROW_BYTES);
+        assert_eq!(collector.ready_row_bytes, OPPONENT_READY_ROW_BYTES);
+        assert_eq!(collector.ready_outer_bytes, OPPONENT_READY_OUTER_BYTES);
+        assert_eq!(
+            collector.escaped_limit,
+            roles * OPPONENT_ESCAPED_ROLE_TRACE_BYTES
+        );
         assert_eq!(collector.row_limit, roles * ROWS_PER_ROLE);
         const {
             assert!(
-                2 * OPPONENT_LARGE_ROW_BYTES + CONTEXT_BYTES + 9 * SMALL_ROW_BYTES + ROWS_PER_ROLE
+                OPPONENT_PREPARED_ROW_BYTES
+                    + OPPONENT_READY_ROW_BYTES
+                    + CONTEXT_BYTES
+                    + 9 * SMALL_ROW_BYTES
+                    + ROWS_PER_ROLE
                     <= OPPONENT_ROLE_TRACE_BYTES
             );
         }
@@ -2335,7 +2486,7 @@ mod tests {
     #[test]
     fn opponent_observer_overflow_preserves_failure_without_retry_or_success() {
         let mut collector = Collector::reserved_for_checks(1, 4, clock(1024).whole).unwrap();
-        let cap = collector.large_row_bytes;
+        let cap = collector.prepared_row_bytes;
         assert!(collector.row(&"x".repeat(cap + 1), cap).is_err());
         assert!(collector.failure.is_some());
         assert!(collector.bytes.is_empty());
@@ -2895,6 +3046,90 @@ mod tests {
         assert!(Reserved::new(usize::MAX, 3, c).is_err());
     }
     #[test]
+    fn complete_frozen_raw_latent_fits_opponent_observation_without_truncation() {
+        let config = rz_eval::pals_model::PalsModelConfig::baseline();
+        let raw = PalsRawOutput {
+            candidate_logits: vec![1.0; config.max_candidates],
+            wdl_logits: [0.0, 1.0, -0.0],
+            divergence_logits: Some(vec![-1.0; config.max_divergences]),
+            task_logits: Some([0.0; rz_eval::pals_model::V_TASKS]),
+            private_latent: vec![0.5; config.latent_elements()],
+        };
+        let projection = native_raw_output_bit_projection(&raw).unwrap();
+        assert!(projection.len() > 32 * 1024);
+        assert!(projection.len() < RAW_OUTPUT_BIT_PROJECTION_BYTES);
+        assert!(projection.contains("private_latent: len=6144;u32hex="));
+        let mut collector = Collector::reserved_for_checks(1, 4, clock(1024 * 1024).whole).unwrap();
+        let actual = binding(11, 22, 7);
+        collector.dispatched(actual).unwrap();
+        collector
+            .terminal(
+                actual,
+                NativeRoleTerminal::Ready(Ok(&PalsNativeResult::Evaluation(raw))),
+            )
+            .unwrap();
+        let row = std::str::from_utf8(&collector.bytes)
+            .unwrap()
+            .lines()
+            .nth(1)
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_str(row).unwrap();
+        assert_eq!(row["fact"]["raw_projection"]["text"], projection);
+        assert_eq!(row["fact"]["raw_projection"]["complete"], true);
+        assert!(collector.failure.is_none());
+        assert_eq!(
+            collector.limit,
+            OPPONENT_PREPARED_ROW_BYTES
+                + OPPONENT_READY_ROW_BYTES
+                + CONTEXT_BYTES
+                + 9 * SMALL_ROW_BYTES
+                + ROWS_PER_ROLE
+        );
+        assert!(sealed_raw_projection(&projection));
+        assert!(projection.len() <= RAW_UNESCAPED_TEXT_BYTES);
+        let trace = std::str::from_utf8(&collector.bytes).unwrap();
+        assert_eq!(
+            serde_json::to_vec(trace).unwrap().len(),
+            collector.escaped_bytes + 2
+        );
+        assert!(collector.escaped_bytes <= collector.escaped_limit);
+    }
+    #[test]
+    fn opponent_ready_outer_escape_bound_refuses_arbitrary_escaped_row() {
+        let mut collector = Collector::reserved_for_checks(1, 4, clock(1024).whole).unwrap();
+        collector.row(&"prior", SMALL_ROW_BYTES).unwrap();
+        let prior = collector.bytes.clone();
+        let used = collector.escaped_bytes;
+        // Inner row fits 64KiB, but wrapping escaped diagnostic text does not
+        // fit the sealed Ready outer bound. It cannot be committed as success.
+        let hostile = "\\".repeat(OPPONENT_READY_OUTER_BYTES / 3 + 1);
+        assert!(
+            collector
+                .row_with_outer_cap(
+                    &hostile,
+                    OPPONENT_READY_ROW_BYTES,
+                    OPPONENT_READY_OUTER_BYTES,
+                )
+                .is_err()
+        );
+        assert_eq!(collector.bytes, prior);
+        assert_eq!(collector.escaped_bytes, used);
+        assert_eq!(collector.rows, 1);
+        assert!(collector.failure.is_some());
+    }
+    #[test]
+    fn raw_bit_projection_rejects_out_of_profile_shape() {
+        let config = rz_eval::pals_model::PalsModelConfig::baseline();
+        let raw = PalsRawOutput {
+            candidate_logits: vec![0.0; config.max_candidates + 1],
+            wdl_logits: [0.0; 3],
+            divergence_logits: None,
+            task_logits: None,
+            private_latent: vec![0.0; config.latent_elements()],
+        };
+        assert!(native_raw_output_bit_projection(&raw).is_err());
+    }
+    #[test]
     fn bounded_debug_and_failed_observer_row_keep_prior_owned_bytes() {
         struct ManyWrites;
         impl fmt::Debug for ManyWrites {
@@ -3373,9 +3608,13 @@ mod tests {
     #[test]
     fn public_output_exact_cap_and_shortage_match_pre_load_reservation() {
         let requirement = replay_output_requirements(3, 2).unwrap();
-        assert_eq!(requirement.trace_bytes(), 432 * 1024);
+        assert_eq!(requirement.trace_bytes(), 3 * ROLE_TRACE_BYTES);
+        assert_eq!(requirement.escaped_trace_bytes(), 6 * ROLE_TRACE_BYTES);
         assert_eq!(requirement.text_bytes(), 112 * 1024);
-        assert_eq!(requirement.required_output_bytes(), 2 * 1024 * 1024);
+        assert_eq!(
+            requirement.required_output_bytes(),
+            6 * ROLE_TRACE_BYTES + 6 * 112 * 1024 + HEADER_RESERVE
+        );
         let copied = requirement;
         let cap = requirement.required_output_bytes();
         assert!(requirement.check_output_limit(cap).is_ok());
@@ -3406,8 +3645,9 @@ mod tests {
                 usize::MAX / (STAGE_TEXT_BYTES + 2 * SNAPSHOT_BYTES),
                 "retained snapshot overflow",
             ),
+            (usize::MAX / ROLE_TRACE_BYTES, 0, "escaped trace overflow"),
             (
-                usize::MAX / ROLE_TRACE_BYTES,
+                usize::MAX / escaped_role_trace_bytes(0),
                 0,
                 "serialized upper bound overflow",
             ),

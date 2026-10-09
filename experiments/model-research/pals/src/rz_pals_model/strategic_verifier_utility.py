@@ -12,9 +12,10 @@ an action. Caller JSON, depth, CPU agreement, lack of a counterexample, or old
 coverage-utility results cannot fill those gaps. This unit therefore ALWAYS
 returns unknown/masked, preference/sign/cost=None and actual utility groups0.
 
-Original raw bytes and independent pins are retained. There is no new closure
-wire, action producer, Pareto implementation, no-step loss, target, scorer call,
-training, warm state, checkpoint or product V API in this module.
+Original raw bytes and independent pins are retained. The separate /2 report
+inspectors below read actual Rust coverage-cost audits without importing their
+capabilities. Reported numerical costs/preferences remain caller reports; these
+inspectors never admit utility, a target, training, warm state or product V.
 """
 
 import copy
@@ -321,3 +322,254 @@ def admit_same_witness_cost_dominance(*, checked_query, criterion_bytes, before_
     pins = query.canonical(expected_pins, max_bytes=MAX_NEW_RAW_BYTES - total)
     return CheckedStrategicUtilityPair(_FACTORY, checked=checked_query, criterion=criterion_bytes, before=before_pair_bytes,
                                       observations=action_observations, witnesses=whole_witnesses, pins=pins)
+
+
+WHOLE_COST_REPORT_SCHEMA = "rz-pals-coverage-whole-action-cost/2"
+CONDITIONAL_COST_REPORT_SCHEMA = "rz-pals-conditional-whole-cost-dominance/2"
+CAPTURED_WHOLE_COST_REPORT_SCHEMA = "rz-pals-coverage-whole-action-cost/3"
+CAPTURED_CONDITIONAL_COST_REPORT_SCHEMA = "rz-pals-conditional-whole-cost-dominance/3"
+_COVERAGE_POLICY = "first_registered_defend_response_coverage/1"
+_REGISTERED_COVERAGE_POLICY = "registered_defend_response_coverage/2"
+_COUNTER_SCOPE = "registered_child_report_correlated_to_independent_native_plus_separate_live_native_execution"
+_CAPTURED_COUNTER_SCOPE = "child_work_report_plus_actual_captured_input_nn_replay_and_independent_cpu_work"
+_SOURCE_REPORT_SCOPE = "registered_source_owned_report;physical_child_work_not_attested"
+_INDEPENDENT_WORK_SCOPE = "fresh_independent_cpu_attempts_and_actual_recorded_input_nn_ready_stats_including_initialization_and_final_join"
+_FRESH_FACT_SCOPE = "actual_fresh_independent_cpu_endpoint_fact_only;not_correlated_child_scalar_score"
+_WHOLE_AXES = ("whole_elapsed_ns", "cpu_nodes", "physical_nn_inputs")
+_WHOLE_REPORT_FIELDS = ("schema", "policy", "query_sha256", "parent", "source_binding", "source_input",
+    "source_output", "conditional_fact_sha256", "selected_original_action_index", "selected_action", "whole_elapsed_ns", "whole_cost",
+    "initial_selection", "next_selection", "independent_native_work_interval", "source_work", "independent_native_work",
+    "work_counter_scope", "source_native_ids_equated_to_witness", "whole_causal_elapsed_observed",
+    "preparation_transport_check_intervals_ns", "logical_phase_elapsed_ns", "logical_phase_scope",
+    "neural_v_executed", "neural_v_skipped_by_policy", "selector_cpu_search_executed", "selector_nn_inputs",
+    "next_selection_cpu_search_executed", "next_selection_nn_inputs", "next_choice", "whole_work_counts_known",
+    "utility_authority", "target_authority", "training_authority", "learned_utility_claim",
+    "product_verifier_enabled", "optimizer_steps")
+_PAIR_REPORT_FIELDS = ("schema", "policy", "scope", "parent", "source_query_sha256",
+    "prior_ledger_before_sha256", "source_inputs", "selected_original_action_indices", "source_actions", "whole_costs", "work_counter_scope", "preference", "mask",
+    "reason", "actual_utility_groups", "utility_observation_admitted", "target_authority", "training_authority",
+    "neural_v_executed", "learned_utility_claim", "strategic_refutation_admitted", "rules_proof_admitted",
+    "depth_or_cpu_agreement_reward", "no_counterexample_reward", "paper_reward_claim",
+    "product_verifier_enabled", "optimizer_steps")
+_CAPTURED_WHOLE_REPORT_FIELDS = tuple(name for name in _WHOLE_REPORT_FIELDS if name != "independent_native_work_interval") + (
+    "independent_witness_work_interval", "source_child_work_provenance", "actual_independent_work_scope",
+    "source_child_physical_work_attested", "source_cpu_scalar_score_correlated")
+_CAPTURED_PAIR_REPORT_FIELDS = _PAIR_REPORT_FIELDS + ("source_child_work_provenance",
+    "source_child_physical_work_attested", "source_cpu_scalar_score_correlated", "conditional_fact_scope")
+_REPORT_PARENT_FIELDS = ("parent_input_sha256", "current_view_sha256", "frozen_admission_sha256", "encoding_sha256")
+_REPORT_BINDING_SHA_FIELDS = ("query_sha256", "prior_ledger_sha256", "semantic_input_sha256",
+    "semantic_context_sha256", "semantic_branch_meaning_sha256", "semantic_before_result_anchor_sha256")
+_REPORT_BINDING_PIN_FIELDS = ("catalogue_artifact", "before_result_artifact", "cpu_request_artifact")
+_REPORT_ACTION_FIELDS = ("slot", "task", "semantic_input_sha256", "profile_registration", "baseline_depth",
+    "requested_depth", "max_nodes_per_check", "max_wall_time_ms", "max_output_bytes", "budget_bucket")
+
+
+def _report_original(raw, expected_pin, names, captured_names=None, captured_schema=None):
+    # Validate bounded immutable bytes and the closed independent pin before
+    # parsing/copying caller objects. A pin is provenance, never native authority.
+    if type(raw) is not bytes or not 1 <= len(raw) <= MAX_NEW_RAW_BYTES:
+        raise ValueError("coverage cost report bounded original immutable bytes required")
+    _fields(expected_pin, ("bytes", "sha256"))
+    _uint(expected_pin["bytes"], 1, MAX_NEW_RAW_BYTES)
+    query._sha(expected_pin["sha256"])
+    _actual(raw, expected_pin)
+    value = query._parse(raw)
+    if type(value) is dict and value.get("schema") == captured_schema and captured_names is not None:
+        names = captured_names
+    return _fields(value, names)
+
+
+def _captured_report_provenance(value, *, pair=False):
+    if (value["source_child_work_provenance"] != _SOURCE_REPORT_SCOPE
+            or value["source_child_physical_work_attested"] is not False
+            or value["source_cpu_scalar_score_correlated"] is not None
+            or (pair and value["conditional_fact_scope"] != _FRESH_FACT_SCOPE)
+            or (not pair and value["actual_independent_work_scope"] != _INDEPENDENT_WORK_SCOPE)):
+        raise ValueError("captured-input report cannot promote child work or scalar score to physical proof")
+
+
+def _whole_report_cost(value):
+    if value is None:
+        return None
+    _fields(value, _WHOLE_AXES)
+    return tuple(_uint(value[name], 0, 2**64 - 1) for name in _WHOLE_AXES)
+
+
+def _report_parent(value):
+    _fields(value, _REPORT_PARENT_FIELDS)
+    for name in _REPORT_PARENT_FIELDS:
+        query._sha(value[name])
+
+
+def _report_binding(value):
+    _fields(value, _REPORT_BINDING_SHA_FIELDS + _REPORT_BINDING_PIN_FIELDS)
+    for name in _REPORT_BINDING_SHA_FIELDS:
+        query._sha(value[name])
+    for name in _REPORT_BINDING_PIN_FIELDS:
+        query._pin(value[name])
+
+
+def _report_action(value, index):
+    _fields(value, _REPORT_ACTION_FIELDS)
+    if value["task"] != "defend_response" or _uint(value["slot"], 0, 7) != index:
+        raise ValueError("coverage report original selected DefendResponse action differs")
+    query._sha(value["semantic_input_sha256"])
+    for name in ("profile_registration", "budget_bucket"):
+        _uint(value[name], 0, 255)
+    baseline, requested = (_uint(value[name], 1, 64) for name in ("baseline_depth", "requested_depth"))
+    if baseline > requested:
+        raise ValueError("coverage report original CPU depth order differs")
+    _uint(value["max_nodes_per_check"], 1, 2**64 - 1)
+    _uint(value["max_wall_time_ms"], 1, 300000)
+    _uint(value["max_output_bytes"], 1024, 1048576)
+    # A registry index alone does not prove different resolved profile controls.
+    return tuple(value[name] for name in _REPORT_ACTION_FIELDS if name not in ("slot", "budget_bucket", "profile_registration"))
+
+
+def _report_interval(value, whole):
+    _fields(value, ("start_ns", "end_ns"))
+    start, end = (_uint(value[name], 0, whole) for name in ("start_ns", "end_ns"))
+    if start > end:
+        raise ValueError("coverage cost report observed interval order")
+    return start, end
+
+
+def _report_work(value):
+    if value is None:
+        return None
+    if type(value) is not list or len(value) != 2:
+        raise ValueError("coverage cost report exact source and native counter pair required")
+    return tuple(_uint(number, 0, 2**64 - 1) for number in value)
+
+
+def _reported_only(raw, value):
+    return {"schema": "rz-pals-coverage-cost-report-inspection/1",
+        "scope": "independently_pinned_rust_audit_report_only;no_capability_import",
+        "original_report": query.byte_pin(raw), "reported": copy.deepcopy(value),
+        "actual_utility_groups": 0, "utility_authority": False, "target_authority": False,
+        "training_authority": False, "native_capability_imported": False,
+        "physical_execution_attested_here": False, "optimizer_steps": 0}
+
+
+def inspect_coverage_whole_cost_report(*, report_bytes, expected_report_pin):
+    """Read a closed /2 Rust audit without reconstructing a completed action.
+
+    Unknown counters/subphase durations stay None. The retained child report and
+    independent native work are distinct executions; their counters are summed
+    only when the source declares both and arithmetic/accounting agrees.
+    """
+    value = _report_original(report_bytes, expected_report_pin, _WHOLE_REPORT_FIELDS,
+                            _CAPTURED_WHOLE_REPORT_FIELDS, CAPTURED_WHOLE_COST_REPORT_SCHEMA)
+    captured = value["schema"] == CAPTURED_WHOLE_COST_REPORT_SCHEMA
+    if captured:
+        _captured_report_provenance(value)
+    if (value["schema"] not in (WHOLE_COST_REPORT_SCHEMA, CAPTURED_WHOLE_COST_REPORT_SCHEMA)
+            or value["policy"] not in (_COVERAGE_POLICY, _REGISTERED_COVERAGE_POLICY)
+            or value["work_counter_scope"] != (_CAPTURED_COUNTER_SCOPE if captured else _COUNTER_SCOPE) or value["next_choice"] != "defer"
+            or value["logical_phase_scope"] != "combined_parent_intervals_observed;unseparated_subphases_unknown;no_additive_double_count"):
+        raise ValueError("unsupported coverage whole-cost report scope")
+    for name in ("query_sha256", "conditional_fact_sha256"):
+        query._sha(value[name])
+    _report_parent(value["parent"])
+    _report_binding(value["source_binding"])
+    for name in ("source_input", "source_output"):
+        query._pin(value[name])
+    index = _uint(value["selected_original_action_index"], 0, 7)
+    _report_action(value["selected_action"], index)
+    whole = _uint(value["whole_elapsed_ns"], 0, 2**64 - 1)
+    initial = _report_interval(value["initial_selection"], whole)
+    next_selection = _report_interval(value["next_selection"], whole)
+    _report_interval(value["independent_witness_work_interval" if captured else "independent_native_work_interval"], whole)
+    if initial[1] > next_selection[0] or next_selection[1] != whole:
+        raise ValueError("coverage whole-cost final selection clock differs")
+    for name in ("source_native_ids_equated_to_witness", "neural_v_executed", "selector_cpu_search_executed",
+                 "next_selection_cpu_search_executed", "utility_authority", "target_authority", "training_authority",
+                 "learned_utility_claim", "product_verifier_enabled"):
+        if value[name] is not False:
+            raise ValueError("coverage report expanded authority or unrecorded selector work")
+    for name in ("whole_causal_elapsed_observed", "neural_v_skipped_by_policy"):
+        if value[name] is not True:
+            raise ValueError("coverage report missing actual interval or explicit skipped V policy")
+    for name in ("selector_nn_inputs", "next_selection_nn_inputs", "optimizer_steps"):
+        if type(value[name]) is not int or value[name] != 0:
+            raise ValueError("coverage report cannot add selector NN/training work")
+    phases = _fields(value["logical_phase_elapsed_ns"],
+                     ("initial_v_or_coverage_selection", "preparation", "nn", "cpu", "transfer", "check", "next_selection"))
+    _uint(phases["initial_v_or_coverage_selection"], 0, whole)
+    _uint(phases["next_selection"], 0, whole)
+    if (phases["initial_v_or_coverage_selection"] != initial[1] - initial[0]
+            or phases["next_selection"] != next_selection[1] - next_selection[0]
+            or any(phases[name] is not None for name in ("preparation", "nn", "cpu", "transfer", "check"))):
+        raise ValueError("coverage report invented unseparated subphase durations")
+    intervals = _fields(value["preparation_transport_check_intervals_ns"],
+        ("preparation_and_preflight", "supervisor_setup", "launch_work_and_wait", "drain", "postflight",
+         "after_capture_before_check", "result_check", "check_to_next_query_admission"))
+    for duration in intervals.values():
+        if duration is not None:
+            _uint(duration, 0, whole)
+    source, native_work = _report_work(value["source_work"]), _report_work(value["independent_native_work"])
+    costs = _whole_report_cost(value["whole_cost"])
+    if type(value["whole_work_counts_known"]) is not bool or value["whole_work_counts_known"] != (costs is not None):
+        raise ValueError("coverage report unknown whole counts cannot become zero or known")
+    if costs is not None:
+        if (source is None or native_work is None or (not captured and source != native_work) or costs[0] != whole
+                or costs[1:] != (source[0] + native_work[0], source[1] + native_work[1])):
+            raise ValueError("coverage report must charge source and independent witness separately")
+    return _reported_only(report_bytes, value)
+
+
+def inspect_conditional_cost_pair_report(*, report_bytes, expected_report_pin):
+    """Retain a /2 conditional preference claim as a report, never a target."""
+    value = _report_original(report_bytes, expected_report_pin, _PAIR_REPORT_FIELDS,
+                            _CAPTURED_PAIR_REPORT_FIELDS, CAPTURED_CONDITIONAL_COST_REPORT_SCHEMA)
+    captured = value["schema"] == CAPTURED_CONDITIONAL_COST_REPORT_SCHEMA
+    if captured:
+        _captured_report_provenance(value, pair=True)
+    if (value["schema"] not in (CONDITIONAL_COST_REPORT_SCHEMA, CAPTURED_CONDITIONAL_COST_REPORT_SCHEMA)
+            or value["policy"] != "same_conditional_raw_endpoint_whole_cost_dominance/2"
+            or value["scope"] != "conditional_cost_observation_only;not_paper_reward_or_learned_utility"
+            or value["work_counter_scope"] != (_CAPTURED_COUNTER_SCOPE if captured else _COUNTER_SCOPE)):
+        raise ValueError("unsupported conditional cost pair report scope")
+    for name in ("source_query_sha256", "prior_ledger_before_sha256"):
+        query._sha(value[name])
+    _report_parent(value["parent"])
+    if type(value["source_inputs"]) is not list or len(value["source_inputs"]) != 2:
+        raise ValueError("conditional cost report exact two source artifacts required")
+    for pin in value["source_inputs"]:
+        query._pin(pin)
+    if type(value["selected_original_action_indices"]) is not list or len(value["selected_original_action_indices"]) != 2:
+        raise ValueError("conditional cost report exact two original action indices required")
+    indices = tuple(_uint(index, 0, 7) for index in value["selected_original_action_indices"])
+    if type(value["source_actions"]) is not list or len(value["source_actions"]) != 2:
+        raise ValueError("conditional cost report exact two original actions required")
+    actions = tuple(_report_action(action, index) for action, index in zip(value["source_actions"], indices))
+    if type(value["whole_costs"]) is not list or len(value["whole_costs"]) != 2:
+        raise ValueError("conditional cost report exact two whole costs required")
+    costs = tuple(_whole_report_cost(item) for item in value["whole_costs"])
+    if type(value["mask"]) is not bool or type(value["utility_observation_admitted"]) is not bool:
+        raise ValueError("conditional cost report exact boolean masks required")
+    if (type(value["actual_utility_groups"]) is not int or value["actual_utility_groups"] != int(value["mask"])
+            or value["utility_observation_admitted"] != value["mask"]):
+        raise ValueError("conditional cost report group/mask disagreement")
+    if type(value["reason"]) is not str or not 1 <= len(value["reason"]) <= 256:
+        raise ValueError("conditional cost report bounded reason required")
+    for name in ("target_authority", "training_authority", "neural_v_executed", "learned_utility_claim",
+                 "strategic_refutation_admitted", "rules_proof_admitted", "depth_or_cpu_agreement_reward",
+                 "no_counterexample_reward", "paper_reward_claim", "product_verifier_enabled"):
+        if value[name] is not False:
+            raise ValueError("conditional cost report cannot expand observation authority")
+    if type(value["optimizer_steps"]) is not int or value["optimizer_steps"] != 0:
+        raise ValueError("conditional cost report training execution unsupported")
+    if value["mask"]:
+        if indices[0] == indices[1] or actions[0] == actions[1] or value["source_inputs"][0] == value["source_inputs"][1]:
+            raise ValueError("same action repetition cannot be a conditional utility preference")
+        if None in costs or value["preference"] not in ("left", "right"):
+            raise ValueError("conditional preference requires reported whole costs")
+        left, right = costs
+        actual = ("left" if left != right and all(a <= b for a, b in zip(left, right)) else
+                  "right" if left != right and all(a >= b for a, b in zip(left, right)) else None)
+        if value["preference"] != actual or value["reason"] != "same_conditional_fact_strict_whole_cost_dominance":
+            raise ValueError("conditional cost report strict Pareto claim differs")
+    elif value["preference"] is not None:
+        raise ValueError("masked conditional cost report cannot carry a preference")
+    return _reported_only(report_bytes, value)

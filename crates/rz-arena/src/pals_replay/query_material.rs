@@ -14,6 +14,18 @@ use rz_uci::pals_cpu_task::strategic_action::replay_inputs::{
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Instant;
 
+#[path = "repair_query_episode.rs"]
+mod episode;
+pub use episode::{CheckedRepairQuery, EpisodeClockScope, RepairQueryEpisode};
+#[cfg(any(feature = "pals-collection-onnx", feature = "native-cuda"))]
+#[path = "captured_repair_witness.rs"]
+mod captured_witness;
+#[cfg(any(feature = "pals-collection-onnx", feature = "native-cuda"))]
+pub use captured_witness::{
+    CapturedRepairWitnessCause, CapturedRepairWitnessFailure, CheckedCapturedRepairWitness,
+    MAX_CAPTURED_REPAIR_AUDIT_BYTES, witness_captured_repair_inputs,
+};
+
 /// Constructed only by the actual capture owner under its original W. No public
 /// constructor, Clone or serde: the material borrows original input and stdout.
 /// A separate next-Query checker must still admit the question, native witness,
@@ -26,6 +38,9 @@ pub struct ReportedRepairPriorMaterial<'capture> {
     caller_started_ns: u64,
     before_next_query_at: Instant,
     elapsed_before_next_query_ns: u64,
+    next_query_issue: MaterialIssueGate,
+    #[cfg(any(feature = "pals-collection-onnx", feature = "native-cuda"))]
+    captured_witness_issue: MaterialIssueGate,
 }
 impl ReportedRepairPriorMaterial<'_> {
     pub fn checked_report(&self) -> &CheckedRepairReplayObservation<'_> {
@@ -131,6 +146,9 @@ impl OwnedReplayCapture {
             caller_started_ns,
             before_next_query_at,
             elapsed_before_next_query_ns,
+            next_query_issue: MaterialIssueGate::default(),
+            #[cfg(any(feature = "pals-collection-onnx", feature = "native-cuda"))]
+            captured_witness_issue: MaterialIssueGate::default(),
         })
     }
 }

@@ -19,13 +19,21 @@ mod binary;
 mod chronology;
 mod delivery;
 mod query_material;
+pub mod utility_observation;
 pub use binary::CheckedReplayLoadedBinary;
 pub use chronology::{CheckedRepairReplayObservation, ReplayCallerTiming};
 pub use delivery::{
     BoundRepairReplayDelivery, BoundReplayDelivery, RepairReplayDeliveryRegistration,
     ReplayDeliveryRegistration,
 };
-pub use query_material::ReportedRepairPriorMaterial;
+#[cfg(any(feature = "pals-collection-onnx", feature = "native-cuda"))]
+pub use query_material::{
+    CapturedRepairWitnessCause, CapturedRepairWitnessFailure, CheckedCapturedRepairWitness,
+    MAX_CAPTURED_REPAIR_AUDIT_BYTES, witness_captured_repair_inputs,
+};
+pub use query_material::{
+    CheckedRepairQuery, EpisodeClockScope, RepairQueryEpisode, ReportedRepairPriorMaterial,
+};
 
 pub const MAX_REPLAY_CALLER_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_REPLAY_CALLER_READ_BYTES: u64 = MAX_REPLAY_CALLER_BINARY_BYTES + 32 * 1024 * 1024;

@@ -38,13 +38,14 @@ fn usage() {
         Actual ONNX mode accepts independently registered Untrained P/C on explicit CPU only.\n\
         --describe-registration prints read-only executable/CPU/encoder/model-config facts and exits.\n\
         --describe-producer ID constructs the checked CPU/native owner, prints registration facts and exits.\n\
+        --describe-checked-source ID constructs the same checked owner and prints its full source description.\n\
         Strict producer mode requires independent prior registration bytes; failure has no legacy fallback.\n\
         Output preserves seals, actual native tensors, physical raw/delivery/consumption, masks, PGN and failure receipt."
     );
 }
 
 // Selection admission precedes every owner/runtime/model dispatch. The only
-// non-strict exception is read-only producer-registration bootstrap metadata.
+// non-strict exception is read-only checked-owner bootstrap metadata.
 fn validate_refinement_cli(
     mode: &str,
     provider: Option<&str>,
@@ -79,6 +80,25 @@ fn set_refinement_arg<T>(slot: &mut Option<T>, value: T, flag: &str) -> Result<(
     Ok(())
 }
 
+fn validate_describe_cli(
+    producer: bool,
+    checked_source: bool,
+    strict_registration_or_limits: bool,
+) -> Result<bool, String> {
+    if producer && checked_source {
+        return Err(
+            "describe-producer and describe-checked-source require separate bootstrap invocations"
+                .into(),
+        );
+    }
+    if (producer || checked_source) && strict_registration_or_limits {
+        return Err(
+            "checked-owner description cannot enroll or consume a strict registration".into(),
+        );
+    }
+    Ok(producer || checked_source)
+}
+
 fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let mut config = PalsCollectionConfig::default();
     let mut output = None;
@@ -98,6 +118,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let mut producer_journal_bytes = None;
     let mut producer_capture_bytes = None;
     let mut describe_producer = None;
+    let mut describe_checked_source = None;
     let mut pals = PalsConfig::default();
     let mut pals_rounds = 2_u64;
     let mut args = std::env::args().skip(1);
@@ -144,6 +165,9 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             "--producer-journal-bytes" => producer_journal_bytes = Some(value.parse::<u64>()?),
             "--producer-capture-bytes" => producer_capture_bytes = Some(value.parse::<u64>()?),
             "--describe-producer" => describe_producer = Some(value),
+            "--describe-checked-source" => {
+                set_refinement_arg(&mut describe_checked_source, value, &flag)?;
+            }
             "--beam-width" => pals.beam_width = value.parse()?,
             "--line-plies" => pals.line_plies = value.parse()?,
             "--max-role-calls" => pals.max_role_calls = value.parse()?,
@@ -179,6 +203,14 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             _ => return Err(format!("unknown argument {flag}").into()),
         }
     }
+    let describe_owner = validate_describe_cli(
+        describe_producer.is_some(),
+        describe_checked_source.is_some(),
+        producer_registration.is_some()
+            || producer_registration_sha256.is_some()
+            || producer_journal_bytes.is_some()
+            || producer_capture_bytes.is_some(),
+    )?;
     let recheck_selected = validate_refinement_cli(
         &mode,
         provider.as_deref(),
@@ -186,16 +218,8 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         refinement_registration.as_ref(),
         refinement_registration_sha256.as_deref(),
         producer_registration.is_some() && producer_registration_sha256.is_some(),
-        describe_producer.is_some(),
+        describe_owner,
     )?;
-    if describe_producer.is_some()
-        && (producer_registration.is_some()
-            || producer_registration_sha256.is_some()
-            || producer_journal_bytes.is_some()
-            || producer_capture_bytes.is_some())
-    {
-        return Err("--describe-producer cannot enroll or consume a strict registration".into());
-    }
     let producer_config = match (producer_registration, producer_registration_sha256) {
         (None, None) => {
             if producer_journal_bytes.is_some() || producer_capture_bytes.is_some() {
@@ -215,7 +239,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             );
         }
     };
-    if describe_producer.is_none() && output.is_none() {
+    if !describe_owner && output.is_none() {
         return Err("--output-root is required and must be absolute outside the checkout".into());
     }
     config.validate()?;
@@ -371,6 +395,14 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         );
         return Ok(true);
     }
+    if let Some(producer_id) = describe_checked_source {
+        // Validate the ID through the same checked producer owner used by
+        // --describe-producer. Emit the actual owner's borrowed description,
+        // rather than reconstructing it from assets or registration metadata.
+        pals_producer_registration_description(driver.as_mut(), &producer_id)?;
+        println!("{}", serde_json::to_string(driver.description())?);
+        return Ok(true);
+    }
     let output = output.ok_or("--output-root is required")?;
     let cancelled = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
@@ -404,6 +436,18 @@ mod tests {
     use super::*;
     fn public_registration() -> PathBuf {
         std::env::temp_dir().join("public-refinement-registration.json")
+    }
+
+    #[test]
+    fn checked_owner_bootstrap_is_exclusive_and_cannot_consume_registration() {
+        assert!(!validate_describe_cli(false, false, false).unwrap());
+        assert!(!validate_describe_cli(false, false, true).unwrap());
+        assert!(validate_describe_cli(true, false, false).unwrap());
+        assert!(validate_describe_cli(false, true, false).unwrap());
+        assert!(validate_describe_cli(true, true, false).is_err());
+        for (producer, source) in [(true, false), (false, true), (true, true)] {
+            assert!(validate_describe_cli(producer, source, true).is_err());
+        }
     }
 
     #[test]

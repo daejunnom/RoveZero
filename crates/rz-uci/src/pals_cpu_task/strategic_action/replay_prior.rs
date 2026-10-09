@@ -11,12 +11,19 @@ use super::{
     SnapshotText,
 };
 use rz_contracts::pals::Move16;
-use rz_position::BoardMove;
-use rz_search::cpu::{CpuCompletion, CpuScoreScope};
-use rz_search::pals::engine::RoleModel;
-use rz_search::pals::engine::replay::{FreshReplayOwner, ReplayCpuPhase, ReplayOpponentOutcome};
+use rz_position::{BoardMove, Color, PositionSnapshot};
+use rz_search::cpu::{CPU_MATE_THRESHOLD, CpuCompletion, CpuScoreScope};
+use rz_search::cpu_value::CpuValueIdentity;
+use rz_search::pals::engine::replay::{
+    FreshReplayOwner, ReplayCpuPhase, ReplayOpponentOutcome, ReplayStageReport,
+};
+use rz_search::pals::engine::{RecheckEndpointEvidence, RoleModel};
+use rz_search::pals::store::{BoundKind, RawScore};
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
+
+#[path = "replay_captured_cpu_witness.rs"]
+pub mod captured_cpu_witness;
 
 #[path = "replay_reported.rs"]
 mod reported;
@@ -137,6 +144,129 @@ pub enum PriorOutcome {
     RulesTerminalOpponentEndpoint,
 }
 
+/// Live, source-owned endpoint fact. There is no deserializer, public
+/// constructor or wire projection. CPU raw units are not calibrated cp, WDL,
+/// Rules proof, a strategic refutation, or a training target.
+#[derive(Debug)]
+pub struct ConditionalEndpointFact {
+    snapshot: PositionSnapshot,
+    raw_value: i32,
+    perspective: Color,
+    root_perspective: Color,
+    completed_depth: u16,
+    registered_condition_sha256: [u8; 32],
+    value_identity: CpuValueIdentity,
+}
+impl ConditionalEndpointFact {
+    pub fn snapshot(&self) -> &PositionSnapshot {
+        &self.snapshot
+    }
+    pub fn raw_value(&self) -> i32 {
+        self.raw_value
+    }
+    pub fn perspective(&self) -> Color {
+        self.perspective
+    }
+    pub fn root_perspective(&self) -> Color {
+        self.root_perspective
+    }
+    pub fn completed_depth(&self) -> u16 {
+        self.completed_depth
+    }
+    pub fn registered_condition_sha256(&self) -> &[u8; 32] {
+        &self.registered_condition_sha256
+    }
+    pub fn value_identity(&self) -> &CpuValueIdentity {
+        &self.value_identity
+    }
+    pub fn raw_value_in_root_perspective(&self) -> i32 {
+        if self.perspective == self.root_perspective {
+            self.raw_value
+        } else {
+            -self.raw_value
+        }
+    }
+    pub fn same_conditional_fact(&self, other: &Self) -> bool {
+        self.snapshot.same_state(&other.snapshot)
+            && self.raw_value == other.raw_value
+            && self.perspective == other.perspective
+            && self.root_perspective == other.root_perspective
+            && self.completed_depth == other.completed_depth
+            && self.registered_condition_sha256 == other.registered_condition_sha256
+            && self.value_identity == other.value_identity
+    }
+}
+
+fn live_endpoint_fact<M: RoleModel>(
+    owner: &FreshReplayOwner<M>,
+    stage: &ReplayStageReport,
+) -> Option<ConditionalEndpointFact> {
+    let report = stage.report()?;
+    if !stage.exact_completed()
+        || report.score_scope != CpuScoreScope::CompletedIteration
+        || report.completion != CpuCompletion::DepthLimit
+        || report.completed_depth != stage.requested_depth()
+        || report.root_restricted
+        || report.reused_completed_depth != 0
+        || report.score.unsigned_abs() >= CPU_MATE_THRESHOLD as u32
+        || report.value_identity.validate().is_err()
+    {
+        return None;
+    }
+    let id = stage.observation()?;
+    let observed = owner.observation(id).ok()?;
+    let (snapshot, endpoint_state) = match stage.phase() {
+        ReplayCpuPhase::RepairEndpoint => {
+            let endpoint = owner.repair_endpoint()?;
+            match endpoint.evidence {
+                RecheckEndpointEvidence::OwnCpu {
+                    observation_id,
+                    execution_id,
+                    admitted_scope,
+                    ..
+                } if observation_id == id
+                    && execution_id == stage.execution()
+                    && admitted_scope == CpuScoreScope::CompletedIteration => {}
+                _ => return None,
+            }
+            (endpoint.snapshot.clone(), endpoint.state)
+        }
+        ReplayCpuPhase::RepairOpponentEndpoint => {
+            let endpoint = owner.opponent_endpoint()?;
+            if endpoint.terminal.is_some() || endpoint.stage?.execution() != stage.execution() {
+                return None;
+            }
+            (endpoint.snapshot.clone(), endpoint.state)
+        }
+        _ => return None,
+    };
+    let RawScore::Cpu {
+        value,
+        perspective,
+        bound: BoundKind::ExactWithinSearch,
+    } = observed.score
+    else {
+        return None;
+    };
+    if observed.state != endpoint_state
+        || value != report.score
+        || perspective != snapshot.side_to_move()
+        || observed.value_identity.as_ref() != Some(&report.value_identity)
+        || observed.cpu_condition.as_deref() != Some(stage.task_condition())
+    {
+        return None;
+    }
+    Some(ConditionalEndpointFact {
+        snapshot,
+        raw_value: value,
+        perspective,
+        root_perspective: owner.root_snapshot().side_to_move(),
+        completed_depth: report.completed_depth,
+        registered_condition_sha256: Sha256::digest(stage.registered_condition().as_bytes()).into(),
+        value_identity: report.value_identity.clone(),
+    })
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct PriorStage {
     phase: Option<PriorPhase>,
@@ -160,6 +290,8 @@ pub struct PriorStage {
     registered_condition_sha256: [u8; 32],
     task_condition_sha256: [u8; 32],
     pv: PackedMoves,
+    #[serde(skip)]
+    conditional_endpoint: Option<ConditionalEndpointFact>,
 }
 impl PriorStage {
     fn complete(&self) -> bool {
@@ -181,6 +313,9 @@ impl PriorStage {
     }
     pub fn completed_depth(&self) -> Option<u16> {
         self.completed_depth
+    }
+    pub fn conditional_endpoint(&self) -> Option<&ConditionalEndpointFact> {
+        self.conditional_endpoint.as_ref()
     }
 }
 
@@ -205,6 +340,10 @@ pub struct ReplayQueryPrior {
     readiness: PriorReadiness,
     work_returned_elapsed_ms: Option<u64>,
     work_returned_within_execution_window: Option<bool>,
+    #[serde(skip)]
+    native_work_started_at: Option<std::time::Instant>,
+    #[serde(skip)]
+    native_work_returned_at: Option<std::time::Instant>,
     /// Retained scalar facts do not fabricate a missing report or cost as zero.
     stage_count: usize,
     #[serde(serialize_with = "serialize_stages")]
@@ -240,6 +379,8 @@ impl Default for ReplayQueryPrior {
             stage_count: 0,
             work_returned_elapsed_ms: None,
             work_returned_within_execution_window: None,
+            native_work_started_at: None,
+            native_work_returned_at: None,
             stages: std::array::from_fn(|_| PriorStage::default()),
             opponent_anchor_ply: None,
             repaired_line: PackedMoves::default(),
@@ -263,6 +404,12 @@ impl ReplayQueryPrior {
         self.work_returned_elapsed_ms =
             u64::try_from(now.saturating_duration_since(started).as_millis()).ok();
         self.work_returned_within_execution_window = Some(now < execution);
+        self.native_work_returned_at = Some(now);
+    }
+    pub(super) fn observe_native_entry(&mut self, actual_entry: std::time::Instant) {
+        if self.native_work_started_at.is_none() {
+            self.native_work_started_at = Some(actual_entry);
+        }
     }
     pub(super) fn capture<M: RoleModel>(
         &mut self,
@@ -299,6 +446,7 @@ impl ReplayQueryPrior {
                 );
                 out.pv.capture(&report.pv, MAX_PV_MOVES)?;
             }
+            out.conditional_endpoint = live_endpoint_fact(owner, stage);
         }
         self.opponent_anchor_ply = owner.opponent_anchor_ply();
         self.repaired_line
@@ -337,6 +485,9 @@ impl ReplayQueryPrior {
     }
     pub fn readiness(&self) -> PriorReadiness {
         self.readiness
+    }
+    pub fn native_work_interval(&self) -> Option<(std::time::Instant, std::time::Instant)> {
+        Some((self.native_work_started_at?, self.native_work_returned_at?))
     }
     pub fn outcome(&self) -> PriorOutcome {
         self.outcome
@@ -762,6 +913,39 @@ fn classify_readiness(
 pub(super) mod tests {
     use super::super::CpuStageObservation;
     use super::*;
+    #[test]
+    fn live_fact_and_native_clock_are_not_imported_or_added_to_old_wire() {
+        let mut prior = ReplayQueryPrior::default();
+        let before = serde_json::to_value(&prior).unwrap();
+        assert!(prior.native_work_interval().is_none());
+        let now = std::time::Instant::now();
+        prior.observe_work_return(now, now + std::time::Duration::from_secs(1));
+        // A caller-supplied historical S is not actual native entry evidence.
+        assert!(prior.native_work_interval().is_none());
+        prior.observe_native_entry(now);
+        assert!(prior.native_work_interval().is_some());
+        let wire = serde_json::to_value(&prior).unwrap();
+        assert_eq!(
+            before.as_object().unwrap().keys().collect::<Vec<_>>(),
+            wire.as_object().unwrap().keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !wire
+                .as_object()
+                .unwrap()
+                .keys()
+                .any(|key| key.contains("native_work"))
+        );
+        for stage in &prior.stages {
+            assert!(stage.conditional_endpoint().is_none());
+            assert!(
+                serde_json::to_value(stage)
+                    .unwrap()
+                    .get("conditional_endpoint")
+                    .is_none()
+            );
+        }
+    }
 
     /// Controlled declarations only. This helper is never a production self-pin
     /// fallback or evidence of running ONNX/processes/strict parent admission.

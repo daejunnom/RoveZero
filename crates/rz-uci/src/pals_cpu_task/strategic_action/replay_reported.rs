@@ -161,6 +161,8 @@ impl StageWire {
             registered_condition_sha256: self.registered_condition_sha256,
             task_condition_sha256: self.task_condition_sha256,
             pv: packed(self.pv, MAX_PV_MOVES)?,
+            // Imported bytes cannot mint a live source-owned endpoint fact.
+            conditional_endpoint: None,
         })
     }
 }
@@ -195,6 +197,9 @@ impl ProjectionWire {
             readiness: self.readiness,
             work_returned_elapsed_ms: self.work_returned_elapsed_ms,
             work_returned_within_execution_window: self.work_returned_within_execution_window,
+            // Portable reports do not carry the live producer's local clock.
+            native_work_started_at: None,
+            native_work_returned_at: None,
             stage_count: self.stage_count,
             stages,
             opponent_anchor_ply: self.opponent_anchor_ply,

@@ -498,6 +498,15 @@ mod private_warm;
 pub use private_warm::{NativePrivateWarmObservation, NativePrivateWarmRevocation};
 
 #[cfg(feature = "onnx-cpu")]
+#[path = "pals_native/recorded_witness.rs"]
+mod recorded_witness;
+#[cfg(feature = "onnx-cpu")]
+pub use recorded_witness::{
+    NativeRecordedCpuPristineAck, NativeRecordedInputWitness, RECORDED_INPUT_WITNESS_SCHEMA,
+    RECORDED_INPUT_WITNESS_SCOPE, recorded_input_witness_source_digest,
+};
+
+#[cfg(feature = "onnx-cpu")]
 mod native {
     use super::private_warm::{NativeWarmState, WarmPhysical};
     use super::*;
@@ -543,6 +552,7 @@ mod native {
     const DEPLOYMENT_FROZEN_EPOCH: u64 = 1;
     static EPOCHS: AtomicU64 = AtomicU64::new(0x5041_4c53_0000_0000);
     static RULE_OWNERS: AtomicU64 = AtomicU64::new(0x5041_4c52_0000_0000);
+    static RECORDED_WITNESS_LEASES: AtomicU64 = AtomicU64::new(1);
     type NativeWorker = SingleWorker<PalsNativeCommand, Result<PalsNativeResult, BackendError>>;
     type NativePhysicalLease =
         PhysicalLease<PalsNativeCommand, Result<PalsNativeResult, BackendError>>;
@@ -596,6 +606,9 @@ mod native {
         new_game_resets: AtomicU64,
         in_flight: AtomicU64,
         game_generation: AtomicU64,
+        pending_game_target: AtomicU64,
+        game_lifecycle: Mutex<()>,
+        game_reset_failure: Mutex<Option<RoleError>>,
         request_high_water: AtomicU64,
         execution_high_water: AtomicU64,
         quarantined: AtomicBool,
@@ -1004,7 +1017,7 @@ mod native {
         Ok(())
     }
     fn accept_invocation_owner(
-        model: NativeRoleModel,
+        mut model: NativeRoleModel,
         budget: NativeInvocationBudget,
         cancel: &AtomicBool,
     ) -> Result<NativeRoleModel, NativeLoadFailure> {
@@ -1012,6 +1025,9 @@ mod native {
             let finish = Some(model.finish_handle());
             return Err(budget.failure(NativeLoadStage::PostConstruction, cause, cancel, finish));
         }
+        // This private binding is issued only by the actual invocation factory.
+        // A later caller cannot replace original S/E/W with a new relative window.
+        model.cpu_invocation_budget = Some(budget);
         Ok(model)
     }
     /// Owned opt-in input. Execution identity, namespace, Session and placement
@@ -2152,6 +2168,30 @@ mod native {
             }
         }
     }
+    fn require_recorded_nn_zero(stats: &NativeBackendStatsReceipt) -> Result<(), RoleError> {
+        if [
+            stats.admitted_role_requests,
+            stats.public_cache_hits,
+            stats.public_cache_misses,
+            stats.public_nn_runs_attempted,
+            stats.public_nn_runs_completed,
+            stats.public_nn_runs_failed_known,
+            stats.role_nn_runs_attempted,
+            stats.role_nn_runs_completed,
+            stats.role_nn_runs_failed_known,
+            stats.completed_nn_inputs,
+            stats.validated_public_outputs,
+            stats.validated_role_outputs,
+            stats.new_game_resets,
+            stats.live_public_cache_entries,
+        ]
+        .into_iter()
+        .any(|count| count != 0)
+        {
+            return Err(RoleError::Backend("Recorded CPU invocation already performed NN/cache/role work before pristine fence".into()));
+        }
+        Ok(())
+    }
     /// Bounded typed diagnostics. Library message text and paths are never
     /// copied into a portable receipt.
     #[derive(Clone, Debug, serde::Serialize)]
@@ -2165,6 +2205,62 @@ mod native {
         pub cause_truncated: Option<bool>,
     }
     impl WorkerOwner {
+        fn invalidate_game_observations(&self) {
+            *self.final_stats.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *self
+                .cuda_record_page_snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            *self
+                .cuda_record_page_snapshot_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        fn request_game_target(&self, target: u64) -> Result<(), RoleError> {
+            let _guard = self
+                .game_lifecycle
+                .lock()
+                .map_err(|_| RoleError::Unavailable)?;
+            if self.finishing.load(Ordering::Acquire) || self.shutdown.load(Ordering::Acquire) {
+                return Err(RoleError::Unavailable);
+            }
+            if target <= self.game_generation.load(Ordering::Acquire) {
+                return Err(RoleError::InvalidOutput);
+            }
+            self.game_generation.store(target, Ordering::Release);
+            self.pending_game_target.store(target, Ordering::Release);
+            self.invalidate_game_observations();
+            Ok(())
+        }
+        fn remember_game_reset_failure(&self, error: RoleError) -> RoleError {
+            let mut first = self
+                .game_reset_failure
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            first.get_or_insert(error).clone()
+        }
+        fn accept_game_target(&self, target: u64) -> Result<(), RoleError> {
+            if self.game_generation.load(Ordering::Acquire) != target
+                || self.pending_game_target.load(Ordering::Acquire) != target
+            {
+                return Err(RoleError::Backend(
+                    "PALS reset ACK target differs from current logical game".into(),
+                ));
+            }
+            if let Some(warm) = &self.private_warm {
+                warm.state.reset_after_known_fence(target)?;
+            }
+            // Old ACKs can never spend a newer target. Invalidate again before
+            // admitting fresh final observations after this actual reset fence.
+            self.invalidate_game_observations();
+            self.pending_game_target
+                .compare_exchange(target, 0, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| {
+                    RoleError::Backend("PALS pending reset target changed before ACK".into())
+                })?;
+            self.new_game_resets.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
         fn execution_receipt(&self) -> NativeExecutionReceipt {
             let mut receipt = self.execution.clone();
             let selected = self.startup_probe_timeout_ms.load(Ordering::Acquire);
@@ -2561,12 +2657,22 @@ mod native {
                 if self.owner.quarantined.load(Ordering::Acquire) {
                     return Err(RoleError::PhysicalCompletionUnknown);
                 }
-                if self
+                if let Some(error) = self
                     .owner
-                    .final_stats
+                    .game_reset_failure
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .is_some()
+                    .clone()
+                {
+                    return Err(error);
+                }
+                if self.owner.pending_game_target.load(Ordering::Acquire) == 0
+                    && self
+                        .owner
+                        .final_stats
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some()
                     && (self.owner.execution.cuda_loading_profile.is_none()
                         || self
                             .owner
@@ -2602,46 +2708,52 @@ mod native {
                     if Instant::now() >= until {
                         return Err(RoleError::Deadline);
                     }
+                    let pending_target = self.owner.pending_game_target.load(Ordering::Acquire);
                     let lease = worker
-                        .submit(
-                            if self.owner.execution.provider == "cuda"
-                                && !self.owner.final_mapping_confirmed.load(Ordering::Acquire)
+                        .submit(if pending_target != 0 {
+                            PalsNativeCommand::ResetTo(pending_target)
+                        } else if self.owner.execution.provider == "cuda"
+                            && !self.owner.final_mapping_confirmed.load(Ordering::Acquire)
+                        {
+                            PalsNativeCommand::VerifyRuntime
+                        } else if self.owner.execution.cuda_loading_profile.is_some()
+                            && self
+                                .owner
+                                .final_loading_mapping
+                                .lock()
+                                .map_err(|_| RoleError::PhysicalCompletionUnknown)?
+                                .is_none()
+                        {
+                            PalsNativeCommand::ObserveRuntimeMappings
+                        } else {
+                            #[cfg(feature = "experimental-io-binding")]
                             {
-                                PalsNativeCommand::VerifyRuntime
-                            } else if self.owner.execution.cuda_loading_profile.is_some()
-                                && self
-                                    .owner
-                                    .final_loading_mapping
-                                    .lock()
-                                    .map_err(|_| RoleError::PhysicalCompletionUnknown)?
-                                    .is_none()
-                            {
-                                PalsNativeCommand::ObserveRuntimeMappings
-                            } else {
-                                #[cfg(feature = "experimental-io-binding")]
+                                if self.owner.execution.cuda_record_pages.is_some()
+                                    && self
+                                        .owner
+                                        .cuda_record_page_snapshot
+                                        .lock()
+                                        .map_err(|_| RoleError::PhysicalCompletionUnknown)?
+                                        .is_none()
                                 {
-                                    if self.owner.execution.cuda_record_pages.is_some()
-                                        && self
-                                            .owner
-                                            .cuda_record_page_snapshot
-                                            .lock()
-                                            .map_err(|_| RoleError::PhysicalCompletionUnknown)?
-                                            .is_none()
-                                    {
-                                        PalsNativeCommand::SnapshotCudaRecordPages
-                                    } else {
-                                        PalsNativeCommand::SnapshotStats
-                                    }
-                                }
-                                #[cfg(not(feature = "experimental-io-binding"))]
-                                {
+                                    PalsNativeCommand::SnapshotCudaRecordPages
+                                } else {
                                     PalsNativeCommand::SnapshotStats
                                 }
-                            },
-                        )
+                            }
+                            #[cfg(not(feature = "experimental-io-binding"))]
+                            {
+                                PalsNativeCommand::SnapshotStats
+                            }
+                        })
                         .map_err(|error| {
                             self.owner.remember_failure(&error);
-                            model_error(error)
+                            let error = model_error(error);
+                            if pending_target != 0 {
+                                self.owner.remember_game_reset_failure(error)
+                            } else {
+                                error
+                            }
                         })?;
                     self.owner.in_flight.fetch_add(1, Ordering::AcqRel);
                     *slot = Some(lease);
@@ -2651,6 +2763,10 @@ mod native {
                     let expected_mapping =
                         matches!(lease.input(), PalsNativeCommand::ObserveRuntimeMappings);
                     let expected_stats = matches!(lease.input(), PalsNativeCommand::SnapshotStats);
+                    let expected_reset = match lease.input() {
+                        PalsNativeCommand::ResetTo(target) => Some(*target),
+                        _ => None,
+                    };
                     #[cfg(feature = "experimental-io-binding")]
                     let expected_pages =
                         matches!(lease.input(), PalsNativeCommand::SnapshotCudaRecordPages);
@@ -2659,6 +2775,13 @@ mod native {
                             self.owner.in_flight.fetch_sub(1, Ordering::AcqRel);
                             *slot = None;
                             match result {
+                                Ok(PalsNativeResult::ResetTo { game_generation })
+                                    if expected_reset == Some(game_generation) =>
+                                {
+                                    self.owner.accept_game_target(game_generation).map_err(
+                                        |error| self.owner.remember_game_reset_failure(error),
+                                    )?;
+                                }
                                 Ok(PalsNativeResult::RuntimeVerified)
                                     if self.owner.execution.provider == "cuda"
                                         && expected_verify =>
@@ -2695,7 +2818,10 @@ mod native {
                                         .final_stats
                                         .lock()
                                         .unwrap_or_else(|e| e.into_inner()) = Some(stats.into());
-                                    if self.owner.execution.cuda_record_pages.is_none() {
+                                    if self.owner.execution.cuda_record_pages.is_none()
+                                        && self.owner.pending_game_target.load(Ordering::Acquire)
+                                            == 0
+                                    {
                                         return Ok(());
                                     }
                                 }
@@ -2730,14 +2856,24 @@ mod native {
                                         .map_err(|_| RoleError::Unavailable)? = None;
                                 }
                                 Ok(_) => {
-                                    return Err(RoleError::Backend(
+                                    let error = RoleError::Backend(
                                         "PALS Stats lease received a different control response"
                                             .into(),
-                                    ));
+                                    );
+                                    return Err(if expected_reset.is_some() {
+                                        self.owner.remember_game_reset_failure(error)
+                                    } else {
+                                        error
+                                    });
                                 }
                                 Err(error) => {
                                     self.owner.remember_failure(&error);
-                                    return Err(model_error(error));
+                                    let error = model_error(error);
+                                    return Err(if expected_reset.is_some() {
+                                        self.owner.remember_game_reset_failure(error)
+                                    } else {
+                                        error
+                                    });
                                 }
                             }
                         }
@@ -2767,7 +2903,14 @@ mod native {
             }
         }
         pub fn finish(&self, until: Instant) -> Result<NativeRoleReceipt, RoleError> {
-            self.owner.finishing.store(true, Ordering::Release);
+            {
+                let _guard = self
+                    .owner
+                    .game_lifecycle
+                    .lock()
+                    .map_err(|_| RoleError::PhysicalCompletionUnknown)?;
+                self.owner.finishing.store(true, Ordering::Release);
+            }
             if self
                 .owner
                 .private_warm
@@ -2795,8 +2938,19 @@ mod native {
                 return Err(RoleError::PhysicalCompletionUnknown);
             }
             if self.owner.shutdown.load(Ordering::Acquire) {
+                if let Some(error) = self
+                    .owner
+                    .game_reset_failure
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                {
+                    return Err(error);
+                }
                 let receipt = self.receipt();
-                return if receipt.backend_stats.is_some() {
+                return if receipt.backend_stats.is_some()
+                    && self.owner.pending_game_target.load(Ordering::Acquire) == 0
+                {
                     Ok(receipt)
                 } else {
                     Err(RoleError::Backend(
@@ -2857,6 +3011,13 @@ mod native {
                             return Err(RoleError::PhysicalCompletionUnknown);
                         }
                         self.owner.shutdown.store(true, Ordering::Release);
+                        if stats_failure.is_none()
+                            && self.owner.pending_game_target.load(Ordering::Acquire) != 0
+                        {
+                            return Err(RoleError::Backend(
+                                "PALS shutdown has an unacknowledged game target".into(),
+                            ));
+                        }
                         return stats_failure.map_or_else(|| Ok(self.receipt()), Err);
                     }
                     Poll::Ready(Err(error)) => {
@@ -3208,6 +3369,8 @@ mod native {
         startup_loading_elapsed_ns: Option<u64>,
         startup_clock: Option<Instant>,
         startup_diagnostic: Option<NativeStartupFailureDiagnostic>,
+        cpu_invocation_budget: Option<NativeInvocationBudget>,
+        cpu_invocation_load_interval: Option<(Instant, Instant)>,
     }
     impl NativeRoleModel {
         pub fn load_pinned(
@@ -3258,6 +3421,7 @@ mod native {
             budget: NativeInvocationBudget,
             cancel: &AtomicBool,
         ) -> Result<Self, NativeLoadFailure> {
+            let load_started = Instant::now();
             validate_cpu_fresh_invocation(&config, options, budget, cancel)?;
             validate_cpu_invocation_bundle(pin.bundle_digest())
                 .map_err(|cause| budget.failure(NativeLoadStage::Admission, cause, cancel, None))?;
@@ -3312,7 +3476,21 @@ mod native {
             // The returned model owns exactly the Arc captured before runtime
             // initialization. Post-check uses that owner, with no cleanup call
             // or new relative deadline hidden inside the failure path.
-            accept_invocation_owner(model, budget, cancel)
+            let mut model = accept_invocation_owner(model, budget, cancel)?;
+            let load_finished = Instant::now();
+            if let Err(cause) = budget.check_at(load_finished, cancel) {
+                let finish = Some(model.finish_handle());
+                return Err(budget.failure(
+                    NativeLoadStage::PostConstruction,
+                    cause,
+                    cancel,
+                    finish,
+                ));
+            }
+            // Actual factory entry through successful owner construction and
+            // original-clock admission. Generic loaders never fill this fact.
+            model.cpu_invocation_load_interval = Some((load_started, load_finished));
+            Ok(model)
         }
         /// Explicit CPU-only approximate artifact domain. A legacy Fresh
         /// manifest never silently gains a seed input or frozen query policy.
@@ -3735,6 +3913,9 @@ mod native {
                 new_game_resets: AtomicU64::new(0),
                 in_flight: AtomicU64::new(0),
                 game_generation: AtomicU64::new(game),
+                pending_game_target: AtomicU64::new(0),
+                game_lifecycle: Mutex::new(()),
+                game_reset_failure: Mutex::new(None),
                 request_high_water: AtomicU64::new(0),
                 execution_high_water: AtomicU64::new(0),
                 quarantined: AtomicBool::new(false),
@@ -3833,6 +4014,8 @@ mod native {
                 startup_loading_elapsed_ns: None,
                 startup_clock: None,
                 startup_diagnostic: None,
+                cpu_invocation_budget: None,
+                cpu_invocation_load_interval: None,
             })
         }
         pub fn finish_handle(&self) -> NativeRoleFinishHandle {
@@ -3842,6 +4025,11 @@ mod native {
         }
         pub fn model_epoch(&self) -> [u8; 32] {
             self.model_epoch
+        }
+        /// Actual CPU invocation-factory interval in the caller's Instant domain.
+        /// None is unobserved, including generic loaders; it is never zero cost.
+        pub fn invocation_load_interval(&self) -> Option<(Instant, Instant)> {
+            self.cpu_invocation_load_interval
         }
         pub fn source_identity(&self) -> NativeRoleSourceIdentity {
             NativeRoleSourceIdentity {
@@ -3853,6 +4041,330 @@ mod native {
                 model_configuration: PalsModelConfig::baseline(),
                 trained: self.owner.trained,
                 execution: self.owner.execution_receipt(),
+            }
+        }
+        /// Observe actual NN-zero counters immediately before a borrowed captured
+        /// input loop. The ACK proves this fence only; it does not promise that a
+        /// caller can release the model borrow and retain future pristine state.
+        pub fn witness_recorded_cpu_pristine(
+            &mut self,
+            budget: NativeInvocationBudget,
+            cancel: &AtomicBool,
+        ) -> Result<NativeRecordedCpuPristineAck, RoleError> {
+            let started = Instant::now();
+            budget.check_at(started, cancel)?;
+            let load = self.cpu_invocation_load_interval.ok_or_else(|| RoleError::Backend(
+                "Recorded pristine ACK requires the actual CPU invocation factory load interval".into()
+            ))?;
+            if self.cpu_invocation_budget != Some(budget)
+                || self.owner.execution.provider != "cpu"
+                || self.owner.execution.runtime_bundle_sha256.is_some()
+                || self.owner.execution.device_public_memory
+                || self.owner.execution.host_record_pages.is_some()
+                || self.owner.execution.private_warm.is_some()
+                || self.owner.execution.cuda_record_pages.is_some()
+                || self.owner.private_warm.is_some()
+                || self.drain_limit != budget.cleanup_reserve()
+                || self.sequence != 0
+                || self.owner.physical_completed.load(Ordering::Acquire) != 0
+                || self.owner.consumed.load(Ordering::Acquire) != 0
+                || self
+                    .owner
+                    .observer
+                    .lock()
+                    .map_err(|_| RoleError::Unavailable)?
+                    .is_some()
+                || load.0 < budget.started()
+                || load.1 < load.0
+                || load.1 > started
+            {
+                return Err(RoleError::Backend("Recorded pristine ACK requires original CPU Fresh factory, clock and unused product owner".into()));
+            }
+            let stats = self.recorded_witness_stats(budget, cancel)?;
+            require_recorded_nn_zero(&stats)?;
+            let finished = Instant::now();
+            budget.check_at(finished, cancel)?;
+            let ns = |at: Instant| {
+                u64::try_from(at.duration_since(budget.started()).as_nanos())
+                    .map_err(|_| RoleError::InvalidOutput)
+            };
+            let ack = NativeRecordedCpuPristineAck {
+                schema: "rz-pals-native-recorded-cpu-pristine-ack/1",
+                observation: "actual_exclusive_cpu_worker_snapshot_stats_ready;nn_zero_at_this_fence;future_exclusive_model_borrow_required",
+                source_identity: self.source_identity(),
+                process_epoch: self.epoch.0,
+                backend_stats: stats,
+                started_elapsed_ns: ns(started)?,
+                completed_elapsed_ns: ns(finished)?,
+                physical_completion_confirmed: true,
+                invocation_budget: budget,
+                invocation_load_interval: load,
+                work_started_at: started,
+                work_finished_at: finished,
+            };
+            budget.check_at(Instant::now(), cancel)?;
+            Ok(ack)
+        }
+        /// Execute the exact immutable captured tensor in a separate observation
+        /// namespace. Historical query[7] is preserved, not regenerated as the
+        /// current remaining deadline. The typed result proves only this actual
+        /// CPU inference; the capture owner must separately bind source bytes,
+        /// Rules, parent/request registration and independent CPU conditions.
+        /// No product RoleQuery, search consumption or startup-probe count is
+        /// manufactured by this witness-only path.
+        pub fn witness_recorded_cpu_input(
+            &mut self,
+            input: PalsModelInput,
+            expected_input_key: [u8; 32],
+            budget: NativeInvocationBudget,
+            cancel: &AtomicBool,
+        ) -> Result<NativeRecordedInputWitness, RoleError> {
+            budget.check_at(Instant::now(), cancel)?;
+            if self.cpu_invocation_budget != Some(budget)
+                || self.owner.execution.provider != "cpu"
+                || self.owner.execution.runtime_bundle_sha256.is_some()
+                || self.owner.execution.device_public_memory
+                || self.owner.execution.host_record_pages.is_some()
+                || self.owner.execution.private_warm.is_some()
+                || self.owner.execution.cuda_record_pages.is_some()
+                || self.owner.private_warm.is_some()
+                || self.drain_limit != budget.cleanup_reserve()
+                || self.sequence != 0
+                || self.owner.physical_completed.load(Ordering::Acquire) != 0
+                || self.owner.consumed.load(Ordering::Acquire) != 0
+                || self
+                    .owner
+                    .observer
+                    .lock()
+                    .map_err(|_| RoleError::Unavailable)?
+                    .is_some()
+                || !matches!(input.role, PalsRole::Proposer | PalsRole::Critic)
+                || input.model_epoch != self.model_epoch
+            {
+                return Err(RoleError::Backend(
+                    "Recorded input witness requires CPU Fresh P/C owner, exact model and original cleanup reserve".into(),
+                ));
+            }
+            input
+                .validate(&PalsModelConfig::baseline())
+                .map_err(model_error)?;
+            if input
+                .canonical_input_key(&PalsModelConfig::baseline())
+                .map_err(model_error)?
+                != expected_input_key
+            {
+                return Err(RoleError::Backend(
+                    "Recorded exact input fingerprint differs".into(),
+                ));
+            }
+            let work_started_at = Instant::now();
+            budget.check_at(work_started_at, cancel)?;
+            let before = self.recorded_witness_stats(budget, cancel)?;
+            let lease_sequence = next(&RECORDED_WITNESS_LEASES)?;
+            let (returned, actual_input) =
+                self.recorded_witness_command(PalsNativeCommand::Evaluate(input), budget, cancel)?;
+            let PalsNativeResult::Evaluation(raw_output) = returned else {
+                return Err(RoleError::InvalidOutput);
+            };
+            let input = actual_input.ok_or(RoleError::InvalidOutput)?;
+            // Decode the immutable physical job, never a reconstructed RoleQuery.
+            raw_output
+                .decode(&input, &PalsModelConfig::baseline())
+                .map_err(model_error)?;
+            if input
+                .canonical_input_key(&PalsModelConfig::baseline())
+                .map_err(model_error)?
+                != expected_input_key
+            {
+                return Err(RoleError::InvalidOutput);
+            }
+            budget.check_at(Instant::now(), cancel)?;
+            let after = self.recorded_witness_stats(budget, cancel)?;
+            let public = after
+                .public_nn_runs_completed
+                .checked_sub(before.public_nn_runs_completed)
+                .ok_or(RoleError::InvalidOutput)?;
+            if public > 1
+                || after
+                    .public_nn_runs_attempted
+                    .checked_sub(before.public_nn_runs_attempted)
+                    != Some(public)
+                || after
+                    .role_nn_runs_attempted
+                    .checked_sub(before.role_nn_runs_attempted)
+                    != Some(1)
+                || after
+                    .role_nn_runs_completed
+                    .checked_sub(before.role_nn_runs_completed)
+                    != Some(1)
+                || after
+                    .admitted_role_requests
+                    .checked_sub(before.admitted_role_requests)
+                    != Some(1)
+                || after
+                    .completed_nn_inputs
+                    .checked_sub(before.completed_nn_inputs)
+                    != public.checked_add(1)
+                || after.public_nn_runs_failed_known != before.public_nn_runs_failed_known
+                || after.role_nn_runs_failed_known != before.role_nn_runs_failed_known
+                || after
+                    .validated_role_outputs
+                    .checked_sub(before.validated_role_outputs)
+                    != Some(1)
+            {
+                return Err(RoleError::Backend(
+                    "Recorded witness actual graph counters differ".into(),
+                ));
+            }
+            let raw_output_bit_projection = crate::pals_cpu_task::strategic_action::native_replay::native_raw_output_bit_projection(&raw_output)
+                .map_err(|error| RoleError::Backend(format!("Recorded raw projection: {error:?}")))?;
+            let work_finished_at = Instant::now();
+            budget.check_at(work_finished_at, cancel)?;
+            let ns = |at: Instant| {
+                u64::try_from(at.saturating_duration_since(budget.started()).as_nanos())
+                    .map_err(|_| RoleError::InvalidOutput)
+            };
+            let witness = NativeRecordedInputWitness {
+                schema: RECORDED_INPUT_WITNESS_SCHEMA,
+                scope: RECORDED_INPUT_WITNESS_SCOPE,
+                implementation_sha256: recorded_input_witness_source_digest(),
+                source_identity: self.source_identity(),
+                process_epoch: self.epoch.0,
+                lease_sequence,
+                input_key: expected_input_key,
+                historical_deadline_feature_bits: input.query[7].to_bits(),
+                input,
+                raw_output,
+                raw_output_bit_projection,
+                started_elapsed_ns: ns(work_started_at)?,
+                completed_elapsed_ns: ns(work_finished_at)?,
+                execution_until_elapsed_ns: ns(budget.execution_until())?,
+                whole_until_elapsed_ns: ns(budget.whole_until())?,
+                physical_completion_confirmed: true,
+                backend_stats_before: before,
+                backend_stats_after: after,
+                invocation_budget: budget,
+                invocation_load_interval: self.cpu_invocation_load_interval,
+                invocation_load_elapsed_ns: self
+                    .cpu_invocation_load_interval
+                    .map(|(started, finished)| -> Result<_, RoleError> {
+                        Ok((ns(started)?, ns(finished)?))
+                    })
+                    .transpose()?,
+                work_started_at,
+                work_finished_at,
+            };
+            // Final live gate after allocating the observation. A late or
+            // cancelled return never exposes a successful typed witness.
+            budget.check_at(Instant::now(), cancel)?;
+            Ok(witness)
+        }
+        fn recorded_witness_stats(
+            &mut self,
+            budget: NativeInvocationBudget,
+            cancel: &AtomicBool,
+        ) -> Result<NativeBackendStatsReceipt, RoleError> {
+            match self
+                .recorded_witness_command(PalsNativeCommand::SnapshotStats, budget, cancel)?
+                .0
+            {
+                PalsNativeResult::Stats(stats) => {
+                    stats.validate().map_err(model_error)?;
+                    Ok(stats.into())
+                }
+                _ => Err(RoleError::InvalidOutput),
+            }
+        }
+        fn recorded_witness_command(
+            &mut self,
+            command: PalsNativeCommand,
+            budget: NativeInvocationBudget,
+            cancel: &AtomicBool,
+        ) -> Result<(PalsNativeResult, Option<PalsModelInput>), RoleError> {
+            budget.check_at(Instant::now(), cancel)?;
+            if self.owner.quarantined.load(Ordering::Acquire) {
+                return Err(RoleError::PhysicalCompletionUnknown);
+            }
+            if self.unusable
+                || !self.owner.startup_ready.load(Ordering::Acquire)
+                || self.owner.finishing.load(Ordering::Acquire)
+                || self.owner.shutdown.load(Ordering::Acquire)
+                || self.control_lease.is_some()
+                || self.runtime.state().executions != 0
+                || self.owner.in_flight.load(Ordering::Acquire) != 0
+                || self.delivered_request.is_some()
+                || self.pending_new_game
+            {
+                return Err(RoleError::Unavailable);
+            }
+            // The input/session is retained by this actual lease through Ready
+            // or quarantine. No now+reserve timeout replaces original W.
+            self.control_lease = Some({
+                let mut worker = self
+                    .owner
+                    .worker
+                    .lock()
+                    .map_err(|_| RoleError::Unavailable)?;
+                let _game_guard = self
+                    .owner
+                    .game_lifecycle
+                    .lock()
+                    .map_err(|_| RoleError::Unavailable)?;
+                budget.check_at(Instant::now(), cancel)?;
+                if self.owner.finishing.load(Ordering::Acquire)
+                    || self.owner.shutdown.load(Ordering::Acquire)
+                {
+                    return Err(RoleError::Unavailable);
+                }
+                let lease = worker.submit(command).map_err(model_error)?;
+                self.owner.in_flight.fetch_add(1, Ordering::AcqRel);
+                lease
+            });
+            let mut logical_error = None;
+            loop {
+                if logical_error.is_none() {
+                    logical_error = budget.check_at(Instant::now(), cancel).err();
+                }
+                let lease = self
+                    .control_lease
+                    .as_mut()
+                    .expect("admitted recorded witness lease");
+                match lease.poll() {
+                    PhysicalPoll::Ready(result) => {
+                        self.owner.in_flight.fetch_sub(1, Ordering::AcqRel);
+                        let actual_input = match lease.input() {
+                            PalsNativeCommand::Evaluate(input) => Some(input.clone()),
+                            _ => None,
+                        };
+                        self.control_lease = None;
+                        let result = result.map_err(|error| {
+                            self.owner.remember_failure(&error);
+                            model_error(error)
+                        })?;
+                        if let Some(error) = logical_error {
+                            return Err(error);
+                        }
+                        budget.check_at(Instant::now(), cancel)?;
+                        return Ok((result, actual_input));
+                    }
+                    PhysicalPoll::Quarantined | PhysicalPoll::Consumed => {
+                        if let Ok(Some(error)) = lease.quarantine_cause() {
+                            self.owner.remember_failure(&error);
+                        }
+                        self.owner.quarantined.store(true, Ordering::Release);
+                        self.unusable = true;
+                        return Err(RoleError::PhysicalCompletionUnknown);
+                    }
+                    PhysicalPoll::Pending => {}
+                }
+                if Instant::now() >= budget.whole_until() {
+                    // Retain the actual lease and worker closure/session/input.
+                    // A logical cancel or E expiry never confirms physical end.
+                    self.owner.quarantined.store(true, Ordering::Release);
+                    self.unusable = true;
+                    return Err(RoleError::PhysicalCompletionUnknown);
+                }
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
         pub fn set_observer(
@@ -4040,11 +4552,39 @@ mod native {
                         .ok_or(RoleError::Unavailable)?
                         .cuda_placement_witness = Some(witness);
                 }
-                if !matches!(
-                    self.startup_command(PalsNativeCommand::NewGame, until)?,
-                    PalsNativeResult::NewGame
-                ) {
-                    return Err(RoleError::InvalidOutput);
+                let pending_target = self.owner.pending_game_target.load(Ordering::Acquire);
+                if pending_target == 0 {
+                    // Preserve the existing physical 0 -> logical 1 startup.
+                    if !matches!(
+                        self.startup_command(PalsNativeCommand::NewGame, until)?,
+                        PalsNativeResult::NewGame
+                    ) {
+                        return Err(RoleError::InvalidOutput);
+                    }
+                } else {
+                    match self
+                        .startup_command(PalsNativeCommand::ResetTo(pending_target), until)
+                        .map_err(|error| {
+                            if error == RoleError::PhysicalCompletionUnknown {
+                                error
+                            } else {
+                                self.owner.remember_game_reset_failure(error)
+                            }
+                        })? {
+                        PalsNativeResult::ResetTo { game_generation }
+                            if game_generation == pending_target =>
+                        {
+                            self.owner
+                                .accept_game_target(game_generation)
+                                .map_err(|error| self.owner.remember_game_reset_failure(error))?;
+                            self.pending_new_game = false;
+                        }
+                        _ => {
+                            return Err(self
+                                .owner
+                                .remember_game_reset_failure(RoleError::InvalidOutput));
+                        }
+                    }
                 }
                 self.owner
                     .startup_probe
@@ -4185,6 +4725,7 @@ mod native {
                 PalsNativeCommand::ObserveRuntimeMappings => "runtime_loading_mapping",
                 PalsNativeCommand::VerifyCudaPlacement => "cuda_placement_audit",
                 PalsNativeCommand::NewGame => "new_game_reset",
+                PalsNativeCommand::ResetTo(_) => "explicit_game_reset",
                 PalsNativeCommand::SnapshotStats => "backend_stats",
                 #[cfg(feature = "experimental-io-binding")]
                 PalsNativeCommand::SnapshotCudaRecordPages => "cuda_record_pages_observation",
@@ -4254,6 +4795,7 @@ mod native {
             }
             if self.runtime.state().executions != 0
                 || self.owner.in_flight.load(Ordering::Acquire) != 0
+                || self.control_lease.is_some()
             {
                 return Err(RoleError::Unavailable);
             }
@@ -4390,15 +4932,43 @@ mod native {
                 self.owner.quarantined.store(true, Ordering::Release);
                 return Err(RoleError::PhysicalCompletionUnknown);
             }
-            self.control_lease = Some(
-                self.owner
-                    .worker
+            if self.control_lease.is_some() {
+                self.unusable = true;
+                self.owner.quarantined.store(true, Ordering::Release);
+                return Err(RoleError::PhysicalCompletionUnknown);
+            }
+            let target = self.game;
+            self.control_lease = Some({
+                let mut worker = self.owner.worker.lock().map_err(|_| {
+                    RoleError::Backend("PALS cache-reset owner lock poisoned".into())
+                })?;
+                let _game_guard = self
+                    .owner
+                    .game_lifecycle
                     .lock()
-                    .map_err(|_| RoleError::Backend("PALS cache-reset owner lock poisoned".into()))?
-                    .submit(PalsNativeCommand::NewGame)
-                    .map_err(model_error)?,
-            );
-            self.owner.in_flight.fetch_add(1, Ordering::AcqRel);
+                    .map_err(|_| RoleError::Unavailable)?;
+                if canceled.load(Ordering::Acquire) {
+                    return Err(RoleError::Canceled);
+                }
+                if Instant::now() >= until {
+                    return Err(RoleError::Deadline);
+                }
+                if self.owner.finishing.load(Ordering::Acquire)
+                    || self.owner.shutdown.load(Ordering::Acquire)
+                {
+                    return Err(RoleError::Unavailable);
+                }
+                let lease = match worker.submit(PalsNativeCommand::ResetTo(target)) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        self.owner.remember_failure(&error);
+                        self.unusable = true;
+                        return Err(self.owner.remember_game_reset_failure(model_error(error)));
+                    }
+                };
+                self.owner.in_flight.fetch_add(1, Ordering::AcqRel);
+                lease
+            });
             let mut terminal = None;
             let mut drain_until = None;
             loop {
@@ -4422,24 +4992,37 @@ mod native {
                         self.owner.in_flight.fetch_sub(1, Ordering::AcqRel);
                         self.control_lease = None;
                         match result {
-                            Ok(PalsNativeResult::NewGame) => {
-                                if let Some(warm) = &self.owner.private_warm {
-                                    warm.state.reset_after_known_fence(self.game)?;
+                            Ok(PalsNativeResult::ResetTo { game_generation })
+                                if game_generation == target =>
+                            {
+                                if let Err(error) = self.owner.accept_game_target(game_generation) {
+                                    self.unusable = true;
+                                    return Err(self.owner.remember_game_reset_failure(error));
                                 }
                                 self.pending_new_game = false;
-                                self.owner.new_game_resets.fetch_add(1, Ordering::AcqRel);
+                                if terminal.is_none() && canceled.load(Ordering::Acquire) {
+                                    self.owner.canceled.fetch_add(1, Ordering::AcqRel);
+                                    terminal = Some(RoleError::Canceled);
+                                } else if terminal.is_none() && Instant::now() >= until {
+                                    self.owner.expired.fetch_add(1, Ordering::AcqRel);
+                                    terminal = Some(RoleError::Deadline);
+                                }
                                 return terminal.map_or(Ok(()), Err);
                             }
                             Ok(_) => {
                                 self.unusable = true;
-                                return Err(RoleError::Backend(
-                                    "PALS reset lease received a different response".into(),
+                                return Err(self.owner.remember_game_reset_failure(
+                                    RoleError::Backend(
+                                        "PALS reset lease received a different response".into(),
+                                    ),
                                 ));
                             }
                             Err(error) => {
                                 self.owner.remember_failure(&error);
                                 self.unusable = true;
-                                return Err(model_error(error));
+                                return Err(self
+                                    .owner
+                                    .remember_game_reset_failure(model_error(error)));
                             }
                         }
                     }
@@ -4976,11 +5559,20 @@ mod native {
             }
         }
         fn new_game(&mut self) {
+            if self.owner.finishing.load(Ordering::Acquire)
+                || self.owner.shutdown.load(Ordering::Acquire)
+            {
+                self.unusable = true;
+                return;
+            }
             let _ = self.close_unconsumed(NativeRoleRejection::GameReset);
             match self.game.checked_add(1) {
                 Some(value) => {
+                    if self.owner.request_game_target(value).is_err() {
+                        self.unusable = true;
+                        return;
+                    }
                     self.game = value;
-                    self.owner.game_generation.store(value, Ordering::Release);
                     self.pending_new_game = true;
                 }
                 None => self.unusable = true,
@@ -4989,6 +5581,12 @@ mod native {
             // epoch and execution/request high-water marks never reset.
         }
         fn new_game_with_generation(&mut self, generation: Option<u64>) {
+            if self.owner.finishing.load(Ordering::Acquire)
+                || self.owner.shutdown.load(Ordering::Acquire)
+            {
+                self.unusable = true;
+                return;
+            }
             if self.owner.private_warm.is_none() {
                 self.new_game();
                 return;
@@ -4996,8 +5594,11 @@ mod native {
             let _ = self.close_unconsumed(NativeRoleRejection::GameReset);
             match generation {
                 Some(game) if game > self.game => {
+                    if self.owner.request_game_target(game).is_err() {
+                        self.unusable = true;
+                        return;
+                    }
                     self.game = game;
-                    self.owner.game_generation.store(game, Ordering::Release);
                     self.pending_new_game = true;
                 }
                 _ => self.unusable = true,
@@ -6327,6 +6928,9 @@ mod native {
                 new_game_resets: AtomicU64::new(0),
                 in_flight: AtomicU64::new(0),
                 game_generation: AtomicU64::new(1),
+                pending_game_target: AtomicU64::new(0),
+                game_lifecycle: Mutex::new(()),
+                game_reset_failure: Mutex::new(None),
                 request_high_water: AtomicU64::new(0),
                 execution_high_water: AtomicU64::new(0),
                 quarantined: AtomicBool::new(false),
@@ -6432,6 +7036,8 @@ mod native {
                 startup_loading_elapsed_ns: None,
                 startup_clock: None,
                 startup_diagnostic: None,
+                cpu_invocation_budget: None,
+                cpu_invocation_load_interval: None,
             }
         }
         fn output(input: &PalsModelInput) -> PalsNativeResult {
@@ -6443,6 +7049,396 @@ mod native {
                 task_logits: None,
                 private_latent: vec![0.0; PalsModelConfig::baseline().latent_elements()],
             })
+        }
+        /// These fixtures exercise the new lease guards with a mock physical
+        /// worker; they do not attest actual ORT inference or source capture.
+        fn recorded_fixture_model(
+            canceled_on_evaluate: Option<Arc<AtomicBool>>,
+            invalid_raw: bool,
+        ) -> NativeRoleModel {
+            let mut stats = PalsBackendStats::default();
+            fixture_model(move |command| match command {
+                PalsNativeCommand::Evaluate(input) => {
+                    stats.admitted_role_requests += 1;
+                    stats.public_cache_misses += 1;
+                    stats.public_nn_runs_attempted += 1;
+                    stats.public_nn_runs_completed += 1;
+                    stats.role_nn_runs_attempted += 1;
+                    stats.role_nn_runs_completed += 1;
+                    stats.completed_nn_inputs += 2;
+                    stats.validated_public_outputs += 1;
+                    stats.validated_role_outputs += 1;
+                    if let Some(cancel) = &canceled_on_evaluate {
+                        cancel.store(true, Ordering::Release);
+                    }
+                    let mut result = output(input);
+                    if invalid_raw && let PalsNativeResult::Evaluation(raw) = &mut result {
+                        raw.private_latent.clear();
+                    }
+                    PhysicalRun::Complete(Ok(result))
+                }
+                PalsNativeCommand::SnapshotStats => {
+                    PhysicalRun::Complete(Ok(PalsNativeResult::Stats(stats.clone())))
+                }
+                PalsNativeCommand::VerifyRuntime => {
+                    PhysicalRun::Complete(Ok(PalsNativeResult::RuntimeVerified))
+                }
+                PalsNativeCommand::NewGame => PhysicalRun::Complete(Ok(PalsNativeResult::NewGame)),
+                PalsNativeCommand::ResetTo(target) => {
+                    PhysicalRun::Complete(Ok(PalsNativeResult::ResetTo {
+                        game_generation: *target,
+                    }))
+                }
+                _ => unexpected_cuda_placement(),
+            })
+        }
+        fn recorded_fixture_budget() -> NativeInvocationBudget {
+            let started = Instant::now();
+            let execution = started + Duration::from_secs(2);
+            NativeInvocationBudget::new(
+                started,
+                execution,
+                execution + Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .unwrap()
+        }
+        fn recorded_fixture_input(cancel: &AtomicBool) -> PalsModelInput {
+            let position = Position::startpos();
+            let legal = position.legal_moves();
+            let mut input = prepare_role_input(
+                &query(&position, &legal, cancel),
+                NativeQueryKind::Propose,
+                [3; 32],
+            )
+            .unwrap();
+            // Historical data deliberately differs from the current live E.
+            input.query[7] = 123.25;
+            input
+        }
+        #[test]
+        fn recorded_witness_requires_the_original_actual_factory_budget() {
+            let cancel = AtomicBool::new(false);
+            let budget = recorded_fixture_budget();
+            let mut model = recorded_fixture_model(None, false);
+            let input = recorded_fixture_input(&cancel);
+            let key = input
+                .canonical_input_key(&PalsModelConfig::baseline())
+                .unwrap();
+            assert!(
+                model
+                    .witness_recorded_cpu_input(input.clone(), key, budget, &cancel)
+                    .is_err()
+            );
+            assert_eq!(model.owner.in_flight.load(Ordering::Acquire), 0);
+            let mut model = accept_invocation_owner(model, budget, &cancel).unwrap();
+            let replacement = recorded_fixture_budget();
+            assert!(
+                model
+                    .witness_recorded_cpu_input(input, key, replacement, &cancel)
+                    .is_err()
+            );
+            assert_eq!(model.owner.in_flight.load(Ordering::Acquire), 0);
+            let receipt = model.finish_handle().finish(budget.whole_until()).unwrap();
+            assert_eq!(receipt.backend_stats.unwrap().completed_nn_inputs, 0);
+        }
+        #[test]
+        fn recorded_pristine_gate_rejects_generic_owner_and_cancel_before_control() {
+            let mut model = fixture_model(binding_fixture_command);
+            let budget = recorded_fixture_budget();
+            let cancel = AtomicBool::new(false);
+            assert!(matches!(
+                model.witness_recorded_cpu_pristine(budget, &cancel),
+                Err(RoleError::Backend(_))
+            ));
+            assert_eq!(model.owner.in_flight.load(Ordering::Acquire), 0);
+            assert!(model.control_lease.is_none());
+            cancel.store(true, Ordering::Release);
+            assert!(matches!(
+                model.witness_recorded_cpu_pristine(budget, &cancel),
+                Err(RoleError::Canceled)
+            ));
+            let done = model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(done.physically_completed_role_calls, 0);
+            assert_eq!(done.backend_stats.unwrap().completed_nn_inputs, 0);
+        }
+        #[test]
+        fn recorded_pristine_counters_refuse_any_previous_graph_or_cache_work() {
+            let zero: NativeBackendStatsReceipt = PalsBackendStats::default().into();
+            assert!(require_recorded_nn_zero(&zero).is_ok());
+            for mutation in 0..14 {
+                let mut stats = zero.clone();
+                match mutation {
+                    0 => stats.admitted_role_requests = 1,
+                    1 => stats.public_cache_hits = 1,
+                    2 => stats.public_cache_misses = 1,
+                    3 => stats.public_nn_runs_attempted = 1,
+                    4 => stats.public_nn_runs_completed = 1,
+                    5 => stats.public_nn_runs_failed_known = 1,
+                    6 => stats.role_nn_runs_attempted = 1,
+                    7 => stats.role_nn_runs_completed = 1,
+                    8 => stats.role_nn_runs_failed_known = 1,
+                    9 => stats.completed_nn_inputs = 1,
+                    10 => stats.validated_public_outputs = 1,
+                    11 => stats.validated_role_outputs = 1,
+                    12 => stats.new_game_resets = 1,
+                    _ => stats.live_public_cache_entries = 1,
+                }
+                assert!(require_recorded_nn_zero(&stats).is_err());
+            }
+        }
+        #[test]
+        fn recorded_witness_preserves_historical_input_bits_and_actual_graph_work() {
+            let cancel = AtomicBool::new(false);
+            let budget = recorded_fixture_budget();
+            let model = recorded_fixture_model(None, false);
+            let mut model = accept_invocation_owner(model, budget, &cancel).unwrap();
+            let input = recorded_fixture_input(&cancel);
+            let key = input
+                .canonical_input_key(&PalsModelConfig::baseline())
+                .unwrap();
+            let witness = model
+                .witness_recorded_cpu_input(input, key, budget, &cancel)
+                .unwrap();
+            assert_eq!(
+                witness.historical_deadline_feature_bits(),
+                123.25f32.to_bits()
+            );
+            assert_eq!(witness.input().query[7].to_bits(), 123.25f32.to_bits());
+            assert_eq!(witness.input_key(), key);
+            assert_eq!(witness.invocation_budget(), budget);
+            assert!(witness.work_started_at() >= budget.started());
+            assert!(witness.work_finished_at() < budget.execution_until());
+            assert!(witness.physical_completion_confirmed());
+            assert_eq!(witness.backend_stats_before().completed_nn_inputs, 0);
+            assert_eq!(witness.backend_stats_after().completed_nn_inputs, 2);
+            assert!(witness.raw_output_bit_projection().len() > 32 * 1024);
+            let receipt = model.finish_handle().finish(budget.whole_until()).unwrap();
+            assert!(receipt.physical_shutdown_confirmed);
+            assert_eq!(receipt.physically_completed_role_calls, 0);
+            assert_eq!(receipt.search_consumed_role_inputs, 0);
+            assert!(receipt.startup_probe.is_none());
+            assert_eq!(receipt.backend_stats.unwrap().completed_nn_inputs, 2);
+        }
+        #[test]
+        fn recorded_witness_refuses_changed_bits_epoch_and_nonfinite_before_admission() {
+            let cancel = AtomicBool::new(false);
+            let budget = recorded_fixture_budget();
+            let model = recorded_fixture_model(None, false);
+            let mut model = accept_invocation_owner(model, budget, &cancel).unwrap();
+            let input = recorded_fixture_input(&cancel);
+            let key = input
+                .canonical_input_key(&PalsModelConfig::baseline())
+                .unwrap();
+            let mut changed = input.clone();
+            changed.query[7] = f32::from_bits(changed.query[7].to_bits() + 1);
+            assert!(
+                model
+                    .witness_recorded_cpu_input(changed, key, budget, &cancel)
+                    .is_err()
+            );
+            let mut changed = input.clone();
+            changed.model_epoch = [4; 32];
+            assert!(
+                model
+                    .witness_recorded_cpu_input(changed, key, budget, &cancel)
+                    .is_err()
+            );
+            let mut changed = input;
+            changed.query[7] = f32::NAN;
+            assert!(
+                model
+                    .witness_recorded_cpu_input(changed, key, budget, &cancel)
+                    .is_err()
+            );
+            let receipt = model.finish_handle().finish(budget.whole_until()).unwrap();
+            assert_eq!(receipt.backend_stats.unwrap().completed_nn_inputs, 0);
+        }
+        #[test]
+        fn recorded_witness_cancel_after_submit_drains_without_issuing_a_capability() {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let budget = recorded_fixture_budget();
+            let model = recorded_fixture_model(Some(Arc::clone(&cancel)), false);
+            let mut model = accept_invocation_owner(model, budget, &cancel).unwrap();
+            let input = recorded_fixture_input(&cancel);
+            let key = input
+                .canonical_input_key(&PalsModelConfig::baseline())
+                .unwrap();
+            assert!(matches!(
+                model.witness_recorded_cpu_input(input, key, budget, &cancel),
+                Err(RoleError::Canceled)
+            ));
+            assert_eq!(model.owner.in_flight.load(Ordering::Acquire), 0);
+            assert!(model.control_lease.is_none());
+            assert!(!model.owner.quarantined.load(Ordering::Acquire));
+            let receipt = model.finish_handle().finish(budget.whole_until()).unwrap();
+            assert!(receipt.physical_shutdown_confirmed);
+            assert_eq!(receipt.backend_stats.unwrap().completed_nn_inputs, 2);
+            assert_eq!(receipt.search_consumed_role_inputs, 0);
+        }
+        #[test]
+        fn recorded_witness_invalid_head_preserves_known_physical_completion() {
+            let cancel = AtomicBool::new(false);
+            let budget = recorded_fixture_budget();
+            let model = recorded_fixture_model(None, true);
+            let mut model = accept_invocation_owner(model, budget, &cancel).unwrap();
+            let input = recorded_fixture_input(&cancel);
+            let key = input
+                .canonical_input_key(&PalsModelConfig::baseline())
+                .unwrap();
+            assert!(
+                model
+                    .witness_recorded_cpu_input(input, key, budget, &cancel)
+                    .is_err()
+            );
+            assert_eq!(model.owner.in_flight.load(Ordering::Acquire), 0);
+            assert!(model.control_lease.is_none());
+            let receipt = model.finish_handle().finish(budget.whole_until()).unwrap();
+            assert!(receipt.physical_shutdown_confirmed);
+            assert_eq!(receipt.backend_stats.unwrap().completed_nn_inputs, 2);
+            assert_eq!(receipt.search_consumed_role_inputs, 0);
+        }
+        #[test]
+        fn recorded_witness_unknown_completion_retains_the_actual_lease() {
+            let cancel = AtomicBool::new(false);
+            let budget = recorded_fixture_budget();
+            let model = fixture_model(|command| match command {
+                PalsNativeCommand::SnapshotStats => {
+                    PhysicalRun::Complete(Ok(PalsNativeResult::Stats(PalsBackendStats::default())))
+                }
+                PalsNativeCommand::Evaluate(_) => PhysicalRun::Quarantined(binding_backend_error()),
+                _ => unexpected_cuda_placement(),
+            });
+            let mut model = accept_invocation_owner(model, budget, &cancel).unwrap();
+            let input = recorded_fixture_input(&cancel);
+            let key = input
+                .canonical_input_key(&PalsModelConfig::baseline())
+                .unwrap();
+            assert!(matches!(
+                model.witness_recorded_cpu_input(input, key, budget, &cancel),
+                Err(RoleError::PhysicalCompletionUnknown)
+            ));
+            assert_eq!(model.owner.in_flight.load(Ordering::Acquire), 1);
+            assert!(model.control_lease.is_some());
+            assert!(model.owner.quarantined.load(Ordering::Acquire));
+            let receipt = model.finish_handle().receipt();
+            assert!(!receipt.physical_shutdown_confirmed);
+            assert!(!receipt.native_buffers_released);
+            assert_eq!(receipt.search_consumed_role_inputs, 0);
+        }
+        #[test]
+        fn recorded_witness_late_ready_is_known_completion_without_capability() {
+            let cancel = AtomicBool::new(false);
+            let input = recorded_fixture_input(&cancel);
+            let key = input
+                .canonical_input_key(&PalsModelConfig::baseline())
+                .unwrap();
+            let mut model = fixture_model(|command| match command {
+                PalsNativeCommand::SnapshotStats => {
+                    PhysicalRun::Complete(Ok(PalsNativeResult::Stats(PalsBackendStats::default())))
+                }
+                PalsNativeCommand::Evaluate(input) => {
+                    std::thread::sleep(Duration::from_millis(150));
+                    PhysicalRun::Complete(Ok(output(input)))
+                }
+                PalsNativeCommand::VerifyRuntime => {
+                    PhysicalRun::Complete(Ok(PalsNativeResult::RuntimeVerified))
+                }
+                _ => unexpected_cuda_placement(),
+            });
+            model.drain_limit = Duration::from_millis(500);
+            let started = Instant::now();
+            let execution = started + Duration::from_millis(100);
+            let budget = NativeInvocationBudget::new(
+                started,
+                execution,
+                execution + model.drain_limit,
+                model.drain_limit,
+            )
+            .unwrap();
+            let mut model = accept_invocation_owner(model, budget, &cancel).unwrap();
+            assert!(matches!(
+                model.witness_recorded_cpu_input(input, key, budget, &cancel),
+                Err(RoleError::Deadline)
+            ));
+            assert!(Instant::now() >= budget.execution_until());
+            assert_eq!(model.owner.in_flight.load(Ordering::Acquire), 0);
+            assert!(model.control_lease.is_none());
+            assert!(!model.owner.quarantined.load(Ordering::Acquire));
+            let receipt = model.finish_handle().finish(budget.whole_until()).unwrap();
+            assert!(receipt.physical_shutdown_confirmed);
+            assert_eq!(receipt.search_consumed_role_inputs, 0);
+        }
+        #[test]
+        fn recorded_witness_pending_through_original_whole_fence_keeps_lease() {
+            let cancel = AtomicBool::new(false);
+            let input = recorded_fixture_input(&cancel);
+            let key = input
+                .canonical_input_key(&PalsModelConfig::baseline())
+                .unwrap();
+            let (release, released) = std::sync::mpsc::sync_channel(1);
+            let entered = Arc::new(AtomicBool::new(false));
+            let worker_entered = Arc::clone(&entered);
+            let mut model = fixture_model(move |command| match command {
+                PalsNativeCommand::SnapshotStats => {
+                    PhysicalRun::Complete(Ok(PalsNativeResult::Stats(PalsBackendStats::default())))
+                }
+                PalsNativeCommand::Evaluate(input) => {
+                    worker_entered.store(true, Ordering::Release);
+                    released.recv_timeout(Duration::from_secs(2)).unwrap();
+                    PhysicalRun::Complete(Ok(output(input)))
+                }
+                _ => unexpected_cuda_placement(),
+            });
+            model.drain_limit = Duration::from_millis(100);
+            let started = Instant::now();
+            let execution = started + Duration::from_millis(200);
+            let budget = NativeInvocationBudget::new(
+                started,
+                execution,
+                execution + model.drain_limit,
+                model.drain_limit,
+            )
+            .unwrap();
+            let mut model = accept_invocation_owner(model, budget, &cancel).unwrap();
+            assert!(matches!(
+                model.witness_recorded_cpu_input(input, key, budget, &cancel),
+                Err(RoleError::PhysicalCompletionUnknown)
+            ));
+            assert!(entered.load(Ordering::Acquire));
+            assert!(Instant::now() >= budget.whole_until());
+            assert_eq!(model.owner.in_flight.load(Ordering::Acquire), 1);
+            assert!(model.control_lease.is_some());
+            assert!(model.owner.quarantined.load(Ordering::Acquire));
+            assert!(model.unusable);
+            assert!(!model.finish_handle().receipt().physical_shutdown_confirmed);
+            // Release/join only this test's mock after the production W gate.
+            // The late Ready never clears quarantine or issues a capability.
+            release.send(()).unwrap();
+            let test_cleanup_until = Instant::now() + Duration::from_secs(2);
+            loop {
+                assert!(Instant::now() < test_cleanup_until);
+                match model.control_lease.as_mut().unwrap().poll() {
+                    PhysicalPoll::Ready(Ok(PalsNativeResult::Evaluation(_))) => break,
+                    PhysicalPoll::Pending => std::thread::yield_now(),
+                    _ => panic!("released test worker must complete its original job"),
+                }
+            }
+            assert!(model.owner.quarantined.load(Ordering::Acquire));
+            assert!(model.unusable);
+            loop {
+                assert!(Instant::now() < test_cleanup_until);
+                match model.owner.worker.lock().unwrap().try_shutdown() {
+                    Poll::Ready(Ok(())) => break,
+                    Poll::Pending => std::thread::yield_now(),
+                    Poll::Ready(Err(error)) => panic!("test-only mock shutdown: {error}"),
+                }
+            }
+            assert_eq!(model.owner.in_flight.load(Ordering::Acquire), 1);
+            assert!(!model.finish_handle().receipt().physical_shutdown_confirmed);
         }
         fn query<'a>(
             position: &'a Position,
@@ -7081,6 +8077,13 @@ mod native {
                             stats.new_game_resets += 1;
                             PalsNativeResult::NewGame
                         }
+                        PalsNativeCommand::ResetTo(target) => {
+                            cached = false;
+                            stats.new_game_resets += 1;
+                            PalsNativeResult::ResetTo {
+                                game_generation: *target,
+                            }
+                        }
                         PalsNativeCommand::EvaluatePrivateWarm(_)
                         | PalsNativeCommand::VerifyCudaPlacement
                         | PalsNativeCommand::ObserveRuntimeMappings => {
@@ -7274,6 +8277,11 @@ mod native {
             match command {
                 PalsNativeCommand::Evaluate(input) => PhysicalRun::Complete(Ok(output(input))),
                 PalsNativeCommand::NewGame => PhysicalRun::Complete(Ok(PalsNativeResult::NewGame)),
+                PalsNativeCommand::ResetTo(target) => {
+                    PhysicalRun::Complete(Ok(PalsNativeResult::ResetTo {
+                        game_generation: *target,
+                    }))
+                }
                 PalsNativeCommand::SnapshotStats => {
                     PhysicalRun::Complete(Ok(PalsNativeResult::Stats(PalsBackendStats::default())))
                 }
@@ -7700,6 +8708,9 @@ mod native {
                         output(input)
                     }
                     PalsNativeCommand::NewGame => PalsNativeResult::NewGame,
+                    PalsNativeCommand::ResetTo(target) => PalsNativeResult::ResetTo {
+                        game_generation: *target,
+                    },
                     PalsNativeCommand::EvaluatePrivateWarm(_)
                     | PalsNativeCommand::VerifyCudaPlacement
                     | PalsNativeCommand::ObserveRuntimeMappings => {
@@ -7755,6 +8766,9 @@ mod native {
                 PhysicalRun::Complete(Ok(match command {
                     PalsNativeCommand::Evaluate(input) => output(input),
                     PalsNativeCommand::NewGame => PalsNativeResult::NewGame,
+                    PalsNativeCommand::ResetTo(target) => PalsNativeResult::ResetTo {
+                        game_generation: *target,
+                    },
                     PalsNativeCommand::EvaluatePrivateWarm(_)
                     | PalsNativeCommand::VerifyCudaPlacement
                     | PalsNativeCommand::ObserveRuntimeMappings => {
@@ -7822,6 +8836,9 @@ mod native {
                 PhysicalRun::Complete(Ok(match command {
                     PalsNativeCommand::Evaluate(input) => output(input),
                     PalsNativeCommand::NewGame => PalsNativeResult::NewGame,
+                    PalsNativeCommand::ResetTo(target) => PalsNativeResult::ResetTo {
+                        game_generation: *target,
+                    },
                     PalsNativeCommand::EvaluatePrivateWarm(_)
                     | PalsNativeCommand::VerifyCudaPlacement
                     | PalsNativeCommand::ObserveRuntimeMappings => {
@@ -7883,6 +8900,12 @@ mod native {
                         observed.fetch_add(1, Ordering::SeqCst);
                         PalsNativeResult::NewGame
                     }
+                    PalsNativeCommand::ResetTo(target) => {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        PalsNativeResult::ResetTo {
+                            game_generation: *target,
+                        }
+                    }
                     PalsNativeCommand::SnapshotStats => {
                         PalsNativeResult::Stats(PalsBackendStats::default())
                     }
@@ -7935,6 +8958,345 @@ mod native {
             );
         }
         #[test]
+        fn repeated_logical_resets_target_one_physical_reset_before_nn() {
+            let targets = Arc::new(Mutex::new(Vec::new()));
+            let actual = Arc::clone(&targets);
+            let mut model = fixture_model(move |command| {
+                if let PalsNativeCommand::ResetTo(target) = command {
+                    actual.lock().unwrap().push(*target);
+                }
+                binding_fixture_command(command)
+            });
+            model.new_game();
+            model.new_game();
+            assert!(targets.lock().unwrap().is_empty());
+            let position = Position::startpos();
+            let legal = position.legal_moves();
+            let cancel = AtomicBool::new(false);
+            model.propose(query(&position, &legal, &cancel)).unwrap();
+            model.accepted_output();
+            assert_eq!(*targets.lock().unwrap(), [3]);
+            assert_eq!(model.owner.pending_game_target.load(Ordering::Acquire), 0);
+            let done = model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(done.game_generation, 3);
+            assert_eq!(done.completed_new_game_resets, 1);
+            assert_eq!(done.physically_completed_role_calls, 1);
+            assert_eq!(done.search_consumed_role_inputs, 1);
+        }
+        #[test]
+        fn repeated_logical_resets_are_acknowledged_before_quit_stats() {
+            let commands = Arc::new(Mutex::new(Vec::new()));
+            let actual = Arc::clone(&commands);
+            let mut model = fixture_model(move |command| {
+                actual.lock().unwrap().push(match command {
+                    PalsNativeCommand::ResetTo(target) => format!("reset:{target}"),
+                    PalsNativeCommand::SnapshotStats => "stats".into(),
+                    _ => "other".into(),
+                });
+                binding_fixture_command(command)
+            });
+            // A stale previous observation must not short-circuit the reset.
+            *model.owner.final_stats.lock().unwrap() = Some(PalsBackendStats::default().into());
+            model.new_game();
+            model.new_game();
+            assert!(model.owner.final_stats.lock().unwrap().is_none());
+            let done = model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(*commands.lock().unwrap(), ["reset:3", "stats"]);
+            assert_eq!(done.game_generation, 3);
+            assert_eq!(done.completed_new_game_resets, 1);
+            assert_eq!(done.physically_completed_role_calls, 0);
+            assert_eq!(done.backend_stats.unwrap().completed_nn_inputs, 0);
+            assert!(done.physical_shutdown_confirmed && done.native_buffers_released);
+            // A finished owner cannot publish a target after the final fence.
+            assert_eq!(
+                model.owner.request_game_target(4),
+                Err(RoleError::Unavailable)
+            );
+            assert_eq!(model.owner.pending_game_target.load(Ordering::Acquire), 0);
+        }
+        #[test]
+        fn reset_wrong_ack_preserves_first_known_failure_without_retry() {
+            for backend_failure in [false, true] {
+                let attempts = Arc::new(AtomicU64::new(0));
+                let actual = Arc::clone(&attempts);
+                let mut model = fixture_model(move |command| match command {
+                    PalsNativeCommand::ResetTo(target) => {
+                        actual.fetch_add(1, Ordering::AcqRel);
+                        PhysicalRun::Complete(if backend_failure {
+                            Err(binding_backend_error())
+                        } else {
+                            Ok(PalsNativeResult::ResetTo {
+                                game_generation: *target - 1,
+                            })
+                        })
+                    }
+                    _ => binding_fixture_command(command),
+                });
+                model.new_game();
+                let cancel = AtomicBool::new(false);
+                let primary = model
+                    .ensure_new_game(Instant::now() + Duration::from_secs(2), &cancel)
+                    .unwrap_err();
+                assert!(matches!(primary, RoleError::Backend(_)));
+                assert!(model.unusable);
+                assert_eq!(model.owner.in_flight.load(Ordering::Acquire), 0);
+                assert!(model.control_lease.is_none());
+                assert_eq!(model.owner.pending_game_target.load(Ordering::Acquire), 2);
+                let handle = model.finish_handle();
+                assert_eq!(
+                    handle
+                        .finish(Instant::now() + Duration::from_secs(2))
+                        .unwrap_err(),
+                    primary
+                );
+                assert_eq!(
+                    handle
+                        .finish(Instant::now() + Duration::from_secs(2))
+                        .unwrap_err(),
+                    primary
+                );
+                assert_eq!(attempts.load(Ordering::Acquire), 1);
+                let receipt = handle.receipt();
+                assert!(!receipt.quarantined && receipt.physical_shutdown_confirmed);
+                assert!(receipt.backend_stats.is_none());
+                assert_eq!(receipt.completed_new_game_resets, 0);
+            }
+        }
+        #[cfg(feature = "experimental-io-binding")]
+        #[test]
+        fn quit_resets_resident_generation_before_fresh_final_snapshot() {
+            let (execution, mut snapshot) = resident_boundary_fixture();
+            let stale: NativeCudaRecordPageSnapshotReceipt = snapshot.clone().into();
+            let mut model = fixture_model_with_execution(
+                move |command| {
+                    PhysicalRun::Complete(Ok(match command {
+                        PalsNativeCommand::ResetTo(target) => {
+                            assert!(*target > snapshot.game_generation);
+                            snapshot.game_generation = *target;
+                            snapshot.live_blocks = 0;
+                            snapshot.certified_projections = 0;
+                            PalsNativeResult::ResetTo {
+                                game_generation: *target,
+                            }
+                        }
+                        PalsNativeCommand::VerifyRuntime => PalsNativeResult::RuntimeVerified,
+                        PalsNativeCommand::SnapshotCudaRecordPages => {
+                            PalsNativeResult::CudaRecordPagesObserved(Box::new(snapshot.clone()))
+                        }
+                        PalsNativeCommand::SnapshotStats => {
+                            PalsNativeResult::Stats(PalsBackendStats::default())
+                        }
+                        _ => return unexpected_cuda_placement(),
+                    }))
+                },
+                Some(execution),
+            );
+            *model.owner.cuda_record_page_snapshot.lock().unwrap() = Some(stale);
+            *model.owner.final_stats.lock().unwrap() = Some(PalsBackendStats::default().into());
+            model.new_game();
+            model.new_game();
+            assert!(
+                model
+                    .owner
+                    .cuda_record_page_snapshot
+                    .lock()
+                    .unwrap()
+                    .is_none()
+            );
+            let done = model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(done.game_generation, 3);
+            assert_eq!(
+                done.cuda_record_page_observation.unwrap().game_generation,
+                3
+            );
+            assert_eq!(done.completed_new_game_resets, 1);
+            assert_eq!(done.physically_completed_role_calls, 0);
+        }
+        #[test]
+        fn reset_target_jump_and_nonmonotonic_ack_do_not_spend_newer_target() {
+            let model = fixture_model(binding_fixture_command);
+            model.owner.request_game_target(11).unwrap();
+            assert_eq!(
+                model.owner.request_game_target(11),
+                Err(RoleError::InvalidOutput)
+            );
+            assert_eq!(
+                model.owner.request_game_target(10),
+                Err(RoleError::InvalidOutput)
+            );
+            assert!(model.owner.accept_game_target(2).is_err());
+            assert_eq!(model.owner.pending_game_target.load(Ordering::Acquire), 11);
+            let done = model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(done.game_generation, 11);
+            assert_eq!(done.completed_new_game_resets, 1);
+        }
+        #[test]
+        fn waiting_target_publication_rechecks_the_actual_finish_gate() {
+            let model = fixture_model(binding_fixture_command);
+            let owner = Arc::clone(&model.owner);
+            let waiting = Arc::new(AtomicBool::new(false));
+            let entered = Arc::clone(&waiting);
+            let guard = model.owner.game_lifecycle.lock().unwrap();
+            let publish = std::thread::spawn(move || {
+                entered.store(true, Ordering::Release);
+                owner.request_game_target(2)
+            });
+            let wait_until = Instant::now() + Duration::from_secs(2);
+            while !waiting.load(Ordering::Acquire) {
+                assert!(Instant::now() < wait_until);
+                std::thread::yield_now();
+            }
+            // The producer began before finish, but cannot publish after its
+            // synchronized flag. No stale pre-lock bool grants authority.
+            model.owner.finishing.store(true, Ordering::Release);
+            drop(guard);
+            assert_eq!(publish.join().unwrap(), Err(RoleError::Unavailable));
+            assert_eq!(model.owner.game_generation.load(Ordering::Acquire), 1);
+            assert_eq!(model.owner.pending_game_target.load(Ordering::Acquire), 0);
+            model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+        }
+        #[test]
+        fn canceled_reset_ready_keeps_actual_ack_without_nn_admission() {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let signal = Arc::clone(&cancel);
+            let mut model = fixture_model(move |command| {
+                if matches!(command, PalsNativeCommand::ResetTo(_)) {
+                    signal.store(true, Ordering::Release);
+                }
+                binding_fixture_command(command)
+            });
+            model.new_game();
+            assert_eq!(
+                model.ensure_new_game(Instant::now() + Duration::from_secs(2), &cancel),
+                Err(RoleError::Canceled)
+            );
+            assert_eq!(model.owner.pending_game_target.load(Ordering::Acquire), 0);
+            assert!(!model.pending_new_game);
+            let done = model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(done.completed_new_game_resets, 1);
+            assert_eq!(done.physically_completed_role_calls, 0);
+        }
+        #[test]
+        fn late_reset_ready_applies_target_but_preserves_logical_deadline() {
+            let (entered, actual_entry) = std::sync::mpsc::sync_channel(1);
+            let (release, actual_release) = std::sync::mpsc::sync_channel(1);
+            let mut model = fixture_model(move |command| {
+                if matches!(command, PalsNativeCommand::ResetTo(_)) {
+                    entered.send(()).unwrap();
+                    actual_release.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                binding_fixture_command(command)
+            });
+            model.drain_limit = Duration::from_secs(2);
+            model.new_game();
+            let cancel = AtomicBool::new(false);
+            // Establish E only after the fixture and target exist. ACK release
+            // requires actual admission/entry first, then observed E expiry;
+            // a guessed worker sleep duration is never the late-Ready witness.
+            let until = Instant::now() + Duration::from_secs(1);
+            let release_after_expiry = std::thread::spawn(move || {
+                actual_entry.recv_timeout(Duration::from_secs(2)).unwrap();
+                while Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(Instant::now() >= until);
+                release.send(()).unwrap();
+            });
+            assert_eq!(
+                model.ensure_new_game(until, &cancel),
+                Err(RoleError::Deadline)
+            );
+            release_after_expiry.join().unwrap();
+            assert_eq!(model.owner.pending_game_target.load(Ordering::Acquire), 0);
+            assert!(model.control_lease.is_none());
+            assert_eq!(model.owner.in_flight.load(Ordering::Acquire), 0);
+            let done = model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(done.completed_new_game_resets, 1);
+            assert_eq!(done.physically_completed_role_calls, 0);
+        }
+        #[test]
+        fn quit_reset_pending_at_whole_fence_retains_lease_and_target() {
+            let (release, released) = std::sync::mpsc::sync_channel(1);
+            let entered = Arc::new(AtomicBool::new(false));
+            let actual = Arc::clone(&entered);
+            let mut model = fixture_model(move |command| {
+                if matches!(command, PalsNativeCommand::ResetTo(_)) {
+                    actual.store(true, Ordering::Release);
+                    released.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+                binding_fixture_command(command)
+            });
+            model.new_game();
+            let handle = model.finish_handle();
+            let whole = Instant::now() + Duration::from_millis(100);
+            assert!(matches!(
+                handle.finish(whole),
+                Err(RoleError::PhysicalCompletionUnknown)
+            ));
+            assert!(entered.load(Ordering::Acquire));
+            assert!(Instant::now() >= whole);
+            assert_eq!(model.owner.in_flight.load(Ordering::Acquire), 1);
+            assert!(model.owner.stats_lease.lock().unwrap().is_some());
+            assert_eq!(model.owner.pending_game_target.load(Ordering::Acquire), 2);
+            let receipt = handle.receipt();
+            assert!(receipt.quarantined && !receipt.physical_shutdown_confirmed);
+            assert!(receipt.backend_stats.is_none());
+            assert_eq!(receipt.completed_new_game_resets, 0);
+            // Test-only mock release never promotes the original unknown fence.
+            release.send(()).unwrap();
+            let cleanup = Instant::now() + Duration::from_secs(2);
+            loop {
+                assert!(Instant::now() < cleanup);
+                match model
+                    .owner
+                    .stats_lease
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .poll()
+                {
+                    PhysicalPoll::Ready(Ok(PalsNativeResult::ResetTo { game_generation: 2 })) => {
+                        break;
+                    }
+                    PhysicalPoll::Pending => std::thread::yield_now(),
+                    _ => panic!("released mock must finish its exact original reset"),
+                }
+            }
+            loop {
+                assert!(Instant::now() < cleanup);
+                match model.owner.worker.lock().unwrap().try_shutdown() {
+                    Poll::Ready(Ok(())) => break,
+                    Poll::Pending => std::thread::yield_now(),
+                    _ => panic!("test-only mock reset shutdown failed"),
+                }
+            }
+            assert_eq!(model.owner.in_flight.load(Ordering::Acquire), 1);
+            assert_eq!(model.owner.pending_game_target.load(Ordering::Acquire), 2);
+            assert!(!handle.receipt().physical_shutdown_confirmed);
+        }
+        #[test]
         fn canceled_logical_result_waits_for_physical_completion() {
             let cancel = Arc::new(AtomicBool::new(false));
             let signal = Arc::clone(&cancel);
@@ -7945,6 +9307,11 @@ mod native {
                     PhysicalRun::Complete(Ok(output(input)))
                 }
                 PalsNativeCommand::NewGame => PhysicalRun::Complete(Ok(PalsNativeResult::NewGame)),
+                PalsNativeCommand::ResetTo(target) => {
+                    PhysicalRun::Complete(Ok(PalsNativeResult::ResetTo {
+                        game_generation: *target,
+                    }))
+                }
                 PalsNativeCommand::SnapshotStats => {
                     PhysicalRun::Complete(Ok(PalsNativeResult::Stats(PalsBackendStats::default())))
                 }
@@ -7981,6 +9348,11 @@ mod native {
                 let mut model = fixture_model(move |command| match command {
                     PalsNativeCommand::NewGame => {
                         PhysicalRun::Complete(Ok(PalsNativeResult::NewGame))
+                    }
+                    PalsNativeCommand::ResetTo(target) => {
+                        PhysicalRun::Complete(Ok(PalsNativeResult::ResetTo {
+                            game_generation: *target,
+                        }))
                     }
                     PalsNativeCommand::SnapshotStats => PhysicalRun::Complete(Ok(
                         PalsNativeResult::Stats(PalsBackendStats::default()),
@@ -8070,6 +9442,11 @@ mod native {
             let mut model = fixture_model(|command| match command {
                 PalsNativeCommand::Evaluate(input) => PhysicalRun::Complete(Ok(output(input))),
                 PalsNativeCommand::NewGame => PhysicalRun::Complete(Ok(PalsNativeResult::NewGame)),
+                PalsNativeCommand::ResetTo(target) => {
+                    PhysicalRun::Complete(Ok(PalsNativeResult::ResetTo {
+                        game_generation: *target,
+                    }))
+                }
                 PalsNativeCommand::SnapshotStats => PhysicalRun::Quarantined(BackendError::new(
                     FailureKind::BackendFailure,
                     FailureStage::Backend,
@@ -8108,6 +9485,9 @@ mod native {
                 PhysicalRun::Complete(Ok(match command {
                     PalsNativeCommand::Evaluate(input) => output(input),
                     PalsNativeCommand::NewGame => PalsNativeResult::NewGame,
+                    PalsNativeCommand::ResetTo(target) => PalsNativeResult::ResetTo {
+                        game_generation: *target,
+                    },
                     PalsNativeCommand::EvaluatePrivateWarm(_)
                     | PalsNativeCommand::VerifyCudaPlacement
                     | PalsNativeCommand::ObserveRuntimeMappings => {

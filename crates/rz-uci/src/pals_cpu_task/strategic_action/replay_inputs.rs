@@ -893,6 +893,16 @@ impl CheckedReplayInputs {
     pub fn resources(&self) -> &ReplayResourceDeclaration {
         &self.request.resources
     }
+    /// Source-owned role/store/CPU bounds from these already checked inputs.
+    /// This only projects existing arithmetic; it creates no model or execution.
+    pub fn mode_requirements(&self) -> Result<ReplayModeRequirements, ReplayError> {
+        replay_mode_requirements(
+            self.request.mode,
+            self.config.line_plies,
+            self.plan.prefix.len(),
+            self.plan.nodes_per_check,
+        )
+    }
     pub fn parent_pins(&self) -> &ReplayParentPins {
         &self.request.parent
     }

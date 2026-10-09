@@ -853,3 +853,159 @@ def admit_strategic_query(*, parents, parent_index, catalogue_bytes, before_resu
     return CheckedStrategicQuery(_FACTORY, parent=parents, index=parent_index, catalogue=catalogue_bytes,
         before=before_result_bytes, profiles=registered_profiles, prior=prior_observations,
         semantics=action_semantic_inputs, pins=expected_pins)
+
+
+# A separate /3 report lane. The Rust arena keeps actual native/capture owners;
+# these bytes never reconstruct those capabilities or fabricate a legacy receipt.
+REPAIR_QUERY_REPORT_SCHEMA = "rz-pals-actual-repair-next-query/3"
+REPAIR_QUERY_REPORT_SCOPE = "actual_parent_chronology_and_independent_native_conditional_prior"
+CAPTURED_REPAIR_QUERY_REPORT_SCOPE = "captured_nn_input_reinference_and_independent_cpu_condition_reexecution"
+_REPAIR_REPORT_FACTORY = object()
+
+
+def _repair_episode_digest(domain, value):
+    """Matches the separately versioned Rust /3 domain-NUL-JSON identity."""
+    return hashlib.sha256(domain.encode("utf-8") + b"\0" + canonical(value)).hexdigest()
+
+
+def _repair_query_report(base_query, raw, expected):
+    if type(base_query) is not CheckedStrategicQuery:
+        raise ValueError("Repair Query report requires original checked Query/2")
+    base_query.verify()
+    _actual(raw, expected)
+    value = _fields(_parse(raw), ("schema", "assurance_scope", "parent", "source_binding",
+        "query_sha256", "prior_ledger_before_sha256", "prior_ledger_sha256", "prior_ordinal",
+        "catalogue", "source_input", "source_output", "conditional_fact_sha256", "clock_scope",
+        "reported_work_counts", "reported_work_counts_scope", "selection_interval_ns",
+        "elapsed_through_admission_ns", "ledger_event_elapsed_ns", "whole_budget_ns", "native_execution_is_same_physical_child",
+        "query2_action_semantics_revalidated", "utility_authority", "target_authority",
+        "training_authority", "product_authority"))
+    assets = base_query.raw_assets()
+    pins = assets["expected_pins"]
+    before = _parse(assets["before_result"])
+    if (value["schema"] != REPAIR_QUERY_REPORT_SCHEMA or value["assurance_scope"] not in (
+            REPAIR_QUERY_REPORT_SCOPE, CAPTURED_REPAIR_QUERY_REPORT_SCOPE)
+            or value["parent"] != pins["parent"] or value["catalogue"] != pins["catalogue"]
+            or any(value[key] is not False for key in ("native_execution_is_same_physical_child",
+                "query2_action_semantics_revalidated", "utility_authority", "target_authority",
+                "training_authority", "product_authority"))):
+        raise ValueError("Repair Query report fixed parent/catalogue/negative authority")
+    source = _fields(value["source_binding"], ("query_sha256", "catalogue_artifact", "before_result_artifact",
+        "prior_ledger_sha256", "semantic_input_sha256", "semantic_context_sha256",
+        "semantic_branch_meaning_sha256", "semantic_before_result_anchor_sha256", "cpu_request_artifact"))
+    if (source["query_sha256"] != base_query.sha256 or source["catalogue_artifact"] != pins["catalogue"]
+            or source["before_result_artifact"] != pins["before_result"]
+            or source["prior_ledger_sha256"] != before["prior_ledger_sha256"]
+            or value["prior_ledger_before_sha256"] != source["prior_ledger_sha256"]
+            or source["semantic_input_sha256"] not in pins["action_semantic_sha256"]):
+        raise ValueError("Repair Query report original question/prior/semantic binding differs")
+    matched = [cap for cap in base_query.action_semantic_inputs() if cap.sha256 == source["semantic_input_sha256"]]
+    if not matched:
+        raise ValueError("Repair Query report original semantic action missing")
+    semantic_receipt = matched[0].rules_receipt()
+    if any(cap.rules_receipt() != semantic_receipt for cap in matched[1:]):
+        raise ValueError("Repair Query report repeated semantic identity differs")
+    if (source["semantic_context_sha256"] != semantic_receipt["context_sha256"]
+            or source["semantic_branch_meaning_sha256"] != semantic_receipt["branch_meaning_sha256"]
+            or source["semantic_before_result_anchor_sha256"] != semantic_receipt["before_result_anchor_sha256"]):
+        raise ValueError("Repair Query report original semantic context/branch/anchor differs")
+    for key in ("query_sha256", "prior_ledger_before_sha256", "prior_ledger_sha256", "conditional_fact_sha256"):
+        _sha(value[key])
+    for key in ("semantic_input_sha256", "semantic_context_sha256", "semantic_branch_meaning_sha256",
+            "semantic_before_result_anchor_sha256", "prior_ledger_sha256", "query_sha256"):
+        _sha(source[key])
+    for key in ("source_input", "source_output", "catalogue"):
+        _pin(value[key])
+    _pin(source["cpu_request_artifact"])
+    # This consumer binds the first transition from Query/2. Later /3 transitions
+    # stay in the live Rust episode; importing another JSON never extends it.
+    if _uint(value["prior_ordinal"], 0, 15) != 0:
+        raise ValueError("Repair Query report imported ledger cannot extend live episode")
+    elapsed = _uint(value["elapsed_through_admission_ns"], 0)
+    ledger_elapsed = _uint(value["ledger_event_elapsed_ns"], 0)
+    whole = _uint(value["whole_budget_ns"], 1, 300_000_000_000)
+    if elapsed >= whole or ledger_elapsed > elapsed:
+        raise ValueError("Repair Query report original whole window expired")
+    if value["clock_scope"] == "preparation_only":
+        if value["selection_interval_ns"] is not None:
+            raise ValueError("Repair Query report preparation scope invented selection")
+    elif value["clock_scope"] == "before_selection_callback":
+        interval = value["selection_interval_ns"]
+        if type(interval) is not list or len(interval) != 2:
+            raise ValueError("Repair Query report actual selection interval required")
+        if _uint(interval[0]) != 0 or _uint(interval[1]) > elapsed:
+            raise ValueError("Repair Query report selection/admission order")
+    else:
+        raise ValueError("Repair Query report unsupported clock scope")
+    work_scope = ("child_report_correlated_to_independent_native_not_same_physical_execution"
+        if value["assurance_scope"] == REPAIR_QUERY_REPORT_SCOPE
+        else "child_report_separate_from_captured_nn_and_independent_cpu_executions")
+    if value["reported_work_counts_scope"] != work_scope:
+        raise ValueError("Repair Query report child work provenance")
+    counts = value["reported_work_counts"]
+    if counts is not None:
+        if type(counts) is not list or len(counts) != 2:
+            raise ValueError("Repair Query report known/unknown work counters")
+        for count in counts:
+            _uint(count)
+    event = {"ordinal": value["prior_ordinal"], "source_query": source["query_sha256"],
+        "previous_ledger": value["prior_ledger_before_sha256"], "source_input": value["source_input"],
+        "source_output": value["source_output"], "conditional_fact_sha256": value["conditional_fact_sha256"],
+        "ledger_event_elapsed_ns": ledger_elapsed}
+    if _repair_episode_digest("rz-pals-actual-repair-prior-ledger/3", event) != value["prior_ledger_sha256"]:
+        raise ValueError("Repair Query report event/ledger identity differs")
+    identity = {"schema": REPAIR_QUERY_REPORT_SCHEMA, "parent": value["parent"],
+        "source_query_sha256": source["query_sha256"], "prior_ledger_sha256": value["prior_ledger_sha256"],
+        "decision_ordinal": value["prior_ordinal"] + 1, "catalogue": value["catalogue"]}
+    if _repair_episode_digest(REPAIR_QUERY_REPORT_SCHEMA, identity) != value["query_sha256"]:
+        raise ValueError("Repair Query report next question identity differs")
+    return value
+
+
+class CheckedRepairQueryReport:
+    """Immutable checked report, explicitly distinct from a live Rust Query."""
+    __slots__ = ("_base", "_raw", "_expected")
+
+    def __init__(self, token=None, *, base=None, raw=None, expected=None):
+        if token is not _REPAIR_REPORT_FACTORY:
+            raise ValueError("use admit_repair_query_report; native capability cannot be imported")
+        object.__setattr__(self, "_base", base)
+        object.__setattr__(self, "_raw", raw)
+        object.__setattr__(self, "_expected", canonical(expected))
+
+    def __setattr__(self, name, value):
+        raise AttributeError("Repair Query report is immutable")
+
+    def verify(self):
+        _repair_query_report(self._base, self._raw, _parse(self._expected))
+        return self
+
+    @property
+    def sha256(self):
+        return _repair_query_report(self._base, self._raw, _parse(self._expected))["query_sha256"]
+
+    def report(self):
+        return copy.deepcopy(_repair_query_report(self._base, self._raw, _parse(self._expected)))
+
+    def original_action_features(self):
+        self.verify()
+        return self._base.features()
+
+    def audit(self):
+        value = self.report()
+        return {"schema": REPAIR_QUERY_REPORT_SCHEMA, "query_sha256": value["query_sha256"],
+            "scope": "checked_pinned_caller_report_only_live_rust_owners_not_imported",
+            "live_native_capability": False, "runtime_clock_proof": False,
+            "legacy_cpu_receipt_created": False, "utility_authority": False,
+            "target_authority": False, "training_authority": False, "product_authority": False}
+
+
+def admit_repair_query_report(*, original_query, report_bytes, expected_report_pin):
+    """Read the separately versioned /3 report alongside the original Query/2.
+
+    Exact pins and causal metadata do not attest that Rust, a child or a native
+    witness executed. Only the live Rust factory owns that admission capability.
+    """
+    _repair_query_report(original_query, report_bytes, expected_report_pin)
+    return CheckedRepairQueryReport(_REPAIR_REPORT_FACTORY, base=original_query,
+        raw=report_bytes, expected=expected_report_pin)

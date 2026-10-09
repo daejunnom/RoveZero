@@ -1561,6 +1561,9 @@ pub enum PalsNativeCommand {
     /// Separate CPU-only Warm graph domain; a Fresh mode payload is also explicit.
     EvaluatePrivateWarm(PalsWarmInput),
     NewGame,
+    /// NN-zero reset to an explicit logical target. Repeated logical new games
+    /// may skip generations; the exclusive backend accepts only increasing ones.
+    ResetTo(u64),
     SnapshotStats,
     /// Metadata from this exclusive worker's actual resident owner. This command
     /// neither creates a native Run nor converts unknown completion to a fence.
@@ -1573,6 +1576,9 @@ pub enum PalsNativeCommand {
 pub enum PalsNativeResult {
     Evaluation(PalsRawOutput),
     NewGame,
+    ResetTo {
+        game_generation: u64,
+    },
     Stats(PalsBackendStats),
     #[cfg(feature = "experimental-io-binding")]
     CudaRecordPagesObserved(Box<CudaRecordPageSnapshot>),
@@ -2272,13 +2278,6 @@ impl PalsOnnxBackend {
         if let Some(cause) = &self.quarantine {
             return Err(cause.clone());
         }
-        if self.has_active_physical_invocation() {
-            return Err(fail(
-                K::BackendFailure,
-                S::Backend,
-                "PALS NewGame requires the completed physical invocation boundary",
-            ));
-        }
         let next_generation = self.game_generation.checked_add(1).ok_or_else(|| {
             fail(
                 K::ResourceExhausted,
@@ -2286,6 +2285,28 @@ impl PalsOnnxBackend {
                 "PALS game generation exhausted",
             )
         })?;
+        self.clear_public_memory_to(next_generation)
+    }
+    /// Actual exclusive-worker reset target, separate from logical UCI changes.
+    /// Refusal leaves the physical owner/cache namespace unchanged.
+    pub fn clear_public_memory_to(&mut self, next_generation: u64) -> Result<(), BackendError> {
+        if let Some(cause) = &self.quarantine {
+            return Err(cause.clone());
+        }
+        if self.has_active_physical_invocation() {
+            return Err(fail(
+                K::BackendFailure,
+                S::Backend,
+                "PALS NewGame requires the completed physical invocation boundary",
+            ));
+        }
+        if next_generation <= self.game_generation {
+            return Err(fail(
+                K::InvalidInput,
+                S::Admission,
+                "PALS reset target must strictly increase the physical game generation",
+            ));
+        }
         #[cfg(feature = "experimental-io-binding")]
         if let Some(pages) = &mut self.cuda_record_pages {
             // The resident owner checks its actual invocation/fence state before
@@ -2543,7 +2564,9 @@ impl PalsOnnxBackend {
                 PalsNativeCommand::Evaluate(_) | PalsNativeCommand::EvaluatePrivateWarm(_) => {
                     HostRecordPageObservationBoundary::Evaluate
                 }
-                PalsNativeCommand::NewGame => HostRecordPageObservationBoundary::NewGame,
+                PalsNativeCommand::NewGame | PalsNativeCommand::ResetTo(_) => {
+                    HostRecordPageObservationBoundary::NewGame
+                }
                 PalsNativeCommand::SnapshotStats => {
                     HostRecordPageObservationBoundary::SnapshotStats
                 }
@@ -2571,6 +2594,12 @@ impl PalsOnnxBackend {
                 PalsNativeCommand::NewGame => self
                     .clear_public_memory()
                     .map(|()| PalsNativeResult::NewGame),
+                PalsNativeCommand::ResetTo(target) => {
+                    self.clear_public_memory_to(*target)
+                        .map(|()| PalsNativeResult::ResetTo {
+                            game_generation: *target,
+                        })
+                }
                 PalsNativeCommand::SnapshotStats => {
                     self.snapshot_stats().map(PalsNativeResult::Stats)
                 }
