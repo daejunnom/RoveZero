@@ -19,6 +19,8 @@ mod native_retention;
 mod native_runner;
 pub mod pals_collect;
 pub mod pals_launch;
+#[cfg(feature = "pals-collection-onnx")]
+pub mod pals_replay;
 mod pgn;
 mod plan;
 mod process;

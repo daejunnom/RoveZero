@@ -15,7 +15,149 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
 type StdoutObserver<'a> = &'a mut dyn FnMut(&[u8]);
+
+pub const MAX_ORIGINAL_INPUT_BYTES: usize = 2 * 1024 * 1024;
+
+/// A process-local original clock. No serialized duration reconstructs this
+/// ownership, and creating the declaration grants no execution/closure proof.
+#[derive(Clone, Copy, Debug)]
+pub struct OriginalProcessWindow {
+    started: Instant,
+    execution: Instant,
+    whole: Instant,
+}
+impl OriginalProcessWindow {
+    pub fn new(started: Instant, execution: Instant, whole: Instant) -> Result<Self, ArenaError> {
+        if started >= execution || execution >= whole || started > Instant::now() {
+            return Err(ArenaError::Budget(
+                "original process window must be ordered and process-local".into(),
+            ));
+        }
+        Ok(Self {
+            started,
+            execution,
+            whole,
+        })
+    }
+    fn check_before_spawn(self, limits: ProcessLimits) -> Result<(), ArenaError> {
+        limits.validate()?;
+        let cleanup = Duration::from_millis(limits.shutdown_grace_ms)
+            .checked_mul(2)
+            .ok_or_else(|| ArenaError::Budget("original cleanup policy overflow".into()))?;
+        if self.execution.duration_since(self.started) > Duration::from_millis(limits.wall_ms)
+            || self.whole.duration_since(self.execution) > cleanup
+        {
+            return Err(ArenaError::Budget(
+                "original window exceeds declared process limits".into(),
+            ));
+        }
+        if Instant::now() >= self.execution {
+            return Err(ArenaError::Budget(
+                "original execution window expired before spawn".into(),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn elapsed_ns(self, at: Instant) -> Option<u64> {
+        u64::try_from(at.saturating_duration_since(self.started).as_nanos()).ok()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct OriginalProcessInput<'a> {
+    pub bytes: &'a [u8],
+    pub window: OriginalProcessWindow,
+}
+
+/// Observed transport only. This is not model/source admission, physical native
+/// completion, a cgroup resource proof or a checked next Query capability.
+#[derive(Debug, Serialize)]
+pub struct OriginalProcessObservation {
+    schema: &'static str,
+    input_bytes: usize,
+    written_bytes: Option<usize>,
+    stdin_closed_after_input: bool,
+    stdout_eof: bool,
+    stderr_eof: bool,
+    original_supervisor_entry_ns: Option<u64>,
+    original_spawn_ns: Option<u64>,
+    original_finished_ns: Option<u64>,
+    finished_before_whole: bool,
+    cancelled_at_return: bool,
+    ownership_lost: bool,
+}
+impl OriginalProcessObservation {
+    #[cfg(target_os = "linux")]
+    fn new(input_bytes: usize) -> Self {
+        Self {
+            schema: "rz-original-process-transport/1",
+            input_bytes,
+            written_bytes: None,
+            stdin_closed_after_input: false,
+            stdout_eof: false,
+            stderr_eof: false,
+            original_supervisor_entry_ns: None,
+            original_spawn_ns: None,
+            original_finished_ns: None,
+            finished_before_whole: false,
+            cancelled_at_return: false,
+            ownership_lost: false,
+        }
+    }
+    pub fn written_bytes(&self) -> Option<usize> {
+        self.written_bytes
+    }
+    pub fn stdout_eof(&self) -> bool {
+        self.stdout_eof
+    }
+    pub fn stderr_eof(&self) -> bool {
+        self.stderr_eof
+    }
+    pub fn finished_before_whole(&self) -> bool {
+        self.finished_before_whole
+    }
+}
+
+#[derive(Debug)]
+pub struct OriginalProcessOutput {
+    process: ProcessOutput,
+    observation: OriginalProcessObservation,
+}
+impl OriginalProcessOutput {
+    pub fn process(&self) -> &ProcessOutput {
+        &self.process
+    }
+    pub fn observation(&self) -> &OriginalProcessObservation {
+        &self.observation
+    }
+    pub fn transport_complete(&self) -> bool {
+        let o = &self.observation;
+        let r = &self.process.receipt;
+        o.written_bytes == Some(o.input_bytes)
+            && o.stdin_closed_after_input
+            && o.stdout_eof
+            && o.stderr_eof
+            && o.finished_before_whole
+            && o.original_supervisor_entry_ns.is_some()
+            && o.original_spawn_ns.is_some()
+            && o.original_finished_ns.is_some()
+            && !o.cancelled_at_return
+            && !o.ownership_lost
+            && r.stop == ProcessStop::Exited
+            && r.exit_code == Some(0)
+            && r.exit_signal.is_none()
+            && r.group_cleanup == CleanupStatus::Gone
+            && r.errors.is_empty()
+            && self.process.pending_child.is_none()
+    }
+    /// Consume the observation capability to transfer pending-child custody.
+    pub fn into_process(self) -> ProcessOutput {
+        self.process
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessLimits {
@@ -219,7 +361,7 @@ pub fn supervise(
             cancel,
             None,
             None,
-            None,
+            linux::InvocationIo::default(),
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -254,7 +396,7 @@ pub fn supervise_with_watch(
             cancel,
             Some(linux::ArtifactObservation::Flat(watch)),
             None,
-            None,
+            linux::InvocationIo::default(),
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -302,7 +444,7 @@ pub fn supervise_in_directory(
             cancel,
             watch.map(linux::ArtifactObservation::Flat),
             None,
-            None,
+            linux::InvocationIo::default(),
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -370,7 +512,7 @@ pub(crate) fn supervise_tree_observed(
             cancel,
             Some(linux::ArtifactObservation::Tree(watch)),
             stdout_observer,
-            None,
+            linux::InvocationIo::default(),
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -422,7 +564,10 @@ pub fn supervise_protocol_in_directory(
             cancel,
             Some(linux::ArtifactObservation::Tree(watch)),
             None,
-            Some(commands),
+            linux::InvocationIo {
+                commands: Some(commands),
+                ..Default::default()
+            },
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -430,6 +575,75 @@ pub fn supervise_protocol_in_directory(
         let _ = (program, args, directory, cancel, commands);
         Err(ArenaError::Invalid(
             "native UCI preflight requires Linux".into(),
+        ))
+    }
+}
+
+/// Replay-sized bytes through the same nonblocking pipe/group owner, under an
+/// original absolute execution and whole deadline. Existing protocol limits are
+/// unchanged. Blocking OS preflight/spawn/observation is not a hard-timeout proof;
+/// late completion is recorded and cannot pass transport_complete().
+pub fn supervise_input_in_original_window(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    input: OriginalProcessInput<'_>,
+) -> Result<OriginalProcessOutput, ArenaError> {
+    input.window.check_before_spawn(limits)?;
+    watch.validate()?;
+    if input.bytes.is_empty() || input.bytes.len() > MAX_ORIGINAL_INPUT_BYTES {
+        return Err(ArenaError::Budget(
+            "original input requires 1..2MiB bytes".into(),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut observation = OriginalProcessObservation::new(input.bytes.len());
+        observation.original_supervisor_entry_ns = input.window.elapsed_ns(Instant::now());
+        if !directory
+            .metadata()
+            .map_err(|_| ArenaError::Io("process.cwd_metadata".into()))?
+            .is_dir()
+        {
+            return Err(ArenaError::Invalid(
+                "original process cwd handle must be a directory".into(),
+            ));
+        }
+        let directory = directory
+            .try_clone()
+            .map_err(|_| ArenaError::Io("process.cwd_clone".into()))?;
+        let process = linux::supervise(
+            program,
+            args,
+            directory,
+            limits,
+            cancel,
+            Some(linux::ArtifactObservation::Tree(watch)),
+            None,
+            linux::InvocationIo {
+                commands: Some(input.bytes),
+                original: Some(input.window),
+                observation: Some(&mut observation),
+            },
+        )?;
+        let returned = Instant::now();
+        observation.original_finished_ns = input.window.elapsed_ns(returned);
+        observation.finished_before_whole = returned < input.window.whole;
+        observation.cancelled_at_return =
+            cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+        Ok(OriginalProcessOutput {
+            process,
+            observation,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (program, args, directory, cancel);
+        Err(ArenaError::Invalid(
+            "original input supervision currently requires Linux".into(),
         ))
     }
 }
@@ -453,6 +667,13 @@ mod linux {
     use std::time::{Duration, Instant};
 
     const POLL: Duration = Duration::from_millis(5);
+
+    #[derive(Default)]
+    pub(super) struct InvocationIo<'a, 'b> {
+        pub commands: Option<&'a [u8]>,
+        pub original: Option<OriginalProcessWindow>,
+        pub observation: Option<&'b mut OriginalProcessObservation>,
+    }
 
     #[derive(Clone, Copy)]
     pub(super) enum ArtifactObservation<'a> {
@@ -488,8 +709,16 @@ mod linux {
         cancel: Option<&AtomicBool>,
         watch: Option<ArtifactObservation<'_>>,
         mut stdout_observer: Option<StdoutObserver<'_>>,
-        commands: Option<&[u8]>,
+        io: InvocationIo<'_, '_>,
     ) -> Result<ProcessOutput, ArenaError> {
+        let InvocationIo {
+            commands,
+            original,
+            mut observation,
+        } = io;
+        if let Some(window) = original {
+            window.check_before_spawn(limits)?;
+        }
         native_elf(program)?;
         default_child_disposition()?;
         // Verify required observation support before starting an executable.
@@ -498,7 +727,13 @@ mod linux {
         if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             return Err(ArenaError::Invalid("process.cancelled_before_spawn".into()));
         }
+        if let Some(window) = original {
+            window.check_before_spawn(limits)?;
+        }
         let started = Instant::now();
+        if let (Some(window), Some(o)) = (original, observation.as_deref_mut()) {
+            o.original_spawn_ns = window.elapsed_ns(started);
+        }
         let wall = Duration::from_millis(limits.wall_ms);
         let grace = Duration::from_millis(limits.shutdown_grace_ms);
         started
@@ -580,6 +815,8 @@ mod linux {
         let mut killed = false;
         let mut leader_done = false;
         let mut ownership_lost = false;
+        let mut stdout_eof = false;
+        let mut stderr_eof = false;
         let mut cleanup_started = None;
         let preserve_unverified = matches!(watch, Some(ArtifactObservation::Tree(_)));
         loop {
@@ -587,7 +824,10 @@ mod linux {
             if stop.is_none() {
                 if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                     stop = Some(ProcessStop::Cancelled);
-                } else if now.duration_since(started) >= wall {
+                } else if original.map_or_else(
+                    || now.duration_since(started) >= wall,
+                    |window| now >= window.execution,
+                ) {
                     stop = Some(ProcessStop::WallLimit);
                 }
             }
@@ -639,10 +879,15 @@ mod linux {
             // cancellation and process checks even under continuous output.
             let prior_out = out.len();
             let prior_err = err.len();
-            for result in [
+            let stdout_open = stdout.is_some();
+            let stderr_open = stderr.is_some();
+            let drained = [
                 drain(&mut stdout, &mut out, limits.max_output_bytes, &mut receipt),
                 drain(&mut stderr, &mut err, limits.max_output_bytes, &mut receipt),
-            ] {
+            ];
+            stdout_eof |= stdout_open && stdout.is_none() && drained[0].is_ok();
+            stderr_eof |= stderr_open && stderr.is_none() && drained[1].is_ok();
+            for result in drained {
                 match result {
                     Ok(true) if stop.is_none() => stop = Some(ProcessStop::OutputLimit),
                     Err(()) => {
@@ -728,6 +973,21 @@ mod linux {
                 cleanup_started.get_or_insert_with(Instant::now);
             }
             let no_others = last_group.is_some_and(|snapshot| snapshot.other_members == 0);
+            if original.is_some_and(|window| Instant::now() >= window.whole) {
+                evidence(&mut receipt, "process.original_whole_window_expired");
+                if stop.is_none() || stop == Some(ProcessStop::Exited) {
+                    stop = Some(ProcessStop::WallLimit);
+                }
+                // waitid above preserved/rechecked ownership; no reap is made
+                // from a recycled PID. Final status remains unverified here.
+                signal(
+                    group,
+                    Signal::SIGKILL,
+                    &mut receipt,
+                    "process.kill_original_whole",
+                );
+                break;
+            }
             if leader_done && no_others && stdout.is_none() && stderr.is_none() {
                 // The child may have created its final outputs between this
                 // pass's snapshot and exit observation. Inspect that final
@@ -750,7 +1010,11 @@ mod linux {
             }
             if let Some(shutdown_at) = shutdown {
                 let age = shutdown_at.elapsed();
-                if age >= grace && !killed {
+                let original_kill_due = original.is_some_and(|window| {
+                    let half = window.whole.duration_since(window.execution) / 2;
+                    Instant::now() >= window.execution + half
+                });
+                if (age >= grace || original_kill_due) && !killed {
                     signal(group, Signal::SIGKILL, &mut receipt, "process.kill");
                     killed = true;
                 }
@@ -783,6 +1047,14 @@ mod linux {
             .map_err(|_| ArenaError::Budget("process elapsed duration overflow".into()))?;
         receipt.stdout_bytes = out.len() as u64;
         receipt.stderr_bytes = err.len() as u64;
+        if let Some(o) = observation {
+            o.written_bytes = Some(input_offset);
+            o.stdin_closed_after_input =
+                commands.is_some_and(|bytes| input_offset == bytes.len()) && stdin.is_none();
+            o.stdout_eof = stdout_eof;
+            o.stderr_eof = stderr_eof;
+            o.ownership_lost = ownership_lost;
+        }
         Ok(ProcessOutput {
             receipt,
             stdout: out,
@@ -1320,6 +1592,210 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn original_watch() -> OwnedArtifactTreeWatch {
+            OwnedArtifactTreeWatch {
+                max_total_bytes: 1024,
+                max_file_bytes: 1024,
+                max_files: 4,
+                max_depth: 0,
+            }
+        }
+
+        fn original_limits() -> ProcessLimits {
+            ProcessLimits {
+                wall_ms: 5000,
+                shutdown_grace_ms: 250,
+                max_output_bytes: 256 * 1024,
+                max_child_processes: 1,
+            }
+        }
+
+        struct OriginalTestDirectory(std::path::PathBuf);
+        impl OriginalTestDirectory {
+            fn new() -> Self {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let path = std::env::temp_dir().join(format!(
+                    "rz-original-process-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                std::fs::create_dir(&path).unwrap();
+                Self(path)
+            }
+            fn file(&self) -> File {
+                File::open(&self.0).unwrap()
+            }
+        }
+        impl Drop for OriginalTestDirectory {
+            fn drop(&mut self) {
+                // These tests create no artifacts or descendants. Never recurse
+                // through a replacement entry or remove another test's tree.
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+
+        #[test]
+        fn original_window_refuses_reordering_expiry_and_resource_extension() {
+            let now = Instant::now();
+            assert!(OriginalProcessWindow::new(now, now, now + Duration::from_secs(1)).is_err());
+            assert!(OriginalProcessWindow::new(now, now + Duration::from_secs(1), now).is_err());
+            let old = now - Duration::from_secs(2);
+            let expired =
+                OriginalProcessWindow::new(old, old + Duration::from_secs(1), now).unwrap();
+            assert!(expired.check_before_spawn(original_limits()).is_err());
+            let too_long = OriginalProcessWindow::new(
+                now,
+                now + Duration::from_secs(6),
+                now + Duration::from_millis(6500),
+            )
+            .unwrap();
+            assert!(too_long.check_before_spawn(original_limits()).is_err());
+            let extra_cleanup = OriginalProcessWindow::new(
+                now,
+                now + Duration::from_secs(1),
+                now + Duration::from_secs(2),
+            )
+            .unwrap();
+            assert!(extra_cleanup.check_before_spawn(original_limits()).is_err());
+        }
+
+        #[test]
+        fn original_input_transports_more_than_protocol_limit_and_requires_real_closure() {
+            let directory = OriginalTestDirectory::new();
+            let program = File::open("/bin/cat").unwrap();
+            // No newline: this lane transports frozen JSON bytes, not UCI lines.
+            let input = vec![b'x'; 96 * 1024];
+            let started = Instant::now();
+            let window = OriginalProcessWindow::new(
+                started,
+                started + Duration::from_secs(5),
+                started + Duration::from_millis(5500),
+            )
+            .unwrap();
+            let mut output = supervise_input_in_original_window(
+                &program,
+                &[],
+                &directory.file(),
+                original_limits(),
+                None,
+                &original_watch(),
+                OriginalProcessInput {
+                    bytes: &input,
+                    window,
+                },
+            )
+            .unwrap();
+            assert_eq!(output.process().stdout, input);
+            assert_eq!(output.observation().written_bytes(), Some(input.len()));
+            assert!(output.transport_complete(), "{output:?}");
+            output.observation.stdout_eof = false;
+            assert!(!output.transport_complete());
+            output.observation.stdout_eof = true;
+            output.observation.finished_before_whole = false;
+            assert!(!output.transport_complete());
+            output.observation.finished_before_whole = true;
+            output.observation.written_bytes = Some(input.len() - 1);
+            assert!(!output.transport_complete());
+            // The old protocol API still refuses this input before spawning.
+            assert!(
+                supervise_protocol_in_directory(
+                    &program,
+                    &[],
+                    &directory.file(),
+                    original_limits(),
+                    None,
+                    &original_watch(),
+                    &input,
+                )
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn original_execution_does_not_restart_clock_for_a_child_that_wont_read() {
+            let directory = OriginalTestDirectory::new();
+            let program = File::open("/bin/sleep").unwrap();
+            let input = vec![b'x'; 96 * 1024];
+            let started = Instant::now() - Duration::from_millis(200);
+            let window = OriginalProcessWindow::new(
+                started,
+                started + Duration::from_millis(350),
+                started + Duration::from_millis(850),
+            )
+            .unwrap();
+            let limits = ProcessLimits {
+                wall_ms: 350,
+                ..original_limits()
+            };
+            let output = supervise_input_in_original_window(
+                &program,
+                &[OsString::from("10")],
+                &directory.file(),
+                limits,
+                None,
+                &original_watch(),
+                OriginalProcessInput {
+                    bytes: &input,
+                    window,
+                },
+            )
+            .unwrap();
+            assert_eq!(output.process().receipt.stop, ProcessStop::WallLimit);
+            assert!(output.observation.original_spawn_ns.unwrap() >= 200_000_000);
+            assert!(output.observation.written_bytes.unwrap() < input.len());
+            assert!(!output.transport_complete());
+            assert!(output.process().pending_child.is_none(), "{output:?}");
+        }
+
+        #[test]
+        fn original_output_limit_and_cancel_do_not_certify_transport() {
+            let directory = OriginalTestDirectory::new();
+            let program = File::open("/bin/cat").unwrap();
+            let input = vec![b'x'; 32 * 1024];
+            let started = Instant::now();
+            let window = OriginalProcessWindow::new(
+                started,
+                started + Duration::from_secs(5),
+                started + Duration::from_millis(5500),
+            )
+            .unwrap();
+            let limits = ProcessLimits {
+                max_output_bytes: 16,
+                ..original_limits()
+            };
+            let output = supervise_input_in_original_window(
+                &program,
+                &[],
+                &directory.file(),
+                limits,
+                None,
+                &original_watch(),
+                OriginalProcessInput {
+                    bytes: &input,
+                    window,
+                },
+            )
+            .unwrap();
+            assert_eq!(output.process().receipt.stop, ProcessStop::OutputLimit);
+            assert!(!output.transport_complete());
+            let cancelled = AtomicBool::new(true);
+            assert!(
+                supervise_input_in_original_window(
+                    &program,
+                    &[],
+                    &directory.file(),
+                    original_limits(),
+                    Some(&cancelled),
+                    &original_watch(),
+                    OriginalProcessInput {
+                        bytes: &input,
+                        window
+                    },
+                )
+                .is_err()
+            );
+        }
 
         #[test]
         fn source_profile_forwarding_is_one_exact_opt_in_value() {
