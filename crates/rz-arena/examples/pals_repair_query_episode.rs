@@ -685,12 +685,12 @@ mod enabled {
         )?;
         let started = episode.original_started();
         let deadline = episode.original_deadline();
-        if let Some(gate) = pair_gate {
-            if deadline > gate.latest_whole {
-                return Err(invalid(
-                    "full original side W no longer fits fixed pair reservation; no child/model work",
-                ));
-            }
+        if let Some(gate) = pair_gate
+            && deadline > gate.latest_whole
+        {
+            return Err(invalid(
+                "full original side W no longer fits fixed pair reservation; no child/model work",
+            ));
         }
         let mut store = ReportStore::new(output.clone(), deadline)?;
         let declaration = ReplayLaunchDeclaration {
@@ -1006,7 +1006,7 @@ mod enabled {
                 "schema": "rz-pals-repair-query-episode-acceptance/1",
                 "selection_policy": SELECTION_POLICY,
                 "registered_action_index": selection.action_index(),
-                "plan_artifact": actual_pin(&raw_plan),
+                "plan_artifact": actual_pin(raw_plan),
                 "source_scope": "captured_nn_input_reinference_and_independent_cpu_condition_reexecution",
                 "reported_child_body_artifact": actual_pin(material.raw_native_bytes()),
                 "independent_witness_artifact": actual_pin(&witness_audit),
