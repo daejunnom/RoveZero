@@ -195,7 +195,8 @@ mod tests {
             elapsed(start, start + Duration::from_nanos(401)).unwrap(),
             401
         );
-        assert!(elapsed(start, start - Duration::from_nanos(1)).is_err());
+        // A 1ns subtraction is not distinct on every supported platform clock.
+        assert!(elapsed(start, start - Duration::from_millis(1)).is_err());
         let captured = start + Duration::from_nanos(200);
         let checked = captured + Duration::from_nanos(300);
         assert_eq!(elapsed(start, checked).unwrap(), 500);
