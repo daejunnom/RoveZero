@@ -307,6 +307,36 @@ impl PalsNativeRefinementRegistration {
     }
 }
 
+// Registration admission and actual collection dispatch must derive the same
+// closed tuple from the selected policy, then validate the live engine getters.
+fn observed_refinement_identity(
+    policy: PostRepairRecheckPolicy,
+    actual_search_identity: &str,
+    actual_conditions: Option<&str>,
+) -> Result<PalsSearchPolicyIdentityV3, ArenaError> {
+    let expected = match policy {
+        PostRepairRecheckPolicy::SameRepairedLineOnceV1 => {
+            PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1()
+        }
+        PostRepairRecheckPolicy::ActualOpponentContinuationV1 => {
+            PalsSearchPolicyIdentityV3::expected_actual_opponent_continuation_v1()
+        }
+        PostRepairRecheckPolicy::Disabled => {
+            return Err(invalid("disabled search has no refinement policy identity"));
+        }
+    };
+    let conditions = actual_conditions
+        .ok_or_else(|| invalid("actual selected engine refinement conditions are absent"))?;
+    let observed = PalsSearchPolicyIdentityV3 {
+        version: expected.version,
+        policy: expected.policy,
+        search_identity: actual_search_identity.into(),
+        conditions_sha256: Sha256::digest(conditions.as_bytes()).into(),
+    };
+    observed.validate().map_err(|e| invalid(e.to_string()))?;
+    Ok(observed)
+}
+
 fn observed_refinement_selection(
     registration: Option<&PalsNativeRefinementRegistration>,
     actual_policy: PostRepairRecheckPolicy,
@@ -325,25 +355,8 @@ fn observed_refinement_selection(
                     "actual selected policy differs from its registration lane",
                 ));
             }
-            let conditions = actual_conditions.ok_or_else(|| {
-                invalid("actual selected engine refinement conditions are absent")
-            })?;
-            let expected = match policy {
-                PostRepairRecheckPolicy::SameRepairedLineOnceV1 => {
-                    PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1()
-                }
-                PostRepairRecheckPolicy::ActualOpponentContinuationV1 => {
-                    PalsSearchPolicyIdentityV3::expected_actual_opponent_continuation_v1()
-                }
-                PostRepairRecheckPolicy::Disabled => unreachable!(),
-            };
-            let observed = PalsSearchPolicyIdentityV3 {
-                version: expected.version,
-                policy: expected.policy,
-                search_identity: actual_search_identity.into(),
-                conditions_sha256: Sha256::digest(conditions.as_bytes()).into(),
-            };
-            observed.validate().map_err(|e| invalid(e.to_string()))?;
+            let observed =
+                observed_refinement_identity(policy, actual_search_identity, actual_conditions)?;
             if observed != registration.wire.search_policy {
                 return Err(invalid(
                     "actual engine refinement getters differ from independently registered policy",
@@ -2574,17 +2587,11 @@ impl PalsCollectionDriver for OwnPalsOnnxCollectionDriver {
                 ));
             }
             if selected_return {
-                let conditions = self
-                    .engine
-                    .refinement_conditions()
-                    .ok_or_else(|| invalid("selected search return conditions absent"))?;
-                let actual = PalsSearchPolicyIdentityV3 {
-                    version: rz_experiments::PALS_POST_REPAIR_RECHECK_V3_VERSION.into(),
-                    policy: rz_experiments::PALS_POST_REPAIR_RECHECK_V3_POLICY.into(),
-                    search_identity: self.engine.search_identity().into(),
-                    conditions_sha256: Sha256::digest(conditions.as_bytes()).into(),
-                };
-                actual.validate().map_err(|e| invalid(e.to_string()))?;
+                let actual = observed_refinement_identity(
+                    self.engine.post_repair_recheck_policy(),
+                    self.engine.search_identity(),
+                    self.engine.refinement_conditions(),
+                )?;
                 let actual = serde_json::to_value(actual).map_err(|e| invalid(e.to_string()))?;
                 if s.source
                     .native
@@ -2959,6 +2966,47 @@ mod tests {
                 actual,
                 actual.search_identity(),
                 actual.conditions()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn selected_native_return_identity_keeps_each_closed_tuple_and_checks_actual_getters() {
+        let legacy = PostRepairRecheckPolicy::SameRepairedLineOnceV1;
+        let continuation = PostRepairRecheckPolicy::ActualOpponentContinuationV1;
+        for (policy, expected, other) in [
+            (
+                legacy,
+                PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1(),
+                continuation,
+            ),
+            (
+                continuation,
+                PalsSearchPolicyIdentityV3::expected_actual_opponent_continuation_v1(),
+                legacy,
+            ),
+        ] {
+            assert_eq!(
+                observed_refinement_identity(policy, policy.search_identity(), policy.conditions())
+                    .unwrap(),
+                expected
+            );
+            assert!(
+                observed_refinement_identity(policy, other.search_identity(), policy.conditions())
+                    .is_err()
+            );
+            assert!(
+                observed_refinement_identity(policy, policy.search_identity(), other.conditions())
+                    .is_err()
+            );
+            assert!(observed_refinement_identity(policy, policy.search_identity(), None).is_err());
+        }
+        assert!(
+            observed_refinement_identity(
+                PostRepairRecheckPolicy::Disabled,
+                PALS_SEARCH_VERSION,
+                None
             )
             .is_err()
         );

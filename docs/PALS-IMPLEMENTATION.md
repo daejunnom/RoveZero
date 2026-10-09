@@ -143,7 +143,7 @@ P6의 양성 자체 CPU pair만으로 두 원문의 전체 구현 완료를 선�
 |---|---|
 | CPU_T SEE 정렬 | `LegalSeeV1` Rust ordering과 private CPU_T의 명시적 `--cpu-ordering=legal-see-v1`·봉인된 `ordering_policy: legal_see_v1`, producer의 `--ordering-policy legal_see_v1`까지 연결돼 있다. legacy 기본값·식별은 유지하며 SEE는 전략적 증명이나 영구 pruning이 아니다. 등록 기준 `b6de532`의 Linux·Windows CI에서 실제 선택 engine·조건·report·독립 resume namespace를 검사했다. 새 실제 producer 실행과 기력 효과는 별도 인수한다. |
 | V 결과 환류 | bounded coverage loop와 native Repair 보고의 단일 prior 자료 발급 접점이 있다. capture의 loaded binary·원래 S/E/W·Rules·raw body·부모 transport 비용을 검사하지만, 자료 발급만으로 actual native witness·다음 Query admission·episode ledger·whole-action utility를 발급하지 않는다. coverage 증가는 전략적 유용성이나 학습 target의 증거가 아니다. |
-| GPU record 공유 메모리 | host whole-input page와 record별 CUDA resident packing을 구분한다. 명시적 `registered-packing-v1` lane의 missing subset 인코딩·device join·불변 read view·물리 pin·예약·격리·CLI/arena 연결 소스가 있다. source/CPU 검사와 실제 target GPU의 수치·물리 완료·eviction·메모리 관측 인수는 분리한다. 전체 입력 cache 성공을 record별 GPU 공유의 증거로 쓰지 않는다. |
+| GPU record 공유 메모리 | host whole-input page와 record별 CUDA resident packing을 구분한다. 명시적 `registered-packing-v1` lane의 missing subset 인코딩·device join·불변 read view·물리 pin·예약·격리·CLI/arena 연결 소스가 있다. `34149e2`의 실제 CUDA 독립 수치·resident anchor/derived/repeat·새 게임 초기화·정상 물리 종료는 아래 실행 범위에서 인수했다. 제품 UCI의 stop·늦은 root·미확정 완료 경로, VRAM peak와 개선 효과는 별도로 남긴다. 전체 입력 cache 성공을 record별 GPU 공유의 증거로 쓰지 않는다. |
 | Repair 이후 C 재검토 | 같은 line을 한 번 재검토하는 기존 lane과 실제 새 C continuation의 별도 S lane·다중 Reply 관측 접점이 있다. 원래 첫 수·Repair line/revision·첫 ongoing 상대 anchor·실제 dispatch/소비를 대조한다. 새 source의 실제 다중 Reply 수집 인수와 전략적 강도 효과는 별도로 남기며 다음 round의 root Propose로 대신하지 않는다. |
 | 실제 CPU pair | 해당 integration source/binary와 시계·NN 소비·typed failed-go 0·Rules·PGN·process·저장·cleanup을 모두 인수한다. preparation 자기 보고나 CPU CI로 대체하지 않는다. |
 | 선택적 후속 기능 | CUDA private Warm, paused search stack, set-associative TT, fast pruning과 대체 optimizer는 원문의 후보·미결정 범위를 보존한다. 기본 Fresh 구현의 필수 통과 조건으로 임의 확대하지 않는다. |
@@ -153,6 +153,50 @@ P6의 양성 자체 CPU pair만으로 두 원문의 전체 구현 완료를 선�
 자산·환경과 유한 예산을 확인한 뒤 인수한다. 과거 GPU 보류·실패 자료는 그대로 보존한다.
 구현·CPU CI·실신경망·실제 대국·GPU 인수와 미지원 옵션을 각각 기록하며 미실행을
 성공 또는 skip 인수로 채우지 않는다.
+
+### 실제 GPU 수치·resident page 인수 범위
+
+2026-10-09의 `gpu-numeric-resident-20261009-01`은 source
+`34149e2cc6e588cf32452aece0494aeb8cb05134`와 release `pals_model_check`
+바이너리 SHA-256 `46c8eb1b522c45f1e0e46f34ba88d98c4c9898c31afee503b4c4759477c8bd1c`에
+고정한 실제 WSL CUDA 검사다. FP32·TF32 off, 같은 미학습 P/C export와 독립 reference를
+사용했다. `observed-summary.json` 및 pin이 일치하는 `numeric.json`·`execution.json`·
+`launch.json`·`launcher-execution.json`을 직접 대조했다. 상세 근거와 한계는
+[실제 GPU 수치·resident 인수 기록](research/PALS-IMPLEMENTATION.md#실제-gpu-수치resident-인수와-r7-잔여)에 둔다.
+
+독립 numeric 6개, resident anchor 6개와 derived 15개·repeat 15개를 수행했다.
+resident backend의 완료 입력은 public 10·private 37, 총 47이다. 별도 whole comparator
+30과 기존 main numeric backend 20은 다른 계수 범위이므로 47에 더해 제품 처리량으로
+표시하지 않는다. resident 대조의 최대 절대 차이는 후보 logit `2.682209e-7`, WDL
+`5.960464e-8`, latent `1.430511e-6`이며 기존 허용 오차를 만족했다. 새 게임 뒤 bank의
+live block·certified projection·host/device 소유 bytes가 0이고 generation은 2였다.
+worker ACK와 정상 물리 shutdown, 실제 exit 0·reap·group 종료 및 unit inactive를 확인했다.
+
+외부 벽시계는 43.172초, checker 실행은 38.096초다. 적용 affinity는 `0 2`,
+memory.high/max는 6GiB/12GiB, swap은 0이며 새 cgroup `memory.peak`는
+3,644,235,776 bytes, `memory.events`의 OOM 계수는 모두 0이었다. 이 peak는 VRAM
+또는 Windows 전체 커밋 peak가 아니다. VRAM peak, 네이티브 파라미터 저장의 실제 공유,
+device K/V를 host로 복사한 tensor 대조는 `unknown` 또는 미실행으로 남긴다.
+
+이 인수는 독립 checker와 물리 worker의 정상 경로에 한정된다. 제품 UCI의 stop·cancel·
+늦은 결과·새 root 및 미확정 물리 완료 인수, 실제 CPU 4N·Query·전체 action utility·
+다중 Reply·paired 대국은 완료하지 않았다. 실제 학습·기력 또는 성능 개선을 주장하지
+않으며, 후속 source의 CPU CI나 GPU 인수로 이 자료를 자동 승격하지 않는다.
+
+### 기록 입력 witness와 새 실행의 구분
+
+새 `captured_nn_input_reinference_and_independent_cpu_condition_reexecution` 경로는
+source owner가 보존한 P/C 입력을 그대로 재추론하고, 같은 조건의 CPU 문제를 독립
+Rust CPU로 다시 실행하는 경계다. `query[7]`의 deadline feature는 **과거 입력값**으로
+bit와 입력 식별을 유지한다. 이를 현재의 남은 시간으로 갱신하거나 새 실행 시계로
+해석하지 않는다. 새 작업의 취소·완료와 비용은 별도 실제 관측이며 원래 S/E/W 안에서
+검사한다. 기록 입력을 다시 계산한 사실은 과거 child의 물리 실행을 인증하지 않는다.
+
+원래 child의 CPU scalar score는 구조화된 원문이 없어 동등성이
+`unknown_not_structurally_reported`다. 새 독립 CPU의 score·조건·종료·노드와 새 NN
+출력·완료는 별도 사실로 남긴다. 과거 score를 파싱하거나 새 score로 덮어쓰지 않으며,
+같은 입력의 NN raw bit 대조와 CPU score 동등성을 혼동하지 않는다. 이 source 접점의
+존재는 실제 R2 실행·R3 Query admission·R4 utility·R5 수집·R6 대국의 완료 증거가 아니다.
 
 ### 현재 소스의 최종 인수 순서
 
@@ -168,7 +212,8 @@ P6의 양성 자체 CPU pair만으로 두 원문의 전체 구현 완료를 선�
    비용·utility 경계를 연결한다. 중복·순서 역전·늦은 결과·취소를 거부하고 unknown은
    masked로 보존한다. legacy receipt를 만들어 native 관측을 대신하지 않는다.
 4. 같은 통합 소스에서 actual 다중 Reply의 tensor·dispatch·소비·Repair anchor/revision,
-   분할·누출·영수증·저장을 인수한다. GPU 수치·공유 page·물리 수명 검사는 별도로 남긴다.
+   분할·누출·영수증·저장을 인수한다. 위 `34149e2` GPU 수치·resident 정상 종료 인수와
+   별개로 제품 GPU stop·늦은 root·미확정 완료 경로를 확인한다.
 5. 같은 최종 source/binary의 자체 CPU 상대 한 쌍을 기존 120초+1초·최대 256 ply·
    전체 15분+정리 30초로 실행한다. 두 판의 백/흑·시계·NN 소비·typed failed-go·Rules·
    PGN·EOF/reap/group 종료·필수 최종 저장을 확인한다. 과거 source에 고정된 준비
@@ -176,3 +221,8 @@ P6의 양성 자체 CPU pair만으로 두 원문의 전체 구현 완료를 선�
 6. 원문의 선택된 필수 요구사항을 source·CPU 검사·실제 CPU·GPU·paired 자료에
    대조하고 정확한 최종 SHA의 CI와 PR 인수 기록을 갱신한다. 미지원 선택적 연구,
    실제 학습 제외와 관측되지 않은 값은 완료 범위와 함께 명시한다.
+
+R7의 현재 잔여는 실제 R2의 기록 입력·독립 CPU/NN witness, R3의 다음 Query/episode
+ledger, R4의 전체 action 비용·utility, R5의 다중 Reply 수집·consumer, R6의 current-source
+자체 CPU_R 두 판과 process/storage 인수, 제품 GPU stop/late-root 인수 및 최종 SHA CI다.
+완료한 독립 GPU 검사와 소스·CPU fixture를 이 잔여 실행의 대체 증거로 사용하지 않는다.
