@@ -618,6 +618,8 @@ mod check {
         )?;
         Ok(RoleRecord {
             revision,
+            parent_revision: None,
+            supersedes_revision: None,
             origin_state: state,
             kind,
             line: vec![movement],

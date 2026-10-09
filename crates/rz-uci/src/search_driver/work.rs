@@ -29,6 +29,12 @@ impl PalsResolverIdentity {
             rz_search::pals::engine::PALS_VALUE_RESOLVER_SEMANTICS,
         )
     }
+    fn registered_model_wdl() -> Self {
+        Self::from_semantics(
+            rz_search::pals::value::MODEL_WDL_RESOLVER_VERSION,
+            rz_search::pals::value::MODEL_WDL_RESOLVER_SEMANTICS,
+        )
+    }
 }
 
 /// Immutable startup selection, not proof that a post-Repair Reply ran or won.
@@ -55,6 +61,8 @@ impl PalsSearchPolicyIdentity {
         for selected in [
             PostRepairRecheckPolicy::SameRepairedLineOnceV1,
             PostRepairRecheckPolicy::ActualOpponentContinuationV1,
+            PostRepairRecheckPolicy::FrozenModelWdlV2,
+            PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
         ] {
             let conditions: [u8; 32] =
                 Sha256::digest(selected.conditions().unwrap().as_bytes()).into();
@@ -336,12 +344,14 @@ impl ProcessWorkJournal {
         resolver: PalsResolverIdentity,
         policy: PalsSearchPolicyIdentity,
     ) -> Result<Self, ContractError> {
-        policy.validate()?;
-        if resolver != PalsResolverIdentity::registered() {
+        let selected = policy.selected_policy()?;
+        let own = resolver == PalsResolverIdentity::registered();
+        let model = resolver == PalsResolverIdentity::registered_model_wdl();
+        if !(own || selected.uses_frozen_model_wdl() && model) {
             return Err(ContractError::new(
                 ErrorCode::UnsupportedContract,
                 Stage::Admission,
-                "post-Repair recheck v1 requires the own CPU value resolver",
+                "post-Repair recheck requires a registered resolver; legacy v1 permits only the own CPU value resolver",
             ));
         }
         Ok(Self::with_registration(
@@ -674,6 +684,42 @@ mod tests {
         assert!(
             ProcessWorkJournal::new_pals_with_search_policy(foreign, policy_fixture()).is_err()
         );
+    }
+
+    #[test]
+    fn frozen_wdl_lanes_accept_both_registered_resolvers_and_reject_drift() {
+        use rz_search::pals::engine::PostRepairRecheckPolicy;
+        for selected in [
+            PostRepairRecheckPolicy::FrozenModelWdlV2,
+            PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
+        ] {
+            let policy = PalsSearchPolicyIdentity {
+                version: selected.registration_version().unwrap().into(),
+                policy: selected.registration_policy().unwrap().into(),
+                search_identity: selected.search_identity().into(),
+                conditions_sha256: Sha256::digest(selected.conditions().unwrap().as_bytes()).into(),
+            };
+            for resolver in [
+                PalsResolverIdentity::registered(),
+                PalsResolverIdentity::registered_model_wdl(),
+            ] {
+                let actual = ProcessWorkJournal::new_pals_with_search_policy(
+                    resolver.clone(),
+                    policy.clone(),
+                )
+                .unwrap()
+                .snapshot()
+                .unwrap();
+                assert_eq!(actual.pals_resolver, Some(resolver.clone()));
+                assert_eq!(actual.pals_search_policy, Some(policy.clone()));
+                let mut drifted = resolver;
+                drifted.semantics_sha256[0] ^= 1;
+                assert!(
+                    ProcessWorkJournal::new_pals_with_search_policy(drifted, policy.clone())
+                        .is_err()
+                );
+            }
+        }
     }
 
     #[test]

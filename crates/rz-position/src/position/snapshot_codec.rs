@@ -112,14 +112,12 @@ mod tests {
             } else {
                 HistoryCompleteness::UnknownPrefix
             };
-            assert!(
-                PositionSnapshot::from_uci_replay(
-                    &invalid,
-                    old.revision(),
-                    PositionLimits::default()
-                )
-                .is_err()
-            );
+            assert!(PositionSnapshot::from_uci_replay(
+                &invalid,
+                old.revision(),
+                PositionLimits::default()
+            )
+            .is_err());
         }
     }
 }

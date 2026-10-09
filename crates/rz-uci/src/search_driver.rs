@@ -10,7 +10,7 @@ use rz_search::cpu_checker::{
     ExternalUciIdentity, OwnedCheckerDescriptor, OwnedCpuChecker,
 };
 use rz_search::driver::SearchControl;
-use rz_search::pals::engine::{ModelValueIdentity, PostRepairRecheckPolicy};
+use rz_search::pals::engine::{ModelValueIdentity, PostRepairRecheckPolicy, ResolverPolicy};
 use sha2::{Digest as _, Sha256};
 use std::{
     fmt,
@@ -87,6 +87,7 @@ pub struct PalsCheckerRegistration {
     pub conditions: String,
     pub capabilities: CheckerCapabilities,
     pub owned_descriptor: Option<OwnedCheckerDescriptor>,
+    pub cpu_resume_policy: Option<rz_search::cpu::CpuResumePolicy>,
     pub role_model: String,
     pub model_value: Option<ModelValueIdentity>,
     pub resolver_version: &'static str,
@@ -97,11 +98,32 @@ impl PalsCheckerRegistration {
         checker: &dyn CpuChecker,
         model: &M,
     ) -> Result<Self, SearchSessionFailure> {
+        let policy = if matches!(checker.identity(), CheckerIdentity::ExternalUci(_)) {
+            ResolverPolicy::ModelWdlRestricted
+        } else {
+            ResolverPolicy::OwnRawRestricted
+        };
+        Self::capture_with_resolver(checker, model, policy)
+    }
+    fn capture_with_resolver<M: rz_search::pals::engine::RoleModel>(
+        checker: &dyn CpuChecker,
+        model: &M,
+        policy: ResolverPolicy,
+    ) -> Result<Self, SearchSessionFailure> {
         checker
             .validate_namespace()
             .map_err(|error| SearchSessionFailure::debug("PalsCheckerRegistration", &error))?;
         let external = matches!(checker.identity(), CheckerIdentity::ExternalUci(_));
-        let (resolver_version, resolver_semantics) = if external {
+        if external && policy == ResolverPolicy::OwnRawRestricted {
+            return Err(SearchSessionFailure {
+                physical_completion: DriverPhysicalCompletion::Confirmed,
+                code: "PalsResolverUnsupported",
+                detail: "own raw resolver requires an owned checker; no foreign helper was started"
+                    .into(),
+            });
+        }
+        let (resolver_version, resolver_semantics) = if policy == ResolverPolicy::ModelWdlRestricted
+        {
             (
                 rz_search::pals::value::MODEL_WDL_RESOLVER_VERSION,
                 rz_search::pals::value::MODEL_WDL_RESOLVER_SEMANTICS,
@@ -117,8 +139,9 @@ impl PalsCheckerRegistration {
             conditions: checker.conditions().to_owned(),
             capabilities: checker.capabilities(),
             owned_descriptor: checker.owned_descriptor(),
+            cpu_resume_policy: checker.owned_resume_policy(),
             role_model: model.identity().to_owned(),
-            model_value: if external {
+            model_value: if policy == ResolverPolicy::ModelWdlRestricted {
                 model.value_identity().cloned()
             } else {
                 None
@@ -386,8 +409,98 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
         identity: EngineIdentity,
         policy: PostRepairRecheckPolicy,
     ) -> Result<Self, SearchSessionFailure> {
-        let registration = PalsCheckerRegistration::capture(checker.as_ref(), &model)?;
+        let resolver = if matches!(checker.identity(), CheckerIdentity::ExternalUci(_)) {
+            ResolverPolicy::ModelWdlRestricted
+        } else {
+            ResolverPolicy::OwnRawRestricted
+        };
+        Self::new_with_boxed_checker_and_selected_policies(
+            config,
+            model,
+            checker,
+            max_rounds,
+            max_cpu_nodes,
+            cpu_depth,
+            identity,
+            resolver,
+            policy,
+            false,
+        )
+    }
+
+    /// Explicit independent resolver/refinement selection; legacy constructors
+    /// above retain their historical checker-dependent defaults and hashes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_boxed_checker_and_policies(
+        config: rz_search::pals::engine::PalsConfig,
+        model: M,
+        checker: Box<dyn CpuChecker>,
+        max_rounds: u64,
+        max_cpu_nodes: u64,
+        cpu_depth: u16,
+        identity: EngineIdentity,
+        resolver: ResolverPolicy,
+        policy: PostRepairRecheckPolicy,
+    ) -> Result<Self, SearchSessionFailure> {
+        Self::new_with_boxed_checker_and_selected_policies(
+            config,
+            model,
+            checker,
+            max_rounds,
+            max_cpu_nodes,
+            cpu_depth,
+            identity,
+            resolver,
+            policy,
+            true,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_policies(
+        config: rz_search::pals::engine::PalsConfig,
+        model: M,
+        cpu_config: rz_search::cpu::CpuConfig,
+        max_rounds: u64,
+        max_cpu_nodes: u64,
+        cpu_depth: u16,
+        identity: EngineIdentity,
+        resolver: ResolverPolicy,
+        policy: PostRepairRecheckPolicy,
+        resume: rz_search::cpu::CpuResumePolicy,
+    ) -> Result<Self, SearchSessionFailure> {
+        let cpu = rz_search::cpu::CpuEngine::with_resume_policy(cpu_config, resume)
+            .map_err(|error| SearchSessionFailure::debug("PalsCpuConstructor", &error))?;
+        let checker = OwnedCpuChecker::new(cpu)
+            .map_err(|error| SearchSessionFailure::debug("PalsCheckerConstructor", &error))?;
+        Self::new_with_boxed_checker_and_policies(
+            config,
+            model,
+            Box::new(checker),
+            max_rounds,
+            max_cpu_nodes,
+            cpu_depth,
+            identity,
+            resolver,
+            policy,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_boxed_checker_and_selected_policies(
+        config: rz_search::pals::engine::PalsConfig,
+        model: M,
+        checker: Box<dyn CpuChecker>,
+        max_rounds: u64,
+        max_cpu_nodes: u64,
+        cpu_depth: u16,
+        identity: EngineIdentity,
+        resolver: ResolverPolicy,
+        policy: PostRepairRecheckPolicy,
+        explicit: bool,
+    ) -> Result<Self, SearchSessionFailure> {
+        let registration =
+            PalsCheckerRegistration::capture_with_resolver(checker.as_ref(), &model, resolver)?;
         if policy != PostRepairRecheckPolicy::Disabled
+            && !policy.uses_frozen_model_wdl()
             && matches!(registration.identity, CheckerIdentity::ExternalUci(_))
         {
             return Err(SearchSessionFailure {
@@ -413,12 +526,27 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
         }
         let legacy_implementation =
             checker_implementation(&registration, &config, max_rounds, max_cpu_nodes, cpu_depth);
-        let engine =
+        let engine = if explicit {
+            rz_search::pals::engine::PalsEngine::new_with_boxed_checker_and_policies(
+                config, model, checker, resolver, policy,
+            )
+        } else {
             rz_search::pals::engine::PalsEngine::new_with_boxed_checker_and_refinement_policy(
                 config, model, checker, policy,
             )
-            .map_err(|error| SearchSessionFailure::debug("PalsConstructor", &error))?;
+        }
+        .map_err(|error| SearchSessionFailure::debug("PalsConstructor", &error))?;
         let search_policy = selected_search_policy(&engine, policy)?;
+        let legacy_implementation = if explicit {
+            let mut hash = Sha256::new();
+            hash.update(b"rz-uci-pals-followup-session/2\0");
+            hash.update(legacy_implementation.0);
+            hash.update(engine.search_identity());
+            hash.update(resolver.version());
+            Digest(hash.finalize().into())
+        } else {
+            legacy_implementation
+        };
         let implementation = search_policy
             .as_ref()
             .map_or(legacy_implementation, |selected| {
@@ -461,6 +589,38 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
 
     pub fn checker_registration(&self) -> &PalsCheckerRegistration {
         &self.registration
+    }
+    pub fn enable_archive(
+        &self,
+        config: rz_search::pals::store::ArchiveConfig,
+    ) -> Result<(), SearchSessionFailure> {
+        self.engine
+            .lock()
+            .map_err(|_| SearchSessionFailure::debug("PalsArchive", &"engine lock poisoned"))?
+            .enable_archive(config)
+            .map_err(|error| SearchSessionFailure::debug("PalsArchive", &error))
+    }
+    pub fn selected_policies(
+        &self,
+    ) -> Result<
+        (
+            ResolverPolicy,
+            PostRepairRecheckPolicy,
+            &'static str,
+            Option<&'static str>,
+        ),
+        SearchSessionFailure,
+    > {
+        let engine = self
+            .engine
+            .lock()
+            .map_err(|_| SearchSessionFailure::debug("PalsPolicies", &"engine lock poisoned"))?;
+        Ok((
+            engine.resolver_policy(),
+            engine.post_repair_recheck_policy(),
+            engine.search_identity(),
+            engine.refinement_conditions(),
+        ))
     }
     /// Available before any go, including when a later result is early/unknown.
     /// This does not attest that a recheck branch ran or refuted a repaired line.
@@ -1007,18 +1167,34 @@ fn pals_failure<M: rz_search::pals::engine::RoleModel>(
             rz_search::pals::engine::RoleError::PhysicalCompletionUnknown
         )
     );
-    if role_unknown {
-        return SearchSessionFailure::physical_completion_unknown();
-    }
     // An idle persistent process need not have exited or drained. Only actual
     // quarantine/ownership loss establishes unconfirmed physical completion.
     let checker_unknown = engine
         .checker_last_attempt()
         .and_then(|attempt| attempt.external.as_ref())
         .is_some_and(|attempt| attempt.process.quarantined || attempt.process.ownership_lost);
-    let mut failure = SearchSessionFailure::debug(code, error);
+    let mut failure = if role_unknown {
+        SearchSessionFailure::physical_completion_unknown()
+    } else {
+        SearchSessionFailure::debug(code, error)
+    };
     if checker_unknown {
         failure.physical_completion = DriverPhysicalCompletion::Unknown;
+    }
+    if let Some(cleanup_error) = engine.last_cpu_checkpoint_cleanup_error() {
+        // Keep the original failure and completion classification. The cleanup
+        // is a distinct typed cause; each backend-provided detail stays bounded.
+        let secondary = SearchSessionFailure::debug("CpuCheckpointCleanup", cleanup_error);
+        failure.detail.push_str("; ");
+        failure.detail.push_str(&secondary.to_string());
+        if matches!(
+            cleanup_error,
+            rz_search::pals::engine::PalsError::Role(
+                rz_search::pals::engine::RoleError::PhysicalCompletionUnknown
+            )
+        ) {
+            failure.physical_completion = DriverPhysicalCompletion::Unknown;
+        }
     }
     failure
 }
@@ -1038,9 +1214,14 @@ fn selected_search_policy<M: rz_search::pals::engine::RoleModel>(
         return Err(mismatch());
     }
     if requested == PostRepairRecheckPolicy::Disabled {
-        if engine.search_identity() != rz_search::pals::engine::PALS_SEARCH_VERSION
-            || engine.refinement_conditions().is_some()
-        {
+        let expected = match engine.search_identity() {
+            rz_search::pals::engine::PALS_SEARCH_VERSION => None,
+            rz_search::pals::engine::PALS_FOLLOWUP_SEARCH_VERSION => {
+                Some(rz_search::pals::engine::PALS_FOLLOWUP_CONDITIONS)
+            }
+            _ => return Err(mismatch()),
+        };
+        if engine.refinement_conditions() != expected {
             return Err(mismatch());
         }
         return Ok(None);
@@ -1961,6 +2142,291 @@ mod tests {
     fn refinement_checker() -> OwnedCpuChecker<rz_search::cpu::CpuEngine> {
         OwnedCpuChecker::new(rz_search::cpu::CpuEngine::new(refinement_cpu_config()).unwrap())
             .unwrap()
+    }
+
+    struct CancelingRoleFailure(RoleError);
+    impl RoleModel for CancelingRoleFailure {
+        fn identity(&self) -> &str {
+            "test-only-canceling-role-failure"
+        }
+        fn propose(&mut self, query: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+            query.cancel.store(true, Ordering::Release);
+            Err(self.0.clone())
+        }
+        fn reply(&mut self, _: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+            unreachable!("the first Proposer call fails")
+        }
+        fn repair(&mut self, _: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+            unreachable!("the first Proposer call fails")
+        }
+        fn divergences(&mut self, _: DivergenceQuery<'_>) -> Result<Vec<f32>, RoleError> {
+            unreachable!("the first Proposer call fails")
+        }
+    }
+
+    /// This in-process fixture declares a stack policy without its disposal
+    /// capability. It runs no CPU analysis and represents no physical GPU work.
+    struct MissingStackDisposal(OwnedCpuChecker<rz_search::cpu::CpuEngine>);
+    impl CpuChecker for MissingStackDisposal {
+        fn identity(&self) -> &CheckerIdentity {
+            self.0.identity()
+        }
+        fn conditions(&self) -> &str {
+            self.0.conditions()
+        }
+        fn capabilities(&self) -> CheckerCapabilities {
+            self.0.capabilities()
+        }
+        fn owned_descriptor(&self) -> Option<OwnedCheckerDescriptor> {
+            self.0.owned_descriptor()
+        }
+        fn owned_resume_policy(&self) -> Option<rz_search::cpu::CpuResumePolicy> {
+            self.0.owned_resume_policy()
+        }
+        fn last_attempt(&self) -> Option<&CheckerAttempt> {
+            self.0.last_attempt()
+        }
+        fn reset_attempt(&mut self) {
+            self.0.reset_attempt();
+        }
+        fn analyze(
+            &mut self,
+            _: &Position,
+            _: rz_search::cpu::CpuLimits,
+            _: &AtomicBool,
+        ) -> Result<rz_search::cpu_checker::CheckerReport, rz_search::cpu_checker::CheckerError>
+        {
+            unreachable!("the first Proposer call fails before CPU admission")
+        }
+        fn new_game(
+            &mut self,
+            deadline: Instant,
+            cancel: &AtomicBool,
+        ) -> Result<(), rz_search::cpu_checker::CheckerError> {
+            self.0.new_game(deadline, cancel)
+        }
+        fn shutdown(
+            &mut self,
+            deadline: Instant,
+        ) -> Result<CheckerShutdown, rz_search::cpu_checker::CheckerError> {
+            self.0.shutdown(deadline)
+        }
+    }
+
+    #[test]
+    fn pals_failure_preserves_secondary_checkpoint_cleanup_and_primary_completion() {
+        for primary in [
+            RoleError::Backend("actual primary role failure".into()),
+            RoleError::PhysicalCompletionUnknown,
+        ] {
+            let cpu = rz_search::cpu::CpuEngine::with_resume_policy(
+                refinement_cpu_config(),
+                rz_search::cpu::CpuResumePolicy::PausedStack,
+            )
+            .unwrap();
+            let checker = MissingStackDisposal(OwnedCpuChecker::new(cpu).unwrap());
+            let mut engine = rz_search::pals::engine::PalsEngine::new_with_boxed_checker(
+                refinement_config(),
+                CancelingRoleFailure(primary.clone()),
+                Box::new(checker),
+            )
+            .unwrap();
+            let cancel = AtomicBool::new(false);
+            let error = engine
+                .search(
+                    &Position::startpos(),
+                    rz_search::pals::engine::PalsLimits {
+                        deadline: Instant::now() + Duration::from_secs(1),
+                        max_rounds: 1,
+                        max_cpu_nodes: 8,
+                        cpu_depth: 1,
+                    },
+                    &cancel,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(&error, rz_search::pals::engine::PalsError::Role(actual) if actual == &primary)
+            );
+            assert!(matches!(
+                engine.last_cpu_checkpoint_cleanup_error(),
+                Some(rz_search::pals::engine::PalsError::Checker(
+                    rz_search::cpu_checker::CheckerError::Unsupported(
+                        "owned paused stack disposal"
+                    )
+                ))
+            ));
+            let failure = pals_failure("PalsSearch", &error, &engine);
+            assert!(
+                failure
+                    .detail
+                    .contains("CpuCheckpointCleanup: Checker(Unsupported")
+            );
+            assert!(failure.detail.contains("owned paused stack disposal"));
+            if primary == RoleError::PhysicalCompletionUnknown {
+                assert_eq!(failure.code, "PhysicalCompletionUnknown");
+                assert_eq!(
+                    failure.physical_completion,
+                    DriverPhysicalCompletion::Unknown
+                );
+            } else {
+                assert_eq!(failure.code, "PalsSearch");
+                assert_eq!(
+                    failure.physical_completion,
+                    DriverPhysicalCompletion::Confirmed
+                );
+                assert!(failure.detail.contains("actual primary role failure"));
+            }
+            assert!(failure.detail.len() <= 1100);
+        }
+    }
+
+    #[test]
+    fn followup_constructor_starts_owned_raw_and_model_wdl_frozen_lanes() {
+        for policy in [
+            PostRepairRecheckPolicy::Disabled,
+            PostRepairRecheckPolicy::FrozenModelWdlV2,
+            PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
+        ] {
+            for resolver in [
+                ResolverPolicy::OwnRawRestricted,
+                ResolverPolicy::ModelWdlRestricted,
+            ] {
+                let driver = PalsSessionDriver::new_with_policies(
+                    refinement_config(),
+                    rz_search::pals::engine::LegalOrderRoleMock,
+                    refinement_cpu_config(),
+                    1,
+                    8,
+                    1,
+                    refinement_name(),
+                    resolver,
+                    policy,
+                    rz_search::cpu::CpuResumePolicy::CompletedIteration,
+                )
+                .unwrap();
+                driver
+                    .start_checker(
+                        Instant::now() + Duration::from_secs(1),
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                    .unwrap();
+                assert!(driver.checker_started());
+                let (actual_resolver, actual_policy, identity, conditions) =
+                    driver.selected_policies().unwrap();
+                assert_eq!((actual_resolver, actual_policy), (resolver, policy));
+                if policy == PostRepairRecheckPolicy::Disabled {
+                    assert_eq!(
+                        identity,
+                        rz_search::pals::engine::PALS_FOLLOWUP_SEARCH_VERSION
+                    );
+                    assert_eq!(
+                        conditions,
+                        Some(rz_search::pals::engine::PALS_FOLLOWUP_CONDITIONS)
+                    );
+                } else {
+                    assert_eq!(identity, policy.search_identity());
+                    assert_eq!(conditions, policy.conditions());
+                }
+                let receipt = driver.work_receipt().unwrap().unwrap();
+                let registered = receipt.pals_resolver.unwrap();
+                assert_eq!(registered.version, resolver.version());
+                assert_eq!(registered.semantics_sha256, resolver.semantics_sha256());
+                assert_eq!(
+                    receipt.pals_search_policy.is_some(),
+                    policy != PostRepairRecheckPolicy::Disabled
+                );
+                assert_eq!(receipt.go_invocations, 0);
+                assert_eq!(receipt.pals.unwrap().role_calls, Some(0));
+                assert_eq!(
+                    driver
+                        .finish_checker(Instant::now() + Duration::from_secs(1))
+                        .unwrap(),
+                    CheckerShutdown::owned_no_process()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn followup_constructor_starts_external_model_wdl_frozen_lanes_without_search_work() {
+        for policy in [
+            PostRepairRecheckPolicy::Disabled,
+            PostRepairRecheckPolicy::FrozenModelWdlV2,
+            PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
+        ] {
+            let state = Arc::new(CheckerProbeState::default());
+            let driver = PalsSessionDriver::new_with_boxed_checker_and_policies(
+                refinement_config(),
+                rz_search::pals::engine::LegalOrderRoleMock,
+                Box::new(CheckerProbe::new(Arc::clone(&state))),
+                1,
+                8,
+                1,
+                refinement_name(),
+                ResolverPolicy::ModelWdlRestricted,
+                policy,
+            )
+            .unwrap();
+            assert!(!driver.checker_started());
+            assert_eq!(state.starts.load(Ordering::Acquire), 0);
+            driver
+                .start_checker(
+                    Instant::now() + Duration::from_secs(1),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap();
+            assert!(driver.checker_started());
+            assert_eq!(state.starts.load(Ordering::Acquire), 1);
+            assert_eq!(state.analyses.load(Ordering::Acquire), 0);
+            let receipt = driver.work_receipt().unwrap().unwrap();
+            let resolver = receipt.pals_resolver.unwrap();
+            assert_eq!(
+                resolver.version,
+                rz_search::pals::value::MODEL_WDL_RESOLVER_VERSION
+            );
+            assert_eq!(
+                resolver.semantics_sha256,
+                ResolverPolicy::ModelWdlRestricted.semantics_sha256()
+            );
+            assert_eq!(
+                receipt.pals_search_policy.is_some(),
+                policy != PostRepairRecheckPolicy::Disabled
+            );
+            assert_eq!(receipt.go_invocations, 0);
+            assert_eq!(receipt.pals.unwrap().role_calls, Some(0));
+            assert!(
+                driver
+                    .finish_checker(Instant::now() + Duration::from_secs(1))
+                    .unwrap()
+                    .cleanup_complete
+            );
+            assert_eq!(state.shutdowns.load(Ordering::Acquire), 1);
+        }
+    }
+
+    #[test]
+    fn followup_constructor_keeps_legacy_recheck_own_resolver_only() {
+        for policy in [
+            PostRepairRecheckPolicy::SameRepairedLineOnceV1,
+            PostRepairRecheckPolicy::ActualOpponentContinuationV1,
+        ] {
+            let result = PalsSessionDriver::new_with_policies(
+                refinement_config(),
+                rz_search::pals::engine::LegalOrderRoleMock,
+                refinement_cpu_config(),
+                1,
+                8,
+                1,
+                refinement_name(),
+                ResolverPolicy::ModelWdlRestricted,
+                policy,
+                rz_search::cpu::CpuResumePolicy::CompletedIteration,
+            );
+            let Err(failure) = result else {
+                panic!("legacy own-only recheck admitted a model resolver")
+            };
+            assert_eq!(failure.code, "PalsSearchPolicyRegistration");
+        }
     }
 
     #[test]

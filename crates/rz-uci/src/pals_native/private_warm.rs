@@ -7,6 +7,8 @@
 
 use rz_contracts::{CancelToken, RequestId};
 use rz_eval::pals_model::{PalsModelConfig, PalsModelInput, PalsRole};
+#[cfg(feature = "experimental-io-binding")]
+use rz_eval::pals_onnx::PalsCudaWarmInput;
 use rz_eval::pals_onnx::PalsWarmInput;
 use rz_eval::pals_private::{
     PhysicalSeedCompletion, PrivateCancelReason, PrivateInvocation, PrivateInvocationMode,
@@ -25,6 +27,11 @@ pub(super) const BANK_BYTES: u64 = 256 * 1024;
 pub(super) const TRANSIENT_BYTES: u64 = 256 * 1024;
 pub(super) const PAYLOAD_BYTES: u64 = 1024 * 1024;
 pub(super) const OWNER_RESERVATION_BYTES: u64 = BANK_BYTES + TRANSIENT_BYTES + 2 * PAYLOAD_BYTES;
+#[cfg(feature = "experimental-io-binding")]
+pub(super) const CUDA_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024;
+#[cfg(feature = "experimental-io-binding")]
+pub(super) const CUDA_OWNER_RESERVATION_BYTES: u64 =
+    BANK_BYTES + TRANSIENT_BYTES + 2 * CUDA_PAYLOAD_BYTES;
 
 pub(super) fn source_digest() -> [u8; 32] {
     Sha256::digest(include_bytes!("private_warm.rs")).into()
@@ -88,6 +95,7 @@ pub(super) struct PreparedWarm {
     external_cancel: usize,
     request: Option<PrivateSeedRequest>,
     frozen: Option<Arc<FrozenQuery>>,
+    model_config: PalsModelConfig,
 }
 pub(super) struct WarmPhysical {
     pub prepared: PreparedWarm,
@@ -95,6 +103,8 @@ pub(super) struct WarmPhysical {
     // Allocated before bank.begin; retained on unconfirmed handoff/physical
     // completion. The other full payload belongs to the real worker command.
     pub backup_payload: Option<PalsWarmInput>,
+    #[cfg(feature = "experimental-io-binding")]
+    pub backup_cuda_payload: Option<PalsCudaWarmInput>,
 }
 impl WarmPhysical {
     pub fn seed(&self) -> Option<&PrivateSeedLease> {
@@ -108,7 +118,7 @@ impl WarmPhysical {
                 input_key: self
                     .prepared
                     .input
-                    .canonical_input_key(&PalsModelConfig::baseline())
+                    .canonical_input_key(&self.prepared.model_config)
                     .map_err(|error| RoleError::Backend(error.to_string()))?,
             })
         }
@@ -121,6 +131,8 @@ struct PendingAcceptance {
 
 pub(super) struct NativeWarmState {
     model: PrivateModelIdentity,
+    model_config: PalsModelConfig,
+    mode: PrivateInvocationMode,
     bank: PrivateSeedBank,
     frozen: Mutex<[Vec<Arc<FrozenQuery>>; 2]>,
     pending: Mutex<Option<PendingAcceptance>>,
@@ -178,6 +190,37 @@ pub struct NativePrivateWarmRevocation {
 
 impl NativeWarmState {
     pub fn new(model: PrivateModelIdentity, game: u64) -> Result<Arc<Self>, RoleError> {
+        Self::new_in_domain(
+            model,
+            game,
+            PalsModelConfig::baseline(),
+            PrivateInvocationMode::ApproxWarmV1,
+        )
+    }
+    /// Exact-current CUDA query domain. Changed non-record bits and query lines
+    /// cause a bank miss, never replacement with an old query tensor.
+    #[cfg(feature = "experimental-io-binding")]
+    pub fn new_cuda(
+        model: PrivateModelIdentity,
+        game: u64,
+        model_config: PalsModelConfig,
+    ) -> Result<Arc<Self>, RoleError> {
+        Self::new_in_domain(
+            model,
+            game,
+            model_config,
+            PrivateInvocationMode::ApproxCudaWarmV2,
+        )
+    }
+    fn new_in_domain(
+        model: PrivateModelIdentity,
+        game: u64,
+        model_config: PalsModelConfig,
+        mode: PrivateInvocationMode,
+    ) -> Result<Arc<Self>, RoleError> {
+        model_config
+            .validate()
+            .map_err(|e| RoleError::Backend(e.to_string()))?;
         let bank = PrivateSeedBank::new(
             PrivateSeedLimits {
                 slots_per_role: 1,
@@ -195,6 +238,8 @@ impl NativeWarmState {
         }
         Ok(Arc::new(Self {
             model,
+            model_config,
+            mode,
             bank,
             frozen: Mutex::new(frozen),
             pending: Mutex::new(None),
@@ -250,7 +295,7 @@ impl NativeWarmState {
             return Err(RoleError::Deadline);
         }
         input
-            .validate(&PalsModelConfig::baseline())
+            .validate(&self.model_config)
             .map_err(|e| RoleError::Backend(e.to_string()))?;
         let is_value = logical.purpose == RoleQueryPurpose::ValueFresh;
         let frozen = if is_value {
@@ -272,43 +317,47 @@ impl NativeWarmState {
             if input.role != expected {
                 return Err(RoleError::InvalidOutput);
             }
-            let key = logical_key(logical, input.role);
-            let mut bank = self.frozen.lock().map_err(|_| RoleError::Unavailable)?;
-            let existing = bank[role]
-                .iter()
-                .find(|entry| {
-                    entry.key == key
-                        && entry.rules_revision == snapshot.revision()
-                        && entry.rules.matches(&snapshot)
-                })
-                .cloned();
-            let entry = if let Some(entry) = existing {
-                self.query_hits.fetch_add(1, Ordering::AcqRel);
-                entry
+            if self.mode == PrivateInvocationMode::ApproxCudaWarmV2 {
+                None
             } else {
-                let entry = Arc::new(FrozenQuery {
-                    key,
-                    rules: snapshot.weak_position_identity(),
-                    rules_revision: snapshot.revision(),
-                    bits: input.query.map(f32::to_bits),
-                    first_input: input
-                        .canonical_input_key(&PalsModelConfig::baseline())
-                        .map_err(|e| RoleError::Backend(e.to_string()))?,
-                });
-                if bank[role].len() == MAX_FROZEN_CONTEXTS_PER_ROLE {
-                    if Arc::strong_count(&bank[role][0]) != 1 {
-                        return Err(RoleError::Backend(
-                            "Native frozen-query pinned capacity exhausted".into(),
-                        ));
+                let key = logical_key(logical, input.role);
+                let mut bank = self.frozen.lock().map_err(|_| RoleError::Unavailable)?;
+                let existing = bank[role]
+                    .iter()
+                    .find(|entry| {
+                        entry.key == key
+                            && entry.rules_revision == snapshot.revision()
+                            && entry.rules.matches(&snapshot)
+                    })
+                    .cloned();
+                let entry = if let Some(entry) = existing {
+                    self.query_hits.fetch_add(1, Ordering::AcqRel);
+                    entry
+                } else {
+                    let entry = Arc::new(FrozenQuery {
+                        key,
+                        rules: snapshot.weak_position_identity(),
+                        rules_revision: snapshot.revision(),
+                        bits: input.query.map(f32::to_bits),
+                        first_input: input
+                            .canonical_input_key(&self.model_config)
+                            .map_err(|e| RoleError::Backend(e.to_string()))?,
+                    });
+                    if bank[role].len() == MAX_FROZEN_CONTEXTS_PER_ROLE {
+                        if Arc::strong_count(&bank[role][0]) != 1 {
+                            return Err(RoleError::Backend(
+                                "Native frozen-query pinned capacity exhausted".into(),
+                            ));
+                        }
+                        bank[role].remove(0);
                     }
-                    bank[role].remove(0);
-                }
-                bank[role].push(entry.clone());
-                self.query_freezes.fetch_add(1, Ordering::AcqRel);
-                entry
-            };
-            input.query = entry.bits.map(f32::from_bits);
-            Some(entry)
+                    bank[role].push(entry.clone());
+                    self.query_freezes.fetch_add(1, Ordering::AcqRel);
+                    entry
+                };
+                input.query = entry.bits.map(f32::from_bits);
+                Some(entry)
+            }
         };
         let request = if is_value {
             None
@@ -330,7 +379,7 @@ impl NativeWarmState {
                 context: PrivateRulesContext::seal(
                     &snapshot,
                     &input,
-                    &PalsModelConfig::baseline(),
+                    &self.model_config,
                     situation,
                 )
                 .map_err(private_error)?,
@@ -346,6 +395,7 @@ impl NativeWarmState {
             external_cancel: std::ptr::from_ref(external_cancel) as usize,
             request,
             frozen,
+            model_config: self.model_config.clone(),
         })
     }
     pub fn begin(&self, prepared: PreparedWarm) -> Result<WarmPhysical, RoleError> {
@@ -353,7 +403,7 @@ impl NativeWarmState {
             match self.bank.begin(
                 request.clone(),
                 &prepared.snapshot,
-                PrivateInvocationMode::ApproxWarmV1,
+                self.mode,
                 &prepared.cancel,
                 prepared.until,
             ) {
@@ -378,6 +428,8 @@ impl NativeWarmState {
             prepared,
             seed,
             backup_payload: None,
+            #[cfg(feature = "experimental-io-binding")]
+            backup_cuda_payload: None,
         })
     }
     /// Called exclusively after actual PhysicalPoll::Ready. Decode/observer
@@ -601,10 +653,19 @@ impl NativeWarmState {
                 .map_err(|_| RoleError::Unavailable)?
                 .is_some(),
             retained_prepared_input: retained.is_some(),
-            retained_full_payload_bytes: retained
-                .as_ref()
-                .and_then(|r| r.backup_payload.as_ref())
-                .map_or(0, PalsWarmInput::owned_host_bytes),
+            retained_full_payload_bytes: retained.as_ref().map_or(0, |r| {
+                let bytes = r
+                    .backup_payload
+                    .as_ref()
+                    .map_or(0, PalsWarmInput::owned_host_bytes);
+                #[cfg(feature = "experimental-io-binding")]
+                let bytes = bytes.saturating_add(
+                    r.backup_cuda_payload
+                        .as_ref()
+                        .map_or(0, PalsCudaWarmInput::owned_host_bytes),
+                );
+                bytes
+            }),
             first_query_input_sha256_per_role: std::array::from_fn(|i| {
                 frozen[i].iter().map(|f| f.first_input).collect()
             }),
@@ -688,7 +749,9 @@ mod tests {
             RoleQueryPurpose::RepairPolicy => super::super::NativeQueryKind::Repair,
             _ => super::super::NativeQueryKind::Propose,
         };
-        let input = super::super::prepare_role_input(&query, kind, [3; 32]).unwrap();
+        let input =
+            super::super::prepare_role_input_for_config(&query, kind, [3; 32], &core.model_config)
+                .unwrap();
         core.prepare(
             RequestId::new(ProcessEpoch(1), id),
             input,
@@ -720,6 +783,86 @@ mod tests {
     }
     fn latent() -> Vec<f32> {
         (0..6144).map(|i| i as f32 * 0.000125 + 0.25).collect()
+    }
+
+    #[cfg(feature = "experimental-io-binding")]
+    fn cuda_state() -> Arc<NativeWarmState> {
+        let legacy = state();
+        NativeWarmState::new_cuda(legacy.model, 0, PalsModelConfig::full_line_interaction_v2())
+            .unwrap()
+    }
+    #[cfg(feature = "experimental-io-binding")]
+    #[test]
+    fn cuda_current_query_reuses_only_accepted_seed_and_value_is_fresh() {
+        let core = cuda_state();
+        let position = Position::startpos();
+        let cancel = AtomicBool::new(false);
+        let until = Instant::now() + Duration::from_secs(30);
+        let mut context = context(PalsRole::Proposer);
+        let first = prepared(&core, &position, &context, 1, &cancel, until);
+        let query_bits = first.input.query.map(f32::to_bits);
+        let physical = core.begin(first).unwrap();
+        assert!(matches!(
+            physical.invocation().unwrap(),
+            PrivateInvocation::Fresh { .. }
+        ));
+        core.completed(physical, Some(&latent())).unwrap();
+        assert_eq!(core.snapshot().unwrap().accepted_seeds, 0);
+        accept(&core, &position, &context, 1, &cancel, until).unwrap();
+        context.public_revision = 1;
+        let second = prepared(&core, &position, &context, 2, &cancel, until);
+        assert_eq!(second.input.query.map(f32::to_bits), query_bits);
+        let physical = core.begin(second).unwrap();
+        assert!(matches!(
+            physical.invocation().unwrap(),
+            PrivateInvocation::ApproxCudaWarmV2 { .. }
+        ));
+        core.completed(physical, Some(&latent())).unwrap();
+        assert_eq!(core.snapshot().unwrap().accepted_seeds, 1);
+        let mut stale = context.clone();
+        stale.search_generation += 1;
+        assert!(accept(&core, &position, &stale, 2, &cancel, until).is_err());
+        core.reject_output(None);
+        let observed = core.snapshot().unwrap();
+        assert_eq!(observed.accepted_seeds, 1);
+        assert_eq!(observed.query_freezes, 0);
+        assert_eq!(observed.frozen_contexts_per_role, [0, 0]);
+        context.purpose = RoleQueryPurpose::ValueFresh;
+        let value = prepared(&core, &position, &context, 3, &cancel, until);
+        let physical = core.begin(value).unwrap();
+        assert!(physical.seed().is_none());
+        assert!(matches!(
+            physical.invocation().unwrap(),
+            PrivateInvocation::Fresh { .. }
+        ));
+        core.completed(physical, Some(&latent())).unwrap();
+        accept(&core, &position, &context, 3, &cancel, until).unwrap();
+        assert_eq!(core.snapshot().unwrap().accepted_seeds, 1);
+    }
+    #[cfg(feature = "experimental-io-binding")]
+    #[test]
+    fn cuda_unknown_retains_exact_prepared_input_and_bank_without_new_fence() {
+        let core = cuda_state();
+        let position = Position::startpos();
+        let cancel = AtomicBool::new(false);
+        let until = Instant::now() + Duration::from_secs(30);
+        let context = context(PalsRole::Proposer);
+        let first = prepared(&core, &position, &context, 1, &cancel, until);
+        let input = Arc::downgrade(&first.input);
+        let physical = core.begin(first).unwrap();
+        core.retain_unknown(physical, "cuda_fixture_completion_unknown");
+        let observed = core.snapshot().unwrap();
+        assert!(
+            observed.quarantined && observed.admission_closed && observed.retained_prepared_input
+        );
+        assert!(input.upgrade().is_some());
+        assert!(observed.active_lease.is_some());
+        assert_eq!(observed.accepted_seeds, 0);
+        assert_eq!(observed.known_seed_completions, 0);
+        assert!(matches!(
+            core.reset_after_known_fence(1),
+            Err(RoleError::PhysicalCompletionUnknown)
+        ));
     }
 
     #[test]
@@ -775,6 +918,8 @@ mod tests {
         let legal = position.legal_moves();
         let record = rz_search::pals::engine::RoleRecord {
             revision: 1,
+            parent_revision: None,
+            supersedes_revision: None,
             origin_state: context.state,
             kind: rz_search::pals::engine::RecordKind::Proposal,
             line: vec![legal[0]],
@@ -984,8 +1129,8 @@ mod tests {
         assert_eq!(snapshot.known_seed_completions, 1);
         assert_eq!(snapshot.pinned_entries, 1);
         assert!(core.reset_after_known_fence(1).is_err());
-        assert!(
-            core.prepare(
+        assert!(core
+            .prepare(
                 RequestId::new(ProcessEpoch(1), 3),
                 prepared(&state(), &position, &context, 3, &cancel, until)
                     .input
@@ -997,8 +1142,7 @@ mod tests {
                 CancelToken::new(),
                 &cancel
             )
-            .is_err()
-        );
+            .is_err());
         drop(core);
         assert!(owner.upgrade().is_some());
         assert!(input.upgrade().is_some());
@@ -1035,8 +1179,8 @@ mod tests {
             [3; 32],
         )
         .unwrap();
-        assert!(
-            core.prepare(
+        assert!(core
+            .prepare(
                 RequestId::new(ProcessEpoch(1), 3),
                 input,
                 position.snapshot(),
@@ -1045,8 +1189,7 @@ mod tests {
                 CancelToken::new(),
                 &cancel
             )
-            .is_err()
-        );
+            .is_err());
         assert_eq!(core.snapshot().unwrap().frozen_contexts_per_role, [2, 0]);
         assert!(held.frozen.is_some());
     }

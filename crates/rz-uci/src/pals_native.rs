@@ -6,7 +6,8 @@ pub use rz_eval::pals_device_resources::{
     NativeCudaRecordPagesLimitsInput, NativeCudaRecordPagesResourceInput,
 };
 use rz_eval::pals_model::{
-    PalsCandidateToken, PalsModelConfig, PalsModelInput, PalsRecordToken, PalsRole,
+    PalsCandidateToken, PalsFullLineInput, PalsModelConfig, PalsModelInput, PalsModelProfile,
+    PalsRecordLine, PalsRecordToken, PalsRole,
 };
 use rz_position::{
     BoardMove, Color, HistoryCompleteness, HistoryOrigin, PieceKind, Position, Square,
@@ -18,6 +19,7 @@ use std::collections::BTreeSet;
 use std::time::Instant;
 
 pub const PALS_RULES_ENCODING: &str = "rz-pals-rules-fields-v1";
+pub const PALS_RULES_FULL_LINE_ENCODING: &str = "rz-pals-rules-full-line-v2";
 pub const PALS_RULES_BASE_SEMANTICS: &str = "board:a1-h8;empty=0;white_PNBRQK=1..6;black_PNBRQK=7..12;history:newest_first_exact_fen;records:latest_kinds_and_author_critical_pinned;candidate_order:Rules;divergence_query:fields_1,3,4,8..14=0";
 const MAX_HISTORY: usize = 4096;
 
@@ -88,6 +90,55 @@ pub const PALS_DIVERGENCE_FEATURES: [&str; 8] = [
     "prefix_halfmove_clock:/150",
     "prefix_legal_candidate_count:/256",
 ];
+pub const PALS_FULL_LINE_FEATURES: [&str; 9] = [
+    "full_line.record_tokens",
+    "full_line.record_lengths",
+    "full_line.record_mask",
+    "full_line.query_tokens",
+    "full_line.query_lengths",
+    "full_line.query_mask",
+    "full_line.record_kind",
+    "full_line.parent_local_index",
+    "full_line.supersedes_local_index",
+];
+pub fn pals_rules_profile_for_config(config: &PalsModelConfig) -> &'static str {
+    if config.profile.uses_full_line() {
+        PALS_RULES_FULL_LINE_ENCODING
+    } else {
+        PALS_RULES_ENCODING
+    }
+}
+pub fn pals_record_features_for_config(config: &PalsModelConfig) -> [&'static str; 16] {
+    let mut features = PALS_RECORD_FEATURES;
+    if config.profile.uses_full_line() {
+        features[6] = "origin_state_id:disabled_v2_zero";
+    }
+    features
+}
+pub fn pals_query_features_for_config(config: &PalsModelConfig) -> [&'static str; 16] {
+    let mut features = PALS_QUERY_FEATURES;
+    if config.profile.uses_full_line() {
+        features[6] = "situation_revision:disabled_v2_zero";
+        features[7] = "deadline_remaining:disabled_v2_zero";
+    }
+    features
+}
+pub fn pals_rules_semantic_fields_for_config(
+    config: &PalsModelConfig,
+) -> impl Iterator<Item = &'static str> {
+    let mut fields = vec![
+        pals_rules_profile_for_config(config),
+        PALS_RULES_BASE_SEMANTICS,
+    ];
+    fields.extend(PALS_METADATA_FEATURES);
+    fields.extend(pals_record_features_for_config(config));
+    fields.extend(pals_query_features_for_config(config));
+    fields.extend(PALS_DIVERGENCE_FEATURES);
+    if config.profile.uses_full_line() {
+        fields.extend(PALS_FULL_LINE_FEATURES);
+    }
+    fields.into_iter()
+}
 pub fn pals_rules_semantic_fields() -> impl Iterator<Item = &'static str> {
     std::iter::once(PALS_RULES_ENCODING)
         .chain(std::iter::once(PALS_RULES_BASE_SEMANTICS))
@@ -97,8 +148,14 @@ pub fn pals_rules_semantic_fields() -> impl Iterator<Item = &'static str> {
         .chain(PALS_DIVERGENCE_FEATURES)
 }
 pub fn pals_rules_encoding_semantic_digest() -> [u8; 32] {
+    pals_rules_encoding_semantic_digest_for_config(&PalsModelConfig::baseline())
+}
+pub fn pals_rules_encoding_semantic_digest_for_profile(profile: PalsModelProfile) -> [u8; 32] {
+    pals_rules_encoding_semantic_digest_for_config(&PalsModelConfig::for_profile(profile))
+}
+pub fn pals_rules_encoding_semantic_digest_for_config(config: &PalsModelConfig) -> [u8; 32] {
     let mut h = Sha256::new();
-    for field in pals_rules_semantic_fields() {
+    for field in pals_rules_semantic_fields_for_config(config) {
         h.update((field.len() as u64).to_le_bytes());
         h.update(field.as_bytes());
     }
@@ -109,9 +166,19 @@ pub fn pals_rules_encoding_semantic_digest() -> [u8; 32] {
 /// pure identity getter grants no loaded-model or native execution authority;
 /// PrivateWarm continues to use its separate capability-owned encoding.
 pub fn pals_fresh_encoding_semantic_digest() -> [u8; 32] {
+    pals_fresh_encoding_semantic_digest_for_config(&PalsModelConfig::baseline())
+}
+pub fn pals_fresh_encoding_semantic_digest_for_profile(profile: PalsModelProfile) -> [u8; 32] {
+    pals_fresh_encoding_semantic_digest_for_config(&PalsModelConfig::for_profile(profile))
+}
+pub fn pals_fresh_encoding_semantic_digest_for_config(config: &PalsModelConfig) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(rz_eval::pals_model::PALS_ENCODING_SCHEMA);
-    h.update(pals_rules_encoding_semantic_digest());
+    h.update(config.profile.encoding_schema());
+    if config.profile != PalsModelProfile::LegacySummaryV1 {
+        h.update(config.profile.model_semantics());
+        h.update(config.profile.as_str());
+    }
+    h.update(pals_rules_encoding_semantic_digest_for_config(config));
     h.finalize().into()
 }
 pub fn pals_native_source_digest() -> [u8; 32] {
@@ -124,8 +191,15 @@ pub fn verify_pals_rules_profile(
     profile: Option<&str>,
     semantic_digest: Option<[u8; 32]>,
 ) -> Result<(), RoleError> {
+    verify_pals_rules_profile_for_config(profile, semantic_digest, &PalsModelConfig::baseline())
+}
+pub fn verify_pals_rules_profile_for_config(
+    profile: Option<&str>,
+    semantic_digest: Option<[u8; 32]>,
+    config: &PalsModelConfig,
+) -> Result<(), RoleError> {
     match (profile, semantic_digest) {
-        (Some(PALS_RULES_ENCODING), Some(digest)) if digest == pals_rules_encoding_semantic_digest() => Ok(()),
+        (Some(profile), Some(digest)) if profile == pals_rules_profile_for_config(config) && digest == pals_rules_encoding_semantic_digest_for_config(config) => Ok(()),
         (None, _) | (_, None) => Err(RoleError::Backend("PALS product export lacks the required Rules input semantic profile; legacy numeric fixtures do not authorize product execution".into())),
         _ => Err(RoleError::Backend("PALS export Rules input semantic profile differs from this encoder".into())),
     }
@@ -236,7 +310,8 @@ fn board_and_metadata(position: &Position) -> Result<(Vec<u8>, [f32; 16]), RoleE
 fn records(
     records: &[RoleRecord],
     revision: u64,
-) -> Result<(Vec<PalsRecordToken>, Vec<u64>), RoleError> {
+    config: &PalsModelConfig,
+) -> Result<(Vec<PalsRecordToken>, Vec<u64>, Option<Vec<PalsRecordLine>>), RoleError> {
     if records.len() > 16_384 {
         return Err(RoleError::Backend(
             "PALS public record scan budget exceeded".into(),
@@ -263,21 +338,59 @@ fn records(
             critical.insert(index);
         }
     }
-    if critical.len() > 128 {
+    if critical.len() > config.max_records {
         return Err(RoleError::Backend(
             "PALS critical context exceeds registered record width".into(),
         ));
     }
     let mut admitted = critical.clone();
+    // The bounded view retains direct evidence for its active critical records.
+    // Historical noncritical relationships stay in raw/archive provenance and
+    // may be absent from this model view; no unbounded ancestor walk is used.
+    if config.profile.uses_full_line() {
+        for &index in &critical {
+            for required in [
+                records[index].parent_revision,
+                records[index].supersedes_revision,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let mut matches = records
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, record)| record.revision == required);
+                let (target, _) = matches.next().ok_or_else(|| {
+                    RoleError::Backend("PALS full-line required relationship is unavailable".into())
+                })?;
+                if matches.next().is_some() || target == index {
+                    return Err(RoleError::Backend(
+                        "PALS full-line relationship is ambiguous or self-referential".into(),
+                    ));
+                }
+                admitted.insert(target);
+            }
+        }
+        if admitted.len() > config.max_records {
+            return Err(RoleError::Backend(
+                "PALS direct critical relationships exceed record bound".into(),
+            ));
+        }
+    }
     for index in (0..records.len()).rev() {
-        if admitted.len() == 128 {
+        if admitted.len() == config.max_records {
             break;
         }
         admitted.insert(index);
     }
     let mut result = Vec::with_capacity(admitted.len());
     let mut required = Vec::with_capacity(critical.len());
-    for index in admitted {
+    let selected: Vec<_> = admitted.into_iter().collect();
+    let mut full_line = config
+        .profile
+        .uses_full_line()
+        .then(|| Vec::with_capacity(selected.len()));
+    for &index in &selected {
         let record = &records[index];
         if record.line.len() > 256 {
             return Err(RoleError::Backend(
@@ -309,7 +422,11 @@ fn records(
         };
         features[5] = flag(record.perspective == Color::White);
         // An anchor identifier is a provenance field, never a calibrated score.
-        features[6] = record.origin_state.0 as f32;
+        features[6] = if config.profile.uses_full_line() {
+            0.0
+        } else {
+            record.origin_state.0 as f32
+        };
         features[7] = record.line.len() as f32 / 256.0;
         if let Some(movement) = record.line.first() {
             let c = candidate(*movement);
@@ -333,13 +450,51 @@ fn records(
             critical: is_critical,
             features,
         });
+        if let Some(lines) = &mut full_line {
+            let local = |relationship: Option<u64>| -> Result<Option<usize>, RoleError> {
+                let Some(revision) = relationship else {
+                    return Ok(None);
+                };
+                let mut matches = selected
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, index)| records[**index].revision == revision);
+                let target = matches.next().map(|(slot, _)| slot);
+                if matches.next().is_some() {
+                    return Err(RoleError::Backend(
+                        "PALS selected relationship is ambiguous".into(),
+                    ));
+                }
+                if target.is_none() && is_critical {
+                    return Err(RoleError::Backend(
+                        "PALS selected required relationship is missing".into(),
+                    ));
+                }
+                Ok(target)
+            };
+            lines.push(PalsRecordLine {
+                moves: record.line.iter().copied().map(candidate).collect(),
+                parent: local(record.parent_revision)?,
+                supersedes: local(record.supersedes_revision)?,
+                parent_required: is_critical && record.parent_revision.is_some(),
+                supersedes_required: is_critical && record.supersedes_revision.is_some(),
+            });
+        }
     }
-    Ok((result, required))
+    Ok((result, required, full_line))
 }
 pub fn prepare_role_input(
     query: &RoleQuery<'_>,
     kind: NativeQueryKind,
     model_epoch: [u8; 32],
+) -> Result<PalsModelInput, RoleError> {
+    prepare_role_input_for_config(query, kind, model_epoch, &PalsModelConfig::baseline())
+}
+pub fn prepare_role_input_for_config(
+    query: &RoleQuery<'_>,
+    kind: NativeQueryKind,
+    model_epoch: [u8; 32],
+    config: &PalsModelConfig,
 ) -> Result<PalsModelInput, RoleError> {
     query.check_control()?;
     if kind == NativeQueryKind::Divergence
@@ -355,7 +510,8 @@ pub fn prepare_role_input(
         ));
     }
     let (board, metadata) = board_and_metadata(query.position)?;
-    let (records, required_critical_records) = records(query.records, query.revision)?;
+    let (records, required_critical_records, full_line_records) =
+        records(query.records, query.revision, config)?;
     let candidates = query.legal.iter().copied().map(candidate).collect();
     let mut features = [0.0; 16];
     features[0] = match kind {
@@ -369,11 +525,19 @@ pub fn prepare_role_input(
     features[3] = flag(query.counterexample.is_some());
     features[4] = query.counterexample.map_or(0.0, |l| l.len() as f32 / 256.0);
     features[5] = query.legal.len() as f32 / 256.0;
-    features[6] = query.revision as f32;
-    features[7] = query
-        .deadline
-        .saturating_duration_since(Instant::now())
-        .as_secs_f32();
+    features[6] = if config.profile.uses_full_line() {
+        0.0
+    } else {
+        query.revision as f32
+    };
+    features[7] = if config.profile.uses_full_line() {
+        0.0
+    } else {
+        query
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs_f32()
+    };
     features[8] = flag(query.position.side_to_move() == Color::White);
     if let Some(movement) = query.prefix.last() {
         let c = candidate(*movement);
@@ -404,15 +568,32 @@ pub fn prepare_role_input(
         situation_revision: query.revision,
         history_digest: pals_history_digest(query.position)?,
         model_epoch,
+        full_line: full_line_records.map(|records| PalsFullLineInput {
+            records,
+            query_prefix: query.prefix.iter().copied().map(candidate).collect(),
+            query_proposal: query.proposal.iter().copied().map(candidate).collect(),
+            query_counter: query
+                .counterexample
+                .unwrap_or(&[])
+                .iter()
+                .copied()
+                .map(candidate)
+                .collect(),
+        }),
     };
-    input
-        .validate(&PalsModelConfig::baseline())
-        .map_err(model_error)?;
+    input.validate(config).map_err(model_error)?;
     Ok(input)
 }
 pub fn prepare_divergence_input(
     query: &DivergenceQuery<'_>,
     model_epoch: [u8; 32],
+) -> Result<PalsModelInput, RoleError> {
+    prepare_divergence_input_for_config(query, model_epoch, &PalsModelConfig::baseline())
+}
+pub fn prepare_divergence_input_for_config(
+    query: &DivergenceQuery<'_>,
+    model_epoch: [u8; 32],
+    config: &PalsModelConfig,
 ) -> Result<PalsModelInput, RoleError> {
     if query.cancel.load(std::sync::atomic::Ordering::Acquire) {
         return Err(RoleError::Canceled);
@@ -434,7 +615,8 @@ pub fn prepare_divergence_input(
         return Err(RoleError::InvalidOutput);
     }
     let (board, metadata) = board_and_metadata(query.root)?;
-    let (records, required_critical_records) = records(query.records, query.revision)?;
+    let (records, required_critical_records, full_line_records) =
+        records(query.records, query.revision, config)?;
     let mut prefix = query.root.clone();
     let mut by_ply = Vec::with_capacity(query.proposal.len());
     for (ply, movement) in query.proposal.iter().enumerate() {
@@ -466,11 +648,19 @@ pub fn prepare_divergence_input(
     features[0] = 3.0;
     features[2] = query.proposal.len() as f32 / 256.0;
     features[5] = query.candidates.len() as f32 / 128.0;
-    features[6] = query.revision as f32;
-    features[7] = query
-        .deadline
-        .saturating_duration_since(Instant::now())
-        .as_secs_f32();
+    features[6] = if config.profile.uses_full_line() {
+        0.0
+    } else {
+        query.revision as f32
+    };
+    features[7] = if config.profile.uses_full_line() {
+        0.0
+    } else {
+        query
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs_f32()
+    };
     features[15] = 1.0;
     let input = PalsModelInput {
         role: PalsRole::Critic,
@@ -484,10 +674,14 @@ pub fn prepare_divergence_input(
         situation_revision: query.revision,
         history_digest: pals_history_digest(query.root)?,
         model_epoch,
+        full_line: full_line_records.map(|records| PalsFullLineInput {
+            records,
+            query_prefix: vec![],
+            query_proposal: query.proposal.iter().copied().map(candidate).collect(),
+            query_counter: vec![],
+        }),
     };
-    input
-        .validate(&PalsModelConfig::baseline())
-        .map_err(model_error)?;
+    input.validate(config).map_err(model_error)?;
     Ok(input)
 }
 
@@ -529,6 +723,8 @@ mod native {
         PalsSessionResidency, PalsStartupStageProbe, PalsStartupStageSnapshot, PalsWarmCapability,
         PalsWarmInput,
     };
+    #[cfg(feature = "experimental-io-binding")]
+    use rz_eval::pals_onnx::{PalsCudaWarmCapability, PalsCudaWarmInput};
     use rz_eval::worker::{PhysicalLease, PhysicalPoll, SingleWorker};
     use rz_position::contracts::ContractPosition;
     use rz_runtime::contracts::{ContractClock, ContractSystemClock};
@@ -615,6 +811,7 @@ mod native {
         finishing: AtomicBool,
         shutdown: AtomicBool,
         model_epoch: [u8; 32],
+        model_config: PalsModelConfig,
         manifest_digest: [u8; 32],
         encoding_semantic_digest: [u8; 32],
         adapter_source_digest: [u8; 32],
@@ -645,15 +842,125 @@ mod native {
         private_warm: Option<NativeWarmOwner>,
         warm_admission: Mutex<Option<WarmAdmission>>,
     }
+    #[derive(Clone, Copy)]
+    enum NativeWarmCapability {
+        Cpu(PalsWarmCapability),
+        #[cfg(feature = "experimental-io-binding")]
+        Cuda(PalsCudaWarmCapability),
+    }
+    impl NativeWarmCapability {
+        fn model_identity(&self) -> rz_eval::pals_private::PrivateModelIdentity {
+            match self {
+                Self::Cpu(cap) => cap.private_model_identity(),
+                #[cfg(feature = "experimental-io-binding")]
+                Self::Cuda(cap) => cap.private_model_identity(),
+            }
+        }
+        fn implementation_digest(&self) -> [u8; 32] {
+            match self {
+                Self::Cpu(cap) => cap.implementation_digest(),
+                #[cfg(feature = "experimental-io-binding")]
+                Self::Cuda(cap) => cap.implementation_digest(),
+            }
+        }
+        fn owner_bytes(&self) -> u64 {
+            match self {
+                Self::Cpu(_) => private_warm::OWNER_RESERVATION_BYTES,
+                #[cfg(feature = "experimental-io-binding")]
+                Self::Cuda(_) => private_warm::CUDA_OWNER_RESERVATION_BYTES,
+            }
+        }
+        fn payload_bytes(&self) -> u64 {
+            match self {
+                Self::Cpu(_) => private_warm::PAYLOAD_BYTES,
+                #[cfg(feature = "experimental-io-binding")]
+                Self::Cuda(_) => private_warm::CUDA_PAYLOAD_BYTES,
+            }
+        }
+        fn state(&self, game: u64) -> Result<Arc<NativeWarmState>, RoleError> {
+            match self {
+                Self::Cpu(cap) => NativeWarmState::new(cap.private_model_identity(), game),
+                #[cfg(feature = "experimental-io-binding")]
+                Self::Cuda(cap) => NativeWarmState::new_cuda(
+                    cap.private_model_identity(),
+                    game,
+                    cap.model_config(),
+                ),
+            }
+        }
+        fn payload(&self, input: PalsModelInput) -> Result<NativeWarmPayload, BackendError> {
+            match self {
+                Self::Cpu(cap) => PalsWarmInput::fresh(cap, input).map(NativeWarmPayload::Cpu),
+                #[cfg(feature = "experimental-io-binding")]
+                Self::Cuda(cap) => {
+                    PalsCudaWarmInput::fresh(cap, input).map(NativeWarmPayload::Cuda)
+                }
+            }
+        }
+    }
+    enum NativeWarmPayload {
+        Cpu(PalsWarmInput),
+        #[cfg(feature = "experimental-io-binding")]
+        Cuda(PalsCudaWarmInput),
+    }
+    impl NativeWarmPayload {
+        fn owned_host_bytes(&self) -> u64 {
+            match self {
+                Self::Cpu(input) => input.owned_host_bytes(),
+                #[cfg(feature = "experimental-io-binding")]
+                Self::Cuda(input) => input.owned_host_bytes(),
+            }
+        }
+        fn initial_latent_bits(&self) -> &[u32] {
+            match self {
+                Self::Cpu(input) => input.initial_latent_bits(),
+                #[cfg(feature = "experimental-io-binding")]
+                Self::Cuda(input) => input.initial_latent_bits(),
+            }
+        }
+        fn bind_lease(
+            &mut self,
+            cap: &NativeWarmCapability,
+            lease: &rz_eval::pals_private::PrivateSeedLease,
+        ) -> Result<(), BackendError> {
+            match (self, cap) {
+                (Self::Cpu(input), NativeWarmCapability::Cpu(cap)) => input.bind_lease(cap, lease),
+                #[cfg(feature = "experimental-io-binding")]
+                (Self::Cuda(input), NativeWarmCapability::Cuda(cap)) => {
+                    input.bind_lease(cap, lease)
+                }
+                #[cfg(feature = "experimental-io-binding")]
+                _ => Err(BackendError::new(
+                    rz_eval::error::FailureKind::IdentityMismatch,
+                    rz_eval::error::FailureStage::Admission,
+                    "native warm capability/payload domains differ",
+                )),
+            }
+        }
+        fn command(self) -> PalsNativeCommand {
+            match self {
+                Self::Cpu(input) => PalsNativeCommand::EvaluatePrivateWarm(input),
+                #[cfg(feature = "experimental-io-binding")]
+                Self::Cuda(input) => PalsNativeCommand::EvaluateCudaWarm(input),
+            }
+        }
+        fn retain_backup(self, physical: &mut WarmPhysical) {
+            match self {
+                Self::Cpu(input) => physical.backup_payload = Some(input),
+                #[cfg(feature = "experimental-io-binding")]
+                Self::Cuda(input) => physical.backup_cuda_payload = Some(input),
+            }
+        }
+    }
     struct NativeWarmOwner {
-        capability: PalsWarmCapability,
+        capability: NativeWarmCapability,
         state: Arc<NativeWarmState>,
     }
     /// A single prepared physical handoff. Dropping it without real Ready
     /// conservatively retains the bank, frozen query and full backup payload.
     struct WarmAdmission {
         state: Arc<NativeWarmState>,
-        payload: Option<PalsWarmInput>,
+        payload: Option<NativeWarmPayload>,
         physical: Option<WarmPhysical>,
     }
     impl Drop for WarmAdmission {
@@ -711,6 +1018,16 @@ mod native {
         Ready(Result<&'a PalsNativeResult, &'a BackendError>),
         CompletionUnknown(NativeRoleCompletionUnknown),
     }
+    /// Immutable actual Warm admission. The seed bits belong to the bound full
+    /// worker payload, and the bank snapshot is observed after its real begin.
+    /// This callback grants no input/output replacement or seed acceptance.
+    #[derive(Clone, Copy)]
+    pub struct NativePrivateWarmPrepared<'a> {
+        pub invocation: rz_eval::pals_private::PrivateInvocation,
+        pub initial_latent_bits: &'a [u32],
+        pub seed_provenance: Option<&'a rz_eval::pals_private::PrivateSeedProvenance>,
+        pub bank: &'a NativePrivateWarmObservation,
+    }
     struct ObservedRoleExecution {
         binding: NativeRoleExecutionBinding,
         unknown_observed: bool,
@@ -737,6 +1054,20 @@ mod native {
             _logical: Option<&RoleLogicalContext>,
         ) -> Result<(), RoleError> {
             self.prepared(id, input, context)
+        }
+        /// Explicit Warm collector entry point. It never falls back to the
+        /// legacy Fresh prepared callback or relabels a seeded invocation.
+        fn prepared_private_warm(
+            &mut self,
+            _id: RequestId,
+            _input: &PalsModelInput,
+            _context: NativePreparedContext<'_>,
+            _logical: Option<&RoleLogicalContext>,
+            _prepared: NativePrivateWarmPrepared<'_>,
+        ) -> Result<(), RoleError> {
+            Err(RoleError::Backend(
+                "collector does not declare the private Warm observation namespace".into(),
+            ))
         }
         /// Called only after the actual worker submit and Lease ownership exist.
         /// Failure cannot undo physical admission; the runtime retains/drains it.
@@ -1899,17 +2230,23 @@ mod native {
         pub trained: bool,
         pub execution: NativeExecutionReceipt,
     }
-    fn transient_device_layout() -> Result<(u64, u64), RoleError> {
+    fn transient_device_layout_for_config(c: &PalsModelConfig) -> Result<(u64, u64), RoleError> {
         use rz_eval::pals_model::{
             DIVERGENCE_FEATURES, METADATA_FEATURES, QUERY_FEATURES, RECORD_FEATURES,
         };
-        let c = PalsModelConfig::baseline();
         let to_u64 = |n| u64::try_from(n).map_err(|_| RoleError::InvalidOutput);
         let r = to_u64(c.max_records)?;
         let candidates = to_u64(c.max_candidates)?;
         let divergences = to_u64(c.max_divergences)?;
         // Actual bounded ActiveInputs tensor layout: i64 board/candidates,
         // f32 numeric fields, bool masks and the shared P/C scalar condition.
+        let full_line_inputs = if c.profile.uses_full_line() {
+            // Exact fixed ABI: record/query move tokens, bool masks and two
+            // local relationships per selected record. No device peak claim.
+            r * 256 * (3 * 8 + 1) + 3 * 256 * (3 * 8 + 1) + r * 2 * 8
+        } else {
+            0
+        };
         let inputs = 64 * 8
             + to_u64(METADATA_FEATURES)? * 4
             + r * to_u64(RECORD_FEATURES)? * 4
@@ -1919,7 +2256,8 @@ mod native {
             + divergences * to_u64(DIVERGENCE_FEATURES)? * 4
             + divergences
             + to_u64(QUERY_FEATURES)? * 4
-            + 1;
+            + 1
+            + full_line_inputs;
         let tokens = to_u64(c.public_memory_tokens(c.max_records).map_err(model_error)?)?;
         // Two public K/V heads and mask plus private latent/policy/WDL/critic
         // outputs. Native graph workspace/weights remain the separately
@@ -1945,7 +2283,8 @@ mod native {
                             "PALS CUDA requires onnx-cuda on Linux; CPU fallback forbidden".into(),
                         ));
                     }
-                    let (request, physical) = transient_device_layout()?;
+                    let (request, physical) =
+                        transient_device_layout_for_config(backend.model_config())?;
                     (
                         "cuda",
                         Some(device_id),
@@ -1972,6 +2311,50 @@ mod native {
             }
             Some(rz_eval::onnx::NativeLoadingProfile::EagerCuda12Cudnn9V1) | None => None,
         };
+        let private_warm =
+            backend
+                .private_warm_capability()
+                .map(|cap| NativePrivateWarmDeclaration {
+                    schema: cap.schema(),
+                    query_semantics: cap.query_semantics(),
+                    export_manifest_sha256: cap.manifest_digest(),
+                    encoding_semantic_sha256: cap.private_model_identity().encoding,
+                    model_epoch: cap.model_epoch(),
+                    frozen_epoch: cap.private_model_identity().frozen_epoch,
+                    implementation_sha256: private_warm::source_digest(),
+                    loader_implementation_sha256: cap.implementation_digest(),
+                    frozen_contexts_per_role: private_warm::MAX_FROZEN_CONTEXTS_PER_ROLE,
+                    accepted_seeds_per_role: 1,
+                    bank_bytes: private_warm::BANK_BYTES,
+                    transient_bytes: private_warm::TRANSIENT_BYTES,
+                    payload_bytes: private_warm::PAYLOAD_BYTES,
+                    reserved_owner_bytes: private_warm::OWNER_RESERVATION_BYTES,
+                    value_always_fresh: true,
+                    native_cpu_loaded_capability: true,
+                });
+        #[cfg(feature = "experimental-io-binding")]
+        let private_warm = private_warm.or_else(|| {
+            backend
+                .private_cuda_warm_capability()
+                .map(|cap| NativePrivateWarmDeclaration {
+                    schema: cap.schema(),
+                    query_semantics: cap.query_semantics(),
+                    export_manifest_sha256: cap.manifest_digest(),
+                    encoding_semantic_sha256: cap.private_model_identity().encoding,
+                    model_epoch: cap.model_epoch(),
+                    frozen_epoch: cap.private_model_identity().frozen_epoch,
+                    implementation_sha256: private_warm::source_digest(),
+                    loader_implementation_sha256: cap.implementation_digest(),
+                    frozen_contexts_per_role: 0,
+                    accepted_seeds_per_role: 1,
+                    bank_bytes: private_warm::BANK_BYTES,
+                    transient_bytes: private_warm::TRANSIENT_BYTES,
+                    payload_bytes: private_warm::CUDA_PAYLOAD_BYTES,
+                    reserved_owner_bytes: private_warm::CUDA_OWNER_RESERVATION_BYTES,
+                    value_always_fresh: true,
+                    native_cpu_loaded_capability: false,
+                })
+        });
         Ok(NativeExecutionReceipt {
             provider,
             device_id,
@@ -1990,26 +2373,7 @@ mod native {
             host_record_pages: backend
                 .host_record_page_snapshot()
                 .map(|snapshot| NativeHostRecordPageDeclaration::from_policy(snapshot.policy)),
-            private_warm: backend.private_warm_capability().map(|cap| {
-                NativePrivateWarmDeclaration {
-                    schema: cap.schema(),
-                    query_semantics: cap.query_semantics(),
-                    export_manifest_sha256: cap.manifest_digest(),
-                    encoding_semantic_sha256: cap.private_model_identity().encoding,
-                    model_epoch: cap.model_epoch(),
-                    frozen_epoch: cap.private_model_identity().frozen_epoch,
-                    implementation_sha256: private_warm::source_digest(),
-                    loader_implementation_sha256: cap.implementation_digest(),
-                    frozen_contexts_per_role: private_warm::MAX_FROZEN_CONTEXTS_PER_ROLE,
-                    accepted_seeds_per_role: 1,
-                    bank_bytes: private_warm::BANK_BYTES,
-                    transient_bytes: private_warm::TRANSIENT_BYTES,
-                    payload_bytes: private_warm::PAYLOAD_BYTES,
-                    reserved_owner_bytes: private_warm::OWNER_RESERVATION_BYTES,
-                    value_always_fresh: true,
-                    native_cpu_loaded_capability: true,
-                }
-            }),
+            private_warm,
             cuda_record_pages: None,
         })
     }
@@ -2466,24 +2830,45 @@ mod native {
                 Err(RoleError::InvalidOutput)
             };
         };
-        if receipt.execution.provider != "cpu"
-            || receipt.execution.device_public_memory
-            || declaration.schema != rz_eval::pals_onnx::PRIVATE_WARM_SCHEMA
-            || declaration.query_semantics != rz_eval::pals_onnx::FROZEN_QUERY_SEMANTICS_V1
+        let domain = if declaration.schema == rz_eval::pals_onnx::PRIVATE_WARM_SCHEMA {
+            receipt.execution.provider == "cpu"
+                && !receipt.execution.device_public_memory
+                && declaration.query_semantics == rz_eval::pals_onnx::FROZEN_QUERY_SEMANTICS_V1
+                && declaration.frozen_contexts_per_role
+                    == private_warm::MAX_FROZEN_CONTEXTS_PER_ROLE
+                && declaration.payload_bytes == private_warm::PAYLOAD_BYTES
+                && declaration.reserved_owner_bytes == private_warm::OWNER_RESERVATION_BYTES
+                && declaration.native_cpu_loaded_capability
+        } else {
+            #[cfg(feature = "experimental-io-binding")]
+            {
+                declaration.schema == rz_eval::pals_onnx::PRIVATE_CUDA_WARM_SCHEMA
+                    && receipt.execution.provider == "cuda"
+                    && receipt.execution.device_public_memory
+                    && declaration.query_semantics
+                        == rz_eval::pals_onnx::PRIVATE_CUDA_QUERY_SEMANTICS
+                    && declaration.frozen_contexts_per_role == 0
+                    && declaration.payload_bytes == private_warm::CUDA_PAYLOAD_BYTES
+                    && declaration.reserved_owner_bytes
+                        == private_warm::CUDA_OWNER_RESERVATION_BYTES
+                    && !declaration.native_cpu_loaded_capability
+            }
+            #[cfg(not(feature = "experimental-io-binding"))]
+            {
+                false
+            }
+        };
+        if !domain
             || declaration.export_manifest_sha256 != receipt.export_manifest_sha256
             || declaration.encoding_semantic_sha256 != receipt.encoding_semantic_sha256
             || declaration.model_epoch != receipt.model_epoch
             || declaration.frozen_epoch != receipt.frozen_epoch
             || declaration.implementation_sha256 != private_warm::source_digest()
             || declaration.loader_implementation_sha256 == [0; 32]
-            || declaration.frozen_contexts_per_role != private_warm::MAX_FROZEN_CONTEXTS_PER_ROLE
             || declaration.accepted_seeds_per_role != 1
             || declaration.bank_bytes != private_warm::BANK_BYTES
             || declaration.transient_bytes != private_warm::TRANSIENT_BYTES
-            || declaration.payload_bytes != private_warm::PAYLOAD_BYTES
-            || declaration.reserved_owner_bytes != private_warm::OWNER_RESERVATION_BYTES
             || !declaration.value_always_fresh
-            || !declaration.native_cpu_loaded_capability
         {
             return Err(RoleError::InvalidOutput);
         }
@@ -3101,15 +3486,16 @@ mod native {
             } else {
                 None
             };
-            let command =
-                if let Some(admission) = &mut warm {
-                    PalsNativeCommand::EvaluatePrivateWarm(admission.payload.take().ok_or_else(
-                        || fault(ErrorCode::BackendFailure, "PALS warm payload missing"),
-                    )?)
-                } else {
-                    // Default Fresh ownership/serialization is unchanged.
-                    PalsNativeCommand::Evaluate(request.role().state.as_ref().clone())
-                };
+            let command = if let Some(admission) = &mut warm {
+                admission
+                    .payload
+                    .take()
+                    .ok_or_else(|| fault(ErrorCode::BackendFailure, "PALS warm payload missing"))?
+                    .command()
+            } else {
+                // Default Fresh ownership/serialization is unchanged.
+                PalsNativeCommand::Evaluate(request.role().state.as_ref().clone())
+            };
             let physical = self
                 .owner
                 .worker
@@ -3260,7 +3646,7 @@ mod native {
             let output = raw.and_then(|raw| {
                 let request = lease.request.role();
                 let decoded = raw
-                    .decode(&request.state, &PalsModelConfig::baseline())
+                    .decode(&request.state, &self.owner.model_config)
                     .map_err(|_| {
                         fault(
                             ErrorCode::NumericalFailure,
@@ -3517,6 +3903,40 @@ mod native {
             .map_err(model_error)?;
             Self::new_with_options(backend, options)
         }
+        #[cfg(feature = "experimental-io-binding")]
+        pub fn load_with_runtime_and_cuda_private_warm_with_options(
+            export: &std::path::Path,
+            expected_export_sha256: &str,
+            runtime: rz_eval::onnx::OrtRuntime,
+            config: rz_eval::pals_onnx::PalsOnnxConfig,
+            options: NativeOwnerOptions,
+            control: Option<(PalsCudaControlPolicy, &std::path::Path)>,
+        ) -> Result<Self, RoleError> {
+            options.validate(&config)?;
+            if options.host_record_pages.is_some() {
+                return Err(RoleError::Backend("CUDA Warm requires the device public owner; host record pages cannot be selected".into()));
+            }
+            let backend = match control {
+                Some((policy, profile)) => {
+                    PalsOnnxBackend::load_cuda_private_warm_with_control_policy(
+                        export,
+                        expected_export_sha256,
+                        runtime,
+                        config,
+                        policy,
+                        profile,
+                    )
+                }
+                None => PalsOnnxBackend::load_cuda_private_warm(
+                    export,
+                    expected_export_sha256,
+                    runtime,
+                    config,
+                ),
+            }
+            .map_err(model_error)?;
+            Self::new_with_options(backend, options)
+        }
         pub fn load_pinned_with_cuda_control_policy(
             export: &std::path::Path,
             expected_export_sha256: &str,
@@ -3673,7 +4093,17 @@ mod native {
         ) -> Result<Self, RoleError> {
             options.validate(&backend.config())?;
             let drain_limit = options.drain_limit;
-            let warm_capability = backend.private_warm_capability().copied();
+            let warm_capability = backend
+                .private_warm_capability()
+                .copied()
+                .map(NativeWarmCapability::Cpu);
+            #[cfg(feature = "experimental-io-binding")]
+            let warm_capability = warm_capability.or_else(|| {
+                backend
+                    .private_cuda_warm_capability()
+                    .cloned()
+                    .map(NativeWarmCapability::Cuda)
+            });
             let resident_resources = registration
                 .as_ref()
                 .map(|registration| {
@@ -3705,7 +4135,7 @@ mod native {
                     "Resident CUDA backend requires the explicit owned factory".into(),
                 ));
             }
-            if warm_capability.is_some()
+            if matches!(warm_capability, Some(NativeWarmCapability::Cpu(_)))
                 && (backend.config().provider != rz_eval::onnx::Provider::Cpu
                     || backend.config().device_public_memory)
             {
@@ -3737,11 +4167,11 @@ mod native {
             let additional_host_bytes = REQUEST_BYTES
                 .checked_add(page_reservation)
                 .and_then(|b| {
-                    b.checked_add(if warm_capability.is_some() {
-                        private_warm::OWNER_RESERVATION_BYTES
-                    } else {
-                        0
-                    })
+                    b.checked_add(
+                        warm_capability
+                            .as_ref()
+                            .map_or(0, NativeWarmCapability::owner_bytes),
+                    )
                 })
                 .and_then(|b| {
                     b.checked_add(
@@ -3754,11 +4184,11 @@ mod native {
             let runtime_host_bytes = (4 * REQUEST_BYTES)
                 .checked_add(page_reservation)
                 .and_then(|b| {
-                    b.checked_add(if warm_capability.is_some() {
-                        private_warm::OWNER_RESERVATION_BYTES
-                    } else {
-                        0
-                    })
+                    b.checked_add(
+                        warm_capability
+                            .as_ref()
+                            .map_or(0, NativeWarmCapability::owner_bytes),
+                    )
                 })
                 .and_then(|b| {
                     b.checked_add(
@@ -3778,18 +4208,19 @@ mod native {
             // CUDA load already verifies pinned dependencies. The full origin
             // audit requires the first physical Run, performed by this same
             // worker in prepare_startup before protocol readiness is served.
-            verify_pals_rules_profile(
+            let model_config = backend.model_config().clone();
+            verify_pals_rules_profile_for_config(
                 backend.rules_input_profile(),
                 backend.rules_input_semantic_sha256(),
+                &model_config,
             )?;
             let model_epoch = backend.model_epoch();
             let model = Digest(backend.manifest_digest());
-            let encoding = Digest(
-                warm_capability.map_or_else(pals_fresh_encoding_semantic_digest, |cap| {
-                    cap.private_model_identity().encoding
-                }),
-            );
-            let adapter_source_digest = if let Some(cap) = warm_capability {
+            let encoding = Digest(warm_capability.as_ref().map_or_else(
+                || pals_fresh_encoding_semantic_digest_for_config(&model_config),
+                |cap| cap.model_identity().encoding,
+            ));
+            let adapter_source_digest = if let Some(cap) = &warm_capability {
                 let mut hash = Sha256::new();
                 hash.update(b"rz-pals-native-private-warm-adapter/1");
                 hash.update(pals_native_source_digest());
@@ -3810,7 +4241,13 @@ mod native {
                     .collect::<String>()
             );
             if warm_capability.is_some() {
-                identity.push_str("-cpu-approx-warm-query-v1");
+                identity.push_str(
+                    if matches!(warm_capability, Some(NativeWarmCapability::Cpu(_))) {
+                        "-cpu-approx-warm-query-v1"
+                    } else {
+                        "-cuda-approx-warm-v2"
+                    },
+                );
             }
             if is_cuda {
                 identity.push_str(&format!(
@@ -3873,7 +4310,8 @@ mod native {
             let game = if warm_capability.is_some() { 0 } else { 1 };
             let private_warm = warm_capability
                 .map(|capability| {
-                    NativeWarmState::new(capability.private_model_identity(), game)
+                    capability
+                        .state(game)
                         .map(|state| NativeWarmOwner { capability, state })
                 })
                 .transpose()?;
@@ -3922,6 +4360,7 @@ mod native {
                 finishing: AtomicBool::new(false),
                 shutdown: AtomicBool::new(false),
                 model_epoch,
+                model_config,
                 manifest_digest: model.0,
                 encoding_semantic_digest: encoding.0,
                 adapter_source_digest,
@@ -4026,6 +4465,22 @@ mod native {
         pub fn model_epoch(&self) -> [u8; 32] {
             self.model_epoch
         }
+        pub fn model_config(&self) -> &PalsModelConfig {
+            &self.owner.model_config
+        }
+        fn fresh_command(&self, input: PalsModelInput) -> Result<PalsNativeCommand, RoleError> {
+            #[cfg(feature = "experimental-io-binding")]
+            if let Some(NativeWarmOwner {
+                capability: NativeWarmCapability::Cuda(cap),
+                ..
+            }) = &self.owner.private_warm
+            {
+                return PalsCudaWarmInput::fresh(cap, input)
+                    .map(PalsNativeCommand::EvaluateCudaWarm)
+                    .map_err(model_error);
+            }
+            Ok(PalsNativeCommand::Evaluate(input))
+        }
         /// Actual CPU invocation-factory interval in the caller's Instant domain.
         /// None is unobserved, including generic loaders; it is never zero cost.
         pub fn invocation_load_interval(&self) -> Option<(Instant, Instant)> {
@@ -4038,7 +4493,7 @@ mod native {
                 export_manifest_sha256: self.owner.manifest_digest,
                 encoding_semantic_sha256: self.owner.encoding_semantic_digest,
                 adapter_source_sha256: self.owner.adapter_source_digest,
-                model_configuration: PalsModelConfig::baseline(),
+                model_configuration: self.owner.model_config.clone(),
                 trained: self.owner.trained,
                 execution: self.owner.execution_receipt(),
             }
@@ -4146,10 +4601,10 @@ mod native {
                 ));
             }
             input
-                .validate(&PalsModelConfig::baseline())
+                .validate(&self.owner.model_config)
                 .map_err(model_error)?;
             if input
-                .canonical_input_key(&PalsModelConfig::baseline())
+                .canonical_input_key(&self.owner.model_config)
                 .map_err(model_error)?
                 != expected_input_key
             {
@@ -4169,10 +4624,10 @@ mod native {
             let input = actual_input.ok_or(RoleError::InvalidOutput)?;
             // Decode the immutable physical job, never a reconstructed RoleQuery.
             raw_output
-                .decode(&input, &PalsModelConfig::baseline())
+                .decode(&input, &self.owner.model_config)
                 .map_err(model_error)?;
             if input
-                .canonical_input_key(&PalsModelConfig::baseline())
+                .canonical_input_key(&self.owner.model_config)
                 .map_err(model_error)?
                 != expected_input_key
             {
@@ -4374,6 +4829,26 @@ mod native {
             if self.owner.private_warm.is_some() {
                 return Err(RoleError::Backend("Native private warm collector schema is unsupported; Fresh observer evidence is not warm provenance".into()));
             }
+            self.install_observer(observer)
+        }
+        /// Opt into the actual private Warm namespace. The collector must
+        /// implement prepared_private_warm and sees borrowed immutable payloads.
+        pub fn set_private_warm_observer(
+            &mut self,
+            observer: Box<dyn NativeRoleObserver>,
+        ) -> Result<(), RoleError> {
+            if self.owner.private_warm.is_none() {
+                return Err(RoleError::Backend(
+                    "private Warm observer requires an actual loaded private Warm capability"
+                        .into(),
+                ));
+            }
+            self.install_observer(observer)
+        }
+        fn install_observer(
+            &mut self,
+            observer: Box<dyn NativeRoleObserver>,
+        ) -> Result<(), RoleError> {
             if self.runtime.state().executions != 0
                 || self.owner.in_flight.load(Ordering::Acquire) != 0
                 || self.delivered_request.is_some()
@@ -4475,7 +4950,7 @@ mod native {
                             "prepare_proposer_input"
                         };
                     }
-                    let input = prepare_role_input(
+                    let input = prepare_role_input_for_config(
                         &RoleQuery {
                             position: &position,
                             legal: &legal,
@@ -4489,9 +4964,10 @@ mod native {
                         },
                         kind,
                         self.model_epoch,
+                        &self.owner.model_config,
                     )?;
                     if !matches!(
-                        self.startup_command(PalsNativeCommand::Evaluate(input), until)?,
+                        self.startup_command(self.fresh_command(input)?, until)?,
                         PalsNativeResult::Evaluation(_)
                     ) {
                         return Err(RoleError::InvalidOutput);
@@ -4820,13 +5296,22 @@ mod native {
                         // output validation without recomputing/duplicating it.
                         let checked = match result {
                             Ok(result) => {
-                                if let (
-                                    PalsNativeCommand::Evaluate(input),
-                                    PalsNativeResult::Evaluation(raw),
-                                ) = (lease.input(), &result)
+                                let input = match lease.input() {
+                                    PalsNativeCommand::Evaluate(input) => Some(input),
+                                    PalsNativeCommand::EvaluatePrivateWarm(input) => {
+                                        Some(input.input())
+                                    }
+                                    #[cfg(feature = "experimental-io-binding")]
+                                    PalsNativeCommand::EvaluateCudaWarm(input) => {
+                                        Some(input.input())
+                                    }
+                                    _ => None,
+                                };
+                                if let (Some(input), PalsNativeResult::Evaluation(raw)) =
+                                    (input, &result)
                                 {
                                     let checked = raw
-                                        .decode(input, &PalsModelConfig::baseline())
+                                        .decode(input, &self.owner.model_config)
                                         .map_err(model_error);
                                     if checked.is_ok() {
                                         let mut probe = self
@@ -5121,14 +5606,16 @@ mod native {
                     canceled,
                 )?;
                 // All full storage is allocated/budgeted before bank.begin.
-                let mut payload =
-                    PalsWarmInput::fresh(&warm.capability, prepared.input.as_ref().clone())
-                        .map_err(model_error)?;
-                let mut backup =
-                    PalsWarmInput::fresh(&warm.capability, prepared.input.as_ref().clone())
-                        .map_err(model_error)?;
-                if payload.owned_host_bytes() > private_warm::PAYLOAD_BYTES
-                    || backup.owned_host_bytes() > private_warm::PAYLOAD_BYTES
+                let mut payload = warm
+                    .capability
+                    .payload(prepared.input.as_ref().clone())
+                    .map_err(model_error)?;
+                let mut backup = warm
+                    .capability
+                    .payload(prepared.input.as_ref().clone())
+                    .map_err(model_error)?;
+                if payload.owned_host_bytes() > warm.capability.payload_bytes()
+                    || backup.owned_host_bytes() > warm.capability.payload_bytes()
                 {
                     return Err(RoleError::Backend(
                         "Native warm full payload reservation exhausted".into(),
@@ -5146,7 +5633,7 @@ mod native {
                 } else {
                     Ok(())
                 };
-                physical.backup_payload = Some(backup);
+                backup.retain_backup(&mut physical);
                 if let Err(error) = bound {
                     warm.state
                         .retain_unknown(physical, "prelaunch_payload_bind_failed");
@@ -5186,11 +5673,15 @@ mod native {
                         rz_eval::pals_private::PrivateInvocation::ApproxWarmV1 {
                             invocation_key,
                             ..
+                        }
+                        | rz_eval::pals_private::PrivateInvocation::ApproxCudaWarmV2 {
+                            invocation_key,
+                            ..
                         } => invocation_key,
                     }
                 } else {
                     input
-                        .canonical_input_key(&PalsModelConfig::baseline())
+                        .canonical_input_key(&self.owner.model_config)
                         .map_err(model_error)?
                 }),
                 history: Digest(input.history_digest),
@@ -5275,14 +5766,35 @@ mod native {
                 state: state_identity,
                 key,
             });
-            self.owner.observe("prepared", |observer| {
-                observer.prepared_with_logical_context(
-                    id,
-                    request.state.as_ref(),
-                    prepared_context,
-                    logical,
-                )
-            })?;
+            if let Some(admission) = &warm_admission {
+                let physical = admission.physical.as_ref().ok_or(RoleError::Unavailable)?;
+                let payload = admission.payload.as_ref().ok_or(RoleError::Unavailable)?;
+                self.owner.observe("prepared_private_warm", |observer| {
+                    let bank = admission.state.snapshot()?;
+                    let prepared = NativePrivateWarmPrepared {
+                        invocation: physical.invocation()?,
+                        initial_latent_bits: payload.initial_latent_bits(),
+                        seed_provenance: physical.seed().and_then(|seed| seed.seed_provenance()),
+                        bank: &bank,
+                    };
+                    observer.prepared_private_warm(
+                        id,
+                        request.state.as_ref(),
+                        prepared_context,
+                        logical,
+                        prepared,
+                    )
+                })?;
+            } else {
+                self.owner.observe("prepared", |observer| {
+                    observer.prepared_with_logical_context(
+                        id,
+                        request.state.as_ref(),
+                        prepared_context,
+                        logical,
+                    )
+                })?;
+            }
             if let Some(admission) = warm_admission {
                 let mut slot = self
                     .owner
@@ -5438,7 +5950,12 @@ mod native {
             kind: NativeQueryKind,
             logical: Option<&RoleLogicalContext>,
         ) -> Result<RoleEvaluation, RoleError> {
-            let input = prepare_role_input(&query, kind, self.model_epoch)?;
+            let input = prepare_role_input_for_config(
+                &query,
+                kind,
+                self.model_epoch,
+                &self.owner.model_config,
+            )?;
             let output = self.run(
                 input,
                 query.position,
@@ -5480,7 +5997,12 @@ mod native {
             // model estimate, not a candidate value or foreign-CP calibration.
             let state = query.position.position_identity();
             let perspective = query.position.side_to_move();
-            let input = prepare_role_input(&query, NativeQueryKind::Propose, self.model_epoch)?;
+            let input = prepare_role_input_for_config(
+                &query,
+                NativeQueryKind::Propose,
+                self.model_epoch,
+                &self.owner.model_config,
+            )?;
             let output = self.run(
                 input,
                 query.position,
@@ -5528,7 +6050,11 @@ mod native {
             })
         }
         fn divergences(&mut self, query: DivergenceQuery<'_>) -> Result<Vec<f32>, RoleError> {
-            let input = prepare_divergence_input(&query, self.model_epoch)?;
+            let input = prepare_divergence_input_for_config(
+                &query,
+                self.model_epoch,
+                &self.owner.model_config,
+            )?;
             let output = self.run(
                 input,
                 query.root,
@@ -5626,7 +6152,11 @@ mod native {
                     "Native divergence logical context mismatch".into(),
                 ));
             }
-            let input = prepare_divergence_input(&query, self.model_epoch)?;
+            let input = prepare_divergence_input_for_config(
+                &query,
+                self.model_epoch,
+                &self.owner.model_config,
+            )?;
             let output = self.run(
                 input,
                 query.root,
@@ -5653,7 +6183,12 @@ mod native {
             }
             let state = query.position.position_identity();
             let perspective = query.position.side_to_move();
-            let input = prepare_role_input(&query, NativeQueryKind::Propose, self.model_epoch)?;
+            let input = prepare_role_input_for_config(
+                &query,
+                NativeQueryKind::Propose,
+                self.model_epoch,
+                &self.owner.model_config,
+            )?;
             let output = self.run(
                 input,
                 query.position,
@@ -5701,6 +6236,11 @@ mod native {
             }
             self.delivered_request = None;
             self.owner.consumed.fetch_add(1, Ordering::AcqRel);
+            self.owner
+                .observe("accepted", |observer| observer.accepted(id))?;
+            self.owner.observe("accepted_context", |observer| {
+                observer.accepted_context(id, &acceptance)
+            })?;
             Ok(())
         }
         fn accepted_output(&mut self) {
@@ -6922,6 +7462,7 @@ mod native {
                 quarantined: AtomicBool::new(false),
                 shutdown: AtomicBool::new(false),
                 model_epoch: [3; 32],
+                model_config: PalsModelConfig::baseline(),
                 manifest_digest: [3; 32],
                 encoding_semantic_digest: encoding.0,
                 adapter_source_digest: pals_native_source_digest(),
@@ -7620,7 +8161,8 @@ mod native {
 
         #[test]
         fn transient_cuda_reservations_follow_bounded_tensor_layout() {
-            let (request, execution) = transient_device_layout().unwrap();
+            let (request, execution) =
+                transient_device_layout_for_config(&PalsModelConfig::baseline()).unwrap();
             assert!(request > 0 && execution > request);
             assert!(request + execution < REQUEST_BYTES);
             // A transient tensor reservation never becomes a session/peak claim.
@@ -8073,6 +8615,10 @@ mod native {
                         PalsNativeCommand::EvaluatePrivateWarm(_)
                         | PalsNativeCommand::VerifyCudaPlacement
                         | PalsNativeCommand::ObserveRuntimeMappings => {
+                            return unexpected_cuda_placement();
+                        }
+                        #[cfg(feature = "experimental-io-binding")]
+                        PalsNativeCommand::EvaluateCudaWarm(_) => {
                             return unexpected_cuda_placement();
                         }
                         #[cfg(feature = "experimental-io-binding")]
@@ -8703,6 +9249,8 @@ mod native {
                         return unexpected_cuda_placement();
                     }
                     #[cfg(feature = "experimental-io-binding")]
+                    PalsNativeCommand::EvaluateCudaWarm(_) => return unexpected_cuda_placement(),
+                    #[cfg(feature = "experimental-io-binding")]
                     PalsNativeCommand::SnapshotCudaRecordPages => {
                         return unexpected_cuda_placement();
                     }
@@ -8760,6 +9308,8 @@ mod native {
                     | PalsNativeCommand::ObserveRuntimeMappings => {
                         return unexpected_cuda_placement();
                     }
+                    #[cfg(feature = "experimental-io-binding")]
+                    PalsNativeCommand::EvaluateCudaWarm(_) => return unexpected_cuda_placement(),
                     #[cfg(feature = "experimental-io-binding")]
                     PalsNativeCommand::SnapshotCudaRecordPages => {
                         return unexpected_cuda_placement();
@@ -8831,6 +9381,8 @@ mod native {
                         return unexpected_cuda_placement();
                     }
                     #[cfg(feature = "experimental-io-binding")]
+                    PalsNativeCommand::EvaluateCudaWarm(_) => return unexpected_cuda_placement(),
+                    #[cfg(feature = "experimental-io-binding")]
                     PalsNativeCommand::SnapshotCudaRecordPages => {
                         return unexpected_cuda_placement();
                     }
@@ -8900,6 +9452,8 @@ mod native {
                     | PalsNativeCommand::ObserveRuntimeMappings => {
                         return unexpected_cuda_placement();
                     }
+                    #[cfg(feature = "experimental-io-binding")]
+                    PalsNativeCommand::EvaluateCudaWarm(_) => return unexpected_cuda_placement(),
                     #[cfg(feature = "experimental-io-binding")]
                     PalsNativeCommand::SnapshotCudaRecordPages => {
                         return unexpected_cuda_placement();
@@ -9305,6 +9859,8 @@ mod native {
                 | PalsNativeCommand::VerifyCudaPlacement
                 | PalsNativeCommand::ObserveRuntimeMappings => unexpected_cuda_placement(),
                 #[cfg(feature = "experimental-io-binding")]
+                PalsNativeCommand::EvaluateCudaWarm(_) => unexpected_cuda_placement(),
+                #[cfg(feature = "experimental-io-binding")]
                 PalsNativeCommand::SnapshotCudaRecordPages => unexpected_cuda_placement(),
                 PalsNativeCommand::VerifyRuntime => {
                     PhysicalRun::Complete(Ok(PalsNativeResult::RuntimeVerified))
@@ -9346,6 +9902,8 @@ mod native {
                     PalsNativeCommand::EvaluatePrivateWarm(_)
                     | PalsNativeCommand::VerifyCudaPlacement
                     | PalsNativeCommand::ObserveRuntimeMappings => unexpected_cuda_placement(),
+                    #[cfg(feature = "experimental-io-binding")]
+                    PalsNativeCommand::EvaluateCudaWarm(_) => unexpected_cuda_placement(),
                     #[cfg(feature = "experimental-io-binding")]
                     PalsNativeCommand::SnapshotCudaRecordPages => unexpected_cuda_placement(),
                     PalsNativeCommand::VerifyRuntime => {
@@ -9442,6 +10000,8 @@ mod native {
                 | PalsNativeCommand::VerifyCudaPlacement
                 | PalsNativeCommand::ObserveRuntimeMappings => unexpected_cuda_placement(),
                 #[cfg(feature = "experimental-io-binding")]
+                PalsNativeCommand::EvaluateCudaWarm(_) => unexpected_cuda_placement(),
+                #[cfg(feature = "experimental-io-binding")]
                 PalsNativeCommand::SnapshotCudaRecordPages => unexpected_cuda_placement(),
                 PalsNativeCommand::VerifyRuntime => {
                     PhysicalRun::Complete(Ok(PalsNativeResult::RuntimeVerified))
@@ -9479,6 +10039,8 @@ mod native {
                     | PalsNativeCommand::ObserveRuntimeMappings => {
                         return unexpected_cuda_placement();
                     }
+                    #[cfg(feature = "experimental-io-binding")]
+                    PalsNativeCommand::EvaluateCudaWarm(_) => return unexpected_cuda_placement(),
                     #[cfg(feature = "experimental-io-binding")]
                     PalsNativeCommand::SnapshotCudaRecordPages => {
                         return unexpected_cuda_placement();
@@ -9529,9 +10091,9 @@ pub use native::{
     NativeHostRecordPageLimits, NativeHostRecordPageObservationReceipt,
     NativeHostRecordPageSnapshotReceipt, NativeHostRecordPageStatsReceipt, NativeInvocationBudget,
     NativeLoadFailure, NativeLoadStage, NativeOwnerOptions, NativePreparedContext,
-    NativePrivateWarmDeclaration, NativeRoleCompletionUnknown, NativeRoleExecutionBinding,
-    NativeRoleFinishHandle, NativeRoleModel, NativeRoleObserver, NativeRoleReceipt,
-    NativeRoleRejection, NativeRoleSourceIdentity, NativeRoleTerminal,
+    NativePrivateWarmDeclaration, NativePrivateWarmPrepared, NativeRoleCompletionUnknown,
+    NativeRoleExecutionBinding, NativeRoleFinishHandle, NativeRoleModel, NativeRoleObserver,
+    NativeRoleReceipt, NativeRoleRejection, NativeRoleSourceIdentity, NativeRoleTerminal,
     NativeStartupCommandObservation, NativeStartupErrorKind, NativeStartupFailureDiagnostic,
     NativeStartupProbeReceipt, NativeStartupTimingObservation,
 };
@@ -9551,6 +10113,140 @@ mod tests {
         assert!(verify_pals_rules_profile(Some("different_fields"), Some(expected)).is_err());
         assert!(verify_pals_rules_profile(Some(PALS_RULES_ENCODING), Some([0; 32])).is_err());
         assert_ne!(pals_native_source_digest(), [0; 32]);
+    }
+    fn full_record(revision: u64, line: Vec<BoardMove>) -> RoleRecord {
+        RoleRecord {
+            revision,
+            parent_revision: None,
+            supersedes_revision: None,
+            origin_state: StateId(65_000),
+            kind: RecordKind::Proposal,
+            line,
+            value: None,
+            completed_depth: 0,
+            score_scope: None,
+            cpu_observation: None,
+            perspective: Color::White,
+            critical: false,
+        }
+    }
+    #[test]
+    fn full_line_middle_moves_are_observed_and_identity_slots_are_disabled() {
+        let position = Position::startpos();
+        let legal = position.legal_moves();
+        let cancel = AtomicBool::new(false);
+        let moves = |middle: &str, back: &str| {
+            ["e2e4", middle, "g1f3", back, "f1e2"]
+                .into_iter()
+                .map(|value| BoardMove::from_uci(value).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let first = vec![full_record(7, moves("g8f6", "f6g8"))];
+        let second = vec![full_record(7, moves("b8c6", "c6b8"))];
+        let query = RoleQuery {
+            position: &position,
+            legal: &legal,
+            prefix: &[],
+            proposal: &first[0].line,
+            counterexample: Some(&first[0].line),
+            records: &first,
+            revision: 8,
+            deadline: Instant::now() + Duration::from_secs(1),
+            cancel: &cancel,
+        };
+        let config = PalsModelConfig::full_line_interaction_v2();
+        let a = prepare_role_input_for_config(&query, NativeQueryKind::Repair, [1; 32], &config)
+            .unwrap();
+        let b = prepare_role_input_for_config(
+            &RoleQuery {
+                records: &second,
+                ..query
+            },
+            NativeQueryKind::Repair,
+            [1; 32],
+            &config,
+        )
+        .unwrap();
+        // Summaries have equal length/endpoints; the full sequence makes these
+        // different real inputs rather than a hash surrogate for the evidence.
+        assert_eq!(a.records, b.records);
+        assert_eq!(a.query, b.query);
+        assert_eq!(a.records[0].features[6], 0.0);
+        assert_eq!(a.query[6..8], [0.0, 0.0]);
+        assert_eq!(
+            a.full_line.as_ref().unwrap().query_proposal,
+            first[0]
+                .line
+                .iter()
+                .copied()
+                .map(candidate)
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(
+            a.canonical_input_key(&config).unwrap(),
+            b.canonical_input_key(&config).unwrap()
+        );
+        assert_eq!(pals_rules_semantic_fields().count(), 58);
+        assert_eq!(pals_rules_semantic_fields_for_config(&config).count(), 67);
+        assert!(
+            verify_pals_rules_profile_for_config(
+                Some(PALS_RULES_ENCODING),
+                Some(pals_rules_encoding_semantic_digest()),
+                &config
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn full_line_relationships_are_local_and_only_direct_critical_relations_are_required() {
+        let position = Position::startpos();
+        let legal = position.legal_moves();
+        let cancel = AtomicBool::new(false);
+        let mut history: Vec<_> = (1..=130)
+            .map(|revision| {
+                let mut record = full_record(revision, vec![]);
+                record.parent_revision = (revision > 1).then_some(revision - 1);
+                record
+            })
+            .collect();
+        let config = PalsModelConfig::full_line_interaction_v2();
+        let query = RoleQuery {
+            position: &position,
+            legal: &legal,
+            prefix: &[],
+            proposal: &[],
+            counterexample: None,
+            records: &history,
+            revision: 130,
+            deadline: Instant::now() + Duration::from_secs(1),
+            cancel: &cancel,
+        };
+        let input =
+            prepare_role_input_for_config(&query, NativeQueryKind::Propose, [1; 32], &config)
+                .unwrap();
+        let lines = input.full_line.unwrap().records;
+        assert_eq!(lines.len(), 128);
+        assert_eq!(history[2].parent_revision, Some(2)); // raw relation retained
+        assert_eq!(lines[0].parent, None); // historical relation outside model view
+        assert!(!lines[0].parent_required);
+        assert_eq!(lines[127].parent, Some(126));
+        assert!(lines[127].parent_required);
+        history[129].parent_revision = Some(999);
+        let missing = RoleQuery {
+            position: &position,
+            legal: &legal,
+            prefix: &[],
+            proposal: &[],
+            counterexample: None,
+            records: &history,
+            revision: 130,
+            deadline: Instant::now() + Duration::from_secs(1),
+            cancel: &cancel,
+        };
+        assert!(
+            prepare_role_input_for_config(&missing, NativeQueryKind::Propose, [1; 32], &config)
+                .is_err()
+        );
     }
     #[test]
     fn actual_rules_board_rights_history_and_legal_order() {
@@ -9587,6 +10283,8 @@ mod tests {
         let unknown: Vec<_> = (0..129)
             .map(|i| RoleRecord {
                 revision: i,
+                parent_revision: None,
+                supersedes_revision: None,
                 origin_state: StateId(0),
                 kind: RecordKind::Counterexample,
                 line: vec![],

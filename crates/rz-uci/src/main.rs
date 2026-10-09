@@ -100,6 +100,11 @@ fn run_pals(
     let mut cpu_depth = None;
     let mut situations = None;
     let mut post_repair_recheck = None;
+    let mut resolver_policy = None;
+    let mut cpu_resume = None;
+    let mut arena_wire = None;
+    let mut archive_root = None;
+    let mut archive_repository = None;
     let mut native = PalsNativeOptions::default();
     for argument in arguments {
         if native.cuda_record_pages.take(&argument)? {
@@ -124,6 +129,30 @@ fn run_pals(
         } else if let Some(value) = argument.strip_prefix("--pals-post-repair-recheck=") {
             if post_repair_recheck.replace(value.to_owned()).is_some() {
                 return Err("duplicate PALS post-Repair recheck policy".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-model-profile=") {
+            if native.model_profile.replace(value.to_owned()).is_some() {
+                return Err("duplicate PALS model profile".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-resolver-policy=") {
+            if resolver_policy.replace(value.to_owned()).is_some() {
+                return Err("duplicate PALS resolver policy".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-cpu-resume=") {
+            if cpu_resume.replace(value.to_owned()).is_some() {
+                return Err("duplicate PALS CPU resume policy".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-arena-wire=") {
+            if arena_wire.replace(value.to_owned()).is_some() {
+                return Err("duplicate PALS arena wire".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-archive-root=") {
+            if archive_root.replace(value.to_owned()).is_some() {
+                return Err("duplicate PALS archive root".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-archive-repository=") {
+            if archive_repository.replace(value.to_owned()).is_some() {
+                return Err("duplicate PALS archive repository boundary".into());
             }
         } else if let Some(value) = argument.strip_prefix("--pals-cpu-checker=") {
             if native.checker.selection.replace(value.to_owned()).is_some() {
@@ -222,6 +251,14 @@ fn run_pals(
             {
                 return Err("duplicate PALS private warm option".into());
             }
+        } else if let Some(value) = argument.strip_prefix("--pals-cuda-private-warm=") {
+            if native
+                .cuda_private_warm
+                .replace(value.parse::<bool>()?)
+                .is_some()
+            {
+                return Err("duplicate PALS CUDA private warm option".into());
+            }
         } else if let Some(value) = argument.strip_prefix("--pals-device-public-memory=") {
             if native
                 .device_public_memory
@@ -301,6 +338,22 @@ fn run_pals(
     };
     config.validate()?;
     let external_checker = native.checker.is_external()?;
+    let selected_resolver = pals_resolver_policy(resolver_policy.as_deref(), external_checker)?;
+    let selected_resume = match cpu_resume.as_deref() {
+        None | Some("completed-iteration") => rz_search::cpu::CpuResumePolicy::CompletedIteration,
+        Some("paused-stack") => rz_search::cpu::CpuResumePolicy::PausedStack,
+        _ => return Err("PALS CPU resume requires completed-iteration or paused-stack".into()),
+    };
+    if external_checker && selected_resume == rz_search::cpu::CpuResumePolicy::PausedStack {
+        return Err(
+            "PALS PausedStack requires an owned CPU checker; no foreign helper was started".into(),
+        );
+    }
+    if external_checker && cpu_resume.is_some() {
+        return Err("PALS explicit native CPU resume policy requires an owned checker; no foreign helper was started".into());
+    }
+    let v4 = pals_arena_wire_v4(arena_wire.as_deref())?;
+    let archive = pals_archive_config(archive_root, archive_repository)?;
     let cuda_record_pages =
         native
             .cuda_record_pages
@@ -309,6 +362,12 @@ fn run_pals(
     // admission, model loading or a foreign checker lifecycle can begin.
     let refinement_policy =
         pals_refinement_policy(post_repair_recheck.as_deref(), external_checker)?;
+    if refinement_policy != rz_search::pals::engine::PostRepairRecheckPolicy::Disabled
+        && !refinement_policy.uses_frozen_model_wdl()
+        && selected_resolver != rz_search::pals::engine::ResolverPolicy::OwnRawRestricted
+    {
+        return Err("PALS post-Repair recheck v1 requires the own raw resolver; no checker profile or model was loaded".into());
+    }
     if external_checker && model.as_deref() != Some("onnx") {
         return Err("external PALS CPU checker requires the explicit contextual-WDL ONNX model; the legal-order mock has no model-value endpoint".into());
     }
@@ -323,6 +382,7 @@ fn run_pals(
         );
     }
     if model.as_deref() == Some("onnx") {
+        pals_model_profile(native.model_profile.as_deref())?;
         if work_receipts.is_some() {
             return Err("native PALS uses pals-output-root/launch-sha256/endpoint-id for one combined native/search receipt".into());
         }
@@ -334,6 +394,11 @@ fn run_pals(
             max_cpu_nodes,
             cpu_depth,
             refinement_policy,
+            selected_resolver,
+            selected_resume,
+            resolver_policy.is_some(),
+            v4,
+            archive,
         );
     }
     if model.as_deref() != Some("legal-order-mock") {
@@ -344,21 +409,63 @@ fn run_pals(
             "PALS mock selection cannot accept neural assets or a provider declaration".into(),
         );
     }
+    if selected_resolver != rz_search::pals::engine::ResolverPolicy::OwnRawRestricted
+        || refinement_policy.uses_frozen_model_wdl()
+    {
+        return Err("model WDL policies require a frozen ONNX value endpoint; the legal-order mock has no model value".into());
+    }
     let driver = Arc::new(
-        rz_uci::search_driver::PalsSessionDriver::new_with_refinement_policy(
-            config,
-            rz_search::pals::engine::LegalOrderRoleMock,
-            rz_search::cpu::CpuConfig::default(),
-            rounds,
-            max_cpu_nodes,
-            cpu_depth,
-            rz_uci::EngineIdentity {
-                name: "RoveZero PALS explicit legal-order CPU mock + own CPU_R".into(),
-                author: "RoveZero contributors".into(),
-            },
-            refinement_policy,
-        )?,
+        if !v4
+            && selected_resume == rz_search::cpu::CpuResumePolicy::CompletedIteration
+            && resolver_policy.is_none()
+        {
+            rz_uci::search_driver::PalsSessionDriver::new_with_refinement_policy(
+                config,
+                rz_search::pals::engine::LegalOrderRoleMock,
+                rz_search::cpu::CpuConfig::default(),
+                rounds,
+                max_cpu_nodes,
+                cpu_depth,
+                rz_uci::EngineIdentity {
+                    name: "RoveZero PALS explicit legal-order CPU mock + own CPU_R".into(),
+                    author: "RoveZero contributors".into(),
+                },
+                refinement_policy,
+            )?
+        } else {
+            let cpu = rz_search::cpu::CpuEngine::with_resume_policy(
+                rz_search::cpu::CpuConfig::default(),
+                selected_resume,
+            )?;
+            let checker = rz_search::cpu_checker::OwnedCpuChecker::new(cpu)?;
+            rz_uci::search_driver::PalsSessionDriver::new_with_boxed_checker_and_policies(
+                config,
+                rz_search::pals::engine::LegalOrderRoleMock,
+                Box::new(checker),
+                rounds,
+                max_cpu_nodes,
+                cpu_depth,
+                rz_uci::EngineIdentity {
+                    name: "RoveZero PALS explicit legal-order CPU mock + own CPU_R".into(),
+                    author: "RoveZero contributors".into(),
+                },
+                selected_resolver,
+                refinement_policy,
+            )?
+        },
     );
+    if let Some(archive) = archive {
+        driver.enable_archive(archive)?;
+    }
+    let work_receipts = if v4 {
+        Some(
+            work_receipts
+                .ok_or("PALS V4 mock wire requires explicit search work output/launch/endpoint")?
+                .with_pals_followup(&driver)?,
+        )
+    } else {
+        work_receipts
+    };
     let mut settings = EngineSettings::default();
     settings.search.max_simulations = max_cpu_nodes;
     serve_search_process(driver, settings, work_receipts)?;
@@ -374,16 +481,85 @@ fn pals_refinement_policy(
         None => PostRepairRecheckPolicy::Disabled,
         Some("same-repaired-line-once-v1") => PostRepairRecheckPolicy::SameRepairedLineOnceV1,
         Some("actual-opponent-continuation-v1") => PostRepairRecheckPolicy::ActualOpponentContinuationV1,
-        Some(_) => return Err("PALS post-Repair recheck requires an exact explicit same-repaired-line-once-v1 or actual-opponent-continuation-v1 lane; omission retains legacy".into()),
+        Some("frozen-model-wdl-v2") => PostRepairRecheckPolicy::FrozenModelWdlV2,
+        Some("iterative-frozen-model-wdl-v2") => PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
+        Some(_) => return Err("PALS post-Repair recheck requires an exact explicit same-repaired-line-once-v1, actual-opponent-continuation-v1, frozen-model-wdl-v2, or iterative-frozen-model-wdl-v2 lane; omission retains disabled".into()),
     };
-    if external_checker && policy != PostRepairRecheckPolicy::Disabled {
+    if external_checker
+        && policy != PostRepairRecheckPolicy::Disabled
+        && !policy.uses_frozen_model_wdl()
+    {
         return Err("PALS post-Repair recheck v1 supports own CPU/Rules evidence only; no external checker or model was started".into());
     }
     Ok(policy)
 }
+fn pals_resolver_policy(
+    selected: Option<&str>,
+    external: bool,
+) -> Result<rz_search::pals::engine::ResolverPolicy, Box<dyn std::error::Error>> {
+    use rz_search::pals::engine::ResolverPolicy;
+    let policy = match selected {
+        None if external => ResolverPolicy::ModelWdlRestricted,
+        None | Some("own-raw-restricted") => ResolverPolicy::OwnRawRestricted,
+        Some("model-wdl-restricted") => ResolverPolicy::ModelWdlRestricted,
+        _ => {
+            return Err("PALS resolver requires own-raw-restricted or model-wdl-restricted".into());
+        }
+    };
+    if external && policy == ResolverPolicy::OwnRawRestricted {
+        return Err(
+            "PALS own raw resolver requires an owned checker; no profile or model was loaded"
+                .into(),
+        );
+    }
+    Ok(policy)
+}
+fn pals_model_profile(
+    selected: Option<&str>,
+) -> Result<rz_eval::pals_model::PalsModelProfile, Box<dyn std::error::Error>> {
+    use rz_eval::pals_model::PalsModelProfile;
+    match selected {
+        None | Some("full_line_interaction_v2") => Ok(PalsModelProfile::FullLineInteractionV2),
+        Some("legacy_summary_v1") => Ok(PalsModelProfile::LegacySummaryV1),
+        Some("full_line_v2") => Ok(PalsModelProfile::FullLineV2),
+        Some("interaction_head_v2") => Ok(PalsModelProfile::InteractionHeadV2),
+        _ => Err("unsupported PALS model profile".into()),
+    }
+}
+fn pals_arena_wire_v4(selected: Option<&str>) -> Result<bool, Box<dyn std::error::Error>> {
+    let v4 = match selected {
+        None => false,
+        Some("v4") => true,
+        _ => return Err("PALS arena wire supports only explicit v4".into()),
+    };
+    if v4 && !cfg!(feature = "search-work-receipts") {
+        return Err("PALS V4 wire requires search-work-receipts".into());
+    }
+    Ok(v4)
+}
+fn pals_archive_config(
+    root: Option<String>,
+    repository: Option<String>,
+) -> Result<Option<rz_search::pals::store::ArchiveConfig>, Box<dyn std::error::Error>> {
+    match (root, repository) {
+        (None, None) => Ok(None),
+        (Some(root), Some(repository)) => {
+            let root = std::path::PathBuf::from(root);
+            let repository = std::path::PathBuf::from(repository);
+            if !root.is_absolute() || !repository.is_absolute() {
+                return Err("PALS archive root and repository boundary must be absolute".into());
+            }
+            Ok(Some(rz_search::pals::store::ArchiveConfig::new(
+                root, repository,
+            )))
+        }
+        _ => Err("PALS archive requires both its absolute root and repository boundary".into()),
+    }
+}
 
 #[derive(Default)]
 struct PalsNativeOptions {
+    model_profile: Option<String>,
     checker: PalsCheckerOptions,
     manifest: Option<String>,
     manifest_hash: Option<String>,
@@ -400,6 +576,7 @@ struct PalsNativeOptions {
     cuda_session_arena: Option<u64>,
     host_record_pages: Option<bool>,
     private_warm: Option<bool>,
+    cuda_private_warm: Option<bool>,
     device_public_memory: Option<bool>,
     cuda_control_mode: Option<String>,
     cuda_control_inventory: Option<String>,
@@ -1033,7 +1210,85 @@ impl PalsCheckerOptions {
 }
 #[cfg(test)]
 mod pals_checker_option_tests {
-    use super::{PalsCheckerOptions, pals_refinement_policy, run_pals};
+    use super::{
+        PalsCheckerOptions, pals_model_profile, pals_refinement_policy, pals_resolver_policy,
+        run_pals,
+    };
+
+    #[test]
+    fn followup_selections_are_explicit_and_reject_own_raw_foreign_before_loading() {
+        use rz_eval::pals_model::PalsModelProfile;
+        use rz_search::pals::engine::{PostRepairRecheckPolicy, ResolverPolicy};
+        assert_eq!(
+            pals_model_profile(None).unwrap(),
+            PalsModelProfile::FullLineInteractionV2
+        );
+        assert_eq!(
+            pals_model_profile(Some("legacy_summary_v1")).unwrap(),
+            PalsModelProfile::LegacySummaryV1
+        );
+        assert_eq!(
+            pals_resolver_policy(Some("model-wdl-restricted"), false).unwrap(),
+            ResolverPolicy::ModelWdlRestricted
+        );
+        assert_eq!(
+            pals_refinement_policy(Some("frozen-model-wdl-v2"), true).unwrap(),
+            PostRepairRecheckPolicy::FrozenModelWdlV2
+        );
+        assert_eq!(
+            pals_refinement_policy(Some("iterative-frozen-model-wdl-v2"), true).unwrap(),
+            PostRepairRecheckPolicy::IterativeFrozenModelWdlV2
+        );
+        for profile in ["legacy_summary_v1", "full_line_interaction_v2"] {
+            let failure = run_pals(
+                vec![
+                    "--pals-model=onnx".into(),
+                    format!("--pals-model-profile={profile}"),
+                    "--pals-cpu-checker=external-uci".into(),
+                    "--pals-cpu-profile=/intentionally-unopened-helper-profile.json".into(),
+                    "--pals-cpu-profile-sha256=unread-fixture-pin".into(),
+                    "--pals-resolver-policy=own-raw-restricted".into(),
+                ],
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                failure
+                    .to_string()
+                    .contains("no profile or model was loaded")
+            );
+        }
+        let failure = run_pals(
+            vec![
+                "--pals-model=onnx".into(),
+                "--pals-cpu-checker=external-uci".into(),
+                "--pals-cpu-profile=/intentionally-unopened-helper-profile.json".into(),
+                "--pals-cpu-profile-sha256=unread-fixture-pin".into(),
+                "--pals-cpu-resume=paused-stack".into(),
+            ],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("PausedStack requires an owned CPU checker")
+        );
+        let failure = run_pals(
+            vec![
+                "--pals-model=onnx".into(),
+                "--pals-resolver-policy=model-wdl-restricted".into(),
+                "--pals-post-repair-recheck=same-repaired-line-once-v1".into(),
+            ],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("no checker profile or model was loaded")
+        );
+    }
 
     #[test]
     fn post_repair_policy_is_an_exact_opt_in_with_legacy_omission() {
@@ -1145,7 +1400,8 @@ mod pals_checker_option_tests {
 }
 impl PalsNativeOptions {
     fn any(&self) -> bool {
-        self.manifest.is_some()
+        self.model_profile.is_some()
+            || self.manifest.is_some()
             || self.manifest_hash.is_some()
             || self.runtime.is_some()
             || self.runtime_hash.is_some()
@@ -1161,6 +1417,7 @@ impl PalsNativeOptions {
             || self.device_public_memory.is_some()
             || self.host_record_pages.is_some()
             || self.private_warm.is_some()
+            || self.cuda_private_warm.is_some()
             || self.cuda_control_mode.is_some()
             || self.cuda_control_inventory.is_some()
             || self.cuda_control_inventory_hash.is_some()
@@ -1174,6 +1431,7 @@ impl PalsNativeOptions {
 }
 
 #[cfg(not(feature = "onnx-cpu"))]
+#[allow(clippy::too_many_arguments)]
 fn run_native_pals(
     _native: PalsNativeOptions,
     _cuda_record_pages: Option<PalsCudaRecordPagesSelection>,
@@ -1182,6 +1440,11 @@ fn run_native_pals(
     _cpu_nodes: u64,
     _cpu_depth: u16,
     _refinement_policy: rz_search::pals::engine::PostRepairRecheckPolicy,
+    _resolver_policy: rz_search::pals::engine::ResolverPolicy,
+    _resume_policy: rz_search::cpu::CpuResumePolicy,
+    _explicit_resolver: bool,
+    _v4: bool,
+    _archive: Option<rz_search::pals::store::ArchiveConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "PALS ONNX startup requires feature onnx-cpu; no provider or model fallback was started"
@@ -1190,6 +1453,7 @@ fn run_native_pals(
 }
 
 #[cfg(feature = "onnx-cpu")]
+#[allow(clippy::too_many_arguments)]
 fn run_native_pals(
     native: PalsNativeOptions,
     cuda_record_pages: Option<PalsCudaRecordPagesSelection>,
@@ -1198,9 +1462,20 @@ fn run_native_pals(
     cpu_nodes: u64,
     cpu_depth: u16,
     refinement_policy: rz_search::pals::engine::PostRepairRecheckPolicy,
+    resolver_policy: rz_search::pals::engine::ResolverPolicy,
+    resume_policy: rz_search::cpu::CpuResumePolicy,
+    explicit_resolver: bool,
+    v4: bool,
+    archive: Option<rz_search::pals::store::ArchiveConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // PALS owns a distinct manifest and tensors. LC0 NativeConfig and its
     // attestation cannot authorize or describe this model.
+    let expected_profile = pals_model_profile(native.model_profile.as_deref())?;
+    let followup_lane = v4
+        || expected_profile != rz_eval::pals_model::PalsModelProfile::LegacySummaryV1
+        || explicit_resolver
+        || resume_policy == rz_search::cpu::CpuResumePolicy::PausedStack
+        || refinement_policy.uses_frozen_model_wdl();
     let checker_profile = native.checker.load()?;
     let checker = checker_profile
         .as_ref()
@@ -1254,6 +1529,22 @@ fn run_native_pals(
     {
         return Err("PALS private warm requires a separately pinned CPU/host warm export; CUDA/device/V are unsupported".into());
     }
+    let cuda_warm = native.cuda_private_warm.unwrap_or(false);
+    if cuda_warm
+        && (provider != "cuda"
+            || !expected_profile.uses_full_line()
+            || !native.device_public_memory.unwrap_or(false)
+            || native.private_warm.unwrap_or(false)
+            || native.host_record_pages.unwrap_or(false)
+            || native.cuda_record_pages.any())
+    {
+        return Err("PALS CUDA Warm requires explicit CUDA/device public memory, its own export, and no CPU Warm/host pages/resident packing selection".into());
+    }
+    if cuda_warm && !cfg!(feature = "experimental-io-binding") {
+        return Err(
+            "PALS CUDA Warm requires experimental-io-binding; no fallback was started".into(),
+        );
+    }
     let loading_profile = pals_cuda_loading_profile(
         native.cuda_loading_profile.as_deref(),
         native.cuda_loading_profile_hash.as_deref(),
@@ -1272,7 +1563,7 @@ fn run_native_pals(
         (Some(mode), Some(inventory), Some(hash), Some(profile))
             if mode == "inventory-v2" && provider == "cuda" =>
         {
-            if native.device_public_memory.unwrap_or(false) {
+            if native.device_public_memory.unwrap_or(false) && !cuda_warm {
                 return Err("PALS inventory-v2 control mode requires host public memory; no device-binding fallback was started".into());
             }
             let inventory = std::path::PathBuf::from(inventory);
@@ -1427,6 +1718,16 @@ fn run_native_pals(
     // deadline. Earlier pin/cache preparation belongs to overall CLI cost.
     let model_loading_started = std::time::Instant::now();
     let mut model = match cuda_control {
+        #[cfg(feature = "experimental-io-binding")]
+        Some((policy, profile)) if cuda_warm => {
+            let runtime = match loading_profile {
+                Some(loading) => {
+                    rz_eval::onnx::OrtRuntime::load_with_cuda_loading_profile(&pin, loading)?
+                }
+                None => rz_eval::onnx::OrtRuntime::load(&pin)?,
+            };
+            rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_private_warm_with_options(&manifest, &manifest_hash, runtime, backend_config, owner_options, Some((policy, profile.as_path())))?
+        }
         Some((policy, profile)) => {
             let runtime = match loading_profile {
                 Some(loading) => {
@@ -1464,6 +1765,11 @@ fn run_native_pals(
                 owner_options,
             )?
         }
+        #[cfg(feature = "experimental-io-binding")]
+        None if cuda_warm => {
+            let runtime = rz_eval::onnx::OrtRuntime::load(&pin)?;
+            rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_private_warm_with_options(&manifest, &manifest_hash, runtime, backend_config, owner_options, None)?
+        }
         None => rz_uci::pals_native::NativeRoleModel::load_pinned_with_options(
             &manifest,
             &manifest_hash,
@@ -1475,6 +1781,11 @@ fn run_native_pals(
     let model_loading_elapsed = model_loading_started.elapsed();
     let finish = model.finish_handle();
     let startup = (|| {
+        if model.model_config().profile != expected_profile {
+            return Err(rz_search::pals::engine::RoleError::Backend(
+                "loaded PALS model profile differs from explicit/default selection".into(),
+            ));
+        }
         let budget = model.configure_startup_probe_timeout(native.startup_probe_timeout_ms)?;
         model.observe_startup_loading(model_loading_elapsed)?;
         model.prepare_startup(std::time::Instant::now() + budget)
@@ -1483,12 +1794,7 @@ fn run_native_pals(
         let mut publication = None;
         let mut failure_writer = match receipt_config.as_ref() {
             Some((root, launch, endpoint)) => {
-                match rz_uci::pals_attestation::PalsReceiptWriter::open(
-                    root,
-                    endpoint,
-                    launch,
-                    &runtime_hash,
-                ) {
+                match open_pals_receipt(root, endpoint, launch, &runtime_hash, v4, None) {
                     Ok(mut writer) => match writer.failed_startup(finish.receipt(), &primary, None)
                     {
                         Ok(()) => Some(writer),
@@ -1534,31 +1840,78 @@ fn run_native_pals(
     };
     // The helper is unstarted through every fallible constructor. No foreign
     // process can disappear into a constructor Drop without a shutdown receipt.
-    let driver = match match checker {
-        Some(checker) => {
-            rz_uci::search_driver::PalsSessionDriver::new_with_checker_and_refinement_policy(
+    let model_source = model.source_identity();
+    let constructed = if followup_lane {
+        match checker {
+            Some(checker) => {
+                rz_uci::search_driver::PalsSessionDriver::new_with_boxed_checker_and_policies(
+                    config,
+                    model,
+                    Box::new(checker),
+                    rounds,
+                    cpu_nodes,
+                    cpu_depth,
+                    identity,
+                    resolver_policy,
+                    refinement_policy,
+                )
+            }
+            None => rz_uci::search_driver::PalsSessionDriver::new_with_policies(
                 config,
                 model,
-                checker,
+                rz_search::cpu::CpuConfig::default(),
+                rounds,
+                cpu_nodes,
+                cpu_depth,
+                identity,
+                resolver_policy,
+                refinement_policy,
+                resume_policy,
+            ),
+        }
+    } else {
+        match checker {
+            Some(checker) => {
+                rz_uci::search_driver::PalsSessionDriver::new_with_checker_and_refinement_policy(
+                    config,
+                    model,
+                    checker,
+                    rounds,
+                    cpu_nodes,
+                    cpu_depth,
+                    identity,
+                    refinement_policy,
+                )
+            }
+            None => rz_uci::search_driver::PalsSessionDriver::new_with_refinement_policy(
+                config,
+                model,
+                rz_search::cpu::CpuConfig::default(),
                 rounds,
                 cpu_nodes,
                 cpu_depth,
                 identity,
                 refinement_policy,
-            )
+            ),
         }
-        None => rz_uci::search_driver::PalsSessionDriver::new_with_refinement_policy(
-            config,
-            model,
-            rz_search::cpu::CpuConfig::default(),
-            rounds,
-            cpu_nodes,
-            cpu_depth,
-            identity,
-            refinement_policy,
-        ),
-    } {
-        Ok(driver) => Arc::new(driver),
+    };
+    let (driver, followup) = match constructed.and_then(|driver| {
+        if let Some(archive) = archive {
+            driver.enable_archive(archive)?;
+        }
+        let followup = if v4 {
+            Some(
+                rz_uci::pals_attestation::PalsFollowupMarkerV4::capture_native(
+                    &model_source,
+                    &driver,
+                )?,
+            )
+        } else {
+            None
+        };
+        Ok((driver, followup))
+    }) {
+        Ok((driver, followup)) => (Arc::new(driver), followup),
         Err(primary) => {
             let cleanup = finish
                 .finish(std::time::Instant::now() + settings.shutdown_limit)
@@ -1597,11 +1950,13 @@ fn run_native_pals(
             let mut publication = None;
             if let Some((root, launch, endpoint)) = receipt_config.as_ref() {
                 let result = (|| {
-                    let mut writer = rz_uci::pals_attestation::PalsReceiptWriter::open(
+                    let mut writer = open_pals_receipt(
                         root,
                         endpoint,
                         launch,
                         &runtime_hash,
+                        v4,
+                        followup.clone(),
                     )?;
                     if let Ok(evidence) = &observed_checker {
                         writer.observe_checker(evidence.clone())?;
@@ -1676,11 +2031,13 @@ fn run_native_pals(
     };
     let mut receipts = match receipt_config {
         Some((root, launch, endpoint)) => {
-            let opened = rz_uci::pals_attestation::PalsReceiptWriter::open(
+            let opened = open_pals_receipt(
                 &root,
                 &endpoint,
                 &launch,
                 &runtime_hash,
+                v4,
+                followup.clone(),
             );
             match opened {
                 Ok(mut writer) => match (|| {
@@ -1811,9 +2168,30 @@ fn run_native_pals(
     }
 }
 
+#[cfg(feature = "onnx-cpu")]
+fn open_pals_receipt(
+    root: &std::path::Path,
+    endpoint: &str,
+    launch: &str,
+    runtime: &str,
+    v4: bool,
+    marker: Option<rz_uci::pals_attestation::PalsFollowupMarkerV4>,
+) -> Result<
+    rz_uci::pals_attestation::PalsReceiptWriter,
+    rz_uci::process_receipts::ProcessReceiptError,
+> {
+    if v4 {
+        rz_uci::pals_attestation::PalsReceiptWriter::open_v4(
+            root, endpoint, launch, runtime, marker,
+        )
+    } else {
+        rz_uci::pals_attestation::PalsReceiptWriter::open(root, endpoint, launch, runtime)
+    }
+}
+
 /// Both owners are attempted independently against the same overall deadline.
 /// A slow helper must not grant the Native owner a fresh cleanup window.
-#[cfg(feature = "onnx-cpu")]
+#[cfg(any(feature = "onnx-cpu", test))]
 fn finish_pals_owners_within<C, N>(
     limit: Duration,
     checker: impl FnOnce(std::time::Instant) -> C,
@@ -2046,6 +2424,7 @@ fn run_own_cpu(
     let mut max_depth = None;
     let mut max_nodes = None;
     let mut tt_entries = None;
+    let mut arena_wire = None;
     for argument in arguments {
         if let Some(value) = argument.strip_prefix("--cpu-max-depth=") {
             if max_depth.replace(value.parse::<u16>()?).is_some() {
@@ -2059,10 +2438,23 @@ fn run_own_cpu(
             if tt_entries.replace(value.parse::<usize>()?).is_some() {
                 return Err("duplicate CPU TT limit".into());
             }
+        } else if let Some(value) = argument.strip_prefix("--pals-arena-wire=") {
+            if arena_wire.replace(value.to_owned()).is_some() {
+                return Err("duplicate PALS arena wire".into());
+            }
         } else {
-            return Err("CPU search only accepts --cpu-max-depth, --cpu-max-nodes and --cpu-tt-entries; neural provider/model flags are inapplicable".into());
+            return Err("CPU search only accepts --cpu-max-depth, --cpu-max-nodes, --cpu-tt-entries and an explicit PALS arena wire; neural provider/model flags are inapplicable".into());
         }
     }
+    let work_receipts = if pals_arena_wire_v4(arena_wire.as_deref())? {
+        Some(
+            work_receipts
+                .ok_or("V4 OwnCpu wire requires explicit search work output/launch/endpoint")?
+                .with_v4()?,
+        )
+    } else {
+        work_receipts
+    };
     let max_nodes = max_nodes.unwrap_or(100_000);
     // Explicit finite limits: default profile is own bootstrap CPU_R, not NNUE.
     let config = rz_search::cpu::CpuConfig {
@@ -2085,8 +2477,43 @@ struct SearchWorkOptions {
     root: std::path::PathBuf,
     launch_sha256: String,
     endpoint_id: String,
+    #[cfg(feature = "search-work-receipts")]
+    v4: bool,
+    #[cfg(feature = "search-work-receipts")]
+    followup: Option<rz_uci::pals_attestation::PalsFollowupMarkerV4>,
 }
 impl SearchWorkOptions {
+    fn with_pals_followup<M: rz_search::pals::engine::RoleModel + 'static>(
+        self,
+        driver: &rz_uci::search_driver::PalsSessionDriver<M>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        #[cfg(feature = "search-work-receipts")]
+        {
+            let mut receipt = self;
+            receipt.v4 = true;
+            receipt.followup =
+                Some(rz_uci::pals_attestation::PalsFollowupMarkerV4::capture_search(driver)?);
+            Ok(receipt)
+        }
+        #[cfg(not(feature = "search-work-receipts"))]
+        {
+            let _ = (self, driver);
+            Err("PALS V4 mock wire requires search-work-receipts".into())
+        }
+    }
+    fn with_v4(self) -> Result<Self, Box<dyn std::error::Error>> {
+        #[cfg(feature = "search-work-receipts")]
+        {
+            let mut receipt = self;
+            receipt.v4 = true;
+            Ok(receipt)
+        }
+        #[cfg(not(feature = "search-work-receipts"))]
+        {
+            let _ = self;
+            Err("V4 wire requires search-work-receipts".into())
+        }
+    }
     fn take(arguments: &mut Vec<String>) -> Result<Option<Self>, Box<dyn std::error::Error>> {
         let mut root = None;
         let mut launch = None;
@@ -2128,6 +2555,8 @@ impl SearchWorkOptions {
                         root,
                         launch_sha256,
                         endpoint_id,
+                        v4: false,
+                        followup: None,
                     }))
                 }
             }
@@ -2146,11 +2575,26 @@ fn serve_search_process(
     #[cfg(feature = "search-work-receipts")]
     let mut receipts = match receipt {
         Some(receipt) => {
-            let mut writer = rz_uci::pals_attestation::SearchWorkReceiptWriter::open(
-                &receipt.root,
-                &receipt.endpoint_id,
-                &receipt.launch_sha256,
-            )?;
+            let mut writer = match (receipt.v4, receipt.followup) {
+                (true, Some(marker)) => rz_uci::pals_attestation::SearchWorkReceiptWriter::open_v4(
+                    &receipt.root,
+                    &receipt.endpoint_id,
+                    &receipt.launch_sha256,
+                    marker,
+                )?,
+                (true, None) => {
+                    rz_uci::pals_attestation::SearchWorkReceiptWriter::open_v4_without_pals(
+                        &receipt.root,
+                        &receipt.endpoint_id,
+                        &receipt.launch_sha256,
+                    )?
+                }
+                (false, _) => rz_uci::pals_attestation::SearchWorkReceiptWriter::open(
+                    &receipt.root,
+                    &receipt.endpoint_id,
+                    &receipt.launch_sha256,
+                )?,
+            };
             writer.startup(driver.work_receipt()?)?;
             Some(writer)
         }
