@@ -46,21 +46,31 @@ impl PalsSearchPolicyIdentity {
     pub const POLICY: &'static str = "same_repaired_line_once_v1";
 
     pub fn validate(&self) -> Result<(), ContractError> {
-        let expected_conditions: [u8; 32] =
-            Sha256::digest(rz_search::pals::engine::POST_REPAIR_RECHECK_CONDITIONS.as_bytes())
-                .into();
-        if self.version != Self::VERSION
-            || self.policy != Self::POLICY
-            || self.search_identity != rz_search::pals::engine::POST_REPAIR_RECHECK_SEARCH_VERSION
-            || self.conditions_sha256 != expected_conditions
-        {
-            return Err(ContractError::new(
-                ErrorCode::IdentityMismatch,
-                Stage::Admission,
-                "PALS selected search policy identity differs from its closed lane",
-            ));
+        self.selected_policy().map(|_| ())
+    }
+    pub(crate) fn selected_policy(
+        &self,
+    ) -> Result<rz_search::pals::engine::PostRepairRecheckPolicy, ContractError> {
+        use rz_search::pals::engine::PostRepairRecheckPolicy;
+        for selected in [
+            PostRepairRecheckPolicy::SameRepairedLineOnceV1,
+            PostRepairRecheckPolicy::ActualOpponentContinuationV1,
+        ] {
+            let conditions: [u8; 32] =
+                Sha256::digest(selected.conditions().unwrap().as_bytes()).into();
+            if Some(self.version.as_str()) == selected.registration_version()
+                && Some(self.policy.as_str()) == selected.registration_policy()
+                && self.search_identity == selected.search_identity()
+                && self.conditions_sha256 == conditions
+            {
+                return Ok(selected);
+            }
         }
-        Ok(())
+        Err(ContractError::new(
+            ErrorCode::IdentityMismatch,
+            Stage::Admission,
+            "PALS selected search policy identity differs from its closed lane",
+        ))
     }
 }
 

@@ -26,12 +26,48 @@ pub const PALS_POST_REPAIR_RECHECK_V3_CONDITIONS_SHA256: [u8; 32] = [
     0xbe, 0xa4, 0x4b, 0x7e, 0x9a, 0xb5, 0x9f, 0x32, 0xdc, 0xff, 0xb1, 0xb4, 0xc5, 0x97, 0xfd, 0x36,
     0xa4, 0xb7, 0x50, 0x37, 0x80, 0x3a, 0xee, 0xac, 0xd6, 0xc1, 0x87, 0x85, 0xce, 0x83, 0x81, 0x66,
 ];
+pub const PALS_POST_REPAIR_CONTINUATION_V3_VERSION: &str = "pals-post-repair-continuation/1";
+pub const PALS_POST_REPAIR_CONTINUATION_V3_OPTION_VALUE: &str = "actual-opponent-continuation-v1";
+pub const PALS_POST_REPAIR_CONTINUATION_V3_POLICY: &str = "actual_opponent_continuation_v1";
+pub const PALS_POST_REPAIR_CONTINUATION_V3_SEARCH_IDENTITY: &str =
+    "pals-restricted-refinement-post-repair-continuation/1";
+/// Independent pin of the exact 468-byte continuation conditions, compared by arena.
+pub const PALS_POST_REPAIR_CONTINUATION_V3_CONDITIONS_SHA256: [u8; 32] = [
+    0x87, 0x6c, 0x71, 0x04, 0xc2, 0x81, 0x83, 0x13, 0x12, 0x43, 0x10, 0x1d, 0xf8, 0x6c, 0x38, 0x68,
+    0x65, 0xbf, 0x90, 0x3f, 0x26, 0x54, 0x5e, 0xdd, 0xe0, 0x1d, 0x48, 0xde, 0x44, 0x03, 0xd4, 0xd1,
+];
 
 /// Omission selects the historical lane; there is no serialized Disabled alias.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub enum PalsPostRepairRecheckPolicyV3 {
     #[serde(rename = "same-repaired-line-once-v1")]
     SameRepairedLineOnceV1,
+    #[serde(rename = "actual-opponent-continuation-v1")]
+    ActualOpponentContinuationV1,
+}
+impl PalsPostRepairRecheckPolicyV3 {
+    pub fn version(self) -> &'static str {
+        match self {
+            Self::SameRepairedLineOnceV1 => PALS_POST_REPAIR_RECHECK_V3_VERSION,
+            Self::ActualOpponentContinuationV1 => PALS_POST_REPAIR_CONTINUATION_V3_VERSION,
+        }
+    }
+    pub fn option_value(self) -> &'static str {
+        match self {
+            Self::SameRepairedLineOnceV1 => PALS_POST_REPAIR_RECHECK_V3_OPTION_VALUE,
+            Self::ActualOpponentContinuationV1 => PALS_POST_REPAIR_CONTINUATION_V3_OPTION_VALUE,
+        }
+    }
+    pub fn expected_identity(self) -> PalsSearchPolicyIdentityV3 {
+        match self {
+            Self::SameRepairedLineOnceV1 => {
+                PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1()
+            }
+            Self::ActualOpponentContinuationV1 => {
+                PalsSearchPolicyIdentityV3::expected_actual_opponent_continuation_v1()
+            }
+        }
+    }
 }
 
 /// Four-field identity captured from immutable startup-selected engine getters.
@@ -54,12 +90,18 @@ impl PalsSearchPolicyIdentityV3 {
     }
     pub fn validate(&self) -> Result<(), ManifestError> {
         require(
-            self.version == PALS_POST_REPAIR_RECHECK_V3_VERSION
-                && self.policy == PALS_POST_REPAIR_RECHECK_V3_POLICY
-                && self.search_identity == PALS_POST_REPAIR_RECHECK_V3_SEARCH_IDENTITY
-                && self.conditions_sha256 == PALS_POST_REPAIR_RECHECK_V3_CONDITIONS_SHA256,
+            *self == Self::expected_same_repaired_line_once_v1()
+                || *self == Self::expected_actual_opponent_continuation_v1(),
             "selected search policy identity differs from the closed post-Repair lane",
         )
+    }
+    pub fn expected_actual_opponent_continuation_v1() -> Self {
+        Self {
+            version: PALS_POST_REPAIR_CONTINUATION_V3_VERSION.into(),
+            policy: PALS_POST_REPAIR_CONTINUATION_V3_POLICY.into(),
+            search_identity: PALS_POST_REPAIR_CONTINUATION_V3_SEARCH_IDENTITY.into(),
+            conditions_sha256: PALS_POST_REPAIR_CONTINUATION_V3_CONDITIONS_SHA256,
+        }
     }
 }
 impl<'de> Deserialize<'de> for PalsSearchPolicyIdentityV3 {
@@ -486,6 +528,15 @@ fn pals_search_lane(p: &PalsEndpointV3) -> Result<(), ManifestError> {
                     .get(PALS_POST_REPAIR_RECHECK_V3_OPTION_KEY)
                     .is_some_and(|value| value == PALS_POST_REPAIR_RECHECK_V3_OPTION_VALUE),
             "post-Repair search lane requires its exact single option and Own CPU_R",
+        ),
+        PALS_POST_REPAIR_CONTINUATION_V3_VERSION => require(
+            p.cpu_r.is_own()
+                && p.search.options.len() == 1
+                && p.search
+                    .options
+                    .get(PALS_POST_REPAIR_RECHECK_V3_OPTION_KEY)
+                    .is_some_and(|value| value == PALS_POST_REPAIR_CONTINUATION_V3_OPTION_VALUE),
+            "actual C continuation requires its exact single option and Own CPU_R",
         ),
         _ => require(false, "unsupported PALS search semantic lane"),
     }
@@ -1382,16 +1433,28 @@ fn receipt_endpoint(
     failures: &BTreeSet<PalsRunFailureV3>,
 ) -> Result<(), ManifestError> {
     match e {
-        PalsEngineV3::Pals(p) if p.search.semantic_id == PALS_POST_REPAIR_RECHECK_V3_VERSION => {
+        PalsEngineV3::Pals(p)
+            if matches!(
+                p.search.semantic_id.as_str(),
+                PALS_POST_REPAIR_RECHECK_V3_VERSION | PALS_POST_REPAIR_CONTINUATION_V3_VERSION
+            ) =>
+        {
             pals_search_lane(p)?;
-            o.pals_search_policy
-                .as_ref()
-                .ok_or_else(|| {
-                    ManifestError::Integrity(
-                        "PALS V3: selected post-Repair lane observation missing".into(),
-                    )
-                })?
-                .validate()?;
+            let observed = o.pals_search_policy.as_ref().ok_or_else(|| {
+                ManifestError::Integrity(
+                    "PALS V3: selected post-Repair lane observation missing".into(),
+                )
+            })?;
+            observed.validate()?;
+            let expected = if p.search.semantic_id == PALS_POST_REPAIR_RECHECK_V3_VERSION {
+                PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1()
+            } else {
+                PalsSearchPolicyIdentityV3::expected_actual_opponent_continuation_v1()
+            };
+            require(
+                *observed == expected,
+                "observed post-Repair lane differs from the selected manifest",
+            )?;
         }
         _ => require(
             o.pals_search_policy.is_none(),
@@ -2229,6 +2292,72 @@ mod tests {
             }
         }
         r
+    }
+
+    #[test]
+    fn actual_c_continuation_manifest_identity_and_receipt_do_not_alias_the_old_lane() {
+        let selected = PalsPostRepairRecheckPolicyV3::ActualOpponentContinuationV1;
+        assert_eq!(
+            decode_json::<PalsPostRepairRecheckPolicyV3>("\"actual-opponent-continuation-v1\"")
+                .unwrap(),
+            selected
+        );
+        let expected = selected.expected_identity();
+        expected.validate().unwrap();
+        let raw = serde_json::to_string(&expected).unwrap();
+        assert_eq!(
+            decode_json::<PalsSearchPolicyIdentityV3>(&raw).unwrap(),
+            expected
+        );
+        let old = PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1();
+        for field in 0..4 {
+            let mut mixed = expected.clone();
+            match field {
+                0 => mixed.version = old.version.clone(),
+                1 => mixed.policy = old.policy.clone(),
+                2 => mixed.search_identity = old.search_identity.clone(),
+                3 => mixed.conditions_sha256 = old.conditions_sha256,
+                _ => unreachable!(),
+            }
+            assert!(mixed.validate().is_err());
+        }
+        let mut m = manifest();
+        let PalsEngineV3::Pals(p) = &mut m.engines[0] else {
+            unreachable!()
+        };
+        p.search.semantic_id = selected.version().into();
+        p.search.options = BTreeMap::from([(
+            PALS_POST_REPAIR_RECHECK_V3_OPTION_KEY.into(),
+            selected.option_value().into(),
+        )]);
+        let lock = m.lock().unwrap();
+        let mut r = receipt(&lock);
+        let id = lock.manifest.engines[0].id();
+        for game in &mut r.games {
+            for endpoint in &mut game.engines {
+                if endpoint.endpoint_id == id {
+                    endpoint.pals_search_policy = Some(expected.clone());
+                }
+            }
+        }
+        r.validate_against(&lock).unwrap();
+        for game in &mut r.games {
+            for endpoint in &mut game.engines {
+                if endpoint.endpoint_id == id {
+                    endpoint.pals_search_policy = Some(old.clone());
+                }
+            }
+        }
+        assert!(r.validate_against(&lock).is_err());
+        let mut wrong = lock.manifest.clone();
+        let PalsEngineV3::Pals(p) = &mut wrong.engines[0] else {
+            unreachable!()
+        };
+        p.search.options.insert(
+            PALS_POST_REPAIR_RECHECK_V3_OPTION_KEY.into(),
+            PALS_POST_REPAIR_RECHECK_V3_OPTION_VALUE.into(),
+        );
+        assert!(wrong.lock().is_err());
     }
 
     #[test]

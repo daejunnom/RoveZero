@@ -208,6 +208,8 @@ impl PalsNativeRefinementRegistration {
             .map_err(|_| invalid("refinement registration is not UTF-8"))?;
         let wire: RefinementRegistrationWire = crate::decode_json(text)?;
         if wire.version != REFINEMENT_REGISTRATION_VERSION
+            || wire.search_policy
+                != PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1()
             || !valid_sha(&wire.base_registry_canonical_sha256)
             || !valid_sha(&wire.collector_binary_sha256)
         {
@@ -262,6 +264,8 @@ impl PalsNativeRefinementRegistration {
             .validate()
             .map_err(|e| invalid(e.to_string()))?;
         if self.wire.version != REFINEMENT_REGISTRATION_VERSION
+            || self.wire.search_policy
+                != PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1()
             || !valid_sha(&self.raw_sha256)
             || self.wire.base_registry_canonical_sha256 != canonical_sha256(base)?
             || self.wire.collector_binary_sha256 != base.collector_binary_sha256
@@ -1233,7 +1237,8 @@ impl Sink {
             ));
         }
         self.rejected_recheck = Some(event.identity);
-        if !self.selected_recheck()
+        if event.policy != PostRepairRecheckPolicy::SameRepairedLineOnceV1
+            || !self.selected_recheck()
             || self.closed_rechecks.contains(&event.identity)
             || self.closed_rechecks.len() >= MAX_RECHECK_ATTEMPTS
         {
@@ -1424,6 +1429,11 @@ impl Sink {
         Ok(())
     }
     fn finish_recheck(&mut self, event: RecheckFinished<'_>) -> Result<(), RoleError> {
+        if event.policy != PostRepairRecheckPolicy::SameRepairedLineOnceV1 {
+            return Err(role_error(
+                "single-Reply native witness does not admit a C continuation",
+            ));
+        }
         if self.closed_rechecks.contains(&event.identity) {
             return Err(role_error("duplicate recheck finish"));
         }
@@ -2837,6 +2847,26 @@ mod tests {
     }
 
     #[test]
+    fn single_reply_native_witness_refuses_actual_c_continuation_registration() {
+        let base = refinement_base();
+        let mut wire: RefinementRegistrationWire =
+            serde_json::from_slice(&refinement_bytes(&base)).unwrap();
+        wire.search_policy = PalsSearchPolicyIdentityV3::expected_actual_opponent_continuation_v1();
+        wire.search_policy.validate().unwrap();
+        assert!(admitted_refinement(&serde_json::to_vec(&wire).unwrap()).is_err());
+        let actual = PostRepairRecheckPolicy::ActualOpponentContinuationV1;
+        assert!(
+            observed_refinement_selection(
+                None,
+                actual,
+                actual.search_identity(),
+                actual.conditions()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn refinement_selection_checks_actual_engine_identity_conditions_and_legacy_disabled() {
         use rz_search::pals::engine::{
             POST_REPAIR_RECHECK_CONDITIONS, POST_REPAIR_RECHECK_SEARCH_VERSION,
@@ -3464,6 +3494,7 @@ mod tests {
         }
         fn prepared(&self) -> RecheckPrepared<'_> {
             RecheckPrepared {
+                policy: PostRepairRecheckPolicy::SameRepairedLineOnceV1,
                 identity: self.identity(),
                 root_state: rz_search::pals::store::StateId(0),
                 root_snapshot: &self.root_snapshot,
@@ -3491,6 +3522,7 @@ mod tests {
             reply_accepted: bool,
         ) -> RecheckFinished<'_> {
             RecheckFinished {
+                policy: PostRepairRecheckPolicy::SameRepairedLineOnceV1,
                 identity: self.identity(),
                 prepared_accepted,
                 reply_call_attempted,
@@ -3499,6 +3531,7 @@ mod tests {
                 selected_response: None,
                 counterline: &[],
                 full_suffix_replayed: false,
+                counterline_completed: false,
                 repaired_endpoint: self.endpoint(),
                 counter_endpoint: None,
                 comparable: false,

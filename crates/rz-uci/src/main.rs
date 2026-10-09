@@ -373,7 +373,8 @@ fn pals_refinement_policy(
     let policy = match selected {
         None => PostRepairRecheckPolicy::Disabled,
         Some("same-repaired-line-once-v1") => PostRepairRecheckPolicy::SameRepairedLineOnceV1,
-        Some(_) => return Err("PALS post-Repair recheck requires the exact explicit same-repaired-line-once-v1 lane; omission retains legacy".into()),
+        Some("actual-opponent-continuation-v1") => PostRepairRecheckPolicy::ActualOpponentContinuationV1,
+        Some(_) => return Err("PALS post-Repair recheck requires an exact explicit same-repaired-line-once-v1 or actual-opponent-continuation-v1 lane; omission retains legacy".into()),
     };
     if external_checker && policy != PostRepairRecheckPolicy::Disabled {
         return Err("PALS post-Repair recheck v1 supports own CPU/Rules evidence only; no external checker or model was started".into());
@@ -1074,6 +1075,32 @@ mod pals_checker_option_tests {
         ] {
             assert!(run_pals(vec![flag.into()], None).is_err());
         }
+    }
+
+    #[test]
+    fn actual_opponent_continuation_is_explicit_and_does_not_alias_suffix_replay() {
+        use rz_search::pals::engine::PostRepairRecheckPolicy;
+        assert_eq!(
+            pals_refinement_policy(Some("actual-opponent-continuation-v1"), false).unwrap(),
+            PostRepairRecheckPolicy::ActualOpponentContinuationV1
+        );
+        assert!(pals_refinement_policy(Some("actual-opponent-continuation-v1"), true).is_err());
+        for value in [
+            "actual_opponent_continuation_v1",
+            "actual-opponent-continuation-v2",
+            "ACTUAL-OPPONENT-CONTINUATION-V1",
+        ] {
+            assert!(pals_refinement_policy(Some(value), false).is_err());
+        }
+        let duplicate = run_pals(
+            vec![
+                "--pals-post-repair-recheck=same-repaired-line-once-v1".into(),
+                "--pals-post-repair-recheck=actual-opponent-continuation-v1".into(),
+            ],
+            None,
+        )
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("duplicate PALS post-Repair"));
     }
 
     #[test]

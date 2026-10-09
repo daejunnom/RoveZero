@@ -899,11 +899,13 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> SearchSessionDriver for Pa
                     },
                 });
             }
-            let selected_policy = if self.search_policy.is_some() {
-                PostRepairRecheckPolicy::SameRepairedLineOnceV1
-            } else {
-                PostRepairRecheckPolicy::Disabled
-            };
+            let selected_policy = self
+                .search_policy
+                .as_ref()
+                .map(PalsSearchPolicyIdentity::selected_policy)
+                .transpose()
+                .map_err(|error| SearchSessionFailure::debug("PalsSearchPolicyIdentity", &error))?
+                .unwrap_or(PostRepairRecheckPolicy::Disabled);
             if selected_search_policy(&engine, selected_policy)? != self.search_policy {
                 return Err(SearchSessionFailure {
                     physical_completion: DriverPhysicalCompletion::Confirmed,
@@ -1045,8 +1047,11 @@ fn selected_search_policy<M: rz_search::pals::engine::RoleModel>(
     }
     let conditions = engine.refinement_conditions().ok_or_else(mismatch)?;
     let identity = PalsSearchPolicyIdentity {
-        version: PalsSearchPolicyIdentity::VERSION.into(),
-        policy: PalsSearchPolicyIdentity::POLICY.into(),
+        version: requested
+            .registration_version()
+            .ok_or_else(mismatch)?
+            .into(),
+        policy: requested.registration_policy().ok_or_else(mismatch)?.into(),
         search_identity: engine.search_identity().into(),
         conditions_sha256: Sha256::digest(conditions.as_bytes()).into(),
     };
@@ -2056,6 +2061,71 @@ mod tests {
         )
         .unwrap();
         assert_ne!(selected.implementation(), changed_budget.implementation());
+    }
+
+    #[test]
+    fn actual_c_continuation_driver_registers_its_own_lane_and_rejects_cross_lane_getters() {
+        use rz_search::pals::engine::LegalOrderRoleMock;
+        let driver = PalsSessionDriver::new_with_refinement_policy(
+            refinement_config(),
+            LegalOrderRoleMock,
+            refinement_cpu_config(),
+            1,
+            8,
+            1,
+            refinement_name(),
+            PostRepairRecheckPolicy::ActualOpponentContinuationV1,
+        )
+        .unwrap();
+        let old = refinement_driver(LegalOrderRoleMock);
+        assert_ne!(driver.implementation(), old.implementation());
+        let policy = driver.search_policy_registration().unwrap();
+        assert_eq!(
+            policy.selected_policy().unwrap(),
+            PostRepairRecheckPolicy::ActualOpponentContinuationV1
+        );
+        assert_ne!(policy, old.search_policy_registration().unwrap());
+        let engine = driver.engine.lock().unwrap();
+        assert!(
+            selected_search_policy(&engine, PostRepairRecheckPolicy::SameRepairedLineOnceV1)
+                .is_err()
+        );
+        assert_eq!(
+            selected_search_policy(
+                &engine,
+                PostRepairRecheckPolicy::ActualOpponentContinuationV1
+            )
+            .unwrap()
+            .as_ref(),
+            Some(policy)
+        );
+        drop(engine);
+        let context = checker_context(&driver);
+        context.cancellation.cancel();
+        let report = driver
+            .run(&Position::startpos(), &context, &mut |_| {})
+            .unwrap();
+        assert!(report.best_move.is_none());
+        let receipt = driver.work_receipt().unwrap().unwrap();
+        assert_eq!(receipt.pals_search_policy.as_ref(), Some(policy));
+        assert_eq!(receipt.pals.unwrap().consumed_role_outputs, Some(0));
+        #[cfg(feature = "search-work-receipts")]
+        {
+            let raw = serde_json::to_string(policy).unwrap();
+            assert_eq!(
+                serde_json::from_str::<PalsSearchPolicyIdentity>(&raw).unwrap(),
+                *policy
+            );
+            let mut mixed = policy.clone();
+            mixed.conditions_sha256 = old.search_policy_registration().unwrap().conditions_sha256;
+            assert!(mixed.validate().is_err());
+            assert!(
+                serde_json::from_str::<PalsSearchPolicyIdentity>(
+                    &serde_json::to_string(&mixed).unwrap()
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

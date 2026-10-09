@@ -1777,9 +1777,19 @@ impl PalsArenaLaunchV3 {
             }
             _ => return Err(invalid("semantic endpoint and executable recipe differ")),
         };
-        if selected_policy.is_some() {
+        if let Some(policy) = &selected_policy {
             // Append exactly once after all registered native/provider options.
-            arguments.push("--pals-post-repair-recheck=same-repaired-line-once-v1".into());
+            let option =
+                if policy == &PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1() {
+                    PalsPostRepairRecheckPolicyV3::SameRepairedLineOnceV1.option_value()
+                } else if policy
+                    == &PalsSearchPolicyIdentityV3::expected_actual_opponent_continuation_v1()
+                {
+                    PalsPostRepairRecheckPolicyV3::ActualOpponentContinuationV1.option_value()
+                } else {
+                    return Err(invalid("unsupported selected post-Repair launch identity"));
+                };
+            arguments.push(format!("--pals-post-repair-recheck={option}"));
         }
         require(
             arguments.len() <= 32
@@ -1891,22 +1901,20 @@ fn validate_search_policy_selection(
             )?;
             Ok(None)
         }
-        Some(PalsPostRepairRecheckPolicyV3::SameRepairedLineOnceV1) => {
+        Some(selected) => {
             require(
                 engine.cpu_r.is_own()
-                    && engine.search.semantic_id == "pals-post-repair-recheck/1"
+                    && engine.search.semantic_id == selected.version()
                     && engine.search.options.len() == 1
                     && engine
                         .search
                         .options
                         .get("post_repair_recheck")
                         .map(String::as_str)
-                        == Some("same-repaired-line-once-v1"),
+                        == Some(selected.option_value()),
                 "post-Repair recheck requires exact manifest/recipe selection and own CPU_R; external dispatch is unsupported",
             )?;
-            Ok(Some(
-                PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1(),
-            ))
+            Ok(Some(selected.expected_identity()))
         }
     }
 }
@@ -4250,8 +4258,10 @@ fn validate_pals_process_work_inner(
             kind == "pals" && !external,
             "non-PALS or external work cannot inherit a post-Repair recheck marker",
         )?;
-        let expected = PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1();
-        validate_search_policy_marker(work, Some(&expected))?;
+        let observed: PalsSearchPolicyIdentityV3 =
+            serde_json::from_value(work["pals_search_policy"].clone())
+                .map_err(|e| invalid(format!("search policy marker wire: {e}")))?;
+        observed.validate().map_err(|e| invalid(e.to_string()))?;
     }
     // Historical v1 receipts omit this additive identity. Keep their absence
     // observable; an explicit identity must match the registered semantics.
@@ -8737,31 +8747,85 @@ mod tests {
         bad["native"]["execution"] = "not an object".into();
         assert!(validate(&bad).is_err());
     }
-    fn select_post_repair_recheck(mut input: PalsArenaLaunchV3) -> PalsArenaLaunchV3 {
+    fn select_post_repair_recheck(input: PalsArenaLaunchV3) -> PalsArenaLaunchV3 {
+        select_refinement(input, PalsPostRepairRecheckPolicyV3::SameRepairedLineOnceV1)
+    }
+    fn select_refinement(
+        mut input: PalsArenaLaunchV3,
+        selected: PalsPostRepairRecheckPolicyV3,
+    ) -> PalsArenaLaunchV3 {
         let PalsEngineV3::Pals(p) = &mut input.semantic_lock.manifest.engines[0] else {
             unreachable!()
         };
-        p.search.semantic_id = "pals-post-repair-recheck/1".into();
-        p.search.options = BTreeMap::from([(
-            "post_repair_recheck".into(),
-            "same-repaired-line-once-v1".into(),
-        )]);
+        p.search.semantic_id = selected.version().into();
+        p.search.options =
+            BTreeMap::from([("post_repair_recheck".into(), selected.option_value().into())]);
         match &mut input.endpoints[0] {
-            PalsEndpointLaunchV3::LegalOrderMock(s) => {
-                s.post_repair_recheck = Some(PalsPostRepairRecheckPolicyV3::SameRepairedLineOnceV1)
-            }
-            PalsEndpointLaunchV3::OnnxCpu(n) => {
-                n.search.post_repair_recheck =
-                    Some(PalsPostRepairRecheckPolicyV3::SameRepairedLineOnceV1)
-            }
+            PalsEndpointLaunchV3::LegalOrderMock(s) => s.post_repair_recheck = Some(selected),
+            PalsEndpointLaunchV3::OnnxCpu(n) => n.search.post_repair_recheck = Some(selected),
             PalsEndpointLaunchV3::OnnxCuda(n) => {
-                n.model.search.post_repair_recheck =
-                    Some(PalsPostRepairRecheckPolicyV3::SameRepairedLineOnceV1)
+                n.model.search.post_repair_recheck = Some(selected)
             }
             _ => unreachable!(),
         }
         input.semantic_lock = input.semantic_lock.manifest.lock().unwrap();
         input
+    }
+
+    #[test]
+    fn actual_c_continuation_contract_pin_and_launch_are_distinct_for_mock_cpu_and_cuda() {
+        use rz_search::pals::engine::PostRepairRecheckPolicy;
+        let actual = PostRepairRecheckPolicy::ActualOpponentContinuationV1;
+        let declaration = PalsPostRepairRecheckPolicyV3::ActualOpponentContinuationV1;
+        let expected = declaration.expected_identity();
+        assert_eq!(
+            Some(expected.version.as_str()),
+            actual.registration_version()
+        );
+        assert_eq!(Some(expected.policy.as_str()), actual.registration_policy());
+        assert_eq!(expected.search_identity, actual.search_identity());
+        assert_eq!(
+            expected.conditions_sha256,
+            <[u8; 32]>::from(Sha256::digest(actual.conditions().unwrap().as_bytes()))
+        );
+        assert_eq!(actual.conditions().unwrap().len(), 468);
+        expected.validate().unwrap();
+        for old in [fixture(), native_fixture(), cuda_fixture().0] {
+            let legacy = old.clone().lock().unwrap();
+            let input = select_refinement(old, declaration);
+            let selected = input.clone().lock().unwrap();
+            let args = &selected.endpoint_views[0].arguments;
+            assert_eq!(
+                args.last().unwrap(),
+                "--pals-post-repair-recheck=actual-opponent-continuation-v1"
+            );
+            assert_eq!(
+                &args[..args.len() - 1],
+                legacy.endpoint_views[0].arguments.as_slice()
+            );
+            assert_eq!(
+                args.iter()
+                    .filter(|arg| arg.starts_with("--pals-post-repair-recheck="))
+                    .count(),
+                1
+            );
+            assert_ne!(selected.sha256(), legacy.sha256());
+            let mut mismatch = input;
+            let PalsEngineV3::Pals(p) = &mut mismatch.semantic_lock.manifest.engines[0] else {
+                unreachable!()
+            };
+            p.search.semantic_id = PalsPostRepairRecheckPolicyV3::SameRepairedLineOnceV1
+                .version()
+                .into();
+            p.search.options.insert(
+                "post_repair_recheck".into(),
+                PalsPostRepairRecheckPolicyV3::SameRepairedLineOnceV1
+                    .option_value()
+                    .into(),
+            );
+            mismatch.semantic_lock = mismatch.semantic_lock.manifest.lock().unwrap();
+            assert!(mismatch.lock().is_err());
+        }
     }
 
     #[test]
@@ -8949,6 +9013,36 @@ mod tests {
             selected_isa: None,
             scope: "independent test wire fixture",
         }
+    }
+
+    #[test]
+    fn actual_c_continuation_work_marker_is_structural_until_both_launch_snapshots_match() {
+        let lock = select_refinement(
+            fixture(),
+            PalsPostRepairRecheckPolicyV3::ActualOpponentContinuationV1,
+        )
+        .lock()
+        .unwrap();
+        let mut work = work_fixture("pals");
+        work["pals_search_policy"] = serde_json::to_value(
+            PalsSearchPolicyIdentityV3::expected_actual_opponent_continuation_v1(),
+        )
+        .unwrap();
+        validate_pals_process_work(&work, "pals", true).unwrap();
+        validate_search_policy_pair(&lock, NativeEngineRole::Baseline, &work, &work).unwrap();
+        let mut old = work.clone();
+        old["pals_search_policy"] =
+            serde_json::to_value(PalsSearchPolicyIdentityV3::expected_same_repaired_line_once_v1())
+                .unwrap();
+        // Each identity is structurally valid; the independently locked launch
+        // must reject substitution at either startup or termination.
+        validate_pals_process_work(&old, "pals", true).unwrap();
+        assert!(
+            validate_search_policy_pair(&lock, NativeEngineRole::Baseline, &old, &work).is_err()
+        );
+        assert!(
+            validate_search_policy_pair(&lock, NativeEngineRole::Baseline, &work, &old).is_err()
+        );
     }
 
     #[test]
