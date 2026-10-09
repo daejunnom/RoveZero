@@ -3136,3 +3136,10 @@ GPU 검증 보류와 실제 학습 제외를 유지한다.
 - spawn 전 실패는 bundle을 소유한 typed failure를 반환한다. spawn 후 readback 실패는 capture 안에 기록하여 stdout/stderr·process receipt·pending child를 버리지 않는다. 사용자는 ownership-lost 또는 cleanup Unverified를 격리하고 후속 실행/결과 인수를 거부해야 한다. Drop은 durable 입력을 삭제하거나 미완료 child/모델 물리 완료를 인증하지 않는다.
 
 새 CPU 검사는 원래 창의 순서·expiry·extension 거부, 실제 native cat의 96KiB 무개행 전달/EOF/reap, input을 읽지 않는 sleep의 E 중지, 출력 제한/취소 거부, 기존 protocol 입력 제한 유지, caller 정책 치환 거부, 실제 descriptor hash의 읽기 위치·credit·pin·원래 guard 검사를 포함한다. 실제 등록된 ONNX 4N bundle 실행·native 물리 closure·strict Query next-prior 인수·whole-action cost·utility/paired 성과는 이 검사와 구분하며 계속 미인수다. 전체 P0~P6의 잔여 구현과 CPU 실제 실행 조건도 유지한다.
+
+
+### replay caller 최초 CI 실패와 종료 관측 보완
+
+`f5e857a`의 CI `37864492893`은 네 job의 종료를 모두 확인했다. model CPU와 bindings는 성공했으나 Linux/Windows workspace는 `u64` process 출력 상한과 `usize` transport 선언의 E0308/E0277 비교 오류로 실패했다. 새 transport 검사 성공으로 기록하지 않으며 원시 로그를 별도 보고서 루트에 보존한다. 수정은 checked 정수 변환으로 선언값을 유지하며 변환 실패를 거부한다.
+
+추가 검토로 원래 E 이전의 leader exit 관측을 W 이내 정리 완료와 분리했다. 첫 waitid 종료 관측의 S 이후 offset과 E 이전 여부를 기록하며, 해당 관측 없이 전달 완료를 발급하지 않는다. OS가 종료를 늦게 보여 주는 경우도 소급하여 통과시키지 않는다. 기존 실제 cat 검사에 E 관측 누락의 거부를 추가했다. 기존 receipt·protocol·준비/CLI wire·공통 계약은 유지하며, 수정 HEAD의 정확한 CPU CI 인수는 PR 설명과 외부 SHA·로그 영수증으로 별도 확인한다.

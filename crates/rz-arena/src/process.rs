@@ -84,6 +84,8 @@ pub struct OriginalProcessObservation {
     stderr_eof: bool,
     original_supervisor_entry_ns: Option<u64>,
     original_spawn_ns: Option<u64>,
+    original_exit_observed_ns: Option<u64>,
+    exit_observed_before_execution: bool,
     original_finished_ns: Option<u64>,
     finished_before_whole: bool,
     cancelled_at_return: bool,
@@ -101,6 +103,8 @@ impl OriginalProcessObservation {
             stderr_eof: false,
             original_supervisor_entry_ns: None,
             original_spawn_ns: None,
+            original_exit_observed_ns: None,
+            exit_observed_before_execution: false,
             original_finished_ns: None,
             finished_before_whole: false,
             cancelled_at_return: false,
@@ -118,6 +122,12 @@ impl OriginalProcessObservation {
     }
     pub fn finished_before_whole(&self) -> bool {
         self.finished_before_whole
+    }
+    pub fn exit_observed_before_execution(&self) -> bool {
+        self.exit_observed_before_execution
+    }
+    pub fn original_exit_observed_ns(&self) -> Option<u64> {
+        self.original_exit_observed_ns
     }
 }
 
@@ -141,8 +151,10 @@ impl OriginalProcessOutput {
             && o.stdout_eof
             && o.stderr_eof
             && o.finished_before_whole
+            && o.exit_observed_before_execution
             && o.original_supervisor_entry_ns.is_some()
             && o.original_spawn_ns.is_some()
+            && o.original_exit_observed_ns.is_some()
             && o.original_finished_ns.is_some()
             && !o.cancelled_at_return
             && !o.ownership_lost
@@ -910,6 +922,7 @@ mod linux {
             if err.len() > prior_err {
                 crate::native_diagnostics::observe_stream(false, &err[prior_err..]);
             }
+            let previously_exited = leader_done;
             if !leader_done {
                 match waitid(
                     Id::Pid(group),
@@ -946,6 +959,14 @@ mod linux {
                         break;
                     }
                 }
+            }
+            if !previously_exited
+                && leader_done
+                && let (Some(window), Some(o)) = (original, observation.as_deref_mut())
+            {
+                let observed_at = Instant::now();
+                o.original_exit_observed_ns = window.elapsed_ns(observed_at);
+                o.exit_observed_before_execution = observed_at < window.execution;
             }
             if leader_done || stop.is_some() {
                 cleanup_started.get_or_insert_with(Instant::now);
@@ -1689,6 +1710,11 @@ mod linux {
             assert_eq!(output.process().stdout, input);
             assert_eq!(output.observation().written_bytes(), Some(input.len()));
             assert!(output.transport_complete(), "{output:?}");
+            assert!(output.observation().exit_observed_before_execution());
+            assert!(output.observation().original_exit_observed_ns().is_some());
+            output.observation.exit_observed_before_execution = false;
+            assert!(!output.transport_complete());
+            output.observation.exit_observed_before_execution = true;
             output.observation.stdout_eof = false;
             assert!(!output.transport_complete());
             output.observation.stdout_eof = true;

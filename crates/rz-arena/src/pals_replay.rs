@@ -115,6 +115,8 @@ fn check_resource_policy(
     output_bytes: usize,
     policy: ReplayCallerPolicy,
 ) -> Result<(), ArenaError> {
+    let output_bytes = u64::try_from(output_bytes)
+        .map_err(|_| ArenaError::Budget("replay caller output limit conversion overflow".into()))?;
     let execution_ms = whole_wall_ms
         .checked_sub(cleanup_reserve_ms)
         .filter(|ms| *ms > 0)
