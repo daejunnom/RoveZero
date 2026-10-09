@@ -17,11 +17,13 @@ use std::time::Instant;
 
 mod chronology;
 mod delivery;
+mod query_material;
 pub use chronology::{CheckedRepairReplayObservation, ReplayCallerTiming};
 pub use delivery::{
     BoundRepairReplayDelivery, BoundReplayDelivery, RepairReplayDeliveryRegistration,
     ReplayDeliveryRegistration,
 };
+pub use query_material::ReportedRepairPriorMaterial;
 
 pub const MAX_REPLAY_CALLER_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_REPLAY_CALLER_READ_BYTES: u64 = MAX_REPLAY_CALLER_BINARY_BYTES + 32 * 1024 * 1024;
@@ -66,7 +68,9 @@ pub struct OwnedReplayCapture {
     bundle: PreparedReplayLaunchBundle,
     process: OriginalProcessOutput,
     postflight_error: Option<ArenaError>,
+    caller_started: Instant,
     caller_finished: Instant,
+    prior_material_issue: query_material::MaterialIssueGate,
     finished_before_original_whole: bool,
     cancelled_at_return: bool,
 }
@@ -162,6 +166,7 @@ pub fn supervise_prepared_observed_replay(
 ) -> Result<OwnedReplayCapture, Box<ReplayCallerFailure>> {
     #[cfg(target_os = "linux")]
     {
+        let caller_started = Instant::now();
         match linux::capture(&bundle, program, directory, policy, cancel) {
             Ok((process, postflight_error)) => {
                 let caller_finished = Instant::now();
@@ -171,7 +176,9 @@ pub fn supervise_prepared_observed_replay(
                     bundle,
                     process,
                     postflight_error,
+                    caller_started,
                     caller_finished,
+                    prior_material_issue: query_material::MaterialIssueGate::default(),
                     finished_before_original_whole,
                     cancelled_at_return,
                 })

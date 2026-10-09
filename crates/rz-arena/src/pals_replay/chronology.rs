@@ -59,6 +59,7 @@ impl ReplayCallerTiming<'_> {
     pub fn elapsed_through_check_ns(&self) -> u64 {
         self.checking_finished_ns
     }
+    /// Snapshot at checking_finished_at, never a budget for a later execution.
     pub fn remaining_original_whole_ns(&self) -> u64 {
         self.whole_ns - self.checking_finished_ns
     }
@@ -109,7 +110,7 @@ impl<'capture> BoundRepairReplayDelivery<'capture> {
     }
 }
 
-fn elapsed(start: Instant, at: Instant) -> Result<u64, ArenaError> {
+pub(super) fn elapsed(start: Instant, at: Instant) -> Result<u64, ArenaError> {
     at.checked_duration_since(start)
         .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
         .ok_or_else(|| invalid("caller original clock extent/order"))
