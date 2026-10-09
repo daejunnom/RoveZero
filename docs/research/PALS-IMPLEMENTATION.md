@@ -3122,3 +3122,17 @@ loaded-image 관측, 독립 등록 자료 및 next before/prior chronology를 �
 검사도 추가한다. 이 소스 단위의 CPU CI 결과는 정확한 HEAD에서 별도로 기록하며, 실제
 등록된 ONNX 4N 실행·외부 supervisor·strict Query 환류·전체 비용·utility 인수는 남아 있다.
 GPU 검증 보류와 실제 학습 제외를 유지한다.
+
+
+## 원래 실행 창을 유지하는 Rust replay caller 후속 구현
+
+이 단위는 기존 `535b52b`의 관측 4N 준비·CLI 연결을 arena의 실제 프로세스 감독 접점까지 연결한다. GPU 보류, 실제 학습 제외, 로컬 heavy CPU 미실행, PR #23 Draft를 유지한다. 정확한 실행 SHA의 CPU CI를 관측하기 전에는 아래 새 검사들을 통과로 기록하지 않는다.
+
+- `OriginalProcessWindow`는 준비 소유자가 가진 process-local S/E/W를 전달한다. serialized duration이나 자식 시작 시각으로 새 실행 창을 만들지 않는다. 새 `supervise_input_in_original_window`는 1..2MiB frozen 입력을 기존 nonblocking pipe·pinned ELF·전용 process group·waitid/reap 경로로 전달한다. 기존 UCI protocol 입력의 64KiB·마지막 newline 제한과 상대 시간 API는 유지한다.
+- 실행 중지 시각은 원래 E다. cleanup의 KILL과 최종 관측은 원래 W로 제한하고, 늦게 반환한 관측은 전달 완료를 통과하지 못한다. blocking OS preflight/spawn/파일 관측에 hard timeout을 보장하지 않는다. 자식의 내부 시계와 부모 S는 같은 process-local Instant가 아니므로, 부모의 절대 E/W 감독이 필수이며 이를 원본 시계의 process 간 직렬화 전송으로 주장하지 않는다.
+- 새 전달 관측은 확인된 input write 수·stdin 종료·stdout/stderr EOF·S 이후 supervisor/spawn/반환 offset·최종 취소·소유권 상태를 기록한다. 정상 exit 0, 두 EOF, 전량 전달, group Gone, 실제 reap, pending child 없음, 오류 없음, W 이내 반환을 모두 요구한다. 기존 receipt의 elapsed는 기존 private supervisor 구간이며 S부터의 전체 offset과 구분한다. 관측은 역직렬화로 발급할 수 없다.
+- `pals-collection-onnx`의 `pals_replay::supervise_prepared_observed_replay`는 prepared bundle을 이동하여 보존한다. 새 manifest /2·explicit expected /3·QueryPriorV1·등록된 4N만 받으며 old /1·/2를 자동 승격하지 않는다. 원래 whole/cleanup/output 선언과 단일 child 정책을 일치시킨다. 등록 replay binary를 caller의 열린 descriptor에서 bounded read_at으로 hash 검증하고, 원래 cwd inode와 준비 파일·manifest를 실행 전후 다시 검증한다. caller pin 검증은 native loaded image·model/source admission의 대체가 아니다.
+- 요청 backing은 bundle에서 빌려 쓰며 전량 복제하지 않는다. binary 최대 512MiB, 검증 read credit 최대 544MiB를 별도 정책으로 제한하고, 모든 검증은 원래 E 또는 종료 후 W를 사용한다. descriptor 검증은 caller의 읽기 위치를 바꾸지 않는다. read credit·metadata/pin mismatch·취소·시간 초과는 거부한다. 경로/metadata 검사와 periodic process-group/tree 관측은 hostile concurrent mutation·escaped child·kernel cgroup/quota 집행을 증명하지 않는다.
+- spawn 전 실패는 bundle을 소유한 typed failure를 반환한다. spawn 후 readback 실패는 capture 안에 기록하여 stdout/stderr·process receipt·pending child를 버리지 않는다. 사용자는 ownership-lost 또는 cleanup Unverified를 격리하고 후속 실행/결과 인수를 거부해야 한다. Drop은 durable 입력을 삭제하거나 미완료 child/모델 물리 완료를 인증하지 않는다.
+
+새 CPU 검사는 원래 창의 순서·expiry·extension 거부, 실제 native cat의 96KiB 무개행 전달/EOF/reap, input을 읽지 않는 sleep의 E 중지, 출력 제한/취소 거부, 기존 protocol 입력 제한 유지, caller 정책 치환 거부, 실제 descriptor hash의 읽기 위치·credit·pin·원래 guard 검사를 포함한다. 실제 등록된 ONNX 4N bundle 실행·native 물리 closure·strict Query next-prior 인수·whole-action cost·utility/paired 성과는 이 검사와 구분하며 계속 미인수다. 전체 P0~P6의 잔여 구현과 CPU 실제 실행 조건도 유지한다.
