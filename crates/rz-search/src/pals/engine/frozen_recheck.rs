@@ -1281,11 +1281,11 @@ mod tests {
                 ),
             ] {
                 let question = json!({
-                    "first_move": work.original_first.to_uci(),
+                    "first_move": work.original_first.to_string(),
                     "record_revision": work.repair_record_revision,
                     "attack_ply": work.attack_ply,
-                    "repaired": work.repaired.iter().map(|m| m.to_uci()).collect::<Vec<_>>(),
-                    "refutation": work.refutation.iter().map(|m| m.to_uci()).collect::<Vec<_>>(),
+                    "repaired": work.repaired.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "refutation": work.refutation.iter().map(ToString::to_string).collect::<Vec<_>>(),
                     "root_fen": selected.nodes[work.root].position.to_fen(),
                 });
                 let first_move = work.original_first;
