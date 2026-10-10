@@ -8800,7 +8800,15 @@ mod native {
                         9 => observed.fresh = Some(false),
                         10 => observed.unknown_observed = true,
                         11 => observed.measurement_complete = false,
-                        12 => value.state = Position::startpos().position_identity(),
+                        12 => {
+                            let mut other = position.clone();
+                            other
+                                .make_move(BoardMove::from_uci("e2e4").unwrap())
+                                .unwrap();
+                            let other_state = other.position_identity();
+                            assert_ne!(other_state, value.state, "case {case}");
+                            value.state = other_state;
+                        }
                         13 => value.perspective = Color::Black,
                         _ => {}
                     }
@@ -9054,22 +9062,34 @@ mod native {
                 EPOCHS.fetch_add(1, Ordering::AcqRel)
             ));
             std::fs::create_dir(&root).unwrap();
-            let runtime_hash = "01".repeat(32);
+            // This mock worker receipt has a static fixture identity, independent
+            // of the debug test executable's size. Production open still observes
+            // the actual executable under its original 128 MiB bound.
             let mut writer =
-                PalsReceiptWriter::open(&root, "fixture", &"ab".repeat(32), &runtime_hash).unwrap();
-            assert!(writer.startup(partial.clone(), None).is_err());
+                PalsReceiptWriter::open_static_identity_fixture(&root, [1; 32]).unwrap();
+            assert_eq!(
+                writer.startup(partial.clone(), None).unwrap_err().stage,
+                "selected PALS CUDA loading profile requires an actual startup mapping ACK"
+            );
             writer.failed_startup(partial, &primary, None).unwrap();
             let ended = finish
                 .finish(Instant::now() + Duration::from_secs(2))
                 .unwrap();
             assert!(ended.physical_shutdown_confirmed && ended.native_buffers_released);
-            assert!(writer.termination(ended.clone(), true, None).is_err());
+            assert_eq!(
+                writer
+                    .termination(ended.clone(), true, None)
+                    .unwrap_err()
+                    .stage,
+                "failed PALS startup cannot publish a successful service termination"
+            );
             writer.termination(ended, false, None).unwrap();
             drop(writer);
             let slot = root.join(crate::process_receipts::process_run_id());
             for file in [STARTUP_FILE, TERMINATION_FILE] {
                 let value: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(slot.join(file)).unwrap()).unwrap();
+                assert_eq!(value["endpoint_id"], "static-pals-receipt-fixture");
                 assert_eq!(value["startup_failure"], "backend");
                 assert_eq!(value["service_exit_success"], false);
                 assert_eq!(

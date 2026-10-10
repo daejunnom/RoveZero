@@ -174,6 +174,30 @@ pub struct PalsReceiptWriter {
 }
 #[cfg(feature = "onnx-cpu")]
 impl PalsReceiptWriter {
+    /// Test-only static identities, never an observed executable attestation.
+    /// Keep the production receipt validation and bounded file writer path.
+    #[cfg(test)]
+    pub(crate) fn open_static_identity_fixture(
+        output_root: &Path,
+        runtime_sha256: [u8; 32],
+    ) -> Result<Self, ProcessReceiptError> {
+        Ok(Self {
+            writer: ProcessReceiptWriter::open_named_root(
+                output_root,
+                STARTUP_FILE,
+                TERMINATION_FILE,
+            )?,
+            endpoint_id: "static-pals-receipt-fixture".into(),
+            launch_sha256: "ab".repeat(32),
+            binary_sha256: "cd".repeat(32),
+            runtime_sha256: crate::process_receipts::hex(&runtime_sha256),
+            startup_failure: None,
+            cpu_checker: None,
+            v4: false,
+            followup: None,
+            followup_lifecycle: None,
+        })
+    }
     pub fn open(
         output_root: &Path,
         endpoint_id: &str,
