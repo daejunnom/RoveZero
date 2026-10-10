@@ -148,6 +148,15 @@ _REVIEWED_DISABLED_FOLLOWUP_CONTROLLED_FALLBACK_SOURCES = (
     {"bytes": 391894, "sha256": "4770a55361a994210a2238240ed4d2dea1a24d7a8b85524cc7c2db31d19f5e19"},
     {"bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
 )
+# Reviewed frozen live-binding successor, still the archive-off Disabled lane.
+# Original controls and current Rules bind acceptance; a stopped request or
+# legal raw prefix grants no publication, completed task or value authority.
+# Compiled source digests do not certify a build, execution or target. The
+# unchanged closed gate excludes archive/V4/ModelWdl and selected recheck lanes.
+_REVIEWED_DISABLED_FOLLOWUP_LIVE_BINDING_SOURCES = (
+    {"bytes": 396086, "sha256": "004db31f9be5133bd1925b373e6df60e97da3d50979a7eb5a031b1dad4ca397b"},
+    {"bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+)
 _SOURCE_REVIEW_PROFILES = (
     ("legacy_prepared_lineage_4469f9d", _REVIEWED_SOURCES),
     ("legacy_disabled_recheck_9c0de959", _REVIEWED_DISABLED_RECHECK_SOURCES),
@@ -165,6 +174,7 @@ _SOURCE_REVIEW_PROFILES = (
     ("legacy_disabled_followup_core_lint_4729c359_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_CORE_LINT_SOURCES),
     ("legacy_disabled_followup_controlled_core_752d328a_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_CONTROLLED_CORE_SOURCES),
     ("legacy_disabled_followup_controlled_fallback_4770a553_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_CONTROLLED_FALLBACK_SOURCES),
+    ("legacy_disabled_followup_live_binding_004db31f_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_LIVE_BINDING_SOURCES),
 )
 _DISABLED_SEARCH_VERSION = "pals-restricted-refinement/0.1"
 _OPT_IN_LANE_FIELDS = ("pals_search_policy", "refinement_registration", "refinement_registration_sha256", "post_repair_recheck", "post_repair_recheck_policy", "post_repair_recheck_conditions",

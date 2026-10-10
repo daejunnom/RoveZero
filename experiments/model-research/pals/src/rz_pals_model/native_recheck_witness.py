@@ -142,6 +142,17 @@ _REVIEWED_OPT_IN_SOURCE_PROFILES = (
         "crates/rz-arena/src/pals_collect/native.rs": {
             "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
     }),
+    # Reviewed frozen live-binding successor, archive-off SingleReply only.
+    # Original controls, exact accepted Repair and Rules-replayed endpoint
+    # provenance remain required. External CP and ModelWdl are separate value
+    # namespaces; neither raw prefixes nor retired tasks gain completed OwnCPU
+    # authority. This literal pair certifies no build, execution or target.
+    ("opt_in_single_reply_followup_live_binding_004db31f_native_1ba6d1e5", {
+        "crates/rz-search/src/pals/engine.rs": {
+            "bytes": 396086, "sha256": "004db31f9be5133bd1925b373e6df60e97da3d50979a7eb5a031b1dad4ca397b"},
+        "crates/rz-arena/src/pals_collect/native.rs": {
+            "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+    }),
 )
 _POLICY = {
     "version": "pals-post-repair-recheck/1",
