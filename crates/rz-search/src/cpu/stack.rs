@@ -1540,6 +1540,123 @@ mod tests {
     }
 
     #[test]
+    fn resumed_value_failure_consumes_one_token_and_preserves_new_work_without_partial_tt() {
+        struct FaultingScore {
+            base: BootstrapCpuValue,
+            fail: Arc<AtomicBool>,
+        }
+        impl CpuValueEvaluator for FaultingScore {
+            fn identity(&self) -> &CpuValueIdentity {
+                self.base.identity()
+            }
+            fn provenance(&self) -> &'static str {
+                self.base.provenance()
+            }
+            fn initialize(&self, p: &Position) -> Result<CpuAccumulator, CpuValueError> {
+                self.base.initialize(p)
+            }
+            fn score(&self, a: &CpuAccumulator, p: &Position) -> Result<i32, CpuValueError> {
+                if self.fail.load(Ordering::Acquire) {
+                    return Err(CpuValueError::NonFiniteForward);
+                }
+                self.base.score(a, p)
+            }
+            fn apply_delta(
+                &self,
+                a: &mut CpuAccumulator,
+                d: &RuleMoveDelta,
+            ) -> Result<CpuAccumulatorUndo, CpuValueError> {
+                self.base.apply_delta(a, d)
+            }
+            fn restore(
+                &self,
+                a: &mut CpuAccumulator,
+                u: CpuAccumulatorUndo,
+                p: &Position,
+            ) -> Result<(), CpuValueError> {
+                self.base.restore(a, u, p)
+            }
+        }
+        let position = Position::startpos();
+        let before = position.snapshot();
+        let restriction = [BoardMove::from_uci("e2e4").unwrap()];
+        let cancel = AtomicBool::new(false);
+        let fail = Arc::new(AtomicBool::new(false));
+        let mut engine = CpuEngine::with_evaluator_ordering_and_resume_policy(
+            config(64),
+            Arc::new(FaultingScore {
+                base: BootstrapCpuValue::default(),
+                fail: Arc::clone(&fail),
+            }),
+            CpuOrderingPolicy::LegacyMvvLvaV1,
+            CpuResumePolicy::PausedStack,
+        )
+        .unwrap();
+        let partial = engine
+            .analyze_root_moves(&position, &restriction, limits(1), &cancel)
+            .unwrap();
+        assert_eq!(partial.nodes, 1);
+        let token = partial.resume.unwrap();
+        let paused = engine.paused_stack_snapshot().unwrap();
+        assert!(engine.tt.iter().all(Option::is_none));
+        fail.store(true, Ordering::Release);
+        // A one-node resume must reach the injected scorer. Seeding Control
+        // with the old charged node would stop before that new work and hide
+        // this typed failure behind NodeLimit.
+        assert!(matches!(
+            engine.resume(&position, &token, limits(1), &cancel),
+            Err(CpuError::Value(CpuValueError::NonFiniteForward))
+        ));
+        let failed_work = engine.last_attempt_work().unwrap();
+        assert_eq!(failed_work.nodes, 1);
+        assert_eq!(failed_work.quiescence_nodes, 1);
+        assert_eq!(failed_work.tt_hits, 0);
+        assert_eq!(token.cumulative_work().unwrap().nodes, 1);
+        assert!(before.same_state(&position.snapshot()));
+        assert!(engine.tt.iter().all(Option::is_none));
+        assert!(!engine.token_is_current(&token));
+        let failed_owner = engine.paused_stack_snapshot().unwrap();
+        assert!(failed_owner.complete);
+        assert_eq!(failed_owner.owner_id, paused.owner_id);
+        assert_eq!(failed_owner.tokens_created, 1);
+        assert_eq!(failed_owner.tokens_resumed, 1);
+        assert_eq!(failed_owner.tokens_invalidated, 0);
+        assert_eq!(failed_owner.tokens_retained, 0);
+        assert_eq!(failed_owner.bytes_current, 0);
+        assert_eq!(failed_owner.replayed_consumed_work, 0);
+        assert!(matches!(
+            engine.resume(&position, &token, limits(1), &cancel),
+            Err(CpuError::ResumeMismatch(_))
+        ));
+        assert_eq!(engine.last_attempt_work(), Some(CpuWork::default()));
+        let rejected = engine.paused_stack_snapshot().unwrap();
+        assert_eq!(rejected.tokens_resumed, 1);
+        assert_eq!(rejected.stale_context_attempts, 1);
+        assert_eq!(rejected.stale_context_rejections, 1);
+
+        fail.store(false, Ordering::Release);
+        let recovered = engine
+            .analyze_root_moves(&position, &restriction, limits(100_000), &cancel)
+            .unwrap();
+        let mut fresh = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 64);
+        let expected = fresh
+            .analyze_root_moves(&position, &restriction, limits(100_000), &cancel)
+            .unwrap();
+        assert_eq!(recovered.completion, CpuCompletion::DepthLimit);
+        assert_eq!(
+            (recovered.score, recovered.pv, recovered.completed_depth),
+            (expected.score, expected.pv, expected.completed_depth)
+        );
+        assert_eq!(engine.last_attempt_work(), fresh.last_attempt_work());
+        compare_tt_and_history(&engine, &fresh);
+        assert!(before.same_state(&position.snapshot()));
+        assert_eq!(
+            engine.paused_stack_snapshot().unwrap().owner_id,
+            paused.owner_id
+        );
+    }
+
+    #[test]
     fn aspiration_failure_and_pvs_research_keep_the_same_work_after_one_node_slices() {
         let position = Position::from_fen("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1").unwrap();
         let mut checkpoint = CpuFloatCheckpoint::zeros_untrained();
