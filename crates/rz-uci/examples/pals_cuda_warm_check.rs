@@ -2422,6 +2422,9 @@ mod check {
             "fresh_control": "independent_warm_capable_factory_owner_with_no_accepted_seed",
             "warm_seed_preparation": "actual_accepted_repair_source_once_then_provisional_cost_outputs_discarded",
             "fresh_vs_warm_raw_output_equality_required": false,
+            "observed_original_integration_calls": report["calls"].as_array().map(Vec::len),
+            "warm_owner_role_totals_include_cost_calls": true,
+            "fresh_owner_role_totals_reported_separately": true,
         });
         let comparison = json!({
             "sharing_measurement": null, "whole_device_vram_peak_bytes": null,
@@ -2474,8 +2477,9 @@ mod check {
         let owner_limits = args.cuda_warm_limits()?;
         let integration_forward_limit = if args.cost_same_seed_context {
             require(
-                scenario.max_role_forwards
-                    > COST_EXTRA_ROLE_FORWARDS + STARTUP_ROLE_FORWARDS + FOLLOWUP_ROLE_FORWARDS,
+                scenario.max_role_forwards == DEFAULT_ROLE_FORWARDS
+                    && scenario.max_role_forwards
+                        > COST_EXTRA_ROLE_FORWARDS + STARTUP_ROLE_FORWARDS + FOLLOWUP_ROLE_FORWARDS,
                 "scenario",
                 "cost_forward_reservation_out_of_bounds",
             )?;
@@ -3060,6 +3064,388 @@ mod check {
         let wdl_error = compare_slice_with(&a.wdl, &b.wdl, POLICY_WDL_ATOL, 0.)?;
         Ok(json!({"legal_policy_max_abs_error": policy_error, "wdl_max_abs_error": wdl_error}))
     }
+    fn cost_receipt_matches(
+        receipt: &Value,
+        calls: u64,
+        consumers: u64,
+        final_receipt: bool,
+    ) -> bool {
+        let live = receipt["quarantined"] == false
+            && receipt["physical_runs_in_flight"].as_u64() == Some(0)
+            && receipt["process_epoch"].as_u64().is_some()
+            && receipt["game_generation"].as_u64().is_some()
+            && [
+                "physically_completed_role_calls",
+                "completed_role_inputs",
+                "delivered_role_inputs",
+            ]
+            .iter()
+            .all(|key| receipt[key].as_u64() == Some(calls))
+            && receipt["search_consumed_role_inputs"].as_u64() == Some(consumers);
+        live && (!final_receipt
+            || (receipt["physical_shutdown_confirmed"] == true
+                && receipt["native_buffers_released"] == true
+                && receipt["backend_stats"]["role_nn_runs_attempted"].as_u64()
+                    == Some(calls + STARTUP_ROLE_FORWARDS)
+                && receipt["backend_stats"]["role_nn_runs_completed"].as_u64()
+                    == Some(calls + STARTUP_ROLE_FORWARDS)
+                && receipt["backend_stats"]["role_nn_runs_failed_known"].as_u64() == Some(0)))
+    }
+    fn cost_raw_bits(raw: &PalsRawOutput) -> Value {
+        json!({"candidate_logits": raw.candidate_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "wdl_logits": raw.wdl_logits.map(f32::to_bits),
+            "divergence_logits": raw.divergence_logits.as_ref().map(|v| v.iter().map(|v| v.to_bits()).collect::<Vec<_>>()),
+            "task_logits": raw.task_logits.map(|v| v.map(f32::to_bits)),
+            "private_latent": raw.private_latent.iter().map(|v| v.to_bits()).collect::<Vec<_>>()})
+    }
+    fn cost_reference(
+        capture: &Value,
+        reference: &Value,
+        configuration: &PalsModelConfig,
+    ) -> Result<Value, Failure> {
+        let cost = &capture["cost_same_seed_context"];
+        let independent = &reference["cost_same_seed_context"];
+        let originals = capture["calls"]
+            .as_array()
+            .ok_or(fail("cost_reference", "original_calls_missing"))?;
+        let source = &cost["original_accepted_repair_source"];
+        let latent: Vec<u32> =
+            serde_json::from_value(cost["original_accepted_full_6144_seed_bits"].clone())
+                .map_err(|_| fail("cost_reference", "original_seed_missing"))?;
+        let original_raw: PalsRawOutput = serde_json::from_value(source["raw_output"].clone())
+            .map_err(|_| fail("cost_reference", "original_output_missing"))?;
+        require(
+            cost["opt_in"] == true
+                && cost["execution_checks_passed"] == true
+                && cost["owners_run_sequentially_after_actual_worker_join"] == true
+                && cost["max_concurrent_physical_workers"].as_u64() == Some(1)
+                && cost["selected_max_leases"].as_u64() == Some(1)
+                && cost["selected_device_payload_bytes_max"].as_u64()
+                    == Some(COST_DEVICE_BYTES_MAX)
+                && cost["preparation_calls_per_lane"].as_u64()
+                    == Some(COST_PREPARATION_CALLS as u64)
+                && cost["measured_calls_per_lane"].as_u64() == Some(COST_MEASURED_CALLS as u64)
+                && cost["extra_role_forward_reservation_including_fresh_startup"].as_u64()
+                    == Some(COST_EXTRA_ROLE_FORWARDS)
+                && capture["max_actual_role_forwards_including_startup"].as_u64()
+                    == Some(DEFAULT_ROLE_FORWARDS)
+                && originals.len() as u64 + STARTUP_ROLE_FORWARDS
+                    <= DEFAULT_ROLE_FORWARDS - COST_EXTRA_ROLE_FORWARDS
+                && originals.contains(source)
+                && source["accepted"] == true
+                && source["accepted_with_original_controls"] == true
+                && source["delivered"] == true
+                && source["physical"]["dispatched"] == true
+                && source["physical"]["ready"] == true
+                && source["physical"]["completed_ok"] == true
+                && source["physical"]["completion_unknown"] == false
+                && source["logical_context"]["purpose"] == "RepairPolicy"
+                && latent.len() == LATENT_ELEMENTS
+                && latent.iter().all(|v| f32::from_bits(*v).is_finite())
+                && original_raw
+                    .private_latent
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+                    == latent
+                && source["raw_output_bits"] == cost_raw_bits(&original_raw)
+                && cost["same_target_input_json_sha256_hex"] == source["input_json_sha256_hex"]
+                && independent["opt_in"] == true
+                && independent["independent_same_seed_reference_passed"] == true
+                && independent["original_accepted_repair_source"] == *source
+                && independent["original_accepted_full_6144_seed_bits"]
+                    == cost["original_accepted_full_6144_seed_bits"]
+                && independent["same_target_input_json_sha256_hex"]
+                    == cost["same_target_input_json_sha256_hex"],
+            "cost_reference",
+            "partial_or_unbound_original_cost_source",
+        )?;
+        let original_count = originals.len() as u64;
+        let expected_warm = original_count + COST_LANE_CALLS as u64;
+        require(
+            capture["actual_role_forwards_including_startup"].as_u64()
+                == Some(expected_warm + STARTUP_ROLE_FORWARDS)
+                && capture["actual_completed_role_forwards_including_startup"].as_u64()
+                    == Some(expected_warm + STARTUP_ROLE_FORWARDS)
+                && capture["actual_known_completed_startup_role_forwards"].as_u64()
+                    == Some(STARTUP_ROLE_FORWARDS)
+                && capture["role_forward_accounting_checked"] == true,
+            "cost_reference",
+            "warm_owner_and_original_integration_accounting_differ",
+        )?;
+        let expected_input: PalsModelInput = serde_json::from_value(source["input"].clone())
+            .map_err(|_| fail("cost_reference", "source_input_invalid"))?;
+        let mut result = json!({"opt_in": true, "independent_same_seed_reference_passed": true,
+            "comparison_status": "not_comparable", "warm_over_fresh_api_wall_ratio": null,
+            "physical_nn_graph_inputs_per_sample": null, "public_cache_counts_per_sample": null,
+            "benchmark_validation_complete": false, "fresh_vs_warm_output_equality_required": false});
+        for (name, warm) in [("warm", true), ("fresh", false)] {
+            let lane = &cost[name];
+            let lane_reference = &independent[name];
+            let calls = lane["calls"]
+                .as_array()
+                .ok_or(fail("cost_reference", "lane_calls_missing"))?;
+            let references = lane_reference["calls"]
+                .as_array()
+                .ok_or(fail("cost_reference", "lane_reference_missing"))?;
+            let base = if warm { original_count } else { 0 };
+            let consumers = base;
+            require(
+                lane["complete"] == true
+                    && lane["failure"].is_null()
+                    && lane["physical_owner_joined"] == true
+                    && lane["preparation_calls_requested"].as_u64()
+                        == Some(COST_PREPARATION_CALLS as u64)
+                    && lane["measured_calls_requested"].as_u64()
+                        == Some(COST_MEASURED_CALLS as u64)
+                    && lane["measured_calls_completed"].as_u64()
+                        == Some(COST_MEASURED_CALLS as u64)
+                    && calls.len() == COST_LANE_CALLS
+                    && references.len() == COST_LANE_CALLS
+                    && cost_receipt_matches(
+                        &lane["final_receipt"],
+                        base + COST_LANE_CALLS as u64,
+                        consumers,
+                        true,
+                    ),
+                "cost_reference",
+                "incomplete_lane_or_owner_accounting",
+            )?;
+            let source_identity = if warm {
+                &capture["source_identity"]
+            } else {
+                &lane["source_identity"]
+            };
+            require(
+                !source_identity.is_null()
+                    && lane_reference["source_identity"] == *source_identity
+                    && source_identity["checkpoint_sha256"]
+                        == capture["source_identity"]["checkpoint_sha256"]
+                    && source_identity["export_manifest_sha256"]
+                        == capture["source_identity"]["export_manifest_sha256"]
+                    && source_identity["model_configuration"] == capture["model_configuration"],
+                "cost_reference",
+                "lane_model_source_namespace_differs",
+            )?;
+            if warm {
+                require(
+                    lane["final_receipt"] == capture["final_receipt"],
+                    "cost_reference",
+                    "warm_final_owner_differs",
+                )?;
+            } else {
+                let startup = &lane["startup_receipt"];
+                require(
+                    cost_receipt_matches(startup, 0, 0, false)
+                        && startup["private_warm_observation"]["accepted_seeds"].as_u64()
+                            == Some(0)
+                        && startup["startup_probe"]["completed_proposer_calls"].as_u64() == Some(1)
+                        && startup["startup_probe"]["completed_critic_calls"].as_u64() == Some(1)
+                        && startup["startup_probe"]["reset_completed"] == true
+                        && startup["startup_probe"]["runtime_mapping_confirmed"] == true
+                        && !startup["startup_probe"]["cuda_placement_witness"].is_null()
+                        && lane["work_completed_within_original_deadline"] == true
+                        && lane["cleanup_failure"].is_null(),
+                    "cost_reference",
+                    "fresh_startup_or_original_cleanup_incomplete",
+                )?;
+            }
+            let mut stable = None;
+            let mut ids: Vec<(Value, Value)> = Vec::with_capacity(COST_LANE_CALLS);
+            let mut checks = Vec::with_capacity(COST_LANE_CALLS);
+            for (index, (call, packet)) in calls.iter().zip(references).enumerate() {
+                let sample = &call["cost_sample"];
+                let before = &sample["receipt_before"];
+                let returned = &sample["receipt_returned"];
+                let after = &sample["receipt_after_close"];
+                require(
+                    sample["lane"]
+                        == if warm {
+                            "warm_same_accepted_seed"
+                        } else {
+                            "fresh_missing_seed"
+                        }
+                        && sample["phase"]
+                            == if index < COST_PREPARATION_CALLS {
+                                "preparation"
+                            } else {
+                                "measurement"
+                            }
+                        && sample["ordinal_in_phase"].as_u64()
+                            == Some(if index < COST_PREPARATION_CALLS {
+                                index + 1
+                            } else {
+                                index + 1 - COST_PREPARATION_CALLS
+                            } as u64)
+                        && sample["api_returned_ok"] == true
+                        && sample["close_unconsumed_returned_ok"] == true
+                        && cost_receipt_matches(before, base + index as u64, consumers, false)
+                        && cost_receipt_matches(
+                            returned,
+                            base + index as u64 + 1,
+                            consumers,
+                            false,
+                        )
+                        && cost_receipt_matches(after, base + index as u64 + 1, consumers, false)
+                        && ["process_epoch", "game_generation"].iter().all(|key| {
+                            before[key] == returned[key]
+                                && before[key] == after[key]
+                                && before[key] == lane["final_receipt"][key]
+                        })
+                        && before["game_generation"].as_u64().is_some()
+                        && before["game_generation"]
+                            == source["logical_context"]["game_generation"]
+                        && cost_known_unconsumed(before, after, call)
+                        && fixed_cost_packet(
+                            call,
+                            &source["input"],
+                            &source["logical_context"],
+                            &latent,
+                            source,
+                            warm,
+                            &mut stable,
+                        )
+                        && (!warm
+                            || after["private_warm_observation"]["accepted_seeds"]
+                                .as_u64()
+                                .is_some_and(|v| v > 0))
+                        && (warm
+                            || after["private_warm_observation"]["accepted_seeds"].as_u64()
+                                == Some(0)),
+                    "cost_reference",
+                    "sample_input_seed_completion_or_consumer_zero_differs",
+                )?;
+                require(
+                    !ids.iter().any(|(request, execution)| {
+                        request == &call["request_id"] || execution == &call["execution_id"]
+                    }) && ["request_id", "execution_id"].iter().all(|key| {
+                        call[key]["epoch"].as_u64().is_some()
+                            && call[key]["sequence"].as_u64().is_some()
+                    }),
+                    "cost_reference",
+                    "duplicate_or_unknown_lane_request_identity",
+                )?;
+                ids.push((call["request_id"].clone(), call["execution_id"].clone()));
+                require(
+                    [
+                        "request_id",
+                        "execution_id",
+                        "input_key_hex",
+                        "input_json_sha256_hex",
+                        "input_f32_bits",
+                        "invocation",
+                        "initial_latent_sha256_hex",
+                        "warm_start",
+                        "input_json_utf8",
+                        "initial_latent_bits",
+                        "logical_context",
+                        "seed_provenance",
+                    ]
+                    .iter()
+                    .all(|key| call[key] == packet[key])
+                        && packet["full_line"] == call["input"]["full_line"]
+                        && packet["captured_raw_output_bits"] == call["raw_output_bits"]
+                        && ["lane", "phase", "ordinal_in_phase"]
+                            .iter()
+                            .all(|key| sample[key] == packet["cost_sample"][key]),
+                    "cost_reference",
+                    "exact_lane_reference_packet_differs",
+                )?;
+                let input_text = call["input_json_utf8"]
+                    .as_str()
+                    .ok_or(fail("cost_reference", "input_bytes_missing"))?;
+                let input: PalsModelInput = serde_json::from_str(input_text)
+                    .map_err(|_| fail("cost_reference", "input_bytes_invalid"))?;
+                require(
+                    input == expected_input
+                        && input_f32_bits(&input) == call["input_f32_bits"]
+                        && hex(&Sha256::digest(input_text.as_bytes()))
+                            == call["input_json_sha256_hex"]
+                        && input
+                            .canonical_input_key(configuration)
+                            .ok()
+                            .map(|key| hex(&key))
+                            .as_deref()
+                            == call["input_key_hex"].as_str(),
+                    "cost_reference",
+                    "input_utf8_bits_or_key_differs",
+                )?;
+                let checkpoint: [u8; 32] = serde_json::from_value(
+                    source_identity["checkpoint_sha256"].clone(),
+                )
+                .map_err(|_| fail("cost_reference", "owner_checkpoint_namespace_missing"))?;
+                let manifest: [u8; 32] =
+                    serde_json::from_value(source_identity["export_manifest_sha256"].clone())
+                        .map_err(|_| fail("cost_reference", "owner_manifest_namespace_missing"))?;
+                require(
+                    checkpoint == input.model_epoch
+                        && hex(&manifest) == capture["export_manifest_sha256_hex"],
+                    "cost_reference",
+                    "lane_input_and_model_owner_namespace_differ",
+                )?;
+                if warm {
+                    let encoding: [u8; 32] =
+                        serde_json::from_value(source_identity["encoding_semantic_sha256"].clone())
+                            .map_err(|_| {
+                                fail("cost_reference", "owner_encoding_namespace_missing")
+                            })?;
+                    require(
+                        call["seed_provenance"]["role"] == call["input"]["role"]
+                            && call["seed_provenance"]["model_manifest_sha256_hex"]
+                                == capture["export_manifest_sha256_hex"]
+                            && call["seed_provenance"]["model_epoch_hex"]
+                                == hex(&input.model_epoch)
+                            && call["seed_provenance"]["encoding_semantic_sha256_hex"]
+                                == hex(&encoding)
+                            && call["seed_provenance"]["frozen_epoch"].as_u64().is_some()
+                            && call["seed_provenance"]["frozen_epoch"]
+                                == source_identity["frozen_epoch"],
+                        "cost_reference",
+                        "seed_role_model_owner_namespace_differs",
+                    )?;
+                }
+                let actual: PalsRawOutput = serde_json::from_value(call["raw_output"].clone())
+                    .map_err(|_| fail("cost_reference", "raw_output_invalid"))?;
+                let ort: PalsRawOutput =
+                    serde_json::from_value(packet["ort_raw_output"].clone())
+                        .map_err(|_| fail("cost_reference", "ort_output_invalid"))?;
+                let torch: PalsRawOutput =
+                    serde_json::from_value(packet["torch_raw_output"].clone())
+                        .map_err(|_| fail("cost_reference", "torch_output_invalid"))?;
+                require(
+                    cost_raw_bits(&actual) == call["raw_output_bits"]
+                        && call["final_latent_sha256_hex"]
+                            == bits_digest(
+                                &actual
+                                    .private_latent
+                                    .iter()
+                                    .map(|v| v.to_bits())
+                                    .collect::<Vec<_>>(),
+                            ),
+                    "cost_reference",
+                    "raw_output_full_bits_or_digest_differs",
+                )?;
+                let ort_error = compare_output(&actual, &ort)?;
+                let torch_error = compare_output(&actual, &torch)?;
+                compare_output(&ort, &torch)?;
+                let ort_decoded = compare_decoded(&actual, &ort, &input, configuration)?;
+                let torch_decoded = compare_decoded(&actual, &torch, &input, configuration)?;
+                compare_decoded(&ort, &torch, &input, configuration)?;
+                checks.push(json!({"request_id": call["request_id"], "execution_id": call["execution_id"],
+                    "cost_sample": packet["cost_sample"], "input_key_hex": call["input_key_hex"],
+                    "initial_latent_sha256_hex": call["initial_latent_sha256_hex"],
+                    "cuda_vs_cpu_ort_max_abs_error": ort_error, "cuda_vs_cpu_torch_max_abs_error": torch_error,
+                    "cuda_vs_cpu_ort_decoded": ort_decoded, "cuda_vs_cpu_torch_decoded": torch_decoded, "passed": true}));
+            }
+            require(
+                !warm || lane["stable_accepted_seed_provenance"] == json!(stable),
+                "cost_reference",
+                "stable_provenance_differs",
+            )?;
+            result[name] = json!({"checks": checks, "source_identity": source_identity, "logical_search_consumers_per_sample": 0});
+        }
+        Ok(result)
+    }
     fn reference(args: &Args) -> Result<Value, Failure> {
         let capture_bytes = pinned(
             &args.path("--capture-json")?,
@@ -3181,8 +3567,16 @@ mod check {
                 "cuda_vs_cpu_ort_max_abs_error": ort_error, "cuda_vs_cpu_torch_max_abs_error": torch_error,
                 "cuda_vs_cpu_ort_decoded": ort_decoded, "cuda_vs_cpu_torch_decoded": torch_decoded, "passed": true}));
         }
-        Ok(
-            json!({"schema": SCHEMA, "phase": "verify_reference", "passed": true,
+        let cost_checked = capture
+            .get("cost_same_seed_context")
+            .map(|_| cost_reference(&capture, &reference, &configuration))
+            .transpose()?;
+        require(
+            cost_checked.is_some() || reference.get("cost_same_seed_context").is_none(),
+            "cost_reference",
+            "unexpected_cost_reference_namespace",
+        )?;
+        let mut report = json!({"schema": SCHEMA, "phase": "verify_reference", "passed": true,
             "execution_checks_passed": true, "independent_same_seed_reference_passed": true,
             "capture_sha256_hex": args.value("--capture-sha256")?,
             "independent_reference_sha256_hex": args.value("--independent-reference-sha256")?,
@@ -3196,8 +3590,11 @@ mod check {
             "cuda_warm_owner_observation": capture["cuda_warm_owner_observation"],
             "cuda_warm_selected_limits": capture["cuda_warm_selected_limits"],
             "validator_v_execution": capture["validator_v_execution"],
-            "unknown_cancel_deadline_quarantine_evidence": capture["unknown_cancel_deadline_quarantine_evidence"]}),
-        )
+            "unknown_cancel_deadline_quarantine_evidence": capture["unknown_cancel_deadline_quarantine_evidence"]});
+        if let Some(cost) = cost_checked {
+            report["cost_same_seed_context"] = cost;
+        }
+        Ok(report)
     }
     fn publish(report: Value, output_path: Option<&Path>) -> ExitCode {
         let bytes = match serde_json::to_vec(&report) {
@@ -3271,6 +3668,7 @@ mod check {
             }
         }
         let output = args.output.clone();
+        let cost_selected = args.cost_same_seed_context;
         let worker_cancel = Arc::clone(&cancel);
         let worker_capture = Arc::clone(&capture);
         let (send, receive) = mpsc::sync_channel(1);
@@ -3316,11 +3714,27 @@ mod check {
                         report["physical_completion"] =
                             json!("unknown_to_supervisor;_native_owner_not_joined");
                         report["native_owner_released"] = json!(false);
+                        if cost_selected {
+                            report["cost_same_seed_context"] = json!({"opt_in": true,
+                                "execution_checks_passed": false, "benchmark_validation_complete": false,
+                                "physical_completion": "unknown", "unreturned_lane_trace": "pending_unavailable_to_supervisor",
+                                "same_seed_independent_reference_required": true, "comparison_status": "not_comparable",
+                                "warm_over_fresh_api_wall_ratio": null, "warm": null, "fresh": null});
+                        }
                         if let Ok(capture) = capture.try_lock() {
                             report["calls"] = json!(capture.wires());
                             report["actual_search_rechecks"] = json!(capture.rechecks);
                             report["scheduler_interrupted_stack_resume_after_gpu_repair"] =
                                 capture.cpu_resume_evidence();
+                            if cost_selected {
+                                report["cost_same_seed_context"]["warm"] =
+                                    json!(capture.cost_warm_lane);
+                                report["cost_same_seed_context"]["original_accepted_repair_source"] =
+                                    json!(capture.cost_fixed_repair.as_ref().map(|v| &v.source));
+                                report["cost_same_seed_context"]["original_accepted_full_6144_seed_bits"] = json!(
+                                    capture.cost_fixed_repair.as_ref().map(|v| &v.source_latent)
+                                );
+                            }
                         }
                         report
                     }
@@ -3335,6 +3749,26 @@ mod check {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn cost_reference_receipt_distinguishes_known_zero_from_missing_consumer_and_fence() {
+            let mut receipt = json!({"process_epoch": 1, "game_generation": 9,
+                "quarantined": false, "physical_runs_in_flight": 0,
+                "physically_completed_role_calls": 8, "completed_role_inputs": 8,
+                "delivered_role_inputs": 8, "search_consumed_role_inputs": 0});
+            assert!(cost_receipt_matches(&receipt, 8, 0, false));
+            assert!(!cost_receipt_matches(&receipt, 8, 0, true));
+            receipt["search_consumed_role_inputs"] = Value::Null;
+            assert!(!cost_receipt_matches(&receipt, 8, 0, false));
+            receipt["search_consumed_role_inputs"] = json!(0);
+            receipt["physical_shutdown_confirmed"] = json!(true);
+            receipt["native_buffers_released"] = json!(true);
+            receipt["backend_stats"] = json!({"role_nn_runs_attempted": 10,
+                "role_nn_runs_completed": 10, "role_nn_runs_failed_known": 0});
+            assert!(cost_receipt_matches(&receipt, 8, 0, true));
+            receipt["backend_stats"]["role_nn_runs_completed"] = Value::Null;
+            assert!(!cost_receipt_matches(&receipt, 8, 0, true));
+        }
         #[test]
         fn cost_opt_in_is_explicit_and_does_not_modify_ordinary_capture_event_bytes() {
             let mut enabled = false;

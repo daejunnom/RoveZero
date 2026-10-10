@@ -14,7 +14,7 @@ from rz_pals_model.cuda_warm_actual_reference import (
     ATOL, LATENT_ELEMENTS, MAX_CAPTURE_CALLS, CAPTURE_SCHEMA, REFERENCE_SCHEMA, DEFAULT_ROLE_FORWARDS,
     _bind_native_source_identity, _compare_raw, _external_path, _json_bytes, _reference_call, _write_reference,
     canonical_captured_input_key, latent_bytes, run_actual_reference_cli,
-    validate_actual_capture, validate_captured_input)
+    validate_actual_capture, validate_captured_input, _reference_streams)
 
 
 MANIFEST_SHA = "11" * 32
@@ -83,7 +83,168 @@ def _capture():
             "calls": [fresh_p, fresh_c, _call(3, warm=True, source=fresh_p)]}
 
 
+def _cost_capture():
+    capture = _capture()
+    source = capture["calls"][-1]
+    source.update(accepted_with_original_controls=True,
+                  logical_context={"purpose": "RepairPolicy", "game_generation": 9, "search_generation": 2,
+                                   "situation_revision": 5, "public_revision": 7, "prefix": []})
+    source_identity = {"checkpoint_sha256": [23] * 32, "export_manifest_sha256": list(bytes.fromhex(MANIFEST_SHA)),
+                       "encoding_semantic_sha256": [0x81] * 32, "adapter_source_sha256": [0x82] * 32,
+                       "model_configuration": capture["model_configuration"], "trained": False, "frozen_epoch": 5}
+    capture["source_identity"] = source_identity
+    source["seed_provenance"].update(encoding_semantic_sha256_hex="81" * 32, frozen_epoch=5)
+    seed = source["raw_output_bits"]["private_latent"]
+    def receipt(calls, consumers, warm, final=False):
+        value = {"process_epoch": 1, "game_generation": 9, "physical_runs_in_flight": 0, "quarantined": False,
+                 "physically_completed_role_calls": calls, "completed_role_inputs": calls,
+                 "delivered_role_inputs": calls, "search_consumed_role_inputs": consumers,
+                 "private_warm_observation": {"pending_acceptance": False, "pinned_entries": 0,
+                                              "active_lease": None, "accepted_seeds": 3 if warm else 0},
+                 "backend_stats": {"role_nn_runs_attempted": calls + 2, "role_nn_runs_completed": calls + 2,
+                                   "role_nn_runs_failed_known": 0}}
+        if final:
+            value.update(physical_shutdown_confirmed=True, native_buffers_released=True)
+        return value
+    cost = {"opt_in": True, "execution_checks_passed": True, "owners_run_sequentially_after_actual_worker_join": True,
+            "max_concurrent_physical_workers": 1, "selected_max_leases": 1, "selected_device_payload_bytes_max": 397312,
+            "preparation_calls_per_lane": 3, "measured_calls_per_lane": 5,
+            "extra_role_forward_reservation_including_fresh_startup": 18,
+            "original_accepted_repair_source": copy.deepcopy(source),
+            "original_accepted_full_6144_seed_bits": copy.deepcopy(seed),
+            "same_target_input_json_sha256_hex": source["input_json_sha256_hex"]}
+    for name, warm in (("warm", True), ("fresh", False)):
+        calls = []
+        base = len(capture["calls"]) if warm else 0
+        for index in range(8):
+            call = _call(index + 1, warm=warm, source=source if warm else None)
+            call.update(accepted=False, rejected="SearchFailedUnconsumed",
+                        logical_context=copy.deepcopy(source["logical_context"]))
+            if warm:
+                call["initial_latent_bits"] = copy.deepcopy(call["initial_latent_bits"])
+                call["seed_provenance"].update(source_lease_id=99, seed_sequence=7,
+                                               encoding_semantic_sha256_hex="81" * 32, frozen_epoch=5)
+            else:
+                call["initial_latent_bits"] = [0] * LATENT_ELEMENTS
+                call["initial_latent_sha256_hex"] = hashlib.sha256(latent_bytes(call["initial_latent_bits"])).hexdigest()
+            call["cost_sample"] = {"lane": "warm_same_accepted_seed" if warm else "fresh_missing_seed",
+                                   "phase": "preparation" if index < 3 else "measurement",
+                                   "ordinal_in_phase": index + 1 if index < 3 else index - 2,
+                                   "api_returned_ok": True, "close_unconsumed_returned_ok": True,
+                                   "receipt_before": receipt(base + index, base, warm),
+                                   "receipt_returned": receipt(base + index + 1, base, warm),
+                                   "receipt_after_close": receipt(base + index + 1, base, warm)}
+            call["cost_observation"] = {"actual_completed_nn_inputs_delta": None, "nn_input_measurement_complete": False}
+            call["cost_sample"]["public_cache_preparation_counters"] = None
+            calls.append(call)
+        lane = {"complete": True, "failure": None, "physical_owner_joined": True,
+                "preparation_calls_requested": 3, "measured_calls_requested": 5, "measured_calls_completed": 5,
+                "calls": calls, "stable_accepted_seed_provenance": copy.deepcopy(calls[0]["seed_provenance"]),
+                "final_receipt": receipt(base + 8, base, warm, True)}
+        if not warm:
+            lane.update(source_identity=copy.deepcopy(source_identity), work_completed_within_original_deadline=True,
+                        cleanup_failure=None, startup_receipt=receipt(0, 0, False))
+            lane["startup_receipt"]["startup_probe"] = {"completed_proposer_calls": 1, "completed_critic_calls": 1,
+                                                        "reset_completed": True, "runtime_mapping_confirmed": True,
+                                                        "cuda_placement_witness": {"fixture": "metadata_only"}}
+        cost[name] = lane
+    capture.update(cost_same_seed_context=cost, final_receipt=copy.deepcopy(cost["warm"]["final_receipt"]),
+                   actual_role_forwards_including_startup=13, actual_completed_role_forwards_including_startup=13)
+    return capture
+
+
 class CapturedReferenceAdmissionTests(unittest.TestCase):
+    def test_cost_keeps_original_and_two_owner_namespaces_without_id_rewrite(self):
+        capture = _cost_capture()
+        before = copy.deepcopy(capture)
+        validate_actual_capture(capture, MANIFEST_SHA)
+        self.assertEqual(capture, before)
+        streams = _reference_streams(capture)
+        self.assertEqual([(name, len(calls)) for name, calls in streams], [("original", 3), ("warm", 8), ("fresh", 8)])
+        self.assertEqual(streams[0][1][0]["request_id"], streams[1][1][0]["request_id"])
+        self.assertEqual(streams[1][1][0]["request_id"], streams[2][1][0]["request_id"])
+        self.assertEqual(streams[1][1][0]["initial_latent_bits"], capture["cost_same_seed_context"]["original_accepted_full_6144_seed_bits"])
+        self.assertEqual(streams[2][1][0]["initial_latent_bits"], [0] * LATENT_ELEMENTS)
+        self.assertIsNone(streams[1][1][0]["cost_observation"]["actual_completed_nn_inputs_delta"])
+        self.assertIsNone(streams[1][1][0]["cost_sample"]["public_cache_preparation_counters"])
+        self.assertEqual(_reference_streams(_capture())[0][0], "original")
+
+    def test_partial_unknown_consumed_or_changed_cost_samples_are_refused(self):
+        for label in ("missing_cost", "partial", "unknown", "consumed", "consumer_none", "unclosed", "seed_last",
+                      "source_removed", "context", "fresh_seed", "fresh_accepted", "mode", "output_bits", "provenance",
+                      "phase", "duplicate", "count", "extra_startup", "warm_count", "budget", "fence", "final_nn_none"):
+            capture = _cost_capture()
+            cost = capture["cost_same_seed_context"]
+            warm = cost["warm"]["calls"][0]
+            after = warm["cost_sample"]["receipt_after_close"]
+            if label == "missing_cost": capture["cost_same_seed_context"] = None
+            elif label == "partial": cost["fresh"]["complete"] = False
+            elif label == "unknown": warm["physical"]["completion_unknown"] = True
+            elif label == "consumed": after["search_consumed_role_inputs"] += 1
+            elif label == "consumer_none": after["search_consumed_role_inputs"] = None
+            elif label == "unclosed": warm["cost_sample"]["close_unconsumed_returned_ok"] = False
+            elif label == "seed_last": warm["initial_latent_bits"][6143] = 0
+            elif label == "source_removed": cost["original_accepted_repair_source"]["accepted"] = False
+            elif label == "context": warm["logical_context"]["public_revision"] += 1
+            elif label == "fresh_seed": cost["fresh"]["calls"][0]["initial_latent_bits"][0] = _bits(-0.0)
+            elif label == "fresh_accepted": cost["fresh"]["calls"][0]["accepted"] = True
+            elif label == "mode": warm["invocation"]["mode"] = "fresh"
+            elif label == "output_bits": warm["raw_output_bits"]["private_latent"][6143] = 0
+            elif label == "provenance": cost["warm"]["calls"][1]["seed_provenance"]["source_lease_id"] += 1
+            elif label == "phase": warm["cost_sample"]["phase"] = "measurement"
+            elif label == "duplicate": cost["warm"]["calls"][1]["request_id"] = warm["request_id"]
+            elif label == "count": cost["fresh"]["calls"].pop()
+            elif label == "extra_startup": cost["fresh"]["startup_receipt"]["startup_probe"]["completed_proposer_calls"] += 1
+            elif label == "warm_count": capture["actual_role_forwards_including_startup"] -= 8
+            elif label == "budget": capture["max_actual_role_forwards_including_startup"] = 128
+            elif label == "fence": cost["fresh"]["final_receipt"]["physical_shutdown_confirmed"] = False
+            else: cost["fresh"]["final_receipt"]["backend_stats"] = None
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                validate_actual_capture(capture, MANIFEST_SHA)
+
+    def test_cost_combined_forward_budget_accepts_64_and_refuses_65_before_replay(self):
+        for original_count in (44, 45):
+            capture = _cost_capture()
+            delta = original_count - len(capture["calls"])
+            capture["calls"][-1:-1] = [_call(sequence) for sequence in range(4, 4 + delta)]
+            warm = capture["cost_same_seed_context"]["warm"]
+            receipts = [warm["final_receipt"]]
+            receipts.extend(sample["cost_sample"][name] for sample in warm["calls"]
+                            for name in ("receipt_before", "receipt_returned", "receipt_after_close"))
+            for receipt in receipts:
+                for name in ("physically_completed_role_calls", "completed_role_inputs", "delivered_role_inputs", "search_consumed_role_inputs"):
+                    receipt[name] += delta
+                for name in ("role_nn_runs_attempted", "role_nn_runs_completed"):
+                    receipt["backend_stats"][name] += delta
+            capture["final_receipt"] = copy.deepcopy(warm["final_receipt"])
+            capture["actual_role_forwards_including_startup"] += delta
+            capture["actual_completed_role_forwards_including_startup"] += delta
+            with self.subTest(original_count=original_count):
+                if original_count == 44:
+                    validate_actual_capture(capture, MANIFEST_SHA)
+                    self.assertEqual(44 + 2 + 8 + 2 + 8, 64)
+                    self.assertEqual(capture["actual_role_forwards_including_startup"], 54)
+                    self.assertEqual(capture["cost_same_seed_context"]["fresh"]["final_receipt"]["backend_stats"]["role_nn_runs_completed"], 10)
+                else:
+                    with self.assertRaisesRegex(ValueError, "reserved forward budget"):
+                        validate_actual_capture(capture, MANIFEST_SHA)
+
+    def test_cost_binds_each_actual_owner_without_rewriting_request_ids(self):
+        capture = _cost_capture()
+        before = copy.deepcopy(capture)
+        config = ModelConfig.for_profile("full_line_interaction_v2")
+        manifest = {"checkpoint_sha256": "17" * 32}
+        self.assertIs(_bind_native_source_identity(capture, manifest, {"trained": False}, config), capture["source_identity"])
+        self.assertEqual(capture, before)
+        for lane, field in (("warm", "encoding"), ("fresh", "checkpoint")):
+            changed = copy.deepcopy(capture)
+            if field == "encoding":
+                changed["cost_same_seed_context"][lane]["calls"][0]["seed_provenance"]["encoding_semantic_sha256_hex"] = "aa" * 32
+            else:
+                changed["cost_same_seed_context"][lane]["source_identity"]["checkpoint_sha256"] = [24] * 32
+            with self.subTest(lane=lane), self.assertRaises(ValueError):
+                _bind_native_source_identity(changed, manifest, {"trained": False}, config)
+
     def test_full_seed_signed_zero_and_prior_same_role_are_preserved(self):
         capture = _capture()
         self.assertEqual(validate_actual_capture(capture, MANIFEST_SHA).profile, "full_line_interaction_v2")

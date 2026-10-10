@@ -32,6 +32,8 @@ MIN_ROLE_FORWARDS = 16
 MAX_ROLE_FORWARDS = 128
 DEFAULT_ROLE_FORWARDS = 64  # Scenario default; admission requires the actual explicit captured value.
 STARTUP_ROLE_FORWARDS = 2
+COST_LANE_CALLS = 8  # preparation 3, measurement 5; two sequential owners
+COST_EXTRA_ROLE_FORWARDS = 18  # Warm 8 + fresh-owner startup 2 + Fresh 8
 MAX_CAPTURE_CALLS = MAX_ROLE_FORWARDS - STARTUP_ROLE_FORWARDS
 LATENT_ELEMENTS = 16 * 384
 MAX_REFERENCE_SECONDS = 900
@@ -293,7 +295,8 @@ def validate_actual_capture(capture, export_manifest_sha256):
     role_budget = _uint(capture.get("max_actual_role_forwards_including_startup"))
     if not MIN_ROLE_FORWARDS <= role_budget <= MAX_ROLE_FORWARDS or len(calls) > role_budget - STARTUP_ROLE_FORWARDS:
         raise ValueError("capture exceeds its explicit registered role-forward budget")
-    actual_forwards = len(calls) + STARTUP_ROLE_FORWARDS
+    cost_calls = validate_cost_capture(capture, config, export_manifest_sha256) if "cost_same_seed_context" in capture else 0
+    actual_forwards = len(calls) + STARTUP_ROLE_FORWARDS + cost_calls
     if (_uint(capture.get("actual_role_forwards_including_startup")) != actual_forwards
             or _uint(capture.get("actual_completed_role_forwards_including_startup")) != actual_forwards
             or _uint(capture.get("actual_known_completed_startup_role_forwards")) != STARTUP_ROLE_FORWARDS
@@ -357,6 +360,179 @@ def validate_actual_capture(capture, export_manifest_sha256):
             raise ValueError("captured final full latent digest mismatch")
         prior_seeds.append((call["input"]["role"], key, final_bits))
     return config
+
+
+def _cost_receipt(receipt, role_calls, consumers, *, final=False):
+    if (type(receipt) is not dict or receipt.get("quarantined") is not False
+            or _uint(receipt.get("physical_runs_in_flight")) != 0):
+        raise ValueError("cost owner physical receipt is unknown or quarantined")
+    for name in ("physically_completed_role_calls", "completed_role_inputs", "delivered_role_inputs"):
+        if _uint(receipt.get(name)) != role_calls:
+            raise ValueError("cost owner physical/delivered accounting mismatch")
+    if _uint(receipt.get("search_consumed_role_inputs")) != consumers:
+        raise ValueError("cost logical consumer accounting mismatch")
+    _uint(receipt.get("process_epoch"))
+    _uint(receipt.get("game_generation"))
+    if final:
+        if receipt.get("physical_shutdown_confirmed") is not True or receipt.get("native_buffers_released") is not True:
+            raise ValueError("cost owner physical fence is incomplete")
+        stats = receipt.get("backend_stats")
+        if (type(stats) is not dict or _uint(stats.get("role_nn_runs_attempted")) != role_calls + STARTUP_ROLE_FORWARDS
+                or _uint(stats.get("role_nn_runs_completed")) != role_calls + STARTUP_ROLE_FORWARDS
+                or _uint(stats.get("role_nn_runs_failed_known")) != 0):
+            raise ValueError("cost owner final role NN accounting mismatch")
+
+
+def _cost_packet(call, source, config, export_manifest_sha256, warm):
+    if (type(call) is not dict or call.get("accepted") is not False
+            or call.get("rejected") != "SearchFailedUnconsumed" or call.get("delivered") is not True
+            or call.get("physical") != {"dispatched": True, "ready": True, "completion_unknown": False, "completed_ok": True}
+            or call.get("logical_context") != source.get("logical_context")
+            or call.get("input_json_utf8") != source.get("input_json_utf8")
+            or call.get("input_f32_bits") != source.get("input_f32_bits")):
+        raise ValueError("cost call is not same-context known physical unconsumed Repair")
+    _identity(call.get("request_id"))
+    _identity(call.get("execution_id"))
+    key = canonical_captured_input_key(call["input"], config)
+    encoded = call["input_json_utf8"].encode("utf-8")
+    if (not 0 < len(encoded) <= MAX_CAPTURE_INPUT_BYTES or _json_bytes(encoded) != call["input"]
+            or _sha(call["input_json_sha256_hex"]) != hashlib.sha256(encoded).hexdigest()
+            or _sha(call["input_key_hex"]) != key or key != source["input_key_hex"]):
+        raise ValueError("cost exact input bytes or canonical key differ")
+    _input_fp32_bits(call["input"], call["input_f32_bits"])
+    initial = call["initial_latent_bits"]
+    digest = hashlib.sha256(latent_bytes(initial)).hexdigest()
+    if _sha(call["initial_latent_sha256_hex"]) != digest or call.get("warm_start") is not warm:
+        raise ValueError("cost full seed bits or mode differ")
+    invocation = call["invocation"]
+    _fields(invocation, ("mode", "input_key_hex", "invocation_key_hex"), ("seed_seal_hex",))
+    if invocation["input_key_hex"] != key or invocation["mode"] != ("approx_cuda_warm_v2" if warm else "fresh"):
+        raise ValueError("cost invocation mode or input differs")
+    _sha(invocation["invocation_key_hex"])
+    if warm:
+        seed = call.get("seed_provenance")
+        if (type(seed) is not dict or initial != source["raw_output_bits"]["private_latent"]
+                or seed.get("seal_hex") != _sha(invocation.get("seed_seal_hex"))
+                or seed.get("source_input_hex") != source["input_key_hex"]
+                or seed.get("latent_bits_digest_hex") != digest or seed.get("role") != call["input"]["role"]
+                or seed.get("model_manifest_sha256_hex") != export_manifest_sha256
+                or seed.get("model_epoch_hex") != _digest_bytes(call["input"]["model_epoch"]).hex()
+                or _uint(seed.get("source_lease_id")) == 0 or _uint(seed.get("seed_sequence")) == 0):
+            raise ValueError("cost Warm sample does not bind original accepted full seed")
+    elif (any(_uint(bit, 32) != 0 for bit in initial) or call.get("seed_provenance") is not None
+          or "seed_seal_hex" in invocation or invocation["invocation_key_hex"] != key):
+        raise ValueError("cost missing-seed Fresh packet differs")
+    _validate_raw_output(call["raw_output"], call["input"], call["raw_output_bits"])
+    if _sha(call["final_latent_sha256_hex"]) != hashlib.sha256(latent_bytes(call["raw_output_bits"]["private_latent"])).hexdigest():
+        raise ValueError("cost final latent bits digest differs")
+
+
+def validate_cost_capture(capture, config, export_manifest_sha256):
+    """Cost-only admission; IDs remain in original/Warm/Fresh namespaces."""
+    cost = capture.get("cost_same_seed_context")
+    if (type(cost) is not dict or cost.get("opt_in") is not True or cost.get("execution_checks_passed") is not True
+            or cost.get("owners_run_sequentially_after_actual_worker_join") is not True
+            or _uint(cost.get("max_concurrent_physical_workers")) != 1 or _uint(cost.get("selected_max_leases")) != 1
+            or _uint(cost.get("selected_device_payload_bytes_max")) != 397312
+            or _uint(cost.get("preparation_calls_per_lane")) != 3 or _uint(cost.get("measured_calls_per_lane")) != 5
+            or _uint(cost.get("extra_role_forward_reservation_including_fresh_startup")) != COST_EXTRA_ROLE_FORWARDS
+            or config.profile != "full_line_interaction_v2"
+            or _uint(capture.get("max_actual_role_forwards_including_startup")) != DEFAULT_ROLE_FORWARDS):
+        raise ValueError("cost capture is partial, unknown or outside registered bounds")
+    source = cost.get("original_accepted_repair_source")
+    if (type(source) is not dict or source not in capture["calls"] or source.get("accepted") is not True
+            or source.get("accepted_with_original_controls") is not True
+            or type(source.get("logical_context")) is not dict or source["logical_context"].get("purpose") != "RepairPolicy"
+            or cost.get("original_accepted_full_6144_seed_bits") != source["raw_output_bits"]["private_latent"]
+            or cost.get("same_target_input_json_sha256_hex") != source["input_json_sha256_hex"]):
+        raise ValueError("cost original accepted Repair source/full seed is missing")
+    latent_bytes(cost["original_accepted_full_6144_seed_bits"])
+    original_calls = len(capture["calls"])
+    if original_calls + STARTUP_ROLE_FORWARDS > DEFAULT_ROLE_FORWARDS - COST_EXTRA_ROLE_FORWARDS:
+        raise ValueError("cost original integration exceeds its reserved forward budget")
+    for name, warm in (("warm", True), ("fresh", False)):
+        lane = cost.get(name)
+        if (type(lane) is not dict or lane.get("complete") is not True or lane.get("failure") is not None
+                or lane.get("physical_owner_joined") is not True or _uint(lane.get("preparation_calls_requested")) != 3
+                or _uint(lane.get("measured_calls_requested")) != 5 or _uint(lane.get("measured_calls_completed")) != 5):
+            raise ValueError("cost lane is partial or physical owner join is unknown")
+        calls = _array(lane.get("calls"), COST_LANE_CALLS, COST_LANE_CALLS)
+        requests, executions = set(), set()  # no global ID rewriting/dedup across independent owners
+        stable = None
+        for index, call in enumerate(calls):
+            _cost_packet(call, source, config, export_manifest_sha256, warm)
+            request, execution = _identity(call["request_id"]), _identity(call["execution_id"])
+            if request in requests or execution in executions:
+                raise ValueError("duplicate cost request/execution within one owner lane")
+            requests.add(request)
+            executions.add(execution)
+            sample = call.get("cost_sample")
+            if (type(sample) is not dict or sample.get("lane") != ("warm_same_accepted_seed" if warm else "fresh_missing_seed")
+                    or sample.get("phase") != ("preparation" if index < 3 else "measurement")
+                    or _uint(sample.get("ordinal_in_phase")) != (index + 1 if index < 3 else index - 2)
+                    or sample.get("api_returned_ok") is not True or sample.get("close_unconsumed_returned_ok") is not True):
+                raise ValueError("cost 3+5 phase or API closure is incomplete")
+            before, returned, after = (sample.get(key) for key in ("receipt_before", "receipt_returned", "receipt_after_close"))
+            if any(type(value) is not dict for value in (before, returned, after)):
+                raise ValueError("cost per-call receipt is missing")
+            base_calls, consumers = (original_calls, original_calls) if warm else (0, 0)
+            _cost_receipt(before, base_calls + index, consumers)
+            _cost_receipt(returned, base_calls + index + 1, consumers)
+            _cost_receipt(after, base_calls + index + 1, consumers)
+            for key in ("process_epoch", "game_generation"):
+                if _uint(before.get(key)) != _uint(returned.get(key)) or before[key] != _uint(after.get(key)):
+                    raise ValueError("cost lane owner namespace changed")
+                if before[key] != _uint(lane["final_receipt"].get(key)):
+                    raise ValueError("cost sample does not bind its final owner namespace")
+            if before["game_generation"] != _uint(source["logical_context"].get("game_generation")):
+                raise ValueError("cost sample game generation differs from its checked Repair context")
+            for key in ("physically_completed_role_calls", "completed_role_inputs", "delivered_role_inputs"):
+                if _uint(after.get(key)) - _uint(before.get(key)) != 1 or after[key] != _uint(returned.get(key)):
+                    raise ValueError("cost physical completion/delivery delta is unknown")
+            if (_uint(after.get("search_consumed_role_inputs")) != _uint(before.get("search_consumed_role_inputs"))
+                    or after["search_consumed_role_inputs"] != _uint(returned.get("search_consumed_role_inputs"))):
+                raise ValueError("cost output was logically consumed")
+            for receipt in (returned, after):
+                if receipt.get("quarantined") is not False or _uint(receipt.get("physical_runs_in_flight")) != 0:
+                    raise ValueError("cost completion is unknown or quarantined")
+            bank, old_bank = after.get("private_warm_observation"), before.get("private_warm_observation")
+            if (type(bank) is not dict or type(old_bank) is not dict or bank.get("pending_acceptance") is not False
+                    or _uint(bank.get("pinned_entries")) != 0 or bank.get("active_lease") is not None
+                    or _uint(bank.get("accepted_seeds")) != _uint(old_bank.get("accepted_seeds"))
+                    or warm and bank["accepted_seeds"] == 0
+                    or not warm and bank["accepted_seeds"] != 0):
+                raise ValueError("cost sample changed the accepted seed bank")
+            if warm:
+                if stable is not None and stable != call["seed_provenance"]:
+                    raise ValueError("cost sample changed full seed provenance")
+                stable = call["seed_provenance"]
+        if warm and lane.get("stable_accepted_seed_provenance") != stable:
+            raise ValueError("cost stable seed provenance receipt differs")
+        final = lane.get("final_receipt")
+        _cost_receipt(final, original_calls + COST_LANE_CALLS if warm else COST_LANE_CALLS,
+                      original_calls if warm else 0, final=True)
+        if warm and final != capture.get("final_receipt"):
+            raise ValueError("cost Warm final receipt is not the original owner receipt")
+        if not warm:
+            startup = lane.get("startup_receipt")
+            _cost_receipt(startup, 0, 0)
+            probe = startup.get("startup_probe")
+            if (type(probe) is not dict or probe.get("completed_proposer_calls") != 1
+                    or probe.get("completed_critic_calls") != 1 or probe.get("reset_completed") is not True
+                    or probe.get("runtime_mapping_confirmed") is not True or probe.get("cuda_placement_witness") is None
+                    or lane.get("work_completed_within_original_deadline") is not True or lane.get("cleanup_failure") is not None):
+                raise ValueError("cost Fresh startup or original deadline cleanup is incomplete")
+            startup_bank = startup.get("private_warm_observation")
+            if type(startup_bank) is not dict or _uint(startup_bank.get("accepted_seeds")) != 0:
+                raise ValueError("cost Fresh startup already carries an accepted seed")
+    return COST_LANE_CALLS
+
+
+def _reference_streams(capture):
+    streams = [("original", capture["calls"])]
+    if "cost_same_seed_context" in capture:
+        streams.extend((name, capture["cost_same_seed_context"][name]["calls"]) for name in ("warm", "fresh"))
+    return streams
 
 
 def _json_bytes(contents):
@@ -550,6 +726,14 @@ def _bind_native_source_identity(capture, manifest, metadata, config):
             provenance = call["seed_provenance"]
             if provenance.get("encoding_semantic_sha256_hex") != encoding or _uint(provenance["frozen_epoch"]) != frozen_epoch:
                 raise ValueError("Warm seed provenance differs from the captured loaded owner namespace")
+    if "cost_same_seed_context" in capture:
+        cost = capture["cost_same_seed_context"]
+        # Use each actual owner's capability namespace; preserve all original IDs.
+        _bind_native_source_identity({"source_identity": source, "calls": cost["warm"]["calls"],
+                                      "export_manifest_sha256_hex": capture["export_manifest_sha256_hex"]}, manifest, metadata, config)
+        _bind_native_source_identity({"source_identity": cost["fresh"].get("source_identity"),
+                                      "calls": cost["fresh"]["calls"],
+                                      "export_manifest_sha256_hex": capture["export_manifest_sha256_hex"]}, manifest, metadata, config)
     return source
 
 
@@ -567,9 +751,13 @@ def _write_reference(path, report):
         os.fsync(stream.fileno())
     os.link(temporary, path)
     temporary.unlink()
-    return {"schema": REFERENCE_SCHEMA, "reference_passed": True, "calls": len(report["calls"]),
-            "output_json": str(path), "reference_sha256_hex": hashlib.sha256(contents).hexdigest(),
-            "reference_bytes": len(contents), "optimizer_steps": 0, "gpu_execution": "not_run_by_reference"}
+    summary = {"schema": REFERENCE_SCHEMA, "reference_passed": True, "calls": len(report["calls"]),
+               "output_json": str(path), "reference_sha256_hex": hashlib.sha256(contents).hexdigest(),
+               "reference_bytes": len(contents), "optimizer_steps": 0, "gpu_execution": "not_run_by_reference"}
+    if "cost_same_seed_context" in report:
+        summary["cost_same_seed_reference_passed"] = report["cost_same_seed_context"]["independent_same_seed_reference_passed"]
+        summary["cost_reference_calls"] = {name: len(report["cost_same_seed_context"][name]["calls"]) for name in ("warm", "fresh")}
+    return summary
 
 
 def numeric_check_cuda_warm_actual_reference(checkpoint, export_manifest, export_manifest_sha256,
@@ -625,6 +813,7 @@ def numeric_check_cuda_warm_actual_reference(checkpoint, export_manifest, export
     original_threads, original_dtype = torch.get_num_threads(), torch.get_default_dtype()
     original_tf32 = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
     reports = []
+    cost_reports = {"warm": [], "fresh": []}
     try:
         torch.set_num_threads(2)
         torch.set_default_dtype(torch.float32)
@@ -646,7 +835,7 @@ def numeric_check_cuda_warm_actual_reference(checkpoint, export_manifest, export
         private = _cpu_session(graph_sources[domain["private_role"]])
         deadline()
         with torch.no_grad(), torch.device("cpu"):
-            for call in capture["calls"]:
+            for namespace, call in ((name, call) for name, calls in _reference_streams(capture) for call in calls):
                 deadline()
                 value = call["input"]
                 data, arrays = _tensor_input(value, config)
@@ -666,7 +855,16 @@ def numeric_check_cuda_warm_actual_reference(checkpoint, export_manifest, export
                         np.testing.assert_allclose(actual, expected, atol=ATOL, rtol=RTOL)
                 raw_ort = _raw_output(private.run(None, _feed(data, memory_ort, seed, value["role"], call["warm_start"], config)), value)
                 deadline()
-                reports.append(_reference_call(call, raw_ort, raw_torch))
+                packet = _reference_call(call, raw_ort, raw_torch)
+                if namespace == "original":
+                    reports.append(packet)
+                else:
+                    # Copy the actual packet; reference evaluation never accepts
+                    # the provisional output or changes its seed/provenance.
+                    packet.update({name: call[name] for name in ("input_json_utf8", "initial_latent_bits", "logical_context", "seed_provenance")})
+                    packet["captured_raw_output_bits"] = call["raw_output_bits"]
+                    packet["cost_sample"] = {name: call["cost_sample"][name] for name in ("lane", "phase", "ordinal_in_phase")}
+                    cost_reports[namespace].append(packet)
         del model, public, private
     finally:
         torch.set_num_threads(original_threads)
@@ -701,6 +899,24 @@ def numeric_check_cuda_warm_actual_reference(checkpoint, export_manifest, export
               "limits": {"capture_bytes": MAX_CAPTURE_BYTES, "report_bytes": MAX_REFERENCE_BYTES,
                          "calls": capture["max_actual_role_forwards_including_startup"] - STARTUP_ROLE_FORWARDS,
                          "registered_maximum_calls": MAX_CAPTURE_CALLS, "combined_graph_bytes": MAX_WARM_GRAPH_BYTES}}
+    if "cost_same_seed_context" in capture:
+        cost = capture["cost_same_seed_context"]
+        report["cost_same_seed_context"] = {
+            "opt_in": True, "independent_same_seed_reference_passed": True,
+            "original_accepted_repair_source": cost["original_accepted_repair_source"],
+            "original_accepted_full_6144_seed_bits": cost["original_accepted_full_6144_seed_bits"],
+            "same_target_input_json_sha256_hex": cost["same_target_input_json_sha256_hex"],
+            "warm": {"calls": cost_reports["warm"], "source_identity": source},
+            "fresh": {"calls": cost_reports["fresh"], "source_identity": cost["fresh"]["source_identity"]},
+            "preparation_calls_per_lane": 3, "measured_calls_per_lane": 5,
+            "extra_role_forward_reservation_including_fresh_startup": COST_EXTRA_ROLE_FORWARDS,
+            "comparison_status": "not_comparable", "warm_over_fresh_api_wall_ratio": None,
+            "physical_nn_graph_inputs_per_sample": None, "public_cache_counts_per_sample": None,
+            "logical_search_consumers_per_sample": 0,
+            "reference_forward_counts": {name: 2 * COST_LANE_CALLS for name in ("torch_public", "torch_private", "ort_public", "ort_private")},
+            "scope": "same_actual_cost_sample_input_full_seed_mode_raw_and_policy_wdl;not_a_cost_speed_or_cache_claim"}
+        # Original counts stay original; the added replay is reported separately.
+        report["total_reference_forward_counts"] = {name: count + 2 * COST_LANE_CALLS for name, count in report["forward_counts"].items()}
     return _write_reference(output_json, report)
 
 
