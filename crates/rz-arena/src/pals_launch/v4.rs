@@ -10,6 +10,8 @@ use rz_experiments::*;
 
 mod followup;
 pub use followup::*;
+#[cfg(any(feature = "pals-collection-onnx", feature = "native-cuda"))]
+mod lifecycle;
 
 pub const PALS_ARENA_V4_DOMAIN: &str = "rz-pals-arena-launch-v4/1";
 pub const PALS_NATIVE_STARTUP_V4_DOMAIN: &str = "rz-pals-native-startup-v4/1";
@@ -58,7 +60,7 @@ pub struct LockedPalsArenaLaunchV4 {
     opening: OpeningSpec,
     endpoint_views: [ExternalUciEndpointV2; 2],
     #[cfg(target_os = "linux")]
-    archive_roots: std::sync::Arc<std::sync::Mutex<BTreeMap<usize,followup::ArchiveRootPins>>>,
+    archive_roots: std::sync::Arc<std::sync::Mutex<BTreeMap<usize, followup::ArchiveRootPins>>>,
 }
 fn requested_options(engine: &PalsEngineV4) -> &BTreeMap<String, String> {
     match engine {
@@ -76,7 +78,10 @@ fn config(e: &PalsEndpointV4) -> PalsModelConfig {
     };
     PalsModelConfig::for_profile(profile)
 }
-fn policy_arguments(e: &PalsEndpointV4, binding: Option<&PalsEndpointExecutionBindingV4>) -> Result<Vec<String>, ArenaError> {
+fn policy_arguments(
+    e: &PalsEndpointV4,
+    binding: Option<&PalsEndpointExecutionBindingV4>,
+) -> Result<Vec<String>, ArenaError> {
     if let PalsIterativeRepairPolicyV4::Bounded(l) = &e.policies.iterative_repair {
         require(
             l.max_repairs_per_first_move == 3 && l.max_pending_questions == 64,
@@ -99,7 +104,10 @@ fn policy_arguments(e: &PalsEndpointV4, binding: Option<&PalsEndpointExecutionBi
                 PalsResolverPolicyV4::ModelWdl => "model-wdl-restricted",
             }
         ),
-        format!("--pals-cuda-private-warm={}", matches!(e.policies.cuda_warm, PalsCudaWarmPolicyV4::ApproxWarm(_))),
+        format!(
+            "--pals-cuda-private-warm={}",
+            matches!(e.policies.cuda_warm, PalsCudaWarmPolicyV4::ApproxWarm(_))
+        ),
     ];
     if e.base.cpu_r.is_own() {
         args.push(format!(
@@ -120,11 +128,20 @@ fn policy_arguments(e: &PalsEndpointV4, binding: Option<&PalsEndpointExecutionBi
         }
         _ => return Err(invalid("iterative repair requires frozen WDL recheck")),
     }
-    args.extend(followup::selected_policy_arguments(e,binding)?);
+    args.extend(followup::selected_policy_arguments(e, binding)?);
     Ok(args)
 }
 
 impl PalsArenaValidationContext for LockedPalsArenaLaunchV4 {
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "pals-collection-onnx", feature = "native-cuda")
+    ))]
+    fn archive_runtime_root_selected(&self, role: NativeEngineRole) -> bool {
+        self.input
+            .execution_binding(role_index(role))
+            .is_some_and(|b| b.cold_archive.is_some())
+    }
     #[cfg(target_os = "linux")]
     fn verify_semantic(&self) -> Result<(), ArenaError> {
         self.input.semantic_lock.verify().map_err(ArenaError::from)
@@ -159,17 +176,31 @@ impl PalsArenaValidationContext for LockedPalsArenaLaunchV4 {
     fn native_wire_version(&self) -> u32 {
         4
     }
-    fn native_receipt_byte_cap(&self,role:NativeEngineRole)->usize {
-        if self.input.execution_binding(role_index(role)).is_some(){256*1024}else{128*1024}
+    fn native_receipt_byte_cap(&self, role: NativeEngineRole) -> usize {
+        if self.input.execution_binding(role_index(role)).is_some() {
+            256 * 1024
+        } else {
+            128 * 1024
+        }
     }
-    fn device_public_memory_selected(&self,role:NativeEngineRole)->bool {
-        self.input.execution_binding(role_index(role)).and_then(|b|b.cuda_warm.as_ref()).is_some()
+    fn device_public_memory_selected(&self, role: NativeEngineRole) -> bool {
+        self.input
+            .execution_binding(role_index(role))
+            .and_then(|b| b.cuda_warm.as_ref())
+            .is_some()
     }
-    fn shared_role_layout(&self,role:NativeEngineRole)->&str {
-        self.input.execution_binding(role_index(role)).and_then(|b|b.cuda_warm.as_ref()).map_or("shared_pc_if",|w|w.layout.as_str())
+    fn shared_role_layout(&self, role: NativeEngineRole) -> &str {
+        self.input
+            .execution_binding(role_index(role))
+            .and_then(|b| b.cuda_warm.as_ref())
+            .map_or("shared_pc_if", |w| w.layout.as_str())
     }
-    fn validate_selected_private_execution(&self,role:NativeEngineRole,record:&serde_json::Value)->Result<(),ArenaError> {
-        followup::validate_selected_private_execution(self,role,record)
+    fn validate_selected_private_execution(
+        &self,
+        role: NativeEngineRole,
+        record: &serde_json::Value,
+    ) -> Result<(), ArenaError> {
+        followup::validate_selected_private_execution(self, role, record)
     }
     fn native_wire_domains(&self) -> (&'static str, &'static str) {
         (
@@ -204,7 +235,8 @@ impl PalsArenaValidationContext for LockedPalsArenaLaunchV4 {
             &startup["search_work"],
             &termination["search_work"],
         )?;
-        validate_followup_marker_pair(self, role, startup, termination).map(|_| ())
+        validate_followup_marker_pair(self, role, startup, termination)?;
+        followup::validate_lifecycle_pair(self, role, startup, termination).map(|_| ())
     }
 }
 
@@ -508,7 +540,7 @@ impl PalsArenaLaunchV4 {
         for i in 0..2 {
             self.endpoint(i)?;
             if let PalsEngineV4::Pals(e) = &m.engines[i] {
-                policy_arguments(e,self.execution_binding(i))?;
+                policy_arguments(e, self.execution_binding(i))?;
                 require(
                     e.model_v2.arena_candidate(),
                     "diagnostic checkpoint/export cannot enter arena",
@@ -925,7 +957,10 @@ impl PalsArenaLaunchV4 {
                             "--pals-cuda-session-arena-bytes={}",
                             cuda.session_arena_bytes
                         ),
-                        format!("--pals-device-public-memory={}", matches!(e.policies.cuda_warm, PalsCudaWarmPolicyV4::ApproxWarm(_))),
+                        format!(
+                            "--pals-device-public-memory={}",
+                            matches!(e.policies.cuda_warm, PalsCudaWarmPolicyV4::ApproxWarm(_))
+                        ),
                     ]);
                     if let Some(control) = &cuda.cuda_control {
                         control.inventory.validate()?;
@@ -1101,7 +1136,7 @@ impl PalsArenaLaunchV4 {
             _ => return Err(invalid("semantic endpoint and executable recipe differ")),
         };
         if let PalsEngineV4::Pals(e) = &m.engines[i] {
-            arguments.extend(policy_arguments(e,self.execution_binding(i))?);
+            arguments.extend(policy_arguments(e, self.execution_binding(i))?);
         } else if matches!(self.endpoints[i], PalsEndpointLaunchV3::OwnCpu { .. }) {
             arguments.push("--pals-arena-wire=v4".into());
         }
@@ -1253,10 +1288,15 @@ impl LockedPalsArenaLaunchV4 {
             _ => return Err(invalid("no native checkpoint identity")),
         };
         let shared = n.graphs.iter().any(|g| g.role == "shared_pc");
-        let warm = self.input.execution_binding(role_index(role)).and_then(|b|b.cuda_warm.as_ref());
+        let warm = self
+            .input
+            .execution_binding(role_index(role))
+            .and_then(|b| b.cuda_warm.as_ref());
         let layout_valid = if let Some(warm) = warm {
-            shared && value["schema"] == warm.export_schema
-                && value["layout"] == warm.layout && value["layout_revision"] == warm.layout_revision
+            shared
+                && value["schema"] == warm.export_schema
+                && value["layout"] == warm.layout
+                && value["layout_revision"] == warm.layout_revision
                 && value["query_semantics"] == warm.query_semantics
                 && value["execution_domain"] == warm.execution_domain
                 && value["model_semantics"] == v4.model_v2.model_semantics
@@ -1536,7 +1576,7 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV4 {
         if let Some(profile) = self.cuda_profile_argument(role, runtime_root)? {
             arguments.push(profile);
         }
-        arguments.extend(self.archive_runtime_arguments(role,runtime_root)?);
+        arguments.extend(self.archive_runtime_arguments(role, runtime_root)?);
         Ok(arguments)
     }
     fn uses_separate_preflight_runtime_root(
@@ -1974,6 +2014,8 @@ pub struct PalsProcessWorkAuditV4 {
     #[serde(flatten)]
     pub base: PalsProcessWorkAuditV3,
     pub marker: Option<PalsActualFollowupMarkerV4>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub followup_lifecycle: Option<serde_json::Value>,
 }
 impl std::ops::Deref for PalsProcessWorkAuditV4 {
     type Target = PalsProcessWorkAuditV3;
@@ -1991,7 +2033,7 @@ fn collect_process_work(
 }
 
 #[cfg(target_os = "linux")]
-fn observed_output_bytes(
+fn metadata_output_bytes(
     output: &PalsObservedPairOutputV4,
     work: &[PalsProcessWorkAuditV4],
 ) -> Result<u64, ArenaError> {
@@ -2069,6 +2111,70 @@ fn observed_output_bytes(
         .ok_or_else(|| invalid("V4 output byte observation overflow"))
 }
 #[cfg(target_os = "linux")]
+fn observed_output_bytes(
+    output: &PalsObservedPairOutputV4,
+    work: &[PalsProcessWorkAuditV4],
+) -> Result<Option<u64>, ArenaError> {
+    #[cfg(any(feature = "pals-collection-onnx", feature = "native-cuda"))]
+    let mut total = metadata_output_bytes(output, work)?;
+    #[cfg(not(any(feature = "pals-collection-onnx", feature = "native-cuda")))]
+    let total = metadata_output_bytes(output, work)?;
+    let lock = output.native.launch_owner().spec();
+    #[cfg(any(feature = "pals-collection-onnx", feature = "native-cuda"))]
+    {
+        let mut sessions = BTreeSet::new();
+        for session in work {
+            let index = lock
+                .endpoint_views
+                .iter()
+                .position(|e| e.id == session.endpoint_id)
+                .ok_or_else(|| invalid("archive output belongs to unknown endpoint"))?;
+            require(
+                sessions.insert((index, session.process_id)),
+                "archive output process counted twice",
+            )?;
+            let role = if index == 0 {
+                NativeEngineRole::Baseline
+            } else {
+                NativeEngineRole::Candidate
+            };
+            let Some(extent) =
+                lifecycle::archive_output_extent(lock, role, session.followup_lifecycle.as_ref())?
+            else {
+                return Ok(None);
+            };
+            total = total
+                .checked_add(extent)
+                .ok_or_else(|| invalid("archive write output overflow"))?;
+        }
+        for index in 0..2 {
+            if lock
+                .input
+                .execution_binding(index)
+                .is_some_and(|b| b.cold_archive.is_some())
+                && sessions.iter().filter(|(i, _)| *i == index).count() != 2
+            {
+                return Ok(None);
+            }
+        }
+    }
+    #[cfg(not(any(feature = "pals-collection-onnx", feature = "native-cuda")))]
+    {
+        let _ = lock;
+        require(
+            output
+                .native
+                .launch_owner()
+                .spec()
+                .input
+                .followup_execution
+                .is_none(),
+            "actual archive output requires the selected Native producer",
+        )?;
+    }
+    Ok(Some(total))
+}
+#[cfg(target_os = "linux")]
 fn observed<T>(value: T, method: &str) -> PalsObservedV3<T> {
     PalsObservedV3::Observed {
         value,
@@ -2084,11 +2190,23 @@ fn endpoint_admitted(e: &PalsEndpointReceiptV4) -> bool {
         && matches!(e.process_cleanup,PalsObservedV3::Observed{..})
         // Enabled lanes require their separately captured lifecycle/trace.
         && match &e.checks.policies {
-            PalsObservedV3::Observed{value,..}=>
+            PalsObservedV3::Observed{value,..}=> {
+                let p=&value.policies;
+                let selected=p.recheck!=PalsRecheckPolicyV4::Disabled
+                    || !matches!(p.cold_archive,PalsColdArchivePolicyV4::Disabled)
+                    || !matches!(p.paused_stack,PalsPausedStackPolicyV4::Disabled)
+                    || !matches!(p.cuda_warm,PalsCudaWarmPolicyV4::Disabled);
+                (!selected || e.followup_lifecycle.as_ref().is_some_and(|scope|
+                    scope.process_epoch.is_some() && scope.capture_complete && scope.owner_shutdown_complete
+                    && scope.capture_failure.is_none() && scope.partial_facts.is_none()))
+                &&
                 (matches!(value.policies.cold_archive,PalsColdArchivePolicyV4::Disabled)||matches!(e.archive,PalsObservedV3::Observed{..}))
                 && (matches!(value.policies.paused_stack,PalsPausedStackPolicyV4::Disabled)||matches!(e.paused_stack,PalsObservedV3::Observed{..}))
                 && (matches!(value.policies.cuda_warm,PalsCudaWarmPolicyV4::Disabled)||matches!(e.cuda_warm,PalsObservedV3::Observed{..}))
-                && (matches!(value.policies.recheck,PalsRecheckPolicyV4::Disabled)||matches!(e.repair_trace_total,PalsObservedV3::Observed{value,..} if value==e.repair_traces.len() as u64)),
+                && (matches!(value.policies.recheck,PalsRecheckPolicyV4::Disabled)||matches!(e.repair_trace_total,PalsObservedV3::Observed{value,..} if value==e.repair_traces.len() as u64))
+                && (matches!(p.iterative_repair,PalsIterativeRepairPolicyV4::Disabled)
+                    || matches!(e.repair_admissions_peak,Some(PalsObservedV3::Observed{..})))
+            },
             PalsObservedV3::Unknown=>true,
         }
 }
@@ -2256,6 +2374,10 @@ fn endpoint_v4_receipt(
         },
         "supervisor-owned process-group Gone/reaped normal exit with joined stdout/stderr reader completion; each game PID separately checked against exact renderer/exits and native shutdown; interval scoped to whole pair owner",
     );
+    #[cfg(any(feature = "pals-collection-onnx", feature = "native-cuda"))]
+    if let Some(work) = work {
+        lifecycle::project(lock, role, work, native, &mut out)?;
+    }
     Ok(out)
 }
 pub fn run_pals_pair_observed_v4(
@@ -2415,7 +2537,13 @@ fn collect_process_work_with_audits(
         if name == "runtime-cache" && native {
             continue;
         }
-        if name == "cold-archive-managed" && lock.input.execution_binding(role_index(role)).and_then(|b|b.cold_archive.as_ref()).is_some() {
+        if name == "cold-archive-managed"
+            && lock
+                .input
+                .execution_binding(role_index(role))
+                .and_then(|b| b.cold_archive.as_ref())
+                .is_some()
+        {
             continue;
         }
         require(
@@ -2793,6 +2921,7 @@ fn validate_work_records(
     let (s, t) = (json(startup)?, json(termination)?);
     lock.validate_wire_pair(role, &s, &t)?;
     let marker = validate_followup_marker_pair(lock, role, &s, &t)?;
+    let followup_lifecycle = followup::validate_lifecycle_pair(lock, role, &s, &t)?;
     let engine = &lock.endpoint_views[role_index(role)];
     let external = lock
         .input
@@ -2892,6 +3021,7 @@ fn validate_work_records(
             search_work: t["search_work"].clone(),
         },
         marker,
+        followup_lifecycle,
     })
 }
 
@@ -3104,6 +3234,7 @@ pub fn assemble_pals_core_receipt_v4(
                 pgn: pgn_artifact.clone(),
             });
         }
+        let output_bytes = observed_output_bytes(output, &assembly.work)?;
         let core = PalsRunReceiptV4 {
             schema_version:4,
             domain: PALS_RECEIPT_V4_DOMAIN.into(),
@@ -3112,11 +3243,11 @@ pub fn assemble_pals_core_receipt_v4(
             lock_sha256: lock.input.semantic_lock.canonical_sha256.clone(),
             training_executed: false,
             training: PalsObservedV3::Unknown,
-            output_bytes: PalsObservedV3::Observed {value: observed_output_bytes(output,&assembly.work)?, method: "actual observed supervisor stream bytes plus retained receipt/evidence file lengths counted once per exact path, including separately read CPU/mock work envelopes; pinned inputs and separately capped runtime caches are outside this output-evidence scope".into()},
+            output_bytes: output_bytes.map_or(PalsObservedV3::Unknown,|value|PalsObservedV3::Observed {value, method: if lock.input.followup_execution.as_ref().is_some_and(|b|b.archive_output.is_some()) {"actual supervisor streams plus unique retained evidence lengths and actual archive write extents, each process-lifetime owner counted once; commit retention, integrity reads and runtime/input snapshots are distinct".into()} else {"actual observed supervisor stream bytes plus retained receipt/evidence file lengths counted once per exact path, including separately read CPU/mock work envelopes; pinned inputs and separately capped runtime caches are outside this output-evidence scope".into()}}),
             policy_failures:BTreeSet::new(),
             wall_time_ms: output.wall_time_ms,
             cleanup_time_ms: cleanup,
-            pair_eligible: failures.is_empty() && games.iter().all(|game|game.engines.iter().all(endpoint_admitted)),
+            pair_eligible: output_bytes.is_some() && failures.is_empty() && games.iter().all(|game|game.engines.iter().all(endpoint_admitted)),
             failures,
             games,
         };
@@ -3183,8 +3314,28 @@ pub fn save_pals_core_assembly_v4(
         required.is_some_and(|n| n <= owner.spec().input.budget.max_output_bytes),
         "core assembly conservative evidence reservation exceeds output budget",
     )?;
+    // Unknown write extent is retained as Unknown. The declared per-session
+    // prewrite reservation is used only to save bounded failure evidence.
+    let output_reservation = match observed_output_bytes(output, &assembly.work)? {
+        Some(bytes) => bytes,
+        None => metadata_output_bytes(output, &assembly.work)?
+            .checked_add(
+                owner
+                    .spec()
+                    .input
+                    .followup_execution
+                    .as_ref()
+                    .and_then(|b| b.archive_output.as_ref())
+                    .ok_or_else(|| invalid("unknown archive extent lacks an original reservation"))?
+                    .archive_write_bytes_max_per_endpoint
+                    .iter()
+                    .try_fold(0u64, |total, bytes| total.checked_add(*bytes))
+                    .ok_or_else(|| invalid("archive output reservation overflow"))?,
+            )
+            .ok_or_else(|| invalid("failure evidence output reservation overflow"))?,
+    };
     require(
-        observed_output_bytes(output, &assembly.work)?
+        output_reservation
             .checked_add(bytes.len() as u64)
             .is_some_and(|n| n <= owner.spec().input.budget.max_output_bytes),
         "V4 observed streams and retained evidence plus core assembly exceed output budget",
