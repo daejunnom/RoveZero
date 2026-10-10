@@ -1889,6 +1889,9 @@ pub struct PalsStores {
     generation: u64,
     checked_cpu_pvs: BTreeMap<LineId, CheckedCpuPv>,
     archive: Option<archive::ArchiveManager>,
+    /// Session write authority survives archive close without retaining files,
+    /// hot-store owners, cold handles or permission to admit another write.
+    archive_write_ledger: Option<Arc<archive::ArchiveWriteLedger>>,
 }
 
 impl PalsStores {
@@ -1910,6 +1913,7 @@ impl PalsStores {
             generation: 0,
             checked_cpu_pvs: BTreeMap::new(),
             archive: None,
+            archive_write_ledger: None,
         }
     }
 

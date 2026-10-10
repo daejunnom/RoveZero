@@ -60,6 +60,375 @@ fn setup(root: &TestRoot) -> PalsStores {
     store.enable_archive(root.config()).unwrap();
     store
 }
+fn runtime_limits(write_bytes: u64) -> ArchiveRuntimeLimits {
+    ArchiveRuntimeLimits {
+        game_bytes_max: write_bytes,
+        global_bytes_max: GLOBAL_ARCHIVE_BYTES,
+        index_entries_max: 16,
+        index_bytes_max: 1024,
+        load_bytes_max: write_bytes.min(ARCHIVE_RECORD_PAYLOAD_BYTES),
+        load_deadline_max_ms: 10_000,
+        record_payload_bytes_max: write_bytes.min(ARCHIVE_RECORD_PAYLOAD_BYTES),
+        max_load_pins: 4,
+    }
+}
+fn managed_setup(root: &TestRoot, selected: ArchiveRuntimeLimits) -> PalsStores {
+    let mut store = setup(root);
+    store.set_archive_runtime_limits(selected).unwrap();
+    store
+}
+fn owner_snapshot(store: &PalsStores) -> ArchiveOwnerSnapshot {
+    store.archive_owner_snapshot().unwrap().unwrap()
+}
+
+#[test]
+fn session_write_cap_is_exact_across_live_and_closed_game_owners() {
+    for close_first in [false, true] {
+        let root = TestRoot::new();
+        let bundle = Bundle::new(0);
+        let extent = HEADER + serde_json::to_vec(&bundle).unwrap().len() as u64;
+        let selected = runtime_limits(2 * extent);
+        let mut first = managed_setup(&root, selected);
+        let receipt = first
+            .archive
+            .as_mut()
+            .unwrap()
+            .commit(&bundle, &mut budget(), ArchiveStats::default())
+            .unwrap();
+        let handle = receipt.state_handle(StateId(0));
+        let first_snapshot = owner_snapshot(&first);
+        assert_eq!(first_snapshot.archive_write_bytes_total, Some(extent));
+        assert_eq!(first_snapshot.session_write_bytes_consumed, Some(extent));
+        assert_eq!(first_snapshot.write_bytes_remaining, Some(extent));
+        if close_first {
+            let closed = first.close_archive_owner().unwrap().unwrap();
+            assert_eq!(closed.lifecycle, ArchiveOwnerLifecycle::Closed);
+            assert!(closed.cleanup_complete && closed.admission_closed);
+            assert!(!first.archive_enabled());
+            assert!(handle.owner.upgrade().is_none());
+            assert_eq!(
+                first.archive_inactive(budget()).unwrap_err(),
+                StoreError::ArchiveDisabled
+            );
+        }
+
+        // The domain is canonical, even when the requested path is spelled
+        // differently. Handle identity is still the new manager's own Arc.
+        let mut next = PalsStores::new(limits());
+        let mut config = root.config();
+        config.root = config.root.join(".");
+        next.enable_archive(config).unwrap();
+        next.set_archive_runtime_limits(selected).unwrap();
+        next.inherit_archive_write_budget_from(&first).unwrap();
+        let inherited = owner_snapshot(&next);
+        assert_ne!(inherited.owner_id, first_snapshot.owner_id);
+        assert_eq!(inherited.generation, 0);
+        assert_eq!(inherited.archive_write_bytes_total, Some(0));
+        assert_eq!(
+            inherited.session_write_ledger_id,
+            first_snapshot.session_write_ledger_id
+        );
+        assert_eq!(inherited.session_write_bytes_max, Some(2 * extent));
+        assert_eq!(inherited.session_write_bytes_consumed, Some(extent));
+        assert_eq!(inherited.write_bytes_remaining, Some(extent));
+        assert_eq!(
+            next.archive.as_ref().unwrap().verify_owner(&handle),
+            Err(StoreError::InvalidHandle("cold owner or generation"))
+        );
+        next.archive
+            .as_mut()
+            .unwrap()
+            .commit(&bundle, &mut budget(), ArchiveStats::default())
+            .unwrap();
+        let exhausted = owner_snapshot(&next);
+        assert_eq!(exhausted.session_write_bytes_consumed, Some(2 * extent));
+        assert_eq!(exhausted.archive_write_bytes_total, Some(extent));
+        assert_eq!(exhausted.write_bytes_reserved, 0);
+        assert_eq!(exhausted.write_bytes_remaining, Some(0));
+
+        let mut third = managed_setup(&root, selected);
+        third.inherit_archive_write_budget_from(&next).unwrap();
+        assert_eq!(
+            third
+                .archive
+                .as_mut()
+                .unwrap()
+                .commit(&bundle, &mut budget(), ArchiveStats::default())
+                .unwrap_err(),
+            StoreError::ArchiveQuota("archive lifetime write bytes")
+        );
+        let rejected = owner_snapshot(&third);
+        assert_eq!(rejected.generation, 0);
+        assert_eq!(rejected.archive_write_bytes_total, Some(0));
+        assert_eq!(rejected.session_write_bytes_consumed, Some(2 * extent));
+        assert_eq!(rejected.write_bytes_remaining, Some(0));
+        assert!(
+            fs::read_dir(&third.archive.as_ref().unwrap().directory)
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn write_budget_inheritance_rejects_domain_use_and_duplicate_without_mutation() {
+    let root = TestRoot::new();
+    let other_root = TestRoot::new();
+    let selected = runtime_limits(1024 * 1024);
+    let source = managed_setup(&root, selected);
+    let source_before = owner_snapshot(&source);
+    for case in 0..12 {
+        let mut changed = selected;
+        match case {
+            1 => changed.game_bytes_max += 1,
+            2 => changed.global_bytes_max -= 1,
+            3 => changed.index_entries_max += 1,
+            4 => changed.index_bytes_max += 1,
+            5 => changed.load_bytes_max -= 1,
+            6 => changed.load_deadline_max_ms += 1,
+            7 => changed.record_payload_bytes_max -= 1,
+            8 => changed.max_load_pins += 1,
+            _ => {}
+        }
+        let mut next = managed_setup(if case == 0 { &other_root } else { &root }, changed);
+        match case {
+            9 => {
+                next.focus_actual_moves(Position::startpos().snapshot())
+                    .unwrap();
+            }
+            10 => {
+                next.measure_archive_usage_with_budget(&mut budget())
+                    .unwrap();
+            }
+            11 => {
+                next.inherit_archive_write_budget_from(&source).unwrap();
+            }
+            _ => {}
+        }
+        let before = owner_snapshot(&next);
+        let hot_before = next.hot_stats();
+        assert!(
+            matches!(
+                next.inherit_archive_write_budget_from(&source),
+                Err(StoreError::InvalidConditions(_))
+            ),
+            "case {case}"
+        );
+        assert_eq!(owner_snapshot(&next), before, "case {case}");
+        assert_eq!(next.hot_stats(), hot_before, "case {case}");
+        assert_eq!(owner_snapshot(&source), source_before, "case {case}");
+    }
+
+    let mut legacy = setup(&root);
+    let legacy_before = owner_snapshot(&legacy);
+    assert!(legacy.inherit_archive_write_budget_from(&source).is_err());
+    assert_eq!(owner_snapshot(&legacy), legacy_before);
+    let mut selected_next = managed_setup(&root, selected);
+    let before = owner_snapshot(&selected_next);
+    assert!(
+        selected_next
+            .inherit_archive_write_budget_from(&legacy)
+            .is_err()
+    );
+    assert_eq!(owner_snapshot(&selected_next), before);
+    let legacy_source = setup(&root);
+    legacy
+        .inherit_archive_write_budget_from(&legacy_source)
+        .unwrap();
+    legacy
+        .inherit_archive_write_budget_from(&legacy_source)
+        .unwrap();
+    assert_eq!(owner_snapshot(&legacy), legacy_before);
+}
+
+#[test]
+fn partial_write_and_failed_publication_debit_actual_bytes_and_retain_known_files() {
+    for fault in [
+        TestCommitFault::PartialPayload(17),
+        TestCommitFault::ExpirePostCommitScan,
+    ] {
+        let root = TestRoot::new();
+        let selected = runtime_limits(1024 * 1024);
+        let mut store = managed_setup(&root, selected);
+        let mut position = Position::startpos();
+        store.focus_actual_moves(position.snapshot()).unwrap();
+        position.make_move(mv("e2e4")).unwrap();
+        store.focus_actual_moves(position.snapshot()).unwrap();
+        let hot_before = store.hot_stats();
+        let directory = store.archive.as_ref().unwrap().directory.clone();
+        store.archive.as_mut().unwrap().test_commit_fault = Some(fault);
+        let error = store.archive_inactive(budget()).unwrap_err();
+        let partial = matches!(fault, TestCommitFault::PartialPayload(_));
+        if partial {
+            assert!(matches!(
+                error,
+                StoreError::ArchiveIo {
+                    stage: "injected archive partial write",
+                    ..
+                }
+            ));
+        } else {
+            assert_eq!(error, StoreError::ArchiveDeadline);
+        }
+        let path = directory.join(if partial {
+            "seg-00000000000000000000.pending"
+        } else {
+            "seg-00000000000000000000.arc"
+        });
+        let actual = fs::metadata(&path).unwrap().len();
+        let snapshot = owner_snapshot(&store);
+        assert_eq!(snapshot.pending_commit_bytes, Some(actual));
+        assert!(snapshot.pending_files_retained);
+        assert!(!snapshot.pending_buffers_retained);
+        assert!(snapshot.admission_closed);
+        assert_eq!(snapshot.lifecycle, ArchiveOwnerLifecycle::Failed);
+        assert!(!snapshot.complete);
+        assert_eq!(snapshot.archive_write_bytes_total, Some(actual));
+        assert_eq!(snapshot.session_write_bytes_consumed, Some(actual));
+        assert_eq!(
+            snapshot.write_bytes_remaining,
+            Some(selected.game_bytes_max - actual)
+        );
+        assert_eq!(snapshot.write_bytes_reserved, 0);
+        assert_eq!(
+            store.archive_write_ledger.as_ref().unwrap().facts(),
+            Some((actual, 0))
+        );
+        assert_eq!(store.hot_stats(), hot_before);
+        assert_eq!(snapshot.ram_reclaim_events, 0);
+        if partial {
+            assert_eq!(actual, HEADER + 17);
+            assert_eq!(snapshot.committed_chunks, 0);
+            assert_eq!(snapshot.integrity_verified_chunks, 0);
+        } else {
+            assert_eq!(snapshot.committed_chunks, 1);
+            assert_eq!(snapshot.integrity_verified_chunks, 1);
+        }
+        assert_eq!(
+            store.close_archive_owner().unwrap_err(),
+            StoreError::InvalidConditions("archive close retains pending ownership")
+        );
+        let rejected_close = owner_snapshot(&store);
+        assert!(!rejected_close.cleanup_complete);
+        assert!(rejected_close.pending_files_retained);
+        assert_eq!(rejected_close.pending_commit_bytes, Some(actual));
+        assert_eq!(fs::metadata(&path).unwrap().len(), actual);
+
+        let mut next = managed_setup(&root, selected);
+        next.inherit_archive_write_budget_from(&store).unwrap();
+        let inherited = owner_snapshot(&next);
+        assert_eq!(
+            inherited.session_write_ledger_id,
+            snapshot.session_write_ledger_id
+        );
+        assert_eq!(inherited.session_write_bytes_consumed, Some(actual));
+        assert_eq!(inherited.archive_write_bytes_total, Some(0));
+    }
+}
+
+#[test]
+fn prewrite_create_failure_releases_unwritten_reservation_and_keeps_zero_actual_debit() {
+    let root = TestRoot::new();
+    let selected = runtime_limits(1024 * 1024);
+    let mut store = managed_setup(&root, selected);
+    let directory = store.archive.as_ref().unwrap().directory.clone();
+    fs::remove_dir(&directory).unwrap();
+    assert!(matches!(
+        store.archive.as_mut().unwrap().commit(
+            &Bundle::new(0),
+            &mut budget(),
+            ArchiveStats::default()
+        ),
+        Err(StoreError::ArchiveIo {
+            stage: "archive temporary create",
+            ..
+        })
+    ));
+    let snapshot = owner_snapshot(&store);
+    assert_eq!(snapshot.session_write_bytes_consumed, Some(0));
+    assert_eq!(snapshot.archive_write_bytes_total, Some(0));
+    assert_eq!(
+        snapshot.write_bytes_remaining,
+        Some(selected.game_bytes_max)
+    );
+    assert_eq!(snapshot.write_bytes_reserved, 0);
+    assert_eq!(snapshot.pending_commit_bytes, Some(0));
+    assert!(!snapshot.pending_files_retained);
+    assert_eq!(
+        store.archive_write_ledger.as_ref().unwrap().facts(),
+        Some((0, 0))
+    );
+}
+
+#[test]
+fn closed_owner_retains_only_ledger_through_deadline_cancel_and_repeated_cleanup() {
+    let root = TestRoot::new();
+    let selected = runtime_limits(1024 * 1024);
+    let mut previous = managed_setup(&root, selected);
+    let receipt = previous
+        .archive
+        .as_mut()
+        .unwrap()
+        .commit(&Bundle::new(0), &mut budget(), ArchiveStats::default())
+        .unwrap();
+    let handle = receipt.state_handle(StateId(0));
+    let path = previous.archive.as_ref().unwrap().path(receipt.generation);
+    let closed = previous.close_archive_owner().unwrap().unwrap();
+    for failure in [StoreError::ArchiveDeadline, StoreError::ArchiveCanceled] {
+        let mut staged = managed_setup(&root, selected);
+        staged.inherit_archive_write_budget_from(&previous).unwrap();
+        let mut allowance = budget();
+        if failure == StoreError::ArchiveDeadline {
+            allowance.deadline = Instant::now();
+        }
+        let result: Result<(), StoreError> =
+            staged.with_archive_allocation(StorePins::default(), &mut allowance, |_| {
+                Err(failure.clone())
+            });
+        assert_eq!(result.unwrap_err(), failure);
+        let snapshot = owner_snapshot(&staged);
+        assert_eq!(
+            snapshot.session_write_ledger_id,
+            closed.session_write_ledger_id
+        );
+        assert_eq!(
+            snapshot.session_write_bytes_consumed,
+            closed.session_write_bytes_consumed
+        );
+        assert_eq!(snapshot.write_bytes_remaining, closed.write_bytes_remaining);
+        assert_eq!(snapshot.archive_write_bytes_total, Some(0));
+        assert_eq!(snapshot.generation, 0);
+        drop(staged);
+        assert!(previous.close_archive_owner().unwrap().is_none());
+        assert!(!previous.archive_enabled());
+        assert!(previous.archive_owner_snapshot().unwrap().is_none());
+        assert!(handle.owner.upgrade().is_none());
+        assert_eq!(
+            previous.enable_archive(root.config()),
+            Err(StoreError::InvalidConditions(
+                "archive session write authority requires a replacement store"
+            ))
+        );
+        assert_eq!(
+            previous.archive_inactive(budget()).unwrap_err(),
+            StoreError::ArchiveDisabled
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), receipt.committed_bytes);
+    }
+    let mut retry = managed_setup(&root, selected);
+    retry.inherit_archive_write_budget_from(&previous).unwrap();
+    let snapshot = owner_snapshot(&retry);
+    assert_eq!(
+        snapshot.session_write_ledger_id,
+        closed.session_write_ledger_id
+    );
+    assert_eq!(
+        snapshot.session_write_bytes_consumed,
+        closed.session_write_bytes_consumed
+    );
+    assert_eq!(snapshot.write_bytes_remaining, closed.write_bytes_remaining);
+}
 fn mv(text: &str) -> BoardMove {
     text.parse().unwrap()
 }

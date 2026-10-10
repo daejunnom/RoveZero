@@ -100,6 +100,11 @@ pub struct ArchiveOwnerSnapshot {
     pub io_failures: u64,
     pub pin_saturation_failures: u64,
     pub archive_write_bytes_total: Option<u64>,
+    /// Actual process-session authority shared across replacement game owners.
+    /// Legacy owners without runtime selectors have no session write ledger.
+    pub session_write_ledger_id: Option<u64>,
+    pub session_write_bytes_max: Option<u64>,
+    pub session_write_bytes_consumed: Option<u64>,
     pub write_bytes_reserved: u64,
     pub write_bytes_remaining: Option<u64>,
     pub admission_closed: bool,
@@ -363,6 +368,8 @@ pub(super) struct ArchiveManager {
     state_owner: Weak<()>,
     line_owner: Weak<()>,
     runtime_limits: Option<ArchiveRuntimeLimits>,
+    write_ledger: Option<Arc<ArchiveWriteLedger>>,
+    write_budget_inherited: bool,
     used: bool,
     telemetry: std::sync::Mutex<ArchiveOwnerSnapshot>,
     pending_cleanup: bool,
@@ -374,6 +381,122 @@ pub(super) struct ArchiveManager {
 enum TestCommitFault {
     PartialPayload(usize),
     ExpirePostCommitScan,
+}
+
+/// Fixed-size session accounting only. Archive handle ownership, generations,
+/// disk quotas and read allowances remain on the independent game manager.
+#[derive(Debug)]
+pub(super) struct ArchiveWriteLedger {
+    id: u64,
+    maximum: u64,
+    root: PathBuf,
+    runtime_limits: ArchiveRuntimeLimits,
+    state: std::sync::Mutex<ArchiveWriteLedgerState>,
+}
+#[derive(Debug, Default)]
+struct ArchiveWriteLedgerState {
+    consumed: u64,
+    reserved: u64,
+    invalid: bool,
+}
+impl ArchiveWriteLedger {
+    fn new(root: PathBuf, runtime_limits: ArchiveRuntimeLimits) -> Result<Arc<Self>, StoreError> {
+        static LEDGERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = LEDGERS
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |value| value.checked_add(1),
+            )
+            .map_err(|_| StoreError::RevisionExhausted)?;
+        Ok(Arc::new(Self {
+            id,
+            maximum: runtime_limits.game_bytes_max,
+            root,
+            runtime_limits,
+            state: std::sync::Mutex::new(ArchiveWriteLedgerState::default()),
+        }))
+    }
+    fn facts(&self) -> Option<(u64, u64)> {
+        let state = self.state.lock().ok()?;
+        (!state.invalid).then_some((state.consumed, state.reserved))
+    }
+    fn remaining(&self) -> Result<u64, StoreError> {
+        let (consumed, reserved) = self
+            .facts()
+            .ok_or(StoreError::ArchiveQuota("archive write ledger unknown"))?;
+        consumed
+            .checked_add(reserved)
+            .and_then(|used| self.maximum.checked_sub(used))
+            .ok_or(StoreError::ArchiveQuota("archive lifetime write bytes"))
+    }
+    fn reserve(self: &Arc<Self>, bytes: u64) -> Result<ArchiveWriteReservation, StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| StoreError::ArchiveQuota("archive write ledger unknown"))?;
+        if state.invalid {
+            return Err(StoreError::ArchiveQuota("archive write ledger unknown"));
+        }
+        let reserved = state
+            .reserved
+            .checked_add(bytes)
+            .filter(|reserved| {
+                state
+                    .consumed
+                    .checked_add(*reserved)
+                    .is_some_and(|total| total <= self.maximum)
+            })
+            .ok_or(StoreError::ArchiveQuota("archive lifetime write bytes"))?;
+        state.reserved = reserved;
+        Ok(ArchiveWriteReservation {
+            ledger: Arc::clone(self),
+            remaining: bytes,
+        })
+    }
+}
+struct ArchiveWriteReservation {
+    ledger: Arc<ArchiveWriteLedger>,
+    remaining: u64,
+}
+impl ArchiveWriteReservation {
+    fn debit_written(&mut self, bytes: u64) -> std::io::Result<()> {
+        let mut state = self
+            .ledger
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("archive write ledger unknown"))?;
+        let debit = self
+            .remaining
+            .checked_sub(bytes)
+            .zip(state.reserved.checked_sub(bytes))
+            .zip(state.consumed.checked_add(bytes))
+            .filter(|(_, consumed)| *consumed <= self.ledger.maximum);
+        let Some(((remaining, reserved), consumed)) = debit else {
+            state.invalid = true;
+            return Err(std::io::Error::other("archive write ledger debit invalid"));
+        };
+        self.remaining = remaining;
+        state.reserved = reserved;
+        state.consumed = consumed;
+        Ok(())
+    }
+}
+impl Drop for ArchiveWriteReservation {
+    fn drop(&mut self) {
+        // Successful physical writes are already consumed. Only the unwritten
+        // portion of this reservation is releasable after any failure or unwind.
+        let mut state = self.ledger.state.lock().unwrap_or_else(|poison| {
+            let mut state = poison.into_inner();
+            state.invalid = true;
+            state
+        });
+        if let Some(reserved) = state.reserved.checked_sub(self.remaining) {
+            state.reserved = reserved;
+        } else {
+            state.invalid = true;
+        }
+    }
 }
 fn add_counter(value: &mut u64, amount: u64, complete: &mut bool) {
     if let Some(next) = value.checked_add(amount) {
@@ -550,6 +673,8 @@ impl ArchiveManager {
             state_owner: Weak::new(),
             line_owner: Weak::new(),
             runtime_limits: None,
+            write_ledger: None,
+            write_budget_inherited: false,
             used: false,
             pending_cleanup: false,
             #[cfg(test)]
@@ -630,6 +755,19 @@ impl ArchiveManager {
         snapshot.generation = self.next_generation;
         snapshot.reserved_generations = self.next_generation;
         snapshot.runtime_limits = self.runtime_limits;
+        if let Some(ledger) = &self.write_ledger {
+            let facts = ledger.facts();
+            snapshot.session_write_ledger_id = Some(ledger.id);
+            snapshot.session_write_bytes_max = Some(ledger.maximum);
+            snapshot.session_write_bytes_consumed = facts.map(|facts| facts.0);
+            snapshot.write_bytes_remaining = facts.and_then(|(consumed, reserved)| {
+                consumed
+                    .checked_add(reserved)
+                    .and_then(|used| ledger.maximum.checked_sub(used))
+            });
+            snapshot.complete &= snapshot.session_write_bytes_consumed.is_some()
+                && snapshot.write_bytes_remaining.is_some();
+        }
         snapshot.complete &= !self.telemetry.is_poisoned()
             && snapshot.global_scan_complete
             && snapshot.global_scan_after_last_commit
@@ -718,7 +856,11 @@ impl ArchiveManager {
             let path = entry.path();
             no_link(&path)?;
             if entry.file_name() == ".quota.lock" {
-                if !entry.file_type().map_err(|e| io("archive lock type", e))?.is_file() {
+                if !entry
+                    .file_type()
+                    .map_err(|e| io("archive lock type", e))?
+                    .is_file()
+                {
                     return Err(StoreError::ArchiveIntegrity("archive quota lock type"));
                 }
                 continue;
@@ -802,16 +944,18 @@ impl ArchiveManager {
             .record_bytes
             .min(remaining.saturating_sub(HEADER))
             .min(budget.max_bytes.saturating_sub(2 * HEADER) / 2);
-        let write_remaining = if let Some(limits) = self.runtime_limits {
-            let used = self
-                .snapshot()
-                .archive_write_bytes_total
-                .ok_or(StoreError::ArchiveQuota("archive write extent unknown"))?;
-            Some(limits.game_bytes_max.saturating_sub(used))
+        let write_remaining = if self.runtime_limits.is_some() {
+            Some(
+                self.write_ledger
+                    .as_ref()
+                    .ok_or(StoreError::ArchiveQuota("archive write ledger missing"))?
+                    .remaining()?,
+            )
         } else {
             None
         };
-        let maximum = maximum.min(write_remaining.map_or(u64::MAX, |bytes| bytes.saturating_sub(HEADER)));
+        let maximum =
+            maximum.min(write_remaining.map_or(u64::MAX, |bytes| bytes.saturating_sub(HEADER)));
         if maximum == 0 {
             return Err(
                 if write_remaining.is_some_and(|remaining| remaining <= HEADER) {
@@ -861,18 +1005,13 @@ impl ArchiveManager {
         }
         let bytes = writer.bytes;
         let extent = HEADER + bytes.len() as u64;
-        if let Some(limits) = self.runtime_limits {
-            let used = self
-                .snapshot()
-                .archive_write_bytes_total
-                .ok_or(StoreError::ArchiveQuota("archive write extent unknown"))?;
-            if used
-                .checked_add(extent)
-                .is_none_or(|total| total > limits.game_bytes_max)
-            {
-                return Err(StoreError::ArchiveQuota("archive lifetime write bytes"));
-            }
-        }
+        // Serialization may run concurrently with another inherited owner.
+        // Reserve the whole extent atomically before creating or writing a file.
+        let mut write_reservation = self
+            .write_ledger
+            .as_ref()
+            .map(|ledger| ledger.reserve(extent))
+            .transpose()?;
         let checksum: [u8; 32] = Sha256::digest(&bytes).into();
         let generation = self.next_generation;
         // Failed verification can leave a committed file. Reserve its number
@@ -910,6 +1049,7 @@ impl ArchiveManager {
             let mut output = CountedWriter {
                 inner: file.as_mut().expect("owned file"),
                 written: &mut written,
+                reservation: write_reservation.as_mut(),
             };
             output
                 .write_all(MAGIC)
@@ -920,9 +1060,13 @@ impl ArchiveManager {
             #[cfg(test)]
             if let Some(TestCommitFault::PartialPayload(count)) = self.test_commit_fault {
                 self.test_commit_fault = None;
-                output.write_all(&bytes[..count.min(bytes.len())])
+                output
+                    .write_all(&bytes[..count.min(bytes.len())])
                     .map_err(|e| io("archive partial payload write", e))?;
-                return Err(io("injected archive partial write", std::io::Error::other("fixture")));
+                return Err(io(
+                    "injected archive partial write",
+                    std::io::Error::other("fixture"),
+                ));
             }
             output
                 .write_all(&bytes)
@@ -955,15 +1099,23 @@ impl ArchiveManager {
             if self.runtime_limits.is_some() {
                 let post_commit_budget = *budget;
                 #[cfg(test)]
-                let post_commit_budget = if matches!(self.test_commit_fault, Some(TestCommitFault::ExpirePostCommitScan)) {
+                let post_commit_budget = if matches!(
+                    self.test_commit_fault,
+                    Some(TestCommitFault::ExpirePostCommitScan)
+                ) {
                     self.test_commit_fault = None;
-                    ArchiveIoBudget { deadline: Instant::now(), ..post_commit_budget }
+                    ArchiveIoBudget {
+                        deadline: Instant::now(),
+                        ..post_commit_budget
+                    }
                 } else {
                     post_commit_budget
                 };
                 let (game, global) = self.usage(post_commit_budget)?;
                 if game > self.config.game_bytes || global > self.config.global_bytes {
-                    return Err(StoreError::ArchiveQuota("post-commit managed archive bytes"));
+                    return Err(StoreError::ArchiveQuota(
+                        "post-commit managed archive bytes",
+                    ));
                 }
             }
             Ok(())
@@ -976,18 +1128,25 @@ impl ArchiveManager {
             fs::metadata(&temporary).ok().map(|metadata| metadata.len())
         };
         drop(file);
+        // Drop releases only unwritten reserved bytes; CountedWriter already
+        // debited every successful write, including a failed publication.
+        drop(write_reservation);
         self.note(|meter| {
-            meter.archive_write_bytes_total = actual.and_then(|amount| {
+            let actual_written = if self.runtime_limits.is_some() {
+                Some(written)
+            } else {
+                actual
+            };
+            meter.archive_write_bytes_total = actual_written.and_then(|amount| {
                 meter
                     .archive_write_bytes_total
                     .and_then(|total| total.checked_add(amount))
             });
             meter.write_bytes_reserved = 0;
-            meter.write_bytes_remaining = self.runtime_limits.and_then(|limits| {
-                meter
-                    .archive_write_bytes_total
-                    .and_then(|used| limits.game_bytes_max.checked_sub(used))
-            });
+            meter.write_bytes_remaining = self
+                .write_ledger
+                .as_ref()
+                .and_then(|ledger| ledger.remaining().ok());
             if result.is_ok() {
                 meter.pending_commit_bytes = Some(0);
                 meter.pending_files_retained = false;
@@ -1100,6 +1259,7 @@ impl ArchiveManager {
 struct CountedWriter<'a, W> {
     inner: &'a mut W,
     written: &'a mut u64,
+    reservation: Option<&'a mut ArchiveWriteReservation>,
 }
 impl<W: Write> Write for CountedWriter<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -1108,6 +1268,9 @@ impl<W: Write> Write for CountedWriter<'_, W> {
             .written
             .checked_add(count as u64)
             .ok_or_else(|| std::io::Error::other("archive write count overflow"))?;
+        if let Some(reservation) = &mut self.reservation {
+            reservation.debit_written(count as u64)?;
+        }
         Ok(count)
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -1258,6 +1421,11 @@ impl PalsStores {
         if self.archive.is_some() {
             return Err(StoreError::InvalidConditions("archive already enabled"));
         }
+        if self.archive_write_ledger.is_some() {
+            return Err(StoreError::InvalidConditions(
+                "archive session write authority requires a replacement store",
+            ));
+        }
         let mut manager = ArchiveManager::open(config)?;
         manager.state_owner = Arc::downgrade(&self.states.identity);
         manager.line_owner = Arc::downgrade(&self.lines.identity);
@@ -1282,6 +1450,7 @@ impl PalsStores {
         let hot_in_use = self.hot_stats() != ArchiveStats::default();
         let manager = self.archive.as_mut().ok_or(StoreError::ArchiveDisabled)?;
         if hot_in_use
+            || self.archive_write_ledger.is_some()
             || manager.used
             || manager.runtime_limits.is_some()
             || manager.allocation_active
@@ -1320,16 +1489,96 @@ impl PalsStores {
         {
             return Err(StoreError::InvalidConditions("archive runtime selectors"));
         }
+        let ledger = ArchiveWriteLedger::new(manager.config.root.clone(), limits)?;
         manager.config.game_bytes = limits.game_bytes_max;
         manager.config.global_bytes = limits.global_bytes_max;
         manager.config.record_bytes = limits.record_payload_bytes_max;
         manager.config.max_load_pins = limits.max_load_pins as usize;
         manager.runtime_limits = Some(limits);
+        manager.write_ledger = Some(Arc::clone(&ledger));
+        self.archive_write_ledger = Some(ledger);
         manager.note(|meter| {
             meter.runtime_limits = Some(limits);
             meter.load_pins_max = limits.max_load_pins;
             meter.write_bytes_remaining = Some(limits.game_bytes_max);
         });
+        Ok(())
+    }
+    /// Attach an unused replacement owner to the existing session's actual
+    /// cumulative write authority. The source may already have closed: only its
+    /// ledger survives close, never its file or ColdHandle authority. Rejection
+    /// changes neither owner. Legacy None/None selectors keep their old meaning.
+    pub fn inherit_archive_write_budget_from(
+        &mut self,
+        previous: &PalsStores,
+    ) -> Result<(), StoreError> {
+        let hot_in_use = self.hot_stats() != ArchiveStats::default()
+            || self.root.is_some()
+            || self.generation != 0
+            || !self.checked_cpu_pvs.is_empty()
+            || !self.derived.entries.is_empty();
+        let manager = self.archive.as_mut().ok_or(StoreError::ArchiveDisabled)?;
+        let Some(limits) = manager.runtime_limits else {
+            if previous.archive_write_ledger.is_none()
+                && previous
+                    .archive
+                    .as_ref()
+                    .is_none_or(|source| source.runtime_limits.is_none())
+            {
+                return Ok(());
+            }
+            return Err(StoreError::InvalidConditions(
+                "archive write budget selectors mismatch",
+            ));
+        };
+        let source =
+            previous
+                .archive_write_ledger
+                .as_ref()
+                .ok_or(StoreError::InvalidConditions(
+                    "archive write budget selectors mismatch",
+                ))?;
+        if source.root != manager.config.root || source.runtime_limits != limits {
+            return Err(StoreError::InvalidConditions(
+                "archive write budget domain mismatch",
+            ));
+        }
+        let initial = manager.snapshot();
+        let destination_unused = manager
+            .write_ledger
+            .as_ref()
+            .is_some_and(|ledger| ledger.facts() == Some((0, 0)));
+        if hot_in_use
+            || manager.used
+            || manager.write_budget_inherited
+            || manager.next_generation != 0
+            || manager.allocation_active
+            || manager.auto_budget.is_some()
+            || !manager.load_pins.is_empty()
+            || manager.pins.count() != 0
+            || manager.pending_cleanup
+            || initial.event_sequence != 2
+            || initial.lifecycle != ArchiveOwnerLifecycle::Open
+            || initial.admission_closed
+            || initial.archive_write_bytes_total != Some(0)
+            || !destination_unused
+        {
+            return Err(StoreError::InvalidConditions(
+                "archive write budget inheritance is one-shot before use",
+            ));
+        }
+        let (_, reserved) = source
+            .facts()
+            .ok_or(StoreError::ArchiveQuota("archive write ledger unknown"))?;
+        if reserved != 0 {
+            return Err(StoreError::InvalidConditions(
+                "archive write budget inheritance requires idle ledger",
+            ));
+        }
+        manager.write_ledger = Some(Arc::clone(source));
+        manager.write_budget_inherited = true;
+        self.archive_write_ledger = Some(Arc::clone(source));
+        manager.note(|_| {});
         Ok(())
     }
     /// O(1), with no filesystem access or event increment.
@@ -1445,7 +1694,12 @@ impl PalsStores {
         let result = operation(&mut *scope.stores);
         scope.finish()?;
         if let Err(error) = &result {
-            scope.stores.archive.as_ref().expect("same archive owner").failure_after(baseline, error);
+            scope
+                .stores
+                .archive
+                .as_ref()
+                .expect("same archive owner")
+                .failure_after(baseline, error);
         }
         result
     }
@@ -1648,7 +1902,11 @@ impl PalsStores {
             }
             let (bundle, _) = manager.read(generation, None, budget)?;
             self.check_bundle_counts(&bundle)?;
-            if bundle.observations.iter().any(|(_, cold)| cold.conflicts_external_request(observation)) {
+            if bundle
+                .observations
+                .iter()
+                .any(|(_, cold)| cold.conflicts_external_request(observation))
+            {
                 return Err(StoreError::InvalidEvidence(
                     "foreign physical request belongs to another archived task",
                 ));
