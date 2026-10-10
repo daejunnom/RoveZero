@@ -127,6 +127,7 @@ fn policy_arguments(e: &PalsEndpointV4) -> Result<Vec<String>, ArenaError> {
 }
 
 impl PalsArenaValidationContext for LockedPalsArenaLaunchV4 {
+    #[cfg(target_os = "linux")]
     fn verify_semantic(&self) -> Result<(), ArenaError> {
         self.input.semantic_lock.verify().map_err(ArenaError::from)
     }
@@ -166,6 +167,7 @@ impl PalsArenaValidationContext for LockedPalsArenaLaunchV4 {
             PALS_NATIVE_TERMINATION_V4_DOMAIN,
         )
     }
+    #[cfg(target_os = "linux")]
     fn native_wire_filenames(&self) -> (&'static str, &'static str) {
         (
             "pals-native-startup.v4.json",
@@ -2043,12 +2045,14 @@ fn observed_output_bytes(
         })
         .ok_or_else(|| invalid("V4 output byte observation overflow"))
 }
+#[cfg(target_os = "linux")]
 fn observed<T>(value: T, method: &str) -> PalsObservedV3<T> {
     PalsObservedV3::Observed {
         value,
         method: method.into(),
     }
 }
+#[cfg(target_os = "linux")]
 fn endpoint_admitted(e: &PalsEndpointReceiptV4) -> bool {
     let model_ok = matches!(e.checks.model, PalsObservedV3::Observed { .. })
         || matches!(e.checks.policies, PalsObservedV3::Unknown);
@@ -2747,6 +2751,7 @@ fn verify_external_profile(
     })
 }
 
+#[cfg(target_os = "linux")]
 fn validate_work_records(
     lock: &LockedPalsArenaLaunchV4,
     role: NativeEngineRole,

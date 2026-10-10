@@ -3742,6 +3742,7 @@ pub fn validate_pals_native_records(
 /// Shared physical admission context. Implementations keep their own semantic
 /// lock and native wire domain; no historical manifest is synthesized.
 trait PalsArenaValidationContext: NativeLaunchDeclaration {
+    #[cfg(target_os = "linux")]
     fn verify_semantic(&self) -> Result<(), ArenaError>;
     fn launch_sha256(&self) -> &str;
     fn native(&self, role: NativeEngineRole) -> Result<&PalsOnnxLaunchV3, ArenaError>;
@@ -3758,6 +3759,7 @@ trait PalsArenaValidationContext: NativeLaunchDeclaration {
     ) -> Result<Option<(&PalsExternalCpuRV3, &PalsExternalCpuRLaunchV3)>, ArenaError>;
     fn native_wire_version(&self) -> u32;
     fn native_wire_domains(&self) -> (&'static str, &'static str);
+    #[cfg(target_os = "linux")]
     fn native_wire_filenames(&self) -> (&'static str, &'static str);
     fn validate_policy_pair(
         &self,
@@ -3775,6 +3777,7 @@ trait PalsArenaValidationContext: NativeLaunchDeclaration {
     }
 }
 impl PalsArenaValidationContext for LockedPalsArenaLaunchV3 {
+    #[cfg(target_os = "linux")]
     fn verify_semantic(&self) -> Result<(), ArenaError> {
         self.input.semantic_lock.verify().map_err(ArenaError::from)
     }
@@ -3811,6 +3814,7 @@ impl PalsArenaValidationContext for LockedPalsArenaLaunchV3 {
     fn native_wire_version(&self) -> u32 {
         3
     }
+    #[cfg(target_os = "linux")]
     fn native_wire_filenames(&self) -> (&'static str, &'static str) {
         (
             "pals-native-startup.v3.json",
