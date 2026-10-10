@@ -554,6 +554,14 @@ mod check {
         cancel_address: usize,
         wire: Value,
     }
+    fn paused_stack_spans_repair_and_c_tail(
+        paused_at: u64,
+        repair_at: u64,
+        critic_at: u64,
+        resumed_at: u64,
+    ) -> bool {
+        paused_at < repair_at && repair_at < critic_at && critic_at < resumed_at
+    }
     struct Capture {
         configuration: PalsModelConfig,
         started: Instant,
@@ -708,7 +716,7 @@ mod check {
                             })
                             && call.wire["accepted_context_elapsed_ns"]
                                 .as_u64()
-                                .is_some_and(|at| at < resumed_at && paused_at < resumed_at)
+                                .is_some_and(|at| paused_at < at && at < resumed_at)
                     })
                     .collect();
                 for repair in repairs {
@@ -751,7 +759,11 @@ mod check {
                                 && ids.contains(&request_id(call.id))
                                 && call.wire["accepted_context_elapsed_ns"]
                                     .as_u64()
-                                    .is_some_and(|at| repair_at < at && at < resumed_at)
+                                    .is_some_and(|at| {
+                                        paused_stack_spans_repair_and_c_tail(
+                                            paused_at, repair_at, at, resumed_at,
+                                        )
+                                    })
                         }) else {
                             continue;
                         };
@@ -2614,6 +2626,27 @@ mod check {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn existing_paused_stack_must_span_accepted_repair_c_and_actual_resume() {
+            // Timestamp admission only: this fixture supplies no CUDA Run,
+            // acceptance callback, live token, scheduler link or physical fence.
+            assert!(paused_stack_spans_repair_and_c_tail(10, 20, 30, 40));
+            for timestamps in [
+                (25, 20, 30, 40), // A new pause after Repair is not the held stack.
+                (20, 20, 30, 40),
+                (10, 30, 20, 40),
+                (10, 20, 20, 40),
+                (10, 20, 30, 30),
+                (10, 20, 40, 30),
+            ] {
+                assert!(!paused_stack_spans_repair_and_c_tail(
+                    timestamps.0,
+                    timestamps.1,
+                    timestamps.2,
+                    timestamps.3,
+                ));
+            }
+        }
         #[test]
         fn cuda_warm_owner_limits_use_native_byte_units_and_refuse_missing_exclusive_budget() {
             let limits = cuda_warm_limits("1", "397312").unwrap();
