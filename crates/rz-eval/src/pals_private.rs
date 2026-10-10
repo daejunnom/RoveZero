@@ -19,8 +19,8 @@
 //! arrives, this intentionally remains retained for the process lifetime.
 
 use crate::pals_model::{PalsModelConfig, PalsModelInput, PalsRole};
-use rz_contracts::CancelToken;
 use rz_contracts::pals::SituationHandle;
+use rz_contracts::CancelToken;
 use rz_position::{PositionSnapshot, WeakPositionIdentity};
 use sha2::{Digest as _, Sha256};
 use std::mem::size_of;
@@ -2045,13 +2045,11 @@ mod tests {
                     deadline(),
                 )
                 .unwrap();
-            assert!(
-                lease
-                    .complete_known(PhysicalSeedCompletion::Succeeded)
-                    .unwrap()
-                    .stage_output(&invalid)
-                    .is_err()
-            );
+            assert!(lease
+                .complete_known(PhysicalSeedCompletion::Succeeded)
+                .unwrap()
+                .stage_output(&invalid)
+                .is_err());
             assert_eq!(bank.snapshot().unwrap().entries_per_role, [0; 3]);
         }
         let lease = bank
@@ -2440,16 +2438,14 @@ mod tests {
         let retained = owner
             .upgrade()
             .expect("actual seed pin retained in quarantine");
-        assert!(
-            retained
-                .lock()
-                .unwrap()
-                .active
-                .as_ref()
-                .unwrap()
-                .seed
-                .is_some()
-        );
+        assert!(retained
+            .lock()
+            .unwrap()
+            .active
+            .as_ref()
+            .unwrap()
+            .seed
+            .is_some());
         // The test supplies a simulated actual fence; without it the owner is
         // intentionally retained. No new seed/admission follows this recovery.
         let recovered = PrivateSeedBank { inner: retained };
@@ -2608,13 +2604,11 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(lease.seed_provenance().unwrap().role, req.role);
-            assert!(
-                lease
-                    .seed_bits()
-                    .unwrap()
-                    .iter()
-                    .all(|bits| *bits == expected.to_bits())
-            );
+            assert!(lease
+                .seed_bits()
+                .unwrap()
+                .iter()
+                .all(|bits| *bits == expected.to_bits()));
             assert_eq!(consume(&lease)[0], expected * 0.5 + 0.25);
             lease
                 .complete_known(PhysicalSeedCompletion::Succeeded)
