@@ -14,6 +14,7 @@ pals-collection = ["dep:rz-uci"]
 pals-collection-onnx = ["pals-collection", "rz-uci/onnx-cpu"]
 native-cuda = ["dep:rz-uci", "rz-uci/onnx-cuda"]
 native-cuda-batch = ["native-cuda", "rz-uci/experimental-batch", "rz-eval/experimental-batch"]
+pals-followup-cuda-warm = ["native-cuda", "rz-uci/experimental-io-binding", "rz-eval/experimental-io-binding"]
 
 [[bin]]
 name = "rz-arena-fixture-engine"

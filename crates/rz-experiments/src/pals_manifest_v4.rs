@@ -14,6 +14,9 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod followup;
+pub use followup::*;
+
 pub const PALS_MANIFEST_V4_DOMAIN: &str = "rz-pals-execution-v4/1";
 pub const PALS_RECEIPT_V4_DOMAIN: &str = "rz-pals-receipt-v4/1";
 pub const PALS_V4_CONTRACT_REVISION: &str = "pals/0.2";
@@ -369,6 +372,8 @@ impl PalsModelSpecificationV4 {
         );
         require(
             (self.model_schema == PALS_V4_MODEL_SCHEMA
+                || (full_line && e.model.backend == PalsModelBackendV3::OrtCuda
+                    && self.model_schema == "rovezero.pals-private-cuda-warm.v2")
                 || (legacy && self.model_schema == "rovezero.pals-model.v1"))
                 && self.model_semantics
                     == if legacy {
@@ -572,6 +577,9 @@ impl PalsEndpointV4 {
         shared::component(&e.search)?;
         shared::component(&e.runtime)?;
         self.policies.validate_against(e, r, pilot)?;
+        require((self.model_v2.model_schema == "rovezero.pals-private-cuda-warm.v2")
+            == matches!(self.policies.cuda_warm,PalsCudaWarmPolicyV4::ApproxWarm(_)),
+            "CUDA Warm export schema requires its separately selected actual device owner")?;
         self.policy_identity.validate_against(self)?;
         e.binary.validate()?;
         require(
@@ -905,6 +913,8 @@ pub struct PalsArchiveObservationV4 {
     pub io_failures: u64,
     pub pin_saturation_failures: u64,
     pub cleanup_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_scope: Option<PalsArchiveActualScopeV4>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -920,6 +930,8 @@ pub struct PalsPausedStackObservationV4 {
     /// Resumed consumed work must never be counted a second time.
     pub replayed_consumed_work: u64,
     pub owner_released: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_scope: Option<PalsPausedStackActualScopeV4>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -944,6 +956,8 @@ pub struct PalsCudaWarmObservationV4 {
     pub rejected_seed_contexts: u64,
     pub fresh_value_evaluations: u64,
     pub buffers_released: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_scope: Option<PalsCudaWarmActualScopeV4>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -999,6 +1013,8 @@ pub struct PalsRecheckObservationV4 {
     pub resolution: PalsRecheckResolutionV4,
     /// Extra Fresh inputs are part of original physical NN accounting/budget.
     pub fresh_nn_inputs_charged: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_scope: Option<PalsRecheckActualScopeV4>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -1013,6 +1029,8 @@ pub struct PalsRepairTraceV4 {
     pub repair_ordinal: u32,
     pub evidence_sha256: String,
     pub recheck: PalsObservedV3<PalsRecheckObservationV4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_scope: Option<PalsRepairActualScopeV4>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -1029,6 +1047,10 @@ pub struct PalsEndpointReceiptV4 {
     pub repair_traces: Vec<PalsRepairTraceV4>,
     pub repair_trace_total: PalsObservedV3<u64>,
     pub pending_questions_peak: PalsObservedV3<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_admissions_peak: Option<PalsObservedV3<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_lifecycle: Option<PalsFollowupLifecycleScopeV4>,
 }
 impl PalsEndpointReceiptV4 {
     /// Wrap actual shared facts while explicitly leaving every new check unknown.
@@ -1044,6 +1066,8 @@ impl PalsEndpointReceiptV4 {
             repair_traces: Vec::new(),
             repair_trace_total: PalsObservedV3::Unknown,
             pending_questions_peak: PalsObservedV3::Unknown,
+            repair_admissions_peak: None,
+            followup_lifecycle: None,
         }
     }
 }
@@ -1260,17 +1284,22 @@ impl PalsArchiveObservationV4 {
         eligible: bool,
         failures: &BTreeSet<PalsPolicyFailureV4>,
     ) -> Result<(), ManifestError> {
+        if let Some(scope) = &self.actual_scope {
+            followup::validate_actual_archive(self, scope, l, eligible)?;
+        }
         require(
             self.owner_id > 0
-                && self.generation > 0
+                && (self.actual_scope.is_some() || self.generation > 0)
                 && self.integrity_verified_chunks <= self.committed_chunks
                 && self.integrity_verified_bytes <= self.committed_bytes
-                && self.ram_released_bytes <= self.integrity_verified_bytes
+                && (self.actual_scope.is_some()
+                    || self.ram_released_bytes <= self.integrity_verified_bytes)
                 && (self.pending_commit_bytes == 0 || self.pending_buffers_retained)
                 && self.loads_completed <= self.loads_requested
                 && self.owner_generation_checks >= self.loads_requested
-                && self.pinned_entries_peak <= self.index_entries_peak
-                && self.global_managed_bytes >= self.committed_bytes,
+                && (self.actual_scope.is_some()
+                    || (self.pinned_entries_peak <= self.index_entries_peak
+                        && self.global_managed_bytes >= self.committed_bytes)),
             "archive owner/generation/commit/integrity/RAM-release/pin accounting inconsistent",
         )?;
         policy_failure(
@@ -1327,6 +1356,9 @@ impl PalsPausedStackObservationV4 {
         eligible: bool,
         failures: &BTreeSet<PalsPolicyFailureV4>,
     ) -> Result<(), ManifestError> {
+        if let Some(scope) = &self.actual_scope {
+            followup::validate_actual_stack(self, scope, eligible)?;
+        }
         require(
             self.tokens_resumed
                 .checked_add(self.tokens_invalidated)
@@ -1361,6 +1393,9 @@ impl PalsCudaWarmObservationV4 {
         eligible: bool,
         failures: &BTreeSet<PalsPolicyFailureV4>,
     ) -> Result<(), ManifestError> {
+        if let Some(scope) = &self.actual_scope {
+            followup::validate_actual_warm(self, scope, o, eligible)?;
+        }
         if let Some(capability) =
             checked_observation(&self.capability, eligible || self.leases_admitted > 0)?
         {
@@ -1381,7 +1416,8 @@ impl PalsCudaWarmObservationV4 {
                 .checked_add(self.leases_quarantined)
                 .is_some_and(|n| n <= self.leases_admitted)
                 && self.seed_context_checked_consumptions == self.accepted_seed_consumptions
-                && self.accepted_seed_consumptions <= self.fresh_value_evaluations
+                && (self.actual_scope.is_some()
+                    || self.accepted_seed_consumptions <= self.fresh_value_evaluations)
                 && self.fresh_value_evaluations <= o.nn_inputs_completed
                 && (self.leases_admitted == 0 || self.leases_peak > 0),
             "CUDA Warm lease/accepted-seed/Fresh-value physical accounting inconsistent",
@@ -1416,6 +1452,9 @@ impl PalsCudaWarmObservationV4 {
 }
 impl PalsRecheckObservationV4 {
     fn validate_against(&self, e: &PalsEndpointV4) -> Result<(), ManifestError> {
+        if let Some(scope) = &self.actual_scope {
+            followup::validate_actual_recheck(self, scope, e)?;
+        }
         for value in [&self.before, &self.after] {
             match value {
                 PalsRecheckValueV4::Unknown => {}
@@ -1468,7 +1507,8 @@ impl PalsRecheckObservationV4 {
                 },
             ) => {
                 require(
-                    p == q && c == d && self.fresh_nn_inputs_charged == 2,
+                    p == q && c == d
+                        && (self.actual_scope.is_some() || self.fresh_nn_inputs_charged == 2),
                     "both Fresh WDL endpoints need the same perspective/context and two budgeted inputs",
                 )?;
                 (a[0] - a[2]).partial_cmp(&(b[0] - b[2]))
@@ -1502,7 +1542,7 @@ impl PalsRecheckObservationV4 {
                     .filter(|v| matches!(v, PalsRecheckValueV4::FrozenWdl { .. }))
                     .count() as u64;
                 require(
-                    self.fresh_nn_inputs_charged == fresh,
+                    self.actual_scope.is_some() || self.fresh_nn_inputs_charged == fresh,
                     "mixed/unknown recheck must retain only its actual Fresh NN cost",
                 )?;
                 None
@@ -1537,6 +1577,13 @@ fn validate_traces(
     eligible: bool,
     failures: &BTreeSet<PalsRunFailureV3>,
 ) -> Result<(), ManifestError> {
+    if o.followup_lifecycle.is_some() {
+        return followup::validate_actual_traces(o, p, eligible, failures);
+    }
+    require(o.repair_admissions_peak.is_none()
+        && o.repair_traces.iter().all(|t| t.actual_scope.is_none()
+            && observed(&t.recheck).is_none_or(|r| r.actual_scope.is_none())),
+        "actual followup evidence cannot inherit a historical synthetic scope")?;
     require(
         o.repair_traces.len() <= PALS_V4_REPAIR_TRACE_MAX,
         "repair trace collection exceeds bounded receipt capacity",
@@ -1724,6 +1771,9 @@ fn validate_endpoint(
     }
     match e {
         PalsEngineV4::Pals(p) => {
+            if let Some(scope) = &o.followup_lifecycle {
+                scope.validate_for(&p.policies, eligible)?;
+            }
             match &p.policies.cold_archive {
                 PalsColdArchivePolicyV4::Bounded(l) => {
                     if let Some(archive) = checked_observation(&o.archive, eligible)? {
@@ -1917,9 +1967,15 @@ impl PalsRunReceiptV4 {
                         })?;
                 }
                 if let Some(a) = observed(&o.archive) {
+                    let written = match &a.actual_scope {
+                        Some(scope) => scope.archive_write_bytes_total.ok_or_else(|| {
+                            ManifestError::Integrity("PALS V4: actual archive output extent unknown".into())
+                        })?,
+                        None => a.committed_bytes,
+                    };
                     accounted_output =
                         accounted_output
-                            .checked_add(a.committed_bytes)
+                            .checked_add(written)
                             .ok_or_else(|| {
                                 ManifestError::Integrity(
                                     "PALS V4: archive output byte overflow".into(),
@@ -2530,7 +2586,9 @@ mod tests {
                 after: frozen_value([0.1, 0.2, 0.7]),
                 resolution: PalsRecheckResolutionV4::BeforePreferred,
                 fresh_nn_inputs_charged: 2,
+                actual_scope: None,
             }),
+            actual_scope: None,
         }
     }
     #[test]
@@ -2620,6 +2678,7 @@ mod tests {
             io_failures: 0,
             pin_saturation_failures: 0,
             cleanup_complete: true,
+            actual_scope: None,
         };
         a.validate_against(&limits, true, &BTreeSet::new()).unwrap();
         a.integrity_verified_bytes = 0;
@@ -2670,6 +2729,7 @@ mod tests {
             stale_context_rejections: 1,
             replayed_consumed_work: 0,
             owner_released: true,
+            actual_scope: None,
         };
         s.validate_against(&limits, true, &BTreeSet::new()).unwrap();
         s.replayed_consumed_work = 1;
@@ -2715,6 +2775,7 @@ mod tests {
             rejected_seed_contexts: 0,
             fresh_value_evaluations: 0,
             buffers_released: false,
+            actual_scope: None,
         };
         let failures = BTreeSet::from([PalsPolicyFailureV4::CudaCompletionUnknown]);
         w.validate_against(&limits, &o, false, &failures).unwrap();

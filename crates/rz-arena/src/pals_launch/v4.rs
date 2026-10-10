@@ -8,6 +8,9 @@ use super::*;
 use rz_eval::pals_model::{PalsModelConfig, PalsModelProfile};
 use rz_experiments::*;
 
+mod followup;
+pub use followup::*;
+
 pub const PALS_ARENA_V4_DOMAIN: &str = "rz-pals-arena-launch-v4/1";
 pub const PALS_NATIVE_STARTUP_V4_DOMAIN: &str = "rz-pals-native-startup-v4/1";
 pub const PALS_NATIVE_TERMINATION_V4_DOMAIN: &str = "rz-pals-native-termination-v4/1";
@@ -45,6 +48,8 @@ pub struct PalsArenaLaunchV4 {
     pub opening_artifact: ArtifactRef,
     pub endpoints: [PalsEndpointLaunchV3; 2],
     pub budget: NativeResourceBudgetV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_execution: Option<PalsFollowupExecutionBindingV4>,
 }
 #[derive(Clone, Debug)]
 pub struct LockedPalsArenaLaunchV4 {
@@ -52,6 +57,8 @@ pub struct LockedPalsArenaLaunchV4 {
     sha256: String,
     opening: OpeningSpec,
     endpoint_views: [ExternalUciEndpointV2; 2],
+    #[cfg(target_os = "linux")]
+    archive_roots: std::sync::Arc<std::sync::Mutex<BTreeMap<usize,followup::ArchiveRootPins>>>,
 }
 fn requested_options(engine: &PalsEngineV4) -> &BTreeMap<String, String> {
     match engine {
@@ -69,7 +76,7 @@ fn config(e: &PalsEndpointV4) -> PalsModelConfig {
     };
     PalsModelConfig::for_profile(profile)
 }
-fn policy_arguments(e: &PalsEndpointV4) -> Result<Vec<String>, ArenaError> {
+fn policy_arguments(e: &PalsEndpointV4, binding: Option<&PalsEndpointExecutionBindingV4>) -> Result<Vec<String>, ArenaError> {
     if let PalsIterativeRepairPolicyV4::Bounded(l) = &e.policies.iterative_repair {
         require(
             l.max_repairs_per_first_move == 3 && l.max_pending_questions == 64,
@@ -92,7 +99,7 @@ fn policy_arguments(e: &PalsEndpointV4) -> Result<Vec<String>, ArenaError> {
                 PalsResolverPolicyV4::ModelWdl => "model-wdl-restricted",
             }
         ),
-        "--pals-cuda-private-warm=false".into(),
+        format!("--pals-cuda-private-warm={}", matches!(e.policies.cuda_warm, PalsCudaWarmPolicyV4::ApproxWarm(_))),
     ];
     if e.base.cpu_r.is_own() {
         args.push(format!(
@@ -113,16 +120,7 @@ fn policy_arguments(e: &PalsEndpointV4) -> Result<Vec<String>, ArenaError> {
         }
         _ => return Err(invalid("iterative repair requires frozen WDL recheck")),
     }
-    // CUDA Warm/archive require actual native capability and owner plumbing.
-    // Unsupported non-default selections fail before snapshot/spawn.
-    require(
-        matches!(e.policies.cuda_warm, PalsCudaWarmPolicyV4::Disabled),
-        "CUDA ApproxWarm arena launch capability is not registered by this executable; no host or CPU fallback",
-    )?;
-    require(
-        matches!(e.policies.cold_archive, PalsColdArchivePolicyV4::Disabled),
-        "cold archive arena owner binding must be explicitly registered before launch",
-    )?;
+    args.extend(followup::selected_policy_arguments(e,binding)?);
     Ok(args)
 }
 
@@ -160,6 +158,18 @@ impl PalsArenaValidationContext for LockedPalsArenaLaunchV4 {
     }
     fn native_wire_version(&self) -> u32 {
         4
+    }
+    fn native_receipt_byte_cap(&self,role:NativeEngineRole)->usize {
+        if self.input.execution_binding(role_index(role)).is_some(){256*1024}else{128*1024}
+    }
+    fn device_public_memory_selected(&self,role:NativeEngineRole)->bool {
+        self.input.execution_binding(role_index(role)).and_then(|b|b.cuda_warm.as_ref()).is_some()
+    }
+    fn shared_role_layout(&self,role:NativeEngineRole)->&str {
+        self.input.execution_binding(role_index(role)).and_then(|b|b.cuda_warm.as_ref()).map_or("shared_pc_if",|w|w.layout.as_str())
+    }
+    fn validate_selected_private_execution(&self,role:NativeEngineRole,record:&serde_json::Value)->Result<(),ArenaError> {
+        followup::validate_selected_private_execution(self,role,record)
     }
     fn native_wire_domains(&self) -> (&'static str, &'static str) {
         (
@@ -467,11 +477,12 @@ impl PalsArenaLaunchV4 {
         }
         let b = self.budget;
         let unique = self.unique_input_bytes()?;
+        let output_cap = self.validate_followup_execution()?;
         require(
             unique <= b.max_input_bytes
                 && b.max_input_bytes > 0
                 && b.max_output_bytes > V4_METADATA_CAP
-                && b.max_output_bytes <= 64 * 1024 * 1024
+                && b.max_output_bytes <= output_cap
                 && b.max_output_bytes <= m.output_bytes_max
                 && b.max_runtime_bytes > 0
                 && b.max_runtime_bytes <= 10 * 1024 * 1024 * 1024
@@ -497,7 +508,7 @@ impl PalsArenaLaunchV4 {
         for i in 0..2 {
             self.endpoint(i)?;
             if let PalsEngineV4::Pals(e) = &m.engines[i] {
-                policy_arguments(e)?;
+                policy_arguments(e,self.execution_binding(i))?;
                 require(
                     e.model_v2.arena_candidate(),
                     "diagnostic checkpoint/export cannot enter arena",
@@ -564,6 +575,8 @@ impl PalsArenaLaunchV4 {
             sha256: crate::canonical_sha256(self)?,
             opening: self.opening(),
             endpoint_views: [self.endpoint(0)?, self.endpoint(1)?],
+            #[cfg(target_os = "linux")]
+            archive_roots: Default::default(),
         })
     }
     pub fn runner_status_patch(&self) -> Result<PalsRunnerStatusPatchV3, ArenaError> {
@@ -912,7 +925,7 @@ impl PalsArenaLaunchV4 {
                             "--pals-cuda-session-arena-bytes={}",
                             cuda.session_arena_bytes
                         ),
-                        "--pals-device-public-memory=false".into(),
+                        format!("--pals-device-public-memory={}", matches!(e.policies.cuda_warm, PalsCudaWarmPolicyV4::ApproxWarm(_))),
                     ]);
                     if let Some(control) = &cuda.cuda_control {
                         control.inventory.validate()?;
@@ -1088,7 +1101,7 @@ impl PalsArenaLaunchV4 {
             _ => return Err(invalid("semantic endpoint and executable recipe differ")),
         };
         if let PalsEngineV4::Pals(e) = &m.engines[i] {
-            arguments.extend(policy_arguments(e)?);
+            arguments.extend(policy_arguments(e,self.execution_binding(i))?);
         } else if matches!(self.endpoints[i], PalsEndpointLaunchV3::OwnCpu { .. }) {
             arguments.push("--pals-arena-wire=v4".into());
         }
@@ -1240,7 +1253,15 @@ impl LockedPalsArenaLaunchV4 {
             _ => return Err(invalid("no native checkpoint identity")),
         };
         let shared = n.graphs.iter().any(|g| g.role == "shared_pc");
-        let layout_valid = if shared {
+        let warm = self.input.execution_binding(role_index(role)).and_then(|b|b.cuda_warm.as_ref());
+        let layout_valid = if let Some(warm) = warm {
+            shared && value["schema"] == warm.export_schema
+                && value["layout"] == warm.layout && value["layout_revision"] == warm.layout_revision
+                && value["query_semantics"] == warm.query_semantics
+                && value["execution_domain"] == warm.execution_domain
+                && value["model_semantics"] == v4.model_v2.model_semantics
+                && value["batch_mode"] == "one_scalar_role_and_one_scalar_mode_per_physical_batch"
+        } else if shared {
             value["schema"] == "rovezero.pals-model.v2"
                 && value["layout"] == "shared_pc_if"
                 && value["layout_revision"] == 1
@@ -1515,6 +1536,7 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV4 {
         if let Some(profile) = self.cuda_profile_argument(role, runtime_root)? {
             arguments.push(profile);
         }
+        arguments.extend(self.archive_runtime_arguments(role,runtime_root)?);
         Ok(arguments)
     }
     fn uses_separate_preflight_runtime_root(
@@ -1578,6 +1600,7 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV4 {
                 .into(),
             ]);
         }
+        arguments.extend(self.archive_existing_arguments(role)?);
         Ok(arguments)
     }
 }
@@ -2390,6 +2413,9 @@ fn collect_process_work_with_audits(
             .to_str()
             .ok_or_else(|| invalid("non-UTF8 runtime slot"))?;
         if name == "runtime-cache" && native {
+            continue;
+        }
+        if name == "cold-archive-managed" && lock.input.execution_binding(role_index(role)).and_then(|b|b.cold_archive.as_ref()).is_some() {
             continue;
         }
         require(
@@ -3267,6 +3293,7 @@ mod tests {
             opening_artifact: old.opening_artifact,
             endpoints: old.endpoints,
             budget: old.budget,
+            followup_execution: None,
         }
     }
     #[test]

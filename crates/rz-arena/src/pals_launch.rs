@@ -3759,6 +3759,12 @@ trait PalsArenaValidationContext: NativeLaunchDeclaration {
     ) -> Result<Option<(&PalsExternalCpuRV3, &PalsExternalCpuRLaunchV3)>, ArenaError>;
     fn native_wire_version(&self) -> u32;
     fn native_wire_domains(&self) -> (&'static str, &'static str);
+    fn native_receipt_byte_cap(&self, _role: NativeEngineRole) -> usize {128 * 1024}
+    fn device_public_memory_selected(&self, _role: NativeEngineRole) -> bool {false}
+    fn shared_role_layout(&self, _role: NativeEngineRole) -> &str {"shared_pc_if"}
+    fn validate_selected_private_execution(&self, _role: NativeEngineRole, record:&serde_json::Value) -> Result<(),ArenaError> {
+        require_no_undeclared_private_warm(record)
+    }
     #[cfg(target_os = "linux")]
     fn native_wire_filenames(&self) -> (&'static str, &'static str);
     fn validate_policy_pair(
@@ -3847,7 +3853,7 @@ fn validate_pals_native_records_inner<L: PalsArenaValidationContext>(
     game: bool,
 ) -> Result<(PalsNativeSessionAuditV3, u32), ArenaError> {
     require(
-        startup.len() <= 128 * 1024 && termination.len() <= 128 * 1024,
+        startup.len() <= lock.native_receipt_byte_cap(role) && termination.len() <= lock.native_receipt_byte_cap(role),
         "native receipt budget exceeded",
     )?;
     let s = json(startup)?;
@@ -3904,7 +3910,7 @@ fn validate_pals_native_records_inner<L: PalsArenaValidationContext>(
                 && record["host_record_page_observation"].is_null(),
             "unsupported undeclared host record-page execution/observation: the arena lock registers the whole-input public graph only",
         )?;
-        require_no_undeclared_private_warm(record)?;
+        lock.validate_selected_private_execution(role,record)?;
     }
     let cuda_record_pages = validate_cuda_record_pages_pair(cuda, sn, tn)?;
     if lock.external_binding(role)?.is_some() {
@@ -3966,7 +3972,7 @@ fn validate_pals_native_records_inner<L: PalsArenaValidationContext>(
             execution["provider"] == "cuda"
                 && execution["device_id"] == cuda.device_id
                 && execution["session_arena_bytes"] == cuda.session_arena_bytes
-                && execution["device_public_memory"] == false
+                && execution["device_public_memory"] == lock.device_public_memory_selected(role)
                 && array_hash(&execution["runtime_sha256"])? == native.runtime.sha256
                 && array_hash(&execution["runtime_bundle_sha256"])?
                     == cuda.cuda_bundle.canonical_sha256,
@@ -4167,7 +4173,7 @@ fn validate_pals_native_records_inner<L: PalsArenaValidationContext>(
             && sn["residency"]["native_sessions"] == native.graphs.len()
             && graphs.len() == native.graphs.len()
             && if shared {
-                sn["residency"]["layout"] == "shared_pc_if"
+                sn["residency"]["layout"] == lock.shared_role_layout(role)
                     && sn["residency"]["role_reader_weights_shared"].is_null()
             } else {
                 sn["residency"]["role_reader_weights_shared"] == false
