@@ -16,7 +16,9 @@
 //! role forward(기본 64),
 //! 작업 60초 + 정리 30초, 단일 JSON 산출물 128 MiB로 제한한다. 부모 감독자는
 //! 프로세스/파이프에도 90초/128 MiB 상한을 적용해야 한다. 이 파일은 GPU 실행을
-//! 예약하거나 export/reference를 생성하지 않는다. capture의 실행 검사와 별도의
+//! 예약하거나 export/reference를 생성하지 않는다. --runtime-output-root는 기존
+//! caller-owned RuntimeCache의 root이며 capture 산출물 디렉터리와 분리한다.
+//! capture의 실행 검사와 별도의
 //! CPU Torch/ORT seeded reference 검사를 분리하고 최종 passed는 둘 다 요구한다.
 //! scenario.execution_profile은 actual_opponent_continuation_v1(기본) 또는
 //! iterative_frozen_model_wdl_v2다. 같은 실제 search 안에서 중단 CPU stack,
@@ -45,7 +47,7 @@ mod check {
     use rz_eval::pals_model::{PalsModelConfig, PalsModelInput, PalsModelProfile, PalsRawOutput};
     use rz_eval::pals_onnx::{PRIVATE_CUDA_WARM_SCHEMA, PalsCudaControlPolicy, PalsOnnxConfig};
     use rz_eval::pals_private::{PrivateInvocation, PrivateSeedProvenance};
-    use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeLibraryPin};
+    use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeCache};
     use rz_position::{BoardMove, Position, PositionIdentity, PositionSnapshot};
     use rz_search::cpu::{
         CpuCapabilities, CpuConfig, CpuEngine, CpuError, CpuLimits, CpuProfile, CpuReport,
@@ -1764,12 +1766,11 @@ mod check {
                 .map_err(|_| fail("runtime", "bundle_utf8_invalid"))?,
         )
         .map_err(|_| fail("runtime", "bundle_invalid"))?;
-        let pin = RuntimeLibraryPin::copy_cuda_bundle(
-            &args.path("--runtime-root")?,
-            &args.path("--runtime-output-root")?,
-            &spec,
-        )
-        .map_err(|_| fail("runtime", "bundle_pin_failed"))?;
+        let runtime_cache = RuntimeCache::open(&args.path("--runtime-output-root")?)
+            .map_err(|_| fail("runtime", "runtime_cache_unavailable"))?;
+        let pin = runtime_cache
+            .cuda_bundle(&args.path("--runtime-root")?, &spec)
+            .map_err(|_| fail("runtime", "bundle_pin_failed"))?;
         require(Instant::now() < deadline, "runtime", "deadline_after_pin")?;
         let runtime =
             OrtRuntime::load(&pin).map_err(|_| fail("runtime", "full_cuda_bootstrap_failed"))?;
@@ -2126,6 +2127,7 @@ mod check {
                 "resolver_implementation_sha256_hex": hex(&rz_search::pals::engine::compiled_resolver_implementation_sha256())},
             "export_manifest_sha256_hex": args.value("--export-manifest-sha256")?,
             "scenario_sha256_hex": args.value("--scenario-sha256")?, "cuda_bundle_manifest_sha256_hex": args.value("--cuda-bundle-sha256")?,
+            "runtime_storage": pin.storage(),
             "first_proposer_fresh_checked": first_p_fresh, "first_critic_fresh_checked": first_c_fresh,
             "all_observed_value_calls_fresh_checked": all_value_fresh,
             "fresh_vs_seeded_equality_required": false, "same_seed_independent_reference_required": true,
