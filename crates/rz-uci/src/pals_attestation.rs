@@ -10,6 +10,7 @@ use crate::{
 use serde::Serialize;
 use std::path::Path;
 pub mod checker;
+pub mod followup;
 
 pub const STARTUP_FILE: &str = "pals-native-startup.v3.json";
 pub const TERMINATION_FILE: &str = "pals-native-termination.v3.json";
@@ -152,6 +153,8 @@ pub struct PalsNativeReceiptV4 {
     /// None preserves a failure before a search driver was constructed; no
     /// requested selection is promoted into an actual driver observation.
     pub v4: Option<PalsFollowupMarkerV4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_lifecycle: Option<followup::PalsFollowupLifecycleV4>,
 }
 
 /// Existing private root, fresh process slot, fixed names, bounded encoding,
@@ -167,6 +170,7 @@ pub struct PalsReceiptWriter {
     cpu_checker: Option<checker::PalsCheckerProcessReceipt>,
     v4: bool,
     followup: Option<PalsFollowupMarkerV4>,
+    followup_lifecycle: Option<followup::PalsFollowupLifecycleV4>,
 }
 #[cfg(feature = "onnx-cpu")]
 impl PalsReceiptWriter {
@@ -248,6 +252,7 @@ impl PalsReceiptWriter {
             cpu_checker: None,
             v4,
             followup,
+            followup_lifecycle: None,
         })
     }
     pub fn observe_checker(
@@ -264,6 +269,15 @@ impl PalsReceiptWriter {
             ));
         }
         self.cpu_checker = Some(observation);
+        Ok(())
+    }
+    pub fn set_followup_lifecycle(
+        &mut self, snapshot: Option<followup::PalsFollowupLifecycleV4>,
+    ) -> Result<(), ProcessReceiptError> {
+        if !self.v4 && snapshot.is_some() {
+            return Err(ProcessReceiptError::boundary("followup owner evidence requires the explicit V4 envelope"));
+        }
+        self.followup_lifecycle = snapshot;
         Ok(())
     }
     fn envelope(
@@ -391,6 +405,7 @@ impl PalsReceiptWriter {
             self.writer.publish_termination(&PalsNativeReceiptV4 {
                 evidence: receipt,
                 v4: self.followup.clone(),
+                followup_lifecycle: self.followup_lifecycle.clone(),
             })
         } else {
             self.writer.publish_termination(&receipt)
@@ -416,6 +431,7 @@ impl PalsReceiptWriter {
             self.writer.publish_startup(&PalsNativeReceiptV4 {
                 evidence: receipt,
                 v4: self.followup.clone(),
+                followup_lifecycle: self.followup_lifecycle.clone(),
             })
         } else {
             self.writer.publish_startup(&receipt)
@@ -569,6 +585,8 @@ pub struct SearchWorkReceiptV4 {
     #[serde(flatten)]
     pub evidence: SearchWorkReceiptV3,
     pub v4: Option<PalsFollowupMarkerV4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_lifecycle: Option<followup::PalsFollowupLifecycleV4>,
 }
 pub struct SearchWorkReceiptWriter {
     writer: ProcessReceiptWriter,
@@ -577,6 +595,7 @@ pub struct SearchWorkReceiptWriter {
     binary_sha256: String,
     v4: bool,
     followup: Option<PalsFollowupMarkerV4>,
+    followup_lifecycle: Option<followup::PalsFollowupLifecycleV4>,
 }
 impl SearchWorkReceiptWriter {
     pub fn open(
@@ -649,7 +668,17 @@ impl SearchWorkReceiptWriter {
             binary_sha256,
             v4,
             followup,
+            followup_lifecycle: None,
         })
+    }
+    pub fn set_followup_lifecycle(
+        &mut self, snapshot: Option<followup::PalsFollowupLifecycleV4>,
+    ) -> Result<(), ProcessReceiptError> {
+        if !self.v4 && snapshot.is_some() {
+            return Err(ProcessReceiptError::boundary("followup owner evidence requires the explicit V4 envelope"));
+        }
+        self.followup_lifecycle = snapshot;
+        Ok(())
     }
     fn envelope(
         &self,
@@ -686,6 +715,7 @@ impl SearchWorkReceiptWriter {
             self.writer.publish_startup(&SearchWorkReceiptV4 {
                 evidence: receipt,
                 v4: self.followup.clone(),
+                followup_lifecycle: self.followup_lifecycle.clone(),
             })
         } else {
             self.writer.publish_startup(&receipt)
@@ -710,6 +740,7 @@ impl SearchWorkReceiptWriter {
             self.writer.publish_termination(&SearchWorkReceiptV4 {
                 evidence: receipt,
                 v4: self.followup.clone(),
+                followup_lifecycle: self.followup_lifecycle.clone(),
             })
         } else {
             self.writer.publish_termination(&receipt)

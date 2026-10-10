@@ -753,6 +753,33 @@ impl PrivateSeedBank {
         result
     }
 
+    /// Close this same-game bank after the caller's actual physical owner
+    /// fence. This method does not produce that fence or change the game. A
+    /// refused close preserves all seed storage and permanently closes new
+    /// admission; live leases, provisional seeds and outside pins cannot be
+    /// discarded to manufacture release evidence.
+    pub fn close_after_known_fence(&self) -> Result<PrivateSeedSnapshot, PrivateSeedError> {
+        let mut state = lock(&self.inner)?;
+        state.admission_closed = true;
+        let result = (|| {
+            if state.quarantine_owner.is_some()
+                || state.active.as_ref().is_some_and(|active| active.unknown)
+            { return Err(PrivateSeedError::PhysicalCompletionUnknown); }
+            if state.active.is_some() { return Err(PrivateSeedError::ActivePhysicalLease); }
+            if state.pending.is_some() { return Err(PrivateSeedError::PendingFinalization); }
+            if state.slots.iter().flatten().any(|seed| Arc::strong_count(seed) != 1) {
+                return Err(PrivateSeedError::PhysicalCompletionUnknown);
+            }
+            for role in &mut state.slots { role.clear(); }
+            state.bank_bytes = state.base_bytes;
+            Ok(())
+        })();
+        if let Err(error) = result { state.last_failure = Some(error); }
+        drop(state);
+        result?;
+        self.snapshot()
+    }
+
     pub fn snapshot(&self) -> Result<PrivateSeedSnapshot, PrivateSeedError> {
         let state = lock(&self.inner)?;
         Ok(PrivateSeedSnapshot {

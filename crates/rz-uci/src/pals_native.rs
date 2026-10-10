@@ -184,6 +184,17 @@ pub fn pals_fresh_encoding_semantic_digest_for_config(config: &PalsModelConfig) 
 pub fn pals_native_source_digest() -> [u8; 32] {
     Sha256::digest(include_bytes!("pals_native.rs")).into()
 }
+#[cfg(feature = "onnx-cpu")]
+pub fn pals_native_private_warm_source_digest() -> [u8; 32] { private_warm::source_digest() }
+#[cfg(feature = "experimental-io-binding")]
+pub fn pals_native_cuda_warm_adapter_source_digest() -> [u8; 32] {
+    let mut hash=Sha256::new();
+    hash.update(b"rz-pals-native-private-warm-adapter/1");
+    hash.update(pals_native_source_digest());
+    hash.update(private_warm::source_digest());
+    hash.update(rz_eval::pals_onnx::cuda_private_warm_implementation_digest());
+    hash.finalize().into()
+}
 /// Shape compatibility alone does not prove that a model was trained on the
 /// same feature meanings. This pin verifies the declared Rules transformation;
 /// actual learned-input suitability still needs separate data/model evidence.
@@ -737,7 +748,7 @@ mod native {
     use rz_search::pals::engine::{
         MODEL_WDL_VALUE_SEMANTICS, ModelValueIdentity, ModelValueOutput, RecheckFinished,
         RecheckPrepared, RoleAcceptance, RoleEvaluation, RoleLogicalContext, RoleModel,
-        RoleQueryPurpose, RoleSearchClosure,
+        RoleQueryPurpose, RoleSearchClosure, RoleValueExecutionEvidence,
     };
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -840,6 +851,10 @@ mod native {
         last_observer_failure: Mutex<Option<NativeFailureReceipt>>,
         // One actual submitted role lease, never a high-water reconstruction.
         role_execution: Mutex<Option<ObservedRoleExecution>>,
+        // V4-only accounting is selected before admission. It changes no
+        // model input and adds no second NN or Stats-control invocation.
+        followup_evidence: AtomicBool,
+        prepared_perspective: Mutex<Option<(RequestId, rz_contracts::Color)>>,
         private_warm: Option<NativeWarmOwner>,
         warm_admission: Mutex<Option<WarmAdmission>>,
     }
@@ -956,6 +971,14 @@ mod native {
     struct NativeWarmOwner {
         capability: NativeWarmCapability,
         state: Arc<NativeWarmState>,
+        #[cfg(feature="experimental-io-binding")]
+        observer: Option<rz_eval::pals_onnx::PalsCudaWarmObservationHandle>,
+    }
+    #[derive(Clone,Copy,Debug,Eq,PartialEq)]
+    pub struct NativeCudaWarmObservationLimits {
+        pub max_leases:u32,
+        /// Explicit owned CUDA K/V payload limit; excludes ORT workspace.
+        pub device_bytes_max:u64,
     }
     /// A single prepared physical handoff. Dropping it without real Ready
     /// conservatively retains the bank, frozen query and full backup payload.
@@ -1035,6 +1058,12 @@ mod native {
         ready_observed: bool,
         // The first secondary observer failure survives pending/unknown work.
         observer_error: Option<RoleError>,
+        prepared_state: rz_contracts::StateIdentity,
+        prepared_perspective: Option<rz_contracts::Color>,
+        input_sha256: [u8; 32],
+        fresh: Option<bool>,
+        completed_nn_inputs: Option<u64>,
+        measurement_complete: bool,
     }
     /// Optional bounded collector. All callbacks run on the calling/search
     /// thread and use its clock; startup probe inputs never enter this stream.
@@ -3493,6 +3522,8 @@ mod native {
                     .take()
                     .ok_or_else(|| fault(ErrorCode::BackendFailure, "PALS warm payload missing"))?
                     .command()
+            } else if self.owner.followup_evidence.load(Ordering::Acquire) {
+                PalsNativeCommand::EvaluateWithEvidence(request.role().state.as_ref().clone())
             } else {
                 // Default Fresh ownership/serialization is unchanged.
                 PalsNativeCommand::Evaluate(request.role().state.as_ref().clone())
@@ -3529,6 +3560,12 @@ mod native {
                 request: lease.request.role().id,
                 execution: lease.execution,
             };
+            let prepared_perspective = self.owner.prepared_perspective.lock().ok()
+                .and_then(|slot| slot.filter(|(id, _)| *id == binding.request).map(|(_, color)| color));
+            let fresh = lease.warm.as_ref().map_or(Some(true), |warm| {
+                warm.physical.as_ref().and_then(|physical| physical.invocation().ok())
+                    .map(|invocation| matches!(invocation, rz_eval::pals_private::PrivateInvocation::Fresh { .. }))
+            });
             *self
                 .owner
                 .role_execution
@@ -3538,6 +3575,12 @@ mod native {
                 unknown_observed: false,
                 ready_observed: false,
                 observer_error: None,
+                prepared_state: lease.request.role().state_identity,
+                prepared_perspective,
+                input_sha256: lease.request.role().key.input.0,
+                fresh,
+                completed_nn_inputs: None,
+                measurement_complete: false,
             });
             if let Err(error) = self
                 .owner
@@ -3593,6 +3636,17 @@ mod native {
             if let Err(error) = &result {
                 self.owner.remember_failure(error);
             }
+            if let Ok(PalsNativeResult::EvaluationWithEvidence { outcome, actual_completed_nn_inputs_delta, complete }) = &result {
+                if let Err(error) = outcome {
+                    self.owner.remember_failure(error);
+                }
+                if let Ok(mut observed) = self.owner.role_execution.lock()
+                    && let Some(observed) = observed.as_mut().filter(|o| o.binding == binding)
+                {
+                    observed.completed_nn_inputs = *actual_completed_nn_inputs_delta;
+                    observed.measurement_complete = *complete;
+                }
+            }
             if let Err(error) = self
                 .owner
                 .observe_role_terminal(binding, NativeRoleTerminal::Ready(result.as_ref()))
@@ -3607,6 +3661,13 @@ mod native {
                             lease.request.role().id,
                             Ok(raw),
                             &self.owner.execution_receipt(),
+                        )
+                    })
+                }
+                Ok(PalsNativeResult::EvaluationWithEvidence { outcome, .. }) => {
+                    self.owner.observe("physical_return", |observer| {
+                        observer.physically_completed_with_execution(
+                            lease.request.role().id, outcome.as_ref(), &self.owner.execution_receipt(),
                         )
                     })
                 }
@@ -3628,6 +3689,17 @@ mod native {
                     self.owner.completed.fetch_add(1, Ordering::AcqRel);
                     Ok(raw)
                 }
+                Ok(PalsNativeResult::EvaluationWithEvidence { outcome, .. }) => match outcome {
+                    Ok(raw) => {
+                        self.owner.completed.fetch_add(1, Ordering::AcqRel);
+                        Ok(raw)
+                    }
+                    Err(_) => {
+                        self.owner.physical_failed.fetch_add(1, Ordering::AcqRel);
+                        Err(fault(ErrorCode::BackendFailure,
+                            "PALS native role execution failed after physical completion"))
+                    }
+                },
                 Ok(_) => {
                     self.owner.validation_failed.fetch_add(1, Ordering::AcqRel);
                     Err(fault(
@@ -3753,6 +3825,7 @@ mod native {
         startup_attempted: bool,
         startup_probe_configured: bool,
         delivered_request: Option<RequestId>,
+        last_value_execution: Option<RoleValueExecutionEvidence>,
         startup_loading_elapsed_ns: Option<u64>,
         startup_clock: Option<Instant>,
         startup_diagnostic: Option<NativeStartupFailureDiagnostic>,
@@ -3760,6 +3833,52 @@ mod native {
         cpu_invocation_load_interval: Option<(Instant, Instant)>,
     }
     impl NativeRoleModel {
+        /// Enable metadata from the same physical execution before the first
+        /// startup/search admission. Legacy callers keep the Evaluate wire.
+        pub fn enable_followup_execution_evidence(&mut self) -> Result<(), RoleError> {
+            if self.sequence != 0 || self.startup_attempted
+                || self.owner.in_flight.load(Ordering::Acquire) != 0
+                || self.owner.finishing.load(Ordering::Acquire)
+                || self.owner.shutdown.load(Ordering::Acquire)
+                || self.owner.followup_evidence.swap(true, Ordering::AcqRel)
+            {
+                return Err(RoleError::Backend("followup evidence must be selected once before admission".into()));
+            }
+            Ok(())
+        }
+        fn capture_value_execution(
+            &mut self,
+            context: &RoleLogicalContext,
+            output: &ModelValueOutput,
+        ) {
+            self.last_value_execution = None;
+            if !self.owner.followup_evidence.load(Ordering::Acquire) {
+                return;
+            }
+            let Ok(observation) = self.owner.role_execution.try_lock() else { return; };
+            let Some(observation) = observation.as_ref().filter(|observation| {
+                Some(observation.binding.request) == self.delivered_request
+                    && observation.input_sha256 == output.input_sha256
+                    && output.identity.model_epoch == self.model_epoch
+            }) else { return; };
+            let Some(prepared_perspective) = observation.prepared_perspective else { return; };
+            self.last_value_execution = Some(RoleValueExecutionEvidence {
+                request: observation.binding.request,
+                execution: observation.binding.execution,
+                prepared_state: observation.prepared_state,
+                prepared_perspective,
+                input_sha256: observation.input_sha256,
+                model_epoch: self.model_epoch,
+                context: context.into(),
+                fresh: observation.fresh,
+                physically_completed: observation.ready_observed.then_some(true),
+                completed_nn_inputs: observation.completed_nn_inputs,
+                complete: observation.ready_observed && !observation.unknown_observed
+                    && observation.measurement_complete
+                    && observation.completed_nn_inputs.is_some()
+                    && observation.fresh == Some(true),
+            });
+        }
         pub fn load_pinned(
             export: &std::path::Path,
             expected_export_sha256: &str,
@@ -3856,6 +3975,7 @@ mod native {
                 options,
                 None,
                 Some(&mut finish),
+                None,
             )
             .map_err(|cause| {
                 budget.failure(NativeLoadStage::OwnerConstruction, cause, cancel, finish)
@@ -4030,6 +4150,12 @@ mod native {
         ) -> Result<Self, RoleError> {
             Self::new_with_optional_cuda_record_pages(backend, options, None)
         }
+        #[cfg(feature="experimental-io-binding")]
+        pub fn new_with_cuda_warm_observations(
+            backend:PalsOnnxBackend, options:NativeOwnerOptions, limits:NativeCudaWarmObservationLimits,
+        )->Result<Self,RoleError> {
+            Self::new_with_optional_cuda_record_pages_and_capture(backend,options,None,None,Some(limits))
+        }
         /// Explicit resident factory for the OwnCPU product path. External CPU
         /// helpers are unsupported by this selection and must be refused before
         /// model loading by the caller. No caller namespace or epoch is accepted.
@@ -4084,6 +4210,7 @@ mod native {
                 options,
                 registration,
                 None,
+                None,
             )
         }
         fn new_with_optional_cuda_record_pages_and_capture(
@@ -4091,6 +4218,7 @@ mod native {
             options: NativeOwnerOptions,
             registration: Option<NativeCudaRecordPagesRegistration>,
             finish_capture: Option<&mut Option<NativeRoleFinishHandle>>,
+            warm_observation_limits:Option<NativeCudaWarmObservationLimits>,
         ) -> Result<Self, RoleError> {
             options.validate(&backend.config())?;
             let drain_limit = options.drain_limit;
@@ -4161,6 +4289,19 @@ mod native {
                     .map_err(model_error)?;
             }
             let execution = execution_receipt(&backend)?;
+            #[cfg(not(feature="experimental-io-binding"))]
+            if warm_observation_limits.is_some() {return Err(RoleError::Unavailable);}
+            #[cfg(feature="experimental-io-binding")]
+            let warm_observer=warm_observation_limits.map(|limits| {
+                if limits.max_leases!=1 || limits.device_bytes_max==0
+                    || limits.device_bytes_max>execution.execution_device_reservation()
+                    || !matches!(warm_capability,Some(NativeWarmCapability::Cuda(_))) {
+                    return Err(RoleError::InvalidOutput);
+                }
+                backend.enable_cuda_private_warm_observations(rz_eval::pals_onnx::PalsCudaWarmRuntimeLimits {
+                    max_leases:limits.max_leases,device_bytes_max:limits.device_bytes_max,
+                }).map_err(model_error)
+            }).transpose()?;
             let page_reservation = execution
                 .host_record_pages
                 .as_ref()
@@ -4313,7 +4454,14 @@ mod native {
                 .map(|capability| {
                     capability
                         .state(game)
-                        .map(|state| NativeWarmOwner { capability, state })
+                        .and_then(|state| {
+                            #[cfg(feature="experimental-io-binding")]
+                            if warm_observer.is_some() {state.enable_followup_observations()?;}
+                            Ok(NativeWarmOwner { capability,state,
+                                #[cfg(feature="experimental-io-binding")]
+                                observer:warm_observer,
+                            })
+                        })
                 })
                 .transpose()?;
             let clock = ContractSystemClock::new(epoch);
@@ -4399,6 +4547,8 @@ mod native {
                 observer_failures: AtomicU64::new(0),
                 last_observer_failure: Mutex::new(None),
                 role_execution: Mutex::new(None),
+                followup_evidence: AtomicBool::new(false),
+                prepared_perspective: Mutex::new(None),
                 private_warm,
                 warm_admission: Mutex::new(None),
             });
@@ -4451,6 +4601,7 @@ mod native {
                 startup_attempted: false,
                 startup_probe_configured: false,
                 delivered_request: None,
+                last_value_execution: None,
                 startup_loading_elapsed_ns: None,
                 startup_clock: None,
                 startup_diagnostic: None,
@@ -4476,9 +4627,14 @@ mod native {
                 ..
             }) = &self.owner.private_warm
             {
-                return PalsCudaWarmInput::fresh(cap, input)
-                    .map(PalsNativeCommand::EvaluateCudaWarm)
-                    .map_err(model_error);
+                let mut payload=PalsCudaWarmInput::fresh(cap,input).map_err(model_error)?;
+                if let Some(observer)=self.owner.private_warm.as_ref().and_then(|warm|warm.observer.as_ref()) {
+                    payload.bind_execution_observation(observer,rz_eval::pals_onnx::PalsCudaWarmExecutionBinding {
+                        backend_owner_id:observer.owner_id(),purpose:rz_eval::pals_onnx::PalsCudaWarmInvocationPurpose::Startup,
+                        request:None,execution:None,bank_lease_id:None,
+                    }).map_err(model_error)?;
+                }
+                return Ok(PalsNativeCommand::EvaluateCudaWarm(payload));
             }
             Ok(PalsNativeCommand::Evaluate(input))
         }
@@ -5762,6 +5918,12 @@ mod native {
                     pinned: self.owner.execution.pinned_request_bytes,
                 },
             });
+            if self.owner.followup_evidence.load(Ordering::Acquire) {
+                *self.owner.prepared_perspective.lock().map_err(|_| RoleError::Unavailable)? =
+                    Some((id, if position.side_to_move() == Color::White {
+                        rz_contracts::Color::White
+                    } else { rz_contracts::Color::Black }));
+            }
             let representation = SharedRepresentationScope::new(RepresentationScope {
                 situation,
                 state: state_identity,
@@ -5993,6 +6155,7 @@ mod native {
             Some(&self.value_identity)
         }
         fn evaluate_value(&mut self, query: RoleQuery<'_>) -> Result<ModelValueOutput, RoleError> {
+            self.last_value_execution = None;
             // Frontier evaluation uses the existing proposer forward/shared WDL
             // head. Its candidate-policy output is unused. This is a contextual
             // model estimate, not a candidate value or foreign-CP calibration.
@@ -6178,9 +6341,14 @@ mod native {
             query: RoleQuery<'_>,
             context: &RoleLogicalContext,
         ) -> Result<ModelValueOutput, RoleError> {
+            self.last_value_execution = None;
             check_context(&query, context, RoleQueryPurpose::ValueFresh)?;
             if self.owner.private_warm.is_none() {
-                return self.evaluate_value(query);
+                // Context is copied into evidence only. Preserve the existing
+                // Fresh input, graph and logical-free preparation path.
+                let output = self.evaluate_value(query)?;
+                self.capture_value_execution(context, &output);
+                return Ok(output);
             }
             let state = query.position.position_identity();
             let perspective = query.position.side_to_move();
@@ -6204,13 +6372,45 @@ mod native {
             let RolePayload::Proposal { wdl, .. } = output.payload else {
                 return Err(RoleError::InvalidOutput);
             };
-            Ok(ModelValueOutput {
+            let output = ModelValueOutput {
                 identity: self.value_identity.clone(),
                 input_sha256: output.key.input.0,
                 state,
                 perspective,
                 wdl: wdl.probabilities(),
-            })
+            };
+            self.capture_value_execution(context, &output);
+            Ok(output)
+        }
+        fn last_value_execution_evidence(&self) -> Option<RoleValueExecutionEvidence> {
+            self.last_value_execution
+        }
+        fn preflight_new_game(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<(), RoleError> {
+            if cancel.load(Ordering::Acquire) { return Err(RoleError::Canceled); }
+            if Instant::now() >= deadline { return Err(RoleError::Deadline); }
+            if self.unusable || self.owner.quarantined.load(Ordering::Acquire) {
+                return Err(RoleError::PhysicalCompletionUnknown);
+            }
+            if self.owner.finishing.load(Ordering::Acquire) || self.owner.shutdown.load(Ordering::Acquire) {
+                return Err(RoleError::Unavailable);
+            }
+            // A retained unknown execution/control lease cannot authorize an
+            // old Store replacement. This query schedules no Reset or NN.
+            if self.runtime.state().executions != 0
+                || self.owner.in_flight.load(Ordering::Acquire) != 0
+                || self.control_lease.is_some()
+                || self.owner.warm_admission.try_lock().map_err(|_| RoleError::Unavailable)?.is_some()
+                || self.owner.role_execution.try_lock().map_err(|_| RoleError::Unavailable)?
+                    .as_ref().is_some_and(|execution| !execution.ready_observed || execution.unknown_observed)
+            {
+                return Err(RoleError::PhysicalCompletionUnknown);
+            }
+            if let Some(error) = self.owner.game_reset_failure.try_lock()
+                .map_err(|_| RoleError::Unavailable)?.as_ref()
+            { return Err(error.clone()); }
+            if cancel.load(Ordering::Acquire) { return Err(RoleError::Canceled); }
+            if Instant::now() >= deadline { return Err(RoleError::Deadline); }
+            Ok(())
         }
         fn accepted_output_checked(
             &mut self,
@@ -7513,6 +7713,8 @@ mod native {
                 observer_failures: AtomicU64::new(0),
                 last_observer_failure: Mutex::new(None),
                 role_execution: Mutex::new(None),
+                followup_evidence: AtomicBool::new(false),
+                prepared_perspective: Mutex::new(None),
                 private_warm: None,
                 warm_admission: Mutex::new(None),
             });
@@ -7561,6 +7763,7 @@ mod native {
                 startup_attempted: false,
                 startup_probe_configured: false,
                 delivered_request: None,
+                last_value_execution: None,
                 startup_loading_elapsed_ns: None,
                 startup_clock: None,
                 startup_diagnostic: None,
@@ -10087,6 +10290,7 @@ pub use native::{
     NativeBackendStatsReceipt, NativeCudaLoadingIdentity, NativeCudaRecordPageSnapshotReceipt,
     NativeCudaRecordPageStatsReceipt, NativeCudaRecordPagesDeclaration,
     NativeCudaRecordPagesRegistration, NativeCudaRecordPagesResourceDeclaration,
+    NativeCudaWarmObservationLimits,
     NativeExecutionReceipt, NativeFailureReceipt, NativeHostRecordPageBankReceipt,
     NativeHostRecordPageCommandReceipt, NativeHostRecordPageDeclaration,
     NativeHostRecordPageLimits, NativeHostRecordPageObservationReceipt,

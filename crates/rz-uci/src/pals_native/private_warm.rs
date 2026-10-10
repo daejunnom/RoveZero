@@ -143,7 +143,24 @@ pub(super) struct NativeWarmState {
     query_hits: AtomicU64,
     last_event: Mutex<Option<&'static str>>,
     last_revocation_failure: Mutex<Option<PrivateSeedError>>,
+    followup: Mutex<Option<NativeWarmBankObservation>>,
 }
+
+/// Metadata of the selected CUDA producer. Counters are advanced only by the
+/// actual submitted-payload/Ready join, never by a prepared seed or callback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct NativeWarmBankObservation {
+    pub owner_id: u64,
+    pub event_sequence: u64,
+    pub accepted_seed_consumptions: u64,
+    pub accepted_seed_context_checked: u64,
+    pub rejected_seed_contexts: u64,
+    pub fresh_value_evaluations: u64,
+    pub value_always_fresh: bool,
+    pub closed: bool,
+    pub complete: bool,
+}
+static FOLLOWUP_BANK_OWNERS: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct NativePrivateWarmObservation {
@@ -250,6 +267,7 @@ impl NativeWarmState {
             query_hits: AtomicU64::new(0),
             last_event: Mutex::new(None),
             last_revocation_failure: Mutex::new(None),
+            followup: Mutex::new(None),
         }))
     }
     pub fn is_closed(&self) -> bool {
@@ -590,6 +608,62 @@ impl NativeWarmState {
         if let Ok(mut event) = self.last_event.lock() {
             *event = Some(stage);
         }
+    }
+    pub fn enable_followup_observations(&self) -> Result<(), RoleError> {
+        let mut slot = self.followup.try_lock().map_err(|_| RoleError::Unavailable)?;
+        if slot.is_some() { return Err(RoleError::InvalidOutput); }
+        let owner_id = FOLLOWUP_BANK_OWNERS.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+            |value| value.checked_add(1)).map_err(|_| RoleError::Unavailable)?;
+        *slot = Some(NativeWarmBankObservation { owner_id,event_sequence:0,
+            accepted_seed_consumptions:0,accepted_seed_context_checked:0,rejected_seed_contexts:0,
+            fresh_value_evaluations:0,value_always_fresh:true,closed:false,complete:true });
+        Ok(())
+    }
+    pub fn followup_observation(&self) -> Option<NativeWarmBankObservation> {
+        self.followup.try_lock().ok().and_then(|slot| *slot)
+    }
+    pub fn observe_ready_join(&self, invocation: PrivateInvocation, value: bool, private_completed: bool, exact: bool) {
+        let Ok(mut slot) = self.followup.try_lock() else { return; };
+        let Some(s) = slot.as_mut() else { return; };
+        let Some(sequence) = s.event_sequence.checked_add(1) else { s.complete=false;return; };
+        s.event_sequence=sequence;
+        if !exact { s.complete=false;return; }
+        if value && !matches!(invocation,PrivateInvocation::Fresh{..}) { s.value_always_fresh=false;s.complete=false; }
+        if !private_completed { return; }
+        let counter = if value {Some(&mut s.fresh_value_evaluations)}
+            else if matches!(invocation,PrivateInvocation::ApproxCudaWarmV2{..}) {Some(&mut s.accepted_seed_consumptions)}
+            else {None};
+        if let Some(counter)=counter {if let Some(next)=counter.checked_add(1){*counter=next;}else{s.complete=false;}}
+        // Every admitted Approx payload reached bind_lease with the actual
+        // model/role/question/Rules seal. The exact Ready join retains it.
+        if !value && matches!(invocation,PrivateInvocation::ApproxCudaWarmV2{..}) {
+            if let Some(next)=s.accepted_seed_context_checked.checked_add(1){s.accepted_seed_context_checked=next;}else{s.complete=false;}
+        }
+    }
+    pub fn observe_context_rejection(&self) {
+        if let Ok(mut slot)=self.followup.try_lock() && let Some(s)=slot.as_mut() {
+            match (s.event_sequence.checked_add(1),s.rejected_seed_contexts.checked_add(1)) {
+                (Some(sequence),Some(count))=>{s.event_sequence=sequence;s.rejected_seed_contexts=count;}
+                _=>s.complete=false,
+            }
+        }
+    }
+    /// Caller must have joined the actual worker after a known physical fence.
+    /// Same-game terminal closure does not advance the seed namespace.
+    pub fn close_after_known_fence(&self) -> Result<(), RoleError> {
+        self.closed.store(true,Ordering::Release);
+        if self.is_quarantined()
+            || self.retained.try_lock().map_err(|_|RoleError::Unavailable)?.is_some()
+            || self.pending.try_lock().map_err(|_|RoleError::Unavailable)?.is_some() {
+            return Err(RoleError::PhysicalCompletionUnknown);
+        }
+        self.bank.close_after_known_fence().map_err(private_error)?;
+        for role in self.frozen.try_lock().map_err(|_|RoleError::Unavailable)?.iter_mut() {role.clear();}
+        let mut slot=self.followup.try_lock().map_err(|_|RoleError::Unavailable)?;
+        if let Some(s)=slot.as_mut() {
+            if let Some(next)=s.event_sequence.checked_add(1){s.event_sequence=next;s.closed=true;}else{s.complete=false;return Err(RoleError::Unavailable);}
+        }
+        Ok(())
     }
     pub fn reset_after_known_fence(&self, game: u64) -> Result<(), RoleError> {
         // Production calls this only after its actual worker NewGame Ready.
