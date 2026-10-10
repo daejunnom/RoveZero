@@ -430,7 +430,7 @@ fn validate_pals_external_cpu_r_session_context<L: PalsArenaValidationContext>(
         .process_identity
         .as_ref()
         .ok_or_else(|| invalid("external helper actual historical spawn identity missing"))?;
-    ready_resources.validate_against(expected_parent_pid, helper, &*lock.resource(role), p)?;
+    ready_resources.validate_against(expected_parent_pid, helper, lock.resource(role), p)?;
     require(
         t["native"]["physical_shutdown_confirmed"] == true
             && t["native"]["native_buffers_released"] == true
@@ -476,7 +476,7 @@ fn validate_pals_external_cpu_r_session_context<L: PalsArenaValidationContext>(
         applied_option_values: PalsObservedV3::Unknown,
         model_loading: PalsObservedV3::Unknown,
     };
-    receipt.validate_against(endpoint, &*lock.resource(role))?;
+    receipt.validate_against(endpoint, lock.resource(role))?;
     Ok(PalsExternalCpuRSessionAuditV3 {
         purpose,
         endpoint_id: endpoint.id.clone(),

@@ -307,11 +307,12 @@ fn board_and_metadata(position: &Position) -> Result<(Vec<u8>, [f32; 16]), RoleE
     metadata[15] = 1.0;
     Ok((board, metadata))
 }
+type EncodedPalsRecords = (Vec<PalsRecordToken>, Vec<u64>, Option<Vec<PalsRecordLine>>);
 fn records(
     records: &[RoleRecord],
     revision: u64,
     config: &PalsModelConfig,
-) -> Result<(Vec<PalsRecordToken>, Vec<u64>, Option<Vec<PalsRecordLine>>), RoleError> {
+) -> Result<EncodedPalsRecords, RoleError> {
     if records.len() > 16_384 {
         return Err(RoleError::Backend(
             "PALS public record scan budget exceeded".into(),

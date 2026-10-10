@@ -453,7 +453,7 @@ impl PalsArenaLaunchV4 {
             "diagnostic declarations cannot launch arena",
         )?;
         require(
-            m.pilot.max_plies % 2 == 0,
+            m.pilot.max_plies.is_multiple_of(2),
             "paired runner requires even max ply count",
         )?;
         self.require_reap_status_runner()?;
