@@ -160,7 +160,9 @@ class NativeRecheckBoundaryTests(unittest.TestCase):
                 witness._policy_identity(value)
 
     def test_policy_rejects_unknown_disabled_and_extra_field(self):
-        for policy in ("Disabled", "same-repaired-line-once-v1", "actual_opponent_continuation_v1", "actual-opponent-continuation-v1", None):
+        for policy in ("Disabled", "same-repaired-line-once-v1", "actual_opponent_continuation_v1",
+                       "actual-opponent-continuation-v1", "frozen_model_wdl_v2",
+                       "iterative_frozen_model_wdl_v2", None):
             value = copy.deepcopy(witness._POLICY)
             value["policy"] = policy
             with self.assertRaises(witness.UnsupportedNativeRecheck):
@@ -298,6 +300,25 @@ class NativeRecheckBoundaryTests(unittest.TestCase):
             changed[path]["bytes"] += 1
             with self.assertRaises(witness.UnsupportedNativeRecheck):
                 witness._reviewed_source_pair(changed)
+
+    def test_followup_core_review_preserves_history_and_rejects_component_hybrids(self):
+        _, historical = witness._reviewed_source_pair(REVIEWED_WHOLE_SOURCE_PINS)
+        _, current = witness._reviewed_source_pair(REVIEWED_CURRENT_WHOLE_SOURCE_PINS)
+        self.assertEqual(historical, REVIEWED_WHOLE_SOURCE_PINS)
+        self.assertEqual(current, REVIEWED_CURRENT_WHOLE_SOURCE_PINS)
+        _, pre_lint = witness._reviewed_source_pair(REVIEWED_PRE_LINT_WHOLE_SOURCE_PINS)
+        self.assertEqual(pre_lint, REVIEWED_PRE_LINT_WHOLE_SOURCE_PINS)
+        self.assertNotEqual(historical, current)
+        for path in witness._SOURCE_PATHS:
+            with self.subTest(component=path):
+                hybrid = copy.deepcopy(current)
+                hybrid[path] = copy.deepcopy(historical[path])
+                with self.assertRaises(witness.UnsupportedNativeRecheck):
+                    witness._reviewed_source_pair(hybrid)
+                changed = copy.deepcopy(current)
+                changed[path]["bytes"] += 1
+                with self.assertRaises(witness.UnsupportedNativeRecheck):
+                    witness._reviewed_source_pair(changed)
 
     def test_unchecked_repair_anchor_cannot_be_constructed(self):
         with self.assertRaises(ValueError):
@@ -608,6 +629,16 @@ class NativeRecheckWholeGateTests(unittest.TestCase):
         fixture.observation["score"] = {"kind":"Estimate","value_f32_bits":0,"white_perspective":False}
         self.assertEqual(fixture.read()["reason"],"frontier_only_endpoint")
 
+    def test_new_retired_or_model_endpoint_cannot_gain_legacy_completed_cp_authority(self):
+        fixture = SyntheticEndpoint()
+        fixture.evidence["task"]["status"] = {"kind":"RetiredPaused","checkpoint":3,"evidence":4}
+        with self.assertRaisesRegex(ValueError, "typed actual task status"):
+            fixture.read()
+        fixture = SyntheticEndpoint()
+        fixture.endpoint["evidence"] = {"kind":"ModelWdl"}
+        with self.assertRaisesRegex(witness.UnsupportedNativeRecheck, "unsupported_native_recheck_endpoint_evidence"):
+            fixture.read()
+
     def test_unobserved_terminal_and_mate_band_do_not_gain_cp_authority(self):
         fixture = SyntheticEndpoint()
         fixture.observation["score"]["value"] = 30000
@@ -661,8 +692,8 @@ class NativeRecheckWholeGateTests(unittest.TestCase):
             with self.assertRaises(ValueError): witness._publication_shape(mutated,**local)
 
 
-# Independent review pins: do not derive/enroll these from the production table.
-# A source successor requires an explicit new review and deliberate fixture edit.
+# Historical closed-table pins. They remain independent of the live checkout.
+# Preserving an old profile is not a historical build or execution observation.
 REVIEWED_WHOLE_SOURCE_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
         "bytes": 355881,
@@ -671,6 +702,30 @@ REVIEWED_WHOLE_SOURCE_PINS = {
     "crates/rz-arena/src/pals_collect/native.rs": {
         "bytes": 224380,
         "sha256": "a286a2403317be7f5f058b65488e7c9722d2b7f4b9bf683ea95e5c9f51a7aaf8",
+    },
+}
+
+# Independent current-fixture pins: do not derive these from the production
+# table or live hashes. A successor needs review and a deliberate fixture edit.
+REVIEWED_PRE_LINT_WHOLE_SOURCE_PINS = {
+    "crates/rz-search/src/pals/engine.rs": {
+        "bytes": 374235,
+        "sha256": "b86af1f0e55f55add0d4cca277772f8d1c8edf3b3d93d147629c4ab6f881103a",
+    },
+    "crates/rz-arena/src/pals_collect/native.rs": {
+        "bytes": 233158,
+        "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9",
+    },
+}
+
+REVIEWED_CURRENT_WHOLE_SOURCE_PINS = {
+    "crates/rz-search/src/pals/engine.rs": {
+        "bytes": 374216,
+        "sha256": "4729c3595731d82e7252dd4aec316bf051092449d95f4fe8a4a83017038ee018",
+    },
+    "crates/rz-arena/src/pals_collect/native.rs": {
+        "bytes": 233158,
+        "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9",
     },
 }
 
@@ -747,15 +802,15 @@ class SyntheticWholeRecheckFixture:
         self.producer = producer
         repo = Path(__file__).resolve().parents[4]
         self.source_raws = {}
-        for path, name in zip(REVIEWED_WHOLE_SOURCE_PINS, ("engine_source", "native_source")):
-            expected = REVIEWED_WHOLE_SOURCE_PINS[path]
+        for path, name in zip(REVIEWED_CURRENT_WHOLE_SOURCE_PINS, ("engine_source", "native_source")):
+            expected = REVIEWED_CURRENT_WHOLE_SOURCE_PINS[path]
             with (repo / path).open("rb") as stream:
                 actual = stream.read(expected["bytes"] + 1)
             if byte_pin(actual) != expected:
                 raise AssertionError("reviewed Rust fixture source pin changed: " + path)
             self.source_raws[name] = actual
         manifest = {"source_commit": "a" * 40,
-                    "files": [{"path": path, **copy.deepcopy(pin)} for path, pin in REVIEWED_WHOLE_SOURCE_PINS.items()]}
+                    "files": [{"path": path, **copy.deepcopy(pin)} for path, pin in REVIEWED_CURRENT_WHOLE_SOURCE_PINS.items()]}
         self.source_raws["source_manifest"] = canonical(manifest)
         build = {"schema": witness.BUILD_SCHEMA, "source_commit": "a" * 40,
                  "actual_build_exit_code": 0, "source_verified_before_and_after_build": True,
@@ -1104,7 +1159,7 @@ class NativeRecheckPublicWholeTests(unittest.TestCase):
             original = json.loads(fixture.seed.artifacts["receipt.json"])
             self.assertEqual(original["artifacts"][witness.TRACE_ARTIFACT], byte_pin(fixture.trace_raw))
             self.assertEqual(set(original["artifacts"]), set(fixture.assets) - {"receipt.json"})
-            self.assertEqual(fixture.anchor.admission()["source_observation"]["reviewed_transition_sources"], REVIEWED_WHOLE_SOURCE_PINS)
+            self.assertEqual(fixture.anchor.admission()["source_observation"]["reviewed_transition_sources"], REVIEWED_CURRENT_WHOLE_SOURCE_PINS)
             self.assertEqual(fixture.repaired_check.rules_receipt()["claimed_line"]["claim_truth"], "unknown")
             self.assertEqual(fixture.reply_check.rules_receipt()["claimed_line"]["claim_truth"], "unknown")
             # Capabilities are immutable and their returned views are detached.

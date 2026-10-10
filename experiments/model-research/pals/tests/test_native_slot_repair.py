@@ -28,6 +28,23 @@ from test_semantic_verifier import SemanticFixture, tokens
 import test_training as fixtures
 
 
+# Independent live-fixture pins, deliberately separate from historical table
+# preservation and from production enrollment. Unknown successors still fail.
+REVIEWED_PRE_LINT_SOURCE_PINS = {
+    "crates/rz-search/src/pals/engine.rs": {
+        "bytes": 374235, "sha256": "b86af1f0e55f55add0d4cca277772f8d1c8edf3b3d93d147629c4ab6f881103a"},
+    "crates/rz-arena/src/pals_collect/native.rs": {
+        "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+}
+
+REVIEWED_CURRENT_SOURCE_PINS = {
+    "crates/rz-search/src/pals/engine.rs": {
+        "bytes": 374216, "sha256": "4729c3595731d82e7252dd4aec316bf051092449d95f4fe8a4a83017038ee018"},
+    "crates/rz-arena/src/pals_collect/native.rs": {
+        "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+}
+
+
 def raw(value):
     return fixtures.frozen_fixture_bytes(value)
 
@@ -103,8 +120,15 @@ class SlotFixture(RepairFixture):
             "line": self.lineages[1]["counterexample"], "value": None, "completed_depth": 0, "scope": "Unknown",
             "white_score_perspective": True, "critical": False, "source_cpu_profile_sha256": self.source["cpu_profile_sha256"]}
         repo = Path(__file__).resolve().parents[4]
-        self.engine_raw = (repo / slot_witness._SOURCE_PATHS[0]).read_bytes()
-        self.native_raw = (repo / slot_witness._SOURCE_PATHS[1]).read_bytes()
+        source_raws = []
+        for path in slot_witness._SOURCE_PATHS:
+            expected = REVIEWED_CURRENT_SOURCE_PINS[path]
+            with (repo / path).open("rb") as stream:
+                actual = stream.read(expected["bytes"] + 1)
+            if semantic.byte_pin(actual) != expected:
+                raise AssertionError("reviewed Rust fixture source pin changed: " + path)
+            source_raws.append(actual)
+        self.engine_raw, self.native_raw = source_raws
         self.manifest = {"source_commit": "a" * 40, "files": [{"path": path, **semantic.byte_pin(value)}
             for path, value in zip(slot_witness._SOURCE_PATHS, (self.engine_raw, self.native_raw))]}
         self.build = {"schema": slot_witness.BUILD_SCHEMA, "source_commit": "a" * 40,
@@ -343,12 +367,7 @@ class NativeSlotRepairTests(unittest.TestCase):
         self.assertEqual(body["initial_repair_native_request"], [1, 4])
         self.assertEqual(body["publication_native_request"], [1, 5])
         self.assertEqual(body["captured_input_revision"], 2)
-        self.assertEqual(body["transition_profile"]["reviewed_transition_sources"], {
-            "crates/rz-search/src/pals/engine.rs": {
-                "bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"},
-            "crates/rz-arena/src/pals_collect/native.rs": {
-                "bytes": 224380, "sha256": "a286a2403317be7f5f058b65488e7c9722d2b7f4b9bf683ea95e5c9f51a7aaf8"},
-        })
+        self.assertEqual(body["transition_profile"]["reviewed_transition_sources"], REVIEWED_CURRENT_SOURCE_PINS)
         self.assertEqual(admission["scope"], "conditional_unique_prepared_lineage")
         self.assertFalse(body["direct_causal_ids_present"])
         self.assertFalse(body["before_dispatch_witness_claimed"])
@@ -450,14 +469,11 @@ class NativeSlotRepairTests(unittest.TestCase):
             {"bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"},
             {"bytes": 220199, "sha256": "eea0654a5c11d6e0d69b5c5df71363a8e2d8f4fb7ad02cf5d766fb4b06ec456f"})))
         self.assertEqual(slot_witness._reviewed_source_pair(earlier_selection), earlier_selection)
-        current = {path: semantic.byte_pin(value) for path, value in zip(slot_witness._SOURCE_PATHS,
-            (self.fixture.engine_raw, self.fixture.native_raw))}
-        self.assertEqual(current[slot_witness._SOURCE_PATHS[0]],
-            {"bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"})
-        self.assertEqual(current[slot_witness._SOURCE_PATHS[1]],
-            {"bytes": 224380, "sha256": "a286a2403317be7f5f058b65488e7c9722d2b7f4b9bf683ea95e5c9f51a7aaf8"})
-        self.assertEqual(slot_witness._reviewed_source_pair(current), current)
-        self.assertNotEqual(current, old)
+        earlier_revision_fixture = dict(zip(slot_witness._SOURCE_PATHS, (
+            {"bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"},
+            {"bytes": 224380, "sha256": "a286a2403317be7f5f058b65488e7c9722d2b7f4b9bf683ea95e5c9f51a7aaf8"})))
+        self.assertEqual(slot_witness._reviewed_source_pair(earlier_revision_fixture), earlier_revision_fixture)
+        self.assertNotEqual(earlier_revision_fixture, old)
 
     def test_unknown_engine_or_native_source_pair_remains_unsupported(self):
         for name, index in (("engine_source", 0), ("native_source", 1)):
@@ -472,6 +488,22 @@ class NativeSlotRepairTests(unittest.TestCase):
                 values["build_registration"] = raw(build)
                 with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_transition_source_pair"):
                     slot_witness._source_review(values, self.fixture.source)
+
+    def test_current_review_is_one_literal_pair_and_rejects_historical_hybrids(self):
+        observed = {path: semantic.byte_pin(value) for path, value in zip(slot_witness._SOURCE_PATHS,
+            (self.fixture.engine_raw, self.fixture.native_raw))}
+        self.assertEqual(observed, REVIEWED_CURRENT_SOURCE_PINS)
+        self.assertEqual(slot_witness._reviewed_source_pair(observed), observed)
+        self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_PRE_LINT_SOURCE_PINS), REVIEWED_PRE_LINT_SOURCE_PINS)
+        historical = dict(zip(slot_witness._SOURCE_PATHS, (
+            {"bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"},
+            {"bytes": 224380, "sha256": "a286a2403317be7f5f058b65488e7c9722d2b7f4b9bf683ea95e5c9f51a7aaf8"})))
+        for path in slot_witness._SOURCE_PATHS:
+            with self.subTest(historical_component=path):
+                hybrid = copy.deepcopy(observed)
+                hybrid[path] = copy.deepcopy(historical[path])
+                with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_transition_source_pair"):
+                    slot_witness._reviewed_source_pair(hybrid)
 
     def test_actual_manifest_and_binary_bindings_precede_unknown_pair_mask(self):
         values = source_review_raws(self.fixture)
@@ -500,7 +532,7 @@ class NativeSlotRepairTests(unittest.TestCase):
             slot_witness._source_review(values, declared)
         for owner in ("source", "native", "search_configuration", "independent_registry"):
             for marker in ("post_repair_recheck_policy", "pals_search_policy"):
-                for policy in ("SameRepairedLineOnceV1", "Disabled"):
+                for policy in ("SameRepairedLineOnceV1", "Disabled", "FrozenModelWdlV2", "IterativeFrozenModelWdlV2"):
                     with self.subTest(owner=owner, marker=marker, policy=policy):
                         source = copy.deepcopy(self.fixture.source)
                         target = source if owner == "source" else source["native"] if owner == "native" else source["native"].setdefault(owner, {})
@@ -535,7 +567,10 @@ class NativeSlotRepairTests(unittest.TestCase):
     def test_all_policy_owners_preserve_omission_and_legacy_but_refuse_other_search_versions(self):
         values = source_review_raws(self.fixture)
         for owner in ("source", "native", "search_configuration", "independent_registry"):
-            for version in (None, "pals-restricted-refinement-post-repair-recheck/1", "pals-restricted-refinement-post-repair-continuation/1", "unknown-search-version/1"):
+            for version in (None, "pals-restricted-refinement-post-repair-recheck/1",
+                            "pals-restricted-refinement-post-repair-continuation/1",
+                            "rovezero.pals-full-line-v2/0.2", "post-repair-frozen-wdl-v2",
+                            "post-repair-frozen-wdl-queue-v2", "unknown-search-version/1"):
                 with self.subTest(owner=owner, version=version):
                     source = copy.deepcopy(self.fixture.source)
                     target = source if owner == "source" else source["native"] if owner == "native" else source["native"].setdefault(owner, {})

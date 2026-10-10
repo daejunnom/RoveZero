@@ -102,6 +102,26 @@ _REVIEWED_OPT_IN_SOURCE_PROFILES = (
         "crates/rz-arena/src/pals_collect/native.rs": {
             "bytes": 224380, "sha256": "a286a2403317be7f5f058b65488e7c9722d2b7f4b9bf683ea95e5c9f51a7aaf8"},
     }),
+    # Independently reviewed frozen followup core, old same-line single-Reply
+    # constructor and observer only. Archive is off in that collector path;
+    # new V4/frozen/queue policies cannot use its legacy registration. The exact
+    # policy, raw CP completion and Rules gates below remain authoritative.
+    # No ModelWdl, retired-task, utility or actual execution scope is enrolled.
+    ("opt_in_single_reply_followup_core_b86af1f0_native_1ba6d1e5", {
+        "crates/rz-search/src/pals/engine.rs": {
+            "bytes": 374235, "sha256": "b86af1f0e55f55add0d4cca277772f8d1c8edf3b3d93d147629c4ab6f881103a"},
+        "crates/rz-arena/src/pals_collect/native.rs": {
+            "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+    }),
+    # Independently reviewed lint-only successor, with the same closed legacy
+    # single-Reply scope. PalsError identity conversions/Result wrappers change
+    # no observation, policy or authority; prior source pairs remain retained.
+    ("opt_in_single_reply_followup_core_lint_4729c359_native_1ba6d1e5", {
+        "crates/rz-search/src/pals/engine.rs": {
+            "bytes": 374216, "sha256": "4729c3595731d82e7252dd4aec316bf051092449d95f4fe8a4a83017038ee018"},
+        "crates/rz-arena/src/pals_collect/native.rs": {
+            "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+    }),
 )
 _POLICY = {
     "version": "pals-post-repair-recheck/1",

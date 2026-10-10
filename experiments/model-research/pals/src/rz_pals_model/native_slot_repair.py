@@ -116,6 +116,22 @@ _REVIEWED_DISABLED_CONTINUATION_REVISION_FIXTURE_SOURCES = (
     {"bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"},
     {"bytes": 224380, "sha256": "a286a2403317be7f5f058b65488e7c9722d2b7f4b9bf683ea95e5c9f51a7aaf8"},
 )
+# Independently reviewed frozen followup-core pair, legacy Disabled branch only.
+# The old loader still calls the old constructor with archive off and legacy
+# search identity. V4 resolver/frozen/queue selection is separate and rejected
+# by the unchanged policy gate below. Typed retired CPU work grants no completed
+# authority. This literal pair does not certify a build, execution or target.
+_REVIEWED_DISABLED_FOLLOWUP_CORE_SOURCES = (
+    {"bytes": 374235, "sha256": "b86af1f0e55f55add0d4cca277772f8d1c8edf3b3d93d147629c4ab6f881103a"},
+    {"bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+)
+# Reviewed lint successor of the same Disabled branch: two identity PalsError
+# conversions and an identical Result wrapper were removed. Historical pairs
+# remain separate; no new policy, task, value or execution scope is granted.
+_REVIEWED_DISABLED_FOLLOWUP_CORE_LINT_SOURCES = (
+    {"bytes": 374216, "sha256": "4729c3595731d82e7252dd4aec316bf051092449d95f4fe8a4a83017038ee018"},
+    {"bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+)
 _SOURCE_REVIEW_PROFILES = (
     ("legacy_prepared_lineage_4469f9d", _REVIEWED_SOURCES),
     ("legacy_disabled_recheck_9c0de959", _REVIEWED_DISABLED_RECHECK_SOURCES),
@@ -129,6 +145,8 @@ _SOURCE_REVIEW_PROFILES = (
     ("legacy_disabled_continuation_selection_v2_eea0654a", _REVIEWED_DISABLED_CONTINUATION_SELECTION_V2_SOURCES),
     ("legacy_disabled_selected_identity_8886c0e0", _REVIEWED_DISABLED_SELECTED_IDENTITY_SOURCES),
     ("legacy_disabled_continuation_revision_fixture_a286a240", _REVIEWED_DISABLED_CONTINUATION_REVISION_FIXTURE_SOURCES),
+    ("legacy_disabled_followup_core_b86af1f0_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_CORE_SOURCES),
+    ("legacy_disabled_followup_core_lint_4729c359_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_CORE_LINT_SOURCES),
 )
 _DISABLED_SEARCH_VERSION = "pals-restricted-refinement/0.1"
 _OPT_IN_LANE_FIELDS = ("pals_search_policy", "refinement_registration", "refinement_registration_sha256", "post_repair_recheck", "post_repair_recheck_policy", "post_repair_recheck_conditions",
