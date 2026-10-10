@@ -917,7 +917,7 @@ fn cost_failure(error: &(dyn Error + 'static)) -> serde_json::Value {
 fn cost_percentiles(samples: &[u64]) -> serde_json::Value {
     let mut ordered = samples.to_vec();
     ordered.sort_unstable();
-    let rank = |percent: usize| (ordered.len() * percent + 99) / 100 - 1;
+    let rank = |percent: usize| (ordered.len() * percent).div_ceil(100) - 1;
     json!({"raw_ns":samples,"count":samples.len(),"p50_ns":ordered[rank(50)],
         "p95_ns":ordered[rank(95)],"quantile_method":"nearest_rank;five_samples_p95_is_max"})
 }
@@ -1011,7 +1011,8 @@ fn cost_common_six(
         "thread_scope":"explicit_common_six_model_cost_profile;arena_default_intra2_is_a_separate_engine_profile",
         "graph_optimization":backend.graph_optimization(),"device_public_memory":backend.config().device_public_memory,
         "runtime_sha256":hex_digest(&backend.runtime_binary_digest()),
-        "runtime_bundle_sha256":backend.runtime_bundle_digest().as_ref().map(hex_digest),
+        "runtime_bundle_sha256":backend.runtime_bundle_digest().as_ref().map(hex_digest)});
+    let serde_json::Value::Object(timing_fields) = json!({
         "warmup_calls_per_case_lane":COST_WARMUP,"measured_calls_per_case_lane":COST_SAMPLES,
         "soft_work_seconds_max":COST_SECONDS,"report_bytes_max":COST_REPORT_BYTES,
         "external_supervisor_required":"physical Run may outlive soft deadline;root bounds60seconds plus cleanup30seconds",
@@ -1021,13 +1022,25 @@ fn cost_common_six(
         "cache_hit_preparation":"inherits same input public cache from preceding final cold call;no extra priming Run",
         "cold_scope":"public_cache_cleared_before_each_call;model_loaded_and_three_preparation_calls_before_five_samples",
         "planned_role_api_calls":{"ready":2,"preparation":36,"measured":60},
-        "expected_physical_nn_inputs_per_call":{"cold":2,"cache_hit":1},
+        "expected_physical_nn_inputs_per_call":{"cold":2,"cache_hit":1}})
+    else {
+        return Err("cost timing metadata is not an object".into());
+    };
+    let serde_json::Value::Object(scope_fields) = json!({
         "engine_consumed_nn_inputs":"unknown;direct_model_cost_mode_has_no_engine_consumer",
         "timer_overhead":"raw;recorded_not_subtracted","cuda_kernel_event_elapsed":"unknown",
         "per_call_host_allocator_peak":"unknown","vram_peak":"unknown","device_sharing":"unknown",
         "physical_shutdown":"requires_external_exit_and_cleanup;not_claimed_by_direct_owner_snapshot",
         "five_percent_model_gate":false,"strength_or_full_engine_effect_claim":false,
-        "ready":[],"rows":[]});
+        "ready":[],"rows":[]})
+    else {
+        return Err("cost scope metadata is not an object".into());
+    };
+    let receipt_fields = receipt
+        .as_object_mut()
+        .ok_or("cost receipt is not an object")?;
+    receipt_fields.extend(timing_fields);
+    receipt_fields.extend(scope_fields);
     let mut overhead = Vec::with_capacity(COST_SAMPLES);
     for _ in 0..COST_SAMPLES {
         let timer = Instant::now();

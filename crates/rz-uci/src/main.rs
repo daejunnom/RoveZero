@@ -2485,7 +2485,7 @@ fn open_pals_receipt(
 
 /// Both owners are attempted independently against the same overall deadline.
 /// A slow helper must not grant the Native owner a fresh cleanup window.
-#[cfg(any(feature = "onnx-cpu", test))]
+#[cfg(all(test, feature = "onnx-cpu"))]
 fn finish_pals_owners_within<C, N>(
     limit: Duration,
     checker: impl FnOnce(std::time::Instant) -> C,
