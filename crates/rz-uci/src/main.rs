@@ -2374,7 +2374,7 @@ fn run_native_pals(
     }
     let lifecycle = driver.followup_lifecycle();
     if let Err(error) = &lifecycle {
-        followup_failure.get_or_insert(error.clone());
+        followup_failure.get_or_insert(*error);
     }
     let observed_work = driver.work_receipt();
     let observed_checker = checker_profile
