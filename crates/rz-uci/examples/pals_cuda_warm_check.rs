@@ -267,7 +267,11 @@ mod check {
             .and_then(|path| path.canonicalize().ok())
             .ok_or(fail("arguments", "checkout_boundary_unavailable"))?;
         let resolved = if new_file {
-            require(!path.exists(), "arguments", "output_exists")?;
+            require(
+                matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+                "arguments",
+                "output_exists",
+            )?;
             path.parent().and_then(|path| path.canonicalize().ok())
         } else {
             path.canonicalize().ok()
@@ -349,7 +353,10 @@ mod check {
             }
             if !flag.ends_with("-sha256") {
                 if let Some(value) = args.values.get(flag) {
-                    external(Path::new(value), flag == "--output-json")?;
+                    external(
+                        Path::new(value),
+                        matches!(flag, "--output-json" | "--profile-root"),
+                    )?;
                 }
             }
         }
@@ -2490,6 +2497,37 @@ mod check {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn profile_output_is_exclusive_without_changing_existing_input_canonicalization() {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "rz-pals-warm-path-only-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let profile = root.join("profiles");
+            assert!(external(&profile, true).is_ok());
+            assert!(external(&profile, false).is_err());
+            std::fs::create_dir(&profile).unwrap();
+            assert!(external(&profile, false).is_ok());
+            assert!(external(&profile, true).is_err());
+            std::fs::remove_dir(&profile).unwrap();
+            let output = root.join("capture.json");
+            std::fs::write(&output, b"{}").unwrap();
+            assert!(external(&output, true).is_err());
+            assert!(external(&output, false).is_ok());
+            std::fs::remove_file(&output).unwrap();
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(root.join("absent"), &profile).unwrap();
+                assert!(external(&profile, true).is_err());
+                std::fs::remove_file(&profile).unwrap();
+            }
+            std::fs::remove_dir(&root).unwrap();
+        }
         #[test]
         fn independent_numeric_comparison_requires_complete_finite_role_outputs() {
             let raw = PalsRawOutput {

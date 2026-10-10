@@ -15,6 +15,8 @@ const MAX_PROFILE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_NODES: usize = 5000;
 const CUDA: &str = "CUDAExecutionProvider";
 const CPU: &str = "CPUExecutionProvider";
+const CUDA_WARM_GRAPH_NAME: &str = "shared_pc_if_approx_cuda_warm_v2";
+const CUDA_WARM_IF_ANNOTATION: &str = "cuda_warm_if_dispatch_candidate";
 
 fn policy_error(detail: &'static str) -> BackendError {
     fail(K::BackendUnavailable, S::Backend, detail)
@@ -35,12 +37,25 @@ struct GraphPolicy {
     proposer_private: BTreeMap<String, String>,
     critic_private: BTreeMap<String, String>,
     role_transfer: Option<RoleTransferPolicy>,
+    required_cuda_dispatch: BTreeSet<String>,
 }
 #[derive(Clone)]
 struct RoleTransferPolicy {
     scope: String,
     destination_node: String,
     host_condition_nodes: Vec<String>,
+}
+#[derive(Clone)]
+struct CudaWarmControlRoute {
+    root_scope: String,
+    mode_node: String,
+    role_transfer: RoleTransferPolicy,
+    required_cuda_dispatch: BTreeSet<String>,
+}
+#[derive(Clone, Copy)]
+enum PrivateRole {
+    Proposer,
+    Critic,
 }
 #[derive(Deserialize)]
 struct Inventory {
@@ -56,6 +71,10 @@ struct Inventory {
 struct InventoryGraph {
     role: String,
     sha256: String,
+    /// Optional for historical role-only inventories. The additional route is
+    /// admitted only with the exact registered serialized CUDA Warm name.
+    #[serde(default)]
+    serialized_graph_name: Option<String>,
     inventory: InventoryScope,
 }
 #[derive(Deserialize)]
@@ -65,6 +84,10 @@ struct InventoryScope {
     #[serde(default)]
     outputs: Vec<InventoryInput>,
     integral_initializers: Vec<IntegralSeed>,
+    /// Dense plus sparse serialized initializers; required to be zero in each
+    /// new Warm branch. Historical inventories keep their existing contract.
+    #[serde(default)]
+    initializer_count: Option<usize>,
     nodes: Vec<InventoryNode>,
     subgraphs: Vec<InventoryScope>,
 }
@@ -102,6 +125,7 @@ enum Origin {
     Metadata,
     Integral,
     Role,
+    CudaWarmMode,
     Data,
 }
 impl Origin {
@@ -110,6 +134,7 @@ impl Origin {
             Self::Metadata => "shape_metadata",
             Self::Integral => "small_integral_constant",
             Self::Role => "role_control",
+            Self::CudaWarmMode => "cuda_warm_mode_control",
             Self::Data => "model_data_or_unknown",
         }
     }
@@ -126,6 +151,8 @@ struct InventoryNode {
     constant_integral_seeds: Vec<IntegralSeed>,
     static_annotation: String,
     actual_provider: String,
+    #[serde(default)]
+    attribute_names: Option<Vec<String>>,
 }
 impl PalsCudaControlPolicy {
     /// Explicit reviewed source inventory, not runtime-discovered fallback.
@@ -165,6 +192,12 @@ impl PalsCudaControlPolicy {
                     "PALS control graph role is unsupported or duplicated",
                 ));
             }
+            let warm_route = if graph.serialized_graph_name.as_deref() == Some(CUDA_WARM_GRAPH_NAME)
+            {
+                Some(cuda_warm_control_route(&graph.role, &graph.inventory)?)
+            } else {
+                None
+            };
             let mut policy = GraphPolicy {
                 digest: parse_sha256(&graph.sha256)?,
                 nodes: BTreeMap::new(),
@@ -173,16 +206,34 @@ impl PalsCudaControlPolicy {
                 proposer_private: BTreeMap::new(),
                 critic_private: BTreeMap::new(),
                 role_transfer: None,
+                required_cuda_dispatch: warm_route
+                    .as_ref()
+                    .map(|route| route.required_cuda_dispatch.clone())
+                    .unwrap_or_default(),
             };
             let mut names = BTreeSet::new();
-            inspect_scope(
-                &graph.inventory,
-                &BTreeMap::new(),
-                &mut policy,
-                &mut names,
-                &mut count,
-            )?;
-            policy.role_transfer = role_transfer_policy(&graph.role, &graph.inventory);
+            if let Some(route) = &warm_route {
+                inspect_scope_with_layout(
+                    &graph.inventory,
+                    &BTreeMap::new(),
+                    &mut policy,
+                    &mut names,
+                    &mut count,
+                    Some(route),
+                    None,
+                )?;
+            } else {
+                inspect_scope(
+                    &graph.inventory,
+                    &BTreeMap::new(),
+                    &mut policy,
+                    &mut names,
+                    &mut count,
+                )?;
+            }
+            policy.role_transfer = warm_route
+                .map(|route| route.role_transfer)
+                .or_else(|| role_transfer_policy(&graph.role, &graph.inventory));
             if policy.major.is_empty() {
                 return Err(policy_error(
                     "PALS control inventory has no neural computation",
@@ -305,8 +356,7 @@ impl PalsCudaControlPolicy {
                 || placement.graph_sha256 != graph.digest
                 || placement.assigned_nodes == 0
                 || placement.optimization != PalsGraphOptimization::Disable
-                || placement.assigned_nodes
-                    > graph.nodes.len() + placement.approved_transfers.len()
+                || placement.assigned_nodes > graph.nodes.len() + placement.approved_transfers.len()
                 || !valid_transfers(graph, &placement.approved_transfers)
                 || placement.cuda_nodes == 0
                 || placement
@@ -360,6 +410,18 @@ fn inspect_scope(
     names: &mut BTreeSet<String>,
     count: &mut usize,
 ) -> Result<(), BackendError> {
+    inspect_scope_with_layout(scope, inherited, policy, names, count, None, None)
+}
+
+fn inspect_scope_with_layout(
+    scope: &InventoryScope,
+    inherited: &BTreeMap<String, Origin>,
+    policy: &mut GraphPolicy,
+    names: &mut BTreeSet<String>,
+    count: &mut usize,
+    warm_route: Option<&CudaWarmControlRoute>,
+    private_role: Option<PrivateRole>,
+) -> Result<(), BackendError> {
     let mut origins = inherited.clone();
     for input in &scope.inputs {
         let origin = if input.name == "role_is_critic" {
@@ -367,6 +429,13 @@ fn inspect_scope(
                 return Err(policy_error("PALS role control seed is not scalar BOOL"));
             }
             Origin::Role
+        } else if input.name == "warm_start"
+            && warm_route.is_some_and(|route| route.root_scope == scope.path)
+        {
+            if input.dtype != "BOOL" || input.shape != serde_json::json!([]) {
+                return Err(policy_error("PALS CUDA Warm mode is not scalar BOOL"));
+            }
+            Origin::CudaWarmMode
         } else {
             Origin::Data
         };
@@ -515,26 +584,36 @@ fn inspect_scope(
                 ));
             }
             policy.major.insert(node.name.clone(), node.op.clone());
-            if scope.path.contains("/then_branch") {
-                policy
-                    .critic_private
-                    .insert(node.name.clone(), node.op.clone());
-            }
-            if scope.path.contains("/else_branch") {
-                policy
-                    .proposer_private
-                    .insert(node.name.clone(), node.op.clone());
+            match private_role {
+                Some(PrivateRole::Critic) => {
+                    policy
+                        .critic_private
+                        .insert(node.name.clone(), node.op.clone());
+                }
+                Some(PrivateRole::Proposer) => {
+                    policy
+                        .proposer_private
+                        .insert(node.name.clone(), node.op.clone());
+                }
+                None => {}
             }
         }
         // If dispatch stays on CUDA EP. Its CPU condition does not grant a CPU
         // fallback permission to this node or to its private branch kernels.
-        if node.op == "If"
-            && (node.static_annotation != "role_if_dispatch_candidate"
-                || node.inputs != ["role_is_critic"]
-                || actual_origins != [Origin::Role])
-        {
+        let role_if = node.op == "If"
+            && node.static_annotation == "role_if_dispatch_candidate"
+            && node.inputs == ["role_is_critic"]
+            && actual_origins == [Origin::Role];
+        let cuda_warm_if = node.op == "If"
+            && node.static_annotation == CUDA_WARM_IF_ANNOTATION
+            && node.inputs == ["warm_start"]
+            && actual_origins == [Origin::CudaWarmMode]
+            && warm_route.is_some_and(|route| {
+                route.root_scope == scope.path && route.mode_node == node.name
+            });
+        if node.op == "If" && !role_if && !cuda_warm_if {
             return Err(policy_error(
-                "PALS If control condition is not the exact role scalar",
+                "PALS If control is not the exact registered role or CUDA Warm scalar",
             ));
         }
         // Capture the lexical outer scope at this exact node. Future outputs,
@@ -548,7 +627,22 @@ fn inspect_scope(
             if node.op != "If" {
                 return Err(policy_error("PALS has an undeclared nested graph"));
             }
-            inspect_scope(child, &origins, policy, names, count)?;
+            let child_role = if role_if {
+                match child.path.strip_prefix(&prefix) {
+                    Some("then_branch") => Some(PrivateRole::Critic),
+                    Some("else_branch") => Some(PrivateRole::Proposer),
+                    _ => {
+                        return Err(policy_error(
+                            "PALS private role branch lacks its exact direct If scope",
+                        ));
+                    }
+                }
+            } else {
+                private_role
+            };
+            inspect_scope_with_layout(
+                child, &origins, policy, names, count, warm_route, child_role,
+            )?;
             child_count += 1;
         }
         for name in &node.outputs {
@@ -568,6 +662,269 @@ fn inspect_scope(
         ));
     }
     Ok(())
+}
+
+fn descriptor(
+    values: &[InventoryInput],
+    name: &str,
+    dtype: &str,
+    shape: &serde_json::Value,
+) -> bool {
+    let mut matched = values.iter().filter(|value| value.name == name);
+    matched
+        .next()
+        .is_some_and(|value| value.dtype == dtype && &value.shape == shape)
+        && matched.next().is_none()
+}
+
+fn exported_serial_name(name: &str, stem: &str) -> bool {
+    name.strip_prefix(stem).is_some_and(|serial| {
+        !serial.is_empty()
+            && serial.bytes().all(|byte| byte.is_ascii_digit())
+            && serial.parse::<u64>().is_ok_and(|value| value > 0)
+    })
+}
+
+fn exact_if_attributes(node: &InventoryNode) -> bool {
+    node.attribute_names.as_ref().is_some_and(|names| {
+        names.len() == 2
+            && names.iter().filter(|name| *name == "then_branch").count() == 1
+            && names.iter().filter(|name| *name == "else_branch").count() == 1
+    })
+}
+
+fn direct_if_branches<'a>(
+    scope: &'a InventoryScope,
+    node: &InventoryNode,
+) -> Result<(&'a InventoryScope, &'a InventoryScope), BackendError> {
+    let prefix = format!("{}/node{}:{}/", scope.path, node.index, node.name);
+    let then_path = format!("{prefix}then_branch");
+    let else_path = format!("{prefix}else_branch");
+    let nested: Vec<_> = scope
+        .subgraphs
+        .iter()
+        .filter(|child| child.path.starts_with(&prefix))
+        .collect();
+    if nested.len() != 2 || !exact_if_attributes(node) {
+        return Err(policy_error(
+            "PALS CUDA Warm If needs exactly its two direct branches",
+        ));
+    }
+    let then = nested.iter().find(|child| child.path == then_path).copied();
+    let otherwise = nested.iter().find(|child| child.path == else_path).copied();
+    match (then, otherwise) {
+        (Some(then), Some(otherwise)) => Ok((then, otherwise)),
+        _ => Err(policy_error(
+            "PALS CUDA Warm branches differ from the exact If scope",
+        )),
+    }
+}
+
+fn consumers<'a>(
+    scope: &'a InventoryScope,
+    input: &str,
+    result: &mut Vec<(&'a InventoryScope, &'a InventoryNode)>,
+) {
+    result.extend(
+        scope
+            .nodes
+            .iter()
+            .filter(|node| node.inputs.iter().any(|name| name == input))
+            .map(|node| (scope, node)),
+    );
+    for child in &scope.subgraphs {
+        consumers(child, input, result);
+    }
+}
+
+fn cuda_warm_control_route(
+    role: &str,
+    scope: &InventoryScope,
+) -> Result<CudaWarmControlRoute, BackendError> {
+    let scalar = serde_json::json!([]);
+    let latent = serde_json::json!(["batch", 16, 384]);
+    if role != "shared_pc"
+        || scope.path != "shared_pc"
+        || !descriptor(&scope.inputs, "role_is_critic", "BOOL", &scalar)
+        || !descriptor(&scope.inputs, "warm_start", "BOOL", &scalar)
+        || !descriptor(&scope.inputs, "initial_latent", "FLOAT", &latent)
+        || !descriptor(&scope.outputs, "is_critic", "BOOL", &scalar)
+    {
+        return Err(policy_error(
+            "PALS registered CUDA Warm root ABI is invalid",
+        ));
+    }
+    let mut modes = scope
+        .nodes
+        .iter()
+        .filter(|node| node.name == "private_warm_mode");
+    let mode = modes
+        .next()
+        .ok_or_else(|| policy_error("PALS CUDA Warm mode is absent"))?;
+    if modes.next().is_some()
+        || mode.op != "If"
+        || !mode.domain.is_empty()
+        || mode.inputs != ["warm_start"]
+        || mode.outputs.len() != 1
+        || mode.static_annotation != CUDA_WARM_IF_ANNOTATION
+        || !mode.constant_integral_seeds.is_empty()
+        || !exported_serial_name(&mode.outputs[0], "selected_private_initial_")
+    {
+        return Err(policy_error(
+            "PALS CUDA Warm mode is not the exact initial selector",
+        ));
+    }
+    let (warm, fresh) = direct_if_branches(scope, mode)?;
+    let warm_output = format!("{}__warm_branch", mode.outputs[0]);
+    let fresh_output = format!("{}__fresh_branch", mode.outputs[0]);
+    for (branch, output) in [(warm, &warm_output), (fresh, &fresh_output)] {
+        if !branch.inputs.is_empty()
+            || branch.initializer_count != Some(0)
+            || !branch.integral_initializers.is_empty()
+            || branch.nodes.len() != 1
+            || branch.outputs.len() != 1
+            || !descriptor(&branch.outputs, output, "FLOAT", &latent)
+        {
+            return Err(policy_error(
+                "PALS CUDA Warm branch has extra IO, weights, or computation",
+            ));
+        }
+    }
+    let seed = &warm.nodes[0];
+    if seed.index != 0
+        || seed.name != "consume_complete_private_seed"
+        || seed.op != "Identity"
+        || !seed.domain.is_empty()
+        || seed.inputs != ["initial_latent"]
+        || seed.outputs != [warm_output]
+        || seed
+            .attribute_names
+            .as_ref()
+            .is_none_or(|names| !names.is_empty())
+        || !seed.constant_integral_seeds.is_empty()
+        || seed.static_annotation != "none"
+        || !warm.subgraphs.is_empty()
+    {
+        return Err(policy_error(
+            "PALS CUDA Warm seed branch must be one complete latent Identity",
+        ));
+    }
+    let initial = &fresh.nodes[0];
+    if initial.index != 0
+        || !exported_serial_name(&initial.name, "route_private_initial_")
+        || initial.op != "If"
+        || !initial.domain.is_empty()
+        || initial.inputs != ["role_is_critic"]
+        || initial.outputs != [fresh_output]
+        || initial.static_annotation != "role_if_dispatch_candidate"
+        || !initial.constant_integral_seeds.is_empty()
+    {
+        return Err(policy_error(
+            "PALS CUDA Warm Fresh branch is not the original initial role If",
+        ));
+    }
+    let (critic_initial, proposer_initial) = direct_if_branches(fresh, initial)?;
+    for branch in [critic_initial, proposer_initial] {
+        if !branch.inputs.is_empty()
+            || branch.initializer_count != Some(0)
+            || !branch.integral_initializers.is_empty()
+            || branch.outputs.len() != 1
+            || branch.outputs[0].dtype != "FLOAT"
+            || branch.outputs[0].shape != latent
+            || !branch.subgraphs.is_empty()
+        {
+            return Err(policy_error(
+                "PALS original initial role branch has unexpected IO or weights",
+            ));
+        }
+    }
+    let mut role_consumers = Vec::new();
+    consumers(scope, "role_is_critic", &mut role_consumers);
+    let mut condition_nodes = Vec::new();
+    let mut destination = None;
+    let mut ffn_count = 0;
+    let mut heads_count = 0;
+    for (owner, node) in role_consumers {
+        if node.inputs != ["role_is_critic"] {
+            return Err(policy_error(
+                "PALS CUDA Warm role has another data consumer",
+            ));
+        }
+        if owner.path == scope.path && node.op == "Identity" {
+            if node.name != "output_is_critic"
+                || node.outputs != ["is_critic"]
+                || node.static_annotation != "role_scalar_identity_candidate"
+                || destination.replace(node.name.clone()).is_some()
+            {
+                return Err(policy_error(
+                    "PALS CUDA Warm role destination is not unique",
+                ));
+            }
+        } else if node.op == "If"
+            && node.static_annotation == "role_if_dispatch_candidate"
+            && ((owner.path == fresh.path && node.name == initial.name)
+                || (owner.path == scope.path
+                    && (exported_serial_name(&node.name, "route_private_ffn_")
+                        || exported_serial_name(&node.name, "route_private_heads_"))))
+        {
+            let (then, otherwise) = direct_if_branches(owner, node)?;
+            if [then, otherwise]
+                .iter()
+                .any(|branch| !branch.inputs.is_empty() || branch.initializer_count != Some(0))
+            {
+                return Err(policy_error(
+                    "PALS CUDA Warm private role branch has copied inputs or weights",
+                ));
+            }
+            if owner.path == scope.path {
+                if exported_serial_name(&node.name, "route_private_ffn_") {
+                    ffn_count += 1;
+                }
+                if exported_serial_name(&node.name, "route_private_heads_") {
+                    heads_count += 1;
+                }
+            }
+            condition_nodes.push(node.name.clone());
+        } else {
+            return Err(policy_error(
+                "PALS CUDA Warm has an unregistered nested role consumer",
+            ));
+        }
+    }
+    let mut mode_consumers = Vec::new();
+    consumers(scope, "warm_start", &mut mode_consumers);
+    let mut seed_consumers = Vec::new();
+    consumers(scope, "initial_latent", &mut seed_consumers);
+    if condition_nodes.len() != 6
+        || ffn_count != 4
+        || heads_count != 1
+        || mode_consumers.len() != 1
+        || mode_consumers[0].0.path != scope.path
+        || mode_consumers[0].1.name != mode.name
+        || seed_consumers.len() != 1
+        || seed_consumers[0].0.path != warm.path
+        || seed_consumers[0].1.name != seed.name
+    {
+        return Err(policy_error(
+            "PALS CUDA Warm control consumers differ from the registered route",
+        ));
+    }
+    let destination =
+        destination.ok_or_else(|| policy_error("PALS CUDA Warm role output is absent"))?;
+    let mut required_cuda_dispatch: BTreeSet<_> = condition_nodes.iter().cloned().collect();
+    required_cuda_dispatch.insert(mode.name.clone());
+    required_cuda_dispatch.insert(seed.name.clone());
+    required_cuda_dispatch.insert(destination.clone());
+    Ok(CudaWarmControlRoute {
+        root_scope: scope.path.clone(),
+        mode_node: mode.name.clone(),
+        role_transfer: RoleTransferPolicy {
+            scope: scope.path.clone(),
+            destination_node: destination,
+            host_condition_nodes: condition_nodes,
+        },
+        required_cuda_dispatch,
+    })
 }
 
 fn role_transfer_policy(role: &str, scope: &InventoryScope) -> Option<RoleTransferPolicy> {
@@ -892,7 +1249,7 @@ fn verify_control_transfer(
             _ => {
                 return Err(policy_error(
                     "PALS generated transfer origin/count metadata is unapproved",
-                ))
+                ));
             }
         }
     }
@@ -1021,6 +1378,15 @@ fn verify_placement(
         ));
     }
     let (cuda_nodes, cpu_nodes) = (headers[CUDA], headers[CPU]);
+    if policy.required_cuda_dispatch.iter().any(|name| {
+        !nodes
+            .get(name)
+            .is_some_and(|(op, provider)| policy.nodes.get(name) == Some(op) && provider == CUDA)
+    }) {
+        return Err(policy_error(
+            "PALS CUDA Warm lacks exact pre-Run CUDA mode, seed, or role consumer placement",
+        ));
+    }
     let approved_transfers = verify_control_transfer(policy, log, &nodes, &copies)?;
     if !began || cuda_nodes + cpu_nodes > policy.nodes.len() + approved_transfers.len() {
         return Err(policy_error("PALS placement evidence missing"));
@@ -1151,7 +1517,7 @@ fn verify_profile(
             _ => {
                 return Err(policy_error(
                     "PALS kernel is unapproved CPU inference or unknown placement",
-                ))
+                ));
             }
         }
     }
@@ -1476,6 +1842,7 @@ mod tests {
             proposer_private: [("p_nn".into(), "Gemm".into())].into(),
             critic_private: [("c_nn".into(), "Gemm".into())].into(),
             role_transfer: None,
+            required_cuda_dispatch: BTreeSet::new(),
         }
     }
     fn log(lines: &[&str]) -> PlacementLog {
@@ -1537,6 +1904,342 @@ mod tests {
             .capture_transfer("Add MemcpyFromHost after role_is_critic for CUDAExecutionProvider");
         captured.capture_transfer(COPY_SUMMARY);
         (policy, captured)
+    }
+    fn warm_node(
+        index: usize,
+        name: &str,
+        op: &str,
+        input: &str,
+        outputs: Vec<String>,
+    ) -> serde_json::Value {
+        let (annotation, origin) = match op {
+            "If" if input == "warm_start" => (CUDA_WARM_IF_ANNOTATION, "cuda_warm_mode_control"),
+            "If" => ("role_if_dispatch_candidate", "role_control"),
+            "Identity" if input == "role_is_critic" => {
+                ("role_scalar_identity_candidate", "role_control")
+            }
+            "Gemm" => ("major_nn_requires_cuda", "model_data_or_unknown"),
+            "Shape" => ("shape_metadata_candidate", "model_data_or_unknown"),
+            _ => ("none", "model_data_or_unknown"),
+        };
+        serde_json::json!({"index":index,"name":name,"domain":"","op":op,
+            "inputs":[input],"outputs":outputs,"input_origins":[origin],
+            "constant_integral_seeds":[],"static_annotation":annotation,"actual_provider":"unknown",
+            "attribute_names":if op == "If" { vec!["then_branch","else_branch"] } else { vec![] }})
+    }
+    fn warm_scope_value() -> serde_json::Value {
+        let latent = serde_json::json!(["batch", 16, 384]);
+        let branch = |path: String, tag: &str| {
+            let output = format!("{tag}_latent");
+            serde_json::json!({"path":path,"inputs":[],"outputs":[
+                {"name":output,"dtype":"FLOAT","shape":latent}],
+                "integral_initializers":[],"initializer_count":0,
+                "nodes":[warm_node(0,&format!("{tag}_nn"),"Gemm","query",vec![output])],"subgraphs":[]})
+        };
+        let selected = "selected_private_initial_10";
+        let mode_path = "shared_pc/node0:private_warm_mode";
+        let fresh_path = format!("{mode_path}/else_branch");
+        let initial_name = "route_private_initial_9";
+        let initial_path = format!("{fresh_path}/node0:{initial_name}");
+        let warm = serde_json::json!({"path":format!("{mode_path}/then_branch"),"inputs":[],
+            "outputs":[{"name":format!("{selected}__warm_branch"),"dtype":"FLOAT","shape":latent}],
+            "integral_initializers":[],"initializer_count":0,
+            "nodes":[warm_node(0,"consume_complete_private_seed","Identity","initial_latent",vec![format!("{selected}__warm_branch")])],
+            "subgraphs":[]});
+        let fresh = serde_json::json!({"path":fresh_path,"inputs":[],
+            "outputs":[{"name":format!("{selected}__fresh_branch"),"dtype":"FLOAT","shape":latent}],
+            "integral_initializers":[],"initializer_count":0,
+            "nodes":[warm_node(0,initial_name,"If","role_is_critic",vec![format!("{selected}__fresh_branch")])],
+            "subgraphs":[branch(format!("{initial_path}/then_branch"),"critic_initial"),
+                branch(format!("{initial_path}/else_branch"),"proposer_initial")]});
+        let mut nodes = vec![warm_node(
+            0,
+            "private_warm_mode",
+            "If",
+            "warm_start",
+            vec![selected.into()],
+        )];
+        let mut subgraphs = vec![warm, fresh];
+        for index in 1..=5 {
+            let name = format!(
+                "route_private_{}_{}",
+                if index == 5 { "heads" } else { "ffn" },
+                index + 10
+            );
+            nodes.push(warm_node(
+                index,
+                &name,
+                "If",
+                "role_is_critic",
+                vec![format!("selected_{index}")],
+            ));
+            for (suffix, role) in [("then_branch", "critic"), ("else_branch", "proposer")] {
+                subgraphs.push(branch(
+                    format!("shared_pc/node{index}:{name}/{suffix}"),
+                    &format!("{role}_route_{index}"),
+                ));
+            }
+        }
+        nodes.push(warm_node(
+            6,
+            "output_is_critic",
+            "Identity",
+            "role_is_critic",
+            vec!["is_critic".into()],
+        ));
+        nodes.push(warm_node(
+            7,
+            "shape_node",
+            "Shape",
+            "query",
+            vec!["query_shape".into()],
+        ));
+        nodes.push(warm_node(
+            8,
+            "nn",
+            "Gemm",
+            "query",
+            vec!["shared_features".into()],
+        ));
+        serde_json::json!({"path":"shared_pc","inputs":[
+            {"name":"role_is_critic","dtype":"BOOL","shape":[]},
+            {"name":"warm_start","dtype":"BOOL","shape":[]},
+            {"name":"initial_latent","dtype":"FLOAT","shape":latent},
+            {"name":"query","dtype":"FLOAT","shape":["batch",16]}],
+            "outputs":[{"name":"is_critic","dtype":"BOOL","shape":[]}],
+            "integral_initializers":[],"initializer_count":1,"nodes":nodes,"subgraphs":subgraphs})
+    }
+    fn inspected_warm(scope: &InventoryScope) -> Result<GraphPolicy, BackendError> {
+        let route = cuda_warm_control_route("shared_pc", scope)?;
+        let mut policy = GraphPolicy {
+            digest: [1; 32],
+            nodes: BTreeMap::new(),
+            controls: BTreeMap::new(),
+            major: BTreeMap::new(),
+            proposer_private: BTreeMap::new(),
+            critic_private: BTreeMap::new(),
+            role_transfer: Some(route.role_transfer.clone()),
+            required_cuda_dispatch: route.required_cuda_dispatch.clone(),
+        };
+        inspect_scope_with_layout(
+            scope,
+            &BTreeMap::new(),
+            &mut policy,
+            &mut BTreeSet::new(),
+            &mut 0,
+            Some(&route),
+            None,
+        )?;
+        Ok(policy)
+    }
+    fn warm_graph_log() -> (GraphPolicy, PlacementLog) {
+        let scope = serde_json::from_value(warm_scope_value()).unwrap();
+        let policy = inspected_warm(&scope).unwrap();
+        let mut captured = log(&[
+            "Node placements",
+            "Node(s) placed on [CPUExecutionProvider]. Number of nodes: 1",
+            "Shape (shape_node)",
+        ]);
+        captured.capture(&format!(
+            "Node(s) placed on [{CUDA}]. Number of nodes: {}",
+            policy.nodes.len()
+        ));
+        for (name, op) in &policy.nodes {
+            if name != "shape_node" {
+                captured.capture(&format!("{op} ({name})"));
+            }
+        }
+        captured.capture("MemcpyFromHost (Memcpy)");
+        captured
+            .capture_transfer("Add MemcpyFromHost after role_is_critic for CUDAExecutionProvider");
+        captured.capture_transfer(COPY_SUMMARY);
+        (policy, captured)
+    }
+    #[test]
+    fn cuda_warm_route_is_separate_from_legacy_and_classifies_only_actual_role_branches() {
+        let scope: InventoryScope = serde_json::from_value(warm_scope_value()).unwrap();
+        assert!(role_transfer_policy("shared_pc", &scope).is_none());
+        assert!(inspect_scope(
+            &scope,
+            &BTreeMap::new(),
+            &mut graph(),
+            &mut BTreeSet::new(),
+            &mut 0
+        )
+        .is_err());
+        let policy = inspected_warm(&scope).unwrap();
+        assert_eq!(policy.required_cuda_dispatch.len(), 9);
+        assert_eq!(
+            policy
+                .role_transfer
+                .as_ref()
+                .unwrap()
+                .host_condition_nodes
+                .len(),
+            6
+        );
+        assert!(policy.critic_private.contains_key("critic_initial_nn"));
+        assert!(!policy.proposer_private.contains_key("critic_initial_nn"));
+        assert!(policy.proposer_private.contains_key("proposer_initial_nn"));
+        assert!(!policy.critic_private.contains_key("proposer_initial_nn"));
+        assert!(!policy.critic_private.contains_key("nn"));
+        assert!(!policy.proposer_private.contains_key("nn"));
+        assert!(!policy.controls.contains_key("private_warm_mode"));
+        assert!(!policy
+            .controls
+            .contains_key("consume_complete_private_seed"));
+        assert!(cuda_warm_control_route("public", &scope).is_err());
+    }
+    #[test]
+    fn cuda_warm_rejects_arbitrary_bool_if_seed_math_extra_branch_weights_and_nested_role_consumers(
+    ) {
+        type AlterWarmScope = Box<dyn Fn(&mut serde_json::Value)>;
+        let cases: Vec<(&str, AlterWarmScope)> = vec![
+            (
+                "vector_mode",
+                Box::new(|v| v["inputs"][1]["shape"] = serde_json::json!([1])),
+            ),
+            (
+                "partial_seed",
+                Box::new(|v| v["inputs"][2]["shape"] = serde_json::json!(["batch", 16, 383])),
+            ),
+            (
+                "arbitrary_bool",
+                Box::new(|v| v["nodes"][0]["inputs"] = serde_json::json!(["another_bool"])),
+            ),
+            (
+                "other_mode",
+                Box::new(|v| v["nodes"][0]["name"] = serde_json::json!("unregistered_mode")),
+            ),
+            (
+                "extra_attribute",
+                Box::new(|v| {
+                    v["nodes"][0]["attribute_names"] =
+                        serde_json::json!(["then_branch", "else_branch", "extra"])
+                }),
+            ),
+            (
+                "seed_math",
+                Box::new(|v| v["subgraphs"][0]["nodes"][0]["op"] = serde_json::json!("Add")),
+            ),
+            (
+                "query_double_add",
+                Box::new(|v| {
+                    v["subgraphs"][0]["nodes"][0]["inputs"] =
+                        serde_json::json!(["initial_latent", "query"])
+                }),
+            ),
+            (
+                "seed_weights",
+                Box::new(|v| v["subgraphs"][0]["initializer_count"] = serde_json::json!(1)),
+            ),
+            (
+                "missing_seed_weight_attestation",
+                Box::new(|v| {
+                    v["subgraphs"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("initializer_count");
+                }),
+            ),
+            (
+                "extra_seed_node",
+                Box::new(|v| {
+                    let extra = v["subgraphs"][0]["nodes"][0].clone();
+                    v["subgraphs"][0]["nodes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(extra);
+                }),
+            ),
+            (
+                "nonoriginal_fresh",
+                Box::new(|v| {
+                    v["subgraphs"][1]["nodes"][0]["name"] = serde_json::json!("other_role_initial")
+                }),
+            ),
+            (
+                "extra_fresh_node",
+                Box::new(|v| {
+                    let extra = v["subgraphs"][1]["nodes"][0].clone();
+                    v["subgraphs"][1]["nodes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(extra);
+                }),
+            ),
+            (
+                "nested_role_data",
+                Box::new(|v| {
+                    v["subgraphs"][2]["nodes"][0]["inputs"] = serde_json::json!(["role_is_critic"])
+                }),
+            ),
+            (
+                "another_role_head",
+                Box::new(|v| v["nodes"][1]["name"] = serde_json::json!("route_private_heads_99")),
+            ),
+            (
+                "misstated_mode_flow",
+                Box::new(|v| {
+                    v["nodes"][0]["input_origins"] = serde_json::json!(["small_integral_constant"])
+                }),
+            ),
+        ];
+        for (name, alter) in cases {
+            let mut value = warm_scope_value();
+            alter(&mut value);
+            let scope: InventoryScope = serde_json::from_value(value).unwrap();
+            assert!(inspected_warm(&scope).is_err(), "{name}");
+        }
+    }
+    #[test]
+    fn cuda_warm_requires_actual_cuda_dispatch_and_original_single_role_copy_evidence() {
+        let (policy, mut captured) = warm_graph_log();
+        let placement = verify_placement("shared_pc", &policy, &captured).unwrap();
+        assert_eq!(placement.approved_transfers.len(), 1);
+        assert!(placement.approved_transfers[0]
+            .host_condition_nodes
+            .contains(&"route_private_initial_9".into()));
+        captured
+            .lines
+            .retain(|line| line != "If (route_private_initial_9)");
+        assert!(verify_placement("shared_pc", &policy, &captured).is_err());
+        let (_, mut bad) = warm_graph_log();
+        bad.transfer_lines[0] =
+            "Add MemcpyFromHost after warm_start for CUDAExecutionProvider".into();
+        assert!(verify_placement("shared_pc", &policy, &bad).is_err());
+        let (_, mut bad) = warm_graph_log();
+        bad.transfer_lines[1] = COPY_SUMMARY.replacen("1 Memcpy", "2 Memcpy", 1);
+        assert!(verify_placement("shared_pc", &policy, &bad).is_err());
+        let (_, mut bad) = warm_graph_log();
+        bad.lines[2] = "If (private_warm_mode)".into();
+        assert!(verify_placement("shared_pc", &policy, &bad).is_err());
+        let (_, mut bad) = warm_graph_log();
+        bad.lines[2] = "Gemm (critic_initial_nn)".into();
+        assert!(verify_placement("shared_pc", &policy, &bad).is_err());
+    }
+    #[test]
+    fn cuda_warm_profile_fresh_critic_scope_cannot_also_attest_proposer_or_allow_cpu_nn() {
+        let (policy, captured) = warm_graph_log();
+        let transfers = verify_placement("shared_pc", &policy, &captured)
+            .unwrap()
+            .approved_transfers;
+        let event = |node: &str, provider: &str| serde_json::json!({"cat":"Node","name":format!("{node}_kernel_time"),"args":{"provider":provider,"op_name":"Gemm"}});
+        let critic_only =
+            serde_json::to_vec(&vec![event("critic_initial_nn", CUDA), event("nn", CUDA)]).unwrap();
+        let witness = verify_profile(&critic_only, &policy, &transfers).unwrap();
+        assert_eq!(witness.critic_private_kernels, 1);
+        assert_eq!(witness.proposer_private_kernels, 0);
+        let both = serde_json::to_vec(&vec![
+            event("critic_initial_nn", CUDA),
+            event("proposer_initial_nn", CUDA),
+        ])
+        .unwrap();
+        let witness = verify_profile(&both, &policy, &transfers).unwrap();
+        assert_eq!(witness.critic_private_kernels, 1);
+        assert_eq!(witness.proposer_private_kernels, 1);
+        let cpu = serde_json::to_vec(&vec![event("critic_initial_nn", CPU)]).unwrap();
+        assert!(verify_profile(&cpu, &policy, &transfers).is_err());
     }
     #[test]
     fn role_transfer_source_requires_scalar_bool_unique_root_destination_and_six_host_conditions() {
@@ -1721,6 +2424,7 @@ mod tests {
             outputs: outputs.iter().map(|name| (*name).into()).collect(),
             static_annotation: annotation.into(),
             actual_provider: "unknown".into(),
+            attribute_names: None,
             input_origins: input_origins.iter().map(|name| (*name).into()).collect(),
             constant_integral_seeds: Vec::new(),
         };
@@ -1738,6 +2442,7 @@ mod tests {
                 shape: vec![],
                 source: "graph_initializer_metadata".into(),
             }],
+            initializer_count: None,
             nodes: vec![
                 node(
                     0,
