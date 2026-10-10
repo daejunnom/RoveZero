@@ -6337,15 +6337,13 @@ mod native {
                         .map_err(model_error)?
                 }),
                 history: Digest(input.history_digest),
-                candidates: Digest(
-                    Sha256::digest(
-                        packed_candidates
-                            .iter()
-                            .flat_map(|c| c.to_le_bytes())
-                            .collect::<Vec<_>>(),
-                    )
-                    .into(),
-                ),
+                candidates: Digest({
+                    let mut hash = Sha256::new();
+                    for candidate in &packed_candidates {
+                        hash.update(candidate.to_le_bytes());
+                    }
+                    hash.finalize().into()
+                }),
                 mask_positions: Digest(
                     Sha256::digest(
                         [
