@@ -1128,6 +1128,304 @@ mod tests {
         total.tt_hits += part.tt_hits;
     }
 
+    #[test]
+    #[ignore = "opt-in API cost probe; fixed interrupted workload, not a strength result"]
+    fn cost_same_interrupted_workload() {
+        use std::fmt::Write as _;
+
+        const FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+        const TARGET_DEPTH: u16 = 2;
+        const TT_ENTRIES: usize = 64;
+        const NODE_LIMIT_SCRIPT: [u64; 16] = [64; 16];
+        const WARMUPS: usize = 3;
+        const MEASUREMENTS: usize = 5;
+        const WALL_LIMIT: Duration = Duration::from_secs(45);
+
+        struct Attempt {
+            api: &'static str,
+            span: Duration,
+            work_delta: CpuWork,
+            before: Option<CpuPausedStackSnapshot>,
+            after: Option<CpuPausedStackSnapshot>,
+            returned_token: bool,
+            token_is_paused_stack: bool,
+            token_bytes: Option<usize>,
+            completion: CpuCompletion,
+            completed_depth: u16,
+        }
+
+        struct Sample {
+            policy: CpuResumePolicy,
+            attempts: Vec<Attempt>,
+            api_span: Duration,
+            work: CpuWork,
+            resumes: usize,
+            final_report: Option<CpuReport>,
+            not_exercised: Option<&'static str>,
+        }
+
+        fn interrupted(policy: CpuResumePolicy, deadline: Instant) -> Sample {
+            // A fresh owner gives both policies the same empty TT and history.
+            // Setup, token checks, snapshots and assertions are outside API spans.
+            let position = Position::from_fen(FEN).unwrap();
+            let initial_position = position.snapshot();
+            let cancellation = AtomicBool::new(false);
+            let mut engine = CpuEngine::with_evaluator_ordering_and_resume_policy(
+                config(TT_ENTRIES),
+                Arc::new(BootstrapCpuValue::default()),
+                CpuOrderingPolicy::LegalSeeV1,
+                policy,
+            )
+            .unwrap();
+            let mut sample = Sample {
+                policy,
+                attempts: Vec::with_capacity(NODE_LIMIT_SCRIPT.len()),
+                api_span: Duration::ZERO,
+                work: CpuWork::default(),
+                resumes: 0,
+                final_report: None,
+                not_exercised: Some("fixed_script_exhausted"),
+            };
+            let mut token: Option<CpuResumeToken> = None;
+            for max_nodes in NODE_LIMIT_SCRIPT {
+                if Instant::now() >= deadline {
+                    sample.not_exercised = Some("global_wall_limit");
+                    break;
+                }
+                let limits = CpuLimits {
+                    max_depth: TARGET_DEPTH,
+                    max_nodes,
+                    deadline: Some(deadline),
+                };
+                let before = engine.paused_stack_snapshot();
+                let (api, result, span) = if let Some(token) = token.as_ref() {
+                    assert!(engine.token_is_current(token));
+                    sample.resumes += 1;
+                    let start = Instant::now();
+                    let result = engine.resume(&position, token, limits, &cancellation);
+                    let span = start.elapsed();
+                    ("resume", result, span)
+                } else {
+                    let start = Instant::now();
+                    let result = engine.analyze(&position, limits, &cancellation);
+                    let span = start.elapsed();
+                    ("analyze", result, span)
+                };
+                let mut report = result.expect("actual API failure is not not_exercised");
+                // last_attempt_work is already the fresh delta for this call;
+                // subtracting the preceding call would miscount replayed work.
+                let work_delta = engine.last_attempt_work().expect("CpuEngine observes work");
+                let after = engine.paused_stack_snapshot();
+                assert_eq!(work_delta.nodes, report.nodes);
+                assert_eq!(work_delta.quiescence_nodes, report.quiescence_nodes);
+                assert_eq!(work_delta.tt_hits, report.tt_hits);
+                assert!(work_delta.nodes <= max_nodes);
+                assert!(initial_position.same_state(&position.snapshot()));
+                match policy {
+                    CpuResumePolicy::CompletedIteration => {
+                        assert!(before.is_none() && after.is_none());
+                    }
+                    CpuResumePolicy::PausedStack => {
+                        let before = before.unwrap();
+                        let after = after.unwrap();
+                        assert_eq!(before.owner_id, after.owner_id);
+                        assert!(after.complete);
+                        assert!(after.tokens_retained <= 1);
+                        assert!(after.bytes_current <= CPU_PAUSED_STACK_MAX_BYTES as u64);
+                        assert!(after.bytes_peak <= CPU_PAUSED_STACK_MAX_BYTES as u64);
+                        assert_eq!(after.replayed_consumed_work, 0);
+                    }
+                }
+                sample.api_span += span;
+                add(&mut sample.work, work_delta);
+                let returned_token = report.resume.is_some();
+                let token_is_paused_stack = report
+                    .resume
+                    .as_ref()
+                    .is_some_and(CpuResumeToken::is_paused_stack);
+                let token_bytes = report
+                    .resume
+                    .as_ref()
+                    .and_then(CpuResumeToken::paused_stack_bytes);
+                sample.attempts.push(Attempt {
+                    api,
+                    span,
+                    work_delta,
+                    before,
+                    after,
+                    returned_token,
+                    token_is_paused_stack,
+                    token_bytes,
+                    completion: report.completion,
+                    completed_depth: report.completed_depth,
+                });
+                let completion = report.completion;
+                let completed_depth = report.completed_depth;
+                token = report.resume.take();
+                sample.final_report = Some(report);
+                if completion == CpuCompletion::DepthLimit {
+                    sample.not_exercised = if completed_depth != TARGET_DEPTH {
+                        Some("target_depth_not_reached")
+                    } else if sample.resumes == 0 {
+                        Some("no_node_limit_resume")
+                    } else {
+                        None
+                    };
+                    break;
+                }
+                if completion != CpuCompletion::NodeLimit {
+                    sample.not_exercised = Some(if completion == CpuCompletion::Deadline {
+                        "global_wall_limit"
+                    } else {
+                        "non_node_limit_completion"
+                    });
+                    break;
+                }
+                if token.is_none() {
+                    sample.not_exercised = Some("resume_token_unavailable_at_fixed_budget");
+                    break;
+                }
+            }
+            // This disposes only this owner's frames after measurement. Snapshot
+            // rows prove traversal accounting, not bridge closure/owner release.
+            engine.discard_paused_stack();
+            sample
+        }
+
+        let deadline = Instant::now() + WALL_LIMIT;
+        let mut output = String::new();
+        writeln!(
+            output,
+            "cpu_cost_manifest fen={FEN:?} ordering={} tt_entries={TT_ENTRIES} \
+             config_max_depth=4 quiescence_ply=4 target_depth={TARGET_DEPTH} \
+             node_limit_script={NODE_LIMIT_SCRIPT:?} warmups={WARMUPS} \
+             measurements={MEASUREMENTS} wall_limit_seconds=45 \
+             timer=API_entry_to_return setup_in_timer=false \
+             comparison=same_interrupted_workload budget_adaptation=false \
+             fresh_TT_and_history_per_owner=true paused_snapshot_None=unavailable \
+             max_API_calls=256",
+            CpuOrderingPolicy::LegalSeeV1.identity(),
+        )
+        .unwrap();
+        let mut warmups_exercised = true;
+        let mut measurements_exercised = 0;
+        let mut measured_api_spans = [Duration::ZERO; 2];
+        let mut measured_work = [CpuWork::default(); 2];
+        for repetition in 0..WARMUPS + MEASUREMENTS {
+            // Alternate order, but never transfer TT/history/tokens between owners.
+            let policies = if repetition % 2 == 0 {
+                [
+                    CpuResumePolicy::CompletedIteration,
+                    CpuResumePolicy::PausedStack,
+                ]
+            } else {
+                [
+                    CpuResumePolicy::PausedStack,
+                    CpuResumePolicy::CompletedIteration,
+                ]
+            };
+            let first = interrupted(policies[0], deadline);
+            let second = interrupted(policies[1], deadline);
+            let samples = if first.policy == CpuResumePolicy::CompletedIteration {
+                [first, second]
+            } else {
+                [second, first]
+            };
+            let exercised = samples.iter().all(|sample| sample.not_exercised.is_none());
+            if exercised {
+                let baseline = samples[0].final_report.as_ref().unwrap();
+                let paused = samples[1].final_report.as_ref().unwrap();
+                assert_eq!(
+                    (
+                        baseline.score,
+                        &baseline.pv,
+                        baseline.best_move,
+                        baseline.completed_depth
+                    ),
+                    (
+                        paused.score,
+                        &paused.pv,
+                        paused.best_move,
+                        paused.completed_depth
+                    ),
+                    "cost comparison requires the same completed workload result",
+                );
+            }
+            let warmup = repetition < WARMUPS;
+            if warmup {
+                warmups_exercised &= exercised;
+            } else if exercised {
+                measurements_exercised += 1;
+                for (index, sample) in samples.iter().enumerate() {
+                    measured_api_spans[index] += sample.api_span;
+                    add(&mut measured_work[index], sample.work);
+                }
+            }
+            for sample in &samples {
+                for (slice, attempt) in sample.attempts.iter().enumerate() {
+                    writeln!(
+                        output,
+                        "cpu_cost_attempt repetition={repetition} warmup={warmup} \
+                         policy={} slice={slice} node_limit={} api={} api_ns={} \
+                         work_delta={:?} returned_token={} token_is_paused_stack={} \
+                         token_bytes={:?} snapshot_before={:?} snapshot_after={:?} \
+                         completion={:?} completed_depth={}",
+                        sample.policy.identity(),
+                        NODE_LIMIT_SCRIPT[slice],
+                        attempt.api,
+                        attempt.span.as_nanos(),
+                        attempt.work_delta,
+                        attempt.returned_token,
+                        attempt.token_is_paused_stack,
+                        attempt.token_bytes,
+                        attempt.before,
+                        attempt.after,
+                        attempt.completion,
+                        attempt.completed_depth,
+                    )
+                    .unwrap();
+                }
+                writeln!(
+                    output,
+                    "cpu_cost_sample repetition={repetition} warmup={warmup} policy={} \
+                     status={} reason={:?} API_calls={} resumes={} api_ns={} work_delta_total={:?}",
+                    sample.policy.identity(),
+                    if sample.not_exercised.is_none() {
+                        "exercised"
+                    } else {
+                        "not_exercised"
+                    },
+                    sample.not_exercised,
+                    sample.attempts.len(),
+                    sample.resumes,
+                    sample.api_span.as_nanos(),
+                    sample.work,
+                )
+                .unwrap();
+            }
+        }
+        let comparison_ready = warmups_exercised && measurements_exercised == MEASUREMENTS;
+        writeln!(
+            output,
+            "cpu_cost_summary status={} warmups_exercised={warmups_exercised} \
+             measured_pairs_exercised={measurements_exercised}/{MEASUREMENTS} \
+             completed_iteration_api_ns={} paused_stack_api_ns={} \
+             completed_iteration_work={:?} paused_stack_work={:?} \
+             comparison_ready={comparison_ready} timing_scope=API_only",
+            if comparison_ready {
+                "exercised"
+            } else {
+                "not_exercised"
+            },
+            measured_api_spans[0].as_nanos(),
+            measured_api_spans[1].as_nanos(),
+            measured_work[0],
+            measured_work[1],
+        )
+        .unwrap();
+        print!("{output}");
+    }
+
     fn run_slices(
         engine: &mut CpuEngine,
         position: &Position,

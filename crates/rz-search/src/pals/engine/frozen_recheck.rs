@@ -1107,6 +1107,322 @@ mod tests {
             refutation,
         }
     }
+
+    /// Explicit CPU/mock API-span observation, separate from regular checks.
+    /// The enqueue/dedup spans can be queue-only; drain includes actual fixture
+    /// rechecks and repairs. Different observed work never yields a cost ratio.
+    #[test]
+    #[ignore = "opt-in bounded CPU/mock Repair queue cost observation"]
+    fn cost_fixed_repair_actions() {
+        use serde_json::{Value, json};
+        const WARMUPS: usize = 3;
+        const SAMPLES: usize = 5;
+        const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+
+        fn raw_counters(counters: PalsCounters) -> Value {
+            macro_rules! fields {
+                ($($field:ident),* $(,)?) => {{
+                    let mut result = serde_json::Map::new();
+                    $(result.insert(stringify!($field).into(), json!(counters.$field));)*
+                    Value::Object(result)
+                }};
+            }
+            fields!(
+                rounds,
+                proposals,
+                refutations,
+                repairs,
+                supported_refutations,
+                supported_repairs,
+                role_calls,
+                proposer_calls,
+                critic_calls,
+                repair_calls,
+                completed_proposer_calls,
+                completed_critic_calls,
+                completed_repair_calls,
+                consumed_role_outputs,
+                accepted_proposer_outputs,
+                accepted_critic_outputs,
+                accepted_repair_outputs,
+                value_calls,
+                completed_value_calls,
+                accepted_value_outputs,
+                external_checker_tasks,
+                external_checker_reports,
+                external_checker_nodes_observed,
+                external_checker_work_incomplete,
+                external_checker_node_budget_reserved,
+                consumed_external_checker_tasks,
+                cpu_tasks_requested,
+                cpu_tasks,
+                cpu_work_observation_incomplete,
+                cpu_nodes,
+                cpu_quiescence_nodes,
+                cpu_tt_hits,
+                completed_cpu_tasks,
+                partial_cpu_iterations,
+                consumed_cpu_tasks,
+                reused_completed_cpu_tasks_consumed,
+                consumed_partial_cpu_values,
+                consumed_frontier_cpu_values,
+                consumed_cached_cpu_values,
+                evidence_cache_hits,
+                examined_edges,
+                retained_situations,
+                root_scope_observation_complete,
+                unknown_root_children,
+                repair_queue_enqueued,
+                repair_queue_deduplicated,
+                repair_queue_without_new_evidence,
+                repair_queue_peak,
+                frozen_wdl_comparisons,
+                frozen_wdl_unresolved,
+            )
+        }
+        fn queue_state(selected: &PalsEngine<WdlFixture>, first: BoardMove) -> Value {
+            json!({
+                "pending": selected.repair_queue.len(),
+                "dedup_questions": selected.repair_questions.len(),
+                "first_move_repairs": selected.repair_counts.get(&first).copied().unwrap_or(0),
+                "record_revision": selected.revision,
+                "records": selected.records.len(),
+                "mock_value_revisions": selected.model.revisions,
+            })
+        }
+        fn observed_work(
+            selected: &PalsEngine<WdlFixture>,
+            mut counters: PalsCounters,
+        ) -> (PalsCounters, Vec<u64>, u64, usize) {
+            // Exclude queue bookkeeping only from the workload comparison;
+            // raw before/after counters below retain all four actual fields.
+            counters.repair_queue_enqueued = 0;
+            counters.repair_queue_deduplicated = 0;
+            counters.repair_queue_without_new_evidence = 0;
+            counters.repair_queue_peak = 0;
+            (
+                counters,
+                selected.model.revisions.clone(),
+                selected.revision,
+                selected.records.len(),
+            )
+        }
+
+        let stop_at = Instant::now() + Duration::from_secs(45);
+        let cancel = AtomicBool::new(false);
+        let mut rows = Vec::with_capacity(SAMPLES * 2 * 3);
+        let mut comparisons = Vec::with_capacity(SAMPLES);
+        let mut complete = true;
+        let mut warmups_completed = 0;
+        let mut samples_completed = 0;
+        for trial in 0..WARMUPS + SAMPLES {
+            if Instant::now() >= stop_at {
+                complete = false;
+                break;
+            }
+            // Both independent owners and their accepted frontier are prepared
+            // before either policy's timer. No new backend or search is added.
+            let mut immediate = engine(
+                PostRepairRecheckPolicy::FrozenModelWdlV2,
+                ResolverPolicy::ModelWdlRestricted,
+            );
+            let mut bounded = engine(
+                PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
+                ResolverPolicy::ModelWdlRestricted,
+            );
+            let mut immediate_counters = PalsCounters::default();
+            let mut bounded_counters = PalsCounters::default();
+            let immediate_work = accepted_repair(&mut immediate, &mut immediate_counters);
+            let bounded_work = accepted_repair(&mut bounded, &mut bounded_counters);
+            assert_eq!(immediate_work.original_first, bounded_work.original_first);
+            assert_eq!(immediate_work.repaired, bounded_work.repaired);
+            assert_eq!(immediate_work.refutation, bounded_work.refutation);
+            assert!(
+                immediate.nodes[immediate_work.root]
+                    .position
+                    .snapshot()
+                    .same_state(&bounded.nodes[bounded_work.root].position.snapshot())
+            );
+            assert!(
+                immediate.nodes[immediate_work.repaired_leaf]
+                    .position
+                    .snapshot()
+                    .same_state(
+                        &bounded.nodes[bounded_work.repaired_leaf]
+                            .position
+                            .snapshot()
+                    )
+            );
+            assert_eq!(immediate.model.identity, bounded.model.identity);
+            assert_eq!(
+                immediate.config.max_role_calls,
+                bounded.config.max_role_calls
+            );
+            assert_eq!(
+                immediate_work.repair_record_revision,
+                bounded_work.repair_record_revision
+            );
+            let mut budget = limits();
+            budget.deadline = budget.deadline.min(stop_at);
+            let measured = trial >= WARMUPS;
+            let mut workloads = Vec::with_capacity(2);
+            for (policy, selected, counters, work) in [
+                (
+                    "FrozenModelWdlV2",
+                    &mut immediate,
+                    &mut immediate_counters,
+                    immediate_work,
+                ),
+                (
+                    "IterativeFrozenModelWdlV2",
+                    &mut bounded,
+                    &mut bounded_counters,
+                    bounded_work,
+                ),
+            ] {
+                let question = json!({
+                    "first_move": work.original_first.to_uci(),
+                    "record_revision": work.repair_record_revision,
+                    "attack_ply": work.attack_ply,
+                    "repaired": work.repaired.iter().map(|m| m.to_uci()).collect::<Vec<_>>(),
+                    "refutation": work.refutation.iter().map(|m| m.to_uci()).collect::<Vec<_>>(),
+                    "root_fen": selected.nodes[work.root].position.to_fen(),
+                });
+                let first_move = work.original_first;
+                let first = work.clone();
+                let duplicate = work.clone();
+                let mut progress = |_: BoardMove| {};
+                for (action, queued) in [
+                    ("accepted_work", Some(first)),
+                    ("same_work_duplicate", Some(duplicate)),
+                    ("drain", None),
+                ] {
+                    if Instant::now() >= budget.deadline {
+                        complete = false;
+                        break;
+                    }
+                    let before = *counters;
+                    let queue_before = queue_state(selected, first_move);
+                    let work_before = observed_work(selected, before);
+                    // Only the actual API entry-to-return span is timed. Work
+                    // cloning, snapshots, assertions and JSON stay outside.
+                    let (outcome, elapsed) = if let Some(work) = queued {
+                        let started = Instant::now();
+                        let outcome = selected.queue_or_recheck_frozen(
+                            work,
+                            budget,
+                            &cancel,
+                            counters,
+                            &mut progress,
+                        );
+                        (outcome, started.elapsed())
+                    } else {
+                        let started = Instant::now();
+                        let outcome =
+                            selected.drain_repair_queue(budget, &cancel, counters, &mut progress);
+                        (outcome, started.elapsed())
+                    };
+                    let after = *counters;
+                    let work_after = observed_work(selected, after);
+                    let stopped = selected.stopped(budget, &cancel);
+                    if measured || outcome.is_err() || stopped.is_some() {
+                        rows.push(json!({
+                            "phase": if measured { "measurement" } else { "warmup" },
+                            "trial": trial,
+                            "policy": policy,
+                            "action": action,
+                            "question": question,
+                            "max_rounds": budget.max_rounds,
+                            "max_cpu_nodes": budget.max_cpu_nodes,
+                            "cpu_depth": budget.cpu_depth,
+                            "max_role_calls": selected.config.max_role_calls,
+                            "external_evidence_added_between_actions": 0,
+                            "api_ns": u64::try_from(elapsed.as_nanos()).ok(),
+                            "span_scope": if work_before == work_after {
+                                "queue_management_only"
+                            } else {
+                                "cpu_mock_recheck_or_repair_included"
+                            },
+                            "raw_counters_before": raw_counters(before),
+                            "raw_counters_after": raw_counters(after),
+                            "queue_before": queue_before,
+                            "queue_after": queue_state(selected, first_move),
+                            "original_error": outcome.as_ref().err().map(|e| format!("{e:?}")),
+                            "stop_cause": stopped.map(|s| format!("{s:?}")),
+                        }));
+                    }
+                    complete &= outcome.is_ok()
+                        && stopped.is_none()
+                        && selected.repair_queue.len() <= MAX_PENDING_REPAIRS
+                        && selected
+                            .repair_counts
+                            .values()
+                            .all(|count| *count <= MAX_REPAIRS_PER_FIRST)
+                        && selected
+                            .records
+                            .iter()
+                            .filter(|record| record.kind == RecordKind::Repair)
+                            .all(|record| record.line.first() == Some(&first_move));
+                    if !complete {
+                        break;
+                    }
+                }
+                workloads.push(observed_work(selected, *counters));
+                if !complete {
+                    break;
+                }
+            }
+            if measured {
+                let work_matches = workloads.len() == 2 && workloads[0] == workloads[1];
+                comparisons.push(json!({
+                    "trial": trial,
+                    "same_input_script": true,
+                    "same_original_deadline": true,
+                    "same_node_limit": budget.max_cpu_nodes,
+                    "same_depth": budget.cpu_depth,
+                    "observed_work_matches": work_matches,
+                    "comparability": if !complete || !work_matches {
+                        "not_comparable"
+                    } else {
+                        "matched_cpu_mock_api_work_only"
+                    },
+                    "cost_effect_ratio": null,
+                }));
+            }
+            if !complete {
+                break;
+            }
+            if measured {
+                samples_completed += 1;
+            } else {
+                warmups_completed += 1;
+            }
+        }
+        let report = json!({
+            "schema": "rz-pals-fixed-repair-api-cost/1",
+            "scope": "CPU/mock queue API spans; drain includes actual fixture recheck/repair work",
+            "product_disabled": "not_called: production Disabled never enters these queue APIs",
+            "backend": "existing WdlFixture and owned CPU checker",
+            "physical_nn_inputs": null,
+            "limits": { "warmups": WARMUPS, "samples": SAMPLES, "wall_ms": 45000,
+                "output_bytes_max": MAX_OUTPUT_BYTES, "pending": MAX_PENDING_REPAIRS,
+                "repairs_per_first_move": MAX_REPAIRS_PER_FIRST },
+            "warmups_completed": warmups_completed,
+            "samples_completed": samples_completed,
+            "complete": complete && Instant::now() < stop_at,
+            "comparisons": comparisons,
+            "api_spans": rows,
+        });
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert!(encoded.len() <= MAX_OUTPUT_BYTES);
+        println!("PALS_QUEUE_COST_JSON {encoded}");
+        // Failures retain their raw report above; they are never successful
+        // samples or a reason to change the selected policy/budgets silently.
+        assert_eq!(report["complete"], json!(true));
+        assert_eq!(warmups_completed, WARMUPS);
+        assert_eq!(samples_completed, SAMPLES);
+    }
+
     #[test]
     fn own_checker_and_model_resolver_are_independent_and_legacy_constructor_is_preserved() {
         let mut selected = engine(
