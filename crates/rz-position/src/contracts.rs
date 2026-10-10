@@ -369,6 +369,13 @@ pub fn profile_digest() -> shared::Digest {
     *PROFILE.get_or_init(|| shared::Digest(Sha256::digest(IDENTITY_PROFILE.as_bytes()).into()))
 }
 
+/// Read the existing Rules semantic identity, including exact known history.
+/// This pure observation does not issue an owner, revision, evaluation request
+/// or terminal proof; those remain the actual registry and Rules authorities.
+pub fn rules_snapshot_semantic_digest(snapshot: &PositionSnapshot) -> shared::Digest {
+    state_digest(snapshot)
+}
+
 fn state_digest(snapshot: &PositionSnapshot) -> shared::Digest {
     let mut hash = Sha256::new();
     frame(&mut hash, b"rz-position-state/1");
