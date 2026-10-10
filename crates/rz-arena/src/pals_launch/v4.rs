@@ -959,7 +959,7 @@ impl PalsArenaLaunchV4 {
                         ),
                         format!(
                             "--pals-device-public-memory={}",
-                            matches!(e.policies.cuda_warm, PalsCudaWarmPolicyV4::ApproxWarm(_))
+                            matches!(v4.policies.cuda_warm, PalsCudaWarmPolicyV4::ApproxWarm(_))
                         ),
                     ]);
                     if let Some(control) = &cuda.cuda_control {
