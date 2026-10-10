@@ -1671,16 +1671,17 @@ impl PalsStores {
         manager.verify_hot_owner(self)?;
         let baseline = manager.snapshot();
         let owner = Arc::downgrade(&manager.identity);
-        let old_pins = manager.pins.clone();
-        let mut combined = old_pins.clone();
-        combined.extend(&pins);
+        // The caller already owns its temporary/resident pins. Validate their
+        // union before moving the previous pins into the restoration guard.
+        let mut combined = pins;
+        combined.extend(&manager.pins);
         if let Err(error) = self.validate_pins(&combined) {
             manager.failure_after(baseline, &error);
             return Err(error);
         }
         let initial = *budget;
         let manager = self.archive.as_mut().expect("archive checked");
-        manager.pins = combined;
+        let old_pins = std::mem::replace(&mut manager.pins, combined);
         manager.auto_budget = Some(initial);
         manager.allocation_active = true;
         manager.used = true;
@@ -1774,11 +1775,13 @@ impl PalsStores {
             return Ok(false);
         }
         let manager = self.archive.as_ref().ok_or(StoreError::ArchiveDisabled)?;
-        let old_pins = manager.pins.clone();
-        let mut combined = old_pins.clone();
-        combined.extend(&extra);
+        let mut combined = extra;
+        combined.extend(&manager.pins);
         self.validate_pins(&combined)?;
-        self.archive.as_mut().expect("archive checked").pins = combined;
+        let old_pins = std::mem::replace(
+            &mut self.archive.as_mut().expect("archive checked").pins,
+            combined,
+        );
         let result = self.archive_inactive_inner(budget);
         let manager = self.archive.as_mut().expect("archive restored");
         manager.pins = old_pins;

@@ -1908,12 +1908,16 @@ fn scoped_allowance_rejects_second_budget_and_restores_pins_after_error_and_unwi
     old_pins.states.insert(state);
     store.set_archive_pins(old_pins.clone()).unwrap();
     let mut extra = StorePins::default();
+    extra.states.insert(state);
     extra.situations.insert(actual);
     let mut shared = budget();
     let original = shared;
     let conflict = StoreError::InvalidConditions("archive allocation allowance is active");
     let result: Result<(), StoreError> =
         store.with_archive_allocation(extra, &mut shared, |stores| {
+            let pins = &stores.archive.as_ref().unwrap().pins;
+            assert_eq!(pins.states, old_pins.states);
+            assert!(pins.situations.contains(&actual));
             let mut other = budget();
             let other_original = other;
             assert_eq!(
@@ -1975,6 +1979,20 @@ fn scoped_allowance_rejects_second_budget_and_restores_pins_after_error_and_unwi
     assert_eq!(manager.pins, old_pins);
     assert!(!manager.allocation_active);
     assert!(manager.auto_budget.is_none());
+    let mut invalid = StorePins::default();
+    invalid.states.insert(StateId(usize::MAX));
+    assert_eq!(
+        store.with_archive_allocation(invalid, &mut shared, |_| -> Result<(), StoreError> {
+            panic!("invalid pin must fail before operation")
+        }),
+        Err(StoreError::InvalidHandle("state"))
+    );
+    let manager = store.archive.as_ref().unwrap();
+    assert_eq!(manager.pins, old_pins);
+    assert!(!manager.allocation_active);
+    assert!(manager.auto_budget.is_none());
+    assert_eq!(shared.max_bytes, original.max_bytes);
+    assert_eq!(shared.deadline, original.deadline);
     store
         .with_archive_allocation(StorePins::default(), &mut shared, |_| Ok(()))
         .unwrap();
