@@ -8,15 +8,15 @@ use crate::asset::{self, parse_sha256};
 use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
 use crate::onnx::{NativeLoadingProfile, NativeMappingObservation, OrtRuntime, Provider};
 use crate::pals_model::{
-    MAX_LINE_PLY, PALS_ENCODING_SCHEMA, PALS_MODEL_SCHEMA, PalsModelConfig, PalsModelInput,
-    PalsModelProfile, PalsRawOutput, PalsRole, PreparedPalsFullLineTensors, PreparedPalsTensors,
-    QUERY_LINE_COUNT, V_TASK_NAMES,
+    PalsModelConfig, PalsModelInput, PalsModelProfile, PalsRawOutput, PalsRole,
+    PreparedPalsFullLineTensors, PreparedPalsTensors, MAX_LINE_PLY, PALS_ENCODING_SCHEMA,
+    PALS_MODEL_SCHEMA, QUERY_LINE_COUNT, V_TASK_NAMES,
 };
 use crate::worker::{PhysicalRun, SingleWorker};
 use ort::execution_providers::{
     ArenaExtendStrategy, CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider,
 };
-use ort::session::{Session, builder::GraphOptimizationLevel};
+use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::tensor::TensorElementType;
 use ort::value::{Tensor, ValueType};
 use rz_contracts::{Digest, PrecisionProfile};
@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 mod cuda_control;
@@ -42,46 +42,46 @@ pub use cuda_control::{
     PalsGraphOptimization, PalsGraphPlacement, PalsKernelWitness,
 };
 pub use device_packing_admission::{
+    DevicePackingAdmissionError, DevicePackingDeclaredResources, DevicePackingResourceDeclaration,
+    PackingArtifactPart, PackingArtifactRegistration, PackingNativeVerification,
+    PackingVerificationScope, RegisteredPackingArtifactBytes, RegisteredPackingBytePin,
     DEVICE_PACKING_DOMAIN, DEVICE_PACKING_GRAPH_FILE, DEVICE_PACKING_MANIFEST_FILE,
     DEVICE_PACKING_MAX_GRAPH_BYTES, DEVICE_PACKING_MAX_MANIFEST_BYTES,
-    DEVICE_PACKING_MAX_NODE_PAYLOAD_SUM, DEVICE_PACKING_SCHEMA, DevicePackingAdmissionError,
-    DevicePackingDeclaredResources, DevicePackingResourceDeclaration, PackingArtifactPart,
-    PackingArtifactRegistration, PackingNativeVerification, PackingVerificationScope,
-    RegisteredPackingArtifactBytes, RegisteredPackingBytePin,
+    DEVICE_PACKING_MAX_NODE_PAYLOAD_SUM, DEVICE_PACKING_SCHEMA,
 };
-pub use device_packing_assets::{DevicePackingAssetError, load_checked_fixed_packing_graph};
+pub use device_packing_assets::{load_checked_fixed_packing_graph, DevicePackingAssetError};
 pub use device_packing_graph::{
-    CheckedFixedPackingGraph, PACKING_GRAPH_BODY_INSPECTOR_VERSION,
-    PACKING_GRAPH_MAX_INSPECTION_HOST_BYTES, PACKING_GRAPH_MAX_WIRE_FIELDS, PackingGraphBodyError,
-    PackingGraphBodyInspection, PackingGraphBodyVerification, PackingGraphDataType,
-    PackingGraphDimension, PackingGraphInspectionBudget, PackingGraphName,
-    PackingGraphNodeDescriptor, PackingGraphShape, PackingGraphTensorDescriptor,
+    CheckedFixedPackingGraph, PackingGraphBodyError, PackingGraphBodyInspection,
+    PackingGraphBodyVerification, PackingGraphDataType, PackingGraphDimension,
+    PackingGraphInspectionBudget, PackingGraphName, PackingGraphNodeDescriptor, PackingGraphShape,
+    PackingGraphTensorDescriptor, PACKING_GRAPH_BODY_INSPECTOR_VERSION,
+    PACKING_GRAPH_MAX_INSPECTION_HOST_BYTES, PACKING_GRAPH_MAX_WIRE_FIELDS,
 };
 #[cfg(feature = "experimental-io-binding")]
 pub use device_pages_plan::native::{
-    CudaRecordPageSnapshot, CudaRecordPageStats, resident_cuda_minimum_metadata_host_bytes,
+    resident_cuda_minimum_metadata_host_bytes, CudaRecordPageSnapshot, CudaRecordPageStats,
 };
 pub use device_pages_plan::{
-    CpuOwnedPublicBacking, DEVICE_PAGE_RECORD_CAPACITY, DevicePageDomain, DevicePageError,
-    DevicePageInvocationDeclaration, DevicePageNamespace, DevicePagePayload, DevicePagePlan,
-    DevicePageReservation, DevicePagesLimits, DevicePagesRegistry, DeviceProjectionOffset,
-    DevicePublicBacking, DevicePublicBlock, DevicePublicBlockDescriptor,
-    device_packing_maximum_node_payload_sum,
+    device_packing_maximum_node_payload_sum, CpuOwnedPublicBacking, DevicePageDomain,
+    DevicePageError, DevicePageInvocationDeclaration, DevicePageNamespace, DevicePagePayload,
+    DevicePagePlan, DevicePageReservation, DevicePagesLimits, DevicePagesRegistry,
+    DeviceProjectionOffset, DevicePublicBacking, DevicePublicBlock, DevicePublicBlockDescriptor,
+    DEVICE_PAGE_RECORD_CAPACITY,
 };
 pub use public_pages::{HostRecordPagePolicy, HostRecordPageSnapshot, HostRecordPageStats};
 #[cfg(feature = "experimental-io-binding")]
 pub use warm::cuda::{
-    PRIVATE_CUDA_QUERY_SEMANTICS, PRIVATE_CUDA_WARM_EXECUTION_DOMAIN,
-    PRIVATE_CUDA_WARM_GRAPH_SEMANTICS, PRIVATE_CUDA_WARM_MEASUREMENT_CONTRACT,
-    PRIVATE_CUDA_WARM_SCHEMA, PalsCudaWarmCapability, PalsCudaWarmExecutionBinding,
+    cuda_private_warm_implementation_digest, PalsCudaWarmCapability, PalsCudaWarmExecutionBinding,
     PalsCudaWarmInput, PalsCudaWarmInvocationObservation, PalsCudaWarmInvocationPurpose,
     PalsCudaWarmInvocationState, PalsCudaWarmObservationHandle, PalsCudaWarmObservationSnapshot,
     PalsCudaWarmObservationStatus, PalsCudaWarmOwnerObservation, PalsCudaWarmRuntimeLimits,
-    cuda_private_warm_implementation_digest,
+    PRIVATE_CUDA_QUERY_SEMANTICS, PRIVATE_CUDA_WARM_EXECUTION_DOMAIN,
+    PRIVATE_CUDA_WARM_GRAPH_SEMANTICS, PRIVATE_CUDA_WARM_MEASUREMENT_CONTRACT,
+    PRIVATE_CUDA_WARM_SCHEMA,
 };
 pub use warm::{
-    FROZEN_QUERY_SEMANTICS_V1, PRIVATE_WARM_GRAPH_SEMANTICS, PRIVATE_WARM_SCHEMA,
-    PalsWarmCapability, PalsWarmInput,
+    PalsWarmCapability, PalsWarmInput, FROZEN_QUERY_SEMANTICS_V1, PRIVATE_WARM_GRAPH_SEMANTICS,
+    PRIVATE_WARM_SCHEMA,
 };
 
 /// Implementation provenance only. Changing this source digest does not
@@ -4477,14 +4477,12 @@ mod tests {
         );
         let poisoned = HostRecordPageObservationHandle::new(host_page_observation_fixture());
         let other = poisoned.clone();
-        assert!(
-            std::thread::spawn(move || {
-                let _guard = other.0.latest.lock().unwrap();
-                panic!("poison metadata-only host page observation fixture");
-            })
-            .join()
-            .is_err()
-        );
+        assert!(std::thread::spawn(move || {
+            let _guard = other.0.latest.lock().unwrap();
+            panic!("poison metadata-only host page observation fixture");
+        })
+        .join()
+        .is_err());
         let snapshot = poisoned.snapshot();
         assert_eq!(snapshot.status, HostRecordPageObservationStatus::Poisoned);
         assert!(snapshot.latest.is_some());
@@ -4524,12 +4522,10 @@ mod tests {
         trace.update_input(|slot| *slot = Some(metadata(&trace, &input())));
         let frozen = legacy.snapshot_and_stop();
         assert!(frozen.input_observations.is_none());
-        assert!(
-            serde_json::to_value(frozen)
-                .unwrap()
-                .get("input_observations")
-                .is_none()
-        );
+        assert!(serde_json::to_value(frozen)
+            .unwrap()
+            .get("input_observations")
+            .is_none());
 
         let probe = PalsStartupStageProbe::new();
         assert!(probe.start_with_input_observations(Instant::now()));
@@ -4561,11 +4557,9 @@ mod tests {
         assert_ne!(observations[0].input_key, observations[1].input_key);
         assert_eq!(observations[0].role_evaluation_returned_ok, Some(true));
         assert_eq!(observations[1].role_evaluation_returned_ok, Some(false));
-        assert!(
-            observations
-                .iter()
-                .all(|input| input.completion_binding.is_none())
-        );
+        assert!(observations
+            .iter()
+            .all(|input| input.completion_binding.is_none()));
         assert!(!probe.start_with_input_observations(Instant::now()));
         first.update_input(|slot| *slot = None);
         assert_eq!(
@@ -4615,18 +4609,14 @@ mod tests {
         );
         assert_eq!(observed.events[1].role, PalsRole::Proposer);
         assert_eq!(observed.events[1].request_ordinal, 1);
-        assert!(
-            observed
-                .events
-                .windows(2)
-                .all(|pair| pair[0].elapsed_ns <= pair[1].elapsed_ns)
-        );
-        assert!(
-            observed
-                .events
-                .iter()
-                .all(|event| event.elapsed_ns <= observed.snapshot_elapsed_ns.unwrap())
-        );
+        assert!(observed
+            .events
+            .windows(2)
+            .all(|pair| pair[0].elapsed_ns <= pair[1].elapsed_ns));
+        assert!(observed
+            .events
+            .iter()
+            .all(|event| event.elapsed_ns <= observed.snapshot_elapsed_ns.unwrap()));
         // A late native return cannot mutate the already frozen startup view,
         // arm a new capture, or be mistaken for an observed physical fence.
         startup_return(Some(&trace), PalsStartupBackendStage::PublicRun, true);
@@ -4735,14 +4725,12 @@ mod tests {
     fn startup_stage_probe_poison_is_explicit_and_does_not_rearm() {
         let probe = PalsStartupStageProbe::new();
         let other = probe.clone();
-        assert!(
-            std::thread::spawn(move || {
-                let _held = other.shared.ledger.lock().unwrap();
-                panic!("poison metadata-only startup diagnostic fixture");
-            })
-            .join()
-            .is_err()
-        );
+        assert!(std::thread::spawn(move || {
+            let _held = other.shared.ledger.lock().unwrap();
+            panic!("poison metadata-only startup diagnostic fixture");
+        })
+        .join()
+        .is_err());
         assert!(!probe.start(Instant::now()));
         assert!(probe.begin_role(PalsRole::Proposer).is_none());
         let snapshot = probe.snapshot_and_stop();
@@ -5351,13 +5339,11 @@ mod tests {
             failure
         );
         let mut final_rejected = CudaMappingAudit::default();
-        assert!(
-            final_rejected
-                .final_audit(|| panic!(
-                    "final audit cannot require lazy provider images before first Run"
-                ))
-                .is_err()
-        );
+        assert!(final_rejected
+            .final_audit(|| panic!(
+                "final audit cannot require lazy provider images before first Run"
+            ))
+            .is_err());
         final_rejected.after_run(true, || Ok(())).unwrap();
         let failure = final_rejected
             .final_audit(|| {

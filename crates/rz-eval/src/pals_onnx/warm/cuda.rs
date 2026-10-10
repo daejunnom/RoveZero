@@ -10,10 +10,10 @@ use crate::pals_private::PRIVATE_CUDA_WARM_SEMANTICS;
 mod observation;
 pub(in crate::pals_onnx) use observation::CudaWarmDeviceAllocationGuard;
 pub use observation::{
-    PRIVATE_CUDA_WARM_MEASUREMENT_CONTRACT, PalsCudaWarmExecutionBinding,
-    PalsCudaWarmInvocationObservation, PalsCudaWarmInvocationPurpose, PalsCudaWarmInvocationState,
-    PalsCudaWarmObservationHandle, PalsCudaWarmObservationSnapshot, PalsCudaWarmObservationStatus,
-    PalsCudaWarmOwnerObservation, PalsCudaWarmRuntimeLimits,
+    PalsCudaWarmExecutionBinding, PalsCudaWarmInvocationObservation, PalsCudaWarmInvocationPurpose,
+    PalsCudaWarmInvocationState, PalsCudaWarmObservationHandle, PalsCudaWarmObservationSnapshot,
+    PalsCudaWarmObservationStatus, PalsCudaWarmOwnerObservation, PalsCudaWarmRuntimeLimits,
+    PRIVATE_CUDA_WARM_MEASUREMENT_CONTRACT,
 };
 
 pub const PRIVATE_CUDA_WARM_SCHEMA: &str = "rovezero.pals-private-cuda-warm.v2";
@@ -977,13 +977,15 @@ impl PalsOnnxBackend {
             }
             self.public_encodes = self.public_encodes.saturating_add(1);
         }
-        if cached && let Some(trace) = trace {
-            trace.observe_memory(
-                self.device_memory
-                    .as_ref()
-                    .expect("cached device public owner"),
-                true,
-            );
+        if cached {
+            if let Some(trace) = trace {
+                trace.observe_memory(
+                    self.device_memory
+                        .as_ref()
+                        .expect("cached device public owner"),
+                    true,
+                );
+            }
         }
         self.device_warm_role = Some(
             DeviceWarmRole::new(self.shared_pc.as_ref().expect("CUDA Warm session"), input)
@@ -1390,7 +1392,7 @@ mod tests {
         PhysicalSeedCompletion, PrivateInvocationMode, PrivateRulesContext, PrivateSeedBank,
         PrivateSeedLimits, PrivateSeedRequest, PrivateSituationContext,
     };
-    use rz_contracts::{CancelToken, pals::SituationHandle};
+    use rz_contracts::{pals::SituationHandle, CancelToken};
     use rz_position::{Position, PositionSnapshot};
     use std::time::Duration;
 
@@ -1708,11 +1710,9 @@ mod tests {
         };
         let mut wrong = actual_binding;
         wrong.backend_owner_id += 1;
-        assert!(
-            payload
-                .bind_execution_observation(&observer, wrong)
-                .is_err()
-        );
+        assert!(payload
+            .bind_execution_observation(&observer, wrong)
+            .is_err());
         assert!(payload.execution_observation_binding().is_none());
         payload
             .bind_execution_observation(&observer, actual_binding)
@@ -1721,11 +1721,9 @@ mod tests {
             payload.execution_observation_binding(),
             Some(actual_binding)
         );
-        assert!(
-            payload
-                .bind_execution_observation(&observer, actual_binding)
-                .is_err()
-        );
+        assert!(payload
+            .bind_execution_observation(&observer, actual_binding)
+            .is_err());
         assert_eq!(payload.input_key, key);
         assert_eq!(payload.invocation(), mode);
         assert_eq!(payload.initial_latent_bits(), bits);
