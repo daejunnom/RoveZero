@@ -37,9 +37,16 @@ REVIEWED_PRE_LINT_SOURCE_PINS = {
         "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
 }
 
-REVIEWED_CURRENT_SOURCE_PINS = {
+REVIEWED_LINT_SOURCE_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
         "bytes": 374216, "sha256": "4729c3595731d82e7252dd4aec316bf051092449d95f4fe8a4a83017038ee018"},
+    "crates/rz-arena/src/pals_collect/native.rs": {
+        "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+}
+
+REVIEWED_CURRENT_SOURCE_PINS = {
+    "crates/rz-search/src/pals/engine.rs": {
+        "bytes": 382810, "sha256": "752d328ae53dc1b4c06a1f3b7cbbd311834dbb59961e598c4752d8fcb9222cf4"},
     "crates/rz-arena/src/pals_collect/native.rs": {
         "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
 }
@@ -495,6 +502,7 @@ class NativeSlotRepairTests(unittest.TestCase):
         self.assertEqual(observed, REVIEWED_CURRENT_SOURCE_PINS)
         self.assertEqual(slot_witness._reviewed_source_pair(observed), observed)
         self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_PRE_LINT_SOURCE_PINS), REVIEWED_PRE_LINT_SOURCE_PINS)
+        self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_LINT_SOURCE_PINS), REVIEWED_LINT_SOURCE_PINS)
         historical = dict(zip(slot_witness._SOURCE_PATHS, (
             {"bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"},
             {"bytes": 224380, "sha256": "a286a2403317be7f5f058b65488e7c9722d2b7f4b9bf683ea95e5c9f51a7aaf8"})))

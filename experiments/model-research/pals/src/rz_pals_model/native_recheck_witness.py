@@ -122,6 +122,16 @@ _REVIEWED_OPT_IN_SOURCE_PROFILES = (
         "crates/rz-arena/src/pals_collect/native.rs": {
             "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
     }),
+    # Reviewed controlled-allocation successor in the same archive-off legacy
+    # single-Reply scope. Accepted Repair, original controls, Rules replay and
+    # completed OwnCPU comparison remain required by this collector/consumer.
+    # Raw retention, archive/V4 selection and new endpoints gain no authority.
+    ("opt_in_single_reply_followup_controlled_core_752d328a_native_1ba6d1e5", {
+        "crates/rz-search/src/pals/engine.rs": {
+            "bytes": 382810, "sha256": "752d328ae53dc1b4c06a1f3b7cbbd311834dbb59961e598c4752d8fcb9222cf4"},
+        "crates/rz-arena/src/pals_collect/native.rs": {
+            "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+    }),
 )
 _POLICY = {
     "version": "pals-post-repair-recheck/1",

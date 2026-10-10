@@ -132,6 +132,14 @@ _REVIEWED_DISABLED_FOLLOWUP_CORE_LINT_SOURCES = (
     {"bytes": 374216, "sha256": "4729c3595731d82e7252dd4aec316bf051092449d95f4fe8a4a83017038ee018"},
     {"bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
 )
+# Reviewed controlled-allocation successor, still the archive-off legacy
+# Disabled collector path. The controls keep raw facts separate from logical
+# publication; Rules, typed tasks and the policy gate below retain authority.
+# This whole literal pair does not admit archive/V4 policies or target labels.
+_REVIEWED_DISABLED_FOLLOWUP_CONTROLLED_CORE_SOURCES = (
+    {"bytes": 382810, "sha256": "752d328ae53dc1b4c06a1f3b7cbbd311834dbb59961e598c4752d8fcb9222cf4"},
+    {"bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+)
 _SOURCE_REVIEW_PROFILES = (
     ("legacy_prepared_lineage_4469f9d", _REVIEWED_SOURCES),
     ("legacy_disabled_recheck_9c0de959", _REVIEWED_DISABLED_RECHECK_SOURCES),
@@ -147,6 +155,7 @@ _SOURCE_REVIEW_PROFILES = (
     ("legacy_disabled_continuation_revision_fixture_a286a240", _REVIEWED_DISABLED_CONTINUATION_REVISION_FIXTURE_SOURCES),
     ("legacy_disabled_followup_core_b86af1f0_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_CORE_SOURCES),
     ("legacy_disabled_followup_core_lint_4729c359_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_CORE_LINT_SOURCES),
+    ("legacy_disabled_followup_controlled_core_752d328a_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_CONTROLLED_CORE_SOURCES),
 )
 _DISABLED_SEARCH_VERSION = "pals-restricted-refinement/0.1"
 _OPT_IN_LANE_FIELDS = ("pals_search_policy", "refinement_registration", "refinement_registration_sha256", "post_repair_recheck", "post_repair_recheck_policy", "post_repair_recheck_conditions",
