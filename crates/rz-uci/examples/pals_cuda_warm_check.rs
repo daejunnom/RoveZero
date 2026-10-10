@@ -28,6 +28,14 @@
 //! iterative_frozen_model_wdl_v2다. 같은 실제 search 안에서 중단 CPU stack,
 //! 수락된 GPU Repair/C tail, live token의 실제 scheduler resume가 연결되지
 //! 않으면 두 profile 모두 인수 실패다. pause를 만들려고 NN/CPU 출력을 바꾸지 않는다.
+//!
+//! capture에 --cost-same-seed-context를 명시하면 독립 API 비용을 관측한다.
+//! 실제 수락 Repair source를 보존하고 Warm/Fresh owner를 순차 실행하며, 각
+//! lane의 같은 Repair 입력으로 준비 3회와 측정 5회를 45초 work 한도 안에 수행한다.
+//! 비용 출력은 known physical completion 뒤 close_unconsumed로 닫는다. consumer는
+//! 실제 0이며 기존 integration capture의 수락 증거와 구분한다. sample별 실제
+//! public-cache/NN 계수가 미관측이면 not_comparable로 남기고 비율을 만들지 않는다.
+//! 같은 seed의 독립 Torch/ORT reference 요구는 유지한다.
 
 #![recursion_limit = "256"]
 
@@ -73,7 +81,7 @@ mod check {
         NativeCudaWarmObservationLimits, NativeExecutionReceipt, NativeOwnerOptions,
         NativePreparedContext, NativePrivateWarmPrepared, NativeQueryKind,
         NativeRoleExecutionBinding, NativeRoleFinishHandle, NativeRoleModel, NativeRoleObserver,
-        NativeRoleRejection, NativeRoleTerminal, prepare_role_input_for_config,
+        NativeRoleReceipt, NativeRoleRejection, NativeRoleTerminal, prepare_role_input_for_config,
     };
     use serde::Deserialize;
     use serde_json::{Value, json};
@@ -110,6 +118,12 @@ mod check {
     const LATENT_ATOL: f64 = 1e-4;
     const LATENT_RTOL: f64 = 1e-3;
     const MAX_CPU_TRACE_ATTEMPTS: usize = 128;
+    const COST_PREPARATION_CALLS: usize = 3;
+    const COST_MEASURED_CALLS: usize = 5;
+    const COST_LANE_CALLS: usize = COST_PREPARATION_CALLS + COST_MEASURED_CALLS;
+    const COST_EXTRA_ROLE_FORWARDS: u64 = COST_LANE_CALLS as u64 * 2 + STARTUP_ROLE_FORWARDS;
+    const COST_WALL: Duration = Duration::from_secs(45);
+    const COST_DEVICE_BYTES_MAX: u64 = 397_312;
 
     #[derive(Clone, Copy)]
     struct Failure {
@@ -240,6 +254,7 @@ mod check {
         mode: String,
         values: BTreeMap<String, String>,
         output: PathBuf,
+        cost_same_seed_context: bool,
     }
     impl Args {
         fn value(&self, key: &str) -> Result<&str, Failure> {
@@ -351,7 +366,12 @@ mod check {
             _ => return Err(fail("arguments", "unsupported_mode")),
         };
         let mut values = BTreeMap::new();
+        let mut cost_same_seed_context = false;
         while let Some(flag) = arguments.next() {
+            if flag == "--cost-same-seed-context" {
+                cost_opt_in(&mode, &mut cost_same_seed_context)?;
+                continue;
+            }
             require(
                 values.len() < allowed.len() && allowed.contains(&flag.as_str()),
                 "arguments",
@@ -380,6 +400,7 @@ mod check {
             mode,
             values,
             output,
+            cost_same_seed_context,
         };
         for &flag in allowed {
             let optional = [
@@ -419,9 +440,25 @@ mod check {
             "control_inventory_requires_all_three_fields",
         )?;
         if args.mode == "capture" {
-            args.cuda_warm_limits()?;
+            let limits = args.cuda_warm_limits()?;
+            if args.cost_same_seed_context {
+                require(
+                    limits.max_leases == 1 && limits.device_bytes_max == COST_DEVICE_BYTES_MAX,
+                    "arguments",
+                    "cost_requires_registered_exclusive_cuda_warm_limits",
+                )?;
+            }
         }
         Ok(args)
+    }
+    fn cost_opt_in(mode: &str, enabled: &mut bool) -> Result<(), Failure> {
+        require(
+            mode == "capture" && !*enabled,
+            "arguments",
+            "cost_same_seed_context_invalid_or_duplicate",
+        )?;
+        *enabled = true;
+        Ok(())
     }
     fn pinned(path: &Path, expected: &str, maximum: usize) -> Result<Vec<u8>, Failure> {
         let bytes =
@@ -538,6 +575,15 @@ mod check {
             }
         }
     }
+    #[derive(Clone)]
+    struct FixedCostRepair {
+        question: OwnedQuestion,
+        input: PalsModelInput,
+        source: Value,
+        source_latent: Vec<u32>,
+        configuration: PalsModelConfig,
+        model_epoch: [u8; 32],
+    }
     struct CallCapture {
         id: RequestId,
         wire: Value,
@@ -577,6 +623,9 @@ mod check {
         max_role_forwards: u64,
         call_output_bytes_reserved: usize,
         output_reservation_exhausted: bool,
+        cost_same_seed_context: bool,
+        cost_fixed_repair: Option<FixedCostRepair>,
+        cost_warm_lane: Option<Value>,
     }
     impl Capture {
         fn new(started: Instant) -> Self {
@@ -595,6 +644,9 @@ mod check {
                 max_role_forwards: DEFAULT_ROLE_FORWARDS,
                 call_output_bytes_reserved: 0,
                 output_reservation_exhausted: false,
+                cost_same_seed_context: false,
+                cost_fixed_repair: None,
+                cost_warm_lane: None,
             }
         }
         fn call(&mut self, id: RequestId) -> Result<&mut CallCapture, RoleError> {
@@ -1100,6 +1152,11 @@ mod check {
     }
     #[derive(Clone)]
     struct Observer(Arc<Mutex<Capture>>);
+    fn observe_cost_elapsed(wire: &mut Value, enabled: bool, event: &str, elapsed: Duration) {
+        if enabled {
+            wire["cost_observation"][event] = json!(elapsed.as_nanos());
+        }
+    }
     impl NativeRoleObserver for Observer {
         fn prepared(
             &mut self,
@@ -1215,6 +1272,8 @@ mod check {
         }
         fn dispatched(&mut self, binding: NativeRoleExecutionBinding) -> Result<(), RoleError> {
             let mut capture = self.0.lock().map_err(|_| RoleError::Unavailable)?;
+            let elapsed = capture.started.elapsed();
+            let cost_enabled = capture.cost_same_seed_context;
             let call = capture.call(binding.request)?;
             if call.wire["physical"]["dispatched"] == true {
                 return Err(RoleError::InvalidOutput);
@@ -1222,6 +1281,12 @@ mod check {
             call.wire["execution_id"] =
                 json!({"epoch": binding.execution.epoch.0, "sequence": binding.execution.sequence});
             call.wire["physical"]["dispatched"] = json!(true);
+            observe_cost_elapsed(
+                &mut call.wire,
+                cost_enabled,
+                "dispatched_elapsed_ns",
+                elapsed,
+            );
             Ok(())
         }
         fn terminal(
@@ -1230,6 +1295,8 @@ mod check {
             event: NativeRoleTerminal<'_>,
         ) -> Result<(), RoleError> {
             let mut capture = self.0.lock().map_err(|_| RoleError::Unavailable)?;
+            let elapsed = capture.started.elapsed();
+            let cost_enabled = capture.cost_same_seed_context;
             let call = capture.call(binding.request)?;
             if call.wire["execution_id"]
                 != json!({"epoch": binding.execution.epoch.0, "sequence": binding.execution.sequence})
@@ -1244,12 +1311,27 @@ mod check {
                             outcome.is_ok(),
                         _ => result.is_ok(),
                     });
+                    if cost_enabled {
+                        let (delta, complete) = match result {
+                            Ok(PalsNativeResult::EvaluationWithEvidence {
+                                actual_completed_nn_inputs_delta,
+                                complete,
+                                ..
+                            }) => (*actual_completed_nn_inputs_delta, *complete),
+                            _ => (None, false),
+                        };
+                        call.wire["cost_observation"]["actual_completed_nn_inputs_delta"] =
+                            json!(delta);
+                        call.wire["cost_observation"]["nn_input_measurement_complete"] =
+                            json!(complete);
+                    }
                 }
                 NativeRoleTerminal::CompletionUnknown(reason) => {
                     call.wire["physical"]["completion_unknown"] = json!(true);
                     call.wire["physical"]["unknown_reason"] = json!(format!("{reason:?}"));
                 }
             }
+            observe_cost_elapsed(&mut call.wire, cost_enabled, "terminal_elapsed_ns", elapsed);
             Ok(())
         }
         fn physically_completed_with_execution(
@@ -1260,7 +1342,15 @@ mod check {
         ) -> Result<(), RoleError> {
             let mut capture = self.0.lock().map_err(|_| RoleError::Unavailable)?;
             let configuration = capture.configuration.clone();
+            let elapsed = capture.started.elapsed();
+            let cost_enabled = capture.cost_same_seed_context;
             let call = capture.call(id)?;
+            observe_cost_elapsed(
+                &mut call.wire,
+                cost_enabled,
+                "physical_callback_elapsed_ns",
+                elapsed,
+            );
             call.wire["execution"] = json!(execution);
             let Ok(raw) = result else {
                 call.wire["raw_failure"] = json!("known_native_failure");
@@ -1797,6 +1887,564 @@ mod check {
         )
     }
 
+    fn cost_work_wall(args: &Args) -> Duration {
+        if args.cost_same_seed_context {
+            COST_WALL
+        } else {
+            WALL
+        }
+    }
+    fn cost_counts(receipt: &NativeRoleReceipt) -> Value {
+        json!({
+            "process_epoch": receipt.process_epoch, "game_generation": receipt.game_generation,
+            "request_high_water": receipt.request_high_water,
+            "execution_high_water": receipt.execution_high_water,
+            "physically_completed_role_calls": receipt.physically_completed_role_calls,
+            "completed_role_inputs": receipt.completed_role_inputs,
+            "delivered_role_inputs": receipt.delivered_role_inputs,
+            "search_consumed_role_inputs": receipt.search_consumed_role_inputs,
+            "physical_runs_in_flight": receipt.physical_runs_in_flight,
+            "quarantined": receipt.quarantined,
+            "private_warm_observation": receipt.private_warm_observation,
+            "backend_stats": receipt.backend_stats,
+            "backend_stats_observation": receipt.backend_stats_observation,
+        })
+    }
+    fn cost_delta(before: &Value, after: &Value, key: &str) -> Option<u64> {
+        let old = before[key].as_u64()?;
+        let new = after[key].as_u64()?;
+        if old == u64::MAX || new == u64::MAX {
+            return None;
+        }
+        new.checked_sub(old)
+    }
+    fn cost_known_unconsumed(before: &Value, after: &Value, call: &Value) -> bool {
+        cost_delta(before, after, "physically_completed_role_calls") == Some(1)
+            && cost_delta(before, after, "completed_role_inputs") == Some(1)
+            && cost_delta(before, after, "delivered_role_inputs") == Some(1)
+            && cost_delta(before, after, "search_consumed_role_inputs") == Some(0)
+            && after["physical_runs_in_flight"] == 0
+            && after["quarantined"] == false
+            && call["physical"]["dispatched"] == true
+            && call["physical"]["ready"] == true
+            && call["physical"]["completed_ok"] == true
+            && call["physical"]["completion_unknown"] == false
+            && call["delivered"] == true
+            && call["accepted"] == false
+            && call["rejected"] == "SearchFailedUnconsumed"
+            && !call["raw_output"].is_null()
+            && after["private_warm_observation"]["pending_acceptance"] == false
+            && after["private_warm_observation"]["pinned_entries"] == 0
+            && after["private_warm_observation"]["active_lease"].is_null()
+            && after["private_warm_observation"]["accepted_seeds"]
+                .as_u64()
+                .is_some()
+            && after["private_warm_observation"]["accepted_seeds"]
+                == before["private_warm_observation"]["accepted_seeds"]
+    }
+    fn fixed_cost_packet(
+        call: &Value,
+        input: &Value,
+        context: &Value,
+        latent: &[u32],
+        source: &Value,
+        warm: bool,
+        stable_provenance: &mut Option<Value>,
+    ) -> bool {
+        if context["purpose"] != "RepairPolicy"
+            || call["input"] != *input
+            || call["logical_context"] != *context
+        {
+            return false;
+        }
+        let Ok(initial) = serde_json::from_value::<Vec<u32>>(call["initial_latent_bits"].clone())
+        else {
+            return false;
+        };
+        if initial.len() != LATENT_ELEMENTS
+            || initial.iter().any(|v| !f32::from_bits(*v).is_finite())
+        {
+            return false;
+        }
+        if warm {
+            let seed = &call["seed_provenance"];
+            if call["warm_start"] != true
+                || call["invocation"]["mode"] != "approx_cuda_warm_v2"
+                || initial != latent
+                || seed.is_null()
+                || seed["source_lease_id"].as_u64().is_none_or(|v| v == 0)
+                || seed["seed_sequence"].as_u64().is_none_or(|v| v == 0)
+                || seed["seal_hex"].as_str().is_none_or(|v| !valid_digest(v))
+                || call["invocation"]["seed_seal_hex"] != seed["seal_hex"]
+                || seed["source_input_hex"] != source["input_key_hex"]
+                || seed["latent_bits_digest_hex"] != bits_digest(latent)
+            {
+                return false;
+            }
+            if let Some(stable) = stable_provenance {
+                if seed != &*stable {
+                    return false;
+                }
+            } else {
+                *stable_provenance = Some(seed.clone());
+            }
+            true
+        } else {
+            call["warm_start"] == false
+                && call["invocation"]["mode"] == "fresh"
+                && call["seed_provenance"].is_null()
+                && initial.iter().all(|value| *value == 0f32.to_bits())
+        }
+    }
+    fn cost_trace(
+        started: Instant,
+        fixed: &FixedCostRepair,
+        reserved: usize,
+    ) -> Arc<Mutex<Capture>> {
+        let mut trace = Capture::new(started);
+        trace.configuration = fixed.configuration.clone();
+        trace.cost_same_seed_context = true;
+        trace.max_role_forwards = STARTUP_ROLE_FORWARDS + COST_LANE_CALLS as u64;
+        // All three streams use the original output limit before dispatch.
+        trace.call_output_bytes_reserved = reserved;
+        Arc::new(Mutex::new(trace))
+    }
+    fn run_cost_lane(
+        owner: &mut NativeRoleModel,
+        handle: &NativeRoleFinishHandle,
+        trace: &Arc<Mutex<Capture>>,
+        fixed: &FixedCostRepair,
+        warm: bool,
+        cancel: &AtomicBool,
+    ) -> Value {
+        let lane = if warm {
+            "warm_same_accepted_seed"
+        } else {
+            "fresh_missing_seed"
+        };
+        let mut stable_provenance = None;
+        let mut preparation_after = None;
+        let mut completed_samples = 0;
+        let outcome = (|| {
+            require(
+                fixed.question.context.purpose == RoleQueryPurpose::RepairPolicy
+                    && owner.model_epoch() == fixed.model_epoch
+                    && sha_json(owner.model_config())? == sha_json(&fixed.configuration)?,
+                "cost",
+                "repair_model_or_precision_namespace_changed",
+            )?;
+            owner
+                .set_private_warm_observer(Box::new(Observer(Arc::clone(trace))))
+                .map_err(|error| role_failure("cost_observer", error))?;
+            let expected_input = json!(fixed.input);
+            let expected_context = logical(&fixed.question.context);
+            for index in 0..COST_LANE_CALLS {
+                require(
+                    !cancel.load(Ordering::Acquire) && Instant::now() < fixed.question.deadline,
+                    "cost",
+                    "original_deadline_or_cancel",
+                )?;
+                let preparation = index < COST_PREPARATION_CALLS;
+                let mut trace_guard = trace
+                    .lock()
+                    .map_err(|_| fail("cost", "capture_unavailable"))?;
+                trace_guard.stage = if preparation {
+                    "cost_preparation"
+                } else {
+                    "cost_measurement"
+                };
+                let started = trace_guard.started;
+                let count_before = trace_guard.calls.len();
+                drop(trace_guard);
+                let before = cost_counts(&handle.receipt());
+                let api_started = Instant::now();
+                let output = owner
+                    .repair_with_context(fixed.question.query(cancel), &fixed.question.context);
+                let api_finished = Instant::now();
+                let returned = cost_counts(&handle.receipt());
+                // No cost output publishes a seed or receives an acceptance.
+                // The public closure drops only a known logical output token.
+                let closed = owner.close_unconsumed(NativeRoleRejection::SearchFailedUnconsumed);
+                let after = cost_counts(&handle.receipt());
+                let mut trace_guard = trace
+                    .lock()
+                    .map_err(|_| fail("cost", "capture_unavailable"))?;
+                require(
+                    trace_guard.calls.len() == count_before + 1,
+                    "cost",
+                    "actual_call_missing",
+                )?;
+                let call = trace_guard
+                    .calls
+                    .last_mut()
+                    .ok_or(fail("cost", "actual_call_missing"))?;
+                call.wire["cost_sample"] = json!({
+                    "lane": lane, "phase": if preparation { "preparation" } else { "measurement" },
+                    "ordinal_in_phase": if preparation { index + 1 } else { index + 1 - COST_PREPARATION_CALLS },
+                    "repair_with_context_api_started_elapsed_ns": api_started.duration_since(started).as_nanos(),
+                    "repair_with_context_api_finished_elapsed_ns": api_finished.duration_since(started).as_nanos(),
+                    "repair_with_context_api_wall_ns": api_finished.duration_since(api_started).as_nanos(),
+                    "api_returned_ok": output.is_ok(), "close_unconsumed_returned_ok": closed.is_ok(),
+                    "receipt_before": before, "receipt_returned": returned, "receipt_after_close": after,
+                    "native_physical_calls_delta": cost_delta(&before, &after, "physically_completed_role_calls"),
+                    "native_completed_role_inputs_delta": cost_delta(&before, &after, "completed_role_inputs"),
+                    "native_delivered_inputs_delta": cost_delta(&before, &after, "delivered_role_inputs"),
+                    "native_search_consumed_inputs_delta": cost_delta(&before, &after, "search_consumed_role_inputs"),
+                    "public_cache_preparation_counters": null,
+                    "public_cache_preparation_counters_observation": "not_exposed_by_live_native_finish_receipt",
+                });
+                output.map_err(|error| role_failure("cost_repair", error))?;
+                closed.map_err(|error| role_failure("cost_close_unconsumed", error))?;
+                require(
+                    cost_known_unconsumed(&before, &after, &call.wire)
+                        && fixed_cost_packet(
+                            &call.wire,
+                            &expected_input,
+                            &expected_context,
+                            &fixed.source_latent,
+                            &fixed.source,
+                            warm,
+                            &mut stable_provenance,
+                        ),
+                    "cost",
+                    "same_input_seed_provenance_or_known_consumer_zero_not_preserved",
+                )?;
+                if !warm {
+                    require(
+                        after["private_warm_observation"]["accepted_seeds"] == 0,
+                        "cost",
+                        "fresh_control_published_seed",
+                    )?;
+                }
+                if index + 1 == COST_PREPARATION_CALLS {
+                    preparation_after = Some(after);
+                }
+                if !preparation {
+                    completed_samples += 1;
+                }
+            }
+            Ok::<_, Failure>(())
+        })();
+        let trace = trace.lock().ok();
+        json!({
+            "lane": lane, "complete": outcome.is_ok() && completed_samples == COST_MEASURED_CALLS,
+            "failure": outcome.err().map(Failure::wire),
+            "preparation_calls_requested": COST_PREPARATION_CALLS,
+            "measured_calls_requested": COST_MEASURED_CALLS,
+            "measured_calls_completed": completed_samples,
+            "stable_accepted_seed_provenance": stable_provenance,
+            "seed_publication_by_cost_outputs": false,
+            "accepted_consumer_scope": "known_physical_output_closed_logically_unconsumed",
+            "receipt_after_preparation": preparation_after,
+            "preparation_backend_stats": preparation_after.as_ref().and_then(|v| v.get("backend_stats")).filter(|v| !v.is_null()),
+            "call_output_bytes_reserved": trace.as_ref().map(|v| v.call_output_bytes_reserved),
+            "calls": trace.as_ref().map(|v| v.wires()),
+            "live_receipt_after_lane": cost_counts(&handle.receipt()),
+        })
+    }
+    fn prepare_warm_cost(
+        owner: &mut NativeRoleModel,
+        handle: &NativeRoleFinishHandle,
+        capture: &Arc<Mutex<Capture>>,
+        started: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(FixedCostRepair, Value), Failure> {
+        let captured = capture
+            .lock()
+            .map_err(|_| fail("cost_source", "capture_unavailable"))?;
+        let (question, input, request, source_latent) = captured
+            .last_repair()
+            .ok_or(fail("cost_source", "actual_accepted_repair_missing"))?;
+        let source = captured
+            .calls
+            .iter()
+            .find(|call| call.id == request)
+            .ok_or(fail("cost_source", "actual_accepted_repair_missing"))?
+            .wire
+            .clone();
+        require(
+            question.context.purpose == RoleQueryPurpose::RepairPolicy
+                && source["accepted"] == true
+                && source["accepted_with_original_controls"] == true
+                && source_latent.len() == LATENT_ELEMENTS
+                && source_latent.iter().all(|v| f32::from_bits(*v).is_finite()),
+            "cost_source",
+            "actual_accepted_complete_repair_source_required",
+        )?;
+        let fixed = FixedCostRepair {
+            question,
+            input,
+            source,
+            source_latent,
+            configuration: captured.configuration.clone(),
+            model_epoch: owner.model_epoch(),
+        };
+        let trace = cost_trace(started, &fixed, captured.call_output_bytes_reserved);
+        drop(captured);
+        let mut lane = run_cost_lane(owner, handle, &trace, &fixed, true, cancel);
+        if let Err(error) = owner.set_private_warm_observer(Box::new(Observer(Arc::clone(capture))))
+        {
+            lane["complete"] = json!(false);
+            lane["integration_observer_restore_failure"] =
+                role_failure("cost_restore_integration_observer", error).wire();
+        }
+        Ok((fixed, lane))
+    }
+    fn run_fresh_cost_owner(
+        args: &Args,
+        fixed: &FixedCostRepair,
+        warm: &Value,
+        started: Instant,
+        deadline: Instant,
+        whole: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<Value, Failure> {
+        require(
+            !cancel.load(Ordering::Acquire) && Instant::now() < deadline,
+            "cost_fresh_load",
+            "original_deadline_or_cancel",
+        )?;
+        let reserved = warm["call_output_bytes_reserved"]
+            .as_u64()
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or(fail("cost_fresh_load", "output_reservation_unknown"))?;
+        let bundle_bytes = pinned(
+            &args.path("--cuda-bundle")?,
+            args.value("--cuda-bundle-sha256")?,
+            64 * 1024,
+        )?;
+        let spec = CudaRuntimeBundleSpec::from_json(
+            std::str::from_utf8(&bundle_bytes)
+                .map_err(|_| fail("cost_fresh_load", "bundle_utf8_invalid"))?,
+        )
+        .map_err(|_| fail("cost_fresh_load", "bundle_invalid"))?;
+        let cache = RuntimeCache::open(&args.path("--runtime-output-root")?)
+            .map_err(|_| fail("cost_fresh_load", "runtime_cache_unavailable"))?;
+        let pin = cache
+            .cuda_bundle(&args.path("--runtime-root")?, &spec)
+            .map_err(|_| fail("cost_fresh_load", "bundle_pin_failed"))?;
+        require(
+            Instant::now() < deadline,
+            "cost_fresh_load",
+            "deadline_after_pin",
+        )?;
+        let runtime = OrtRuntime::load(&pin)
+            .map_err(|_| fail("cost_fresh_load", "full_cuda_bootstrap_failed"))?;
+        let control = if args.values.contains_key("--control-inventory") {
+            Some(
+                PalsCudaControlPolicy::from_inventory(
+                    &args.path("--control-inventory")?,
+                    args.value("--control-inventory-sha256")?,
+                )
+                .map_err(|_| fail("cost_fresh_load", "control_inventory_invalid"))?,
+            )
+        } else {
+            None
+        };
+        // The original profile root was created exclusively by the first owner.
+        // The second owner gets a new child, with the same selected policy.
+        let profile = args
+            .values
+            .get("--profile-root")
+            .map(|path| PathBuf::from(path).join("cost-fresh-owner"));
+        if let Some(profile) = &profile {
+            external(profile, true)?;
+        }
+        let load_started = Instant::now();
+        let mut owner = NativeRoleModel::load_with_runtime_and_cuda_private_warm_and_observations(
+            &args.path("--export-manifest")?,
+            args.value("--export-manifest-sha256")?,
+            runtime,
+            PalsOnnxConfig {
+                provider: Provider::Cuda {
+                    device_id: 0,
+                    arena_bytes: 256 * 1024 * 1024,
+                },
+                intra_threads: 1,
+                cache_public_memory: true,
+                device_public_memory: true,
+            },
+            NativeOwnerOptions {
+                drain_limit: CLEANUP,
+                host_record_pages: None,
+            },
+            control.zip(profile.as_deref()),
+            Some(args.cuda_warm_limits()?),
+        )
+        .map_err(|error| role_failure("cost_fresh_load", error))?;
+        let handle = owner.finish_handle();
+        let source = owner.source_identity();
+        let trace = cost_trace(started, fixed, reserved);
+        let mut startup = None;
+        let outcome = (|| {
+            require(
+                owner.model_epoch() == fixed.model_epoch
+                    && sha_json(owner.model_config())? == sha_json(&fixed.configuration)?,
+                "cost_fresh_load",
+                "model_or_encoding_namespace_changed",
+            )?;
+            owner
+                .set_private_warm_observer(Box::new(Observer(Arc::clone(&trace))))
+                .map_err(|error| role_failure("cost_fresh_observer", error))?;
+            owner
+                .configure_startup_probe_timeout(Some(30_000))
+                .map_err(|error| role_failure("cost_fresh_startup", error))?;
+            owner
+                .observe_startup_loading(load_started.elapsed())
+                .map_err(|error| role_failure("cost_fresh_startup", error))?;
+            owner.new_game_with_generation(Some(fixed.question.context.game_generation));
+            owner
+                .prepare_startup(deadline.min(Instant::now() + Duration::from_secs(30)))
+                .map_err(|error| role_failure("cost_fresh_startup", error))?;
+            let actual = handle.receipt();
+            require(
+                actual.startup_probe.as_ref().is_some_and(|v| {
+                    v.completed_proposer_calls == 1
+                        && v.completed_critic_calls == 1
+                        && v.reset_completed
+                        && v.runtime_mapping_confirmed
+                        && v.cuda_placement_witness.is_some()
+                }) && actual
+                    .private_warm_observation
+                    .as_ref()
+                    .is_some_and(|v| v.accepted_seeds == 0)
+                    && actual.search_consumed_role_inputs == 0,
+                "cost_fresh_startup",
+                "actual_cuda_readiness_or_missing_seed_not_verified",
+            )?;
+            startup = Some(actual);
+            Ok::<_, Failure>(run_cost_lane(
+                &mut owner, &handle, &trace, fixed, false, cancel,
+            ))
+        })();
+        let work_completed_within_deadline =
+            Instant::now() <= deadline && !cancel.load(Ordering::Acquire);
+        let cleanup_started = Instant::now();
+        let shutdown = handle.finish(whole);
+        let receipt = handle.receipt();
+        let observation = handle.cuda_warm_followup_observation();
+        let joined = shutdown.is_ok()
+            && receipt.physical_shutdown_confirmed
+            && receipt.native_buffers_released
+            && !receipt.quarantined
+            && receipt.physical_runs_in_flight == 0;
+        let mut lane =
+            outcome.unwrap_or_else(|error| json!({"complete": false, "failure": error.wire()}));
+        lane["source_identity"] = json!(source);
+        lane["startup_receipt"] = json!(startup);
+        lane["final_receipt"] = json!(receipt);
+        lane["final_owner_observation"] = json!(observation);
+        lane["physical_owner_joined"] = json!(joined);
+        lane["work_completed_within_original_deadline"] = json!(work_completed_within_deadline);
+        lane["cleanup_elapsed_ns"] = json!(cleanup_started.elapsed().as_nanos());
+        lane["cleanup_failure"] = json!(
+            shutdown
+                .err()
+                .map(|error| role_failure("cost_fresh_cleanup", error).wire())
+        );
+        lane["owner_total_actual_completed_nn_inputs"] = json!(
+            receipt
+                .backend_stats
+                .as_ref()
+                .map(|v| v.completed_nn_inputs)
+        );
+        lane["owner_total_backend_stats"] = json!(receipt.backend_stats);
+        lane["complete"] =
+            json!(lane["complete"] == true && joined && work_completed_within_deadline);
+        drop(owner);
+        drop(handle);
+        Ok(lane)
+    }
+    fn execute_request(
+        args: &Args,
+        started: Instant,
+        deadline: Instant,
+        whole: Instant,
+        cancel: &AtomicBool,
+        capture: &Arc<Mutex<Capture>>,
+    ) -> Result<Value, Failure> {
+        let mut report = execute(args, started, deadline, whole, cancel, capture)?;
+        if !args.cost_same_seed_context {
+            return Ok(report);
+        }
+        let captured = capture
+            .lock()
+            .map_err(|_| fail("cost", "capture_unavailable"))?;
+        let fixed = captured.cost_fixed_repair.clone();
+        let mut warm = captured.cost_warm_lane.clone().unwrap_or_else(|| json!({
+            "complete": false, "failure": fail("cost_source", "actual_accepted_repair_missing").wire(),
+        }));
+        drop(captured);
+        let warm_joined = report["final_receipt"]["physical_shutdown_confirmed"] == true
+            && report["final_receipt"]["native_buffers_released"] == true
+            && report["final_receipt"]["physical_runs_in_flight"] == 0
+            && report["final_receipt"]["quarantined"] == false
+            && report["cuda_warm_owner_observation"]["backend_dropped"] == true
+            && report["cuda_warm_owner_observation"]["worker_joined"] == true;
+        warm["physical_owner_joined"] = json!(warm_joined);
+        warm["final_receipt"] = report["final_receipt"].clone();
+        warm["final_owner_observation"] = report["cuda_warm_owner_observation"].clone();
+        warm["owner_total_backend_stats"] = report["final_receipt"]["backend_stats"].clone();
+        warm["owner_total_actual_completed_nn_inputs"] =
+            report["final_receipt"]["backend_stats"]["completed_nn_inputs"].clone();
+        let fresh = match &fixed {
+            Some(fixed) if warm_joined && warm["complete"] == true => {
+                run_fresh_cost_owner(args, fixed, &warm, started, deadline, whole, cancel)
+                    .unwrap_or_else(|error| json!({"complete": false, "failure": error.wire()}))
+            }
+            _ => {
+                json!({"complete": false, "failure": fail("cost_fresh_load", "prior_warm_lane_or_physical_fence_incomplete").wire()})
+            }
+        };
+        let complete = warm["complete"] == true
+            && warm_joined
+            && fresh["complete"] == true
+            && Instant::now() <= whole
+            && !cancel.load(Ordering::Acquire);
+        let mut cost = json!({
+            "opt_in": true, "scope": "repair_with_context_api_known_physical_logical_consumer_zero",
+            "execution_checks_passed": complete, "benchmark_validation_complete": false,
+            "wall_limit_ms": COST_WALL.as_millis(), "cleanup_limit_ms": CLEANUP.as_millis(),
+            "preparation_calls_per_lane": COST_PREPARATION_CALLS,
+            "measured_calls_per_lane": COST_MEASURED_CALLS,
+            "extra_role_forward_reservation_including_fresh_startup": COST_EXTRA_ROLE_FORWARDS,
+            "owners_run_sequentially_after_actual_worker_join": warm_joined,
+            "max_concurrent_physical_workers": 1,
+            "selected_max_leases": 1, "selected_device_payload_bytes_max": COST_DEVICE_BYTES_MAX,
+        });
+        let reference = json!({
+            "same_target_input_json_sha256_hex": fixed.as_ref().and_then(|v| sha_json(&v.input).ok()),
+            "original_accepted_repair_source": fixed.as_ref().map(|v| &v.source),
+            "original_accepted_full_6144_seed_bits": fixed.as_ref().map(|v| &v.source_latent),
+            "same_seed_independent_reference_required": true,
+            "independent_reference": "not_run;original_capture_same_seed_torch_and_ort_reference_preserved",
+            "value_fresh_used_as_control": false,
+            "fresh_control": "independent_warm_capable_factory_owner_with_no_accepted_seed",
+            "warm_seed_preparation": "actual_accepted_repair_source_once_then_provisional_cost_outputs_discarded",
+            "fresh_vs_warm_raw_output_equality_required": false,
+        });
+        let comparison = json!({
+            "sharing_measurement": null, "whole_device_vram_peak_bytes": null,
+            "preparation_cache_counts_comparable": false, "comparable": false,
+            "comparison_status": "not_comparable",
+            "comparison_reason": "sample_phase_public_cache_and_nn_counts_not_exposed_by_live_native_receipt",
+            "warm_over_fresh_api_wall_ratio": null,
+            "api_wall_includes_native_prepare_submit_wait_decode_and_observer_cost": true,
+            "physical_callback_timestamp_is_observer_receipt_time_not_cuda_kernel_duration": true,
+        });
+        // Keep macro expansion bounded; all three literals are known objects.
+        if let (Value::Object(fields), Value::Object(reference), Value::Object(comparison)) =
+            (&mut cost, reference, comparison)
+        {
+            fields.extend(reference);
+            fields.extend(comparison);
+        }
+        cost["warm"] = warm;
+        cost["fresh"] = fresh;
+        report["cost_same_seed_context"] = cost;
+        Ok(report)
+    }
+
     fn failure_report(error: Failure, started: Instant) -> Value {
         json!({"schema": SCHEMA, "phase": "capture", "passed": false, "execution_checks_passed": false,
             "gpu_execution": "not_confirmed", "failure": error.wire(), "elapsed_ms": started.elapsed().as_millis(),
@@ -1824,6 +2472,17 @@ mod check {
             .map_err(|_| fail("scenario", "json_invalid"))?;
         let position = scenario.position()?;
         let owner_limits = args.cuda_warm_limits()?;
+        let integration_forward_limit = if args.cost_same_seed_context {
+            require(
+                scenario.max_role_forwards
+                    > COST_EXTRA_ROLE_FORWARDS + STARTUP_ROLE_FORWARDS + FOLLOWUP_ROLE_FORWARDS,
+                "scenario",
+                "cost_forward_reservation_out_of_bounds",
+            )?;
+            scenario.max_role_forwards - COST_EXTRA_ROLE_FORWARDS
+        } else {
+            scenario.max_role_forwards
+        };
         capture
             .lock()
             .map_err(|_| fail("scenario", "capture_unavailable"))?
@@ -1912,7 +2571,7 @@ mod check {
                 .cloned()
                 .ok_or(fail("model", "value_namespace_missing"))?;
             drop(selected);
-            let forwards = Arc::new(ForwardBudget::new(scenario.max_role_forwards));
+            let forwards = Arc::new(ForwardBudget::new(integration_forward_limit));
             let model = Model {
                 native: Arc::clone(&native),
                 identity,
@@ -1938,7 +2597,7 @@ mod check {
                 line_plies: scenario.line_plies,
                 max_nodes: 1024,
                 max_records: 128,
-                max_role_calls: scenario.max_role_forwards
+                max_role_calls: integration_forward_limit
                     - STARTUP_ROLE_FORWARDS
                     - FOLLOWUP_ROLE_FORWARDS,
                 cpu_nodes_per_task: scenario.cpu_nodes_per_task,
@@ -2057,6 +2716,27 @@ mod check {
                     "actual_accepted_repair_and_c_continuation_not_exercised",
                 ))
             };
+            if args.cost_same_seed_context && resume.is_ok() {
+                let mut owner = native
+                    .lock()
+                    .map_err(|_| fail("cost", "owner_unavailable"))?;
+                match prepare_warm_cost(&mut owner, &handle, capture, started, cancel) {
+                    Ok((fixed, lane)) => {
+                        let mut captured = capture
+                            .lock()
+                            .map_err(|_| fail("cost", "capture_unavailable"))?;
+                        captured.cost_fixed_repair = Some(fixed);
+                        captured.cost_warm_lane = Some(lane);
+                    }
+                    Err(error) => {
+                        capture
+                            .lock()
+                            .map_err(|_| fail("cost", "capture_unavailable"))?
+                            .cost_warm_lane =
+                            Some(json!({"complete": false, "failure": error.wire()}));
+                    }
+                }
+            }
             let checker = engine
                 .shutdown_checker(whole)
                 .map_err(|_| fail("cleanup", "own_checker_shutdown_failed"))?;
@@ -2125,17 +2805,23 @@ mod check {
                 v.role_nn_runs_failed_known,
             )
         });
-        let expected_forwards = capture.calls.len() as u64 + STARTUP_ROLE_FORWARDS;
+        let cost_calls = capture
+            .cost_warm_lane
+            .as_ref()
+            .and_then(|lane| lane["calls"].as_array())
+            .map_or(0, |calls| calls.len() as u64);
+        let integration_forwards = capture.calls.len() as u64 + STARTUP_ROLE_FORWARDS;
+        let expected_forwards = integration_forwards + cost_calls;
         let startup_completed = receipt
             .startup_probe
             .as_ref()
             .map(|v| v.completed_proposer_calls + v.completed_critic_calls);
         let accounting = nn_counts == Some((expected_forwards, expected_forwards, 0))
             && startup_completed == Some(STARTUP_ROLE_FORWARDS)
-            && receipt.physically_completed_role_calls == capture.calls.len() as u64
-            && receipt.completed_role_inputs == capture.calls.len() as u64
-            && forwarded == Some(expected_forwards)
-            && receipt.delivered_role_inputs == capture.calls.len() as u64
+            && receipt.physically_completed_role_calls == capture.calls.len() as u64 + cost_calls
+            && receipt.completed_role_inputs == capture.calls.len() as u64 + cost_calls
+            && forwarded == Some(integration_forwards)
+            && receipt.delivered_role_inputs == capture.calls.len() as u64 + cost_calls
             && receipt.search_consumed_role_inputs == capture.calls.len() as u64;
         let resume_ok = resume.as_ref().is_some_and(|v| v.is_ok());
         let cpu_resume = capture.cpu_resume_evidence();
@@ -2150,11 +2836,22 @@ mod check {
             .all(|call| {
                 call.wire["warm_start"] == false && call.wire["invocation"]["mode"] == "fresh"
             });
-        let actual_seed_consumptions = capture
-            .calls
-            .iter()
-            .filter(|call| call.wire["warm_start"] == true)
-            .count() as u64;
+        let cost_seed_consumptions = capture
+            .cost_warm_lane
+            .as_ref()
+            .and_then(|lane| lane["calls"].as_array())
+            .map_or(0, |calls| {
+                calls
+                    .iter()
+                    .filter(|call| call["warm_start"] == true)
+                    .count() as u64
+            });
+        let actual_seed_consumptions = cost_seed_consumptions
+            + capture
+                .calls
+                .iter()
+                .filter(|call| call.wire["warm_start"] == true)
+                .count() as u64;
         let actual_value_calls = capture
             .calls
             .iter()
@@ -2227,11 +2924,11 @@ mod check {
                 && nn_counts.is_some_and(|counts| counts.1 > 0),
             "device_selection": {"device_id": 0, "selected_gpu_count": 1, "physical_worker_count": 1},
             "actual_training": false, "strength_or_speedup_claim": false, "public_sharing_or_vram_measurement_claim": false,
-            "wall_limit_ms": WALL.as_millis(), "cleanup_limit_ms": CLEANUP.as_millis(), "whole_limit_ms": (WALL + CLEANUP).as_millis(),
+            "wall_limit_ms": cost_work_wall(args).as_millis(), "cleanup_limit_ms": CLEANUP.as_millis(), "whole_limit_ms": (cost_work_wall(args) + CLEANUP).as_millis(),
             "output_limit_bytes": OUTPUT_LIMIT, "max_actual_role_forwards_including_startup": capture.max_role_forwards,
             "default_role_forward_budget": DEFAULT_ROLE_FORWARDS,
             "role_forward_budget_bounds": {"min": MIN_ROLE_FORWARDS, "max": MAX_ROLE_FORWARDS},
-            "search_role_and_value_forward_budget": capture.max_role_forwards - STARTUP_ROLE_FORWARDS - FOLLOWUP_ROLE_FORWARDS,
+            "search_role_and_value_forward_budget": integration_forward_limit - STARTUP_ROLE_FORWARDS - FOLLOWUP_ROLE_FORWARDS,
             "call_output_bytes_reserved": capture.call_output_bytes_reserved,
             "call_output_reservation_exhausted": capture.output_reservation_exhausted,
             "actual_role_forwards_including_startup": nn_counts.map(|counts| counts.0),
@@ -2523,10 +3220,14 @@ mod check {
         }
         // Full raw tensors live in the bounded artifact. Avoid a second 128 MiB
         // stdout copy; native logs remain subject to the parent's pipe guard.
-        let summary = json!({"schema": SCHEMA, "phase": report["phase"], "passed": report["passed"],
+        let mut summary = json!({"schema": SCHEMA, "phase": report["phase"], "passed": report["passed"],
             "execution_checks_passed": report["execution_checks_passed"], "failure": report["failure"],
             "report_sha256_hex": hex(&Sha256::digest(&bytes)), "report_bytes": bytes.len(),
             "output_json": output_path.map(|v| v.to_string_lossy().into_owned())});
+        if let Some(cost) = report.get("cost_same_seed_context") {
+            summary["cost_execution_checks_passed"] = cost["execution_checks_passed"].clone();
+            summary["cost_comparison_status"] = cost["comparison_status"].clone();
+        }
         let stdout = serde_json::to_vec(&summary).unwrap_or_default();
         let mut stdout_writer = io::stdout().lock();
         if stdout_writer
@@ -2536,8 +3237,11 @@ mod check {
         {
             return ExitCode::FAILURE;
         }
-        if report["passed"] == true
-            || (report["phase"] == "capture" && report["execution_checks_passed"] == true)
+        if (report["passed"] == true
+            || (report["phase"] == "capture" && report["execution_checks_passed"] == true))
+            && report
+                .get("cost_same_seed_context")
+                .is_none_or(|cost| cost["execution_checks_passed"] == true)
         {
             ExitCode::SUCCESS
         } else {
@@ -2557,10 +3261,15 @@ mod check {
             });
             return publish(report, Some(&args.output));
         }
-        let deadline = started + WALL;
+        let deadline = started + cost_work_wall(&args);
         let whole = deadline + CLEANUP;
         let cancel = Arc::new(AtomicBool::new(false));
         let capture = Arc::new(Mutex::new(Capture::new(started)));
+        if args.cost_same_seed_context {
+            if let Ok(mut capture) = capture.lock() {
+                capture.cost_same_seed_context = true;
+            }
+        }
         let output = args.output.clone();
         let worker_cancel = Arc::clone(&cancel);
         let worker_capture = Arc::clone(&capture);
@@ -2568,7 +3277,7 @@ mod check {
         if std::thread::Builder::new()
             .name("pals-bounded-actual-cuda-warm-check".into())
             .spawn(move || {
-                let report = execute(
+                let report = execute_request(
                     &args,
                     started,
                     deadline,
@@ -2626,6 +3335,177 @@ mod check {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn cost_opt_in_is_explicit_and_does_not_modify_ordinary_capture_event_bytes() {
+            let mut enabled = false;
+            assert!(cost_opt_in("verify-reference", &mut enabled).is_err());
+            assert!(!enabled);
+            assert!(cost_opt_in("capture", &mut enabled).is_ok());
+            assert!(enabled);
+            assert!(cost_opt_in("capture", &mut enabled).is_err());
+
+            let mut wire = json!({"physical": {"dispatched": true, "ready": false}});
+            let before = serde_json::to_vec(&wire).unwrap();
+            observe_cost_elapsed(
+                &mut wire,
+                false,
+                "dispatched_elapsed_ns",
+                Duration::from_nanos(10),
+            );
+            assert_eq!(serde_json::to_vec(&wire).unwrap(), before);
+            for (event, elapsed) in [
+                ("dispatched_elapsed_ns", 10),
+                ("terminal_elapsed_ns", 20),
+                ("physical_callback_elapsed_ns", 30),
+            ] {
+                observe_cost_elapsed(&mut wire, true, event, Duration::from_nanos(elapsed));
+                assert_eq!(wire["cost_observation"][event], elapsed);
+            }
+            // These observer times are metadata. A terminal observation alone
+            // does not supply a known receipt, accepted consumer or CUDA Run.
+            assert_eq!(wire["physical"]["ready"], false);
+            assert!(wire.get("accepted").is_none());
+            assert!(wire.get("execution").is_none());
+        }
+        #[test]
+        fn cost_metadata_keeps_the_same_repair_packet_full_seed_and_original_provenance() {
+            let input = json!({"query": [1, 2], "records": [3, 4], "history_digest": "fixed"});
+            let context =
+                json!({"purpose": "RepairPolicy", "public_revision": 7, "game_generation": 1});
+            let latent = vec![0.25f32.to_bits(); LATENT_ELEMENTS];
+            let seal = "a".repeat(64);
+            let source = json!({"input_key_hex": "b".repeat(64)});
+            let seed = json!({"source_input_hex": source["input_key_hex"],
+                "latent_bits_digest_hex": bits_digest(&latent), "source_lease_id": 9,
+                "seed_sequence": 4, "seal_hex": seal});
+            let warm = json!({"input": input, "logical_context": context,
+                "initial_latent_bits": latent, "warm_start": true,
+                "seed_provenance": seed,
+                "invocation": {"mode": "approx_cuda_warm_v2", "seed_seal_hex": seal}});
+            let mut stable = None;
+            assert!(fixed_cost_packet(
+                &warm,
+                &input,
+                &context,
+                &latent,
+                &source,
+                true,
+                &mut stable
+            ));
+            assert!(fixed_cost_packet(
+                &warm,
+                &input,
+                &context,
+                &latent,
+                &source,
+                true,
+                &mut stable
+            ));
+            for (field, replacement) in [
+                (
+                    "input",
+                    json!({"query": [1, 3], "records": [3, 4], "history_digest": "fixed"}),
+                ),
+                (
+                    "logical_context",
+                    json!({"purpose": "ValueFresh", "public_revision": 7, "game_generation": 1}),
+                ),
+                (
+                    "initial_latent_bits",
+                    json!(vec![0.5f32.to_bits(); LATENT_ELEMENTS]),
+                ),
+                (
+                    "seed_provenance",
+                    json!({"source_input_hex": source["input_key_hex"],
+                    "latent_bits_digest_hex": bits_digest(&latent), "source_lease_id": 10,
+                    "seed_sequence": 4, "seal_hex": seal}),
+                ),
+            ] {
+                let mut changed = warm.clone();
+                changed[field] = replacement;
+                assert!(!fixed_cost_packet(
+                    &changed,
+                    &input,
+                    &context,
+                    &latent,
+                    &source,
+                    true,
+                    &mut stable
+                ));
+            }
+            let fresh = json!({"input": input, "logical_context": context,
+                "initial_latent_bits": vec![0f32.to_bits(); LATENT_ELEMENTS], "warm_start": false,
+                "seed_provenance": null, "invocation": {"mode": "fresh"}});
+            assert!(fixed_cost_packet(
+                &fresh, &input, &context, &latent, &source, false, &mut None
+            ));
+            let mut wrong_purpose = fresh.clone();
+            let value_context =
+                json!({"purpose": "ValueFresh", "public_revision": 7, "game_generation": 1});
+            wrong_purpose["logical_context"] = value_context.clone();
+            assert!(!fixed_cost_packet(
+                &wrong_purpose,
+                &input,
+                &value_context,
+                &latent,
+                &source,
+                false,
+                &mut None
+            ));
+            // Packet equality is source metadata only; no fixture Run, receipt,
+            // worker join, acceptance or independent numerical pass is supplied.
+        }
+        #[test]
+        fn cost_known_completion_and_zero_consumer_cannot_hide_unknown_or_accepted_work() {
+            let before = json!({"physically_completed_role_calls": 7, "completed_role_inputs": 7,
+                "delivered_role_inputs": 7, "search_consumed_role_inputs": 4,
+                "private_warm_observation": {"accepted_seeds": 2}});
+            let after = json!({"physically_completed_role_calls": 8, "completed_role_inputs": 8,
+                "delivered_role_inputs": 8, "search_consumed_role_inputs": 4,
+                "physical_runs_in_flight": 0, "quarantined": false,
+                "private_warm_observation": {"accepted_seeds": 2, "pending_acceptance": false,
+                    "pinned_entries": 0, "active_lease": null}});
+            let call = json!({"physical": {"dispatched": true, "ready": true,
+                "completed_ok": true, "completion_unknown": false},
+                "delivered": true, "accepted": false, "rejected": "SearchFailedUnconsumed", "raw_output": {}});
+            assert!(cost_known_unconsumed(&before, &after, &call));
+            assert_eq!(
+                cost_delta(&before, &after, "search_consumed_role_inputs"),
+                Some(0)
+            );
+            let mut unknown = before.clone();
+            unknown["search_consumed_role_inputs"] = Value::Null;
+            assert_eq!(
+                cost_delta(&unknown, &after, "search_consumed_role_inputs"),
+                None
+            );
+            assert!(!cost_known_unconsumed(&unknown, &after, &call));
+            let mut consumed = after.clone();
+            consumed["search_consumed_role_inputs"] = json!(5);
+            assert!(!cost_known_unconsumed(&before, &consumed, &call));
+            let mut published = after.clone();
+            published["private_warm_observation"]["accepted_seeds"] = json!(3);
+            assert!(!cost_known_unconsumed(&before, &published, &call));
+            let mut unknown_call = call.clone();
+            unknown_call["physical"]["completion_unknown"] = json!(true);
+            assert!(!cost_known_unconsumed(&before, &after, &unknown_call));
+        }
+        #[test]
+        fn cost_opt_in_has_finite_sample_and_forward_bounds_without_changing_default_wall() {
+            assert_eq!(COST_PREPARATION_CALLS, 3);
+            assert_eq!(COST_MEASURED_CALLS, 5);
+            assert_eq!(COST_EXTRA_ROLE_FORWARDS, 18);
+            assert_eq!(COST_DEVICE_BYTES_MAX, 397_312);
+            let mut args = Args {
+                mode: "capture".into(),
+                values: BTreeMap::new(),
+                output: PathBuf::from("metadata-fixture-only"),
+                cost_same_seed_context: false,
+            };
+            assert_eq!(cost_work_wall(&args), Duration::from_secs(60));
+            args.cost_same_seed_context = true;
+            assert_eq!(cost_work_wall(&args), Duration::from_secs(45));
+        }
         #[test]
         fn existing_paused_stack_must_span_accepted_repair_c_and_actual_resume() {
             // Timestamp admission only: this fixture supplies no CUDA Run,
