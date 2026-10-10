@@ -1742,6 +1742,8 @@ fn run_native_pals(
             "PALS CUDA Warm requires experimental-io-binding; no fallback was started".into(),
         );
     }
+    #[cfg(feature = "experimental-io-binding")]
+    let warm_observation_limits = native.warm_observation_limits();
     let loading_profile = pals_cuda_loading_profile(
         native.cuda_loading_profile.as_deref(),
         native.cuda_loading_profile_hash.as_deref(),
@@ -1923,7 +1925,7 @@ fn run_native_pals(
                 }
                 None => rz_eval::onnx::OrtRuntime::load(&pin)?,
             };
-            rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_private_warm_and_observations(&manifest, &manifest_hash, runtime, backend_config, owner_options, Some((policy, profile.as_path())),native.warm_observation_limits())?
+            rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_private_warm_and_observations(&manifest, &manifest_hash, runtime, backend_config, owner_options, Some((policy, profile.as_path())),warm_observation_limits)?
         }
         Some((policy, profile)) => {
             let runtime = match loading_profile {
@@ -1965,7 +1967,7 @@ fn run_native_pals(
         #[cfg(feature = "experimental-io-binding")]
         None if cuda_warm => {
             let runtime = rz_eval::onnx::OrtRuntime::load(&pin)?;
-            rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_private_warm_and_observations(&manifest, &manifest_hash, runtime, backend_config, owner_options, None,native.warm_observation_limits())?
+            rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_private_warm_and_observations(&manifest, &manifest_hash, runtime, backend_config, owner_options, None,warm_observation_limits)?
         }
         None => rz_uci::pals_native::NativeRoleModel::load_pinned_with_options(
             &manifest,
