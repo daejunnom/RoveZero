@@ -188,6 +188,41 @@ deadline·상주 메모리를 먼저 정의한다. model 구조·history 입력�
 
 ## 구현·연구의 진행 축
 
+PALS 독자 엔진의 실제 연결·책임 경계와 남은 인수는
+[PALS 구현·인수 요약](PALS-IMPLEMENTATION.md)과
+[이전 상세 실행 이력](research/PALS-IMPLEMENTATION.md)을 참고한다. PR23의 추가 범위와
+계층별 기본값은 [후속 계약](PALS-FOLLOWUP-CONTRACTS.md)을 따른다. 이전의 비학습 목표와
+당시 CPU/CI/GPU 자료는 보존하며 새 V4/FullLineInteractionV2 기준의 인수로 승격하지 않는다.
+
+### PR23 후속의 책임과 수명
+
+새 모델 init·제품 profile 생략은 `FullLineInteractionV2`가 기본이다. input-only
+`full_line_v2`, head-only `interaction_head_v2`, explicit legacy `legacy_summary_v1`을
+독립 대조로 보존한다. 새 후속 등록은 V4 manifest/lock을 명시하고 child에 V4 wire를
+전달한다. 일반 CLI의 wire 생략은 기존 호환 동작이며, 모델 profile 기본과 wire 선택을
+같은 접점으로 해석하지 않는다. 기존 `baseline()`·V1/V2/V3 codec·digest의 의미를 유지한다.
+
+| 소유 경계 | 이번 후속의 계약과 구현·인수 한계 |
+|---|---|
+| Rules·자체 CPU | Rules가 exact position/history·make/unmake를 소유한다. optional `PausedStack`은 실제 root/PVS/negamax/qsearch/SEE 미완료 frame·accumulator와 TT/ordering owner를 유지한다. 한 실제 paused task·8MiB·일회 token이며 기본은 `CompletedIteration`이다. stale pause의 소비 비용·역사는 보존한다. orphan/logical cancel의 실제 frame 폐기·token/bytes 0·complete snapshot 확인 전에는 논리 pause를 retire하지 않는다. GPU 물리 lease는 CPU cleanup의 책임 밖이다. |
+| checker·resolver·Fresh | checker와 `ResolverPolicy`를 독립 선택한다. own raw namespace는 자체 CPU만, model WDL은 own/외부 checker를 지원한다. 외부 제품 실행은 현재 Linux native ELF의 binary/argv/UCI 검증 범위다. frozen Fresh의 두 끝점은 같은 모델·정밀도·공개 문맥 revision·관점이며 mixed/unknown은 unresolved다. 외부 CP/mate·bound를 Rules 사실이나 own raw로 전환하지 않는다. |
+| 결론·반복 queue | `ContextWdl` raw 관측 두 개와 dependency를 가진 conditional WDL의 namespace/revision을 유지한다. 실제 새 C continuation·Fresh 새 P 관측과 엄격한 개선만 Repair의 supersedes/RepairedBy 근거가 된다. queue는 명시적 `IterativeFrozenModelWdlV2`의 S 정책이며 원래 first move와 새 증거를 보존한다. 재검토 기본은 `Disabled`다. |
+| bounded hot/cold 저장소 | Store·Engine은 controlled allocation·hot 80% 회수·최대1회 Capacity 재시도를 원래 deadline/byte와 resident/temporary·active/paused/dependency 핀 안에서 연결한다. commit·무결성 확인 뒤 회수하고 typed 실패를 보존하며 Node를 compact하지 않는다. 새 게임의 독립 owner는 원래 session write ledger를 승계한다. Native→Arena는 owner/session 실제 비용·close·partial/unknown을 검증하며 선언을 실행 사실로 바꾸지 않는다. |
+| host/CUDA Warm·물리 완료 | 서로 다른 capability이며 기본 off다. 같은 accepted role·모델/epoch·Rules/history/query에서만 seed를 재사용하고 public record revision만 변경 가능하다. Value/V는 Fresh다. 실제 request/execution/bank/ordinal join과 물리 완료를 확인한다. cancel/physical unknown의 owner·input/output/seed/workspace와 근거는 물리 완료 전 보존·격리하며 논리 취소나 root 전이로 재사용하지 않는다. |
+| 진단 학습·실행 인수 | historical 연속·재개24 update PASS, 이전1+8 실패·누적33·actual target0, source8 직접 대조 재사용과 이번 새 optimizer0을 구분한다. 실제 learned V utility/action 근거는 부족하다. 현재 CPU/NN/GPU 검사는 미시작이며 CI·baseline·비용·paired pilot 인수는 구현 기록을 따른다. 본격 학습·기력·유료 자원·병합 승인으로 확대하지 않는다. |
+
+소스 책임은 [CPU stack](../crates/rz-search/src/cpu/stack.rs),
+[CPU lifecycle](../crates/rz-search/src/pals/engine/cpu_lifecycle.rs),
+[checker](../crates/rz-search/src/cpu_checker.rs),
+[frozen recheck](../crates/rz-search/src/pals/engine/frozen_recheck.rs),
+[store archive](../crates/rz-search/src/pals/store/archive.rs),
+[archive lifecycle](../crates/rz-search/src/pals/engine/archive_lifecycle.rs),
+[CUDA Warm](../crates/rz-eval/src/pals_onnx/warm/cuda.rs)에 연결한다. 소스 준비·CPU/mock,
+actual NN·GPU 수명·학습 smoke·대국을 각각 인수한다. 새 diagnostic 범위의 제한은
+[TRAINING-PLAN](TRAINING-PLAN.md#2026-10-10-pals-diagnostic-학습-smoke)을 따른다.
+모델 입력/head·queue·stack·Warm 및 구현별 비용은 각각 고정 조건으로 비교한다.
+모델·탐색의 A/S 변경에 의미 보존 E 최적화의 전역 5% gate를 추가하지 않는다.
+
 20개 TASK의 실제 순서와 병렬 의존성은 [구현 지시서](IMPLEMENTATION-DIRECTIVES.md)를
 따른다. 총괄의 최소 공통 계약 → A/B/C01/D01/E/F01 mock 병렬 → 독립 규칙·UCI·
 CPU/mock 인수 → 단일 가중치의 실제 Rust 추론 → 종단 계측 → 한 검색/런타임

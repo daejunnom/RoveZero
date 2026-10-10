@@ -20,6 +20,9 @@ use ort::value::{Tensor, ValueType};
 use rz_encoding::classical::{EncodedInput, INPUT_VALUES};
 use rz_encoding::POLICY_SIZE;
 use rz_native_loader::{LibrarySet, LoadError, ProcessLibrarySet};
+pub use rz_native_loader::{
+    NativeLoadingProfile, NativeMappingObservation, NVIDIA_LOAD_ORDER, ORT_LIBRARY_NAMES,
+};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -122,6 +125,7 @@ pub struct OrtRuntime {
     build_info: String,
     cuda_libraries: Option<ProcessLibrarySet>,
     ort_libraries: Option<Arc<Vec<rz_native_loader::OwnedLibrary>>>,
+    loading_profile: Option<NativeLoadingProfile>,
 }
 
 impl std::fmt::Debug for OrtRuntime {
@@ -130,6 +134,7 @@ impl std::fmt::Debug for OrtRuntime {
             .field("pin", &self.pin)
             .field("build_info", &self.build_info)
             .field("cuda_bundle", &self.pin.bundle_digest())
+            .field("native_loading_profile", &self.loading_profile)
             .finish()
     }
 }
@@ -138,6 +143,7 @@ struct RuntimeLatch {
     // ORT may retain the native library even if later initialization fails.
     // Preserve its bootstrap capability on both success and latched failure.
     pin: RuntimeLibraryPin,
+    loading_profile: Option<NativeLoadingProfile>,
     result: Result<OrtRuntime, BackendError>,
 }
 
@@ -152,6 +158,17 @@ impl OrtRuntime {
     /// LD_LIBRARY_PATH. No dependencies are downloaded by this API.
     /// A hash is identity, not a sandbox for executing native code.
     pub fn load(pin: &RuntimeLibraryPin) -> Result<Self, BackendError> {
+        Self::load_with_cuda_loading_profile(pin, NativeLoadingProfile::EagerCuda12Cudnn9V1)
+    }
+
+    /// Explicit diagnostic profile selection before any native constructor.
+    /// Existing CPU/LC0 callers keep load() and eager16. A different profile
+    /// cannot reuse an already initialized process, even with identical files.
+    pub fn load_with_cuda_loading_profile(
+        pin: &RuntimeLibraryPin,
+        requested_profile: NativeLoadingProfile,
+    ) -> Result<Self, BackendError> {
+        let loading_profile = cuda_loading_profile(pin.bundle_digest(), requested_profile)?;
         let unavailable = || {
             BackendError::new(
                 K::BackendUnavailable,
@@ -162,7 +179,7 @@ impl OrtRuntime {
         let mut guard = RUNTIME.lock().map_err(|error| {
             unavailable().with_external_cause(CauseCode::RuntimeInitialize, &error)
         })?;
-        if let Some(latch) = guard.as_ref() {
+        if let Some(latch) = guard.as_mut() {
             if latch.pin.path() != pin.path()
                 || latch.pin.binary_digest() != pin.binary_digest()
                 || latch.pin.bundle_digest() != pin.bundle_digest()
@@ -172,6 +189,17 @@ impl OrtRuntime {
                     S::Backend,
                     "ORT library is process-global and already pinned",
                 ));
+            }
+            if latch.loading_profile != loading_profile {
+                let failure = BackendError::new(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "ORT process native loading policy cannot be changed",
+                );
+                if latch.result.is_ok() {
+                    latch.result = Err(failure);
+                }
+                return Err(latch.result.as_ref().unwrap_err().clone());
             }
             let runtime = latch.result.as_ref().map_err(Clone::clone)?;
             return if runtime.pin.binary_digest() == pin.binary_digest()
@@ -227,7 +255,13 @@ impl OrtRuntime {
                         bytes: library.bytes,
                     })
                     .collect();
-                Some(LibrarySet::load(dependencies).map_err(loader_error)?)
+                Some(
+                    LibrarySet::load_with_profile(
+                        dependencies,
+                        loading_profile.expect("CUDA has an explicit loading profile"),
+                    )
+                    .map_err(loader_error)?,
+                )
             } else {
                 None
             };
@@ -261,6 +295,7 @@ impl OrtRuntime {
                 build_info: info.to_owned(),
                 cuda_libraries,
                 ort_libraries,
+                loading_profile,
             })
         })
         .unwrap_or_else(|payload| {
@@ -276,6 +311,7 @@ impl OrtRuntime {
         });
         *guard = Some(RuntimeLatch {
             pin: pin.clone(),
+            loading_profile,
             result: result.clone(),
         });
         result
@@ -292,10 +328,38 @@ impl OrtRuntime {
         self.pin.bundle_digest()
     }
 
+    pub fn native_loading_profile(&self) -> Option<NativeLoadingProfile> {
+        self.loading_profile
+    }
+
+    pub fn native_loading_profile_digest(&self) -> Option<[u8; 32]> {
+        self.loading_profile
+            .map(|profile| asset::sha256(profile.canonical_descriptor().as_bytes()))
+    }
+
+    /// Actual mapping origin audit, sampled by explicit acceptance callers.
+    /// It shares the immutable failure latch with normal verification and does
+    /// not initialize a provider or replace a physical completion fence.
+    pub fn cuda_mapping_observation(
+        &self,
+        include_runtime: bool,
+    ) -> Result<NativeMappingObservation, BackendError> {
+        self.audit_cuda_mappings(include_runtime, true)
+            .map(|observed| observed.expect("explicit origin observation was requested"))
+    }
+
     /// Canonical descriptors of the actually retained runtime bundle. This is
     /// loaded pin metadata, not an unchecked bootstrap JSON declaration.
     pub fn bundle_files(&self) -> Option<&[crate::runtime_pin::RuntimeBundleFile]> {
         self.pin.bundle_files()
+    }
+
+    /// Audit the explicitly preloaded NVIDIA dependencies before constructing a
+    /// CUDA session. ORT provider images may load lazily during the first CUDA
+    /// Run; callers must use the full audit after that Run and its completion
+    /// fence succeed. This does not initialize a provider or prove completion.
+    pub fn verify_cuda_dependencies(&self) -> Result<(), BackendError> {
+        self.verify_cuda_mappings(false)
     }
 
     /// Recheck all resident bundle images after later numerical/worker calls,
@@ -306,6 +370,14 @@ impl OrtRuntime {
     }
 
     fn verify_cuda_mappings(&self, include_runtime: bool) -> Result<(), BackendError> {
+        self.audit_cuda_mappings(include_runtime, false).map(|_| ())
+    }
+
+    fn audit_cuda_mappings(
+        &self,
+        include_runtime: bool,
+        observe: bool,
+    ) -> Result<Option<NativeMappingObservation>, BackendError> {
         // Existing clones must observe the first latched failure too. A later
         // filesystem/map change cannot turn a poisoned process runtime into a
         // valid constructor input, or replace its original typed cause.
@@ -320,6 +392,7 @@ impl OrtRuntime {
         if let Some(latch) = guard.as_ref() {
             if latch.pin.path() != self.pin.path()
                 || latch.pin.bundle_digest() != self.pin.bundle_digest()
+                || latch.loading_profile != self.loading_profile
             {
                 return Err(BackendError::new(
                     K::IdentityMismatch,
@@ -336,20 +409,28 @@ impl OrtRuntime {
                 "CUDA requires a pinned runtime bundle",
             )
         })?;
+        // Normal verification does not allocate receipt/name vectors on the
+        // existing per-Run path. Only explicit acceptance observations do so.
         let verified = libraries
             .verify_mappings()
             .and_then(|()| {
                 if include_runtime {
-                    // All three ORT images become mandatory after the actual CUDA
-                    // probe. Before that point only the explicitly preloaded NVIDIA
-                    // images are required to be resident.
-                    libraries.verify_runtime_mappings(
-                        self.ort_libraries
-                            .as_ref()
-                            .expect("CUDA runtime owns its three pinned ORT images"),
-                    )
+                    // All three ORT images become mandatory after the actual
+                    // CUDA probe. Keep the existing separate NVIDIA audit
+                    // before this full runtime-origin audit.
+                    let ort = self
+                        .ort_libraries
+                        .as_ref()
+                        .expect("CUDA runtime owns its three pinned ORT images");
+                    if observe {
+                        libraries.runtime_mapping_observation(ort).map(Some)
+                    } else {
+                        libraries.verify_runtime_mappings(ort).map(|()| None)
+                    }
+                } else if observe {
+                    libraries.mapping_observation().map(Some)
                 } else {
-                    Ok(())
+                    Ok(None)
                 }
             })
             .map_err(loader_error);
@@ -359,6 +440,7 @@ impl OrtRuntime {
             if let Some(latch) = guard.as_mut() {
                 if latch.pin.path() == self.pin.path()
                     && latch.pin.bundle_digest() == self.pin.bundle_digest()
+                    && latch.loading_profile == self.loading_profile
                     && latch.result.is_ok()
                 {
                     latch.result = Err(failure.clone());
@@ -366,6 +448,53 @@ impl OrtRuntime {
             }
         }
         verified
+    }
+}
+
+fn cuda_loading_profile(
+    bundle: Option<[u8; 32]>,
+    requested: NativeLoadingProfile,
+) -> Result<Option<NativeLoadingProfile>, BackendError> {
+    if bundle.is_some() {
+        Ok(Some(requested))
+    } else if requested == NativeLoadingProfile::EagerCuda12Cudnn9V1 {
+        Ok(None)
+    } else {
+        Err(BackendError::new(
+            K::IdentityMismatch,
+            S::Backend,
+            "experimental native loading profile requires a complete CUDA bundle",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod native_loading_profile_tests {
+    use super::*;
+
+    #[test]
+    fn cpu_bootstrap_keeps_no_native_profile_and_rejects_explicit_shim() {
+        assert_eq!(
+            cuda_loading_profile(None, NativeLoadingProfile::EagerCuda12Cudnn9V1).unwrap(),
+            None
+        );
+        assert!(cuda_loading_profile(None, NativeLoadingProfile::CuDnnShimLazyV1).is_err());
+        assert_eq!(
+            cuda_loading_profile(Some([7; 32]), NativeLoadingProfile::CuDnnShimLazyV1).unwrap(),
+            Some(NativeLoadingProfile::CuDnnShimLazyV1)
+        );
+        assert_ne!(
+            asset::sha256(
+                NativeLoadingProfile::EagerCuda12Cudnn9V1
+                    .canonical_descriptor()
+                    .as_bytes()
+            ),
+            asset::sha256(
+                NativeLoadingProfile::CuDnnShimLazyV1
+                    .canonical_descriptor()
+                    .as_bytes()
+            )
+        );
     }
 }
 

@@ -2,7 +2,7 @@
 //! 실제 Rules/registry는 caller가 공급한다. 이 owner는 체스 상태나 digest를 만들지
 //! 않으며 Runtime의 raw-cache namespace 초기화와 물리 buffer drain을 대체하지 않는다.
 
-use std::time::Instant;
+use std::{collections::VecDeque, time::Instant};
 
 use rz_contracts::{
     AcceptanceScope, Color, ContractError, ErrorCode, GameGeneration, ProcessEpoch, RootGeneration,
@@ -16,9 +16,66 @@ use rz_search::time::TimeBudgetError;
 
 use crate::bridge::{BudgetKind, BuildSearchError, BuildSearchSettings, SearchBinding, SideToMove};
 use crate::{
-    Command, Diagnostic, Effect, Event, PositionPort, SearchCompletion, SearchTicket, Session,
-    SessionResult, handle_event, parse,
+    CancelReason, Command, Diagnostic, Effect, Event, PositionPort, SearchCompletion, SearchTicket,
+    Session, SessionResult, handle_event, parse,
 };
+
+/// UCI publication authority is independent of the selected search algorithm.
+/// Evaluation scopes retain the unchanged 0.1 model contract; native CPU/PALS
+/// drivers use a search identity and never fabricate a neural model descriptor.
+#[derive(Clone, Copy, Debug)]
+pub enum SessionScope {
+    Evaluation(AcceptanceScope),
+    Search(rz_contracts::pals::SearchAuthority),
+}
+impl PartialEq for SessionScope {
+    fn eq(&self, other: &Self) -> bool {
+        match (*self, *other) {
+            (Self::Evaluation(a), Self::Evaluation(b)) => {
+                a.game == b.game
+                    && a.root == b.root
+                    && a.model == b.model
+                    && a.encoding == b.encoding
+                    && a.backend == b.backend
+            }
+            (Self::Search(a), Self::Search(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for SessionScope {}
+impl SessionScope {
+    pub fn game(self) -> GameGeneration {
+        match self {
+            Self::Evaluation(s) => s.game,
+            Self::Search(s) => s.game,
+        }
+    }
+    pub fn root(self) -> RootGeneration {
+        match self {
+            Self::Evaluation(s) => s.root,
+            Self::Search(s) => s.root,
+        }
+    }
+    fn set_generations(&mut self, game: GameGeneration, root: RootGeneration) {
+        match self {
+            Self::Evaluation(s) => {
+                s.game = game;
+                s.root = root;
+            }
+            Self::Search(s) => {
+                s.game = game;
+                s.root = root;
+            }
+        }
+    }
+    pub fn evaluation(self) -> Option<AcceptanceScope> {
+        match self {
+            Self::Evaluation(s) => Some(s),
+            Self::Search(_) => None,
+        }
+    }
+}
 
 /// Typed contract causes remain alongside protocol/legacy backend diagnostics.
 /// An event-loop handler forwards `session` only after recording `errors`.
@@ -41,22 +98,32 @@ struct CurrentSearch {
     binding: SearchBinding,
     cancellation: ContractCancellation,
     deadlines: ContractDeadlines,
-    scope: AcceptanceScope,
+    scope: SessionScope,
     infinite: bool,
     work_completed: bool,
+}
+
+struct RetiredCancellation {
+    ticket: SearchTicket,
+    reason: CancelReason,
 }
 
 /// One Session owner's acceptance authority. Epoch, model/encoding/backend
 /// handles, and initial generations are explicit inputs from their real owners.
 /// Reusing this owner with an independently active Session is rejected.
 pub struct ContractSessionOwner {
-    scope: AcceptanceScope,
+    scope: SessionScope,
     epoch: ProcessEpoch,
     clock: InstantClock,
     settings: BuildSearchSettings,
     last_dispatch: Instant,
     ticket: Option<SearchTicket>,
     current: Option<CurrentSearch>,
+    // Opaque identities only: no position, search work or reusable authority.
+    // A service supplies its existing worker bound; old standalone constructors
+    // retain their original typed-Stale behavior with a zero-length history.
+    retired_cancellations: VecDeque<RetiredCancellation>,
+    max_retired_cancellations: usize,
 }
 
 impl ContractSessionOwner {
@@ -66,13 +133,51 @@ impl ContractSessionOwner {
         clock: InstantClock,
         settings: BuildSearchSettings,
     ) -> Result<Self, ContractError> {
+        Self::new_scope(SessionScope::Evaluation(scope), epoch, clock, settings)
+    }
+    pub fn new_scope(
+        scope: SessionScope,
+        epoch: ProcessEpoch,
+        clock: InstantClock,
+        settings: BuildSearchSettings,
+    ) -> Result<Self, ContractError> {
+        Self::new_scope_with_cancel_history(scope, epoch, clock, settings, 0)
+    }
+
+    /// Explicit service-only diagnostic history, bounded by its worker limit.
+    /// Remembering a canceled identity never reopens result/work admission.
+    /// The zero-history mode preserves the standalone constructor behavior.
+    pub fn new_scope_with_cancel_history(
+        scope: SessionScope,
+        epoch: ProcessEpoch,
+        clock: InstantClock,
+        settings: BuildSearchSettings,
+        max_retired_cancellations: usize,
+    ) -> Result<Self, ContractError> {
         if clock.domain().0 != epoch {
             return Err(error(
                 ErrorCode::IdentityMismatch,
                 "process epoch and UCI clock domain differ",
             ));
         }
+        if let SessionScope::Search(authority) = scope
+            && authority.epoch != epoch
+        {
+            return Err(error(
+                ErrorCode::IdentityMismatch,
+                "search identity and UCI process epoch differ",
+            ));
+        }
         clock.now()?;
+        let mut retired_cancellations = VecDeque::new();
+        retired_cancellations
+            .try_reserve_exact(max_retired_cancellations)
+            .map_err(|_| {
+                error(
+                    ErrorCode::ResourceExhausted,
+                    "bounded canceled-ticket diagnostic history allocation failed",
+                )
+            })?;
         Ok(Self {
             scope,
             epoch,
@@ -81,10 +186,17 @@ impl ContractSessionOwner {
             last_dispatch: Instant::now(),
             ticket: None,
             current: None,
+            retired_cancellations,
+            max_retired_cancellations,
         })
     }
 
     pub fn scope(&self) -> AcceptanceScope {
+        self.scope
+            .evaluation()
+            .expect("evaluation-only registry accessor")
+    }
+    pub fn lifecycle_scope(&self) -> SessionScope {
         self.scope
     }
     pub fn process_epoch(&self) -> ProcessEpoch {
@@ -97,6 +209,9 @@ impl ContractSessionOwner {
         self.ticket.as_ref()
     }
     pub fn active_scope(&self) -> Option<AcceptanceScope> {
+        self.current.as_ref().and_then(|c| c.scope.evaluation())
+    }
+    pub fn active_lifecycle_scope(&self) -> Option<SessionScope> {
         self.current.as_ref().map(|c| c.scope)
     }
     pub fn active_binding(&self) -> Option<&SearchBinding> {
@@ -129,13 +244,19 @@ impl ContractSessionOwner {
                 "registry update requires an idle UCI session",
             ));
         }
-        if scope.game != self.scope.game || scope.root != self.scope.root {
+        if scope.game != self.scope.game() || scope.root != self.scope.root() {
             return Err(error(
                 ErrorCode::IdentityMismatch,
                 "registry update cannot replace game/root generations",
             ));
         }
-        self.scope = scope;
+        if self.scope.evaluation().is_none() {
+            return Err(error(
+                ErrorCode::UnsupportedContract,
+                "search driver has no model registry",
+            ));
+        }
+        self.scope = SessionScope::Evaluation(scope);
         Ok(())
     }
 
@@ -173,14 +294,14 @@ impl ContractSessionOwner {
         } else {
             None
         };
+        let previous_ticket = self.current.as_ref().map(|c| c.binding.ticket().clone());
         let mut out = ContractSessionOutcome::from(session.handle_line(line));
         if !out.session.accepted {
             return out;
         }
         if let Some((game, root)) = next {
             self.close_current();
-            self.scope.game = game;
-            self.scope.root = root;
+            self.scope.set_generations(game, root);
         }
         if matches!(command, Command::Stop | Command::Quit) {
             self.close_current();
@@ -249,6 +370,7 @@ impl ContractSessionOwner {
                 out.session.effects.push(effect);
             }
         }
+        self.remember_actual_cancellations(previous_ticket.as_ref(), &out.session.effects);
         self.synchronize(session);
         out
     }
@@ -277,6 +399,7 @@ impl ContractSessionOwner {
         }
         let now = now.max(Instant::now()).max(self.last_dispatch);
         self.last_dispatch = now;
+        let previous_ticket = self.current.as_ref().map(|c| c.binding.ticket().clone());
         let out = match event {
             Event::Progress { ticket, bestmove } => self.progress(session, &ticket, &bestmove, now),
             Event::Complete { ticket, completion } => {
@@ -295,6 +418,7 @@ impl ContractSessionOwner {
             }
             event => handle_event(session, event).into(),
         };
+        self.remember_actual_cancellations(previous_ticket.as_ref(), &out.session.effects);
         self.synchronize(session);
         // The common cancellation clone is authoritative even when an invalid
         // candidate returned before its final guard. Mirror it into legacy work.
@@ -314,7 +438,7 @@ impl ContractSessionOwner {
         let scope = self.scope;
         let clock = self.clock;
         let Some(current) = self.matching_current(ticket) else {
-            return stale(None);
+            return self.late_result(ticket, "Progress", None);
         };
         if current.work_completed {
             return stale(None);
@@ -341,7 +465,7 @@ impl ContractSessionOwner {
         let scope = self.scope;
         let clock = self.clock;
         let Some(current) = self.matching_current(ticket) else {
-            return stale(Some(completion));
+            return self.late_result(ticket, "Complete", Some(completion));
         };
         if current.work_completed {
             return stale(Some(completion));
@@ -417,17 +541,17 @@ impl ContractSessionOwner {
     ) -> Result<(GameGeneration, RootGeneration), ContractError> {
         let root = self
             .scope
-            .root
+            .root()
             .0
             .checked_add(1)
             .ok_or_else(|| error(ErrorCode::ResourceExhausted, "root generation overflow"))?;
         let game =
             if new_game {
-                self.scope.game.0.checked_add(1).ok_or_else(|| {
+                self.scope.game().0.checked_add(1).ok_or_else(|| {
                     error(ErrorCode::ResourceExhausted, "game generation overflow")
                 })?
             } else {
-                self.scope.game.0
+                self.scope.game().0
             };
         Ok((GameGeneration(game), RootGeneration(root)))
     }
@@ -436,6 +560,73 @@ impl ContractSessionOwner {
             current.cancellation.cancel();
         }
         self.ticket = None;
+    }
+    fn remember_actual_cancellations<S>(
+        &mut self,
+        previous_ticket: Option<&SearchTicket>,
+        effects: &[Effect<S>],
+    ) {
+        if self.max_retired_cancellations == 0 {
+            return;
+        }
+        let Some(previous_ticket) = previous_ticket else {
+            return;
+        };
+        // Only a real Session-generated Cancel effect for this owner's prior
+        // common binding qualifies. Rejected commands and foreign events cannot
+        // mint a diagnostic exemption; natural completion has no Cancel effect.
+        for effect in effects {
+            let Effect::Cancel { ticket, reason } = effect else {
+                continue;
+            };
+            if ticket != previous_ticket
+                || self
+                    .retired_cancellations
+                    .iter()
+                    .any(|c| c.ticket == *ticket)
+            {
+                continue;
+            }
+            if self.retired_cancellations.len() == self.max_retired_cancellations {
+                self.retired_cancellations.pop_front();
+            }
+            self.retired_cancellations.push_back(RetiredCancellation {
+                ticket: ticket.clone(),
+                reason: *reason,
+            });
+        }
+    }
+    fn late_result<S>(
+        &self,
+        ticket: &SearchTicket,
+        event_kind: &'static str,
+        completion: Option<SearchCompletion>,
+    ) -> ContractSessionOutcome<S> {
+        // A real failed publication must retain its typed Stale and SearchFailed
+        // causes even when its ticket was canceled normally. Physical-unknown
+        // publications are fenced by the engine owner before this reducer.
+        if !matches!(completion.as_ref(), Some(SearchCompletion::Failed { .. }))
+            && let Some(cancellation) = self
+                .retired_cancellations
+                .iter()
+                .find(|c| c.ticket == *ticket)
+        {
+            let mut out = SessionResult {
+                accepted: false,
+                ..SessionResult::default()
+            };
+            out.diagnostics.push(Diagnostic {
+                code: "CanceledSearchResultIgnored",
+                message: format!(
+                    "ignored late {event_kind} after owned {:?} cancellation; no result or work admission",
+                    cancellation.reason
+                ),
+            });
+            return out.into();
+        }
+        // Eviction only reduces the classification window. It never admits an
+        // unknown/foreign ticket or removes a failure's original cause.
+        stale(completion)
     }
     fn synchronize<P: PositionPort>(&mut self, session: &Session<P>) {
         self.ticket = session.active_ticket();
@@ -458,7 +649,7 @@ impl Drop for ContractSessionOwner {
 
 fn acceptance(
     current: &CurrentSearch,
-    scope: AcceptanceScope,
+    scope: SessionScope,
     clock: InstantClock,
     now: Instant,
 ) -> Result<(), ContractError> {
@@ -486,12 +677,8 @@ fn mirror_cancel(current: &CurrentSearch) {
         current.cancellation.cancel();
     }
 }
-fn same_scope(a: AcceptanceScope, b: AcceptanceScope) -> bool {
-    a.game == b.game
-        && a.root == b.root
-        && a.model == b.model
-        && a.encoding == b.encoding
-        && a.backend == b.backend
+fn same_scope(a: SessionScope, b: SessionScope) -> bool {
+    a == b
 }
 fn error(code: ErrorCode, detail: &'static str) -> ContractError {
     ContractError::new(code, Stage::Admission, detail)
@@ -500,7 +687,7 @@ fn map_build_error(err: BuildSearchError) -> ContractError {
     match err {
         BuildSearchError::SimulationLimitExceeded { .. } => error(
             ErrorCode::ResourceExhausted,
-            "go nodes exceeds configured simulation bound",
+            "go nodes exceeds configured search work bound",
         ),
         BuildSearchError::UntimedDeadlineOverflow => {
             error(ErrorCode::ResourceExhausted, "untimed deadline overflow")

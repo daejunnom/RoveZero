@@ -20,6 +20,17 @@ use std::{
 };
 
 pub const NATIVE_PAIR_METADATA_CAP: u64 = 64 * 1024;
+pub(crate) fn pair_stream_cap(output_bytes: u64, metadata_cap: u64) -> Result<u64, ArenaError> {
+    output_bytes
+        .checked_sub(metadata_cap)
+        .and_then(|n| n.checked_div(2))
+        .filter(|n| *n > 0 && metadata_cap > 0)
+        .ok_or_else(|| {
+            ArenaError::Budget(
+                "native output budget needs receipt, PGN/config and stream reservations".into(),
+            )
+        })
+}
 const MAX_INNER_ARG_BYTES: usize = 16 * 1024;
 static NATIVE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static NATIVE_ADMISSION_CLOSED: AtomicBool = AtomicBool::new(false);
@@ -37,6 +48,47 @@ pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 
         role: rz_experiments::NativeEngineRole,
     ) -> Result<NativeEngineView<'_>, rz_experiments::ManifestError>;
     fn provider_name(&self) -> &'static str;
+    /// V4 has independently typed model/resolver/recheck/stack selections.
+    /// Historical declarations retain their original 32-token codec limit.
+    fn argument_limit(&self) -> usize {
+        32
+    }
+    /// Fixed receipt reservation selected before input copying or child spawn.
+    /// Legacy declarations keep their original 64 KiB receipt and stream split.
+    fn pair_metadata_cap(&self) -> u64 {
+        NATIVE_PAIR_METADATA_CAP
+    }
+    /// Arguments needed only by the two game sessions, after option preflight.
+    fn runtime_arguments(
+        &self,
+        _role: rz_experiments::NativeEngineRole,
+        _runtime_root: &Path,
+    ) -> Result<Vec<OsString>, ArenaError> {
+        Ok(Vec::new())
+    }
+    /// Probe-only arguments must not create the two game sessions' evidence.
+    fn preflight_arguments(
+        &self,
+        _role: rz_experiments::NativeEngineRole,
+        _runtime_root: &Path,
+    ) -> Result<Vec<OsString>, ArenaError> {
+        Ok(Vec::new())
+    }
+    /// Default probes retain the historical role runtime path. A selected
+    /// separate root is created and pinned by the Native owner, with a fixed
+    /// role-specific sibling name; declarations cannot supply arbitrary paths.
+    /// Its entries consume the existing runtime aggregate, never a new quota.
+    fn uses_separate_preflight_runtime_root(
+        &self,
+        _role: rz_experiments::NativeEngineRole,
+    ) -> Result<bool, ArenaError> {
+        Ok(false)
+    }
+    fn amend_execution_limitations(&self, _limitations: &mut Vec<String>) {}
+    /// A bounded path below `inputs`; native declarations keep their old names.
+    fn snapshot_relative_path(&self, _artifact: &ArtifactRef) -> Option<String> {
+        None
+    }
     fn seed(&self) -> u64 {
         1
     }
@@ -75,7 +127,7 @@ pub struct NativeEngineView<'a> {
     pub external: Option<&'a rz_experiments::ExternalUciEndpointV2>,
     pub environment: Option<&'a rz_experiments::EngineEnvironmentV2>,
 }
-impl NativeEngineView<'_> {
+impl<'a> NativeEngineView<'a> {
     #[cfg(target_os = "linux")]
     fn executable_input(&self, artifact: &ArtifactRef) -> bool {
         self.artifact(NativeArtifactRole::Binary)
@@ -88,7 +140,7 @@ impl NativeEngineView<'_> {
     pub fn artifact(
         &self,
         role: rz_experiments::NativeArtifactRole,
-    ) -> Result<&ArtifactRef, ArenaError> {
+    ) -> Result<&'a ArtifactRef, ArenaError> {
         if let Some(external) = self.external {
             return if role == rz_experiments::NativeArtifactRole::Binary {
                 Ok(&external.binary)
@@ -294,10 +346,16 @@ impl<S: NativeLaunchDeclaration> NativeLaunchOwner<S> {
 /// `argv_split` parser. This is a single `args=` outer argv element, not shell
 /// quoting. Quotes and backslashes are rejected rather than ambiguously escaped.
 pub fn encode_fastchess_native_args(tokens: &[OsString]) -> Result<OsString, ArenaError> {
-    if tokens.is_empty() || tokens.len() > 32 {
-        return Err(ArenaError::Invalid(
-            "native engine arguments require 1..32 tokens".into(),
-        ));
+    encode_fastchess_native_args_with_limit(tokens, 32)
+}
+pub fn encode_fastchess_native_args_with_limit(
+    tokens: &[OsString],
+    limit: usize,
+) -> Result<OsString, ArenaError> {
+    if !matches!(limit, 32 | 48) || tokens.is_empty() || tokens.len() > limit {
+        return Err(ArenaError::Invalid(format!(
+            "native engine arguments require 1..{limit} tokens and a registered 32/48-token limit"
+        )));
     }
     let mut encoded = String::from("args=");
     for (index, token) in tokens.iter().enumerate() {
@@ -449,6 +507,40 @@ pub(crate) mod linux {
         pub path: PathBuf,
         pub file: File,
     }
+    pub(crate) struct PreflightRuntimeRoot {
+        pub name: &'static str,
+        pub path: PathBuf,
+        pub directory: Dir,
+        pub file: File,
+    }
+    fn preflight_runtime_name(role: NativeEngineRole) -> &'static str {
+        match role {
+            NativeEngineRole::Baseline => "external-baseline-preflight-runtime",
+            NativeEngineRole::Candidate => "external-candidate-preflight-runtime",
+        }
+    }
+    fn create_preflight_runtime_root(
+        parent: &Dir,
+        parent_path: &Path,
+        role: NativeEngineRole,
+    ) -> Result<PreflightRuntimeRoot, ArenaError> {
+        let name = preflight_runtime_name(role);
+        parent
+            .create_dir(name)
+            .map_err(|_| io("cannot create exclusive native preflight runtime root"))?;
+        let directory = parent
+            .open_dir_nofollow(name)
+            .map_err(|_| io("cannot pin native preflight runtime root"))?;
+        let file = readable_directory_pin(&directory)?;
+        file.set_permissions(Permissions::from_mode(0o700))
+            .map_err(|_| io("cannot make native preflight runtime root private"))?;
+        Ok(PreflightRuntimeRoot {
+            name,
+            path: parent_path.join(name),
+            directory,
+            file,
+        })
+    }
     pub(crate) struct Snapshot {
         pub directory: Dir,
         pub input_directory: Dir,
@@ -462,8 +554,123 @@ pub(crate) mod linux {
         pub watch: OwnedArtifactTreeWatch,
         pub limits: ProcessLimits,
         pub _runtime_root_pins: [File; 2],
-        pub bundle_directory: Option<Dir>,
+        pub preflight_runtime_roots: [Option<PreflightRuntimeRoot>; 2],
+        pub input_subdirectories: BTreeMap<PathBuf, Dir>,
         pub preparation_cache_hint: Option<crate::SnapshotCacheHint>,
+    }
+    impl Snapshot {
+        pub(crate) fn preflight_runtime_path(&self, role: NativeEngineRole) -> PathBuf {
+            let index = match role {
+                NativeEngineRole::Baseline => 0,
+                NativeEngineRole::Candidate => 1,
+            };
+            self.preflight_runtime_roots[index].as_ref().map_or_else(
+                || {
+                    self.path.join(match role {
+                        NativeEngineRole::Baseline => "baseline-runtime",
+                        NativeEngineRole::Candidate => "candidate-runtime",
+                    })
+                },
+                |root| root.path.clone(),
+            )
+        }
+    }
+
+    /// The optional roots retain both the directory capability and a readable
+    /// permissions/inode pin. Reopening the direct name without following links
+    /// binds the argv path to that retained inode before and after every probe.
+    pub(crate) fn verify_preflight_runtime_roots(snapshot: &Snapshot) -> Result<(), ArenaError> {
+        verify_preflight_runtime_root_pins(
+            &snapshot.directory,
+            &snapshot.path,
+            &snapshot.preflight_runtime_roots,
+        )
+    }
+    fn verify_preflight_runtime_root_pins(
+        parent: &Dir,
+        parent_path: &Path,
+        roots: &[Option<PreflightRuntimeRoot>; 2],
+    ) -> Result<(), ArenaError> {
+        if roots.iter().all(Option::is_none) {
+            return Ok(());
+        }
+        let mut inodes = std::collections::BTreeSet::new();
+        // The crate forbids unsafe code. Read the effective UID from the same
+        // trusted procfs self observation used for Linux arena admission.
+        let mut status = Vec::new();
+        File::open("/proc/self/status")
+            .map_err(|_| io("cannot observe native preflight owner UID"))?
+            .take(16 * 1024 + 1)
+            .read_to_end(&mut status)
+            .map_err(|_| io("cannot read native preflight owner UID"))?;
+        if status.len() > 16 * 1024 {
+            return Err(ArenaError::Budget(
+                "native preflight owner observation exceeds 16KiB".into(),
+            ));
+        }
+        let status = std::str::from_utf8(&status)
+            .map_err(|_| io("native preflight owner UID observation is not UTF-8"))?;
+        let mut uid_lines = status.lines().filter_map(|line| line.strip_prefix("Uid:"));
+        let values = uid_lines
+            .next()
+            .ok_or_else(|| io("native preflight effective UID is unavailable"))?
+            .split_whitespace()
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| io("native preflight effective UID is invalid"))?;
+        if values.len() != 4 || uid_lines.next().is_some() {
+            return Err(ArenaError::Integrity(
+                "native preflight UID observation is not one complete identity".into(),
+            ));
+        }
+        let owner_uid = values[1];
+        for (role, root) in [NativeEngineRole::Baseline, NativeEngineRole::Candidate]
+            .into_iter()
+            .zip(roots)
+        {
+            let Some(root) = root else { continue };
+            let name = preflight_runtime_name(role);
+            if root.name != name || root.path != parent_path.join(name) {
+                return Err(ArenaError::Integrity(
+                    "native preflight root role/name/path differs from the closed sibling plan"
+                        .into(),
+                ));
+            }
+            let named = parent.open_dir_nofollow(name).map_err(|_| {
+                ArenaError::Integrity("native preflight root pathname changed".into())
+            })?;
+            let named_file = readable_directory_pin(&named)?;
+            let capability_file = readable_directory_pin(&root.directory)?;
+            let held = root
+                .file
+                .metadata()
+                .map_err(|_| io("native preflight held root metadata unavailable"))?;
+            let named = named_file
+                .metadata()
+                .map_err(|_| io("native preflight named root metadata unavailable"))?;
+            let capability = capability_file
+                .metadata()
+                .map_err(|_| io("native preflight capability metadata unavailable"))?;
+            for metadata in [&held, &named, &capability] {
+                if !metadata.is_dir()
+                    || metadata.uid() != owner_uid
+                    || metadata.mode() & 0o7777 != 0o700
+                {
+                    return Err(ArenaError::Integrity(
+                        "native preflight root is not a private owner directory".into(),
+                    ));
+                }
+            }
+            if (held.dev(), held.ino()) != (named.dev(), named.ino())
+                || (held.dev(), held.ino()) != (capability.dev(), capability.ino())
+                || !inodes.insert((held.dev(), held.ino()))
+            {
+                return Err(ArenaError::Integrity(
+                    "native preflight root no longer names its distinct owned inode".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn pin<'a>(
@@ -502,6 +709,122 @@ pub(crate) mod linux {
             ));
         }
         Ok(file)
+    }
+    fn snapshot_path(relative: &str, max_depth: usize) -> Result<PathBuf, ArenaError> {
+        if relative.is_empty()
+            || relative.len() > 512
+            || relative.split('/').count() > max_depth
+            || relative.split('/').any(|part| {
+                part.is_empty()
+                    || part.len() > 128
+                    || part.starts_with('.')
+                    || !part.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+            })
+        {
+            return Err(ArenaError::Invalid(
+                "native snapshot path must have bounded safe relative components".into(),
+            ));
+        }
+        Ok(PathBuf::from(relative))
+    }
+    fn snapshot_parents(
+        names: &[String],
+        max_depth: usize,
+    ) -> Result<std::collections::BTreeSet<PathBuf>, ArenaError> {
+        let mut destinations = std::collections::BTreeSet::new();
+        let mut parents = std::collections::BTreeSet::new();
+        for name in names {
+            let relative = snapshot_path(name, max_depth)?;
+            if !destinations.insert(relative.clone()) {
+                return Err(ArenaError::Integrity(
+                    "distinct native inputs share a snapshot destination".into(),
+                ));
+            }
+            for parent in relative.ancestors().skip(1) {
+                if !parent.as_os_str().is_empty() {
+                    parents.insert(parent.to_path_buf());
+                }
+            }
+        }
+        if parents.iter().any(|parent| destinations.contains(parent)) {
+            return Err(ArenaError::Integrity(
+                "native snapshot file conflicts with an input directory".into(),
+            ));
+        }
+        Ok(parents)
+    }
+
+    /// Recheck every named directory against its original no-follow capability.
+    /// Checking ancestors first binds nested names to the same closed topology.
+    pub(crate) fn verify_input_directories(
+        output: &Dir,
+        inputs: &Dir,
+        subdirectories: &BTreeMap<PathBuf, Dir>,
+    ) -> Result<(), ArenaError> {
+        let compare = |parent: &Dir, name: &std::ffi::OsStr, held: &Dir| {
+            let named = parent.open_dir_nofollow(name).map_err(|_| {
+                ArenaError::Integrity("native input directory pathname changed".into())
+            })?;
+            let held_meta = readable_directory_pin(held)?
+                .metadata()
+                .map_err(|_| io("native input directory metadata unavailable"))?;
+            let named_meta = readable_directory_pin(&named)?
+                .metadata()
+                .map_err(|_| io("native named directory metadata unavailable"))?;
+            if (held_meta.dev(), held_meta.ino()) != (named_meta.dev(), named_meta.ino()) {
+                return Err(ArenaError::Integrity(
+                    "native input directory no longer names its owned inode".into(),
+                ));
+            }
+            Ok(())
+        };
+        compare(output, std::ffi::OsStr::new("inputs"), inputs)?;
+        for (relative, held) in subdirectories {
+            let parent = relative.parent().ok_or_else(|| {
+                ArenaError::Integrity("native input directory has no parent".into())
+            })?;
+            let parent = if parent.as_os_str().is_empty() {
+                inputs
+            } else {
+                subdirectories.get(parent).ok_or_else(|| {
+                    ArenaError::Integrity("native input directory parent is not retained".into())
+                })?
+            };
+            compare(
+                parent,
+                relative.file_name().ok_or_else(|| {
+                    ArenaError::Integrity("native input directory has no name".into())
+                })?,
+                held,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn input_parent<'a>(
+        inputs: &'a Dir,
+        subdirectories: &'a BTreeMap<PathBuf, Dir>,
+        snapshot_relative: &'a Path,
+    ) -> Result<(&'a Dir, &'a std::ffi::OsStr), ArenaError> {
+        let relative = snapshot_relative.strip_prefix("inputs").map_err(|_| {
+            ArenaError::Integrity("native input escaped closed snapshot topology".into())
+        })?;
+        let parent = relative
+            .parent()
+            .ok_or_else(|| ArenaError::Integrity("native input has no parent".into()))?;
+        let directory = if parent.as_os_str().is_empty() {
+            inputs
+        } else {
+            subdirectories.get(parent).ok_or_else(|| {
+                ArenaError::Integrity("native input parent is outside closed topology".into())
+            })?
+        };
+        let name = relative
+            .file_name()
+            .ok_or_else(|| ArenaError::Integrity("native input has no direct copy name".into()))?;
+        Ok((directory, name))
     }
     fn outside_git(path: &Path) -> Result<PathBuf, ArenaError> {
         let metadata =
@@ -579,6 +902,9 @@ pub(crate) mod linux {
         executable: bool,
         max_bytes: u64,
     ) -> Result<(InputPin, NativeSnapshotReceipt), ArenaError> {
+        // Every ancestor is already pinned by preparation. This operation may
+        // create only one basename, never traverse a caller-supplied directory.
+        snapshot_path(relative, 1)?;
         let source_metadata = source
             .metadata()
             .map_err(|_| io("cannot inspect verified source inode"))?;
@@ -713,6 +1039,8 @@ pub(crate) mod linux {
         }
         spec.validate_execution()?;
         let input = spec.view();
+        let metadata_cap = spec.pair_metadata_cap();
+        let stream_cap = pair_stream_cap(input.budget.max_output_bytes, metadata_cap)?;
         crate::validate_opening_artifact_for_spec(
             input.opening,
             input.max_plies,
@@ -721,6 +1049,29 @@ pub(crate) mod linux {
         let total = spec.unique_bytes()?;
         if total > input.budget.max_input_bytes {
             return Err(ArenaError::Budget("native input aggregate exceeded".into()));
+        }
+        let separate_preflight = [
+            spec.uses_separate_preflight_runtime_root(NativeEngineRole::Baseline)?,
+            spec.uses_separate_preflight_runtime_root(NativeEngineRole::Candidate)?,
+        ];
+        let preflight_root_count = separate_preflight
+            .iter()
+            .filter(|selected| **selected)
+            .count() as u32;
+        if preflight_root_count > input.budget.max_runtime_files {
+            return Err(ArenaError::Budget(
+                "native preflight root reservation exceeds existing runtime entry budget".into(),
+            ));
+        }
+        for (selected, role) in separate_preflight
+            .into_iter()
+            .zip([NativeEngineRole::Baseline, NativeEngineRole::Candidate])
+        {
+            if selected && spec.engine_view(role)?.external.is_none() {
+                return Err(ArenaError::Integrity(
+                    "a separate native preflight root requires an external UCI endpoint".into(),
+                ));
+            }
         }
         let mut unique = BTreeMap::new();
         for artifact in spec.declared_inputs() {
@@ -732,6 +1083,41 @@ pub(crate) mod linux {
                 ));
             }
         }
+        let cuda_bundle = spec
+            .engine_view(NativeEngineRole::Baseline)?
+            .cuda_bundle
+            .or(spec.engine_view(NativeEngineRole::Candidate)?.cuda_bundle);
+        let mut names = Vec::new();
+        for (index, artifact) in unique.values().enumerate() {
+            let bundle_name = cuda_bundle.and_then(|bundle| {
+                if &bundle.manifest == artifact {
+                    Some("bundle.v1.json")
+                } else {
+                    bundle
+                        .files
+                        .iter()
+                        .find(|entry| &entry.artifact == artifact)
+                        .map(|entry| entry.filename.as_str())
+                }
+            });
+            let legacy_name = bundle_name.map_or_else(
+                || format!("pin-{index:02}"),
+                |name| format!("cuda-bundle/{name}"),
+            );
+            let name = spec.snapshot_relative_path(artifact).unwrap_or(legacy_name);
+            if bundle_name.is_some() && name != format!("cuda-bundle/{}", bundle_name.unwrap()) {
+                return Err(ArenaError::Invalid(
+                    "native snapshot override changes the declared CUDA bundle topology".into(),
+                ));
+            }
+            if bundle_name.is_none() && name.starts_with("cuda-bundle/") {
+                return Err(ArenaError::Invalid(
+                    "native snapshot override uses the reserved CUDA bundle namespace".into(),
+                ));
+            }
+            names.push(name);
+        }
+        let parents = snapshot_parents(&names, usize::from(input.budget.max_runtime_depth))?;
         // Verify every source before creating the attempt and keep those exact,
         // rewound handles for copying instead of reopening and hashing again.
         // The copy stream is still hashed, so same-inode writes fail closed.
@@ -748,7 +1134,7 @@ pub(crate) mod linux {
             &root,
             total
                 .checked_add(input.budget.max_output_bytes)
-                .and_then(|n| n.checked_add(NATIVE_PAIR_METADATA_CAP))
+                .and_then(|n| n.checked_add(metadata_cap))
                 .ok_or_else(|| io("native retention reservation overflow"))?,
         )?;
         root.create_dir(label).map_err(|_| {
@@ -776,24 +1162,28 @@ pub(crate) mod linux {
             .set_permissions(Permissions::from_mode(0o700))
             .map_err(|_| io("cannot make native input directory private"))?;
         let path = root_path.join(label);
-        let cuda_bundle = spec
-            .engine_view(NativeEngineRole::Baseline)?
-            .cuda_bundle
-            .or(spec.engine_view(NativeEngineRole::Candidate)?.cuda_bundle);
-        let bundle_directory = if cuda_bundle.is_some() {
-            inputs
-                .create_dir("cuda-bundle")
-                .map_err(|_| io("cannot create exclusive CUDA input directory"))?;
-            let directory = inputs
-                .open_dir_nofollow("cuda-bundle")
-                .map_err(|_| io("cannot pin CUDA input directory"))?;
-            readable_directory_pin(&directory)?
+        let mut input_subdirectories: BTreeMap<PathBuf, Dir> = BTreeMap::new();
+        for relative in parents {
+            let parent = relative.parent().expect("planned relative parent");
+            let parent = if parent.as_os_str().is_empty() {
+                &inputs
+            } else {
+                input_subdirectories.get(parent).ok_or_else(|| {
+                    ArenaError::Integrity("planned snapshot parent is absent".into())
+                })?
+            };
+            let name = relative.file_name().expect("planned relative name");
+            parent
+                .create_dir(name)
+                .map_err(|_| io("cannot create exclusive native input subdirectory"))?;
+            let child = parent
+                .open_dir_nofollow(name)
+                .map_err(|_| io("cannot pin native input subdirectory"))?;
+            readable_directory_pin(&child)?
                 .set_permissions(Permissions::from_mode(0o700))
-                .map_err(|_| io("cannot make CUDA input directory private"))?;
-            Some(directory)
-        } else {
-            None
-        };
+                .map_err(|_| io("cannot make native input subdirectory private"))?;
+            input_subdirectories.insert(relative, child);
+        }
         let mut pins = Vec::new();
         let mut receipts = Vec::new();
         let mut preparation_cache_hint = crate::SnapshotCacheHint::rolling(
@@ -801,22 +1191,7 @@ pub(crate) mod linux {
             "after_copy_each_verified",
         );
         crate::emit_native_phase("snapshot_copy_started");
-        for (index, (artifact, source)) in unique.values().zip(sources).enumerate() {
-            let bundle_name = cuda_bundle.and_then(|bundle| {
-                if &bundle.manifest == artifact {
-                    Some("bundle.v1.json")
-                } else {
-                    bundle
-                        .files
-                        .iter()
-                        .find(|entry| &entry.artifact == artifact)
-                        .map(|entry| entry.filename.as_str())
-                }
-            });
-            let name = bundle_name.map_or_else(
-                || format!("pin-{index:02}"),
-                |name| format!("cuda-bundle/{name}"),
-            );
+        for ((artifact, source), name) in unique.values().zip(sources).zip(names) {
             trace
                 .attempted_snapshot_relative_paths
                 .push(format!("inputs/{name}"));
@@ -827,19 +1202,16 @@ pub(crate) mod linux {
                         spec.engine_view(role)
                             .is_ok_and(|e| e.executable_input(artifact))
                     });
-            let destination = if let Some(name) = bundle_name {
-                (
-                    bundle_directory.as_ref().expect("bundle directory created"),
-                    name,
-                )
-            } else {
-                (&inputs, name.as_str())
-            };
+            let snapshot_relative = PathBuf::from("inputs").join(&name);
+            let destination = input_parent(&inputs, &input_subdirectories, &snapshot_relative)?;
             let copied = readonly_copy(
                 artifact,
                 source,
                 destination.0,
-                destination.1,
+                destination
+                    .1
+                    .to_str()
+                    .expect("validated UTF-8 snapshot name"),
                 path.join("inputs").join(&name),
                 executable,
                 input.budget.max_input_bytes,
@@ -897,10 +1269,10 @@ pub(crate) mod linux {
                 spec.validate_additional_manifest(&bytes)?;
             }
         }
-        if let Some(bundle) = &bundle_directory {
-            readable_directory_pin(bundle)?
+        for child in input_subdirectories.values() {
+            readable_directory_pin(child)?
                 .set_permissions(Permissions::from_mode(0o500))
-                .map_err(|_| io("cannot close CUDA input directory to writes"))?;
+                .map_err(|_| io("cannot close native input subdirectory to writes"))?;
         }
         readable_directory_pin(&inputs)?
             .set_permissions(Permissions::from_mode(0o500))
@@ -926,6 +1298,18 @@ pub(crate) mod linux {
                 .map_err(|_| io("cannot make role runtime root private"))?;
             runtime_root_pins.push(pin);
         }
+        let mut preflight_runtime_roots: [Option<PreflightRuntimeRoot>; 2] = [None, None];
+        for (index, role) in [NativeEngineRole::Baseline, NativeEngineRole::Candidate]
+            .into_iter()
+            .enumerate()
+        {
+            if !separate_preflight[index] {
+                continue;
+            }
+            preflight_runtime_roots[index] =
+                Some(create_preflight_runtime_root(&directory, &path, role)?);
+        }
+        verify_preflight_runtime_root_pins(&directory, &path, &preflight_runtime_roots)?;
         let cwd = directory
             .try_clone()
             .map_err(|_| io("cannot clone native cwd"))?
@@ -940,20 +1324,10 @@ pub(crate) mod linux {
                 "native artifact budget needs input/runtime/output reservations".into(),
             ));
         }
-        let stream_cap = input
-            .budget
-            .max_output_bytes
-            .checked_sub(NATIVE_PAIR_METADATA_CAP)
-            .and_then(|n| n.checked_div(2))
-            .filter(|n| *n > 0)
-            .ok_or_else(|| {
-                ArenaError::Budget(
-                    "native output budget needs receipt, PGN/config and stream reservations".into(),
-                )
-            })?;
         let max_files = usize::try_from(input.budget.max_runtime_files)
             .map_err(|_| ArenaError::Budget("native file count cannot fit host".into()))?
             .checked_add(pins.len())
+            .and_then(|n| n.checked_add(input_subdirectories.len()))
             .and_then(|n| n.checked_add(8))
             .ok_or_else(|| ArenaError::Budget("native file count overflow".into()))?;
         Ok(Snapshot {
@@ -987,7 +1361,8 @@ pub(crate) mod linux {
             _runtime_root_pins: runtime_root_pins.try_into().map_err(|_| {
                 ArenaError::Integrity("native runtime root pin count differs".into())
             })?,
-            bundle_directory,
+            preflight_runtime_roots,
+            input_subdirectories,
             preparation_cache_hint,
         })
     }
@@ -1002,6 +1377,30 @@ pub(crate) mod linux {
             ));
         }
         Ok(format!("{key}{value}").into())
+    }
+    pub(crate) enum ExternalArgumentMode<'a> {
+        Preflight(&'a Path),
+        Runtime(&'a Path),
+    }
+    pub(crate) fn external_arguments<S: NativeLaunchDeclaration>(
+        spec: &S,
+        role: NativeEngineRole,
+        external: &rz_experiments::ExternalUciEndpointV2,
+        pins: &[InputPin],
+        mode: ExternalArgumentMode<'_>,
+    ) -> Result<Vec<OsString>, ArenaError> {
+        let mut tokens = external
+            .arguments
+            .iter()
+            .map(|arg| {
+                crate::external_uci::resolve_asset_tokens(arg, external, pins).map(OsString::from)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        tokens.extend(match mode {
+            ExternalArgumentMode::Preflight(root) => spec.preflight_arguments(role, root)?,
+            ExternalArgumentMode::Runtime(root) => spec.runtime_arguments(role, root)?,
+        });
+        Ok(tokens)
     }
     pub(crate) fn build_invocation<S: NativeLaunchDeclaration>(
         spec: &S,
@@ -1042,14 +1441,17 @@ pub(crate) mod linux {
             let engine = spec.engine_view(role)?;
             let binary = pin(pins, engine.artifact(NativeArtifactRole::Binary)?)?;
             if let Some(external) = engine.external {
-                let tokens = external
-                    .arguments
-                    .iter()
-                    .map(|arg| {
-                        crate::external_uci::resolve_asset_tokens(arg, external, pins)
-                            .map(OsString::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                let root = &roots[match role {
+                    NativeEngineRole::Baseline => 0,
+                    NativeEngineRole::Candidate => 1,
+                }];
+                let tokens = external_arguments(
+                    spec,
+                    role,
+                    external,
+                    pins,
+                    ExternalArgumentMode::Runtime(root),
+                )?;
                 let variables = external
                     .environment
                     .as_ref()
@@ -1078,7 +1480,10 @@ pub(crate) mod linux {
                     format!("name={}", engine.engine_id).into(),
                 ]);
                 if !launch.arguments.is_empty() {
-                    args.push(encode_fastchess_native_args(&launch.arguments)?);
+                    args.push(encode_fastchess_native_args_with_limit(
+                        &launch.arguments,
+                        spec.argument_limit(),
+                    )?);
                 }
                 for (name, value) in &external.requested_options {
                     let value = crate::external_uci::resolve_asset_tokens(value, external, pins)?;
@@ -1150,7 +1555,7 @@ pub(crate) mod linux {
                 key_path("cmd=", &launch.program.path)?,
                 key_path("dir=", cwd)?,
                 format!("name={}", engine.engine_id).into(),
-                encode_fastchess_native_args(&launch.arguments)?,
+                encode_fastchess_native_args_with_limit(&launch.arguments, spec.argument_limit())?,
             ]);
         }
         let opening = &pin(pins, input.opening_artifact)?.path;
@@ -1257,12 +1662,422 @@ pub(crate) mod linux {
         if spec.provider_name() == "CUDA" {
             limitations.push("CUDA device0/FP32/TF32off/selected arena is requested admission metadata, not measured VRAM, aggregate GPU allocation or a kernel-enforced hard cap".into());
         }
+        spec.amend_execution_limitations(&mut limitations);
         Ok(FastchessInvocation { args, limitations })
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn v4_argument_ceiling_is_explicit_and_preserves_legacy_32() {
+            let args = vec![OsString::from("--bounded-fixture=value"); 48];
+            assert!(encode_fastchess_native_args(&args[..32]).is_ok());
+            assert!(encode_fastchess_native_args(&args[..33]).is_err());
+            assert!(encode_fastchess_native_args_with_limit(&args, 48).is_ok());
+            assert!(encode_fastchess_native_args_with_limit(&args, 47).is_err());
+            let mut excessive = args;
+            excessive.push("--extra=value".into());
+            assert!(encode_fastchess_native_args_with_limit(&excessive, 48).is_err());
+        }
+
+        #[derive(Clone, Debug)]
+        struct RuntimeArgumentsFixture;
+        impl sealed::Sealed for RuntimeArgumentsFixture {}
+        impl NativeLaunchDeclaration for RuntimeArgumentsFixture {
+            fn input_sha256(&self) -> &str {
+                "unused-runtime-arguments-fixture"
+            }
+            fn view(&self) -> NativePairView<'_> {
+                panic!("argv fixture does not own a pair")
+            }
+            fn declared_inputs(&self) -> Vec<&ArtifactRef> {
+                Vec::new()
+            }
+            fn unique_bytes(&self) -> Result<u64, rz_experiments::ManifestError> {
+                Ok(0)
+            }
+            fn engine_view(
+                &self,
+                _role: NativeEngineRole,
+            ) -> Result<NativeEngineView<'_>, rz_experiments::ManifestError> {
+                panic!("argv fixture does not resolve an engine")
+            }
+            fn provider_name(&self) -> &'static str {
+                "synthetic"
+            }
+            fn runtime_arguments(
+                &self,
+                role: NativeEngineRole,
+                root: &Path,
+            ) -> Result<Vec<OsString>, ArenaError> {
+                Ok(vec![
+                    format!("--fixture-role={role:?}").into(),
+                    key_path("--fixture-runtime-root=", root)?,
+                ])
+            }
+            fn preflight_arguments(
+                &self,
+                _role: NativeEngineRole,
+                root: &Path,
+            ) -> Result<Vec<OsString>, ArenaError> {
+                Ok(vec![key_path("--fixture-preflight-cache-root=", root)?])
+            }
+        }
+        impl crate::native_runner::NativeProviderDeclaration for RuntimeArgumentsFixture {
+            type Audit = serde_json::Value;
+            fn scope(&self) -> &'static str {
+                "synthetic-admission-fixture"
+            }
+            fn receipt_filename(&self) -> &'static str {
+                "unused-admission-receipt.json"
+            }
+            fn startup_filename(&self) -> &'static str {
+                "unused-startup.json"
+            }
+            fn termination_filename(&self) -> &'static str {
+                "unused-termination.json"
+            }
+            fn validate_runtime_admission(&self) -> Result<(), ArenaError> {
+                Err(ArenaError::Budget(
+                    "injected identical-resource admission failure".into(),
+                ))
+            }
+            fn validate_records(
+                &self,
+                _role: NativeEngineRole,
+                _startup: &[u8],
+                _termination: &[u8],
+                _session: &str,
+            ) -> Result<(Self::Audit, u32), ArenaError> {
+                panic!("rejected admission must never inspect provider records")
+            }
+        }
+
+        #[test]
+        fn preflight_runtime_roots_are_exclusive_private_fixed_role_pins() {
+            let base = std::env::temp_dir().join(format!(
+                "rovezero-preflight-root-pins-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&base).unwrap();
+            let directory = Dir::open_ambient_dir(&base, cap_std::ambient_authority()).unwrap();
+            assert!(
+                !RuntimeArgumentsFixture
+                    .uses_separate_preflight_runtime_root(NativeEngineRole::Baseline)
+                    .unwrap()
+            );
+            assert!(
+                !RuntimeArgumentsFixture
+                    .uses_separate_preflight_runtime_root(NativeEngineRole::Candidate)
+                    .unwrap()
+            );
+            let mut roots = [
+                Some(
+                    create_preflight_runtime_root(&directory, &base, NativeEngineRole::Baseline)
+                        .unwrap(),
+                ),
+                Some(
+                    create_preflight_runtime_root(&directory, &base, NativeEngineRole::Candidate)
+                        .unwrap(),
+                ),
+            ];
+            verify_preflight_runtime_root_pins(&directory, &base, &roots).unwrap();
+            assert!(
+                create_preflight_runtime_root(&directory, &base, NativeEngineRole::Baseline)
+                    .is_err()
+            );
+            assert_ne!(
+                roots[0].as_ref().unwrap().file.metadata().unwrap().ino(),
+                roots[1].as_ref().unwrap().file.metadata().unwrap().ino()
+            );
+            let original_name = roots[0].as_ref().unwrap().name;
+            for invalid in [
+                "inputs",
+                "baseline-runtime",
+                "../escape",
+                "nested/root",
+                "external-candidate-preflight-runtime",
+            ] {
+                roots[0].as_mut().unwrap().name = invalid;
+                assert!(verify_preflight_runtime_root_pins(&directory, &base, &roots).is_err());
+            }
+            roots[0].as_mut().unwrap().name = original_name;
+            roots[0]
+                .as_ref()
+                .unwrap()
+                .file
+                .set_permissions(Permissions::from_mode(0o755))
+                .unwrap();
+            assert!(verify_preflight_runtime_root_pins(&directory, &base, &roots).is_err());
+            roots[0]
+                .as_ref()
+                .unwrap()
+                .file
+                .set_permissions(Permissions::from_mode(0o700))
+                .unwrap();
+            verify_preflight_runtime_root_pins(&directory, &base, &roots).unwrap();
+            drop(roots);
+            drop(directory);
+            std::fs::remove_dir_all(base).unwrap();
+        }
+        #[test]
+        fn preflight_runtime_root_recheck_rejects_symlink_and_replaced_inode() {
+            let base = std::env::temp_dir().join(format!(
+                "rovezero-preflight-root-replace-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&base).unwrap();
+            let directory = Dir::open_ambient_dir(&base, cap_std::ambient_authority()).unwrap();
+            let roots = [
+                Some(
+                    create_preflight_runtime_root(&directory, &base, NativeEngineRole::Baseline)
+                        .unwrap(),
+                ),
+                None,
+            ];
+            let path = roots[0].as_ref().unwrap().path.clone();
+            let old = base.join("retained-original");
+            std::fs::rename(&path, &old).unwrap();
+            std::os::unix::fs::symlink(&old, &path).unwrap();
+            assert!(verify_preflight_runtime_root_pins(&directory, &base, &roots).is_err());
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, Permissions::from_mode(0o700)).unwrap();
+            assert!(verify_preflight_runtime_root_pins(&directory, &base, &roots).is_err());
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::rename(&old, &path).unwrap();
+            verify_preflight_runtime_root_pins(&directory, &base, &roots).unwrap();
+            drop(roots);
+            drop(directory);
+            std::fs::remove_dir_all(base).unwrap();
+        }
+        #[test]
+        fn runtime_admission_failure_precedes_preflight_and_retains_original_owner() {
+            let base = std::env::temp_dir()
+                .join(format!("rovezero-runtime-admission-{}", std::process::id()));
+            std::fs::create_dir(&base).expect("exclusive admission fixture");
+            std::fs::create_dir(base.join("inputs")).unwrap();
+            let directory = Dir::open_ambient_dir(&base, cap_std::ambient_authority()).unwrap();
+            let input_directory = directory.open_dir_nofollow("inputs").unwrap();
+            let owner = NativeLaunchOwner {
+                spec: RuntimeArgumentsFixture,
+                _lease: NativeAdmissionLease::acquire().unwrap(),
+                snapshot: Snapshot {
+                    cwd: directory.try_clone().unwrap().into_std_file(),
+                    _runtime_root_pins: [
+                        directory.try_clone().unwrap().into_std_file(),
+                        directory.try_clone().unwrap().into_std_file(),
+                    ],
+                    preflight_runtime_roots: [None, None],
+                    directory,
+                    input_directory,
+                    path: base.clone(),
+                    output_directory: "synthetic-admission-only".into(),
+                    pins: Vec::new(),
+                    receipts: Vec::new(),
+                    // No runner exists: reaching supervision would be a bug.
+                    runner_index: usize::MAX,
+                    invocation: FastchessInvocation {
+                        args: Vec::new(),
+                        limitations: Vec::new(),
+                    },
+                    watch: OwnedArtifactTreeWatch {
+                        max_total_bytes: 1,
+                        max_file_bytes: 1,
+                        max_files: 1,
+                        max_depth: 1,
+                    },
+                    limits: ProcessLimits {
+                        wall_ms: 100,
+                        shutdown_grace_ms: 10,
+                        max_output_bytes: 1,
+                        max_child_processes: 1,
+                    },
+                    input_subdirectories: BTreeMap::new(),
+                    preparation_cache_hint: None,
+                },
+            };
+            let failure = crate::native_runner::run_native_pair_for(owner, None).unwrap_err();
+            assert!(matches!(&failure.cause, ArenaError::Budget(detail)
+                if detail == "injected identical-resource admission failure"));
+            assert!(failure.process().is_none());
+            assert!(failure.receipt.is_none() && failure.receipt_artifact.is_none());
+            assert_eq!(failure.launch_owner().unwrap().snapshot.path, base);
+            drop(failure);
+            assert!(
+                base.join("inputs").is_dir(),
+                "failure must preserve the owned attempt"
+            );
+            // Synthetic pre-spawn owner only; no runner/model/process exists.
+            std::fs::remove_dir_all(base).unwrap();
+        }
+
+        #[test]
+        fn external_runtime_arguments_are_absent_from_option_preflight() {
+            let binary = ArtifactRef {
+                path: "synthetic-engine".into(),
+                sha256: "a".repeat(64),
+                bytes: 1,
+                source: "https://example.org/argv-hook-fixture".into(),
+                license: "Synthetic argv fixture only".into(),
+            };
+            let mut external = crate::stockfish19_endpoint(binary, NativeEngineRole::Candidate);
+            external.arguments = vec!["--fixture-engine-mode".into()];
+            let declaration = RuntimeArgumentsFixture;
+            let preflight = external_arguments(
+                &declaration,
+                NativeEngineRole::Candidate,
+                &external,
+                &[],
+                ExternalArgumentMode::Preflight(Path::new("/owned/attempt/candidate-runtime")),
+            )
+            .unwrap();
+            assert_eq!(
+                preflight,
+                vec![
+                    OsString::from("--fixture-engine-mode"),
+                    OsString::from(
+                        "--fixture-preflight-cache-root=/owned/attempt/candidate-runtime"
+                    ),
+                ]
+            );
+            let runtime = external_arguments(
+                &declaration,
+                NativeEngineRole::Candidate,
+                &external,
+                &[],
+                ExternalArgumentMode::Runtime(Path::new("/owned/attempt/candidate-runtime")),
+            )
+            .unwrap();
+            assert_eq!(
+                runtime,
+                vec![
+                    OsString::from("--fixture-engine-mode"),
+                    OsString::from("--fixture-role=Candidate"),
+                    OsString::from("--fixture-runtime-root=/owned/attempt/candidate-runtime"),
+                ]
+            );
+            assert!(encode_fastchess_native_args(&runtime).is_ok());
+        }
+
+        #[test]
+        fn snapshot_topology_rejects_aliases_duplicates_prefixes_and_excess_depth() {
+            let names = vec![
+                "pin-00".into(),
+                "cuda-bundle/libcudart.so.12".into(),
+                "pals-0123456789abcdef/export.json".into(),
+                "pals-0123456789abcdef/public_memory.onnx".into(),
+            ];
+            let parents = snapshot_parents(&names, 4).unwrap();
+            assert_eq!(
+                parents,
+                [
+                    PathBuf::from("cuda-bundle"),
+                    PathBuf::from("pals-0123456789abcdef")
+                ]
+                .into_iter()
+                .collect()
+            );
+            for invalid in [
+                "",
+                "/absolute",
+                "../parent",
+                "a/../file",
+                "a/./file",
+                "a//file",
+                "a/file/",
+                "a\\file",
+                "C:/file",
+                "a/\nfile",
+                "a/'file",
+                "a/\"file",
+                "a/b/c/d/file",
+            ] {
+                assert!(
+                    snapshot_parents(&[invalid.into()], 4).is_err(),
+                    "accepted {invalid:?}"
+                );
+            }
+            for invalid in [vec!["same", "same"], vec!["folder", "folder/model.onnx"]] {
+                assert!(
+                    snapshot_parents(
+                        &invalid.into_iter().map(String::from).collect::<Vec<_>>(),
+                        4
+                    )
+                    .is_err()
+                );
+            }
+        }
+
+        #[test]
+        fn preserved_export_topology_rechecks_directory_identity_and_rejects_symlinks() {
+            let base = std::env::temp_dir()
+                .join(format!("rovezero-export-topology-{}", std::process::id()));
+            std::fs::create_dir(&base).expect("exclusive topology fixture");
+            std::fs::create_dir(base.join("inputs")).unwrap();
+            std::fs::create_dir(base.join("inputs/pals-export")).unwrap();
+            let directory = Dir::open_ambient_dir(&base, cap_std::ambient_authority()).unwrap();
+            let inputs = directory.open_dir_nofollow("inputs").unwrap();
+            let child = inputs.open_dir_nofollow("pals-export").unwrap();
+            let subdirectories = [(PathBuf::from("pals-export"), child)]
+                .into_iter()
+                .collect();
+            let bytes = b"synthetic graph bytes";
+            let source_path = base.join("source");
+            std::fs::write(&source_path, bytes).unwrap();
+            let artifact = ArtifactRef {
+                path: "public_memory.onnx".into(),
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+                bytes: bytes.len() as u64,
+                source: "https://example.org/export-topology-fixture".into(),
+                license: "Synthetic ownership fixture only".into(),
+            };
+            let relative = Path::new("inputs/pals-export/public_memory.onnx");
+            let (parent, name) = input_parent(&inputs, &subdirectories, relative).unwrap();
+            let (pin, _) = readonly_copy(
+                &artifact,
+                File::open(&source_path).unwrap(),
+                parent,
+                name.to_str().unwrap(),
+                base.join(relative),
+                false,
+                4096,
+            )
+            .unwrap();
+            verify_input_directories(&directory, &inputs, &subdirectories).unwrap();
+            assert_eq!(std::fs::read(&pin.path).unwrap(), bytes);
+            assert!(
+                input_parent(&inputs, &subdirectories, Path::new("inputs/unowned/file")).is_err()
+            );
+            assert!(
+                readonly_copy(
+                    &artifact,
+                    File::open(&source_path).unwrap(),
+                    &inputs,
+                    "pals-export/alias",
+                    base.join("inputs/pals-export/alias"),
+                    false,
+                    4096
+                )
+                .is_err()
+            );
+            std::fs::rename(base.join("inputs/pals-export"), base.join("old-export")).unwrap();
+            std::os::unix::fs::symlink(base.join("old-export"), base.join("inputs/pals-export"))
+                .unwrap();
+            assert!(verify_input_directories(&directory, &inputs, &subdirectories).is_err());
+            std::fs::remove_file(base.join("inputs/pals-export")).unwrap();
+            std::fs::create_dir(base.join("inputs/pals-export")).unwrap();
+            assert!(verify_input_directories(&directory, &inputs, &subdirectories).is_err());
+            assert_eq!(
+                std::fs::read(base.join("old-export/public_memory.onnx")).unwrap(),
+                bytes
+            );
+            drop(pin);
+            // Exclusive synthetic fixture, no engine/session or model owner.
+            std::fs::remove_dir_all(base).unwrap();
+        }
 
         #[test]
         fn engine_and_environment_launcher_are_executable_readonly_private_snapshots() {

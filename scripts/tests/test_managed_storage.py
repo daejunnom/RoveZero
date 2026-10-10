@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -8,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from managed_storage import ManagedBuild, StorageError, checked, read_record, tree_size
+from managed_storage import ManagedBuild, StorageError, checked, read_record, remove_tree, tree_size
 from managed_process import run_group
 
 
@@ -50,6 +51,122 @@ class StorageTests(unittest.TestCase):
         self.assertFalse(owner.target.exists())
         self.assertLessEqual(tree_size(owner.slot), owner.slot_limit)
         self.assertTrue(self.model.exists())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX directory deletion permissions")
+    def test_readonly_owned_directories_are_removed_after_verified_finish(self):
+        owner = self.acquire()
+        nested = owner.scratch / "frozen-parent"
+        nested.mkdir()
+        retained = nested / "private-input"
+        retained.write_bytes(b"owned regenerable input")
+        retained.chmod(0o400)
+        nested.chmod(0o500)
+        owner.scratch.chmod(0o500)
+        try:
+            receipt = owner.finish(exit_code=0, tree_gone=True)
+            self.assertTrue(receipt["temporary_removed"])
+            self.assertFalse(owner.scratch.exists())
+            self.assertFalse(owner.lock.exists())
+            self.assertEqual(self.model.read_bytes(), b"retained-original")
+        finally:
+            # Only test-fixture cleanup if the regression is still present.
+            for directory in (owner.scratch, nested):
+                if directory.exists():
+                    directory.chmod(0o700)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX directory deletion permissions")
+    def test_readonly_parent_retry_repairs_directory_without_chmod_shared_file(self):
+        owner = self.acquire()
+        nested = owner.scratch / "frozen-parent"
+        nested.mkdir()
+        target = nested / "private-input"
+        target.write_bytes(b"owned")
+        target.chmod(0o400)
+        nested.chmod(0o500)
+        original = PermissionError("unlink requires writable parent")
+        import managed_storage
+        real_rmtree = managed_storage.shutil.rmtree
+        retries = []
+
+        def unlink_after_repair(name):
+            retries.append(name)
+            self.assertTrue(stat.S_IMODE(nested.stat().st_mode) & stat.S_IWUSR)
+            self.assertTrue(stat.S_IMODE(nested.stat().st_mode) & stat.S_IXUSR)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o400)
+            os.unlink(name)
+
+        def permission_failure(path, *, onerror):
+            # Exercise the same failure even when CI runs as root and bypasses
+            # normal permission checks; the retry checks the real directory mode.
+            onerror(unlink_after_repair, str(target), (PermissionError, original, None))
+            real_rmtree(path, onerror=onerror)
+
+        try:
+            with patch("managed_storage.shutil.rmtree", side_effect=permission_failure):
+                remove_tree(owner.scratch, owner.slot)
+            self.assertEqual(retries, [str(target)])
+            self.assertFalse(owner.scratch.exists())
+            self.assertEqual(self.model.read_bytes(), b"retained-original")
+        finally:
+            if nested.exists():
+                nested.chmod(0o700)
+
+    def test_cleanup_retry_preserves_original_permission_failure(self):
+        owner = self.acquire()
+        target = owner.scratch / "private-input"
+        target.write_bytes(b"owned")
+        original = PermissionError("initial unlink failure")
+        retry = OSError("retry failed")
+
+        def retry_failure(_name):
+            raise retry
+
+        def permission_failure(_path, *, onerror):
+            onerror(retry_failure, str(target), (PermissionError, original, None))
+
+        with patch("managed_storage.shutil.rmtree", side_effect=permission_failure):
+            with self.assertRaises(OSError) as failure:
+                remove_tree(owner.scratch, owner.slot)
+        self.assertIs(failure.exception, retry)
+        self.assertIs(failure.exception.__cause__, original)
+        self.assertTrue(target.exists())
+        self.assertTrue(owner.lock.exists())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX no-follow permission repair")
+    def test_cleanup_changed_parent_link_is_rejected_before_permission_repair(self):
+        owner = self.acquire()
+        nested = owner.scratch / "frozen-parent"
+        nested.mkdir()
+        target = nested / self.model.name
+        target.write_bytes(b"owned regenerable copy")
+        nested.chmod(0o500)
+        saved = owner.scratch / "saved-parent"
+        source_mode = stat.S_IMODE(self.source.stat().st_mode)
+        original = PermissionError("initial unlink failure")
+
+        def changed_link(_path, *, onerror):
+            # The full tree was already preflighted. A changed link must never
+            # give permission repair authority over the external source tree.
+            nested.rename(saved)
+            nested.symlink_to(self.source, target_is_directory=True)
+            onerror(os.unlink, str(target), (PermissionError, original, None))
+
+        try:
+            with patch("managed_storage.shutil.rmtree", side_effect=changed_link):
+                with self.assertRaises(StorageError) as failure:
+                    remove_tree(owner.scratch, owner.slot)
+            self.assertIs(failure.exception.__cause__, original)
+            self.assertEqual(stat.S_IMODE(self.source.stat().st_mode), source_mode)
+            self.assertEqual(self.model.read_bytes(), b"retained-original")
+            self.assertTrue((saved / self.model.name).exists())
+            self.assertTrue(owner.lock.exists())
+        finally:
+            if nested.is_symlink():
+                nested.unlink()  # Test fixture cleanup only; do not follow it.
+            if saved.exists():
+                saved.rename(nested)
+            if nested.exists():
+                nested.chmod(0o700)
 
     def test_pre_run_oversize_cache_and_aggregate_retention(self):
         first = self.acquire(slot_limit=4096, total_limit=6144)

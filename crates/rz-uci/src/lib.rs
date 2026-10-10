@@ -20,8 +20,18 @@ pub mod native_bootstrap;
 pub mod native_cuda_attestation;
 #[cfg(feature = "onnx-cpu")]
 pub mod native_profile;
+#[cfg(feature = "search-work-receipts")]
+pub mod pals_attestation;
+#[cfg(feature = "search-work-receipts")]
+pub mod pals_checker_profile;
+#[cfg(feature = "search-work-receipts")]
+pub mod pals_cpu_task;
+pub mod pals_native;
 pub mod parser;
+#[cfg(feature = "search-work-receipts")]
+pub mod process_receipts;
 pub mod runner;
+pub mod search_driver;
 pub mod session;
 
 pub use parser::{Command, GoLimits, ParseError, ParserLimits, PositionBase, PositionSpec, parse};

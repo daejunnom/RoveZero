@@ -1,7 +1,177 @@
 use rz_position::{
     BoardMove, Color, HistoryCompleteness, HistoryOrigin, Piece, PieceKind, Position,
-    PositionError, Square,
+    PositionError, PositionSnapshot, Square, UciReplay,
 };
+
+fn assert_exact_uci_replay(snapshot: &PositionSnapshot, max_plies: usize) -> UciReplay {
+    let replay = snapshot.uci_replay(max_plies).unwrap();
+    assert_eq!(replay.origin, snapshot.history_origin());
+    assert_eq!(replay.completeness, snapshot.history_completeness());
+    assert_eq!(replay.moves.len() + 1, snapshot.known_history_len());
+    let expected: Vec<_> = snapshot.known_history().collect();
+    let mut restored = match replay.origin {
+        HistoryOrigin::StartPosition => {
+            let start = Position::startpos();
+            assert_eq!(replay.start_fen, start.to_fen());
+            start
+        }
+        HistoryOrigin::Fen => Position::from_fen(&replay.start_fen).unwrap(),
+    };
+    assert!(restored.snapshot().same_state(expected.last().unwrap()));
+    for (&mv, frame) in replay.moves.iter().zip(expected.iter().rev().skip(1)) {
+        restored.make_move(mv).unwrap();
+        assert!(restored.snapshot().same_state(frame), "replayed {mv}");
+    }
+    assert_eq!(restored.position_identity(), snapshot.position_identity());
+    assert_eq!(
+        restored.snapshot().known_history_fens(),
+        snapshot.known_history_fens()
+    );
+    replay
+}
+
+#[test]
+fn uci_replay_preserves_the_whole_prefix_and_import_provenance() {
+    let start_fen = Position::startpos().to_fen();
+    for mut position in [
+        Position::startpos(),
+        Position::from_fen(&start_fen).unwrap(),
+        Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1").unwrap(),
+    ] {
+        let initial = position.snapshot();
+        let empty = assert_exact_uci_replay(&initial, 0);
+        assert_eq!(empty.start_fen, initial.to_fen());
+        assert!(empty.moves.is_empty());
+        let line: &[&str] = if position.side_to_move() == Color::White {
+            &["g1f3", "g8f6", "f3g1", "f6g8", "e2e4", "e7e5"]
+        } else {
+            &["g8f6", "g1f3", "f6g8", "f3g1", "e7e5", "d2d4"]
+        };
+        position.apply_uci_moves(line).unwrap();
+        let before = position.snapshot();
+        let replay = assert_exact_uci_replay(&before, line.len());
+        assert_eq!(
+            replay.moves,
+            line.iter()
+                .map(|mv| BoardMove::from_uci(mv).unwrap())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(replay.start_fen, initial.to_fen());
+        assert_eq!(replay.origin, empty.origin);
+        assert_eq!(replay.completeness, empty.completeness);
+        assert!(position.matches_snapshot(&before));
+        assert_eq!(initial.uci_replay(0).unwrap(), empty);
+        // Pawn moves may complete repetition evidence, never the raw prefix.
+        if replay.origin == HistoryOrigin::Fen {
+            assert_eq!(replay.completeness, HistoryCompleteness::UnknownPrefix);
+        }
+    }
+}
+
+#[test]
+fn uci_replay_records_castling_ep_and_every_promotion_kind() {
+    let mut cases = vec![
+        ("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 87 42", "e1g1"),
+        ("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 87 42", "e1c1"),
+        ("r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 87 42", "e8g8"),
+        ("k7/8/8/3pP3/8/8/8/4K3 w - d6 0 2", "e5d6"),
+        ("k7/8/8/8/3Pp3/8/8/4K3 b - d3 0 2", "e4d3"),
+    ];
+    for mv in ["a7b8q", "a7b8r", "a7b8b", "a7b8n"] {
+        cases.push(("1r5k/P7/8/8/8/8/8/7K w - - 0 1", mv));
+    }
+    for (fen, mv) in cases {
+        let mut position = Position::from_fen(fen).unwrap();
+        let initial = position.snapshot();
+        let undo = position.make_uci(mv).unwrap();
+        let replay = assert_exact_uci_replay(&position.snapshot(), 1);
+        assert_eq!(replay.start_fen, fen);
+        assert_eq!(replay.moves, [BoardMove::from_uci(mv).unwrap()]);
+        assert_eq!(replay.moves[0].to_string(), mv);
+        position.unmake(undo).unwrap();
+        assert_eq!(
+            position.snapshot().uci_replay(0).unwrap(),
+            initial.uci_replay(0).unwrap()
+        );
+    }
+}
+
+#[test]
+fn uci_replay_keeps_immutable_snapshots_after_undo_clone_preview_and_transactions() {
+    let mut position = Position::startpos();
+    let initial = position.snapshot();
+    let mut undos = Vec::new();
+    for index in 0..128 {
+        undos.push(
+            position
+                .make_uci(["g1f3", "g8f6", "f3g1", "f6g8"][index % 4])
+                .unwrap(),
+        );
+    }
+    let repeated = position.snapshot();
+    let repeated_replay = assert_exact_uci_replay(&repeated, 128);
+    let mut cloned = position.clone();
+    cloned.make_uci("e2e4").unwrap();
+    assert_exact_uci_replay(&cloned.snapshot(), 129);
+    let preview = position
+        .preview_move(BoardMove::from_uci("d2d4").unwrap())
+        .unwrap();
+    assert_exact_uci_replay(&preview.snapshot(), 129);
+    assert!(position.matches_snapshot(&repeated));
+    assert!(position.apply_uci_moves(&["e2e4", "e7e5", "e1e3"]).is_err());
+    assert_eq!(
+        position.snapshot().uci_replay(128).unwrap(),
+        repeated_replay
+    );
+    while let Some(undo) = undos.pop() {
+        position.unmake(undo).unwrap();
+        let snapshot = position.snapshot();
+        assert_exact_uci_replay(&snapshot, snapshot.known_history_len() - 1);
+    }
+    assert!(position.snapshot().same_state(&initial));
+    assert_eq!(repeated.uci_replay(128).unwrap(), repeated_replay);
+
+    position.make_uci("e2e4").unwrap();
+    let black = position.make_uci("e7e5").unwrap();
+    let original = position.snapshot();
+    position.unmake(black).unwrap();
+    position.apply_uci_moves(&["c7c5"]).unwrap();
+    let branch = assert_exact_uci_replay(&position.snapshot(), 2);
+    assert_eq!(branch.moves[1].to_string(), "c7c5");
+    assert_eq!(
+        assert_exact_uci_replay(&original, 2).moves[1].to_string(),
+        "e7e5"
+    );
+}
+
+#[test]
+fn uci_replay_cap_failures_preserve_live_evidence_and_terminal_history() {
+    let mut position = Position::startpos();
+    assert!(position.snapshot().uci_replay(0).unwrap().moves.is_empty());
+    for mv in ["f2f3", "e7e5", "g2g4", "d8h4"] {
+        position.make_uci(mv).unwrap();
+    }
+    assert!(position.legal_moves().is_empty());
+    let view = position.ordered_legal_moves();
+    let before = view.snapshot();
+    for cap in [0, 3] {
+        assert_eq!(
+            before.uci_replay(cap).unwrap_err(),
+            PositionError::ResourceLimit("UCI replay plies")
+        );
+        assert!(position.matches_snapshot(before));
+    }
+    assert_exact_uci_replay(before, 4);
+    assert_exact_uci_replay(before, usize::MAX);
+    for fen in [
+        "7k/6Q1/5K2/8/8/8/8/8 b - - 150 1",
+        "7k/5K2/6Q1/8/8/8/8/8 b - - 0 1",
+        "7k/8/8/8/8/8/8/K7 w - - 4294967295 4294967295",
+    ] {
+        let terminal = Position::from_fen(fen).unwrap();
+        assert_exact_uci_replay(&terminal.snapshot(), 0);
+    }
+}
 
 #[test]
 fn fen_rejects_malformed_and_contradictory_rule_state() {

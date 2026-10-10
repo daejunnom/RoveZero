@@ -1,6 +1,6 @@
 use crate::{
-    BoardMove, Color, HistoryCompleteness, HistoryOrigin, PieceKind, Position, PositionError,
-    Square,
+    BoardMove, Color, HistoryCompleteness, HistoryOrigin, LegalMoveView, PieceKind, Position,
+    PositionError, Square,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,6 +92,40 @@ impl Position {
         self.classify_with_generated_legal(&self.legal_moves())
     }
 
+    /// Exact automatic termination using one Rules-owned legal view. Claimable
+    /// draws are deliberately excluded: CPU search does not exercise a claim by
+    /// merely reaching a threshold. No intended-move preview is needed here.
+    pub fn play_status_from_view(
+        &self,
+        legal: &LegalMoveView,
+    ) -> Result<PlayStatus, PositionError> {
+        if !self.matches_snapshot(legal.snapshot()) {
+            return Err(PositionError::StaleView);
+        }
+        Ok(self.automatic_status(legal.moves().is_empty(), self.known_repetition_count() >= 5))
+    }
+
+    fn automatic_status(&self, no_legal_moves: bool, known_fivefold: bool) -> PlayStatus {
+        if no_legal_moves {
+            if self.in_check() {
+                PlayStatus::Terminal {
+                    reason: TerminalReason::Checkmate,
+                    winner: Some(self.side_to_move().opposite()),
+                }
+            } else {
+                draw(TerminalReason::Stalemate)
+            }
+        } else if has_proven_dead_material(self) {
+            draw(TerminalReason::DeadPosition)
+        } else if known_fivefold {
+            draw(TerminalReason::FivefoldRepetition)
+        } else if self.halfmove_clock() >= 150 {
+            draw(TerminalReason::SeventyFiveMove)
+        } else {
+            PlayStatus::Ongoing
+        }
+    }
+
     /// Rules callers may reuse the ordered legal array generated for this exact
     /// immutable state. This is not a public caller-supplied legality boundary.
     pub(crate) fn classify_with_generated_legal(
@@ -132,24 +166,8 @@ impl Position {
             },
         ];
 
-        let play_status = if legal.is_empty() {
-            if self.in_check() {
-                PlayStatus::Terminal {
-                    reason: TerminalReason::Checkmate,
-                    winner: Some(self.side_to_move().opposite()),
-                }
-            } else {
-                draw(TerminalReason::Stalemate)
-            }
-        } else if has_proven_dead_material(self) {
-            draw(TerminalReason::DeadPosition)
-        } else if fivefold == Availability::Available {
-            draw(TerminalReason::FivefoldRepetition)
-        } else if self.halfmove_clock() >= 150 {
-            draw(TerminalReason::SeventyFiveMove)
-        } else {
-            PlayStatus::Ongoing
-        };
+        let play_status =
+            self.automatic_status(legal.is_empty(), fivefold == Availability::Available);
 
         if play_status == PlayStatus::Ongoing {
             for &mv in legal {

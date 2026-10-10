@@ -28,6 +28,23 @@ pub struct NativeProviderSessionAudit {
     pub physical_drain: String,
 }
 
+/// Read-only view of an actual launch-owner input pin. The path names the
+/// private snapshot, not the source asset or the helper's registered program.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub struct NativeProviderInputView<'a> {
+    pub artifact: &'a rz_experiments::ArtifactRef,
+    pub path: &'a std::path::Path,
+    pub file: &'a std::fs::File,
+}
+
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub struct NativeProviderInputContext<'a> {
+    pub directory: &'a cap_std::fs::Dir,
+    pub pins: &'a [NativeProviderInputView<'a>],
+}
+
 /// Provider-specific wire acceptance is distinct from shared process/PGN gates.
 #[doc(hidden)]
 pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
@@ -37,8 +54,61 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
     fn receipt_version(&self) -> u32 {
         1
     }
+    fn contract_revision(&self) -> &str {
+        "0.1"
+    }
+    #[cfg(target_os = "linux")]
+    fn validate_runtime_admission(&self) -> Result<(), ArenaError> {
+        Ok(())
+    }
+    /// Consume provider-specific evidence from the owner-pinned preflight root
+    /// after both probes have closed, before admitting any game process. The
+    /// default preserves historical Own/V1/V2 behavior and creates no evidence.
+    #[cfg(target_os = "linux")]
+    fn validate_external_preflight(
+        &self,
+        _role: rz_experiments::NativeEngineRole,
+        _preflight: &crate::ExternalUciPreflight,
+        _runtime_directory: &cap_std::fs::Dir,
+        _inputs: &NativeProviderInputContext<'_>,
+    ) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
+        Ok(Vec::new())
+    }
     fn expected_provider_sessions(&self) -> usize {
         4
+    }
+    fn uses_provider_records(
+        &self,
+        role: rz_experiments::NativeEngineRole,
+    ) -> Result<bool, ArenaError> {
+        Ok(self.engine_view(role)?.external.is_none())
+    }
+    fn provider_export_artifact(
+        &self,
+        role: rz_experiments::NativeEngineRole,
+    ) -> Result<Option<&rz_experiments::ArtifactRef>, ArenaError> {
+        let engine = self.engine_view(role)?;
+        if engine.external.is_some() {
+            Ok(None)
+        } else {
+            Ok(Some(engine.artifact(
+                rz_experiments::NativeArtifactRole::ExportManifest,
+            )?))
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn validate_conversion_manifest(
+        &self,
+        _role: rz_experiments::NativeEngineRole,
+        startup: &[u8],
+        manifest: &[u8],
+        batch_experiment: bool,
+    ) -> Result<(), ArenaError> {
+        linux::verify_conversion_provenance(
+            &linux::json(startup)?,
+            &linux::json(manifest)?,
+            batch_experiment,
+        )
     }
     fn role_startup_filename(&self, _role: rz_experiments::NativeEngineRole) -> &'static str {
         self.startup_filename()
@@ -73,6 +143,32 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
         termination: &[u8],
         session: &str,
     ) -> Result<(Self::Audit, u32), ArenaError>;
+    /// Context-aware production entry. Historical providers keep their exact
+    /// validator; inputs and supervisor output never become wire declarations.
+    #[cfg(target_os = "linux")]
+    fn validate_records_with_context(
+        &self,
+        role: rz_experiments::NativeEngineRole,
+        startup: &[u8],
+        termination: &[u8],
+        session: &str,
+        _inputs: &NativeProviderInputContext<'_>,
+        _supervisor_stdout: &[u8],
+    ) -> Result<(Self::Audit, u32), ArenaError> {
+        self.validate_records(role, startup, termination, session)
+    }
+    #[cfg(target_os = "linux")]
+    fn validate_provider_session_set(
+        &self,
+        _sessions: &[Self::Audit],
+        _preflight: &[crate::ExternalUciPreflight],
+        _runtime_root: &cap_std::fs::Dir,
+        _inputs: &NativeProviderInputContext<'_>,
+        _supervisor_stdout: &[u8],
+        _artifacts: &[rz_experiments::ArtifactRef],
+    ) -> Result<(), ArenaError> {
+        Ok(())
+    }
     #[cfg(target_os = "linux")]
     fn verify_session_evidence(
         &self,
@@ -90,6 +186,15 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
         _native_pids: &[u32],
     ) -> Result<Vec<u32>, ArenaError> {
         Ok(Vec::new())
+    }
+    #[cfg(target_os = "linux")]
+    fn external_game_process_ids(
+        &self,
+        _role: rz_experiments::NativeEngineRole,
+        external_ids: &[u32],
+        _root_output: &cap_std::fs::Dir,
+    ) -> Result<Vec<u32>, ArenaError> {
+        Ok(external_ids.to_vec())
     }
     /// Additional provider-specific acceptance of the supervisor-owned stdout.
     /// CPU V1 keeps its existing gate; CUDA requires the pinned runner's exit
@@ -588,55 +693,28 @@ pub(crate) mod linux {
         owner: &mut NativeLaunchOwner<S>,
         mut cache_hint: Option<&mut SnapshotCacheHint>,
     ) -> Result<(), ArenaError> {
+        crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot)?;
+        crate::native_launch::linux::verify_input_directories(
+            &owner.snapshot.directory,
+            &owner.snapshot.input_directory,
+            &owner.snapshot.input_subdirectories,
+        )?;
         for item in &mut owner.snapshot.pins {
             verify_copy(&mut item.file, &item.artifact)?;
             let relative = item
                 .path
                 .strip_prefix(&owner.snapshot.path)
                 .map_err(|_| invalid("native pin escaped owned directory"))?;
-            let name = relative
-                .file_name()
-                .ok_or_else(|| invalid("native input has no direct copy name"))?;
             let mut options = OpenOptions::new();
             options
                 .read(true)
                 .follow(FollowSymlinks::No)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-            let parent = relative
-                .parent()
-                .ok_or_else(|| invalid("native input has no parent"))?;
-            let directory = if parent == std::path::Path::new("inputs") {
-                &owner.snapshot.input_directory
-            } else if parent == std::path::Path::new("inputs/cuda-bundle") {
-                let held = owner
-                    .snapshot
-                    .bundle_directory
-                    .as_ref()
-                    .ok_or_else(|| invalid("CUDA input directory is not retained"))?;
-                let named = owner
-                    .snapshot
-                    .input_directory
-                    .open_dir_nofollow("cuda-bundle")
-                    .map_err(|_| invalid("CUDA input directory pathname changed"))?;
-                let held_meta = held
-                    .try_clone()
-                    .map_err(|_| invalid("cannot clone CUDA directory pin"))?
-                    .into_std_file()
-                    .metadata()
-                    .map_err(|_| invalid("CUDA input directory metadata unavailable"))?;
-                let named_meta = named
-                    .into_std_file()
-                    .metadata()
-                    .map_err(|_| invalid("CUDA named directory metadata unavailable"))?;
-                if (held_meta.dev(), held_meta.ino()) != (named_meta.dev(), named_meta.ino()) {
-                    return Err(invalid(
-                        "CUDA input directory no longer names its owned inode",
-                    ));
-                }
-                held
-            } else {
-                return Err(invalid("native input escaped closed snapshot topology"));
-            };
+            let (directory, name) = crate::native_launch::linux::input_parent(
+                &owner.snapshot.input_directory,
+                &owner.snapshot.input_subdirectories,
+                relative,
+            )?;
             let path_file = directory
                 .open_with(name, &options)
                 .map_err(|_| invalid("native input pathname changed"))?
@@ -660,6 +738,77 @@ pub(crate) mod linux {
             }
         }
         Ok(())
+    }
+    // Callback boundaries compare the owner-held capabilities without rehashing
+    // a multi-gigabyte runtime per probe. Full byte verification remains at the
+    // existing prelaunch/post-run boundaries; the profile loader hashes its own
+    // bounded actual bytes inside the provider callback.
+    fn verify_provider_input_names<S: NativeLaunchDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+    ) -> Result<(), ArenaError> {
+        crate::native_launch::linux::verify_input_directories(
+            &owner.snapshot.directory,
+            &owner.snapshot.input_directory,
+            &owner.snapshot.input_subdirectories,
+        )?;
+        for item in &owner.snapshot.pins {
+            let relative = item
+                .path
+                .strip_prefix(&owner.snapshot.path)
+                .map_err(|_| invalid("provider input pin escaped owner root"))?;
+            let (directory, name) = crate::native_launch::linux::input_parent(
+                &owner.snapshot.input_directory,
+                &owner.snapshot.input_subdirectories,
+                relative,
+            )?;
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .follow(FollowSymlinks::No)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            let named = directory
+                .open_with(name, &options)
+                .map_err(|_| invalid("provider input name is unavailable"))?
+                .into_std()
+                .metadata()
+                .map_err(|_| invalid("provider named input metadata missing"))?;
+            let held = item
+                .file
+                .metadata()
+                .map_err(|_| invalid("provider input pin metadata missing"))?;
+            if !held.is_file()
+                || held.len() != item.artifact.bytes
+                || held.mode() & 0o222 != 0
+                || held.nlink() != 1
+                || (held.dev(), held.ino(), held.uid(), held.mode(), held.len())
+                    != (
+                        named.dev(),
+                        named.ino(),
+                        named.uid(),
+                        named.mode(),
+                        named.len(),
+                    )
+            {
+                return Err(invalid(
+                    "provider input name differs from read-only owner pin",
+                ));
+            }
+        }
+        Ok(())
+    }
+    fn provider_input_views<S: NativeLaunchDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+    ) -> Vec<NativeProviderInputView<'_>> {
+        owner
+            .snapshot
+            .pins
+            .iter()
+            .map(|pin| NativeProviderInputView {
+                artifact: &pin.artifact,
+                path: &pin.path,
+                file: &pin.file,
+            })
+            .collect()
     }
     // Only the launch owner's synced, verified private snapshots are eligible.
     // This is a best-effort kernel cache hint, not deletion, memory reclamation
@@ -771,25 +920,83 @@ pub(crate) mod linux {
             execution_order: [0, 1],
         })
     }
+    fn validate_preflight_provider_evidence(
+        evidence: &[(String, Vec<u8>)],
+    ) -> Result<(), ArenaError> {
+        if evidence.len() > 4 {
+            return Err(invalid("preflight provider evidence count exceeded"));
+        }
+        let mut names = BTreeSet::new();
+        for (relative, bytes) in evidence {
+            let components: Vec<_> = std::path::Path::new(relative).components().collect();
+            if relative.len() > 256
+                || components.len() != 2
+                || components
+                    .iter()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                || !names.insert(relative)
+                || bytes.is_empty()
+                || bytes.len() > 128 * 1024
+            {
+                return Err(invalid(
+                    "preflight provider evidence topology/byte bound invalid",
+                ));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    #[test]
+    fn preflight_provider_evidence_rejects_aliases_traversal_and_overflow() {
+        let rows = vec![
+            ("native-process-10/startup.json".into(), vec![1]),
+            ("native-process-10/termination.json".into(), vec![2]),
+        ];
+        assert!(validate_preflight_provider_evidence(&[]).is_ok()); // historical default
+        assert!(validate_preflight_provider_evidence(&rows).is_ok());
+        let mut duplicate = rows.clone();
+        duplicate.push(rows[0].clone());
+        assert!(validate_preflight_provider_evidence(&duplicate).is_err());
+        for name in [
+            "../startup.json",
+            "/root/startup.json",
+            "native/../startup.json",
+            "native/startup/nested.json",
+        ] {
+            assert!(validate_preflight_provider_evidence(&[(name.into(), vec![1])]).is_err());
+        }
+        assert!(validate_preflight_provider_evidence(&[(rows[0].0.clone(), vec![])]).is_err());
+        assert!(
+            validate_preflight_provider_evidence(&[(rows[0].0.clone(), vec![0; 128 * 1024 + 1])])
+                .is_err()
+        );
+        let excessive: Vec<_> = (0..5)
+            .map(|i| (format!("native-process-{i}/startup.json"), vec![1]))
+            .collect();
+        assert!(validate_preflight_provider_evidence(&excessive).is_err());
+    }
     fn preflight_endpoints<S: NativeProviderDeclaration>(
         bundle: &mut NativeRunBundle<S>,
         cancel: Option<&AtomicBool>,
-    ) -> Result<Vec<crate::ExternalUciPreflight>, ArenaError> {
+    ) -> Result<(Vec<crate::ExternalUciPreflight>, Vec<ArtifactRef>), ArenaError> {
         let mut receipts = Vec::new();
+        let mut provider_artifacts = Vec::new();
         for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
             let owner = bundle.owner.as_ref().expect("preflight owns snapshot");
             let Some(e) = owner.spec.engine_view(role)?.external.cloned() else {
                 continue;
             };
             let binary = pin(&owner.snapshot.pins, &e.binary)?;
-            let args = e
-                .arguments
-                .iter()
-                .map(|s| {
-                    crate::external_uci::resolve_asset_tokens(s, &e, &owner.snapshot.pins)
-                        .map(std::ffi::OsString::from)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            // Option identification/readiness probes must not create game-only
+            // provider records in the role runtime directory.
+            let runtime_root = owner.snapshot.preflight_runtime_path(role);
+            let args = crate::native_launch::linux::external_arguments(
+                &owner.spec,
+                role,
+                &e,
+                &owner.snapshot.pins,
+                crate::native_launch::linux::ExternalArgumentMode::Preflight(&runtime_root),
+            )?;
             let requested = e
                 .requested_options
                 .iter()
@@ -829,6 +1036,7 @@ pub(crate) mod linux {
                 max_output_bytes: 256 * 1024,
                 max_child_processes: owner.spec.view().budget.max_child_processes,
             };
+            preflight_runtime_totals(owner)?;
             let process = crate::supervise_protocol_in_directory(
                 &launch.program.file,
                 &launch.arguments,
@@ -840,6 +1048,8 @@ pub(crate) mod linux {
             )?;
             bundle.process = Some(process);
             let process = bundle.process.as_ref().expect("probe process retained");
+            let root_recheck =
+                crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot);
             let tag = match role {
                 NativeEngineRole::Baseline => "baseline",
                 NativeEngineRole::Candidate => "candidate",
@@ -868,6 +1078,8 @@ pub(crate) mod linux {
                     "external identification failed process/cleanup gate",
                 ));
             }
+            root_recheck?;
+            preflight_runtime_totals(owner)?;
             let identification_process = process.receipt.clone();
             put(
                 owner,
@@ -879,6 +1091,7 @@ pub(crate) mod linux {
             let advertisement = crate::parse_uci_advertisement(&process.stdout)?;
             crate::validate_uci_options(&advertisement, &e.expected_uci_name, &requested)?;
             let commands = crate::uci_preflight_commands(&requested, e.family == "stockfish")?;
+            preflight_runtime_totals(owner)?;
             let process = crate::supervise_protocol_in_directory(
                 &launch.program.file,
                 &launch.arguments,
@@ -890,6 +1103,8 @@ pub(crate) mod linux {
             )?;
             bundle.process = Some(process);
             let process = bundle.process.as_ref().expect("readiness process retained");
+            let root_recheck =
+                crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot);
             put(
                 owner,
                 &format!("external-{tag}-readiness.stdout.log"),
@@ -914,6 +1129,8 @@ pub(crate) mod linux {
                     "external readiness/stop/quit failed process/cleanup gate",
                 ));
             }
+            root_recheck?;
+            preflight_runtime_totals(owner)?;
             if crate::parse_uci_advertisement(&process.stdout)? != advertisement {
                 return Err(invalid(
                     "external advertisements differ across preflight sessions",
@@ -983,17 +1200,70 @@ pub(crate) mod linux {
                 &bytes,
                 64 * 1024,
             )?;
+            use cap_fs_ext::DirExt;
+            let index = if role == NativeEngineRole::Baseline {
+                0
+            } else {
+                1
+            };
+            let preflight_directory = match &owner.snapshot.preflight_runtime_roots[index] {
+                Some(root) => root.directory.try_clone(),
+                None => owner.snapshot.directory.open_dir_nofollow(if index == 0 {
+                    "baseline-runtime"
+                } else {
+                    "candidate-runtime"
+                }),
+            }
+            .map_err(|e| ArenaError::Io(e.to_string()))?;
+            // The selected capability is owner-held; compare its path/name pins
+            // immediately before and after provider consumption as well.
+            crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot)?;
+            verify_provider_input_names(owner)?;
+            let pins = provider_input_views(owner);
+            let inputs = NativeProviderInputContext {
+                directory: &owner.snapshot.input_directory,
+                pins: &pins,
+            };
+            let evidence = owner.spec.validate_external_preflight(
+                role,
+                &receipt,
+                &preflight_directory,
+                &inputs,
+            )?;
+            verify_provider_input_names(owner)?;
+            let prefix = owner.snapshot.preflight_runtime_roots[index]
+                .as_ref()
+                .map_or(
+                    if index == 0 {
+                        "baseline-runtime"
+                    } else {
+                        "candidate-runtime"
+                    },
+                    |root| root.name,
+                );
+            validate_preflight_provider_evidence(&evidence)?;
+            for (relative, bytes) in evidence {
+                provider_artifacts.push(artifact(owner, &format!("{prefix}/{relative}"), &bytes));
+            }
+            crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot)?;
+            preflight_runtime_totals(owner)?;
             receipts.push(receipt);
             bundle.process = None;
         }
-        Ok(receipts)
+        Ok((receipts, provider_artifacts))
     }
     pub(super) fn run<S: NativeProviderDeclaration>(
         bundle: &mut NativeRunBundle<S>,
         cancel: Option<&AtomicBool>,
     ) -> Result<(NativePairReceipt<S::Audit>, ArtifactRef), ArenaError> {
         let run_started = std::time::Instant::now();
-        let external_preflight = preflight_endpoints(bundle, cancel)?;
+        bundle
+            .owner
+            .as_ref()
+            .expect("prepared native owner")
+            .spec
+            .validate_runtime_admission()?;
+        let (external_preflight, preflight_artifacts) = preflight_endpoints(bundle, cancel)?;
         let owner = bundle.owner.as_mut().expect("prepared native owner");
         crate::emit_native_phase("prelaunch_verification_started");
         let mut rolling = SnapshotCacheHint::rolling(
@@ -1063,13 +1333,13 @@ pub(crate) mod linux {
             validation_scope: owner.spec.scope().into(),
             input_sha256: owner.spec.input_sha256().into(),
             pair_id: owner.spec.view().pair_id.into(),
-            contract_revision: "0.1".into(),
+            contract_revision: owner.spec.contract_revision().into(),
             runner_source_commit: owner.spec.view().runner.source_commit.clone(),
             runner_binary_sha256: owner.spec.view().runner.binary.sha256.clone(),
             process: process.receipt.clone(),
             snapshots: owner.snapshot.receipts.clone(),
             snapshot_cache_hints: cache_hints,
-            artifacts: Vec::new(),
+            artifacts: preflight_artifacts,
             provider_sessions: Vec::new(),
             external_preflight,
             external_execution: Vec::new(),
@@ -1129,7 +1399,7 @@ pub(crate) mod linux {
             .view()
             .budget
             .max_output_bytes
-            .checked_sub(NATIVE_PAIR_METADATA_CAP)
+            .checked_sub(owner.spec.pair_metadata_cap())
             .and_then(|n| n.checked_sub(owner.snapshot.limits.max_output_bytes))
             .ok_or_else(|| ArenaError::Budget("native PGN reservation underflow".into()))?;
         let pgn_bytes = read_file(&owner.snapshot.directory, "match.pgn", pgn_cap);
@@ -1191,10 +1461,18 @@ pub(crate) mod linux {
                 }
                 Err(error) => receipt.pgn_audit_error = Some(error.to_string()),
             }
-            match audit_providers(owner, &process.stdout, &mut receipt.artifacts) {
+            match audit_providers(
+                owner,
+                &process.stdout,
+                &receipt.external_preflight,
+                &mut receipt.artifacts,
+            ) {
                 Ok((sessions, pids)) => {
                     receipt.provider_sessions = sessions;
                     for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+                        if owner.spec.uses_provider_records(role)? {
+                            continue;
+                        }
                         if let Some(e) = owner.spec.engine_view(role)?.external {
                             let options = e
                                 .requested_options
@@ -1208,12 +1486,17 @@ pub(crate) mod linux {
                                     .map(|v| (k.clone(), v))
                                 })
                                 .collect::<Result<BTreeMap<_, _>, _>>()?;
-                            match crate::external_uci::audit_external_game_protocol(
-                                &process.stdout,
-                                e,
-                                &options,
-                                &pids,
-                            ) {
+                            match owner
+                                .spec
+                                .external_game_process_ids(role, &pids, &owner.snapshot.directory)
+                                .and_then(|role_pids| {
+                                    crate::external_uci::audit_external_game_protocol(
+                                        &process.stdout,
+                                        e,
+                                        &options,
+                                        &role_pids,
+                                    )
+                                }) {
                                 Ok(a) => receipt.external_execution.push(a),
                                 Err(e) => receipt.external_audit_error = Some(e.to_string()),
                             }
@@ -1316,7 +1599,7 @@ pub(crate) mod linux {
                 .spec
                 .receipt_filename(),
             &bytes,
-            NATIVE_PAIR_METADATA_CAP,
+            owner.spec.pair_metadata_cap(),
         )?;
         bundle.receipt_artifact = Some(artifact.clone());
         crate::emit_native_phase("receipt_saved");
@@ -1821,15 +2104,14 @@ pub(crate) mod linux {
             physical_drain: "confirmed".into(),
         })
     }
-    fn runtime_tree<S: NativeLaunchDeclaration>(
+    fn runtime_tree(
         directory: &Dir,
         depth: usize,
         files: &mut u32,
         dirs: &mut u32,
         bytes: &mut u64,
-        owner: &NativeLaunchOwner<S>,
+        budget: rz_experiments::NativeResourceBudgetV1,
     ) -> Result<(), ArenaError> {
-        let budget = owner.spec.view().budget;
         if depth > budget.max_runtime_depth as usize {
             return Err(ArenaError::Budget("native runtime depth exceeded".into()));
         }
@@ -1865,7 +2147,7 @@ pub(crate) mod linux {
                     files,
                     dirs,
                     bytes,
-                    owner,
+                    budget,
                 )?;
             } else if metadata.is_file() {
                 *files = files.checked_add(1).ok_or_else(|| {
@@ -1908,7 +2190,109 @@ pub(crate) mod linux {
         }
         Ok(())
     }
-    fn verify_conversion_provenance(
+    /// Additional roots and all their children consume the existing shared
+    /// runtime entry/byte limits. The periodic whole-attempt watch remains
+    /// unchanged; this stage barrier does not create a kernel filesystem quota.
+    fn preflight_runtime_totals<S: NativeLaunchDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+    ) -> Result<(u32, u32, u64), ArenaError> {
+        crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot)?;
+        if owner
+            .snapshot
+            .preflight_runtime_roots
+            .iter()
+            .all(Option::is_none)
+        {
+            return Ok((0, 0, 0));
+        }
+        let mut files = 0u32;
+        let mut dirs = owner
+            .snapshot
+            .preflight_runtime_roots
+            .iter()
+            .flatten()
+            .count() as u32;
+        let mut bytes = 0u64;
+        if dirs > owner.spec.view().budget.max_runtime_files {
+            return Err(ArenaError::Budget(
+                "native preflight roots exceed runtime entry budget".into(),
+            ));
+        }
+        for root in owner.snapshot.preflight_runtime_roots.iter().flatten() {
+            runtime_tree(
+                &root.directory,
+                0,
+                &mut files,
+                &mut dirs,
+                &mut bytes,
+                owner.spec.view().budget,
+            )?;
+        }
+        Ok((files, dirs, bytes))
+    }
+    #[cfg(test)]
+    #[test]
+    fn preflight_and_game_runtime_trees_consume_one_unchanged_aggregate() {
+        let base = std::env::temp_dir().join(format!(
+            "rovezero-preflight-runtime-quota-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&base).unwrap();
+        for name in ["preflight", "game"] {
+            std::fs::create_dir(base.join(name)).unwrap();
+            std::fs::write(base.join(name).join("receipt.json"), b"abc").unwrap();
+        }
+        let directory = Dir::open_ambient_dir(&base, cap_std::ambient_authority()).unwrap();
+        let preflight = directory.open_dir_nofollow("preflight").unwrap();
+        let game = directory.open_dir_nofollow("game").unwrap();
+        let budget = rz_experiments::NativeResourceBudgetV1 {
+            max_input_bytes: 1,
+            max_output_bytes: 1,
+            max_runtime_bytes: 6,
+            max_artifact_bytes: 8,
+            max_child_processes: 1,
+            max_runtime_files: 3,
+            max_runtime_depth: 0,
+            address_space_per_process_bytes: 0,
+        };
+        let scan = |budget| {
+            // Only the additional preflight root consumes a new fixed runtime
+            // directory entry. The historical game-root accounting is unchanged.
+            let (mut files, mut dirs, mut bytes) = (0, 1, 0);
+            runtime_tree(&preflight, 0, &mut files, &mut dirs, &mut bytes, budget)?;
+            runtime_tree(&game, 0, &mut files, &mut dirs, &mut bytes, budget)?;
+            Ok::<_, ArenaError>((files, dirs, bytes))
+        };
+        assert_eq!(scan(budget).unwrap(), (2, 1, 6));
+        assert!(matches!(
+            scan(rz_experiments::NativeResourceBudgetV1 {
+                max_runtime_bytes: 5,
+                ..budget
+            }),
+            Err(ArenaError::Budget(_))
+        ));
+        assert!(matches!(
+            scan(rz_experiments::NativeResourceBudgetV1 {
+                max_runtime_files: 2,
+                ..budget
+            }),
+            Err(ArenaError::Budget(_))
+        ));
+        std::fs::create_dir(base.join("preflight/nested")).unwrap();
+        assert!(matches!(scan(budget), Err(ArenaError::Budget(_))));
+        std::fs::remove_dir(base.join("preflight/nested")).unwrap();
+        std::os::unix::fs::symlink(base.join("game/receipt.json"), base.join("preflight/alias"))
+            .unwrap();
+        assert!(matches!(scan(budget), Err(ArenaError::Integrity(_))));
+        std::fs::remove_file(base.join("preflight/alias")).unwrap();
+        std::fs::hard_link(base.join("game/receipt.json"), base.join("preflight/alias")).unwrap();
+        assert!(matches!(scan(budget), Err(ArenaError::Integrity(_))));
+        drop(preflight);
+        drop(game);
+        drop(directory);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+    pub(super) fn verify_conversion_provenance(
         startup: &Value,
         manifest: &Value,
         batch_experiment: bool,
@@ -1961,18 +2345,19 @@ pub(crate) mod linux {
     fn audit_providers<S: NativeProviderDeclaration>(
         owner: &NativeLaunchOwner<S>,
         stdout: &[u8],
+        preflight: &[crate::ExternalUciPreflight],
         artifacts: &mut Vec<ArtifactRef>,
     ) -> Result<(Vec<S::Audit>, Vec<u32>), ArenaError> {
         let mut sessions = Vec::new();
         let mut ids = BTreeSet::new();
         let mut scanned = 0u32;
-        let (mut tree_files, mut tree_dirs, mut tree_bytes) = (0, 0, 0);
+        let (mut tree_files, mut tree_dirs, mut tree_bytes) = preflight_runtime_totals(owner)?;
         for (role, name) in [
             (NativeEngineRole::Baseline, "baseline-runtime"),
             (NativeEngineRole::Candidate, "candidate-runtime"),
         ] {
             let engine = owner.spec.engine_view(role)?;
-            if engine.external.is_some() {
+            if !owner.spec.uses_provider_records(role)? {
                 continue;
             }
             let directory = owner
@@ -1986,7 +2371,7 @@ pub(crate) mod linux {
                 &mut tree_files,
                 &mut tree_dirs,
                 &mut tree_bytes,
-                owner,
+                owner.spec.view().budget,
             )?;
             let mut session_names = Vec::new();
             for entry in directory
@@ -2035,13 +2420,21 @@ pub(crate) mod linux {
                     &format!("{name}/{session}/{termination_filename}"),
                     &termination_bytes,
                 ));
-                let startup = json(&startup_bytes)?;
-                let (audit, pid) = owner.spec.validate_records(
+                verify_provider_input_names(owner)?;
+                let pins = provider_input_views(owner);
+                let inputs = NativeProviderInputContext {
+                    directory: &owner.snapshot.input_directory,
+                    pins: &pins,
+                };
+                let (audit, pid) = owner.spec.validate_records_with_context(
                     role,
                     &startup_bytes,
                     &termination_bytes,
                     &session,
+                    &inputs,
+                    stdout,
                 )?;
+                verify_provider_input_names(owner)?;
                 if !ids.insert(pid) {
                     return Err(invalid("native pair reused a process identity"));
                 }
@@ -2054,22 +2447,22 @@ pub(crate) mod linux {
                 }
                 // Compare conversion provenance with the exact copied export
                 // manifest bytes rather than trusting additional receipt strings.
-                let export = pin(
-                    &owner.snapshot.pins,
-                    engine.artifact(NativeArtifactRole::ExportManifest)?,
-                )?;
-                let manifest = json(&read_bytes(
-                    export
-                        .file
-                        .try_clone()
-                        .map_err(|_| invalid("cannot clone export pin"))?,
-                    64 * 1024,
-                )?)?;
-                verify_conversion_provenance(
-                    &startup,
-                    &manifest,
-                    engine.batch_experiment.is_some(),
-                )?;
+                if let Some(export) = owner.spec.provider_export_artifact(role)? {
+                    let export = pin(&owner.snapshot.pins, export)?;
+                    let manifest_bytes = read_bytes(
+                        export
+                            .file
+                            .try_clone()
+                            .map_err(|_| invalid("cannot clone export pin"))?,
+                        64 * 1024,
+                    )?;
+                    owner.spec.validate_conversion_manifest(
+                        role,
+                        &startup_bytes,
+                        &manifest_bytes,
+                        engine.batch_experiment.is_some(),
+                    )?;
+                }
                 sessions.push(audit);
             }
         }
@@ -2078,6 +2471,21 @@ pub(crate) mod linux {
             .spec
             .validate_process_exit_trace(stdout, &expected_pids)?;
         let external = owner.spec.external_exit_ids(stdout, &expected_pids)?;
+        verify_provider_input_names(owner)?;
+        let pins = provider_input_views(owner);
+        let inputs = NativeProviderInputContext {
+            directory: &owner.snapshot.input_directory,
+            pins: &pins,
+        };
+        owner.spec.validate_provider_session_set(
+            &sessions,
+            preflight,
+            &owner.snapshot.directory,
+            &inputs,
+            stdout,
+            artifacts,
+        )?;
+        verify_provider_input_names(owner)?;
         Ok((sessions, external))
     }
 }
