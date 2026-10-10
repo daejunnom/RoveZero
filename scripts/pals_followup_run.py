@@ -18,10 +18,13 @@ import time
 
 sys.dont_write_bytecode = True
 from managed_process import run_group
-from managed_storage import checked
+from managed_storage import checked, tree_size
 
 GIB = 1024 ** 3
 SCHEMA = "rz-pals-followup-local-wrapper/1"
+COLAB_SCHEMA = "rz-pals-followup-colab-observed-wrapper/1"
+RESOURCE_PROFILES = ("strict-local", "colab-observed")
+EXTERNAL_GC_LEDGER_SCHEMA = "rovezero.external-gc-ledger.v1"
 PROFILES = ("legacy_summary_v1", "full_line_v2", "interaction_head_v2", "full_line_interaction_v2")
 
 
@@ -92,6 +95,130 @@ def check_resources(cpus):
         if (root / name).read_text(encoding="ascii").strip() != str(value):
             raise ValueError("inherited memory.high/max/swap differs from 6GiB/12GiB/0")
     return {"cpu_affinity": sorted(cpus), **limits, "method": "actual inherited affinity and cgroup-v2 reads"}
+
+
+def observe_resources(cpus):
+    """Colab observations are never an admission of the strict local policy.
+
+    Read only this process's inherited cgroup and permission capabilities. No
+    affinity, quota, memory or cgroup setting is installed or silently changed.
+    """
+    requested = {"cpu_affinity": sorted(cpus), "cpu_quota": 2,
+                 "memory.high": 6 * GIB, "memory.max": 12 * GIB,
+                 "memory.swap.max": 0, "pids.max": 128}
+    observations = {name: {"requested": value, "observed": None, "status": "unknown"}
+                    for name, value in requested.items()}
+    result = {"profile": "colab-observed", "platform": sys.platform,
+              "strict_local_resources_admitted": False,
+              "method": "read-only current inherited affinity/cgroup-v2 observations",
+              "ancestor_effective_limits": "unknown", "settings_installed": False,
+              "cgroup_write_performed": False, "observations": observations,
+              "cgroup_membership": None, "cgroup_write_capability": {
+                  "observed": None, "status": "unknown", "applied_settings_verified": False}}
+    if sys.platform != "linux":
+        result["execution_platform_status"] = "unfulfilled"
+        return result
+    result["execution_platform_status"] = "satisfied"
+    try:
+        affinity = sorted(os.sched_getaffinity(0))
+        observations["cpu_affinity"].update(observed=affinity,
+            status="satisfied" if affinity == sorted(cpus) else "unfulfilled")
+    except (AttributeError, OSError) as error:
+        observations["cpu_affinity"]["error_type"] = type(error).__name__
+    try:
+        membership = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+        relative = next((line[3:] for line in membership.splitlines() if line.startswith("0::")), None)
+        if (relative is None or not relative.startswith("/")
+                or any(part in (".", "..") for part in relative.split("/"))):
+            raise ValueError("actual safe cgroup-v2 membership unavailable")
+        root = Path("/sys/fs/cgroup") / relative.lstrip("/")
+        result["cgroup_membership"] = relative
+    except (OSError, ValueError) as error:
+        result["cgroup_observation_error_type"] = type(error).__name__
+        return result
+    names = ("cpu.max", "memory.high", "memory.max", "memory.swap.max", "pids.max")
+    for name in names:
+        target = "cpu_quota" if name == "cpu.max" else name
+        row = observations[target]
+        try:
+            raw = (root / name).read_text(encoding="ascii").strip()
+            row["raw"] = raw
+            if name == "cpu.max":
+                fields = raw.split()
+                if (len(fields) != 2 or not fields[1].isdecimal() or int(fields[1]) <= 0
+                        or (fields[0] != "max" and not fields[0].isdecimal())):
+                    raise ValueError("malformed cgroup CPU quota")
+                value = "unlimited" if fields[0] == "max" else int(fields[0]) / int(fields[1])
+            else:
+                if raw != "max" and not raw.isdecimal():
+                    raise ValueError("malformed cgroup limit")
+                value = "unlimited" if raw == "max" else int(raw)
+            row.update(observed=value, status="satisfied" if value == row["requested"] else "unfulfilled")
+        except (OSError, ValueError) as error:
+            row["error_type"] = type(error).__name__
+    try:
+        writable = os.access(root, os.W_OK) and all(os.access(root / name, os.W_OK) for name in names)
+        result["cgroup_write_capability"].update(observed=writable,
+            status="observed_capability_only" if writable else "unfulfilled")
+    except OSError as error:
+        result["cgroup_write_capability"]["error_type"] = type(error).__name__
+    return result
+
+
+def external_gc_observation(args):
+    """Record requests and actual external GC separately; never invoke GC."""
+    path, digest = args.external_gc_ledger, args.external_gc_ledger_sha256
+    if (path is None) != (digest is None):
+        raise ValueError("external GC ledger and independently registered SHA256 are required together")
+    if path is None:
+        return {"ledger": None, "request_count": "unknown", "actual_execution_count": "unknown",
+                "actual_full_gc_calls": "unknown", "memory_contention_observed": "unknown",
+                "product_GC_hooks": 0, "GC_invoked_by_wrapper": False,
+                "performance_evidence_eligible": False}
+    path = pinned(path, digest, 256 * 1024)
+    value = bounded_json(path)
+    requests, executions = value.get("requests"), value.get("actual_executions")
+    if (value.get("schema") != EXTERNAL_GC_LEDGER_SCHEMA
+            or not isinstance(requests, list) or not isinstance(executions, list)
+            or len(requests) > 64 or len(executions) > 64
+            or not (type(value.get("memory_contention_observed")) is bool
+                    or value.get("memory_contention_observed") == "unknown")
+            or value.get("performance_evidence_eligible") is not False):
+        raise ValueError("bounded separate request/actual external GC ledger required")
+    identifiers = set()
+    for request in requests:
+        identifier = request.get("id") if isinstance(request, dict) else None
+        if (not isinstance(identifier, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", identifier)
+                or identifier in identifiers or request.get("product_hook") is not False):
+            raise ValueError("unique external GC request IDs and product_hook=false required")
+        identifiers.add(identifier)
+    actual_calls = 0
+    execution_ids = set()
+    for execution in executions:
+        identifier = execution.get("id") if isinstance(execution, dict) else None
+        if (not isinstance(execution, dict) or execution.get("request_id") not in identifiers
+                or not isinstance(identifier, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", identifier)
+                or identifier in execution_ids
+                or execution.get("scope") != "owned_external_controller"
+                or type(execution.get("full_gc_calls")) is not int
+                or not 0 <= execution["full_gc_calls"] <= 64
+                or execution.get("product_hook") is not False):
+            raise ValueError("actual external GC events must reference requests and exclude product hooks")
+        execution_ids.add(identifier)
+        actual_calls += execution["full_gc_calls"]
+    return {"ledger": {"path": str(path), "sha256": digest, "bytes": path.stat().st_size},
+            "request_count": len(requests), "actual_execution_count": len(executions),
+            "actual_full_gc_calls": actual_calls,
+            "memory_contention_observed": value["memory_contention_observed"],
+            "product_GC_hooks": 0, "GC_invoked_by_wrapper": False,
+            "performance_evidence_eligible": False}
+
+
+def check_colab_output_budget(args):
+    """Bound only this attempt's fresh output, never models or shared runtime."""
+    target = args.output_root / args.label if args.mode == "arena" else args.model_report
+    if tree_size(target, allow_disappearing=True) > args.output_bytes_max:
+        raise RuntimeError("owned Colab attempt exceeds registered finite output budget")
 
 
 def arena_plan(args, binary):
@@ -168,6 +295,10 @@ def main():
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--cpu-affinity", nargs=2, type=int, required=True)
     parser.add_argument("--seconds", type=int, default=960)
+    parser.add_argument("--resource-profile", choices=RESOURCE_PROFILES, default="strict-local")
+    parser.add_argument("--output-bytes-max", type=int, default=2 * GIB)
+    parser.add_argument("--external-gc-ledger", type=Path)
+    parser.add_argument("--external-gc-ledger-sha256")
     parser.add_argument("--run", action="store_true")
     commands = parser.add_subparsers(dest="mode", required=True)
     arena = commands.add_parser("arena")
@@ -193,26 +324,67 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.seconds <= 3600 or any(cpu < 0 for cpu in args.cpu_affinity) or len(set(args.cpu_affinity)) != 2:
         parser.error("finite 1..3600s window and two distinct nonnegative CPU IDs required")
+    if not 1 <= args.output_bytes_max <= 2 * GIB:
+        parser.error("finite output budget of 1 byte..2GiB required")
     receipt_path = outside_git(args.receipt)
     if receipt_path.exists() or not receipt_path.parent.is_dir():
         parser.error("receipt must be a fresh file under existing outside-Git parent")
+    started = time.monotonic()
+    gc_observation = external_gc_observation(args)
     binary = pinned(args.binary, args.binary_sha256, 256 * 1024 * 1024)
     command, details = arena_plan(args, binary) if args.mode == "arena" else model_plan(args, binary)
-    receipt = {"schema": SCHEMA, "mode": args.mode, "planning_only": not args.run,
+    receipt = {"schema": SCHEMA if args.resource_profile == "strict-local" else COLAB_SCHEMA,
+               "mode": args.mode, "planning_only": not args.run,
                "command": command, "binary_sha256": args.binary_sha256, "window_seconds": args.seconds,
                "gpu_validation_window_seconds_max": 3600, "resource_policy": {"cpu_affinity": sorted(args.cpu_affinity),
                    "memory_high_bytes": 6 * GIB, "memory_max_bytes": 12 * GIB, "swap_max_bytes": 0},
                "actual_resources": "unknown", "training_executed": False, "strength_eligible": False,
                "automatic_retry": False, "tree_gone": "unknown", "exit_code": None, **details}
-    started = time.monotonic()
+    if args.resource_profile == "colab-observed":
+        receipt.update(resource_profile="colab-observed", strict_local_resources_admitted=False,
+                       resource_policy_interpretation="requested targets, actual capability is independently observed",
+                       cleanup_seconds_max=30, physical_workers_max=1, concurrent_wrapper_children_max=1,
+                       output_bytes_max=args.output_bytes_max,
+                       output_budget_scope="fresh attempt generated files only; inherited stdout/stderr bytes unknown",
+                       inherited_stdio_bytes="unknown", process_exit_is_provider_fence=False,
+                       native_arena_policy_relaxed=False, external_GC=gc_observation,
+                       performance_evidence_eligible=False, remote_creation_performed=False,
+                       new_cloud_cost_authorized=False, preparation_is_in_work_window=True)
+    elif args.external_gc_ledger is not None:
+        receipt.update(external_GC=gc_observation, performance_evidence_eligible=False)
+    # Preserve the strict-local timeout start and receipt behavior. Colab's
+    # independently named observation profile includes preparation in its window.
+    if args.resource_profile == "strict-local":
+        started = time.monotonic()
     if args.run:
-        receipt["actual_resources"] = check_resources(args.cpu_affinity)
+        observer = check_resources if args.resource_profile == "strict-local" else observe_resources
+        receipt["actual_resources"] = observer(args.cpu_affinity)
         environment = os.environ.copy()
         environment.update({"OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "PYTHONDONTWRITEBYTECODE": "1"})
-        code, gone, failure = run_group(command, binary.parent, environment, args.seconds,
-                                       lambda: check_resources(args.cpu_affinity))
-        receipt.update(exit_code=code, tree_gone=gone, supervisor_error=failure,
-                       status="completed" if code == 0 and gone else "failed_ownership_preserved")
+        if args.resource_profile == "strict-local":
+            code, gone, failure = run_group(command, binary.parent, environment, args.seconds,
+                                           lambda: check_resources(args.cpu_affinity))
+            receipt.update(exit_code=code, tree_gone=gone, supervisor_error=failure,
+                           status="completed" if code == 0 and gone else "failed_ownership_preserved")
+        else:
+            remaining = args.seconds - (time.monotonic() - started)
+            if sys.platform != "linux" or remaining <= 0:
+                receipt.update(exit_code=125 if sys.platform != "linux" else 124, tree_gone=True,
+                    status="unsupported_execution_platform" if sys.platform != "linux" else "preparation_deadline_expired",
+                    child_spawned=False)
+            else:
+                check_colab_output_budget(args)
+                def observed_budget():
+                    check_colab_output_budget(args)
+                code, gone, failure = run_group(command, binary.parent, environment, remaining, observed_budget)
+                if gone:
+                    try:
+                        check_colab_output_budget(args)
+                    except (OSError, RuntimeError) as error:
+                        code, failure = 125, str(error)
+                receipt.update(exit_code=code, tree_gone=gone, supervisor_error=failure,
+                    status="completed_observed_profile" if code == 0 and gone else "failed_ownership_preserved",
+                    actual_resources_after=observe_resources(args.cpu_affinity))
     else:
         receipt["status"] = "prepared_no_child_spawned"
     receipt["elapsed_seconds"] = time.monotonic() - started
