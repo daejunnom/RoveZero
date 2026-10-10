@@ -1763,6 +1763,27 @@ pub enum PalsNativeResult {
     CudaPlacementVerified(Box<PalsCudaPlacementWitness>),
     RuntimeMappingsObserved(Box<PalsNativeMappingWitness>),
 }
+
+fn host_observation_outcome(
+    result: &Result<PalsNativeResult, BackendError>,
+    physical_completion_unknown: bool,
+) -> HostRecordPageObservationOutcome {
+    if physical_completion_unknown {
+        HostRecordPageObservationOutcome::PhysicalCompletionUnknown
+    } else if matches!(
+        result,
+        Err(_)
+            | Ok(PalsNativeResult::EvaluationWithEvidence {
+                outcome: Err(_),
+                ..
+            })
+    ) {
+        HostRecordPageObservationOutcome::ReturnedError
+    } else {
+        HostRecordPageObservationOutcome::ReturnedOk
+    }
+}
+
 impl PalsNativeCommand {
     /// Stable diagnostic label matched in the enum's defining feature domain.
     /// Downstream feature unification must not hide an enabled control variant.
@@ -2970,13 +2991,7 @@ impl PalsOnnxBackend {
                     .map(|witness| PalsNativeResult::RuntimeMappingsObserved(Box::new(witness))),
             };
             if let Some(observer) = &observer {
-                let outcome = if self.quarantine.is_some() {
-                    HostRecordPageObservationOutcome::PhysicalCompletionUnknown
-                } else if result.is_ok() {
-                    HostRecordPageObservationOutcome::ReturnedOk
-                } else {
-                    HostRecordPageObservationOutcome::ReturnedError
-                };
+                let outcome = host_observation_outcome(&result, self.quarantine.is_some());
                 observer.record(boundary, outcome, self.host_record_page_snapshot());
             }
             match self.quarantine.as_ref() {
@@ -4758,6 +4773,31 @@ mod tests {
         stats.live_public_cache_entries = 2;
         assert!(stats.validate().is_err());
     }
+    #[test]
+    fn host_page_observation_preserves_known_role_failure_inside_evidence() {
+        let error = fail(K::NumericalFailure, S::Output, "known role output failure");
+        let legacy = Err(error.clone());
+        let evidence = Ok(PalsNativeResult::EvaluationWithEvidence {
+            outcome: Err(error),
+            actual_completed_nn_inputs_delta: Some(1),
+            complete: true,
+        });
+        for result in [&legacy, &evidence] {
+            assert_eq!(
+                host_observation_outcome(result, false),
+                HostRecordPageObservationOutcome::ReturnedError
+            );
+            assert_eq!(
+                host_observation_outcome(result, true),
+                HostRecordPageObservationOutcome::PhysicalCompletionUnknown
+            );
+        }
+        assert_eq!(
+            host_observation_outcome(&Ok(PalsNativeResult::NewGame), false),
+            HostRecordPageObservationOutcome::ReturnedOk
+        );
+    }
+
     #[test]
     fn native_nn_evidence_counts_public_miss_and_cache_hit_without_another_command() {
         let before = PalsBackendStats::default();
