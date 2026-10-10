@@ -2649,7 +2649,9 @@ mod check {
         }
         #[test]
         fn cuda_warm_owner_limits_use_native_byte_units_and_refuse_missing_exclusive_budget() {
-            let limits = cuda_warm_limits("1", "397312").unwrap();
+            let Ok(limits) = cuda_warm_limits("1", "397312") else {
+                panic!("registered CUDA Warm owner limits were rejected");
+            };
             assert_eq!(limits.max_leases, 1);
             assert_eq!(limits.device_bytes_max, 397312);
             let config = PalsModelConfig::full_line_interaction_v2();
