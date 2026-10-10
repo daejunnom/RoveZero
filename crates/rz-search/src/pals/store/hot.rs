@@ -30,6 +30,14 @@ impl<T> HotRecords<T> {
     pub(super) fn next_id(&self) -> usize {
         self.next
     }
+    /// Requested backing capacity only. Hash table allocator internals and any
+    /// shared allocations inside T are deliberately excluded.
+    pub(super) fn owned_capacity_bytes(&self) -> Option<u64> {
+        self.values
+            .capacity()
+            .checked_mul(std::mem::size_of::<Option<(usize, T)>>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+    }
     pub(super) fn reserve(&mut self, additional: usize) -> Result<(), StoreError> {
         #[cfg(test)]
         if self.fail_reservations != 0 {

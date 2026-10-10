@@ -21,8 +21,10 @@ use rz_position::{
 mod archive;
 mod hot;
 pub use archive::{
-    ArchiveConfig, ArchiveIoBudget, ArchiveLoadPin, ArchiveReceipt, ArchiveRecordKind,
-    ArchiveStats, ColdHandle, EngineArchiveNode, EngineArchiveReceipt, LoadedArchive, StorePins,
+    ArchiveConfig, ArchiveIoBudget, ArchiveLoadPin, ArchiveOwnerLifecycle, ArchiveOwnerSnapshot,
+    ArchiveReceipt, ArchiveRecordKind, ArchiveRuntimeLimits, ArchiveStats, ColdHandle,
+    EngineArchiveNode, EngineArchiveReceipt, LoadedArchive, StorePins,
+    archive_accounting_source_sha256,
 };
 use hot::HotRecords;
 
