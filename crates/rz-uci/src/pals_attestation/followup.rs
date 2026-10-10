@@ -1603,11 +1603,11 @@ mod tests {
     }
     #[test]
     fn duplicate_search_capture_and_unknown_game_are_sticky_incomplete() {
-        let mut journal = journal(true, false, false, false);
+        let mut duplicate = journal(true, false, false, false);
         let source = search(None);
-        journal.capture_search(&source);
-        journal.capture_search(&source);
-        assert!(!journal.lifecycle.unwrap().capture_complete);
+        duplicate.capture_search(&source);
+        duplicate.capture_search(&source);
+        assert!(!duplicate.lifecycle.unwrap().capture_complete);
         let mut journal = journal(true, false, false, false);
         journal.lifecycle = None;
         let mut missing = source.clone();
