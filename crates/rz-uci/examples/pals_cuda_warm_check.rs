@@ -3463,7 +3463,12 @@ mod check {
             )?;
             result[name] = json!({"checks": checks, "source_identity": source_identity, "logical_search_consumers_per_sample": 0});
         }
-        Ok(result)
+        Ok(completed_cost_reference_metadata(result))
+    }
+    fn completed_cost_reference_metadata(mut result: Value) -> Value {
+        // Called only after every original, owner, same-seed and numeric check.
+        result["execution_checks_passed"] = json!(true);
+        result
     }
     fn reference(args: &Args) -> Result<Value, Failure> {
         let capture_bytes = pinned(
@@ -3615,6 +3620,13 @@ mod check {
         }
         Ok(report)
     }
+    fn report_passes_execution_gate(report: &Value) -> bool {
+        (report["passed"] == true
+            || (report["phase"] == "capture" && report["execution_checks_passed"] == true))
+            && report
+                .get("cost_same_seed_context")
+                .is_none_or(|cost| cost["execution_checks_passed"] == true)
+    }
     fn publish(report: Value, output_path: Option<&Path>) -> ExitCode {
         let bytes = match serde_json::to_vec(&report) {
             Ok(bytes) if bytes.len() < OUTPUT_LIMIT => bytes,
@@ -3653,12 +3665,7 @@ mod check {
         {
             return ExitCode::FAILURE;
         }
-        if (report["passed"] == true
-            || (report["phase"] == "capture" && report["execution_checks_passed"] == true))
-            && report
-                .get("cost_same_seed_context")
-                .is_none_or(|cost| cost["execution_checks_passed"] == true)
-        {
+        if report_passes_execution_gate(&report) {
             ExitCode::SUCCESS
         } else {
             ExitCode::FAILURE
@@ -3769,6 +3776,46 @@ mod check {
     mod tests {
         use super::*;
 
+        #[test]
+        fn publish_gate_preserves_capture_reference_and_partial_cost_exits() {
+            let capture =
+                json!({"phase": "capture", "passed": false, "execution_checks_passed": true});
+            let reference = json!({"phase": "verify_reference", "passed": true, "execution_checks_passed": true});
+            assert!(report_passes_execution_gate(&capture));
+            assert!(report_passes_execution_gate(&reference));
+
+            let cost = json!({"opt_in": true, "independent_same_seed_reference_passed": true,
+                "benchmark_validation_complete": false, "comparison_status": "not_comparable",
+                "warm_over_fresh_api_wall_ratio": null});
+            let mut cost_reference = reference.clone();
+            cost_reference["cost_same_seed_context"] = cost.clone();
+            // Reproduce the missing success marker that previously exited 1.
+            assert!(!report_passes_execution_gate(&cost_reference));
+            let verified = completed_cost_reference_metadata(cost);
+            cost_reference["cost_same_seed_context"] = verified.clone();
+            assert!(report_passes_execution_gate(&cost_reference));
+            assert_eq!(verified["benchmark_validation_complete"], false);
+            assert_eq!(verified["comparison_status"], "not_comparable");
+            assert!(verified["warm_over_fresh_api_wall_ratio"].is_null());
+            let mut cost_capture = capture.clone();
+            cost_capture["cost_same_seed_context"] = verified;
+            assert!(report_passes_execution_gate(&cost_capture));
+
+            for marker in [json!(false), Value::Null, json!("true")] {
+                cost_reference["cost_same_seed_context"]["execution_checks_passed"] =
+                    marker.clone();
+                cost_capture["cost_same_seed_context"]["execution_checks_passed"] = marker;
+                assert!(!report_passes_execution_gate(&cost_reference));
+                assert!(!report_passes_execution_gate(&cost_capture));
+            }
+            for missing_or_failed in [
+                json!({}),
+                json!({"phase": "capture", "passed": false}),
+                json!({"phase": "verify_reference", "passed": false, "execution_checks_passed": true}),
+            ] {
+                assert!(!report_passes_execution_gate(&missing_or_failed));
+            }
+        }
         #[test]
         fn cost_reference_receipt_distinguishes_known_zero_from_missing_consumer_and_fence() {
             let mut receipt = json!({"process_epoch": 1, "game_generation": 9,
