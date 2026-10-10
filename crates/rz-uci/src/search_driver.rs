@@ -204,6 +204,8 @@ pub struct PalsSessionDriver<M: rz_search::pals::engine::RoleModel + 'static> {
     checker_lifecycle: Mutex<PalsCheckerLifecycle>,
     #[cfg(feature = "search-work-receipts")]
     followup: Mutex<crate::pals_attestation::followup::FollowupJournal>,
+    #[cfg(feature = "search-work-receipts")]
+    followup_capture_complete: AtomicBool,
 }
 impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
     pub fn new(
@@ -279,6 +281,8 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
             checker_lifecycle: Mutex::new(PalsCheckerLifecycle::default()),
             #[cfg(feature = "search-work-receipts")]
             followup: Mutex::new(Default::default()),
+            #[cfg(feature = "search-work-receipts")]
+            followup_capture_complete: AtomicBool::new(true),
         })
     }
 
@@ -590,6 +594,8 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
             checker_lifecycle: Mutex::new(PalsCheckerLifecycle::default()),
             #[cfg(feature = "search-work-receipts")]
             followup: Mutex::new(Default::default()),
+            #[cfg(feature = "search-work-receipts")]
+            followup_capture_complete: AtomicBool::new(true),
         })
     }
 
@@ -607,67 +613,258 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
             .map_err(|error| SearchSessionFailure::debug("PalsArchive", &error))
     }
     pub fn set_archive_runtime_limits(
-        &self, limits: rz_search::pals::store::ArchiveRuntimeLimits,
+        &self,
+        limits: rz_search::pals::store::ArchiveRuntimeLimits,
     ) -> Result<(), SearchSessionFailure> {
-        let mut engine=self.engine.lock()
-            .map_err(|_|SearchSessionFailure::debug("PalsArchiveLimits",&"engine lock poisoned"))?;
-        engine.set_archive_runtime_limits(limits)
-            .map_err(|error|SearchSessionFailure::debug("PalsArchiveLimits",&error))?;
-        if engine.archive_runtime_limits().copied()!=Some(limits) {
-            return Err(SearchSessionFailure::debug("PalsArchiveLimits",&"actual limits differ from selected limits"));
+        let mut engine = self.engine.lock().map_err(|_| {
+            SearchSessionFailure::debug("PalsArchiveLimits", &"engine lock poisoned")
+        })?;
+        engine
+            .set_archive_runtime_limits(limits)
+            .map_err(|error| SearchSessionFailure::debug("PalsArchiveLimits", &error))?;
+        if engine.archive_runtime_limits().copied() != Some(limits) {
+            return Err(SearchSessionFailure::debug(
+                "PalsArchiveLimits",
+                &"actual limits differ from selected limits",
+            ));
         }
         Ok(())
+    }
+    pub fn observe_archive_startup(
+        &self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), SearchSessionFailure> {
+        self.engine
+            .try_lock()
+            .map_err(|_| {
+                SearchSessionFailure::debug("PalsArchiveStartup", &"engine owner unavailable")
+            })?
+            .observe_archive_startup(deadline, cancel)
+            .map_err(|error| SearchSessionFailure::debug("PalsArchiveStartup", &error))
     }
     #[cfg(feature = "search-work-receipts")]
     pub fn enable_followup_execution(
-        &self, process_epoch:Option<u64>, cuda_warm_implementation:Option<[u8;32]>,
+        &self,
+        process_epoch: Option<u64>,
+        cuda_warm_implementation: Option<[u8; 32]>,
     ) -> Result<(), SearchSessionFailure> {
         use crate::pals_attestation::followup as f;
-        let engine=self.engine.lock()
-            .map_err(|_|SearchSessionFailure::debug("PalsFollowup",&"engine lock poisoned"))?;
-        let repair=engine.post_repair_recheck_policy().uses_frozen_model_wdl();
-        let stack=self.registration.cpu_resume_policy==Some(rz_search::cpu::CpuResumePolicy::PausedStack);
-        let archive=engine.archive_enabled();
-        if !repair && !stack && !archive && cuda_warm_implementation.is_none() {return Ok(());}
-        let method=|method:&str,digest:[u8;32]|f::NativeOwnerMethodIdentityV4 {
-            method:method.into(),implementation_sha256:f::hex(&digest),
-        };
-        let methods=f::NativeFollowupOwnerMethodsV4 {
-            producer_domain:f::DOMAIN.into(),producer_schema_version:1,
-            producer_implementation_sha256:f::hex(&f::compiled_followup_producer_sha256()),
-            trace_capacity:f::TRACE_CAPACITY as u32,trace_bytes_max:f::TRACE_BYTES_MAX as u64,
-            repair:repair.then(||method("engine_actual_repair_recorder_v4",rz_search::pals::engine::compiled_search_implementation_sha256())),
-            paused_stack:stack.then(||method(rz_search::cpu::CPU_PAUSED_STACK_OWNER_ACCOUNTING_METHOD,
-                rz_search::cpu::compiled_paused_stack_owner_sha256())),
-            cold_archive:archive.then(||method("archive_actual_owner_events_v4",rz_search::pals::store::archive_accounting_source_sha256())),
-            cuda_warm:cuda_warm_implementation.map(|sha|method("cuda_actual_warm_owner_events_v4",sha)),
-        };
-        let mut journal=self.followup.lock()
-            .map_err(|_|SearchSessionFailure::debug("PalsFollowup",&"journal poisoned"))?;
-        if !journal.enable(process_epoch,methods) {
-            return Err(SearchSessionFailure::debug("PalsFollowup",&"followup capture already selected"));
+        let engine = self
+            .engine
+            .lock()
+            .map_err(|_| SearchSessionFailure::debug("PalsFollowup", &"engine lock poisoned"))?;
+        let repair = engine.post_repair_recheck_policy().uses_frozen_model_wdl();
+        let stack = self.registration.cpu_resume_policy
+            == Some(rz_search::cpu::CpuResumePolicy::PausedStack);
+        let archive = engine.archive_enabled();
+        if !repair && !stack && !archive && cuda_warm_implementation.is_none() {
+            return Ok(());
         }
-        journal.capture_owner(&engine.followup_owner_snapshot());
+        let method = |method: &str, digest: [u8; 32]| f::NativeOwnerMethodIdentityV4 {
+            method: method.into(),
+            implementation_sha256: f::hex(&digest),
+        };
+        let methods = f::NativeFollowupOwnerMethodsV4 {
+            producer_domain: f::DOMAIN.into(),
+            producer_schema_version: 1,
+            producer_implementation_sha256: f::hex(&f::compiled_followup_producer_sha256()),
+            trace_capacity: f::TRACE_CAPACITY as u32,
+            trace_bytes_max: f::TRACE_BYTES_MAX as u64,
+            repair: repair.then(|| {
+                method(
+                    "engine_actual_followup_search_v4",
+                    rz_search::pals::engine::compiled_search_implementation_sha256(),
+                )
+            }),
+            paused_stack: stack.then(|| {
+                method(
+                    rz_search::cpu::CPU_PAUSED_STACK_OWNER_ACCOUNTING_METHOD,
+                    rz_search::cpu::compiled_paused_stack_owner_sha256(),
+                )
+            }),
+            cold_archive: archive.then(|| {
+                method(
+                    "archive_actual_owner_events_v4",
+                    rz_search::pals::store::archive_accounting_source_sha256(),
+                )
+            }),
+            cuda_warm: cuda_warm_implementation
+                .map(|sha| method("cuda_actual_backend_and_bank_events_v4", sha)),
+        };
+        let mut journal = self
+            .followup
+            .lock()
+            .map_err(|_| SearchSessionFailure::debug("PalsFollowup", &"journal poisoned"))?;
+        if !journal.enable(
+            process_epoch,
+            methods,
+            engine.post_repair_recheck_policy()
+                == PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
+        ) {
+            return Err(SearchSessionFailure::debug(
+                "PalsFollowup",
+                &"followup capture already selected",
+            ));
+        }
+        journal.capture_initial_owner(&engine.followup_owner_snapshot());
         Ok(())
     }
     #[cfg(feature = "search-work-receipts")]
-    pub fn followup_lifecycle(&self)->Result<Option<crate::pals_attestation::followup::PalsFollowupLifecycleV4>,ContractError> {
-        self.followup.try_lock().map(|journal|journal.lifecycle.clone()).map_err(|_|ContractError::new(
-            ErrorCode::BackendFailure,Stage::Output,"followup journal metadata unavailable"))
+    pub fn followup_lifecycle(
+        &self,
+    ) -> Result<Option<crate::pals_attestation::followup::PalsFollowupLifecycleV4>, ContractError>
+    {
+        self.followup
+            .try_lock()
+            .map(|journal| {
+                let mut lifecycle = journal.lifecycle.clone();
+                if !self.followup_capture_complete.load(Ordering::Acquire)
+                    && let Some(lifecycle) = lifecycle.as_mut()
+                {
+                    lifecycle.capture_complete = false;
+                    lifecycle.owner_shutdown_complete = false;
+                    lifecycle.capture_failure.get_or_insert(
+                        crate::pals_attestation::followup::PalsCaptureFailureV4::CaptureIncomplete,
+                    );
+                }
+                lifecycle
+            })
+            .map_err(|_| {
+                ContractError::new(
+                    ErrorCode::BackendFailure,
+                    Stage::Output,
+                    "followup journal metadata unavailable",
+                )
+            })
+    }
+    #[cfg(feature = "search-work-receipts")]
+    pub fn capture_warm_followup(
+        &self,
+        value: Option<crate::pals_attestation::followup::NativeCudaWarmObservationV4>,
+    ) -> Result<(), SearchSessionFailure> {
+        self.followup
+            .try_lock()
+            .map_err(|_| {
+                self.followup_capture_complete
+                    .store(false, Ordering::Release);
+                checker_owner_unknown("PalsFollowupMetadata")
+            })?
+            .capture_warm(value);
+        Ok(())
+    }
+    #[cfg(feature = "search-work-receipts")]
+    pub fn finish_followup_owners(
+        &self,
+        deadline: Instant,
+        native_fenced: bool,
+    ) -> Result<(), ContractError> {
+        if !self
+            .followup
+            .try_lock()
+            .map_err(|_| {
+                ContractError::new(
+                    ErrorCode::BackendFailure,
+                    Stage::Output,
+                    "followup journal unavailable",
+                )
+            })?
+            .enabled()
+        {
+            return Ok(());
+        }
+        let checker_fenced = self
+            .checker_lifecycle
+            .try_lock()
+            .ok()
+            .and_then(|s| s.shutdown)
+            .is_some_and(|s| s.cleanup_complete && !s.quarantined && !s.ownership_lost);
+        if !checker_fenced || !native_fenced {
+            return Err(ContractError::new(
+                ErrorCode::BackendFailure,
+                Stage::Output,
+                "actual followup owner fences are incomplete",
+            ));
+        }
+        let mut engine = loop {
+            match self.engine.try_lock() {
+                Ok(engine) => break engine,
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(1))
+                }
+                _ => {
+                    return Err(ContractError::new(
+                        ErrorCode::BackendFailure,
+                        Stage::Output,
+                        "followup owner close unavailable on original deadline",
+                    ));
+                }
+            }
+        };
+        let mut journal = self.followup.try_lock().map_err(|_| {
+            ContractError::new(
+                ErrorCode::BackendFailure,
+                Stage::Output,
+                "followup journal unavailable",
+            )
+        })?;
+        if !journal.enabled() {
+            return Ok(());
+        }
+        let closed = engine.finish_followup_owners(deadline);
+        journal.capture_owner(&engine.followup_owner_snapshot());
+        closed.map(|_| ()).map_err(|_| {
+            ContractError::new(
+                ErrorCode::BackendFailure,
+                Stage::Output,
+                "actual archive owner close failed",
+            )
+        })
     }
     #[cfg(feature = "search-work-receipts")]
     pub fn seal_followup_lifecycle(
-        &self, native_fenced:bool, protocol_retired:bool,
-        warm:Option<crate::pals_attestation::followup::NativeCudaWarmObservationV4>,
-    )->Result<(),ContractError> {
-        let work=self.work.snapshot()?;
-        let checker_fenced=self.checker_lifecycle.try_lock().ok().and_then(|state|state.shutdown)
-            .is_some_and(|shutdown|shutdown.cleanup_complete && !shutdown.quarantined && !shutdown.ownership_lost);
-        let mut journal=self.followup.try_lock().map_err(|_|ContractError::new(
-            ErrorCode::BackendFailure,Stage::Output,"followup journal metadata unavailable"))?;
-        if protocol_retired && work.active_invocations==0 {journal.output_retired();}
+        &self,
+        native_fenced: bool,
+        protocol_retired: bool,
+        warm: Option<crate::pals_attestation::followup::NativeCudaWarmObservationV4>,
+    ) -> Result<(), ContractError> {
+        let work = self.work.snapshot()?;
+        let checker_fenced = self
+            .checker_lifecycle
+            .try_lock()
+            .ok()
+            .and_then(|state| state.shutdown)
+            .is_some_and(|shutdown| {
+                shutdown.cleanup_complete && !shutdown.quarantined && !shutdown.ownership_lost
+            });
+        let mut journal = self.followup.try_lock().map_err(|_| {
+            ContractError::new(
+                ErrorCode::BackendFailure,
+                Stage::Output,
+                "followup journal metadata unavailable",
+            )
+        })?;
+        if !self.followup_capture_complete.load(Ordering::Acquire) {
+            journal.incomplete(
+                crate::pals_attestation::followup::PalsCaptureFailureV4::CaptureIncomplete,
+            );
+        }
+        if protocol_retired && work.active_invocations == 0 {
+            journal.output_retired();
+        }
         journal.capture_warm(warm);
-        journal.seal(checker_fenced,native_fenced);
+        journal.seal(checker_fenced, native_fenced);
+        if journal
+            .lifecycle
+            .as_ref()
+            .is_some_and(|l| !l.capture_complete || !l.owner_shutdown_complete)
+        {
+            return Err(ContractError::new(
+                ErrorCode::BackendFailure,
+                Stage::Output,
+                "actual followup lifecycle capture or owner fence is incomplete",
+            ));
+        }
         Ok(())
     }
     pub fn selected_policies(
@@ -921,33 +1118,46 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> PalsSessionDriver<M> {
         };
         let result = engine.shutdown_checker(deadline);
         self.capture_checker(&engine)?;
+        // Preserve the actual checker fence even if independent archive close
+        // fails below. Neither error may erase an already returned owner fact.
+        {
+            let mut state = self
+                .checker_lifecycle
+                .lock()
+                .map_err(|_| checker_owner_unknown("PalsCheckerEvidence"))?;
+            state.shutdown = result.as_ref().ok().copied().or_else(|| {
+                state
+                    .last_attempt
+                    .as_ref()
+                    .and_then(|attempt| attempt.external.as_ref())
+                    .map(|attempt| attempt.process)
+            });
+        }
         #[cfg(feature = "search-work-receipts")]
         {
-            let mut journal=self.followup.lock().map_err(|_|checker_owner_unknown("PalsFollowupOwnerEvidence"))?;
+            let mut journal = self
+                .followup
+                .lock()
+                .map_err(|_| checker_owner_unknown("PalsFollowupOwnerEvidence"))?;
             if journal.enabled() {
-                if result.as_ref().is_ok_and(|s|s.cleanup_complete && !s.quarantined && !s.ownership_lost) {
-                    let closed=engine.finish_followup_owners(deadline);
+                if !journal.requires_native_fence()
+                    && result
+                        .as_ref()
+                        .is_ok_and(|s| s.cleanup_complete && !s.quarantined && !s.ownership_lost)
+                {
+                    let closed = engine.finish_followup_owners(deadline);
                     journal.capture_owner(&engine.followup_owner_snapshot());
-                    if let Err(error)=closed {
-                        journal.incomplete(crate::pals_attestation::followup::PalsCaptureFailureV4::OwnerUnknown);
-                        return Err(SearchSessionFailure::debug("PalsArchiveOwnerClose",&error));
+                    if let Err(error) = closed {
+                        journal.incomplete(
+                            crate::pals_attestation::followup::PalsCaptureFailureV4::OwnerUnknown,
+                        );
+                        return Err(SearchSessionFailure::debug("PalsArchiveOwnerClose", &error));
                     }
-                } else {journal.capture_owner(&engine.followup_owner_snapshot());}
+                } else {
+                    journal.capture_owner(&engine.followup_owner_snapshot());
+                }
             }
         }
-        let mut state = self
-            .checker_lifecycle
-            .lock()
-            .map_err(|_| checker_owner_unknown("PalsCheckerEvidence"))?;
-        // Only actual returned state or actual adapter evidence is retained.
-        // Absence of a startup attempt remains None, never fabricated shutdown.
-        state.shutdown = result.as_ref().ok().copied().or_else(|| {
-            state
-                .last_attempt
-                .as_ref()
-                .and_then(|attempt| attempt.external.as_ref())
-                .map(|attempt| attempt.process)
-        });
         match result {
             Ok(shutdown)
                 if shutdown.cleanup_complete
@@ -979,16 +1189,26 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> SearchSessionDriver for Pa
         self.work.snapshot().map(Some)
     }
     #[cfg(feature = "search-work-receipts")]
-    fn followup_lifecycle(&self)->Result<Option<crate::pals_attestation::followup::PalsFollowupLifecycleV4>,ContractError> {
+    fn followup_lifecycle(
+        &self,
+    ) -> Result<Option<crate::pals_attestation::followup::PalsFollowupLifecycleV4>, ContractError>
+    {
         PalsSessionDriver::followup_lifecycle(self)
     }
     #[cfg(feature = "search-work-receipts")]
-    fn seal_followup_lifecycle(&self,protocol_retired:bool)->Result<(),ContractError> {
-        PalsSessionDriver::seal_followup_lifecycle(self,true,protocol_retired,None)
+    fn seal_followup_lifecycle(&self, protocol_retired: bool) -> Result<(), ContractError> {
+        PalsSessionDriver::seal_followup_lifecycle(self, true, protocol_retired, None)
     }
-    fn accept_uci_output(&self,_authority:rz_contracts::pals::SearchAuthority,_bestmove:&str,_from_report:bool)->Result<(),ContractError> {
+    fn accept_uci_output(
+        &self,
+        _authority: rz_contracts::pals::SearchAuthority,
+        _bestmove: &str,
+        _from_report: bool,
+    ) -> Result<(), ContractError> {
         #[cfg(feature = "search-work-receipts")]
-        if let Ok(mut journal)=self.followup.try_lock() {journal.output_retired();}
+        if let Ok(mut journal) = self.followup.try_lock() {
+            journal.output_retired();
+        }
         Ok(())
     }
     fn pals_checker_registration(&self) -> Option<PalsCheckerRegistration> {
@@ -1065,7 +1285,9 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> SearchSessionDriver for Pa
         }
         match self.engine.try_lock() {
             Ok(mut engine) => {
-                if engine.archive_enabled() { return Ok(()); }
+                if engine.archive_enabled() {
+                    return Ok(());
+                }
                 engine.new_game();
                 self.reset_applied.fetch_max(requested, Ordering::AcqRel);
                 Ok(())
@@ -1183,6 +1405,13 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> SearchSessionDriver for Pa
                     &context.control.cancellation,
                 );
                 self.capture_checker(&engine)?;
+                #[cfg(feature = "search-work-receipts")]
+                if reset.is_err() {
+                    self.followup
+                        .lock()
+                        .map_err(|_| checker_owner_unknown("PalsFollowupResetEvidence"))?
+                        .capture_owner(&engine.followup_owner_snapshot());
+                }
                 reset.map_err(|error| pals_failure("PalsReset", &error, &engine))?;
                 // A failed reset stays unapplied. A newer concurrent request
                 // remains pending even when this older reset succeeds.
@@ -1208,11 +1437,20 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> SearchSessionDriver for Pa
                 &mut *progress,
             );
             #[cfg(feature = "search-work-receipts")]
-            if let Ok(mut journal)=self.followup.try_lock()
-                && journal.enabled()
-            {
-                if let Some(snapshot)=engine.last_followup_execution_snapshot() {journal.capture_search(snapshot);}
-                else {journal.incomplete(crate::pals_attestation::followup::PalsCaptureFailureV4::CaptureIncomplete);}
+            match self.followup.try_lock() {
+                Ok(mut journal) if journal.enabled() => {
+                    if let Some(snapshot) = engine.last_followup_execution_snapshot() {
+                        journal.capture_search(snapshot);
+                    } else {
+                        journal.incomplete(
+                            crate::pals_attestation::followup::PalsCaptureFailureV4::CaptureIncomplete,
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => self
+                    .followup_capture_complete
+                    .store(false, Ordering::Release),
             }
             if let Some(counters) = engine.last_search_counters() {
                 observation = AttemptObservation::Pals {
@@ -1582,9 +1820,16 @@ impl std::error::Error for SearchSessionFailure {}
 /// Progress is advisory: UCI checks its exact root legal set and authority.
 pub trait SearchSessionDriver: Send + Sync + 'static {
     #[cfg(feature = "search-work-receipts")]
-    fn followup_lifecycle(&self)->Result<Option<crate::pals_attestation::followup::PalsFollowupLifecycleV4>,ContractError> {Ok(None)}
+    fn followup_lifecycle(
+        &self,
+    ) -> Result<Option<crate::pals_attestation::followup::PalsFollowupLifecycleV4>, ContractError>
+    {
+        Ok(None)
+    }
     #[cfg(feature = "search-work-receipts")]
-    fn seal_followup_lifecycle(&self,_protocol_retired:bool)->Result<(),ContractError> {Ok(())}
+    fn seal_followup_lifecycle(&self, _protocol_retired: bool) -> Result<(), ContractError> {
+        Ok(())
+    }
     fn kind(&self) -> SearchKind;
     fn implementation(&self) -> Digest;
     fn identity(&self) -> EngineIdentity;

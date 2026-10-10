@@ -272,10 +272,13 @@ impl PalsReceiptWriter {
         Ok(())
     }
     pub fn set_followup_lifecycle(
-        &mut self, snapshot: Option<followup::PalsFollowupLifecycleV4>,
+        &mut self,
+        snapshot: Option<followup::PalsFollowupLifecycleV4>,
     ) -> Result<(), ProcessReceiptError> {
         if !self.v4 && snapshot.is_some() {
-            return Err(ProcessReceiptError::boundary("followup owner evidence requires the explicit V4 envelope"));
+            return Err(ProcessReceiptError::boundary(
+                "followup owner evidence requires the explicit V4 envelope",
+            ));
         }
         self.followup_lifecycle = snapshot;
         Ok(())
@@ -371,7 +374,14 @@ impl PalsReceiptWriter {
             crate::pals_native::validate_host_record_page_evidence(&native, true).map_err(|_| {
                 ProcessReceiptError::boundary("successful PALS host record pages require actual final snapshot, declared bounds and physical join evidence")
             })?;
-            crate::pals_native::validate_private_warm_evidence(&native, true).map_err(|_| {
+            let terminal = self
+                .followup_lifecycle
+                .as_ref()
+                .and_then(|lifecycle| match &lifecycle.cuda_warm {
+                    followup::NativeObservedV4::Observed { value, .. } => Some(value),
+                    followup::NativeObservedV4::Unknown => None,
+                });
+            crate::pals_native::validate_private_warm_evidence_with_terminal_scope(&native, true,terminal).map_err(|_| {
                 ProcessReceiptError::boundary("successful PALS private warm requires its actual capability, bounded seed ownership and known physical join")
             })?;
         }
@@ -672,10 +682,13 @@ impl SearchWorkReceiptWriter {
         })
     }
     pub fn set_followup_lifecycle(
-        &mut self, snapshot: Option<followup::PalsFollowupLifecycleV4>,
+        &mut self,
+        snapshot: Option<followup::PalsFollowupLifecycleV4>,
     ) -> Result<(), ProcessReceiptError> {
         if !self.v4 && snapshot.is_some() {
-            return Err(ProcessReceiptError::boundary("followup owner evidence requires the explicit V4 envelope"));
+            return Err(ProcessReceiptError::boundary(
+                "followup owner evidence requires the explicit V4 envelope",
+            ));
         }
         self.followup_lifecycle = snapshot;
         Ok(())
@@ -853,6 +866,7 @@ mod followup_tests {
         let own_cpu = serde_json::to_value(SearchWorkReceiptV4 {
             evidence: evidence.clone(),
             v4: None,
+            followup_lifecycle: None,
         })
         .unwrap();
         assert_eq!(own_cpu["schema_version"], 4);
@@ -860,6 +874,7 @@ mod followup_tests {
         let v4 = serde_json::to_value(SearchWorkReceiptV4 {
             evidence,
             v4: Some(PalsFollowupMarkerV4::capture_search(&driver).unwrap()),
+            followup_lifecycle: None,
         })
         .unwrap();
         assert_eq!(v4["schema_version"], 4);

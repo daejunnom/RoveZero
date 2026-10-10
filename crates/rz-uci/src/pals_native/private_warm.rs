@@ -143,11 +143,15 @@ pub(super) struct NativeWarmState {
     query_hits: AtomicU64,
     last_event: Mutex<Option<&'static str>>,
     last_revocation_failure: Mutex<Option<PrivateSeedError>>,
+    #[cfg(feature = "experimental-io-binding")]
     followup: Mutex<Option<NativeWarmBankObservation>>,
+    #[cfg(feature = "experimental-io-binding")]
+    followup_complete: AtomicBool,
 }
 
 /// Metadata of the selected CUDA producer. Counters are advanced only by the
 /// actual submitted-payload/Ready join, never by a prepared seed or callback.
+#[cfg(feature = "experimental-io-binding")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct NativeWarmBankObservation {
     pub owner_id: u64,
@@ -160,6 +164,7 @@ pub(super) struct NativeWarmBankObservation {
     pub closed: bool,
     pub complete: bool,
 }
+#[cfg(feature = "experimental-io-binding")]
 static FOLLOWUP_BANK_OWNERS: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -267,7 +272,10 @@ impl NativeWarmState {
             query_hits: AtomicU64::new(0),
             last_event: Mutex::new(None),
             last_revocation_failure: Mutex::new(None),
+            #[cfg(feature = "experimental-io-binding")]
             followup: Mutex::new(None),
+            #[cfg(feature = "experimental-io-binding")]
+            followup_complete: AtomicBool::new(true),
         }))
     }
     pub fn is_closed(&self) -> bool {
@@ -609,59 +617,174 @@ impl NativeWarmState {
             *event = Some(stage);
         }
     }
+    #[cfg(feature = "experimental-io-binding")]
     pub fn enable_followup_observations(&self) -> Result<(), RoleError> {
-        let mut slot = self.followup.try_lock().map_err(|_| RoleError::Unavailable)?;
-        if slot.is_some() { return Err(RoleError::InvalidOutput); }
-        let owner_id = FOLLOWUP_BANK_OWNERS.fetch_update(Ordering::AcqRel, Ordering::Acquire,
-            |value| value.checked_add(1)).map_err(|_| RoleError::Unavailable)?;
-        *slot = Some(NativeWarmBankObservation { owner_id,event_sequence:0,
-            accepted_seed_consumptions:0,accepted_seed_context_checked:0,rejected_seed_contexts:0,
-            fresh_value_evaluations:0,value_always_fresh:true,closed:false,complete:true });
+        let mut slot = self
+            .followup
+            .try_lock()
+            .map_err(|_| RoleError::Unavailable)?;
+        if slot.is_some() {
+            return Err(RoleError::InvalidOutput);
+        }
+        let owner_id = FOLLOWUP_BANK_OWNERS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| RoleError::Unavailable)?;
+        *slot = Some(NativeWarmBankObservation {
+            owner_id,
+            event_sequence: 0,
+            accepted_seed_consumptions: 0,
+            accepted_seed_context_checked: 0,
+            rejected_seed_contexts: 0,
+            fresh_value_evaluations: 0,
+            value_always_fresh: true,
+            closed: false,
+            complete: true,
+        });
         Ok(())
     }
+    #[cfg(feature = "experimental-io-binding")]
     pub fn followup_observation(&self) -> Option<NativeWarmBankObservation> {
-        self.followup.try_lock().ok().and_then(|slot| *slot)
+        match self.followup.try_lock() {
+            Ok(slot) => slot.map(|mut value| {
+                value.complete &= self.followup_complete.load(Ordering::Acquire);
+                value
+            }),
+            Err(_) => {
+                self.followup_complete.store(false, Ordering::Release);
+                None
+            }
+        }
     }
-    pub fn observe_ready_join(&self, invocation: PrivateInvocation, value: bool, private_completed: bool, exact: bool) {
-        let Ok(mut slot) = self.followup.try_lock() else { return; };
-        let Some(s) = slot.as_mut() else { return; };
-        let Some(sequence) = s.event_sequence.checked_add(1) else { s.complete=false;return; };
-        s.event_sequence=sequence;
-        if !exact { s.complete=false;return; }
-        if value && !matches!(invocation,PrivateInvocation::Fresh{..}) { s.value_always_fresh=false;s.complete=false; }
-        if !private_completed { return; }
-        let counter = if value {Some(&mut s.fresh_value_evaluations)}
-            else if matches!(invocation,PrivateInvocation::ApproxCudaWarmV2{..}) {Some(&mut s.accepted_seed_consumptions)}
-            else {None};
-        if let Some(counter)=counter {if let Some(next)=counter.checked_add(1){*counter=next;}else{s.complete=false;}}
+    #[cfg(feature = "experimental-io-binding")]
+    pub fn observe_join_incomplete(&self) {
+        self.followup_complete.store(false, Ordering::Release);
+    }
+    #[cfg(feature = "experimental-io-binding")]
+    pub fn observe_ready_join(
+        &self,
+        invocation: PrivateInvocation,
+        value: bool,
+        private_completed: bool,
+        exact: bool,
+    ) {
+        let Ok(mut slot) = self.followup.try_lock() else {
+            self.followup_complete.store(false, Ordering::Release);
+            return;
+        };
+        let Some(s) = slot.as_mut() else {
+            return;
+        };
+        let Some(sequence) = s.event_sequence.checked_add(1) else {
+            s.complete = false;
+            return;
+        };
+        s.event_sequence = sequence;
+        if !exact {
+            s.complete = false;
+            return;
+        }
+        if value && !matches!(invocation, PrivateInvocation::Fresh { .. }) {
+            s.value_always_fresh = false;
+            s.complete = false;
+        }
+        if !private_completed {
+            return;
+        }
+        let counter = if value {
+            Some(&mut s.fresh_value_evaluations)
+        } else if matches!(invocation, PrivateInvocation::ApproxCudaWarmV2 { .. }) {
+            Some(&mut s.accepted_seed_consumptions)
+        } else {
+            None
+        };
+        if let Some(counter) = counter {
+            if let Some(next) = counter.checked_add(1) {
+                *counter = next;
+            } else {
+                s.complete = false;
+            }
+        }
         // Every admitted Approx payload reached bind_lease with the actual
         // model/role/question/Rules seal. The exact Ready join retains it.
-        if !value && matches!(invocation,PrivateInvocation::ApproxCudaWarmV2{..}) {
-            if let Some(next)=s.accepted_seed_context_checked.checked_add(1){s.accepted_seed_context_checked=next;}else{s.complete=false;}
+        if !value && matches!(invocation, PrivateInvocation::ApproxCudaWarmV2 { .. }) {
+            if let Some(next) = s.accepted_seed_context_checked.checked_add(1) {
+                s.accepted_seed_context_checked = next;
+            } else {
+                s.complete = false;
+            }
         }
     }
     pub fn observe_context_rejection(&self) {
-        if let Ok(mut slot)=self.followup.try_lock() && let Some(s)=slot.as_mut() {
-            match (s.event_sequence.checked_add(1),s.rejected_seed_contexts.checked_add(1)) {
-                (Some(sequence),Some(count))=>{s.event_sequence=sequence;s.rejected_seed_contexts=count;}
-                _=>s.complete=false,
+        #[cfg(feature = "experimental-io-binding")]
+        {
+            let Ok(mut slot) = self.followup.try_lock() else {
+                self.followup_complete.store(false, Ordering::Release);
+                return;
+            };
+            if let Some(s) = slot.as_mut() {
+                match (
+                    s.event_sequence.checked_add(1),
+                    s.rejected_seed_contexts.checked_add(1),
+                ) {
+                    (Some(sequence), Some(count)) => {
+                        s.event_sequence = sequence;
+                        s.rejected_seed_contexts = count;
+                    }
+                    _ => s.complete = false,
+                }
             }
         }
     }
     /// Caller must have joined the actual worker after a known physical fence.
     /// Same-game terminal closure does not advance the seed namespace.
+    #[cfg(feature = "experimental-io-binding")]
     pub fn close_after_known_fence(&self) -> Result<(), RoleError> {
-        self.closed.store(true,Ordering::Release);
+        let result = self.close_same_game_bank();
+        if result.is_err() {
+            self.followup_complete.store(false, Ordering::Release);
+        }
+        result
+    }
+    #[cfg(feature = "experimental-io-binding")]
+    fn close_same_game_bank(&self) -> Result<(), RoleError> {
+        self.closed.store(true, Ordering::Release);
         if self.is_quarantined()
-            || self.retained.try_lock().map_err(|_|RoleError::Unavailable)?.is_some()
-            || self.pending.try_lock().map_err(|_|RoleError::Unavailable)?.is_some() {
+            || self
+                .retained
+                .try_lock()
+                .map_err(|_| RoleError::Unavailable)?
+                .is_some()
+            || self
+                .pending
+                .try_lock()
+                .map_err(|_| RoleError::Unavailable)?
+                .is_some()
+        {
             return Err(RoleError::PhysicalCompletionUnknown);
         }
         self.bank.close_after_known_fence().map_err(private_error)?;
-        for role in self.frozen.try_lock().map_err(|_|RoleError::Unavailable)?.iter_mut() {role.clear();}
-        let mut slot=self.followup.try_lock().map_err(|_|RoleError::Unavailable)?;
-        if let Some(s)=slot.as_mut() {
-            if let Some(next)=s.event_sequence.checked_add(1){s.event_sequence=next;s.closed=true;}else{s.complete=false;return Err(RoleError::Unavailable);}
+        for role in self
+            .frozen
+            .try_lock()
+            .map_err(|_| RoleError::Unavailable)?
+            .iter_mut()
+        {
+            role.clear();
+        }
+        let mut slot = self
+            .followup
+            .try_lock()
+            .map_err(|_| RoleError::Unavailable)?;
+        if let Some(s) = slot.as_mut() {
+            if let Some(next) = s.event_sequence.checked_add(1) {
+                s.event_sequence = next;
+                s.closed = true;
+            } else {
+                s.complete = false;
+                return Err(RoleError::Unavailable);
+            }
         }
         Ok(())
     }
@@ -864,6 +987,83 @@ mod tests {
         let legacy = state();
         NativeWarmState::new_cuda(legacy.model, 0, PalsModelConfig::full_line_interaction_v2())
             .unwrap()
+    }
+    #[cfg(feature = "experimental-io-binding")]
+    #[test]
+    fn cuda_observation_contention_is_sticky_without_closing_model_admission() {
+        for ready in [false, true] {
+            let core = cuda_state();
+            core.enable_followup_observations().unwrap();
+            let guard = core.followup.lock().unwrap();
+            if ready {
+                core.observe_ready_join(
+                    PrivateInvocation::Fresh { input_key: [8; 32] },
+                    true,
+                    true,
+                    true,
+                );
+            } else {
+                core.observe_context_rejection();
+            }
+            drop(guard);
+            let observation = core.followup_observation().unwrap();
+            assert!(!observation.complete);
+            assert_eq!(observation.event_sequence, 0);
+            assert_eq!(observation.fresh_value_evaluations, 0);
+            assert_eq!(observation.rejected_seed_contexts, 0);
+            assert!(!core.is_closed());
+            core.observe_ready_join(
+                PrivateInvocation::Fresh { input_key: [8; 32] },
+                true,
+                true,
+                true,
+            );
+            assert!(!core.followup_observation().unwrap().complete);
+        }
+    }
+    #[cfg(feature = "experimental-io-binding")]
+    #[test]
+    fn cuda_same_game_close_clears_only_fenced_accepted_seeds() {
+        let core = cuda_state();
+        core.enable_followup_observations().unwrap();
+        let position = Position::startpos();
+        let control = AtomicBool::new(false);
+        let until = Instant::now() + Duration::from_secs(30);
+        let logical = context(PalsRole::Proposer);
+        let physical = core
+            .begin(prepared(&core, &position, &logical, 1, &control, until))
+            .unwrap();
+        core.completed(physical, Some(&latent())).unwrap();
+        accept(&core, &position, &logical, 1, &control, until).unwrap();
+        let before = core.snapshot().unwrap();
+        assert_eq!(before.entries_per_role[0], 1);
+        core.close_after_known_fence().unwrap();
+        let after = core.snapshot().unwrap();
+        assert_eq!(after.game_generation, before.game_generation);
+        assert_eq!(after.accepted_seeds, before.accepted_seeds);
+        assert_eq!(after.known_seed_completions, before.known_seed_completions);
+        assert_eq!(after.entries_per_role, [0; 3]);
+        assert_eq!(after.pinned_entries, 0);
+        assert!(!after.pending_acceptance && !after.retained_prepared_input);
+        let observation = core.followup_observation().unwrap();
+        assert!(observation.closed && observation.complete && after.admission_closed);
+
+        let pending = cuda_state();
+        pending.enable_followup_observations().unwrap();
+        let physical = pending
+            .begin(prepared(&pending, &position, &logical, 2, &control, until))
+            .unwrap();
+        pending.completed(physical, Some(&latent())).unwrap();
+        let before = pending.snapshot().unwrap();
+        assert!(matches!(
+            pending.close_after_known_fence(),
+            Err(RoleError::PhysicalCompletionUnknown)
+        ));
+        let after = pending.snapshot().unwrap();
+        assert!(after.pending_acceptance && after.admission_closed);
+        assert_eq!(after.provisional_bytes, before.provisional_bytes);
+        assert_eq!(after.game_generation, before.game_generation);
+        assert!(!pending.followup_observation().unwrap().complete);
     }
     #[cfg(feature = "experimental-io-binding")]
     #[test]

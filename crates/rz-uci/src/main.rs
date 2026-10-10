@@ -105,12 +105,32 @@ fn run_pals(
     let mut arena_wire = None;
     let mut archive_root = None;
     let mut archive_repository = None;
+    let mut archive_limits = PalsArchiveLimitOptions::default();
     let mut native = PalsNativeOptions::default();
     for argument in arguments {
+        if archive_limits.take(&argument)? {
+            continue;
+        }
         if native.cuda_record_pages.take(&argument)? {
             continue;
         }
-        if let Some(value) = argument.strip_prefix("--pals-model=") {
+        if let Some(value) = argument.strip_prefix("--pals-cuda-warm-max-leases=") {
+            if native
+                .cuda_warm_max_leases
+                .replace(value.parse()?)
+                .is_some()
+            {
+                return Err("duplicate CUDA Warm lease bound".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-cuda-warm-device-bytes-max=") {
+            if native
+                .cuda_warm_device_bytes_max
+                .replace(value.parse()?)
+                .is_some()
+            {
+                return Err("duplicate CUDA Warm owned-payload byte bound".into());
+            }
+        } else if let Some(value) = argument.strip_prefix("--pals-model=") {
             if model.replace(value.to_owned()).is_some() {
                 return Err("duplicate PALS model".into());
             }
@@ -353,7 +373,8 @@ fn run_pals(
         return Err("PALS explicit native CPU resume policy requires an owned checker; no foreign helper was started".into());
     }
     let v4 = pals_arena_wire_v4(arena_wire.as_deref())?;
-    let archive = pals_archive_config(archive_root, archive_repository)?;
+    let archive = pals_archive_selection(archive_root, archive_repository, archive_limits, v4)?;
+    native.validate_warm_observation_selection(v4)?;
     let cuda_record_pages =
         native
             .cuda_record_pages
@@ -414,6 +435,18 @@ fn run_pals(
     {
         return Err("model WDL policies require a frozen ONNX value endpoint; the legal-order mock has no model value".into());
     }
+    let archive_startup_deadline = match archive.as_ref().and_then(|archive| archive.runtime_limits)
+    {
+        Some(limits) => Some(
+            std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(
+                    limits.load_deadline_max_ms,
+                ))
+                .ok_or("PALS archive startup deadline outside finite clock domain")?,
+        ),
+        None => None,
+    };
+    let archive_startup_cancel = std::sync::atomic::AtomicBool::new(false);
     let driver = Arc::new(
         if !v4
             && selected_resume == rz_search::cpu::CpuResumePolicy::CompletedIteration
@@ -455,7 +488,18 @@ fn run_pals(
         },
     );
     if let Some(archive) = archive {
-        driver.enable_archive(archive)?;
+        driver.enable_archive(archive.config)?;
+        if let Some(limits) = archive.runtime_limits {
+            driver.set_archive_runtime_limits(limits)?;
+            driver.observe_archive_startup(
+                archive_startup_deadline.ok_or("PALS archive startup deadline missing")?,
+                &archive_startup_cancel,
+            )?;
+        }
+    }
+    #[cfg(feature = "search-work-receipts")]
+    if v4 {
+        driver.enable_followup_execution(None, None)?;
     }
     let work_receipts = if v4 {
         Some(
@@ -558,6 +602,131 @@ fn pals_archive_config(
 }
 
 #[derive(Default)]
+struct PalsArchiveLimitOptions {
+    game: Option<u64>,
+    global: Option<u64>,
+    index_entries: Option<u64>,
+    index_bytes: Option<u64>,
+    load_bytes: Option<u64>,
+    load_ms: Option<u64>,
+}
+impl PalsArchiveLimitOptions {
+    fn take(&mut self, argument: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        for (prefix, slot) in [
+            ("--pals-archive-game-bytes-max=", &mut self.game),
+            ("--pals-archive-global-bytes-max=", &mut self.global),
+            ("--pals-archive-index-entries-max=", &mut self.index_entries),
+            ("--pals-archive-index-bytes-max=", &mut self.index_bytes),
+            ("--pals-archive-load-bytes-max=", &mut self.load_bytes),
+            ("--pals-archive-load-deadline-max-ms=", &mut self.load_ms),
+        ] {
+            if let Some(value) = argument.strip_prefix(prefix) {
+                if slot.replace(value.parse()?).is_some() {
+                    return Err("duplicate archive runtime bound".into());
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    fn any(&self) -> bool {
+        [
+            self.game,
+            self.global,
+            self.index_entries,
+            self.index_bytes,
+            self.load_bytes,
+            self.load_ms,
+        ]
+        .iter()
+        .any(Option::is_some)
+    }
+}
+struct PalsArchiveSelection {
+    config: rz_search::pals::store::ArchiveConfig,
+    runtime_limits: Option<rz_search::pals::store::ArchiveRuntimeLimits>,
+}
+fn pals_archive_selection(
+    root: Option<String>,
+    repository: Option<String>,
+    limits: PalsArchiveLimitOptions,
+    v4: bool,
+) -> Result<Option<PalsArchiveSelection>, Box<dyn std::error::Error>> {
+    if !v4 {
+        if limits.any() {
+            return Err("archive runtime bounds require explicit V4 wire".into());
+        }
+        return Ok(
+            pals_archive_config(root, repository)?.map(|config| PalsArchiveSelection {
+                config,
+                runtime_limits: None,
+            }),
+        );
+    }
+    if root.is_none() && repository.is_none() && !limits.any() {
+        return Ok(None);
+    }
+    let [
+        Some(game),
+        Some(global),
+        Some(entries),
+        Some(index),
+        Some(load),
+        Some(ms),
+    ] = [
+        limits.game,
+        limits.global,
+        limits.index_entries,
+        limits.index_bytes,
+        limits.load_bytes,
+        limits.load_ms,
+    ]
+    else {
+        return Err(
+            "V4 archive requires all six explicit runtime bounds and both absolute roots".into(),
+        );
+    };
+    let (Some(root), Some(repository)) = (root, repository) else {
+        return Err("V4 archive requires both absolute roots".into());
+    };
+    let root = std::path::PathBuf::from(root);
+    let repository = std::path::PathBuf::from(repository);
+    if !root.is_absolute()
+        || !repository.is_absolute()
+        || game == 0
+        || game > 256 * 1024 * 1024
+        || global < game
+        || global > 4 * 1024 * 1024 * 1024
+        || entries == 0
+        || entries > u32::MAX as u64
+        || index == 0
+        || index > 16 * 1024 * 1024
+        || load == 0
+        || load > game.min(16 * 1024 * 1024)
+        || ms == 0
+        || ms > 180_000
+    {
+        return Err("V4 archive runtime bounds are outside the actual owner contract".into());
+    }
+    let config =
+        rz_search::pals::store::ArchiveConfig::with_quotas(root, repository, game, global)?;
+    let runtime_limits = rz_search::pals::store::ArchiveRuntimeLimits {
+        game_bytes_max: game,
+        global_bytes_max: global,
+        index_entries_max: u32::try_from(entries)?,
+        index_bytes_max: index,
+        load_bytes_max: load,
+        load_deadline_max_ms: ms,
+        record_payload_bytes_max: config.record_bytes,
+        max_load_pins: u32::try_from(config.max_load_pins)?,
+    };
+    Ok(Some(PalsArchiveSelection {
+        config,
+        runtime_limits: Some(runtime_limits),
+    }))
+}
+
+#[derive(Default)]
 struct PalsNativeOptions {
     model_profile: Option<String>,
     checker: PalsCheckerOptions,
@@ -577,6 +746,8 @@ struct PalsNativeOptions {
     host_record_pages: Option<bool>,
     private_warm: Option<bool>,
     cuda_private_warm: Option<bool>,
+    cuda_warm_max_leases: Option<u32>,
+    cuda_warm_device_bytes_max: Option<u64>,
     device_public_memory: Option<bool>,
     cuda_control_mode: Option<String>,
     cuda_control_inventory: Option<String>,
@@ -1399,6 +1570,30 @@ mod pals_checker_option_tests {
     }
 }
 impl PalsNativeOptions {
+    fn validate_warm_observation_selection(
+        &self,
+        v4: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let selected = self.cuda_private_warm.unwrap_or(false);
+        match (self.cuda_warm_max_leases,self.cuda_warm_device_bytes_max) {
+            (None,None) if !v4 || !selected=>Ok(()),
+            (Some(1),Some(bytes)) if bytes>0 && v4 && selected=>Ok(()),
+            _=>Err("V4 CUDA Warm requires both explicit observation bounds (one lease and positive owned device bytes); bounds are forbidden when the lane is disabled".into()),
+        }
+    }
+    #[cfg(feature = "onnx-cpu")]
+    fn warm_observation_limits(
+        &self,
+    ) -> Option<rz_uci::pals_native::NativeCudaWarmObservationLimits> {
+        self.cuda_warm_max_leases
+            .zip(self.cuda_warm_device_bytes_max)
+            .map(|(max_leases, device_bytes_max)| {
+                rz_uci::pals_native::NativeCudaWarmObservationLimits {
+                    max_leases,
+                    device_bytes_max,
+                }
+            })
+    }
     fn any(&self) -> bool {
         self.model_profile.is_some()
             || self.manifest.is_some()
@@ -1418,6 +1613,8 @@ impl PalsNativeOptions {
             || self.host_record_pages.is_some()
             || self.private_warm.is_some()
             || self.cuda_private_warm.is_some()
+            || self.cuda_warm_max_leases.is_some()
+            || self.cuda_warm_device_bytes_max.is_some()
             || self.cuda_control_mode.is_some()
             || self.cuda_control_inventory.is_some()
             || self.cuda_control_inventory_hash.is_some()
@@ -1444,7 +1641,7 @@ fn run_native_pals(
     _resume_policy: rz_search::cpu::CpuResumePolicy,
     _explicit_resolver: bool,
     _v4: bool,
-    _archive: Option<rz_search::pals::store::ArchiveConfig>,
+    _archive: Option<PalsArchiveSelection>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "PALS ONNX startup requires feature onnx-cpu; no provider or model fallback was started"
@@ -1466,7 +1663,7 @@ fn run_native_pals(
     resume_policy: rz_search::cpu::CpuResumePolicy,
     explicit_resolver: bool,
     v4: bool,
-    archive: Option<rz_search::pals::store::ArchiveConfig>,
+    archive: Option<PalsArchiveSelection>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // PALS owns a distinct manifest and tensors. LC0 NativeConfig and its
     // attestation cannot authorize or describe this model.
@@ -1726,7 +1923,7 @@ fn run_native_pals(
                 }
                 None => rz_eval::onnx::OrtRuntime::load(&pin)?,
             };
-            rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_private_warm_with_options(&manifest, &manifest_hash, runtime, backend_config, owner_options, Some((policy, profile.as_path())))?
+            rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_private_warm_and_observations(&manifest, &manifest_hash, runtime, backend_config, owner_options, Some((policy, profile.as_path())),native.warm_observation_limits())?
         }
         Some((policy, profile)) => {
             let runtime = match loading_profile {
@@ -1768,7 +1965,7 @@ fn run_native_pals(
         #[cfg(feature = "experimental-io-binding")]
         None if cuda_warm => {
             let runtime = rz_eval::onnx::OrtRuntime::load(&pin)?;
-            rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_private_warm_with_options(&manifest, &manifest_hash, runtime, backend_config, owner_options, None)?
+            rz_uci::pals_native::NativeRoleModel::load_with_runtime_and_cuda_private_warm_and_observations(&manifest, &manifest_hash, runtime, backend_config, owner_options, None,native.warm_observation_limits())?
         }
         None => rz_uci::pals_native::NativeRoleModel::load_pinned_with_options(
             &manifest,
@@ -1780,15 +1977,33 @@ fn run_native_pals(
     };
     let model_loading_elapsed = model_loading_started.elapsed();
     let finish = model.finish_handle();
+    let mut original_startup_deadline = None;
+    let archive_startup_cancel = std::sync::atomic::AtomicBool::new(false);
     let startup = (|| {
         if model.model_config().profile != expected_profile {
             return Err(rz_search::pals::engine::RoleError::Backend(
                 "loaded PALS model profile differs from explicit/default selection".into(),
             ));
         }
+        if v4
+            && (archive.is_some()
+                || resume_policy == rz_search::cpu::CpuResumePolicy::PausedStack
+                || refinement_policy.uses_frozen_model_wdl()
+                || cuda_warm)
+        {
+            model.enable_followup_execution_evidence()?;
+        }
         let budget = model.configure_startup_probe_timeout(native.startup_probe_timeout_ms)?;
         model.observe_startup_loading(model_loading_elapsed)?;
-        model.prepare_startup(std::time::Instant::now() + budget)
+        let deadline = std::time::Instant::now()
+            .checked_add(budget)
+            .ok_or_else(|| {
+                rz_search::pals::engine::RoleError::Backend(
+                    "PALS startup deadline outside finite clock domain".into(),
+                )
+            })?;
+        original_startup_deadline = Some(deadline);
+        model.prepare_startup(deadline)
     })();
     if let Err(primary) = startup {
         let mut publication = None;
@@ -1821,6 +2036,7 @@ fn run_native_pals(
             primary: Some(Box::new(primary)),
             cleanup,
             checker_cleanup: None,
+            followup_cleanup: None,
             checker_observation: None,
             publication,
             work_observation: None,
@@ -1897,7 +2113,30 @@ fn run_native_pals(
     };
     let (driver, followup) = match constructed.and_then(|driver| {
         if let Some(archive) = archive {
-            driver.enable_archive(archive)?;
+            driver.enable_archive(archive.config)?;
+            if let Some(limits) = archive.runtime_limits {
+                driver.set_archive_runtime_limits(limits)?;
+                driver.observe_archive_startup(
+                    original_startup_deadline.ok_or_else(|| {
+                        rz_uci::search_driver::SearchSessionFailure {
+                            physical_completion:
+                                rz_uci::search_driver::DriverPhysicalCompletion::Confirmed,
+                            code: "PalsArchiveStartup",
+                            detail: "original startup deadline missing".into(),
+                        }
+                    })?,
+                    &archive_startup_cancel,
+                )?;
+            }
+        }
+        if v4 {
+            #[cfg(feature = "experimental-io-binding")]
+            let cuda_owner =
+                cuda_warm.then(rz_eval::pals_onnx::cuda_private_warm_implementation_digest);
+            #[cfg(not(feature = "experimental-io-binding"))]
+            let cuda_owner = None;
+            driver.enable_followup_execution(Some(finish.receipt().process_epoch), cuda_owner)?;
+            driver.capture_warm_followup(finish.cuda_warm_followup_observation())?;
         }
         let followup = if v4 {
             Some(
@@ -1920,6 +2159,7 @@ fn run_native_pals(
                 primary: Some(Box::new(primary)),
                 cleanup,
                 checker_cleanup: None,
+                followup_cleanup: None,
                 checker_observation: None,
                 publication: None,
                 work_observation: None,
@@ -1935,11 +2175,9 @@ fn run_native_pals(
         if let Err(primary) = startup {
             // Both owners are attempted independently. A failed helper start is
             // not a Native startup failure and does not invent a ready helper.
-            let (checker_cleanup, cleanup) = finish_pals_owners_within(
-                settings.shutdown_limit,
-                |until| driver.finish_checker(until).err(),
-                |until| finish.finish(until).err(),
-            );
+            let startup_lifecycle = driver.followup_lifecycle();
+            let (checker_cleanup, cleanup, followup_cleanup) =
+                finish_failed_pals_owners(&driver, &finish, settings.shutdown_limit, v4);
             let observed_work = driver.work_receipt();
             let observed_checker =
                 rz_uci::pals_attestation::checker::PalsCheckerProcessReceipt::observe(
@@ -1961,10 +2199,14 @@ fn run_native_pals(
                     if let Ok(evidence) = &observed_checker {
                         writer.observe_checker(evidence.clone())?;
                     }
+                    writer.set_followup_lifecycle(
+                        startup_lifecycle.as_ref().ok().cloned().flatten(),
+                    )?;
                     writer.startup(
                         finish.receipt(),
                         observed_work.as_ref().ok().cloned().flatten(),
                     )?;
+                    writer.set_followup_lifecycle(driver.followup_lifecycle().ok().flatten())?;
                     writer.termination(
                         finish.receipt(),
                         false,
@@ -1977,6 +2219,7 @@ fn run_native_pals(
                 primary: Some(Box::new(primary)),
                 cleanup,
                 checker_cleanup,
+                followup_cleanup,
                 checker_observation: observed_checker.err(),
                 publication,
                 work_observation: observed_work.err(),
@@ -1996,15 +2239,13 @@ fn run_native_pals(
     let startup_checker = match startup_checker {
         Ok(evidence) => evidence,
         Err(checker_observation) => {
-            let (checker_cleanup, cleanup) = finish_pals_owners_within(
-                settings.shutdown_limit,
-                |until| driver.finish_checker(until).err(),
-                |until| finish.finish(until).err(),
-            );
+            let (checker_cleanup, cleanup, followup_cleanup) =
+                finish_failed_pals_owners(&driver, &finish, settings.shutdown_limit, v4);
             return Err(Box::new(PalsFinishError {
                 primary: None,
                 cleanup,
                 checker_cleanup,
+                followup_cleanup,
                 checker_observation: Some(checker_observation),
                 publication: None,
                 work_observation: None,
@@ -2014,15 +2255,29 @@ fn run_native_pals(
     let startup_work = match driver.work_receipt() {
         Ok(work) => work,
         Err(work_observation) => {
-            let (checker_cleanup, cleanup) = finish_pals_owners_within(
-                settings.shutdown_limit,
-                |until| driver.finish_checker(until).err(),
-                |until| finish.finish(until).err(),
-            );
+            let (checker_cleanup, cleanup, followup_cleanup) =
+                finish_failed_pals_owners(&driver, &finish, settings.shutdown_limit, v4);
             return Err(Box::new(PalsFinishError {
                 primary: None,
                 cleanup,
                 checker_cleanup,
+                followup_cleanup,
+                checker_observation: None,
+                publication: None,
+                work_observation: Some(work_observation),
+            }));
+        }
+    };
+    let startup_lifecycle = match driver.followup_lifecycle() {
+        Ok(value) => value,
+        Err(work_observation) => {
+            let (checker_cleanup, cleanup, followup_cleanup) =
+                finish_failed_pals_owners(&driver, &finish, settings.shutdown_limit, v4);
+            return Err(Box::new(PalsFinishError {
+                primary: None,
+                cleanup,
+                checker_cleanup,
+                followup_cleanup,
                 checker_observation: None,
                 publication: None,
                 work_observation: Some(work_observation),
@@ -2041,6 +2296,7 @@ fn run_native_pals(
             );
             match opened {
                 Ok(mut writer) => match (|| {
+                    writer.set_followup_lifecycle(startup_lifecycle.clone())?;
                     if let Some(evidence) = startup_checker.as_ref() {
                         writer.observe_checker(evidence.clone())?;
                     }
@@ -2048,15 +2304,18 @@ fn run_native_pals(
                 })() {
                     Ok(()) => Some(writer),
                     Err(publication) => {
-                        let (checker_cleanup, cleanup) = finish_pals_owners_within(
-                            settings.shutdown_limit,
-                            |until| driver.finish_checker(until).err(),
-                            |until| finish.finish(until).err(),
-                        );
+                        let (checker_cleanup, cleanup, followup_cleanup) =
+                            finish_failed_pals_owners(
+                                &driver,
+                                &finish,
+                                settings.shutdown_limit,
+                                v4,
+                            );
                         return Err(Box::new(PalsFinishError {
                             primary: None,
                             cleanup,
                             checker_cleanup,
+                            followup_cleanup,
                             checker_observation: None,
                             publication: Some(publication),
                             work_observation: None,
@@ -2064,15 +2323,13 @@ fn run_native_pals(
                     }
                 },
                 Err(publication) => {
-                    let (checker_cleanup, cleanup) = finish_pals_owners_within(
-                        settings.shutdown_limit,
-                        |until| driver.finish_checker(until).err(),
-                        |until| finish.finish(until).err(),
-                    );
+                    let (checker_cleanup, cleanup, followup_cleanup) =
+                        finish_failed_pals_owners(&driver, &finish, settings.shutdown_limit, v4);
                     return Err(Box::new(PalsFinishError {
                         primary: None,
                         cleanup,
                         checker_cleanup,
+                        followup_cleanup,
                         checker_observation: None,
                         publication: Some(publication),
                         work_observation: None,
@@ -2086,11 +2343,37 @@ fn run_native_pals(
     let clock = ProcessClock::new(ProcessEpoch(1));
     let process = EngineProcess::with_search_driver(driver.clone(), owners, clock);
     let served = serve_process(process, settings);
-    let (checker_finished, finished) = finish_pals_owners_within(
-        settings.shutdown_limit,
+    let owner_until = std::time::Instant::now() + settings.shutdown_limit;
+    let (checker_finished, finished) = finish_pals_owners_before(
+        owner_until,
         |until| driver.finish_checker(until),
         |until| finish.finish(until),
     );
+    let native_final = finish.receipt();
+    let native_fenced = finished.is_ok()
+        && native_final.physical_shutdown_confirmed
+        && native_final.physical_runs_in_flight == 0
+        && !native_final.quarantined;
+    let mut followup_failure = if v4 {
+        driver
+            .finish_followup_owners(owner_until, native_fenced)
+            .err()
+    } else {
+        None
+    };
+    if v4 {
+        followup_failure = followup_failure.or(driver
+            .seal_followup_lifecycle(
+                native_fenced,
+                served.is_ok(),
+                finish.cuda_warm_followup_observation(),
+            )
+            .err());
+    }
+    let lifecycle = driver.followup_lifecycle();
+    if let Err(error) = &lifecycle {
+        followup_failure.get_or_insert(error.clone());
+    }
     let observed_work = driver.work_receipt();
     let observed_checker = checker_profile
         .as_ref()
@@ -2103,6 +2386,11 @@ fn run_native_pals(
         })
         .transpose();
     let publication = receipts.as_mut().and_then(|writer| {
+        if let Err(error) =
+            writer.set_followup_lifecycle(lifecycle.as_ref().ok().cloned().flatten())
+        {
+            return Some(error);
+        }
         if let Ok(Some(evidence)) = &observed_checker {
             if let Err(error) = writer.observe_checker(evidence.clone()) {
                 return Some(error);
@@ -2114,6 +2402,7 @@ fn run_native_pals(
                 served.is_ok()
                     && finished.is_ok()
                     && checker_finished.is_ok()
+                    && followup_failure.is_none()
                     && observed_work.is_ok()
                     && observed_checker.is_ok(),
                 observed_work.as_ref().ok().cloned().flatten(),
@@ -2124,6 +2413,7 @@ fn run_native_pals(
         || observed_work.is_err()
         || checker_finished.is_err()
         || observed_checker.is_err()
+        || followup_failure.is_some()
     {
         return Err(Box::new(PalsFinishError {
             primary: served
@@ -2134,6 +2424,7 @@ fn run_native_pals(
             checker_observation: observed_checker.err(),
             publication,
             work_observation: observed_work.err(),
+            followup_cleanup: followup_failure,
         }));
     }
     match (served, finished) {
@@ -2161,6 +2452,7 @@ fn run_native_pals(
                 .map(|error| Box::new(error) as Box<dyn std::error::Error>),
             cleanup: Some(cleanup),
             checker_cleanup: None,
+            followup_cleanup: None,
             checker_observation: None,
             publication: None,
             work_observation: None,
@@ -2199,9 +2491,59 @@ fn finish_pals_owners_within<C, N>(
 ) -> (C, N) {
     let now = std::time::Instant::now();
     let until = now.checked_add(limit).unwrap_or(now);
+    finish_pals_owners_before(until, checker, native)
+}
+#[cfg(any(feature = "onnx-cpu", test))]
+fn finish_pals_owners_before<C, N>(
+    until: std::time::Instant,
+    checker: impl FnOnce(std::time::Instant) -> C,
+    native: impl FnOnce(std::time::Instant) -> N,
+) -> (C, N) {
     let checker_result = checker(until);
     let native_result = native(until);
     (checker_result, native_result)
+}
+
+/// Startup/publication failures still close the same actual owners. Keep the
+/// independent followup failure alongside the original failure, and retain an
+/// incomplete lifecycle when protocol output was never retired.
+#[cfg(feature = "onnx-cpu")]
+fn finish_failed_pals_owners(
+    driver: &rz_uci::search_driver::PalsSessionDriver<rz_uci::pals_native::NativeRoleModel>,
+    finish: &rz_uci::pals_native::NativeRoleFinishHandle,
+    limit: Duration,
+    v4: bool,
+) -> (
+    Option<rz_uci::search_driver::SearchSessionFailure>,
+    Option<rz_search::pals::engine::RoleError>,
+    Option<rz_contracts::ContractError>,
+) {
+    let now = std::time::Instant::now();
+    let until = now.checked_add(limit).unwrap_or(now);
+    let (checker, native) = finish_pals_owners_before(
+        until,
+        |deadline| driver.finish_checker(deadline),
+        |deadline| finish.finish(deadline),
+    );
+    let receipt = finish.receipt();
+    let native_fenced = native.is_ok()
+        && receipt.physical_shutdown_confirmed
+        && receipt.physical_runs_in_flight == 0
+        && !receipt.quarantined;
+    let followup = if v4 {
+        let closed = driver.finish_followup_owners(until, native_fenced).err();
+        let sealed = driver
+            .seal_followup_lifecycle(
+                native_fenced,
+                false,
+                finish.cuda_warm_followup_observation(),
+            )
+            .err();
+        closed.or(sealed)
+    } else {
+        None
+    };
+    (checker.err(), native.err(), followup)
 }
 
 #[cfg(feature = "onnx-cpu")]
@@ -2383,6 +2725,7 @@ struct PalsFinishError {
     primary: Option<Box<dyn std::error::Error>>,
     cleanup: Option<rz_search::pals::engine::RoleError>,
     checker_cleanup: Option<rz_uci::search_driver::SearchSessionFailure>,
+    followup_cleanup: Option<rz_contracts::ContractError>,
     checker_observation: Option<rz_uci::search_driver::SearchSessionFailure>,
     publication: Option<rz_uci::process_receipts::ProcessReceiptError>,
     work_observation: Option<rz_contracts::ContractError>,
@@ -2398,6 +2741,9 @@ impl std::fmt::Display for PalsFinishError {
         }
         if let Some(cleanup) = &self.checker_cleanup {
             write!(formatter, "PALS CPU helper shutdown failed: {cleanup}; ")?;
+        }
+        if let Some(cleanup) = &self.followup_cleanup {
+            write!(formatter, "PALS followup cleanup failed: {cleanup}; ")?;
         }
         if let Some(observation) = &self.checker_observation {
             write!(
@@ -2595,6 +2941,7 @@ fn serve_search_process(
                     &receipt.launch_sha256,
                 )?,
             };
+            writer.set_followup_lifecycle(driver.followup_lifecycle()?)?;
             writer.startup(driver.work_receipt()?)?;
             Some(writer)
         }
@@ -2613,15 +2960,29 @@ fn serve_search_process(
     #[cfg(feature = "search-work-receipts")]
     {
         let observed = driver.work_receipt();
+        let followup_failure = driver.seal_followup_lifecycle(served.is_ok()).err();
+        let lifecycle = driver.followup_lifecycle();
         let publication = receipts.as_mut().and_then(|writer| {
+            if let Err(error) =
+                writer.set_followup_lifecycle(lifecycle.as_ref().ok().cloned().flatten())
+            {
+                return Some(error);
+            }
             writer
-                .termination(observed.as_ref().ok().cloned().flatten(), served.is_ok())
+                .termination(
+                    observed.as_ref().ok().cloned().flatten(),
+                    served.is_ok() && followup_failure.is_none() && lifecycle.is_ok(),
+                )
                 .err()
         });
-        if observed.is_err() || publication.is_some() {
+        if observed.is_err()
+            || publication.is_some()
+            || followup_failure.is_some()
+            || lifecycle.is_err()
+        {
             return Err(Box::new(SearchWorkFinishError {
                 primary: served.err(),
-                observation: observed.err(),
+                observation: observed.err().or(followup_failure).or(lifecycle.err()),
                 publication,
             }));
         }
