@@ -1,6 +1,7 @@
 //! Independent PyTorch reference -> frozen Rust/ORT P/C acceptance.
 //! Generated fixtures and reports belong to caller-owned external roots.
 use rz_eval::asset;
+use rz_eval::error::{BackendError, FailureKind, FailureStage};
 use rz_eval::onnx::{OrtRuntime, Provider};
 use rz_eval::pals_model::{
     PalsModelConfig, PalsModelInput, PalsModelProfile, PalsRawOutput, PalsRecordLine, PalsRole,
@@ -886,8 +887,342 @@ fn mapping_json(phase: &str, observed: &NativeMappingObservation) -> serde_json:
         "vram_residency":"unknown","normal_process_exit":"requires_external_supervisor"})
 }
 
+const COST_COMMON_SIX_FLAG: &str = "--cost-common-six";
+const COST_SECONDS: u64 = 45;
+const COST_REPORT_BYTES: usize = 1024 * 1024;
+const COST_WARMUP: usize = 3;
+const COST_SAMPLES: usize = 5;
+const COST_CASES: [&str; 6] = [
+    "empty_context",
+    "critic_divergence",
+    "proposer_order",
+    "proposer_order_reversed",
+    "same_board_other_history",
+    "all_promotions",
+];
+
+fn cost_ns(duration: Duration) -> Result<u64, Box<dyn Error>> {
+    Ok(u64::try_from(duration.as_nanos())?)
+}
+
+fn cost_failure(error: &(dyn Error + 'static)) -> serde_json::Value {
+    if let Some(error) = error.downcast_ref::<BackendError>() {
+        json!({"kind":format!("{:?}",error.kind),"stage":format!("{:?}",error.stage),
+            "detail":error.detail,"bounded_cause":error.cause.map(|cause|format!("{cause:?}"))})
+    } else {
+        json!({"kind":"example_cost_failure","detail":error.to_string()})
+    }
+}
+
+fn cost_percentiles(samples: &[u64]) -> serde_json::Value {
+    let mut ordered = samples.to_vec();
+    ordered.sort_unstable();
+    let rank = |percent: usize| (ordered.len() * percent + 99) / 100 - 1;
+    json!({"raw_ns":samples,"count":samples.len(),"p50_ns":ordered[rank(50)],
+        "p95_ns":ordered[rank(95)],"quantile_method":"nearest_rank;five_samples_p95_is_max"})
+}
+
+fn cost_host_memory() -> serde_json::Value {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+            return json!({"status":"unknown","scope":"own_process_proc_status_unavailable"});
+        };
+        let field = |name: &str| {
+            status.lines().find_map(|line| {
+                let value = line.strip_prefix(name)?.trim();
+                let mut parts = value.split_whitespace();
+                let kib: u64 = parts.next()?.parse().ok()?;
+                (parts.next() == Some("kB"))
+                    .then(|| kib.checked_mul(1024))
+                    .flatten()
+            })
+        };
+        json!({"status":"observed_fields_only","rss_bytes":field("VmRSS:"),
+            "process_hwm_bytes":field("VmHWM:"),
+            "scope":"whole_process_lifetime_including_fixture_runtime_load_and_verification;not_per_call_allocator_peak"})
+    }
+    #[cfg(not(target_os = "linux"))]
+    json!({"status":"unknown","scope":"own_process_proc_status_unsupported"})
+}
+
+fn cost_delta(
+    before: &PalsBackendStats,
+    after: &PalsBackendStats,
+    cold: bool,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let delta = |a: u64, b: u64| -> Result<u64, Box<dyn Error>> {
+        b.checked_sub(a)
+            .ok_or_else(|| "cost NN counter regressed".into())
+    };
+    let public = u64::from(cold);
+    let admitted = delta(before.admitted_role_requests, after.admitted_role_requests)?;
+    let public_attempted = delta(
+        before.public_nn_runs_attempted,
+        after.public_nn_runs_attempted,
+    )?;
+    let public_completed = delta(
+        before.public_nn_runs_completed,
+        after.public_nn_runs_completed,
+    )?;
+    let role_attempted = delta(before.role_nn_runs_attempted, after.role_nn_runs_attempted)?;
+    let role_completed = delta(before.role_nn_runs_completed, after.role_nn_runs_completed)?;
+    let physical = delta(before.completed_nn_inputs, after.completed_nn_inputs)?;
+    let hits = delta(before.public_cache_hits, after.public_cache_hits)?;
+    let misses = delta(before.public_cache_misses, after.public_cache_misses)?;
+    let role_validated = delta(before.validated_role_outputs, after.validated_role_outputs)?;
+    if admitted != 1
+        || public_attempted != public
+        || public_completed != public
+        || role_attempted != 1
+        || role_completed != 1
+        || physical != public + 1
+        || hits != u64::from(!cold)
+        || misses != public
+        || role_validated != 1
+        || after.public_nn_runs_failed_known != before.public_nn_runs_failed_known
+        || after.role_nn_runs_failed_known != before.role_nn_runs_failed_known
+    {
+        return Err("cost invocation physical NN work or cache lane differs".into());
+    }
+    Ok(
+        json!({"admitted_role_requests":admitted,"public_attempted":public_attempted,
+        "public_completed":public_completed,"role_attempted":role_attempted,
+        "role_completed":role_completed,"completed_nn_inputs":physical,
+        "public_cache_hits":hits,"public_cache_misses":misses,"validated_role_outputs":role_validated,
+        "physical_completion":"synchronous_run_fence_and_idle_snapshot_confirmed"}),
+    )
+}
+
+fn cost_common_six(
+    args: &[String],
+    fixtures: &Fixtures,
+    fixture_digest: &[u8; 32],
+    backend: &mut PalsOnnxBackend,
+    started: Instant,
+    backend_load_ns: u64,
+) -> Result<(), Box<dyn Error>> {
+    let mut receipt = json!({"schema":"rz-pals-common-six-api-cost/1","status":"pending",
+        "model_profile":fixtures.config.profile,"checkpoint_sha256":fixtures.checkpoint_sha256,
+        "manifest_sha256":args[1],"fixture_sha256":hex_digest(fixture_digest),
+        "original_fixture_case_count":fixtures.cases.len(),"selected_cases":COST_CASES,
+        "provider_argument":args[6],"precision":"fp32","tf32":false,"batch":1,
+        "actual_ORT_intra_threads":backend.config().intra_threads,
+        "thread_scope":"explicit_common_six_model_cost_profile;arena_default_intra2_is_a_separate_engine_profile",
+        "graph_optimization":backend.graph_optimization(),"device_public_memory":backend.config().device_public_memory,
+        "runtime_sha256":hex_digest(&backend.runtime_binary_digest()),
+        "runtime_bundle_sha256":backend.runtime_bundle_digest().as_ref().map(hex_digest),
+        "warmup_calls_per_case_lane":COST_WARMUP,"measured_calls_per_case_lane":COST_SAMPLES,
+        "soft_work_seconds_max":COST_SECONDS,"report_bytes_max":COST_REPORT_BYTES,
+        "external_supervisor_required":"physical Run may outlive soft deadline;root bounds60seconds plus cleanup30seconds",
+        "startup_before_ready_wall_ns":cost_ns(started.elapsed())?,
+        "backend_load_api_ns":backend_load_ns,"host_memory_after_load":cost_host_memory(),
+        "call_time_scope":"PalsOnnxBackend::run entry_to_return including preparation/cache/public_and_role_Run/transfer/fence/output_validation;load/reset/verify/stats/JSON excluded",
+        "cache_hit_preparation":"inherits same input public cache from preceding final cold call;no extra priming Run",
+        "cold_scope":"public_cache_cleared_before_each_call;model_loaded_and_three_preparation_calls_before_five_samples",
+        "planned_role_api_calls":{"ready":2,"preparation":36,"measured":60},
+        "expected_physical_nn_inputs_per_call":{"cold":2,"cache_hit":1},
+        "engine_consumed_nn_inputs":"unknown;direct_model_cost_mode_has_no_engine_consumer",
+        "timer_overhead":"raw;recorded_not_subtracted","cuda_kernel_event_elapsed":"unknown",
+        "per_call_host_allocator_peak":"unknown","vram_peak":"unknown","device_sharing":"unknown",
+        "physical_shutdown":"requires_external_exit_and_cleanup;not_claimed_by_direct_owner_snapshot",
+        "five_percent_model_gate":false,"strength_or_full_engine_effect_claim":false,
+        "ready":[],"rows":[]});
+    let mut overhead = Vec::with_capacity(COST_SAMPLES);
+    for _ in 0..COST_SAMPLES {
+        let timer = Instant::now();
+        overhead.push(cost_ns(timer.elapsed())?);
+    }
+    receipt["timer_pair_overhead"] = cost_percentiles(&overhead);
+    let deadline = || -> Result<(), Box<dyn Error>> {
+        if started.elapsed() >= Duration::from_secs(COST_SECONDS) {
+            return Err("finite45second cost window exhausted;no next physical Run".into());
+        }
+        Ok(())
+    };
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        let selected: Vec<&Case> = COST_CASES
+            .iter()
+            .map(|name| {
+                fixtures
+                    .cases
+                    .iter()
+                    .find(|case| case.name == *name)
+                    .ok_or_else(|| -> Box<dyn Error> { "common cost case missing".into() })
+            })
+            .collect::<Result<_, _>>()?;
+        // Ready uses original P/C fixture inputs and is outside every cost lane.
+        let ready_started = Instant::now();
+        for role in [PalsRole::Proposer, PalsRole::Critic] {
+            let case = selected
+                .iter()
+                .copied()
+                .find(|case| case.input.role == role)
+                .ok_or("common cost fixtures lack P/C readiness coverage")?;
+            deadline()?;
+            backend.clear_public_memory()?;
+            let before = backend.snapshot_stats()?;
+            let timer = Instant::now();
+            let run = backend.run(&case.input);
+            let elapsed = cost_ns(timer.elapsed())?;
+            let after = backend.snapshot_stats();
+            let mut ready = json!({"case":case.name,"role":role,"api_elapsed_ns":elapsed,
+                "backend_before":stats_json(&before),"physical_completion":"unconfirmed"});
+            let ready_result = (|| -> Result<(), Box<dyn Error>> {
+                let raw = run?;
+                let after = after?;
+                ready["backend_after"] = stats_json(&after);
+                ready["NN_delta"] = cost_delta(&before, &after, true)?;
+                ready["physical_completion"] = json!("confirmed");
+                ready["numeric"] = verify(&raw, case, &fixtures.config)?;
+                Ok(())
+            })();
+            if let Err(error) = &ready_result {
+                ready["failure"] = cost_failure(error.as_ref());
+            }
+            receipt["ready"]
+                .as_array_mut()
+                .ok_or("cost ready ledger invalid")?
+                .push(ready);
+            ready_result?;
+            deadline()?;
+        }
+        if backend.cuda_control_inventory_digest().is_some() {
+            receipt["startup_only_cuda_placement"] = json!(backend.verify_cuda_placement()?);
+            receipt["profile_scope"] = json!("explicit_control_ready_P_C_only;profiling_stopped_before_cost_lanes;not_common_six_cost_profile");
+        } else {
+            receipt["profile_scope"] = json!("no_cost_profile_collected");
+        }
+        receipt["ready_elapsed_ns"] = json!(cost_ns(ready_started.elapsed())?);
+        receipt["backend_stats_after_ready"] = stats_json(&backend.snapshot_stats()?);
+        for case in selected {
+            let original_input_sha = hex_digest(&asset::sha256(&serde_json::to_vec(&case.input)?));
+            let input_key = hex_digest(&case.input.canonical_input_key(&fixtures.config)?);
+            let public_key = hex_digest(&case.input.public_memory_key(&fixtures.config)?);
+            for cold in [true, false] {
+                let lane = if cold { "cold" } else { "cache_hit" };
+                let mut row = json!({"case":case.name,"role":case.input.role,"lane":lane,
+                    "original_input_sha256":original_input_sha,"canonical_input_key":input_key,
+                    "public_memory_key":public_key,"records":case.input.records.len(),
+                    "physical_completion":"pending","warmup":[],"measured":[]});
+                let mut measured = Vec::with_capacity(COST_SAMPLES);
+                let mut complete = 0;
+                let lane_result = (|| -> Result<(), Box<dyn Error>> {
+                    for ordinal in 0..COST_WARMUP + COST_SAMPLES {
+                        deadline()?;
+                        if cold {
+                            // Reset and its cost are outside the exact Run timer.
+                            backend.clear_public_memory()?;
+                        }
+                        let before = backend.snapshot_stats()?;
+                        let timer = Instant::now();
+                        let run = backend.run(&case.input);
+                        let elapsed = cost_ns(timer.elapsed())?;
+                        let after = backend.snapshot_stats();
+                        let mut sample = json!({"ordinal":ordinal,"elapsed_ns":elapsed,
+                            "backend_before":stats_json(&before),"physical_completion":"unconfirmed"});
+                        match &after {
+                            Ok(after) => {
+                                sample["backend_after"] = stats_json(after);
+                                sample["returned_physical_nn_inputs_delta"] = json!(after
+                                    .completed_nn_inputs
+                                    .checked_sub(before.completed_nn_inputs));
+                                sample["owner_idle_after_call"] = json!(true);
+                            }
+                            Err(error) => sample["after_stats_failure"] = cost_failure(error),
+                        }
+                        if let Err(error) = &run {
+                            sample["run_failure"] = cost_failure(error);
+                        }
+                        let sample_result = (|| -> Result<(), Box<dyn Error>> {
+                            let raw = run?;
+                            let after = after?;
+                            sample["backend_after"] = stats_json(&after);
+                            sample["NN_delta"] = cost_delta(&before, &after, cold)?;
+                            sample["physical_completion"] = json!("confirmed");
+                            sample["numeric"] = verify(&raw, case, &fixtures.config)?;
+                            sample["raw_output_sha256"] =
+                                json!(hex_digest(&asset::sha256(&serde_json::to_vec(&raw)?)));
+                            complete += 1;
+                            deadline()?;
+                            Ok(())
+                        })();
+                        if let Err(error) = &sample_result {
+                            sample["failure"] = cost_failure(error.as_ref());
+                        }
+                        let field = if ordinal < COST_WARMUP {
+                            "warmup"
+                        } else {
+                            "measured"
+                        };
+                        row[field]
+                            .as_array_mut()
+                            .ok_or("cost sample ledger invalid")?
+                            .push(sample);
+                        sample_result?;
+                        if ordinal >= COST_WARMUP {
+                            measured.push(elapsed);
+                        }
+                    }
+                    row["sample_summary"] = cost_percentiles(&measured);
+                    row["physical_completion"] = json!("all8calls_confirmed");
+                    Ok(())
+                })();
+                row["confirmed_calls"] = json!(complete);
+                if let Err(error) = &lane_result {
+                    row["failure"] = cost_failure(error.as_ref());
+                }
+                receipt["rows"]
+                    .as_array_mut()
+                    .ok_or("cost rows ledger invalid")?
+                    .push(row);
+                lane_result?;
+            }
+        }
+        backend.verify_runtime()?;
+        receipt["backend_stats_final"] = stats_json(&backend.snapshot_stats()?);
+        receipt["drain_scope"] = json!("direct_Run_owner_idle_at_final_snapshot;no_async_worker;external_process_cleanup_not_observed");
+        deadline()?;
+        Ok(())
+    })();
+    receipt["status"] = json!(if result.is_ok() {
+        "passed"
+    } else {
+        "failed_no_further_case_dispatched"
+    });
+    if let Err(error) = &result {
+        receipt["failure"] = cost_failure(error.as_ref());
+    }
+    receipt["host_memory_final"] = cost_host_memory();
+    receipt["program_wall_ns_before_report_write"] = json!(cost_ns(started.elapsed())?);
+    let bytes = serde_json::to_vec_pretty(&receipt)?;
+    if bytes
+        .len()
+        .checked_add(1)
+        .is_none_or(|len| len > COST_REPORT_BYTES)
+    {
+        return Err("cost report exceeded1MiB;registered inputs retained".into());
+    }
+    let mut output = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&args[5])?;
+    output.write_all(&bytes)?;
+    output.write_all(b"\n")?;
+    output.sync_all()?;
+    result
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args: Vec<_> = std::env::args().skip(1).collect();
+    let cost_mode = args.first().is_some_and(|arg| arg == COST_COMMON_SIX_FLAG);
+    let cost_started = cost_mode.then(Instant::now);
+    if cost_mode {
+        args.remove(0);
+        if args.iter().any(|arg| arg.starts_with("--")) {
+            return Err("--cost-common-six is independent;record-page and other optional modes cannot be combined".into());
+        }
+    }
     #[cfg(feature = "experimental-io-binding")]
     let resident_check = resident_cuda::Selection::take(&mut args)?;
     #[cfg(not(feature = "experimental-io-binding"))]
@@ -985,6 +1320,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         None
     };
     let mut config = PalsOnnxConfig::cpu();
+    if cost_mode {
+        config.intra_threads = 1;
+    }
     if is_cuda {
         config.provider = Provider::Cuda {
             device_id: 0,
@@ -1006,7 +1344,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             PalsOnnxBackend::load(Path::new(&args[0]), &args[1], runtime, config)
         }
     };
+    let cost_load_started = cost_mode.then(Instant::now);
     let mut backend = load(runtime.clone(), config, "primary")?;
+    let cost_backend_load_ns = cost_load_started
+        .map(|timer| cost_ns(timer.elapsed()))
+        .transpose()?;
     let graph_optimization = backend.graph_optimization();
     let epoch = backend.model_epoch();
     if epoch != asset::parse_sha256(&fixtures.checkpoint_sha256)?
@@ -1020,6 +1362,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err("fixture identity differs".into());
         }
         case.input.validate(&fixtures.config)?;
+    }
+    if let Some(started) = cost_started {
+        return cost_common_six(
+            &args,
+            &fixtures,
+            &fixture_digest,
+            &mut backend,
+            started,
+            cost_backend_load_ns.ok_or("cost load timer missing")?,
+        );
     }
     // CUDA tests are bounded by the shell/process owner in addition to these
     // logical deadlines. This check never claims a deadline stopped native Run.
@@ -1137,6 +1489,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             PhysicalPoll::Ready(Ok(PalsNativeResult::Evaluation(_))) => {
                 return Err("cache reset unexpectedly returned a neural evaluation".into());
             }
+            PhysicalPoll::Ready(Ok(PalsNativeResult::EvaluationWithEvidence { .. })) => {
+                return Err(BackendError::new(
+                    FailureKind::BackendFailure,
+                    FailureStage::Backend,
+                    "cache reset unexpectedly returned an evidence evaluation",
+                )
+                .into());
+            }
             PhysicalPoll::Ready(Ok(PalsNativeResult::Stats(_))) => {
                 return Err("cache reset unexpectedly returned native statistics".into())
             }
@@ -1173,6 +1533,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 match result? {
                     PalsNativeResult::Evaluation(raw) => {
                         verify(&raw, &fixtures.cases[0], &fixtures.config)?;
+                    }
+                    PalsNativeResult::EvaluationWithEvidence { .. } => {
+                        return Err(BackendError::new(
+                            FailureKind::BackendFailure,
+                            FailureStage::Backend,
+                            "legacy evaluation unexpectedly returned an evidence evaluation",
+                        )
+                        .into());
                     }
                     PalsNativeResult::NewGame => {
                         return Err("evaluation unexpectedly returned a cache reset".into())
