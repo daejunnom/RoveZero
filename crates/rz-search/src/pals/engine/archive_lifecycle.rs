@@ -22,6 +22,7 @@ pub(super) struct EngineArchiveLifecycle {
     remaining_io: u64,
     retried_allocation: bool,
     last_receipt: Option<EngineArchiveReceipt>,
+    active_search_pins: StorePins,
 }
 
 impl<M: RoleModel> PalsEngine<M> {
@@ -55,6 +56,7 @@ impl<M: RoleModel> PalsEngine<M> {
         self.archive_state.remaining_io = 0;
         self.archive_state.retried_allocation = false;
         self.archive_state.last_receipt = None;
+        self.archive_state.active_search_pins = StorePins::default();
         self.archive_state.reopen_error = self
             .archive_state
             .config
@@ -80,6 +82,7 @@ impl<M: RoleModel> PalsEngine<M> {
         self.archive_state.deadline = Some(deadline);
         self.archive_state.remaining_io = SEARCH_ARCHIVE_IO_BYTES;
         self.archive_state.retried_allocation = false;
+        self.archive_state.active_search_pins = StorePins::default();
         self.retire_stale_archive_checkpoints(position)?;
         self.stores
             .set_archive_pins(self.resident_archive_pins()?)?;
@@ -169,18 +172,37 @@ impl<M: RoleModel> PalsEngine<M> {
     /// Foreign request IDs are unique across retained hot and cold reports.
     /// The explicitly chosen archive path shares this search's I/O allowance;
     /// a rejected duplicate consumes the actual scan work as well.
+    #[cfg(test)]
     pub(super) fn append_engine_observation(
         &mut self,
         observation: Observation,
+    ) -> Result<ObservationId, PalsError> {
+        self.append_engine_observation_with_controls(observation, None)
+    }
+
+    pub(super) fn append_engine_observation_with_controls(
+        &mut self,
+        observation: Observation,
+        controls: Option<(Instant, &AtomicBool)>,
     ) -> Result<ObservationId, PalsError> {
         if self.stores.archive_enabled() && observation.external_report.is_some() {
             self.stores
                 .set_archive_pins(self.resident_archive_pins()?)?;
             let mut budget = self.engine_archive_budget()?;
             let initial = budget.max_bytes;
-            let result = self
-                .stores
-                .append_observation_checked_with_archive_budget(observation, &mut budget);
+            let result = if controls.is_some_and(|(deadline, cancel)| {
+                cancel.load(Ordering::Acquire) || Instant::now() >= deadline
+            }) {
+                self.stores
+                    .append_observation_checked_first_with_archive_budget(observation, &mut budget)
+            } else {
+                self.stores
+                    .append_observation_checked_with_archive_budget_controlled(
+                        observation,
+                        &mut budget,
+                        || allocation_controls(controls),
+                    )
+            };
             let used =
                 initial
                     .checked_sub(budget.max_bytes)
@@ -190,8 +212,315 @@ impl<M: RoleModel> PalsEngine<M> {
             self.charge_engine_archive_io(used)?;
             result.map_err(PalsError::Store)
         } else {
-            Ok(self.stores.append_observation(observation)?)
+            if controls.is_none() {
+                return self
+                    .stores
+                    .append_observation(observation)
+                    .map_err(PalsError::from);
+            }
+            // A completed late output remains an immutable raw fact if one hot
+            // append can admit it. It receives no reclaim/retry or acceptance.
+            if controls.is_some_and(|(deadline, cancel)| {
+                cancel.load(Ordering::Acquire) || Instant::now() >= deadline
+            }) {
+                let result = self.stores.append_observation(observation);
+                return if self.stores.archive_enabled() {
+                    result.map_err(PalsError::Store)
+                } else {
+                    result.map_err(PalsError::from)
+                };
+            }
+            let controls = controls.filter(|_| self.stores.archive_enabled());
+            let mut pins = StorePins::default();
+            pins.states.insert(observation.state);
+            pins.lines.extend(observation.line);
+            pins.lines.extend(observation.cpu_pv);
+            pins.observations.extend(observation.supersedes);
+            pins.executions.extend(observation.execution);
+            match observation.score {
+                RawScore::ConditionalWdl {
+                    repaired, counter, ..
+                } => {
+                    pins.observations.extend([repaired, counter]);
+                }
+                RawScore::ConditionalRepairWdl { before, after, .. } => {
+                    pins.observations.extend([before, after]);
+                }
+                _ => {}
+            }
+            self.archive_store_allocation(pins, |stores| {
+                stores.append_observation_controlled(observation, || allocation_controls(controls))
+            })
         }
+    }
+
+    /// One hot allocation may archive inactive Store facts while every engine
+    /// index and pending raw handle keeps its original identity. No Node arena
+    /// compaction is allowed inside this scope.
+    pub(super) fn archive_store_allocation<T>(
+        &mut self,
+        incoming: StorePins,
+        operation: impl FnOnce(&mut PalsStores) -> Result<T, StoreError>,
+    ) -> Result<T, PalsError> {
+        if !self.stores.archive_enabled() {
+            return operation(&mut self.stores).map_err(PalsError::from);
+        }
+        let mut pins = self.resident_archive_pins()?;
+        pins.states.extend(incoming.states);
+        pins.lines.extend(incoming.lines);
+        pins.situations.extend(incoming.situations);
+        pins.observations.extend(incoming.observations);
+        pins.executions.extend(incoming.executions);
+        let mut budget = self.engine_archive_budget()?;
+        let initial = budget.max_bytes;
+        let result = self
+            .stores
+            .with_archive_allocation(pins, &mut budget, operation);
+        let used = initial
+            .checked_sub(budget.max_bytes)
+            .ok_or(StoreError::ArchiveIntegrity(
+                "engine allocation archive accounting",
+            ))?;
+        self.charge_engine_archive_io(used)?;
+        result.map_err(PalsError::Store)
+    }
+
+    /// Public record handles can be held by a local Repair or its pending queue
+    /// before they become a conclusion/dependency. Their lifetime is this
+    /// bounded search, rather than all roots in the game.
+    pub(super) fn pin_archive_active_record(
+        &mut self,
+        line: LineId,
+        observation: ObservationId,
+    ) -> Result<(), PalsError> {
+        if !self.stores.archive_enabled() {
+            return Ok(());
+        }
+        self.stores.lines.get(line)?;
+        if self.stores.observations.get(observation)?.line != Some(line) {
+            return Err(StoreError::InvalidEvidence("active archive record line").into());
+        }
+        let stats = self.stores.hot_stats();
+        let pins = &mut self.archive_state.active_search_pins;
+        if (!pins.lines.contains(&line) && pins.lines.len() >= stats.lines)
+            || (!pins.observations.contains(&observation)
+                && pins.observations.len() >= stats.observations)
+        {
+            return Err(StoreError::PinSaturated("active archive search handles").into());
+        }
+        pins.lines.insert(line);
+        pins.observations.insert(observation);
+        Ok(())
+    }
+
+    pub(super) fn archive_insert_situation(
+        &mut self,
+        snapshot: PositionSnapshot,
+        controls: Option<(Instant, &AtomicBool)>,
+    ) -> Result<SituationId, PalsError> {
+        if controls.is_none() {
+            return self
+                .stores
+                .insert_situation(snapshot)
+                .map_err(PalsError::from);
+        }
+        let controls = controls.filter(|_| self.stores.archive_enabled());
+        self.archive_store_allocation(StorePins::default(), |stores| {
+            stores.insert_situation_controlled(snapshot, || allocation_controls(controls))
+        })
+    }
+
+    pub(super) fn archive_append_line(
+        &mut self,
+        prefix: LineId,
+        movements: &[BoardMove],
+        controls: Option<(Instant, &AtomicBool)>,
+    ) -> Result<LineId, PalsError> {
+        if controls.is_none() {
+            return self
+                .stores
+                .append_line(prefix, movements)
+                .map_err(PalsError::from);
+        }
+        let controls = controls.filter(|_| self.stores.archive_enabled());
+        let mut pins = StorePins::default();
+        pins.lines.insert(prefix);
+        self.archive_store_allocation(pins, |stores| {
+            stores.append_line_controlled(prefix, movements, || allocation_controls(controls))
+        })
+    }
+
+    pub(super) fn archive_append_cpu_pv(
+        &mut self,
+        node: usize,
+        movements: &[BoardMove],
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+    ) -> Result<LineId, PalsError> {
+        let position = self.nodes[node].position.clone();
+        if self.stopped(limits, cancel).is_some() {
+            let result = self.stores.append_cpu_pv(&position, movements);
+            return if self.stores.archive_enabled() {
+                result.map_err(PalsError::Store)
+            } else {
+                result.map_err(PalsError::from)
+            };
+        }
+        let controls = self
+            .stores
+            .archive_enabled()
+            .then_some((limits.deadline, cancel));
+        self.archive_store_allocation(StorePins::default(), |stores| {
+            stores.append_cpu_pv_controlled(&position, movements, || allocation_controls(controls))
+        })
+    }
+
+    pub(super) fn archive_append_rules_terminal(
+        &mut self,
+        position: &Position,
+        situation: SituationId,
+        controls: Option<(Instant, &AtomicBool)>,
+    ) -> Result<ObservationId, PalsError> {
+        if controls.is_none() {
+            return self
+                .stores
+                .append_rules_terminal(position, 0, 0)
+                .map_err(PalsError::from);
+        }
+        let controls = controls.filter(|_| self.stores.archive_enabled());
+        let mut pins = StorePins::default();
+        pins.situations.insert(situation);
+        pins.states
+            .insert(self.stores.situations.get(situation)?.state);
+        self.archive_store_allocation(pins, |stores| {
+            stores
+                .append_rules_terminal_controlled(position, 0, 0, || allocation_controls(controls))
+        })
+    }
+
+    pub(super) fn archive_request_task(
+        &mut self,
+        key: TaskKey,
+        consumer: TaskConsumer,
+        now_tick: u64,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+    ) -> Result<TaskAdmission, PalsError> {
+        let controls = self
+            .stores
+            .archive_enabled()
+            .then_some((limits.deadline, cancel));
+        let consumer_id = consumer.id;
+        let mut admitted = None;
+        let result = self.archive_store_allocation(StorePins::default(), |stores| {
+            let admission = stores.request_task_controlled(key, consumer, now_tick, || {
+                allocation_controls(controls)
+            })?;
+            admitted = Some(admission);
+            Ok(admission)
+        });
+        self.finalize_archive_task_admission(result, admitted, consumer_id, controls)
+    }
+    fn finalize_archive_task_admission(
+        &mut self,
+        result: Result<TaskAdmission, PalsError>,
+        admitted: Option<TaskAdmission>,
+        consumer_id: u64,
+        controls: Option<(Instant, &AtomicBool)>,
+    ) -> Result<TaskAdmission, PalsError> {
+        let result = result.and_then(|admission| {
+            Self::check_logical_controls(controls)?;
+            Ok(admission)
+        });
+        if result.is_err()
+            && let Some(admission) = admitted
+        {
+            let execution = match admission {
+                TaskAdmission::Start(execution)
+                | TaskAdmission::Join(execution)
+                | TaskAdmission::Resume { execution, .. }
+                | TaskAdmission::Reuse { execution, .. } => execution,
+            };
+            let cleanup = self
+                .stores
+                .tasks
+                .cancel_consumer(execution, consumer_id)
+                .and_then(|()| {
+                    if matches!(
+                        admission,
+                        TaskAdmission::Start(_) | TaskAdmission::Resume { .. }
+                    ) {
+                        self.stores.tasks.fail(execution)
+                    } else {
+                        Ok(())
+                    }
+                });
+            if let Err(error) = cleanup {
+                // Keep the original allocation/control failure and its separate
+                // cleanup error. Joined/completed physical facts are never failed.
+                self.last_cpu_checkpoint_cleanup_error = Some(PalsError::Store(error));
+            }
+        }
+        result
+    }
+
+    pub(super) fn archive_add_dependency(
+        &mut self,
+        observation: ObservationId,
+        situation: SituationId,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+    ) -> Result<(), PalsError> {
+        let controls = self
+            .stores
+            .archive_enabled()
+            .then_some((limits.deadline, cancel));
+        let mut pins = StorePins::default();
+        pins.observations.insert(observation);
+        pins.situations.insert(situation);
+        self.archive_store_allocation(pins, |stores| {
+            stores
+                .add_dependency_controlled(observation, situation, || allocation_controls(controls))
+        })
+    }
+
+    pub(super) fn archive_refute_continuation(
+        &mut self,
+        situation: SituationId,
+        line: LineId,
+        evidence: ObservationId,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+    ) -> Result<(), PalsError> {
+        let controls = self
+            .stores
+            .archive_enabled()
+            .then_some((limits.deadline, cancel));
+        self.archive_store_allocation(StorePins::default(), |stores| {
+            stores.refute_continuation_controlled(situation, line, evidence, || {
+                allocation_controls(controls)
+            })
+        })
+    }
+
+    pub(super) fn archive_repair(
+        &mut self,
+        situation: SituationId,
+        refuted: LineId,
+        repaired: LineId,
+        evidence: ObservationId,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+    ) -> Result<(), PalsError> {
+        let controls = self
+            .stores
+            .archive_enabled()
+            .then_some((limits.deadline, cancel));
+        self.archive_store_allocation(StorePins::default(), |stores| {
+            stores.repair_controlled(situation, refuted, repaired, evidence, || {
+                allocation_controls(controls)
+            })
+        })
     }
 
     fn engine_archive_budget(&self) -> Result<ArchiveIoBudget, PalsError> {
@@ -254,7 +583,7 @@ impl<M: RoleModel> PalsEngine<M> {
     }
 
     fn resident_archive_pins(&self) -> Result<StorePins, PalsError> {
-        let mut pins = StorePins::default();
+        let mut pins = self.archive_state.active_search_pins.clone();
         for node in &self.nodes {
             if !self
                 .stores
@@ -793,6 +1122,452 @@ impl<M: RoleModel> PalsEngine<M> {
     }
 }
 
+fn allocation_controls(controls: Option<(Instant, &AtomicBool)>) -> Result<(), StoreError> {
+    if let Some((deadline, cancel)) = controls {
+        if cancel.load(Ordering::Acquire) {
+            return Err(StoreError::ArchiveCanceled);
+        }
+        if Instant::now() >= deadline {
+            return Err(StoreError::ArchiveDeadline);
+        }
+    }
+    Ok(())
+}
+
+fn archive_controls(deadline: Instant, cancel: &AtomicBool) -> Result<(), PalsError> {
+    if cancel.load(Ordering::Acquire) {
+        Err(RoleError::Canceled.into())
+    } else if Instant::now() >= deadline {
+        Err(StoreError::ArchiveDeadline.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn archive_deadline(deadline: Instant) -> Result<(), PalsError> {
+    if Instant::now() >= deadline {
+        Err(StoreError::ArchiveDeadline.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn position_from_snapshot(snapshot: &PositionSnapshot) -> Result<Position, PalsError> {
+    let position = Position::from_snapshot(snapshot, rz_position::PositionLimits::default())?;
+    if !position.snapshot().same_state(snapshot) {
+        return Err(StoreError::ArchiveIntegrity("engine exact Rules restoration").into());
+    }
+    Ok(position)
+}
+
+struct MetadataWriter(Vec<u8>);
+impl MetadataWriter {
+    fn new() -> Result<Self, PalsError> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(NODE_METADATA_MAGIC.len())
+            .map_err(|_| StoreError::PinSaturated("engine metadata allocation"))?;
+        bytes.extend_from_slice(NODE_METADATA_MAGIC);
+        Ok(Self(bytes))
+    }
+    fn bytes(&mut self, bytes: &[u8]) -> Result<(), PalsError> {
+        if self
+            .0
+            .len()
+            .checked_add(bytes.len())
+            .is_none_or(|n| n > NODE_METADATA_BYTES)
+        {
+            return Err(PalsError::Store(StoreError::Capacity(
+                "engine node metadata 4KiB",
+            )));
+        }
+        self.0
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| StoreError::PinSaturated("engine metadata allocation"))?;
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+    fn tag(&mut self, value: u8) -> Result<(), PalsError> {
+        self.bytes(&[value])
+    }
+    fn u16(&mut self, value: u16) -> Result<(), PalsError> {
+        self.bytes(&value.to_le_bytes())
+    }
+    fn u64(&mut self, value: u64) -> Result<(), PalsError> {
+        self.bytes(&value.to_le_bytes())
+    }
+    fn i32(&mut self, value: i32) -> Result<(), PalsError> {
+        self.bytes(&value.to_le_bytes())
+    }
+    fn text(&mut self, value: &str, maximum: usize) -> Result<(), PalsError> {
+        if value.len() > maximum {
+            return Err(StoreError::ArchiveIntegrity("engine identity text bound").into());
+        }
+        self.u16(value.len() as u16)?;
+        self.bytes(value.as_bytes())
+    }
+    fn optional_id(&mut self, value: Option<usize>) -> Result<(), PalsError> {
+        self.tag(u8::from(value.is_some()))?;
+        if let Some(value) = value {
+            self.u64(
+                u64::try_from(value)
+                    .map_err(|_| StoreError::ArchiveIntegrity("engine ID width"))?,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+struct MetadataReader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+impl<'a> MetadataReader<'a> {
+    fn new(bytes: &'a [u8]) -> Result<Self, PalsError> {
+        if bytes.len() > NODE_METADATA_BYTES || !bytes.starts_with(NODE_METADATA_MAGIC) {
+            return Err(
+                StoreError::ArchiveIntegrity("engine node metadata version or bound").into(),
+            );
+        }
+        Ok(Self {
+            bytes,
+            at: NODE_METADATA_MAGIC.len(),
+        })
+    }
+    fn bytes<const N: usize>(&mut self) -> Result<[u8; N], PalsError> {
+        let end = self
+            .at
+            .checked_add(N)
+            .ok_or(StoreError::ArchiveIntegrity("engine metadata offset"))?;
+        let bytes = self
+            .bytes
+            .get(self.at..end)
+            .ok_or(StoreError::ArchiveIntegrity("engine metadata truncation"))?;
+        self.at = end;
+        Ok(bytes.try_into().expect("checked fixed width"))
+    }
+    fn tag(&mut self) -> Result<u8, PalsError> {
+        Ok(self.bytes::<1>()?[0])
+    }
+    fn flag(&mut self) -> Result<bool, PalsError> {
+        match self.tag()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(StoreError::ArchiveIntegrity("engine metadata flag").into()),
+        }
+    }
+    fn u16(&mut self) -> Result<u16, PalsError> {
+        Ok(u16::from_le_bytes(self.bytes()?))
+    }
+    fn u64(&mut self) -> Result<u64, PalsError> {
+        Ok(u64::from_le_bytes(self.bytes()?))
+    }
+    fn i32(&mut self) -> Result<i32, PalsError> {
+        Ok(i32::from_le_bytes(self.bytes()?))
+    }
+    fn text(&mut self, maximum: usize) -> Result<String, PalsError> {
+        let length = usize::from(self.u16()?);
+        if length > maximum {
+            return Err(StoreError::ArchiveIntegrity("engine identity text bound").into());
+        }
+        let end = self
+            .at
+            .checked_add(length)
+            .ok_or(StoreError::ArchiveIntegrity("engine metadata offset"))?;
+        let bytes = self
+            .bytes
+            .get(self.at..end)
+            .ok_or(StoreError::ArchiveIntegrity(
+                "engine metadata text truncation",
+            ))?;
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| StoreError::ArchiveIntegrity("engine identity UTF-8"))?;
+        self.at = end;
+        Ok(text.to_owned())
+    }
+    fn optional_id(&mut self) -> Result<Option<usize>, PalsError> {
+        if !self.flag()? {
+            return Ok(None);
+        }
+        Ok(Some(usize::try_from(self.u64()?).map_err(|_| {
+            StoreError::ArchiveIntegrity("engine ID width")
+        })?))
+    }
+    fn finish(self) -> Result<(), PalsError> {
+        if self.at != self.bytes.len() {
+            return Err(StoreError::ArchiveIntegrity("engine metadata trailing bytes").into());
+        }
+        Ok(())
+    }
+}
+
+fn encode_cpu_identity(
+    writer: &mut MetadataWriter,
+    identity: &CpuValueIdentity,
+) -> Result<(), PalsError> {
+    identity
+        .validate()
+        .map_err(|_| StoreError::ArchiveIntegrity("engine CPU value identity"))?;
+    writer.text(&identity.semantics, 256)?;
+    writer.tag(u8::from(identity.weights_sha256.is_some()))?;
+    if let Some(weights) = &identity.weights_sha256 {
+        writer.text(weights, 64)?;
+    }
+    match &identity.training {
+        CpuTrainingState::Bootstrap => writer.tag(0)?,
+        CpuTrainingState::Untrained => writer.tag(1)?,
+        CpuTrainingState::Learned {
+            run_id,
+            steps,
+            dataset_sha256,
+        } => {
+            writer.tag(2)?;
+            writer.text(run_id, 128)?;
+            writer.u64(*steps)?;
+            writer.text(dataset_sha256, 64)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_cpu_identity(reader: &mut MetadataReader<'_>) -> Result<CpuValueIdentity, PalsError> {
+    let semantics = reader.text(256)?;
+    let weights_sha256 = if reader.flag()? {
+        Some(reader.text(64)?)
+    } else {
+        None
+    };
+    let training = match reader.tag()? {
+        0 => CpuTrainingState::Bootstrap,
+        1 => CpuTrainingState::Untrained,
+        2 => CpuTrainingState::Learned {
+            run_id: reader.text(128)?,
+            steps: reader.u64()?,
+            dataset_sha256: reader.text(64)?,
+        },
+        _ => return Err(StoreError::ArchiveIntegrity("engine CPU training kind").into()),
+    };
+    let identity = CpuValueIdentity {
+        semantics,
+        weights_sha256,
+        training,
+    };
+    identity
+        .validate()
+        .map_err(|_| StoreError::ArchiveIntegrity("engine CPU value identity"))?;
+    Ok(identity)
+}
+
+fn encode_archive_node(node: &Node, nodes: &[Node]) -> Result<EngineArchiveNode, PalsError> {
+    if node.resume.is_some() {
+        return Err(StoreError::PinSaturated("live CPU resume cannot be archived").into());
+    }
+    encode_archive_node_projection(node, nodes)
+}
+
+/// A projection does not serialize mutable native resume ownership. The
+/// lifecycle may use it for a child that remains pinned and resident; dropping
+/// a node still goes through the live-token guard above.
+fn encode_archive_node_projection(
+    node: &Node,
+    nodes: &[Node],
+) -> Result<EngineArchiveNode, PalsError> {
+    let mut metadata = MetadataWriter::new()?;
+    metadata.tag(u8::from(node.terminal.is_some()))?;
+    if let Some((reason, score)) = node.terminal {
+        metadata.tag(match reason {
+            TerminalReason::Checkmate => 0,
+            TerminalReason::Stalemate => 1,
+            TerminalReason::DeadPosition => 2,
+            TerminalReason::FivefoldRepetition => 3,
+            TerminalReason::SeventyFiveMove => 4,
+        })?;
+        metadata.i32(score)?;
+    }
+    metadata.tag(u8::from(node.evidence.is_some()))?;
+    if let Some(evidence) = &node.evidence {
+        metadata.i32(evidence.score)?;
+        metadata.u16(evidence.depth)?;
+        metadata.tag(match evidence.scope {
+            CpuScoreScope::FrontierOnly => 0,
+            CpuScoreScope::CompletedIteration => 1,
+            CpuScoreScope::RulesTerminal => 2,
+        })?;
+        encode_cpu_identity(&mut metadata, &evidence.value_identity)?;
+        metadata.tag(u8::from(evidence.provenance.is_some()))?;
+        if let Some((observation, execution)) = evidence.provenance {
+            metadata.optional_id(Some(observation.0))?;
+            metadata.optional_id(Some(execution.0))?;
+        }
+    }
+    metadata.tag(u8::from(node.model_value.is_some()))?;
+    if let Some(output) = &node.model_value {
+        output.validate(&node.position, &output.identity)?;
+        for (text, maximum) in [
+            (&output.identity.semantics, 256),
+            (&output.identity.model, 1024),
+            (&output.identity.encoding, 256),
+            (&output.identity.precision, 64),
+        ] {
+            metadata.text(text, maximum)?;
+        }
+        metadata.bytes(&output.identity.model_epoch)?;
+        metadata.bytes(&output.input_sha256)?;
+        metadata.tag(match output.perspective {
+            Color::White => 0,
+            Color::Black => 1,
+        })?;
+        for probability in output.wdl {
+            metadata.bytes(&probability.to_bits().to_le_bytes())?;
+        }
+    }
+    metadata.optional_id(node.model_observation.map(|id| id.0))?;
+    metadata.tag(u8::from(node.model_value_revision.is_some()))?;
+    if let Some(revision) = node.model_value_revision {
+        metadata.u64(revision)?;
+    }
+    let mut edges = Vec::new();
+    edges
+        .try_reserve_exact(node.edges.len())
+        .map_err(|_| StoreError::PinSaturated("engine archive edges allocation"))?;
+    for edge in &node.edges {
+        let child = nodes
+            .get(edge.child)
+            .ok_or(StoreError::ArchiveIntegrity("engine edge index"))?;
+        edges.push((Move16::pack(edge.movement)?, Some(child.state)));
+    }
+    Ok(EngineArchiveNode {
+        state: node.state,
+        situation: node.situation,
+        edges,
+        metadata: metadata.0,
+    })
+}
+
+fn decode_archive_node(
+    wire: &EngineArchiveNode,
+    position: Position,
+    situation: SituationId,
+) -> Result<Node, PalsError> {
+    let mut reader = MetadataReader::new(&wire.metadata)?;
+    let terminal = if reader.flag()? {
+        let reason = match reader.tag()? {
+            0 => TerminalReason::Checkmate,
+            1 => TerminalReason::Stalemate,
+            2 => TerminalReason::DeadPosition,
+            3 => TerminalReason::FivefoldRepetition,
+            4 => TerminalReason::SeventyFiveMove,
+            _ => return Err(StoreError::ArchiveIntegrity("engine terminal reason").into()),
+        };
+        Some((reason, reader.i32()?))
+    } else {
+        None
+    };
+    let actual_terminal = match position.classify_position()?.play_status {
+        PlayStatus::Ongoing => None,
+        PlayStatus::Terminal { reason, winner } => Some((
+            reason,
+            match winner {
+                Some(winner) if winner == position.side_to_move() => CPU_MATE_SCORE,
+                Some(_) => -CPU_MATE_SCORE,
+                None => 0,
+            },
+        )),
+    };
+    if terminal != actual_terminal {
+        return Err(StoreError::ArchiveIntegrity("engine Rules terminal mismatch").into());
+    }
+    let evidence = if reader.flag()? {
+        let score = reader.i32()?;
+        let depth = reader.u16()?;
+        let scope = match reader.tag()? {
+            0 => CpuScoreScope::FrontierOnly,
+            1 => CpuScoreScope::CompletedIteration,
+            2 => CpuScoreScope::RulesTerminal,
+            _ => return Err(StoreError::ArchiveIntegrity("engine CPU score scope").into()),
+        };
+        let value_identity = decode_cpu_identity(&mut reader)?;
+        let provenance = if reader.flag()? {
+            let observation = reader
+                .optional_id()?
+                .ok_or(StoreError::ArchiveIntegrity("engine CPU observation ID"))?;
+            let execution = reader
+                .optional_id()?
+                .ok_or(StoreError::ArchiveIntegrity("engine CPU execution ID"))?;
+            Some((ObservationId(observation), ExecutionId(execution)))
+        } else {
+            None
+        };
+        if scope == CpuScoreScope::RulesTerminal && terminal.map(|(_, value)| value) != Some(score)
+        {
+            return Err(StoreError::ArchiveIntegrity("engine CPU Rules-terminal scope").into());
+        }
+        Some(CpuEvidence {
+            score,
+            depth,
+            scope,
+            value_identity,
+            provenance,
+        })
+    } else {
+        None
+    };
+    let model_value = if reader.flag()? {
+        let identity = ModelValueIdentity {
+            semantics: reader.text(256)?,
+            model: reader.text(1024)?,
+            encoding: reader.text(256)?,
+            precision: reader.text(64)?,
+            model_epoch: reader.bytes()?,
+        };
+        let input_sha256 = reader.bytes()?;
+        let perspective = match reader.tag()? {
+            0 => Color::White,
+            1 => Color::Black,
+            _ => return Err(StoreError::ArchiveIntegrity("engine model perspective").into()),
+        };
+        let mut wdl = [0.0; 3];
+        for probability in &mut wdl {
+            *probability = f32::from_bits(u32::from_le_bytes(reader.bytes()?));
+        }
+        let output = ModelValueOutput {
+            identity,
+            input_sha256,
+            state: position.position_identity(),
+            perspective,
+            wdl,
+        };
+        output.validate(&position, &output.identity)?;
+        Some(output)
+    } else {
+        None
+    };
+    let model_observation = reader.optional_id()?.map(ObservationId);
+    let model_value_revision = if reader.flag()? {
+        Some(reader.u64()?)
+    } else {
+        None
+    };
+    reader.finish()?;
+    if model_value.is_some() != model_observation.is_some()
+        || model_value.is_some() != model_value_revision.is_some()
+    {
+        return Err(StoreError::ArchiveIntegrity("engine model value provenance fields").into());
+    }
+    Ok(Node {
+        position,
+        state: wire.state,
+        situation,
+        terminal,
+        edges: Vec::new(),
+        evidence,
+        model_value,
+        model_observation,
+        model_value_revision,
+        resume: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,6 +1629,38 @@ mod tests {
             max_rounds: 1,
             max_cpu_nodes: 1024,
             cpu_depth: 1,
+        }
+    }
+    fn inactive_position(fullmove: usize) -> Position {
+        Position::from_fen(&format!(
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 {fullmove}"
+        ))
+        .unwrap()
+    }
+    fn unknown_observation(state: StateId, line: Option<LineId>) -> Observation {
+        Observation {
+            state,
+            line,
+            source: 9,
+            epoch: 0,
+            scope: EvidenceScope::Model {
+                model: 1,
+                encoding: 2,
+                input: 0,
+            },
+            score: RawScore::Unknown,
+            value_identity: None,
+            checker_identity: None,
+            checker_work: None,
+            external_report: None,
+            model_value_identity: None,
+            model_value_input: None,
+            cpu_condition: None,
+            cpu_pv: None,
+            budget: 0,
+            kind: ObservationKind::Proposal,
+            supersedes: None,
+            execution: None,
         }
     }
 
@@ -1679,438 +2486,548 @@ mod tests {
         damaged.metadata.push(0);
         assert!(decode_archive_node(&damaged, Position::startpos(), damaged.situation).is_err());
     }
-}
-
-fn archive_controls(deadline: Instant, cancel: &AtomicBool) -> Result<(), PalsError> {
-    if cancel.load(Ordering::Acquire) {
-        Err(RoleError::Canceled.into())
-    } else if Instant::now() >= deadline {
-        Err(StoreError::ArchiveDeadline.into())
-    } else {
-        Ok(())
-    }
-}
-
-fn archive_deadline(deadline: Instant) -> Result<(), PalsError> {
-    if Instant::now() >= deadline {
-        Err(StoreError::ArchiveDeadline.into())
-    } else {
-        Ok(())
-    }
-}
-
-fn position_from_snapshot(snapshot: &PositionSnapshot) -> Result<Position, PalsError> {
-    let position = Position::from_snapshot(snapshot, rz_position::PositionLimits::default())?;
-    if !position.snapshot().same_state(snapshot) {
-        return Err(StoreError::ArchiveIntegrity("engine exact Rules restoration").into());
-    }
-    Ok(position)
-}
-
-struct MetadataWriter(Vec<u8>);
-impl MetadataWriter {
-    fn new() -> Result<Self, PalsError> {
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(NODE_METADATA_MAGIC.len())
-            .map_err(|_| StoreError::PinSaturated("engine metadata allocation"))?;
-        bytes.extend_from_slice(NODE_METADATA_MAGIC);
-        Ok(Self(bytes))
-    }
-    fn bytes(&mut self, bytes: &[u8]) -> Result<(), PalsError> {
-        if self
-            .0
-            .len()
-            .checked_add(bytes.len())
-            .is_none_or(|n| n > NODE_METADATA_BYTES)
-        {
-            return Err(PalsError::Store(StoreError::Capacity(
-                "engine node metadata 4KiB",
-            )));
+    #[test]
+    fn midsearch_pressure_keeps_pending_terminal_and_engine_indices_without_compaction() {
+        let mut engine = engine();
+        engine.stores = PalsStores::new(StoreLimits {
+            states: 4,
+            situations: 4,
+            line_chunks: 16,
+            observations: 16,
+            ..StoreLimits::default()
+        });
+        engine
+            .enable_archive(archive_config("midsearch-terminal"))
+            .unwrap();
+        let position = Position::from_fen("7k/5K2/6Q1/8/8/8/8/8 w - - 0 1").unwrap();
+        let cancel = AtomicBool::new(false);
+        let requested = limits();
+        engine
+            .prepare_archive_root(&position, requested.deadline, &cancel)
+            .unwrap();
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine
+            .intern_checked(position.clone(), requested, &cancel)
+            .unwrap();
+        let resident = (engine.nodes[root].state, engine.nodes[root].situation);
+        let generation = engine.stores.generation();
+        let mut inactive = Vec::new();
+        for fullmove in [1000, 1001] {
+            let situation = engine
+                .stores
+                .insert_situation(inactive_position(fullmove).snapshot())
+                .unwrap();
+            inactive.push(engine.stores.situations.get(situation).unwrap().state);
         }
-        self.0
-            .try_reserve_exact(bytes.len())
-            .map_err(|_| StoreError::PinSaturated("engine metadata allocation"))?;
-        self.0.extend_from_slice(bytes);
-        Ok(())
+        assert_eq!(engine.stores.hot_stats().states, 3);
+        let (movement, child) = position
+            .legal_moves()
+            .into_iter()
+            .find_map(|movement| {
+                let mut child = position.clone();
+                child.make_move(movement).unwrap();
+                matches!(
+                    child.classify_position().unwrap().play_status,
+                    PlayStatus::Terminal {
+                        reason: TerminalReason::Checkmate,
+                        ..
+                    }
+                )
+                .then_some((movement, child))
+            })
+            .unwrap();
+        let terminal = engine
+            .connect_checked(
+                root,
+                movement,
+                child.clone(),
+                &mut PalsCounters::default(),
+                requested,
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(root, 0);
+        assert_eq!(terminal, 1);
+        assert_eq!(engine.nodes.len(), 2);
+        assert_eq!(
+            (engine.nodes[root].state, engine.nodes[root].situation),
+            resident
+        );
+        assert_eq!(engine.stores.generation(), generation);
+        assert_eq!(engine.nodes[root].edges[0].child, terminal);
+        assert_eq!(
+            engine
+                .stores
+                .situations
+                .get(engine.nodes[terminal].situation)
+                .unwrap()
+                .state,
+            engine.nodes[terminal].state
+        );
+        assert!(
+            engine
+                .stores
+                .states
+                .get(engine.nodes[terminal].state)
+                .unwrap()
+                .same_state(&child.snapshot())
+        );
+        assert!(engine.nodes[terminal].terminal.is_some());
+        assert!(inactive.iter().all(|state| matches!(
+            engine.stores.states.get(*state),
+            Err(StoreError::ColdRecord("state"))
+        )));
+        assert!(engine.archive_state.remaining_io < SEARCH_ARCHIVE_IO_BYTES);
+        assert!(engine.last_engine_archive().is_none());
     }
-    fn tag(&mut self, value: u8) -> Result<(), PalsError> {
-        self.bytes(&[value])
-    }
-    fn u16(&mut self, value: u16) -> Result<(), PalsError> {
-        self.bytes(&value.to_le_bytes())
-    }
-    fn u64(&mut self, value: u64) -> Result<(), PalsError> {
-        self.bytes(&value.to_le_bytes())
-    }
-    fn i32(&mut self, value: i32) -> Result<(), PalsError> {
-        self.bytes(&value.to_le_bytes())
-    }
-    fn text(&mut self, value: &str, maximum: usize) -> Result<(), PalsError> {
-        if value.len() > maximum {
-            return Err(StoreError::ArchiveIntegrity("engine identity text bound").into());
-        }
-        self.u16(value.len() as u16)?;
-        self.bytes(value.as_bytes())
-    }
-    fn optional_id(&mut self, value: Option<usize>) -> Result<(), PalsError> {
-        self.tag(u8::from(value.is_some()))?;
-        if let Some(value) = value {
-            self.u64(
-                u64::try_from(value)
-                    .map_err(|_| StoreError::ArchiveIntegrity("engine ID width"))?,
-            )?;
-        }
-        Ok(())
-    }
-}
-
-struct MetadataReader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-impl<'a> MetadataReader<'a> {
-    fn new(bytes: &'a [u8]) -> Result<Self, PalsError> {
-        if bytes.len() > NODE_METADATA_BYTES || !bytes.starts_with(NODE_METADATA_MAGIC) {
-            return Err(
-                StoreError::ArchiveIntegrity("engine node metadata version or bound").into(),
+    #[test]
+    fn midsearch_active_raw_repair_handles_survive_pressure_until_next_root_prepare() {
+        let mut engine = engine();
+        engine.stores = PalsStores::new(StoreLimits {
+            states: 8,
+            situations: 8,
+            line_chunks: 16,
+            observations: 8,
+            ..StoreLimits::default()
+        });
+        engine
+            .enable_archive(archive_config("midsearch-raw-repair"))
+            .unwrap();
+        let position = Position::startpos();
+        let cancel = AtomicBool::new(false);
+        let requested = limits();
+        engine
+            .prepare_archive_root(&position, requested.deadline, &cancel)
+            .unwrap();
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine
+            .intern_checked(position.clone(), requested, &cancel)
+            .unwrap();
+        let resident = (engine.nodes[root].state, engine.nodes[root].situation);
+        let mut held = Vec::new();
+        for (kind, moves) in [
+            (RecordKind::Proposal, ["d2d4", "d7d5"]),
+            (RecordKind::Counterexample, ["e2e4", "c7c5"]),
+            (RecordKind::Repair, ["e2e4", "e7e5"]),
+        ] {
+            let line: Vec<_> = moves
+                .into_iter()
+                .map(|movement| movement.parse().unwrap())
+                .collect();
+            held.push(
+                engine
+                    .record_checked(kind, &line, None, 0, None, None, requested, &cancel)
+                    .unwrap()
+                    .unwrap(),
             );
         }
-        Ok(Self {
-            bytes,
-            at: NODE_METADATA_MAGIC.len(),
-        })
-    }
-    fn bytes<const N: usize>(&mut self) -> Result<[u8; N], PalsError> {
-        let end = self
-            .at
-            .checked_add(N)
-            .ok_or(StoreError::ArchiveIntegrity("engine metadata offset"))?;
-        let bytes = self
-            .bytes
-            .get(self.at..end)
-            .ok_or(StoreError::ArchiveIntegrity("engine metadata truncation"))?;
-        self.at = end;
-        Ok(bytes.try_into().expect("checked fixed width"))
-    }
-    fn tag(&mut self) -> Result<u8, PalsError> {
-        Ok(self.bytes::<1>()?[0])
-    }
-    fn flag(&mut self) -> Result<bool, PalsError> {
-        match self.tag()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(StoreError::ArchiveIntegrity("engine metadata flag").into()),
+        let mut inactive_observations = Vec::new();
+        for fullmove in 1000..1005 {
+            let situation = engine
+                .stores
+                .insert_situation(inactive_position(fullmove).snapshot())
+                .unwrap();
+            let (state, focus) = {
+                let situation = engine.stores.situations.get(situation).unwrap();
+                (situation.state, situation.focus)
+            };
+            inactive_observations.push(
+                engine
+                    .stores
+                    .append_observation(unknown_observation(state, Some(focus)))
+                    .unwrap(),
+            );
         }
-    }
-    fn u16(&mut self) -> Result<u16, PalsError> {
-        Ok(u16::from_le_bytes(self.bytes()?))
-    }
-    fn u64(&mut self) -> Result<u64, PalsError> {
-        Ok(u64::from_le_bytes(self.bytes()?))
-    }
-    fn i32(&mut self) -> Result<i32, PalsError> {
-        Ok(i32::from_le_bytes(self.bytes()?))
-    }
-    fn text(&mut self, maximum: usize) -> Result<String, PalsError> {
-        let length = usize::from(self.u16()?);
-        if length > maximum {
-            return Err(StoreError::ArchiveIntegrity("engine identity text bound").into());
+        assert_eq!(engine.stores.hot_stats().observations, 8);
+        engine
+            .append_engine_observation_with_controls(
+                unknown_observation(resident.0, None),
+                Some((requested.deadline, &cancel)),
+            )
+            .unwrap();
+        assert_eq!(engine.nodes.len(), 1);
+        assert_eq!(
+            (engine.nodes[root].state, engine.nodes[root].situation),
+            resident
+        );
+        for (line, observation) in held {
+            assert!(!engine.stores.lines.moves(line).unwrap().is_empty());
+            assert_eq!(
+                engine.stores.observations.get(observation).unwrap().line,
+                Some(line)
+            );
+            assert!(
+                engine
+                    .archive_state
+                    .active_search_pins
+                    .lines
+                    .contains(&line)
+            );
+            assert!(
+                engine
+                    .archive_state
+                    .active_search_pins
+                    .observations
+                    .contains(&observation)
+            );
         }
-        let end = self
-            .at
-            .checked_add(length)
-            .ok_or(StoreError::ArchiveIntegrity("engine metadata offset"))?;
-        let bytes = self
-            .bytes
-            .get(self.at..end)
-            .ok_or(StoreError::ArchiveIntegrity(
-                "engine metadata text truncation",
-            ))?;
-        let text = std::str::from_utf8(bytes)
-            .map_err(|_| StoreError::ArchiveIntegrity("engine identity UTF-8"))?;
-        self.at = end;
-        Ok(text.to_owned())
+        assert!(inactive_observations.iter().all(|observation| matches!(
+            engine.stores.observations.get(*observation),
+            Err(StoreError::ColdRecord("observation"))
+        )));
+        assert!(engine.archive_state.remaining_io < SEARCH_ARCHIVE_IO_BYTES);
+        engine
+            .prepare_archive_root(&position, requested.deadline, &cancel)
+            .unwrap();
+        assert!(engine.archive_state.active_search_pins.lines.is_empty());
+        assert!(
+            engine
+                .archive_state
+                .active_search_pins
+                .observations
+                .is_empty()
+        );
     }
-    fn optional_id(&mut self) -> Result<Option<usize>, PalsError> {
-        if !self.flag()? {
-            return Ok(None);
+    #[test]
+    fn canceled_completed_raw_gets_one_hot_append_without_record_or_node_acceptance() {
+        let mut engine = engine();
+        engine.enable_archive(archive_config("late-raw")).unwrap();
+        let position = Position::startpos();
+        let cancel = AtomicBool::new(false);
+        let requested = limits();
+        engine
+            .prepare_archive_root(&position, requested.deadline, &cancel)
+            .unwrap();
+        engine
+            .stores
+            .focus_actual_moves(position.snapshot())
+            .unwrap();
+        let root = engine
+            .intern_checked(position.clone(), requested, &cancel)
+            .unwrap();
+        let remaining = engine.archive_state.remaining_io;
+        let revision = engine.revision;
+        cancel.store(true, Ordering::Release);
+        let raw = engine
+            .append_engine_observation_with_controls(
+                unknown_observation(engine.nodes[root].state, None),
+                Some((requested.deadline, &cancel)),
+            )
+            .unwrap();
+        assert!(matches!(
+            engine.stores.observations.get(raw).unwrap().score,
+            RawScore::Unknown
+        ));
+        assert_eq!(engine.archive_state.remaining_io, remaining);
+        let movement = BoardMove::from_uci("e2e4").unwrap();
+        let mut child = position;
+        child.make_move(movement).unwrap();
+        assert!(matches!(
+            engine.connect_checked(
+                root,
+                movement,
+                child,
+                &mut PalsCounters::default(),
+                requested,
+                &cancel
+            ),
+            Err(PalsError::Role(RoleError::Canceled))
+        ));
+        assert!(matches!(
+            engine.record_checked(
+                RecordKind::Proposal,
+                &[movement],
+                None,
+                0,
+                None,
+                None,
+                requested,
+                &cancel
+            ),
+            Err(PalsError::Role(RoleError::Canceled))
+        ));
+        assert_eq!(engine.nodes.len(), 1);
+        assert!(engine.nodes[root].edges.is_empty());
+        assert!(engine.records.is_empty());
+        assert_eq!(engine.revision, revision);
+    }
+    #[test]
+    fn live_node_pin_saturation_keeps_last_published_legal_move_and_returns_typed_failure() {
+        let mut engine = engine();
+        // Inject a small live arena after the normal validated constructor; the
+        // actual checked search still uses the production allocation boundary.
+        engine.config.max_nodes = 3;
+        engine.config.line_plies = 1;
+        engine
+            .enable_archive(archive_config("midsearch-node-pins"))
+            .unwrap();
+        let position = Position::startpos();
+        let requested = PalsLimits {
+            max_rounds: 3,
+            ..limits()
+        };
+        let mut published = Vec::new();
+        let result = engine.search_with_progress(
+            &position,
+            requested,
+            &AtomicBool::new(false),
+            |movement| published.push(movement),
+        );
+        assert!(matches!(
+            result,
+            Err(PalsError::Store(StoreError::PinSaturated(
+                "resident engine node arena"
+            )))
+        ));
+        let last_valid = published
+            .last()
+            .copied()
+            .expect("valid progress before the arena filled");
+        assert!(position.legal_moves().contains(&last_valid));
+        assert_eq!(engine.nodes.len(), 3);
+        assert!(
+            engine.nodes[0]
+                .position
+                .snapshot()
+                .same_state(&position.snapshot())
+        );
+        for edge in &engine.nodes[0].edges {
+            assert!(edge.child < engine.nodes.len());
+            assert!(
+                engine
+                    .stores
+                    .situations
+                    .get(engine.nodes[edge.child].situation)
+                    .is_ok()
+            );
         }
-        Ok(Some(usize::try_from(self.u64()?).map_err(|_| {
-            StoreError::ArchiveIntegrity("engine ID width")
-        })?))
+        assert!(engine.last_engine_archive().is_none());
     }
-    fn finish(self) -> Result<(), PalsError> {
-        if self.at != self.bytes.len() {
-            return Err(StoreError::ArchiveIntegrity("engine metadata trailing bytes").into());
-        }
-        Ok(())
+    #[test]
+    fn canceled_foreign_first_hot_append_keeps_original_scan_budget_and_never_consumes() {
+        let mut engine = engine();
+        engine
+            .enable_archive(archive_config("late-foreign"))
+            .unwrap();
+        let cancel = AtomicBool::new(false);
+        let old = Position::startpos();
+        engine.search(&old, limits(), &cancel).unwrap();
+        let previous = foreign_observation(&mut engine, &old, 10_001, 91_001);
+        let observation = engine.append_engine_observation(previous.clone()).unwrap();
+        engine
+            .stores
+            .complete_task(previous.execution.unwrap(), observation)
+            .unwrap();
+        fill_hot(&mut engine);
+        let position = advanced_root();
+        let requested = limits();
+        engine.search(&position, requested, &cancel).unwrap();
+        assert!(matches!(
+            engine.stores.observations.get(observation),
+            Err(StoreError::ColdRecord(_))
+        ));
+        let incoming = foreign_observation(&mut engine, &position, 10_002, 91_002);
+        let execution = incoming.execution.unwrap();
+        let available = engine.archive_state.remaining_io;
+        let generation = engine.stores.generation();
+        let states: Vec<_> = engine.nodes.iter().map(|node| node.state).collect();
+        cancel.store(true, Ordering::Release);
+        let raw = engine
+            .append_engine_observation_with_controls(
+                incoming.clone(),
+                Some((requested.deadline, &cancel)),
+            )
+            .unwrap();
+        assert_eq!(
+            engine.stores.observations.get(raw).unwrap().execution,
+            Some(execution)
+        );
+        assert!(matches!(
+            engine.stores.tasks.get(execution).unwrap().status,
+            TaskStatus::InFlight
+        ));
+        assert!(engine.archive_state.remaining_io < available);
+        assert_eq!(engine.stores.generation(), generation);
+        assert_eq!(
+            engine
+                .nodes
+                .iter()
+                .map(|node| node.state)
+                .collect::<Vec<_>>(),
+            states
+        );
+        let before = engine.stores.hot_stats();
+        let mut rejected = incoming;
+        rejected.external_report.as_mut().unwrap().request_id = 10_003;
+        engine.archive_state.deadline = Some(Instant::now());
+        assert!(matches!(
+            engine.append_engine_observation_with_controls(
+                rejected,
+                Some((requested.deadline, &cancel))
+            ),
+            Err(PalsError::Store(StoreError::ArchiveDeadline))
+        ));
+        assert_eq!(engine.stores.hot_stats(), before);
+        assert!(matches!(
+            engine.stores.tasks.get(execution).unwrap().status,
+            TaskStatus::InFlight
+        ));
     }
-}
 
-fn encode_cpu_identity(
-    writer: &mut MetadataWriter,
-    identity: &CpuValueIdentity,
-) -> Result<(), PalsError> {
-    identity
-        .validate()
-        .map_err(|_| StoreError::ArchiveIntegrity("engine CPU value identity"))?;
-    writer.text(&identity.semantics, 256)?;
-    writer.tag(u8::from(identity.weights_sha256.is_some()))?;
-    if let Some(weights) = &identity.weights_sha256 {
-        writer.text(weights, 64)?;
-    }
-    match &identity.training {
-        CpuTrainingState::Bootstrap => writer.tag(0)?,
-        CpuTrainingState::Untrained => writer.tag(1)?,
-        CpuTrainingState::Learned {
-            run_id,
-            steps,
-            dataset_sha256,
-        } => {
-            writer.tag(2)?;
-            writer.text(run_id, 128)?;
-            writer.u64(*steps)?;
-            writer.text(dataset_sha256, 64)?;
+    #[test]
+    fn post_allocation_task_guard_retires_new_reservations_and_preserves_joined_facts() {
+        // Move the flag/deadline after a real Store admission deterministically.
+        // These are typed TaskTable fixtures; no backend was dispatched and an
+        // opaque pause marker makes no native stack or physical completion claim.
+        for kind in ["start", "resume", "join", "reuse"] {
+            for expired in [false, true] {
+                let mut engine = engine();
+                let root = engine.intern(Position::startpos()).unwrap();
+                let state = engine.nodes[root].state;
+                let situation = engine.nodes[root].situation;
+                let generation = engine.stores.generation();
+                let revision = engine.stores.situations.get(situation).unwrap().revision;
+                let own = (kind == "resume").then(|| engine.cpu_registered_value.clone().unwrap());
+                let key = TaskKey {
+                    state,
+                    line: None,
+                    question: if own.is_some() {
+                        TaskQuestion::AnalyzePosition
+                    } else {
+                        TaskQuestion::ModelProposal
+                    },
+                    root_moves: Vec::new(),
+                    model: 1,
+                    epoch: 0,
+                    value_identity: own.clone(),
+                    checker_identity: own.map(CheckerIdentity::Owned),
+                    cpu_condition: (kind == "resume").then(|| "post-guard-fixture/1".into()),
+                    profile: 1,
+                    condition: 1,
+                    input_revision: 0,
+                    requested_depth: 1,
+                    node_budget: 32,
+                };
+                let consumer = |id| TaskConsumer {
+                    id,
+                    situation,
+                    revision,
+                    generation,
+                    deadline_tick: 100_000,
+                };
+                let TaskAdmission::Start(first) = engine
+                    .stores
+                    .request_task(key.clone(), consumer(1), 0)
+                    .unwrap()
+                else {
+                    panic!("first fixture task must be a new reservation");
+                };
+                let completed = if kind == "reuse" {
+                    let mut raw = unknown_observation(state, None);
+                    raw.execution = Some(first);
+                    let observation = engine.stores.append_observation(raw).unwrap();
+                    engine.stores.complete_task(first, observation).unwrap();
+                    Some(observation)
+                } else {
+                    None
+                };
+                if kind == "resume" {
+                    engine.stores.pause_task(first, 17, None).unwrap();
+                }
+                let (admission, consumer_id) = if kind == "start" {
+                    (TaskAdmission::Start(first), 1)
+                } else {
+                    (engine.stores.request_task(key, consumer(2), 0).unwrap(), 2)
+                };
+                let execution = match (kind, admission) {
+                    ("start", TaskAdmission::Start(execution))
+                    | ("join", TaskAdmission::Join(execution))
+                    | ("reuse", TaskAdmission::Reuse { execution, .. }) => execution,
+                    (
+                        "resume",
+                        TaskAdmission::Resume {
+                            execution,
+                            previous,
+                            checkpoint,
+                        },
+                    ) => {
+                        assert_eq!(previous, first);
+                        assert_eq!(checkpoint, 17);
+                        execution
+                    }
+                    _ => panic!("fixture admission did not match {kind}"),
+                };
+                let cancel = AtomicBool::new(!expired);
+                let deadline = if expired {
+                    Instant::now()
+                } else {
+                    Instant::now() + Duration::from_secs(20)
+                };
+                let result = engine.finalize_archive_task_admission(
+                    Ok(admission),
+                    Some(admission),
+                    consumer_id,
+                    Some((deadline, &cancel)),
+                );
+                if expired {
+                    assert!(matches!(result, Err(PalsError::RoleDeadline)));
+                } else {
+                    assert!(matches!(result, Err(PalsError::RoleCanceled)));
+                }
+                assert!(engine.last_cpu_checkpoint_cleanup_error.is_none());
+                match kind {
+                    "start" | "resume" => {
+                        assert_eq!(
+                            engine.stores.tasks.get(execution).unwrap().status,
+                            TaskStatus::Failed
+                        );
+                        if kind == "resume" {
+                            assert_eq!(
+                                engine.stores.tasks.get(first).unwrap().status,
+                                TaskStatus::Paused {
+                                    checkpoint: 17,
+                                    evidence: None
+                                }
+                            );
+                        }
+                    }
+                    "join" | "reuse" => {
+                        let observation = if let Some(observation) = completed {
+                            assert_eq!(
+                                engine.stores.tasks.get(first).unwrap().status,
+                                TaskStatus::Completed(observation)
+                            );
+                            observation
+                        } else {
+                            assert_eq!(
+                                engine.stores.tasks.get(first).unwrap().status,
+                                TaskStatus::InFlight
+                            );
+                            let mut raw = unknown_observation(state, None);
+                            raw.execution = Some(first);
+                            let observation = engine.stores.append_observation(raw).unwrap();
+                            engine.stores.complete_task(first, observation).unwrap();
+                            observation
+                        };
+                        assert!(matches!(
+                            engine.stores.consume_task(first, consumer_id, 0),
+                            Err(StoreError::CancelledConsumer)
+                        ));
+                        assert_eq!(
+                            engine.stores.consume_task(first, 1, 0).unwrap(),
+                            observation
+                        );
+                        assert!(engine.stores.observations.get(observation).is_ok());
+                    }
+                    _ => unreachable!(),
+                }
+            }
         }
     }
-    Ok(())
-}
-
-fn decode_cpu_identity(reader: &mut MetadataReader<'_>) -> Result<CpuValueIdentity, PalsError> {
-    let semantics = reader.text(256)?;
-    let weights_sha256 = if reader.flag()? {
-        Some(reader.text(64)?)
-    } else {
-        None
-    };
-    let training = match reader.tag()? {
-        0 => CpuTrainingState::Bootstrap,
-        1 => CpuTrainingState::Untrained,
-        2 => CpuTrainingState::Learned {
-            run_id: reader.text(128)?,
-            steps: reader.u64()?,
-            dataset_sha256: reader.text(64)?,
-        },
-        _ => return Err(StoreError::ArchiveIntegrity("engine CPU training kind").into()),
-    };
-    let identity = CpuValueIdentity {
-        semantics,
-        weights_sha256,
-        training,
-    };
-    identity
-        .validate()
-        .map_err(|_| StoreError::ArchiveIntegrity("engine CPU value identity"))?;
-    Ok(identity)
-}
-
-fn encode_archive_node(node: &Node, nodes: &[Node]) -> Result<EngineArchiveNode, PalsError> {
-    if node.resume.is_some() {
-        return Err(StoreError::PinSaturated("live CPU resume cannot be archived").into());
-    }
-    encode_archive_node_projection(node, nodes)
-}
-
-/// A projection does not serialize mutable native resume ownership. The
-/// lifecycle may use it for a child that remains pinned and resident; dropping
-/// a node still goes through the live-token guard above.
-fn encode_archive_node_projection(
-    node: &Node,
-    nodes: &[Node],
-) -> Result<EngineArchiveNode, PalsError> {
-    let mut metadata = MetadataWriter::new()?;
-    metadata.tag(u8::from(node.terminal.is_some()))?;
-    if let Some((reason, score)) = node.terminal {
-        metadata.tag(match reason {
-            TerminalReason::Checkmate => 0,
-            TerminalReason::Stalemate => 1,
-            TerminalReason::DeadPosition => 2,
-            TerminalReason::FivefoldRepetition => 3,
-            TerminalReason::SeventyFiveMove => 4,
-        })?;
-        metadata.i32(score)?;
-    }
-    metadata.tag(u8::from(node.evidence.is_some()))?;
-    if let Some(evidence) = &node.evidence {
-        metadata.i32(evidence.score)?;
-        metadata.u16(evidence.depth)?;
-        metadata.tag(match evidence.scope {
-            CpuScoreScope::FrontierOnly => 0,
-            CpuScoreScope::CompletedIteration => 1,
-            CpuScoreScope::RulesTerminal => 2,
-        })?;
-        encode_cpu_identity(&mut metadata, &evidence.value_identity)?;
-        metadata.tag(u8::from(evidence.provenance.is_some()))?;
-        if let Some((observation, execution)) = evidence.provenance {
-            metadata.optional_id(Some(observation.0))?;
-            metadata.optional_id(Some(execution.0))?;
-        }
-    }
-    metadata.tag(u8::from(node.model_value.is_some()))?;
-    if let Some(output) = &node.model_value {
-        output.validate(&node.position, &output.identity)?;
-        for (text, maximum) in [
-            (&output.identity.semantics, 256),
-            (&output.identity.model, 1024),
-            (&output.identity.encoding, 256),
-            (&output.identity.precision, 64),
-        ] {
-            metadata.text(text, maximum)?;
-        }
-        metadata.bytes(&output.identity.model_epoch)?;
-        metadata.bytes(&output.input_sha256)?;
-        metadata.tag(match output.perspective {
-            Color::White => 0,
-            Color::Black => 1,
-        })?;
-        for probability in output.wdl {
-            metadata.bytes(&probability.to_bits().to_le_bytes())?;
-        }
-    }
-    metadata.optional_id(node.model_observation.map(|id| id.0))?;
-    metadata.tag(u8::from(node.model_value_revision.is_some()))?;
-    if let Some(revision) = node.model_value_revision {
-        metadata.u64(revision)?;
-    }
-    let mut edges = Vec::new();
-    edges
-        .try_reserve_exact(node.edges.len())
-        .map_err(|_| StoreError::PinSaturated("engine archive edges allocation"))?;
-    for edge in &node.edges {
-        let child = nodes
-            .get(edge.child)
-            .ok_or(StoreError::ArchiveIntegrity("engine edge index"))?;
-        edges.push((Move16::pack(edge.movement)?, Some(child.state)));
-    }
-    Ok(EngineArchiveNode {
-        state: node.state,
-        situation: node.situation,
-        edges,
-        metadata: metadata.0,
-    })
-}
-
-fn decode_archive_node(
-    wire: &EngineArchiveNode,
-    position: Position,
-    situation: SituationId,
-) -> Result<Node, PalsError> {
-    let mut reader = MetadataReader::new(&wire.metadata)?;
-    let terminal = if reader.flag()? {
-        let reason = match reader.tag()? {
-            0 => TerminalReason::Checkmate,
-            1 => TerminalReason::Stalemate,
-            2 => TerminalReason::DeadPosition,
-            3 => TerminalReason::FivefoldRepetition,
-            4 => TerminalReason::SeventyFiveMove,
-            _ => return Err(StoreError::ArchiveIntegrity("engine terminal reason").into()),
-        };
-        Some((reason, reader.i32()?))
-    } else {
-        None
-    };
-    let actual_terminal = match position.classify_position()?.play_status {
-        PlayStatus::Ongoing => None,
-        PlayStatus::Terminal { reason, winner } => Some((
-            reason,
-            match winner {
-                Some(winner) if winner == position.side_to_move() => CPU_MATE_SCORE,
-                Some(_) => -CPU_MATE_SCORE,
-                None => 0,
-            },
-        )),
-    };
-    if terminal != actual_terminal {
-        return Err(StoreError::ArchiveIntegrity("engine Rules terminal mismatch").into());
-    }
-    let evidence = if reader.flag()? {
-        let score = reader.i32()?;
-        let depth = reader.u16()?;
-        let scope = match reader.tag()? {
-            0 => CpuScoreScope::FrontierOnly,
-            1 => CpuScoreScope::CompletedIteration,
-            2 => CpuScoreScope::RulesTerminal,
-            _ => return Err(StoreError::ArchiveIntegrity("engine CPU score scope").into()),
-        };
-        let value_identity = decode_cpu_identity(&mut reader)?;
-        let provenance = if reader.flag()? {
-            let observation = reader
-                .optional_id()?
-                .ok_or(StoreError::ArchiveIntegrity("engine CPU observation ID"))?;
-            let execution = reader
-                .optional_id()?
-                .ok_or(StoreError::ArchiveIntegrity("engine CPU execution ID"))?;
-            Some((ObservationId(observation), ExecutionId(execution)))
-        } else {
-            None
-        };
-        if scope == CpuScoreScope::RulesTerminal && terminal.map(|(_, value)| value) != Some(score)
-        {
-            return Err(StoreError::ArchiveIntegrity("engine CPU Rules-terminal scope").into());
-        }
-        Some(CpuEvidence {
-            score,
-            depth,
-            scope,
-            value_identity,
-            provenance,
-        })
-    } else {
-        None
-    };
-    let model_value = if reader.flag()? {
-        let identity = ModelValueIdentity {
-            semantics: reader.text(256)?,
-            model: reader.text(1024)?,
-            encoding: reader.text(256)?,
-            precision: reader.text(64)?,
-            model_epoch: reader.bytes()?,
-        };
-        let input_sha256 = reader.bytes()?;
-        let perspective = match reader.tag()? {
-            0 => Color::White,
-            1 => Color::Black,
-            _ => return Err(StoreError::ArchiveIntegrity("engine model perspective").into()),
-        };
-        let mut wdl = [0.0; 3];
-        for probability in &mut wdl {
-            *probability = f32::from_bits(u32::from_le_bytes(reader.bytes()?));
-        }
-        let output = ModelValueOutput {
-            identity,
-            input_sha256,
-            state: position.position_identity(),
-            perspective,
-            wdl,
-        };
-        output.validate(&position, &output.identity)?;
-        Some(output)
-    } else {
-        None
-    };
-    let model_observation = reader.optional_id()?.map(ObservationId);
-    let model_value_revision = if reader.flag()? {
-        Some(reader.u64()?)
-    } else {
-        None
-    };
-    reader.finish()?;
-    if model_value.is_some() != model_observation.is_some()
-        || model_value.is_some() != model_value_revision.is_some()
-    {
-        return Err(StoreError::ArchiveIntegrity("engine model value provenance fields").into());
-    }
-    Ok(Node {
-        position,
-        state: wire.state,
-        situation,
-        terminal,
-        edges: Vec::new(),
-        evidence,
-        model_value,
-        model_observation,
-        model_value_revision,
-        resume: None,
-    })
 }

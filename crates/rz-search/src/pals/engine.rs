@@ -1567,7 +1567,11 @@ impl<M: RoleModel> PalsEngine<M> {
         let mut result = self.search_inner(position, limits, cancel, progress, &mut counters);
         let canceled = cancel.load(Ordering::Acquire)
             || matches!(&result, Ok(report) if report.completion == PalsCompletion::Canceled)
-            || matches!(&result, Err(PalsError::Role(RoleError::Canceled)));
+            || matches!(
+                &result,
+                Err(PalsError::Role(RoleError::Canceled)
+                    | PalsError::Store(StoreError::ArchiveCanceled))
+            );
         if canceled {
             // This discards only the owned CPU continuation. GPU buffers remain
             // subject to their physical owner/drain even after logical cancel.
@@ -1591,6 +1595,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 RoleSearchClosure::PhysicalCompletionUnknown
             }
             _ if canceled => RoleSearchClosure::Canceled,
+            Err(PalsError::Store(StoreError::ArchiveDeadline)) => RoleSearchClosure::Deadline,
             Ok(report) => match report.completion {
                 PalsCompletion::Canceled => RoleSearchClosure::Canceled,
                 PalsCompletion::Deadline => RoleSearchClosure::Deadline,
@@ -1636,7 +1641,7 @@ impl<M: RoleModel> PalsEngine<M> {
         self.prepare_archive_root(position, limits.deadline, cancel)?;
         let root = loop {
             let attempt = match self.stores.focus_actual_moves(position.snapshot()) {
-                Ok(_) => self.intern(position.clone()),
+                Ok(_) => self.intern_checked(position.clone(), limits, cancel),
                 Err(StoreError::Capacity(_)) => Err(PalsError::Capacity),
                 Err(error) => Err(error.into()),
             };
@@ -1701,7 +1706,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 child.classify_position()?.play_status,
                 PlayStatus::Terminal { .. }
             ) {
-                match self.connect(root, movement, child, counters) {
+                match self.connect_checked(root, movement, child, counters, limits, cancel) {
                     Ok(_) => {}
                     Err(PalsError::Capacity) => {
                         completion = PalsCompletion::Capacity;
@@ -1935,7 +1940,24 @@ impl<M: RoleModel> PalsEngine<M> {
             resolver_version: self.resolver_version(),
         })
     }
+    #[cfg(test)]
     fn intern(&mut self, position: Position) -> Result<usize, PalsError> {
+        self.intern_with_controls(position, None)
+    }
+    fn intern_checked(
+        &mut self,
+        position: Position,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+    ) -> Result<usize, PalsError> {
+        self.intern_with_controls(position, Some((limits.deadline, cancel)))
+    }
+    fn intern_with_controls(
+        &mut self,
+        position: Position,
+        controls: Option<(Instant, &AtomicBool)>,
+    ) -> Result<usize, PalsError> {
+        Self::check_logical_controls(controls)?;
         let snapshot = position.snapshot();
         if let Some(state) = self.stores.states.find(&snapshot) {
             if let Some(index) = self.nodes.iter().position(|node| node.state == state) {
@@ -1943,6 +1965,9 @@ impl<M: RoleModel> PalsEngine<M> {
             }
         }
         if self.nodes.len() >= self.config.max_nodes {
+            if self.archive_enabled() {
+                return Err(StoreError::PinSaturated("resident engine node arena").into());
+            }
             return Err(PalsError::Capacity);
         }
         let situation = if let Some(root) = self.stores.root().filter(|&root| {
@@ -1955,7 +1980,7 @@ impl<M: RoleModel> PalsEngine<M> {
         }) {
             root
         } else {
-            self.stores.insert_situation(snapshot)?
+            self.archive_insert_situation(snapshot, controls)?
         };
         let state = self.stores.situations.get(situation)?.state;
         let terminal = match position.classify_position()?.play_status {
@@ -1970,8 +1995,9 @@ impl<M: RoleModel> PalsEngine<M> {
             )),
         };
         if terminal.is_some() {
-            self.stores.append_rules_terminal(&position, 0, 0)?;
+            self.archive_append_rules_terminal(&position, situation, controls)?;
         }
+        Self::check_logical_controls(controls)?;
         self.nodes.push(Node {
             position,
             state,
@@ -1986,6 +2012,7 @@ impl<M: RoleModel> PalsEngine<M> {
         });
         Ok(self.nodes.len() - 1)
     }
+    #[cfg(test)]
     fn connect(
         &mut self,
         parent: usize,
@@ -1993,6 +2020,34 @@ impl<M: RoleModel> PalsEngine<M> {
         child: Position,
         counters: &mut PalsCounters,
     ) -> Result<usize, PalsError> {
+        self.connect_with_controls(parent, movement, child, counters, None)
+    }
+    fn connect_checked(
+        &mut self,
+        parent: usize,
+        movement: BoardMove,
+        child: Position,
+        counters: &mut PalsCounters,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+    ) -> Result<usize, PalsError> {
+        self.connect_with_controls(
+            parent,
+            movement,
+            child,
+            counters,
+            Some((limits.deadline, cancel)),
+        )
+    }
+    fn connect_with_controls(
+        &mut self,
+        parent: usize,
+        movement: BoardMove,
+        child: Position,
+        counters: &mut PalsCounters,
+        controls: Option<(Instant, &AtomicBool)>,
+    ) -> Result<usize, PalsError> {
+        Self::check_logical_controls(controls)?;
         if let Some(edge) = self.nodes[parent]
             .edges
             .iter()
@@ -2000,7 +2055,7 @@ impl<M: RoleModel> PalsEngine<M> {
         {
             return Ok(edge.child);
         }
-        let child = self.intern(child)?;
+        let child = self.intern_with_controls(child, controls)?;
         self.nodes[parent].edges.push(Edge { movement, child });
         counters.examined_edges += 1;
         Ok(child)
@@ -2196,7 +2251,7 @@ impl<M: RoleModel> PalsEngine<M> {
             };
             let mut child = self.nodes[current].position.clone();
             child.make_move(movement)?;
-            current = self.connect(current, movement, child, counters)?;
+            current = self.connect_checked(current, movement, child, counters, limits, cancel)?;
             prefix.push(movement);
         }
         Ok(current)
@@ -2282,7 +2337,7 @@ impl<M: RoleModel> PalsEngine<M> {
             generation: self.stores.generation(),
             deadline_tick: self.tick_at(limits.deadline),
         };
-        let admission = match self.stores.request_task(
+        let admission = match self.archive_request_task(
             TaskKey {
                 state: self.nodes[node].state,
                 line: None,
@@ -2301,10 +2356,12 @@ impl<M: RoleModel> PalsEngine<M> {
             },
             consumer,
             self.tick_at(Instant::now()),
+            limits,
+            cancel,
         ) {
             Ok(admission) => admission,
-            Err(StoreError::ExpiredConsumer) => return Ok(()),
-            Err(error) => return Err(error.into()),
+            Err(PalsError::Store(StoreError::ExpiredConsumer)) => return Ok(()),
+            Err(error) => return Err(error),
         };
         let execution = match admission {
             TaskAdmission::Reuse {
@@ -2422,41 +2479,44 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         // A stopped task retains completed depth evidence, but never pretends to
         // have examined the requested remaining depth or to prove a mate.
-        let observation = match self.append_engine_observation(Observation {
-            state: self.nodes[node].state,
-            line: None,
-            source: stable_id(report.score_provenance),
-            epoch: 0,
-            scope: EvidenceScope::DepthLimited {
-                depth: report.completed_depth,
-                profile,
-                condition,
+        let observation = match self.append_engine_observation_with_controls(
+            Observation {
+                state: self.nodes[node].state,
+                line: None,
+                source: stable_id(report.score_provenance),
+                epoch: 0,
+                scope: EvidenceScope::DepthLimited {
+                    depth: report.completed_depth,
+                    profile,
+                    condition,
+                },
+                score: if report.score_scope == CpuScoreScope::FrontierOnly {
+                    RawScore::Estimate {
+                        value: report.score as f32,
+                        perspective: self.nodes[node].position.side_to_move(),
+                    }
+                } else {
+                    RawScore::Cpu {
+                        value: report.score,
+                        perspective: self.nodes[node].position.side_to_move(),
+                        bound: BoundKind::ExactWithinSearch,
+                    }
+                },
+                value_identity: Some(report.value_identity.clone()),
+                checker_identity: None,
+                checker_work: None,
+                external_report: None,
+                model_value_identity: None,
+                model_value_input: None,
+                cpu_condition: Some(cpu_condition.clone()),
+                cpu_pv: None,
+                budget: report.nodes,
+                kind: ObservationKind::CpuAnalysis,
+                supersedes: None,
+                execution: Some(execution),
             },
-            score: if report.score_scope == CpuScoreScope::FrontierOnly {
-                RawScore::Estimate {
-                    value: report.score as f32,
-                    perspective: self.nodes[node].position.side_to_move(),
-                }
-            } else {
-                RawScore::Cpu {
-                    value: report.score,
-                    perspective: self.nodes[node].position.side_to_move(),
-                    bound: BoundKind::ExactWithinSearch,
-                }
-            },
-            value_identity: Some(report.value_identity.clone()),
-            checker_identity: None,
-            checker_work: None,
-            external_report: None,
-            model_value_identity: None,
-            model_value_input: None,
-            cpu_condition: Some(cpu_condition.clone()),
-            cpu_pv: None,
-            budget: report.nodes,
-            kind: ObservationKind::CpuAnalysis,
-            supersedes: None,
-            execution: Some(execution),
-        }) {
+            Some((limits.deadline, cancel)),
+        ) {
             Ok(observation) => observation,
             Err(error) => {
                 self.nodes[node].resume = None;
@@ -2514,19 +2574,19 @@ impl<M: RoleModel> PalsEngine<M> {
             }
             // Register exactly the situation and active root which depend on this
             // evidence. Evicting derived model memory will not remove these facts.
-            self.stores
-                .dependencies
-                .add(observation, self.nodes[node].situation)?;
+            self.archive_add_dependency(observation, self.nodes[node].situation, limits, cancel)?;
             if let Some(root) = self.stores.root() {
-                self.stores.dependencies.add(observation, root)?;
+                self.archive_add_dependency(observation, root, limits, cancel)?;
             }
-            self.record(
+            self.record_checked(
                 RecordKind::CpuVerification,
                 line,
                 Some(report.score),
                 report.completed_depth,
                 Some(report.score_scope),
                 Some(self.nodes[node].position.side_to_move()),
+                limits,
+                cancel,
             )?;
         }
         Ok(())
@@ -2593,60 +2653,61 @@ impl<M: RoleModel> PalsEngine<M> {
         counters.completed_value_calls += 1;
         // Keep the full actual input identity; numeric scope IDs are metadata.
         // No exact-input cache reuse is granted by a model namespace or board.
-        let observation = self.append_engine_observation(Observation {
-            state: self.nodes[node].state,
-            line: None,
-            source: stable_id(&identity.semantics),
-            epoch: 0,
-            value_identity: None,
-            checker_identity: None,
-            checker_work: None,
-            external_report: None,
-            model_value_identity: Some(identity.clone()),
-            model_value_input: Some(output.input_sha256),
-            cpu_condition: None,
-            cpu_pv: None,
-            scope: EvidenceScope::Model {
-                model: stable_id(&identity.model),
-                encoding: stable_id(&identity.encoding),
-                input: u64::from_le_bytes(
-                    output.input_sha256[..8]
-                        .try_into()
-                        .map_err(|_| RoleError::InvalidOutput)?,
-                ),
+        let observation = self.append_engine_observation_with_controls(
+            Observation {
+                state: self.nodes[node].state,
+                line: None,
+                source: stable_id(&identity.semantics),
+                epoch: 0,
+                value_identity: None,
+                checker_identity: None,
+                checker_work: None,
+                external_report: None,
+                model_value_identity: Some(identity.clone()),
+                model_value_input: Some(output.input_sha256),
+                cpu_condition: None,
+                cpu_pv: None,
+                scope: EvidenceScope::Model {
+                    model: stable_id(&identity.model),
+                    encoding: stable_id(&identity.encoding),
+                    input: u64::from_le_bytes(
+                        output.input_sha256[..8]
+                            .try_into()
+                            .map_err(|_| RoleError::InvalidOutput)?,
+                    ),
+                },
+                score: if self.followup_lane || self.post_repair_recheck.uses_frozen_model_wdl() {
+                    RawScore::ContextWdl {
+                        win: output.wdl[0],
+                        draw: output.wdl[1],
+                        loss: output.wdl[2],
+                        perspective: output.perspective,
+                        context_revision: self.revision,
+                    }
+                } else {
+                    RawScore::Wdl {
+                        win: output.wdl[0],
+                        draw: output.wdl[1],
+                        loss: output.wdl[2],
+                        perspective: output.perspective,
+                    }
+                },
+                budget: 1,
+                kind: ObservationKind::Proposal,
+                supersedes: None,
+                execution: None,
             },
-            score: if self.followup_lane || self.post_repair_recheck.uses_frozen_model_wdl() {
-                RawScore::ContextWdl {
-                    win: output.wdl[0],
-                    draw: output.wdl[1],
-                    loss: output.wdl[2],
-                    perspective: output.perspective,
-                    context_revision: self.revision,
-                }
-            } else {
-                RawScore::Wdl {
-                    win: output.wdl[0],
-                    draw: output.wdl[1],
-                    loss: output.wdl[2],
-                    perspective: output.perspective,
-                }
-            },
-            budget: 1,
-            kind: ObservationKind::Proposal,
-            supersedes: None,
-            execution: None,
-        })?;
+            Some((limits.deadline, cancel)),
+        )?;
         if cancel.load(Ordering::Acquire) {
             return Err(RoleError::Canceled.into());
         }
         if Instant::now() >= limits.deadline {
             return Err(RoleError::Deadline.into());
         }
-        self.stores
-            .dependencies
-            .add(observation, self.nodes[node].situation)?;
+        self.archive_add_dependency(observation, self.nodes[node].situation, limits, cancel)?;
         if let Some(root) = self.stores.root() {
-            self.stores.dependencies.add(observation, root)?;
+            self.archive_add_dependency(observation, root, limits, cancel)?;
         }
         // Acknowledgement occurs only after successful publication/dependency
         // admission and final controls; failed/late outputs are not consumed.
@@ -2885,7 +2946,7 @@ impl<M: RoleModel> PalsEngine<M> {
             generation,
             deadline_tick: self.tick_at(limits.deadline),
         };
-        let admission = match self.stores.request_task(
+        let admission = match self.archive_request_task(
             TaskKey {
                 state: self.nodes[divergence].state,
                 line: None,
@@ -2904,10 +2965,12 @@ impl<M: RoleModel> PalsEngine<M> {
             },
             consumer,
             self.tick_at(Instant::now()),
+            limits,
+            cancel,
         ) {
             Ok(admission) => admission,
-            Err(StoreError::ExpiredConsumer) => return Ok(None),
-            Err(error) => return Err(error.into()),
+            Err(PalsError::Store(StoreError::ExpiredConsumer)) => return Ok(None),
+            Err(error) => return Err(error),
         };
         let (execution, reused) = match admission {
             TaskAdmission::Start(execution) => (execution, None),
@@ -3026,41 +3089,41 @@ impl<M: RoleModel> PalsEngine<M> {
                 let pv_line = if projection.is_empty() {
                     None
                 } else {
-                    Some(
-                        self.stores
-                            .append_cpu_pv(&self.nodes[divergence].position, &projection)?,
-                    )
+                    Some(self.archive_append_cpu_pv(divergence, &projection, limits, cancel)?)
                 };
-                let observation = self.append_engine_observation(Observation {
-                    state: self.nodes[divergence].state,
-                    line: None,
-                    source: stable_id(&report.identity.adapter_semantics),
-                    epoch: 0,
-                    value_identity: None,
-                    checker_identity: Some(identity.clone()),
-                    checker_work: Some(report.work),
-                    external_report: Some(Box::new(report.clone())),
-                    model_value_identity: None,
-                    model_value_input: None,
-                    cpu_condition: Some(condition.clone()),
-                    cpu_pv: pv_line,
-                    scope: EvidenceScope::ExternalUci {
-                        requested_depth: report.requested_depth,
-                        reported_depth: report.reported_depth,
-                        seldepth: report.seldepth,
-                        bound: report.bound,
+                let observation = self.append_engine_observation_with_controls(
+                    Observation {
+                        state: self.nodes[divergence].state,
+                        line: None,
+                        source: stable_id(&report.identity.adapter_semantics),
+                        epoch: 0,
+                        value_identity: None,
+                        checker_identity: Some(identity.clone()),
+                        checker_work: Some(report.work),
+                        external_report: Some(Box::new(report.clone())),
+                        model_value_identity: None,
+                        model_value_input: None,
+                        cpu_condition: Some(condition.clone()),
+                        cpu_pv: pv_line,
+                        scope: EvidenceScope::ExternalUci {
+                            requested_depth: report.requested_depth,
+                            reported_depth: report.reported_depth,
+                            seldepth: report.seldepth,
+                            bound: report.bound,
+                        },
+                        score: RawScore::ExternalUci {
+                            value: report.score,
+                            bound: report.bound,
+                            perspective: report.perspective,
+                            wdl_per_mille: report.wdl_per_mille,
+                        },
+                        budget: report.work.nodes.unwrap_or(0),
+                        kind: ObservationKind::ExternalCpuAnalysis,
+                        supersedes: None,
+                        execution: Some(execution),
                     },
-                    score: RawScore::ExternalUci {
-                        value: report.score,
-                        bound: report.bound,
-                        perspective: report.perspective,
-                        wdl_per_mille: report.wdl_per_mille,
-                    },
-                    budget: report.work.nodes.unwrap_or(0),
-                    kind: ObservationKind::ExternalCpuAnalysis,
-                    supersedes: None,
-                    execution: Some(execution),
-                })?;
+                    Some((limits.deadline, cancel)),
+                )?;
                 Ok(observation)
             })();
             let observation = match publication {
@@ -3116,12 +3179,13 @@ impl<M: RoleModel> PalsEngine<M> {
         if complete {
             counters.consumed_external_checker_tasks += 1;
         }
-        self.stores
-            .dependencies
-            .add(observation, self.nodes[divergence].situation)?;
-        self.stores
-            .dependencies
-            .add(observation, self.nodes[root].situation)?;
+        self.archive_add_dependency(
+            observation,
+            self.nodes[divergence].situation,
+            limits,
+            cancel,
+        )?;
+        self.archive_add_dependency(observation, self.nodes[root].situation, limits, cancel)?;
         Ok(Some(CpuCandidate {
             pv,
             observation,
@@ -3345,7 +3409,7 @@ impl<M: RoleModel> PalsEngine<M> {
             generation,
             deadline_tick: self.tick_at(limits.deadline),
         };
-        let admission = match self.stores.request_task(
+        let admission = match self.archive_request_task(
             TaskKey {
                 state: self.nodes[divergence].state,
                 line: None,
@@ -3365,10 +3429,12 @@ impl<M: RoleModel> PalsEngine<M> {
             },
             consumer,
             self.tick_at(Instant::now()),
+            limits,
+            cancel,
         ) {
             Ok(admission) => admission,
-            Err(StoreError::ExpiredConsumer) => return Ok(None),
-            Err(error) => return Err(error.into()),
+            Err(PalsError::Store(StoreError::ExpiredConsumer)) => return Ok(None),
+            Err(error) => return Err(error),
         };
         let execution = match admission {
             TaskAdmission::Reuse {
@@ -3490,51 +3556,51 @@ impl<M: RoleModel> PalsEngine<M> {
             .copied()
             .take(self.config.line_plies.saturating_sub(prefix.len()))
             .collect();
-        let pv_line = match self
-            .stores
-            .append_cpu_pv(&self.nodes[divergence].position, &pv)
-        {
+        let pv_line = match self.archive_append_cpu_pv(divergence, &pv, limits, cancel) {
             Ok(line) => line,
             Err(error) => {
                 self.stores.tasks.fail(execution)?;
-                return Err(error.into());
+                return Err(error);
             }
         };
-        let observation = match self.append_engine_observation(Observation {
-            state: self.nodes[divergence].state,
-            line: None,
-            source: stable_id(report.score_provenance),
-            epoch: 0,
-            scope: EvidenceScope::DepthLimited {
-                depth: report.completed_depth,
-                profile,
-                condition,
+        let observation = match self.append_engine_observation_with_controls(
+            Observation {
+                state: self.nodes[divergence].state,
+                line: None,
+                source: stable_id(report.score_provenance),
+                epoch: 0,
+                scope: EvidenceScope::DepthLimited {
+                    depth: report.completed_depth,
+                    profile,
+                    condition,
+                },
+                value_identity: Some(report.value_identity.clone()),
+                checker_identity: None,
+                checker_work: None,
+                external_report: None,
+                model_value_identity: None,
+                model_value_input: None,
+                cpu_condition: Some(cpu_condition.clone()),
+                cpu_pv: Some(pv_line),
+                score: if report.score_scope == CpuScoreScope::FrontierOnly {
+                    RawScore::Estimate {
+                        value: report.score as f32,
+                        perspective: self.nodes[divergence].position.side_to_move(),
+                    }
+                } else {
+                    RawScore::Cpu {
+                        value: report.score,
+                        perspective: self.nodes[divergence].position.side_to_move(),
+                        bound: BoundKind::ExactWithinSearch,
+                    }
+                },
+                budget: report.nodes,
+                kind: ObservationKind::CpuAnalysis,
+                supersedes: None,
+                execution: Some(execution),
             },
-            value_identity: Some(report.value_identity.clone()),
-            checker_identity: None,
-            checker_work: None,
-            external_report: None,
-            model_value_identity: None,
-            model_value_input: None,
-            cpu_condition: Some(cpu_condition.clone()),
-            cpu_pv: Some(pv_line),
-            score: if report.score_scope == CpuScoreScope::FrontierOnly {
-                RawScore::Estimate {
-                    value: report.score as f32,
-                    perspective: self.nodes[divergence].position.side_to_move(),
-                }
-            } else {
-                RawScore::Cpu {
-                    value: report.score,
-                    perspective: self.nodes[divergence].position.side_to_move(),
-                    bound: BoundKind::ExactWithinSearch,
-                }
-            },
-            budget: report.nodes,
-            kind: ObservationKind::CpuAnalysis,
-            supersedes: None,
-            execution: Some(execution),
-        }) {
+            Some((limits.deadline, cancel)),
+        ) {
             Ok(observation) => observation,
             Err(error) => {
                 self.stores.tasks.fail(execution)?;
@@ -3574,12 +3640,13 @@ impl<M: RoleModel> PalsEngine<M> {
         } else {
             counters.consumed_frontier_cpu_values += 1;
         }
-        self.stores
-            .dependencies
-            .add(observation, self.nodes[divergence].situation)?;
-        self.stores
-            .dependencies
-            .add(observation, self.nodes[root].situation)?;
+        self.archive_add_dependency(
+            observation,
+            self.nodes[divergence].situation,
+            limits,
+            cancel,
+        )?;
+        self.archive_add_dependency(observation, self.nodes[root].situation, limits, cancel)?;
         Ok(Some(CpuCandidate {
             pv,
             observation,
@@ -3670,7 +3737,7 @@ impl<M: RoleModel> PalsEngine<M> {
             }
             let mut next = self.nodes[current].position.clone();
             next.make_move(movement)?;
-            current = self.connect(current, movement, next, counters)?;
+            current = self.connect_checked(current, movement, next, counters, limits, cancel)?;
             first.get_or_insert(current);
             line.push(movement);
         }
@@ -3682,6 +3749,7 @@ impl<M: RoleModel> PalsEngine<M> {
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64
     }
+    #[cfg(test)]
     fn record(
         &mut self,
         kind: RecordKind,
@@ -3691,7 +3759,7 @@ impl<M: RoleModel> PalsEngine<M> {
         score_scope: Option<CpuScoreScope>,
         perspective: Option<Color>,
     ) -> Result<Option<(LineId, ObservationId)>, PalsError> {
-        self.record_with_cpu(
+        self.record_with_cpu_impl(
             kind,
             line,
             value,
@@ -3699,12 +3767,36 @@ impl<M: RoleModel> PalsEngine<M> {
             score_scope,
             perspective,
             None,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn record_checked(
+        &mut self,
+        kind: RecordKind,
+        line: &[BoardMove],
+        value: Option<i32>,
+        completed_depth: u16,
+        score_scope: Option<CpuScoreScope>,
+        perspective: Option<Color>,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+    ) -> Result<Option<(LineId, ObservationId)>, PalsError> {
+        self.record_with_cpu_impl(
+            kind,
+            line,
+            value,
+            completed_depth,
+            score_scope,
+            perspective,
+            None,
+            Some((limits.deadline, cancel)),
         )
     }
     // Immutable CPU evidence is an explicit source, while the public line is
     // anchored at the active root and does not inherit the CPU state's value.
     #[allow(clippy::too_many_arguments)]
-    fn record_with_cpu(
+    fn record_with_cpu_checked(
         &mut self,
         kind: RecordKind,
         line: &[BoardMove],
@@ -3713,8 +3805,34 @@ impl<M: RoleModel> PalsEngine<M> {
         score_scope: Option<CpuScoreScope>,
         perspective: Option<Color>,
         cpu_observation: Option<ObservationId>,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
     ) -> Result<Option<(LineId, ObservationId)>, PalsError> {
-        self.revision = self.revision.checked_add(1).ok_or(PalsError::Capacity)?;
+        self.record_with_cpu_impl(
+            kind,
+            line,
+            value,
+            completed_depth,
+            score_scope,
+            perspective,
+            cpu_observation,
+            Some((limits.deadline, cancel)),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn record_with_cpu_impl(
+        &mut self,
+        kind: RecordKind,
+        line: &[BoardMove],
+        value: Option<i32>,
+        completed_depth: u16,
+        score_scope: Option<CpuScoreScope>,
+        perspective: Option<Color>,
+        cpu_observation: Option<ObservationId>,
+        controls: Option<(Instant, &AtomicBool)>,
+    ) -> Result<Option<(LineId, ObservationId)>, PalsError> {
+        Self::check_logical_controls(controls)?;
+        let revision = self.revision.checked_add(1).ok_or(PalsError::Capacity)?;
         let root = self.stores.root().ok_or(PalsError::Capacity)?;
         let root_state = self.stores.situations.get(root)?.state;
         let perspective = perspective.unwrap_or(self.stores.states.get(root_state)?.side_to_move());
@@ -3750,34 +3868,40 @@ impl<M: RoleModel> PalsEngine<M> {
         // Pin the newest proposal/counterexample/repair/CPU estimate for every
         // active first move. Drop only an obsolete input projection, never the
         // immutable observation from which it was derived.
-        for record in &mut self.records {
-            if record.origin_state == root_state
-                && record.kind == kind
-                && record.line.first() == line.first()
-            {
-                record.critical = false;
-            }
-        }
-        if self.records.len() == self.config.max_records {
+        let remains_critical = |record: &RoleRecord| {
+            record.critical
+                && !(record.origin_state == root_state
+                    && record.kind == kind
+                    && record.line.first() == line.first())
+        };
+        let obsolete = if self.records.len() == self.config.max_records {
             let obsolete = self
                 .records
                 .iter()
                 .position(|record| {
-                    !record.critical
+                    !remains_critical(record)
                         && Some(record.revision) != parent_revision
                         && Some(record.revision) != supersedes_revision
                         && !self.records.iter().any(|active| {
-                            active.critical
+                            remains_critical(active)
                                 && (active.parent_revision == Some(record.revision)
                                     || active.supersedes_revision == Some(record.revision))
                         })
                 })
-                .ok_or(PalsError::Capacity)?;
+                .ok_or_else(|| {
+                    if self.archive_enabled() {
+                        PalsError::Store(StoreError::PinSaturated("resident engine public records"))
+                    } else {
+                        PalsError::Capacity
+                    }
+                })?;
             self.archive_public_record_before_remove(obsolete)?;
-            self.records.remove(obsolete);
-        }
-        self.records.push(RoleRecord {
-            revision: self.revision,
+            Some(obsolete)
+        } else {
+            None
+        };
+        let record = RoleRecord {
+            revision,
             parent_revision,
             supersedes_revision,
             kind,
@@ -3789,43 +3913,76 @@ impl<M: RoleModel> PalsEngine<M> {
             cpu_observation,
             perspective,
             critical: true,
-        });
+        };
         if kind == RecordKind::CpuVerification || cpu_observation.is_some() {
+            Self::check_logical_controls(controls)?;
+            self.publish_record(record, obsolete);
             return Ok(None);
         }
-        let line_id = self
-            .stores
-            .append_line(self.stores.situations.get(root)?.focus, line)?;
-        let observation = self.append_engine_observation(Observation {
-            state: root_state,
-            line: Some(line_id),
-            source: stable_id(self.model.identity()),
-            epoch: 0,
-            scope: EvidenceScope::Model {
-                model: stable_id(self.model.identity()),
-                encoding: stable_id("pals-role-query-v1"),
-                input: self.revision,
+        let line_id =
+            self.archive_append_line(self.stores.situations.get(root)?.focus, line, controls)?;
+        let observation = self.append_engine_observation_with_controls(
+            Observation {
+                state: root_state,
+                line: Some(line_id),
+                source: stable_id(self.model.identity()),
+                epoch: 0,
+                scope: EvidenceScope::Model {
+                    model: stable_id(self.model.identity()),
+                    encoding: stable_id("pals-role-query-v1"),
+                    input: revision,
+                },
+                value_identity: None,
+                checker_identity: None,
+                checker_work: None,
+                external_report: None,
+                model_value_identity: None,
+                model_value_input: None,
+                cpu_condition: None,
+                cpu_pv: None,
+                score: RawScore::Unknown,
+                budget: 0,
+                kind: match kind {
+                    RecordKind::Proposal => ObservationKind::Proposal,
+                    RecordKind::Counterexample => ObservationKind::Refutation,
+                    RecordKind::Repair => ObservationKind::Repair,
+                    RecordKind::CpuVerification => unreachable!(),
+                },
+                supersedes: None,
+                execution: None,
             },
-            value_identity: None,
-            checker_identity: None,
-            checker_work: None,
-            external_report: None,
-            model_value_identity: None,
-            model_value_input: None,
-            cpu_condition: None,
-            cpu_pv: None,
-            score: RawScore::Unknown,
-            budget: 0,
-            kind: match kind {
-                RecordKind::Proposal => ObservationKind::Proposal,
-                RecordKind::Counterexample => ObservationKind::Refutation,
-                RecordKind::Repair => ObservationKind::Repair,
-                RecordKind::CpuVerification => unreachable!(),
-            },
-            supersedes: None,
-            execution: None,
-        })?;
+            controls,
+        )?;
+        self.pin_archive_active_record(line_id, observation)?;
+        Self::check_logical_controls(controls)?;
+        self.publish_record(record, obsolete);
         Ok(Some((line_id, observation)))
+    }
+    fn publish_record(&mut self, record: RoleRecord, obsolete: Option<usize>) {
+        for previous in &mut self.records {
+            if previous.origin_state == record.origin_state
+                && previous.kind == record.kind
+                && previous.line.first() == record.line.first()
+            {
+                previous.critical = false;
+            }
+        }
+        if let Some(index) = obsolete {
+            self.records.remove(index);
+        }
+        self.revision = record.revision;
+        self.records.push(record);
+    }
+    fn check_logical_controls(controls: Option<(Instant, &AtomicBool)>) -> Result<(), PalsError> {
+        if let Some((deadline, cancel)) = controls {
+            if cancel.load(Ordering::Acquire) {
+                return Err(RoleError::Canceled.into());
+            }
+            if Instant::now() >= deadline {
+                return Err(RoleError::Deadline.into());
+            }
+        }
+        Ok(())
     }
     fn refresh_projection(&mut self, root_state: StateId) {
         let mut newest = HashSet::new();
@@ -3918,7 +4075,7 @@ impl<M: RoleModel> PalsEngine<M> {
             }
             let mut child = self.nodes[root].position.clone();
             child.make_move(movement)?;
-            let first = self.connect(root, movement, child, counters)?;
+            let first = self.connect_checked(root, movement, child, counters, limits, cancel)?;
             let mut proposal = vec![movement];
             let leaf = self.follow(
                 first,
@@ -3931,8 +4088,16 @@ impl<M: RoleModel> PalsEngine<M> {
                 counters,
             )?;
             counters.proposals += 1;
-            let proposal_record =
-                self.record(RecordKind::Proposal, &proposal, None, 0, None, None)?;
+            let proposal_record = self.record_checked(
+                RecordKind::Proposal,
+                &proposal,
+                None,
+                0,
+                None,
+                None,
+                limits,
+                cancel,
+            )?;
             self.verify(leaf, &proposal, limits, cancel, counters)?;
             self.publish_choice(root, limits, cancel, progress)?;
             let proposal_value = self.completed_line_value(leaf, proposal.len(), limits.cpu_depth);
@@ -4045,7 +4210,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 None
             };
             if let (Some((_, _, line)), Some(candidate)) = (&cpu_line, &cpu_discovery) {
-                self.record_with_cpu(
+                self.record_with_cpu_checked(
                     RecordKind::Counterexample,
                     line,
                     None,
@@ -4053,6 +4218,8 @@ impl<M: RoleModel> PalsEngine<M> {
                     None,
                     None,
                     Some(candidate.observation),
+                    limits,
+                    cancel,
                 )?;
             }
             // C receives the actual CPU-created candidate projection before its
@@ -4102,7 +4269,8 @@ impl<M: RoleModel> PalsEngine<M> {
             if let Some(response) = response.filter(|_| self.stopped(limits, cancel).is_none()) {
                 let mut state = self.nodes[divergence].position.clone();
                 state.make_move(response)?;
-                let response_node = self.connect(divergence, response, state, counters)?;
+                let response_node =
+                    self.connect_checked(divergence, response, state, counters, limits, cancel)?;
                 let mut line = prefix.to_vec();
                 line.push(response);
                 branches.push((response_node, response_node, line, None));
@@ -4125,7 +4293,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 let response = refutation[ply];
                 counters.refutations += 1;
                 if cpu_source.is_some() {
-                    self.record_with_cpu(
+                    self.record_with_cpu_checked(
                         RecordKind::Counterexample,
                         &refutation,
                         None,
@@ -4133,9 +4301,20 @@ impl<M: RoleModel> PalsEngine<M> {
                         None,
                         None,
                         cpu_source,
+                        limits,
+                        cancel,
                     )?;
                 } else {
-                    self.record(RecordKind::Counterexample, &refutation, None, 0, None, None)?;
+                    self.record_checked(
+                        RecordKind::Counterexample,
+                        &refutation,
+                        None,
+                        0,
+                        None,
+                        None,
+                        limits,
+                        cancel,
+                    )?;
                 }
                 self.verify(counter_leaf, &refutation, limits, cancel, counters)?;
                 self.publish_choice(root, limits, cancel, progress)?;
@@ -4148,17 +4327,21 @@ impl<M: RoleModel> PalsEngine<M> {
                     (Some((line, _)), Some(old), Some(counter))
                         if counter < old && self.stopped(limits, cancel).is_none() =>
                     {
-                        let evidence = self.conclusion_observation(
+                        let evidence = self.conclusion_observation_checked(
                             root,
                             line,
                             ObservationKind::Refutation,
                             counter,
                             None,
+                            limits,
+                            cancel,
                         )?;
-                        self.stores.refute_continuation(
+                        self.archive_refute_continuation(
                             self.nodes[root].situation,
                             line,
                             evidence,
+                            limits,
+                            cancel,
                         )?;
                         counters.supported_refutations += 1;
                         Some((line, evidence, counter))
@@ -4184,8 +4367,16 @@ impl<M: RoleModel> PalsEngine<M> {
                     counters,
                 )?;
                 counters.repairs += 1;
-                let repair_record =
-                    self.record(RecordKind::Repair, &repair, None, 0, None, None)?;
+                let repair_record = self.record_checked(
+                    RecordKind::Repair,
+                    &repair,
+                    None,
+                    0,
+                    None,
+                    None,
+                    limits,
+                    cancel,
+                )?;
                 let repair_record_revision = self.revision;
                 self.verify(repair_leaf, &repair, limits, cancel, counters)?;
                 self.publish_choice(root, limits, cancel, progress)?;
@@ -4201,18 +4392,22 @@ impl<M: RoleModel> PalsEngine<M> {
                         && new_value > old_value
                         && self.stopped(limits, cancel).is_none()
                     {
-                        let evidence = self.conclusion_observation(
+                        let evidence = self.conclusion_observation_checked(
                             root,
                             new_line,
                             ObservationKind::Repair,
                             new_value,
                             Some(old_evidence),
+                            limits,
+                            cancel,
                         )?;
-                        self.stores.repair(
+                        self.archive_repair(
                             self.nodes[root].situation,
                             old_line,
                             new_line,
                             evidence,
+                            limits,
+                            cancel,
                         )?;
                         counters.supported_repairs += 1;
                     }
@@ -4635,7 +4830,8 @@ impl<M: RoleModel> PalsEngine<M> {
         counter.extend_from_slice(&repair.repaired[..anchor_ply]);
         let mut state = self.nodes[anchor].position.clone();
         state.make_move(response)?;
-        let mut counter_leaf = self.connect(anchor, response, state, counters)?;
+        let mut counter_leaf =
+            self.connect_checked(anchor, response, state, counters, limits, cancel)?;
         trace.counter_leaf = Some(counter_leaf);
         counter.push(response);
         if self.post_repair_recheck == PostRepairRecheckPolicy::ActualOpponentContinuationV1 {
@@ -4661,7 +4857,8 @@ impl<M: RoleModel> PalsEngine<M> {
                 };
                 let mut state = self.nodes[counter_leaf].position.clone();
                 state.make_move(movement)?;
-                counter_leaf = self.connect(counter_leaf, movement, state, counters)?;
+                counter_leaf =
+                    self.connect_checked(counter_leaf, movement, state, counters, limits, cancel)?;
                 trace.counter_leaf = Some(counter_leaf);
                 counter.push(movement);
             }
@@ -4681,7 +4878,8 @@ impl<M: RoleModel> PalsEngine<M> {
                 }
                 let mut state = self.nodes[counter_leaf].position.clone();
                 state.make_move(*movement)?;
-                counter_leaf = self.connect(counter_leaf, *movement, state, counters)?;
+                counter_leaf =
+                    self.connect_checked(counter_leaf, *movement, state, counters, limits, cancel)?;
                 trace.counter_leaf = Some(counter_leaf);
                 counter.push(*movement);
             }
@@ -4689,13 +4887,15 @@ impl<M: RoleModel> PalsEngine<M> {
             trace.counterline_completed = full_suffix && counter.len() == repair.repaired.len();
         }
         counters.refutations += 1;
-        self.record(
+        self.record_checked(
             RecordKind::Counterexample,
             counter.as_slice(),
             None,
             0,
             None,
             None,
+            limits,
+            cancel,
         )?;
         self.verify(counter_leaf, counter.as_slice(), limits, cancel, counters)?;
         self.publish_choice(repair.root, limits, cancel, progress)?;
@@ -4756,17 +4956,21 @@ impl<M: RoleModel> PalsEngine<M> {
             }
             .into());
         }
-        let evidence = self.conclusion_observation(
+        let evidence = self.conclusion_observation_checked(
             repair.root,
             repair.repaired_line,
             ObservationKind::Refutation,
             counter_value,
             previous_evidence,
+            limits,
+            cancel,
         )?;
-        self.stores.refute_continuation(
+        self.archive_refute_continuation(
             self.nodes[repair.root].situation,
             repair.repaired_line,
             evidence,
+            limits,
+            cancel,
         )?;
         counters.supported_refutations += 1;
         Ok(evidence)
@@ -5063,6 +5267,7 @@ impl<M: RoleModel> PalsEngine<M> {
             resolver_version: self.resolver_version(),
         })
     }
+    #[cfg(test)]
     fn conclusion_observation(
         &mut self,
         root: usize,
@@ -5071,35 +5276,69 @@ impl<M: RoleModel> PalsEngine<M> {
         value: i32,
         supersedes: Option<ObservationId>,
     ) -> Result<ObservationId, PalsError> {
+        self.conclusion_observation_with_controls(root, line, kind, value, supersedes, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn conclusion_observation_checked(
+        &mut self,
+        root: usize,
+        line: LineId,
+        kind: ObservationKind,
+        value: i32,
+        supersedes: Option<ObservationId>,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+    ) -> Result<ObservationId, PalsError> {
+        self.conclusion_observation_with_controls(
+            root,
+            line,
+            kind,
+            value,
+            supersedes,
+            Some((limits.deadline, cancel)),
+        )
+    }
+    fn conclusion_observation_with_controls(
+        &mut self,
+        root: usize,
+        line: LineId,
+        kind: ObservationKind,
+        value: i32,
+        supersedes: Option<ObservationId>,
+        controls: Option<(Instant, &AtomicBool)>,
+    ) -> Result<ObservationId, PalsError> {
         // Restricted-search summaries deliberately retain estimate scope. Even
         // a finite CPU mate score cannot mint RulesTerminal through this route.
-        self.append_engine_observation(Observation {
-            state: self.nodes[root].state,
-            line: Some(line),
-            source: stable_id(self.search_identity()),
-            epoch: 0,
-            scope: EvidenceScope::Model {
-                model: stable_id(self.model.identity()),
-                encoding: stable_id("pals-restricted-summary-v1"),
-                input: self.revision,
+        self.append_engine_observation_with_controls(
+            Observation {
+                state: self.nodes[root].state,
+                line: Some(line),
+                source: stable_id(self.search_identity()),
+                epoch: 0,
+                scope: EvidenceScope::Model {
+                    model: stable_id(self.model.identity()),
+                    encoding: stable_id("pals-restricted-summary-v1"),
+                    input: self.revision,
+                },
+                value_identity: None,
+                checker_identity: None,
+                checker_work: None,
+                external_report: None,
+                model_value_identity: None,
+                model_value_input: None,
+                cpu_condition: None,
+                cpu_pv: None,
+                score: RawScore::Estimate {
+                    value: value as f32,
+                    perspective: self.nodes[root].position.side_to_move(),
+                },
+                budget: 0,
+                kind,
+                supersedes,
+                execution: None,
             },
-            value_identity: None,
-            checker_identity: None,
-            checker_work: None,
-            external_report: None,
-            model_value_identity: None,
-            model_value_input: None,
-            cpu_condition: None,
-            cpu_pv: None,
-            score: RawScore::Estimate {
-                value: value as f32,
-                perspective: self.nodes[root].position.side_to_move(),
-            },
-            budget: 0,
-            kind,
-            supersedes,
-            execution: None,
-        })
+            controls,
+        )
     }
     fn publish_choice(
         &self,
