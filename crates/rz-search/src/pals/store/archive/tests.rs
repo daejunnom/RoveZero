@@ -1413,3 +1413,824 @@ fn node_lookup_ignores_newer_record_only_segment_without_changing_generic_lookup
     );
     assert_eq!(with_nodes.archive.io_bytes, initial - shared.max_bytes);
 }
+
+#[test]
+fn scoped_terminal_admission_keeps_uninstalled_situation_and_pending_raw_ids_hot() {
+    let root = TestRoot::new();
+    let mut small = limits();
+    small.observations = 5;
+    let mut store = PalsStores::new(small);
+    store.enable_archive(root.config()).unwrap();
+    let actual = store
+        .focus_actual_moves(Position::startpos().snapshot())
+        .unwrap();
+    let actual_state = store.situations.get(actual).unwrap().state;
+    let mate = Position::from_fen("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1").unwrap();
+    let mut shared = budget();
+    let original = shared;
+    let pending = store
+        .with_archive_allocation(StorePins::default(), &mut shared, |stores| {
+            stores.insert_situation(mate.snapshot())
+        })
+        .unwrap();
+    assert_eq!(shared.max_bytes, original.max_bytes);
+    let pending_state = store.situations.get(pending).unwrap().state;
+    let pending_line = store
+        .append_line(store.situations.get(actual).unwrap().focus, &[mv("e2e4")])
+        .unwrap();
+    let mut raw = observation(actual_state);
+    raw.line = Some(pending_line);
+    let pending_raw = store.append_observation(raw).unwrap();
+    let historical = (0..3)
+        .map(|_| store.append_observation(observation(actual_state)).unwrap())
+        .collect::<Vec<_>>();
+    assert!(store.archive_pressure());
+    let mut pins = StorePins::default();
+    pins.states.insert(pending_state);
+    pins.situations.insert(pending);
+    pins.lines.insert(pending_line);
+    pins.observations.insert(pending_raw);
+    let terminal = store
+        .with_archive_allocation(pins, &mut shared, |stores| {
+            stores.append_rules_terminal_controlled(&mate, 0, 0, || Ok(()))
+        })
+        .unwrap();
+    assert_eq!(store.situations.get(pending).unwrap().state, pending_state);
+    assert!(store.lines.get(pending_line).is_ok());
+    assert!(store.observations.get(pending_raw).is_ok());
+    assert_eq!(
+        store.observations.get(terminal).unwrap().state,
+        pending_state
+    );
+    assert_eq!(
+        store.observations.get(terminal).unwrap().score,
+        RawScore::Terminal {
+            winner: Some(Color::White)
+        }
+    );
+    for id in historical {
+        assert_eq!(
+            store.observations.get(id),
+            Err(StoreError::ColdRecord("observation"))
+        );
+    }
+    let manager = store.archive.as_ref().unwrap();
+    assert_eq!(manager.next_generation, 1);
+    let bytes = fs::metadata(manager.path(0)).unwrap().len();
+    assert_eq!(original.max_bytes - shared.max_bytes, 2 * bytes);
+    assert_eq!(shared.deadline, original.deadline);
+    assert!(!manager.allocation_active);
+    assert!(manager.auto_budget.is_none());
+    assert_eq!(manager.pins, StorePins::default());
+}
+
+#[test]
+fn scoped_allocation_has_one_capacity_retry_and_returns_debits_on_both_outcomes() {
+    for failures in [1, 2] {
+        let root = TestRoot::new();
+        let mut store = setup(&root);
+        let mut position = Position::startpos();
+        let old = store.focus_actual_moves(position.snapshot()).unwrap();
+        let old_state = store.situations.get(old).unwrap().state;
+        position.make_move(mv("e2e4")).unwrap();
+        let actual = store.focus_actual_moves(position.snapshot()).unwrap();
+        let mut old_pins = StorePins::default();
+        old_pins.situations.insert(actual);
+        store.set_archive_pins(old_pins.clone()).unwrap();
+        store.states.snapshots.fail_next_reservations(failures);
+        position.make_move(mv("e7e5")).unwrap();
+        let mut shared = budget();
+        let original = shared;
+        let result = store.with_archive_allocation(StorePins::default(), &mut shared, |stores| {
+            stores.insert_situation_controlled(position.snapshot(), || Ok(()))
+        });
+        let manager = store.archive.as_ref().unwrap();
+        assert_eq!(manager.next_generation, 1);
+        assert_eq!(
+            original.max_bytes - shared.max_bytes,
+            2 * fs::metadata(manager.path(0)).unwrap().len()
+        );
+        assert_eq!(shared.deadline, original.deadline);
+        assert_eq!(manager.pins, old_pins);
+        assert!(!manager.allocation_active);
+        assert!(manager.auto_budget.is_none());
+        assert!(store.states.get(old_state).is_err());
+        assert!(store.situations.get(actual).is_ok());
+        if failures == 1 {
+            let fresh = result.unwrap();
+            assert!(store.situations.get(fresh).unwrap().state.0 > old_state.0);
+            assert_ne!(fresh, old);
+        } else {
+            assert_eq!(result, Err(StoreError::Capacity("injected hot allocation")));
+        }
+    }
+}
+
+#[test]
+fn scoped_allowance_rejects_second_budget_and_restores_pins_after_error_and_unwind() {
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let actual = store
+        .focus_actual_moves(Position::startpos().snapshot())
+        .unwrap();
+    let state = store.situations.get(actual).unwrap().state;
+    let receipt = store.archive_engine_records(&[], &[], budget()).unwrap();
+    let mut old_pins = StorePins::default();
+    old_pins.states.insert(state);
+    store.set_archive_pins(old_pins.clone()).unwrap();
+    let mut extra = StorePins::default();
+    extra.situations.insert(actual);
+    let mut shared = budget();
+    let original = shared;
+    let conflict = StoreError::InvalidConditions("archive allocation allowance is active");
+    let result: Result<(), StoreError> =
+        store.with_archive_allocation(extra, &mut shared, |stores| {
+            let mut other = budget();
+            let other_original = other;
+            assert_eq!(
+                stores.with_archive_allocation(StorePins::default(), &mut other, |_| Ok(())),
+                Err(conflict.clone())
+            );
+            assert_eq!(stores.set_archive_io_budget(other), Err(conflict.clone()));
+            assert_eq!(
+                stores.set_archive_pins(StorePins::default()),
+                Err(conflict.clone())
+            );
+            assert_eq!(
+                stores
+                    .append_observation_checked_with_archive_budget(observation(state), &mut other),
+                Err(conflict.clone())
+            );
+            assert!(matches!(
+                stores.archive_inactive_with_budget(&mut other),
+                Err(StoreError::InvalidConditions(_))
+            ));
+            assert!(matches!(
+                stores.lookup_cold_state_id_with_budget(state, &mut other),
+                Err(StoreError::InvalidConditions(_))
+            ));
+            assert!(matches!(
+                stores.archive_engine_records_with_pins_and_budget(
+                    &[],
+                    &[],
+                    StorePins::default(),
+                    &mut other
+                ),
+                Err(StoreError::InvalidConditions(_))
+            ));
+            assert!(matches!(
+                stores.read_engine_archive(&receipt, other),
+                Err(StoreError::InvalidConditions(_))
+            ));
+            assert!(matches!(
+                stores.pin_load(&receipt.archive.state_handle(state), other),
+                Err(StoreError::InvalidConditions(_))
+            ));
+            assert_eq!(other.max_bytes, other_original.max_bytes);
+            Err(StoreError::InvalidConditions("fixture operation failed"))
+        });
+    assert_eq!(
+        result,
+        Err(StoreError::InvalidConditions("fixture operation failed"))
+    );
+    assert_eq!(shared.max_bytes, original.max_bytes);
+    assert_eq!(store.archive.as_ref().unwrap().pins, old_pins);
+    assert!(store.archive.as_ref().unwrap().auto_budget.is_none());
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.with_archive_allocation::<()>(StorePins::default(), &mut shared, |_| {
+            panic!("fixture unwind")
+        })
+    }));
+    assert!(unwind.is_err());
+    let manager = store.archive.as_ref().unwrap();
+    assert_eq!(manager.pins, old_pins);
+    assert!(!manager.allocation_active);
+    assert!(manager.auto_budget.is_none());
+    store
+        .with_archive_allocation(StorePins::default(), &mut shared, |_| Ok(()))
+        .unwrap();
+    store.set_archive_io_budget(original).unwrap();
+    assert_eq!(
+        store.with_archive_allocation(StorePins::default(), &mut shared, |_| Ok(())),
+        Err(conflict)
+    );
+    assert_eq!(
+        store
+            .archive
+            .as_ref()
+            .unwrap()
+            .auto_budget
+            .unwrap()
+            .max_bytes,
+        original.max_bytes
+    );
+}
+
+#[test]
+fn scoped_quota_io_bytes_and_expired_deadline_failures_preserve_hot_rows() {
+    for failure in ["quota", "io", "bytes", "deadline"] {
+        let root = TestRoot::new();
+        let mut store = setup(&root);
+        let mut position = Position::startpos();
+        store.focus_actual_moves(position.snapshot()).unwrap();
+        position.make_move(mv("e2e4")).unwrap();
+        store.focus_actual_moves(position.snapshot()).unwrap();
+        position.make_move(mv("e7e5")).unwrap();
+        let before = store.hot_stats();
+        store.states.snapshots.fail_next_reservations(1);
+        let directory = store.archive.as_ref().unwrap().directory.clone();
+        let mut shared = budget();
+        match failure {
+            "quota" => store.archive.as_mut().unwrap().config.game_bytes = 80,
+            "io" => fs::remove_dir(&directory).unwrap(),
+            "bytes" => shared.max_bytes = 0,
+            "deadline" => shared.deadline = Instant::now() - Duration::from_millis(1),
+            _ => unreachable!(),
+        }
+        let original = shared;
+        let error = store
+            .with_archive_allocation(StorePins::default(), &mut shared, |stores| {
+                stores.insert_situation(position.snapshot())
+            })
+            .unwrap_err();
+        match failure {
+            "quota" => assert_eq!(error, StoreError::ArchiveQuota("game archive")),
+            "io" => assert!(matches!(error, StoreError::ArchiveIo { .. })),
+            "bytes" => assert_eq!(error, StoreError::ArchiveByteBudget),
+            "deadline" => assert_eq!(error, StoreError::ArchiveDeadline),
+            _ => unreachable!(),
+        }
+        assert_eq!(store.hot_stats(), before);
+        assert_eq!(shared.max_bytes, original.max_bytes);
+        assert_eq!(shared.deadline, original.deadline);
+        let manager = store.archive.as_ref().unwrap();
+        assert!(!manager.allocation_active);
+        assert!(manager.auto_budget.is_none());
+        assert_eq!(manager.pins, StorePins::default());
+        store.archive.as_mut().unwrap().config.game_bytes = GAME_ARCHIVE_BYTES;
+        if failure == "io" {
+            fs::create_dir(&directory).unwrap();
+        }
+        let mut recovered = budget();
+        store
+            .with_archive_allocation(StorePins::default(), &mut recovered, |stores| {
+                stores.insert_situation(position.snapshot())
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn scoped_dependency_refutation_and_repair_retry_do_not_publish_partial_revisions() {
+    for operation in ["dependency", "refutation", "repair"] {
+        for failures in [1, 2] {
+            let root = TestRoot::new();
+            let mut store = setup(&root);
+            let mut position = Position::startpos();
+            let old = store.focus_actual_moves(position.snapshot()).unwrap();
+            let old_state = store.situations.get(old).unwrap().state;
+            let old_raw = store.append_observation(observation(old_state)).unwrap();
+            store.add_dependency(old_raw, old).unwrap();
+            position.make_move(mv("e2e4")).unwrap();
+            let actual = store.focus_actual_moves(position.snapshot()).unwrap();
+            let current = store.situations.get(actual).unwrap().clone();
+            let old_line = store.append_line(current.focus, &[mv("e7e5")]).unwrap();
+            let repaired_line = store.append_line(current.focus, &[mv("c7c5")]).unwrap();
+            let mut raw = observation(current.state);
+            raw.line = Some(old_line);
+            raw.kind = ObservationKind::Refutation;
+            let refutation = store.append_observation(raw).unwrap();
+            let evidence = if operation == "repair" {
+                store
+                    .refute_continuation(actual, old_line, refutation)
+                    .unwrap();
+                let mut raw = observation(current.state);
+                raw.line = Some(repaired_line);
+                raw.kind = ObservationKind::Repair;
+                raw.supersedes = Some(refutation);
+                store.append_observation(raw).unwrap()
+            } else {
+                refutation
+            };
+            let revision = store.situations.get(actual).unwrap().revision;
+            store.dependencies.fail_allocations = failures;
+            let mut shared = budget();
+            let original = shared;
+            let result =
+                store.with_archive_allocation(StorePins::default(), &mut shared, |stores| {
+                    match operation {
+                        "dependency" => {
+                            stores.add_dependency_controlled(evidence, actual, || Ok(()))
+                        }
+                        "refutation" => stores.refute_continuation_controlled(
+                            actual,
+                            old_line,
+                            evidence,
+                            || Ok(()),
+                        ),
+                        "repair" => stores.repair_controlled(
+                            actual,
+                            old_line,
+                            repaired_line,
+                            evidence,
+                            || Ok(()),
+                        ),
+                        _ => unreachable!(),
+                    }
+                });
+            assert_eq!(store.archive.as_ref().unwrap().next_generation, 1);
+            assert!(shared.max_bytes < original.max_bytes);
+            assert!(store.states.get(old_state).is_err());
+            assert!(store.observations.get(evidence).is_ok());
+            let current = store.situations.get(actual).unwrap();
+            if failures == 2 {
+                assert_eq!(
+                    result,
+                    Err(StoreError::Capacity("injected dependency allocation"))
+                );
+                assert_eq!(current.revision, revision);
+                assert_eq!(store.dependencies.affected(evidence).count(), 0);
+                if operation == "repair" {
+                    assert_eq!(
+                        current.conclusions.get(old_line).unwrap().status,
+                        ContinuationStatus::Refuted
+                    );
+                    assert!(current.conclusions.get(repaired_line).is_none());
+                } else {
+                    assert!(current.conclusions.get(old_line).is_none());
+                }
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    store.dependencies.affected(evidence).collect::<Vec<_>>(),
+                    vec![actual]
+                );
+                assert_eq!(
+                    current.revision,
+                    revision + u64::from(operation != "dependency")
+                );
+                if operation == "repair" {
+                    assert_eq!(
+                        current.conclusions.get(old_line).unwrap().status,
+                        ContinuationStatus::RepairedBy(repaired_line)
+                    );
+                    assert_eq!(
+                        current.conclusions.get(repaired_line).unwrap().status,
+                        ContinuationStatus::Supported
+                    );
+                }
+            }
+            assert!(store.archive.as_ref().unwrap().auto_budget.is_none());
+        }
+    }
+}
+
+#[test]
+fn scoped_controls_stop_after_commit_before_initial_allocation_or_capacity_retry() {
+    for forced in [false, true] {
+        for cause in [StoreError::ArchiveCanceled, StoreError::ArchiveDeadline] {
+            let root = TestRoot::new();
+            let mut store = setup(&root);
+            let mut position = Position::startpos();
+            let old = store.focus_actual_moves(position.snapshot()).unwrap();
+            let old_state = store.situations.get(old).unwrap().state;
+            for movement in if forced {
+                vec!["e2e4"]
+            } else {
+                vec!["e2e4", "e7e5", "g1f3"]
+            } {
+                position.make_move(mv(movement)).unwrap();
+                store.focus_actual_moves(position.snapshot()).unwrap();
+            }
+            let actual = store.root().unwrap();
+            if forced {
+                store.states.snapshots.fail_next_reservations(1);
+            }
+            position
+                .make_move(mv(if forced { "e7e5" } else { "b8c6" }))
+                .unwrap();
+            let serial_before = store.states.snapshots.next_id();
+            let mut shared = budget();
+            let original = shared;
+            let mut calls = 0;
+            let result =
+                store.with_archive_allocation(StorePins::default(), &mut shared, |stores| {
+                    stores.insert_situation_controlled(position.snapshot(), || {
+                        calls += 1;
+                        if calls == if forced { 4 } else { 2 } {
+                            Err(cause.clone())
+                        } else {
+                            Ok(())
+                        }
+                    })
+                });
+            assert_eq!(result, Err(cause));
+            assert_eq!(store.states.snapshots.next_id(), serial_before);
+            assert!(store.states.find(&position.snapshot()).is_none());
+            assert!(store.situations.get(actual).is_ok());
+            assert!(store.states.get(old_state).is_err());
+            let manager = store.archive.as_ref().unwrap();
+            assert_eq!(manager.next_generation, 1);
+            assert_eq!(
+                original.max_bytes - shared.max_bytes,
+                2 * fs::metadata(manager.path(0)).unwrap().len()
+            );
+            assert_eq!(shared.deadline, original.deadline);
+            assert!(!manager.allocation_active);
+            assert!(manager.auto_budget.is_none());
+        }
+    }
+}
+
+#[test]
+fn scoped_pin_saturation_preserves_last_valid_rows_and_does_not_extend_budget() {
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let actual = store
+        .focus_actual_moves(Position::startpos().snapshot())
+        .unwrap();
+    let state = store.situations.get(actual).unwrap().state;
+    let mut pins = StorePins::default();
+    pins.situations.insert(actual);
+    for _ in 0..limits().observations {
+        pins.observations
+            .insert(store.append_observation(observation(state)).unwrap());
+    }
+    let before = store.hot_stats();
+    let mut shared = budget();
+    let original = shared;
+    let result = store.with_archive_allocation(pins.clone(), &mut shared, |stores| {
+        stores.append_observation(observation(state))
+    });
+    assert_eq!(
+        result,
+        Err(StoreError::PinSaturated("all hot records pinned"))
+    );
+    assert_eq!(store.hot_stats(), before);
+    for id in pins.observations {
+        assert!(store.observations.get(id).is_ok());
+    }
+    assert_eq!(shared.max_bytes, original.max_bytes);
+    assert_eq!(shared.deadline, original.deadline);
+    assert_eq!(store.archive.as_ref().unwrap().next_generation, 0);
+    assert!(store.archive.as_ref().unwrap().auto_budget.is_none());
+}
+
+#[test]
+fn final_control_failure_keeps_raw_evidence_without_publishing_refutation_or_repair() {
+    for repairing in [false, true] {
+        let root = TestRoot::new();
+        let mut store = setup(&root);
+        let actual = store
+            .focus_actual_moves(Position::startpos().snapshot())
+            .unwrap();
+        let current = store.situations.get(actual).unwrap().clone();
+        let refuted = store.append_line(current.focus, &[mv("e2e4")]).unwrap();
+        let repaired = store.append_line(current.focus, &[mv("d2d4")]).unwrap();
+        let mut raw = observation(current.state);
+        raw.line = Some(refuted);
+        raw.kind = ObservationKind::Refutation;
+        let refutation = store.append_observation(raw).unwrap();
+        let evidence = if repairing {
+            store
+                .refute_continuation(actual, refuted, refutation)
+                .unwrap();
+            let mut raw = observation(current.state);
+            raw.line = Some(repaired);
+            raw.kind = ObservationKind::Repair;
+            raw.supersedes = Some(refutation);
+            store.append_observation(raw).unwrap()
+        } else {
+            refutation
+        };
+        let retained = store.observations.get(evidence).unwrap().clone();
+        let revision = store.situations.get(actual).unwrap().revision;
+        let mut calls = 0;
+        let mut shared = budget();
+        let original = shared;
+        let result = store.with_archive_allocation(StorePins::default(), &mut shared, |stores| {
+            let controls = || {
+                calls += 1;
+                if calls == 3 {
+                    Err(StoreError::ArchiveCanceled)
+                } else {
+                    Ok(())
+                }
+            };
+            if repairing {
+                stores.repair_controlled(actual, refuted, repaired, evidence, controls)
+            } else {
+                stores.refute_continuation_controlled(actual, refuted, evidence, controls)
+            }
+        });
+        assert_eq!(result, Err(StoreError::ArchiveCanceled));
+        assert_eq!(store.situations.get(actual).unwrap().revision, revision);
+        assert_eq!(store.observations.get(evidence).unwrap(), &retained);
+        assert_eq!(
+            store.dependencies.affected(evidence).collect::<Vec<_>>(),
+            vec![actual]
+        );
+        let conclusions = &store.situations.get(actual).unwrap().conclusions;
+        assert!(conclusions.get(repaired).is_none());
+        if repairing {
+            assert_eq!(
+                conclusions.get(refuted).unwrap().status,
+                ContinuationStatus::Refuted
+            );
+        } else {
+            assert!(conclusions.get(refuted).is_none());
+        }
+        assert_eq!(shared.max_bytes, original.max_bytes);
+        assert!(store.archive.as_ref().unwrap().auto_budget.is_none());
+    }
+}
+
+#[test]
+fn unreturned_task_admission_retires_only_new_reservations_and_keeps_physical_facts() {
+    for admission_kind in ["start", "join", "reuse", "resume"] {
+        let root = TestRoot::new();
+        let mut store = setup(&root);
+        let actual = store
+            .focus_actual_moves(Position::startpos().snapshot())
+            .unwrap();
+        let state = store.situations.get(actual).unwrap().state;
+        let consumer = TaskConsumer {
+            id: 1,
+            situation: actual,
+            revision: 0,
+            generation: store.generation(),
+            deadline_tick: 100,
+        };
+        let previous = if admission_kind != "start" {
+            let TaskAdmission::Start(execution) =
+                store.request_task(key(state), consumer, 0).unwrap()
+            else {
+                panic!("start")
+            };
+            Some(execution)
+        } else {
+            None
+        };
+        let mut completed = None;
+        if admission_kind == "reuse" {
+            let execution = previous.unwrap();
+            let mut raw = observation(state);
+            raw.execution = Some(execution);
+            let evidence = store.append_observation(raw).unwrap();
+            store.complete_task(execution, evidence).unwrap();
+            completed = Some(evidence);
+        } else if admission_kind == "resume" {
+            store.pause_task(previous.unwrap(), 7, None).unwrap();
+        }
+        let mut calls = 0;
+        let mut shared = budget();
+        let result = store.with_archive_allocation(StorePins::default(), &mut shared, |stores| {
+            stores.request_task_controlled(
+                key(state),
+                TaskConsumer { id: 2, ..consumer },
+                0,
+                || {
+                    calls += 1;
+                    if calls == 3 {
+                        Err(StoreError::ArchiveCanceled)
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+        });
+        assert_eq!(result, Err(StoreError::ArchiveCanceled));
+        let issued = *store.tasks.latest.get(&key(state)).unwrap();
+        let task = store.tasks.get(issued).unwrap();
+        assert!(
+            task.consumers
+                .iter()
+                .find(|record| record.consumer.id == 2)
+                .unwrap()
+                .cancelled
+        );
+        match admission_kind {
+            "start" => {
+                assert_eq!(task.status, TaskStatus::Failed);
+                assert!(store.tasks.active_states().next().is_none());
+            }
+            "resume" => {
+                assert_eq!(task.status, TaskStatus::Failed);
+                assert_eq!(task.resumed_from, previous);
+                assert!(matches!(
+                    store.tasks.get(previous.unwrap()).unwrap().status,
+                    TaskStatus::Paused { checkpoint: 7, .. }
+                ));
+            }
+            "join" => {
+                assert_eq!(issued, previous.unwrap());
+                assert_eq!(task.status, TaskStatus::InFlight);
+                assert!(!task.consumers[0].cancelled);
+            }
+            "reuse" => {
+                assert_eq!(issued, previous.unwrap());
+                assert_eq!(task.status, TaskStatus::Completed(completed.unwrap()));
+                assert!(store.observations.get(completed.unwrap()).is_ok());
+            }
+            _ => unreachable!(),
+        }
+        assert!(store.archive.as_ref().unwrap().auto_budget.is_none());
+    }
+}
+
+#[test]
+fn controlled_foreign_scan_and_pressure_commit_return_shared_debits_on_cancel() {
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let mut position = Position::startpos();
+    let old = store.focus_actual_moves(position.snapshot()).unwrap();
+    let state = store.situations.get(old).unwrap().state;
+    let consumer = TaskConsumer {
+        id: 71,
+        situation: old,
+        revision: 0,
+        generation: store.generation(),
+        deadline_tick: 100,
+    };
+    let TaskAdmission::Start(execution) =
+        store.request_task(foreign_key(state), consumer, 0).unwrap()
+    else {
+        panic!("start")
+    };
+    let pv = store.append_cpu_pv(&position, &[mv("e2e4")]).unwrap();
+    let raw = foreign_observation(state, execution, pv, mv("e2e4"), Color::White, 1);
+    let accepted = store
+        .append_observation_checked_with_archive_budget(raw, &mut budget())
+        .unwrap();
+    store.complete_task(execution, accepted).unwrap();
+    position.make_move(mv("e2e4")).unwrap();
+    let actual = store.focus_actual_moves(position.snapshot()).unwrap();
+    store.archive_inactive(budget()).unwrap().unwrap();
+    let state = store.situations.get(actual).unwrap().state;
+    let TaskAdmission::Start(execution) = store
+        .request_task(
+            foreign_key(state),
+            TaskConsumer {
+                id: 72,
+                situation: actual,
+                generation: store.generation(),
+                ..consumer
+            },
+            0,
+        )
+        .unwrap()
+    else {
+        panic!("new start")
+    };
+    let pv = store.append_cpu_pv(&position, &[mv("e7e5")]).unwrap();
+    let raw = foreign_observation(state, execution, pv, mv("e7e5"), Color::Black, 2);
+    for _ in 0..7 {
+        store.append_observation(observation(state)).unwrap();
+    }
+    let serial_before = store.observations.observations.next_id();
+    let mut calls = 0;
+    let mut shared = budget();
+    let original = shared;
+    let result =
+        store.append_observation_checked_with_archive_budget_controlled(raw, &mut shared, || {
+            calls += 1;
+            if calls == 2 {
+                Err(StoreError::ArchiveCanceled)
+            } else {
+                Ok(())
+            }
+        });
+    assert_eq!(result, Err(StoreError::ArchiveCanceled));
+    assert_eq!(store.observations.observations.next_id(), serial_before);
+    assert_eq!(
+        store.tasks.get(execution).unwrap().status,
+        TaskStatus::InFlight
+    );
+    assert!(store.lines.get(pv).is_ok());
+    assert!(store.states.get(state).is_ok());
+    let manager = store.archive.as_ref().unwrap();
+    assert_eq!(manager.next_generation, 2);
+    let read = fs::metadata(manager.path(0)).unwrap().len();
+    let committed = fs::metadata(manager.path(1)).unwrap().len();
+    assert_eq!(original.max_bytes - shared.max_bytes, read + 2 * committed);
+    assert_eq!(shared.deadline, original.deadline);
+    assert!(manager.auto_budget.is_none());
+}
+
+#[test]
+fn checked_first_foreign_append_keeps_original_budget_and_never_reclaims_or_retries() {
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let mut position = Position::startpos();
+    let old = store.focus_actual_moves(position.snapshot()).unwrap();
+    let state = store.situations.get(old).unwrap().state;
+    let consumer = TaskConsumer {
+        id: 71,
+        situation: old,
+        revision: 0,
+        generation: store.generation(),
+        deadline_tick: 100,
+    };
+    let TaskAdmission::Start(execution) =
+        store.request_task(foreign_key(state), consumer, 0).unwrap()
+    else {
+        panic!("start")
+    };
+    let pv = store.append_cpu_pv(&position, &[mv("e2e4")]).unwrap();
+    let raw = foreign_observation(state, execution, pv, mv("e2e4"), Color::White, 1);
+    let accepted = store
+        .append_observation_checked_with_archive_budget(raw, &mut budget())
+        .unwrap();
+    store.complete_task(execution, accepted).unwrap();
+    position.make_move(mv("e2e4")).unwrap();
+    let actual = store.focus_actual_moves(position.snapshot()).unwrap();
+    store.archive_inactive(budget()).unwrap().unwrap();
+    let state = store.situations.get(actual).unwrap().state;
+    let TaskAdmission::Start(execution) = store
+        .request_task(
+            foreign_key(state),
+            TaskConsumer {
+                id: 72,
+                situation: actual,
+                generation: store.generation(),
+                ..consumer
+            },
+            0,
+        )
+        .unwrap()
+    else {
+        panic!("new start")
+    };
+    let pv = store.append_cpu_pv(&position, &[mv("e7e5")]).unwrap();
+    store.tasks.cancel_consumer(execution, 72).unwrap();
+    let retained = (0..7)
+        .map(|_| store.append_observation(observation(state)).unwrap())
+        .collect::<Vec<_>>();
+    assert!(store.archive_pressure());
+    let before = store.hot_stats();
+    let serial_before = store.observations.observations.next_id();
+    let mut shared = budget();
+    let original = shared;
+    let duplicate = foreign_observation(state, execution, pv, mv("e7e5"), Color::Black, 1);
+    assert_eq!(
+        store.append_observation_checked_first_with_archive_budget(duplicate, &mut shared),
+        Err(StoreError::InvalidEvidence(
+            "foreign physical request belongs to another archived task"
+        ))
+    );
+    let cold_bytes = fs::metadata(store.archive.as_ref().unwrap().path(0))
+        .unwrap()
+        .len();
+    assert_eq!(original.max_bytes - shared.max_bytes, cold_bytes);
+    let raw = foreign_observation(state, execution, pv, mv("e7e5"), Color::Black, 2);
+    let mut expired = ArchiveIoBudget {
+        deadline: Instant::now() - Duration::from_millis(1),
+        ..shared
+    };
+    assert_eq!(
+        store.append_observation_checked_first_with_archive_budget(raw.clone(), &mut expired),
+        Err(StoreError::ArchiveDeadline)
+    );
+    assert_eq!(expired.max_bytes, shared.max_bytes);
+    let mut bytes = ArchiveIoBudget {
+        max_bytes: 1,
+        ..shared
+    };
+    assert_eq!(
+        store.append_observation_checked_first_with_archive_budget(raw.clone(), &mut bytes),
+        Err(StoreError::ArchiveByteBudget)
+    );
+    assert_eq!(bytes.max_bytes, 1);
+    store.observations.observations.fail_next_reservations(2);
+    for _ in 0..2 {
+        let remaining = shared.max_bytes;
+        assert_eq!(
+            store.append_observation_checked_first_with_archive_budget(raw.clone(), &mut shared),
+            Err(StoreError::Capacity("injected hot allocation"))
+        );
+        assert_eq!(remaining - shared.max_bytes, cold_bytes);
+        assert_eq!(store.hot_stats(), before);
+        assert_eq!(store.observations.observations.next_id(), serial_before);
+        assert_eq!(store.archive.as_ref().unwrap().next_generation, 1);
+    }
+    let accepted = store
+        .append_observation_checked_first_with_archive_budget(raw, &mut shared)
+        .unwrap();
+    assert_eq!(accepted.0, serial_before);
+    assert_eq!(store.observations.len(), before.observations + 1);
+    for id in retained {
+        assert!(store.observations.get(id).is_ok());
+    }
+    assert_eq!(
+        store.tasks.get(execution).unwrap().status,
+        TaskStatus::CancellationRequested
+    );
+    let third = foreign_observation(state, execution, pv, mv("e7e5"), Color::Black, 3);
+    assert_eq!(
+        store.append_observation_checked_first_with_archive_budget(third, &mut shared),
+        Err(StoreError::Capacity("observations"))
+    );
+    assert_eq!(store.archive.as_ref().unwrap().next_generation, 1);
+    assert_eq!(shared.deadline, original.deadline);
+    assert!(store.archive.as_ref().unwrap().auto_budget.is_none());
+}

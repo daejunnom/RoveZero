@@ -78,6 +78,7 @@ pub enum StoreError {
         kind: std::io::ErrorKind,
     },
     ArchiveIntegrity(&'static str),
+    ArchiveCanceled,
     ArchiveDeadline,
     ArchiveByteBudget,
     PinSaturated(&'static str),
@@ -1141,6 +1142,8 @@ pub struct DependencyIndex {
     dependents: BTreeMap<ObservationId, BTreeSet<SituationId>>,
     edges: usize,
     limit: usize,
+    #[cfg(test)]
+    fail_allocations: usize,
 }
 
 impl DependencyIndex {
@@ -1149,6 +1152,8 @@ impl DependencyIndex {
             dependents: BTreeMap::new(),
             edges: 0,
             limit,
+            #[cfg(test)]
+            fail_allocations: 0,
         }
     }
 
@@ -1163,6 +1168,11 @@ impl DependencyIndex {
             .is_some_and(|ids| ids.contains(&situation))
         {
             return Ok(());
+        }
+        #[cfg(test)]
+        if self.fail_allocations != 0 {
+            self.fail_allocations -= 1;
+            return Err(StoreError::Capacity("injected dependency allocation"));
         }
         if self.edges >= self.limit {
             return Err(StoreError::Capacity("dependency edges"));
@@ -1908,6 +1918,45 @@ impl PalsStores {
         self.generation
     }
 
+    /// Admission controls are rechecked after immutable I/O commits and before
+    /// each allocation attempt. The caller can borrow cancellation authority;
+    /// no callback or borrowed pointer escapes this synchronous operation.
+    fn allocate_hot_with_controls<T>(
+        &mut self,
+        pins: StorePins,
+        mut controls: impl FnMut() -> Result<(), StoreError>,
+        mut operation: impl FnMut(&mut Self) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        controls()?;
+        self.automatic_reclaim(pins.clone(), false)?;
+        self.check_archive_allocation_deadline()?;
+        controls()?;
+        let result = operation(self);
+        if matches!(result, Err(StoreError::Capacity(_))) {
+            controls()?;
+            if self.automatic_reclaim(pins, true)? {
+                self.check_archive_allocation_deadline()?;
+                controls()?;
+                let result = operation(self);
+                controls()?;
+                return result;
+            }
+        }
+        controls()?;
+        result
+    }
+
+    fn allocate_once_with_controls<T>(
+        &mut self,
+        mut controls: impl FnMut() -> Result<(), StoreError>,
+        operation: impl FnOnce(&mut Self) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        controls()?;
+        let result = operation(self);
+        controls()?;
+        result
+    }
+
     pub fn insert_situation(
         &mut self,
         snapshot: PositionSnapshot,
@@ -1915,17 +1964,26 @@ impl PalsStores {
         if !self.automatic_archive_enabled() {
             return self.insert_situation_once(snapshot);
         }
+        self.insert_situation_controlled(snapshot, || Ok(()))
+    }
+
+    pub fn insert_situation_controlled(
+        &mut self,
+        snapshot: PositionSnapshot,
+        controls: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<SituationId, StoreError> {
+        if !self.automatic_archive_enabled() {
+            return self.allocate_once_with_controls(controls, |stores| {
+                stores.insert_situation_once(snapshot)
+            });
+        }
         let mut pins = StorePins::default();
         if let Some(id) = self.states.find(&snapshot) {
             pins.states.insert(id);
         }
-        self.automatic_reclaim(pins.clone(), false)?;
-        let result = self.insert_situation_once(snapshot.clone());
-        if matches!(result, Err(StoreError::Capacity(_))) && self.automatic_reclaim(pins, true)? {
-            self.insert_situation_once(snapshot)
-        } else {
-            result
-        }
+        self.allocate_hot_with_controls(pins, controls, |stores| {
+            stores.insert_situation_once(snapshot.clone())
+        })
     }
     fn insert_situation_once(
         &mut self,
@@ -1951,16 +2009,21 @@ impl PalsStores {
         prefix: LineId,
         checked_moves: &[BoardMove],
     ) -> Result<LineId, StoreError> {
+        self.append_line_controlled(prefix, checked_moves, || Ok(()))
+    }
+
+    pub fn append_line_controlled(
+        &mut self,
+        prefix: LineId,
+        checked_moves: &[BoardMove],
+        controls: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<LineId, StoreError> {
         self.states.get(self.lines.get(prefix)?.start_state)?;
         let mut pins = StorePins::default();
         pins.lines.insert(prefix);
-        self.automatic_reclaim(pins.clone(), false)?;
-        let result = self.lines.append(prefix, checked_moves);
-        if matches!(result, Err(StoreError::Capacity(_))) && self.automatic_reclaim(pins, true)? {
-            self.lines.append(prefix, checked_moves)
-        } else {
-            result
-        }
+        self.allocate_hot_with_controls(pins, controls, |stores| {
+            stores.lines.append(prefix, checked_moves)
+        })
     }
 
     /// Mint a CPU PV handle only after replay through the Rules owner from the
@@ -1971,17 +2034,22 @@ impl PalsStores {
         position: &Position,
         moves: &[BoardMove],
     ) -> Result<LineId, StoreError> {
+        self.append_cpu_pv_controlled(position, moves, || Ok(()))
+    }
+
+    pub fn append_cpu_pv_controlled(
+        &mut self,
+        position: &Position,
+        moves: &[BoardMove],
+        controls: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<LineId, StoreError> {
         let mut pins = StorePins::default();
         if let Some(state) = self.states.find(&position.snapshot()) {
             pins.states.insert(state);
         }
-        self.automatic_reclaim(pins.clone(), false)?;
-        let result = self.append_cpu_pv_once(position, moves);
-        if matches!(result, Err(StoreError::Capacity(_))) && self.automatic_reclaim(pins, true)? {
-            self.append_cpu_pv_once(position, moves)
-        } else {
-            result
-        }
+        self.allocate_hot_with_controls(pins, controls, |stores| {
+            stores.append_cpu_pv_once(position, moves)
+        })
     }
     fn append_cpu_pv_once(
         &mut self,
@@ -2043,6 +2111,22 @@ impl PalsStores {
         if !self.automatic_archive_enabled() {
             return self.append_observation_once(observation);
         }
+        self.append_observation_controlled(observation, || Ok(()))
+    }
+
+    pub fn append_observation_controlled(
+        &mut self,
+        observation: Observation,
+        controls: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<ObservationId, StoreError> {
+        if self.archive_enabled() && observation.external_report.is_some() {
+            return Err(StoreError::ArchiveBudgetRequired);
+        }
+        if !self.automatic_archive_enabled() {
+            return self.allocate_once_with_controls(controls, |stores| {
+                stores.append_observation_once(observation)
+            });
+        }
         let mut pins = StorePins::default();
         pins.states.insert(observation.state);
         pins.lines.extend(observation.line);
@@ -2051,13 +2135,9 @@ impl PalsStores {
         pins.observations
             .extend(observation.score.model_dependencies().into_iter().flatten());
         pins.executions.extend(observation.execution);
-        self.automatic_reclaim(pins.clone(), false)?;
-        let result = self.append_observation_once(observation.clone());
-        if matches!(result, Err(StoreError::Capacity(_))) && self.automatic_reclaim(pins, true)? {
-            self.append_observation_once(observation)
-        } else {
-            result
-        }
+        self.allocate_hot_with_controls(pins, controls, |stores| {
+            stores.append_observation_once(observation.clone())
+        })
     }
     fn append_observation_once(
         &mut self,
@@ -2260,17 +2340,23 @@ impl PalsStores {
         source: u64,
         epoch: u64,
     ) -> Result<ObservationId, StoreError> {
+        self.append_rules_terminal_controlled(position, source, epoch, || Ok(()))
+    }
+
+    pub fn append_rules_terminal_controlled(
+        &mut self,
+        position: &Position,
+        source: u64,
+        epoch: u64,
+        controls: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<ObservationId, StoreError> {
         let mut pins = StorePins::default();
         if let Some(state) = self.states.find(&position.snapshot()) {
             pins.states.insert(state);
         }
-        self.automatic_reclaim(pins.clone(), false)?;
-        let result = self.append_rules_terminal_once(position, source, epoch);
-        if matches!(result, Err(StoreError::Capacity(_))) && self.automatic_reclaim(pins, true)? {
-            self.append_rules_terminal_once(position, source, epoch)
-        } else {
-            result
-        }
+        self.allocate_hot_with_controls(pins, controls, |stores| {
+            stores.append_rules_terminal_once(position, source, epoch)
+        })
     }
     fn append_rules_terminal_once(
         &mut self,
@@ -2335,12 +2421,76 @@ impl PalsStores {
         Ok(())
     }
 
+    /// Register a hot evidence edge with the same allocation policy as records.
+    /// Evidence may originate at a child state while the root depends on it.
+    pub fn add_dependency(
+        &mut self,
+        observation: ObservationId,
+        situation: SituationId,
+    ) -> Result<(), StoreError> {
+        self.add_dependency_controlled(observation, situation, || Ok(()))
+    }
+
+    pub fn add_dependency_controlled(
+        &mut self,
+        observation: ObservationId,
+        situation: SituationId,
+        controls: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.observations.get(observation)?;
+        self.situations.get(situation)?;
+        let mut pins = StorePins::default();
+        pins.observations.insert(observation);
+        pins.situations.insert(situation);
+        self.allocate_hot_with_controls(pins, controls, |stores| {
+            stores.dependencies.add(observation, situation)
+        })
+    }
+
     pub fn refute_continuation(
         &mut self,
         situation: SituationId,
         line: LineId,
         evidence: ObservationId,
     ) -> Result<(), StoreError> {
+        self.refute_continuation_controlled(situation, line, evidence, || Ok(()))
+    }
+
+    pub fn refute_continuation_controlled(
+        &mut self,
+        situation: SituationId,
+        line: LineId,
+        evidence: ObservationId,
+        controls: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.check_conclusion(situation, line, evidence)?;
+        let mut pins = StorePins::default();
+        pins.situations.insert(situation);
+        pins.lines.insert(line);
+        pins.observations.insert(evidence);
+        let revision = self.allocate_hot_with_controls(pins, controls, |stores| {
+            stores.refute_continuation_once(situation, line, evidence)
+        })?;
+        let current = self.situations.get_mut(situation)?;
+        current.revision = revision;
+        current.dirty = true;
+        current.conclusions.continuations.insert(
+            line,
+            ContinuationConclusion {
+                status: ContinuationStatus::Refuted,
+                evidence: Some(evidence),
+                revision,
+            },
+        );
+        Ok(())
+    }
+
+    fn refute_continuation_once(
+        &mut self,
+        situation: SituationId,
+        line: LineId,
+        evidence: ObservationId,
+    ) -> Result<u64, StoreError> {
         self.check_conclusion(situation, line, evidence)?;
         if self.observations.get(evidence)?.kind != ObservationKind::Refutation {
             return Err(StoreError::InvalidEvidence(
@@ -2356,18 +2506,7 @@ impl PalsStores {
             .checked_add(1)
             .ok_or(StoreError::RevisionExhausted)?;
         self.dependencies.add(evidence, situation)?;
-        let current = self.situations.get_mut(situation)?;
-        current.revision = revision;
-        current.dirty = true;
-        current.conclusions.continuations.insert(
-            line,
-            ContinuationConclusion {
-                status: ContinuationStatus::Refuted,
-                evidence: Some(evidence),
-                revision,
-            },
-        );
-        Ok(())
+        Ok(revision)
     }
 
     pub fn repair(
@@ -2377,6 +2516,55 @@ impl PalsStores {
         repaired_line: LineId,
         evidence: ObservationId,
     ) -> Result<(), StoreError> {
+        self.repair_controlled(situation, refuted_line, repaired_line, evidence, || Ok(()))
+    }
+
+    pub fn repair_controlled(
+        &mut self,
+        situation: SituationId,
+        refuted_line: LineId,
+        repaired_line: LineId,
+        evidence: ObservationId,
+        controls: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.check_conclusion(situation, repaired_line, evidence)?;
+        self.lines.get(refuted_line)?;
+        let mut pins = StorePins::default();
+        pins.situations.insert(situation);
+        pins.lines.extend([refuted_line, repaired_line]);
+        pins.observations.insert(evidence);
+        let revision = self.allocate_hot_with_controls(pins, controls, |stores| {
+            stores.repair_once(situation, refuted_line, repaired_line, evidence)
+        })?;
+        let current = self.situations.get_mut(situation)?;
+        current.revision = revision;
+        current.dirty = true;
+        current.conclusions.continuations.insert(
+            refuted_line,
+            ContinuationConclusion {
+                status: ContinuationStatus::RepairedBy(repaired_line),
+                evidence: Some(evidence),
+                revision,
+            },
+        );
+        current.conclusions.continuations.insert(
+            repaired_line,
+            ContinuationConclusion {
+                status: ContinuationStatus::Supported,
+                evidence: Some(evidence),
+                revision,
+            },
+        );
+        Ok(())
+    }
+
+    fn repair_once(
+        &mut self,
+        situation: SituationId,
+        refuted_line: LineId,
+        repaired_line: LineId,
+        evidence: ObservationId,
+    ) -> Result<u64, StoreError> {
         self.check_conclusion(situation, repaired_line, evidence)?;
         let observation = self.observations.get(evidence)?;
         if observation.kind != ObservationKind::Repair {
@@ -2414,26 +2602,7 @@ impl PalsStores {
             .checked_add(1)
             .ok_or(StoreError::RevisionExhausted)?;
         self.dependencies.add(evidence, situation)?;
-        let current = self.situations.get_mut(situation)?;
-        current.revision = revision;
-        current.dirty = true;
-        current.conclusions.continuations.insert(
-            refuted_line,
-            ContinuationConclusion {
-                status: ContinuationStatus::RepairedBy(repaired_line),
-                evidence: Some(evidence),
-                revision,
-            },
-        );
-        current.conclusions.continuations.insert(
-            repaired_line,
-            ContinuationConclusion {
-                status: ContinuationStatus::Supported,
-                evidence: Some(evidence),
-                revision,
-            },
-        );
-        Ok(())
+        Ok(revision)
     }
 
     /// The caller supplies a state already produced by checked Rules moves. This
@@ -2471,17 +2640,63 @@ impl PalsStores {
         if !self.automatic_archive_enabled() {
             return self.request_task_once(key, consumer, now_tick);
         }
-        let mut pins = StorePins::default();
-        pins.states.insert(key.state);
-        pins.lines.extend(key.line);
-        pins.situations.insert(consumer.situation);
-        self.automatic_reclaim(pins.clone(), false)?;
-        let result = self.request_task_once(key.clone(), consumer, now_tick);
-        if matches!(result, Err(StoreError::Capacity(_))) && self.automatic_reclaim(pins, true)? {
-            self.request_task_once(key, consumer, now_tick)
+        self.request_task_controlled(key, consumer, now_tick, || Ok(()))
+    }
+
+    pub fn request_task_controlled(
+        &mut self,
+        key: TaskKey,
+        consumer: TaskConsumer,
+        now_tick: u64,
+        controls: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<TaskAdmission, StoreError> {
+        let mut admitted = None;
+        let result = if !self.automatic_archive_enabled() {
+            self.allocate_once_with_controls(controls, |stores| {
+                let admission = stores.request_task_once(key, consumer, now_tick)?;
+                admitted = Some(admission);
+                Ok(admission)
+            })
         } else {
-            result
+            let mut pins = StorePins::default();
+            pins.states.insert(key.state);
+            pins.lines.extend(key.line);
+            pins.situations.insert(consumer.situation);
+            self.allocate_hot_with_controls(pins, controls, |stores| {
+                let admission = stores.request_task_once(key.clone(), consumer, now_tick)?;
+                admitted = Some(admission);
+                Ok(admission)
+            })
+        };
+        if result.is_err()
+            && let Some(admission) = admitted
+        {
+            self.retire_unreturned_task_admission(admission, consumer.id)?;
         }
+        result
+    }
+
+    fn retire_unreturned_task_admission(
+        &mut self,
+        admission: TaskAdmission,
+        consumer_id: u64,
+    ) -> Result<(), StoreError> {
+        let execution = match admission {
+            TaskAdmission::Start(execution)
+            | TaskAdmission::Join(execution)
+            | TaskAdmission::Resume { execution, .. }
+            | TaskAdmission::Reuse { execution, .. } => execution,
+        };
+        self.tasks.cancel_consumer(execution, consumer_id)?;
+        // A new/resumed reservation was never returned to the backend for
+        // dispatch. Joined physical work keeps its cancellation/drain lifetime.
+        if matches!(
+            admission,
+            TaskAdmission::Start(_) | TaskAdmission::Resume { .. }
+        ) {
+            self.tasks.fail(execution)?;
+        }
+        Ok(())
     }
     fn request_task_once(
         &mut self,

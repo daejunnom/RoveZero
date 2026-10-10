@@ -246,6 +246,7 @@ pub(super) struct ArchiveManager {
     load_pins: BTreeMap<u64, StorePins>,
     next_pin: u64,
     auto_budget: Option<ArchiveIoBudget>,
+    allocation_active: bool,
     state_owner: Weak<()>,
     line_owner: Weak<()>,
 }
@@ -329,6 +330,7 @@ impl ArchiveManager {
             load_pins: BTreeMap::new(),
             next_pin: 0,
             auto_budget: None,
+            allocation_active: false,
             state_owner: Weak::new(),
             line_owner: Weak::new(),
         })
@@ -641,6 +643,57 @@ impl Write for BoundedBuffer {
     }
 }
 
+/// The allowance is borrowed by one synchronous operation. Drop also clears it
+/// when the caller catches an unwind, without extending its deadline or bytes.
+struct ArchiveAllocationScope<'a> {
+    stores: &'a mut PalsStores,
+    budget: &'a mut ArchiveIoBudget,
+    owner: Weak<()>,
+    initial: ArchiveIoBudget,
+    old_pins: Option<StorePins>,
+}
+impl ArchiveAllocationScope<'_> {
+    fn finish(&mut self) -> Result<(), StoreError> {
+        let Some(old_pins) = self.old_pins.take() else {
+            return Ok(());
+        };
+        let manager = self
+            .stores
+            .archive
+            .as_mut()
+            .ok_or(StoreError::InvalidHandle("archive allocation owner"))?;
+        if !self.owner.ptr_eq(&Arc::downgrade(&manager.identity)) {
+            return Err(StoreError::InvalidHandle("archive allocation owner"));
+        }
+        let was_active = manager.allocation_active;
+        let remaining = manager.auto_budget.take();
+        manager.allocation_active = false;
+        manager.pins = old_pins;
+        let remaining = remaining.ok_or(StoreError::ArchiveIntegrity(
+            "archive allocation allowance disappeared",
+        ))?;
+        *self.budget = remaining;
+        if !was_active
+            || remaining.deadline != self.initial.deadline
+            || remaining.max_bytes > self.initial.max_bytes
+        {
+            return Err(StoreError::ArchiveIntegrity(
+                "archive allocation allowance changed",
+            ));
+        }
+        self.stores
+            .archive
+            .as_ref()
+            .expect("same archive owner")
+            .verify_hot_owner(self.stores)
+    }
+}
+impl Drop for ArchiveAllocationScope<'_> {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
 impl PalsStores {
     pub fn enable_archive(&mut self, config: ArchiveConfig) -> Result<(), StoreError> {
         if self.archive.is_some() {
@@ -655,14 +708,78 @@ impl PalsStores {
     pub fn archive_enabled(&self) -> bool {
         self.archive.is_some()
     }
+    fn reject_archive_allocation_scope(&self) -> Result<(), StoreError> {
+        if self
+            .archive
+            .as_ref()
+            .is_some_and(|manager| manager.allocation_active)
+        {
+            Err(StoreError::InvalidConditions(
+                "archive allocation allowance is active",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Scope one allocating facade call under the caller's unchanged deadline
+    /// and remaining byte allowance. Pins include resident engine ownership and
+    /// caller-owned temporary IDs. Both success and failure return actual I/O
+    /// debits, restore the previous pins, and clear the temporary allowance.
+    pub fn with_archive_allocation<T>(
+        &mut self,
+        pins: StorePins,
+        budget: &mut ArchiveIoBudget,
+        operation: impl FnOnce(&mut PalsStores) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        budget.check()?;
+        let manager = self.archive.as_ref().ok_or(StoreError::ArchiveDisabled)?;
+        if manager.allocation_active || manager.auto_budget.is_some() {
+            return Err(StoreError::InvalidConditions(
+                "archive allocation allowance is active",
+            ));
+        }
+        manager.verify_hot_owner(self)?;
+        let owner = Arc::downgrade(&manager.identity);
+        let old_pins = manager.pins.clone();
+        let mut combined = old_pins.clone();
+        combined.extend(&pins);
+        self.validate_pins(&combined)?;
+        let initial = *budget;
+        let manager = self.archive.as_mut().expect("archive checked");
+        manager.pins = combined;
+        manager.auto_budget = Some(initial);
+        manager.allocation_active = true;
+        let mut scope = ArchiveAllocationScope {
+            stores: self,
+            budget,
+            owner,
+            initial,
+            old_pins: Some(old_pins),
+        };
+        let result = operation(&mut *scope.stores);
+        scope.finish()?;
+        result
+    }
     pub(super) fn automatic_archive_enabled(&self) -> bool {
         self.archive
             .as_ref()
             .is_some_and(|manager| manager.auto_budget.is_some())
     }
+    pub(super) fn check_archive_allocation_deadline(&self) -> Result<(), StoreError> {
+        if let Some(budget) = self
+            .archive
+            .as_ref()
+            .and_then(|manager| manager.auto_budget)
+        {
+            budget.check()?;
+        }
+        Ok(())
+    }
     /// One search owns this explicit I/O allowance. Automatic pressure handling
     /// debits it, so multiple allocations cannot each spend the full allowance.
     pub fn set_archive_io_budget(&mut self, budget: ArchiveIoBudget) -> Result<(), StoreError> {
+        self.reject_archive_allocation_scope()?;
         budget.check()?;
         self.archive
             .as_mut()
@@ -671,6 +788,7 @@ impl PalsStores {
         Ok(())
     }
     pub fn set_archive_pins(&mut self, pins: StorePins) -> Result<(), StoreError> {
+        self.reject_archive_allocation_scope()?;
         self.validate_pins(&pins)?;
         self.archive
             .as_mut()
@@ -692,6 +810,7 @@ impl PalsStores {
         let Some(mut budget) = manager.auto_budget else {
             return Ok(false);
         };
+        budget.check()?;
         let result = self.reclaim_for_allocation(extra, force, &mut budget);
         self.archive.as_mut().expect("archive restored").auto_budget = Some(budget);
         result
@@ -711,7 +830,7 @@ impl PalsStores {
         combined.extend(&extra);
         self.validate_pins(&combined)?;
         self.archive.as_mut().expect("archive checked").pins = combined;
-        let result = self.archive_inactive_with_budget(budget);
+        let result = self.archive_inactive_inner(budget);
         let manager = self.archive.as_mut().expect("archive restored");
         manager.pins = old_pins;
         result.map(|receipt| receipt.is_some())
@@ -724,10 +843,49 @@ impl PalsStores {
         observation: Observation,
         budget: &mut ArchiveIoBudget,
     ) -> Result<ObservationId, StoreError> {
+        self.append_observation_checked_with_archive_budget_controlled(observation, budget, || {
+            Ok(())
+        })
+    }
+    pub fn append_observation_checked_with_archive_budget_controlled(
+        &mut self,
+        observation: Observation,
+        budget: &mut ArchiveIoBudget,
+        controls: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<ObservationId, StoreError> {
+        self.append_observation_checked_inner(observation, budget, controls, true)
+    }
+
+    /// Retain a completed foreign raw report during logical cancellation only
+    /// while the original I/O allowance still permits the cold uniqueness scan.
+    /// Exactly one hot append is attempted; no reclamation, retry, or logical
+    /// task consumption occurs, and the deadline is never extended.
+    pub fn append_observation_checked_first_with_archive_budget(
+        &mut self,
+        observation: Observation,
+        budget: &mut ArchiveIoBudget,
+    ) -> Result<ObservationId, StoreError> {
+        self.append_observation_checked_inner(observation, budget, || Ok(()), false)
+    }
+
+    fn append_observation_checked_inner(
+        &mut self,
+        observation: Observation,
+        budget: &mut ArchiveIoBudget,
+        mut controls: impl FnMut() -> Result<(), StoreError>,
+        reclaim: bool,
+    ) -> Result<ObservationId, StoreError> {
+        self.reject_archive_allocation_scope()?;
         budget.check()?;
+        controls()?;
         self.validate_observation_handles(&observation)?;
         if !self.archive_enabled() {
-            return self.append_observation_once(observation);
+            let result = self.append_observation_once(observation);
+            controls()?;
+            if result.is_ok() {
+                budget.check()?;
+            }
+            return result;
         }
         if observation.external_report.is_some() {
             let manager = self.archive.as_ref().expect("archive checked");
@@ -764,6 +922,14 @@ impl PalsStores {
                 }
             }
         }
+        if !reclaim {
+            budget.check()?;
+            let result = self.append_observation_once(observation);
+            if result.is_ok() {
+                budget.check()?;
+            }
+            return result;
+        }
         let mut pins = StorePins::default();
         pins.states.insert(observation.state);
         pins.lines.extend(observation.line);
@@ -773,14 +939,21 @@ impl PalsStores {
         pins.observations
             .extend(observation.score.model_dependencies().into_iter().flatten());
         self.reclaim_for_allocation(pins.clone(), false, budget)?;
+        budget.check()?;
+        controls()?;
         let result = self.append_observation_once(observation.clone());
-        if matches!(result, Err(StoreError::Capacity(_)))
-            && self.reclaim_for_allocation(pins, true, budget)?
-        {
-            self.append_observation_once(observation)
-        } else {
-            result
+        if matches!(result, Err(StoreError::Capacity(_))) {
+            controls()?;
+            if self.reclaim_for_allocation(pins, true, budget)? {
+                budget.check()?;
+                controls()?;
+                let result = self.append_observation_once(observation);
+                controls()?;
+                return result;
+            }
         }
+        controls()?;
+        result
     }
     fn validate_pins(&self, pins: &StorePins) -> Result<(), StoreError> {
         if pins.states.len() > self.limits.states
@@ -967,6 +1140,7 @@ impl PalsStores {
         &mut self,
         budget: ArchiveIoBudget,
     ) -> Result<Option<ArchiveReceipt>, StoreError> {
+        self.reject_archive_allocation_scope()?;
         if !self.pressure() {
             return Ok(None);
         }
@@ -979,6 +1153,13 @@ impl PalsStores {
         self.archive_inactive_with_budget(&mut budget)
     }
     pub fn archive_inactive_with_budget(
+        &mut self,
+        budget: &mut ArchiveIoBudget,
+    ) -> Result<Option<ArchiveReceipt>, StoreError> {
+        self.reject_archive_allocation_scope()?;
+        self.archive_inactive_inner(budget)
+    }
+    fn archive_inactive_inner(
         &mut self,
         budget: &mut ArchiveIoBudget,
     ) -> Result<Option<ArchiveReceipt>, StoreError> {
@@ -1121,6 +1302,7 @@ impl PalsStores {
         mut selection: StorePins,
         budget: &mut ArchiveIoBudget,
     ) -> Result<EngineArchiveReceipt, StoreError> {
+        self.reject_archive_allocation_scope()?;
         budget.check()?;
         if records.len() > self.limits.observations || nodes.len() > self.limits.situations {
             return Err(StoreError::Capacity("engine archive record count"));
@@ -1183,6 +1365,7 @@ impl PalsStores {
         snapshot: &PositionSnapshot,
         budget: &mut ArchiveIoBudget,
     ) -> Result<Option<ColdHandle<StateId>>, StoreError> {
+        self.reject_archive_allocation_scope()?;
         budget.check()?;
         let manager = self.archive.as_ref().ok_or(StoreError::ArchiveDisabled)?;
         for entry in
@@ -1233,6 +1416,7 @@ impl PalsStores {
         state: StateId,
         budget: &mut ArchiveIoBudget,
     ) -> Result<Option<ColdHandle<StateId>>, StoreError> {
+        self.reject_archive_allocation_scope()?;
         budget.check()?;
         let manager = self.archive.as_ref().ok_or(StoreError::ArchiveDisabled)?;
         if state.0 >= self.states.snapshots.next_id() {
@@ -1308,6 +1492,7 @@ impl PalsStores {
         budget: &mut ArchiveIoBudget,
         require_node: bool,
     ) -> Result<Option<EngineArchiveReceipt>, StoreError> {
+        self.reject_archive_allocation_scope()?;
         budget.check()?;
         let initial = budget.max_bytes;
         let manager = self.archive.as_ref().ok_or(StoreError::ArchiveDisabled)?;
@@ -1467,6 +1652,7 @@ impl PalsStores {
         handle: &ColdHandle<T>,
         mut budget: ArchiveIoBudget,
     ) -> Result<LoadedArchive, StoreError> {
+        self.reject_archive_allocation_scope()?;
         budget.check()?;
         let mut manager = self.archive.take().ok_or(StoreError::ArchiveDisabled)?;
         let result = (|| {
@@ -1493,6 +1679,7 @@ impl PalsStores {
         receipt: &EngineArchiveReceipt,
         mut budget: ArchiveIoBudget,
     ) -> Result<LoadedArchive, StoreError> {
+        self.reject_archive_allocation_scope()?;
         budget.check()?;
         let mut manager = self.archive.take().ok_or(StoreError::ArchiveDisabled)?;
         let result = (|| {
@@ -1548,6 +1735,7 @@ impl PalsStores {
         ),
         StoreError,
     > {
+        self.reject_archive_allocation_scope()?;
         budget.check()?;
         let manager = self.archive.as_ref().ok_or(StoreError::ArchiveDisabled)?;
         let handle = receipt.archive.state_handle(StateId(0));
@@ -1584,6 +1772,7 @@ impl PalsStores {
         state: StateId,
         mut budget: ArchiveIoBudget,
     ) -> Result<LoadedArchive, StoreError> {
+        self.reject_archive_allocation_scope()?;
         budget.check()?;
         let mut manager = self.archive.take().ok_or(StoreError::ArchiveDisabled)?;
         let result = (|| {
