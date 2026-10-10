@@ -372,7 +372,8 @@ impl PalsModelSpecificationV4 {
         );
         require(
             (self.model_schema == PALS_V4_MODEL_SCHEMA
-                || (full_line && e.model.backend == PalsModelBackendV3::OrtCuda
+                || (full_line
+                    && e.model.backend == PalsModelBackendV3::OrtCuda
                     && self.model_schema == "rovezero.pals-private-cuda-warm.v2")
                 || (legacy && self.model_schema == "rovezero.pals-model.v1"))
                 && self.model_semantics
@@ -577,9 +578,11 @@ impl PalsEndpointV4 {
         shared::component(&e.search)?;
         shared::component(&e.runtime)?;
         self.policies.validate_against(e, r, pilot)?;
-        require((self.model_v2.model_schema == "rovezero.pals-private-cuda-warm.v2")
-            == matches!(self.policies.cuda_warm,PalsCudaWarmPolicyV4::ApproxWarm(_)),
-            "CUDA Warm export schema requires its separately selected actual device owner")?;
+        require(
+            (self.model_v2.model_schema == "rovezero.pals-private-cuda-warm.v2")
+                == matches!(self.policies.cuda_warm, PalsCudaWarmPolicyV4::ApproxWarm(_)),
+            "CUDA Warm export schema requires its separately selected actual device owner",
+        )?;
         self.policy_identity.validate_against(self)?;
         e.binary.validate()?;
         require(
@@ -1031,6 +1034,10 @@ pub struct PalsRepairTraceV4 {
     pub recheck: PalsObservedV3<PalsRecheckObservationV4>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_scope: Option<PalsRepairActualScopeV4>,
+    /// Actual candidate admission comparison is independent of the later
+    /// accepted Repair → reply C comparison and its physical Fresh inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iterative_repair_comparison: Option<PalsObservedV3<PalsRecheckObservationV4>>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -1294,7 +1301,9 @@ impl PalsArchiveObservationV4 {
                 && self.integrity_verified_bytes <= self.committed_bytes
                 && (self.actual_scope.is_some()
                     || self.ram_released_bytes <= self.integrity_verified_bytes)
-                && (self.pending_commit_bytes == 0 || self.pending_buffers_retained)
+                && (self.actual_scope.is_some()
+                    || self.pending_commit_bytes == 0
+                    || self.pending_buffers_retained)
                 && self.loads_completed <= self.loads_requested
                 && self.owner_generation_checks >= self.loads_requested
                 && (self.actual_scope.is_some()
@@ -1507,7 +1516,8 @@ impl PalsRecheckObservationV4 {
                 },
             ) => {
                 require(
-                    p == q && c == d
+                    p == q
+                        && c == d
                         && (self.actual_scope.is_some() || self.fresh_nn_inputs_charged == 2),
                     "both Fresh WDL endpoints need the same perspective/context and two budgeted inputs",
                 )?;
@@ -1580,10 +1590,15 @@ fn validate_traces(
     if o.followup_lifecycle.is_some() {
         return followup::validate_actual_traces(o, p, eligible, failures);
     }
-    require(o.repair_admissions_peak.is_none()
-        && o.repair_traces.iter().all(|t| t.actual_scope.is_none()
-            && observed(&t.recheck).is_none_or(|r| r.actual_scope.is_none())),
-        "actual followup evidence cannot inherit a historical synthetic scope")?;
+    require(
+        o.repair_admissions_peak.is_none()
+            && o.repair_traces.iter().all(|t| {
+                t.actual_scope.is_none()
+                    && t.iterative_repair_comparison.is_none()
+                    && observed(&t.recheck).is_none_or(|r| r.actual_scope.is_none())
+            }),
+        "actual followup evidence cannot inherit a historical synthetic scope",
+    )?;
     require(
         o.repair_traces.len() <= PALS_V4_REPAIR_TRACE_MAX,
         "repair trace collection exceeds bounded receipt capacity",
@@ -1773,6 +1788,14 @@ fn validate_endpoint(
         PalsEngineV4::Pals(p) => {
             if let Some(scope) = &o.followup_lifecycle {
                 scope.validate_for(&p.policies, eligible)?;
+                followup::validate_actual_endpoint_scope(o, &p.policies, eligible)?;
+            } else {
+                require(
+                    observed(&o.archive).is_none_or(|a| a.actual_scope.is_none())
+                        && observed(&o.paused_stack).is_none_or(|s| s.actual_scope.is_none())
+                        && observed(&o.cuda_warm).is_none_or(|w| w.actual_scope.is_none()),
+                    "actual owner evidence has no independently bound lifecycle scope",
+                )?;
             }
             match &p.policies.cold_archive {
                 PalsColdArchivePolicyV4::Bounded(l) => {
@@ -1847,7 +1870,9 @@ fn validate_endpoint(
                 && matches!(o.cuda_warm, PalsObservedV3::Unknown)
                 && matches!(o.repair_trace_total, PalsObservedV3::Unknown)
                 && matches!(o.pending_questions_peak, PalsObservedV3::Unknown)
-                && o.repair_traces.is_empty(),
+                && o.repair_traces.is_empty()
+                && o.repair_admissions_peak.is_none()
+                && o.followup_lifecycle.is_none(),
             "non-PALS endpoint cannot claim PALS V4 policy work",
         )?,
     }
@@ -1928,6 +1953,7 @@ impl PalsRunReceiptV4 {
         let mut owners = BTreeSet::new();
         let mut helper_tuples = BTreeSet::new();
         let mut accounted_output = 0_u64;
+        let mut archive_output_complete = true;
         for g in &self.games {
             require(
                 g.game_index < 2
@@ -1966,21 +1992,13 @@ impl PalsRunReceiptV4 {
                             ManifestError::Integrity("PALS V4: process output byte overflow".into())
                         })?;
                 }
-                if let Some(a) = observed(&o.archive) {
-                    let written = match &a.actual_scope {
-                        Some(scope) => scope.archive_write_bytes_total.ok_or_else(|| {
-                            ManifestError::Integrity("PALS V4: actual archive output extent unknown".into())
-                        })?,
-                        None => a.committed_bytes,
-                    };
-                    accounted_output =
-                        accounted_output
-                            .checked_add(written)
-                            .ok_or_else(|| {
-                                ManifestError::Integrity(
-                                    "PALS V4: archive output byte overflow".into(),
-                                )
-                            })?;
+                {
+                    let selected = matches!(e,PalsEngineV4::Pals(p) if !matches!(p.policies.cold_archive,PalsColdArchivePolicyV4::Disabled));
+                    let (written, complete) = followup::archive_output_accounting(o, selected)?;
+                    archive_output_complete &= complete;
+                    accounted_output = accounted_output.checked_add(written).ok_or_else(|| {
+                        ManifestError::Integrity("PALS V4: archive output byte overflow".into())
+                    })?;
                 }
                 if let Some(external) = &o.base.external_cpu_r {
                     if let Some(h) = &external.shutdown.process_identity {
@@ -2040,7 +2058,7 @@ impl PalsRunReceiptV4 {
         }
         if let Some(bytes) = output {
             require(
-                *bytes >= accounted_output,
+                archive_output_complete && *bytes >= accounted_output,
                 "total output observation omits known PGN/process/archive bytes",
             )?;
         }
@@ -2589,6 +2607,7 @@ mod tests {
                 actual_scope: None,
             }),
             actual_scope: None,
+            iterative_repair_comparison: None,
         }
     }
     #[test]
@@ -2839,5 +2858,12 @@ mod tests {
         r.validate_against(&lock).unwrap(); // Foreign work remains unknown, never own raw or zero foreign nodes.
         r.games[0].engines[0].base.cpu_nodes = 1;
         assert!(r.validate_against(&lock).is_err());
+    }
+
+    // Actual owner scopes have different units and authority from the retained
+    // historical synthetic fixtures above. Keep their focused regressions here.
+    mod actual {
+        use super::*;
+        include!("pals_manifest_v4/followup_tests.rs");
     }
 }
