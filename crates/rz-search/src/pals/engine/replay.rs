@@ -750,7 +750,9 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         self.engine
             .stores
             .focus_actual_moves(self.root.snapshot())?;
-        let root = self.engine.intern(self.root.clone())?;
+        let root = self
+            .engine
+            .intern_checked(self.root.clone(), limits, cancel)?;
         if let Some((reason, _)) = self.engine.nodes[root].terminal {
             return Ok(ReplayOutcome::RulesTerminal(reason));
         }
@@ -771,7 +773,9 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             .map_err(PalsError::from)?;
         let mut next = self.root.clone();
         next.make_move(first_move)?;
-        let first = self.engine.connect(root, first_move, next, counters)?;
+        let first = self
+            .engine
+            .connect_checked(root, first_move, next, counters, limits, cancel)?;
         let mut proposal = bounded_moves(&[first_move], self.engine.config.line_plies)?;
         let followed = self.engine.follow(
             first,
@@ -788,8 +792,16 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         followed?;
         self.check_control(limits, cancel)?;
         counters.proposals += 1;
-        self.engine
-            .record(RecordKind::Proposal, &self.proposal, None, 0, None, None)?;
+        self.engine.record_checked(
+            RecordKind::Proposal,
+            &self.proposal,
+            None,
+            0,
+            None,
+            None,
+            limits,
+            cancel,
+        )?;
         if !self.proposal.starts_with(&self.plan.prefix)
             || self.proposal.len() <= self.plan.prefix.len()
         {
@@ -889,7 +901,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             return Err(StoreError::StaleConsumer.into());
         }
         self.check_control(limits, cancel)?;
-        self.engine.record_with_cpu(
+        self.engine.record_with_cpu_checked(
             RecordKind::Counterexample,
             &self.candidate_line,
             None,
@@ -897,6 +909,8 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             None,
             None,
             Some(candidate.observation),
+            limits,
+            cancel,
         )?;
         self.publication_revision = Some(self.engine.revision);
         let question = RoleQuestion {
@@ -926,7 +940,8 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             .map_err(PalsError::from)?;
         let mut checked = self.engine.nodes[target].position.clone();
         checked.make_move(selected)?;
-        self.engine.connect(target, selected, checked, counters)?;
+        self.engine
+            .connect_checked(target, selected, checked, counters, limits, cancel)?;
         self.reply_line = bounded_moves(&self.plan.prefix, self.engine.config.line_plies)?;
         self.reply_line.push(selected);
         self.check_control(limits, cancel)?;
@@ -1050,13 +1065,15 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         counters.refutations += 1;
         // This full line is model-generated. The initial H1 observation remains
         // on its own initial Counterexample and accepted Reply context only.
-        self.engine.record(
+        self.engine.record_checked(
             RecordKind::Counterexample,
             &self.model_counterline,
             None,
             0,
             None,
             None,
+            limits,
+            cancel,
         )?;
         self.check_control(limits, cancel)?;
         let accepted_before = counters.accepted_repair_outputs;
@@ -1113,7 +1130,16 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         self.check_control(limits, cancel)?;
         let (line_id, _) = self
             .engine
-            .record(RecordKind::Repair, &self.repaired_line, None, 0, None, None)?
+            .record_checked(
+                RecordKind::Repair,
+                &self.repaired_line,
+                None,
+                0,
+                None,
+                None,
+                limits,
+                cancel,
+            )?
             .ok_or(StoreError::InvalidEvidence(
                 "accepted Repair model publication absent",
             ))?;

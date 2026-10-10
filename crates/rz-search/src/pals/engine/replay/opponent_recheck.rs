@@ -1245,9 +1245,16 @@ impl<M: RoleModel> FreshReplayOwner<M> {
                 .ok_or(PalsError::Capacity)?
                 .counterline,
         );
-        let publication =
-            self.engine
-                .record(RecordKind::Counterexample, &line, None, 0, None, None);
+        let publication = self.engine.record_checked(
+            RecordKind::Counterexample,
+            &line,
+            None,
+            0,
+            None,
+            None,
+            limits,
+            cancel,
+        );
         self.opponent_recheck
             .as_mut()
             .ok_or(PalsError::Capacity)?
@@ -1404,7 +1411,9 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             };
             let mut position = self.engine.nodes[node].position.clone();
             position.make_move(movement)?;
-            node = self.engine.connect(node, movement, position, counters)?;
+            node = self
+                .engine
+                .connect_checked(node, movement, position, counters, limits, cancel)?;
             prefix.push(movement);
             self.opponent_recheck
                 .as_mut()

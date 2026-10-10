@@ -2976,9 +2976,9 @@ mod tests {
                     Some((deadline, &cancel)),
                 );
                 if expired {
-                    assert!(matches!(result, Err(PalsError::RoleDeadline)));
+                    assert!(matches!(result, Err(PalsError::Role(RoleError::Deadline))));
                 } else {
-                    assert!(matches!(result, Err(PalsError::RoleCanceled)));
+                    assert!(matches!(result, Err(PalsError::Role(RoleError::Canceled))));
                 }
                 assert!(engine.last_cpu_checkpoint_cleanup_error.is_none());
                 match kind {
