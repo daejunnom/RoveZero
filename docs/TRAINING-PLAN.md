@@ -20,14 +20,18 @@ PR 병합은 이 범위에 포함하지 않는다. 아래 BT4/F02/F03의 선행 
 
 | 구분 | 실제 확인한 범위와 남은 인수 |
 |---|---|
-| nonzero 진단 비교 | 세 번째 실행에서 P/C/V 각각 연속 4회와 2회+checkpoint/resume+2회를 비교했다. 역할별 8회, 총 24회 actual update에서 모델·AdamW state/step·scheduler·RNG·sampler가 일치했고, 의도한 parameter membership·동결·유한값 검사가 PASS했다. |
+| nonzero 진단 비교 | 이전 세 번째 실행에서 P/C/V 각각 연속 4회와 2회+checkpoint/resume+2회를 비교했다. 역할별 8회, 총 24회 actual update에서 모델·AdamW state/step·scheduler·RNG·sampler가 일치했고, 의도한 parameter membership·동결·유한값 검사가 PASS했다. |
 | 실패와 누적 비용 | 앞선 실행의 1회와 8회 update 실패 자료를 보존한다. 성공한 24회와 합한 실제 누적 소비는 33회다. 실패·재시도와 checkpoint 자료를 실제 누적 비용 기록에 연결한다. |
-| 실제 target·learned V | 실제 학습 target을 사용한 update는 0회다. diagnostic label/coverage는 실제 수집·권한·unknown mask 검증을 통과한 target coverage와 별도다. V-private tensor의 update/resume 검사는 learned V의 유용성·기력 검증과 별도다. |
-| 새 실행 인수 | 새 V4/FullLineInteractionV2 baseline의 실제 NN/GPU 연결, seeded Warm·Repair→C→paused CPU resume와 paired pilot은 아직 pending이다. 과거 CPU/CI/GPU 실행을 새 기준의 성공으로 승격하지 않는다. |
+| 현재 source 재사용 | 영향 source 8개를 직접 대조하여 이전 diagnostic 결과의 재사용을 확인했다. 이전 실제 실행과 현재 재사용 확인은 별도 근거이며 이번 새 optimizer update는 0회다. noNN/fixture consumer 검사를 새 학습 실행으로 세지 않는다. |
+| 실제 target·learned V | 실제 학습 target을 사용한 update는 0회다. diagnostic label/coverage는 실제 수집·권한·unknown mask 검증을 통과한 target coverage와 별도다. V-private tensor의 update/resume 검사는 learned V utility/action의 실제 유용성·기력 근거를 충족하지 않으며 누락 target의 mask를 유지한다. |
+| 새 실행 인수 | 현재 실제 CPU/NN/GPU는 자원 대기로 미시작이다. 새 V4/FullLineInteractionV2 baseline의 수치·GPU 수명과 paired pilot은 pending이며 최신 상태는 [후속 인수 기록](PALS-IMPLEMENTATION.md#진단-학습과-남은-실행-인수)을 따른다. 과거 CPU/CI/GPU 실행을 새 기준의 성공으로 승격하지 않는다. |
 
 P/C는 공유 tensor와 해당 role의 private tensor만, V는 private V tensor만 갱신한다.
-Repair는 P 경로의 검사에 포함한다. nonzero checkpoint는 zero-step format과 별도
-domain이며 optimizer·scheduler·RNG·sampler·freeze 상태를 복원한다. CPU FP32,
+Repair는 P 경로의 검사에 포함한다. 기존 zero-step
+`rz-pals-python-preparation-checkpoint/1` 형식을 유지한다. nonzero
+`rz-pals-python-nonzero-checkpoint/1`은 별도 domain이며 실제 AdamW moments/steps·
+parameter membership·freeze·scheduler·RNG·sampler와 원래 비용을 복원한다.
+invalid load는 검증 전에 model/state를 바꾸지 않는다. CPU FP32,
 batch/accumulation 1, AdamW lr 1e-4·betas 0.9/0.999·eps 1e-8·decay 0.01,
 clip norm 1·constant schedule의 비교를 사용했다.
 

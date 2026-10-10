@@ -60,8 +60,8 @@ Repair 최대 3회·pending 64개, 같은 질문/revision 중복 금지·새 증
 
 ### bounded archive와 선택적 CPU·Warm 수명
 
-기존 hot/cold 저장소에 더하는 **중탐색 controlled allocation scope는 구현·소비자 연결
-중**이다. [store](../crates/rz-search/src/pals/store.rs),
+기존 hot/cold 저장소에 더하는 중탐색 controlled allocation은 Store·Engine·Native·Arena V4에
+연결했다. [store](../crates/rz-search/src/pals/store.rs),
 [archive](../crates/rz-search/src/pals/store/archive.rs)와
 [engine archive lifecycle](../crates/rz-search/src/pals/engine/archive_lifecycle.rs)이 경계다.
 `with_archive_allocation`은 원래 deadline·잔여 byte 예산과 기존/resident/temporary 핀을
@@ -78,6 +78,14 @@ Vec compaction이나 usize 재발급을 하지 않는다. physical active/cancel
 dependency closure는 유지하며, `PhysicalCompletionUnknown`은 실제 완료 전 owner·buffer·
 관련 근거를 격리·보존한다. 논리 취소나 다음 root 준비가 물리 완료를 대신하지 않는다.
 
+새 게임은 독립 Store/cold-handle owner를 만들면서 같은 session write ledger의 ID·상한·
+실제 누적 소비를 승계한다. 부분 쓰기·commit 후 실패 비용은 유지하고 미작성 예약만
+돌려준다. 기존 runtime 8필드와 archive 형식을 유지하며 ledger 세 nullable u64는
+Native→Arena 실제 관측에 전달한다. owner별 쓰기와 session 전체 소비, close·pending 파일·
+unknown을 대조하고 선언으로 complete를 만들지 않는다. startup·staged new-game owner의
+실제 관리 사용량 scan은 원래 deadline 안에서 수행하며 getter는 새 scan을 하지 않는다.
+자세한 형식·보존 경계는 [controlled archive 계약](PALS-FOLLOWUP-CONTRACTS.md#중탐색-controlled-archive-계약)을 따른다.
+
 `PausedStack`은 opt-in이며 기본은 기존 재귀 경로의 `CompletedIteration`이다. own CPU의
 미완료 root/PVS/negamax/qsearch/SEE frame·cursor/PV·alpha-beta·정확한 Rules/history와
 accumulator, TT/ordering owner를 보존한다. 한 실제 paused task·8MiB 한도와 일회 token을
@@ -88,29 +96,46 @@ TT/ordering history 예산은 별도다. 매 admission에서 actual owner를
 PausedStack을 지원하지 않는다. 소스는 [CPU](../crates/rz-search/src/cpu.rs),
 [stack](../crates/rz-search/src/cpu/stack.rs),
 [CPU lifecycle](../crates/rz-search/src/pals/engine/cpu_lifecycle.rs)다.
+orphan frame의 actual disposal·token/bytes 0·complete snapshot 확인 전에는 논리 pause를
+retire하지 않는다. `None`·incomplete는 성공이 아니며 resumed value 실패의 새 작업을 보존한다.
 
 host Warm과 CUDA ApproxWarm은 별도 capability이며 둘 다 기본 off다. CUDA의 명시 선택은
 `--pals-cuda-private-warm=true`이고 `onnx-cuda`·`experimental-io-binding`과 등록된 FullLine
 V2 device public memory가 필요하다. accepted seed는 같은 role·모델/epoch·Rules/history·
 query 문맥에서만 사용하고 공개 record revision만 변경 가능하다. Value/V는 Fresh다.
 unknown/cancel의 input/output/seed/workspace owner는 물리 완료 전 보존·격리한다.
+request/execution/bank/ordinal과 accepted seed의 실제 join, 마지막 physical drain·buffer 0은
+소스 계약과 별도로 실제 실행에서 인수한다.
 소스는 [CUDA Warm](../crates/rz-eval/src/pals_onnx/warm/cuda.rs),
 [private 경계](../crates/rz-eval/src/pals_private.rs)와
 [native Warm](../crates/rz-uci/src/pals_native/private_warm.rs)다.
 
 ### 진단 학습과 남은 실행 인수
 
-diagnostic nonzero smoke의 세 번째 실행은 P/C/V별 연속·재개 비교 총 24 update에서
+이전 diagnostic nonzero smoke의 세 번째 실행은 P/C/V별 연속·재개 비교 총 24 update에서
 모델·AdamW·scheduler·RNG·sampler 일치, parameter membership·동결·유한값 PASS다.
 이전 1+8 update 실패를 보존하며 실제 누적은 33회, 실제 target update는 0회다.
+진단에 영향 주는 source 8개를 직접 대조한 재사용 확인은 이전 실제 실행과 별도 근거다.
+이번 새 optimizer update는 0회이며 제품 learned V utility/action의 실제 유용성 근거는 부족하다.
 사용자가 총 update 한도를 해제했지만 실행별 자원·시간·출력 상한과 실패 기록은 유지한다.
 상세 범위는 [학습 smoke 기록](TRAINING-PLAN.md#2026-10-10-pals-diagnostic-학습-smoke)을 따른다.
 
-직전 통합 소스의 CPU/mock 검사에는 stack 9개와 CPU lifecycle 5개 회귀가 포함됐다.
-그 결과와 과거 CI/GPU 자료는 해당 소스·설정의 증거다. 진행 중인 controlled archive의
-새 연결·검사, 새 V4/FullLineInteractionV2 baseline의 제품 등록·Rust NN, 실제 GPU의
-Repair→C→paused CPU resume·seeded Warm·물리 drain/unknown 수명, 새 paired pilot은
-아직 pending이다. compiled 선언이나 기존 자료를 이 목록의 실행 성공으로 승격하지 않는다.
+`8bc8e26`은 이 문서 갱신에서 대조한 원본 코드 기준이다. 이후 수정된 `662094e`의
+검사·CI는 해당 SHA로 별도 인수하며, 이전 CI 실패·수정 이력을 보존한다. 현재 CI 최종
+상태는 미확인이고 실제 새 CPU/NN/GPU 검사는 0회다. Windows commit 여유 재측정
+2.96GiB는 확인 시점의 관측값이며 기존 6GiB 시작 조건에 못 미쳐 실행을 시작하지 않았다.
+
+| 현재 후속의 인수 범위 | 구현·준비와 실제 실행 상태 |
+|---|---|
+| 저장소·checker/resolver·queue·stack·Warm·V4 | 소스 연결·fixture를 제공한다. 현재 source의 로컬 CPU 검사와 CI 성공은 아직 확인하지 않았다. |
+| 현재 Rust CPU32 | Legacy 6→Both 10→Input 10→Head 6의 32사례를 준비했다. 새 binary·compiled Rules·자산 핀 등록과 실제 입력/출력 수치 인수는 pending이다. |
+| 실제 GPU 수명·수치 | held pause→accepted Repair→accepted C tail→같은 owner resume, 동일 actual input·accepted seed의 독립 reference, final join/drain·buffer 0/unknown 인수는 미실행이다. |
+| 한 변수 비용 | optional common6 비용 모드는 준비 중·미실행이다. 모델/queue/stack/Warm·GQA 반복·Signed192와 load/ready/transfer/cache/drain/peak를 분리한다. 모델·탐색에 전역 5% gate를 추가하지 않는다. |
+| V4 paired pilot | 같은 own checker·ModelWdlRestricted, 선택 기능 off, 120+1·최대256 ply·흑백 교환 1 pair/2 games·900+30초 준비다. 각 판의 Legacy/new 두 엔진을 재시작하므로 4 PALS sessions 각각의 join/drain과 PGN 2판을 인수한다. 자산 핀은 미등록이며 실제 대국·종료 인수는 미실행이다. |
+
+직전 통합 소스의 stack 9개·CPU lifecycle 5개 검사와 과거 CI/GPU 자료는 당시 소스·
+설정의 증거로 보존한다. 현재의 compiled 선언·준비나 이전 결과로 위 pending 항목의
+실행 성공을 주장하지 않으며, 후일 실제 결과는 별도 인수 기록으로 갱신한다.
 
 새 seed 23의 네 profile은 동일한 공통 FP32 tensor 90개를 여섯 profile 쌍에서 bit 단위로
 대조했다. 독립 Torch/CPU ORT shared 수치 24사례와 동일 seed의 Warm CPU 수치 6사례가
