@@ -4894,12 +4894,20 @@ mod tests {
         assert!(!PalsNNInputEvidence::between(&valid, &bad, true).complete);
         assert!(!PalsNNInputEvidence::between(&valid, &PalsBackendStats::default(), true).complete);
         bad = valid.clone();
+        bad.admitted_role_requests = 2;
         bad.role_nn_runs_attempted = 2;
         bad.role_nn_runs_failed_known = 1;
         // Both frames separately validate; a failed-known counter regression
         // still makes the per-invocation stage history incomplete.
+        let regressed_failure = PalsBackendStats {
+            role_nn_runs_completed: 2,
+            role_nn_runs_failed_known: 0,
+            completed_nn_inputs: 3,
+            ..bad.clone()
+        };
         bad.validate().unwrap();
-        assert!(!PalsNNInputEvidence::between(&bad, &valid, true).complete);
+        regressed_failure.validate().unwrap();
+        assert!(!PalsNNInputEvidence::between(&bad, &regressed_failure, true).complete);
     }
     #[test]
     fn cuda_full_audit_waits_for_completed_run_and_latches_origin_failure() {
