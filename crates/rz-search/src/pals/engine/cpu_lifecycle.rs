@@ -65,14 +65,14 @@ impl<M: RoleModel> PalsEngine<M> {
                 stale.push(index);
             }
         }
-        // Store allocates its retirement list before changing statuses. A
-        // rejected admission must not consume a live token or rewrite a fact.
-        self.stores.tasks.retire_paused_except(&current)?;
         if current.is_empty() && self.cpu.supports_paused_stack_discard() {
             // Restricted discovery can leave frames without a resumable Node.
             // Such an orphan has no live task consumer to preserve.
             self.discard_cpu_stack_owner()?;
         }
+        // Unknown or retained physical ownership above must not retire the
+        // logical checkpoint. Store preflights before changing any statuses.
+        self.stores.tasks.retire_paused_except(&current)?;
         for index in stale {
             self.nodes[index].resume = None;
         }
@@ -111,6 +111,20 @@ impl<M: RoleModel> PalsEngine<M> {
         {
             return Err(CheckerError::Invalid("paused stack disposal retained its owner").into());
         }
+        let snapshot = self
+            .cpu
+            .paused_stack_snapshot()
+            .ok_or(CheckerError::Unsupported(
+                "paused stack disposal completion is unknown",
+            ))?;
+        if snapshot.tokens_retained != 0 || snapshot.bytes_current != 0 {
+            return Err(CheckerError::Invalid("paused stack disposal retained its owner").into());
+        }
+        if !snapshot.complete {
+            return Err(
+                CheckerError::Invalid("paused stack disposal completion is unknown").into(),
+            );
+        }
         Ok(())
     }
 }
@@ -127,6 +141,7 @@ mod tests {
         discards: AtomicUsize,
         supports_discard: AtomicBool,
         honors_discard: AtomicBool,
+        snapshot_mode: AtomicUsize,
     }
 
     impl Default for Trace {
@@ -136,6 +151,7 @@ mod tests {
                 discards: AtomicUsize::new(0),
                 supports_discard: AtomicBool::new(true),
                 honors_discard: AtomicBool::new(true),
+                snapshot_mode: AtomicUsize::new(0),
             }
         }
     }
@@ -180,6 +196,17 @@ mod tests {
         }
         fn paused_stack_bytes(&self) -> Option<usize> {
             self.inner.paused_stack_bytes()
+        }
+        fn paused_stack_snapshot(&self) -> Option<crate::cpu::CpuPausedStackSnapshot> {
+            let mut snapshot = self.inner.paused_stack_snapshot()?;
+            match self.trace.snapshot_mode.load(Ordering::Acquire) {
+                1 => None,
+                2 => {
+                    snapshot.complete = false;
+                    Some(snapshot)
+                }
+                _ => Some(snapshot),
+            }
         }
         fn supports_paused_stack_discard(&self) -> bool {
             self.trace.supports_discard.load(Ordering::Acquire)
@@ -570,6 +597,70 @@ mod tests {
         engine.discard_canceled_cpu_checkpoints().unwrap();
         assert!(!engine.cpu.token_is_current(&token));
         assert!(engine.nodes[node].resume.is_none());
+        assert_eq!(counters.cpu_nodes, 1);
+    }
+
+    #[test]
+    fn orphan_frames_and_unknown_disposal_do_not_retire_paused_task_or_raw_evidence() {
+        let (mut engine, trace) = engine(LegalOrderRoleMock);
+        let node = root(&mut engine, &Position::startpos());
+        let mut counters = PalsCounters::default();
+        engine
+            .verify_checked_cpu(node, &[], limits(), &AtomicBool::new(false), &mut counters)
+            .unwrap();
+        let (observation, execution) = engine.nodes[node]
+            .evidence
+            .as_ref()
+            .unwrap()
+            .provenance
+            .unwrap();
+        let token = engine.nodes[node].resume.take().unwrap();
+        let raw = engine.stores.observations.get(observation).unwrap().clone();
+        assert!(engine.cpu.token_is_current(&token));
+        // Actual owner survives even though no Node has a logical token.
+        trace.honors_discard.store(false, Ordering::Release);
+        assert!(matches!(
+            engine.synchronize_cpu_checkpoints(),
+            Err(PalsError::Checker(CheckerError::Invalid(
+                "paused stack disposal retained its owner"
+            )))
+        ));
+        assert!(matches!(
+            engine.stores.tasks.get(execution).unwrap().status,
+            TaskStatus::Paused { .. }
+        ));
+        assert!(engine.cpu.paused_stack_snapshot().unwrap().tokens_retained > 0);
+        trace.honors_discard.store(true, Ordering::Release);
+        trace.snapshot_mode.store(1, Ordering::Release);
+        assert!(matches!(
+            engine.synchronize_cpu_checkpoints(),
+            Err(PalsError::Checker(CheckerError::Unsupported(
+                "paused stack disposal completion is unknown"
+            )))
+        ));
+        assert!(matches!(
+            engine.stores.tasks.get(execution).unwrap().status,
+            TaskStatus::Paused { .. }
+        ));
+        trace.snapshot_mode.store(2, Ordering::Release);
+        assert!(matches!(
+            engine.synchronize_cpu_checkpoints(),
+            Err(PalsError::Checker(CheckerError::Invalid(
+                "paused stack disposal completion is unknown"
+            )))
+        ));
+        assert!(matches!(
+            engine.stores.tasks.get(execution).unwrap().status,
+            TaskStatus::Paused { .. }
+        ));
+        trace.snapshot_mode.store(0, Ordering::Release);
+        engine.synchronize_cpu_checkpoints().unwrap();
+        let actual = engine.cpu.paused_stack_snapshot().unwrap();
+        assert!(actual.complete);
+        assert_eq!((actual.tokens_retained, actual.bytes_current), (0, 0));
+        assert!(matches!(engine.stores.tasks.get(execution).unwrap().status,
+            TaskStatus::RetiredPaused { evidence: Some(id), .. } if id == observation));
+        assert_eq!(engine.stores.observations.get(observation).unwrap(), &raw);
         assert_eq!(counters.cpu_nodes, 1);
     }
 }
