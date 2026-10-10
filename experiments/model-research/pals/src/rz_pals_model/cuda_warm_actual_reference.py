@@ -457,13 +457,16 @@ def validate_cost_capture(capture, config, export_manifest_sha256):
                 or _uint(lane.get("measured_calls_requested")) != 5 or _uint(lane.get("measured_calls_completed")) != 5):
             raise ValueError("cost lane is partial or physical owner join is unknown")
         calls = _array(lane.get("calls"), COST_LANE_CALLS, COST_LANE_CALLS)
-        requests, executions = set(), set()  # no global ID rewriting/dedup across independent owners
+        # Original integration and Warm cost share one physical owner. Fresh
+        # is independent; validate IDs without rewriting the captured packets.
+        requests = {_identity(call["request_id"]) for call in capture["calls"]} if warm else set()
+        executions = {_identity(call["execution_id"]) for call in capture["calls"]} if warm else set()
         stable = None
         for index, call in enumerate(calls):
             _cost_packet(call, source, config, export_manifest_sha256, warm)
             request, execution = _identity(call["request_id"]), _identity(call["execution_id"])
             if request in requests or execution in executions:
-                raise ValueError("duplicate cost request/execution within one owner lane")
+                raise ValueError("duplicate cost request/execution within one physical owner")
             requests.add(request)
             executions.add(execution)
             sample = call.get("cost_sample")

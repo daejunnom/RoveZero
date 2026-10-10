@@ -117,7 +117,7 @@ def _cost_capture():
         calls = []
         base = len(capture["calls"]) if warm else 0
         for index in range(8):
-            call = _call(index + 1, warm=warm, source=source if warm else None)
+            call = _call(base + index + 1, warm=warm, source=source if warm else None)
             call.update(accepted=False, rejected="SearchFailedUnconsumed",
                         logical_context=copy.deepcopy(source["logical_context"]))
             if warm:
@@ -161,8 +161,10 @@ class CapturedReferenceAdmissionTests(unittest.TestCase):
         self.assertEqual(capture, before)
         streams = _reference_streams(capture)
         self.assertEqual([(name, len(calls)) for name, calls in streams], [("original", 3), ("warm", 8), ("fresh", 8)])
-        self.assertEqual(streams[0][1][0]["request_id"], streams[1][1][0]["request_id"])
-        self.assertEqual(streams[1][1][0]["request_id"], streams[2][1][0]["request_id"])
+        for field in ("request_id", "execution_id"):
+            self.assertNotEqual(streams[0][1][0][field], streams[1][1][0][field])
+            self.assertEqual(streams[0][1][0][field], streams[2][1][0][field])
+            self.assertEqual(streams[1][1][0][field], streams[2][1][3][field])
         self.assertEqual(streams[1][1][0]["initial_latent_bits"], capture["cost_same_seed_context"]["original_accepted_full_6144_seed_bits"])
         self.assertEqual(streams[2][1][0]["initial_latent_bits"], [0] * LATENT_ELEMENTS)
         self.assertIsNone(streams[1][1][0]["cost_observation"]["actual_completed_nn_inputs_delta"])
@@ -202,12 +204,25 @@ class CapturedReferenceAdmissionTests(unittest.TestCase):
             with self.subTest(label=label), self.assertRaises(ValueError):
                 validate_actual_capture(capture, MANIFEST_SHA)
 
+    def test_warm_cost_refuses_original_request_and_execution_collisions(self):
+        for field in ("request_id", "execution_id"):
+            capture = _cost_capture()
+            capture["cost_same_seed_context"]["warm"]["calls"][0][field] = copy.deepcopy(capture["calls"][0][field])
+            before = copy.deepcopy(capture)
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "duplicate cost"):
+                validate_actual_capture(capture, MANIFEST_SHA)
+            self.assertEqual(capture, before)
+
     def test_cost_combined_forward_budget_accepts_64_and_refuses_65_before_replay(self):
         for original_count in (44, 45):
             capture = _cost_capture()
             delta = original_count - len(capture["calls"])
             capture["calls"][-1:-1] = [_call(sequence) for sequence in range(4, 4 + delta)]
             warm = capture["cost_same_seed_context"]["warm"]
+            # Synthetic fixture IDs follow the enlarged original owner prefix.
+            for sample in warm["calls"]:
+                for field in ("request_id", "execution_id"):
+                    sample[field]["sequence"] += delta
             receipts = [warm["final_receipt"]]
             receipts.extend(sample["cost_sample"][name] for sample in warm["calls"]
                             for name in ("receipt_before", "receipt_returned", "receipt_after_close"))

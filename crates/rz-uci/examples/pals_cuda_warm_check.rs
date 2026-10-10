@@ -3251,7 +3251,16 @@ mod check {
                 )?;
             }
             let mut stable = None;
-            let mut ids: Vec<(Value, Value)> = Vec::with_capacity(COST_LANE_CALLS);
+            // Warm cost uses the original physical owner; Fresh is independent.
+            // Seed validation only, preserving every captured raw ID.
+            let mut ids: Vec<(Value, Value)> = if warm {
+                originals
+                    .iter()
+                    .map(|call| (call["request_id"].clone(), call["execution_id"].clone()))
+                    .collect()
+            } else {
+                Vec::with_capacity(COST_LANE_CALLS)
+            };
             let mut checks = Vec::with_capacity(COST_LANE_CALLS);
             for (index, (call, packet)) in calls.iter().zip(references).enumerate() {
                 let sample = &call["cost_sample"];
