@@ -132,6 +132,16 @@ _REVIEWED_OPT_IN_SOURCE_PROFILES = (
         "crates/rz-arena/src/pals_collect/native.rs": {
             "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
     }),
+    # Re-reviewed stopped-request/raw-prefix successor, legacy SingleReply only.
+    # Rules-only stopped results and a legal local prefix cannot manufacture an
+    # accepted Repair record/revision/endpoint or a completed OwnCPU comparison.
+    # Typed deadlines and original policy/value gates grant no V4/ModelWdl scope.
+    ("opt_in_single_reply_followup_controlled_fallback_4770a553_native_1ba6d1e5", {
+        "crates/rz-search/src/pals/engine.rs": {
+            "bytes": 391894, "sha256": "4770a55361a994210a2238240ed4d2dea1a24d7a8b85524cc7c2db31d19f5e19"},
+        "crates/rz-arena/src/pals_collect/native.rs": {
+            "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+    }),
 )
 _POLICY = {
     "version": "pals-post-repair-recheck/1",

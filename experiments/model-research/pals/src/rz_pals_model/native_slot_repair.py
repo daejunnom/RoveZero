@@ -140,6 +140,14 @@ _REVIEWED_DISABLED_FOLLOWUP_CONTROLLED_CORE_SOURCES = (
     {"bytes": 382810, "sha256": "752d328ae53dc1b4c06a1f3b7cbbd311834dbb59961e598c4752d8fcb9222cf4"},
     {"bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
 )
+# Re-reviewed stopped-request/raw-prefix successor in the same Disabled lane.
+# A stopped request reads only current Rules; a returned legal prefix remains
+# raw when checked connection fails. Typed deadlines, publication controls and
+# the closed policy gate still exclude archive/V4/ModelWdl/target authority.
+_REVIEWED_DISABLED_FOLLOWUP_CONTROLLED_FALLBACK_SOURCES = (
+    {"bytes": 391894, "sha256": "4770a55361a994210a2238240ed4d2dea1a24d7a8b85524cc7c2db31d19f5e19"},
+    {"bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+)
 _SOURCE_REVIEW_PROFILES = (
     ("legacy_prepared_lineage_4469f9d", _REVIEWED_SOURCES),
     ("legacy_disabled_recheck_9c0de959", _REVIEWED_DISABLED_RECHECK_SOURCES),
@@ -156,6 +164,7 @@ _SOURCE_REVIEW_PROFILES = (
     ("legacy_disabled_followup_core_b86af1f0_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_CORE_SOURCES),
     ("legacy_disabled_followup_core_lint_4729c359_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_CORE_LINT_SOURCES),
     ("legacy_disabled_followup_controlled_core_752d328a_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_CONTROLLED_CORE_SOURCES),
+    ("legacy_disabled_followup_controlled_fallback_4770a553_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_CONTROLLED_FALLBACK_SOURCES),
 )
 _DISABLED_SEARCH_VERSION = "pals-restricted-refinement/0.1"
 _OPT_IN_LANE_FIELDS = ("pals_search_policy", "refinement_registration", "refinement_registration_sha256", "post_repair_recheck", "post_repair_recheck_policy", "post_repair_recheck_conditions",
