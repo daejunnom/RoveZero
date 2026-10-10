@@ -730,6 +730,8 @@ impl PalsOnnxBackend {
             #[cfg(feature = "experimental-io-binding")]
             device_warm_role: None,
             #[cfg(feature = "experimental-io-binding")]
+            cuda_warm_observer: None,
+            #[cfg(feature = "experimental-io-binding")]
             cuda_record_pages: None,
         })
     }

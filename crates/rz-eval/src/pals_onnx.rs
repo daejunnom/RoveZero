@@ -71,8 +71,12 @@ pub use device_pages_plan::{
 pub use public_pages::{HostRecordPagePolicy, HostRecordPageSnapshot, HostRecordPageStats};
 #[cfg(feature = "experimental-io-binding")]
 pub use warm::cuda::{
-    PalsCudaWarmCapability, PalsCudaWarmInput, PRIVATE_CUDA_QUERY_SEMANTICS,
-    PRIVATE_CUDA_WARM_EXECUTION_DOMAIN, PRIVATE_CUDA_WARM_GRAPH_SEMANTICS,
+    cuda_private_warm_implementation_digest, PalsCudaWarmCapability, PalsCudaWarmExecutionBinding,
+    PalsCudaWarmInput, PalsCudaWarmInvocationObservation, PalsCudaWarmInvocationPurpose,
+    PalsCudaWarmInvocationState, PalsCudaWarmObservationHandle, PalsCudaWarmObservationSnapshot,
+    PalsCudaWarmObservationStatus, PalsCudaWarmOwnerObservation, PalsCudaWarmRuntimeLimits,
+    PRIVATE_CUDA_QUERY_SEMANTICS, PRIVATE_CUDA_WARM_EXECUTION_DOMAIN,
+    PRIVATE_CUDA_WARM_GRAPH_SEMANTICS, PRIVATE_CUDA_WARM_MEASUREMENT_CONTRACT,
     PRIVATE_CUDA_WARM_SCHEMA,
 };
 pub use warm::{
@@ -1717,6 +1721,9 @@ pub struct PalsPublicMemoryWitness {
 #[allow(clippy::large_enum_variant)]
 pub enum PalsNativeCommand {
     Evaluate(PalsModelInput),
+    /// Explicit V4 evidence from the same invocation, without a second Run or
+    /// Stats command. The legacy Evaluate result and accounting stay unchanged.
+    EvaluateWithEvidence(PalsModelInput),
     /// Separate CPU-only Warm graph domain; a Fresh mode payload is also explicit.
     EvaluatePrivateWarm(PalsWarmInput),
     /// CUDA Warm has its own capability and physical owner domain.
@@ -1737,6 +1744,14 @@ pub enum PalsNativeCommand {
 }
 pub enum PalsNativeResult {
     Evaluation(PalsRawOutput),
+    EvaluationWithEvidence {
+        /// A known returned failure retains its original BackendError. CUDA
+        /// unknown completion still takes the outer quarantine path instead.
+        outcome: Result<PalsRawOutput, BackendError>,
+        actual_completed_nn_inputs_delta: Option<u64>,
+        /// Completeness of measurement only; this is not output acceptance.
+        complete: bool,
+    },
     NewGame,
     ResetTo {
         game_generation: u64,
@@ -1755,6 +1770,10 @@ impl PalsNativeCommand {
         match self {
             Self::Evaluate(input) if input.role == PalsRole::Critic => "critic_evaluation",
             Self::Evaluate(_) => "proposer_evaluation",
+            Self::EvaluateWithEvidence(input) if input.role == PalsRole::Critic => {
+                "critic_evaluation_with_evidence"
+            }
+            Self::EvaluateWithEvidence(_) => "proposer_evaluation_with_evidence",
             Self::EvaluatePrivateWarm(_) => "private_warm_evaluation",
             #[cfg(feature = "experimental-io-binding")]
             Self::EvaluateCudaWarm(_) => "cuda_warm_evaluation",
@@ -1774,6 +1793,7 @@ impl PalsNativeResult {
     pub fn diagnostic_kind(&self) -> &'static str {
         match self {
             Self::Evaluation(_) => "evaluation",
+            Self::EvaluationWithEvidence { .. } => "evaluation_with_evidence",
             Self::NewGame => "new_game",
             Self::ResetTo { .. } => "reset_to_game",
             Self::Stats(_) => "stats",
@@ -1919,6 +1939,69 @@ impl PalsBackendStats {
     }
 }
 
+/// Differences of the actual public and role completion counters. Saturated,
+/// decreasing, inconsistent or physically unknown counters yield no delta.
+/// This neither calls a graph nor acknowledges a physical completion fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PalsNNInputEvidence {
+    pub actual_completed_nn_inputs_delta: Option<u64>,
+    pub complete: bool,
+}
+impl PalsNNInputEvidence {
+    pub fn between(
+        before: &PalsBackendStats,
+        after: &PalsBackendStats,
+        physical_completion_known: bool,
+    ) -> Self {
+        let delta = (|| {
+            if !physical_completion_known || before.validate().is_err() || after.validate().is_err()
+            {
+                return None;
+            }
+            let cumulative = |stats: &PalsBackendStats| {
+                [
+                    stats.admitted_role_requests,
+                    stats.public_cache_hits,
+                    stats.public_cache_misses,
+                    stats.public_nn_runs_attempted,
+                    stats.public_nn_runs_completed,
+                    stats.public_nn_runs_failed_known,
+                    stats.role_nn_runs_attempted,
+                    stats.role_nn_runs_completed,
+                    stats.role_nn_runs_failed_known,
+                    stats.completed_nn_inputs,
+                    stats.validated_public_outputs,
+                    stats.validated_role_outputs,
+                    stats.new_game_resets,
+                ]
+            };
+            if cumulative(before)
+                .into_iter()
+                .zip(cumulative(after))
+                .any(|(old, new)| {
+                    old == u64::MAX || new == u64::MAX || new.checked_sub(old).is_none()
+                })
+            {
+                return None;
+            }
+            let public = after
+                .public_nn_runs_completed
+                .checked_sub(before.public_nn_runs_completed)?;
+            let role = after
+                .role_nn_runs_completed
+                .checked_sub(before.role_nn_runs_completed)?;
+            let inputs = after
+                .completed_nn_inputs
+                .checked_sub(before.completed_nn_inputs)?;
+            (public.checked_add(role)? == inputs).then_some(inputs)
+        })();
+        Self {
+            actual_completed_nn_inputs_delta: delta,
+            complete: delta.is_some(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PalsGraphIdentity {
     pub role: String,
@@ -1994,6 +2077,8 @@ pub struct PalsOnnxBackend {
     device_role: Option<device::DeviceRole>,
     #[cfg(feature = "experimental-io-binding")]
     device_warm_role: Option<warm::cuda::DeviceWarmRole>,
+    #[cfg(feature = "experimental-io-binding")]
+    cuda_warm_observer: Option<PalsCudaWarmObservationHandle>,
     #[cfg(feature = "experimental-io-binding")]
     cuda_record_pages: Option<device_pages_plan::native::CudaRecordPages>,
     quarantine: Option<BackendError>,
@@ -2250,6 +2335,8 @@ impl PalsOnnxBackend {
             #[cfg(feature = "experimental-io-binding")]
             device_warm_role: None,
             #[cfg(feature = "experimental-io-binding")]
+            cuda_warm_observer: None,
+            #[cfg(feature = "experimental-io-binding")]
             cuda_record_pages: None,
         })
     }
@@ -2344,7 +2431,12 @@ impl PalsOnnxBackend {
             return true;
         }
         #[cfg(feature = "experimental-io-binding")]
-        if self.device_warm_role.is_some() {
+        if self.device_warm_role.is_some()
+            || self
+                .cuda_warm_observer
+                .as_ref()
+                .is_some_and(PalsCudaWarmObservationHandle::has_unfinished_invocation)
+        {
             return true;
         }
         #[cfg(feature = "experimental-io-binding")]
@@ -2784,7 +2876,9 @@ impl PalsOnnxBackend {
     {
         SingleWorker::spawn_with_outcome(move |command| {
             let boundary = match &command {
-                PalsNativeCommand::Evaluate(_) | PalsNativeCommand::EvaluatePrivateWarm(_) => {
+                PalsNativeCommand::Evaluate(_)
+                | PalsNativeCommand::EvaluateWithEvidence(_)
+                | PalsNativeCommand::EvaluatePrivateWarm(_) => {
                     HostRecordPageObservationBoundary::Evaluate
                 }
                 #[cfg(feature = "experimental-io-binding")]
@@ -2814,6 +2908,24 @@ impl PalsOnnxBackend {
             let result = match command {
                 PalsNativeCommand::Evaluate(input) => {
                     self.run(input).map(PalsNativeResult::Evaluation)
+                }
+                PalsNativeCommand::EvaluateWithEvidence(input) => {
+                    let before = self.stats.clone();
+                    let outcome = self.run(input);
+                    let evidence = PalsNNInputEvidence::between(
+                        &before,
+                        &self.stats,
+                        self.quarantine_cause().is_none(),
+                    );
+                    match self.quarantine_cause() {
+                        Some(cause) => Err(cause.clone()),
+                        None => Ok(PalsNativeResult::EvaluationWithEvidence {
+                            outcome,
+                            actual_completed_nn_inputs_delta: evidence
+                                .actual_completed_nn_inputs_delta,
+                            complete: evidence.complete,
+                        }),
+                    }
                 }
                 PalsNativeCommand::EvaluatePrivateWarm(input) => self
                     .run_private_warm(input)
@@ -3511,8 +3623,16 @@ impl Drop for PalsOnnxBackend {
         let completion_unknown = completion_unknown
             || self.cuda_record_pages.as_ref().is_some_and(
                 device_pages_plan::native::CudaRecordPages::physical_completion_unknown,
-            );
+            )
+            || self
+                .cuda_warm_observer
+                .as_ref()
+                .is_some_and(PalsCudaWarmObservationHandle::has_unfinished_invocation);
         if completion_unknown {
+            #[cfg(feature = "experimental-io-binding")]
+            if let Some(observer) = &self.cuda_warm_observer {
+                observer.backend_retained_unknown();
+            }
             // The worker normally retains the entire closure on quarantine. A
             // direct caller may drop its owner: retain the same resources rather
             // than using Drop as an unproven CUDA completion acknowledgement.
@@ -3564,6 +3684,7 @@ impl Drop for PalsOnnxBackend {
             #[cfg(feature = "experimental-io-binding")]
             {
                 self.device_role.take();
+                self.device_warm_role.take();
                 self.cuda_record_pages.take();
                 self.device_memory.take();
             }
@@ -3571,6 +3692,17 @@ impl Drop for PalsOnnxBackend {
             self.memory.take();
             self.record_pages.take();
             self.active.take();
+            #[cfg(feature = "experimental-io-binding")]
+            if let Some(observer) = &self.cuda_warm_observer {
+                // Publish this selected observer's terminal owner event only
+                // after dependent values and all actual model sessions drop.
+                // Runtime/worker/bank ownership is joined separately by Native.
+                self.public.take();
+                self.proposer.take();
+                self.critic.take();
+                self.shared_pc.take();
+                observer.backend_dropped_known();
+            }
         }
     }
 }
@@ -3601,6 +3733,9 @@ mod device {
         // rc.10 allocated tensors retain callbacks rather than this Allocator;
         // keep it last, after all bindings and dependent tensors.
         _allocator: Allocator,
+        // Last: all native binding/value handles above have really dropped
+        // before the metadata guard records their payload release.
+        _warm_observation: Option<warm::cuda::CudaWarmDeviceAllocationGuard>,
     }
     impl DeviceMemory {
         pub fn new(
@@ -3608,6 +3743,44 @@ mod device {
             key: [u8; 32],
             tokens: usize,
             device: i32,
+        ) -> ort::Result<Self> {
+            Self::new_inner(session, key, tokens, device, None)
+        }
+        pub(super) fn new_with_warm_observation(
+            session: &Session,
+            key: [u8; 32],
+            tokens: usize,
+            device: i32,
+            observer: Option<&PalsCudaWarmObservationHandle>,
+        ) -> Result<Self, BackendError> {
+            let bytes = u64::try_from(tokens)
+                .ok()
+                .and_then(|n| n.checked_mul(2 * 64 * 4))
+                .and_then(|n| n.checked_mul(2))
+                .ok_or_else(|| {
+                    fail(
+                        K::ResourceExhausted,
+                        S::Admission,
+                        "CUDA Warm bounded K/V allocation byte count overflows",
+                    )
+                })?;
+            let observation = observer
+                .map(|observer| observer.reserve_device_payload(bytes))
+                .transpose()?;
+            Self::new_inner(session, key, tokens, device, observation).map_err(|error| {
+                native(
+                    CauseCode::TensorCreate,
+                    "cannot allocate CUDA Warm public K/V owner",
+                    error,
+                )
+            })
+        }
+        fn new_inner(
+            session: &Session,
+            key: [u8; 32],
+            tokens: usize,
+            device: i32,
+            observation: Option<warm::cuda::CudaWarmDeviceAllocationGuard>,
         ) -> ort::Result<Self> {
             let allocator = Allocator::new(
                 session,
@@ -3626,9 +3799,18 @@ mod device {
                 key: None,
                 value: None,
                 allocator,
+                observation,
             };
             owned.key = Some(Tensor::new(&owned.allocator, [1, 2, tokens, 64])?);
+            if let Some(observation) = &mut owned.observation {
+                // Bytes of the actual successfully created typed CUDA Tensor,
+                // not manifest syntax or a claim about allocator/VRAM size.
+                observation.tensor_created((tokens as u64) * 2 * 64 * 4);
+            }
             owned.value = Some(Tensor::new(&owned.allocator, [1, 2, tokens, 64])?);
+            if let Some(observation) = &mut owned.observation {
+                observation.tensor_created((tokens as u64) * 2 * 64 * 4);
+            }
             let mask = Tensor::new(&Allocator::default(), [1, tokens])?;
             let binding = owned
                 .binding
@@ -3651,6 +3833,7 @@ mod device {
                 memory_value: owned.value.take().expect("value allocated"),
                 mask,
                 _allocator: owned.allocator,
+                _warm_observation: owned.observation.take(),
             })
         }
         pub fn run(
@@ -3705,6 +3888,9 @@ mod device {
         key: Option<Tensor<f32>>,
         value: Option<Tensor<f32>>,
         allocator: Allocator,
+        // If a later allocation/bind fails, partial native values are dropped
+        // before this last guard records the actual successful allocations.
+        observation: Option<warm::cuda::CudaWarmDeviceAllocationGuard>,
     }
     pub(super) struct DeviceRole {
         pub(super) binding: IoBinding,
@@ -4571,6 +4757,109 @@ mod tests {
         stats.validated_role_outputs = 2;
         stats.live_public_cache_entries = 2;
         assert!(stats.validate().is_err());
+    }
+    #[test]
+    fn native_nn_evidence_counts_public_miss_and_cache_hit_without_another_command() {
+        let before = PalsBackendStats::default();
+        let miss = PalsBackendStats {
+            admitted_role_requests: 1,
+            public_cache_misses: 1,
+            public_nn_runs_attempted: 1,
+            public_nn_runs_completed: 1,
+            role_nn_runs_attempted: 1,
+            role_nn_runs_completed: 1,
+            completed_nn_inputs: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            PalsNNInputEvidence::between(&before, &miss, true),
+            PalsNNInputEvidence {
+                actual_completed_nn_inputs_delta: Some(2),
+                complete: true,
+            }
+        );
+        let hit = PalsBackendStats {
+            admitted_role_requests: 2,
+            public_cache_hits: 1,
+            live_public_cache_entries: 1,
+            role_nn_runs_attempted: 2,
+            role_nn_runs_completed: 2,
+            completed_nn_inputs: 3,
+            ..miss.clone()
+        };
+        assert_eq!(
+            PalsNNInputEvidence::between(&miss, &hit, true),
+            PalsNNInputEvidence {
+                actual_completed_nn_inputs_delta: Some(1),
+                complete: true,
+            }
+        );
+        // A cache gauge can retire while cumulative NN evidence stays exact.
+        let retired = PalsBackendStats {
+            live_public_cache_entries: 0,
+            ..hit.clone()
+        };
+        assert_eq!(
+            PalsNNInputEvidence::between(&hit, &retired, true).actual_completed_nn_inputs_delta,
+            Some(0)
+        );
+    }
+    #[test]
+    fn native_nn_evidence_known_failure_preserves_partial_graph_completion() {
+        let failed = PalsBackendStats {
+            admitted_role_requests: 1,
+            public_cache_misses: 1,
+            public_nn_runs_attempted: 1,
+            public_nn_runs_completed: 1,
+            role_nn_runs_attempted: 1,
+            role_nn_runs_failed_known: 1,
+            completed_nn_inputs: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            PalsNNInputEvidence::between(&PalsBackendStats::default(), &failed, true),
+            PalsNNInputEvidence {
+                actual_completed_nn_inputs_delta: Some(1),
+                complete: true
+            }
+        );
+        assert_eq!(
+            PalsNNInputEvidence::between(&PalsBackendStats::default(), &failed, false),
+            PalsNNInputEvidence {
+                actual_completed_nn_inputs_delta: None,
+                complete: false
+            }
+        );
+    }
+    #[test]
+    fn native_nn_evidence_rejects_saturation_regression_and_inconsistent_totals() {
+        let valid = PalsBackendStats {
+            admitted_role_requests: 1,
+            public_cache_misses: 1,
+            public_nn_runs_attempted: 1,
+            public_nn_runs_completed: 1,
+            role_nn_runs_attempted: 1,
+            role_nn_runs_completed: 1,
+            completed_nn_inputs: 2,
+            ..Default::default()
+        };
+        let mut bad = valid.clone();
+        bad.role_nn_runs_attempted = u64::MAX;
+        assert!(!PalsNNInputEvidence::between(&valid, &bad, true).complete);
+        bad = valid.clone();
+        bad.public_nn_runs_attempted = u64::MAX;
+        assert!(!PalsNNInputEvidence::between(&bad, &bad, true).complete);
+        bad = valid.clone();
+        bad.completed_nn_inputs = 1;
+        assert!(!PalsNNInputEvidence::between(&valid, &bad, true).complete);
+        assert!(!PalsNNInputEvidence::between(&valid, &PalsBackendStats::default(), true).complete);
+        bad = valid.clone();
+        bad.role_nn_runs_attempted = 2;
+        bad.role_nn_runs_failed_known = 1;
+        // Both frames separately validate; a failed-known counter regression
+        // still makes the per-invocation stage history incomplete.
+        bad.validate().unwrap();
+        assert!(!PalsNNInputEvidence::between(&bad, &valid, true).complete);
     }
     #[test]
     fn cuda_full_audit_waits_for_completed_run_and_latches_origin_failure() {
