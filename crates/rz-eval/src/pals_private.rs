@@ -19,20 +19,18 @@
 //! arrives, this intentionally remains retained for the process lifetime.
 
 use crate::pals_model::{PalsModelConfig, PalsModelInput, PalsRole};
-use rz_contracts::pals::SituationHandle;
 use rz_contracts::CancelToken;
+use rz_contracts::pals::SituationHandle;
 use rz_position::{PositionSnapshot, WeakPositionIdentity};
 use sha2::{Digest as _, Sha256};
 use std::mem::size_of;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-pub const PRIVATE_WARM_SEMANTICS: &str =
-    "rz-pals-private-approx-warm/1;fp32-bits;same-exact-rules-context;role-isolated;accepted-seed-only;no-exact-cache";
+pub const PRIVATE_WARM_SEMANTICS: &str = "rz-pals-private-approx-warm/1;fp32-bits;same-exact-rules-context;role-isolated;accepted-seed-only;no-exact-cache";
 /// Distinct CUDA invocation namespace. A bank lease alone does not attest a
 /// loaded CUDA graph, I/O binding, device residency or physical completion.
-pub const PRIVATE_CUDA_WARM_SEMANTICS: &str =
-    "rz-pals-private-approx-cuda-warm/2;fp32-bits;same-exact-rules-context;role-isolated;accepted-seed-only;no-exact-cache;device-public-kv;physical-output-fence";
+pub const PRIVATE_CUDA_WARM_SEMANTICS: &str = "rz-pals-private-approx-cuda-warm/2;fp32-bits;same-exact-rules-context;role-isolated;accepted-seed-only;no-exact-cache;device-public-kv;physical-output-fence";
 pub const CURRENT_NATIVE_PRIVATE_WARM_SUPPORTED: bool = false;
 const MAX_LATENT_ELEMENTS: usize = 16 * 384;
 // Conservative per-allocation ownership overhead. This is a module reservation,
@@ -764,17 +762,32 @@ impl PrivateSeedBank {
         let result = (|| {
             if state.quarantine_owner.is_some()
                 || state.active.as_ref().is_some_and(|active| active.unknown)
-            { return Err(PrivateSeedError::PhysicalCompletionUnknown); }
-            if state.active.is_some() { return Err(PrivateSeedError::ActivePhysicalLease); }
-            if state.pending.is_some() { return Err(PrivateSeedError::PendingFinalization); }
-            if state.slots.iter().flatten().any(|seed| Arc::strong_count(seed) != 1) {
+            {
                 return Err(PrivateSeedError::PhysicalCompletionUnknown);
             }
-            for role in &mut state.slots { role.clear(); }
+            if state.active.is_some() {
+                return Err(PrivateSeedError::ActivePhysicalLease);
+            }
+            if state.pending.is_some() {
+                return Err(PrivateSeedError::PendingFinalization);
+            }
+            if state
+                .slots
+                .iter()
+                .flatten()
+                .any(|seed| Arc::strong_count(seed) != 1)
+            {
+                return Err(PrivateSeedError::PhysicalCompletionUnknown);
+            }
+            for role in &mut state.slots {
+                role.clear();
+            }
             state.bank_bytes = state.base_bytes;
             Ok(())
         })();
-        if let Err(error) = result { state.last_failure = Some(error); }
+        if let Err(error) = result {
+            state.last_failure = Some(error);
+        }
         drop(state);
         result?;
         self.snapshot()
@@ -1414,6 +1427,54 @@ mod tests {
     }
 
     #[test]
+    fn terminal_close_preserves_same_game_counts_and_refuses_live_lease_storage() {
+        let snapshot = Position::startpos().snapshot();
+        let input = input(PalsRole::Proposer);
+        let req = request(&snapshot, &input);
+        let bank = PrivateSeedBank::new(limits(), 1).unwrap();
+        accepted(&bank, &req, &snapshot, PrivateInvocationMode::Fresh);
+        let before = bank.snapshot().unwrap();
+        let after = bank.close_after_known_fence().unwrap();
+        assert_eq!(after.game_generation, before.game_generation);
+        assert_eq!(after.counts, before.counts);
+        assert_eq!(after.entries_per_role, [0; 3]);
+        assert!(after.admission_closed && !after.quarantined);
+
+        let bank = PrivateSeedBank::new(limits(), 1).unwrap();
+        accepted(&bank, &req, &snapshot, PrivateInvocationMode::Fresh);
+        let lease = bank
+            .begin(
+                req,
+                &snapshot,
+                PrivateInvocationMode::ApproxCudaWarmV2,
+                &CancelToken::new(),
+                deadline(),
+            )
+            .unwrap();
+        let before = bank.snapshot().unwrap();
+        assert_eq!(
+            bank.close_after_known_fence(),
+            Err(PrivateSeedError::ActivePhysicalLease)
+        );
+        let after = bank.snapshot().unwrap();
+        assert_eq!(after.active_lease, before.active_lease);
+        assert_eq!(after.entries_per_role, before.entries_per_role);
+        assert_eq!(after.reserved_bank_bytes, before.reserved_bank_bytes);
+        assert!(after.admission_closed && after.pinned_entries > 0);
+        drop(
+            lease
+                .complete_known(PhysicalSeedCompletion::Failed)
+                .unwrap(),
+        );
+        let after = bank.close_after_known_fence().unwrap();
+        assert_eq!(after.game_generation, 1);
+        assert_eq!(after.entries_per_role, [0; 3]);
+        assert_eq!(
+            after.counts.known_completions,
+            before.counts.known_completions + 1
+        );
+    }
+    #[test]
     fn base_reservation_accounts_for_the_full_outward_lease_identity() {
         let bank = PrivateSeedBank::new(limits(), 1).unwrap();
         let reserved = bank.snapshot().unwrap().reserved_bank_bytes;
@@ -1984,11 +2045,13 @@ mod tests {
                     deadline(),
                 )
                 .unwrap();
-            assert!(lease
-                .complete_known(PhysicalSeedCompletion::Succeeded)
-                .unwrap()
-                .stage_output(&invalid)
-                .is_err());
+            assert!(
+                lease
+                    .complete_known(PhysicalSeedCompletion::Succeeded)
+                    .unwrap()
+                    .stage_output(&invalid)
+                    .is_err()
+            );
             assert_eq!(bank.snapshot().unwrap().entries_per_role, [0; 3]);
         }
         let lease = bank
@@ -2377,14 +2440,16 @@ mod tests {
         let retained = owner
             .upgrade()
             .expect("actual seed pin retained in quarantine");
-        assert!(retained
-            .lock()
-            .unwrap()
-            .active
-            .as_ref()
-            .unwrap()
-            .seed
-            .is_some());
+        assert!(
+            retained
+                .lock()
+                .unwrap()
+                .active
+                .as_ref()
+                .unwrap()
+                .seed
+                .is_some()
+        );
         // The test supplies a simulated actual fence; without it the owner is
         // intentionally retained. No new seed/admission follows this recovery.
         let recovered = PrivateSeedBank { inner: retained };
@@ -2543,11 +2608,13 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(lease.seed_provenance().unwrap().role, req.role);
-            assert!(lease
-                .seed_bits()
-                .unwrap()
-                .iter()
-                .all(|bits| *bits == expected.to_bits()));
+            assert!(
+                lease
+                    .seed_bits()
+                    .unwrap()
+                    .iter()
+                    .all(|bits| *bits == expected.to_bits())
+            );
             assert_eq!(consume(&lease)[0], expected * 0.5 + 0.25);
             lease
                 .complete_known(PhysicalSeedCompletion::Succeeded)
