@@ -26,6 +26,13 @@ struct NewFrontier {
     publication: Option<ObservationId>,
 }
 
+#[derive(Default)]
+struct IterativeRepairObservation {
+    comparison_attempted: bool,
+    comparable: bool,
+    publication: Option<ObservationId>,
+}
+
 impl<M: RoleModel> PalsEngine<M> {
     pub(super) fn admit_iterative_repair(&mut self, movement: BoardMove) -> bool {
         if self.post_repair_recheck != PostRepairRecheckPolicy::IterativeFrozenModelWdlV2 {
@@ -122,6 +129,14 @@ impl<M: RoleModel> PalsEngine<M> {
                 continue;
             };
             let revision = self.revision;
+            if counters.accepted_repair_outputs > before {
+                self.observe_accepted_repair(
+                    work.root,
+                    work.original_first,
+                    repaired_line,
+                    revision,
+                );
+            }
             self.verify(repaired_leaf, &repaired, limits, cancel, counters)?;
             self.publish_iterative_repair(
                 &work,
@@ -173,6 +188,45 @@ impl<M: RoleModel> PalsEngine<M> {
         cancel: &AtomicBool,
         counters: &mut PalsCounters,
     ) -> Result<bool, PalsError> {
+        let record_revision = self.revision;
+        let mut observed = IterativeRepairObservation::default();
+        let result = self.publish_iterative_repair_impl(
+            work,
+            frontier,
+            repaired_line,
+            repaired_leaf,
+            repaired,
+            limits,
+            cancel,
+            counters,
+            &mut observed,
+        );
+        let comparison = self.observe_frozen_comparison(
+            frontier.counter_leaf,
+            Some(repaired_leaf),
+            self.nodes[work.root].position.side_to_move(),
+            observed.comparison_attempted,
+            observed.comparable,
+            observed.publication,
+            result.as_ref().err(),
+        );
+        self.observe_iterative_repair_comparison(record_revision, comparison);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_iterative_repair_impl(
+        &mut self,
+        work: &RepairWork,
+        frontier: &NewFrontier,
+        repaired_line: LineId,
+        repaired_leaf: usize,
+        repaired: &[BoardMove],
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        counters: &mut PalsCounters,
+        observed: &mut IterativeRepairObservation,
+    ) -> Result<bool, PalsError> {
         let Some(previous) = frontier.publication else {
             return Ok(false);
         };
@@ -208,6 +262,7 @@ impl<M: RoleModel> PalsEngine<M> {
         );
         match terminals {
             (None, None) => {
+                observed.comparison_attempted = true;
                 self.evaluate_model_value(
                     frontier.counter_leaf,
                     &frontier.counterline,
@@ -223,7 +278,7 @@ impl<M: RoleModel> PalsEngine<M> {
                     return Ok(false);
                 }
             }
-            (Some(_), Some(_)) => {}
+            (Some(_), Some(_)) => observed.comparison_attempted = true,
             _ => {
                 counters.frozen_wdl_unresolved += 1;
                 return Ok(false);
@@ -247,6 +302,7 @@ impl<M: RoleModel> PalsEngine<M> {
             counters.frozen_wdl_unresolved += 1;
             return Ok(false);
         };
+        observed.comparable = true;
         counters.frozen_wdl_comparisons += 1;
         if after <= before {
             return Ok(false);
@@ -306,6 +362,7 @@ impl<M: RoleModel> PalsEngine<M> {
             limits,
             cancel,
         )?;
+        observed.publication = Some(evidence);
         counters.supported_repairs += 1;
         Ok(true)
     }
@@ -485,6 +542,7 @@ impl<M: RoleModel> PalsEngine<M> {
             .get(work.repaired_line)
             .and_then(|c| c.evidence);
         let mut trace = RecheckProgress::default();
+        let mut comparison_attempted = false;
         let prepared = self.model.recheck_prepared(RecheckPrepared {
             policy: self.post_repair_recheck,
             identity,
@@ -602,6 +660,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 )?;
                 self.verify_checked_cpu(leaf, &trace.counterline, limits, cancel, counters)?;
                 let comparison_revision = self.revision;
+                comparison_attempted = true;
                 // Both Fresh invocations see exactly the same public-record revision.
                 // They have different target states, not a shared raw input/cache key.
                 self.evaluate_model_value(
@@ -747,9 +806,33 @@ impl<M: RoleModel> PalsEngine<M> {
             self.last_recheck_observer_error
                 .get_or_insert_with(|| error.clone());
             if result.is_ok() {
-                return Err(error.into());
+                result = Err(error.into());
             }
         }
+        let comparison = self.observe_frozen_comparison(
+            work.repaired_leaf,
+            trace.counter_leaf,
+            root_color,
+            comparison_attempted,
+            trace.comparable,
+            trace.publication,
+            result.as_ref().err(),
+        );
+        self.observe_repair_recheck(
+            work.repair_record_revision,
+            PalsRepairRecheckExecution {
+                reply_context: (&reply_context).into(),
+                prepared_accepted: trace.prepared_accepted,
+                reply_call_attempted: trace.reply_call_attempted,
+                reply_accepted: trace.reply_accepted,
+                selected_response: trace.selected_response,
+                counterline: trace.counterline,
+                counterline_completed: trace.counterline_completed,
+                disposition: trace.disposition,
+                original_error: result.as_ref().err().cloned(),
+                comparison,
+            },
+        );
         result?;
         if let Some(stop) = self.stopped(limits, cancel) {
             return Err(match stop {

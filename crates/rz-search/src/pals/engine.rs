@@ -33,7 +33,15 @@ use std::time::{Duration, Instant};
 
 mod archive_lifecycle;
 mod cpu_lifecycle;
+mod followup_execution;
 mod frozen_recheck;
+pub use followup_execution::{
+    PALS_FOLLOWUP_EXECUTION_TRACE_MAX, PALS_FOLLOWUP_EXECUTION_VERSION,
+    PalsExecutionEndpointSnapshot, PalsExecutionEndpointValue, PalsFollowupExecutionScope,
+    PalsFollowupExecutionSnapshot, PalsFollowupObservationIssue, PalsFollowupOwnerSnapshot,
+    PalsFrozenComparisonExecution, PalsFrozenValueExecution, PalsRepairExecutionTrace,
+    PalsRepairRecheckExecution, RoleExecutionContext, RoleValueExecutionEvidence,
+};
 
 pub const PALS_SEARCH_VERSION: &str = "pals-restricted-refinement/0.1";
 pub const PALS_FOLLOWUP_SEARCH_VERSION: &str = "rovezero.pals-full-line-v2/0.2";
@@ -97,6 +105,10 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
             (
                 "pals/engine/cpu_lifecycle.rs",
                 include_str!("engine/cpu_lifecycle.rs"),
+            ),
+            (
+                "pals/engine/followup_execution.rs",
+                include_str!("engine/followup_execution.rs"),
             ),
             ("pals/store.rs", include_str!("store.rs")),
             ("pals/store/hot.rs", include_str!("store/hot.rs")),
@@ -578,6 +590,11 @@ pub trait RoleModel: Send {
     fn value_identity(&self) -> Option<&ModelValueIdentity> {
         None
     }
+    /// Copies the most recent value's actual Runtime binding and completion.
+    /// This query is non-I/O and does not assert logical output acceptance.
+    fn last_value_execution_evidence(&self) -> Option<RoleValueExecutionEvidence> {
+        None
+    }
     /// Uses the Proposer forward's shared WDL; candidate policy is not consumed.
     /// This estimate cannot calibrate foreign CP/mate or certify Rules facts.
     fn evaluate_value(&mut self, _query: RoleQuery<'_>) -> Result<ModelValueOutput, RoleError> {
@@ -651,6 +668,22 @@ pub trait RoleModel: Send {
     /// Close only delivered-output accounting at this logical search boundary.
     /// Physical leases, drain, and quarantine remain the backend owner's job.
     fn finish_search(&mut self, _reason: RoleSearchClosure) {}
+    /// Verify the old owner's physical fence under the original controls,
+    /// without changing its model bank, logical target or game generation.
+    /// Synchronous providers have no outstanding owner after a returned call.
+    fn preflight_new_game(
+        &mut self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), RoleError> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(RoleError::Canceled);
+        }
+        if Instant::now() >= deadline {
+            return Err(RoleError::Deadline);
+        }
+        Ok(())
+    }
     fn new_game(&mut self) {}
     /// None means logical generation exhaustion; no later question is admitted.
     /// This reset does not assert native drain or a worker reset acknowledgement.
@@ -665,6 +698,9 @@ impl<M: RoleModel + ?Sized> RoleModel for Box<M> {
     }
     fn value_identity(&self) -> Option<&ModelValueIdentity> {
         (**self).value_identity()
+    }
+    fn last_value_execution_evidence(&self) -> Option<RoleValueExecutionEvidence> {
+        (**self).last_value_execution_evidence()
     }
     fn evaluate_value(&mut self, query: RoleQuery<'_>) -> Result<ModelValueOutput, RoleError> {
         (**self).evaluate_value(query)
@@ -730,6 +766,13 @@ impl<M: RoleModel + ?Sized> RoleModel for Box<M> {
     }
     fn finish_search(&mut self, reason: RoleSearchClosure) {
         (**self).finish_search(reason);
+    }
+    fn preflight_new_game(
+        &mut self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), RoleError> {
+        (**self).preflight_new_game(deadline, cancel)
     }
     fn new_game(&mut self) {
         (**self).new_game();
@@ -941,7 +984,7 @@ pub struct PalsResult {
     /// independent and is preserved in task/observation provenance.
     pub resolver_version: &'static str,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum PalsError {
     InvalidConfig,
     InvalidLimits,
@@ -1122,6 +1165,8 @@ pub struct PalsEngine<M: RoleModel> {
     repair_questions: HashSet<(BoardMove, u64, Vec<BoardMove>)>,
     repair_counts: std::collections::HashMap<BoardMove, u8>,
     archive_state: archive_lifecycle::EngineArchiveLifecycle,
+    followup_execution: followup_execution::FollowupExecutionRecorder,
+    new_game_transition_error: Option<PalsError>,
 }
 impl<M: RoleModel> PalsEngine<M> {
     pub fn new(config: PalsConfig, model: M, cpu: CpuEngine) -> Result<Self, PalsError> {
@@ -1337,9 +1382,19 @@ impl<M: RoleModel> PalsEngine<M> {
             repair_questions: HashSet::new(),
             repair_counts: std::collections::HashMap::new(),
             archive_state: archive_lifecycle::EngineArchiveLifecycle::default(),
+            followup_execution: followup_execution::FollowupExecutionRecorder::default(),
+            new_game_transition_error: None,
         })
     }
     pub fn new_game(&mut self) {
+        if self.archive_config().is_some() {
+            // The void compatibility entry has no original caller controls and
+            // cannot certify the old physical/archive release boundary.
+            self.new_game_transition_error = Some(PalsError::Store(StoreError::InvalidConditions(
+                "archive new_game requires try_new_game with original controls",
+            )));
+            return;
+        }
         self.game_generation = self
             .game_generation
             .and_then(|generation| generation.checked_add(1));
@@ -1369,12 +1424,21 @@ impl<M: RoleModel> PalsEngine<M> {
         self.repair_queue.clear();
         self.repair_questions.clear();
         self.repair_counts.clear();
+        self.clear_followup_game();
+        self.new_game_transition_error = None;
     }
     pub fn try_new_game(
         &mut self,
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<(), PalsError> {
+        if self.archive_config().is_some() {
+            let result = self.try_new_archive_game(deadline, cancel);
+            if let Err(error) = &result {
+                self.new_game_transition_error = Some(error.clone());
+            }
+            return result;
+        }
         self.new_game();
         if self.checker_new_game_pending {
             self.cpu.new_game(deadline, cancel)?;
@@ -1559,12 +1623,14 @@ impl<M: RoleModel> PalsEngine<M> {
         self.repair_queue.clear();
         self.repair_questions.clear();
         self.repair_counts.clear();
-        if self.game_generation.is_none() {
-            return Err(PalsError::Capacity);
-        }
+        self.begin_followup_execution(position);
         let mut counters = PalsCounters::default();
         self.external_attempts.clear();
-        let mut result = self.search_inner(position, limits, cancel, progress, &mut counters);
+        let mut result = if self.game_generation.is_none() {
+            Err(PalsError::Capacity)
+        } else {
+            self.search_inner(position, limits, cancel, progress, &mut counters)
+        };
         let canceled = cancel.load(Ordering::Acquire)
             || matches!(&result, Ok(report) if report.completion == PalsCompletion::Canceled)
             || matches!(
@@ -1607,6 +1673,7 @@ impl<M: RoleModel> PalsEngine<M> {
             Err(_) => RoleSearchClosure::Failed,
         };
         self.model.finish_search(closure);
+        self.finish_followup_execution(closure, result.as_ref().err(), counters);
         result
     }
     fn search_inner<F: FnMut(BoardMove)>(
@@ -1635,6 +1702,10 @@ impl<M: RoleModel> PalsEngine<M> {
         {
             return Err(PalsError::InvalidLimits);
         }
+        if let Some(error) = &self.new_game_transition_error {
+            return Err(error.clone());
+        }
+        self.ensure_archive_admission_open()?;
         if let Some(completion) = self.stopped(limits, cancel) {
             // The current request still has a Rules terminal or legal fallback.
             // No old-root value, focus, task, archive retry or logical record is
@@ -1670,6 +1741,7 @@ impl<M: RoleModel> PalsEngine<M> {
             }
         };
         let root = self.finish_archive_root(root, limits.deadline, cancel)?;
+        self.observe_followup_root(root);
         // Archive old input/evidence ownership before invalidating the live
         // projection. Previous-search WDL is not a current-context cache hit.
         for node in &mut self.nodes {
@@ -2148,6 +2220,9 @@ impl<M: RoleModel> PalsEngine<M> {
             return Err(RoleError::Deadline.into());
         }
         self.accept_role_output(node, &context, question, limits, cancel)?;
+        if matches!(call, Call::Repair) {
+            self.observe_repair_question(&context);
+        }
         counters.consumed_role_outputs += 1;
         match call {
             Call::Propose => counters.accepted_proposer_outputs += 1,
@@ -2669,6 +2744,9 @@ impl<M: RoleModel> PalsEngine<M> {
         counters.role_calls += 1;
         counters.value_calls += 1;
         let output = self.model.evaluate_value_with_context(query, &context)?;
+        // Capture before another model callback can replace its one-value slot.
+        // Logical acceptance is recorded only after the gates below succeed.
+        let execution_evidence = self.model.last_value_execution_evidence();
         output.validate(&self.nodes[node].position, &identity)?;
         counters.completed_value_calls += 1;
         // Keep the full actual input identity; numeric scope IDs are metadata.
@@ -2740,9 +2818,20 @@ impl<M: RoleModel> PalsEngine<M> {
         self.accept_role_output(node, &context, question, limits, cancel)?;
         counters.consumed_role_outputs += 1;
         counters.accepted_value_outputs += 1;
+        let observed_input = output.input_sha256;
+        let observed_epoch = output.identity.model_epoch;
+        let observed_perspective = output.perspective;
         self.nodes[node].model_value = Some(output);
         self.nodes[node].model_observation = Some(observation);
         self.nodes[node].model_value_revision = Some(self.revision);
+        self.observe_value_execution(
+            observation,
+            observed_input,
+            observed_epoch,
+            observed_perspective,
+            &context,
+            execution_evidence,
+        );
         Ok(())
     }
 
@@ -4398,6 +4487,11 @@ impl<M: RoleModel> PalsEngine<M> {
                     cancel,
                 )?;
                 let repair_record_revision = self.revision;
+                if counters.accepted_repair_outputs > accepted_repairs_before {
+                    if let Some((line, _)) = repair_record {
+                        self.observe_accepted_repair(root, movement, line, repair_record_revision);
+                    }
+                }
                 self.verify(repair_leaf, &repair, limits, cancel, counters)?;
                 self.publish_choice(root, limits, cancel, progress)?;
                 let completed_repair_value =

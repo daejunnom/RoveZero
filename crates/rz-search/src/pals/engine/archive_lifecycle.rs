@@ -2,7 +2,8 @@
 //! released. Store reads remain hot-only; cold restoration is an explicit call.
 
 use super::super::store::{
-    ArchiveConfig, ArchiveIoBudget, EngineArchiveNode, EngineArchiveReceipt, StorePins,
+    ArchiveConfig, ArchiveIoBudget, ArchiveOwnerSnapshot, ArchiveRuntimeLimits, EngineArchiveNode,
+    EngineArchiveReceipt, StorePins,
 };
 use super::*;
 use crate::cpu_value::CpuTrainingState;
@@ -23,6 +24,8 @@ pub(super) struct EngineArchiveLifecycle {
     retried_allocation: bool,
     last_receipt: Option<EngineArchiveReceipt>,
     active_search_pins: StorePins,
+    pub(super) previous_closed_owner: Option<ArchiveOwnerSnapshot>,
+    closed_current_owner: Option<ArchiveOwnerSnapshot>,
 }
 
 impl<M: RoleModel> PalsEngine<M> {
@@ -34,6 +37,7 @@ impl<M: RoleModel> PalsEngine<M> {
             .map_err(PalsError::Store)?;
         self.archive_state.config = Some(config);
         self.archive_state.reopen_error = None;
+        self.archive_state.closed_current_owner = None;
         Ok(())
     }
 
@@ -43,6 +47,81 @@ impl<M: RoleModel> PalsEngine<M> {
 
     pub fn archive_enabled(&self) -> bool {
         self.stores.archive_enabled()
+    }
+
+    /// The actual one-shot Store selector, never a manifest/default projection.
+    pub fn set_archive_runtime_limits(
+        &mut self,
+        limits: ArchiveRuntimeLimits,
+    ) -> Result<(), PalsError> {
+        self.stores
+            .set_archive_runtime_limits(limits)
+            .map_err(PalsError::Store)?;
+        let actual =
+            self.stores
+                .archive_runtime_limits()
+                .copied()
+                .ok_or(StoreError::InvalidConditions(
+                    "archive selector was not installed",
+                ))?;
+        if let Some(config) = &mut self.archive_state.config {
+            config.game_bytes = actual.game_bytes_max;
+            config.global_bytes = actual.global_bytes_max;
+            config.record_bytes = actual.record_payload_bytes_max;
+            config.max_load_pins = actual.max_load_pins as usize;
+        }
+        Ok(())
+    }
+
+    pub fn archive_runtime_limits(&self) -> Option<&ArchiveRuntimeLimits> {
+        self.stores.archive_runtime_limits().or_else(|| {
+            self.archive_state
+                .closed_current_owner
+                .as_ref()
+                .and_then(|owner| owner.runtime_limits.as_ref())
+        })
+    }
+
+    pub fn archive_owner_snapshot(&self) -> Result<Option<ArchiveOwnerSnapshot>, PalsError> {
+        self.engine_archive_owner_snapshot()
+            .map_err(PalsError::Store)
+    }
+
+    pub(super) fn engine_archive_owner_snapshot(
+        &self,
+    ) -> Result<Option<ArchiveOwnerSnapshot>, StoreError> {
+        Ok(self
+            .stores
+            .archive_owner_snapshot()?
+            .or(self.archive_state.closed_current_owner))
+    }
+
+    pub(super) fn ensure_archive_admission_open(&self) -> Result<(), PalsError> {
+        if self.archive_state.closed_current_owner.is_some() {
+            return Err(PalsError::Store(StoreError::InvalidConditions(
+                "archive owner admission is closed",
+            )));
+        }
+        Ok(())
+    }
+
+    /// The Native caller already owns the actual checker/model release fences.
+    /// This closes only Store's archive owner and retains the real closed copy;
+    /// it performs no physical work and creates no cleanup I/O allowance.
+    pub fn finish_followup_owners(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<PalsFollowupOwnerSnapshot, PalsError> {
+        archive_deadline(deadline)?;
+        if let Some(closed) = self
+            .stores
+            .close_archive_owner()
+            .map_err(PalsError::Store)?
+        {
+            self.archive_state.closed_current_owner = Some(closed);
+        }
+        archive_deadline(deadline)?;
+        Ok(self.followup_owner_snapshot())
     }
 
     /// Bounded receipt of the most recent engine metadata commit, rather than
@@ -57,11 +136,77 @@ impl<M: RoleModel> PalsEngine<M> {
         self.archive_state.retried_allocation = false;
         self.archive_state.last_receipt = None;
         self.archive_state.active_search_pins = StorePins::default();
-        self.archive_state.reopen_error = self
+        self.archive_state.reopen_error = if self.stores.archive_enabled() {
+            None
+        } else {
+            self.archive_state
+                .config
+                .as_ref()
+                .and_then(|config| self.stores.enable_archive(config.clone()).err())
+        };
+    }
+
+    /// All potentially failing preparation happens before replacing the old
+    /// Store. A close failure keeps its actual manager, pins and hot facts alive.
+    pub(super) fn try_new_archive_game(
+        &mut self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), PalsError> {
+        archive_controls(deadline, cancel)?;
+        let generation = self
+            .game_generation
+            .and_then(|value| value.checked_add(1))
+            .ok_or(PalsError::Capacity)?;
+        self.model.preflight_new_game(deadline, cancel)?;
+        archive_controls(deadline, cancel)?;
+        self.cpu.new_game(deadline, cancel)?;
+        archive_controls(deadline, cancel)?;
+        let config = self
             .archive_state
             .config
             .as_ref()
-            .and_then(|config| self.stores.enable_archive(config.clone()).err());
+            .ok_or(StoreError::ArchiveDisabled)?
+            .clone();
+        let runtime_limits = self.archive_runtime_limits().copied();
+        let mut next = PalsStores::new(Self::store_limits(&self.config));
+        next.enable_archive(config).map_err(PalsError::Store)?;
+        if let Some(limits) = runtime_limits {
+            next.set_archive_runtime_limits(limits)
+                .map_err(PalsError::Store)?;
+        }
+        archive_controls(deadline, cancel)?;
+        let closed = self
+            .stores
+            .close_archive_owner()
+            .map_err(PalsError::Store)?
+            .or(self.archive_state.closed_current_owner);
+        // If cancellation/deadline arrives at the immutable close, the old hot
+        // Store and target remain, and the actual closed fact remains observable.
+        self.archive_state.closed_current_owner = closed;
+        archive_controls(deadline, cancel)?;
+        self.stores = next;
+        self.archive_state.previous_closed_owner = closed;
+        self.archive_state.closed_current_owner = None;
+        self.game_generation = Some(generation);
+        self.nodes.clear();
+        self.records.clear();
+        self.model.new_game_with_generation(self.game_generation);
+        self.revision = 0;
+        self.checker_new_game_pending = false;
+        self.reset_archive_new_game();
+        self.consumer_id = 0;
+        self.last_search_counters = None;
+        self.last_recheck_observer_error = None;
+        self.last_cpu_checkpoint_cleanup_error = None;
+        self.external_attempts.clear();
+        self.last_external_attempt = None;
+        self.repair_queue.clear();
+        self.repair_questions.clear();
+        self.repair_counts.clear();
+        self.clear_followup_game();
+        self.new_game_transition_error = None;
+        Ok(())
     }
 
     /// Called before focus_actual_moves, while the previous Node indices are
@@ -83,6 +228,14 @@ impl<M: RoleModel> PalsEngine<M> {
         self.archive_state.remaining_io = SEARCH_ARCHIVE_IO_BYTES;
         self.archive_state.retried_allocation = false;
         self.archive_state.active_search_pins = StorePins::default();
+        if self.stores.archive_runtime_limits().is_some() {
+            let mut budget = self.engine_archive_budget()?;
+            let available = budget.max_bytes;
+            let measured = self.stores.measure_archive_usage_with_budget(&mut budget);
+            self.charge_engine_archive_io(available.saturating_sub(budget.max_bytes))?;
+            measured.map_err(PalsError::Store)?;
+            archive_controls(deadline, cancel)?;
+        }
         self.retire_stale_archive_checkpoints(position)?;
         self.stores
             .set_archive_pins(self.resident_archive_pins()?)?;
@@ -872,26 +1025,58 @@ impl<M: RoleModel> PalsEngine<M> {
         position: &Position,
         mut budget: ArchiveIoBudget,
     ) -> Result<usize, PalsError> {
+        self.load_archived_root_with_budget(position, &mut budget)
+    }
+
+    /// This explicit caller allowance is separate from a search's remaining I/O.
+    /// Selected load limits cap the whole lookup/restore/install operation; both
+    /// Ok and Err return its actual bytes to the caller's unchanged allowance.
+    pub fn load_archived_root_with_budget(
+        &mut self,
+        position: &Position,
+        budget: &mut ArchiveIoBudget,
+    ) -> Result<usize, PalsError> {
         if budget.max_bytes > SEARCH_ARCHIVE_IO_BYTES {
             return Err(StoreError::InvalidConditions("engine cold load exceeds 16MiB").into());
         }
+        let mut work = *budget;
+        if let Some(limits) = self.archive_runtime_limits() {
+            work.max_bytes = work.max_bytes.min(limits.load_bytes_max);
+            let selected_deadline = Instant::now()
+                .checked_add(Duration::from_millis(limits.load_deadline_max_ms))
+                .ok_or(StoreError::InvalidConditions("archive load duration"))?;
+            work.deadline = work.deadline.min(selected_deadline);
+        }
+        let available = work.max_bytes;
+        let result = self.load_archived_root_inner(position, &mut work);
+        budget.max_bytes = budget
+            .max_bytes
+            .saturating_sub(available.saturating_sub(work.max_bytes));
+        result
+    }
+
+    fn load_archived_root_inner(
+        &mut self,
+        position: &Position,
+        budget: &mut ArchiveIoBudget,
+    ) -> Result<usize, PalsError> {
         let snapshot = position.snapshot();
         let state = self
             .stores
-            .lookup_cold_state_with_budget(&snapshot, &mut budget)
+            .lookup_cold_state_with_budget(&snapshot, budget)
             .map_err(PalsError::Store)?
             .ok_or(StoreError::ColdRecord("archived engine root"))?
             .original_id();
         let receipt = self
             .stores
-            .lookup_engine_node_archive_with_budget(state, &mut budget)
+            .lookup_engine_node_archive_with_budget(state, budget)
             .map_err(PalsError::Store)?
             .ok_or(StoreError::ColdRecord("archived engine metadata"))?;
         // Store checks dependency closure, owner/generation and quotas before
         // hot publication. Metadata validation precedes engine publication.
         let loaded = self
             .stores
-            .load_engine_archive_for_state(&receipt, state, budget)
+            .load_engine_archive_for_state_with_budget(&receipt, state, budget)
             .map_err(PalsError::Store)?;
         let pin = loaded.pin;
         let result = self.install_loaded_archive(
@@ -2408,6 +2593,17 @@ mod tests {
         let config = archive_config("new-game");
         let root = config.root.clone();
         engine.enable_archive(config).unwrap();
+        let actual_limits = ArchiveRuntimeLimits {
+            game_bytes_max: 256 * 1024 * 1024,
+            global_bytes_max: 4 * 1024 * 1024 * 1024,
+            index_entries_max: 1024,
+            index_bytes_max: 4096,
+            load_bytes_max: SEARCH_ARCHIVE_IO_BYTES,
+            load_deadline_max_ms: 20_000,
+            record_payload_bytes_max: SEARCH_ARCHIVE_IO_BYTES,
+            max_load_pins: 16,
+        };
+        engine.set_archive_runtime_limits(actual_limits).unwrap();
         fill_hot(&mut engine);
         engine
             .search(&Position::startpos(), limits(), &AtomicBool::new(false))
@@ -2421,10 +2617,46 @@ mod tests {
             deadline: Instant::now() + Duration::from_secs(20),
             max_bytes: SEARCH_ARCHIVE_IO_BYTES,
         };
+        let old_owner = engine.archive_owner_snapshot().unwrap().unwrap();
+        let old_generation = engine.game_generation;
+        let old_nodes = engine.nodes.len();
+        let old_records = engine.records.len();
         engine.new_game();
+        // A void reset has no original controls/fence and keeps the old owner.
+        assert_eq!(engine.game_generation, old_generation);
+        assert_eq!(
+            (engine.nodes.len(), engine.records.len()),
+            (old_nodes, old_records)
+        );
+        assert_eq!(
+            engine.archive_owner_snapshot().unwrap().unwrap().owner_id,
+            old_owner.owner_id
+        );
+        assert!(matches!(
+            engine.new_game_transition_error,
+            Some(PalsError::Store(StoreError::InvalidConditions(_)))
+        ));
+        engine
+            .try_new_game(budget.deadline, &AtomicBool::new(false))
+            .unwrap();
         assert_eq!(engine.archive_config().unwrap().root, root);
+        assert_eq!(engine.archive_runtime_limits(), Some(&actual_limits));
         assert!(engine.archive_enabled());
         assert!(engine.last_engine_archive().is_none());
+        let previous = engine
+            .followup_owner_snapshot()
+            .previous_closed_archive_owner
+            .unwrap();
+        assert_eq!(previous.owner_id, old_owner.owner_id);
+        assert_eq!(
+            previous.lifecycle,
+            super::super::super::store::ArchiveOwnerLifecycle::Closed
+        );
+        assert!(previous.admission_closed && previous.cleanup_complete);
+        assert_ne!(
+            engine.archive_owner_snapshot().unwrap().unwrap().owner_id,
+            old_owner.owner_id
+        );
         assert!(matches!(
             engine.stores.pin_load(&handle, budget),
             Err(StoreError::InvalidHandle(_))
@@ -2433,6 +2665,79 @@ mod tests {
             .search(&Position::startpos(), limits(), &AtomicBool::new(false))
             .unwrap();
         assert!(report.counters.cpu_tasks > 0);
+    }
+
+    #[test]
+    fn close_failure_retains_actual_store_and_nodes_until_load_pin_released() {
+        let mut engine = engine();
+        engine
+            .enable_archive(archive_config("owner-close-retains"))
+            .unwrap();
+        let node = engine.intern(Position::startpos()).unwrap();
+        let state = engine.nodes[node].state;
+        let wire = encode_archive_node_projection(&engine.nodes[node], &engine.nodes).unwrap();
+        let budget = ArchiveIoBudget {
+            deadline: Instant::now() + Duration::from_secs(20),
+            max_bytes: SEARCH_ARCHIVE_IO_BYTES,
+        };
+        let receipt = engine
+            .stores
+            .archive_engine_records(&[], &[wire], budget)
+            .unwrap();
+        let loaded = engine
+            .stores
+            .pin_load(&receipt.archive.state_handle(state), budget)
+            .unwrap();
+        let owner = engine.archive_owner_snapshot().unwrap().unwrap();
+        let generation = engine.game_generation;
+        let situation = engine.nodes[node].situation;
+        let error = engine
+            .try_new_game(budget.deadline, &AtomicBool::new(false))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PalsError::Store(StoreError::InvalidConditions(_))
+        ));
+        assert_eq!(engine.game_generation, generation);
+        assert_eq!(engine.nodes[node].state, state);
+        assert_eq!(engine.nodes[node].situation, situation);
+        assert!(engine.stores.states.get(state).is_ok());
+        assert!(engine.archive_enabled());
+        assert_eq!(
+            engine.archive_owner_snapshot().unwrap().unwrap().owner_id,
+            owner.owner_id
+        );
+        assert!(engine.followup_owner_snapshot().new_game_error.is_some());
+        engine.stores.release_loaded(loaded.pin).unwrap();
+        engine
+            .try_new_game(budget.deadline, &AtomicBool::new(false))
+            .unwrap();
+        assert!(engine.nodes.is_empty());
+        assert!(engine.followup_owner_snapshot().new_game_error.is_none());
+        let closed = engine.finish_followup_owners(budget.deadline).unwrap();
+        let archived = closed.archive.unwrap().unwrap();
+        assert!(archived.admission_closed && archived.cleanup_complete);
+        assert_eq!(
+            archived.lifecycle,
+            super::super::super::store::ArchiveOwnerLifecycle::Closed
+        );
+        assert!(!engine.archive_enabled());
+        assert_eq!(engine.archive_owner_snapshot().unwrap().unwrap(), archived);
+        assert_eq!(
+            engine
+                .followup_owner_snapshot()
+                .archive
+                .unwrap()
+                .unwrap()
+                .event_sequence,
+            archived.event_sequence
+        );
+        assert!(matches!(
+            engine.search(&Position::startpos(), limits(), &AtomicBool::new(false)),
+            Err(PalsError::Store(StoreError::InvalidConditions(
+                "archive owner admission is closed"
+            )))
+        ));
     }
 
     #[test]
