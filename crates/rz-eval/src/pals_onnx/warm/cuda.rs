@@ -10,18 +10,16 @@ use crate::pals_private::PRIVATE_CUDA_WARM_SEMANTICS;
 mod observation;
 pub(in crate::pals_onnx) use observation::CudaWarmDeviceAllocationGuard;
 pub use observation::{
-    PalsCudaWarmExecutionBinding, PalsCudaWarmInvocationObservation, PalsCudaWarmInvocationPurpose,
-    PalsCudaWarmInvocationState, PalsCudaWarmObservationHandle, PalsCudaWarmObservationSnapshot,
-    PalsCudaWarmObservationStatus, PalsCudaWarmOwnerObservation, PalsCudaWarmRuntimeLimits,
-    PRIVATE_CUDA_WARM_MEASUREMENT_CONTRACT,
+    PRIVATE_CUDA_WARM_MEASUREMENT_CONTRACT, PalsCudaWarmExecutionBinding,
+    PalsCudaWarmInvocationObservation, PalsCudaWarmInvocationPurpose, PalsCudaWarmInvocationState,
+    PalsCudaWarmObservationHandle, PalsCudaWarmObservationSnapshot, PalsCudaWarmObservationStatus,
+    PalsCudaWarmOwnerObservation, PalsCudaWarmRuntimeLimits,
 };
 
 pub const PRIVATE_CUDA_WARM_SCHEMA: &str = "rovezero.pals-private-cuda-warm.v2";
 pub const PRIVATE_CUDA_WARM_EXECUTION_DOMAIN: &str = "cuda_device_io_binding_v2";
-pub const PRIVATE_CUDA_WARM_GRAPH_SEMANTICS: &str =
-    "rz-pals-private-native-cuda-warm/2;accepted-final-latent;no-query-double-add;fixed-2-iterations;private-self-kv-recomputed;fp32;pc-only;device-public-kv;io-binding-required";
-pub const PRIVATE_CUDA_QUERY_SEMANTICS: &str =
-    "rz-pals-private-cuda-query/2;same-actual-nonrecord-fp32-and-full-lines;logical-game-search-situation-prefix-focus-role-isolated;records-revision-current;original-deadline-cancel-fixed;value-fresh";
+pub const PRIVATE_CUDA_WARM_GRAPH_SEMANTICS: &str = "rz-pals-private-native-cuda-warm/2;accepted-final-latent;no-query-double-add;fixed-2-iterations;private-self-kv-recomputed;fp32;pc-only;device-public-kv;io-binding-required";
+pub const PRIVATE_CUDA_QUERY_SEMANTICS: &str = "rz-pals-private-cuda-query/2;same-actual-nonrecord-fp32-and-full-lines;logical-game-search-situation-prefix-focus-role-isolated;records-revision-current;original-deadline-cancel-fixed;value-fresh";
 const CUDA_LAYOUT: &str = "shared_pc_if_approx_cuda_warm_v2";
 const CUDA_GRAPH_FILE: &str = "shared_pc_if_approx_cuda_warm_v2.onnx";
 const CUDA_PAYLOAD_LIMIT: u64 = 2 * 1024 * 1024;
@@ -190,7 +188,7 @@ impl PalsCudaWarmInput {
                     K::IdentityMismatch,
                     S::Admission,
                     "CUDA PALS Warm v2 cannot bind a CPU Warm v1 invocation",
-                ))
+                ));
             }
         };
         if input_key != self.input_key || approximate != lease.seed_bits().is_some() {
@@ -276,7 +274,7 @@ impl PalsCudaWarmInput {
                     K::IdentityMismatch,
                     S::Admission,
                     "PALS CUDA Warm input is in the CPU invocation domain",
-                ))
+                ));
             }
         };
         if self.capability != *capability
@@ -485,8 +483,11 @@ impl PalsOnnxBackend {
             || self.device_memory.is_some()
             || self.stats != PalsBackendStats::default()
         {
-            return Err(fail(K::InvalidInput, S::Admission,
-                "CUDA Warm observation selection must precede all physical commands and cannot be replaced"));
+            return Err(fail(
+                K::InvalidInput,
+                S::Admission,
+                "CUDA Warm observation selection must precede all physical commands and cannot be replaced",
+            ));
         }
         let capability = self.private_cuda_warm_capability().copied().ok_or_else(|| {
             fail(K::BackendUnavailable, S::Admission,
@@ -869,9 +870,25 @@ impl PalsOnnxBackend {
             .prepare_tensors(&self.model_config)
             .map_err(model_input)?;
         let key = tensors.public_memory_key;
+        let prepared_identity = StartupPreparedInputIdentity {
+            input_key: tensors.input_key,
+            public_memory_key: tensors.public_memory_key,
+            records: tensors.record_mask.len(),
+        };
         // No physical transfer is possible until the entire active aggregate
         // has been installed. Partial input allocations are prelaunch failures.
         let mut active = ActiveInputs::new(tensors, input.input.role == PalsRole::Critic, None)?;
+        if let Some(trace) = trace {
+            trace.observe_prepared_input(
+                input
+                    .observation_binding
+                    .map(|binding| binding.backend_owner_id),
+                input.input_key,
+                &input.input,
+                prepared_identity,
+                &active,
+            );
+        }
         active.private_warm = Some(input.prepare()?);
         self.active = Some(active);
         startup_return(trace, PalsStartupBackendStage::InputPreparation, true);
@@ -921,6 +938,14 @@ impl PalsOnnxBackend {
                 device_id,
                 self.cuda_warm_observer.as_ref(),
             )?);
+            if let Some(trace) = trace {
+                trace.observe_memory(
+                    self.device_memory
+                        .as_ref()
+                        .expect("installed device public owner"),
+                    false,
+                );
+            }
             startup_enter(trace, PalsStartupBackendStage::PublicRun);
             let result = self
                 .device_memory
@@ -951,6 +976,14 @@ impl PalsOnnxBackend {
                 return Err(error);
             }
             self.public_encodes = self.public_encodes.saturating_add(1);
+        }
+        if cached && let Some(trace) = trace {
+            trace.observe_memory(
+                self.device_memory
+                    .as_ref()
+                    .expect("cached device public owner"),
+                true,
+            );
         }
         self.device_warm_role = Some(
             DeviceWarmRole::new(self.shared_pc.as_ref().expect("CUDA Warm session"), input)
@@ -1014,8 +1047,11 @@ fn validate_cuda_domain(
     config.validate()?;
     match (config.provider, config.device_public_memory, bundle) {
         (Provider::Cuda { device_id, .. }, true, Some(bundle)) => Ok((device_id, bundle)),
-        _ => Err(fail(K::BackendUnavailable, S::Admission,
-            "CUDA Warm requires explicit CUDA, device public K/V, I/O binding and verified runtime bundle")),
+        _ => Err(fail(
+            K::BackendUnavailable,
+            S::Admission,
+            "CUDA Warm requires explicit CUDA, device public K/V, I/O binding and verified runtime bundle",
+        )),
     }
 }
 fn cuda_capability_token(
@@ -1354,7 +1390,7 @@ mod tests {
         PhysicalSeedCompletion, PrivateInvocationMode, PrivateRulesContext, PrivateSeedBank,
         PrivateSeedLimits, PrivateSeedRequest, PrivateSituationContext,
     };
-    use rz_contracts::{pals::SituationHandle, CancelToken};
+    use rz_contracts::{CancelToken, pals::SituationHandle};
     use rz_position::{Position, PositionSnapshot};
     use std::time::Duration;
 
@@ -1672,9 +1708,11 @@ mod tests {
         };
         let mut wrong = actual_binding;
         wrong.backend_owner_id += 1;
-        assert!(payload
-            .bind_execution_observation(&observer, wrong)
-            .is_err());
+        assert!(
+            payload
+                .bind_execution_observation(&observer, wrong)
+                .is_err()
+        );
         assert!(payload.execution_observation_binding().is_none());
         payload
             .bind_execution_observation(&observer, actual_binding)
@@ -1683,9 +1721,11 @@ mod tests {
             payload.execution_observation_binding(),
             Some(actual_binding)
         );
-        assert!(payload
-            .bind_execution_observation(&observer, actual_binding)
-            .is_err());
+        assert!(
+            payload
+                .bind_execution_observation(&observer, actual_binding)
+                .is_err()
+        );
         assert_eq!(payload.input_key, key);
         assert_eq!(payload.invocation(), mode);
         assert_eq!(payload.initial_latent_bits(), bits);

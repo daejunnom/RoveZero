@@ -734,8 +734,8 @@ mod native {
         HostRecordPageObservationStatus, HostRecordPagePolicy, HostRecordPageSnapshot,
         PalsBackendStats, PalsCudaControlPolicy, PalsCudaPlacementWitness, PalsGraphOptimization,
         PalsNativeCommand, PalsNativeMappingWitness, PalsNativeResult, PalsOnnxBackend,
-        PalsSessionResidency, PalsStartupStageProbe, PalsStartupStageSnapshot, PalsWarmCapability,
-        PalsWarmInput,
+        PalsSessionResidency, PalsStartupInputCompletionBinding, PalsStartupSnapshotStatus,
+        PalsStartupStageProbe, PalsStartupStageSnapshot, PalsWarmCapability, PalsWarmInput,
     };
     #[cfg(feature = "experimental-io-binding")]
     use rz_eval::pals_onnx::{PalsCudaWarmCapability, PalsCudaWarmInput};
@@ -2182,6 +2182,17 @@ mod native {
         }
     }
     #[derive(Clone, Debug, serde::Serialize)]
+    pub struct NativeStartupInputObservation {
+        pub startup_request_ordinal: Option<u8>,
+        pub backend_owner_id: Option<u64>,
+        pub role: PalsRole,
+        pub input_key: [u8; 32],
+        pub logical_records: usize,
+        /// Observed from the immutable job retained by the actual Ready lease.
+        pub retained_input_key: Option<[u8; 32]>,
+        pub raw_decode_succeeded: Option<bool>,
+    }
+    #[derive(Clone, Debug, serde::Serialize)]
     pub struct NativeStartupCommandObservation {
         pub command: &'static str,
         pub admitted: bool,
@@ -2191,6 +2202,86 @@ mod native {
         pub physical_completion_confirmed: Option<bool>,
         pub return_error: Option<NativeStartupErrorKind>,
         pub fence_observation: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub input_observation: Option<NativeStartupInputObservation>,
+    }
+
+    fn bind_startup_input_observations(
+        snapshot: &mut PalsStartupStageSnapshot,
+        commands: &[NativeStartupCommandObservation],
+        witness: Option<&PalsCudaPlacementWitness>,
+    ) {
+        let complete = snapshot.snapshot_status == PalsStartupSnapshotStatus::Available
+            && snapshot.capture_started == Some(true)
+            && snapshot.capture_closed
+            && !snapshot.overflow
+            && !snapshot.recording_contended
+            && !snapshot.recording_poisoned;
+        for input in snapshot.input_observations.iter_mut().flatten() {
+            input.completion_binding = None;
+            input.completion_binding_error = Some("incomplete_input_diagnostic");
+            if !complete {
+                continue;
+            }
+            let mut matching = commands.iter().enumerate().filter(|(_, command)| {
+                command.input_observation.as_ref().is_some_and(|identity| {
+                    identity.startup_request_ordinal == Some(input.request_ordinal)
+                })
+            });
+            let Some((ordinal, command)) = matching.next() else {
+                input.completion_binding_error = Some("missing_retained_command_input");
+                continue;
+            };
+            if matching.next().is_some() {
+                input.completion_binding_error = Some("ambiguous_retained_command_input");
+                continue;
+            }
+            let identity = command
+                .input_observation
+                .as_ref()
+                .expect("matched input identity");
+            let Some(owner) = input.backend_owner_id.filter(|owner| *owner != 0) else {
+                input.completion_binding_error = Some("missing_backend_owner_identity");
+                continue;
+            };
+            if identity.backend_owner_id != Some(owner)
+                || identity.role != input.role
+                || identity.input_key != input.input_key
+                || input.prepared_input_key != input.input_key
+                || identity.retained_input_key != Some(input.input_key)
+                || identity.logical_records != input.logical_records
+            {
+                input.completion_binding_error = Some("retained_command_input_or_owner_mismatch");
+                continue;
+            }
+            if !command.admitted
+                || command.physical_completion_confirmed != Some(true)
+                || command.return_error.is_some()
+                || identity.raw_decode_succeeded != Some(true)
+                || input.private_run_returned_ok != Some(true)
+                || input.role_evaluation_returned_ok != Some(true)
+                || !(input.public_run_returned_ok == Some(true)
+                    || input.public_cache_hit == Some(true))
+            {
+                input.completion_binding_error = Some("command_completion_or_decode_not_confirmed");
+                continue;
+            }
+            let Some(witness) = witness else {
+                input.completion_binding_error = Some("missing_same_worker_profile_ack");
+                continue;
+            };
+            input.completion_binding = Some(PalsStartupInputCompletionBinding {
+                command_ordinal: ordinal + 1,
+                backend_owner_id: owner,
+                retained_input_key: identity.retained_input_key.expect("matched retained key"),
+                physical_completion_confirmed: true,
+                raw_decode_succeeded: true,
+                inventory_sha256: witness.inventory_sha256,
+                public_profile_sha256: witness.public.profile_sha256,
+                shared_pc_profile_sha256: witness.shared_pc.profile_sha256,
+            });
+            input.completion_binding_error = None;
+        }
     }
     /// A bounded failure-only timeline. Successful legacy wire stays unchanged.
     /// Loading time is observed at the actual CLI factory, not inferred from
@@ -5404,7 +5495,11 @@ mod native {
             let started = Instant::now();
             self.startup_clock = Some(started);
             if let Some(probe) = self.owner.startup_stage_probe.as_ref() {
-                let _ = probe.start(started);
+                if self.owner.startup_probe_timeout_ms.load(Ordering::Acquire) != 0 {
+                    let _ = probe.start_with_input_observations(started);
+                } else {
+                    let _ = probe.start(started);
+                }
             }
             self.startup_diagnostic = Some(NativeStartupFailureDiagnostic {
                 schema: "rz-pals-startup-failure-diagnostic/1",
@@ -5614,11 +5709,27 @@ mod native {
                 self.owner.startup_ready.store(true, Ordering::Release);
                 Ok(())
             })();
-            let backend_stages = self
+            let mut backend_stages = self
                 .owner
                 .startup_stage_probe
                 .as_ref()
                 .map(PalsStartupStageProbe::snapshot_and_stop);
+            if let Some(snapshot) = backend_stages.as_mut()
+                && snapshot.input_observations.is_some()
+            {
+                let witness = self.owner.startup_probe.lock().ok().and_then(|probe| {
+                    probe
+                        .as_ref()
+                        .and_then(|probe| probe.cuda_placement_witness.clone())
+                });
+                if let Some(diagnostic) = self.startup_diagnostic.as_ref() {
+                    bind_startup_input_observations(
+                        snapshot,
+                        &diagnostic.commands,
+                        witness.as_deref(),
+                    );
+                }
+            }
             if let Err(error) = &outcome {
                 self.unusable = true;
                 if self.owner.execution.cuda_record_pages.is_some()
@@ -5675,6 +5786,7 @@ mod native {
         ) -> Result<PalsNativeResult, RoleError> {
             let kind = command.diagnostic_kind();
             let elapsed = self.startup_elapsed_ns();
+            let input_observation = self.startup_input_observation(&command);
             // A diagnostic cap is not a command admission or completion rule.
             // Suppress capture on overflow without mutating a prior event or
             // replacing the actual command outcome.
@@ -5705,6 +5817,7 @@ mod native {
                     physical_completion_confirmed: None,
                     return_error: None,
                     fence_observation: None,
+                    input_observation,
                 });
             }
             let result = self.startup_command_inner(command, until);
@@ -5718,6 +5831,40 @@ mod native {
                 observation.return_error = result.as_ref().err().map(NativeStartupErrorKind::from);
             }
             result
+        }
+        fn startup_input_observation(
+            &self,
+            command: &PalsNativeCommand,
+        ) -> Option<NativeStartupInputObservation> {
+            if self.owner.startup_probe_timeout_ms.load(Ordering::Acquire) == 0 {
+                return None;
+            }
+            let input = match command {
+                PalsNativeCommand::Evaluate(input)
+                | PalsNativeCommand::EvaluateWithEvidence(input) => input,
+                PalsNativeCommand::EvaluatePrivateWarm(input) => input.input(),
+                #[cfg(feature = "experimental-io-binding")]
+                PalsNativeCommand::EvaluateCudaWarm(input) => input.input(),
+                _ => return None,
+            };
+            #[cfg(feature = "experimental-io-binding")]
+            let backend_owner_id = self
+                .owner
+                .private_warm
+                .as_ref()
+                .and_then(|warm| warm.observer.as_ref())
+                .map(|observer| observer.owner_id());
+            #[cfg(not(feature = "experimental-io-binding"))]
+            let backend_owner_id = None;
+            Some(NativeStartupInputObservation {
+                startup_request_ordinal: None,
+                backend_owner_id,
+                role: input.role,
+                input_key: input.canonical_input_key(&self.owner.model_config).ok()?,
+                logical_records: input.records.len(),
+                retained_input_key: None,
+                raw_decode_succeeded: None,
+            })
         }
         fn startup_command_inner(
             &mut self,
@@ -5755,12 +5902,22 @@ mod native {
                     .map_err(model_error)?,
             );
             self.owner.in_flight.fetch_add(1, Ordering::AcqRel);
-            if let Some(observation) = self
-                .startup_diagnostic
-                .as_mut()
-                .and_then(|d| d.commands.last_mut())
-            {
-                observation.admitted = true;
+            if let Some(diagnostic) = self.startup_diagnostic.as_mut() {
+                let ordinal = u8::try_from(
+                    diagnostic
+                        .commands
+                        .iter()
+                        .filter(|command| command.admitted && command.input_observation.is_some())
+                        .count()
+                        + 1,
+                )
+                .ok();
+                if let Some(observation) = diagnostic.commands.last_mut() {
+                    observation.admitted = true;
+                    if let Some(input) = observation.input_observation.as_mut() {
+                        input.startup_request_ordinal = ordinal;
+                    }
+                }
             }
             loop {
                 let lease = self.control_lease.as_mut().expect("admitted startup lease");
@@ -5796,6 +5953,17 @@ mod native {
                                     let checked = raw
                                         .decode(input, &self.owner.model_config)
                                         .map_err(model_error);
+                                    if let Some(observation) = self
+                                        .startup_diagnostic
+                                        .as_mut()
+                                        .and_then(|diagnostic| diagnostic.commands.last_mut())
+                                        .and_then(|command| command.input_observation.as_mut())
+                                    {
+                                        observation.retained_input_key = input
+                                            .canonical_input_key(&self.owner.model_config)
+                                            .ok();
+                                        observation.raw_decode_succeeded = Some(checked.is_ok());
+                                    }
                                     if checked.is_ok() {
                                         let mut probe = self
                                             .owner
@@ -8940,6 +9108,156 @@ mod native {
             });
         }
         #[test]
+        fn startup_input_completion_requires_retained_owner_key_ready_decode_and_profile() {
+            use rz_eval::pals_onnx::{PalsKernelWitness, PalsStartupInputObservation};
+            // CPU metadata fixtures only: no session, provider, Tensor or NN is
+            // created, and their synthetic profile pins are not GPU evidence.
+            let observed = PalsStartupInputObservation {
+                request_ordinal: 1,
+                role: PalsRole::Proposer,
+                backend_owner_id: Some(7),
+                input_key: [9; 32],
+                prepared_input_key: [9; 32],
+                public_memory_key: [8; 32],
+                logical_records: 0,
+                prepared_records: 1,
+                record_mask: Some(vec![false]),
+                board: None,
+                records: None,
+                record_mask_tensor: None,
+                memory_key: None,
+                memory_value: None,
+                memory_mask: None,
+                public_cache_hit: Some(false),
+                public_run_returned_ok: Some(true),
+                private_run_returned_ok: Some(true),
+                role_evaluation_returned_ok: Some(true),
+                completion_binding: None,
+                completion_binding_error: None,
+            };
+            let snapshot = PalsStartupStageSnapshot {
+                schema: "rovezero.pals-startup-backend-stages.v1",
+                clock_scope: "caller_supplied_monotonic_startup_origin",
+                snapshot_status: PalsStartupSnapshotStatus::Available,
+                capture_started: Some(true),
+                capture_closed: true,
+                snapshot_elapsed_ns: Some(1),
+                captured_requests: 1,
+                max_requests: 2,
+                max_events: 64,
+                overflow: false,
+                recording_contended: false,
+                recording_poisoned: false,
+                events: vec![],
+                input_observations: Some(vec![observed]),
+            };
+            let command = NativeStartupCommandObservation {
+                command: "evaluate_cuda_warm",
+                admitted: true,
+                entered_elapsed_ns: Some(1),
+                returned_elapsed_ns: Some(2),
+                physical_completion_confirmed: Some(true),
+                return_error: None,
+                fence_observation: None,
+                input_observation: Some(NativeStartupInputObservation {
+                    startup_request_ordinal: Some(1),
+                    backend_owner_id: Some(7),
+                    role: PalsRole::Proposer,
+                    input_key: [9; 32],
+                    logical_records: 0,
+                    retained_input_key: Some([9; 32]),
+                    raw_decode_succeeded: Some(true),
+                }),
+            };
+            let kernel = PalsKernelWitness {
+                profile_sha256: [5; 32],
+                cuda_kernels: 1,
+                cuda_transfer_kernels: 0,
+                approved_cpu_control_kernels: 0,
+                neural_kernels: 1,
+                proposer_private_kernels: 1,
+                critic_private_kernels: 1,
+            };
+            let witness = PalsCudaPlacementWitness {
+                schema: "synthetic-metadata-only-test".into(),
+                inventory_sha256: [3; 32],
+                manifest_sha256: [4; 32],
+                runtime_sha256: [1; 32],
+                runtime_bundle_sha256: [2; 32],
+                optimization: PalsGraphOptimization::Disable,
+                initialization: vec![],
+                public: kernel.clone(),
+                shared_pc: kernel,
+                category_provenance: "synthetic-metadata-only-test".into(),
+            };
+            let mut completed = snapshot.clone();
+            bind_startup_input_observations(
+                &mut completed,
+                std::slice::from_ref(&command),
+                Some(&witness),
+            );
+            let input = &completed.input_observations.as_ref().unwrap()[0];
+            let bound = input.completion_binding.as_ref().unwrap();
+            assert_eq!(bound.retained_input_key, [9; 32]);
+            assert_eq!(bound.backend_owner_id, 7);
+            assert_eq!(bound.public_profile_sha256, witness.public.profile_sha256);
+            assert!(input.completion_binding_error.is_none());
+            assert!(input.memory_key.is_none()); // Never impute a shape from completion.
+
+            for mutation in 0..20 {
+                let mut snapshot = snapshot.clone();
+                let mut command = command.clone();
+                let input = &mut snapshot.input_observations.as_mut().unwrap()[0];
+                let identity = command.input_observation.as_mut().unwrap();
+                match mutation {
+                    0 => command.admitted = false,
+                    1 => command.physical_completion_confirmed = None,
+                    2 => command.return_error = Some(NativeStartupErrorKind::Backend),
+                    3 => identity.backend_owner_id = Some(8),
+                    4 => identity.startup_request_ordinal = Some(2),
+                    5 => identity.input_key = [10; 32],
+                    6 => identity.retained_input_key = Some([10; 32]),
+                    7 => identity.raw_decode_succeeded = Some(false),
+                    8 => input.private_run_returned_ok = Some(false),
+                    9 => snapshot.recording_contended = true,
+                    10 => {} // Missing profile ACK below.
+                    11 => input.prepared_input_key = [10; 32],
+                    12 => input.backend_owner_id = None,
+                    13 => identity.raw_decode_succeeded = None,
+                    14 => identity.logical_records = 1,
+                    15 => identity.role = PalsRole::Critic,
+                    16 => identity.retained_input_key = None,
+                    17 => input.role_evaluation_returned_ok = None,
+                    18 => {
+                        input.public_cache_hit = Some(false);
+                        input.public_run_returned_ok = None;
+                    }
+                    19 => snapshot.snapshot_status = PalsStartupSnapshotStatus::Contended,
+                    _ => unreachable!(),
+                }
+                let profile = (mutation != 10).then_some(&witness);
+                bind_startup_input_observations(&mut snapshot, &[command], profile);
+                let input = &snapshot.input_observations.unwrap()[0];
+                assert!(input.completion_binding.is_none(), "mutation {mutation}");
+                assert!(
+                    input.completion_binding_error.is_some(),
+                    "mutation {mutation}"
+                );
+                assert_eq!(input.record_mask, Some(vec![false]));
+            }
+            let mut ambiguous = snapshot.clone();
+            bind_startup_input_observations(
+                &mut ambiguous,
+                &[command.clone(), command],
+                Some(&witness),
+            );
+            assert!(
+                ambiguous.input_observations.unwrap()[0]
+                    .completion_binding
+                    .is_none()
+            );
+        }
+        #[test]
         fn startup_probe_explicit_budget_preserves_default_wire_and_bounds() {
             for selected in [None, Some(1), Some(15_000), Some(120_000), Some(180_000)] {
                 let mut model = fixture_model(|command| match command {
@@ -9116,6 +9434,7 @@ mod native {
                 _ => unexpected_cuda_placement(),
             });
             require_probe(&model);
+            model.configure_startup_probe_timeout(Some(100)).unwrap();
             model.drain_limit = Duration::from_millis(5);
             let result = model.prepare_startup(Instant::now() + Duration::from_millis(100));
             assert!(matches!(result, Err(RoleError::PhysicalCompletionUnknown)));
@@ -9127,6 +9446,10 @@ mod native {
             );
             assert!(diagnostic.logical_deadline_expired);
             assert_eq!(diagnostic.commands[0].physical_completion_confirmed, None);
+            let input = diagnostic.commands[0].input_observation.as_ref().unwrap();
+            assert_eq!(input.startup_request_ordinal, Some(1));
+            assert!(input.retained_input_key.is_none());
+            assert!(input.raw_decode_succeeded.is_none());
             assert_eq!(
                 diagnostic.commands[0].fence_observation,
                 Some("pending_at_registered_physical_fence")
@@ -9175,6 +9498,7 @@ mod native {
                         physical_completion_confirmed: Some(true),
                         return_error: None,
                         fence_observation: None,
+                        input_observation: None,
                     };
                     7
                 ],
@@ -9387,6 +9711,12 @@ mod native {
                             .iter()
                             .all(|event| event.physical_completion_confirmed == Some(true))
                     );
+                    for (ordinal, command) in timing.commands.iter().take(2).enumerate() {
+                        let input = command.input_observation.as_ref().unwrap();
+                        assert_eq!(input.startup_request_ordinal, Some((ordinal + 1) as u8));
+                        assert_eq!(input.retained_input_key, Some(input.input_key));
+                        assert_eq!(input.raw_decode_succeeded, Some(true));
+                    }
                 }
                 assert_eq!(startup.completed_proposer_calls, 1);
                 assert_eq!(startup.completed_critic_calls, 1);
@@ -10830,7 +11160,7 @@ pub use native::{
     NativeRoleFinishHandle, NativeRoleModel, NativeRoleObserver, NativeRoleReceipt,
     NativeRoleRejection, NativeRoleSourceIdentity, NativeRoleTerminal,
     NativeStartupCommandObservation, NativeStartupErrorKind, NativeStartupFailureDiagnostic,
-    NativeStartupProbeReceipt, NativeStartupTimingObservation,
+    NativeStartupInputObservation, NativeStartupProbeReceipt, NativeStartupTimingObservation,
 };
 
 #[cfg(test)]

@@ -8,15 +8,15 @@ use crate::asset::{self, parse_sha256};
 use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
 use crate::onnx::{NativeLoadingProfile, NativeMappingObservation, OrtRuntime, Provider};
 use crate::pals_model::{
-    PalsModelConfig, PalsModelInput, PalsModelProfile, PalsRawOutput, PalsRole,
-    PreparedPalsFullLineTensors, PreparedPalsTensors, MAX_LINE_PLY, PALS_ENCODING_SCHEMA,
-    PALS_MODEL_SCHEMA, QUERY_LINE_COUNT, V_TASK_NAMES,
+    MAX_LINE_PLY, PALS_ENCODING_SCHEMA, PALS_MODEL_SCHEMA, PalsModelConfig, PalsModelInput,
+    PalsModelProfile, PalsRawOutput, PalsRole, PreparedPalsFullLineTensors, PreparedPalsTensors,
+    QUERY_LINE_COUNT, V_TASK_NAMES,
 };
 use crate::worker::{PhysicalRun, SingleWorker};
 use ort::execution_providers::{
     ArenaExtendStrategy, CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider,
 };
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::tensor::TensorElementType;
 use ort::value::{Tensor, ValueType};
 use rz_contracts::{Digest, PrecisionProfile};
@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 mod cuda_control;
@@ -42,46 +42,46 @@ pub use cuda_control::{
     PalsGraphOptimization, PalsGraphPlacement, PalsKernelWitness,
 };
 pub use device_packing_admission::{
-    DevicePackingAdmissionError, DevicePackingDeclaredResources, DevicePackingResourceDeclaration,
-    PackingArtifactPart, PackingArtifactRegistration, PackingNativeVerification,
-    PackingVerificationScope, RegisteredPackingArtifactBytes, RegisteredPackingBytePin,
     DEVICE_PACKING_DOMAIN, DEVICE_PACKING_GRAPH_FILE, DEVICE_PACKING_MANIFEST_FILE,
     DEVICE_PACKING_MAX_GRAPH_BYTES, DEVICE_PACKING_MAX_MANIFEST_BYTES,
-    DEVICE_PACKING_MAX_NODE_PAYLOAD_SUM, DEVICE_PACKING_SCHEMA,
+    DEVICE_PACKING_MAX_NODE_PAYLOAD_SUM, DEVICE_PACKING_SCHEMA, DevicePackingAdmissionError,
+    DevicePackingDeclaredResources, DevicePackingResourceDeclaration, PackingArtifactPart,
+    PackingArtifactRegistration, PackingNativeVerification, PackingVerificationScope,
+    RegisteredPackingArtifactBytes, RegisteredPackingBytePin,
 };
-pub use device_packing_assets::{load_checked_fixed_packing_graph, DevicePackingAssetError};
+pub use device_packing_assets::{DevicePackingAssetError, load_checked_fixed_packing_graph};
 pub use device_packing_graph::{
-    CheckedFixedPackingGraph, PackingGraphBodyError, PackingGraphBodyInspection,
-    PackingGraphBodyVerification, PackingGraphDataType, PackingGraphDimension,
-    PackingGraphInspectionBudget, PackingGraphName, PackingGraphNodeDescriptor, PackingGraphShape,
-    PackingGraphTensorDescriptor, PACKING_GRAPH_BODY_INSPECTOR_VERSION,
-    PACKING_GRAPH_MAX_INSPECTION_HOST_BYTES, PACKING_GRAPH_MAX_WIRE_FIELDS,
+    CheckedFixedPackingGraph, PACKING_GRAPH_BODY_INSPECTOR_VERSION,
+    PACKING_GRAPH_MAX_INSPECTION_HOST_BYTES, PACKING_GRAPH_MAX_WIRE_FIELDS, PackingGraphBodyError,
+    PackingGraphBodyInspection, PackingGraphBodyVerification, PackingGraphDataType,
+    PackingGraphDimension, PackingGraphInspectionBudget, PackingGraphName,
+    PackingGraphNodeDescriptor, PackingGraphShape, PackingGraphTensorDescriptor,
 };
 #[cfg(feature = "experimental-io-binding")]
 pub use device_pages_plan::native::{
-    resident_cuda_minimum_metadata_host_bytes, CudaRecordPageSnapshot, CudaRecordPageStats,
+    CudaRecordPageSnapshot, CudaRecordPageStats, resident_cuda_minimum_metadata_host_bytes,
 };
 pub use device_pages_plan::{
-    device_packing_maximum_node_payload_sum, CpuOwnedPublicBacking, DevicePageDomain,
-    DevicePageError, DevicePageInvocationDeclaration, DevicePageNamespace, DevicePagePayload,
-    DevicePagePlan, DevicePageReservation, DevicePagesLimits, DevicePagesRegistry,
-    DeviceProjectionOffset, DevicePublicBacking, DevicePublicBlock, DevicePublicBlockDescriptor,
-    DEVICE_PAGE_RECORD_CAPACITY,
+    CpuOwnedPublicBacking, DEVICE_PAGE_RECORD_CAPACITY, DevicePageDomain, DevicePageError,
+    DevicePageInvocationDeclaration, DevicePageNamespace, DevicePagePayload, DevicePagePlan,
+    DevicePageReservation, DevicePagesLimits, DevicePagesRegistry, DeviceProjectionOffset,
+    DevicePublicBacking, DevicePublicBlock, DevicePublicBlockDescriptor,
+    device_packing_maximum_node_payload_sum,
 };
 pub use public_pages::{HostRecordPagePolicy, HostRecordPageSnapshot, HostRecordPageStats};
 #[cfg(feature = "experimental-io-binding")]
 pub use warm::cuda::{
-    cuda_private_warm_implementation_digest, PalsCudaWarmCapability, PalsCudaWarmExecutionBinding,
+    PRIVATE_CUDA_QUERY_SEMANTICS, PRIVATE_CUDA_WARM_EXECUTION_DOMAIN,
+    PRIVATE_CUDA_WARM_GRAPH_SEMANTICS, PRIVATE_CUDA_WARM_MEASUREMENT_CONTRACT,
+    PRIVATE_CUDA_WARM_SCHEMA, PalsCudaWarmCapability, PalsCudaWarmExecutionBinding,
     PalsCudaWarmInput, PalsCudaWarmInvocationObservation, PalsCudaWarmInvocationPurpose,
     PalsCudaWarmInvocationState, PalsCudaWarmObservationHandle, PalsCudaWarmObservationSnapshot,
     PalsCudaWarmObservationStatus, PalsCudaWarmOwnerObservation, PalsCudaWarmRuntimeLimits,
-    PRIVATE_CUDA_QUERY_SEMANTICS, PRIVATE_CUDA_WARM_EXECUTION_DOMAIN,
-    PRIVATE_CUDA_WARM_GRAPH_SEMANTICS, PRIVATE_CUDA_WARM_MEASUREMENT_CONTRACT,
-    PRIVATE_CUDA_WARM_SCHEMA,
+    cuda_private_warm_implementation_digest,
 };
 pub use warm::{
-    PalsWarmCapability, PalsWarmInput, FROZEN_QUERY_SEMANTICS_V1, PRIVATE_WARM_GRAPH_SEMANTICS,
-    PRIVATE_WARM_SCHEMA,
+    FROZEN_QUERY_SEMANTICS_V1, PRIVATE_WARM_GRAPH_SEMANTICS, PRIVATE_WARM_SCHEMA,
+    PalsWarmCapability, PalsWarmInput,
 };
 
 /// Implementation provenance only. Changing this source digest does not
@@ -279,6 +279,154 @@ const MAX_GRAPH_BYTES: usize = 256 * 1024 * 1024;
 const MAX_MODEL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_STARTUP_STAGE_EVENTS: usize = 64;
 const MAX_STARTUP_STAGE_REQUESTS: u8 = 2;
+const MAX_STARTUP_INPUT_RECORDS: usize = 128;
+
+/// Copies of input metadata used by an existing startup invocation. Neither a
+/// prepared value nor a returned stage event is a physical-completion witness.
+#[derive(Clone, Debug, Serialize)]
+pub struct PalsStartupTensorObservation {
+    pub element_type: &'static str,
+    pub shape: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PalsStartupInputCompletionBinding {
+    pub command_ordinal: usize,
+    pub backend_owner_id: u64,
+    pub retained_input_key: [u8; 32],
+    pub physical_completion_confirmed: bool,
+    pub raw_decode_succeeded: bool,
+    pub inventory_sha256: [u8; 32],
+    pub public_profile_sha256: [u8; 32],
+    pub shared_pc_profile_sha256: [u8; 32],
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PalsStartupInputObservation {
+    pub request_ordinal: u8,
+    pub role: PalsRole,
+    pub backend_owner_id: Option<u64>,
+    pub input_key: [u8; 32],
+    pub prepared_input_key: [u8; 32],
+    pub public_memory_key: [u8; 32],
+    pub logical_records: usize,
+    pub prepared_records: usize,
+    pub record_mask: Option<Vec<bool>>,
+    pub board: Option<PalsStartupTensorObservation>,
+    pub records: Option<PalsStartupTensorObservation>,
+    pub record_mask_tensor: Option<PalsStartupTensorObservation>,
+    pub memory_key: Option<PalsStartupTensorObservation>,
+    pub memory_value: Option<PalsStartupTensorObservation>,
+    pub memory_mask: Option<PalsStartupTensorObservation>,
+    pub public_cache_hit: Option<bool>,
+    pub public_run_returned_ok: Option<bool>,
+    pub private_run_returned_ok: Option<bool>,
+    pub role_evaluation_returned_ok: Option<bool>,
+    /// Filled only by Native after matching its retained command, Ready and
+    /// raw decode to this owner/input and the same-worker profile ACK.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_binding: Option<PalsStartupInputCompletionBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_binding_error: Option<&'static str>,
+}
+
+#[derive(Clone, Copy)]
+struct StartupTensorMetadata {
+    element_type: &'static str,
+    rank: usize,
+    shape: [i64; 4],
+}
+impl StartupTensorMetadata {
+    #[cfg(feature = "experimental-io-binding")]
+    fn observe<T: ort::tensor::PrimitiveTensorElementType + std::fmt::Debug>(
+        value: &Tensor<T>,
+    ) -> Option<Self> {
+        let ValueType::Tensor { ty, shape, .. } = value.dtype() else {
+            return None;
+        };
+        let element_type = match ty {
+            TensorElementType::Float32 => "float32",
+            TensorElementType::Int64 => "int64",
+            TensorElementType::Bool => "bool",
+            _ => return None,
+        };
+        if shape.len() > 4 {
+            return None;
+        }
+        let mut observed = [0; 4];
+        observed[..shape.len()].copy_from_slice(shape.as_ref());
+        Some(Self {
+            element_type,
+            rank: shape.len(),
+            shape: observed,
+        })
+    }
+    fn snapshot(self) -> PalsStartupTensorObservation {
+        PalsStartupTensorObservation {
+            element_type: self.element_type,
+            shape: self.shape[..self.rank].to_vec(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StartupInputMetadata {
+    request_ordinal: u8,
+    role: PalsRole,
+    backend_owner_id: Option<u64>,
+    input_key: [u8; 32],
+    prepared_input_key: [u8; 32],
+    public_memory_key: [u8; 32],
+    logical_records: usize,
+    prepared_records: usize,
+    record_mask: Option<[bool; MAX_STARTUP_INPUT_RECORDS]>,
+    board: Option<StartupTensorMetadata>,
+    records: Option<StartupTensorMetadata>,
+    record_mask_tensor: Option<StartupTensorMetadata>,
+    memory_key: Option<StartupTensorMetadata>,
+    memory_value: Option<StartupTensorMetadata>,
+    memory_mask: Option<StartupTensorMetadata>,
+    public_cache_hit: Option<bool>,
+    public_run_returned_ok: Option<bool>,
+    private_run_returned_ok: Option<bool>,
+    role_evaluation_returned_ok: Option<bool>,
+}
+#[cfg(feature = "experimental-io-binding")]
+struct StartupPreparedInputIdentity {
+    input_key: [u8; 32],
+    public_memory_key: [u8; 32],
+    records: usize,
+}
+impl StartupInputMetadata {
+    fn snapshot(self) -> PalsStartupInputObservation {
+        PalsStartupInputObservation {
+            request_ordinal: self.request_ordinal,
+            role: self.role,
+            backend_owner_id: self.backend_owner_id,
+            input_key: self.input_key,
+            prepared_input_key: self.prepared_input_key,
+            public_memory_key: self.public_memory_key,
+            logical_records: self.logical_records,
+            prepared_records: self.prepared_records,
+            record_mask: self
+                .record_mask
+                .filter(|_| self.prepared_records <= MAX_STARTUP_INPUT_RECORDS)
+                .map(|mask| mask[..self.prepared_records].to_vec()),
+            board: self.board.map(StartupTensorMetadata::snapshot),
+            records: self.records.map(StartupTensorMetadata::snapshot),
+            record_mask_tensor: self.record_mask_tensor.map(StartupTensorMetadata::snapshot),
+            memory_key: self.memory_key.map(StartupTensorMetadata::snapshot),
+            memory_value: self.memory_value.map(StartupTensorMetadata::snapshot),
+            memory_mask: self.memory_mask.map(StartupTensorMetadata::snapshot),
+            public_cache_hit: self.public_cache_hit,
+            public_run_returned_ok: self.public_run_returned_ok,
+            private_run_returned_ok: self.private_run_returned_ok,
+            role_evaluation_returned_ok: self.role_evaluation_returned_ok,
+            completion_binding: None,
+            completion_binding_error: None,
+        }
+    }
+}
 
 /// Diagnostic stages only: a returned event is not an independent physical
 /// fence, native-input count, readiness proof or permission to release owners.
@@ -340,17 +488,21 @@ pub struct PalsStartupStageSnapshot {
     pub recording_contended: bool,
     pub recording_poisoned: bool,
     pub events: Vec<PalsStartupStageEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_observations: Option<Vec<PalsStartupInputObservation>>,
 }
 
 struct StartupStageLedger {
     origin: Option<Instant>,
     events: [Option<PalsStartupStageEvent>; MAX_STARTUP_STAGE_EVENTS],
     len: usize,
+    inputs: [Option<StartupInputMetadata>; MAX_STARTUP_STAGE_REQUESTS as usize],
 }
 
 struct StartupStageShared {
     start_attempted: AtomicBool,
     active: AtomicBool,
+    input_observations_enabled: AtomicBool,
     requests: AtomicU8,
     overflow: AtomicBool,
     recording_contended: AtomicBool,
@@ -373,6 +525,7 @@ impl PalsStartupStageProbe {
             shared: Arc::new(StartupStageShared {
                 start_attempted: AtomicBool::new(false),
                 active: AtomicBool::new(false),
+                input_observations_enabled: AtomicBool::new(false),
                 requests: AtomicU8::new(0),
                 overflow: AtomicBool::new(false),
                 recording_contended: AtomicBool::new(false),
@@ -381,6 +534,7 @@ impl PalsStartupStageProbe {
                     origin: None,
                     events: [None; MAX_STARTUP_STAGE_EVENTS],
                     len: 0,
+                    inputs: [None; MAX_STARTUP_STAGE_REQUESTS as usize],
                 }),
             }),
         }
@@ -389,6 +543,14 @@ impl PalsStartupStageProbe {
     /// Arm once immediately before the first startup Evaluate, using the same
     /// monotonic origin as the caller's command observations. Never a retry.
     pub fn start(&self, origin: Instant) -> bool {
+        self.start_inner(origin, false)
+    }
+    /// Explicit input diagnostics only; default startup wire and invocations
+    /// keep the metadata channel disabled. This neither admits nor runs work.
+    pub fn start_with_input_observations(&self, origin: Instant) -> bool {
+        self.start_inner(origin, true)
+    }
+    fn start_inner(&self, origin: Instant, inputs: bool) -> bool {
         if self
             .shared
             .start_attempted
@@ -400,6 +562,9 @@ impl PalsStartupStageProbe {
         match self.shared.ledger.try_lock() {
             Ok(mut ledger) => {
                 ledger.origin = Some(origin);
+                self.shared
+                    .input_observations_enabled
+                    .store(inputs, Ordering::Release);
                 self.shared.active.store(true, Ordering::Release);
                 true
             }
@@ -469,11 +634,16 @@ impl PalsStartupStageProbe {
             recording_contended: self.shared.recording_contended.load(Ordering::Acquire),
             recording_poisoned: self.shared.recording_poisoned.load(Ordering::Acquire),
             events: Vec::new(),
+            input_observations: self
+                .shared
+                .input_observations_enabled
+                .load(Ordering::Acquire)
+                .then(Vec::new),
         };
         // Copy the fixed metadata array while locked; allocate the serialized
         // view only after releasing it. No IO or native observation here.
         let copied = match self.shared.ledger.try_lock() {
-            Ok(ledger) => Some((ledger.origin, ledger.events, ledger.len)),
+            Ok(ledger) => Some((ledger.origin, ledger.events, ledger.len, ledger.inputs)),
             Err(TryLockError::WouldBlock) => {
                 snapshot.snapshot_status = PalsStartupSnapshotStatus::Contended;
                 None
@@ -483,10 +653,19 @@ impl PalsStartupStageProbe {
                 None
             }
         };
-        if let Some((origin, events, len)) = copied {
+        if let Some((origin, events, len, inputs)) = copied {
             snapshot.capture_started = Some(origin.is_some());
             snapshot.snapshot_elapsed_ns = origin.and_then(elapsed_ns);
             snapshot.events = events.into_iter().take(len).flatten().collect();
+            if snapshot.input_observations.is_some() {
+                snapshot.input_observations = Some(
+                    inputs
+                        .into_iter()
+                        .flatten()
+                        .map(StartupInputMetadata::snapshot)
+                        .collect(),
+                );
+            }
         }
         snapshot
     }
@@ -499,6 +678,106 @@ struct StartupRoleTrace {
 }
 
 impl StartupRoleTrace {
+    fn inputs_enabled(&self) -> bool {
+        self.probe.shared.active.load(Ordering::Acquire)
+            && self
+                .probe
+                .shared
+                .input_observations_enabled
+                .load(Ordering::Acquire)
+    }
+    fn update_input(&self, update: impl FnOnce(&mut Option<StartupInputMetadata>)) {
+        if !self.inputs_enabled() {
+            return;
+        }
+        match self.probe.shared.ledger.try_lock() {
+            Ok(mut ledger) => {
+                if self.inputs_enabled() {
+                    update(&mut ledger.inputs[usize::from(self.ordinal - 1)]);
+                }
+            }
+            Err(TryLockError::WouldBlock) => self
+                .probe
+                .shared
+                .recording_contended
+                .store(true, Ordering::Release),
+            Err(TryLockError::Poisoned(_)) => self
+                .probe
+                .shared
+                .recording_poisoned
+                .store(true, Ordering::Release),
+        }
+    }
+    #[cfg(feature = "experimental-io-binding")]
+    fn observe_prepared_input(
+        &self,
+        owner: Option<u64>,
+        input_key: [u8; 32],
+        input: &PalsModelInput,
+        prepared: StartupPreparedInputIdentity,
+        active: &ActiveInputs,
+    ) {
+        if !self.inputs_enabled() {
+            return;
+        }
+        // record_mask is the owned CPU input created from the actual prepared
+        // vector. No device value, K/V payload or additional tensor is copied.
+        let record_mask = active
+            .record_mask
+            .try_extract_tensor::<bool>()
+            .ok()
+            .filter(|(_, values)| {
+                values.len() == prepared.records && values.len() <= MAX_STARTUP_INPUT_RECORDS
+            })
+            .map(|(_, values)| {
+                let mut copied = [false; MAX_STARTUP_INPUT_RECORDS];
+                copied[..values.len()].copy_from_slice(values);
+                copied
+            });
+        let observed = StartupInputMetadata {
+            request_ordinal: self.ordinal,
+            role: input.role,
+            backend_owner_id: owner,
+            input_key,
+            prepared_input_key: prepared.input_key,
+            public_memory_key: prepared.public_memory_key,
+            logical_records: input.records.len(),
+            prepared_records: prepared.records,
+            record_mask,
+            board: StartupTensorMetadata::observe(&active.board),
+            records: StartupTensorMetadata::observe(&active.records),
+            record_mask_tensor: StartupTensorMetadata::observe(&active.record_mask),
+            memory_key: None,
+            memory_value: None,
+            memory_mask: None,
+            public_cache_hit: None,
+            public_run_returned_ok: None,
+            private_run_returned_ok: None,
+            role_evaluation_returned_ok: None,
+        };
+        self.update_input(|slot| {
+            if slot.is_none() {
+                *slot = Some(observed);
+            }
+        });
+    }
+    #[cfg(feature = "experimental-io-binding")]
+    fn observe_memory(&self, memory: &device::DeviceMemory, cached: bool) {
+        if !self.inputs_enabled() {
+            return;
+        }
+        let key = StartupTensorMetadata::observe(&memory.memory_key);
+        let value = StartupTensorMetadata::observe(&memory.memory_value);
+        let mask = StartupTensorMetadata::observe(&memory.mask);
+        self.update_input(|slot| {
+            if let Some(input) = slot {
+                input.memory_key = key;
+                input.memory_value = value;
+                input.memory_mask = mask;
+                input.public_cache_hit = Some(cached);
+            }
+        });
+    }
     fn record(&self, stage: PalsStartupBackendStage, boundary: PalsStartupStageBoundary) {
         if !self.probe.shared.active.load(Ordering::Acquire) {
             return;
@@ -538,6 +817,22 @@ impl StartupRoleTrace {
         }
     }
     fn returned(&self, stage: PalsStartupBackendStage, success: bool) {
+        self.update_input(|slot| {
+            if let Some(input) = slot {
+                match stage {
+                    PalsStartupBackendStage::PublicRun => {
+                        input.public_run_returned_ok = Some(success)
+                    }
+                    PalsStartupBackendStage::PrivateRun => {
+                        input.private_run_returned_ok = Some(success)
+                    }
+                    PalsStartupBackendStage::RoleEvaluation => {
+                        input.role_evaluation_returned_ok = Some(success)
+                    }
+                    _ => {}
+                }
+            }
+        });
         self.record(
             stage,
             if success {
@@ -3046,7 +3341,7 @@ impl PalsOnnxBackend {
                     K::UnsupportedModel,
                     S::Admission,
                     "PALS legacy and explicit private Warm graph invocation domains differ",
-                ))
+                ));
             }
         }
         self.cuda_mapping_audit.borrow().allow_run()?;
@@ -4182,17 +4477,112 @@ mod tests {
         );
         let poisoned = HostRecordPageObservationHandle::new(host_page_observation_fixture());
         let other = poisoned.clone();
-        assert!(std::thread::spawn(move || {
-            let _guard = other.0.latest.lock().unwrap();
-            panic!("poison metadata-only host page observation fixture");
-        })
-        .join()
-        .is_err());
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = other.0.latest.lock().unwrap();
+                panic!("poison metadata-only host page observation fixture");
+            })
+            .join()
+            .is_err()
+        );
         let snapshot = poisoned.snapshot();
         assert_eq!(snapshot.status, HostRecordPageObservationStatus::Poisoned);
         assert!(snapshot.latest.is_some());
     }
 
+    #[test]
+    fn startup_input_metadata_is_opt_in_bounded_and_never_a_completion_ack() {
+        fn metadata(trace: &StartupRoleTrace, input: &PalsModelInput) -> StartupInputMetadata {
+            let prepared = input.prepare_tensors(&PalsModelConfig::baseline()).unwrap();
+            let mut mask = [false; MAX_STARTUP_INPUT_RECORDS];
+            mask[..prepared.record_mask.len()].copy_from_slice(&prepared.record_mask);
+            StartupInputMetadata {
+                request_ordinal: trace.ordinal,
+                role: input.role,
+                backend_owner_id: Some(7),
+                input_key: prepared.input_key,
+                prepared_input_key: prepared.input_key,
+                public_memory_key: prepared.public_memory_key,
+                logical_records: input.records.len(),
+                prepared_records: prepared.record_mask.len(),
+                record_mask: Some(mask),
+                board: None,
+                records: None,
+                record_mask_tensor: None,
+                memory_key: None,
+                memory_value: None,
+                memory_mask: None,
+                public_cache_hit: None,
+                public_run_returned_ok: None,
+                private_run_returned_ok: None,
+                role_evaluation_returned_ok: None,
+            }
+        }
+        let legacy = PalsStartupStageProbe::new();
+        assert!(legacy.start(Instant::now()));
+        let trace = legacy.begin_role(PalsRole::Proposer).unwrap();
+        trace.update_input(|slot| *slot = Some(metadata(&trace, &input())));
+        let frozen = legacy.snapshot_and_stop();
+        assert!(frozen.input_observations.is_none());
+        assert!(
+            serde_json::to_value(frozen)
+                .unwrap()
+                .get("input_observations")
+                .is_none()
+        );
+
+        let probe = PalsStartupStageProbe::new();
+        assert!(probe.start_with_input_observations(Instant::now()));
+        let mut empty = input();
+        empty.records.clear();
+        empty.required_critical_records.clear();
+        let first = probe.begin_role(empty.role).unwrap();
+        first.update_input(|slot| *slot = Some(metadata(&first, &empty)));
+        first.returned(PalsStartupBackendStage::PublicRun, true);
+        first.returned(PalsStartupBackendStage::PrivateRun, true);
+        first.finish(true);
+        let mut present = input();
+        present.role = PalsRole::Critic;
+        let second = probe.begin_role(present.role).unwrap();
+        second.update_input(|slot| *slot = Some(metadata(&second, &present)));
+        second.finish(false);
+        assert!(probe.begin_role(PalsRole::Proposer).is_none());
+        let frozen = probe.snapshot_and_stop();
+        let observations = frozen.input_observations.as_ref().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].logical_records, 0);
+        assert_eq!(observations[1].logical_records, 1);
+        assert_eq!(
+            observations[0].prepared_records,
+            observations[1].prepared_records
+        );
+        assert_eq!(observations[0].record_mask, Some(vec![false]));
+        assert_eq!(observations[1].record_mask, Some(vec![true]));
+        assert_ne!(observations[0].input_key, observations[1].input_key);
+        assert_eq!(observations[0].role_evaluation_returned_ok, Some(true));
+        assert_eq!(observations[1].role_evaluation_returned_ok, Some(false));
+        assert!(
+            observations
+                .iter()
+                .all(|input| input.completion_binding.is_none())
+        );
+        assert!(!probe.start_with_input_observations(Instant::now()));
+        first.update_input(|slot| *slot = None);
+        assert_eq!(
+            probe.snapshot_and_stop().input_observations.unwrap().len(),
+            2
+        );
+
+        let contended = PalsStartupStageProbe::new();
+        assert!(contended.start_with_input_observations(Instant::now()));
+        let trace = contended.begin_role(empty.role).unwrap();
+        let held = contended.shared.ledger.lock().unwrap();
+        trace.update_input(|slot| *slot = Some(metadata(&trace, &empty)));
+        drop(held);
+        let frozen = contended.snapshot_and_stop();
+        assert!(frozen.recording_contended);
+        assert!(frozen.input_observations.unwrap().is_empty());
+    }
     #[test]
     fn startup_stage_probe_preserves_partial_stage_and_shared_clock_without_retry() {
         let dormant = PalsStartupStageProbe::new();
@@ -4225,14 +4615,18 @@ mod tests {
         );
         assert_eq!(observed.events[1].role, PalsRole::Proposer);
         assert_eq!(observed.events[1].request_ordinal, 1);
-        assert!(observed
-            .events
-            .windows(2)
-            .all(|pair| pair[0].elapsed_ns <= pair[1].elapsed_ns));
-        assert!(observed
-            .events
-            .iter()
-            .all(|event| event.elapsed_ns <= observed.snapshot_elapsed_ns.unwrap()));
+        assert!(
+            observed
+                .events
+                .windows(2)
+                .all(|pair| pair[0].elapsed_ns <= pair[1].elapsed_ns)
+        );
+        assert!(
+            observed
+                .events
+                .iter()
+                .all(|event| event.elapsed_ns <= observed.snapshot_elapsed_ns.unwrap())
+        );
         // A late native return cannot mutate the already frozen startup view,
         // arm a new capture, or be mistaken for an observed physical fence.
         startup_return(Some(&trace), PalsStartupBackendStage::PublicRun, true);
@@ -4341,12 +4735,14 @@ mod tests {
     fn startup_stage_probe_poison_is_explicit_and_does_not_rearm() {
         let probe = PalsStartupStageProbe::new();
         let other = probe.clone();
-        assert!(std::thread::spawn(move || {
-            let _held = other.shared.ledger.lock().unwrap();
-            panic!("poison metadata-only startup diagnostic fixture");
-        })
-        .join()
-        .is_err());
+        assert!(
+            std::thread::spawn(move || {
+                let _held = other.shared.ledger.lock().unwrap();
+                panic!("poison metadata-only startup diagnostic fixture");
+            })
+            .join()
+            .is_err()
+        );
         assert!(!probe.start(Instant::now()));
         assert!(probe.begin_role(PalsRole::Proposer).is_none());
         let snapshot = probe.snapshot_and_stop();
@@ -4955,11 +5351,13 @@ mod tests {
             failure
         );
         let mut final_rejected = CudaMappingAudit::default();
-        assert!(final_rejected
-            .final_audit(|| panic!(
-                "final audit cannot require lazy provider images before first Run"
-            ))
-            .is_err());
+        assert!(
+            final_rejected
+                .final_audit(|| panic!(
+                    "final audit cannot require lazy provider images before first Run"
+                ))
+                .is_err()
+        );
         final_rejected.after_run(true, || Ok(())).unwrap();
         let failure = final_rejected
             .final_audit(|| {
