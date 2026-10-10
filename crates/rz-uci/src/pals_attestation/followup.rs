@@ -486,7 +486,7 @@ pub enum NativeRecheckValueV4 {
         context_revision: u64,
         observation: u64,
         accepted_output: bool,
-        execution: Option<NativeRoleValueProvenanceV4>,
+        execution: Option<Box<NativeRoleValueProvenanceV4>>,
     },
     RulesTerminal {
         state_sha256: String,
@@ -519,7 +519,7 @@ fn endpoint(s: &PalsExecutionEndpointSnapshot) -> NativeRecheckValueV4 {
             context_revision: v.context_revision,
             observation: v.observation.0 as u64,
             accepted_output: v.logical_accepted,
-            execution: v.execution.map(Into::into),
+            execution: v.execution.map(|execution| Box::new(execution.into())),
         },
         PalsExecutionEndpointValue::RulesTerminal {
             reason,
@@ -1283,6 +1283,75 @@ impl FollowupJournal {
 mod tests {
     use super::*;
     use rz_search::pals::engine::{PostRepairRecheckPolicy, ResolverPolicy};
+
+    #[test]
+    fn boxed_recheck_execution_preserves_null_object_wire_and_roundtrip() {
+        // Static DTO fixture only; these IDs are not actual execution evidence.
+        let digest = "01".repeat(32);
+        let provenance = serde_json::json!({
+            "request": { "epoch": 7, "sequence": 3 },
+            "execution": { "epoch": 7, "sequence": 5 },
+            "prepared_state": { "owner": 13, "revision": 17, "semantic_sha256": digest },
+            "prepared_perspective": "white",
+            "input_sha256": digest,
+            "model_epoch_sha256": digest,
+            "context": {
+                "game_generation": 0,
+                "search_generation": 1,
+                "situation_slot": 2,
+                "situation_generation": 3,
+                "state": 4,
+                "focus": 5,
+                "purpose": "ValueFresh",
+                "focus_sha256": digest,
+                "prefix_sha256": digest,
+                "proposal_sha256": digest,
+                "refutation_sha256": null,
+                "divergence_sha256": digest,
+                "public_revision": 6,
+                "situation_revision": 7
+            },
+            "fresh": true,
+            "physically_completed": true,
+            "completed_nn_inputs": 2,
+            "complete": true
+        });
+        for execution in [serde_json::Value::Null, provenance] {
+            let wire = serde_json::json!({
+                "kind": "frozen_wdl",
+                "model_value_semantics": "fixture-model-wdl",
+                "model_identity": "fixture-model",
+                "encoding_identity": digest,
+                "precision": "fp32",
+                "model_epoch_sha256": digest,
+                "input_sha256": digest,
+                "state_sha256": digest,
+                "perspective": "white",
+                "wdl_bits": [0.25_f32.to_bits(), 0.5_f32.to_bits(), 0.25_f32.to_bits()],
+                "context_revision": 6,
+                "observation": 9,
+                "accepted_output": true,
+                "execution": execution
+            });
+            let value: NativeRecheckValueV4 = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(value.clone()).unwrap(), wire);
+            if execution.is_null() {
+                let mut historical = wire.clone();
+                historical.as_object_mut().unwrap().remove("execution");
+                assert_eq!(
+                    serde_json::from_value::<NativeRecheckValueV4>(historical).unwrap(),
+                    value
+                );
+            } else {
+                let mut unknown = wire.clone();
+                unknown["execution"]["unexpected"] = serde_json::Value::Bool(true);
+                assert!(serde_json::from_value::<NativeRecheckValueV4>(unknown).is_err());
+            }
+            let mut unknown = wire;
+            unknown["unexpected"] = serde_json::Value::Bool(true);
+            assert!(serde_json::from_value::<NativeRecheckValueV4>(unknown).is_err());
+        }
+    }
 
     fn journal(repair: bool, stack: bool, warm: bool, iterative: bool) -> FollowupJournal {
         let method = |name: &str| NativeOwnerMethodIdentityV4 {
