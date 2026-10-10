@@ -3,6 +3,7 @@
 //! capture --export-manifest PATH --export-manifest-sha256 HEX64
 //!   --cuda-bundle PATH --cuda-bundle-sha256 HEX64 --runtime-root DIRECTORY
 //!   --runtime-output-root DIRECTORY --scenario PATH --scenario-sha256 HEX64
+//!   --pals-cuda-warm-max-leases 1 --pals-cuda-warm-device-bytes-max BYTES
 //!   --output-json NEW_PATH
 //! 선택한 metadata-control만 허용할 때 다음 세 인자를 함께 제공한다:
 //!   --control-inventory PATH --control-inventory-sha256 HEX64 --profile-root DIRECTORY
@@ -18,6 +19,9 @@
 //! 프로세스/파이프에도 90초/128 MiB 상한을 적용해야 한다. 이 파일은 GPU 실행을
 //! 예약하거나 export/reference를 생성하지 않는다. --runtime-output-root는 기존
 //! caller-owned RuntimeCache의 root이며 capture 산출물 디렉터리와 분리한다.
+//! owner 한도는 Native/Arena와 같은 명시 K/V payload bytes 단위다.
+//! 등록 FLI 최대 S194의 FP32 K/V 두 쌍 중첩은 397312B이며 weights,
+//! ORT workspace/staging 또는 전체 장치 VRAM을 포함하지 않는다.
 //! capture의 실행 검사와 별도의
 //! CPU Torch/ORT seeded reference 검사를 분리하고 최종 passed는 둘 다 요구한다.
 //! scenario.execution_profile은 actual_opponent_continuation_v1(기본) 또는
@@ -45,7 +49,10 @@ mod check {
     use rz_eval::error::BackendError;
     use rz_eval::onnx::{OrtRuntime, Provider};
     use rz_eval::pals_model::{PalsModelConfig, PalsModelInput, PalsModelProfile, PalsRawOutput};
-    use rz_eval::pals_onnx::{PRIVATE_CUDA_WARM_SCHEMA, PalsCudaControlPolicy, PalsOnnxConfig};
+    use rz_eval::pals_onnx::{
+        PRIVATE_CUDA_WARM_MEASUREMENT_CONTRACT, PRIVATE_CUDA_WARM_SCHEMA, PalsCudaControlPolicy,
+        PalsNativeResult, PalsOnnxConfig,
+    };
     use rz_eval::pals_private::{PrivateInvocation, PrivateSeedProvenance};
     use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeCache};
     use rz_position::{BoardMove, Position, PositionIdentity, PositionSnapshot};
@@ -63,10 +70,10 @@ mod check {
     };
     use rz_search::pals::store::{ExecutionId, PalsStores, TaskQuestion};
     use rz_uci::pals_native::{
-        NativeExecutionReceipt, NativeOwnerOptions, NativePreparedContext,
-        NativePrivateWarmPrepared, NativeQueryKind, NativeRoleExecutionBinding,
-        NativeRoleFinishHandle, NativeRoleModel, NativeRoleObserver, NativeRoleRejection,
-        NativeRoleTerminal, prepare_role_input_for_config,
+        NativeCudaWarmObservationLimits, NativeExecutionReceipt, NativeOwnerOptions,
+        NativePreparedContext, NativePrivateWarmPrepared, NativeQueryKind,
+        NativeRoleExecutionBinding, NativeRoleFinishHandle, NativeRoleModel, NativeRoleObserver,
+        NativeRoleRejection, NativeRoleTerminal, prepare_role_input_for_config,
     };
     use serde::Deserialize;
     use serde_json::{Value, json};
@@ -244,6 +251,37 @@ mod check {
         fn path(&self, key: &str) -> Result<PathBuf, Failure> {
             Ok(self.value(key)?.into())
         }
+        fn cuda_warm_limits(&self) -> Result<NativeCudaWarmObservationLimits, Failure> {
+            cuda_warm_limits(
+                self.value("--pals-cuda-warm-max-leases")?,
+                self.value("--pals-cuda-warm-device-bytes-max")?,
+            )
+        }
+    }
+    fn cuda_warm_limits(
+        max_leases: &str,
+        device_bytes_max: &str,
+    ) -> Result<NativeCudaWarmObservationLimits, Failure> {
+        require(
+            max_leases == "1"
+                && !device_bytes_max.is_empty()
+                && device_bytes_max.len() <= 20
+                && device_bytes_max.bytes().all(|byte| byte.is_ascii_digit()),
+            "arguments",
+            "cuda_warm_limits_invalid",
+        )?;
+        let device_bytes_max = device_bytes_max
+            .parse::<u64>()
+            .map_err(|_| fail("arguments", "cuda_warm_limits_invalid"))?;
+        require(
+            device_bytes_max > 0,
+            "arguments",
+            "cuda_warm_limits_invalid",
+        )?;
+        Ok(NativeCudaWarmObservationLimits {
+            max_leases: 1,
+            device_bytes_max,
+        })
     }
     fn external(path: &Path, new_file: bool) -> Result<(), Failure> {
         require(path.is_absolute(), "arguments", "absolute_path_required")?;
@@ -296,6 +334,8 @@ mod check {
                 "--runtime-output-root",
                 "--scenario",
                 "--scenario-sha256",
+                "--pals-cuda-warm-max-leases",
+                "--pals-cuda-warm-device-bytes-max",
                 "--output-json",
                 "--control-inventory",
                 "--control-inventory-sha256",
@@ -351,7 +391,12 @@ mod check {
             if !optional {
                 args.value(flag)?;
             }
-            if !flag.ends_with("-sha256") {
+            if !flag.ends_with("-sha256")
+                && !matches!(
+                    flag,
+                    "--pals-cuda-warm-max-leases" | "--pals-cuda-warm-device-bytes-max"
+                )
+            {
                 if let Some(value) = args.values.get(flag) {
                     external(
                         Path::new(value),
@@ -373,6 +418,9 @@ mod check {
             "arguments",
             "control_inventory_requires_all_three_fields",
         )?;
+        if args.mode == "capture" {
+            args.cuda_warm_limits()?;
+        }
         Ok(args)
     }
     fn pinned(path: &Path, expected: &str, maximum: usize) -> Result<Vec<u8>, Failure> {
@@ -1179,7 +1227,11 @@ mod check {
             match event {
                 NativeRoleTerminal::Ready(result) => {
                     call.wire["physical"]["ready"] = json!(true);
-                    call.wire["physical"]["completed_ok"] = json!(result.is_ok());
+                    call.wire["physical"]["completed_ok"] = json!(match result {
+                        Ok(PalsNativeResult::EvaluationWithEvidence { outcome, .. }) =>
+                            outcome.is_ok(),
+                        _ => result.is_ok(),
+                    });
                 }
                 NativeRoleTerminal::CompletionUnknown(reason) => {
                     call.wire["physical"]["completion_unknown"] = json!(true);
@@ -1759,6 +1811,7 @@ mod check {
         let scenario: Scenario = serde_json::from_slice(&scenario_bytes)
             .map_err(|_| fail("scenario", "json_invalid"))?;
         let position = scenario.position()?;
+        let owner_limits = args.cuda_warm_limits()?;
         capture
             .lock()
             .map_err(|_| fail("scenario", "capture_unavailable"))?
@@ -1794,7 +1847,7 @@ mod check {
         };
         let profile_root = args.values.get("--profile-root").map(PathBuf::from);
         let load_started = Instant::now();
-        let native = NativeRoleModel::load_with_runtime_and_cuda_private_warm_with_options(
+        let native = NativeRoleModel::load_with_runtime_and_cuda_private_warm_and_observations(
             &args.path("--export-manifest")?,
             args.value("--export-manifest-sha256")?,
             runtime,
@@ -1812,6 +1865,7 @@ mod check {
                 host_record_pages: None,
             },
             control.zip(profile_root.as_deref()),
+            Some(owner_limits),
         )
         .map_err(|error| role_failure("load_cuda_private_warm", error))?;
         let handle = native.finish_handle();
@@ -2018,6 +2072,7 @@ mod check {
         let cleanup_started = Instant::now();
         let shutdown = handle.finish(whole);
         let receipt = handle.receipt();
+        let owner_observation = handle.cuda_warm_followup_observation();
         let capture = capture
             .lock()
             .map_err(|_| fail("capture", "capture_unavailable"))?;
@@ -2083,6 +2138,55 @@ mod check {
             .all(|call| {
                 call.wire["warm_start"] == false && call.wire["invocation"]["mode"] == "fresh"
             });
+        let actual_seed_consumptions = capture
+            .calls
+            .iter()
+            .filter(|call| call.wire["warm_start"] == true)
+            .count() as u64;
+        let actual_value_calls = capture
+            .calls
+            .iter()
+            .filter(|call| {
+                call.question.as_ref().is_some_and(|question| {
+                    question.context.purpose == RoleQueryPurpose::ValueFresh
+                })
+            })
+            .count() as u64;
+        // Join Native's existing owner DTO to this actual call stream. Neither
+        // a capability declaration nor logical cancellation supplies a fence.
+        let owner_accounting = owner_observation.as_ref().is_some_and(|owner| {
+            owner.measurement_contract == PRIVATE_CUDA_WARM_MEASUREMENT_CONTRACT
+                && owner.backend_owner_id != 0
+                && owner.bank_owner_id != 0
+                && owner.capability_available == Some(true)
+                && owner.max_leases == owner_limits.max_leases
+                && owner.device_bytes_max == owner_limits.device_bytes_max
+                && owner.leases_admitted == expected_forwards
+                && owner.leases_physically_completed == expected_forwards
+                && owner.leases_quarantined == 0
+                && owner.leases_active == 0
+                && owner.leases_peak == 1
+                && owner.startup_leases_admitted == STARTUP_ROLE_FORWARDS
+                && owner.startup_leases_physically_completed == STARTUP_ROLE_FORWARDS
+                && owner.startup_leases_quarantined == 0
+                && owner.device_bytes_current == 0
+                && owner.device_bytes_retained == 0
+                && owner.device_bytes_peak > 0
+                && owner.device_bytes_peak <= owner_limits.device_bytes_max
+                && actual_seed_consumptions > 0
+                && owner.accepted_seed_consumptions == actual_seed_consumptions
+                && owner.seed_context_checked_consumptions == actual_seed_consumptions
+                && owner.rejected_seed_contexts == 0
+                && actual_value_calls > 0
+                && owner.fresh_value_evaluations == actual_value_calls
+                && owner.value_always_fresh
+                && owner.admission_closed
+                && owner.bank_closed
+                && owner.backend_dropped
+                && owner.worker_joined
+                && owner.buffers_released
+                && owner.complete
+        });
         let execution_passed = work_failure.is_none()
             && work_completed_within_deadline
             && search.as_ref().is_some_and(|v| v["returned_ok"] == true)
@@ -2095,6 +2199,7 @@ mod check {
             && first_p_fresh
             && first_c_fresh
             && accounting
+            && owner_accounting
             && nn_counts.is_some_and(|counts| counts.0 <= capture.max_role_forwards)
             && !capture.output_reservation_exhausted
             && shutdown.is_ok()
@@ -2121,6 +2226,11 @@ mod check {
             "actual_completed_role_forwards_including_startup": nn_counts.map(|counts| counts.1),
             "actual_known_completed_startup_role_forwards": startup_completed,
             "role_forward_accounting_checked": accounting,
+            "cuda_warm_owner_accounting_checked": owner_accounting,
+            "cuda_warm_owner_observation": owner_observation,
+            "cuda_warm_selected_limits": {"max_leases": owner_limits.max_leases,
+                "device_bytes_max": owner_limits.device_bytes_max,
+                "device_bytes_scope": "explicit_cuda_kv_payload_bytes"},
             "actual_native_checked_role_consumer_calls": receipt.search_consumed_role_inputs,
             "native_checked_consumer_scope": "actual_search_calls_plus_separately_labeled_same_question_resume_and_value_checks",
             "public_graph_runs_accounted_separately_by_backend_stats": true, "elapsed_ms": started.elapsed().as_millis(),
@@ -2131,7 +2241,9 @@ mod check {
             "compiled_component_pins": {
                 "model_boundary_sha256_hex": hex(&rz_eval::pals_model::compiled_model_boundary_sha256()),
                 "search_implementation_sha256_hex": hex(&rz_search::pals::engine::compiled_search_implementation_sha256()),
-                "resolver_implementation_sha256_hex": hex(&rz_search::pals::engine::compiled_resolver_implementation_sha256())},
+                "resolver_implementation_sha256_hex": hex(&rz_search::pals::engine::compiled_resolver_implementation_sha256()),
+                "cuda_warm_owner_implementation_sha256_hex": hex(&rz_eval::pals_onnx::cuda_private_warm_implementation_digest()),
+                "native_cuda_warm_adapter_sha256_hex": hex(&rz_uci::pals_native::pals_native_cuda_warm_adapter_source_digest())},
             "export_manifest_sha256_hex": args.value("--export-manifest-sha256")?,
             "scenario_sha256_hex": args.value("--scenario-sha256")?, "cuda_bundle_manifest_sha256_hex": args.value("--cuda-bundle-sha256")?,
             "runtime_storage": pin.storage(),
@@ -2142,6 +2254,7 @@ mod check {
             "resume": resume.as_ref().and_then(|v| v.as_ref().ok()),
             "failure": work_failure.or_else(|| resume.as_ref().and_then(|v| v.as_ref().err().copied()))
                 .or_else(|| (cpu_resume["passed"] != true).then(|| fail("cpu_scheduler_resume", "actual_pause_repair_c_resume_not_exercised")))
+                .or_else(|| (!owner_accounting).then(|| fail("cuda_warm_owner", "actual_owner_accounting_or_closure_missing")))
                 .map(Failure::wire),
             "cleanup_failure": shutdown.err().map(|error| role_failure("cleanup", error).wire()),
             "calls": capture.wires(), "final_receipt": receipt,
@@ -2257,6 +2370,7 @@ mod check {
             capture["schema"] == SCHEMA
                 && capture["phase"] == "capture"
                 && capture["execution_checks_passed"] == true
+                && capture["cuda_warm_owner_accounting_checked"] == true
                 && capture["scheduler_interrupted_stack_resume_after_gpu_repair"]["passed"] == true,
             "reference",
             "actual_execution_gate_failed",
@@ -2369,6 +2483,9 @@ mod check {
             "tolerance": numeric_contract(), "checks": results,
             "fresh_vs_seeded_equality_required": false, "actual_training": false, "strength_or_speedup_claim": false,
             "scheduler_interrupted_stack_resume_after_gpu_repair": capture["scheduler_interrupted_stack_resume_after_gpu_repair"],
+            "cuda_warm_owner_accounting_checked": capture["cuda_warm_owner_accounting_checked"],
+            "cuda_warm_owner_observation": capture["cuda_warm_owner_observation"],
+            "cuda_warm_selected_limits": capture["cuda_warm_selected_limits"],
             "validator_v_execution": capture["validator_v_execution"],
             "unknown_cancel_deadline_quarantine_evidence": capture["unknown_cancel_deadline_quarantine_evidence"]}),
         )
@@ -2497,6 +2614,28 @@ mod check {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn cuda_warm_owner_limits_use_native_byte_units_and_refuse_missing_exclusive_budget() {
+            let limits = cuda_warm_limits("1", "397312").unwrap();
+            assert_eq!(limits.max_leases, 1);
+            assert_eq!(limits.device_bytes_max, 397312);
+            let config = PalsModelConfig::full_line_interaction_v2();
+            let maximum_tokens = config.public_memory_tokens(config.max_records).unwrap() as u64;
+            assert_eq!(
+                limits.device_bytes_max,
+                maximum_tokens * config.kv_heads as u64 * config.head_dimension as u64 * 4 * 2 * 2
+            );
+            for (leases, bytes) in [
+                ("0", "397312"),
+                ("2", "397312"),
+                ("1", "0"),
+                ("1", ""),
+                ("1", "+1"),
+                ("1", "18446744073709551616"),
+            ] {
+                assert!(cuda_warm_limits(leases, bytes).is_err());
+            }
+        }
         #[test]
         fn profile_output_is_exclusive_without_changing_existing_input_canonicalization() {
             let nonce = std::time::SystemTime::now()
