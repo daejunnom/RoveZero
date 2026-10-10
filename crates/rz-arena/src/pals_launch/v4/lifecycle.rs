@@ -251,8 +251,8 @@ fn stack_transition(
 ) -> Result<(), ArenaError> {
     require(
         a.owner_id == b.owner_id
-            && !(a.admission_closed && !b.admission_closed)
-            && !(a.owner_released && !b.owner_released),
+            && (!a.admission_closed || b.admission_closed)
+            && (!a.owner_released || b.owner_released),
         "paused owner moved or reopened",
     )?;
     monotonic(
@@ -281,7 +281,7 @@ fn archive_transition(
             && a.repository_sha256 == b.repository_sha256
             && a.runtime_limits == b.runtime_limits
             && a.compiled_source_sha256 == b.compiled_source_sha256
-            && !(a.admission_closed && !b.admission_closed),
+            && (!a.admission_closed || b.admission_closed),
         "archive owner moved or reopened",
     )?;
     let mut counters = vec![
@@ -372,7 +372,7 @@ fn warm_transition(
     require(
         a.backend_owner_id == b.backend_owner_id
             && a.bank_owner_id == b.bank_owner_id
-            && !(a.admission_closed && !b.admission_closed),
+            && (!a.admission_closed || b.admission_closed),
         "CUDA backend/bank owner moved or reopened",
     )?;
     monotonic(

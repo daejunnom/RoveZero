@@ -437,7 +437,7 @@ impl LockedPalsArenaLaunchV4 {
             .archive_roots
             .lock()
             .map_err(|_| invalid("archive Arena root owner poisoned"))?;
-        if !roots.contains_key(&role_index(role)) {
+        if let std::collections::btree_map::Entry::Vacant(entry) = roots.entry(role_index(role)) {
             require(
                 runtime_root.is_absolute()
                     && runtime_root.canonicalize().is_ok_and(|p| p == runtime_root),
@@ -468,7 +468,7 @@ impl LockedPalsArenaLaunchV4 {
                 repository_pin: open_dir(&repository)?,
             };
             pins.verify()?;
-            roots.insert(role_index(role), pins);
+            entry.insert(pins);
         }
         let pins = &roots[&role_index(role)];
         require(
