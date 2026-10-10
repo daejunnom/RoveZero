@@ -6,17 +6,29 @@ use crate::cpu::CpuResumePolicy;
 use std::collections::BTreeSet;
 
 impl<M: RoleModel> PalsEngine<M> {
-    fn require_cpu_stack_discard(&self) -> Result<(), PalsError> {
-        let stack_policy = self.cpu.owned_resume_policy() == Some(CpuResumePolicy::PausedStack);
+    fn cpu_stack_discard_required(&self) -> Result<bool, PalsError> {
+        let policy = self.cpu.owned_resume_policy();
+        let supports_discard = self.cpu.supports_paused_stack_discard();
         let stack_token = self
             .nodes
             .iter()
             .filter_map(|node| node.resume.as_ref())
             .any(CpuResumeToken::is_paused_stack);
-        if (stack_policy || stack_token) && !self.cpu.supports_paused_stack_discard() {
+        let observed_stack = self.cpu.paused_stack_snapshot().is_some_and(|snapshot| {
+            snapshot.tokens_retained != 0 || snapshot.bytes_current != 0 || !snapshot.complete
+        });
+        // Disposal capability alone does not select or retain a stack: the
+        // native CompletedIteration owner deliberately has no stack snapshot.
+        // A custom capable owner with no disclosed policy remains unknown and
+        // still needs the original disposal witness.
+        let required = policy == Some(CpuResumePolicy::PausedStack)
+            || stack_token
+            || observed_stack
+            || (supports_discard && policy.is_none());
+        if required && !supports_discard {
             return Err(CheckerError::Unsupported("owned paused stack disposal").into());
         }
-        Ok(())
+        Ok(required)
     }
 
     /// Before every own CPU admission, reconcile retained task metadata with
@@ -27,7 +39,7 @@ impl<M: RoleModel> PalsEngine<M> {
         if self.is_external() {
             return Ok(());
         }
-        self.require_cpu_stack_discard()?;
+        let discard_required = self.cpu_stack_discard_required()?;
         let mut current = BTreeSet::new();
         let mut stale = Vec::new();
         stale
@@ -65,7 +77,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 stale.push(index);
             }
         }
-        if current.is_empty() && self.cpu.supports_paused_stack_discard() {
+        if current.is_empty() && discard_required {
             // Restricted discovery can leave frames without a resumable Node.
             // Such an orphan has no live task consumer to preserve.
             self.discard_cpu_stack_owner()?;
@@ -86,8 +98,7 @@ impl<M: RoleModel> PalsEngine<M> {
         if self.is_external() {
             return Ok(());
         }
-        self.require_cpu_stack_discard()?;
-        if self.cpu.supports_paused_stack_discard() {
+        if self.cpu_stack_discard_required()? {
             self.discard_cpu_stack_owner()?;
         }
         // Drop logical handles even if the finite Store retirement allocation
@@ -267,6 +278,13 @@ mod tests {
     }
 
     fn engine<M: RoleModel>(model: M) -> (PalsEngine<M>, Arc<Trace>) {
+        engine_with_policy(model, CpuResumePolicy::PausedStack)
+    }
+
+    fn engine_with_policy<M: RoleModel>(
+        model: M,
+        policy: CpuResumePolicy,
+    ) -> (PalsEngine<M>, Arc<Trace>) {
         let trace = Arc::new(Trace::default());
         let cpu = RecordingCpu {
             inner: CpuEngine::with_resume_policy(
@@ -276,7 +294,7 @@ mod tests {
                     quiescence_ply: 4,
                     ..CpuConfig::default()
                 },
-                CpuResumePolicy::PausedStack,
+                policy,
             )
             .unwrap(),
             trace: trace.clone(),
@@ -313,6 +331,45 @@ mod tests {
             .focus_actual_moves(position.snapshot())
             .unwrap();
         engine.intern(position.clone()).unwrap()
+    }
+
+    #[test]
+    fn completed_iteration_without_stack_skips_disposal_witness_at_admission_and_cancel() {
+        let (mut engine, trace) =
+            engine_with_policy(LegalOrderRoleMock, CpuResumePolicy::CompletedIteration);
+        assert!(engine.cpu.supports_paused_stack_discard());
+        assert_eq!(engine.cpu.paused_stack_snapshot(), None);
+        engine.synchronize_cpu_checkpoints().unwrap();
+        let node = root(&mut engine, &Position::startpos());
+        let cancel = AtomicBool::new(false);
+        let limits = limits();
+        let mut counters = PalsCounters::default();
+        engine
+            .verify_checked_cpu(node, &[], limits, &cancel, &mut counters)
+            .unwrap();
+        assert_eq!(counters.cpu_tasks_requested, 1);
+        assert_eq!(counters.cpu_nodes, 1);
+        let observation = engine.nodes[node]
+            .evidence
+            .as_ref()
+            .unwrap()
+            .provenance
+            .unwrap()
+            .0;
+        let raw = engine.stores.observations.get(observation).unwrap().clone();
+        let work = engine.cpu.last_attempt().unwrap().work;
+        let before = counters;
+        engine.synchronize_cpu_checkpoints().unwrap();
+        engine.discard_canceled_cpu_checkpoints().unwrap();
+        assert_eq!(trace.discards.load(Ordering::Acquire), 0);
+        assert_eq!(engine.cpu.paused_stack_snapshot(), None);
+        assert_eq!(engine.cpu.last_attempt().unwrap().work, work);
+        assert_eq!(engine.stores.observations.get(observation).unwrap(), &raw);
+        assert_eq!(counters, before);
+        engine.try_new_game(limits.deadline, &cancel).unwrap();
+        engine.synchronize_cpu_checkpoints().unwrap();
+        assert_eq!(trace.discards.load(Ordering::Acquire), 0);
+        assert_eq!(engine.cpu.paused_stack_snapshot(), None);
     }
 
     #[test]
