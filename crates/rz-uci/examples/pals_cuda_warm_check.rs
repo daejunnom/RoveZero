@@ -168,6 +168,16 @@ mod check {
         }
         hex(&hash.finalize())
     }
+    fn seed_provenance_digest(bits: &[u32]) -> String {
+        // Match the bank's provenance framing; raw capture digests stay unframed.
+        let mut hash = Sha256::new();
+        hash.update(b"rz-pals-private-finite-fp32-latent/1");
+        hash.update((bits.len() as u64).to_le_bytes());
+        for value in bits {
+            hash.update(value.to_le_bytes());
+        }
+        hex(&hash.finalize())
+    }
     fn sha_json<T: serde::Serialize>(value: &T) -> Result<String, Failure> {
         serde_json::to_vec(value)
             .map(|bytes| hex(&Sha256::digest(bytes)))
@@ -1977,7 +1987,7 @@ mod check {
                 || seed["seal_hex"].as_str().is_none_or(|v| !valid_digest(v))
                 || call["invocation"]["seed_seal_hex"] != seed["seal_hex"]
                 || seed["source_input_hex"] != source["input_key_hex"]
-                || seed["latent_bits_digest_hex"] != bits_digest(latent)
+                || seed["latent_bits_digest_hex"] != seed_provenance_digest(latent)
             {
                 return false;
             }
@@ -3811,15 +3821,35 @@ mod check {
             assert!(wire.get("execution").is_none());
         }
         #[test]
+        fn seed_provenance_framing_preserves_raw_digest_and_signed_zero_bits() {
+            let mut bits = vec![0.25f32.to_bits(); LATENT_ELEMENTS];
+            bits[0] = (-0.0f32).to_bits();
+            // Independent known hashes of 6144 little-endian FP32 bit words.
+            assert_eq!(
+                seed_provenance_digest(&bits),
+                "31d746ae061e3380aa88d34b3a310197361ecec7205c4f35ff3b5a3367b642a5"
+            );
+            assert_eq!(
+                bits_digest(&bits),
+                "99ea5aff8cdd0b1a31d72ba623c983870d2316751d2af3b7f8541a0ebd838ea4"
+            );
+            bits[0] = 0.0f32.to_bits();
+            assert_eq!(
+                seed_provenance_digest(&bits),
+                "2a90e9a61891c51937fa4465758740a3f4b41c0d5169a6045ada8963c29303d1"
+            );
+        }
+        #[test]
         fn cost_metadata_keeps_the_same_repair_packet_full_seed_and_original_provenance() {
             let input = json!({"query": [1, 2], "records": [3, 4], "history_digest": "fixed"});
             let context =
                 json!({"purpose": "RepairPolicy", "public_revision": 7, "game_generation": 1});
-            let latent = vec![0.25f32.to_bits(); LATENT_ELEMENTS];
+            let mut latent = vec![0.25f32.to_bits(); LATENT_ELEMENTS];
+            latent[0] = (-0.0f32).to_bits();
             let seal = "a".repeat(64);
             let source = json!({"input_key_hex": "b".repeat(64)});
             let seed = json!({"source_input_hex": source["input_key_hex"],
-                "latent_bits_digest_hex": bits_digest(&latent), "source_lease_id": 9,
+                "latent_bits_digest_hex": seed_provenance_digest(&latent), "source_lease_id": 9,
                 "seed_sequence": 4, "seal_hex": seal});
             let warm = json!({"input": input, "logical_context": context,
                 "initial_latent_bits": latent, "warm_start": true,
@@ -3860,7 +3890,7 @@ mod check {
                 (
                     "seed_provenance",
                     json!({"source_input_hex": source["input_key_hex"],
-                    "latent_bits_digest_hex": bits_digest(&latent), "source_lease_id": 10,
+                    "latent_bits_digest_hex": seed_provenance_digest(&latent), "source_lease_id": 10,
                     "seed_sequence": 4, "seal_hex": seal}),
                 ),
             ] {
@@ -3874,6 +3904,20 @@ mod check {
                     &source,
                     true,
                     &mut stable
+                ));
+            }
+            for invalid_digest in [
+                bits_digest(&latent),
+                // Wrong domain, wrong u64LE length and changed signed-zero bits.
+                "1c5d99c251e746969f44af86c1e2fb08c8711e74af9ed2fa573d1113119b5a57".into(),
+                "529debeb04a6b88b84089545051ac6b36b7923a3f9688de175e632ab432c8f6e".into(),
+                "2a90e9a61891c51937fa4465758740a3f4b41c0d5169a6045ada8963c29303d1".into(),
+            ] {
+                let mut changed = warm.clone();
+                changed["seed_provenance"]["latent_bits_digest_hex"] = json!(invalid_digest);
+                // A new observation must reject malformed provenance itself.
+                assert!(!fixed_cost_packet(
+                    &changed, &input, &context, &latent, &source, true, &mut None
                 ));
             }
             let fresh = json!({"input": input, "logical_context": context,

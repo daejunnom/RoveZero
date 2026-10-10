@@ -242,6 +242,12 @@ def latent_bytes(bits):
     return contents
 
 
+def seed_provenance_digest(bits):
+    """Check the bank's framed digest separately from raw capture SHA256."""
+    contents = latent_bytes(bits)
+    return hashlib.sha256(b"rz-pals-private-finite-fp32-latent/1" + struct.pack("<Q", len(bits)) + contents).hexdigest()
+
+
 def _validate_raw_output(value, input_value, bits=None):
     _fields(value, _RAW_FIELDS)
     lengths = {"candidate_logits": len(input_value["candidates"]), "wdl_logits": 3,
@@ -343,7 +349,7 @@ def validate_actual_capture(capture, export_manifest_sha256):
             provenance = call.get("seed_provenance")
             if (type(provenance) is not dict or provenance.get("seal_hex") != seal
                     or provenance.get("role") != call["input"]["role"]
-                    or provenance.get("latent_bits_digest_hex") != call["initial_latent_sha256_hex"]
+                    or provenance.get("latent_bits_digest_hex") != seed_provenance_digest(call["initial_latent_bits"])
                     or provenance.get("model_manifest_sha256_hex") != export_manifest_sha256
                     or provenance.get("model_epoch_hex") != _digest_bytes(call["input"]["model_epoch"]).hex()):
                 raise ValueError("captured seed provenance does not bind this role/model/full seed")
@@ -414,7 +420,7 @@ def _cost_packet(call, source, config, export_manifest_sha256, warm):
         if (type(seed) is not dict or initial != source["raw_output_bits"]["private_latent"]
                 or seed.get("seal_hex") != _sha(invocation.get("seed_seal_hex"))
                 or seed.get("source_input_hex") != source["input_key_hex"]
-                or seed.get("latent_bits_digest_hex") != digest or seed.get("role") != call["input"]["role"]
+                or seed.get("latent_bits_digest_hex") != seed_provenance_digest(initial) or seed.get("role") != call["input"]["role"]
                 or seed.get("model_manifest_sha256_hex") != export_manifest_sha256
                 or seed.get("model_epoch_hex") != _digest_bytes(call["input"]["model_epoch"]).hex()
                 or _uint(seed.get("source_lease_id")) == 0 or _uint(seed.get("seed_sequence")) == 0):

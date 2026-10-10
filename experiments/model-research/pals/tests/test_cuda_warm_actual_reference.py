@@ -13,7 +13,7 @@ from rz_pals_model.config import ModelConfig
 from rz_pals_model.cuda_warm_actual_reference import (
     ATOL, LATENT_ELEMENTS, MAX_CAPTURE_CALLS, CAPTURE_SCHEMA, REFERENCE_SCHEMA, DEFAULT_ROLE_FORWARDS,
     _bind_native_source_identity, _compare_raw, _external_path, _json_bytes, _reference_call, _write_reference,
-    canonical_captured_input_key, latent_bytes, run_actual_reference_cli,
+    canonical_captured_input_key, latent_bytes, seed_provenance_digest, run_actual_reference_cli,
     validate_actual_capture, validate_captured_input, _reference_streams)
 
 
@@ -39,13 +39,19 @@ def _bits(value):
     return struct.unpack("<I", struct.pack("<f", value))[0]
 
 
+def _framed_seed_digest(bits):
+    # Independent producer-format fixture; capture initial/final SHA stays raw.
+    payload = b"".join(struct.pack("<I", bit) for bit in bits)
+    return hashlib.sha256(b"rz-pals-private-finite-fp32-latent/1" + struct.pack("<Q", len(bits)) + payload).hexdigest()
+
+
 def _call(sequence=1, role="proposer", warm=False, source=None):
     config = ModelConfig.for_profile("full_line_interaction_v2")
     value = _input(role)
     key = canonical_captured_input_key(value, config)
     raw = {"candidate_logits": [0.125], "wdl_logits": [0.25, -0.0, -0.25],
            "divergence_logits": [0.375] if role == "critic" else None,
-           "task_logits": None, "private_latent": [0.5] * LATENT_ELEMENTS}
+           "task_logits": None, "private_latent": [-0.0] + [0.5] * (LATENT_ELEMENTS - 1)}
     bits = {name: [_bits(number) for number in numbers] if numbers is not None else None for name, numbers in raw.items()}
     seed = source["raw_output_bits"]["private_latent"] if warm else [_bits(-0.0)] * LATENT_ELEMENTS
     digest = hashlib.sha256(latent_bytes(seed)).hexdigest()
@@ -54,7 +60,7 @@ def _call(sequence=1, role="proposer", warm=False, source=None):
     provenance = None
     if warm:
         invocation["seed_seal_hex"] = "44" * 32
-        provenance = {"seal_hex": "44" * 32, "role": role, "latent_bits_digest_hex": digest,
+        provenance = {"seal_hex": "44" * 32, "role": role, "latent_bits_digest_hex": _framed_seed_digest(seed),
                       "model_manifest_sha256_hex": MANIFEST_SHA, "model_epoch_hex": bytes(value["model_epoch"]).hex(),
                       "source_input_hex": source["input_key_hex"]}
     encoded_input = json.dumps(value, separators=(",", ":"), allow_nan=False)
@@ -154,6 +160,40 @@ def _cost_capture():
 
 
 class CapturedReferenceAdmissionTests(unittest.TestCase):
+    def test_seed_provenance_framing_has_independent_known_digest_and_preserves_raw_sha(self):
+        bits = [0x80000000] + [0x3e800000] * (LATENT_ELEMENTS - 1)
+        known = "31d746ae061e3380aa88d34b3a310197361ecec7205c4f35ff3b5a3367b642a5"
+        self.assertEqual(_framed_seed_digest(bits), known)
+        self.assertEqual(seed_provenance_digest(bits), known)
+        self.assertEqual(hashlib.sha256(latent_bytes(bits)).hexdigest(),
+                         "99ea5aff8cdd0b1a31d72ba623c983870d2316751d2af3b7f8541a0ebd838ea4")
+        bits[0] = 0
+        self.assertEqual(seed_provenance_digest(bits),
+                         "2a90e9a61891c51937fa4465758740a3f4b41c0d5169a6045ada8963c29303d1")
+
+    def test_original_and_cost_reject_raw_only_wrong_domain_length_and_signed_zero_provenance(self):
+        for cost in (False, True):
+            for label in ("raw_only", "wrong_domain", "wrong_length", "signed_zero"):
+                capture = _cost_capture() if cost else _capture()
+                warm = capture["cost_same_seed_context"]["warm"]["calls"][0] if cost else capture["calls"][2]
+                bits = warm["initial_latent_bits"]
+                self.assertEqual(bits[0], 0x80000000)
+                payload = latent_bytes(bits)
+                domain = b"rz-pals-private-finite-fp32-latent/1"
+                length = len(bits)
+                if label == "raw_only":
+                    invalid = hashlib.sha256(payload).hexdigest()
+                else:
+                    if label == "wrong_domain": domain = b"rz-pals-private-finite-fp32-latent/2"
+                    elif label == "wrong_length": length -= 1
+                    else: payload = struct.pack("<I", 0) + payload[4:]
+                    invalid = hashlib.sha256(domain + struct.pack("<Q", length) + payload).hexdigest()
+                warm["seed_provenance"]["latent_bits_digest_hex"] = invalid
+                before = copy.deepcopy(capture)
+                with self.subTest(cost=cost, label=label), self.assertRaisesRegex(ValueError, "seed provenance|original accepted full seed"):
+                    validate_actual_capture(capture, MANIFEST_SHA)
+                self.assertEqual(capture, before)
+
     def test_cost_keeps_original_and_two_owner_namespaces_without_id_rewrite(self):
         capture = _cost_capture()
         before = copy.deepcopy(capture)
