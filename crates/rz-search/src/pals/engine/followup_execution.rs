@@ -806,7 +806,7 @@ mod tests {
         PalsEngine::new_with_boxed_checker_and_policies(
             PalsConfig {
                 line_plies: 6,
-                max_nodes: 128,
+                max_nodes: 257,
                 max_records: 128,
                 ..PalsConfig::default()
             },
