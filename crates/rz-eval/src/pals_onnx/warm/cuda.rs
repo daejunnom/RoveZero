@@ -361,21 +361,45 @@ fn validate_cuda_input(
     Ok(())
 }
 fn cuda_owned_bytes(input: &PalsModelInput, seeds: usize) -> Result<u64, BackendError> {
-    let mut bytes = owned_bytes(input, seeds)?;
+    // The CUDA owner embeds PalsModelInput; count its inline storage only once.
+    // CPU Warm's owner size and admission limit do not belong to this payload.
+    let mut bytes = std::mem::size_of::<PalsCudaWarmInput>() as u64;
+    let mut charge = |capacity: usize, width: usize| -> Result<(), BackendError> {
+        bytes = (capacity as u64)
+            .checked_mul(width as u64)
+            .and_then(|n| bytes.checked_add(n))
+            .ok_or_else(|| {
+                fail(
+                    K::ResourceExhausted,
+                    S::Admission,
+                    "CUDA Warm payload byte overflow",
+                )
+            })?;
+        Ok(())
+    };
+    for (capacity, width) in [
+        (input.board.capacity(), std::mem::size_of::<u8>()),
+        (
+            input.records.capacity(),
+            std::mem::size_of::<crate::pals_model::PalsRecordToken>(),
+        ),
+        (
+            input.required_critical_records.capacity(),
+            std::mem::size_of::<u64>(),
+        ),
+        (
+            input.candidates.capacity(),
+            std::mem::size_of::<crate::pals_model::PalsCandidateToken>(),
+        ),
+        (
+            input.divergence_features.capacity(),
+            std::mem::size_of::<[f32; crate::pals_model::DIVERGENCE_FEATURES]>(),
+        ),
+        (seeds, std::mem::size_of::<u32>()),
+    ] {
+        charge(capacity, width)?;
+    }
     if let Some(full) = &input.full_line {
-        let mut charge = |capacity: usize, width: usize| -> Result<(), BackendError> {
-            bytes = (capacity as u64)
-                .checked_mul(width as u64)
-                .and_then(|n| bytes.checked_add(n))
-                .ok_or_else(|| {
-                    fail(
-                        K::ResourceExhausted,
-                        S::Admission,
-                        "CUDA Warm full-line bytes overflow",
-                    )
-                })?;
-            Ok(())
-        };
         charge(
             full.records.capacity(),
             std::mem::size_of::<crate::pals_model::PalsRecordLine>(),
@@ -397,15 +421,6 @@ fn cuda_owned_bytes(input: &PalsModelInput, seeds: usize) -> Result<u64, Backend
             )?;
         }
     }
-    bytes = bytes
-        .checked_add(std::mem::size_of::<PalsCudaWarmInput>() as u64)
-        .ok_or_else(|| {
-            fail(
-                K::ResourceExhausted,
-                S::Admission,
-                "CUDA Warm owner bytes overflow",
-            )
-        })?;
     if bytes > CUDA_PAYLOAD_LIMIT {
         return Err(fail(
             K::ResourceExhausted,
@@ -1658,6 +1673,22 @@ mod tests {
     fn payload_charges_full_line_capacity_and_requires_all_finite_seed_elements() {
         let cap = capability();
         let mut owned = PalsCudaWarmInput::fresh(&cap, input()).unwrap();
+        let candidate_bytes = std::mem::size_of::<PalsCandidateToken>() as u64;
+        assert_eq!(
+            owned.owned_host_bytes,
+            std::mem::size_of::<PalsCudaWarmInput>() as u64
+                + owned.input.board.capacity() as u64
+                + (owned.input.candidates.capacity()
+                    + owned
+                        .input
+                        .full_line
+                        .as_ref()
+                        .unwrap()
+                        .query_prefix
+                        .capacity()) as u64
+                    * candidate_bytes
+                + owned.initial_bits.capacity() as u64 * std::mem::size_of::<u32>() as u64
+        );
         assert_eq!(owned.initial_bits.len(), 6144);
         assert!(matches!(owned.invocation, PrivateInvocation::Fresh { .. }));
         owned.initial_bits[6143] = f32::INFINITY.to_bits();
@@ -1666,15 +1697,53 @@ mod tests {
         owned.initial_bits.pop();
         assert!(owned.validate_for(&cap).is_err());
         let mut i = input();
+        let key = i.canonical_input_key(&cap.model_config()).unwrap();
+        let before = cuda_owned_bytes(&i, LATENT_ELEMENTS).unwrap();
+        let before_capacity = i.full_line.as_ref().unwrap().query_counter.capacity();
         i.full_line
             .as_mut()
             .unwrap()
             .query_counter
-            .reserve(3 * 1024 * 1024);
+            .reserve_exact(37);
+        let extra = (i.full_line.as_ref().unwrap().query_counter.capacity() - before_capacity)
+            as u64
+            * candidate_bytes;
+        assert_eq!(
+            cuda_owned_bytes(&i, LATENT_ELEMENTS).unwrap(),
+            before + extra
+        );
+        assert_eq!(i.canonical_input_key(&cap.model_config()).unwrap(), key);
+        let capacity_only = PalsCudaWarmInput::fresh(&cap, i).unwrap();
+        assert_eq!(capacity_only.input_key, key);
+        capacity_only.validate_for(&cap).unwrap();
+        let mut i = input();
+        i.full_line
+            .as_mut()
+            .unwrap()
+            .query_counter
+            .reserve_exact(CUDA_PAYLOAD_LIMIT as usize / candidate_bytes as usize + 1);
         assert!(matches!(
             PalsCudaWarmInput::fresh(&cap, i),
             Err(BackendError {
                 kind: K::ResourceExhausted,
+                ..
+            })
+        ));
+    }
+    #[test]
+    fn payload_uses_cuda_reservation_and_rejects_seed_capacity_overflow() {
+        let cap = capability();
+        let mut i = input();
+        i.board.reserve_exact(PAYLOAD_LIMIT as usize);
+        let owned = PalsCudaWarmInput::fresh(&cap, i).unwrap();
+        assert!(owned.owned_host_bytes > PAYLOAD_LIMIT);
+        assert!(owned.owned_host_bytes <= CUDA_PAYLOAD_LIMIT);
+        owned.validate_for(&cap).unwrap();
+        assert!(matches!(
+            cuda_owned_bytes(&input(), usize::MAX),
+            Err(BackendError {
+                kind: K::ResourceExhausted,
+                stage: S::Admission,
                 ..
             })
         ));
