@@ -175,7 +175,7 @@ class _Graph:
         from onnx import TensorProto, helper
         lines = self.line_encoder("query_line_tokens", "query_line_mask")
         lines = self.op("Reshape", lines, self.shape(self.dimension(lines, 0), self.ints([3 * LINE_WIDTH])))
-        self.nodes.append(helper.make_node("Identity", [lines], ["query_line_features"]))
+        self.nodes.append(helper.make_node("Identity", [lines], ["query_line_features"], name=self.name + "_identity_query_line_features"))
         keys = self.op("Slice", "memory_key", self.ints([66]), self.ints([2**63 - 1]), self.ints([2]))
         values = self.op("Slice", "memory_value", self.ints([66]), self.ints([2**63 - 1]), self.ints([2]))
         own = self.op("Transpose", self.op("Concat", keys, values, axis=1), perm=[0, 2, 1, 3])
@@ -192,8 +192,8 @@ class _Graph:
         features = self.op("Concat", own, *related, axis=-1)
         record_mask = self.op("Slice", "memory_mask", self.ints([66]), self.ints([2**63 - 1]), self.ints([1]))
         active = self.op("Cast", self.op("And", record_mask, self.op("Or", *active_refs)), to=TensorProto.FLOAT)
-        self.nodes.append(helper.make_node("Identity", [features], ["relation_features"]))
-        self.nodes.append(helper.make_node("Identity", [active], ["relation_active_float"]))
+        self.nodes.append(helper.make_node("Identity", [features], ["relation_features"], name=self.name + "_identity_relation_features"))
+        self.nodes.append(helper.make_node("Identity", [active], ["relation_active_float"], name=self.name + "_identity_relation_active_float"))
 
     def private_ffn(self, latent, role, index):
         prefix = f"experts.{role}"
