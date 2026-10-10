@@ -87,6 +87,18 @@ impl<M: RoleModel> PalsEngine<M> {
             .map_err(PalsError::Store)
     }
 
+    /// Explicit selected-owner startup observation under the caller's existing
+    /// finite controls. This scans actual managed file extents; the snapshot
+    /// getter itself never performs I/O or replaces unknown values with zero.
+    pub fn observe_archive_startup(
+        &mut self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), PalsError> {
+        self.ensure_archive_admission_open()?;
+        observe_selected_archive_usage(&mut self.stores, deadline, cancel)
+    }
+
     pub(super) fn engine_archive_owner_snapshot(
         &self,
     ) -> Result<Option<ArchiveOwnerSnapshot>, StoreError> {
@@ -175,6 +187,13 @@ impl<M: RoleModel> PalsEngine<M> {
             next.set_archive_runtime_limits(limits)
                 .map_err(PalsError::Store)?;
         }
+        // A new game owns independent cold handles but consumes the same
+        // startup-selected session write allowance under the same archive root.
+        next.inherit_archive_write_budget_from(&self.stores)
+            .map_err(PalsError::Store)?;
+        // Capture the new owner's actual baseline before it becomes visible to
+        // Native search observations. Scan failure retains the previous owner.
+        observe_selected_archive_usage(&mut next, deadline, cancel)?;
         archive_controls(deadline, cancel)?;
         let closed = self
             .stores
@@ -1319,6 +1338,34 @@ fn allocation_controls(controls: Option<(Instant, &AtomicBool)>) -> Result<(), S
     Ok(())
 }
 
+fn observe_selected_archive_usage(
+    stores: &mut PalsStores,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<(), PalsError> {
+    let Some(limits) = stores.archive_runtime_limits().copied() else {
+        // Preserve unselected legacy/off lifetimes without adding startup I/O.
+        return Ok(());
+    };
+    archive_controls(deadline, cancel)?;
+    let selected_deadline = Instant::now()
+        .checked_add(Duration::from_millis(limits.load_deadline_max_ms))
+        .ok_or(StoreError::InvalidConditions(
+            "archive startup load duration",
+        ))?;
+    let mut budget = ArchiveIoBudget {
+        deadline: deadline.min(selected_deadline),
+        max_bytes: limits.load_bytes_max,
+    };
+    archive_controls(budget.deadline, cancel)?;
+    // Store checks this same deadline at each directory/record boundary. This
+    // metadata-only scan reads no payload, so its actual payload-byte debit is 0.
+    stores
+        .measure_archive_usage_with_budget(&mut budget)
+        .map_err(PalsError::Store)?;
+    archive_controls(budget.deadline, cancel)
+}
+
 fn archive_controls(deadline: Instant, cancel: &AtomicBool) -> Result<(), PalsError> {
     if cancel.load(Ordering::Acquire) {
         Err(RoleError::Canceled.into())
@@ -1814,6 +1861,18 @@ mod tests {
             max_rounds: 1,
             max_cpu_nodes: 1024,
             cpu_depth: 1,
+        }
+    }
+    fn selected_archive_limits() -> ArchiveRuntimeLimits {
+        ArchiveRuntimeLimits {
+            game_bytes_max: 256 * 1024 * 1024,
+            global_bytes_max: 4 * 1024 * 1024 * 1024,
+            index_entries_max: 1024,
+            index_bytes_max: 4096,
+            load_bytes_max: SEARCH_ARCHIVE_IO_BYTES,
+            load_deadline_max_ms: 20_000,
+            record_payload_bytes_max: SEARCH_ARCHIVE_IO_BYTES,
+            max_load_pins: 16,
         }
     }
     fn inactive_position(fullmove: usize) -> Position {
@@ -2588,83 +2647,220 @@ mod tests {
     }
 
     #[test]
-    fn new_game_reopens_a_unique_archive_owner_and_keeps_startup_config() {
-        let mut engine = engine();
-        let config = archive_config("new-game");
+    fn selected_archive_startup_observes_actual_files_and_preserves_failed_scan() {
+        let config = archive_config("startup-observation");
         let root = config.root.clone();
-        engine.enable_archive(config).unwrap();
-        let actual_limits = ArchiveRuntimeLimits {
-            game_bytes_max: 256 * 1024 * 1024,
-            global_bytes_max: 4 * 1024 * 1024 * 1024,
-            index_entries_max: 1024,
-            index_bytes_max: 4096,
-            load_bytes_max: SEARCH_ARCHIVE_IO_BYTES,
-            load_deadline_max_ms: 20_000,
-            record_payload_bytes_max: SEARCH_ARCHIVE_IO_BYTES,
-            max_load_pins: 16,
-        };
-        engine.set_archive_runtime_limits(actual_limits).unwrap();
-        fill_hot(&mut engine);
-        engine
-            .search(&Position::startpos(), limits(), &AtomicBool::new(false))
-            .unwrap();
-        let handle = engine
-            .last_engine_archive()
-            .unwrap()
-            .archive
-            .state_handle(StateId(0));
         let budget = ArchiveIoBudget {
             deadline: Instant::now() + Duration::from_secs(20),
             max_bytes: SEARCH_ARCHIVE_IO_BYTES,
         };
-        let old_owner = engine.archive_owner_snapshot().unwrap().unwrap();
-        let old_generation = engine.game_generation;
-        let old_nodes = engine.nodes.len();
-        let old_records = engine.records.len();
-        engine.new_game();
-        // A void reset has no original controls/fence and keeps the old owner.
-        assert_eq!(engine.game_generation, old_generation);
-        assert_eq!(
-            (engine.nodes.len(), engine.records.len()),
-            (old_nodes, old_records)
-        );
-        assert_eq!(
-            engine.archive_owner_snapshot().unwrap().unwrap().owner_id,
-            old_owner.owner_id
-        );
+        // A separate real Store commit supplies existing nonzero managed bytes.
+        // No model request or physical provider completion is simulated here.
+        let mut writer = engine();
+        writer.enable_archive(config.clone()).unwrap();
+        let node = writer.intern(Position::startpos()).unwrap();
+        let wire = encode_archive_node_projection(&writer.nodes[node], &writer.nodes).unwrap();
+        writer
+            .stores
+            .archive_engine_records(&[], &[wire], budget)
+            .unwrap();
+        let written = writer
+            .archive_owner_snapshot()
+            .unwrap()
+            .unwrap()
+            .global_managed_bytes
+            .unwrap();
+        assert!(written > 0);
+
+        let mut selected = engine();
+        selected.enable_archive(config).unwrap();
+        let selected_limits = selected_archive_limits();
+        selected
+            .set_archive_runtime_limits(selected_limits)
+            .unwrap();
+        let before = selected.archive_owner_snapshot().unwrap().unwrap();
+        assert_eq!(before.global_managed_bytes, None);
+        assert!(!before.global_scan_complete && !before.complete);
         assert!(matches!(
-            engine.new_game_transition_error,
-            Some(PalsError::Store(StoreError::InvalidConditions(_)))
+            selected.observe_archive_startup(Instant::now(), &AtomicBool::new(false)),
+            Err(PalsError::Store(StoreError::ArchiveDeadline))
         ));
-        engine
-            .try_new_game(budget.deadline, &AtomicBool::new(false))
-            .unwrap();
-        assert_eq!(engine.archive_config().unwrap().root, root);
-        assert_eq!(engine.archive_runtime_limits(), Some(&actual_limits));
-        assert!(engine.archive_enabled());
-        assert!(engine.last_engine_archive().is_none());
-        let previous = engine
-            .followup_owner_snapshot()
-            .previous_closed_archive_owner
-            .unwrap();
-        assert_eq!(previous.owner_id, old_owner.owner_id);
-        assert_eq!(
-            previous.lifecycle,
-            super::super::super::store::ArchiveOwnerLifecycle::Closed
-        );
-        assert!(previous.admission_closed && previous.cleanup_complete);
-        assert_ne!(
-            engine.archive_owner_snapshot().unwrap().unwrap().owner_id,
-            old_owner.owner_id
-        );
         assert!(matches!(
-            engine.stores.pin_load(&handle, budget),
-            Err(StoreError::InvalidHandle(_))
+            selected.observe_archive_startup(budget.deadline, &AtomicBool::new(true)),
+            Err(PalsError::Role(RoleError::Canceled))
         ));
-        let report = engine
-            .search(&Position::startpos(), limits(), &AtomicBool::new(false))
+        assert_eq!(selected.archive_owner_snapshot().unwrap(), Some(before));
+
+        selected
+            .observe_archive_startup(budget.deadline, &AtomicBool::new(false))
             .unwrap();
-        assert!(report.counters.cpu_tasks > 0);
+        let observed = selected.archive_owner_snapshot().unwrap().unwrap();
+        assert_eq!(observed.owner_id, before.owner_id);
+        assert_eq!(observed.runtime_limits, Some(selected_limits));
+        assert_eq!(
+            observed.session_write_ledger_id,
+            before.session_write_ledger_id
+        );
+        assert_eq!(observed.session_write_bytes_consumed, Some(0));
+        assert_eq!(observed.write_bytes_remaining, before.write_bytes_remaining);
+        assert_eq!(observed.archive_write_bytes_total, Some(0));
+        assert_eq!(observed.global_managed_bytes, Some(written));
+        assert!(observed.global_scan_complete && observed.global_scan_after_last_commit);
+        assert_eq!(
+            observed.global_scan_event_sequence,
+            Some(observed.event_sequence)
+        );
+        assert!(observed.event_sequence > before.event_sequence);
+        assert!(observed.complete);
+        assert_eq!(observed.loads_requested, 0);
+        assert_eq!(observed.load_bytes_total, 0);
+        assert_eq!(selected.game_generation, Some(0));
+        assert!(selected.nodes.is_empty() && selected.records.is_empty());
+        // Repeated getters preserve the actual scan without adding another one.
+        assert_eq!(selected.archive_owner_snapshot().unwrap(), Some(observed));
+
+        std::fs::write(root.join("unexpected.bin"), [1u8]).unwrap();
+        assert!(matches!(
+            selected.observe_archive_startup(budget.deadline, &AtomicBool::new(false)),
+            Err(PalsError::Store(StoreError::ArchiveIntegrity(_)))
+        ));
+        let failed = selected.archive_owner_snapshot().unwrap().unwrap();
+        assert!(!failed.global_scan_complete && !failed.complete);
+        assert_eq!(failed.global_managed_bytes, Some(written));
+        assert_eq!(failed.session_write_bytes_consumed, Some(0));
+
+        let mut off = engine();
+        off.observe_archive_startup(Instant::now(), &AtomicBool::new(true))
+            .unwrap();
+        assert_eq!(off.archive_owner_snapshot().unwrap(), None);
+    }
+
+    #[test]
+    fn new_game_reopens_unique_owner_and_keeps_session_budget_after_closed_retry() {
+        for close_before_retry in [false, true] {
+            let mut engine = engine();
+            let config = archive_config("new-game");
+            let root = config.root.clone();
+            engine.enable_archive(config).unwrap();
+            let actual_limits = selected_archive_limits();
+            engine.set_archive_runtime_limits(actual_limits).unwrap();
+            fill_hot(&mut engine);
+            engine
+                .search(&Position::startpos(), limits(), &AtomicBool::new(false))
+                .unwrap();
+            let handle = engine
+                .last_engine_archive()
+                .unwrap()
+                .archive
+                .state_handle(StateId(0));
+            let budget = ArchiveIoBudget {
+                deadline: Instant::now() + Duration::from_secs(20),
+                max_bytes: SEARCH_ARCHIVE_IO_BYTES,
+            };
+            let old_owner = engine.archive_owner_snapshot().unwrap().unwrap();
+            assert!(old_owner.session_write_ledger_id.is_some());
+            assert_eq!(
+                old_owner.session_write_bytes_max,
+                Some(actual_limits.game_bytes_max)
+            );
+            assert!(old_owner.session_write_bytes_consumed.unwrap() > 0);
+            let old_generation = engine.game_generation;
+            let old_nodes = engine.nodes.len();
+            let old_records = engine.records.len();
+            engine.new_game();
+            // A void reset has no original controls/fence and keeps the old owner.
+            assert_eq!(engine.game_generation, old_generation);
+            assert_eq!(
+                (engine.nodes.len(), engine.records.len()),
+                (old_nodes, old_records)
+            );
+            assert_eq!(
+                engine.archive_owner_snapshot().unwrap().unwrap().owner_id,
+                old_owner.owner_id
+            );
+            assert!(matches!(
+                engine.new_game_transition_error,
+                Some(PalsError::Store(StoreError::InvalidConditions(_)))
+            ));
+            if close_before_retry {
+                // The actual immutable Store close can succeed before the final
+                // controls check fails. Enter that retained-hot/closed-owner state
+                // without timing sleeps or claiming a physical provider execution.
+                let closed = engine
+                    .finish_followup_owners(budget.deadline)
+                    .unwrap()
+                    .archive
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(closed.owner_id, old_owner.owner_id);
+                assert!(!engine.archive_enabled());
+                assert!(matches!(
+                    engine.try_new_game(Instant::now(), &AtomicBool::new(false)),
+                    Err(PalsError::Store(StoreError::ArchiveDeadline))
+                ));
+                assert!(matches!(
+                    engine.try_new_game(budget.deadline, &AtomicBool::new(true)),
+                    Err(PalsError::Role(RoleError::Canceled))
+                ));
+                assert_eq!(engine.game_generation, old_generation);
+                assert_eq!(
+                    (engine.nodes.len(), engine.records.len()),
+                    (old_nodes, old_records)
+                );
+                assert_eq!(engine.archive_owner_snapshot().unwrap(), Some(closed));
+                assert!(engine.followup_owner_snapshot().new_game_error.is_some());
+            }
+            engine
+                .try_new_game(budget.deadline, &AtomicBool::new(false))
+                .unwrap();
+            assert_eq!(engine.archive_config().unwrap().root, root);
+            assert_eq!(engine.archive_runtime_limits(), Some(&actual_limits));
+            assert!(engine.archive_enabled());
+            assert!(engine.last_engine_archive().is_none());
+            let previous = engine
+                .followup_owner_snapshot()
+                .previous_closed_archive_owner
+                .unwrap();
+            assert_eq!(previous.owner_id, old_owner.owner_id);
+            assert_eq!(
+                previous.lifecycle,
+                super::super::super::store::ArchiveOwnerLifecycle::Closed
+            );
+            assert!(previous.admission_closed && previous.cleanup_complete);
+            let new_owner = engine.archive_owner_snapshot().unwrap().unwrap();
+            assert_ne!(new_owner.owner_id, old_owner.owner_id);
+            assert_eq!(
+                new_owner.global_managed_bytes,
+                old_owner.global_managed_bytes
+            );
+            assert!(new_owner.global_scan_complete && new_owner.global_scan_after_last_commit);
+            assert!(new_owner.complete);
+            assert_eq!(
+                new_owner.session_write_ledger_id,
+                old_owner.session_write_ledger_id
+            );
+            assert_eq!(
+                new_owner.session_write_bytes_max,
+                old_owner.session_write_bytes_max
+            );
+            assert_eq!(
+                new_owner.session_write_bytes_consumed,
+                old_owner.session_write_bytes_consumed
+            );
+            assert_eq!(
+                new_owner.write_bytes_remaining,
+                old_owner.write_bytes_remaining
+            );
+            assert_eq!(new_owner.archive_write_bytes_total, Some(0));
+            assert!(matches!(
+                engine.stores.pin_load(&handle, budget),
+                Err(StoreError::InvalidHandle(_))
+            ));
+            let report = engine
+                .search(&Position::startpos(), limits(), &AtomicBool::new(false))
+                .unwrap();
+            assert!(report.counters.cpu_tasks > 0);
+        }
     }
 
     #[test]
