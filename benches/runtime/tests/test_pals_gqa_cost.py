@@ -76,6 +76,29 @@ class GqaCostTests(unittest.TestCase):
             node("context_product", "MatMul", ["candidate", "context_reshape_out"])]
         self.assertEqual(len(cost.analyze(inventory, events, context)["repeat_kv_groups"]), 2)
 
+    def test_where_both_data_inputs_match_but_condition_never_matches(self):
+        for data_axis in (0, 1, 2):
+            with self.subTest(data_axis=data_axis):
+                inventory, events, context = fixture()
+                nodes = inventory["graphs"][0]["inventory"]["nodes"]
+                ports = ["mask_condition", "masked_constant", "other_score"]
+                ports[data_axis] = "scale_out"
+                nodes.append(node("score_where", "Where", ports))
+                next(value for value in nodes if value["name"] == "weights")["inputs"] = ["score_where_out"]
+                report = cost.analyze(inventory, events, context)
+                kinds = [row["kind"] for row in report["repeat_kv_groups"]]
+                self.assertEqual(kinds, ["key", "value"] if data_axis in (1, 2) else ["value"])
+
+    def test_unreviewed_score_link_opcode_cannot_match_as_attention(self):
+        for opcode in ("Gather", "If"):
+            with self.subTest(opcode=opcode):
+                inventory, events, context = fixture()
+                nodes = inventory["graphs"][0]["inventory"]["nodes"]
+                nodes.append(node("score_route", opcode, ["scale_out", "other_input"]))
+                next(value for value in nodes if value["name"] == "weights")["inputs"] = ["score_route_out"]
+                report = cost.analyze(inventory, events, context)
+                self.assertEqual([row["kind"] for row in report["repeat_kv_groups"]], ["value"])
+
     def test_missing_or_changed_named_node_keeps_full_cost_unknown(self):
         for mutation in ("missing", "wrong_op", "missing_duration"):
             inventory, events, context = fixture()

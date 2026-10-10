@@ -198,7 +198,8 @@ def softmax_link(value, scope, producers, consumers, budget, upstream):
             if node["op"] == "Softmax" and axis == 0:
                 found[node["name"]] = node
             allowed = {"Identity", "Cast", "Transpose", "Mul"} if upstream else {"Identity", "Cast", "Mul", "Add", "Where"}
-            if node["op"] in allowed and (upstream or node["op"] != "Where" or axis == 1):
+            # Where data inputs are 1/2; input 0 is the condition.
+            if node["op"] in allowed and (upstream or node["op"] != "Where" or axis in (1, 2)):
                 next_values = node["inputs"] if upstream else node["outputs"]
                 pending.extend((port, depth + 1) for port in next_values)
     # Ambiguous dataflow cannot identify an attention endpoint.
