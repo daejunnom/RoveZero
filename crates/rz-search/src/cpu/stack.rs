@@ -213,6 +213,9 @@ pub(super) fn run(
         engine.invalidate_paused_stack();
     }
     if let Err(error) = engine.validate_limits(position, limits) {
+        if matches!(error, CpuError::InvalidConfig(_)) {
+            engine.observe_paused_stack_rejection(resume);
+        }
         if matches!(error, CpuError::InvalidConfig(_)) || cancel.load(Ordering::Acquire) {
             engine.invalidate_paused_stack();
         }
@@ -223,6 +226,7 @@ pub(super) fn run(
             || task.value_identity != *engine.value_identity
     }) {
         engine.invalidate_paused_stack();
+        engine.observe_paused_stack_rejection(resume);
         return Err(CpuError::ResumeMismatch("retained CPU namespace changed"));
     }
     let started = Instant::now();
@@ -231,6 +235,7 @@ pub(super) fn run(
             if cancel.load(Ordering::Acquire) {
                 engine.invalidate_paused_stack();
             }
+            engine.observe_paused_stack_rejection(resume);
             return Err(CpuError::ResumeMismatch(
                 "Rules state or full known history changed",
             ));
@@ -244,6 +249,7 @@ pub(super) fn run(
             if cancel.load(Ordering::Acquire) {
                 engine.invalidate_paused_stack();
             }
+            engine.observe_paused_stack_rejection(resume);
             return Err(CpuError::ResumeMismatch(
                 "CPU search conditions or value namespace changed",
             ));
@@ -255,13 +261,17 @@ pub(super) fn run(
             if cancel.load(Ordering::Acquire) {
                 engine.invalidate_paused_stack();
             }
+            engine.observe_paused_stack_rejection(resume);
             return Err(CpuError::ResumeMismatch(
                 "paused stack owner or one-use serial is stale",
             ));
         }
-        let retained = engine.paused.as_ref().ok_or(CpuError::ResumeMismatch(
-            "paused stack was consumed or invalidated",
-        ))?;
+        let Some(retained) = engine.paused.as_ref() else {
+            engine.observe_paused_stack_rejection(resume);
+            return Err(CpuError::ResumeMismatch(
+                "paused stack was consumed or invalidated",
+            ));
+        };
         let token = resume.expect("handle came from token");
         if retained.root != token.root
             || retained.root_moves != token.root_moves
@@ -275,11 +285,14 @@ pub(super) fn run(
             if cancel.load(Ordering::Acquire) {
                 engine.invalidate_paused_stack();
             }
+            engine.observe_paused_stack_rejection(resume);
             return Err(CpuError::ResumeMismatch(
                 "paused task metadata, restrictions or target depth changed",
             ));
         }
-        engine.paused.take().expect("validated live task")
+        let task = engine.paused.take().expect("validated live task");
+        engine.observe_paused_stack_resumed();
+        task
     } else {
         // Starting a new traversal from a historical completed result also
         // invalidates any unrelated paused owner.
@@ -338,6 +351,11 @@ pub(super) fn run(
         tt_hits: 0,
         value: task.value.take().expect("paused task owns its accumulator"),
     };
+    if resume.is_some_and(CpuResumeToken::is_paused_stack) {
+        // Observe actual invocation counters before any new work. The saved
+        // task.cumulative diagnostics never initialize these counters.
+        engine.observe_paused_stack_initial_work(control.actual_work());
+    }
     observer(CpuIterationProgress {
         best_move: task.best.first().copied(),
         score: task.score,
@@ -435,6 +453,7 @@ pub(super) fn run(
     };
     if can_pause {
         engine.paused = Some(task);
+        engine.observe_paused_stack_created();
     } else {
         engine.invalidate_paused_stack();
     }
@@ -1116,6 +1135,7 @@ mod tests {
         interval: u64,
     ) -> (CpuReport, CpuWork, bool) {
         let before = position.snapshot();
+        let owner = engine.paused_stack_snapshot().unwrap().owner_id;
         let cancel = AtomicBool::new(false);
         let mut report = if let Some(moves) = root_moves {
             engine
@@ -1134,6 +1154,13 @@ mod tests {
             if report.completion != CpuCompletion::NodeLimit {
                 assert_eq!(report.completion, CpuCompletion::DepthLimit);
                 assert!(engine.paused.is_none());
+                let snapshot = engine.paused_stack_snapshot().unwrap();
+                assert!(snapshot.complete);
+                assert_eq!(snapshot.owner_id, owner);
+                assert_eq!(snapshot.tokens_retained, 0);
+                assert_eq!(snapshot.bytes_current, 0);
+                assert_eq!(snapshot.replayed_consumed_work, 0);
+                assert!(!snapshot.admission_closed && !snapshot.owner_released);
                 return (report, total, saw_exchange);
             }
             let token = report
@@ -1145,6 +1172,23 @@ mod tests {
             assert_eq!(token.cumulative_work(), Some(total));
             assert_eq!(token.paused_stack_bytes(), engine.paused_stack_bytes());
             assert!(token.paused_stack_bytes().unwrap() <= CPU_PAUSED_STACK_MAX_BYTES);
+            let snapshot = engine.paused_stack_snapshot().unwrap();
+            assert_eq!(snapshot, engine.paused_stack_snapshot().unwrap());
+            assert!(snapshot.complete);
+            assert_eq!(snapshot.owner_id, owner);
+            assert_eq!(snapshot.tokens_retained, 1);
+            assert_eq!(snapshot.tokens_peak, 1);
+            assert_eq!(
+                snapshot.bytes_current,
+                token.paused_stack_bytes().unwrap() as u64
+            );
+            assert!(snapshot.bytes_peak >= snapshot.bytes_current);
+            assert!(snapshot.bytes_peak <= CPU_PAUSED_STACK_MAX_BYTES as u64);
+            assert_eq!(snapshot.replayed_consumed_work, 0);
+            assert_eq!(
+                snapshot.tokens_created,
+                snapshot.tokens_resumed + snapshot.tokens_invalidated + 1
+            );
             let task = engine.paused.as_ref().unwrap();
             let fresh = engine.evaluator.initialize(&task.work).unwrap();
             let live = task.value.as_ref().unwrap();
@@ -1163,6 +1207,13 @@ mod tests {
             report = engine
                 .resume(position, &token, limits(interval), &cancel)
                 .unwrap();
+            let after = engine.paused_stack_snapshot().unwrap();
+            assert_eq!(after.tokens_resumed, snapshot.tokens_resumed + 1);
+            assert_eq!(after.tokens_invalidated, snapshot.tokens_invalidated);
+            assert_eq!(
+                after.event_sequence,
+                snapshot.event_sequence + 1 + u64::from(after.tokens_retained)
+            );
         }
         panic!("finite fixture did not complete within its declared call bound");
     }
@@ -1219,12 +1270,25 @@ mod tests {
         unchanged.history = engine.history.clone();
         assert!(engine.token_is_current(&token));
         assert!(engine.supports_paused_stack_discard());
+        let before_discard = engine.paused_stack_snapshot().unwrap();
         assert!(engine.discard_paused_stack());
+        let discarded = engine.paused_stack_snapshot().unwrap();
+        assert!(discarded.complete);
+        assert_eq!(
+            discarded.tokens_invalidated,
+            before_discard.tokens_invalidated + 1
+        );
+        assert_eq!(discarded.event_sequence, before_discard.event_sequence + 1);
+        assert_eq!(discarded.tokens_retained, 0);
+        assert_eq!(discarded.bytes_current, 0);
+        assert_eq!(discarded.bytes_peak, before_discard.bytes_peak);
+        assert!(!discarded.owner_released && !discarded.admission_closed);
         assert!(!engine.token_is_current(&token));
         assert!(engine.paused_stack_bytes().is_none());
         assert_eq!(engine.last_attempt_work(), work);
         compare_tt_and_history(&engine, &unchanged);
         assert!(!engine.discard_paused_stack());
+        assert_eq!(discarded, engine.paused_stack_snapshot().unwrap());
         assert_eq!(engine.last_attempt_work(), work);
         compare_tt_and_history(&engine, &unchanged);
         assert!(matches!(
@@ -1232,6 +1296,71 @@ mod tests {
             Err(CpuError::ResumeMismatch(_))
         ));
         assert_eq!(engine.last_attempt_work().unwrap().nodes, 0);
+        let rejected = engine.paused_stack_snapshot().unwrap();
+        assert_eq!(
+            rejected.stale_context_attempts,
+            discarded.stale_context_attempts + 1
+        );
+        assert_eq!(
+            rejected.stale_context_rejections,
+            discarded.stale_context_rejections + 1
+        );
+        assert_eq!(rejected.event_sequence, discarded.event_sequence + 1);
+    }
+
+    #[test]
+    fn paused_owner_lifetime_survives_new_game_and_counter_overflow_is_unknown() {
+        let position = Position::startpos();
+        let cancel = AtomicBool::new(false);
+        let mut engine = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+        let initial = engine.paused_stack_snapshot().unwrap();
+        assert!(initial.complete && initial.owner_id != 0);
+        assert_eq!(initial.event_sequence, 0);
+        assert_eq!(initial.tokens_peak, 0);
+        assert_eq!(initial.bytes_peak, 0);
+        assert_eq!(initial, engine.paused_stack_snapshot().unwrap());
+        let foreign = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+        assert_ne!(
+            initial.owner_id,
+            foreign.paused_stack_snapshot().unwrap().owner_id
+        );
+        engine.analyze(&position, limits(1), &cancel).unwrap();
+        let paused = engine.paused_stack_snapshot().unwrap();
+        assert_eq!(paused.tokens_created, 1);
+        engine.clear();
+        let reset = engine.paused_stack_snapshot().unwrap();
+        assert_eq!(reset.owner_id, initial.owner_id);
+        assert_eq!(reset.tokens_created, 1);
+        assert_eq!(reset.tokens_invalidated, 1);
+        assert_eq!(reset.event_sequence, paused.event_sequence + 1);
+        assert_eq!(reset.bytes_peak, paused.bytes_peak);
+        assert!(reset.complete);
+        assert!(engine.last_attempt_work().is_none());
+        engine.clear();
+        assert_eq!(reset, engine.paused_stack_snapshot().unwrap());
+
+        // Exhaust the local sequence without mutating the process allocator or
+        // another owner. Real create/discard continue, but release stays unknown.
+        engine
+            .paused_stack_telemetry
+            .as_mut()
+            .unwrap()
+            .event_sequence = u64::MAX;
+        let report = engine.analyze(&position, limits(1), &cancel).unwrap();
+        assert_eq!(report.nodes, 1);
+        let overflow = engine.paused_stack_snapshot().unwrap();
+        assert!(!overflow.complete);
+        assert_eq!(overflow.event_sequence, u64::MAX);
+        assert_eq!(overflow.tokens_created, 2);
+        assert_eq!(overflow.tokens_retained, 1);
+        assert!(engine.discard_paused_stack());
+        let released_frames = engine.paused_stack_snapshot().unwrap();
+        assert_eq!(released_frames.owner_id, initial.owner_id);
+        assert_eq!(released_frames.tokens_invalidated, 2);
+        assert_eq!(released_frames.tokens_retained, 0);
+        assert_eq!(released_frames.bytes_current, 0);
+        assert!(!released_frames.complete);
+        assert!(!released_frames.owner_released);
     }
 
     #[test]
@@ -1523,9 +1652,11 @@ mod tests {
             .unwrap();
         assert!(token.is_paused_stack());
         assert!(engine.token_is_current(&token));
+        let observed_owner = engine.paused_stack_snapshot().unwrap();
         let observed_work = engine.last_attempt_work();
         assert!(engine.token_is_current(&token));
         assert_eq!(engine.last_attempt_work(), observed_work);
+        assert_eq!(observed_owner, engine.paused_stack_snapshot().unwrap());
         let mut malformed = token.clone();
         malformed.pv.clear();
         assert!(!engine.token_is_current(&malformed));
@@ -1567,6 +1698,18 @@ mod tests {
             foreign.resume(&position, &token, limits(1), &AtomicBool::new(false)),
             Err(CpuError::ResumeMismatch(_))
         ));
+        let rejected = engine.paused_stack_snapshot().unwrap();
+        assert_eq!(rejected.tokens_created, 1);
+        assert_eq!(rejected.tokens_retained, 1);
+        assert_eq!(rejected.tokens_resumed, 0);
+        assert_eq!(rejected.tokens_invalidated, 0);
+        assert_eq!(rejected.stale_context_attempts, 5);
+        assert_eq!(rejected.stale_context_rejections, 5);
+        let foreign_owner = foreign.paused_stack_snapshot().unwrap();
+        assert_ne!(foreign_owner.owner_id, rejected.owner_id);
+        assert_eq!(foreign_owner.tokens_created, 0);
+        assert_eq!(foreign_owner.stale_context_attempts, 1);
+        assert_eq!(foreign_owner.stale_context_rejections, 1);
         assert_eq!(engine.last_attempt_work(), Some(CpuWork::default()));
         let next = engine
             .resume(&position, &token, limits(1), &AtomicBool::new(false))
@@ -1585,6 +1728,16 @@ mod tests {
             engine.resume(&position, &next, limits(1), &AtomicBool::new(false)),
             Err(CpuError::ResumeMismatch(_))
         ));
+        let final_owner = engine.paused_stack_snapshot().unwrap();
+        assert!(final_owner.complete);
+        assert_eq!(final_owner.owner_id, observed_owner.owner_id);
+        assert_eq!(final_owner.tokens_created, 2);
+        assert_eq!(final_owner.tokens_resumed, 1);
+        assert_eq!(final_owner.tokens_invalidated, 1);
+        assert_eq!(final_owner.tokens_retained, 0);
+        assert_eq!(final_owner.stale_context_attempts, 7);
+        assert_eq!(final_owner.stale_context_rejections, 7);
+        assert_eq!(final_owner.replayed_consumed_work, 0);
     }
 
     #[test]
@@ -1604,6 +1757,13 @@ mod tests {
         assert_eq!(canceled.nodes, 0);
         assert!(canceled.resume.is_none() && engine.paused.is_none());
         assert!(!engine.token_is_current(&token));
+        let canceled_owner = engine.paused_stack_snapshot().unwrap();
+        assert!(canceled_owner.complete);
+        assert_eq!(canceled_owner.tokens_created, 1);
+        assert_eq!(canceled_owner.tokens_resumed, 1);
+        assert_eq!(canceled_owner.tokens_invalidated, 0);
+        assert_eq!(canceled_owner.tokens_retained, 0);
+        assert_eq!(canceled_owner.bytes_current, 0);
         assert!(matches!(
             engine.resume(&position, &token, limits(1), &cancel),
             Err(CpuError::ResumeMismatch(_))
@@ -1632,6 +1792,15 @@ mod tests {
         ));
         assert!(engine.paused.is_none());
         assert_eq!(engine.last_attempt_work(), Some(CpuWork::default()));
+        let final_owner = engine.paused_stack_snapshot().unwrap();
+        assert!(final_owner.complete);
+        assert_eq!(final_owner.owner_id, canceled_owner.owner_id);
+        assert_eq!(final_owner.tokens_created, 3);
+        assert_eq!(final_owner.tokens_resumed, 1);
+        assert_eq!(final_owner.tokens_invalidated, 2);
+        assert_eq!(final_owner.tokens_retained, 0);
+        assert_eq!(final_owner.stale_context_attempts, 3);
+        assert_eq!(final_owner.stale_context_rejections, 3);
     }
 
     #[test]

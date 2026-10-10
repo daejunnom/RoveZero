@@ -20,10 +20,11 @@ use rz_position::{
     BoardMove, Color, PieceKind, PlayStatus, Position, PositionError, PositionIdentity, Square,
     TerminalReason,
 };
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub const CPU_SEARCH_VERSION: &str = "rz-cpu-pvs/0.1";
@@ -31,6 +32,9 @@ pub const CPU_SEE_SEARCH_VERSION: &str = "rz-cpu-pvs-legal-see/0.1";
 pub const CPU_PAUSED_STACK_SEARCH_VERSION: &str = "rz-cpu-pvs-paused-stack/0.1";
 pub const CPU_PAUSED_STACK_SEE_SEARCH_VERSION: &str = "rz-cpu-pvs-legal-see-paused-stack/0.1";
 pub const CPU_PAUSED_STACK_MAX_BYTES: usize = 8 * 1024 * 1024;
+pub const CPU_PAUSED_STACK_OWNER_ACCOUNTING_DOMAIN: &str =
+    "rz-pals-paused-stack-owner-accounting-v4/1";
+pub const CPU_PAUSED_STACK_OWNER_ACCOUNTING_METHOD: &str = "cpu_actual_paused_frame_owner_v4";
 pub const CPU_SEARCH_CONDITIONS: &str = "iterative-deepening:1..requested;root-window:full-first,aspiration40-following,full-when-mate-or-fail-inclusive;pvs:first-full,following-zero-window,strict-interior-research;qsearch:tactical-capture-ep-promotion,all-check-evasions,no-check-standpat;q-limit:checked-abort;tt:direct-mapped,full-history-value-profile,equal-remaining-depth,completed-nodes-only;selectivity:no-reductions-no-nullmove;ties:Rules-order;score:side-to-move-raw";
 pub const BOOTSTRAP_SCORE_VERSION: &str = "bootstrap-material-pst-v1";
 pub const CPU_MATE_SCORE: i32 = 30_000;
@@ -45,6 +49,28 @@ const MAX_ROOT_MOVES: usize = 256;
 const MAX_KNOWN_HISTORY: usize = 4096;
 const ASPIRATION_WINDOW: i32 = 40;
 const MAX_SEE_POSITIONS_PER_ORDER: u32 = 4096;
+static NEXT_PAUSED_STACK_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Compiled owner provenance, independent of token metadata and observations.
+/// Domain followed by each logical path and raw source in this fixed order;
+/// every item is prefixed by its byte length as a big-endian u64. Changes to
+/// these included sources change the pin; it is not a binary/feature identity.
+pub fn compiled_paused_stack_owner_sha256() -> [u8; 32] {
+    let mut hash = Sha256::new();
+    for bytes in [
+        CPU_PAUSED_STACK_OWNER_ACCOUNTING_DOMAIN.as_bytes(),
+        b"cpu.rs".as_slice(),
+        include_bytes!("cpu.rs").as_slice(),
+        b"cpu/stack.rs".as_slice(),
+        include_bytes!("cpu/stack.rs").as_slice(),
+        b"cpu_checker.rs".as_slice(),
+        include_bytes!("cpu_checker.rs").as_slice(),
+    ] {
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+    hash.finalize().into()
+}
 
 /// Ordering is immutable for the lifetime of one engine and its private TT.
 /// Existing constructors retain the historical MVV/LVA policy and namespace.
@@ -231,6 +257,108 @@ pub struct CpuWork {
     pub tt_hits: u64,
 }
 
+/// Actual PausedStack owner facts, accumulated from construction until owner
+/// destruction. Consumers copy the latest snapshot rather than summing it.
+/// New-game resets do not reset the owner ID, event sequence or totals. A bare
+/// CpuEngine cannot prove terminal admission closure or final owner release.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CpuPausedStackSnapshot {
+    pub owner_id: u64,
+    pub event_sequence: u64,
+    pub tokens_created: u64,
+    pub tokens_resumed: u64,
+    pub tokens_invalidated: u64,
+    pub tokens_retained: u32,
+    pub tokens_peak: u32,
+    pub bytes_current: u64,
+    pub bytes_peak: u64,
+    pub stale_context_attempts: u64,
+    pub stale_context_rejections: u64,
+    /// Previously consumed nodes present in a resumed invocation's initial
+    /// actual work counters. These counters start empty in the owned machine;
+    /// retained cumulative diagnostics are never installed into Control.
+    pub replayed_consumed_work: u64,
+    pub admission_closed: bool,
+    pub owner_released: bool,
+    /// False after any owner-ID/counter overflow or failed ownership invariant.
+    /// Partial facts remain available, but cannot authorize known release.
+    pub complete: bool,
+}
+
+impl CpuPausedStackSnapshot {
+    fn new() -> Self {
+        // Exhaustion stays unknown; never wrap or reuse an issued owner ID.
+        let owner_id = NEXT_PAUSED_STACK_OWNER_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .unwrap_or(0);
+        Self {
+            owner_id,
+            event_sequence: 0,
+            tokens_created: 0,
+            tokens_resumed: 0,
+            tokens_invalidated: 0,
+            tokens_retained: 0,
+            tokens_peak: 0,
+            bytes_current: 0,
+            bytes_peak: 0,
+            stale_context_attempts: 0,
+            stale_context_rejections: 0,
+            replayed_consumed_work: 0,
+            admission_closed: false,
+            owner_released: false,
+            complete: owner_id != 0,
+        }
+    }
+
+    fn add(counter: &mut u64, amount: u64, complete: &mut bool) {
+        if let Some(next) = counter.checked_add(amount) {
+            *counter = next;
+        } else {
+            *complete = false;
+        }
+    }
+
+    fn event(&mut self) {
+        Self::add(&mut self.event_sequence, 1, &mut self.complete);
+    }
+
+    fn created(&mut self, bytes: usize) {
+        self.event();
+        Self::add(&mut self.tokens_created, 1, &mut self.complete);
+        self.tokens_peak = self.tokens_peak.max(1);
+        match u64::try_from(bytes) {
+            Ok(bytes) => self.bytes_peak = self.bytes_peak.max(bytes),
+            Err(_) => self.complete = false,
+        }
+    }
+
+    fn resumed(&mut self) {
+        self.event();
+        Self::add(&mut self.tokens_resumed, 1, &mut self.complete);
+    }
+
+    fn invalidated(&mut self) {
+        self.event();
+        Self::add(&mut self.tokens_invalidated, 1, &mut self.complete);
+    }
+
+    fn rejected_context(&mut self) {
+        self.event();
+        Self::add(&mut self.stale_context_attempts, 1, &mut self.complete);
+        Self::add(&mut self.stale_context_rejections, 1, &mut self.complete);
+    }
+
+    fn resumed_initial_work(&mut self, work: CpuWork) {
+        Self::add(
+            &mut self.replayed_consumed_work,
+            work.nodes,
+            &mut self.complete,
+        );
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CpuResumeToken {
     root: PositionIdentity,
@@ -348,6 +476,7 @@ pub struct CpuEngine {
     paused: Option<stack::PausedTask>,
     stack_owner: Arc<()>,
     stack_serial: u64,
+    paused_stack_telemetry: Option<CpuPausedStackSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -379,6 +508,11 @@ pub trait CpuSearcher: Send {
     /// Retained traversal bytes, excluding the already configured TT/history
     /// owner. None means there is no live paused traversal.
     fn paused_stack_bytes(&self) -> Option<usize> {
+        None
+    }
+    /// None means this implementation does not observe an actual PausedStack
+    /// owner. Queries neither consume a token nor create an accounting event.
+    fn paused_stack_snapshot(&self) -> Option<CpuPausedStackSnapshot> {
         None
     }
     /// Read-only ownership query, without executing or charging work. For a
@@ -462,6 +596,9 @@ impl<C: CpuSearcher + ?Sized> CpuSearcher for Box<C> {
     fn paused_stack_bytes(&self) -> Option<usize> {
         (**self).paused_stack_bytes()
     }
+    fn paused_stack_snapshot(&self) -> Option<CpuPausedStackSnapshot> {
+        (**self).paused_stack_snapshot()
+    }
     fn token_is_current(&self, token: &CpuResumeToken) -> bool {
         (**self).token_is_current(token)
     }
@@ -543,6 +680,9 @@ impl CpuSearcher for CpuEngine {
     }
     fn paused_stack_bytes(&self) -> Option<usize> {
         CpuEngine::paused_stack_bytes(self)
+    }
+    fn paused_stack_snapshot(&self) -> Option<CpuPausedStackSnapshot> {
+        CpuEngine::paused_stack_snapshot(self)
     }
     fn token_is_current(&self, token: &CpuResumeToken) -> bool {
         CpuEngine::token_is_current(self, token)
@@ -700,6 +840,8 @@ impl CpuEngine {
             paused: None,
             stack_owner: Arc::new(()),
             stack_serial: 0,
+            paused_stack_telemetry: (resume_policy == CpuResumePolicy::PausedStack)
+                .then(CpuPausedStackSnapshot::new),
         })
     }
 
@@ -734,6 +876,35 @@ impl CpuEngine {
 
     pub fn paused_stack_bytes(&self) -> Option<usize> {
         self.paused.as_ref().map(|task| task.retained_bytes())
+    }
+
+    /// Read actual frame retention and lifetime totals without changing them.
+    /// Historical token bytes and completed iteration handles are not owners.
+    pub fn paused_stack_snapshot(&self) -> Option<CpuPausedStackSnapshot> {
+        let mut snapshot = self.paused_stack_telemetry?;
+        snapshot.tokens_retained = u32::from(self.paused.is_some());
+        snapshot.bytes_current = match self.paused_stack_bytes() {
+            Some(bytes) => match u64::try_from(bytes) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    snapshot.complete = false;
+                    0
+                }
+            },
+            None => 0,
+        };
+        snapshot.complete &= snapshot.owner_id != 0
+            && snapshot.bytes_current <= CPU_PAUSED_STACK_MAX_BYTES as u64
+            && snapshot
+                .tokens_resumed
+                .checked_add(snapshot.tokens_invalidated)
+                .and_then(|consumed| consumed.checked_add(u64::from(snapshot.tokens_retained)))
+                == Some(snapshot.tokens_created);
+        // Terminal closure belongs to the owning checker bridge, not an idle
+        // synchronous engine or a Node/Task lifecycle projection.
+        snapshot.admission_closed = false;
+        snapshot.owner_released = false;
+        Some(snapshot)
     }
 
     /// Paused tokens require the one live engine-owned traversal. Historical
@@ -808,11 +979,43 @@ impl CpuEngine {
     }
 
     fn invalidate_paused_stack(&mut self) {
-        self.paused = None;
+        if self.paused.take().is_some()
+            && let Some(telemetry) = self.paused_stack_telemetry.as_mut()
+        {
+            telemetry.invalidated();
+        }
         // Tokens retain their old Arc; a fresh allocation cannot share its
         // identity while an old token remains alive.
         self.stack_owner = Arc::new(());
         self.stack_serial = 0;
+    }
+
+    fn observe_paused_stack_created(&mut self) {
+        if let Some(task) = self.paused.as_ref()
+            && let Some(telemetry) = self.paused_stack_telemetry.as_mut()
+        {
+            telemetry.created(task.retained_bytes());
+        }
+    }
+
+    fn observe_paused_stack_resumed(&mut self) {
+        if let Some(telemetry) = self.paused_stack_telemetry.as_mut() {
+            telemetry.resumed();
+        }
+    }
+
+    fn observe_paused_stack_rejection(&mut self, resume: Option<&CpuResumeToken>) {
+        if resume.is_some_and(CpuResumeToken::is_paused_stack)
+            && let Some(telemetry) = self.paused_stack_telemetry.as_mut()
+        {
+            telemetry.rejected_context();
+        }
+    }
+
+    fn observe_paused_stack_initial_work(&mut self, work: CpuWork) {
+        if let Some(telemetry) = self.paused_stack_telemetry.as_mut() {
+            telemetry.resumed_initial_work(work);
+        }
     }
 
     pub fn analyze(
@@ -1674,6 +1877,32 @@ pub fn evaluate_bootstrap(position: &Position) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_iteration_has_no_paused_owner_snapshot_through_boxed_boundary() {
+        let mut engine: Box<dyn CpuSearcher> = Box::new(
+            CpuEngine::new(CpuConfig {
+                tt_entries: 0,
+                ..CpuConfig::default()
+            })
+            .unwrap(),
+        );
+        assert_eq!(engine.resume_policy(), CpuResumePolicy::CompletedIteration);
+        assert_eq!(engine.paused_stack_snapshot(), None);
+        engine
+            .analyze(
+                &Position::startpos(),
+                CpuLimits {
+                    max_depth: 1,
+                    max_nodes: 1,
+                    deadline: None,
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        engine.clear();
+        assert_eq!(engine.paused_stack_snapshot(), None);
+    }
 
     fn engine() -> CpuEngine {
         CpuEngine::new(CpuConfig {

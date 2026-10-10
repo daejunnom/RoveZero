@@ -3,7 +3,8 @@
 //! 평가 단위, 실제 옵션 적용의 증거로 승격하지 않는다.
 
 use crate::cpu::{
-    CpuCapabilities, CpuConfig, CpuError, CpuLimits, CpuReport, CpuResumeToken, CpuSearcher,
+    CpuCapabilities, CpuConfig, CpuError, CpuLimits, CpuPausedStackSnapshot, CpuReport,
+    CpuResumePolicy, CpuResumeToken, CpuSearcher,
 };
 use crate::cpu_value::{CpuTrainingState, CpuValueIdentity};
 use rz_position::{BoardMove, Color, Position};
@@ -406,6 +407,11 @@ pub trait CpuChecker: Send {
     fn owned_resume_policy(&self) -> Option<crate::cpu::CpuResumePolicy> {
         None
     }
+    /// Actual native PausedStack owner facts. External/unsupported owners
+    /// remain unknown; Node/Task retirement is not an owner observation.
+    fn paused_stack_snapshot(&self) -> Option<CpuPausedStackSnapshot> {
+        None
+    }
     /// Read-only liveness check. This cannot resume, consume, recharge or pin a
     /// foreign/native token merely because its metadata has a similar shape.
     fn token_is_current(&self, _token: &CpuResumeToken) -> bool {
@@ -501,6 +507,7 @@ pub struct OwnedCpuChecker<C: CpuSearcher> {
     capabilities: CheckerCapabilities,
     last_attempt: Option<CheckerAttempt>,
     closed: bool,
+    paused_stack_shutdown_complete: bool,
 }
 
 impl<C: CpuSearcher> OwnedCpuChecker<C> {
@@ -548,6 +555,7 @@ impl<C: CpuSearcher> OwnedCpuChecker<C> {
             capabilities,
             last_attempt: None,
             closed: false,
+            paused_stack_shutdown_complete: false,
         })
     }
 
@@ -653,6 +661,19 @@ impl<C: CpuSearcher> CpuChecker for OwnedCpuChecker<C> {
     fn owned_resume_policy(&self) -> Option<crate::cpu::CpuResumePolicy> {
         Some(self.cpu.resume_policy())
     }
+    fn paused_stack_snapshot(&self) -> Option<CpuPausedStackSnapshot> {
+        if self.cpu.resume_policy() != CpuResumePolicy::PausedStack {
+            return None;
+        }
+        let mut snapshot = self.cpu.paused_stack_snapshot()?;
+        snapshot.admission_closed = self.closed;
+        snapshot.owner_released = self.closed
+            && self.paused_stack_shutdown_complete
+            && snapshot.complete
+            && snapshot.tokens_retained == 0
+            && snapshot.bytes_current == 0;
+        Some(snapshot)
+    }
     fn token_is_current(&self, token: &CpuResumeToken) -> bool {
         self.cpu.token_is_current(token)
     }
@@ -745,6 +766,34 @@ impl<C: CpuSearcher> CpuChecker for OwnedCpuChecker<C> {
         // No asynchronous CPU work can survive the preceding synchronous call.
         // Closing is idempotent and requires no subprocess wait or extra budget.
         self.closed = true;
+        if self.cpu.resume_policy() == CpuResumePolicy::PausedStack {
+            self.paused_stack_shutdown_complete = false;
+            if !self.cpu.supports_paused_stack_discard() {
+                return Err(CheckerError::Unsupported("paused stack shutdown discard"));
+            }
+            // Close admission before dropping only the actual retained frames;
+            // TT/history and the last measured attempt are intentionally kept.
+            self.cpu.discard_paused_stack();
+            match self.cpu.paused_stack_snapshot() {
+                Some(snapshot)
+                    if snapshot.complete
+                        && snapshot.tokens_retained == 0
+                        && snapshot.bytes_current == 0 =>
+                {
+                    self.paused_stack_shutdown_complete = true;
+                }
+                Some(_) => {
+                    return Err(CheckerError::Invalid(
+                        "paused stack shutdown ownership is retained or incomplete",
+                    ));
+                }
+                None => {
+                    return Err(CheckerError::Unsupported(
+                        "paused stack shutdown owner observation",
+                    ));
+                }
+            }
+        }
         Ok(CheckerShutdown::owned_no_process())
     }
 }
@@ -809,6 +858,9 @@ mod tests {
         fn capabilities(&self) -> CpuCapabilities {
             self.cpu.capabilities()
         }
+        fn resume_policy(&self) -> CpuResumePolicy {
+            self.cpu.resume_policy()
+        }
         fn clear(&mut self) {
             self.clears.fetch_add(1, Ordering::Relaxed);
             self.cpu.clear();
@@ -838,6 +890,7 @@ mod tests {
             .unwrap(),
         );
         let descriptor = checker.owned_descriptor().unwrap();
+        assert_eq!(checker.paused_stack_snapshot(), None);
         assert_eq!(descriptor.config.tt_entries, 0);
         assert_eq!(descriptor.search_conditions, checker.conditions());
         assert_eq!(
@@ -857,6 +910,7 @@ mod tests {
         assert_eq!(checker.last_attempt().unwrap().work, CheckerWork::default());
         let shutdown = checker.shutdown(Instant::now()).unwrap();
         assert!(shutdown.cleanup_complete);
+        assert_eq!(checker.paused_stack_snapshot(), None);
         assert!(!shutdown.exit_observed);
         assert!(!shutdown.stdout_drained);
         assert_eq!(shutdown.exit_code, None);
@@ -907,6 +961,192 @@ mod tests {
             )
             .unwrap();
         assert_eq!(clears.load(Ordering::Relaxed), 1);
+    }
+
+    fn paused_cpu() -> CpuEngine {
+        CpuEngine::with_resume_policy(
+            CpuConfig {
+                max_depth: 2,
+                tt_entries: 0,
+                ..CpuConfig::default()
+            },
+            CpuResumePolicy::PausedStack,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn owned_paused_shutdown_proves_closed_release_without_resetting_work_or_lifetime() {
+        let cpu: Box<dyn CpuSearcher> = Box::new(paused_cpu());
+        let mut checker = OwnedCpuChecker::new(cpu).unwrap();
+        let position = Position::startpos();
+        let cancel = AtomicBool::new(false);
+        let limits = CpuLimits {
+            max_depth: 2,
+            max_nodes: 1,
+            deadline: None,
+        };
+        let initial = checker.paused_stack_snapshot().unwrap();
+        assert!(initial.complete);
+        assert!(!initial.admission_closed && !initial.owner_released);
+        assert_eq!(initial, checker.paused_stack_snapshot().unwrap());
+        checker.analyze(&position, limits, &cancel).unwrap();
+        let before_new_game = checker.paused_stack_snapshot().unwrap();
+        assert_eq!(before_new_game.tokens_retained, 1);
+        assert!(!before_new_game.owner_released);
+        checker
+            .new_game(Instant::now() + Duration::from_secs(1), &cancel)
+            .unwrap();
+        let after_new_game = checker.paused_stack_snapshot().unwrap();
+        assert_eq!(after_new_game.owner_id, initial.owner_id);
+        assert_eq!(after_new_game.tokens_created, 1);
+        assert_eq!(after_new_game.tokens_invalidated, 1);
+        assert_eq!(after_new_game.bytes_peak, before_new_game.bytes_peak);
+        assert!(after_new_game.complete);
+        assert_eq!(after_new_game.tokens_retained, 0);
+        assert!(checker.cpu.last_attempt_work().is_none());
+        assert!(checker.last_attempt().is_none());
+
+        let CheckerReport::Owned(partial) = checker.analyze(&position, limits, &cancel).unwrap()
+        else {
+            panic!("own paused checker returned foreign report");
+        };
+        let token = partial.resume.unwrap();
+        let work = checker.cpu.last_attempt_work();
+        let attempt = checker.last_attempt().unwrap().clone();
+        let before_shutdown = checker.paused_stack_snapshot().unwrap();
+        assert_eq!(before_shutdown.tokens_created, 2);
+        assert_eq!(before_shutdown.tokens_retained, 1);
+        assert!(token.paused_stack_bytes().unwrap() > 0);
+        let shutdown = checker.shutdown(Instant::now()).unwrap();
+        assert!(shutdown.cleanup_complete);
+        assert!(!shutdown.exit_observed && !shutdown.stdout_drained);
+        let final_owner = checker.paused_stack_snapshot().unwrap();
+        assert!(final_owner.complete && final_owner.admission_closed && final_owner.owner_released);
+        assert_eq!(final_owner.owner_id, initial.owner_id);
+        assert_eq!(final_owner.tokens_invalidated, 2);
+        assert_eq!(final_owner.tokens_retained, 0);
+        assert_eq!(final_owner.bytes_current, 0);
+        assert_eq!(
+            final_owner.event_sequence,
+            before_shutdown.event_sequence + 1
+        );
+        assert_eq!(checker.cpu.last_attempt_work(), work);
+        assert_eq!(checker.last_attempt().unwrap().work, attempt.work);
+        assert_eq!(checker.last_attempt().unwrap().elapsed, attempt.elapsed);
+        assert!(!checker.token_is_current(&token));
+        // Cloned/historical metadata remains diagnostic, never current bytes.
+        assert!(token.paused_stack_bytes().unwrap() > 0);
+        assert!(!checker.cpu.paused_stack_snapshot().unwrap().owner_released);
+        assert!(checker.shutdown(Instant::now()).unwrap().cleanup_complete);
+        assert_eq!(final_owner, checker.paused_stack_snapshot().unwrap());
+        assert!(matches!(
+            checker.analyze(&position, limits, &cancel),
+            Err(CheckerError::Invalid("owned checker has shut down"))
+        ));
+        assert_eq!(final_owner, checker.paused_stack_snapshot().unwrap());
+    }
+
+    struct UndiscardedOwner(CpuEngine, bool);
+    impl CpuSearcher for UndiscardedOwner {
+        fn config(&self) -> &CpuConfig {
+            self.0.config()
+        }
+        fn value_identity(&self) -> &CpuValueIdentity {
+            self.0.value_identity()
+        }
+        fn search_identity(&self) -> &'static str {
+            self.0.search_identity()
+        }
+        fn search_conditions(&self) -> String {
+            self.0.search_conditions()
+        }
+        fn capabilities(&self) -> CpuCapabilities {
+            self.0.capabilities()
+        }
+        fn resume_policy(&self) -> CpuResumePolicy {
+            self.0.resume_policy()
+        }
+        fn paused_stack_snapshot(&self) -> Option<CpuPausedStackSnapshot> {
+            let mut snapshot = self.0.paused_stack_snapshot()?;
+            if self.1 {
+                snapshot.complete = false;
+            }
+            Some(snapshot)
+        }
+        fn supports_paused_stack_discard(&self) -> bool {
+            true
+        }
+        // Deliberately dishonest capability: the default discard drops nothing.
+        fn clear(&mut self) {
+            self.0.clear();
+        }
+        fn analyze(
+            &mut self,
+            p: &Position,
+            l: CpuLimits,
+            c: &AtomicBool,
+        ) -> Result<CpuReport, CpuError> {
+            self.0.analyze(p, l, c)
+        }
+    }
+
+    #[test]
+    fn unknown_or_undiscarded_custom_paused_owner_cannot_claim_shutdown_release() {
+        let mut unknown = OwnedCpuChecker::new(UnknownWork {
+            cpu: paused_cpu(),
+            clears: Arc::new(AtomicUsize::new(0)),
+        })
+        .unwrap();
+        assert_eq!(unknown.paused_stack_snapshot(), None);
+        assert!(matches!(
+            unknown.shutdown(Instant::now()),
+            Err(CheckerError::Unsupported("paused stack shutdown discard"))
+        ));
+        assert_eq!(unknown.paused_stack_snapshot(), None);
+
+        let mut retained = OwnedCpuChecker::new(UndiscardedOwner(paused_cpu(), false)).unwrap();
+        retained
+            .analyze(
+                &Position::startpos(),
+                CpuLimits {
+                    max_depth: 2,
+                    max_nodes: 1,
+                    deadline: None,
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(matches!(
+            retained.shutdown(Instant::now()),
+            Err(CheckerError::Invalid(
+                "paused stack shutdown ownership is retained or incomplete"
+            ))
+        ));
+        let snapshot = retained.paused_stack_snapshot().unwrap();
+        assert!(snapshot.complete && snapshot.admission_closed);
+        assert!(!snapshot.owner_released);
+        assert_eq!(snapshot.tokens_retained, 1);
+        assert!(snapshot.bytes_current > 0);
+        assert_eq!(snapshot.tokens_invalidated, 0);
+
+        // Empty retention alone is insufficient when actual observation is
+        // incomplete. A later successful verified fence can disclose release.
+        assert!(retained.cpu.0.discard_paused_stack());
+        retained.cpu.1 = true;
+        assert!(matches!(
+            retained.shutdown(Instant::now()),
+            Err(CheckerError::Invalid(
+                "paused stack shutdown ownership is retained or incomplete"
+            ))
+        ));
+        let incomplete = retained.paused_stack_snapshot().unwrap();
+        assert_eq!(incomplete.tokens_retained, 0);
+        assert_eq!(incomplete.bytes_current, 0);
+        assert!(!incomplete.complete && !incomplete.owner_released);
+        retained.cpu.1 = false;
+        assert!(retained.shutdown(Instant::now()).unwrap().cleanup_complete);
+        assert!(retained.paused_stack_snapshot().unwrap().owner_released);
     }
 
     fn external() -> ExternalCheckerIdentity {
