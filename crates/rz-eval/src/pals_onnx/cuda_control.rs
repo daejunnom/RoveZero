@@ -1013,20 +1013,24 @@ impl PlacementLog {
         }
     }
     /// Observation bytes only. This does not admit any graph or native Session.
+    #[cfg(feature = "experimental-io-binding")]
     pub(super) fn bounded_lines(&self) -> Result<&[String], BackendError> {
         if self.overflow {
             return Err(policy_error("PALS placement collector overflowed"));
         }
         Ok(&self.lines)
     }
+    #[cfg(feature = "experimental-io-binding")]
     pub(super) fn has_transfer_lines(&self) -> bool {
         !self.transfer_lines.is_empty()
     }
     /// Bounded diagnostic prefix; callers must retain the overflow flag.
     /// These bytes alone never authorize initialized placement.
+    #[cfg(feature = "experimental-io-binding")]
     pub(super) fn diagnostic_lines(&self) -> &[String] {
         &self.lines
     }
+    #[cfg(feature = "experimental-io-binding")]
     pub(super) fn overflowed(&self) -> bool {
         self.overflow
     }

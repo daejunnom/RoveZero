@@ -591,7 +591,7 @@ impl PalsArenaLaunchV4 {
             "new PALS execution/Core requires the registered clock+reap-status patch and actual runner binary; legacy evidence is preserved without promotion",
         )
     }
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(target_os = "linux")]
     fn require_actual_native_epoch(&self) -> Result<(), ArenaError> {
         for (engine, recipe) in self
             .semantic_lock
@@ -2418,7 +2418,7 @@ fn collect_process_work_with_audits(
     Ok(records)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn endpoint_shared_work_receipt(
     lock: &LockedPalsArenaLaunchV4,
     role: NativeEngineRole,
@@ -2869,7 +2869,7 @@ fn validate_work_records(
     })
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn project_core_pgn(
     lock: &LockedPalsArenaLaunchV4,
     native_artifact: &ArtifactRef,
