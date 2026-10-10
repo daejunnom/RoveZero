@@ -70,8 +70,13 @@ pub struct ArchiveOwnerSnapshot {
     pub ram_reclaim_events: u64,
     pub integrity_before_reclaim_events: u64,
     pub unverified_reclaim_events: u64,
+    /// Retained failed transaction file extent, including a renamed segment
+    /// whose later verification or quota scan failed. This is not RAM usage.
     pub pending_commit_bytes: Option<u64>,
+    /// Actual serialized RAM buffers retained by this manager after an operation.
+    /// The current synchronous writer retains none; hot source facts are separate.
     pub pending_buffers_retained: bool,
+    pub pending_files_retained: bool,
     pub global_managed_bytes: Option<u64>,
     pub global_scan_event_sequence: Option<u64>,
     pub global_scan_complete: bool,
@@ -361,6 +366,14 @@ pub(super) struct ArchiveManager {
     used: bool,
     telemetry: std::sync::Mutex<ArchiveOwnerSnapshot>,
     pending_cleanup: bool,
+    #[cfg(test)]
+    test_commit_fault: Option<TestCommitFault>,
+}
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum TestCommitFault {
+    PartialPayload(usize),
+    ExpirePostCommitScan,
 }
 fn add_counter(value: &mut u64, amount: u64, complete: &mut bool) {
     if let Some(next) = value.checked_add(amount) {
@@ -511,7 +524,7 @@ impl ArchiveManager {
                 ram_released_bytes: Some(0),
                 ram_release_method: ARCHIVE_CAPACITY_METHOD,
                 pending_commit_bytes: Some(0),
-                pending_buffers_retained: true,
+                pending_buffers_retained: false,
                 global_scope_kind: "canonical_no_link_managed_root",
                 cold_index_kind: "directory_scan",
                 load_pins_max: config.max_load_pins as u32,
@@ -539,6 +552,8 @@ impl ArchiveManager {
             runtime_limits: None,
             used: false,
             pending_cleanup: false,
+            #[cfg(test)]
+            test_commit_fault: None,
         })
     }
     fn note(&self, event: impl FnOnce(&mut ArchiveOwnerSnapshot)) {
@@ -584,11 +599,12 @@ impl ArchiveManager {
             self.failure(error);
         }
     }
-    fn finish_load<T>(
+    fn finish_read<T>(
         &self,
         before: ArchiveOwnerSnapshot,
         started: Instant,
         bytes: u64,
+        load: bool,
         result: &Result<T, StoreError>,
     ) {
         self.note(|meter| {
@@ -597,7 +613,7 @@ impl ArchiveManager {
             meter.load_elapsed_peak_ms = meter
                 .load_elapsed_peak_ms
                 .max(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-            if result.is_ok() {
+            if load && result.is_ok() {
                 add_counter(&mut meter.loads_completed, 1, &mut meter.complete);
             }
         });
@@ -621,6 +637,10 @@ impl ArchiveManager {
             && snapshot.pending_commit_bytes.is_some()
             && snapshot.ram_released_bytes.is_some()
             && snapshot.archive_write_bytes_total.is_some()
+            && snapshot.loaded_closure_bytes_peak.is_some()
+            && snapshot.loaded_closure_bytes_method.is_some()
+            && !snapshot.pending_files_retained
+            && !snapshot.pending_buffers_retained
             && snapshot.root_sha256.is_some()
             && snapshot.repository_sha256.is_some();
         snapshot
@@ -681,11 +701,13 @@ impl ArchiveManager {
             }
             Err(_) => {
                 meter.global_scan_complete = false;
+                meter.global_scan_after_last_commit = false;
             }
         });
         result
     }
     fn usage_inner(&self, budget: ArchiveIoBudget) -> Result<(u64, u64), StoreError> {
+        budget.check()?;
         let mut total = 0u64;
         let mut game = 0u64;
         for entry in
@@ -694,10 +716,13 @@ impl ArchiveManager {
             budget.check()?;
             let entry = entry.map_err(|e| io("global archive entry", e))?;
             let path = entry.path();
+            no_link(&path)?;
             if entry.file_name() == ".quota.lock" {
+                if !entry.file_type().map_err(|e| io("archive lock type", e))?.is_file() {
+                    return Err(StoreError::ArchiveIntegrity("archive quota lock type"));
+                }
                 continue;
             }
-            no_link(&path)?;
             if !entry
                 .file_type()
                 .map_err(|e| io("global archive type", e))?
@@ -726,6 +751,7 @@ impl ArchiveManager {
                 }
             }
         }
+        budget.check()?;
         Ok((game, total))
     }
     fn commit(
@@ -776,29 +802,21 @@ impl ArchiveManager {
             .record_bytes
             .min(remaining.saturating_sub(HEADER))
             .min(budget.max_bytes.saturating_sub(2 * HEADER) / 2);
-        let maximum = if let Some(limits) = self.runtime_limits {
+        let write_remaining = if let Some(limits) = self.runtime_limits {
             let used = self
                 .snapshot()
                 .archive_write_bytes_total
                 .ok_or(StoreError::ArchiveQuota("archive write extent unknown"))?;
-            maximum.min(
-                limits
-                    .game_bytes_max
-                    .saturating_sub(used)
-                    .saturating_sub(HEADER),
-            )
+            Some(limits.game_bytes_max.saturating_sub(used))
         } else {
-            maximum
+            None
         };
+        let maximum = maximum.min(write_remaining.map_or(u64::MAX, |bytes| bytes.saturating_sub(HEADER)));
         if maximum == 0 {
             return Err(
-                if remaining <= HEADER
-                    || self.runtime_limits.is_some_and(|limits| {
-                        self.snapshot()
-                            .archive_write_bytes_total
-                            .is_none_or(|used| limits.game_bytes_max.saturating_sub(used) <= HEADER)
-                    })
-                {
+                if write_remaining.is_some_and(|remaining| remaining <= HEADER) {
+                    StoreError::ArchiveQuota("archive lifetime write bytes")
+                } else if remaining <= HEADER {
                     StoreError::ArchiveQuota("archive disk bytes")
                 } else {
                     StoreError::ArchiveByteBudget
@@ -817,6 +835,10 @@ impl ArchiveManager {
                 .unwrap_or(StoreError::ArchiveIntegrity("archive encode"));
             return Err(
                 if error == StoreError::ArchiveByteBudget
+                    && write_remaining.is_some_and(|bytes| maximum == bytes.saturating_sub(HEADER))
+                {
+                    StoreError::ArchiveQuota("archive lifetime write bytes")
+                } else if error == StoreError::ArchiveByteBudget
                     && maximum == remaining.saturating_sub(HEADER)
                 {
                     StoreError::ArchiveQuota(
@@ -880,6 +902,7 @@ impl ArchiveManager {
             }
         };
         self.pending_cleanup = self.runtime_limits.is_some();
+        self.note(|meter| meter.global_scan_after_last_commit = false);
         let mut written = 0u64;
         let mut renamed = false;
         let result = (|| {
@@ -893,7 +916,16 @@ impl ArchiveManager {
                 .and_then(|_| output.write_all(&generation.to_le_bytes()))
                 .and_then(|_| output.write_all(&(bytes.len() as u64).to_le_bytes()))
                 .and_then(|_| output.write_all(&checksum))
-                .and_then(|_| output.write_all(&bytes))
+                .map_err(|e| io("archive header write", e))?;
+            #[cfg(test)]
+            if let Some(TestCommitFault::PartialPayload(count)) = self.test_commit_fault {
+                self.test_commit_fault = None;
+                output.write_all(&bytes[..count.min(bytes.len())])
+                    .map_err(|e| io("archive partial payload write", e))?;
+                return Err(io("injected archive partial write", std::io::Error::other("fixture")));
+            }
+            output
+                .write_all(&bytes)
                 .and_then(|_| output.inner.sync_all())
                 .map_err(|e| io("archive write and sync", e))?;
             budget.check()?;
@@ -921,7 +953,18 @@ impl ArchiveManager {
                 meter.last_verified_generation = Some(generation);
             });
             if self.runtime_limits.is_some() {
-                self.usage(*budget)?;
+                let post_commit_budget = *budget;
+                #[cfg(test)]
+                let post_commit_budget = if matches!(self.test_commit_fault, Some(TestCommitFault::ExpirePostCommitScan)) {
+                    self.test_commit_fault = None;
+                    ArchiveIoBudget { deadline: Instant::now(), ..post_commit_budget }
+                } else {
+                    post_commit_budget
+                };
+                let (game, global) = self.usage(post_commit_budget)?;
+                if game > self.config.game_bytes || global > self.config.global_bytes {
+                    return Err(StoreError::ArchiveQuota("post-commit managed archive bytes"));
+                }
             }
             Ok(())
         })();
@@ -947,9 +990,10 @@ impl ArchiveManager {
             });
             if result.is_ok() {
                 meter.pending_commit_bytes = Some(0);
+                meter.pending_files_retained = false;
             } else {
                 meter.pending_commit_bytes = actual;
-                meter.pending_buffers_retained = true;
+                meter.pending_files_retained = true;
             }
             if self.runtime_limits.is_some() && result.is_err() {
                 meter.admission_closed = true;
@@ -960,7 +1004,10 @@ impl ArchiveManager {
         }
         if self.runtime_limits.is_none() && result.is_err() && temporary.exists() {
             fs::remove_file(&temporary).map_err(|e| io("archive temporary cleanup", e))?;
-            self.note(|meter| meter.pending_commit_bytes = Some(0));
+            self.note(|meter| {
+                meter.pending_commit_bytes = Some(0);
+                meter.pending_files_retained = false;
+            });
         }
         result?;
         drop(lock);
@@ -1193,9 +1240,18 @@ impl PalsStores {
         let manager = self.archive.as_ref().ok_or(StoreError::ArchiveDisabled)?;
         let mut budget = manager.load_budget(*original)?;
         let initial = budget.max_bytes;
+        let started = Instant::now();
+        let baseline = manager.snapshot();
         manager.note(|_| {}); // Accepted explicit read scope; never getter work.
-        let result = operation(&mut budget);
-        original.max_bytes -= initial - budget.max_bytes;
+        let result = operation(&mut budget).and_then(|value| {
+            budget.check()?;
+            Ok(value)
+        });
+        let bytes = initial - budget.max_bytes;
+        original.max_bytes -= bytes;
+        // Directory/uniqueness scans consume the selected read allowance but
+        // do not invent a cold-handle load or an owner/generation check.
+        manager.finish_read(baseline, started, bytes, false, &result);
         result
     }
     pub fn enable_archive(&mut self, config: ArchiveConfig) -> Result<(), StoreError> {
@@ -1223,8 +1279,10 @@ impl PalsStores {
         &mut self,
         limits: ArchiveRuntimeLimits,
     ) -> Result<(), StoreError> {
+        let hot_in_use = self.hot_stats() != ArchiveStats::default();
         let manager = self.archive.as_mut().ok_or(StoreError::ArchiveDisabled)?;
-        if manager.used
+        if hot_in_use
+            || manager.used
             || manager.runtime_limits.is_some()
             || manager.allocation_active
             || manager.auto_budget.is_some()
@@ -1249,8 +1307,10 @@ impl PalsStores {
             || limits.index_entries_max == 0
             || limits.index_entries_max > 1_048_576
             || limits.index_bytes_max == 0
+            || limits.index_bytes_max > ARCHIVE_RECORD_PAYLOAD_BYTES
             || limits.load_bytes_max == 0
             || limits.load_bytes_max > limits.game_bytes_max
+            || limits.load_bytes_max > ARCHIVE_RECORD_PAYLOAD_BYTES
             || limits.load_deadline_max_ms == 0
             || Instant::now()
                 .checked_add(std::time::Duration::from_millis(
@@ -1290,6 +1350,8 @@ impl PalsStores {
             || manager.pending_cleanup
             || snapshot.write_bytes_reserved != 0
             || snapshot.pending_commit_bytes != Some(0)
+            || snapshot.pending_files_retained
+            || snapshot.pending_buffers_retained
         {
             let error = StoreError::InvalidConditions("archive close retains pending ownership");
             manager.failure(&error);
@@ -1358,16 +1420,21 @@ impl PalsStores {
             ));
         }
         manager.verify_hot_owner(self)?;
+        let baseline = manager.snapshot();
         let owner = Arc::downgrade(&manager.identity);
         let old_pins = manager.pins.clone();
         let mut combined = old_pins.clone();
         combined.extend(&pins);
-        self.validate_pins(&combined)?;
+        if let Err(error) = self.validate_pins(&combined) {
+            manager.failure_after(baseline, &error);
+            return Err(error);
+        }
         let initial = *budget;
         let manager = self.archive.as_mut().expect("archive checked");
         manager.pins = combined;
         manager.auto_budget = Some(initial);
         manager.allocation_active = true;
+        manager.used = true;
         let mut scope = ArchiveAllocationScope {
             stores: self,
             budget,
@@ -1377,6 +1444,9 @@ impl PalsStores {
         };
         let result = operation(&mut *scope.stores);
         scope.finish()?;
+        if let Err(error) = &result {
+            scope.stores.archive.as_ref().expect("same archive owner").failure_after(baseline, error);
+        }
         result
     }
     pub(super) fn automatic_archive_enabled(&self) -> bool {
@@ -1408,7 +1478,12 @@ impl PalsStores {
     }
     pub fn set_archive_pins(&mut self, pins: StorePins) -> Result<(), StoreError> {
         self.reject_archive_allocation_scope()?;
-        self.validate_pins(&pins)?;
+        if let Err(error) = self.validate_pins(&pins) {
+            if let Some(manager) = &self.archive {
+                manager.failure(&error);
+            }
+            return Err(error);
+        }
         self.archive
             .as_mut()
             .ok_or(StoreError::ArchiveDisabled)?
@@ -1508,39 +1583,9 @@ impl PalsStores {
             return result;
         }
         if observation.external_report.is_some() {
-            let manager = self.archive.as_ref().expect("archive checked");
-            manager.verify_hot_owner(self)?;
-            for entry in fs::read_dir(&manager.directory)
-                .map_err(|e| io("foreign archive uniqueness directory", e))?
-            {
-                budget.check()?;
-                let entry = entry.map_err(|e| io("foreign archive uniqueness entry", e))?;
-                let name = entry.file_name();
-                let Some(number) = name
-                    .to_str()
-                    .and_then(|name| name.strip_prefix("seg-"))
-                    .and_then(|name| name.strip_suffix(".arc"))
-                else {
-                    continue;
-                };
-                let generation = number
-                    .parse::<u64>()
-                    .map_err(|_| StoreError::ArchiveIntegrity("archive segment name"))?;
-                if generation >= manager.next_generation {
-                    continue;
-                }
-                let (bundle, _) = manager.read(generation, None, budget)?;
-                self.check_bundle_counts(&bundle)?;
-                if bundle
-                    .observations
-                    .iter()
-                    .any(|(_, cold)| cold.conflicts_external_request(&observation))
-                {
-                    return Err(StoreError::InvalidEvidence(
-                        "foreign physical request belongs to another archived task",
-                    ));
-                }
-            }
+            self.with_archive_read_budget(budget, |bounded| {
+                self.check_foreign_cold_request(&observation, bounded)
+            })?;
         }
         if !reclaim {
             budget.check()?;
@@ -1574,6 +1619,42 @@ impl PalsStores {
         }
         controls()?;
         result
+    }
+    fn check_foreign_cold_request(
+        &self,
+        observation: &Observation,
+        budget: &mut ArchiveIoBudget,
+    ) -> Result<(), StoreError> {
+        let manager = self.archive.as_ref().ok_or(StoreError::ArchiveDisabled)?;
+        manager.verify_hot_owner(self)?;
+        for entry in fs::read_dir(&manager.directory)
+            .map_err(|e| io("foreign archive uniqueness directory", e))?
+        {
+            budget.check()?;
+            let entry = entry.map_err(|e| io("foreign archive uniqueness entry", e))?;
+            let name = entry.file_name();
+            let Some(number) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("seg-"))
+                .and_then(|name| name.strip_suffix(".arc"))
+            else {
+                continue;
+            };
+            let generation = number
+                .parse::<u64>()
+                .map_err(|_| StoreError::ArchiveIntegrity("archive segment name"))?;
+            if generation >= manager.next_generation {
+                continue;
+            }
+            let (bundle, _) = manager.read(generation, None, budget)?;
+            self.check_bundle_counts(&bundle)?;
+            if bundle.observations.iter().any(|(_, cold)| cold.conflicts_external_request(observation)) {
+                return Err(StoreError::InvalidEvidence(
+                    "foreign physical request belongs to another archived task",
+                ));
+            }
+        }
+        Ok(())
     }
     fn validate_pins(&self, pins: &StorePins) -> Result<(), StoreError> {
         if pins.states.len() > self.limits.states
@@ -2033,6 +2114,8 @@ impl PalsStores {
             })
         });
         let mut manager = self.archive.take().ok_or(StoreError::ArchiveDisabled)?;
+        manager.used = true;
+        let baseline = manager.snapshot();
         let result = (|| {
             manager.verify_hot_owner(self)?;
             let mut bundle = self.bundle_for(&selection, manager.next_generation)?;
@@ -2049,6 +2132,9 @@ impl PalsStores {
                 actual_root,
             })
         })();
+        if let Err(error) = &result {
+            manager.failure_after(baseline, error);
+        }
         self.archive = Some(manager);
         result
     }
@@ -2344,6 +2430,7 @@ impl PalsStores {
         {
             return Err(StoreError::InvalidHandle("archive load pin"));
         }
+        manager.note(|_| {});
         Ok(())
     }
     /// The engine first commits the old root topology. This attested handoff
@@ -2416,7 +2503,7 @@ impl PalsStores {
         })();
         let bytes = initial - budget.max_bytes;
         original.max_bytes -= bytes;
-        manager.finish_load(baseline, started, bytes, &result);
+        manager.finish_read(baseline, started, bytes, true, &result);
         self.archive = Some(manager);
         result
     }
@@ -2483,7 +2570,7 @@ impl PalsStores {
         })();
         let bytes = initial - budget.max_bytes;
         original.max_bytes -= bytes;
-        manager.finish_load(baseline, started, bytes, &result);
+        manager.finish_read(baseline, started, bytes, true, &result);
         self.archive = Some(manager);
         result
     }
@@ -2552,7 +2639,7 @@ impl PalsStores {
         })();
         let bytes = initial - budget.max_bytes;
         original.max_bytes -= bytes;
-        manager.finish_load(baseline, started, bytes, &result);
+        manager.finish_read(baseline, started, bytes, true, &result);
         result
     }
     /// Load the selected archived node's reachable continuation subtree. The
@@ -2643,7 +2730,7 @@ impl PalsStores {
         })();
         let bytes = initial - budget.max_bytes;
         original.max_bytes -= bytes;
-        manager.finish_load(baseline, started, bytes, &result);
+        manager.finish_read(baseline, started, bytes, true, &result);
         self.archive = Some(manager);
         result
     }
@@ -3309,6 +3396,9 @@ impl PalsStores {
                 .loaded_closure_bytes_peak
                 .zip(capacity)
                 .map(|(peak, current)| peak.max(current));
+            if meter.loaded_closure_bytes_peak.is_none() {
+                meter.loaded_closure_bytes_method = None;
+            }
         });
         manager.next_pin = next_pin;
         Ok(LoadedArchive {
