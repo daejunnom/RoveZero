@@ -1595,7 +1595,10 @@ impl<M: RoleModel> PalsEngine<M> {
                 RoleSearchClosure::PhysicalCompletionUnknown
             }
             _ if canceled => RoleSearchClosure::Canceled,
-            Err(PalsError::Store(StoreError::ArchiveDeadline)) => RoleSearchClosure::Deadline,
+            Err(
+                PalsError::Role(RoleError::Deadline)
+                | PalsError::Store(StoreError::ArchiveDeadline),
+            ) => RoleSearchClosure::Deadline,
             Ok(report) => match report.completion {
                 PalsCompletion::Canceled => RoleSearchClosure::Canceled,
                 PalsCompletion::Deadline => RoleSearchClosure::Deadline,
@@ -1631,6 +1634,12 @@ impl<M: RoleModel> PalsEngine<M> {
             || limits.cpu_depth > self.cpu.capabilities().max_depth
         {
             return Err(PalsError::InvalidLimits);
+        }
+        if let Some(completion) = self.stopped(limits, cancel) {
+            // The current request still has a Rules terminal or legal fallback.
+            // No old-root value, focus, task, archive retry or logical record is
+            // accepted after an already observed cancellation/deadline.
+            return self.unsearched_result(position, completion, Instant::now());
         }
         if self.checker_new_game_pending {
             self.cpu.new_game(limits.deadline, cancel)?;
@@ -1866,6 +1875,14 @@ impl<M: RoleModel> PalsEngine<M> {
         position: &Position,
         started: Instant,
     ) -> Result<PalsResult, PalsError> {
+        self.unsearched_result(position, PalsCompletion::Capacity, started)
+    }
+    fn unsearched_result(
+        &self,
+        position: &Position,
+        completion: PalsCompletion,
+        started: Instant,
+    ) -> Result<PalsResult, PalsError> {
         let classification = position.classify_position()?;
         let terminal = match classification.play_status {
             PlayStatus::Ongoing => None,
@@ -1907,7 +1924,7 @@ impl<M: RoleModel> PalsEngine<M> {
             completion: if terminal.is_some() {
                 PalsCompletion::Terminal
             } else {
-                PalsCompletion::Capacity
+                completion
             },
             counters: PalsCounters {
                 retained_situations: self.nodes.len(),
@@ -2251,8 +2268,11 @@ impl<M: RoleModel> PalsEngine<M> {
             };
             let mut child = self.nodes[current].position.clone();
             child.make_move(movement)?;
-            current = self.connect_checked(current, movement, child, counters, limits, cancel)?;
+            // Retain the shape-valid returned movement as a Rules-checked raw
+            // prefix even if acceptance canceled the graph connection. The
+            // caller must still propagate the error before record publication.
             prefix.push(movement);
+            current = self.connect_checked(current, movement, child, counters, limits, cancel)?;
         }
         Ok(current)
     }
@@ -8151,6 +8171,18 @@ mod tests {
             (None, true, false, RoleSearchClosure::Canceled),
             (None, false, true, RoleSearchClosure::Deadline),
             (
+                Some(RoleError::Deadline),
+                false,
+                false,
+                RoleSearchClosure::Deadline,
+            ),
+            (
+                Some(RoleError::Canceled),
+                false,
+                false,
+                RoleSearchClosure::Canceled,
+            ),
+            (
                 Some(RoleError::Unavailable),
                 false,
                 false,
@@ -8813,15 +8845,76 @@ mod tests {
         assert_eq!(result.resolver_version, PALS_VALUE_RESOLVER_VERSION);
         assert_eq!(result.terminal, Some(TerminalReason::Stalemate));
         assert_eq!(result.best_move, None);
+        for (canceled, expired) in [(true, false), (false, true)] {
+            let mut stopped_engine = engine();
+            let before = stopped_engine.stores.hot_stats();
+            let reset_pending = stopped_engine.checker_new_game_pending;
+            let mut requested = limits();
+            if expired {
+                requested.deadline = Instant::now();
+            }
+            let mut progress = Vec::new();
+            let terminal = stopped_engine
+                .search_with_progress(
+                    &position,
+                    requested,
+                    &AtomicBool::new(canceled),
+                    |movement| {
+                        progress.push(movement);
+                    },
+                )
+                .unwrap();
+            assert_eq!(terminal.completion, PalsCompletion::Terminal);
+            assert_eq!(terminal.terminal, Some(TerminalReason::Stalemate));
+            assert_eq!(terminal.best_move, None);
+            assert_eq!(terminal.score, Some(0));
+            assert_eq!(terminal.value_scope, PalsValueScope::RulesTerminal);
+            assert!(matches!(
+                terminal.resolved_value,
+                PalsResolvedValue::RulesTerminal {
+                    winner: None,
+                    perspective: Color::Black
+                }
+            ));
+            assert!(terminal.root_values.is_empty());
+            assert_eq!(terminal.counters.role_calls, 0);
+            assert_eq!(terminal.counters.value_calls, 0);
+            assert_eq!(terminal.counters.cpu_tasks_requested, 0);
+            assert!(progress.is_empty());
+            assert_eq!(stopped_engine.stores.hot_stats(), before);
+            assert_eq!(stopped_engine.stores.root(), None);
+            assert_eq!(stopped_engine.stores.generation(), 0);
+            assert_eq!(stopped_engine.revision, 0);
+            assert!(stopped_engine.nodes.is_empty());
+            assert!(stopped_engine.records().is_empty());
+            assert_eq!(stopped_engine.checker_new_game_pending, reset_pending);
+            assert_eq!(
+                stopped_engine.last_search_counters(),
+                Some(terminal.counters)
+            );
+        }
         let position = Position::startpos();
-        let result = engine()
+        let mut stopped_engine = engine();
+        let result = stopped_engine
             .search(&position, limits(), &AtomicBool::new(true))
             .unwrap();
         assert_eq!(result.resolver_version, PALS_VALUE_RESOLVER_VERSION);
         assert_eq!(result.completion, PalsCompletion::Canceled);
         assert!(position.legal_moves().contains(&result.best_move.unwrap()));
         assert_eq!(result.score, None);
+        assert_eq!(result.value_scope, PalsValueScope::Unknown);
+        assert!(matches!(result.resolved_value, PalsResolvedValue::Unknown));
         assert_eq!(result.counters.cpu_tasks, 0);
+        assert_eq!(result.counters.cpu_tasks_requested, 0);
+        assert_eq!(result.counters.role_calls, 0);
+        assert_eq!(stopped_engine.stores.root(), None);
+        assert!(stopped_engine.nodes.is_empty());
+        let mut invalid = limits();
+        invalid.max_rounds = 0;
+        assert!(matches!(
+            stopped_engine.search(&position, invalid, &AtomicBool::new(true)),
+            Err(PalsError::InvalidLimits)
+        ));
     }
     #[test]
     fn counterexamples_and_repairs_keep_first_move_and_game_evidence() {
@@ -8847,12 +8940,134 @@ mod tests {
         let first = repair.line[0];
         assert!(result.root_values.iter().any(|v| v.movement == first));
         let retained = engine.retained_situations();
+        let before = engine.stores.hot_stats();
+        let root = engine.stores.root();
+        let generation = engine.stores.generation();
+        let revision = engine.revision;
+        let records: Vec<_> = engine
+            .records()
+            .iter()
+            .map(|record| {
+                (
+                    record.revision,
+                    record.parent_revision,
+                    record.supersedes_revision,
+                    record.origin_state,
+                    record.kind,
+                    record.line.clone(),
+                    record.cpu_observation,
+                    record.critical,
+                )
+            })
+            .collect();
+        let nodes: Vec<_> = engine
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.state,
+                    node.situation,
+                    node.edges
+                        .iter()
+                        .map(|edge| (edge.movement, edge.child))
+                        .collect::<Vec<_>>(),
+                    node.model_observation,
+                    node.model_value_revision,
+                    node.evidence
+                        .as_ref()
+                        .and_then(|evidence| evidence.provenance),
+                )
+            })
+            .collect();
         let mut next = position.clone();
         next.make_move(first).unwrap();
-        engine
-            .search(&next, limits(), &AtomicBool::new(true))
-            .unwrap();
-        assert_eq!(engine.retained_situations(), retained);
+        let legal = next.legal_moves();
+        // An old White root is still resident. A pre-stopped Black request may
+        // return only its own legal Unknown fallback, without accepting history.
+        for (canceled, expired, completion) in [
+            (true, false, PalsCompletion::Canceled),
+            (false, true, PalsCompletion::Deadline),
+        ] {
+            let mut requested = limits();
+            if expired {
+                requested.deadline = Instant::now();
+            }
+            let mut progress = Vec::new();
+            let stopped = engine
+                .search_with_progress(&next, requested, &AtomicBool::new(canceled), |movement| {
+                    progress.push(movement);
+                })
+                .unwrap();
+            assert_eq!(stopped.completion, completion);
+            assert_eq!(stopped.best_move, legal.first().copied());
+            assert_ne!(stopped.best_move, result.best_move);
+            assert_eq!(stopped.score, None);
+            assert_eq!(stopped.value_scope, PalsValueScope::Unknown);
+            assert!(matches!(stopped.resolved_value, PalsResolvedValue::Unknown));
+            assert_eq!(stopped.terminal, None);
+            assert_eq!(
+                stopped
+                    .root_values
+                    .iter()
+                    .map(|value| value.movement)
+                    .collect::<Vec<_>>(),
+                legal
+            );
+            assert!(stopped.root_values.iter().all(|value| value.score.is_none()
+                && matches!(value.resolved_value, PalsResolvedValue::Unknown)
+                && value.scope == PalsValueScope::Unknown
+                && value.examined_replies == 0
+                && value.unexplored_replies.is_none()));
+            assert_eq!(stopped.counters.rounds, 0);
+            assert_eq!(stopped.counters.cpu_tasks_requested, 0);
+            assert_eq!(stopped.counters.cpu_tasks, 0);
+            assert_eq!(stopped.counters.role_calls, 0);
+            assert_eq!(stopped.counters.value_calls, 0);
+            assert!(progress.is_empty());
+            assert_eq!(engine.last_search_counters(), Some(stopped.counters));
+            assert_eq!(engine.stores.hot_stats(), before);
+            assert_eq!(engine.stores.root(), root);
+            assert_eq!(engine.stores.generation(), generation);
+            assert_eq!(engine.revision, revision);
+            assert_eq!(engine.retained_situations(), retained);
+            assert_eq!(
+                engine
+                    .records()
+                    .iter()
+                    .map(|record| (
+                        record.revision,
+                        record.parent_revision,
+                        record.supersedes_revision,
+                        record.origin_state,
+                        record.kind,
+                        record.line.clone(),
+                        record.cpu_observation,
+                        record.critical,
+                    ))
+                    .collect::<Vec<_>>(),
+                records
+            );
+            assert_eq!(
+                engine
+                    .nodes
+                    .iter()
+                    .map(|node| (
+                        node.state,
+                        node.situation,
+                        node.edges
+                            .iter()
+                            .map(|edge| (edge.movement, edge.child))
+                            .collect::<Vec<_>>(),
+                        node.model_observation,
+                        node.model_value_revision,
+                        node.evidence
+                            .as_ref()
+                            .and_then(|evidence| evidence.provenance),
+                    ))
+                    .collect::<Vec<_>>(),
+                nodes
+            );
+        }
         engine.new_game();
         assert_eq!(engine.retained_situations(), 0);
         assert!(engine.records().is_empty());

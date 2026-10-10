@@ -2799,8 +2799,55 @@ mod repair_tests {
             matches!(error, Err(ReplayError::Search(error)) if matches!(*error, PalsError::Role(RoleError::Canceled)))
         );
         assert_eq!(owner.counters.accepted_repair_outputs, 1);
+        assert_eq!(owner.counters.completed_repair_calls, 1);
         assert_eq!(owner.repaired_line().len(), 3);
         assert_eq!(owner.stages.len(), 2);
+        // The completed legal movement remains a local raw prefix. It grants
+        // no graph edge, Repair record/revision or endpoint investigation.
+        let mut checked = owner.root.clone();
+        for &movement in owner.repaired_line() {
+            checked.make_move(movement).unwrap();
+        }
+        assert!(
+            !owner
+                .engine
+                .nodes
+                .iter()
+                .any(|node| node.position.snapshot().same_state(&checked.snapshot()))
+        );
+        assert!(
+            !owner
+                .records()
+                .iter()
+                .any(|record| record.kind == RecordKind::Repair)
+        );
+        assert_eq!(owner.repair_endpoint_node, None);
+        assert!(owner.repair_endpoint().is_none());
+        for stage in owner.stages() {
+            let observation = stage.observation().unwrap();
+            assert!(stage.report().is_some());
+            assert!(stage.exact_completed());
+            assert_eq!(
+                owner
+                    .engine
+                    .stores
+                    .tasks
+                    .get(stage.execution())
+                    .unwrap()
+                    .status,
+                TaskStatus::Completed(observation)
+            );
+            assert_eq!(
+                owner
+                    .engine
+                    .stores
+                    .observations
+                    .get(observation)
+                    .unwrap()
+                    .execution,
+                Some(stage.execution())
+            );
+        }
         assert_eq!(owner.repair_record_revision(), None);
         assert_eq!(owner.engine.model.finish_calls, 1);
         assert_eq!(
