@@ -2650,7 +2650,7 @@ mod tests {
     fn selected_archive_startup_observes_actual_files_and_preserves_failed_scan() {
         let config = archive_config("startup-observation");
         let root = config.root.clone();
-        let budget = ArchiveIoBudget {
+        let mut budget = ArchiveIoBudget {
             deadline: Instant::now() + Duration::from_secs(20),
             max_bytes: SEARCH_ARCHIVE_IO_BYTES,
         };
@@ -2662,14 +2662,26 @@ mod tests {
         let wire = encode_archive_node_projection(&writer.nodes[node], &writer.nodes).unwrap();
         writer
             .stores
-            .archive_engine_records(&[], &[wire], budget)
+            .archive_engine_records_with_pins_and_budget(
+                &[],
+                &[wire],
+                StorePins::default(),
+                &mut budget,
+            )
             .unwrap();
-        let written = writer
-            .archive_owner_snapshot()
-            .unwrap()
-            .unwrap()
-            .global_managed_bytes
+        // Legacy owners retain the pre-commit scan until another explicit
+        // measurement. Observe actual file extents with the same remaining
+        // allowance and original deadline before comparing the new owner.
+        let before_scan = writer.archive_owner_snapshot().unwrap().unwrap();
+        assert!(!before_scan.global_scan_after_last_commit);
+        writer
+            .stores
+            .measure_archive_usage_with_budget(&mut budget)
             .unwrap();
+        let observed_writer = writer.archive_owner_snapshot().unwrap().unwrap();
+        assert!(observed_writer.global_scan_complete);
+        assert!(observed_writer.global_scan_after_last_commit);
+        let written = observed_writer.global_managed_bytes.unwrap();
         assert!(written > 0);
 
         let mut selected = engine();
