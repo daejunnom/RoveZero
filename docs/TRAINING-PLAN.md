@@ -9,7 +9,43 @@
 linear fixture lifecycle 범위는 [F TRAINING](../experiments/model-research/TRAINING.md),
 실제 모델/추론과 선행 인수는 [INTEGRATION-STATUS](INTEGRATION-STATUS.md)를 따른다.
 
+## 2026-10-10 PALS diagnostic 학습 smoke
+
+이전 PALS 목표는 실제 optimizer 학습을 제외한 구현·인수였다. 그 이력과 zero-step
+checkpoint/export 자료는 [PALS 구현 기록](PALS-IMPLEMENTATION.md)에 보존한다.
+이번 PR23 후속에서 사용자가 추가한 범위는 **diagnostic fixture를 사용한 작은 nonzero
+학습 smoke**다. 본격 학습, 실제 target을 사용한 학습, 제품 learned V의 연결·전략·기력 인수와
+PR 병합은 이 범위에 포함하지 않는다. 아래 BT4/F02/F03의 선행 권리·데이터·대조 인수도
+이 smoke로 충족한 것으로 처리하지 않는다.
+
+| 구분 | 실제 확인한 범위와 남은 인수 |
+|---|---|
+| nonzero 진단 비교 | 세 번째 실행에서 P/C/V 각각 연속 4회와 2회+checkpoint/resume+2회를 비교했다. 역할별 8회, 총 24회 actual update에서 모델·AdamW state/step·scheduler·RNG·sampler가 일치했고, 의도한 parameter membership·동결·유한값 검사가 PASS했다. |
+| 실패와 누적 비용 | 앞선 실행의 1회와 8회 update 실패 자료를 보존한다. 성공한 24회와 합한 실제 누적 소비는 33회다. 실패·재시도와 checkpoint 자료를 실제 누적 비용 기록에 연결한다. |
+| 실제 target·learned V | 실제 학습 target을 사용한 update는 0회다. diagnostic label/coverage는 실제 수집·권한·unknown mask 검증을 통과한 target coverage와 별도다. V-private tensor의 update/resume 검사는 learned V의 유용성·기력 검증과 별도다. |
+| 새 실행 인수 | 새 V4/FullLineInteractionV2 baseline의 실제 NN/GPU 연결, seeded Warm·Repair→C→paused CPU resume와 paired pilot은 아직 pending이다. 과거 CPU/CI/GPU 실행을 새 기준의 성공으로 승격하지 않는다. |
+
+P/C는 공유 tensor와 해당 role의 private tensor만, V는 private V tensor만 갱신한다.
+Repair는 P 경로의 검사에 포함한다. nonzero checkpoint는 zero-step format과 별도
+domain이며 optimizer·scheduler·RNG·sampler·freeze 상태를 복원한다. CPU FP32,
+batch/accumulation 1, AdamW lr 1e-4·betas 0.9/0.999·eps 1e-8·decay 0.01,
+clip norm 1·constant schedule의 비교를 사용했다.
+
+구현 접점은 [nonzero trainer](../experiments/model-research/pals/src/rz_pals_model/nonzero_training.py),
+[training 계약](../experiments/model-research/pals/src/rz_pals_model/training.py)과
+[target coverage](../experiments/model-research/pals/src/rz_pals_model/target_coverage.py)다.
+
+2026-10-10 사용자는 실패와 재시도를 합친 **총 update 한도**를 해제했다. 실행별
+CPU 2·15분+정리 30초·출력 2GiB 상한과 actual dispatch/completion·실패·checkpoint
+기록은 유지한다. 총 한도 해제는 본격 학습이나 새 유료 자원 사용의 승인이 아니다.
+진단 자산은 arena 승격 불가로 유지한다. 후속 계약과 기본값은
+[PR23 후속 계약](PALS-FOLLOWUP-CONTRACTS.md), 구현·검사·미실행 구분은
+[이번 후속 범위](PALS-IMPLEMENTATION.md#2026-10-10-pr23-후속-범위)를 따른다.
+
 ## 0. 2026-10-04 강도용 모델 전환의 우선순위
+
+이 절의 실행·미실행은 2026-10-04 BT4 전환 당시 범위다. 위 PALS diagnostic 후속과
+별도 이력으로 보존하며, BT4/F02/F03의 본격 학습 인수를 추가하지 않는다.
 
 사용자는 Maia 강도 한계 조사 후 **BT4-it332 실제 적용·LC0/RoveZero 벤치마크**를
 지정했다. [로컬 모델 기록](research/LOCAL-MODEL-BASELINE.md)의 BT4 Rust CPU/CUDA

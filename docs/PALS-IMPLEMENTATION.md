@@ -2,10 +2,128 @@
 
 사용자가 제공한 `RoveZero_PALS_Internal_Algorithms_KO.md`와
 `RoveZero_PALS_Architecture_Flows_KO.md`는 설계 근거다. 문서 속 학습·실행 권고를
-실제 실행 승인으로 확대하지 않는다. 이번 목표는 **실제 학습을 제외한 구현**이며,
+실제 실행 승인으로 확대하지 않는다. 원래 목표는 **실제 학습을 제외한 구현**이며,
 기반 언어는 Rust다. 기존 Rules·PUCT·LC0 모델 경로와 과거 V1/V2 기록은 보존한다.
 
+이 첫 목표의 비학습 인수는 아래 역사 기록에 유지한다. 2026-10-10 사용자가 추가한
+PR23 후속은 새 모델·실행 계약과 diagnostic nonzero 학습 smoke를 포함한다. 이번
+후속의 범위·상태는 다음 절을 기준으로 읽으며, 이전의 학습 제외 문구나 과거 CPU/CI/GPU
+자료를 새 기준의 실행 승인·인수로 확대하지 않는다.
+
+## 2026-10-10 PR23 후속 범위
+
+[후속 연결 계약](PALS-FOLLOWUP-CONTRACTS.md)은 기존 `EvalRequest/EvalOutput`
+revision 0.1과 V1/V2/V3 자료를 보존한다. 아래는 승인된 범위와 현재 준비·검사·미실행의
+구분이다. 본격 학습, 제품 learned V의 연결·전략·기력 인수와 PR 병합은 이번 후속에서 제외한다.
+
+### 모델과 실행 명세의 선택
+
+| 접점 | 새 기본 또는 명시 선택 | 기존 경로와 구분 |
+|---|---|---|
+| 새 모델 init·제품 profile 생략 | `full_line_interaction_v2` / `FullLineInteractionV2` | `baseline()`, 기존 `ModelConfig()`와 legacy serialization의 의미는 유지한다. 새 기본을 과거 자산의 재해석에 쓰지 않는다. |
+| 모델 제거 대조 | `full_line_v2`는 input-only, `interaction_head_v2`는 head-only, `full_line_interaction_v2`는 둘 모두 | `legacy_summary_v1`은 explicit legacy 비교다. 전체 수순 입력과 interaction head 효과를 분리한다. |
+| 새 후속 등록·pilot 명세 | `PalsRunManifestV4`, `schema_version=4`, `contract_revision=pals/0.2`와 V4 lock | 새 준비 경로가 `--pals-arena-wire=v4`와 명시한 profile/policy를 child에 전달한다. V1/V2/V3 codec·digest는 보존한다. |
+| 일반 제품 CLI wire | `--pals-arena-wire=v4`로 명시 선택 | wire 생략은 기존 호환 경로다. 모델의 새 기본값만으로 wire를 V4로 바꾸지 않는다. |
+
+모델 설정·초기화는 [Python config](../experiments/model-research/pals/src/rz_pals_model/config.py),
+[model](../experiments/model-research/pals/src/rz_pals_model/model.py)와
+[CLI](../experiments/model-research/pals/src/rz_pals_model/cli.py), Rust 모델 계약은
+[pals_model](../crates/rz-eval/src/pals_model.rs)을 따른다. V4 선언 검증은
+[manifest](../crates/rz-experiments/src/pals_manifest_v4.rs), 새 준비·실제 argv는
+[pair 준비](../crates/rz-arena/examples/pals_pair_prepare_v4.rs)와
+[V4 launch](../crates/rz-arena/src/pals_launch/v4.rs), 제품 선택은
+[UCI main](../crates/rz-uci/src/main.rs)과 [driver](../crates/rz-uci/src/search_driver.rs)에 연결한다.
+선언·compiled Rules descriptor는 실제 NN·provider readiness·GPU 완료 관측과 별도다.
+
+### checker·resolver·Fresh 재검토와 반복 queue
+
+`CpuChecker`와 `ResolverPolicy`는 독립 선택이다. 제품 CLI의 resolver 생략 기본은
+own checker의 `OwnRawRestricted`, 외부 checker의 `ModelWdlRestricted`다. own raw
+정책은 자체 CPU value namespace만 소비하며, model WDL 정책은 own/외부 checker를
+지원한다. 외부 CP/mate·bound·작업 단위는 own raw·Rules 사실·자체 CPU 노드와 구분한다.
+새 모델과 explicit legacy의 V4 비교에서는 같은 own checker·`ModelWdlRestricted`를
+고정하여 resolver 차이를 모델 효과로 섞지 않는다.
+
+`PostRepairRecheckPolicy`의 기본은 `Disabled`다. 명시적 `FrozenModelWdlV2`는 실제
+C endpoint와 새 P endpoint를 frozen 모델의 Fresh WDL로 다시 계산하고, 같은 관점·모델·
+정밀도·공개 문맥 revision에서 비교한다. 두 Rules terminal은 Rules로 비교하며,
+mixed/unknown은 unresolved로 보존한다. `ContextWdl` 원시 관측 두 개와 dependency를
+참조하는 조건부 결론을 만든다. 엄격한 개선이 있을 때만 `ConditionalRepairWdl`과
+`RepairedBy`로 기존 반박을 supersede한다. 추가 NN은 원래 전역 시간·작업 예산에 포함한다.
+
+반복 queue는 `IterativeFrozenModelWdlV2`를 선택했을 때의 S 정책이다. first move별
+Repair 최대 3회·pending 64개, 같은 질문/revision 중복 금지·새 증거가 없을 때 종료를
+적용한다. 실제 새 C continuation과 Fresh 관측, 원래 first move·근거·supersedes를
+보존한다. queue를 별도의 기본 활성 기능으로 해석하지 않는다. 구현 접점은
+[checker](../crates/rz-search/src/cpu_checker.rs), [engine](../crates/rz-search/src/pals/engine.rs),
+[frozen recheck](../crates/rz-search/src/pals/engine/frozen_recheck.rs)다.
+
+### bounded archive와 선택적 CPU·Warm 수명
+
+기존 hot/cold 저장소에 더하는 **중탐색 controlled allocation scope는 구현·소비자 연결
+중**이다. [store](../crates/rz-search/src/pals/store.rs),
+[archive](../crates/rz-search/src/pals/store/archive.rs)와
+[engine archive lifecycle](../crates/rz-search/src/pals/engine/archive_lifecycle.rs)이 경계다.
+`with_archive_allocation`은 원래 deadline·잔여 byte 예산과 기존/resident/temporary 핀을
+operation 동안 결합하고, 성공·실패 모두 실제 사용량을 반환한 뒤 기존 핀을 복원한다.
+새 state/situation·아직 Node/RoleRecord에 설치하지 않은 line/observation도 임시 보호한다.
+
+hot 80% 또는 Capacity에서 비활성 자료를 archive commit·무결성 확인 뒤 회수하고,
+Capacity 재시도는 정확히 한 번까지만 허용한다. commit 뒤 allocation/retry와 logical
+acceptance 앞의 controlled callback은 `ArchiveCanceled`/`ArchiveDeadline`을 검사한다.
+취소 뒤 재시도를 계속하거나 conclusion revision을 게시하지 않는다. all-pinned,
+quota/I/O/byte-budget 실패는 typed 오류로 남기며 증거 삭제로 성공을 만들지 않는다.
+게임 256MiB·관리 전체 4GiB와 RAM 인덱스 상한을 유지한다. 중탐색 회수에서는 Node
+Vec compaction이나 usize 재발급을 하지 않는다. physical active/cancel-requested 작업의
+dependency closure는 유지하며, `PhysicalCompletionUnknown`은 실제 완료 전 owner·buffer·
+관련 근거를 격리·보존한다. 논리 취소나 다음 root 준비가 물리 완료를 대신하지 않는다.
+
+`PausedStack`은 opt-in이며 기본은 기존 재귀 경로의 `CompletedIteration`이다. own CPU의
+미완료 root/PVS/negamax/qsearch/SEE frame·cursor/PV·alpha-beta·정확한 Rules/history와
+accumulator, TT/ordering owner를 보존한다. 한 실제 paused task·8MiB 한도와 일회 token을
+적용하고 소비한 nodes를 재실행·재청구하지 않는다. 8MiB checkpoint frame 한도와
+TT/ordering history 예산은 별도다. 매 admission에서 actual owner를
+검사하며 stale pause는 역사 증거로 retire하고 Start로 회복한다. CPU 호출 밖의 논리
+취소도 실제 stack을 폐기하되 TT/history와 GPU lease 수명은 별도로 유지한다. 외부 checker는
+PausedStack을 지원하지 않는다. 소스는 [CPU](../crates/rz-search/src/cpu.rs),
+[stack](../crates/rz-search/src/cpu/stack.rs),
+[CPU lifecycle](../crates/rz-search/src/pals/engine/cpu_lifecycle.rs)다.
+
+host Warm과 CUDA ApproxWarm은 별도 capability이며 둘 다 기본 off다. CUDA의 명시 선택은
+`--pals-cuda-private-warm=true`이고 `onnx-cuda`·`experimental-io-binding`과 등록된 FullLine
+V2 device public memory가 필요하다. accepted seed는 같은 role·모델/epoch·Rules/history·
+query 문맥에서만 사용하고 공개 record revision만 변경 가능하다. Value/V는 Fresh다.
+unknown/cancel의 input/output/seed/workspace owner는 물리 완료 전 보존·격리한다.
+소스는 [CUDA Warm](../crates/rz-eval/src/pals_onnx/warm/cuda.rs),
+[private 경계](../crates/rz-eval/src/pals_private.rs)와
+[native Warm](../crates/rz-uci/src/pals_native/private_warm.rs)다.
+
+### 진단 학습과 남은 실행 인수
+
+diagnostic nonzero smoke의 세 번째 실행은 P/C/V별 연속·재개 비교 총 24 update에서
+모델·AdamW·scheduler·RNG·sampler 일치, parameter membership·동결·유한값 PASS다.
+이전 1+8 update 실패를 보존하며 실제 누적은 33회, 실제 target update는 0회다.
+사용자가 총 update 한도를 해제했지만 실행별 자원·시간·출력 상한과 실패 기록은 유지한다.
+상세 범위는 [학습 smoke 기록](TRAINING-PLAN.md#2026-10-10-pals-diagnostic-학습-smoke)을 따른다.
+
+직전 통합 소스의 CPU/mock 검사에는 stack 9개와 CPU lifecycle 5개 회귀가 포함됐다.
+그 결과와 과거 CI/GPU 자료는 해당 소스·설정의 증거다. 진행 중인 controlled archive의
+새 연결·검사, 새 V4/FullLineInteractionV2 baseline의 제품 등록·Rust NN, 실제 GPU의
+Repair→C→paused CPU resume·seeded Warm·물리 drain/unknown 수명, 새 paired pilot은
+아직 pending이다. compiled 선언이나 기존 자료를 이 목록의 실행 성공으로 승격하지 않는다.
+
+새 seed 23의 네 profile은 동일한 공통 FP32 tensor 90개를 여섯 profile 쌍에서 bit 단위로
+대조했다. 독립 Torch/CPU ORT shared 수치 24사례와 동일 seed의 Warm CPU 수치 6사례가
+통과했으며, shared raw 출력의 최대 절대 차이는 `2.026558e-6`이다. 한 실제 CPU 창의
+벽시계는 75.464초였고 optimizer·GPU 실행은 0회다. 새 자산은 미학습 baseline 후보이며,
+제품 등록·Rust 입력/출력·CUDA 수치와 실제 대국 인수 전에는 arena eligible이 아니다.
+실행 중 관측한 cgroup peak는 1,390,157,824 bytes지만 종료 뒤 scope가 사라져 최종 peak와
+events는 미관측이다. 이 표본을 최종 peak 또는 메모리 개선률로 사용하지 않는다.
+
 ## 2026-10-10 현재 소스 인수 상태
+
+이 절부터의 V3·선택16행·학습 제외 단계 표와 실행 수치는 이전 목표의 역사 기록이다.
+당시 소스 인수와 실패·unknown을 보존하며, 위 PR23 후속의 현재 상태와 구분한다.
 
 실제 optimizer 학습을 제외한 선택 구현과 실행 인수를 마쳤다. 기존 제품 실행의 소스는
 `935519d8e2cf3ddb3fe25d52da8497700d7cf1a5`, 마지막 consumer 수정 소스는
