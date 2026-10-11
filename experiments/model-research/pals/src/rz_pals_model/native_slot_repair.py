@@ -168,6 +168,16 @@ _REVIEWED_DISABLED_FOLLOWUP_OBSERVED_PROGRESS_SOURCES = (
     {"bytes": 402637, "sha256": "4b272ed825d98f51ace408b2798093e88487f6b29f94e38b9d2a753f8fc263d1"},
     {"bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
 )
+# Reviewed ordered-scope successor, archive-off legacy Disabled scope only.
+# ReplaceOnFresh/public FIFO stay unchanged. Ordered nonrecursive Repair/C
+# requires ResumeAfterAcceptedRepairC plus IterativeFrozenModelWdlV2 in the
+# separate held-parent-v2 constructor; this collector does not select it.
+# Raw caller build/policy checks still precede this closed pair lookup. No
+# held-parent execution, V4/ModelWdl, utility, cost or training is admitted.
+_REVIEWED_DISABLED_FOLLOWUP_ORDERED_SCOPE_SOURCES = (
+    {"bytes": 402843, "sha256": "70d4bae5ad4e19e86137e47cc66922182c5232cbe35b9b30d42bf43ec6850171"},
+    {"bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+)
 _SOURCE_REVIEW_PROFILES = (
     ("legacy_prepared_lineage_4469f9d", _REVIEWED_SOURCES),
     ("legacy_disabled_recheck_9c0de959", _REVIEWED_DISABLED_RECHECK_SOURCES),
@@ -187,6 +197,7 @@ _SOURCE_REVIEW_PROFILES = (
     ("legacy_disabled_followup_controlled_fallback_4770a553_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_CONTROLLED_FALLBACK_SOURCES),
     ("legacy_disabled_followup_live_binding_004db31f_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_LIVE_BINDING_SOURCES),
     ("legacy_disabled_followup_observed_progress_4b272ed8_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_OBSERVED_PROGRESS_SOURCES),
+    ("legacy_disabled_followup_ordered_scope_70d4bae5_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_ORDERED_SCOPE_SOURCES),
 )
 _DISABLED_SEARCH_VERSION = "pals-restricted-refinement/0.1"
 _OPT_IN_LANE_FIELDS = ("pals_search_policy", "refinement_registration", "refinement_registration_sha256", "post_repair_recheck", "post_repair_recheck_policy", "post_repair_recheck_conditions",

@@ -316,6 +316,8 @@ class NativeRecheckBoundaryTests(unittest.TestCase):
         self.assertEqual(fallback, REVIEWED_CONTROLLED_FALLBACK_WHOLE_SOURCE_PINS)
         _, live_binding = witness._reviewed_source_pair(REVIEWED_LIVE_BINDING_WHOLE_SOURCE_PINS)
         self.assertEqual(live_binding, REVIEWED_LIVE_BINDING_WHOLE_SOURCE_PINS)
+        _, observed = witness._reviewed_source_pair(REVIEWED_OBSERVED_PROGRESS_WHOLE_SOURCE_PINS)
+        self.assertEqual(observed, REVIEWED_OBSERVED_PROGRESS_WHOLE_SOURCE_PINS)
         self.assertNotEqual(historical, current)
         for path in witness._SOURCE_PATHS:
             with self.subTest(component=path):
@@ -772,10 +774,22 @@ REVIEWED_LIVE_BINDING_WHOLE_SOURCE_PINS = {
 }
 
 
-REVIEWED_CURRENT_WHOLE_SOURCE_PINS = {
+REVIEWED_OBSERVED_PROGRESS_WHOLE_SOURCE_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
         "bytes": 402637,
         "sha256": "4b272ed825d98f51ace408b2798093e88487f6b29f94e38b9d2a753f8fc263d1",
+    },
+    "crates/rz-arena/src/pals_collect/native.rs": {
+        "bytes": 233158,
+        "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9",
+    },
+}
+
+
+REVIEWED_CURRENT_WHOLE_SOURCE_PINS = {
+    "crates/rz-search/src/pals/engine.rs": {
+        "bytes": 402843,
+        "sha256": "70d4bae5ad4e19e86137e47cc66922182c5232cbe35b9b30d42bf43ec6850171",
     },
     "crates/rz-arena/src/pals_collect/native.rs": {
         "bytes": 233158,

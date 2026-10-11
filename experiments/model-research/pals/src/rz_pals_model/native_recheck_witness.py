@@ -165,6 +165,18 @@ _REVIEWED_OPT_IN_SOURCE_PROFILES = (
         "crates/rz-arena/src/pals_collect/native.rs": {
             "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
     }),
+    # Reviewed ordered-scope successor, still archive-off legacy SingleReply.
+    # ReplaceOnFresh and public FIFO retain their previous behavior. The new
+    # nonrecursive priority drain requires both ResumeAfterAcceptedRepairC and
+    # IterativeFrozenModelWdlV2, selected by the separate held-parent-v2
+    # constructor. The unchanged collector never selects it here. This exact
+    # pair grants no held-parent execution, V4/ModelWdl, cost or training proof.
+    ("opt_in_single_reply_followup_ordered_scope_70d4bae5_native_1ba6d1e5", {
+        "crates/rz-search/src/pals/engine.rs": {
+            "bytes": 402843, "sha256": "70d4bae5ad4e19e86137e47cc66922182c5232cbe35b9b30d42bf43ec6850171"},
+        "crates/rz-arena/src/pals_collect/native.rs": {
+            "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+    }),
 )
 _POLICY = {
     "version": "pals-post-repair-recheck/1",
