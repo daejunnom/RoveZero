@@ -65,16 +65,16 @@ mod check {
     use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeCache};
     use rz_position::{BoardMove, Position, PositionIdentity, PositionSnapshot};
     use rz_search::cpu::{
-        CpuCapabilities, CpuConfig, CpuEngine, CpuError, CpuLimits, CpuProfile, CpuReport,
-        CpuResumePolicy, CpuResumeToken, CpuSearcher, CpuWork,
+        CpuCapabilities, CpuConfig, CpuEngine, CpuError, CpuLimits, CpuPausedStackSnapshot,
+        CpuProfile, CpuReport, CpuResumePolicy, CpuResumeToken, CpuSearcher, CpuWork,
     };
-    use rz_search::cpu_checker::OwnedCpuChecker;
+    use rz_search::cpu_checker::{CheckerError, OwnedCpuChecker};
     use rz_search::cpu_value::CpuValueIdentity;
     use rz_search::pals::engine::{
-        DivergenceQuery, ModelValueIdentity, ModelValueOutput, PalsConfig, PalsEngine, PalsLimits,
-        PostRepairRecheckPolicy, RecheckFinished, RecheckPrepared, ResolverPolicy, RoleAcceptance,
-        RoleError, RoleEvaluation, RoleLogicalContext, RoleModel, RoleQuery, RoleQueryPurpose,
-        RoleRecord, RoleSearchClosure,
+        DivergenceQuery, ModelValueIdentity, ModelValueOutput, PalsConfig, PalsEngine, PalsError,
+        PalsLimits, PostRepairRecheckPolicy, RecheckFinished, RecheckPrepared, ResolverPolicy,
+        RoleAcceptance, RoleError, RoleEvaluation, RoleLogicalContext, RoleModel, RoleQuery,
+        RoleQueryPurpose, RoleRecord, RoleSearchClosure,
     };
     use rz_search::pals::store::{ExecutionId, PalsStores, TaskQuestion};
     use rz_uci::pals_native::{
@@ -130,6 +130,7 @@ mod check {
         stage: &'static str,
         code: &'static str,
         load_cause: Option<Box<NativeCudaWarmLoadError>>,
+        pals_cause: Option<Box<PalsError>>,
     }
     impl Failure {
         fn wire(self) -> Value {
@@ -150,6 +151,9 @@ mod check {
                     "original_cause_retained_until_projection":true,
                     "physical_run_or_completion_claim":false});
             }
+            if let Some(error) = self.pals_cause {
+                wire["pals_diagnostic"] = pals_error_diagnostic(&error);
+            }
             wire
         }
     }
@@ -158,6 +162,7 @@ mod check {
             stage,
             code,
             load_cause: None,
+            pals_cause: None,
         }
     }
     fn require(condition: bool, stage: &'static str, code: &'static str) -> Result<(), Failure> {
@@ -185,7 +190,51 @@ mod check {
             stage: "load_cuda_private_warm",
             code: role_error_code(&error.cause),
             load_cause: Some(Box::new(error)),
+            pals_cause: None,
         }
+    }
+    fn pals_failure(stage: &'static str, code: &'static str, error: PalsError) -> Failure {
+        Failure {
+            stage,
+            code,
+            load_cause: None,
+            pals_cause: Some(Box::new(error)),
+        }
+    }
+    fn pals_error_diagnostic(error: &PalsError) -> Value {
+        let kind = match error {
+            PalsError::InvalidConfig => "InvalidConfig",
+            PalsError::InvalidLimits => "InvalidLimits",
+            PalsError::Rules(_) => "Rules",
+            PalsError::Cpu(_) => "Cpu",
+            PalsError::Checker(_) => "Checker",
+            PalsError::Role(_) => "Role",
+            PalsError::Store(_) => "Store",
+            PalsError::Capacity => "Capacity",
+            PalsError::RoleCallLimit => "RoleCallLimit",
+        };
+        // Only the typed category and compile-time checker detail are exposed.
+        // In particular, do not format backend/CPU/Rules error payloads, which
+        // can carry private paths or native messages. Keep the typed cause until
+        // this projection instead of replacing a search failure with cleanup.
+        let checker = match error {
+            PalsError::Checker(CheckerError::Invalid(detail)) => {
+                Some(json!({"kind":"Invalid","detail":detail}))
+            }
+            PalsError::Checker(CheckerError::Unsupported(detail)) => {
+                Some(json!({"kind":"Unsupported","detail":detail}))
+            }
+            PalsError::Checker(CheckerError::OwnedReportRejected { reason }) => {
+                Some(json!({"kind":"OwnedReportRejected","detail":reason}))
+            }
+            PalsError::Checker(CheckerError::External { stage, code }) => {
+                Some(json!({"kind":"External","stage":stage,"code":code}))
+            }
+            PalsError::Checker(CheckerError::Owned(_)) => Some(json!({"kind":"Owned"})),
+            _ => None,
+        };
+        json!({"kind":kind,"checker":checker,
+            "original_cause_retained_until_projection":true,"raw_error_text_published":false})
     }
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -1111,6 +1160,9 @@ mod check {
         }
         fn paused_stack_bytes(&self) -> Option<usize> {
             self.engine.paused_stack_bytes()
+        }
+        fn paused_stack_snapshot(&self) -> Option<CpuPausedStackSnapshot> {
+            self.engine.paused_stack_snapshot()
         }
         fn token_is_current(&self, token: &CpuResumeToken) -> bool {
             self.engine.token_is_current(token)
@@ -2764,8 +2816,13 @@ mod check {
             let counters = engine
                 .last_search_counters()
                 .ok_or(fail("search", "actual_counters_missing"))?;
+            let search_failure = search
+                .as_ref()
+                .err()
+                .map(|error| pals_failure("search", "actual_search_failed", error.clone()));
             let search_wire = json!({"identity": engine.search_identity(), "policy": format!("{:?}", engine.post_repair_recheck_policy()),
-                "returned_ok": search.is_ok(), "error": search.as_ref().err().map(|error| format!("{error:?}")),
+                "returned_ok": search.is_ok(), "error": search_failure.as_ref().map(|error| error.code),
+                "error_diagnostic": search_failure.clone().map(Failure::wire),
                 "best_move": search.as_ref().ok().and_then(|v| v.best_move).map(|v| v.to_string()),
                 "completion": search.as_ref().ok().map(|v| format!("{:?}", v.completion)),
                 "role_calls": counters.role_calls, "proposer_calls": counters.proposer_calls,
@@ -2825,14 +2882,29 @@ mod check {
                     }
                 }
             }
-            let checker = engine
-                .shutdown_checker(whole)
-                .map_err(|_| fail("cleanup", "own_checker_shutdown_failed"))?;
+            // Preserve work observations even when the independent CPU owner
+            // cannot prove shutdown. Native GPU cleanup below still has its own
+            // physical receipt and must neither hide nor certify CPU closure.
+            let (checker_closed, checker_cleanup_failure) = match engine.shutdown_checker(whole) {
+                Ok(checker) => (
+                    checker.cleanup_complete,
+                    (!checker.cleanup_complete)
+                        .then(|| fail("cleanup", "own_checker_cleanup_incomplete")),
+                ),
+                Err(error) => (
+                    false,
+                    Some(pals_failure(
+                        "cleanup",
+                        "own_checker_shutdown_failed",
+                        error,
+                    )),
+                ),
+            };
             drop(engine);
             native
                 .lock()
                 .map_err(|_| fail("cleanup", "owner_unavailable"))?
-                .finish_search(if resume.is_ok() {
+                .finish_search(if search.is_ok() && resume.is_ok() && checker_closed {
                     RoleSearchClosure::Completed
                 } else {
                     RoleSearchClosure::Failed
@@ -2841,8 +2913,10 @@ mod check {
             Ok::<_, Failure>((
                 startup,
                 search_wire,
+                search_failure,
                 resume,
-                checker.cleanup_complete,
+                checker_closed,
+                checker_cleanup_failure,
                 forwarded,
             ))
         })();
@@ -2856,16 +2930,27 @@ mod check {
         let capture = capture
             .lock()
             .map_err(|_| fail("capture", "capture_unavailable"))?;
-        let (startup, search, resume, checker_closed, forwarded, work_failure) = match outcome {
-            Ok((startup, search, resume, checker, count)) => (
+        let (
+            startup,
+            search,
+            search_failure,
+            resume,
+            checker_closed,
+            checker_cleanup_failure,
+            forwarded,
+            work_failure,
+        ) = match outcome {
+            Ok((startup, search, search_failure, resume, checker, checker_failure, count)) => (
                 Some(startup),
                 Some(search),
+                search_failure,
                 Some(resume),
                 checker,
+                checker_failure,
                 Some(count),
                 None,
             ),
-            Err(error) => (None, None, None, false, None, Some(error)),
+            Err(error) => (None, None, None, None, false, None, None, Some(error)),
         };
         let captures_complete = !capture.calls.is_empty()
             && capture.calls.iter().all(|call| {
@@ -3049,11 +3134,14 @@ mod check {
             "fresh_vs_seeded_equality_required": false, "same_seed_independent_reference_required": true,
             "startup_receipt": startup, "actual_search": search, "actual_search_rechecks": capture.rechecks,
             "resume": resume.as_ref().and_then(|v| v.as_ref().ok()),
-            "failure": work_failure.or_else(|| resume.as_ref().and_then(|v| v.as_ref().err().cloned()))
+            "failure": work_failure.or(search_failure).or_else(|| resume.as_ref().and_then(|v| v.as_ref().err().cloned()))
+                .or_else(|| checker_cleanup_failure.clone())
                 .or_else(|| (cpu_resume["passed"] != true).then(|| fail("cpu_scheduler_resume", "actual_pause_repair_c_resume_not_exercised")))
                 .or_else(|| (!owner_accounting).then(|| fail("cuda_warm_owner", "actual_owner_accounting_or_closure_missing")))
                 .map(Failure::wire),
             "cleanup_failure": shutdown.err().map(|error| role_failure("cleanup", error).wire()),
+            "checker_cleanup_complete": checker_closed,
+            "checker_cleanup_failure": checker_cleanup_failure.map(Failure::wire),
             "calls": capture.wires(), "final_receipt": receipt,
             "validator_v_execution": "not_run;_native_role_model_has_no_validator_call",
             "unknown_cancel_deadline_quarantine_evidence": "separate_mock_cpu_unit_tests;_not_exercised_by_this_actual_gpu_success_case",
@@ -3889,6 +3977,116 @@ mod check {
             assert_eq!(legacy, json!({"stage":"synthetic","code":"unchanged"}));
         }
         use super::*;
+
+        #[test]
+        fn checker_failure_keeps_typed_cause_without_publishing_raw_error_text() {
+            let original = PalsError::Checker(CheckerError::Unsupported(
+                "paused stack shutdown owner observation",
+            ));
+            let failure = pals_failure("cleanup", "own_checker_shutdown_failed", original);
+            assert!(matches!(
+                failure.pals_cause.as_deref(),
+                Some(PalsError::Checker(CheckerError::Unsupported(
+                    "paused stack shutdown owner observation"
+                )))
+            ));
+            let wire = failure.wire();
+            assert_eq!(wire["code"], "own_checker_shutdown_failed");
+            assert_eq!(wire["pals_diagnostic"]["kind"], "Checker");
+            assert_eq!(wire["pals_diagnostic"]["checker"]["kind"], "Unsupported");
+            assert_eq!(
+                wire["pals_diagnostic"]["checker"]["detail"],
+                "paused stack shutdown owner observation"
+            );
+            assert_eq!(wire["pals_diagnostic"]["raw_error_text_published"], false);
+            let private_payload = "synthetic private backend path and native text";
+            let wire = pals_failure(
+                "search",
+                "actual_search_failed",
+                PalsError::Role(RoleError::Backend(private_payload.to_owned())),
+            )
+            .wire();
+            assert_eq!(wire["pals_diagnostic"]["kind"], "Role");
+            assert!(
+                !serde_json::to_string(&wire)
+                    .unwrap()
+                    .contains(private_payload)
+            );
+        }
+
+        #[test]
+        fn observed_cpu_paused_owner_is_visible_at_admission_and_checker_shutdown() {
+            use rz_search::cpu_checker::{CheckerReport, CpuChecker};
+            let capture = Arc::new(Mutex::new(Capture::new(Instant::now())));
+            capture.lock().unwrap().stage = "actual_pals_search";
+            let engine = CpuEngine::with_resume_policy(
+                CpuConfig {
+                    profile: CpuProfile::Independent,
+                    tt_entries: 128,
+                    max_depth: 2,
+                    quiescence_ply: 8,
+                },
+                CpuResumePolicy::PausedStack,
+            )
+            .unwrap();
+            let observed = ObservedCpu {
+                engine,
+                capture: Arc::clone(&capture),
+            };
+            let mut checker = OwnedCpuChecker::new(observed).unwrap();
+            let initial = checker.paused_stack_snapshot().unwrap();
+            assert!(initial.complete && initial.owner_id != 0);
+            assert!(!initial.admission_closed && !initial.owner_released);
+            assert_eq!(initial, checker.paused_stack_snapshot().unwrap());
+            // This is the same idle owner witness required before the first
+            // PALS CPU task. No frames does not make an absent snapshot valid.
+            assert!(!checker.discard_paused_stack());
+            let idle = checker.paused_stack_snapshot().unwrap();
+            assert_eq!(idle.owner_id, initial.owner_id);
+            assert!(idle.complete);
+            assert_eq!((idle.tokens_retained, idle.bytes_current), (0, 0));
+            let cancel = AtomicBool::new(false);
+            let position = Position::startpos();
+            let limits = CpuLimits {
+                max_depth: 2,
+                max_nodes: 1,
+                deadline: Some(Instant::now() + Duration::from_secs(5)),
+            };
+            let CheckerReport::Owned(partial) =
+                checker.analyze(&position, limits, &cancel).unwrap()
+            else {
+                panic!("own CPU observer returned a foreign report");
+            };
+            let token = partial.resume.as_ref().unwrap();
+            assert!(token.is_paused_stack() && checker.token_is_current(token));
+            let paused = checker.paused_stack_snapshot().unwrap();
+            assert_eq!(paused.tokens_retained, 1);
+            assert!(paused.complete && paused.bytes_current > 0);
+            let attempt = checker.last_attempt().unwrap().clone();
+            let shutdown = checker.shutdown(Instant::now()).unwrap();
+            assert!(shutdown.cleanup_complete);
+            assert!(!shutdown.exit_observed && !shutdown.stdout_drained);
+            let closed = checker.paused_stack_snapshot().unwrap();
+            assert_eq!(closed.owner_id, initial.owner_id);
+            assert!(closed.complete && closed.admission_closed && closed.owner_released);
+            assert_eq!((closed.tokens_retained, closed.bytes_current), (0, 0));
+            assert_eq!(closed.tokens_invalidated, paused.tokens_invalidated + 1);
+            assert_eq!(closed.bytes_peak, paused.bytes_peak);
+            assert!(!checker.token_is_current(token));
+            assert_eq!(checker.last_attempt().unwrap().work, attempt.work);
+            assert_eq!(checker.last_attempt().unwrap().elapsed, attempt.elapsed);
+            assert!(checker.shutdown(Instant::now()).unwrap().cleanup_complete);
+            assert_eq!(closed, checker.paused_stack_snapshot().unwrap());
+            let trace = capture.lock().unwrap();
+            assert_eq!(trace.cpu_attempts.len(), 1);
+            assert_eq!(trace.cpu_attempts[0].wire["report"]["nodes"], partial.nodes);
+            assert_eq!(
+                trace.cpu_attempts[0].wire["report"]["pv"],
+                json!(moves(&partial.pv))
+            );
+            assert!(trace.calls.is_empty());
+            assert_eq!(trace.cpu_resume_evidence()["passed"], false);
+        }
 
         #[test]
         fn conv_default_device_warm_selection_requires_capture_control_not_cost() {
