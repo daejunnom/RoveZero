@@ -499,6 +499,7 @@ impl PalsArenaLaunchV4 {
     pub fn validate(&self) -> Result<(), ArenaError> {
         self.semantic_lock.verify()?;
         require(self.domain == PALS_ARENA_V4_DOMAIN, "wrong V4 arena domain")?;
+        validate_cudnn_conv_pair(&self.endpoints)?;
         resources::validate_profile(self)?;
         let m = &self.semantic_lock.manifest;
         require(
@@ -1005,6 +1006,30 @@ impl PalsArenaLaunchV4 {
                                     loading.canonical_sha256
                                 ),
                             ]);
+                        }
+                        if let Some(conv) = &control.cudnn_conv_search {
+                            require(
+                                m.engines.iter().all(|e| matches!(e, PalsEngineV4::Pals(_)))
+                                    && matches!(
+                                        v4.policies.cuda_warm,
+                                        PalsCudaWarmPolicyV4::Disabled
+                                    )
+                                    && self.execution_binding(i).is_none(),
+                                "DEFAULT host runtime candidate requires the two-PALS V4 pilot with no Warm/followup mode",
+                            )?;
+                            let checkpoint = match &e.model.weights {
+                                PalsWeightIdentityV3::Untrained { artifact, .. }
+                                | PalsWeightIdentityV3::Trained { artifact, .. } => {
+                                    &artifact.sha256
+                                }
+                                _ => {
+                                    return Err(invalid(
+                                        "DEFAULT host requires an actual checkpoint",
+                                    ));
+                                }
+                            };
+                            conv.validate(cuda, checkpoint)?;
+                            args.push("--pals-cudnn-conv-search=default-host-control-v1".into());
                         }
                     }
                     if let Some(probe_ms) = cuda.startup_probe_timeout_ms {
@@ -3513,6 +3538,170 @@ mod tests {
         input.endpoints[1] = input.endpoints[0].clone();
         input.resource_profile = Some(PalsArenaResourceProfileV4::ColabObserved {});
         input
+    }
+    #[cfg(all(target_os = "linux", feature = "native-cuda"))]
+    fn cudnn_conv_pilot_fixture() -> PalsArenaLaunchV4 {
+        let (native, _) = super::super::tests::cuda_control_fixture();
+        let old = match &native.semantic_lock.manifest.engines[0] {
+            PalsEngineV3::Pals(e) => e,
+            _ => unreachable!(),
+        };
+        let mut input = colab_fixture();
+        input.budget = native.budget;
+        for i in 0..2 {
+            let config = if i == 0 {
+                PalsModelConfig::baseline()
+            } else {
+                PalsModelConfig::full_line_interaction_v2()
+            };
+            let PalsEngineV4::Pals(e) = &mut input.semantic_lock.manifest.engines[i] else {
+                unreachable!()
+            };
+            e.base.model = old.model.clone();
+            e.base.model.input_schema = config.profile.encoding_schema().into();
+            e.base.model.implementation_sha256 =
+                hex(rz_eval::pals_model::compiled_model_boundary_sha256());
+            e.base.pools = old.pools.clone();
+            e.model_v2.profile = if i == 0 {
+                PalsModelProfileV4::LegacySummaryV1
+            } else {
+                PalsModelProfileV4::FullLineInteractionV2
+            };
+            e.model_v2.model_schema = if i == 0 {
+                "rovezero.pals-model.v1"
+            } else {
+                "rovezero.pals-model.v2"
+            }
+            .into();
+            e.model_v2.model_semantics = config.profile.model_semantics().into();
+            e.model_v2.model_semantics_sha256 = hex(config.profile.registered_semantics_sha256());
+            e.model_v2.encoding_schema = config.profile.encoding_schema().into();
+            e.model_v2.encoding_sha256 =
+                hex(rz_uci::pals_native::pals_fresh_encoding_semantic_digest_for_config(&config));
+            e.model_v2.max_line_plies = if i == 0 { 0 } else { 256 };
+            let mut cuda = native.endpoints[0].cuda_model().unwrap().clone();
+            cuda.model.encoding_semantic_sha256 =
+                hex(rz_uci::pals_native::pals_rules_encoding_semantic_digest_for_config(&config));
+            cuda.model.adapter_source_sha256 =
+                hex(rz_uci::pals_native::pals_native_source_digest());
+            e.model_v2.model_identity = format!("pals-onnx-pc-fp32-{}", cuda.model.export.sha256);
+            let mut conv = PalsCuDnnConvBindingV1 {
+                profile: PalsCuDnnConvProfileV1::DefaultHostControlV1,
+                backend_source_sha256: digest(include_bytes!("../../../rz-eval/src/pals_onnx.rs")),
+                descriptor_sha256: "0".repeat(64),
+            };
+            let checkpoint = match &e.base.model.weights {
+                PalsWeightIdentityV3::Untrained { artifact, .. }
+                | PalsWeightIdentityV3::Trained { artifact, .. } => &artifact.sha256,
+                _ => unreachable!(),
+            };
+            conv.descriptor_sha256 =
+                digest(&serde_json::to_vec(&conv.descriptor(&cuda, checkpoint)).unwrap());
+            cuda.cuda_control.as_mut().unwrap().cudnn_conv_search = Some(conv);
+            input.endpoints[i] = PalsEndpointLaunchV3::OnnxCuda(Box::new(cuda));
+            input.semantic_lock.manifest.resources[i] =
+                native.semantic_lock.manifest.resources[0].clone();
+        }
+        input.semantic_lock.manifest.declared_changes =
+            input.semantic_lock.manifest.actual_change_axes();
+        input.semantic_lock = input.semantic_lock.manifest.lock().unwrap();
+        input
+    }
+    #[cfg(all(target_os = "linux", feature = "native-cuda"))]
+    #[test]
+    fn pals_cudnn_conv_v4_argv_roundtrip_and_mode_mixing() {
+        let input = cudnn_conv_pilot_fixture();
+        let locked = input.lock().unwrap();
+        let encoded = serde_json::to_string(&input).unwrap();
+        let roundtrip = PalsArenaLaunchV4::from_json(&encoded)
+            .unwrap()
+            .lock()
+            .unwrap();
+        assert_eq!(locked.sha256(), roundtrip.sha256());
+        for i in 0..2 {
+            let args = &locked.endpoint_views[i].arguments;
+            assert_eq!(args, &roundtrip.endpoint_views[i].arguments);
+            assert_eq!(
+                args.iter()
+                    .filter(|a| a.starts_with("--pals-cudnn-conv-search="))
+                    .count(),
+                1
+            );
+            assert!(
+                args.iter()
+                    .any(|a| a == "--pals-cudnn-conv-search=default-host-control-v1")
+            );
+            assert!(
+                args.iter()
+                    .any(|a| a == "--pals-device-public-memory=false")
+            );
+        }
+        let mut none = input.clone();
+        for endpoint in &mut none.endpoints {
+            let PalsEndpointLaunchV3::OnnxCuda(c) = endpoint else {
+                unreachable!()
+            };
+            c.cuda_control.as_mut().unwrap().cudnn_conv_search = None;
+        }
+        let old = none.lock().unwrap();
+        assert_ne!(old.sha256(), locked.sha256());
+        assert!(
+            !serde_json::to_string(&none)
+                .unwrap()
+                .contains("cudnn_conv_search")
+        );
+        for i in 0..2 {
+            let expected: Vec<_> = locked.endpoint_views[i]
+                .arguments
+                .iter()
+                .filter(|a| !a.starts_with("--pals-cudnn-conv-search="))
+                .collect();
+            assert_eq!(
+                old.endpoint_views[i].arguments.iter().collect::<Vec<_>>(),
+                expected
+            );
+        }
+        let mut one = input.clone();
+        let PalsEndpointLaunchV3::OnnxCuda(c) = &mut one.endpoints[1] else {
+            unreachable!()
+        };
+        c.cuda_control.as_mut().unwrap().cudnn_conv_search = None;
+        assert!(one.lock().is_err());
+        let mut mixed = input.clone();
+        mixed.followup_execution = Some(PalsFollowupExecutionBindingV4 {
+            domain: "rz-pals-followup-execution-v4/1".into(),
+            schema_version: 4,
+            archive_output: None,
+            endpoints: [
+                Some(PalsEndpointExecutionBindingV4 {
+                    owner_methods: PalsFollowupOwnerMethodsV4 {
+                        producer_domain: "metadata-only".into(),
+                        producer_schema_version: 4,
+                        producer_implementation_sha256: "a".repeat(64),
+                        trace_capacity: 1,
+                        trace_bytes_max: 1024,
+                        repair: None,
+                        paused_stack: None,
+                        cold_archive: None,
+                        cuda_warm: None,
+                    },
+                    cold_archive: None,
+                    cuda_warm: None,
+                }),
+                None,
+            ],
+        });
+        assert!(
+            mixed
+                .endpoint(0)
+                .unwrap_err()
+                .to_string()
+                .contains("DEFAULT host runtime candidate")
+        );
+        let mut namespace = json(encoded.as_bytes()).unwrap();
+        namespace["endpoints"][0]["configuration"]["cuda_control"]["cudnn_conv_search"]["profile"] =
+            "default-device-warm-v1".into();
+        assert!(PalsArenaLaunchV4::from_json(&namespace.to_string()).is_err());
     }
     #[test]
     fn colab_profile_is_explicit_and_absent_strict_wire_bytes_are_preserved() {

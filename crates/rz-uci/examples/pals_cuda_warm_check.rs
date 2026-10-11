@@ -2316,7 +2316,6 @@ mod check {
                 cache_public_memory: true,
                 device_public_memory: true,
                 cudnn_conv_search: cuda_conv_selection(args)?,
-                ..PalsOnnxConfig::cpu()
             },
             NativeOwnerOptions {
                 drain_limit: CLEANUP,
@@ -2589,7 +2588,6 @@ mod check {
                 cache_public_memory: true,
                 device_public_memory: true,
                 cudnn_conv_search: cuda_conv_selection(args)?,
-                ..PalsOnnxConfig::cpu()
             },
             NativeOwnerOptions {
                 drain_limit: CLEANUP,

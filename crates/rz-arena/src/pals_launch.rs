@@ -989,6 +989,103 @@ pub struct PalsCudaControlBindingV3 {
     /// nineteen-file binary bundle and the control/NN placement inventory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loading_profile: Option<PalsCudaLoadingBindingV1>,
+    /// Separate experimental host-runtime selection; omission preserves the
+    /// historical control envelope, canonical digest and executable argv.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_cudnn_conv"
+    )]
+    pub cudnn_conv_search: Option<PalsCuDnnConvBindingV1>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum PalsCuDnnConvProfileV1 {
+    #[serde(rename = "default-host-control-v1")]
+    DefaultHostControlV1,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PalsCuDnnConvBindingV1 {
+    pub profile: PalsCuDnnConvProfileV1,
+    pub backend_source_sha256: String,
+    pub descriptor_sha256: String,
+}
+fn deserialize_present_cudnn_conv<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PalsCuDnnConvBindingV1>, D::Error> {
+    PalsCuDnnConvBindingV1::deserialize(deserializer).map(Some)
+}
+fn cudnn_conv_binding(cuda: &PalsOnnxCudaLaunchV3) -> Option<&PalsCuDnnConvBindingV1> {
+    cuda.cuda_control.as_ref()?.cudnn_conv_search.as_ref()
+}
+impl PalsCuDnnConvBindingV1 {
+    fn descriptor(&self, cuda: &PalsOnnxCudaLaunchV3, checkpoint: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema":"rz-pals-cudnn-default-loaded-execution/1",
+            "scope":"loaded_backend_request_not_selected_plan_or_process_exit",
+            "selected_profile":"default-host-control-v1",
+            "manifest_sha256":cuda.model.export.sha256,"model_epoch":checkpoint,
+            "backend_source_sha256":self.backend_source_sha256,
+            "runtime_sha256":cuda.model.runtime.sha256,
+            "runtime_bundle_sha256":cuda.cuda_bundle.canonical_sha256,
+            "control_inventory_sha256":cuda.cuda_control.as_ref().map(|c|&c.inventory.sha256),
+            "provider":"CUDAExecutionProvider","device_id":cuda.device_id,
+            "session_arena_bytes":cuda.session_arena_bytes,
+            "intra_threads":2,"inter_threads":1,"parallel_execution":false,
+            "cache_public_memory":true,"public_memory":"host",
+            "native_loading_profile":"eager-cuda12-cudnn9-v1","graph_optimization":"disable",
+            "cudnn_conv_algo_search_requested":"DEFAULT","tf32_requested":false,"cuda_graph_requested":false,
+            "nvidia_tf32_override_environment_request":"absent"
+        })
+    }
+    fn validate(&self, cuda: &PalsOnnxCudaLaunchV3, checkpoint: &str) -> Result<(), ArenaError> {
+        let control = cuda
+            .cuda_control
+            .as_ref()
+            .ok_or_else(|| invalid("DEFAULT requires inventory control"))?;
+        require(
+            hash(&self.backend_source_sha256)
+                && hash(&self.descriptor_sha256)
+                && self.backend_source_sha256
+                    == digest(include_bytes!("../../rz-eval/src/pals_onnx.rs"))
+                && hash(checkpoint)
+                && control.loading_profile.is_none()
+                && cuda.cuda_record_pages.is_none()
+                && cuda.session_arena_bytes == 2u64 << 30
+                && cuda.model.graphs.len() == 2
+                && cuda
+                    .model
+                    .graphs
+                    .iter()
+                    .map(|g| g.role.as_str())
+                    .collect::<BTreeSet<_>>()
+                    == BTreeSet::from(["public", "shared_pc"]),
+            "DEFAULT host candidate requires exact compiled backend source, eager inventory, two public/shared graphs and unchanged two-GiB model arenas",
+        )?;
+        control.inventory.validate()?;
+        require_public_artifact(&control.inventory)?;
+        require(
+            (1..=MAX_CONTROL_INVENTORY_BYTES).contains(&control.inventory.bytes),
+            "DEFAULT inventory bound differs",
+        )?;
+        let bytes = serde_json::to_vec(&self.descriptor(cuda, checkpoint))
+            .map_err(|e| invalid(e.to_string()))?;
+        require(
+            digest(&bytes) == self.descriptor_sha256,
+            "DEFAULT declared loaded-execution descriptor hash differs",
+        )
+    }
+}
+fn validate_cudnn_conv_pair(endpoints: &[PalsEndpointLaunchV3; 2]) -> Result<(), ArenaError> {
+    let selected = endpoints
+        .iter()
+        .filter_map(PalsEndpointLaunchV3::cuda_model)
+        .filter(|c| cudnn_conv_binding(c).is_some())
+        .count();
+    require(
+        selected == 0 || selected == 2,
+        "DEFAULT host runtime candidate must be selected for both PALS CUDA model endpoints",
+    )
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum PalsCudaLoadingProfileV1 {
@@ -1123,6 +1220,13 @@ impl PalsArenaLaunchV3 {
         Ok(input)
     }
     pub fn validate(&self) -> Result<(), ArenaError> {
+        require(
+            self.endpoints
+                .iter()
+                .filter_map(PalsEndpointLaunchV3::cuda_model)
+                .all(|c| cudnn_conv_binding(c).is_none()),
+            "DEFAULT host runtime candidate requires a separately registered V4 arena pilot",
+        )?;
         self.semantic_lock.verify()?;
         for index in 0..2 {
             validate_launch_search_policy(self, index)?;
@@ -1486,6 +1590,13 @@ impl PalsArenaLaunchV3 {
         Ok(total)
     }
     fn endpoint(&self, i: usize) -> Result<ExternalUciEndpointV2, ArenaError> {
+        require(
+            self.endpoints[i]
+                .cuda_model()
+                .and_then(cudnn_conv_binding)
+                .is_none(),
+            "V3 cannot generate DEFAULT host runtime candidate argv",
+        )?;
         let helper = self.external_cpu_r_binding(i)?;
         let m = &self.semantic_lock.manifest;
         let role = if i == 0 {
@@ -2634,6 +2745,67 @@ fn validate_native_loading_evidence(
         startup: validate_native_loading_mapping(cuda, loading, startup_mapping)?,
         final_mapping: validate_native_loading_mapping(cuda, loading, final_mapping)?,
     }))
+}
+fn validate_native_cudnn_conv(
+    cuda: Option<&PalsOnnxCudaLaunchV3>,
+    wire_version: u32,
+    checkpoint: &str,
+    record: &serde_json::Value,
+) -> Result<(), ArenaError> {
+    let actual = &record["execution"]["cudnn_conv_search_diagnostic"];
+    let selected = cuda.and_then(cudnn_conv_binding);
+    let Some(binding) = selected else {
+        return require(
+            actual.is_null(),
+            "undeclared cuDNN DEFAULT execution diagnostic",
+        );
+    };
+    let cuda = cuda.expect("binding requires CUDA");
+    require(
+        wire_version == 4,
+        "DEFAULT host candidate cannot attest a legacy native wire",
+    )?;
+    binding.validate(cuda, checkpoint)?;
+    require(
+        record["execution"]["device_public_memory"] == false
+            && record["execution"]["private_warm"].is_null()
+            && record["execution"]["host_record_pages"].is_null()
+            && record["execution"]["cuda_record_pages"].is_null(),
+        "DEFAULT host candidate cannot mix device/Warm/page execution",
+    )?;
+    let descriptor = binding.descriptor(cuda, checkpoint);
+    require(
+        actual.as_object().is_some_and(|v| v.len() == 10)
+            && actual["descriptor"] == descriptor
+            && array_hash(&actual["descriptor_sha256"])? == binding.descriptor_sha256
+            && actual["descriptor_encoding"] == "serde_json_utf8_fixed_descriptor_object"
+            && actual["actual_cudnn_plan"] == "unknown"
+            && actual["numerical_note"] == "unknown"
+            && actual["tf32_actual"] == "unknown"
+            && actual["tf32_retry"] == "unknown"
+            && actual["production_default_changed"] == false
+            && actual["warm_success_claim"] == false
+            && actual["pilot_success_claim"] == false,
+        "actual DEFAULT descriptor/schema/hash/source/runtime/bundle/inventory/config differs from the registered host candidate",
+    )
+}
+fn validate_native_cudnn_conv_pair(
+    cuda: Option<&PalsOnnxCudaLaunchV3>,
+    wire_version: u32,
+    checkpoint: &str,
+    startup: &serde_json::Value,
+    termination: &serde_json::Value,
+) -> Result<(), ArenaError> {
+    if cuda.and_then(cudnn_conv_binding).is_some() {
+        require(
+            startup["execution"] == termination["execution"],
+            "DEFAULT host execution changed between startup and final receipt",
+        )?;
+    }
+    for record in [startup, termination] {
+        validate_native_cudnn_conv(cuda, wire_version, checkpoint, record)?;
+    }
+    Ok(())
 }
 fn validate_native_startup_budget(
     cuda: &PalsOnnxCudaLaunchV3,
@@ -4121,6 +4293,7 @@ fn validate_pals_native_records_inner<L: PalsArenaValidationContext>(
         PalsWeightIdentityV3::Trained { artifact, .. } => (artifact, true),
         _ => return Err(invalid("missing actual weights")),
     };
+    validate_native_cudnn_conv_pair(cuda, lock.native_wire_version(), &checkpoint.sha256, sn, tn)?;
     for field in [
         "model_epoch",
         "export_manifest_sha256",
@@ -7136,7 +7309,7 @@ mod tests {
             "public_nn_runs_failed_known":0,"role_nn_runs_failed_known":0,"validated_public_outputs":public,
             "validated_role_outputs":role,"live_public_cache_entries":0,"new_game_resets":1})
     }
-    fn cuda_control_fixture() -> (PalsArenaLaunchV3, Vec<u8>) {
+    pub(super) fn cuda_control_fixture() -> (PalsArenaLaunchV3, Vec<u8>) {
         let (mut f, _) = cuda_fixture();
         let cuda = f.endpoints[0].cuda_model().unwrap();
         // Static metadata/receipt linkage fixture, never native CUDA evidence.
@@ -7156,6 +7329,7 @@ mod tests {
         cuda.cuda_control = Some(Box::new(PalsCudaControlBindingV3 {
             inventory,
             loading_profile: None,
+            cudnn_conv_search: None,
         }));
         (f, bytes)
     }
@@ -7190,6 +7364,141 @@ mod tests {
             profile,
             canonical_sha256: profile.canonical_sha256(),
         }
+    }
+    fn cudnn_conv_fixture() -> (PalsOnnxCudaLaunchV3, PalsCuDnnConvBindingV1) {
+        let (f, _) = cuda_control_fixture();
+        let mut cuda = f.endpoints[0].cuda_model().unwrap().clone();
+        let mut binding = PalsCuDnnConvBindingV1 {
+            profile: PalsCuDnnConvProfileV1::DefaultHostControlV1,
+            backend_source_sha256: digest(include_bytes!("../../rz-eval/src/pals_onnx.rs")),
+            descriptor_sha256: "0".repeat(64),
+        };
+        binding.descriptor_sha256 =
+            digest(&serde_json::to_vec(&binding.descriptor(&cuda, &"a".repeat(64))).unwrap());
+        cuda.cuda_control.as_mut().unwrap().cudnn_conv_search = Some(binding.clone());
+        (cuda, binding)
+    }
+    #[test]
+    fn pals_cudnn_conv_absence_preserves_codec_digest_and_argv() {
+        let (old, _) = cuda_control_fixture();
+        let locked = old.lock().unwrap();
+        let encoded = serde_json::to_string(&old).unwrap();
+        assert!(!encoded.contains("cudnn_conv_search"));
+        let roundtrip = PalsArenaLaunchV3::from_json(&encoded)
+            .unwrap()
+            .lock()
+            .unwrap();
+        assert_eq!(locked.sha256(), roundtrip.sha256());
+        assert_eq!(
+            locked.endpoint_views[0].arguments,
+            roundtrip.endpoint_views[0].arguments
+        );
+        let mut bad = json(encoded.as_bytes()).unwrap();
+        bad["endpoints"][0]["configuration"]["cuda_control"]["cudnn_conv_search"] =
+            serde_json::Value::Null;
+        assert!(PalsArenaLaunchV3::from_json(&bad.to_string()).is_err());
+        bad["endpoints"][0]["configuration"]["cuda_control"]["cudnn_conv_search"] = serde_json::json!({
+            "profile":"default-device-warm-v1","backend_source_sha256":"a".repeat(64),"descriptor_sha256":"b".repeat(64)});
+        assert!(PalsArenaLaunchV3::from_json(&bad.to_string()).is_err());
+    }
+    #[test]
+    fn pals_cudnn_conv_selection_requires_v4_eager_host_pair_and_exact_pins() {
+        let (cuda, binding) = cudnn_conv_fixture();
+        binding.validate(&cuda, &"a".repeat(64)).unwrap();
+        let (mut old, _) = cuda_control_fixture();
+        old.endpoints[0] = PalsEndpointLaunchV3::OnnxCuda(Box::new(cuda.clone()));
+        assert!(old.lock().is_err());
+        assert!(old.endpoint(0).is_err());
+        assert!(validate_cudnn_conv_pair(&old.endpoints).is_err());
+        old.endpoints[1] = old.endpoints[0].clone();
+        validate_cudnn_conv_pair(&old.endpoints).unwrap();
+        let mut mixed = cuda.clone();
+        mixed.cuda_control.as_mut().unwrap().loading_profile = Some(loading_binding_fixture());
+        assert!(binding.validate(&mixed, &"a".repeat(64)).is_err());
+        let mut bad = binding.clone();
+        bad.descriptor_sha256 = "f".repeat(64);
+        assert!(bad.validate(&cuda, &"a".repeat(64)).is_err());
+        bad = binding;
+        bad.backend_source_sha256 = "f".repeat(64);
+        assert!(bad.validate(&cuda, &"a".repeat(64)).is_err());
+    }
+    #[test]
+    fn pals_cudnn_conv_loaded_descriptor_rejects_tamper_and_undeclared_modes() {
+        let (cuda, binding) = cudnn_conv_fixture();
+        let checkpoint = "a".repeat(64);
+        let descriptor = binding.descriptor(&cuda, &checkpoint);
+        let actual = serde_json::json!({"descriptor":descriptor,"descriptor_sha256":hash_array(&binding.descriptor_sha256),
+            "descriptor_encoding":"serde_json_utf8_fixed_descriptor_object","actual_cudnn_plan":"unknown",
+            "numerical_note":"unknown","tf32_actual":"unknown","tf32_retry":"unknown",
+            "production_default_changed":false,"warm_success_claim":false,"pilot_success_claim":false});
+        let record = serde_json::json!({"execution":{"device_public_memory":false,"cudnn_conv_search_diagnostic":actual}});
+        validate_native_cudnn_conv(Some(&cuda), 4, &checkpoint, &record).unwrap();
+        validate_native_cudnn_conv_pair(Some(&cuda), 4, &checkpoint, &record, &record.clone())
+            .unwrap();
+        let mut changed_final = record.clone();
+        let first = changed_final["execution"]["cudnn_conv_search_diagnostic"]["descriptor_sha256"]
+            [0]
+        .as_u64()
+        .unwrap();
+        changed_final["execution"]["cudnn_conv_search_diagnostic"]["descriptor_sha256"][0] =
+            (first ^ 1).into();
+        assert!(
+            validate_native_cudnn_conv_pair(Some(&cuda), 4, &checkpoint, &record, &changed_final)
+                .is_err()
+        );
+        let mut missing_final = record.clone();
+        missing_final["execution"]["cudnn_conv_search_diagnostic"] = serde_json::Value::Null;
+        assert!(
+            validate_native_cudnn_conv_pair(Some(&cuda), 4, &checkpoint, &record, &missing_final)
+                .is_err()
+        );
+        assert!(validate_native_cudnn_conv(Some(&cuda), 3, &checkpoint, &record).is_err());
+        assert!(validate_native_cudnn_conv(None, 4, &checkpoint, &record).is_err());
+        let mut legacy = cuda.clone();
+        legacy.cuda_control.as_mut().unwrap().cudnn_conv_search = None;
+        assert!(validate_native_cudnn_conv(Some(&legacy), 4, &checkpoint, &record).is_err());
+        for field in [
+            "schema",
+            "selected_profile",
+            "backend_source_sha256",
+            "runtime_sha256",
+            "runtime_bundle_sha256",
+            "control_inventory_sha256",
+            "manifest_sha256",
+            "model_epoch",
+            "cache_public_memory",
+            "public_memory",
+            "native_loading_profile",
+            "graph_optimization",
+            "device_id",
+            "session_arena_bytes",
+            "intra_threads",
+            "inter_threads",
+            "parallel_execution",
+            "tf32_requested",
+            "cuda_graph_requested",
+            "nvidia_tf32_override_environment_request",
+        ] {
+            let mut bad = record.clone();
+            bad["execution"]["cudnn_conv_search_diagnostic"]["descriptor"][field] =
+                serde_json::Value::Null;
+            assert!(
+                validate_native_cudnn_conv(Some(&cuda), 4, &checkpoint, &bad).is_err(),
+                "{field}"
+            );
+        }
+        for field in [
+            "production_default_changed",
+            "warm_success_claim",
+            "pilot_success_claim",
+        ] {
+            let mut bad = record.clone();
+            bad["execution"]["cudnn_conv_search_diagnostic"][field] = true.into();
+            assert!(validate_native_cudnn_conv(Some(&cuda), 4, &checkpoint, &bad).is_err());
+        }
+        let mut bad = record;
+        bad["execution"]["device_public_memory"] = true.into();
+        assert!(validate_native_cudnn_conv(Some(&cuda), 4, &checkpoint, &bad).is_err());
     }
     fn mapping_fixture(
         cuda: &PalsOnnxCudaLaunchV3,
