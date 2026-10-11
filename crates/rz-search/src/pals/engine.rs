@@ -16,7 +16,7 @@ pub use super::value::{
 };
 use crate::cpu::{
     CPU_MATE_SCORE, CpuEngine, CpuError, CpuLimits, CpuReport, CpuResumeToken, CpuScoreScope,
-    CpuSearcher,
+    CpuSearcher, CpuSideScopeSnapshot,
 };
 use crate::cpu_checker::{
     CheckerAttempt, CheckerError, CheckerIdentity, CheckerReport, CheckerShutdown, CpuChecker,
@@ -62,6 +62,27 @@ pub const POST_REPAIR_FROZEN_WDL_SEARCH_VERSION: &str = "post-repair-frozen-wdl-
 pub const POST_REPAIR_FROZEN_WDL_QUEUE_SEARCH_VERSION: &str = "post-repair-frozen-wdl-queue-v2";
 pub const POST_REPAIR_FROZEN_WDL_CONDITIONS: &str = "accepted-repair;unchanged-first-move;C-at-each-actual-counter-prefix;equal-line-length;Fresh-same-frozen-model-precision-context-revision-WDL-or-both-Rules-terminal;immutable-raw-context-revision-pair;mixed-scope-unresolved;strict-value-decrease;conditional-refutation-only;shared-role-cpu-store-deadline-cancel-limits";
 pub const POST_REPAIR_FROZEN_WDL_QUEUE_CONDITIONS: &str = "accepted-repair;unchanged-first-move;C-at-each-actual-counter-prefix;equal-line-length;Fresh-same-frozen-model-precision-context-revision-WDL-or-both-Rules-terminal;immutable-raw-context-revision-pair;mixed-scope-unresolved;strict-value-decrease;conditional-refutation-only;shared-role-cpu-store-deadline-cancel-limits;pending-at-most-64;Repair-at-most-3-per-first-move;deduplicate-question-revision;stop-without-new-evidence;fresh-counter-to-new-Repair-strict-improvement;supersede-active-refutation-with-paired-evidence";
+pub const PALS_CPU_INTERLEAVE_SEARCH_VERSION: &str = "post-repair-frozen-wdl-queue-held-parent-v1";
+pub const PALS_CPU_INTERLEAVE_CONDITIONS: &str = "iterative-frozen-WDL-queue-v2;S-held-parent-side-scope-v1;one-primary-paused-task-plus-held-path-publication-reservation-max8MiB;side-CompletedIteration-one-shot-separate-TT-ordering-storage;transient-Rules-path-replay-separately-observed-host-memory;original-AnalyzePosition-task-resume-only-after-accepted-Repair-and-C-tail;same-state-history-depth-value-condition-owner-task-node-chunk;shared-cpu-nodes-role-store-deadline-cancel-limits;read-only-progress-after-recheck-finish;no-completed-work-recharge";
+
+/// Startup-selected S scheduling lane. Ordinary fresh work keeps the historical
+/// replacement behavior. This opt-in never weakens token or TaskTable checks.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CpuInterleavePolicy {
+    #[default]
+    ReplaceOnFresh,
+    ResumeAfterAcceptedRepairC,
+}
+
+type ObservedProgress<'a> = dyn FnMut(BoardMove, &PalsStores, &[RoleRecord]) + 'a;
+
+struct HeldCpuTask {
+    active_root: StateId,
+    node: usize,
+    execution: ExecutionId,
+    target_depth: u16,
+    prefix: Vec<BoardMove>,
+}
 
 /// Checker selection controls CPU discovery only. Value resolution is an
 /// independent startup policy; foreign CP/mate reports never become own raw.
@@ -1140,6 +1161,8 @@ pub struct PalsEngine<M: RoleModel> {
     resolver: ResolverPolicy,
     followup_lane: bool,
     post_repair_recheck: PostRepairRecheckPolicy,
+    cpu_interleave: CpuInterleavePolicy,
+    held_cpu_task: Option<HeldCpuTask>,
     model: M,
     cpu: Box<dyn CpuChecker>,
     checker_registered_identity: CheckerIdentity,
@@ -1359,6 +1382,8 @@ impl<M: RoleModel> PalsEngine<M> {
             resolver,
             followup_lane: true,
             post_repair_recheck: policy,
+            cpu_interleave: CpuInterleavePolicy::ReplaceOnFresh,
+            held_cpu_task: None,
             model,
             cpu,
             checker_registered_identity,
@@ -1386,6 +1411,31 @@ impl<M: RoleModel> PalsEngine<M> {
             new_game_transition_error: None,
         })
     }
+
+    /// Immutable opt-in requiring an owner which can actually preserve one
+    /// paused task while fresh side work runs. Unsupported combinations fail
+    /// before an engine/model call; old constructors do not select this lane.
+    pub fn new_with_boxed_checker_and_policies_and_cpu_interleave(
+        config: PalsConfig,
+        model: M,
+        cpu: Box<dyn CpuChecker>,
+        resolver: ResolverPolicy,
+        policy: PostRepairRecheckPolicy,
+        interleave: CpuInterleavePolicy,
+    ) -> Result<Self, PalsError> {
+        if interleave == CpuInterleavePolicy::ResumeAfterAcceptedRepairC
+            && (policy != PostRepairRecheckPolicy::IterativeFrozenModelWdlV2
+                || cpu.owned_resume_policy() != Some(crate::cpu::CpuResumePolicy::PausedStack)
+                || !cpu.preserves_paused_on_fresh_tasks()
+                || !cpu.capabilities().resume)
+        {
+            return Err(CpuError::Unsupported("held-parent Repair/C resume profile").into());
+        }
+        let mut engine =
+            Self::new_with_boxed_checker_and_policies(config, model, cpu, resolver, policy)?;
+        engine.cpu_interleave = interleave;
+        Ok(engine)
+    }
     pub fn new_game(&mut self) {
         if self.archive_config().is_some() {
             // The void compatibility entry has no original caller controls and
@@ -1399,6 +1449,7 @@ impl<M: RoleModel> PalsEngine<M> {
             .game_generation
             .and_then(|generation| generation.checked_add(1));
         self.nodes.clear();
+        self.held_cpu_task = None;
         self.records.clear();
         // Preserve the old synchronous own clear. A foreign reset can fail and
         // needs caller controls; defer it to search or explicit try_new_game.
@@ -1436,6 +1487,8 @@ impl<M: RoleModel> PalsEngine<M> {
             let result = self.try_new_archive_game(deadline, cancel);
             if let Err(error) = &result {
                 self.new_game_transition_error = Some(error.clone());
+            } else {
+                self.held_cpu_task = None;
             }
             return result;
         }
@@ -1551,6 +1604,9 @@ impl<M: RoleModel> PalsEngine<M> {
     }
     /// Consumers must bind this effective identity, not only the legacy constant.
     pub fn search_identity(&self) -> &'static str {
+        if self.cpu_interleave == CpuInterleavePolicy::ResumeAfterAcceptedRepairC {
+            return PALS_CPU_INTERLEAVE_SEARCH_VERSION;
+        }
         if self.followup_lane && self.post_repair_recheck == PostRepairRecheckPolicy::Disabled {
             PALS_FOLLOWUP_SEARCH_VERSION
         } else {
@@ -1558,6 +1614,9 @@ impl<M: RoleModel> PalsEngine<M> {
         }
     }
     pub fn refinement_conditions(&self) -> Option<&'static str> {
+        if self.cpu_interleave == CpuInterleavePolicy::ResumeAfterAcceptedRepairC {
+            return Some(PALS_CPU_INTERLEAVE_CONDITIONS);
+        }
         if self.followup_lane && self.post_repair_recheck == PostRepairRecheckPolicy::Disabled {
             Some(PALS_FOLLOWUP_CONDITIONS)
         } else {
@@ -1568,6 +1627,12 @@ impl<M: RoleModel> PalsEngine<M> {
     /// that search returns; the caller owns cumulative per-process accounting.
     pub fn last_search_counters(&self) -> Option<PalsCounters> {
         self.last_search_counters
+    }
+    pub fn cpu_interleave_policy(&self) -> CpuInterleavePolicy {
+        self.cpu_interleave
+    }
+    pub fn cpu_side_scope_snapshot(&self) -> Option<CpuSideScopeSnapshot> {
+        self.cpu.paused_side_scope_snapshot()
     }
     /// First secondary finish-callback error in the latest entered search. The
     /// original operation error takes precedence. Reset on search and new_game.
@@ -1612,6 +1677,20 @@ impl<M: RoleModel> PalsEngine<M> {
     /// Publishes only choices observed before the logical deadline/cancellation.
     /// UCI can preserve this last valid choice while the physical owner drains.
     pub fn search_with_progress<F: FnMut(BoardMove)>(
+        &mut self,
+        position: &Position,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        mut progress: F,
+    ) -> Result<PalsResult, PalsError> {
+        self.search_with_observed_progress(position, limits, cancel, |movement, _, _| {
+            progress(movement)
+        })
+    }
+
+    /// The callback sees the current immutable authority and record projection.
+    /// It cannot mutate the scheduler or manufacture TaskTable provenance.
+    pub fn search_with_observed_progress<F: FnMut(BoardMove, &PalsStores, &[RoleRecord])>(
         &mut self,
         position: &Position,
         limits: PalsLimits,
@@ -1676,7 +1755,7 @@ impl<M: RoleModel> PalsEngine<M> {
         self.finish_followup_execution(closure, result.as_ref().err(), counters);
         result
     }
-    fn search_inner<F: FnMut(BoardMove)>(
+    fn search_inner<F: FnMut(BoardMove, &PalsStores, &[RoleRecord])>(
         &mut self,
         position: &Position,
         limits: PalsLimits,
@@ -1741,6 +1820,7 @@ impl<M: RoleModel> PalsEngine<M> {
             }
         };
         let root = self.finish_archive_root(root, limits.deadline, cancel)?;
+        self.prepare_cpu_interleave_root(root, limits)?;
         self.observe_followup_root(root);
         // Archive old input/evidence ownership before invalidating the live
         // projection. Previous-search WDL is not a current-context cache hit.
@@ -2396,6 +2476,21 @@ impl<M: RoleModel> PalsEngine<M> {
             self.external_request(root, node, line, None, true, limits, cancel, counters)?;
             return self.evaluate_model_value(node, line, limits, cancel, counters);
         }
+        if self.cpu_interleave == CpuInterleavePolicy::ResumeAfterAcceptedRepairC
+            && self
+                .held_cpu_task
+                .as_ref()
+                .is_some_and(|held| held.node == node && held.target_depth == limits.cpu_depth)
+            && self.nodes[node]
+                .resume
+                .as_ref()
+                .is_some_and(|token| token.is_paused_stack() && self.cpu.token_is_current(token))
+        {
+            // Ordinary frontier visits preserve this live original task. Only
+            // the accepted Repair/C barrier moves its held context and admits
+            // its real TaskTable resume; cache and side work cannot do so early.
+            return Ok(());
+        }
         if self.nodes[node].evidence.as_ref().is_some_and(|e| {
             e.depth >= limits.cpu_depth
                 && e.scope == CpuScoreScope::CompletedIteration
@@ -2411,6 +2506,17 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         let task_nodes = remaining.min(self.config.cpu_nodes_per_task);
         self.synchronize_cpu_checkpoints()?;
+        let held_prefix = if self.cpu_interleave == CpuInterleavePolicy::ResumeAfterAcceptedRepairC
+        {
+            let mut prefix = Vec::new();
+            prefix
+                .try_reserve_exact(line.len())
+                .map_err(|_| PalsError::Capacity)?;
+            prefix.extend_from_slice(line);
+            Some(prefix)
+        } else {
+            None
+        };
         let descriptor = self.owned_descriptor()?;
         let profile = stable_id(descriptor.config.profile.identity());
         let value_identity = self.owned_identity()?.clone();
@@ -2627,6 +2733,37 @@ impl<M: RoleModel> PalsEngine<M> {
             }
             self.nodes[node].resume = None;
         } else if let Some(token) = report.resume {
+            let held = if let Some(prefix) = held_prefix.filter(|_| token.is_paused_stack()) {
+                // Reserve both the live path and the bounded replacement path
+                // during a resume publication. Frames and TT are never cloned.
+                let charge = prefix
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<BoardMove>())
+                    .saturating_mul(2)
+                    .saturating_add(std::mem::size_of::<HeldCpuTask>());
+                if token
+                    .paused_stack_bytes()
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(charge)
+                    > crate::cpu::CPU_PAUSED_STACK_MAX_BYTES
+                {
+                    self.discard_cpu_stack_owner()?;
+                    self.nodes[node].resume = None;
+                    self.held_cpu_task = None;
+                    self.stores.tasks.fail(execution)?;
+                    return Err(PalsError::Capacity);
+                }
+                let root = self.stores.root().ok_or(StoreError::StaleConsumer)?;
+                Some(HeldCpuTask {
+                    active_root: self.stores.situations.get(root)?.state,
+                    node,
+                    execution,
+                    target_depth: limits.cpu_depth,
+                    prefix,
+                })
+            } else {
+                None
+            };
             self.nodes[node].resume = Some(token);
             if let Err(error) = self
                 .stores
@@ -2635,6 +2772,9 @@ impl<M: RoleModel> PalsEngine<M> {
                 self.nodes[node].resume = None;
                 self.stores.tasks.fail(execution)?;
                 return Err(error.into());
+            }
+            if let Some(held) = held {
+                self.held_cpu_task = Some(held);
             }
         } else {
             self.stores.tasks.fail(execution)?;
@@ -4107,7 +4247,7 @@ impl<M: RoleModel> PalsEngine<M> {
         limits: PalsLimits,
         cancel: &AtomicBool,
         counters: &mut PalsCounters,
-        progress: &mut dyn FnMut(BoardMove),
+        progress: &mut ObservedProgress<'_>,
     ) -> Result<(), PalsError> {
         let root_rank = self.ranked(
             root,
@@ -4583,7 +4723,7 @@ impl<M: RoleModel> PalsEngine<M> {
         limits: PalsLimits,
         cancel: &AtomicBool,
         counters: &mut PalsCounters,
-        progress: &mut dyn FnMut(BoardMove),
+        progress: &mut ObservedProgress<'_>,
     ) -> Result<(), PalsError> {
         if self.post_repair_recheck == PostRepairRecheckPolicy::Disabled || self.is_external() {
             return Ok(());
@@ -4896,7 +5036,7 @@ impl<M: RoleModel> PalsEngine<M> {
         limits: PalsLimits,
         cancel: &AtomicBool,
         counters: &mut PalsCounters,
-        progress: &mut dyn FnMut(BoardMove),
+        progress: &mut ObservedProgress<'_>,
         trace: &mut RecheckProgress,
     ) -> Result<(), PalsError> {
         let calls_before = counters.critic_calls;
@@ -5459,7 +5599,7 @@ impl<M: RoleModel> PalsEngine<M> {
         root: usize,
         limits: PalsLimits,
         cancel: &AtomicBool,
-        progress: &mut dyn FnMut(BoardMove),
+        progress: &mut ObservedProgress<'_>,
     ) -> Result<(), PalsError> {
         if let Some(stop) = self.stopped(limits, cancel) {
             return Err(match stop {
@@ -5488,7 +5628,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 }
             }
             if let Some(movement) = best {
-                progress(movement);
+                progress(movement, &self.stores, &self.records);
             }
             if let Some(stop) = self.stopped(limits, cancel) {
                 return Err(match stop {
@@ -5519,7 +5659,7 @@ impl<M: RoleModel> PalsEngine<M> {
             }
         }
         if let Some(movement) = best {
-            progress(movement);
+            progress(movement, &self.stores, &self.records);
         }
         // Progress belongs to the UCI consumer and may itself spend time or
         // trigger stop. A final round must not report RoundLimit after that
@@ -6235,7 +6375,7 @@ mod tests {
                 },
                 &AtomicBool::new(false),
                 &mut counters,
-                &mut |_| {},
+                &mut |_, _, _| {},
             )
             .unwrap();
         assert!(counters.external_checker_reports > 0);
@@ -6737,7 +6877,7 @@ mod tests {
                 limits,
                 cancel,
                 &mut self.counters,
-                &mut |_| {},
+                &mut |_, _, _| {},
             )
         }
     }

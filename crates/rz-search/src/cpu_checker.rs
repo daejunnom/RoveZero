@@ -4,7 +4,7 @@
 
 use crate::cpu::{
     CpuCapabilities, CpuConfig, CpuError, CpuLimits, CpuPausedStackSnapshot, CpuReport,
-    CpuResumePolicy, CpuResumeToken, CpuSearcher,
+    CpuResumePolicy, CpuResumeToken, CpuSearcher, CpuSideScopeSnapshot,
 };
 use crate::cpu_value::{CpuTrainingState, CpuValueIdentity};
 use rz_position::{BoardMove, Color, Position};
@@ -407,6 +407,12 @@ pub trait CpuChecker: Send {
     fn owned_resume_policy(&self) -> Option<crate::cpu::CpuResumePolicy> {
         None
     }
+    fn preserves_paused_on_fresh_tasks(&self) -> bool {
+        false
+    }
+    fn paused_side_scope_snapshot(&self) -> Option<CpuSideScopeSnapshot> {
+        None
+    }
     /// Actual native PausedStack owner facts. External/unsupported owners
     /// remain unknown; Node/Task retirement is not an owner observation.
     fn paused_stack_snapshot(&self) -> Option<CpuPausedStackSnapshot> {
@@ -508,6 +514,7 @@ pub struct OwnedCpuChecker<C: CpuSearcher> {
     last_attempt: Option<CheckerAttempt>,
     closed: bool,
     paused_stack_shutdown_complete: bool,
+    preserves_paused_on_fresh_tasks: bool,
 }
 
 impl<C: CpuSearcher> OwnedCpuChecker<C> {
@@ -537,6 +544,7 @@ impl<C: CpuSearcher> OwnedCpuChecker<C> {
             ));
         }
         let identity = CheckerIdentity::Owned(cpu.value_identity().clone());
+        let preserves_paused_on_fresh_tasks = cpu.preserves_paused_on_fresh_tasks();
         let capabilities = CheckerCapabilities {
             max_depth: cap.max_depth,
             max_prefix_plies: cap.max_prefix_plies,
@@ -556,6 +564,7 @@ impl<C: CpuSearcher> OwnedCpuChecker<C> {
             last_attempt: None,
             closed: false,
             paused_stack_shutdown_complete: false,
+            preserves_paused_on_fresh_tasks,
         })
     }
 
@@ -574,6 +583,7 @@ impl<C: CpuSearcher> OwnedCpuChecker<C> {
         let config = self.cpu.config();
         let capabilities = self.cpu.capabilities();
         if self.cpu.value_identity() != identity
+            || self.cpu.preserves_paused_on_fresh_tasks() != self.preserves_paused_on_fresh_tasks
             || self.cpu.search_identity() != self.search_identity
             || self.cpu.search_conditions() != self.conditions
             || config.profile != self.config.profile
@@ -660,6 +670,12 @@ impl<C: CpuSearcher> CpuChecker for OwnedCpuChecker<C> {
     }
     fn owned_resume_policy(&self) -> Option<crate::cpu::CpuResumePolicy> {
         Some(self.cpu.resume_policy())
+    }
+    fn preserves_paused_on_fresh_tasks(&self) -> bool {
+        self.preserves_paused_on_fresh_tasks
+    }
+    fn paused_side_scope_snapshot(&self) -> Option<CpuSideScopeSnapshot> {
+        self.cpu.paused_side_scope_snapshot()
     }
     fn paused_stack_snapshot(&self) -> Option<CpuPausedStackSnapshot> {
         if self.cpu.resume_policy() != CpuResumePolicy::PausedStack {

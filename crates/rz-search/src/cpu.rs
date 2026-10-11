@@ -31,6 +31,9 @@ pub const CPU_SEARCH_VERSION: &str = "rz-cpu-pvs/0.1";
 pub const CPU_SEE_SEARCH_VERSION: &str = "rz-cpu-pvs-legal-see/0.1";
 pub const CPU_PAUSED_STACK_SEARCH_VERSION: &str = "rz-cpu-pvs-paused-stack/0.1";
 pub const CPU_PAUSED_STACK_SEE_SEARCH_VERSION: &str = "rz-cpu-pvs-legal-see-paused-stack/0.1";
+pub const CPU_PAUSED_SIDE_SCOPE_SEARCH_VERSION: &str = "rz-cpu-pvs-paused-side-scope/1";
+pub const CPU_PAUSED_SIDE_SCOPE_SEE_SEARCH_VERSION: &str =
+    "rz-cpu-pvs-legal-see-paused-side-scope/1";
 pub const CPU_PAUSED_STACK_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const CPU_PAUSED_STACK_OWNER_ACCOUNTING_DOMAIN: &str =
     "rz-pals-paused-stack-owner-accounting-v4/1";
@@ -477,6 +480,20 @@ pub struct CpuEngine {
     stack_owner: Arc<()>,
     stack_serial: u64,
     paused_stack_telemetry: Option<CpuPausedStackSnapshot>,
+    /// Opt-in one-shot work owns another bounded TT/history, never the paused
+    /// traversal's owner. The side engine cannot retain an interrupted stack.
+    paused_side_scope: Option<Box<CpuEngine>>,
+    side_scope_observation: Option<CpuSideScopeSnapshot>,
+}
+
+/// Actual one-shot attempts and fixed owner storage. Fixed bytes are a
+/// reservation declaration, not peak RSS or the 8MiB paused-frame charge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CpuSideScopeSnapshot {
+    pub attempts: u64,
+    pub work: CpuWork,
+    pub fixed_reserved_bytes: usize,
+    pub complete: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -504,6 +521,14 @@ pub trait CpuSearcher: Send {
     fn capabilities(&self) -> CpuCapabilities;
     fn resume_policy(&self) -> CpuResumePolicy {
         CpuResumePolicy::CompletedIteration
+    }
+    /// Fresh side tasks can run without replacing the single paused owner.
+    /// This is an explicit scheduling capability, not ordinary PausedStack.
+    fn preserves_paused_on_fresh_tasks(&self) -> bool {
+        false
+    }
+    fn paused_side_scope_snapshot(&self) -> Option<CpuSideScopeSnapshot> {
+        None
     }
     /// Retained traversal bytes, excluding the already configured TT/history
     /// owner. None means there is no live paused traversal.
@@ -593,6 +618,12 @@ impl<C: CpuSearcher + ?Sized> CpuSearcher for Box<C> {
     fn resume_policy(&self) -> CpuResumePolicy {
         (**self).resume_policy()
     }
+    fn preserves_paused_on_fresh_tasks(&self) -> bool {
+        (**self).preserves_paused_on_fresh_tasks()
+    }
+    fn paused_side_scope_snapshot(&self) -> Option<CpuSideScopeSnapshot> {
+        (**self).paused_side_scope_snapshot()
+    }
     fn paused_stack_bytes(&self) -> Option<usize> {
         (**self).paused_stack_bytes()
     }
@@ -677,6 +708,12 @@ impl CpuSearcher for CpuEngine {
     }
     fn resume_policy(&self) -> CpuResumePolicy {
         CpuEngine::resume_policy(self)
+    }
+    fn preserves_paused_on_fresh_tasks(&self) -> bool {
+        CpuEngine::preserves_paused_on_fresh_tasks(self)
+    }
+    fn paused_side_scope_snapshot(&self) -> Option<CpuSideScopeSnapshot> {
+        CpuEngine::paused_side_scope_snapshot(self)
     }
     fn paused_stack_bytes(&self) -> Option<usize> {
         CpuEngine::paused_stack_bytes(self)
@@ -842,7 +879,61 @@ impl CpuEngine {
             stack_serial: 0,
             paused_stack_telemetry: (resume_policy == CpuResumePolicy::PausedStack)
                 .then(CpuPausedStackSnapshot::new),
+            paused_side_scope: None,
+            side_scope_observation: None,
         })
+    }
+
+    /// Separate S profile: hold one primary PausedStack while other fresh
+    /// questions execute with a distinct CompletedIteration TT/history owner.
+    /// Frozen evaluator weights are shared; mutable TT/ordering are never
+    /// copied, transferred or shared across scopes. Existing constructors keep
+    /// the fresh-analysis replacement contract.
+    pub fn with_paused_side_scope(
+        config: CpuConfig,
+        evaluator: Arc<dyn CpuValueEvaluator>,
+        ordering: CpuOrderingPolicy,
+    ) -> Result<Self, CpuError> {
+        let fixed_reserved_bytes = Self::side_scope_allocation_bytes(&config)?;
+        let side = Self::with_evaluator_and_ordering(config.clone(), evaluator.clone(), ordering)?;
+        let mut primary = Self::with_evaluator_ordering_and_resume_policy(
+            config,
+            evaluator,
+            ordering,
+            CpuResumePolicy::PausedStack,
+        )?;
+        primary.paused_side_scope = Some(Box::new(side));
+        primary.side_scope_observation = Some(CpuSideScopeSnapshot {
+            attempts: 0,
+            work: CpuWork::default(),
+            fixed_reserved_bytes,
+            complete: true,
+        });
+        Ok(primary)
+    }
+
+    fn side_scope_allocation_bytes(config: &CpuConfig) -> Result<usize, CpuError> {
+        usize::try_from(config.tt_allocation_bytes()?)
+            .map_err(|_| CpuError::Allocation)?
+            .checked_add(std::mem::size_of::<[[[i32; 64]; 64]; 2]>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
+            .ok_or(CpuError::Allocation)
+    }
+
+    /// Reserved fixed side-scope storage, not a measured peak. Active recursive
+    /// frames, allocator overhead and the primary 8MiB pause charge are separate.
+    pub fn paused_side_scope_reserved_bytes(&self) -> Option<usize> {
+        self.paused_side_scope
+            .as_ref()
+            .and_then(|side| Self::side_scope_allocation_bytes(side.config()).ok())
+    }
+
+    pub fn preserves_paused_on_fresh_tasks(&self) -> bool {
+        self.paused_side_scope.is_some()
+    }
+
+    pub fn paused_side_scope_snapshot(&self) -> Option<CpuSideScopeSnapshot> {
+        self.side_scope_observation
     }
 
     pub fn config(&self) -> &CpuConfig {
@@ -854,6 +945,12 @@ impl CpuEngine {
     }
 
     pub fn search_identity(&self) -> &'static str {
+        if self.paused_side_scope.is_some() {
+            return match self.ordering {
+                CpuOrderingPolicy::LegacyMvvLvaV1 => CPU_PAUSED_SIDE_SCOPE_SEARCH_VERSION,
+                CpuOrderingPolicy::LegalSeeV1 => CPU_PAUSED_SIDE_SCOPE_SEE_SEARCH_VERSION,
+            };
+        }
         match (self.ordering, self.resume_policy) {
             (CpuOrderingPolicy::LegacyMvvLvaV1, CpuResumePolicy::CompletedIteration) => {
                 CPU_SEARCH_VERSION
@@ -954,12 +1051,24 @@ impl CpuEngine {
                 self.ordering.identity()
             ),
         };
-        match self.resume_policy {
+        let conditions = match self.resume_policy {
             CpuResumePolicy::CompletedIteration => conditions,
             CpuResumePolicy::PausedStack => format!(
-                "{conditions};resume={};paused-owner:single-use-root-full-history-restriction-profile-value-conditions-target-depth;paused-memory:max-1-task-8388608-bytes;consumed-work:no-replay-no-recharge;cancel-newgame-fresh-analysis:invalidate",
-                self.resume_policy.identity()
+                "{conditions};resume={};paused-owner:single-use-root-full-history-restriction-profile-value-conditions-target-depth;paused-memory:max-1-task-8388608-bytes;consumed-work:no-replay-no-recharge;{}",
+                self.resume_policy.identity(),
+                if self.paused_side_scope.is_some() {
+                    "cancel-newgame:invalidate;fresh-analysis:held-parent-side-scope"
+                } else {
+                    "cancel-newgame-fresh-analysis:invalidate"
+                }
             ),
+        };
+        if let Some(bytes) = self.paused_side_scope_reserved_bytes() {
+            format!(
+                "{conditions};fresh-task-scope:held-parent-one-shot-v1;side-resume:none;side-TT-ordering:separate-owner;side-fixed-reserved-bytes={bytes};cancel-newgame:invalidate-all;side-and-primary-work:shared-caller-node-deadline-budget"
+            )
+        } else {
+            conditions
         }
     }
 
@@ -976,6 +1085,9 @@ impl CpuEngine {
         self.tt.iter_mut().for_each(|entry| *entry = None);
         *self.history = [[[0; 64]; 64]; 2];
         self.last_attempt_work = None;
+        if let Some(side) = self.paused_side_scope.as_mut() {
+            side.clear();
+        }
     }
 
     fn invalidate_paused_stack(&mut self) {
@@ -1066,7 +1178,9 @@ impl CpuEngine {
         cancellation: &AtomicBool,
     ) -> Result<CpuReport, CpuError> {
         self.last_attempt_work = Some(CpuWork::default());
-        self.invalidate_paused_stack();
+        if self.paused_side_scope.is_none() || cancellation.load(Ordering::Acquire) {
+            self.invalidate_paused_stack();
+        }
         if prefix.len() > MAX_DEPTH as usize {
             return Err(CpuError::InvalidLimits("divergence prefix exceeds 64 ply"));
         }
@@ -1130,6 +1244,64 @@ impl CpuEngine {
         )
     }
 
+    fn run_paused_side_scope(
+        &mut self,
+        position: &Position,
+        root_moves: Option<&[BoardMove]>,
+        limits: CpuLimits,
+        cancellation: &AtomicBool,
+        observer: &mut dyn FnMut(CpuIterationProgress),
+    ) -> Result<CpuReport, CpuError> {
+        let version = self.search_identity();
+        let (result, work) = {
+            let side = self
+                .paused_side_scope
+                .as_mut()
+                .ok_or(CpuError::Unsupported("held-parent side scope"))?;
+            let result = side.run(position, root_moves, limits, cancellation, None, observer);
+            (result, side.last_attempt_work())
+        };
+        // The last attempt and shared caller budget cover this side execution
+        // only, not the parent's cumulative pause diagnostics.
+        self.last_attempt_work = work;
+        if let Some(observation) = self.side_scope_observation.as_mut() {
+            if let Some(attempts) = observation.attempts.checked_add(1) {
+                observation.attempts = attempts;
+            } else {
+                observation.complete = false;
+            }
+            if let Some(work) = work {
+                for (total, added) in [
+                    (&mut observation.work.nodes, work.nodes),
+                    (
+                        &mut observation.work.quiescence_nodes,
+                        work.quiescence_nodes,
+                    ),
+                    (&mut observation.work.tt_hits, work.tt_hits),
+                ] {
+                    if let Some(sum) = total.checked_add(added) {
+                        *total = sum;
+                    } else {
+                        observation.complete = false;
+                    }
+                }
+            } else {
+                observation.complete = false;
+            }
+        }
+        if cancellation.load(Ordering::Acquire) {
+            self.invalidate_paused_stack();
+        }
+        result.map(|mut report| {
+            // This report belongs to the declared composite implementation.
+            // One-shot side work has no continuation token or resumed depth.
+            report.search_version = version;
+            report.resume = None;
+            report.reused_completed_depth = 0;
+            report
+        })
+    }
+
     fn run(
         &mut self,
         position: &Position,
@@ -1139,6 +1311,15 @@ impl CpuEngine {
         resume: Option<&CpuResumeToken>,
         observer: &mut dyn FnMut(CpuIterationProgress),
     ) -> Result<CpuReport, CpuError> {
+        if resume.is_none() && self.paused.is_some() && self.paused_side_scope.is_some() {
+            return self.run_paused_side_scope(
+                position,
+                root_moves,
+                limits,
+                cancellation,
+                observer,
+            );
+        }
         if self.resume_policy == CpuResumePolicy::PausedStack {
             return stack::run(
                 self,
@@ -1877,6 +2058,145 @@ pub fn evaluate_bootstrap(position: &Position) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn held_cpu() -> CpuEngine {
+        CpuEngine::with_paused_side_scope(
+            CpuConfig {
+                tt_entries: 64,
+                max_depth: 2,
+                ..CpuConfig::default()
+            },
+            Arc::new(BootstrapCpuValue::default()),
+            CpuOrderingPolicy::LegacyMvvLvaV1,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn paused_side_scope_keeps_parent_tt_history_and_resumes_without_recharge() {
+        let mut cpu = held_cpu();
+        let position = Position::startpos();
+        let cancel = AtomicBool::new(false);
+        let partial = CpuLimits {
+            max_depth: 1,
+            max_nodes: 8,
+            deadline: None,
+        };
+        let first = cpu.analyze(&position, partial, &cancel).unwrap();
+        let mut token = first.resume.clone().unwrap();
+        assert!(token.is_paused_stack() && cpu.token_is_current(&token));
+        let parent_tt = format!("{:?}", cpu.tt);
+        let parent_history = cpu.history.clone();
+        let owner = cpu.paused_stack_snapshot().unwrap();
+        let side = cpu
+            .analyze_divergence(
+                &position,
+                &[BoardMove::from_uci("e2e4").unwrap()],
+                partial,
+                &cancel,
+            )
+            .unwrap();
+        assert!(side.nodes > 0 && side.nodes <= partial.max_nodes);
+        assert!(side.resume.is_none());
+        assert_eq!(side.search_version, CPU_PAUSED_SIDE_SCOPE_SEARCH_VERSION);
+        assert_eq!(format!("{:?}", cpu.tt), parent_tt);
+        assert_eq!(cpu.history, parent_history);
+        assert_eq!(cpu.paused_stack_snapshot().unwrap(), owner);
+        assert!(cpu.token_is_current(&token));
+        let side_observed = cpu.paused_side_scope_snapshot().unwrap();
+        assert_eq!(side_observed.attempts, 1);
+        assert_eq!(side_observed.work.nodes, side.nodes);
+        assert!(side_observed.complete && side_observed.fixed_reserved_bytes > 0);
+        let mut charged = first.nodes;
+        let mut final_report = None;
+        for _ in 0..256 {
+            let next = cpu.resume(&position, &token, partial, &cancel).unwrap();
+            assert!(!cpu.token_is_current(&token));
+            charged += next.nodes;
+            if next.completed_depth == 1 {
+                final_report = Some(next);
+                break;
+            }
+            token = next.resume.clone().unwrap();
+            assert_eq!(token.cumulative_work().unwrap().nodes, charged);
+        }
+        let finished = final_report.expect("finite depth-one resume must finish");
+        let mut baseline = held_cpu();
+        let uninterrupted = baseline
+            .analyze(
+                &position,
+                CpuLimits {
+                    max_depth: 1,
+                    max_nodes: 2048,
+                    deadline: None,
+                },
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(
+            (finished.completed_depth, finished.score, finished.pv),
+            (
+                uninterrupted.completed_depth,
+                uninterrupted.score,
+                uninterrupted.pv
+            )
+        );
+        assert_eq!(charged, uninterrupted.nodes);
+        let closed = cpu.paused_stack_snapshot().unwrap();
+        assert_eq!(closed.tokens_peak, 1);
+        assert!(closed.bytes_peak <= CPU_PAUSED_STACK_MAX_BYTES as u64);
+        assert_eq!(closed.replayed_consumed_work, 0);
+        assert_eq!(cpu.paused_side_scope_snapshot().unwrap(), side_observed);
+    }
+
+    #[test]
+    fn paused_side_scope_cancel_and_clear_invalidate_only_the_real_owner() {
+        let mut cpu = held_cpu();
+        let position = Position::startpos();
+        let cancel = AtomicBool::new(false);
+        let limited = CpuLimits {
+            max_depth: 2,
+            max_nodes: 1,
+            deadline: None,
+        };
+        let token = cpu
+            .analyze(&position, limited, &cancel)
+            .unwrap()
+            .resume
+            .unwrap();
+        let wrong_prefix = [BoardMove::from_uci("e2e5").unwrap()];
+        assert!(
+            cpu.analyze_divergence(&position, &wrong_prefix, limited, &cancel)
+                .is_err()
+        );
+        assert!(cpu.token_is_current(&token));
+        cancel.store(true, Ordering::Release);
+        let side = cpu.analyze(&position, limited, &cancel).unwrap();
+        assert_eq!(side.completion, CpuCompletion::Canceled);
+        assert_eq!(side.nodes, 0);
+        assert!(!cpu.token_is_current(&token));
+        let actual = cpu.paused_stack_snapshot().unwrap();
+        assert!(actual.complete && actual.tokens_retained == 0 && actual.bytes_current == 0);
+        cancel.store(false, Ordering::Release);
+        let fresh = cpu
+            .analyze(&position, limited, &cancel)
+            .unwrap()
+            .resume
+            .unwrap();
+        assert!(cpu.token_is_current(&fresh));
+        cpu.clear();
+        assert!(!cpu.token_is_current(&fresh));
+        assert!(
+            cpu.paused_side_scope
+                .as_ref()
+                .unwrap()
+                .tt
+                .iter()
+                .all(Option::is_none)
+        );
+        assert_eq!(cpu.paused_stack_snapshot().unwrap().tokens_peak, 1);
+        assert_eq!(cpu.last_attempt_work(), None);
+    }
 
     #[test]
     fn completed_iteration_has_no_paused_owner_snapshot_through_boxed_boundary() {

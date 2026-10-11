@@ -52,7 +52,7 @@ impl<M: RoleModel> PalsEngine<M> {
         limits: PalsLimits,
         cancel: &AtomicBool,
         counters: &mut PalsCounters,
-        progress: &mut dyn FnMut(BoardMove),
+        progress: &mut ObservedProgress<'_>,
     ) -> Result<(), PalsError> {
         if self.post_repair_recheck == PostRepairRecheckPolicy::IterativeFrozenModelWdlV2 {
             let question = (
@@ -81,7 +81,7 @@ impl<M: RoleModel> PalsEngine<M> {
         limits: PalsLimits,
         cancel: &AtomicBool,
         counters: &mut PalsCounters,
-        progress: &mut dyn FnMut(BoardMove),
+        progress: &mut ObservedProgress<'_>,
     ) -> Result<(), PalsError> {
         while self.stopped(limits, cancel).is_none() {
             let Some(work) = self.repair_queue.pop_front() else {
@@ -440,7 +440,7 @@ impl<M: RoleModel> PalsEngine<M> {
         limits: PalsLimits,
         cancel: &AtomicBool,
         counters: &mut PalsCounters,
-        progress: &mut dyn FnMut(BoardMove),
+        progress: &mut ObservedProgress<'_>,
     ) -> Result<Option<NewFrontier>, PalsError> {
         if self.stopped(limits, cancel).is_some() {
             return Ok(None);
@@ -647,6 +647,10 @@ impl<M: RoleModel> PalsEngine<M> {
                     trace.disposition = RecheckDisposition::NoAlternativeResponse;
                     return Ok(());
                 }
+                // Only this accepted Repair/C continuation barrier can select
+                // the opt-in held parent. It resumes the original task/state,
+                // never the new counter leaf or a token from another namespace.
+                self.resume_cpu_after_repair_c(limits, cancel, counters)?;
                 counters.refutations += 1;
                 self.record_checked(
                     RecordKind::Counterexample,
@@ -725,7 +729,9 @@ impl<M: RoleModel> PalsEngine<M> {
                     trace.disposition = RecheckDisposition::CounterNotLower;
                     return Ok(());
                 }
-                self.publish_choice(work.root, limits, cancel, progress)?;
+                if self.cpu_interleave == CpuInterleavePolicy::ReplaceOnFresh {
+                    self.publish_choice(work.root, limits, cancel, progress)?;
+                }
                 let evidence =
                     self.frozen_refutation_observation(work, leaf, new, previous, limits, cancel)?;
                 self.archive_refute_continuation(
@@ -834,6 +840,16 @@ impl<M: RoleModel> PalsEngine<M> {
             },
         );
         result?;
+        if self.cpu_interleave == CpuInterleavePolicy::ResumeAfterAcceptedRepairC
+            && trace.prepared_accepted
+            && trace.reply_accepted
+            && trace.counterline_completed
+        {
+            // recheck_finished and its immutable TaskTable/record witness are
+            // now complete. Publish before a subsequent P call can replace its
+            // resident seed. This is a read-only observer, not invented work.
+            self.publish_choice(work.root, limits, cancel, progress)?;
+        }
         if let Some(stop) = self.stopped(limits, cancel) {
             return Err(match stop {
                 PalsCompletion::Canceled => RoleError::Canceled,
@@ -911,6 +927,7 @@ mod tests {
         finished: Vec<(RecheckDisposition, bool, Option<u64>, Option<u64>)>,
         revisions: Vec<u64>,
         replies: Option<[BoardMove; 3]>,
+        finished_notice: Option<std::sync::Arc<AtomicBool>>,
     }
     impl WdlFixture {
         fn new() -> Self {
@@ -925,6 +942,7 @@ mod tests {
                 finished: Vec::new(),
                 revisions: Vec::new(),
                 replies: None,
+                finished_notice: None,
             }
         }
     }
@@ -1009,6 +1027,9 @@ mod tests {
             Ok(output)
         }
         fn recheck_finished(&mut self, event: RecheckFinished<'_>) -> Result<(), RoleError> {
+            if let Some(notice) = &self.finished_notice {
+                notice.store(true, Ordering::Release);
+            }
             let revision = |endpoint: &RecheckEndpoint<'_>| match &endpoint.evidence {
                 RecheckEndpointEvidence::ModelWdl {
                     context_revision, ..
@@ -1060,6 +1081,234 @@ mod tests {
             .map(|m| BoardMove::from_uci(m).unwrap())
             .collect()
     }
+    #[test]
+    fn held_parent_repair_c_barrier_resumes_original_task_with_shared_budget() {
+        use crate::cpu::{CpuOrderingPolicy, CpuResumePolicy};
+        use crate::cpu_value::BootstrapCpuValue;
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let mut model = WdlFixture::new();
+        model.finished_notice = Some(finished.clone());
+        let cpu = CpuEngine::with_paused_side_scope(
+            CpuConfig {
+                max_depth: 2,
+                tt_entries: 64,
+                ..CpuConfig::default()
+            },
+            std::sync::Arc::new(BootstrapCpuValue::default()),
+            CpuOrderingPolicy::LegacyMvvLvaV1,
+        )
+        .unwrap();
+        assert_eq!(cpu.resume_policy(), CpuResumePolicy::PausedStack);
+        let mut engine = PalsEngine::new_with_boxed_checker_and_policies_and_cpu_interleave(
+            PalsConfig {
+                line_plies: 6,
+                cpu_nodes_per_task: 8,
+                ..PalsConfig::default()
+            },
+            model,
+            Box::new(OwnedCpuChecker::new(cpu).unwrap()),
+            ResolverPolicy::ModelWdlRestricted,
+            PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
+            CpuInterleavePolicy::ResumeAfterAcceptedRepairC,
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        let budget = PalsLimits {
+            max_cpu_nodes: 32,
+            cpu_depth: 2,
+            ..limits()
+        };
+        let mut counters = PalsCounters::default();
+        // Explicit registered CPU/mock Repair fixture, never GPU evidence.
+        let work = accepted_repair(&mut engine, &mut counters);
+        engine
+            .verify_checked_cpu(
+                work.repaired_leaf,
+                &work.repaired,
+                budget,
+                &cancel,
+                &mut counters,
+            )
+            .unwrap();
+        let token = engine.nodes[work.repaired_leaf].resume.clone().unwrap();
+        let (observation, previous) = engine.nodes[work.repaired_leaf]
+            .evidence
+            .as_ref()
+            .unwrap()
+            .provenance
+            .unwrap();
+        let raw = engine.stores.observations.get(observation).unwrap().clone();
+        let root = work.root;
+        // A same-node frontier visit is not the actual Repair/C barrier and
+        // must neither resume nor charge the held original task early.
+        let requested = counters.cpu_tasks_requested;
+        engine
+            .verify_checked_cpu(
+                work.repaired_leaf,
+                &work.repaired,
+                budget,
+                &cancel,
+                &mut counters,
+            )
+            .unwrap();
+        assert_eq!(counters.cpu_nodes, 8);
+        assert_eq!(counters.cpu_tasks_requested, requested);
+        assert_eq!(engine.held_cpu_task.as_ref().unwrap().execution, previous);
+        assert!(engine.cpu.token_is_current(&token));
+        // A different fresh state runs in the real one-shot side owner before
+        // C; it cannot invalidate the original task, token, TT or path.
+        engine
+            .verify_checked_cpu(root, &[], budget, &cancel, &mut counters)
+            .unwrap();
+        assert!(engine.cpu.token_is_current(&token));
+        assert_eq!(counters.cpu_nodes, 16);
+        let mut observed = false;
+        engine
+            .frozen_recheck_once(
+                &work,
+                budget,
+                &cancel,
+                &mut counters,
+                &mut |_, stores, records| {
+                    assert!(finished.load(Ordering::Acquire));
+                    assert!(!records.is_empty());
+                    observed = (0..stores.tasks.len()).any(|index| {
+                        let task = stores.tasks.get(ExecutionId(index)).unwrap();
+                        task.resumed_from == Some(previous)
+                            && task.key.state == stores.tasks.get(previous).unwrap().key.state
+                    });
+                },
+            )
+            .unwrap();
+        assert!(observed);
+        assert_eq!(engine.search_identity(), PALS_CPU_INTERLEAVE_SEARCH_VERSION);
+        assert_eq!(counters.cpu_nodes, 32);
+        assert_eq!(counters.cpu_tasks_requested, 4);
+        assert!(!engine.cpu.token_is_current(&token));
+        let renewed = engine.nodes[work.repaired_leaf].resume.as_ref().unwrap();
+        assert!(engine.cpu.token_is_current(renewed));
+        assert_eq!(renewed.cumulative_work().unwrap().nodes, 16);
+        assert_eq!(engine.stores.observations.get(observation).unwrap(), &raw);
+        let side = engine.cpu_side_scope_snapshot().unwrap();
+        assert_eq!((side.attempts, side.work.nodes), (2, 16));
+        assert!(side.complete);
+        let owner = engine.cpu.paused_stack_snapshot().unwrap();
+        assert_eq!(owner.tokens_peak, 1);
+        assert_eq!(owner.replayed_consumed_work, 0);
+        assert_eq!(owner.tokens_resumed, 1);
+        engine.discard_canceled_cpu_checkpoints().unwrap();
+        assert_eq!(
+            engine.cpu.paused_stack_snapshot().unwrap().tokens_retained,
+            0
+        );
+    }
+
+    #[test]
+    fn held_parent_c_barrier_with_smaller_task_chunk_keeps_original_owner() {
+        use crate::cpu::CpuOrderingPolicy;
+        use crate::cpu_value::BootstrapCpuValue;
+        let cpu = CpuEngine::with_paused_side_scope(
+            CpuConfig {
+                max_depth: 2,
+                tt_entries: 64,
+                ..CpuConfig::default()
+            },
+            std::sync::Arc::new(BootstrapCpuValue::default()),
+            CpuOrderingPolicy::LegacyMvvLvaV1,
+        )
+        .unwrap();
+        let mut engine = PalsEngine::new_with_boxed_checker_and_policies_and_cpu_interleave(
+            PalsConfig {
+                line_plies: 6,
+                cpu_nodes_per_task: 8,
+                ..PalsConfig::default()
+            },
+            WdlFixture::new(),
+            Box::new(OwnedCpuChecker::new(cpu).unwrap()),
+            ResolverPolicy::ModelWdlRestricted,
+            PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
+            CpuInterleavePolicy::ResumeAfterAcceptedRepairC,
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        let budget = PalsLimits {
+            max_cpu_nodes: 23,
+            cpu_depth: 2,
+            ..limits()
+        };
+        let mut counters = PalsCounters::default();
+        let work = accepted_repair(&mut engine, &mut counters);
+        engine
+            .verify_checked_cpu(
+                work.repaired_leaf,
+                &work.repaired,
+                budget,
+                &cancel,
+                &mut counters,
+            )
+            .unwrap();
+        let token = engine.nodes[work.repaired_leaf].resume.clone().unwrap();
+        let previous = engine.held_cpu_task.as_ref().unwrap().execution;
+        engine
+            .verify_checked_cpu(work.root, &[], budget, &cancel, &mut counters)
+            .unwrap();
+        engine
+            .frozen_recheck_once(&work, budget, &cancel, &mut counters, &mut |_, _, _| {})
+            .unwrap();
+        assert!(engine.cpu.token_is_current(&token));
+        assert_eq!(engine.held_cpu_task.as_ref().unwrap().execution, previous);
+        assert_eq!(
+            engine.cpu.paused_stack_snapshot().unwrap().tokens_resumed,
+            0
+        );
+        assert_eq!(counters.cpu_nodes, 23);
+        assert_eq!(engine.cpu_side_scope_snapshot().unwrap().work.nodes, 15);
+        engine.discard_canceled_cpu_checkpoints().unwrap();
+    }
+
+    #[test]
+    fn held_parent_profile_rejects_replace_or_wrong_refinement_owner() {
+        use crate::cpu::{CpuOrderingPolicy, CpuResumePolicy};
+        use crate::cpu_value::BootstrapCpuValue;
+        for policy in [
+            PostRepairRecheckPolicy::Disabled,
+            PostRepairRecheckPolicy::FrozenModelWdlV2,
+            PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
+        ] {
+            let cpu =
+                CpuEngine::with_resume_policy(CpuConfig::default(), CpuResumePolicy::PausedStack)
+                    .unwrap();
+            assert!(
+                PalsEngine::new_with_boxed_checker_and_policies_and_cpu_interleave(
+                    PalsConfig::default(),
+                    WdlFixture::new(),
+                    Box::new(OwnedCpuChecker::new(cpu).unwrap()),
+                    ResolverPolicy::ModelWdlRestricted,
+                    policy,
+                    CpuInterleavePolicy::ResumeAfterAcceptedRepairC,
+                )
+                .is_err()
+            );
+        }
+        let cpu = CpuEngine::with_paused_side_scope(
+            CpuConfig::default(),
+            std::sync::Arc::new(BootstrapCpuValue::default()),
+            CpuOrderingPolicy::LegacyMvvLvaV1,
+        )
+        .unwrap();
+        assert!(
+            PalsEngine::new_with_boxed_checker_and_policies_and_cpu_interleave(
+                PalsConfig::default(),
+                WdlFixture::new(),
+                Box::new(OwnedCpuChecker::new(cpu).unwrap()),
+                ResolverPolicy::ModelWdlRestricted,
+                PostRepairRecheckPolicy::Disabled,
+                CpuInterleavePolicy::ResumeAfterAcceptedRepairC,
+            )
+            .is_err()
+        );
+    }
+
     fn accepted_repair(
         engine: &mut PalsEngine<WdlFixture>,
         counters: &mut PalsCounters,
@@ -1291,7 +1540,7 @@ mod tests {
                 let first_move = work.original_first;
                 let first = work.clone();
                 let duplicate = work.clone();
-                let mut progress = |_: BoardMove| {};
+                let mut progress = |_: BoardMove, _: &PalsStores, _: &[RoleRecord]| {};
                 for (action, queued) in [
                     ("accepted_work", Some(first)),
                     ("same_work_duplicate", Some(duplicate)),
@@ -1457,7 +1706,7 @@ mod tests {
             let work = accepted_repair(&mut selected, &mut counters);
             let cancel = AtomicBool::new(false);
             let frontier = selected
-                .frozen_recheck_once(&work, limits(), &cancel, &mut counters, &mut |_| {})
+                .frozen_recheck_once(&work, limits(), &cancel, &mut counters, &mut |_, _, _| {})
                 .unwrap()
                 .unwrap();
             assert_eq!(
@@ -1509,10 +1758,22 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let budget = limits();
         selected
-            .queue_or_recheck_frozen(work.clone(), budget, &cancel, &mut counters, &mut |_| {})
+            .queue_or_recheck_frozen(
+                work.clone(),
+                budget,
+                &cancel,
+                &mut counters,
+                &mut |_, _, _| {},
+            )
             .unwrap();
         selected
-            .queue_or_recheck_frozen(work.clone(), budget, &cancel, &mut counters, &mut |_| {})
+            .queue_or_recheck_frozen(
+                work.clone(),
+                budget,
+                &cancel,
+                &mut counters,
+                &mut |_, _, _| {},
+            )
             .unwrap();
         assert_eq!(selected.repair_queue.len(), 1);
         assert_eq!(counters.repair_queue_deduplicated, 1);
@@ -1521,7 +1782,7 @@ mod tests {
         }
         assert!(!selected.admit_iterative_repair(work.original_first));
         selected
-            .drain_repair_queue(budget, &cancel, &mut counters, &mut |_| {})
+            .drain_repair_queue(budget, &cancel, &mut counters, &mut |_, _, _| {})
             .unwrap();
         assert!(selected.repair_queue.is_empty());
         assert_eq!(selected.repair_counts[&work.original_first], 3);
@@ -1607,10 +1868,16 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let budget = limits();
         selected
-            .queue_or_recheck_frozen(work.clone(), budget, &cancel, &mut counters, &mut |_| {})
+            .queue_or_recheck_frozen(
+                work.clone(),
+                budget,
+                &cancel,
+                &mut counters,
+                &mut |_, _, _| {},
+            )
             .unwrap();
         selected
-            .drain_repair_queue(budget, &cancel, &mut counters, &mut |_| {})
+            .drain_repair_queue(budget, &cancel, &mut counters, &mut |_, _, _| {})
             .unwrap();
         assert!(counters.accepted_repair_outputs > 0);
         assert!(counters.supported_repairs > 0);
@@ -1681,14 +1948,26 @@ mod tests {
                 question.repair_record_revision = selected.revision;
             }
             selected
-                .queue_or_recheck_frozen(question, budget, &cancel, &mut counters, &mut |_| {})
+                .queue_or_recheck_frozen(
+                    question,
+                    budget,
+                    &cancel,
+                    &mut counters,
+                    &mut |_, _, _| {},
+                )
                 .unwrap();
         }
         assert_eq!(selected.repair_queue.len(), MAX_PENDING_REPAIRS);
         assert_eq!(counters.repair_queue_enqueued, MAX_PENDING_REPAIRS as u64);
         assert_eq!(counters.repair_queue_peak, MAX_PENDING_REPAIRS);
         selected
-            .queue_or_recheck_frozen(work.clone(), budget, &cancel, &mut counters, &mut |_| {})
+            .queue_or_recheck_frozen(
+                work.clone(),
+                budget,
+                &cancel,
+                &mut counters,
+                &mut |_, _, _| {},
+            )
             .unwrap();
         assert_eq!(counters.repair_queue_deduplicated, 1);
         let mut overflow = work;
@@ -1699,7 +1978,13 @@ mod tests {
             .0;
         overflow.repair_record_revision = selected.revision;
         assert!(matches!(
-            selected.queue_or_recheck_frozen(overflow, budget, &cancel, &mut counters, &mut |_| {}),
+            selected.queue_or_recheck_frozen(
+                overflow,
+                budget,
+                &cancel,
+                &mut counters,
+                &mut |_, _, _| {}
+            ),
             Err(PalsError::Capacity)
         ));
         assert_eq!(selected.repair_queue.len(), MAX_PENDING_REPAIRS);
@@ -1738,7 +2023,7 @@ mod tests {
                         limits(),
                         &AtomicBool::new(false),
                         &mut counters,
-                        &mut |_| {},
+                        &mut |_, _, _| {},
                     )
                     .unwrap()
                     .unwrap();

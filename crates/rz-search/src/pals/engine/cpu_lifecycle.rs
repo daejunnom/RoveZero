@@ -6,6 +6,121 @@ use crate::cpu::CpuResumePolicy;
 use std::collections::BTreeSet;
 
 impl<M: RoleModel> PalsEngine<M> {
+    pub(super) fn prepare_cpu_interleave_root(
+        &mut self,
+        root: usize,
+        limits: PalsLimits,
+    ) -> Result<(), PalsError> {
+        if self.cpu_interleave == CpuInterleavePolicy::ResumeAfterAcceptedRepairC
+            && self.held_cpu_task.as_ref().is_some_and(|held| {
+                held.active_root != self.nodes[root].state || held.target_depth != limits.cpu_depth
+            })
+        {
+            self.discard_cpu_stack_owner()?;
+            self.synchronize_cpu_checkpoints()?;
+            self.held_cpu_task = None;
+        }
+        Ok(())
+    }
+
+    /// Called only after a completed, actually accepted post-Repair C tail.
+    /// The frozen model value still comes from its own Fresh namespace. This
+    /// executes the original CPU state/task with the remaining shared budget.
+    pub(super) fn resume_cpu_after_repair_c(
+        &mut self,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        counters: &mut PalsCounters,
+    ) -> Result<(), PalsError> {
+        if self.cpu_interleave != CpuInterleavePolicy::ResumeAfterAcceptedRepairC
+            || self.stopped(limits, cancel).is_some()
+            || counters.cpu_nodes >= limits.max_cpu_nodes
+        {
+            return Ok(());
+        }
+        self.synchronize_cpu_checkpoints()?;
+        let Some(held) = self.held_cpu_task.as_ref() else {
+            return Ok(());
+        };
+        let root = self.stores.root().ok_or(StoreError::StaleConsumer)?;
+        if self.stores.situations.get(root)?.state != held.active_root {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        if held.target_depth != limits.cpu_depth {
+            return Err(StoreError::InvalidConditions("held CPU target depth changed").into());
+        }
+        let node = held.node;
+        let Some(token) = self.nodes[node].resume.as_ref() else {
+            return Err(StoreError::InvalidConditions("held CPU task has no token").into());
+        };
+        if !token.is_paused_stack() || !self.cpu.token_is_current(token) {
+            return Err(StoreError::InvalidConditions("held CPU task owner is stale").into());
+        }
+        let previous = held.execution;
+        let task = self.stores.tasks.get(previous)?;
+        if task.key.state != self.nodes[node].state
+            || task.key.question != TaskQuestion::AnalyzePosition
+            || !matches!(task.status, TaskStatus::Paused { checkpoint, .. }
+                if checkpoint == node as u64)
+        {
+            return Err(StoreError::InvalidConditions("held CPU execution is not paused").into());
+        }
+        // TaskTable keys include the requested node chunk. A smaller remainder
+        // is a different task, not permission to replace or rename this owner.
+        let remaining = limits.max_cpu_nodes.saturating_sub(counters.cpu_nodes);
+        if remaining.min(self.config.cpu_nodes_per_task) != task.key.node_budget {
+            return Ok(());
+        }
+        // The retained path is authority from the same active Rules root, not
+        // a record hash or a repaired/counter state's approximate identity.
+        let root_node = self
+            .nodes
+            .iter()
+            .find(|node| node.state == held.active_root)
+            .ok_or(StoreError::StaleConsumer)?;
+        let mut checked = root_node.position.clone();
+        for &movement in &held.prefix {
+            checked.make_move(movement)?;
+        }
+        if checked.position_identity() != self.nodes[node].position.position_identity() {
+            return Err(StoreError::InvalidConditions("held CPU prefix/history mismatch").into());
+        }
+        // Move the retained path into this invocation rather than cloning a
+        // third prefix buffer. verify_checked_cpu publishes its successor path
+        // under the same combined 8MiB pause reservation.
+        let held = self.held_cpu_task.take().expect("validated held CPU task");
+        let requested_before = counters.cpu_tasks_requested;
+        let result = self.verify_checked_cpu(node, &held.prefix, limits, cancel, counters);
+        if self.held_cpu_task.is_none()
+            && self.nodes[node]
+                .resume
+                .as_ref()
+                .is_some_and(|token| token.is_paused_stack() && self.cpu.token_is_current(token))
+        {
+            self.held_cpu_task = Some(held);
+        }
+        result?;
+        if self.stopped(limits, cancel).is_none() && counters.cpu_tasks_requested > requested_before
+        {
+            let (_, execution) = self.nodes[node]
+                .evidence
+                .as_ref()
+                .and_then(|evidence| evidence.provenance)
+                .ok_or(StoreError::InvalidEvidence("CPU resume publication absent"))?;
+            if self.stores.tasks.get(execution)?.resumed_from != Some(previous) {
+                return Err(StoreError::InvalidEvidence("held CPU task was not resumed").into());
+            }
+        }
+        if self.nodes[node]
+            .resume
+            .as_ref()
+            .is_none_or(|token| !token.is_paused_stack())
+        {
+            self.held_cpu_task = None;
+        }
+        Ok(())
+    }
+
     fn cpu_stack_discard_required(&self) -> Result<bool, PalsError> {
         let policy = self.cpu.owned_resume_policy();
         let supports_discard = self.cpu.supports_paused_stack_discard();
@@ -87,6 +202,22 @@ impl<M: RoleModel> PalsEngine<M> {
         self.stores.tasks.retire_paused_except(&current)?;
         for index in stale {
             self.nodes[index].resume = None;
+            if self
+                .held_cpu_task
+                .as_ref()
+                .is_some_and(|held| held.node == index)
+            {
+                self.held_cpu_task = None;
+            }
+        }
+        if self.held_cpu_task.as_ref().is_some_and(|held| {
+            self.nodes.get(held.node).is_none_or(|node| {
+                node.resume.as_ref().is_none_or(|token| {
+                    !token.is_paused_stack() || !self.cpu.token_is_current(token)
+                })
+            })
+        }) {
+            self.held_cpu_task = None;
         }
         Ok(())
     }
@@ -106,11 +237,12 @@ impl<M: RoleModel> PalsEngine<M> {
         for node in &mut self.nodes {
             node.resume = None;
         }
+        self.held_cpu_task = None;
         self.stores.tasks.retire_paused_except(&BTreeSet::new())?;
         Ok(())
     }
 
-    fn discard_cpu_stack_owner(&mut self) -> Result<(), PalsError> {
+    pub(super) fn discard_cpu_stack_owner(&mut self) -> Result<(), PalsError> {
         self.cpu.discard_paused_stack();
         // An advertised custom implementation must actually invalidate known
         // frame owners; a false return alone proves no physical completion.
@@ -323,6 +455,73 @@ mod tests {
             max_cpu_nodes: 32,
             cpu_depth: 2,
         }
+    }
+
+    #[test]
+    fn observed_progress_preserves_default_choices_and_current_authority() {
+        let config = PalsConfig {
+            beam_width: 1,
+            line_plies: 4,
+            cpu_nodes_per_task: 8,
+            max_role_calls: 64,
+            ..PalsConfig::default()
+        };
+        let create = || {
+            PalsEngine::new(
+                config.clone(),
+                LegalOrderRoleMock,
+                CpuEngine::new(CpuConfig {
+                    tt_entries: 64,
+                    max_depth: 2,
+                    ..CpuConfig::default()
+                })
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let mut legacy = create();
+        let mut observed = create();
+        let position = Position::startpos();
+        let cancel = AtomicBool::new(false);
+        let budget = limits();
+        let mut legacy_choices = Vec::new();
+        let a = legacy
+            .search_with_progress(&position, budget, &cancel, |movement| {
+                legacy_choices.push(movement)
+            })
+            .unwrap();
+        let mut observed_choices = Vec::new();
+        let b = observed
+            .search_with_observed_progress(
+                &position,
+                budget,
+                &cancel,
+                |movement, stores, records| {
+                    let root = stores.root().unwrap();
+                    assert_eq!(
+                        stores
+                            .states
+                            .get(stores.situations.get(root).unwrap().state)
+                            .unwrap()
+                            .position_identity(),
+                        position.position_identity()
+                    );
+                    assert!(!records.is_empty());
+                    observed_choices.push(movement);
+                },
+            )
+            .unwrap();
+        assert_eq!(legacy_choices, observed_choices);
+        assert_eq!(
+            (a.best_move, a.score, a.counters),
+            (b.best_move, b.score, b.counters)
+        );
+        assert_eq!(legacy.search_identity(), observed.search_identity());
+        assert_eq!(
+            observed.cpu_interleave_policy(),
+            CpuInterleavePolicy::ReplaceOnFresh
+        );
+        assert_eq!(observed.cpu_side_scope_snapshot(), None);
     }
 
     fn root<M: RoleModel>(engine: &mut PalsEngine<M>, position: &Position) -> usize {
