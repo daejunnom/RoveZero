@@ -13,6 +13,7 @@ use crate::pals_model::{
     PALS_MODEL_SCHEMA, QUERY_LINE_COUNT, V_TASK_NAMES,
 };
 use crate::worker::{PhysicalRun, SingleWorker};
+use ort::execution_providers::cuda::CuDNNConvAlgorithmSearch;
 use ort::execution_providers::{
     ArenaExtendStrategy, CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider,
 };
@@ -866,6 +867,15 @@ fn startup_return(trace: Option<&StartupRoleTrace>, stage: PalsStartupBackendSta
     }
 }
 
+/// Explicit diagnostic request only; neither variant observes a selected plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PalsCuDnnConvSearch {
+    /// Preserve the CUDA EP's implicit EXHAUSTIVE option: no setter is called.
+    LegacyImplicitExhaustive,
+    /// A separately registered host-public CUDA control diagnostic variable.
+    ExperimentalDefault,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PalsOnnxConfig {
     pub provider: Provider,
@@ -876,6 +886,7 @@ pub struct PalsOnnxConfig {
     /// Device-resident public K/V has a separate explicit admission. The
     /// feature only compiles its code; selecting CPU never enables it.
     pub device_public_memory: bool,
+    pub cudnn_conv_search: PalsCuDnnConvSearch,
 }
 impl PalsOnnxConfig {
     pub fn cpu() -> Self {
@@ -884,6 +895,7 @@ impl PalsOnnxConfig {
             intra_threads: 2,
             cache_public_memory: true,
             device_public_memory: false,
+            cudnn_conv_search: PalsCuDnnConvSearch::LegacyImplicitExhaustive,
         }
     }
     fn validate(&self) -> Result<(), BackendError> {
@@ -917,7 +929,38 @@ impl PalsOnnxConfig {
                 "device PALS memory requires explicit CUDA and the I/O binding feature",
             ));
         }
+        if self.cudnn_conv_search == PalsCuDnnConvSearch::ExperimentalDefault
+            && (!matches!(self.provider, Provider::Cuda { .. }) || self.device_public_memory)
+        {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Admission,
+                "experimental cuDNN DEFAULT requires CUDA with host public memory",
+            ));
+        }
         Ok(())
+    }
+    /// Pure preflight for callers before runtime/model I/O. The loader repeats
+    /// this with the actual retained runtime profile before reading the model.
+    pub fn validate_execution_selection(
+        self,
+        native_loading: Option<NativeLoadingProfile>,
+        explicit_control: bool,
+    ) -> Result<(), BackendError> {
+        self.validate()?;
+        if self.cudnn_conv_search == PalsCuDnnConvSearch::ExperimentalDefault
+            && (!matches!(self.provider, Provider::Cuda { .. })
+                || self.device_public_memory
+                || !explicit_control
+                || native_loading != Some(NativeLoadingProfile::EagerCuda12Cudnn9V1))
+        {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Admission,
+                "experimental cuDNN DEFAULT requires explicit eager CUDA control with host public memory",
+            ));
+        }
+        validate_native_loading_path(native_loading, self, explicit_control)
     }
 }
 
@@ -1788,7 +1831,11 @@ fn load_session(
             device_id,
             arena_bytes,
         } => {
-            let cuda = CUDAExecutionProvider::default();
+            let cuda = match config.cudnn_conv_search {
+                PalsCuDnnConvSearch::LegacyImplicitExhaustive => CUDAExecutionProvider::default(),
+                PalsCuDnnConvSearch::ExperimentalDefault => CUDAExecutionProvider::default()
+                    .with_conv_algorithm_search(CuDNNConvAlgorithmSearch::Default),
+            };
             if !cuda.is_available().map_err(configure)? {
                 return Err(fail(
                     K::BackendUnavailable,
@@ -2430,6 +2477,9 @@ impl PalsOnnxBackend {
         policy: PalsCudaControlPolicy,
         profile_root: &Path,
     ) -> Result<Self, BackendError> {
+        if config.cudnn_conv_search == PalsCuDnnConvSearch::ExperimentalDefault {
+            config.validate_execution_selection(runtime.native_loading_profile(), true)?;
+        }
         if !matches!(config.provider, Provider::Cuda { .. }) || config.device_public_memory {
             return Err(fail(
                 K::BackendUnavailable,
@@ -2453,8 +2503,7 @@ impl PalsOnnxBackend {
         config: PalsOnnxConfig,
         audit: Option<(PalsCudaControlPolicy, std::path::PathBuf)>,
     ) -> Result<Self, BackendError> {
-        config.validate()?;
-        validate_native_loading_path(runtime.native_loading_profile(), config, audit.is_some())?;
+        config.validate_execution_selection(runtime.native_loading_profile(), audit.is_some())?;
         if !path.is_absolute() {
             return Err(fail(
                 K::InvalidInput,
@@ -4760,6 +4809,32 @@ mod tests {
         validate_native_loading_path(shim, cuda, true).unwrap();
         cuda.device_public_memory = true;
         assert!(validate_native_loading_path(shim, cuda, true).is_err());
+    }
+
+    #[test]
+    fn conv_default_admission_requires_eager_host_cuda_control() {
+        let eager = Some(NativeLoadingProfile::EagerCuda12Cudnn9V1);
+        let mut config = PalsOnnxConfig::cpu();
+        assert_eq!(
+            config.cudnn_conv_search,
+            PalsCuDnnConvSearch::LegacyImplicitExhaustive
+        );
+        config.cudnn_conv_search = PalsCuDnnConvSearch::ExperimentalDefault;
+        assert!(config.validate().is_err());
+        assert!(config.validate_execution_selection(eager, true).is_err());
+        config.provider = Provider::Cuda {
+            device_id: 0,
+            arena_bytes: 2 * 1024 * 1024 * 1024,
+        };
+        assert!(config.validate_execution_selection(eager, false).is_err());
+        assert!(config.validate_execution_selection(None, true).is_err());
+        assert!(config
+            .validate_execution_selection(Some(NativeLoadingProfile::CuDnnShimLazyV1), true)
+            .is_err());
+        config.validate_execution_selection(eager, true).unwrap();
+        config.device_public_memory = true;
+        assert!(config.validate().is_err());
+        assert!(config.validate_execution_selection(eager, true).is_err());
     }
 
     fn shim_observation() -> NativeMappingObservation {

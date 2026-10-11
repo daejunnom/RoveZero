@@ -397,7 +397,7 @@ def model_plan(args, binary):
         raise ValueError("CPU validation cannot silently inherit CUDA assets")
     inventory_path = getattr(args, "control_inventory", None)
     inventory_sha = getattr(args, "control_inventory_sha256", None)
-    control = args.provider in ("cuda-control", "cuda-control-shim")
+    control = args.provider in ("cuda-control", "cuda-control-shim", "cuda-control-conv-default")
     if control:
         if inventory_path is None or inventory_sha is None:
             raise ValueError("CUDA control validation requires an explicit pinned metadata inventory")
@@ -413,11 +413,23 @@ def model_plan(args, binary):
         command.extend((str(inventory), inventory_sha))
     elif inventory_path is not None or inventory_sha is not None:
         raise ValueError("metadata inventory requires an explicit CUDA control provider")
-    return command, {"model_profile": profile, "export_sha256": args.export_sha256,
-                     "fixture_sha256": args.fixtures_sha256, "provider": args.provider,
-                     "cuda_control_inventory_sha256": inventory_sha if control else None,
-                     "native_placement_audit_required": control,
-                     "numeric_reference_only": True, "strength_eligible": False}
+    details = {"model_profile": profile, "export_sha256": args.export_sha256,
+               "fixture_sha256": args.fixtures_sha256, "provider": args.provider,
+               "cuda_control_inventory_sha256": inventory_sha if control else None,
+               "native_placement_audit_required": control,
+               "numeric_reference_only": True, "strength_eligible": False}
+    if args.provider == "cuda-control-conv-default":
+        details["cudnn_conv_search_diagnostic"] = {
+            "scope": "single_requested_option_no_observed_cudnn_plan",
+            "cudnn_conv_algo_search_requested": "DEFAULT",
+            "native_loading_profile_requested": "eager-cuda12-cudnn9-v1",
+            "backend_execution_descriptor": "requires_loaded_checker_receipt",
+            "actual_cudnn_plan": "unknown", "numerical_note": "unknown",
+            "tf32_requested": False, "tf32_actual": "unknown", "tf32_retry": "unknown",
+            "production_default_changed": False, "warm_success_claim": False,
+            "pilot_success_claim": False, "failure_cause": "not_proven",
+        }
+    return command, details
 
 
 def main():
@@ -450,7 +462,7 @@ def main():
     model.add_argument("--runtime-sha256", required=True)
     model.add_argument("--runtime-cache", type=Path, required=True)
     model.add_argument("--model-report", type=Path, required=True)
-    model.add_argument("--provider", choices=("cpu", "cuda", "cuda-device", "cuda-control", "cuda-control-shim"), default="cpu")
+    model.add_argument("--provider", choices=("cpu", "cuda", "cuda-device", "cuda-control", "cuda-control-shim", "cuda-control-conv-default"), default="cpu")
     model.add_argument("--cuda-bundle", type=Path)
     model.add_argument("--cuda-bundle-sha256")
     model.add_argument("--control-inventory", type=Path)

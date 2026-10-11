@@ -7,8 +7,9 @@ use rz_eval::pals_model::{
     PalsModelConfig, PalsModelInput, PalsModelProfile, PalsRawOutput, PalsRecordLine, PalsRole,
 };
 use rz_eval::pals_onnx::{
-    HostRecordPagePolicy, HostRecordPageSnapshot, PalsBackendStats, PalsCudaControlPolicy,
-    PalsNativeCommand, PalsNativeResult, PalsOnnxBackend, PalsOnnxConfig, PalsPublicMemoryWitness,
+    HostRecordPagePolicy, HostRecordPageSnapshot, PalsBackendStats, PalsCuDnnConvSearch,
+    PalsCudaControlPolicy, PalsNativeCommand, PalsNativeResult, PalsOnnxBackend, PalsOnnxConfig,
+    PalsPublicMemoryWitness,
 };
 use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeCache};
 use rz_eval::worker::PhysicalPoll;
@@ -1254,6 +1255,128 @@ fn cost_common_six(
     result
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckerProvider {
+    Cpu,
+    Cuda,
+    CudaDevice,
+    CudaControl,
+    CudaControlShim,
+    CudaControlConvDefault,
+}
+impl CheckerProvider {
+    fn parse(provider: &str, argument_count: usize) -> Result<Self, &'static str> {
+        match (provider, argument_count) {
+            ("cpu", 8) => Ok(Self::Cpu),
+            ("cuda", 9) => Ok(Self::Cuda),
+            ("cuda-device", 9) => Ok(Self::CudaDevice),
+            ("cuda-control", 11) => Ok(Self::CudaControl),
+            ("cuda-control-shim", 11) => Ok(Self::CudaControlShim),
+            ("cuda-control-conv-default", 11) => Ok(Self::CudaControlConvDefault),
+            _ => Err("CUDA requires its explicit pinned bundle; CPU excludes it"),
+        }
+    }
+    fn is_cuda(self) -> bool {
+        self != Self::Cpu
+    }
+    fn explicit_control(self) -> bool {
+        matches!(
+            self,
+            Self::CudaControl | Self::CudaControlShim | Self::CudaControlConvDefault
+        )
+    }
+    fn loading_profile(self) -> Option<NativeLoadingProfile> {
+        match self {
+            Self::Cpu => None,
+            Self::CudaControlShim => Some(NativeLoadingProfile::CuDnnShimLazyV1),
+            _ => Some(NativeLoadingProfile::EagerCuda12Cudnn9V1),
+        }
+    }
+    fn config(self, cost_mode: bool) -> Result<PalsOnnxConfig, Box<dyn Error>> {
+        if self == Self::CudaControlConvDefault && cost_mode {
+            return Err(
+                "cuDNN DEFAULT is a separate numerical diagnostic; cost mode cannot be combined"
+                    .into(),
+            );
+        }
+        let mut config = PalsOnnxConfig::cpu();
+        if cost_mode {
+            config.intra_threads = 1;
+        }
+        if self.is_cuda() {
+            config.provider = Provider::Cuda {
+                device_id: 0,
+                arena_bytes: 2 * 1024 * 1024 * 1024,
+            };
+            config.device_public_memory = self == Self::CudaDevice;
+        }
+        if self == Self::CudaControlConvDefault {
+            config.cudnn_conv_search = PalsCuDnnConvSearch::ExperimentalDefault;
+        }
+        config.validate_execution_selection(self.loading_profile(), self.explicit_control())?;
+        Ok(config)
+    }
+}
+
+/// Configuration provenance only. This separate digest never identifies an
+/// observed cuDNN plan, numerical-note, retry, or a successful process exit.
+fn conv_default_execution_evidence(
+    backend: &PalsOnnxBackend,
+) -> Result<Option<serde_json::Value>, Box<dyn Error>> {
+    let config = backend.config();
+    if config.cudnn_conv_search != PalsCuDnnConvSearch::ExperimentalDefault {
+        return Ok(None);
+    }
+    config.validate_execution_selection(
+        backend.native_loading_profile(),
+        backend.cuda_control_inventory_digest().is_some(),
+    )?;
+    let Provider::Cuda {
+        device_id,
+        arena_bytes,
+    } = config.provider
+    else {
+        return Err("cuDNN DEFAULT execution descriptor has no CUDA provider".into());
+    };
+    let bundle = backend
+        .runtime_bundle_digest()
+        .ok_or("CUDA bundle identity absent")?;
+    // Record only the explicitly recognized process request. This environment
+    // override does not observe the plan, numerical note, or cuDNN retry.
+    let tf32_environment_override = match std::env::var_os("NVIDIA_TF32_OVERRIDE") {
+        None => "absent",
+        Some(value) if value == "0" => "0",
+        Some(value) if value == "1" => "1",
+        Some(_) => "unrecognized",
+    };
+    let descriptor = json!({
+        "schema":"rz-pals-cuda-control-conv-default-execution/1",
+        "scope":"loaded_backend_execution_request_not_observed_cudnn_plan",
+        "manifest_sha256":hex_digest(&backend.manifest_digest()),
+        "model_epoch":hex_digest(&backend.model_epoch()),
+        "runtime_sha256":hex_digest(&backend.runtime_binary_digest()),
+        "runtime_bundle_sha256":hex_digest(&bundle),
+        "control_inventory_sha256":backend.cuda_control_inventory_digest().as_ref().map(hex_digest),
+        "provider":"CUDAExecutionProvider","device_id":device_id,"session_arena_bytes":arena_bytes,
+        "intra_threads":config.intra_threads,"inter_threads":1,"parallel_execution":false,
+        "cache_public_memory":config.cache_public_memory,"public_memory":"host",
+        "native_loading_profile":"eager-cuda12-cudnn9-v1","graph_optimization":backend.graph_optimization(),
+        "cudnn_conv_algo_search_requested":"DEFAULT","tf32_requested":false,
+        "nvidia_tf32_override_environment_request":tf32_environment_override,"cuda_graph_requested":false
+    });
+    let serialized = serde_json::to_vec(&descriptor)?;
+    Ok(Some(json!({
+        "descriptor":descriptor,"descriptor_sha256":hex_digest(&asset::sha256(&serialized)),
+        "descriptor_encoding":"serde_json_utf8_fixed_descriptor_object",
+        "actual_cudnn_plan":"unknown","numerical_note":"unknown",
+        "tf32_actual":"unknown","tf32_retry":"unknown",
+        "experiment_scope":"single_requested_option_numeric_and_lifetime_diagnostic",
+        "native_termination_acceptance":"requires_external_process_exit_zero_and_cleanup",
+        "production_default_changed":false,"warm_success_claim":false,"pilot_success_claim":false,
+        "failure_cause":"not_proven"
+    })))
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args: Vec<_> = std::env::args().skip(1).collect();
     let cost_mode = args.first().is_some_and(|arg| arg == COST_COMMON_SIX_FLAG);
@@ -1289,13 +1412,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     if !matches!(args.len(), 8 | 9 | 11) {
-        return Err("usage: pals_model_check EXPORT.json EXPORT_SHA256 ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu|cuda|cuda-device|cuda-control|cuda-control-shim CACHE_ROOT [CUDA_BUNDLE.json] [INVENTORY_V2.json INVENTORY_SHA256]; CPU-only optional trailing --check-host-record-pages; Linux cuda-control-shim optional trailing --check-cuda-record-pages MANIFEST SHA256 GRAPH SHA256 RESOURCES.json".into());
+        return Err("usage: pals_model_check EXPORT.json EXPORT_SHA256 ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu|cuda|cuda-device|cuda-control|cuda-control-shim|cuda-control-conv-default CACHE_ROOT [CUDA_BUNDLE.json] [INVENTORY_V2.json INVENTORY_SHA256]; CPU-only optional trailing --check-host-record-pages; Linux cuda-control-shim optional trailing --check-cuda-record-pages MANIFEST SHA256 GRAPH SHA256 RESOURCES.json".into());
     }
-    let is_cuda = match (args[6].as_str(), args.len()) {
-        ("cpu", 8) => false,
-        ("cuda" | "cuda-device", 9) => true,
-        ("cuda-control" | "cuda-control-shim", 11) => true,
-        _ => return Err("CUDA requires its explicit pinned bundle; CPU excludes it".into()),
+    let selected_provider = CheckerProvider::parse(&args[6], args.len())?;
+    let is_cuda = selected_provider.is_cuda();
+    // Candidate combinations are refused before fixture/model reads, cache
+    // mutation, or native loading. Only the candidate's inventory moves earlier.
+    let mut config = selected_provider.config(cost_mode)?;
+    let preflight_control = if selected_provider == CheckerProvider::CudaControlConvDefault {
+        Some(PalsCudaControlPolicy::from_inventory(
+            Path::new(&args[9]),
+            &args[10],
+        )?)
+    } else {
+        None
     };
     let report = Path::new(&args[5]);
     outside_git(report.parent().ok_or("report has no existing parent")?)?;
@@ -1361,7 +1491,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         ));
         startup_trace.stage("runtime_origin_audit_returned");
     }
-    let control_policy = if matches!(args[6].as_str(), "cuda-control" | "cuda-control-shim") {
+    let control_policy = if preflight_control.is_some() {
+        preflight_control
+    } else if selected_provider.explicit_control() {
         Some(PalsCudaControlPolicy::from_inventory(
             Path::new(&args[9]),
             &args[10],
@@ -1369,17 +1501,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
-    let mut config = PalsOnnxConfig::cpu();
-    if cost_mode {
-        config.intra_threads = 1;
-    }
-    if is_cuda {
-        config.provider = Provider::Cuda {
-            device_id: 0,
-            arena_bytes: 2 * 1024 * 1024 * 1024,
-        };
-        config.device_public_memory = args[6] == "cuda-device";
-    }
     let load = |runtime, config, suffix: &str| {
         startup_trace.stage("session_load_entered");
         let result = if let Some(policy) = &control_policy {
@@ -1403,6 +1524,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let cost_load_started = cost_mode.then(Instant::now);
     let mut backend = load(runtime.clone(), config, "primary")?;
+    let conv_default_execution = conv_default_execution_evidence(&backend)?;
     let cost_backend_load_ns = cost_load_started
         .map(|timer| cost_ns(timer.elapsed()))
         .transpose()?;
@@ -1516,6 +1638,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // measured performance improvement is inferred from these correctness calls.
     config.cache_public_memory = false;
     let mut fresh = load(runtime.clone(), config, "fresh")?;
+    let fresh_conv_default_execution = conv_default_execution_evidence(&fresh)?;
     let mut fresh_proposer_seen = false;
     let mut fresh_critic_seen = false;
     let mut fresh_placement_witness = None;
@@ -1780,6 +1903,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     let fields = receipt
         .as_object_mut()
         .ok_or("acceptance receipt is not an object")?;
+    if let Some(primary) = conv_default_execution {
+        // The old baseline wire retains its historical field. This candidate
+        // has no observation of actual TF32 use, even after numerical success.
+        fields.insert("tf32".into(), json!("unknown"));
+        fields.insert("tf32_requested".into(), json!(false));
+        fields.insert(
+            "cudnn_conv_search_diagnostic".into(),
+            json!({
+                "primary_backend_execution":primary,
+                "fresh_backend_execution":fresh_conv_default_execution
+                    .ok_or("fresh DEFAULT execution descriptor absent")?
+            }),
+        );
+    }
     if !fixtures.config.profile.is_legacy() {
         fields.insert("model_profile".into(), json!(fixtures.config.profile));
         fields.insert(
@@ -1845,4 +1982,61 @@ fn main() -> Result<(), Box<dyn Error>> {
     startup_trace.stage("report_write_returned");
     println!("PALS P/C numeric/physical checks passed; trained={trained}; GPU peak unknown");
     Ok(())
+}
+
+#[cfg(test)]
+mod conv_selection_tests {
+    use super::*;
+
+    #[test]
+    fn conv_default_selection_is_exact_control_host_and_eager() {
+        let selected = CheckerProvider::parse("cuda-control-conv-default", 11).unwrap();
+        assert!(selected.explicit_control());
+        assert_eq!(
+            selected.loading_profile(),
+            Some(NativeLoadingProfile::EagerCuda12Cudnn9V1)
+        );
+        let config = selected.config(false).unwrap();
+        assert_eq!(
+            config.cudnn_conv_search,
+            PalsCuDnnConvSearch::ExperimentalDefault
+        );
+        assert!(!config.device_public_memory);
+        for arity in [0, 8, 9, 10, 12, 17] {
+            assert!(CheckerProvider::parse("cuda-control-conv-default", arity).is_err());
+        }
+        assert!(selected.config(true).is_err());
+        assert!(CheckerProvider::parse("cuda-control-conv-default-shim", 11).is_err());
+    }
+
+    #[test]
+    fn original_provider_modes_keep_implicit_conv_and_loading_selection() {
+        for (name, count) in [
+            ("cpu", 8),
+            ("cuda", 9),
+            ("cuda-control", 11),
+            ("cuda-control-shim", 11),
+        ] {
+            let selected = CheckerProvider::parse(name, count).unwrap();
+            assert_eq!(
+                selected.config(false).unwrap().cudnn_conv_search,
+                PalsCuDnnConvSearch::LegacyImplicitExhaustive
+            );
+        }
+        assert_eq!(
+            CheckerProvider::parse("cuda-control-shim", 11)
+                .unwrap()
+                .loading_profile(),
+            Some(NativeLoadingProfile::CuDnnShimLazyV1)
+        );
+        assert_eq!(
+            CheckerProvider::parse("cpu", 8).unwrap().loading_profile(),
+            None
+        );
+        assert_eq!(
+            CheckerProvider::parse("cuda-device", 9).unwrap(),
+            CheckerProvider::CudaDevice
+        );
+        assert!(!CheckerProvider::CudaDevice.explicit_control());
+    }
 }

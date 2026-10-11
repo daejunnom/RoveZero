@@ -115,22 +115,37 @@ class FollowupPlanTests(unittest.TestCase):
             runtime_cache=self.output, provider="cuda-control", cuda_bundle=bundle,
             cuda_bundle_sha256=digest, control_inventory=inventory,
             control_inventory_sha256=inventory_sha)
-        command, evidence = wrapper.model_plan(args, self.root / "validator")
-        self.assertEqual(command[-2:], [str(inventory), inventory_sha])
-        self.assertTrue(evidence["native_placement_audit_required"])
-        for alteration in ("ordinary_provider", "partial_pin", "another_export", "invented_placement"):
-            invalid = copy.copy(args)
-            if alteration == "ordinary_provider":
-                invalid.provider = "cuda"
-            elif alteration == "partial_pin":
-                invalid.control_inventory_sha256 = None
+        for provider in ("cuda-control", "cuda-control-conv-default"):
+            args.provider = provider
+            command, evidence = wrapper.model_plan(args, self.root / "validator")
+            self.assertEqual(command[-2:], [str(inventory), inventory_sha])
+            self.assertEqual(command[7], provider)
+            self.assertTrue(evidence["native_placement_audit_required"])
+            if provider == "cuda-control":
+                self.assertNotIn("cudnn_conv_search_diagnostic", evidence)
             else:
-                changed = dict(value)
-                changed["manifest_sha256" if alteration == "another_export" else "actual_provider_placement"] = "unknown"
-                invalid.control_inventory_sha256 = self.write(inventory, changed)
-            with self.subTest(alteration=alteration), self.assertRaises(ValueError):
-                wrapper.model_plan(invalid, self.root / "validator")
-            inventory.write_text(json.dumps(value), encoding="utf-8")
+                observation = evidence["cudnn_conv_search_diagnostic"]
+                self.assertEqual(observation["cudnn_conv_algo_search_requested"], "DEFAULT")
+                self.assertEqual(observation["native_loading_profile_requested"], "eager-cuda12-cudnn9-v1")
+                self.assertIs(observation["tf32_requested"], False)
+                for name in ("actual_cudnn_plan", "numerical_note", "tf32_actual", "tf32_retry"):
+                    self.assertEqual(observation[name], "unknown")
+                self.assertEqual(observation["backend_execution_descriptor"], "requires_loaded_checker_receipt")
+                for name in ("production_default_changed", "warm_success_claim", "pilot_success_claim"):
+                    self.assertIs(observation[name], False)
+            for alteration in ("ordinary_provider", "partial_pin", "another_export", "invented_placement"):
+                invalid = copy.copy(args)
+                if alteration == "ordinary_provider":
+                    invalid.provider = "cuda"
+                elif alteration == "partial_pin":
+                    invalid.control_inventory_sha256 = None
+                else:
+                    changed = dict(value)
+                    changed["manifest_sha256" if alteration == "another_export" else "actual_provider_placement"] = "unknown"
+                    invalid.control_inventory_sha256 = self.write(inventory, changed)
+                with self.subTest(provider=provider, alteration=alteration), self.assertRaises(ValueError):
+                    wrapper.model_plan(invalid, self.root / "validator")
+                inventory.write_text(json.dumps(value), encoding="utf-8")
 
     def gc_args(self, value):
         path = self.root / "external-gc.json"

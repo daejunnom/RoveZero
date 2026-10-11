@@ -2273,6 +2273,7 @@ mod check {
                 intra_threads: 1,
                 cache_public_memory: true,
                 device_public_memory: true,
+                ..PalsOnnxConfig::cpu()
             },
             NativeOwnerOptions {
                 drain_limit: CLEANUP,
@@ -2544,6 +2545,7 @@ mod check {
                 intra_threads: 1,
                 cache_public_memory: true,
                 device_public_memory: true,
+                ..PalsOnnxConfig::cpu()
             },
             NativeOwnerOptions {
                 drain_limit: CLEANUP,

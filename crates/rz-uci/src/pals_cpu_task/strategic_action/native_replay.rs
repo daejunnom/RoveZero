@@ -2871,6 +2871,7 @@ mod tests {
                 intra_threads: 1,
                 cache_public_memory: cache,
                 device_public_memory: false,
+                ..PalsOnnxConfig::cpu()
             };
             assert!(validate_config(cfg, &p).is_ok());
             assert!(
@@ -2969,6 +2970,7 @@ mod tests {
             intra_threads: 1,
             cache_public_memory: false,
             device_public_memory: false,
+            ..PalsOnnxConfig::cpu()
         };
         assert!(
             validate_config(
