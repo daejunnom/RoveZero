@@ -23,6 +23,71 @@ impl<M: RoleModel> PalsEngine<M> {
         Ok(())
     }
 
+    /// Select the ordered Repair/C lane only for a live original CPU owner in
+    /// this active Rules root. A root AnalyzePosition has an empty prefix and
+    /// no first-move restriction; the accepted Repair supplies the queue scope.
+    pub(super) fn held_cpu_repair_priority(
+        &self,
+        root: usize,
+        original_first: BoardMove,
+        limits: PalsLimits,
+    ) -> Result<bool, PalsError> {
+        if self.cpu_interleave != CpuInterleavePolicy::ResumeAfterAcceptedRepairC
+            || self.post_repair_recheck != PostRepairRecheckPolicy::IterativeFrozenModelWdlV2
+        {
+            return Ok(false);
+        }
+        let Some(held) = self.held_cpu_task.as_ref() else {
+            return Ok(false);
+        };
+        self.validate_checker_namespace()?;
+        let root_node = self
+            .nodes
+            .get(root)
+            .ok_or(StoreError::InvalidHandle("held Repair root"))?;
+        if root_node.state != held.active_root
+            || held.target_depth != limits.cpu_depth
+            || held
+                .prefix
+                .first()
+                .is_some_and(|first| *first != original_first)
+        {
+            return Ok(false);
+        }
+        if self.stores.root() != Some(root_node.situation) {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        let node = self
+            .nodes
+            .get(held.node)
+            .ok_or(StoreError::InvalidHandle("held CPU node"))?;
+        let Some(token) = node.resume.as_ref() else {
+            return Err(StoreError::InvalidConditions("held CPU task has no token").into());
+        };
+        if !token.is_paused_stack() || !self.cpu.token_is_current(token) {
+            return Err(StoreError::InvalidConditions("held CPU task owner is stale").into());
+        }
+        let task = self.stores.tasks.get(held.execution)?;
+        if task.key.state != node.state
+            || task.key.line.is_some()
+            || task.key.question != TaskQuestion::AnalyzePosition
+            || !task.key.root_moves.is_empty()
+            || task.key.requested_depth != held.target_depth
+            || task.key.value_identity.as_ref() != self.cpu_registered_value.as_ref()
+            || task.key.cpu_condition.as_ref() != Some(&self.cpu_registered_condition)
+            || task
+                .key
+                .checker_identity
+                .as_ref()
+                .is_some_and(|identity| identity != &self.checker_registered_identity)
+            || !matches!(task.status, TaskStatus::Paused { checkpoint, .. }
+                if checkpoint == held.node as u64)
+        {
+            return Err(StoreError::InvalidConditions("held CPU execution is not paused").into());
+        }
+        Ok(true)
+    }
+
     /// Called only after a completed, actually accepted post-Repair C tail.
     /// The frozen model value still comes from its own Fresh namespace. This
     /// executes the original CPU state/task with the remaining shared budget.

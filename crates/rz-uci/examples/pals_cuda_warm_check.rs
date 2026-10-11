@@ -761,13 +761,7 @@ mod check {
     ) -> bool {
         paused_at < repair_at && repair_at < critic_at && critic_at < resumed_at
     }
-    fn resident_repair_for_progress<'a>(
-        calls: impl Iterator<Item = &'a Value>,
-        cpu_resume: &Value,
-    ) -> Option<RequestId> {
-        if cpu_resume["passed"] != true {
-            return None;
-        }
+    fn resident_repair_request<'a>(calls: impl Iterator<Item = &'a Value>) -> Option<RequestId> {
         // The native bank has one slot per role. Historical accepted Repair
         // packets do not retain a seed after any later accepted P publication.
         // C and ValueFresh never replace that P slot.
@@ -787,10 +781,6 @@ mod check {
             || latest["physical"]["ready"] != true
             || latest["physical"]["completed_ok"] != true
             || latest["physical"]["completion_unknown"] != false
-            || !cpu_resume["matched_actual_pause_repair_c_resume_sequences"]
-                .as_array()?
-                .iter()
-                .any(|chain| chain["accepted_gpu_repair_request_id"] == latest["request_id"])
         {
             return None;
         }
@@ -798,6 +788,20 @@ mod check {
             epoch: rz_contracts::ProcessEpoch(latest["request_id"]["epoch"].as_u64()?),
             sequence: latest["request_id"]["sequence"].as_u64()?,
         })
+    }
+    fn resident_repair_for_progress<'a>(
+        calls: impl Iterator<Item = &'a Value>,
+        cpu_resume: &Value,
+    ) -> Option<RequestId> {
+        if cpu_resume["passed"] != true {
+            return None;
+        }
+        let resident = resident_repair_request(calls)?;
+        cpu_resume["matched_actual_pause_repair_c_resume_sequences"]
+            .as_array()?
+            .iter()
+            .any(|chain| chain["accepted_gpu_repair_request_id"] == request_id(resident))
+            .then_some(resident)
     }
     struct Capture {
         configuration: PalsModelConfig,
@@ -811,6 +815,7 @@ mod check {
         cpu_trace_overflow: bool,
         scheduler_resume_links: Vec<Value>,
         scheduler_resume_link_overflow: bool,
+        progress_replay_source: Option<RequestId>,
         max_role_forwards: u64,
         call_output_bytes_reserved: usize,
         output_reservation_exhausted: bool,
@@ -832,6 +837,7 @@ mod check {
                 cpu_trace_overflow: false,
                 scheduler_resume_links: Vec::new(),
                 scheduler_resume_link_overflow: false,
+                progress_replay_source: None,
                 max_role_forwards: DEFAULT_ROLE_FORWARDS,
                 call_output_bytes_reserved: 0,
                 output_reservation_exhausted: false,
@@ -914,6 +920,9 @@ mod check {
             None
         }
         fn cpu_resume_evidence(&self) -> Value {
+            self.cpu_resume_evidence_for_repair(self.progress_replay_source)
+        }
+        fn cpu_resume_evidence_for_repair(&self, required_repair: Option<RequestId>) -> Value {
             let mut matches = Vec::new();
             'attempts: for (resume_index, attempt) in self.cpu_attempts.iter().enumerate() {
                 let wire = &attempt.wire;
@@ -963,6 +972,7 @@ mod check {
                     .iter()
                     .filter(|call| {
                         call.accepted
+                            && required_repair.is_none_or(|id| call.id == id)
                             && call.wire["stage"] == "actual_pals_search"
                             && call.question.as_ref().is_some_and(|question| {
                                 question.context.purpose == RoleQueryPurpose::RepairPolicy
@@ -1052,7 +1062,10 @@ mod check {
                             "returned_complete_requested_depth": wire["report"]["completed_depth"]
                                 .as_u64() >= wire["requested"]["max_depth"].as_u64(),
                         }));
-                        // One concrete chain is enough for this exercise gate.
+                        // Search every eligible sequence for the exact resident
+                        // Repair before stopping. A different historical chain
+                        // cannot witness the single resident P seed.
+                        // One concrete matching chain is enough for this gate.
                         // All underlying CPU calls and NN packets remain in the
                         // trace; duplicated proof chains need no output copies.
                         break 'attempts;
@@ -1072,6 +1085,7 @@ mod check {
                 "observed_calls": self.cpu_attempts.iter().map(|call| call.wire.clone()).collect::<Vec<_>>(),
                 "actual_owner_actions": self.cpu_owner_actions,
                 "scheduler_resume_links": self.scheduler_resume_links,
+                "required_accepted_repair_request_id": required_repair.map(request_id),
                 "matched_actual_pause_repair_c_resume_sequences": matches,
             })
         }
@@ -2933,11 +2947,22 @@ mod check {
                             .lock()
                             .map_err(|_| fail("resume", "capture_unavailable"))?;
                         observe_scheduler_resume_links(&mut captured, stores)?;
-                        let proof = captured.cpu_resume_evidence();
-                        Ok::<_, Failure>(resident_repair_for_progress(
+                        let Some(resident) = resident_repair_request(
+                            captured.calls.iter().map(|call| &call.wire),
+                        ) else {
+                            return Ok::<_, Failure>(None);
+                        };
+                        let proof = captured.cpu_resume_evidence_for_repair(Some(resident));
+                        let selected = resident_repair_for_progress(
                             captured.calls.iter().map(|call| &call.wire),
                             &proof,
-                        ))
+                        );
+                        if selected.is_some() {
+                            // Keep the final owner receipt bound to the exact
+                            // chain selected at this live progress boundary.
+                            captured.progress_replay_source = selected;
+                        }
+                        Ok::<_, Failure>(selected)
                     })();
                     let result = match selected {
                         Ok(None) => return,
@@ -4785,6 +4810,178 @@ mod check {
             assert_eq!(
                 resident_repair_for_progress([&invalid].into_iter(), &proof),
                 None
+            );
+        }
+
+        fn resident_cpu_evidence_fixture() -> (Capture, RequestId) {
+            // Synthetic receipt admission only; no NN, CPU search, live token
+            // or real TaskTable execution is performed by this fixture.
+            use rz_search::pals::store::{LineId, SituationId, StateId};
+            let started = Instant::now();
+            let deadline = started + Duration::from_secs(5);
+            let position = Position::startpos();
+            let mut capture = Capture::new(started);
+            capture.stage = "actual_pals_search";
+            capture.cpu_attempts.push(CpuAttemptCapture {
+                state: position.position_identity(),
+                deadline: Some(deadline),
+                cancel_address: 7,
+                wire: json!({"kind": "analyze", "stage": "actual_pals_search",
+                    "returned_ok": true, "finished_elapsed_ns": 10,
+                    "requested": {"max_depth": 3, "max_nodes": 8},
+                    "report": {"completed_depth": 0,
+                        "resume_token": {"is_paused_stack": true, "owner_current_after": true}}}),
+            });
+            capture.cpu_attempts.push(CpuAttemptCapture {
+                state: position.position_identity(),
+                deadline: Some(deadline),
+                cancel_address: 7,
+                wire: json!({"kind": "resume", "stage": "actual_pals_search",
+                    "returned_ok": true, "started_elapsed_ns": 40,
+                    "resume_source_attempt_index": 0, "input_token_current_after": false,
+                    "requested": {"max_depth": 3, "max_nodes": 8},
+                    "resume_token": {"is_paused_stack": true, "owner_current_before": true,
+                        "retained_bytes": 128, "cumulative_work": {"nodes": 8}},
+                    "report": {"nodes": 8, "completed_depth": 1}}),
+            });
+            capture
+                .scheduler_resume_links
+                .push(json!({"same_exact_task_key": true,
+                "actual_resume_attempt_indices": [1]}));
+            for (sequence, text, response, critic, repair_at, critic_at) in [
+                (15, "e2e4", "e7e5", 33, 20, 30),
+                (28, "d2d4", "d7d5", 44, 22, 32),
+            ] {
+                let movement = BoardMove::from_uci(text).unwrap();
+                let reply = BoardMove::from_uci(response).unwrap();
+                let id = RequestId {
+                    epoch: rz_contracts::ProcessEpoch(7),
+                    sequence,
+                };
+                let critic_id = RequestId {
+                    sequence: critic,
+                    ..id
+                };
+                let question = OwnedQuestion {
+                    position: position.clone(),
+                    legal: position.legal_moves(),
+                    prefix: vec![movement],
+                    proposal: vec![movement, reply],
+                    counterexample: Some(vec![movement, reply]),
+                    records: vec![],
+                    context: RoleLogicalContext {
+                        game_generation: 1,
+                        search_generation: 1,
+                        situation: SituationId {
+                            slot: 0,
+                            generation: 0,
+                        },
+                        state: StateId(0),
+                        focus: LineId(sequence as usize),
+                        purpose: RoleQueryPurpose::RepairPolicy,
+                        prefix: vec![movement],
+                        focus_sha256: [0; 32],
+                        prefix_sha256: [0; 32],
+                        proposal_sha256: [0; 32],
+                        refutation_sha256: Some([0; 32]),
+                        divergence_sha256: [0; 32],
+                        public_revision: sequence,
+                        situation_revision: 0,
+                    },
+                    deadline,
+                };
+                for (call_id, owned_question, at, purpose, role) in [
+                    (id, Some(question), repair_at, "RepairPolicy", "proposer"),
+                    (critic_id, None, critic_at, "ReplyPolicy", "critic"),
+                ] {
+                    capture.calls.push(CallCapture {
+                        id: call_id,
+                        wire: json!({"request_id": request_id(call_id), "accepted": true,
+                            "accepted_with_original_controls": true, "stage": "actual_pals_search",
+                            "accepted_context_elapsed_ns": at, "logical_context": {"purpose": purpose},
+                            "input": {"role": role}, "physical": {"ready": true,
+                                "completed_ok": true, "completion_unknown": false}}),
+                        question: owned_question,
+                        snapshot: position.snapshot(),
+                        deadline,
+                        cancel_address: 7,
+                        raw: None,
+                        accepted: true,
+                    });
+                }
+                capture.rechecks.push(json!({"event": "finished",
+                    "actual_search_continuation_completed": true,
+                    "repaired": moves(&[movement, reply]),
+                    "refutation": moves(&[movement, reply]),
+                    "reply_context": {"game_generation": 1, "search_generation": 1},
+                    "actual_new_prefix_c_tail_request_ids": [request_id(critic_id)]}));
+            }
+            (
+                capture,
+                RequestId {
+                    epoch: rz_contracts::ProcessEpoch(7),
+                    sequence: 28,
+                },
+            )
+        }
+
+        #[test]
+        fn resident_cpu_proof_searches_past_first_historical_chain() {
+            let (mut capture, resident) = resident_cpu_evidence_fixture();
+            let historical = capture.cpu_resume_evidence();
+            assert_eq!(historical["passed"], true);
+            assert_eq!(
+                historical["matched_actual_pause_repair_c_resume_sequences"][0]["accepted_gpu_repair_request_id"]
+                    ["sequence"],
+                15
+            );
+            let current = capture.cpu_resume_evidence_for_repair(Some(resident));
+            assert_eq!(current["passed"], true);
+            assert_eq!(
+                resident_repair_for_progress(
+                    capture.calls.iter().map(|call| &call.wire),
+                    &historical
+                ),
+                None
+            );
+            assert_eq!(
+                resident_repair_for_progress(capture.calls.iter().map(|call| &call.wire), &current),
+                Some(resident)
+            );
+            capture.progress_replay_source = Some(resident);
+            let final_owner = capture.cpu_resume_evidence();
+            assert_eq!(
+                final_owner["required_accepted_repair_request_id"],
+                request_id(resident)
+            );
+            assert_eq!(
+                final_owner["matched_actual_pause_repair_c_resume_sequences"][0]["accepted_gpu_repair_request_id"],
+                request_id(resident)
+            );
+        }
+
+        #[test]
+        fn resident_cpu_proof_keeps_missing_c_owner_and_query_guards() {
+            let (mut capture, resident) = resident_cpu_evidence_fixture();
+            capture.rechecks[1]["actual_search_continuation_completed"] = json!(false);
+            // As in the actual v18 failure, a valid historical CPU resume does
+            // not grant a Warm replay of another resident Repair question.
+            assert_eq!(capture.cpu_resume_evidence()["passed"], true);
+            assert_eq!(
+                capture.cpu_resume_evidence_for_repair(Some(resident))["passed"],
+                false
+            );
+            capture.rechecks[1]["actual_search_continuation_completed"] = json!(true);
+            capture.rechecks[1]["refutation"] = json!(["e2e4", "e7e5"]);
+            assert_eq!(
+                capture.cpu_resume_evidence_for_repair(Some(resident))["passed"],
+                false
+            );
+            capture.rechecks[1]["refutation"] = json!(["d2d4", "d7d5"]);
+            capture.cpu_attempts[1].wire["resume_token"]["owner_current_before"] = json!(false);
+            assert_eq!(
+                capture.cpu_resume_evidence_for_repair(Some(resident))["passed"],
+                false
             );
         }
 

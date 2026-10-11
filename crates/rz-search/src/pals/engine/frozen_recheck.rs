@@ -55,25 +55,45 @@ impl<M: RoleModel> PalsEngine<M> {
         progress: &mut ObservedProgress<'_>,
     ) -> Result<(), PalsError> {
         if self.post_repair_recheck == PostRepairRecheckPolicy::IterativeFrozenModelWdlV2 {
-            let question = (
-                work.original_first,
-                work.repair_record_revision,
-                work.repaired.clone(),
-            );
-            if !self.repair_questions.insert(question) {
-                counters.repair_queue_deduplicated += 1;
-                return Ok(());
+            let scope = (work.root, work.original_first);
+            if self.enqueue_frozen_repair(work, counters)?
+                && self.stopped(limits, cancel).is_none()
+                && self.held_cpu_repair_priority(scope.0, scope.1, limits)?
+            {
+                // This selected S lane observes the accepted Repair's C tail,
+                // actual original-task resume and finish before another branch
+                // can publish P. Other pending first moves retain their order.
+                self.drain_repair_queue_scope(Some(scope), limits, cancel, counters, progress)?;
             }
-            if self.repair_queue.len() >= MAX_PENDING_REPAIRS {
-                return Err(PalsError::Capacity);
-            }
-            self.repair_queue.push_back(work);
-            counters.repair_queue_enqueued += 1;
-            counters.repair_queue_peak = counters.repair_queue_peak.max(self.repair_queue.len());
         } else {
             self.frozen_recheck_once(&work, limits, cancel, counters, progress)?;
         }
         Ok(())
+    }
+
+    /// Queue admission never invokes a role or drains recursively. In
+    /// particular, iterative followups share the current bounded drain loop.
+    fn enqueue_frozen_repair(
+        &mut self,
+        work: RepairWork,
+        counters: &mut PalsCounters,
+    ) -> Result<bool, PalsError> {
+        let question = (
+            work.original_first,
+            work.repair_record_revision,
+            work.repaired.clone(),
+        );
+        if !self.repair_questions.insert(question) {
+            counters.repair_queue_deduplicated += 1;
+            return Ok(false);
+        }
+        if self.repair_queue.len() >= MAX_PENDING_REPAIRS {
+            return Err(PalsError::Capacity);
+        }
+        self.repair_queue.push_back(work);
+        counters.repair_queue_enqueued += 1;
+        counters.repair_queue_peak = counters.repair_queue_peak.max(self.repair_queue.len());
+        Ok(true)
     }
 
     pub(super) fn drain_repair_queue(
@@ -83,8 +103,30 @@ impl<M: RoleModel> PalsEngine<M> {
         counters: &mut PalsCounters,
         progress: &mut ObservedProgress<'_>,
     ) -> Result<(), PalsError> {
+        self.drain_repair_queue_scope(None, limits, cancel, counters, progress)
+    }
+
+    fn drain_repair_queue_scope(
+        &mut self,
+        priority: Option<(usize, BoardMove)>,
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        counters: &mut PalsCounters,
+        progress: &mut ObservedProgress<'_>,
+    ) -> Result<(), PalsError> {
         while self.stopped(limits, cancel).is_none() {
-            let Some(work) = self.repair_queue.pop_front() else {
+            let next = if let Some((root, first)) = priority {
+                if !self.held_cpu_repair_priority(root, first, limits)? {
+                    break;
+                }
+                self.repair_queue
+                    .iter()
+                    .position(|work| work.root == root && work.original_first == first)
+                    .and_then(|index| self.repair_queue.remove(index))
+            } else {
+                self.repair_queue.pop_front()
+            };
+            let Some(work) = next else {
                 break;
             };
             let Some(frontier) =
@@ -150,7 +192,7 @@ impl<M: RoleModel> PalsEngine<M> {
             )?;
             self.publish_choice(work.root, limits, cancel, progress)?;
             if counters.accepted_repair_outputs > before && repaired != work.repaired {
-                self.queue_or_recheck_frozen(
+                self.enqueue_frozen_repair(
                     RepairWork {
                         root: work.root,
                         original_first: work.original_first,
@@ -161,10 +203,7 @@ impl<M: RoleModel> PalsEngine<M> {
                         repaired,
                         refutation: frontier.counterline,
                     },
-                    limits,
-                    cancel,
                     counters,
-                    progress,
                 )?;
             } else {
                 counters.repair_queue_without_new_evidence += 1;
@@ -925,6 +964,7 @@ mod tests {
     struct WdlFixture {
         identity: ModelValueIdentity,
         finished: Vec<(RecheckDisposition, bool, Option<u64>, Option<u64>)>,
+        finished_lines: Vec<LineId>,
         revisions: Vec<u64>,
         replies: Option<[BoardMove; 3]>,
         finished_notice: Option<std::sync::Arc<AtomicBool>>,
@@ -940,6 +980,7 @@ mod tests {
                     model_epoch: [3; 32],
                 },
                 finished: Vec::new(),
+                finished_lines: Vec::new(),
                 revisions: Vec::new(),
                 replies: None,
                 finished_notice: None,
@@ -1027,6 +1068,7 @@ mod tests {
             Ok(output)
         }
         fn recheck_finished(&mut self, event: RecheckFinished<'_>) -> Result<(), RoleError> {
+            self.finished_lines.push(event.identity.repaired_line);
             if let Some(notice) = &self.finished_notice {
                 notice.store(true, Ordering::Release);
             }
@@ -1081,6 +1123,291 @@ mod tests {
             .map(|m| BoardMove::from_uci(m).unwrap())
             .collect()
     }
+
+    fn held_engine() -> PalsEngine<WdlFixture> {
+        use crate::cpu::CpuOrderingPolicy;
+        use crate::cpu_value::BootstrapCpuValue;
+        let cpu = CpuEngine::with_paused_side_scope(
+            CpuConfig {
+                max_depth: 2,
+                tt_entries: 64,
+                ..CpuConfig::default()
+            },
+            std::sync::Arc::new(BootstrapCpuValue::default()),
+            CpuOrderingPolicy::LegacyMvvLvaV1,
+        )
+        .unwrap();
+        PalsEngine::new_with_boxed_checker_and_policies_and_cpu_interleave(
+            PalsConfig {
+                line_plies: 6,
+                cpu_nodes_per_task: 8,
+                ..PalsConfig::default()
+            },
+            WdlFixture::new(),
+            Box::new(OwnedCpuChecker::new(cpu).unwrap()),
+            ResolverPolicy::ModelWdlRestricted,
+            PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
+            CpuInterleavePolicy::ResumeAfterAcceptedRepairC,
+        )
+        .unwrap()
+    }
+
+    fn other_first_repair(
+        engine: &mut PalsEngine<WdlFixture>,
+        counters: &mut PalsCounters,
+    ) -> RepairWork {
+        repair_work_for_lines(
+            engine,
+            counters,
+            line(&["d2d4", "d7d5", "c1f4", "g8f6", "g1f3", "e7e6"]),
+            line(&["d2d4", "d7d5", "b1c3", "g8f6", "g1f3", "e7e6"]),
+        )
+    }
+
+    #[test]
+    fn held_parent_priority_rechecks_before_other_first_and_retains_pending_order() {
+        let mut selected = held_engine();
+        let mut counters = PalsCounters::default();
+        let work = accepted_repair(&mut selected, &mut counters);
+        let other = other_first_repair(&mut selected, &mut counters);
+        let later_other = other_first_repair(&mut selected, &mut counters);
+        let pending = [other.repaired_line, later_other.repaired_line];
+        let cancel = AtomicBool::new(false);
+        let budget = PalsLimits {
+            max_cpu_nodes: 256,
+            cpu_depth: 2,
+            ..limits()
+        };
+        // Registered CPU/mock branches are already accepted fixture records.
+        // Admit their initial Repair and keep unrelated followups out of this
+        // queue-order check; the selected first still exercises real followups.
+        assert!(selected.admit_iterative_repair(work.original_first));
+        selected
+            .repair_counts
+            .insert(other.original_first, MAX_REPAIRS_PER_FIRST);
+        selected
+            .enqueue_frozen_repair(other, &mut counters)
+            .unwrap();
+        selected
+            .enqueue_frozen_repair(later_other, &mut counters)
+            .unwrap();
+        selected
+            .verify_checked_cpu(work.root, &[], budget, &cancel, &mut counters)
+            .unwrap();
+        let held = selected.held_cpu_task.as_ref().unwrap();
+        assert!(held.prefix.is_empty());
+        let previous = held.execution;
+        let original_key = selected.stores.tasks.get(previous).unwrap().key.clone();
+        let mut resumed_before_return = false;
+        let mut progress = |_: BoardMove, stores: &PalsStores, _: &[RoleRecord]| {
+            resumed_before_return |= (0..stores.tasks.len()).any(|index| {
+                let task = stores.tasks.get(ExecutionId(index)).unwrap();
+                task.resumed_from == Some(previous) && task.key == original_key
+            });
+        };
+        selected
+            .queue_or_recheck_frozen(work.clone(), budget, &cancel, &mut counters, &mut progress)
+            .unwrap();
+        assert!(resumed_before_return);
+        assert_eq!(
+            selected.model.finished_lines.first(),
+            Some(&work.repaired_line)
+        );
+        assert!(
+            selected
+                .model
+                .finished_lines
+                .iter()
+                .all(|line| !pending.contains(line))
+        );
+        assert_eq!(
+            selected
+                .repair_queue
+                .iter()
+                .map(|work| work.repaired_line)
+                .collect::<Vec<_>>(),
+            pending
+        );
+        assert!(counters.accepted_repair_outputs > 0);
+        assert!(selected.repair_counts[&work.original_first] <= MAX_REPAIRS_PER_FIRST);
+        let enqueued = counters.repair_queue_enqueued;
+        let role_calls = counters.role_calls;
+        selected
+            .queue_or_recheck_frozen(work, budget, &cancel, &mut counters, &mut |_, _, _| {})
+            .unwrap();
+        assert_eq!(counters.repair_queue_deduplicated, 1);
+        assert_eq!(counters.repair_queue_enqueued, enqueued);
+        assert_eq!(counters.role_calls, role_calls);
+        let before_public_drain = selected.model.finished_lines.len();
+        selected
+            .drain_repair_queue(budget, &cancel, &mut counters, &mut |_, _, _| {})
+            .unwrap();
+        assert_eq!(
+            &selected.model.finished_lines[before_public_drain..],
+            &pending
+        );
+        assert!(selected.repair_queue.is_empty());
+        assert!(counters.cpu_nodes <= budget.max_cpu_nodes);
+        assert_eq!(selected.cpu.paused_stack_snapshot().unwrap().tokens_peak, 1);
+        selected.discard_canceled_cpu_checkpoints().unwrap();
+    }
+
+    #[test]
+    fn held_parent_priority_requires_matching_nonempty_prefix_first() {
+        let mut selected = held_engine();
+        let mut counters = PalsCounters::default();
+        let work = accepted_repair(&mut selected, &mut counters);
+        let other = other_first_repair(&mut selected, &mut counters);
+        selected
+            .repair_counts
+            .insert(work.original_first, MAX_REPAIRS_PER_FIRST);
+        let budget = PalsLimits {
+            max_cpu_nodes: 128,
+            cpu_depth: 2,
+            ..limits()
+        };
+        let cancel = AtomicBool::new(false);
+        selected
+            .verify_checked_cpu(
+                work.repaired_leaf,
+                &work.repaired,
+                budget,
+                &cancel,
+                &mut counters,
+            )
+            .unwrap();
+        let original = selected.held_cpu_task.as_ref().unwrap().execution;
+        assert_eq!(
+            selected.held_cpu_task.as_ref().unwrap().prefix.first(),
+            Some(&work.original_first)
+        );
+        let pending_line = other.repaired_line;
+        selected
+            .queue_or_recheck_frozen(other, budget, &cancel, &mut counters, &mut |_, _, _| {})
+            .unwrap();
+        assert_eq!(counters.critic_calls, 0);
+        assert_eq!(counters.cpu_nodes, 8);
+        assert_eq!(selected.held_cpu_task.as_ref().unwrap().execution, original);
+        selected
+            .queue_or_recheck_frozen(
+                work.clone(),
+                budget,
+                &cancel,
+                &mut counters,
+                &mut |_, _, _| {},
+            )
+            .unwrap();
+        assert_eq!(selected.model.finished_lines, [work.repaired_line]);
+        assert_eq!(selected.repair_queue.len(), 1);
+        assert_eq!(selected.repair_queue[0].repaired_line, pending_line);
+        assert!((0..selected.stores.tasks.len()).any(|index| {
+            selected
+                .stores
+                .tasks
+                .get(ExecutionId(index))
+                .unwrap()
+                .resumed_from
+                == Some(original)
+        }));
+        selected.discard_canceled_cpu_checkpoints().unwrap();
+    }
+
+    #[test]
+    fn held_parent_priority_cancel_deadline_duplicate_and_no_owner_do_not_execute() {
+        for canceled in [true, false] {
+            let mut selected = held_engine();
+            let mut counters = PalsCounters::default();
+            let work = accepted_repair(&mut selected, &mut counters);
+            let budget = PalsLimits {
+                max_cpu_nodes: 128,
+                cpu_depth: 2,
+                ..limits()
+            };
+            let cancel = AtomicBool::new(false);
+            selected
+                .verify_checked_cpu(work.root, &[], budget, &cancel, &mut counters)
+                .unwrap();
+            let token = selected.nodes[work.root].resume.clone().unwrap();
+            cancel.store(canceled, Ordering::Release);
+            let stopped_budget = if canceled {
+                budget
+            } else {
+                PalsLimits {
+                    deadline: Instant::now(),
+                    ..budget
+                }
+            };
+            for _ in 0..2 {
+                selected
+                    .queue_or_recheck_frozen(
+                        work.clone(),
+                        stopped_budget,
+                        &cancel,
+                        &mut counters,
+                        &mut |_, _, _| {},
+                    )
+                    .unwrap();
+            }
+            selected
+                .drain_repair_queue(stopped_budget, &cancel, &mut counters, &mut |_, _, _| {})
+                .unwrap();
+            assert_eq!(selected.repair_queue.len(), 1);
+            assert_eq!(counters.repair_queue_deduplicated, 1);
+            assert_eq!(counters.cpu_nodes, 8);
+            assert_eq!(counters.critic_calls, 0);
+            assert!(selected.cpu.token_is_current(&token));
+            selected.discard_canceled_cpu_checkpoints().unwrap();
+            assert!(!selected.cpu.token_is_current(&token));
+            assert!(selected.held_cpu_task.is_none());
+            cancel.store(false, Ordering::Release);
+            let next = accepted_repair(&mut selected, &mut counters);
+            selected
+                .queue_or_recheck_frozen(next, budget, &cancel, &mut counters, &mut |_, _, _| {})
+                .unwrap();
+            assert_eq!(selected.repair_queue.len(), 2);
+            assert_eq!(counters.critic_calls, 0);
+            assert_eq!(counters.cpu_nodes, 8);
+        }
+    }
+
+    #[test]
+    fn default_repair_queue_waits_and_public_drain_retains_fifo() {
+        let mut selected = engine(
+            PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
+            ResolverPolicy::ModelWdlRestricted,
+        );
+        let mut counters = PalsCounters::default();
+        let work = accepted_repair(&mut selected, &mut counters);
+        let other = other_first_repair(&mut selected, &mut counters);
+        let pending = [work.repaired_line, other.repaired_line];
+        for first in [work.original_first, other.original_first] {
+            selected.repair_counts.insert(first, MAX_REPAIRS_PER_FIRST);
+        }
+        let cancel = AtomicBool::new(false);
+        let budget = limits();
+        for work in [work, other] {
+            selected
+                .queue_or_recheck_frozen(work, budget, &cancel, &mut counters, &mut |_, _, _| {})
+                .unwrap();
+        }
+        assert_eq!(selected.cpu_interleave, CpuInterleavePolicy::ReplaceOnFresh);
+        assert_eq!(counters.critic_calls, 0);
+        assert!(selected.model.finished_lines.is_empty());
+        assert_eq!(
+            selected
+                .repair_queue
+                .iter()
+                .map(|work| work.repaired_line)
+                .collect::<Vec<_>>(),
+            pending
+        );
+        selected
+            .drain_repair_queue(budget, &cancel, &mut counters, &mut |_, _, _| {})
+            .unwrap();
+        assert_eq!(selected.model.finished_lines, pending);
+        assert!(selected.repair_queue.is_empty());
+    }
+
     #[test]
     fn held_parent_repair_c_barrier_resumes_original_task_with_shared_budget() {
         use crate::cpu::{CpuOrderingPolicy, CpuResumePolicy};
