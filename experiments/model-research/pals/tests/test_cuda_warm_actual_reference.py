@@ -12,7 +12,9 @@ from unittest.mock import patch
 from rz_pals_model.config import ModelConfig
 from rz_pals_model.cuda_warm_actual_reference import (
     ATOL, LATENT_ELEMENTS, MAX_CAPTURE_CALLS, CAPTURE_SCHEMA, REFERENCE_SCHEMA, DEFAULT_ROLE_FORWARDS,
+    COST_PROFILE_LEGACY, COST_PROFILE_CONV_DEFAULT, COST_PROGRESS_BOUNDARY,
     _bind_native_source_identity, _compare_raw, _external_path, _json_bytes, _reference_call, _write_reference,
+    _arguments, _cost_reference_profile, _cost_sample_origin, numeric_check_cuda_warm_actual_reference,
     canonical_captured_input_key, latent_bytes, seed_provenance_digest, run_actual_reference_cli,
     validate_actual_capture, validate_captured_input, _reference_streams)
 
@@ -159,7 +161,158 @@ def _cost_capture():
     return capture
 
 
+def _progress_cost_capture():
+    capture = _cost_capture()
+    cost, warm = capture["cost_same_seed_context"], capture["cost_same_seed_context"]["warm"]
+    base = len(capture["calls"])
+    # A later actual search publication follows the eight unconsumed samples.
+    # IDs remain captured producer IDs; the sample and final counts differ.
+    capture["calls"].append(_call(12, "critic"))
+    cost["cost_execution_boundary"] = COST_PROGRESS_BOUNDARY
+    warm["integration_inputs_at_progress"] = base
+    warm["receipt_at_resident_progress"] = copy.deepcopy(warm["calls"][0]["cost_sample"]["receipt_before"])
+    final = warm["final_receipt"]
+    for key in ("physically_completed_role_calls", "completed_role_inputs", "delivered_role_inputs", "search_consumed_role_inputs"):
+        final[key] += 1
+    for key in ("role_nn_runs_attempted", "role_nn_runs_completed"):
+        final["backend_stats"][key] += 1
+    capture["final_receipt"] = copy.deepcopy(final)
+    capture["actual_role_forwards_including_startup"] += 1
+    capture["actual_completed_role_forwards_including_startup"] += 1
+    return capture
+
+
+def _default_cost_capture():
+    capture = _progress_cost_capture()
+    capture["cost_same_seed_context"].update(
+        cost_profile=COST_PROFILE_CONV_DEFAULT, cudnn_conv_search_requested="default-device-warm-v1",
+        nvidia_tf32_override_required="0", tf32_requested=False, tf32_actual="unknown", tf32_retry="unknown",
+        cudnn_execution_diagnostic={
+            "descriptor": {"selected_profile": "default-device-warm-v1", "cudnn_conv_algo_search_requested": "DEFAULT",
+                           "nvidia_tf32_override_environment_request": "0", "tf32_requested": False,
+                           "scope": "loaded_backend_request_not_selected_plan_or_process_exit"},
+            "tf32_actual": "unknown", "tf32_retry": "unknown", "actual_cudnn_plan": "unknown"})
+    return capture
+
+
 class CapturedReferenceAdmissionTests(unittest.TestCase):
+    def test_progress_samples_bind_resident_prefix_and_final_owner_without_rewriting_capture(self):
+        legacy, progress = _cost_capture(), _progress_cost_capture()
+        for capture in (legacy, progress):
+            before = copy.deepcopy(capture)
+            validate_actual_capture(capture, MANIFEST_SHA)
+            cost = capture["cost_same_seed_context"]
+            self.assertEqual(_cost_sample_origin(cost, cost["warm"], len(capture["calls"]), True), 3)
+            self.assertEqual(_cost_sample_origin(cost, cost["fresh"], len(capture["calls"]), False), 0)
+            self.assertEqual(capture, before)
+        warm = progress["cost_same_seed_context"]["warm"]
+        self.assertEqual(warm["calls"][-1]["cost_sample"]["receipt_after_close"]["search_consumed_role_inputs"], 3)
+        self.assertEqual(warm["final_receipt"]["search_consumed_role_inputs"], 4)
+        self.assertEqual(warm["final_receipt"]["backend_stats"]["role_nn_runs_completed"], 14)
+
+    def test_progress_origin_partial_foreign_or_not_yet_accepted_source_is_refused(self):
+        for label in ("boundary", "missing_boundary", "missing_receipt", "zero_base", "excess_base", "consumer", "namespace", "source_prefix"):
+            capture = _progress_cost_capture()
+            cost, warm = capture["cost_same_seed_context"], capture["cost_same_seed_context"]["warm"]
+            if label == "boundary": cost["cost_execution_boundary"] = "unknown"
+            elif label == "missing_boundary": del cost["cost_execution_boundary"]
+            elif label == "missing_receipt": del warm["receipt_at_resident_progress"]
+            elif label == "zero_base": warm["integration_inputs_at_progress"] = 0
+            elif label == "excess_base": warm["integration_inputs_at_progress"] = 5
+            elif label == "consumer": warm["receipt_at_resident_progress"]["search_consumed_role_inputs"] = 2
+            elif label == "namespace": warm["receipt_at_resident_progress"]["process_epoch"] = 2
+            else:
+                warm["integration_inputs_at_progress"] = 2
+                for key in ("physically_completed_role_calls", "completed_role_inputs", "delivered_role_inputs", "search_consumed_role_inputs"):
+                    warm["receipt_at_resident_progress"][key] = 2
+            before = copy.deepcopy(capture)
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                validate_actual_capture(capture, MANIFEST_SHA)
+            self.assertEqual(capture, before)
+
+    def test_progress_sample_end_cannot_replace_the_required_final_integration_drain(self):
+        capture = _progress_cost_capture()
+        final = capture["cost_same_seed_context"]["warm"]["final_receipt"]
+        for key in ("physically_completed_role_calls", "completed_role_inputs", "delivered_role_inputs", "search_consumed_role_inputs"):
+            final[key] -= 1
+        for key in ("role_nn_runs_attempted", "role_nn_runs_completed"):
+            final["backend_stats"][key] -= 1
+        capture["final_receipt"] = copy.deepcopy(final)
+        with self.assertRaisesRegex(ValueError, "accounting mismatch"):
+            validate_actual_capture(capture, MANIFEST_SHA)
+
+    def test_default_cost_explicit_namespace_preserves_loaded_requests_and_unknown_actual_scope(self):
+        capture = _default_cost_capture()
+        before = copy.deepcopy(capture)
+        with patch.dict("os.environ", {"NVIDIA_TF32_OVERRIDE": "0"}):
+            metadata = _cost_reference_profile(capture, COST_PROFILE_CONV_DEFAULT)
+        validate_actual_capture(capture, MANIFEST_SHA)
+        self.assertEqual(metadata["cost_profile"], COST_PROFILE_CONV_DEFAULT)
+        self.assertEqual(metadata["cudnn_execution_diagnostic"], capture["cost_same_seed_context"]["cudnn_execution_diagnostic"])
+        self.assertEqual(metadata["tf32_actual"], "unknown")
+        self.assertEqual(metadata["tf32_retry"], "unknown")
+        self.assertEqual(metadata["cost_execution_boundary"], COST_PROGRESS_BOUNDARY)
+        self.assertEqual(capture, before)
+
+    def test_default_cost_needs_matching_separate_opt_in_and_env0_before_artifact_loading(self):
+        capture = _default_cost_capture()
+        for requested in (None, COST_PROFILE_LEGACY):
+            reads = []
+            def read(path, *args):
+                reads.append(path.name)
+                return (json.dumps(capture).encode() if path.name == "capture.json" else b"{}"), {"sha256": "11" * 32}
+            with tempfile.TemporaryDirectory(prefix="rz-pals-cost-admission-") as directory:
+                paths = [Path(directory) / name for name in ("frozen.pt", "export.json", "capture.json", "reference.json")]
+                with patch("rz_pals_model.cuda_warm_actual_reference._source_hashes", return_value={}), \
+                     patch("rz_pals_model.cuda_warm_actual_reference._read_immutable_bytes", side_effect=read), \
+                     patch("rz_pals_model.cuda_warm_actual_reference._external_path", side_effect=lambda path, *args: path), \
+                     patch.dict("os.environ", {"NVIDIA_TF32_OVERRIDE": "0"}), \
+                     self.subTest(requested=requested), self.assertRaisesRegex(ValueError, "explicit matching"):
+                    numeric_check_cuda_warm_actual_reference(paths[0], paths[1], MANIFEST_SHA, paths[2], "11" * 32,
+                                                             paths[3], cost_profile=requested)
+                self.assertEqual(reads, ["capture.json", "export.json"])
+                self.assertFalse(paths[3].exists())
+        for environment in (None, "1", ""):
+            with patch.dict("os.environ", {}, clear=True):
+                if environment is not None:
+                    import os
+                    os.environ["NVIDIA_TF32_OVERRIDE"] = environment
+                with self.subTest(environment=environment), self.assertRaisesRegex(ValueError, "before loading"):
+                    _cost_reference_profile(capture, COST_PROFILE_CONV_DEFAULT)
+
+    def test_default_cost_rejects_tampered_request_descriptor_and_legacy_promotion(self):
+        for label in ("profile", "search", "env", "tf32", "actual", "retry", "descriptor_env", "descriptor_search", "descriptor_actual"):
+            capture = _default_cost_capture()
+            cost = capture["cost_same_seed_context"]
+            if label == "profile": cost["cost_profile"] = "unknown/v1"
+            elif label == "search": cost["cudnn_conv_search_requested"] = "legacy_implicit_exhaustive"
+            elif label == "env": cost["nvidia_tf32_override_required"] = None
+            elif label == "tf32": cost["tf32_requested"] = True
+            elif label == "actual": cost["tf32_actual"] = False
+            elif label == "retry": cost["tf32_retry"] = False
+            elif label == "descriptor_env": cost["cudnn_execution_diagnostic"]["descriptor"]["nvidia_tf32_override_environment_request"] = "absent"
+            elif label == "descriptor_search": cost["cudnn_execution_diagnostic"]["descriptor"]["cudnn_conv_algo_search_requested"] = "EXHAUSTIVE"
+            else: cost["cudnn_execution_diagnostic"]["tf32_actual"] = False
+            with patch.dict("os.environ", {"NVIDIA_TF32_OVERRIDE": "0"}), self.subTest(label=label), self.assertRaises(ValueError):
+                _cost_reference_profile(capture, COST_PROFILE_CONV_DEFAULT)
+        for capture in (_capture(), _cost_capture()):
+            with self.subTest(has_cost="cost_same_seed_context" in capture), self.assertRaises(ValueError):
+                _cost_reference_profile(capture, COST_PROFILE_CONV_DEFAULT)
+
+    def test_legacy_profileless_reference_wire_and_embedded_cli_default_remain_compatible(self):
+        capture = _cost_capture()
+        self.assertEqual(_cost_reference_profile(_capture(), None), {})
+        self.assertEqual(_cost_reference_profile(capture, None), {})
+        self.assertEqual(_cost_reference_profile(capture, COST_PROFILE_LEGACY), {})
+        capture["cost_same_seed_context"]["cost_profile"] = COST_PROFILE_LEGACY
+        self.assertEqual(_cost_reference_profile(capture, None), {"cost_profile": COST_PROFILE_LEGACY})
+        parser = argparse.ArgumentParser()
+        _arguments(parser)
+        args = ["--" + name + "=fixture" for name in ("checkpoint", "export-manifest", "export-manifest-sha256",
+                                                     "capture-json", "capture-sha256", "output-json")]
+        self.assertIsNone(parser.parse_args(args).cost_profile)
+        self.assertEqual(parser.parse_args(args + ["--cost-profile", COST_PROFILE_CONV_DEFAULT]).cost_profile, COST_PROFILE_CONV_DEFAULT)
+
     def test_seed_provenance_framing_has_independent_known_digest_and_preserves_raw_sha(self):
         bits = [0x80000000] + [0x3e800000] * (LATENT_ELEMENTS - 1)
         known = "31d746ae061e3380aa88d34b3a310197361ecec7205c4f35ff3b5a3367b642a5"

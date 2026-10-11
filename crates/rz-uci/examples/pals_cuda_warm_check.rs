@@ -65,16 +65,17 @@ mod check {
     use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeCache};
     use rz_position::{BoardMove, Position, PositionIdentity, PositionSnapshot};
     use rz_search::cpu::{
-        CpuCapabilities, CpuConfig, CpuEngine, CpuError, CpuLimits, CpuPausedStackSnapshot,
-        CpuProfile, CpuReport, CpuResumePolicy, CpuResumeToken, CpuSearcher, CpuWork,
+        CpuCapabilities, CpuConfig, CpuEngine, CpuError, CpuLimits, CpuOrderingPolicy,
+        CpuPausedStackSnapshot, CpuProfile, CpuReport, CpuResumePolicy, CpuResumeToken,
+        CpuSearcher, CpuWork,
     };
     use rz_search::cpu_checker::{CheckerError, OwnedCpuChecker};
-    use rz_search::cpu_value::CpuValueIdentity;
+    use rz_search::cpu_value::{BootstrapCpuValue, CpuValueIdentity};
     use rz_search::pals::engine::{
-        DivergenceQuery, ModelValueIdentity, ModelValueOutput, PalsConfig, PalsEngine, PalsError,
-        PalsLimits, PostRepairRecheckPolicy, RecheckFinished, RecheckPrepared, ResolverPolicy,
-        RoleAcceptance, RoleError, RoleEvaluation, RoleLogicalContext, RoleModel, RoleQuery,
-        RoleQueryPurpose, RoleRecord, RoleSearchClosure,
+        CpuInterleavePolicy, DivergenceQuery, ModelValueIdentity, ModelValueOutput, PalsConfig,
+        PalsEngine, PalsError, PalsLimits, PostRepairRecheckPolicy, RecheckFinished,
+        RecheckPrepared, ResolverPolicy, RoleAcceptance, RoleError, RoleEvaluation,
+        RoleLogicalContext, RoleModel, RoleQuery, RoleQueryPurpose, RoleRecord, RoleSearchClosure,
     };
     use rz_search::pals::store::{ExecutionId, PalsStores, TaskQuestion};
     use rz_uci::pals_native::{
@@ -343,6 +344,7 @@ mod check {
         values: BTreeMap<String, String>,
         output: PathBuf,
         cost_same_seed_context: bool,
+        cost_conv_default: bool,
     }
     impl Args {
         fn value(&self, key: &str) -> Result<&str, Failure> {
@@ -456,9 +458,14 @@ mod check {
         };
         let mut values = BTreeMap::new();
         let mut cost_same_seed_context = false;
+        let mut cost_conv_default = false;
         while let Some(flag) = arguments.next() {
-            if flag == "--cost-same-seed-context" {
+            if matches!(
+                flag.as_str(),
+                "--cost-same-seed-context" | "--cost-same-seed-context-conv-default"
+            ) {
                 cost_opt_in(&mode, &mut cost_same_seed_context)?;
+                cost_conv_default = flag == "--cost-same-seed-context-conv-default";
                 continue;
             }
             require(
@@ -490,6 +497,7 @@ mod check {
             values,
             output,
             cost_same_seed_context,
+            cost_conv_default,
         };
         for &flag in allowed {
             let optional = [
@@ -532,6 +540,7 @@ mod check {
             "control_inventory_requires_all_three_fields",
         )?;
         cuda_conv_selection(&args)?;
+        cost_default_environment(&args, std::env::var("NVIDIA_TF32_OVERRIDE").ok().as_deref())?;
         if args.mode == "capture" {
             let limits = args.cuda_warm_limits()?;
             if args.cost_same_seed_context {
@@ -555,10 +564,10 @@ mod check {
     }
     fn cuda_conv_selection(args: &Args) -> Result<PalsCuDnnConvSearch, Failure> {
         match args.values.get("--cudnn-conv-search").map(String::as_str) {
-            None => Ok(PalsCuDnnConvSearch::LegacyImplicitExhaustive),
+            None if !args.cost_conv_default => Ok(PalsCuDnnConvSearch::LegacyImplicitExhaustive),
             Some("default-device-warm-v1")
                 if args.mode == "capture"
-                    && !args.cost_same_seed_context
+                    && (!args.cost_same_seed_context || args.cost_conv_default)
                     && [
                         "--control-inventory",
                         "--control-inventory-sha256",
@@ -589,6 +598,20 @@ mod check {
                 "default_device_warm_requires_separate_eager_control_capture",
             )),
         }
+    }
+    fn cost_default_environment(args: &Args, tf32_override: Option<&str>) -> Result<(), Failure> {
+        if args.cost_conv_default {
+            require(
+                args.mode == "capture"
+                    && args.cost_same_seed_context
+                    && args.values.get("--cudnn-conv-search").map(String::as_str)
+                        == Some("default-device-warm-v1")
+                    && tf32_override == Some("0"),
+                "arguments",
+                "default_cost_requires_explicit_conv_default_and_tf32_override_zero",
+            )?;
+        }
+        Ok(())
     }
     fn pinned(path: &Path, expected: &str, maximum: usize) -> Result<Vec<u8>, Failure> {
         let bytes =
@@ -738,6 +761,44 @@ mod check {
     ) -> bool {
         paused_at < repair_at && repair_at < critic_at && critic_at < resumed_at
     }
+    fn resident_repair_for_progress<'a>(
+        calls: impl Iterator<Item = &'a Value>,
+        cpu_resume: &Value,
+    ) -> Option<RequestId> {
+        if cpu_resume["passed"] != true {
+            return None;
+        }
+        // The native bank has one slot per role. Historical accepted Repair
+        // packets do not retain a seed after any later accepted P publication.
+        // C and ValueFresh never replace that P slot.
+        let latest = calls
+            .filter(|call| {
+                call["accepted"] == true
+                    && call["input"]["role"] == "proposer"
+                    && matches!(
+                        call["logical_context"]["purpose"].as_str(),
+                        Some("ProposePolicy" | "RepairPolicy")
+                    )
+            })
+            .last()?;
+        if latest["logical_context"]["purpose"] != "RepairPolicy"
+            || latest["stage"] != "actual_pals_search"
+            || latest["accepted_with_original_controls"] != true
+            || latest["physical"]["ready"] != true
+            || latest["physical"]["completed_ok"] != true
+            || latest["physical"]["completion_unknown"] != false
+            || !cpu_resume["matched_actual_pause_repair_c_resume_sequences"]
+                .as_array()?
+                .iter()
+                .any(|chain| chain["accepted_gpu_repair_request_id"] == latest["request_id"])
+        {
+            return None;
+        }
+        Some(RequestId {
+            epoch: rz_contracts::ProcessEpoch(latest["request_id"]["epoch"].as_u64()?),
+            sequence: latest["request_id"]["sequence"].as_u64()?,
+        })
+    }
     struct Capture {
         configuration: PalsModelConfig,
         started: Instant,
@@ -786,23 +847,33 @@ mod check {
                 .ok_or(RoleError::InvalidOutput)
         }
         fn last_repair(&self) -> Option<(OwnedQuestion, PalsModelInput, RequestId, Vec<u32>)> {
-            self.calls.iter().rev().find_map(|call| {
-                let question = call.question.as_ref()?;
-                if !call.accepted || question.context.purpose != RoleQueryPurpose::RepairPolicy {
-                    return None;
-                }
-                Some((
-                    question.clone(),
-                    serde_json::from_value(call.wire["input"].clone()).ok()?,
-                    call.id,
-                    call.raw
-                        .as_ref()?
-                        .private_latent
-                        .iter()
-                        .map(|value| value.to_bits())
-                        .collect(),
-                ))
-            })
+            let id = self.calls.iter().rev().find_map(|call| {
+                (call.accepted
+                    && call.question.as_ref()?.context.purpose == RoleQueryPurpose::RepairPolicy)
+                    .then_some(call.id)
+            })?;
+            self.repair_by_request(id)
+        }
+        fn repair_by_request(
+            &self,
+            id: RequestId,
+        ) -> Option<(OwnedQuestion, PalsModelInput, RequestId, Vec<u32>)> {
+            let call = self.calls.iter().find(|call| call.id == id)?;
+            let question = call.question.as_ref()?;
+            if !call.accepted || question.context.purpose != RoleQueryPurpose::RepairPolicy {
+                return None;
+            }
+            Some((
+                question.clone(),
+                serde_json::from_value(call.wire["input"].clone()).ok()?,
+                call.id,
+                call.raw
+                    .as_ref()?
+                    .private_latent
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect(),
+            ))
         }
         fn wires(&self) -> Vec<Value> {
             self.calls.iter().map(|call| call.wire.clone()).collect()
@@ -1158,6 +1229,12 @@ mod check {
         fn resume_policy(&self) -> CpuResumePolicy {
             self.engine.resume_policy()
         }
+        fn preserves_paused_on_fresh_tasks(&self) -> bool {
+            self.engine.preserves_paused_on_fresh_tasks()
+        }
+        fn paused_side_scope_snapshot(&self) -> Option<rz_search::cpu::CpuSideScopeSnapshot> {
+            self.engine.paused_side_scope_snapshot()
+        }
         fn paused_stack_bytes(&self) -> Option<usize> {
             self.engine.paused_stack_bytes()
         }
@@ -1256,6 +1333,13 @@ mod check {
             let Some(previous) = task.resumed_from else {
                 continue;
             };
+            if capture
+                .scheduler_resume_links
+                .iter()
+                .any(|link| link["execution"] == json!(execution))
+            {
+                continue;
+            }
             let source = stores
                 .tasks
                 .get(previous)
@@ -1834,19 +1918,29 @@ mod check {
                 _ => false,
             }
     }
+    struct RepairProgress<'a> {
+        records: &'a [RoleRecord],
+        stores: &'a PalsStores,
+        source_request: RequestId,
+    }
+
     fn replay(
         model: &mut NativeRoleModel,
         handle: &NativeRoleFinishHandle,
         capture: &Arc<Mutex<Capture>>,
         forwards: &ForwardBudget,
-        records: &[RoleRecord],
-        stores: &PalsStores,
+        progress: RepairProgress<'_>,
         cancel: &AtomicBool,
     ) -> Result<Value, Failure> {
+        let RepairProgress {
+            records,
+            stores,
+            source_request,
+        } = progress;
         let (original, old_input, source_request, source_latent) = capture
             .lock()
             .map_err(|_| fail("resume", "capture_unavailable"))?
-            .last_repair()
+            .repair_by_request(source_request)
             .ok_or(fail("resume", "actual_accepted_search_repair_missing"))?;
         let mut current = original.clone();
         let revision = records.iter().map(|v| v.revision).max().unwrap_or(0);
@@ -1864,6 +1958,7 @@ mod check {
         require(
             situation.state == current.context.state
                 && situation.focus == current.context.focus
+                && situation.revision == current.context.situation_revision
                 && stores
                     .states
                     .get(situation.state)
@@ -1871,7 +1966,6 @@ mod check {
             "resume",
             "actual_store_rules_or_focus_changed",
         )?;
-        current.context.situation_revision = situation.revision;
         let input = prepare_role_input_for_config(
             &current.query(cancel),
             NativeQueryKind::Repair,
@@ -2013,7 +2107,8 @@ mod check {
             "current_record_revision": revision, "same_exact_nonrecord_and_rules_history": true,
             "same_original_deadline_and_cancel": true, "accepted_full_6144_seed_reused": true,
             "current_store_state_situation_and_focus_checked": true,
-            "resume_consumer": "public_checked_native_role_consumer_of_actual_search_question",
+            "resume_consumer": "read_only_actual_search_progress_before_next_P_publication",
+            "source_resident_at_actual_progress_checked": true,
             "repair_logits": output.logits, "repair_wdl": output.wdl, "value_wdl": estimate.wdl,
             "value_fresh_checked": true, "receipt_before": before, "receipt_staged": staged, "receipt_after": after,
             "receipt_after_value": value_after}),
@@ -2312,9 +2407,13 @@ mod check {
             configuration: captured.configuration.clone(),
             model_epoch: owner.model_epoch(),
         };
+        let integration_inputs_at_progress = captured.calls.len() as u64;
+        let receipt_at_resident_progress = cost_counts(&handle.receipt());
         let trace = cost_trace(started, &fixed, captured.call_output_bytes_reserved);
         drop(captured);
         let mut lane = run_cost_lane(owner, handle, &trace, &fixed, true, cancel);
+        lane["integration_inputs_at_progress"] = json!(integration_inputs_at_progress);
+        lane["receipt_at_resident_progress"] = receipt_at_resident_progress;
         if let Err(error) = owner.set_private_warm_observer(Box::new(Observer(Arc::clone(capture))))
         {
             lane["complete"] = json!(false);
@@ -2332,6 +2431,7 @@ mod check {
         whole: Instant,
         cancel: &AtomicBool,
     ) -> Result<Value, Failure> {
+        cost_default_environment(args, std::env::var("NVIDIA_TF32_OVERRIDE").ok().as_deref())?;
         require(
             !cancel.load(Ordering::Acquire) && Instant::now() < deadline,
             "cost_fresh_load",
@@ -2537,6 +2637,12 @@ mod check {
             && !cancel.load(Ordering::Acquire);
         let mut cost = json!({
             "opt_in": true, "scope": "repair_with_context_api_known_physical_logical_consumer_zero",
+            "cost_profile": if args.cost_conv_default {"same-seed-conv-default-env0/v1"} else {"same-seed-legacy/v1"},
+            "cudnn_conv_search_requested": if args.cost_conv_default {"default-device-warm-v1"} else {"legacy_implicit_exhaustive"},
+            "tf32_requested": false, "tf32_actual": "unknown", "tf32_retry": "unknown",
+            "nvidia_tf32_override_required": if args.cost_conv_default {Some("0")} else {None},
+            "cudnn_execution_diagnostic": report["startup_receipt"]["execution"]["cudnn_conv_search_diagnostic"],
+            "cost_execution_boundary": "resident_repair_actual_search_progress_before_later_P_publication",
             "execution_checks_passed": complete, "benchmark_validation_complete": false,
             "wall_limit_ms": COST_WALL.as_millis(), "cleanup_limit_ms": CLEANUP.as_millis(),
             "preparation_calls_per_lane": COST_PREPARATION_CALLS,
@@ -2595,6 +2701,9 @@ mod check {
         cancel: &AtomicBool,
         capture: &Arc<Mutex<Capture>>,
     ) -> Result<Value, Failure> {
+        // The dedicated DEFAULT cost namespace admits only the process-level
+        // requested override. No ORT/cuDNN plan or actual TF32 state is inferred.
+        cost_default_environment(args, std::env::var("NVIDIA_TF32_OVERRIDE").ok().as_deref())?;
         require(
             cfg!(target_os = "linux"),
             "platform",
@@ -2718,15 +2827,22 @@ mod check {
                 value_identity,
                 forwards: Arc::clone(&forwards),
             };
-            let cpu = CpuEngine::with_resume_policy(
-                CpuConfig {
-                    profile: CpuProfile::Independent,
-                    tt_entries: 1024,
-                    max_depth: scenario.cpu_depth,
-                    quiescence_ply: 8,
-                },
-                CpuResumePolicy::PausedStack,
-            )
+            let cpu_config = CpuConfig {
+                profile: CpuProfile::Independent,
+                tt_entries: 1024,
+                max_depth: scenario.cpu_depth,
+                quiescence_ply: 8,
+            };
+            let cpu = match scenario.execution_profile {
+                ExecutionProfile::ActualOpponentContinuationV1 => {
+                    CpuEngine::with_resume_policy(cpu_config, CpuResumePolicy::PausedStack)
+                }
+                ExecutionProfile::IterativeFrozenModelWdlV2 => CpuEngine::with_paused_side_scope(
+                    cpu_config,
+                    Arc::new(BootstrapCpuValue::default()),
+                    CpuOrderingPolicy::LegacyMvvLvaV1,
+                ),
+            }
             .map_err(|_| fail("search", "own_cpu_configuration_failed"))?;
             let cpu = ObservedCpu {
                 engine: cpu,
@@ -2752,7 +2868,7 @@ mod check {
                     )
                 }
                 ExecutionProfile::IterativeFrozenModelWdlV2 => {
-                    PalsEngine::new_with_boxed_checker_and_policies(
+                    PalsEngine::new_with_boxed_checker_and_policies_and_cpu_interleave(
                         config,
                         model,
                         Box::new(
@@ -2761,6 +2877,7 @@ mod check {
                         ),
                         ResolverPolicy::ModelWdlRestricted,
                         PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
+                        CpuInterleavePolicy::ResumeAfterAcceptedRepairC,
                     )
                 }
             }
@@ -2797,7 +2914,8 @@ mod check {
                 .lock()
                 .map_err(|_| fail("search", "capture_unavailable"))?
                 .stage = "actual_pals_search";
-            let search = engine.search(
+            let mut progress_resume = None;
+            let search = engine.search_with_observed_progress(
                 &position,
                 PalsLimits {
                     deadline,
@@ -2806,6 +2924,76 @@ mod check {
                     cpu_depth: scenario.cpu_depth,
                 },
                 cancel,
+                |_, stores, records| {
+                    if progress_resume.is_some() {
+                        return;
+                    }
+                    let selected = (|| {
+                        let mut captured = capture
+                            .lock()
+                            .map_err(|_| fail("resume", "capture_unavailable"))?;
+                        observe_scheduler_resume_links(&mut captured, stores)?;
+                        let proof = captured.cpu_resume_evidence();
+                        Ok::<_, Failure>(resident_repair_for_progress(
+                            captured.calls.iter().map(|call| &call.wire),
+                            &proof,
+                        ))
+                    })();
+                    let result = match selected {
+                        Ok(None) => return,
+                        Err(error) => Err(error),
+                        Ok(Some(source)) => (|| {
+                            let mut owner = native
+                                .lock()
+                                .map_err(|_| fail("resume", "owner_unavailable"))?;
+                            let result = replay(
+                                &mut owner,
+                                &handle,
+                                capture,
+                                &forwards,
+                                RepairProgress {
+                                    records,
+                                    stores,
+                                    source_request: source,
+                                },
+                                cancel,
+                            )?;
+                            // Cost lanes consume the same actual resident Repair
+                            // before the next P publication can evict its seed.
+                            if args.cost_same_seed_context {
+                                match prepare_warm_cost(&mut owner, &handle, capture, started, cancel) {
+                                    Ok((fixed, lane)) => {
+                                        let complete = lane["complete"] == true;
+                                        let mut captured = capture
+                                            .lock()
+                                            .map_err(|_| fail("cost", "capture_unavailable"))?;
+                                        captured.cost_fixed_repair = Some(fixed);
+                                        captured.cost_warm_lane = Some(lane);
+                                        require(complete, "cost", "progress_cost_lane_incomplete")?;
+                                    }
+                                    Err(error) => {
+                                        capture
+                                            .lock()
+                                            .map_err(|_| fail("cost", "capture_unavailable"))?
+                                            .cost_warm_lane =
+                                            Some(json!({"complete": false, "failure": error.clone().wire()}));
+                                        return Err(error);
+                                    }
+                                }
+                            }
+                            Ok(result)
+                        })(),
+                    };
+                    if let Ok(mut captured) = capture.lock() {
+                        captured.stage = "actual_pals_search";
+                    }
+                    if result.is_err() {
+                        // Preserve the first failed probe and stop subsequent
+                        // logical dispatch. Physical ownership drains below.
+                        cancel.store(true, Ordering::Release);
+                    }
+                    progress_resume = Some(result);
+                },
             );
             {
                 let mut trace = capture
@@ -2834,54 +3022,20 @@ mod check {
                 "paused_stack_selected": true, "execution_profile": format!("{:?}", scenario.execution_profile),
                 "value_calls": counters.value_calls, "accepted_value_outputs": counters.accepted_value_outputs,
                 "cpu_work_observation_incomplete": counters.cpu_work_observation_incomplete,
+                "cpu_interleave_policy": format!("{:?}", engine.cpu_interleave_policy()),
+                "cpu_completed_iteration_side_scope": engine.cpu_side_scope_snapshot().map(|side| json!({
+                    "attempts": side.attempts, "work": cpu_work(side.work),
+                    "fixed_reserved_bytes": side.fixed_reserved_bytes,
+                    "fixed_reserved_bytes_are_observed_peak": false, "complete": side.complete})),
                 "actual_interrupted_stack_resume_trace": "actual_CpuSearcher_wrapper_and_TaskTable_resumed_from"});
-            let records = engine.records().to_vec();
-            let continuation = capture
-                .lock()
-                .map_err(|_| fail("search", "capture_unavailable"))?
-                .recheck_completed;
-            // Do not forge a Repair or select an alternative by modifying NN
-            // logits. Its absence is an explicit unmet exercise gate.
-            let resume = if continuation && counters.accepted_repair_outputs > 0 {
-                let mut owner = native
-                    .lock()
-                    .map_err(|_| fail("resume", "owner_unavailable"))?;
-                replay(
-                    &mut owner,
-                    &handle,
-                    capture,
-                    &forwards,
-                    &records,
-                    engine.stores(),
-                    cancel,
-                )
-            } else {
+            // No invented Repair, widened bank or relabeled Fresh fallback.
+            // Missing actual progress remains an explicit unmet exercise gate.
+            let resume = progress_resume.unwrap_or_else(|| {
                 Err(fail(
-                    "search",
-                    "actual_accepted_repair_and_c_continuation_not_exercised",
+                    "resume",
+                    "actual_resident_repair_c_original_cpu_resume_progress_not_exercised",
                 ))
-            };
-            if args.cost_same_seed_context && resume.is_ok() {
-                let mut owner = native
-                    .lock()
-                    .map_err(|_| fail("cost", "owner_unavailable"))?;
-                match prepare_warm_cost(&mut owner, &handle, capture, started, cancel) {
-                    Ok((fixed, lane)) => {
-                        let mut captured = capture
-                            .lock()
-                            .map_err(|_| fail("cost", "capture_unavailable"))?;
-                        captured.cost_fixed_repair = Some(fixed);
-                        captured.cost_warm_lane = Some(lane);
-                    }
-                    Err(error) => {
-                        capture
-                            .lock()
-                            .map_err(|_| fail("cost", "capture_unavailable"))?
-                            .cost_warm_lane =
-                            Some(json!({"complete": false, "failure": error.wire()}));
-                    }
-                }
-            }
+            });
             // Preserve work observations even when the independent CPU owner
             // cannot prove shutdown. Native GPU cleanup below still has its own
             // physical receipt and must neither hide nor certify CPU closure.
@@ -3134,7 +3288,12 @@ mod check {
             "fresh_vs_seeded_equality_required": false, "same_seed_independent_reference_required": true,
             "startup_receipt": startup, "actual_search": search, "actual_search_rechecks": capture.rechecks,
             "resume": resume.as_ref().and_then(|v| v.as_ref().ok()),
-            "failure": work_failure.or(search_failure).or_else(|| resume.as_ref().and_then(|v| v.as_ref().err().cloned()))
+            "failure": work_failure
+                .or_else(|| resume.as_ref().and_then(|v| v.as_ref().err())
+                    .filter(|error| error.code != "actual_resident_repair_c_original_cpu_resume_progress_not_exercised")
+                    .cloned())
+                .or(search_failure)
+                .or_else(|| resume.as_ref().and_then(|v| v.as_ref().err().cloned()))
                 .or_else(|| checker_cleanup_failure.clone())
                 .or_else(|| (cpu_resume["passed"] != true).then(|| fail("cpu_scheduler_resume", "actual_pause_repair_c_resume_not_exercised")))
                 .or_else(|| (!owner_accounting).then(|| fail("cuda_warm_owner", "actual_owner_accounting_or_closure_missing")))
@@ -3270,6 +3429,51 @@ mod check {
             "task_logits": raw.task_logits.map(|v| v.map(f32::to_bits)),
             "private_latent": raw.private_latent.iter().map(|v| v.to_bits()).collect::<Vec<_>>()})
     }
+    fn cost_profile_matches_reference(cost: &Value, reference: &Value) -> bool {
+        match cost.get("cost_profile").and_then(Value::as_str) {
+            None | Some("same-seed-legacy/v1") => matches!(
+                reference.get("cost_profile").and_then(Value::as_str),
+                None | Some("same-seed-legacy/v1")
+            ),
+            Some("same-seed-conv-default-env0/v1") => {
+                reference["cost_profile"] == cost["cost_profile"]
+                    && cost["cudnn_conv_search_requested"] == "default-device-warm-v1"
+                    && cost["nvidia_tf32_override_required"] == "0"
+                    && cost["tf32_requested"] == false
+                    && cost["tf32_actual"] == "unknown"
+                    && cost["tf32_retry"] == "unknown"
+            }
+            _ => false,
+        }
+    }
+    fn cost_sample_origin(
+        cost: &Value,
+        lane: &Value,
+        warm: bool,
+        final_integration_inputs: u64,
+    ) -> Result<u64, Failure> {
+        if !warm {
+            return Ok(0);
+        }
+        if cost.get("cost_execution_boundary").is_none() {
+            // Legacy artifacts ran cost after all integration inputs. Keep
+            // their exact counter interpretation, without rewriting them.
+            return Ok(final_integration_inputs);
+        }
+        let base = lane["integration_inputs_at_progress"]
+            .as_u64()
+            .ok_or(fail("cost_reference", "progress_cost_origin_missing"))?;
+        require(
+            cost["cost_execution_boundary"]
+                == "resident_repair_actual_search_progress_before_later_P_publication"
+                && base > 0
+                && base <= final_integration_inputs
+                && cost_receipt_matches(&lane["receipt_at_resident_progress"], base, base, false),
+            "cost_reference",
+            "progress_cost_origin_or_known_consumer_count_invalid",
+        )?;
+        Ok(base)
+    }
     fn cost_reference(
         capture: &Value,
         reference: &Value,
@@ -3328,7 +3532,8 @@ mod check {
                 && independent["original_accepted_full_6144_seed_bits"]
                     == cost["original_accepted_full_6144_seed_bits"]
                 && independent["same_target_input_json_sha256_hex"]
-                    == cost["same_target_input_json_sha256_hex"],
+                    == cost["same_target_input_json_sha256_hex"]
+                && cost_profile_matches_reference(cost, independent),
             "cost_reference",
             "partial_or_unbound_original_cost_source",
         )?;
@@ -3351,6 +3556,13 @@ mod check {
             "comparison_status": "not_comparable", "warm_over_fresh_api_wall_ratio": null,
             "physical_nn_graph_inputs_per_sample": null, "public_cache_counts_per_sample": null,
             "benchmark_validation_complete": false, "fresh_vs_warm_output_equality_required": false});
+        if let Some(profile) = cost.get("cost_profile") {
+            result["cost_profile"] = profile.clone();
+            result["tf32_requested"] = cost["tf32_requested"].clone();
+            result["tf32_actual"] = cost["tf32_actual"].clone();
+            result["tf32_retry"] = cost["tf32_retry"].clone();
+            result["cudnn_execution_diagnostic"] = cost["cudnn_execution_diagnostic"].clone();
+        }
         for (name, warm) in [("warm", true), ("fresh", false)] {
             let lane = &cost[name];
             let lane_reference = &independent[name];
@@ -3362,6 +3574,7 @@ mod check {
                 .ok_or(fail("cost_reference", "lane_reference_missing"))?;
             let base = if warm { original_count } else { 0 };
             let consumers = base;
+            let sample_base = cost_sample_origin(cost, lane, warm, original_count)?;
             require(
                 lane["complete"] == true
                     && lane["failure"].is_null()
@@ -3460,14 +3673,24 @@ mod check {
                             } as u64)
                         && sample["api_returned_ok"] == true
                         && sample["close_unconsumed_returned_ok"] == true
-                        && cost_receipt_matches(before, base + index as u64, consumers, false)
                         && cost_receipt_matches(
-                            returned,
-                            base + index as u64 + 1,
-                            consumers,
+                            before,
+                            sample_base + index as u64,
+                            sample_base,
                             false,
                         )
-                        && cost_receipt_matches(after, base + index as u64 + 1, consumers, false)
+                        && cost_receipt_matches(
+                            returned,
+                            sample_base + index as u64 + 1,
+                            sample_base,
+                            false,
+                        )
+                        && cost_receipt_matches(
+                            after,
+                            sample_base + index as u64 + 1,
+                            sample_base,
+                            false,
+                        )
                         && ["process_epoch", "game_generation"].iter().all(|key| {
                             before[key] == returned[key]
                                 && before[key] == after[key]
@@ -4095,6 +4318,7 @@ mod check {
                 values: BTreeMap::new(),
                 output: PathBuf::new(),
                 cost_same_seed_context: false,
+                cost_conv_default: false,
             };
             assert!(matches!(
                 cuda_conv_selection(&args),
@@ -4378,6 +4602,89 @@ mod check {
             assert!(!cost_known_unconsumed(&before, &after, &unknown_call));
         }
         #[test]
+        fn default_cost_is_explicit_env_zero_and_separate_from_generic_cost() {
+            let mut args = Args {
+                mode: "capture".into(),
+                values: BTreeMap::new(),
+                output: PathBuf::new(),
+                cost_same_seed_context: true,
+                cost_conv_default: false,
+            };
+            args.values.insert(
+                "--cudnn-conv-search".into(),
+                "default-device-warm-v1".into(),
+            );
+            for flag in [
+                "--control-inventory",
+                "--control-inventory-sha256",
+                "--profile-root",
+            ] {
+                args.values.insert(flag.into(), "not-read".into());
+            }
+            assert!(cuda_conv_selection(&args).is_err());
+            args.cost_conv_default = true;
+            assert!(matches!(
+                cuda_conv_selection(&args),
+                Ok(PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm)
+            ));
+            assert!(cost_default_environment(&args, Some("0")).is_ok());
+            for environment in [None, Some(""), Some("1"), Some("false")] {
+                assert!(cost_default_environment(&args, environment).is_err());
+            }
+            args.values.remove("--cudnn-conv-search");
+            assert!(cuda_conv_selection(&args).is_err());
+            assert!(cost_default_environment(&args, Some("0")).is_err());
+            args.cost_conv_default = false;
+            assert!(matches!(
+                cuda_conv_selection(&args),
+                Ok(PalsCuDnnConvSearch::LegacyImplicitExhaustive)
+            ));
+            assert!(cost_default_environment(&args, None).is_ok());
+        }
+
+        #[test]
+        fn default_cost_reference_namespace_cannot_be_legacy_or_automatic_tf32_claim() {
+            let default = json!({"cost_profile": "same-seed-conv-default-env0/v1",
+                "cudnn_conv_search_requested": "default-device-warm-v1",
+                "nvidia_tf32_override_required": "0", "tf32_requested": false,
+                "tf32_actual": "unknown", "tf32_retry": "unknown"});
+            assert!(cost_profile_matches_reference(&default, &default));
+            assert!(!cost_profile_matches_reference(&default, &json!({})));
+            assert!(!cost_profile_matches_reference(
+                &default,
+                &json!({"cost_profile": "same-seed-legacy/v1"})
+            ));
+            let mut invented = default.clone();
+            invented["tf32_actual"] = json!(false);
+            assert!(!cost_profile_matches_reference(&invented, &default));
+            assert!(cost_profile_matches_reference(&json!({}), &json!({})));
+            assert!(!cost_profile_matches_reference(&json!({}), &default));
+        }
+
+        #[test]
+        fn progress_cost_samples_keep_their_actual_origin_and_final_owner_totals_separate() {
+            let cost = json!({"cost_execution_boundary": "resident_repair_actual_search_progress_before_later_P_publication"});
+            let mut lane = json!({"integration_inputs_at_progress": 21,
+                "receipt_at_resident_progress": {"process_epoch": 1, "game_generation": 1,
+                    "quarantined": false, "physical_runs_in_flight": 0,
+                    "physically_completed_role_calls": 21, "completed_role_inputs": 21,
+                    "delivered_role_inputs": 21, "search_consumed_role_inputs": 21}});
+            assert_eq!(cost_sample_origin(&cost, &lane, true, 40).ok(), Some(21));
+            assert!(cost_sample_origin(&cost, &lane, true, 20).is_err());
+            lane["receipt_at_resident_progress"]["search_consumed_role_inputs"] = json!(20);
+            assert!(cost_sample_origin(&cost, &lane, true, 40).is_err());
+            assert!(cost_sample_origin(&cost, &json!({}), true, 40).is_err());
+            assert_eq!(
+                cost_sample_origin(&json!({}), &json!({}), true, 40).ok(),
+                Some(40)
+            );
+            assert_eq!(
+                cost_sample_origin(&cost, &json!({}), false, 40).ok(),
+                Some(0)
+            );
+        }
+
+        #[test]
         fn cost_opt_in_has_finite_sample_and_forward_bounds_without_changing_default_wall() {
             assert_eq!(COST_PREPARATION_CALLS, 3);
             assert_eq!(COST_MEASURED_CALLS, 5);
@@ -4388,11 +4695,99 @@ mod check {
                 values: BTreeMap::new(),
                 output: PathBuf::from("metadata-fixture-only"),
                 cost_same_seed_context: false,
+                cost_conv_default: false,
             };
             assert_eq!(cost_work_wall(&args), Duration::from_secs(60));
             args.cost_same_seed_context = true;
             assert_eq!(cost_work_wall(&args), Duration::from_secs(45));
         }
+        #[test]
+        fn progress_replay_selects_exact_resident_repair_after_cpu_c_chain() {
+            // Boundary fixtures only: these packets prove no NN execution,
+            // acceptance, physical fence or real scheduler ownership.
+            let call = |sequence, purpose, role| {
+                json!({"request_id": {"epoch": 7, "sequence": sequence},
+                    "stage": "actual_pals_search", "accepted": true,
+                    "accepted_with_original_controls": true, "input": {"role": role},
+                    "logical_context": {"purpose": purpose},
+                    "physical": {"ready": true, "completed_ok": true, "completion_unknown": false}})
+            };
+            let proof = json!({"passed": true,
+            "matched_actual_pause_repair_c_resume_sequences": [
+                {"accepted_gpu_repair_request_id": {"epoch": 7, "sequence": 37}}
+            ]});
+            let mut calls = vec![
+                call(37, "RepairPolicy", "proposer"),
+                call(38, "ValueFresh", "proposer"),
+                call(39, "ReplyPolicy", "critic"),
+            ];
+            assert_eq!(
+                resident_repair_for_progress(calls.iter(), &proof),
+                Some(RequestId {
+                    epoch: rz_contracts::ProcessEpoch(7),
+                    sequence: 37
+                }),
+            );
+            // Reproduce the actual stale last_repair selection: a later P
+            // publication replaces its slot even with a completed old chain.
+            calls.push(call(51, "ProposePolicy", "proposer"));
+            assert_eq!(resident_repair_for_progress(calls.iter(), &proof), None);
+            calls.last_mut().unwrap()["accepted"] = json!(false);
+            assert_eq!(
+                resident_repair_for_progress(calls.iter(), &proof),
+                Some(RequestId {
+                    epoch: rz_contracts::ProcessEpoch(7),
+                    sequence: 37
+                }),
+            );
+        }
+
+        #[test]
+        fn progress_replay_refuses_unobserved_or_mismatched_actual_source() {
+            let source = json!({"request_id": {"epoch": 7, "sequence": 37},
+                "stage": "actual_pals_search", "accepted": true,
+                "accepted_with_original_controls": true, "input": {"role": "proposer"},
+                "logical_context": {"purpose": "RepairPolicy"},
+                "physical": {"ready": true, "completed_ok": true, "completion_unknown": false}});
+            let proof = json!({"passed": true,
+            "matched_actual_pause_repair_c_resume_sequences": [
+                {"accepted_gpu_repair_request_id": {"epoch": 7, "sequence": 37}}
+            ]});
+            for invalid in [
+                json!({}),
+                json!({"passed": false}),
+                json!({"passed": "true"}),
+                json!({"passed": true, "matched_actual_pause_repair_c_resume_sequences": []}),
+                json!({"passed": true, "matched_actual_pause_repair_c_resume_sequences": [
+                    {"accepted_gpu_repair_request_id": {"epoch": 8, "sequence": 37}}]}),
+            ] {
+                assert_eq!(
+                    resident_repair_for_progress([&source].into_iter(), &invalid),
+                    None
+                );
+            }
+            for field in ["accepted", "accepted_with_original_controls"] {
+                let mut invalid = source.clone();
+                invalid[field] = json!(false);
+                assert_eq!(
+                    resident_repair_for_progress([&invalid].into_iter(), &proof),
+                    None
+                );
+            }
+            let mut invalid = source.clone();
+            invalid["physical"]["completion_unknown"] = json!(true);
+            assert_eq!(
+                resident_repair_for_progress([&invalid].into_iter(), &proof),
+                None
+            );
+            invalid = source.clone();
+            invalid["stage"] = json!("same_question_record_revision_resume");
+            assert_eq!(
+                resident_repair_for_progress([&invalid].into_iter(), &proof),
+                None
+            );
+        }
+
         #[test]
         fn existing_paused_stack_must_span_accepted_repair_c_and_actual_resume() {
             // Timestamp admission only: this fixture supplies no CUDA Run,

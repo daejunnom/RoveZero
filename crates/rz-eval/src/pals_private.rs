@@ -1596,12 +1596,7 @@ mod tests {
         let mut replacement = source.clone();
         replacement.context =
             PrivateRulesContext::seal(&snapshot, &other, &config, situation).unwrap();
-        accepted(
-            &bank,
-            &replacement,
-            &snapshot,
-            PrivateInvocationMode::Fresh,
-        );
+        accepted(&bank, &replacement, &snapshot, PrivateInvocationMode::Fresh);
         original.situation_revision = 2;
         resumed.context =
             PrivateRulesContext::seal(&snapshot, &original, &config, situation).unwrap();

@@ -34,6 +34,10 @@ DEFAULT_ROLE_FORWARDS = 64  # Scenario default; admission requires the actual ex
 STARTUP_ROLE_FORWARDS = 2
 COST_LANE_CALLS = 8  # preparation 3, measurement 5; two sequential owners
 COST_EXTRA_ROLE_FORWARDS = 18  # Warm 8 + fresh-owner startup 2 + Fresh 8
+COST_PROFILE_LEGACY = "same-seed-legacy/v1"
+COST_PROFILE_CONV_DEFAULT = "same-seed-conv-default-env0/v1"
+COST_PROFILES = (COST_PROFILE_LEGACY, COST_PROFILE_CONV_DEFAULT)
+COST_PROGRESS_BOUNDARY = "resident_repair_actual_search_progress_before_later_P_publication"
 MAX_CAPTURE_CALLS = MAX_ROLE_FORWARDS - STARTUP_ROLE_FORWARDS
 LATENT_ELEMENTS = 16 * 384
 MAX_REFERENCE_SECONDS = 900
@@ -389,6 +393,82 @@ def _cost_receipt(receipt, role_calls, consumers, *, final=False):
             raise ValueError("cost owner final role NN accounting mismatch")
 
 
+def _cost_sample_origin(cost, lane, original_calls, warm):
+    """Separate a progress sample prefix from the final integration owner.
+
+    Old captures ran after the completed search. New captures measure while
+    the actual accepted Repair seed is resident, before later P publications.
+    Neither representation changes the final drain/NN accounting requirement.
+    """
+    if not warm:
+        return 0
+    if "cost_execution_boundary" not in cost:
+        if "integration_inputs_at_progress" in lane or "receipt_at_resident_progress" in lane:
+            raise ValueError("cost progress origin lacks its explicit execution boundary")
+        return original_calls
+    if cost["cost_execution_boundary"] != COST_PROGRESS_BOUNDARY:
+        raise ValueError("cost execution boundary is unsupported")
+    base = _uint(lane.get("integration_inputs_at_progress"))
+    if not 0 < base <= original_calls:
+        raise ValueError("cost progress origin is outside the original integration prefix")
+    origin = lane.get("receipt_at_resident_progress")
+    _cost_receipt(origin, base, base)
+    final = lane.get("final_receipt")
+    if type(final) is not dict or any(_uint(origin.get(key)) != _uint(final.get(key))
+                                     for key in ("process_epoch", "game_generation")):
+        raise ValueError("cost progress receipt does not bind its final owner namespace")
+    return base
+
+
+def _captured_cost_profile_metadata(cost):
+    """Preserve requested native provenance; do not infer the actual CUDA plan."""
+    profile = cost.get("cost_profile", COST_PROFILE_LEGACY)
+    if profile not in COST_PROFILES:
+        raise ValueError("cost reference profile is unsupported")
+    if profile == COST_PROFILE_CONV_DEFAULT:
+        if (cost.get("cudnn_conv_search_requested") != "default-device-warm-v1"
+                or cost.get("nvidia_tf32_override_required") != "0"
+                or cost.get("tf32_requested") is not False or cost.get("tf32_actual") != "unknown"
+                or cost.get("tf32_retry") != "unknown"):
+            raise ValueError("DEFAULT cost capture lacks its explicit env0/TF32 request provenance")
+        diagnostic = cost.get("cudnn_execution_diagnostic")
+        descriptor = diagnostic.get("descriptor") if type(diagnostic) is dict else None
+        if (type(descriptor) is not dict or descriptor.get("selected_profile") != "default-device-warm-v1"
+                or descriptor.get("cudnn_conv_algo_search_requested") != "DEFAULT"
+                or descriptor.get("nvidia_tf32_override_environment_request") != "0"
+                or descriptor.get("tf32_requested") is not False
+                or diagnostic.get("tf32_actual") != "unknown" or diagnostic.get("tf32_retry") != "unknown"):
+            raise ValueError("DEFAULT cost capture lacks its loaded native request descriptor")
+    # A profile-less legacy capture retains its old wire representation. An
+    # explicitly named profile and the loaded request diagnostic remain exact.
+    names = ("cost_profile", "cudnn_conv_search_requested", "tf32_requested", "tf32_actual", "tf32_retry",
+             "nvidia_tf32_override_required", "cudnn_execution_diagnostic", "cost_execution_boundary")
+    return {name: cost[name] for name in names if name in cost}
+
+
+def _cost_reference_profile(capture, requested_profile):
+    """Match the separate CLI opt-in before checkpoint/graph or NN loading."""
+    if requested_profile is not None and requested_profile not in COST_PROFILES:
+        raise ValueError("requested cost reference profile is unsupported")
+    cost = capture.get("cost_same_seed_context")
+    if cost is None:
+        if requested_profile is not None:
+            raise ValueError("requested cost reference profile lacks an actual cost capture")
+        return {}
+    if type(cost) is not dict:
+        raise ValueError("actual cost reference capture is malformed")
+    metadata = _captured_cost_profile_metadata(cost)
+    actual_profile = cost.get("cost_profile", COST_PROFILE_LEGACY)
+    if actual_profile == COST_PROFILE_CONV_DEFAULT:
+        if requested_profile != actual_profile:
+            raise ValueError("DEFAULT cost reference requires its explicit matching cost-profile opt-in")
+        if os.environ.get("NVIDIA_TF32_OVERRIDE") != "0":
+            raise ValueError("DEFAULT cost reference requires NVIDIA_TF32_OVERRIDE=0 before loading")
+    elif requested_profile not in (None, actual_profile):
+        raise ValueError("requested cost reference profile differs from the actual capture")
+    return metadata
+
+
 def _cost_packet(call, source, config, export_manifest_sha256, warm):
     if (type(call) is not dict or call.get("accepted") is not False
             or call.get("rejected") != "SearchFailedUnconsumed" or call.get("delivered") is not True
@@ -445,6 +525,9 @@ def validate_cost_capture(capture, config, export_manifest_sha256):
             or config.profile != "full_line_interaction_v2"
             or _uint(capture.get("max_actual_role_forwards_including_startup")) != DEFAULT_ROLE_FORWARDS):
         raise ValueError("cost capture is partial, unknown or outside registered bounds")
+    _captured_cost_profile_metadata(cost)
+    if "cost_execution_boundary" in cost and cost["cost_execution_boundary"] != COST_PROGRESS_BOUNDARY:
+        raise ValueError("cost execution boundary is unsupported")
     source = cost.get("original_accepted_repair_source")
     if (type(source) is not dict or source not in capture["calls"] or source.get("accepted") is not True
             or source.get("accepted_with_original_controls") is not True
@@ -463,6 +546,9 @@ def validate_cost_capture(capture, config, export_manifest_sha256):
                 or _uint(lane.get("measured_calls_requested")) != 5 or _uint(lane.get("measured_calls_completed")) != 5):
             raise ValueError("cost lane is partial or physical owner join is unknown")
         calls = _array(lane.get("calls"), COST_LANE_CALLS, COST_LANE_CALLS)
+        sample_base = _cost_sample_origin(cost, lane, original_calls, warm)
+        if warm and source not in capture["calls"][:sample_base]:
+            raise ValueError("cost Repair source was not accepted within its observed progress prefix")
         # Original integration and Warm cost share one physical owner. Fresh
         # is independent; validate IDs without rewriting the captured packets.
         requests = {_identity(call["request_id"]) for call in capture["calls"]} if warm else set()
@@ -484,7 +570,7 @@ def validate_cost_capture(capture, config, export_manifest_sha256):
             before, returned, after = (sample.get(key) for key in ("receipt_before", "receipt_returned", "receipt_after_close"))
             if any(type(value) is not dict for value in (before, returned, after)):
                 raise ValueError("cost per-call receipt is missing")
-            base_calls, consumers = (original_calls, original_calls) if warm else (0, 0)
+            base_calls, consumers = sample_base, sample_base
             _cost_receipt(before, base_calls + index, consumers)
             _cost_receipt(returned, base_calls + index + 1, consumers)
             _cost_receipt(after, base_calls + index + 1, consumers)
@@ -766,11 +852,14 @@ def _write_reference(path, report):
     if "cost_same_seed_context" in report:
         summary["cost_same_seed_reference_passed"] = report["cost_same_seed_context"]["independent_same_seed_reference_passed"]
         summary["cost_reference_calls"] = {name: len(report["cost_same_seed_context"][name]["calls"]) for name in ("warm", "fresh")}
+        if "cost_profile" in report["cost_same_seed_context"]:
+            summary["cost_profile"] = report["cost_same_seed_context"]["cost_profile"]
     return summary
 
 
 def numeric_check_cuda_warm_actual_reference(checkpoint, export_manifest, export_manifest_sha256,
-                                             capture_json, capture_sha256, output_json, *, max_seconds=300):
+                                             capture_json, capture_sha256, output_json, *, max_seconds=300,
+                                             cost_profile=None):
     """Replay captured P/C calls within its explicitly registered 16..128 budget.
 
     This function checks a cooperative wall deadline around every execution;
@@ -780,6 +869,8 @@ def numeric_check_cuda_warm_actual_reference(checkpoint, export_manifest, export
     """
     if type(max_seconds) is not int or not 1 <= max_seconds <= MAX_REFERENCE_SECONDS:
         raise ValueError("actual reference wall budget must be an integer in 1..900 seconds")
+    if cost_profile is not None and cost_profile not in COST_PROFILES:
+        raise ValueError("requested cost reference profile is unsupported")
     started = time.monotonic()
     def deadline():
         if time.monotonic() - started >= max_seconds:
@@ -790,6 +881,7 @@ def numeric_check_cuda_warm_actual_reference(checkpoint, export_manifest, export
     capture_bytes, capture_pin = _read_immutable_bytes(capture_json, MAX_CAPTURE_BYTES, _sha(capture_sha256))
     manifest_bytes, manifest_pin = _read_immutable_bytes(export_manifest, MAX_WARM_MANIFEST_BYTES, _sha(export_manifest_sha256))
     capture, manifest = _json_bytes(capture_bytes), _json_bytes(manifest_bytes)
+    cost_metadata = _cost_reference_profile(capture, cost_profile)
     config = validate_actual_capture(capture, export_manifest_sha256)
     domain = warm_export_domain(config, cuda=True)
     metadata_bytes, metadata_pin = _read_immutable_bytes(checkpoint.with_name("checkpoint.json"), MAX_WARM_MANIFEST_BYTES)
@@ -912,10 +1004,13 @@ def numeric_check_cuda_warm_actual_reference(checkpoint, export_manifest, export
         cost = capture["cost_same_seed_context"]
         report["cost_same_seed_context"] = {
             "opt_in": True, "independent_same_seed_reference_passed": True,
+            **cost_metadata,
             "original_accepted_repair_source": cost["original_accepted_repair_source"],
             "original_accepted_full_6144_seed_bits": cost["original_accepted_full_6144_seed_bits"],
             "same_target_input_json_sha256_hex": cost["same_target_input_json_sha256_hex"],
-            "warm": {"calls": cost_reports["warm"], "source_identity": source},
+            "warm": {"calls": cost_reports["warm"], "source_identity": source,
+                     **{key: cost["warm"][key] for key in ("integration_inputs_at_progress", "receipt_at_resident_progress")
+                        if key in cost["warm"]}},
             "fresh": {"calls": cost_reports["fresh"], "source_identity": cost["fresh"]["source_identity"]},
             "preparation_calls_per_lane": 3, "measured_calls_per_lane": 5,
             "extra_role_forward_reservation_including_fresh_startup": COST_EXTRA_ROLE_FORWARDS,
@@ -938,6 +1033,8 @@ def _arguments(parser):
     for name in ("checkpoint", "export-manifest", "export-manifest-sha256", "capture-json", "capture-sha256", "output-json"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--max-seconds", type=int, default=300)
+    parser.add_argument("--cost-profile", choices=COST_PROFILES,
+                        help="separate cost namespace opt-in; DEFAULT requires env0 and a matching actual capture")
 
 
 def _worker(arguments, sender):
@@ -961,7 +1058,8 @@ def run_actual_reference_cli(arguments):
         raise ValueError("actual reference wall budget must be an integer in 1..900 seconds")
     values = {"checkpoint": arguments.checkpoint, "export_manifest": arguments.export_manifest,
               "export_manifest_sha256": arguments.export_manifest_sha256, "capture_json": arguments.capture_json,
-              "capture_sha256": arguments.capture_sha256, "output_json": arguments.output_json, "max_seconds": arguments.max_seconds}
+              "capture_sha256": arguments.capture_sha256, "output_json": arguments.output_json, "max_seconds": arguments.max_seconds,
+              "cost_profile": getattr(arguments, "cost_profile", None)}
     context = multiprocessing.get_context("spawn")
     receiver, sender = context.Pipe(duplex=False)
     worker = context.Process(target=_worker, args=(values, sender), name="rz-pals-actual-cpu-reference")
