@@ -21,6 +21,34 @@ use std::path::Path;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
+/// Opt-in crash localization for the numerical checker only. Stage records
+/// are not provider fences or performance evidence. Never used by the engine.
+struct NativeStartupTrace(Option<Instant>);
+impl NativeStartupTrace {
+    fn new(cost_mode: bool) -> Result<Self, Box<dyn Error>> {
+        let enabled =
+            std::env::var_os("RZ_PALS_NUMERIC_STARTUP_TRACE").is_some_and(|value| value == "1");
+        if enabled && cost_mode {
+            return Err("native startup trace cannot be combined with cost measurement".into());
+        }
+        Ok(Self(enabled.then(Instant::now)))
+    }
+
+    fn stage(&self, stage: &'static str) {
+        if let Some(started) = self.0 {
+            // Best effort diagnostics must not turn a successful numerical
+            // check into a failure when its diagnostic sink is unavailable.
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "RZ_PALS_CHECK_STAGE stage={stage} elapsed_ns={} performance_evidence_eligible=false physical_completion=unknown",
+                started.elapsed().as_nanos()
+            );
+            let _ = stderr.flush();
+        }
+    }
+}
+
 #[cfg(feature = "experimental-io-binding")]
 #[path = "pals_model_check/resident_cuda.rs"]
 mod resident_cuda;
@@ -1229,6 +1257,7 @@ fn cost_common_six(
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args: Vec<_> = std::env::args().skip(1).collect();
     let cost_mode = args.first().is_some_and(|arg| arg == COST_COMMON_SIX_FLAG);
+    let startup_trace = NativeStartupTrace::new(cost_mode)?;
     let cost_started = cost_mode.then(Instant::now);
     if cost_mode {
         args.remove(0);
@@ -1277,10 +1306,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !fixture_path.is_absolute() {
         return Err("fixture must be absolute".into());
     }
+    startup_trace.stage("fixtures_entered");
     let fixture_bytes = asset::read_bounded(fixture_path, 16 * 1024 * 1024)?;
     let fixture_digest = asset::sha256(&fixture_bytes);
     let fixtures: Fixtures = serde_json::from_slice(&fixture_bytes)?;
     validate_fixture_coverage(&fixtures)?;
+    startup_trace.stage("fixtures_returned");
+    startup_trace.stage("runtime_pin_entered");
     let cache = RuntimeCache::open(Path::new(&args[7]))?;
     let pin = if is_cuda {
         let spec_bytes = asset::read_bounded(Path::new(&args[8]), 64 * 1024)?;
@@ -1300,8 +1332,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         cache.library(Path::new(&args[2]), &args[3])?
     };
+    startup_trace.stage("runtime_pin_returned");
     // Shim lazy is an explicitly registered diagnostic variable. Other modes,
     // including the existing cuda-control mode, retain eager16 bootstrap.
+    startup_trace.stage("runtime_load_entered");
     let runtime = (if args[6] == "cuda-control-shim" {
         OrtRuntime::load_with_cuda_loading_profile(&pin, NativeLoadingProfile::CuDnnShimLazyV1)
     } else {
@@ -1313,16 +1347,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         failure
     })?;
+    startup_trace.stage("runtime_load_returned");
     let runtime_digest = runtime.binary_digest();
     let runtime_bundle_digest = runtime.bundle_digest();
     let loading_profile = runtime.native_loading_profile();
     let loading_profile_digest = runtime.native_loading_profile_digest();
     let mut loading_observations = Vec::new();
     if is_cuda {
+        startup_trace.stage("runtime_origin_audit_entered");
         loading_observations.push(mapping_json(
             "dependencies_before_sessions",
             &runtime.cuda_mapping_observation(false)?,
         ));
+        startup_trace.stage("runtime_origin_audit_returned");
     }
     let control_policy = if matches!(args[6].as_str(), "cuda-control" | "cuda-control-shim") {
         Some(PalsCudaControlPolicy::from_inventory(
@@ -1344,7 +1381,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         config.device_public_memory = args[6] == "cuda-device";
     }
     let load = |runtime, config, suffix: &str| {
-        if let Some(policy) = &control_policy {
+        startup_trace.stage("session_load_entered");
+        let result = if let Some(policy) = &control_policy {
             PalsOnnxBackend::load_with_cuda_control_policy(
                 Path::new(&args[0]),
                 &args[1],
@@ -1355,7 +1393,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             )
         } else {
             PalsOnnxBackend::load(Path::new(&args[0]), &args[1], runtime, config)
-        }
+        };
+        startup_trace.stage(if result.is_ok() {
+            "session_load_returned_ok"
+        } else {
+            "session_load_returned_error"
+        });
+        result
     };
     let cost_load_started = cost_mode.then(Instant::now);
     let mut backend = load(runtime.clone(), config, "primary")?;
@@ -1394,11 +1438,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut proposer_seen = false;
     let mut critic_seen = false;
     let mut placement_witness = None;
-    for case in &fixtures.cases {
+    for (case_index, case) in fixtures.cases.iter().enumerate() {
         if began.elapsed() >= Duration::from_secs(120) {
             return Err("finite numeric window exhausted before next physical Run".into());
         }
+        if case_index == 0 {
+            startup_trace.stage("first_native_run_entered");
+        }
         let raw = backend.run(&case.input)?;
+        if case_index == 0 {
+            startup_trace.stage("first_native_run_returned");
+        }
         let pages = backend.host_public_page_snapshot();
         if pages.max_entries != 1
             || pages.pinned_entries != 0
@@ -1425,6 +1475,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         raw_outputs.push(raw);
     }
+    startup_trace.stage("numeric_cases_returned");
     let mut validator = fixtures.cases[0].input.clone();
     validator.role = PalsRole::Validator;
     validator.divergence_features.clear();
@@ -1783,6 +1834,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             })?,
         );
     }
+    startup_trace.stage("report_write_entered");
     let mut output = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -1790,6 +1842,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     serde_json::to_writer_pretty(&mut output, &receipt)?;
     output.write_all(b"\n")?;
     output.sync_all()?;
+    startup_trace.stage("report_write_returned");
     println!("PALS P/C numeric/physical checks passed; trained={trained}; GPU peak unknown");
     Ok(())
 }
