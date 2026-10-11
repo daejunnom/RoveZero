@@ -153,6 +153,18 @@ _REVIEWED_OPT_IN_SOURCE_PROFILES = (
         "crates/rz-arena/src/pals_collect/native.rs": {
             "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
     }),
+    # Reviewed observed-progress successor in the same archive-off SingleReply
+    # scope. Old constructors still select ReplaceOnFresh; held-parent scheduling
+    # requires the separate IterativeFrozenModelWdlV2/PausedStack constructor.
+    # The move-only progress wrapper preserves the legacy publication boundary,
+    # and the collector bytes are unchanged. This exact pair grants no held-parent,
+    # V4/ModelWdl, physical execution, cost, utility or training authority.
+    ("opt_in_single_reply_followup_observed_progress_4b272ed8_native_1ba6d1e5", {
+        "crates/rz-search/src/pals/engine.rs": {
+            "bytes": 402637, "sha256": "4b272ed825d98f51ace408b2798093e88487f6b29f94e38b9d2a753f8fc263d1"},
+        "crates/rz-arena/src/pals_collect/native.rs": {
+            "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+    }),
 )
 _POLICY = {
     "version": "pals-post-repair-recheck/1",

@@ -157,6 +157,17 @@ _REVIEWED_DISABLED_FOLLOWUP_LIVE_BINDING_SOURCES = (
     {"bytes": 396086, "sha256": "004db31f9be5133bd1925b373e6df60e97da3d50979a7eb5a031b1dad4ca397b"},
     {"bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
 )
+# Reviewed observed-progress successor, archive-off legacy Disabled scope only.
+# Old constructors select ReplaceOnFresh and the default root-preparation branch
+# is a no-op. Held-parent requires the separate IterativeFrozenModelWdlV2/
+# PausedStack constructor; this legacy collector never selects it. The move-only
+# progress wrapper and unchanged collector retain the existing controls and Rules
+# authority. This exact pair grants no held-parent, V4/ModelWdl, execution, cost,
+# utility or training authority; the closed policy and raw-build gates still apply.
+_REVIEWED_DISABLED_FOLLOWUP_OBSERVED_PROGRESS_SOURCES = (
+    {"bytes": 402637, "sha256": "4b272ed825d98f51ace408b2798093e88487f6b29f94e38b9d2a753f8fc263d1"},
+    {"bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+)
 _SOURCE_REVIEW_PROFILES = (
     ("legacy_prepared_lineage_4469f9d", _REVIEWED_SOURCES),
     ("legacy_disabled_recheck_9c0de959", _REVIEWED_DISABLED_RECHECK_SOURCES),
@@ -175,6 +186,7 @@ _SOURCE_REVIEW_PROFILES = (
     ("legacy_disabled_followup_controlled_core_752d328a_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_CONTROLLED_CORE_SOURCES),
     ("legacy_disabled_followup_controlled_fallback_4770a553_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_CONTROLLED_FALLBACK_SOURCES),
     ("legacy_disabled_followup_live_binding_004db31f_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_LIVE_BINDING_SOURCES),
+    ("legacy_disabled_followup_observed_progress_4b272ed8_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_OBSERVED_PROGRESS_SOURCES),
 )
 _DISABLED_SEARCH_VERSION = "pals-restricted-refinement/0.1"
 _OPT_IN_LANE_FIELDS = ("pals_search_policy", "refinement_registration", "refinement_registration_sha256", "post_repair_recheck", "post_repair_recheck_policy", "post_repair_recheck_conditions",
