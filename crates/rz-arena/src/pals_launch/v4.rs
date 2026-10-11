@@ -642,8 +642,11 @@ impl PalsArenaLaunchV4 {
     fn require_reap_status_runner(&self) -> Result<(), ArenaError> {
         require(
             self.runner_status_patch()? == PalsRunnerStatusPatchV3::ClockAndReapStatus
-                && self.runner.binary.sha256 == PALS_CLOCK_REAP_RUNNER_SHA256
-                && self.runner.binary.bytes == PALS_CLOCK_REAP_RUNNER_BYTES,
+                && registered_reap_runner(
+                    &self.runner.version,
+                    &self.runner.binary.sha256,
+                    self.runner.binary.bytes,
+                ),
             "new PALS execution/Core requires the registered clock+reap-status patch and actual runner binary; legacy evidence is preserved without promotion",
         )
     }
@@ -3537,6 +3540,38 @@ mod tests {
             cloud_lock.sha256()
         );
         assert_ne!(cloud_lock.sha256(), canonical);
+    }
+    #[test]
+    fn v4_runner_requires_registered_version_hash_and_bytes_together() {
+        let original = fixture();
+        let old_lock = original.lock().unwrap();
+        let mut cloud = colab_fixture();
+        cloud.runner.version = PALS_CLOCK_REAP_COLAB_RUNNER_VERSION.into();
+        cloud.runner.binary.sha256 = PALS_CLOCK_REAP_COLAB_RUNNER_SHA256.into();
+        cloud.runner.binary.bytes = PALS_CLOCK_REAP_COLAB_RUNNER_BYTES;
+        let lock = cloud.lock().unwrap();
+        assert_eq!(
+            LockedPalsArenaLaunchV4::from_json(&lock.to_json().unwrap())
+                .unwrap()
+                .sha256(),
+            lock.sha256()
+        );
+        let mut wrong_version = cloud.clone();
+        wrong_version.runner.version = crate::FASTCHESS_VERSION.into();
+        assert!(wrong_version.lock().is_err());
+        let mut wrong_hash = cloud.clone();
+        wrong_hash.runner.binary.sha256 = PALS_CLOCK_REAP_RUNNER_SHA256.into();
+        assert!(wrong_hash.lock().is_err());
+        let mut wrong_bytes = cloud.clone();
+        wrong_bytes.runner.binary.bytes = PALS_CLOCK_REAP_RUNNER_BYTES;
+        assert!(wrong_bytes.lock().is_err());
+        let mut wrong_patch = cloud;
+        wrong_patch.runner.dirty_patch.as_mut().unwrap().bytes -= 1;
+        assert!(wrong_patch.lock().is_err());
+        assert_eq!(
+            original.lock().unwrap().to_json().unwrap(),
+            old_lock.to_json().unwrap()
+        );
     }
     #[test]
     fn cloud_lane_does_not_expand_external_or_inconsistent_resource_admission() {

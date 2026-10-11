@@ -45,6 +45,27 @@ pub const PALS_CLOCK_REAP_PATCH_BYTES: u64 = 9907;
 pub const PALS_CLOCK_REAP_RUNNER_SHA256: &str =
     "29e89312bc4ec16a32ec185d8b53c60b0cdbad17eaac294f987491e36b8d29ff";
 pub const PALS_CLOCK_REAP_RUNNER_BYTES: u64 = 2466608;
+/// Separately registered baseline-ISA release build of the same source and patch.
+/// Release mode reports the short version; its exact binary pin retains provenance.
+pub const PALS_CLOCK_REAP_COLAB_RUNNER_VERSION: &str = "fastchess alpha 1.8.2";
+pub const PALS_CLOCK_REAP_COLAB_RUNNER_SHA256: &str =
+    "9e70bcf2c619836e2c438e31a30f56aacfac8199aebc24007191b106605b3f7e";
+pub const PALS_CLOCK_REAP_COLAB_RUNNER_BYTES: u64 = 2438832;
+
+pub(crate) fn registered_reap_runner(version: &str, sha256: &str, bytes: u64) -> bool {
+    matches!(
+        (version, sha256, bytes),
+        (
+            crate::FASTCHESS_VERSION,
+            PALS_CLOCK_REAP_RUNNER_SHA256,
+            PALS_CLOCK_REAP_RUNNER_BYTES
+        ) | (
+            PALS_CLOCK_REAP_COLAB_RUNNER_VERSION,
+            PALS_CLOCK_REAP_COLAB_RUNNER_SHA256,
+            PALS_CLOCK_REAP_COLAB_RUNNER_BYTES
+        )
+    )
+}
 const MAX_JSON_BYTES: usize = 256 * 1024;
 const MAX_CONTROL_INVENTORY_BYTES: u64 = 1024 * 1024;
 const MAX_STARTUP_PROBE_TIMEOUT_MS: u64 = 180_000;
@@ -1142,7 +1163,12 @@ impl PalsArenaLaunchV3 {
         require(
             self.runner.source_url == crate::FASTCHESS_SOURCE_URL
                 && self.runner.source_commit == crate::FASTCHESS_SOURCE_COMMIT
-                && self.runner.version == crate::FASTCHESS_VERSION
+                && (self.runner.version == crate::FASTCHESS_VERSION
+                    || registered_reap_runner(
+                        &self.runner.version,
+                        &self.runner.binary.sha256,
+                        self.runner.binary.bytes,
+                    ))
                 && self.runner.dirty
                 && self.runner_status_patch().is_ok(),
             "clock-audited pinned Fastchess and an exact registered patch are required",
@@ -1298,8 +1324,11 @@ impl PalsArenaLaunchV3 {
     fn require_reap_status_runner(&self) -> Result<(), ArenaError> {
         require(
             self.runner_status_patch()? == PalsRunnerStatusPatchV3::ClockAndReapStatus
-                && self.runner.binary.sha256 == PALS_CLOCK_REAP_RUNNER_SHA256
-                && self.runner.binary.bytes == PALS_CLOCK_REAP_RUNNER_BYTES,
+                && registered_reap_runner(
+                    &self.runner.version,
+                    &self.runner.binary.sha256,
+                    self.runner.binary.bytes,
+                ),
             "new PALS execution/Core requires the registered clock+reap-status patch and actual runner binary; legacy evidence is preserved without promotion",
         )
     }
@@ -8009,6 +8038,55 @@ mod tests {
         unregistered_binary.runner.binary.sha256 = "f".repeat(64);
         assert!(unregistered_binary.lock().is_ok()); // metadata-only declaration remains explicit.
         assert!(unregistered_binary.require_reap_status_runner().is_err());
+    }
+    #[test]
+    fn pals_runner_colab_release_version_and_binary_are_one_registration() {
+        let legacy = fixture();
+        let historical = legacy.lock().unwrap().to_json().unwrap();
+        let mut current = legacy.clone();
+        let patch = current.runner.dirty_patch.as_mut().unwrap();
+        patch.sha256 = PALS_CLOCK_REAP_PATCH_SHA256.into();
+        patch.bytes = PALS_CLOCK_REAP_PATCH_BYTES;
+        let registrations = [
+            (
+                crate::FASTCHESS_VERSION,
+                PALS_CLOCK_REAP_RUNNER_SHA256,
+                PALS_CLOCK_REAP_RUNNER_BYTES,
+            ),
+            (
+                PALS_CLOCK_REAP_COLAB_RUNNER_VERSION,
+                PALS_CLOCK_REAP_COLAB_RUNNER_SHA256,
+                PALS_CLOCK_REAP_COLAB_RUNNER_BYTES,
+            ),
+        ];
+        for (v, version) in registrations.iter().enumerate() {
+            for (h, hash) in registrations.iter().enumerate() {
+                for (b, bytes) in registrations.iter().enumerate() {
+                    current.runner.version = version.0.into();
+                    current.runner.binary.sha256 = hash.1.into();
+                    current.runner.binary.bytes = bytes.2;
+                    let accepted = v == h && h == b;
+                    assert_eq!(current.require_reap_status_runner().is_ok(), accepted);
+                    if accepted {
+                        let lock = current.lock().unwrap();
+                        assert_eq!(
+                            LockedPalsArenaLaunchV3::from_json(&lock.to_json().unwrap())
+                                .unwrap()
+                                .sha256(),
+                            lock.sha256()
+                        );
+                    } else if v == 1 {
+                        assert!(current.lock().is_err());
+                    }
+                }
+            }
+        }
+        current.runner.version = PALS_CLOCK_REAP_COLAB_RUNNER_VERSION.into();
+        current.runner.binary.sha256 = PALS_CLOCK_REAP_COLAB_RUNNER_SHA256.into();
+        current.runner.binary.bytes = PALS_CLOCK_REAP_COLAB_RUNNER_BYTES + 1;
+        assert!(current.require_reap_status_runner().is_err());
+        assert!(current.lock().is_err());
+        assert_eq!(legacy.lock().unwrap().to_json().unwrap(), historical);
     }
     #[test]
     fn pals_native_recipe_assets_and_dynamic_arguments_do_not_leak_lc0_flags() {

@@ -1402,6 +1402,40 @@ pub(crate) mod linux {
         });
         Ok(tokens)
     }
+    fn validate_native_runner(
+        runner: &rz_experiments::ToolIdentity,
+        clock: rz_experiments::NativePairClock,
+    ) -> Result<(), ArenaError> {
+        let reap_patch = runner.dirty_patch.as_ref().is_some_and(|patch| {
+            patch.sha256 == crate::pals_launch::PALS_CLOCK_REAP_PATCH_SHA256
+                && patch.bytes == crate::pals_launch::PALS_CLOCK_REAP_PATCH_BYTES
+        });
+        // The audited clock+reap release uses a separately pinned short version.
+        // Keep historical clean movetime and clock-only declarations unchanged;
+        // both registered reap builds must match their version/hash/bytes together.
+        let supported_version = if reap_patch {
+            runner.dirty
+                && matches!(clock, rz_experiments::NativePairClock::Game(_))
+                && crate::pals_launch::registered_reap_runner(
+                    &runner.version,
+                    &runner.binary.sha256,
+                    runner.binary.bytes,
+                )
+        } else {
+            runner.version == crate::FASTCHESS_VERSION
+        };
+        if runner.source_url != crate::FASTCHESS_SOURCE_URL
+            || runner.source_commit != crate::FASTCHESS_SOURCE_COMMIT
+            || !supported_version
+            || (matches!(clock, rz_experiments::NativePairClock::Movetime(_))
+                && (runner.dirty || runner.dirty_patch.is_some()))
+        {
+            return Err(ArenaError::Invalid(
+                "unsupported or dirty native integration Fastchess".into(),
+            ));
+        }
+        Ok(())
+    }
     pub(crate) fn build_invocation<S: NativeLaunchDeclaration>(
         spec: &S,
         pins: &[InputPin],
@@ -1409,16 +1443,7 @@ pub(crate) mod linux {
         roots: &[PathBuf; 2],
     ) -> Result<FastchessInvocation, ArenaError> {
         let input = spec.view();
-        if input.runner.source_url != crate::FASTCHESS_SOURCE_URL
-            || input.runner.source_commit != crate::FASTCHESS_SOURCE_COMMIT
-            || input.runner.version != crate::FASTCHESS_VERSION
-            || (matches!(input.clock, rz_experiments::NativePairClock::Movetime(_))
-                && (input.runner.dirty || input.runner.dirty_patch.is_some()))
-        {
-            return Err(ArenaError::Invalid(
-                "unsupported or dirty native integration Fastchess".into(),
-            ));
-        }
+        validate_native_runner(input.runner, input.clock)?;
         let prefix = u32::try_from(input.opening.moves.len())
             .map_err(|_| ArenaError::Budget("native opening ply overflow".into()))?;
         let remaining = input
@@ -1669,6 +1694,91 @@ pub(crate) mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn native_runner_registration_preserves_clean_movetime_and_pairs_reap_pins() {
+            use crate::pals_launch::{
+                PALS_CLOCK_REAP_COLAB_RUNNER_BYTES, PALS_CLOCK_REAP_COLAB_RUNNER_SHA256,
+                PALS_CLOCK_REAP_COLAB_RUNNER_VERSION, PALS_CLOCK_REAP_PATCH_BYTES,
+                PALS_CLOCK_REAP_PATCH_SHA256, PALS_CLOCK_REAP_RUNNER_BYTES,
+                PALS_CLOCK_REAP_RUNNER_SHA256,
+            };
+            let artifact = |path: &str, sha: &str, bytes| ArtifactRef {
+                path: path.into(),
+                sha256: sha.into(),
+                bytes,
+                source: crate::FASTCHESS_SOURCE_URL.into(),
+                license: "GPL-3.0".into(),
+            };
+            let mut runner = rz_experiments::ToolIdentity {
+                version: crate::FASTCHESS_VERSION.into(),
+                source_url: crate::FASTCHESS_SOURCE_URL.into(),
+                source_commit: crate::FASTCHESS_SOURCE_COMMIT.into(),
+                binary: artifact("runner/fastchess", &"a".repeat(64), 32),
+                dirty: false,
+                dirty_patch: None,
+                build_mode: "release".into(),
+                compiler: "synthetic-metadata-only".into(),
+                target: "x86_64-unknown-linux-gnu".into(),
+                isa: "x86-64".into(),
+            };
+            let movetime = rz_experiments::NativePairClock::Movetime(
+                rz_experiments::NativeMovetimeV1 { movetime_ms: 10 },
+            );
+            let game = rz_experiments::NativePairClock::Game(
+                rz_experiments::NativeGameClockV3 {
+                    base_ms: 120_000,
+                    increment_ms: 1_000,
+                },
+            );
+            assert!(validate_native_runner(&runner, movetime).is_ok());
+            runner.dirty = true;
+            assert!(validate_native_runner(&runner, movetime).is_err());
+            runner.dirty_patch = Some(artifact(
+                "runner/clock.patch",
+                rz_experiments::FASTCHESS_CLOCK_PATCH_SHA256,
+                rz_experiments::FASTCHESS_CLOCK_PATCH_BYTES,
+            ));
+            assert!(validate_native_runner(&runner, game).is_ok());
+            runner.dirty_patch = Some(artifact(
+                "runner/clock-reap.patch",
+                PALS_CLOCK_REAP_PATCH_SHA256,
+                PALS_CLOCK_REAP_PATCH_BYTES,
+            ));
+            let versions = [crate::FASTCHESS_VERSION, PALS_CLOCK_REAP_COLAB_RUNNER_VERSION];
+            let hashes = [
+                PALS_CLOCK_REAP_RUNNER_SHA256,
+                PALS_CLOCK_REAP_COLAB_RUNNER_SHA256,
+            ];
+            let sizes = [PALS_CLOCK_REAP_RUNNER_BYTES, PALS_CLOCK_REAP_COLAB_RUNNER_BYTES];
+            for (v, version) in versions.iter().enumerate() {
+                for (h, hash) in hashes.iter().enumerate() {
+                    for (b, bytes) in sizes.iter().enumerate() {
+                        runner.version = (*version).into();
+                        runner.binary.sha256 = (*hash).into();
+                        runner.binary.bytes = *bytes;
+                        assert_eq!(
+                            validate_native_runner(&runner, game).is_ok(),
+                            v == h && h == b
+                        );
+                        assert!(validate_native_runner(&runner, movetime).is_err());
+                    }
+                }
+            }
+            assert!(validate_native_runner(&runner, game).is_ok());
+            for field in ["source", "commit", "patch", "dirty", "version"] {
+                let mut invalid = runner.clone();
+                match field {
+                    "source" => invalid.source_url.push_str("/unsupported"),
+                    "commit" => invalid.source_commit = "0".repeat(40),
+                    "patch" => invalid.dirty_patch.as_mut().unwrap().bytes -= 1,
+                    "dirty" => invalid.dirty = false,
+                    "version" => invalid.version.push_str(" unsupported"),
+                    _ => unreachable!(),
+                }
+                assert!(validate_native_runner(&invalid, game).is_err(), "{field}");
+            }
+        }
 
         #[test]
         fn v4_argument_ceiling_is_explicit_and_preserves_legacy_32() {
