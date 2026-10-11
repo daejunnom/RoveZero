@@ -62,6 +62,8 @@ static NEXT_COPY: AtomicU64 = AtomicU64::new(0);
 
 mod cache;
 pub use cache::RuntimeCache;
+mod aliases;
+pub use aliases::RuntimeBundleAlias;
 
 /// Storage provenance is distinct from model-evaluation cache provenance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -122,6 +124,10 @@ impl std::fmt::Debug for RuntimeBundleFile {
 pub struct CudaRuntimeBundleSpec {
     pub schema_version: u32,
     pub files: Vec<RuntimeBundleFile>,
+    /// V2 only: a closed, explicit set of relative cuDNN loader basenames.
+    /// Omitted in V1; it never changes that format's canonical digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loader_aliases: Option<Vec<RuntimeBundleAlias>>,
 }
 
 impl std::fmt::Debug for CudaRuntimeBundleSpec {
@@ -129,6 +135,7 @@ impl std::fmt::Debug for CudaRuntimeBundleSpec {
         f.debug_struct("CudaRuntimeBundleSpec")
             .field("schema_version", &self.schema_version)
             .field("files", &self.files)
+            .field("loader_aliases", &self.loader_aliases)
             .finish()
     }
 }
@@ -149,7 +156,7 @@ impl CudaRuntimeBundleSpec {
     }
 
     pub fn validate(&self) -> Result<(), BackendError> {
-        if self.schema_version != 1 {
+        if !matches!(self.schema_version, 1 | 2) {
             return Err(bundle_error("CUDA bundle schema version is unsupported"));
         }
         if self.files.len() > MAX_BUNDLE_FILES {
@@ -201,6 +208,7 @@ impl CudaRuntimeBundleSpec {
                 "CUDA bundle lacks first-profile NVIDIA dependencies",
             ));
         }
+        aliases::validate(self)?;
         Ok(())
     }
 
@@ -212,7 +220,11 @@ impl CudaRuntimeBundleSpec {
         let mut files: Vec<_> = self.files.iter().collect();
         files.sort_unstable_by(|left, right| left.filename.cmp(&right.filename));
         let mut digest = Sha256::new();
-        digest.update(b"RoveZero/native-cuda-bundle\0binary-codec-v1\0");
+        digest.update(match self.schema_version {
+            1 => b"RoveZero/native-cuda-bundle\0binary-codec-v1\0".as_slice(),
+            2 => b"RoveZero/native-cuda-bundle\0binary-codec-v2-aliases\0".as_slice(),
+            _ => unreachable!("validated schema"),
+        });
         digest.update(self.schema_version.to_be_bytes());
         digest.update((files.len() as u32).to_be_bytes());
         for file in files {
@@ -226,6 +238,17 @@ impl CudaRuntimeBundleSpec {
             }]);
             digest.update(file.bytes.to_be_bytes());
             digest.update(bundle_file_digest(file)?);
+        }
+        if let Some(aliases) = &self.loader_aliases {
+            let mut aliases: Vec<_> = aliases.iter().collect();
+            aliases.sort_unstable_by(|left, right| left.filename.cmp(&right.filename));
+            digest.update((aliases.len() as u32).to_be_bytes());
+            for alias in aliases {
+                for basename in [&alias.filename, &alias.target] {
+                    digest.update((basename.len() as u32).to_be_bytes());
+                    digest.update(basename.as_bytes());
+                }
+            }
         }
         Ok(digest.finalize().into())
     }
@@ -262,7 +285,9 @@ fn bundle_limit_error(detail: &'static str) -> BackendError {
 
 struct OwnedCudaBundle {
     digest: [u8; 32],
+    schema_version: u32,
     files: Vec<RuntimeBundleFile>,
+    loader_aliases: Option<Vec<RuntimeBundleAlias>>,
     // The core handle is OwnedCopy::_pin; every other bundle file is held here.
     _pins: Vec<File>,
 }
@@ -457,6 +482,16 @@ impl RuntimeLibraryPin {
         self.0.bundle.as_ref().map(|bundle| bundle.files.as_slice())
     }
 
+    /// Exact registered manifest semantics, including V2 loader aliases.
+    /// Consumers must not reconstruct a V1 manifest from `bundle_files` alone.
+    pub fn bundle_spec(&self) -> Option<CudaRuntimeBundleSpec> {
+        self.0.bundle.as_ref().map(|bundle| CudaRuntimeBundleSpec {
+            schema_version: bundle.schema_version,
+            files: bundle.files.clone(),
+            loader_aliases: bundle.loader_aliases.clone(),
+        })
+    }
+
     #[cfg_attr(not(all(feature = "onnx", target_os = "linux")), allow(dead_code))]
     pub(crate) fn try_clone_nvidia_pins(&self) -> Result<Vec<PinnedBundleLibrary>, BackendError> {
         self.try_clone_bundle_pins(false)
@@ -487,6 +522,11 @@ impl RuntimeLibraryPin {
             if bundle._pins.len() + 1 != bundle.files.len() {
                 return Err(bundle_error("CUDA bundle handle count differs"));
             }
+            aliases::verify(
+                directory,
+                bundle.loader_aliases.as_deref().unwrap_or(&[]),
+                &bundle.files,
+            )?;
             let mut result = Vec::with_capacity(if ort { 3 } else { NVIDIA_FILENAMES.len() });
             let mut other_pins = bundle._pins.iter();
             for entry in &bundle.files {
@@ -514,6 +554,8 @@ impl RuntimeLibraryPin {
                     || retained.ino() != named.ino()
                     || retained.len() != entry.bytes
                     || named.len() != entry.bytes
+                    || retained.nlink() != 1
+                    || named.nlink() != 1
                     || retained.permissions().mode() & 0o777 != 0o400
                     || named.permissions().mode() & 0o777 != 0o400
                 {
@@ -575,7 +617,7 @@ impl RuntimeLibraryPin {
         output_root: &Path,
         spec: &CudaRuntimeBundleSpec,
     ) -> Result<Self, BackendError> {
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
         let source_root = real_bundle_root(source_root)?;
         let output_root = real_bundle_root(output_root)?;
         let bundle_digest = spec.digest()?;
@@ -590,7 +632,8 @@ impl RuntimeLibraryPin {
             .map_err(|error| {
                 bundle_io_error("cannot create exclusive CUDA bundle directory", &error)
             })?;
-        let mut created_files = Vec::with_capacity(spec.files.len());
+        let mut created_files =
+            Vec::with_capacity(spec.files.len() + spec.loader_aliases.as_ref().map_or(0, Vec::len));
         let result = (|| {
             let mut files = spec.files.clone();
             files.sort_unstable_by(|left, right| left.filename.cmp(&right.filename));
@@ -601,9 +644,10 @@ impl RuntimeLibraryPin {
                 let metadata = fs::symlink_metadata(&source).map_err(|error| {
                     bundle_io_error("CUDA bundle source metadata failed", &error)
                 })?;
-                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.nlink() != 1
+                {
                     return Err(bundle_error(
-                        "CUDA bundle source must be a regular nonsymlink file",
+                        "CUDA bundle source must be a single-link regular nonsymlink file",
                     ));
                 }
                 // Linux O_NOFOLLOW closes the symlink swap window; O_NONBLOCK
@@ -614,6 +658,18 @@ impl RuntimeLibraryPin {
                     .open(&source)
                     .map_err(|error| bundle_io_error("cannot open CUDA bundle source", &error))?;
                 verify_bundle_file_length(&reader, file.bytes)?;
+                if reader
+                    .metadata()
+                    .map_err(|error| {
+                        bundle_io_error("CUDA bundle source pin metadata failed", &error)
+                    })?
+                    .nlink()
+                    != 1
+                {
+                    return Err(bundle_identity_error(
+                        "CUDA bundle source pin is hard-linked",
+                    ));
+                }
                 let path = directory.join(&file.filename);
                 let mut writer = OpenOptions::new()
                     .write(true)
@@ -652,6 +708,18 @@ impl RuntimeLibraryPin {
                     pins.push(pin);
                 }
             }
+            for alias in spec.loader_aliases.as_deref().unwrap_or(&[]) {
+                let path = directory.join(&alias.filename);
+                std::os::unix::fs::symlink(&alias.target, &path).map_err(|error| {
+                    bundle_io_error("cannot create declared CUDA loader alias", &error)
+                })?;
+                created_files.push(path);
+            }
+            aliases::verify(
+                &directory,
+                spec.loader_aliases.as_deref().unwrap_or(&[]),
+                &files,
+            )?;
             let (path, digest, pin) =
                 core.ok_or_else(|| bundle_error("CUDA bundle core pin is missing"))?;
             fs::set_permissions(&directory, fs::Permissions::from_mode(0o500))
@@ -662,7 +730,9 @@ impl RuntimeLibraryPin {
                 _pin: pin,
                 bundle: Some(OwnedCudaBundle {
                     digest: bundle_digest,
+                    schema_version: spec.schema_version,
                     files,
+                    loader_aliases: spec.loader_aliases.clone(),
                     _pins: pins,
                 }),
                 storage: RuntimeStorage {

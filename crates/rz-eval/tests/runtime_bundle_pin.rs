@@ -1,7 +1,8 @@
 //! Authored, tiny fake-library fixtures. No test executes ORT, CUDA or native code.
 
 use rz_eval::runtime_pin::{
-    CudaRuntimeBundleSpec, RuntimeBundleFile, RuntimeBundleFileRole as Role, RuntimeLibraryPin,
+    CudaRuntimeBundleSpec, RuntimeBundleAlias, RuntimeBundleFile, RuntimeBundleFileRole as Role,
+    RuntimeLibraryPin,
 };
 use sha2::{Digest, Sha256};
 
@@ -59,6 +60,7 @@ fn spec() -> CudaRuntimeBundleSpec {
     CudaRuntimeBundleSpec {
         schema_version: 1,
         files,
+        loader_aliases: None,
     }
 }
 
@@ -79,11 +81,119 @@ fn manifest_json(spec: &CudaRuntimeBundleSpec) -> String {
             )
         })
         .collect();
+    let alias_json = match &spec.loader_aliases {
+        Some(aliases) => format!(
+            ",\"loader_aliases\":[{}]",
+            aliases
+                .iter()
+                .map(|alias| format!(
+                    "{{\"filename\":\"{}\",\"target\":\"{}\"}}",
+                    alias.filename, alias.target
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        None => String::new(),
+    };
     format!(
-        "{{\"schema_version\":{},\"files\":[{}]}}",
+        "{{\"schema_version\":{},\"files\":[{}]{}}}",
         spec.schema_version,
-        files.join(",")
+        files.join(","),
+        alias_json,
     )
+}
+
+fn alias_spec() -> CudaRuntimeBundleSpec {
+    let mut spec = spec();
+    spec.schema_version = 2;
+    spec.loader_aliases = Some(
+        NVIDIA
+            .iter()
+            .filter(|filename| filename.starts_with("libcudnn"))
+            .map(|target| RuntimeBundleAlias {
+                filename: format!("{target}.8.0"),
+                target: (*target).into(),
+            })
+            .collect(),
+    );
+    spec
+}
+
+#[test]
+fn alias_manifest_binds_closed_declarations_and_preserves_legacy_digest() {
+    let legacy = spec();
+    let legacy_digest = legacy.digest().unwrap();
+    let legacy_hex: String = legacy_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    // Independent binary-codec-v1 golden from the authored nineteen-file fixture.
+    assert_eq!(
+        legacy_hex,
+        "8637ae81a64922e83091d99fcdf213f6d8712ab49c0111ef7a56c5441b0fc0a7"
+    );
+    let source = manifest_json(&legacy);
+    assert!(!source.contains("loader_aliases"));
+    assert_eq!(CudaRuntimeBundleSpec::from_json(&source).unwrap(), legacy);
+    let aliases = alias_spec();
+    let aliased_digest = aliases.digest().unwrap();
+    assert_ne!(legacy_digest, aliased_digest);
+    assert_eq!(
+        CudaRuntimeBundleSpec::from_json(&manifest_json(&aliases)).unwrap(),
+        aliases
+    );
+    let mut reordered = aliases.clone();
+    reordered.files.reverse();
+    reordered.loader_aliases.as_mut().unwrap().reverse();
+    assert_eq!(aliased_digest, reordered.digest().unwrap());
+    let mut subset = aliases.clone();
+    subset.loader_aliases.as_mut().unwrap().pop();
+    assert_ne!(aliased_digest, subset.digest().unwrap());
+    let mut v1_with_aliases = aliases.clone();
+    v1_with_aliases.schema_version = 1;
+    assert!(v1_with_aliases.validate().is_err());
+    let mut v2_without_aliases = legacy.clone();
+    v2_without_aliases.schema_version = 2;
+    assert!(v2_without_aliases.validate().is_err());
+    let mut empty = aliases.clone();
+    empty.loader_aliases = Some(vec![]);
+    assert!(empty.validate().is_err());
+    let mut duplicate = aliases.clone();
+    let repeated = duplicate.loader_aliases.as_ref().unwrap()[0].clone();
+    duplicate.loader_aliases.as_mut().unwrap()[1] = repeated;
+    assert!(duplicate.validate().is_err());
+    for (filename, target) in [
+        ("../libcudnn_graph.so.9.8.0", "libcudnn_graph.so.9"),
+        ("libcudnn_graph.so.9.8.0", "/lib/libcudnn_graph.so.9"),
+        ("libcudnn_graph.so.9.8.0", "../libcudnn_graph.so.9"),
+        ("libcudnn_graph.so.9.8.0", "./libcudnn_graph.so.9"),
+        ("libcudnn_graph.so.9.8.0", "libcudnn_ops.so.9"),
+        ("libcudnn_graph.so.9.9.0", "libcudnn_graph.so.9"),
+        ("libcustom.so.9.8.0", "libcudnn_graph.so.9"),
+    ] {
+        let mut invalid = aliases.clone();
+        invalid.loader_aliases.as_mut().unwrap()[0] = RuntimeBundleAlias {
+            filename: filename.into(),
+            target: target.into(),
+        };
+        assert!(invalid.validate().is_err());
+        assert!(!format!("{invalid:?}").contains("../"));
+        assert!(!format!("{invalid:?}").contains("/lib/"));
+    }
+    let json = manifest_json(&aliases);
+    assert!(CudaRuntimeBundleSpec::from_json(&json.replacen(
+        "\"target\":",
+        "\"unknown\":0,\"target\":",
+        1
+    ))
+    .is_err());
+    assert!(CudaRuntimeBundleSpec::from_json(&json.replacen(
+        "\"target\":",
+        "\"filename\":\"duplicate\",\"target\":",
+        1
+    ))
+    .is_err());
+    assert_eq!(legacy.digest().unwrap(), legacy_digest);
 }
 
 #[test]
@@ -219,7 +329,7 @@ mod linux {
     use super::*;
     use std::{
         fs,
-        os::unix::fs::{symlink, PermissionsExt},
+        os::unix::fs::{symlink, MetadataExt, PermissionsExt},
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
@@ -308,6 +418,203 @@ mod linux {
             fs::remove_dir(&self.output).unwrap();
             fs::remove_dir(&self.root).unwrap();
         }
+    }
+
+    #[test]
+    fn explicit_aliases_share_original_inodes_reuse_and_preserve_v1_entry() {
+        use rz_eval::runtime_pin::{RuntimeCache, RuntimeStorageOrigin};
+        let mut aliased = alias_spec();
+        let fixture = Fixture::new(&mut aliased);
+        fs::set_permissions(&fixture.output, fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = RuntimeCache::open(&fixture.output).unwrap();
+        let mut legacy = aliased.clone();
+        legacy.schema_version = 1;
+        legacy.loader_aliases = None;
+        let legacy_pin = cache.cuda_bundle(&fixture.source, &legacy).unwrap();
+        let legacy_directory = fixture.bundle_directory();
+        let legacy_core_inode = fs::metadata(legacy_directory.join(CORE)).unwrap().ino();
+        let first = cache.cuda_bundle(&fixture.source, &aliased).unwrap();
+        assert_eq!(first.storage().origin, RuntimeStorageOrigin::CacheCreated);
+        let directory = fs::read_dir(&fixture.output)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("cuda-alias-v2-")
+            })
+            .unwrap();
+        assert_eq!(fs::read_dir(&legacy_directory).unwrap().count(), 19);
+        assert_eq!(
+            fs::metadata(legacy_directory.join(CORE)).unwrap().ino(),
+            legacy_core_inode
+        );
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 27);
+        assert_eq!(first.bundle_files().unwrap().len(), 19);
+        assert_eq!(
+            first.bundle_spec().unwrap().digest().unwrap(),
+            aliased.digest().unwrap()
+        );
+        for alias in aliased.loader_aliases.as_ref().unwrap() {
+            let link = directory.join(&alias.filename);
+            let target = directory.join(&alias.target);
+            assert!(fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(fs::read_link(&link).unwrap(), Path::new(&alias.target));
+            let via_link = fs::File::open(&link).unwrap().metadata().unwrap();
+            let original = fs::File::open(&target).unwrap().metadata().unwrap();
+            assert_eq!(
+                (via_link.dev(), via_link.ino()),
+                (original.dev(), original.ino())
+            );
+            assert_eq!(original.nlink(), 1);
+            assert_eq!(original.permissions().mode() & 0o777, 0o400);
+            assert_eq!(fs::read(link).unwrap(), fs::read(target).unwrap());
+        }
+        for file in &aliased.files {
+            fs::remove_file(fixture.source.join(&file.filename)).unwrap();
+        }
+        let second = cache.cuda_bundle(&fixture.source, &aliased).unwrap();
+        assert_eq!(second.storage().origin, RuntimeStorageOrigin::CacheReused);
+        assert_eq!(second.storage().cache_key, first.storage().cache_key);
+        assert_eq!(
+            second.storage().bytes,
+            aliased.files.iter().map(|file| file.bytes).sum::<u64>()
+        );
+        let cloned = first.clone();
+        drop(first);
+        assert_eq!(cloned.bundle_digest(), second.bundle_digest());
+        // A subsequent entry's quota scan must validate the closed aliases, not
+        // count their target payload twice or accept arbitrary symlink entries.
+        let cpu_source = fixture.source.join("cpu.fixture");
+        fs::write(&cpu_source, FAKE_BYTES).unwrap();
+        drop(cache.library(&cpu_source, &hex(FAKE_BYTES)).unwrap());
+        assert_eq!(fs::read_dir(&fixture.output).unwrap().count(), 3);
+        drop(legacy_pin);
+        drop(cloned);
+        drop(second);
+        fixture.release();
+    }
+
+    #[test]
+    fn alias_cache_rejects_external_chained_regular_and_hardlink_replacements() {
+        use rz_eval::runtime_pin::RuntimeCache;
+        for corruption in [
+            "absolute",
+            "relative-external",
+            "wrong-pair",
+            "chained-target",
+            "regular-alias",
+            "hardlink-alias",
+            "hardlink-target",
+            "missing",
+            "extra",
+        ] {
+            let mut spec = alias_spec();
+            let fixture = Fixture::new(&mut spec);
+            fs::set_permissions(&fixture.output, fs::Permissions::from_mode(0o700)).unwrap();
+            let cache = RuntimeCache::open(&fixture.output).unwrap();
+            drop(cache.cuda_bundle(&fixture.source, &spec).unwrap());
+            let directory = fixture.bundle_directory();
+            let alias = &spec.loader_aliases.as_ref().unwrap()[0];
+            let link = directory.join(&alias.filename);
+            let target = directory.join(&alias.target);
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+            match corruption {
+                "absolute" => {
+                    fs::remove_file(&link).unwrap();
+                    symlink(fixture.source.join(&alias.target), &link).unwrap();
+                }
+                "relative-external" => {
+                    fs::remove_file(&link).unwrap();
+                    symlink(format!("../../source/{}", alias.target), &link).unwrap();
+                }
+                "wrong-pair" => {
+                    fs::remove_file(&link).unwrap();
+                    symlink("libcudnn_cnn.so.9", &link).unwrap();
+                }
+                "chained-target" => {
+                    fs::remove_file(&target).unwrap();
+                    symlink(fixture.source.join(&alias.target), &target).unwrap();
+                }
+                "regular-alias" => {
+                    fs::remove_file(&link).unwrap();
+                    fs::write(&link, fs::read(&target).unwrap()).unwrap();
+                    fs::set_permissions(&link, fs::Permissions::from_mode(0o400)).unwrap();
+                }
+                "hardlink-alias" => {
+                    fs::remove_file(&link).unwrap();
+                    fs::hard_link(&target, &link).unwrap();
+                }
+                "hardlink-target" => {
+                    fs::hard_link(&target, fixture.source.join("outside-hardlink.fixture"))
+                        .unwrap();
+                }
+                "missing" => {
+                    fs::remove_file(&link).unwrap();
+                }
+                "extra" => {
+                    symlink("libcudnn.so.9", directory.join("undeclared-alias.so")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o500)).unwrap();
+            assert!(
+                cache.cuda_bundle(&fixture.source, &spec).is_err(),
+                "{corruption}"
+            );
+            if corruption != "missing" {
+                let core = spec
+                    .files
+                    .iter()
+                    .find(|file| file.filename == CORE)
+                    .unwrap();
+                assert!(
+                    cache
+                        .library(&fixture.source.join(CORE), &hex(&payload(core)))
+                        .is_err(),
+                    "a quota scan must also reject {corruption}"
+                );
+            }
+            // The cache never repairs a published entry after a rejection.
+            assert_eq!(fs::read_dir(&fixture.output).unwrap().count(), 1);
+            fixture.release();
+        }
+    }
+
+    #[test]
+    fn source_hardlinks_are_rejected_and_aliases_are_not_copied_from_source() {
+        let mut spec = alias_spec();
+        let fixture = Fixture::new(&mut spec);
+        let source = fixture.source.join(CUDA);
+        fs::hard_link(&source, fixture.source.join("hardlink.fixture")).unwrap();
+        assert!(
+            RuntimeLibraryPin::copy_cuda_bundle(&fixture.source, &fixture.output, &spec).is_err()
+        );
+        assert_eq!(fs::read_dir(&fixture.output).unwrap().count(), 0);
+        fs::remove_file(fixture.source.join("hardlink.fixture")).unwrap();
+        // An undeclared external alias in the caller's mutable source is never
+        // consulted. The owned alias is generated only from the closed manifest.
+        let alias = &spec.loader_aliases.as_ref().unwrap()[0];
+        symlink(
+            "/unopened-external-target",
+            fixture.source.join(&alias.filename),
+        )
+        .unwrap();
+        let pin =
+            RuntimeLibraryPin::copy_cuda_bundle(&fixture.source, &fixture.output, &spec).unwrap();
+        let directory = fixture.bundle_directory();
+        assert_eq!(
+            fs::read_link(directory.join(&alias.filename)).unwrap(),
+            Path::new(&alias.target)
+        );
+        drop(pin);
+        fixture.release();
     }
 
     #[test]

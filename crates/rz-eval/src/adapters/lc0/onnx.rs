@@ -354,6 +354,11 @@ impl OrtRuntime {
         self.pin.bundle_files()
     }
 
+    /// Registered manifest semantics of the retained pins, including aliases.
+    pub fn bundle_spec(&self) -> Option<crate::runtime_pin::CudaRuntimeBundleSpec> {
+        self.pin.bundle_spec()
+    }
+
     /// Audit the explicitly preloaded NVIDIA dependencies before constructing a
     /// CUDA session. ORT provider images may load lazily during the first CUDA
     /// Run; callers must use the full audit after that Run and its completion
