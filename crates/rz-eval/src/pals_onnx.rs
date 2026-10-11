@@ -874,6 +874,23 @@ pub enum PalsCuDnnConvSearch {
     LegacyImplicitExhaustive,
     /// A separately registered host-public CUDA control diagnostic variable.
     ExperimentalDefault,
+    /// Separate opt-in device-public CUDA Warm diagnostic; never host admission.
+    ExperimentalDefaultDeviceWarm,
+}
+
+/// Loaded execution configuration only. No selected plan or native exit proof.
+#[derive(Clone, Debug, Serialize)]
+pub struct PalsCuDnnExecutionDiagnostic {
+    pub descriptor: serde_json::Value,
+    pub descriptor_sha256: [u8; 32],
+    pub descriptor_encoding: &'static str,
+    pub actual_cudnn_plan: &'static str,
+    pub numerical_note: &'static str,
+    pub tf32_actual: &'static str,
+    pub tf32_retry: &'static str,
+    pub production_default_changed: bool,
+    pub warm_success_claim: bool,
+    pub pilot_success_claim: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -938,6 +955,17 @@ impl PalsOnnxConfig {
                 "experimental cuDNN DEFAULT requires CUDA with host public memory",
             ));
         }
+        if self.cudnn_conv_search == PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm
+            && (!matches!(self.provider, Provider::Cuda { .. })
+                || !self.device_public_memory
+                || !cfg!(feature = "experimental-io-binding"))
+        {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Admission,
+                "DEFAULT device-Warm requires CUDA device public memory and I/O binding",
+            ));
+        }
         Ok(())
     }
     /// Pure preflight for callers before runtime/model I/O. The loader repeats
@@ -948,6 +976,13 @@ impl PalsOnnxConfig {
         explicit_control: bool,
     ) -> Result<(), BackendError> {
         self.validate()?;
+        if self.cudnn_conv_search == PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Admission,
+                "DEFAULT device-Warm requires the separately checked CUDA Warm loader",
+            ));
+        }
         if self.cudnn_conv_search == PalsCuDnnConvSearch::ExperimentalDefault
             && (!matches!(self.provider, Provider::Cuda { .. })
                 || self.device_public_memory
@@ -958,6 +993,33 @@ impl PalsOnnxConfig {
                 K::BackendUnavailable,
                 S::Admission,
                 "experimental cuDNN DEFAULT requires explicit eager CUDA control with host public memory",
+            ));
+        }
+        validate_native_loading_path(native_loading, self, explicit_control)
+    }
+    /// Separate pure selection fence. The Warm loader also checks its actual
+    /// loaded export/capability; this request alone grants no Warm authority.
+    pub fn validate_cuda_warm_execution_selection(
+        self,
+        native_loading: Option<NativeLoadingProfile>,
+        explicit_control: bool,
+    ) -> Result<(), BackendError> {
+        self.validate()?;
+        if self.cudnn_conv_search == PalsCuDnnConvSearch::ExperimentalDefault {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Admission,
+                "host DEFAULT cannot select the CUDA Warm loader",
+            ));
+        }
+        if self.cudnn_conv_search == PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm
+            && (!explicit_control
+                || native_loading != Some(NativeLoadingProfile::EagerCuda12Cudnn9V1))
+        {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Admission,
+                "DEFAULT device-Warm requires explicit eager inventory control",
             ));
         }
         validate_native_loading_path(native_loading, self, explicit_control)
@@ -1833,8 +1895,11 @@ fn load_session(
         } => {
             let cuda = match config.cudnn_conv_search {
                 PalsCuDnnConvSearch::LegacyImplicitExhaustive => CUDAExecutionProvider::default(),
-                PalsCuDnnConvSearch::ExperimentalDefault => CUDAExecutionProvider::default()
-                    .with_conv_algorithm_search(CuDNNConvAlgorithmSearch::Default),
+                PalsCuDnnConvSearch::ExperimentalDefault
+                | PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm => {
+                    CUDAExecutionProvider::default()
+                        .with_conv_algorithm_search(CuDNNConvAlgorithmSearch::Default)
+                }
             };
             if !cuda.is_available().map_err(configure)? {
                 return Err(fail(
@@ -2477,7 +2542,7 @@ impl PalsOnnxBackend {
         policy: PalsCudaControlPolicy,
         profile_root: &Path,
     ) -> Result<Self, BackendError> {
-        if config.cudnn_conv_search == PalsCuDnnConvSearch::ExperimentalDefault {
+        if config.cudnn_conv_search != PalsCuDnnConvSearch::LegacyImplicitExhaustive {
             config.validate_execution_selection(runtime.native_loading_profile(), true)?;
         }
         if !matches!(config.provider, Provider::Cuda { .. }) || config.device_public_memory {
@@ -3037,6 +3102,92 @@ impl PalsOnnxBackend {
     }
     pub fn config(&self) -> PalsOnnxConfig {
         self.config
+    }
+    pub fn cudnn_conv_search_diagnostic(
+        &self,
+    ) -> Result<Option<PalsCuDnnExecutionDiagnostic>, BackendError> {
+        let selection = self.config.cudnn_conv_search;
+        if selection == PalsCuDnnConvSearch::LegacyImplicitExhaustive {
+            return Ok(None);
+        }
+        let control = self.cuda_control_inventory_digest().is_some();
+        let selected_profile = match selection {
+            PalsCuDnnConvSearch::ExperimentalDefault => {
+                self.config
+                    .validate_execution_selection(self.native_loading_profile(), control)?;
+                "default-host-control-v1"
+            }
+            PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm => {
+                self.config.validate_cuda_warm_execution_selection(
+                    self.native_loading_profile(),
+                    control,
+                )?;
+                #[cfg(feature = "experimental-io-binding")]
+                if self.private_cuda_warm_capability().is_none() {
+                    return Err(fail(
+                        K::IdentityMismatch,
+                        S::Admission,
+                        "DEFAULT device-Warm requires an actual loaded Warm export capability",
+                    ));
+                }
+                "default-device-warm-v1"
+            }
+            PalsCuDnnConvSearch::LegacyImplicitExhaustive => unreachable!(),
+        };
+        let Provider::Cuda {
+            device_id,
+            arena_bytes,
+        } = self.config.provider
+        else {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Admission,
+                "DEFAULT diagnostic requires actual CUDA provider",
+            ));
+        };
+        let hex = |bytes: &[u8; 32]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let environment = match std::env::var_os("NVIDIA_TF32_OVERRIDE") {
+            None => "absent",
+            Some(v) if v == "0" => "0",
+            Some(v) if v == "1" => "1",
+            Some(_) => "unrecognized",
+        };
+        let descriptor = serde_json::json!({
+            "schema":"rz-pals-cudnn-default-loaded-execution/1",
+            "scope":"loaded_backend_request_not_selected_plan_or_process_exit",
+            "selected_profile":selected_profile,
+            "manifest_sha256":hex(&self.manifest_digest()),"model_epoch":hex(&self.model_epoch()),
+            "backend_source_sha256":hex(&asset::sha256(include_bytes!("pals_onnx.rs"))),
+            "runtime_sha256":hex(&self.runtime_binary_digest()),
+            "runtime_bundle_sha256":self.runtime_bundle_digest().as_ref().map(hex),
+            "control_inventory_sha256":self.cuda_control_inventory_digest().as_ref().map(hex),
+            "provider":"CUDAExecutionProvider","device_id":device_id,"session_arena_bytes":arena_bytes,
+            "intra_threads":self.config.intra_threads,"inter_threads":1,"parallel_execution":false,
+            "cache_public_memory":self.config.cache_public_memory,
+            "public_memory":if self.config.device_public_memory {"device"} else {"host"},
+            "native_loading_profile":"eager-cuda12-cudnn9-v1","graph_optimization":self.graph_optimization(),
+            "cudnn_conv_algo_search_requested":"DEFAULT","tf32_requested":false,"cuda_graph_requested":false,
+            "nvidia_tf32_override_environment_request":environment
+        });
+        let bytes = serde_json::to_vec(&descriptor).map_err(|_| {
+            fail(
+                K::BackendFailure,
+                S::Backend,
+                "cannot serialize bounded DEFAULT execution descriptor",
+            )
+        })?;
+        Ok(Some(PalsCuDnnExecutionDiagnostic {
+            descriptor,
+            descriptor_sha256: asset::sha256(&bytes),
+            descriptor_encoding: "serde_json_utf8_fixed_descriptor_object",
+            actual_cudnn_plan: "unknown",
+            numerical_note: "unknown",
+            tf32_actual: "unknown",
+            tf32_retry: "unknown",
+            production_default_changed: false,
+            warm_success_claim: false,
+            pilot_success_claim: false,
+        }))
     }
     pub fn graph_optimization(&self) -> PalsGraphOptimization {
         session_optimization(self.config, self.cuda_control_audit.is_some())
@@ -4835,6 +4986,47 @@ mod tests {
         config.device_public_memory = true;
         assert!(config.validate().is_err());
         assert!(config.validate_execution_selection(eager, true).is_err());
+    }
+
+    #[test]
+    fn conv_default_device_warm_is_a_separate_admission() {
+        let eager = Some(NativeLoadingProfile::EagerCuda12Cudnn9V1);
+        let mut config = PalsOnnxConfig::cpu();
+        config.cudnn_conv_search = PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm;
+        assert!(config
+            .validate_cuda_warm_execution_selection(eager, true)
+            .is_err());
+        config.provider = Provider::Cuda {
+            device_id: 0,
+            arena_bytes: 256 * 1024 * 1024,
+        };
+        assert!(config
+            .validate_cuda_warm_execution_selection(eager, true)
+            .is_err());
+        config.device_public_memory = true;
+        assert!(config.validate_execution_selection(eager, true).is_err());
+        assert!(config
+            .validate_cuda_warm_execution_selection(eager, false)
+            .is_err());
+        assert!(config
+            .validate_cuda_warm_execution_selection(
+                Some(NativeLoadingProfile::CuDnnShimLazyV1),
+                true
+            )
+            .is_err());
+        assert!(config
+            .validate_cuda_warm_execution_selection(None, true)
+            .is_err());
+        assert_eq!(
+            config
+                .validate_cuda_warm_execution_selection(eager, true)
+                .is_ok(),
+            cfg!(feature = "experimental-io-binding")
+        );
+        config.cudnn_conv_search = PalsCuDnnConvSearch::ExperimentalDefault;
+        assert!(config
+            .validate_cuda_warm_execution_selection(eager, true)
+            .is_err());
     }
 
     fn shim_observation() -> NativeMappingObservation {

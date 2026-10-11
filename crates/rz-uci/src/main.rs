@@ -329,6 +329,10 @@ fn run_pals(
             if native.startup_probe_timeout_ms.replace(value).is_some() {
                 return Err("duplicate PALS startup probe timeout".into());
             }
+        } else if let Some(value) = argument.strip_prefix("--pals-cudnn-conv-search=") {
+            if native.cudnn_conv_search.replace(value.to_owned()).is_some() {
+                return Err("duplicate PALS cuDNN convolution diagnostic selection".into());
+            }
         } else if let Some(value) = argument.strip_prefix("--pals-cuda-loading-profile=") {
             if native
                 .cuda_loading_profile
@@ -756,6 +760,7 @@ struct PalsNativeOptions {
     cuda_profile_parent: Option<String>,
     cuda_loading_profile: Option<String>,
     cuda_loading_profile_hash: Option<String>,
+    cudnn_conv_search: Option<String>,
     startup_probe_timeout_ms: Option<u64>,
     cuda_record_pages: PalsCudaRecordPagesOptions,
 }
@@ -1622,6 +1627,7 @@ impl PalsNativeOptions {
             || self.cuda_profile_parent.is_some()
             || self.cuda_loading_profile.is_some()
             || self.cuda_loading_profile_hash.is_some()
+            || self.cudnn_conv_search.is_some()
             || self.startup_probe_timeout_ms.is_some()
             || self.cuda_record_pages.any()
     }
@@ -1673,6 +1679,8 @@ fn run_native_pals(
         || explicit_resolver
         || resume_policy == rz_search::cpu::CpuResumePolicy::PausedStack
         || refinement_policy.uses_frozen_model_wdl();
+    // Selection-only validation precedes helper metadata, model and runtime I/O.
+    let cudnn_conv_search = pals_cudnn_conv_selection(&native, expected_profile, v4)?;
     let checker_profile = native.checker.load()?;
     let checker = checker_profile
         .as_ref()
@@ -1820,6 +1828,7 @@ fn run_native_pals(
         None => rz_eval::runtime_pin::RuntimeCache::for_user()?,
     };
     let mut backend_config = rz_eval::pals_onnx::PalsOnnxConfig::cpu();
+    backend_config.cudnn_conv_search = cudnn_conv_search;
     let pin = if provider == "cpu" {
         cache.library(&runtime_path, &runtime_hash)?
     } else {
@@ -2463,6 +2472,57 @@ fn run_native_pals(
 }
 
 #[cfg(feature = "onnx-cpu")]
+fn pals_cudnn_conv_selection(
+    native: &PalsNativeOptions,
+    profile: rz_eval::pals_model::PalsModelProfile,
+    v4: bool,
+) -> Result<rz_eval::pals_onnx::PalsCuDnnConvSearch, &'static str> {
+    use rz_eval::pals_onnx::PalsCuDnnConvSearch as Selection;
+    let Some(selected) = native.cudnn_conv_search.as_deref() else {
+        return Ok(Selection::LegacyImplicitExhaustive);
+    };
+    if !cfg!(all(feature = "onnx-cuda", target_os = "linux"))
+        || native.provider.as_deref() != Some("cuda")
+        || native.cuda_control_mode.as_deref() != Some("inventory-v2")
+        || native.cuda_control_inventory.is_none()
+        || native.cuda_control_inventory_hash.is_none()
+        || (native.cuda_profile_root.is_none() && native.cuda_profile_parent.is_none())
+        || native.cuda_loading_profile.is_some()
+        || native.cuda_loading_profile_hash.is_some()
+        || native.private_warm.unwrap_or(false)
+        || native.host_record_pages.unwrap_or(false)
+        || native.cuda_record_pages.any()
+        || !v4
+        || native.output_root.is_none()
+        || native.launch_hash.is_none()
+        || native.endpoint_id.is_none()
+    {
+        return Err(
+            "PALS DEFAULT diagnostic requires explicit eager CUDA inventory control, V4 receipts and no CPU Warm/pages/packing selection",
+        );
+    }
+    match selected {
+        "default-host-control-v1"
+            if !native.device_public_memory.unwrap_or(false)
+                && !native.cuda_private_warm.unwrap_or(false) =>
+        {
+            Ok(Selection::ExperimentalDefault)
+        }
+        "default-device-warm-v1"
+            if cfg!(feature = "experimental-io-binding")
+                && native.device_public_memory.unwrap_or(false)
+                && native.cuda_private_warm.unwrap_or(false)
+                && profile.uses_full_line() =>
+        {
+            Ok(Selection::ExperimentalDefaultDeviceWarm)
+        }
+        _ => Err(
+            "PALS cuDNN diagnostic must exactly match host control or separately pinned device-Warm selection",
+        ),
+    }
+}
+
+#[cfg(feature = "onnx-cpu")]
 fn open_pals_receipt(
     root: &std::path::Path,
     endpoint: &str,
@@ -2613,6 +2673,50 @@ fn pals_profile_root(
 #[cfg(all(test, feature = "onnx-cpu"))]
 mod pals_profile_tests {
     use super::{finish_pals_owners_within, pals_cuda_loading_profile, pals_profile_root};
+
+    #[test]
+    fn conv_default_profiles_are_explicit_and_closed_before_io() {
+        use super::{PalsNativeOptions, pals_cudnn_conv_selection};
+        use rz_eval::{pals_model::PalsModelProfile, pals_onnx::PalsCuDnnConvSearch as Selection};
+        let profile = PalsModelProfile::FullLineInteractionV2;
+        let mut native = PalsNativeOptions::default();
+        assert_eq!(
+            pals_cudnn_conv_selection(&native, profile, false).unwrap(),
+            Selection::LegacyImplicitExhaustive
+        );
+        native.cudnn_conv_search = Some("default-host-control-v1".into());
+        assert!(pals_cudnn_conv_selection(&native, profile, true).is_err());
+        native.provider = Some("cuda".into());
+        native.cuda_control_mode = Some("inventory-v2".into());
+        native.cuda_control_inventory = Some("not-read".into());
+        native.cuda_control_inventory_hash = Some("not-read".into());
+        native.cuda_profile_root = Some("not-created".into());
+        native.output_root = Some("not-created".into());
+        native.launch_hash = Some("not-read".into());
+        native.endpoint_id = Some("diagnostic".into());
+        assert_eq!(
+            pals_cudnn_conv_selection(&native, profile, true).is_ok(),
+            cfg!(all(feature = "onnx-cuda", target_os = "linux"))
+        );
+        assert!(pals_cudnn_conv_selection(&native, profile, false).is_err());
+        native.cudnn_conv_search = Some("default-device-warm-v1".into());
+        assert!(pals_cudnn_conv_selection(&native, profile, true).is_err());
+        native.device_public_memory = Some(true);
+        native.cuda_private_warm = Some(true);
+        assert_eq!(
+            pals_cudnn_conv_selection(&native, profile, true).is_ok(),
+            cfg!(all(
+                feature = "onnx-cuda",
+                feature = "experimental-io-binding",
+                target_os = "linux"
+            ))
+        );
+        native.cuda_loading_profile = Some("cudnn-shim-lazy-v1".into());
+        assert!(pals_cudnn_conv_selection(&native, profile, true).is_err());
+        native.cuda_loading_profile = None;
+        native.provider = Some("cpu".into());
+        assert!(pals_cudnn_conv_selection(&native, profile, true).is_err());
+    }
 
     #[test]
     fn both_owner_cleanup_attempts_share_one_deadline_even_after_helper_failure() {

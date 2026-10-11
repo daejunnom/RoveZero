@@ -58,8 +58,8 @@ mod check {
     use rz_eval::onnx::{OrtRuntime, Provider};
     use rz_eval::pals_model::{PalsModelConfig, PalsModelInput, PalsModelProfile, PalsRawOutput};
     use rz_eval::pals_onnx::{
-        PRIVATE_CUDA_WARM_MEASUREMENT_CONTRACT, PRIVATE_CUDA_WARM_SCHEMA, PalsCudaControlPolicy,
-        PalsNativeResult, PalsOnnxConfig,
+        PRIVATE_CUDA_WARM_MEASUREMENT_CONTRACT, PRIVATE_CUDA_WARM_SCHEMA, PalsCuDnnConvSearch,
+        PalsCudaControlPolicy, PalsNativeResult, PalsOnnxConfig,
     };
     use rz_eval::pals_private::{PrivateInvocation, PrivateSeedProvenance};
     use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeCache};
@@ -365,6 +365,7 @@ mod check {
                 "--control-inventory",
                 "--control-inventory-sha256",
                 "--profile-root",
+                "--cudnn-conv-search",
             ],
             "verify-reference" => &[
                 "--capture-json",
@@ -417,6 +418,7 @@ mod check {
                 "--control-inventory",
                 "--control-inventory-sha256",
                 "--profile-root",
+                "--cudnn-conv-search",
             ]
             .contains(&flag);
             if !optional {
@@ -425,7 +427,9 @@ mod check {
             if !flag.ends_with("-sha256")
                 && !matches!(
                     flag,
-                    "--pals-cuda-warm-max-leases" | "--pals-cuda-warm-device-bytes-max"
+                    "--pals-cuda-warm-max-leases"
+                        | "--pals-cuda-warm-device-bytes-max"
+                        | "--cudnn-conv-search"
                 )
             {
                 if let Some(value) = args.values.get(flag) {
@@ -449,6 +453,7 @@ mod check {
             "arguments",
             "control_inventory_requires_all_three_fields",
         )?;
+        cuda_conv_selection(&args)?;
         if args.mode == "capture" {
             let limits = args.cuda_warm_limits()?;
             if args.cost_same_seed_context {
@@ -469,6 +474,43 @@ mod check {
         )?;
         *enabled = true;
         Ok(())
+    }
+    fn cuda_conv_selection(args: &Args) -> Result<PalsCuDnnConvSearch, Failure> {
+        match args.values.get("--cudnn-conv-search").map(String::as_str) {
+            None => Ok(PalsCuDnnConvSearch::LegacyImplicitExhaustive),
+            Some("default-device-warm-v1")
+                if args.mode == "capture"
+                    && !args.cost_same_seed_context
+                    && [
+                        "--control-inventory",
+                        "--control-inventory-sha256",
+                        "--profile-root",
+                    ]
+                    .iter()
+                    .all(|key| args.values.contains_key(*key)) =>
+            {
+                let config = PalsOnnxConfig {
+                    provider: Provider::Cuda {
+                        device_id: 0,
+                        arena_bytes: 256 * 1024 * 1024,
+                    },
+                    device_public_memory: true,
+                    cudnn_conv_search: PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm,
+                    ..PalsOnnxConfig::cpu()
+                };
+                config
+                    .validate_cuda_warm_execution_selection(
+                        Some(rz_eval::onnx::NativeLoadingProfile::EagerCuda12Cudnn9V1),
+                        true,
+                    )
+                    .map_err(|_| fail("arguments", "invalid_default_device_warm_admission"))?;
+                Ok(PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm)
+            }
+            _ => Err(fail(
+                "arguments",
+                "default_device_warm_requires_separate_eager_control_capture",
+            )),
+        }
     }
     fn pinned(path: &Path, expected: &str, maximum: usize) -> Result<Vec<u8>, Failure> {
         let bytes =
@@ -2273,6 +2315,7 @@ mod check {
                 intra_threads: 1,
                 cache_public_memory: true,
                 device_public_memory: true,
+                cudnn_conv_search: cuda_conv_selection(args)?,
                 ..PalsOnnxConfig::cpu()
             },
             NativeOwnerOptions {
@@ -2545,6 +2588,7 @@ mod check {
                 intra_threads: 1,
                 cache_public_memory: true,
                 device_public_memory: true,
+                cudnn_conv_search: cuda_conv_selection(args)?,
                 ..PalsOnnxConfig::cpu()
             },
             NativeOwnerOptions {
@@ -3777,6 +3821,47 @@ mod check {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn conv_default_device_warm_selection_requires_capture_control_not_cost() {
+            let mut args = Args {
+                mode: "capture".into(),
+                values: BTreeMap::new(),
+                output: PathBuf::new(),
+                cost_same_seed_context: false,
+            };
+            assert!(matches!(
+                cuda_conv_selection(&args),
+                Ok(PalsCuDnnConvSearch::LegacyImplicitExhaustive)
+            ));
+            args.values.insert(
+                "--cudnn-conv-search".into(),
+                "default-device-warm-v1".into(),
+            );
+            assert!(cuda_conv_selection(&args).is_err());
+            for flag in [
+                "--control-inventory",
+                "--control-inventory-sha256",
+                "--profile-root",
+            ] {
+                args.values.insert(flag.into(), "not-read".into());
+            }
+            assert!(matches!(
+                cuda_conv_selection(&args),
+                Ok(PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm)
+            ));
+            args.cost_same_seed_context = true;
+            assert!(cuda_conv_selection(&args).is_err());
+            args.cost_same_seed_context = false;
+            args.mode = "verify-reference".into();
+            assert!(cuda_conv_selection(&args).is_err());
+            args.mode = "capture".into();
+            args.values.insert(
+                "--cudnn-conv-search".into(),
+                "default-host-control-v1".into(),
+            );
+            assert!(cuda_conv_selection(&args).is_err());
+        }
 
         #[test]
         fn publish_gate_preserves_capture_reference_and_partial_cost_exits() {

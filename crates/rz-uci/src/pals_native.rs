@@ -2102,6 +2102,9 @@ mod native {
         /// recorded here. Missing preserves historic eager/CPU wire formats.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub cuda_loading_profile: Option<NativeCudaLoadingIdentity>,
+        /// Candidate-only actual loaded configuration, not plan or exit proof.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cudnn_conv_search_diagnostic: Option<rz_eval::pals_onnx::PalsCuDnnExecutionDiagnostic>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub startup_probe_timeout_ms: Option<u64>,
         pub transient_request_device_bytes: u64,
@@ -2486,6 +2489,9 @@ mod native {
             runtime_bundle_sha256: backend.runtime_bundle_digest(),
             cuda_control_inventory_sha256: backend.cuda_control_inventory_digest(),
             cuda_loading_profile,
+            cudnn_conv_search_diagnostic: backend
+                .cudnn_conv_search_diagnostic()
+                .map_err(model_error)?,
             startup_probe_timeout_ms: None,
             transient_request_device_bytes: request,
             transient_execution_device_bytes: physical,
@@ -7141,6 +7147,7 @@ mod native {
                 runtime_bundle_sha256: Some([2; 32]),
                 cuda_control_inventory_sha256: Some([12; 32]),
                 cuda_loading_profile: None,
+                cudnn_conv_search_diagnostic: None,
                 startup_probe_timeout_ms: None,
                 transient_request_device_bytes: 11,
                 transient_execution_device_bytes: 22,
@@ -7156,6 +7163,59 @@ mod native {
         // Pure clock/admission checks and controlled SingleWorker owner checks.
         // These fixtures do not load ORT/model files or prove provider, binary,
         // source-registration, native inference or whole-cost execution.
+        #[test]
+        fn conv_default_optional_wire_preserves_legacy_and_metadata_clones() {
+            // Serialization-only fixture; no loaded backend or GPU claim.
+            let mut execution = NativeExecutionReceipt {
+                provider: "cpu",
+                device_id: None,
+                session_arena_bytes: None,
+                runtime_sha256: [1; 32],
+                runtime_bundle_sha256: None,
+                cuda_control_inventory_sha256: None,
+                cuda_loading_profile: None,
+                cudnn_conv_search_diagnostic: None,
+                startup_probe_timeout_ms: None,
+                transient_request_device_bytes: 0,
+                transient_execution_device_bytes: 0,
+                pinned_request_bytes: 0,
+                device_public_memory: false,
+                host_record_pages: None,
+                private_warm: None,
+                cuda_record_pages: None,
+            };
+            let baseline = serde_json::to_value(&execution).unwrap();
+            assert!(baseline.get("cudnn_conv_search_diagnostic").is_none());
+            assert!(baseline.get("cuda_loading_profile").is_none());
+            let descriptor = serde_json::json!({"scope":"synthetic_configuration_not_loaded_proof","selected_profile":"default-device-warm-v1"});
+            let raw = serde_json::to_vec(&descriptor).unwrap();
+            execution.cudnn_conv_search_diagnostic =
+                Some(rz_eval::pals_onnx::PalsCuDnnExecutionDiagnostic {
+                    descriptor,
+                    descriptor_sha256: rz_eval::asset::sha256(&raw),
+                    descriptor_encoding: "serde_json_utf8_fixed_descriptor_object",
+                    actual_cudnn_plan: "unknown",
+                    numerical_note: "unknown",
+                    tf32_actual: "unknown",
+                    tf32_retry: "unknown",
+                    production_default_changed: false,
+                    warm_success_claim: false,
+                    pilot_success_claim: false,
+                });
+            let first = serde_json::to_value(execution.clone()).unwrap();
+            let second = serde_json::to_value(execution.clone()).unwrap();
+            assert_eq!(first, second);
+            let observed = &first["cudnn_conv_search_diagnostic"];
+            assert_eq!(observed["actual_cudnn_plan"], "unknown");
+            assert_eq!(observed["tf32_actual"], "unknown");
+            assert_eq!(observed["tf32_retry"], "unknown");
+            assert_eq!(observed["warm_success_claim"], false);
+            assert_eq!(
+                observed["descriptor_sha256"],
+                serde_json::to_value(rz_eval::asset::sha256(&raw)).unwrap()
+            );
+            assert_eq!(baseline["provider"], first["provider"]);
+        }
         #[test]
         fn invocation_budget_preserves_original_absolute_clock_and_is_copy() {
             fn requires_copy<T: Copy>() {}
@@ -7816,6 +7876,7 @@ mod native {
                 runtime_bundle_sha256: Some([2; 32]),
                 cuda_control_inventory_sha256: Some([3; 32]),
                 cuda_loading_profile: None,
+                cudnn_conv_search_diagnostic: None,
                 startup_probe_timeout_ms: None,
                 transient_request_device_bytes: 0,
                 transient_execution_device_bytes: 0,
@@ -8251,6 +8312,7 @@ mod native {
                     runtime_bundle_sha256: None,
                     cuda_control_inventory_sha256: None,
                     cuda_loading_profile: None,
+                    cudnn_conv_search_diagnostic: None,
                     startup_probe_timeout_ms: None,
                     transient_request_device_bytes: 0,
                     transient_execution_device_bytes: 0,
@@ -9047,6 +9109,7 @@ mod native {
                 runtime_sha256: [1; 32],
                 runtime_bundle_sha256: Some([2; 32]),
                 cuda_control_inventory_sha256: Some([3; 32]),
+                cudnn_conv_search_diagnostic: None,
                 cuda_loading_profile: Some(NativeCudaLoadingIdentity {
                     profile: profile.identifier(),
                     canonical_sha256: digest,

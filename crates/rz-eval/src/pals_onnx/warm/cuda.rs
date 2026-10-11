@@ -537,6 +537,7 @@ impl PalsOnnxBackend {
         policy: PalsCudaControlPolicy,
         profile_root: &Path,
     ) -> Result<Self, BackendError> {
+        config.validate_cuda_warm_execution_selection(runtime.native_loading_profile(), true)?;
         let root = cuda_control::owned_profile_root(profile_root)?;
         Self::load_cuda_warm_inner(
             path,
@@ -554,7 +555,10 @@ impl PalsOnnxBackend {
         audit: Option<(PalsCudaControlPolicy, std::path::PathBuf)>,
     ) -> Result<Self, BackendError> {
         let (device_id, runtime_bundle) = validate_cuda_domain(config, runtime.bundle_digest())?;
-        validate_native_loading_path(runtime.native_loading_profile(), config, audit.is_some())?;
+        config.validate_cuda_warm_execution_selection(
+            runtime.native_loading_profile(),
+            audit.is_some(),
+        )?;
         if !path.is_absolute() {
             return Err(fail(
                 K::InvalidInput,
@@ -669,6 +673,7 @@ impl PalsOnnxBackend {
         if let Some((policy, _)) = &audit {
             hash.update(policy.inventory);
         }
+        seal_cuda_warm_conv_execution_domain(&mut hash, config.cudnn_conv_search)?;
         let identity = PrivateModelIdentity {
             model: manifest_digest,
             encoding: hash.finalize().into(),
@@ -1057,6 +1062,26 @@ impl PalsOnnxBackend {
     }
 }
 
+fn seal_cuda_warm_conv_execution_domain(
+    hash: &mut Sha256,
+    selection: PalsCuDnnConvSearch,
+) -> Result<(), BackendError> {
+    match selection {
+        // No tag or extra zero byte: retain the exact legacy hashing sequence.
+        PalsCuDnnConvSearch::LegacyImplicitExhaustive => Ok(()),
+        PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm => {
+            hash.update(
+                b"rz-pals-cuda-warm-conv-execution-domain/1;default-device-warm-v1;DEFAULT",
+            );
+            Ok(())
+        }
+        PalsCuDnnConvSearch::ExperimentalDefault => Err(fail(
+            K::BackendUnavailable,
+            S::Admission,
+            "host DEFAULT cannot seal a device-Warm execution domain",
+        )),
+    }
+}
 fn validate_cuda_domain(
     config: PalsOnnxConfig,
     bundle: Option<[u8; 32]>,
@@ -1402,6 +1427,35 @@ fn validate_cuda_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn conv_default_execution_domain_keeps_legacy_bytes_and_isolates_warm() {
+        let prefix = b"independently fixed preexisting model/native options";
+        let expected: [u8; 32] = Sha256::digest(prefix).into();
+        let mut legacy = Sha256::new();
+        legacy.update(prefix);
+        seal_cuda_warm_conv_execution_domain(
+            &mut legacy,
+            PalsCuDnnConvSearch::LegacyImplicitExhaustive,
+        )
+        .unwrap();
+        assert_eq!(<[u8; 32]>::from(legacy.finalize()), expected);
+        let mut candidate = Sha256::new();
+        candidate.update(prefix);
+        seal_cuda_warm_conv_execution_domain(
+            &mut candidate,
+            PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm,
+        )
+        .unwrap();
+        assert_ne!(<[u8; 32]>::from(candidate.finalize()), expected);
+        let mut foreign = Sha256::new();
+        foreign.update(prefix);
+        assert!(seal_cuda_warm_conv_execution_domain(
+            &mut foreign,
+            PalsCuDnnConvSearch::ExperimentalDefault
+        )
+        .is_err());
+        assert_eq!(<[u8; 32]>::from(foreign.finalize()), expected);
+    }
     use crate::pals_model::{PalsCandidateToken, PalsFullLineInput};
     use crate::pals_private::{
         PhysicalSeedCompletion, PrivateInvocationMode, PrivateRulesContext, PrivateSeedBank,
