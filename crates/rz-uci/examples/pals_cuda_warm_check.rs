@@ -214,7 +214,7 @@ mod check {
             PalsError::Capacity => "Capacity",
             PalsError::RoleCallLimit => "RoleCallLimit",
         };
-        // Only the typed category and compile-time checker detail are exposed.
+        // Only typed categories and compile-time checker detail are exposed.
         // In particular, do not format backend/CPU/Rules error payloads, which
         // can carry private paths or native messages. Keep the typed cause until
         // this projection instead of replacing a search failure with cleanup.
@@ -234,7 +234,12 @@ mod check {
             PalsError::Checker(CheckerError::Owned(_)) => Some(json!({"kind":"Owned"})),
             _ => None,
         };
-        json!({"kind":kind,"checker":checker,
+        let role = match error {
+            PalsError::Role(error) => Some(json!({"kind":role_error_code(error),
+                "raw_error_text_published":false})),
+            _ => None,
+        };
+        json!({"kind":kind,"checker":checker,"role":role,
             "original_cause_retained_until_projection":true,"raw_error_text_published":false})
     }
     fn hex(bytes: &[u8]) -> String {
@@ -1748,34 +1753,77 @@ mod check {
         value_identity: ModelValueIdentity,
         forwards: Arc<ForwardBudget>,
     }
+    #[derive(Clone, Copy)]
+    enum ForwardLane {
+        Search,
+        Followup,
+    }
     struct ForwardBudget {
-        consumed: AtomicU64,
+        // Low/high u32 lanes contain search/followup admission counts. One CAS
+        // charges the selected lane and global sum together, including reentry.
+        // The registered maximum is at most 128, far below either lane width.
+        admitted: AtomicU64,
         maximum: u64,
     }
     impl ForwardBudget {
         fn new(maximum: u64) -> Self {
             Self {
-                consumed: AtomicU64::new(STARTUP_ROLE_FORWARDS),
+                admitted: AtomicU64::new(0),
                 maximum,
             }
         }
+        fn usage(&self, ordering: Ordering) -> (u64, u64, u64) {
+            let lanes = self.admitted.load(ordering);
+            (
+                STARTUP_ROLE_FORWARDS,
+                lanes & u64::from(u32::MAX),
+                lanes >> u32::BITS,
+            )
+        }
         fn load(&self, ordering: Ordering) -> u64 {
-            self.consumed.load(ordering)
+            let (startup, search, followup) = self.usage(ordering);
+            startup + search + followup
+        }
+        fn observation(&self) -> Value {
+            let (startup, search, followup) = self.usage(Ordering::Acquire);
+            json!({"global_limit":self.maximum,
+                "search_limit":self.maximum.checked_sub(STARTUP_ROLE_FORWARDS + FOLLOWUP_ROLE_FORWARDS),
+                "followup_limit":FOLLOWUP_ROLE_FORWARDS, "startup_reserved":startup,
+                "search_admissions":search, "followup_admissions":followup,
+                "global_admissions_including_startup_reservation":startup + search + followup,
+                "scope":"admission_charges;_actual_NN_and_completion_use_separate_native_receipts",
+                "failed_admission_refunds_or_retries":false})
         }
     }
     fn admission(forwards: &ForwardBudget) -> Result<(), RoleError> {
-        forward_admission(forwards, forwards.maximum)
+        forward_admission(forwards, ForwardLane::Followup)
     }
     fn search_admission(forwards: &ForwardBudget) -> Result<(), RoleError> {
-        // Preserve one actual same-question Warm resume and one Fresh Value
-        // forward after search, even in the separate WDL comparison profile.
-        forward_admission(forwards, forwards.maximum - FOLLOWUP_ROLE_FORWARDS)
+        // Search has its own fixed quota. Already charged mid-search Warm and
+        // Fresh Value followups must not reserve their two global slots twice.
+        forward_admission(forwards, ForwardLane::Search)
     }
-    fn forward_admission(forwards: &ForwardBudget, limit: u64) -> Result<(), RoleError> {
+    fn forward_admission(forwards: &ForwardBudget, lane: ForwardLane) -> Result<(), RoleError> {
+        let search_limit = forwards
+            .maximum
+            .checked_sub(STARTUP_ROLE_FORWARDS + FOLLOWUP_ROLE_FORWARDS)
+            .filter(|_| forwards.maximum <= MAX_ROLE_FORWARDS)
+            .ok_or(RoleError::Unavailable)?;
         forwards
-            .consumed
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                (v < limit).then_some(v + 1)
+            .admitted
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |lanes| {
+                let search = lanes & u64::from(u32::MAX);
+                let followup = lanes >> u32::BITS;
+                if STARTUP_ROLE_FORWARDS + search + followup >= forwards.maximum {
+                    return None;
+                }
+                match lane {
+                    ForwardLane::Search if search < search_limit => Some(lanes + 1),
+                    ForwardLane::Followup if followup < FOLLOWUP_ROLE_FORWARDS => {
+                        Some(lanes + (1u64 << u32::BITS))
+                    }
+                    _ => None,
+                }
             })
             .map(|_| ())
             .map_err(|_| RoleError::Unavailable)
@@ -3047,6 +3095,7 @@ mod check {
                 "paused_stack_selected": true, "execution_profile": format!("{:?}", scenario.execution_profile),
                 "value_calls": counters.value_calls, "accepted_value_outputs": counters.accepted_value_outputs,
                 "cpu_work_observation_incomplete": counters.cpu_work_observation_incomplete,
+                "harness_forward_admission_budget": forwards.observation(),
                 "cpu_interleave_policy": format!("{:?}", engine.cpu_interleave_policy()),
                 "cpu_completed_iteration_side_scope": engine.cpu_side_scope_snapshot().map(|side| json!({
                     "attempts": side.attempts, "work": cpu_work(side.work),
@@ -4263,6 +4312,43 @@ mod check {
         }
 
         #[test]
+        fn role_failure_keeps_safe_enum_without_private_error_payload() {
+            for (error, kind) in [
+                (RoleError::Unavailable, "unavailable"),
+                (RoleError::InvalidOutput, "invalid_output"),
+                (RoleError::Canceled, "canceled"),
+                (RoleError::Deadline, "deadline"),
+                (
+                    RoleError::PhysicalCompletionUnknown,
+                    "physical_completion_unknown",
+                ),
+                (
+                    RoleError::Backend("synthetic private path and error text".into()),
+                    "backend_error",
+                ),
+            ] {
+                let failure =
+                    pals_failure("search", "actual_search_failed", PalsError::Role(error));
+                assert!(matches!(
+                    failure.pals_cause.as_deref(),
+                    Some(PalsError::Role(_))
+                ));
+                let wire = failure.wire();
+                assert_eq!(wire["pals_diagnostic"]["kind"], "Role");
+                assert_eq!(wire["pals_diagnostic"]["role"]["kind"], kind);
+                assert_eq!(
+                    wire["pals_diagnostic"]["role"]["raw_error_text_published"],
+                    false
+                );
+                assert!(
+                    !serde_json::to_string(&wire)
+                        .unwrap()
+                        .contains("synthetic private")
+                );
+            }
+        }
+
+        #[test]
         fn observed_cpu_paused_owner_is_visible_at_admission_and_checker_shutdown() {
             use rz_search::cpu_checker::{CheckerReport, CpuChecker};
             let capture = Arc::new(Mutex::new(Capture::new(Instant::now())));
@@ -5086,10 +5172,14 @@ mod check {
         #[test]
         fn forward_budget_has_no_silent_retry_slot() {
             let counts = ForwardBudget::new(MAX_ROLE_FORWARDS);
-            for _ in STARTUP_ROLE_FORWARDS..MAX_ROLE_FORWARDS {
+            for _ in 0..MAX_ROLE_FORWARDS - STARTUP_ROLE_FORWARDS - FOLLOWUP_ROLE_FORWARDS {
+                assert!(search_admission(&counts).is_ok());
+            }
+            for _ in 0..FOLLOWUP_ROLE_FORWARDS {
                 assert!(admission(&counts).is_ok());
             }
             assert!(admission(&counts).is_err());
+            assert!(search_admission(&counts).is_err());
             assert_eq!(counts.load(Ordering::Acquire), MAX_ROLE_FORWARDS);
             assert_ne!(bits_digest(&[0, 1]), bits_digest(&[1, 0]));
         }
@@ -5107,6 +5197,108 @@ mod check {
             assert!(admission(&counts).is_ok());
             assert!(admission(&counts).is_ok());
             assert!(admission(&counts).is_err());
+        }
+
+        #[test]
+        fn mid_search_followups_do_not_reserve_their_global_slots_twice() {
+            let counts = ForwardBudget::new(DEFAULT_ROLE_FORWARDS);
+            for _ in 0..25 {
+                assert!(search_admission(&counts).is_ok());
+            }
+            // Counter-only replay of v19: real Warm request26/Value27 happened
+            // here. This fixture performs no NN and grants no physical fence.
+            assert!(admission(&counts).is_ok());
+            assert!(admission(&counts).is_ok());
+            for _ in 25..58 {
+                assert!(search_admission(&counts).is_ok());
+            }
+            assert_eq!(counts.usage(Ordering::Acquire), (2, 58, 2));
+            assert_eq!(counts.load(Ordering::Acquire), 62);
+            assert!(search_admission(&counts).is_ok());
+            assert!(search_admission(&counts).is_ok());
+            assert_eq!(counts.usage(Ordering::Acquire), (2, 60, 2));
+            assert_eq!(counts.load(Ordering::Acquire), DEFAULT_ROLE_FORWARDS);
+            let full = counts.usage(Ordering::Acquire);
+            assert!(search_admission(&counts).is_err());
+            assert!(admission(&counts).is_err());
+            assert_eq!(counts.usage(Ordering::Acquire), full);
+        }
+
+        #[test]
+        fn unused_or_partially_failed_followups_keep_exact_reserved_quotas() {
+            for charged_followups in 0..=FOLLOWUP_ROLE_FORWARDS {
+                let counts = ForwardBudget::new(DEFAULT_ROLE_FORWARDS);
+                for _ in 0..charged_followups {
+                    // A charge remains spent if subsequent NN work fails; this
+                    // budget has no refund or relabel-to-search operation.
+                    assert!(admission(&counts).is_ok());
+                }
+                for _ in 0..60 {
+                    assert!(search_admission(&counts).is_ok());
+                }
+                let before_failed_admission = counts.usage(Ordering::Acquire);
+                assert!(search_admission(&counts).is_err());
+                assert!(search_admission(&counts).is_err());
+                assert_eq!(counts.usage(Ordering::Acquire), before_failed_admission);
+                assert_eq!(before_failed_admission, (2, 60, charged_followups));
+                for _ in charged_followups..FOLLOWUP_ROLE_FORWARDS {
+                    assert!(admission(&counts).is_ok());
+                }
+                assert_eq!(counts.usage(Ordering::Acquire), (2, 60, 2));
+                assert_eq!(counts.load(Ordering::Acquire), DEFAULT_ROLE_FORWARDS);
+                assert!(admission(&counts).is_err());
+            }
+        }
+
+        #[test]
+        fn followup_reentry_cannot_borrow_unused_search_or_exceed_registered_caps() {
+            // 46 is the existing cost namespace's integration allowance:
+            // 64 total minus its independent 18-forward cost reservation.
+            for maximum in [16, 46, DEFAULT_ROLE_FORWARDS, MAX_ROLE_FORWARDS] {
+                let counts = ForwardBudget::new(maximum);
+                assert!(admission(&counts).is_ok());
+                assert!(admission(&counts).is_ok());
+                let reserved = counts.usage(Ordering::Acquire);
+                assert!(admission(&counts).is_err());
+                assert_eq!(counts.usage(Ordering::Acquire), reserved);
+                for _ in 0..maximum - STARTUP_ROLE_FORWARDS - FOLLOWUP_ROLE_FORWARDS {
+                    assert!(search_admission(&counts).is_ok());
+                }
+                assert_eq!(counts.load(Ordering::Acquire), maximum);
+                let full = counts.usage(Ordering::Acquire);
+                assert!(search_admission(&counts).is_err());
+                assert!(admission(&counts).is_err());
+                assert_eq!(counts.usage(Ordering::Acquire), full);
+            }
+            for maximum in [STARTUP_ROLE_FORWARDS, MAX_ROLE_FORWARDS + 1] {
+                let counts = ForwardBudget::new(maximum);
+                let before = counts.usage(Ordering::Acquire);
+                assert!(search_admission(&counts).is_err());
+                assert!(admission(&counts).is_err());
+                assert_eq!(counts.usage(Ordering::Acquire), before);
+            }
+        }
+
+        #[test]
+        fn independent_forward_lanes_charge_one_atomic_global_budget() {
+            let counts = Arc::new(ForwardBudget::new(DEFAULT_ROLE_FORWARDS));
+            std::thread::scope(|scope| {
+                let search = Arc::clone(&counts);
+                scope.spawn(move || {
+                    for _ in 0..60 {
+                        assert!(search_admission(&search).is_ok());
+                    }
+                    assert!(search_admission(&search).is_err());
+                });
+                let followup = Arc::clone(&counts);
+                scope.spawn(move || {
+                    assert!(admission(&followup).is_ok());
+                    assert!(admission(&followup).is_ok());
+                    assert!(admission(&followup).is_err());
+                });
+            });
+            assert_eq!(counts.usage(Ordering::Acquire), (2, 60, 2));
+            assert_eq!(counts.load(Ordering::Acquire), DEFAULT_ROLE_FORWARDS);
         }
         #[test]
         fn raw_tolerance_does_not_bypass_strict_legal_policy_or_wdl() {
