@@ -917,6 +917,7 @@ fn mapping_json(phase: &str, observed: &NativeMappingObservation) -> serde_json:
 }
 
 const COST_COMMON_SIX_FLAG: &str = "--cost-common-six";
+const COST_COMMON_SIX_CONV_DEFAULT_FLAG: &str = "--cost-common-six-conv-default";
 const COST_SECONDS: u64 = 45;
 const COST_REPORT_BYTES: usize = 1024 * 1024;
 const COST_WARMUP: usize = 3;
@@ -929,6 +930,58 @@ const COST_CASES: [&str; 6] = [
     "same_board_other_history",
     "all_promotions",
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CostProfile {
+    CommonSix,
+    CommonSixConvDefault,
+}
+
+impl CostProfile {
+    fn take(args: &mut Vec<String>) -> Result<Option<Self>, &'static str> {
+        let selected = match args.first().map(String::as_str) {
+            Some(COST_COMMON_SIX_FLAG) => Some(Self::CommonSix),
+            Some(COST_COMMON_SIX_CONV_DEFAULT_FLAG) => Some(Self::CommonSixConvDefault),
+            _ => None,
+        };
+        if selected.is_some() {
+            args.remove(0);
+            if args.iter().any(|arg| arg.starts_with("--")) {
+                return Err("common-six cost is independent;record-page and other optional modes cannot be combined");
+            }
+        }
+        Ok(selected)
+    }
+
+    fn flag(self) -> &'static str {
+        match self {
+            Self::CommonSix => COST_COMMON_SIX_FLAG,
+            Self::CommonSixConvDefault => COST_COMMON_SIX_CONV_DEFAULT_FLAG,
+        }
+    }
+
+    fn validate_provider(self, provider: CheckerProvider) -> Result<(), &'static str> {
+        match (self, provider) {
+            (Self::CommonSix, CheckerProvider::CudaControlConvDefault) => Err(
+                "cuDNN DEFAULT cost requires the separate --cost-common-six-conv-default opt-in",
+            ),
+            (Self::CommonSixConvDefault, CheckerProvider::CudaControlConvDefault) => Ok(()),
+            (Self::CommonSixConvDefault, _) => Err(
+                "--cost-common-six-conv-default requires exact cuda-control-conv-default with pinned bundle and inventory",
+            ),
+            (Self::CommonSix, _) => Ok(()),
+        }
+    }
+
+    fn validate_tf32_override(self, value: Option<&std::ffi::OsStr>) -> Result<(), &'static str> {
+        // The execution owner supplies the environment before native loading.
+        // This checks an explicit request; it does not observe a cuDNN plan.
+        if self == Self::CommonSixConvDefault && value != Some(std::ffi::OsStr::new("0")) {
+            return Err("DEFAULT cost requires NVIDIA_TF32_OVERRIDE=0 before native loading");
+        }
+        Ok(())
+    }
+}
 
 fn cost_ns(duration: Duration) -> Result<u64, Box<dyn Error>> {
     Ok(u64::try_from(duration.as_nanos())?)
@@ -1030,6 +1083,7 @@ fn cost_common_six(
     backend: &mut PalsOnnxBackend,
     started: Instant,
     backend_load_ns: u64,
+    cost_profile: CostProfile,
 ) -> Result<(), Box<dyn Error>> {
     let mut receipt = json!({"schema":"rz-pals-common-six-api-cost/1","status":"pending",
         "model_profile":fixtures.config.profile,"checkpoint_sha256":fixtures.checkpoint_sha256,
@@ -1041,6 +1095,19 @@ fn cost_common_six(
         "graph_optimization":backend.graph_optimization(),"device_public_memory":backend.config().device_public_memory,
         "runtime_sha256":hex_digest(&backend.runtime_binary_digest()),
         "runtime_bundle_sha256":backend.runtime_bundle_digest().as_ref().map(hex_digest)});
+    // DEFAULT is a separately registered cost request. The original wire and
+    // common-six timing/verification lanes remain unchanged for legacy modes.
+    if cost_profile == CostProfile::CommonSixConvDefault {
+        cost_profile.validate_tf32_override(std::env::var_os("NVIDIA_TF32_OVERRIDE").as_deref())?;
+        let evidence = conv_default_execution_evidence(backend)?
+            .ok_or("DEFAULT cost loaded backend lacks the requested execution descriptor")?;
+        receipt["cost_opt_in"] = json!(cost_profile.flag());
+        receipt["cudnn_conv_search_diagnostic"] = evidence;
+        receipt["tf32"] = json!("unknown");
+        receipt["tf32_requested"] = json!(false);
+        receipt["nvidia_tf32_override_environment_request"] = json!("0");
+        receipt["experiment_scope"] = json!("explicit_DEFAULT_common_six_API_cost;colab_observed_resource_evidence_is_external;not_a_production_default_or_speedup_claim");
+    }
     let serde_json::Value::Object(timing_fields) = json!({
         "warmup_calls_per_case_lane":COST_WARMUP,"measured_calls_per_case_lane":COST_SAMPLES,
         "soft_work_seconds_max":COST_SECONDS,"report_bytes_max":COST_REPORT_BYTES,
@@ -1292,15 +1359,12 @@ impl CheckerProvider {
             _ => Some(NativeLoadingProfile::EagerCuda12Cudnn9V1),
         }
     }
-    fn config(self, cost_mode: bool) -> Result<PalsOnnxConfig, Box<dyn Error>> {
-        if self == Self::CudaControlConvDefault && cost_mode {
-            return Err(
-                "cuDNN DEFAULT is a separate numerical diagnostic; cost mode cannot be combined"
-                    .into(),
-            );
+    fn config(self, cost_profile: Option<CostProfile>) -> Result<PalsOnnxConfig, Box<dyn Error>> {
+        if let Some(cost_profile) = cost_profile {
+            cost_profile.validate_provider(self)?;
         }
         let mut config = PalsOnnxConfig::cpu();
-        if cost_mode {
+        if cost_profile.is_some() {
             config.intra_threads = 1;
         }
         if self.is_cuda() {
@@ -1379,15 +1443,10 @@ fn conv_default_execution_evidence(
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args: Vec<_> = std::env::args().skip(1).collect();
-    let cost_mode = args.first().is_some_and(|arg| arg == COST_COMMON_SIX_FLAG);
+    let cost_profile = CostProfile::take(&mut args)?;
+    let cost_mode = cost_profile.is_some();
     let startup_trace = NativeStartupTrace::new(cost_mode)?;
     let cost_started = cost_mode.then(Instant::now);
-    if cost_mode {
-        args.remove(0);
-        if args.iter().any(|arg| arg.starts_with("--")) {
-            return Err("--cost-common-six is independent;record-page and other optional modes cannot be combined".into());
-        }
-    }
     #[cfg(feature = "experimental-io-binding")]
     let resident_check = resident_cuda::Selection::take(&mut args)?;
     #[cfg(not(feature = "experimental-io-binding"))]
@@ -1412,13 +1471,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     if !matches!(args.len(), 8 | 9 | 11) {
-        return Err("usage: pals_model_check EXPORT.json EXPORT_SHA256 ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu|cuda|cuda-device|cuda-control|cuda-control-shim|cuda-control-conv-default CACHE_ROOT [CUDA_BUNDLE.json] [INVENTORY_V2.json INVENTORY_SHA256]; CPU-only optional trailing --check-host-record-pages; Linux cuda-control-shim optional trailing --check-cuda-record-pages MANIFEST SHA256 GRAPH SHA256 RESOURCES.json".into());
+        return Err("usage: pals_model_check [--cost-common-six|--cost-common-six-conv-default] EXPORT.json EXPORT_SHA256 ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu|cuda|cuda-device|cuda-control|cuda-control-shim|cuda-control-conv-default CACHE_ROOT [CUDA_BUNDLE.json] [INVENTORY_V2.json INVENTORY_SHA256]; DEFAULT cost requires its separate leading flag, exact cuda-control-conv-default and NVIDIA_TF32_OVERRIDE=0; CPU-only optional trailing --check-host-record-pages; Linux cuda-control-shim optional trailing --check-cuda-record-pages MANIFEST SHA256 GRAPH SHA256 RESOURCES.json".into());
     }
     let selected_provider = CheckerProvider::parse(&args[6], args.len())?;
     let is_cuda = selected_provider.is_cuda();
     // Candidate combinations are refused before fixture/model reads, cache
     // mutation, or native loading. Only the candidate's inventory moves earlier.
-    let mut config = selected_provider.config(cost_mode)?;
+    let mut config = selected_provider.config(cost_profile)?;
+    if let Some(cost_profile) = cost_profile {
+        cost_profile.validate_tf32_override(std::env::var_os("NVIDIA_TF32_OVERRIDE").as_deref())?;
+    }
     let preflight_control = if selected_provider == CheckerProvider::CudaControlConvDefault {
         Some(PalsCudaControlPolicy::from_inventory(
             Path::new(&args[9]),
@@ -1550,6 +1612,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &mut backend,
             started,
             cost_backend_load_ns.ok_or("cost load timer missing")?,
+            cost_profile.ok_or("cost selection missing")?,
         );
     }
     // CUDA tests are bounded by the shell/process owner in addition to these
@@ -1996,7 +2059,7 @@ mod conv_selection_tests {
             selected.loading_profile(),
             Some(NativeLoadingProfile::EagerCuda12Cudnn9V1)
         );
-        let config = selected.config(false).unwrap();
+        let config = selected.config(None).unwrap();
         assert_eq!(
             config.cudnn_conv_search,
             PalsCuDnnConvSearch::ExperimentalDefault
@@ -2005,7 +2068,7 @@ mod conv_selection_tests {
         for arity in [0, 8, 9, 10, 12, 17] {
             assert!(CheckerProvider::parse("cuda-control-conv-default", arity).is_err());
         }
-        assert!(selected.config(true).is_err());
+        assert!(selected.config(Some(CostProfile::CommonSix)).is_err());
         assert!(CheckerProvider::parse("cuda-control-conv-default-shim", 11).is_err());
     }
 
@@ -2019,7 +2082,7 @@ mod conv_selection_tests {
         ] {
             let selected = CheckerProvider::parse(name, count).unwrap();
             assert_eq!(
-                selected.config(false).unwrap().cudnn_conv_search,
+                selected.config(None).unwrap().cudnn_conv_search,
                 PalsCuDnnConvSearch::LegacyImplicitExhaustive
             );
         }
@@ -2038,5 +2101,91 @@ mod conv_selection_tests {
             CheckerProvider::CudaDevice
         );
         assert!(!CheckerProvider::CudaDevice.explicit_control());
+    }
+
+    #[test]
+    fn default_cost_needs_its_exact_leading_flag_and_provider() {
+        let mut args = vec![
+            COST_COMMON_SIX_CONV_DEFAULT_FLAG.into(),
+            "registered-export".into(),
+        ];
+        assert_eq!(
+            CostProfile::take(&mut args).unwrap(),
+            Some(CostProfile::CommonSixConvDefault)
+        );
+        assert_eq!(args, ["registered-export"]);
+        let config = CheckerProvider::CudaControlConvDefault
+            .config(Some(CostProfile::CommonSixConvDefault))
+            .unwrap();
+        assert_eq!(
+            config.cudnn_conv_search,
+            PalsCuDnnConvSearch::ExperimentalDefault
+        );
+        assert_eq!(config.intra_threads, 1);
+        assert!(!config.device_public_memory);
+        for provider in [
+            CheckerProvider::Cpu,
+            CheckerProvider::Cuda,
+            CheckerProvider::CudaDevice,
+            CheckerProvider::CudaControl,
+            CheckerProvider::CudaControlShim,
+        ] {
+            assert!(provider
+                .config(Some(CostProfile::CommonSixConvDefault))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn default_cost_tf32_request_is_required_without_mutating_process_environment() {
+        let profile = CostProfile::CommonSixConvDefault;
+        assert!(profile
+            .validate_tf32_override(Some(std::ffi::OsStr::new("0")))
+            .is_ok());
+        for value in [
+            None,
+            Some(std::ffi::OsStr::new("1")),
+            Some(std::ffi::OsStr::new("")),
+            Some(std::ffi::OsStr::new("false")),
+        ] {
+            assert!(profile.validate_tf32_override(value).is_err());
+        }
+        assert!(CostProfile::CommonSix.validate_tf32_override(None).is_ok());
+    }
+
+    #[test]
+    fn cost_flags_are_independent_and_ordinary_numeric_selection_is_unchanged() {
+        for other in [
+            COST_COMMON_SIX_FLAG,
+            COST_COMMON_SIX_CONV_DEFAULT_FLAG,
+            HOST_PAGE_CHECK_FLAG,
+            "--check-cuda-control-policy",
+        ] {
+            let mut args = vec![COST_COMMON_SIX_CONV_DEFAULT_FLAG.into(), other.into()];
+            assert!(CostProfile::take(&mut args).is_err());
+        }
+        let original = vec![
+            "registered-export".into(),
+            COST_COMMON_SIX_CONV_DEFAULT_FLAG.into(),
+        ];
+        let mut args = original.clone();
+        assert_eq!(CostProfile::take(&mut args).unwrap(), None);
+        assert_eq!(args, original);
+        let config = CheckerProvider::CudaControlConvDefault
+            .config(None)
+            .unwrap();
+        assert_eq!(config.intra_threads, 2);
+        assert_eq!(
+            config.cudnn_conv_search,
+            PalsCuDnnConvSearch::ExperimentalDefault
+        );
+        let baseline = CheckerProvider::CudaControl
+            .config(Some(CostProfile::CommonSix))
+            .unwrap();
+        assert_eq!(baseline.intra_threads, 1);
+        assert_eq!(
+            baseline.cudnn_conv_search,
+            PalsCuDnnConvSearch::LegacyImplicitExhaustive
+        );
     }
 }

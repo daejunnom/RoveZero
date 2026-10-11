@@ -1550,6 +1550,95 @@ mod tests {
         ));
     }
     #[test]
+    fn single_slot_record_revision_resume_refuses_evicted_same_role_context() {
+        use crate::pals_model::{PalsFullLineInput, PalsModelProfile};
+        let snapshot = Position::startpos().snapshot();
+        let config = PalsModelConfig::for_profile(PalsModelProfile::FullLineV2);
+        let mut original = input(PalsRole::Proposer);
+        original.full_line = Some(PalsFullLineInput {
+            records: vec![],
+            query_prefix: original.candidates.clone(),
+            query_proposal: original.candidates.clone(),
+            query_counter: vec![],
+        });
+        let mut source = request(&snapshot, &input(PalsRole::Proposer));
+        let situation = source.context.situation;
+        source.context =
+            PrivateRulesContext::seal(&snapshot, &original, &config, situation).unwrap();
+        let bank = PrivateSeedBank::new(
+            PrivateSeedLimits {
+                slots_per_role: 1,
+                ..limits()
+            },
+            1,
+        )
+        .unwrap();
+        accepted(&bank, &source, &snapshot, PrivateInvocationMode::Fresh);
+        // A C publication occupies another role's slot. It cannot evict P.
+        let critic = request(&snapshot, &input(PalsRole::Critic));
+        accepted(&bank, &critic, &snapshot, PrivateInvocationMode::Fresh);
+        original.situation_revision = 1;
+        let mut resumed = source.clone();
+        resumed.context =
+            PrivateRulesContext::seal(&snapshot, &original, &config, situation).unwrap();
+        accepted(
+            &bank,
+            &resumed,
+            &snapshot,
+            PrivateInvocationMode::ApproxCudaWarmV2,
+        );
+
+        // A later accepted P answer for a different question really replaces
+        // the one resident P seed. An old capture of Repair is no authority to
+        // recreate that evicted seed or call a subsequent Fresh run Warm.
+        let mut other = original.clone();
+        other.full_line.as_mut().unwrap().query_proposal[0].to = 20;
+        let mut replacement = source.clone();
+        replacement.context =
+            PrivateRulesContext::seal(&snapshot, &other, &config, situation).unwrap();
+        accepted(
+            &bank,
+            &replacement,
+            &snapshot,
+            PrivateInvocationMode::Fresh,
+        );
+        original.situation_revision = 2;
+        resumed.context =
+            PrivateRulesContext::seal(&snapshot, &original, &config, situation).unwrap();
+        let before = bank.snapshot().unwrap();
+        assert!(matches!(
+            bank.begin(
+                resumed,
+                &snapshot,
+                PrivateInvocationMode::ApproxCudaWarmV2,
+                &CancelToken::new(),
+                deadline(),
+            ),
+            Err(PrivateSeedError::MissingSeed)
+        ));
+        let refused = bank.snapshot().unwrap();
+        assert_eq!(refused.counts, before.counts);
+        assert_eq!(refused.entries_per_role, [1, 1, 0]);
+        assert!(refused.active_lease.is_none());
+        assert_eq!(refused.pinned_entries, 0);
+        assert_eq!(refused.provisional_bytes, 0);
+        other.situation_revision = 2;
+        replacement.context =
+            PrivateRulesContext::seal(&snapshot, &other, &config, situation).unwrap();
+        accepted(
+            &bank,
+            &replacement,
+            &snapshot,
+            PrivateInvocationMode::ApproxCudaWarmV2,
+        );
+        let after = bank.snapshot().unwrap();
+        assert_eq!(after.counts.fresh_admissions, 3);
+        assert_eq!(after.counts.warm_admissions, 2);
+        assert_eq!(after.counts.accepted_seeds, 5);
+        assert_eq!(after.entries_per_role, [1, 1, 0]);
+    }
+
+    #[test]
     fn cuda_full_line_query_change_cannot_reuse_same_rules_seed() {
         use crate::pals_model::{PalsFullLineInput, PalsModelProfile};
         let snapshot = Position::startpos().snapshot();
