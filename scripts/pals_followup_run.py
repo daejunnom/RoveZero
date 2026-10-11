@@ -27,6 +27,36 @@ RESOURCE_PROFILES = ("strict-local", "colab-observed")
 EXTERNAL_GC_LEDGER_SCHEMA = "rovezero.external-gc-ledger.v1"
 PROFILES = ("legacy_summary_v1", "full_line_v2", "interaction_head_v2", "full_line_interaction_v2")
 
+# Run in a separate, supervised process. ORT 1.22's CUDA provider constructs
+# CUDA driver wrappers during dlopen, before model Run. An absolute-path driver
+# probe does not establish that the provider can resolve this SONAME. Keep the
+# same environment as the native child and never repair the linker or load NN.
+CUDA_DRIVER_LOOKUP = """
+import ctypes, json
+from pathlib import Path
+try:
+    driver = ctypes.CDLL('libcuda.so.1')
+    with Path('/proc/self/maps').open('rb') as stream:
+        data = stream.read(2 * 1024 * 1024 + 1)
+    if len(data) > 2 * 1024 * 1024:
+        raise ValueError('driver mapping observation exceeds bound')
+    paths = set()
+    for line in data.splitlines():
+        fields = line.split(None, 5)
+        if len(fields) == 6:
+            path = Path(fields[5].decode('utf-8'))
+            if path.name.startswith('libcuda.so'):
+                if not path.is_absolute() or str(path).endswith(' (deleted)'):
+                    raise ValueError('driver mapping origin unavailable')
+                paths.add(str(path))
+    if len(paths) != 1:
+        raise ValueError('one observed system driver image required')
+    print(json.dumps({'status': 'available', 'resolved_path': paths.pop()}))
+except (OSError, ValueError, UnicodeError) as error:
+    print(json.dumps({'status': 'unavailable', 'error_type': type(error).__name__}))
+    raise SystemExit(125)
+"""
+
 
 def sha(value):
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
@@ -221,6 +251,76 @@ def check_colab_output_budget(args):
         raise RuntimeError("owned Colab attempt exceeds registered finite output budget")
 
 
+def check_colab_driver_lookup(receipt_path, cwd, environment, remaining, budget):
+    """Check the provider's default host-driver lookup before any model child.
+
+    This is host integration evidence, separate from the pinned 19-file vendor
+    bundle, device readiness, physical completion and numerical acceptance.
+    No cuInit, environment mutation, linker-cache change or retry is performed.
+    """
+    evidence = {"soname": "libcuda.so.1", "status": "unknown",
+                "same_environment_as_native_child": True, "cu_init_performed": False,
+                "model_executed": False, "linker_settings_changed": False,
+                "tree_gone": True, "child_spawned": False, "exit_code": None}
+    if remaining <= 0:
+        evidence["status"] = "deadline_expired"
+        return evidence
+    log = outside_git(receipt_path.with_name(receipt_path.name + ".driver-lookup.log"))
+    if log.exists():
+        raise ValueError("driver lookup log must be a fresh outside-Git file")
+    descriptors = []
+    def bounded_probe():
+        budget()
+        if log.stat().st_size > 64 * 1024:
+            raise RuntimeError("driver lookup log exceeds finite bound")
+    try:
+        with log.open("xb") as stream:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            for target in (1, 2):
+                descriptors.append(os.dup(target))
+            os.dup2(stream.fileno(), 1)
+            os.dup2(stream.fileno(), 2)
+            code, gone, failure = run_group(
+                [sys.executable, "-I", "-c", CUDA_DRIVER_LOOKUP], cwd, environment,
+                min(10, remaining), bounded_probe)
+    except (OSError, RuntimeError) as error:
+        # A raised supervisor may have started a child. Do not invent a clean
+        # process tree or allow the model child after an unconfirmed cleanup.
+        evidence.update(status="probe_supervision_raised", tree_gone="unknown",
+                        child_spawned="unknown", log=str(log),
+                        supervisor_error_type=type(error).__name__)
+        return evidence
+    finally:
+        for target, original in zip((1, 2), descriptors):
+            os.dup2(original, target)
+            os.close(original)
+    evidence.update(exit_code=code, tree_gone=gone, child_spawned=True,
+                    log=str(log), supervisor_error=failure)
+    if not gone or failure is not None or code != 0:
+        evidence["status"] = "lookup_or_supervision_failed"
+        return evidence
+    if log.stat().st_size > 64 * 1024:
+        evidence["status"] = "invalid_probe_output"
+        return evidence
+    try:
+        with log.open("rb") as stream:
+            data = stream.read(64 * 1024 + 1)
+        if len(data) > 64 * 1024:
+            raise ValueError("driver lookup log exceeds finite bound")
+        value = json.loads(data.decode("utf-8"), object_pairs_hook=unique_object)
+        path = value["resolved_path"]
+        if (set(value) != {"status", "resolved_path"} or value["status"] != "available"
+                or not isinstance(path, str) or not Path(path).is_absolute()
+                or not Path(path).name.startswith("libcuda.so") or path.endswith(" (deleted)")):
+            raise ValueError("invalid driver lookup observation")
+    except (OSError, ValueError, KeyError, TypeError, UnicodeError):
+        evidence["status"] = "invalid_probe_output"
+    else:
+        evidence.update(status="available", resolved_path=path)
+    return evidence
+
+
 def arena_plan(args, binary):
     lock_path = pinned(args.lock, args.lock_sha256, 256 * 1024)
     lock = bounded_json(lock_path)
@@ -368,7 +468,16 @@ def main():
                            status="completed" if code == 0 and gone else "failed_ownership_preserved")
         else:
             remaining = args.seconds - (time.monotonic() - started)
-            if sys.platform != "linux" or remaining <= 0:
+            if sys.platform == "linux" and args.mode == "model-check" and args.provider != "cpu":
+                receipt["host_driver_lookup"] = check_colab_driver_lookup(
+                    receipt_path, binary.parent, environment, remaining,
+                    lambda: check_colab_output_budget(args))
+                remaining = args.seconds - (time.monotonic() - started)
+            if receipt.get("host_driver_lookup", {}).get("status", "available") != "available":
+                probe = receipt["host_driver_lookup"]
+                receipt.update(exit_code=125, tree_gone=probe["tree_gone"],
+                    status="host_driver_lookup_failed_no_model_spawned", child_spawned=False)
+            elif sys.platform != "linux" or remaining <= 0:
                 receipt.update(exit_code=125 if sys.platform != "linux" else 124, tree_gone=True,
                     status="unsupported_execution_platform" if sys.platform != "linux" else "preparation_deadline_expired",
                     child_spawned=False)

@@ -3702,3 +3702,41 @@ GPU 검증 보류·실제 학습 제외·로컬 heavy CPU 미실행을 유지한
 - 관측 횟수·보류 횟수·첫/마지막 보류 코드는 실제 process owner의 작은 private scalar로 보존하고 readonly getter로 제공한다. 성공 후 이전 보류 관측을 지우거나 성공 receipt의 오류로 바꾸지 않는다. legacy transport/1 JSON은 그대로 유지한다. 관측 횟수는 syscall의 hard-timeout·자식의 ready·NN 완료 증거가 아니다.
 
 실제 cat 입력 검사에 관측 횟수와 원래 입력 전 완료 조건을 연결하고, 직접 다른 executable을 확인하는 기존 거부 검사를 유지한다. 보류 대상이 metadata·내용 검증 오류로 넓어지지 않게 CPU 경계 검사도 추가한다. 이 source 수정의 정확한 CI는 게시 후 별도로 확인하며, 실제 frozen NN·next Query·utility·paired 인수는 계속 남긴다.
+
+### Colab L4의 ABI 호환 빌드와 CUDA 드라이버 이름 검색
+
+2026-10-11 Colab 실행은 `ed0274b8ffcdf6b820fbd123f216d4a647250ff3`의 native 소스를 사용했다.
+Colab glibc 2.35 환경에서 `pals_model_check`, `pals_repair_query_episode`,
+`pals_cuda_warm_check`, `rz-uci`를 재빌드하고 각각의 바이너리 SHA-256과 최대 요구
+GLIBC 2.34를 등록했다. 빌드 감독은 종료와 임시 자료 회수를 확인했다. 시스템 glibc를
+교체한 결과나 실제 NN 실행 성공으로 해석하지 않는다. 이 소스의 CPU CI
+[38136095604](https://github.com/daejunnom/RoveZero/actions/runs/38136095604)는 네 job 성공이다.
+이후 실행 래퍼의 변경은 별도 source/CI로 검증한다.
+
+- 격리된 환경에서 `libcuda.so.1` 기본 이름 검색은 `OSError`로 실패했다. 호스트 드라이버
+  절대 경로의 독립 검사에서는 `cuInit=0`, 장치 수 1이 관측됐다. 두 검사는 다른 질문이며,
+  절대 경로 성공으로 provider의 이름 검색 성공을 대신하지 않는다.
+- GDB 진단은 `session_load_entered` 뒤 CUDA provider의 로딩 단계에서 SIGSEGV로 종료했다.
+  첫 native Run 진입과 수치 report는 없었다. 세 감독 command의 process tree 종료는
+  확인했지만 NN의 물리 완료·shutdown은 `unknown`으로 보존한다.
+- 같은 SHA-256의 CUDA provider ELF와 스택 주소를 대조했다. `dlopen` 실패 분기에서
+  오류 처리에 들어가 간접 포인터를 역참조하는 흐름과 일치한다. ORT 1.22의
+  [CUDADriverWrapper](https://github.com/microsoft/onnxruntime/blob/v1.22.0/onnxruntime/contrib_ops/cuda/bert/tensorrt_fused_multihead_attention/cudaDriverWrapper.cc)는
+  static 초기화에서 이 SONAME을 연다. 오류 경로의 host 초기화 순서 문제는 소스·역어셈블리
+  기반 추론이며, GDB에서 해당 포인터 값을 직접 관측한 증거는 아니다. 모델·Warm·VRAM
+  문제나 GPU 하드웨어 고장으로 판정하지 않는다.
+
+`pals_followup_run.py`의 **Linux `colab-observed` CUDA model-check**에는 모델 자식 실행 전
+독립 Python 자식으로 기본 SONAME 검색을 확인하는 검사를 둔다. 원래 native 자식과 같은
+환경을 사용하고, 실제 mapped driver 경로·종료·실패를 별도 `host_driver_lookup`으로 기록한다.
+검사 상한은 남은 전체 창과 10초 중 작은 값이며, 로그 64KiB와 자기 process maps 2MiB를
+제한한다. 실패·비정상 출력·종료 미확인에서는 모델을 시작하지 않고 원래 소유권 상태를
+보존한다. 검사·정리 비용을 원래 창에서 차감하며 새 실행 시계를 만들지 않는다.
+계획 단계·CPU·strict-local 경로에는 이 추가 검사를 적용하지 않는다.
+
+이 검사는 `cuInit`·모델 실행·환경변수 변경·linker 설정 수정을 하지 않으며, 기존 19-file
+vendor bundle 검증·물리 fence·독립 수치 인수를 대신하지 않는다. Colab 호스트 드라이버의
+system linker cache 준비는 별도 환경 작업으로 다룬다. 다른 버전의 CUDA compat driver를
+대신 사용하거나 호스트 드라이버를 vendor bundle에 섞지 않는다. 이번 GPU 창은 첫 native
+실패 뒤 종료하고 L4 `STOPPED` 및 원시 진단 자료 회수를 확인했다. 다음 실행에서는 환경
+수정을 먼저 검증한 뒤 독립 NN→Repair→Warm→비용·대국의 미인수 항목을 이어간다.

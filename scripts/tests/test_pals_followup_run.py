@@ -5,6 +5,7 @@ import copy
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -177,6 +178,179 @@ class FollowupPlanTests(unittest.TestCase):
         self.assertFalse(evidence["native_arena_policy_relaxed"])
         self.assertEqual(evidence["actual_resources"], "unknown")
         self.assertEqual(evidence["external_GC"]["actual_full_gc_calls"], "unknown")
+
+
+class DriverLookupTests(unittest.TestCase):
+    """Mocked host lookup and execution gates; never load a CUDA library."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="rovezero-driver-boundary-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.receipt = self.root / "receipt.json"
+        self.driver = str(self.root / "libcuda.so.580.178.04")
+
+    def probe(self, data=None, result=(0, True, None), remaining=30, error=None):
+        data = data if data is not None else json.dumps({
+            "status": "available", "resolved_path": self.driver}).encode()
+        environment = {"PATH": "registered path", "OMP_NUM_THREADS": "2"}
+        original = environment.copy()
+        def run(argv, cwd, env, timeout, budget):
+            self.assertEqual(argv[:3], [sys.executable, "-I", "-c"])
+            self.assertEqual(cwd, self.root)
+            self.assertIs(env, environment)
+            self.assertEqual(timeout, min(10, remaining))
+            budget()
+            if error:
+                raise error
+            os.write(1, data)
+            return result
+        with mock.patch.object(wrapper, "run_group", side_effect=run) as spawn:
+            evidence = wrapper.check_colab_driver_lookup(
+                self.receipt, self.root, environment, remaining, lambda: None)
+        self.assertEqual(environment, original)
+        return evidence, spawn
+
+    def test_default_lookup_is_bounded_separate_and_preserves_environment(self):
+        evidence, spawn = self.probe(remaining=3)
+        self.assertEqual(evidence["status"], "available")
+        self.assertEqual(evidence["resolved_path"], self.driver)
+        self.assertTrue(evidence["tree_gone"])
+        self.assertTrue(evidence["same_environment_as_native_child"])
+        self.assertFalse(evidence["cu_init_performed"])
+        self.assertFalse(evidence["model_executed"])
+        self.assertFalse(evidence["linker_settings_changed"])
+        spawn.assert_called_once()
+
+    def test_missing_driver_signal_and_incomplete_cleanup_are_not_success(self):
+        for index, result in enumerate(((125, True, None), (-11, True, None),
+                                        (0, False, None), (0, True, "budget failure"))):
+            self.receipt = self.root / f"failure-{index}.json"
+            with self.subTest(result=result):
+                evidence, _ = self.probe(result=result)
+                self.assertEqual(evidence["status"], "lookup_or_supervision_failed")
+                self.assertEqual(evidence["tree_gone"], result[1])
+                self.assertTrue(Path(evidence["log"]).is_file())
+
+    def test_raised_supervisor_preserves_unknown_ownership(self):
+        evidence, _ = self.probe(error=RuntimeError("supervisor did not return"))
+        self.assertEqual(evidence["status"], "probe_supervision_raised")
+        self.assertEqual(evidence["tree_gone"], "unknown")
+        self.assertEqual(evidence["child_spawned"], "unknown")
+
+    def test_invalid_or_oversized_probe_output_is_not_admitted(self):
+        valid = {"status": "available", "resolved_path": self.driver}
+        values = (b"not JSON", b"{}", b"[]", b"\xff", b"x" * (64 * 1024 + 1),
+                  json.dumps({**valid, "status": "unavailable"}).encode(),
+                  json.dumps({**valid, "resolved_path": "libcuda.so.1"}).encode(),
+                  json.dumps({**valid, "resolved_path": self.driver + " (deleted)"}).encode(),
+                  json.dumps({**valid, "extra": True}).encode(),
+                  ('{"status":"available","status":"available","resolved_path":'
+                   + json.dumps(self.driver) + '}').encode())
+        for index, data in enumerate(values):
+            self.receipt = self.root / f"invalid-{index}.json"
+            with self.subTest(index=index):
+                evidence, _ = self.probe(data=data)
+                self.assertEqual(evidence["status"], "invalid_probe_output")
+
+    def test_expired_lookup_never_spawns_and_existing_log_is_not_overwritten(self):
+        evidence, spawn = self.probe(remaining=0)
+        spawn.assert_not_called()
+        self.assertEqual(evidence["status"], "deadline_expired")
+        log = self.receipt.with_name(self.receipt.name + ".driver-lookup.log")
+        log.write_bytes(b"retained evidence")
+        with self.assertRaises(ValueError):
+            self.probe()
+        self.assertEqual(log.read_bytes(), b"retained evidence")
+
+    @unittest.skipUnless(sys.platform == "linux", "actual probe supervision requires Linux")
+    def test_real_supervisor_captures_stub_output_and_reaps_before_admission(self):
+        # Exercise the real inherited-FD/process-group boundary with tiny Python
+        # stubs. No CUDA library, NN, optimizer or engine is loaded.
+        for code in (0, 125):
+            self.receipt = self.root / f"actual-supervisor-{code}.json"
+            script = ("import json,os,sys; assert os.environ['RZ_PROBE_STUB']=='1'; "
+                      + "print(" + repr(json.dumps({"status": "available",
+                                                    "resolved_path": self.driver})) + "); "
+                      + f"sys.exit({code})")
+            with mock.patch.object(wrapper, "CUDA_DRIVER_LOOKUP", script):
+                evidence = wrapper.check_colab_driver_lookup(
+                    self.receipt, self.root, {"RZ_PROBE_STUB": "1"}, 3, lambda: None)
+            self.assertTrue(evidence["tree_gone"])
+            self.assertEqual(evidence["exit_code"], code)
+            self.assertEqual(evidence["status"],
+                             "available" if code == 0 else "lookup_or_supervision_failed")
+
+    def model_argv(self, provider="cuda", resource="colab-observed", execute=True):
+        files = {"binary": b"fixture executable", "export": json.dumps({
+            "config": {"profile": "legacy_summary_v1"}}).encode(),
+            "runtime": b"fixture runtime", "fixtures": b"{}", "cuda-bundle": b"{}"}
+        argv = ["wrapper", "--receipt", str(self.receipt), "--cpu-affinity", "0", "2",
+                "--resource-profile", resource, "--seconds", "100"]
+        for name in ("binary",):
+            path = self.root / name
+            path.write_bytes(files[name])
+            argv += ["--" + name, str(path), "--" + name + "-sha256",
+                     hashlib.sha256(files[name]).hexdigest()]
+        if execute:
+            argv.append("--run")
+        argv += ["model-check", "--model-profile", "legacy_summary_v1", "--provider", provider,
+                 "--runtime-cache", str(self.root / "runtime-cache"),
+                 "--model-report", str(self.root / "model-report.json")]
+        for name in ("export", "runtime", "fixtures", "cuda-bundle"):
+            if name == "cuda-bundle" and provider == "cpu":
+                continue
+            path = self.root / name
+            path.write_bytes(files[name])
+            argv += ["--" + name, str(path), "--" + name + "-sha256",
+                     hashlib.sha256(files[name]).hexdigest()]
+        return argv
+
+    def execute(self, argv, probe, clock):
+        with (mock.patch.object(sys, "argv", argv),
+              mock.patch.object(wrapper.sys, "platform", "linux"),
+              mock.patch.object(wrapper, "observe_resources", return_value={}),
+              mock.patch.object(wrapper, "check_resources", return_value={}),
+              mock.patch.object(wrapper, "check_colab_driver_lookup", return_value=probe) as lookup,
+              mock.patch.object(wrapper.time, "monotonic", side_effect=clock),
+              mock.patch.object(wrapper, "run_group", return_value=(0, True, None)) as native,
+              contextlib.redirect_stdout(io.StringIO())):
+            code = wrapper.main()
+        return code, json.loads(self.receipt.read_text()), lookup, native
+
+    def test_failed_probe_blocks_model_even_after_whole_window_expires(self):
+        code, receipt, lookup, native = self.execute(self.model_argv(),
+            {"status": "lookup_or_supervision_failed", "tree_gone": False}, [0, 2, 101, 102])
+        lookup.assert_called_once()
+        native.assert_not_called()
+        self.assertEqual(code, 125)
+        self.assertEqual(receipt["status"], "host_driver_lookup_failed_no_model_spawned")
+        self.assertFalse(receipt["tree_gone"])
+        self.assertFalse(receipt["child_spawned"])
+
+    def test_successful_probe_cost_is_charged_to_original_model_window(self):
+        code, receipt, lookup, native = self.execute(self.model_argv(),
+            {"status": "available", "tree_gone": True}, [0, 2, 8, 9])
+        lookup.assert_called_once()
+        native.assert_called_once()
+        self.assertEqual(native.call_args.args[3], 92)
+        self.assertIs(lookup.call_args.args[2], native.call_args.args[2])
+        self.assertEqual(code, 0)
+        self.assertEqual(receipt["status"], "completed_observed_profile")
+
+    def test_planning_cpu_and_strict_local_do_not_run_host_lookup(self):
+        cases = (("cuda", "colab-observed", False, [0, 1]),
+                 ("cpu", "colab-observed", True, [0, 2, 3]),
+                 ("cuda", "strict-local", True, [0, 1, 2]))
+        for index, (provider, resource, execute, clock) in enumerate(cases):
+            self.receipt = self.root / f"no-lookup-{index}.json"
+            with self.subTest(provider=provider, resource=resource, execute=execute):
+                code, receipt, lookup, native = self.execute(
+                    self.model_argv(provider, resource, execute), None, clock)
+                lookup.assert_not_called()
+                self.assertNotIn("host_driver_lookup", receipt)
+                self.assertEqual(native.call_count, int(execute))
+                self.assertEqual(code, 0)
 
 
 class ResourceObservationTests(unittest.TestCase):
