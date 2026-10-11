@@ -982,6 +982,31 @@ mod native {
         /// Explicit owned CUDA K/V payload limit; excludes ORT workspace.
         pub device_bytes_max: u64,
     }
+    /// Original load/owner-admission cause. Reading this diagnostic neither
+    /// certifies a physical Run nor changes any worker cleanup authority.
+    #[derive(Clone, Debug)]
+    pub struct NativeCudaWarmLoadError {
+        pub stage: &'static str,
+        pub cause: RoleError,
+        pub backend: Option<Box<BackendError>>,
+    }
+    #[cfg(feature = "experimental-io-binding")]
+    impl NativeCudaWarmLoadError {
+        fn role(stage: &'static str, cause: RoleError) -> Self {
+            Self {
+                stage,
+                cause,
+                backend: None,
+            }
+        }
+        fn backend(stage: &'static str, cause: BackendError) -> Self {
+            Self {
+                stage,
+                cause: model_error(&cause),
+                backend: Some(Box::new(cause)),
+            }
+        }
+    }
     /// A single prepared physical handoff. Dropping it without real Ready
     /// conservatively retains the bank, frozen query and full backup payload.
     struct WarmAdmission {
@@ -2396,6 +2421,72 @@ mod native {
             + divergences * 4;
         Ok((inputs, outputs))
     }
+    fn cuda_warm_tensor_layout_for_config(
+        config: &PalsModelConfig,
+        cuda_warm: bool,
+    ) -> Result<(u64, u64), RoleError> {
+        let (inputs, outputs) = transient_device_layout_for_config(config)?;
+        if !cuda_warm {
+            return Ok((inputs, outputs));
+        }
+        let tokens = config
+            .public_memory_tokens(config.max_records)
+            .map_err(model_error)?;
+        let kv_bytes = [2, config.kv_heads, tokens, config.head_dimension, 4]
+            .into_iter()
+            .try_fold(1_u64, |total, value| {
+                total.checked_mul(u64::try_from(value).ok()?)
+            })
+            .ok_or(RoleError::InvalidOutput)?;
+        let seed_bytes = u64::try_from(config.latent_elements())
+            .ok()
+            .and_then(|n| n.checked_mul(4))
+            .and_then(|n| n.checked_add(1))
+            .ok_or(RoleError::InvalidOutput)?;
+        // The Warm ABI always supplies initial_latent and scalar warm_start,
+        // even for Fresh. Public replacement allocates its new K/V before the
+        // previous owned K/V are dropped. Charge both lifetimes, without
+        // claiming ORT workspace/allocator peaks or loosening its payload cap.
+        Ok((
+            inputs
+                .checked_add(seed_bytes)
+                .ok_or(RoleError::InvalidOutput)?,
+            outputs
+                .checked_add(kv_bytes)
+                .ok_or(RoleError::InvalidOutput)?,
+        ))
+    }
+    fn cuda_tensor_layout_for_backend(backend: &PalsOnnxBackend) -> Result<(u64, u64), RoleError> {
+        #[cfg(feature = "experimental-io-binding")]
+        let cuda_warm = backend.private_cuda_warm_capability().is_some();
+        #[cfg(not(feature = "experimental-io-binding"))]
+        let cuda_warm = false;
+        cuda_warm_tensor_layout_for_config(backend.model_config(), cuda_warm)
+    }
+    #[cfg(any(feature = "experimental-io-binding", test))]
+    fn validate_cuda_warm_observation_admission(
+        limits: NativeCudaWarmObservationLimits,
+        execution: &NativeExecutionReceipt,
+        actual_cuda_warm: bool,
+    ) -> Result<(), BackendError> {
+        use rz_eval::error::{FailureKind as K, FailureStage as S};
+        let detail = if limits.max_leases != 1 {
+            Some("CUDA Warm observation admission requires exactly one lease")
+        } else if limits.device_bytes_max == 0 {
+            Some("CUDA Warm observation device payload limit must be positive")
+        } else if !actual_cuda_warm {
+            Some("CUDA Warm observation admission requires the actual loaded CUDA Warm capability")
+        } else if limits.device_bytes_max > execution.execution_device_reservation() {
+            Some(
+                "CUDA Warm observation payload limit exceeds the charged physical tensor reservation",
+            )
+        } else {
+            None
+        };
+        detail.map_or(Ok(()), |detail| {
+            Err(BackendError::new(K::InvalidInput, S::Admission, detail))
+        })
+    }
     fn execution_receipt(backend: &PalsOnnxBackend) -> Result<NativeExecutionReceipt, RoleError> {
         let (provider, device_id, session_arena_bytes, request, physical) =
             match backend.config().provider {
@@ -2409,8 +2500,7 @@ mod native {
                             "PALS CUDA requires onnx-cuda on Linux; CPU fallback forbidden".into(),
                         ));
                     }
-                    let (request, physical) =
-                        transient_device_layout_for_config(backend.model_config())?;
+                    let (request, physical) = cuda_tensor_layout_for_backend(backend)?;
                     (
                         "cuda",
                         Some(device_id),
@@ -4417,9 +4507,35 @@ mod native {
             control: Option<(PalsCudaControlPolicy, &std::path::Path)>,
             observation_limits: Option<NativeCudaWarmObservationLimits>,
         ) -> Result<Self, RoleError> {
-            options.validate(&config)?;
+            Self::load_with_runtime_and_cuda_private_warm_and_observations_diagnostic(
+                export,
+                expected_export_sha256,
+                runtime,
+                config,
+                options,
+                control,
+                observation_limits,
+            )
+            .map_err(|failure| failure.cause)
+        }
+        /// Opt-in diagnostic sibling. Keeps the backend cause owned and typed
+        /// before the historical RoleError projection, including load failures
+        /// that occur before a physical worker or finish handle exists.
+        #[cfg(feature = "experimental-io-binding")]
+        pub fn load_with_runtime_and_cuda_private_warm_and_observations_diagnostic(
+            export: &std::path::Path,
+            expected_export_sha256: &str,
+            runtime: rz_eval::onnx::OrtRuntime,
+            config: rz_eval::pals_onnx::PalsOnnxConfig,
+            options: NativeOwnerOptions,
+            control: Option<(PalsCudaControlPolicy, &std::path::Path)>,
+            observation_limits: Option<NativeCudaWarmObservationLimits>,
+        ) -> Result<Self, NativeCudaWarmLoadError> {
+            options
+                .validate(&config)
+                .map_err(|cause| NativeCudaWarmLoadError::role("owner_options", cause))?;
             if options.host_record_pages.is_some() {
-                return Err(RoleError::Backend("CUDA Warm requires the device public owner; host record pages cannot be selected".into()));
+                return Err(NativeCudaWarmLoadError::role("owner_options", RoleError::Backend("CUDA Warm requires the device public owner; host record pages cannot be selected".into())));
             }
             let backend = match control {
                 Some((policy, profile)) => {
@@ -4439,11 +4555,25 @@ mod native {
                     config,
                 ),
             }
-            .map_err(model_error)?;
+            .map_err(|cause| NativeCudaWarmLoadError::backend("backend_load", cause))?;
+            if let Some(limits) = observation_limits {
+                let execution = execution_receipt(&backend).map_err(|cause| {
+                    NativeCudaWarmLoadError::role("execution_declaration", cause)
+                })?;
+                validate_cuda_warm_observation_admission(
+                    limits,
+                    &execution,
+                    backend.private_cuda_warm_capability().is_some(),
+                )
+                .map_err(|cause| {
+                    NativeCudaWarmLoadError::backend("observation_admission", cause)
+                })?;
+            }
             match observation_limits {
                 Some(limits) => Self::new_with_cuda_warm_observations(backend, options, limits),
                 None => Self::new_with_options(backend, options),
             }
+            .map_err(|cause| NativeCudaWarmLoadError::role("owner_construction", cause))
         }
         pub fn load_pinned_with_cuda_control_policy(
             export: &std::path::Path,
@@ -4691,13 +4821,12 @@ mod native {
             #[cfg(feature = "experimental-io-binding")]
             let warm_observer = warm_observation_limits
                 .map(|limits| {
-                    if limits.max_leases != 1
-                        || limits.device_bytes_max == 0
-                        || limits.device_bytes_max > execution.execution_device_reservation()
-                        || !matches!(warm_capability, Some(NativeWarmCapability::Cuda(_)))
-                    {
-                        return Err(RoleError::InvalidOutput);
-                    }
+                    validate_cuda_warm_observation_admission(
+                        limits,
+                        &execution,
+                        matches!(warm_capability, Some(NativeWarmCapability::Cuda(_))),
+                    )
+                    .map_err(model_error)?;
                     backend
                         .enable_cuda_private_warm_observations(
                             rz_eval::pals_onnx::PalsCudaWarmRuntimeLimits {
@@ -9099,6 +9228,69 @@ mod native {
             // A transient tensor reservation never becomes a session/peak claim.
             assert!(execution < 2 * 1024 * 1024 * 1024);
         }
+        #[test]
+        fn cuda_warm_load_admission_charges_seed_and_old_new_public_kv() {
+            let config = PalsModelConfig::full_line_interaction_v2();
+            let ordinary = transient_device_layout_for_config(&config).unwrap();
+            assert_eq!(ordinary, (860033, 224974));
+            assert_eq!(
+                cuda_warm_tensor_layout_for_config(&config, false).unwrap(),
+                ordinary
+            );
+            let warm = cuda_warm_tensor_layout_for_config(&config, true).unwrap();
+            assert_eq!(warm, (884610, 423630));
+            // CPU arithmetic fixture, never a loaded capability/GPU witness.
+            let (mut execution, _) = loading_mapping_fixture();
+            execution.transient_request_device_bytes = warm.0;
+            execution.transient_execution_device_bytes = warm.1;
+            let limits = NativeCudaWarmObservationLimits {
+                max_leases: 1,
+                device_bytes_max: 397312,
+            };
+            assert!(validate_cuda_warm_observation_admission(limits, &execution, true).is_ok());
+            assert_eq!(execution.execution_device_reservation(), warm.1);
+            assert_eq!(
+                execution.runtime_device_reservation().unwrap(),
+                warm.0 + warm.1
+            );
+            for (limits, capability) in [
+                (
+                    NativeCudaWarmObservationLimits {
+                        max_leases: 2,
+                        ..limits
+                    },
+                    true,
+                ),
+                (
+                    NativeCudaWarmObservationLimits {
+                        device_bytes_max: 0,
+                        ..limits
+                    },
+                    true,
+                ),
+                (
+                    NativeCudaWarmObservationLimits {
+                        device_bytes_max: warm.1 + 1,
+                        ..limits
+                    },
+                    true,
+                ),
+                (limits, false),
+            ] {
+                let cause =
+                    validate_cuda_warm_observation_admission(limits, &execution, capability)
+                        .unwrap_err();
+                assert_eq!(cause.stage, rz_eval::error::FailureStage::Admission);
+                assert_eq!(cause.kind, rz_eval::error::FailureKind::InvalidInput);
+            }
+            execution.transient_execution_device_bytes = ordinary.1;
+            let cause =
+                validate_cuda_warm_observation_admission(limits, &execution, true).unwrap_err();
+            assert_eq!(
+                cause.detail,
+                "CUDA Warm observation payload limit exceeds the charged physical tensor reservation"
+            );
+        }
         fn loading_mapping_fixture() -> (NativeExecutionReceipt, PalsNativeMappingWitness) {
             let profile = rz_eval::onnx::NativeLoadingProfile::CuDnnShimLazyV1;
             let digest = rz_eval::asset::sha256(profile.canonical_descriptor().as_bytes());
@@ -11211,8 +11403,8 @@ pub use native::{
     NativeBackendStatsReceipt, NativeCudaLoadingIdentity, NativeCudaRecordPageSnapshotReceipt,
     NativeCudaRecordPageStatsReceipt, NativeCudaRecordPagesDeclaration,
     NativeCudaRecordPagesRegistration, NativeCudaRecordPagesResourceDeclaration,
-    NativeCudaWarmObservationLimits, NativeExecutionReceipt, NativeFailureReceipt,
-    NativeHostRecordPageBankReceipt, NativeHostRecordPageCommandReceipt,
+    NativeCudaWarmLoadError, NativeCudaWarmObservationLimits, NativeExecutionReceipt,
+    NativeFailureReceipt, NativeHostRecordPageBankReceipt, NativeHostRecordPageCommandReceipt,
     NativeHostRecordPageDeclaration, NativeHostRecordPageLimits,
     NativeHostRecordPageObservationReceipt, NativeHostRecordPageSnapshotReceipt,
     NativeHostRecordPageStatsReceipt, NativeInvocationBudget, NativeLoadFailure, NativeLoadStage,

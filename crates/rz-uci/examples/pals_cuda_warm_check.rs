@@ -78,8 +78,8 @@ mod check {
     };
     use rz_search::pals::store::{ExecutionId, PalsStores, TaskQuestion};
     use rz_uci::pals_native::{
-        NativeCudaWarmObservationLimits, NativeExecutionReceipt, NativeOwnerOptions,
-        NativePreparedContext, NativePrivateWarmPrepared, NativeQueryKind,
+        NativeCudaWarmLoadError, NativeCudaWarmObservationLimits, NativeExecutionReceipt,
+        NativeOwnerOptions, NativePreparedContext, NativePrivateWarmPrepared, NativeQueryKind,
         NativeRoleExecutionBinding, NativeRoleFinishHandle, NativeRoleModel, NativeRoleObserver,
         NativeRoleReceipt, NativeRoleRejection, NativeRoleTerminal, prepare_role_input_for_config,
     };
@@ -125,18 +125,40 @@ mod check {
     const COST_WALL: Duration = Duration::from_secs(45);
     const COST_DEVICE_BYTES_MAX: u64 = 397_312;
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     struct Failure {
         stage: &'static str,
         code: &'static str,
+        load_cause: Option<Box<NativeCudaWarmLoadError>>,
     }
     impl Failure {
         fn wire(self) -> Value {
-            json!({"stage": self.stage, "code": self.code})
+            let mut wire = json!({"stage": self.stage, "code": self.code});
+            if let Some(failure) = self.load_cause {
+                // Static backend detail and bounded cause identity only. Raw
+                // native messages, tensor buffers and private paths stay out.
+                let backend = failure.backend.as_ref().map(|error| json!({
+                    "kind":format!("{:?}",error.kind),"stage":format!("{:?}",error.stage),
+                    "detail":error.detail,"cause":error.cause.map(|cause| json!({
+                        "code":format!("{:?}",cause.code),"prefix_sha256":hex(&cause.prefix_sha256),
+                        "hashed_bytes":cause.hashed_bytes,"truncated":cause.truncated,
+                        "formatting_failed":cause.formatting_failed
+                    })),"raw_native_text_published":false
+                }));
+                wire["load_diagnostic"] = json!({"stage":failure.stage,
+                    "role_kind":role_error_code(&failure.cause),"backend":backend,
+                    "original_cause_retained_until_projection":true,
+                    "physical_run_or_completion_claim":false});
+            }
+            wire
         }
     }
     fn fail(stage: &'static str, code: &'static str) -> Failure {
-        Failure { stage, code }
+        Failure {
+            stage,
+            code,
+            load_cause: None,
+        }
     }
     fn require(condition: bool, stage: &'static str, code: &'static str) -> Result<(), Failure> {
         if condition {
@@ -146,17 +168,24 @@ mod check {
         }
     }
     fn role_failure(stage: &'static str, error: RoleError) -> Failure {
-        fail(
-            stage,
-            match error {
-                RoleError::Unavailable => "unavailable",
-                RoleError::InvalidOutput => "invalid_output",
-                RoleError::Canceled => "canceled",
-                RoleError::Deadline => "deadline",
-                RoleError::PhysicalCompletionUnknown => "physical_completion_unknown",
-                RoleError::Backend(_) => "backend_error",
-            },
-        )
+        fail(stage, role_error_code(&error))
+    }
+    fn role_error_code(error: &RoleError) -> &'static str {
+        match error {
+            RoleError::Unavailable => "unavailable",
+            RoleError::InvalidOutput => "invalid_output",
+            RoleError::Canceled => "canceled",
+            RoleError::Deadline => "deadline",
+            RoleError::PhysicalCompletionUnknown => "physical_completion_unknown",
+            RoleError::Backend(_) => "backend_error",
+        }
+    }
+    fn cuda_warm_load_failure(error: NativeCudaWarmLoadError) -> Failure {
+        Failure {
+            stage: "load_cuda_private_warm",
+            code: role_error_code(&error.cause),
+            load_cause: Some(Box::new(error)),
+        }
     }
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -2575,28 +2604,29 @@ mod check {
         };
         let profile_root = args.values.get("--profile-root").map(PathBuf::from);
         let load_started = Instant::now();
-        let native = NativeRoleModel::load_with_runtime_and_cuda_private_warm_and_observations(
-            &args.path("--export-manifest")?,
-            args.value("--export-manifest-sha256")?,
-            runtime,
-            PalsOnnxConfig {
-                provider: Provider::Cuda {
-                    device_id: 0,
-                    arena_bytes: 256 * 1024 * 1024,
+        let native =
+            NativeRoleModel::load_with_runtime_and_cuda_private_warm_and_observations_diagnostic(
+                &args.path("--export-manifest")?,
+                args.value("--export-manifest-sha256")?,
+                runtime,
+                PalsOnnxConfig {
+                    provider: Provider::Cuda {
+                        device_id: 0,
+                        arena_bytes: 256 * 1024 * 1024,
+                    },
+                    intra_threads: 1,
+                    cache_public_memory: true,
+                    device_public_memory: true,
+                    cudnn_conv_search: cuda_conv_selection(args)?,
                 },
-                intra_threads: 1,
-                cache_public_memory: true,
-                device_public_memory: true,
-                cudnn_conv_search: cuda_conv_selection(args)?,
-            },
-            NativeOwnerOptions {
-                drain_limit: CLEANUP,
-                host_record_pages: None,
-            },
-            control.zip(profile_root.as_deref()),
-            Some(owner_limits),
-        )
-        .map_err(|error| role_failure("load_cuda_private_warm", error))?;
+                NativeOwnerOptions {
+                    drain_limit: CLEANUP,
+                    host_record_pages: None,
+                },
+                control.zip(profile_root.as_deref()),
+                Some(owner_limits),
+            )
+            .map_err(cuda_warm_load_failure)?;
         let handle = native.finish_handle();
         let source = native.source_identity();
         let native = Arc::new(Mutex::new(native));
@@ -3019,7 +3049,7 @@ mod check {
             "fresh_vs_seeded_equality_required": false, "same_seed_independent_reference_required": true,
             "startup_receipt": startup, "actual_search": search, "actual_search_rechecks": capture.rechecks,
             "resume": resume.as_ref().and_then(|v| v.as_ref().ok()),
-            "failure": work_failure.or_else(|| resume.as_ref().and_then(|v| v.as_ref().err().copied()))
+            "failure": work_failure.or_else(|| resume.as_ref().and_then(|v| v.as_ref().err().cloned()))
                 .or_else(|| (cpu_resume["passed"] != true).then(|| fail("cpu_scheduler_resume", "actual_pause_repair_c_resume_not_exercised")))
                 .or_else(|| (!owner_accounting).then(|| fail("cuda_warm_owner", "actual_owner_accounting_or_closure_missing")))
                 .map(Failure::wire),
@@ -3818,6 +3848,46 @@ mod check {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn cuda_warm_load_diagnostic_keeps_original_typed_cause_and_static_guard() {
+            use rz_eval::error::{BackendError, CauseCode, FailureKind, FailureStage};
+            let original = BackendError::new(FailureKind::InvalidInput, FailureStage::Admission,
+                "CUDA Warm observation payload limit exceeds the charged physical tensor reservation")
+                .with_external_cause(CauseCode::OutputValidation, &"synthetic original cause");
+            let expected_cause = original.cause.unwrap();
+            let failure = cuda_warm_load_failure(NativeCudaWarmLoadError {
+                stage: "observation_admission",
+                cause: RoleError::InvalidOutput,
+                backend: Some(Box::new(original.clone())),
+            });
+            assert_eq!(
+                failure.load_cause.as_ref().unwrap().backend.as_deref(),
+                Some(&original)
+            );
+            let wire = failure.wire();
+            assert_eq!(wire["code"], "invalid_output");
+            assert_eq!(wire["load_diagnostic"]["stage"], "observation_admission");
+            assert_eq!(
+                wire["load_diagnostic"]["backend"]["detail"],
+                original.detail
+            );
+            assert_eq!(
+                wire["load_diagnostic"]["backend"]["cause"]["prefix_sha256"],
+                hex(&expected_cause.prefix_sha256)
+            );
+            assert_eq!(
+                wire["load_diagnostic"]["backend"]["raw_native_text_published"],
+                false
+            );
+            assert_eq!(
+                wire["load_diagnostic"]["physical_run_or_completion_claim"],
+                false
+            );
+            let raw = serde_json::to_string(&wire).unwrap();
+            assert!(!raw.contains("synthetic original cause"));
+            let legacy = fail("synthetic", "unchanged").wire();
+            assert_eq!(legacy, json!({"stage":"synthetic","code":"unchanged"}));
+        }
         use super::*;
 
         #[test]
