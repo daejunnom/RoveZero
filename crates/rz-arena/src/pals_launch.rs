@@ -1034,7 +1034,7 @@ impl PalsCudaLoadingBindingV1 {
 pub enum PalsEndpointLaunchV3 {
     LegalOrderMock(PalsSearchLaunchV3),
     OnnxCpu(PalsOnnxLaunchV3),
-    OnnxCuda(PalsOnnxCudaLaunchV3),
+    OnnxCuda(Box<PalsOnnxCudaLaunchV3>),
     OwnCpu {
         max_depth: u16,
         max_nodes: u64,
@@ -7117,7 +7117,7 @@ mod tests {
         f.semantic_lock.manifest.resources[0].requested_gpu = Some("RTX 4050 6GB".into());
         f.semantic_lock.manifest.resources[0].device_allocation_max_bytes = 6 << 30;
         f.semantic_lock = f.semantic_lock.manifest.lock().unwrap();
-        f.endpoints[0] = PalsEndpointLaunchV3::OnnxCuda(PalsOnnxCudaLaunchV3 {
+        f.endpoints[0] = PalsEndpointLaunchV3::OnnxCuda(Box::new(PalsOnnxCudaLaunchV3 {
             model,
             cuda_bundle: bundle,
             device_id: 0,
@@ -7125,7 +7125,7 @@ mod tests {
             cuda_control: None,
             startup_probe_timeout_ms: None,
             cuda_record_pages: None,
-        });
+        }));
         f.budget.max_runtime_bytes = 4 << 30;
         f.budget.max_artifact_bytes = 8 << 30;
         (f, descriptor)
