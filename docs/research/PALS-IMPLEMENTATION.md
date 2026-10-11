@@ -3754,3 +3754,18 @@ system linker cache 준비는 별도 환경 작업으로 다룬다. 다른 버�
 Colab 관측 프로필을 선택해도 현재 V4 대국의 Rust 자원 인수가 자동으로 완화되지 않는다.
 실제 적용되지 않은 strict-local 메모리 제한은 인수 증거로 기록하지 않으며, 클라우드
 관측 대국을 제공하려면 별도의 명시적 실행·영수증 경계를 먼저 검증한다.
+### Colab 관측 자원과 명시 CUDA 제어 검사
+
+PALS V4 launch의 선택 필드 `resource_profile: {"profile":"colab_observed"}`는
+own-checker PALS 두 엔진의 기능 pilot만 허용한다. 필드가 없으면 기존 strict
+자원 인수와 canonical bytes를 유지한다. Colab 경로는 두 CPU affinity를 검증하고,
+상속된 cgroup 값의 숫자·`max`·미관측 상태를 시작·종료 및 실패 자료에 따로 남긴다.
+요청한 6/12GiB 값을 적용됐다고 기록하지 않으며 Core 자원 인수는 `Unknown`,
+pair·기력·성능 인수는 false로 유지한다. 모델·시계·물리 완료·프로세스 정리 검사는 유지한다.
+
+`pals_followup_run.py model-check --provider cuda-control`은 export에 묶인
+정적 metadata inventory와 SHA를 명시적으로 요구한다. 이는 기존 Rust의
+provenance 재계산·pre-Run placement·실제 neural CUDA kernel 검사를 호출한다.
+정적 inventory나 `readyok`만으로 실제 CUDA 성공을 보고하지 않는다. 일반 CUDA·CPU
+경로에 inventory를 섞지 않으며 blanket CPU fallback을 도입하지 않는다.
+

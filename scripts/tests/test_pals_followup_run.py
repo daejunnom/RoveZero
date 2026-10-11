@@ -97,6 +97,41 @@ class FollowupPlanTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             wrapper.model_plan(args, self.root / "validator")
 
+    def test_cuda_control_inventory_is_explicit_pinned_and_bound_to_export(self):
+        export = self.root / "control-export.json"
+        export_sha = self.write(export, {"config": {}})
+        fixtures, runtime, bundle = (self.root / name for name in ("fixtures", "runtime", "bundle"))
+        for path in (fixtures, runtime, bundle):
+            path.write_bytes(b"pinned input")
+        digest = hashlib.sha256(b"pinned input").hexdigest()
+        inventory = self.root / "inventory.json"
+        value = {"schema": "rovezero.pals-static-control-inventory.v2",
+                 "manifest_sha256": export_sha, "actual_provider_placement": "not_observed",
+                 "cpu_allowlist": "not_created"}
+        inventory_sha = self.write(inventory, value)
+        args = argparse.Namespace(export=export, export_sha256=export_sha,
+            model_profile="legacy_summary_v1", fixtures=fixtures, fixtures_sha256=digest,
+            runtime=runtime, runtime_sha256=digest, model_report=self.output / "numeric.json",
+            runtime_cache=self.output, provider="cuda-control", cuda_bundle=bundle,
+            cuda_bundle_sha256=digest, control_inventory=inventory,
+            control_inventory_sha256=inventory_sha)
+        command, evidence = wrapper.model_plan(args, self.root / "validator")
+        self.assertEqual(command[-2:], [str(inventory), inventory_sha])
+        self.assertTrue(evidence["native_placement_audit_required"])
+        for alteration in ("ordinary_provider", "partial_pin", "another_export", "invented_placement"):
+            invalid = copy.copy(args)
+            if alteration == "ordinary_provider":
+                invalid.provider = "cuda"
+            elif alteration == "partial_pin":
+                invalid.control_inventory_sha256 = None
+            else:
+                changed = dict(value)
+                changed["manifest_sha256" if alteration == "another_export" else "actual_provider_placement"] = "unknown"
+                invalid.control_inventory_sha256 = self.write(inventory, changed)
+            with self.subTest(alteration=alteration), self.assertRaises(ValueError):
+                wrapper.model_plan(invalid, self.root / "validator")
+            inventory.write_text(json.dumps(value), encoding="utf-8")
+
     def gc_args(self, value):
         path = self.root / "external-gc.json"
         digest = self.write(path, value)
@@ -157,6 +192,7 @@ class FollowupPlanTests(unittest.TestCase):
 
     def test_colab_planning_uses_separate_schema_and_never_spawns(self):
         lock = self.fixture()
+        lock["input"]["resource_profile"] = {"profile": "colab_observed"}
         args = self.args(lock)
         binary = self.root / "runner"
         binary.write_bytes(b"registered fixture")
@@ -178,6 +214,27 @@ class FollowupPlanTests(unittest.TestCase):
         self.assertFalse(evidence["native_arena_policy_relaxed"])
         self.assertEqual(evidence["actual_resources"], "unknown")
         self.assertEqual(evidence["external_GC"]["actual_full_gc_calls"], "unknown")
+        self.assertEqual(evidence["native_arena_resource_profile"], "colab_observed")
+        self.assertFalse(evidence["pilot_pair_eligible"])
+
+    def test_arena_wrapper_profile_must_match_the_explicit_native_lock(self):
+        value = self.fixture()
+        args = self.args(value)
+        args.resource_profile = "colab-observed"
+        with self.assertRaises(ValueError):
+            wrapper.arena_plan(args, self.root / "runner")
+        value["input"]["resource_profile"] = {"profile": "colab_observed"}
+        args = self.args(value)
+        with self.assertRaises(ValueError):
+            wrapper.arena_plan(args, self.root / "runner")
+        args.resource_profile = "colab-observed"
+        _, evidence = wrapper.arena_plan(args, self.root / "runner")
+        self.assertFalse(evidence["pilot_pair_eligible"])
+        value["input"]["resource_profile"]["skip_lifetime_checks"] = True
+        args = self.args(value)
+        args.resource_profile = "colab-observed"
+        with self.assertRaises(ValueError):
+            wrapper.arena_plan(args, self.root / "runner")
 
 
 class DriverLookupTests(unittest.TestCase):

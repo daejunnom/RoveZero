@@ -93,8 +93,8 @@ def unique_object(pairs):
     return value
 
 
-def bounded_json(path):
-    path = regular(path, 256 * 1024)
+def bounded_json(path, maximum=256 * 1024):
+    path = regular(path, maximum)
     return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object,
                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
 
@@ -328,6 +328,13 @@ def arena_plan(args, binary):
             or lock.get("input", {}).get("domain") != "rz-pals-arena-launch-v4/1"):
         raise ValueError("an actual locked V4 arena envelope is required")
     sha(lock["sha256"])
+    native_profile = lock["input"].get("resource_profile")
+    wrapper_profile = getattr(args, "resource_profile", "strict-local")
+    if wrapper_profile == "colab-observed":
+        if native_profile != {"profile": "colab_observed"}:
+            raise ValueError("Colab arena requires an explicitly locked native colab_observed resource profile")
+    elif native_profile is not None:
+        raise ValueError("strict-local wrapper cannot select a Colab-observed native arena lock")
     value = lock["input"]["semantic_lock"]["manifest"]
     pilot = value["pilot"]
     if (value.get("schema_version") != 4 or value.get("contract_revision") != "pals/0.2"
@@ -351,10 +358,15 @@ def arena_plan(args, binary):
     output = outside_git(args.output_root)
     if not assets.is_absolute() or not assets.is_dir() or not output.is_dir() or (output / args.label).exists():
         raise ValueError("existing absolute asset/output roots and fresh attempt label required")
-    return [str(binary), args.stage, str(lock_path), str(assets), str(output), args.label], {
+    evidence = {
         "lock_file_sha256": args.lock_sha256, "arena_launch_sha256": lock["sha256"],
         "pilot": pilot, "resource_declarations_checked": True, "native_policy_admission": "Rust V4 owner before spawn",
     }
+    if native_profile is not None:
+        evidence.update(native_arena_resource_profile="colab_observed",
+                        native_policy_admission="Rust V4 owner: explicit inherited observations; strict Core resource match remains Unknown",
+                        pilot_pair_eligible=False, strength_eligible=False)
+    return [str(binary), args.stage, str(lock_path), str(assets), str(output), args.label], evidence
 
 
 def model_plan(args, binary):
@@ -383,8 +395,28 @@ def model_plan(args, binary):
         command.append(str(bundle))
     elif args.cuda_bundle is not None or args.cuda_bundle_sha256 is not None:
         raise ValueError("CPU validation cannot silently inherit CUDA assets")
+    inventory_path = getattr(args, "control_inventory", None)
+    inventory_sha = getattr(args, "control_inventory_sha256", None)
+    control = args.provider in ("cuda-control", "cuda-control-shim")
+    if control:
+        if inventory_path is None or inventory_sha is None:
+            raise ValueError("CUDA control validation requires an explicit pinned metadata inventory")
+        inventory = pinned(inventory_path, inventory_sha, 1024 * 1024)
+        static = bounded_json(inventory, 1024 * 1024)
+        if (static.get("schema") != "rovezero.pals-static-control-inventory.v2"
+                or static.get("manifest_sha256") != args.export_sha256
+                or static.get("actual_provider_placement") != "not_observed"
+                or static.get("cpu_allowlist") != "not_created"):
+            raise ValueError("static control inventory does not describe this exact export")
+        # Native Rust reconstructs provenance and audits placement before Run.
+        # Static input alone grants neither blanket CPU fallback nor CUDA success.
+        command.extend((str(inventory), inventory_sha))
+    elif inventory_path is not None or inventory_sha is not None:
+        raise ValueError("metadata inventory requires an explicit CUDA control provider")
     return command, {"model_profile": profile, "export_sha256": args.export_sha256,
                      "fixture_sha256": args.fixtures_sha256, "provider": args.provider,
+                     "cuda_control_inventory_sha256": inventory_sha if control else None,
+                     "native_placement_audit_required": control,
                      "numeric_reference_only": True, "strength_eligible": False}
 
 
@@ -418,9 +450,11 @@ def main():
     model.add_argument("--runtime-sha256", required=True)
     model.add_argument("--runtime-cache", type=Path, required=True)
     model.add_argument("--model-report", type=Path, required=True)
-    model.add_argument("--provider", choices=("cpu", "cuda", "cuda-device"), default="cpu")
+    model.add_argument("--provider", choices=("cpu", "cuda", "cuda-device", "cuda-control", "cuda-control-shim"), default="cpu")
     model.add_argument("--cuda-bundle", type=Path)
     model.add_argument("--cuda-bundle-sha256")
+    model.add_argument("--control-inventory", type=Path)
+    model.add_argument("--control-inventory-sha256")
     args = parser.parse_args()
     if not 1 <= args.seconds <= 3600 or any(cpu < 0 for cpu in args.cpu_affinity) or len(set(args.cpu_affinity)) != 2:
         parser.error("finite 1..3600s window and two distinct nonnegative CPU IDs required")

@@ -10,6 +10,9 @@ use rz_experiments::*;
 
 mod followup;
 pub use followup::*;
+#[path = "v4_resources.rs"]
+mod resources;
+pub use resources::*;
 #[cfg(any(feature = "pals-collection-onnx", feature = "native-cuda"))]
 mod lifecycle;
 
@@ -52,6 +55,9 @@ pub struct PalsArenaLaunchV4 {
     pub budget: NativeResourceBudgetV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub followup_execution: Option<PalsFollowupExecutionBindingV4>,
+    /// Absence preserves the strict inherited-resource admission and its wire bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_profile: Option<PalsArenaResourceProfileV4>,
 }
 #[derive(Clone, Debug)]
 pub struct LockedPalsArenaLaunchV4 {
@@ -61,6 +67,8 @@ pub struct LockedPalsArenaLaunchV4 {
     endpoint_views: [ExternalUciEndpointV2; 2],
     #[cfg(target_os = "linux")]
     archive_roots: std::sync::Arc<std::sync::Mutex<BTreeMap<usize, followup::ArchiveRootPins>>>,
+    #[cfg(target_os = "linux")]
+    resource_observations: std::sync::Arc<std::sync::Mutex<Vec<PalsArenaResourceObservationV4>>>,
 }
 fn requested_options(engine: &PalsEngineV4) -> &BTreeMap<String, String> {
     match engine {
@@ -491,6 +499,7 @@ impl PalsArenaLaunchV4 {
     pub fn validate(&self) -> Result<(), ArenaError> {
         self.semantic_lock.verify()?;
         require(self.domain == PALS_ARENA_V4_DOMAIN, "wrong V4 arena domain")?;
+        resources::validate_profile(self)?;
         let m = &self.semantic_lock.manifest;
         require(
             m.purpose == PalsRunPurposeV4::ArenaPilot,
@@ -609,6 +618,8 @@ impl PalsArenaLaunchV4 {
             endpoint_views: [self.endpoint(0)?, self.endpoint(1)?],
             #[cfg(target_os = "linux")]
             archive_roots: Default::default(),
+            #[cfg(target_os = "linux")]
+            resource_observations: Default::default(),
         })
     }
     pub fn runner_status_patch(&self) -> Result<PalsRunnerStatusPatchV3, ArenaError> {
@@ -1506,10 +1517,18 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV4 {
     }
     fn pair_metadata_cap(&self) -> u64 {
         V4_METADATA_CAP
+            + if self.input.resource_profile.is_some() {
+                resources::FAILURE_METADATA_CAP
+            } else {
+                0
+            }
     }
     fn amend_execution_limitations(&self, limitations: &mut Vec<String>) {
         limitations.push("V4 frozen P/C paired pilot; model/profile, resolver, checker, recheck, stack and CUDA flags are separately locked and checked against actual producer getters; no training or Elo promotion".into());
         limitations.push("Shared V3 physical resource DTOs preserve their exact meaning; the V4 semantic lock and raw domains are never coerced to historical IDs".into());
+        if self.input.resource_profile.is_some() {
+            limitations.push("Explicit Colab-observed functional pilot: inherited cgroup values are observations separate from requested local targets; no strict-local resource, performance, pair or strength eligibility".into());
+        }
     }
     fn seed(&self) -> u64 {
         self.input.semantic_lock.manifest.pilot.seed
@@ -1662,7 +1681,7 @@ impl NativeProviderDeclaration for LockedPalsArenaLaunchV4 {
     fn validate_runtime_admission(&self) -> Result<(), ArenaError> {
         self.input.require_reap_status_runner()?;
         self.input.require_actual_native_epoch()?;
-        verify_pals_inherited_resources_v4(self).map(|_| ())
+        resources::admit(self, "before_native_spawn").map(|_| ())
     }
     #[cfg(target_os = "linux")]
     fn validate_external_preflight(
@@ -2274,15 +2293,21 @@ fn endpoint_v4_receipt(
         verified,
         "owner copied verified original handle into distinct synced read-only inode; pinned executable/input handles consumed by audited runner/native loading and retired after process/physical cleanup",
     );
-    let affinity = verify_pals_inherited_resources_v4(lock)?;
+    let affinity = resources::admit(lock, "endpoint_receipt_after_process_exit")?;
     out.base.actual_affinity = observed(
         affinity,
         "actual /proc/self affinity after inherited native admission; child affinity is separately attested for external checker",
     );
-    out.checks.resource_limits = observed(
-        lock.input.semantic_lock.manifest.resources[index].clone(),
-        "actual /proc/self affinity and cgroup-v2 memory.high/max/swap.max independently rechecked; requested device index only, no VRAM peak claim",
-    );
+    out.checks.resource_limits = if lock.input.resource_profile.is_some() {
+        // Actual numeric/max/unknown values are retained in the separate assembly
+        // observation. Requested local limits cannot become observed matches.
+        PalsObservedV3::Unknown
+    } else {
+        observed(
+            lock.input.semantic_lock.manifest.resources[index].clone(),
+            "actual /proc/self affinity and cgroup-v2 memory.high/max/swap.max independently rechecked; requested device index only, no VRAM peak claim",
+        )
+    };
     if work.is_some() {
         out.checks.physical_work_accounting = observed(
             true,
@@ -2480,6 +2505,14 @@ pub fn verify_pals_inherited_resources_v4(
         )?;
     }
     Ok(actual)
+}
+
+/// Explicit profile-aware admission. The historical verifier above stays strict.
+#[cfg(target_os = "linux")]
+pub fn verify_pals_runtime_resources_v4(
+    spec: &LockedPalsArenaLaunchV4,
+) -> Result<Vec<u32>, ArenaError> {
+    resources::admit(spec, "explicit_execute_before_preparation")
 }
 
 #[cfg(target_os = "linux")]
@@ -3062,6 +3095,9 @@ pub struct PalsCoreAssemblyV4 {
     pub core: Option<PalsRunReceiptV4>,
     pub assembly_error: Option<String>,
     pub training_executed: bool,
+    /// Colab observations never replace Core's strict resource-limit checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_observations: Option<Vec<PalsArenaResourceObservationV4>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -3076,7 +3112,8 @@ pub fn assemble_pals_core_receipt_v4(
         native_receipt: native.receipt_artifact.clone(), wall_time_ms: Some(output.wall_time_ms), cleanup_time_ms,
         timing_scope: "UCI preflight through mandatory arena postcheck/receipt; snapshot preparation separate; cleanup is supervisor-owned measured interval".into(),
         game_process_correspondence: "pinned Fastchess 1.8.2 source: one synchronous worker, restart=on, recover=false; TRACE/renderer game id and color plus finished-white-exit-black-exit windows; separate native/owned-group completion gates required".into(),
-        work: vec![], pgn_provenance: None, core: None, assembly_error: None, training_executed: false };
+        work: vec![], pgn_provenance: None, core: None, assembly_error: None, training_executed: false,
+        resource_observations: None };
     let result: Result<PalsRunReceiptV4, ArenaError> = (|| {
         lock.input.require_reap_status_runner()?;
         lock.input.require_actual_native_epoch()?;
@@ -3247,7 +3284,7 @@ pub fn assemble_pals_core_receipt_v4(
             policy_failures:BTreeSet::new(),
             wall_time_ms: output.wall_time_ms,
             cleanup_time_ms: cleanup,
-            pair_eligible: output_bytes.is_some() && failures.is_empty() && games.iter().all(|game|game.engines.iter().all(endpoint_admitted)),
+            pair_eligible: lock.input.resource_profile.is_none() && output_bytes.is_some() && failures.is_empty() && games.iter().all(|game|game.engines.iter().all(endpoint_admitted)),
             failures,
             games,
         };
@@ -3257,6 +3294,17 @@ pub fn assemble_pals_core_receipt_v4(
     match result {
         Ok(core) => assembly.core = Some(core),
         Err(error) => assembly.assembly_error = Some(error.to_string()),
+    }
+    if lock.input.resource_profile.is_some() {
+        match lock.resource_observations.lock() {
+            Ok(observations) => assembly.resource_observations = Some(observations.clone()),
+            Err(_) => {
+                assembly.core = None;
+                assembly.assembly_error = Some(
+                    "Colab resource observation owner poisoned; original evidence retained".into(),
+                );
+            }
+        }
     }
     assembly
 }
@@ -3360,7 +3408,7 @@ pub fn save_pals_core_assembly_v4(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn fixture() -> PalsArenaLaunchV4 {
+    pub(super) fn fixture() -> PalsArenaLaunchV4 {
         let old = super::super::tests::fixture();
         let mut base = match &old.semantic_lock.manifest.engines[0] {
             PalsEngineV3::Pals(e) => e.as_ref().clone(),
@@ -3445,7 +3493,68 @@ mod tests {
             endpoints: old.endpoints,
             budget: old.budget,
             followup_execution: None,
+            resource_profile: None,
         }
+    }
+    pub(super) fn colab_fixture() -> PalsArenaLaunchV4 {
+        let mut input = fixture();
+        let mut manifest = input.semantic_lock.manifest.clone();
+        let mut candidate = manifest.engines[0].clone();
+        let PalsEngineV4::Pals(endpoint) = &mut candidate else {
+            unreachable!()
+        };
+        endpoint.base.id = manifest.engines[1].id().into();
+        manifest.engines[1] = candidate;
+        manifest.declared_changes = manifest.actual_change_axes();
+        input.semantic_lock = manifest.lock().unwrap();
+        input.endpoints[1] = input.endpoints[0].clone();
+        input.resource_profile = Some(PalsArenaResourceProfileV4::ColabObserved {});
+        input
+    }
+    #[test]
+    fn colab_profile_is_explicit_and_absent_strict_wire_bytes_are_preserved() {
+        let input = fixture();
+        let canonical = crate::canonical_sha256(&input).unwrap();
+        let mut value = serde_json::to_value(&input).unwrap();
+        assert!(value.get("resource_profile").is_none());
+        let decoded = PalsArenaLaunchV4::from_json(&value.to_string()).unwrap();
+        assert_eq!(crate::canonical_sha256(&decoded).unwrap(), canonical);
+        value["resource_profile"] = serde_json::Value::Null;
+        let decoded = PalsArenaLaunchV4::from_json(&value.to_string()).unwrap();
+        assert_eq!(crate::canonical_sha256(&decoded).unwrap(), canonical);
+        let cloud = colab_fixture();
+        cloud.validate().unwrap();
+        let cloud_bytes = serde_json::to_value(&cloud).unwrap();
+        assert_eq!(
+            cloud_bytes["resource_profile"],
+            serde_json::json!({"profile":"colab_observed"})
+        );
+        let cloud_lock = cloud.lock().unwrap();
+        assert_eq!(
+            LockedPalsArenaLaunchV4::from_json(&cloud_lock.to_json().unwrap())
+                .unwrap()
+                .sha256(),
+            cloud_lock.sha256()
+        );
+        assert_ne!(cloud_lock.sha256(), canonical);
+    }
+    #[test]
+    fn cloud_lane_does_not_expand_external_or_inconsistent_resource_admission() {
+        let mut old = fixture();
+        old.resource_profile = Some(PalsArenaResourceProfileV4::ColabObserved {});
+        assert!(old.validate().is_err()); // The second endpoint is OwnCpu, not PALS.
+        let mut value = serde_json::to_value(colab_fixture()).unwrap();
+        value["resource_profile"] = serde_json::json!({"profile":"strict_local"});
+        assert!(PalsArenaLaunchV4::from_json(&value.to_string()).is_err());
+        value["resource_profile"] =
+            serde_json::json!({"profile":"colab_observed","skip_physical_completion":true});
+        assert!(PalsArenaLaunchV4::from_json(&value.to_string()).is_err());
+        let mut cloud = colab_fixture();
+        let mut manifest = cloud.semantic_lock.manifest.clone();
+        manifest.resources[0].swap_max_bytes = 1;
+        manifest.resources[1].swap_max_bytes = 1;
+        cloud.semantic_lock = manifest.lock().unwrap();
+        assert!(cloud.validate().is_err());
     }
     #[test]
     fn v4_executes_actual_explicit_flags_and_preserves_v3_lock_bytes() {

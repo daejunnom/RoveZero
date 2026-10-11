@@ -100,9 +100,14 @@ fn prepare_or_execute(args: &[String], execute: bool) -> Result<(), Box<dyn Erro
         }
     }
     if execute {
-        let affinity = verify_pals_inherited_resources_v4(&lock)?;
+        let affinity = verify_pals_runtime_resources_v4(&lock)?;
         eprintln!(
-            "pals_inherited_affinity={affinity:?} cgroup_memory_limits=verified gpu_peak=unknown"
+            "pals_inherited_affinity={affinity:?} cgroup_memory_limits={} gpu_peak=unknown",
+            if lock.input().resource_profile.is_some() {
+                "colab_observed_not_strict_admission"
+            } else {
+                "verified"
+            }
         );
     }
     let owner =
@@ -151,6 +156,16 @@ fn prepare_or_execute(args: &[String], execute: bool) -> Result<(), Box<dyn Erro
             Ok(())
         }
         Err(failure) => {
+            match save_pals_colab_failure_resources_v4(&failure) {
+                Ok(Some(artifact)) => eprintln!(
+                    "pals_colab_failure_resources={} sha256={} bytes={} strict_local_resources_admitted=false strength_eligible=false",
+                    artifact.path, artifact.sha256, artifact.bytes,
+                ),
+                Ok(None) => {}
+                Err(error) => eprintln!(
+                    "Colab failure resource evidence save failed: {error}; original failure and owner retained",
+                ),
+            }
             eprintln!(
                 "PALS pair failed: {failure}; original evidence and unresolved ownership are retained"
             );
