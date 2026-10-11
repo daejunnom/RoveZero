@@ -7100,6 +7100,8 @@ mod tests {
                 "bytes":f.artifact.bytes,"sha256":f.artifact.sha256})).collect::<Vec<_>>()}))
         .unwrap();
         let mut bundle = CudaBundleBindingV1 {
+            schema_version: None,
+            loader_aliases: None,
             manifest: asset("runtime/bundle.json"),
             canonical_sha256: "0".repeat(64),
             files,
@@ -8129,6 +8131,56 @@ mod tests {
             !cache_argument.contains(output_root.to_str().unwrap())
                 && !cache_argument.contains("second-attempt")
         );
+    }
+    #[test]
+    fn pals_cuda_alias_v2_descriptor_matches_native_codec_without_rewriting_v1() {
+        let (mut input, old_descriptor) = cuda_fixture();
+        let original = input.lock().unwrap().to_json().unwrap();
+        let PalsEndpointLaunchV3::OnnxCuda(cuda) = &mut input.endpoints[0] else {
+            unreachable!()
+        };
+        let bundle = &mut cuda.cuda_bundle;
+        bundle.schema_version = Some(2);
+        bundle.loader_aliases = Some(
+            bundle
+                .files
+                .iter()
+                .filter(|file| file.filename.starts_with("libcudnn"))
+                .map(|file| rz_experiments::CudaBundleAliasBindingV2 {
+                    filename: format!("{}.8.0", file.filename),
+                    target: file.filename.clone(),
+                })
+                .collect(),
+        );
+        let descriptor = serde_json::to_vec(&serde_json::json!({"schema_version":2,
+            "loader_aliases":bundle.loader_aliases,
+            "files":bundle.files.iter().map(|f|serde_json::json!({"role":f.role,
+                "filename":f.filename,"bytes":f.artifact.bytes,"sha256":f.artifact.sha256})).collect::<Vec<_>>()})).unwrap();
+        bundle.manifest.sha256 = digest(&descriptor);
+        bundle.manifest.bytes = descriptor.len() as u64;
+        bundle.canonical_sha256 = bundle.canonical_digest().unwrap();
+        let native = rz_eval::runtime_pin::CudaRuntimeBundleSpec::from_json(
+            std::str::from_utf8(&descriptor).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            bundle.canonical_sha256,
+            native
+                .digest()
+                .unwrap()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        let lock = input.lock().unwrap();
+        lock.validate_cuda_bundle(NativeEngineRole::Baseline, &descriptor)
+            .unwrap();
+        assert!(
+            lock.validate_cuda_bundle(NativeEngineRole::Baseline, &old_descriptor)
+                .is_err()
+        );
+        let (old_input, _) = cuda_fixture();
+        assert_eq!(old_input.lock().unwrap().to_json().unwrap(), original);
     }
     #[test]
     fn pals_cuda_recipe_pins_nineteen_libraries_without_cpu_or_lc0_fallback() {

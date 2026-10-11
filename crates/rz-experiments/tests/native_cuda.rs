@@ -15,6 +15,8 @@ fn artifact(path: &str, bytes: u64) -> ArtifactRef {
 
 fn bundle() -> CudaBundleBindingV1 {
     let mut bundle = CudaBundleBindingV1 {
+        schema_version: None,
+        loader_aliases: None,
         manifest: artifact("runtime/bundle.json", 128),
         canonical_sha256: "f".repeat(64),
         files: CUDA_BUNDLE_FILENAMES
@@ -173,6 +175,99 @@ fn bundle_binary_codec_matches_independently_encoded_c_golden_vector() {
         bundle().canonical_digest().unwrap()
     );
     assert_eq!(reversed.total_bytes().unwrap(), 19);
+}
+
+#[test]
+fn bundle_alias_v2_codec_matches_independent_vector_and_keeps_v1_wire() {
+    let original = bundle();
+    let old_wire = serde_json::to_string(&original).unwrap();
+    let old_value: Value = serde_json::from_str(&old_wire).unwrap();
+    assert!(old_value.get("schema_version").is_none());
+    assert!(old_value.get("loader_aliases").is_none());
+    let mut v2 = original.clone();
+    v2.schema_version = Some(2);
+    v2.loader_aliases = Some(
+        v2.files
+            .iter()
+            .filter(|file| file.filename.starts_with("libcudnn"))
+            .map(|file| CudaBundleAliasBindingV2 {
+                filename: format!("{}.8.0", file.filename),
+                target: file.filename.clone(),
+            })
+            .collect(),
+    );
+    v2.canonical_sha256 = v2.canonical_digest().unwrap();
+    // Independently encoded with Python struct/hashlib: nineteen filename-sorted
+    // bytes=1 / 0xaa digest files and eight sorted cuDNN 9.8.0 loader aliases.
+    assert_eq!(
+        v2.canonical_sha256,
+        "e6bbd0ac84abd42128c11c35e5d057eaf72958f04229ef2d63aa3ddfa7aba81f"
+    );
+    v2.validate().unwrap();
+    let mut reversed = v2.clone();
+    reversed.files.reverse();
+    reversed.loader_aliases.as_mut().unwrap().reverse();
+    assert_eq!(reversed.canonical_digest().unwrap(), v2.canonical_sha256);
+    let wire = serde_json::to_string(&v2).unwrap();
+    let parsed: CudaBundleBindingV1 = decode_json(&wire).unwrap();
+    assert_eq!(parsed, v2);
+    assert_eq!(serde_json::to_string(&original).unwrap(), old_wire);
+    assert_eq!(
+        original.canonical_digest().unwrap(),
+        bundle().canonical_digest().unwrap()
+    );
+}
+
+#[test]
+fn bundle_alias_v2_rejects_mixed_null_empty_foreign_and_duplicate_declarations() {
+    let original = bundle();
+    let aliases = vec![CudaBundleAliasBindingV2 {
+        filename: "libcudnn.so.9.8.0".into(),
+        target: "libcudnn.so.9".into(),
+    }];
+    for (schema, alias) in [
+        (Some(1), None),
+        (Some(2), None),
+        (None, Some(aliases.clone())),
+        (Some(1), Some(aliases.clone())),
+        (Some(3), Some(aliases.clone())),
+        (Some(2), Some(vec![])),
+        (Some(2), Some(vec![aliases[0].clone(); 9])),
+    ] {
+        let mut invalid = original.clone();
+        invalid.schema_version = schema;
+        invalid.loader_aliases = alias;
+        assert!(invalid.canonical_digest().is_err());
+    }
+    let mut v2 = original.clone();
+    v2.schema_version = Some(2);
+    v2.loader_aliases = Some(aliases);
+    v2.canonical_sha256 = v2.canonical_digest().unwrap();
+    let mut stale = v2.clone();
+    stale.canonical_sha256 = original.canonical_sha256;
+    assert!(stale.validate().is_err());
+    for (filename, target) in [
+        ("libcudnn.so.9.9.0", "libcudnn.so.9"),
+        ("libcublas.so.12.8.0", "libcublas.so.12"),
+        ("libcudnn.so.9.8.0", "../libcudnn.so.9"),
+        ("../libcudnn.so.9.8.0", "libcudnn.so.9"),
+    ] {
+        let mut invalid = v2.clone();
+        invalid.loader_aliases.as_mut().unwrap()[0] = CudaBundleAliasBindingV2 {
+            filename: filename.into(),
+            target: target.into(),
+        };
+        assert!(invalid.canonical_digest().is_err());
+    }
+    let mut duplicate = v2.clone();
+    let first = duplicate.loader_aliases.as_ref().unwrap()[0].clone();
+    duplicate.loader_aliases.as_mut().unwrap().push(first);
+    assert!(duplicate.canonical_digest().is_err());
+    for field in ["schema_version", "loader_aliases"] {
+        let mut value = serde_json::to_value(&v2).unwrap();
+        value[field] = Value::Null;
+        assert!(decode_json::<CudaBundleBindingV1>(&value.to_string()).is_err());
+    }
 }
 
 #[test]

@@ -1722,15 +1722,14 @@ pub(crate) mod linux {
                 target: "x86_64-unknown-linux-gnu".into(),
                 isa: "x86-64".into(),
             };
-            let movetime = rz_experiments::NativePairClock::Movetime(
-                rz_experiments::NativeMovetimeV1 { movetime_ms: 10 },
-            );
-            let game = rz_experiments::NativePairClock::Game(
-                rz_experiments::NativeGameClockV3 {
-                    base_ms: 120_000,
-                    increment_ms: 1_000,
-                },
-            );
+            let movetime =
+                rz_experiments::NativePairClock::Movetime(rz_experiments::NativeMovetimeV1 {
+                    movetime_ms: 10,
+                });
+            let game = rz_experiments::NativePairClock::Game(rz_experiments::NativeGameClockV3 {
+                base_ms: 120_000,
+                increment_ms: 1_000,
+            });
             assert!(validate_native_runner(&runner, movetime).is_ok());
             runner.dirty = true;
             assert!(validate_native_runner(&runner, movetime).is_err());
@@ -1745,12 +1744,18 @@ pub(crate) mod linux {
                 PALS_CLOCK_REAP_PATCH_SHA256,
                 PALS_CLOCK_REAP_PATCH_BYTES,
             ));
-            let versions = [crate::FASTCHESS_VERSION, PALS_CLOCK_REAP_COLAB_RUNNER_VERSION];
+            let versions = [
+                crate::FASTCHESS_VERSION,
+                PALS_CLOCK_REAP_COLAB_RUNNER_VERSION,
+            ];
             let hashes = [
                 PALS_CLOCK_REAP_RUNNER_SHA256,
                 PALS_CLOCK_REAP_COLAB_RUNNER_SHA256,
             ];
-            let sizes = [PALS_CLOCK_REAP_RUNNER_BYTES, PALS_CLOCK_REAP_COLAB_RUNNER_BYTES];
+            let sizes = [
+                PALS_CLOCK_REAP_RUNNER_BYTES,
+                PALS_CLOCK_REAP_COLAB_RUNNER_BYTES,
+            ];
             for (v, version) in versions.iter().enumerate() {
                 for (h, hash) in hashes.iter().enumerate() {
                     for (b, bytes) in sizes.iter().enumerate() {

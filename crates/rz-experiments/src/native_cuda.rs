@@ -103,6 +103,21 @@ pub struct CudaBundleFileBindingV1 {
     pub artifact: ArtifactRef,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CudaBundleAliasBindingV2 {
+    pub filename: String,
+    pub target: String,
+}
+
+fn present_bundle_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 /// The manifest artifact binds raw JSON bytes; canonical_sha256 separately binds
 /// C's filename-sorted binary codec. Neither hash proves that a file was read.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -111,6 +126,20 @@ pub struct CudaBundleBindingV1 {
     pub manifest: ArtifactRef,
     pub canonical_sha256: String,
     pub files: Vec<CudaBundleFileBindingV1>,
+    /// Absent fields retain the original V1 wire and binary codec. V2 requires
+    /// an explicit schema and the closed cuDNN loader-alias declaration together.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_bundle_option"
+    )]
+    pub schema_version: Option<u32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_bundle_option"
+    )]
+    pub loader_aliases: Option<Vec<CudaBundleAliasBindingV2>>,
 }
 
 impl CudaBundleBindingV1 {
@@ -156,6 +185,7 @@ impl CudaBundleBindingV1 {
     }
 
     fn metadata_bytes(&self) -> Result<u64, ManifestError> {
+        self.validate_loader_aliases()?;
         self.manifest.validate()?;
         require(
             self.manifest.bytes <= MAX_CUDA_NATIVE_LAUNCH_JSON_BYTES as u64,
@@ -224,6 +254,37 @@ impl CudaBundleBindingV1 {
         Ok(total)
     }
 
+    fn validate_loader_aliases(&self) -> Result<(), ManifestError> {
+        let aliases = match (self.schema_version, &self.loader_aliases) {
+            (None, None) => return Ok(()),
+            (Some(2), Some(aliases)) if !aliases.is_empty() && aliases.len() <= 8 => aliases,
+            _ => {
+                return Err(violation(
+                    "cuda_bundle.loader_aliases",
+                    "CudaBundleAliasSchema",
+                    "V1 omits schema/aliases; V2 requires schema 2 and one to eight explicit aliases",
+                ));
+            }
+        };
+        let mut filenames = BTreeSet::new();
+        for alias in aliases {
+            require(
+                alias.target.starts_with("libcudnn")
+                    && alias.filename == format!("{}.8.0", alias.target)
+                    && self.files.iter().any(|file| {
+                        file.role == CudaBundleFileRoleV1::NvidiaDependency
+                            && file.filename == alias.target
+                            && CUDA_BUNDLE_FILENAMES.contains(&(file.filename.as_str(), file.role))
+                    })
+                    && filenames.insert(alias.filename.as_str()),
+                "cuda_bundle.loader_aliases",
+                "CudaBundleAliasProfile",
+                "CUDA loader aliases must be unique cuDNN 9.8.0 names targeting registered regular files",
+            )?;
+        }
+        Ok(())
+    }
+
     /// Exact C codec: domain, u32-BE schema/count, filename-sorted entries with
     /// u32-BE name length, name bytes, u8 role, u64-BE size, 32 decoded SHA bytes.
     pub fn canonical_digest(&self) -> Result<String, ManifestError> {
@@ -231,8 +292,13 @@ impl CudaBundleBindingV1 {
         let mut files: Vec<_> = self.files.iter().collect();
         files.sort_unstable_by(|left, right| left.filename.cmp(&right.filename));
         let mut digest = Sha256::new();
-        digest.update(b"RoveZero/native-cuda-bundle\0binary-codec-v1\0");
-        digest.update(1_u32.to_be_bytes());
+        let schema = self.schema_version.unwrap_or(1);
+        digest.update(match schema {
+            1 => b"RoveZero/native-cuda-bundle\0binary-codec-v1\0".as_slice(),
+            2 => b"RoveZero/native-cuda-bundle\0binary-codec-v2-aliases\0".as_slice(),
+            _ => unreachable!("validated schema"),
+        });
+        digest.update(schema.to_be_bytes());
         digest.update((files.len() as u32).to_be_bytes());
         for file in files {
             digest.update((file.filename.len() as u32).to_be_bytes());
@@ -246,6 +312,17 @@ impl CudaBundleBindingV1 {
                 raw[index] = (hex_digit(pair[0]) << 4) | hex_digit(pair[1]);
             }
             digest.update(raw);
+        }
+        if let Some(aliases) = &self.loader_aliases {
+            let mut aliases: Vec<_> = aliases.iter().collect();
+            aliases.sort_unstable_by(|left, right| left.filename.cmp(&right.filename));
+            digest.update((aliases.len() as u32).to_be_bytes());
+            for alias in aliases {
+                for basename in [&alias.filename, &alias.target] {
+                    digest.update((basename.len() as u32).to_be_bytes());
+                    digest.update(basename.as_bytes());
+                }
+            }
         }
         Ok(format!("{:x}", digest.finalize()))
     }
