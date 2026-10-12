@@ -58,6 +58,23 @@ V22의 두 판과 개별 물리 종료 자료는 typed Core 생성 실패를 포
 
 제품·검사 소스와 현재 대국 인수는 [현재 실행 기록](PALS-IMPLEMENTATION.md#2026-10-12-게임별-종료-소유자-수정과-현재-인수)에 연결한다.
 
+## 2026-10-13 Pilot23과 학습 증거의 범위
+
+제품 `4fef868`의 Build22와 새 Pilot23은 frozen `LegacySummaryV1`/`FullLineInteractionV2`
+모델의 기능 실행이다. 120초+1초·흑백 교환 두 판에서 Rules 반복 무승부, 새 typed
+Core와 네 game session의 정상 물리 종료를 관측했다. preflight와 game owner 8개,
+startup·termination 8쌍과 startup/ready profile 32개를 보존한다. Colab-observed
+결과의 strict-local·성능·기력·모델 승격 eligibility는 false이며 두 판으로 Elo를
+확정하지 않는다.
+
+이번 optimizer update와 실제 target 학습은 0회다. 이전 diagnostic 24회 성공과
+실패 9회, 누적 33회의 checkpoint/resume 근거는 그대로 유지한다. 원 수치·Warm
+cohort의 component 재사용 확인과 새 frozen 대국은 실제 학습이나 learned V utility의
+일반화 근거로 합산하지 않는다. Warm off 대국은 새 Warm 검사도 아니다. 원
+`f75a739`/V22의 typed Core null·owner 중복 실패와 capacity 실패를 역사 자료로 보존한다.
+이전 절의 pending은 당시 상태이며 새 실행 범위는
+[Build22와 Pilot23 실제 기능 관측](PALS-IMPLEMENTATION.md#2026-10-13-build22와-pilot23-실제-기능-관측)을 따른다.
+
 ## 0. 2026-10-04 강도용 모델 전환의 우선순위
 
 이 절의 실행·미실행은 2026-10-04 BT4 전환 당시 범위다. 위 PALS diagnostic 후속과

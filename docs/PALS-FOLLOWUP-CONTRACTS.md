@@ -195,6 +195,24 @@ V22의 typed Core 생성 실패와 process owner 중복 오류는 원문을 유�
 
 현재 실행 상태와 실패 이력은 [게임별 종료 소유자 수정과 현재 인수](PALS-IMPLEMENTATION.md#2026-10-12-게임별-종료-소유자-수정과-현재-인수)를 따른다.
 
+### 2026-10-13 Pilot23의 실제 종료 관측
+
+`4fef868`/Build22의 새 Pilot23에서 원 producer의 typed Core가 생성됐고 assembly
+error·Core failure는 없었다. preflight 4개와 game 4개의 owner를 분리하고,
+startup·termination 8쌍·startup/ready profile 원시 파일 32개와 새 입력 lock을
+연결했다. 네 game session의 정상 physical shutdown·buffer release와 owned tree
+종료, 두 PGN의 색 교환·120+1 시계·Rules 반복 무승부를 실제 자료로 확인했다.
+공유 pair stream의 cleanup 비용을 한 번만 청구하는 기존 계약을 유지하며, 다른
+게임의 0을 독립 cleanup 계측으로 해석하지 않는다.
+
+원 V22의 typed Core null과 owner 중복 실패는 교정한 성공 자료로 덮어쓰지 않는다.
+이번 자료는 별도 source/build/lock/실행 식별로 보존한다. typed deadline 오류 분기의
+실제 발동은 unknown이며 CPU 검사와 성공 반환만으로 해당 분기를 인수하지 않는다.
+새 기능 관측은 Colab-observed 범위다. strict-local·성능·기력 eligibility와 typed Core의
+pair eligibility는 false를 유지한다. NN 완료·검색 소비·착수 반환은 별개 counter다.
+Warm off 대국을 새 Warm 인수로 표시하지 않으며 실제 TF32 kernel/plan도 unknown이다.
+구체적인 실행 범위는 [Build22와 Pilot23 실제 기능 관측](PALS-IMPLEMENTATION.md#2026-10-13-build22와-pilot23-실제-기능-관측)을 따른다.
+
 ## 작은 학습과 실행 인수
 
 실제 target coverage와 진단 fixture를 분리한다. nonzero checkpoint는 zero-step

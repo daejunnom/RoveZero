@@ -127,6 +127,44 @@ request/execution/bank/ordinal과 accepted seed의 실제 join, 마지막 physic
 사용자가 총 update 한도를 해제했지만 실행별 자원·시간·출력 상한과 실패 기록은 유지한다.
 상세 범위는 [학습 smoke 기록](TRAINING-PLAN.md#2026-10-10-pals-diagnostic-학습-smoke)을 따른다.
 
+### 2026-10-13 Build22와 Pilot23 실제 기능 관측
+
+제품 소스 `4fef86812792823313fc67e845ed90a500954959`의 Build22는 14개 명령을
+exit 0·owned tree 정리·supervisor 오류 없음으로 완료했다. 등록된 ELF 5개의 GLIBC
+상한은 2.34다. 이전 Build21의 성공과 별도 실행이며, Build22 영수증 SHA-256은
+`4e932feff8781fed934ef164a50b3931b3b239992848fc7815fe95fb870b1f9d`다.
+
+같은 등록 제품의 새 Pilot23은 metadata와 실제 execute를 각각 정상 종료했다.
+새 typed Core는 실제 producer에서 생성됐고 assembly error와 Core failure 목록은
+비어 있다. Core SHA-256은
+`e526192f23e5c77e0d450ae033918e527a2723248aebd9961a5b5a9392f77beb`다.
+`LegacySummaryV1`과 `FullLineInteractionV2`의 흑백 교환 두 판은 120초+1초 피셔,
+최대 256 ply·선택 기능 off로 진행됐으며, 각각 58·68 ply에서 Rules의 3회 반복
+무승부로 끝났다. PGN의 색·엔진 구성·시계·종료와 runner clock/failure 감사를
+실제 자료로 확인했다.
+
+preflight 4개와 game 4개의 실제 process owner를 분리하여 startup·termination
+8쌍과 profile 원시 파일 32개를 보존했다. 네 game session의 physical shutdown과
+buffer release는 모두 확인됐고, 게임 검색 반환은 성공 126회·실패 0회·물리 완료
+unknown 0회다. 이 반환 수는 NN 입력 완료 수나 검색 소비 평가 수가 아니며 각
+counter를 별도로 보존한다. profile 자료의 범위는 startup·ready이며 게임 전체의
+GPU 성능·사용률을 대신하지 않는다. 자식과 감독의 종료 뒤 L4는 정지 상태다.
+
+결과는 `functional_pair_checks_passed_colab_observed`다. 실제 자원은 strict-local
+정책과 다르므로 `strict_local_admitted=false`, `performance_evidence_eligible=false`,
+`strength_eligible=false`와 typed Core의 `pair_eligible=false`를 유지한다.
+선언한 FP32·TF32 off와 실제 kernel/plan의 TF32 관측을 구분하며 후자는 unknown이다.
+새 Warm 실행·strict-local 인수·성능/기력 개선·Elo·모델 승격을 주장하지 않는다.
+
+기존 수치·정상 Warm은 원 `c3b035e`/Build13 및 검증 전용 `8b4970d`의 실행 cohort,
+비용 관측은 `555a913`/Build14로 보존한다. 영향 source·모델/입력·가중치·runtime·
+raw reference의 component 재사용 근거를 연결하되 새 Build22 실행으로 재라벨하지
+않는다. Build22의 Warm 바이너리는 이전 것과 다르며 이번 Pilot23에서는 Warm을
+끄고 실행했다. 기존 `f75a739`/V22의 typed Core null·process owner 중복·exit 1과
+capacity 실패는 당시 원문 그대로 남긴다. 뒤의 과거 pending 문구는 해당 실행 당시의
+상태다. E06/E07와 전체 조건의 총괄 최종 판정·정확한 공개 tip의 CI는 PR와 외부
+인수 보고서에서 관리한다. 이번 optimizer update와 실제 target 학습은 0회다.
+
 ### 2026-10-12 게임별 종료 소유자 수정과 현재 인수
 
 현재 후속 실행에 등록한 제품 소스는 `4fef86812792823313fc67e845ed90a500954959`다. 이전 `f75a739`의 Build21은 13개 명령의 정상 종료, 등록된 ELF 5개, CPU selector 6개의 검사 10개 성공을 실제 자료로 보존한다. 새 제품 소스의 Build22와 Pilot23은 실제 완료 자료를 기다리고 있으며, 이전 빌드의 성공을 새 빌드의 성공으로 표시하지 않는다.

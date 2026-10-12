@@ -255,6 +255,21 @@ source-proof21은 `ae36afc`에서 `4fef868`까지 선택 소스 322개 중 319�
 게임별 actual PID와 공유 정리 비용의 계약은 [후속 계약](PALS-FOLLOWUP-CONTRACTS.md#게임별-종료-소유자와-공유-정리-비용),
 실제 대국과 남은 Build22·Pilot23 인수는 [현재 실행 기록](PALS-IMPLEMENTATION.md#2026-10-12-게임별-종료-소유자-수정과-현재-인수)을 따른다.
 
+### 2026-10-13 게임별 producer의 실제 실행 연결
+
+제품 `4fef868`/Build22의 Pilot23은 새 producer의 typed Core, preflight/game의 별개
+owner와 네 game session의 물리 종료를 실제 실행 자료에 연결했다. 두 엔진은 각
+판 재시작했고, Legacy/new 구성의 색 교환·Rules/시계/PGN·owned tree 종료를 함께
+관측했다. 기존 단일 worker와 physical lease의 책임은 유지되며, 논리 취소를
+물리 완료로 바꾸거나 종료 불명 buffer를 재사용하는 예외를 추가하지 않는다.
+
+원 numeric/Warm cohort와 component 재사용 확인, 검사 전용 tip의 CPU CI, 새 제품의
+실제 실행은 서로 다른 근거다. 원 V22의 typed Core null·owner 중복 실패를 보존하고
+새 자료를 이전 owner의 재조립으로 취급하지 않는다. Colab-observed 기능 결과는
+strict-local 자원 인수나 성능·기력 개선을 뜻하지 않는다. 실제 TF32·새 Warm의
+현재 바이너리 실행 효과와 전체 peak의 미관측 범위는 그대로 둔다.
+상세 숫자·계수·원 실패는 [Build22와 Pilot23 실제 기능 관측](PALS-IMPLEMENTATION.md#2026-10-13-build22와-pilot23-실제-기능-관측)에 연결한다.
+
 ## 복구와 검증 경계
 
 재사용을 연구하면 같은 자체 모델의 fresh/full 경로를 비교·복구 기준으로 확보한다. 감사용 fresh 계산도 온라인 대국에서는 시간 비용이다. 마감 안에 복구할 수 없는 내부 오류는 기록하고, 타 엔진을 숨겨 호출해 정상 결과로 바꾸지 않는다. 자체 helper/fallback과 외부 엔진 composite는 서로 다른 실험 계약이다.
